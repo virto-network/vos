@@ -32,8 +32,9 @@ use crate::{framework::BuiltInComponent, lookups::MemoryAccessLookupElements};
 /// MemoryChip: proves read/write consistency of RAM accesses.
 ///
 /// Each row is one memory access (Load or Store). The trace is sorted by
-/// (address, timestamp). For consecutive accesses to the same address,
-/// reads must return the value from the last write.
+/// (address, 2·timestamp + is_write): at one timestamp an address's reads
+/// precede its writes. For consecutive accesses to the same address, reads
+/// must return the value from the last write.
 pub struct MemoryChip;
 
 /// Ordering deltas must fit below this bit width. Twenty-eight bits cover the
@@ -89,19 +90,22 @@ pub enum Column {
     #[size = 1]
     AdvHiH,
     /// 28-bit little-endian decomposition of the per-transition ordering delta
-    /// `OrderDelta = IsSameAddrNext·ts_diff + AdvLoH·(lo_diff−1) +
+    /// `OrderDelta = IsSameAddrNext·key_diff + AdvLoH·(lo_diff−1) +
     /// AdvHiH·(hi_diff−1)`, a SELF-CONTAINED non-negativity range-check (no
     /// Range256 lookup — the consumer pass runs with an immutable `&SideNote`).
-    /// 28 bits covers every timestamp admitted by the canonical 100M-gas
-    /// actor-proof budget plus the 16-bit half diffs. `2^28 < p/4`, so a
+    /// 28 bits covers twice every timestamp admitted by the canonical
+    /// 100M-gas actor-proof budget plus the 16-bit half diffs. `2^28 < p/4`, so a
     /// field-wrapped negative cannot alias a valid small positive.
     #[size = 28]
     OrderBits,
     /// 1 iff this is a per-page closing read (the §2 boundary injection),
     /// produced only by MemoryPageChip; 0 for every step / precompile /
     /// ts=0-write entry.  Part of the logup tuple (so producers and consumer
-    /// agree) and gates the group-end constraint.
+    /// agree) and gates the group-end constraint.  `#[mask_next_row]`: an
+    /// unreadable page's group goes from its start straight to its closing
+    /// read.
     #[size = 1]
+    #[mask_next_row]
     IsClosing,
     /// BOUND helper: `IsGroupStart = is_real_next · (1 − IsSameAddrNext)` — 1
     /// iff the NEXT ledger row begins a new address group (next row real and a
@@ -115,6 +119,26 @@ pub enum Column {
     /// read, so every accessed address lands in a listed page (design §2).
     #[size = 1]
     IsGroupEnd,
+    /// 1 iff this real row starts its address group: the previous row's
+    /// `IsGroupStart`.  `#[mask_next_row]` so that row can set it.
+    #[size = 1]
+    #[mask_next_row]
+    IsStart,
+    /// The address's page is readable (its permission 1 or 2), constant
+    /// along the group.
+    #[size = 1]
+    #[mask_next_row]
+    Readable,
+    /// The address's page is writable (its permission 2), constant along
+    /// the group.
+    #[size = 1]
+    #[mask_next_row]
+    Writable,
+    /// BOUND helper `IsStart · (Readable + Writable)`: the page's
+    /// permission on its group's start, the ts=0 write MemoryPageChip
+    /// produces with it, and 0 on every other row.
+    #[size = 1]
+    PermissionH,
     // Read-consistency uses an unconditional
     // `(1 - is_write) · (value - prev_value) = 0` constraint (no gating
     // helper column): padding rows have value=0 and prev_value=0, so the
@@ -157,6 +181,25 @@ fn decompose_access(
         .collect()
 }
 
+/// The ledger's write entries for a witness-input call's bytes, one a byte
+/// from its address on, at `timestamp`.
+#[cfg(feature = "prover")]
+fn witness_entries(
+    write: &crate::core::step::WitnessWrite,
+    timestamp: u64,
+) -> impl Iterator<Item = MemEntry> + '_ {
+    write
+        .bytes
+        .iter()
+        .enumerate()
+        .map(move |(offset, &value)| MemEntry {
+            address: write.address.wrapping_add(offset as u32),
+            value,
+            timestamp,
+            is_write: true,
+        })
+}
+
 impl BuiltInComponent for MemoryChip {
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
@@ -178,8 +221,11 @@ impl BuiltInComponent for MemoryChip {
         let is_closing = crate::trace::trace_eval!(trace_eval, Column::IsClosing);
         let prev_value = crate::trace::trace_eval!(trace_eval, Column::PrevValue);
 
-        // IsClosing is a bound boolean (only MemoryPageChip ever sets it).
-        eval.add_constraint(is_closing[0].clone() * (is_closing[0].clone() - E::F::one()));
+        // IsClosing is a bound boolean (only MemoryPageChip ever sets it);
+        // IsWrite and IsPadding are booleans too.
+        for flag in [&is_closing, &is_write, &is_pad] {
+            eval.add_constraint(flag[0].clone() * (flag[0].clone() - E::F::one()));
+        }
 
         // Read consistency is unconditional: `(1 - is_write) · (value -
         // prev_value) = 0`.  On padding rows value=prev_value=0 so 1·0=0
@@ -230,10 +276,14 @@ impl BuiltInComponent for MemoryChip {
             is_same_addr[0].clone() + adv_lo[0].clone() + adv_hi[0].clone() - both_real,
         );
 
-        // OrderDelta = same·ts_diff + lo·(lo_diff−1) + hi·(hi_diff−1), 28-bit
-        // range-checked ≥ 0.  same=1 ⇒ ts non-decreasing; lo=1 ⇒ lo strictly
-        // increases (hi equal) ⇒ addr↑; hi=1 ⇒ hi strictly increases ⇒ addr↑.
-        // 0 on every non-real→real transition (all three coeffs are 0 there).
+        // OrderDelta = same·key_diff + lo·(lo_diff−1) + hi·(hi_diff−1),
+        // 28-bit range-checked ≥ 0, with key = 2·ts + is_write.  same=1 ⇒
+        // the key is non-decreasing: ts is, and at one ts an address's reads
+        // come before its writes, so a step that reads and writes one byte
+        // (a precompile whose output overlaps its input) reads the value
+        // from before it; lo=1 ⇒ lo strictly increases (hi equal) ⇒ addr↑;
+        // hi=1 ⇒ hi strictly increases ⇒ addr↑.  0 on every non-real→real
+        // transition (all three coeffs are 0 there).
         let combine_ts = |bytes: &[E::F; 8]| -> E::F {
             let mut acc = E::F::zero();
             let mut pow = E::F::one();
@@ -243,11 +293,14 @@ impl BuiltInComponent for MemoryChip {
             }
             acc
         };
-        let ts_diff = combine_ts(&timestamp_next) - combine_ts(&timestamp);
-        let order_delta = is_same_addr[0].clone() * ts_diff
+        let is_write_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsWrite);
+        let two = E::F::from(BaseField::from(2u32));
+        let key_diff = two.clone() * (combine_ts(&timestamp_next) - combine_ts(&timestamp))
+            + is_write_next[0].clone()
+            - is_write[0].clone();
+        let order_delta = is_same_addr[0].clone() * key_diff
             + adv_lo[0].clone() * (lo_diff - E::F::one())
             + adv_hi[0].clone() * (hi_diff - E::F::one());
-        let two = E::F::from(BaseField::from(2u32));
         let mut recomposed = E::F::zero();
         let mut pow2 = E::F::one();
         for bit in &order_bits {
@@ -273,7 +326,6 @@ impl BuiltInComponent for MemoryChip {
         // boundary by omitting a touched page: every accessed address must be
         // a listed page (else its group lacks the ts=0 write / closing read
         // producer → group-start violation or logup imbalance).
-        let is_write_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsWrite);
         let is_group_start = crate::trace::trace_eval!(trace_eval, Column::IsGroupStart);
         let is_group_end = crate::trace::trace_eval!(trace_eval, Column::IsGroupEnd);
         let is_real_next = E::F::one() - is_pad_next[0].clone();
@@ -300,13 +352,56 @@ impl BuiltInComponent for MemoryChip {
         // Group end: the last real row of every address group is a closing read.
         eval.add_constraint(is_group_end[0].clone() * (E::F::one() - is_closing[0].clone()));
 
+        // ── Page permissions ──────────────────────────────────────────────
+        // Every address group starts with its page's ts=0 write, which
+        // MemoryPageChip produces carrying the page's proven permission
+        // (`2·permission` in the tuple's last field; no other producer
+        // emits ts = 0). The group holds it, and every row after the start
+        // obeys it: a write needs a writable page; an unreadable page's
+        // start is followed by its closing read, so no step, BLAKE2b or
+        // witness-input access lands in it.
+        let is_start = crate::trace::trace_eval!(trace_eval, Column::IsStart);
+        let is_start_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsStart);
+        let readable = crate::trace::trace_eval!(trace_eval, Column::Readable);
+        let readable_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Readable);
+        let writable = crate::trace::trace_eval!(trace_eval, Column::Writable);
+        let writable_next = crate::trace::trace_eval_next_row!(trace_eval, Column::Writable);
+        let is_closing_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsClosing);
+        let permission = crate::trace::trace_eval!(trace_eval, Column::PermissionH);
+        for flag in [&is_start, &readable, &writable] {
+            eval.add_constraint(flag[0].clone() * (flag[0].clone() - E::F::one()));
+        }
+        eval.add_constraint(writable[0].clone() * (E::F::one() - readable[0].clone()));
+        eval.add_constraint(is_start_next[0].clone() - is_group_start[0].clone());
+        eval.add_constraint(
+            permission[0].clone()
+                - is_start[0].clone() * (readable[0].clone() + writable[0].clone()),
+        );
+        eval.add_constraint(
+            is_same_addr[0].clone() * (readable_next[0].clone() - readable[0].clone()),
+        );
+        eval.add_constraint(
+            is_same_addr[0].clone() * (writable_next[0].clone() - writable[0].clone()),
+        );
+        eval.add_constraint(
+            is_same_addr[0].clone()
+                * (E::F::one() - readable[0].clone())
+                * (E::F::one() - is_closing_next[0].clone()),
+        );
+        eval.add_constraint(
+            is_write[0].clone()
+                * (E::F::one() - is_start[0].clone())
+                * (E::F::one() - writable[0].clone()),
+        );
+
         // Consumer lookup (negative multiplicity)
-        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1], is_closing[1])
+        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1],
+        // is_closing + 2·permission[1])
         let mut tuple: Vec<E::F> = address.to_vec();
         tuple.push(value[0].clone());
         tuple.extend_from_slice(&timestamp);
         tuple.push(is_write[0].clone());
-        tuple.push(is_closing[0].clone());
+        tuple.push(is_closing[0].clone() + permission[0].clone() + permission[0].clone());
 
         eval.add_to_relation(RelationEntry::new(
             lookup_elements,
@@ -401,11 +496,14 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
                 w.size,
             ));
         }
+        if let Some(ref w) = step.witness {
+            entries.extend(witness_entries(w, step.timestamp));
+        }
     }
     for op in &side_note.blake2b_mem_ops {
         for (i, &b) in op.h_bytes.iter().enumerate() {
             entries.push(MemEntry {
-                address: op.h_ptr + i as u32,
+                address: op.h_ptr.wrapping_add(i as u32),
                 value: b,
                 timestamp: op.ts,
                 is_write: false,
@@ -413,7 +511,7 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         }
         for (i, &b) in op.m_bytes.iter().enumerate() {
             entries.push(MemEntry {
-                address: op.m_ptr + i as u32,
+                address: op.m_ptr.wrapping_add(i as u32),
                 value: b,
                 timestamp: op.ts,
                 is_write: false,
@@ -421,103 +519,7 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         }
         for (i, &b) in op.out_bytes.iter().enumerate() {
             entries.push(MemEntry {
-                address: op.h_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: true,
-            });
-        }
-    }
-    for op in &side_note.ristretto_mem_ops {
-        for (i, &b) in op.scalar_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.scalar_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: false,
-            });
-        }
-        for (i, &b) in op.point_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.point_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: false,
-            });
-        }
-        for (i, &b) in op.out_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.output_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: true,
-            });
-        }
-    }
-    for op in &side_note.ristretto_add_mem_ops {
-        for (i, &b) in op.p_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.p_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: false,
-            });
-        }
-        for (i, &b) in op.q_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.q_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: false,
-            });
-        }
-        for (i, &b) in op.out_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.output_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: true,
-            });
-        }
-    }
-    for op in &side_note.scalar_binop_mem_ops {
-        for (i, &b) in op.a_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.a_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: false,
-            });
-        }
-        for (i, &b) in op.b_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.b_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: false,
-            });
-        }
-        for (i, &b) in op.out_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.output_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: true,
-            });
-        }
-    }
-    for op in &side_note.scalar_reduce_wide_mem_ops {
-        for (i, &b) in op.wide_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.wide_ptr + i as u32,
-                value: b,
-                timestamp: op.ts,
-                is_write: false,
-            });
-        }
-        for (i, &b) in op.out_bytes.iter().enumerate() {
-            entries.push(MemEntry {
-                address: op.output_ptr + i as u32,
+                address: op.h_ptr.wrapping_add(i as u32),
                 value: b,
                 timestamp: op.ts,
                 is_write: true,
@@ -549,7 +551,7 @@ pub fn analyze_dedup(side_note: &crate::side_note::SideNote) -> MemoryDedupRepor
         return MemoryDedupReport::default();
     }
 
-    entries.sort_by_key(|e| (e.address, e.timestamp));
+    entries.sort_by_key(|e| (e.address, e.timestamp, e.is_write));
 
     // A "flood group" = run of consecutive entries (in sort order) where
     //   addr[i+1] == addr[i] + 1, ts[i+1] == ts[i], is_write[i+1] == is_write[i].
@@ -686,17 +688,21 @@ impl BuiltInProverComponent for MemoryChip {
                     w.size,
                 ));
             }
+            // A witness-input call's bytes, written at its step's ts; it
+            // reads no memory. `WitnessInputChip` produces their tuples.
+            if let Some(ref w) = step.witness {
+                entries.extend(witness_entries(w, step.timestamp));
+            }
         }
 
         // Blake2b precompile memory ops: 64 byte reads at h_ptr + 128 byte
         // reads at m_ptr + 64 byte writes back at h_ptr, all at the ECALL
-        // step's ts.  Reads are pushed before writes so the stable
-        // `sort_by_key(|e| (e.address, e.timestamp))` at the end keeps the
-        // (read, then write) order at the same (addr, ts) pair.
+        // step's ts.  The ledger's order puts the reads before the writes
+        // at the same (addr, ts) pair, as the AIR requires.
         for op in &side_note.blake2b_mem_ops {
             for (i, &b) in op.h_bytes.iter().enumerate() {
                 entries.push(MemEntry {
-                    address: op.h_ptr + i as u32,
+                    address: op.h_ptr.wrapping_add(i as u32),
                     value: b,
                     timestamp: op.ts,
                     is_write: false,
@@ -704,7 +710,7 @@ impl BuiltInProverComponent for MemoryChip {
             }
             for (i, &b) in op.m_bytes.iter().enumerate() {
                 entries.push(MemEntry {
-                    address: op.m_ptr + i as u32,
+                    address: op.m_ptr.wrapping_add(i as u32),
                     value: b,
                     timestamp: op.ts,
                     is_write: false,
@@ -712,117 +718,7 @@ impl BuiltInProverComponent for MemoryChip {
             }
             for (i, &b) in op.out_bytes.iter().enumerate() {
                 entries.push(MemEntry {
-                    address: op.h_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: true,
-                });
-            }
-        }
-
-        // Ristretto255 scalar-mult precompile memory ops.
-        // 32 reads each (scalar + point) + 32 writes (output), all
-        // at the ECALL ts.  Producer side comes from
-        // RistrettoEcallChip.
-        for op in &side_note.ristretto_mem_ops {
-            for (i, &b) in op.scalar_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.scalar_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: false,
-                });
-            }
-            for (i, &b) in op.point_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.point_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: false,
-                });
-            }
-            for (i, &b) in op.out_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.output_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: true,
-                });
-            }
-        }
-
-        // Ristretto255 point-add precompile memory ops:
-        // 32 reads each (P + Q) + 32 writes (output), all at ECALL ts.
-        for op in &side_note.ristretto_add_mem_ops {
-            for (i, &b) in op.p_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.p_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: false,
-                });
-            }
-            for (i, &b) in op.q_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.q_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: false,
-                });
-            }
-            for (i, &b) in op.out_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.output_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: true,
-                });
-            }
-        }
-
-        // Scalar mul/add mod ℓ precompile memory ops:
-        // 32 reads (a) + 32 reads (b) + 32 writes (output) per call.
-        for op in &side_note.scalar_binop_mem_ops {
-            for (i, &b) in op.a_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.a_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: false,
-                });
-            }
-            for (i, &b) in op.b_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.b_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: false,
-                });
-            }
-            for (i, &b) in op.out_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.output_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: true,
-                });
-            }
-        }
-
-        // scalar_from_bytes_mod_order_wide precompile memory
-        // ops: 64 reads (wide input) + 32 writes (canonical output).
-        for op in &side_note.scalar_reduce_wide_mem_ops {
-            for (i, &b) in op.wide_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.wide_ptr + i as u32,
-                    value: b,
-                    timestamp: op.ts,
-                    is_write: false,
-                });
-            }
-            for (i, &b) in op.out_bytes.iter().enumerate() {
-                entries.push(MemEntry {
-                    address: op.output_ptr + i as u32,
+                    address: op.h_ptr.wrapping_add(i as u32),
                     value: b,
                     timestamp: op.ts,
                     is_write: true,
@@ -870,8 +766,9 @@ impl BuiltInProverComponent for MemoryChip {
             return trace.finalize_bit_reversed();
         }
 
-        // Sort by (address, timestamp) — initial writes at ts=0 come first per address
-        entries.sort_by_key(|e| (e.address, e.timestamp));
+        // Sort by (address, timestamp, is_write): initial writes at ts=0
+        // come first per address, and at one ts its reads precede its writes.
+        entries.sort_by_key(|e| (e.address, e.timestamp, e.is_write));
 
         let num_entries = entries.len();
         let mut log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_entries);
@@ -886,7 +783,7 @@ impl BuiltInProverComponent for MemoryChip {
         // Pass 1: base columns; track (addr, ts, is_same_addr) per row so the
         // ordering helpers (pass 2) can read the cyclic next row.
         let mut addrs = vec![0u32; num_rows];
-        let mut tss = vec![0u64; num_rows];
+        let mut keys = vec![0u64; num_rows];
         let mut same_addr = vec![false; num_rows];
         for (row, entry) in entries.iter().enumerate() {
             trace.fill_columns_bytes(row, &entry.address.to_le_bytes(), Column::Address);
@@ -913,8 +810,23 @@ impl BuiltInProverComponent for MemoryChip {
             let is_closing = closing_ts != 0 && entry.timestamp == closing_ts;
             trace.fill_columns(row, is_closing, Column::IsClosing);
 
+            // The page's permission, as MemoryPageChip proves it, held
+            // along the address's group; on its start, also the tuple's.
+            let permission = side_note
+                .memory_layout
+                .permission(entry.address / crate::page_merkle::PAGE_SIZE as u32);
+            trace.fill_columns(row, permission >= 1, Column::Readable);
+            trace.fill_columns(row, permission == 2, Column::Writable);
+            let is_start = row == 0 || entries[row - 1].address != entry.address;
+            trace.fill_columns(row, is_start, Column::IsStart);
+            trace.fill_columns(
+                row,
+                if is_start { permission } else { 0 },
+                Column::PermissionH,
+            );
+
             addrs[row] = entry.address;
-            tss[row] = entry.timestamp;
+            keys[row] = 2 * entry.timestamp + u64::from(entry.is_write);
             same_addr[row] = same_addr_next;
         }
         for row in num_entries..num_rows {
@@ -923,7 +835,7 @@ impl BuiltInProverComponent for MemoryChip {
 
         // Pass 2: ordering helpers, reading the cyclic next = (row+1) % num_rows.
         //   AdvLoH / AdvHiH: which 16-bit half advances (when not same address).
-        //   OrderBits: 28-bit decomposition of OrderDelta = same·ts_diff +
+        //   OrderBits: 28-bit decomposition of OrderDelta = same·key_diff +
         //   lo·(lo_diff−1) + hi·(hi_diff−1), all ≥ 0.
         for row in 0..num_rows {
             let next = (row + 1) % num_rows;
@@ -945,7 +857,7 @@ impl BuiltInProverComponent for MemoryChip {
             trace.fill_columns(row, is_group_end, Column::IsGroupEnd);
 
             let order_delta: u64 = if same_addr[row] {
-                tss[next] - tss[row]
+                keys[next] - keys[row]
             } else if adv_lo {
                 ((addrs[next] & 0xFFFF) - (addrs[row] & 0xFFFF)) as u64 - 1
             } else if adv_hi {
@@ -984,23 +896,41 @@ impl BuiltInProverComponent for MemoryChip {
         let timestamp = crate::trace::original_base_column!(component_trace, Column::Timestamp);
         let is_write = crate::trace::original_base_column!(component_trace, Column::IsWrite);
         let is_closing = crate::trace::original_base_column!(component_trace, Column::IsClosing);
+        let permission = crate::trace::original_base_column!(component_trace, Column::PermissionH);
 
-        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1], is_closing[1])
-        let mut tuple: Vec<_> = address.to_vec();
-        tuple.push(value[0].clone());
-        tuple.extend_from_slice(&timestamp);
-        tuple.push(is_write[0].clone());
-        tuple.push(is_closing[0].clone());
+        // Byte-level tuple: (addr[4], value[1], timestamp[8], is_write[1],
+        // is_closing + 2·permission[1])
+        let (address, value, timestamp, is_write, is_closing, permission) = (
+            address.clone(),
+            value.clone(),
+            timestamp.clone(),
+            is_write.clone(),
+            is_closing.clone(),
+            permission.clone(),
+        );
 
         // Consumer side (negative multiplicity)
-        logup.add_to_relation_with(
+        logup.add_to_relation_computed(
             mem_lookup,
             [is_pad[0].clone()],
             |[pad]| {
                 use stwo::prover::backend::simd::m31::PackedBaseField;
                 (-(PackedBaseField::one() - pad)).into()
             },
-            &tuple,
+            15,
+            move |v| {
+                let mut tuple = Vec::with_capacity(15);
+                for limb in &address {
+                    tuple.push(limb.at(v));
+                }
+                tuple.push(value[0].at(v));
+                for limb in &timestamp {
+                    tuple.push(limb.at(v));
+                }
+                tuple.push(is_write[0].at(v));
+                tuple.push(is_closing[0].at(v) + permission[0].at(v) + permission[0].at(v));
+                tuple
+            },
         );
 
         logup.finalize()

@@ -915,8 +915,10 @@ outbox sequence numbers, which receivers deduplicate.
 - Every precompile takes a pointer in φ[7] and leaves every register
   unchanged. `WHAT` in φ[7] can therefore only come from a host that does
   not know the id.
-- The prover attaches each call to its chip (BLAKE2b, Ristretto) inside the
-  same slice. The STARK alone rejects a tampered call input (S5b).
+- The prover attaches each call to its chip (BLAKE2b) inside the same
+  slice. The Ristretto and scalar ids 110–114 are no precompile: their
+  chips were removed as unsound, and a generic bignum chip (slice 7)
+  replaces them. The STARK alone rejects a tampered call input (S5b).
 - **On JAM,** the unknown id returns `WHAT` and the guest computes in
   software, with identical results for runs that complete.
 - **Gas** [decided; delegated by the owner]:
@@ -1311,8 +1313,10 @@ prototypes exist where noted.
 11. The minimal published proof format and fixed shape classes
     (requirements 4 and 5).
 12. Window aggregation for on-chain verification (requirement 6).
-13. Move Ristretto and the scalar operations (ids 110–114) into the VOS
-    range, with the `WHAT` fallback in the guest crypto wrappers.
+13. ~~Move Ristretto and the scalar operations (ids 110–114) into the VOS
+    range.~~ Removed instead: their chips and ids are gone from the prover,
+    the runtime and the shims; a generic bignum chip (slice 7) takes their
+    place.
 
 **Storage**
 
@@ -1367,8 +1371,8 @@ knowledge and aggregation are the longest work and gate goal 8.
   precompile change from `exp/gp-precompiles` and the work in section 16.
   Master's JAR runtime is not ported.
 - **Prover:** `pvm/proof` (prover, chain segments, verifier, settlement
-  verifier, BLAKE2b and Ristretto chips), on the refine path, without its
-  JAR paths.
+  verifier, BLAKE2b chips), on the refine path, without its JAR paths. Its
+  Ristretto chips were removed.
 - **`support/vos-raft`:** the consensus core. Its `std` driver is replaced
   (section 10).
 - **`support/merkle-crdt`:** the DAG and sync format; the apply path is

@@ -209,7 +209,7 @@ pub fn prove_format(
 /// latency-sensitive flows like *private tap-to-pay*.
 ///
 /// Same 96-bit conjectured security as `prove()` but ~2× faster on
-/// real PVM workloads (a ristretto-heavy workload: ~0.7 s vs ~1.4 s on
+/// real PVM workloads (a curve-arithmetic workload: ~0.7 s vs ~1.4 s on
 /// the reference Intel Core Ultra 7 155H).  Cost: proof size ~1.6×
 /// larger.  Acceptable trade for tap-to-pay where prove time
 /// dominates user experience.
@@ -265,8 +265,8 @@ fn segment_memory_roots(side_note: &SideNote) -> ([u8; 32], [u8; 32]) {
 /// a dense `initial_memory`.
 fn compute_final_memory_commitment(side_note: &SideNote) -> [u8; 32] {
     // Replay ALL of this (segment's) writes — regular stores AND precompile
-    // output writes (blake2b / ristretto / scalar-*, which live in
-    // `*_mem_ops`, not `step.mem_write`) — over the initial memory. Using
+    // output writes (blake2b's, which live in
+    // `blake2b_mem_ops`, not `step.mem_write`) — over the initial memory. Using
     // step writes alone leaves precompile-output bytes stale, so a downstream
     // segment's initial-memory commitment (which DOES reflect those writes,
     // via `segment::replay_writes`) would mismatch and `verify_chain`'s
@@ -787,10 +787,10 @@ where
     // *consumer* pass.  Producers (CpuChip, Blake2bChip) write per-row
     // multiplicities + entries into `side_note` while filling their main
     // trace; consumer chips (ALU/range/lookup tables, boundary chips,
-    // memory ledgers, RistrettoChip, …) only read those, so they run on
+    // memory ledgers, …) only read those, so they run on
     // rayon with shared `&SideNote`.  Mirrors the producer/consumer
     // split already used by interaction-trace generation a few stages
-    // below.  Measured saving on log17 a ristretto-heavy workload (MOBILE):
+    // below.  Measured saving on a log17 curve-arithmetic workload (MOBILE):
     // ~130 ms → ~70 ms of trace_gen.
     let t = Instant::now();
     let traces = generate_component_traces(side_note, components, min_log_sizes);
@@ -894,7 +894,7 @@ where
     // `tree_builder.extend_evals` is mutating, so we do that
     // sequentially after the parallel pass.
     //
-    // Measured win at log17 a ristretto-heavy workload (MOBILE config):
+    // Measured win on a log17 curve-arithmetic workload (MOBILE config):
     // ~140 ms → ~50–70 ms with the default thread pool cap (10
     // threads); brings total prove time from 0.71 s to ~0.62 s.
     let t = Instant::now();

@@ -10,7 +10,7 @@
 // 32-bit targets — CODE_WINDOW_SIZE = 1 << 32 overflows usize), and the
 // workspace stwo pin is feature-less, with `std,prover,parallel` added
 // back only by vos-pvm-proof's `prover` feature — so this crate's normal-dep graph
-// carries no vos_pvm / rayon / curve25519-dalek / vos-pvm-proof-blake3.
+// carries no vos_pvm / rayon / vos-pvm-proof-blake3.
 
 #![no_std]
 
@@ -871,24 +871,20 @@ fn verify_chain_standalone_shaped(
 /// published SET of allowed commitments instead of a single one.
 ///
 /// WHY a set: canonical-shape proving (forcing each preprocessed-bearing chip
-/// to a fixed `log_size`) makes most chips' preprocessed columns identical
-/// across segments, but two chips — `RistrettoFixedBaseConsumerChip` and
-/// `RistrettoCombCompressChip` — have preprocessed selectors gated on the
-/// per-segment fixed-base-scalar-mult ("comb") count, so a segment with `k`
-/// comb calls gets a distinct commitment `C_k` even at the forced `log_size`.
-/// The number of distinct `C_k` is small and bounded (a `SEG_STEPS`-sized
-/// segment can hold only a few comb calls), so a deployment publishes the
-/// allowlist `{C_0, C_1, …, C_max}` — one canonical commitment per comb-call
-/// count.  Each `C_k` is WITNESS-INDEPENDENT (a function of `k` + the forced
-/// profile, not of the scalars/account contents), so the allowlist is a fixed
-/// per-program constant.
+/// to a fixed `log_size`) makes a program's preprocessed columns identical
+/// across segments, so one program at one forced profile has one canonical
+/// commitment. A deployment that accepts several shapes (several forced
+/// profiles, or several versions of the program) publishes one commitment
+/// per shape. Each is WITNESS-INDEPENDENT (a function of the program and the
+/// forced profile, not of its inputs), so the allowlist is a fixed
+/// per-deployment constant.
 ///
 /// SOUNDNESS: every segment's commitment must be IN the allowlist (a
 /// from-scratch prover splicing a foreign program produces a commitment in no
-/// `C_k`), and each segment then verifies standalone against its own
+/// listed shape), and each segment then verifies standalone against its own
 /// commitment.  Combined with the same boundary-continuity + anchoring as
 /// [`verify_chain_standalone`], an accepted chain proves: the program is one
-/// of the published canonical voucher-check shapes, per-segment validity, and
+/// of the published canonical shapes, per-segment validity, and
 /// full register / pc / timestamp / memory continuity.
 ///
 /// PRECONDITION: the prover used canonical-shape proving (`vos_pvm_proof::prove_canonical`

@@ -178,6 +178,31 @@ pub(crate) struct TranspiledElf {
     pub(crate) host_calls: Vec<(u64, u32)>,
 }
 
+impl TranspiledElf {
+    /// The pc of an instruction whose static jump or branch target is the
+    /// halt address, if one is: only a dynamic jump through the halt entry
+    /// reaches it, as the proof's halt selector does.
+    pub(crate) fn static_halt_target(&self) -> Option<u64> {
+        use vos_pvm::args::{Args, decode_args};
+        (0..self.code.len())
+            .filter(|&pc| self.bitmask.get(pc) == Some(&1))
+            .find(|&pc| {
+                let Some(opcode) = Opcode::from_byte(self.code[pc]) else {
+                    return false;
+                };
+                let skip = vos_pvm::interpreter::skip_for_bitmask(&self.bitmask, pc);
+                let target = match decode_args(&self.code, pc, skip, opcode.category()) {
+                    Args::Offset { offset }
+                    | Args::RegImmOffset { offset, .. }
+                    | Args::TwoRegOffset { offset, .. } => offset,
+                    _ => return false,
+                };
+                target as u32 as u64 == vos_pvm::PVM_HALT_ADDR
+            })
+            .map(|pc| pc as u64)
+    }
+}
+
 /// Transpile an rv64em ELF into a **GP standard-program (SPI) blob** — the
 /// format `vos_pvm::spi::parse_standard_program` consumes and
 /// `vos_pvm::refine::execute_with` runs. The entry prologue places refine at

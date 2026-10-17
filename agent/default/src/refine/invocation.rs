@@ -502,23 +502,23 @@ impl<'a> Invocation<'a> {
             .iter()
             .filter_map(|limits| limits.kernel_limit(declared))
             .fold(machine.gas(), u64::min);
-        let (output, used) = kernel(
+        let run = kernel(
             &self.base.meter,
             &program,
             &call_arguments,
             gas,
             self.limits.attest,
         )?;
-        if !machine.charge(used) {
+        if !machine.charge(run.gas_used) {
             return Err(Failure::OutOfGas);
         }
-        copy_out(machine, &output, r[10], 0, r[11])?;
-        machine.set_register(7, output.len() as u64);
+        copy_out(machine, &run.output, r[10], 0, r[11])?;
+        machine.set_register(7, run.output.len() as u64);
         machine.set_register(8, 0);
         self.attests.push(Attest {
             program,
-            arguments: call_arguments,
-            output,
+            witness_input: run.witness_input,
+            output: run.output,
         });
         Ok(())
     }

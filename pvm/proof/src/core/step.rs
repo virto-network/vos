@@ -68,8 +68,20 @@ pub struct PvmStep {
     /// Whether the embedder successfully handled and acknowledged this host
     /// call. False for non-host instructions and unhandled calls.
     pub host_call_acknowledged: bool,
+    /// The bytes a served witness-input call wrote, where it wrote them;
+    /// `None` for every other step, and for a call that wrote none.
+    pub witness: Option<alloc::boxed::Box<WitnessWrite>>,
     /// Whether this step caused an exit.
     pub exit: bool,
+}
+
+/// What a witness-input call wrote: `bytes` from `address` on, at its
+/// step's timestamp. The call's count is their length.
+#[cfg(feature = "prover")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WitnessWrite {
+    pub address: u32,
+    pub bytes: alloc::vec::Vec<u8>,
 }
 
 /// A memory access record.
@@ -83,9 +95,10 @@ pub struct MemAccess {
 /// The one register write a step performed: file index + written value.
 /// A PVM instruction writes at most one register (every interpreter opcode
 /// arm is a single `registers[x] = …` assignment), so this pair is the
-/// entire register-file delta of a step — `None` when the step left the
-/// file unchanged (including a write of the value already held, which is
-/// unobservable and recorded as no write, matching [`PvmStep::reg_write`]).
+/// entire register-file delta of a step — `None` when the step wrote no
+/// register. An executed instruction that writes one records the write even
+/// when it wrote the value already held (the proof fixes each instruction's
+/// write); a conditional move that does not move records none.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RegWrite {
     pub index: u8,
@@ -138,6 +151,8 @@ pub struct CompactStep {
     /// Whether the embedder successfully handled and acknowledged this
     /// Standard-profile host call (see [`PvmStep::host_call_acknowledged`]).
     pub host_call_acknowledged: bool,
+    /// What a witness-input call wrote (see [`PvmStep::witness`]).
+    pub witness: Option<alloc::boxed::Box<WitnessWrite>>,
     /// Whether this step caused an exit.
     pub exit: bool,
 }
@@ -173,6 +188,7 @@ impl CompactStep {
             gas_charged: self.gas_charged,
             next_pc: self.next_pc,
             host_call_acknowledged: self.host_call_acknowledged,
+            witness: self.witness.clone(),
             exit: self.exit,
         }
     }
@@ -227,6 +243,7 @@ impl PvmStep {
             gas_charged: self.gas_charged,
             next_pc: self.next_pc,
             host_call_acknowledged: self.host_call_acknowledged,
+            witness: self.witness.clone(),
             exit: self.exit,
         }
     }
@@ -289,6 +306,7 @@ mod tests {
             gas_charged: u64::from(ts == 1),
             next_pc: ts as u32 * 3 + 4,
             host_call_acknowledged: ts == 2,
+            witness: None,
             exit: false,
         }
     }

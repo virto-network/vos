@@ -40,7 +40,7 @@ pub fn prove_canonical(
     prove_canonical_format(side_note, min_log_sizes, &crate::format::LEGACY_SEGMENT)
 }
 
-/// [`prove_canonical`] under `format`, at its parameters (format 24's are
+/// [`prove_canonical`] under `format`, at its parameters (format 33's are
 /// MOBILE's); [`ProvingError::FormatNotAdmitted`] on a format the registry
 /// does not admit.
 pub fn prove_canonical_format(
@@ -52,7 +52,7 @@ pub fn prove_canonical_format(
     prepare_side_note_for_verification(side_note);
     let components = crate::all_components();
     // Full set present ⇒ constant mask = all component bits set.  Built via
-    // a widening shift so COUNT == 32 (all u32 bits) doesn't overflow.
+    // a widening shift so a COUNT of 32 (all u32 bits) doesn't overflow.
     let component_mask = ((1u64 << crate::chip_idx::COUNT) - 1) as u32;
     let (proof, _) = prove_impl_with_components_overridden(
         side_note,
@@ -199,8 +199,7 @@ pub fn natural_log_sizes_for(side_note: &mut SideNote, indices: &[usize]) -> Vec
 /// [`prove_canonical`] gives all of a chain's windows an identical shape.
 /// Chips whose size is already uniform get their own size back (forcing is a
 /// no-op); varying chips get the chain-wide max, so the windows collapse onto
-/// the minimal canonical-shape set (distinct shapes remain only where content
-/// differs beyond size, e.g. fixed-base-comb call count). The floors are the
+/// one canonical shape. The floors are the
 /// observed per-window maxima for THIS trace's op pattern, not a proven
 /// bound — a deployment's drift guard + allowlist-coverage gate catch a
 /// reshaped transition. `None` when the trace is empty, `seg_steps` is zero,

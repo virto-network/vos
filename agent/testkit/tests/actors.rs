@@ -204,7 +204,7 @@ fn an_attestable_method_runs_as_its_own_kernel() {
         step.attests[0].program,
         ProgramHash::of(&kernel("ledger", "checksum"))
     );
-    assert_eq!(step.attests[0].arguments, values.encode());
+    assert_eq!(step.attests[0].witness_input, values.encode());
     assert_eq!(step.attests[0].output, expected.encode());
 }
 

@@ -443,7 +443,7 @@ pub(crate) fn add_range(set: &mut BTreeSet<u32>, ptr: u32, len: u32) {
 }
 
 /// The set of pages a segment touches: the union of all real RAM byte accesses
-/// — step reads/writes plus every precompile mem-op family — mapped to page
+/// — step reads/writes, witness-input writes and BLAKE2b mem-ops — mapped to page
 /// granularity.  This is the single source of truth the ledger's per-page
 /// boundary injection and the boundary multiproof must agree on; it enumerates
 /// exactly the address sources that [`crate::chips::memory`]'s ledger builder
@@ -458,30 +458,14 @@ pub fn touched_pages(side_note: &crate::side_note::SideNote) -> BTreeSet<u32> {
         if let Some(ref w) = step.mem_write {
             add_range(&mut pages, w.address, w.size as u32);
         }
+        if let Some(ref w) = step.witness {
+            add_range(&mut pages, w.address, w.bytes.len() as u32);
+        }
     }
     for op in &side_note.blake2b_mem_ops {
         add_range(&mut pages, op.h_ptr, op.h_bytes.len() as u32);
         add_range(&mut pages, op.m_ptr, op.m_bytes.len() as u32);
         // out_bytes overwrite the h range — same pages.
-    }
-    for op in &side_note.ristretto_mem_ops {
-        add_range(&mut pages, op.scalar_ptr, op.scalar_bytes.len() as u32);
-        add_range(&mut pages, op.point_ptr, op.point_bytes.len() as u32);
-        add_range(&mut pages, op.output_ptr, op.out_bytes.len() as u32);
-    }
-    for op in &side_note.ristretto_add_mem_ops {
-        add_range(&mut pages, op.p_ptr, op.p_bytes.len() as u32);
-        add_range(&mut pages, op.q_ptr, op.q_bytes.len() as u32);
-        add_range(&mut pages, op.output_ptr, op.out_bytes.len() as u32);
-    }
-    for op in &side_note.scalar_binop_mem_ops {
-        add_range(&mut pages, op.a_ptr, op.a_bytes.len() as u32);
-        add_range(&mut pages, op.b_ptr, op.b_bytes.len() as u32);
-        add_range(&mut pages, op.output_ptr, op.out_bytes.len() as u32);
-    }
-    for op in &side_note.scalar_reduce_wide_mem_ops {
-        add_range(&mut pages, op.wide_ptr, op.wide_bytes.len() as u32);
-        add_range(&mut pages, op.output_ptr, op.out_bytes.len() as u32);
     }
     pages
 }

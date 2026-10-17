@@ -95,9 +95,26 @@ impl Output {
     }
 }
 
-/// An attestable method's entry: its arguments' address and length, in the
-/// standard argument window, and its output.
-pub type Entry = unsafe extern "C" fn(*const u8, u64) -> Output;
+/// An attestable method's entry: its arguments' address and length, which
+/// its kernel's prologue read through the witness input, and where its
+/// io-hash goes, which the prologue leaves in φ9..φ12 at the halt; and its
+/// output.
+pub type Entry = unsafe extern "C" fn(*const u8, u64, *mut [u8; 32]) -> Output;
+
+/// An attestable method's end: its encoded `output`, leaked for the host,
+/// and its io-hash ([`vos_pvm_precompiles::compute_io_hash`]) written at
+/// `io_hash`. Its arguments are all private and it reads no root, so the
+/// public arguments and the roots are empty.
+///
+/// # Safety
+///
+/// `io_hash` must point at 32 writable bytes.
+pub unsafe fn attested(output: Vec<u8>, io_hash: *mut [u8; 32]) -> Output {
+    let hash = vos_pvm_precompiles::compute_io_hash(&[], &output, &[]);
+    // SAFETY: the caller's contract.
+    unsafe { io_hash.write(hash) };
+    Output::leak(output)
+}
 
 /// An attestable method of the actor and its entry, which `#[messages]`
 /// generates as `__vos_attest_<method>`: the root a kernel is derived from

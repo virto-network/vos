@@ -138,11 +138,11 @@ fn forge_halt_selector(
     }
     assert!(saw_non_bit, "the forged chain must require a non-bit carry");
 
-    // HALT's terminal convention keeps next_pc at pc. The side note has one
-    // real row, so its logical successor is already padding.
-    for i in 0..4 {
-        let pc = trace.original_trace[Column::Pc.offset() + i].as_slice()[row];
-        trace.original_trace[Column::NextPc.offset() + i].as_mut_slice()[row] = pc;
+    // HALT's terminal convention continues at the halt address. The side
+    // note has one real row, so its logical successor is already padding.
+    for (i, byte) in halt.into_iter().enumerate() {
+        trace.original_trace[Column::NextPc.offset() + i].as_mut_slice()[row] =
+            BaseField::from(byte as u32);
     }
 }
 

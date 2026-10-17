@@ -4,19 +4,20 @@
 //! `Blake2bChip` carries.  It reuses the shared compression arithmetic core
 //! (`add_compression_core` / `add_compression_interaction_core` / the trace
 //! fill / the schedule fill) over its OWN main `BoundaryColumn` — the shared
-//! `Column` layout minus the 1040 ECALL-binding limbs only the main chip
-//! constrains — and:
+//! `Column` layout minus the ECALL-binding columns only the main chip
+//! constrains, plus `EmitMult` — and:
 //!
 //! - carries its OWN `PreprocessedColumn` (distinct `preprocessed_prefix`):
 //!   stwo dedups preprocessed columns by id while the prover commits each
 //!   component's preprocessed trace positionally, so two active components
 //!   sharing preprocessed ids would desync — distinct prefixes are required;
-//! - replaces the dropped CPU-call binding (which is what makes IsReal
-//!   honest in the main chip) with its OWN **IsReal anchor**: without it a
-//!   prover lights up only the row-95 production and forges `h_out`;
+//! - carries the **IsReal anchor** the main chip carries too (boolean,
+//!   constant within a compression): without it a prover lights up only
+//!   the row-95 production and forges `h_out`.  It needs no tail guard: a
+//!   trailing partial block has no row 95 and produces nothing;
 //! - PRODUCES one `Blake2bCompression` tuple `(h_in, m, t, f, h_out)` per
-//!   compression at row 95.  `MemoryPageChip` / `MemoryMerkleChip` (step 5)
-//!   consume them; until then the chip is validated open-chain.
+//!   compression at row 95, which `MemoryPageChip` / `MemoryMerkleChip`
+//!   consume.
 
 #[allow(unused_imports)]
 use alloc::{vec, vec::Vec};
@@ -209,15 +210,14 @@ impl ScheduleColumns for PreprocessedColumn {
     ];
 }
 
-/// The boundary chip's own main-column set: `Column` minus the 1040
-/// ECALL-binding limbs (`HPtr`/`MPtr`/`CallTs` and the per-byte
-/// `HRdAddr`/`MRdAddr`/`HWrAddr` address columns).  Those bind guest-RAM
-/// reads/writes and the CPU ECALL step — meaningless for multiproof
-/// compressions, which hash page images and node pairs that never touch
-/// the memory ledger.  Variant order, sizes and `mask_next_row` flags
-/// mirror `Column`; see `Column`'s doc comments for per-column semantics.
-/// `EmitMult` (dead in the main chip) is live here — it carries the row-95
-/// production multiplicity.
+/// The boundary chip's own main-column set: `Column` minus the
+/// ECALL-binding columns (`HPtr`/`MPtr`/`CallTs` and the address columns of
+/// `address.rs`).  Those bind guest-RAM reads/writes and the CPU ECALL step
+/// — meaningless for multiproof compressions, which hash page images and
+/// node pairs that never touch the memory ledger.  Sizes and
+/// `mask_next_row` flags mirror `Column`; see `Column`'s doc comments for
+/// per-column semantics.  `EmitMult`, which `Column` lacks, carries the
+/// row-95 production multiplicity.
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum BoundaryColumn {
     #[size = 8]

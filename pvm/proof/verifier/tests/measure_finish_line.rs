@@ -11,14 +11,14 @@
 //! one-segment program — `prove_canonical_format` proves the whole trace as one
 //! segment).
 //!
-//! `FORMAT` names the format the segment proves under: 24 (the default), the
-//! legacy Blake2s one, or 26, the Poseidon2-M31 one; both prove on
+//! `FORMAT` names the format the segment proves under: 33 (the default), the
+//! legacy Blake2s one, or 31, the Poseidon2-M31 one; both prove on
 //! `SimdBackend`. The harness prints which it ran.
 //!
 //! Run (one measurement per process so `VmHWM` is clean):
 //!   STEPS=7    cargo test -p vos-pvm-proof-verifier --release --test measure_finish_line \
 //!                measure -- --exact --nocapture
-//!   STEPS=7 FORMAT=26 cargo test -p vos-pvm-proof-verifier --release \
+//!   STEPS=7 FORMAT=31 cargo test -p vos-pvm-proof-verifier --release \
 //!                --test measure_finish_line measure -- --exact --nocapture
 
 use std::time::Instant;

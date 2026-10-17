@@ -49,8 +49,8 @@
 //!   element propagation).
 //! - `lookups` — relation definitions for cross-chip lookups
 //!   (Range256, BitwiseAnd, MemoryAccess, RegisterMemory,
-//!   ProgramMemory, JumpTable, ProgramExecution, Blake2bState,
-//!   Blake2bCall).
+//!   ProgramMemory, JumpTable, ProgramExecution, Blake2bCall,
+//!   Blake2bCompression, MerkleNode, …).
 //! - [`trace`] — column-fill helpers + interaction-trace builder.
 //! - [`proof`] — public proof type (serializable).
 //! - `prove` / `verify` / `program_id` — top-level prover / verifier
@@ -76,7 +76,7 @@
 //!   [`segment::TraceStream`] for the chain / streaming paths.
 //! - **Prove** — [`prove`] (STANDARD) or [`prove_mobile`] (low-latency
 //!   MOBILE); [`prove_with_config`] for a custom [`PcsConfig`]; all three
-//!   under the legacy format 24. [`prove_format`] proves under any admitted
+//!   under the legacy format 33. [`prove_format`] proves under any admitted
 //!   format of the [`format`](mod@format) registry, at its parameters.
 //! - **Verify** — [`verify`] / [`verify_with_pcs_policy`] (prover-side,
 //!   with the SideNote); [`verify_chain`] for a segment chain. The
@@ -169,6 +169,8 @@ pub mod side_note;
 #[cfg(feature = "prover")]
 pub mod bench_helpers;
 #[cfg(feature = "prover")]
+pub mod kernel;
+#[cfg(feature = "prover")]
 mod program_id;
 #[cfg(feature = "prover")]
 mod prove;
@@ -225,29 +227,24 @@ pub mod chip_idx {
     pub const PROGRAM_BOUNDARY: usize = 10;
     pub const PROGRAM_MEMORY: usize = 11;
     pub const JUMP_TABLE: usize = 12;
-    pub const RANGE_MULTIPLICITY_256: usize = 13;
-    pub const BITWISE_LOOKUP: usize = 14;
-    pub const POWER_OF_TWO: usize = 15;
-    pub const POPCOUNT: usize = 16;
-    pub const BITCOUNT: usize = 17;
-    pub const BYTE_TO_BITS: usize = 18;
-    pub const MUL: usize = 19;
-    pub const BITWISE: usize = 20;
-    pub const COMPARE: usize = 21;
-    pub const DIVREM: usize = 22;
-    pub const RISTRETTO: usize = 23;
-    pub const RISTRETTO_ECALL: usize = 24;
-    pub const RISTRETTO_COMB_TABLE: usize = 25;
-    pub const RISTRETTO_FIXED_BASE_CONSUMER: usize = 26;
-    pub const RISTRETTO_COMB_ANCHOR: usize = 27;
-    pub const RISTRETTO_COMB_SCALAR_BOUNDARY: usize = 28;
-    pub const RISTRETTO_COMB_COMPRESS: usize = 29;
-    pub const RISTRETTO_COMB_COMPRESS_OUTPUT: usize = 30;
+    /// The witness input's bytes.  Before the range table: its trace-gen
+    /// counts the bytes and addresses it range-checks.
+    pub const WITNESS_INPUT: usize = 13;
+    pub const RANGE_MULTIPLICITY_256: usize = 14;
+    pub const BITWISE_LOOKUP: usize = 15;
+    pub const POWER_OF_TWO: usize = 16;
+    pub const POPCOUNT: usize = 17;
+    pub const BITCOUNT: usize = 18;
+    pub const BYTE_TO_BITS: usize = 19;
+    pub const MUL: usize = 20;
+    pub const BITWISE: usize = 21;
+    pub const COMPARE: usize = 22;
+    pub const DIVREM: usize = 23;
     /// 2^16-row byte-wide AND table.  Placed last: it is a receiver whose
     /// multiplicity counts are accumulated by the two blake2b chips during
     /// their trace-gen (idx 1/2), so it must be generated after all its
     /// consumers (BASE_COMPONENTS ordering rule).
-    pub const BITWISE_AND_BYTE: usize = 31;
+    pub const BITWISE_AND_BYTE: usize = 24;
     /// Total entries expected in `BASE_COMPONENTS`. Trailing const-time
     /// assertion in `lib.rs` checks this against the actual array length.
     pub const COUNT: usize = BITWISE_AND_BYTE + 1;
@@ -268,24 +265,17 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::ProgramBoundaryChip,
     &chips::ProgramMemoryChip, // producer-only until the CpuChip consumer is added
     &chips::JumpTableChip,     // producer of jump_table[] lookups
+    &chips::WitnessInputChip,  // OPTIONAL — a witness input's bytes, gated by their calls
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
-    &chips::PopcountChip,                    // per-byte popcount lookup table
-    &chips::BitcountChip,                    // per-byte (lz, tz) lookup table
+    &chips::PopcountChip,       // per-byte popcount lookup table
+    &chips::BitcountChip,       // per-byte (lz, tz) lookup table
     &chips::ByteToBitsChip, // per-byte 8-bit decomposition lookup table (dormant until consumers are added)
     &chips::MulChip,        // consumer of MultiplicationLookup
     &chips::BitwiseChip,    // consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
     &chips::CompareChip,    // consumer of CompareLookup, producer of Range256 lookups
     &chips::DivRemChip,     // consumer of DivRemLookup
-    &chips::RistrettoChip,  // OPTIONAL precompile, gated by activity.ristretto
-    &chips::RistrettoEcallChip, // OPTIONAL, gated by activity.ristretto_ecall
-    &chips::RistrettoCombTableChip, // OPTIONAL, gated by activity.ristretto_comb
-    &chips::RistrettoFixedBaseConsumerChip, // OPTIONAL, gated by activity.ristretto_comb
-    &chips::RistrettoCombAnchorChip, // column-shrink — OPTIONAL, gated by activity.ristretto_comb
-    &chips::RistrettoCombScalarBoundaryChip, // OPTIONAL, gated by activity.ristretto_comb
-    &chips::RistrettoCombCompressChip, // OPTIONAL, gated by activity.ristretto_comb
-    &chips::RistrettoCombCompressOutputChip, // OPTIONAL, gated by activity.ristretto_comb
     &chips::BitwiseAndByteChip, // byte-wide AND table — consumed by the two blake2b chips
 ];
 
@@ -313,6 +303,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::ProgramBoundaryChip,
     &chips::ProgramMemoryChip,
     &chips::JumpTableChip,
+    &chips::WitnessInputChip,
     &chips::RangeMultiplicity256,
     &chips::BitwiseLookupChip,
     &chips::PowerOfTwoChip,
@@ -323,14 +314,6 @@ const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
     &chips::BitwiseChip, // consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
     &chips::CompareChip, // consumer of CompareLookup, producer of Range256 lookups
     &chips::DivRemChip,  // consumer of DivRemLookup
-    &chips::RistrettoChip, // OPTIONAL precompile, mirrored in verifier-only build
-    &chips::RistrettoEcallChip, // OPTIONAL, mirrored in verifier-only build
-    &chips::RistrettoCombTableChip,
-    &chips::RistrettoFixedBaseConsumerChip,
-    &chips::RistrettoCombAnchorChip,
-    &chips::RistrettoCombScalarBoundaryChip,
-    &chips::RistrettoCombCompressChip,
-    &chips::RistrettoCombCompressOutputChip,
     &chips::BitwiseAndByteChip,
 ];
 
@@ -381,7 +364,7 @@ pub fn active_components(
 #[cfg(feature = "prover")]
 fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
     use crate::chips::cpu::classify::classify_opcode as classify;
-    use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO, is_one_of};
+    use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_WITNESS_INPUT};
     let mut a = ChipActivity::default();
     for step in &side_note.steps {
         // A precompile call counts only when served
@@ -390,18 +373,13 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
         if ecall == Some(ECALL_BLAKE2B_COMPRESS as u64) {
             a.blake2b = true;
         }
-        // Every Ristretto and scalar ECALL gates RistrettoEcallChip.
-        // Whether RistrettoChip itself is active depends on the *kind* of
-        // the recorded call: Variable scalar mults populate
-        // `ristretto_field_rows` and are handled below; FixedBasepoint
-        // calls route to the comb-method chips (21..=26) and bypass
-        // RistrettoChip, and the point-add and scalar ECALLs fire no
-        // field-op rows. We can't tell the kind from `step.imm` alone,
-        // so activate RistrettoChip only via the `ristretto_field_rows`
-        // post-ingest check; this avoids activating an empty chip when
-        // every scalar mult in the trace was FixedBase.
-        if ecall.is_some_and(|id| is_one_of(id, &ECALL_RISTRETTO)) {
-            a.ristretto_ecall = true;
+        // A witness-input call compares its count with its capacity; one
+        // that wrote bytes hands them to WitnessInputChip.
+        if ecall == Some(u64::from(ECALL_WITNESS_INPUT)) {
+            a.compare = true;
+        }
+        if step.witness.is_some() {
+            a.witness_input = true;
         }
         let f = classify(step.opcode);
         if f.is_jump_ind || f.is_load_imm_jump_ind {
@@ -444,19 +422,6 @@ fn activity_from_steps(side_note: &side_note::SideNote) -> ChipActivity {
             a.divrem = true;
         }
     }
-    // Chip-level tests that bypass the ECALL path can pre-populate
-    // ristretto_field_rows directly.
-    if !side_note.ristretto_field_rows.is_empty() {
-        a.ristretto = true;
-    }
-    // Comb-method consumer + producer chips fire
-    // when at least one fixed-basepoint scalar mult call is queued in
-    // `ristretto_comb_calls`.  In production this is populated by the
-    // ECALL routing; in chip-isolated tests the harness pushes
-    // calls directly.
-    if !side_note.ristretto_comb_calls.is_empty() {
-        a.ristretto_comb = true;
-    }
     a
 }
 
@@ -471,9 +436,7 @@ struct ChipActivity {
     bitwise: bool,
     compare: bool,
     divrem: bool,
-    ristretto: bool,
-    ristretto_ecall: bool,
-    ristretto_comb: bool,
+    witness_input: bool,
 }
 
 #[cfg(feature = "prover")]
@@ -486,20 +449,13 @@ impl ChipActivity {
         match idx {
             chip_idx::BLAKE2B => self.blake2b,
             chip_idx::JUMP_TABLE => self.jump_table,
+            chip_idx::WITNESS_INPUT => self.witness_input,
             chip_idx::POPCOUNT => self.popcount,
             chip_idx::BITCOUNT => self.bitcount,
             chip_idx::MUL => self.mul,
             chip_idx::BITWISE => self.bitwise,
             chip_idx::COMPARE => self.compare,
             chip_idx::DIVREM => self.divrem,
-            chip_idx::RISTRETTO => self.ristretto,
-            chip_idx::RISTRETTO_ECALL => self.ristretto_ecall,
-            chip_idx::RISTRETTO_COMB_TABLE
-            | chip_idx::RISTRETTO_FIXED_BASE_CONSUMER
-            | chip_idx::RISTRETTO_COMB_ANCHOR
-            | chip_idx::RISTRETTO_COMB_SCALAR_BOUNDARY
-            | chip_idx::RISTRETTO_COMB_COMPRESS
-            | chip_idx::RISTRETTO_COMB_COMPRESS_OUTPUT => self.ristretto_comb,
             _ => true,
         }
     }
@@ -631,6 +587,13 @@ pub use verify::{
 #[cfg(feature = "prover")]
 pub mod harness {
     pub use crate::framework::{MachineComponent, MachineProverComponent};
+
+    /// Every chip, in proving order: what a gate checks a forged trace
+    /// against when its refusal is a lookup's, not one chip's constraint.
+    #[cfg(feature = "debug-internals")]
+    pub fn base_components() -> &'static [&'static dyn MachineProverComponent] {
+        crate::BASE_COMPONENTS
+    }
 }
 #[cfg(feature = "prover")]
 pub use program_id::{ProgramCommitment, program_commitment_hex, program_commitment_of_proof};

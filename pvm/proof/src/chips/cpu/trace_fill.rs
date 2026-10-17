@@ -14,19 +14,17 @@
 
 #![cfg(feature = "prover")]
 
+use stwo::core::fields::m31::BaseField;
 use stwo::prover::backend::simd::m31::LOG_N_LANES;
 
-use crate::core::ecall::{
-    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
-    ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
-};
+use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_WITNESS_INPUT};
 use crate::core::step::WORD_SIZE;
 use crate::side_note::SideNote;
 use crate::trace::builder::{FinalizedTrace, TraceBuilder};
 
 use super::classify::{classify_opcode, dest_reg, uses_immediate};
 use super::columns::Column;
-use super::reg_access::step_reg_accesses;
+use super::reg_access::{access_shape, step_reg_accesses};
 
 /// Carry chain for `NextTimestamp = Timestamp + 1`: carry i is 1 iff
 /// limbs 0..=i of `ts` are all 0xff (the increment overflows through
@@ -100,24 +98,22 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         let flags = classify_opcode(step.opcode);
 
         // Source operands.  Default convention (used by all but
-        // the rotate-imm-alt swap):
+        // the ImmAlt, SetGt and Cmov-immediate swaps):
         //   ThreeReg     → (regs[ra], regs[rb])
         //   TwoRegOneImm → (regs[rb], imm)
         //   TwoReg       → (0, regs[rb])
         //   OneRegImmOffset → (regs[ra], imm)  [imm-compare branches]
         //   Other immediate-source ops → (0, imm)
         //
-        // RotR64ImmAlt / RotR32ImmAlt swap the source convention —
-        // the immediate is the rotated value, the register is the
+        // The ImmAlt shifts and rotates swap the source convention —
+        // the immediate is the shifted value, the register is the
         // shift amount.  In AIR terms: val_b ← imm, val_d ← regs[rb].
         let (mut val_b, mut val_d) = match step.opcode.category() {
             vos_pvm::instruction::InstructionCategory::ThreeReg => {
                 (step.regs_before[step.reg_a], step.regs_before[step.reg_b])
             }
-            vos_pvm::instruction::InstructionCategory::TwoRegOneImm
-                if flags.is_rotate_r_imm_alt =>
-            {
-                // Rotate-imm-alt swap.
+            vos_pvm::instruction::InstructionCategory::TwoRegOneImm if flags.is_imm_alt => {
+                // ImmAlt swap.
                 (step.imm, step.regs_before[step.reg_b])
             }
             vos_pvm::instruction::InstructionCategory::TwoRegOneImm if flags.is_set_gt => {
@@ -167,8 +163,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 // val_d = 2^((modulus − n_real) mod modulus).
                 let compl = if shift == 0 { 0 } else { modulus - shift };
                 saved_shift_amount_compl = compl as u8;
-                // reg_val_d + compl = modulus · ShiftQuotientCompl.
-                saved_shift_quotient_compl = (val_d + compl) / modulus;
+                // RegValD[0] + compl = 32·k, k's bits in ShiftQuotientCompl.
+                saved_shift_quotient_compl = ((val_d & 0xff) + compl) / 32;
                 val_d = 1u64 << compl;
                 side_note.power_of_two_counts[compl as usize] += 1;
             } else {
@@ -186,7 +182,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, val_b, Column::ValB);
         trace.fill_columns(row, val_d, Column::ValD);
 
-        let dr = dest_reg(step);
+        // A witness-input call's result is the count it writes to φ7.
+        let is_witness = step.served_ecall() == Some(u64::from(ECALL_WITNESS_INPUT));
+        let dr = if is_witness { 7 } else { dest_reg(step) };
         let result = step.regs_after[dr];
         trace.fill_columns(row, result, Column::Result);
 
@@ -439,7 +437,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             let mul_high_u64 = u64::from_le_bytes(mul_high);
             let unsigned_product_low_u64 = u64::from_le_bytes(unsigned_product_low_bytes);
             let unsigned_product_hi_u64 = u64::from_le_bytes(unsigned_product_hi_bytes);
-            side_note.mul_entries.push(crate::side_note::MulEntry {
+            let entry = crate::side_note::MulEntry {
                 val_b,
                 val_d,
                 result,
@@ -462,7 +460,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 is_mul_upper_su: flags.is_mul_upper_su,
                 is_mul_upper_ss: flags.is_mul_upper_ss,
                 is_32bit: flags.is_32bit,
-            });
+            };
+            range_bytes.extend(crate::chips::mul::range_checked_bytes(&entry));
+            side_note.mul_entries.push(entry);
         }
         // Signed lt: if signs differ, negative is smaller. If same, use unsigned compare.
         let cmp_lt_s_flag: u8 = if sign_bit_b != sign_bit_d {
@@ -473,8 +473,26 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, cmp_lt_s_flag, Column::CmpLtSFlag);
         let eq_flag: u8 = if val_b == val_d { 1 } else { 0 };
         trace.fill_columns(row, eq_flag, Column::EqFlag);
-        // Branch constraints read `val_b[i] - val_d[i]` directly, so
-        // there are no ByteEq / ByteDiffInv columns to fill.
+        // EqFlag's converse: the sum of squared byte differences and its
+        // inverse.
+        let squares: u64 = val_b_bytes
+            .iter()
+            .zip(&val_d_bytes)
+            .map(|(&b, &d)| (i64::from(b) - i64::from(d)).pow(2) as u64)
+            .sum();
+        let squares = BaseField::from(squares as u32);
+        let squares_inv = if eq_flag == 1 {
+            BaseField::from(0u32)
+        } else {
+            squares.inverse()
+        };
+        trace.fill_columns_base_field(row, &[squares], Column::EqDiffSquaresH);
+        trace.fill_columns_base_field(row, &[squares_inv], Column::EqDiffSquaresInv);
+        trace.fill_columns_base_field(
+            row,
+            &[squares * squares_inv],
+            Column::EqDiffSquaresTimesInvH,
+        );
         trace.fill_columns(row, flags.is_set_lt_u, Column::IsSetLtU);
         trace.fill_columns(row, flags.is_set_lt_s, Column::IsSetLtS);
         trace.fill_columns(row, flags.is_set_gt, Column::IsSetGt);
@@ -517,9 +535,13 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flags.is_rotate_r64, Column::IsRotateR64);
         trace.fill_columns(row, flags.is_rotate_l32, Column::IsRotateL32);
         trace.fill_columns(row, flags.is_rotate_r32, Column::IsRotateR32);
-        trace.fill_columns(row, flags.is_rotate_r_imm_alt, Column::IsRotateRImmAlt);
+        trace.fill_columns(row, flags.is_imm_alt, Column::IsImmAlt);
         trace.fill_columns(row, saved_shift_amount_compl, Column::ShiftAmountCompl);
-        trace.fill_columns(row, saved_shift_quotient_compl, Column::ShiftQuotientCompl);
+        trace.fill_columns_bytes(
+            row,
+            &bits::<4>(saved_shift_quotient_compl),
+            Column::ShiftQuotientCompl,
+        );
 
         // ── Flags ──
         trace.fill_columns(row, false, Column::IsPadding);
@@ -555,12 +577,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // Some helpers depend on val_b/val_d/cmp_lt_flag/sign_bit_b/d/
         // div_by_zero, which are computed later in this iteration.  See
         // the deferred helper-column fills near the end of the loop body.
-        // IsMulUpper is folded into the (mu_uu+mu_su+mu_ss) sum
-        // expression — no CpuChip column to fill.
+        // IsMulUpper is the (mu_uu+mu_su+mu_ss) sum — no column to fill.
         trace.fill_columns(row, flags.is_mul_upper_uu, Column::IsMulUpperUU);
         trace.fill_columns(row, flags.is_mul_upper_su, Column::IsMulUpperSU);
         trace.fill_columns(row, flags.is_mul_upper_ss, Column::IsMulUpperSS);
         trace.fill_columns(row, flags.is_div_s, Column::IsDivS);
+        trace.fill_columns(row, flags.is_shar_r, Column::IsSharR);
         // IsBitwise is folded — no column to fill.
         trace.fill_columns(row, flags.is_shift, Column::IsShift);
         // IsCompare is folded — no column to fill.
@@ -585,7 +607,36 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flags.is_br_le_s, Column::IsBrLeS);
         trace.fill_columns(row, flags.is_br_gt_s, Column::IsBrGtS);
         trace.fill_columns(row, flags.is_jump, Column::IsJump);
-        trace.fill_columns(row, step.branch_taken, Column::BranchTaken);
+        // A branch's BranchTaken is its condition, which the AIR binds. The
+        // step records whether its pc took the target, which cannot tell
+        // when the target is its fallthrough: there the condition decides.
+        let lt_or_eq = |lt: u8| lt == 1 || eq_flag == 1;
+        let condition = if flags.is_br_eq {
+            eq_flag == 1
+        } else if flags.is_br_ne {
+            eq_flag == 0
+        } else if flags.is_br_lt_u {
+            cmp_lt_flag == 1
+        } else if flags.is_br_ge_u {
+            cmp_lt_flag == 0
+        } else if flags.is_br_le_u {
+            lt_or_eq(cmp_lt_flag)
+        } else if flags.is_br_gt_u {
+            !lt_or_eq(cmp_lt_flag)
+        } else if flags.is_br_lt_s {
+            cmp_lt_s_flag == 1
+        } else if flags.is_br_ge_s {
+            cmp_lt_s_flag == 0
+        } else if flags.is_br_le_s {
+            lt_or_eq(cmp_lt_s_flag)
+        } else if flags.is_br_gt_s {
+            !lt_or_eq(cmp_lt_s_flag)
+        } else {
+            false
+        };
+        let fallthrough = step.pc + 1 + step.skip_len;
+        let branch_taken = step.branch_taken || (condition && step.branch_target == fallthrough);
+        trace.fill_columns(row, branch_taken, Column::BranchTaken);
         trace.fill_columns_bytes(row, &step.branch_target.to_le_bytes(), Column::BranchTarget);
         trace.fill_columns(row, flags.is_div_rem, Column::IsDivRem);
         trace.fill_columns(row, flags.div_rem_op, Column::DivRemOp);
@@ -604,10 +655,10 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             && step.exit
             && (val_d.wrapping_add(step.imm_y) as u32 == vos_pvm::PVM_HALT_ADDR as u32);
         trace.fill_columns(row, is_halt_load_imm_jump_ind, Column::IsHaltLoadImmJumpInd);
-        // ImmYBytes always carries low 4 bytes of step.imm_y so the
-        // prog_mem lookup balances on every row (canonical = 0 for
-        // non-LoadImmJumpInd ops).
-        trace.fill_columns_bytes(row, &(step.imm_y as u32).to_le_bytes(), Column::ImmYBytes);
+        // ImmYBytes always carries the low 5 bytes of step.imm_y so the
+        // prog_mem lookup balances on every row (canonical = 0 for ops
+        // without a second immediate).
+        trace.fill_columns_bytes(row, &step.imm_y.to_le_bytes()[..5], Column::ImmYBytes);
         // Per-byte add-with-carry chain for JumpIndAddr =
         // (val_b + step.imm) mod 2^32.  The constraint is gated by
         // IsJumpInd, so on non-JumpInd rows the columns are left at
@@ -686,244 +737,28 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         }
 
         // ── DivRem auxiliary ──
-        let mut div_quotient = [0u8; WORD_SIZE];
-        let mut div_remainder = [0u8; WORD_SIZE];
-        let mut div_mul_carry = [0u8; 16];
-        let mut div_mul_carry_hi = [0u8; 16];
-        let mut div_by_zero: u8 = 0;
-        let mut div_corr_hi = [0u8; WORD_SIZE];
-        let mut div_corr_carry = [0u8; WORD_SIZE];
-        if flags.is_div_rem {
-            let dividend = val_b;
-            let divisor = val_d;
-            if divisor == 0 {
-                div_by_zero = 1;
-                // For div-by-zero: result is special (u64::MAX for div, dividend for rem)
-                // quotient/remainder don't matter, constraint is bypassed
-            } else {
-                // Compute the canonical (q, r) the interpreter wrote.
-                // For DivS / RemS we need *signed* round-toward-zero
-                // division so the byte-level decomposition matches
-                // two's complement (e.g. -100/7 → q = -14 →
-                // q.to_le_bytes() = 0xF2,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF).
-                let (q_bytes, r_bytes): ([u8; 8], [u8; 8]) = if flags.is_div_s {
-                    if flags.is_32bit {
-                        let b32 = dividend as i32;
-                        let d32 = divisor as i32;
-                        // i32 div / rem with the standard PVM
-                        // overflow guard (INT_MIN / -1 = INT_MIN, rem = 0).
-                        let (q32, r32) = if b32 == i32::MIN && d32 == -1 {
-                            (i32::MIN, 0i32)
-                        } else {
-                            (b32 / d32, b32 % d32)
-                        };
-                        // Sign-extend div_quotient / div_remainder
-                        // to match the result column (which is the
-                        // interpreter's `q as i64 as u64`).  The 32-bit
-                        // schoolbook + sign-correction chain only
-                        // reference [0..4]; the result-quotient binding
-                        // requires [4..8] to track sign-extension too.
-                        (
-                            (q32 as i64 as u64).to_le_bytes(),
-                            (r32 as i64 as u64).to_le_bytes(),
-                        )
-                    } else {
-                        let bs = dividend as i64;
-                        let ds = divisor as i64;
-                        let (qs, rs) = if bs == i64::MIN && ds == -1 {
-                            (i64::MIN, 0i64)
-                        } else {
-                            (bs / ds, bs % ds)
-                        };
-                        ((qs as u64).to_le_bytes(), (rs as u64).to_le_bytes())
-                    }
-                } else if flags.is_shift && flags.shift_op == 2 {
-                    // Arithmetic right shift (SharR): divisor = 2^shift_k
-                    // and the PVM result is `(val_b as iN) >> shift_k`,
-                    // which sign-fills the top bits.  Unsigned division
-                    // (the else branch) zero-fills, so for negative
-                    // val_b the result and quotient diverge — breaking
-                    // the `result[i] = div_quotient[i]` binding.  Override
-                    // q here so div_quotient matches the PVM result;
-                    // schoolbook still holds because q·d + r = b mod 2^64
-                    // for r = b − q·d (and 0 ≤ r < d since d divides the
-                    // low bits exactly the same way).
-                    let shift_k = saved_shift_amount as u32;
-                    let q_arith: u64 = if flags.is_32bit {
-                        (dividend as u32 as i32).wrapping_shr(shift_k) as i64 as u64
-                    } else {
-                        (dividend as i64).wrapping_shr(shift_k) as u64
-                    };
-                    let r_arith = dividend.wrapping_sub(q_arith.wrapping_mul(divisor));
-                    (q_arith.to_le_bytes(), r_arith.to_le_bytes())
-                } else {
-                    // DivU / RemU: unsigned division.
-                    (
-                        (dividend / divisor).to_le_bytes(),
-                        (dividend % divisor).to_le_bytes(),
-                    )
-                };
-                div_quotient = q_bytes;
-                div_remainder = r_bytes;
-
-                // Carry chain for q * divisor + remainder = dividend (schoolbook)
-                let divisor_bytes = divisor.to_le_bytes();
-                let input_limbs = if flags.is_32bit { 4 } else { WORD_SIZE };
-                let out_limbs = input_limbs * 2;
-                let mut accum = [0u32; 16];
-                for i in 0..input_limbs {
-                    for j in 0..input_limbs {
-                        accum[i + j] += div_quotient[i] as u32 * divisor_bytes[j] as u32;
-                    }
-                }
-                // Add remainder to low limbs
-                for i in 0..input_limbs {
-                    accum[i] += div_remainder[i] as u32;
-                }
-                for k in 0..out_limbs.min(16).saturating_sub(1) {
-                    let carry = accum[k] >> 8;
-                    div_mul_carry[k] = carry as u8;
-                    div_mul_carry_hi[k] = (carry >> 8) as u8;
-                    accum[k + 1] += carry;
-                }
-                if out_limbs > 0 && out_limbs <= 16 {
-                    let carry = accum[out_limbs - 1] >> 8;
-                    div_mul_carry[out_limbs - 1] = carry as u8;
-                    div_mul_carry_hi[out_limbs - 1] = (carry >> 8) as u8;
-                }
-
-                // DivS sign-correction for the 64-bit schoolbook's
-                // high bytes.  See the "DivS sign correction"
-                // constraint block in add_constraints.
-                //
-                //   div_corr_hi[i] + carry_out·256 + (i==0 ? sa : 0)
-                //     = sq·d_u[i] + sd·q_u[i] + carry_in + (i==0 ? sr : 0)
-                if flags.is_div_s && !flags.is_32bit {
-                    let sa = (val_b >> 63) & 1;
-                    let sd = (val_d >> 63) & 1;
-                    let term_d = if (div_quotient[7] >> 7) & 1 == 1 {
-                        val_d
-                    } else {
-                        0
-                    };
-                    let term_q = if sd == 1 {
-                        u64::from_le_bytes(div_quotient)
-                    } else {
-                        0
-                    };
-                    let term_d_bytes = term_d.to_le_bytes();
-                    let term_q_bytes = term_q.to_le_bytes();
-                    let sr_bit = (div_remainder[7] >> 7) & 1;
-                    let mut carry: i32 = 0;
-                    for i in 0..WORD_SIZE {
-                        let extra_lhs = if i == 0 { sa as i32 } else { 0 };
-                        let extra_rhs = if i == 0 { sr_bit as i32 } else { 0 };
-                        // s = sq·d_u[i] + sd·q_u[i] + carry_in + (i==0 ? sr : 0)
-                        //     − (i==0 ? sa : 0)
-                        let s = term_d_bytes[i] as i32 + term_q_bytes[i] as i32 + carry + extra_rhs
-                            - extra_lhs;
-                        // Want: div_corr_hi[i] + carry_out·256 = s.
-                        // s ∈ [−1, 511 + carry_in]; with carry_in ≤ 2
-                        // and per-byte cap, take low byte and carry out.
-                        let s_mod = s.rem_euclid(256);
-                        div_corr_hi[i] = s_mod as u8;
-                        carry = (s - s_mod) / 256;
-                        div_corr_carry[i] = carry as u8;
-                    }
-                } else if flags.is_div_s && flags.is_32bit {
-                    // 32-bit DivS sign-correction.
-                    // Same equation as the 64-bit case but over 4
-                    // bytes; sa/sd/sq/sr derive from byte 3 (32-bit
-                    // sign), not byte 7.  DivCorrHi[4..8] and
-                    // DivCorrCarry[4..8] left at 0 — unused by both
-                    // the 32-bit schoolbook and the 32-bit chain.
-                    let sa = (val_b_bytes[3] >> 7) & 1;
-                    let sd = (val_d_bytes[3] >> 7) & 1;
-                    let sq = (div_quotient[3] >> 7) & 1;
-                    let sr = (div_remainder[3] >> 7) & 1;
-                    // val_d / div_quotient as 32-bit unsigned.
-                    let d_u32 = u32::from_le_bytes([
-                        val_d_bytes[0],
-                        val_d_bytes[1],
-                        val_d_bytes[2],
-                        val_d_bytes[3],
-                    ]);
-                    let q_u32 = u32::from_le_bytes([
-                        div_quotient[0],
-                        div_quotient[1],
-                        div_quotient[2],
-                        div_quotient[3],
-                    ]);
-                    let term_d = if sq == 1 { d_u32 } else { 0 };
-                    let term_q = if sd == 1 { q_u32 } else { 0 };
-                    let term_d_bytes = term_d.to_le_bytes();
-                    let term_q_bytes = term_q.to_le_bytes();
-                    let mut carry: i32 = 0;
-                    for i in 0..4 {
-                        let extra_lhs = if i == 0 { sa as i32 } else { 0 };
-                        let extra_rhs = if i == 0 { sr as i32 } else { 0 };
-                        let s = term_d_bytes[i] as i32 + term_q_bytes[i] as i32 + carry + extra_rhs
-                            - extra_lhs;
-                        let s_mod = s.rem_euclid(256);
-                        div_corr_hi[i] = s_mod as u8;
-                        carry = (s - s_mod) / 256;
-                        div_corr_carry[i] = carry as u8;
-                    }
-                } else if flags.is_shift && flags.shift_op == 2 {
-                    // SharR: arith-right-shift override (above) put a
-                    // sign-extended quotient into `div_quotient`.  For
-                    // negative inputs that means q ≥ 2^63 (64-bit) or
-                    // q ≥ 2^31 (32-bit), so the schoolbook `q·d + r`
-                    // overflows into the high 8 bytes (64-bit) or high
-                    // 4 bytes (32-bit).  DivRemChip's schoolbook chain
-                    // pins those overflow bytes to `div_corr_hi[i]`,
-                    // so we have to witness them — DivS's sign-
-                    // correction formula doesn't apply here (is_div_s
-                    // is 0 for SharR), so we extract the bytes
-                    // directly from the carry-propagated schoolbook
-                    // accumulator above.  `div_corr_carry` stays at
-                    // its default 0 — DivRemChip's DivS sign-
-                    // correction chain (which is the only consumer of
-                    // `div_corr_carry`) is gated on is_div_s and
-                    // doesn't fire on SharR rows.
-                    let n = if flags.is_32bit { 4 } else { WORD_SIZE };
-                    for i in 0..n {
-                        div_corr_hi[i] = (accum[i + n] & 0xFF) as u8;
-                    }
-                }
-            }
-        }
+        // DivRemChip's row: the quotient and remainder the AIR proves, and
+        // the chip's internal witness.
+        let divrem_entry = flags.is_div_rem.then(|| {
+            crate::chips::divrem::entry(
+                val_b,
+                val_d,
+                flags.is_32bit,
+                flags.is_div_s,
+                flags.is_shar_r,
+            )
+        });
+        let (div_quotient, div_remainder, div_by_zero) = match &divrem_entry {
+            Some(e) => (
+                e.div_quotient.to_le_bytes(),
+                e.div_remainder.to_le_bytes(),
+                e.div_by_zero as u8,
+            ),
+            None => ([0u8; WORD_SIZE], [0u8; WORD_SIZE], 0),
+        };
         trace.fill_columns_bytes(row, &div_quotient, Column::DivQuotient);
         trace.fill_columns_bytes(row, &div_remainder, Column::DivRemainder);
-        // DivMulCarry/DivMulCarryHi are witnessed on DivRemChip.
         trace.fill_columns(row, div_by_zero, Column::DivByZero);
-        // DivCorrHi[8] + DivCorrCarry[8] are not CpuChip columns;
-        // div_corr_hi / div_corr_carry are captured in DivRemEntry
-        // below and witnessed on DivRemChip.
-
-        // DivCmpDiff / DivCmpCarry chain witnesses live on DivRemChip.
-        // Compute them here only on divrem rows so they can flow into
-        // the DivRemEntry below; non-divrem rows skip the work entirely.
-        let mut div_cmp_diff = [0u8; WORD_SIZE];
-        let mut div_cmp_carry = [0u8; WORD_SIZE];
-        if flags.is_div_rem {
-            let mut c: u16 = 0;
-            for i in 0..WORD_SIZE {
-                let s = val_d_bytes[i] as u16 + (255u16 - div_remainder[i] as u16) + c;
-                div_cmp_diff[i] = (s & 0xFF) as u8;
-                c = s >> 8;
-                div_cmp_carry[i] = c as u8;
-            }
-            // 8 Range256 charges per divrem row (matches DivRemChip's
-            // 8 emissions on each real row of its narrower trace).
-            for &b in &div_cmp_diff {
-                range_bytes.push(b);
-            }
-        }
-
-        // DivRemEntry push is deferred until after sign_bit_q/r are
-        // computed (the sign-bit block below) so they can flow into
-        // DivRemChip via the entry.
 
         // Byte-wise zero-check for div_remainder (mirrors the val_d
         // pattern above).  Drives the sign-of-r uniqueness constraint.
@@ -941,62 +776,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns_base_field(row, &val_r_byte_inv, Column::ValRByteInv);
         trace.fill_columns_bytes(row, &val_r_partial_nz, Column::ValRPartialNZ);
 
-        // |val_d| / |div_remainder| chains and the AbsCmp comparison
-        // chain live on DivRemChip.  Compute the bytes here so the
-        // DivRemEntry can ship them; only divrem rows allocate, and on
-        // those rows the AbsCmpDiff bytes feed the Range256 multiplicity.
-        let mut abs_d = [0u8; WORD_SIZE];
-        let mut abs_d_carry = [0u8; WORD_SIZE];
-        let mut abs_r = [0u8; WORD_SIZE];
-        let mut abs_r_carry = [0u8; WORD_SIZE];
-        let mut abs_cmp_diff = [0u8; WORD_SIZE];
-        let mut abs_cmp_carry = [0u8; WORD_SIZE];
-        if flags.is_div_rem {
-            let sign_d_p30: u8 = if flags.is_32bit {
-                (val_d_bytes[3] >> 7) & 1
-            } else {
-                (val_d_bytes[7] >> 7) & 1
-            };
-            let sign_r_p30: u8 = if flags.is_32bit {
-                (div_remainder[3] >> 7) & 1
-            } else {
-                (div_remainder[7] >> 7) & 1
-            };
-            if sign_d_p30 == 0 {
-                abs_d.copy_from_slice(&val_d_bytes);
-            } else {
-                let mut c: u16 = 1; // +1 of two's complement
-                for i in 0..WORD_SIZE {
-                    let s = (255u16 - val_d_bytes[i] as u16) + c;
-                    abs_d[i] = (s & 0xFF) as u8;
-                    c = s >> 8;
-                    abs_d_carry[i] = c as u8;
-                }
-            }
-            if sign_r_p30 == 0 {
-                abs_r.copy_from_slice(&div_remainder);
-            } else {
-                let mut c: u16 = 1;
-                for i in 0..WORD_SIZE {
-                    let s = (255u16 - div_remainder[i] as u16) + c;
-                    abs_r[i] = (s & 0xFF) as u8;
-                    c = s >> 8;
-                    abs_r_carry[i] = c as u8;
-                }
-            }
-            let mut c: u16 = 0;
-            for i in 0..WORD_SIZE {
-                let s = abs_d[i] as u16 + (255u16 - abs_r[i] as u16) + c;
-                abs_cmp_diff[i] = (s & 0xFF) as u8;
-                c = s >> 8;
-                abs_cmp_carry[i] = c as u8;
-            }
-            // 8 Range256 charges per divrem row (matches DivRemChip's
-            // 8 emissions on each real row of its narrower trace).
-            for &b in &abs_cmp_diff {
-                range_bytes.push(b);
-            }
-        }
         // SignBitQ / SignBitR are pinned to bit 7 of the multiplexed
         // source byte (div_quotient[7] in 64-bit, div_quotient[3] in
         // 32-bit; same for remainder).
@@ -1020,40 +799,9 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, sign_src_q, Column::SignSrcQ);
         trace.fill_columns(row, sign_src_r, Column::SignSrcR);
 
-        // Capture this row for DivRemChip's main trace.  Pushed here
-        // (rather than just after div_quotient/div_remainder are
-        // filled) so all 4 sign bits are available — DivRemChip's
-        // sign-correction chain reads them via the lookup tuple.
-        if flags.is_div_rem {
-            let div_quotient_u64 = u64::from_le_bytes(div_quotient);
-            let div_remainder_u64 = u64::from_le_bytes(div_remainder);
-            side_note
-                .divrem_entries
-                .push(crate::side_note::DivRemEntry {
-                    val_b,
-                    val_d,
-                    div_quotient: div_quotient_u64,
-                    div_remainder: div_remainder_u64,
-                    div_corr_hi,
-                    div_corr_carry,
-                    div_mul_carry,
-                    div_mul_carry_hi,
-                    div_by_zero: div_by_zero != 0,
-                    is_32bit: flags.is_32bit,
-                    is_div_s: flags.is_div_s,
-                    div_cmp_diff,
-                    div_cmp_carry,
-                    sign_bit_b,
-                    sign_bit_d,
-                    sign_bit_q,
-                    sign_bit_r,
-                    abs_d,
-                    abs_d_carry,
-                    abs_r,
-                    abs_r_carry,
-                    abs_cmp_diff,
-                    abs_cmp_carry,
-                });
+        if let Some(entry) = divrem_entry {
+            range_bytes.extend(crate::chips::divrem::range_checked_bytes(&entry));
+            side_note.divrem_entries.push(entry);
         }
 
         // Hi nibbles + BitwiseLookupChip charges for the 8 sign-bit
@@ -1316,17 +1064,45 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         let ecall = step.served_ecall();
         let is_blake_ecall = ecall == Some(ECALL_BLAKE2B_COMPRESS as u64);
         trace.fill_columns(row, is_blake_ecall, Column::IsBlakeEcall);
-        // Ristretto ECALL gates: one boolean per id.
-        // Same imm-match shape as IsBlakeEcall; the operand pointers reuse the
-        // Phi10/Phi11/Phi12 slots (= regs_before[7,8,9]) filled below.
-        for (id, column) in [
-            (ECALL_RISTRETTO_SCALAR_MULT, Column::Is110Ecall),
-            (ECALL_RISTRETTO_POINT_ADD, Column::Is111Ecall),
-            (ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, Column::Is112Ecall),
-            (ECALL_SCALAR_MUL_MOD_L, Column::Is113Ecall),
-            (ECALL_SCALAR_ADD_MOD_L, Column::Is114Ecall),
-        ] {
-            trace.fill_columns(row, ecall == Some(u64::from(id)), column);
+        // Witness input: its selector, whether its count is non-zero with
+        // the count's inverse, and the comparison count ≤ φ8 CompareChip
+        // proves.
+        trace.fill_columns(row, is_witness, Column::IsWitnessEcall);
+        if is_witness {
+            use stwo::core::fields::m31::BaseField;
+            let count = step.regs_after[7];
+            trace.fill_columns(row, count != 0, Column::WitnessNonEmpty);
+            if count != 0 {
+                let inverse = BaseField::from(count as u32).inverse();
+                trace.fill_columns_base_field(row, &[inverse], Column::WitnessCountInv);
+                trace.fill_columns_base_field(
+                    row,
+                    &[BaseField::from(1u32)],
+                    Column::WitnessCountTimesInvH,
+                );
+            }
+            let capacity = step.regs_before[8];
+            let (capacity_bytes, count_bytes) = (capacity.to_le_bytes(), count.to_le_bytes());
+            let mut cmp_sub_result = [0u8; WORD_SIZE];
+            let mut cmp_carry = [0u8; WORD_SIZE];
+            let mut carry: u16 = 1;
+            for i in 0..WORD_SIZE {
+                let sum = capacity_bytes[i] as u16 + (count_bytes[i] ^ 0xFF) as u16 + carry;
+                cmp_sub_result[i] = (sum & 0xFF) as u8;
+                cmp_carry[i] = (sum >> 8) as u8;
+                carry = cmp_carry[i] as u16;
+            }
+            // CompareChip range-checks its subtraction's bytes.
+            range_bytes.extend_from_slice(&cmp_sub_result);
+            side_note
+                .compare_entries
+                .push(crate::side_note::CompareEntry {
+                    val_b: capacity,
+                    val_d: count,
+                    cmp_lt_flag: 1 - cmp_carry[WORD_SIZE - 1],
+                    cmp_sub_result,
+                    cmp_carry,
+                });
         }
         // Phi10 slot ← h_ptr (a0 = x10 = PVM φ[7]).
         trace.fill_columns(row, step.regs_before[7], Column::Phi10);
@@ -1337,68 +1113,49 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         // Phi7 slot ← f_flag (a3 = x13 = PVM φ[10]).
         let phi7_u64 = step.regs_before[10];
         trace.fill_columns(row, phi7_u64, Column::Phi7);
-        // The `Phi7` column holds the M31 field-reduction of this u64, and the
-        // boolean-identity constraints — `(1 − Phi7Bool) · Phi7 = 0` and
-        // `Phi7Bool · (Phi7 · Phi7Inv − 1) = 0` (mod.rs) — operate
-        // on that *field* value. So `Phi7Bool` / `Phi7Inv` MUST be derived
-        // from the reduced field element, NOT the raw u64: a nonzero u64 that
-        // is ≡ 0 mod M31 (a nonzero multiple of 2³¹−1, e.g. 0x7FFF_FFFF in
-        // x13 on a non-ECALL row) reduces to the zero field element, so a
-        // u64-based `Phi7Bool = 1` leaves `Phi7·Phi7Inv = 0 ≠ 1` and makes
-        // the gadget unsatisfiable. (The sole real consumer, blake2b's
-        // `f_flag`, is 0/1, where field == u64 — this only corrects the
-        // otherwise-unconstrained x13 values on non-blake2b rows.)
-        const M31_P: u64 = (1u64 << 31) - 1;
-        let phi7_field: u64 = {
-            let mut combined: u64 = 0;
-            let mut pow: u64 = 1;
-            for b in phi7_u64.to_le_bytes() {
-                combined = (combined + (b as u64) * pow) % M31_P;
-                pow = (pow * 256) % M31_P;
-            }
-            combined
-        };
-        let phi7_bool: u8 = if phi7_field != 0 { 1 } else { 0 };
+        // Phi7 is non-zero exactly when its bytes' sum is: at most 2040,
+        // it is its own field value, so its inverse witnesses it.
+        let phi7_sum = BaseField::from(
+            phi7_u64
+                .to_le_bytes()
+                .iter()
+                .map(|&b| u32::from(b))
+                .sum::<u32>(),
+        );
+        let phi7_bool: u8 = (phi7_u64 != 0).into();
         trace.fill_columns(row, phi7_bool, Column::Phi7Bool);
-        // Phi7Inv = field inverse of the reduced value (0 when it is 0).
-        // Fermat's little theorem: inverse = v^(p-2) mod p.
-        let phi7_inv_u64: u64 = if phi7_field != 0 {
-            let mut result: u64 = 1;
-            let mut base = phi7_field;
-            let mut exp = M31_P - 2;
-            while exp > 0 {
-                if exp & 1 == 1 {
-                    result = (result * base) % M31_P;
-                }
-                base = (base * base) % M31_P;
-                exp >>= 1;
-            }
-            result
+        let phi7_inv = if phi7_u64 != 0 {
+            phi7_sum.inverse()
         } else {
-            0
+            BaseField::from(0u32)
         };
-        trace.fill_columns(row, phi7_inv_u64, Column::Phi7Inv);
+        trace.fill_columns_base_field(row, &[phi7_inv], Column::Phi7Inv);
 
         // ── Register-memory producer descriptors ──
         let accesses = step_reg_accesses(step);
+        // The indices are the instruction's on every row, whether or not
+        // the access is made.
+        let shape = access_shape(step.opcode);
         trace.fill_columns(row, accesses.val_b_read.is_some(), Column::ValBIsReg);
-        trace.fill_columns(
-            row,
-            accesses.val_b_read.map(|(a, _)| a).unwrap_or(0),
-            Column::ValBRegIdx,
-        );
+        trace.fill_columns(row, shape.val_b_from_a, Column::ValBFromA);
+        let val_b_reg = if shape.val_b_from_a {
+            step.reg_a
+        } else {
+            step.reg_b
+        };
+        trace.fill_columns(row, val_b_reg as u8, Column::ValBRegIdx);
         trace.fill_columns(row, accesses.val_d_read.is_some(), Column::ValDIsReg);
-        trace.fill_columns(
-            row,
-            accesses.val_d_read.map(|(a, _)| a).unwrap_or(0),
-            Column::ValDRegIdx,
-        );
+        trace.fill_columns(row, step.reg_b as u8, Column::ValDRegIdx);
         trace.fill_columns(row, accesses.result_write.is_some(), Column::ResultIsReg);
-        trace.fill_columns(
-            row,
-            accesses.result_write.map(|(a, _)| a).unwrap_or(0),
-            Column::ResultRegIdx,
-        );
+        trace.fill_columns(row, shape.result_to_d, Column::ResultToD);
+        let result_reg = if is_witness {
+            7
+        } else if shape.result_to_d {
+            step.reg_d
+        } else {
+            step.reg_a
+        };
+        trace.fill_columns(row, result_reg as u8, Column::ResultRegIdx);
 
         // ── Deferred helper-column fills ──
         // All inputs (val_b, val_d, sign_bit_b, sign_bit_d, cmp_lt_flag,
@@ -1419,8 +1176,14 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, is_compare_b && vd_zero_b, Column::IsCmpVdzH);
             trace.fill_columns(row, flags.is_cmov_iz && vd_zero_b, Column::IsCmovIzVdzH);
             trace.fill_columns(row, flags.is_cmov_nz && !vd_zero_b, Column::IsCmovNzNotVdzH);
-            // CmpLtValB/D body helpers — byte-wise products.
-            let cmp_lt_u8: u8 = if cmp_lt_flag != 0 { 1 } else { 0 };
+            // CmpLtValB/D body helpers — byte-wise products with the
+            // min/max's less-than: signed on MinS/MaxS rows.
+            let cmp_lt_u8: u8 = if flags.is_min_s || flags.is_max_s {
+                cmp_lt_s_flag
+            } else {
+                cmp_lt_flag
+            };
+            trace.fill_columns(row, cmp_lt_u8, Column::MinMaxLtFlag);
             let mut cmp_lt_vb = [0u8; 8];
             let mut cmp_lt_vd = [0u8; 8];
             for i in 0..8 {
@@ -1508,6 +1271,14 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                     (dbz_active_v * gate_rem_v).rem_euclid(stwo::core::fields::m31::P),
                 )],
                 Column::DbzActiveRemH,
+            );
+            let width_64_v = !flags.is_32bit as u32;
+            trace.fill_columns_base_field(
+                row,
+                &[BaseField::from(
+                    (dbz_active_v * gate_rem_v * width_64_v).rem_euclid(stwo::core::fields::m31::P),
+                )],
+                Column::DbzActiveRem64H,
             );
 
             // ── Partial-NZ (MSB direction) times-indicator helpers ──
@@ -1623,7 +1394,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             trace.fill_columns(row, flags.is_lzb && flags.is_32bit, Column::IsLzb32H);
 
             // ── Branch / sequential PC selectors ──
-            let bt = step.branch_taken;
+            let bt = branch_taken;
             let eq_b = eq_flag != 0;
             let is_branch_b = flags.is_br_eq
                 || flags.is_br_ne
@@ -1635,8 +1406,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
                 || flags.is_br_ge_s
                 || flags.is_br_le_s
                 || flags.is_br_gt_s;
-            trace.fill_columns(row, flags.is_br_eq && bt, Column::IsBrEqTakenH);
-            trace.fill_columns(row, flags.is_br_ne && !bt, Column::IsBrNeNotTakenH);
             trace.fill_columns(
                 row,
                 is_compare_b && eq_b || is_branch_b && eq_b,
@@ -1661,25 +1430,22 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         };
         trace.fill_columns(row, is_truncated, Column::IsTruncated);
 
-        // Raw register value behind ValD + the shift quotient.
-        let reg_val_d_u64 = accesses.val_d_read.map(|(_, v)| v).unwrap_or(0);
+        // ValD's source, its register or the immediate, and the shift
+        // amount's quotient: RegValD[0] = ShiftAmount + 32·k.
+        let reg_val_d_u64 = accesses.val_d_read.map_or(step.imm, |(_, v)| v);
         trace.fill_columns(row, reg_val_d_u64, Column::RegValD);
-        let shift_q: u64 = if (flags.is_shift && flags.shift_op <= 2)
-            || flags.is_rotate_l64
-            || flags.is_rotate_r64
-            || flags.is_rotate_l32
-            || flags.is_rotate_r32
-        {
-            let modulus = if flags.is_32bit { 32u64 } else { 64 };
-            reg_val_d_u64 / modulus
+        let shift_q = if is_shift_constrained {
+            ((reg_val_d_u64 & 0xff) - u64::from(shift_amount)) / 32
         } else {
             0
         };
-        trace.fill_columns(row, shift_q, Column::ShiftQuotient);
+        trace.fill_columns_bytes(row, &bits::<3>(shift_q), Column::ShiftQuotient);
 
         for &b in &result_bytes {
             range_bytes.push(b);
         }
+        // The next timestamp's limbs, bytes.
+        range_bytes.extend_from_slice(&(step.timestamp + 1).to_le_bytes());
         // Range-check cmp_sub_result bytes for carry chain soundness
         if flags.is_compare || flags.is_branch {
             for &b in &cmp_sub_result {
@@ -1703,8 +1469,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, flag_bytes[3], Column::FlagByte3);
         trace.fill_columns(row, flag_bytes[4], Column::FlagByte4);
         trace.fill_columns(row, flag_bytes[5], Column::FlagByte5);
-        // 6 byte-to-bits emissions per real row, one per packed byte.
-        for &fb in &flag_bytes {
+        trace.fill_columns(row, flag_bytes[6], Column::FlagByte6);
+        trace.fill_columns(row, flag_bytes[7], Column::FlagByte7);
+        trace.fill_columns(row, flag_bytes[8], Column::FlagByte8);
+        trace.fill_columns(row, flag_bytes[9], Column::FlagByte9);
+        // 6 byte-to-bits emissions per real row, one per byte 0..5.
+        for &fb in &flag_bytes[..6] {
             side_note.byte_to_bits_counts[fb as usize] += 1;
         }
 
@@ -1740,48 +1510,37 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             val_b_is_reg_b && is_truncated_b,
             Column::ValBIsRegTruncH,
         );
-        trace.fill_columns(row, val_d_is_reg_b, Column::ValDIsRegH);
-        trace.fill_columns(row, val_d_is_reg_b && !is_shift_c_b, Column::NonShiftGateH);
+        trace.fill_columns(row, !val_d_is_reg_b, Column::ValDIsImmH);
+        trace.fill_columns(row, !is_shift_c_b, Column::NonShiftGateH);
         trace.fill_columns(
             row,
-            val_d_is_reg_b && !is_shift_c_b && !is_truncated_b,
+            !is_shift_c_b && !is_truncated_b,
             Column::NonShiftGateNotTruncH,
         );
         trace.fill_columns(
             row,
-            val_d_is_reg_b && !is_shift_c_b && is_truncated_b,
+            !is_shift_c_b && is_truncated_b,
             Column::NonShiftGateTruncH,
         );
-        trace.fill_columns(
-            row,
-            val_d_is_reg_b && is_shift_c_b,
-            Column::ValDIsRegShiftCH,
-        );
+        trace.fill_columns(row, is_shift_c_b, Column::RealShiftCH);
         trace.fill_columns(row, real_b && is_rot_r_either_b, Column::IsRotateRGateH);
         // Phi7 helpers.
         trace.fill_columns(row, real_b && !phi7_bool_b, Column::RealNotPhi7BoolH);
         trace.fill_columns(row, real_b && phi7_bool_b, Column::RealPhi7BoolH);
-        // Phi7TimesInvH = Phi7 (u64) · Phi7Inv (u64) reduced mod P.
-        // For Phi7 = 0 → both 0 → 0.  For Phi7 ≠ 0 → product = 1 (mod P).
-        // Compute via u128 to dodge overflow.
-        let phi7_field_u32 = (phi7_u64 % stwo::core::fields::m31::P as u64) as u32;
-        let phi7_inv_field_u32 = phi7_inv_u64 as u32;
-        let prod =
-            (phi7_field_u32 as u64 * phi7_inv_field_u32 as u64) % stwo::core::fields::m31::P as u64;
-        use stwo::core::fields::m31::BaseField;
-        trace.fill_columns_base_field(row, &[BaseField::from(prod as u32)], Column::Phi7TimesInvH);
+        // Phi7TimesInvH = (Σ Phi7 bytes) · Phi7Inv: 0 or 1.
+        trace.fill_columns_base_field(row, &[phi7_sum * phi7_inv], Column::Phi7TimesInvH);
         let _ = (val_b_is_reg_b, val_d_is_reg_b, result_is_reg_b);
 
         // Additional degree-3 selector patterns in CpuChip.
         trace.fill_columns(
             row,
-            flags.is_rotate_r_imm_alt && !is_truncated_b,
-            Column::IsRotRImmAltNotTruncH,
+            flags.is_imm_alt && !is_truncated_b,
+            Column::IsImmAltNotTruncH,
         );
         trace.fill_columns(
             row,
-            flags.is_rotate_r_imm_alt && is_truncated_b,
-            Column::IsRotRImmAltTruncH,
+            flags.is_imm_alt && is_truncated_b,
+            Column::IsImmAltTruncH,
         );
         trace.fill_columns(
             row,
@@ -1886,7 +1645,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             ("Real32bitH", Column::Real32bitH),
             ("ValBIsRegH", Column::ValBIsRegH),
             ("ValBIsRegNotTruncH", Column::ValBIsRegNotTruncH),
-            ("ValDIsRegH", Column::ValDIsRegH),
+            ("ValDIsImmH", Column::ValDIsImmH),
             ("NonShiftGateH", Column::NonShiftGateH),
             ("NonShiftGateNotTruncH", Column::NonShiftGateNotTruncH),
             ("RealNotPhi7BoolH", Column::RealNotPhi7BoolH),
@@ -1923,6 +1682,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             ("DbzActiveH", Column::DbzActiveH),
             ("DbzActiveQuotH", Column::DbzActiveQuotH),
             ("DbzActiveRemH", Column::DbzActiveRemH),
+            ("DbzActiveRem64H", Column::DbzActiveRem64H),
             ("CmpLtValBH", Column::CmpLtValBH),
             ("CmpLtValDH", Column::CmpLtValDH),
             ("IsBranchTakenH", Column::IsBranchTakenH),
@@ -1933,8 +1693,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
             ("MemByteActiveMonoH", Column::MemByteActiveMonoH),
             ("MemAddrCarry", Column::MemAddrCarry),
             ("IsLoadLocalNotActiveH", Column::IsLoadLocalNotActiveH),
-            ("IsRotRImmAltNotTruncH", Column::IsRotRImmAltNotTruncH),
-            ("IsRotRImmAltTruncH", Column::IsRotRImmAltTruncH),
+            ("IsImmAltNotTruncH", Column::IsImmAltNotTruncH),
+            ("IsImmAltTruncH", Column::IsImmAltTruncH),
             ("Is32ShiftCH", Column::Is32ShiftCH),
             ("ValDPartialNZMsb", Column::ValDPartialNZMsb),
             ("ValDPartialNZMsbLo", Column::ValDPartialNZMsbLo),
@@ -1993,6 +1753,8 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
         trace.fill_columns(row, ts, Column::Timestamp);
         trace.fill_columns(row, ts + 1, Column::NextTimestamp);
         fill_ts_carry(&mut trace, row, ts);
+        // Its six zero flag bytes, looked up as every row's are.
+        side_note.byte_to_bits_counts[0] += 6;
         // GateDivH = (DivRemOp - 2)·(DivRemOp - 3).  Constraint is
         // unconditional (no is_real gate); on padding rows DivRemOp = 0,
         // so GateDivH must be filled with (0 - 2)·(0 - 3) = 6.  Other
@@ -2006,4 +1768,10 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote) -> FinalizedTrace {
     }
 
     trace.finalize_bit_reversed()
+}
+
+/// The low `N` bits of `value`, least significant first.
+fn bits<const N: usize>(value: u64) -> [u8; N] {
+    debug_assert!(value >> N == 0, "{value} exceeds {N} bits");
+    core::array::from_fn(|i| ((value >> i) & 1) as u8)
 }

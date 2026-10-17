@@ -16,6 +16,17 @@
 //! `< 2^DEPTH`, the one load-bearing index range-check — design §1) held
 //! constant across the page's 32 rows; ledger byte addresses are degree-1 in
 //! it (`addr = idx·4096 + block·128 + cell`).
+//!
+//! A page's permission: the program's layout is four regions of pages,
+//! preprocessed constants, so part of its identity — two readable (the
+//! read-only data, the argument window), two writable (the read-write data
+//! with its heap, the stack). A row selects the region its page lies in
+//! and proves `first ≤ page < end` by two 20-bit decompositions; selecting
+//! none, the page is unmapped, which needs no proof since it only forbids.
+//! The row's ts=0 writes carry the permission, `0` unmapped, `1` readable,
+//! `2` writable, in their tuple's last field as `2·permission` (every other
+//! producer's tuples carry 0 there, the closing reads 1), and `MemoryChip`
+//! holds every access of the address to it.
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -57,6 +68,95 @@ pub struct MemoryPageChip;
 const BLOCK_BYTES: usize = 128;
 const BLOCKS_PER_PAGE: usize = 32;
 
+/// A layout's regions: the first [`FIRST_WRITABLE`] readable, the rest
+/// writable.
+pub const REGIONS: usize = 4;
+pub const FIRST_WRITABLE: usize = 2;
+/// The bits of a page index, and of a page's distance to its region's ends.
+#[cfg(feature = "prover")]
+const PAGE_BITS: usize = DEPTH as usize;
+
+/// The pages a program may touch, and how: what MemoryPageChip's
+/// preprocessed region columns hold, and so part of the program's
+/// identity. Four regions of whole pages: the read-only data and the
+/// argument window, readable; the read-write data with its heap and the
+/// stack, writable. Every other page is unmapped.
+#[cfg(feature = "prover")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryLayout {
+    pub regions: [PageRange; REGIONS],
+}
+
+/// The pages `[first, end)`.
+#[cfg(feature = "prover")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PageRange {
+    pub first: u32,
+    pub end: u32,
+}
+
+#[cfg(feature = "prover")]
+impl MemoryLayout {
+    /// Every page writable: a machine with no layout, as a flat test
+    /// memory is.
+    pub const fn writable() -> Self {
+        let none = PageRange { first: 0, end: 0 };
+        Self {
+            regions: [
+                none,
+                none,
+                PageRange {
+                    first: 0,
+                    end: 1 << PAGE_BITS,
+                },
+                none,
+            ],
+        }
+    }
+
+    /// A standard program's layout, as `derive` lays a kernel out: its
+    /// read-only data and argument window readable, its read-write data
+    /// with its heap and its stack writable.
+    pub fn standard(layout: &vos_pvm::spi::StandardLayout<'_>) -> Self {
+        let page = u64::from(vos_pvm::PVM_PAGE_SIZE);
+        let pages = |region: vos_pvm::spi::SpiRegion| PageRange {
+            first: (region.base / page) as u32,
+            end: ((region.base + region.size) / page) as u32,
+        };
+        Self {
+            regions: [
+                pages(layout.ro),
+                pages(layout.args),
+                pages(layout.rw),
+                pages(layout.stack),
+            ],
+        }
+    }
+
+    /// The region `page` lies in, if any.
+    pub fn region_of(&self, page: u32) -> Option<usize> {
+        self.regions
+            .iter()
+            .position(|range| range.first <= page && page < range.end)
+    }
+
+    /// `page`'s permission: 0 unmapped, 1 readable, 2 writable.
+    pub fn permission(&self, page: u32) -> u8 {
+        match self.region_of(page) {
+            None => 0,
+            Some(region) if region < FIRST_WRITABLE => 1,
+            Some(_) => 2,
+        }
+    }
+}
+
+#[cfg(feature = "prover")]
+impl Default for MemoryLayout {
+    fn default() -> Self {
+        Self::writable()
+    }
+}
+
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
     /// Entering-image bytes of this block (leaf-compression message AND the
@@ -92,8 +192,11 @@ pub enum Column {
     #[size = 20]
     #[mask_next_row]
     IdxBits,
-    /// 1 on real rows, 0 on padding.
+    /// 1 on real rows, 0 on padding; constant across a page's 32 rows
+    /// (`#[mask_next_row]` replication), so every real page produces its
+    /// leaf from block 0's `h_in` on.
     #[size = 1]
+    #[mask_next_row]
     IsReal,
     /// BOUND helper `(1 − IsLastBlock) · IsReal`: gates the leaf chain
     /// continuity + page-index replication (degree-1 so they stay degree 2).
@@ -105,6 +208,22 @@ pub enum Column {
     /// BOUND helper `IsLastBlock · IsReal`: gates the leaf `MerkleNode` produce.
     #[size = 1]
     LastBlockGateH,
+    /// 1 on the region the page lies in, at most one: the page's
+    /// permission, unmapped when none.
+    #[size = 4]
+    RegionSelect,
+    /// The selected region's first page, `Σ RegionSelect·RegionFirst`.
+    #[size = 1]
+    RegionFirstH,
+    /// The selected region's end page, `Σ RegionSelect·RegionEnd`.
+    #[size = 1]
+    RegionEndH,
+    /// `page − first` on a selected region, as 20 bits: non-negative.
+    #[size = 20]
+    FromFirstBits,
+    /// `end − 1 − page` on a selected region, as 20 bits: non-negative.
+    #[size = 20]
+    ToEndBits,
 }
 
 #[derive(Debug, Copy, Clone, PreprocessedAirColumn)]
@@ -129,6 +248,12 @@ pub enum PreprocessedColumn {
     /// `f` flag of this block's leaf compression (`(block == 31)`).
     #[size = 1]
     FBlock,
+    /// The layout's regions' first pages, constant on every row.
+    #[size = 4]
+    RegionFirst,
+    /// The layout's regions' end pages (exclusive), constant on every row.
+    #[size = 4]
+    RegionEnd,
 }
 
 impl BuiltInComponent for MemoryPageChip {
@@ -166,6 +291,7 @@ impl BuiltInComponent for MemoryPageChip {
         let idx_bits = crate::trace::trace_eval!(trace_eval, Column::IdxBits);
         let idx_bits_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IdxBits);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+        let is_real_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsReal);
         let chain_gate = crate::trace::trace_eval!(trace_eval, Column::ChainGateH);
         let block0_gate = crate::trace::trace_eval!(trace_eval, Column::Block0GateH);
         let last_gate = crate::trace::trace_eval!(trace_eval, Column::LastBlockGateH);
@@ -201,6 +327,12 @@ impl BuiltInComponent for MemoryPageChip {
         );
         eval.add_constraint(block0_gate[0].clone() - is_block0[0].clone() * is_real[0].clone());
         eval.add_constraint(last_gate[0].clone() - is_last_block[0].clone() * is_real[0].clone());
+
+        // ── Realness replication within a page (degree 2) ─────────
+        eval.add_constraint(
+            (one.clone() - is_last_block[0].clone())
+                * (is_real_next[0].clone() - is_real[0].clone()),
+        );
 
         // ── Page-index replication within a page (degree 2) ───────
         for k in 0..20 {
@@ -250,8 +382,64 @@ impl BuiltInComponent for MemoryPageChip {
             pow *= two.clone();
         }
 
+        // ── The page's permission ─────────────────────────────────
+        // At most one region selected; on it, `first ≤ page < end` as two
+        // non-negative 20-bit distances (the page and the bounds lie below
+        // 2^20, so a negative distance, near p, has no decomposition).
+        let select = crate::trace::trace_eval!(trace_eval, Column::RegionSelect);
+        let first_h = crate::trace::trace_eval!(trace_eval, Column::RegionFirstH);
+        let end_h = crate::trace::trace_eval!(trace_eval, Column::RegionEndH);
+        let from_first = crate::trace::trace_eval!(trace_eval, Column::FromFirstBits);
+        let to_end = crate::trace::trace_eval!(trace_eval, Column::ToEndBits);
+        let region_first =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RegionFirst);
+        let region_end =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::RegionEnd);
+        let mut selected = E::F::zero();
+        let mut first = E::F::zero();
+        let mut end = E::F::zero();
+        let mut readable = E::F::zero();
+        let mut writable = E::F::zero();
+        for k in 0..REGIONS {
+            eval.add_constraint(select[k].clone() * (select[k].clone() - one.clone()));
+            selected += select[k].clone();
+            first += select[k].clone() * region_first[k].clone();
+            end += select[k].clone() * region_end[k].clone();
+            if k < FIRST_WRITABLE {
+                readable += select[k].clone();
+            } else {
+                writable += select[k].clone();
+            }
+        }
+        eval.add_constraint(selected.clone() * (selected.clone() - one.clone()));
+        eval.add_constraint(first_h[0].clone() - first);
+        eval.add_constraint(end_h[0].clone() - end);
+        for bit in from_first.iter().chain(&to_end) {
+            eval.add_constraint(bit.clone() * (bit.clone() - one.clone()));
+        }
+        let bits_value = |bits: &[E::F]| -> E::F {
+            let mut value = E::F::zero();
+            let mut weight = E::F::one();
+            for bit in bits {
+                value += bit.clone() * weight.clone();
+                weight *= two.clone();
+            }
+            value
+        };
+        eval.add_constraint(
+            bits_value(&from_first) - (selected.clone() * idx_value.clone() - first_h[0].clone()),
+        );
+        eval.add_constraint(
+            bits_value(&to_end)
+                - (end_h[0].clone() - selected.clone() - selected * idx_value.clone()),
+        );
+        // The ts=0 writes' last field: 2·permission, the permission 0
+        // unmapped, 1 readable, 2 writable.
+        let permission_field = two.clone() * (readable + writable.clone() + writable);
+
         // ── Emissions (fixed order; finalize_logup_in_pairs) ──────
-        // 1) 128 ts=0 boundary writes: (addr, before, 0, write=1, closing=0).
+        // 1) 128 ts=0 boundary writes: (addr, before, 0, write=1,
+        //    2·permission).
         for i in 0..BLOCK_BYTES {
             let mut tuple: Vec<E::F> = Vec::with_capacity(15);
             tuple.push(addr0_base.clone() + cst(i as u8));
@@ -263,7 +451,7 @@ impl BuiltInComponent for MemoryPageChip {
                 tuple.push(E::F::zero()); // ts = 0
             }
             tuple.push(one.clone()); // is_write = 1
-            tuple.push(E::F::zero()); // is_closing = 0
+            tuple.push(permission_field.clone()); // not closing: 2·permission
             eval.add_to_relation(RelationEntry::new(
                 mem_lookup,
                 is_real[0].clone().into(),
@@ -344,9 +532,14 @@ impl BuiltInComponent for MemoryPageChip {
 impl BuiltInProverComponent for MemoryPageChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+    fn generate_preprocessed_trace(&self, log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
+        let regions = side_note.memory_layout.regions;
+        let firsts = regions.map(|range| BaseField::from(range.first));
+        let ends = regions.map(|range| BaseField::from(range.end));
         for row in 0..trace.num_rows() {
+            trace.fill_columns_base_field(row, &firsts, PreprocessedColumn::RegionFirst);
+            trace.fill_columns_base_field(row, &ends, PreprocessedColumn::RegionEnd);
             let block = row % BLOCKS_PER_PAGE;
             trace.fill_columns(row, block == 0, PreprocessedColumn::IsBlock0);
             trace.fill_columns(
@@ -399,6 +592,21 @@ impl BuiltInProverComponent for MemoryPageChip {
             let outs_a = leaf_block_outputs(after_arr);
             let idx_bits: [BaseField; 20] =
                 core::array::from_fn(|k| BaseField::from((page.page_idx >> k) & 1));
+            // Its region, if any: the selector, the bounds, and the two
+            // distances inside them.
+            let layout = &side_note.memory_layout;
+            let region = layout.region_of(page.page_idx);
+            let select: [BaseField; REGIONS] =
+                core::array::from_fn(|k| BaseField::from(u32::from(region == Some(k))));
+            let (first, end) =
+                region.map_or((0, 0), |k| (layout.regions[k].first, layout.regions[k].end));
+            let (from_first, to_end) = match region {
+                Some(_) => (page.page_idx - first, end - 1 - page.page_idx),
+                None => (0, 0),
+            };
+            let bits = |value: u32| -> [BaseField; PAGE_BITS] {
+                core::array::from_fn(|k| BaseField::from((value >> k) & 1))
+            };
 
             for block in 0..BLOCKS_PER_PAGE {
                 let row = pi * BLOCKS_PER_PAGE + block;
@@ -427,6 +635,11 @@ impl BuiltInProverComponent for MemoryPageChip {
                 trace.fill_columns(row, block != BLOCKS_PER_PAGE - 1, Column::ChainGateH);
                 trace.fill_columns(row, block == 0, Column::Block0GateH);
                 trace.fill_columns(row, block == BLOCKS_PER_PAGE - 1, Column::LastBlockGateH);
+                trace.fill_columns_base_field(row, &select, Column::RegionSelect);
+                trace.fill_columns(row, BaseField::from(first), Column::RegionFirstH);
+                trace.fill_columns(row, BaseField::from(end), Column::RegionEndH);
+                trace.fill_columns_base_field(row, &bits(from_first), Column::FromFirstBits);
+                trace.fill_columns_base_field(row, &bits(to_end), Column::ToEndBits);
             }
         }
         // Padding rows keep IsReal = 0 and all helpers 0.
@@ -463,6 +676,7 @@ impl BuiltInProverComponent for MemoryPageChip {
         let is_real = crate::trace::original_base_column!(component_trace, Column::IsReal);
         let last_gate =
             crate::trace::original_base_column!(component_trace, Column::LastBlockGateH);
+        let select = crate::trace::original_base_column!(component_trace, Column::RegionSelect);
 
         let block_lo = component_trace
             .preprocessed_base_column::<1, PreprocessedColumn>(PreprocessedColumn::BlockLo);
@@ -501,10 +715,14 @@ impl BuiltInProverComponent for MemoryPageChip {
             }
         };
 
-        // 1) 128 ts=0 writes.
+        // 1) 128 ts=0 writes, their last field 2·permission.
         for i in 0..BLOCK_BYTES {
-            let (before, addr_bytes, is_real) =
-                (before.clone(), addr_bytes.clone(), is_real.clone());
+            let (before, addr_bytes, is_real, select) = (
+                before.clone(),
+                addr_bytes.clone(),
+                is_real.clone(),
+                select.clone(),
+            );
             logup.add_to_relation_computed(
                 mem,
                 [is_real[0].clone()],
@@ -522,7 +740,12 @@ impl BuiltInProverComponent for MemoryPageChip {
                         t.push(PackedBaseField::zero());
                     }
                     t.push(PackedBaseField::one());
-                    t.push(PackedBaseField::zero());
+                    let mut permission = PackedBaseField::zero();
+                    for (k, column) in select.iter().enumerate() {
+                        let code = if k < FIRST_WRITABLE { 1 } else { 2 };
+                        permission += column.at(v) * bc(code);
+                    }
+                    t.push(permission * two);
                     t
                 },
             );

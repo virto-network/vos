@@ -331,12 +331,18 @@ where
     }
 
     // A.1's third and fourth items, as the prover ran them: the boundary
-    // states and the interaction PoW, before the relation challenges. Gated
-    // on `side_note.closing_chip_active`, as the prover's mix is: the
-    // default `verify` path sees the flag via the prover-mutated side_note,
-    // and chip-isolated `verify_with_explicit_components` only flips it when
-    // the caller's slice includes the boundary + closing chip pair.
-    if side_note.closing_chip_active {
+    // states and the interaction PoW, before the relation challenges. The
+    // production path (`boundary_positions` known) always mixes and binds
+    // them: the side note is the prover's, so its `closing_chip_active`
+    // cannot switch the binding off. Chip-isolated
+    // `verify_with_explicit_components` mixes only when the caller's slice
+    // includes the boundary + closing chip pair and flipped the flag.
+    if boundary_positions.is_some() && initial_state.timestamp < 1 {
+        return Err(VerificationError::InvalidStructure(
+            "initial_state.timestamp must be >= 1 (memory-boundary anchoring)".to_string(),
+        ));
+    }
+    if boundary_positions.is_some() || side_note.closing_chip_active {
         crate::proof::mix_boundary_states(
             verifier_channel,
             format.encoding,
@@ -374,9 +380,7 @@ where
     // positions = the chip-isolated explicit-components path, which has
     // no stable component order and is not a trust boundary; the
     // production path always supplies `Some`.
-    if side_note.closing_chip_active
-        && let Some(positions) = &boundary_positions
-    {
+    if let Some(positions) = &boundary_positions {
         crate::boundary_binding::check_boundary_claimed_sums(
             &initial_state,
             &final_state,

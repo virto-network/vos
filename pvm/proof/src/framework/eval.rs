@@ -1,25 +1,8 @@
-use num_traits::{One, Zero};
-use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, FrameworkEval};
 
 use crate::trace::eval::TraceEval;
 
 use crate::framework::traits::builtin::BuiltInComponent;
-
-/// Combine up to 8 LE bytes into a single field element representing the
-/// same u64 (mod p).  Shared by CpuChip's Phi7 inversion witness and the
-/// ShiftQuotient identity.  `bytes.len() <= 8`.
-pub fn combine_le_u64<E: EvalAtRow>(bytes: &[E::F]) -> E::F {
-    debug_assert!(bytes.len() <= 8);
-    let b256 = E::F::from(BaseField::from(256u32));
-    let mut out = E::F::zero();
-    let mut pow = E::F::one();
-    for b in bytes {
-        out += b.clone() * pow.clone();
-        pow = pow.clone() * b256.clone();
-    }
-    out
-}
 
 pub struct BuiltInComponentEval<'a, C: BuiltInComponent> {
     pub(crate) component: &'a C,

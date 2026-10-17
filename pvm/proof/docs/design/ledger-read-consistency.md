@@ -192,6 +192,16 @@ The 4-slot emission machinery stays dormant (slots 1..3 emit 0-mult) so
 — the capstone is segmented and the register ledger is not the dominant cost.
 [Reconsider only if profiling shows the register ledger dominates a segment.]
 
+**Later (formats 31–34):** the dormant slots were themselves a hole: a prover could
+set `SlotReal_i = 1` and consume any read at `Ts_i`, unordered and unchained.
+They are gone; each row consumes one access. The adjacent-real-rows gadget left
+a second hole: padding switched it off, so rows after a padding row formed a
+second, unordered chain for a register whose first row took a free
+`PrevValue`. A chain of same-register rows now starts at its register's `ts = 0`
+write (the `ChainStartH` helper: a row whose predecessor is no same-register
+real row is a write at `ts = 0`), and a register has exactly one, from the
+boundary chip. Memory's address groups follow the same rule (§ group start).
+
 ### (E) Format bump + docs
 
 - `src/proof.rs`: `PROOF_FORMAT_VERSION 5 → 6` + a history entry (the AIR changed:

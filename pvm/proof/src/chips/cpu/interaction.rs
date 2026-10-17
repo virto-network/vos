@@ -29,7 +29,7 @@ use crate::lookups::{
     DivRemLookupElements, JumpTableLookupElements, LogupTraceBuilder, MemoryAccessLookupElements,
     MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
     ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
-    RegisterMemoryLookupElements, RistrettoCallLookupElements,
+    RegisterMemoryLookupElements, WitnessCallLookupElements,
 };
 use crate::trace::component::ComponentTrace;
 
@@ -421,82 +421,29 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // ── Ristretto ECALL register reads + RELATION-A ──
-    // Prover-side mirror of the mod.rs producers, in the same order: three
-    // register-read producers (φ[7], φ[8], φ[9]-except-112), then five per-id
-    // RELATION-A producers.  Operand pointers reuse the Phi10/Phi11/Phi12
-    // slots (= φ[7,8,9]); the RELATION-A ptr slots are in RistrettoEcallChip
-    // trace-layout order.
+    // ── Witness-input register reads ──
+    // Prover-side mirror of the mod.rs producers, in the same order: φ[7]
+    // and φ[8], the call's destination and capacity, from the Phi10/Phi11
+    // slots.
     {
-        let ristretto_call: &RistrettoCallLookupElements = lookup_elements.as_ref();
-        let is_110 = crate::trace::original_base_column!(component_trace, Column::Is110Ecall);
-        let is_111 = crate::trace::original_base_column!(component_trace, Column::Is111Ecall);
-        let is_112 = crate::trace::original_base_column!(component_trace, Column::Is112Ecall);
-        let is_113 = crate::trace::original_base_column!(component_trace, Column::Is113Ecall);
-        let is_114 = crate::trace::original_base_column!(component_trace, Column::Is114Ecall);
+        let is_witness =
+            crate::trace::original_base_column!(component_trace, Column::IsWitnessEcall);
 
         // Register-read producers: (reg_idx, value[8], ts[8], is_write=0).
-        // φ[7] and φ[8] for all five ids; φ[9] for all except 112.
-        for (reg_idx, value, not_112) in [
-            (7u32, phi10.clone(), false),
-            (8u32, phi11.clone(), false),
-            (9u32, phi12.clone(), true),
-        ] {
-            let idx_const = PackedBaseField::broadcast(BaseField::from(reg_idx));
-            let val_c = value;
-            let ts_c = timestamp.clone();
-            let mult_cols = [
-                is_110[0].clone(),
-                is_111[0].clone(),
-                is_112[0].clone(),
-                is_113[0].clone(),
-                is_114[0].clone(),
-            ];
-            logup.add_to_relation_computed(
-                reg_lookup,
-                mult_cols,
-                move |[a, b, c, d, e]| {
-                    if not_112 {
-                        (a + b + d + e).into()
-                    } else {
-                        (a + b + c + d + e).into()
-                    }
-                },
-                18,
-                move |v| {
-                    let mut t = Vec::with_capacity(18);
-                    t.push(idx_const);
-                    for c in &val_c {
-                        t.push(c.at(v));
-                    }
-                    for c in &ts_c {
-                        t.push(c.at(v));
-                    }
-                    t.push(PackedBaseField::broadcast(BaseField::from(0u32)));
-                    t
-                },
-            );
-        }
-
-        // RELATION-A producers: (id, ptr0[4], ptr1[4], ptr2[4], ts[8]).
-        // ptr slots in RistrettoEcallChip trace-layout order (sub-block
-        // 0/1/2 base ptr); each is the low 4 bytes of a Phi slot.
-        for (id, p0, p1, p2, mult) in [
-            (110u32, &phi11, &phi10, &phi12, is_110[0].clone()),
-            (111u32, &phi10, &phi11, &phi12, is_111[0].clone()),
-            (112u32, &phi10, &phi10, &phi11, is_112[0].clone()),
-            (113u32, &phi10, &phi11, &phi12, is_113[0].clone()),
-            (114u32, &phi10, &phi11, &phi12, is_114[0].clone()),
-        ] {
-            let mut tuple: Vec<_> = Vec::with_capacity(21);
+        for (reg_idx, value) in [(7u32, &phi10), (8u32, &phi11)] {
+            let mut tuple: Vec<_> = Vec::with_capacity(18);
             tuple.push(crate::trace::component::FinalizedColumn::Constant(
-                BaseField::from(id),
+                BaseField::from(reg_idx),
             ));
-            tuple.extend_from_slice(&p0[0..4]);
-            tuple.extend_from_slice(&p1[0..4]);
-            tuple.extend_from_slice(&p2[0..4]);
+            tuple.extend_from_slice(value);
             tuple.extend_from_slice(&timestamp);
-            logup.add_to_relation_with(ristretto_call, [mult], |[active]| active.into(), &tuple);
+            tuple.push(is_write_read.clone());
+            logup.add_to_relation_with(
+                reg_lookup,
+                [is_witness[0].clone()],
+                |[active]| active.into(),
+                &tuple,
+            );
         }
     }
 
@@ -555,7 +502,7 @@ pub(super) fn generate_interaction_trace(
         );
     }
 
-    // ── ProgramMemory consumer (prover-side, 2 paired, 33 limbs) ──
+    // ── ProgramMemory consumer (prover-side, 2 paired, 37 limbs) ──
     {
         let prog_mem: &ProgramMemoryLookupElements = lookup_elements.as_ref();
         let pc = crate::trace::original_base_column!(component_trace, Column::Pc);
@@ -594,6 +541,14 @@ pub(super) fn generate_interaction_trace(
         tuple.push(fb3[0].clone());
         tuple.push(fb4[0].clone());
         tuple.push(fb5[0].clone());
+        for byte in [
+            Column::FlagByte6,
+            Column::FlagByte7,
+            Column::FlagByte8,
+            Column::FlagByte9,
+        ] {
+            tuple.push(component_trace.original_base_column::<1, _>(byte)[0].clone());
+        }
         tuple.extend_from_slice(&imm_y_for_lookup);
         tuple.extend_from_slice(&branch_target_for_lookup);
         tuple.push(host_call_precompile_dispatch[0].clone());
@@ -620,7 +575,8 @@ pub(super) fn generate_interaction_trace(
     // Mirrors the 6 verifier-side emissions in cpu/mod.rs.  Each tuple
     // is `(FlagByteI, bit0, ..., bit7)` with bit_j either an
     // individual flag column or a sum-of-sub-flags expression.
-    // Multiplicity = is_real on every emission.
+    // Multiplicity 1 on every row: a padding row's zero bytes pin its flags
+    // to zero.
     {
         let bt: &ByteToBitsLookupElements = lookup_elements.as_ref();
         let is_pad_col = crate::trace::original_base_column!(component_trace, Column::IsPadding);
@@ -633,6 +589,7 @@ pub(super) fn generate_interaction_trace(
         let f_is_add = crate::trace::original_base_column!(component_trace, Column::IsAdd);
         let f_is_sub = crate::trace::original_base_column!(component_trace, Column::IsSub);
         let f_is_mul = crate::trace::original_base_column!(component_trace, Column::IsMul);
+        let f_is_shar_r = crate::trace::original_base_column!(component_trace, Column::IsSharR);
         let f_is_and = crate::trace::original_base_column!(component_trace, Column::IsAnd);
         let f_is_or = crate::trace::original_base_column!(component_trace, Column::IsOr);
         let f_is_xor = crate::trace::original_base_column!(component_trace, Column::IsXor);
@@ -701,13 +658,12 @@ pub(super) fn generate_interaction_trace(
             crate::trace::original_base_column!(component_trace, Column::IsRotateL32);
         let f_is_rotate_r32 =
             crate::trace::original_base_column!(component_trace, Column::IsRotateR32);
-        let f_is_rotate_r_imm_alt =
-            crate::trace::original_base_column!(component_trace, Column::IsRotateRImmAlt);
+        let f_is_imm_alt = crate::trace::original_base_column!(component_trace, Column::IsImmAlt);
 
         let one_pkg =
             || stwo::prover::backend::simd::m31::PackedBaseField::broadcast(BaseField::from(1));
 
-        // byte 0: (FlagByte0, is_add, is_sub, is_mul, MU_SUM, BW_SUM,
+        // byte 0: (FlagByte0, is_add, is_sub, is_mul, is_shar_r, BW_SUM,
         //          is_shift, CMP_SUM, is_move)
         {
             let pad = is_pad_col[0].clone();
@@ -715,9 +671,7 @@ pub(super) fn generate_interaction_trace(
             let a = f_is_add[0].clone();
             let s = f_is_sub[0].clone();
             let m = f_is_mul[0].clone();
-            let mu_uu = f_is_mul_upper_uu[0].clone();
-            let mu_su = f_is_mul_upper_su[0].clone();
-            let mu_ss = f_is_mul_upper_ss[0].clone();
+            let shar = f_is_shar_r[0].clone();
             let bw_and = f_is_and[0].clone();
             let bw_or = f_is_or[0].clone();
             let bw_xor = f_is_xor[0].clone();
@@ -737,7 +691,7 @@ pub(super) fn generate_interaction_trace(
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -745,7 +699,7 @@ pub(super) fn generate_interaction_trace(
                         a.at(i),
                         s.at(i),
                         m.at(i),
-                        mu_uu.at(i) + mu_su.at(i) + mu_ss.at(i),
+                        shar.at(i),
                         bw_and.at(i)
                             + bw_or.at(i)
                             + bw_xor.at(i)
@@ -794,7 +748,7 @@ pub(super) fn generate_interaction_trace(
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -838,7 +792,7 @@ pub(super) fn generate_interaction_trace(
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -873,7 +827,7 @@ pub(super) fn generate_interaction_trace(
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -908,7 +862,7 @@ pub(super) fn generate_interaction_trace(
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -928,7 +882,7 @@ pub(super) fn generate_interaction_trace(
 
         // byte 5: (FlagByte5, is_rotate_l64, is_count_set_bits,
         //          is_lzb, is_tzb, is_rotate_r64, is_rotate_l32,
-        //          is_rotate_r32, is_rotate_r_imm_alt)
+        //          is_rotate_r32, is_imm_alt)
         {
             let pad = is_pad_col[0].clone();
             let fbc = fb5[0].clone();
@@ -939,11 +893,11 @@ pub(super) fn generate_interaction_trace(
             let rr64 = f_is_rotate_r64[0].clone();
             let rl32 = f_is_rotate_l32[0].clone();
             let rr32 = f_is_rotate_r32[0].clone();
-            let rria = f_is_rotate_r_imm_alt[0].clone();
+            let rria = f_is_imm_alt[0].clone();
             logup.add_to_relation_computed(
                 bt,
                 [pad],
-                move |[p]| (one_pkg() - p).into(),
+                move |[_]| one_pkg().into(),
                 9,
                 move |i| {
                     vec![
@@ -1271,7 +1225,7 @@ pub(super) fn generate_interaction_trace(
     }
 
     // ── DivRemLookup producer (prover-side mirror) ──
-    // 40-limb tuple (includes 4 sign bits).
+    // 41-limb tuple (4 sign bits, is_div_s, is_shar_r).
     {
         let divrem_p54g: &DivRemLookupElements = lookup_elements.as_ref();
         let val_b_p54g = crate::trace::original_base_column!(component_trace, Column::ValB);
@@ -1298,6 +1252,8 @@ pub(super) fn generate_interaction_trace(
         tuple_p54g.push(dbz_p54g[0].clone());
         tuple_p54g.push(is_32_p54g[0].clone());
         tuple_p54g.push(is_ds_p54g[0].clone());
+        let is_shar_r = crate::trace::original_base_column!(component_trace, Column::IsSharR);
+        tuple_p54g.push(is_shar_r[0].clone());
         for _ in 0..2 {
             logup.add_to_relation_with(
                 divrem_p54g,
@@ -1439,6 +1395,76 @@ pub(super) fn generate_interaction_trace(
                 ],
                 |[a, b, c, d, e, f]| (a + b + c + d + e + f).into(),
                 &tuple_p54e,
+            );
+        }
+    }
+
+    // ── Witness input (prover-side mirror) ──
+    // Two CompareLookup tuples (φ8, count, 0), then two WitnessCall tuples
+    // (ts, φ7's low four bytes, count), the count combined from Result's
+    // three low bytes.
+    {
+        use stwo::prover::backend::simd::m31::PackedBaseField;
+        let compare: &CompareLookupElements = lookup_elements.as_ref();
+        let witness_call: &WitnessCallLookupElements = lookup_elements.as_ref();
+        let is_witness =
+            crate::trace::original_base_column!(component_trace, Column::IsWitnessEcall);
+        let non_empty =
+            crate::trace::original_base_column!(component_trace, Column::WitnessNonEmpty);
+        let result = crate::trace::original_base_column!(component_trace, Column::Result);
+        let mut compare_tuple: Vec<_> = phi11.to_vec();
+        compare_tuple.extend_from_slice(&result);
+        compare_tuple.push(crate::trace::component::FinalizedColumn::Constant(
+            BaseField::from(0u32),
+        ));
+        for _ in 0..2 {
+            logup.add_to_relation_with(
+                compare,
+                [is_witness[0].clone()],
+                |[active]| active.into(),
+                &compare_tuple,
+            );
+        }
+        for _ in 0..2 {
+            let (ts_c, destination_c, result_c) =
+                (timestamp.clone(), phi10.clone(), result.clone());
+            logup.add_to_relation_computed(
+                witness_call,
+                [non_empty[0].clone()],
+                |[active]| active.into(),
+                13,
+                move |v| {
+                    let mut t = Vec::with_capacity(13);
+                    for c in &ts_c {
+                        t.push(c.at(v));
+                    }
+                    for c in &destination_c[..4] {
+                        t.push(c.at(v));
+                    }
+                    let byte = |i: usize| result_c[i].at(v);
+                    t.push(
+                        byte(0)
+                            + byte(1) * PackedBaseField::broadcast(BaseField::from(1u32 << 8))
+                            + byte(2) * PackedBaseField::broadcast(BaseField::from(1u32 << 16)),
+                    );
+                    t
+                },
+            );
+        }
+    }
+
+    // ── NextTimestamp Range256 lookups (8, kept last) ──
+    {
+        let next_ts = crate::trace::original_base_column!(component_trace, Column::NextTimestamp);
+        for col in &next_ts {
+            logup.add_to_relation_with(
+                range256,
+                [is_pad[0].clone()],
+                |[pad]| {
+                    use stwo::prover::backend::simd::m31::PackedBaseField;
+                    (PackedBaseField::one() - pad).into()
+                },
+                std::slice::from_ref(col),
             );
         }
     }

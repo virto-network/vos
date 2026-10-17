@@ -989,12 +989,13 @@ fn observed_step(
     );
     let (reg_a, reg_b, reg_d) = decode_reg_indices(opcode, &decoded);
     let regs_after = machine.registers;
-    let changed: Vec<usize> = (0..PVM_REGISTER_COUNT)
-        .filter(|&index| observation.registers_before[index] != regs_after[index])
-        .collect();
-    if changed.len() > 1 {
-        return Err("one instruction changed more than one register".to_string());
-    }
+    let reg_write = crate::core::tracing::recorded_write(
+        opcode,
+        (reg_a, reg_b, reg_d),
+        &observation.registers_before,
+        &regs_after,
+        observation.exit,
+    )?;
     let gas_charged = if observation.need_gas_charge_before {
         observation
             .gas_before
@@ -1017,7 +1018,7 @@ fn observed_step(
         skip_len,
         regs_before: observation.registers_before,
         regs_after,
-        reg_write: changed.first().copied(),
+        reg_write,
         reg_a,
         reg_b,
         reg_d,
@@ -1029,8 +1030,15 @@ fn observed_step(
         mem_write,
         gas_after: machine.gas,
         gas_charged,
-        next_pc: machine.pc,
+        // A halting step continues at the halt address, as the tracer
+        // records it.
+        next_pc: if observation.exit == Some(&ExitReason::Halt) {
+            vos_pvm::PVM_HALT_ADDR as u32
+        } else {
+            machine.pc
+        },
         host_call_acknowledged: false,
+        witness: None,
         exit: exited,
     })
 }

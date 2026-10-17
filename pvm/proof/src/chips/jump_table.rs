@@ -30,6 +30,7 @@
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
+use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
@@ -80,6 +81,10 @@ pub enum PreprocessedColumn {
     /// `jump_table[N]` as 4 little-endian bytes.  0 on padding rows.
     #[size = 4]
     Target,
+    /// 1 on the table's entries, 0 on its padding rows, whose `(0, 0)`
+    /// tuple no dynamic jump may use: a jump to address 0 panics.
+    #[size = 1]
+    IsEntry,
 }
 
 impl BuiltInComponent for JumpTableChip {
@@ -95,7 +100,10 @@ impl BuiltInComponent for JumpTableChip {
     ) {
         let addr = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Addr);
         let target = crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::Target);
+        let is_entry =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::IsEntry);
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
+        eval.add_constraint((E::F::one() - is_entry[0].clone()) * mult[0].clone());
 
         // Tuple: (addr[4], target[4]) — 8 limbs.
         let mut tuple: Vec<E::F> = addr.to_vec();
@@ -130,8 +138,9 @@ impl BuiltInProverComponent for JumpTableChip {
                     &side_note.jump_table[row].to_le_bytes(),
                     PreprocessedColumn::Target,
                 );
+                trace.fill_columns(row, true, PreprocessedColumn::IsEntry);
             }
-            // Padding rows: addr/target stay at 0.
+            // Padding rows: addr/target/is_entry stay at 0.
         }
 
         trace.finalize_bit_reversed()

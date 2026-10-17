@@ -33,12 +33,13 @@ vectors:
     cargo test -p vos-pvm --test pvm_vectors
 
 # Prover integration suites, including the soundness gates behind
-# `debug-internals`. Memory-heavy: two threads fit under a 24 GiB limit, e.g.
+# `debug-internals`, and the re-runs of the test actors' kernels from their
+# attests on the agent's model. Memory-heavy: two threads fit under a 24 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
 # them; the verifier's suite runs in `test`. The settlement verifier's own
 # tests check its channel copy against the prover's.
-test-proof: build-guests
+test-proof: build-guests build-test-actors
     cargo test -p vos-pvm-proof --features debug-internals --tests -- --test-threads=2
     cd pvm/proof/settlement-verifier; cargo test
 

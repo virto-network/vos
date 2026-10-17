@@ -38,7 +38,7 @@ fn poseidon2_hash(byte: u8) -> crate::poseidon2::P2Hash {
     crate::poseidon2::P2Hash([BaseField::from_u32_unchecked(byte as u32); 8])
 }
 
-/// A format-24 proof, on the Blake2s channel.
+/// A format-33 proof, on the Blake2s channel.
 fn proof() -> Proof {
     let (config, stark) = stark_proof(blake2s_hash);
     proof_of(
@@ -49,7 +49,7 @@ fn proof() -> Proof {
     )
 }
 
-/// A format-26 proof, on the Poseidon2-M31 channel.
+/// A format-31 proof, on the Poseidon2-M31 channel.
 fn poseidon2_proof() -> Proof {
     let (config, stark) = stark_proof(poseidon2_hash);
     proof_of(

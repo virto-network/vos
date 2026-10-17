@@ -185,7 +185,45 @@ pub use transcript::{
 ///        column (the program-memory tuple drops from 33 to 32 limbs), so
 ///        program commitments change. Older proofs reject.
 ///   25 — Poseidon2-M31 PCS variant of format 24.
-///   26–30 — the registry's ([`crate::format`]).
+///   26–30 — the registry's ([`crate::format`]) on format 24's AIR: 26
+///        Poseidon2-M31 segments, 27 leaves and folds, 28 the wrap, 29
+///        device proofs, 30 credential proofs.
+///   31–34 — the registry's on the hardened segment AIR, which retires 24,
+///        26, 27 and 29 (28 and 30 prove other AIRs and keep their numbers).
+///        A run's ends and its witness input: a halting step continues at
+///        the halt address, so a segment's final pc is the halt address
+///        exactly when it ends at a halt; a kernel's witness-input call
+///        (0x401, dispatch 101) writes its count to φ7, at most φ8, and
+///        `WitnessInputChip` (index 13) writes exactly its bytes; the
+///        register ledger sorts a register's reads before its writes within
+///        a timestamp. The Ristretto and scalar chips removed: CpuChip drops
+///        its five `Is{110..114}Ecall` selectors, the eight chips and their
+///        eleven relations leave the AIR (`COUNT` 25, `BITWISE_AND_BYTE` at
+///        index 24) and ids 110–114 are no precompile. The AIR audit's
+///        hardening: MulChip and DivRemChip Range256-check every product
+///        byte, quotient and remainder byte, high half and carry their
+///        chains read, and booleanize the magnitude chains' carries, so each
+///        chain holds over the integers; DivRemChip pins the schoolbook's
+///        high half per operation (zero, signed correction with the
+///        `MIN / −1` overflow, or floor division for an arithmetic shift,
+///        flagged by the DivRem tuple's new `is_shar_r`, which flag byte 0's
+///        bit 3 commits in place of the implied `is_mul_upper`).
+///        Blake2bChip holds `IsReal` across a compression, refuses the
+///        trailing partial block, and derives its addresses by byte carries
+///        on every row. CpuChip: boolean add/sub and pc carries; a padding
+///        row's flag bytes zero, its flags and emission gates with them;
+///        equality bound both ways; signed min/max results; an 8-byte
+///        immediate store's high word (ImmYBytes and ProgramMemory's
+///        ImmYCanon carry 5 bytes, the program-memory tuple 37 limbs); a
+///        trap stays at its pc; ProgramMemory serves only instruction
+///        starts (a preprocessed IsInstruction); NextTimestamp
+///        range-checked; φ10's non-zeroness by its bytes' sum; 32-bit
+///        BLAKE2b pointers; the ImmAlt shifts' operand swap. The register
+///        ledger drops its merged read slots and starts each register's
+///        chain at its ts = 0 write. MemoryPageChip carries the program's
+///        layout as preprocessed regions and proves each page's permission,
+///        which MemoryChip enforces on every access. Program commitments
+///        change.
 pub const PROOF_FORMAT_VERSION: u32 = crate::format::LEGACY_SEGMENT_NUMBER;
 
 /// Exact number of commitment trees in this generation of the Stwo proof:
@@ -199,7 +237,7 @@ pub const MAX_PROOF_COMPONENTS: usize = u32::BITS as usize;
 /// impossible and can otherwise reach an unchecked subtraction.
 pub const MIN_PROOF_LOG_SIZE: u32 = 4;
 /// Hard transport-independent cap for every proof-owned column vector. The
-/// complete v20/v21 AIR currently commits 7,912 columns in its widest tree;
+/// full segment AIR commits 4,882 columns in its widest tree (8,039 in all);
 /// the next power of two leaves narrowly audited generation-local headroom.
 pub const MAX_PROOF_COLUMNS_PER_TREE: usize = 1 << 13;
 /// Hard cap for OODS samples attached to one committed column.
@@ -1118,7 +1156,7 @@ pub fn check_pcs_policy(
 
 /// The FRI-shape check every verify path runs before any cryptographic work.
 /// With a policy, its per-field floors, under every format. Without one,
-/// format 24's conjectured-security floor ([`check_min_security`]); every
+/// format 33's conjectured-security floor ([`check_min_security`]); every
 /// other format fixes its parameters, checked with its floors
 /// ([`check_format_security`]) once the proof's shape is known.
 pub fn check_shape_policy(

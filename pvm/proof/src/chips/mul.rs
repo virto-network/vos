@@ -5,6 +5,11 @@
 //! (via MulCarry/MulCarryHi); and the MulUpper SS/SU sign-correction
 //! (via UnsignedProductHi/MulCorrTermA/B/Carry).
 //!
+//! Every product byte and carry the chains read is Range256-checked, so
+//! each chain equation stays far below the field's modulus and holds over
+//! the integers: the schoolbook is the exact product `b·d`, the
+//! correction the exact `result + term_a + term_b ≡ uph (mod 2^64)`.
+//!
 //! Lookup tuple (47 limbs): val_b\[8\] + val_d\[8\] + result\[8\] +
 //! mul_high\[8\] + unsigned_product_low\[8\] + sign_bit_b + sign_bit_d +
 //! 5 flags.  CpuChip witnesses val_b/val_d/result/mul_high/
@@ -40,8 +45,11 @@ use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
-use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::MultiplicationLookupElements};
+use crate::side_note::{MulEntry, SideNote};
+use crate::{
+    framework::BuiltInComponent,
+    lookups::{MultiplicationLookupElements, Range256LookupElements},
+};
 
 pub struct MulChip;
 
@@ -184,14 +192,15 @@ impl BuiltInComponent for MulChip {
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    type LookupElements = MultiplicationLookupElements;
+    type LookupElements = (MultiplicationLookupElements, Range256LookupElements);
 
     fn add_constraints<E: EvalAtRow>(
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &MultiplicationLookupElements,
+        lookup_elements: &(MultiplicationLookupElements, Range256LookupElements),
     ) {
+        let (lookup_elements, range256_lookup) = lookup_elements;
         let val_b = crate::trace::trace_eval!(trace_eval, Column::ValB);
         let val_d = crate::trace::trace_eval!(trace_eval, Column::ValD);
         let result = crate::trace::trace_eval!(trace_eval, Column::Result);
@@ -421,6 +430,29 @@ impl BuiltInComponent for MulChip {
             }
         }
 
+        // ── Range256: the product bytes and every carry (64 per real row,
+        // in `range_checked_bytes`' order).  Bytes make the schoolbook an
+        // integer identity — `Σ out·256^k + 256^16·c₁₅ = b·d < 2^128`
+        // forces `c₁₅ = 0` and `out = b·d` — and bound the correction
+        // carries to {0, 1, 2}. ──
+        for value in [
+            &upl[..],
+            &mul_high,
+            &uph,
+            &mul_carry,
+            &mul_carry_hi,
+            &corr_carry,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            eval.add_to_relation(RelationEntry::new(
+                range256_lookup,
+                is_real.clone().into(),
+                core::slice::from_ref(value),
+            ));
+        }
+
         // ── Lookup consumer ──
         // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +
         //   sign_bit_b + sign_bit_d + 4 rotate flags + 5 mul flags.
@@ -450,6 +482,19 @@ impl BuiltInComponent for MulChip {
 
         eval.finalize_logup_in_pairs();
     }
+}
+
+/// The Range256 values a row emits, as a multiset.
+#[cfg(feature = "prover")]
+pub fn range_checked_bytes(e: &MulEntry) -> impl Iterator<Item = u8> + '_ {
+    e.unsigned_product_low
+        .to_le_bytes()
+        .into_iter()
+        .chain(e.mul_high.to_le_bytes())
+        .chain(e.unsigned_product_hi.to_le_bytes())
+        .chain(e.mul_carry)
+        .chain(e.mul_carry_hi)
+        .chain(e.mul_corr_carry)
 }
 
 #[cfg(feature = "prover")]
@@ -586,6 +631,13 @@ impl BuiltInProverComponent for MulChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let mul: &MultiplicationLookupElements = lookup_elements.as_ref();
+        let range256: &Range256LookupElements = lookup_elements.as_ref();
+        let upl = crate::trace::original_base_column!(component_trace, Column::UnsignedProductLow);
+        let mul_high = crate::trace::original_base_column!(component_trace, Column::MulHigh);
+        let uph = crate::trace::original_base_column!(component_trace, Column::UnsignedProductHi);
+        let mul_carry = crate::trace::original_base_column!(component_trace, Column::MulCarry);
+        let mul_carry_hi = crate::trace::original_base_column!(component_trace, Column::MulCarryHi);
+        let corr_carry = crate::trace::original_base_column!(component_trace, Column::MulCorrCarry);
         let val_b = crate::trace::original_base_column!(component_trace, Column::ValB);
         let val_d = crate::trace::original_base_column!(component_trace, Column::ValD);
         let result = crate::trace::original_base_column!(component_trace, Column::Result);
@@ -601,6 +653,28 @@ impl BuiltInProverComponent for MulChip {
         let is_mu_ss = crate::trace::original_base_column!(component_trace, Column::IsMulUpperSS);
         let is_32bit = crate::trace::original_base_column!(component_trace, Column::Is32Bit);
         let is_padding = crate::trace::original_base_column!(component_trace, Column::IsPadding);
+
+        for value in [
+            &upl[..],
+            &mul_high,
+            &uph,
+            &mul_carry,
+            &mul_carry_hi,
+            &corr_carry,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            logup.add_to_relation_with(
+                range256,
+                [is_padding[0].clone()],
+                |[pad]| {
+                    use stwo::prover::backend::simd::m31::PackedBaseField;
+                    (PackedBaseField::one() - pad).into()
+                },
+                core::slice::from_ref(value),
+            );
+        }
 
         let mut tuple: Vec<_> = val_b.to_vec();
         tuple.extend_from_slice(&val_d);

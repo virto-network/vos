@@ -318,11 +318,12 @@ fn prove_preflights_slice_cardinality_without_proving() {
 
 #[test]
 fn proof_generation_numbers_reject_previous_formats() {
-    assert_eq!(crate::PROOF_FORMAT_VERSION, 24);
-    // Every number before the registry's, and 25, the retired Poseidon2-M31
-    // variant of 24, are unregistered.
-    for previous in (0..=23).chain([25]) {
+    assert_eq!(crate::PROOF_FORMAT_VERSION, 33);
+    // Every number before the registry's, and the retired ones, are
+    // unregistered.
+    for previous in (0..=23).chain(crate::format::RETIRED) {
         assert!(crate::format::lookup(previous).is_none(), "{previous}");
+        assert!(crate::format::admitted(previous).is_err(), "{previous}");
     }
 }
 

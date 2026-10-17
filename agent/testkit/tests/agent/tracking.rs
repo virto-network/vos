@@ -257,6 +257,15 @@ fn a_tracked_program_runs_to_its_result() {
         (hash ^ value).wrapping_mul(0x0000_0100_0000_01b3)
     });
     assert_eq!(report.output, expected.encode());
+    // The io-hash its prologue left in φ9 to φ12, of its output alone.
+    let io_hash: Vec<u8> = report.registers[9..13]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    assert_eq!(
+        io_hash,
+        vos_pvm_precompiles::compute_io_hash(&[], &report.output, &[])
+    );
     let written = report.written.expect("tracked");
     assert!(!written.is_empty());
     let parsed = vos_pvm::spi::parse_standard_program(&checksum).unwrap();
@@ -269,4 +278,150 @@ fn a_tracked_program_runs_to_its_result() {
             .all(|page| pages(layout.rw).contains(page) || pages(layout.stack).contains(page)),
         "{written:x?}"
     );
+}
+
+/// The witness-input calls of [`reader`], each its destination and
+/// capacity, on [`READER_INPUT`]: three bytes, none, four, a short read of
+/// the three left, and a read at the end. The prover's tests pin the same.
+const READER_CALLS: [(u64, u64); 5] = [
+    (RW + 0x100, 3),
+    (RW + 0x200, 0),
+    (RW + 0x300, 4),
+    (RW + 0x400, 8),
+    (RW + 0x500, 5),
+];
+const READER_INPUT: [u8; 10] = [0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7, 0xa8, 0xa9];
+
+/// A standard program that makes [`READER_CALLS`]'s witness-input calls,
+/// storing each count it returns at [`RW`] plus eight bytes a call, and
+/// halts with an empty output; a page of read-only data and five heap
+/// pages at [`RW`]. The prover's tests build the same program.
+fn reader(calls: &[(u64, u64)]) -> Vec<u8> {
+    let mut code = Vec::new();
+    let mut starts = Vec::new();
+    let mut emit = |bytes: &[u8]| {
+        starts.push(code.len());
+        code.extend_from_slice(bytes);
+    };
+    let load_imm =
+        |register: u8, value: u64| [&[51, register][..], &(value as u32).to_le_bytes()].concat();
+    for (index, &(destination, capacity)) in calls.iter().enumerate() {
+        emit(&load_imm(7, destination));
+        emit(&load_imm(8, capacity));
+        emit(&[10, 0x01, 0x04]);
+        let store = RW as u32 + 8 * index as u32;
+        emit(&[&[62, 7][..], &store.to_le_bytes()].concat());
+    }
+    emit(&load_imm(8, 0));
+    emit(&[50, 0]);
+    let mut bitmask = vec![0; code.len()];
+    for start in starts {
+        bitmask[start] = 1;
+    }
+    build_standard_program(&StandardProgram {
+        ro_data: vec![1; PAGE as usize],
+        rw_data: vec![],
+        heap_pages: 5,
+        stack_size: PAGE as u32,
+        code: CodeBlob {
+            jump_table: vec![],
+            code,
+            bitmask,
+        },
+    })
+    .unwrap()
+}
+
+fn witness_probe(program: &[u8], input: &[u8]) -> Probe {
+    Probe {
+        program: ProgramHash::of(program).0,
+        track: false,
+        gas: 1_000_000,
+        arguments: Some(input.to_vec()),
+        writes: vec![],
+        registers: vec![],
+        reads: vec![],
+    }
+}
+
+/// A kernel's witness input, as the agent serves it: each call writes the
+/// next `min(capacity, remaining)` bytes at its destination and returns
+/// their count, a short read the rest and a read at the end 0, at a call's
+/// price and each byte's, on every host and backend.
+#[test]
+fn the_witness_input_reads_short_then_ends() {
+    let program = reader(&READER_CALLS);
+    let probe = Probe {
+        reads: [(RW, 40)]
+            .into_iter()
+            .chain(
+                READER_CALLS
+                    .iter()
+                    .map(|&(destination, _)| (destination, 8)),
+            )
+            .map(|(address, len)| (address, len as u32))
+            .collect(),
+        ..witness_probe(&program, &READER_INPUT)
+    };
+    let report = agreed(&program, &probe);
+    assert_eq!((report.status, report.served), (HALT, 5));
+    let counts: Vec<u64> = report.reads[0]
+        .chunks(8)
+        .map(|count| u64::from_le_bytes(count.try_into().unwrap()))
+        .collect();
+    assert_eq!(counts, [3, 0, 4, 3, 0]);
+    let written = |bytes: &[u8]| [bytes, &vec![0; 8 - bytes.len()]].concat();
+    assert_eq!(report.reads[1], written(&READER_INPUT[..3]));
+    assert_eq!(report.reads[2], written(&[]));
+    assert_eq!(report.reads[3], written(&READER_INPUT[3..7]));
+    assert_eq!(report.reads[4], written(&READER_INPUT[7..]));
+    assert_eq!(report.reads[5], written(&[]));
+    // Each call's price, beside its instructions' gas: the gas of the same
+    // program on an empty input, which reads nothing, less the bytes'.
+    let empty = agreed(&program, &witness_probe(&program, &[]));
+    assert_eq!(
+        empty.gas - report.gas,
+        vos_wire::abi::precompile::WITNESS_INPUT_BYTE * READER_INPUT.len() as u64
+    );
+}
+
+/// A witness-input call whose destination cannot take its bytes stops the
+/// kernel, at the read-only data or past the address space; one that
+/// writes nothing never touches it.
+#[test]
+fn a_witness_input_outside_writable_memory_is_refused() {
+    for destination in [RO + 8, (1 << 32) - 2] {
+        let program = reader(&[(destination, 4)]);
+        let report = agreed(&program, &witness_probe(&program, &READER_INPUT));
+        assert_eq!((report.status, report.served), (1, 0), "{destination:#x}");
+        let program = reader(&[(destination, 0)]);
+        let report = agreed(&program, &witness_probe(&program, &READER_INPUT));
+        assert_eq!(
+            (report.status, report.served),
+            (HALT, 1),
+            "{destination:#x}"
+        );
+    }
+}
+
+/// A derived kernel's prologue reads its arguments into pages of its own,
+/// room for a request's bytes: an input that fills them is too long, and
+/// the kernel traps before its method runs.
+#[test]
+fn a_kernel_refuses_an_input_past_its_arguments() {
+    let checksum = Actors::load().checksum;
+    // The most a request holds: 8,191 values, their count first, and four
+    // bytes past them, which the method's decoding leaves.
+    let values: Vec<u64> = (0..8_191).collect();
+    let mut input = values.encode();
+    input.resize(vos_wire::abi::cap::REQUEST, 0);
+    let probe = |input: &[u8]| Probe {
+        gas: 100_000_000,
+        ..witness_probe(&checksum, input)
+    };
+    let report = agreed(&checksum, &probe(&input));
+    assert_eq!(report.status, HALT);
+    input.push(0);
+    let report = agreed(&checksum, &probe(&input));
+    assert_eq!(report.status, 1, "the prologue traps");
 }

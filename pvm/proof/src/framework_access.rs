@@ -202,6 +202,7 @@ pub fn drive_chip_oods<E: stwo_constraint_framework::EvalAtRow>(
         cx::PROGRAM_BOUNDARY => run(&ProgramBoundaryChip, log_size, lookup, eval),
         cx::PROGRAM_MEMORY => run(&ProgramMemoryChip, log_size, lookup, eval),
         cx::JUMP_TABLE => run(&JumpTableChip, log_size, lookup, eval),
+        cx::WITNESS_INPUT => run(&WitnessInputChip, log_size, lookup, eval),
         cx::RANGE_MULTIPLICITY_256 => run(&RangeMultiplicity256, log_size, lookup, eval),
         cx::BITWISE_LOOKUP => run(&BitwiseLookupChip, log_size, lookup, eval),
         cx::POWER_OF_TWO => run(&PowerOfTwoChip, log_size, lookup, eval),
@@ -212,20 +213,6 @@ pub fn drive_chip_oods<E: stwo_constraint_framework::EvalAtRow>(
         cx::BITWISE => run(&BitwiseChip, log_size, lookup, eval),
         cx::COMPARE => run(&CompareChip, log_size, lookup, eval),
         cx::DIVREM => run(&DivRemChip, log_size, lookup, eval),
-        cx::RISTRETTO => run(&RistrettoChip, log_size, lookup, eval),
-        cx::RISTRETTO_ECALL => run(&RistrettoEcallChip, log_size, lookup, eval),
-        cx::RISTRETTO_COMB_TABLE => run(&RistrettoCombTableChip, log_size, lookup, eval),
-        cx::RISTRETTO_FIXED_BASE_CONSUMER => {
-            run(&RistrettoFixedBaseConsumerChip, log_size, lookup, eval)
-        }
-        cx::RISTRETTO_COMB_ANCHOR => run(&RistrettoCombAnchorChip, log_size, lookup, eval),
-        cx::RISTRETTO_COMB_SCALAR_BOUNDARY => {
-            run(&RistrettoCombScalarBoundaryChip, log_size, lookup, eval)
-        }
-        cx::RISTRETTO_COMB_COMPRESS => run(&RistrettoCombCompressChip, log_size, lookup, eval),
-        cx::RISTRETTO_COMB_COMPRESS_OUTPUT => {
-            run(&RistrettoCombCompressOutputChip, log_size, lookup, eval)
-        }
         _ => panic!("drive_chip_oods: invalid chip_idx {chip_idx}"),
     }
 }

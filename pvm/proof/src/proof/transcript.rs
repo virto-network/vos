@@ -63,7 +63,7 @@ pub fn mix_statement_header(
 /// - [`Encoding::Lossless`]: the boundary chips' own bytes
 ///   ([`crate::boundary_binding::boundary_state_bytes`]), one M31 a byte, as
 ///   one run of 296.
-/// - [`Encoding::Legacy`]: format 24's, a u64 at a time: the registers in
+/// - [`Encoding::Legacy`]: format 33's, a u64 at a time: the registers in
 ///   and out, pc and ts in, pc and ts out, then each memory root as four
 ///   little-endian u64s.
 pub fn mix_boundary_states(

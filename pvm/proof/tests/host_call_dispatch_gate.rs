@@ -4,7 +4,7 @@
 //!
 //! A continued precompile row must expose the exact CPU selector
 //! whose lookup emits the matching handler record. A from-scratch prover must
-//! not be able to acknowledge a cryptographic Ecalli, clear or swap its exact
+//! not be able to acknowledge a precompile Ecalli, clear or swap its exact
 //! selector, and omit the handler-chip row while retaining the sequential
 //! continuation.
 
@@ -15,12 +15,8 @@ use vos_pvm::interpreter::Interpreter;
 use vos_pvm::{ExitReason, PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 use vos_pvm_proof::chips::CpuChip;
 use vos_pvm_proof::chips::cpu::Column;
-use vos_pvm_proof::core::ecall::proof_precompile_dispatch_id;
-use vos_pvm_proof::core::tracing::{
-    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
-    ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
-    TracingPvm,
-};
+use vos_pvm_proof::core::ecall::{ECALL_WITNESS_INPUT, proof_precompile_dispatch_id};
+use vos_pvm_proof::core::tracing::{ECALL_BLAKE2B_COMPRESS, TracingPvm};
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::harness::{MachineComponent, MachineProverComponent};
 use vos_pvm_proof::trace::component::ComponentTrace;
@@ -30,13 +26,9 @@ const ARG0_ADDR: u64 = PVM_ZONE_SIZE as u64 + 0x1000;
 const ARG1_ADDR: u64 = ARG0_ADDR + 0x100;
 const ARG2_ADDR: u64 = ARG1_ADDR + 0x100;
 
-const PRECOMPILE_SELECTORS: [(u32, Column); 6] = [
+const PRECOMPILE_SELECTORS: [(u32, Column); 2] = [
     (ECALL_BLAKE2B_COMPRESS, Column::IsBlakeEcall),
-    (ECALL_RISTRETTO_SCALAR_MULT, Column::Is110Ecall),
-    (ECALL_RISTRETTO_POINT_ADD, Column::Is111Ecall),
-    (ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, Column::Is112Ecall),
-    (ECALL_SCALAR_MUL_MOD_L, Column::Is113Ecall),
-    (ECALL_SCALAR_ADD_MOD_L, Column::Is114Ecall),
+    (ECALL_WITNESS_INPUT, Column::IsWitnessEcall),
 ];
 
 fn traced_side_note(id: u32) -> SideNote {
@@ -59,7 +51,9 @@ fn traced_side_note(id: u32) -> SideNote {
         memory.clone(),
         10_000,
     );
-    let mut tracing = TracingPvm::new(pvm);
+    let mut tracing = TracingPvm::new(pvm)
+        .with_witness_input(vec![1, 2, 3])
+        .expect("a small witness input");
     assert_eq!(tracing.run_with_precompiles(), ExitReason::Panic);
     SideNote::new(tracing.into_trace(), code, bitmask).with_memory(memory)
 }
@@ -166,7 +160,7 @@ fn acknowledged_precompile_cannot_clear_or_swap_exact_dispatch_selector() {
 /// selector and dispatch agree, yet the CPU AIR must reject it.
 #[test]
 fn non_ecalli_row_cannot_be_acknowledged() {
-    let mut side_note = traced_side_note(ECALL_SCALAR_ADD_MOD_L);
+    let mut side_note = traced_side_note(ECALL_BLAKE2B_COMPRESS);
     let chip = CpuChip;
     let trace = chip.generate_component_trace(&mut side_note);
     assert_cpu(&chip, &trace, &side_note).expect("honest trace");
@@ -184,11 +178,11 @@ fn non_ecalli_row_cannot_be_acknowledged() {
     let mut forged = trace;
     for (column, value) in [
         (Column::HostCallAcknowledged, 1u32),
-        (Column::Is114Ecall, 1),
+        (Column::IsBlakeEcall, 1),
         (
             Column::HostCallPrecompileDispatch,
             u32::from(proof_precompile_dispatch_id(u64::from(
-                ECALL_SCALAR_ADD_MOD_L,
+                ECALL_BLAKE2B_COMPRESS,
             ))),
         ),
     ] {

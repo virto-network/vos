@@ -8,6 +8,9 @@ regardless of aggregation. Design decisions (not re-litigated here): approach
 A (Merkle memory), tree keyed by **page address** (not hashed keys),
 **4096-byte pages**, **blake2b** (the existing compression AIR), no PCS change.
 
+The Ristretto chips this design names were since removed (proof format
+28); their mentions here are the design's record, not the current AIR.
+
 This is v2, after a five-lens adversarial review of v1. The review's breaks
 and the resulting changes are folded in throughout; §7 lists the negative
 tests each one demands.
@@ -156,6 +159,13 @@ RistrettoCombCompressOutput. Only MemoryPageChip emits `is_closing = 1` (on
 closing-read tuples). A limb (not a chip-local column alone) is needed
 because MemoryChip cannot otherwise recognize "closing row" — `closing_ts`
 is per-proof data, and MemoryChip's claimed sum is not closed-form.
+
+Since formats 31–34 the limb is `is_closing + 2·permission`: MemoryPageChip's ts=0
+writes carry their page's permission (0 unmapped, 1 readable, 2 writable),
+proven against the program's layout, its preprocessed regions; every other
+producer still emits 0. MemoryChip holds the permission along the address
+group and refuses a write to a page not writable and any access to a page
+not readable.
 
 **ts-exclusivity prerequisites (review BREAKs — the v1 premise was false in
 code, and both holes also undermine the v6 read-consistency claims on their

@@ -149,7 +149,7 @@ fn largest_step(gas: u64) -> Step {
         attests: (0..cap::ATTESTS)
             .map(|_| Attest {
                 program: ProgramHash([0; 32]),
-                arguments: vec![0; cap::REQUEST],
+                witness_input: vec![0; cap::REQUEST],
                 output: vec![0; cap::REPLY],
             })
             .collect(),

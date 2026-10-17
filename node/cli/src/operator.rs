@@ -108,12 +108,12 @@ impl InstallArgs {
 /// version.
 fn derived_lines(derivation: &Derivation, schema: &Schema) -> String {
     let mut lines = format!("done\nprogram {}\n", hex::encode(derivation.program.0));
-    for (method, kernel) in &derivation.kernels {
-        let name = schema.method(*method).map_or_else(
-            || format!("{:#010x}", method.0),
+    for kernel in &derivation.kernels {
+        let name = schema.method(kernel.method).map_or_else(
+            || format!("{:#010x}", kernel.method.0),
             |method| String::from_utf8_lossy(&method.name).into_owned(),
         );
-        lines += &format!("kernel {name} {}\n", hex::encode(kernel.0));
+        lines += &format!("kernel {name} {}\n", hex::encode(kernel.program.0));
     }
     lines += &format!(
         "elf {}\ntranspiler {}\n",

@@ -176,14 +176,14 @@ No proof leaves a test in this slice: masking is slice 6.
     limbs, little-endian, a u32 two, a 32-byte hash 16. The Poseidon2
     channel's `mix_u64` and PoW nonces move to four limbs; today's
     `reduce(lo32), reduce(hi32)` retires with the old formats.
-- **Inner parameters** (formats 26, 27): blowup 4, 44 queries, PoW 20,
+- **Inner parameters** (formats 31, 32): blowup 4, 44 queries, PoW 20,
   FRI fold step 1, log last-layer degree bound 0: 108 conjectured and
-  62.7 proven bits for segments [model], a grind of about 30 ms.
+  62.8 proven bits for segments [model], a grind of about 30 ms.
 - **Interaction PoW of 8 bits,** mixed before any logup challenge is
   drawn (A.1 item 4), in the prover, the native verifier and the
   preflight; its slot in the transcript stays for every format with
   logup.
-- **Device and credential formats** (29, 30): blowup 2, 86 queries, PoW
+- **Device and credential formats** (34, 30): blowup 2, 86 queries, PoW
   20, interaction PoW 8: 62 proven bits, 2 over the floor.
 - **The wrap** (28): blowup 64, 20 queries, PoW 26, interaction PoW 8,
   fold step 3, last layer 2^6, needing affine DEEP batching for its 80
@@ -306,8 +306,9 @@ No proof leaves a test in this slice: masking is slice 6.
   - a follower's catch-up beyond the kept tail.
 - **PolkaJam:** a re-probe on upgrade, and the recompiler run once the
   owner sets `vm.unprivileged_userfaultfd`.
-- **Ristretto ids 110–114:** carried. Derive refuses a kernel that
-  reaches them.
+- **Ristretto ids 110–114:** removed, chips and ids (the owner's
+  decision): they were unsound, and slice 7's generic bignum chip
+  replaces them. Derive refuses a kernel that reaches them.
 - **Estimate:** 2–3 weeks, beside 5.1–5.6.
 
 ### M0 acceptance
@@ -367,8 +368,8 @@ beside 5.8.
   logup, and intermediates.
 - **Beside 5.8:** it needs the gate set's definition, not the VM.
 - **Tests:** §3's four equivalence tests (constraint ≡ gate on random
-  points), on all 32 chips.
-- **Gate:** 32 of 32 chips are equivalent, with counts within 1% of the
+  points), on all 25 chips.
+- **Gate:** 25 of 25 chips are equivalent, with counts within 1% of the
   spike's log.
 - **Estimate:** 1–2 weeks.
 

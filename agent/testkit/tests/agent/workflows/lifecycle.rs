@@ -696,7 +696,7 @@ fn a_nested_attest_commits_with_its_step() {
         let result = flows.batch(1, vec![start]);
         let attests = &due(&result, 0).attests;
         assert_eq!(attests.len(), 1);
-        assert_eq!(attests[0].arguments, values.encode());
+        assert_eq!(attests[0].witness_input, values.encode());
         let checksum = attests[0].output.clone();
         flows.sweep(1);
         assert_eq!(ended(&flows.record(0)), &Outcome::Done(checksum));

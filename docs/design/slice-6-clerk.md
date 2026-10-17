@@ -93,7 +93,7 @@ public output and the anchor hierarchy.
    - **What:**
      - a source read of `starkware-libs/proving`;
      - a design note for zero-knowledge in the pinned Stwo, or its
-       successor: salted commitments, randomized trace rows across the 32
+       successor: salted commitments, randomized trace rows across the 25
        components and their lookup columns, a masked composition;
      - the toolchain move it forces.
    - **The one number it must produce:** whether the degree slack fits
@@ -259,7 +259,9 @@ public output and the anchor hierarchy.
 - **Carried on, by name:**
   - **the private key transform:** not needed here, since 5.4 needs an
     iterating map;
-  - **Ristretto ids 110–114 in the prover:** the Clerk doesn't need them;
+  - **Ristretto ids 110–114 in the prover:** removed in slice 5, chips
+    and ids; the Clerk doesn't need them, and slice 7's generic bignum
+    chip replaces them;
   - **the identity design's step 3** (credentials, anonymous origins):
     slice 6 or later, with a holder-side prover.
 

@@ -10,7 +10,7 @@ use vos_wire::ids::{
 use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, RefineArgs, WorkError};
 use vos_wire::keys::{Due, Transform};
-use vos_wire::records::{Derivation, Snapshot, Workflow, WorkflowState};
+use vos_wire::records::{Derivation, Kernel, Snapshot, Workflow, WorkflowState};
 use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Page, Run, Write};
 use vos_wire::{Decode, Encode};
 
@@ -104,19 +104,29 @@ fn installs_keep_their_bytes() {
     let derivation = Derivation {
         program: ProgramHash([3; 32]),
         kernels: vec![
-            (MethodId(0x0a0b_0c0d), ProgramHash([1; 32])),
-            (MethodId(0x0e0f_1011), ProgramHash([2; 32])),
+            Kernel {
+                method: MethodId(0x0a0b_0c0d),
+                program: ProgramHash([1; 32]),
+                image_root: [7; 32],
+            },
+            Kernel {
+                method: MethodId(0x0e0f_1011),
+                program: ProgramHash([2; 32]),
+                image_root: [8; 32],
+            },
         ],
         elf: [4; 32],
         transpiler: 5,
         heap: 6,
     };
-    let kernel = |method: u32, program: &[u8]| [&method.to_le_bytes()[..], program].concat();
+    let kernel = |method: u32, program: &[u8], root: &[u8]| {
+        [&method.to_le_bytes()[..], program, root].concat()
+    };
     let derived = [
         &[3; 32][..],
         &2u32.to_le_bytes(),
-        &kernel(0x0a0b_0c0d, &[1; 32]),
-        &kernel(0x0e0f_1011, &[2; 32]),
+        &kernel(0x0a0b_0c0d, &[1; 32], &[7; 32]),
+        &kernel(0x0e0f_1011, &[2; 32], &[8; 32]),
         &[4; 32],
         &5u32.to_le_bytes(),
         &6u32.to_le_bytes(),

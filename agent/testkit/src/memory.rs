@@ -4,6 +4,7 @@
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use vos_pvm::ExitReason;
+use vos_pvm::precompile::{WITNESS_INPUT, WitnessFault, WitnessInput};
 use vos_pvm::refine::Machine;
 use vos_wire::abi::{Failure, Rows, cap, price};
 use vos_wire::ids::InstanceId;
@@ -57,25 +58,51 @@ pub(crate) fn precompile(machine: &mut Machine, id: u64) -> Result<(), Failure> 
         .ok_or(Failure::Trapped)
 }
 
-/// Run an attestable method's kernel: arguments in the standard window,
-/// output by the halt convention, and no host calls but precompiles. Its
-/// output and gas used.
+/// A kernel's run: its output, the bytes it read through its witness
+/// input, and the gas it used.
+pub(crate) struct KernelRun {
+    pub output: Vec<u8>,
+    pub witness_input: Vec<u8>,
+    pub gas_used: u64,
+}
+
+/// Run an attestable method's kernel: laid out with no arguments, which it
+/// reads through its witness input from `input`, output by the halt
+/// convention, and no host calls but precompiles. An input past a work
+/// result's cap is refused.
 pub(crate) fn kernel(
     program: &[u8],
-    arguments: &[u8],
+    input: &[u8],
     gas: u64,
     output: usize,
-) -> Result<(Vec<u8>, u64), Failure> {
-    let mut machine = Machine::load(program, arguments, gas).map_err(|_| Failure::Trapped)?;
+) -> Result<KernelRun, Failure> {
+    let mut witness = WitnessInput::new(input).ok_or(Failure::Cap)?;
+    let mut machine = Machine::load(program, &[], gas).map_err(|_| Failure::Trapped)?;
     loop {
         match machine.try_resume().map_err(|_| Failure::Trapped)? {
+            ExitReason::HostCall(WITNESS_INPUT) => {
+                let mut registers = *machine.registers();
+                let mut left = machine.gas_remaining();
+                let served = witness.serve(&mut registers, machine.memory_mut(), &mut left);
+                let spent = machine.gas_remaining() - left;
+                machine.charge(spent);
+                match served {
+                    Ok(_) => *machine.registers_mut() = registers,
+                    Err(WitnessFault::OutOfGas) => return Err(Failure::OutOfGas),
+                    Err(WitnessFault::Unwritable) => return Err(Failure::Trapped),
+                }
+            }
             ExitReason::HostCall(id) if vos_pvm::precompile::is_precompile(id) => {
                 precompile(&mut machine, id)?;
             }
             ExitReason::Halt => {
                 let invocation = machine.finish(ExitReason::Halt);
                 let output = invocation.output_bounded(output).ok_or(Failure::Cap)?;
-                return Ok((output, invocation.gas_used));
+                return Ok(KernelRun {
+                    output,
+                    witness_input: witness.read().to_vec(),
+                    gas_used: invocation.gas_used,
+                });
             }
             ExitReason::OutOfGas => return Err(Failure::OutOfGas),
             _ => return Err(Failure::Trapped),

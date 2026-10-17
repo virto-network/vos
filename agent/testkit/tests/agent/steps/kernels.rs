@@ -1,11 +1,15 @@
 //! Kernels: an attestable method's, bound at install, derived from an
-//! actor's ELF, and run apart from its arguments.
+//! actor's ELF, and run on the arguments their witness input reads.
 
 use super::*;
 use vos_wire::abi::cap::Target;
+use vos_wire::records::Kernel;
 
+/// A kernel's machine maps no arguments: they reach it through its
+/// witness input. A store at the standard argument window, which φ7 names,
+/// traps, in the agent as in the model.
 #[test]
-fn an_attestable_may_not_write_its_arguments() {
+fn a_kernels_argument_window_is_unmapped() {
     use vos_pvm_program::{CodeBlob, StandardProgram, build_standard_program};
     // store_ind_u8 [φ7] = φ0, then return to the halt address.
     let scribble = build_standard_program(&StandardProgram {
@@ -33,7 +37,7 @@ fn an_attestable_may_not_write_its_arguments() {
     else {
         unreachable!("an install")
     };
-    derivation.kernels[0].1 = program;
+    derivation.kernels[0].program = program;
     node.batch(
         0,
         vec![Input::Admin(Admin::Install {
@@ -77,7 +81,7 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
     else {
         unreachable!("an install")
     };
-    let with = |kernels: Vec<(MethodId, vos_wire::ids::ProgramHash)>| {
+    let with = |kernels: Vec<Kernel>| {
         Input::Admin(Admin::Install {
             instance,
             derivation: vos_wire::records::Derivation {
@@ -97,8 +101,20 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
         0,
         vec![
             with(vec![]),
-            with(vec![checksum, (mint, checksum.1)]),
-            with(vec![checksum, (tally, checksum.1)]),
+            with(vec![
+                checksum,
+                Kernel {
+                    method: mint,
+                    ..checksum
+                },
+            ]),
+            with(vec![
+                checksum,
+                Kernel {
+                    method: tally,
+                    ..checksum
+                },
+            ]),
             with(vec![checksum, checksum]),
             with(derivation.kernels.clone()),
         ],

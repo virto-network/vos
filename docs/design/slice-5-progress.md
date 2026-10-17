@@ -390,6 +390,616 @@ its channel, its parameters, its encodings and its floors.
 - Clippy with `-D warnings` on the workspace and on the proof crates with
   `debug-internals`.
 
+## Step 5.5: the witness-input precompile, the run's ends and the io-hash
+
+### The witness input, `0x401`
+
+- **Served alike everywhere:** `vos_pvm::precompile::WitnessInput` serves a
+  call: φ7 the destination, φ8 the capacity, `min(capacity, remaining)`
+  bytes written there and their count in φ7, 0 at the end. The testkit's
+  model and the tracer serve through it; the agent serves through its own
+  `Machine::witness_input`, on VOS and JAM alike (the agent serves its
+  kernels on both). A call that cannot pay stops the kernel out of gas, one
+  whose bytes cannot land traps it, and a handler's call of `0x401` is an
+  id the agent does not serve (`WHAT`).
+- **Its price** (decided here): 2,500 a call, an actor's `input`, plus 24 a
+  byte, an actor's per-byte price, charged before the bytes are written;
+  the agent takes `PRECOMPILE_SERVING` (27,000) from the batch's meter a
+  call, as for every precompile. A kernel's 64 KiB of arguments cost
+  1,575,364 gas [model].
+- **The record:** `Attest { program, witness_input, output }`: the bytes the
+  kernel read, in call order, at most 4 MiB. **Deviation from the plan:**
+  it replaces `arguments` rather than joining it. The kernel now reads its
+  arguments through the input, so the two would hold the same bytes, and a
+  step's sixteen attests at both caps would pass the work result's 4 MiB
+  (`cap::step_result` sizes an attest at its arguments and output: about
+  3.42 MiB of 4 MiB today, 4.42 MiB with both) [model].
+- **`derive`'s prologue** (`TRANSPILER_VERSION` 3, 29 instructions): it
+  reads the input into 17 zero pages past the kernel's read-write data
+  (room for a request's 64 KiB and a byte), calls until a call returns 0,
+  traps if it filled them, calls the entry on the bytes, and returns to
+  the halt address with the output in φ7/φ8 and the io-hash in φ9..φ12.
+  The loader maps no arguments and leaves φ8 at 0. `derive` admits
+  `0x401` (`is_kernel_call`).
+- **The image root:** each `Derivation` kernel (`records::Kernel`) names
+  `image_root`, the page tree's root over its initial memory with no
+  arguments (`vos_pvm_program::image`), computed in `Derivation::new` at
+  install, the VOS node's and the JAM builder's alike.
+
+### The io-hash
+
+`compute_io_hash(public_args, output, roots)` (`vos_pvm_precompiles::io`):
+BLAKE2b-256 of `vos/io/v1`, then the three fields SCALE-encoded (a compact
+length and the bytes; a compact count and each `RootRead` as kind, space,
+LE window and root, 73 bytes). On the PVM it hashes through `0x400`. The
+SDK's attestable entry computes it on its encoded output, with no public
+arguments and no roots, and the prologue leaves it in φ9..φ12.
+
+### The AIR binding
+
+- **CpuChip:** `IsWitnessEcall` selects dispatch 101, committed in
+  PROGRAM_MEMORY like `0x400`'s. Its row reads φ7 and φ8 at its timestamp
+  (the register reads Ristretto's ids share), writes the count to φ7 alone
+  (`ResultIsReg`, `ResultRegIdx` 7), a count below 2^24 at a destination
+  below 2^32; `WitnessNonEmpty` (with an inverse) is set exactly when the
+  count is not zero. Four new emissions: `(φ8, count, lt = 0)` twice to
+  CompareChip, so the count is at most φ8, and `(ts, destination, count)`
+  twice to the new relation `WitnessCall` when non-empty. Four columns.
+- **`WitnessInputChip`** (index 13; `chip_idx::COUNT` 32 → 33, so the
+  component mask is a `u64`): one row a byte, 22 columns, 8 lookups. A
+  call's first row consumes its tuple; while bytes are left a row is
+  followed by the call's next byte, at its timestamp, the next address (a
+  carry chain with every byte range-checked, no wrap past 2^32) and one
+  fewer left; the last has one left; a row that does not start a call
+  follows one that goes on. Each row writes its byte to the memory ledger.
+- **The register ledger sorts reads before writes** within a timestamp
+  (key `2·ts + is_write`). Without it a prover could order the witness
+  call's φ7 read after its write and read the count as the destination;
+  the same freedom let a step reading and writing one register (an ALU op
+  whose destination is a source) read its own result. A same-register gap
+  of 2^27 steps is now the limit, past the 100M-step budget.
+- **The halt:** a halting step's `next_pc` is `PVM_HALT_ADDR`, in the
+  tracer, the Refine prover's observation and CpuChip's two halt
+  selectors, so a segment's `pc_out` is the halt address exactly when it
+  ends at a halt.
+
+### Tests
+
+- live ≡ traced (`pvm/proof/tests/witness_input.rs`): each of the
+  `kernels` actor's three kernels, attested on the agent's model on 0, 4
+  and 200 values, re-runs from its attest (`kernel::trace_kernel`) to the
+  same output and to `compute_io_hash(&[], output, &[])`, reading its
+  recorded input whole; the agent's own tests hold its attests equal to
+  the model's on VOS and JAM;
+- the cursors at every call: one reader program, pinned on both sides
+  (`tracking.rs` for the agent, `witness_input.rs` for the tracer): three
+  bytes, none, four, a short read of three, a read at the end, cursors
+  0, 3, 3, 7, 10;
+- a short read returns its count and a read at the end 0: there, and
+  `vos_pvm`'s unit tests;
+- writes outside the named range refused: a write moved one byte past or
+  before its destination, a byte past or short of the count, and a count
+  past its capacity each fail verification (the last passes once the
+  compare emission is removed); the column-level gates
+  (`witness_input_gate.rs`) for every CpuChip and WitnessInputChip
+  constraint, and the ledger's read-after-write;
+- an oversize input refused: past 4 MiB by `WitnessInput`, the tracer and
+  the agent; past a request's bytes by the prologue, on every host;
+- the initial root equals the install's, the derivation's and the first
+  segment's proven `memory_root`;
+- a halting run's last segment ends at the halt address, and a segment
+  cut just before the halting step ends at that step's pc; the chain
+  verifies.
+
+### Numbers
+
+- **The `kernels` actor's kernels, re-traced** [measured]: `named` 891
+  steps whatever its input; `digest` 1,797, 2,537 and 20,394 steps on 0,
+  4 and 200 values; `areas` 925, 1,697 and 31,094. Each reads its input
+  in two calls, the second at the end; the prologue, the entry's decoding
+  and the io-hash's one compression are in every count.
+- **The witness input's AIR cost** [model]: a row of 22 columns a byte
+  in WitnessInputChip, and four columns on the CPU; a kernel's 64 KiB of
+  arguments is a 2^16-row chip.
+- **The gates** [measured, on this machine]: `just check` green, 1,006
+  tests; `just test-proof` under `systemd-run` at 16 GiB with `nice -n
+  10` and two threads green, 527 tests in its first suite, 1,002 s in all.
+
+### The operand binding
+
+Fable's review of 5.5 found CpuChip bound no register index or
+register-source flag to the instruction: a ThreeReg row could drop its
+ValB read, take any ValB, and write the sum to φ9, an arbitrary io-hash.
+The fix, and the holes of the same class it turned up:
+
+- **The flag bag is 80 bits in 10 bytes** (`PROG_MEMORY_N_FLAGS`; the
+  instruction tuple 32 → 36 limbs). Byte 6 is the instruction's register
+  accesses (`reg_access::access_shape`: ValB from φA or φB or none, ValD
+  from φB or the immediate, the result to φA or φD or none) with the
+  remainder bit of a division and the two operand swaps; bytes 7–9 the
+  compare, branch and bitwise sub-operations, which were bound only as
+  sums (an `And` could be applied as an `Or`, a `MinU` as a `CmovIz`
+  writing anything). CpuChip recomposes bytes 6–9 from their bits, each
+  boolean, in its own constraints (no new lookups); the indices are
+  `ValBRegIdx = RegB + ValBFromA·(RegA − RegB)`, `ValDRegIdx = RegB`,
+  `ResultRegIdx = RegA + ResultToD·(RegD − RegA) + 7·IsWitnessEcall`. A
+  conditional move's result bit is its move, a witness call's its count.
+- **Every instruction's write is recorded** (`tracing::recorded_write`,
+  shared with the Refine prover's observation), even of the value the
+  register held, so `ResultIsReg` is fixed by the instruction.
+- **An immediate operand is the instruction's:** `RegValD` is ValD's
+  source, its register or the immediate, pinned to `ImmBytes`; ValD was
+  free on every immediate instruction (`LoadImm φ4 = 42` could load
+  anything). `LoadImmJump` moves its immediate and `LoadImmJumpInd`'s
+  result is its `imm_x`; both results were free.
+- **Shift amounts:** the identity `RegValD = ShiftAmount + modulus·q` was
+  over M31 with an unchecked 8-byte q, so any amount satisfied it, and it
+  was ungated on immediate shifts. It is now on the low byte, with q's
+  bits (3 and 4 columns), over the integers; `IsShiftConstrained = IsShift`.
+- **MemoryChip** sorts by `2·ts + is_write`, as the register ledger does,
+  and its `IsWrite` and `IsPadding` are boolean.
+- **Lookup tables keyed by main columns:** Range256, BitwiseAnd and
+  PowerOfTwo read their entries from main columns a prover fills, not
+  their committed preprocessed ones; any Range256 check was void. They now
+  read the preprocessed columns; their main traces are multiplicities.
+- **Smaller ones:** the register ledger's `IsPadding` is boolean; the
+  jump table's padding rows (tuple `(0, 0)`) take no multiplicity
+  (`IsEntry`); a MemoryPage page is real on all its 32 rows, so it always
+  produces its leaf; derive and ProgramMemory refuse a static jump to the
+  halt address; a witness call that writes no bytes may name any
+  destination, as the live call does.
+
+Each forgery is a gate that the old code accepted and the new refuses:
+`operand_binding_gate.rs` (12), `memory_ledger_gate.rs` (2),
+`jump_table_gate.rs` (1), and `witness_input.rs`'s zero-count call
+(which failed to prove before).
+
+### Findings, not fixed here
+
+An audit of the other chips for the same class reported these; they are
+the next fixes:
+
+- **The register ledger's merged read slots** (`Ts1..Ts3`) are not
+  ordered: a read can take a stale value by riding an earlier row.
+- **Mul and DivRem carries** are not range-checked, nor the top carry
+  pinned: a product or quotient can be wrong; DivRem's `|r| < |d|` chain
+  uses unchecked carries.
+- **BLAKE2b:** the write addresses are pinned on row 0 only, and the
+  main chip's `IsReal` is not held across its 96 rows.
+- ~~**Ristretto:** ids 110–114 compute nothing tied to memory, row roles
+  and source rows in the comb chips are free, `IsFixedBase` is not
+  checked against the base point.~~ Resolved by removal: the chips and
+  the ids are gone (below).
+- **Shifts right:** nothing distinguishes `ShloR` from `SharR` in the
+  AIR (both prove either quotient).
+- `ShloL/ShloR/SharRImmAlt` take their operands unswapped and do not
+  prove (completeness only).
+
+### The Ristretto chips removed
+
+The owner's decision: the Ristretto and scalar chips were unsound (the
+finding above), derive already refused a kernel using them, and slice 7's
+generic bignum chip replaces them.
+
+- **Gone:** the eight chips (`RistrettoChip`, `RistrettoEcallChip`, the
+  comb table, its anchor, scalar boundary, fixed-base consumer, compress
+  and compress-output chips), their eleven relations, CpuChip's five
+  `Is{110..114}Ecall` selectors and their emissions, the tracer's handlers
+  and records, the side note's streams, the segment cutter's and cursors'
+  streams, the shim's `ristretto` feature (`Scalar`, `RistrettoPoint`) and
+  `curve25519-dalek` from the prover and the shim.
+- **The ids:** 110–114 are no precompile anywhere: the tracer does not
+  serve them (`proof_precompile_dispatch_id` is 0), the runtime neither
+  serves nor prices them, and derive refuses a kernel reaching one; a test
+  pins each.
+- **The AIR:** `chip_idx::COUNT` 33 → 25, `BITWISE_AND_BYTE` at 24, so the
+  component mask is a `u32` again. A witness-input call keeps its φ7 and
+  φ8 register reads, now in a block of their own.
+- **The full width** [measured]: a full canonical segment (every chip,
+  mask `0x1ffffff`) commits **7,556 columns**: 173 preprocessed, 5,107
+  main, 2,268 interaction, 8 composition. It was 13,037 with the
+  Ristretto chips, at 32 chips. The full shape now fits under a kernel
+  leaf's ~9,300-column headroom [model].
+- **Tests:** the Ristretto suites are deleted (`comb_value_sweep`,
+  `ristretto_ts_gate`, the Ristretto parts of `precompiles` and
+  `chip_isolated`); the dispatch gates and the host-call pc gates now run
+  on BLAKE2b and the witness input; the segment fixture threads three
+  BLAKE2b compressions across its windows.
+- **Gates** [measured, on this machine]: `just check` green, 998 tests;
+  `just test-proof` under `systemd-run` at 16 GiB with `nice -n 10` green,
+  465 tests (the prover's library 132 → 91 unit tests); `just
+  test-bench-proof` green; clippy clean on every feature set of `just
+  clippy` that touches the prover.
+
+## 5.5b hardening: ARITH
+
+The arithmetic holes of the AIR audit (G3, and G1's X-DIVHI), closed on
+`s5-hard-arith`. Each forgery is a permanent
+gate in `pvm/proof/tests/arith_gate.rs`: an execution whose destination
+register holds the forged value in every step from the forged one on, so
+the register ledger and the closing state agree with it, proved by forged
+chips that rewrite MulChip's, DivRemChip's and the CpuChip's division
+columns (and move the lookup multiplicities with them) between trace
+generation and commitment, then verified with the real chips. Before the
+fix all eight proved and verified [measured]; after it each is refused.
+
+| hole | forgery (arith_gate.rs) | before | after |
+|---|---|---|---|
+| G3-1 MulChip carries free | `mul64_carries_solved_in_m31_refused` (6·7 as 41), `shlo_l64_…` (1 << 3 as 0xDEAD_BEEF) | accepted | refused: logup sum not zero (non-byte carries) |
+| G3-2 DivRem schoolbook free | `divu64_carries_solved_in_m31_refused` (100/7 as 13) | accepted | refused: logup sum not zero |
+| G3-3 magnitude chains | `rems64_magnitude_carries_solved_in_m31_refused` (−100 rem 7 as −9, \|r\| claimed 0) | accepted | refused: constraints (boolean AbsR carries) |
+| G3-3 signed correction carries free | `divs64_correction_carries_solved_in_m31_refused` (−100/7 as 0xDB6D…DB60 rem −4) | accepted | refused: logup sum not zero |
+| G3-4 / X-DIVHI high half free | `shlo_r64_quotient_top_bits_refused` (0x1000 >> 12 as 1 + 2^52, all carries bytes) | accepted | refused: constraints (H = 0) |
+| G3-4 SharR = ShloR | `shar_r64_sign_dropped_refused` (−1024 >> 3 as the logical shift) | accepted | refused: constraints (floor-division H) |
+| new: 32-bit divisor magnitude | `divs32_negative_divisor_magnitude_refused` (100 / −7 as −13 rem 9, every chain over the integers) | accepted | refused: constraints (\|d\| of the sign-extended word) |
+
+Controls, refused before and after: the honest filler's witness for a
+forged product, the low bits of a shift quotient, and `13·7 + 9 = 100`
+with `r ≥ d`; the harness proves an honest execution.
+
+- **The fixes** (`chips/mul.rs`, `chips/divrem.rs`): Range256 on every
+  byte and carry the chains read — MulChip 64 emissions a row (low and
+  high products, `MulHigh`, the 32 schoolbook and 8 correction carries),
+  DivRemChip 96 (quotient, remainder, high half, the 32 schoolbook and 8
+  correction carries, `AbsD`, `AbsR`, the two compare chains' bytes) —
+  and boolean `AbsDCarry`/`AbsRCarry`/`AbsCmpCarry`/`DivCmpCarry`. Every
+  chain equation then stays below 2^25 and holds over the integers; the
+  schoolbook's final carry is 0 because `q·d + r < 2^(2W)`. DivRemChip
+  pins the schoolbook's high half `H`: `H = 0` on unsigned division and
+  ShloR; `H ≡ sq·d + sd·q + sr − sb + k (mod 2^W)` on DivS/RemS, written
+  with `−sb` as `sb·(2^W − 1)` so the carries stay in {0, 1, 2}; and
+  `H ≡ sq·d − sb` on SharR (the same chain with `sd·q` dropped — a shift's
+  `2^63` is unsigned — and `sr = 0` by `r < d`), which with `0 ≤ r < d`
+  is floor division. These are the auditors' minimal fixes; the SharR
+  high half, their `sb·(d − 1)`, is `sq·d − sb` through the signed chain
+  (equal, as floor division gives `q` the sign of `b`), which reuses its
+  columns.
+- **The flag** (CPU, kept minimal): the DivRem tuple gains `is_shar_r`
+  (41 limbs). It must be committed per opcode, and the 80 flag bits were
+  all in use, so flag byte 0's bit 3 now commits `is_shar_r` in place of
+  `is_mul_upper`, which its three variants (bytes 2–3, bound bit by bit)
+  already imply. CpuChip gains the `IsSharR` column; the byte-0
+  byte-to-bits tuple and the DivRem emission carry it. Program
+  commitments of code with an arithmetic shift or a MulUpper change.
+- **Completeness** (G3-5), each now a positive test in `phase2_alu.rs`:
+  DivS/RemS `MIN / −1` at both widths — a boolean `DivOverflow` adds 1 to
+  the correction, allowed only on a signed division by −1 (all-ones
+  divisor word), where `|r| < 1` and the identity force `b = q = MIN`;
+  `−256 / 256` (the offset chain); DivU32/RemU32/ShloR32 results with bit
+  31 set (a 32-bit row's quotient and remainder are sign-extended words,
+  the `r < d` decision read at byte 3); SharR32 of negative values
+  (`r` taken mod 2^32); SharR by the top bit at both widths. Also found
+  and fixed: a 32-bit remainder by zero of a value with bit 31 set
+  (CpuChip bound the result's high word to the truncated dividend's
+  zeros; `DbzActiveRem64H` now binds it on 64-bit rows only, the 32-bit
+  sign extension covering the rest).
+- **Found here, fixed** (beyond G3): a 32-bit signed division by a
+  negative divisor took `|d|` over the 8 bytes of the zero-extended word,
+  about 2^64, so `|r| < |d|` held for any remainder — a forgery surviving
+  every G3 fix. The magnitude chain now reads the sign-extended word.
+- **G3-6** (and G1's T-WEAK): `forge_two_reg_result`,
+  `forge_three_reg_result` and alu_negative's direct forgeries carry the
+  forged value through every later step (`forge_first_result`), so only
+  the op's own constraints can refuse them; the chips' internal-witness
+  forgeries are arith_gate's. All still refused.
+- **Restructured:** DivRemChip computes its own row (`divrem::entry`,
+  `witness`, `range_checked_bytes`); the CpuChip fill calls it instead of
+  carrying ~300 lines of the chip's chains, and both chips' Range256
+  multiplicities come from the chip's own list.
+- **Width** [measured]: the full shape commits 7,846 columns (173
+  preprocessed, 5,109 main, 2,556 interaction, 8 composition), from 7,556.
+- **Gates** [measured, on this machine]: `just check` green, 998 tests;
+  `just test-proof` under
+  `systemd-run` at 14 GiB with `nice -n 10` green, 493 tests; `just
+  test-bench-proof` green; `just clippy` clean.
+- **Files outside the track's own**, each change isolated: `cpu/classify.rs`
+  (`is_shar_r`, the byte-0 slot), `cpu/columns.rs` (`IsSharR`,
+  `DbzActiveRem64H`), `cpu/mod.rs` and `cpu/interaction.rs` (the byte-0
+  tuple's slot, the DivRem tuple's field, the remainder-by-zero binding),
+  `cpu/trace_fill.rs` (the DivRem block replaced by `divrem::entry`, the
+  multiplicity charges), `side_note.rs` (`DivRemEntry`), `proof.rs` and
+  `refine/tests.rs` (the format), `tests/common/mod.rs`.
+
+## 5.5b hardening: BLAKE
+
+The AIR audit's BLAKE2b group (G4) and the memory group's items on the
+BLAKE2b chip, the root boundary and the host verifier (G2). Each hole's
+forgery is a permanent gate test; each was run on the unfixed tree first.
+
+| hole | before | fix | gate test | after |
+|---|---|---|---|---|
+| G4-1 `IsReal` not held across a compression | ACCEPTED: a lone real row 95 writes a forged digest at a forged address and ts; a lone real row 0 consumes the call and drops the write | `IsReal` boolean, `ContinuityGate·(IsReal_next − IsReal) = 0` (`blake2b/mod.rs`, the IsReal anchor) | `blake2b_gate`: `a_lone_last_row_cannot_write`, `a_lone_first_row_cannot_drop_the_write` | REFUSED (continuity) |
+| G4-1, found here: the trailing partial block | ACCEPTED: block 0 padding, call 0 placed in the 64-row tail, which has no row 95; the wrap to row 0 kept satisfied | `IsTail·IsReal = 0`, `IsTail` preprocessed (`r ≥ 96·⌊N/96⌋`) | `a_tail_block_cannot_consume_a_call` | REFUSED (`IsTail`) |
+| G4-6 `IsReal = 2` | ACCEPTED | the booleanity above | `is_real_two_is_refused` | REFUSED |
+| G4-2 / G2-3 write address pinned on row 0 only | ACCEPTED: row 95's `HWrAddrB2` moved 64 KiB | `HWrAddr` dropped; the writes use the `h` addresses, whose limb relations hold on every row (`blake2b/address.rs`) | `the_write_address_is_pinned_on_the_writing_row` | REFUSED (limb relation) |
+| G4-3 addresses mod p | ACCEPTED: `h_ptr + p` read and written | byte-carry addresses (`address.rs`): limb 0 `ptr0 + i − 256·c_i`, `c_i` boolean, Range256; limbs 1..3 the pointer's or `(ptr >> 8) + 1`'s, chosen by `c_i`; the increment's limbs Range256, carries boolean, no carry out of limb 3 | `an_address_aliased_by_p_is_refused`, `a_range_wrapping_2_32_is_unprovable`, `ranges_carrying_across_limbs_are_accepted` | REFUSED (carry booleanity) |
+| G4-8 dead code | — | `Blake2bStateLookupElements` and the main chip's `EmitMult` deleted | — | — |
+| G4-7 tracer | the flat path read zeros out of range and recorded the access | `handle_blake2b_ecall` serves through `vos_pvm::precompile::execute` on flat and sparse memory alike (refused ⇒ Panic); the ledger builder uses `wrapping_add` | — | — |
+| G2-4 root boundary `IsReal` | ACCEPTED (`IsReal = 2`) | `IsReal·(IsReal − 1) = 0` (`memory_root_boundary.rs`) | `memory_root_boundary_gate` | REFUSED |
+| G2-7 host verify gated on a side-note flag | ACCEPTED end to end: a proof made without the boundary mix, its final φ9 forged, verified against a side note with `closing_chip_active` cleared | the production path (`boundary_positions` known) always mixes the boundary states and checks the claimed sums, and refuses `initial_state.timestamp < 1` (`verify.rs`) | `host_verify_boundary_gate` | REFUSED |
+| G2-2 `IsPadding = 2` mints a write | closed by d418e727, untested; ACCEPTED with the booleanity removed (mutation run) | — | `memory_ledger_padding_gate` | REFUSED |
+
+- **Deviation from the auditor's G4-3 fix.** A full carry chain with
+  Range256 on all four limbs of 192 addresses is 768 lookups a row. Only
+  limb 0 needs its own carry; limbs 1..3 take one of two values, the
+  pointer's own limbs or those of `(ptr >> 8) + 1`, so one range-checked
+  increment per pointer covers them: 198 lookups. Every limb is still a
+  range-checked byte (or a pointer limb, which the CPU's call tuple
+  supplies), every identity is over small integers, so each address is
+  `ptr + i` exactly. G4-2's fix falls out: the write tuples read the `h`
+  addresses on row 95, where their relations hold.
+- **The width** [measured]: `Blake2bChip` is 44 preprocessed (+2), 1,744
+  main (−247) and 1,344 interaction (+396) columns, so the full shape is
+  7,707 columns (+151).
+- **Completeness:** a pointer within 256 bytes of 2^32 (`ptr ≥
+  0xFFFF_FF00`) has no satisfying increment even when its range does not
+  wrap; the standard layout maps nothing above `0xFFFF_0000`.
+- **Dependencies:** the addresses are canonical given canonical `HPtr`
+  and `MPtr` bytes, which the CPU call tuple carries (the CPU group's
+  register limbs).
+- **Not here:** G4-4 and G4-5 (the CPU's 0x400 path) and G2-1 (page
+  permissions) are track CPU's. The AIR changed, so the proof format
+  needs a bump; that is left to the merge of the three tracks.
+- **Gates** [measured, on this machine, under `systemd-run` at 14 GiB with
+  `nice -n 10`, three tracks in parallel]: `just test-proof` green, 478
+  tests (465 + the 13 new gates); `just test-bench-proof` green; `just
+  check` green (`tree_crash` failed once under the parallel load and passed
+  on rerun); clippy clean on every feature set of `just clippy` that
+  touches the prover.
+
+## 5.5b hardening: CPU
+
+The CPU, register and memory-permission holes of the AIR audit (G1, G2-1,
+G4-4, G4-5), each ported as a permanent gate, run first on the unfixed
+AIR (ACCEPTED), then fixed (REFUSED).
+
+### Page permissions: the design (G2-1)
+
+Today the AIR proves a run on an all-RW machine: a store to a read-only
+page, or any access to an unmapped page, faults on the PVM but proves.
+A kernel's permissions are static (no host call changes them) and fixed by
+its layout, which `derive` gives it: the read-only data, the read-write
+data with its heap, and the stack, each a whole number of pages, the
+argument window (empty for a kernel), and nothing else mapped.
+
+The two candidates:
+
+- **(a) A permission in the page leaf**, and a `(page, perm)` relation
+  CpuChip consumes per memory row. It changes what an image root is (the
+  program crate's `image_root`, `page_merkle`, every recorded root), adds
+  per-row lookups to the widest chip, and leaves the BLAKE2b and witness
+  writes, which are not CpuChip's, unchecked.
+- **(b) The layout's regions as preprocessed constants**, each memory
+  access proving its address lies in a permitted region. Per CPU row that
+  is two 32-bit range comparisons, and the precompiles' accesses again.
+
+Chosen: **(b), checked per page and enforced per ledger row**, which is
+cheaper than either as stated and covers every producer:
+
+1. **The regions are preprocessed.** MemoryPageChip carries four regions
+   as constant preprocessed columns, in pages: read-only data and the
+   argument window (readable), read-write data with its heap and the
+   stack (writable). They enter the preprocessed commitment, which is the
+   program's identity, so a proof's permissions are its program id's. A
+   kernel's come from its layout (`trace_kernel`); a side note with no
+   layout (the test machines) has one writable region over all pages.
+2. **A listed page claims its permission and proves it.** Each page row
+   selects at most one region and proves `lo ≤ page < hi` by two 20-bit
+   decompositions. Claiming none (unmapped) needs no proof: it only
+   forbids. A page claimed readable lies in a readable or writable region,
+   one claimed writable in a writable region.
+3. **The ledger carries the permission through each address.** The page's
+   ts=0 write, which starts every address group of the ledger, carries its
+   permission in the tuple's last field (`is_closing + 2·perm`; every other
+   producer emits 0 there, and no other producer emits ts = 0). MemoryChip
+   holds `Readable`/`Writable` constant along the group and enforces on
+   every row after its start: a write needs `Writable`; on an unreadable
+   page the start is followed directly by the closing read.
+
+So every CPU load or store, BLAKE2b read or write and witness-input write
+lands in a group whose page proved the permission it needs, with no new
+lookup, no new relation, and no change to the image root. Cost: on
+MemoryPageChip 8 preprocessed and 46 main columns (4 selectors, the two
+bounds, 40 bits), on MemoryChip 4 main columns, no interaction columns.
+
+Out of this binding: refine machine slices, whose inner machines change
+their pages' permissions at run time (the `pages` host call); their side
+notes keep the all-writable layout. A layout per slice, or a permission
+that a page's history carries, would be their binding.
+
+### The holes, each before and after
+
+Every gate ran first on the unfixed AIR at 0dc9ba45: each forgery
+ACCEPTED (the gate failed with `SOUNDNESS GAP`); after the fix, REFUSED.
+A gate's forgery edits the honest trace as a forger would, consistent with
+every constraint that does not bind the column it changes; a lookup's
+refusal is checked against every chip's constraints and the whole trace's
+logup balance (`harness::base_components`, debug-internals).
+
+- **H-CARRY** (critical): Add/Sub carries were free field elements, so
+  any result solved its byte equations. Now bits on every row.
+  `cpu_soundness_gate::an_add_s_carries_are_bits` (Add64 100 + 7 → 999).
+- **H-REGSLOT** (critical): the merged read slots `Ts1..Ts3` consumed any
+  read, unordered. Gone: each ledger row consumes one access (27 columns
+  and three emissions fewer). `register_ledger_gate::a_read_is_not_merged_into_another`
+  ACCEPTED before; after, the forgery has no column to stand in.
+- **H-REGPAD** (critical): padding switched the sortedness gadget off,
+  and a run after it took a free `PrevValue`. A chain of same-register rows
+  now starts at its register's ts = 0 write (`ChainStartH`), one per
+  register; the auditor's suffix-padding rule plus write-first rule needs a
+  preprocessed first-row column, this needs none and is MemoryChip's rule.
+  `a_read_follows_its_register_s_writes` (a stale read of φ2 after a
+  padding row).
+- **H-PADEMIT** (critical): a padding row's flags were free, so it could
+  emit register, memory, BLAKE2b and witness tuples; `IsPadding` was not a
+  bit. Now `IsPadding` is a bit and a padding row's ten flag bytes are
+  zero; the byte-to-bits lookups run on every row (multiplicity 1, the
+  zero tuple counted per padding row), so every flag is pinned there, and
+  the memory-width shape is ungated, zeroing the active bytes; the
+  precompile selectors and the result write follow. Cheaper than gating
+  each of the ~20 emission multiplicities, and it covers any later gate.
+  `a_padding_row_emits_nothing` (φ2 := 100 at ts 1 from a padding row),
+  `padding_is_a_bit` (Add64 with `IsPadding = 2`, its realness −1).
+- **H-BREQ** (critical): equality was bound one way. `EqFlag` is now the
+  operands' equality both ways on compare and branch rows: the sum of
+  squared byte differences, below 2^20, and its inverse; BranchEq/BranchNe
+  take it as their condition. A branch whose target is its fallthrough
+  records `BranchTaken` as its condition, which the fill now honours
+  (before, the step's "pc moved" bit stood there, which the strict
+  Lt/Ge/Le/Gt constraints refused for a true condition).
+  `an_equal_branch_eq_is_taken`, `an_equal_branch_ne_falls_through`,
+  `equal_operands_are_equal` (BranchLeUImm 42 ≤ 42 not taken);
+  `control_flow_negative` gains the auditor's end-to-end forgeries.
+- **H-MINMAX** (high): MinS/MaxS results were free. One column,
+  `MinMaxLtFlag` (the signed less-than on their rows, the unsigned
+  otherwise), feeds the MinU/MaxU helpers, whose result constraints now
+  cover the signed rows; the auditor's 16 helper columns are not needed.
+  `a_signed_min_is_its_lesser_operand`, `a_signed_max_is_its_greater_operand`.
+- **H-STIMM64** (high): an 8-byte immediate store's high word was free.
+  `ImmYBytes` and ProgramMemory's `ImmYCanon` carry imm_y's fifth byte, its
+  sign byte (the program-memory tuple 37 limbs), and MemValue[4..8] equals
+  it. `a_store_immediate_s_high_word_is_the_instruction_s`.
+- **H-TRAPPC** (high): a Trap's NextPc, a segment's final pc, was free.
+  It stays at its pc. `a_trap_stays_at_its_pc` (a panic presented at the
+  halt address).
+- **H-NOOP** (medium): ProgramMemory served its zero tuple at non-start
+  pcs. A preprocessed `IsInstruction` refuses them any multiplicity.
+  `only_an_instruction_start_is_fetched`.
+- **L-TSLIMB** (low): NextTimestamp's limbs are Range256-checked (8
+  lookups per row, kept last). `a_timestamp_s_limbs_are_bytes` (the limb
+  256, a withheld carry; checked against every chip and the logup balance).
+- **L-PCCARRY** (low): PcCarry bits. `a_pc_carry_is_a_bit`.
+- **L-PHI7, G4-5** (low): `Phi7Bool` tests the sum of φ10's bytes (zero
+  exactly when the register is), not its field reduction; `Phi7Inv` one
+  column. `cpu_completeness::a_compression_flag_of_the_modulus_proves`
+  (φ10 = 2^31 − 1, unprovable before).
+- **L-ISWRITE** (low): the register ledger's `IsWrite` is a bit.
+- **G4-4** (medium): a BLAKE2b call's φ7/φ8 high bytes are zero.
+  `a_compression_s_pointers_are_32_bit`.
+- **G2-1** (high): the design above. `page_permission_gate::a_store_to_a_read_only_page_is_refused`
+  (the auditor's: a store to a read-only and to an unmapped page, run on a
+  writable one; ACCEPTED before, both REFUSED after, and the writable
+  layout proves under another program identity),
+  `a_page_lies_in_the_region_it_claims`, `a_read_of_a_read_only_page_proves`.
+
+**Completeness:**
+
+- **C-IMMALT**, fixed: the ImmAlt shifts swap their operands as RotR's
+  does (`IsRotateRImmAlt` is now `IsImmAlt`, set on all eight).
+  `cpu_completeness::imm_alt_{left,right}_shifts_prove` (the auditor's
+  `5 << 3` refused before).
+- Branches to their fallthrough, fixed (above):
+  `branches_to_their_fallthrough_prove`.
+- **C-DJUMP**, recorded: an invalid dynamic jump (odd, zero or past the
+  table) panics on the machine but has no `(addr, target)` entry, so its
+  step cannot be proven. A kernel ends at a halt (`trace_kernel` refuses
+  any other exit), so no kernel proof needs it; proving it would need a
+  terminal selector whose address provably lies outside the table (odd,
+  or above `2·len`), a comparison against the table's length.
+- The register ledger's 28-bit order delta still caps a register idle for
+  2^27 steps (G1), as the memory ledger's does (G2-5).
+
+**Vacuous negatives replaced:** `forge_two_reg_result` (bitmanip's
+negatives) now carries the forged result through the run, so the ledger
+accepts it and only the operation's constraints can refuse it; all 14 are
+still refused. `forge_three_reg_result` (alu_negative) is track ARITH's.
+The `padding_is_a_bit`, carry and branch gates edit exactly their column.
+
+**Gates** [measured, on this machine, under `systemd-run` at 14 GiB with
+`nice -n 10` and 6 jobs]: `just check` green, 998 tests; `just
+test-proof` green, 493 tests; `just test-bench-proof` green; clippy clean
+on the prover's feature sets of `just clippy`.
+
+**Merge notes:** format 30/31 is also track ARITH's; the merged AIR takes
+one bump. No new flag bit: `IsImmAlt` is the old `IsRotateRImmAlt` bit.
+The byte-to-bits emissions' multiplicity (now 1) sits next to ARITH's
+byte-0 slot; the DivRem emission block and trace_fill's DivRem section are
+untouched.
+
+## 5.5b: the tracks merged, and onto 5.3
+
+The three hardening tracks merged into `s5-witness` (arith, then blake,
+then cpu), and `s5-witness` into `vos-core` over step 5.3.
+
+### The tracks
+
+- **arith** fast-forwarded `s5-witness`; **blake** merged without a
+  conflict.
+- **cpu:** the format history (both tracks had written their own 30 and 31)
+  became one entry for the three tracks' AIR; `tests/common/mod.rs` took
+  arith's `forge_first_result`, the same forgery the cpu track inlined in
+  `forge_two_reg_result`. The overlaps the tracks named merged cleanly and
+  were checked by hand: flag byte 0's bit 3 commits `is_shar_r` (arith) in
+  the byte-to-bits tuples, both the constraint and the interaction side,
+  whose multiplicity is now 1 on every row (cpu), so a padding row's
+  `IsSharR` is pinned to 0 like every flag; the DivRem tuple's 41 limbs
+  (arith) are untouched by cpu; `IsImmAlt` (cpu) and `is_shar_r` (arith)
+  are both set on SharRImmAlt.
+- **Found by the merge:** blake's `memory_ledger_padding_gate` refills the
+  memory ledger from explicit rows, and cpu's permission columns (`IsStart`,
+  `Readable`, `Writable`, `PermissionH`) were left zero, so its honest
+  control failed. The refill now derives them as MemoryChip does; the
+  forgery is still refused (the `IsPadding` booleanity, and now also
+  `IsStart`'s, as the minting row's `IsStart` is −1). The eval helper
+  `combine_le_u64`, whose last callers blake and cpu each removed, is gone.
+- After each merge, every gate test of the three tracks and of 5.5 ran
+  green.
+
+### Onto 5.3
+
+- **Conflicts:** `prove.rs` and `verify.rs`, which 5.3 split into
+  `prove/{canonical,debug,profile}.rs` and `verify/recursion.rs`: 5.3's
+  layout kept, 5.5's edits ported into the moved code (the debug names
+  list: `WitnessInput` in, the Ristretto chips out, `BitwiseAndByte` in;
+  comments). `verify.rs`'s boundary block: 5.3's `mix_boundary_states`
+  and interaction PoW, under blake's G2-7 rule: the production path
+  (`boundary_positions` known) always mixes and checks the claimed sums,
+  whatever `closing_chip_active` says, and refuses an initial timestamp
+  below 1. `lookups/relations.rs`: the Ristretto relations gone, 5.3's
+  `MAX_RELATION_WIDTH` kept over the relations left (`WitnessCall` in,
+  the BLAKE2b state relation out; still 265). The Ristretto files 5.3
+  touched are deleted; `poseidon2_canonical_segment.rs`, which 5.3 had
+  replaced by `verifier/tests/formats.rs`, stays deleted. `justfile`: 5.3's
+  recipes, with 5.5's `build-test-actors` before `test-proof`.
+- **Ported to run-time selection:** the new gate tests drew lookup elements
+  on `recursion_pcs::ProverChannel`; they draw on a `Blake2sChannel` through
+  `ChannelRef`, and arith's forged-chip wrapper implements the erased
+  traits' `ChannelRef` and `SimdBackend` signatures.
+
+### The format numbers
+
+5.5 and the tracks changed the segment AIR, so every format naming it
+takes a new number, and the numbers that named the old one are retired
+(`format::RETIRED`: refused as retired, never registered again). The
+branches' own numbers (26 to 31) were never published and are gone.
+
+| number | proofs | status | counts at its reference shape [model] |
+|---|---|---|---|
+| 28 | the final wrap (recursion AIR) | reserved, unchanged | 146 / 74 (74.71) |
+| 30 | credential proofs (recursion AIR's `p2`) | reserved, unchanged | 106 / 62 (62.52) |
+| 31 | segments, Poseidon2-M31 (was 26) | admitted | 108 / 62 (62.79) |
+| 32 | leaves and folds (was 27) | reserved | 108 / 63 (63.37) |
+| 33 | segments, Blake2s, legacy encodings (was 24); `PROOF_FORMAT_VERSION` | admitted | MOBILE: 96 / 57 (57.49) |
+| 34 | device proofs (was 29) | reserved | 106 / 62 (62.13) |
+| 24, 25, 26, 27, 29 | retired | refused | — |
+
+- 5.3's parameters (2/44/20/1/0/8 inner, 1/86/20/1/0/8 device, the wrap's)
+  and floors are unchanged, and each entry's rounded counts are too. The
+  segment reference shape, recomputed from the AIR: 9,047 sampled values
+  (was 14,102), 5,169 constraints (6,650), 1,553,989,632 logup fractions
+  at 2^20 (2,445,279,232), 97,124,352 at 2^16; relations still up to 265
+  limbs. 86 is still the least device query count that clears 62.
+
+### The width
+
+The full shape [measured] (every chip, mask `0x1ffffff`, from the AIR's
+trace sizes, the method that gave 7,556 at 5.5): **8,039 columns**, 185
+preprocessed, 4,882 main, 2,964 interaction, 8 composition; arith +290,
+blake +151 and cpu +42 over 5.5's 7,556. It still fits a kernel leaf's
+~9,300-column headroom [model].
+
+@GATES@
+
 ## Step 5.7: the items carried from slice 4
 
 ### Per-target limits (the owner's decision)
@@ -595,7 +1205,8 @@ catch-up past the tail 2.24–2.55 s).
 
 Already so: `derive` refuses a kernel reaching any host call but a
 precompile, and these are none. A test now pins it for each of the five
-ids, beside BLAKE2b's precompile, which derives.
+ids, beside BLAKE2b's precompile, which derives. Since removed, chips and
+ids (step 5.5's last section).
 
 ### PolkaJam
 

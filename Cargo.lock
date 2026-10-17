@@ -2601,7 +2601,6 @@ name = "vos-pvm-precompiles"
 version = "0.1.0"
 dependencies = [
  "blake2",
- "curve25519-dalek",
 ]
 
 [[package]]
@@ -2609,6 +2608,7 @@ name = "vos-pvm-program"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "vos-pvm-precompiles",
 ]
 
 [[package]]
@@ -2617,7 +2617,6 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
- "curve25519-dalek",
  "impl-trait-for-tuples",
  "num-traits",
  "postcard",
@@ -2627,8 +2626,12 @@ dependencies = [
  "stwo-constraint-framework",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-precompiles",
+ "vos-pvm-program",
  "vos-pvm-proof-derive",
  "vos-pvm-proof-verifier",
+ "vos-testkit",
+ "vos-wire",
 ]
 
 [[package]]
@@ -2667,6 +2670,7 @@ name = "vos-sdk"
 version = "0.1.0"
 dependencies = [
  "trybuild",
+ "vos-pvm-precompiles",
  "vos-sdk-macros",
  "vos-wire",
 ]
@@ -2692,6 +2696,7 @@ dependencies = [
  "vos-jam",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-tree",
  "vos-wire",

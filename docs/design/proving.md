@@ -45,8 +45,11 @@ Design, draft 5. It is the architecture behind slices 5, 6 and 7
 ## 2. What the research found
 
 - **Verifying a raw segment on JAM is not viable.**
-  - The base AIR is 13,037 columns. Ristretto is 42% of them, BLAKE2b
-    23% and the page-Merkle boundary 22%; the CPU is 6%.
+  - The base AIR was 13,037 columns: Ristretto 42% of them, BLAKE2b
+    23% and the page-Merkle boundary 22%, the CPU 6%. The Ristretto
+    chips have since been removed (unsound; slice 7's generic bignum chip
+    replaces them), and the AIR audit's hardening widened what was left:
+    the full shape is now 25 chips and 8,039 columns [measured].
   - Verify gas is linear in columns. The best measured segment verify
     is 1.17B gas, and every projected lever stacked still leaves
     0.45–0.7B.
@@ -231,7 +234,8 @@ attribution). Its full design is `recursion-air.md`.
   so longer segments make recursion cheaper per step.
   - **The shape per kernel is load-bearing.** A kernel-like shape fits
     the padded shape up to about 9,300 columns. The full 32-chip set
-    (13,037) would double every node.
+    (13,037) would have doubled every node; without the Ristretto chips
+    and hardened, the full set is 8,039 columns, inside it [model].
   - At derive time, each kernel's leaf rows are computed from its shape.
     A kernel over the limit is refused, or waits for a format with a
     larger shape.
@@ -323,9 +327,11 @@ pub struct Statement {
 ```
 
 - **The io-hash** is `BLAKE2b-256(public_args ‖ output ‖ roots)`, in the
-  canonical encoding. The kernel computes it through the `0x400`
-  precompile and writes it to φ9..12 at halt. Today's
-  `compute_io_hash(public, return)` gains the roots.
+  canonical encoding: the domain `vos/io/v1`, then each field's SCALE
+  encoding (a compact length and the bytes; a compact count and each
+  `RootRead` as its kind byte, its space, its window as eight LE bytes and
+  its root). The kernel computes it through the `0x400` precompile and
+  writes it to φ9..12 at halt (`vos_pvm_precompiles::compute_io_hash`).
 - **The venue recomputes the io-hash** from the statement's fields and
   compares it with the proof's public input. It never trusts a submitted
   hash.
@@ -397,12 +403,16 @@ last for decades.**
 
 | proof | target | example | conjectured / proven |
 |---|---|---|---|
-| segment and fold proofs (formats 26, 27) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 44 queries, PoW 20, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 108 / 62 (62.7 for segments, 63 for folds) |
-| device and credential proofs (29, 30; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin | blowup 2 (log 1), 86 queries, PoW 20, plus interaction PoW 8 | 106 / 62 |
+| segment and fold proofs (formats 31, 32) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 44 queries, PoW 20, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 108 / 62 (62.8 for segments, 63 for folds) |
+| device and credential proofs (34, 30; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin | blowup 2 (log 1), 86 queries, PoW 20, plus interaction PoW 8 | 106 / 62 |
 | the final wrap (28) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 80, 74 as built |
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
+- **The numbers:** 31 to 34 name the hardened segment AIR (33 is the legacy
+  Blake2s segment format the default prover produces). 24 to 27 and 29,
+  which named the segment AIR before its hardening, are retired: refused,
+  and never registered again.
 - **The inner grind:** PoW 20 and interaction PoW 8 cost about 30 ms a
   proof on 8 threads, against about 2.1 s at 26 and 24 [model]; the five
   more queries make a fold about 13% dearer [model]. The inner proven count
@@ -682,11 +692,11 @@ alike.
 **A.2 What the in-AIR verifier must handle (M1),** from our chips:
 - **a challenge pair per relation,** drawn as A.1 item 5 says;
 - **chips reading the next row:** CPU, BLAKE2B, BLAKE2B_BOUNDARY, MEMORY,
-  MEMORY_PAGE, REGISTER_MEMORY, and three Ristretto chips;
+  MEMORY_PAGE, REGISTER_MEMORY;
 - **chips finalizing one fraction a column:** bitcount, bitwise_and_byte,
   bitwise_lookup, byte_to_bits, jump_table, memory_root_boundary, memory,
   popcount, power_of_two, program_memory, range_multiplicity,
-  register_memory_boundary, register_memory_closing, ristretto_comb.
+  register_memory_boundary, register_memory_closing.
 
 **A.3 Encodings and the node output (M0 for the encodings, M1 for the
 output).**

@@ -15,8 +15,8 @@ soundness reasoning.
 
 | Input to `verify_standalone(proof, hash)`        | Trusted? | Source                                        |
 |---                                               |---       |---                                            |
-| `proof.format_version`                           | NO       | Verifier rejects a number the registry (`src/format.rs`) does not admit, and a Stark proof on another channel than the format's. |
-| `proof.interaction_pow`                          | NO       | Checked against the format's interaction PoW bits, before any relation challenge is drawn; must be 0 under format 24. |
+| `proof.format_version`                           | NO       | Verifier rejects a number the registry (`src/format.rs`) does not admit (a retired one among them), and a Stark proof on another channel than the format's. |
+| `proof.interaction_pow`                          | NO       | Checked against the format's interaction PoW bits, before any relation challenge is drawn; must be 0 under format 33. |
 | `proof.stark_proof`                              | NO       | Cryptographically verified by stwo.           |
 | `proof.claimed_sums`                             | NO       | Constrained: per-component logup must sum to 0. |
 | `proof.log_sizes`                                | NO       | Capped by `DEFAULT_MAX_LOG_SIZE` (overridable). |
@@ -28,7 +28,7 @@ The verifier accepts the proof iff:
 
 1. `format_version` names an admitted format, and that number plus the
    complete `pcs_config` are bound into the Fiat–Shamir prefix. Under every
-   format but the legacy 24, `pcs_config` must equal the format's, and the
+   format but the legacy 33, `pcs_config` must equal the format's, and the
    proof's conjectured and proven bit counts (`src/security.rs`), taken at
    its own shape, must reach the format's floors.
 2. Nested proof vectors, canonical M31 encodings, component/tree dimensions,
@@ -184,11 +184,11 @@ A proof verified against `hash = H(P)` for program `P` proves that:
 
 ## Proof shape (`pcs_config`)
 
-The registry's formats (`src/format.rs`) fix their parameters: format 26,
+The registry's formats (`src/format.rs`) fix their parameters: format 31,
 the Poseidon2-M31 segment format, proves at blowup 4, 44 queries, 20 PoW
 bits and 8 interaction PoW bits, and is refused below 100 conjectured or
 60 proven bits. A `PcsPolicy` passed to a `*_with_pcs_policy` path pins
-every format's shape, 26's included. What follows is format 24's, the legacy Blake2s format,
+every format's shape, 31's included. What follows is format 33's, the legacy Blake2s format,
 whose proofs carry their own parameters.
 
 `production_pcs_config()` (used by the no-arg `prove`) sets:

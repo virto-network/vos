@@ -345,11 +345,16 @@ impl Outgoing {
 }
 
 /// An attestable method run in this step, kept so the run can be proven
-/// later. Its arguments may be private: work results stay in the space's
-/// log and are never published as they are.
+/// later. Its input may be private: work results stay in the space's log
+/// and are never published as they are.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Attest {
     pub program: ProgramHash,
-    pub arguments: Vec<u8>,
+    /// The bytes the kernel read through its witness input
+    /// ([`crate::abi::precompile::WITNESS_INPUT`]), in call order: its
+    /// arguments, which its prologue reads whole. A prover's re-run serves
+    /// it the same bytes, so the two runs read alike. Within the attest's
+    /// cap, and at most a work result's ([`crate::abi::cap::WORK_RESULT`]).
+    pub witness_input: Vec<u8>,
     pub output: Vec<u8>,
 }

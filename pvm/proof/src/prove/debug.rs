@@ -40,6 +40,7 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
         "ProgBoundary",
         "ProgMemory",
         "JumpTable",
+        "WitnessInput",
         "Range256",
         "BitwiseLookup",
         "PowerOfTwo",
@@ -50,14 +51,7 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
         "Bitwise",
         "Compare",
         "DivRem",
-        "Ristretto",
-        "RistrettoEcall",
-        "RistCombTable",
-        "RistFixedBaseConsumer",
-        "RistCombAnchor",
-        "RistCombScalarBoundary",
-        "RistCombCompress",
-        "RistCombCompressOutput",
+        "BitwiseAndByte",
     ];
 
     let traces: Vec<ComponentTrace> = components

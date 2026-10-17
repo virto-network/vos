@@ -45,19 +45,6 @@ pub struct SideNote {
     /// per-row flag-byte decomposition emissions.  When no consumer
     /// emits, all entries are zero.
     pub byte_to_bits_counts: Vec<u32>,
-    /// Session 2.1: RistrettoCombTableChip multiplicity counts.
-    /// Indexed by `row = window_idx * 16 + scalar_window` (window_idx
-    /// ∈ 0..64, scalar_window ∈ 0..16 ⇒ 1024 rows).  Populated by
-    /// `populate_ristretto_comb_counts` walking each entry in
-    /// `ristretto_comb_calls` and bumping the entry hit by each of
-    /// its 64 windows.
-    pub ristretto_comb_counts: Vec<u32>,
-    /// Session 2.1: per-call records driving the
-    /// `RistrettoFixedBaseConsumerChip` trace fill.  One entry per
-    /// fixed-basepoint scalar mult.  Empty today (consumer chip is a
-    /// chip-isolated POC; production ECALL routing via
-    /// `ScalarMultKind::FixedBasepoint` lands in step 8).
-    pub ristretto_comb_calls: Vec<RistrettoCombCall>,
     /// Blake2b compression calls to prove via the Blake2bChip.
     pub blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
     /// Per-byte memory operations for each blake2b ECALL (reads for h, m;
@@ -77,28 +64,6 @@ pub struct SideNote {
     /// compression's row 95.  A missing entry (hand-built side notes)
     /// defaults to 1.
     pub merkle_blake2b_mults: Vec<u32>,
-    /// R1f: Ristretto255 scalar-mult ECALL records (scalar / input
-    /// point / output point as 32 LE bytes each).  Populated by the
-    /// trace driver after `TracingPvm::run_with_precompiles`; consumed
-    /// by `ingest_ristretto_boundary` to emit RistrettoChip boundary
-    /// rows.  Empty unless the program issued at least one
-    /// ECALL_RISTRETTO_SCALAR_MULT.
-    pub ristretto_calls: Vec<crate::core::tracing::RistrettoRecord>,
-    /// R1f: per-byte memory operations for each Ristretto ECALL (32
-    /// scalar reads + 32 point reads + 32 output writes).  MemoryChip
-    /// will eventually ingest these into the ledger so the
-    /// RistrettoChip memory-consumer lookups balance — currently
-    /// captured but not yet wired into the ledger.
-    pub ristretto_mem_ops: Vec<crate::core::tracing::RistrettoMemOp>,
-    /// Step 9: Ristretto255 point-add ECALL records.
-    pub ristretto_add_calls: Vec<crate::core::tracing::RistrettoPointAddRecord>,
-    pub ristretto_add_mem_ops: Vec<crate::core::tracing::RistrettoPointAddMemOp>,
-    /// Step 12: scalar_from_bytes_mod_order_wide ECALL records.
-    pub scalar_reduce_wide_calls: Vec<crate::core::tracing::ScalarReduceWideRecord>,
-    pub scalar_reduce_wide_mem_ops: Vec<crate::core::tracing::ScalarReduceWideMemOp>,
-    /// Step 18: scalar mul/add mod ℓ ECALL records.
-    pub scalar_binop_calls: Vec<crate::core::tracing::ScalarBinopRecord>,
-    pub scalar_binop_mem_ops: Vec<crate::core::tracing::ScalarBinopMemOp>,
     /// Initial register state at the start of the traced execution.  Seeds
     /// the RegisterMemoryBoundaryChip producers at ts=0 and surfaces in the
     /// public SegmentState boundary.  Default all-zero; callers that care
@@ -158,16 +123,6 @@ pub struct SideNote {
     pub compare_entries: Vec<CompareEntry>,
     /// Per-divrem-row witness for DivRemChip.
     pub divrem_entries: Vec<DivRemEntry>,
-    /// R1e-quat: per-row witness for RistrettoChip's field-arithmetic
-    /// rows (is_add / is_sub / is_mul rows produced by the host-side
-    /// composition in chips::ristretto::{witness, point}).  Populated
-    /// either directly (chip-level tests) or by the trace driver
-    /// when an ECALL_RISTRETTO_SCALAR_MULT step is captured (R1f).
-    /// Empty when the chip is gated off; in that case
-    /// `generate_main_trace` emits all-zero padding rows and the
-    /// chip's lookup balance stays at 0 = 0.
-    #[cfg(feature = "prover")]
-    pub ristretto_field_rows: Vec<crate::chips::ristretto::witness::FieldOpRow>,
     /// Memory-page Merkle boundary payload, built on the prove path by
     /// [`SideNote::ingest_memory_pages`].  Holds the listed pages' entering /
     /// exit images, the boundary multiproof (leaves + merge schedule + roots),
@@ -179,11 +134,16 @@ pub struct SideNote {
     /// unconditionally active and their preprocessed traces are row-index pure).
     #[cfg(feature = "prover")]
     pub memory_pages: Option<MemoryPagePayload>,
+    /// The pages the program may touch, and how: `MemoryPageChip`'s
+    /// preprocessed regions, so part of its proof's program identity.
+    /// Every page writable unless a layout is attached
+    /// ([`Self::with_memory_layout`]), as a kernel's is.
+    pub memory_layout: crate::chips::memory_page::MemoryLayout,
 }
 
 /// The chain-side trace holder: everything a chain pass needs from a traced
 /// run — the program-static fields, the initial memory/register state, and
-/// the five precompile call/mem-op stream pairs — with the steps in
+/// the BLAKE2b precompile's call/mem-op streams — with the steps in
 /// [`CompactStep`] form (no per-step register snapshots), so a
 /// multi-million-step chain resides at ~2.6× less than a full [`SideNote`].
 ///
@@ -207,18 +167,12 @@ pub struct CompactTrace {
     pub initial_memory: Vec<u8>,
     /// Program's jump_table (program-static, shared by all segments).
     pub jump_table: Vec<u32>,
-    /// The five precompile call/mem-op stream pairs, exactly as a full
-    /// `SideNote` carries them (each pair parallel 1:1, ts-ascending).
+    /// The BLAKE2b precompile's call/mem-op streams, exactly as a full
+    /// `SideNote` carries them (parallel 1:1, ts-ascending).
     pub blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
     pub blake2b_mem_ops: Vec<crate::core::tracing::Blake2bMemOp>,
-    pub ristretto_calls: Vec<crate::core::tracing::RistrettoRecord>,
-    pub ristretto_mem_ops: Vec<crate::core::tracing::RistrettoMemOp>,
-    pub ristretto_add_calls: Vec<crate::core::tracing::RistrettoPointAddRecord>,
-    pub ristretto_add_mem_ops: Vec<crate::core::tracing::RistrettoPointAddMemOp>,
-    pub scalar_reduce_wide_calls: Vec<crate::core::tracing::ScalarReduceWideRecord>,
-    pub scalar_reduce_wide_mem_ops: Vec<crate::core::tracing::ScalarReduceWideMemOp>,
-    pub scalar_binop_calls: Vec<crate::core::tracing::ScalarBinopRecord>,
-    pub scalar_binop_mem_ops: Vec<crate::core::tracing::ScalarBinopMemOp>,
+    /// The pages the program may touch (program-static).
+    pub memory_layout: crate::chips::memory_page::MemoryLayout,
 }
 
 impl CompactTrace {
@@ -227,8 +181,8 @@ impl CompactTrace {
     }
 
     /// Expand into the full `SideNote` the single-proof paths hold: steps
-    /// with snapshots rebuilt from `initial_regs`, the streams moved over,
-    /// and the ristretto boundary ingested. Note
+    /// with snapshots rebuilt from `initial_regs` and the streams moved
+    /// over. Note
     /// `SideNote::initial_regs` stays at its all-zero default (as on the
     /// historical assembly path); `prove` seeds it from
     /// `steps[0].regs_before`.
@@ -236,18 +190,10 @@ impl CompactTrace {
         let steps = expand_steps(&self.steps, self.initial_regs);
         let mut sn = SideNote::new(steps, self.code, self.bitmask)
             .with_memory(self.initial_memory)
-            .with_jump_table(self.jump_table);
+            .with_jump_table(self.jump_table)
+            .with_memory_layout(self.memory_layout);
         sn.blake2b_calls = self.blake2b_calls;
         sn.blake2b_mem_ops = self.blake2b_mem_ops;
-        sn.ristretto_calls = self.ristretto_calls;
-        sn.ristretto_mem_ops = self.ristretto_mem_ops;
-        sn.ristretto_add_calls = self.ristretto_add_calls;
-        sn.ristretto_add_mem_ops = self.ristretto_add_mem_ops;
-        sn.scalar_reduce_wide_calls = self.scalar_reduce_wide_calls;
-        sn.scalar_reduce_wide_mem_ops = self.scalar_reduce_wide_mem_ops;
-        sn.scalar_binop_calls = self.scalar_binop_calls;
-        sn.scalar_binop_mem_ops = self.scalar_binop_mem_ops;
-        sn.ingest_ristretto_boundary();
         sn
     }
 }
@@ -275,44 +221,38 @@ pub struct MemoryPagePayload {
     pub multiproof: crate::page_merkle::MerkleMultiproof,
 }
 
-/// Single divrem-row witness for the DivRemLookup
-/// balance.  div_corr_hi / div_corr_carry are DivRemChip-internal;
-/// the 4 sign bits flow from CpuChip via the lookup
-/// tuple so DivRemChip can run the sign-correction chains.
+/// Single divrem-row witness for DivRemChip: the DivRemLookup tuple's
+/// fields and the chip's internal chains (see `chips::divrem::witness`).
 #[derive(Clone, Debug)]
 pub struct DivRemEntry {
     pub val_b: u64,
     pub val_d: u64,
     pub div_quotient: u64,
     pub div_remainder: u64,
-    /// High 8 bytes of the schoolbook output.  Internal to
-    /// DivRemChip — pinned by the schoolbook chain on DivU rows and
-    /// additionally by the sign-correction chain on DivS rows.
+    /// High half of the schoolbook `q·d + r = b + 2^W·H`.
     pub div_corr_hi: [u8; 8],
-    /// Per-byte carry of the sign-correction chain.  Internal
-    /// witness on DivRemChip.
+    /// Per-byte carry of the signed correction chain.
     pub div_corr_carry: [u8; 8],
     pub div_mul_carry: [u8; 16],
     pub div_mul_carry_hi: [u8; 16],
     pub div_by_zero: bool,
     pub is_32bit: bool,
     pub is_div_s: bool,
-    /// `val_d - 1 - div_remainder` chain (val_d + ~div_remainder + 1 in
-    /// two's complement); fired only on unsigned div rows.  Filled
-    /// uniformly so the per-byte Range256 emission balances on every
-    /// real DivRemChip row.
+    /// Arithmetic right shift: floor division by `2^n`.
+    pub is_shar_r: bool,
+    /// The signed division `MIN / −1`, whose true quotient overflows.
+    pub div_overflow: bool,
+    /// `val_d + ~div_remainder` chain (`r < d` on unsigned rows), filled
+    /// on every row.
     pub div_cmp_diff: [u8; 8],
     pub div_cmp_carry: [u8; 8],
-    /// 4 sign bits flowed from CpuChip.  Bound on CpuChip
-    /// via nibble lookups; consumed here for the DivS
-    /// sign-correction chain.
+    /// The 4 sign bits CpuChip pins and flows through the tuple.
     pub sign_bit_b: u8,
     pub sign_bit_d: u8,
     pub sign_bit_q: u8,
     pub sign_bit_r: u8,
-    /// |val_d| / |div_remainder| via two's-complement
-    /// conditional negation + comparison chain.  All six arrays are
-    /// DivRemChip-internal; gated on sign_bit_d/sign_bit_r.
+    /// |val_d| / |div_remainder| via two's-complement conditional
+    /// negation, and their comparison chain.
     pub abs_d: [u8; 8],
     pub abs_d_carry: [u8; 8],
     pub abs_r: [u8; 8],
@@ -392,40 +332,6 @@ pub struct MulEntry {
     pub is_32bit: bool,
 }
 
-/// Session 2.1: one fixed-base scalar-mult call driving the
-/// `RistrettoFixedBaseConsumerChip` + `RistrettoCombCompressChip`
-/// + `RistrettoCombCompressOutputChip` trio.
-///
-/// Step 8 (scalar binding): the `scalar` bytes are pinned to PVM
-/// memory by `RistrettoCombScalarBoundaryChip`.
-///
-/// R1e-bis Batch 4a (output binding): `out_bytes` are produced by
-/// `RistrettoCombCompressChip`'s row +43 (canonical s_can) and
-/// emitted as memory producers by
-/// `RistrettoCombCompressOutputChip`'s 32 rows per call at
-/// `(output_ptr + i, byte, ts, is_write=1)`.  `output_ptr` and
-/// `ts` come straight from the actor's ECALL-step register
-/// snapshot via `ingest_ristretto_boundary`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RistrettoCombCall {
-    /// 32 LE bytes; the scalar `k` to multiply against the fixed
-    /// basepoint G.  Decomposes into 64 4-bit windows that drive the
-    /// per-window `RistrettoCombLookupElements` lookups.
-    pub scalar: [u8; 32],
-    /// 32 LE bytes; the canonical compressed Ristretto encoding of
-    /// `k · G`.  Equals `compress(k · G)` per RFC 9496.  Drives the
-    /// output chip's memory producer at `(output_ptr+i, byte, ts,
-    /// is_write=1)`.
-    pub out_bytes: [u8; 32],
-    /// `output_ptr` register value at the ECALL step — base of the
-    /// 32-byte output buffer in PVM memory.  Drives the output
-    /// chip's per-byte memory address.
-    pub output_ptr: u32,
-    /// ECALL step timestamp.  Same `ts` as the matching
-    /// `RistrettoMemOp`; used by the output chip's memory producer.
-    pub ts: u64,
-}
-
 impl SideNote {
     pub fn new(steps: Vec<PvmStep>, code: Vec<u8>, bitmask: Vec<u8>) -> Self {
         Self::new_shared(steps, code.into(), bitmask.into())
@@ -449,20 +355,10 @@ impl SideNote {
             popcount_counts: vec![0u32; 256],
             bitcount_counts: vec![0u32; 256],
             byte_to_bits_counts: vec![0u32; 256],
-            ristretto_comb_counts: vec![0u32; 1024],
-            ristretto_comb_calls: Vec::new(),
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
             merkle_blake2b_calls: Vec::new(),
             merkle_blake2b_mults: Vec::new(),
-            ristretto_calls: Vec::new(),
-            ristretto_mem_ops: Vec::new(),
-            ristretto_add_calls: Vec::new(),
-            ristretto_add_mem_ops: Vec::new(),
-            scalar_reduce_wide_calls: Vec::new(),
-            scalar_reduce_wide_mem_ops: Vec::new(),
-            scalar_binop_calls: Vec::new(),
-            scalar_binop_mem_ops: Vec::new(),
             initial_regs: [0u64; NUM_REGS],
             final_regs: [0u64; NUM_REGS],
             closing_chip_active: false,
@@ -474,9 +370,8 @@ impl SideNote {
             compare_entries: Vec::new(),
             divrem_entries: Vec::new(),
             #[cfg(feature = "prover")]
-            ristretto_field_rows: Vec::new(),
-            #[cfg(feature = "prover")]
             memory_pages: None,
+            memory_layout: Default::default(),
         }
     }
 
@@ -564,6 +459,12 @@ impl SideNote {
         self
     }
 
+    /// Attach the program's layout: the pages it may touch, and how.
+    pub fn with_memory_layout(mut self, layout: crate::chips::memory_page::MemoryLayout) -> Self {
+        self.memory_layout = layout;
+        self
+    }
+
     pub fn with_memory(mut self, flat_mem: Vec<u8>) -> Self {
         self.initial_memory = flat_mem;
         self.sparse_initial_memory = None;
@@ -604,214 +505,6 @@ impl SideNote {
 
     pub fn add_range256(&mut self, value: u8) {
         self.range256_counts[value as usize] += 1;
-    }
-
-    /// R1e-quat: push one RistrettoChip field-op row AND increment the
-    /// Range256 multiplicity for every committed byte on that row.
-    /// Must be used in place of `ristretto_field_rows.push(row)` —
-    /// RangeMultiplicity256's trace fill runs at component index 9
-    /// while RistrettoChip is at index 19, so RistrettoChip can't
-    /// add to the byte counts after its own trace is being built.
-    /// Pushing through this helper guarantees Range256's negative-
-    /// multiplicity consumer side balances against the chip's
-    /// positive emissions.
-    #[cfg(feature = "prover")]
-    pub fn add_ristretto_field_row(&mut self, row: crate::chips::ristretto::witness::FieldOpRow) {
-        if row.is_real != 0 {
-            for k in 0..32 {
-                self.add_range256(row.a[k]);
-                self.add_range256(row.b[k]);
-                self.add_range256(row.out[k]);
-                self.add_range256(row.add_intermediate[k]);
-                self.add_range256(row.pass1_lo[k]);
-                self.add_range256(row.pass1_carry[k]);
-                self.add_range256(row.pass1_carry_mid[k]);
-                self.add_range256(row.pass2_lo[k]);
-                self.add_range256(row.pass2_carry[k]);
-                self.add_range256(row.after_top_bit[k]);
-                self.add_range256(row.after_top_carry[k]);
-                self.add_range256(row.sub_chain_carry_aip[k]);
-            }
-            for k in 0..64 {
-                self.add_range256(row.mul_product[k]);
-                self.add_range256(row.mul_carry[k]);
-                self.add_range256(row.mul_carry_mid[k]);
-                self.add_range256(row.mul_carry_hi[k]);
-            }
-            for k in 0..2 {
-                self.add_range256(row.pass1_hi[k]);
-            }
-        }
-        self.ristretto_field_rows.push(row);
-    }
-
-    /// R1f boundary capture: convert each captured Ristretto255 ECALL
-    /// record into a balanced 6-row block on the chip:
-    ///
-    ///   row k+0: INPUT producer  out = scalar bytes
-    ///   row k+1: INPUT producer  out = point bytes
-    ///   row k+2: INPUT producer  out = output bytes
-    ///   row k+3: OUTPUT consumer a = scalar bytes (source = k+0)
-    ///   row k+4: OUTPUT consumer a = point bytes  (source = k+1)
-    ///   row k+5: OUTPUT consumer a = output bytes (source = k+2)
-    ///
-    /// The lookup balances by construction: every producer is drained
-    /// by exactly one consumer.  The chip activates iff at least one
-    /// ECALL was captured.
-    ///
-    /// Caller MUST populate `ristretto_calls` from
-    /// `TracingPvm::ristretto_records()` (and `ristretto_mem_ops` for
-    /// the eventual MemoryChip integration) BEFORE invoking this
-    /// method, and MUST invoke it before any chip's trace fill so the
-    /// Range256 multiplicities accumulate correctly.
-    ///
-    /// **Step-3 limitation**: this is the BYTE-BOUNDARY closure only.
-    /// It does not yet bind the chip output bytes to the actual
-    /// scalar-mult result — that work threads through Step 4 (the
-    /// scalar-mult chain on extended Edwards coords + curve-equation
-    /// witness for compress / decompress).  Until then, the chip
-    /// simply attests "these 96 bytes per call were observed" without
-    /// constraining their relationship.
-    ///
-    /// **Canonicality precondition**: each of scalar / point / output
-    /// must satisfy `< p` byte-wise (debug_assert in `fill_input`).
-    /// Most natural Ristretto encodings sit comfortably under p, but
-    /// arbitrary scalars (mod ℓ) can exceed p; a `fill_input_unchecked`
-    /// variant for the dedicated boundary path lands together with
-    /// Step 4.
-    #[cfg(feature = "prover")]
-    pub fn ingest_ristretto_boundary(&mut self) {
-        use crate::chips::ristretto::witness::{fill_input, fill_output};
-        use crate::core::tracing::ScalarMultKind;
-        let calls = std::mem::take(&mut self.ristretto_calls);
-        // RistrettoCombCall.output_ptr / .ts come from the parallel
-        // ristretto_mem_ops record (same per-call order — every
-        // RistrettoRecord has exactly one matching RistrettoMemOp,
-        // produced together by `TracingPvm::run_with_precompiles`).
-        // Collect the (output_ptr, ts) pairs upfront so the mutable
-        // borrow of `ristretto_comb_calls` below doesn't conflict
-        // with an immutable borrow of `ristretto_mem_ops`.
-        let mem_op_data: Vec<(u32, u64)> = self
-            .ristretto_mem_ops
-            .iter()
-            .map(|op| (op.output_ptr, op.ts))
-            .collect();
-        let mut mem_iter = mem_op_data.iter();
-        for rec in &calls {
-            // Session 2.1 step 8 (partial): route fixed-basepoint
-            // records onto the comb-method path (RistrettoCombTableChip
-            // + RistrettoFixedBaseConsumerChip).  Variable-base records
-            // continue to use RistrettoChip's double-and-add ladder.
-            //
-            // **Soundness gap (deferred follow-up)**: this routing does
-            // not yet tie the consumer chip's per-window k_i nibbles to
-            // the input scalar bytes, nor the chip's final
-            // extended-Edwards Acc to the output's compressed Ristretto
-            // bytes.  Compress chain implementation (R1e-bis) is the
-            // next-larger deliverable; until then a malicious prover
-            // could fabricate a fixed-basepoint scalar mult result.
-            //
-            // We DO bypass RistrettoChip's boundary-row injection for
-            // fixed-base records to realize the perf win.  The chip
-            // gates off (activity.ristretto stays false if no field
-            // rows accumulate) freeing the trace's row budget.
-            // Step the mem-op iterator in lockstep with the call
-            // iterator so each FixedBasepoint call gets its matching
-            // (output_ptr, ts) pair.
-            let mem_op = mem_iter.next().copied();
-            match rec.kind {
-                ScalarMultKind::FixedBasepoint => {
-                    let (output_ptr, ts) =
-                        mem_op.expect("ristretto_mem_ops length must match ristretto_calls");
-                    self.ristretto_comb_calls.push(RistrettoCombCall {
-                        scalar: rec.scalar,
-                        out_bytes: rec.output,
-                        output_ptr,
-                        ts,
-                    });
-                }
-                ScalarMultKind::Variable => {
-                    let scalar_row = self.ristretto_field_rows.len() as u16;
-                    self.add_ristretto_field_row(fill_input(rec.scalar));
-                    let point_row = self.ristretto_field_rows.len() as u16;
-                    self.add_ristretto_field_row(fill_input(rec.point));
-                    let output_row = self.ristretto_field_rows.len() as u16;
-                    self.add_ristretto_field_row(fill_input(rec.output));
-                    self.add_ristretto_field_row(fill_output(rec.scalar, scalar_row));
-                    self.add_ristretto_field_row(fill_output(rec.point, point_row));
-                    self.add_ristretto_field_row(fill_output(rec.output, output_row));
-                }
-            }
-        }
-        self.populate_ristretto_comb_counts();
-        self.populate_ristretto_compress_counts();
-        self.ristretto_calls = calls;
-    }
-
-    /// Session 2.1: walk every entry in `ristretto_comb_calls` and bump
-    /// `ristretto_comb_counts[window_idx * 16 + scalar_window]` for each
-    /// of the call's 64 windows.  Idempotent — resets the counts vector
-    /// to zero before walking, so multiple calls produce the same final
-    /// state.
-    ///
-    /// Drives the lookup balance between the
-    /// `RistrettoFixedBaseConsumerChip` (emits +1 per window) and the
-    /// `RistrettoCombTableChip` (emits −multiplicity per row).
-    pub fn populate_ristretto_comb_counts(&mut self) {
-        for v in self.ristretto_comb_counts.iter_mut() {
-            *v = 0;
-        }
-        for call in &self.ristretto_comb_calls {
-            for i in 0..64usize {
-                let byte = call.scalar[i / 2];
-                let nibble_idx = i % 2;
-                let k_i = ((byte >> (nibble_idx * 4)) & 0x0F) as usize;
-                let row = i * 16 + k_i;
-                self.ristretto_comb_counts[row] += 1;
-            }
-        }
-    }
-
-    /// R1e-bis Batch 3c: walk `ristretto_comb_calls` and bump
-    /// `byte_to_bits_counts` for every byte the compress chain
-    /// sign-checks.  Each fixed-base scalar mult emits 1 sign check
-    /// in Batch 3c (rotate, on `T·z_inv.bytes[0]`) and will grow to
-    /// 3 once Batches 3d/3e add the y_negate and s_neg checks.
-    ///
-    /// Mirrors `populate_ristretto_comb_counts`'s pattern: idempotent
-    /// (does NOT zero the counts, since CpuChip's
-    /// flag-byte decomposition also writes here — additive
-    /// bookkeeping) and called both from chip-isolated tests and
-    /// from `ingest_ristretto_boundary` for production traces.
-    #[cfg(feature = "prover")]
-    pub fn populate_ristretto_compress_counts(&mut self) {
-        use crate::chips::ristretto::comb_table::{
-            CombTable, NUM_WINDOWS, ed25519_basepoint_extended,
-        };
-        use crate::chips::ristretto::compress::compute_compress_witness;
-        use crate::chips::ristretto::point::{ExtendedPoint, point_add_rows, point_identity};
-
-        let table = CombTable::from_base(&ed25519_basepoint_extended());
-        for call in &self.ristretto_comb_calls {
-            // Re-derive Acc = scalar · G via the comb-table walk
-            // (mirrors `RistrettoCombCompressChip::build_compress_rows`).
-            let mut acc = point_identity();
-            for w in 0..NUM_WINDOWS {
-                let byte = call.scalar[w / 2];
-                let nibble_idx = w % 2;
-                let k_i = ((byte >> (nibble_idx * 4)) & 0x0F) as usize;
-                let entry: ExtendedPoint = table.rows[w][k_i];
-                let (_r, new_acc) = point_add_rows(&acc, &entry);
-                acc = new_acc;
-            }
-            let w = compute_compress_witness(&acc);
-            // Rotate sign source: byte 0 of T·z_inv.
-            self.byte_to_bits_counts[w.t_z_inv[0] as usize] += 1;
-            // y_negate sign source: byte 0 of X'·z_inv.
-            self.byte_to_bits_counts[w.x_z_inv[0] as usize] += 1;
-            // s_neg sign source: byte 0 of s.
-            self.byte_to_bits_counts[w.s[0] as usize] += 1;
-        }
     }
 
     pub fn add_bitwise_and(&mut self, a: u8, b: u8) {

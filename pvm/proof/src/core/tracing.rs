@@ -4,12 +4,11 @@ use vos_pvm::args;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
 
-use crate::core::step::{CompactStep, MemAccess, PvmStep, RegWrite, expand_steps};
+use vos_pvm::precompile::{WITNESS_INPUT, WitnessFault, WitnessInput, WitnessRead};
 
-pub use crate::core::ecall::{
-    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_POINT_ADD, ECALL_RISTRETTO_SCALAR_MULT,
-    ECALL_SCALAR_ADD_MOD_L, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE, ECALL_SCALAR_MUL_MOD_L,
-};
+use crate::core::step::{CompactStep, MemAccess, PvmStep, RegWrite, WitnessWrite, expand_steps};
+
+pub use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
 
 /// A recorded blake2b call for the precompile chip.
 #[derive(Clone, Debug)]
@@ -41,153 +40,6 @@ pub struct Blake2bMemOp {
     pub out_bytes: [u8; 64],
 }
 
-/// A recorded scalar mul/add mod ℓ call for chip integration.
-/// Both ECALL types share the same shape: 32B + 32B → 32B.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ScalarBinopRecord {
-    pub op_id: u32, // ECALL_SCALAR_MUL_MOD_L or _ADD_MOD_L
-    pub a: [u8; 32],
-    pub b: [u8; 32],
-    pub output: [u8; 32],
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct ScalarBinopMemOp {
-    /// ECALL id (113 = SCALAR_MUL_MOD_L, 114 = SCALAR_ADD_MOD_L).  Carried so
-    /// RistrettoEcallChip can emit the matching RELATION-A `id` limb (the two
-    /// share an identical memory layout but CpuChip produces a per-imm id).
-    pub op_id: u32,
-    pub a_ptr: u32,
-    pub b_ptr: u32,
-    pub output_ptr: u32,
-    pub ts: u64,
-    pub a_bytes: [u8; 32],
-    pub b_bytes: [u8; 32],
-    pub out_bytes: [u8; 32],
-}
-
-/// A recorded wide-scalar reduction call for chip integration.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ScalarReduceWideRecord {
-    pub wide: [u8; 64],
-    pub output: [u8; 32],
-}
-
-/// Per-byte memory operations for a single
-/// scalar_from_bytes_mod_order_wide ECALL: 64 reads + 32 writes.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ScalarReduceWideMemOp {
-    pub wide_ptr: u32,
-    pub output_ptr: u32,
-    pub ts: u64,
-    pub wide_bytes: [u8; 64],
-    pub out_bytes: [u8; 32],
-}
-
-/// A recorded Ristretto255 point-add call for the (in-progress) chip
-/// integration.  Captures both compressed inputs + the compressed
-/// output — the bytes the chip's boundary lookup will commit to.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RistrettoPointAddRecord {
-    pub p: [u8; 32],
-    pub q: [u8; 32],
-    pub output: [u8; 32],
-}
-
-/// Per-byte memory operations for a single ristretto_point_add ECALL.
-/// 32 P-bytes + 32 Q-bytes read at the call's timestamp + 32 output
-/// bytes written.  Insertion order in the MemoryChip ledger keeps
-/// reads before writes at tie-break.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RistrettoPointAddMemOp {
-    pub p_ptr: u32,
-    pub q_ptr: u32,
-    pub output_ptr: u32,
-    pub ts: u64,
-    pub p_bytes: [u8; 32],
-    pub q_bytes: [u8; 32],
-    pub out_bytes: [u8; 32],
-}
-
-/// Classification of the input point in a `RistrettoRecord`, set by
-/// the ECALL handler from `detect_scalar_mult_kind`.  Lets the chip
-/// dispatch fixed-base scalar mults (Ristretto255 basepoint G) onto
-/// the comb-method path and variable-base mults onto double-and-add.
-///
-/// This enum is the side-note plumbing for the comb method.  The chip
-/// side (lookup relation, preprocessed columns, fixed-base row class)
-/// is the follow-up; today the field is informational and the chip
-/// still runs the variable-base path for every record.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
-pub enum ScalarMultKind {
-    /// Default: input point is not a registered fixed base.  Chip
-    /// runs the double-and-add ladder over the decompressed input.
-    #[default]
-    Variable,
-    /// Input point bytes matched the canonical Ristretto255 basepoint
-    /// `G`.  Chip can route through the comb-table fixed-base path.
-    FixedBasepoint,
-}
-
-/// Detect whether a 32-byte compressed Ristretto255 point is a
-/// registered fixed base.  Only the canonical basepoint is supported
-/// today; future protocols (Pedersen `H` etc.) would extend this.
-pub fn detect_scalar_mult_kind(point_bytes: &[u8; 32]) -> ScalarMultKind {
-    #[cfg(feature = "prover")]
-    {
-        let bp = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
-        if *point_bytes == bp {
-            return ScalarMultKind::FixedBasepoint;
-        }
-    }
-    let _ = point_bytes;
-    ScalarMultKind::Variable
-}
-
-/// A recorded Ristretto255 scalar-mult call for the precompile chip.
-/// Captures the canonical 32-byte scalar, 32-byte compressed input
-/// point, and 32-byte compressed output point — exactly the bytes the
-/// chip's boundary lookup will commit to.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RistrettoRecord {
-    pub scalar: [u8; 32],
-    pub point: [u8; 32],
-    pub output: [u8; 32],
-    /// Set by `detect_scalar_mult_kind` from `point` at ECALL time.
-    /// Drives chip-side dispatch between comb-method and double-and-add.
-    pub kind: ScalarMultKind,
-}
-
-/// Per-byte memory operations for a single ristretto_scalar_mult ECALL.
-/// 32 scalar reads + 32 point reads + 32 output writes, all sharing the
-/// ECALL step's timestamp.  Insertion order in the MemoryChip ledger
-/// keeps reads before writes at tie-break.
-#[derive(Clone, Debug, PartialEq)]
-pub struct RistrettoMemOp {
-    /// Pointer register φ\[7\] — base of the 32-byte scalar buffer.
-    pub scalar_ptr: u32,
-    /// Pointer register φ\[8\] — base of the 32-byte input compressed point.
-    pub point_ptr: u32,
-    /// Pointer register φ\[9\] — base of the 32-byte output compressed point.
-    pub output_ptr: u32,
-    /// Timestamp of the ECALL step that triggered the precompile.
-    pub ts: u64,
-    /// 32 scalar bytes read at (scalar_ptr + i, ts).
-    pub scalar_bytes: [u8; 32],
-    /// 32 point bytes read at (point_ptr + i, ts).
-    pub point_bytes: [u8; 32],
-    /// 32 output bytes written at (output_ptr + i, ts).
-    pub out_bytes: [u8; 32],
-    /// Mirrors `RistrettoRecord.kind` so the
-    /// memory-producer chip can dispatch on basepoint vs variable-base
-    /// without rejoining records and memops.  `RistrettoEcallChip` uses
-    /// this to skip the scalar-byte producers for `FixedBasepoint`
-    /// records — those bytes are produced by
-    /// `RistrettoCombScalarBoundaryChip` instead so the ledger can bind
-    /// the scalar nibbles directly to PVM memory.
-    pub kind: ScalarMultKind,
-}
-
 pub struct TracingPvm {
     pub pvm: Interpreter,
     /// Recorded steps in compact form — the register-file snapshots are
@@ -208,14 +60,11 @@ pub struct TracingPvm {
     last_regs: [u64; PVM_REGISTER_COUNT],
     pub blake2b_records: Vec<Blake2bRecord>,
     pub blake2b_mem_ops: Vec<Blake2bMemOp>,
-    pub ristretto_records: Vec<RistrettoRecord>,
-    pub ristretto_mem_ops: Vec<RistrettoMemOp>,
-    pub ristretto_add_records: Vec<RistrettoPointAddRecord>,
-    pub ristretto_add_mem_ops: Vec<RistrettoPointAddMemOp>,
-    pub scalar_reduce_wide_records: Vec<ScalarReduceWideRecord>,
-    pub scalar_reduce_wide_mem_ops: Vec<ScalarReduceWideMemOp>,
-    pub scalar_binop_records: Vec<ScalarBinopRecord>,
-    pub scalar_binop_mem_ops: Vec<ScalarBinopMemOp>,
+    /// The input a kernel's witness-input calls read, when the run has one;
+    /// without it a witness-input call is an unhandled host call.
+    witness_input: Option<WitnessInput<Vec<u8>>>,
+    /// Each witness-input call served, in order.
+    pub witness_reads: Vec<WitnessRead>,
     timestamp: u64,
 }
 
@@ -229,16 +78,25 @@ impl TracingPvm {
             last_regs: [0u64; PVM_REGISTER_COUNT],
             blake2b_records: Vec::new(),
             blake2b_mem_ops: Vec::new(),
-            ristretto_records: Vec::new(),
-            ristretto_mem_ops: Vec::new(),
-            ristretto_add_records: Vec::new(),
-            ristretto_add_mem_ops: Vec::new(),
-            scalar_reduce_wide_records: Vec::new(),
-            scalar_reduce_wide_mem_ops: Vec::new(),
-            scalar_binop_records: Vec::new(),
-            scalar_binop_mem_ops: Vec::new(),
+            witness_input: None,
+            witness_reads: Vec::new(),
             timestamp: 1, // 0 is reserved for initial memory entries
         }
+    }
+
+    /// Serve the run's witness-input calls from `input`, as the agent
+    /// served the kernel's live run from the bytes its attest recorded.
+    /// `None` past an input's cap ([`vos_pvm::precompile::WITNESS_INPUT_MAX`]).
+    pub fn with_witness_input(mut self, input: Vec<u8>) -> Option<Self> {
+        self.witness_input = Some(WitnessInput::new(input)?);
+        Some(self)
+    }
+
+    /// The witness input's bytes read so far, and how many remain.
+    pub fn witness_cursor(&self) -> Option<(usize, usize)> {
+        self.witness_input
+            .as_ref()
+            .map(|input| (input.cursor(), input.remaining()))
     }
 
     /// Execute a single step, recording the witness.
@@ -293,23 +151,22 @@ impl TracingPvm {
 
         let regs_after = self.pvm.registers;
         let gas_after = self.pvm.gas;
-        let next_pc = self.pvm.pc;
+        // A halting step continues at the halt address, outside a derived
+        // program's code: its segment ends there only at a halt.
+        let next_pc = if result == Some(ExitReason::Halt) {
+            vos_pvm::PVM_HALT_ADDR as u32
+        } else {
+            self.pvm.pc
+        };
 
-        let reg_write = (0..PVM_REGISTER_COUNT).find(|&i| regs_before[i] != regs_after[i]);
-        // One interpreter step writes at most one register (every opcode
-        // arm is a single assignment) — the invariant that
-        // makes `RegWrite` the whole register-file delta. Verify rather
-        // than assume: a second changed index would be silently lost.
-        if let Some(i) = reg_write
-            && let Some(j) =
-                ((i + 1)..PVM_REGISTER_COUNT).find(|&j| regs_before[j] != regs_after[j])
-        {
-            panic!(
-                "step at ts {} changed registers {i} and {j}: a compact \
-                     step records exactly one register write",
-                self.timestamp,
-            );
-        }
+        let reg_write = recorded_write(
+            opcode,
+            (reg_a, reg_b, reg_d),
+            &regs_before,
+            &regs_after,
+            result.as_ref(),
+        )
+        .unwrap_or_else(|error| panic!("step at ts {}: {error}", self.timestamp));
         self.last_regs = regs_after;
 
         let gas_charged = if need_gas_charge {
@@ -353,6 +210,7 @@ impl TracingPvm {
             gas_charged,
             next_pc,
             host_call_acknowledged: false,
+            witness: None,
             exit,
         });
 
@@ -397,23 +255,17 @@ impl TracingPvm {
             return Some(ExitReason::OutOfGas);
         }
         match exit {
+            ExitReason::HostCall(WITNESS_INPUT) if self.witness_input.is_some() => {
+                if let Some(stop) = self.handle_witness_input() {
+                    return Some(stop);
+                }
+            }
             ExitReason::HostCall(id) if id == u64::from(ECALL_BLAKE2B_COMPRESS) => {
-                self.handle_blake2b_ecall();
-            }
-            ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_SCALAR_MULT) => {
-                self.handle_ristretto_scalar_mult_ecall();
-            }
-            ExitReason::HostCall(id) if id == u64::from(ECALL_RISTRETTO_POINT_ADD) => {
-                self.handle_ristretto_point_add_ecall();
-            }
-            ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE) => {
-                self.handle_scalar_reduce_wide_ecall();
-            }
-            ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_MUL_MOD_L) => {
-                self.handle_scalar_binop_ecall(ECALL_SCALAR_MUL_MOD_L);
-            }
-            ExitReason::HostCall(id) if id == u64::from(ECALL_SCALAR_ADD_MOD_L) => {
-                self.handle_scalar_binop_ecall(ECALL_SCALAR_ADD_MOD_L);
+                // An argument range the machine cannot read or write
+                // panics it, as the refine host's serving does.
+                if !self.handle_blake2b_ecall() {
+                    return Some(ExitReason::Panic);
+                }
             }
             other => return Some(other),
         }
@@ -464,65 +316,73 @@ impl TracingPvm {
         }
     }
 
-    fn handle_blake2b_ecall(&mut self) {
-        // Read h (64 bytes) from memory at address in φ[7] (a0).
-        //
-        // Register convention: vos-pvm-precompiles shim emits a0/a1/a2/a3
-        // → h_ptr/m_ptr/t_low/f_flag, which grey-transpiler maps to PVM
-        // φ[7/8/9/10].  Same off-by-three alignment as the other
-        // precompile handlers (commit 02922c4 + this session's
-        // 5339d38/1cc1296/8c3a9ff for ristretto_scalar_mult /
-        // scalar_reduce_wide / scalar_binop / ristretto_point_add).
-        // Blake2b additionally requires CpuChip-side rewiring (the
-        // `Blake2bCallLookupElements` tuple's slot-to-register-index
-        // mapping is updated in `chips/cpu/{trace_fill,mod,interaction}.rs`).
-        let h_ptr_u = self.pvm.registers[7] as usize;
-        let m_ptr_u = self.pvm.registers[8] as usize;
-        let h_ptr = self.pvm.registers[7] as u32;
-        let m_ptr = self.pvm.registers[8] as u32;
-        let t_low = self.pvm.registers[9];
-        let f = self.pvm.registers[10] != 0; // a3 (= x13 = φ[10]) holds f_flag
+    /// Serve a witness-input call from the run's input, as the agent serves
+    /// it: its bytes written at φ7, its count in φ7, which the step records
+    /// as its register write, and its bytes as its witness write. A call
+    /// that cannot pay stops the run out of gas, and one whose bytes cannot
+    /// land panics it, neither acknowledged.
+    fn handle_witness_input(&mut self) -> Option<ExitReason> {
+        let input = self.witness_input.as_mut().expect("a witness input");
+        let mut registers = self.pvm.registers;
+        let mut gas = self.pvm.gas;
+        let served = input.serve(&mut registers, self.pvm.memory_mut(), &mut gas);
+        self.pvm.gas = gas;
+        let read = match served {
+            Ok(read) => read,
+            Err(WitnessFault::OutOfGas) => return Some(ExitReason::OutOfGas),
+            Err(WitnessFault::Unwritable) => return Some(ExitReason::Panic),
+        };
+        let bytes = input.read()[read.cursor..read.cursor + read.count].to_vec();
+        self.pvm.registers = registers;
+        self.last_regs = registers;
+        let step = self
+            .steps
+            .last_mut()
+            .expect("a served call has its recorded instruction");
+        // The count is the call's register write, even when φ7 held it.
+        step.reg_write = Some(RegWrite {
+            index: 7,
+            value: registers[7],
+        });
+        step.witness = (read.count > 0).then(|| {
+            Box::new(WitnessWrite {
+                address: read.destination as u32,
+                bytes,
+            })
+        });
+        self.witness_reads.push(read);
+        None
+    }
 
-        let mut h = [0u64; 8];
-        let mut m = [0u64; 16];
-        let mut h_bytes = [0u8; 64];
-        let mut m_bytes = [0u8; 128];
-
-        for i in 0..8 {
-            let off = h_ptr_u + i * 8;
-            if off + 8 <= self.pvm.flat_mem().len() {
-                h[i] = u64::from_le_bytes(self.pvm.flat_mem()[off..off + 8].try_into().unwrap());
-                h_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem()[off..off + 8]);
-            }
-        }
-        for i in 0..16 {
-            let off = m_ptr_u + i * 8;
-            if off + 8 <= self.pvm.flat_mem().len() {
-                m[i] = u64::from_le_bytes(self.pvm.flat_mem()[off..off + 8].try_into().unwrap());
-                m_bytes[i * 8..(i + 1) * 8].copy_from_slice(&self.pvm.flat_mem()[off..off + 8]);
-            }
-        }
-
-        let t = t_low as u128;
-
-        // Execute blake2b compression
-        let result = blake2b_compress_sw(&h, &m, t, f);
-
-        // Write result back to h_ptr and capture the exact bytes that hit memory
-        let mut out_bytes = [0u8; 64];
-        for i in 0..8 {
-            let off = h_ptr_u + i * 8;
-            let bytes = result[i].to_le_bytes();
-            out_bytes[i * 8..(i + 1) * 8].copy_from_slice(&bytes);
-            if off + 8 <= self.pvm.flat_mem().len() {
-                self.write_flat_bytes(off, &bytes);
-            }
-        }
-
-        // The ECALL step's timestamp was already assigned and incremented by
-        // the preceding self.step() call; its value is self.timestamp - 1.
+    /// Serve one compression and record it for the BLAKE2b chip: false when
+    /// an argument range is out of the machine's accessible memory.
+    ///
+    /// Served by the runtime's own [`vos_pvm::precompile::execute`], the
+    /// refine host's serving, through the memory's permission-checked
+    /// accessors, over a flat or a sparse memory alike: a range the runtime
+    /// refuses (a 64-bit pointer, an inaccessible or wrapping range) is a
+    /// panic here too, never a read of zeros.
+    fn handle_blake2b_ecall(&mut self) -> bool {
+        let registers = self.pvm.registers;
+        let Some(vos_pvm::precompile::PrecompileCall::Blake2bCompress {
+            h_ptr,
+            m_ptr,
+            h,
+            m,
+            t,
+            f,
+            h_bytes,
+            m_bytes,
+            out_bytes,
+        }) = vos_pvm::precompile::execute(
+            u64::from(ECALL_BLAKE2B_COMPRESS),
+            &registers,
+            self.pvm.memory_mut(),
+        )
+        else {
+            return false;
+        };
         let ts = self.timestamp - 1;
-
         self.blake2b_records.push(Blake2bRecord { h, m, t, f });
         self.blake2b_mem_ops.push(Blake2bMemOp {
             h_ptr,
@@ -532,226 +392,7 @@ impl TracingPvm {
             m_bytes,
             out_bytes,
         });
-    }
-
-    /// Read 32 scalar bytes + 32 compressed-point bytes from flat_mem,
-    /// run the host-side `dalek` scalar mult, write 32 compressed
-    /// output bytes back, and capture the call for the (in-progress)
-    /// RistrettoChip.  Buffers out of bounds are handled by writing
-    /// the canonical compressed-identity sentinel (`[0u8; 32]`) — the
-    /// chip will accept this output as the malformed-input branch.
-    fn handle_ristretto_scalar_mult_ecall(&mut self) {
-        // PVM register convention (matches grey-transpiler's RISC-V → PVM
-        // mapping in `riscv.rs::map_register`):
-        //   φ[7] = A0 (RISC-V x10), φ[8] = A1, φ[9] = A2.
-        // The vos-pvm-precompiles shim's inline asm uses `in("a0") scalar_ptr`
-        // etc., which the transpiler routes to φ[7/8/9].  Earlier code read
-        // φ[10/11/12] (= A3/A4/A5) and silently saw zeros for transpiled
-        // actor traces — the bug that kept the comb-method path dormant in
-        // production.  Other ECALL handlers in this file still use
-        // φ[10/11/12] and have the same bug; they're left as-is here to
-        // keep this fix scoped to the comb path.
-        let scalar_ptr_u = self.pvm.registers[7] as usize;
-        let point_ptr_u = self.pvm.registers[8] as usize;
-        let output_ptr_u = self.pvm.registers[9] as usize;
-        let scalar_ptr = self.pvm.registers[7] as u32;
-        let point_ptr = self.pvm.registers[8] as u32;
-        let output_ptr = self.pvm.registers[9] as u32;
-
-        let mut scalar_bytes = [0u8; 32];
-        let mut point_bytes = [0u8; 32];
-        let mem_len = self.pvm.flat_mem().len();
-        let buffers_in_bounds = scalar_ptr_u.saturating_add(32) <= mem_len
-            && point_ptr_u.saturating_add(32) <= mem_len
-            && output_ptr_u.saturating_add(32) <= mem_len;
-        if buffers_in_bounds {
-            scalar_bytes.copy_from_slice(&self.pvm.flat_mem()[scalar_ptr_u..scalar_ptr_u + 32]);
-            point_bytes.copy_from_slice(&self.pvm.flat_mem()[point_ptr_u..point_ptr_u + 32]);
-        }
-
-        let out_bytes = ristretto_scalar_mult_sw(&scalar_bytes, &point_bytes);
-
-        if buffers_in_bounds {
-            self.write_flat_bytes(output_ptr_u, &out_bytes);
-        }
-
-        let ts = self.timestamp - 1;
-        let kind = detect_scalar_mult_kind(&point_bytes);
-
-        self.ristretto_records.push(RistrettoRecord {
-            scalar: scalar_bytes,
-            point: point_bytes,
-            output: out_bytes,
-            kind,
-        });
-        self.ristretto_mem_ops.push(RistrettoMemOp {
-            scalar_ptr,
-            point_ptr,
-            output_ptr,
-            ts,
-            scalar_bytes,
-            point_bytes,
-            out_bytes,
-            kind,
-        });
-    }
-
-    /// Scalar mul/add mod ℓ.  Reads 32 + 32, writes 32.
-    fn handle_scalar_binop_ecall(&mut self, op_id: u32) {
-        // PVM A0/A1/A2 = φ[7/8/9] per grey-transpiler's mapping.  The
-        // shim's `in("a0") a_ptr, in("a1") b_ptr, in("a2") output_ptr`
-        // routes pointers to those PVM registers. No CpuChip-side binding
-        // tuple, so this is handler-only.
-        let a_ptr_u = self.pvm.registers[7] as usize;
-        let b_ptr_u = self.pvm.registers[8] as usize;
-        let output_ptr_u = self.pvm.registers[9] as usize;
-        let a_ptr = self.pvm.registers[7] as u32;
-        let b_ptr = self.pvm.registers[8] as u32;
-        let output_ptr = self.pvm.registers[9] as u32;
-
-        let mut a_bytes = [0u8; 32];
-        let mut b_bytes = [0u8; 32];
-        let mem_len = self.pvm.flat_mem().len();
-        let buffers_in_bounds = a_ptr_u.saturating_add(32) <= mem_len
-            && b_ptr_u.saturating_add(32) <= mem_len
-            && output_ptr_u.saturating_add(32) <= mem_len;
-        if buffers_in_bounds {
-            a_bytes.copy_from_slice(&self.pvm.flat_mem()[a_ptr_u..a_ptr_u + 32]);
-            b_bytes.copy_from_slice(&self.pvm.flat_mem()[b_ptr_u..b_ptr_u + 32]);
-        }
-
-        let out_bytes = scalar_binop_sw(op_id, &a_bytes, &b_bytes);
-
-        if buffers_in_bounds {
-            self.write_flat_bytes(output_ptr_u, &out_bytes);
-        }
-
-        let ts = self.timestamp - 1;
-        self.scalar_binop_records.push(ScalarBinopRecord {
-            op_id,
-            a: a_bytes,
-            b: b_bytes,
-            output: out_bytes,
-        });
-        self.scalar_binop_mem_ops.push(ScalarBinopMemOp {
-            op_id,
-            a_ptr,
-            b_ptr,
-            output_ptr,
-            ts,
-            a_bytes,
-            b_bytes,
-            out_bytes,
-        });
-    }
-
-    /// Read 64 wide-bytes from flat_mem, reduce via dalek's
-    /// `from_bytes_mod_order_wide`, write 32 canonical scalar bytes
-    /// back, capture the call.  Out-of-bounds buffers ⇒ all-zero
-    /// output (canonical zero scalar).
-    fn handle_scalar_reduce_wide_ecall(&mut self) {
-        // PVM A0/A1 = φ[7/8] per grey-transpiler's RISC-V → PVM
-        // mapping (x10/x11 → φ[7/8]).  The vos-pvm-precompiles shim
-        // uses `in("a0") wide_ptr, in("a1") output_ptr` so the
-        // pointers land in φ[7/8].  The previous handler read
-        // φ[10/11] (= a3/a4), part of the same off-by-three bug
-        // fixed for `handle_ristretto_scalar_mult_ecall` in `02922c4`.
-        // No CpuChip-side binding tuple for this ECALL, so the fix
-        // is purely host-side: ensures the host's reads + writes hit
-        // the correct PVM addresses, making the actor's downstream
-        // reads return the actual canonical scalar.
-        let wide_ptr_u = self.pvm.registers[7] as usize;
-        let output_ptr_u = self.pvm.registers[8] as usize;
-        let wide_ptr = self.pvm.registers[7] as u32;
-        let output_ptr = self.pvm.registers[8] as u32;
-
-        let mut wide_bytes = [0u8; 64];
-        let mem_len = self.pvm.flat_mem().len();
-        let buffers_in_bounds =
-            wide_ptr_u.saturating_add(64) <= mem_len && output_ptr_u.saturating_add(32) <= mem_len;
-        if buffers_in_bounds {
-            wide_bytes.copy_from_slice(&self.pvm.flat_mem()[wide_ptr_u..wide_ptr_u + 64]);
-        }
-
-        let out_bytes = scalar_reduce_wide_sw(&wide_bytes);
-
-        if buffers_in_bounds {
-            self.write_flat_bytes(output_ptr_u, &out_bytes);
-        }
-
-        let ts = self.timestamp - 1;
-        self.scalar_reduce_wide_records
-            .push(ScalarReduceWideRecord {
-                wide: wide_bytes,
-                output: out_bytes,
-            });
-        self.scalar_reduce_wide_mem_ops.push(ScalarReduceWideMemOp {
-            wide_ptr,
-            output_ptr,
-            ts,
-            wide_bytes,
-            out_bytes,
-        });
-    }
-
-    /// Read 32 P-bytes + 32 Q-bytes from flat_mem, run host-side
-    /// `dalek` point addition (compress(decompress(P) + decompress(Q))),
-    /// write 32 output bytes back, and capture the call.  Buffers
-    /// out of bounds → canonical compressed identity sentinel.
-    fn handle_ristretto_point_add_ecall(&mut self) {
-        // PVM A0/A1/A2 = φ[7/8/9] per grey-transpiler's mapping.  Same
-        // off-by-three pattern as the other ECALL handlers; no
-        // CpuChip-side binding tuple, so handler-only fix.
-        let p_ptr_u = self.pvm.registers[7] as usize;
-        let q_ptr_u = self.pvm.registers[8] as usize;
-        let output_ptr_u = self.pvm.registers[9] as usize;
-        let p_ptr = self.pvm.registers[7] as u32;
-        let q_ptr = self.pvm.registers[8] as u32;
-        let output_ptr = self.pvm.registers[9] as u32;
-
-        let mut p_bytes = [0u8; 32];
-        let mut q_bytes = [0u8; 32];
-        let mem_len = self.pvm.flat_mem().len();
-        let buffers_in_bounds = p_ptr_u.saturating_add(32) <= mem_len
-            && q_ptr_u.saturating_add(32) <= mem_len
-            && output_ptr_u.saturating_add(32) <= mem_len;
-        if buffers_in_bounds {
-            p_bytes.copy_from_slice(&self.pvm.flat_mem()[p_ptr_u..p_ptr_u + 32]);
-            q_bytes.copy_from_slice(&self.pvm.flat_mem()[q_ptr_u..q_ptr_u + 32]);
-        }
-
-        let out_bytes = ristretto_point_add_sw(&p_bytes, &q_bytes);
-
-        if buffers_in_bounds {
-            self.write_flat_bytes(output_ptr_u, &out_bytes);
-        }
-
-        let ts = self.timestamp - 1;
-        self.ristretto_add_records.push(RistrettoPointAddRecord {
-            p: p_bytes,
-            q: q_bytes,
-            output: out_bytes,
-        });
-        self.ristretto_add_mem_ops.push(RistrettoPointAddMemOp {
-            p_ptr,
-            q_ptr,
-            output_ptr,
-            ts,
-            p_bytes,
-            q_bytes,
-            out_bytes,
-        });
-    }
-
-    fn write_flat_bytes(&mut self, address: usize, bytes: &[u8]) {
-        debug_assert!(address.saturating_add(bytes.len()) <= self.pvm.flat_mem().len());
-        for (offset, byte) in bytes.iter().copied().enumerate() {
-            let address = u32::try_from(address + offset)
-                .expect("in-bounds PVM flat-memory address must fit u32");
-            self.pvm
-                .write_u8(address, byte)
-                .expect("tracing flat memory is writable");
-        }
+        true
     }
 
     /// Number of steps recorded so far.
@@ -822,15 +463,6 @@ impl TracingPvm {
             })
             .collect();
         side_note.blake2b_mem_ops = self.blake2b_mem_ops;
-        side_note.ristretto_calls = self.ristretto_records;
-        side_note.ristretto_mem_ops = self.ristretto_mem_ops;
-        side_note.ristretto_add_calls = self.ristretto_add_records;
-        side_note.ristretto_add_mem_ops = self.ristretto_add_mem_ops;
-        side_note.scalar_reduce_wide_calls = self.scalar_reduce_wide_records;
-        side_note.scalar_reduce_wide_mem_ops = self.scalar_reduce_wide_mem_ops;
-        side_note.scalar_binop_calls = self.scalar_binop_records;
-        side_note.scalar_binop_mem_ops = self.scalar_binop_mem_ops;
-        side_note.ingest_ristretto_boundary();
         side_note
     }
 
@@ -846,145 +478,6 @@ impl TracingPvm {
     pub fn blake2b_calls(&self) -> &[Blake2bRecord] {
         &self.blake2b_records
     }
-
-    /// Return recorded Ristretto255 scalar-mult calls for the precompile chip.
-    pub fn ristretto_calls(&self) -> &[RistrettoRecord] {
-        &self.ristretto_records
-    }
-}
-
-// ── Software blake2b for the precompile ──────────────────────
-
-const BLAKE2B_IV: [u64; 8] = [
-    0x6A09E667F3BCC908,
-    0xBB67AE8584CAA73B,
-    0x3C6EF372FE94F82B,
-    0xA54FF53A5F1D36F1,
-    0x510E527FADE682D1,
-    0x9B05688C2B3E6C1F,
-    0x1F83D9ABFB41BD6B,
-    0x5BE0CD19137E2179,
-];
-
-const BLAKE2B_SIGMA: [[usize; 16]; 12] = [
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
-    [11, 8, 12, 0, 5, 2, 15, 13, 10, 14, 3, 6, 7, 1, 9, 4],
-    [7, 9, 3, 1, 13, 12, 11, 14, 2, 6, 5, 10, 4, 0, 15, 8],
-    [9, 0, 5, 7, 2, 4, 10, 15, 14, 1, 11, 12, 6, 8, 3, 13],
-    [2, 12, 6, 10, 0, 11, 8, 3, 4, 13, 7, 5, 15, 14, 1, 9],
-    [12, 5, 1, 15, 14, 13, 4, 10, 0, 7, 6, 3, 9, 2, 8, 11],
-    [13, 11, 7, 14, 12, 1, 3, 9, 5, 0, 15, 4, 8, 6, 2, 10],
-    [6, 15, 14, 9, 11, 3, 0, 8, 12, 2, 13, 7, 1, 4, 10, 5],
-    [10, 2, 8, 4, 7, 6, 1, 5, 15, 11, 9, 14, 3, 12, 13, 0],
-    [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15],
-    [14, 10, 4, 8, 9, 15, 13, 6, 1, 12, 0, 2, 11, 7, 5, 3],
-];
-
-fn blake2b_compress_sw(h: &[u64; 8], m: &[u64; 16], t: u128, f: bool) -> [u64; 8] {
-    let mut v = [0u64; 16];
-    v[..8].copy_from_slice(h);
-    v[8..].copy_from_slice(&BLAKE2B_IV);
-    v[12] ^= t as u64;
-    v[13] ^= (t >> 64) as u64;
-    if f {
-        v[14] = !v[14];
-    }
-
-    for round in 0..12 {
-        let s = &BLAKE2B_SIGMA[round];
-        g_sw(&mut v, 0, 4, 8, 12, m[s[0]], m[s[1]]);
-        g_sw(&mut v, 1, 5, 9, 13, m[s[2]], m[s[3]]);
-        g_sw(&mut v, 2, 6, 10, 14, m[s[4]], m[s[5]]);
-        g_sw(&mut v, 3, 7, 11, 15, m[s[6]], m[s[7]]);
-        g_sw(&mut v, 0, 5, 10, 15, m[s[8]], m[s[9]]);
-        g_sw(&mut v, 1, 6, 11, 12, m[s[10]], m[s[11]]);
-        g_sw(&mut v, 2, 7, 8, 13, m[s[12]], m[s[13]]);
-        g_sw(&mut v, 3, 4, 9, 14, m[s[14]], m[s[15]]);
-    }
-
-    let mut result = [0u64; 8];
-    for i in 0..8 {
-        result[i] = h[i] ^ v[i] ^ v[i + 8];
-    }
-    result
-}
-
-fn g_sw(v: &mut [u64; 16], a: usize, b: usize, c: usize, d: usize, mx: u64, my: u64) {
-    v[a] = v[a].wrapping_add(v[b]).wrapping_add(mx);
-    v[d] = (v[d] ^ v[a]).rotate_right(32);
-    v[c] = v[c].wrapping_add(v[d]);
-    v[b] = (v[b] ^ v[c]).rotate_right(24);
-    v[a] = v[a].wrapping_add(v[b]).wrapping_add(my);
-    v[d] = (v[d] ^ v[a]).rotate_right(16);
-    v[c] = v[c].wrapping_add(v[d]);
-    v[b] = (v[b] ^ v[c]).rotate_right(63);
-}
-
-// ── Software Ristretto255 scalar mult for the precompile ─────────
-//
-// Host-side reference using `curve25519-dalek`.  Returns the
-// canonical compressed Ristretto encoding of `k * P`, or `[0u8; 32]`
-// (compressed identity) on either non-canonical scalar bytes or an
-// invalid input point encoding.  This is exactly the function the
-// RistrettoChip will be constrained to compute — by going through
-// `curve25519-dalek`, the precompile's input/output agreement with
-// the reference crypto is by construction.
-
-fn scalar_binop_sw(op_id: u32, a: &[u8; 32], b: &[u8; 32]) -> [u8; 32] {
-    use curve25519_dalek::scalar::Scalar;
-    let sa = Scalar::from_canonical_bytes(*a).into_option();
-    let sb = Scalar::from_canonical_bytes(*b).into_option();
-    match (sa, sb) {
-        (Some(x), Some(y)) => match op_id {
-            ECALL_SCALAR_MUL_MOD_L => (x * y).to_bytes(),
-            ECALL_SCALAR_ADD_MOD_L => (x + y).to_bytes(),
-            _ => [0u8; 32],
-        },
-        _ => [0u8; 32],
-    }
-}
-
-fn scalar_reduce_wide_sw(wide_bytes: &[u8; 64]) -> [u8; 32] {
-    use curve25519_dalek::scalar::Scalar;
-    Scalar::from_bytes_mod_order_wide(wide_bytes).to_bytes()
-}
-
-fn ristretto_point_add_sw(p_bytes: &[u8; 32], q_bytes: &[u8; 32]) -> [u8; 32] {
-    use curve25519_dalek::ristretto::CompressedRistretto;
-    let p = match CompressedRistretto::from_slice(p_bytes)
-        .ok()
-        .and_then(|c| c.decompress())
-    {
-        Some(p) => p,
-        None => return [0u8; 32],
-    };
-    let q = match CompressedRistretto::from_slice(q_bytes)
-        .ok()
-        .and_then(|c| c.decompress())
-    {
-        Some(q) => q,
-        None => return [0u8; 32],
-    };
-    (p + q).compress().to_bytes()
-}
-
-fn ristretto_scalar_mult_sw(scalar_bytes: &[u8; 32], point_bytes: &[u8; 32]) -> [u8; 32] {
-    use curve25519_dalek::ristretto::CompressedRistretto;
-    use curve25519_dalek::scalar::Scalar;
-
-    let scalar = match Scalar::from_canonical_bytes(*scalar_bytes).into_option() {
-        Some(s) => s,
-        None => return [0u8; 32],
-    };
-    let point = match CompressedRistretto::from_slice(point_bytes)
-        .ok()
-        .and_then(|c| c.decompress())
-    {
-        Some(p) => p,
-        None => return [0u8; 32],
-    };
-    (scalar * point).compress().to_bytes()
 }
 
 /// Compute skip(i) — distance to next instruction minus 1.
@@ -1497,12 +990,9 @@ mod tests {
 
     #[test]
     fn precompile_call_is_acknowledged_before_continuing() {
-        let code = vec![
-            Opcode::Ecalli as u8,
-            ECALL_SCALAR_ADD_MOD_L as u8,
-            Opcode::Trap as u8,
-        ];
-        let bitmask = vec![1, 0, 1];
+        let [low, high, ..] = ECALL_BLAKE2B_COMPRESS.to_le_bytes();
+        let code = vec![Opcode::Ecalli as u8, low, high, Opcode::Trap as u8];
+        let bitmask = vec![1, 0, 0, 1];
         let pvm = Interpreter::new(
             code,
             bitmask,
@@ -1514,11 +1004,11 @@ mod tests {
         let mut tracing = TracingPvm::new(pvm);
 
         assert_eq!(tracing.step_with_precompiles(), None);
-        assert_eq!(tracing.pvm.pc, 2, "handled call must advance exactly once");
+        assert_eq!(tracing.pvm.pc, 3, "handled call must advance exactly once");
         assert!(tracing.pvm.pending_host_call().is_none());
         assert_eq!(
             tracing.trace()[0].next_pc,
-            2,
+            3,
             "acknowledged row must produce the continuation PC",
         );
         assert!(
@@ -1560,30 +1050,39 @@ mod tests {
             "unhandled row must expose the cause PC",
         );
     }
-
-    #[test]
-    fn detects_basepoint() {
-        let bp = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
-        assert_eq!(detect_scalar_mult_kind(&bp), ScalarMultKind::FixedBasepoint);
-    }
-
-    #[test]
-    fn rejects_non_basepoint() {
-        let mut bp = curve25519_dalek::constants::RISTRETTO_BASEPOINT_COMPRESSED.to_bytes();
-        bp[0] ^= 0xff; // mutate first byte
-        assert_eq!(detect_scalar_mult_kind(&bp), ScalarMultKind::Variable);
-    }
-
-    #[test]
-    fn rejects_zero() {
-        assert_eq!(
-            detect_scalar_mult_kind(&[0u8; 32]),
-            ScalarMultKind::Variable
-        );
-    }
 }
 
 /// Decode register indices from decoded instruction arguments.
+/// The register write a step records: the register its opcode writes when
+/// it executed, even if it wrote the value the register held (the proof
+/// fixes each instruction's write), and otherwise what it changed, if
+/// anything. A dynamic jump to the halt address executes, writing before it
+/// jumps; a step the machine stopped (out of gas, a fault, a trap, a host
+/// call) does not. An error when the step changed a register other than
+/// that one, or more than one.
+pub(crate) fn recorded_write(
+    opcode: Opcode,
+    (reg_a, reg_b, reg_d): (usize, usize, usize),
+    regs_before: &[u64; PVM_REGISTER_COUNT],
+    regs_after: &[u64; PVM_REGISTER_COUNT],
+    exit: Option<&ExitReason>,
+) -> Result<Option<usize>, &'static str> {
+    let mut changed = (0..PVM_REGISTER_COUNT).filter(|&i| regs_before[i] != regs_after[i]);
+    let first = changed.next();
+    if changed.next().is_some() {
+        return Err("one instruction changed more than one register");
+    }
+    if exit.is_some() && exit != Some(&ExitReason::Halt) {
+        return Ok(first);
+    }
+    let destination =
+        crate::chips::cpu::static_destination(opcode, reg_a, reg_b, reg_d, regs_before);
+    if first.is_some() && first != destination {
+        return Err("an instruction changed a register other than its destination");
+    }
+    Ok(destination)
+}
+
 pub(crate) fn decode_reg_indices(
     _opcode: Opcode,
     decoded_args: &args::Args,

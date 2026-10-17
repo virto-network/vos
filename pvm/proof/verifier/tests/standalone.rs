@@ -10,7 +10,7 @@ use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{Proof, SideNote, prove};
 use vos_pvm_proof_verifier::{CommitmentHash, verify_standalone};
 
-/// The Blake2s Stark proof of a format-24 proof.
+/// The Blake2s Stark proof of a format-33 proof.
 fn stark(proof: &mut Proof) -> &mut StarkProof<Blake2sMerkleHasher> {
     Blake2sMerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Blake2s proof")
 }

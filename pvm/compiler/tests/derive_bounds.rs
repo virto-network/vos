@@ -257,12 +257,12 @@ fn a_crafted_package_derives_in_bounded_time() {
 #[test]
 fn a_kernel_jumping_into_its_prologue_is_refused() {
     // `_start` returns; the entry jumps to the prologue's JALR, at the
-    // prologue (TEXT + 16) plus 8.
+    // prologue (TEXT + 16) plus 80.
     let start = TEXT;
     let entry = TEXT + 4;
     let code: Vec<u8> = [
         i_type(0x67, 0, 0, RA, 0), // _start: ret
-        jal(0, 20),                // entry: j TEXT + 24
+        jal(0, 92),                // entry: j TEXT + 96
         i_type(0x67, 0, 0, RA, 0),
         i_type(0x67, 0, 0, RA, 0),
     ]

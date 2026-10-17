@@ -24,7 +24,6 @@ prover = [
     "dep:vos-pvm",
     "dep:rayon",
     "dep:blake3",
-    "dep:curve25519-dalek",
     "stwo/std",
     "stwo/prover",
     "stwo/parallel",
@@ -58,21 +57,21 @@ num-traits = { version = "0.2", default-features = false }
 impl-trait-for-tuples = { workspace = true }
 rayon = { workspace = true, optional = true }
 blake3 = { version = "1", optional = true }
-# Host-side reference implementation of Ristretto scalar mult, used by
-# the TracingPvm precompile capture path so the prover can record the
-# canonical output bytes alongside the call.  Same crate cipher-clerk
-# uses for its on-chain math, so the precompile boundary is by-
-# construction agreement with cipher-clerk's own crypto.
-curve25519-dalek = { version = "4.1", optional = true, default-features = false, features = ["alloc", "precomputed-tables", "zeroize"] }
 
 [dev-dependencies]
 vos-pvm-compiler = { workspace = true }
+vos-pvm-precompiles = { path = "precompiles", default-features = false, features = ["blake2b"] }
+vos-pvm-program = { workspace = true }
+# The agent's reference model and the test actors it runs (`just
+# build-test-actors`): a kernel's live run, which the prover's re-run of
+# it must match.
+vos-testkit = { path = "../../agent/testkit" }
+vos-wire = { workspace = true }
 bincode = "1"
 # no_std + serde wire format shared with the PVM settlement verifier
 # (settlement-verifier): the fixture this crate serializes is deserialized there.
 postcard = { version = "1", features = ["alloc"] }
 vos-pvm-proof-verifier = { workspace = true }
-curve25519-dalek = { version = "4.1", default-features = false, features = ["alloc", "precomputed-tables"] }
 
 # Both examples demonstrate the prover end-to-end; mark them
 # prover-only so a verifier-only build (`--no-default-features`) skips

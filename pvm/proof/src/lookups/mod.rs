@@ -11,22 +11,19 @@ mod relations;
 
 #[cfg(feature = "prover")]
 pub use self::logup_trace_builder::LogupTraceBuilder;
-pub use self::relations::{MAX_RELATION_WIDTH, boundary_relation_challenges};
+pub use self::relations::{
+    MAX_RELATION_WIDTH, PROG_MEMORY_N_FLAG_BYTES, PROG_MEMORY_N_FLAGS, boundary_relation_challenges,
+};
 pub use self::{
     range_check::Range256LookupElements,
     relations::{
         BitcountLookupElements, BitwiseAndByteLookupElements, BitwiseAndLookupElements,
         BitwiseLookupElements, Blake2bCallLookupElements, Blake2bCompressionLookupElements,
-        Blake2bStateLookupElements, ByteToBitsLookupElements, CompareLookupElements,
-        DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements,
-        MerkleNodeLookupElements, MultiplicationLookupElements, PopcountLookupElements,
-        PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements,
-        RegisterMemoryLookupElements, RistrettoCallLookupElements,
-        RistrettoCombCompressOutputLookupElements, RistrettoCombCompressRegFileLookupElements,
-        RistrettoCombConsumerRegisterFileLookupElements, RistrettoCombCoordBoundaryLookupElements,
-        RistrettoCombFinalAccLookupElements, RistrettoCombLookupElements,
-        RistrettoCombScalarBoundaryLookupElements, RistrettoFixedOutTsLookupElements,
-        RistrettoFixedScalarTsLookupElements, RistrettoRegisterFileLookupElements,
+        ByteToBitsLookupElements, CompareLookupElements, DivRemLookupElements,
+        JumpTableLookupElements, MemoryAccessLookupElements, MerkleNodeLookupElements,
+        MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
+        ProgramExecutionLookupElements, ProgramMemoryLookupElements, RegisterMemoryLookupElements,
+        WitnessCallLookupElements,
     },
 };
 
@@ -43,7 +40,6 @@ macros::register_relation! {
         PowerOfTwoLookupElements,
         PopcountLookupElements,
         BitcountLookupElements,
-        Blake2bStateLookupElements,
         Blake2bCallLookupElements,
         Blake2bCompressionLookupElements,
         MerkleNodeLookupElements,
@@ -52,17 +48,7 @@ macros::register_relation! {
         CompareLookupElements,
         DivRemLookupElements,
         ByteToBitsLookupElements,
-        RistrettoRegisterFileLookupElements,
-        RistrettoCombLookupElements,
-        RistrettoCombConsumerRegisterFileLookupElements,
-        RistrettoCombCoordBoundaryLookupElements,
-        RistrettoCombScalarBoundaryLookupElements,
-        RistrettoCombCompressRegFileLookupElements,
-        RistrettoCombCompressOutputLookupElements,
-        RistrettoCombFinalAccLookupElements,
-        RistrettoCallLookupElements,
-        RistrettoFixedScalarTsLookupElements,
-        RistrettoFixedOutTsLookupElements,
+        WitnessCallLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}
 }

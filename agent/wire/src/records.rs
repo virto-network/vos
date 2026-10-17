@@ -19,7 +19,7 @@ use crate::{Decode, Encode};
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Derivation {
     pub program: ProgramHash,
-    pub kernels: Vec<(MethodId, ProgramHash)>,
+    pub kernels: Vec<Kernel>,
     pub elf: [u8; 32],
     pub transpiler: u32,
     /// The pages of the actor's heap past its program's read-write data,
@@ -28,12 +28,29 @@ pub struct Derivation {
     pub heap: u32,
 }
 
+/// An attestable method's kernel: its program, and the root of the page
+/// tree over its initial memory, laid out with no arguments, from which a
+/// proof of a run of it starts ([`vos_pvm_program::image`]). Its arguments
+/// reach it through its witness input, so the root is the same for every
+/// run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Kernel {
+    pub method: MethodId,
+    pub program: ProgramHash,
+    pub image_root: [u8; 32],
+}
+
 impl Derivation {
     /// The derivation of package `elf`: its actor's program and each
     /// attestable method's kernel, by the method's id, as version
     /// `transpiler` derived them, each named by its hash, and the `heap`
     /// pages its program leaves out. The one constructor of a VOS node's
     /// install and of a JAM builder's, so the two agree.
+    ///
+    /// # Panics
+    ///
+    /// If a kernel is not a standard program, which a derivation never
+    /// makes.
     pub fn new(
         elf: &[u8],
         actor: &[u8],
@@ -45,7 +62,13 @@ impl Derivation {
             program: ProgramHash::of(actor),
             kernels: kernels
                 .iter()
-                .map(|(method, kernel)| (MethodId(*method), ProgramHash::of(kernel)))
+                .map(|(method, kernel)| Kernel {
+                    method: MethodId(*method),
+                    program: ProgramHash::of(kernel),
+                    image_root: vos_pvm_program::parse_standard_program(kernel)
+                        .and_then(|program| program.image_root())
+                        .expect("a derived kernel is a standard program"),
+                })
                 .collect(),
             elf: crate::result::digest(elf),
             transpiler,
@@ -57,13 +80,13 @@ impl Derivation {
     pub fn kernel(&self, method: MethodId) -> Option<ProgramHash> {
         self.kernels
             .iter()
-            .find(|(bound, _)| *bound == method)
-            .map(|(_, kernel)| *kernel)
+            .find(|kernel| kernel.method == method)
+            .map(|kernel| kernel.program)
     }
 
     /// Every program it derived, the actor's first: what its agent pins.
     pub fn programs(&self) -> impl Iterator<Item = ProgramHash> + '_ {
-        core::iter::once(self.program).chain(self.kernels.iter().map(|(_, kernel)| *kernel))
+        core::iter::once(self.program).chain(self.kernels.iter().map(|kernel| kernel.program))
     }
 }
 

@@ -7,12 +7,10 @@
 //! derivation here keeps them in sync.
 
 use super::classify::{classify_opcode, uses_immediate};
-use crate::core::ecall::{
-    ECALL_BLAKE2B_COMPRESS, ECALL_RISTRETTO_THREE_OPERANDS, ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE,
-    is_one_of,
-};
+use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_WITNESS_INPUT};
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
+use vos_pvm::instruction::Opcode;
 
 /// Register-access descriptor for a single PVM step.  Used by both
 /// CpuChip (to fill the ValB/ValD/Result register-source flags + indices) and
@@ -32,15 +30,95 @@ pub(crate) struct StepRegAccesses {
     pub val_a_read: Option<(u8, u64)>,
     /// (reg_idx, value) if the step wrote a register.
     pub result_write: Option<(u8, u64)>,
-    /// ECALL-specific register reads.  Blake2b hostcall reads φ[7],
-    /// φ[10], φ[11], φ[12] at the ECALL step's timestamp; these entries land
-    /// in the ledger alongside the regular ValB/ValD reads and match the
-    /// producers CpuChip emits gated by IsBlakeEcall.  Empty for non-blake2b
-    /// steps.
+    /// ECALL-specific register reads at the ECALL step's timestamp: they
+    /// land in the ledger alongside the regular ValB/ValD reads and match
+    /// the producers CpuChip emits gated by the call's selector.  Empty for
+    /// every other step.
     pub ecall_reads: Vec<(u8, u64)>,
 }
 
-/// Mirrors the ValB/ValD assignment matrix in generate_main_trace.
+/// The register accesses an instruction's operands and result make, fixed
+/// by its opcode alone: ProgramMemory commits them per pc, as five bits of
+/// flag byte 6, and CpuChip pins each row's register-source flags and
+/// indices to them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AccessShape {
+    /// ValB reads a register: φA when `val_b_from_a`, otherwise φB. When
+    /// it reads none, it is the immediate (the operand swaps CpuChip pins
+    /// it on) or unused.
+    pub val_b_is_reg: bool,
+    pub val_b_from_a: bool,
+    /// ValD reads φB; otherwise it is the immediate.
+    pub val_d_is_reg: bool,
+    /// The instruction writes a register: φD when `result_to_d`, otherwise
+    /// φA. A conditional move writes it only when it moves; a call's
+    /// writes are its precompile's (the witness input's count to φ7).
+    pub result_is_reg: bool,
+    pub result_to_d: bool,
+}
+
+/// The [`AccessShape`] of `opcode`.
+pub(crate) fn access_shape(opcode: Opcode) -> AccessShape {
+    use vos_pvm::instruction::InstructionCategory::*;
+    let flags = classify_opcode(opcode);
+    // The ImmAlt shifts and rotates, SetGt*Imm and Cmov*Imm swap their
+    // sources: ValB is the immediate and ValD reads φB.
+    let swapped = flags.is_imm_alt || flags.is_set_gt || flags.is_cmov_imm;
+    let category = opcode.category();
+    let (val_b_is_reg, val_b_from_a) = match category {
+        ThreeReg | OneRegImmOffset => (true, true),
+        TwoRegOneImm if swapped => (false, false),
+        TwoRegOneImm => (true, false),
+        TwoReg => (false, false),
+        _ if uses_immediate(opcode) => (false, false),
+        _ => (true, true),
+    };
+    let val_d_is_reg = match category {
+        TwoRegOneImm => swapped,
+        OneRegImmOffset => false,
+        _ => !uses_immediate(opcode),
+    };
+    let result_is_reg = match category {
+        NoArgs | OneImm | TwoImm | OneOffset | OneRegTwoImm | TwoRegOneOffset => false,
+        OneRegOneImm => !matches!(opcode, Opcode::JumpInd) && !flags.is_store,
+        OneRegImmOffset => matches!(opcode, Opcode::LoadImmJump),
+        TwoRegOneImm => !flags.is_store,
+        OneRegExtImm | TwoReg | TwoRegTwoImm | ThreeReg => true,
+    };
+    AccessShape {
+        val_b_is_reg,
+        val_b_from_a,
+        val_d_is_reg,
+        result_is_reg,
+        result_to_d: result_is_reg && category == ThreeReg,
+    }
+}
+
+/// The register an executed instruction writes, by its opcode's
+/// [`AccessShape`] and its decoded registers: its destination, unless it is
+/// a conditional move that does not move.
+pub(crate) fn static_destination(
+    opcode: Opcode,
+    reg_a: usize,
+    reg_b: usize,
+    reg_d: usize,
+    regs_before: &[u64],
+) -> Option<usize> {
+    let shape = access_shape(opcode);
+    if !shape.result_is_reg {
+        return None;
+    }
+    let flags = classify_opcode(opcode);
+    // CmovIz[Imm] moves when φB is zero, CmovNz[Imm] when it is not.
+    if (flags.is_cmov_iz && regs_before[reg_b] != 0)
+        || (flags.is_cmov_nz && regs_before[reg_b] == 0)
+    {
+        return None;
+    }
+    Some(if shape.result_to_d { reg_d } else { reg_a })
+}
+
+/// The step's register reads and write, as the ledger records them.
 ///
 /// Skipped cases: in-trace ValB/ValD get rewritten mid-step
 /// for these, so the ledger tuple wouldn't match what the logup emits.
@@ -50,43 +128,18 @@ pub(crate) struct StepRegAccesses {
 /// dedicated RegValB/RegValD columns and cross-constraints let the ledger
 /// see the raw register values.
 pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAccesses {
-    use vos_pvm::instruction::InstructionCategory::*;
-    // RotR64ImmAlt / RotR32ImmAlt swap the source convention
-    // — val_b ← imm (no register read), val_d ← regs[rb].
-    let is_rotate_r_imm_alt = classify_opcode(step.opcode).is_rotate_r_imm_alt;
-    // SetGtSImm/SetGtUImm use the same source swap — val_b ← imm
-    // (no register read), val_d ← regs[rb] — so the SetLt comparison yields
-    // greater-than.
-    let is_set_gt = classify_opcode(step.opcode).is_set_gt;
-    // CmovIzImm/CmovNzImm swap the same way: val_b ← imm (the moved value,
-    // no register read), val_d ← regs[rb] (the condition ValDIsZero gates).
-    let is_cmov_imm = classify_opcode(step.opcode).is_cmov_imm;
-    // Cross-constraints in add_constraints handle the 32-bit Add/Sub/Mul/DivRem
-    // truncation: ValB low 4 bytes match RegValB; upper 4 bytes match only when
-    // !IsTruncated.
-    let val_b_read = match step.opcode.category() {
-        ThreeReg => Some((step.reg_a as u8, step.regs_before[step.reg_a])),
-        // Source swap for RotR*ImmAlt / SetGt / CmovImm: val_b is imm, not a register.
-        TwoRegOneImm if is_rotate_r_imm_alt || is_set_gt || is_cmov_imm => None,
-        TwoRegOneImm => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
-        OneRegImmOffset => Some((step.reg_a as u8, step.regs_before[step.reg_a])),
-        TwoReg => None,
-        _ if uses_immediate(step.opcode) => None,
-        _ => Some((step.reg_a as u8, step.regs_before[step.reg_a])),
-    };
-    // Shifts with shift_op ≤ 2 rewrite ValD mid-step; the ledger emission is
-    // restored using the RegValD column (holds raw regs[reg_b]).
-    let val_d_read = match step.opcode.category() {
-        ThreeReg | TwoReg => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
-        // Source swap: val_d is regs[rb] for
-        // RotR*ImmAlt / SetGt* / Cmov*Imm.
-        TwoRegOneImm if is_rotate_r_imm_alt || is_set_gt || is_cmov_imm => {
-            Some((step.reg_b as u8, step.regs_before[step.reg_b]))
-        }
-        TwoRegOneImm | OneRegImmOffset => None,
-        _ if uses_immediate(step.opcode) => None,
-        _ => Some((step.reg_b as u8, step.regs_before[step.reg_b])),
-    };
+    let shape = access_shape(step.opcode);
+    let val_b_read = shape.val_b_is_reg.then(|| {
+        let reg = if shape.val_b_from_a {
+            step.reg_a
+        } else {
+            step.reg_b
+        };
+        (reg as u8, step.regs_before[reg])
+    });
+    let val_d_read = shape
+        .val_d_is_reg
+        .then(|| (step.reg_b as u8, step.regs_before[step.reg_b]));
     // StoreInd source-value read.  TwoRegOneImm's val_b
     // already covers reg_b (the base); val_a_read picks up reg_a
     // (the source value) for StoreInd[U][8/16/32/64].
@@ -106,14 +159,13 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     // These must match the producers CpuChip emits gated by the matching
     // Is*Ecall column, otherwise the register-memory logup balance breaks.
     //   blake2b: φ[7,8,9,10] (h_ptr/m_ptr/t_low/f_flag).
-    //   ristretto scalar_mult/point_add/scalar_binop: φ[7,8,9].
-    //   ristretto reduce_wide (112): φ[7,8] only.
+    //   witness input: φ[7,8] (destination/capacity), before the step's
+    //   write of its count to φ[7].
     // Only a served call reads them (`PvmStep::served_ecall`): for any
     // other the CpuChip emits no producer.
     let ecall = step.served_ecall();
     let is_blake_ecall = ecall == Some(ECALL_BLAKE2B_COMPRESS as u64);
-    let is_ristretto_reduce = ecall == Some(ECALL_SCALAR_FROM_BYTES_MOD_ORDER_WIDE as u64);
-    let is_ristretto_three = ecall.is_some_and(|id| is_one_of(id, &ECALL_RISTRETTO_THREE_OPERANDS));
+    let is_witness_ecall = ecall == Some(ECALL_WITNESS_INPUT as u64);
     let ecall_reads = if is_blake_ecall {
         vec![
             (7u8, step.regs_before[7]),
@@ -121,13 +173,7 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
             (9u8, step.regs_before[9]),
             (10u8, step.regs_before[10]),
         ]
-    } else if is_ristretto_three {
-        vec![
-            (7u8, step.regs_before[7]),
-            (8u8, step.regs_before[8]),
-            (9u8, step.regs_before[9]),
-        ]
-    } else if is_ristretto_reduce {
+    } else if is_witness_ecall {
         vec![(7u8, step.regs_before[7]), (8u8, step.regs_before[8])]
     } else {
         Vec::new()

@@ -28,8 +28,8 @@ core::arch::global_asm!(
     "ret",
 );
 
-/// What to run: the program, whether to track it, the gas it gets, its
-/// arguments in the standard window, the agent's writes into it before it
+/// What to run: the program, whether to track it, the gas it gets, the
+/// input its witness-input calls read, the agent's writes into it before it
 /// runs, registers to set, and what to read back once it stops.
 #[derive(Decode)]
 struct Probe {
@@ -43,7 +43,8 @@ struct Probe {
 }
 
 /// How the machine stopped (as `invoke`'s status) and its detail, its gas
-/// and registers, the precompile calls served, the pages written when
+/// and registers, the precompile and witness-input calls served, the pages
+/// written when
 /// tracked, its output by the halt convention when it halted, and the
 /// bytes read back, empty where unreadable.
 #[derive(Encode)]
@@ -71,10 +72,11 @@ unsafe extern "C" fn tracker_refine(arguments: *const u8, len: u64) -> Output {
 
 fn run(probe: Probe) -> Report {
     let mut machine = Machine::acquire(&probe.program).expect("a machine");
-    if let Some(arguments) = &probe.arguments {
-        assert!(machine.map_read_only(ARGUMENTS, arguments.len() as u64, arguments));
+    if probe.arguments.is_some() {
+        // A kernel's registers, as the agent sets them: the loader's for no
+        // arguments, which it reads through its witness input.
         machine.set_register(7, ARGUMENTS);
-        machine.set_register(8, arguments.len() as u64);
+        machine.set_register(8, 0);
     }
     if probe.track {
         let header = header(&probe.program).expect("a header");
@@ -91,9 +93,18 @@ fn run(probe: Probe) -> Report {
     }
     machine.set_gas(probe.gas);
     let mut served = 0;
+    let input = probe.arguments.as_deref().unwrap_or_default();
+    let mut read = 0;
     let (status, detail) = loop {
         // Every page the machine first writes is paid.
         match machine.invoke_paying(&mut || true) {
+            Exit::Host(precompile::WITNESS_INPUT) => match machine.witness_input(&input[read..]) {
+                Ok(count) => {
+                    read += count;
+                    served += 1;
+                }
+                Err(_) => break (1, 0),
+            },
             Exit::Host(id) if precompile::price(id).is_some() => match machine.precompile(id) {
                 Ok(()) => served += 1,
                 Err(_) => break (1, 0),

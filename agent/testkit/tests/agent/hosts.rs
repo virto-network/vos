@@ -106,6 +106,25 @@ fn the_agent_serves_the_precompiles_a_node_does_at_its_price() {
             "{id:#x}"
         );
     }
+    // A kernel's witness input, which only the agent serves, at the price
+    // the tracer that re-runs the kernel charges.
+    assert_eq!(
+        (
+            abi::precompile::WITNESS_INPUT,
+            abi::precompile::WITNESS_INPUT_CALL,
+            abi::precompile::WITNESS_INPUT_BYTE,
+        ),
+        (
+            vos_pvm::precompile::WITNESS_INPUT,
+            vos_pvm::precompile::WITNESS_INPUT_GAS,
+            vos_pvm::precompile::WITNESS_INPUT_BYTE_GAS,
+        )
+    );
+    assert!(surface::kernel(abi::precompile::WITNESS_INPUT));
+    assert_eq!(
+        vos_pvm::precompile::WITNESS_INPUT_MAX,
+        vos_wire::abi::cap::WORK_RESULT
+    );
 }
 
 /// Batches that read no state refine on a VOS host (the pool, applied

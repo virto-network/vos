@@ -7,26 +7,32 @@
 //!
 //! | number | proofs | channel | log blowup, queries, PoW, fold step, last layer, interaction PoW | floors | at its reference shape |
 //! |---|---|---|---|---|---|
-//! | 24 | segments, legacy | Blake2s | the proof's own, 96 conjectured bits or more | 96 / — | MOBILE: 96 / 57 |
-//! | 26 | segments | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 62 |
-//! | 27 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
 //! | 28 | the final wrap, masked | Blake2b-256 | 6, 20, 26, 3, 6, 8 | 100 / 80 | 146 / 74, short without affine batching |
-//! | 29 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
 //! | 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
+//! | 31 | segments | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 62 |
+//! | 32 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
+//! | 33 | segments, legacy encodings | Blake2s | the proof's own, 96 conjectured bits or more | 96 / — | MOBILE: 96 / 57 |
+//! | 34 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
 //!
-//! - **24** is the Blake2s segment format the default entry points produce,
+//! - **The segment AIR** is the one every segment, leaf and device format
+//!   names: 31, 32, 33 and 34 name its hardened form (the witness input, the
+//!   Ristretto chips removed, the AIR audit's fixes), and the numbers that
+//!   named its earlier form, 24 to 27 and 29, are [`RETIRED`]: refused, and
+//!   never registered again. 28 and 30 prove the recursion AIR and keep
+//!   their numbers.
+//! - **33** is the Blake2s segment format the default entry points produce,
 //!   kept while the refine bundles, the chain proofs and their tests use it.
 //!   Its transcript has no interaction PoW and mixes the boundary states a
 //!   word at a time, and its parameters are the proof's own under the 96-bit
-//!   conjectured floor. 25 is not registered.
-//! - **26 to 30** use the lossless encodings ([`Encoding::Lossless`]) and
-//!   exactly their parameters. 27 to 30 are registered and refused until
-//!   their AIRs and channels exist; the wrap's fold step 3 is refused until
-//!   it is reviewed.
-//! - **The inner formats** (26, 27) grind 20 bits of PoW and 8 of interaction
-//!   PoW and take 44 queries: 62.7 proven bits for segments, the query term
-//!   binding.
-//! - **The device and credential formats** (29, 30) take the least query
+//!   conjectured floor.
+//! - **28 and 30 to 32, and 34** use the lossless encodings
+//!   ([`Encoding::Lossless`]) and exactly their parameters. 28, 30, 32 and 34
+//!   are registered and refused until their AIRs and channels exist; the
+//!   wrap's fold step 3 is refused until it is reviewed.
+//! - **The inner formats** (31, 32) grind 20 bits of PoW and 8 of interaction
+//!   PoW and take 44 queries: 62.8 proven bits for segments, the query
+//!   term binding.
+//! - **The device and credential formats** (34, 30) take the least query
 //!   count, 86, whose proven count clears the floor of 60 by 2 bits.
 //! - **The wrap** (28) needs DEEP batching with an independent coefficient a
 //!   sampled value ([`DeepBatching::Affine`]) for its proven 80. Stwo batches
@@ -70,7 +76,7 @@ pub enum ChannelKind {
 /// How values enter a format's hashes and transcript.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Encoding {
-    /// Format 24's: the boundary states mixed a word at a time, and no
+    /// Format 33's: the boundary states mixed a word at a time, and no
     /// interaction PoW.
     Legacy,
     /// The boundary states as the boundary chips' bytes, one M31 a byte, in
@@ -152,7 +158,7 @@ pub struct Format {
     pub kind: ProofKind,
     pub channel: ChannelKind,
     pub encoding: Encoding,
-    /// The parameters a proof must carry exactly, but for format 24, which
+    /// The parameters a proof must carry exactly, but for format 33, which
     /// takes the proof's own and records MOBILE's here.
     pub params: FormatParams,
     pub masked: bool,
@@ -190,7 +196,7 @@ impl Format {
 
 /// The number the default prover produces: the legacy Blake2s segment
 /// format.
-pub const LEGACY_SEGMENT_NUMBER: u32 = 24;
+pub const LEGACY_SEGMENT_NUMBER: u32 = 33;
 
 /// Every segment AIR's widest relation (`Blake2bCompression`, 265 limbs),
 /// rounded up.
@@ -204,10 +210,10 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
     log_degree_bound: 20,
     log_trace_length: 20,
     log_composition_degree_bound: 21,
-    sampled_values: 14_102,
+    sampled_values: 9_047,
     max_samples_per_column: 2,
-    constraints: 6_650,
-    logup_fractions: 2_445_279_232,
+    constraints: 5_169,
+    logup_fractions: 1_553_989_632,
     relation_width: SEGMENT_RELATION_WIDTH,
 };
 
@@ -216,7 +222,7 @@ pub const DEVICE_REFERENCE: SecurityShape = SecurityShape {
     log_degree_bound: 16,
     log_trace_length: 16,
     log_composition_degree_bound: 17,
-    logup_fractions: 152_829_952,
+    logup_fractions: 97_124_352,
     ..SEGMENT_REFERENCE
 };
 
@@ -308,7 +314,7 @@ pub const LEGACY_SEGMENT: Format = Format {
 };
 
 pub const SEGMENT: Format = Format {
-    number: 26,
+    number: 31,
     kind: ProofKind::Segment,
     channel: ChannelKind::Poseidon2M31,
     encoding: Encoding::Lossless,
@@ -325,7 +331,7 @@ pub const SEGMENT: Format = Format {
 };
 
 pub const LEAF_FOLD: Format = Format {
-    number: 27,
+    number: 32,
     kind: ProofKind::LeafFold,
     channel: ChannelKind::Poseidon2M31,
     encoding: Encoding::Lossless,
@@ -369,7 +375,7 @@ pub const WRAP: Format = Format {
 };
 
 pub const DEVICE_PROOF: Format = Format {
-    number: 29,
+    number: 34,
     kind: ProofKind::Device,
     channel: ChannelKind::Blake2sM31,
     encoding: Encoding::Lossless,
@@ -404,13 +410,19 @@ pub const CREDENTIAL_PROOF: Format = Format {
 
 /// Every registered format, by number.
 pub const REGISTRY: [Format; 6] = [
-    LEGACY_SEGMENT,
+    WRAP,
+    CREDENTIAL_PROOF,
     SEGMENT,
     LEAF_FOLD,
-    WRAP,
+    LEGACY_SEGMENT,
     DEVICE_PROOF,
-    CREDENTIAL_PROOF,
 ];
+
+/// The numbers whose AIR a later format superseded: 24 and its Poseidon2-M31
+/// variant 25, and 26, 27 and 29, the registry's first segment, leaf and
+/// device formats, all of the segment AIR before its hardening. Each is
+/// refused and never registered again, so a number names one AIR.
+pub const RETIRED: [u32; 5] = [24, 25, 26, 27, 29];
 
 /// The entry for `number`, admitted or not.
 pub fn lookup(number: u32) -> Option<&'static Format> {
@@ -424,6 +436,9 @@ pub fn admitted(number: u32) -> Result<&'static Format, alloc::string::String> {
         Some(format) => Err(alloc::format!(
             "proof format {number} ({:?}) is registered but not admitted",
             format.kind
+        )),
+        None if RETIRED.contains(&number) => Err(alloc::format!(
+            "proof format {number} is retired: its AIR is superseded"
         )),
         None => Err(alloc::format!("proof format {number} is not registered")),
     }
@@ -499,12 +514,12 @@ mod tests {
         assert_eq!(
             pinned,
             [
-                (24, 96, 57),
-                (26, 108, 62),
-                (27, 108, 63),
                 (28, 146, 74),
-                (29, 106, 62),
                 (30, 106, 62),
+                (31, 108, 62),
+                (32, 108, 63),
+                (33, 96, 57),
+                (34, 106, 62),
             ]
         );
         for format in REGISTRY {
@@ -518,14 +533,14 @@ mod tests {
     }
 
     /// The unrounded counts the parameters were chosen by: the inner formats'
-    /// 62.7, and the device formats' least query count whose count clears 62.
+    /// 62.8, and the device formats' least query count whose count clears 62.
     #[test]
     fn the_parameters_are_the_least_that_clear_their_margins() {
         let count = |params: &FormatParams, shape: &SecurityShape| {
             crate::security::proven_count(params, shape).unwrap()
         };
         let segment = count(&SEGMENT.params, &SEGMENT_REFERENCE);
-        assert!((62.69..62.70).contains(&segment), "{segment}");
+        assert!((62.79..62.80).contains(&segment), "{segment}");
         for format in [DEVICE_PROOF, CREDENTIAL_PROOF] {
             let fewer = FormatParams {
                 n_queries: format.params.n_queries - 1,
@@ -567,18 +582,26 @@ mod tests {
         );
     }
 
-    /// Every number names one entry; only 24 and 26 are admitted, and every
-    /// other number is refused.
+    /// Every number names one entry; only 31 and 33 are admitted; the
+    /// retired numbers are refused as retired and name no entry; every other
+    /// number is refused.
     #[test]
     fn the_registry_numbers_round_trip() {
         for format in REGISTRY {
             assert_eq!(lookup(format.number), Some(&format));
             assert_eq!(
                 admitted(format.number).is_ok(),
-                [24, 26].contains(&format.number)
+                [31, 33].contains(&format.number)
             );
+            assert!(!RETIRED.contains(&format.number), "{}", format.number);
         }
-        for number in (0..24).chain([25, 31, u32::MAX]) {
+        assert!(REGISTRY.windows(2).all(|w| w[0].number < w[1].number));
+        for number in RETIRED {
+            assert!(lookup(number).is_none());
+            let error = admitted(number).unwrap_err();
+            assert!(error.contains("retired"), "{error}");
+        }
+        for number in (0..24).chain([35, u32::MAX]) {
             assert!(lookup(number).is_none());
             assert!(admitted(number).is_err());
         }
@@ -609,7 +632,7 @@ mod tests {
         less_pow.pow_bits = 15;
         let error = check(&SEGMENT, &less_pow, &SEGMENT_REFERENCE).unwrap_err();
         assert!(
-            error.contains("proven bits, below format 26's floor of 60"),
+            error.contains("proven bits, below format 31's floor of 60"),
             "{error}"
         );
 
@@ -627,9 +650,9 @@ mod tests {
         let mut stronger = config;
         stronger.fri_config.n_queries = 45;
         let error = check(&SEGMENT, &stronger, &SEGMENT_REFERENCE).unwrap_err();
-        assert!(error.contains("differ from format 26"), "{error}");
+        assert!(error.contains("differ from format 31"), "{error}");
 
-        // Format 24 takes its own parameters at its conjectured floor.
+        // Format 33 takes its own parameters at its conjectured floor.
         let standard = PcsConfig {
             pow_bits: 20,
             fri_config: FriConfig::new(0, 4, 19, 1),

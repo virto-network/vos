@@ -457,17 +457,17 @@ impl<'a> Invocation<'a> {
                         }
                     }
                 }
-                let (output, used) = kernel(program, &call_arguments, gas, self.limits.attest)?;
-                if !machine.charge(used) {
+                let run = kernel(program, &call_arguments, gas, self.limits.attest)?;
+                if !machine.charge(run.gas_used) {
                     return Err(Failure::OutOfGas);
                 }
-                copy_out(machine, &output, r[10], 0, r[11])?;
-                machine.registers_mut()[7] = output.len() as u64;
+                copy_out(machine, &run.output, r[10], 0, r[11])?;
+                machine.registers_mut()[7] = run.output.len() as u64;
                 machine.registers_mut()[8] = 0;
                 self.attests.push(Attest {
                     program: ProgramHash::of(program),
-                    arguments: call_arguments,
-                    output,
+                    witness_input: run.witness_input,
+                    output: run.output,
                 });
             }
             Op::Request | Op::Result | Op::Sleep => {

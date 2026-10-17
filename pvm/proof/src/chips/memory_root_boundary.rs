@@ -13,7 +13,7 @@
 
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
-use num_traits::Zero;
+use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{
@@ -74,6 +74,9 @@ impl BuiltInComponent for MemoryRootBoundaryChip {
         let hash_before = crate::trace::trace_eval!(trace_eval, Column::HashBefore);
         let hash_after = crate::trace::trace_eval!(trace_eval, Column::HashAfter);
         let is_real = crate::trace::trace_eval!(trace_eval, Column::IsReal);
+
+        // A row consumes the root once or not at all.
+        eval.add_constraint(is_real[0].clone() * (is_real[0].clone() - E::F::one()));
 
         // Tuple: (level=0, index=0, hash_before[32], hash_after[32]) — 66 limbs.
         let mut tuple: Vec<E::F> = Vec::with_capacity(66);

@@ -36,14 +36,10 @@ pub struct PowerOfTwoChip;
 
 const POW2_LOG_SIZE: u32 = 6; // 2^6 = 64 rows
 
+/// The table's entries are its preprocessed columns, which the verifier
+/// commits; the main trace holds only their multiplicities.
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
-    /// Shift amount (0-63)
-    #[size = 1]
-    ShiftAmount,
-    /// 2^shift_amount as 8 LE bytes
-    #[size = 8]
-    PowerVal,
     /// Multiplicity: how many times this entry was used
     #[size = 1]
     Multiplicity,
@@ -71,8 +67,10 @@ impl BuiltInComponent for PowerOfTwoChip {
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
         lookup_elements: &PowerOfTwoLookupElements,
     ) {
-        let shift_amount = crate::trace::trace_eval!(trace_eval, Column::ShiftAmount);
-        let power_val = crate::trace::trace_eval!(trace_eval, Column::PowerVal);
+        let shift_amount =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::ShiftAmount);
+        let power_val =
+            crate::trace::preprocessed_trace_eval!(trace_eval, PreprocessedColumn::PowerVal);
         let mult = crate::trace::trace_eval!(trace_eval, Column::Multiplicity);
 
         let mut tuple: Vec<E::F> = vec![shift_amount[0].clone()];
@@ -123,11 +121,8 @@ impl BuiltInProverComponent for PowerOfTwoChip {
             }
         }
 
-        for row in 0..64usize {
-            let power: u64 = 1u64 << row;
-            trace.fill_columns(row, row as u8, Column::ShiftAmount);
-            trace.fill_columns(row, power, Column::PowerVal);
-            trace.fill_columns(row, BaseField::from(counts[row]), Column::Multiplicity);
+        for (row, &count) in counts.iter().enumerate() {
+            trace.fill_columns(row, BaseField::from(count), Column::Multiplicity);
         }
 
         trace.finalize_bit_reversed()
@@ -146,9 +141,12 @@ impl BuiltInProverComponent for PowerOfTwoChip {
         let mut logup = LogupTraceBuilder::new(log_size);
 
         let pow2_lookup: &PowerOfTwoLookupElements = lookup_elements.as_ref();
-        let shift_amount =
-            crate::trace::original_base_column!(component_trace, Column::ShiftAmount);
-        let power_val = crate::trace::original_base_column!(component_trace, Column::PowerVal);
+        let shift_amount = crate::trace::preprocessed_base_column!(
+            component_trace,
+            PreprocessedColumn::ShiftAmount
+        );
+        let power_val =
+            crate::trace::preprocessed_base_column!(component_trace, PreprocessedColumn::PowerVal);
         let mult = crate::trace::original_base_column!(component_trace, Column::Multiplicity);
 
         // Consumer side (negative multiplicity)

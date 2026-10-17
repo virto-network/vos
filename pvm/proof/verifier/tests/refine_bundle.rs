@@ -15,7 +15,7 @@ use vos_pvm_proof_verifier::{
     verify_refine_bundle_authenticated,
 };
 
-/// The Blake2s Stark proof of a format-24 proof.
+/// The Blake2s Stark proof of a format-33 proof.
 fn stark(proof: &mut Proof) -> &mut StarkProof<Blake2sMerkleHasher> {
     Blake2sMerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Blake2s proof")
 }

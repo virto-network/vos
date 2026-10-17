@@ -41,16 +41,10 @@ pub(crate) struct OpcodeFlags {
     /// `ValDIsZero` gates), but the imm variants move the IMMEDIATE guarded
     /// by `regs[rb]`. `is_cmov_imm` swaps the source so `val_b = imm`,
     /// `val_d = regs[rb]`. The swap mechanism mirrors `is_set_gt` /
-    /// `is_rotate_r_imm_alt`, BUT — unlike `is_rotate_r_imm_alt`, which is
-    /// packed into the 48-flag program-memory bag (opcode-bound) — neither
-    /// `is_cmov_imm` nor `is_set_gt` is in that bag, so they are free
-    /// witness columns bound only transitively via the register-pinned
-    /// `result` (the same model as the other unpacked compare sub-flags
-    /// `is_set_lt_s/u`, `is_cmov_iz/nz`). Sound because each flag only
-    /// ADDS a pin (`flag·(val_b−ImmBytes)=0`) and gates nothing else:
-    /// asserting it spuriously can only over-constrain, and omitting it on
-    /// a real swapped row reduces to the pre-existing compare-operand model.
-    /// NOT a compare-partition sub-flag; co-occurs with `is_cmov_iz/nz`.
+    /// `is_imm_alt`; like every compare sub-flag it is committed
+    /// per pc in ProgramMemory's flag bytes (byte 6), so a row cannot drop
+    /// the swap and leave its moved value free. NOT a compare-partition
+    /// sub-flag; co-occurs with `is_cmov_iz/nz`.
     pub is_cmov_imm: bool,
     pub is_min_s: bool,
     pub is_min_u: bool,
@@ -114,6 +108,10 @@ pub(crate) struct OpcodeFlags {
     /// fails proving — the schoolbook's high bytes aren't zero in
     /// two's-complement.
     pub is_div_s: bool,
+    /// Arithmetic right shifts (SharR32/SharR64 and their immediate forms):
+    /// floor division by `2^n`, which DivRemChip tells from a logical
+    /// shift's unsigned division by this flag in the DivRem tuple.
+    pub is_shar_r: bool,
     /// Per-size signed-load flags (covers direct + indirect
     /// variants: LoadI8 / LoadIndI8 → is_load_i8, etc.).  Drive the
     /// inactive-byte sign-extension binding for `result[i]` on
@@ -160,8 +158,8 @@ pub(crate) struct OpcodeFlags {
     /// (OneRegTwoImm category).  In both cases the *value* written
     /// to memory is `imm_y` (already pinned to canonical via
     /// `ImmYCanon` in ProgramMemoryChip).  Drives the per-byte
-    /// MemValue ↔ ImmYBytes binding for the low 4 bytes.  MemSize=8
-    /// imm_y values are out of scope (would need ImmYBytesHi[4]).
+    /// MemValue ↔ ImmYBytes binding: the low 4 bytes, and on an 8-byte
+    /// store the high 4, each `ImmYBytes[4]`.
     pub is_store_imm_any: bool,
     /// 1 iff this opcode is one of `StoreImm[U][8/16/32/64]`
     /// (TwoImm only — the *direct*-addressing immediate-source
@@ -225,15 +223,14 @@ pub(crate) struct OpcodeFlags {
     /// 2^((32 − n) mod 32); result low 4 bytes = UnsignedProductLow
     /// + mul_high; high 4 bytes = sign-extension.
     pub is_rotate_r32: bool,
-    /// 1 iff this opcode is `RotR64ImmAlt` or
-    /// `RotR32ImmAlt` — the swapped-source variants where the
-    /// immediate is the rotated value and `regs[rb]` is the shift
-    /// amount (vs. RotR64Imm / RotR32Imm where the convention is
-    /// reversed).  Drives a swapped trace fill (val_b ← imm,
-    /// val_d ← regs[rb]) plus a `val_b = ImmBytes` constraint
-    /// pinning the new source.  Set alongside is_rotate_r64 /
-    /// is_rotate_r32 so the existing rotate-r constraints fire.
-    pub is_rotate_r_imm_alt: bool,
+    /// 1 iff this opcode is an `ImmAlt` shift or rotate — the
+    /// swapped-source variants where the immediate is the shifted value
+    /// and `regs[rb]` is the shift amount (vs. the `Imm` variants where
+    /// the convention is reversed).  Drives a swapped trace fill (val_b ←
+    /// imm, val_d ← regs[rb]) plus a `val_b = ImmBytes` constraint
+    /// pinning the new source.  Set alongside the shift's or rotate's own
+    /// flags so their constraints fire.
+    pub is_imm_alt: bool,
 }
 
 pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
@@ -311,11 +308,13 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         }
         // Left shifts: constrained via mul (val_d = 2^shift_amount)
         Opcode::ShloL64 | Opcode::ShloLImm64 | Opcode::ShloLImmAlt64 => {
+            f.is_imm_alt = op == Opcode::ShloLImmAlt64;
             f.is_shift = true;
             f.shift_op = 0;
             f.is_mul = true;
         }
         Opcode::ShloL32 | Opcode::ShloLImm32 | Opcode::ShloLImmAlt32 => {
+            f.is_imm_alt = op == Opcode::ShloLImmAlt32;
             f.is_shift = true;
             f.shift_op = 0;
             f.is_mul = true;
@@ -323,31 +322,37 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         }
         // Logical right shifts: constrained via divrem (val_d = 2^shift_amount, result = quotient)
         Opcode::ShloR64 | Opcode::ShloRImm64 | Opcode::ShloRImmAlt64 => {
+            f.is_imm_alt = op == Opcode::ShloRImmAlt64;
             f.is_shift = true;
             f.shift_op = 1;
             f.is_div_rem = true;
             f.div_rem_op = 0;
         }
         Opcode::ShloR32 | Opcode::ShloRImm32 | Opcode::ShloRImmAlt32 => {
+            f.is_imm_alt = op == Opcode::ShloRImmAlt32;
             f.is_shift = true;
             f.shift_op = 1;
             f.is_div_rem = true;
             f.div_rem_op = 0;
             f.is_32bit = true;
         }
-        // Arithmetic right shifts: same as logical right but with sign extension
-        // Uses divrem + power-of-two (like ShloR). Sign extension handled separately.
+        // Arithmetic right shifts: floor division by val_d = 2^shift_amount
+        // (divrem + power-of-two, like ShloR), told apart by is_shar_r.
         Opcode::SharR64 | Opcode::SharRImm64 | Opcode::SharRImmAlt64 => {
+            f.is_imm_alt = op == Opcode::SharRImmAlt64;
             f.is_shift = true;
             f.shift_op = 2;
             f.is_div_rem = true;
             f.div_rem_op = 0;
+            f.is_shar_r = true;
         }
         Opcode::SharR32 | Opcode::SharRImm32 | Opcode::SharRImmAlt32 => {
+            f.is_imm_alt = op == Opcode::SharRImmAlt32;
             f.is_shift = true;
             f.shift_op = 2;
             f.is_div_rem = true;
             f.div_rem_op = 0;
+            f.is_shar_r = true;
             f.is_32bit = true;
         }
         // RotL64 reuses the mul-schoolbook (val_d = 2^n)
@@ -378,13 +383,13 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         }
         // RotR64ImmAlt — value = imm, shift = regs[rb].
         // Set is_rotate_r64 so the existing rotate-r logic fires;
-        // is_rotate_r_imm_alt drives the swapped trace fill.
+        // is_imm_alt drives the swapped trace fill.
         Opcode::RotR64ImmAlt => {
             f.is_shift = true;
             f.shift_op = 4;
             f.is_mul = true;
             f.is_rotate_r64 = true;
-            f.is_rotate_r_imm_alt = true;
+            f.is_imm_alt = true;
         }
         // RotR32 + RotR32Imm — value in val_b, shift in val_d.
         // Same shape as RotR64 but with modulus 32.
@@ -402,7 +407,7 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_32bit = true;
             f.is_mul = true;
             f.is_rotate_r32 = true;
-            f.is_rotate_r_imm_alt = true;
+            f.is_imm_alt = true;
         }
         // Compare
         Opcode::SetLtU | Opcode::SetLtUImm => {
@@ -754,8 +759,13 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
             f.is_store_imm_direct = true;
         }
         // Jumps (unconditional, non-sequential target)
-        Opcode::Jump | Opcode::LoadImmJump => {
+        Opcode::Jump => {
             f.is_jump = true;
+        }
+        // LoadImmJump also moves its immediate, ValD, into φA.
+        Opcode::LoadImmJump => {
+            f.is_jump = true;
+            f.is_move = true;
         }
         // Fallthrough/Unlikely: pure sequential terminators (basic-block hints
         // with no semantic effect).  All flags stay 0 so the default
@@ -834,17 +844,22 @@ pub(super) fn dest_reg(step: &crate::core::step::PvmStep) -> usize {
     }
 }
 
-/// Extract the 48 category/sub-category flags in the order matching
-/// ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
+/// Extract the 80 flags — category, sub-operation and register-access —
+/// in the order matching ProgramMemoryChip's preprocessed columns.  Used by ProgramMemoryChip's
 /// preprocessed-trace fill to pin flag values to the canonical
 /// classify_opcode result.
-pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 48] {
+pub(crate) fn classify_opcode_for_program_memory(
+    op: Opcode,
+) -> [u8; crate::lookups::PROG_MEMORY_N_FLAGS] {
     let f = classify_opcode(op);
+    let shape = super::reg_access::access_shape(op);
     [
         f.is_add as u8,
         f.is_sub as u8,
         f.is_mul as u8,
-        f.is_mul_upper as u8,
+        // Byte 0 bit 3: is_mul_upper is implied by its three variants
+        // (bytes 2 and 3), so the slot commits is_shar_r.
+        f.is_shar_r as u8,
         f.is_bitwise as u8,
         f.is_shift as u8,
         f.is_compare as u8,
@@ -888,6 +903,42 @@ pub(crate) fn classify_opcode_for_program_memory(op: Opcode) -> [u8; 48] {
         f.is_rotate_r64 as u8,
         f.is_rotate_l32 as u8,
         f.is_rotate_r32 as u8,
-        f.is_rotate_r_imm_alt as u8,
+        f.is_imm_alt as u8,
+        // byte 6: the register accesses and the remaining operand modifiers.
+        shape.val_b_is_reg as u8,
+        shape.val_b_from_a as u8,
+        shape.val_d_is_reg as u8,
+        shape.result_is_reg as u8,
+        shape.result_to_d as u8,
+        (f.is_div_rem && f.div_rem_op >= 2) as u8,
+        f.is_set_gt as u8,
+        f.is_cmov_imm as u8,
+        // byte 7: the compare sub-operations.
+        f.is_set_lt_u as u8,
+        f.is_set_lt_s as u8,
+        f.is_cmov_iz as u8,
+        f.is_cmov_nz as u8,
+        f.is_min_s as u8,
+        f.is_min_u as u8,
+        f.is_max_s as u8,
+        f.is_max_u as u8,
+        // bytes 8 and 9: the branch conditions, then the bitwise
+        // sub-operations.
+        f.is_br_eq as u8,
+        f.is_br_ne as u8,
+        f.is_br_lt_u as u8,
+        f.is_br_ge_u as u8,
+        f.is_br_le_u as u8,
+        f.is_br_gt_u as u8,
+        f.is_br_lt_s as u8,
+        f.is_br_ge_s as u8,
+        f.is_br_le_s as u8,
+        f.is_br_gt_s as u8,
+        f.is_and as u8,
+        f.is_or as u8,
+        f.is_xor as u8,
+        f.is_and_inv as u8,
+        f.is_or_inv as u8,
+        f.is_xnor as u8,
     ]
 }
