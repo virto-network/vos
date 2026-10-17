@@ -441,7 +441,10 @@ its channel, its parameters, its encodings and its floors.
   when a chip's rows need more than its size or a fixed chip's size is not
   the shape's. `prove_kernel` cuts a run by a class's budgets
   (`segment_bounds_budgeted`) and proves each window at the first class
-  whose sizes hold its natural sizes, halving a window none holds.
+  whose sizes hold its rows, halving a window none holds. A class is tried
+  by proving at it: its traces are generated once, at the class's sizes,
+  and an overflowing chip refuses the class before any commitment; a class
+  of fewer steps than the window is skipped.
   `program_commitment_for_shape` computes a class's preprocessed root from
   the code alone (`kernel::kernel_side_note`): it is the root every segment
   of the class commits.
@@ -450,9 +453,16 @@ its channel, its parameters, its encodings and its floors.
   chips exactly the shape's (more or fewer refused, by name), the sizes
   exactly one class's, then `verify_standalone` against that class's root.
   The shape check is structural and comes before any cryptographic work.
-  `verify_kernel_chain` adds the image root and continuity. A shape must
-  hold `chip_idx::ALWAYS` and size every chip from 2^4 to 2^24, or the
-  program is refused.
+  `verify_kernel_chain` verifies a whole run against the program and its
+  entry (`KernelEntry::of` the kernel's blob, refused unless its hash and
+  image root are the program's): the first segment at timestamp 1, at the
+  entry pc, with the loader's registers and from the image root; each
+  continuing the one before; the last ending at the halt pc; every
+  structural check before any proof is verified. It takes the proofs by
+  value, as verifying consumes them, and returns the final registers, the
+  io-hash in φ9..φ12. A shape must hold `chip_idx::ALWAYS`, have one to
+  four classes and size every chip from 2^4 to 2^24, or the program is
+  refused.
 
 ### Dropping a chip, under the hardened AIR
 
@@ -479,14 +489,28 @@ Re-checked on the 25-chip AIR (`pvm/proof/src/shape.rs`):
 
 ### The `Derivation`
 
-`Kernel` (`agent/wire/src/records.rs`) gains `shape: Shape { chips,
-classes: [SegmentClass { log_steps, pages, log_sizes }] }`, computed by
-derive (`Derived::shapes`, one a kernel) and taken by `Derivation::new`,
-so a node's install and a JAM builder's agree. A class's sizes are a
-fixed `[u8; 25]` by chip (0 outside the shape), so a kernel's record
-decodes with one allocation. The wire test pins the encoding: the mask as
-a u32, the classes' count, each class's byte, u16 and 25 bytes; 92 bytes a
-kernel for derive's three classes. A kernel's record is no longer `Copy`.
+`Kernel` (`agent/wire/src/records.rs`) gains `shape: Shape { policy,
+chips, classes: [SegmentClass { log_steps, pages, log_sizes }] }`,
+computed by derive (`Derived::shapes`, one a kernel) and taken by
+`Derivation::new`, so a node's install and a JAM builder's agree.
+`policy` is the version of derive's classes and capacities
+(`vos_pvm_compiler::shape::POLICY`, 1), so changing them derives other
+`Derivation`s visibly. A class's sizes are a fixed `[u8; 25]` by chip (0
+outside the shape), so a kernel's record decodes with one allocation. The
+wire test pins the encoding: the policy and the mask as u32s, the
+classes' count, each class's byte, u16 and 25 bytes; 96 bytes a kernel's
+shape for derive's three classes. A kernel's record is no longer `Copy`.
+
+The proof crate reads a record through one validating conversion,
+`KernelShape::try_from(&records::Shape)` (the `wire` feature, on by
+default), which every consumer and the tests share. It refuses a chip
+past the AIR's 25, a nonzero size for a chip outside the mask, a missing
+`ALWAYS` chip, more than `MAX_CLASSES` classes (4), and whatever
+`KernelShape::check` refuses; sizes outside the mask being zero, a record
+is of exactly one shape. The cap is what `DECODE_KERNEL` covers:
+`the_start_reserves_cover_decoding_a_batch` decodes six installs of the
+`wide` actor's 33 kernels at four classes each in 1.93M of 2.49M kept,
+under its four-fifths bound [measured]; a fifth class would pass it.
 
 **Found by the gate, and fixed:** a refine's start reserve
 (`defaults::refine_start`, 20 gas a byte) did not cover decoding a batch
@@ -498,7 +522,8 @@ trapped with the shapes. `defaults::batch_start` adds `DECODE_KERNEL`
 (8,000 gas) for each kernel a batch's installs name; every node, the JAM
 builder's fit, its simulation and the reference runner give a refine
 `batch_start`. `the_start_reserves_cover_decoding_a_batch` measures the
-six installs: 1.63M of 2.37M kept.
+six installs: 1.65M of 2.38M kept. The reserve is a consensus constant,
+which this step changed: `core-model.md` §8.5 says so.
 
 ### The program id (`pvm/proof/src/program_id.rs`)
 
@@ -529,7 +554,14 @@ six installs: 1.63M of 2.37M kept.
     always-present set;
   - each kernel's runs stay within the shape its install recorded;
   - both prove over their shapes, every segment at its first class, and
-    their chains verify against their programs, each root its class's;
+    their chains verify against their programs, each root its class's,
+    and return the registers holding the run's io-hash;
+  - a kernel's entry is its loader's (pc 0, timestamp 1, the layout's
+    registers), and another blob is refused;
+  - a chain not from the entry is refused: one proved from step 2, and
+    one whose first state names another timestamp, pc or registers;
+  - a chain not ending at the halt is refused: a run proved up to its last
+    step verifies as a segment, not as the kernel's run;
   - a full-set proof of the same run verifies alone and is refused as the
     kernel's (0x60000 more chips);
   - a proof missing a chip is refused (a kernel that jumps over a count of
@@ -539,10 +571,12 @@ six installs: 1.63M of 2.37M kept.
   - a run needing a dropped chip does not verify;
   - a segment past its class is refused by the prover, naming the chip.
 - Unit tests: a proof is of exactly one class; a malformed shape is
-  refused; the program id's layout and golden vector, the leaf mode, every
+  refused, more than four classes among it; a record converts to one
+  shape, and each malformed record is refused; the program id's layout and golden vector, the leaf mode, every
   field moving it, and a malformed program refused.
 - **The window kernel** (spike 3's settlement-window actor rebuilt on
-  vos-core, `spikes/s5-shape/window`, its cipher-clerk Ristretto calls
+  vos-core, `spikes/s5-shape/window` on branch `spike/s5-shape`, kept off
+  the vos-core line, its cipher-clerk Ristretto calls
   served in software by its shim; derive prunes them from the kernel) runs
   live on the agent's reference model on the 8-journal window, re-traces
   from its attest to the same output, proves over its shape and verifies as
@@ -564,9 +598,10 @@ Intel Core Ultra 7 155H shared with other agents' runs (load average
 - **Columns:** the shape 8,024 (180 preprocessed, 4,880 main, 2,956
   interaction, 8 composition), the full set 8,039: **15 fewer (0.19%)**,
   POPCOUNT's and BITCOUNT's.
-- **Verify gas on the JAM-only host** (`spikes/s5-shape/guest-verify`, spike
-  1's guest and harness on the current verifier: vos-pvm's GP 0.8.0
-  instruction gas with PolkaJam's host-call prices):
+- **Verify gas on the JAM-only host** (`spikes/s5-shape/guest-verify` on
+  branch `spike/s5-shape`, spike 1's guest and harness on the current
+  verifier: vos-pvm's GP 0.8.0 instruction gas with PolkaJam's host-call
+  prices):
 
   | segment | shape (23 chips, class sizes) | full set (25) | natural (22, unpinned) |
   |---|---|---|---|
@@ -603,7 +638,9 @@ Intel Core Ultra 7 155H shared with other agents' runs (load average
 [measured, on this machine, each under `systemd-run` at 14 GiB with
 `nice -n 10` and `CARGO_INCREMENTAL=0`]: `just check` green, 1,005 tests;
 `just test-proof` green, 555 tests (`kernel_shape` 8, and 6 new unit
-tests); `just clippy` clean.
+tests); `just clippy` clean. With the review folded, on vos-core: `just
+check` green, 1,005 tests; `just test-proof` green, 577 tests
+(`kernel_shape` 11); `just clippy` clean.
 
 ## Step 5.5: the witness-input precompile, the run's ends and the io-hash
 
