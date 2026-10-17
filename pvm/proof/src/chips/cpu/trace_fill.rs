@@ -2,7 +2,7 @@
 //!
 //! Holds the per-step witness fill: for every traced PVM step, write
 //! the corresponding row of every CpuChip column.  The column shapes
-//! mirror the constraints defined in `cpu/mod.rs::add_constraints`
+//! mirror the constraints defined in `cpu/constraints/`
 //! one-to-one — if you add a column there, the fill for it lives
 //! here.
 //!
@@ -1456,7 +1456,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
         // ── Pack the 48 individual flags into 6 bytes ──
         // The packing matches `program_memory::pack_flags` and the
         // canonical 48-flag layout in `classify_opcode_for_program_memory`.
-        // Per-row byte-to-bits lookups (in cpu/mod.rs) bind individual
+        // Per-row byte-to-bits lookups (`constraints::program::flag_bits`) bind individual
         // flag columns / sum-of-sub-flags expressions to these bytes.
         // ProgramMemoryChip's preprocessed FlagByte0..5 columns hold
         // the canonical packing for each PC; the prog_mem lookup

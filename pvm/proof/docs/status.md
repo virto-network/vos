@@ -251,7 +251,7 @@ re-audit), they belong here when discovered.
 
 ## How to read the source
 
-- Start with `src/chips/cpu/mod.rs::add_constraints` — that's
+- Start with `CpuChip::add_constraints` (`src/chips/cpu/constraints/`) — that's
   where 90% of the soundness work lives.
 - Follow constraints by phase number tagged in comments
   (`Phase 13d:`, `Phase 16:`, …) — each tag points at one

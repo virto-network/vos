@@ -467,7 +467,7 @@ fn div_s64_negative_forged_off_by_one_rejected() {
 //
 // Negative-result DivS32 / RemS32 is bound: the result-binding
 // `result[i] = 0xFF · SignBitResult` for i ∈ 4..8 (gated on
-// is_div_rem · is_32bit at cpu/mod.rs:495-501) sign-extends the low-32
+// is_div_rem · is_32bit, `cpu::constraints::divrem::divrem`) sign-extends the low-32
 // result up to 64 bits, matching the interpreter's `q as i64 as u64`.
 // The smoke + forge tests below cover the negative-result paths.
 
