@@ -1731,3 +1731,98 @@ fixed, and five pieces of preparation, which open M1.
   prefix, one page tree, `add_constraints` split by instruction class,
   and the inner parameters' recount with its decision rule. The review's
   smaller code-quality items wait for 5.16.
+
+## Step 5.8.0 (B): the refactors
+
+Track B of M1's preparation, on `s5-prep-b` from `5e29355d`. Four
+refactors, a commit each; none changes a constraint.
+
+### The check
+
+- **Proof bytes** [measured]: a scratch harness proves 17 proofs and
+  hashes each (SHA-256 of its bincode): a hand-built seven-step program
+  and the bench guests `diverse`, `hash-software` and `hash-precompile`,
+  each under format 31 and format 33, natural and canonical shapes, and
+  the hand-built program under `prove`'s standard config. Proving is
+  deterministic (two baseline runs match). After each refactor the 17
+  hashes match the baseline's.
+
+### One Poseidon2 crate
+
+- **`vos-poseidon2`** (`pvm/proof/poseidon2`), beside `precompiles` and
+  `verifier`, where `recair-air` and `final-verifier` will sit. no_std,
+  no dependencies, no allocation, stable Rust:
+  - its own M31, the permutation and its parameters, the linear layers
+    generic over the word (for `recair-air`'s bodies), the leaf sponge,
+    the node compression, and the transcript duplex with an `Observer`
+    for the prover's recorder;
+  - the packed SIMD permutation behind the `packed` feature, which the
+    prover turns on: the verifier path never compiles it, and the crate
+    builds and tests on stable with and without it;
+  - the round-constant generator test is the crate's
+    (`tests/round_constants.rs`).
+- **The prover and the settlement verifier** keep only the Stwo
+  adapters: `P2Hash`, the hasher, the channel and the Merkle channel,
+  since Stwo's traits cannot be implemented in a crate without Stwo. The settlement verifier's copy of the permutation,
+  constants, sponge and channel goes.
+- **The PVM settlement verify** [measured], `settle_run`: 11,011,239
+  instructions and 27,347,708 gas, against 10,951,979 and 27,306,959
+  before (+0.5%, +0.15%). The crate's field matches Stwo's reductions
+  form for form; a first version with branches and a reducing internal
+  diagonal cost +26% gas.
+- **A Stwo word enters reduced:** the adapters map a word through
+  `M31::from(u32)`, so a non-canonical limb in a proof cannot panic the
+  verifier.
+
+### One transcript prefix
+
+- `verify.rs`'s `transcript_prefix` replays the statement header, the
+  preprocessed and main roots, the boundary states and the interaction
+  PoW, the relation elements, the claimed sums and the interaction root.
+  `verify_on` and the recursion seams call it; the seams' copy goes.
+- **Every proof mixes its boundary states,** as production does: the
+  seams no longer gate the mix on a side note's `closing_chip_active`,
+  and chip-isolated harnesses (`prove_with_explicit_components`) mix
+  them and grind the interaction PoW too. So the seams take the proof
+  alone. Production proofs are unchanged; chip-isolated proofs, which no
+  verifier accepts across a trust boundary, change.
+- The preprocessed-root check, the logup sum and the boundary binding
+  run around the prefix; none touches the transcript.
+- `recursion_seams`' test names format 31.
+- **Left:** the standalone verifier (`pvm/proof/verifier/src/lib.rs`,
+  `verify_standalone_on`) keeps its own copy of the prefix, outside
+  track B's files; it differs only in drawing the relation elements by
+  mask. A.1's in-AIR transcript should follow `transcript_prefix`.
+
+### One page tree
+
+- `page_merkle` takes its tags, leaf and node from
+  `vos_pvm_program::image` (whose tags are now public) and asserts the
+  two depths equal; its own copies and the comment on formats 10 to 21
+  go. Refine's commitments hash with `vos_pvm_precompiles::blake2b_256`,
+  the function the image tree uses, in place of `page_merkle`'s
+  BLAKE2b-256.
+
+### The CPU split
+
+- `add_constraints`' 3,560 lines become 56 functions in 12 modules under
+  `chips/cpu/constraints`, by instruction class; `add_constraints` calls
+  them in the body's order. Each function reads the columns it uses
+  (`trace_eval!` is a pure read); IsBranch, IsStore and IsCompare are
+  functions of the row; the relation elements travel in a `Lookups`
+  struct. `cpu/mod.rs` falls to 246 lines; the split totals about 4,100,
+  the column reads each function repeats.
+- The split was generated from the body's top-level statements, each
+  function's reads drawn from the definitions it uses, then checked by
+  proof bytes. A first version called the functions in module order and
+  failed with `ConstraintsNotSatisfied`: the interaction trace pairs the
+  relation entries in the body's order.
+
+### Gates
+
+- `just check`: green, 1,019 tests.
+- `just test-proof`: green, 566 tests, the settlement verifier's among
+  them.
+- `just clippy`: green.
+- `vos-poseidon2` on stable (1.96), with and without `packed`: builds and
+  its 14 tests pass.
