@@ -9,23 +9,26 @@
 //! — and binds both roots in-circuit (see
 //! `docs/design/memory-merkle-binding.md`).
 //!
-//! This module is the single host-side source of truth for that tree.  It is
-//! intentionally independent of any external blake2b crate: it hashes via the
-//! same [`crate::chips::blake2b_compress`] software core the
-//! in-AIR Blake2bBoundaryChip uses, so the host root and the circuit root are
-//! identical by construction.
+//! The tree itself — its domain tags, leaf and node — is
+//! `vos_pvm_program::image`'s, the one a program's image root is computed
+//! over; this module adds the multiproofs and the compression calls the
+//! circuit proves, through the same [`crate::chips::blake2b_compress`] core
+//! the in-AIR Blake2bBoundaryChip uses.
 //!
 //! Hash spec (matches the circuit's tag-block precompute):
-//! - `leaf(page)  = blake2b256(TAG_LEAF ‖ page)`   (33 128-byte blocks)
-//! - `node(l, r)  = blake2b256(TAG_NODE ‖ l ‖ r)`  (2 128-byte blocks)
+//! - `leaf(page)  = blake2b256(LEAF_TAG ‖ page)`   (33 128-byte blocks)
+//! - `node(l, r)  = blake2b256(NODE_TAG ‖ l ‖ r)`  (2 128-byte blocks)
 //!
-//! `TAG_LEAF` / `TAG_NODE` are distinct full 128-byte first blocks, giving
-//! leaf/node domain separation as distinct chaining states; the absent-page
-//! default is the all-zero leaf, which cannot collide with `leaf(page)` except
-//! with negligible probability.
+//! The tags are distinct full 128-byte first blocks, giving leaf/node domain
+//! separation as distinct chaining states; the absent-page default is the
+//! all-zero leaf, which cannot collide with `leaf(page)` except with
+//! negligible probability.
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
+
+use vos_pvm_program::image::{LEAF_TAG, NODE_TAG};
+pub use vos_pvm_program::image::{leaf_hash, node_hash};
 
 use crate::chips::blake2b_compress;
 
@@ -47,6 +50,7 @@ const _: () = assert!(
     DEPTH < 31,
     "tree depth must be < log2(p) for index soundness"
 );
+const _: () = assert!(DEPTH == vos_pvm_program::image::DEPTH);
 
 /// Blake2b IV (raw, pre-parameter-XOR).
 const IV: [u64; 8] = [
@@ -63,17 +67,6 @@ const IV: [u64; 8] = [
 /// Parameter block XOR for sequential blake2b with a 32-byte digest
 /// (`digest_length = 32`, `key_length = 0`, `fanout = 1`, `depth = 1`).
 const PARAM_XOR_256: u64 = 0x0101_0020;
-
-/// Domain tag prepended as the full first 128-byte block of a leaf hash.
-///
-/// This byte string was introduced in proof formats 10 and 11 and remains
-/// stable in formats 12 through 19. Its historical crate name is intentional:
-/// moving the prover must not change committed roots. It remains unchanged in
-/// proof formats 20 and 21; those versions add the hardened Refine closure envelope,
-/// not a page-hash permutation change.
-const TAG_LEAF: &[u8] = b"zkpvm/page-merkle/leaf/v1";
-/// Stable inner-node domain for proof formats 10 through 19; see `TAG_LEAF`.
-const TAG_NODE: &[u8] = b"zkpvm/page-merkle/node/v1";
 
 const BLOCK: usize = 128;
 
@@ -94,53 +87,6 @@ fn block_words(block: &[u8]) -> [u64; 16] {
         *w = u64::from_le_bytes(b);
     }
     m
-}
-
-/// Standard blake2b-256 of an arbitrary message, built on the in-circuit
-/// software compression core so host and circuit agree bit-for-bit.
-pub(crate) fn blake2b256(msg: &[u8]) -> [u8; 32] {
-    let mut h = iv_param_256();
-    // At least one block, even for an empty message; the final block is
-    // zero-padded and `t` counts real (non-padding) bytes processed so far.
-    let n_blocks = msg.len().div_ceil(BLOCK).max(1);
-    for i in 0..n_blocks {
-        let start = i * BLOCK;
-        let end = (start + BLOCK).min(msg.len());
-        let mut block = [0u8; BLOCK];
-        block[..end - start].copy_from_slice(&msg[start..end]);
-        let t = end as u128; // bytes processed including this block, padding excluded
-        let last = i == n_blocks - 1;
-        h = blake2b_compress(&h, &block_words(&block), t, last);
-    }
-    let mut out = [0u8; 32];
-    for i in 0..4 {
-        out[i * 8..i * 8 + 8].copy_from_slice(&h[i].to_le_bytes());
-    }
-    out
-}
-
-/// Build a tag-prefixed message: the tag zero-padded to a full 128-byte block,
-/// followed by `payload`.
-fn tagged(tag: &[u8], payload: &[u8]) -> Vec<u8> {
-    debug_assert!(tag.len() <= BLOCK);
-    let mut msg = Vec::with_capacity(BLOCK + payload.len());
-    msg.extend_from_slice(tag);
-    msg.resize(BLOCK, 0);
-    msg.extend_from_slice(payload);
-    msg
-}
-
-/// Leaf hash of one page.
-pub fn leaf_hash(page: &[u8; PAGE_SIZE]) -> [u8; 32] {
-    blake2b256(&tagged(TAG_LEAF, page))
-}
-
-/// Inner-node hash of two child hashes.
-pub fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
-    let mut payload = [0u8; 64];
-    payload[..32].copy_from_slice(left);
-    payload[32..].copy_from_slice(right);
-    blake2b256(&tagged(TAG_NODE, &payload))
 }
 
 /// `default_hashes()[ℓ]` = root of an all-zero (absent) subtree at level `ℓ`;
@@ -492,11 +438,11 @@ fn tagged_first_block(tag: &[u8]) -> [u8; BLOCK] {
 // Cheap (one compression) and `no_std`-friendly — recomputed rather than
 // cached, since the verifier-side `add_constraints` needs them without `std`.
 fn h_after_leaf_tag() -> [u64; 8] {
-    h_after_tag(TAG_LEAF)
+    h_after_tag(LEAF_TAG)
 }
 
 fn h_after_node_tag() -> [u64; 8] {
-    h_after_tag(TAG_NODE)
+    h_after_tag(NODE_TAG)
 }
 
 /// The 8-word blake2b chaining state after compressing the leaf tag's first
@@ -696,14 +642,6 @@ pub fn segment_multiproof(side_note: &crate::side_note::SideNote) -> MerkleMulti
 #[cfg(all(test, feature = "prover"))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn blake2b256_known_answer() {
-        // Standard BLAKE2b-256 of the empty string.
-        let got = blake2b256(b"");
-        let want = hex_to_32("0e5751c026e543b2e8ab2eb06099daa1d1e5df47778f7787faab45cdf12fe3a8");
-        assert_eq!(got, want);
-    }
 
     fn hex_to_32(s: &str) -> [u8; 32] {
         let mut out = [0u8; 32];
@@ -1000,7 +938,7 @@ mod tests {
     #[test]
     fn leaf_call_chain_reproduces_leaf_hash() {
         // The tag-precompute (start from h_after_leaf_tag, prove 32 page blocks)
-        // must equal the full-message blake2b256(TAG_LEAF ‖ page).
+        // must equal the full-message blake2b256(LEAF_TAG ‖ page).
         let mut page = [0u8; PAGE_SIZE];
         for (i, b) in page.iter_mut().enumerate() {
             *b = (i % 251) as u8;

@@ -1,14 +1,14 @@
 //! The root a proof's memory starts from: the page tree over a standard
 //! program's initial memory.
 //!
-//! The tree is the prover's (`vos_pvm_proof::page_merkle`): a complete binary
-//! tree of depth [`DEPTH`] over the 32-bit address space, keyed by page,
-//! each leaf the BLAKE2b-256 of a domain block and the page, each node of a
-//! domain block and its two children, and a page of zeros the empty leaf.
-//! So the root covers the initial memory's contents: the read-only and
-//! read-write data where the standard layout places them, and zeros in the
-//! heap, the stack and every other page. The prover's tests pin the two
-//! implementations to each other.
+//! The tree is a complete binary tree of depth [`DEPTH`] over the 32-bit
+//! address space, keyed by page, each leaf the BLAKE2b-256 of a domain block
+//! and the page, each node of a domain block and its two children, and a page
+//! of zeros the empty leaf. So the root covers the initial memory's contents:
+//! the read-only and read-write data where the standard layout places them,
+//! and zeros in the heap, the stack and every other page. The prover's page
+//! tree (`vos_pvm_proof::page_merkle`) is this one: it takes its tags, leaf
+//! and node from here.
 
 use alloc::vec::Vec;
 
@@ -18,8 +18,10 @@ use crate::{PAGE_SIZE, StandardProgram};
 pub const DEPTH: u32 = 32 - PAGE_SIZE.trailing_zeros();
 
 const BLOCK: usize = 128;
-const LEAF: &[u8] = b"zkpvm/page-merkle/leaf/v1";
-const NODE: &[u8] = b"zkpvm/page-merkle/node/v1";
+/// The leaf's domain, zero-padded to the first block of its message.
+pub const LEAF_TAG: &[u8] = b"zkpvm/page-merkle/leaf/v1";
+/// The node's domain, zero-padded to the first block of its message.
+pub const NODE_TAG: &[u8] = b"zkpvm/page-merkle/node/v1";
 
 /// BLAKE2b-256 of `tag` zero-padded to a block, then `payload`.
 fn tagged(tag: &[u8], payload: &[u8]) -> [u8; 32] {
@@ -33,7 +35,7 @@ fn tagged(tag: &[u8], payload: &[u8]) -> [u8; 32] {
 /// A page's leaf.
 pub fn leaf_hash(page: &[u8]) -> [u8; 32] {
     debug_assert_eq!(page.len(), PAGE_SIZE as usize);
-    tagged(LEAF, page)
+    tagged(LEAF_TAG, page)
 }
 
 /// A node over its two children.
@@ -41,7 +43,7 @@ pub fn node_hash(left: &[u8; 32], right: &[u8; 32]) -> [u8; 32] {
     let mut payload = [0u8; 64];
     payload[..32].copy_from_slice(left);
     payload[32..].copy_from_slice(right);
-    tagged(NODE, &payload)
+    tagged(NODE_TAG, &payload)
 }
 
 /// The root of a tree whose leaves are `leaves`, sorted by page and each
