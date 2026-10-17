@@ -1817,3 +1817,18 @@ The window, eight journals, format 31, on the shared Intel Core Ultra 7
   `the_fixtures_are_judged` reads the files and judges them as a venue
   does.
 - 5.15 adds A.6's statement fixtures once the wrap exists.
+
+### Gates
+
+[measured, each under `systemd-run` with `nice -n 10` and
+`CARGO_INCREMENTAL=0`]: `just check` green at 14 GiB, 1,005 tests; `just
+test-proof` green at 24 GiB, 581 tests (`window_kernel` 2, `fixtures` 2),
+27 minutes; `just clippy` clean.
+
+### Outside the track's files
+
+- Root `Cargo.toml`: `cipher-clerk` in the workspace's dependencies, and
+  `opt-level = 3` for vos-tree and vos-pvm-precompiles in the dev and test
+  profiles.
+- `pvm/proof/tests/common/mod.rs`: `kernel_program`, a kernel's program
+  from its blob and its install's record.
