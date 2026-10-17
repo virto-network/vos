@@ -454,6 +454,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "cipher-clerk"
+version = "0.3.0"
+source = "git+https://codeberg.org/Virto/CipherClerk.git?tag=v0.3.0#b841640b5ba7009ab95107bdf87d218dcee7ff9e"
+dependencies = [
+ "blake2",
+ "curve25519-dalek",
+ "zeroize",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2617,6 +2627,7 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "blake3",
+ "cipher-clerk",
  "impl-trait-for-tuples",
  "num-traits",
  "postcard",
@@ -2631,6 +2642,7 @@ dependencies = [
  "vos-pvm-proof-derive",
  "vos-pvm-proof-verifier",
  "vos-testkit",
+ "vos-tree",
  "vos-wire",
 ]
 

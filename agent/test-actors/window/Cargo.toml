@@ -1,0 +1,23 @@
+[package]
+name = "window"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "window"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+# The settlement window, its accounts hashed with the `blake2` crate: without
+# `pvm-precompile`, which names a shim of the Ristretto precompiles.
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3.0", default-features = false, features = ["settlement"] }
+vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
+vos-sdk = { workspace = true }
+vos-tree = { path = "../../tree" }

@@ -75,6 +75,10 @@ bincode = "1"
 # (settlement-verifier): the fixture this crate serializes is deserialized there.
 postcard = { version = "1", features = ["alloc"] }
 vos-pvm-proof-verifier = { workspace = true }
+# The window kernel's arguments: a space's pseudo-account rows in a tree at
+# two versions, their multiproofs, and the statement they make.
+cipher-clerk = { workspace = true, features = ["settlement"] }
+vos-tree = { workspace = true }
 
 # Both examples demonstrate the prover end-to-end; mark them
 # prover-only so a verifier-only build (`--no-default-features`) skips

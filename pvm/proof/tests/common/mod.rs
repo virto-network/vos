@@ -214,3 +214,34 @@ pub fn forge_three_reg_result(
     forge_first_result(&mut steps, rd as usize, forged);
     prove_and_verify(steps, &code, &bitmask);
 }
+
+/// A kernel's program under `format`, as its install records the kernel:
+/// each class's preprocessed root computed from its code alone.
+pub fn kernel_program(
+    blob: &[u8],
+    record: &vos_wire::records::Kernel,
+    format: &'static vos_pvm_proof::format::Format,
+) -> vos_pvm_proof::program_id::KernelProgram {
+    let shape =
+        vos_pvm_proof::shape::KernelShape::try_from(&record.shape).expect("an install's shape");
+    let side_note = vos_pvm_proof::kernel::kernel_side_note(blob).expect("a standard program");
+    let preprocessed_roots = (0..shape.classes.len())
+        .map(|class| {
+            vos_pvm_proof::program_commitment_for_shape(
+                &side_note,
+                &shape.segment(class).expect("a class"),
+                format,
+            )
+            .expect("the class's root")
+        })
+        .collect();
+    vos_pvm_proof::program_id::KernelProgram {
+        transpiler: vos_pvm_compiler::TRANSPILER_VERSION,
+        program: record.program.0,
+        shape,
+        format: format.number,
+        preprocessed_roots,
+        image_root: record.image_root,
+        leaf_circuits: vos_pvm_proof::program_id::LeafCircuits::None,
+    }
+}

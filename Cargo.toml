@@ -94,6 +94,16 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.vos-pvm-proof-verifier]
 opt-level = 3
+# The window kernel's test builds a tree of a million rows, hashing in
+# software.
+[profile.dev.package.vos-tree]
+opt-level = 3
+[profile.test.package.vos-tree]
+opt-level = 3
+[profile.dev.package.vos-pvm-precompiles]
+opt-level = 3
+[profile.test.package.vos-pvm-precompiles]
+opt-level = 3
 
 [workspace.dependencies]
 # Exact: the workspace nightly is a 1.90 pre-release, which a later fjall
@@ -115,6 +125,8 @@ vos-jam = { path = "node/jam" }
 vos-raft = { path = "support/vos-raft" }
 vos-sdk = { path = "agent/sdk" }
 vos-sdk-macros = { path = "agent/sdk-macros" }
+# The settlement window, which the window test actor's kernel states.
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3.0", default-features = false }
 
 # Stwo from the fork's `vos/base` branch: upstream `e1286720` with dashmap
 # optional, Poseidon252 behind a feature, and upstream's `74951f79`, which
