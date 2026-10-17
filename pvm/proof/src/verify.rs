@@ -437,6 +437,11 @@ fn verify_preprocessed_trace<MC: PcsStack>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
+    if side_note.memory_layout().is_none() {
+        return Err(VerificationError::InvalidStructure(
+            "a sparse memory image without its program's layout".to_string(),
+        ));
+    }
     // The caller passes the same prover-trait component set the
     // prover used (either `active_components(side_note)` for the default
     // path, or an explicit slice for the chip-isolated harness).  This

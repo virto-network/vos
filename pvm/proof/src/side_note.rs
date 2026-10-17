@@ -135,10 +135,10 @@ pub struct SideNote {
     #[cfg(feature = "prover")]
     pub memory_pages: Option<MemoryPagePayload>,
     /// The pages the program may touch, and how: `MemoryPageChip`'s
-    /// preprocessed regions, so part of its proof's program identity.
-    /// Every page writable unless a layout is attached
-    /// ([`Self::with_memory_layout`]), as a kernel's is.
-    pub memory_layout: crate::chips::memory_page::MemoryLayout,
+    /// preprocessed regions, so part of its proof's program identity. Read
+    /// through [`Self::memory_layout`]; attached by
+    /// [`Self::with_memory_layout`].
+    memory_layout: Option<crate::chips::memory_page::MemoryLayout>,
 }
 
 /// The chain-side trace holder: everything a chain pass needs from a traced
@@ -371,7 +371,7 @@ impl SideNote {
             divrem_entries: Vec::new(),
             #[cfg(feature = "prover")]
             memory_pages: None,
-            memory_layout: Default::default(),
+            memory_layout: None,
         }
     }
 
@@ -459,10 +459,34 @@ impl SideNote {
         self
     }
 
-    /// Attach the program's layout: the pages it may touch, and how.
+    /// Attach the program's layout: the pages it may touch, and how. Its
+    /// regions must be disjoint.
     pub fn with_memory_layout(mut self, layout: crate::chips::memory_page::MemoryLayout) -> Self {
-        self.memory_layout = layout;
+        assert!(
+            layout.is_disjoint(),
+            "a layout's regions overlap: {layout:?}"
+        );
+        self.memory_layout = Some(layout);
         self
+    }
+
+    /// The pages the program may touch, and how: the attached layout, or
+    /// every page writable over a flat memory, a test machine's. `None` for
+    /// a sparse image without one: a kernel's image comes with its layout,
+    /// and proving and verifying refuse one without.
+    pub fn memory_layout(&self) -> Option<crate::chips::memory_page::MemoryLayout> {
+        self.memory_layout.or_else(|| {
+            self.sparse_initial_memory
+                .is_none()
+                .then(crate::chips::memory_page::MemoryLayout::writable)
+        })
+    }
+
+    /// [`Self::memory_layout`] where the prove and verify paths have
+    /// already refused a side note without one.
+    pub(crate) fn layout(&self) -> crate::chips::memory_page::MemoryLayout {
+        self.memory_layout()
+            .expect("a sparse memory image without its layout")
     }
 
     pub fn with_memory(mut self, flat_mem: Vec<u8>) -> Self {

@@ -785,6 +785,7 @@ impl BuiltInProverComponent for MemoryChip {
         let mut addrs = vec![0u32; num_rows];
         let mut keys = vec![0u64; num_rows];
         let mut same_addr = vec![false; num_rows];
+        let layout = side_note.layout();
         for (row, entry) in entries.iter().enumerate() {
             trace.fill_columns_bytes(row, &entry.address.to_le_bytes(), Column::Address);
             trace.fill_columns(row, entry.value, Column::Value);
@@ -812,9 +813,8 @@ impl BuiltInProverComponent for MemoryChip {
 
             // The page's permission, as MemoryPageChip proves it, held
             // along the address's group; on its start, also the tuple's.
-            let permission = side_note
-                .memory_layout
-                .permission(entry.address / crate::page_merkle::PAGE_SIZE as u32);
+            let permission =
+                layout.permission(entry.address / crate::page_merkle::PAGE_SIZE as u32);
             trace.fill_columns(row, permission >= 1, Column::Readable);
             trace.fill_columns(row, permission == 2, Column::Writable);
             let is_start = row == 0 || entries[row - 1].address != entry.address;

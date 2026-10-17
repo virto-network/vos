@@ -116,7 +116,9 @@ mod prover {
         jump_table: &'a [u32],
         blake2b_calls: &'a [crate::chips::blake2b::Blake2bCall],
         blake2b_mem_ops: &'a [crate::core::tracing::Blake2bMemOp],
-        memory_layout: crate::chips::memory_page::MemoryLayout,
+        /// `None` for a sparse image without one, whose segments proving
+        /// refuses.
+        memory_layout: Option<crate::chips::memory_page::MemoryLayout>,
     }
 
     impl<'a> From<&'a SideNote> for ChainParts<'a> {
@@ -127,7 +129,7 @@ mod prover {
                 jump_table: &full.jump_table,
                 blake2b_calls: &full.blake2b_calls,
                 blake2b_mem_ops: &full.blake2b_mem_ops,
-                memory_layout: full.memory_layout,
+                memory_layout: full.memory_layout(),
             }
         }
     }
@@ -140,7 +142,7 @@ mod prover {
                 jump_table: &full.jump_table,
                 blake2b_calls: &full.blake2b_calls,
                 blake2b_mem_ops: &full.blake2b_mem_ops,
-                memory_layout: full.memory_layout,
+                memory_layout: Some(full.memory_layout),
             }
         }
     }
@@ -439,8 +441,11 @@ mod prover {
 
         let sn = SideNote::new(steps, parts.code.to_vec(), parts.bitmask.to_vec())
             .with_jump_table(parts.jump_table.to_vec())
-            .with_memory_layout(parts.memory_layout)
             .with_initial_regs(initial_regs);
+        let sn = match parts.memory_layout {
+            Some(layout) => sn.with_memory_layout(layout),
+            None => sn,
+        };
         let mut sn = match mem {
             SegmentMemory::Dense(memory) => sn.with_memory(memory),
             SegmentMemory::Sparse(memory) => sn.with_sparse_memory(memory),
@@ -963,6 +968,7 @@ mod prover {
             code: &'a [u8],
             bitmask: &'a [u8],
             jump_table: &'a [u32],
+            memory_layout: crate::chips::memory_page::MemoryLayout,
         ) -> ChainParts<'a> {
             ChainParts {
                 code,
@@ -970,9 +976,7 @@ mod prover {
                 jump_table,
                 blake2b_calls: &self.blake2b_calls,
                 blake2b_mem_ops: &self.blake2b_mem_ops,
-                // A streamed trace runs on a flat memory: every page
-                // writable.
-                memory_layout: Default::default(),
+                memory_layout: Some(memory_layout),
             }
         }
 
@@ -1025,6 +1029,7 @@ mod prover {
         code: Vec<u8>,
         bitmask: Vec<u8>,
         jump_table: Vec<u32>,
+        memory_layout: crate::chips::memory_page::MemoryLayout,
         cutter: BudgetedCutter,
         /// The carried image: the initial memory with every retired
         /// window's writes applied — the image ENTERING the current
@@ -1053,13 +1058,15 @@ mod prover {
         /// segment_bounds`]), realized as an unbounded page budget — the
         /// budgeted walk degenerates to exactly the uniform bounds.
         /// `initial_memory` is the image the trace starts from (the
-        /// pre-run flat_mem); `code`/`bitmask`/`jump_table` the
-        /// program-static fields every window shares.
+        /// pre-run flat_mem); `code`/`bitmask`/`jump_table` and
+        /// `memory_layout` the program-static fields every window shares.
+        #[allow(clippy::too_many_arguments)]
         pub fn new(
             source: S,
             code: Vec<u8>,
             bitmask: Vec<u8>,
             jump_table: Vec<u32>,
+            memory_layout: crate::chips::memory_page::MemoryLayout,
             initial_memory: Vec<u8>,
             seg_steps: usize,
             page_budget: usize,
@@ -1074,6 +1081,7 @@ mod prover {
                 code,
                 bitmask,
                 jump_table,
+                memory_layout,
                 cutter: BudgetedCutter::new(seg_steps, max_pages),
                 mem: initial_memory,
                 regs: [0u64; NUM_REGS],
@@ -1151,7 +1159,12 @@ mod prover {
                 .expect("no current window: call next_window first");
             let steps = expand_steps(&w.buf.steps, self.regs);
             assemble_segment(
-                &w.buf.parts(&self.code, &self.bitmask, &self.jump_table),
+                &w.buf.parts(
+                    &self.code,
+                    &self.bitmask,
+                    &self.jump_table,
+                    self.memory_layout,
+                ),
                 steps,
                 self.regs,
                 SegmentMemory::Dense(self.mem.clone()),
@@ -1452,6 +1465,7 @@ mod tests {
         assert_eq!(via_cursor.blake2b_calls, via_slice.blake2b_calls);
         assert_eq!(via_cursor.blake2b_mem_ops, via_slice.blake2b_mem_ops);
         assert_eq!(via_cursor.range256_counts, via_slice.range256_counts);
+        assert_eq!(via_cursor.memory_layout(), via_slice.memory_layout());
     }
 
     #[test]
@@ -1554,7 +1568,7 @@ mod tests {
             jump_table: full.jump_table.to_vec(),
             blake2b_calls: full.blake2b_calls.clone(),
             blake2b_mem_ops: full.blake2b_mem_ops.clone(),
-            memory_layout: full.memory_layout,
+            memory_layout: full.memory_layout().expect("a layout"),
         }
     }
 
@@ -1692,6 +1706,7 @@ mod tests {
             full.code.to_vec(),
             full.bitmask.to_vec(),
             full.jump_table.to_vec(),
+            full.memory_layout().expect("a layout"),
             full.initial_memory.clone(),
             seg_steps,
             page_budget,
@@ -1843,7 +1858,7 @@ mod tests {
             jump_table: vec![],
             blake2b_calls,
             blake2b_mem_ops,
-            memory_layout: Default::default(),
+            memory_layout: crate::chips::memory_page::MemoryLayout::writable(),
         };
 
         for (seg_steps, page_budget) in [(2usize, 0usize), (6, 2), (4, 2)] {
@@ -1858,6 +1873,7 @@ mod tests {
                 code.clone(),
                 bitmask.clone(),
                 vec![],
+                crate::chips::memory_page::MemoryLayout::writable(),
                 flat_mem.clone(),
                 seg_steps,
                 page_budget,

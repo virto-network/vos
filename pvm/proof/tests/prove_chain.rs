@@ -14,6 +14,7 @@ use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::{Interpreter, Memory};
 
+use vos_pvm_proof::chips::memory_page::MemoryLayout;
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::segment::segment_bounds;
 use vos_pvm_proof::{SideNote, program_commitment_of_proof, prove_chain};
@@ -57,7 +58,9 @@ fn prove_chain_verifies_as_canonical_chain() {
     let all_steps = tracing.into_trace();
     assert_eq!(all_steps.len(), 7);
 
-    let full = SideNote::new(all_steps, code, bitmask).with_sparse_memory(initial_memory);
+    let full = SideNote::new(all_steps, code, bitmask)
+        .with_sparse_memory(initial_memory)
+        .with_memory_layout(MemoryLayout::writable());
     // Multi-window cut: 4-step windows over 7 steps ⇒ [0,4), [4,7).
     let bounds = segment_bounds(full.steps.len(), 4);
     assert_eq!(bounds, vec![(0, 4), (4, 7)], "expected a 2-window chain");

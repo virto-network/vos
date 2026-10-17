@@ -572,10 +572,15 @@ impl Collector {
                     return;
                 }
                 self.timestamps.insert(identity, active.next_timestamp);
+                // A refine machine's permissions are any runs of pages its
+                // program sets, committed in its state, not four regions;
+                // its slice proofs bind the exact replayed trace, whose
+                // machine faults where the program's pages forbid.
                 let mut side_note = SideNote::new_shared(active.steps, active.code, active.bitmask)
                     .with_shared_jump_table(active.jump_table)
                     .with_initial_regs(active.initial_regs)
-                    .with_sparse_memory(active.initial_memory);
+                    .with_sparse_memory(active.initial_memory)
+                    .with_memory_layout(crate::chips::memory_page::MemoryLayout::writable());
                 side_note.blake2b_calls = active.blake2b_calls;
                 side_note.blake2b_mem_ops = active.blake2b_mem_ops;
                 let observed_exit_state = self.machine_state_commitment(active.identity, machine);

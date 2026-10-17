@@ -98,7 +98,8 @@ pub struct PageRange {
 #[cfg(feature = "prover")]
 impl MemoryLayout {
     /// Every page writable: a machine with no layout, as a flat test
-    /// memory is.
+    /// memory is. A kernel's proof never takes it: its identity would let
+    /// every page fault prove.
     pub const fn writable() -> Self {
         let none = PageRange { first: 0, end: 0 };
         Self {
@@ -133,6 +134,17 @@ impl MemoryLayout {
         }
     }
 
+    /// Whether no page lies in two regions: a page selects the region it
+    /// lies in, so overlapping regions would let it pick the permissive
+    /// one.
+    pub fn is_disjoint(&self) -> bool {
+        self.regions.iter().enumerate().all(|(k, a)| {
+            self.regions[k + 1..]
+                .iter()
+                .all(|b| a.first.max(b.first) >= a.end.min(b.end))
+        })
+    }
+
     /// The region `page` lies in, if any.
     pub fn region_of(&self, page: u32) -> Option<usize> {
         self.regions
@@ -147,13 +159,6 @@ impl MemoryLayout {
             Some(region) if region < FIRST_WRITABLE => 1,
             Some(_) => 2,
         }
-    }
-}
-
-#[cfg(feature = "prover")]
-impl Default for MemoryLayout {
-    fn default() -> Self {
-        Self::writable()
     }
 }
 
@@ -534,7 +539,7 @@ impl BuiltInProverComponent for MemoryPageChip {
 
     fn generate_preprocessed_trace(&self, log_size: u32, side_note: &SideNote) -> FinalizedTrace {
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
-        let regions = side_note.memory_layout.regions;
+        let regions = side_note.layout().regions;
         let firsts = regions.map(|range| BaseField::from(range.first));
         let ends = regions.map(|range| BaseField::from(range.end));
         for row in 0..trace.num_rows() {
@@ -582,6 +587,7 @@ impl BuiltInProverComponent for MemoryPageChip {
         let log_size =
             crate::trace::utils::ceil_log2_at_least_lanes(num_rows_real.max(1)).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
+        let layout = side_note.layout();
 
         for (pi, page) in pages.iter().enumerate() {
             let before_arr: &[u8; crate::page_merkle::PAGE_SIZE] =
@@ -594,7 +600,6 @@ impl BuiltInProverComponent for MemoryPageChip {
                 core::array::from_fn(|k| BaseField::from((page.page_idx >> k) & 1));
             // Its region, if any: the selector, the bounds, and the two
             // distances inside them.
-            let layout = &side_note.memory_layout;
             let region = layout.region_of(page.page_idx);
             let select: [BaseField; REGIONS] =
                 core::array::from_fn(|k| BaseField::from(u32::from(region == Some(k))));

@@ -10,7 +10,7 @@
 use stwo::core::channel::Blake2sChannel;
 use stwo::core::fields::m31::BaseField;
 use vos_pvm::instruction::Opcode;
-use vos_pvm::interpreter::{Interpreter, PERM_NONE, PERM_RO, PERM_RW};
+use vos_pvm::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
 use vos_pvm::{ExitReason, PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::SideNote;
@@ -359,4 +359,71 @@ fn a_blake2b_write_to_a_read_only_page_is_refused() {
         refused(side_note),
         "SOUNDNESS GAP: a BLAKE2b write to a read-only page proved"
     );
+}
+
+// ── The layout is explicit ─────────────────────────────────────────────
+
+/// A trap on a sparse memory holding one page at A, the image a kernel's
+/// run starts from.
+fn sparse_run() -> SideNote {
+    let code = vec![Opcode::Trap as u8];
+    let bitmask = vec![1];
+    let mut memory = Memory::sparse(1u64 << 32);
+    memory.init_copy(A, &[V]);
+    let image = memory.nonzero_page_image().into();
+    let pvm = Interpreter::with_memory(
+        code.clone(),
+        bitmask.clone(),
+        vec![],
+        [0; PVM_REGISTER_COUNT],
+        memory,
+        10_000,
+    );
+    let mut tracer = TracingPvm::new(pvm);
+    assert_eq!(tracer.run(), ExitReason::Panic);
+    SideNote::new(tracer.into_trace(), code, bitmask).with_sparse_memory(image)
+}
+
+/// A sparse image without its program's layout is neither proven nor
+/// verified: its identity would make every page writable. Asked for
+/// explicitly, every page writable proves.
+#[test]
+fn a_sparse_image_without_its_layout_is_refused() {
+    let mut bare = sparse_run();
+    assert_eq!(bare.memory_layout(), None);
+    assert!(matches!(
+        vos_pvm_proof::prove(&mut bare),
+        Err(vos_pvm_proof::ProvingError::NoMemoryLayout)
+    ));
+    let mut side_note = sparse_run().with_memory_layout(MemoryLayout::writable());
+    let proof = vos_pvm_proof::prove(&mut side_note).expect("proving failed");
+    vos_pvm_proof::prepare_side_note_for_verification(&mut bare);
+    assert!(vos_pvm_proof::verify(proof.clone(), &bare).is_err());
+    vos_pvm_proof::verify(proof, &side_note).expect("verification failed");
+}
+
+/// Regions are disjoint, or a page in two could select the permissive one.
+#[test]
+fn a_layout_s_regions_are_disjoint() {
+    let page = |first, end| PageRange { first, end };
+    let of = |regions| MemoryLayout { regions };
+    assert!(MemoryLayout::writable().is_disjoint());
+    assert!(layout(true).is_disjoint());
+    assert!(of([page(0, 5), page(5, 9), page(9, 9), page(3, 3)]).is_disjoint());
+    assert!(!of([page(0, 5), page(4, 9), page(0, 0), page(0, 0)]).is_disjoint());
+    assert!(!of([page(0, 0), page(2, 3), page(0, 0), page(0, 10)]).is_disjoint());
+}
+
+#[test]
+#[should_panic(expected = "overlap")]
+fn an_overlapping_layout_is_refused() {
+    let page = |first, end| PageRange { first, end };
+    let _ = writable_run(MemoryLayout {
+        regions: [
+            page(PAGE, PAGE + 1),
+            page(0, 0),
+            page(0, 1 << 20),
+            page(0, 0),
+        ],
+    });
 }

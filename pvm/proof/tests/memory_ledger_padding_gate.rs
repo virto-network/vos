@@ -234,7 +234,9 @@ fn fill_ledger(rows: &[Row], log_size: u32, sn: &SideNote) -> Vec<BaseColumn> {
         let permission = if r.pad == 1 {
             0
         } else {
-            sn.memory_layout.permission(r.addr / PAGE_SIZE as u32) as i64
+            sn.memory_layout()
+                .expect("a layout")
+                .permission(r.addr / PAGE_SIZE as u32) as i64
         };
         let (readable, writable) = (permission >= 1, permission == 2);
         trace.fill_columns_base_field(i, &[field(is_start)], Ledger::IsStart);

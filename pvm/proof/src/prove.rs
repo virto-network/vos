@@ -60,6 +60,9 @@ pub enum ProvingError {
     /// The registry does not admit the format, or no stack implements its
     /// channel: the prover produces only what a verifier accepts.
     FormatNotAdmitted(u32),
+    /// A sparse memory image without its program's layout: its proof would
+    /// carry an identity with every page writable.
+    NoMemoryLayout,
 }
 
 impl ProvingError {
@@ -79,6 +82,9 @@ impl core::fmt::Display for ProvingError {
             Self::Stwo(error) => error.fmt(formatter),
             Self::FormatNotAdmitted(number) => {
                 write!(formatter, "the prover does not produce format {number}")
+            }
+            Self::NoMemoryLayout => {
+                formatter.write_str("a sparse memory image without its program's layout")
             }
         }
     }
@@ -346,7 +352,8 @@ fn backfill_final_regs(side_note: &mut SideNote) {
 }
 
 /// Reject memory witnesses that cannot represent a completed PVM memory
-/// instruction before any page-boundary construction or trace allocation.
+/// instruction before any page-boundary construction or trace allocation,
+/// and a sparse image without its program's layout.
 ///
 /// A faulting instruction is present in the execution trace so its terminal
 /// PC/gas state can be observed, but it performed no memory access. The CPU
@@ -362,6 +369,10 @@ fn backfill_final_regs(side_note: &mut SideNote) {
 /// overflow or an unbalanced lookup.
 fn validate_memory_witnesses(side_note: &SideNote) -> Result<(), ProvingError> {
     const ADDRESS_SPACE_SIZE: u64 = 1u64 << 32;
+
+    if side_note.memory_layout().is_none() {
+        return Err(ProvingError::NoMemoryLayout);
+    }
 
     for step in &side_note.steps {
         let flags = crate::chips::cpu::classify::classify_opcode(step.opcode);
