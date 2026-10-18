@@ -182,12 +182,14 @@ No proof leaves a test in this slice: masking is slice 6.
 - **Inner parameters** (formats 31, 32): blowup 4, 44 queries, PoW 20,
   FRI fold step 1, log last-layer degree bound 0: 108 conjectured and
   62.8 proven bits for segments [model], a grind of about 30 ms.
+  Superseded at 5.10a by 35/36/37 (segments at 40 queries and PoW 24).
 - **Interaction PoW of 8 bits,** mixed before any logup challenge is
   drawn (A.1 item 4), in the prover, the native verifier and the
   preflight; its slot in the transcript stays for every format with
   logup.
 - **Device and credential formats** (34, 30): blowup 2, 86 queries, PoW
-  20, interaction PoW 8: 62 proven bits, 2 over the floor.
+  20, interaction PoW 8: 62 proven bits, 2 over the floor. Superseded at
+  5.10a by 35/36/37 (the device format is 37).
 - **The wrap** (28): blowup 64, 20 queries, PoW 26, interaction PoW 8,
   fold step 3, last layer 2^6, needing affine DEEP batching for its 80
   proven bits; as built it counts 74 (`proving.md` §3.5). 5.14 decides
@@ -337,7 +339,8 @@ in its order; 5.9 runs beside 5.8.
 **What M0 changed under M1:**
 - **Formats:** segments are 31 (Poseidon2-M31), leaves and folds 32, the
   wrap 28; 33 is the legacy Blake2s segment format, 34 and 30 the device
-  and credential formats. 24–27 and 29 are retired.
+  and credential formats. 24–27 and 29 are retired. Superseded at 5.10a by
+  35/36/37: 31, 33 and 34 are retired.
 - **The segment AIR** is 25 chips, **8,039 columns** in full (185
   preprocessed, 4,882 main, 2,964 interaction, 8 composition) and 5,177
   constraints. A derived kernel's shape is 23 of them, 8,024 columns
@@ -398,7 +401,7 @@ M0's milestone review left these before the recursion builds on them.
     the boundary states only `if side_note.closing_chip_active`.
   - One function serves both, and A.1's in-AIR transcript follows it.
   - `tests/recursion_seams.rs:45`'s `..._format_26_...` is renamed for
-    format 31.
+    format 31 (superseded at 5.10a by 35/36/37).
 - **One page tree.** `page_merkle.rs:74-140` re-implements
   `vos_pvm_program::image`'s tree; it reuses it, and the stale comment at
   `:75` (formats 12 to 21) goes.

@@ -2549,3 +2549,200 @@ from `b739bc9e`.
 - `docs/design/research/slice-5/count-35.log`: the count crate's output
   under a header saying how it was ported; the crate stays uncommitted, as
   for `count-hardened.log`.
+
+## Step 5.10: the in-AIR verifier's pieces
+
+`recursion-air.md` §10's step 3, on `vos-core` from `bc1f4f70`: a segment
+proof of format 35 verified in a circuit, piece by piece, each a function on
+a `Context` (`pvm/proof/recair/src/verifier`).
+
+### The pieces
+
+- **The channel** (`channel.rs`): `Poseidon2M31Channel` in rows, on the
+  lossless encodings: `mix_u64` as one wire of four 16-bit limbs, roots as
+  their eight words, felts as wires, the boundary bytes as one run of 296;
+  a felt draw is a squeeze's first wire, `draw_secure_felts(2)` both. The
+  PoW is the check's two permutations, then the first word's trailing zeros
+  (`word = 2^n·h`, `h` of `31 − n` bits; `2^n·h` is even and below
+  `2^31 − 1`, so it is the integer). A query is a drawn word's canonical
+  decomposition: 31 bits that recompose it and are not all one (zero's
+  other decomposition, `2^31 − 1 = p`), checked by inverting their sum
+  minus 31; its position the low bits, as `draw_queries` masks it. 63 rows a
+  query. The nonce's limbs are not range-checked: the work is in the hash
+  whatever the limbs.
+- **Merkle openings** (`merkle.rs`): a leaf is the tree's row sorted by log
+  size (stable, fixed at build), one sponge; a node a level, ordered by the
+  position's bit, the last one's output the root's wires. The preprocessed
+  tree's bits are Stwo's remap: the first and the top `h − 1`.
+  `expand_decommitment` replays `MerkleVerifierLifted::verify`'s walk and
+  records each node's sibling, so each query gets its whole path; FRI's
+  layers use it too.
+- **FRI at fold step 1** (`fri.rs`), per query: in each layer the query's
+  and its sibling's leaves (four words, one permutation each), the pair's
+  node, the path; then `(own + sib) + α·(own − sib)·t`, `t` the inverse of
+  the point's `y` (layer 0) or `x` (`x` doubled a layer). An odd position's
+  point is the even one's conjugate or antipode, so the sign cancels and
+  nothing selects. The last fold's output is the last layer's one
+  coefficient's wire.
+- **DEEP** (`deep.rs`): `build_samples_with_randomness_and_periodicity`'s
+  points and `α` exponents at the pin (a column of two samples gets the
+  periodicity sample first). Per point once: `c = z̄.y − z.y`, `V = Σ α^k·v`
+  and `W = conj(Σ ᾱ^k·v)` (two rows a sample), `A = W − V`, `B = c·V −
+  z.y·A`, `Re`/`Im` of the point's coordinates. Per query and point:
+  `S(q)`'s Horner chain, an `h8` row a clean block (eight lanes of a leaf
+  row, one sample each at the point, exponents in a step, no other sample
+  of the point between them) and one fused row any other sample; then six
+  rows (`D(q)`, its inverse, the numerator, the sum).
+- **OODS** (`oods.rs`): 5.9's compiled constraints over the sampled
+  values', claimed sums' and challenges' wires, folded under the
+  composition coefficient, times the vanishing inverse (the point shifted
+  onto the coset's doubling chain, `x` doubled `B − 1` times); written into
+  the sampled composition `left + x·right`.
+- **The logup sums** (`logup.rs`), as the native verifier checks them: the
+  claimed sums add to zero, and each boundary chip's equals its public term
+  over the absorbed bytes' lanes (`Σ α^i·t_i − z` Horner from the last limb,
+  one row a limb). So the other chips' sums and the public terms add to
+  zero.
+- **The shape** (`shape.rs`): a circuit is built for a format, a component
+  mask, its log sizes and the program's preprocessed root; from them the
+  header words (`mix_statement_header` run on a word-recording channel),
+  the trees' orders, the sample offsets (`vos_pvm_proof::sample_layout`:
+  the components' masks at the identity point), the relations' draw order
+  (a recording channel's squeezes matched by `z`) and the compiled
+  constraints. `SegmentShape::check` refuses a proof of another format,
+  configuration, mask, log sizes or preprocessed root; in the circuit the
+  header the channel mixes is checked word by word against the shape's
+  constants, and the preprocessed root likewise. The mask is not mixed
+  natively: it is the circuit's structure.
+- **The witness** (`witness.rs`): `SegmentValues::from_proof` runs the
+  native walk (`extract_recursion_data`), takes the positions in draw
+  order from the transcript's last squeezes (repeats kept), and lays out
+  each tree's sorted leaf row and path and each FRI layer's sibling and
+  path; the FRI walk folds with Stwo's own `fold_circle_into_line` and
+  `fold_coset`. `SegmentValues::blank` is the layout without values.
+- **Composed** (`segment.rs`): in the native verifier's order, each check
+  where the native one is (the logup sums after the claimed sums are mixed,
+  OODS after the OODS point is drawn, the PoW before the queries), so a
+  tamper is refused where the native verifier refuses it.
+
+### Decisions
+
+- **`Bit`** (carried from 5.8): `gadgets::node` takes a `Bit`, which only
+  `Context::assert_bit` makes.
+- **A lenient `Context`** records a gate whose output differs from the wire
+  it must equal as a `Mismatch` (the address, both values and the piece)
+  instead of panicking; the strict default is unchanged. Rows are counted
+  by piece (`Context::piece`). A tamper test names the check that refused.
+- **Message wires' unread lanes** (carried from 5.8): no consumer reads a
+  lane its absorbing row did not absorb: DEEP's singles read real lanes
+  only and its `h8` blocks are whole blocks of real columns; felts, roots,
+  nonces and the 296 bytes are whole wires.
+- **Paths per query, not shared:** a repeated position is verified twice;
+  the structure does not depend on the draws.
+- **No `h8` outside DEEP**, as 5.9 found.
+
+### Tests (`pvm/proof/recair/tests/verifier.rs`, `just check`)
+
+- **Composed, on the fixture (18 chips) and on a run proved over all 25:**
+  no mismatch; the in-circuit transcript equals the native recorder's
+  (`record`s of `extract_recursion_data`) permutation for permutation, 2,584
+  on the fixture; every draw is the native verifier's (each relation's `z`
+  and `α`, the composition coefficient, the OODS point, the DEEP
+  coefficient, the 17 folding coefficients, the 40 positions in draw
+  order); each query's DEEP quotient is its native first-layer value. The
+  wiring built without values is the filled one's.
+- **The circuit proves and verifies:** the fixture's verifier circuit,
+  padded to 2^16 / 2^16 / 2^15, proves in 1.2 s and verifies.
+- **Each piece on recorded data, alone:** every tree's opening of every
+  query; `expand_decommitment`'s paths each recompute the root (a witness
+  one short or one long refused); FRI from the native first-layer values
+  and coefficients; DEEP from the native samples, coefficient and point
+  (each quotient the native one); OODS from the native values; the logup
+  sums from the native sums, bytes and challenges.
+- **Each tamper refused by its check** (the composed circuit's first
+  mismatch): a trace Merkle sibling, a preprocessed sibling, a queried value
+  and a composition value (`merkle`); a FRI layer value and path node
+  (`fri`); the PoW nonce, the interaction PoW nonce, a FRI root and the
+  last layer's coefficient (`pow`: the last two are mixed before the PoW is
+  ground, as natively); a claimed sum (`logup`); a boundary byte with its
+  interaction PoW reground natively (`logup`), and without (`pow`); an OODS
+  sample, the running sum's, and a composition sample (`oods`); a header
+  word (`shape`). Alone: the last layer's coefficient refused by every
+  query's last fold, a first-layer value and a sibling by FRI; a queried
+  value and a sampled value move DEEP's quotients; an OODS sample, a
+  claimed sum and the register-memory relation's `z` refused by OODS; a
+  claimed sum and a byte of each boundary state by the logup sums.
+- **A tampered witness, proved, is refused** by the recursion verifier.
+- **The bits:** zero's all-ones decomposition is refused by the canonical
+  check alone; a word with 23 trailing zeros fails a 24-bit PoW.
+- **The shape:** another format, configuration, mask, log sizes or
+  preprocessed root is refused by `SegmentShape::check` and by the witness
+  builder.
+
+### Rows
+
+[measured: rows built; the model is `research/slice-5/count-35.log`]
+
+| circuit | `p2` | `qm31` | `h8` |
+|---|---|---|---|
+| the fixture (4,277 columns, 5,473 samples at 15 points, lifting 2^19) | 35,944 | 62,647 | 25,000 |
+| a full-shape run (25 chips) | 55,785 | 100,169 | 46,160 |
+| **the window kernel's class-1 leaf topology** (built without values) | **57,655** | **101,438** | **46,000** |
+| its model, without the leaf's own work | 59,242 | 102,049 | 46,080 |
+
+The window kernel's leaf by piece, against §4.7's terms (per query × 40,
+then once):
+
+| piece | measured | model |
+|---|---|---|
+| `p2` leaf hashes and paths, four trees | 1,082 a query | 1,004 + 84 |
+| `p2` FRI leaves and paths | 243 a query | 266 |
+| `p2` channel, PoWs and query draws | 4,655 | 5,082 |
+| `qm31` query word and bits | 64 a query | 63 |
+| `qm31` query point from bits | 75 a query | 84 |
+| `qm31` FRI folds and twiddles | 106 a query | 133 |
+| `qm31` DEEP, per point (16 points) and off the `h8` runs | 96 + 785 a query | 108 + 769 |
+| `h8` DEEP blocks | 1,150 a query | 1,152 |
+| `qm31` DEEP once (sampled values' sums, constants, powers) | 20,445 | 20,458 |
+| `qm31` OODS (compiled, accumulation, powers, point, check) | 35,216 | 35,222 |
+| `qm31` logup, with the boundary public terms | 655 | 25 + about 800 (§4.1) |
+| `qm31` PoW checks | 46 | 64 |
+| `qm31` header and preprocessed root against the shape | 34 | 0 |
+
+- **The lifting height is 2^20, not the model's 2^21:** Stwo's
+  composition bound is the largest component's log size plus one (19 for
+  MEMORY's 18), split once and blown up by 4. One FRI layer and one path
+  level fewer a query (the model's 19 layers are 18).
+- **16 sample points, not 18:** the periodicity points of the largest
+  columns coincide with their second sample's point.
+- `p2` has **7,881 rows (12.0%) to spare** under 2^16, against the model's
+  9.5%; `qm31` 29,634 under 2^17; `h8` 19,536 under 2^16. The leaf's own
+  work (5.12: the state digests, the io-hash, the flags) is not counted.
+
+### Gates
+
+[measured, under `systemd-run` at 14 GiB with `nice -n 10`,
+`CARGO_INCREMENTAL=0` and 8 jobs]
+- **Every piece accepts real data and refuses each tamper** (above).
+- **`just check`** green: 1,063 tests (1,049 at 5.10a), the verifier's 14 among
+  them, 3.0 s on their own; clippy clean.
+- Not run: `test-proof` (no prover suite changed) and the window kernel's
+  real segment in a circuit, which 5.12 lists (spike 3's segment); its
+  leaf's topology is built and counted here.
+
+### Carried to later steps
+
+- **5.11:** the window kernel's leaf rows above are built, not modelled;
+  5.11's regression test pins them per piece.
+- **5.12:** the nonce's limbs are not range-checked (the PoW's work does
+  not need it); the boundary bytes are not range-checked here, as
+  `proving.md` A.3 leaves to the leaf (the 32 bytes of φ9..12).
+
+### Outside the step's files
+
+- `pvm/proof/src/verify/recursion.rs`: `sample_layout`, a shape's trees,
+  sample offsets and component layout; `verify.rs` and `lib.rs` export it.
+- `pvm/proof/src/refine_codec/tests.rs`: a stale "format-31" doc comment.
+- `docs/design/slice-5-proving.md`: formats 31, 33 and 34 noted superseded
+  at 5.10a by 35/36/37.
+- `docs/design/recursion-air.md` §4.8: what the build found.

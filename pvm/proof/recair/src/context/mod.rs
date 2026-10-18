@@ -25,11 +25,22 @@
 //! [`Context::finalize`] pads every component to its size, computes the
 //! multiplicities, and runs the static wiring check
 //! ([`Circuit::check_wiring`]).
+//!
+//! **A refused witness.** A gate whose computed output differs from the wire
+//! it must equal is a witness no trace satisfies: the yield and the uses of
+//! that address carry different values, so the `Gate` relation does not
+//! balance. A strict context panics there; a lenient one
+//! ([`Context::lenient`]) records a [`Mismatch`] and goes on, so a test can
+//! name the check that refused a tampered witness, and prove the witness to
+//! see the verifier refuse it.
+//!
+//! **Pieces.** Rows are counted under the label [`Context::piece`] last set,
+//! and a mismatch names it.
 
 mod arith;
 mod finalize;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
@@ -48,6 +59,27 @@ impl Var {
     pub const fn address(self) -> u32 {
         self.0
     }
+}
+
+/// A wire constrained to 0 or 1: made only by [`Context::assert_bit`], one
+/// `b·b = b` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Bit(Var);
+
+impl Bit {
+    pub const fn var(self) -> Var {
+        self.0
+    }
+}
+
+/// A gate whose computed output differs from the wire it must equal: the
+/// address, the wire's value and the gate's, and the piece being built.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mismatch {
+    pub address: u32,
+    pub expected: SecureField,
+    pub computed: SecureField,
+    pub piece: &'static str,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,7 +131,7 @@ pub struct P2Row<'a, V> {
     pub act: [BaseField; 8],
     pub c: [BaseField; 10],
     /// The direction bit, for a node: a use.
-    pub bit: Option<Var>,
+    pub bit: Option<Bit>,
     /// Wires at consecutive addresses the output must equal; new wires
     /// otherwise.
     pub out: Option<[Var; 2]>,
@@ -207,6 +239,10 @@ pub struct Context<V: Value> {
     constant_vars: HashMap<[u32; 4], Var>,
     n_outputs: u32,
     outputs_set: bool,
+    lenient: bool,
+    mismatches: Vec<Mismatch>,
+    piece: &'static str,
+    piece_rows: BTreeMap<&'static str, [usize; 3]>,
 }
 
 impl<V: Value> Default for Context<V> {
@@ -238,6 +274,10 @@ impl<V: Value> Context<V> {
             constant_vars: HashMap::new(),
             n_outputs,
             outputs_set: n_outputs == 0,
+            lenient: false,
+            mismatches: Vec::new(),
+            piece: "context",
+            piece_rows: BTreeMap::new(),
         };
         for (address, value) in [
             (ZERO_ADDRESS, SecureField::zero()),
@@ -283,6 +323,34 @@ impl<V: Value> Context<V> {
 
     pub fn zero(&self) -> Var {
         Var(ZERO_ADDRESS)
+    }
+
+    /// Records a gate's output that differs from the wire it must equal, as
+    /// a [`Mismatch`], instead of panicking.
+    pub fn lenient(mut self) -> Self {
+        self.lenient = true;
+        self
+    }
+
+    /// The mismatches a lenient context recorded, in the order the gates were
+    /// built.
+    pub fn mismatches(&self) -> &[Mismatch] {
+        &self.mismatches
+    }
+
+    /// Counts the rows built from now on under `piece`, and names it in a
+    /// mismatch; returns the label it replaces.
+    pub fn piece(&mut self, piece: &'static str) -> &'static str {
+        core::mem::replace(&mut self.piece, piece)
+    }
+
+    /// The rows each piece built: `p2`, `qm31`, `h8`.
+    pub fn piece_rows(&self) -> &BTreeMap<&'static str, [usize; 3]> {
+        &self.piece_rows
+    }
+
+    fn count_row(&mut self, component: usize) {
+        self.piece_rows.entry(self.piece).or_default()[component] += 1;
     }
 
     pub fn one(&self) -> Var {
@@ -372,11 +440,20 @@ impl<V: Value> Context<V> {
             Some(var) => {
                 if let (Some(expected), Some(computed)) =
                     (self.values[var.0 as usize].to_qm31(), value.to_qm31())
+                    && expected != computed
                 {
-                    assert_eq!(
-                        expected, computed,
-                        "a gate's output differs from the wire it must equal"
+                    assert!(
+                        self.lenient,
+                        "a gate's output differs from the wire it must equal \
+                         (address {}, piece {}): {expected} ≠ {computed}",
+                        var.0, self.piece
                     );
+                    self.mismatches.push(Mismatch {
+                        address: var.0,
+                        expected,
+                        computed,
+                        piece: self.piece,
+                    });
                 }
                 (var, self.slot(var, true))
             }
@@ -384,6 +461,7 @@ impl<V: Value> Context<V> {
     }
 
     fn push_qm31(&mut self, op: Qm31Op, slots: [Slot; 4]) {
+        self.count_row(1);
         let values = slots.map(|slot| match slot.role {
             Role::Free => V::from_qm31(SecureField::zero()),
             _ => self.values[slot.address as usize],
@@ -445,6 +523,7 @@ impl<V: Value> Context<V> {
         }
         let (var, out_slot) = self.out_slot(out, computed);
         slots[3] = out_slot;
+        self.count_row(1);
         self.qm31.push(Qm31Gate {
             op,
             slots,
@@ -477,6 +556,7 @@ impl<V: Value> Context<V> {
         }
         let computed = acc * mu + horner;
         let (var, out_slot) = self.out_slot(out, computed);
+        self.count_row(2);
         self.h8.push(H8Gate {
             inputs: inputs.map(Var::address),
             out: out_slot,
@@ -524,7 +604,7 @@ impl<V: Value> Context<V> {
             Message::Free(value) => value,
         });
         let b = match (mode, bit) {
-            (P2Mode::Node, Some(bit)) => self.value(bit),
+            (P2Mode::Node, Some(bit)) => self.value(bit.var()),
             (P2Mode::Node, None) => panic!("a node row needs its bit"),
             _ => zero,
         };
@@ -564,7 +644,7 @@ impl<V: Value> Context<V> {
         });
         let bit = bit
             .filter(|_| mode == P2Mode::Node)
-            .map(|bit| self.slot(bit, false).address);
+            .map(|bit| self.slot(bit.var(), false).address);
         let (digest, out_slots) = match out {
             None => {
                 let digest = [0, 1].map(|w| self.new_var(state[w], State::Yielded));
@@ -585,6 +665,7 @@ impl<V: Value> Context<V> {
             }
         };
         let gate = self.p2.len();
+        self.count_row(0);
         if let Some(prev) = prev.filter(|_| mode.is_chained()) {
             self.p2[prev.gate].next = Some(gate);
         }

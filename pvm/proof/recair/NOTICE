@@ -14,3 +14,13 @@ it was modified (Apache-2.0 §4(b)):
   crates/circuits/src/finalize_constants.rs and
   crates/circuit_common/src/finalize.rs;
 - src/value.rs, from crates/circuits/src/ivalue.rs.
+
+It also adapts code from Stwo (https://github.com/starkware-libs/stwo), as
+the workspace pins it (the fork olanod/stwo at bbfa8bc3), Copyright
+StarkWare Industries Ltd., licensed under the Apache License, Version 2.0,
+each file naming its source and stating that it was modified:
+
+- src/verifier/merkle.rs's `expand_decommitment`, from
+  crates/stwo/src/core/vcs_lifted/verifier.rs (`MerkleVerifierLifted::verify`);
+- src/verifier/witness.rs's FRI walk, from crates/stwo/src/core/fri.rs
+  (`compute_decommitment_positions_and_rebuild_evals`, `SparseEvaluation`).

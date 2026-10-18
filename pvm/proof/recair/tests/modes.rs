@@ -74,7 +74,7 @@ fn modes_circuit() -> Finalized<SecureField> {
             compress(&sibling, &expected)
         };
         let bit_var = context.guess(SecureField::from(BaseField::from(bit)));
-        context.assert_bit(bit_var);
+        let bit_var = context.assert_bit(bit_var);
         let out = (level == 2).then(|| {
             let wires = digest_wires(&expected);
             let pair = context.guess_pair(wires);

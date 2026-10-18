@@ -10,7 +10,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_poseidon2::{DRAW_DOMAIN, RATE};
 
-use crate::context::{Context, Message, P2Handle, P2Row, Var};
+use crate::context::{Bit, Context, Message, P2Handle, P2Row, Var};
 use crate::value::Value;
 use vos_recair_air::p2::P2Mode;
 
@@ -76,14 +76,15 @@ pub fn leaf_hash<V: Value>(
 }
 
 /// A Merkle node over `child`, the row below, and `sibling`: `compress(child,
-/// sibling)` when `bit` is 0, `compress(sibling, child)` when it is 1. `bit`
-/// must be a bit, which its producer constrains. The output is `out` when
+/// sibling)` when `bit` is 0, `compress(sibling, child)` when it is 1. The
+/// row's input is linear in the bit, so a non-bit would pick a blend of the
+/// two orders: [`Bit`] is made only by a constraint. The output is `out` when
 /// given.
 pub fn node<V: Value>(
     context: &mut Context<V>,
     child: &P2Handle<V>,
     sibling: [Message<V>; 2],
-    bit: Var,
+    bit: Bit,
     out: Option<[Var; 2]>,
 ) -> P2Handle<V> {
     context.p2(P2Row {
@@ -104,6 +105,7 @@ pub struct TranscriptGadget<V> {
     digest: [Var; 2],
     last_absorption: Option<P2Handle<V>>,
     n_draws: u32,
+    permutations: Vec<[V; 4]>,
 }
 
 impl<V: Value> TranscriptGadget<V> {
@@ -113,7 +115,14 @@ impl<V: Value> TranscriptGadget<V> {
             digest: [context.zero(); 2],
             last_absorption: None,
             n_draws: 0,
+            permutations: Vec::new(),
         }
+    }
+
+    /// Every permutation's output state, in the transcript's order: what a
+    /// native recorder's records hold.
+    pub fn permutations(&self) -> &[[V; 4]] {
+        &self.permutations
     }
 
     /// The digest's two wires.
@@ -140,7 +149,9 @@ impl<V: Value> TranscriptGadget<V> {
                 act: active_lanes(chunk, n_values),
                 ..P2Row::new(mode)
             };
-            prev = Some(context.p2(row));
+            let handle = context.p2(row);
+            self.permutations.push(handle.state);
+            prev = Some(handle);
         }
         let last = prev.expect("an absorption permutes");
         self.digest = last.digest;
@@ -160,6 +171,7 @@ impl<V: Value> TranscriptGadget<V> {
             c,
             ..P2Row::new(P2Mode::Wired)
         });
+        self.permutations.push(handle.state);
         self.n_draws += 1;
         handle.digest
     }
@@ -168,7 +180,7 @@ impl<V: Value> TranscriptGadget<V> {
     /// 16-bit limbs: the digest and `n_bits`, then that state's first eight
     /// words and the nonce. The second row's first word is the one whose
     /// trailing zeros count. The transcript is left as it was.
-    pub fn pow(&self, context: &mut Context<V>, n_bits: u32, nonce: Var) -> P2Handle<V> {
+    pub fn pow(&mut self, context: &mut Context<V>, n_bits: u32, nonce: Var) -> P2Handle<V> {
         let mut c = [BaseField::zero(); 10];
         c[8] = BaseField::from(n_bits);
         let first = context.p2(P2Row {
@@ -177,13 +189,16 @@ impl<V: Value> TranscriptGadget<V> {
             c,
             ..P2Row::new(P2Mode::Wired)
         });
+        self.permutations.push(first.state);
         let mut act = [BaseField::zero(); RATE];
         act[..4].fill(BaseField::one());
-        context.p2(P2Row {
+        let second = context.p2(P2Row {
             prev: Some(&first),
             m: [Message::Wire(nonce), zero_message()],
             act,
             ..P2Row::new(P2Mode::ChannelFirst)
-        })
+        });
+        self.permutations.push(second.state);
+        second
     }
 }

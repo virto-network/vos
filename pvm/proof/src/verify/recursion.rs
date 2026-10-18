@@ -609,3 +609,155 @@ fn poseidon2_stark(
     <crate::poseidon2::P2MerkleChannel as PcsStack>::stark(&proof.stark_proof)
         .expect("the recursion seams take proofs on the Poseidon2-M31 channel")
 }
+
+/// What a segment proof's verifier commits and samples, as a function of its
+/// shape alone (`component_mask`, `log_sizes`, `config`): the in-AIR
+/// verifier's structure, before any proof is read.
+pub struct SampleLayout {
+    /// The lifting height: the composition tree's, and FRI's first layer's.
+    pub lifting_log_size: u32,
+    /// `lifting_log_size − log_blowup_factor`.
+    pub max_log_degree_bound: u32,
+    /// Each tree's columns' log sizes on the evaluation domain, in commit
+    /// order: preprocessed, main, interaction, composition.
+    pub column_log_sizes: alloc::vec::Vec<alloc::vec::Vec<u32>>,
+    /// Each tree's columns' sample points, each the OODS point plus this
+    /// offset, in the order the proof's `sampled_values` hold them.
+    pub sample_offsets: alloc::vec::Vec<
+        alloc::vec::Vec<
+            alloc::vec::Vec<stwo::core::circle::CirclePoint<stwo::core::fields::m31::BaseField>>,
+        >,
+    >,
+    /// Each active component's main and interaction columns, and the
+    /// preprocessed tree's columns it reads, in its order.
+    pub components: alloc::vec::Vec<ComponentLayout>,
+}
+
+/// An active component's place in the trees.
+pub struct ComponentLayout {
+    pub chip: usize,
+    pub log_size: u32,
+    pub main_columns: core::ops::Range<usize>,
+    pub interaction_columns: core::ops::Range<usize>,
+    pub preprocessed_indices: alloc::vec::Vec<usize>,
+}
+
+/// The [`SampleLayout`] of a segment proof's shape: the components the mask
+/// selects at `log_sizes`, their masks at the identity point, which gives
+/// each sample point's offset from the OODS point.
+pub fn sample_layout(
+    component_mask: u32,
+    log_sizes: &[u32],
+    config: &stwo::core::pcs::PcsConfig,
+) -> SampleLayout {
+    use stwo::core::air::Components;
+    use stwo::core::circle::CirclePoint;
+    use stwo::core::fields::m31::BaseField;
+    use stwo::core::fields::qm31::SECURE_EXTENSION_DEGREE;
+    use stwo::core::pcs::utils::try_get_lifting_log_size;
+    use stwo::core::verifier::COMPOSITION_LOG_SPLIT;
+    use stwo_constraint_framework::TraceLocationAllocator;
+
+    let active: alloc::vec::Vec<usize> = (0..crate::chip_idx::COUNT)
+        .filter(|&i| component_mask & (1 << i) != 0)
+        .collect();
+    assert_eq!(active.len(), log_sizes.len(), "one log size a component");
+    let components: alloc::vec::Vec<&'static dyn crate::framework::MachineComponent> = active
+        .iter()
+        .map(|&i| crate::BASE_COMPONENTS[i] as &dyn crate::framework::MachineComponent)
+        .collect();
+    let mut lookup = AllLookupElements::default();
+    let mut channel = crate::poseidon2::Poseidon2M31Channel::default();
+    for component in &components {
+        component.draw_lookup_elements(
+            &mut lookup,
+            crate::pcs::FsChannel::as_ref_channel(&mut channel),
+        );
+    }
+    let allocator = &mut TraceLocationAllocator::default();
+    let verifier_components: alloc::vec::Vec<alloc::boxed::Box<dyn Component>> = components
+        .iter()
+        .zip(log_sizes)
+        .map(|(component, &log_size)| {
+            component.to_component(allocator, &lookup, log_size, SecureField::default())
+        })
+        .collect();
+    let committed = super::committed_log_sizes(&components, log_sizes);
+    let components_ref: alloc::vec::Vec<&dyn Component> =
+        verifier_components.iter().map(|c| &**c).collect();
+    let all = Components {
+        components: components_ref,
+        n_preprocessed_columns: committed[PREPROCESSED_TRACE_IDX].len(),
+    };
+    let blowup = config.fri_config.log_blowup_factor;
+    let split = all.composition_log_degree_bound() - COMPOSITION_LOG_SPLIT;
+    let lifting_log_size =
+        try_get_lifting_log_size(config, split + blowup).expect("a lifting height");
+    let max_log_degree_bound = lifting_log_size - blowup;
+    let mut points = all.mask_points(CirclePoint::zero(), max_log_degree_bound, false);
+    points.push(alloc::vec![
+        alloc::vec![CirclePoint::zero()];
+        2 * SECURE_EXTENSION_DEGREE
+    ]);
+    let base = |coordinate: SecureField| {
+        let [x, rest @ ..] = coordinate.to_m31_array();
+        assert_eq!(
+            rest,
+            [BaseField::from(0); 3],
+            "a mask offset is a base point"
+        );
+        x
+    };
+    let sample_offsets = points
+        .0
+        .into_iter()
+        .map(|tree| {
+            tree.into_iter()
+                .map(|column| {
+                    column
+                        .into_iter()
+                        .map(|point| CirclePoint {
+                            x: base(point.x),
+                            y: base(point.y),
+                        })
+                        .collect()
+                })
+                .collect()
+        })
+        .collect();
+    let mut column_log_sizes: alloc::vec::Vec<alloc::vec::Vec<u32>> = committed
+        .0
+        .into_iter()
+        .map(|tree| tree.into_iter().map(|log_size| log_size + blowup).collect())
+        .collect();
+    column_log_sizes.push(alloc::vec![lifting_log_size; 2 * SECURE_EXTENSION_DEGREE]);
+    let (mut main, mut interaction) = (0, 0);
+    let components = active
+        .iter()
+        .zip(&components)
+        .zip(log_sizes)
+        .zip(&verifier_components)
+        .map(|(((&chip, component), &log_size), verifier)| {
+            let sizes = component.trace_sizes(log_size);
+            let n_main = sizes[ORIGINAL_TRACE_IDX].len();
+            let n_interaction = sizes[INTERACTION_TRACE_IDX].len();
+            let layout = ComponentLayout {
+                chip,
+                log_size,
+                main_columns: main..main + n_main,
+                interaction_columns: interaction..interaction + n_interaction,
+                preprocessed_indices: verifier.preprocessed_column_indices(),
+            };
+            main += n_main;
+            interaction += n_interaction;
+            layout
+        })
+        .collect();
+    SampleLayout {
+        lifting_log_size,
+        max_log_degree_bound,
+        column_log_sizes,
+        sample_offsets,
+        components,
+    }
+}

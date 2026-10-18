@@ -33,6 +33,7 @@ impl<V: Value> Context<V> {
     /// [`Context::finalize`], padding to `sizes` (`p2`, `qm31`, `h8`) rows.
     pub fn finalize_to(mut self, sizes: Option<[usize; 3]>) -> Result<Finalized<V>, WiringError> {
         assert!(self.outputs_set, "the outputs are set before finalizing");
+        self.piece("finalize");
         self.fix_constants();
         self.yield_guesses();
         let rows = self.rows();

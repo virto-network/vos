@@ -14,6 +14,8 @@
 //!   sponge, the Merkle node and the transcript.
 //! - [`compile`] turns a component's constraints into `qm31` rows that
 //!   evaluate them at the OODS point, as the native verifier does.
+//! - [`verifier`] verifies a segment proof in a circuit, piece by piece:
+//!   the channel, Merkle openings, FRI, DEEP, OODS and the logup sums.
 
 pub mod circuit;
 pub mod compile;
@@ -22,9 +24,10 @@ pub mod gadgets;
 pub mod prove;
 pub mod trace;
 pub mod value;
+pub mod verifier;
 
 pub use circuit::{Circuit, Entry, Qm31Op, WiringError};
-pub use context::{Context, Finalized, Message, P2Handle, P2Row, Var, Witness};
+pub use context::{Bit, Context, Finalized, Message, Mismatch, P2Handle, P2Row, Var, Witness};
 pub use prove::{
     ProveError, RecairProof, VerifyError, circuit_commitment, circuit_hash_of, prove, verify,
 };

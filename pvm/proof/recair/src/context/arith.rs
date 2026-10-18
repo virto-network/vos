@@ -8,7 +8,7 @@
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 
-use super::{Context, Var};
+use super::{Bit, Context, Var};
 use crate::circuit::Qm31Op;
 use crate::value::Value;
 
@@ -128,8 +128,9 @@ impl<V: Value> Context<V> {
         b
     }
 
-    /// Constrains `b` to a bit: `b·b = b`, one row.
-    pub fn assert_bit(&mut self, b: Var) {
+    /// Constrains `b` to a bit: `b·b = b`, one row. Over QM31 too, 0 and 1
+    /// are the only solutions.
+    pub fn assert_bit(&mut self, b: Var) -> Bit {
         self.qm31_into(
             Qm31Op {
                 k_m: BaseField::one(),
@@ -140,6 +141,7 @@ impl<V: Value> Context<V> {
             None,
             b,
         );
+        Bit(b)
     }
 
     /// Constrains `a` to equal `b`: `1·a` written to `b`'s address.

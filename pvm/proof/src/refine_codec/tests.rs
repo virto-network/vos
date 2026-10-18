@@ -49,7 +49,7 @@ fn proof() -> Proof {
     )
 }
 
-/// A format-31 proof, on the Poseidon2-M31 channel.
+/// A format-35 proof, on the Poseidon2-M31 channel.
 fn poseidon2_proof() -> Proof {
     let (config, stark) = stark_proof(poseidon2_hash);
     proof_of(

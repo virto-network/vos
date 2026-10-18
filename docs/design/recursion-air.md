@@ -452,6 +452,26 @@ measured slopes (`R/spike4b-stack.md` §2.3):
 In rows a query, for the kernel: 943 leaf-hash, 84 path and 266 FRI
 permutations; 1,091 `h8`; 1,139 QM31 [model].
 
+### 4.8 Built
+
+`vos-recair`'s `verifier` (slice 5's 5.10) builds §4.1–§4.6 as pieces on a
+`Context`, composed in the native verifier's order; on real format-35
+proofs its transcript is the native recorder's permutation for
+permutation, and a tamper is refused by the check the native verifier
+refuses it with. What the build found against the model:
+- **The window kernel's lifting height is 2^20, not 2^21:** Stwo's
+  composition bound is the largest component's log size plus one, split
+  once. One FRI layer and one path level fewer a query.
+- **16 sample points, not 18,** and 1,150 `h8` blocks and 785 single
+  samples a query (the model: 1,152 and 769).
+- **The class-1 leaf's topology, built without values:** 57,655 / 101,438 /
+  46,000 rows [measured], against 59,242 / 102,049 / 46,080 [model], before
+  the leaf's own work: `p2` 12.0% under 2^16.
+- **The logup check is the native one:** the claimed sums add to zero and
+  each boundary chip's is its public term, about 650 rows.
+- **The header is checked word by word** against the circuit's constants
+  (34 rows), rather than starting the channel from a constant digest.
+
 ## 5. Sizing the leaves
 
 Inner parameters: blowup 4, interaction PoW 8, FRI fold step 1, log

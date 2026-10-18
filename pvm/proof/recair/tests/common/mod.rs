@@ -157,7 +157,7 @@ pub fn random_circuit<V: Value>(seed: u64, gates: usize) -> Context<V> {
             13 if !open.is_empty() => {
                 let child = open.swap_remove(rng.below(open.len()));
                 let bit = context.guess(m31_value(rng.below(2) as u32));
-                context.assert_bit(bit);
+                let bit = context.assert_bit(bit);
                 let sibling = if rng.below(2) == 0 {
                     [0, 1].map(|_| Message::Free(V::from_qm31(rng.qm31())))
                 } else {

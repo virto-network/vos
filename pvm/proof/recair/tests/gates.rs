@@ -199,7 +199,7 @@ fn small_circuit() -> vos_recair::Context<SecureField> {
         let bit = context.guess(SecureField::from(stwo::core::fields::m31::BaseField::from(
             i as u32 % 2,
         )));
-        context.assert_bit(bit);
+        let bit = context.assert_bit(bit);
         let parent = node(
             &mut context,
             &leaf,

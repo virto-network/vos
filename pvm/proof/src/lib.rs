@@ -603,9 +603,10 @@ pub use verify::{DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_pcs_pol
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use verify::{
-    ComponentOodsMask, DeepBatch, OodsReconstruction, RecursionData, RecursionTranscript,
-    extract_recursion_data, reconstruct_oods_for_recursion, record_canonical_transcript,
-    verify_with_explicit_components, verify_with_max_log_size, verify_with_options,
+    ComponentLayout, ComponentOodsMask, DeepBatch, OodsReconstruction, RecursionData,
+    RecursionTranscript, SampleLayout, extract_recursion_data, reconstruct_oods_for_recursion,
+    record_canonical_transcript, sample_layout, verify_with_explicit_components,
+    verify_with_max_log_size, verify_with_options,
 };
 
 /// Chip-isolated harness surface — re-exports the trait

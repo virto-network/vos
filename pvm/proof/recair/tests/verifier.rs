@@ -1,0 +1,892 @@
+//! The in-AIR verifier's pieces (`recursion-air.md` §4) on real format-35
+//! proofs: the fixture (18 chips) and a run proved over all 25.
+//!
+//! - **Composed:** the fixture verified in a circuit, its transcript
+//!   permutation for permutation the native recorder's, every draw the
+//!   native verifier's, every query's DEEP quotient its first-layer value;
+//!   the wiring without values is the filled one's; the circuit proves and
+//!   verifies.
+//! - **Each piece on recorded data:** the channel, Merkle openings and
+//!   `expand_decommitment`, FRI, DEEP, OODS and the logup sums, each fed the
+//!   native verifier's values alone.
+//! - **Each tamper refused, by the check that should refuse it:** a Merkle
+//!   sibling, a queried value, a FRI layer value and path node, the last
+//!   layer's coefficient, either PoW nonce, a claimed sum, an OODS sample, a
+//!   boundary byte (the interaction PoW reground), a header word; and a
+//!   tampered witness, proved, is refused by the verifier.
+//! - **The shape:** a proof of another format, configuration, mask, log
+//!   sizes or program is refused before its values reach a circuit.
+//! - **Rows:** each piece's, on the fixture and on the window kernel's
+//!   class-1 leaf topology (built without values), against `recursion-air.md`
+//!   §4.7's model.
+
+use std::sync::OnceLock;
+
+use num_traits::{One, Zero};
+use stwo::core::channel::{Channel as _, MerkleChannel};
+use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::qm31::SecureField;
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+use vos_pvm_proof::pcs::{FsChannel, StarkProofAny};
+use vos_pvm_proof::poseidon2::{P2Hash, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel};
+use vos_pvm_proof::{Proof, RecursionData, chip_idx, extract_recursion_data};
+use vos_recair::verifier::bits::{assert_trailing_zeros, check_word_bits, guess_bits};
+use vos_recair::verifier::channel::u64_wire;
+use vos_recair::verifier::circle::{Point, domain_point};
+use vos_recair::verifier::fri::{FriCommitment, verify_query};
+use vos_recair::verifier::logup::{BoundaryRelations, Challenges};
+use vos_recair::verifier::merkle::{ExpandError, expand_decommitment, verify_opening};
+use vos_recair::verifier::segment::preprocessed_bits;
+use vos_recair::verifier::shape::CompiledInput;
+use vos_recair::verifier::witness::digest_wires;
+use vos_recair::verifier::{
+    SegmentShape, SegmentValues, ShapeMismatch, WitnessError, deep, logup, oods, verify_segment,
+};
+use vos_recair::{Bit, Context, NoValue, Var};
+
+/// A real proof, its circuit's shape, its values and the native verifier's
+/// record of it.
+struct Real {
+    proof: Proof,
+    shape: SegmentShape,
+    values: SegmentValues<SecureField>,
+    data: RecursionData,
+}
+
+impl Real {
+    fn new(proof: Proof) -> Self {
+        let shape = SegmentShape::of(&proof);
+        let values = SegmentValues::from_proof(&shape, &proof).expect("the proof's values");
+        let data = extract_recursion_data(&proof);
+        Self {
+            proof,
+            shape,
+            values,
+            data,
+        }
+    }
+
+    /// Each query's position in draw order.
+    fn drawn(&self) -> Vec<usize> {
+        let n = self.shape.config().fri_config.n_queries;
+        let records = &self.data.transcript.records;
+        let mask = (1usize << self.shape.layout.lifting_log_size) - 1;
+        records[records.len() - n.div_ceil(8)..]
+            .iter()
+            .flat_map(|record| record.output[..8].iter().map(|w| w.0 as usize & mask))
+            .take(n)
+            .collect()
+    }
+
+    /// The native first-layer value at `position`.
+    fn first_layer(&self, position: usize) -> SecureField {
+        let index = self.data.query_positions.binary_search(&position).unwrap();
+        self.data.first_layer_evals[index]
+    }
+
+    /// Each relation's `z` and `α`, in draw order, as the native verifier
+    /// drew them: `z` its challenges', `α` the rest of its squeeze (a
+    /// one-limb relation never powers it).
+    fn challenges(&self) -> Vec<[SecureField; 2]> {
+        let native = self.data.lookup_elements.relation_challenges();
+        let records = &self.data.transcript.records;
+        self.shape
+            .relations
+            .iter()
+            .map(|name| {
+                let relation = native.iter().find(|r| &r.name == name).unwrap();
+                let squeeze = records
+                    .iter()
+                    .find(|record| {
+                        SecureField::from_m31_array(core::array::from_fn(|i| record.output[i]))
+                            == relation.z
+                    })
+                    .expect("the relation's squeeze");
+                let alpha =
+                    SecureField::from_m31_array(core::array::from_fn(|i| squeeze.output[4 + i]));
+                if let Some(&power) = relation.alpha_powers.get(1) {
+                    assert_eq!(power, alpha);
+                }
+                [relation.z, alpha]
+            })
+            .collect()
+    }
+}
+
+fn fixture() -> &'static Real {
+    static FIXTURE: OnceLock<Real> = OnceLock::new();
+    FIXTURE.get_or_init(|| {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../fixtures/segment-35.proof"
+        ))
+        .expect("the format-35 fixture");
+        Real::new(postcard::from_bytes(&bytes).expect("a proof"))
+    })
+}
+
+/// A run proved over all 25 chips, the ones it does not use padded.
+fn full_shape() -> &'static Real {
+    static FULL: OnceLock<Real> = OnceLock::new();
+    FULL.get_or_init(|| {
+        use vos_pvm::instruction::Opcode;
+        use vos_pvm::interpreter::Interpreter;
+        use vos_pvm_proof::core::tracing::TracingPvm;
+
+        let mut code = Vec::new();
+        let mut bitmask = Vec::new();
+        for register in 2..8 {
+            code.extend_from_slice(&[Opcode::Add64 as u8, 0x10 | (register - 1), register]);
+            bitmask.extend_from_slice(&[1, 0, 0]);
+        }
+        code.push(Opcode::Trap as u8);
+        bitmask.push(1);
+        let mut registers = [0u64; vos_pvm::PVM_REGISTER_COUNT];
+        registers[0] = 100;
+        registers[1] = 1;
+        let memory = vec![0u8; 64 * 1024];
+        let pvm = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            registers,
+            memory.clone(),
+            10_000,
+        );
+        let mut tracing = TracingPvm::new(pvm);
+        tracing.run();
+        let mut side_note =
+            vos_pvm_proof::SideNote::new(tracing.into_trace(), code, bitmask).with_memory(memory);
+        let proof = vos_pvm_proof::prove_canonical_format(
+            &mut side_note,
+            &[],
+            &vos_pvm_proof::format::SEGMENT,
+        )
+        .expect("proves");
+        assert_eq!(proof.component_mask, chip_idx::ALL);
+        Real::new(proof)
+    })
+}
+
+fn value(context: &Context<SecureField>, var: Var) -> SecureField {
+    context.value(var)
+}
+
+fn position_of(context: &Context<SecureField>, bits: &[Bit]) -> usize {
+    bits.iter()
+        .enumerate()
+        .map(|(i, bit)| usize::from(value(context, bit.var()) == SecureField::one()) << i)
+        .sum()
+}
+
+fn bump(value: &mut SecureField) {
+    *value += SecureField::one();
+}
+
+/// The composed circuit over `values`, lenient: its context and the first
+/// mismatch's piece.
+fn first_refusal(real: &Real, values: &SegmentValues<SecureField>) -> Option<&'static str> {
+    let mut context = Context::<SecureField>::new().lenient();
+    verify_segment(&mut context, &real.shape, values);
+    context.mismatches().first().map(|mismatch| mismatch.piece)
+}
+
+/// The composed circuit on `real`: no mismatch, the transcript the native
+/// recorder's permutation for permutation, every draw the native verifier's,
+/// each query's DEEP quotient its first-layer value. Returns the context.
+fn verifies_as_natively(real: &Real) -> Context<SecureField> {
+    let mut context = Context::<SecureField>::new();
+    let verified = verify_segment(&mut context, &real.shape, &real.values);
+    let data = &real.data;
+
+    let permutations = verified.channel.transcript().permutations();
+    assert_eq!(permutations.len(), data.transcript.records.len());
+    for (i, (permutation, record)) in permutations
+        .iter()
+        .zip(&data.transcript.records)
+        .enumerate()
+    {
+        let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
+        assert_eq!(
+            *permutation,
+            vos_recair::value::wires_of(words),
+            "permutation {i}"
+        );
+    }
+
+    let draws = &verified.draws;
+    for (drawn, native) in draws.relations.iter().zip(real.challenges()) {
+        assert_eq!(drawn.map(|var| value(&context, var)), native);
+    }
+    assert_eq!(value(&context, draws.composition_coeff), data.random_coeff);
+    assert_eq!(value(&context, draws.oods.x), data.oods_point.x);
+    assert_eq!(value(&context, draws.oods.y), data.oods_point.y);
+    assert_eq!(value(&context, draws.deep_coeff), data.deep_coeff);
+    let alphas: Vec<SecureField> = draws
+        .fri_alphas
+        .iter()
+        .map(|&var| value(&context, var))
+        .collect();
+    assert_eq!(alphas, data.fold_alphas);
+    let drawn: Vec<usize> = draws
+        .queries
+        .iter()
+        .map(|bits| position_of(&context, bits))
+        .collect();
+    assert_eq!(drawn, real.drawn());
+    for (&position, &answer) in drawn.iter().zip(&verified.answers) {
+        assert_eq!(value(&context, answer), real.first_layer(position));
+    }
+    context
+}
+
+fn print_rows(name: &str, context: &Context<impl vos_recair::Value>) {
+    eprintln!("{name}: {:?} rows (p2, qm31, h8)", context.rows());
+    for (piece, rows) in context.piece_rows() {
+        eprintln!("  {piece}: {rows:?}");
+    }
+}
+
+// ── Composed ───────────────────────────────────────────────────────────────
+
+#[test]
+fn the_fixture_verifies_in_a_circuit_as_natively() {
+    let real = fixture();
+    let context = verifies_as_natively(real);
+    print_rows("the fixture's circuit", &context);
+    let (blocks, singles, samples) = real.shape.deep.counts();
+    eprintln!(
+        "DEEP: {samples} samples at {} points; a query's chains {blocks} h8 blocks and {singles} \
+         single samples",
+        real.shape.deep.points.len()
+    );
+
+    // The wiring built without values is the filled one's.
+    let mut wiring = Context::<NoValue>::new();
+    verify_segment(
+        &mut wiring,
+        &real.shape,
+        &SegmentValues::<NoValue>::blank(&real.shape),
+    );
+    assert_eq!(
+        wiring.finalize().expect("the wiring checks").circuit,
+        context.finalize().expect("the wiring checks").circuit
+    );
+}
+
+#[test]
+fn a_full_shape_proof_verifies_in_a_circuit_as_natively() {
+    let context = verifies_as_natively(full_shape());
+    print_rows("the full shape's circuit", &context);
+}
+
+#[test]
+fn the_verifier_circuit_proves_and_verifies() {
+    let real = fixture();
+    let mut context = Context::<SecureField>::new();
+    verify_segment(&mut context, &real.shape, &real.values);
+    let finalized = context.finalize().expect("the wiring checks");
+    let started = std::time::Instant::now();
+    let proof = vos_recair::prove(&finalized.circuit, &finalized.witness).expect("proves");
+    eprintln!(
+        "the fixture's verifier circuit, {:?} rows, proved in {:.2}s",
+        finalized.circuit.log_sizes(),
+        started.elapsed().as_secs_f64()
+    );
+    let (_, hash) = vos_recair::circuit_commitment(&finalized.circuit).unwrap();
+    vos_recair::verify(proof, &hash).expect("verifies");
+}
+
+// ── Tampers, composed ──────────────────────────────────────────────────────
+
+#[test]
+fn every_tamper_is_refused_by_its_check() {
+    let real = fixture();
+    let mut cases: Vec<(&str, &str, SegmentValues<SecureField>)> = Vec::new();
+    let mut add = |name: &'static str,
+                   piece: &'static str,
+                   edit: &dyn Fn(&mut SegmentValues<SecureField>)| {
+        let mut values = real.values.clone();
+        edit(&mut values);
+        cases.push((name, piece, values));
+    };
+    add("a Merkle sibling", "merkle", &|v| {
+        bump(&mut v.queries[3].trees[1].path[5][0])
+    });
+    add("a preprocessed sibling", "merkle", &|v| {
+        bump(&mut v.queries[9].trees[0].path[0][1])
+    });
+    add("a queried value", "merkle", &|v| {
+        bump(&mut v.queries[7].trees[2].leaf[10])
+    });
+    add("a composition value", "merkle", &|v| {
+        bump(&mut v.queries[1].trees[3].leaf[1])
+    });
+    add("a FRI layer value", "fri", &|v| {
+        bump(&mut v.queries[0].fri[3].sibling)
+    });
+    add("a FRI path node", "fri", &|v| {
+        bump(&mut v.queries[5].fri[2].path[1][1])
+    });
+    add("a FRI root", "pow", &|v| bump(&mut v.fri_roots[4][0]));
+    add("the last layer's coefficient", "pow", &|v| {
+        bump(&mut v.last_layer)
+    });
+    add("the PoW nonce", "pow", &|v| bump(&mut v.nonce));
+    add("the interaction PoW nonce", "pow", &|v| {
+        bump(&mut v.interaction_nonce)
+    });
+    add("a claimed sum", "logup", &|v| bump(&mut v.claimed_sums[2]));
+    add("a header word", "shape", &|v| bump(&mut v.header[11]));
+    let running_sum = {
+        let component = &real.shape.layout.components[0];
+        let column = component.interaction_columns.end - 1;
+        real.shape.sample_index[2][column] + 1
+    };
+    add("an OODS sample", "oods", &move |v| {
+        bump(&mut v.sampled[running_sum])
+    });
+    let composition = real.shape.sample_index[3][5];
+    add("a composition sample", "oods", &move |v| {
+        bump(&mut v.sampled[composition])
+    });
+
+    // A boundary byte, its interaction PoW reground natively: the public
+    // terms refuse it.
+    let mut values = real.values.clone();
+    let mut bytes = vos_pvm_proof::boundary_binding::boundary_state_bytes(
+        &real.proof.initial_state,
+        &real.proof.final_state,
+    );
+    bytes[3] ^= 1;
+    values.boundary[0] = vos_recair::verifier::witness::pack(
+        &bytes[..4]
+            .iter()
+            .map(|&b| BaseField::from(b as u32))
+            .collect::<Vec<_>>(),
+    )[0];
+    values.interaction_nonce = u64_wire(regrind_interaction(real, &bytes));
+    cases.push(("a boundary byte", "logup", values));
+
+    for (name, piece, values) in &cases {
+        assert_eq!(
+            first_refusal(real, values),
+            Some(*piece),
+            "{name} is refused by {piece}"
+        );
+    }
+
+    // The interaction PoW alone, for a tampered byte not reground.
+    let mut values = real.values.clone();
+    bump(&mut values.boundary[30]);
+    assert_eq!(first_refusal(real, &values), Some("pow"));
+}
+
+/// The interaction PoW nonce over the transcript with `bytes` as the
+/// boundary states.
+fn regrind_interaction(real: &Real, bytes: &[u8]) -> u64 {
+    let StarkProofAny::Poseidon2M31(stark) = &real.proof.stark_proof else {
+        unreachable!()
+    };
+    let mut channel = Poseidon2M31Channel::default();
+    vos_pvm_proof::proof::mix_statement_header(
+        &mut channel,
+        real.shape.format.number,
+        &real.shape.config(),
+        &real.shape.log_sizes,
+    );
+    P2MerkleChannel::mix_root(&mut channel, stark.commitments[0]);
+    P2MerkleChannel::mix_root(&mut channel, stark.commitments[1]);
+    channel.mix_bytes(bytes);
+    let bits = real.shape.format.interaction_pow_bits();
+    (0..)
+        .find(|&nonce| channel.verify_pow_nonce(bits, nonce))
+        .unwrap()
+}
+
+/// A tampered witness, proved, is refused: its `Gate` relation does not
+/// balance.
+#[test]
+fn a_tampered_witness_proved_is_refused() {
+    let real = fixture();
+    let mut values = real.values.clone();
+    bump(&mut values.queries[3].trees[1].path[5][0]);
+    let mut context = Context::<SecureField>::new().lenient();
+    verify_segment(&mut context, &real.shape, &values);
+    assert!(!context.mismatches().is_empty());
+    let finalized = context.finalize().expect("the wiring checks");
+    let refused = match vos_recair::prove(&finalized.circuit, &finalized.witness) {
+        Err(_) => true,
+        Ok(proof) => {
+            let (_, hash) = vos_recair::circuit_commitment(&finalized.circuit).unwrap();
+            vos_recair::verify(proof, &hash).is_err()
+        }
+    };
+    assert!(refused, "a tampered witness proves and verifies");
+}
+
+// ── The shape ──────────────────────────────────────────────────────────────
+
+#[test]
+fn a_proof_of_another_shape_is_refused() {
+    let real = fixture();
+    let check = |edit: &dyn Fn(&mut Proof)| {
+        let mut proof = real.proof.clone();
+        edit(&mut proof);
+        real.shape.check(&proof)
+    };
+    assert_eq!(check(&|_| {}), Ok(()));
+    assert_eq!(
+        check(&|p| p.format_version = 32),
+        Err(ShapeMismatch::Format {
+            circuit: 35,
+            proof: 32
+        })
+    );
+    assert_eq!(
+        check(&|p| p.pcs_config.pow_bits = 20),
+        Err(ShapeMismatch::Config)
+    );
+    assert!(matches!(
+        check(&|p| p.component_mask ^= 1 << chip_idx::POPCOUNT),
+        Err(ShapeMismatch::ComponentMask { .. })
+    ));
+    assert_eq!(
+        check(&|p| p.log_sizes[3] += 1),
+        Err(ShapeMismatch::LogSizes)
+    );
+    assert_eq!(
+        check(&|p| {
+            let StarkProofAny::Poseidon2M31(stark) = &mut p.stark_proof else {
+                unreachable!()
+            };
+            stark.0.commitments[0].0[0] += BaseField::one();
+        }),
+        Err(ShapeMismatch::PreprocessedRoot)
+    );
+    let mut proof = real.proof.clone();
+    proof.log_sizes[0] += 1;
+    assert_eq!(
+        SegmentValues::from_proof(&real.shape, &proof).unwrap_err(),
+        WitnessError::Shape(ShapeMismatch::LogSizes)
+    );
+}
+
+// ── Each piece on recorded data ────────────────────────────────────────────
+
+/// Bits guessed and constrained for `position`.
+fn bits_of(context: &mut Context<SecureField>, position: usize, n: u32) -> Vec<Bit> {
+    guess_bits(context, Some(position as u32), n)
+}
+
+fn guess_digest(context: &mut Context<SecureField>, hash: &P2Hash) -> [Var; 2] {
+    context.guess_pair(digest_wires(hash))
+}
+
+#[test]
+fn the_bits_refuse_a_noncanonical_word_and_a_short_pow() {
+    // Zero's other decomposition, thirty-one ones, recomposes it but is
+    // refused.
+    let mut context = Context::<SecureField>::new().lenient();
+    let word = context.guess(SecureField::zero());
+    let ones = guess_bits(&mut context, Some(u32::MAX), 31);
+    check_word_bits(&mut context, word, &ones);
+    assert_eq!(context.mismatches().len(), 1, "only the canonical check");
+
+    let mut context = Context::<SecureField>::new().lenient();
+    let word = context.guess(SecureField::zero());
+    let zeros = guess_bits(&mut context, Some(0), 31);
+    check_word_bits(&mut context, word, &zeros);
+    assert!(context.mismatches().is_empty());
+
+    for (word, n_bits, passes) in [(0u32, 24, true), (5 << 24, 24, true), (3 << 23, 24, false)] {
+        let mut context = Context::<SecureField>::new().lenient();
+        let var = context.guess(SecureField::from(BaseField::from(word)));
+        assert_trailing_zeros(&mut context, var, n_bits);
+        assert_eq!(context.mismatches().is_empty(), passes, "{word:#x}");
+    }
+}
+
+#[test]
+fn expand_decommitment_gives_each_query_its_path() {
+    let real = fixture();
+    let StarkProofAny::Poseidon2M31(stark) = &real.proof.stark_proof else {
+        unreachable!()
+    };
+    let tree = 1;
+    let height = real.shape.heights[tree];
+    let order = &real.shape.leaf_order[tree];
+    let leaf = |index: usize| {
+        let row: Vec<BaseField> = order
+            .iter()
+            .map(|&c| stark.queried_values[tree][c][index])
+            .collect();
+        let mut hasher = P2MerkleHasher::default();
+        hasher.update_leaf(&row);
+        hasher.finalize()
+    };
+    let positions = &real.data.query_positions;
+    let leaves: Vec<(usize, P2Hash)> = positions
+        .iter()
+        .enumerate()
+        .map(|(i, &p)| (p, leaf(i)))
+        .collect();
+    let witness = &stark.decommitments[tree].hash_witness;
+    let expanded = expand_decommitment::<P2MerkleHasher>(height, &leaves, witness).unwrap();
+    assert_eq!(expanded.root, stark.commitments[tree]);
+    for &(position, hash) in &leaves {
+        let mut node = hash;
+        for (level, sibling) in expanded.path(position).into_iter().enumerate() {
+            node = if position >> level & 1 == 0 {
+                P2MerkleHasher::hash_children((node, sibling))
+            } else {
+                P2MerkleHasher::hash_children((sibling, node))
+            };
+        }
+        assert_eq!(node, stark.commitments[tree], "position {position}");
+    }
+    assert_eq!(
+        expand_decommitment::<P2MerkleHasher>(height, &leaves, &witness[1..]).unwrap_err(),
+        ExpandError::WitnessTooShort
+    );
+    let mut long = witness.clone();
+    long.push(P2Hash::default());
+    assert_eq!(
+        expand_decommitment::<P2MerkleHasher>(height, &leaves, &long).unwrap_err(),
+        ExpandError::WitnessTooLong
+    );
+}
+
+/// Every tree's opening of every query, alone: accepted, and a sibling or a
+/// value tampered refused.
+#[test]
+fn the_merkle_openings_accept_and_refuse() {
+    let real = fixture();
+    let StarkProofAny::Poseidon2M31(stark) = &real.proof.stark_proof else {
+        unreachable!()
+    };
+    let lifting = real.shape.layout.lifting_log_size;
+    let open = |tamper: Option<(usize, bool)>| {
+        let mut context = Context::<SecureField>::new().lenient();
+        for (q, (&position, query)) in real.drawn().iter().zip(&real.values.queries).enumerate() {
+            let bits = bits_of(&mut context, position, lifting);
+            for (tree, opening) in query.trees.iter().enumerate() {
+                let mut opening = opening.clone();
+                if tamper == Some((q, true)) && tree == 2 {
+                    bump(&mut opening.path[3][1]);
+                }
+                if tamper == Some((q, false)) && tree == 0 {
+                    bump(&mut opening.leaf[0]);
+                }
+                let tree_bits = if tree == 0 {
+                    preprocessed_bits(&bits, real.shape.heights[0])
+                } else {
+                    bits.clone()
+                };
+                let wires: Vec<Var> = opening.leaf.iter().map(|&v| context.guess(v)).collect();
+                let root = guess_digest(&mut context, &stark.commitments[tree]);
+                verify_opening(
+                    &mut context,
+                    &wires,
+                    real.shape.leaf_order[tree].len(),
+                    &tree_bits,
+                    &opening.path,
+                    root,
+                );
+            }
+        }
+        context.mismatches().len()
+    };
+    // A refused opening's root differs in both its wires.
+    assert_eq!(open(None), 0);
+    assert_eq!(open(Some((4, true))), 2);
+    assert_eq!(open(Some((11, false))), 2);
+}
+
+/// FRI alone, on the native first-layer values, folding coefficients and
+/// positions: accepted; a sibling, a first-layer value or the last layer's
+/// coefficient tampered refused.
+#[test]
+fn fri_accepts_and_refuses() {
+    let real = fixture();
+    let lifting = real.shape.layout.lifting_log_size;
+    let run = |tamper: &str| {
+        let mut context = Context::<SecureField>::new().lenient();
+        let roots = real
+            .values
+            .fri_roots
+            .iter()
+            .map(|&root| context.guess_pair(root))
+            .collect();
+        let alphas = real
+            .data
+            .fold_alphas
+            .iter()
+            .map(|&alpha| context.guess(alpha))
+            .collect();
+        let mut last = real.values.last_layer;
+        if tamper == "last" {
+            bump(&mut last);
+        }
+        let commitment = FriCommitment {
+            roots,
+            alphas,
+            last_layer: context.guess(last),
+        };
+        for (q, (&position, query)) in real.drawn().iter().zip(&real.values.queries).enumerate() {
+            let bits = bits_of(&mut context, position, lifting);
+            let point = domain_point(&mut context, lifting, &bits);
+            let mut first = real.first_layer(position);
+            if tamper == "value" && q == 6 {
+                bump(&mut first);
+            }
+            let value = context.guess(first);
+            let mut openings = query.fri.clone();
+            if tamper == "sibling" && q == 2 {
+                bump(&mut openings[7].sibling);
+            }
+            verify_query(
+                &mut context,
+                lifting,
+                &commitment,
+                &bits,
+                point,
+                value,
+                &openings,
+            );
+        }
+        context.mismatches().to_vec()
+    };
+    assert!(run("").is_empty());
+    for tamper in ["last", "value", "sibling"] {
+        assert!(!run(tamper).is_empty(), "{tamper}");
+    }
+    // The last layer: every query's last fold is refused.
+    assert_eq!(run("last").len(), real.values.queries.len());
+}
+
+/// DEEP alone, from the native sampled values, coefficient and OODS point:
+/// each query's quotient is the native first-layer value; a queried value
+/// or a sampled value tampered moves it.
+#[test]
+fn deep_is_the_native_quotient() {
+    let real = fixture();
+    let lifting = real.shape.layout.lifting_log_size;
+    let run = |tamper: &str| {
+        let mut context = Context::<SecureField>::new();
+        let mut sampled_values = real.values.sampled.clone();
+        if tamper == "sample" {
+            bump(&mut sampled_values[100]);
+        }
+        let sampled: Vec<Var> = sampled_values.iter().map(|&v| context.guess(v)).collect();
+        let oods = Point {
+            x: context.guess(real.data.oods_point.x),
+            y: context.guess(real.data.oods_point.y),
+        };
+        let alpha = context.guess(real.data.deep_coeff);
+        let constants = deep::prepare(&mut context, &real.shape.deep, oods, alpha, &sampled);
+        let mut moved = 0;
+        for (q, (&position, query)) in real.drawn().iter().zip(&real.values.queries).enumerate() {
+            let bits = bits_of(&mut context, position, lifting);
+            let point = domain_point(&mut context, lifting, &bits);
+            let leaves: Vec<Vec<Var>> = query
+                .trees
+                .iter()
+                .enumerate()
+                .map(|(tree, opening)| {
+                    let mut leaf = opening.leaf.clone();
+                    if tamper == "queried" && q == 3 && tree == 1 {
+                        bump(&mut leaf[17]);
+                    }
+                    leaf.iter().map(|&v| context.guess(v)).collect()
+                })
+                .collect();
+            let answer = deep::answer(
+                &mut context,
+                &real.shape.deep,
+                &constants,
+                point,
+                [&leaves[0], &leaves[1], &leaves[2], &leaves[3]],
+            );
+            if value(&context, answer) != real.first_layer(position) {
+                moved += 1;
+            }
+        }
+        moved
+    };
+    assert_eq!(run(""), 0);
+    assert_eq!(run("queried"), 1);
+    assert_eq!(run("sample"), real.values.queries.len());
+}
+
+/// The composition check alone, from the native values: accepted; an OODS
+/// sample, a claimed sum or a challenge tampered refused.
+#[test]
+fn oods_accepts_and_refuses() {
+    let real = fixture();
+    let challenges = real.challenges();
+    let inputs = real.shape.compiled_inputs();
+    let run = |tamper: Option<usize>| {
+        let mut context = Context::<SecureField>::new().lenient();
+        let wires: Vec<Var> = inputs
+            .iter()
+            .enumerate()
+            .map(|(i, input)| {
+                let mut value = match *input {
+                    CompiledInput::Sample(index) => real.values.sampled[index],
+                    CompiledInput::ClaimedSum(chip) => real.values.claimed_sums[chip],
+                    CompiledInput::Challenge(r, k) => challenges[r][k],
+                };
+                if tamper == Some(i) {
+                    bump(&mut value);
+                }
+                context.guess(value)
+            })
+            .collect();
+        let coeff = context.guess(real.data.random_coeff);
+        let oods_point = Point {
+            x: context.guess(real.data.oods_point.x),
+            y: context.guess(real.data.oods_point.y),
+        };
+        let composition = core::array::from_fn(|c| {
+            context.guess(real.values.sampled[real.shape.sample_index[3][c]])
+        });
+        oods::check(
+            &mut context,
+            &real.shape.compiled,
+            &wires,
+            coeff,
+            oods_point,
+            real.shape.layout.max_log_degree_bound,
+            composition,
+        );
+        context.mismatches().len()
+    };
+    assert_eq!(run(None), 0);
+    let last_of = |pick: &dyn Fn(&CompiledInput) -> bool| inputs.iter().rposition(pick).unwrap();
+    let running_sum = last_of(&|input| matches!(input, CompiledInput::Sample(_)));
+    let claimed = last_of(&|input| matches!(input, CompiledInput::ClaimedSum(_)));
+    // The register-memory relation's `z`: a relation only chips idle on the
+    // trace use samples to zero there whatever `z` is.
+    let register = real.shape.boundary_relations[0];
+    let challenge = last_of(&|input| *input == CompiledInput::Challenge(register, 0));
+    for tamper in [running_sum, claimed, challenge] {
+        assert_eq!(run(Some(tamper)), 1, "{:?}", inputs[tamper]);
+    }
+}
+
+/// The logup sums alone, from the native claimed sums, boundary bytes and
+/// challenges: accepted; a claimed sum or a boundary byte tampered refused.
+#[test]
+fn the_logup_sums_accept_and_refuse() {
+    let real = fixture();
+    let challenges = real.challenges();
+    let run = |sum: Option<usize>, byte: Option<usize>| {
+        let mut context = Context::<SecureField>::new().lenient();
+        let claimed: Vec<Var> = real
+            .values
+            .claimed_sums
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let mut v = v;
+                if sum == Some(i) {
+                    bump(&mut v);
+                }
+                context.guess(v)
+            })
+            .collect();
+        let boundary: Vec<Var> = real
+            .values
+            .boundary
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let mut v = v;
+                if byte.is_some_and(|byte| byte / 4 == i) {
+                    let mut limbs = v.to_m31_array();
+                    limbs[byte.unwrap() % 4] += BaseField::one();
+                    v = SecureField::from_m31_array(limbs);
+                }
+                context.guess(v)
+            })
+            .collect();
+        let mut challenge = |r: usize| {
+            let [z, alpha] = challenges[r];
+            Challenges {
+                z: context.guess(z),
+                alpha: context.guess(alpha),
+            }
+        };
+        let [register, program, merkle] = real.shape.boundary_relations;
+        let relations = BoundaryRelations {
+            register_memory: challenge(register),
+            program_execution: challenge(program),
+            merkle_node: challenge(merkle),
+        };
+        logup::check(
+            &mut context,
+            &claimed,
+            &real.shape.positions,
+            &boundary,
+            &relations,
+        );
+        context.mismatches().len()
+    };
+    assert_eq!(run(None, None), 0);
+    let positions = real.shape.positions;
+    // A boundary chip's sum: the total and its public term.
+    assert_eq!(run(Some(positions.register_closing), None), 2);
+    // Another chip's: the total.
+    assert_eq!(run(Some(0), None), 1);
+    // A byte of each boundary state: a register in and out, pc and ts in and
+    // out, each memory root.
+    // The closing timestamp enters the register closing's tuples and the
+    // program boundary's consumed one.
+    for (byte, refusals) in [
+        (5, 1),
+        (104 + 9, 1),
+        (208, 1),
+        (212, 1),
+        (220, 1),
+        (224, 2),
+        (232 + 31, 1),
+        (264, 1),
+    ] {
+        assert_eq!(run(None, Some(byte)), refusals, "byte {byte}");
+    }
+}
+
+// ── Rows ───────────────────────────────────────────────────────────────────
+
+/// The window kernel's class-1 leaf topology (mask `0x01f9ffff`, 5.10a's
+/// count), built without values: each piece's rows against `count-35.log`'s
+/// model (59,300 / 102,849 / 46,080 with the leaf's own work).
+#[test]
+fn the_window_kernels_leaf_rows() {
+    const MASK: u32 = 0x01f9_ffff;
+    const LOG_SIZES: [u32; 23] = [
+        15, 14, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 8, 15, 15, 15, 15, 16,
+    ];
+    let shape = SegmentShape::new(
+        &vos_pvm_proof::format::SEGMENT,
+        MASK,
+        &LOG_SIZES,
+        P2Hash::default(),
+    );
+    let mut context = Context::<NoValue>::new();
+    verify_segment(&mut context, &shape, &SegmentValues::blank(&shape));
+    print_rows("the window kernel's class-1 leaf", &context);
+    let (blocks, singles, samples) = shape.deep.counts();
+    eprintln!(
+        "DEEP: {samples} samples at {} points; a query's chains {blocks} h8 blocks and {singles} \
+         single samples; lifting 2^{}",
+        shape.deep.points.len(),
+        shape.layout.lifting_log_size
+    );
+    let rows = context.rows();
+    assert!(
+        rows[0] <= 1 << 16 && rows[1] <= 1 << 17 && rows[2] <= 1 << 16,
+        "{rows:?}"
+    );
+}

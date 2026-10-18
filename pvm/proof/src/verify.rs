@@ -23,8 +23,9 @@ use crate::{lookups::AllLookupElements, side_note::SideNote};
 
 mod recursion;
 pub use recursion::{
-    ComponentOodsMask, DeepBatch, OodsReconstruction, RecursionData, RecursionTranscript,
-    extract_recursion_data, reconstruct_oods_for_recursion, record_canonical_transcript,
+    ComponentLayout, ComponentOodsMask, DeepBatch, OodsReconstruction, RecursionData,
+    RecursionTranscript, SampleLayout, extract_recursion_data, reconstruct_oods_for_recursion,
+    record_canonical_transcript, sample_layout,
 };
 
 /// Verify a chain of segment proofs. Each segment's final state must match
