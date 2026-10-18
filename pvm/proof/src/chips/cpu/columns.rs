@@ -10,6 +10,7 @@
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 
 #[derive(Debug, Copy, Clone, AirColumn)]
+#[row = "Row"]
 pub enum Column {
     #[size = 8]
     Timestamp,

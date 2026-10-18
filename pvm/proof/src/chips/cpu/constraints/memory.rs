@@ -5,12 +5,11 @@ use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
-use super::{Lookups, Trace, is_store};
-use crate::chips::cpu::columns::Column;
+use super::{Lookups, Row, is_store};
 use crate::core::step::WORD_SIZE;
 
 /// Scalar-memory address validity: no access below the initialization zone, none wrapping through 2^32.
-pub(in crate::chips::cpu) fn address_validity<E: EvalAtRow>(eval: &mut E, trace_eval: &Trace<E>) {
+pub(in crate::chips::cpu) fn address_validity<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let f256 = E::F::from(BaseField::from(256u32));
 
     // ── Scalar-memory address validity ──
@@ -27,28 +26,14 @@ pub(in crate::chips::cpu) fn address_validity<E: EvalAtRow>(eval: &mut E, trace_
     // The product is at most 65535 * 256, strictly below the M31 modulus,
     // so it cannot vanish by field reduction.
     {
-        let is_load_mem = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
-        let is_standard_mem_h = crate::trace::trace_eval!(trace_eval, Column::IsStandardMemH);
-        let last_carry_h = crate::trace::trace_eval!(trace_eval, Column::MemLastAddrCarryH);
-        let range_product_h = crate::trace::trace_eval!(trace_eval, Column::MemRangeProductH);
-        let range_inv = crate::trace::trace_eval!(trace_eval, Column::MemRangeInv);
-        let range_times_inv_h = crate::trace::trace_eval!(trace_eval, Column::MemRangeTimesInvH);
-        let mem_addr_guard = crate::trace::trace_eval!(trace_eval, Column::MemAddr);
-        let carry2_guard = crate::trace::trace_eval!(trace_eval, Column::MemByteAddrCarry2);
-        let carry3_guard = crate::trace::trace_eval!(trace_eval, Column::MemByteAddrCarry3);
-        let size1_guard = crate::trace::trace_eval!(trace_eval, Column::IsMemSize1);
-        let size2_guard = crate::trace::trace_eval!(trace_eval, Column::IsMemSize2);
-        let size4_guard = crate::trace::trace_eval!(trace_eval, Column::IsMemSize4);
-        let size8_guard = crate::trace::trace_eval!(trace_eval, Column::IsMemSize8);
+        let is_memory = row.is_load[0].clone() + is_store(row);
+        eval.add_constraint(row.is_standard_mem_h[0].clone() - is_memory);
 
-        let is_memory = is_load_mem[0].clone() + is_store(trace_eval);
-        eval.add_constraint(is_standard_mem_h[0].clone() - is_memory);
-
-        let selected_last_carry = size1_guard[0].clone() * carry3_guard[0].clone()
-            + size2_guard[0].clone() * carry3_guard[1].clone()
-            + size4_guard[0].clone() * carry3_guard[3].clone()
-            + size8_guard[0].clone() * carry3_guard[7].clone();
-        eval.add_constraint(last_carry_h[0].clone() - selected_last_carry);
+        let selected_last_carry = row.is_mem_size1[0].clone() * row.mem_byte_addr_carry3[0].clone()
+            + row.is_mem_size2[0].clone() * row.mem_byte_addr_carry3[1].clone()
+            + row.is_mem_size4[0].clone() * row.mem_byte_addr_carry3[3].clone()
+            + row.is_mem_size8[0].clone() * row.mem_byte_addr_carry3[7].clone();
+        eval.add_constraint(row.mem_last_addr_carry_h[0].clone() - selected_last_carry);
 
         // Derive the high word from the canonical byte-0 memory-lookup
         // address, rather than the raw MemAddr limbs. Indirect-address
@@ -58,16 +43,18 @@ pub(in crate::chips::cpu) fn address_validity<E: EvalAtRow>(eval: &mut E, trace_
         //   b3 = MemAddr[3] + carry3[0]
         // so b2 + 256*b3 simplifies to the expression below while still
         // being authenticated by the canonical MemoryChip ledger tuple.
-        let high_word = mem_addr_guard[2].clone()
-            + carry2_guard[0].clone()
-            + f256.clone() * mem_addr_guard[3].clone();
-        let no_wrap_factor = f256.clone() - mem_addr_guard[3].clone() - last_carry_h[0].clone();
-        eval.add_constraint(range_product_h[0].clone() - high_word * no_wrap_factor);
+        let high_word = row.mem_addr[2].clone()
+            + row.mem_byte_addr_carry2[0].clone()
+            + f256.clone() * row.mem_addr[3].clone();
+        let no_wrap_factor =
+            f256.clone() - row.mem_addr[3].clone() - row.mem_last_addr_carry_h[0].clone();
+        eval.add_constraint(row.mem_range_product_h[0].clone() - high_word * no_wrap_factor);
         eval.add_constraint(
-            range_times_inv_h[0].clone() - range_product_h[0].clone() * range_inv[0].clone(),
+            row.mem_range_times_inv_h[0].clone()
+                - row.mem_range_product_h[0].clone() * row.mem_range_inv[0].clone(),
         );
         eval.add_constraint(
-            is_standard_mem_h[0].clone() * (range_times_inv_h[0].clone() - E::F::one()),
+            row.is_standard_mem_h[0].clone() * (row.mem_range_times_inv_h[0].clone() - E::F::one()),
         );
     }
 }
@@ -75,13 +62,11 @@ pub(in crate::chips::cpu) fn address_validity<E: EvalAtRow>(eval: &mut E, trace_
 /// Range256 checks of the result bytes.
 pub(in crate::chips::cpu) fn result_bytes<E: EvalAtRow>(
     eval: &mut E,
-    trace_eval: &Trace<E>,
+    row: &Row<E::F>,
     lookups: &Lookups<'_>,
 ) {
     let range256_lookup = lookups.range256_lookup;
-    let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
-    let is_real = E::F::one() - is_pad[0].clone();
-    let result = crate::trace::trace_eval!(trace_eval, Column::Result);
+    let is_real = E::F::one() - row.is_padding[0].clone();
     // ════════════════════════════════════════════════════════════════════
     // Range256 checks for result byte limbs
     // ════════════════════════════════════════════════════════════════════
@@ -89,7 +74,7 @@ pub(in crate::chips::cpu) fn result_bytes<E: EvalAtRow>(
         eval.add_to_relation(RelationEntry::new(
             range256_lookup,
             is_real.clone().into(),
-            &[result[i].clone()],
+            &[row.result[i].clone()],
         ));
     }
 }
@@ -97,21 +82,14 @@ pub(in crate::chips::cpu) fn result_bytes<E: EvalAtRow>(
 /// The byte-level memory-access lookups and their address carries.
 pub(in crate::chips::cpu) fn memory_access<E: EvalAtRow>(
     eval: &mut E,
-    trace_eval: &Trace<E>,
+    row: &Row<E::F>,
     lookups: &Lookups<'_>,
 ) {
     let mem_lookup = lookups.mem_lookup;
     // ════════════════════════════════════════════════════════════════════
     // Memory access lookup (producer side)
     // ════════════════════════════════════════════════════════════════════
-    // IsStore folded — `is_store(trace_eval)` is the sum.
-    let mem_addr = crate::trace::trace_eval!(trace_eval, Column::MemAddr);
-    let mem_value = crate::trace::trace_eval!(trace_eval, Column::MemValue);
-    let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
-    let mem_byte_active = crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
-    let mem_byte_carry1 = crate::trace::trace_eval!(trace_eval, Column::MemByteAddrCarry1);
-    let mem_byte_carry2 = crate::trace::trace_eval!(trace_eval, Column::MemByteAddrCarry2);
-    let mem_byte_carry3 = crate::trace::trace_eval!(trace_eval, Column::MemByteAddrCarry3);
+    // IsStore folded — `is_store(row)` is the sum.
     let f256 = E::F::from(BaseField::from(256));
 
     // Byte-level memory lookups: one per byte offset. The address is the
@@ -125,27 +103,27 @@ pub(in crate::chips::cpu) fn memory_access<E: EvalAtRow>(
     // them; the booleanity constraints below keep them in {0,1}.
     for byte_idx in 0..WORD_SIZE {
         let byte_offset = E::F::from(BaseField::from(byte_idx as u32));
-        let c1 = mem_byte_carry1[byte_idx].clone();
-        let c2 = mem_byte_carry2[byte_idx].clone();
-        let c3 = mem_byte_carry3[byte_idx].clone();
+        let c1 = row.mem_byte_addr_carry1[byte_idx].clone();
+        let c2 = row.mem_byte_addr_carry2[byte_idx].clone();
+        let c3 = row.mem_byte_addr_carry3[byte_idx].clone();
         let mut tuple: Vec<E::F> = Vec::with_capacity(15);
         // Canonical bytes of MemAddr + byte_idx, with carry.
-        tuple.push(mem_addr[0].clone() + byte_offset - f256.clone() * c1.clone());
-        tuple.push(mem_addr[1].clone() + c1.clone() - f256.clone() * c2.clone());
-        tuple.push(mem_addr[2].clone() + c2.clone() - f256.clone() * c3.clone());
-        tuple.push(mem_addr[3].clone() + c3.clone());
+        tuple.push(row.mem_addr[0].clone() + byte_offset - f256.clone() * c1.clone());
+        tuple.push(row.mem_addr[1].clone() + c1.clone() - f256.clone() * c2.clone());
+        tuple.push(row.mem_addr[2].clone() + c2.clone() - f256.clone() * c3.clone());
+        tuple.push(row.mem_addr[3].clone() + c3.clone());
         // value byte
-        tuple.push(mem_value[byte_idx].clone());
+        tuple.push(row.mem_value[byte_idx].clone());
         // timestamp
-        tuple.extend_from_slice(&timestamp);
+        tuple.extend_from_slice(&row.timestamp);
         // is_write
-        tuple.push(is_store(trace_eval));
+        tuple.push(is_store(row));
         // is_closing = 0 (CpuChip never emits closing reads)
         tuple.push(E::F::zero());
 
         eval.add_to_relation(RelationEntry::new(
             mem_lookup,
-            mem_byte_active[byte_idx].clone().into(),
+            row.mem_byte_active[byte_idx].clone().into(),
             &tuple,
         ));
     }
@@ -155,9 +133,9 @@ pub(in crate::chips::cpu) fn memory_access<E: EvalAtRow>(
     // carry bits; ledger-match pins them to the canonical decomposition.
     for byte_idx in 0..WORD_SIZE {
         for c in [
-            mem_byte_carry1[byte_idx].clone(),
-            mem_byte_carry2[byte_idx].clone(),
-            mem_byte_carry3[byte_idx].clone(),
+            row.mem_byte_addr_carry1[byte_idx].clone(),
+            row.mem_byte_addr_carry2[byte_idx].clone(),
+            row.mem_byte_addr_carry3[byte_idx].clone(),
         ] {
             eval.add_constraint(c.clone() * (E::F::one() - c));
         }
@@ -165,9 +143,7 @@ pub(in crate::chips::cpu) fn memory_access<E: EvalAtRow>(
 }
 
 /// `MemByteActive` pinned to a prefix of ones of length `MemSize`.
-pub(in crate::chips::cpu) fn active_bytes<E: EvalAtRow>(eval: &mut E, trace_eval: &Trace<E>) {
-    let mem_byte_active_mono_h = crate::trace::trace_eval!(trace_eval, Column::MemByteActiveMonoH);
-    let mem_byte_active = crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
+pub(in crate::chips::cpu) fn active_bytes<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     // ════════════════════════════════════════════════════════════════════
     // Pin MemByteActive to a prefix-1 pattern of length MemSize
     //
@@ -184,19 +160,18 @@ pub(in crate::chips::cpu) fn active_bytes<E: EvalAtRow>(eval: &mut E, trace_eval
     // hold on every row: a padding row's flags are zero, so its MemSize
     // and its active bytes are too.
     {
-        let mem_size = crate::trace::trace_eval!(trace_eval, Column::MemSize);
         // Per-byte MemByteActive is boolean on every row
         // (`control::control_flow_helpers`).
         // Monotonicity.
         for i in 0..WORD_SIZE - 1 {
-            eval.add_constraint(mem_byte_active_mono_h[i].clone());
+            eval.add_constraint(row.mem_byte_active_mono_h[i].clone());
         }
         // MemSize equals the count of active bytes.
         let mut active_sum = E::F::zero();
         for i in 0..WORD_SIZE {
-            active_sum += mem_byte_active[i].clone();
+            active_sum += row.mem_byte_active[i].clone();
         }
-        eval.add_constraint(mem_size[0].clone() - active_sum);
+        eval.add_constraint(row.mem_size[0].clone() - active_sum);
         // Pin MemSize to opcode-canonical width via per-size flags
         // pinned by ProgramMemoryChip.  A flag-based formulation keeps
         // the degree at 1 (a direct degree-6 valid-size polynomial
@@ -204,23 +179,16 @@ pub(in crate::chips::cpu) fn active_bytes<E: EvalAtRow>(eval: &mut E, trace_eval
         // canonical opcode decoding via the ProgramMemory tuple, and
         // exactly one is set on a memory-op row (load OR store), all
         // zero on non-memory rows.
-        let f_is_mem_size_1_l = crate::trace::trace_eval!(trace_eval, Column::IsMemSize1);
-        let f_is_mem_size_2_l = crate::trace::trace_eval!(trace_eval, Column::IsMemSize2);
-        let f_is_mem_size_4_l = crate::trace::trace_eval!(trace_eval, Column::IsMemSize4);
-        let f_is_mem_size_8_l = crate::trace::trace_eval!(trace_eval, Column::IsMemSize8);
-        let canonical_size = f_is_mem_size_1_l[0].clone()
-            + f_is_mem_size_2_l[0].clone() * E::F::from(BaseField::from(2u32))
-            + f_is_mem_size_4_l[0].clone() * E::F::from(BaseField::from(4u32))
-            + f_is_mem_size_8_l[0].clone() * E::F::from(BaseField::from(8u32));
-        eval.add_constraint(mem_size[0].clone() - canonical_size);
+        let canonical_size = row.is_mem_size1[0].clone()
+            + row.is_mem_size2[0].clone() * E::F::from(BaseField::from(2u32))
+            + row.is_mem_size4[0].clone() * E::F::from(BaseField::from(4u32))
+            + row.is_mem_size8[0].clone() * E::F::from(BaseField::from(8u32));
+        eval.add_constraint(row.mem_size[0].clone() - canonical_size);
     }
 }
 
 /// Loads: the result is the memory value on active bytes.
-pub(in crate::chips::cpu) fn load_result<E: EvalAtRow>(eval: &mut E, trace_eval: &Trace<E>) {
-    let result = crate::trace::trace_eval!(trace_eval, Column::Result);
-    let mem_value = crate::trace::trace_eval!(trace_eval, Column::MemValue);
-    let mem_byte_active = crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
+pub(in crate::chips::cpu) fn load_result<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     // ════════════════════════════════════════════════════════════════════
     // Bind Result to MemValue on Load steps
     //
@@ -236,21 +204,17 @@ pub(in crate::chips::cpu) fn load_result<E: EvalAtRow>(eval: &mut E, trace_eval:
     // signed loads must be 0xFF · sign_bit_of_top_active_byte.
     // See the signed-load inactive-byte sign-extension block below for
     // the pinning + per-byte equality constraint.
-    let is_load_local = crate::trace::trace_eval!(trace_eval, Column::IsLoad);
     for i in 0..WORD_SIZE {
         eval.add_constraint(
-            is_load_local[0].clone()
-                * mem_byte_active[i].clone()
-                * (result[i].clone() - mem_value[i].clone()),
+            row.is_load[0].clone()
+                * row.mem_byte_active[i].clone()
+                * (row.result[i].clone() - row.mem_value[i].clone()),
         );
     }
 }
 
 /// Direct stores: the memory value is `val_b`.
-pub(in crate::chips::cpu) fn direct_store_value<E: EvalAtRow>(eval: &mut E, trace_eval: &Trace<E>) {
-    let val_b = crate::trace::trace_eval!(trace_eval, Column::ValB);
-    let mem_value = crate::trace::trace_eval!(trace_eval, Column::MemValue);
-    let mem_byte_active = crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
+pub(in crate::chips::cpu) fn direct_store_value<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     // ════════════════════════════════════════════════════════════════════
     // Bind MemValue ↔ val_b on Direct stores
     //
@@ -268,24 +232,18 @@ pub(in crate::chips::cpu) fn direct_store_value<E: EvalAtRow>(eval: &mut E, trac
     // StoreInd, imm_y for StoreImm/StoreImmInd) that aren't in
     // val_b — those are bound separately below.
     {
-        let is_store_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                is_store_direct_local[0].clone()
-                    * mem_byte_active[i].clone()
-                    * (mem_value[i].clone() - val_b[i].clone()),
+                row.is_store_direct[0].clone()
+                    * row.mem_byte_active[i].clone()
+                    * (row.mem_value[i].clone() - row.val_b[i].clone()),
             );
         }
     }
 }
 
 /// Indirect register-source stores: the memory value is `RegValA`.
-pub(in crate::chips::cpu) fn indirect_store_value<E: EvalAtRow>(
-    eval: &mut E,
-    trace_eval: &Trace<E>,
-) {
-    let mem_value = crate::trace::trace_eval!(trace_eval, Column::MemValue);
-    let mem_byte_active = crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
+pub(in crate::chips::cpu) fn indirect_store_value<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     // ════════════════════════════════════════════════════════════════════
     // Bind MemValue ↔ RegValA on indirect register-source stores
     //
@@ -300,21 +258,18 @@ pub(in crate::chips::cpu) fn indirect_store_value<E: EvalAtRow>(
     //   IsStoreInd · mem_byte_active[i] · (mem_value[i] −
     //                                      reg_val_a[i]) = 0
     {
-        let is_store_ind_p28 = crate::trace::trace_eval!(trace_eval, Column::IsStoreInd);
-        let reg_val_a_p28 = crate::trace::trace_eval!(trace_eval, Column::RegValA);
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                is_store_ind_p28[0].clone()
-                    * mem_byte_active[i].clone()
-                    * (mem_value[i].clone() - reg_val_a_p28[i].clone()),
+                row.is_store_ind[0].clone()
+                    * row.mem_byte_active[i].clone()
+                    * (row.mem_value[i].clone() - row.reg_val_a[i].clone()),
             );
         }
     }
 }
 
 /// Direct loads and stores: the address is the immediate.
-pub(in crate::chips::cpu) fn direct_address<E: EvalAtRow>(eval: &mut E, trace_eval: &Trace<E>) {
-    let mem_addr = crate::trace::trace_eval!(trace_eval, Column::MemAddr);
+pub(in crate::chips::cpu) fn direct_address<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     // ════════════════════════════════════════════════════════════════════
     // Bind MemAddr ↔ ImmBytes[0..4] on direct loads/stores
     //
@@ -335,32 +290,22 @@ pub(in crate::chips::cpu) fn direct_address<E: EvalAtRow>(eval: &mut E, trace_ev
     // (`addr = regs[r] + imm`, covers LoadInd* / StoreInd* /
     // StoreImmInd*) is bound by a separate carry-chain (below).
     {
-        let is_load_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsLoadDirect);
-        let is_store_direct_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreDirect);
         // This also covers StoreImm direct (TwoImm with `addr = imm_x`).
         // step.imm = imm_x for TwoImm, so ImmBytes already pins the
         // address bytes.
-        let is_store_imm_direct_local =
-            crate::trace::trace_eval!(trace_eval, Column::IsStoreImmDirect);
-        let imm_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
-        let direct_mem_active = is_load_direct_local[0].clone()
-            + is_store_direct_local[0].clone()
-            + is_store_imm_direct_local[0].clone();
+        let direct_mem_active = row.is_load_direct[0].clone()
+            + row.is_store_direct[0].clone()
+            + row.is_store_imm_direct[0].clone();
         for i in 0..4 {
             eval.add_constraint(
-                direct_mem_active.clone() * (mem_addr[i].clone() - imm_bytes_local[i].clone()),
+                direct_mem_active.clone() * (row.mem_addr[i].clone() - row.imm_bytes[i].clone()),
             );
         }
     }
 }
 
 /// StoreImm and StoreImmInd: the memory value is `imm_y`.
-pub(in crate::chips::cpu) fn immediate_store_value<E: EvalAtRow>(
-    eval: &mut E,
-    trace_eval: &Trace<E>,
-) {
-    let mem_value = crate::trace::trace_eval!(trace_eval, Column::MemValue);
-    let mem_byte_active = crate::trace::trace_eval!(trace_eval, Column::MemByteActive);
+pub(in crate::chips::cpu) fn immediate_store_value<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     // ════════════════════════════════════════════════════════════════════
     // Bind MemValue ↔ ImmYBytes on StoreImm / StoreImmInd
     //
@@ -378,22 +323,18 @@ pub(in crate::chips::cpu) fn immediate_store_value<E: EvalAtRow>(
     // each its byte 4, `ImmYBytes[4]`, which the prog_mem tuple
     // carries too.
     {
-        let is_store_imm_any_local = crate::trace::trace_eval!(trace_eval, Column::IsStoreImmAny);
-        let imm_y_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmYBytes);
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                is_store_imm_any_local[0].clone()
-                    * mem_byte_active[i].clone()
-                    * (mem_value[i].clone() - imm_y_bytes_local[i.min(4)].clone()),
+                row.is_store_imm_any[0].clone()
+                    * row.mem_byte_active[i].clone()
+                    * (row.mem_value[i].clone() - row.imm_y_bytes[i.min(4)].clone()),
             );
         }
     }
 }
 
 /// Indirect loads and stores: the address is `val_b` plus the immediate, mod 2^32.
-pub(in crate::chips::cpu) fn indirect_address<E: EvalAtRow>(eval: &mut E, trace_eval: &Trace<E>) {
-    let val_b = crate::trace::trace_eval!(trace_eval, Column::ValB);
-    let mem_addr = crate::trace::trace_eval!(trace_eval, Column::MemAddr);
+pub(in crate::chips::cpu) fn indirect_address<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let f256 = E::F::from(BaseField::from(256));
     // ════════════════════════════════════════════════════════════════════
     // Bind MemAddr ↔ (val_b + ImmBytes) mod 2^32 on indirect ops
@@ -416,9 +357,6 @@ pub(in crate::chips::cpu) fn indirect_address<E: EvalAtRow>(eval: &mut E, trace_
     // Per-byte carry boolean (val_b[i] + ImmBytes[i] + carry_in
     // ≤ 511 with carry_in ≤ 1, so carry_out ≤ 1).
     {
-        let is_mem_indirect_local = crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
-        let mem_addr_carry = crate::trace::trace_eval!(trace_eval, Column::MemAddrCarry);
-        let imm_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
         // Per-byte mem_addr_carry is boolean on every row
         // (`row::shared_helpers`), even where the chain is dormant.
         // Add-with-carry chain (gated on is_mem_indirect).
@@ -426,13 +364,13 @@ pub(in crate::chips::cpu) fn indirect_address<E: EvalAtRow>(eval: &mut E, trace_
             let carry_in = if i == 0 {
                 E::F::zero()
             } else {
-                mem_addr_carry[i - 1].clone()
+                row.mem_addr_carry[i - 1].clone()
             };
             eval.add_constraint(
-                is_mem_indirect_local[0].clone()
-                    * (mem_addr[i].clone() + mem_addr_carry[i].clone() * f256.clone()
-                        - val_b[i].clone()
-                        - imm_bytes_local[i].clone()
+                row.is_mem_indirect[0].clone()
+                    * (row.mem_addr[i].clone() + row.mem_addr_carry[i].clone() * f256.clone()
+                        - row.val_b[i].clone()
+                        - row.imm_bytes[i].clone()
                         - carry_in),
             );
         }
@@ -440,13 +378,7 @@ pub(in crate::chips::cpu) fn indirect_address<E: EvalAtRow>(eval: &mut E, trace_
 }
 
 /// Signed loads: inactive bytes extend the sign.
-pub(in crate::chips::cpu) fn signed_load_extension<E: EvalAtRow>(
-    eval: &mut E,
-    trace_eval: &Trace<E>,
-) {
-    let is_load_local_not_active_h =
-        crate::trace::trace_eval!(trace_eval, Column::IsLoadLocalNotActiveH);
-    let result = crate::trace::trace_eval!(trace_eval, Column::Result);
+pub(in crate::chips::cpu) fn signed_load_extension<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     // ════════════════════════════════════════════════════════════════════
     // Signed-load inactive-byte sign-extension
     //
@@ -464,14 +396,8 @@ pub(in crate::chips::cpu) fn signed_load_extension<E: EvalAtRow>(
     // a load result.  The interpreter writes 0 (unsigned) / 0xFF
     // (signed-extended) per the JAVM spec.
     {
-        let f_is_load_i8 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI8);
-        let f_is_load_i16 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI16);
-        let f_is_load_i32 = crate::trace::trace_eval!(trace_eval, Column::IsLoadI32);
-        let load_sign_src = crate::trace::trace_eval!(trace_eval, Column::LoadSignSrc);
-        let load_sign_bit = crate::trace::trace_eval!(trace_eval, Column::LoadSignBit);
-
         // Boolean witnesses + at-most-one-active.
-        for f in [&f_is_load_i8, &f_is_load_i16, &f_is_load_i32] {
+        for f in [&row.is_load_i8, &row.is_load_i16, &row.is_load_i32] {
             eval.add_constraint(f[0].clone() * (E::F::one() - f[0].clone()));
         }
         // Mutex: sum ≤ 1.  Combined with each being boolean and
@@ -481,10 +407,10 @@ pub(in crate::chips::cpu) fn signed_load_extension<E: EvalAtRow>(
 
         // LoadSignSrc multiplex.
         eval.add_constraint(
-            load_sign_src[0].clone()
-                - f_is_load_i8[0].clone() * result[0].clone()
-                - f_is_load_i16[0].clone() * result[1].clone()
-                - f_is_load_i32[0].clone() * result[3].clone(),
+            row.load_sign_src[0].clone()
+                - row.is_load_i8[0].clone() * row.result[0].clone()
+                - row.is_load_i16[0].clone() * row.result[1].clone()
+                - row.is_load_i32[0].clone() * row.result[3].clone(),
         );
 
         // Inactive-byte binding for all loads: result[i] = 0xFF · LoadSignBit
@@ -494,8 +420,8 @@ pub(in crate::chips::cpu) fn signed_load_extension<E: EvalAtRow>(
         // 2-factor selector × linear body via helper.
         for i in 1..WORD_SIZE {
             eval.add_constraint(
-                is_load_local_not_active_h[i].clone()
-                    * (result[i].clone() - f_ff_p20.clone() * load_sign_bit[0].clone()),
+                row.is_load_local_not_active_h[i].clone()
+                    * (row.result[i].clone() - f_ff_p20.clone() * row.load_sign_bit[0].clone()),
             );
         }
     }

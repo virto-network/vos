@@ -18,7 +18,10 @@ pub(super) mod registers;
 pub(super) mod row;
 pub(super) mod signs;
 
-use crate::chips::cpu::columns::{Column, PreprocessedColumn};
+use core::ops::Add;
+
+use crate::chips::cpu::columns::Column;
+pub(super) use crate::chips::cpu::columns::Row;
 use crate::lookups::{
     BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements,
     Blake2bCallLookupElements, ByteToBitsLookupElements, CompareLookupElements,
@@ -27,10 +30,6 @@ use crate::lookups::{
     ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
     RegisterMemoryLookupElements, WitnessCallLookupElements,
 };
-use crate::trace::eval::TraceEval;
-
-/// A row of the CPU chip's trace.
-pub(super) type Trace<E> = TraceEval<PreprocessedColumn, Column, E>;
 
 /// The relations the CPU chip's rows enter.
 pub(super) struct Lookups<'a> {
@@ -54,8 +53,8 @@ pub(super) struct Lookups<'a> {
 }
 
 /// IsBranch: the sum of the ten branch flags.
-pub(super) fn is_branch<E: stwo_constraint_framework::EvalAtRow>(trace_eval: &Trace<E>) -> E::F {
-    let flag = |column| trace_eval.column_eval::<1>(column)[0].clone();
+pub(super) fn is_branch<F: Clone + Add<Output = F>>(row: &Row<F>) -> F {
+    let flag = |column| row.column(column)[0].clone();
     flag(Column::IsBrEq)
         + flag(Column::IsBrNe)
         + flag(Column::IsBrLtU)
@@ -69,14 +68,14 @@ pub(super) fn is_branch<E: stwo_constraint_framework::EvalAtRow>(trace_eval: &Tr
 }
 
 /// IsStore: the sum of the three store-class flags.
-pub(super) fn is_store<E: stwo_constraint_framework::EvalAtRow>(trace_eval: &Trace<E>) -> E::F {
-    let flag = |column| trace_eval.column_eval::<1>(column)[0].clone();
+pub(super) fn is_store<F: Clone + Add<Output = F>>(row: &Row<F>) -> F {
+    let flag = |column| row.column(column)[0].clone();
     flag(Column::IsStoreDirect) + flag(Column::IsStoreImmAny) + flag(Column::IsStoreInd)
 }
 
 /// IsCompare: the sum of the eight compare flags.
-pub(super) fn is_compare<E: stwo_constraint_framework::EvalAtRow>(trace_eval: &Trace<E>) -> E::F {
-    let flag = |column| trace_eval.column_eval::<1>(column)[0].clone();
+pub(super) fn is_compare<F: Clone + Add<Output = F>>(row: &Row<F>) -> F {
+    let flag = |column| row.column(column)[0].clone();
     flag(Column::IsSetLtU)
         + flag(Column::IsSetLtS)
         + flag(Column::IsCmovIz)

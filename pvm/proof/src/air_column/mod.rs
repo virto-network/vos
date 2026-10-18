@@ -49,4 +49,26 @@ mod tests {
                 .all(|id| id.starts_with("abc"))
         );
     }
+
+    #[test]
+    fn row_view_has_a_field_per_column() {
+        #[derive(Debug, Copy, Clone, AirColumn)]
+        #[row = "TestRow"]
+        enum Test {
+            #[size = 2]
+            ValRPartNZ,
+            #[size = 1]
+            #[mask_next_row]
+            Is32Bit,
+        }
+
+        let row = TestRow {
+            val_r_part_nz: [1, 2],
+            is32_bit: [3],
+            is32_bit_next: [4],
+        };
+        assert_eq!(row.column(Test::ValRPartNZ), &[1, 2]);
+        assert_eq!(row.column(Test::Is32Bit), &[3]);
+        assert_eq!(row.is32_bit_next, [4]);
+    }
 }

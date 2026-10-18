@@ -5,15 +5,11 @@ use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
-use super::{Lookups, Trace};
-use crate::chips::cpu::columns::Column;
+use super::{Lookups, Row};
 use crate::core::step::WORD_SIZE;
 
 /// Host-call continuation.
-pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(
-    eval: &mut E,
-    trace_eval: &Trace<E>,
-) {
+pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let f256 = E::F::from(BaseField::from(256u32));
     // ── Host-call continuation ──
     //
@@ -22,27 +18,18 @@ pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(
     // either remains at its cause PC and terminates the trace, or carries
     // an explicit acknowledgment and advances sequentially.
     {
-        let is_exit = crate::trace::trace_eval!(trace_eval, Column::IsExit);
-        let is_trap = crate::trace::trace_eval!(trace_eval, Column::IsTrap);
-        let is_jump_ind = crate::trace::trace_eval!(trace_eval, Column::IsJumpInd);
-        let is_load_imm_jump_ind = crate::trace::trace_eval!(trace_eval, Column::IsLoadImmJumpInd);
-        let acknowledged = crate::trace::trace_eval!(trace_eval, Column::HostCallAcknowledged);
-        let precompile_dispatch =
-            crate::trace::trace_eval!(trace_eval, Column::HostCallPrecompileDispatch);
-        let is_blake = crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
-        let is_witness = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
-        let pc = crate::trace::trace_eval!(trace_eval, Column::Pc);
-        let next_pc = crate::trace::trace_eval!(trace_eval, Column::NextPc);
-        let skip_len = crate::trace::trace_eval!(trace_eval, Column::SkipLen);
-        let pc_carry = crate::trace::trace_eval!(trace_eval, Column::PcCarry);
+        let soft_host = row.is_exit[0].clone()
+            - row.is_trap[0].clone()
+            - row.is_jump_ind[0].clone()
+            - row.is_load_imm_jump_ind[0].clone();
 
-        let soft_host = is_exit[0].clone()
-            - is_trap[0].clone()
-            - is_jump_ind[0].clone()
-            - is_load_imm_jump_ind[0].clone();
-
-        eval.add_constraint(acknowledged[0].clone() * (E::F::one() - acknowledged[0].clone()));
-        eval.add_constraint(acknowledged[0].clone() * (E::F::one() - soft_host.clone()));
+        eval.add_constraint(
+            row.host_call_acknowledged[0].clone()
+                * (E::F::one() - row.host_call_acknowledged[0].clone()),
+        );
+        eval.add_constraint(
+            row.host_call_acknowledged[0].clone() * (E::F::one() - soft_host.clone()),
+        );
 
         // ProgramMemory commits the exact cryptographic dispatch ID, which
         // is non-zero only for an ECALLI identifier the proof runtime
@@ -50,24 +37,29 @@ pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(
         // relation, and its weighted selector must equal that
         // authenticated ID, so only a supported call can be acknowledged.
         // A call that is not acknowledged selects no relation.
-        let precompile_selector_sum = is_blake[0].clone() + is_witness[0].clone();
-        eval.add_constraint(precompile_selector_sum - acknowledged[0].clone());
-        let selected_dispatch = is_blake[0].clone() * E::F::from(BaseField::from(100u32))
-            + is_witness[0].clone() * E::F::from(BaseField::from(101u32));
+        let precompile_selector_sum =
+            row.is_blake_ecall[0].clone() + row.is_witness_ecall[0].clone();
+        eval.add_constraint(precompile_selector_sum - row.host_call_acknowledged[0].clone());
+        let selected_dispatch = row.is_blake_ecall[0].clone() * E::F::from(BaseField::from(100u32))
+            + row.is_witness_ecall[0].clone() * E::F::from(BaseField::from(101u32));
         eval.add_constraint(
-            selected_dispatch - acknowledged[0].clone() * precompile_dispatch[0].clone(),
+            selected_dispatch
+                - row.host_call_acknowledged[0].clone()
+                    * row.host_call_precompile_dispatch[0].clone(),
         );
 
         let seq_pc = [
-            pc[0].clone() + E::F::one() + skip_len[0].clone() - pc_carry[0].clone() * f256.clone(),
-            pc[1].clone() + pc_carry[0].clone() - pc_carry[1].clone() * f256.clone(),
-            pc[2].clone() + pc_carry[1].clone() - pc_carry[2].clone() * f256.clone(),
-            pc[3].clone() + pc_carry[2].clone(),
+            row.pc[0].clone() + E::F::one() + row.skip_len[0].clone()
+                - row.pc_carry[0].clone() * f256.clone(),
+            row.pc[1].clone() + row.pc_carry[0].clone() - row.pc_carry[1].clone() * f256.clone(),
+            row.pc[2].clone() + row.pc_carry[1].clone() - row.pc_carry[2].clone() * f256.clone(),
+            row.pc[3].clone() + row.pc_carry[2].clone(),
         ];
         for i in 0..4 {
             eval.add_constraint(
-                soft_host.clone() * (next_pc[i].clone() - pc[i].clone())
-                    - acknowledged[0].clone() * (seq_pc[i].clone() - pc[i].clone()),
+                soft_host.clone() * (row.next_pc[i].clone() - row.pc[i].clone())
+                    - row.host_call_acknowledged[0].clone()
+                        * (seq_pc[i].clone() - row.pc[i].clone()),
             );
         }
 
@@ -82,9 +74,9 @@ pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(
         // PC, so a proof states only that the run stopped there; the
         // host's policy tells a pending call from the panic, and a
         // kernel's proof is read only to its halt.
-        let is_padding_next = crate::trace::trace_eval_next_row!(trace_eval, Column::IsPadding);
         eval.add_constraint(
-            (soft_host - acknowledged[0].clone()) * (E::F::one() - is_padding_next[0].clone()),
+            (soft_host - row.host_call_acknowledged[0].clone())
+                * (E::F::one() - row.is_padding_next[0].clone()),
         );
     }
 }
@@ -92,23 +84,13 @@ pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(
 /// The BLAKE2b call: its register reads, the Phi7Bool tie and the call binding.
 pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
     eval: &mut E,
-    trace_eval: &Trace<E>,
+    row: &Row<E::F>,
     lookups: &Lookups<'_>,
 ) {
     let blake2b_call_lookup = lookups.blake2b_call_lookup;
     let reg_lookup = lookups.reg_lookup;
-    let real_not_phi7_bool_h = crate::trace::trace_eval!(trace_eval, Column::RealNotPhi7BoolH);
-    let real_phi7_bool_h = crate::trace::trace_eval!(trace_eval, Column::RealPhi7BoolH);
-    let phi7_times_inv_h = crate::trace::trace_eval!(trace_eval, Column::Phi7TimesInvH);
-    let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
     // ── blake2b ECALL register-read producers + Phi7Bool tie ──
     {
-        let is_blake_ecall = crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
-        let phi7 = crate::trace::trace_eval!(trace_eval, Column::Phi7);
-        let phi10 = crate::trace::trace_eval!(trace_eval, Column::Phi10);
-        let phi11 = crate::trace::trace_eval!(trace_eval, Column::Phi11);
-        let phi12 = crate::trace::trace_eval!(trace_eval, Column::Phi12);
-
         // Slot → PVM register index for the ECALL register-read
         // producer.  The `Column::Phi*` names don't match their actual
         // sources, which are:
@@ -118,20 +100,20 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
         //   Phi12 ← φ[9]  (t_low)
         // See `trace_fill.rs` for the full mapping.
         const ECALL_REG_IDXS: [u32; 4] = [10, 7, 8, 9];
-        let phi_cols: [&[E::F]; 4] = [&phi7, &phi10, &phi11, &phi12];
+        let phi_cols: [&[E::F]; 4] = [&row.phi7, &row.phi10, &row.phi11, &row.phi12];
         for (slot, &reg_idx) in ECALL_REG_IDXS.iter().enumerate() {
             let mut tuple: Vec<E::F> = Vec::with_capacity(18);
             tuple.push(E::F::from(BaseField::from(reg_idx)));
             for c in phi_cols[slot] {
                 tuple.push(c.clone());
             }
-            for c in &timestamp {
+            for c in &row.timestamp {
                 tuple.push(c.clone());
             }
             tuple.push(E::F::from(BaseField::from(0u32))); // is_write = 0 (read)
             eval.add_to_relation(RelationEntry::new(
                 reg_lookup,
-                is_blake_ecall[0].clone().into(),
+                row.is_blake_ecall[0].clone().into(),
                 &tuple,
             ));
         }
@@ -140,41 +122,37 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
         // register is) tie, gated only by is_real.
         // Phi7Bool is boolean on every row (`registers::register_helpers`).
         // If Phi7Bool = 0, then Phi7's bytes are 0.
-        let phi7_sum = phi7
+        let phi7_sum = row
+            .phi7
             .iter()
             .fold(E::F::zero(), |sum, byte| sum + byte.clone());
-        eval.add_constraint(real_not_phi7_bool_h[0].clone() * phi7_sum);
+        eval.add_constraint(row.real_not_phi7_bool_h[0].clone() * phi7_sum);
         // If Phi7Bool = 1, then Phi7 · Phi7Inv = 1 — body lifted into
         // Phi7TimesInvH so the gate × body is deg 2.
         eval.add_constraint(
-            real_phi7_bool_h[0].clone() * (phi7_times_inv_h[0].clone() - E::F::one()),
+            row.real_phi7_bool_h[0].clone() * (row.phi7_times_inv_h[0].clone() - E::F::one()),
         );
     }
 
     // Blake2b call binding: mirror of the prover-side producer.
     {
-        let is_blake_ecall = crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
-        let phi10 = crate::trace::trace_eval!(trace_eval, Column::Phi10);
-        let phi11 = crate::trace::trace_eval!(trace_eval, Column::Phi11);
-        let phi12 = crate::trace::trace_eval!(trace_eval, Column::Phi12);
-        let phi7_bool = crate::trace::trace_eval!(trace_eval, Column::Phi7Bool);
         let mut tuple: Vec<E::F> = Vec::with_capacity(25);
         for i in 0..4 {
-            tuple.push(phi10[i].clone());
+            tuple.push(row.phi10[i].clone());
         }
         for i in 0..4 {
-            tuple.push(phi11[i].clone());
+            tuple.push(row.phi11[i].clone());
         }
         for i in 0..WORD_SIZE {
-            tuple.push(phi12[i].clone());
+            tuple.push(row.phi12[i].clone());
         }
-        tuple.push(phi7_bool[0].clone());
+        tuple.push(row.phi7_bool[0].clone());
         for i in 0..WORD_SIZE {
-            tuple.push(timestamp[i].clone());
+            tuple.push(row.timestamp[i].clone());
         }
         eval.add_to_relation(RelationEntry::new(
             blake2b_call_lookup,
-            is_blake_ecall[0].clone().into(),
+            row.is_blake_ecall[0].clone().into(),
             &tuple,
         ));
 
@@ -182,8 +160,8 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
         // φ7 or φ8 is past 2^32, and the call tuple carries their low
         // four bytes only.
         for i in 4..WORD_SIZE {
-            eval.add_constraint(is_blake_ecall[0].clone() * phi10[i].clone());
-            eval.add_constraint(is_blake_ecall[0].clone() * phi11[i].clone());
+            eval.add_constraint(row.is_blake_ecall[0].clone() * row.phi10[i].clone());
+            eval.add_constraint(row.is_blake_ecall[0].clone() * row.phi11[i].clone());
         }
 
         // Phi7Bool and IsBlakeEcall are boolean on every row
@@ -194,11 +172,10 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
 /// The witness-input call's register reads.
 pub(in crate::chips::cpu) fn witness_input_reads<E: EvalAtRow>(
     eval: &mut E,
-    trace_eval: &Trace<E>,
+    row: &Row<E::F>,
     lookups: &Lookups<'_>,
 ) {
     let reg_lookup = lookups.reg_lookup;
-    let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
     // ── Witness-input register reads ──
     // The call reads φ[7] and φ[8], its destination and capacity, from
     // the Phi10/Phi11 slots (= regs_before[7,8], filled every row); the
@@ -206,24 +183,21 @@ pub(in crate::chips::cpu) fn witness_input_reads<E: EvalAtRow>(
     // at the step ts. Two emissions keep finalize_logup_in_pairs
     // balanced.
     {
-        let is_witness = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
-        let phi10 = crate::trace::trace_eval!(trace_eval, Column::Phi10); // φ[7]
-        let phi11 = crate::trace::trace_eval!(trace_eval, Column::Phi11); // φ[8]
-
-        // Register-read producers (reg_idx, value[8], ts[8], is_write=0).
-        for (reg_idx, value) in [(7u32, &phi10), (8u32, &phi11)] {
+        // Register-read producers (reg_idx, value[8], ts[8], is_write=0):
+        // φ[7] in Phi10, φ[8] in Phi11.
+        for (reg_idx, value) in [(7u32, &row.phi10), (8u32, &row.phi11)] {
             let mut tuple: Vec<E::F> = Vec::with_capacity(18);
             tuple.push(E::F::from(BaseField::from(reg_idx)));
             for c in value.iter() {
                 tuple.push(c.clone());
             }
-            for c in &timestamp {
+            for c in &row.timestamp {
                 tuple.push(c.clone());
             }
             tuple.push(E::F::from(BaseField::from(0u32))); // is_write = 0 (read)
             eval.add_to_relation(RelationEntry::new(
                 reg_lookup,
-                is_witness[0].clone().into(),
+                row.is_witness_ecall[0].clone().into(),
                 &tuple,
             ));
         }
@@ -233,13 +207,11 @@ pub(in crate::chips::cpu) fn witness_input_reads<E: EvalAtRow>(
 /// The witness-input call's binding.
 pub(in crate::chips::cpu) fn witness_input<E: EvalAtRow>(
     eval: &mut E,
-    trace_eval: &Trace<E>,
+    row: &Row<E::F>,
     lookups: &Lookups<'_>,
 ) {
     let compare_lookup = lookups.compare_lookup;
     let witness_call_lookup = lookups.witness_call_lookup;
-    let result = crate::trace::trace_eval!(trace_eval, Column::Result);
-    let timestamp = crate::trace::trace_eval!(trace_eval, Column::Timestamp);
     // ── Witness input ──
     // An acknowledged witness-input row reads φ7, the destination, and
     // φ8, the capacity (the register reads above); writes its count to
@@ -252,62 +224,69 @@ pub(in crate::chips::cpu) fn witness_input<E: EvalAtRow>(
     // [destination, destination + count) at ts, and nothing else.
     // Four emissions, two paired blocks, kept last (CONSTRAINTS.md 2).
     {
-        let is_witness = crate::trace::trace_eval!(trace_eval, Column::IsWitnessEcall);
-        let non_empty = crate::trace::trace_eval!(trace_eval, Column::WitnessNonEmpty);
-        let count_inv = crate::trace::trace_eval!(trace_eval, Column::WitnessCountInv);
-        let count_times_inv = crate::trace::trace_eval!(trace_eval, Column::WitnessCountTimesInvH);
-        let result_is_reg = crate::trace::trace_eval!(trace_eval, Column::ResultIsReg);
-        let result_reg_idx = crate::trace::trace_eval!(trace_eval, Column::ResultRegIdx);
-        let destination = crate::trace::trace_eval!(trace_eval, Column::Phi10);
-        let capacity = crate::trace::trace_eval!(trace_eval, Column::Phi11);
         let f256 = E::F::from(BaseField::from(256u32));
-        let count = result[0].clone()
-            + result[1].clone() * f256.clone()
-            + result[2].clone() * f256.clone() * f256;
+        let count = row.result[0].clone()
+            + row.result[1].clone() * f256.clone()
+            + row.result[2].clone() * f256.clone() * f256;
 
         // The count is φ7's write, and below 2^24, so it is its own
         // field value.
-        eval.add_constraint(is_witness[0].clone() * (E::F::one() - result_is_reg[0].clone()));
         eval.add_constraint(
-            is_witness[0].clone() * (result_reg_idx[0].clone() - E::F::from(BaseField::from(7u32))),
+            row.is_witness_ecall[0].clone() * (E::F::one() - row.result_is_reg[0].clone()),
         );
-        for byte in &result[3..WORD_SIZE] {
-            eval.add_constraint(is_witness[0].clone() * byte.clone());
+        eval.add_constraint(
+            row.is_witness_ecall[0].clone()
+                * (row.result_reg_idx[0].clone() - E::F::from(BaseField::from(7u32))),
+        );
+        for byte in &row.result[3..WORD_SIZE] {
+            eval.add_constraint(row.is_witness_ecall[0].clone() * byte.clone());
         }
         // A call that writes bytes writes them below 2^32; one that
         // writes none may name any destination, as the live call does.
-        for byte in &destination[4..WORD_SIZE] {
-            eval.add_constraint(non_empty[0].clone() * byte.clone());
+        for byte in &row.phi10[4..WORD_SIZE] {
+            eval.add_constraint(row.witness_non_empty[0].clone() * byte.clone());
         }
         // WitnessNonEmpty: a witness row's count is non-zero exactly
         // when it is set.
-        eval.add_constraint(non_empty[0].clone() * (E::F::one() - non_empty[0].clone()));
-        eval.add_constraint(non_empty[0].clone() * (E::F::one() - is_witness[0].clone()));
-        eval.add_constraint((is_witness[0].clone() - non_empty[0].clone()) * count.clone());
-        eval.add_constraint(count_times_inv[0].clone() - count.clone() * count_inv[0].clone());
-        eval.add_constraint(non_empty[0].clone() * (count_times_inv[0].clone() - E::F::one()));
+        eval.add_constraint(
+            row.witness_non_empty[0].clone() * (E::F::one() - row.witness_non_empty[0].clone()),
+        );
+        eval.add_constraint(
+            row.witness_non_empty[0].clone() * (E::F::one() - row.is_witness_ecall[0].clone()),
+        );
+        eval.add_constraint(
+            (row.is_witness_ecall[0].clone() - row.witness_non_empty[0].clone()) * count.clone(),
+        );
+        eval.add_constraint(
+            row.witness_count_times_inv_h[0].clone()
+                - count.clone() * row.witness_count_inv[0].clone(),
+        );
+        eval.add_constraint(
+            row.witness_non_empty[0].clone()
+                * (row.witness_count_times_inv_h[0].clone() - E::F::one()),
+        );
 
         // count ≤ capacity: CompareChip proves capacity < count false.
         let mut compare: Vec<E::F> = Vec::with_capacity(17);
-        compare.extend_from_slice(&capacity);
-        compare.extend_from_slice(&result);
+        compare.extend_from_slice(&row.phi11);
+        compare.extend_from_slice(&row.result);
         compare.push(E::F::zero());
         for _ in 0..2 {
             eval.add_to_relation(RelationEntry::new(
                 compare_lookup,
-                is_witness[0].clone().into(),
+                row.is_witness_ecall[0].clone().into(),
                 &compare,
             ));
         }
         // The call WitnessInputChip writes: (ts, destination, count).
         let mut call: Vec<E::F> = Vec::with_capacity(13);
-        call.extend_from_slice(&timestamp);
-        call.extend_from_slice(&destination[..4]);
+        call.extend_from_slice(&row.timestamp);
+        call.extend_from_slice(&row.phi10[..4]);
         call.push(count);
         for _ in 0..2 {
             eval.add_to_relation(RelationEntry::new(
                 witness_call_lookup,
-                non_empty[0].clone().into(),
+                row.witness_non_empty[0].clone().into(),
                 &call,
             ));
         }

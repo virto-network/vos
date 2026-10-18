@@ -3,7 +3,7 @@ use proc_macro::TokenStream;
 mod derive_impl;
 mod utils;
 
-#[proc_macro_derive(AirColumn, attributes(size, mask_next_row))]
+#[proc_macro_derive(AirColumn, attributes(size, mask_next_row, row))]
 pub fn derive_air_column(input: TokenStream) -> TokenStream {
     derive_impl::generate_impl(input.into(), false)
         .map(Into::into)

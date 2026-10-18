@@ -3,94 +3,65 @@ use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::EvalAtRow;
 
-use super::Trace;
-use crate::chips::cpu::columns::Column;
+use super::Row;
 use crate::core::step::WORD_SIZE;
 
 /// The ValDIsZero and division-by-zero helpers.
-pub(in crate::chips::cpu) fn zero_divisor_helpers<E: EvalAtRow>(
-    eval: &mut E,
-    trace_eval: &Trace<E>,
-) {
-    let is_32bit = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
-    let val_d = crate::trace::trace_eval!(trace_eval, Column::ValD);
-    let gate_div_h = crate::trace::trace_eval!(trace_eval, Column::GateDivH);
-    let gate_rem_h = crate::trace::trace_eval!(trace_eval, Column::GateRemH);
-    let val_d_is_zero_for_h = crate::trace::trace_eval!(trace_eval, Column::ValDIsZero);
-    let div_by_zero_for_h = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
-    let is_div_rem_for_h = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
+pub(in crate::chips::cpu) fn zero_divisor_helpers<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     // ── ValDIsZero / DBZ binding helpers ──
-    let val_d_byte_indicator_h = crate::trace::trace_eval!(trace_eval, Column::ValDByteIndicatorH);
-    let val_d_byte_ind_minus_1_h =
-        crate::trace::trace_eval!(trace_eval, Column::ValDByteIndMinus1H);
-    let part_nz_times_ind_h = crate::trace::trace_eval!(trace_eval, Column::PartNZTimesIndH);
-    let is_div_rem_times_vdz_h = crate::trace::trace_eval!(trace_eval, Column::IsDivRemTimesVdzH);
-    let dbz_active_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveH);
-    let dbz_active_quot_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveQuotH);
-    let dbz_active_rem_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveRemH);
     // ValDByteInv columns aren't read here directly — they're pulled
     // in within the inverse-pinning block below.  But we do define
     // helpers in terms of them at this top region for visibility:
     {
-        let val_d_byte_inv_top = crate::trace::trace_eval!(trace_eval, Column::ValDByteInv);
-        let val_d_partial_nz_top = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZ);
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                val_d_byte_indicator_h[i].clone()
-                    - val_d[i].clone() * val_d_byte_inv_top[i].clone(),
+                row.val_d_byte_indicator_h[i].clone()
+                    - row.val_d[i].clone() * row.val_d_byte_inv[i].clone(),
             );
             // ValDByteIndMinus1H[i] = ValD[i] · (ByteIndicator - 1)
             //                       = ValD · ByteIndicator − ValD
             eval.add_constraint(
-                val_d_byte_ind_minus_1_h[i].clone()
-                    - val_d[i].clone() * val_d_byte_indicator_h[i].clone()
-                    + val_d[i].clone(),
+                row.val_d_byte_ind_minus1_h[i].clone()
+                    - row.val_d[i].clone() * row.val_d_byte_indicator_h[i].clone()
+                    + row.val_d[i].clone(),
             );
         }
         // PartNZTimesIndH[i - 1] = PartialNZ[i-1] · ByteIndicator[i] for i ≥ 1.
         for i in 1..WORD_SIZE {
             eval.add_constraint(
-                part_nz_times_ind_h[i - 1].clone()
-                    - val_d_partial_nz_top[i - 1].clone() * val_d_byte_indicator_h[i].clone(),
+                row.part_nz_times_ind_h[i - 1].clone()
+                    - row.val_d_partial_nz[i - 1].clone() * row.val_d_byte_indicator_h[i].clone(),
             );
         }
     }
     eval.add_constraint(
-        is_div_rem_times_vdz_h[0].clone()
-            - is_div_rem_for_h[0].clone() * val_d_is_zero_for_h[0].clone(),
+        row.is_div_rem_times_vdz_h[0].clone()
+            - row.is_div_rem[0].clone() * row.val_d_is_zero[0].clone(),
     );
     eval.add_constraint(
-        dbz_active_h[0].clone() - is_div_rem_for_h[0].clone() * div_by_zero_for_h[0].clone(),
+        row.dbz_active_h[0].clone() - row.is_div_rem[0].clone() * row.div_by_zero[0].clone(),
     );
     eval.add_constraint(
-        dbz_active_quot_h[0].clone() - dbz_active_h[0].clone() * gate_div_h[0].clone(),
+        row.dbz_active_quot_h[0].clone() - row.dbz_active_h[0].clone() * row.gate_div_h[0].clone(),
     );
     eval.add_constraint(
-        dbz_active_rem_h[0].clone() - dbz_active_h[0].clone() * gate_rem_h[0].clone(),
+        row.dbz_active_rem_h[0].clone() - row.dbz_active_h[0].clone() * row.gate_rem_h[0].clone(),
     );
-    let dbz_active_rem_64_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveRem64H);
     eval.add_constraint(
-        dbz_active_rem_64_h[0].clone()
-            - dbz_active_rem_h[0].clone() * (E::F::one() - is_32bit[0].clone()),
+        row.dbz_active_rem64_h[0].clone()
+            - row.dbz_active_rem_h[0].clone() * (E::F::one() - row.is32_bit[0].clone()),
     );
 }
 
 /// DivRem: the result is the quotient or the remainder, sign-extended on 32-bit rows.
-pub(in crate::chips::cpu) fn divrem<E: EvalAtRow>(eval: &mut E, trace_eval: &Trace<E>) {
-    let result = crate::trace::trace_eval!(trace_eval, Column::Result);
-    let sign_bit_result_p19 = crate::trace::trace_eval!(trace_eval, Column::SignBitResult);
+pub(in crate::chips::cpu) fn divrem<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let f_ff_p19: E::F = E::F::from(BaseField::from(255));
-    let div_active_quot_h = crate::trace::trace_eval!(trace_eval, Column::DivActiveQuotH);
-    let div_active_rem_h = crate::trace::trace_eval!(trace_eval, Column::DivActiveRemH);
-    let is_div_rem_32_h = crate::trace::trace_eval!(trace_eval, Column::IsDivRem32bitH);
     // ════════════════════════════════════════════════════════════════════
     // DIVREM: quotient * divisor + remainder = dividend
     // dividend = val_b, divisor = val_d
     // For div (op 0,1): result = quotient. For rem (op 2,3): result = remainder.
     // When divisor == 0 (div_by_zero=1): constraint bypassed (special result).
     // ════════════════════════════════════════════════════════════════════
-    let div_quotient = crate::trace::trace_eval!(trace_eval, Column::DivQuotient);
-    let div_remainder = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
     // The divrem chains live in DivRemChip: the schoolbook q·d+r=b
     // chain, the r<d uniqueness chain, and the DivS sign-correction
     // chain.  CpuChip flows val_b/val_d/q/r + 4 sign bits + flags via
@@ -103,22 +74,24 @@ pub(in crate::chips::cpu) fn divrem<E: EvalAtRow>(eval: &mut E, trace_eval: &Tra
     // For div ops (op ∈ {0, 1}): result = quotient.
     for i in 0..WORD_SIZE {
         eval.add_constraint(
-            div_active_quot_h[0].clone() * (result[i].clone() - div_quotient[i].clone()),
+            row.div_active_quot_h[0].clone()
+                * (row.result[i].clone() - row.div_quotient[i].clone()),
         );
     }
 
     // For rem ops (op ∈ {2, 3}): result = remainder.
     for i in 0..WORD_SIZE {
         eval.add_constraint(
-            div_active_rem_h[0].clone() * (result[i].clone() - div_remainder[i].clone()),
+            row.div_active_rem_h[0].clone()
+                * (row.result[i].clone() - row.div_remainder[i].clone()),
         );
     }
 
     // 32-bit: upper result limbs match the sign-extension pattern.
     for i in 4..WORD_SIZE {
         eval.add_constraint(
-            is_div_rem_32_h[0].clone()
-                * (result[i].clone() - f_ff_p19.clone() * sign_bit_result_p19[0].clone()),
+            row.is_div_rem32bit_h[0].clone()
+                * (row.result[i].clone() - f_ff_p19.clone() * row.sign_bit_result[0].clone()),
         );
     }
 
@@ -131,20 +104,8 @@ pub(in crate::chips::cpu) fn divrem<E: EvalAtRow>(eval: &mut E, trace_eval: &Tra
 }
 
 /// The byte-wise zero check of `val_d` and the division-by-zero result.
-pub(in crate::chips::cpu) fn zero_divisor<E: EvalAtRow>(eval: &mut E, trace_eval: &Trace<E>) {
-    let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
-    let is_real = E::F::one() - is_pad[0].clone();
-    let val_b = crate::trace::trace_eval!(trace_eval, Column::ValB);
-    let result = crate::trace::trace_eval!(trace_eval, Column::Result);
-    let div_by_zero_for_h = crate::trace::trace_eval!(trace_eval, Column::DivByZero);
-    let val_d_byte_indicator_h = crate::trace::trace_eval!(trace_eval, Column::ValDByteIndicatorH);
-    let val_d_byte_ind_minus_1_h =
-        crate::trace::trace_eval!(trace_eval, Column::ValDByteIndMinus1H);
-    let part_nz_times_ind_h = crate::trace::trace_eval!(trace_eval, Column::PartNZTimesIndH);
-    let is_div_rem_times_vdz_h = crate::trace::trace_eval!(trace_eval, Column::IsDivRemTimesVdzH);
-    let dbz_active_quot_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveQuotH);
-    let dbz_active_rem_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveRemH);
-    let dbz_active_rem_64_h = crate::trace::trace_eval!(trace_eval, Column::DbzActiveRem64H);
+pub(in crate::chips::cpu) fn zero_divisor<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
+    let is_real = E::F::one() - row.is_padding[0].clone();
     // ════════════════════════════════════════════════════════════════════
     // Byte-wise val_d zero-check + DivByZero result binding
     //
@@ -173,20 +134,18 @@ pub(in crate::chips::cpu) fn zero_divisor<E: EvalAtRow>(eval: &mut E, trace_eval
     //   ValDIsZero = 1 − PartialNZ[7].
     // ValDIsZero recurrence + DBZ binding.
     {
-        let val_d_partial_nz = crate::trace::trace_eval!(trace_eval, Column::ValDPartialNZ);
-        let val_d_is_zero_p29 = crate::trace::trace_eval!(trace_eval, Column::ValDIsZero);
-
         // Per-byte indicator: `val_d · (val_d · inv − 1) = 0`.  Lifted
         // via `ValDByteIndMinus1H[i] = val_d[i] · (ByteIndicator − 1)`
         // (helper-defined above); main constraint is is_real · helper = deg 2.
         for i in 0..WORD_SIZE {
-            eval.add_constraint(is_real.clone() * val_d_byte_ind_minus_1_h[i].clone());
+            eval.add_constraint(is_real.clone() * row.val_d_byte_ind_minus1_h[i].clone());
         }
 
         // PartialNZ recurrence — flattened via PartNZTimesIndH.
         // PartialNZ[0] = ByteIndicator[0].
         eval.add_constraint(
-            is_real.clone() * (val_d_partial_nz[0].clone() - val_d_byte_indicator_h[0].clone()),
+            is_real.clone()
+                * (row.val_d_partial_nz[0].clone() - row.val_d_byte_indicator_h[0].clone()),
         );
         for i in 1..WORD_SIZE {
             // OR(PartialNZ[i-1], Ind[i]) = PartialNZ[i-1] + Ind[i] -
@@ -194,51 +153,44 @@ pub(in crate::chips::cpu) fn zero_divisor<E: EvalAtRow>(eval: &mut E, trace_eval
             // The product term is PartNZTimesIndH[i - 1] (deg 1 helper).
             eval.add_constraint(
                 is_real.clone()
-                    * (val_d_partial_nz[i].clone()
-                        - val_d_partial_nz[i - 1].clone()
-                        - val_d_byte_indicator_h[i].clone()
-                        + part_nz_times_ind_h[i - 1].clone()),
+                    * (row.val_d_partial_nz[i].clone()
+                        - row.val_d_partial_nz[i - 1].clone()
+                        - row.val_d_byte_indicator_h[i].clone()
+                        + row.part_nz_times_ind_h[i - 1].clone()),
             );
         }
 
         // ValDIsZero = 1 − PartialNZ[7].  (deg 2, unchanged)
         eval.add_constraint(
             is_real.clone()
-                * (val_d_is_zero_p29[0].clone() + val_d_partial_nz[WORD_SIZE - 1].clone()
+                * (row.val_d_is_zero[0].clone() + row.val_d_partial_nz[WORD_SIZE - 1].clone()
                     - E::F::one()),
         );
 
         // DivByZero = is_div_rem · ValDIsZero — flattened via IsDivRemTimesVdzH.
         eval.add_constraint(
-            is_real.clone() * (div_by_zero_for_h[0].clone() - is_div_rem_times_vdz_h[0].clone()),
+            is_real.clone() * (row.div_by_zero[0].clone() - row.is_div_rem_times_vdz_h[0].clone()),
         );
 
         // DivByZero result binding — flattened via DbzActiveQuotH/RemH.
         let f_ff_p29: E::F = E::F::from(BaseField::from(255));
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                dbz_active_quot_h[0].clone() * (result[i].clone() - f_ff_p29.clone()),
+                row.dbz_active_quot_h[0].clone() * (row.result[i].clone() - f_ff_p29.clone()),
             );
             let gate = if i < 4 {
-                &dbz_active_rem_h
+                &row.dbz_active_rem_h
             } else {
-                &dbz_active_rem_64_h
+                &row.dbz_active_rem64_h
             };
-            eval.add_constraint(gate[0].clone() * (result[i].clone() - val_b[i].clone()));
+            eval.add_constraint(gate[0].clone() * (row.result[i].clone() - row.val_b[i].clone()));
         }
     }
 }
 
 /// DivS: the remainder takes the dividend's sign when non-zero.
-pub(in crate::chips::cpu) fn remainder_sign<E: EvalAtRow>(eval: &mut E, trace_eval: &Trace<E>) {
-    let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
-    let is_real = E::F::one() - is_pad[0].clone();
-    let val_r_byte_indicator_h = crate::trace::trace_eval!(trace_eval, Column::ValRByteIndicatorH);
-    let val_r_byte_ind_minus_1_h =
-        crate::trace::trace_eval!(trace_eval, Column::ValRByteIndMinus1H);
-    let val_r_part_nz_times_ind_h =
-        crate::trace::trace_eval!(trace_eval, Column::ValRPartNZTimesIndH);
-    let div_s_active_partial_h = crate::trace::trace_eval!(trace_eval, Column::DivSActivePartialH);
+pub(in crate::chips::cpu) fn remainder_sign<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
+    let is_real = E::F::one() - row.is_padding[0].clone();
     // ════════════════════════════════════════════════════════════════════
     // The full DivS |r|<|d| chain lives in DivRemChip.
     // AbsD/AbsDCarry/AbsR/AbsRCarry + AbsCmpDiff/AbsCmpCarry are
@@ -262,31 +214,28 @@ pub(in crate::chips::cpu) fn remainder_sign<E: EvalAtRow>(eval: &mut E, trace_ev
     // uniqueness is complete: there's exactly one (q, r) pair
     // satisfying both bounds + the schoolbook + the sign-correction.
     {
-        let val_r_partial_nz = crate::trace::trace_eval!(trace_eval, Column::ValRPartialNZ);
-        let sign_bit_b_p31 = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
-        let sign_bit_r_p31 = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
-
         // Per-byte indicator pinning.
         for i in 0..WORD_SIZE {
-            eval.add_constraint(is_real.clone() * val_r_byte_ind_minus_1_h[i].clone());
+            eval.add_constraint(is_real.clone() * row.val_r_byte_ind_minus1_h[i].clone());
         }
         // PartialNZ recurrence.
         eval.add_constraint(
-            is_real.clone() * (val_r_partial_nz[0].clone() - val_r_byte_indicator_h[0].clone()),
+            is_real.clone()
+                * (row.val_r_partial_nz[0].clone() - row.val_r_byte_indicator_h[0].clone()),
         );
         for i in 1..WORD_SIZE {
             eval.add_constraint(
                 is_real.clone()
-                    * (val_r_partial_nz[i].clone()
-                        - val_r_partial_nz[i - 1].clone()
-                        - val_r_byte_indicator_h[i].clone()
-                        + val_r_part_nz_times_ind_h[i - 1].clone()),
+                    * (row.val_r_partial_nz[i].clone()
+                        - row.val_r_partial_nz[i - 1].clone()
+                        - row.val_r_byte_indicator_h[i].clone()
+                        + row.val_r_part_nz_times_ind_h[i - 1].clone()),
             );
         }
         // Sign-of-r constraint.
         eval.add_constraint(
-            div_s_active_partial_h[0].clone()
-                * (sign_bit_r_p31[0].clone() - sign_bit_b_p31[0].clone()),
+            row.div_s_active_partial_h[0].clone()
+                * (row.sign_bit_r[0].clone() - row.sign_bit_b[0].clone()),
         );
     }
 }

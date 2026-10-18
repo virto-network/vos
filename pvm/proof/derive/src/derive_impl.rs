@@ -33,6 +33,16 @@ pub fn generate_impl(input: TokenStream, preprocessed: bool) -> syn::Result<Toke
     } else {
         TokenStream::new()
     };
+    let row_impl = match string_attr(&input, "row")? {
+        Some(row) if !preprocessed => row_impl(&variants, &crate_ident, enum_ident, &row),
+        Some(_) => {
+            return Err(syn::Error::new(
+                Span::call_site(),
+                "a row view is only derived for main-trace columns",
+            ));
+        }
+        None => TokenStream::new(),
+    };
 
     let size_fn_ident = format_ident!("{SIZE_FN_IDENT}");
     let offset_fn_ident = format_ident!("{OFFSET_FN_IDENT}");
@@ -62,6 +72,8 @@ pub fn generate_impl(input: TokenStream, preprocessed: bool) -> syn::Result<Toke
         #column_impl
 
         #preprocessed_impl
+
+        #row_impl
     })
 }
 
@@ -112,32 +124,7 @@ fn preprocessed_impl(
     crate_ident: &TokenStream,
     enum_ident: &syn::Ident,
 ) -> Result<TokenStream, syn::Error> {
-    let mut prefix = None;
-    for attr in &input.attrs {
-        if attr
-            .path
-            .get_ident()
-            .is_none_or(|ident| *ident != "preprocessed_prefix")
-        {
-            continue;
-        }
-        let syn::Meta::NameValue(meta) = attr.parse_meta()? else {
-            return Err(syn::Error::new_spanned(attr, "string literal is expected"));
-        };
-        if let syn::Lit::Str(s) = meta.lit {
-            if prefix.is_none() {
-                prefix = Some(s.value())
-            } else {
-                return Err(syn::Error::new_spanned(
-                    attr,
-                    "repeating `preprocessed_prefix` attribute",
-                ));
-            }
-        } else {
-            return Err(syn::Error::new_spanned(attr, "string literal is expected"));
-        }
-    }
-
+    let prefix = string_attr(input, "preprocessed_prefix")?;
     let prefix = prefix.ok_or_else(|| {
         syn::Error::new(
             Span::call_site(),
@@ -161,6 +148,110 @@ fn preprocessed_impl(
             const PREPROCESSED_IDS: &'static [&'static str] = &[#(#ids,)*];
         }
     })
+}
+
+/// The value of the enum-level attribute `#[name = "..."]`, if present.
+fn string_attr(input: &syn::ItemEnum, name: &str) -> syn::Result<Option<String>> {
+    let mut value = None;
+    for attr in &input.attrs {
+        if attr.path.get_ident().is_none_or(|ident| *ident != name) {
+            continue;
+        }
+        let syn::Meta::NameValue(meta) = attr.parse_meta()? else {
+            return Err(syn::Error::new_spanned(attr, "string literal is expected"));
+        };
+        let syn::Lit::Str(s) = meta.lit else {
+            return Err(syn::Error::new_spanned(attr, "string literal is expected"));
+        };
+        if value.replace(s.value()).is_some() {
+            return Err(syn::Error::new_spanned(
+                attr,
+                format!("repeating `{name}` attribute"),
+            ));
+        }
+    }
+    Ok(value)
+}
+
+/// A variant's field in the row view: its name in snake case, a word
+/// boundary before an upper-case letter that follows a lower-case letter or
+/// a digit, or that starts a word after an acronym (`ValRPartNZTimesIndH`
+/// is `val_r_part_nz_times_ind_h`, `Is32Bit` is `is32_bit`, `IsRotateR64`
+/// is `is_rotate_r64`).
+fn field_name(ident: &syn::Ident) -> String {
+    let chars: Vec<char> = ident.to_string().chars().collect();
+    let mut name = String::new();
+    for (i, &c) in chars.iter().enumerate() {
+        let boundary = i > 0 && c.is_ascii_uppercase() && {
+            let prev = chars[i - 1];
+            let next = chars.get(i + 1);
+            prev.is_ascii_lowercase()
+                || prev.is_ascii_digit()
+                || (prev.is_ascii_uppercase() && next.is_some_and(|n| n.is_ascii_lowercase()))
+        };
+        if boundary {
+            name.push('_');
+        }
+        name.push(c.to_ascii_lowercase());
+    }
+    name
+}
+
+/// The row view `#[row = "Name"]` asks for: a struct `Name<F>` with every
+/// column's values at the row, a field per variant (its `_next` twin for a
+/// `mask_next_row` variant's next row), read once from a `TraceEval`.
+fn row_impl(
+    parsed_variants: &[ParsedVariant],
+    crate_ident: &TokenStream,
+    enum_ident: &syn::Ident,
+    row: &str,
+) -> TokenStream {
+    let row_ident = format_ident!("{row}");
+    let mut fields = Vec::new();
+    let mut reads = Vec::new();
+    let mut arms = Vec::new();
+    for v in parsed_variants {
+        let ident = &v.ident;
+        let field = format_ident!("{}", field_name(ident));
+        let size = v.size;
+        let doc = format!("`{enum_ident}::{ident}`.");
+        fields.push(quote! { #[doc = #doc] pub #field: [F; #size] });
+        reads.push(quote! { #field: trace_eval.column_eval(#enum_ident::#ident) });
+        arms.push(quote! { #enum_ident::#ident => &self.#field });
+        if v.mask_next_row {
+            let next = format_ident!("{}_next", field_name(ident));
+            let doc = format!("`{enum_ident}::{ident}` on the next row.");
+            fields.push(quote! { #[doc = #doc] pub #next: [F; #size] });
+            reads.push(quote! { #next: trace_eval.column_eval_next_row(#enum_ident::#ident) });
+        }
+    }
+    let doc = format!("The values of every `{enum_ident}` at a row, read once.");
+    quote! {
+        #[doc = #doc]
+        pub struct #row_ident<F> {
+            #(#fields,)*
+        }
+
+        impl<F: Clone> #row_ident<F> {
+            /// The row `trace_eval` evaluates.
+            pub fn new<P, E>(trace_eval: &#crate_ident::trace::eval::TraceEval<P, #enum_ident, E>) -> Self
+            where
+                P: #crate_ident::air_column::PreprocessedAirColumn,
+                E: ::stwo_constraint_framework::EvalAtRow<F = F>,
+            {
+                Self {
+                    #(#reads,)*
+                }
+            }
+
+            /// The values of `column`.
+            pub fn column(&self, column: #enum_ident) -> &[F] {
+                match column {
+                    #(#arms,)*
+                }
+            }
+        }
+    }
 }
 
 fn mask_next_row_impl(parsed_variants: &[ParsedVariant]) -> TokenStream {

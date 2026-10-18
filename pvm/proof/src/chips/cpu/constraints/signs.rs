@@ -3,16 +3,11 @@ use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
-use super::{Lookups, Trace};
-use crate::chips::cpu::columns::Column;
+use super::{Lookups, Row};
 
 /// The sign bits' source bytes.
-pub(in crate::chips::cpu) fn sign_sources<E: EvalAtRow>(eval: &mut E, trace_eval: &Trace<E>) {
-    let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
-    let is_real = E::F::one() - is_pad[0].clone();
-    let val_b = crate::trace::trace_eval!(trace_eval, Column::ValB);
-    let val_d = crate::trace::trace_eval!(trace_eval, Column::ValD);
-    let real_32bit_h = crate::trace::trace_eval!(trace_eval, Column::Real32bitH);
+pub(in crate::chips::cpu) fn sign_sources<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
+    let is_real = E::F::one() - row.is_padding[0].clone();
     // ════════════════════════════════════════════════════════════════════
     // Pin SignBitB / SignBitD / SignBitQ / SignBitR to bit 7
     // of their respective source bytes via nibble-AND lookups.
@@ -43,35 +38,29 @@ pub(in crate::chips::cpu) fn sign_sources<E: EvalAtRow>(eval: &mut E, trace_eval
     // Ground constraint: pin SignSrcB / SignSrcD / SignSrcQ /
     // SignSrcR to the canonical Is32Bit-multiplexed source byte.
     {
-        let sign_src_b = crate::trace::trace_eval!(trace_eval, Column::SignSrcB);
-        let sign_src_d = crate::trace::trace_eval!(trace_eval, Column::SignSrcD);
-        let sign_src_q = crate::trace::trace_eval!(trace_eval, Column::SignSrcQ);
-        let sign_src_r = crate::trace::trace_eval!(trace_eval, Column::SignSrcR);
-        let div_quotient_local = crate::trace::trace_eval!(trace_eval, Column::DivQuotient);
-        let div_remainder_local = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
         // Route `is_real · is_32bit` through the Real32bitH helper.
         // `is_real · (1 - is_32bit) · X` → `(is_real - Real32bitH) · X`,
         // and `is_real · is_32bit · X` → `Real32bitH · X`.
-        let real_minus_32 = is_real.clone() - real_32bit_h[0].clone();
+        let real_minus_32 = is_real.clone() - row.real32bit_h[0].clone();
         eval.add_constraint(
-            is_real.clone() * sign_src_b[0].clone()
-                - real_minus_32.clone() * val_b[7].clone()
-                - real_32bit_h[0].clone() * val_b[3].clone(),
+            is_real.clone() * row.sign_src_b[0].clone()
+                - real_minus_32.clone() * row.val_b[7].clone()
+                - row.real32bit_h[0].clone() * row.val_b[3].clone(),
         );
         eval.add_constraint(
-            is_real.clone() * sign_src_d[0].clone()
-                - real_minus_32.clone() * val_d[7].clone()
-                - real_32bit_h[0].clone() * val_d[3].clone(),
+            is_real.clone() * row.sign_src_d[0].clone()
+                - real_minus_32.clone() * row.val_d[7].clone()
+                - row.real32bit_h[0].clone() * row.val_d[3].clone(),
         );
         eval.add_constraint(
-            is_real.clone() * sign_src_q[0].clone()
-                - real_minus_32.clone() * div_quotient_local[7].clone()
-                - real_32bit_h[0].clone() * div_quotient_local[3].clone(),
+            is_real.clone() * row.sign_src_q[0].clone()
+                - real_minus_32.clone() * row.div_quotient[7].clone()
+                - row.real32bit_h[0].clone() * row.div_quotient[3].clone(),
         );
         eval.add_constraint(
-            is_real.clone() * sign_src_r[0].clone()
-                - real_minus_32 * div_remainder_local[7].clone()
-                - real_32bit_h[0].clone() * div_remainder_local[3].clone(),
+            is_real.clone() * row.sign_src_r[0].clone()
+                - real_minus_32 * row.div_remainder[7].clone()
+                - row.real32bit_h[0].clone() * row.div_remainder[3].clone(),
         );
     }
 }
@@ -79,27 +68,13 @@ pub(in crate::chips::cpu) fn sign_sources<E: EvalAtRow>(eval: &mut E, trace_eval
 /// The sign bits pinned to bit 7 of their source bytes, through nibble lookups.
 pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
     eval: &mut E,
-    trace_eval: &Trace<E>,
+    row: &Row<E::F>,
     lookups: &Lookups<'_>,
 ) {
     let bitwise_and_lookup = lookups.bitwise_and_lookup;
-    let is_pad = crate::trace::trace_eval!(trace_eval, Column::IsPadding);
-    let is_real = E::F::one() - is_pad[0].clone();
-    let result = crate::trace::trace_eval!(trace_eval, Column::Result);
+    let is_real = E::F::one() - row.is_padding[0].clone();
     // Sign-bit nibble lookups (last lookup block before finalize).
     {
-        let sign_src_b = crate::trace::trace_eval!(trace_eval, Column::SignSrcB);
-        let sign_src_d = crate::trace::trace_eval!(trace_eval, Column::SignSrcD);
-        let sign_b_hi = crate::trace::trace_eval!(trace_eval, Column::SignBHiNib);
-        let sign_d_hi = crate::trace::trace_eval!(trace_eval, Column::SignDHiNib);
-        let sign_q_hi = crate::trace::trace_eval!(trace_eval, Column::SignQHiNib);
-        let sign_r_hi = crate::trace::trace_eval!(trace_eval, Column::SignRHiNib);
-        let sign_bit_b = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
-        let sign_bit_d = crate::trace::trace_eval!(trace_eval, Column::SignBitD);
-        let sign_bit_q = crate::trace::trace_eval!(trace_eval, Column::SignBitQ);
-        let sign_bit_r = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
-        let sign_src_q = crate::trace::trace_eval!(trace_eval, Column::SignSrcQ);
-        let sign_src_r = crate::trace::trace_eval!(trace_eval, Column::SignSrcR);
         let eight_p17: E::F = E::F::from(BaseField::from(8));
         let sixteen_p17: E::F = E::F::from(BaseField::from(16));
         let fifteen_p17: E::F = E::F::from(BaseField::from(15));
@@ -109,12 +84,12 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             bitwise_and_lookup,
             is_real.clone().into(),
             &[
-                sign_b_hi[0].clone(),
+                row.sign_b_hi_nib[0].clone(),
                 eight_p17.clone(),
-                sign_bit_b[0].clone() * eight_p17.clone(),
+                row.sign_bit_b[0].clone() * eight_p17.clone(),
             ],
         ));
-        let lo_b = sign_src_b[0].clone() - sign_b_hi[0].clone() * sixteen_p17.clone();
+        let lo_b = row.sign_src_b[0].clone() - row.sign_b_hi_nib[0].clone() * sixteen_p17.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
@@ -126,12 +101,12 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             bitwise_and_lookup,
             is_real.clone().into(),
             &[
-                sign_d_hi[0].clone(),
+                row.sign_d_hi_nib[0].clone(),
                 eight_p17.clone(),
-                sign_bit_d[0].clone() * eight_p17.clone(),
+                row.sign_bit_d[0].clone() * eight_p17.clone(),
             ],
         ));
-        let lo_d = sign_src_d[0].clone() - sign_d_hi[0].clone() * sixteen_p17.clone();
+        let lo_d = row.sign_src_d[0].clone() - row.sign_d_hi_nib[0].clone() * sixteen_p17.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
@@ -144,12 +119,12 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             bitwise_and_lookup,
             is_real.clone().into(),
             &[
-                sign_q_hi[0].clone(),
+                row.sign_q_hi_nib[0].clone(),
                 eight_p17.clone(),
-                sign_bit_q[0].clone() * eight_p17.clone(),
+                row.sign_bit_q[0].clone() * eight_p17.clone(),
             ],
         ));
-        let lo_q = sign_src_q[0].clone() - sign_q_hi[0].clone() * sixteen_p17.clone();
+        let lo_q = row.sign_src_q[0].clone() - row.sign_q_hi_nib[0].clone() * sixteen_p17.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
@@ -161,12 +136,12 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             bitwise_and_lookup,
             is_real.clone().into(),
             &[
-                sign_r_hi[0].clone(),
+                row.sign_r_hi_nib[0].clone(),
                 eight_p17.clone(),
-                sign_bit_r[0].clone() * eight_p17.clone(),
+                row.sign_bit_r[0].clone() * eight_p17.clone(),
             ],
         ));
-        let lo_r = sign_src_r[0].clone() - sign_r_hi[0].clone() * sixteen_p17.clone();
+        let lo_r = row.sign_src_r[0].clone() - row.sign_r_hi_nib[0].clone() * sixteen_p17.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
@@ -179,18 +154,16 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
         // SignBitResult's value is unused.  Keeping the same shape as
         // the other 4 sign-bit pins keeps the lookup-pair structure
         // uniform.
-        let sign_bit_result = crate::trace::trace_eval!(trace_eval, Column::SignBitResult);
-        let result_hi = crate::trace::trace_eval!(trace_eval, Column::ResultHiNib);
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
             &[
-                result_hi[0].clone(),
+                row.result_hi_nib[0].clone(),
                 eight_p17.clone(),
-                sign_bit_result[0].clone() * eight_p17.clone(),
+                row.sign_bit_result[0].clone() * eight_p17.clone(),
             ],
         ));
-        let lo_res = result[3].clone() - result_hi[0].clone() * sixteen_p17.clone();
+        let lo_res = row.result[3].clone() - row.result_hi_nib[0].clone() * sixteen_p17.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
@@ -198,19 +171,17 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
         ));
 
         // LoadSignBit — pin to bit 7 of LoadSignSrc.
-        let load_sign_bit_pin = crate::trace::trace_eval!(trace_eval, Column::LoadSignBit);
-        let load_sign_hi = crate::trace::trace_eval!(trace_eval, Column::LoadSignHiNib);
-        let load_sign_src_pin = crate::trace::trace_eval!(trace_eval, Column::LoadSignSrc);
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
             &[
-                load_sign_hi[0].clone(),
+                row.load_sign_hi_nib[0].clone(),
                 eight_p17.clone(),
-                load_sign_bit_pin[0].clone() * eight_p17.clone(),
+                row.load_sign_bit[0].clone() * eight_p17.clone(),
             ],
         ));
-        let lo_load = load_sign_src_pin[0].clone() - load_sign_hi[0].clone() * sixteen_p17.clone();
+        let lo_load =
+            row.load_sign_src[0].clone() - row.load_sign_hi_nib[0].clone() * sixteen_p17.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
