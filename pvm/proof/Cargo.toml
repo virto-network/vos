@@ -55,7 +55,6 @@ stwo-constraint-framework = { workspace = true }
 # link the verifier without a duplicate-lang-item clash against its own panic
 # handler. The `prover` feature adds `serde/std` / `num-traits/std` back for
 # native prover builds.
-# Same shape settlement-verifier pins (the proven riscv64em no_std graph).
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 num-traits = { version = "0.2", default-features = false }
 impl-trait-for-tuples = { workspace = true }
@@ -76,8 +75,7 @@ vos-pvm-compiler = { workspace = true }
 # it must match.
 vos-testkit = { path = "../../agent/testkit" }
 bincode = "1"
-# no_std + serde wire format shared with the PVM settlement verifier
-# (settlement-verifier): the fixture this crate serializes is deserialized there.
+# The wrap's wire format, which the final verifier decodes.
 postcard = { version = "1", features = ["alloc"] }
 vos-pvm-proof-verifier = { workspace = true }
 # The window kernel's arguments: a space's pseudo-account rows in a tree at

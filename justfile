@@ -43,11 +43,9 @@ vectors:
 # Memory-heavy: two threads fit under a 24 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
-# them; the verifier's suite runs in `test`. The settlement verifier's own
-# tests check its channel copy against the prover's.
-test-proof: build-guests build-test-actors judge-wasm
+# them; the verifier's suite runs in `test`.
+test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --tests -- --test-threads=2
-    cd pvm/proof/settlement-verifier; cargo test
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
 # verifier's blob built as a runtime builds it, under the PVF's semantics and
@@ -65,13 +63,6 @@ judge-wasm:
 fixtures:
     with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test fixtures the_fixtures_are_the_generators }
 
-# Guest programs the prover suites run.
-build-guests: build-settle
-
-# The settlement verifier as a PVM program.
-build-settle:
-    cd pvm/proof/settlement-verifier; cargo build --release --target riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --features pvm-settle --bin settle
-
 # The tests run on mimalloc as the node's binary does, and as it does with
 # transparent huge pages off.
 export MIMALLOC_ALLOW_THP := "0"
@@ -79,7 +70,7 @@ export MIMALLOC_ALLOW_THP := "0"
 # Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
-    for manifest in ([agent/default agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/settlement-verifier pvm/proof/verifier-wasm-bench pvm/proof/final-verifier/wasm spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+    for manifest in ([agent/default agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
 # item.
@@ -88,7 +79,6 @@ doc-check:
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
-    cd pvm/proof/settlement-verifier; cargo clippy --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-bench --features prove --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --features faults --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
@@ -157,14 +147,12 @@ check-no-std:
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the
-# builds without std, the workspace's lints and the settlement verifier's,
-# and the suites of the node, the agent, vos-raft and the crates under them.
+# builds without std, the workspace's lints, and the suites of the node, the agent, vos-raft and the crates under them.
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
 check: fmt-check doc-check check-no-std build-test-actors build-agent
     cargo clippy --workspace --all-targets --quiet -- -D warnings
-    cd pvm/proof/settlement-verifier; cargo clippy --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-recair-air -p vos-recair -p vos-final-verifier -p vos-statement --features vos-statement/fixtures
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 

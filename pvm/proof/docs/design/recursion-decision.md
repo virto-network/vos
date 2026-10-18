@@ -11,8 +11,9 @@ does not need it.** Two products share one verifier:
   program (e.g. a light voucher state transition, a few thousand steps) proves as
   ONE segment and its proof is verified on-chain (JAM PVM / Substrate). No
   recursion. This is complete and shippable, and is exactly what the
-  `settlement-verifier` crate does (a verify-only Poseidon2-over-M31 stwo verifier
-  that builds `no_std` for the JAM PVM and wasm32). Track A is unaffected by the
+  `settlement-verifier` crate did (a verify-only Poseidon2-over-M31 stwo verifier
+  that built `no_std` for the JAM PVM and wasm32; retired, the final verifier
+  supersedes it). Track A is unaffected by the
   recursion verdict.
 
 - **Track B — fold many segments (the capstone is 76) into one constant-size
