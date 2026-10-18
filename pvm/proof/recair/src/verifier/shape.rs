@@ -321,3 +321,21 @@ fn draw_order(component_mask: u32) -> (Vec<String>, AllLookupElements) {
         .collect();
     (names, lookup)
 }
+
+#[cfg(test)]
+mod tests {
+    /// The relations' challenges come in the order the channel drew them,
+    /// which every build shares: a leaf circuit is compiled over them, so a
+    /// kernel's program id does not move with the features a build turns on.
+    #[test]
+    fn the_relations_are_in_the_order_drawn() {
+        let (drawn, lookup) = super::draw_order(0);
+        let names: Vec<String> = lookup
+            .relation_challenges()
+            .into_iter()
+            .map(|relation| relation.name)
+            .collect();
+        assert!(drawn.len() > 1);
+        assert_eq!(names, drawn);
+    }
+}

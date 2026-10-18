@@ -1,4 +1,4 @@
-use alloc::collections::BTreeMap;
+use alloc::vec::Vec;
 use core::any::TypeId;
 
 use num_traits::{One, Zero};
@@ -57,14 +57,25 @@ macros::register_relation! {
     pub(crate) trait RegisteredLookupBound {}
 }
 
+/// The drawn relations, in the order the channel drew them. Never in
+/// `TypeId` order: a type's id moves with the build (a crate's features
+/// change it), and the leaf circuits, so a kernel's program id, are
+/// compiled over [`AllLookupElements::relation_challenges`]'s order.
 #[derive(Default, Debug, Clone)]
-pub struct AllLookupElements(BTreeMap<TypeId, RelationVariant>);
+pub struct AllLookupElements(Vec<(TypeId, RelationVariant)>);
+
+impl AllLookupElements {
+    fn get(&self, type_id: TypeId) -> Option<&RelationVariant> {
+        self.0
+            .iter()
+            .find_map(|(id, variant)| (*id == type_id).then_some(variant))
+    }
+}
 
 impl<T: RegisteredLookupBound> AsRef<T> for AllLookupElements {
     fn as_ref(&self) -> &T {
         let variant = self
-            .0
-            .get(&TypeId::of::<T>())
+            .get(TypeId::of::<T>())
             .expect("lookup elements weren't initialized");
         T::unwrap_ref(variant)
     }
@@ -103,9 +114,12 @@ impl RelationChallenges {
 }
 
 impl AllLookupElements {
-    /// Every drawn relation's challenges.
+    /// Every drawn relation's challenges, in the order drawn.
     pub fn relation_challenges(&self) -> alloc::vec::Vec<RelationChallenges> {
-        self.0.values().map(RelationVariant::challenges).collect()
+        self.0
+            .iter()
+            .map(|(_, variant)| variant.challenges())
+            .collect()
     }
 }
 
@@ -140,10 +154,10 @@ impl<T: RegisteredLookupBound> ComponentLookupElements for T {
         channel: &mut impl stwo::core::channel::Channel,
     ) {
         let type_id = TypeId::of::<Self>();
-        lookup_elements
-            .0
-            .entry(type_id)
-            .or_insert_with(|| <Self as RegisteredLookupBound>::draw(channel).into());
+        if lookup_elements.get(type_id).is_none() {
+            let variant = <Self as RegisteredLookupBound>::draw(channel).into();
+            lookup_elements.0.push((type_id, variant));
+        }
     }
 }
 
