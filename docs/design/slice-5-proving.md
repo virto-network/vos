@@ -698,6 +698,14 @@ M0's milestone review left these before the recursion builds on them.
     minutes a window);
   - verified natively, in Wasm and on the JAM-only host.
 - **Gate:** every venue judges every fixture alike.
+  - **Passed** (`slice-5-progress.md` 5.15) [measured]: eleven fixtures,
+    A.6's nine and two more (another program than the pin, another space),
+    judged alike natively, in Wasm (PVF and client) and on the JAM-only
+    host, the accepted statement's id the same at each; the window's 26
+    segments end to end in 5.7 minutes (291 s of segments and leaves, 46 s
+    of folds, a 5.58 s wrap), the predicate's three in 39 s; both
+    statements accepted natively, in Wasm (38.3M instructions) and on the
+    JAM-only host (96.1–96.3M gas).
 - **Estimate:** about 2 weeks.
 
 ### 5.16 Acceptance

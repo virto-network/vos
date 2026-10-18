@@ -3515,3 +3515,187 @@ JAM-only host and in Wasm.
   the Wasm harness.
 - `docs/design/proving.md` §3.5, §4, the risks, A.4, A.7;
   `recursion-air.md` §7, §8, §10's step 7; `slice-5-proving.md` 5.14's gate.
+
+## Step 5.15: end to end
+
+`recursion-air.md` §10's step 8, on `vos-core` from `cc4463c1`:
+`vos-statement` and the venue's check, the golden fixtures (A.6) judged
+alike at every venue, and the window statement and the solvency predicate
+end to end; 5.14b's review folded first.
+
+### 5.14b's review, folded first (its own commit)
+
+- **F1, the bytes:** `vos_final_verifier::decode` reads at most
+  `MAX_PROOF_BYTES` (256 KiB, a venue's weight bound; `Error::Length`), by
+  `postcard::take_from_bytes`, a byte after the proof refused
+  (`Error::Decode`). Postcard's varints need not be minimal: the wrap with
+  its format re-encoded as a two-byte varint verifies (a test holds it), so
+  one proof has many encodings and a venue keys on the statement's id,
+  never on the proof's bytes or their hash (documented in both crates and
+  `proving.md` §3.6).
+- **F2:** the six malformed shapes Stwo refuses rather than the shape
+  check, each pinned to its error: a column of queried values or a queried
+  value fewer (`Merkle(QueriedValuesShapeMismatch)`), an inner FRI layer
+  fewer or more (`Fri(InvalidNumFriLayers)`), a FRI witness value fewer
+  (`Fri(InnerLayerEvaluationsInvalid { inner_layer: 0 })`), a last layer
+  twice as long (`Fri(LastLayerDegreeInvalid)`); every other malformed shape
+  pinned to its variant too (`Shape`, `Noncanonical`, `Format`).
+- **F4** is `vos-statement`'s invariant (below).
+- **F5:** the security tool's `log_degree_bound - log_last_layer` by
+  checked subtraction.
+- **`Error::code`:** a refusal's class as a byte, a Stwo refusal's kind
+  under `0x10`, which every venue reports alike.
+
+### `vos-statement` (`pvm/proof/statement`)
+
+- **The types** of `proving.md` §3.6: `Statement { format, program, space,
+  public_args, output, roots }`, `ProgramId` (eight M31 words), `SpaceId`,
+  `RootRead { kind, space, window, root }`, `StatementId`.
+- **The encoding,** SCALE: the format and the program's words as
+  little-endian `u32`s, the space, then `public_args`, `output` and `roots`
+  exactly as the io-hash encodes them (compact lengths and count, a root as
+  its kind, space, window and root), so the io-hash's preimage is the
+  encoding's tail. **A decode is canonical:** a compact only in its
+  shortest mode, a program word below `p`, a count the input can hold,
+  nothing after; a statement has one encoding.
+- **`io_hash()`** is `BLAKE2b-256("vos/io/v1" ‖ tail)`, equal to
+  `vos_pvm_precompiles::compute_io_hash` (a test); **`id()`** is
+  `BLAKE2b-256("vos/statement/v1" ‖ format ‖ program ‖ space ‖ io_hash)`.
+  Both pinned by golden vectors, recomputed independently (Python's
+  `hashlib.blake2b`) before pinning.
+- **`judge(venue, program, statement, proof)`,** the venue's check, in
+  order: the format (accepted, and 28); the statement's program against
+  `program`; every root's space against the statement's; every root
+  anchored; the io-hash recomputed, the id from it; a repeat; then
+  `vos_final_verifier::verify_bytes` against `program` and the recomputed
+  io-hash. **`program` is the venue's pin, never the caller's** (F4, the
+  crate's docs): a venue verifying against the statement's or the proof's
+  id would accept any kernel's proof. `Venue` is the venue's state
+  (`accepts`, `anchored`, `seen`); `Refusal::code` its refusal's class
+  (`0x100` and the final verifier's code for a refused proof), 0 an
+  acceptance.
+- **`model`:** a venue as plain data (`Policy`: formats, anchors, seen
+  ids) and a judgement's input as one byte string (`Input`: the pin, the
+  policy and the statement; then the proof), which every harness hands its
+  venue alike (`judge_bytes`).
+- **`fixtures`** (feature, std): the fixtures' encoding and reader, for the
+  harnesses.
+- **The venue on the JAM-only host:** the refine program moved here from
+  `vos-final-verifier` (which `vos-statement` depends on), `final-verify.elf`
+  still: its payload's first byte asks it to verify words (5.14's
+  measurement) or to judge an `Input`; its report adds the judgement's code
+  and the accepted id. 494 KB as a PVM program (464 KB before).
+- **The Wasm harness:** the blob exports `judge` (its code) and
+  `statement_id`; the runner's `judge <fixtures>` and `statements
+  <name.input>...` modes. 305 KB (292 KB before).
+- no_std, stable for x86 and wasm32, built by `just check-no-std` for the
+  embedded target, wasm32 without nightly features and the PVM.
+
+### The golden fixtures (`pvm/proof/fixtures`, `proving.md` A.6)
+
+- **The generator** (`pvm/proof/tests/fixtures.rs`, `statements`): a small
+  kernel that sets φ9..12 to a fixed statement `S`'s io-hash (its nonce,
+  output and two roots of its space), cut in three segments of its class,
+  their leaves folded to a root, wrapped (`wrap.proof`, 123,833 bytes); and
+  two roots that are not a whole run wrapped as a cheating prover would,
+  the circuit lenient (`wrap-prefix.proof`: the first two segments, which
+  set the io-hash and never halt; `wrap-midway.proof`: the last two,
+  labelled from 0, which never start at the entry). Eleven cases
+  (`statements.cases`, 5.5 KB), the tampered one a patch of the valid
+  proof, the rest the three proofs as they are. 380 KB in all; the segment
+  fixtures unchanged.
+- **Deterministic:** the stale-fixture test regenerates them (65 s) and
+  compares byte for byte; `just fixtures` writes them.
+- **Judged** natively and on the JAM-only host by
+  `vos-statement/tests/fixtures.rs` (`just check`), and in Wasm by the
+  runner's `judge`:
+
+| fixture | recorded | native | Wasm PVF | Wasm client | JAM-only host |
+|---|---|---|---|---|---|
+| valid | 0 | 0 | 0, 38.31M instr. | 0, 37.79M | 0, 96.3M gas |
+| tampered | `0x112` | `0x112` | `0x112`, 25.3M | `0x112`, 25.0M | `0x112`, 67.0M |
+| wrong program | `0x108` | `0x108` | `0x108`, 3.15M | `0x108`, 3.10M | `0x108`, 17.5M |
+| unanchored root | `0x5` | `0x5` | `0x5` | `0x5` | `0x5`, 0.1M |
+| prefix | `0x109` | `0x109` | `0x109`, 3.22M | `0x109`, 3.17M | `0x109`, 17.7M |
+| mid-way | `0x109` | `0x109` | `0x109` | `0x109` | `0x109`, 17.7M |
+| repeated | `0x6` | `0x6` | `0x6` | `0x6` | `0x6`, 0.2M |
+| unaccepted format | `0x2` | `0x2` | `0x2` | `0x2` | `0x2`, 0.1M |
+| wrong io-hash | `0x108` | `0x108` | `0x108` | `0x108` | `0x108`, 17.5M |
+| another program than the pin | `0x3` | `0x3` | `0x3` | `0x3` | `0x3`, 0.1M |
+| another space | `0x4` | `0x4` | `0x4` | `0x4` | `0x4`, 0.1M |
+
+  `0x112` is Stwo's Merkle refusal (a root mismatch), `0x108` the
+  interaction PoW (the words, mixed before it, are not the proof's),
+  `0x109` the logup sums (a wrap proved over a refused root does not
+  balance). The accepted id, `9b95b904…`, is the same at all three.
+
+### End to end (`test-proof`)
+
+- **The window** (`window_kernel`'s `the_window_wraps`): 26 segments
+  proved in their classes and verified in their leaves (291 s), 25 folds
+  (46 s), the wrap (5.58 s, 2.5 GiB heap, 123,686 bytes): 5.7 minutes in
+  all, against 3–5 projected. Its `Statement` (rootless; its anchors'
+  roots are in its arguments, bound through its output) recomputes the
+  run's io-hash; a venue pinning its program accepts it natively and on
+  the JAM-only host (96.1M gas, 460 KiB heap), its id `d4df8c31…`.
+- **The solvency predicate** (`kernel_shape`'s `the_predicate_wraps`,
+  `areas`): its 1,658 steps cut in three class-0 segments (3.7–5.0 s each,
+  leaves 1.5–1.6 s), two folds (1.5–1.6 s), the wrap (6.7 s, 123,859
+  bytes), 39 s in all; accepted natively and on the JAM-only host (96.3M
+  gas), its id `df697f30…`.
+- **In Wasm** (the runner's `statements`, one core): both accepted, the
+  ids the same; 38.26M / 38.33M instructions under the PVF's semantics,
+  37.73M / 37.80M the client's; `verify` on the words alone 38.23M /
+  38.31M, 2.3 ms; a tampered byte refused.
+- `common::wrap_root`, `judged_statement` and `write_wrap` are shared by
+  both, and `statement/tests/support/jam.rs` (the guest on the JAM-only
+  host) by every test that runs it.
+
+### F3: fuzzing (`pvm/proof/fuzz`)
+
+- **`final_verifier_bytes`:** arbitrary bytes against the golden words,
+  the corpus seeded with the three wraps; **`final_verifier_mutate`:** a
+  list of `arbitrary` mutations of the golden wrap, structural (any tree,
+  column, witness or layer grown, shrunk or emptied; a value set to any
+  limbs, noncanonical among them; a hash, a nonce, a configuration field, a
+  log size, the format) and byte-level (flips, insertions, removals,
+  truncation of its re-encoding), each verified both ways. `panic =
+  abort`; a verified mutation must state the golden words.
+- **Run** [measured, `cargo fuzz`, one core each]: the bytes target 10
+  minutes, 770,814 runs at about 1,280 a second, 3,965 edges, a corpus of
+  624; the mutation target 10 minutes (26,702 runs, sharing the machine
+  with `just check`), then 15 more at up to 1,024 bytes of mutations
+  (40,586 runs, 45 a second, 4,451 edges, a corpus of 748). No crash, no
+  panic, no accepted mutation. Logs under the job's `tmp/s5/5.15-fuzz-*`.
+
+### Gates
+
+[measured, under `systemd-run` at 14 GiB with `nice -n 10`,
+`CARGO_INCREMENTAL=0`; the Wasm runs pinned to one core]
+- **Every venue judges every fixture alike:** eleven of eleven, at four
+  venues (native, Wasm PVF, Wasm client, the JAM-only host).
+- **Both statements** verified natively, in Wasm and on the JAM-only host.
+- **`just check`** green: 1,111 tests (1,101 at 5.14); clippy clean; the
+  builds without std, `vos-statement` and its guest among them.
+- **`test-proof`, the suites this step touches:** `fixtures` (its two
+  tests), `kernel_shape`'s `the_predicate_wraps`, `window_kernel`'s
+  `the_window_wraps`, green under 14 GiB.
+
+### Carried to later steps
+
+- **5.16:** the acceptance gates (`ci-full`, `test-proof`, the checker
+  loop), the rows of A.7, the end review and the code-quality review.
+- **Slice 6:** the fixtures regenerated at the masked wrap's format; the
+  pallet's registries over `Venue`; a fixed-layout decode, which would also
+  make the proof's encoding canonical.
+
+### Outside the step's files
+
+- `Cargo.toml`: `vos-statement` a member, at opt-level 3 in the dev and
+  test profiles.
+- `justfile`: `check-no-std` builds `vos-statement` for the three targets
+  and `final-verify.elf` from it; `test` and `check` test it with its
+  fixtures.
+- `pvm/proof/recair/tests/wrap.rs`: the guest's runner shared.
+- `docs/design/proving.md` §3.6, §6, A.6; `recursion-air.md` §8, §10's
+  step 8; `slice-5-proving.md` 5.15's gate.

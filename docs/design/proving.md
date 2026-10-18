@@ -417,6 +417,20 @@ pub struct Statement {
     treat it as the space's.
 - **Repeats:** a venue refuses a statement id it has seen. A kernel whose
   legitimate statements can repeat carries a nonce in `public_args`.
+  A venue keys on the statement id, never on the proof's bytes or their
+  hash: postcard's varints need not be minimal, so one proof has many
+  encodings, and many proofs state one statement.
+- **The venue's check, built** (slice 5's 5.15, `vos_statement::judge`),
+  in order: the format (accepted, and 28, the one the final verifier
+  reads); the statement's program against the venue's pin; every root's
+  space against the statement's; every root anchored; the io-hash
+  recomputed from the fields and the id from it; a repeat; then the final
+  proof (at most 256 KiB, one postcard encoding and nothing after it)
+  against the pinned program id and the recomputed io-hash. **The program
+  id is the venue's argument, never the caller's:** a venue that verified
+  against the statement's or the proof's id would accept any kernel's
+  proof. Each refusal has a class every venue reports alike
+  (`Refusal::code`, the final verifier's `Error::code` under it).
 - **Low-entropy fields:** anything in `output` or `public_args` derived
   from private data is a nullifier or a salted commitment, never a plain
   hash of a guessable value.
@@ -458,8 +472,12 @@ pub struct Statement {
     no_std, with no prover dependency;
   - `final-verifier` (`vos-final-verifier`): no_std, for x86, wasm32
     and riscv64em-javm;
-  - `statement` (`vos-statement`): the types, the encoding and the id,
-    with no vos dependency, so Kreivo can depend on it;
+  - `statement` (`vos-statement`): the types, the encoding, the io-hash
+    and the id, and the venue's check over `vos-final-verifier`, with no
+    other vos dependency, so Kreivo can depend on it; its `model` is a
+    venue as plain data, which the fixtures are judged against, and its
+    JAM refine program (`final-verify.elf`) is the venue on the JAM-only
+    host;
   - the golden fixtures, under `fixtures` (A.6).
 
   Every venue uses the last three. The source uses no nightly feature:
@@ -567,7 +585,9 @@ last for decades.**
     8. dispatch to the handler compiled into the runtime for that
        program.
 
-    Panic guards wrap the decode and the verifier.
+    Panic guards wrap the decode and the verifier. Steps 1–7 but the
+    statement's own decode are `vos_statement::judge` (slice 5's 5.15),
+    the program's pinned id passed in from the registry.
   - **Fail-closed:** a runtime without the verifier rejects every proof,
     and a failed submit pays its full weight.
   - **Built-in handlers:** `Record` records the statement, and
@@ -917,6 +937,34 @@ carriers.
 Every venue judges them alike. A generator makes them, regenerated at
 each format bump, and stores them under `pvm/proof/fixtures` (about
 1.2 MB). M0 promised it and did not build it; slice 5's 5.8.0 does.
+
+**Built** (slice 5's 5.15) [measured]: the generator
+(`pvm/proof/tests/fixtures.rs`) proves a small kernel stating a fixed
+statement `S` (two roots of its space, a nonce, an output) in three
+segments, folds them and wraps the root (`wrap.proof`, 123,833 bytes), and
+wraps two roots that are not a whole run as a cheating prover would, the
+wrap's checks failing (`wrap-prefix.proof`, `wrap-midway.proof`). The cases
+(`statements.cases`, 5.5 KB), each a venue's state, a statement, a proof or
+a patch of one, and its verdict:
+
+| case | verdict | native | Wasm (PVF, client) | JAM-only host |
+|---|---|---|---|---|
+| valid | accepted | accepted | accepted, 38.3M / 37.8M instructions | accepted, 96.3M gas |
+| tampered (a byte flipped) | `0x112` Stwo, Merkle | `0x112` | `0x112` | `0x112`, 67.0M |
+| wrong program (the venue pins another, the wrap is this kernel's) | `0x108` interaction PoW | `0x108` | `0x108` | `0x108`, 17.5M |
+| unanchored root (an older window's) | `0x5` | `0x5` | `0x5` | `0x5`, 0.1M |
+| prefix (no halt) | `0x109` logup | `0x109` | `0x109` | `0x109`, 17.7M |
+| mid-way (no entry, labelled from 0) | `0x109` logup | `0x109` | `0x109` | `0x109`, 17.7M |
+| repeated | `0x6` | `0x6` | `0x6` | `0x6`, 0.2M |
+| unaccepted format (30) | `0x2` | `0x2` | `0x2` | `0x2`, 0.1M |
+| wrong io-hash (the output changed) | `0x108` interaction PoW | `0x108` | `0x108` | `0x108`, 17.5M |
+| another program than the pin | `0x3` | `0x3` | `0x3` | `0x3`, 0.1M |
+| another space | `0x4` | `0x4` | `0x4` | `0x4`, 0.1M |
+
+The accepted statement's id is the same at every venue. A refused proof's
+class is the first check it fails: the words are mixed before the
+interaction PoW, so a proof of other words falls short there; a wrap
+proved over a refused root does not balance its logup sums.
 
 **A.7 Budgets per node (M1: measured, then pinned).** Heavy tests run
 under `systemd-run` with these caps as `MemoryMax`.
