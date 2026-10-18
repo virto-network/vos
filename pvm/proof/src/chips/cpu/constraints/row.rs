@@ -149,7 +149,7 @@ pub(in crate::chips::cpu) fn shared_helpers<E: EvalAtRow>(eval: &mut E, trace_ev
         }
         for i in 1..WORD_SIZE {
             eval.add_constraint(
-                val_r_part_nz_times_ind_h[i].clone()
+                val_r_part_nz_times_ind_h[i - 1].clone()
                     - val_r_partial_nz_top[i - 1].clone() * val_r_byte_indicator_h[i].clone(),
             );
         }

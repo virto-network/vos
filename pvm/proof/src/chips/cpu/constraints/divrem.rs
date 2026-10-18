@@ -47,11 +47,10 @@ pub(in crate::chips::cpu) fn zero_divisor_helpers<E: EvalAtRow>(
                     + val_d[i].clone(),
             );
         }
-        // PartNZTimesIndH[i] = PartialNZ[i-1] · ByteIndicator[i] for i ≥ 1.
-        // Index 0 unused; default fill = 0.
+        // PartNZTimesIndH[i - 1] = PartialNZ[i-1] · ByteIndicator[i] for i ≥ 1.
         for i in 1..WORD_SIZE {
             eval.add_constraint(
-                part_nz_times_ind_h[i].clone()
+                part_nz_times_ind_h[i - 1].clone()
                     - val_d_partial_nz_top[i - 1].clone() * val_d_byte_indicator_h[i].clone(),
             );
         }
@@ -202,13 +201,13 @@ pub(in crate::chips::cpu) fn zero_divisor<E: EvalAtRow>(eval: &mut E, trace_eval
         for i in 1..WORD_SIZE {
             // OR(PartialNZ[i-1], Ind[i]) = PartialNZ[i-1] + Ind[i] -
             //                              PartialNZ[i-1]·Ind[i]
-            // The product term is now PartNZTimesIndH[i] (deg 1 helper).
+            // The product term is PartNZTimesIndH[i - 1] (deg 1 helper).
             eval.add_constraint(
                 is_real.clone()
                     * (val_d_partial_nz[i].clone()
                         - val_d_partial_nz[i - 1].clone()
                         - val_d_byte_indicator_h[i].clone()
-                        + part_nz_times_ind_h[i].clone()),
+                        + part_nz_times_ind_h[i - 1].clone()),
             );
         }
 
@@ -293,7 +292,7 @@ pub(in crate::chips::cpu) fn remainder_sign<E: EvalAtRow>(eval: &mut E, trace_ev
                     * (val_r_partial_nz[i].clone()
                         - val_r_partial_nz[i - 1].clone()
                         - val_r_byte_indicator_h[i].clone()
-                        + val_r_part_nz_times_ind_h[i].clone()),
+                        + val_r_part_nz_times_ind_h[i - 1].clone()),
             );
         }
         // Sign-of-r constraint.

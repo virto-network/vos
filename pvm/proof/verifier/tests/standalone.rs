@@ -10,7 +10,7 @@ use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{Proof, SideNote, prove};
 use vos_pvm_proof_verifier::{CommitmentHash, verify_standalone};
 
-/// The Blake2s Stark proof of a format-33 proof.
+/// The Blake2s Stark proof of a format-36 proof.
 fn stark(proof: &mut Proof) -> &mut StarkProof<Blake2sMerkleHasher> {
     Blake2sMerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Blake2s proof")
 }
@@ -407,13 +407,13 @@ fn standalone_verify_rejects_format_version_mismatch() {
 
     // Forge: a number the registry does not hold, as a proof of a future
     // AIR would carry.
-    proof.format_version = 35;
+    proof.format_version = 38;
 
     let err = verify_standalone(proof, preprocessed_commitment)
         .expect_err("should reject mismatched format_version");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("proof format 35 is not registered"),
+        msg.contains("proof format 38 is not registered"),
         "expected format-version error, got: {msg}"
     );
 }

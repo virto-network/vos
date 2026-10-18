@@ -12,10 +12,8 @@ use crate::air_column::{AirColumn, PreprocessedAirColumn};
 #[derive(Debug, Copy, Clone, AirColumn)]
 pub enum Column {
     #[size = 8]
-    #[mask_next_row]
     Timestamp,
     #[size = 4]
-    #[mask_next_row]
     Pc,
     #[size = 4]
     NextPc,
@@ -54,10 +52,6 @@ pub enum Column {
     #[size = 1]
     #[mask_next_row]
     IsPadding,
-    #[size = 1]
-    RegAWritten,
-    #[size = 8]
-    Gas,
     // ── Operation category flags ──
     #[size = 1]
     IsAdd,
@@ -161,8 +155,6 @@ pub enum Column {
     // ── Shift auxiliary ──
     #[size = 1]
     ShiftAmount,
-    #[size = 1]
-    ShiftOp,
     /// 1 when is_shift AND shift_op ∈ {0,1} (left shift or logical right shift)
     #[size = 1]
     IsShiftConstrained,
@@ -939,11 +931,12 @@ pub enum Column {
     /// `is_real`.
     #[size = 8]
     ValDByteIndMinus1H,
-    /// `ValDPartialNZ[i-1] · ValDByteIndicatorH[i]` for i = 1..8 — used
-    /// in the OR-recurrence `PartialNZ[i] = PartialNZ[i-1] + Ind[i] -
-    /// PartialNZ[i-1]·Ind[i]`.  Index 0 is unused (PartialNZ\[0\] is set
-    /// directly to ValDByteIndicatorH\[0\]).
-    #[size = 8]
+    /// `ValDPartialNZ[i-1] · ValDByteIndicatorH[i]` at limb `i - 1` for
+    /// i = 1..8 — used in the OR-recurrence
+    /// `PartialNZ[i] = PartialNZ[i-1] + Ind[i] - PartialNZ[i-1]·Ind[i]`.
+    /// PartialNZ\[0\] is set directly to ValDByteIndicatorH\[0\], so no
+    /// limb serves i = 0.
+    #[size = 7]
     PartNZTimesIndH,
     /// `IsDivRem · ValDIsZero` — pins DivByZero on divrem rows.
     #[size = 1]
@@ -966,11 +959,11 @@ pub enum Column {
     // BitManip MSB recurrences.  (sign_ext_bit is enforced boolean
     // unconditionally, so no separate helper is needed.)
     /// `ValDPartialNZMsb[i+1] · ValDByteIndicatorH[i]` for the MSB-direction
-    /// recurrence — i ∈ 0..7 (index 7 unused; default fill = 0).
-    #[size = 8]
+    /// recurrence — i ∈ 0..7.
+    #[size = 7]
     PartNZMsbTimesIndH,
-    /// Same for the low-4-byte MSB recurrence — i ∈ 0..3 (index 3 unused).
-    #[size = 4]
+    /// Same for the low-4-byte MSB recurrence — i ∈ 0..3.
+    #[size = 3]
     PartNZMsbLoTimesIndH,
 
     // TZ / LZ result binding.
@@ -1019,9 +1012,8 @@ pub enum Column {
     // Control flow next_pc + memory monotonicity.
     // (BranchTaken and MemByteActive booleans are enforced unconditionally
     // as `X·(1-X)=0`, so no separate helpers are needed.)
-    /// `MemByteActive[i+1] · (1 - MemByteActive[i])` per i ∈ 0..7
-    /// (index 7 unused, default fill = 0).
-    #[size = 8]
+    /// `MemByteActive[i+1] · (1 - MemByteActive[i])` per i ∈ 0..7.
+    #[size = 7]
     MemByteActiveMonoH,
 
     // Register-memory binding selector helpers.  Many cross-constraints
@@ -1102,8 +1094,9 @@ pub enum Column {
     /// `DivRemainder[i] · (ValRByteIndicatorH - 1)` — inv pinning.
     #[size = 8]
     ValRByteIndMinus1H,
-    /// `ValRPartialNZ[i-1] · ValRByteIndicatorH[i]` — OR-recurrence.
-    #[size = 8]
+    /// `ValRPartialNZ[i-1] · ValRByteIndicatorH[i]` at limb `i - 1` for
+    /// i = 1..8 — OR-recurrence.
+    #[size = 7]
     ValRPartNZTimesIndH,
     /// `IsDivS · (1 - DivByZero) · ValRPartialNZ[7]` — sign-of-r gate.
     #[size = 1]

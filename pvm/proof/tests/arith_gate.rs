@@ -391,7 +391,7 @@ fn forge_cpu_quotient(trace: &mut ComponentTrace, side_note: &mut SideNote, q: u
             set(
                 trace,
                 Cpu::ValRPartNZTimesIndH,
-                i,
+                i - 1,
                 f(partial_nz * indicator),
             );
         }

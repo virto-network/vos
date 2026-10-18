@@ -40,7 +40,7 @@ pub fn prove_canonical(
     prove_canonical_format(side_note, min_log_sizes, &crate::format::LEGACY_SEGMENT)
 }
 
-/// [`prove_canonical`] under `format`, at its parameters (format 33's are
+/// [`prove_canonical`] under `format`, at its parameters (format 36's are
 /// MOBILE's); [`ProvingError::FormatNotAdmitted`] on a format the registry
 /// does not admit.
 pub fn prove_canonical_format(

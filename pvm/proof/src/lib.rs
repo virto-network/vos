@@ -76,7 +76,7 @@
 //!   [`segment::TraceStream`] for the chain / streaming paths.
 //! - **Prove** — [`prove`] (STANDARD) or [`prove_mobile`] (low-latency
 //!   MOBILE); [`prove_with_config`] for a custom [`PcsConfig`]; all three
-//!   under the legacy format 33. [`prove_format`] proves under any admitted
+//!   under the legacy format 36. [`prove_format`] proves under any admitted
 //!   format of the [`format`](mod@format) registry, at its parameters.
 //! - **Verify** — [`verify`] / [`verify_with_pcs_policy`] (prover-side,
 //!   with the SideNote); [`verify_chain`] for a segment chain. The

@@ -318,7 +318,7 @@ fn prove_preflights_slice_cardinality_without_proving() {
 
 #[test]
 fn proof_generation_numbers_reject_previous_formats() {
-    assert_eq!(crate::PROOF_FORMAT_VERSION, 33);
+    assert_eq!(crate::PROOF_FORMAT_VERSION, 36);
     // Every number before the registry's, and the retired ones, are
     // unregistered.
     for previous in (0..=23).chain(crate::format::RETIRED) {

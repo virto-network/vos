@@ -300,10 +300,12 @@ Two things the count did not see:
 - **Stwo's `InfoEvaluator` cannot invert** (its counter's `inverse` is
   unimplemented at the pin), so no component can invert a trace expression
   today; the compiler does it in one row, tested on a synthetic component.
-- **Sixteen CPU columns and twelve next-row masks no constraint reads**
-  [measured]: `Gas` (8), `RegAWritten`, `ShiftOp`, one limb each of five
-  8-limb product-chain helpers, and the next row of `Timestamp` and `Pc`.
-  They cost the leaf their samples and nothing else; a test pins the list.
+- **Fifteen CPU columns and twelve next-row masks no constraint read**
+  [measured]: `Gas` (8), `RegAWritten`, `ShiftOp`, the unused limb of five
+  product-chain helpers, and the next row of `Timestamp` and `Pc`. They cost
+  the leaf their samples and nothing else, and formats 35 to 37 drop them
+  (slice 5's 5.10a): 27 samples fewer, 9,020 in the full shape. A test
+  asserts that every sample a chip's mask holds is read.
 
 **Equivalence tests, for every chip of the 25:**
 1. **constraint ≡ gate:** at random assignments to samples, preprocessed
@@ -452,13 +454,18 @@ permutations; 1,091 `h8`; 1,139 QM31 [model].
 
 ## 5. Sizing the leaves
 
-Inner parameters: blowup 4, 44 queries, PoW 20, interaction PoW 8, FRI fold
-step 1, log last-layer degree bound 0 (`proving.md` §4, format 32). The rows
-below were counted at 39 queries over the pre-hardening shape (7,519 columns,
-4,223 constraints). At 44 queries over the hardened shape (8,024 columns,
-5,175 constraints), the kernel leaf comes to **64,824 / 105,417 / 51,172**
-rows [model, `R/count-hardened.log`, at the window kernel's class 1]: still
-within the padded shape, with 712 of `p2`'s rows (1.1%) to spare. The five more queries make a fold about 13% dearer [model]. Rows
+Inner parameters: blowup 4, interaction PoW 8, FRI fold step 1, log
+last-layer degree bound 0; a leaf verifies a segment at 40 queries and PoW 24
+(format 35), and a fold verifies leaves and folds at 44 queries and PoW 20
+(format 32; `proving.md` §4). The rows below were counted at 39 queries over
+the pre-hardening shape (7,519 columns, 4,223 constraints). At 44 queries over
+the hardened shape (8,024 columns, 5,175 constraints) the kernel leaf came to
+64,824 / 105,417 / 51,172 rows, 712 of `p2`'s rows (1.1%) to spare
+[model, `R/count-hardened.log`]. Format 35's segment AIR drops 15 unread
+columns (8,009 in the window kernel's shape), and at 40 queries the kernel
+leaf comes to **59,300 / 102,849 / 46,080** rows [model, `R/count-35.log`, at
+the window kernel's class 1]: 6,236 of `p2`'s rows (9.5%) to spare. The five
+more queries make a fold about 13% dearer than 39 [model]. Rows
 [model]; memory
 and time [projected] at 5.0–10.9 B per extended cell and 51–110M extended
 cells per second, the range of spike 4b's circuit-prover runs and spike 4a's

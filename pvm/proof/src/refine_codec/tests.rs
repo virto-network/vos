@@ -38,7 +38,7 @@ fn poseidon2_hash(byte: u8) -> crate::poseidon2::P2Hash {
     crate::poseidon2::P2Hash([BaseField::from_u32_unchecked(byte as u32); 8])
 }
 
-/// A format-33 proof, on the Blake2s channel.
+/// A format-36 proof, on the Blake2s channel.
 fn proof() -> Proof {
     let (config, stark) = stark_proof(blake2s_hash);
     proof_of(
@@ -254,7 +254,7 @@ fn the_decoder_refuses_reserved_formats_and_channel_mismatches() {
         .filter(|format| format.status != crate::format::Status::Admitted)
         .map(|format| format.number)
         .chain(crate::format::RETIRED)
-        .chain([35])
+        .chain([38])
     {
         let mut reserved = encoded.clone();
         patch_u32(&mut reserved, FIRST_FORMAT_OFFSET, number);

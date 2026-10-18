@@ -224,6 +224,15 @@ pub use transcript::{
 ///        layout as preprocessed regions and proves each page's permission,
 ///        which MemoryChip enforces on every access. Program commitments
 ///        change.
+///   35–37 — the registry's on the segment AIR without the columns and
+///        masks no constraint reads, which retires 31, 33 and 34. CpuChip
+///        drops `Gas` (the AIR proves no gas accounting), `RegAWritten`,
+///        `ShiftOp`, the unused limb of `PartNZTimesIndH`,
+///        `PartNZMsbTimesIndH`, `PartNZMsbLoTimesIndH`, `MemByteActiveMonoH`
+///        and `ValRPartNZTimesIndH`, and the next-row masks of `Timestamp`
+///        and `Pc`: 15 main columns and 27 samples. Segments (35) take 40
+///        queries and 24 bits of PoW; 36 is the legacy Blake2s format, 37
+///        the device format.
 pub const PROOF_FORMAT_VERSION: u32 = crate::format::LEGACY_SEGMENT_NUMBER;
 
 /// Exact number of commitment trees in this generation of the Stwo proof:
@@ -1168,7 +1177,7 @@ pub fn check_pcs_policy(
 
 /// The FRI-shape check every verify path runs before any cryptographic work.
 /// With a policy, its per-field floors, under every format. Without one,
-/// format 33's conjectured-security floor ([`check_min_security`]); every
+/// format 36's conjectured-security floor ([`check_min_security`]); every
 /// other format fixes its parameters, checked with its floors
 /// ([`check_format_security`]) once the proof's shape is known.
 pub fn check_shape_policy(

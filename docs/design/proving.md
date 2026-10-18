@@ -203,6 +203,13 @@ attribution). Its full design is `recursion-air.md`.
   through it the program id, pins them: they are part of the program's
   identity. A write to a readable page, or a touch of an unmapped one,
   cannot be proved.
+- **No gas in the AIR** [decided]. The AIR proves no gas accounting, and
+  an out-of-gas exit is never proven: a proof states the run's steps, and
+  gas stays the meter of the host that runs the kernel. The CPU's `Gas`
+  column, which trace generation filled and no constraint read, is
+  dropped rather than constrained, with the other columns and next-row
+  masks no constraint reads (formats 35 to 37): each cost every leaf its
+  samples.
 - **Unmasked.** Segments never leave the prover role.
 
 ### 3.3 Leaf circuits
@@ -417,20 +424,28 @@ last for decades.**
 
 | proof | target | example | conjectured / proven |
 |---|---|---|---|
-| segment and fold proofs (formats 31, 32) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 44 queries, PoW 20, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 108 / 62 (62.8 for segments, 63 for folds) |
-| device and credential proofs (34, 30; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin | blowup 2 (log 1), 86 queries, PoW 20, plus interaction PoW 8 | 106 / 62 |
+| segment proofs (format 35) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.86) |
+| leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
+| device and credential proofs (37, 30; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin | blowup 2 (log 1), 86 queries, PoW 20, plus interaction PoW 8 | 106 / 62 |
 | the final wrap (28) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 80, 74 as built |
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
-- **The numbers:** 31 to 34 name the hardened segment AIR (33 is the legacy
-  Blake2s segment format the default prover produces). 24 to 27 and 29,
-  which named the segment AIR before its hardening, are retired: refused,
-  and never registered again.
-- **The inner grind:** PoW 20 and interaction PoW 8 cost about 30 ms a
-  proof on 8 threads, against about 2.1 s at 26 and 24 [model]; the five
-  more queries make a fold about 13% dearer [model]. The inner proven count
-  is set by the query term.
+- **The numbers:** 35 to 37 name the segment AIR (36 is the legacy
+  Blake2s segment format the default prover produces). 24 to 27, 29, 31,
+  33 and 34, which named its earlier forms, are retired: refused, and
+  never registered again.
+- **The inner grind:** a segment's PoW 24 costs 0.43 s on average on 8
+  threads (median 0.26 s, 95th percentile 1.44 s), against 0.028 s at 20
+  [measured, 128 grinds each, SIMD]; interaction PoW 8 is negligible.
+  Leaves and folds keep PoW 20, and their 44 queries make a fold about 13%
+  dearer than 39 would [model]. The inner proven count is set by the query
+  term.
+- **Why segments take 40 queries:** a kernel leaf's `p2` rows grow with the
+  segment's width times its queries. At 44 over the window kernel's 8,009
+  columns the leaf needs 64,717 of `p2`'s 65,536 rows; at 40, 59,300, 9.5%
+  to spare [model, `count-35.log`]. PoW 24 keeps the proven count, 62.86
+  against 62.79.
 - **Devices:** 86 is the least query count whose proven count clears 60 by
   2 bits; 84 gave 61.2.
 
@@ -768,30 +783,37 @@ counts as conjectured / proven at the reference shape [model]:
 
 | number | proofs | channel | parameters | floors | counts | status |
 |---|---|---|---|---|---|---|
-| 31 | segments | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 62 | admitted |
+| 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 | admitted |
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
-| 33 | segments, legacy encodings | Blake2s | the proof's own, at least 96 conjectured bits (MOBILE: 2, 38, 20, 1, 0, none) | 96 / — | 96 / 57 | admitted |
-| 34 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
+| 36 | segments, legacy encodings | Blake2s | the proof's own, at least 96 conjectured bits (MOBILE: 2, 38, 20, 1, 0, none) | 96 / — | 96 / 57 | admitted |
+| 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 | 28 | the final wrap, masked | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 74 as built | reserved |
 | 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 
 - **Each entry** holds its channel, its encodings, its parameters, the DEEP
   batching its proven floor assumes and both bit counts.
-- **31, 32 and 34 use A.3's encodings** and exactly their parameters, as
+- **32, 35 and 37 use A.3's encodings** and exactly their parameters, as
   do 28 and 30.
-- **33 is the legacy segment format** the default prover produces, kept
+- **35 takes fewer queries and more PoW than 32** (40 and 24 bits against
+  44 and 20): a kernel leaf's rows grow with the segment's width times its
+  queries, and a fold verifies under half the recursion AIR's shape. The
+  proven count is the query term's either way, 62.86 against 62.79.
+- **36 is the legacy segment format** the default prover produces, kept
   while the refine bundles and chain proofs use it: no interaction PoW,
   the boundary states mixed a word at a time, and the proof's own
   parameters under the 96-bit conjectured floor.
-- **31 to 34 name the hardened segment AIR;** 28, 30 and 32 prove the
+- **35 to 37 name the segment AIR,** hardened and without the columns and
+  next-row masks no constraint reads (§3.2); 28, 30 and 32 prove the
   recursion AIR, 32's leaves verifying the segment AIR. A reserved entry is
   refused until its AIR and channel exist, and 28 until affine batching
   does. 32's exist from slice 5's 5.8: `vos-recair` proves and verifies its
   proofs natively, and the registry the segment verifiers read refuses it
   until the leaf pins its padded shape.
-- **24 to 27 and 29 are retired.** They named the segment AIR before its
-  hardening, so they are refused and never registered again: a number
-  names one AIR.
+- **24 to 27, 29, 31, 33 and 34 are retired.** 24 to 27 and 29 named the
+  segment AIR before its hardening, and 31, 33 and 34 the hardened AIR
+  with its unread columns (31 at 44 queries), so they are refused and
+  never registered again: a number names one AIR and one set of
+  parameters.
 
 **A.5 What may leave the prover role (slice 6):**
 - the `Statement`;

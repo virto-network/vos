@@ -53,8 +53,8 @@ fn proved(format: &'static Format) -> &'static (Proof, SideNote) {
     static LEGACY: OnceLock<(Proof, SideNote)> = OnceLock::new();
     static SEGMENT: OnceLock<(Proof, SideNote)> = OnceLock::new();
     let cell = match format.number {
-        33 => &LEGACY,
-        31 => &SEGMENT,
+        36 => &LEGACY,
+        35 => &SEGMENT,
         number => panic!("format {number} is not proved here"),
     };
     cell.get_or_init(|| {
@@ -138,7 +138,7 @@ fn a_proof_under_one_format_is_refused_under_another() {
             relabelled.format_version = number;
             refused_both(relabelled, side_note, "retired");
         }
-        for number in [23, 35] {
+        for number in [23, 38] {
             let mut relabelled = proof.clone();
             relabelled.format_version = number;
             refused_both(relabelled, side_note, "not registered");
@@ -146,8 +146,8 @@ fn a_proof_under_one_format_is_refused_under_another() {
     }
 }
 
-/// The interaction PoW is checked: a format-31 proof with a nonce its
-/// channel does not accept is refused, and a format-33 proof, which has
+/// The interaction PoW is checked: a format-35 proof with a nonce its
+/// channel does not accept is refused, and a format-36 proof, which has
 /// none, is refused with a nonce.
 #[test]
 fn the_interaction_pow_is_checked() {
@@ -203,7 +203,7 @@ fn transcript_before_interaction_pow(proof: &Proof) -> Poseidon2M31Channel {
     channel
 }
 
-/// A proof below a floor is refused: less PoW than format 31's conjectured
+/// A proof below a floor is refused: less PoW than format 35's conjectured
 /// floor allows, or than its proven floor allows; and, at its floors,
 /// parameters other than the format's.
 #[test]
@@ -216,19 +216,19 @@ fn a_proof_below_a_floor_is_refused() {
         changed
     };
     refused_both(
-        with_pow(11),
+        with_pow(19),
         side_note,
-        "99 conjectured bits, below format 31's floor of 100",
+        "99 conjectured bits, below format 35's floor of 100",
     );
     refused_both(
-        with_pow(15),
+        with_pow(20),
         side_note,
-        "proven bits, below format 31's floor of 60",
+        "proven bits, below format 35's floor of 60",
     );
-    refused_both(with_pow(21), side_note, "differ from format 31");
+    refused_both(with_pow(25), side_note, "differ from format 35");
 }
 
-/// A policy pins every format's shape: a format-31 proof, at blowup 4, is
+/// A policy pins every format's shape: a format-35 proof, at blowup 4, is
 /// refused under STANDARD's floor of blowup 16, with and without the side
 /// note, and verifies under MOBILE's.
 #[test]
@@ -266,8 +266,8 @@ fn a_policy_pins_every_formats_shape() {
         .expect("verifies");
 }
 
-/// The counts of a real proof, at its own shape, clear format 31's floors;
-/// format 33's carry its conjectured 96.
+/// The counts of a real proof, at its own shape, clear format 35's floors;
+/// format 36's carry its conjectured 96.
 #[test]
 fn the_bit_counts_are_counted_at_the_proofs_shape() {
     let segment = proof_security_bits(&proved(&format::SEGMENT).0).unwrap();
@@ -276,7 +276,7 @@ fn the_bit_counts_are_counted_at_the_proofs_shape() {
         (segment, legacy),
         (
             SecurityBits {
-                conjectured: 108,
+                conjectured: 104,
                 proven: 63,
             },
             SecurityBits {
@@ -288,7 +288,7 @@ fn the_bit_counts_are_counted_at_the_proofs_shape() {
     assert!(segment.proven >= format::SEGMENT.floor.proven);
 }
 
-/// A full canonical segment proves under format 31 and verifies; a main
+/// A full canonical segment proves under format 35 and verifies; a main
 /// root with one limb changed is refused, and a non-canonical limb is
 /// refused without a panic.
 #[test]

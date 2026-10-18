@@ -521,7 +521,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
             0
         };
         trace.fill_columns(row, shift_amount, Column::ShiftAmount);
-        trace.fill_columns(row, flags.shift_op, Column::ShiftOp);
         // IsShiftConstrained covers all four rotate variants.  val_d
         // gets rewritten to a power of two; the val_d-vs-RegValD
         // cross-constraint then skips equality on those rows.
@@ -545,8 +544,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
 
         // ── Flags ──
         trace.fill_columns(row, false, Column::IsPadding);
-        trace.fill_columns(row, step.reg_write.is_some(), Column::RegAWritten);
-        trace.fill_columns(row, step.gas_after, Column::Gas);
         trace.fill_columns(row, flags.is_add, Column::IsAdd);
         trace.fill_columns(row, flags.is_sub, Column::IsSub);
         trace.fill_columns(row, flags.is_mul, Column::IsMul);
@@ -1229,7 +1226,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
             // this loop.  Reuse the locals from that fill.
             let mut indicator = [BaseField::from(0u32); 8];
             let mut ind_minus1 = [BaseField::from(0u32); 8];
-            let mut part_nz_times_ind = [BaseField::from(0u32); 8];
+            let mut part_nz_times_ind = [BaseField::from(0u32); 7];
             for i in 0..WORD_SIZE {
                 let vd_i = BaseField::from(val_d_bytes[i] as u32);
                 indicator[i] = vd_i * val_d_byte_inv[i];
@@ -1241,7 +1238,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
                 if i >= 1 {
                     // PartialNZ[i-1] · ByteIndicator[i].
                     let pnz_prev = BaseField::from(val_d_partial_nz[i - 1] as u32);
-                    part_nz_times_ind[i] = pnz_prev * indicator[i];
+                    part_nz_times_ind[i - 1] = pnz_prev * indicator[i];
                 }
             }
             trace.fill_columns_base_field(row, &indicator, Column::ValDByteIndicatorH);
@@ -1299,13 +1296,13 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
                 running_msb_lo |= nz;
                 pnz_msb_lo[i] = running_msb_lo;
             }
-            let mut pnz_msb_times_ind = [BaseField::from(0u32); 8];
+            let mut pnz_msb_times_ind = [BaseField::from(0u32); 7];
             for i in 0..7 {
                 let pnz_next = BaseField::from(pnz_msb[i + 1] as u32);
                 pnz_msb_times_ind[i] = pnz_next * indicator[i];
             }
             trace.fill_columns_base_field(row, &pnz_msb_times_ind, Column::PartNZMsbTimesIndH);
-            let mut pnz_msb_lo_times_ind = [BaseField::from(0u32); 4];
+            let mut pnz_msb_lo_times_ind = [BaseField::from(0u32); 3];
             for i in 0..3 {
                 let pnz_next = BaseField::from(pnz_msb_lo[i + 1] as u32);
                 pnz_msb_lo_times_ind[i] = pnz_next * indicator[i];
@@ -1414,8 +1411,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
             trace.fill_columns(row, is_branch_b && bt, Column::IsBranchTakenH);
 
             // ── Memory monotonicity helper ──
-            let zeros8 = [0u8; 8];
-            trace.fill_columns_bytes(row, &zeros8, Column::MemByteActiveMonoH);
+            trace.fill_columns_bytes(row, &[0u8; 7], Column::MemByteActiveMonoH);
         }
 
         // Raw register value behind ValB + IsTruncated flag.
@@ -1580,13 +1576,13 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
         // div_remainder (the local array), so use that as the source —
         // the constraint reads `div_remainder_top[i]·val_r_byte_inv_top[i]`.
         let mut vr_indicator = [BaseField::from(0u32); 8];
-        let mut vr_part_nz_times_ind = [BaseField::from(0u32); 8];
+        let mut vr_part_nz_times_ind = [BaseField::from(0u32); 7];
         for i in 0..8 {
             let vr_i = BaseField::from(div_remainder[i] as u32);
             vr_indicator[i] = vr_i * val_r_byte_inv[i];
             if i >= 1 {
                 let pnz_prev = BaseField::from(val_r_partial_nz[i - 1] as u32);
-                vr_part_nz_times_ind[i] = pnz_prev * vr_indicator[i];
+                vr_part_nz_times_ind[i - 1] = pnz_prev * vr_indicator[i];
             }
         }
         trace.fill_columns_base_field(row, &vr_indicator, Column::ValRByteIndicatorH);

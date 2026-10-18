@@ -423,25 +423,10 @@ fn each_chips_combination_is_the_verifiers_at_random_points() {
     }
 }
 
-/// The samples no constraint reads, `(chip, column, offset)` of the main
-/// trace: the CPU's timestamp and pc are masked at the next row, which no
-/// constraint reads, and sixteen of its columns no constraint reads at all
-/// (`Gas`, `RegAWritten`, `ShiftOp`, and one limb each of
-/// `PartNZTimesIndH`, `PartNZMsbTimesIndH`, `PartNZMsbLoTimesIndH`,
-/// `MemByteActiveMonoH` and `ValRPartNZTimesIndH`). Each still costs the
-/// verifier its samples; a change of the list is seen here.
-fn unread() -> Vec<(usize, usize, isize)> {
-    let next_row = (0..12).map(|column| (chip_idx::CPU, column, 1));
-    let never = [
-        57, 58, 59, 60, 61, 62, 63, 64, 65, 96, 485, 505, 509, 530, 573,
-    ]
-    .map(|column| (chip_idx::CPU, column, 0));
-    next_row.chain(never).collect()
-}
-
 /// At random points, every input a chip reads moves its combination: no
-/// read column is lost in compiling. The samples a chip's mask holds and no
-/// constraint reads are [`unread`]'s.
+/// read column is lost in compiling. Every sample a chip's mask holds is
+/// read: the AIR carries no column, and no next-row mask, that no
+/// constraint reads, each of which would cost every leaf its samples.
 #[test]
 fn every_sample_a_chip_reads_moves_its_combination() {
     let chips = chips();
@@ -480,31 +465,56 @@ fn every_sample_a_chip_reads_moves_its_combination() {
             }
         }
     }
-    assert_eq!(never_read, unread());
+    assert!(
+        never_read.is_empty(),
+        "samples no constraint reads, (chip, column, offset): {never_read:?}"
+    );
 }
 
-/// A flipped coefficient and a dropped term, each in rows across every
-/// chip: tests 1 and 2 refuse every one.
+/// Mis-compiled gates, in rows across every chip: a flipped coefficient, a
+/// dropped term, `a` and `b` swapped where their coefficients differ, an
+/// operand re-pointed to its neighbouring input, and a relation's `z` and
+/// `α` swapped throughout. Tests 1 and 2 refuse every one, the first
+/// mutation of each kind on a chip through a `Context`.
 #[test]
 fn a_miscompiled_gate_fails_both_equivalence_tests_on_every_chip() {
     let chips = chips();
     let mut rng = Rng::new(13);
+    let mut kinds = [0usize; 5];
     for (chip, (recording, compiled)) in chips.chips.iter().enumerate() {
         let point = random_point(recording, &mut rng, false);
         let coeff = rng.qm31();
         let recorded = recorded(recording, &point, &chips.relations);
         let native = native(recording, &point, coeff, &drive_chip(chip, &chips.lookup));
         let inputs = input_values(compiled, std::slice::from_ref(&point), &chips.relations);
-        let gates: Vec<usize> = (0..compiled.rows.len())
-            .filter(|&r| matches!(compiled.rows[r], Row::Gate { .. }))
-            .collect();
-        let picks = gates.len().min(6);
-        for pick in 0..picks {
-            let r = if gates.len() <= 6 {
-                gates[pick]
+        let refused = |wrong: &Compiled, through_context: bool, what: &str| {
+            let values = if through_context {
+                emitted(wrong, &inputs).remove(0)
             } else {
-                gates[rng.below(gates.len())]
+                wrong.evaluate(&inputs).remove(0)
             };
+            assert_ne!(values, recorded, "{}: {what} passes test 1", recording.name);
+            assert_ne!(
+                compose_values(None, coeff, &values).unwrap(),
+                native,
+                "{}: {what} passes test 2",
+                recording.name
+            );
+        };
+        // Up to six of the rows `admits`, every one if there are no more.
+        let mut picks = |admits: &dyn Fn(&Row) -> bool| -> Vec<usize> {
+            let rows: Vec<usize> = (0..compiled.rows.len())
+                .filter(|&r| admits(&compiled.rows[r]))
+                .collect();
+            if rows.len() <= 6 {
+                rows
+            } else {
+                (0..6).map(|_| rows[rng.below(rows.len())]).collect()
+            }
+        };
+
+        let gates = picks(&|row| matches!(row, Row::Gate { .. }));
+        for (pick, &r) in gates.iter().enumerate() {
             for flip in [true, false] {
                 let mut wrong = compiled.clone();
                 let Row::Gate { op, .. } = &mut wrong.rows[r] else {
@@ -519,25 +529,76 @@ fn a_miscompiled_gate_fails_both_equivalence_tests_on_every_chip() {
                 } else {
                     BaseField::zero()
                 };
-                let values = if pick == 0 {
-                    emitted(&wrong, &inputs).remove(0)
-                } else {
-                    wrong.evaluate(&inputs).remove(0)
-                };
-                assert_ne!(
-                    values, recorded,
-                    "{}: row {r} mis-compiled (flip {flip}) passes test 1",
-                    recording.name
-                );
-                assert_ne!(
-                    compose_values(None, coeff, &values).unwrap(),
-                    native,
-                    "{}: row {r} mis-compiled (flip {flip}) passes test 2",
-                    recording.name
-                );
+                refused(&wrong, pick == 0, &format!("row {r} (flip {flip})"));
+                kinds[usize::from(!flip)] += 1;
             }
         }
+
+        let swappable = picks(&|row| {
+            matches!(row, Row::Gate { op, operands: [Some(a), Some(b), _] }
+                if op.k_a != op.k_b && a != b)
+        });
+        for (pick, &r) in swappable.iter().enumerate() {
+            let mut wrong = compiled.clone();
+            let Row::Gate { operands, .. } = &mut wrong.rows[r] else {
+                unreachable!()
+            };
+            operands.swap(0, 1);
+            refused(&wrong, pick == 0, &format!("row {r} with a and b swapped"));
+            kinds[2] += 1;
+        }
+
+        let reading = picks(&|row| {
+            matches!(row, Row::Gate { operands, .. }
+                if operands.iter().any(|o| matches!(o, Some(Operand::Input(_)))))
+        });
+        for (pick, &r) in reading.iter().enumerate() {
+            let mut wrong = compiled.clone();
+            let Row::Gate { operands, .. } = &mut wrong.rows[r] else {
+                unreachable!()
+            };
+            let operand = operands
+                .iter_mut()
+                .find_map(|o| match o {
+                    Some(Operand::Input(i)) => Some(i),
+                    _ => None,
+                })
+                .unwrap();
+            *operand = if *operand + 1 < compiled.inputs.len() {
+                *operand + 1
+            } else {
+                *operand - 1
+            };
+            refused(&wrong, pick == 0, &format!("row {r} re-pointed"));
+            kinds[3] += 1;
+        }
+
+        let index = |input: compile::Input| compiled.inputs.iter().position(|&i| i == input);
+        let pair = (0..compiled.relations.len()).find_map(|relation| {
+            Some((
+                index(compile::Input::Z(relation))?,
+                index(compile::Input::Alpha(relation))?,
+            ))
+        });
+        if let Some((z, alpha)) = pair {
+            let swap = |operand: &mut Operand| match operand {
+                Operand::Input(i) if *i == z => *i = alpha,
+                Operand::Input(i) if *i == alpha => *i = z,
+                _ => {}
+            };
+            let mut wrong = compiled.clone();
+            for row in &mut wrong.rows {
+                match row {
+                    Row::Gate { operands, .. } => operands.iter_mut().flatten().for_each(swap),
+                    Row::Inverse(operand) => swap(operand),
+                }
+            }
+            refused(&wrong, true, "z and α swapped");
+            kinds[4] += 1;
+        }
     }
+    eprintln!("mutations: flipped, dropped, swapped, re-pointed, z and α: {kinds:?}");
+    assert!(kinds.iter().all(|&n| n > 0), "{kinds:?}");
 }
 
 #[test]
@@ -837,9 +898,9 @@ fn check_real(proof: &Proof) {
 fn the_fixtures_composition_is_compiled() {
     let bytes = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/../fixtures/segment-31.proof"
+        "/../fixtures/segment-35.proof"
     ))
-    .expect("the format-31 fixture");
+    .expect("the format-35 fixture");
     let proof: Proof = postcard::from_bytes(&bytes).expect("a proof");
     check_real(&proof);
 }

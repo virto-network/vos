@@ -1,4 +1,4 @@
-//! The recursion seams on a format-31 proof: the recorded transcript, the
+//! The recursion seams on a format-35 proof: the recorded transcript, the
 //! step-by-step extraction and the OODS reconstruction replay the same
 //! verifier transcript.
 
@@ -42,12 +42,12 @@ fn side_note() -> SideNote {
 }
 
 #[test]
-fn the_seams_replay_one_transcript_on_a_format_31_proof() {
+fn the_seams_replay_one_transcript_on_a_format_35_proof() {
     let mut side_note = side_note();
     let proof = prove_format(&mut side_note, &SEGMENT).expect("proves");
     let stark = proof.stark_proof.clone();
     let vos_pvm_proof::StarkProofAny::Poseidon2M31(stark) = stark else {
-        panic!("format 31 proves on the Poseidon2-M31 channel");
+        panic!("format 35 proves on the Poseidon2-M31 channel");
     };
 
     let recorded = record_canonical_transcript(&proof);

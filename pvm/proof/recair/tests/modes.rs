@@ -444,7 +444,7 @@ fn a_tampered_proof_is_refused() {
         ),
         (
             "the format",
-            Box::new(|proof| proof.format_version = 31),
+            Box::new(|proof| proof.format_version = 35),
             "not the recursion AIR's",
         ),
     ];

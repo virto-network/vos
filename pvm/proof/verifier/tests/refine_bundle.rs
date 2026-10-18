@@ -15,7 +15,7 @@ use vos_pvm_proof_verifier::{
     verify_refine_bundle_authenticated,
 };
 
-/// The Blake2s Stark proof of a format-33 proof.
+/// The Blake2s Stark proof of a format-36 proof.
 fn stark(proof: &mut Proof) -> &mut StarkProof<Blake2sMerkleHasher> {
     Blake2sMerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Blake2s proof")
 }
@@ -240,38 +240,21 @@ fn nested_bundle_verifies_only_with_replay_and_rejects_hostile_edits() {
     // honest admitted bundle before applying any hostile edits below.
     let trusted_programs = TrustedPrograms::from_bundle(&bundle);
 
-    // A valid proof for the exact same outer program and AIR/PCS shape, but
-    // a different initial gas budget, cannot be substituted for this
-    // execution. This is deliberately a same-program proof substitution:
-    // only exact deterministic replay distinguishes the witnesses.
+    // The AIR states no gas: the same run under a different initial gas
+    // budget proves to the same child proof, so the proof cannot tell the
+    // two budgets apart. The bundle binds the budget instead, through its
+    // gas limit and the exact replay (`arguments/gas`, below).
     let alternate_bundle = prove_refine(trace_refine(&outer, &arguments, gas + 1).unwrap())
         .expect("prove alternate Refine closure");
     assert_eq!(
-        bundle.slices[0].proof.component_mask,
-        alternate_bundle.slices[0].proof.component_mask
+        postcard::to_allocvec(&bundle.slices[0].proof).unwrap(),
+        postcard::to_allocvec(&alternate_bundle.slices[0].proof).unwrap(),
+        "a child proof does not depend on the gas budget"
     );
-    assert_eq!(
-        bundle.slices[0].proof.log_sizes,
-        alternate_bundle.slices[0].proof.log_sizes
-    );
+    assert_ne!(bundle.gas_limit, alternate_bundle.gas_limit);
     assert_ne!(
-        bundle.slices[0].proof.stark_proof.commitment(1).unwrap(),
-        alternate_bundle.slices[0]
-            .proof
-            .stark_proof
-            .commitment(1)
-            .unwrap(),
-        "different gas witnesses must produce different main-trace commitments"
-    );
-    let mut substituted_execution = bundle.clone();
-    substituted_execution.slices[0].proof = alternate_bundle.slices[0].proof.clone();
-    reseal(&mut substituted_execution);
-    assert_replay_mismatch(
-        &substituted_execution,
-        &outer,
-        &arguments,
-        gas,
-        "child proof does not bind exact replay trace",
+        bundle.transcript_commitment,
+        alternate_bundle.transcript_commitment
     );
 
     // The trusted resolver key includes every PCS field. STANDARD, MOBILE,
