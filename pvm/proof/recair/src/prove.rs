@@ -1,13 +1,15 @@
 //! Native proving and verifying of a circuit on the Poseidon2-M31 channel,
 //! under format 32 (`vos_pvm_proof::format::LEAF_FOLD`), the recursion AIR's
-//! format for leaves and folds, at its exact parameters.
+//! format for leaves and folds, at its exact parameters; and proving under
+//! any format of the recursion AIR on its channel ([`prove_on`]), the wrap's
+//! (28) on Blake2b-256, which `vos-final-verifier` verifies.
 //!
 //! **The transcript**, as the prover runs it and the verifier replays it:
 //! 1. the proof's domain, the format and the PCS configuration, then the
 //!    components' log sizes (`vos_pvm_proof::proof::mix_statement_header`);
 //! 2. the preprocessed root, then the main trace's root;
-//! 3. the outputs' values, which the public logup terms read, before any
-//!    challenge is drawn;
+//! 3. the outputs' values, in their addresses' order, which the public logup
+//!    terms read, before any challenge is drawn;
 //! 4. the interaction PoW nonce;
 //! 5. the `Gate` relation's challenges;
 //! 6. the three claimed sums, then the interaction root; then Stwo's
@@ -19,12 +21,13 @@
 
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};
-use stwo::core::channel::Channel;
+use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::proof::StarkProof;
-use stwo::core::proof_of_work::GrindOps;
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::{CommitmentSchemeProver, ComponentProver, ProvingError};
@@ -37,7 +40,7 @@ use vos_pvm_proof::proof::{
     PROOF_COMMITMENT_TREE_COUNT, check_format_security, check_interaction_pow,
     mix_statement_header,
 };
-use vos_recair_air::gate::{FIRST_OUTPUT_ADDRESS, GATE_WIDTH, public_logup_sum, public_terms};
+use vos_recair_air::gate::{GATE_WIDTH, Layout, public_logup_sum};
 use vos_recair_air::{
     Components, GateRelation, LOG_CONSTRAINT_EXPANSION, LogSizes, preprocessed_log_sizes,
 };
@@ -49,17 +52,17 @@ use crate::trace::{self, Evaluations, MainTrace};
 /// The format a recursion AIR proof carries.
 pub const FORMAT: &Format = &LEAF_FOLD;
 
-/// A proof of a circuit's witness.
+/// A proof of a circuit's witness, on the Poseidon2-M31 trees unless said.
 #[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct RecairProof {
+pub struct RecairProof<H: MerkleHasherLifted = P2MerkleHasher> {
     pub format_version: u32,
     /// `p2`, `qm31`, `h8`.
     pub log_sizes: LogSizes,
-    /// The outputs' values, at the addresses from 3.
+    /// The outputs' values, in their addresses' order: a node's from 3.
     pub outputs: Vec<SecureField>,
     pub interaction_pow: u64,
     pub claimed_sums: [SecureField; 3],
-    pub stark_proof: StarkProof<P2MerkleHasher>,
+    pub stark_proof: StarkProof<H>,
 }
 
 /// Why a proof is refused.
@@ -136,20 +139,32 @@ fn twiddle_log_size(log_sizes: &LogSizes, config: &PcsConfig) -> u32 {
 /// The preprocessed tree's root, and the circuit's hash, of a circuit whose
 /// wiring checks.
 pub fn circuit_commitment(circuit: &Circuit) -> Result<(P2Hash, Digest), WiringError> {
+    let root = preprocessed_root_on::<P2MerkleChannel>(FORMAT, circuit)?;
+    Ok((root, circuit_hash_of(&circuit.log_sizes(), &root)))
+}
+
+/// The preprocessed tree's root of a circuit whose wiring checks, committed
+/// on `MC`'s trees under `format`'s blowup.
+pub fn preprocessed_root_on<MC: MerkleChannel>(
+    format: &Format,
+    circuit: &Circuit,
+) -> Result<<MC::H as MerkleHasherLifted>::Hash, WiringError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
     circuit.check_wiring()?;
     let log_sizes = circuit.log_sizes();
-    let config = FORMAT.pcs_config();
+    let config = format.pcs_config();
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(twiddle_log_size(&log_sizes, &config))
             .circle_domain()
             .half_coset,
     );
-    let mut scheme = CommitmentSchemeProver::<SimdBackend, P2MerkleChannel>::new(config, &twiddles);
+    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     let mut builder = scheme.tree_builder();
     builder.extend_evals(preprocessed_evaluations(circuit));
-    builder.commit(&mut Poseidon2M31Channel::default());
-    let root = scheme.roots()[0];
-    Ok((root, circuit_hash_of(&log_sizes, &root)))
+    builder.commit(&mut MC::C::default());
+    Ok(scheme.roots()[0])
 }
 
 fn preprocessed_evaluations(circuit: &Circuit) -> Evaluations {
@@ -173,17 +188,32 @@ pub fn prove_with(
     witness: &Witness<SecureField>,
     tamper: impl FnOnce(&mut MainTrace),
 ) -> Result<RecairProof, ProveError> {
+    prove_on::<P2MerkleChannel>(FORMAT, circuit, witness, tamper)
+}
+
+/// Proves `witness` over `circuit` under `format`, a format of the
+/// recursion AIR, on `MC`, its channel; the main trace passed through
+/// `tamper` before it is committed.
+pub fn prove_on<MC: MerkleChannel>(
+    format: &Format,
+    circuit: &Circuit,
+    witness: &Witness<SecureField>,
+    tamper: impl FnOnce(&mut MainTrace),
+) -> Result<RecairProof<MC::H>, ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
     circuit.check_wiring().map_err(ProveError::Wiring)?;
     let log_sizes = circuit.log_sizes();
-    let config = FORMAT.pcs_config();
+    let config = format.pcs_config();
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(twiddle_log_size(&log_sizes, &config))
             .circle_domain()
             .half_coset,
     );
-    let channel = &mut Poseidon2M31Channel::default();
-    mix_statement_header(channel, FORMAT.number, &config, &log_sizes);
-    let mut scheme = CommitmentSchemeProver::<SimdBackend, P2MerkleChannel>::new(config, &twiddles);
+    let channel = &mut MC::C::default();
+    mix_statement_header(channel, format.number, &config, &log_sizes);
+    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     scheme.set_store_polynomials_coefficients();
 
     let mut builder = scheme.tree_builder();
@@ -200,9 +230,9 @@ pub fn prove_with(
 
     let outputs: Vec<SecureField> = witness.outputs.clone();
     channel.mix_felts(&outputs);
-    let interaction_pow = <SimdBackend as GrindOps<Poseidon2M31Channel>>::grind(
+    let interaction_pow = <SimdBackend as stwo::core::proof_of_work::GrindOps<MC::C>>::grind(
         channel,
-        FORMAT.interaction_pow_bits(),
+        format.interaction_pow_bits(),
     );
     channel.mix_u64(interaction_pow);
     let relation = GateRelation::draw(channel);
@@ -219,11 +249,10 @@ pub fn prove_with(
     let components = Components::new(&relation, &log_sizes, &claimed_sums);
     let provers: [&dyn ComponentProver<SimdBackend>; 3] =
         [&components.p2, &components.qm31, &components.h8];
-    let stark_proof =
-        stwo::prover::prove::<SimdBackend, P2MerkleChannel>(&provers, channel, scheme)
-            .map_err(ProveError::Stwo)?;
+    let stark_proof = stwo::prover::prove::<SimdBackend, MC>(&provers, channel, scheme)
+        .map_err(ProveError::Stwo)?;
     Ok(RecairProof {
-        format_version: FORMAT.number,
+        format_version: format.number,
         log_sizes,
         outputs,
         interaction_pow,
@@ -260,7 +289,7 @@ fn preflight(proof: &RecairProof, format: &Format) -> Result<(), VerifyError> {
             proof.format_version
         )));
     }
-    if stark.config != format.pcs_config() {
+    if format.verifier_config(&stark.config) != format.pcs_config() {
         return Err(VerifyError(format!(
             "proof parameters differ from format {}'s",
             format.number
@@ -342,7 +371,7 @@ pub fn verify(proof: RecairProof, circuit_hash: &Digest) -> Result<(), VerifyErr
     }
 
     // The layout and the security count do not depend on the challenges.
-    let config = stark.config;
+    let config = format.pcs_config();
     let layout = Components::new(&GateRelation::dummy(), &log_sizes, &proof.claimed_sums);
     let trace_log_sizes = committed_log_sizes(&layout, &log_sizes);
     let (protocol, mut shape) = vos_pvm_proof::framework_access::preflight_component_dimensions(
@@ -365,13 +394,12 @@ pub fn verify(proof: RecairProof, circuit_hash: &Digest) -> Result<(), VerifyErr
     channel.mix_felts(&proof.claimed_sums);
     scheme.commit(stark.commitments[2], &trace_log_sizes[2], channel);
 
-    let outputs = proof
-        .outputs
-        .iter()
-        .enumerate()
-        .map(|(i, &value)| (FIRST_OUTPUT_ADDRESS + i as u32, value));
+    let layout = Layout::node(proof.outputs.len() as u32);
     let total = proof.claimed_sums.iter().copied().sum::<SecureField>()
-        + public_logup_sum(&relation, public_terms(outputs));
+        + public_logup_sum(
+            &relation,
+            layout.public_terms(proof.outputs.iter().copied()),
+        );
     if !total.is_zero() {
         return Err(VerifyError(
             "the claimed sums and the public terms do not add to zero".into(),

@@ -31,8 +31,8 @@ required-features = ["pvm-settle"]
 # prover-only) optional + prover-gated, so this `default-features = false` build
 # (no std, no prover, no parallel) does not drag crossbeam-utils + lock_api on
 # the no_std/no-atomics PVM / wasm32 targets.
-stwo = { git = "https://github.com/olanod/stwo", rev = "bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef", default-features = false }
-stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef", default-features = false }
+stwo = { git = "https://github.com/olanod/stwo", rev = "ab294189b34fac653e0a753971c69a0d39d01d16", default-features = false }
+stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "ab294189b34fac653e0a753971c69a0d39d01d16", default-features = false }
 num-traits = { version = "0.2", default-features = false }
 # The Poseidon2-M31 permutation and its modes, shared with the prover.
 vos-pvm-poseidon2 = { path = "../poseidon2" }

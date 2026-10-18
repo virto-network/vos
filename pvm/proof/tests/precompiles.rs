@@ -74,6 +74,7 @@ fn prove_blake2b_precompile() {
         pow_bits: 5,
         fri_config: vos_pvm_proof::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
     let proof =
         vos_pvm_proof::prove_with_config(&mut side_note, config).expect("blake2b proving failed");
@@ -119,6 +120,7 @@ fn prove_vos_halt_jump_without_a_program_jump_table() {
         pow_bits: 5,
         fri_config: vos_pvm_proof::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
     let proof = vos_pvm_proof::prove_with_config(&mut side_note, config)
         .expect("the terminal halt jump must prove");
@@ -227,6 +229,7 @@ fn prove_blake2b_via_ecall() {
         pow_bits: 5,
         fri_config: vos_pvm_proof::FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
     let proof = vos_pvm_proof::prove_with_config(&mut side_note, config).expect("proving failed");
     // Test config uses pow_bits=5 / fri_log_blowup=0, well below the

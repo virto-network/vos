@@ -89,6 +89,89 @@ pub const FIRST_OUTPUT_ADDRESS: u32 = 3;
 /// `u`, the QM31 generator over CM31: `(0, 0, 1, 0)`.
 pub const U_VALUE: SecureField = SecureField::from_u32_unchecked(0, 0, 1, 0);
 
+/// Where a circuit's reserved wires sit: zero, one and `u` at three
+/// consecutive addresses, and its outputs at consecutive addresses.
+///
+/// - **A node** (a leaf or a fold, [`Layout::node`]): zero, one and `u` at
+///   [`ZERO_ADDRESS`]..=[`U_ADDRESS`], its outputs from
+///   [`FIRST_OUTPUT_ADDRESS`].
+/// - **The wrap** ([`Layout::wrap`]): its public words at addresses from 0,
+///   one word a wire, then zero, one and `u` (`proving.md` A.3).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Layout {
+    /// The zero wire's address; one and `u` follow it.
+    pub zero: u32,
+    /// The first output's address; the others follow it.
+    pub first_output: u32,
+    pub n_outputs: u32,
+}
+
+impl Layout {
+    /// A node's: zero, one and `u` at 0–2, `n_outputs` outputs from 3.
+    pub const fn node(n_outputs: u32) -> Self {
+        Self {
+            zero: ZERO_ADDRESS,
+            first_output: FIRST_OUTPUT_ADDRESS,
+            n_outputs,
+        }
+    }
+
+    /// The wrap's: `n_outputs` outputs from 0, then zero, one and `u`.
+    pub const fn wrap(n_outputs: u32) -> Self {
+        Self {
+            zero: n_outputs,
+            first_output: 0,
+            n_outputs,
+        }
+    }
+
+    pub const fn one(&self) -> u32 {
+        self.zero + 1
+    }
+
+    pub const fn u(&self) -> u32 {
+        self.zero + 2
+    }
+
+    /// Output `i`'s address.
+    pub const fn output(&self, i: u32) -> u32 {
+        self.first_output + i
+    }
+
+    /// The first address past the reserved wires, the first a builder's own
+    /// wire takes, `None` on overflow.
+    pub const fn end(&self) -> Option<u32> {
+        let constants = self.zero.checked_add(3);
+        let outputs = self.first_output.checked_add(self.n_outputs);
+        match (constants, outputs) {
+            (Some(a), Some(b)) => Some(if a > b { a } else { b }),
+            _ => None,
+        }
+    }
+
+    /// The public terms a verifier adds, one use each: `u`, then each
+    /// output's value at its address.
+    pub fn public_terms(
+        &self,
+        outputs: impl IntoIterator<Item = SecureField>,
+    ) -> impl Iterator<Item = PublicTerm> {
+        let layout = *self;
+        core::iter::once(PublicTerm {
+            address: layout.u(),
+            value: U_VALUE,
+        })
+        .chain(
+            outputs
+                .into_iter()
+                .zip(0..)
+                .map(move |(value, i)| PublicTerm {
+                    address: layout.output(i),
+                    value,
+                }),
+        )
+    }
+}
+
 /// The `Gate` relation's challenges.
 #[derive(Clone, Debug, PartialEq)]
 pub struct GateRelation(pub LookupElements<GATE_WIDTH>);
@@ -131,22 +214,6 @@ impl<F: Clone, EF: RelationEFTraitBound<F>> Relation<F, EF> for GateRelation {
 pub struct PublicTerm {
     pub address: u32,
     pub value: SecureField,
-}
-
-/// The public terms a verifier adds, one use each: `u`, then the outputs at
-/// their addresses.
-pub fn public_terms(
-    outputs: impl IntoIterator<Item = (u32, SecureField)>,
-) -> impl Iterator<Item = PublicTerm> {
-    core::iter::once(PublicTerm {
-        address: U_ADDRESS,
-        value: U_VALUE,
-    })
-    .chain(
-        outputs
-            .into_iter()
-            .map(|(address, value)| PublicTerm { address, value }),
-    )
 }
 
 /// The sum of the public terms' fractions, each a use (`+1`). The components'

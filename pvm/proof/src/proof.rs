@@ -384,7 +384,7 @@ pub(crate) fn public_io_hash_from_registers(registers: &[u64; 13]) -> [u8; 32] {
 /// The admitted format a proof names, with its Stwo proof in that format's
 /// channel.
 pub fn proof_format(proof: &Proof) -> Result<&'static Format, alloc::string::String> {
-    let format = crate::format::admitted(proof.format_version)?;
+    let format = crate::format::admitted_segment(proof.format_version)?;
     if proof.stark_proof.channel() != format.channel {
         return Err(alloc::format!(
             "proof format {} runs on the {:?} channel, but its Stark proof is on {:?}",

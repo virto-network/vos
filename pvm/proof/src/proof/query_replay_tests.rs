@@ -143,6 +143,7 @@ where
         pow_bits: 4,
         fri_config: FriConfig::new(0, 1, 40, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(LOG_N_ROWS + 1 + config.fri_config.log_blowup_factor)
@@ -247,6 +248,7 @@ where
         pow_bits: 4,
         fri_config: FriConfig::new(0, 1, 40, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
     let twiddles = SimdBackend::precompute_twiddles(
         CanonicCoset::new(SQUARE_LOG_N_ROWS + 1 + config.fri_config.log_blowup_factor)

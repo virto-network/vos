@@ -54,6 +54,7 @@ fn harness_smoke_bound1_only() {
         pow_bits: 5,
         fri_config: FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
 
     let proof = prove_with_explicit_components(&mut side_note, config, BOUND1_HARNESS_COMPONENTS)
@@ -134,6 +135,7 @@ fn harness_blake2b_isolated() {
         pow_bits: 5,
         fri_config: FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
 
     let components: &[&'static dyn MachineProverComponent] = &[&chips::Blake2bChip];
@@ -202,6 +204,7 @@ fn harness_blake2b_boundary_isolated() {
         pow_bits: 5,
         fri_config: FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
 
     let components: &[&'static dyn MachineProverComponent] = &[&chips::Blake2bBoundaryChip];
@@ -282,6 +285,7 @@ fn harness_cpuchip_isolated_add64() {
         pow_bits: 5,
         fri_config: FriConfig::new(0, 1, 3, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
 
     // Just CpuChip — if its flatten is OK, prove succeeds and verify

@@ -267,7 +267,9 @@ where
         .iter()
         .map(|component| &**component)
         .collect();
-    let config = proof.pcs_config;
+    // The proof's parameters with its format's DEEP batching, which a proof
+    // does not carry.
+    let config = format.verifier_config(&proof.pcs_config);
     let stark = MC::stark(&proof.stark_proof).ok_or_else(|| {
         VerificationError::InvalidStructure("Stark proof channel differs".to_string())
     })?;

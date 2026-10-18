@@ -97,6 +97,7 @@ fn stark_proof<H: MerkleHasherLifted>(hash: impl Fn(u8) -> H::Hash) -> (PcsConfi
             fold_step: 1,
         },
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
     let commitments = TreeVec::new((1..=4).map(&hash).collect());
     let sampled_values = TreeVec::new(vec![

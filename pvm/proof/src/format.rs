@@ -7,7 +7,7 @@
 //!
 //! | number | proofs | channel | log blowup, queries, PoW, fold step, last layer, interaction PoW | floors | at its reference shape |
 //! |---|---|---|---|---|---|
-//! | 28 | the final wrap, masked | Blake2b-256 | 6, 20, 26, 3, 6, 8 | 100 / 80 | 146 / 74, short without affine batching |
+//! | 28 | the final wrap | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
 //! | 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
 //! | 32 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
 //! | 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 |
@@ -29,12 +29,14 @@
 //!   word at a time, and its parameters are the proof's own under the 96-bit
 //!   conjectured floor.
 //! - **28, 30, 32, 35 and 37** use the lossless encodings
-//!   ([`Encoding::Lossless`]) and exactly their parameters. 28, 30, 32 and 37
-//!   are registered and refused until their AIRs and channels exist; the
-//!   wrap's fold step 3 is refused until it is reviewed. 32's AIR and channel
-//!   exist: `vos-recair` proves and verifies its proofs natively, pinning
-//!   each circuit by its hash. This registry, which the segment verifiers
-//!   read, refuses it until the leaf pins its padded shape.
+//!   ([`Encoding::Lossless`]) and exactly their parameters. 30, 32 and 37 are
+//!   registered and refused until their AIRs and channels exist. 32's AIR and
+//!   channel exist: `vos-recair` proves and verifies its proofs natively,
+//!   pinning each circuit by its hash, and this registry refuses it, as no
+//!   verifier outside the recursion reads a leaf or a fold. 28 is admitted:
+//!   `vos-recair` proves the wrap on the fork's Blake2b-256 channel and
+//!   `vos-final-verifier` verifies it, fold step 3 reviewed in the fork. A
+//!   segment verifier takes only a segment format ([`admitted_segment`]).
 //! - **The inner formats** grind 8 bits of interaction PoW. Segments (35)
 //!   take 40 queries and 24 bits of PoW: 62.86 proven bits, the query term
 //!   binding, and 104 conjectured. A kernel leaf's rows grow with the
@@ -51,9 +53,13 @@
 //!   The ways to 80 are affine batching at blowup 64 and 19–20 queries (about
 //!   1.06× the verifier's cost, a change to the fork for this format only), a
 //!   6-bit PoW in the batching phase at blowup 64 and 20 queries (about
-//!   1.11×), or blowup 8 with 41 queries (about 1.97×). The entry carries the
-//!   affine plan's parameters; [`crate::security`] counts what is built and
-//!   finds 74.
+//!   1.11×), or blowup 8 with 41 queries (about 1.97×). The fork batches
+//!   affinely when a configuration asks ([`FormatParams::batching`]), and
+//!   [`crate::security`] counts 82.6 at 20 queries (80 needs 19). Batching is
+//!   not in a proof's bytes: a verifier sets it from the format
+//!   ([`Format::verifier_config`]).
+//! - **The wrap is unmasked** until slice 6: `masked` says what its proofs
+//!   are, and masking it is a format change.
 //! - **The bit counts** are [`crate::security`]'s, at each entry's reference
 //!   shape; the verifier counts again at the proof's own shape and refuses a
 //!   proof below either floor.
@@ -94,17 +100,12 @@ pub enum Encoding {
     Lossless,
 }
 
-/// How a format's DEEP quotient batches its sampled values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DeepBatching {
-    /// By powers of one coefficient: Stwo's, what [`crate::security`]
-    /// counts.
-    Powers,
-    /// An independent coefficient a sampled value, whose error loses the
-    /// factor of the values' count. Not built: a format that names it needs
-    /// it for its proven floor.
-    Affine,
-}
+/// How a format's DEEP quotient batches its sampled values: by powers of one
+/// coefficient (Stwo's), or with an independent coefficient a sampled value
+/// (the fork's, `DIVERGENCE-012`), whose error loses the factor of the
+/// values' count. A proof does not carry it: a verifier sets it from the
+/// format ([`Format::verifier_config`]).
+pub use stwo::core::pcs::DeepBatching;
 
 /// Whether a verifier accepts a format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +125,7 @@ pub struct FormatParams {
     pub fold_step: u32,
     pub log_last_layer: u32,
     pub interaction_pow_bits: u32,
+    pub batching: DeepBatching,
 }
 
 impl FormatParams {
@@ -137,11 +139,14 @@ impl FormatParams {
                 fold_step: self.fold_step,
             },
             lifting_log_size: None,
+            deep_batching: self.batching,
         }
     }
 
-    /// The parameters of a proof's own config, with `interaction_pow_bits`.
-    pub fn of(config: &PcsConfig, interaction_pow_bits: u32) -> Self {
+    /// The parameters of a proof's own config, with its format's
+    /// `interaction_pow_bits` and `batching`: a proof's config does not
+    /// carry its batching.
+    pub fn of(config: &PcsConfig, interaction_pow_bits: u32, batching: DeepBatching) -> Self {
         Self {
             log_blowup: config.fri_config.log_blowup_factor,
             n_queries: config.fri_config.n_queries,
@@ -149,6 +154,7 @@ impl FormatParams {
             fold_step: config.fri_config.fold_step,
             log_last_layer: config.fri_config.log_last_layer_degree_bound,
             interaction_pow_bits,
+            batching,
         }
     }
 }
@@ -171,8 +177,6 @@ pub struct Format {
     /// takes the proof's own and records MOBILE's here.
     pub params: FormatParams,
     pub masked: bool,
-    /// The DEEP batching the format's proven floor assumes.
-    pub batching: DeepBatching,
     pub floor: SecurityFloor,
     pub status: Status,
     /// The shape [`Format::bits`] is counted at.
@@ -188,8 +192,19 @@ impl Format {
         matches!(self.encoding, Encoding::Lossless)
     }
 
+    /// The format's configuration, its DEEP batching among it.
     pub const fn pcs_config(&self) -> PcsConfig {
         self.params.pcs_config()
+    }
+
+    /// The configuration a verifier checks a proof under: the proof's own,
+    /// with the format's DEEP batching, which a proof does not carry (its
+    /// deserialized config reads [`DeepBatching::Powers`]).
+    pub const fn verifier_config(&self, proof: &PcsConfig) -> PcsConfig {
+        PcsConfig {
+            deep_batching: self.params.batching,
+            ..*proof
+        }
     }
 
     /// The interaction PoW a proof under this format grinds, 0 for none.
@@ -281,6 +296,7 @@ const SEGMENT_PARAMS: FormatParams = FormatParams {
     fold_step: 1,
     log_last_layer: 0,
     interaction_pow_bits: 8,
+    batching: DeepBatching::Powers,
 };
 
 /// Leaves' and folds': a fold verifies under half the recursion AIR's
@@ -292,6 +308,7 @@ const LEAF_FOLD_PARAMS: FormatParams = FormatParams {
     fold_step: 1,
     log_last_layer: 0,
     interaction_pow_bits: 8,
+    batching: DeepBatching::Powers,
 };
 
 const DEVICE: FormatParams = FormatParams {
@@ -301,6 +318,7 @@ const DEVICE: FormatParams = FormatParams {
     fold_step: 1,
     log_last_layer: 0,
     interaction_pow_bits: 8,
+    batching: DeepBatching::Powers,
 };
 
 const INNER_FLOOR: SecurityFloor = SecurityFloor {
@@ -320,9 +338,9 @@ pub const LEGACY_SEGMENT: Format = Format {
         fold_step: 1,
         log_last_layer: 0,
         interaction_pow_bits: 0,
+        batching: DeepBatching::Powers,
     },
     masked: false,
-    batching: DeepBatching::Powers,
     floor: SecurityFloor {
         conjectured: crate::proof::MIN_CONJECTURED_SECURITY_BITS,
         proven: 0,
@@ -342,7 +360,6 @@ pub const SEGMENT: Format = Format {
     encoding: Encoding::Lossless,
     params: SEGMENT_PARAMS,
     masked: false,
-    batching: DeepBatching::Powers,
     floor: INNER_FLOOR,
     status: Status::Admitted,
     reference: SEGMENT_REFERENCE,
@@ -365,7 +382,6 @@ pub const LEAF_FOLD: Format = Format {
     encoding: Encoding::Lossless,
     params: LEAF_FOLD_PARAMS,
     masked: false,
-    batching: DeepBatching::Powers,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: LEAF_FOLD_REFERENCE,
@@ -387,18 +403,18 @@ pub const WRAP: Format = Format {
         fold_step: 3,
         log_last_layer: 6,
         interaction_pow_bits: 8,
+        batching: DeepBatching::Affine,
     },
-    masked: true,
-    batching: DeepBatching::Affine,
+    masked: false,
     floor: SecurityFloor {
         conjectured: 100,
         proven: 80,
     },
-    status: Status::Reserved,
+    status: Status::Admitted,
     reference: WRAP_REFERENCE,
     bits: SecurityBits {
         conjectured: 146,
-        proven: 74,
+        proven: 82,
     },
 };
 
@@ -409,7 +425,6 @@ pub const DEVICE_PROOF: Format = Format {
     encoding: Encoding::Lossless,
     params: DEVICE,
     masked: true,
-    batching: DeepBatching::Powers,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: DEVICE_REFERENCE,
@@ -426,7 +441,6 @@ pub const CREDENTIAL_PROOF: Format = Format {
     encoding: Encoding::Lossless,
     params: DEVICE,
     masked: true,
-    batching: DeepBatching::Powers,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: CREDENTIAL_REFERENCE,
@@ -472,6 +486,19 @@ pub fn admitted(number: u32) -> Result<&'static Format, alloc::string::String> {
         )),
         None => Err(alloc::format!("proof format {number} is not registered")),
     }
+}
+
+/// The entry for `number`, if it is admitted and names segment proofs: what
+/// a segment verifier accepts.
+pub fn admitted_segment(number: u32) -> Result<&'static Format, alloc::string::String> {
+    let format = admitted(number)?;
+    if format.kind != ProofKind::Segment {
+        return Err(alloc::format!(
+            "proof format {number} ({:?}) does not name segment proofs",
+            format.kind
+        ));
+    }
+    Ok(format)
 }
 
 #[cfg(test)]
@@ -528,8 +555,7 @@ mod tests {
     }
 
     /// The tool's two counts, pinned per format at its reference shape:
-    /// every format clears its floors but the wrap, which needs affine
-    /// batching for its proven count.
+    /// every format clears its floors, the wrap with affine batching.
     #[test]
     fn the_bit_counts_are_pinned_per_format() {
         let pinned: Vec<(u32, u32, u32)> = REGISTRY
@@ -544,7 +570,7 @@ mod tests {
         assert_eq!(
             pinned,
             [
-                (28, 146, 74),
+                (28, 146, 82),
                 (30, 106, 62),
                 (32, 108, 63),
                 (35, 104, 62),
@@ -552,14 +578,7 @@ mod tests {
                 (37, 106, 62),
             ]
         );
-        for format in REGISTRY {
-            assert_eq!(
-                format.meets_floors(),
-                format.batching == DeepBatching::Powers,
-                "format {}",
-                format.number
-            );
-        }
+        assert!(REGISTRY.iter().all(Format::meets_floors));
     }
 
     /// The unrounded counts the parameters were chosen by: the segments'
@@ -587,44 +606,87 @@ mod tests {
         }
     }
 
-    /// The wrap counts 74.7 proven bits at blowup 64 with 18 queries or 20,
-    /// and as many queries as the analysis takes: the batching term of
-    /// powers-of-one-coefficient DEEP binds, and it grows with the blowup. At
-    /// blowup 8 it reaches 80 with 41 queries. The verifier's check says so.
+    /// The wrap counts 82.6 proven bits under affine batching, and needs 19
+    /// queries for its floor of 80. Batched by powers of one coefficient it
+    /// counts 74.7 at blowup 64 with 18 queries or 20, and as many queries
+    /// as the analysis takes: that batching term binds, and it grows with
+    /// the blowup; at blowup 8 it reaches 80 with 41 queries. The verifier's
+    /// check says so.
     #[test]
-    fn the_wrap_falls_short_without_affine_batching() {
-        let proven = |log_blowup, n_queries| {
+    fn the_wrap_needs_affine_batching() {
+        let count = |batching, log_blowup, n_queries| {
             let params = FormatParams {
                 log_blowup,
                 n_queries,
+                batching,
                 ..WRAP.params
             };
             crate::security::proven_count(&params, &WRAP_REFERENCE).unwrap()
         };
-        assert_eq!(WRAP.batching, DeepBatching::Affine);
+        assert_eq!(WRAP.params.batching, DeepBatching::Affine);
+        let affine = count(DeepBatching::Affine, 6, 20);
+        assert!((82.60..82.61).contains(&affine), "{affine}");
+        let least =
+            |batching, log_blowup| (1..=256).find(|&q| count(batching, log_blowup, q) >= 80.0);
+        assert_eq!(least(DeepBatching::Affine, 6), Some(19));
+
         for queries in [18, 20, 256] {
-            let bits = proven(6, queries);
+            let bits = count(DeepBatching::Powers, 6, queries);
             assert!((74.71..74.72).contains(&bits), "{queries} queries: {bits}");
         }
-        let least = |log_blowup| (1..=256).find(|&q| proven(log_blowup, q) >= 80.0);
-        assert_eq!([least(6), least(4), least(3)], [None, None, Some(41)]);
-        let error = crate::proof::check_format_security(&WRAP, &WRAP.pcs_config(), &WRAP_REFERENCE)
-            .unwrap_err();
+        assert_eq!(
+            [6, 4, 3].map(|log_blowup| least(DeepBatching::Powers, log_blowup)),
+            [None, None, Some(41)]
+        );
+        let powers = Format {
+            params: FormatParams {
+                batching: DeepBatching::Powers,
+                ..WRAP.params
+            },
+            ..WRAP
+        };
+        let error =
+            crate::proof::check_format_security(&powers, &powers.pcs_config(), &WRAP_REFERENCE)
+                .unwrap_err();
         assert!(
             error.contains("74 proven bits, below format 28's floor of 80"),
             "{error}"
         );
+        assert_eq!(
+            crate::proof::check_format_security(&WRAP, &WRAP.pcs_config(), &WRAP_REFERENCE),
+            Ok(WRAP.bits)
+        );
     }
 
-    /// Every number names one entry; only 35 and 36 are admitted; the
-    /// retired numbers are refused as retired and name no entry; every other
-    /// number is refused.
+    /// A proof's config does not carry its batching: deserialized, it reads
+    /// powers, and the verifier takes the format's.
+    #[test]
+    fn the_verifier_takes_the_batching_from_the_format() {
+        let carried = PcsConfig {
+            deep_batching: DeepBatching::Powers,
+            ..WRAP.pcs_config()
+        };
+        assert_eq!(WRAP.verifier_config(&carried), WRAP.pcs_config());
+        assert_eq!(WRAP.pcs_config().deep_batching, DeepBatching::Affine);
+        assert!(crate::proof::check_format_security(&WRAP, &carried, &WRAP_REFERENCE).is_ok());
+        for format in [SEGMENT, LEAF_FOLD, LEGACY_SEGMENT] {
+            assert_eq!(format.pcs_config().deep_batching, DeepBatching::Powers);
+        }
+    }
+
+    /// Every number names one entry; only 28, 35 and 36 are admitted, and a
+    /// segment verifier takes 35 and 36 alone; the retired numbers are
+    /// refused as retired and name no entry; every other number is refused.
     #[test]
     fn the_registry_numbers_round_trip() {
         for format in REGISTRY {
             assert_eq!(lookup(format.number), Some(&format));
             assert_eq!(
                 admitted(format.number).is_ok(),
+                [28, 35, 36].contains(&format.number)
+            );
+            assert_eq!(
+                admitted_segment(format.number).is_ok(),
                 [35, 36].contains(&format.number)
             );
             assert!(!RETIRED.contains(&format.number), "{}", format.number);
@@ -691,6 +753,7 @@ mod tests {
             pow_bits: 20,
             fri_config: FriConfig::new(0, 4, 19, 1),
             lifting_log_size: None,
+            deep_batching: Default::default(),
         };
         assert!(check(&LEGACY_SEGMENT, &standard, &SEGMENT_REFERENCE).is_ok());
     }

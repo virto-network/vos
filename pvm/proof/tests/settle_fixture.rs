@@ -42,6 +42,7 @@ fn mobile_config() -> PcsConfig {
         pow_bits: 20,
         fri_config: FriConfig::new(0, 2, 38, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     }
 }
 

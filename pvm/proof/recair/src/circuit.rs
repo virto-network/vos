@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use stwo::core::fields::m31::{BaseField, P};
-use vos_recair_air::gate::{FIRST_OUTPUT_ADDRESS, U_ADDRESS};
+use vos_recair_air::gate::Layout;
 use vos_recair_air::p2::P2Mode;
 
 /// An operand's entry in the `Gate` relation. A multiplicity of zero leaves
@@ -67,14 +67,14 @@ pub struct H8Wiring {
     pub out: Entry,
 }
 
-/// A circuit's wiring, padded to its components' sizes, and its outputs: the
-/// wires at [`FIRST_OUTPUT_ADDRESS`] onwards, with `u` before them.
+/// A circuit's wiring, padded to its components' sizes, and where its
+/// reserved wires sit: its outputs and `u`, the public uses.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Circuit {
     pub p2: Vec<P2Wiring>,
     pub qm31: Vec<Qm31Wiring>,
     pub h8: Vec<H8Wiring>,
-    pub n_outputs: u32,
+    pub layout: Layout,
 }
 
 /// Why a circuit's wiring is refused.
@@ -175,8 +175,9 @@ impl Circuit {
                 .into_iter()
                 .chain([row.out])
         });
-        let public = core::iter::once(U_ADDRESS)
-            .chain((0..self.n_outputs).map(|i| FIRST_OUTPUT_ADDRESS + i))
+        let layout = self.layout;
+        let public = core::iter::once(layout.u())
+            .chain((0..layout.n_outputs).map(move |i| layout.output(i)))
             .map(|address| Entry {
                 address,
                 multiplicity: 1,
@@ -209,9 +210,10 @@ impl Circuit {
         {
             return Err(WiringError::Address(u64::from(row.out_address) + 1));
         }
-        if u64::from(FIRST_OUTPUT_ADDRESS) + u64::from(self.n_outputs) > u64::from(P) {
+        let end = u64::from(self.layout.first_output) + u64::from(self.layout.n_outputs);
+        if end > u64::from(P) || u64::from(self.layout.zero) + 3 > u64::from(P) {
             return Err(WiringError::Address(
-                u64::from(FIRST_OUTPUT_ADDRESS) + u64::from(self.n_outputs),
+                end.max(u64::from(self.layout.zero) + 3),
             ));
         }
 

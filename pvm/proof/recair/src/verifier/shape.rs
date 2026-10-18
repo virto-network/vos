@@ -266,7 +266,7 @@ impl SegmentShape {
                 proof: proof.format_version,
             });
         }
-        if proof.pcs_config != self.config() {
+        if self.stark.format.verifier_config(&proof.pcs_config) != self.config() {
             return Err(ShapeMismatch::Config);
         }
         if proof.component_mask != self.component_mask {

@@ -114,8 +114,9 @@ fn every_admitted_format_round_trips() {
 }
 
 /// A proof is refused under every other number: a registered format the
-/// registry does not admit, the other admitted format (whose channel its
-/// Stark proof is not on), a retired number, and an unregistered one.
+/// registry does not admit, the other admitted segment format (whose channel
+/// its Stark proof is not on), the wrap's (admitted, but not a segment
+/// format), a retired number, and an unregistered one.
 #[test]
 fn a_proof_under_one_format_is_refused_under_another() {
     for format in admitted() {
@@ -126,10 +127,10 @@ fn a_proof_under_one_format_is_refused_under_another() {
         {
             let mut relabelled = proof.clone();
             relabelled.format_version = other.number;
-            let expected = if other.status == format::Status::Admitted {
-                "Stark proof is on"
-            } else {
-                "not admitted"
+            let expected = match (other.status, other.kind) {
+                (format::Status::Admitted, format::ProofKind::Segment) => "Stark proof is on",
+                (format::Status::Admitted, _) => "does not name segment proofs",
+                _ => "not admitted",
             };
             refused_both(relabelled, side_note, expected);
         }

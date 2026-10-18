@@ -449,6 +449,7 @@ fn standalone_verify_rejects_weak_pcs_config() {
         pow_bits: 0,
         fri_config: FriConfig::new(0, 4, 1, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
     let mut side_note = SideNote::new(steps, code, bitmask);
     let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
@@ -488,6 +489,7 @@ fn standalone_verify_accepts_weak_pcs_config_with_relaxed_policy() {
         pow_bits: 0,
         fri_config: FriConfig::new(0, 4, 1, 1),
         lifting_log_size: None,
+        deep_batching: Default::default(),
     };
     let mut side_note = SideNote::new(steps, code, bitmask);
     let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");

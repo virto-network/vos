@@ -149,6 +149,7 @@ mod imp {
             pow_bits: 5,
             fri_config: FriConfig::new(0, 1, 3, 1),
             lifting_log_size: None,
+            deep_batching: Default::default(),
         };
         eprintln!("=== Scale sweep (test security, rough memory estimate) ===");
         eprintln!("  main_cols=286, interaction_cols=~90, constraint_blowup=4");
@@ -184,6 +185,7 @@ mod imp {
             pow_bits,
             fri_config: FriConfig::new(0, log_blowup, n_queries, 1),
             lifting_log_size: None,
+            deep_batching: Default::default(),
         };
         let sec_bits = config.security_bits();
         // Policy mirrors the under-test config so we exercise the algebraic
@@ -256,6 +258,7 @@ mod imp {
                 pow_bits: 20,
                 fri_config: FriConfig::new(0, 4, 19, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
         bench_pcs_config(
@@ -265,6 +268,7 @@ mod imp {
                 pow_bits: 16,
                 fri_config: FriConfig::new(0, 3, 20, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
         bench_pcs_config(
@@ -274,6 +278,7 @@ mod imp {
                 pow_bits: 20,
                 fri_config: FriConfig::new(0, 2, 38, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
         bench_pcs_config(
@@ -283,6 +288,7 @@ mod imp {
                 pow_bits: 20,
                 fri_config: FriConfig::new(0, 1, 76, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
         // pow=32 makes prove ~10x slower (PoW-grind dominates); stwo caps
@@ -302,6 +308,7 @@ mod imp {
                 pow_bits: 20,
                 fri_config: FriConfig::new(0, 2, 38, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
         bench_pcs_config(
@@ -311,6 +318,7 @@ mod imp {
                 pow_bits: 20,
                 fri_config: FriConfig::new(0, 2, 30, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
         bench_pcs_config(
@@ -320,6 +328,7 @@ mod imp {
                 pow_bits: 20,
                 fri_config: FriConfig::new(0, 2, 22, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
         eprintln!("\n(blowup=4 with raised pow_bits — cheaper FRI but PoW grind cost)");
@@ -330,6 +339,7 @@ mod imp {
                 pow_bits: 24,
                 fri_config: FriConfig::new(0, 2, 36, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
     }
@@ -344,6 +354,7 @@ mod imp {
                 pow_bits: 20,
                 fri_config: FriConfig::new(0, 4, 19, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
         bench_pcs_config(
@@ -353,6 +364,7 @@ mod imp {
                 pow_bits: 20,
                 fri_config: FriConfig::new(0, 2, 38, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
         bench_pcs_config(
@@ -362,6 +374,7 @@ mod imp {
                 pow_bits: 20,
                 fri_config: FriConfig::new(0, 1, 76, 1),
                 lifting_log_size: None,
+                deep_batching: Default::default(),
             },
         );
     }

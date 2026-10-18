@@ -11,7 +11,6 @@
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
-use vos_recair_air::gate::{FIRST_OUTPUT_ADDRESS, U_ADDRESS, ZERO_ADDRESS};
 
 use super::{
     Context, Finalized, H8Gate, H8Values, P2Gate, P2Values, Qm31Gate, Role, Slot, State, Var,
@@ -90,9 +89,9 @@ impl<V: Value> Context<V> {
                 uses[address as usize] += 1;
             }
         }
-        uses[U_ADDRESS as usize] += 1;
-        for i in 0..self.n_outputs {
-            uses[(FIRST_OUTPUT_ADDRESS + i) as usize] += 1;
+        uses[self.layout.u() as usize] += 1;
+        for i in 0..self.layout.n_outputs {
+            uses[self.layout.output(i) as usize] += 1;
         }
         uses
     }
@@ -237,7 +236,7 @@ impl<V: Value> Context<V> {
         self.h8.resize(
             sizes[2],
             H8Gate {
-                inputs: [ZERO_ADDRESS; 5],
+                inputs: [self.layout.zero; 5],
                 out: Slot::FREE,
                 values: H8Values {
                     acc: zero,
@@ -325,15 +324,15 @@ impl<V: Value> Context<V> {
                 out: entry(&gate.out),
             })
             .collect();
-        let outputs = (0..self.n_outputs)
-            .map(|i| self.values[(FIRST_OUTPUT_ADDRESS + i) as usize])
+        let outputs = (0..self.layout.n_outputs)
+            .map(|i| self.values[self.layout.output(i) as usize])
             .collect();
         Finalized {
             circuit: Circuit {
                 p2,
                 qm31,
                 h8,
-                n_outputs: self.n_outputs,
+                layout: self.layout,
             },
             witness: Witness {
                 p2: p2_values,

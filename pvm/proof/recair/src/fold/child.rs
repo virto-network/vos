@@ -143,7 +143,7 @@ impl ChildShape {
                 proof: proof.format_version,
             });
         }
-        if proof.stark_proof.config != self.stark.config() {
+        if FORMAT.verifier_config(&proof.stark_proof.config) != self.stark.config() {
             return Err(ShapeMismatch::Config);
         }
         if proof.log_sizes != self.log_sizes {
@@ -189,7 +189,7 @@ pub fn recursion_data(
     let stark = &proof.stark_proof;
     let root = stark.commitments[0];
     crate::verify(proof.clone(), &circuit_hash_of(&proof.log_sizes, &root)).expect("a valid proof");
-    let config = stark.config;
+    let config = FORMAT.pcs_config();
     let recorder = Rc::new(RefCell::new(Vec::new()));
     let channel = &mut Poseidon2M31Channel::recording(recorder.clone());
     mix_statement_header(channel, FORMAT.number, &config, &proof.log_sizes);

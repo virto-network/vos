@@ -16,8 +16,10 @@
 //!   `x + x = x`, one and `u` by `u·x = u`, an M31 constant by `k·one`, any
 //!   other by at most two rows from `one`, `i = u² − 2`, `u` and `iu`. A
 //!   constant is never yielded by a consumer.
-//! - **Outputs** sit at the reserved addresses from 3, copied there by
-//!   [`Context::set_outputs`]; with `u` they are the circuit's public uses.
+//! - **Outputs** sit at reserved addresses, a node's from 3 and the wrap's
+//!   from 0 ([`Layout`]), set by [`Context::set_outputs`] or
+//!   [`Context::set_output_lanes`]; with `u` they are the circuit's public
+//!   uses.
 //! - **`p2` rows chain:** a chained row names its predecessor, which may have
 //!   one successor. Rows are laid out chain by chain, each chain contiguous,
 //!   in the order the chains were started.
@@ -45,7 +47,7 @@ use std::collections::{BTreeMap, HashMap};
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
-use vos_recair_air::gate::{FIRST_OUTPUT_ADDRESS, ONE_ADDRESS, U_ADDRESS, U_VALUE, ZERO_ADDRESS};
+use vos_recair_air::gate::{Layout, U_VALUE};
 use vos_recair_air::p2::P2Mode;
 
 use crate::circuit::{Circuit, Qm31Op};
@@ -215,7 +217,7 @@ pub struct Witness<V> {
     /// Each row's `a`, `b`, `c` and `out`.
     pub qm31: Vec<[V; 4]>,
     pub h8: Vec<H8Values<V>>,
-    /// The outputs' values, from [`FIRST_OUTPUT_ADDRESS`].
+    /// The outputs' values, in their addresses' order.
     pub outputs: Vec<V>,
 }
 
@@ -237,7 +239,7 @@ pub struct Context<V: Value> {
     /// The constants by value, in the order they were asked for.
     constants: Vec<(SecureField, Var)>,
     constant_vars: HashMap<[u32; 4], Var>,
-    n_outputs: u32,
+    layout: Layout,
     outputs_set: bool,
     lenient: bool,
     mismatches: Vec<Mismatch>,
@@ -261,9 +263,24 @@ impl<V: Value> Context<V> {
         Self::with_outputs(0)
     }
 
-    /// A context whose circuit outputs `n_outputs` wires, at the addresses
-    /// from [`FIRST_OUTPUT_ADDRESS`], set by [`Context::set_outputs`].
+    /// A node's context, whose circuit outputs `n_outputs` wires at the
+    /// addresses from 3 ([`Layout::node`]), set by [`Context::set_outputs`].
     pub fn with_outputs(n_outputs: u32) -> Self {
+        Self::with_layout(Layout::node(n_outputs))
+    }
+
+    /// A context whose reserved wires sit as `layout` says.
+    ///
+    /// # Panics
+    /// When the layout's zero, one and `u` overlap its outputs.
+    pub fn with_layout(layout: Layout) -> Self {
+        let n_outputs = layout.n_outputs;
+        let constants = layout.zero..layout.zero + 3;
+        let outputs = layout.first_output..layout.first_output + n_outputs;
+        assert!(
+            constants.end <= outputs.start || outputs.end <= constants.start,
+            "zero, one and u apart from the outputs"
+        );
         let mut context = Self {
             values: Vec::new(),
             states: Vec::new(),
@@ -272,25 +289,31 @@ impl<V: Value> Context<V> {
             h8: Vec::new(),
             constants: Vec::new(),
             constant_vars: HashMap::new(),
-            n_outputs,
+            layout,
             outputs_set: n_outputs == 0,
             lenient: false,
             mismatches: Vec::new(),
             piece: "context",
             piece_rows: BTreeMap::new(),
         };
-        for (address, value) in [
-            (ZERO_ADDRESS, SecureField::zero()),
-            (ONE_ADDRESS, SecureField::one()),
-            (U_ADDRESS, U_VALUE),
-        ] {
-            let var = context.new_var(V::from_qm31(value), State::Yielded);
+        let end = layout.end().expect("the reserved addresses fit in u32");
+        for address in 0..end {
+            let var = if constants.contains(&address) {
+                let value = [SecureField::zero(), SecureField::one(), U_VALUE]
+                    [(address - layout.zero) as usize];
+                let var = context.new_var(V::from_qm31(value), State::Yielded);
+                context.constant_vars.insert(key(value), var);
+                var
+            } else {
+                // An output's address, or a gap no wire takes.
+                let state = if outputs.contains(&address) {
+                    State::Reserved
+                } else {
+                    State::Yielded
+                };
+                context.new_var(V::from_qm31(SecureField::zero()), state)
+            };
             assert_eq!(var.address(), address);
-            context.constant_vars.insert(key(value), var);
-        }
-        for i in 0..n_outputs {
-            let var = context.new_var(V::from_qm31(SecureField::zero()), State::Reserved);
-            assert_eq!(var.address(), FIRST_OUTPUT_ADDRESS + i);
         }
         let [zero, one, u] = [context.zero(), context.one(), context.u()];
         let yields = |var: Var| Slot {
@@ -322,7 +345,12 @@ impl<V: Value> Context<V> {
     }
 
     pub fn zero(&self) -> Var {
-        Var(ZERO_ADDRESS)
+        Var(self.layout.zero)
+    }
+
+    /// Where the circuit's reserved wires sit.
+    pub fn layout(&self) -> Layout {
+        self.layout
     }
 
     /// Records a gate's output that differs from the wire it must equal, as
@@ -354,11 +382,11 @@ impl<V: Value> Context<V> {
     }
 
     pub fn one(&self) -> Var {
-        Var(ONE_ADDRESS)
+        Var(self.layout.one())
     }
 
     pub fn u(&self) -> Var {
-        Var(U_ADDRESS)
+        Var(self.layout.u())
     }
 
     /// A wire's value.
@@ -693,12 +721,35 @@ impl<V: Value> Context<V> {
     /// circuit's public uses.
     pub fn set_outputs(&mut self, vars: &[Var]) {
         assert!(!self.outputs_set, "the outputs are set once");
-        assert_eq!(vars.len(), self.n_outputs as usize, "one wire an output");
+        assert_eq!(
+            vars.len(),
+            self.layout.n_outputs as usize,
+            "one wire an output"
+        );
         for (i, &var) in vars.iter().enumerate() {
-            let reserved = Var(FIRST_OUTPUT_ADDRESS + i as u32);
+            let reserved = Var(self.layout.output(i as u32));
             self.values[reserved.0 as usize] = self.value(var);
             self.states[reserved.0 as usize] = State::Guess;
             self.assert_eq(var, reserved);
+        }
+        self.outputs_set = true;
+    }
+
+    /// Sets each output to one lane of a packed wire, `(wire, lane)` in the
+    /// outputs' order, the M31 `wire_lane` as the QM31 `(wire_lane, 0, 0, 0)`:
+    /// one word a wire, a row each.
+    pub fn set_output_lanes(&mut self, lanes: &[(Var, usize)]) {
+        assert!(!self.outputs_set, "the outputs are set once");
+        assert_eq!(
+            lanes.len(),
+            self.layout.n_outputs as usize,
+            "one lane an output"
+        );
+        for (i, &(wire, lane)) in lanes.iter().enumerate() {
+            let reserved = Var(self.layout.output(i as u32));
+            self.values[reserved.0 as usize] = self.value(wire).limb(lane);
+            self.states[reserved.0 as usize] = State::Guess;
+            self.assert_lane(wire, lane, reserved);
         }
         self.outputs_set = true;
     }

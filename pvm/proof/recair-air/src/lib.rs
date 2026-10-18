@@ -109,6 +109,26 @@ pub fn preprocessed_log_sizes(log_sizes: &LogSizes) -> Vec<u32> {
     .collect()
 }
 
+/// Each committed tree's column log sizes at `log_sizes`: the preprocessed
+/// tree's (in commitment order), the main trace's and the interaction
+/// trace's, each component's columns at its log size, in the components'
+/// order. What the components' `trace_log_degree_bounds` give, without
+/// building them.
+pub fn committed_log_sizes(log_sizes: &LogSizes) -> [Vec<u32>; 3] {
+    let columns = |counts: [usize; 3]| -> Vec<u32> {
+        counts
+            .into_iter()
+            .zip(log_sizes)
+            .flat_map(|(count, &log_size)| core::iter::repeat_n(log_size, count))
+            .collect()
+    };
+    [
+        preprocessed_log_sizes(log_sizes),
+        columns([p2::N_MAIN, qm31::N_MAIN, h8::N_MAIN]),
+        columns([p2::N_INTERACTION, qm31::N_INTERACTION, h8::N_INTERACTION]),
+    ]
+}
+
 /// The three components at `log_sizes` and their claimed sums, their
 /// columns allocated in the trees' order.
 pub struct Components {
@@ -195,6 +215,15 @@ mod tests {
         ]) {
             let sizes = component.trace_log_degree_bounds();
             assert_eq!([sizes[1].len(), sizes[2].len()], [main, interaction]);
+        }
+        let committed = committed_log_sizes(&[4, 5, 6]);
+        for tree in 1..3 {
+            let bounds: Vec<u32> = components
+                .as_dyn()
+                .iter()
+                .flat_map(|component| component.trace_log_degree_bounds()[tree].clone())
+                .collect();
+            assert_eq!(committed[tree], bounds, "tree {tree}");
         }
         assert_eq!(
             components.as_dyn().map(|c| c.n_constraints()),

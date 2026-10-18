@@ -612,9 +612,11 @@ fn verify_standalone_on<MC: PcsStack>(
     // precede the relation elements, which therefore depend on the claimed
     // boundary states. `memory_commitment` stays unmixed (computed outside
     // the circuit). The proof's own PCS config: a legacy proof carries its
-    // own, and every other format's equals the format's, checked above.
+    // own, and every other format's equals the format's, checked above; the
+    // DEEP batching is the format's, which a proof does not carry.
     let verifier_channel = &mut MC::C::default();
-    let commitment_scheme = &mut CommitmentSchemeVerifier::<MC>::new(proof.pcs_config);
+    let commitment_scheme =
+        &mut CommitmentSchemeVerifier::<MC>::new(format.verifier_config(&proof.pcs_config));
     let lookup_elements = vos_pvm_proof::proof::replay_prefix::<MC>(
         &proof,
         stark,

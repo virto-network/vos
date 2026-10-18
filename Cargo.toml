@@ -148,14 +148,18 @@ vos-sdk-macros = { path = "agent/sdk-macros" }
 # The settlement window, which the window test actor's kernel states.
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3.0", default-features = false }
 
-# Stwo from the fork's `vos/base` branch: upstream `e1286720` with dashmap
+# Stwo from the fork's `vos/wrap` branch: upstream `e1286720` with dashmap
 # optional, Poseidon252 behind a feature, and upstream's `74951f79`, which
-# lets the verifier accept a preprocessed tree below the lifting height.
+# lets the verifier accept a preprocessed tree below the lifting height
+# (`vos/base`); then the final wrap's Blake2b-256 Merkle hasher and channel,
+# FRI fold step 3 reviewed, affine DEEP batching opt-in per configuration,
+# and errors in place of panics on a malformed last layer and on
+# inconsistent queried values.
 # Declared without features: workspace features are additive, and the
 # verifier-only build must stay free of std and rayon. The prover adds
 # `std,prover,parallel` through vos-pvm-proof's `prover` feature.
-stwo = { git = "https://github.com/olanod/stwo", rev = "bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef", default-features = false }
-stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef", default-features = false }
+stwo = { git = "https://github.com/olanod/stwo", rev = "ab294189b34fac653e0a753971c69a0d39d01d16", default-features = false }
+stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "ab294189b34fac653e0a753971c69a0d39d01d16", default-features = false }
 
 num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }

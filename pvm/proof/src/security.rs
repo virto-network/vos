@@ -13,13 +13,18 @@
 //! - **the query phase** (`pcs/fri.py`, `_get_query_phase_error`):
 //!   `2^-pow_bits · (1 - γ)^n_queries`, with the proximity parameter
 //!   `γ = 1 - √ρ - η` and the gap `η = √ρ / (2m)`;
-//! - **the DEEP batching** of every sampled value into one quotient by powers
-//!   of one coefficient (`_get_batching_error`): `(B - 1) · ε_lin(k)`, `B` the
-//!   sampled values;
+//! - **the DEEP batching** of every sampled value into one quotient
+//!   (`_get_batching_error`): by powers of one coefficient (Stwo's,
+//!   [`DeepBatching::Powers`]), `(B - 1) · ε_lin(k)`, `B` the sampled values,
+//!   the proximity gap for curves (BCIKS20 Theorem 6.2); with an independent
+//!   coefficient a value ([`DeepBatching::Affine`]), `ε_lin(k)`, the gap for
+//!   affine spaces (BCIKS20 Theorem 1.6), as `soundcalc` counts it;
 //! - **each FRI fold** (`_get_commit_phase_error`): `(f - 1) · ε_lin(k / F_i)`,
 //!   `f` the round's folding factor and `F_i` the product of the factors
-//!   through it. Stwo folds the circle to the line once, then the line by
-//!   `2^fold_step` a round, to the last layer;
+//!   through it. Stwo's first round folds the circle to the line and the line
+//!   `fold_step - 1` times before its first commitment, one round of factor
+//!   `2^fold_step`; each later round folds by `2^fold_step`, the last by what
+//!   remains, to the last layer (the fork's `DIVERGENCE-011`);
 //! - **ALI** (`circuits/deep_ali.py`, Theorem 8 of eprint 2022/1216):
 //!   `L · C / |F|`, `C` the constraints combined by powers of one coefficient;
 //! - **DEEP**: `L · (d·(k + c - 1) + (k - 1)) / (|F| - k - D)`, `k` the
@@ -60,7 +65,7 @@
 //! The arithmetic is IEEE-754 double precision with only the basic operations,
 //! so every verifier computes the same counts.
 
-use crate::format::FormatParams;
+use crate::format::{DeepBatching, FormatParams};
 
 /// The proof shape the proven count depends on, beside the format's
 /// parameters.
@@ -155,8 +160,10 @@ struct Analysis {
     log_blowup: u32,
     queries: f64,
     pow_bits: f64,
-    /// `log2` of each fold's factor, the circle fold first.
+    /// `log2` of each round's folding factor, the first round's with the
+    /// circle fold in it.
     folds: alloc::vec::Vec<u32>,
+    batching: DeepBatching,
     shape: SecurityShape,
     interaction_pow_bits: f64,
 }
@@ -183,8 +190,8 @@ impl Analysis {
         if dimension + shape.max_samples_per_column as f64 >= sqrt_rho * domain {
             return None;
         }
-        let mut folds = alloc::vec![1];
-        let mut remaining = shape.log_degree_bound - 1 - params.log_last_layer;
+        let mut folds = alloc::vec::Vec::new();
+        let mut remaining = shape.log_degree_bound - params.log_last_layer;
         while remaining > 0 {
             let step = params.fold_step.min(remaining);
             folds.push(step);
@@ -198,6 +205,7 @@ impl Analysis {
             queries: params.n_queries as f64,
             pow_bits: f64::from(params.pow_bits),
             folds,
+            batching: params.batching,
             shape: *shape,
             interaction_pow_bits: f64::from(params.interaction_pow_bits),
         })
@@ -237,8 +245,11 @@ impl Analysis {
     fn other_bits(&self, m: u32) -> f64 {
         let shape = &self.shape;
         let field = field_size();
-        let batching = (shape.sampled_values.saturating_sub(1).max(1) as f64)
-            * self.linear_error(m, self.log_k);
+        let batched = match self.batching {
+            DeepBatching::Powers => shape.sampled_values.saturating_sub(1).max(1) as f64,
+            DeepBatching::Affine => 1.0,
+        };
+        let batching = batched * self.linear_error(m, self.log_k);
         let mut folded = 0;
         let mut folds = 0.0f64;
         for &log_factor in &self.folds {
@@ -328,6 +339,7 @@ mod tests {
             fold_step: 1,
             log_last_layer: 0,
             interaction_pow_bits: 8,
+            batching: DeepBatching::Powers,
         };
         let shape = |max_samples_per_column| SecurityShape {
             log_degree_bound: 4,
@@ -355,6 +367,7 @@ mod tests {
             fold_step: 1,
             log_last_layer: 0,
             interaction_pow_bits: 8,
+            batching: DeepBatching::Powers,
         };
         let shape = SecurityShape {
             log_degree_bound: 20,
@@ -370,5 +383,40 @@ mod tests {
         let at = |m| analysis.query_bits(m);
         assert!(at(M_MAX) < 64.0 && at(M_MAX) > 63.99);
         assert!(at(3) < at(30) && at(30) < at(300));
+    }
+
+    /// Stwo's first round folds by `2^fold_step`, the circle fold among
+    /// them; later rounds by `2^fold_step`, the last by what remains. At fold
+    /// step 1 that is one fold a round, as before.
+    #[test]
+    fn the_rounds_fold_as_stwo_folds() {
+        let params = |fold_step, log_last_layer| FormatParams {
+            log_blowup: 6,
+            n_queries: 20,
+            pow_bits: 26,
+            fold_step,
+            log_last_layer,
+            interaction_pow_bits: 8,
+            batching: DeepBatching::Affine,
+        };
+        let shape = SecurityShape {
+            log_degree_bound: 16,
+            log_trace_length: 15,
+            log_composition_degree_bound: 17,
+            sampled_values: 916,
+            max_samples_per_column: 2,
+            constraints: 313,
+            logup_fractions: 1 << 20,
+            relation_width: 5,
+        };
+        let folds = |fold_step, log_last_layer| {
+            Analysis::new(&params(fold_step, log_last_layer), &shape)
+                .unwrap()
+                .folds
+        };
+        assert_eq!(folds(3, 6), [3, 3, 3, 1]);
+        assert_eq!(folds(3, 7), [3, 3, 3]);
+        assert_eq!(folds(1, 0), [1; 16]);
+        assert_eq!(folds(4, 0), [4; 4]);
     }
 }

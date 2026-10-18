@@ -1039,12 +1039,6 @@ name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
-
-[[package]]
-name = "hashbrown"
-version = "0.17.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "allocator-api2",
  "equivalent",
@@ -1052,6 +1046,12 @@ dependencies = [
  "serde",
  "serde_core",
 ]
+
+[[package]]
+name = "hashbrown"
+version = "0.17.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 
 [[package]]
 name = "heapless"
@@ -2114,7 +2114,7 @@ checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 [[package]]
 name = "stwo"
 version = "2.2.0"
-source = "git+https://github.com/olanod/stwo?rev=bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef#bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef"
+source = "git+https://github.com/olanod/stwo?rev=ab294189b34fac653e0a753971c69a0d39d01d16#ab294189b34fac653e0a753971c69a0d39d01d16"
 dependencies = [
  "blake2",
  "blake3",
@@ -2123,7 +2123,7 @@ dependencies = [
  "dashmap",
  "educe",
  "fnv",
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
  "hex",
  "indexmap",
  "itertools 0.12.1",
@@ -2142,9 +2142,9 @@ dependencies = [
 [[package]]
 name = "stwo-constraint-framework"
 version = "2.2.0"
-source = "git+https://github.com/olanod/stwo?rev=bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef#bbfa8bc3ae8ce958ee70d4bc59b8436bb453b3ef"
+source = "git+https://github.com/olanod/stwo?rev=ab294189b34fac653e0a753971c69a0d39d01d16#ab294189b34fac653e0a753971c69a0d39d01d16"
 dependencies = [
- "hashbrown 0.17.1",
+ "hashbrown 0.16.1",
  "itertools 0.12.1",
  "num-traits",
  "rand 0.8.6",
@@ -2493,7 +2493,11 @@ dependencies = [
 name = "vos-final-verifier"
 version = "0.1.0"
 dependencies = [
+ "num-traits",
+ "postcard",
+ "serde",
  "stwo",
+ "vos-pvm-proof",
  "vos-recair-air",
 ]
 

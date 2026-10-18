@@ -185,7 +185,11 @@ pub fn format_security_bits(
     config: &PcsConfig,
     shape: &SecurityShape,
 ) -> Result<SecurityBits, String> {
-    let params = FormatParams::of(config, format.interaction_pow_bits());
+    let params = FormatParams::of(
+        config,
+        format.interaction_pow_bits(),
+        format.params.batching,
+    );
     crate::security::security_bits(&params, shape)
         .ok_or_else(|| String::from("parameters outside the security analysis"))
 }
@@ -212,7 +216,7 @@ pub fn check_format_security(
             bits.proven, format.number, format.floor.proven
         ));
     }
-    if format.exact_params() && *config != format.pcs_config() {
+    if format.exact_params() && format.verifier_config(config) != format.pcs_config() {
         return Err(format!(
             "proof parameters differ from format {}'s",
             format.number

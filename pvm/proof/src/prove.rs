@@ -126,6 +126,7 @@ pub fn production_pcs_config() -> PcsConfig {
         // Stwo v2.x lifted protocol; `None` lets `try_get_lifting_log_size`
         // default it to `log_trace_size`.  See pvm/proof/STWO_2.2.0_MIGRATION.md.
         lifting_log_size: None,
+        deep_batching: stwo::core::pcs::DeepBatching::Powers,
     }
 }
 
@@ -182,6 +183,7 @@ pub fn production_pcs_config_mobile() -> PcsConfig {
         pow_bits: 20,
         fri_config: FriConfig::new(0, 2, 38, 1),
         lifting_log_size: None,
+        deep_batching: stwo::core::pcs::DeepBatching::Powers,
     }
 }
 

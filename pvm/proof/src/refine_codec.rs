@@ -406,7 +406,7 @@ fn encode_proof(encoder: &mut Encoder, proof: &Proof) -> Result<(), RefineProofC
     }
     encode_segment_state(encoder, &proof.initial_state)?;
     encode_segment_state(encoder, &proof.final_state)?;
-    let format = crate::format::admitted(proof.format_version)
+    let format = crate::format::admitted_segment(proof.format_version)
         .map_err(|_| RefineProofCodecError::InvalidStructure)?;
     match &proof.stark_proof {
         StarkProofAny::Blake2s(stark) if format.channel == crate::format::ChannelKind::Blake2s => {
@@ -423,7 +423,7 @@ fn encode_proof(encoder: &mut Encoder, proof: &Proof) -> Result<(), RefineProofC
 
 fn decode_proof(decoder: &mut Decoder<'_>) -> Result<Proof, RefineProofCodecError> {
     let format_version = decoder.u32()?;
-    let format = crate::format::admitted(format_version)
+    let format = crate::format::admitted_segment(format_version)
         .map_err(|_| RefineProofCodecError::InvalidStructure)?;
     let interaction_pow = decoder.u64()?;
     let num_components = decoder.u32()? as usize;
@@ -508,6 +508,7 @@ fn decode_pcs_config(decoder: &mut Decoder<'_>) -> Result<PcsConfig, RefineProof
             fold_step,
         },
         lifting_log_size,
+        deep_batching: stwo::core::pcs::DeepBatching::Powers,
     })
 }
 

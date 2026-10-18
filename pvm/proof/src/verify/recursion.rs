@@ -69,6 +69,14 @@ pub fn reconstruct_oods_for_recursion(proof: &Proof) -> OodsReconstruction {
         unbuilt => panic!("format {}'s channel is not built", format.number))
 }
 
+/// The proof's parameters with its format's DEEP batching, which a proof
+/// does not carry.
+fn verifier_config(proof: &Proof) -> stwo::core::pcs::PcsConfig {
+    crate::proof::proof_format(proof)
+        .expect("an admitted proof format")
+        .verifier_config(&proof.pcs_config)
+}
+
 fn reconstruct_oods_on<MC: PcsStack>(proof: &Proof) -> OodsReconstruction {
     use stwo::core::air::Components;
     use stwo::core::circle::CirclePoint;
@@ -77,7 +85,7 @@ fn reconstruct_oods_on<MC: PcsStack>(proof: &Proof) -> OodsReconstruction {
     use stwo::core::pcs::utils::try_get_lifting_log_size;
     use stwo::core::verifier::COMPOSITION_LOG_SPLIT;
 
-    let config = proof.pcs_config;
+    let config = verifier_config(proof);
     let sp = MC::stark(&proof.stark_proof).expect("the proof's channel");
     let claimed_log_sizes = &proof.log_sizes;
     let claimed_sums = &proof.claimed_sums;
@@ -276,8 +284,9 @@ pub fn record_canonical_transcript(proof: &Proof) -> RecursionTranscript {
 
     let recorder = Rc::new(RefCell::new(alloc::vec::Vec::new()));
     let channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
-    let commitment_scheme =
-        &mut CommitmentSchemeVerifier::<crate::poseidon2::P2MerkleChannel>::new(proof.pcs_config);
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<crate::poseidon2::P2MerkleChannel>::new(
+        verifier_config(proof),
+    );
     let ctx = recursion_verify_prefix(proof, channel, commitment_scheme);
     let components_ref: alloc::vec::Vec<&dyn Component> =
         ctx.verifier_components.iter().map(|c| &**c).collect();
@@ -395,8 +404,9 @@ pub fn extract_recursion_data(proof: &Proof) -> RecursionData {
 
     let recorder = Rc::new(RefCell::new(alloc::vec::Vec::new()));
     let channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
-    let commitment_scheme =
-        &mut CommitmentSchemeVerifier::<crate::poseidon2::P2MerkleChannel>::new(proof.pcs_config);
+    let commitment_scheme = &mut CommitmentSchemeVerifier::<crate::poseidon2::P2MerkleChannel>::new(
+        verifier_config(proof),
+    );
     let ctx = recursion_verify_prefix(proof, channel, commitment_scheme);
     let components: alloc::vec::Vec<&dyn Component> =
         ctx.verifier_components.iter().map(|c| &**c).collect();
