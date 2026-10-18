@@ -1,5 +1,6 @@
 //! Bits, and the checks the verifier builds on them: a drawn word's
-//! canonical decomposition (a query's position) and a PoW's trailing zeros.
+//! canonical decomposition (a query's position), a PoW's trailing zeros and
+//! a nonce's 16-bit limbs.
 
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
@@ -133,4 +134,19 @@ pub fn assert_trailing_zeros<V: Value>(context: &mut Context<V>, word: Var, n_bi
     let high = m31_of(context.value(word)).map(|word| word >> n_bits);
     let bits = guess_bits(context, high, 31 - n_bits);
     recompose(context, &bits, n_bits, Some(word));
+}
+
+/// Each of `wire`'s four limbs is below `2^16`: the wire is a u64's four
+/// 16-bit limbs, as `mix_u64` absorbs them. A limb's 16 bits recompose it,
+/// and `Σ 2^i·b_i < p`, so the limb is that integer. 100 rows.
+pub fn assert_u16_limbs<V: Value>(context: &mut Context<V>, wire: Var) {
+    let limbs = context
+        .value(wire)
+        .to_qm31()
+        .map(|value| value.to_m31_array().map(|limb| limb.0));
+    for lane in 0..4 {
+        let limb = context.limb(wire, lane);
+        let bits = guess_bits(context, limbs.map(|limbs| limbs[lane]), 16);
+        recompose(context, &bits, 0, Some(limb));
+    }
 }

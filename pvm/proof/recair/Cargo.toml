@@ -22,3 +22,5 @@ bincode = "1"
 # from a run proved over every chip.
 postcard = { version = "1", features = ["alloc"] }
 vos-pvm = { workspace = true }
+# The shape's security counts against the standalone verifier's.
+vos-pvm-proof-verifier = { workspace = true }

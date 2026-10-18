@@ -2568,8 +2568,9 @@ a `Context` (`pvm/proof/recair/src/verifier`).
   decomposition: 31 bits that recompose it and are not all one (zero's
   other decomposition, `2^31 − 1 = p`), checked by inverting their sum
   minus 31; its position the low bits, as `draw_queries` masks it. 63 rows a
-  query. The nonce's limbs are not range-checked: the work is in the hash
-  whatever the limbs.
+  query. Each nonce's four limbs are range-checked to 16 bits (100 rows a
+  nonce), so the circuit accepts exactly the nonces a u64 encodes, as the
+  native verifier does.
 - **Merkle openings** (`merkle.rs`): a leaf is the tree's row sorted by log
   size (stable, fixed at build), one sponge; a node a level, ordered by the
   position's bit, the last one's output the root's wires. The preprocessed
@@ -2604,7 +2605,12 @@ a `Context` (`pvm/proof/recair/src/verifier`).
   one row a limb). So the other chips' sums and the public terms add to
   zero.
 - **The shape** (`shape.rs`): a circuit is built for a format, a component
-  mask, its log sizes and the program's preprocessed root; from them the
+  mask, its log sizes and the program's preprocessed root, and never for
+  one the native verifier refuses: `SegmentShape::new` asserts the format
+  admitted, the mask this AIR's with a log size a component, each log size
+  in `4..=24` (`MIN_PROOF_LOG_SIZE..=DEFAULT_MAX_LOG_SIZE`), and
+  `check_format_security` at the shape's counts (`sample_layout`'s
+  `security_shape`, from `framework_access::air_layout`); from them the
   header words (`mix_statement_header` run on a word-recording channel),
   the trees' orders, the sample offsets (`vos_pvm_proof::sample_layout`:
   the components' masks at the identity point), the relations' draw order
@@ -2613,13 +2619,18 @@ a `Context` (`pvm/proof/recair/src/verifier`).
   configuration, mask, log sizes or preprocessed root; in the circuit the
   header the channel mixes is checked word by word against the shape's
   constants, and the preprocessed root likewise. The mask is not mixed
-  natively: it is the circuit's structure.
+  natively: it is the circuit's structure. `verify_segment` asserts every
+  length of the values against the shape (header words, boundary wires,
+  claimed sums, samples, FRI roots, queries, each opening's leaf, path and
+  layers) before guessing any: the structure never follows the values.
 - **The witness** (`witness.rs`): `SegmentValues::from_proof` runs the
   native walk (`extract_recursion_data`), takes the positions in draw
   order from the transcript's last squeezes (repeats kept), and lays out
   each tree's sorted leaf row and path and each FRI layer's sibling and
   path; the FRI walk folds with Stwo's own `fold_circle_into_line` and
-  `fold_coset`. `SegmentValues::blank` is the layout without values.
+  `fold_coset`. `SegmentValues::blank` is the layout without values;
+  `SegmentValues::with_draws` lays a proof out at given draws, a test's
+  seam for a repeated position.
 - **Composed** (`segment.rs`): in the native verifier's order, each check
   where the native one is (the logup sums after the claimed sums are mixed,
   OODS after the OODS point is drawn, the PoW before the queries), so a
@@ -2639,6 +2650,13 @@ a `Context` (`pvm/proof/recair/src/verifier`).
   nonces and the 296 bytes are whole wires.
 - **Paths per query, not shared:** a repeated position is verified twice;
   the structure does not depend on the draws.
+- **No circuit for a shape the native verifier refuses,** and no structure
+  from the values: `SegmentShape::new` refuses what the native preflight
+  and `check_format_security` refuse, and `verify_segment` asserts every
+  length against the shape.
+- **The nonces exact:** a limb past 16 bits is a wire no u64 encodes; the
+  work would still be in the hash, but the circuit accepts exactly the
+  native verifier's nonces, for 100 `qm31` rows a nonce.
 - **No `h8` outside DEEP**, as 5.9 found.
 
 ### Tests (`pvm/proof/recair/tests/verifier.rs`, `just check`)
@@ -2667,17 +2685,31 @@ a `Context` (`pvm/proof/recair/src/verifier`).
   ground, as natively); a claimed sum (`logup`); a boundary byte with its
   interaction PoW reground natively (`logup`), and without (`pow`); an OODS
   sample, the running sum's, and a composition sample (`oods`); a header
-  word (`shape`). Alone: the last layer's coefficient refused by every
+  word (`shape`); the main root (`pow`: mixed before the interaction PoW),
+  the interaction and composition roots (`oods`: each moves the OODS
+  point). Alone: the last layer's coefficient refused by every
   query's last fold, a first-layer value and a sibling by FRI; a queried
   value and a sampled value move DEEP's quotients; an OODS sample, a
   claimed sum and the register-memory relation's `z` refused by OODS; a
   claimed sum and a byte of each boundary state by the logup sums.
 - **A tampered witness, proved, is refused** by the recursion verifier.
 - **The bits:** zero's all-ones decomposition is refused by the canonical
-  check alone; a word with 23 trailing zeros fails a 24-bit PoW.
+  check alone; a word with 23 trailing zeros fails a 24-bit PoW; a nonce
+  limb of 2^16 is refused in each lane, and in the channel a nonce whose
+  4-bit work passes with limb 0 at `2^16 + k` is refused for the limb
+  alone, a natively ground nonce accepted.
 - **The shape:** another format, configuration, mask, log sizes or
   preprocessed root is refused by `SegmentShape::check` and by the witness
-  builder.
+  builder. No shape is built for format 32 (reserved), for a log size of
+  25, or below the floor: format 35 with a proven floor of 63 builds the
+  window kernel's shape (63 bits) and refuses it with MEMORY at 2^20 rows
+  (62). Values one FRI layer short in one query, in every query and the
+  roots, a header word, a claimed sum, a sample, a query or a path node
+  short are each refused by their length's assertion.
+- **A repeated position** (about 0.15% of proofs draw one): the fixture
+  laid out with draw 11 at draw 3's position (`with_draws`) gives draw 11
+  draw 3's openings, the rest unchanged, and every tree opening and FRI
+  query of the 40 is accepted.
 
 ### Rows
 
@@ -2685,9 +2717,9 @@ a `Context` (`pvm/proof/recair/src/verifier`).
 
 | circuit | `p2` | `qm31` | `h8` |
 |---|---|---|---|
-| the fixture (4,277 columns, 5,473 samples at 15 points, lifting 2^19) | 35,944 | 62,647 | 25,000 |
-| a full-shape run (25 chips) | 55,785 | 100,169 | 46,160 |
-| **the window kernel's class-1 leaf topology** (built without values) | **57,655** | **101,438** | **46,000** |
+| the fixture (4,277 columns, 5,473 samples at 15 points, lifting 2^19) | 35,944 | 62,847 | 25,000 |
+| a full-shape run (25 chips) | 55,785 | 100,369 | 46,160 |
+| **the window kernel's class-1 leaf topology** (built without values) | **57,655** | **101,638** | **46,000** |
 | its model, without the leaf's own work | 59,242 | 102,049 | 46,080 |
 
 The window kernel's leaf by piece, against §4.7's terms (per query × 40,
@@ -2706,7 +2738,7 @@ then once):
 | `qm31` DEEP once (sampled values' sums, constants, powers) | 20,445 | 20,458 |
 | `qm31` OODS (compiled, accumulation, powers, point, check) | 35,216 | 35,222 |
 | `qm31` logup, with the boundary public terms | 655 | 25 + about 800 (§4.1) |
-| `qm31` PoW checks | 46 | 64 |
+| `qm31` PoW checks, with the nonces' limbs | 246 | 64 |
 | `qm31` header and preprocessed root against the shape | 34 | 0 |
 
 - **The lifting height is 2^20, not the model's 2^21:** Stwo's
@@ -2716,7 +2748,7 @@ then once):
 - **16 sample points, not 18:** the periodicity points of the largest
   columns coincide with their second sample's point.
 - `p2` has **7,881 rows (12.0%) to spare** under 2^16, against the model's
-  9.5%; `qm31` 29,634 under 2^17; `h8` 19,536 under 2^16. The leaf's own
+  9.5%; `qm31` 29,434 under 2^17; `h8` 19,536 under 2^16. The leaf's own
   work (5.12: the state digests, the io-hash, the flags) is not counted.
 
 ### Gates
@@ -2724,8 +2756,11 @@ then once):
 [measured, under `systemd-run` at 14 GiB with `nice -n 10`,
 `CARGO_INCREMENTAL=0` and 8 jobs]
 - **Every piece accepts real data and refuses each tamper** (above).
-- **`just check`** green: 1,063 tests (1,049 at 5.10a), the verifier's 14 among
-  them, 3.0 s on their own; clippy clean.
+- **`just check`** green: 1,067 tests (1,049 at 5.10a), the verifier's 18 among
+  them, 3.1 s on their own; clippy clean.
+- **The shape's counts are the standalone verifier's:** on the fixture and
+  the full-shape run, `format_security_bits` at `sample_layout`'s
+  `security_shape` equals `vos_pvm_proof_verifier::proof_security_bits`.
 - Not run: `test-proof` (no prover suite changed) and the window kernel's
   real segment in a circuit, which 5.12 lists (spike 3's segment); its
   leaf's topology is built and counted here.
@@ -2734,14 +2769,20 @@ then once):
 
 - **5.11:** the window kernel's leaf rows above are built, not modelled;
   5.11's regression test pins them per piece.
-- **5.12:** the nonce's limbs are not range-checked (the PoW's work does
-  not need it); the boundary bytes are not range-checked here, as
-  `proving.md` A.3 leaves to the leaf (the 32 bytes of φ9..12).
+- **5.12:** the leaf checks the native per-segment `initial_state.timestamp
+  ≥ 1` (`verifier/src/lib.rs:590`, memory-boundary anchoring) on
+  `Verified.boundary` (`segment.rs`): the initial ts bytes' value, which
+  this piece leaves unchecked.
+- **The boundary bytes stay unchecked in this piece by design:**
+  `proving.md` A.3's local argument, under which the leaf range-checks only
+  the 32 io-hash bytes (φ9..12) it combines lossily; every other use is
+  exact on M31 values.
 
 ### Outside the step's files
 
 - `pvm/proof/src/verify/recursion.rs`: `sample_layout`, a shape's trees,
-  sample offsets and component layout; `verify.rs` and `lib.rs` export it.
+  sample offsets, component layout and security shape (from
+  `framework_access::air_layout`); `verify.rs` and `lib.rs` export it.
 - `pvm/proof/src/refine_codec/tests.rs`: a stale "format-31" doc comment.
 - `docs/design/slice-5-proving.md`: formats 31, 33 and 34 noted superseded
   at 5.10a by 35/36/37.

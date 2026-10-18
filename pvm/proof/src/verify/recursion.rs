@@ -631,6 +631,9 @@ pub struct SampleLayout {
     /// Each active component's main and interaction columns, and the
     /// preprocessed tree's columns it reads, in its order.
     pub components: alloc::vec::Vec<ComponentLayout>,
+    /// The shape the native verifier counts the proof's security at
+    /// ([`crate::framework_access::AirLayout::security_shape`]).
+    pub security_shape: crate::security::SecurityShape,
 }
 
 /// An active component's place in the trees.
@@ -685,6 +688,9 @@ pub fn sample_layout(
     let committed = super::committed_log_sizes(&components, log_sizes);
     let components_ref: alloc::vec::Vec<&dyn Component> =
         verifier_components.iter().map(|c| &**c).collect();
+    let security_shape = crate::framework_access::air_layout(config, &components_ref, &committed)
+        .expect("an AIR layout")
+        .security_shape(&components_ref);
     let all = Components {
         components: components_ref,
         n_preprocessed_columns: committed[PREPROCESSED_TRACE_IDX].len(),
@@ -759,5 +765,6 @@ pub fn sample_layout(
         column_log_sizes,
         sample_offsets,
         components,
+        security_shape,
     }
 }

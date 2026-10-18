@@ -464,9 +464,10 @@ refuses it with. What the build found against the model:
   once. One FRI layer and one path level fewer a query.
 - **16 sample points, not 18,** and 1,150 `h8` blocks and 785 single
   samples a query (the model: 1,152 and 769).
-- **The class-1 leaf's topology, built without values:** 57,655 / 101,438 /
+- **The class-1 leaf's topology, built without values:** 57,655 / 101,638 /
   46,000 rows [measured], against 59,242 / 102,049 / 46,080 [model], before
-  the leaf's own work: `p2` 12.0% under 2^16.
+  the leaf's own work: `p2` 12.0% under 2^16. The `qm31` count holds the
+  nonces' 16-bit limb checks, 100 rows each, which the model leaves out.
 - **The logup check is the native one:** the claimed sums add to zero and
   each boundary chip's is its public term, about 650 rows.
 - **The header is checked word by word** against the circuit's constants

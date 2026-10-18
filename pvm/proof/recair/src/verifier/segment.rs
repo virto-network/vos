@@ -59,13 +59,60 @@ pub fn preprocessed_bits(bits: &[Bit], height: u32) -> Vec<Bit> {
     out
 }
 
+/// Asserts every length of `values` is `shape`'s: the circuit's structure
+/// is the shape's alone, never the values'.
+fn assert_lengths<V: Value>(shape: &SegmentShape, values: &SegmentValues<V>) {
+    let lifting = shape.layout.lifting_log_size as usize;
+    assert_eq!(values.header.len(), shape.header.len(), "header words");
+    assert_eq!(
+        values.boundary.len(),
+        vos_pvm_proof::boundary_binding::BOUNDARY_STATE_BYTES.div_ceil(4),
+        "boundary wires"
+    );
+    assert_eq!(
+        values.claimed_sums.len(),
+        shape.log_sizes.len(),
+        "claimed sums"
+    );
+    assert_eq!(values.sampled.len(), shape.n_samples, "sampled values");
+    assert_eq!(values.fri_roots.len(), shape.n_fri_layers, "FRI roots");
+    assert_eq!(
+        values.queries.len(),
+        shape.config().fri_config.n_queries,
+        "queries"
+    );
+    for query in &values.queries {
+        assert_eq!(query.trees.len(), 4, "trees");
+        for (tree, opening) in query.trees.iter().enumerate() {
+            assert_eq!(
+                opening.leaf.len(),
+                shape.leaf_order[tree].len().div_ceil(4),
+                "leaf wires"
+            );
+            assert_eq!(
+                opening.path.len(),
+                shape.heights[tree] as usize,
+                "tree path nodes"
+            );
+        }
+        assert_eq!(query.fri.len(), shape.n_fri_layers, "FRI layers");
+        for (layer, opening) in query.fri.iter().enumerate() {
+            assert_eq!(opening.path.len(), lifting - layer - 1, "FRI path nodes");
+        }
+    }
+}
+
 /// Verifies the segment proof whose values are `values` in `context`, a
 /// circuit of `shape`.
+///
+/// # Panics
+/// When a length of `values` is not `shape`'s.
 pub fn verify_segment<V: Value>(
     context: &mut Context<V>,
     shape: &SegmentShape,
     values: &SegmentValues<V>,
 ) -> Verified<V> {
+    assert_lengths(shape, values);
     let config = shape.config();
     let lifting = shape.layout.lifting_log_size;
     context.piece("channel");

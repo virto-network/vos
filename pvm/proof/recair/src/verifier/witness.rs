@@ -26,10 +26,10 @@ use stwo::core::poly::line::LineDomain;
 use stwo::core::proof::StarkProof;
 use stwo::core::utils::bit_reverse_index;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
-use vos_pvm_proof::Proof;
 use vos_pvm_proof::boundary_binding::{BOUNDARY_STATE_BYTES, boundary_state_bytes};
 use vos_pvm_proof::pcs::StarkProofAny;
 use vos_pvm_proof::poseidon2::{P2Hash, P2MerkleHasher, PermKind};
+use vos_pvm_proof::{Proof, RecursionData};
 
 use crate::value::Value;
 
@@ -40,14 +40,14 @@ use super::shape::{SegmentShape, ShapeMismatch};
 
 /// A query's opening of a trace tree: its leaf's row, sorted and packed
 /// four values a wire, and its path, the leaf's sibling first.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TreeOpening<V> {
     pub leaf: Vec<V>,
     pub path: Vec<[V; 2]>,
 }
 
 /// A query's openings: the four trees, then FRI's layers.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueryValues<V> {
     pub trees: Vec<TreeOpening<V>>,
     pub fri: Vec<FriOpening<V>>,
@@ -160,24 +160,15 @@ impl SegmentValues<SecureField> {
     /// When the proof does not verify natively: the builder lays out a valid
     /// proof's values, which a test may then tamper.
     pub fn from_proof(shape: &SegmentShape, proof: &Proof) -> Result<Self, WitnessError> {
-        shape.check(proof)?;
-        let StarkProofAny::Poseidon2M31(stark) = &proof.stark_proof else {
-            return Err(ShapeMismatch::Structure("not a Poseidon2-M31 proof").into());
-        };
-        let data = vos_pvm_proof::extract_recursion_data(proof);
-        let config = shape.config();
-        let n_queries = config.fri_config.n_queries;
-        let lifting = shape.layout.lifting_log_size;
-        if data.lifting_log_size != lifting || stark.sampled_values.len() != 4 {
-            return Err(ShapeMismatch::Structure("the trees").into());
-        }
+        let (stark, data) = recursion_data(shape, proof)?;
 
         // The positions in draw order: the transcript's last squeezes.
+        let n_queries = shape.config().fri_config.n_queries;
         let n_draws = n_queries.div_ceil(8);
         let records = &data.transcript.records;
         let draws = &records[records.len() - n_draws..];
         assert!(draws.iter().all(|record| record.kind == PermKind::Squeeze));
-        let mask = (1usize << lifting) - 1;
+        let mask = (1usize << shape.layout.lifting_log_size) - 1;
         let drawn: Vec<usize> = draws
             .iter()
             .flat_map(|record| record.output[..8].iter().map(|word| word.0 as usize & mask))
@@ -187,7 +178,38 @@ impl SegmentValues<SecureField> {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted, data.query_positions, "the drawn positions");
+        Self::lay_out(shape, proof, stark, &data, &drawn)
+    }
 
+    /// The values of `proof` with its queries at `drawn`, in that order,
+    /// each a position the proof opens: [`SegmentValues::from_proof`]'s
+    /// layout at draws the proof did not make, such as a position drawn
+    /// twice, which some 0.15% of proofs draw.
+    ///
+    /// # Panics
+    /// As [`SegmentValues::from_proof`], and when a draw is a position the
+    /// proof does not open.
+    #[doc(hidden)]
+    pub fn with_draws(
+        shape: &SegmentShape,
+        proof: &Proof,
+        drawn: &[usize],
+    ) -> Result<Self, WitnessError> {
+        let (stark, data) = recursion_data(shape, proof)?;
+        Self::lay_out(shape, proof, stark, &data, drawn)
+    }
+
+    /// Lays out `proof`'s values, its queries at `drawn`, in draw order,
+    /// repeats kept: the openings are by sorted, deduplicated position, as
+    /// the proof decommits them, and each draw takes its position's, so a
+    /// position drawn twice is opened twice.
+    fn lay_out(
+        shape: &SegmentShape,
+        proof: &Proof,
+        stark: &StarkProof<P2MerkleHasher>,
+        data: &RecursionData,
+        drawn: &[usize],
+    ) -> Result<Self, WitnessError> {
         let trees = trace_openings(shape, stark, &data.query_positions)?;
         let fri = fri_openings(
             shape,
@@ -200,7 +222,10 @@ impl SegmentValues<SecureField> {
         let queries = drawn
             .iter()
             .map(|&position| {
-                let index = data.query_positions.binary_search(&position).unwrap();
+                let index = data
+                    .query_positions
+                    .binary_search(&position)
+                    .expect("a position the proof opens");
                 QueryValues {
                     trees: trees.iter().map(|tree| tree[index].clone()).collect(),
                     fri: fri
@@ -250,6 +275,23 @@ impl SegmentValues<SecureField> {
             queries,
         })
     }
+}
+
+/// `proof`'s Stark proof, the proof checked of `shape`, and the native
+/// verifier's walk over it.
+fn recursion_data<'a>(
+    shape: &SegmentShape,
+    proof: &'a Proof,
+) -> Result<(&'a StarkProof<P2MerkleHasher>, RecursionData), WitnessError> {
+    shape.check(proof)?;
+    let StarkProofAny::Poseidon2M31(stark) = &proof.stark_proof else {
+        return Err(ShapeMismatch::Structure("not a Poseidon2-M31 proof").into());
+    };
+    let data = vos_pvm_proof::extract_recursion_data(proof);
+    if data.lifting_log_size != shape.layout.lifting_log_size || stark.sampled_values.len() != 4 {
+        return Err(ShapeMismatch::Structure("the trees").into());
+    }
+    Ok((stark, data))
 }
 
 /// Each trace tree's opening at each sorted query position.

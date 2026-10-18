@@ -2703,6 +2703,7 @@ dependencies = [
  "vos-pvm",
  "vos-pvm-poseidon2",
  "vos-pvm-proof",
+ "vos-pvm-proof-verifier",
  "vos-recair-air",
 ]
 

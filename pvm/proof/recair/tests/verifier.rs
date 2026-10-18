@@ -12,10 +12,17 @@
 //! - **Each tamper refused, by the check that should refuse it:** a Merkle
 //!   sibling, a queried value, a FRI layer value and path node, the last
 //!   layer's coefficient, either PoW nonce, a claimed sum, an OODS sample, a
-//!   boundary byte (the interaction PoW reground), a header word; and a
-//!   tampered witness, proved, is refused by the verifier.
-//! - **The shape:** a proof of another format, configuration, mask, log
-//!   sizes or program is refused before its values reach a circuit.
+//!   boundary byte (the interaction PoW reground), a header word, each
+//!   committed root; and a tampered witness, proved, is refused by the
+//!   verifier. A nonce limb of 2^16, a wire no u64 encodes, is refused even
+//!   when its work passes.
+//! - **The shape:** a shape the native verifier refuses (a format not
+//!   admitted, a log size past 2^24, counts below the format's floor) builds
+//!   no circuit; a proof of another format, configuration, mask, log sizes or
+//!   program is refused before its values reach a circuit, and values of
+//!   another structure before they are guessed.
+//! - **Repeats:** a position drawn twice is laid out twice, each opening
+//!   accepted.
 //! - **Rows:** each piece's, on the fixture and on the window kernel's
 //!   class-1 leaf topology (built without values), against `recursion-air.md`
 //!   §4.7's model.
@@ -27,11 +34,15 @@ use stwo::core::channel::{Channel as _, MerkleChannel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+use vos_pvm_proof::format::{Format, LEAF_FOLD, SEGMENT, SecurityFloor};
 use vos_pvm_proof::pcs::{FsChannel, StarkProofAny};
 use vos_pvm_proof::poseidon2::{P2Hash, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel};
 use vos_pvm_proof::{Proof, RecursionData, chip_idx, extract_recursion_data};
-use vos_recair::verifier::bits::{assert_trailing_zeros, check_word_bits, guess_bits};
-use vos_recair::verifier::channel::u64_wire;
+use vos_recair::gadgets::TranscriptGadget;
+use vos_recair::verifier::bits::{
+    assert_trailing_zeros, assert_u16_limbs, check_word_bits, guess_bits,
+};
+use vos_recair::verifier::channel::{Channel, u64_wire};
 use vos_recair::verifier::circle::{Point, domain_point};
 use vos_recair::verifier::fri::{FriCommitment, verify_query};
 use vos_recair::verifier::logup::{BoundaryRelations, Challenges};
@@ -247,6 +258,24 @@ fn print_rows(name: &str, context: &Context<impl vos_recair::Value>) {
     }
 }
 
+/// The message `build` panics with, if it panics.
+fn panic_message(build: impl FnOnce()) -> Option<String> {
+    let payload = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build)).err()?;
+    Some(
+        payload
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default(),
+    )
+}
+
+/// The window kernel's class-1 leaf topology: its mask and log sizes.
+const WINDOW_MASK: u32 = 0x01f9_ffff;
+const WINDOW_LOG_SIZES: [u32; 23] = [
+    15, 14, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 8, 15, 15, 15, 15, 16,
+];
+
 // ── Composed ───────────────────────────────────────────────────────────────
 
 #[test]
@@ -349,6 +378,16 @@ fn every_tamper_is_refused_by_its_check() {
     let composition = real.shape.sample_index[3][5];
     add("a composition sample", "oods", &move |v| {
         bump(&mut v.sampled[composition])
+    });
+    // Each committed root: the main root precedes the interaction PoW; the
+    // interaction root, the composition coefficient and the OODS point; the
+    // composition root, the OODS point.
+    add("the main root", "pow", &|v| bump(&mut v.roots[0][0]));
+    add("the interaction root", "oods", &|v| {
+        bump(&mut v.roots[1][1])
+    });
+    add("the composition root", "oods", &|v| {
+        bump(&mut v.roots[2][0])
     });
 
     // A boundary byte, its interaction PoW reground natively: the public
@@ -472,6 +511,192 @@ fn a_proof_of_another_shape_is_refused() {
     );
 }
 
+/// A shape the native verifier refuses builds no circuit: a format not
+/// admitted, a log size past the native bound, counts below the format's
+/// floor at this shape, counted as the standalone verifier counts them.
+#[test]
+fn a_shape_the_native_verifier_refuses_builds_no_circuit() {
+    for real in [fixture(), full_shape()] {
+        assert_eq!(
+            vos_pvm_proof::proof::format_security_bits(
+                real.shape.format,
+                &real.shape.config(),
+                &real.shape.layout.security_shape
+            ),
+            Ok(vos_pvm_proof_verifier::proof_security_bits(&real.proof).unwrap())
+        );
+    }
+    let refusal = |format: &'static Format, log_sizes: &[u32]| {
+        panic_message(|| {
+            SegmentShape::new(format, WINDOW_MASK, log_sizes, P2Hash::default());
+        })
+    };
+    let refused = |format, log_sizes: &[u32], reason: &str| {
+        let message = refusal(format, log_sizes).expect("refused");
+        assert!(message.contains(reason), "{message}");
+    };
+    refused(&LEAF_FOLD, &WINDOW_LOG_SIZES, "an admitted format");
+    let mut oversize = WINDOW_LOG_SIZES;
+    oversize[3] = vos_pvm_proof::DEFAULT_MAX_LOG_SIZE + 1;
+    refused(&SEGMENT, &oversize, "log sizes the native verifier admits");
+    // Format 35 with a proven floor of 63 bits: the window kernel's shape
+    // counts 63, the same with its widest chip at 2^20 rows 62.
+    let raised: &'static Format = Box::leak(Box::new(Format {
+        floor: SecurityFloor {
+            proven: 63,
+            ..SEGMENT.floor
+        },
+        ..SEGMENT
+    }));
+    assert_eq!(refusal(raised, &WINDOW_LOG_SIZES), None);
+    let mut taller = WINDOW_LOG_SIZES;
+    taller[3] = 20;
+    refused(raised, &taller, "a shape the format's floors admit");
+}
+
+/// Values whose lengths are not the shape's are refused before any is
+/// guessed: the circuit's structure never follows them.
+#[test]
+fn values_of_another_structure_are_refused() {
+    let real = fixture();
+    type Edit = Box<dyn Fn(&mut SegmentValues<SecureField>)>;
+    let cases: Vec<(&str, Edit)> = vec![
+        (
+            "FRI layers",
+            Box::new(|v| {
+                v.queries[4].fri.pop();
+            }),
+        ),
+        (
+            "FRI roots",
+            Box::new(|v| {
+                v.fri_roots.pop();
+                for query in &mut v.queries {
+                    query.fri.pop();
+                }
+            }),
+        ),
+        (
+            "header words",
+            Box::new(|v| {
+                v.header.pop();
+            }),
+        ),
+        (
+            "claimed sums",
+            Box::new(|v| {
+                v.claimed_sums.pop();
+            }),
+        ),
+        (
+            "sampled values",
+            Box::new(|v| {
+                v.sampled.pop();
+            }),
+        ),
+        (
+            "queries",
+            Box::new(|v| {
+                v.queries.pop();
+            }),
+        ),
+        (
+            "tree path nodes",
+            Box::new(|v| {
+                v.queries[2].trees[1].path.pop();
+            }),
+        ),
+    ];
+    for (reason, edit) in cases {
+        let mut values = real.values.clone();
+        edit(&mut values);
+        let message = panic_message(|| {
+            verify_segment(
+                &mut Context::<SecureField>::new().lenient(),
+                &real.shape,
+                &values,
+            );
+        })
+        .expect("refused");
+        assert!(message.contains(reason), "{reason}: {message}");
+    }
+}
+
+// ── Repeats ────────────────────────────────────────────────────────────────
+
+/// A position drawn twice, as some 0.15% of proofs draw one: the fixture's
+/// openings laid out at its draws with one repeated, each draw's openings
+/// its position's, every opening accepted by the Merkle and FRI checks.
+#[test]
+fn a_position_drawn_twice_is_opened_twice() {
+    let real = fixture();
+    let lifting = real.shape.layout.lifting_log_size;
+    let mut drawn = real.drawn();
+    let (first, repeat) = (3, 11);
+    drawn[repeat] = drawn[first];
+    let values =
+        SegmentValues::with_draws(&real.shape, &real.proof, &drawn).expect("the proof's values");
+    assert_eq!(values.queries[repeat], real.values.queries[first]);
+    for (q, query) in values.queries.iter().enumerate() {
+        if q != repeat {
+            assert_eq!(*query, real.values.queries[q], "query {q}");
+        }
+    }
+
+    let StarkProofAny::Poseidon2M31(stark) = &real.proof.stark_proof else {
+        unreachable!()
+    };
+    let mut context = Context::<SecureField>::new().lenient();
+    let fri_roots = values
+        .fri_roots
+        .iter()
+        .map(|&root| context.guess_pair(root))
+        .collect();
+    let alphas = real
+        .data
+        .fold_alphas
+        .iter()
+        .map(|&alpha| context.guess(alpha))
+        .collect();
+    let commitment = FriCommitment {
+        roots: fri_roots,
+        alphas,
+        last_layer: context.guess(values.last_layer),
+    };
+    for (&position, query) in drawn.iter().zip(&values.queries) {
+        let bits = bits_of(&mut context, position, lifting);
+        for (tree, opening) in query.trees.iter().enumerate() {
+            let tree_bits = if tree == 0 {
+                preprocessed_bits(&bits, real.shape.heights[0])
+            } else {
+                bits.clone()
+            };
+            let wires: Vec<Var> = opening.leaf.iter().map(|&v| context.guess(v)).collect();
+            let root = guess_digest(&mut context, &stark.commitments[tree]);
+            verify_opening(
+                &mut context,
+                &wires,
+                real.shape.leaf_order[tree].len(),
+                &tree_bits,
+                &opening.path,
+                root,
+            );
+        }
+        let point = domain_point(&mut context, lifting, &bits);
+        let value = context.guess(real.first_layer(position));
+        verify_query(
+            &mut context,
+            lifting,
+            &commitment,
+            &bits,
+            point,
+            value,
+            &query.fri,
+        );
+    }
+    assert!(context.mismatches().is_empty());
+}
+
 // ── Each piece on recorded data ────────────────────────────────────────────
 
 /// Bits guessed and constrained for `position`.
@@ -505,6 +730,57 @@ fn the_bits_refuse_a_noncanonical_word_and_a_short_pow() {
         assert_trailing_zeros(&mut context, var, n_bits);
         assert_eq!(context.mismatches().is_empty(), passes, "{word:#x}");
     }
+}
+
+/// A nonce's limbs are each below 2^16, the wire a u64's: a limb of 2^16 is
+/// refused, alone and in the channel, where a nonce whose work passes with
+/// such a limb is refused for the limb alone.
+#[test]
+fn a_nonce_limb_of_2_16_is_refused() {
+    let limbs = |limbs: [u32; 4]| SecureField::from_m31_array(limbs.map(BaseField::from));
+    let refusals = |wire: SecureField| {
+        let mut context = Context::<SecureField>::new().lenient();
+        let var = context.guess(wire);
+        assert_u16_limbs(&mut context, var);
+        context.mismatches().len()
+    };
+    assert_eq!(refusals(u64_wire(u64::MAX)), 0);
+    assert_eq!(refusals(u64_wire(0x0123_4567_89ab_cdef)), 0);
+    for lane in 0..4 {
+        let mut wide = [0xffff; 4];
+        wide[lane] = 1 << 16;
+        assert_eq!(refusals(limbs(wide)), 1, "lane {lane}");
+    }
+
+    // At 4 bits: the work alone (the hash and its trailing zeros), and the
+    // channel's check.
+    const BITS: u32 = 4;
+    let work = |nonce: SecureField| {
+        let mut context = Context::<SecureField>::new().lenient();
+        let var = context.guess(nonce);
+        let check = TranscriptGadget::new(&context).pow(&mut context, BITS, var);
+        let word = context.limb(check.digest[0], 0);
+        assert_trailing_zeros(&mut context, word, BITS);
+        context.mismatches().is_empty()
+    };
+    let check_pow = |nonce: SecureField| {
+        let mut context = Context::<SecureField>::new().lenient();
+        let var = context.guess(nonce);
+        let mut channel = Channel::new(&context);
+        channel.check_pow(&mut context, BITS, var);
+        context.mismatches().len()
+    };
+    let native = Poseidon2M31Channel::default();
+    let nonce = (0..)
+        .find(|&nonce| native.verify_pow_nonce(BITS, nonce))
+        .unwrap();
+    assert!(work(u64_wire(nonce)));
+    assert_eq!(check_pow(u64_wire(nonce)), 0);
+    let forged = (0..)
+        .map(|k| limbs([(1 << 16) + k, 0, 0, 0]))
+        .find(|&wire| work(wire))
+        .unwrap();
+    assert_eq!(check_pow(forged), 1);
 }
 
 #[test]
@@ -864,16 +1140,7 @@ fn the_logup_sums_accept_and_refuse() {
 /// model (59,300 / 102,849 / 46,080 with the leaf's own work).
 #[test]
 fn the_window_kernels_leaf_rows() {
-    const MASK: u32 = 0x01f9_ffff;
-    const LOG_SIZES: [u32; 23] = [
-        15, 14, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 8, 15, 15, 15, 15, 16,
-    ];
-    let shape = SegmentShape::new(
-        &vos_pvm_proof::format::SEGMENT,
-        MASK,
-        &LOG_SIZES,
-        P2Hash::default(),
-    );
+    let shape = SegmentShape::new(&SEGMENT, WINDOW_MASK, &WINDOW_LOG_SIZES, P2Hash::default());
     let mut context = Context::<NoValue>::new();
     verify_segment(&mut context, &shape, &SegmentValues::blank(&shape));
     print_rows("the window kernel's class-1 leaf", &context);

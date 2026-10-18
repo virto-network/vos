@@ -36,7 +36,7 @@ pub struct FriCommitment {
 
 /// A query's opening of one layer: its sibling's value, and the path above
 /// the pair's node, its first sibling the pair's parent's.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FriOpening<V> {
     pub sibling: V,
     pub path: Vec<[V; 2]>,

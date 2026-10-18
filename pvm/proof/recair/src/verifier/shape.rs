@@ -5,11 +5,14 @@
 //! component mask and its log sizes, and the program's preprocessed root.
 //! From them come the statement header the channel mixes, the trees' column
 //! orders, the sample points, the relations' draw order, the compiled
-//! constraints and FRI's layers. [`SegmentShape::check`] refuses a proof of
-//! another shape, field by field, before its values reach a circuit; in the
-//! circuit, the header the channel mixes is checked against the shape's
-//! constants word by word, and every structural use of the log sizes is the
-//! shape's.
+//! constraints and FRI's layers. [`SegmentShape::new`] refuses, as the
+//! native verifier does, a format not admitted, a log size out of range and
+//! a shape below the format's security floor: no circuit is built for a
+//! shape the native verifier refuses. [`SegmentShape::check`] refuses a
+//! proof of another shape, field by field, before its values reach a
+//! circuit; in the circuit, the header the channel mixes is checked against
+//! the shape's constants word by word, and every structural use of the log
+//! sizes is the shape's, every length of the values checked against it.
 
 use core::cell::RefCell;
 use std::rc::Rc;
@@ -18,12 +21,13 @@ use stwo::core::channel::Channel as _;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::PcsConfig;
 use vos_pvm_proof::boundary_binding::{BoundaryChipPositions, boundary_positions_in_mask};
-use vos_pvm_proof::format::{ChannelKind, Encoding, Format};
+use vos_pvm_proof::format::{ChannelKind, Encoding, Format, Status};
 use vos_pvm_proof::framework_access::boundary_relation_challenges;
 use vos_pvm_proof::framework_access::{AllLookupElements, draw_all_lookup_elements};
 use vos_pvm_proof::pcs::Commitment;
 use vos_pvm_proof::poseidon2::{P2Hash, PermKind, Poseidon2M31Channel};
-use vos_pvm_proof::{Proof, SampleLayout, sample_layout};
+use vos_pvm_proof::proof::{MIN_PROOF_LOG_SIZE, check_format_security};
+use vos_pvm_proof::{DEFAULT_MAX_LOG_SIZE, Proof, SampleLayout, chip_idx, sample_layout};
 
 use crate::compile::{self, Compiled, Input, Recording};
 
@@ -113,9 +117,13 @@ impl SegmentShape {
     /// root is `preprocessed_root`.
     ///
     /// # Panics
-    /// When the format is not a lossless Poseidon2-M31 format at fold step
-    /// 1, last layer degree bound 0 and no fixed lifting height, with both
-    /// PoWs; or when the mask lacks a boundary chip.
+    /// On a shape the native verifier refuses: a format not admitted, a mask
+    /// outside the AIR or without its log sizes, a log size outside
+    /// `MIN_PROOF_LOG_SIZE..=DEFAULT_MAX_LOG_SIZE`, or counts below the
+    /// format's security floor at this shape. And when the format is not a
+    /// lossless Poseidon2-M31 format at fold step 1, last layer degree bound
+    /// 0 and no fixed lifting height, with both PoWs; or when the mask lacks
+    /// a boundary chip.
     pub fn new(
         format: &'static Format,
         component_mask: u32,
@@ -123,6 +131,22 @@ impl SegmentShape {
         preprocessed_root: P2Hash,
     ) -> Self {
         let config = format.pcs_config();
+        assert_eq!(format.status, Status::Admitted, "an admitted format");
+        assert!(
+            component_mask != 0 && component_mask & !chip_idx::ALL == 0,
+            "a mask of this AIR's chips"
+        );
+        assert_eq!(
+            component_mask.count_ones() as usize,
+            log_sizes.len(),
+            "a log size a component"
+        );
+        assert!(
+            log_sizes
+                .iter()
+                .all(|log_size| (MIN_PROOF_LOG_SIZE..=DEFAULT_MAX_LOG_SIZE).contains(log_size)),
+            "log sizes the native verifier admits"
+        );
         assert_eq!(
             format.channel,
             ChannelKind::Poseidon2M31,
@@ -151,6 +175,9 @@ impl SegmentShape {
         vos_pvm_proof::proof::mix_statement_header(&mut header, format.number, &config, log_sizes);
 
         let layout = sample_layout(component_mask, log_sizes, &config);
+        if let Err(refusal) = check_format_security(format, &config, &layout.security_shape) {
+            panic!("a shape the format's floors admit: {refusal}");
+        }
         let (relations, lookup) = draw_order(component_mask);
         let challenges = lookup.relation_challenges();
         let boundary_relations = boundary_relation_challenges(&lookup).map(|(z, _)| {

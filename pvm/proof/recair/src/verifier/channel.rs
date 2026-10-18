@@ -8,8 +8,9 @@
 //!   words are a squeeze's two wires.
 //! - **PoW:** the check's two permutations, then the first word's trailing
 //!   zeros ([`bits::assert_trailing_zeros`]); the nonce, mixed after, is the
-//!   wire of its four limbs. A limb is not range-checked: the work is in the
-//!   hash whatever the limbs, and they are absorbed as they are.
+//!   wire of its four limbs, each range-checked to 16 bits
+//!   ([`bits::assert_u16_limbs`]): the circuit accepts exactly the nonces a
+//!   u64 encodes, as the native verifier does.
 //! - **Queries:** each a drawn word's canonical bit decomposition, its
 //!   position the low bits, as Stwo's `draw_queries` masks it.
 //!
@@ -85,8 +86,10 @@ impl<V: Value> Channel<V> {
         self.transcript.squeeze(context)
     }
 
-    /// `verify_pow_nonce(n_bits, nonce)`, then `mix_u64(nonce)`.
+    /// `verify_pow_nonce(n_bits, nonce)`, then `mix_u64(nonce)`: `nonce`
+    /// the four 16-bit limbs of a u64.
     pub fn check_pow(&mut self, context: &mut Context<V>, n_bits: u32, nonce: Var) {
+        bits::assert_u16_limbs(context, nonce);
         let check = self.transcript.pow(context, n_bits, nonce);
         let word = context.limb(check.digest[0], 0);
         bits::assert_trailing_zeros(context, word, n_bits);
