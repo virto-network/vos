@@ -61,8 +61,10 @@ native verifier, and the build of slice 5's M1.
    [model / measured]: an eighth of a permutation row for the leaf hash, and
    about an eighth of a DEEP row a sample.
 6. **The fold converges at once.** Verifying two children of the padded shape
-   needs 30,619 / 41,480 / 3,588 rows, 47% / 32% / 5% of the shape [model].
-   The leaf sets the shape; a fold alone would settle at 2^15 / 2^16 / 2^12.
+   needs 30,619 / 41,480 / 3,588 rows, 47% / 32% / 5% of the shape [model];
+   built, **32,167 / 42,896 / 4,048** finalized, 49.1% / 32.7% / 6.2%
+   [measured, slice 5's 5.13, §6]. The leaf sets the shape; a fold alone
+   would settle at 2^15 / 2^16 / 2^12.
 7. **The final wrap** verifies the root fold in 2^14 / 2^15 / 2^11 rows
    (tallest 2^15 ≤ 2^17) [model]: 2.2–4.9 GiB at blowup 64 [projected], about
    85M JAM gas with Blake2b-256 in software, 64M through `0x400`, 117–119M
@@ -128,12 +130,12 @@ masking variant (c) applies unchanged (`R/spike2-masking.md` §3b).
 
 ### 1.3 `p2`: Poseidon2-M31, one permutation a row
 
-- **The permutation** is measured as vos's: width 16, R_F = 8, R_P = 14,
-  rate 8, its Grain constants, and its round order: add constants, the linear
-  layer, then the S-box (`P/src/poseidon2/mod.rs:40-44`, `:283-307`). M0
-  replaces it with the reference arrangement and Plonky3's constants (§11,
-  R2). The shape survives: the final `M_E` is linear, there are 142 S-boxes
-  either way, and `p2_check` is re-run.
+- **The permutation** was first measured as vos's then: width 16, R_F = 8,
+  R_P = 14, rate 8, its Grain constants, and its round order: add constants,
+  the linear layer, then the S-box. M0 replaced it with the reference
+  arrangement and Plonky3's constants (§11, R2; slice 5's 5.2). The shape
+  survived: the final `M_E` is linear, there are 142 S-boxes either way,
+  and `p2_check` was re-run.
 - **The S-box at degree 3:** `a = y²` and `out = a²·y`, two columns per S-box.
   The 15 untouched words of a partial round stay linear expressions. That is
   16 input columns plus 142 × 2 = **300 columns, the floor at degree 3**: y⁵
@@ -348,7 +350,7 @@ follows the code.
 
 **The boundary states are mixed as bytes** (`proving.md` A.3): each byte of
 the boundary chips' tuples (`P/src/boundary_binding.rs:262-268`) is one M31,
-and item 3 absorbs the 296 as one run, 37 permutations against today's 38
+and item 3 absorbs the 296 as one run, 37 permutations against format 36's 38
 per-value absorbs. The transcript so binds the exact tuples the public logup
 terms use before any challenge is drawn. The leaf range-checks only the 32
 bytes of φ9..12, which it combines into the io-hash's limbs; every other
@@ -370,11 +372,11 @@ rows [model].
 Exactly `Poseidon2M31Channel` (`P/src/poseidon2/mod.rs:489-619`): absorb into
 `[8, 16)` over the digest in `[0, 8)` (channel modes), squeeze
 `digest ‖ n_draws ‖ 3` (wired mode), PoW as two permutations with
-`trailing_zeros(s2[0]) ≥ n` checked by decomposing its high bits. In the new
-formats the boundary states are absorbed as bytes (§4.1), `mix_u64` absorbs
-four 16-bit limbs, and the PoW nonce enters as four; today the last two are
-`reduce(lo32), reduce(hi32)` (`P/src/poseidon2/mod.rs:576-577`, `:592-597`),
-which folds a word ≥ p onto a smaller one. The absorb
+`trailing_zeros(s2[0]) ≥ n` checked by decomposing its high bits. In the
+lossless formats the boundary states are absorbed as bytes (§4.1),
+`mix_u64` absorbs four 16-bit limbs, and the PoW nonce enters as four; the
+old `reduce(lo32), reduce(hi32)`, which folded a word ≥ p onto a smaller
+one, retired with the formats that used it. The absorb
 carries no length or tag (`absorb([a]) = absorb([a, 0])`,
 `P/src/poseidon2/mod.rs:531-547`); that is sound only because the transcript's
 shape is fixed, and a circuit pins it.
@@ -709,11 +711,15 @@ build-std. It holds:
   ids, the parameters of §7, the format number;
 - Stwo's core verifier at the pin, FRI fold step 3 and a 2^6 last layer
   (`ST/stwo/src/core/fri.rs:107-200`, admitted after review);
-- the Blake2b-256 Merkle hasher and channel, through the host where one exists
-  (VOS `0x400`, Kreivo's `blake2_256`), in software otherwise;
+- the Blake2b-256 Merkle hasher and channel, in software as built; through
+  the host (VOS `0x400`, Kreivo's `blake2_256`) once the fork's hasher
+  takes a compression hook (slice 6);
 - the public logup sum from the program id, the io-hash, `u` and `one`;
-- lean as spike 4a's: no preflight, components built once, a fixed-layout
-  decode (`R/spike4a-final-gas.md` §4).
+- the components built once, as spike 4a's; unlike spike 4a's, a shape
+  check before any Stwo call (`check_shape`, `check_samples`: the
+  verifier must be panic-free, `proving.md` §6); and postcard's decode,
+  16.0M of its 96.4M gas, until a fixed-layout decode (slice 6,
+  `R/spike4a-final-gas.md` §4).
 
 **Expected size:** spike 4a's proxy verifier is 344–370 KB as a PVM program
 and 208 KB as a Wasm blob [measured]; the recursion AIR's constraints (313,

@@ -1676,32 +1676,10 @@ count, then the floors]:
 
 ### Carried into M1
 
-- **The leaf's rows are tight.** At 44 queries over the hardened
-  shape's 8,024 columns, the kernel leaf's `p2` comes to about 64.8k of
-  2^16 [model]. The ~9,300-column headroom, counted at 39 queries, is
-  about 8,100 at 44. 5.11 counts it on the hardened AIR first. The plan
-  carries it.
-- **The wrap's 80 proven bits:** 74.71 as built. 5.14 chooses between
-  affine DEEP batching (recommended), a batching-phase PoW, and blowup 8.
-- **The program id's leaf-circuit hashes** (5.12). The id enters the
-  `Derivation` once an install can compute the class roots, which today
-  need the prover.
-- **Pinning costs prover time.** The ALU chips pad to the class's steps,
-  and WITNESS_INPUT pads to 2^16 in every segment. Narrower capacities,
-  or WITNESS_INPUT in the entry class alone, are open.
-- **Recorded, unfixed:**
-  - C-DJUMP, an invalid dynamic jump that cannot be proved; no kernel
-    needs it.
-  - The ledgers' 2^27-step idle limit.
-  - A BLAKE2b pointer within 256 bytes of 2^32 that cannot be proved.
-  - Refine slices' page permissions, bound by replay and not in the AIR.
-- **AVX-512F** is compiled but not run on this machine.
-- **For the owner:**
-  - 5.6, the phone run;
-  - PolkaJam's recompiler run, which needs a build that tolerates cores
-    without L3, or another machine.
-- **M0's closing:** the Opus milestone review, folded below; then a
-  push.
+Taken within the slice: the leaf's rows (5.10a's format 35 at 40 queries,
+counted at 5.11), the wrap's 80 proven bits (5.14's affine batching), the
+program id's leaf-circuit hashes (5.12), and M0's closing (the review
+below, then the push). The rest are in [Carried out of slice 5](#carried-out-of-slice-5).
 
 ### The milestone review
 
@@ -2016,14 +1994,8 @@ refactors, a commit each; none changes a constraint.
 
 ### Left for 5.16
 
-- **A typed row:** an `AirColumn` derive that generates a `Row<E>` view,
-  each column a field read once, would replace the column reads each
-  split function repeats, about 600 lines of the split's 4,100.
-- **The split's carried names and comments:** the `_p19` and `_p54`
-  suffixes on its locals (`f_ff_p19`, `sign_bit_result_p19`,
-  `tuple_p54`, `f_is_mul_p54` and their kin), and the comments that say
-  "now" or "for now" (`compare.rs`, `control.rs`, `divrem.rs`), come
-  from the body before the split and need renaming and rewording.
+The typed row and the split's carried names: in [Carried out of slice 5](#carried-out-of-slice-5), under 5.16's
+code-quality step.
 
 ### Gates
 
@@ -2222,17 +2194,8 @@ refactors, a commit each; none changes a constraint.
 
 ### Carried to later steps
 
-- **5.10: a `Bit` type for `node`'s direction.** `gadgets::node` takes
-  `bit: Var` and trusts its producer to constrain it: a `p2` row reads
-  the bit as a use, and the `Node` mode's input is linear in `b`, so a
-  non-bit picks a blend of the two orders. A `Bit` newtype only
-  `Context::assert_bit` or a bit decomposition produces would move that
-  trust into the types.
-- **5.9 on: a message wire's unread lanes are not zero.** A `p2` row's
-  message lanes with `act = 0` are yielded (or used) with the wire, but
-  not absorbed: nothing constrains them. A consumer of such a wire reads
-  the prover's choice there and must not assume zero; a partial block's
-  padding comes from `c`, not from the wire.
+The `Bit` type for `node`'s direction (built at 5.10, `context/mod.rs`) and
+the invariant that a message wire's unread lanes are not zero: in [Carried out of slice 5](#carried-out-of-slice-5).
 
 ### A pre-existing failure, fixed
 
@@ -2767,16 +2730,10 @@ then once):
 
 ### Carried to later steps
 
-- **5.11:** the window kernel's leaf rows above are built, not modelled;
-  5.11's regression test pins them per piece.
-- **5.12:** the leaf checks the native per-segment `initial_state.timestamp
-  ≥ 1` (`verifier/src/lib.rs:590`, memory-boundary anchoring) on
-  `Verified.boundary` (`segment.rs`): the initial ts bytes' value, which
-  this piece leaves unchecked.
-- **The boundary bytes stay unchecked in this piece by design:**
-  `proving.md` A.3's local argument, under which the leaf range-checks only
-  the 32 io-hash bytes (φ9..12) it combines lossily; every other use is
-  exact on M31 values.
+Taken: the window kernel's leaf rows, built and pinned per piece (5.11);
+the initial ts ≥ 1 checked on the leaf's boundary (5.12). The boundary
+bytes the leaf leaves unchecked by design (`proving.md` A.3's local
+argument) are in the external audit's scope, in [Carried out of slice 5](#carried-out-of-slice-5).
 
 ### Outside the step's files
 
@@ -3062,13 +3019,8 @@ rows.
 
 ### Carried to later steps
 
-- **5.13:** the fold re-hashes each child's 52-word preimage in A.3's
-  order; the flags and positions sit in one wire, `[first, last, entry,
-  halt]`, the rest on whole wires. A leaf's W and program id are free
-  witnesses, which only the fold binds.
-- **Format 32's registry status** stays reserved: the leaf pins its padded
-  shape (`PADDED_ROWS`), and the fold and wrap decide when the segment
-  verifiers' registry admits it.
+Taken: the fold re-hashing each child's preimage and binding a leaf's W and
+program id (5.13). Format 32's registry status: in [Carried out of slice 5](#carried-out-of-slice-5).
 
 ### Outside the step's files
 
@@ -3274,18 +3226,10 @@ and the fold's rows fitting the shape it proves at.
 
 ### Carried to later steps
 
-- **5.14, the wrap:** it checks the root's W against the fold circuit's
-  hash (`FoldCircuit::hash`), its constant, and refuses a root without
-  `first = 0`, the entry flag and the halt flag; its public words are the
-  root's program id and io-hash, as the root's preimage carries them.
-- **Format 32's registry status** stays reserved; its padded shape is
-  pinned (`LEAF_FOLD_LOG_SIZES`), and the wrap decides when the segment
-  verifiers' registry admits it.
-- **The program id's version 3** changes every id; nothing pins one yet
-  outside the tests, which recompute them.
-- **5.15:** the whole window's tree (its 26 segments) and the solvency
-  predicate's, end to end; here the window kernel's first four segments
-  fold.
+Taken: the wrap's checks and public words (5.14); the window's and the
+predicate's trees end to end (5.15). Format 32's status, and the program
+id's pinning (nothing outside the tests pins an id; the reproducibility
+gate): in [Carried out of slice 5](#carried-out-of-slice-5).
 
 ### Outside the step's files
 
@@ -3493,14 +3437,9 @@ JAM-only host and in Wasm.
 
 ### Carried to later steps
 
-- **5.15:** `vos-statement` and the io-hash recomputation in the final
-  verifier; the solvency predicate's tree; the golden fixtures (A.6) with
-  the wrap's.
-- **Slice 6:** masking the wrap is a format change (a new number, or 28
-  bumped); the `0x400` and Kreivo `blake2_256` hooks; a fixed-layout
-  decode.
-- **The fork:** `DIVERGENCE-011` and `-012` stay open for the external
-  audit (the affine batching citation and count).
+Taken: `vos-statement`, the solvency predicate's tree and the golden
+fixtures (5.15). Masking as a format change, the `0x400` and `blake2_256`
+hooks, the fixed-layout decode and `DIVERGENCE-011`/`-012`: in [Carried out of slice 5](#carried-out-of-slice-5).
 
 ### Outside the step's files
 
@@ -3684,11 +3623,9 @@ end to end; 5.14b's review folded first.
 
 ### Carried to later steps
 
-- **5.16:** the acceptance gates (`ci-full`, `test-proof`, the checker
-  loop), the rows of A.7, the end review and the code-quality review.
-- **Slice 6:** the fixtures regenerated at the masked wrap's format; the
-  pallet's registries over `Venue`; a fixed-layout decode, which would also
-  make the proof's encoding canonical.
+5.16's gates and reviews are its own. The fixtures at the masked format,
+the pallet's registries over `Venue` and the fixed-layout decode: in
+[Carried out of slice 5](#carried-out-of-slice-5).
 
 ### Outside the step's files
 
@@ -3854,10 +3791,9 @@ moved with the relations' order). `wrap.proof` is 124,025 bytes,
 
 ### Carried to later steps
 
-- **Slice 6:** the window kernel states its public arguments and roots in
-  its io-hash once the SDK supports it; until then the Clerk's handler
-  checks the window's space and anchors (`anchor_i`, `anchor_j`, in its
-  output) against its anchored roots, since `judge` cannot.
+The window kernel's roots and public arguments in its io-hash, and what a
+venue may do with its statement until then (F2 of the end review): in
+[Carried out of slice 5](#carried-out-of-slice-5).
 
 ### Outside the step's files
 
@@ -3867,3 +3803,190 @@ moved with the relations' order). `wrap.proof` is 124,025 bytes,
 - `pvm/proof/final-verifier/wasm/run`: its modes documented, its counting
   best-effort.
 - `docs/design/proving.md` §3.6, A.6; `slice-5-proving.md` 5.15.
+
+## Step 5.16a: the end review folded
+
+The slice's end review (Fable, read-only, at 8a66fc3a) found one defect in
+the slice's deliverable and stale lines in the design docs, and asked for
+one list of what leaves the slice.
+
+### F1, the fix: the statement id without the format
+
+- **The hole:** `Statement::id` hashed `format`, and the program id does
+  not move with the final format (it covers the segment format only). A
+  venue accepting two final formats during a transition, as §3.6 and A.4
+  require, would give one run an id under each, and its repeat check
+  would let a settlement apply twice. Same class as 5.15b's F1, one field
+  over.
+- **The fix:** `id = BLAKE2b-256("vos/statement/v1" ‖ program ‖ space ‖
+  io_hash)`. The format stays a checked field, as `space` is. The golden
+  id re-pinned (`06925f7b…`, recomputed outside Rust from its preimage);
+  the io-hash is unchanged; `every_field_is_bound` holds the format to
+  move neither.
+- **The fixture, "the same run, another accepted format":** the venue
+  accepts 28 and 38 (a number no format holds) and has accepted `S` under
+  38; `S` under 28 is refused as a repeat, `0x6`, natively, in Wasm under
+  both semantics and on the JAM-only host (0.1M gas). It would have been
+  accepted before the fix.
+- **Why this route:** the repeat check reads only the id the venue keeps,
+  so recording the successor's acceptance as that id exercises the whole
+  path a transition takes, with no test-only format in shipped code. A
+  verifier admitting a test format with 28's verifier would put a second
+  acceptance path into `admit` for a case the id alone decides. This
+  verifier reads 28 alone, so the case the other way round (accepted
+  under 28, then presented under the successor) waits for the masked
+  format, whose fixtures add it. The model's own test holds the same.
+- **The fixtures:** `statements.cases` written anew (13 cases, 6.4 KB);
+  the three wraps byte-identical; the valid statement's id
+  `406628d2…c972` at every venue.
+
+### The docs
+
+- **`proving.md`:** §3.3/§3.4 at format 35's 40 queries (the kernel leaf
+  12% spare, about 1,000 columns of headroom); §3.5 masked in slice 6;
+  §3.6 the id without the format, and that only the kernel's code binds a
+  `RootRead` to what it verified (admitting a program id is admitting
+  that kernel's audit); §4 the end-to-end proven bound, 62.86, format 36
+  below the floor, the audit's scope; §6 panic-free by construction (a
+  FRAME runtime cannot catch a panic), the pallet's own length cap, the
+  words an input, every re-pin a governance event, the anchor table keyed
+  by kind; §8, §10 and §11 the phone run pending the owner's team; A.1
+  and A.3 cited by function, not line; A.6 the thirteenth case.
+- **`recursion-air.md`:** §0 the fold's built rows; §1.3 and §4.2 in the
+  past tense about the retired permutation and `reduce`; §8 as built
+  (the shape checks, Blake2b in software, postcard's decode).
+- **`pvm/proof/SECURITY.md`,** rewritten for the two paths: the formats
+  and their counts, the end-to-end bound, format 36's status, the
+  hardened AIR and what its audit covered, the witness input, the halt
+  rule, no gas, page permissions as identity, the statement's trust
+  boundary (the venue's pin, the id, the rootless rule, the kernel's
+  audit), panic-freedom, the fork's open divergences, the audit's scope.
+- **This log:** the scattered carried lists replaced by one, below.
+
+### Gates
+
+[measured, on this machine, under `systemd-run` at 14 GiB with `nice -n
+10`]: `just check` green, 1,113 tests in 94 suites; `cargo test -p
+vos-statement --features fixtures` green (the guest rebuilt), the 13
+fixtures judged as recorded natively and on the JAM-only host; `just
+judge-wasm` green, 13 fixtures under the PVF's semantics and the
+client's; the fixtures' stale test (`the_fixtures_are_the_generators`)
+green after `just fixtures`.
+
+## Carried out of slice 5
+
+Every item the slice carries, in one place; the steps' own sections say
+what they took and point here.
+
+### Within the slice: 5.16's remaining steps
+
+- **The acceptance gates:** `ci-full`, `test-proof`, the checker loop and
+  A.7's rows; then the code-quality review.
+- **The code-quality list:** the gates under `tests/gates/`; `phase2_alu`
+  renamed; `divrem.rs` split; `proof.rs`'s changelog comments; an
+  `AirColumn` derive generating a `Row<E>` view, each column read once
+  (about 600 of the CPU split's 4,100 lines); the split's `_p19` and
+  `_p54` suffixes (`f_ff_p19`, `sign_bit_result_p19`, `tuple_p54`,
+  `f_is_mul_p54` and their kin) and its "now" / "for now" comments
+  (`compare.rs`, `control.rs`, `divrem.rs`).
+
+### To slice 6
+
+- **Masking the wrap,** variant (c) with R1–R8, gated at ≤ 24 GiB and
+  ≤ 200M gas: a format bump (a new number, or 28 bumped) that also takes
+  - the fixed-layout decode (most of the decode's 16.0M of 96.4M gas; it
+    makes the encoding canonical too), and
+  - Blake2b through `0x400` and Kreivo's `blake2_256` (a compression hook
+    in the fork's hasher);
+
+  and the golden fixtures regenerated at that format, with the
+  transition's repeat case in both directions.
+- **F2, the venue binding.** A rootless statement is valid at every venue,
+  forever, and a rooted one is venue-bound only by the governance rule
+  that a space anchors on one venue at a time. Slice 6's statement design
+  puts a venue domain in the id or the io-hash, or makes migration refuse
+  windows outside each venue's range in code (`proving.md` §7). The window
+  kernel's anchors go into its io-hash once the SDK states a kernel's
+  roots and `#[public]` arguments there; **until then no venue acts on the
+  window's statement unless its handler checks `anchor_i` and `anchor_j`
+  against its anchored roots,** and that check is a stopgap for tests, not
+  a deployment path.
+- **Forgery gates for the recursion AIR,** written before the audit, the
+  standard the base AIR's hardening set: `p2`'s modes and chaining, the
+  `Gate` relation's signed multiplicities (R12), `assert_one_of`, the lane
+  gadgets, and the boundary bytes the leaf leaves unchecked by design
+  (A.3's local argument). The invariant they lean on: a message wire's
+  unread lanes are not zero, and no consumer may assume they are.
+- **Adversarial venue fixtures for every id and io-hash field:** a "replay
+  with this field changed" case for each (another space, format, venue,
+  window, nonce), designed from the preimages before the pallet exists.
+- **`vos-statement` and `vos-final-verifier` panic-free by construction,**
+  the fuzz campaigns a CI job, and every index and `unwrap` on the verify
+  path audited at the pin.
+- **The reproducibility gate:** the window kernel's and the predicate's
+  program ids, `H_fold` and the wrap root pinned as repository constants,
+  computed in CI under both feature sets (with and without
+  `debug-internals`) and on aarch64; a `program-id` tool whose output
+  governance pins. Nothing outside the tests pins an id today.
+- **Kreivo's dependency path:** `vos-statement` → `vos-final-verifier` →
+  a git-pinned Stwo fork and `vos-recair-air`, under a runtime crate; a
+  frame-contrib pallet needs a publishable or vendored path.
+- **Format 36's retirement or upgrade:** at 96 / 57 it is below the 60-bit
+  floor, and the default prover entry points and the refine bundles still
+  produce it. Retire it, or move the refine path to 35.
+- **The pallet** (P0, P1) over `Venue`: its registries (formats; programs,
+  with a delay; spaces, their anchor table keyed by root kind too, since
+  `RootRead.kind` has no registry yet); the extrinsic's length capped by
+  the pallet; the statement's words an input to the verifier, never an
+  output; every re-pin a governance event at every venue.
+- **Format 32** stays reserved: no verifier outside the recursion reads a
+  leaf or a fold.
+- **Prover time:** the ALU chips pad to the class's steps and
+  WITNESS_INPUT pads to 2^16 in every segment; narrower capacities, or
+  WITNESS_INPUT in the entry class alone, are open.
+- **Recorded, unfixed:** C-DJUMP (an invalid dynamic jump cannot be
+  proved; no kernel needs it); the ledgers' 2^27-step gap; a BLAKE2b
+  pointer within 256 bytes of 2^32; refine slices' page permissions,
+  bound by replay and not in the AIR.
+
+### The external audit
+
+Before value rides on a proof. Its scope:
+- the base segment AIR, above all the parts the hardening's groups (G1–G4)
+  left without forgery gates: PROGRAM_MEMORY's decode binding,
+  JUMP_TABLE, the lookup tables, MEMORY_PAGE and MEMORY_MERKLE, the
+  witness-input chip, the boundary-binding argument, the segment-cut and
+  closing-flag rule;
+- the fork's divergences: the Blake2b channel, fold step 3, affine DEEP
+  batching, the completeness backport, with `DIVERGENCE-011` (0.8 bits of
+  format 28's fold term) and `-012` (the citation and the count carrying
+  the wrap from 74.7 to 82.6 proven bits) still open;
+- the security tool's counts (`security.rs`);
+- the recursion AIR: the in-AIR verifier, the gate compiler, the claimed
+  sums, the fold, and the Poseidon2 channel and A.3's encodings;
+- the leaf's binding (its entry constants, the io-hash's range checks),
+  the wrap, `vos-final-verifier`, `vos-statement`;
+- `derive` (layout to preprocessed columns, its refusals) and the program
+  id's derivation;
+- the masking and the public sums' re-cut, once built.
+
+**Its owner and timing are the owner's to set: open.**
+
+### To slice 7
+
+- **The phone factor:** 5.6's run on a real flagship, pending the owner's
+  team; it replaces the projected ARM factor.
+- **The device profile** (`proving.md` §8), and before it the credential
+  AIR, the Poseidon2 root kind and the zkPVM's Poseidon2 chip; narrow
+  BLAKE2b; the bignum chip replacing Ristretto.
+- **The one-size lifting-height gap for BLAKE2B-heavy kernels:** a class
+  whose chips share the largest log size samples its two-sample columns
+  on coinciding points, and its leaf outgrows `qm31`'s 2^17; derive
+  refuses it. A `POLICY` keeping the largest chip alone at the top, or
+  DEEP blocks for coinciding samples, would admit it.
+
+### For the owner
+
+- **AVX-512F** is compiled but not run on this machine.
+- **PolkaJam's recompiler run** needs a build that tolerates cores
+  without L3, or another machine.
