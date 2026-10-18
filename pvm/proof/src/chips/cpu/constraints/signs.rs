@@ -75,9 +75,9 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
     let is_real = E::F::one() - row.is_padding[0].clone();
     // Sign-bit nibble lookups (last lookup block before finalize).
     {
-        let eight_p17: E::F = E::F::from(BaseField::from(8));
-        let sixteen_p17: E::F = E::F::from(BaseField::from(16));
-        let fifteen_p17: E::F = E::F::from(BaseField::from(15));
+        let eight: E::F = E::F::from(BaseField::from(8));
+        let sixteen: E::F = E::F::from(BaseField::from(16));
+        let fifteen: E::F = E::F::from(BaseField::from(15));
 
         // SignBitB: (hi_b, 8, 8·bit_b), (src_b − 16·hi_b, 0xF, same).
         eval.add_to_relation(RelationEntry::new(
@@ -85,15 +85,15 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             is_real.clone().into(),
             &[
                 row.sign_b_hi_nib[0].clone(),
-                eight_p17.clone(),
-                row.sign_bit_b[0].clone() * eight_p17.clone(),
+                eight.clone(),
+                row.sign_bit_b[0].clone() * eight.clone(),
             ],
         ));
-        let lo_b = row.sign_src_b[0].clone() - row.sign_b_hi_nib[0].clone() * sixteen_p17.clone();
+        let lo_b = row.sign_src_b[0].clone() - row.sign_b_hi_nib[0].clone() * sixteen.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
-            &[lo_b.clone(), fifteen_p17.clone(), lo_b],
+            &[lo_b.clone(), fifteen.clone(), lo_b],
         ));
 
         // SignBitD.
@@ -102,15 +102,15 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             is_real.clone().into(),
             &[
                 row.sign_d_hi_nib[0].clone(),
-                eight_p17.clone(),
-                row.sign_bit_d[0].clone() * eight_p17.clone(),
+                eight.clone(),
+                row.sign_bit_d[0].clone() * eight.clone(),
             ],
         ));
-        let lo_d = row.sign_src_d[0].clone() - row.sign_d_hi_nib[0].clone() * sixteen_p17.clone();
+        let lo_d = row.sign_src_d[0].clone() - row.sign_d_hi_nib[0].clone() * sixteen.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
-            &[lo_d.clone(), fifteen_p17.clone(), lo_d],
+            &[lo_d.clone(), fifteen.clone(), lo_d],
         ));
 
         // SignBitQ — source is the multiplexed SignSrcQ
@@ -120,15 +120,15 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             is_real.clone().into(),
             &[
                 row.sign_q_hi_nib[0].clone(),
-                eight_p17.clone(),
-                row.sign_bit_q[0].clone() * eight_p17.clone(),
+                eight.clone(),
+                row.sign_bit_q[0].clone() * eight.clone(),
             ],
         ));
-        let lo_q = row.sign_src_q[0].clone() - row.sign_q_hi_nib[0].clone() * sixteen_p17.clone();
+        let lo_q = row.sign_src_q[0].clone() - row.sign_q_hi_nib[0].clone() * sixteen.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
-            &[lo_q.clone(), fifteen_p17.clone(), lo_q],
+            &[lo_q.clone(), fifteen.clone(), lo_q],
         ));
 
         // SignBitR — source is SignSrcR (multiplexed).
@@ -137,15 +137,15 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             is_real.clone().into(),
             &[
                 row.sign_r_hi_nib[0].clone(),
-                eight_p17.clone(),
-                row.sign_bit_r[0].clone() * eight_p17.clone(),
+                eight.clone(),
+                row.sign_bit_r[0].clone() * eight.clone(),
             ],
         ));
-        let lo_r = row.sign_src_r[0].clone() - row.sign_r_hi_nib[0].clone() * sixteen_p17.clone();
+        let lo_r = row.sign_src_r[0].clone() - row.sign_r_hi_nib[0].clone() * sixteen.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
-            &[lo_r.clone(), fifteen_p17.clone(), lo_r],
+            &[lo_r.clone(), fifteen.clone(), lo_r],
         ));
 
         // SignBitResult — pin to bit 7 of result[3].  No Is32Bit
@@ -159,15 +159,15 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             is_real.clone().into(),
             &[
                 row.result_hi_nib[0].clone(),
-                eight_p17.clone(),
-                row.sign_bit_result[0].clone() * eight_p17.clone(),
+                eight.clone(),
+                row.sign_bit_result[0].clone() * eight.clone(),
             ],
         ));
-        let lo_res = row.result[3].clone() - row.result_hi_nib[0].clone() * sixteen_p17.clone();
+        let lo_res = row.result[3].clone() - row.result_hi_nib[0].clone() * sixteen.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
-            &[lo_res.clone(), fifteen_p17.clone(), lo_res],
+            &[lo_res.clone(), fifteen.clone(), lo_res],
         ));
 
         // LoadSignBit — pin to bit 7 of LoadSignSrc.
@@ -176,16 +176,16 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             is_real.clone().into(),
             &[
                 row.load_sign_hi_nib[0].clone(),
-                eight_p17.clone(),
-                row.load_sign_bit[0].clone() * eight_p17.clone(),
+                eight.clone(),
+                row.load_sign_bit[0].clone() * eight.clone(),
             ],
         ));
         let lo_load =
-            row.load_sign_src[0].clone() - row.load_sign_hi_nib[0].clone() * sixteen_p17.clone();
+            row.load_sign_src[0].clone() - row.load_sign_hi_nib[0].clone() * sixteen.clone();
         eval.add_to_relation(RelationEntry::new(
             bitwise_and_lookup,
             is_real.clone().into(),
-            &[lo_load.clone(), fifteen_p17.clone(), lo_load],
+            &[lo_load.clone(), fifteen.clone(), lo_load],
         ));
     }
 

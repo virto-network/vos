@@ -416,12 +416,12 @@ pub(in crate::chips::cpu) fn signed_load_extension<E: EvalAtRow>(eval: &mut E, r
         // Inactive-byte binding for all loads: result[i] = 0xFF · LoadSignBit
         // when mem_byte_active[i] = 0.  Skip i=0 (always active for any
         // non-zero MemSize, so mem_byte_active[0] = 1 ⇒ gate = 0).
-        let f_ff_p20: E::F = E::F::from(BaseField::from(255));
+        let ff: E::F = E::F::from(BaseField::from(255));
         // 2-factor selector × linear body via helper.
         for i in 1..WORD_SIZE {
             eval.add_constraint(
                 row.is_load_local_not_active_h[i].clone()
-                    * (row.result[i].clone() - f_ff_p20.clone() * row.load_sign_bit[0].clone()),
+                    * (row.result[i].clone() - ff.clone() * row.load_sign_bit[0].clone()),
             );
         }
     }

@@ -39,7 +39,7 @@ pub(in crate::chips::cpu) fn selector_helpers<E: EvalAtRow>(eval: &mut E, row: &
 
 /// Add: a byte-wise carry chain, sign-extended on 32-bit rows.
 pub(in crate::chips::cpu) fn add<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    let f_ff_p19: E::F = E::F::from(BaseField::from(255));
+    let ff: E::F = E::F::from(BaseField::from(255));
     let f256 = E::F::from(BaseField::from(256u32));
     // ════════════════════════════════════════════════════════════════════
     // ADD: result[i] + carry[i]*256 = val_b[i] + val_d[i] + carry[i-1]
@@ -69,14 +69,14 @@ pub(in crate::chips::cpu) fn add<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     for i in 4..WORD_SIZE {
         eval.add_constraint(
             row.is_add32bit_h[0].clone()
-                * (row.result[i].clone() - f_ff_p19.clone() * row.sign_bit_result[0].clone()),
+                * (row.result[i].clone() - ff.clone() * row.sign_bit_result[0].clone()),
         );
     }
 }
 
 /// Sub: two's-complement addition, sign-extended on 32-bit rows.
 pub(in crate::chips::cpu) fn sub<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    let f_ff_p19: E::F = E::F::from(BaseField::from(255));
+    let ff: E::F = E::F::from(BaseField::from(255));
     let f256 = E::F::from(BaseField::from(256u32));
     let f255 = E::F::from(BaseField::from(255u32));
     // ════════════════════════════════════════════════════════════════════
@@ -109,14 +109,14 @@ pub(in crate::chips::cpu) fn sub<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     for i in 4..WORD_SIZE {
         eval.add_constraint(
             row.is_sub32bit_h[0].clone()
-                * (row.result[i].clone() - f_ff_p19.clone() * row.sign_bit_result[0].clone()),
+                * (row.result[i].clone() - ff.clone() * row.sign_bit_result[0].clone()),
         );
     }
 }
 
 /// 32-bit Mul: the result sign-extended; the product itself is bound through MulChip.
 pub(in crate::chips::cpu) fn mul<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    let f_ff_p19: E::F = E::F::from(BaseField::from(255));
+    let ff: E::F = E::F::from(BaseField::from(255));
     // ════════════════════════════════════════════════════════════════════
     // MUL: CpuChip witnesses UnsignedProductLow/Hi/MulHigh (used by the
     // result-variant binding below); their values are pinned by lookup
@@ -130,7 +130,7 @@ pub(in crate::chips::cpu) fn mul<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     for i in 4..WORD_SIZE {
         eval.add_constraint(
             row.is_mul32bit_h[0].clone()
-                * (row.result[i].clone() - f_ff_p19.clone() * row.sign_bit_result[0].clone()),
+                * (row.result[i].clone() - ff.clone() * row.sign_bit_result[0].clone()),
         );
     }
 }

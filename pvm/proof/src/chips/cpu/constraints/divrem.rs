@@ -55,7 +55,7 @@ pub(in crate::chips::cpu) fn zero_divisor_helpers<E: EvalAtRow>(eval: &mut E, ro
 
 /// DivRem: the result is the quotient or the remainder, sign-extended on 32-bit rows.
 pub(in crate::chips::cpu) fn divrem<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    let f_ff_p19: E::F = E::F::from(BaseField::from(255));
+    let ff: E::F = E::F::from(BaseField::from(255));
     // ════════════════════════════════════════════════════════════════════
     // DIVREM: quotient * divisor + remainder = dividend
     // dividend = val_b, divisor = val_d
@@ -91,7 +91,7 @@ pub(in crate::chips::cpu) fn divrem<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>)
     for i in 4..WORD_SIZE {
         eval.add_constraint(
             row.is_div_rem32bit_h[0].clone()
-                * (row.result[i].clone() - f_ff_p19.clone() * row.sign_bit_result[0].clone()),
+                * (row.result[i].clone() - ff.clone() * row.sign_bit_result[0].clone()),
         );
     }
 
@@ -173,10 +173,10 @@ pub(in crate::chips::cpu) fn zero_divisor<E: EvalAtRow>(eval: &mut E, row: &Row<
         );
 
         // DivByZero result binding — flattened via DbzActiveQuotH/RemH.
-        let f_ff_p29: E::F = E::F::from(BaseField::from(255));
+        let ff: E::F = E::F::from(BaseField::from(255));
         for i in 0..WORD_SIZE {
             eval.add_constraint(
-                row.dbz_active_quot_h[0].clone() * (row.result[i].clone() - f_ff_p29.clone()),
+                row.dbz_active_quot_h[0].clone() * (row.result[i].clone() - ff.clone()),
             );
             let gate = if i < 4 {
                 &row.dbz_active_rem_h
