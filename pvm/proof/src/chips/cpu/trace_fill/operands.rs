@@ -209,9 +209,8 @@ pub(super) fn flag_columns(out: &mut Sinks, s: Step) {
     );
     trace.fill_columns(row, flags.is_sub && flags.is_32bit, Column::IsSub32bitH);
     trace.fill_columns(row, flags.is_mul && flags.is_32bit, Column::IsMul32bitH);
-    // Some helpers depend on val_b/val_d/cmp_lt_flag/sign_bit_b/d/
-    // div_by_zero, which are computed later in this iteration.  See
-    // the deferred helper-column fills near the end of the loop body.
+    // The helpers that also read the operands, the comparison or the
+    // division are `helpers`'.
     // IsMulUpper is the (mu_uu+mu_su+mu_ss) sum — no column to fill.
     trace.fill_columns(row, flags.is_mul_upper_uu, Column::IsMulUpperUU);
     trace.fill_columns(row, flags.is_mul_upper_su, Column::IsMulUpperSU);

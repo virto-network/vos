@@ -100,8 +100,7 @@ pub(super) fn helpers(
     );
 
     // ── val_d byte-indicator helpers ──
-    // val_d_byte_inv / val_d_partial_nz are filled earlier in
-    // this loop.  Reuse the locals from that fill.
+    // From `compare`'s val_d_byte_inv and val_d_partial_nz.
     let mut indicator = [BaseField::from(0u32); 8];
     let mut ind_minus1 = [BaseField::from(0u32); 8];
     let mut part_nz_times_ind = [BaseField::from(0u32); 7];
@@ -157,8 +156,7 @@ pub(super) fn helpers(
 
     // ── Partial-NZ (MSB direction) times-indicator helpers ──
     // PartNZMsbTimesIndH[i] = PartialNZMsb[i+1] · ByteIndicator[i] for i ∈ 0..7.
-    // val_d_partial_nz_msb is computed later in this loop, after
-    // this helper-fill block — compute it here independently.
+    // The MSB-direction partial ORs, as `bit_counts` computes them.
     let mut pnz_msb = [0u8; 8];
     let mut running_msb: u8 = 0;
     for i in (0..WORD_SIZE).rev() {
@@ -408,8 +406,7 @@ pub(super) fn residual(out: &mut Sinks, s: Step, shift: &Shift, div: &DivRem, co
     // IsLoadLocalNotActiveH[i] = is_load · (1 - mem_byte_active[i]).
     let mut load_not_active = [0u8; 8];
     if flags.is_load {
-        // mem_byte_active is filled inside the `if mem` block above.
-        // Reconstruct it here from MemSize.
+        // MemByteActive, as `memory` fills it, from the access's size.
         let mem_size: u8 = step
             .mem_read
             .as_ref()

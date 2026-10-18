@@ -161,10 +161,8 @@ pub(super) fn mul(s: Step, ops: &Operands) -> MulWitness {
     }
     // MulCarry/MulCarryHi, UnsignedProductHi, MulCorrTermA/B/Carry,
     // MulHigh, and UnsignedProductLow are witnessed on MulChip, not
-    // CpuChip.
-    //
-    // MulEntry capture happens below — it needs sign_bit_b/sign_bit_d,
-    // which are computed further down.
+    // CpuChip; `mul_entry` captures MulChip's row once `compare` has the
+    // operands' signs.
     MulWitness {
         mul_high,
         mul_carry,

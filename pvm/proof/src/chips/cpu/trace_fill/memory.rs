@@ -36,9 +36,8 @@ pub(super) fn memory_flags(out: &mut Sinks, s: Step) {
         0
     };
     trace.fill_columns(row, reg_val_a_u64, Column::RegValA);
-    // RotL64 flag.  RotL64's val_d gets rewritten to 2^n +
-    // ShiftQuotient infra fires (gated on the IsShiftConstrained
-    // above).
+    // RotL64 flag.  RotL64's val_d is rewritten to 2^n, and the
+    // ShiftQuotient columns, gated on IsShiftConstrained, fire.
     trace.fill_columns(row, flags.is_rotate_l64, Column::IsRotateL64);
 }
 

@@ -47,8 +47,8 @@ pub(super) fn divrem(out: &mut Sinks, s: Step, ops: &Operands) -> DivRem {
     trace.fill_columns_bytes(row, &div_remainder, Column::DivRemainder);
     trace.fill_columns(row, div_by_zero, Column::DivByZero);
 
-    // Byte-wise zero-check for div_remainder (mirrors the val_d
-    // pattern above).  Drives the sign-of-r uniqueness constraint.
+    // Byte-wise zero-check for div_remainder (as `compare`'s for val_d).
+    // Drives the sign-of-r uniqueness constraint.
     let mut val_r_byte_inv = [stwo::core::fields::m31::BaseField::from(0u32); 8];
     let mut val_r_partial_nz = [0u8; 8];
     let mut running_nz: u8 = 0;
