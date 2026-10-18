@@ -3912,6 +3912,59 @@ fixtures under the PVF's semantics and the client's; `just clippy` green;
 the fixtures' stale test (`kernel fixtures::the_fixtures_are_the_generators`)
 green with and without `debug-internals`, every fixture byte-identical.
 
+## Step 5.16c: the code-quality cleanup, part 2
+
+The quality review's second part, folded as separate commits, every one
+behaviour-preserving: proof bytes and the golden fixtures are unchanged
+throughout (the stale-fixture test after each commit that touches the
+prover, the AIR or the recursion).
+
+| Commit | What | Lines |
+|---|---|---|
+| `febe6282` | Module splits: `chips/divrem` into `mod` (columns), `constraints`, `witness`, `trace`; `proof.rs`'s preflight (`proof/preflight.rs`) and PCS/security policy (`proof/policy.rs`); `segment` into `bounds`, `window`, `cursor`, `tests`; `page_merkle`'s tests; Blake2b's compression core into `blake2b/compression/{mod,constraints,interaction,fill}`, `add_compression_core` one call per section over the columns it reads once | +4,821 −4,550 |
+| `2a4399f7` | `trace_fill`'s 1,725-line `generate_main_trace` into `trace_fill/{operands,alu,compare,shift,control,bitmanip,divrem,memory,host_call,helpers}`: `fill_row` calls one function per section in the loop body's order, each taking what it reads (`Operands`, `MulWitness`, `Compare`, `Shift`, `DivRem`, `BitCounts`, `HostCall`) and writing through `Sinks` | +2,328 −1,769 |
+| `d5af4d75` | `interaction.rs`'s 1,435-line function into `interaction/{memory,control,lookups,registers,signs,program}`, one function per relation group in the emission order | +1,592 −1,473 |
+| `940d18e4` | The `AirColumn` derive's row view: `#[row = "Row"]` generates `Row<F>`, a field per column in snake case (a `_next` twin for a `mask_next_row` column) read once from a `TraceEval`, and `Row::column`; the CPU constraint functions take `&Row<E::F>`, built once in `add_constraints`; the 624 `trace_eval!` reads are gone | +1,110 −1,563 |
+| `34df7bd5` | The arithmetic lookup tuples once (`cpu/tuples.rs`: `MUL_HEAD`/`MUL_UPPER`/`MUL_TAIL`, `DIVREM`, `COMPARE`, `BITWISE`, and the flag lists IsCompare, IsBranch, IsStore and IsBitwise sum), read by the constraints and the interaction trace in the same order | +221 −338 |
+| `181bca64` | The `_pNN` suffixes: the row view and the tuple lists took 85 of the 91 names; the last six are the constants they are (`ff`, `eight`, `sixteen`, `fifteen`) | ±39 |
+| `6534ae5c` | One recursion-AIR transcript prefix: `vos_pvm_recair_air::transcript` (the six steps documented once; `replay_prefix` over a `Prefix`) for the final verifier, recair's `verify` and the fold child's `recursion_data`; recair's `committed_log_sizes` is recair-air's | +119 −69 |
+| `7c76bbc3` | The chip list once: `chips!` generates `chip_idx` (indices, `COUNT`, `NAMES`, the masks), the prover's and the verifier's `BASE_COMPONENTS` and `visit_chip`, which `drive_chip_oods` walks; recair's `CHIP_NAMES` is `chip_idx::NAMES` | +154 −222 |
+| `30c3cb28` | recair's test helpers: `assert_transcript_is` (4 copies), `prove_and_verify` and `is_refused` (the roundtrip), `segment_fixture`, and `full_shape_proof`, built once a binary behind a `OnceLock` (was built twice) | +137 −183 |
+| `1ad7ca55` | `core/tracing.rs`'s `decode_mem_access`: the width, then one match per argument shape (was 20 arms written out) | +66 −347 |
+| `8f3d5587` | `refine/prover.rs`'s collector into `refine/collector.rs` | +877 −863 |
+| `aeaf1682` | recair's two longest test files along their sections: `compiler/{real,synthetic}.rs`, `verifier/pieces.rs` | +767 −757 |
+| `7718f978` | `trace_fill`'s comments name the section that computes what they once called above or below | +11 −18 |
+
+**Total: +12,242 −12,191, net +51 lines.** The splits cost lines (each
+section function destructures what it reads: about +560 in `trace_fill`,
++120 in `interaction`); the row view, the tuple lists, the chip list and
+`decode_mem_access` took about 1,100 back.
+
+Not taken here:
+- **The compiler's `shape::chip`** stays its crate's: vos-pvm-compiler
+  cannot depend on the prover, and the verifier-only build of vos-pvm-proof
+  has no `vos_wire`. `kernel_shape`'s test holds it equal to `chip_idx`.
+- **The row view on the interaction side** (`ComponentTrace`), and the
+  program-memory consumer's flag sums: the brief asked for the constraint
+  side.
+- **`observed_step` and `TracingPvm::step` as one `record_step`**
+  (review item 11): their error paths differ (checked against unchecked
+  gas and pc arithmetic), so unifying them changes behaviour on invalid
+  traces.
+- The rest of the review's medium and low items (10's siblings, 12–35
+  beyond the above).
+
+### Gates
+
+[measured, on this machine, under `systemd-run` at 14 GiB with `nice -n
+10`, at `7718f978`]: `just check` green, 1,113 tests in 86 suites (9
+min); the prover suites (`just test-proof`'s, one test thread) green: the
+library 89, `gates` 221, `isa` 212, `kernel` 31 (28 min with the builds);
+`just judge-wasm` green, 13 fixtures under the PVF's semantics and the
+client's; `just clippy` green; the fixtures' stale test (`kernel
+fixtures::the_fixtures_are_the_generators`) green with and without
+`debug-internals`, every fixture byte-identical.
+
 ## Carried out of slice 5
 
 Every item the slice carries, in one place; the steps' own sections say
@@ -3921,12 +3974,9 @@ what they took and point here.
 
 - **The acceptance gates:** `ci-full`, `test-proof`, the checker loop and
   A.7's rows; then the code-quality review.
-- **The code-quality list, part 2:** `divrem.rs` split; an
-  `AirColumn` derive generating a `Row<E>` view, each column read once
-  (about 600 of the CPU split's 4,100 lines); the split's `_p19` and
-  `_p54` suffixes (`f_ff_p19`, `sign_bit_result_p19`, `tuple_p54`,
-  `f_is_mul_p54` and their kin); the rest of the review's list, as
-  5.16b records it.
+- **The code-quality list, the rest:** what 5.16c leaves (its "Not
+  taken here"): the compiler's own chip list, the interaction side's row
+  view, `record_step`, and the review's remaining medium and low items.
 
 ### To slice 6
 
