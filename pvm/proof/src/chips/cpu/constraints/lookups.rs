@@ -4,7 +4,8 @@ use alloc::{vec, vec::Vec};
 use num_traits::One;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
-use super::{Lookups, Row, is_branch, is_compare};
+use super::{Lookups, Row, is_bitwise, is_branch, is_compare, values};
+use crate::chips::cpu::tuples::{BITWISE, COMPARE, DIVREM, MUL_HEAD, MUL_TAIL, MUL_UPPER};
 use crate::core::step::WORD_SIZE;
 
 /// The power-of-two, popcount and bitcount lookups.
@@ -97,7 +98,6 @@ pub(in crate::chips::cpu) fn mul_lookup<E: EvalAtRow>(
     row: &Row<E::F>,
     lookups: &Lookups<'_>,
 ) {
-    let mul_lookup = lookups.mul_lookup;
     // ── MultiplicationLookup producer ──
     // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +
     //   sign_bit_b + sign_bit_d + 4 rotate flags + 5 mul flags.
@@ -106,33 +106,20 @@ pub(in crate::chips::cpu) fn mul_lookup<E: EvalAtRow>(
     //   - sign correction: pins result for is_mul_upper rows.
     //   - result-variant dispatch: pins result for non-upper mul rows
     //     from upl ± mul_high based on rotate flags.
-    {
-        let is_mul_lo_e = row.is_mul[0].clone()
-            - row.is_mul_upper_uu[0].clone()
-            - row.is_mul_upper_su[0].clone()
-            - row.is_mul_upper_ss[0].clone();
-        let mut tuple_p54: Vec<E::F> = Vec::with_capacity(35);
-        tuple_p54.extend_from_slice(&row.val_b);
-        tuple_p54.extend_from_slice(&row.val_d);
-        tuple_p54.extend_from_slice(&row.result);
-        tuple_p54.push(row.sign_bit_b[0].clone());
-        tuple_p54.push(row.sign_bit_d[0].clone());
-        tuple_p54.push(row.is_rotate_l64[0].clone());
-        tuple_p54.push(row.is_rotate_r64[0].clone());
-        tuple_p54.push(row.is_rotate_l32[0].clone());
-        tuple_p54.push(row.is_rotate_r32[0].clone());
-        tuple_p54.push(is_mul_lo_e);
-        tuple_p54.push(row.is_mul_upper_uu[0].clone());
-        tuple_p54.push(row.is_mul_upper_su[0].clone());
-        tuple_p54.push(row.is_mul_upper_ss[0].clone());
-        tuple_p54.push(row.is32_bit[0].clone());
-        for _ in 0..2 {
-            eval.add_to_relation(RelationEntry::new(
-                mul_lookup,
-                row.is_mul[0].clone().into(),
-                &tuple_p54,
-            ));
-        }
+    let is_mul_lo = MUL_UPPER
+        .iter()
+        .fold(row.is_mul[0].clone(), |is_mul_lo, &upper| {
+            is_mul_lo - row.column(upper)[0].clone()
+        });
+    let mut tuple = values(row, &MUL_HEAD);
+    tuple.push(is_mul_lo);
+    tuple.extend(values(row, &MUL_TAIL));
+    for _ in 0..2 {
+        eval.add_to_relation(RelationEntry::new(
+            lookups.mul_lookup,
+            row.is_mul[0].clone().into(),
+            &tuple,
+        ));
     }
 }
 
@@ -142,7 +129,6 @@ pub(in crate::chips::cpu) fn divrem_lookup<E: EvalAtRow>(
     row: &Row<E::F>,
     lookups: &Lookups<'_>,
 ) {
-    let divrem_lookup = lookups.divrem_lookup;
     // ── DivRemLookup producer ──
     // Tuple (41 limbs): val_b[8] + val_d[8] + div_quotient[8] +
     //   div_remainder[8] + sign_bit_b + sign_bit_d + sign_bit_q +
@@ -151,28 +137,13 @@ pub(in crate::chips::cpu) fn divrem_lookup<E: EvalAtRow>(
     // Multiplicity = is_div_rem.
     // The 4 sign bits let DivRemChip's sign-correction chain run;
     // div_corr_hi[8] is DivRemChip-internal (not in this tuple).
-    {
-        let mut tuple_p54g: Vec<E::F> = Vec::with_capacity(41);
-        tuple_p54g.extend_from_slice(&row.val_b);
-        tuple_p54g.extend_from_slice(&row.val_d);
-        tuple_p54g.extend_from_slice(&row.div_quotient);
-        tuple_p54g.extend_from_slice(&row.div_remainder);
-        tuple_p54g.push(row.sign_bit_b[0].clone());
-        tuple_p54g.push(row.sign_bit_d[0].clone());
-        tuple_p54g.push(row.sign_bit_q[0].clone());
-        tuple_p54g.push(row.sign_bit_r[0].clone());
-        tuple_p54g.push(row.is_div_rem[0].clone());
-        tuple_p54g.push(row.div_by_zero[0].clone());
-        tuple_p54g.push(row.is32_bit[0].clone());
-        tuple_p54g.push(row.is_div_s[0].clone());
-        tuple_p54g.push(row.is_shar_r[0].clone());
-        for _ in 0..2 {
-            eval.add_to_relation(RelationEntry::new(
-                divrem_lookup,
-                row.is_div_rem[0].clone().into(),
-                &tuple_p54g,
-            ));
-        }
+    let tuple = values(row, &DIVREM);
+    for _ in 0..2 {
+        eval.add_to_relation(RelationEntry::new(
+            lookups.divrem_lookup,
+            row.is_div_rem[0].clone().into(),
+            &tuple,
+        ));
     }
 }
 
@@ -182,23 +153,17 @@ pub(in crate::chips::cpu) fn compare_lookup<E: EvalAtRow>(
     row: &Row<E::F>,
     lookups: &Lookups<'_>,
 ) {
-    let compare_lookup = lookups.compare_lookup;
-    let is_cmp_or_branch = is_compare(row) + is_branch(row);
     // ── CompareLookup producer ──
     // Tuple (17 limbs): val_b[8] + val_d[8] + cmp_lt_flag.
     // Multiplicity = is_compare + is_branch.  Two paired emissions.
-    {
-        let mut tuple_p54f: Vec<E::F> = Vec::with_capacity(17);
-        tuple_p54f.extend_from_slice(&row.val_b);
-        tuple_p54f.extend_from_slice(&row.val_d);
-        tuple_p54f.push(row.cmp_lt_flag[0].clone());
-        for _ in 0..2 {
-            eval.add_to_relation(RelationEntry::new(
-                compare_lookup,
-                is_cmp_or_branch.clone().into(),
-                &tuple_p54f,
-            ));
-        }
+    let is_cmp_or_branch = is_compare(row) + is_branch(row);
+    let tuple = values(row, &COMPARE);
+    for _ in 0..2 {
+        eval.add_to_relation(RelationEntry::new(
+            lookups.compare_lookup,
+            is_cmp_or_branch.clone().into(),
+            &tuple,
+        ));
     }
 }
 
@@ -208,34 +173,17 @@ pub(in crate::chips::cpu) fn bitwise_lookup<E: EvalAtRow>(
     row: &Row<E::F>,
     lookups: &Lookups<'_>,
 ) {
-    let bitwise_lookup = lookups.bitwise_lookup;
     // ── BitwiseLookup producer ──
     // Tuple (30 limbs): val_b[8] + val_d[8] + result[8] + 6 sub-flags.
-    // Multiplicity = is_bitwise_e (sum of 6 sub-flags).  Two paired
+    // Multiplicity = IsBitwise (sum of 6 sub-flags).  Two paired
     // emissions for finalize_logup_in_pairs.
-    {
-        let is_bitwise_p54e = row.is_and[0].clone()
-            + row.is_or[0].clone()
-            + row.is_xor[0].clone()
-            + row.is_and_inv[0].clone()
-            + row.is_or_inv[0].clone()
-            + row.is_xnor[0].clone();
-        let mut tuple_p54e: Vec<E::F> = Vec::with_capacity(30);
-        tuple_p54e.extend_from_slice(&row.val_b);
-        tuple_p54e.extend_from_slice(&row.val_d);
-        tuple_p54e.extend_from_slice(&row.result);
-        tuple_p54e.push(row.is_and[0].clone());
-        tuple_p54e.push(row.is_or[0].clone());
-        tuple_p54e.push(row.is_xor[0].clone());
-        tuple_p54e.push(row.is_and_inv[0].clone());
-        tuple_p54e.push(row.is_or_inv[0].clone());
-        tuple_p54e.push(row.is_xnor[0].clone());
-        for _ in 0..2 {
-            eval.add_to_relation(RelationEntry::new(
-                bitwise_lookup,
-                is_bitwise_p54e.clone().into(),
-                &tuple_p54e,
-            ));
-        }
+    let is_bitwise = is_bitwise(row);
+    let tuple = values(row, &BITWISE);
+    for _ in 0..2 {
+        eval.add_to_relation(RelationEntry::new(
+            lookups.bitwise_lookup,
+            is_bitwise.clone().into(),
+            &tuple,
+        ));
     }
 }

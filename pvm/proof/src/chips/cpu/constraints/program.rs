@@ -5,7 +5,7 @@ use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
-use super::{Lookups, Row, is_branch, is_compare, is_store};
+use super::{Lookups, Row, is_bitwise, is_branch, is_compare, is_store};
 use crate::chips::cpu::columns::Column;
 
 /// The program-memory consumer: the instruction tuple of each step.
@@ -111,12 +111,7 @@ pub(in crate::chips::cpu) fn flag_bits<E: EvalAtRow>(
         // Read the individual-flag bit expressions for each byte.
 
         // Sum expressions for the 4 folded category slots.
-        let bw_sum_e = row.is_and[0].clone()
-            + row.is_or[0].clone()
-            + row.is_xor[0].clone()
-            + row.is_and_inv[0].clone()
-            + row.is_or_inv[0].clone()
-            + row.is_xnor[0].clone();
+        let bw_sum_e = is_bitwise(row);
         let cmp_sum_e = is_compare(row);
         let br_sum_e = is_branch(row);
         let st_sum_e = is_store(row);

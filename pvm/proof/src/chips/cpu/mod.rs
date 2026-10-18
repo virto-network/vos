@@ -48,6 +48,7 @@ mod reg_access;
 mod interaction;
 #[cfg(feature = "prover")]
 mod trace_fill;
+mod tuples;
 
 #[cfg(feature = "prover")]
 pub(crate) use classify::classify_opcode_for_program_memory;

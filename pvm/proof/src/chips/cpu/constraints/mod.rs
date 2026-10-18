@@ -18,10 +18,12 @@ pub(super) mod registers;
 pub(super) mod row;
 pub(super) mod signs;
 
+use alloc::vec::Vec;
 use core::ops::Add;
 
 use crate::chips::cpu::columns::Column;
 pub(super) use crate::chips::cpu::columns::Row;
+use crate::chips::cpu::tuples::{BITWISE_FLAGS, BRANCH_FLAGS, COMPARE_FLAGS, STORE_FLAGS};
 use crate::lookups::{
     BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements,
     Blake2bCallLookupElements, ByteToBitsLookupElements, CompareLookupElements,
@@ -52,36 +54,39 @@ pub(super) struct Lookups<'a> {
     pub witness_call_lookup: &'a WitnessCallLookupElements,
 }
 
+/// The values of `columns`, in order: a tuple of [`tuples`](super::tuples).
+pub(super) fn values<F: Clone>(row: &Row<F>, columns: &[Column]) -> Vec<F> {
+    columns
+        .iter()
+        .flat_map(|&column| row.column(column).iter().cloned())
+        .collect()
+}
+
+/// The sum of the flags `columns`, left to right.
+fn sum<F: Clone + Add<Output = F>>(row: &Row<F>, columns: &[Column]) -> F {
+    columns
+        .iter()
+        .map(|&column| row.column(column)[0].clone())
+        .reduce(|sum, flag| sum + flag)
+        .expect("a sum of flags names at least one")
+}
+
 /// IsBranch: the sum of the ten branch flags.
 pub(super) fn is_branch<F: Clone + Add<Output = F>>(row: &Row<F>) -> F {
-    let flag = |column| row.column(column)[0].clone();
-    flag(Column::IsBrEq)
-        + flag(Column::IsBrNe)
-        + flag(Column::IsBrLtU)
-        + flag(Column::IsBrGeU)
-        + flag(Column::IsBrLeU)
-        + flag(Column::IsBrGtU)
-        + flag(Column::IsBrLtS)
-        + flag(Column::IsBrGeS)
-        + flag(Column::IsBrLeS)
-        + flag(Column::IsBrGtS)
+    sum(row, &BRANCH_FLAGS)
 }
 
 /// IsStore: the sum of the three store-class flags.
 pub(super) fn is_store<F: Clone + Add<Output = F>>(row: &Row<F>) -> F {
-    let flag = |column| row.column(column)[0].clone();
-    flag(Column::IsStoreDirect) + flag(Column::IsStoreImmAny) + flag(Column::IsStoreInd)
+    sum(row, &STORE_FLAGS)
 }
 
 /// IsCompare: the sum of the eight compare flags.
 pub(super) fn is_compare<F: Clone + Add<Output = F>>(row: &Row<F>) -> F {
-    let flag = |column| row.column(column)[0].clone();
-    flag(Column::IsSetLtU)
-        + flag(Column::IsSetLtS)
-        + flag(Column::IsCmovIz)
-        + flag(Column::IsCmovNz)
-        + flag(Column::IsMinS)
-        + flag(Column::IsMinU)
-        + flag(Column::IsMaxS)
-        + flag(Column::IsMaxU)
+    sum(row, &COMPARE_FLAGS)
+}
+
+/// IsBitwise: the sum of the six bitwise flags.
+pub(super) fn is_bitwise<F: Clone + Add<Output = F>>(row: &Row<F>) -> F {
+    sum(row, &BITWISE_FLAGS)
 }
