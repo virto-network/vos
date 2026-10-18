@@ -11,7 +11,9 @@ use {
 };
 
 /// Run the calling test again in a child process, which forges and asserts
-/// (`true` there); in the parent `false`, once the child has failed.
+/// (`true` there); in the parent `false`, once the child has failed. Stwo's
+/// assertion evaluator panics before finalizing its `LogupAtRow`, whose Drop
+/// guard aborts the double panic: a refusal is the child's failure.
 #[cfg(feature = "debug-internals")]
 macro_rules! in_child {
     ($test:expr) => {
