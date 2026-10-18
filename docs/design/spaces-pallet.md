@@ -10,15 +10,15 @@ VOS delivers three things:
   tested against a mock of the interface in §9 (6.17b).
 
 The supporting research, with file:line citations, is
-`../spaces-pallet-research.md`. `KR` below is Kreivo's `runtime/kreivo/src`
+`docs/design/research/slice-6/spaces-pallet-research.md`. `KR` below is Kreivo's `runtime/kreivo/src`
 at master 87f8728.
 
 **VOS-side contract, the sources this design follows:**
-- `slice-6-on-chain.md` (VOS's slice-6 plan): pin D (spaces, windows,
+- `docs/design/slice-6-on-chain.md` (VOS's slice-6 plan): pin D (spaces, windows,
   anchors), pin F (the check order), decisions 9–12;
-- `owner-decisions.md` (2026-10-19);
+- `docs/design/research/slice-6/owner-decisions.md` (2026-10-19);
 - the background on why anchors and statements exist:
-  `vos-core/docs/design/identity-and-authority.md` §5, §11 and §12, and
+  `docs/design/identity-and-authority.md` §5, §11 and §12, and
   `docs/design/proving.md` §12.
 
 ## 0.1 Build order for the teammate

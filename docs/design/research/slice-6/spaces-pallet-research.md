@@ -1,7 +1,7 @@
 # Spaces pallet: research for slice 6
 
 2026-10-19. Read-only. The handoff design built on it is
-`stage/spaces-pallet-design.md`.
+`docs/design/spaces-pallet.md`.
 
 Path keys:
 - `FC` = frame-contrib 2.3.1, the version Kreivo uses, in
@@ -220,7 +220,7 @@ Path keys:
 
 ## 3. The shape of a spaces pallet
 
-The full design is `stage/spaces-pallet-design.md`.
+The full design is `docs/design/spaces-pallet.md`.
 
 - **What it keeps from communities:**
   - the sovereign account;

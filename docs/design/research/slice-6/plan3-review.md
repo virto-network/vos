@@ -6,6 +6,8 @@ Reviewer: Fable, 2026-10-19. Read-only. Against `stage/slice-6-plan.md`
 `vos-core` at `31b7938e`, Kreivo master `87f8728` (+ spike `a7370f1`), and the
 SDK sources Kreivo locks (frame-system 48.0.0, sp-runtime 44.0.0,
 fc-pallet-gas-transaction-payment 2.3.1).
+The staged files are now `docs/design/slice-6-on-chain.md` (draft 4),
+`doc-fixes.md` here and `docs/design/spaces-pallet.md`.
 
 ## Verdict
 
