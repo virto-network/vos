@@ -116,7 +116,7 @@ fn direct_observation_builds_canonical_nested_sparse_slices() {
         &trace.slices[3].side_note.code,
     ));
 
-    let metrics = prover::collector_metrics_for(&outer, &arguments, gas).unwrap();
+    let metrics = collector::collector_metrics_for(&outer, &arguments, gas).unwrap();
     assert_eq!(metrics.static_program_copies, 2);
     assert_eq!(metrics.program_identity_hashes, 1);
     assert_eq!(

@@ -374,6 +374,8 @@ fn refine_execution_commitment(
 }
 
 #[cfg(feature = "prover")]
+mod collector;
+#[cfg(feature = "prover")]
 mod prover;
 
 #[cfg(feature = "prover")]
