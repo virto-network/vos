@@ -578,6 +578,29 @@ M0's milestone review left these before the recursion builds on them.
   - at most 4 GiB;
   - time at most 1× the segment's proving (expected 1.2–2.6 s), against
     a target of 0.13–0.5×.
+- **Gate passed** [measured, 5.12; `vos-recair`'s `leaf`]:
+  - **the window kernel's leaves,** its real first, second and last
+    segments (classes 0, 1 and 0) verified in their classes' leaves as
+    natively, transcript for transcript: the class-1 leaf **57,700 /
+    102,227 / 46,000** rows finalized, proved in **1.5 s, 0.22×** its
+    segment's 6.8 s, at **0.92 GiB** of heap against the segment's 4.8
+    GiB; the class-0 leaves 56,698 / 102,145 / 45,960, 1.4–2.1 s,
+    0.39–0.57× their segments' 3.7 s. The
+    first states the entry, the last the halt and the run's io-hash, and
+    the first's exit digest is the second's entry digest;
+  - **`areas`,** a predicate-like kernel (a row read and a comparison), its
+    run one class-0 segment: both flags, its io-hash, 1.4–1.5 s;
+  - each flag's conditions negated, refused (an entry pc, ts, register or
+    image root; a segment from mid-run; one not ending at the halt); a
+    tampered boundary byte refused, and an io-hash byte of 256 by its range
+    check;
+  - **the program id finalized** with its classes' leaf-circuit hashes
+    (the slot's version 1), in the prover role: 1.5 s for the window
+    kernel's three classes, at 351 MiB; an install derives without the
+    prover's stack;
+  - **derive counts every class's leaf rows** from the shape
+    (`vos_pvm_compiler::leaf`), the built circuit's exactly, and refuses a
+    kernel whose leaf would not fit.
 - **Estimate:** 2–3 weeks.
 
 ### 5.13 The fold and the fixed point (F)

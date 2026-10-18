@@ -245,3 +245,153 @@ pub fn kernel_program(
         leaf_circuits: vos_pvm_proof::program_id::LeafCircuits::None,
     }
 }
+
+/// The system allocator, counting the bytes allocated and their peak: a
+/// test binary that measures a prover's memory installs it as its global
+/// allocator. A resident-set figure would miss memory the allocator keeps
+/// from an earlier proof and hands to the next.
+pub struct Counting;
+
+static ALLOCATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+unsafe impl std::alloc::GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: std::alloc::Layout) -> *mut u8 {
+        use std::sync::atomic::Ordering::Relaxed;
+        // SAFETY: the caller's contract for `GlobalAlloc::alloc`.
+        let pointer = unsafe { std::alloc::System.alloc(layout) };
+        if !pointer.is_null() {
+            let allocated = ALLOCATED.fetch_add(layout.size(), Relaxed) + layout.size();
+            PEAK.fetch_max(allocated, Relaxed);
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, layout: std::alloc::Layout) {
+        // SAFETY: the caller's contract for `GlobalAlloc::dealloc`.
+        unsafe { std::alloc::System.dealloc(pointer, layout) };
+        ALLOCATED.fetch_sub(layout.size(), std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// `work`'s result, its time, and its peak heap past the allocations
+/// before it, in MiB (0 unless the binary installs [`Counting`]).
+pub fn measured<T>(work: impl FnOnce() -> T) -> (T, std::time::Duration, u64) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let base = ALLOCATED.load(Relaxed);
+    PEAK.store(base, Relaxed);
+    let started = std::time::Instant::now();
+    let result = work();
+    let elapsed = started.elapsed();
+    (result, elapsed, ((PEAK.load(Relaxed) - base) >> 20) as u64)
+}
+
+/// What a kernel's leaf measured: its rows, its proving time and its peak
+/// heap over the allocations before it (0 unless the binary installs
+/// [`Counting`]), and the output it states.
+pub struct LeafRun {
+    pub rows: [usize; 3],
+    pub finalized: [usize; 3],
+    pub proving: std::time::Duration,
+    pub peak_mib: u64,
+    pub output: vos_recair::leaf::NodeOutput,
+}
+
+/// `proof`, a segment of `program`'s class `class`, verified in its leaf at
+/// `position`, as natively (its transcript the native recorder's,
+/// permutation for permutation, and no mismatch); the leaf within the
+/// padded shape, its circuit's hash the program's for the class, proved and
+/// verified, its public output the native output's digest.
+pub fn prove_leaf(
+    program: &vos_pvm_proof::program_id::KernelProgram,
+    entry: &vos_pvm_proof::program_id::KernelEntry,
+    class: usize,
+    proof: &vos_pvm_proof::Proof,
+    position: u32,
+) -> LeafRun {
+    use stwo::core::fields::m31::BaseField;
+    use stwo::core::fields::qm31::SecureField;
+    use vos_pvm_proof::poseidon2::P2Hash;
+    use vos_pvm_proof::program_id::LeafCircuits;
+    use vos_recair::leaf::{LeafCircuit, PADDED_ROWS};
+    use vos_recair::verifier::witness::digest_wires;
+
+    let leaf = LeafCircuit::of_class(program, entry, class);
+    let fold_word = P2Hash(core::array::from_fn(|i| BaseField::from(7_000 + i as u32)));
+    let (values, output) = leaf
+        .values(proof, P2Hash(program.id().0), fold_word, position)
+        .expect("the segment's values");
+
+    let mut transcript = vos_recair::Context::<SecureField>::new();
+    let verified =
+        vos_recair::verifier::verify_segment(&mut transcript, &leaf.shape, &values.segment);
+    let records = vos_pvm_proof::extract_recursion_data(proof)
+        .transcript
+        .records;
+    let permutations = verified.channel.transcript().permutations();
+    assert_eq!(permutations.len(), records.len());
+    for (i, (permutation, record)) in permutations.iter().zip(&records).enumerate() {
+        let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
+        assert_eq!(
+            *permutation,
+            vos_recair::value::wires_of(words),
+            "permutation {i}"
+        );
+    }
+    drop(transcript);
+
+    let context = leaf.build(&values);
+    let rows = context.rows();
+    assert!(
+        rows.iter()
+            .zip(PADDED_ROWS)
+            .all(|(&rows, padded)| rows <= padded),
+        "{rows:?}"
+    );
+    // A derivation's bound: the built rows exactly, and the finalizing's
+    // within its allowance.
+    let mut sizes = program.shape.classes[class].log_sizes.iter();
+    let record: [u8; 25] = core::array::from_fn(|chip| {
+        if program.shape.components & 1 << chip != 0 {
+            *sizes.next().expect("a size a chip")
+        } else {
+            0
+        }
+    });
+    let terms = vos_pvm_compiler::leaf::leaf_terms(program.shape.components, &record);
+    assert_eq!(terms.rows(), rows, "the derivation's rows");
+    let finalized = context.finalized_rows();
+    assert!(
+        finalized[1] - rows[1] <= vos_pvm_compiler::leaf::FINALIZE,
+        "{finalized:?} against {rows:?}"
+    );
+    assert_eq!([finalized[0], finalized[2]], [rows[0], rows[2]]);
+    let filled = context
+        .finalize_to(Some(PADDED_ROWS))
+        .expect("the wiring checks");
+    let (_, hash) = vos_recair::circuit_commitment(&filled.circuit).expect("checks");
+    let LeafCircuits::Hashes(hashes) = &program.leaf_circuits else {
+        panic!("a program with its leaf circuits")
+    };
+    assert_eq!(
+        hashes[class].0.map(|word| word.0),
+        hash.map(|word| word.value()),
+        "the class's leaf circuit"
+    );
+
+    let (leaf_proof, proving, peak_mib) =
+        measured(|| vos_recair::prove(&filled.circuit, &filled.witness).expect("proves"));
+    assert_eq!(
+        leaf_proof.outputs,
+        digest_wires(&output.digest()).to_vec(),
+        "the leaf states the native output"
+    );
+    vos_recair::verify(leaf_proof, &hash).expect("the leaf verifies");
+    LeafRun {
+        rows,
+        finalized,
+        proving,
+        peak_mib,
+        output,
+    }
+}

@@ -16,11 +16,14 @@
 //!   evaluate them at the OODS point, as the native verifier does.
 //! - [`verifier`] verifies a segment proof in a circuit, piece by piece:
 //!   the channel, Merkle openings, FRI, DEEP, OODS and the logup sums.
+//! - [`leaf`] is a kernel leaf: a segment verified, its boundary states
+//!   digested and flagged, and the node output it states.
 
 pub mod circuit;
 pub mod compile;
 pub mod context;
 pub mod gadgets;
+pub mod leaf;
 pub mod prove;
 pub mod trace;
 pub mod value;

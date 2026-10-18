@@ -2654,6 +2654,7 @@ dependencies = [
  "vos-pvm-program",
  "vos-pvm-proof-derive",
  "vos-pvm-proof-verifier",
+ "vos-recair",
  "vos-testkit",
  "vos-tree",
  "vos-wire",
@@ -2701,10 +2702,13 @@ dependencies = [
  "stwo",
  "stwo-constraint-framework",
  "vos-pvm",
+ "vos-pvm-compiler",
  "vos-pvm-poseidon2",
+ "vos-pvm-program",
  "vos-pvm-proof",
  "vos-pvm-proof-verifier",
  "vos-recair-air",
+ "vos-wire",
 ]
 
 [[package]]

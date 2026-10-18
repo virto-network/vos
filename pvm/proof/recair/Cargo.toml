@@ -11,6 +11,8 @@ vos-pvm-poseidon2 = { workspace = true }
 # The Poseidon2-M31 channel and its SIMD backend, the format registry, the
 # transcript's header and the security accounting.
 vos-pvm-proof = { workspace = true }
+# A kernel's install record, which a leaf's program is computed from.
+vos-wire = { workspace = true }
 stwo = { workspace = true, features = ["std", "prover", "parallel"] }
 stwo-constraint-framework = { workspace = true, features = ["std", "prover", "parallel"] }
 num-traits = "0.2"
@@ -22,6 +24,10 @@ bincode = "1"
 # from a run proved over every chip.
 postcard = { version = "1", features = ["alloc"] }
 vos-pvm = { workspace = true }
+# A small kernel, laid out as the loader lays it out.
+vos-pvm-program = { workspace = true }
+# A derivation's leaf rows, held to the built leaves.
+vos-pvm-compiler = { workspace = true }
 # The shape's security counts against the standalone verifier's.
 vos-pvm-proof-verifier = { workspace = true }
 # A chip-isolated proof, COMPARE's leaf's (`prove_chip_isolated_format`).

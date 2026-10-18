@@ -9,9 +9,13 @@
 //! pseudo-account pairs among them. The method runs live on the agent's
 //! reference model; its kernel re-runs from the attest to the same output,
 //! proves over its shape on the segment format, and verifies as a chain
-//! against its program, its io-hash the run's.
+//! against its program, its io-hash the run's. Its first, second and last
+//! segments verify in their classes' leaves, which prove and verify.
 
 mod common;
+
+#[global_allocator]
+static ALLOCATOR: common::Counting = common::Counting;
 
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -25,7 +29,8 @@ use cipher_clerk::types::{Account, Layer};
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
 use vos_pvm_proof::program_id::KernelEntry;
-use vos_pvm_proof::{Proof, program_commitment_of_proof, prove_kernel};
+use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
+use vos_pvm_proof::{Proof, ProvingError, program_commitment_of_proof, prove_kernel, prove_shaped};
 use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment};
 use vos_testkit::Testkit;
 use vos_testkit::programs::{derivation, derived, method, package};
@@ -542,4 +547,97 @@ fn the_window_proves_and_verifies_over_its_shape() {
         io_hash,
         vos_pvm_precompiles::compute_io_hash(&[], &instance.expected.encode(), &[])
     );
+}
+
+/// Window `[a, b)` of the run proved at the first class of `program`'s
+/// shape that holds it, as `prove_kernel` proves it, and the class.
+fn prove_at_first_class(
+    cursor: &mut SegmentCursor<'_>,
+    (a, b): (usize, usize),
+    program: &vos_pvm_proof::program_id::KernelProgram,
+) -> (usize, Proof) {
+    let steps = (b - a).next_power_of_two().trailing_zeros();
+    for (class, sizes) in program.shape.classes.iter().enumerate() {
+        if steps > u32::from(sizes.log_steps) {
+            continue;
+        }
+        let shape = program.shape.segment(class).unwrap();
+        match prove_shaped(&mut cursor.side_note(a, b), &shape, &SEGMENT) {
+            Ok(proof) => return (class, proof),
+            Err(ProvingError::Shape { .. }) => continue,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    panic!("no class holds [{a}, {b})")
+}
+
+/// The window's kernel's leaves: its program finalized with its leaf
+/// circuits; its first segment (the entry's, class 0), its second (a class-1
+/// window of the 32k cut) and its last (class 0, the halt), each verified in
+/// its class's leaf as natively, the leaf within the padded shape, proved
+/// and verified. The first states the entry, the last the halt and the
+/// run's io-hash; the first's exit digest is the second's entry digest. The
+/// class-1 leaf proves in at most 4 GiB of heap and in at most the time of
+/// its segment's proving.
+#[test]
+fn the_windows_leaves_prove_and_verify() {
+    let instance = instance();
+    let kernel = run(&instance.arguments.encode());
+    let trace = traced(&kernel);
+    let ((program, entry), elapsed, peak) = common::measured(|| {
+        vos_recair::leaf::kernel_program(
+            &kernel.blob,
+            &kernel.record,
+            vos_pvm_compiler::TRANSPILER_VERSION,
+            &SEGMENT,
+        )
+        .expect("the kernel's program")
+    });
+    eprintln!(
+        "the program with its {} leaf circuits in {:.1}s, its peak heap {peak} MiB, id {:02x?}",
+        program.shape.classes.len(),
+        elapsed.as_secs_f64(),
+        &program.id().to_bytes()[..8]
+    );
+    let cut = &program.shape.classes[CUT];
+    let bounds =
+        segment_bounds_budgeted(&trace.side_note, 1 << cut.log_steps, usize::from(cut.pages));
+    let last = bounds.len() - 1;
+    let mut cursor = SegmentCursor::new(&trace.side_note);
+    let mut outputs = Vec::new();
+    for position in [0, 1, last] {
+        let ((class, proof), segment, segment_peak) =
+            common::measured(|| prove_at_first_class(&mut cursor, bounds[position], &program));
+        let leaf = common::prove_leaf(&program, &entry, class, &proof, position as u32);
+        eprintln!(
+            "segment {position} ({:?}, class {class}) proved in {:.2}s, its peak heap \
+             {segment_peak} MiB; its leaf: {:?} rows ({:?} finalized), proved in {:.2}s ({:.2}× \
+             the segment's), its peak heap {} MiB",
+            bounds[position],
+            segment.as_secs_f64(),
+            leaf.rows,
+            leaf.finalized,
+            leaf.proving.as_secs_f64(),
+            leaf.proving.as_secs_f64() / segment.as_secs_f64(),
+            leaf.peak_mib,
+        );
+        if class == CUT {
+            assert!(leaf.peak_mib <= 4 << 10, "{} MiB", leaf.peak_mib);
+            assert!(
+                leaf.proving <= segment,
+                "{:?} against {segment:?}",
+                leaf.proving
+            );
+        }
+        outputs.push((class, leaf.output));
+    }
+    let [(_, first), (second_class, second), (_, end)] = outputs[..] else {
+        unreachable!()
+    };
+    assert_eq!(second_class, CUT, "the second segment is a class-1 window");
+    assert!(first.entry && !first.halt);
+    assert!(!second.entry && !second.halt);
+    assert!(!end.entry && end.halt);
+    assert_eq!(first.exit_digest, second.entry_digest);
+    assert_eq!(end.io_hash, trace.io_hash);
 }

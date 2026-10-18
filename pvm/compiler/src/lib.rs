@@ -19,6 +19,7 @@
 
 pub mod assembler;
 mod derive;
+pub mod leaf;
 mod linker;
 mod peephole;
 mod riscv;

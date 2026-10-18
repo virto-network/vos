@@ -40,6 +40,11 @@
 //! input:** one whose reachable code does is refused, naming the chain of
 //! functions from the entry to the call.
 //!
+//! **A kernel's leaf fits the recursion:** each class of its shape gives a
+//! leaf whose rows, bounded from the shape alone ([`crate::leaf`]), fit the
+//! recursion AIR's padded shape; a kernel past it is refused, naming the
+//! class and the rows.
+//!
 //! **Bounded work:** every lookup is logarithmic, and a kernel is built
 //! from what its entry reaches alone, so a derivation's work grows with the
 //! ELF once and with each kernel's reach and size, whatever the ELF claims.
@@ -140,6 +145,16 @@ pub enum DeriveError {
         id: u64,
         chain: Vec<String>,
     },
+    #[error(
+        "attestable method {method:#010x}'s kernel's class {class} leaf takes {rows:?} rows, \
+         past the recursion's padded shape {:?}",
+        crate::leaf::PADDED
+    )]
+    Leaf {
+        method: u32,
+        class: usize,
+        rows: [usize; 3],
+    },
 }
 
 /// Derive an actor's program and its kernels from its ELF.
@@ -167,10 +182,18 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
         .collect::<Result<_, DeriveError>>()?;
     let shapes = kernels
         .iter()
-        .map(|(_, kernel)| {
-            crate::shape::kernel_shape(kernel).expect("a kernel is a standard program")
+        .map(|(method, kernel)| {
+            let shape = crate::shape::kernel_shape(kernel).expect("a kernel is a standard program");
+            match crate::leaf::oversized_leaves(&shape).first() {
+                Some(&(class, rows)) => Err(DeriveError::Leaf {
+                    method: *method,
+                    class,
+                    rows,
+                }),
+                None => Ok(shape),
+            }
         })
-        .collect();
+        .collect::<Result<_, DeriveError>>()?;
     Ok(Derived {
         actor,
         kernels,

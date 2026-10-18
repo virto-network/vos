@@ -19,8 +19,9 @@
 //! 7. the image root, the page tree's over the kernel's initial memory (32
 //!    bytes);
 //! 8. the leaf-circuit slot: its version (a u32), the count of its hashes
-//!    (a u32) and each hash's eight words. Version 0 holds none: the leaf
-//!    circuits do not exist yet.
+//!    (a u32) and each hash's eight words. Version 1 holds each class's leaf
+//!    circuit's hash, in the classes' order (`vos_recair::leaf`, the prover
+//!    role's); version 0 holds none, a program whose leaves are not built.
 //!
 //! **The id** hashes the preimage as the recursion AIR's `p2` leaf mode
 //! does: eight words a permutation, absorbed into the rate, then a 1 and
@@ -34,7 +35,7 @@ use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 
 use crate::format::ChannelKind;
 use crate::pcs::Commitment;
-use crate::poseidon2::{P2MerkleHasher, u32_limbs};
+use crate::poseidon2::{P2Hash, P2MerkleHasher, u32_limbs};
 use crate::shape::KernelShape;
 
 /// The preimage's domain.
@@ -61,8 +62,20 @@ impl ProgramId {
 /// The leaf circuits' slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeafCircuits {
-    /// Version 0: before the leaf circuits exist.
+    /// Version 0: no leaf circuit, a program no fold binds.
     None,
+    /// Version 1: each class's leaf circuit's hash, in the classes' order.
+    Hashes(Vec<P2Hash>),
+}
+
+impl LeafCircuits {
+    /// The slot's version.
+    pub fn version(&self) -> u32 {
+        match self {
+            Self::None => 0,
+            Self::Hashes(_) => 1,
+        }
+    }
 }
 
 /// What a kernel's program id pins.
@@ -154,6 +167,15 @@ impl KernelProgram {
                 self.format
             ));
         }
+        if let LeafCircuits::Hashes(hashes) = &self.leaf_circuits
+            && hashes.len() != self.shape.classes.len()
+        {
+            return Err(alloc::format!(
+                "{} leaf circuits for {} classes",
+                hashes.len(),
+                self.shape.classes.len()
+            ));
+        }
         Ok(())
     }
 
@@ -183,10 +205,14 @@ impl KernelProgram {
             }
         }
         words.extend(byte_limbs(&self.image_root));
-        match self.leaf_circuits {
-            LeafCircuits::None => {
-                words.extend(u32_limbs(0));
-                words.extend(u32_limbs(0));
+        words.extend(u32_limbs(self.leaf_circuits.version()));
+        match &self.leaf_circuits {
+            LeafCircuits::None => words.extend(u32_limbs(0)),
+            LeafCircuits::Hashes(hashes) => {
+                words.extend(u32_limbs(hashes.len() as u32));
+                for hash in hashes {
+                    words.extend(hash.0);
+                }
             }
         }
         words
@@ -209,7 +235,6 @@ impl KernelProgram {
 mod tests {
     use super::*;
     use crate::chip_idx;
-    use crate::poseidon2::P2Hash;
     use crate::shape::SegmentClass;
     use alloc::vec;
 
@@ -310,7 +335,7 @@ mod tests {
     #[test]
     fn every_field_moves_the_id() {
         let id = program().id();
-        let changed: [fn(&mut KernelProgram); 9] = [
+        let changed: [fn(&mut KernelProgram); 10] = [
             |p| p.transpiler += 1,
             |p| p.program[31] ^= 1,
             |p| p.shape.components |= 1 << chip_idx::DIVREM,
@@ -324,6 +349,9 @@ mod tests {
                 }
             },
             |p| p.image_root[0] ^= 1,
+            |p| {
+                p.leaf_circuits = LeafCircuits::Hashes(vec![P2Hash::default(); 2]);
+            },
         ];
         for (index, change) in changed.iter().enumerate() {
             let mut program = program();
@@ -345,5 +373,36 @@ mod tests {
         let mut leaf = program();
         leaf.format = crate::format::LEAF_FOLD.number;
         assert!(leaf.check().is_err());
+        let mut leaves = program();
+        leaves.leaf_circuits = LeafCircuits::Hashes(vec![P2Hash::default()]);
+        assert!(leaves.check().unwrap_err().contains("leaf circuits"));
+    }
+
+    /// Version 1's slot: its version, the hashes' count and each hash's
+    /// words, after the image root; a hash's word moves the id.
+    #[test]
+    fn the_leaf_circuits_slot_is_pinned() {
+        let mut program = program();
+        let hashes: Vec<P2Hash> = (0..2u32)
+            .map(|class| {
+                P2Hash(core::array::from_fn(|i| {
+                    BaseField::from(3_000 + 100 * class + i as u32)
+                }))
+            })
+            .collect();
+        program.leaf_circuits = LeafCircuits::Hashes(hashes.clone());
+        program.check().unwrap();
+        let words: Vec<u32> = program.preimage().iter().map(|word| word.0).collect();
+        let slot = &words[words.len() - 4 - 16..];
+        assert_eq!(&slot[..4], &[1, 0, 2, 0]);
+        for (k, hash) in hashes.iter().enumerate() {
+            assert_eq!(&slot[4 + 8 * k..12 + 8 * k], &hash.0.map(|word| word.0)[..]);
+        }
+        let id = program.id();
+        let LeafCircuits::Hashes(hashes) = &mut program.leaf_circuits else {
+            unreachable!()
+        };
+        hashes[1].0[7] = BaseField::from(1);
+        assert_ne!(program.id(), id);
     }
 }

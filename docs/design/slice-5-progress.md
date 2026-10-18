@@ -2907,3 +2907,180 @@ add up to `count-35.log`'s.
   35's rows from `count-35.log` and the measured ones, in place of the
   39-query ones; the solvency predicate's row kept, marked as the 39-query
   count), its bullets, §10's step 4, R6 and R7.
+
+## Step 5.12: the kernel leaves
+
+`recursion-air.md` §10's step 5, on `vos-core` from `60ac71e1`: a kernel's
+segment verified in its class's leaf circuit, the node output it states,
+the program id finalized with its leaf circuits, and a derivation's leaf
+rows.
+
+### 5.11's review, folded first (its own commit)
+
+- `SegmentShape::chip_isolated` refuses a mask holding any of the four
+  boundary chips (REGISTER_MEMORY_BOUNDARY, REGISTER_MEMORY_CLOSING,
+  PROGRAM_BOUNDARY, MEMORY_ROOT_BOUNDARY), not only all four; one, two and
+  all four tested, each panic's message checked, and `SegmentShape::new`'s
+  on COMPARE's mask too.
+- A leaf takes a segment's shape only (`LeafCircuit::new` asserts the
+  boundary terms), so it is never built over a chip-isolated one.
+- `prove_chip_isolated_format` behind `debug-internals`, which
+  `vos-recair`'s dev-dependency enables.
+- The kernel leaf's topology test's comment made timeless; COMPARE's
+  leaf's PoW (6) and query-draw (5) `p2` rows in its per-piece list.
+
+### The leaf (`pvm/proof/recair/src/leaf`)
+
+- **`LeafCircuit`,** one per (kernel, class): the class's `SegmentShape`
+  (with the boundary chips and the class's preprocessed root) and the
+  kernel's entry state are its constants. `verify` runs `verify_segment`,
+  then the leaf's own work on the 74 boundary wires the channel absorbed;
+  `build` sets the output digest at the reserved addresses 3–4; `hash` is
+  the padded topology's circuit hash.
+- **The state digests:** the leaf sponge over 37 wires each (148 bytes:
+  registers, pc, ts, root). The boundary bytes' fields fall on whole
+  wires, so no byte is repacked and no wire carries an unread lane.
+- **The flags** are bits the prover states in one wire with the position,
+  `[p, p, entry, halt]` (`first == last` one lane-sum row, each flag a
+  `Bit`): `entry·(w − k) = 0` for each of the 37 entry wires against the
+  constants (the kernel's entry pc, ts 1, the loader's registers from
+  `KernelEntry::of`, the image root), `halt·(w − k) = 0` on pc out. A flag
+  at zero states nothing: the fold takes the entry flag from the left, the
+  halt flag from the right, and the wrap refuses a root without both.
+- **The initial ts ≥ 1** (carried from 5.10): one of ts in's two wires,
+  picked by a guessed bit, is inverted, so not all eight bytes are zero,
+  the native per-segment check.
+- **The io-hash:** φ9..12's 32 bytes, each recomposed from 8 bits (13 rows
+  a byte), and 16 limbs `b0 + 256·b1` into four guessed wires, a lane each
+  checked (two rows a limb).
+- **The output:** the leaf sponge over 52 words, `proving.md` A.3's fields
+  in an order that keeps each on whole wires: the program id, `[first,
+  last, entry, halt]`, the entry and exit digests, the io-hash, W. The
+  native `NodeOutput` (`leaf/output.rs`) computes the same digest.
+- **Its own rows** [measured]: 45 `p2` (two digests of 19, the output's
+  7) and 535 `qm31` (flags 85, io-hash 448, outputs 2); finalizing adds
+  about 54 `qm31` rows of constants.
+
+### The program id (`leaf/program.rs`, `program_id.rs`)
+
+- **The leaf-circuit slot's version 1** holds each class's leaf circuit's
+  hash, in the classes' order (its version, count and each hash's eight
+  words; a count other than the classes' refused by `check`).
+- **Computed in the prover role** (`vos_recair::leaf::kernel_program`, from
+  the kernel's blob and its install record): each class's preprocessed
+  root, the entry from the loader's layout, then the leaf circuits. 1.5 s
+  for the window kernel's three classes [measured]: not the cost but the
+  stack keeps it out of an install, which derives without Stwo's prover
+  or the recursion AIR (`vos-node-host`, `vos-jam` and the CLI link
+  `vos-pvm-compiler` alone). The record carries what the prover role
+  needs: the kernel's hash, image root and shape, its policy version
+  (`Shape::policy`) among it; the id covers the shape itself, so a record
+  of any policy computes to its own id.
+
+### A derivation's leaf rows (`pvm/compiler/src/leaf.rs`)
+
+- **From the shape alone, without the circuit:** the chips' AIR as tables
+  (each chip's preprocessed columns, its main and interaction columns as
+  runs of masks, the relations it draws, its compiled OODS gates and
+  constraints; each relation's tuple size), the heights (`L` the largest
+  log size plus 2, `L − 2` FRI layers), and DEEP's plan replayed: each
+  column's sample points as circle-group indices modulo 2^31 (a mask
+  offset a step of the lifted trace's domain, a two-sample column's
+  periodicity sample first), the clean blocks of eight leaf lanes, the
+  single samples, and the `α` powers. Every piece's rows (`Terms`, by the
+  context's pieces) are the built circuit's exactly; `leaf_rows` adds a
+  finalizing allowance of 512 `qm31` rows.
+- **Derive refuses** a kernel whose class's leaf would not fit 2^16 /
+  2^17 / 2^16 (`DeriveError::Leaf`, naming the method, the class and the
+  rows). The shapes it derives are unchanged, so `POLICY` stays 1.
+- **Found:** a class whose chips share the largest log size has all their
+  columns at the lifting height, where a two-sample column's periodicity
+  sample falls on its second sample's point; those samples leave DEEP's
+  `h8` blocks for one-sample `qm31` rows. The window kernel's chips all at
+  2^12 take 155,536 `qm31` rows, past 2^17 [measured], and are refused;
+  its derived classes, MEMORY alone the largest, take about 102k.
+
+### Tests
+
+- **`recair/tests/leaf.rs`** (`just check`), on a small kernel (a standard
+  program setting φ8 and φ9..12, traced from the loader's layout, proved at
+  its natural sizes over all 25 chips, whole and cut after its third
+  step): the leaf verifies its segment as natively, transcript for
+  transcript, its output digest the native `NodeOutput`'s, both flags set,
+  the io-hash φ9..12's; the wiring without values the filled one's; its
+  hash `LeafCircuit::hash`'s; proved at the padded shape in 1.6 s and
+  verified; its own rows pinned; its rows a derivation's count. The cut
+  run's leaves: the head states the entry, the tail the halt, and the
+  head's exit digest is the tail's entry digest. Each flag's conditions
+  negated are refused by `leaf: flags` (an entry pc, ts, φ1 or φ8, or image
+  root; the tail's entry; the head's halt; a flag of two), and without the
+  flag the same constants state nothing. A tampered boundary byte is
+  refused first by the PoW; one of 256 also by the io-hash's range check.
+- **`recair/tests/leaf_rows.rs`** (`just check`): the derivation's tables
+  are the AIR's (each chip's columns and masks, preprocessed log sizes,
+  relations, compiled gates and constraints; each relation's tuple size;
+  format 35's parameters); its terms are the built leaf's piece by piece,
+  and DEEP's plan's points, blocks and singles, on the window kernel's
+  class-1 shape, the full shape, the window's chips all at 2^12 and six
+  random shapes.
+- **`vos-pvm-compiler`'s `leaf`:** the window kernel's class-1 leaf
+  counted (16 points, 1,150 blocks, 785 singles; OODS 35,216; DEEP once
+  20,445; 57,700 / 102,173 / 46,000), and a class of one size refused.
+- **`program_id.rs`:** version 1's slot pinned, a hash's word moving the
+  id, a count other than the classes' refused.
+- **`test-proof`:** `window_kernel`'s `the_windows_leaves_prove_and_verify`
+  (the program finalized; segments 0, 1 and 25 each verified in its
+  class's leaf, the leaf's hash the program's, proved and verified, the
+  derivation's count exact) and `kernel_shape`'s
+  `a_predicates_leaf_proves_and_verifies` (`areas`). Their heap is counted
+  by a counting global allocator, since a resident-set figure misses what
+  the allocator keeps from a segment's proof and hands to the leaf's.
+
+### Gates
+
+[measured, under `systemd-run` at 14 GiB with `nice -n 10`,
+`CARGO_INCREMENTAL=0`, load average 7–9]
+- **Rows within the padded shape:** the window kernel's class-1 leaf
+  57,700 / 102,227 / 46,000 finalized (`p2` 12.0% under 2^16, `qm31` 22.0%
+  under 2^17), class 0's 56,698 / 102,145 / 45,960, `areas`' 56,698 /
+  101,510 / 46,040.
+- **Memory:** 942 MiB of heap to prove a leaf, against a class-1 segment's
+  4,788 MiB and a class-0 segment's 2,548 MiB.
+- **Time:** the class-1 leaf 1.51 s, **0.22×** its segment's 6.82 s; the
+  class-0 leaves 1.43–1.48 s, 0.39× their segments' 3.65–3.75 s; `areas`
+  1.44–1.50 s; the small kernel's 1.6 s. The class-1 leaf is in the
+  target's 0.13–0.5×.
+- **The program finalized** in 1.5 s and 351 MiB of heap for the window
+  kernel's three classes.
+- **`just check`** green: 1,079 tests (1,070 at 5.11; nine new).
+- **`test-proof`** green: 572 tests, under 14 GiB rather than the recipe's
+  24 GiB, so with one thread, and `window_kernel`'s leaf test run on its
+  own: after the 26-segment test in the same process (peak RSS 9.1 GiB) it
+  outgrew 14 GiB.
+- `cargo clippy -p vos-recair -p vos-pvm-proof -p vos-pvm-compiler
+  --all-targets`, and `vos-pvm-proof`'s with `debug-internals`, clean.
+
+### Carried to later steps
+
+- **5.13:** the fold re-hashes each child's 52-word preimage in A.3's
+  order; the flags and positions sit in one wire, `[first, last, entry,
+  halt]`, the rest on whole wires. A leaf's W and program id are free
+  witnesses, which only the fold binds.
+- **Format 32's registry status** stays reserved: the leaf pins its padded
+  shape (`PADDED_ROWS`), and the fold and wrap decide when the segment
+  verifiers' registry admits it.
+
+### Outside the step's files
+
+- `pvm/proof/src/program_id.rs`: `LeafCircuits::Hashes`, the slot's
+  version 1.
+- `pvm/proof/recair/src/context/finalize.rs`: `Context::finalized_rows`.
+- `pvm/compiler/src/derive.rs`: `DeriveError::Leaf`.
+- `pvm/proof/tests/{common/mod.rs,window_kernel.rs,kernel_shape.rs}`: the
+  leaves' heavy tests, `prove_leaf` and the counting allocator;
+  `vos-recair` a dev-dependency of `vos-pvm-proof`.
+- `justfile`: `test-proof`'s comment names the leaves.
+- `docs/design/proving.md` §3.3 (the flags, ts ≥ 1, derive's count, the
+  one-size finding), §3.6 (the program id in the prover role), A.3 (the
+  preimage's order); `recursion-air.md` §4.8, §5's table, R1;
+  `slice-5-proving.md` 5.12's gate.

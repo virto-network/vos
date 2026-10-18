@@ -53,6 +53,15 @@ impl<V: Value> Context<V> {
         Ok(finalized)
     }
 
+    /// The rows the circuit has once finalized, before its padding: its
+    /// constants fixed and its pending guesses yielded.
+    pub fn finalized_rows(&self) -> [usize; 3] {
+        let mut context = self.clone();
+        context.fix_constants();
+        context.yield_guesses();
+        context.rows()
+    }
+
     /// The uses of each address: operands, `h8` inputs, node bits and the
     /// public terms.
     fn uses(&self) -> Vec<i64> {

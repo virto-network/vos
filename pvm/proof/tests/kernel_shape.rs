@@ -10,7 +10,12 @@
 //! The kernels are the `kernels` test actor's (`just build-test-actors`):
 //! `digest` hashes its input through the BLAKE2b precompile, as the window
 //! kernel does, and `areas` computes over its input and hashes only its
-//! io-hash, as a solvency predicate.
+//! io-hash, as a solvency predicate; its run verifies in its leaf.
+
+mod common;
+
+#[global_allocator]
+static ALLOCATOR: common::Counting = common::Counting;
 
 use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::shape::{self as derived_shape, chip};
@@ -453,4 +458,34 @@ fn a_chain_not_ending_at_the_halt_is_refused() {
     assert_eq!(verify_kernel_segment(proof.clone(), &program).unwrap(), 0);
     let error = verify_kernel_chain(vec![proof], &program, &kernel.entry()).unwrap_err();
     assert!(error.to_string().contains("halt"), "{error}");
+}
+
+/// `areas`, a solvency predicate's kind of kernel, its run one segment of
+/// class 0, verified in its leaf as natively: the leaf states the entry,
+/// the halt and the run's io-hash, within the padded shape, proved and
+/// verified, its circuit the program's class-0 leaf circuit.
+#[test]
+fn a_predicates_leaf_proves_and_verifies() {
+    let (kernel, _, shape) = areas();
+    let (program, entry) = vos_recair::leaf::kernel_program(
+        &kernel.blob,
+        &kernel.record,
+        vos_pvm_compiler::TRANSPILER_VERSION,
+        &SEGMENT,
+    )
+    .expect("the kernel's program");
+    assert_eq!(entry, kernel.entry());
+    let proof = prove_shaped(&mut kernel.whole(), &shape, &SEGMENT).unwrap();
+    let leaf = common::prove_leaf(&program, &entry, 0, &proof, 0);
+    eprintln!(
+        "areas: {} chips; its leaf {:?} rows ({:?} finalized), proved in {:.2}s, its peak \
+         heap {} MiB",
+        proof.log_sizes.len(),
+        leaf.rows,
+        leaf.finalized,
+        leaf.proving.as_secs_f64(),
+        leaf.peak_mib
+    );
+    assert!(leaf.output.entry && leaf.output.halt);
+    assert_eq!(leaf.output.io_hash, kernel.trace.io_hash);
 }

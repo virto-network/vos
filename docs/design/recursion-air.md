@@ -481,6 +481,17 @@ refuses it with. What the build found against the model:
   shape holds no boundary chip and its logup check is the claimed sums'
   total, as `verify_with_explicit_components` checks it. The class-1 topology's rows
   are pinned term by term beside the model (`recair/tests/leaves.rs`).
+- **The kernel leaves** (slice 5's 5.12, `vos-recair`'s `leaf`): the window
+  kernel's real segments verified in their classes' leaves, which prove and
+  verify. The leaf's own work is 45 `p2` rows (the two state digests, 19
+  permutations each, and the output's 7) and 535 `qm31` (the flags 85, the
+  io-hash's 32 range-checked bytes and 16 limbs 448, the outputs 2), as
+  §4.1's model counts; finalizing adds 54 `qm31` rows of constants. The
+  class-1 leaf: **57,700 / 102,227 / 46,000** finalized [measured], `p2`
+  12.0% under 2^16, proved in 1.5 s at 942 MiB of heap, 0.22× its
+  segment's 6.8 s (4.8 GiB). A derivation counts the same rows from the shape alone
+  (`vos_pvm_compiler::leaf`), and refuses a kernel whose leaf would not
+  fit.
 
 ## 5. Sizing the leaves
 
@@ -508,10 +519,13 @@ Every leaf has the recursion AIR's 458 columns; what varies is the rows.
 | COMPARE, chip-isolated, its verifier [measured] | 68 | 7,732 / 10,279 / 240 | 2^13 / 2^14 / 2^8 | 3.7M | | 0.21–0.24 s [measured] |
 | **window kernel, class 1 (32k cut)** | 8,009 | **59,300 / 102,849 / 46,080** | **2^16 / 2^17 / 2^16** | **33.2M** | 0.6–1.4 GiB | 1.2–2.6 s |
 | its topology, before the leaf's own work [measured] | 8,009 | 57,655 / 101,638 / 46,000 | 2^16 / 2^17 / 2^16 | 33.2M | | |
+| its leaf, finalized [measured] | 8,009 | 57,700 / 102,227 / 46,000 | 2^16 / 2^17 / 2^16 | 33.2M | 0.92 GiB of heap | 1.5 s [measured] |
+| window kernel, class 0, its leaf [measured] | 8,009 | 56,698 / 102,145 / 45,960 | 2^16 / 2^17 / 2^16 | 33.2M | 0.92 GiB of heap | 1.5–2.1 s [measured] |
 | window kernel, class 0 (4k cut) | 8,009 | 58,218 / 102,727 / 46,040 | 2^16 / 2^17 / 2^16 | 33.2M | 0.6–1.4 GiB | 1.2–2.6 s |
 | window kernel, segment FRI fold step 3 | 8,009 | 53,036 / 109,569 / 46,080 | 2^16 / 2^17 / 2^16 | 33.2M | same | same |
 | full 25-chip shape, class 1 sizes | 8,024 | 59,396 / 101,336 / 46,440 | 2^16 / 2^17 / 2^16 | 33.2M | 0.6–1.4 GiB | 1.2–2.6 s |
 | solvency predicate, 32k cut (39 queries, pre-hardening) | 4,538 | 38,911 / 70,235 / 25,233 | 2^16 / 2^17 / 2^15 | 31.4M | 0.6–1.3 GiB | 1.1–2.5 s |
+| `areas`, a predicate-like kernel (the `kernels` actor), class 0, its leaf [measured] | 23 chips | 56,698 / 101,510 / 46,040 | 2^16 / 2^17 / 2^16 | 33.2M | 0.92 GiB of heap | 1.4–1.5 s [measured] |
 
 - **Against the segment:** the kernel's segment commits 230.4M cells at the
   32k cut [model, `R/count-35.log`; 201.7M before the hardening, 609.3M at
@@ -743,7 +757,7 @@ preprocessed tree (2^17) sits below its lifting height (2^20).
 
 | # | risk | measurement |
 |---|---|---|
-| R1 | **The recursion prover's Poseidon2 hashing**: about 25M permutations a leaf proof, 2.5–7.5 s on eight threads at today's scalar 0.8–2.4 µs [measured, model], one to six times the rest of the leaf | M0's SIMD hasher, gated on a segment's total cost, its proving plus its leaf, against the Blake2s route's projection (`proving.md` §3.2): step 5.2 measured a leaf's commitment at 0.63 s [measured], and 5.12 measures the whole leaf against its 1.5–3 s [projected] |
+| R1 | **The recursion prover's Poseidon2 hashing**: about 25M permutations a leaf proof, 2.5–7.5 s on eight threads at today's scalar 0.8–2.4 µs [measured, model], one to six times the rest of the leaf | M0's SIMD hasher, gated on a segment's total cost, its proving plus its leaf, against the Blake2s route's projection (`proving.md` §3.2): step 5.2 measured a leaf's commitment at 0.63 s [measured], and 5.12 measured the whole leaf at 1.4–2.1 s and 0.92 GiB of heap [measured], against its 1.5–3 s [projected] |
 | R2 | **vos's permutation is not the reference Poseidon2:** each linear layer precedes its S-box layer, so there is no final `M_E`, and the full-to-partial and partial-to-full boundaries swap `M_E` and `M_I` (`P/src/poseidon2/mod.rs:283-307` against Plonky3's `poseidon2/src/lib.rs:139-143`, `external.rs:288-336`). It is Stwo's example, whose TODOs flag the order and the internal diagonal (`ST/examples/src/poseidon/mod.rs:125-126`, `:156`) | the reference arrangement adopted in M0 (Plonky3 pinned at `f983316`, checked on its vectors) before the format and the recursion AIR pin it; every commitment changes once |
 | R3 | **The gate compiler is wrong** | §3's tests on all 25 chips, gate ≡ verifier on real proofs |
 | R4 | **The in-AIR verifier departs from the native one** (periodicity points, lifted leaf order, transcript order, PoW) | piecewise differential tests on recorded transcripts; tamper tests; the external audit (`proving.md` §4) |

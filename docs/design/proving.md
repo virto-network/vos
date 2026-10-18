@@ -237,6 +237,14 @@ attribution). Its full design is `recursion-air.md`.
     stack top, φ7 the argument base), with φ8, the argument size, at 0,
     since arguments arrive through the precompile;
   - the memory root is the image root.
+- **A flag is a bit the prover states,** and the leaf checks it implies its
+  conditions (`flag·(w − k) = 0` a wire). A flag left at zero states
+  nothing: the fold takes the entry flag from the left and the halt flag
+  from the right, and the wrap refuses a root without both, so leaving one
+  at zero only costs the prover its statement.
+- **Every segment's initial ts is not zero,** as the native verifier
+  refuses a segment starting at ts 0 (memory-boundary anchoring): one of
+  the ts's two wires has an inverse.
 - **The halt flag holds** when `pc_out` equals a leaf-circuit constant,
   `PVM_HALT_ADDR` (2^32 − 2^16, `pvm/runtime/src/lib.rs:88`): the return
   address the loader puts in φ0.
@@ -252,9 +260,17 @@ attribution). Its full design is `recursion-air.md`.
     columns [model]. The full 32-chip set (13,037) would have doubled
     every node; without the Ristretto chips and hardened, the full set is
     8,039 columns, just inside it [model].
-  - At derive time, each kernel's leaf rows are computed from its shape.
-    A kernel over the limit is refused, or waits for a format with a
-    larger shape.
+  - At derive time, each kernel's leaf rows are computed from its shape
+    (`vos_pvm_compiler::leaf`: the chips' AIR as tables and the in-AIR
+    verifier's structure, its DEEP plan among it, the built circuit's rows
+    exactly, with an allowance for its constants). A kernel over the limit
+    is refused, or waits for a format with a larger shape.
+  - **Width is not the only term:** the chips at the largest log size are
+    at the lifting height, where a two-sample column's periodicity sample
+    falls on its second sample's point, so their samples leave DEEP's
+    `h8` blocks for `qm31` rows of one sample. The window kernel's chips
+    all at one size take 155.5k `qm31` rows, past 2^17 [measured]; its
+    derived classes, with MEMORY alone the largest, take 102k.
 
 ### 3.4 Fold nodes
 
@@ -383,8 +399,11 @@ pub struct Statement {
   - the image root;
   - the leaf-circuit hashes.
 
-  It is kept in the install's `Derivation`. Venues store and compare it;
-  they never compute it.
+  The prover role computes it from the install's record of the kernel (its
+  hash, image root and shape, the shape's policy version among it; the
+  `Derivation`'s transpiler version), with each class's preprocessed root
+  and leaf circuit: an install derives without the prover's stack. Venues
+  store and compare it; they never compute it.
 - **Formats are chosen at run time,** so a verifier accepts two during a
   transition: a proof's format number selects its channel and parameters
   from the registry (A.4).
@@ -758,12 +777,12 @@ output).**
     gates, `b0 + 256·b1`.
 - **A state digest** hashes 148 words, in order: the 13 registers (8
   bytes each), pc (4), ts (8), the memory root (32).
-- **A node outputs** one 8-word Poseidon2-M31 digest. Its preimage
-  holds:
+- **A node outputs** one 8-word Poseidon2-M31 digest, the leaf sponge over
+  its preimage's 52 words, in this order, each field on whole wires of
+  four:
   - the program id (8);
-  - `first` and `last` (1 each);
+  - `first`, `last`, the entry flag and the halt flag (1 each);
   - the entry and exit digests (8 each);
-  - the entry and halt flags (1 each);
   - the io-hash (16 limbs, φ9..12's);
   - the fold-circuit word W (8).
 
