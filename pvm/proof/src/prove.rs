@@ -458,6 +458,35 @@ pub fn prove_with_explicit_components(
     Ok(proof)
 }
 
+/// Chip-isolated prove path under an admitted `format`, at its parameters:
+/// the chips `component_mask` selects, in chip order, each at least its
+/// floor in `min_log_sizes`. The proof carries the mask, so the recursion
+/// seams read its shape; like [`prove_with_explicit_components`]'s, it pairs
+/// only with `verify_with_explicit_components`, which skips the boundary
+/// binding.
+pub fn prove_chip_isolated_format(
+    side_note: &mut SideNote,
+    format: &'static Format,
+    component_mask: u32,
+    min_log_sizes: &[u32],
+) -> Result<Proof, ProvingError> {
+    install_thread_pool();
+    let chips = 0..crate::chip_idx::COUNT;
+    let components: Vec<&dyn crate::framework::MachineProverComponent> = chips
+        .filter(|&chip| component_mask & 1 << chip != 0)
+        .map(|chip| crate::BASE_COMPONENTS[chip])
+        .collect();
+    let (proof, _) = prove_impl_with_components(
+        side_note,
+        Target::of(format)?,
+        false,
+        &components,
+        component_mask,
+        min_log_sizes,
+    )?;
+    Ok(proof)
+}
+
 fn prove_impl_with_components(
     side_note: &mut SideNote,
     target: Target,

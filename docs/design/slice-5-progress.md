@@ -2787,3 +2787,121 @@ then once):
 - `docs/design/slice-5-proving.md`: formats 31, 33 and 34 noted superseded
   at 5.10a by 35/36/37.
 - `docs/design/recursion-air.md` §4.8: what the build found.
+
+## Step 5.11: the first feasibility gate
+
+`recursion-air.md` §10's step 4, on `vos-core` from `19a5892b`: COMPARE's
+leaf proved, and the window kernel leaf's topology pinned term by term. The
+targets are format 35's (40 queries, PoW 24, 8,009 columns;
+`research/slice-5/count-35.log`), not the plan's 39-query ones.
+
+### COMPARE's leaf (`pvm/proof/recair/tests/leaves.rs`)
+
+- **The proof:** `prove_chip_isolated_format` (new, `prove.rs`, hidden): a
+  mask's chips under an admitted format at its parameters, each at least a
+  floor, the mask carried in the proof. COMPARE at 2^12 rows with
+  RANGE_MULTIPLICITY_256 at 2^8: COMPARE commits no preprocessed column and
+  a proof's preprocessed tree is never empty (`air_layout` refuses it), so
+  the byte-range table it looks up gives the one column the model counts.
+  68 committed columns against the model's 63. The trace is padding rows:
+  with no CPU to produce COMPARE's lookups only an idle COMPARE's sums
+  close, and the circuit's rows do not depend on the values. It verifies
+  natively (`verify_with_explicit_components` at format 35's exact policy).
+- **The circuit:** `SegmentShape::chip_isolated`, the shape of a mask
+  without the boundary chips (a mask holding them is refused; a segment's
+  shape is `SegmentShape::new`'s alone), whose logup check is
+  `logup::check_total`, the claimed sums adding to zero, as
+  `verify_with_explicit_components` checks it. `SegmentShape`'s boundary
+  relations and positions are now one `Option<BoundaryTerms>`.
+- **Verified as natively:** no mismatch; its transcript the native
+  recorder's permutation for permutation; each query's DEEP quotient its
+  native first-layer value.
+- **Rows** [measured]: **7,732 / 10,279 / 240**, against **8,644 / 10,352 /
+  280** [model, `count-35.log`'s "verify COMPARE alone" at 40 queries, the
+  verifier's rows without a leaf's own work]: 0.894 / 0.993 / 0.857, within
+  15%. Against the plan's 39-query 8,488 / 10,869 / 273 (with a leaf's own
+  work): 0.911 / 0.946 / 0.879. The lifting height is 2^14, not the model's
+  2^15, as for the kernel (§4.8): a path level and a FRI layer fewer.
+  By piece: merkle 2,560 `p2`; FRI 5,040 `p2`, 2,800 `qm31`; query bits
+  2,560 and points 2,040 `qm31`; DEEP 2,160 `qm31` and 240 `h8` over the
+  queries, 230 `qm31` once; OODS 227; PoW 246; channel 121 `p2`; header 13;
+  logup 1.
+- **Proved** padded to 2^13 / 2^14 / 2^8 in **0.21–0.24 s**, verified in
+  0.013–0.015 s [measured, three runs, load average 8–10]: under the gate's
+  1 s.
+- **Tampers,** each refused by its check (the lenient context's first
+  mismatch): an OODS sample, COMPARE's running sum (`oods`); a queried value
+  and a Merkle sibling (`merkle`); a FRI value (`fri`); the PoW nonce and
+  the interaction PoW nonce (`pow`); a claimed sum (`logup`). A tampered
+  sibling's witness, proved, does not verify.
+
+### The kernel leaf's rows, per term
+
+`the_window_kernels_leaf_rows_per_term` (moved from `verifier.rs`, which
+bounded the totals only) builds the class-1 topology without values and
+pins each of `count-35.log`'s terms as measured, beside the model's, each
+measured term derived from the pieces' rows and the shape (paths from the
+trees' heights, DEEP's single samples and blocks from its plan; a new
+`deep once` piece parts DEEP's per-query rows from its once rows). The
+terms cover every row; the measured totals are pinned, and the model's
+add up to `count-35.log`'s.
+
+| term | measured | model | delta |
+|---|---|---|---|
+| `p2` leaf hashes, four trees, a query | 1,004 | 1,004 | 0 |
+| `p2` Merkle paths, four trees, a query | 78 | 84 | −6 |
+| `p2` FRI leaves and paths, a query | 243 | 266 | −23 |
+| `p2` channel, PoWs and query draws | 4,655 | 5,082 | −427 |
+| `qm31` query word and 31 bits, a query | 64 | 63 | +1 |
+| `qm31` query point from bits, a query | 75 | 84 | −9 |
+| `qm31` DEEP per point, a query | 96 | 108 | −12 |
+| `qm31` DEEP samples off the `h8` runs, a query | 785 | 769 | +16 |
+| `qm31` FRI folds and twiddles, a query | 106 | 133 | −27 |
+| `qm31` OODS (compiled, accumulation, powers, point, check) | 35,216 | 35,222 | −6 |
+| `qm31` logup, with the boundary public terms | 655 | 25 | +630 |
+| `qm31` DEEP sums of sampled values | 20,445 | 20,458 | −13 |
+| `qm31` PoW checks | 246 | 64 | +182 |
+| `qm31` header and preprocessed root against the shape | 34 | 0 | +34 |
+| `qm31` the context's constants | 2 | 0 | +2 |
+| `h8` DEEP blocks, a query | 1,150 | 1,152 | −2 |
+| **total** | **57,655 / 101,638 / 46,000** | **59,242 / 102,049 / 46,080** | −1,587 / −411 / −80 |
+
+- **The lifting height is 2^20, not 2^21** (§4.8): one path level and one
+  FRI layer fewer a query (paths 78 = 18 + 3·20; FRI 18 layers of
+  3 + path, 243), the query point's and the folds' rows with them.
+- **16 sample points, not 18:** six rows a point fewer; 16 more single
+  samples, two fewer blocks.
+- **The channel:** the transcript absorbs the proof's 8,997 sampled values,
+  where the model's channel counts DEEP's 9,985 samples, the periodicity
+  ones among them (494 permutations); the statement header and the 296
+  boundary bytes, which it leaves out, add back.
+- **Left out by the model:** the PoW nonces' 16-bit limb checks (100 rows
+  a nonce), the boundary chips' public terms (about 630 rows), the header
+  and preprocessed root against the shape (34).
+- `p2` 7,881 (12.0%) under 2^16, `qm31` 29,434 under 2^17, `h8` 19,536
+  under 2^16, before the leaf's own work (5.12).
+
+### Gates
+
+[measured, under `systemd-run` at 14 GiB with `nice -n 10`,
+`CARGO_INCREMENTAL=0`]
+- **COMPARE's leaf** within 15% of the model and under 1 s; every tamper
+  refused. **The kernel leaf's topology** within 2^16 / 2^17 / 2^16, its
+  terms pinned. The first feasibility gate is passed.
+- **`just check`** green: 1,070 tests (1,067 at 5.10; four new, one moved).
+- `cargo clippy -p vos-recair -p vos-pvm-proof --all-targets` clean.
+- Not run: `test-proof` (no prover suite changed; the new prover entry is
+  exercised by `leaves.rs` in `just check`).
+
+### Outside the step's files
+
+- `pvm/proof/src/prove.rs`, `lib.rs`: `prove_chip_isolated_format`.
+- `pvm/proof/recair/src/verifier/{shape,segment,logup}.rs`: the
+  chip-isolated shape, `BoundaryTerms`, `check_total`, the `deep once`
+  piece.
+- `docs/design/slice-5-proving.md` 5.11 (and the risk on the model's
+  rows): format 35's targets and the gate's measured figures.
+- `docs/design/recursion-air.md`: §0 item 4, §4.8, §5's leaf table (format
+  35's rows from `count-35.log` and the measured ones, in place of the
+  39-query ones; the solvency predicate's row kept, marked as the 39-query
+  count), its bullets, §10's step 4, R6 and R7.

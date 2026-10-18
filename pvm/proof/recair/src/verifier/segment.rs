@@ -178,18 +178,23 @@ pub fn verify_segment<V: Value>(
         z: relations[r][0],
         alpha: relations[r][1],
     };
-    let [register, program, merkle] = shape.boundary_relations;
-    logup::check(
-        context,
-        &claimed_sums,
-        &shape.positions,
-        &boundary,
-        &BoundaryRelations {
-            register_memory: challenge(register),
-            program_execution: challenge(program),
-            merkle_node: challenge(merkle),
-        },
-    );
+    match shape.boundary {
+        Some(terms) => {
+            let [register, program, merkle] = terms.relations;
+            logup::check(
+                context,
+                &claimed_sums,
+                &terms.positions,
+                &boundary,
+                &BoundaryRelations {
+                    register_memory: challenge(register),
+                    program_execution: challenge(program),
+                    merkle_node: challenge(merkle),
+                },
+            );
+        }
+        None => logup::check_total(context, &claimed_sums),
+    }
 
     context.piece("channel");
     let interaction_root = guess_pair(context, values.roots[1]);
@@ -241,7 +246,7 @@ pub fn verify_segment<V: Value>(
     context.piece("queries");
     let queries = channel.draw_queries(context, config.fri_config.n_queries, lifting);
 
-    context.piece("deep");
+    context.piece("deep once");
     let constants = deep::prepare(context, &shape.deep, oods_point, deep_coeff, &sampled);
     let commitment = FriCommitment {
         roots: fri_roots,

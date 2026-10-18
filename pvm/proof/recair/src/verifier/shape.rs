@@ -13,6 +13,9 @@
 //! circuit; in the circuit, the header the channel mixes is checked against
 //! the shape's constants word by word, and every structural use of the log
 //! sizes is the shape's, every length of the values checked against it.
+//! [`SegmentShape::chip_isolated`] is a chip's shape without the boundary
+//! chips, whose logup check is the claimed sums' total alone: a chip's leaf
+//! measured, never a segment's.
 
 use core::cell::RefCell;
 use std::rc::Rc;
@@ -81,6 +84,16 @@ impl stwo::core::channel::Channel for HeaderWords {
     }
 }
 
+/// Where the boundary chips' claimed sums are checked against the public
+/// terms over the boundary states.
+#[derive(Clone, Copy, Debug)]
+pub struct BoundaryTerms {
+    /// The register-memory, program-execution and Merkle-node relations'
+    /// indices in [`SegmentShape::relations`].
+    pub relations: [usize; 3],
+    pub positions: BoundaryChipPositions,
+}
+
 /// A segment verifier circuit's shape.
 pub struct SegmentShape {
     pub format: &'static Format,
@@ -93,10 +106,8 @@ pub struct SegmentShape {
     pub layout: SampleLayout,
     /// The relations, by name, in the order the channel draws them.
     pub relations: Vec<String>,
-    /// The register-memory, program-execution and Merkle-node relations'
-    /// indices in [`SegmentShape::relations`].
-    pub boundary_relations: [usize; 3],
-    pub positions: BoundaryChipPositions,
+    /// The boundary chips' public terms; none in a chip-isolated shape.
+    pub boundary: Option<BoundaryTerms>,
     pub compiled: Compiled,
     /// Each tree's height: preprocessed, main, interaction, composition.
     pub heights: [u32; 4],
@@ -129,6 +140,46 @@ impl SegmentShape {
         component_mask: u32,
         log_sizes: &[u32],
         preprocessed_root: P2Hash,
+    ) -> Self {
+        let positions =
+            boundary_positions_in_mask(component_mask).expect("the boundary chips are active");
+        Self::build(
+            format,
+            component_mask,
+            log_sizes,
+            preprocessed_root,
+            Some(positions),
+        )
+    }
+
+    /// The shape of a chip-isolated proof
+    /// (`vos_pvm_proof::prove_chip_isolated_format`): its logup check is the
+    /// claimed sums' total alone, as `verify_with_explicit_components`
+    /// checks it, without the boundary binding. Such a proof binds no
+    /// boundary state and is no segment; it measures a chip's leaf.
+    ///
+    /// # Panics
+    /// As [`SegmentShape::new`], and when the mask holds every boundary
+    /// chip: a segment's shape is built by [`SegmentShape::new`] alone.
+    pub fn chip_isolated(
+        format: &'static Format,
+        component_mask: u32,
+        log_sizes: &[u32],
+        preprocessed_root: P2Hash,
+    ) -> Self {
+        assert!(
+            boundary_positions_in_mask(component_mask).is_none(),
+            "a mask without the boundary chips"
+        );
+        Self::build(format, component_mask, log_sizes, preprocessed_root, None)
+    }
+
+    fn build(
+        format: &'static Format,
+        component_mask: u32,
+        log_sizes: &[u32],
+        preprocessed_root: P2Hash,
+        positions: Option<BoundaryChipPositions>,
     ) -> Self {
         let config = format.pcs_config();
         assert_eq!(format.status, Status::Admitted, "an admitted format");
@@ -180,19 +231,20 @@ impl SegmentShape {
         }
         let (relations, lookup) = draw_order(component_mask);
         let challenges = lookup.relation_challenges();
-        let boundary_relations = boundary_relation_challenges(&lookup).map(|(z, _)| {
-            let name = &challenges
-                .iter()
-                .find(|relation| relation.z == z)
-                .expect("a drawn relation")
-                .name;
-            relations
-                .iter()
-                .position(|known| known == name)
-                .expect("a drawn relation")
+        let boundary = positions.map(|positions| BoundaryTerms {
+            relations: boundary_relation_challenges(&lookup).map(|(z, _)| {
+                let name = &challenges
+                    .iter()
+                    .find(|relation| relation.z == z)
+                    .expect("a drawn relation")
+                    .name;
+                relations
+                    .iter()
+                    .position(|known| known == name)
+                    .expect("a drawn relation")
+            }),
+            positions,
         });
-        let positions =
-            boundary_positions_in_mask(component_mask).expect("the boundary chips are active");
 
         let recordings: Vec<Recording> = layout
             .components
@@ -263,8 +315,7 @@ impl SegmentShape {
             header: header.0,
             layout,
             relations,
-            boundary_relations,
-            positions,
+            boundary,
             compiled,
             heights,
             leaf_order,

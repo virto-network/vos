@@ -23,9 +23,8 @@
 //!   another structure before they are guessed.
 //! - **Repeats:** a position drawn twice is laid out twice, each opening
 //!   accepted.
-//! - **Rows:** each piece's, on the fixture and on the window kernel's
-//!   class-1 leaf topology (built without values), against `recursion-air.md`
-//!   §4.7's model.
+//! - **Rows:** each piece's, on the fixture (the window kernel's leaf
+//!   topology is pinned term by term in `leaves.rs`).
 
 use std::sync::OnceLock;
 
@@ -1044,7 +1043,7 @@ fn oods_accepts_and_refuses() {
     let claimed = last_of(&|input| matches!(input, CompiledInput::ClaimedSum(_)));
     // The register-memory relation's `z`: a relation only chips idle on the
     // trace use samples to zero there whatever `z` is.
-    let register = real.shape.boundary_relations[0];
+    let register = real.shape.boundary.unwrap().relations[0];
     let challenge = last_of(&|input| *input == CompiledInput::Challenge(register, 0));
     for tamper in [running_sum, claimed, challenge] {
         assert_eq!(run(Some(tamper)), 1, "{:?}", inputs[tamper]);
@@ -1094,7 +1093,8 @@ fn the_logup_sums_accept_and_refuse() {
                 alpha: context.guess(alpha),
             }
         };
-        let [register, program, merkle] = real.shape.boundary_relations;
+        let terms = real.shape.boundary.unwrap();
+        let [register, program, merkle] = terms.relations;
         let relations = BoundaryRelations {
             register_memory: challenge(register),
             program_execution: challenge(program),
@@ -1103,14 +1103,14 @@ fn the_logup_sums_accept_and_refuse() {
         logup::check(
             &mut context,
             &claimed,
-            &real.shape.positions,
+            &terms.positions,
             &boundary,
             &relations,
         );
         context.mismatches().len()
     };
     assert_eq!(run(None, None), 0);
-    let positions = real.shape.positions;
+    let positions = real.shape.boundary.unwrap().positions;
     // A boundary chip's sum: the total and its public term.
     assert_eq!(run(Some(positions.register_closing), None), 2);
     // Another chip's: the total.
@@ -1131,29 +1131,4 @@ fn the_logup_sums_accept_and_refuse() {
     ] {
         assert_eq!(run(None, Some(byte)), refusals, "byte {byte}");
     }
-}
-
-// ── Rows ───────────────────────────────────────────────────────────────────
-
-/// The window kernel's class-1 leaf topology (mask `0x01f9ffff`, 5.10a's
-/// count), built without values: each piece's rows against `count-35.log`'s
-/// model (59,300 / 102,849 / 46,080 with the leaf's own work).
-#[test]
-fn the_window_kernels_leaf_rows() {
-    let shape = SegmentShape::new(&SEGMENT, WINDOW_MASK, &WINDOW_LOG_SIZES, P2Hash::default());
-    let mut context = Context::<NoValue>::new();
-    verify_segment(&mut context, &shape, &SegmentValues::blank(&shape));
-    print_rows("the window kernel's class-1 leaf", &context);
-    let (blocks, singles, samples) = shape.deep.counts();
-    eprintln!(
-        "DEEP: {samples} samples at {} points; a query's chains {blocks} h8 blocks and {singles} \
-         single samples; lifting 2^{}",
-        shape.deep.points.len(),
-        shape.layout.lifting_log_size
-    );
-    let rows = context.rows();
-    assert!(
-        rows[0] <= 1 << 16 && rows[1] <= 1 << 17 && rows[2] <= 1 << 16,
-        "{rows:?}"
-    );
 }

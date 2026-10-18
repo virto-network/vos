@@ -525,19 +525,29 @@ M0's milestone review left these before the recursion builds on them.
   - a tampered OODS sample, queried value, sibling, FRI value and nonce
     are each refused;
   - a regression test pins the topology's rows per term of the
-    re-baselined log (5.9), not only its totals.
-- **Gate:**
-  - COMPARE's rows within 15% of 8,488 / 10,869 / 273, and at most 1 s;
-  - the kernel leaf's topology within 2^16 / 2^17 / 2^16. `count.log`
-    counted 55,307 / 96,324 / 42,549 at 39 queries over 7,519 columns. At
-    44 queries over the hardened shape's 8,024 columns and about 5,160
-    constraints: about **64.8k / 111k / 51k** [model, `count.log`'s terms
-    scaled by the measured columns, samples and constraints], plus about
-    25 `p2` rows for the byte-form digests. `p2` sits within about 1% of
-    2^16, so this count comes first. If it passes 2^16, the levers are
-    fewer queries with more PoW (5.8.0's rule: PoW 24 and 40 queries,
-    about −6k `p2` rows), FRI fold step 3 in inner proofs (about −7k),
-    or `p2` at 2^17.
+    re-baselined log (`count-35.log`), not only its totals.
+- **Gate** (format 35: 40 queries, PoW 24, the window kernel's 8,009
+  columns; `research/slice-5/count-35.log`):
+  - COMPARE's rows within 15% of **8,644 / 10,352 / 280** [model, the
+    verifier's rows at 40 queries; 8,702 / 11,152 / 280 with a leaf's own
+    work, which a chip-isolated proof has none of; 8,488 / 10,869 / 273
+    was the 39-query count], and at most 1 s;
+  - the kernel leaf's topology within 2^16 / 2^17 / 2^16: **59,242 /
+    102,049 / 46,080** [model] before the leaf's own work (59,300 /
+    102,849 / 46,080 with it), `p2` 9.5% under 2^16. At 44 queries over
+    the 8,024-column shape it was about 64.8k / 111k / 51k [model], `p2`
+    within about 1% of 2^16, which 5.8.0's rule moved to format 35 at
+    5.10a.
+- **Gate passed** [measured, 5.11]:
+  - **COMPARE's leaf** (COMPARE at 2^12 rows with the byte-range table's
+    one preprocessed column, 68 columns, chip-isolated, format 35):
+    **7,732 / 10,279 / 240** rows, 0.89 / 0.99 / 0.86 of the model
+    (lifting 2^14, not the model's 2^15); padded to 2^13 / 2^14 / 2^8;
+    proved in **0.21–0.24 s** at load 8–10, verified in 0.013–0.015 s; every tamper refused by its
+    check.
+  - **The kernel leaf's topology: 57,655 / 101,638 / 46,000** rows, `p2`
+    12.0% under 2^16, `qm31` 29,434 under 2^17, `h8` 19,536 under 2^16;
+    each of `count-35.log`'s terms pinned, with its delta from the model.
 - **Estimate:** 1–2 weeks.
 
 ### 5.12 The kernel leaves (F)
@@ -704,5 +714,6 @@ its gate. This slice's sharpest:
   external audit before value.
 - **The model's rows:** 5.11 counts the kernel leaf's topology term by
   term, weeks before 5.12 proves it. At 44 queries over the hardened
-  shape, its `p2` sits within about 1% of 2^16 [model], so 5.8.0's rule
-  recounts it at 5.10's start and moves the segment format if it must.
+  shape, its `p2` sat within about 1% of 2^16 [model]; 5.8.0's rule moved
+  the segment format to 35 (40 queries, PoW 24), and the built topology's
+  `p2` is 12.0% under 2^16 [measured, 5.11].

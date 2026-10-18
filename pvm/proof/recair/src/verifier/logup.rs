@@ -125,6 +125,16 @@ fn register_file<V: Value>(
     sum.expect("thirteen registers")
 }
 
+/// The components' `claimed_sums` add to zero.
+pub fn check_total<V: Value>(context: &mut Context<V>, claimed_sums: &[Var]) {
+    let zero = context.zero();
+    let terms: Vec<(BaseField, Var)> = claimed_sums
+        .iter()
+        .map(|&sum| (BaseField::one(), sum))
+        .collect();
+    super::bits::linear(context, &terms, Some(zero));
+}
+
 /// The logup check over the components' `claimed_sums` (active order), and
 /// the boundary chips' at `positions` against the public terms over the
 /// boundary bytes' wires.
@@ -135,12 +145,7 @@ pub fn check<V: Value>(
     boundary: &[Var],
     relations: &BoundaryRelations,
 ) {
-    let zero = context.zero();
-    let terms: Vec<(BaseField, Var)> = claimed_sums
-        .iter()
-        .map(|&sum| (BaseField::one(), sum))
-        .collect();
-    super::bits::linear(context, &terms, Some(zero));
+    check_total(context, claimed_sums);
 
     // Register file in: (r, value, 0, 1); out: (r, value, ts_out, 0).
     let expected = register_file(
