@@ -84,6 +84,12 @@ impl stwo::core::channel::Channel for HeaderWords {
     }
 }
 
+/// The chips whose claimed sums the boundary states bind.
+const BOUNDARY_CHIPS: u32 = 1 << chip_idx::REGISTER_MEMORY_BOUNDARY
+    | 1 << chip_idx::REGISTER_MEMORY_CLOSING
+    | 1 << chip_idx::PROGRAM_BOUNDARY
+    | 1 << chip_idx::MEMORY_ROOT_BOUNDARY;
+
 /// Where the boundary chips' claimed sums are checked against the public
 /// terms over the boundary states.
 #[derive(Clone, Copy, Debug)]
@@ -159,8 +165,8 @@ impl SegmentShape {
     /// boundary state and is no segment; it measures a chip's leaf.
     ///
     /// # Panics
-    /// As [`SegmentShape::new`], and when the mask holds every boundary
-    /// chip: a segment's shape is built by [`SegmentShape::new`] alone.
+    /// As [`SegmentShape::new`], and when the mask holds any boundary chip:
+    /// a segment's shape is built by [`SegmentShape::new`] alone.
     pub fn chip_isolated(
         format: &'static Format,
         component_mask: u32,
@@ -168,7 +174,7 @@ impl SegmentShape {
         preprocessed_root: P2Hash,
     ) -> Self {
         assert!(
-            boundary_positions_in_mask(component_mask).is_none(),
+            component_mask & BOUNDARY_CHIPS == 0,
             "a mask without the boundary chips"
         );
         Self::build(format, component_mask, log_sizes, preprocessed_root, None)

@@ -24,3 +24,5 @@ postcard = { version = "1", features = ["alloc"] }
 vos-pvm = { workspace = true }
 # The shape's security counts against the standalone verifier's.
 vos-pvm-proof-verifier = { workspace = true }
+# A chip-isolated proof, COMPARE's leaf's (`prove_chip_isolated_format`).
+vos-pvm-proof = { workspace = true, features = ["debug-internals"] }

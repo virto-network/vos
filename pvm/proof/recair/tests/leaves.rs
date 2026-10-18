@@ -241,28 +241,54 @@ fn compares_leaf_refuses_each_tamper() {
     assert!(refused, "a tampered witness proves and verifies");
 }
 
-/// A chip-isolated shape is no segment's: a mask with the boundary chips
-/// builds its shape with the binding only, and the COMPARE proof's shape is
-/// refused by a segment's.
+/// A panic's message, whether its payload is static or formatted.
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    match payload.downcast::<String>() {
+        Ok(message) => *message,
+        Err(payload) => payload
+            .downcast_ref::<&str>()
+            .map(|message| message.to_string())
+            .unwrap_or_default(),
+    }
+}
+
+/// A chip-isolated shape is no segment's: a mask holding any boundary chip,
+/// one of them or all four, builds no chip-isolated shape, and the COMPARE
+/// proof's mask builds no segment's.
 #[test]
 fn a_chip_isolated_shape_holds_no_boundary_chip() {
     let compare = compare();
     assert!(compare.shape.boundary.is_none());
     assert_eq!(compare.shape.check(&compare.proof), Ok(()));
+    let boundary = [
+        chip_idx::REGISTER_MEMORY_BOUNDARY,
+        chip_idx::REGISTER_MEMORY_CLOSING,
+        chip_idx::PROGRAM_BOUNDARY,
+        chip_idx::MEMORY_ROOT_BOUNDARY,
+    ];
+    let mut masks: Vec<u32> = boundary
+        .iter()
+        .map(|&chip| COMPARE_MASK | 1 << chip)
+        .collect();
+    masks.push(COMPARE_MASK | 1 << boundary[0] | 1 << boundary[2]);
+    masks.push(WINDOW_MASK);
+    for mask in masks {
+        let log_sizes = vec![8; mask.count_ones() as usize];
+        let message = std::panic::catch_unwind(|| {
+            SegmentShape::chip_isolated(&SEGMENT, mask, &log_sizes, P2Hash::default());
+        })
+        .expect_err("refused");
+        assert_eq!(
+            panic_message(message),
+            "a mask without the boundary chips",
+            "{mask:#x}"
+        );
+    }
     let message = std::panic::catch_unwind(|| {
-        SegmentShape::chip_isolated(&SEGMENT, WINDOW_MASK, &WINDOW_LOG_SIZES, P2Hash::default());
+        SegmentShape::new(&SEGMENT, COMPARE_MASK, &[8, 12], P2Hash::default());
     })
     .expect_err("refused");
-    assert_eq!(
-        message.downcast_ref::<&str>(),
-        Some(&"a mask without the boundary chips")
-    );
-    assert!(
-        std::panic::catch_unwind(|| {
-            SegmentShape::new(&SEGMENT, COMPARE_MASK, &[8, 12], P2Hash::default());
-        })
-        .is_err()
-    );
+    assert_eq!(panic_message(message), "the boundary chips are active");
 }
 
 // ── The window kernel's leaf rows ──────────────────────────────────────────
@@ -357,8 +383,9 @@ const WINDOW_TERMS: [Term; 17] = [
 
 /// The window kernel's class-1 leaf topology (mask `0x01f9ffff`), built
 /// without values: each term's rows as measured, pinned, beside
-/// `count-35.log`'s model (59,242 / 102,049 / 46,080 before the leaf's own
-/// work, which 5.12 adds), and the totals within 2^16 / 2^17 / 2^16.
+/// `count-35.log`'s model (59,242 / 102,049 / 46,080), the segment's
+/// verification without the leaf's own work, and the totals within 2^16 /
+/// 2^17 / 2^16.
 #[test]
 fn the_window_kernels_leaf_rows_per_term() {
     let shape = SegmentShape::new(&SEGMENT, WINDOW_MASK, &WINDOW_LOG_SIZES, P2Hash::default());

@@ -61,8 +61,9 @@
 //! - `prover` (default) — trace generation, proof creation, blake3
 //!   commitments, rayon parallelism.  Pulls in heavy deps.
 //! - `debug-internals` — exposes `debug_claimed_sums` for bisecting
-//!   prover-side logup imbalances when adding a new constraint.  Off
-//!   by default; production callers don't need it.
+//!   prover-side logup imbalances when adding a new constraint, and
+//!   `prove_chip_isolated_format`, a chip's proof alone for measuring
+//!   its leaf.  Off by default; production callers don't need it.
 //! - `--no-default-features` — verifier-only, `no_std` compatible,
 //!   minimal dep tree.
 //!
@@ -581,13 +582,13 @@ pub use prove::{
 pub use prove::{
     NaturalFloors, ProveProfile, canonical_profile_for_bounds_compact, install_thread_pool,
     natural_log_sizes_for, prepare_side_note_for_verification, production_pcs_config,
-    production_pcs_config_mobile, prove_chip_isolated_format, prove_profiled,
-    prove_profiled_with_config, prove_with_explicit_components,
+    production_pcs_config_mobile, prove_profiled, prove_profiled_with_config,
+    prove_with_explicit_components,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::{
     debug_assert_constraints_explicit, debug_assert_constraints_streaming, debug_claimed_sums,
-    debug_claimed_sums_streaming,
+    debug_claimed_sums_streaming, prove_chip_isolated_format,
 };
 #[cfg(feature = "prover")]
 pub use side_note::{CompactTrace, SideNote};

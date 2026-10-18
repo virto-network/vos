@@ -2797,7 +2797,8 @@ targets are format 35's (40 queries, PoW 24, 8,009 columns;
 
 ### COMPARE's leaf (`pvm/proof/recair/tests/leaves.rs`)
 
-- **The proof:** `prove_chip_isolated_format` (new, `prove.rs`, hidden): a
+- **The proof:** `prove_chip_isolated_format` (new, `prove.rs`, behind
+  `debug-internals`): a
   mask's chips under an admitted format at its parameters, each at least a
   floor, the mask carried in the proof. COMPARE at 2^12 rows with
   RANGE_MULTIPLICITY_256 at 2^8: COMPARE commits no preprocessed column and
@@ -2808,8 +2809,8 @@ targets are format 35's (40 queries, PoW 24, 8,009 columns;
   close, and the circuit's rows do not depend on the values. It verifies
   natively (`verify_with_explicit_components` at format 35's exact policy).
 - **The circuit:** `SegmentShape::chip_isolated`, the shape of a mask
-  without the boundary chips (a mask holding them is refused; a segment's
-  shape is `SegmentShape::new`'s alone), whose logup check is
+  without the boundary chips (a mask holding any of the four is refused; a
+  segment's shape is `SegmentShape::new`'s alone), whose logup check is
   `logup::check_total`, the claimed sums adding to zero, as
   `verify_with_explicit_components` checks it. `SegmentShape`'s boundary
   relations and positions are now one `Option<BoundaryTerms>`.
@@ -2822,10 +2823,11 @@ targets are format 35's (40 queries, PoW 24, 8,009 columns;
   15%. Against the plan's 39-query 8,488 / 10,869 / 273 (with a leaf's own
   work): 0.911 / 0.946 / 0.879. The lifting height is 2^14, not the model's
   2^15, as for the kernel (§4.8): a path level and a FRI layer fewer.
-  By piece: merkle 2,560 `p2`; FRI 5,040 `p2`, 2,800 `qm31`; query bits
-  2,560 and points 2,040 `qm31`; DEEP 2,160 `qm31` and 240 `h8` over the
-  queries, 230 `qm31` once; OODS 227; PoW 246; channel 121 `p2`; header 13;
-  logup 1.
+  By piece: merkle 2,560 `p2`; FRI 5,040 `p2`, 2,800 `qm31`; query draws 5
+  `p2`, their bits 2,560 `qm31`, and points 2,040 `qm31`; DEEP 2,160 `qm31`
+  and 240 `h8` over the queries, 230 `qm31` once; OODS 227; PoW 6 `p2` and
+  246 `qm31`; channel 121 `p2`; header 13; logup 1; the context's constants
+  2.
 - **Proved** padded to 2^13 / 2^14 / 2^8 in **0.21–0.24 s**, verified in
   0.013–0.015 s [measured, three runs, load average 8–10]: under the gate's
   1 s.

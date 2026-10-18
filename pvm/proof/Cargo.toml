@@ -40,7 +40,8 @@ wire = ["dep:vos-wire"]
 # logup imbalances.  Off by default so the production prover surface
 # stays clean; turn on with `--features debug-internals` to bisect
 # "ConstraintsNotSatisfied" vs. "claimed logup sum is not zero" failure
-# modes when adding constraints.
+# modes when adding constraints; and `prove_chip_isolated_format`, a
+# chip's proof alone, which the recursion prover's tests measure a leaf on.
 debug-internals = ["prover"]
 
 [dependencies]

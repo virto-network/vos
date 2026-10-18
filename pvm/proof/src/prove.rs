@@ -463,7 +463,8 @@ pub fn prove_with_explicit_components(
 /// floor in `min_log_sizes`. The proof carries the mask, so the recursion
 /// seams read its shape; like [`prove_with_explicit_components`]'s, it pairs
 /// only with `verify_with_explicit_components`, which skips the boundary
-/// binding.
+/// binding. A measurement seam, not a prove path: behind `debug-internals`.
+#[cfg(feature = "debug-internals")]
 pub fn prove_chip_isolated_format(
     side_note: &mut SideNote,
     format: &'static Format,
