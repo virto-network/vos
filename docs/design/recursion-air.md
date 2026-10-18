@@ -67,8 +67,9 @@ native verifier, and the build of slice 5's M1.
    would settle at 2^15 / 2^16 / 2^12.
 7. **The final wrap** verifies the root fold in 2^14 / 2^15 / 2^11 rows
    (tallest 2^15 ≤ 2^17) [model]: 2.2–4.9 GiB at blowup 64 [projected], about
-   85M JAM gas with Blake2b-256 in software, 64M through `0x400`, 117–119M
-   masked, about 122 KB unmasked [model].
+   85M JAM gas with Blake2b-256 in software, 64M through `0x400`, about
+   122 KB unmasked [model]; 115.8–118.7M masked with postcard [measured,
+   spike 6a], about 98M with format 39's fixed layout [est].
 8. **Every node carries the fold's circuit-hash word** (§6): a fold requires
    each child to carry its own word, and the wrap pins the root's, so every
    fold in the tree is the true fold circuit and every other node a leaf of
@@ -126,7 +127,10 @@ Driven through `InfoEvaluator` and `ExprEvaluator` (`SP/count/src/rec.rs`)
 | **recursion AIR** | 57 | 361 | 32 | **458** | 313 | **3** | | 2,052 |
 
 Interaction columns pair their fractions (`finalize_logup_in_pairs`), so
-masking variant (c) applies unchanged (`R/spike2-masking.md` §3b).
+masking variant (c) applies unchanged (`R/spike2-masking.md` §3b). Its
+blinding columns live in a wrap-only variant (`MaskedEval`), never in the
+shared components, so format 32, `H_fold` and every program id stay as
+they are.
 
 ### 1.3 `p2`: Poseidon2-M31, one permutation a row
 
@@ -672,10 +676,10 @@ and fold layout of §1.1 is unchanged.
 | rows p2 / qm31 / h8 | 15,311 / 20,766 / 1,794 → 2^14 / 2^15 / 2^11, tallest **2^15** (≤ 2^17) | model |
 | own parameters | blowup 64, 20 queries, PoW 26, interaction PoW 8, fold step 3, last layer 2^6, Blake2b-256 Merkle and channel, affine DEEP batching for 80 proven bits (`proving.md` §3.5) | decided (format 28) |
 | cells, extended cells | 7.5M, 481M | model |
-| memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked; ×1.56–1.6 masked (c): 3.5–7.8 GiB | projected |
+| memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked [projected]; masked (format 39): 3.45 GiB of heap (×1.41), 11.6–15 s (×2.6–2.9) [measured] | projected, measured |
 | JAM gas, unmasked | 81.1M with the model's Blake2s; **85.2M Blake2b-256 in software (×1.05); 64.1M through `0x400` (×0.79)** | model (`R/spike4a-final-gas.md` §5, §7) |
-| JAM gas, masked | 117–119M (×1.37–1.40) | projected |
-| proof | about 122 KB unmasked, 164–170 KB masked | model |
+| JAM gas, masked | 115.8–118.7M (×1.21–1.24); the toy's ×1.37–1.40 overestimated | measured (spike 6a) |
+| proof | about 122 KB unmasked [model], 160–163 KB masked [measured] | model, measured |
 
 - The gas uses spike 4a's fit within 5.8%
   (`gas ≈ −4.2M + 59.3k·C + 2,171·q·C + 17,183·P + 9,376·F`) at 458 columns,
@@ -711,9 +715,12 @@ build-std. It holds:
   ids, the parameters of §7, the format number;
 - Stwo's core verifier at the pin, FRI fold step 3 and a 2^6 last layer
   (`ST/stwo/src/core/fri.rs:107-200`, admitted after review);
-- the Blake2b-256 Merkle hasher and channel, in software as built; through
-  the host (VOS `0x400`, Kreivo's `blake2_256`) once the fork's hasher
-  takes a compression hook (slice 6);
+- the Blake2b-256 Merkle hasher and channel, in software as built. The
+  hook that would route it through a host (VOS `0x400`, Kreivo's
+  `blake2_256`) is deferred, a lever for when ref_time binds: nothing in
+  slice 6 verifies as a PVM guest on a VOS host, and Kreivo's binding
+  limit is proof_size. JAM serves no hash (Gray Paper 0.8.0 has no hash
+  host call), so a JAM verifier hashes in software;
 - the public logup sum from the program id, the io-hash, `u` and `one`;
 - the components built once, as spike 4a's; unlike spike 4a's, a shape
   check before any Stwo call (`check_shape`, `check_samples`: the
@@ -805,7 +812,8 @@ Ordered so feasibility is retired first. Weeks are engineer-weeks
 These are M1's 17–24 weeks after its 1–2-week preparation (`proving.md` §11,
 slice 5's 5.8.0), with review time on top. They sit below spike 4b §8's 20–28
 to a working tree for our own AIR: the design and its counts are now measured,
-and production hardening (the audit, masking) is slice 6. Step 1 depends on M0's SIMD Poseidon2 hasher for speed,
+masking is slice 6, and the external audit's timing is the owner's
+(`slice-5-progress.md`). Step 1 depends on M0's SIMD Poseidon2 hasher for speed,
 not for correctness, and on the fork's completeness fix: the recursion AIR's
 preprocessed tree (2^17) sits below its lifting height (2^20).
 
@@ -825,7 +833,7 @@ preprocessed tree (2^17) sits below its lifting height (2^20).
 | R10 | **The wrap's gas**: the fit is on a one-component proxy | step 7 verifies the real wrap on the JAM-only host |
 | R11 | **The final verifier needs nightly** (the pin's `portable_simd` is prover-only; riscv64em-javm needs build-std) | step 1 builds the skeleton with no nightly feature in the source: on stable for x86 and wasm32, on the pinned nightly with build-std for JAM |
 | R12 | **Signed multiplicities**: a yield by a first consumer is new soundness surface | §1.1's argument; the `Context`'s static checks; the audit of that argument |
-| R13 | **Masking the wrap** (slice 6) costs more than (c)'s ×1.6 | one masked wrap: ≤ 24 GiB, ≤ 200M gas (`proving.md` §10) |
+| R13 | **Masking the wrap** (slice 6) costs more than (c)'s ×1.6 | spike 6a, measured: memory ×1.41 and gas ×1.21–1.24, within the gate (≤ 24 GiB, ≤ 200M gas, `proving.md` §10); time ×2.6–2.9, above the toy's ×1.6, from Blake2b Merkle hashing at a lifting one level higher |
 
 ## Appendix: reproduce
 
