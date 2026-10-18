@@ -1,7 +1,7 @@
 //! Proving benchmarks at various trace sizes, comparable to Nexus prover-benches.
 //!
 //! These are measurement harnesses, not correctness tests — the real ALU/memory
-//! semantics are covered by the functional tests (`phase2_alu`, `memory`, …), so
+//! semantics are covered by the functional tests (`isa`: `alu`, `memory`, …), so
 //! they live under `benches/` (out of `cargo test`) and run serially, one prove
 //! at a time, so a single large trace never competes for RAM with another.
 //!

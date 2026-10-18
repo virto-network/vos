@@ -101,7 +101,7 @@ the canonical paired structure.
 
 Adding a constraint without a matching negative test (a deliberately-wrong
 trace that the verifier must reject) leaves you with no proof the constraint
-fires.  See `tests/bitmanip.rs` for the pattern: build an honest trace,
+fires.  See `tests/isa/bitmanip.rs` for the pattern: build an honest trace,
 mutate one column, assert `prove + verify` panics with
 `ConstraintsNotSatisfied`.
 
@@ -124,8 +124,5 @@ discovered the hard way:
     pair structure should pass `prove_fibonacci_actor` (a few hundred
     steps) before claiming the change is safe at scale.
 
-Minimum sweep: `cargo test -p vos-pvm-proof --test add64_e2e --test memory --test
-control_flow --test bitmanip --test alu_negative --test
-control_flow_negative --test memory_negative --test program_identity
---test prove_vos_actor`.  ~6 minutes; catches all known regression
-classes.
+Minimum sweep: `cargo test -p vos-pvm-proof --features debug-internals --test
+isa --test gates`; catches all known regression classes.

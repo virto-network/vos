@@ -5,10 +5,12 @@
 
 pub mod kernel;
 
+use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_recair::gadgets::{TranscriptGadget, leaf_hash, node};
-use vos_pvm_recair::{Context, Message, P2Handle, Qm31Op, Value, Var};
+use vos_pvm_recair::verifier::witness::pack;
+use vos_pvm_recair::{Bit, Context, Message, P2Handle, Qm31Op, Value, Var};
 
 /// SplitMix64.
 pub struct Rng(u64);
@@ -190,18 +192,6 @@ pub fn random_circuit<V: Value>(seed: u64, gates: usize) -> Context<V> {
     context
 }
 
-/// `values` packed four a wire, zeros past the end.
-pub fn pack(values: &[BaseField]) -> Vec<SecureField> {
-    values
-        .chunks(4)
-        .map(|chunk| {
-            SecureField::from_m31_array(core::array::from_fn(|i| {
-                chunk.get(i).copied().unwrap_or(BaseField::from(0))
-            }))
-        })
-        .collect()
-}
-
 pub fn words(values: &[BaseField]) -> Vec<vos_pvm_poseidon2::M31> {
     values
         .iter()
@@ -217,4 +207,31 @@ pub fn digest_wires(digest: &vos_pvm_poseidon2::Digest) -> [SecureField; 2] {
         .collect();
     let packed = pack(&values);
     [packed[0], packed[1]]
+}
+
+/// The window kernel's class-1 leaf topology: its mask and log sizes.
+pub const WINDOW_MASK: u32 = 0x01f9_ffff;
+pub const WINDOW_LOG_SIZES: [u32; 23] = [
+    15, 14, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 8, 15, 15, 15, 15, 16,
+];
+
+/// `context`'s rows, in all and by piece, to stderr.
+pub fn print_rows(name: &str, context: &Context<impl Value>) {
+    eprintln!("{name}: {:?} rows (p2, qm31, h8)", context.rows());
+    for (piece, rows) in context.piece_rows() {
+        eprintln!("  {piece}: {rows:?}");
+    }
+}
+
+/// The position `bits` hold, low bit first.
+pub fn position_of(context: &Context<SecureField>, bits: &[Bit]) -> usize {
+    bits.iter()
+        .enumerate()
+        .map(|(i, bit)| usize::from(context.value(bit.var()) == SecureField::one()) << i)
+        .sum()
+}
+
+/// `value` moved by one.
+pub fn bump(value: &mut SecureField) {
+    *value += SecureField::one();
 }

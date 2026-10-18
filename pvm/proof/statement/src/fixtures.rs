@@ -7,7 +7,7 @@
 //!   that proof's bytes if any, its [`Input`] and its verdict's code
 //!   (`crate::code`), in this module's encoding ([`encode`]).
 //!
-//! The generator (`pvm/proof/tests/fixtures.rs`) writes them, and refuses
+//! The generator (`pvm/proof/tests/kernel/fixtures.rs`) writes them, and refuses
 //! fixtures it no longer makes.
 
 use alloc::string::String;

@@ -724,7 +724,7 @@ where
 /// This reproduces exactly what a from-scratch malicious prover can do —
 /// run the whole pipeline with lying boundary metadata that is
 /// self-consistent with its own transcript. It exists so the
-/// boundary-binding gate test (`tests/boundary_binding.rs`) can assert
+/// boundary-binding gate test (`tests/gates/boundary_binding.rs`) can assert
 /// such proofs are REJECTED by `verify` / `verify_standalone`. It grants
 /// no capability an adversary lacks, but it is not part of the supported
 /// proving API.

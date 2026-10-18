@@ -638,7 +638,7 @@ fn verify_standalone_on<MC: PcsStack>(
     // `#[mask_next_row]` `prev_value` binding, a range-checked
     // `(reg, ts)` sortedness gadget, and an `is_write` tuple limb),
     // which is sound against a from-scratch prover (gate:
-    // `pvm/proof/tests/ledger_readconsistency_gate.rs`) — see
+    // `pvm/proof/tests/gates/ledger_readconsistency_gate.rs`) — see
     // `vos_pvm_proof::boundary_binding` and `chips/register_memory_closing.rs`.
     // So registers/pc/timestamp are all genuine bound public inputs. A
     // mask missing any binding

@@ -57,11 +57,11 @@ judge-wasm:
     for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm $semantics judge pvm/proof/fixtures }
 
 # The proof fixtures under `pvm/proof/fixtures` (`proving.md` A.6), written
-# anew by their generator, `pvm/proof/tests/fixtures.rs`: at a format bump,
+# anew by their generator, `pvm/proof/tests/kernel/fixtures.rs`: at a format bump,
 # or a change of the AIR or a kernel's shape. `test-proof` refuses fixtures
 # the generator no longer makes.
 fixtures:
-    with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test fixtures the_fixtures_are_the_generators }
+    with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators }
 
 # The tests run on mimalloc as the node's binary does, and as it does with
 # transparent huge pages off.

@@ -482,7 +482,7 @@ refuses it with. What the build found against the model:
   8,644 / 10,352 / 280, its circuit proved in 0.21–0.24 s. A chip-isolated
   shape holds no boundary chip and its logup check is the claimed sums'
   total, as `verify_with_explicit_components` checks it. The class-1 topology's rows
-  are pinned term by term beside the model (`recair/tests/leaves.rs`).
+  are pinned term by term beside the model (`recair/tests/recursion/leaves.rs`).
 - **The kernel leaves** (slice 5's 5.12, `vos-pvm-recair`'s `leaf`): the window
   kernel's real segments verified in their classes' leaves, which prove and
   verify. The leaf's own work is 45 `p2` rows (the two state digests, 19

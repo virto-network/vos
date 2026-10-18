@@ -1018,7 +1018,7 @@ each format bump, and stores them under `pvm/proof/fixtures` (about
 1.2 MB). M0 promised it and did not build it; slice 5's 5.8.0 does.
 
 **Built** (slice 5's 5.15, its review folded in 5.15b) [measured]: the
-generator (`pvm/proof/tests/fixtures.rs`) proves a small kernel stating a fixed
+generator (`pvm/proof/tests/kernel/fixtures.rs`) proves a small kernel stating a fixed
 statement `S` (two roots of its space, a nonce, an output) in three
 segments, folds them and wraps the root (`wrap.proof`, 124,025 bytes), and
 wraps two roots that are not a whole run as a cheating prover would, the

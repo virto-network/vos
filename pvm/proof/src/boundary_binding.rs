@@ -50,7 +50,7 @@
 //!   — and hence the actor io-hash in `final_state.registers[9..13]` —
 //!   to equal the trace's actual final register state. Combined with the
 //!   metadata→column binding here, registers are a fully bound public
-//!   input (gate: `tests/ledger_readconsistency_gate.rs`).
+//!   input (gate: `tests/gates/ledger_readconsistency_gate.rs`).
 //!   `memory_commitment` has no committed column and stays OUTSIDE this
 //!   binding entirely.
 //!

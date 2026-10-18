@@ -1,9 +1,5 @@
-//! Test helpers shared across `tests/*.rs` integration tests.
-//!
-//! Cargo treats files directly under `tests/` as separate test binaries, but
-//! `tests/common/mod.rs` is included via `mod common;` in each binary without
-//! triggering a duplicate-binary warning.  Callers do `mod common;` then
-//! `use common::*;`.
+//! Test helpers shared across the test binaries (`gates`, `isa`, `kernel`),
+//! each of which includes this module as `common`.
 
 #![allow(dead_code)]
 
@@ -75,24 +71,6 @@ pub fn trace_until_opcode_zero(
 /// Panics if either side fails — this is the positive-test happy path.
 pub fn prove_and_verify(steps: Vec<PvmStep>, code: &[u8], bitmask: &[u8]) {
     let mut side_note = vos_pvm_proof::SideNote::new(steps, code.to_vec(), bitmask.to_vec());
-    let proof = prove(&mut side_note).expect("proving failed");
-    verify(proof, &side_note).expect("verification failed");
-}
-
-/// Same as `prove_and_verify` but additionally prints per-component logup
-/// claimed sums via `debug_claimed_sums` before proving.  Useful when a
-/// constraint addition produces a `ConstraintsNotSatisfied` and you need to
-/// distinguish "logup imbalance" (per-component sums non-zero, total
-/// non-zero) from "structural pair-shape blow-up" (sums zero, prover still
-/// rejects).  See `pvm/proof/src/chips/cpu/CONSTRAINTS.md`.
-///
-/// This helper requires the `debug-internals` feature
-/// (`cargo test -p vos-pvm-proof --features debug-internals`).
-#[cfg(feature = "debug-internals")]
-pub fn prove_and_verify_with_debug(steps: Vec<PvmStep>, code: &[u8], bitmask: &[u8]) {
-    let mut side_note = vos_pvm_proof::SideNote::new(steps, code.to_vec(), bitmask.to_vec());
-    eprintln!("--- per-component logup sums ---");
-    vos_pvm_proof::debug_claimed_sums(&mut side_note);
     let proof = prove(&mut side_note).expect("proving failed");
     verify(proof, &side_note).expect("verification failed");
 }
@@ -170,6 +148,18 @@ pub fn three_reg_program(op: Opcode, rd: u8, ra: u8, rb: u8) -> (Vec<u8>, Vec<u8
     let code = vec![op as u8, reg_byte, rd, Opcode::Trap as u8];
     let bitmask = vec![1, 0, 0, 1];
     (code, bitmask)
+}
+
+/// Trace a ThreeReg program with the given registers.
+pub fn trace_three_reg(
+    op: Opcode,
+    rd: u8,
+    ra: u8,
+    rb: u8,
+    regs: [u64; PVM_REGISTER_COUNT],
+) -> Vec<PvmStep> {
+    let (code, bitmask) = three_reg_program(op, rd, ra, rb);
+    trace_until_opcode_zero(code, bitmask, regs)
 }
 
 /// Trace a ThreeReg program with given (input_a, input_b) in the source
@@ -292,14 +282,13 @@ pub fn measured<T>(work: impl FnOnce() -> T) -> (T, std::time::Duration, u64) {
 
 /// What a node, a leaf or a fold, measured: its rows, its proving time and its peak
 /// heap over the allocations before it (0 unless the binary installs
-/// [`Counting`]); its proof and the output it states.
+/// [`Counting`]); the node, its proof and the output it states.
 pub struct NodeRun {
     pub rows: [usize; 3],
     pub finalized: [usize; 3],
     pub proving: std::time::Duration,
     pub peak_mib: u64,
-    pub proof: vos_pvm_recair::RecairProof,
-    pub output: vos_pvm_recair::leaf::NodeOutput,
+    pub node: vos_pvm_recair::tree::Node,
 }
 
 /// `proof`, a segment of `program`'s class `class`, verified in its leaf at
@@ -397,8 +386,10 @@ pub fn prove_leaf(
         finalized,
         proving,
         peak_mib,
-        proof: leaf_proof,
-        output,
+        node: vos_pvm_recair::tree::Node {
+            proof: leaf_proof,
+            output,
+        },
     }
 }
 
@@ -415,20 +406,13 @@ pub fn prove_fold(
     right: &NodeRun,
     fold_word: vos_pvm_proof::poseidon2::P2Hash,
 ) -> NodeRun {
-    use vos_pvm_recair::fold::Proved;
     use vos_pvm_recair::leaf::PADDED_ROWS;
     use vos_pvm_recair::verifier::witness::digest_wires;
 
-    fn proved(node: &NodeRun) -> Proved<'_> {
-        Proved {
-            proof: &node.proof,
-            output: &node.output,
-        }
-    }
     let (values, output) = fold
         .values(
-            proved(left),
-            proved(right),
+            left.node.proved(),
+            right.node.proved(),
             &program.id_preimage(),
             fold_word,
         )
@@ -453,8 +437,10 @@ pub fn prove_fold(
         finalized,
         proving,
         peak_mib,
-        proof: fold_proof,
-        output,
+        node: vos_pvm_recair::tree::Node {
+            proof: fold_proof,
+            output,
+        },
     }
 }
 
@@ -470,12 +456,8 @@ pub fn wrap_root(
     use vos_pvm_recair::wrap::{self, WrapCircuit};
 
     let circuit = WrapCircuit::get();
-    let proved = vos_pvm_recair::fold::Proved {
-        proof: &root.proof,
-        output: &root.output,
-    };
     let (values, statement) = circuit
-        .values(proved, &program.id_preimage())
+        .values(root.node.proved(), &program.id_preimage())
         .expect("the root's values");
     let finalized = circuit
         .build(&values)
@@ -497,7 +479,7 @@ pub fn wrap_root(
     let verified = vos_pvm_final_verifier::verify_bytes(&bytes, &words).expect("the wrap verifies");
     assert_eq!(verified, statement);
     assert_eq!(statement.program, program.id().0.map(|word| word.0));
-    assert_eq!(statement.io_hash, root.output.io_hash);
+    assert_eq!(statement.io_hash, root.node.output.io_hash);
     (bytes, words)
 }
 
@@ -562,4 +544,34 @@ pub fn write_wrap(
     ] {
         std::fs::write(directory.join(format!("{name}.{extension}")), bytes).expect("writes");
     }
+}
+
+/// `instructions` as code, each one's start marked in the bitmask, with no
+/// jump table.
+pub fn code_of(instructions: &[Vec<u8>]) -> vos_pvm_program::CodeBlob {
+    let mut code = Vec::new();
+    let mut bitmask = Vec::new();
+    for instruction in instructions {
+        code.extend_from_slice(instruction);
+        bitmask.push(1);
+        bitmask.resize(code.len(), 0);
+    }
+    vos_pvm_program::CodeBlob {
+        jump_table: vec![],
+        code,
+        bitmask,
+    }
+}
+
+/// A standard program of `instructions`, laid out as the loader lays it
+/// out: no data, one heap page, a 4 KiB stack.
+pub fn standard_program(instructions: &[Vec<u8>]) -> Vec<u8> {
+    vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
+        ro_data: vec![],
+        rw_data: vec![],
+        heap_pages: 1,
+        stack_size: 4096,
+        code: code_of(instructions),
+    })
+    .expect("a standard program")
 }

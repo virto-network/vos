@@ -18,7 +18,7 @@
 //!   - register columns are pinned to the trace by the register ledger's
 //!     read-consistency (a cross-row `prev_value` binding, a `(reg, ts)`
 //!     sortedness gadget and an `is_write` limb; gate:
-//!     `tests/ledger_readconsistency_gate.rs`);
+//!     `tests/gates/ledger_readconsistency_gate.rs`);
 //!   - `memory_root` is the page-Merkle root the boundary multiproof binds
 //!     in-circuit (`Memory{Page,Merkle,RootBoundary}Chip`).
 //! `verify_chain` itself is a host-side capability: it consumes

@@ -771,7 +771,7 @@ pub(crate) fn classify_opcode(op: Opcode) -> OpcodeFlags {
         // with no semantic effect).  All flags stay 0 so the default
         // sequential-PC identity (next_pc = pc + 1 + skip_len) constrains them
         // — see fallthrough_forged_next_pc_rejected and
-        // unlikely_forged_next_pc_rejected in tests/control_flow.rs.
+        // unlikely_forged_next_pc_rejected in tests/isa/control_flow.rs.
         Opcode::Fallthrough | Opcode::Unlikely => {}
         // JumpInd / LoadImmJumpInd: dynamic dispatch.  Both pinned via
         // JumpTableChip lookups; JumpInd uses (val_b+imm), LoadImmJumpInd

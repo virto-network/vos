@@ -25,6 +25,7 @@
 //! - [`wrap`] is the final wrap: a tree's root verified, its circuit,
 //!   program and run checked, the program id and io-hash its public words,
 //!   proved under format 28 on the Blake2b-256 channel.
+//! - [`tree`] proves a run's tree node by node: leaves, folds, the wrap.
 
 pub mod circuit;
 pub mod compile;
@@ -34,6 +35,7 @@ pub mod gadgets;
 pub mod leaf;
 pub mod prove;
 pub mod trace;
+pub mod tree;
 pub mod value;
 pub mod verifier;
 pub mod wrap;

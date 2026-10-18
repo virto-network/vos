@@ -304,7 +304,7 @@ where
     // boundary columns — the mix in the transcript alone is only
     // tamper-evidence against post-prove edits, not against a from-scratch
     // prover. See `boundary_binding` for the soundness argument and
-    // `tests/boundary_binding.rs` for the forgery gate. `None`
+    // `tests/gates/boundary_binding.rs` for the forgery gate. `None`
     // positions = the chip-isolated explicit-components path, which has
     // no stable component order and is not a trust boundary; the
     // production path always supplies `Some`.

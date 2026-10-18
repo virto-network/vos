@@ -50,7 +50,7 @@ use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 ///    claimed sum from the PUBLIC `final_state.registers`/`timestamp`
 ///    (a closed-form function of its thirteen (reg, value, closing_ts,
 ///    is_write=0) tuples) and requires equality with `proof.claimed_sums`
-///    — closing the lying-METADATA attack (gate: `tests/boundary_binding.rs`).
+///    — closing the lying-METADATA attack (gate: `tests/gates/boundary_binding.rs`).
 /// 2. column → trace: this chip's RegVal column is pinned to the trace's
 ///    actual final register value by `RegisterMemoryChip` read-consistency,
 ///    which is sound against a from-scratch prover: the closing read
