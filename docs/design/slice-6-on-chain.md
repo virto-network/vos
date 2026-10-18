@@ -32,7 +32,7 @@ Plan, draft 4, final for commit. It takes the owner's decisions
   - the items slice 5 carried here (`slice-5-progress.md`, "Carried out of
     slice 5"), each placed in a step below.
 - **Slice 7 is mobile.** The Clerk across spaces
-  (`clerk-across-spaces.md`, renamed from `slice-6-clerk.md`) follows this
+  (`clerk-across-spaces.md`, the Clerk's draft renamed at 6.0d) follows this
   slice.
 - **Its home in the repository:** `docs/design/slice-6-on-chain.md`, with
   `slice-6-progress.md` beside it [proposed].
@@ -587,7 +587,8 @@ Throwaway code on local branches; each with a gate and a fallback.
 - **6.0d The docs.** Copy the staged research into `research/slice-6/`;
   open `slice-6-progress.md`; apply `doc-fixes.md`'s items tagged [now]
   and [decision N] (the decisions are taken); the [step 6.x] items land
-  with their step; rename `slice-6-clerk.md` (decision 15).
+  with their step; rename the Clerk's draft to `clerk-across-spaces.md`
+  (decision 15).
 - **6.0e A Rust client on a Kreivo dev chain** (for 6.17b).
   - **What:** start a dev chain from Kreivo master's runtime
     (`polkadot-omni-node` stable2606-2 in `--dev` mode with Kreivo's dev

@@ -7,7 +7,7 @@ Reviewer: Fable, 2026-10-18. Read-only, against `vos-core` at `31b7938e`:
 `agent/sdk-macros/src/messages.rs`, `agent/test-actors/window/src/lib.rs`,
 `pvm/proof/statement/src/lib.rs`; `docs/design/core-model.md` §7–9, §11–12;
 `proving.md` §3.6, §6, §7, §11–12, A.5; `identity-and-authority.md` §11–14;
-`slice-6-clerk.md` 5.2–5.4; `research/slice-5/kreivo-pallet.md` §2–5.
+`clerk-across-spaces.md` C.2–C.4 (then 5.2–5.4); `research/slice-5/kreivo-pallet.md` §2–5.
 
 ## Verdict
 
@@ -210,7 +210,7 @@ not drawn:
 - **Counterparties must anchor on the same venue.** The settle handler needs
   both spaces' anchors at *its* venue; with one anchor venue per space, a pair
   on Kreivo and JAM cannot settle until one migrates. State it in
-  `slice-6-clerk.md` 5.2.
+  `clerk-across-spaces.md` C.2.
 
 Credential statements to third parties ("balance ≥ Y") rest on the space's
 honesty about itself; that is a product fact worth one sentence in §4.
@@ -405,7 +405,7 @@ and the per-agent path storage (finding 4).
 5. **Spans S3, `RootKind { Space }` only.** Take it. It retires `Carried`, the
    two-anchor read and the creation-window device, and bounds history to a
    marker row per pair. The Clerk's pair rows become cumulative aggregates
-   (decision 4 of `slice-6-clerk.md`), which is the simpler Clerk anyway.
+   (decision 4 of `clerk-across-spaces.md`), which is the simpler Clerk anyway.
 6. **F2: (c) plus (b).** Take (c); replace (b)'s audit with the pallet flag
    (finding 7).
 7. **Retention W1.** Take it. W2 is a gigabyte a window at 1k writes/s and buys

@@ -400,7 +400,7 @@ The fourteen are the right ones, each with options and evidence. Changes:
 ## I. Doc fixes (question 9)
 
 Spot-checked 32 line references in `proving.md`, 9 in `recursion-air.md`, 18 in
-`core-model.md`, 9 in `identity-and-authority.md`, 14 in `slice-6-clerk.md`:
+`core-model.md`, 9 in `identity-and-authority.md`, 14 in the Clerk's draft (`clerk-across-spaces.md`):
 every one lands on the quoted text. The replacement numbers match the spikes
 (115.8–118.7M, 160–163 KB, 3.45 GiB, ×1.41, +75.7 KiB, 3.99 ms, 0.43 UNITS,
 538,683 B, 82.70, 8.5–13 and 18–29.5 weeks). Two amendments: proving item 15

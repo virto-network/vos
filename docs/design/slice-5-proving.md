@@ -9,7 +9,7 @@ Plan, draft 8.
   - Slice 6 masks the final proof and puts statements on chain (Kreivo,
     JAM, `&self` reads).
   - Slice 7 is mobile.
-  - The Clerk across spaces (`slice-6-clerk.md`, to be renumbered)
+  - The Clerk across spaces (`clerk-across-spaces.md`)
     follows slice 6.
 - **Draft 8 replaces draft 7.** It folds in Fable's review of draft 7
   (`research/slice-5/plan7-review.md`, R1–R11) and the owner's word on

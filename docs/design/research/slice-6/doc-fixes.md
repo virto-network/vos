@@ -438,7 +438,7 @@ with these items.
 15. **§5's `Verified` expiry for every statement:** a rootless statement's
     `Seen` entry never expires.
 
-## `slice-6-clerk.md`
+## The Clerk's draft (`clerk-across-spaces.md`)
 
 1. **The file's name and title, "Slice 6 (draft): the Clerk across
    spaces"; "written for slice 5 before the owner chose proving first; now

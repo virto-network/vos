@@ -1,6 +1,7 @@
-# Slice 6 (draft): the Clerk across spaces
+# The Clerk across spaces (draft)
 
-Plan, draft 2, written for slice 5 before the owner chose proving first; now slice 6's starting point.
+Plan, draft 2, written for slice 5 before the owner chose proving first.
+Its slice number is set when it is scheduled; it follows slice 6.
 - **Draft 1** followed the owner's choice of proving plus the Clerk.
 - **Draft 2** folds Fable's review of draft 1:
   - why settlement by statement is safe;

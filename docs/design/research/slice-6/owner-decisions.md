@@ -18,4 +18,4 @@
 12b. Kreivo scope in slice 6 = DESIGN + KIT ONLY: spaces-pallet design; verifier crates packaged for vendoring with the sync check; the node's Kreivo client tested against a MOCK of the designed interface. NO pallet code from us (no test-fixture pallet). Slice 6's on-chain end to end runs on the JAM service only; the Kreivo leg runs when the teammate's pallet exists. Decisions 9–11 (vendoring path, governance, deposit) become inputs to the design doc, not our build. Decision 12 (node accounts) is folded into the design: authorities map of node sr25519 keys; sovereign account pays.
 13. Code-quality rest from slice 5: ALL in slice 6 (6.22 cleanup), not split.
 14. External audit: scope frozen at M2 acceptance; engage after slice 6, before any value.
-15. Rename slice-6-clerk.md → clerk-across-spaces.md (slice number set when scheduled), with a header noting what changed.
+15. Rename the Clerk's slice-6 draft → clerk-across-spaces.md (slice number set when scheduled), with a header noting what changed.

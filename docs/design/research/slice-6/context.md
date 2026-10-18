@@ -1,6 +1,8 @@
 # Slice 6 planning context: masking (M2) and statements on chain (M3)
 
 Gathered 2026-10-18, read-only, on `vos-core` at `31b7938e`.
+`clerk-across-spaces.md` is the Clerk's draft, renamed at 6.0d; its line
+numbers here are the draft's at `31b7938e`.
 
 Path keys:
 - `D` = `docs/design/` in the worktree.
@@ -194,7 +196,7 @@ The pipeline helpers are in `P/recair/src/tree.rs`: `Node`, `leaf` (:56), `fold`
   - `D/proving.md:677-698` (§7);
   - `D/identity-and-authority.md:402-434` (§11);
   - `R/kreivo-pallet.md:189-211`;
-  - `D/slice-6-clerk.md:174-198`.
+  - `D/clerk-across-spaces.md:174-198`.
 
 ---
 
@@ -337,8 +339,8 @@ For each item: **Decided**, **Open**, **Depends on** (Dep), **Evidence** (Ev).
   - reads at the last anchored cut, to the space root (`D/proving.md:844`);
   - the space root commits `(space_id, window)` (:688-689).
 - **Open:**
-  - the `SpaceId` derivation (the creation record's hash, `D/slice-6-clerk.md:147-148`);
-  - the window clock: relay blocks / `WindowLength` on Kreivo (`R/kreivo-pallet.md:198-199`) against JAM time (`D/slice-6-clerk.md:183-185`);
+  - the `SpaceId` derivation (the creation record's hash, `D/clerk-across-spaces.md:147-148`);
+  - the window clock: relay blocks / `WindowLength` on Kreivo (`R/kreivo-pallet.md:198-199`) against JAM time (`D/clerk-across-spaces.md:183-185`);
   - **Kreivo's window length**, deferred to slice 6 (`D/proving.md:686-687,851`);
   - who builds the space root over independently replicated agents (the representative agent, `D/identity-and-authority.md:409-412`);
   - a deterministic per-agent cut;
@@ -444,7 +446,7 @@ The program id needs the install's `Derivation` plus the recursion stack (`D/pro
   Verify each against 5.16b–c's commits first (`D/slice-5-progress.md:3882-3956`).
 - **For the owner:** AVX-512F is compiled but never run; PolkaJam's recompiler needs a machine whose cores report L3.
 
-**Estimates:** M2 6–8 weeks and M3 8–12 weeks (`D/proving.md:809-810`). M3's row does not itemize `SpaceId`, the space root, the window clock or anchors (M3.2), which `D/slice-6-clerk.md` sized as their own design rounds.
+**Estimates:** M2 6–8 weeks and M3 8–12 weeks (`D/proving.md:809-810`). M3's row does not itemize `SpaceId`, the space root, the window clock or anchors (M3.2), which `D/clerk-across-spaces.md` sized as their own design rounds.
 
 ---
 
@@ -533,7 +535,7 @@ Ordered by how much of the plan rests on the risk.
    - (c) in-code migration ranges, rooted statements only.
 
    Rootless statements need (a) or (b) (`D/slice-5-progress.md:4174-4183`; `P/SECURITY.md:184-189`).
-2. **The window clock and Kreivo's window length** (`D/proving.md:686-687,851`). Options: relay block / `WindowLength`, JAM slots, or per-pair sequence cuts for the Clerk (`D/slice-6-clerk.md:176-181`). Bounded below by the prover's latency (C.12).
+2. **The window clock and Kreivo's window length** (`D/proving.md:686-687,851`). Options: relay block / `WindowLength`, JAM slots, or per-pair sequence cuts for the Clerk (`D/clerk-across-spaces.md:176-181`). Bounded below by the prover's latency (C.12).
 3. **`SpaceId` and the space root's builder:** the representative agent (identity §11), and which keys sign anchors.
 4. **Where anchors and registries live first:** the Kreivo pallet (`D/proving.md:626-671`), or the JAM registry agent (`D/identity-and-authority.md:402-463`). One anchor venue per space at a time (`D/proving.md:690-692`).
 5. **The JAM verifier's shape:** a dedicated service (the evidence: C.9) or an actor in the default agent (which needs `MAX_HANDLER_GAS`, program-cap and preimage changes).
@@ -562,7 +564,7 @@ Ordered by how much of the plan rests on the risk.
 ## E. Inconsistencies and stale statements
 
 1. **`D/proving.md:809`** (§11 M2, "R1–R8 on the wrap and on device proofs") and **:603** (§5, "Where: device proofs, and the final wrap") predate the owner's narrowing to the wrap. **:799** and **`D/recursion-air.md:828`**: fine.
-2. **`D/proving.md:196`** caps the witness input at 4 MiB. The code caps attest arguments, the witness input, at 64 KiB VOS / 2 KiB JAM (`cap.rs:9,195,239-240`; `invocation.rs:491`). **`D/slice-6-clerk.md:59,209`** assumes the witness channel lifts the 64 KiB cap. It does not.
+2. **`D/proving.md:196`** caps the witness input at 4 MiB. The code caps attest arguments, the witness input, at 64 KiB VOS / 2 KiB JAM (`cap.rs:9,195,239-240`; `invocation.rs:491`). **`D/clerk-across-spaces.md:59,209`** assumes the witness channel lifts the 64 KiB cap. It does not.
 3. **Masked-cost figures rest on the 85M model, not the measured 96.4M:**
    - `D/proving.md:366-371` and `D/recursion-air.md:668-671`: 117–119M, 164–170 KB;
    - measured × (c) gives about 132–135M in software [est].
@@ -592,7 +594,7 @@ Ordered by how much of the plan rests on the risk.
    - §11.4 :979-991: the status names `verify_refine_bundle_authenticated` and "replay required"; partly still true, since there is no hiding;
    - §12 :1069-1070 and :1151-1152: "until proofs (slice 5)" and aggregation "once it exists";
    - §18 Q6 and Q7 (:1415-1417) are answered by proving.md and recursion-air.md.
-9. **`D/slice-6-clerk.md` is wholly pre-proving-first:**
+9. **`D/clerk-across-spaces.md` is wholly pre-proving-first:**
    - "written for slice 5", steps numbered 5.x (:3, :75-280);
    - the split reversed (:31-35);
    - "No proving is wired … ~15,800 columns" (:17-24), now 8,039 and proved end to end;

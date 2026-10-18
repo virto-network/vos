@@ -58,6 +58,8 @@ Design note for slice 5 planning, 2026-10-16. Read-only research: nothing was bu
 
 **Paths:**
 - **D** = `vos/.worktrees/vos-core/docs/design`; **V** = `vos/.worktrees/vos-core`.
+- `D/clerk-across-spaces.md` is the Clerk's draft, renamed at slice 6's 6.0d; the line numbers
+  here are the draft's on 2026-10-16, its step numbers 5.x (now C.x).
 - **K** = `~/src/virto/kreivo` (e4b2af3, stable2603); **M** = `~/src/virto/modesto` (3df2915).
 - **F** = `~/src/virto/frame-contrib` (`feat/private-communities`). Kreivo pins 0b576914 (`K/Cargo.lock:2464`), absent here.
 - **P** = `~/src/gh/polkadot-sdk` (master eb11ef2b85, newer than stable2603: re-check its limits there).
@@ -235,7 +237,7 @@ pub fn submit(origin: OriginFor<T>, statement: Box<StatementOf<T>>,
   - **The controller** (a community account, a multisig or a pass account) rotates keys and deregisters. The name is
     freed after the deposit's delay (`:459-461`).
   - **The anchor keys** are the space's ed25519 node keys signing directly, since anchors cannot wait for referenda.
-  - **`binding`** means "signed both ways" (`D/slice-6-clerk.md:147-148`): the creation record hashes to `space_id`,
+  - **`binding`** means "signed both ways" (`D/clerk-across-spaces.md:147-148`): the creation record hashes to `space_id`,
     and a node key it names signs `(Kreivo genesis, controller)`.
 - **Identity §5 holds** (`D/identity-and-authority.md:133-144`): every input is a chain-authenticated signed origin or
   a proof. Collators can delay inputs, never forge them.
@@ -255,7 +257,7 @@ pub fn submit(origin: OriginFor<T>, statement: Box<StatementOf<T>>,
   - the newest root must be within `max_root_age`, capped by a global `MaxRootAge`, which is also the horizon for
     pruning anchors;
   - the older root of a two-anchor read (`D/slice-5-proving.md:118-120`) is `Carried`, and its handler checks it
-    against its own state (`D/slice-6-clerk.md:187-194`, `:220-222`).
+    against its own state (`D/clerk-across-spaces.md:187-194`, `:220-222`).
 - **"As of W":** 5.2 reads the latest complete root W ≤ V (`D/slice-5-proving.md:209-214`), which no anchor need
   cover.
   - **Proposal:** chain-bound attests read the agent root at the last window cut, which that window's space root
@@ -269,7 +271,7 @@ pub fn submit(origin: OriginFor<T>, statement: Box<StatementOf<T>>,
 - **Dedup:** `Verified: id -> { program, at, expires_window }` refuses replays. `on_idle` prunes an entry, within a
   bound, once its newest root is stale; a later replay fails `RootStale`, so the set stays bounded.
 - **Ordering lives in handlers.**
-  - The Clerk binds windows to pair sequence numbers (`D/slice-6-clerk.md:176-181`).
+  - The Clerk binds windows to pair sequence numbers (`D/clerk-across-spaces.md:176-181`).
   - It keeps the last settled anchor and the rows commitment per (A, B, currency), and accepts only a statement
     starting there (`:187-194`, `:220-228`).
   - A statement may span to any later anchor (`:299`).
@@ -290,7 +292,7 @@ pub fn submit(origin: OriginFor<T>, statement: Box<StatementOf<T>>,
 - **Size:** `MaxProofLen = 512 KiB`, checked before decode. A 300 KB proof is 6% of the 5 MiB PoV and 8% of the
   3.75 MiB normal length, entering the PoV once; weight binds first.
 - **Preimage path:** not below about 1 MiB. It pays the bytes in two PoVs plus a deposit, under a 4 MiB cap. JAM uses
-  preimages (`D/slice-6-clerk.md:215-219`); Kreivo stays inline.
+  preimages (`D/clerk-across-spaces.md:215-219`); Kreivo stays inline.
 - **Fees:** about 1.0 UNITS of length fee per 300 KB proof on Kusama (0.34 per 100 KB), plus weight. Never feeless
   (`K/runtime/kreivo/src/lib.rs:108`).
 - **Deposits:** held for spaces (like a community's UNITS/2, `config/communities/mod.rs:23`) and space-owned programs.

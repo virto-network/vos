@@ -2,6 +2,8 @@
 
 Read-only design, 2026-10-18, on `vos-core` at `31b7938e`. Paths are relative
 to the worktree unless they start with `~`. `D` = `docs/design/`.
+`clerk-across-spaces.md` is the Clerk's draft, renamed at 6.0d; its line
+numbers here are the draft's at `31b7938e`, its step numbers 5.x (now C.x).
 Tags: [measured] from the docs, [read] from the code, [est] my arithmetic, not run.
 
 The constraints taken as given: crash-fault trust inside a space; one log per
@@ -61,7 +63,7 @@ pub struct SpaceId(pub [u8; 32]);         // = BLAKE2b-256("vos/space/id" ‖ SC
 - **No controller in the genesis.** Controllers are venue accounts. A venue binds
   one at registration by a founding node key's signature over
   `H("vos/space/register" ‖ venue_id ‖ space_id ‖ controller)`: the "signed both
-  ways" of `slice-6-clerk.md:147`, and it stops squatting (nobody else holds a
+  ways" of `clerk-across-spaces.md:147`, and it stops squatting (nobody else holds a
   founding key).
 - **Where it lives:** one type for both sides. Today `SpaceId` is in
   `vos-statement`, which `vos-wire` must not depend on (it pulls the final
@@ -77,7 +79,7 @@ pub struct SpaceId(pub [u8; 32]);         // = BLAKE2b-256("vos/space/id" ‖ SC
   binds it (§3), so a wrong one finds no anchor.
 - **The node** gets a `space.genesis` file next to the space file (or a field in
   it). `vosx space up` writes it once.
-- Clerk: `SpaceId` in transport pair keys (`slice-6-clerk.md` 5.2) is this type.
+- Clerk: `SpaceId` in transport pair keys (`clerk-across-spaces.md` 5.2) is this type.
   JAM: the representative service's registration names it.
 
 ---
@@ -97,7 +99,7 @@ pub struct SpaceId(pub [u8; 32]);         // = BLAKE2b-256("vos/space/id" ‖ SC
 `w ≥ now_w − AnchorGrace`. A change of `length_ms` is a registry update that
 takes effect at a stated future window, renumbering from there
 (`origin' = boundary`, `w' = w_switch + …`). This **disagrees with**
-`kreivo-pallet.md:198` (relay blocks) and `slice-6-clerk.md:183-185` (JAM time
+`kreivo-pallet.md:198` (relay blocks) and `clerk-across-spaces.md:183-185` (JAM time
 via the builder's node). C3 should win: those two disagree with each other,
 which is the problem C3 removes.
 
@@ -254,7 +256,7 @@ recorded on both; each venue refuses anchors outside its range. That is all the
 |---|---|---|---|
 | S1 | a `Carried` `RootRead` kind: the venue skips the anchor check and the handler compares it with its stored last-settled root | the kernel reads rows at the **old** cut: the old tree kept until the pair settles, unbounded for an idle pair | pruning the space's trees by time |
 | S2 | the venue keeps anchors per pair (no pruning while a handler references one) | the same old trees on the space side; unbounded venue storage | the same |
-| **S3** | **carry a commitment, not a root:** the handler keeps per `(A, B, currency)` the last settled cumulative state (`c = H(salt ‖ cum_sent ‖ cum_recv ‖ seq)`, or the plain numbers if gross flows may be public); the kernel takes the old values privately and `c_prev` as a `#[public]` argument, reads the current rows at **one** anchored cut, and outputs `(net, seq, c_new)` | the Clerk's pair rows are cumulative per `(peer, currency)` (decision 4's aggregate, `slice-6-clerk.md:290-295`), with an in-band settle marker on the pair recording `cum(seq)` as a row on each side | statements needing two genuine anchored reads (none known) |
+| **S3** | **carry a commitment, not a root:** the handler keeps per `(A, B, currency)` the last settled cumulative state (`c = H(salt ‖ cum_sent ‖ cum_recv ‖ seq)`, or the plain numbers if gross flows may be public); the kernel takes the old values privately and `c_prev` as a `#[public]` argument, reads the current rows at **one** anchored cut, and outputs `(net, seq, c_new)` | the Clerk's pair rows are cumulative per `(peer, currency)` (decision 4's aggregate, `clerk-across-spaces.md:290-295`), with an in-band settle marker on the pair recording `cum(seq)` as a row on each side | statements needing two genuine anchored reads (none known) |
 
 **Recommendation: S3.** It needs no history at all: one anchored root per
 statement, anchors prunable at `MaxRootAge`, no tree retention beyond the cut
@@ -263,7 +265,7 @@ through seq s: X", B's says "credited through s: Y"; the handler pairs them on
 s. That is where the per-pair sequence cut (C5) belongs: in rows and outputs,
 not in the window machinery. Spans to any later anchor come free: the delta is
 `cum_new − cum_prev`. It also retires the "absence at a past anchor"
-creation-window device (`slice-6-clerk.md:195-199`) and `RootKind::Carried`.
+creation-window device (`clerk-across-spaces.md:195-199`) and `RootKind::Carried`.
 Cost: `cipher_clerk::settlement::window(space, anchor_i, anchor_j, reads)` changes
 shape (one anchor, a carried state). The owner's call (context D.12).
 
@@ -400,7 +402,7 @@ paths is ~`x / 36` compressions, each ≈ 35 ms and 50 MiB of proving (core mode
   now, the final proof's hash later (A.5). The served part may move to a blob
   (CAS) referenced by hash once records grow (slice 4's 4.4a path); inline is
   fine for the first milestone (`ATTESTS` 16 × 256 KiB = the 4 MiB work-result cap).
-- This **corrects** `slice-6-clerk.md:59,209` ("the witness channel lifts the
+- This **corrects** `clerk-across-spaces.md:59,209` ("the witness channel lifts the
   64 KiB cap"): it does not today, and under this proposal it is the served
   channel, not the argument cap, that grows.
 
@@ -468,11 +470,11 @@ parallel once step 1's types are fixed, since it depends on nothing else.
    space root: **proving wins**; core model §9.3 gains agent and space roots.
 2. `proving.md:693-696` "roots differ by host" vs R4: **R4**; with it the
    "kinds equal on both hosts" rule holds by construction.
-3. `kreivo-pallet.md:198` (relay blocks) vs `slice-6-clerk.md:183-185` (JAM time):
+3. `kreivo-pallet.md:198` (relay blocks) vs `clerk-across-spaces.md:183-185` (JAM time):
    **neither; C3** (Unix time in the genesis), the owner's to choose.
-4. `kreivo-pallet.md:105,200-204` (`Carried`) and `slice-6-clerk.md:187-199`
+4. `kreivo-pallet.md:105,200-204` (`Carried`) and `clerk-across-spaces.md:187-199`
    (two-anchor reads, creation stamps) vs S3: **S3** if the owner takes it.
-5. `slice-6-clerk.md:59,209` (the channel lifts the 64 KiB cap) vs the code
+5. `clerk-across-spaces.md:59,209` (the channel lifts the 64 KiB cap) vs the code
    (`invocation.rs:491`): **the code is right today**; §5.5's `Limits::served` is
    the proposed fix.
 6. `proving.md:196` and A.5 (4 MiB) vs the 64 KiB cap: both stand under §5.5,
