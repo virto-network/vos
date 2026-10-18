@@ -412,25 +412,6 @@ impl BuiltInComponent for MemoryChip {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn wide_access_decomposition_wraps_in_u32_domain() {
-        let entries = decompose_access(u32::MAX - 2, 0x0807_0605_0403_0201, 7, false, 8);
-        let addresses: Vec<_> = entries.iter().map(|entry| entry.address).collect();
-        assert_eq!(
-            addresses,
-            [u32::MAX - 2, u32::MAX - 1, u32::MAX, 0, 1, 2, 3, 4]
-        );
-        assert_eq!(
-            entries.iter().map(|entry| entry.value).collect::<Vec<_>>(),
-            [1, 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-}
-
 /// The ledger's accesses, one entry per byte: every step's read, write and
 /// witness input, and the Blake2b precompile's reads and writes, unsorted.
 #[cfg(feature = "prover")]
@@ -719,5 +700,24 @@ impl BuiltInProverComponent for MemoryChip {
         );
 
         logup.finalize()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wide_access_decomposition_wraps_in_u32_domain() {
+        let entries = decompose_access(u32::MAX - 2, 0x0807_0605_0403_0201, 7, false, 8);
+        let addresses: Vec<_> = entries.iter().map(|entry| entry.address).collect();
+        assert_eq!(
+            addresses,
+            [u32::MAX - 2, u32::MAX - 1, u32::MAX, 0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            entries.iter().map(|entry| entry.value).collect::<Vec<_>>(),
+            [1, 2, 3, 4, 5, 6, 7, 8]
+        );
     }
 }
