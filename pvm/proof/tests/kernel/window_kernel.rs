@@ -721,43 +721,59 @@ fn the_window_wraps() {
         segment_bounds_budgeted(&trace.side_note, 1 << cut.log_steps, usize::from(cut.pages));
     let fold = vos_pvm_recair::fold::FoldCircuit::new();
     let word = vos_pvm_recair::fold::FoldCircuit::word();
+    let mut totals = common::Totals::default();
     let started = Instant::now();
     let mut cursor = SegmentCursor::new(&trace.side_note);
-    let mut nodes: Vec<common::NodeRun> = (0..bounds.len())
-        .map(|position| {
-            let (class, proof) = prove_at_first_class(&mut cursor, bounds[position], &program);
-            common::prove_leaf(&program, &entry, class, &proof, position as u32, word)
-        })
-        .collect();
+    let mut nodes = Vec::with_capacity(bounds.len());
+    for (position, &bound) in bounds.iter().enumerate() {
+        let ((class, proof), segment, segment_peak) =
+            common::measured(|| prove_at_first_class(&mut cursor, bound, &program));
+        let leaf = common::prove_leaf(&program, &entry, class, &proof, position as u32, word);
+        eprintln!(
+            "segment {position} ({bound:?}, class {class}) proved in {:.2}s, its peak heap \
+             {segment_peak} MiB; its leaf in {:.2}s, its peak heap {} MiB",
+            segment.as_secs_f64(),
+            leaf.proving.as_secs_f64(),
+            leaf.peak_mib,
+        );
+        totals.segments.add(segment, segment_peak);
+        totals.leaves.add(leaf.proving, leaf.peak_mib);
+        nodes.push(leaf);
+    }
     eprintln!(
         "{} segments proved in their leaves in {:.0}s",
         nodes.len(),
         started.elapsed().as_secs_f64()
     );
     let started = Instant::now();
-    let mut folds = 0;
     while nodes.len() > 1 {
         let mut level = Vec::with_capacity(nodes.len().div_ceil(2));
         let mut pending = nodes.into_iter();
         while let Some(left) = pending.next() {
             match pending.next() {
                 Some(right) => {
-                    level.push(common::prove_fold(&fold, &program, &left, &right, word));
-                    folds += 1;
+                    let node = common::prove_fold(&fold, &program, &left, &right, word);
+                    totals.folds.add(node.proving, node.peak_mib);
+                    level.push(node);
                 }
                 None => level.push(left),
             }
         }
         nodes = level;
     }
-    eprintln!("{folds} folds in {:.0}s", started.elapsed().as_secs_f64());
+    eprintln!(
+        "{} folds in {:.0}s",
+        totals.folds.count,
+        started.elapsed().as_secs_f64()
+    );
     let root = nodes.pop().expect("the root");
     let output = root.node.output;
     assert_eq!((output.first, output.last), (0, bounds.len() as u32 - 1));
     assert!(output.entry && output.halt, "the whole run");
     assert_eq!(output.io_hash, trace.io_hash);
 
-    let (bytes, words) = common::wrap_root("the window", &program, &root);
+    let (bytes, words) = common::wrap_root("the window", &program, &root, &mut totals.wrap);
+    totals.report("the window");
     let input = common::judged_statement(
         vos_statement::Statement {
             format: vos_statement::FORMAT,

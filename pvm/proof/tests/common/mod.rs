@@ -280,6 +280,59 @@ pub fn measured<T>(work: impl FnOnce() -> T) -> (T, std::time::Duration, u64) {
     (result, elapsed, ((PEAK.load(Relaxed) - base) >> 20) as u64)
 }
 
+/// Proofs of one kind in a run: how many, their proving time summed and
+/// the largest peak heap among them (MiB).
+#[derive(Default)]
+pub struct Tally {
+    pub count: usize,
+    pub proving: std::time::Duration,
+    pub peak_mib: u64,
+}
+
+impl Tally {
+    pub fn add(&mut self, proving: std::time::Duration, peak_mib: u64) {
+        self.count += 1;
+        self.proving += proving;
+        self.peak_mib = self.peak_mib.max(peak_mib);
+    }
+}
+
+/// A run's proofs end to end, by kind: its segments, leaves, folds and wrap.
+#[derive(Default)]
+pub struct Totals {
+    pub segments: Tally,
+    pub leaves: Tally,
+    pub folds: Tally,
+    pub wrap: Tally,
+}
+
+impl Totals {
+    /// Prints each kind's tally, and the recursion (the leaves, folds and
+    /// wrap) as a share of the segments' proving.
+    pub fn report(&self, name: &str) {
+        let recursion = self.leaves.proving + self.folds.proving + self.wrap.proving;
+        for (kind, tally) in [
+            ("segments", &self.segments),
+            ("leaves", &self.leaves),
+            ("folds", &self.folds),
+            ("wrap", &self.wrap),
+        ] {
+            eprintln!(
+                "{name}: {} {kind} proved in {:.2}s, the largest peak heap {} MiB",
+                tally.count,
+                tally.proving.as_secs_f64(),
+                tally.peak_mib
+            );
+        }
+        eprintln!(
+            "{name}: the recursion proved in {:.2}s, {:.1}% of the segments' {:.2}s",
+            recursion.as_secs_f64(),
+            100.0 * recursion.as_secs_f64() / self.segments.proving.as_secs_f64(),
+            self.segments.proving.as_secs_f64()
+        );
+    }
+}
+
 /// What a node, a leaf or a fold, measured: its rows, its proving time and its peak
 /// heap over the allocations before it (0 unless the binary installs
 /// [`Counting`]); the node, its proof and the output it states.
@@ -447,11 +500,13 @@ pub fn prove_fold(
 /// `root`, the root of a whole run of `program`, wrapped under format 28 on
 /// the Blake2b-256 channel within 2^17 rows and 8 GiB of heap, and verified
 /// by `vos-pvm-final-verifier`, its statement the program's id and the root's
-/// io-hash: the proof's bytes (postcard) and its public words.
+/// io-hash: the proof's bytes (postcard) and its public words; its proving
+/// time and peak heap added to `wrap`.
 pub fn wrap_root(
     name: &str,
     program: &vos_pvm_proof::program_id::KernelProgram,
     root: &NodeRun,
+    wrap: &mut Tally,
 ) -> (Vec<u8>, [u32; vos_pvm_final_verifier::PUBLIC_WORDS]) {
     use vos_pvm_recair::wrap::{self, WrapCircuit};
 
@@ -476,6 +531,7 @@ pub fn wrap_root(
         bytes.len()
     );
     assert!(peak_mib <= 8 << 10, "{peak_mib} MiB");
+    wrap.add(proving, peak_mib);
     let verified = vos_pvm_final_verifier::verify_bytes(&bytes, &words).expect("the wrap verifies");
     assert_eq!(verified, statement);
     assert_eq!(statement.program, program.id().0.map(|word| word.0));

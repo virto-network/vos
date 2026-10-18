@@ -502,25 +502,31 @@ fn the_predicate_wraps() {
         (2 * steps / 3, steps),
     ];
     let word = FoldCircuit::word();
+    let mut totals = common::Totals::default();
     let mut cursor = SegmentCursor::new(&kernel.trace.side_note);
-    let leaves: Vec<common::NodeRun> = (0..cuts.len())
-        .map(|position| {
-            let (a, b) = cuts[position];
-            let (proof, segment, _) = common::measured(|| {
-                prove_shaped(&mut cursor.side_note(a, b), &shape, &SEGMENT).unwrap()
-            });
-            let leaf = common::prove_leaf(&program, &entry, 0, &proof, position as u32, word);
-            eprintln!(
-                "areas: segment {position} ({a}..{b}) proved in {:.2}s; its leaf in {:.2}s",
-                segment.as_secs_f64(),
-                leaf.proving.as_secs_f64()
-            );
-            leaf
-        })
-        .collect();
+    let mut leaves = Vec::with_capacity(cuts.len());
+    for (position, &(a, b)) in cuts.iter().enumerate() {
+        let (proof, segment, segment_peak) = common::measured(|| {
+            prove_shaped(&mut cursor.side_note(a, b), &shape, &SEGMENT).unwrap()
+        });
+        let leaf = common::prove_leaf(&program, &entry, 0, &proof, position as u32, word);
+        eprintln!(
+            "areas: segment {position} ({a}..{b}) proved in {:.2}s, its peak heap {segment_peak} \
+             MiB; its leaf in {:.2}s, its peak heap {} MiB",
+            segment.as_secs_f64(),
+            leaf.proving.as_secs_f64(),
+            leaf.peak_mib,
+        );
+        totals.segments.add(segment, segment_peak);
+        totals.leaves.add(leaf.proving, leaf.peak_mib);
+        leaves.push(leaf);
+    }
     let fold = FoldCircuit::new();
     let head = common::prove_fold(&fold, &program, &leaves[0], &leaves[1], word);
     let root = common::prove_fold(&fold, &program, &head, &leaves[2], word);
+    for node in [&head, &root] {
+        totals.folds.add(node.proving, node.peak_mib);
+    }
     eprintln!(
         "areas: two folds in {:.2}s and {:.2}s",
         head.proving.as_secs_f64(),
@@ -533,7 +539,8 @@ fn the_predicate_wraps() {
     );
     assert_eq!(root.node.output.io_hash, kernel.trace.io_hash);
 
-    let (bytes, words) = common::wrap_root("areas", &program, &root);
+    let (bytes, words) = common::wrap_root("areas", &program, &root, &mut totals.wrap);
+    totals.report("areas");
     let input = common::judged_statement(
         vos_statement::Statement {
             format: vos_statement::FORMAT,
