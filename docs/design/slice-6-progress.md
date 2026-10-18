@@ -61,9 +61,9 @@ segment fixtures beside them).
   - `core-model.md` 12 (decision 3): the refine-bundle path (format 36)
     is "retired by the owner's decision of 2026-10-19, and deleted at
     slice 6's 6.9", not "deleted"; it is still in the code;
-  - `core-model.md` 14 and 17: requirement 4 is met "by the statement
-    (slice 5) and format 39 (slice 6)", and the track's item 9 is struck
-    as "masked in slice 6", since format 39 is not built yet.
+  - `core-model.md` 14 and 17: requirement 4 is "met by the statement
+    (slice 5); format 39 at 6.6", and the track's item 9 stays unstruck,
+    placed in slice 6, since format 39 is not built yet.
 - **`clerk-across-spaces.md` 10** rests on the Clerk's decision 4 (the
   aggregate rows), still open in that draft: written as "under decision
   4's aggregate rows, a pair reads two rows".
@@ -98,6 +98,23 @@ draft's before the rename.
 `04e8a3cb` `kreivo-pallet.md`'s note; `d29b36f0` the rename and its
 references; `c75c11d5` the Clerk's items; `4a49afa8` the research's
 pointers; and this entry.
+
+**Review** (Opus): mostly clean; 2 medium and 4 low findings, folded in
+one commit:
+- **medium:** `core-model.md` §9.3's agent root stated as built: now
+  "[decided; built at slice 6's 6.11 (agent root) and 6.14 (space
+  root)]", "VOS will keep"; `proving.md` §3.5's fixed-layout decode sat
+  in the "Built (slice 5's 5.14) [measured]" list: now its own "Levers"
+  bullet, "format 39 is to decode a fixed layout (6.4)";
+- **low:** requirement 4 "met by the statement (slice 5); format 39 at
+  6.6", item 9 unstruck; "masked from slice 6" (`identity-and-authority.md`
+  §11) and "to be verified in a JAM statements service's refine (slice
+  6)" (`core-model.md` §11.1); `Limits::served` "(proposed; set by
+  6.0a)" in `proving.md` and the Clerk doc; the JAM transport "(or as a
+  preimage; 6.0b decides)"; the Clerk doc's "Decided in this draft"
+  marked superseded by C.0, C.4 and C.5 where they are, and its decision
+  4's aggregate read at one cut against the carried commitment;
+  `proving.md` A.6's long line rewrapped.
 
 **Gates:** docs only, so no `just check`; no reference to the
 draft's old name is left in `docs/`.

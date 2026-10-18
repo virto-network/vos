@@ -196,7 +196,8 @@ attribution). Its full design is `recursion-air.md`.
     most φ8, and has no other effect;
   - the caller's arguments are capped by `Limits::attest` (64 KiB on VOS,
     2 KiB on JAM); a statement's served witness travels as a blob by
-    hash, under `Limits::served` and the kernel's declared gas (slice 6);
+    hash, under `Limits::served` (proposed; set by 6.0a) and the
+    kernel's declared gas (slice 6);
     4 MiB stays the ceiling of the kernel's whole input;
   - `derive` admits the new id, and a live≡traced test gates it in M0.
 - **Page permissions are preprocessed.** The program's layout is four
@@ -387,10 +388,11 @@ attribution). Its full design is `recursion-air.md`.
   - **38.2M retired Wasm instructions** under the PVF's semantics (37.7M
     the client's), 2.1 ms, a 292 KB blob;
   - **122–125 KB** (the window kernel's 123,686 bytes);
-  - **5.45 s and a 2.5 GiB heap** to prove the window kernel's wrap;
-  - format 39 decodes a fixed layout; the Blake2b hook is deferred, a
-    lever for when ref_time binds: nothing in slice 6 verifies as a PVM
-    guest on a VOS host, and Kreivo's binding limit is proof_size.
+  - **5.45 s and a 2.5 GiB heap** to prove the window kernel's wrap.
+- **Levers:** format 39 is to decode a fixed layout (6.4); the Blake2b
+  hook is deferred, a lever for when ref_time binds: nothing in slice 6
+  verifies as a PVM guest on a VOS host, and Kreivo's binding limit is
+  proof_size.
 - **Fold step above 1:** the pinned Stwo implements it; our fork's review
   and tamper tests admitted it for format 28 (slice 5's 5.14).
 - **Its public inputs** are the program id (8 M31) and the io-hash (its
@@ -724,7 +726,7 @@ last for decades.**
   the space's registered keys and keeping a rootless statement's `Seen`
   entry forever, as Kreivo does; accepted program ids are constants
   changed by redeploy; a proof rides in its work item's payload (or as a
-  preimage, if 6.0b found the payload cannot carry it). An actor in the
+  preimage; 6.0b decides). An actor in the
   default agent cannot host it: `MAX_HANDLER_GAS` 100M, a 512 KiB program
   cap (538,683 B with both formats linked), 2 KiB messages, no preimage
   access.
@@ -1115,7 +1117,8 @@ carriers.
 
 Every venue judges them alike. A generator makes them, regenerated at
 each format bump, and stores them under `pvm/proof/fixtures` (about
-380 KB, plus the segment fixtures). M0 promised it and did not build it; slice 5's 5.8.0 does.
+380 KB, plus the segment fixtures). M0 promised it and did not build
+it; slice 5's 5.8.0 does.
 
 **Built** (slice 5's 5.15, its review folded in 5.15b) [measured]: the
 generator (`pvm/proof/tests/kernel/fixtures.rs`) proves a small kernel stating a fixed

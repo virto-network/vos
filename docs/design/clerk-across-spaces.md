@@ -57,7 +57,7 @@ adds a proof without changing it:
 
 **Clerk first** also settles what reshapes proving: how many rows a
 window reads, the witness channel (the argument cap stays; a statement's
-rows arrive as a served witness by hash, under `Limits::served`), the
+rows arrive as a served witness by hash, under `Limits::served` (proposed; set by 6.0a)), the
 public output and the anchor hierarchy.
 
 ## Goals
@@ -207,7 +207,7 @@ slice 5's 5.15).
     rows and paths, and the roots go into the `Attest` record);
   - it runs `settlement::window`;
   - the argument cap stays; a statement's rows arrive as a served
-    witness by hash, under `Limits::served`.
+    witness by hash, under `Limits::served` (proposed; set by 6.0a).
 
 ### C.5 The venues
 
@@ -285,19 +285,24 @@ measurements, Ristretto removed.
    encoded origin, with the loss mode stated.
 4. **Per-journal pseudo-accounts, or one aggregate pair per (peer,
    currency)** maintained by the agent.
-   - **The aggregate:** the statement reads two rows at two anchors, so
-     completeness and the per-segment journal limit vanish. The sum's
+   - **The aggregate:** the statement reads the pair's two rows at one
+     anchored cut against the carried commitment (C.4), so completeness
+     and the per-segment journal limit vanish. The sum's
      correctness inside the space is what no one proves anyway in tier 1.
    - It departs from cipher-clerk's per-journal conventions.
 
 **Decided in this draft on the review's advice, and the owner's to
-override:**
+override** (superseded by C.4/C.5 where marked):
 - transport gets its own design round, and uses the identity ABI's
   origin;
-- windows are cut at pair sequence numbers;
-- statements may span from the last settled anchor to any later one;
-- spike 1's decision rule (about 200M gas and 4 MB per segment);
-- registration by the representative's first transfer.
+- windows are cut at pair sequence numbers (superseded: Unix-time
+  windows, the pair's sequence cut in its rows, C.4);
+- statements may span from the last settled anchor to any later one
+  (superseded: the carried commitment, C.4);
+- spike 1's decision rule (about 200M gas and 4 MB per segment)
+  (superseded: spike 4a, C.0);
+- registration by the representative's first transfer (superseded:
+  registration at the venue from the genesis, C.5).
 
 ## Risks
 

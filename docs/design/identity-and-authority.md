@@ -444,7 +444,7 @@ an agent, but approving a payment is a member's grant like any other.
   private one.**
   - An unmasked STARK opens parts of its trace, so a settlement proof
     sent to JAM would leak the space's ledger to the world.
-  - The final proof is masked (format 39, slice 6); aggregation (the
+  - The final proof is masked from slice 6 (format 39); aggregation (the
     recursion) and fixed shapes came first, in slice 5.
 
 ## 12. The root space and the registry of spaces

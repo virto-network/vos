@@ -706,8 +706,9 @@ The Local (replica-only) lane is deferred until a use case needs it.
   read, scan and write of a refine is witnessed against the root the
   chain stores (section 12).
 - Hashing inside the PVM uses the hash precompile (section 11.2).
-- Every agent has a root on both hosts: committed rows sit under `0x03`,
-  VOS keeps one tree per agent over them, and that tree is the node at
+- [decided; built at slice 6's 6.11 (agent root) and 6.14 (space root)]
+  Every agent has a root on both hosts: committed rows sit under `0x03`,
+  VOS will keep one tree per agent over them, and that tree is the node at
   `0x03` of a JAM agent's whole-keyspace tree. A space has a root per
   window, built by its representative (`proving.md` §7).
 
@@ -909,8 +910,8 @@ outbox sequence numbers, which receivers deduplicate.
   - On JAM, an on-chain agent's refine runs the verifier program itself,
     and its accumulate applies the public output. A window's segments
     fold into one final proof (slice 5): 96.4M JAM gas unmasked, about
-    116–119M masked with postcard [measured], verified in a JAM
-    statements service's refine.
+    116–119M masked with postcard [measured], to be verified in a JAM
+    statements service's refine (slice 6).
 
 ### 11.2 Precompiles [decided direction; prototyped in S5b]
 
@@ -1003,8 +1004,8 @@ Requirements before any proof leaves a space:
    pure (section 11.1), so their only host calls are precompiles, which
    are already in-AIR (S5b).
 3. **No plain hash of private inputs** in anything published.
-4. **A minimal published format** (met by the statement, slice 5, and
-   format 39, slice 6). A published proof carries only:
+4. **A minimal published format** (met by the statement (slice 5);
+   format 39 at 6.6). A published proof carries only:
    - the public output: the return value, the roots and the program hash;
    - a fixed shape class.
 
@@ -1323,9 +1324,9 @@ prototypes exist where noted.
 
 7. Chained segments on the refine path, sized by prover memory (S5, S5b).
 8. Reduce the BLAKE2b chip's memory per compression (S5b).
-9. ~~Zero-knowledge proving (section 11.4, requirement 1).~~ The final
-   proof is masked in slice 6 (format 39, `proving.md` §5), on the pinned
-   Stwo fork with no Stwo move.
+9. Zero-knowledge proving (section 11.4, requirement 1): slice 6
+   (format 39, `proving.md` §5), on the pinned Stwo fork with no Stwo
+   move.
 10. ~~Witness-free verification of attestable programs, with no plain hash
     of private inputs (requirements 2 and 3).~~ Done by the statement
     (slice 5).
