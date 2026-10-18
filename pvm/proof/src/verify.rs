@@ -23,9 +23,9 @@ use crate::{lookups::AllLookupElements, side_note::SideNote};
 
 mod recursion;
 pub use recursion::{
-    ComponentLayout, ComponentOodsMask, DeepBatch, OodsReconstruction, RecursionData,
-    RecursionTranscript, SampleLayout, extract_recursion_data, reconstruct_oods_for_recursion,
-    record_canonical_transcript, replay_stark, sample_layout, sample_layout_of,
+    ComponentOodsMask, OodsReconstruction, RecursionData, RecursionTranscript, SampleLayout,
+    extract_recursion_data, reconstruct_oods_for_recursion, record_canonical_transcript,
+    replay_stark, sample_layout, sample_layout_of,
 };
 
 /// Verify a chain of segment proofs. Each segment's final state must match
@@ -84,17 +84,6 @@ pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationErro
     verify_with_shape(proof, side_note, DEFAULT_MAX_LOG_SIZE, None)
 }
 
-/// Caller-supplied per-component `log_size` cap variant of `verify`.
-/// See `verify` for the default and the `max_log_size` cap rationale.
-/// Shares `verify`'s default FRI-shape floor (the conjectured-security floor).
-pub fn verify_with_max_log_size(
-    proof: Proof,
-    side_note: &SideNote,
-    max_log_size: u32,
-) -> Result<(), VerificationError> {
-    verify_with_shape(proof, side_note, max_log_size, None)
-}
-
 /// Enforce a custom `PcsPolicy` (FRI shape + PoW floor)
 /// on `proof.pcs_config`.  The default `verify` accepts any shape meeting the
 /// conjectured-security floor; reach for this to pin an EXACT shape (stricter
@@ -106,18 +95,6 @@ pub fn verify_with_pcs_policy(
     policy: &crate::proof::PcsPolicy,
 ) -> Result<(), VerificationError> {
     verify_with_shape(proof, side_note, DEFAULT_MAX_LOG_SIZE, Some(policy))
-}
-
-/// Both knobs at once — the explicit-`PcsPolicy` funnel (strict per-field
-/// pin). The default `verify` / `verify_with_max_log_size` paths go through
-/// `verify_with_shape` with the conjectured-security floor instead.
-pub fn verify_with_options(
-    proof: Proof,
-    side_note: &SideNote,
-    max_log_size: u32,
-    policy: &crate::proof::PcsPolicy,
-) -> Result<(), VerificationError> {
-    verify_with_shape(proof, side_note, max_log_size, Some(policy))
 }
 
 /// Shared component-setup funnel for the SideNote verify paths. `policy`

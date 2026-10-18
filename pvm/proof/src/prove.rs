@@ -41,15 +41,11 @@ mod profile;
 mod shaped;
 
 pub use canonical::{
-    canonical_profile_for, canonical_profile_for_bounds, natural_log_sizes_for,
-    program_commitment_for_profile, program_commitment_for_profile_format, prove_canonical,
-    prove_canonical_format, prove_chain, prove_chain_format,
+    canonical_profile_for_bounds, program_commitment_for_profile,
+    program_commitment_for_profile_format, prove_canonical, prove_canonical_format, prove_chain,
 };
 #[cfg(feature = "debug-internals")]
-pub use debug::{
-    debug_assert_constraints_explicit, debug_assert_constraints_streaming, debug_claimed_sums,
-    debug_claimed_sums_streaming,
-};
+pub use debug::{debug_assert_constraints_explicit, debug_claimed_sums};
 pub use profile::ProveProfile;
 pub use shaped::{KernelSegment, program_commitment_for_shape, prove_kernel, prove_shaped};
 

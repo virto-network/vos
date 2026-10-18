@@ -85,7 +85,7 @@
 //!   [`program_commitment_hex`] extract the program commitment a
 //!   verifier pins.
 //! - **Large executions** — the [`segment`] cut helpers,
-//!   [`canonical_profile_for`], and [`prove_canonical`] produce a
+//!   [`canonical_profile_for_bounds`], and [`prove_canonical`] produce a
 //!   chain of equal-shape segments.
 //!
 //! Core types: [`Proof`], [`SegmentState`], [`SideNote`], [`PcsPolicy`],
@@ -546,7 +546,6 @@ pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemory
 // that assemble a custom `PcsPolicy`; hidden from the top-level page.
 #[doc(hidden)]
 pub use proof::{
-    MOBILE_MIN_FRI_LOG_BLOWUP, MOBILE_MIN_FRI_QUERIES, MOBILE_MIN_POW_BITS,
     STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS, check_pcs_policy,
 };
 #[doc(hidden)]
@@ -554,14 +553,14 @@ pub use proof::{
 pub use prove::{prove_pre_config_relabel_for_test, prove_with_boundary_override};
 // ── Prove: the stable surface ────────────────────────────────────────
 // Single proof: `prove` / `prove_mobile` / `prove_with_config`.
-// Segment chain: `canonical_profile_for` (or `_for_bounds`) derives the
-// forcing profile, `prove_canonical` proves each window to one shape.
+// Segment chain: `canonical_profile_for_bounds` derives the forcing
+// profile, `prove_canonical` proves each window to one shape.
 #[cfg(feature = "prover")]
 pub use prove::{
-    KernelSegment, ProvingError, canonical_profile_for, canonical_profile_for_bounds,
-    program_commitment_for_profile, program_commitment_for_profile_format,
-    program_commitment_for_shape, prove, prove_canonical, prove_canonical_format, prove_chain,
-    prove_chain_format, prove_format, prove_kernel, prove_mobile, prove_shaped, prove_with_config,
+    KernelSegment, ProvingError, canonical_profile_for_bounds, program_commitment_for_profile,
+    program_commitment_for_profile_format, program_commitment_for_shape, prove, prove_canonical,
+    prove_canonical_format, prove_chain, prove_format, prove_kernel, prove_mobile, prove_shaped,
+    prove_with_config,
 };
 // Advanced / internal prove surface: the profiling variants, the thread-pool
 // installer, and the explicit-component harness entry. Public for tests;
@@ -569,14 +568,13 @@ pub use prove::{
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::{
-    ProveProfile, install_thread_pool, natural_log_sizes_for, prepare_side_note_for_verification,
-    production_pcs_config, production_pcs_config_mobile, prove_profiled,
-    prove_profiled_with_config, prove_with_explicit_components,
+    ProveProfile, install_thread_pool, prepare_side_note_for_verification, production_pcs_config,
+    production_pcs_config_mobile, prove_profiled, prove_profiled_with_config,
+    prove_with_explicit_components,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::{
-    debug_assert_constraints_explicit, debug_assert_constraints_streaming, debug_claimed_sums,
-    debug_claimed_sums_streaming, prove_chip_isolated_format,
+    debug_assert_constraints_explicit, debug_claimed_sums, prove_chip_isolated_format,
 };
 #[cfg(feature = "prover")]
 pub use side_note::SideNote;
@@ -587,15 +585,14 @@ pub use stwo::core::pcs::PcsConfig;
 // (`verify_standalone`) — no_std, no prover deps.
 #[cfg(feature = "prover")]
 pub use verify::{DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_pcs_policy};
-// Advanced verify surface (max-log-size / options / explicit components)
+// Advanced verify surface (explicit components)
 // and the recursion seams the in-AIR verifier is checked against.
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use verify::{
-    ComponentLayout, ComponentOodsMask, DeepBatch, OodsReconstruction, RecursionData,
-    RecursionTranscript, SampleLayout, extract_recursion_data, reconstruct_oods_for_recursion,
-    record_canonical_transcript, replay_stark, sample_layout, sample_layout_of,
-    verify_with_explicit_components, verify_with_max_log_size, verify_with_options,
+    ComponentOodsMask, OodsReconstruction, RecursionData, RecursionTranscript, SampleLayout,
+    extract_recursion_data, reconstruct_oods_for_recursion, record_canonical_transcript,
+    replay_stark, sample_layout, sample_layout_of, verify_with_explicit_components,
 };
 
 /// Chip-isolated harness surface — re-exports the trait

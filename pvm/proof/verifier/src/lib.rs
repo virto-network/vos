@@ -398,22 +398,10 @@ pub fn verify_standalone_with_pcs_policy(
     )
 }
 
-/// Both knobs at once — the explicit-`PcsPolicy` funnel (strict per-field
-/// pin). The default `verify_standalone` / `verify_standalone_with_max_log_size`
-/// paths use the conjectured-security floor instead (via `verify_standalone_shaped`).
-pub fn verify_standalone_with_options(
-    proof: Proof,
-    preprocessed_commitment: CommitmentHash,
-    max_log_size: u32,
-    policy: &PcsPolicy,
-) -> Result<(), VerificationError> {
-    verify_standalone_shaped(proof, preprocessed_commitment, max_log_size, Some(policy))
-}
-
 /// Shared verify funnel. `policy` selects the FRI-shape floor: `None` = the
 /// conjectured-security floor (the default paths — accepts STANDARD and
 /// MOBILE), `Some(p)` = an exact `PcsPolicy` pin (the strict `*_with_pcs_policy`
-/// path). All four public `verify_standalone*` entry points funnel here.
+/// path). The public `verify_standalone*` entry points funnel here.
 fn verify_standalone_shaped(
     mut proof: Proof,
     preprocessed_commitment: CommitmentHash,
@@ -746,57 +734,6 @@ pub fn verify_chain_standalone(
     preprocessed_commitment: CommitmentHash,
     expected_initial_root: [u8; 32],
 ) -> Result<[u8; 32], VerificationError> {
-    // Default: the conjectured-security floor, so a canonical MOBILE chain
-    // (`vos_pvm_proof::prove_chain`) verifies without the caller naming
-    // `PcsPolicy::MOBILE`. `None` selects that floor; the explicit
-    // `verify_chain_standalone_with_options` path passes a `PcsPolicy`.
-    verify_chain_standalone_shaped(
-        proofs,
-        preprocessed_commitment,
-        expected_initial_root,
-        DEFAULT_MAX_LOG_SIZE,
-        None,
-    )
-}
-
-/// [`verify_chain_standalone`] with explicit `max_log_size` cap + `PcsPolicy`.
-///
-/// The strict-pin counterpart to `verify_chain_standalone` (which uses the
-/// conjectured-security floor): every segment is verified against the exact
-/// `policy` shape. `expected_initial_root` is the page-Merkle root of the
-/// program's starting RAM image — the memory analogue of the program
-/// commitment — checked against `proofs[0].initial_state.memory_root`.  On
-/// success returns the chain's final root
-/// (`proofs.last().final_state.memory_root`) so the caller can pin the
-/// post-state.  Callers compute `expected_initial_root` host-side via
-/// `vos_pvm_proof::page_merkle::image_root` over the input image.
-pub fn verify_chain_standalone_with_options(
-    proofs: &[Proof],
-    preprocessed_commitment: CommitmentHash,
-    expected_initial_root: [u8; 32],
-    max_log_size: u32,
-    policy: &PcsPolicy,
-) -> Result<[u8; 32], VerificationError> {
-    verify_chain_standalone_shaped(
-        proofs,
-        preprocessed_commitment,
-        expected_initial_root,
-        max_log_size,
-        Some(policy),
-    )
-}
-
-/// Shared chain-verify funnel. `policy`: `None` = the conjectured-security
-/// floor (the default `verify_chain_standalone` — accepts STANDARD and
-/// MOBILE), `Some(p)` = an exact `PcsPolicy` pin
-/// (`verify_chain_standalone_with_options`).
-fn verify_chain_standalone_shaped(
-    proofs: &[Proof],
-    preprocessed_commitment: CommitmentHash,
-    expected_initial_root: [u8; 32],
-    max_log_size: u32,
-    policy: Option<&PcsPolicy>,
-) -> Result<[u8; 32], VerificationError> {
     if proofs.is_empty() {
         return Err(VerificationError::InvalidStructure(
             "verify_chain_standalone: empty proof chain".to_string(),
@@ -825,86 +762,15 @@ fn verify_chain_standalone_shaped(
     // Each segment verifies standalone against the SAME program commitment:
     // no side note, and program identity is pinned across the whole chain.
     for proof in proofs {
-        verify_standalone_shaped(proof.clone(), preprocessed_commitment, max_log_size, policy)?;
-    }
-    Ok(proofs[proofs.len() - 1].final_state.memory_root)
-}
-
-/// Like [`verify_chain_standalone`], but pins program identity to a small
-/// published SET of allowed commitments instead of a single one.
-///
-/// WHY a set: canonical-shape proving (forcing each preprocessed-bearing chip
-/// to a fixed `log_size`) makes a program's preprocessed columns identical
-/// across segments, so one program at one forced profile has one canonical
-/// commitment. A deployment that accepts several shapes (several forced
-/// profiles, or several versions of the program) publishes one commitment
-/// per shape. Each is WITNESS-INDEPENDENT (a function of the program and the
-/// forced profile, not of its inputs), so the allowlist is a fixed
-/// per-deployment constant.
-///
-/// SOUNDNESS: every segment's commitment must be IN the allowlist (a
-/// from-scratch prover splicing a foreign program produces a commitment in no
-/// listed shape), and each segment then verifies standalone against its own
-/// commitment.  Combined with the same boundary-continuity + anchoring as
-/// [`verify_chain_standalone`], an accepted chain proves: the program is one
-/// of the published canonical shapes, per-segment validity, and
-/// full register / pc / timestamp / memory continuity.
-///
-/// PRECONDITION: the prover used canonical-shape proving (`vos_pvm_proof::prove_canonical`
-/// with the deployment's per-chip `min_log_size` profile) so the forced
-/// `log_size`s are constant across the chain; otherwise log_size variation
-/// would produce commitments outside the allowlist.
-pub fn verify_chain_standalone_allowlist(
-    proofs: &[Proof],
-    allowed_commitments: &[CommitmentHash],
-    expected_initial_root: [u8; 32],
-    max_log_size: u32,
-    policy: &PcsPolicy,
-) -> Result<[u8; 32], VerificationError> {
-    if proofs.is_empty() {
-        return Err(VerificationError::InvalidStructure(
-            "verify_chain_standalone_allowlist: empty proof chain".to_string(),
-        ));
-    }
-    if allowed_commitments.is_empty() {
-        return Err(VerificationError::InvalidStructure(
-            "verify_chain_standalone_allowlist: empty commitment allowlist".to_string(),
-        ));
-    }
-    // Anchor the entering image (memory analogue of program identity).
-    if proofs[0].initial_state.memory_root != expected_initial_root {
-        return Err(VerificationError::InvalidStructure(
-            "verify_chain_standalone_allowlist: proofs[0].initial_state.memory_root \
-             does not match expected_initial_root"
-                .to_string(),
-        ));
-    }
-    // Boundary continuity across the chain.
-    for window in proofs.windows(2) {
-        if window[0].final_state != window[1].initial_state {
-            return Err(VerificationError::InvalidStructure(format!(
-                "segment chain broken: final state at ts={} does not match next initial at ts={}",
-                window[0].final_state.timestamp, window[1].initial_state.timestamp,
-            )));
-        }
-    }
-    // Each segment's program commitment must be in the published allowlist,
-    // then it verifies standalone against that (its own) commitment.
-    for proof in proofs {
-        let Some(actual) = proof.preprocessed_commitment() else {
-            return Err(VerificationError::InvalidStructure(
-                "verify_chain_standalone_allowlist: a segment has no program commitment"
-                    .to_string(),
-            ));
-        };
-        if !allowed_commitments.contains(&actual) {
-            return Err(VerificationError::InvalidStructure(
-                "verify_chain_standalone_allowlist: a segment's program commitment \
-                 is not in the published allowlist"
-                    .to_string(),
-            ));
-        }
-        verify_standalone_with_options(proof.clone(), actual, max_log_size, policy)?;
+        // The conjectured-security floor, so a canonical MOBILE chain
+        // (`vos_pvm_proof::prove_chain`) verifies without the caller naming
+        // `PcsPolicy::MOBILE`.
+        verify_standalone_shaped(
+            proof.clone(),
+            preprocessed_commitment,
+            DEFAULT_MAX_LOG_SIZE,
+            None,
+        )?;
     }
     Ok(proofs[proofs.len() - 1].final_state.memory_root)
 }
