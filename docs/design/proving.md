@@ -26,7 +26,8 @@ Design, draft 5. It is the architecture behind slices 5, 6 and 7
   a recursion layer into one final proof. That proof is verified by:
   - a peer;
   - a pallet on the Kreivo parachain, first;
-  - a public JAM agent, later.
+  - a JAM statements service, a dedicated service whose refine verifies
+    and whose accumulate records (slice 6).
 - **One shape for every final proof.** A general-purpose verifier checks
   any statement from any space. Public data travels as opaque bytes,
   which a handler for that program decodes after verification.
@@ -193,7 +194,10 @@ attribution). Its full design is `recursion-air.md`.
   - **its AIR binding:** the dispatch id is committed in PROGRAM_MEMORY,
     like `0x400`'s; it writes only `[φ7, φ7 + count)`, with the count at
     most φ8, and has no other effect;
-  - the whole input is capped at 4 MiB, a work result's cap;
+  - the caller's arguments are capped by `Limits::attest` (64 KiB on VOS,
+    2 KiB on JAM); a statement's served witness travels as a blob by
+    hash, under `Limits::served` and the kernel's declared gas (slice 6);
+    4 MiB stays the ceiling of the kernel's whole input;
   - `derive` admits the new id, and a live≡traced test gates it in M0.
 - **Page permissions are preprocessed.** The program's layout is four
   regions of pages: two readable (the read-only data, the argument
@@ -358,17 +362,24 @@ attribution). Its full design is `recursion-air.md`.
   the format. The security tool counts its batching term as `ε_lin(k)`
   (BCIKS20 Theorem 1.6), and its first FRI round as the fork folds it, by
   `2^fold_step` with the circle fold in it (`DIVERGENCE-011`).
-- **Masked** with variant (c), in slice 6: format 28's wraps are
-  unmasked (§4, A.4), and masking takes a new final format.
+- **Masked** as format 39 (variant (c), A.4): blowup 32, 24 queries, PoW
+  26, interaction PoW 8, fold step 3, a 2^6 last layer, affine DEEP
+  batching; 146 / 82 (82.70) [model]. Format 28 stays a test format.
 - **The final channel** [decided]: Blake2b-256 Merkle trees and a
   Blake2b Fiat–Shamir transcript. This is new code in our Stwo fork.
-  Kreivo's host and VOS's precompile both serve Blake2b.
-- **Cost** [model]:
+  VOS's `0x400` serves a Blake2b compression and Kreivo's host
+  `blake2_256` the whole-message hash; JAM serves no hash (Gray Paper
+  0.8.0 has no hash host call), so a JAM verifier hashes in software. On
+  Kreivo the host hash would shorten ref_time, but proof_size binds a
+  block and length sets the fee.
+- **Cost:**
   - about 85M JAM gas unmasked with Blake2b in software, and 64M through
-    VOS's `0x400` precompile;
-  - 117–119M masked;
-  - about 122 KB unmasked;
-  - 2.2–4.9 GiB to prove at blowup 64 [projected].
+    VOS's `0x400` precompile [model];
+  - masked (spike 6a, shape A, postcard): 115.8–118.7M JAM gas (decode
+    19.9M, verify 95.8M), 45.2M Wasm instructions, 160–163 KB, 3.45 GiB
+    of heap and 11.6–15 s to prove [measured]; about 98M with format
+    39's fixed-layout decode [est];
+  - about 122 KB unmasked [model].
 - **Built** (slice 5's 5.14) [measured], unmasked:
   - **96.4M JAM gas** on the JAM-only host, Blake2b-256 in software: the
     proof's postcard decode 16.0M of it, the verify 80.3M; a 469 KB PVM
@@ -377,9 +388,9 @@ attribution). Its full design is `recursion-air.md`.
     the client's), 2.1 ms, a 292 KB blob;
   - **122–125 KB** (the window kernel's 123,686 bytes);
   - **5.45 s and a 2.5 GiB heap** to prove the window kernel's wrap;
-  - the levers left: a fixed-layout decode (most of the 16.0M) and
-    Blake2b through `0x400`, which needs a compression hook in the fork's
-    hasher.
+  - format 39 decodes a fixed layout; the Blake2b hook is deferred, a
+    lever for when ref_time binds: nothing in slice 6 verifies as a PVM
+    guest on a VOS host, and Kreivo's binding limit is proof_size.
 - **Fold step above 1:** the pinned Stwo implements it; our fork's review
   and tamper tests admitted it for format 28 (slice 5's 5.14).
 - **Its public inputs** are the program id (8 M31) and the io-hash (its
@@ -542,7 +553,8 @@ last for decades.**
 | segment proofs (format 35) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.86) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
 | device and credential proofs (37, 30; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin | blowup 2 (log 1), 86 queries, PoW 20, plus interaction PoW 8 | 106 / 62 |
-| the final wrap (28) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
+| the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
+| the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
@@ -585,6 +597,8 @@ last for decades.**
   - the gate compiler (constraint ≡ gate);
   - the claimed-sum handling;
   - the masking, and the public-sum re-cut;
+  - the masked wrap's transcript and R1–R4, and the lifted protocol under
+    (c) (`research/slice-6/spike6b-masked-bits.md` §4);
   - the base segment AIR, the parts slice 5's hardening left without
     forgery gates first: PROGRAM_MEMORY's decode binding, JUMP_TABLE, the
     lookup tables, MEMORY_PAGE and MEMORY_MERKLE, the witness-input chip,
@@ -600,15 +614,23 @@ last for decades.**
 
 ## 5. Masking [proposed]
 
-- **Where:** device proofs, and the final wrap. Segment, leaf and fold
-  proofs stay in the prover role, as the witness rows do.
+- **Where:** the final wrap (slice 6). Device proofs (slice 7) reuse it:
+  the masking is generic over the component set and the channel. Segment,
+  leaf and fold proofs stay in the prover role, as the witness rows do.
 - **Device proofs at rate 1/2** serve authorizations a space re-checks at
   its ingress, never settlement.
 - **How:** spike 2's variant (c), already prototyped on our pinned Stwo
   fork, with Fable's R1–R8:
-  1. the rank check;
-  2. claimed sums blinded, and the public-sum boundary re-cut;
-  3. a rank test of the FRI mask;
+  1. the rank check; the prover retries on R1's failure, a public event
+     that leaks nothing;
+  2. claimed sums blinded: one blinding QM31 a component on one row,
+     through a `BlindRelation` drawn after `Gate`; the wrap's public sum
+     is the 24 words and `u`, so its boundary re-cut is trivial;
+  3. the FRI mask's rank: under affine batching each of R's columns gets
+     its own QM31 coefficient, so a 4-column R is singular about 2^-31 an
+     attempt; R takes 8 columns, whose coefficients span M31^4 except
+     with probability about 2^-155, with no prover check (the rank test
+     runs on a small circuit only);
   4. hedged randomness, H(OS ‖ witness);
   5. a degree audit (the recursion AIR's gates stay at degree ≤ 3 with
      paired logup, so (c) applies);
@@ -617,6 +639,10 @@ last for decades.**
   8. the cost measured.
 - **The composition mode:** a test pins that (c) lifts no constraint past
   the blowup. If it did, the prover would re-LDE every column.
+- **On the wrap** (spike 6a): no re-LDE [measured]; the prover ×2.6–2.9
+  in time (the lifting rises to 22, and Blake2b Merkle hashing of the
+  doubled leaf layer dominates), ×1.41 in memory; verify ×1.20, bytes
+  ×1.31 [measured]. Shape A's preprocessed root is format 28's.
 - **Leaks:**
   - proving time (mitigated by publishing at the window cadence);
   - the public fields the kernel declares.
@@ -624,12 +650,30 @@ last for decades.**
 ## 6. Verifiers [proposed]
 
 - **Peers:** native, on the same crate.
-- **Kreivo, a general-purpose pallet, built in slice 6 after the
-  recursion** [decided] (`research/slice-5/kreivo-pallet.md`):
+- **Kreivo, a general-purpose pallet** [decided], `pallet-spaces`
+  (`spaces-pallet.md`, its handoff design; `research/slice-5/kreivo-pallet.md`
+  for the first survey):
   - **Registries:**
-    - spaces: a controller account, and node keys that post one anchor
-      per window;
+    - spaces: a space registered from its genesis, with a **sovereign
+      account** that holds the registration deposit and pays its
+      authorities' fees and deposits; an **authorities map** of the
+      nodes' own sr25519 accounts, each paired with its ed25519 anchor
+      key, set by the controller (an `AccountId`); a registration signs
+      its first window; the venue-bound flag; the migration range;
+    - anchors keyed by `(space, kind, window)`; `MaxRootAge` (24 h) is
+      the only age;
     - formats and programs: governance, with a delay.
+  - **Fees:** `submit` takes a refundable deposit, released on acceptance
+    or a repeat, forfeited on any other refusal; normal length and weight
+    fees, paid by the sovereign account through `ChargeSpaceFee` within a
+    spend budget per window. A proof's length counts as proof_size, so
+    about 20 statements fit a block on one core.
+  - **The repeat rule:** a rootless statement's `Seen` entry never
+    expires, since it has no anchor whose age refuses a replay.
+  - **The node's Kreivo client:** the representative and the worker
+    anchor and submit through a `VenueClient` signing with the node's own
+    sr25519 key, which holds no balance.
+  - The weights and benchmarks are the teammate's.
   - **`submit(statement, proof)`, checked in this order:**
     1. the size cap;
     2. a strict decode;
@@ -665,14 +709,25 @@ last for decades.**
     compares the whole `RootRead`, kind among it.
   - **Fail-closed:** a runtime without the verifier rejects every proof,
     and a failed submit pays its full weight.
-  - **Built-in handlers:** `Record` records the statement, and
-    `Credential` records a scoped nullifier. Neither runs a STARK in
-    `validate`.
-  - **Its home:** frame-contrib, to be confirmed in slice 6.
-- **The JAM agent:**
-  - refine verifies, accumulate records;
-  - accepted program ids are constants, changed by redeploy;
-  - payloads arrive as preimages.
+  - **Built-in handlers:** `Record`; a `Credential` handler with slice 7's
+    credential AIR; the Clerk's settlement handler with the Clerk. Every
+    value-moving handler is two-sided or spends the submitting space's
+    own escrow. No handler runs a STARK in `validate`.
+  - **Its home:** `pallet-spaces`, in Kreivo, built by the Kreivo teammate
+    from `spaces-pallet.md`, to replace pallet-communities later; the
+    verifier stack vendored into Kreivo with a sync check against a VOS
+    tag (VOS's kit, slice 6's 6.16); frame-contrib and crates.io later.
+- **The JAM statements service** (slice 6): a dedicated service; refine
+  verifies anchors' signatures and statements (about 100M gas a
+  statement; a report's accumulate has 10M); accumulate holds the spaces,
+  anchors and repeats, and records, checking an anchor's signer against
+  the space's registered keys and keeping a rootless statement's `Seen`
+  entry forever, as Kreivo does; accepted program ids are constants
+  changed by redeploy; a proof rides in its work item's payload (or as a
+  preimage, if 6.0b found the payload cannot carry it). An actor in the
+  default agent cannot host it: `MAX_HANDLER_GAS` 100M, a 512 KiB program
+  cap (538,683 B with both formats linked), 2 KiB messages, no preimage
+  access.
 
 ## 7. Roots and anchors [proposed]
 
@@ -683,17 +738,46 @@ last for decades.**
 - **A chain-bound statement reads at the space's last anchored window
   cut.** A statement that stays inside the space keeps "as of the latest
   complete root W ≤ V".
-- **Latency:** a chain-bound statement waits for its window's anchor. The
-  window length Kreivo runs is decided in slice 6.
+- **Windows** [decided] are Unix time from the space's genesis,
+  `w = ⌊(t − origin)/length⌋`, the clock frozen in the genesis; the length
+  per space in [2, 60] minutes, default 10.
+- **Time between parties is the venue's** [decided]: every expiry,
+  timeout or exposure deadline between parties uses the venue's chain
+  time, never a window number or the space's clock; the space's clock
+  schedules only its own cuts, and a venue anchors only windows closed by
+  its own clock (`w < now_w`).
+- **Latency:** authorization across spaces is instant (the counterparty
+  credits within its exposure cap); trustless settlement takes about
+  `L/2 + D + t_prove + inclusion`, about 10 minutes on average at L = 10;
+  parallel proving is the lever below that.
 - **Each space root commits to `(space_id, window)`,** and each
   `RootRead` carries both.
+- **`SpaceId`** [decided] is the genesis hash,
+  `BLAKE2b-256("vos/space/id" ‖ SCALE(genesis))`; the window clock is
+  frozen in the genesis.
+- **The space root** [decided] is built by the space's representative
+  agent: `S_w = BLAKE2b-256("vos/space/v1" ‖ space ‖ w ‖ A_rep)`, `A_rep`
+  the representative's agent root at its own cut of w, over its rows
+  `(agent, kind, w) → the agent's root at cut(w)` (`slice-6-on-chain.md`,
+  pin D).
+- **Anchors** [decided] are signed by one registered node key; the
+  controller rotates the keys.
+- **Retention:** none past a cut. A request made in window w reads at
+  `cut(w)` and is served at the next cut.
+- **Spans** [decided]: a statement over a span of windows takes a carried
+  commitment to its last settled state as a `#[public]` argument, not an
+  old root; no tree history is kept.
+- **An anchor gives ordering and non-equivocation, not integrity:** a
+  space can anchor any root of its own making, so every value-moving
+  handler is two-sided or spends the submitting space's own escrow.
 - **Venue migration:** a space anchors on one venue at a time. The signed
   migration point is recorded on both venues, and each refuses windows
   outside its range.
 - **Root kinds:**
-  - A JAM-deployed agent's maps are subtrees of one tree, so roots differ
-    by host. A chain accepts only root kinds that are the same on both
-    hosts.
+  - Committed rows sit first in the keyspace, under `0x03`, so an
+    agent's root is the same on both hosts: VOS's tree per agent equals
+    JAM's node at `0x03` [decided]. `RootKind { Space = 0 }`; 1 is
+    reserved for the Poseidon2 kind (§8).
   - A map may take the **Poseidon2 root kind** (§8). Its root is then a
     Poseidon2-M31 tree's root.
 
@@ -796,7 +880,12 @@ that narrows the inner proof makes folds cheaper too.
 | the final wrap misses its gas or size | the real wrap verified on the JAM-only host (≤ 150M unmasked) and in the Wasm harness | slice 5, M1 |
 | the multi-step FRI path, or the new Blake2b channel, is unsound | a review plus tamper tests before the format admits them | slice 5, M1 |
 | the wrap misses its 80 proven bits | 74.7 at blowup 64 with powers-of-one DEEP batching [model]; **retired at 5.14:** affine batching in the fork for format 28, 82.6 proven bits [model] | slice 5, M1 |
-| masking the wrap costs more than (c)'s factor | one masked wrap: ≤ 24 GiB, ≤ 200M gas; leakage and soundness tests | slice 6 |
+| masking the wrap costs more than (c)'s factor | one masked wrap: ≤ 24 GiB, ≤ 200M gas; leakage and soundness tests. Measured (spike 6a): 3.45 GiB of heap, 115.8–118.7M gas; the gate is 6.3–6.6 | slice 6 |
+| the cut and held build fail under failover | the cut and the held build across a leader change (6.12) | slice 6 |
+| the prover worker falls behind the window cadence | the worker measured against the cadence (6.18) | slice 6 |
+| the teammate's pallet diverges from the design | the pallet against the conformance vectors (6.17) | slice 6, then the teammate's |
+| a deadline between parties is read from a space's clock | a test that every deadline is the venue's time | slice 6 |
+| a forgery in the recursion AIR | the recursion AIR's forgery gates (6.8) | slice 6 |
 | the credential AIR misses sub-second | masked auth and payment proofs on a real flagship | slice 7 |
 | the signature chips' cost or soundness | a gate ladder per chip; a phone run | slice 7 |
 
@@ -806,8 +895,8 @@ that narrows the inner proof makes folds cheaper too.
 |---|---|---|---|
 | **5** | **M0 Foundation** | our Stwo fork pinned, with the completeness fix and no_std gating; a shape per kernel; formats chosen at run time, with lossless encodings; the inner parameters, interaction PoW and both bit counts; the witness-input precompile, the halt pc and the io-hash with roots; the reference Poseidon2, a SIMD hasher and the channel gate; the phone run (not run: pending the owner's team) | 6–9 weeks |
 | **5** | **M1 The recursion, unmasked, in tests** | a preparation step (slice 5's 5.8.0: the window kernel on the line, the fixture generator, shared code, the inner parameters recounted); then `recursion-air.md` §10's eight steps: the gate VM; the gate compiler; the in-AIR verifier's pieces; COMPARE's leaf; the window kernel's and the solvency predicate's leaves; the fold and the fixed point; the final wrap with the Blake2b channel and `vos-pvm-final-verifier`; end to end with `vos-statement` and the golden fixtures | 18–26 weeks, plus reviews |
-| **6** | **M2 Masking** | R1–R8 on the wrap and on device proofs; 248-bit salts; leakage and soundness gates | 6–8 weeks |
-| **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo pallet (P0 and P1); the JAM verifier agent | 8–12 weeks |
+| **6** | **M2 Masking** | R1–R8 on the final wrap, generic over components and channel for slice 7; format 39; 248-bit salts; leakage and soundness gates; the items carried from slice 5 | 8.5–13 weeks |
+| **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo spaces pallet's design, the verifier kit and the node's client (the pallet is the Kreivo teammate's); the JAM statements service | 18.5–29 weeks |
 | **7** | **M4 Credential AIR** | the Poseidon2 root kind; the zkPVM Poseidon2 chip; the credential AIR with PRF passkeys; a phone gate | 6–10 weeks |
 | **7** | **M5 Device profile** | the device shape; lean kernels; narrow BLAKE2b | 6–10 weeks |
 | **7** | **M6 Signature chips** | SHA-256, SHA-512, the bignum chip, the P-256 and Edwards drivers | 8–14 weeks |
@@ -816,10 +905,13 @@ that narrows the inner proof makes folds cheaper too.
   5.5 → 5.12 (`slice-5-proving.md`); 5.7 runs beside it.
 - M1's 18–26 weeks are 1–2 for its preparation and 17–24 for §10's
   steps, which sit below spike 4b §8's 20–28 to a working tree for our
-  own AIR: the design and its counts are now measured, and production
-  hardening (the audit, masking) is slice 6.
+  own AIR: the design and its counts are now measured; masking is slice
+  6; the external audit's timing is the owner's (`slice-5-progress.md`).
+- Slice 6's spikes, acceptance and the slice-5 rest add 5–7 weeks to M2
+  and M3: slice 6 is 32–49 engineer-weeks (`slice-6-on-chain.md`,
+  "Estimates").
 - The Clerk across spaces follows slice 6.
-- The total is about 58–89 engineer-weeks.
+- The total is about 76–118 engineer-weeks.
 
 ## 12. Decisions
 
@@ -839,6 +931,14 @@ that narrows the inner proof makes folds cheaper too.
 8. **Slicing:** three slices, as in §11.
 9. **The segment channel:** Poseidon2-M31, on a segment's total cost
    (§3.2).
+10. **The window length** (2026-10-19): windows of Unix time from the
+    space's genesis, the length per space in [2, 60] minutes, default 10;
+    every deadline between parties is the venue's time (§7).
+11. **The pallet's home** (2026-10-19): `pallet-spaces` in Kreivo, built
+    by the Kreivo teammate from `spaces-pallet.md`, to replace
+    pallet-communities later; slice 6 delivers its design, the verifier
+    kit vendored with a sync check, and the node's client (§6). This
+    replaces 7's "in slice 6".
 
 **Decided on the evidence, and the owner's to override:**
 - reads at the last anchored cut, to the space root;
@@ -847,9 +947,6 @@ that narrows the inner proof makes folds cheaper too.
 - 248-bit salts;
 - one padded fold shape as a format constant;
 - an external audit before value rides on a proof.
-
-**Deferred:** Kreivo's window length (slice 6), and the pallet's home
-(slice 6).
 
 ## Appendix A. For the implementer
 
@@ -953,7 +1050,8 @@ counts as conjectured / proven at the reference shape [model]:
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
 | 36 | segments, legacy encodings | Blake2s | the proof's own, at least 96 conjectured bits (MOBILE: 2, 38, 20, 1, 0, none) | 96 / — | 96 / 57 | admitted |
 | 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
-| 28 | the final wrap (unmasked until slice 6) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
+| 28 | the final wrap, unmasked (tests only) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
+| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | reserved; admitted at slice 6's 6.4 |
 | 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 
 - **Each entry** holds its channel, its encodings, its parameters, the DEEP
@@ -977,8 +1075,10 @@ counts as conjectured / proven at the reference shape [model]:
   28 is admitted from slice 5's 5.14: `vos-pvm-recair` proves the wrap and
   `vos-pvm-final-verifier` verifies it; a segment verifier takes only a
   segment format.
-- **Masking the wrap** (slice 6) changes its proofs, so it takes a new
-  number or a bump of 28.
+- **Masking takes a new number, 39:** a bump of 28 would break "a number
+  names one AIR and one set of parameters". 40, spike 6a's blowup-64
+  shape, is retired unregistered; 38 stays unassigned, the fixtures' "a
+  number no format holds".
 - **24 to 27, 29, 31, 33 and 34 are retired.** 24 to 27 and 29 named the
   segment AIR before its hardening, and 31, 33 and 34 the hardened AIR
   with its unread columns (31 at 44 queries), so they are refused and
@@ -1015,7 +1115,7 @@ carriers.
 
 Every venue judges them alike. A generator makes them, regenerated at
 each format bump, and stores them under `pvm/proof/fixtures` (about
-1.2 MB). M0 promised it and did not build it; slice 5's 5.8.0 does.
+380 KB, plus the segment fixtures). M0 promised it and did not build it; slice 5's 5.8.0 does.
 
 **Built** (slice 5's 5.15, its review folded in 5.15b) [measured]: the
 generator (`pvm/proof/tests/kernel/fixtures.rs`) proves a small kernel stating a fixed
@@ -1067,7 +1167,7 @@ under `systemd-run` with these caps as `MemoryMax`.
 | segment (the window kernel's) | its class | ≤ 24 GiB | ≤ 8 s, once the SIMD hasher lands |
 | leaf | ≤ the padded shape | ≤ 4 GiB | 1.2–2.6 s [projected]; ≤ 1× the segment's proving (target 0.13–0.5×) |
 | fold | the padded shape | ≤ 4 GiB; 942 MiB of heap [measured] | 1.2–2.6 s [projected]; ≤ the leaf's; 1.5 s [measured] |
-| wrap | ≤ 2^17; 2^14 / 2^15 / 2^11 [measured] | ≤ 8 GiB unmasked; a 2.5 GiB heap [measured] | 4.4–9.5 s [projected]; 5.45 s [measured] |
+| wrap | ≤ 2^17; 2^14 / 2^15 / 2^11 [measured] | ≤ 8 GiB unmasked; a 2.5 GiB heap [measured]. 39: ≤ 8 GiB; 3.45 GiB of heap [measured] | 4.4–9.5 s [projected]; 5.45 s [measured]. 39: ≤ 15 s; 11.6 s [measured] |
 
 A window of 16 segments proves end to end in about 3–5 minutes
 [projected].
