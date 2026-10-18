@@ -3,6 +3,8 @@
 
 #![allow(dead_code)]
 
+pub mod kernel;
+
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use vos_recair::gadgets::{TranscriptGadget, leaf_hash, node};

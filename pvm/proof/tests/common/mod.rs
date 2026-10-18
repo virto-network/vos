@@ -286,30 +286,32 @@ pub fn measured<T>(work: impl FnOnce() -> T) -> (T, std::time::Duration, u64) {
     (result, elapsed, ((PEAK.load(Relaxed) - base) >> 20) as u64)
 }
 
-/// What a kernel's leaf measured: its rows, its proving time and its peak
+/// What a node, a leaf or a fold, measured: its rows, its proving time and its peak
 /// heap over the allocations before it (0 unless the binary installs
-/// [`Counting`]), and the output it states.
-pub struct LeafRun {
+/// [`Counting`]); its proof and the output it states.
+pub struct NodeRun {
     pub rows: [usize; 3],
     pub finalized: [usize; 3],
     pub proving: std::time::Duration,
     pub peak_mib: u64,
+    pub proof: vos_recair::RecairProof,
     pub output: vos_recair::leaf::NodeOutput,
 }
 
 /// `proof`, a segment of `program`'s class `class`, verified in its leaf at
-/// `position`, as natively (its transcript the native recorder's,
-/// permutation for permutation, and no mismatch); the leaf within the
-/// padded shape, its circuit's hash the program's for the class, proved and
-/// verified, its public output the native output's digest.
+/// `position` under the fold word `fold_word`, as natively (its transcript
+/// the native recorder's, permutation for permutation, and no mismatch);
+/// the leaf within the padded shape, its circuit's hash the program's for
+/// the class, proved and verified, its public output the native output's
+/// digest.
 pub fn prove_leaf(
     program: &vos_pvm_proof::program_id::KernelProgram,
     entry: &vos_pvm_proof::program_id::KernelEntry,
     class: usize,
     proof: &vos_pvm_proof::Proof,
     position: u32,
-) -> LeafRun {
-    use stwo::core::fields::m31::BaseField;
+    fold_word: vos_pvm_proof::poseidon2::P2Hash,
+) -> NodeRun {
     use stwo::core::fields::qm31::SecureField;
     use vos_pvm_proof::poseidon2::P2Hash;
     use vos_pvm_proof::program_id::LeafCircuits;
@@ -317,7 +319,6 @@ pub fn prove_leaf(
     use vos_recair::verifier::witness::digest_wires;
 
     let leaf = LeafCircuit::of_class(program, entry, class);
-    let fold_word = P2Hash(core::array::from_fn(|i| BaseField::from(7_000 + i as u32)));
     let (values, output) = leaf
         .values(proof, P2Hash(program.id().0), fold_word, position)
         .expect("the segment's values");
@@ -386,12 +387,69 @@ pub fn prove_leaf(
         digest_wires(&output.digest()).to_vec(),
         "the leaf states the native output"
     );
-    vos_recair::verify(leaf_proof, &hash).expect("the leaf verifies");
-    LeafRun {
+    vos_recair::verify(leaf_proof.clone(), &hash).expect("the leaf verifies");
+    NodeRun {
         rows,
         finalized,
         proving,
         peak_mib,
+        proof: leaf_proof,
+        output,
+    }
+}
+
+/// The fold of `left` and `right`, nodes of `program`'s run under the fold
+/// word `fold_word`, the fold circuit's hash: verified as natively (no
+/// mismatch), within the padded shape, proved and verified against
+/// `fold_word`, its public output the native output's digest. Its rows
+/// finalized, proving time and peak heap (0 unless the binary installs
+/// [`Counting`]), its proof and output.
+pub fn prove_fold(
+    fold: &vos_recair::fold::FoldCircuit,
+    program: &vos_pvm_proof::program_id::KernelProgram,
+    left: &NodeRun,
+    right: &NodeRun,
+    fold_word: vos_pvm_proof::poseidon2::P2Hash,
+) -> NodeRun {
+    use vos_recair::fold::Proved;
+    use vos_recair::leaf::PADDED_ROWS;
+    use vos_recair::verifier::witness::digest_wires;
+
+    fn proved(node: &NodeRun) -> Proved<'_> {
+        Proved {
+            proof: &node.proof,
+            output: &node.output,
+        }
+    }
+    let (values, output) = fold
+        .values(
+            proved(left),
+            proved(right),
+            &program.id_preimage(),
+            fold_word,
+        )
+        .expect("the children's values");
+    let context = fold.build(&values);
+    let rows = context.rows();
+    let finalized = context.finalized_rows();
+    let filled = context
+        .finalize_to(Some(PADDED_ROWS))
+        .expect("the wiring checks");
+    let (fold_proof, proving, peak_mib) =
+        measured(|| vos_recair::prove(&filled.circuit, &filled.witness).expect("proves"));
+    assert_eq!(
+        fold_proof.outputs,
+        digest_wires(&output.digest()).to_vec(),
+        "the fold states the native output"
+    );
+    let hash = fold_word.0.map(|word| vos_pvm_poseidon2::M31::new(word.0));
+    vos_recair::verify(fold_proof.clone(), &hash).expect("the fold verifies");
+    NodeRun {
+        rows,
+        finalized,
+        proving,
+        peak_mib,
+        proof: fold_proof,
         output,
     }
 }

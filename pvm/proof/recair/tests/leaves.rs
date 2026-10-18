@@ -181,43 +181,47 @@ fn compares_leaf_refuses_each_tamper() {
     assert_eq!(first_refusal(&compare.values), None);
     // COMPARE's running sum at the OODS point.
     let running_sum = {
-        let component = &compare.shape.layout.components[1];
+        let component = &compare.shape.stark.layout.components[1];
         assert_eq!(component.chip, chip_idx::COMPARE);
         let column = component.interaction_columns.end - 1;
-        compare.shape.sample_index[2][column] + 1
+        compare.shape.stark.sample_index[2][column] + 1
     };
     type Edit = Box<dyn Fn(&mut SegmentValues<SecureField>)>;
     let cases: Vec<(&str, &str, Edit)> = vec![
         (
             "an OODS sample",
             "oods",
-            Box::new(move |v| bump(&mut v.sampled[running_sum])),
+            Box::new(move |v| bump(&mut v.stark.sampled[running_sum])),
         ),
         (
             "a queried value",
             "merkle",
-            Box::new(|v| bump(&mut v.queries[7].trees[1].leaf[3])),
+            Box::new(|v| bump(&mut v.stark.queries[7].trees[1].leaf[3])),
         ),
         (
             "a Merkle sibling",
             "merkle",
-            Box::new(|v| bump(&mut v.queries[3].trees[2].path[5][0])),
+            Box::new(|v| bump(&mut v.stark.queries[3].trees[2].path[5][0])),
         ),
         (
             "a FRI value",
             "fri",
-            Box::new(|v| bump(&mut v.queries[0].fri[3].sibling)),
+            Box::new(|v| bump(&mut v.stark.queries[0].fri[3].sibling)),
         ),
-        ("the PoW nonce", "pow", Box::new(|v| bump(&mut v.nonce))),
+        (
+            "the PoW nonce",
+            "pow",
+            Box::new(|v| bump(&mut v.stark.nonce)),
+        ),
         (
             "the interaction PoW nonce",
             "pow",
-            Box::new(|v| bump(&mut v.interaction_nonce)),
+            Box::new(|v| bump(&mut v.stark.interaction_nonce)),
         ),
         (
             "a claimed sum",
             "logup",
-            Box::new(|v| bump(&mut v.claimed_sums[1])),
+            Box::new(|v| bump(&mut v.stark.claimed_sums[1])),
         ),
     ];
     for (name, piece, edit) in &cases {
@@ -227,7 +231,7 @@ fn compares_leaf_refuses_each_tamper() {
     }
 
     let mut values = compare.values.clone();
-    bump(&mut values.queries[3].trees[2].path[5][0]);
+    bump(&mut values.stark.queries[3].trees[2].path[5][0]);
     let mut context = Context::<SecureField>::new().lenient();
     verify_segment(&mut context, &compare.shape, &values);
     let finalized = context.finalize().expect("the wiring checks");
@@ -393,14 +397,14 @@ fn the_window_kernels_leaf_rows_per_term() {
     verify_segment(&mut context, &shape, &SegmentValues::blank(&shape));
     print_rows("the window kernel's class-1 leaf", &context);
 
-    assert_eq!(shape.layout.lifting_log_size, 20);
+    assert_eq!(shape.stark.layout.lifting_log_size, 20);
     assert_eq!(shape.config().fri_config.n_queries, QUERIES);
-    let (blocks, singles, samples) = shape.deep.counts();
-    let points = shape.deep.points.len();
+    let (blocks, singles, samples) = shape.stark.deep.counts();
+    let points = shape.stark.deep.points.len();
     eprintln!(
         "{} sampled values; DEEP: {samples} samples at {points} points, a query's {blocks} h8 \
          blocks and {singles} single samples",
-        shape.n_samples
+        shape.stark.n_samples
     );
     assert_eq!(points, 16);
 
@@ -428,7 +432,7 @@ fn the_window_kernels_leaf_rows_per_term() {
         assert_eq!(rows % QUERIES, 0, "{rows} rows over {QUERIES} queries");
         rows / QUERIES
     };
-    let paths: usize = shape.heights.iter().map(|&h| h as usize).sum();
+    let paths: usize = shape.stark.heights.iter().map(|&h| h as usize).sum();
     let deep = piece("deep");
     let measured = [
         per_query(piece("merkle")[0]) - paths,

@@ -3084,3 +3084,224 @@ rows.
   one-size finding), §3.6 (the program id in the prover role), A.3 (the
   preimage's order); `recursion-air.md` §4.8, §5's table, R1;
   `slice-5-proving.md` 5.12's gate.
+
+## Step 5.13: the fold and the fixed point
+
+`recursion-air.md` §10's step 6, on `vos-core` from `84394f55`: two child
+proofs of the padded shape, leaves or folds, verified in one fold
+circuit, the program and the circuits they carry bound, their run joined,
+and the fold's rows fitting the shape it proves at.
+
+### 5.12's review, folded first (its own commit)
+
+- `recair/tests/leaf_rows.rs`: every piece's term is asserted equal to the
+  built leaf's rows, the terms' total to the built rows, the bound's `p2`
+  and `h8` to them exactly and its `qm31` to them plus `FINALIZE`; the
+  derivation's padded shape is `vos_recair::leaf::PADDED_ROWS`.
+- **New negations** (`recair/tests/leaf.rs`): `LeafValues` states `first`
+  and `last` apart, and the io-hash's 16 limbs, four a wire, so `first`
+  other than `last` is refused by `leaf: flags`, a stated limb other than
+  its bytes' by `leaf: io-hash` (each of the 16 lanes); an initial ts of
+  zero is refused by the ts check's inverse, a mismatch (zero's guess is
+  zero, the row's output not one) and not a panic, after the PoW the moved
+  transcript fails. `Context::inverse` documents it.
+- **Docs:** `proving.md` §3.6, who computes the program id a venue pins
+  (the prover role, or a build tool with the recursion stack; a venue
+  takes the pin as governance input); A.3, why a state digest leaves
+  `memory_commitment` out (no column binds it, no transcript mixes it);
+  `slice-5-proving.md`'s risks, the one-size lifting-height gap and its
+  two options (a `POLICY` keeping the largest chip alone at the top, or
+  DEEP blocks for coinciding samples).
+
+### What every verifier shares (`recair/src/verifier/stark.rs`)
+
+- **`StarkShape`**, a verifier circuit's geometry for a proof of any AIR
+  on a lossless Poseidon2-M31 format at fold step 1: its `SampleLayout`,
+  relations, compiled constraints, the trees' heights and leaf orders,
+  the sample indices, DEEP's plan and FRI's layers. `SegmentShape` holds
+  one beside its header, mask, log sizes, root and boundary terms.
+- **`StarkValues`**, the values past an AIR's own prefix (the main,
+  interaction and composition roots, the interaction nonce, the claimed
+  sums, the samples, FRI, the PoW nonce, the queries), laid out by one
+  builder for a segment or a recursion AIR proof; `SegmentValues` holds
+  them beside its header and boundary bytes.
+- **The transcript's shared parts:** `interaction` (the interaction PoW,
+  the relations drawn, the claimed sums mixed) and `verify_rest` (from the
+  interaction root: composition, OODS, samples, FRI, PoW, queries, each
+  query's openings, DEEP and FRI). `verify_segment` is its prefix, the
+  boundary logup check and those two; its rows are unchanged, piece by
+  piece (the leaf-rows test holds them to the derivation's count).
+- **`vos_pvm_proof::replay_stark`:** `extract_recursion_data`'s walk
+  (Stwo's verifier head and `verify_values` replayed) over any AIR's
+  components, after that AIR's own prefix; the segment's
+  `extract_recursion_data` is its prefix and this.
+
+### A fold's child (`recair/src/fold/child.rs`)
+
+- **`ChildShape::padded`:** the recursion AIR's three components at
+  `LEAF_FOLD_LOG_SIZES` (2^16 / 2^17 / 2^16, now a format constant beside
+  `LEAF_FOLD`), their layout as `sample_layout` lays a segment's, their
+  constraints compiled by 5.9's compiler from their own `evaluate` (`p2`'s
+  303 constraints in 1,935 rows, `qm31`'s 3 in 74, `h8`'s 7 in 92), the
+  `Gate` relation the one drawn, under format 32 (44 queries, PoW 20).
+  Built once, in 10 ms [measured].
+- **`verify_child`:** the header's constant words, the preprocessed root
+  (a witness: a child's circuit), the main root, the child's two output
+  wires (its committed digest), then `interaction`, the logup sums as
+  `vos_recair::verify` checks them (the claimed sums, `u`'s use and each
+  output's public term add to zero), then `verify_rest`.
+- **`circuit_hash`:** `vos_recair_air::circuit_hash` in rows, one
+  absorption from the zero digest of its 28 constant words
+  (`circuit_hash_prefix`, new) and the root's eight.
+- **`ChildValues::from_proof`:** the proof verified natively, its
+  transcript through the interaction root replayed as `verify` runs it,
+  then `replay_stark`, laid out by `StarkValues::lay_out`;
+  `child::recursion_data` exposes the walk.
+- **What the build found** [measured]: the child's lifting height is
+  **2^19, not the model's 2^20** (`qm31` at 2^17 bounds the composition
+  at 2^18, split once, blown up by 4), so 17 FRI layers; 486 sampled
+  values, 514 DEEP samples with the periodicity ones, at **3 points**
+  (the model's 4); 46 `h8` blocks and 146 single samples a query. A
+  child's verification is **16,065 / 21,394 / 2,024** rows, against the
+  model's 15,291 / 20,686 / 1,794.
+
+### The fold (`recair/src/fold/mod.rs`)
+
+- **`FoldCircuit`,** one for every program: its constant is the child's
+  shape; the program, the children's circuits and W are witnesses. Its
+  hash (`FoldCircuit::hash`, the padded topology's) is W's true value,
+  0.3 s [measured].
+- **For each child:** its proof verified with its output digest's two
+  wires guessed; its circuit hash from its preprocessed root; its 52-word
+  preimage (13 wires, A.3's order, `leaf::preimage`'s ranges) re-hashed and
+  asserted equal to those wires, so a tampered preimage is refused by
+  `fold: preimage` and not by the child's transcript.
+- **The circuit set:** a one-hot choice of bits over the program's four
+  leaf-circuit hashes and W (`Σ b = 1`, `b·(h − c) = 0` a wire); the
+  child's W equal to the fold's; the fold's W in its output.
+- **The program:** the id recomputed from its 44-word preimage, both
+  children's ids equal to it, the candidates above that preimage's
+  hashes.
+- **The run:** `1 + left.last − right.first = 0` (two rows), the left's
+  exit digest equal to the right's entry digest; the output's scalars
+  `[left.first, right.last, left.entry, right.halt]` from the two
+  children's wires by a pointwise product and a fused row, its entry
+  digest the left's, its exit digest and io-hash the right's, its program
+  the recomputed id, its W the fold's: `NodeOutput::fold` natively.
+- **A fold states, it does not refuse,** a run without an entry or a
+  halt: the flag stays zero and the wrap refuses the root. Claiming a
+  flag a child lacks changes the child's preimage, which its re-hash
+  refuses.
+- **Its own rows** [measured]: 37 `p2` (the circuit hashes 10, the
+  preimages 14, the program id 6, the output 7) and 74 `qm31` (the
+  circuit choices 58, the preimages 4, the program 4, adjacency 2,
+  continuity 2, the output 4); the model's 37 and 110.
+
+### The program id in two levels (`pvm/proof/src/program_id.rs`)
+
+- **Why:** the fold recomputes the id in-circuit, and one fold circuit
+  serves every kernel, while the id's preimage held each class's sizes
+  and roots: a length per kernel. The id now hashes a preimage of fixed
+  length, `ID_WORDS` = 44 (`IdPreimage`): the kernel's digest (the leaf
+  sponge over every field but the leaf circuits, version 3), the
+  leaf-circuit slot's version and count, and `MAX_LEAF_CIRCUITS` = 4
+  hashes (`shape::MAX_CLASSES`), zeros past the count. A zero hash admits
+  no circuit, as none hashes to zero.
+- Every field still reaches the id; the golden vector is re-pinned; the
+  kernel's digest does not depend on the slot.
+
+### Tests
+
+- **`recair/tests/fold.rs`** (`just check`), on the small kernel of 5.12's
+  leaf test (`tests/common/kernel.rs`, shared), its run cut in four
+  segments at their natural sizes, their leaves proved under a program
+  of their circuits and W:
+  - a fold of two leaves: each child's transcript the native recorder's,
+    permutation for permutation; the native `NodeOutput::fold`, its
+    digest the circuit's; proved and verified against W;
+  - a tree over the four segments: two folds of two leaves, then a fold
+    of the two folds, stating the whole run (positions 0–3, both flags,
+    the run's entry digest and io-hash); its wiring without values the
+    filled one's, its circuit hash W; proved in 1.43 s and verified;
+  - refusals, each by its intended check: a wrong program (another
+    kernel's digest) and a leaf carrying a wrong program id (`fold:
+    program`); a gap (the second segment at position 2, `fold:
+    adjacency`); broken continuity (the third segment at position 1,
+    `fold: continuity`, and that fold proved does not verify); a wrong
+    child circuit (a program without the leaves' circuit) and a foreign W
+    (`fold: circuit`), and a child claiming another candidate, none or
+    two; a tampered child preimage, an io-hash limb or a digest word, and
+    a prefix or a run started mid-way claiming the halt or the entry
+    flag (`fold: preimage`), while folding them states neither;
+  - a tampered child proof refused by the native check's piece: the
+    preprocessed and main roots, an output wire and the interaction
+    nonce by `pow`; a claimed sum by `logup`; the composition root and a
+    sample by `oods`; the PoW nonce by `pow`; a queried value by
+    `merkle`; a FRI sibling by `fri`;
+  - the fold's rows pinned by piece, under half of each component.
+- **`recair/tests/compiler.rs`:** the recursion AIR's components compiled:
+  each constraint its recording's at random points over M31 and QM31
+  values, evaluated and emitted; each combination `PointEvaluator`'s;
+  every input moving it.
+- **`test-proof`:** `window_kernel`'s
+  `the_windows_leaves_and_folds_prove_and_verify`: the program finalized,
+  its first four segments and its last verified in their classes' leaves
+  (the leaves now carry the fold circuit's hash as W), then the first
+  four folded in pairs and the two folds folded, each proved and verified
+  against W; the root states the run's first four segments, its entry
+  and no halt. `kernel_shape`'s leaf test takes the fold word as an
+  argument.
+
+### Gates
+
+[measured, under `systemd-run` at 14 GiB with `nice -n 10`,
+`CARGO_INCREMENTAL=0`]
+- **Within the shape:** the fold **32,167 / 42,896 / 4,048** rows
+  finalized, **49.1% / 32.7% / 6.2%** of 2^16 / 2^17 / 2^16 (the model's
+  47% / 32% / 5%), whether its children are leaves or folds: the fixed
+  point at once.
+- **A leaf's memory and time:** the window kernel's root fold over two
+  folds proved in **1.50 s at 942 MiB** of heap, its folds of leaves in
+  1.54 and 1.55 s, as its class-1 leaves in the same run (942 MiB,
+  1.53–1.69 s; their segments 8.0–9.1 s at 4.8 GiB); the small kernel's
+  root in 1.43 s. A fold's heap is a leaf's: both prove the padded shape.
+- **`just check`** green: 1,090 tests (1,079 at 5.12; eleven new); clippy
+  clean, and `vos-pvm-proof`'s with `debug-internals`.
+- **`test-proof`, the suites this step touches:** `window_kernel`'s
+  leaves and folds (59 s), `kernel_shape` (12 tests), `fixtures` and
+  `recursion_seams`, green under 14 GiB with one thread. The rest of
+  `test-proof` was not run: no other prover suite changed.
+
+### Carried to later steps
+
+- **5.14, the wrap:** it checks the root's W against the fold circuit's
+  hash (`FoldCircuit::hash`), its constant, and refuses a root without
+  `first = 0`, the entry flag and the halt flag; its public words are the
+  root's program id and io-hash, as the root's preimage carries them.
+- **Format 32's registry status** stays reserved; its padded shape is
+  pinned (`LEAF_FOLD_LOG_SIZES`), and the wrap decides when the segment
+  verifiers' registry admits it.
+- **The program id's version 3** changes every id; nothing pins one yet
+  outside the tests, which recompute them.
+- **5.15:** the whole window's tree (its 26 segments) and the solvency
+  predicate's, end to end; here the window kernel's first four segments
+  fold.
+
+### Outside the step's files
+
+- `pvm/proof/src/program_id.rs`: the id in two levels (`IdPreimage`,
+  `ID_WORDS`, `MAX_LEAF_CIRCUITS`, `kernel_words`, `kernel_digest`), the
+  golden vector re-pinned.
+- `pvm/proof/src/format.rs`: `LEAF_FOLD_LOG_SIZES`.
+- `pvm/proof/src/verify/recursion.rs`: `replay_stark` and
+  `sample_layout_of`, any AIR's walk and layout, which the segment's
+  `extract_recursion_data` and `sample_layout` now call; `verify.rs` and
+  `lib.rs` export them.
+- `pvm/proof/recair-air/src/lib.rs`: `circuit_hash_prefix`.
+- `pvm/proof/tests/{common/mod.rs,window_kernel.rs,kernel_shape.rs}`:
+  `prove_leaf` takes the fold word, `prove_fold`, `NodeRun`.
+- `justfile`: `test-proof`'s comment names the folds.
+- `docs/design/proving.md` §3.4 (the ends, the padded shape's constant,
+  what was built), §3.6 (the id's two levels), A.7's fold row;
+  `recursion-air.md` §6 (what was built) and §10's step 6;
+  `slice-5-proving.md` 5.13's gate.

@@ -25,7 +25,7 @@ mod recursion;
 pub use recursion::{
     ComponentLayout, ComponentOodsMask, DeepBatch, OodsReconstruction, RecursionData,
     RecursionTranscript, SampleLayout, extract_recursion_data, reconstruct_oods_for_recursion,
-    record_canonical_transcript, sample_layout,
+    record_canonical_transcript, replay_stark, sample_layout, sample_layout_of,
 };
 
 /// Verify a chain of segment proofs. Each segment's final state must match

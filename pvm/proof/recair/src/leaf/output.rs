@@ -17,18 +17,37 @@
 //! | 28..44 | the io-hash, φ9..12's 32 bytes as 16 limbs `b0 + 256·b1` |
 //! | 44..52 | the fold-circuit word W |
 //!
-//! The digest is the leaf sponge over them, as the program id's.
+//! The digest is the leaf sponge over them, as the program id's. A fold
+//! states [`NodeOutput::fold`] of its children's.
 
 use stwo::core::fields::m31::BaseField;
+use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use vos_pvm_proof::SegmentState;
 use vos_pvm_proof::poseidon2::{P2Hash, P2MerkleHasher};
+
+use crate::verifier::witness::pack;
 
 /// The words a state digest hashes.
 pub const STATE_WORDS: usize = 13 * 8 + 4 + 8 + 32;
 
 /// The words a node's output preimage holds.
 pub const PREIMAGE_WORDS: usize = 52;
+
+/// The preimage's fields as wires, four words a wire.
+pub mod preimage {
+    use core::ops::Range;
+
+    pub const PROGRAM: Range<usize> = 0..2;
+    /// `[first, last, entry, halt]`.
+    pub const SCALARS: usize = 2;
+    pub const ENTRY_DIGEST: Range<usize> = 3..5;
+    pub const EXIT_DIGEST: Range<usize> = 5..7;
+    pub const IO_HASH: Range<usize> = 7..11;
+    pub const FOLD_WORD: Range<usize> = 11..13;
+    /// The preimage's wires.
+    pub const WIRES: usize = 13;
+}
 
 /// A state as a state digest takes it: its registers, pc, ts and memory
 /// root.
@@ -135,5 +154,30 @@ impl NodeOutput {
     /// Its digest.
     pub fn digest(&self) -> P2Hash {
         leaf_sponge(&self.preimage())
+    }
+
+    /// Its preimage's wires.
+    pub fn preimage_wires(&self) -> [SecureField; preimage::WIRES] {
+        pack(&self.preimage())
+            .try_into()
+            .expect("the preimage's wires")
+    }
+
+    /// The output a fold of `left` and `right` states: the run from
+    /// `left`'s first segment to `right`'s last, its entry flag and digest
+    /// `left`'s, its halt flag, exit digest and io-hash `right`'s, under
+    /// `left`'s program and fold word.
+    pub fn fold(left: &Self, right: &Self) -> Self {
+        Self {
+            program: left.program,
+            first: left.first,
+            last: right.last,
+            entry: left.entry,
+            halt: right.halt,
+            entry_digest: left.entry_digest,
+            exit_digest: right.exit_digest,
+            io_hash: right.io_hash,
+            fold_word: left.fold_word,
+        }
     }
 }

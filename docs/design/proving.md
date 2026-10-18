@@ -290,15 +290,19 @@ attribution). Its full design is `recursion-air.md`.
   - **adjacency:** `left.last + 1 == right.first`;
   - **continuity:** `left.exit_digest == right.entry_digest`;
   - **the ends:** the entry flag comes from the left, and the halt flag
-    and io-hash from the right.
+    and io-hash from the right, each from its side alone. A fold states
+    a run without an entry or a halt and refuses nothing for it: the
+    flag stays zero, and the wrap refuses the root.
 - **The wrap** checks the root's W against the true fold-circuit hash,
   its constant. Every fold below then carries that hash, so every fold
   child is a leaf of the program or a true fold. The wrap refuses a
   root without `first = 0`, the entry flag and the halt flag, so a
   prefix of a run, or a run started mid-way, cannot fold into a
   statement.
-- **One padded shape for leaves and folds,** a format constant: 2^16 /
-  2^17 / 2^16 rows.
+- **One padded shape for leaves and folds,** a format constant
+  (`LEAF_FOLD_LOG_SIZES`): 2^16 / 2^17 / 2^16 rows. Every child a fold
+  verifies has it, so one circuit verifies a leaf or a fold, and only the
+  preprocessed root, a witness, tells them apart.
   - **The kernel leaf is tight.** At 44 queries over the 8,024-column
     shape, its `p2` is about 64.8k rows of 2^16, about 1% spare, and its
     `qm31` about 111k of 2^17 [model].
@@ -308,6 +312,17 @@ attribution). Its full design is `recursion-air.md`.
   - A fold uses under half of the shape, so a child could grow by about
     3,200 columns before the fold outgrows it.
   - A kernel that does not fit is refused (§3.3).
+- **Built** [measured, slice 5's 5.13; `vos-recair`'s `fold`]:
+  - a child's verification is 16,065 / 21,394 / 2,024 rows (its lifting
+    height 2^19, 17 FRI layers, 486 sampled values at 3 points), and the
+    fold's own work 37 `p2` and 74 `qm31` rows: **32,167 / 42,896 /
+    4,048** finalized, 49.1% / 32.7% / 6.2% of the padded shape, the
+    model's 47% / 32% / 5%;
+  - it proves in **1.5 s at 942 MiB** of heap, a leaf's time and memory,
+    over the window kernel's leaves and over two folds;
+  - the fixed point holds at once: a fold of two children of the padded
+    shape fits the padded shape, and its rows do not depend on whether
+    the children are leaves or folds.
 - **Depth:** the root proof's shape does not depend on the tree's depth.
   Only proving time reveals the segment count, and statements are
   published at the window cadence.
@@ -398,6 +413,13 @@ pub struct Statement {
   - the preprocessed root;
   - the image root;
   - the leaf-circuit hashes.
+
+  It hashes in two levels, so that one fold circuit recomputes every
+  kernel's id: the kernel's digest over everything but the leaf circuits,
+  a run whose length is the kernel's, then the id over a preimage of fixed
+  length, 44 words: that digest, the leaf-circuit slot's version and
+  count, and four hashes (the most classes a shape has), zeros past the
+  count. A fold takes those 44 words as its witness.
 
   The prover role computes it from the install's record of the kernel (its
   hash, image root and shape, the shape's policy version among it; the
@@ -883,7 +905,7 @@ under `systemd-run` with these caps as `MemoryMax`.
 |---|---|---|---|
 | segment (the window kernel's) | its class | ≤ 24 GiB | ≤ 8 s, once the SIMD hasher lands |
 | leaf | ≤ the padded shape | ≤ 4 GiB | 1.2–2.6 s [projected]; ≤ 1× the segment's proving (target 0.13–0.5×) |
-| fold | the padded shape | ≤ 4 GiB | 1.2–2.6 s [projected]; ≤ the leaf's |
+| fold | the padded shape | ≤ 4 GiB; 942 MiB of heap [measured] | 1.2–2.6 s [projected]; ≤ the leaf's; 1.5 s [measured] |
 | wrap | ≤ 2^17 | ≤ 8 GiB unmasked | 4.4–9.5 s [projected] |
 
 A window of 16 segments proves end to end in about 3–5 minutes

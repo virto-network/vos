@@ -471,6 +471,95 @@ fn every_sample_a_chip_reads_moves_its_combination() {
     );
 }
 
+/// The recursion AIR's three components, a fold's child's AIR
+/// (`vos_recair::fold::child`), at the padded shape's log sizes: tests 1
+/// and 2, each compiled constraint its recording's at random points over
+/// M31 and QM31 values, emitted and evaluated, and each component's
+/// combination the verifier's; and test 3, every input moving it.
+#[test]
+fn the_recursion_airs_components_compile_to_their_recordings() {
+    use vos_recair_air::{GateRelation, h8, p2, qm31};
+    let mut channel = Poseidon2M31Channel::default();
+    channel.mix_u64(13);
+    let gate = GateRelation::draw(&mut channel);
+    let relations = vec![RelationChallenges {
+        name: "Gate".into(),
+        z: gate.0.z,
+        alpha_powers: gate.0.alpha_powers.to_vec(),
+    }];
+    let shape = compile::relations_of(&relations);
+    let [p2_log, qm31_log, h8_log] = vos_pvm_proof::format::LEAF_FOLD_LOG_SIZES;
+    let p2 = p2::P2Eval {
+        log_size: p2_log,
+        relation: gate.clone(),
+    };
+    let qm31 = qm31::Qm31Eval {
+        log_size: qm31_log,
+        relation: gate.clone(),
+    };
+    let h8 = h8::H8Eval {
+        log_size: h8_log,
+        relation: gate.clone(),
+    };
+    type Drive<'a> = Box<dyn Fn(PointEvaluator<'_>) -> PointEvaluator<'_> + 'a>;
+    let components: [(Recording, Drive<'_>); 3] = [
+        (Recording::of("p2", &p2), Box::new(|eval| p2.evaluate(eval))),
+        (
+            Recording::of("qm31", &qm31),
+            Box::new(|eval| qm31.evaluate(eval)),
+        ),
+        (Recording::of("h8", &h8), Box::new(|eval| h8.evaluate(eval))),
+    ];
+    let mut rng = Rng::new(19);
+    for (recording, drive) in &components {
+        let compiled = compile::compile(std::slice::from_ref(recording), &shape);
+        for m31 in [true, false] {
+            let point = random_point(recording, &mut rng, m31);
+            let expected = if m31 {
+                recorded_m31(recording, &point, &relations)
+            } else {
+                recorded(recording, &point, &relations)
+            };
+            let inputs = input_values(&compiled, std::slice::from_ref(&point), &relations);
+            assert_eq!(
+                compiled.evaluate(&inputs)[0],
+                expected,
+                "{}",
+                recording.name
+            );
+            assert_eq!(
+                emitted(&compiled, &inputs)[0],
+                expected,
+                "{}",
+                recording.name
+            );
+        }
+        let point = random_point(recording, &mut rng, false);
+        let coeff = rng.qm31();
+        let inputs = input_values(&compiled, std::slice::from_ref(&point), &relations);
+        let rows = compiled.evaluate_rows(&inputs);
+        let honest = compose_values(None, coeff, &compiled.values(&inputs, &rows)[0]);
+        assert_eq!(
+            honest.unwrap(),
+            native(recording, &point, coeff, drive),
+            "{}: the verifier's combination",
+            recording.name
+        );
+        for (i, input) in compiled.inputs.iter().enumerate() {
+            let mut tampered = inputs.clone();
+            tampered[i] += SecureField::one();
+            let moved = compose_values(None, coeff, &retampered(&compiled, &tampered, &rows, i)[0]);
+            assert_ne!(moved, honest, "{}: {input:?} tampered", recording.name);
+        }
+        eprintln!(
+            "{}: {} constraints, {} rows",
+            recording.name,
+            compiled.components[0].constraints.len(),
+            compiled.rows.len()
+        );
+    }
+}
+
 /// Mis-compiled gates, in rows across every chip: a flipped coefficient, a
 /// dropped term, `a` and `b` swapped where their coefficients differ, an
 /// operand re-pointed to its neighbouring input, and a relation's `z` and

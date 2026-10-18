@@ -159,4 +159,49 @@ impl<V: Value> Context<V> {
             b,
         );
     }
+
+    /// `flag·(a − b) = 0`: when `flag` is one, `a` is `b`. Two rows.
+    pub fn assert_eq_if(&mut self, flag: Bit, a: Var, b: Var) {
+        let difference = self.sub(a, b);
+        let zero = self.zero();
+        self.qm31_into(
+            Qm31Op {
+                k_m: BaseField::one(),
+                ..Default::default()
+            },
+            Some(flag.var()),
+            Some(difference),
+            None,
+            zero,
+        );
+    }
+
+    /// `Σ_j lanes_j·wire_j`, an M31 as a wire.
+    pub fn lane_sum(&mut self, wire: Var, lanes: [u32; 4]) -> Var {
+        self.qm31(
+            Qm31Op {
+                lanes: lanes.map(BaseField::from),
+                ..Default::default()
+            },
+            None,
+            None,
+            Some(wire),
+        )
+    }
+
+    /// Lane `j` of `wire` equals the M31 wire `value`.
+    pub fn assert_lane(&mut self, wire: Var, j: usize, value: Var) {
+        let mut lanes = [BaseField::zero(); 4];
+        lanes[j] = BaseField::one();
+        self.qm31_into(
+            Qm31Op {
+                lanes,
+                ..Default::default()
+            },
+            None,
+            None,
+            Some(wire),
+            value,
+        );
+    }
 }

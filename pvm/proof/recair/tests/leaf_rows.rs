@@ -64,7 +64,8 @@ fn runs(
 }
 
 /// The derivation's tables are the AIR's: each chip's columns, masks,
-/// relations and compiled gates, and each relation's tuple size.
+/// relations and compiled gates, each relation's tuple size, and the
+/// format's parameters and padded shape.
 #[test]
 fn the_tables_are_the_airs() {
     let log_sizes = vec![12; chip_idx::COUNT];
@@ -123,6 +124,7 @@ fn the_tables_are_the_airs() {
             "{name}"
         );
     }
+    assert_eq!(leaf::PADDED, vos_recair::leaf::PADDED_ROWS);
     assert_eq!(SEGMENT.params.n_queries, leaf::QUERIES);
     assert_eq!(SEGMENT.params.log_blowup, 2);
     assert_eq!(SEGMENT.params.fold_step, 1);
@@ -143,11 +145,11 @@ fn built(mask: u32, log_sizes: &[u32]) -> (Context<NoValue>, (usize, usize, usiz
     let mut context = Context::<NoValue>::with_outputs(2);
     let wires = leaf.verify(&mut context, &LeafValues::blank(&leaf.shape));
     context.set_outputs(&wires.digest);
-    let (blocks, singles, _) = leaf.shape.deep.counts();
+    let (blocks, singles, _) = leaf.shape.stark.deep.counts();
     let finalized = context.finalized_rows();
     (
         context,
-        (leaf.shape.deep.points.len(), blocks, singles),
+        (leaf.shape.stark.deep.points.len(), blocks, singles),
         finalized,
     )
 }

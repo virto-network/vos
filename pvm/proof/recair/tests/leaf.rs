@@ -27,53 +27,16 @@ use stwo::core::fields::qm31::SecureField;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
 use vos_pvm_proof::poseidon2::P2Hash;
-use vos_pvm_proof::program_id::{ENTRY_TIMESTAMP, HALT_PC};
+use vos_pvm_proof::program_id::HALT_PC;
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::{Proof, RecursionData, extract_recursion_data, prove_canonical_format};
 use vos_recair::leaf::{LeafCircuit, LeafValues, NodeOutput, PADDED_ROWS, State};
 use vos_recair::verifier::SegmentShape;
 use vos_recair::{Context, NoValue, Value};
 
-/// The kernel's io-hash words, φ9..12; φ12's sign-extends, so its high
-/// bytes are 0xff.
-const IO: [u32; 4] = [0x4433_2211, 0x0807_0605, 0x7f00_00ff, 0x9abc_def0];
+mod common;
 
-/// A standard program that sets φ8, the output's length, to 0 and φ9..12
-/// to [`IO`], then returns to φ0, the halt address.
-fn blob() -> Vec<u8> {
-    let mut code = Vec::new();
-    let mut bitmask = Vec::new();
-    for (register, value) in [(8u8, 0u32)].into_iter().chain((9..13).zip(IO)) {
-        code.extend_from_slice(&[51, register]);
-        code.extend_from_slice(&value.to_le_bytes());
-        bitmask.extend_from_slice(&[1, 0, 0, 0, 0, 0]);
-    }
-    code.extend_from_slice(&[50, 0]);
-    bitmask.extend_from_slice(&[1, 0]);
-    vos_pvm_program::build_standard_program(&vos_pvm_program::StandardProgram {
-        ro_data: vec![],
-        rw_data: vec![],
-        heap_pages: 1,
-        stack_size: 4096,
-        code: vos_pvm_program::CodeBlob {
-            jump_table: vec![],
-            code,
-            bitmask,
-        },
-    })
-    .expect("a standard program")
-}
-
-/// The state the kernel's run starts at, from the loader's layout.
-fn entry(blob: &[u8]) -> State {
-    let program = vos_pvm_program::parse_standard_program(blob).expect("standard");
-    State {
-        registers: program.layout(&[]).expect("lays out").registers,
-        pc: 0,
-        timestamp: ENTRY_TIMESTAMP,
-        memory_root: program.image_root().expect("an image root"),
-    }
-}
+use common::kernel::{IO, blob, entry};
 
 /// A segment's proof, its leaf circuit and the native verifier's record.
 struct Segment {

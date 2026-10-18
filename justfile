@@ -36,8 +36,8 @@ vectors:
 # Prover integration suites, including the soundness gates behind
 # `debug-internals`, the re-runs of the test actors' kernels from their
 # attests on the agent's model, the settlement window's kernel proved over
-# its shape, the kernels' leaves proved on the recursion AIR, and the
-# fixtures checked against their generator.
+# its shape, the kernels' leaves and the window kernel's folds proved on
+# the recursion AIR, and the fixtures checked against their generator.
 # Memory-heavy: two threads fit under a 24 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among

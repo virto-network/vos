@@ -476,7 +476,10 @@ fn a_predicates_leaf_proves_and_verifies() {
     .expect("the kernel's program");
     assert_eq!(entry, kernel.entry());
     let proof = prove_shaped(&mut kernel.whole(), &shape, &SEGMENT).unwrap();
-    let leaf = common::prove_leaf(&program, &entry, 0, &proof, 0);
+    let fold_word = vos_pvm_proof::poseidon2::P2Hash(core::array::from_fn(|i| {
+        stwo::core::fields::m31::BaseField::from(7_000 + i as u32)
+    }));
+    let leaf = common::prove_leaf(&program, &entry, 0, &proof, 0, fold_word);
     eprintln!(
         "areas: {} chips; its leaf {:?} rows ({:?} finalized), proved in {:.2}s, its peak \
          heap {} MiB",

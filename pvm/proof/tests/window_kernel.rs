@@ -9,8 +9,10 @@
 //! pseudo-account pairs among them. The method runs live on the agent's
 //! reference model; its kernel re-runs from the attest to the same output,
 //! proves over its shape on the segment format, and verifies as a chain
-//! against its program, its io-hash the run's. Its first, second and last
-//! segments verify in their classes' leaves, which prove and verify.
+//! against its program, its io-hash the run's. Its first four segments and
+//! its last verify in their classes' leaves, which prove and verify; the
+//! first four's leaves fold into a tree, two folds of two leaves and a fold
+//! of the two folds, each proved and verified.
 
 mod common;
 
@@ -571,16 +573,22 @@ fn prove_at_first_class(
     panic!("no class holds [{a}, {b})")
 }
 
-/// The window's kernel's leaves: its program finalized with its leaf
-/// circuits; its first segment (the entry's, class 0), its second (a class-1
-/// window of the 32k cut) and its last (class 0, the halt), each verified in
-/// its class's leaf as natively, the leaf within the padded shape, proved
-/// and verified. The first states the entry, the last the halt and the
-/// run's io-hash; the first's exit digest is the second's entry digest. The
-/// class-1 leaf proves in at most 4 GiB of heap and in at most the time of
-/// its segment's proving.
+/// The window's kernel's leaves and folds: its program finalized with its
+/// leaf circuits; its first four segments (the entry's, class 0, then
+/// class-1 windows of the 32k cut) and its last (class 0, the halt), each
+/// verified in its class's leaf as natively, the leaf within the padded
+/// shape, proved and verified. The first states the entry, the last the
+/// halt and the run's io-hash; the first's exit digest is the second's
+/// entry digest. A class-1 leaf proves in at most 4 GiB of heap and in at
+/// most the time of its segment's proving.
+///
+/// The first four leaves fold: two folds of two leaves, then a fold of the
+/// two folds, the root of the run's first four segments, each within the
+/// padded shape, proved and verified against the fold circuit's hash. The
+/// root proves in at most 4 GiB of heap, as a leaf, and in at most the
+/// time of a class-1 segment's proving.
 #[test]
-fn the_windows_leaves_prove_and_verify() {
+fn the_windows_leaves_and_folds_prove_and_verify() {
     let instance = instance();
     let kernel = run(&instance.arguments.encode());
     let trace = traced(&kernel);
@@ -603,12 +611,16 @@ fn the_windows_leaves_prove_and_verify() {
     let bounds =
         segment_bounds_budgeted(&trace.side_note, 1 << cut.log_steps, usize::from(cut.pages));
     let last = bounds.len() - 1;
+    let fold = vos_recair::fold::FoldCircuit::new();
+    let (word, elapsed, _) = common::measured(|| fold.hash());
+    eprintln!("the fold circuit's hash in {:.1}s", elapsed.as_secs_f64());
     let mut cursor = SegmentCursor::new(&trace.side_note);
-    let mut outputs = Vec::new();
-    for position in [0, 1, last] {
+    let mut leaves = Vec::new();
+    let mut slowest = std::time::Duration::ZERO;
+    for position in [0, 1, 2, 3, last] {
         let ((class, proof), segment, segment_peak) =
             common::measured(|| prove_at_first_class(&mut cursor, bounds[position], &program));
-        let leaf = common::prove_leaf(&program, &entry, class, &proof, position as u32);
+        let leaf = common::prove_leaf(&program, &entry, class, &proof, position as u32, word);
         eprintln!(
             "segment {position} ({:?}, class {class}) proved in {:.2}s, its peak heap \
              {segment_peak} MiB; its leaf: {:?} rows ({:?} finalized), proved in {:.2}s ({:.2}× \
@@ -628,16 +640,54 @@ fn the_windows_leaves_prove_and_verify() {
                 "{:?} against {segment:?}",
                 leaf.proving
             );
+            slowest = slowest.max(segment);
         }
-        outputs.push((class, leaf.output));
+        leaves.push((class, leaf));
     }
-    let [(_, first), (second_class, second), (_, end)] = outputs[..] else {
+    let outputs: Vec<_> = leaves
+        .iter()
+        .map(|(class, leaf)| (*class, leaf.output))
+        .collect();
+    let [(_, first), (second_class, second), .., (_, end)] = outputs[..] else {
         unreachable!()
     };
     assert_eq!(second_class, CUT, "the second segment is a class-1 window");
     assert!(first.entry && !first.halt);
     assert!(!second.entry && !second.halt);
     assert!(!end.entry && end.halt);
+
+    // The tree over the first four segments.
+    let pairs = [
+        common::prove_fold(&fold, &program, &leaves[0].1, &leaves[1].1, word),
+        common::prove_fold(&fold, &program, &leaves[2].1, &leaves[3].1, word),
+    ];
+    let root = common::prove_fold(&fold, &program, &pairs[0], &pairs[1], word);
+    for (name, run) in [
+        ("the fold of leaves 0 and 1", &pairs[0]),
+        ("the fold of leaves 2 and 3", &pairs[1]),
+        ("the fold of the two folds", &root),
+    ] {
+        eprintln!(
+            "{name}: {:?} rows ({:?} finalized), proved in {:.2}s, its peak heap {} MiB",
+            run.rows,
+            run.finalized,
+            run.proving.as_secs_f64(),
+            run.peak_mib,
+        );
+    }
+    assert!(root.peak_mib <= 4 << 10, "{} MiB", root.peak_mib);
+    assert!(
+        root.proving <= slowest,
+        "{:?} against {slowest:?}",
+        root.proving
+    );
+    let root = root.output;
+    assert_eq!((root.first, root.last), (0, 3));
+    assert!(root.entry && !root.halt, "a prefix of the run");
+    assert_eq!(root.entry_digest, first.entry_digest);
+    assert_eq!(root.exit_digest, outputs[3].1.exit_digest);
+    assert_eq!(root.program.0, program.id().0);
+    assert_eq!(root.fold_word, word);
     assert_eq!(first.exit_digest, second.entry_digest);
     assert_eq!(end.io_hash, trace.io_hash);
 }

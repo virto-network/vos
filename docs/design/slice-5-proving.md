@@ -623,6 +623,29 @@ M0's milestone review left these before the recursion builds on them.
     word, a leaf carrying a wrong program id.
 - **Gate:** a fold verifies two folds within the shape, at the memory and
   time of a leaf (≤ 4 GiB, expected 1.2–2.6 s).
+- **Gate passed** [measured, 5.13; `vos-recair`'s `fold`]:
+  - **the fold circuit,** one for every program: two children of the
+    padded shape verified with 5.10's pieces over the recursion AIR (its
+    components compiled by 5.9's compiler), each child's preimage
+    re-hashed to its committed output, its circuit hash recomputed from
+    its preprocessed root and chosen among the program's leaf circuits
+    and W, the program id recomputed from its 44-word preimage (the id
+    now hashes in two levels, so its preimage has one length for every
+    kernel), adjacency, continuity and the ends;
+  - **32,167 / 42,896 / 4,048** rows finalized, 49.1% / 32.7% / 6.2% of
+    the padded shape (the model's 47% / 32% / 5%), the fixed point at
+    once; proved in **1.5 s at 942 MiB** of heap, a leaf's;
+  - **the window kernel's tree:** its first four segments' leaves folded
+    in pairs, then the two folds, each proved and verified against the
+    fold circuit's hash; and a small kernel's run of four segments, the
+    same tree, its root stating the whole run;
+  - each refusal by its intended check, in `just check`: a wrong program
+    and a leaf carrying a wrong program id (`fold: program`), a gap
+    (`fold: adjacency`), broken continuity (`fold: continuity`, and the
+    fold proved does not verify), a wrong child circuit and a foreign W
+    (`fold: circuit`), a tampered child preimage (`fold: preimage`); a
+    prefix and a mid-run start state no halt and no entry, and claiming
+    one is the preimage's re-hash's refusal.
 - **Estimate:** 2–3 weeks.
 
 ### 5.14 The final wrap (F)

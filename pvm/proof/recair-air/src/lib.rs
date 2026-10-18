@@ -32,7 +32,7 @@ use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
 
 pub use gate::GateRelation;
-use vos_pvm_poseidon2::{Digest, Transcript, u32_limbs, u64_limbs};
+use vos_pvm_poseidon2::{Digest, M31, Transcript, u32_limbs, u64_limbs};
 
 /// The components' log sizes, in the order [`p2`], [`qm31`], [`h8`].
 pub type LogSizes = [u32; 3];
@@ -63,6 +63,16 @@ pub fn circuit_hash(
     log_sizes: &LogSizes,
     preprocessed_root: &Digest,
 ) -> Digest {
+    let mut words = circuit_hash_prefix(format, params, log_sizes);
+    words.extend(preprocessed_root);
+    let mut transcript = Transcript::default();
+    transcript.absorb(&words, &mut ());
+    *transcript.digest()
+}
+
+/// The words [`circuit_hash`] absorbs before the preprocessed root: the
+/// domain, the format, its parameters and the log sizes, 28 of them.
+pub fn circuit_hash_prefix(format: u32, params: [u32; 6], log_sizes: &LogSizes) -> Vec<M31> {
     let mut words = Vec::new();
     for word in CIRCUIT_HASH_DOMAIN {
         words.extend(u64_limbs(word));
@@ -73,10 +83,7 @@ pub fn circuit_hash(
     {
         words.extend(u32_limbs(value));
     }
-    words.extend(preprocessed_root);
-    let mut transcript = Transcript::default();
-    transcript.absorb(&words, &mut ());
-    *transcript.digest()
+    words
 }
 
 /// Every column's id in the preprocessed tree, in commitment order: [`p2`]'s,

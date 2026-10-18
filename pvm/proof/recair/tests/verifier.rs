@@ -46,8 +46,7 @@ use vos_recair::verifier::circle::{Point, domain_point};
 use vos_recair::verifier::fri::{FriCommitment, verify_query};
 use vos_recair::verifier::logup::{BoundaryRelations, Challenges};
 use vos_recair::verifier::merkle::{ExpandError, expand_decommitment, verify_opening};
-use vos_recair::verifier::segment::preprocessed_bits;
-use vos_recair::verifier::shape::CompiledInput;
+use vos_recair::verifier::stark::{CompiledInput, preprocessed_bits};
 use vos_recair::verifier::witness::digest_wires;
 use vos_recair::verifier::{
     SegmentShape, SegmentValues, ShapeMismatch, WitnessError, deep, logup, oods, verify_segment,
@@ -80,7 +79,7 @@ impl Real {
     fn drawn(&self) -> Vec<usize> {
         let n = self.shape.config().fri_config.n_queries;
         let records = &self.data.transcript.records;
-        let mask = (1usize << self.shape.layout.lifting_log_size) - 1;
+        let mask = (1usize << self.shape.stark.layout.lifting_log_size) - 1;
         records[records.len() - n.div_ceil(8)..]
             .iter()
             .flat_map(|record| record.output[..8].iter().map(|w| w.0 as usize & mask))
@@ -101,6 +100,7 @@ impl Real {
         let native = self.data.lookup_elements.relation_challenges();
         let records = &self.data.transcript.records;
         self.shape
+            .stark
             .relations
             .iter()
             .map(|name| {
@@ -282,11 +282,11 @@ fn the_fixture_verifies_in_a_circuit_as_natively() {
     let real = fixture();
     let context = verifies_as_natively(real);
     print_rows("the fixture's circuit", &context);
-    let (blocks, singles, samples) = real.shape.deep.counts();
+    let (blocks, singles, samples) = real.shape.stark.deep.counts();
     eprintln!(
         "DEEP: {samples} samples at {} points; a query's chains {blocks} h8 blocks and {singles} \
          single samples",
-        real.shape.deep.points.len()
+        real.shape.stark.deep.points.len()
     );
 
     // The wiring built without values is the filled one's.
@@ -339,54 +339,56 @@ fn every_tamper_is_refused_by_its_check() {
         cases.push((name, piece, values));
     };
     add("a Merkle sibling", "merkle", &|v| {
-        bump(&mut v.queries[3].trees[1].path[5][0])
+        bump(&mut v.stark.queries[3].trees[1].path[5][0])
     });
     add("a preprocessed sibling", "merkle", &|v| {
-        bump(&mut v.queries[9].trees[0].path[0][1])
+        bump(&mut v.stark.queries[9].trees[0].path[0][1])
     });
     add("a queried value", "merkle", &|v| {
-        bump(&mut v.queries[7].trees[2].leaf[10])
+        bump(&mut v.stark.queries[7].trees[2].leaf[10])
     });
     add("a composition value", "merkle", &|v| {
-        bump(&mut v.queries[1].trees[3].leaf[1])
+        bump(&mut v.stark.queries[1].trees[3].leaf[1])
     });
     add("a FRI layer value", "fri", &|v| {
-        bump(&mut v.queries[0].fri[3].sibling)
+        bump(&mut v.stark.queries[0].fri[3].sibling)
     });
     add("a FRI path node", "fri", &|v| {
-        bump(&mut v.queries[5].fri[2].path[1][1])
+        bump(&mut v.stark.queries[5].fri[2].path[1][1])
     });
-    add("a FRI root", "pow", &|v| bump(&mut v.fri_roots[4][0]));
+    add("a FRI root", "pow", &|v| bump(&mut v.stark.fri_roots[4][0]));
     add("the last layer's coefficient", "pow", &|v| {
-        bump(&mut v.last_layer)
+        bump(&mut v.stark.last_layer)
     });
-    add("the PoW nonce", "pow", &|v| bump(&mut v.nonce));
+    add("the PoW nonce", "pow", &|v| bump(&mut v.stark.nonce));
     add("the interaction PoW nonce", "pow", &|v| {
-        bump(&mut v.interaction_nonce)
+        bump(&mut v.stark.interaction_nonce)
     });
-    add("a claimed sum", "logup", &|v| bump(&mut v.claimed_sums[2]));
+    add("a claimed sum", "logup", &|v| {
+        bump(&mut v.stark.claimed_sums[2])
+    });
     add("a header word", "shape", &|v| bump(&mut v.header[11]));
     let running_sum = {
-        let component = &real.shape.layout.components[0];
+        let component = &real.shape.stark.layout.components[0];
         let column = component.interaction_columns.end - 1;
-        real.shape.sample_index[2][column] + 1
+        real.shape.stark.sample_index[2][column] + 1
     };
     add("an OODS sample", "oods", &move |v| {
-        bump(&mut v.sampled[running_sum])
+        bump(&mut v.stark.sampled[running_sum])
     });
-    let composition = real.shape.sample_index[3][5];
+    let composition = real.shape.stark.sample_index[3][5];
     add("a composition sample", "oods", &move |v| {
-        bump(&mut v.sampled[composition])
+        bump(&mut v.stark.sampled[composition])
     });
     // Each committed root: the main root precedes the interaction PoW; the
     // interaction root, the composition coefficient and the OODS point; the
     // composition root, the OODS point.
-    add("the main root", "pow", &|v| bump(&mut v.roots[0][0]));
+    add("the main root", "pow", &|v| bump(&mut v.stark.roots[0][0]));
     add("the interaction root", "oods", &|v| {
-        bump(&mut v.roots[1][1])
+        bump(&mut v.stark.roots[1][1])
     });
     add("the composition root", "oods", &|v| {
-        bump(&mut v.roots[2][0])
+        bump(&mut v.stark.roots[2][0])
     });
 
     // A boundary byte, its interaction PoW reground natively: the public
@@ -403,7 +405,7 @@ fn every_tamper_is_refused_by_its_check() {
             .map(|&b| BaseField::from(b as u32))
             .collect::<Vec<_>>(),
     )[0];
-    values.interaction_nonce = u64_wire(regrind_interaction(real, &bytes));
+    values.stark.interaction_nonce = u64_wire(regrind_interaction(real, &bytes));
     cases.push(("a boundary byte", "logup", values));
 
     for (name, piece, values) in &cases {
@@ -429,14 +431,14 @@ fn regrind_interaction(real: &Real, bytes: &[u8]) -> u64 {
     let mut channel = Poseidon2M31Channel::default();
     vos_pvm_proof::proof::mix_statement_header(
         &mut channel,
-        real.shape.format.number,
+        real.shape.stark.format.number,
         &real.shape.config(),
         &real.shape.log_sizes,
     );
     P2MerkleChannel::mix_root(&mut channel, stark.commitments[0]);
     P2MerkleChannel::mix_root(&mut channel, stark.commitments[1]);
     channel.mix_bytes(bytes);
-    let bits = real.shape.format.interaction_pow_bits();
+    let bits = real.shape.stark.format.interaction_pow_bits();
     (0..)
         .find(|&nonce| channel.verify_pow_nonce(bits, nonce))
         .unwrap()
@@ -448,7 +450,7 @@ fn regrind_interaction(real: &Real, bytes: &[u8]) -> u64 {
 fn a_tampered_witness_proved_is_refused() {
     let real = fixture();
     let mut values = real.values.clone();
-    bump(&mut values.queries[3].trees[1].path[5][0]);
+    bump(&mut values.stark.queries[3].trees[1].path[5][0]);
     let mut context = Context::<SecureField>::new().lenient();
     verify_segment(&mut context, &real.shape, &values);
     assert!(!context.mismatches().is_empty());
@@ -518,9 +520,9 @@ fn a_shape_the_native_verifier_refuses_builds_no_circuit() {
     for real in [fixture(), full_shape()] {
         assert_eq!(
             vos_pvm_proof::proof::format_security_bits(
-                real.shape.format,
+                real.shape.stark.format,
                 &real.shape.config(),
-                &real.shape.layout.security_shape
+                &real.shape.stark.layout.security_shape
             ),
             Ok(vos_pvm_proof_verifier::proof_security_bits(&real.proof).unwrap())
         );
@@ -563,14 +565,14 @@ fn values_of_another_structure_are_refused() {
         (
             "FRI layers",
             Box::new(|v| {
-                v.queries[4].fri.pop();
+                v.stark.queries[4].fri.pop();
             }),
         ),
         (
             "FRI roots",
             Box::new(|v| {
-                v.fri_roots.pop();
-                for query in &mut v.queries {
+                v.stark.fri_roots.pop();
+                for query in &mut v.stark.queries {
                     query.fri.pop();
                 }
             }),
@@ -584,25 +586,25 @@ fn values_of_another_structure_are_refused() {
         (
             "claimed sums",
             Box::new(|v| {
-                v.claimed_sums.pop();
+                v.stark.claimed_sums.pop();
             }),
         ),
         (
             "sampled values",
             Box::new(|v| {
-                v.sampled.pop();
+                v.stark.sampled.pop();
             }),
         ),
         (
             "queries",
             Box::new(|v| {
-                v.queries.pop();
+                v.stark.queries.pop();
             }),
         ),
         (
             "tree path nodes",
             Box::new(|v| {
-                v.queries[2].trees[1].path.pop();
+                v.stark.queries[2].trees[1].path.pop();
             }),
         ),
     ];
@@ -629,16 +631,19 @@ fn values_of_another_structure_are_refused() {
 #[test]
 fn a_position_drawn_twice_is_opened_twice() {
     let real = fixture();
-    let lifting = real.shape.layout.lifting_log_size;
+    let lifting = real.shape.stark.layout.lifting_log_size;
     let mut drawn = real.drawn();
     let (first, repeat) = (3, 11);
     drawn[repeat] = drawn[first];
     let values =
         SegmentValues::with_draws(&real.shape, &real.proof, &drawn).expect("the proof's values");
-    assert_eq!(values.queries[repeat], real.values.queries[first]);
-    for (q, query) in values.queries.iter().enumerate() {
+    assert_eq!(
+        values.stark.queries[repeat],
+        real.values.stark.queries[first]
+    );
+    for (q, query) in values.stark.queries.iter().enumerate() {
         if q != repeat {
-            assert_eq!(*query, real.values.queries[q], "query {q}");
+            assert_eq!(*query, real.values.stark.queries[q], "query {q}");
         }
     }
 
@@ -647,6 +652,7 @@ fn a_position_drawn_twice_is_opened_twice() {
     };
     let mut context = Context::<SecureField>::new().lenient();
     let fri_roots = values
+        .stark
         .fri_roots
         .iter()
         .map(|&root| context.guess_pair(root))
@@ -660,13 +666,13 @@ fn a_position_drawn_twice_is_opened_twice() {
     let commitment = FriCommitment {
         roots: fri_roots,
         alphas,
-        last_layer: context.guess(values.last_layer),
+        last_layer: context.guess(values.stark.last_layer),
     };
-    for (&position, query) in drawn.iter().zip(&values.queries) {
+    for (&position, query) in drawn.iter().zip(&values.stark.queries) {
         let bits = bits_of(&mut context, position, lifting);
         for (tree, opening) in query.trees.iter().enumerate() {
             let tree_bits = if tree == 0 {
-                preprocessed_bits(&bits, real.shape.heights[0])
+                preprocessed_bits(&bits, real.shape.stark.heights[0])
             } else {
                 bits.clone()
             };
@@ -675,7 +681,7 @@ fn a_position_drawn_twice_is_opened_twice() {
             verify_opening(
                 &mut context,
                 &wires,
-                real.shape.leaf_order[tree].len(),
+                real.shape.stark.leaf_order[tree].len(),
                 &tree_bits,
                 &opening.path,
                 root,
@@ -789,8 +795,8 @@ fn expand_decommitment_gives_each_query_its_path() {
         unreachable!()
     };
     let tree = 1;
-    let height = real.shape.heights[tree];
-    let order = &real.shape.leaf_order[tree];
+    let height = real.shape.stark.heights[tree];
+    let order = &real.shape.stark.leaf_order[tree];
     let leaf = |index: usize| {
         let row: Vec<BaseField> = order
             .iter()
@@ -840,10 +846,15 @@ fn the_merkle_openings_accept_and_refuse() {
     let StarkProofAny::Poseidon2M31(stark) = &real.proof.stark_proof else {
         unreachable!()
     };
-    let lifting = real.shape.layout.lifting_log_size;
+    let lifting = real.shape.stark.layout.lifting_log_size;
     let open = |tamper: Option<(usize, bool)>| {
         let mut context = Context::<SecureField>::new().lenient();
-        for (q, (&position, query)) in real.drawn().iter().zip(&real.values.queries).enumerate() {
+        for (q, (&position, query)) in real
+            .drawn()
+            .iter()
+            .zip(&real.values.stark.queries)
+            .enumerate()
+        {
             let bits = bits_of(&mut context, position, lifting);
             for (tree, opening) in query.trees.iter().enumerate() {
                 let mut opening = opening.clone();
@@ -854,7 +865,7 @@ fn the_merkle_openings_accept_and_refuse() {
                     bump(&mut opening.leaf[0]);
                 }
                 let tree_bits = if tree == 0 {
-                    preprocessed_bits(&bits, real.shape.heights[0])
+                    preprocessed_bits(&bits, real.shape.stark.heights[0])
                 } else {
                     bits.clone()
                 };
@@ -863,7 +874,7 @@ fn the_merkle_openings_accept_and_refuse() {
                 verify_opening(
                     &mut context,
                     &wires,
-                    real.shape.leaf_order[tree].len(),
+                    real.shape.stark.leaf_order[tree].len(),
                     &tree_bits,
                     &opening.path,
                     root,
@@ -884,11 +895,12 @@ fn the_merkle_openings_accept_and_refuse() {
 #[test]
 fn fri_accepts_and_refuses() {
     let real = fixture();
-    let lifting = real.shape.layout.lifting_log_size;
+    let lifting = real.shape.stark.layout.lifting_log_size;
     let run = |tamper: &str| {
         let mut context = Context::<SecureField>::new().lenient();
         let roots = real
             .values
+            .stark
             .fri_roots
             .iter()
             .map(|&root| context.guess_pair(root))
@@ -899,7 +911,7 @@ fn fri_accepts_and_refuses() {
             .iter()
             .map(|&alpha| context.guess(alpha))
             .collect();
-        let mut last = real.values.last_layer;
+        let mut last = real.values.stark.last_layer;
         if tamper == "last" {
             bump(&mut last);
         }
@@ -908,7 +920,12 @@ fn fri_accepts_and_refuses() {
             alphas,
             last_layer: context.guess(last),
         };
-        for (q, (&position, query)) in real.drawn().iter().zip(&real.values.queries).enumerate() {
+        for (q, (&position, query)) in real
+            .drawn()
+            .iter()
+            .zip(&real.values.stark.queries)
+            .enumerate()
+        {
             let bits = bits_of(&mut context, position, lifting);
             let point = domain_point(&mut context, lifting, &bits);
             let mut first = real.first_layer(position);
@@ -937,7 +954,7 @@ fn fri_accepts_and_refuses() {
         assert!(!run(tamper).is_empty(), "{tamper}");
     }
     // The last layer: every query's last fold is refused.
-    assert_eq!(run("last").len(), real.values.queries.len());
+    assert_eq!(run("last").len(), real.values.stark.queries.len());
 }
 
 /// DEEP alone, from the native sampled values, coefficient and OODS point:
@@ -946,10 +963,10 @@ fn fri_accepts_and_refuses() {
 #[test]
 fn deep_is_the_native_quotient() {
     let real = fixture();
-    let lifting = real.shape.layout.lifting_log_size;
+    let lifting = real.shape.stark.layout.lifting_log_size;
     let run = |tamper: &str| {
         let mut context = Context::<SecureField>::new();
-        let mut sampled_values = real.values.sampled.clone();
+        let mut sampled_values = real.values.stark.sampled.clone();
         if tamper == "sample" {
             bump(&mut sampled_values[100]);
         }
@@ -959,9 +976,14 @@ fn deep_is_the_native_quotient() {
             y: context.guess(real.data.oods_point.y),
         };
         let alpha = context.guess(real.data.deep_coeff);
-        let constants = deep::prepare(&mut context, &real.shape.deep, oods, alpha, &sampled);
+        let constants = deep::prepare(&mut context, &real.shape.stark.deep, oods, alpha, &sampled);
         let mut moved = 0;
-        for (q, (&position, query)) in real.drawn().iter().zip(&real.values.queries).enumerate() {
+        for (q, (&position, query)) in real
+            .drawn()
+            .iter()
+            .zip(&real.values.stark.queries)
+            .enumerate()
+        {
             let bits = bits_of(&mut context, position, lifting);
             let point = domain_point(&mut context, lifting, &bits);
             let leaves: Vec<Vec<Var>> = query
@@ -978,7 +1000,7 @@ fn deep_is_the_native_quotient() {
                 .collect();
             let answer = deep::answer(
                 &mut context,
-                &real.shape.deep,
+                &real.shape.stark.deep,
                 &constants,
                 point,
                 [&leaves[0], &leaves[1], &leaves[2], &leaves[3]],
@@ -991,7 +1013,7 @@ fn deep_is_the_native_quotient() {
     };
     assert_eq!(run(""), 0);
     assert_eq!(run("queried"), 1);
-    assert_eq!(run("sample"), real.values.queries.len());
+    assert_eq!(run("sample"), real.values.stark.queries.len());
 }
 
 /// The composition check alone, from the native values: accepted; an OODS
@@ -1000,7 +1022,7 @@ fn deep_is_the_native_quotient() {
 fn oods_accepts_and_refuses() {
     let real = fixture();
     let challenges = real.challenges();
-    let inputs = real.shape.compiled_inputs();
+    let inputs = real.shape.stark.compiled_inputs();
     let run = |tamper: Option<usize>| {
         let mut context = Context::<SecureField>::new().lenient();
         let wires: Vec<Var> = inputs
@@ -1008,8 +1030,8 @@ fn oods_accepts_and_refuses() {
             .enumerate()
             .map(|(i, input)| {
                 let mut value = match *input {
-                    CompiledInput::Sample(index) => real.values.sampled[index],
-                    CompiledInput::ClaimedSum(chip) => real.values.claimed_sums[chip],
+                    CompiledInput::Sample(index) => real.values.stark.sampled[index],
+                    CompiledInput::ClaimedSum(chip) => real.values.stark.claimed_sums[chip],
                     CompiledInput::Challenge(r, k) => challenges[r][k],
                 };
                 if tamper == Some(i) {
@@ -1024,15 +1046,15 @@ fn oods_accepts_and_refuses() {
             y: context.guess(real.data.oods_point.y),
         };
         let composition = core::array::from_fn(|c| {
-            context.guess(real.values.sampled[real.shape.sample_index[3][c]])
+            context.guess(real.values.stark.sampled[real.shape.stark.sample_index[3][c]])
         });
         oods::check(
             &mut context,
-            &real.shape.compiled,
+            &real.shape.stark.compiled,
             &wires,
             coeff,
             oods_point,
-            real.shape.layout.max_log_degree_bound,
+            real.shape.stark.layout.max_log_degree_bound,
             composition,
         );
         context.mismatches().len()
@@ -1060,6 +1082,7 @@ fn the_logup_sums_accept_and_refuse() {
         let mut context = Context::<SecureField>::new().lenient();
         let claimed: Vec<Var> = real
             .values
+            .stark
             .claimed_sums
             .iter()
             .enumerate()

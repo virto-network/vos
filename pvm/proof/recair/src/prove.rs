@@ -101,7 +101,7 @@ impl core::fmt::Display for ProveError {
 impl std::error::Error for ProveError {}
 
 /// The format's parameters as the circuit hash takes them.
-fn hashed_params(format: &Format) -> [u32; 6] {
+pub(crate) fn hashed_params(format: &Format) -> [u32; 6] {
     let params = format.params;
     [
         params.log_blowup,
@@ -234,7 +234,10 @@ pub fn prove_with(
 
 /// Each tree's column log sizes, the preprocessed tree's in its commitment
 /// order.
-fn committed_log_sizes(components: &Components, log_sizes: &LogSizes) -> TreeVec<Vec<u32>> {
+pub(crate) fn committed_log_sizes(
+    components: &Components,
+    log_sizes: &LogSizes,
+) -> TreeVec<Vec<u32>> {
     let mut sizes = TreeVec::concat_cols(
         components
             .as_dyn()

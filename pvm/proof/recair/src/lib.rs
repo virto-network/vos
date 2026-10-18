@@ -14,14 +14,19 @@
 //!   sponge, the Merkle node and the transcript.
 //! - [`compile`] turns a component's constraints into `qm31` rows that
 //!   evaluate them at the OODS point, as the native verifier does.
-//! - [`verifier`] verifies a segment proof in a circuit, piece by piece:
-//!   the channel, Merkle openings, FRI, DEEP, OODS and the logup sums.
+//! - [`verifier`] verifies a proof in a circuit, piece by piece: the
+//!   channel, Merkle openings, FRI, DEEP, OODS and the logup sums; a segment
+//!   proof's prefix, and what every AIR's verifier shares.
 //! - [`leaf`] is a kernel leaf: a segment verified, its boundary states
 //!   digested and flagged, and the node output it states.
+//! - [`fold`] is a fold node: two children of the padded shape, leaves or
+//!   folds, verified, their circuits, program and run checked, and the node
+//!   output their run states.
 
 pub mod circuit;
 pub mod compile;
 pub mod context;
+pub mod fold;
 pub mod gadgets;
 pub mod leaf;
 pub mod prove;

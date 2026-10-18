@@ -352,6 +352,12 @@ pub const SEGMENT: Format = Format {
     },
 };
 
+/// The padded shape every leaf and fold proves at, [`LEAF_FOLD`]'s
+/// (`proving.md` §3.4): `p2`, `qm31` and `h8` at 2^16, 2^17 and 2^16 rows.
+/// One shape for both, so a fold verifies either child with one circuit,
+/// and a fold's own rows fit it (`recursion-air.md` §6, the fixed point).
+pub const LEAF_FOLD_LOG_SIZES: [u32; 3] = [16, 17, 16];
+
 pub const LEAF_FOLD: Format = Format {
     number: 32,
     kind: ProofKind::LeafFold,

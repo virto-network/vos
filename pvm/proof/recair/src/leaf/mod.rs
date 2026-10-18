@@ -42,6 +42,7 @@ use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_proof::Proof;
+use vos_pvm_proof::format::LEAF_FOLD_LOG_SIZES;
 use vos_pvm_proof::pcs::Commitment;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{ENTRY_TIMESTAMP, HALT_PC, KernelEntry, KernelProgram};
@@ -54,12 +55,18 @@ use crate::verifier::bits::{guess_bits, m31_of, recompose};
 use crate::verifier::witness::{digest_wires, pack};
 use crate::verifier::{SegmentShape, SegmentValues, WitnessError, verify_segment};
 
-pub use output::{NodeOutput, PREIMAGE_WORDS, STATE_WORDS, State, io_hash_limbs, io_hash_of};
+pub use output::{
+    NodeOutput, PREIMAGE_WORDS, STATE_WORDS, State, io_hash_limbs, io_hash_of, preimage,
+};
 pub use program::{LEAF_CIRCUITS_VERSION, kernel_program, leaf_circuit_hashes};
 
 /// The padded shape of every leaf and fold (`proving.md` §3.4, A.4's format
-/// 32): `p2`, `qm31` and `h8` rows.
-pub const PADDED_ROWS: [usize; 3] = [1 << 16, 1 << 17, 1 << 16];
+/// 32, [`LEAF_FOLD_LOG_SIZES`]): `p2`, `qm31` and `h8` rows.
+pub const PADDED_ROWS: [usize; 3] = [
+    1 << LEAF_FOLD_LOG_SIZES[0],
+    1 << LEAF_FOLD_LOG_SIZES[1],
+    1 << LEAF_FOLD_LOG_SIZES[2],
+];
 
 /// The boundary states' wires, four bytes a wire, in
 /// `vos_pvm_proof::boundary_binding::boundary_state_bytes`' order: the 13
@@ -166,51 +173,6 @@ fn state_constants<V: Value>(context: &mut Context<V>, state: &State) -> Vec<Var
         .collect()
 }
 
-/// `flag·(wire − constant) = 0`: when `flag` is one, `wire` is `constant`.
-fn implies_equal<V: Value>(context: &mut Context<V>, flag: Bit, wire: Var, constant: Var) {
-    let difference = context.sub(wire, constant);
-    let zero = context.zero();
-    context.qm31_into(
-        Qm31Op {
-            k_m: BaseField::one(),
-            ..Default::default()
-        },
-        Some(flag.var()),
-        Some(difference),
-        None,
-        zero,
-    );
-}
-
-/// `Σ_j lanes_j·wire_j`, an M31 as a wire.
-fn lane_sum<V: Value>(context: &mut Context<V>, wire: Var, lanes: [u32; 4]) -> Var {
-    context.qm31(
-        Qm31Op {
-            lanes: lanes.map(BaseField::from),
-            ..Default::default()
-        },
-        None,
-        None,
-        Some(wire),
-    )
-}
-
-/// Lane `j` of `wire` equals the M31 wire `value`.
-fn assert_lane<V: Value>(context: &mut Context<V>, wire: Var, j: usize, value: Var) {
-    let mut lanes = [BaseField::zero(); 4];
-    lanes[j] = BaseField::one();
-    context.qm31_into(
-        Qm31Op {
-            lanes,
-            ..Default::default()
-        },
-        None,
-        None,
-        Some(wire),
-        value,
-    );
-}
-
 /// The initial ts is not zero: one of its two wires, picked by a guessed
 /// bit, has an inverse.
 fn assert_ts_nonzero<V: Value>(context: &mut Context<V>, ts: [Var; 2]) {
@@ -251,8 +213,8 @@ fn io_hash<V: Value>(context: &mut Context<V>, boundary: &[Var], stated: &[V; 4]
         });
         let packed = context.guess(stated[k]);
         for (j, (wire, lanes)) in limbs.into_iter().enumerate() {
-            let limb = lane_sum(context, wire, lanes);
-            assert_lane(context, packed, j, limb);
+            let limb = context.lane_sum(wire, lanes);
+            context.assert_lane(packed, j, limb);
         }
         packed
     })
@@ -332,7 +294,7 @@ impl LeafCircuit {
 
         let constants = state_constants(context, &self.entry);
         for (index, constant) in wires::entry().into_iter().zip(constants) {
-            implies_equal(context, entry, boundary[index], constant);
+            context.assert_eq_if(entry, boundary[index], constant);
         }
         let halt_pc: Vec<BaseField> = HALT_PC
             .to_le_bytes()
@@ -340,7 +302,7 @@ impl LeafCircuit {
             .map(|&byte| BaseField::from(u32::from(byte)))
             .collect();
         let halt_pc = context.constant(pack(&halt_pc)[0]);
-        implies_equal(context, halt, boundary[wires::PC_OUT], halt_pc);
+        context.assert_eq_if(halt, boundary[wires::PC_OUT], halt_pc);
         assert_ts_nonzero(
             context,
             [

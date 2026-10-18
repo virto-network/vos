@@ -392,6 +392,40 @@ pub struct DeepBatch {
 pub fn extract_recursion_data(proof: &Proof) -> RecursionData {
     use alloc::rc::Rc;
     use core::cell::RefCell;
+
+    let recorder = Rc::new(RefCell::new(alloc::vec::Vec::new()));
+    let channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
+    let commitment_scheme =
+        &mut CommitmentSchemeVerifier::<crate::poseidon2::P2MerkleChannel>::new(proof.pcs_config);
+    let ctx = recursion_verify_prefix(proof, channel, commitment_scheme);
+    let components: alloc::vec::Vec<&dyn Component> =
+        ctx.verifier_components.iter().map(|c| &**c).collect();
+    replay_stark(
+        poseidon2_stark(proof),
+        &components,
+        &recorder,
+        channel,
+        commitment_scheme,
+        ctx.lookup_elements,
+    )
+}
+
+/// [`extract_recursion_data`]'s walk for any AIR's proof on the
+/// Poseidon2-M31 channel: Stwo's verifier head and `verify_values` over
+/// `components`, on `channel` (recording into `recorder`) and
+/// `commitment_scheme`, which have run the AIR's own prefix through the
+/// interaction tree's root. `lookup_elements` are the relation elements
+/// that prefix drew, a segment's; another AIR's take the default.
+///
+/// Panics if the proof does not verify.
+pub fn replay_stark(
+    sp: &stwo::core::proof::StarkProof<crate::poseidon2::P2MerkleHasher>,
+    components: &[&dyn Component],
+    recorder: &alloc::rc::Rc<core::cell::RefCell<alloc::vec::Vec<crate::poseidon2::PermRecord>>>,
+    channel: &mut crate::poseidon2::Poseidon2M31Channel,
+    commitment_scheme: &mut CommitmentSchemeVerifier<crate::poseidon2::P2MerkleChannel>,
+    lookup_elements: AllLookupElements,
+) -> RecursionData {
     use core::iter::zip;
     use stwo::core::air::Components;
     use stwo::core::circle::CirclePoint;
@@ -401,19 +435,11 @@ pub fn extract_recursion_data(proof: &Proof) -> RecursionData {
     use stwo::core::pcs::utils::{prepare_preprocessed_query_positions, try_get_lifting_log_size};
     use stwo::core::verifier::COMPOSITION_LOG_SPLIT;
 
-    let config = proof.pcs_config;
-    let sp = poseidon2_stark(proof).clone();
-
-    let recorder = Rc::new(RefCell::new(alloc::vec::Vec::new()));
-    let channel = &mut crate::poseidon2::Poseidon2M31Channel::recording(recorder.clone());
-    let commitment_scheme =
-        &mut CommitmentSchemeVerifier::<crate::poseidon2::P2MerkleChannel>::new(config);
-    let ctx = recursion_verify_prefix(proof, channel, commitment_scheme);
+    let config = sp.config;
     let prefix_len = recorder.borrow().len();
 
     // ── stwo verifier head (verifier.rs `verify_ex`), replicated via pub calls ─
-    let components_ref: alloc::vec::Vec<&dyn Component> =
-        ctx.verifier_components.iter().map(|c| &**c).collect();
+    let components_ref = components.to_vec();
     let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
         .column_log_sizes
         .len();
@@ -589,7 +615,7 @@ pub fn extract_recursion_data(proof: &Proof) -> RecursionData {
         query_positions,
         preprocessed_query_positions,
         first_layer_evals,
-        lookup_elements: ctx.lookup_elements,
+        lookup_elements,
         lifting_log_size,
         max_log_degree_bound,
         tree_heights: commitment_scheme.trees.iter().map(|t| t.height).collect(),
@@ -653,12 +679,6 @@ pub fn sample_layout(
     log_sizes: &[u32],
     config: &stwo::core::pcs::PcsConfig,
 ) -> SampleLayout {
-    use stwo::core::air::Components;
-    use stwo::core::circle::CirclePoint;
-    use stwo::core::fields::m31::BaseField;
-    use stwo::core::fields::qm31::SECURE_EXTENSION_DEGREE;
-    use stwo::core::pcs::utils::try_get_lifting_log_size;
-    use stwo::core::verifier::COMPOSITION_LOG_SPLIT;
     use stwo_constraint_framework::TraceLocationAllocator;
 
     let active: alloc::vec::Vec<usize> = (0..crate::chip_idx::COUNT)
@@ -691,8 +711,36 @@ pub fn sample_layout(
     let security_shape = crate::framework_access::air_layout(config, &components_ref, &committed)
         .expect("an AIR layout")
         .security_shape(&components_ref);
+    let chips: alloc::vec::Vec<(usize, u32)> = active
+        .iter()
+        .copied()
+        .zip(log_sizes.iter().copied())
+        .collect();
+    sample_layout_of(config, &components_ref, &chips, &committed, security_shape)
+}
+
+/// The [`SampleLayout`] of any AIR's proof under `config`: its verifier's
+/// `components`, each named by its `(chip, log size)` in `chips`, committing
+/// the column log sizes `committed` (preprocessed, main, interaction), its
+/// security counted at `security_shape`. The components' masks at the
+/// identity point give each sample point's offset from the OODS point.
+pub fn sample_layout_of(
+    config: &stwo::core::pcs::PcsConfig,
+    components: &[&dyn Component],
+    chips: &[(usize, u32)],
+    committed: &TreeVec<alloc::vec::Vec<u32>>,
+    security_shape: crate::security::SecurityShape,
+) -> SampleLayout {
+    use stwo::core::air::Components;
+    use stwo::core::circle::CirclePoint;
+    use stwo::core::fields::m31::BaseField;
+    use stwo::core::fields::qm31::SECURE_EXTENSION_DEGREE;
+    use stwo::core::pcs::utils::try_get_lifting_log_size;
+    use stwo::core::verifier::COMPOSITION_LOG_SPLIT;
+
+    assert_eq!(components.len(), chips.len(), "a chip a component");
     let all = Components {
-        components: components_ref,
+        components: components.to_vec(),
         n_preprocessed_columns: committed[PREPROCESSED_TRACE_IDX].len(),
     };
     let blowup = config.fri_config.log_blowup_factor;
@@ -733,18 +781,16 @@ pub fn sample_layout(
         .collect();
     let mut column_log_sizes: alloc::vec::Vec<alloc::vec::Vec<u32>> = committed
         .0
-        .into_iter()
-        .map(|tree| tree.into_iter().map(|log_size| log_size + blowup).collect())
+        .iter()
+        .map(|tree| tree.iter().map(|log_size| log_size + blowup).collect())
         .collect();
     column_log_sizes.push(alloc::vec![lifting_log_size; 2 * SECURE_EXTENSION_DEGREE]);
     let (mut main, mut interaction) = (0, 0);
-    let components = active
+    let components = components
         .iter()
-        .zip(&components)
-        .zip(log_sizes)
-        .zip(&verifier_components)
-        .map(|(((&chip, component), &log_size), verifier)| {
-            let sizes = component.trace_sizes(log_size);
+        .zip(chips)
+        .map(|(component, &(chip, log_size))| {
+            let sizes = component.trace_log_degree_bounds();
             let n_main = sizes[ORIGINAL_TRACE_IDX].len();
             let n_interaction = sizes[INTERACTION_TRACE_IDX].len();
             let layout = ComponentLayout {
@@ -752,7 +798,7 @@ pub fn sample_layout(
                 log_size,
                 main_columns: main..main + n_main,
                 interaction_columns: interaction..interaction + n_interaction,
-                preprocessed_indices: verifier.preprocessed_column_indices(),
+                preprocessed_indices: component.preprocessed_column_indices(),
             };
             main += n_main;
             interaction += n_interaction;

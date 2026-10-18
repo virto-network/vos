@@ -9,8 +9,11 @@
 //! - [`deep`]: each query's DEEP quotient, FRI's first-layer value;
 //! - [`oods`]: the composition check through the compiled constraints;
 //! - [`logup`]: the claimed sums, and the boundary chips' public terms;
-//! - [`shape`]: what a circuit is built for, and the check that a proof has
-//!   it;
+//! - [`stark`]: what every verifier circuit shares, for a proof of any AIR:
+//!   its geometry, the values past its AIR's own prefix, and the transcript
+//!   from the interaction PoW on;
+//! - [`shape`]: what a segment circuit is built for, and the check that a
+//!   proof has it;
 //! - [`witness`]: a proof's values laid out as the circuit guesses them;
 //! - [`segment`]: the pieces composed in the native verifier's order.
 //!
@@ -26,8 +29,10 @@ pub mod merkle;
 pub mod oods;
 pub mod segment;
 pub mod shape;
+pub mod stark;
 pub mod witness;
 
-pub use segment::{Draws, Verified, verify_segment};
+pub use segment::{Verified, verify_segment};
 pub use shape::{SegmentShape, ShapeMismatch};
+pub use stark::{Draws, StarkShape, StarkValues};
 pub use witness::{SegmentValues, WitnessError};

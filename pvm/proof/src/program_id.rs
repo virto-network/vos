@@ -1,12 +1,28 @@
 //! A kernel's program id (`proving.md` §3.6): the Poseidon2-M31 hash of
 //! what pins its proofs, so a fold can recompute it in-circuit.
 //!
-//! **Its preimage** is a run of M31 words, every value in A.3's lossless
-//! limbs: a u32 two 16-bit limbs, little-endian, a 32-byte hash 16, a byte
-//! or a log size one; a Poseidon2-M31 root its own eight words. In order:
+//! **Two levels,** so that one fold circuit recomputes the id of every
+//! kernel: the kernel's fields hash to its digest, a run of words whose
+//! length is the kernel's, and the id hashes a preimage of fixed length,
+//! [`ID_WORDS`], every field on whole wires of four words:
+//!
+//! | words | field |
+//! |---|---|
+//! | 0..8 | the kernel's digest |
+//! | 8..12 | the leaf-circuit slot's version and its hashes' count (a u32 each) |
+//! | 12..44 | [`MAX_LEAF_CIRCUITS`] hashes, eight words each, zeros past the count |
+//!
+//! The fold takes the id's preimage as a witness: the leaf circuits a fold
+//! admits are its hashes. A zero hash past the count admits none, as no
+//! circuit hashes to zero.
+//!
+//! **The kernel's digest** is over a run of M31 words, every value in A.3's
+//! lossless limbs: a u32 two 16-bit limbs, little-endian, a 32-byte hash 16,
+//! a byte or a log size one; a Poseidon2-M31 root its own eight words. In
+//! order:
 //!
 //! 1. the domain, `vos/program-id`'s 14 bytes as 7 limbs, and the
-//!    preimage's version, 2 (a u32);
+//!    preimage's version, 3 (a u32);
 //! 2. `TRANSPILER_VERSION`, the derivation's version (a u32);
 //! 3. the kernel's `ProgramHash` (32 bytes);
 //! 4. its shape: its chips' mask (a u32), its classes' count (a u32), and
@@ -17,15 +33,15 @@
 //! 6. each class's preprocessed root, in the classes' order, in the format's
 //!    channel: eight words for Poseidon2-M31, 16 limbs for Blake2s;
 //! 7. the image root, the page tree's over the kernel's initial memory (32
-//!    bytes);
-//! 8. the leaf-circuit slot: its version (a u32), the count of its hashes
-//!    (a u32) and each hash's eight words. Version 1 holds each class's leaf
-//!    circuit's hash, in the classes' order (`vos_recair::leaf`, the prover
-//!    role's); version 0 holds none, a program whose leaves are not built.
+//!    bytes).
 //!
-//! **The id** hashes the preimage as the recursion AIR's `p2` leaf mode
-//! does: eight words a permutation, absorbed into the rate, then a 1 and
-//! zeros to the next eight (`P2MerkleHasher`'s leaf).
+//! **The leaf-circuit slot:** version 1 holds each class's leaf circuit's
+//! hash, in the classes' order (`vos_recair::leaf`, the prover role's);
+//! version 0 holds none, a program whose leaves are not built.
+//!
+//! **Both hashes** are the recursion AIR's `p2` leaf mode: eight words a
+//! permutation, absorbed into the rate, then a 1 and zeros to the next
+//! eight (`P2MerkleHasher`'s leaf).
 
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -36,13 +52,19 @@ use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use crate::format::ChannelKind;
 use crate::pcs::Commitment;
 use crate::poseidon2::{P2Hash, P2MerkleHasher, u32_limbs};
-use crate::shape::KernelShape;
+use crate::shape::{KernelShape, MAX_CLASSES};
 
-/// The preimage's domain.
+/// The kernel digest's domain.
 pub const DOMAIN: &[u8; 14] = b"vos/program-id";
 
 /// The preimage's version.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
+
+/// The leaf-circuit hashes an id's preimage holds: one a class.
+pub const MAX_LEAF_CIRCUITS: usize = MAX_CLASSES;
+
+/// The words of an id's preimage.
+pub const ID_WORDS: usize = 8 + 4 + 8 * MAX_LEAF_CIRCUITS;
 
 /// A kernel's program id: eight M31 words.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +98,59 @@ impl LeafCircuits {
             Self::Hashes(_) => 1,
         }
     }
+
+    /// Its hashes: none in version 0.
+    pub fn hashes(&self) -> &[P2Hash] {
+        match self {
+            Self::None => &[],
+            Self::Hashes(hashes) => hashes,
+        }
+    }
+}
+
+/// An id's preimage: a kernel's digest and its leaf circuits.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IdPreimage {
+    pub kernel: P2Hash,
+    pub leaf_circuits: LeafCircuits,
+}
+
+impl IdPreimage {
+    /// Its [`ID_WORDS`] words.
+    ///
+    /// # Panics
+    /// When the slot holds more than [`MAX_LEAF_CIRCUITS`] hashes, which
+    /// [`KernelProgram::check`] refuses.
+    pub fn words(&self) -> [BaseField; ID_WORDS] {
+        let hashes = self.leaf_circuits.hashes();
+        assert!(
+            hashes.len() <= MAX_LEAF_CIRCUITS,
+            "at most {MAX_LEAF_CIRCUITS} leaf circuits"
+        );
+        let mut words = [BaseField::from(0); ID_WORDS];
+        words[..8].copy_from_slice(&self.kernel.0);
+        let slot: Vec<BaseField> = u32_limbs(self.leaf_circuits.version())
+            .into_iter()
+            .chain(u32_limbs(hashes.len() as u32))
+            .collect();
+        words[8..12].copy_from_slice(&slot);
+        for (k, hash) in hashes.iter().enumerate() {
+            words[12 + 8 * k..20 + 8 * k].copy_from_slice(&hash.0);
+        }
+        words
+    }
+
+    /// The id it hashes to.
+    pub fn id(&self) -> ProgramId {
+        ProgramId(leaf_sponge(&self.words()).0)
+    }
+}
+
+/// The `p2` leaf mode's sponge over `words`.
+fn leaf_sponge(words: &[BaseField]) -> P2Hash {
+    let mut hasher = P2MerkleHasher::default();
+    hasher.update_leaf(words);
+    hasher.finalize()
 }
 
 /// What a kernel's program id pins.
@@ -179,8 +254,8 @@ impl KernelProgram {
         Ok(())
     }
 
-    /// The preimage's words.
-    pub fn preimage(&self) -> Vec<BaseField> {
+    /// The words its digest hashes: every field but the leaf circuits.
+    pub fn kernel_words(&self) -> Vec<BaseField> {
         let mut words: Vec<BaseField> = byte_limbs(DOMAIN).collect();
         words.extend(u32_limbs(VERSION));
         words.extend(u32_limbs(self.transpiler));
@@ -205,24 +280,25 @@ impl KernelProgram {
             }
         }
         words.extend(byte_limbs(&self.image_root));
-        words.extend(u32_limbs(self.leaf_circuits.version()));
-        match &self.leaf_circuits {
-            LeafCircuits::None => words.extend(u32_limbs(0)),
-            LeafCircuits::Hashes(hashes) => {
-                words.extend(u32_limbs(hashes.len() as u32));
-                for hash in hashes {
-                    words.extend(hash.0);
-                }
-            }
-        }
         words
+    }
+
+    /// The kernel's digest.
+    pub fn kernel_digest(&self) -> P2Hash {
+        leaf_sponge(&self.kernel_words())
+    }
+
+    /// Its id's preimage.
+    pub fn id_preimage(&self) -> IdPreimage {
+        IdPreimage {
+            kernel: self.kernel_digest(),
+            leaf_circuits: self.leaf_circuits.clone(),
+        }
     }
 
     /// Its program id.
     pub fn id(&self) -> ProgramId {
-        let mut hasher = P2MerkleHasher::default();
-        hasher.update_leaf(&self.preimage());
-        ProgramId(hasher.finalize().0)
+        self.id_preimage().id()
     }
 
     /// The channel its proofs commit in.
@@ -268,23 +344,24 @@ mod tests {
         }
     }
 
-    /// The preimage's layout, word by word, and the id's golden vector.
+    /// The kernel digest's words, word by word, and the id's golden
+    /// vector.
     #[test]
     fn the_program_id_is_pinned() {
         let program = program();
         program.check().unwrap();
-        let words: Vec<u32> = program.preimage().iter().map(|word| word.0).collect();
+        let words: Vec<u32> = program.kernel_words().iter().map(|word| word.0).collect();
         let chips = program.shape.components.count_ones() as usize;
         assert_eq!(chips, 18);
         assert_eq!(
             words.len(),
-            7 + 2 + 2 + 16 + 2 + 2 + 2 * (2 + chips) + 2 + 2 * 8 + 16 + 2 + 2
+            7 + 2 + 2 + 16 + 2 + 2 + 2 * (2 + chips) + 2 + 2 * 8 + 16
         );
         assert_eq!(
             &words[..7],
             &[0x6f76, 0x2f73, 0x7270, 0x676f, 0x6172, 0x2d6d, 0x6469]
         );
-        assert_eq!(&words[7..11], &[2, 0, 3, 0]);
+        assert_eq!(&words[7..11], &[3, 0, 3, 0]);
         assert_eq!(&words[11..13], &[0x0100, 0x0302]);
         let shape = 27;
         assert_eq!(
@@ -300,25 +377,25 @@ mod tests {
         );
         let format = shape + 4 + 2 * (2 + chips);
         assert_eq!(&words[format..format + 3], &[35, 0, 1_000]);
-        assert_eq!(&words[words.len() - 4..], &[0, 0, 0, 0]);
-        assert_eq!(&words[words.len() - 6..words.len() - 4], &[0xbdbc, 0xbfbe]);
+        assert_eq!(&words[words.len() - 2..], &[0xbdbc, 0xbfbe]);
+        let id = program.id_preimage().words();
+        assert_eq!(id[..8], program.kernel_digest().0);
+        assert!(id[8..].iter().all(|&word| word == BaseField::from(0)));
         assert_eq!(
             program.id().0.map(|word| word.0),
             [
-                1734320072, 1323405261, 951221436, 30988993, 1818726837, 407748680, 727442506,
-                301179954
+                2135066872, 100226137, 1685726148, 2064667428, 305260091, 2132776637, 2063760913,
+                1333887263
             ],
             "the golden vector"
         );
     }
 
-    /// The id is the `p2` leaf mode's sponge over the preimage: eight words
-    /// added into the rate a permutation, then a 1 and zeros to the next
-    /// eight, the first eight words of the state out.
-    #[test]
-    fn the_id_is_the_leaf_modes_sponge() {
-        let program = program();
-        let mut words = program.preimage();
+    /// The `p2` leaf mode's sponge over `words`: eight words added into the
+    /// rate a permutation, then a 1 and zeros to the next eight, the first
+    /// eight words of the state out.
+    fn sponge(words: &[BaseField]) -> [BaseField; 8] {
+        let mut words = words.to_vec();
         words.push(BaseField::from(1));
         words.resize(words.len().next_multiple_of(8), BaseField::from(0));
         let mut state = [BaseField::from(0); 16];
@@ -328,7 +405,22 @@ mod tests {
             }
             crate::poseidon2::permute(&mut state);
         }
-        assert_eq!(program.id().0, state[..8]);
+        state[..8].try_into().unwrap()
+    }
+
+    /// The kernel's digest and the id are the `p2` leaf mode's sponges over
+    /// their words.
+    #[test]
+    fn the_id_is_the_leaf_modes_sponge() {
+        let mut program = program();
+        program.leaf_circuits = LeafCircuits::Hashes(vec![
+            P2Hash(core::array::from_fn(|i| {
+                BaseField::from(9 + i as u32)
+            }));
+            2
+        ]);
+        assert_eq!(program.kernel_digest().0, sponge(&program.kernel_words()));
+        assert_eq!(program.id().0, sponge(&program.id_preimage().words()));
     }
 
     /// Every field reaches the id.
@@ -379,7 +471,8 @@ mod tests {
     }
 
     /// Version 1's slot: its version, the hashes' count and each hash's
-    /// words, after the image root; a hash's word moves the id.
+    /// words, after the kernel's digest, zeros past the count; a hash's word
+    /// moves the id, and the kernel's digest does not depend on the slot.
     #[test]
     fn the_leaf_circuits_slot_is_pinned() {
         let mut program = program();
@@ -390,14 +483,24 @@ mod tests {
                 }))
             })
             .collect();
+        let kernel = program.kernel_digest();
         program.leaf_circuits = LeafCircuits::Hashes(hashes.clone());
         program.check().unwrap();
-        let words: Vec<u32> = program.preimage().iter().map(|word| word.0).collect();
-        let slot = &words[words.len() - 4 - 16..];
+        assert_eq!(program.kernel_digest(), kernel);
+        let words: Vec<u32> = program
+            .id_preimage()
+            .words()
+            .iter()
+            .map(|word| word.0)
+            .collect();
+        assert_eq!(words.len(), ID_WORDS);
+        assert_eq!(&words[..8], &kernel.0.map(|word| word.0)[..]);
+        let slot = &words[8..];
         assert_eq!(&slot[..4], &[1, 0, 2, 0]);
         for (k, hash) in hashes.iter().enumerate() {
             assert_eq!(&slot[4 + 8 * k..12 + 8 * k], &hash.0.map(|word| word.0)[..]);
         }
+        assert!(slot[4 + 16..].iter().all(|&word| word == 0));
         let id = program.id();
         let LeafCircuits::Hashes(hashes) = &mut program.leaf_circuits else {
             unreachable!()
