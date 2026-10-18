@@ -80,20 +80,6 @@ impl LogupTraceBuilder {
         })
     }
 
-    #[allow(dead_code)]
-    pub fn add_to_relation<'a, T, R>(
-        &mut self,
-        relation: &'a R,
-        mult: T,
-        tuple: &'a [FinalizedColumn<'a>],
-    ) where
-        T: Into<FinalizedColumn<'a>>,
-        R: RegisteredLookupBound,
-    {
-        let mult = mult.into();
-        self.add_to_relation_with(relation, [mult], |[col]| col.into(), tuple);
-    }
-
     pub fn add_to_relation_with<'a, const N: usize, R, F>(
         &mut self,
         relation: &R,

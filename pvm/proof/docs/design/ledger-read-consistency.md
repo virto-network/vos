@@ -187,10 +187,20 @@ a merged read-run spanning a write; per-slot ts monotonicity; ts-last selection)
 identical to memory: in `generate_main_trace_immut`, iterate `entries` (skip
 `merge_entries`), set `mult=1`, `Ts0=entry.ts`, `Ts1..3=0`, `SlotReal1..3=false`.
 The 4-slot emission machinery stays dormant (slots 1..3 emit 0-mult) so
-`finalize_logup_in_pairs` is unchanged. `merge_entries` + its property tests stay
-(uncalled). Perf cost (larger register ledger) is acceptable for a money-path fix
+`finalize_logup_in_pairs` is unchanged. Perf cost (larger register ledger) is acceptable for a money-path fix
 — the capstone is segmented and the register ledger is not the dominant cost.
 [Reconsider only if profiling shows the register ledger dominates a segment.]
+
+The merge, for a later design: consecutive same-(reg, value) reads fold into
+rows of up to `B5_MERGE_CAP = 4` slots (even, for `finalize_logup_in_pairs`; the
+canonical bench's 29,280 rows at 4 fit log size 15). Writes never merge, and a
+run longer than the cap splits into adjacent merged rows. The merge must be
+deterministic and invertible (`unmerge(merge(e)) == e` for every (reg,
+ts)-sorted `e`). Each merged row carries `Mult ∈ 0..=4`, `SlotReal_i = (Mult >
+i)` and a timestamp `TS_i` per slot, each slot consuming `−SlotReal_i ·
+(RegAddr, Value, TS_i)`, the sort key `(RegAddr, TS_0)`. Its helpers and their
+property tests were deleted uncalled; a merged ledger needs per-slot ordering
+and a link to the next row, which the hole below shows.
 
 **Later (formats 31–34):** the dormant slots were themselves a hole: a prover could
 set `SlotReal_i = 1` and consume any read at `Ts_i`, unordered and unchained.

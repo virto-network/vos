@@ -52,17 +52,6 @@ impl<C: AirColumn> TraceBuilder<C> {
         std::array::from_fn(|_idx| iter.next().expect("invalid offset; must be unreachable")[row])
     }
 
-    /// Returns mutable reference to `N` raw columns at `row`.
-    pub fn column_mut<const N: usize>(&mut self, row: usize, col: C) -> [&mut BaseField; N] {
-        assert_eq!(col.size(), N, "column size mismatch");
-
-        let offset = col.offset();
-        let mut iter = self.cols[offset..].iter_mut();
-        std::array::from_fn(|_idx| {
-            &mut iter.next().expect("invalid offset; must be unreachable")[row]
-        })
-    }
-
     /// Fills N columns with a value convertible into base fields.
     pub fn fill_columns<const N: usize, T: IntoBaseFields<N>>(
         &mut self,

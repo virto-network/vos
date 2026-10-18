@@ -43,7 +43,6 @@ pub(in crate::chips::cpu) fn sign_sources<E: EvalAtRow>(eval: &mut E, trace_eval
     // Ground constraint: pin SignSrcB / SignSrcD / SignSrcQ /
     // SignSrcR to the canonical Is32Bit-multiplexed source byte.
     {
-        let is_32bit_local = crate::trace::trace_eval!(trace_eval, Column::Is32Bit);
         let sign_src_b = crate::trace::trace_eval!(trace_eval, Column::SignSrcB);
         let sign_src_d = crate::trace::trace_eval!(trace_eval, Column::SignSrcD);
         let sign_src_q = crate::trace::trace_eval!(trace_eval, Column::SignSrcQ);
@@ -53,7 +52,6 @@ pub(in crate::chips::cpu) fn sign_sources<E: EvalAtRow>(eval: &mut E, trace_eval
         // Route `is_real · is_32bit` through the Real32bitH helper.
         // `is_real · (1 - is_32bit) · X` → `(is_real - Real32bitH) · X`,
         // and `is_real · is_32bit · X` → `Real32bitH · X`.
-        let _ = is_32bit_local;
         let real_minus_32 = is_real.clone() - real_32bit_h[0].clone();
         eval.add_constraint(
             is_real.clone() * sign_src_b[0].clone()
@@ -218,8 +216,6 @@ pub(in crate::chips::cpu) fn sign_nibbles<E: EvalAtRow>(
             is_real.clone().into(),
             &[lo_load.clone(), fifteen_p17.clone(), lo_load],
         ));
-
-        let _ = sixteen_p17; // already consumed via lo_load
     }
 
     // DivCmpDiff Range256 emissions live in DivRemChip (which

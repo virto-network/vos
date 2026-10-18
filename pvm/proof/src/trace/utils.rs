@@ -1,4 +1,3 @@
-use num_traits::Zero;
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 use stwo::{
     core::fields::m31::BaseField,
@@ -6,7 +5,6 @@ use stwo::{
 };
 
 pub use stwo::prover::backend::ColumnOps;
-use stwo_constraint_framework::EvalAtRow;
 
 use crate::core::step::WORD_SIZE;
 
@@ -125,8 +123,4 @@ pub fn finalize_columns(columns: Vec<Vec<BaseField>>) -> Vec<BaseColumn> {
         })
         .collect_into_vec(&mut ret);
     ret
-}
-
-pub fn zero_array<const N: usize, E: EvalAtRow>() -> [E::F; N] {
-    std::array::from_fn(|_i| E::F::zero())
 }

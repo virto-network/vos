@@ -150,10 +150,9 @@ pub fn blake2b_hash<const OUT_LEN: usize>(domain: &[u8], parts: &[&[u8]]) -> [u8
     assert!(OUT_LEN >= 1 && OUT_LEN <= 64);
     // Parameter block: byte0 = digest_length, byte2 = fanout(1), byte3 = depth(1).
     // h[0] = IV[0] XOR param_block[0..8].
-    let mut param_lo: u64 = 0x0101_0000 | (OUT_LEN as u64); // bytes [3]=1, [2]=1, [0]=N
+    let param_lo: u64 = 0x0101_0000 | (OUT_LEN as u64); // bytes [3]=1, [2]=1, [0]=N
     let mut h_words = BLAKE2B_IV;
     h_words[0] ^= param_lo;
-    let _ = &mut param_lo; // suppress unused_mut
 
     let mut h = [0u8; 64];
     for i in 0..8 {

@@ -249,7 +249,6 @@ pub(in crate::chips::cpu) fn register_accesses<E: EvalAtRow>(
         // ValD byte-wise cross-constraint.
         // Skip shift rows (handled by the ShiftQuotient identity below).
         let is_shift_c = crate::trace::trace_eval!(trace_eval, Column::IsShiftConstrained);
-        let _ = is_shift_c; // routed through helpers above
         for i in 0..4 {
             eval.add_constraint(
                 non_shift_gate_h[0].clone() * (val_d[i].clone() - reg_val_d[i].clone()),

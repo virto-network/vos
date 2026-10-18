@@ -110,10 +110,6 @@ impl BuiltInProverComponent for PowerOfTwoChip {
         // Count shift usage: the CpuChip stores ShiftAmount for shift ops.
         // We count how many times each shift_amount value (0-63) is used.
         let mut counts = [0u32; 64];
-        for &count in side_note.power_of_two_counts.iter() {
-            // Already accumulated by CpuChip trace gen
-            let _ = count;
-        }
         // Use pre-accumulated counts from SideNote
         for (i, &c) in side_note.power_of_two_counts.iter().enumerate() {
             if i < 64 {

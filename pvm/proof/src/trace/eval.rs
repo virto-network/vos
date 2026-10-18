@@ -67,18 +67,6 @@ impl<P: PreprocessedAirColumn, C: AirColumn, E: EvalAtRow> TraceEval<P, C, E> {
     }
 }
 
-pub fn shared_preprocessed_column<const N: usize, E: EvalAtRow, P: PreprocessedAirColumn>(
-    eval: &mut E,
-    col: P,
-) -> [E::F; N] {
-    assert_eq!(col.size(), N, "preprocessed column size mismatch");
-    let offset = col.offset();
-    array::from_fn(|i| {
-        let id = <P as PreprocessedAirColumn>::PREPROCESSED_IDS[offset + i].to_owned();
-        eval.get_preprocessed_column(PreProcessedColumnId { id })
-    })
-}
-
 /// Returns evaluations for a given column.
 #[macro_export]
 macro_rules! trace_eval {

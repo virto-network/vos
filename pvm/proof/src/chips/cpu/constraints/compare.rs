@@ -156,8 +156,6 @@ pub(in crate::chips::cpu) fn compare<E: EvalAtRow>(eval: &mut E, trace_eval: &Tr
     }
     // Compare sub-ops use per-op flag columns (flattened to deg 2).
     {
-        let val_d_is_zero = crate::trace::trace_eval!(trace_eval, Column::ValDIsZero);
-
         // Constrain val_d_is_zero: gated via IsCmpVdzH (deg 1 helper).
         for i in 0..WORD_SIZE {
             eval.add_constraint(is_cmp_vdz_h[0].clone() * val_d[i].clone());
@@ -233,7 +231,6 @@ pub(in crate::chips::cpu) fn compare<E: EvalAtRow>(eval: &mut E, trace_eval: &Tr
         }
 
         // CmovIz / CmovNz — gated via the per-condition helpers.
-        let _ = val_d_is_zero;
         for i in 0..WORD_SIZE {
             eval.add_constraint(
                 is_cmov_iz_vdz_h[0].clone() * (result[i].clone() - val_b[i].clone()),

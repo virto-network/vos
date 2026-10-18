@@ -862,7 +862,7 @@ mod tests {
     }
 
     /// Trace a small store/load program and confirm the page enumeration
-    /// agrees with the ledger's own `analyze_dedup` 4096-byte page count, and
+    /// agrees with the pages the ledger's accesses touch, and
     /// that `segment_multiproof` recomputes the entering/exit image roots.
     #[test]
     fn touched_pages_match_ledger_and_segment_multiproof_round_trips() {
@@ -910,18 +910,14 @@ mod tests {
             "expected page 16 (addr 0x1_0000) touched"
         );
 
-        // Page count must equal the ledger's own distinct 4096-byte page count.
-        let report = crate::chips::memory::analyze_dedup(&sn);
-        let ledger_4096 = report
-            .distinct_pages
+        // The pages are the ledger's: every page an access touches.
+        let ledger_pages: BTreeSet<u32> = crate::chips::memory::access_entries(&sn)
             .iter()
-            .find(|&&(ps, _)| ps == PAGE_SIZE)
-            .map(|&(_, n)| n)
-            .expect("analyze_dedup reports a 4096-byte page count");
+            .map(|e| e.address / PAGE_SIZE as u32)
+            .collect();
         assert_eq!(
-            pages.len(),
-            ledger_4096,
-            "touched_pages disagrees with the ledger's distinct 4096-byte page count"
+            pages, ledger_pages,
+            "touched_pages disagrees with the ledger's pages"
         );
 
         // segment_multiproof recomputes the entering/exit roots in-the-large.

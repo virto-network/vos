@@ -105,8 +105,6 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
     {
         let is_blake_ecall = crate::trace::trace_eval!(trace_eval, Column::IsBlakeEcall);
         let phi7 = crate::trace::trace_eval!(trace_eval, Column::Phi7);
-        let phi7_inv = crate::trace::trace_eval!(trace_eval, Column::Phi7Inv);
-        let _phi7_bool = crate::trace::trace_eval!(trace_eval, Column::Phi7Bool);
         let phi10 = crate::trace::trace_eval!(trace_eval, Column::Phi10);
         let phi11 = crate::trace::trace_eval!(trace_eval, Column::Phi11);
         let phi12 = crate::trace::trace_eval!(trace_eval, Column::Phi12);
@@ -142,7 +140,6 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
         // register is) tie, gated only by is_real.
         // Phi7Bool is boolean on every row (`registers::register_helpers`).
         // If Phi7Bool = 0, then Phi7's bytes are 0.
-        let _ = phi7_inv;
         let phi7_sum = phi7
             .iter()
             .fold(E::F::zero(), |sum, byte| sum + byte.clone());

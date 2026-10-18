@@ -212,9 +212,7 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 /// at the same time — the trailing length assertion catches a
 /// shortened array but not a within-bounds reorder. The named
 /// constants double as documentation for which chip each match arm
-/// in `is_active` refers to, so they're kept even for chips that
-/// don't currently appear in a match arm.
-#[allow(dead_code)]
+/// in `is_active` refers to.
 pub mod chip_idx {
     pub const CPU: usize = 0;
     pub const BLAKE2B: usize = 1;

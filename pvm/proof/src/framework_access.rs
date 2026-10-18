@@ -218,15 +218,6 @@ pub fn drive_chip_oods<E: stwo_constraint_framework::EvalAtRow>(
     }
 }
 
-/// [`drive_chip_oods`] for CpuChip (`chip_idx::CPU`).
-pub fn drive_cpu_chip_oods<E: stwo_constraint_framework::EvalAtRow>(
-    log_size: u32,
-    lookup: &AllLookupElements,
-    eval: E,
-) -> E {
-    drive_chip_oods(crate::chip_idx::CPU, log_size, lookup, eval)
-}
-
 /// Functions for creating verifier-side component structures.
 pub mod create_verifier_components {
     use super::*;

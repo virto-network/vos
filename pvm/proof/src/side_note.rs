@@ -504,22 +504,6 @@ impl SideNote {
         self
     }
 
-    pub(crate) fn has_initial_memory(&self) -> bool {
-        !self.initial_memory.is_empty() || self.sparse_initial_memory.is_some()
-    }
-
-    pub(crate) fn initial_memory_byte(&self, address: u32) -> u8 {
-        self.sparse_initial_memory.as_ref().map_or_else(
-            || {
-                self.initial_memory
-                    .get(address as usize)
-                    .copied()
-                    .unwrap_or(0)
-            },
-            |image| image.byte(address),
-        )
-    }
-
     pub fn with_initial_regs(mut self, regs: [u64; NUM_REGS]) -> Self {
         self.initial_regs = regs;
         self

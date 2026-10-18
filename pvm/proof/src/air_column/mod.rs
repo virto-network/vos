@@ -2,8 +2,6 @@ use core::fmt;
 
 pub use vos_pvm_proof_derive::{AirColumn, PreprocessedAirColumn};
 
-pub mod empty;
-
 /// Trait used for column indexing during constraints evaluation and trace generation.
 pub trait AirColumn: 'static + Copy + fmt::Debug {
     /// Total number of columns in the trace.

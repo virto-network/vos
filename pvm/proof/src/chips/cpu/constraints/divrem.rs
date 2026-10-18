@@ -239,7 +239,6 @@ pub(in crate::chips::cpu) fn remainder_sign<E: EvalAtRow>(eval: &mut E, trace_ev
     let val_r_part_nz_times_ind_h =
         crate::trace::trace_eval!(trace_eval, Column::ValRPartNZTimesIndH);
     let div_s_active_partial_h = crate::trace::trace_eval!(trace_eval, Column::DivSActivePartialH);
-    let div_remainder = crate::trace::trace_eval!(trace_eval, Column::DivRemainder);
     // ════════════════════════════════════════════════════════════════════
     // The full DivS |r|<|d| chain lives in DivRemChip.
     // AbsD/AbsDCarry/AbsR/AbsRCarry + AbsCmpDiff/AbsCmpCarry are
@@ -263,7 +262,6 @@ pub(in crate::chips::cpu) fn remainder_sign<E: EvalAtRow>(eval: &mut E, trace_ev
     // uniqueness is complete: there's exactly one (q, r) pair
     // satisfying both bounds + the schoolbook + the sign-correction.
     {
-        let val_r_byte_inv = crate::trace::trace_eval!(trace_eval, Column::ValRByteInv);
         let val_r_partial_nz = crate::trace::trace_eval!(trace_eval, Column::ValRPartialNZ);
         let sign_bit_b_p31 = crate::trace::trace_eval!(trace_eval, Column::SignBitB);
         let sign_bit_r_p31 = crate::trace::trace_eval!(trace_eval, Column::SignBitR);
@@ -290,6 +288,5 @@ pub(in crate::chips::cpu) fn remainder_sign<E: EvalAtRow>(eval: &mut E, trace_ev
             div_s_active_partial_h[0].clone()
                 * (sign_bit_r_p31[0].clone() - sign_bit_b_p31[0].clone()),
         );
-        let _ = (val_r_byte_inv, div_remainder); // routed via helpers
     }
 }

@@ -206,7 +206,7 @@ impl BuiltInProverComponent for CompareChip {
     fn generate_interaction_trace(
         &self,
         component_trace: ComponentTrace,
-        side_note: &SideNote,
+        _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (
         ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
@@ -225,8 +225,6 @@ impl BuiltInProverComponent for CompareChip {
         let cmp_sub_result =
             crate::trace::original_base_column!(component_trace, Column::CmpSubResult);
         let is_padding = crate::trace::original_base_column!(component_trace, Column::IsPadding);
-
-        let _ = side_note;
 
         // Range256 emissions for cmp_sub_result bytes (8 per row).
         for col in &cmp_sub_result {

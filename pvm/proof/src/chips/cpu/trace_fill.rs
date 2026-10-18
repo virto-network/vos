@@ -1233,7 +1233,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
                 // ValDByteIndMinus1H = val_d · (indicator - 1).
                 // For valid traces with vd=0 → ind=0, helper=0;
                 // with vd≠0 → ind=1, helper=0.  Either way 0.
-                let _ = vd_i; // implicit in the math
                 ind_minus1[i] = BaseField::from(0u32);
                 if i >= 1 {
                     // PartialNZ[i-1] · ByteIndicator[i].
@@ -1483,9 +1482,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
         let is_truncated_b = is_truncated != 0;
         let val_b_is_reg_b = accesses.val_b_read.is_some();
         let val_d_is_reg_b = accesses.val_d_read.is_some();
-        let result_is_reg_b = accesses.result_write.is_some();
         let phi7_bool_b = phi7_bool != 0;
-        let _is_blake_ecall_b = is_blake_ecall;
         let real_b = true; // not padding
         let is_32bit_b = flags.is_32bit;
         let is_shift_c_b = is_shift_constrained;
@@ -1525,7 +1522,6 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
         trace.fill_columns(row, real_b && phi7_bool_b, Column::RealPhi7BoolH);
         // Phi7TimesInvH = (Σ Phi7 bytes) · Phi7Inv: 0 or 1.
         trace.fill_columns_base_field(row, &[phi7_sum * phi7_inv], Column::Phi7TimesInvH);
-        let _ = (val_b_is_reg_b, val_d_is_reg_b, result_is_reg_b);
 
         // Additional degree-3 selector patterns in CpuChip.
         trace.fill_columns(
