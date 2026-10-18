@@ -240,10 +240,7 @@ impl TracingPvm {
 
     /// One iteration of [`Self::run_with_precompiles`]: execute exactly one
     /// recorded step, execute and acknowledge a precompile call, and return
-    /// `Some(exit)` only when the run terminates. Lets a streaming driver
-    /// ([`crate::segment::TracingSource`]) pump the tracer step by step while
-    /// the run-to-completion path stays a loop over this, so the two cannot
-    /// diverge.
+    /// `Some(exit)` only when the run terminates.
     pub fn step_with_precompiles(&mut self) -> Option<ExitReason> {
         let exit = self.step()?;
         // A served call pays its VOS price first, exactly as on the refine
@@ -400,21 +397,6 @@ impl TracingPvm {
         self.steps.len()
     }
 
-    /// Drain the OLDEST retained recorded step — the streaming drivers'
-    /// keep-the-tracer-empty primitive: a driver that pumps
-    /// [`Self::step_with_precompiles`] takes each step out as it lands, so
-    /// the tracer never accumulates the trace it is producing. Draining
-    /// removes the step from [`Self::trace`]/[`Self::into_trace`]'s view;
-    /// mixing drained and run-to-completion consumption of one tracer is
-    /// a caller bug. Register continuity ([`Self::step`]'s asserts) is
-    /// tracked independently, so stepping stays sound after a drain.
-    pub fn take_step(&mut self) -> Option<CompactStep> {
-        if self.steps.is_empty() {
-            return None;
-        }
-        Some(self.steps.remove(0))
-    }
-
     /// The register file entering the first recorded step (the file the
     /// interpreter was seeded with); current registers if nothing was
     /// recorded yet.
@@ -464,14 +446,6 @@ impl TracingPvm {
             .collect();
         side_note.blake2b_mem_ops = self.blake2b_mem_ops;
         side_note
-    }
-
-    /// Consume and return the compact trace: the recorded steps plus the
-    /// register file entering the first one — the chain-side form that
-    /// [`crate::segment::CompactSegmentCursor`] expands window by window.
-    pub fn into_compact(self) -> (Vec<CompactStep>, [u64; PVM_REGISTER_COUNT]) {
-        let regs = self.initial_regs();
-        (self.steps, regs)
     }
 
     /// Return recorded blake2b calls for the precompile chip.

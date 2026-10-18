@@ -11,28 +11,19 @@
 //!
 //! SOUNDNESS SCOPE. `verify_chain`'s continuity check compares each
 //! segment's `final_state` to the next's `initial_state` (registers, pc,
-//! timestamp, memory_commitment). Each segment's verification binds those
-//! metadata fields to the committed boundary COLUMNS (boundary-binding
-//! check; see `boundary_binding`). Per field:
-//!   - pc/timestamp columns are pinned to the trace (CpuChip
-//!     program-execution chaining), so the continuity equality forces
-//!     real pc/timestamp continuity.
+//! timestamp, memory root). Each segment's verification binds those fields
+//! to the committed boundary columns (`boundary_binding`):
+//!   - pc/timestamp columns are pinned to the trace by CpuChip's
+//!     program-execution chaining;
 //!   - register columns are pinned to the trace by the register ledger's
-//!     read-consistency (v6: a cross-row `#[mask_next_row]` `prev_value`
-//!     binding + a `(reg, ts)` sortedness gadget + an `is_write` limb),
-//!     which is sound against a from-scratch prover (gate:
-//!     `tests/ledger_readconsistency_gate.rs`), so the continuity
-//!     equality forces genuine register continuity too (see
-//!     `chips/register_memory_closing.rs`).
-//!   - `memory_commitment` is a hash computed outside the circuit (not
-//!     even FS-mixed), so memory continuity trusts the prover. Closing
-//!     it needs an in-circuit memory-image commitment (couples with the
-//!     memory-continuity work in `docs/plans/roadmap.md`).
-//! Independently, `verify_chain` itself is a HOST-SIDE capability, not a
-//! trust-boundary check: it consumes prover-derived `SideNote`s and
-//! anchors no per-segment program commitment. Making it a trust boundary
-//! (a side-note-free `verify_chain_standalone`) is the
-//! chain-verification work in `docs/plans/roadmap.md`.
+//!     read-consistency (a cross-row `prev_value` binding, a `(reg, ts)`
+//!     sortedness gadget and an `is_write` limb; gate:
+//!     `tests/ledger_readconsistency_gate.rs`);
+//!   - `memory_root` is the page-Merkle root the boundary multiproof binds
+//!     in-circuit (`Memory{Page,Merkle,RootBoundary}Chip`).
+//! `verify_chain` itself is a host-side capability: it consumes
+//! prover-derived `SideNote`s. The side-note-free trust boundary is the
+//! verifier crate's `verify_chain_standalone`.
 //!
 //! This is program-agnostic: any actor whose trace is too large for one
 //! proof becomes provable as a chain.
@@ -54,98 +45,11 @@ pub fn segment_bounds(total: usize, max_steps: usize) -> alloc::vec::Vec<(usize,
 
 #[cfg(feature = "prover")]
 mod prover {
-    use crate::chips::blake2b::Blake2bCall;
-    use crate::core::step::{
-        CompactStep, MemAccess, NUM_REGS, PvmStep, WitnessWrite, expand_steps,
-    };
-    use crate::core::tracing::{Blake2bMemOp, TracingPvm};
-    use crate::side_note::{CompactTrace, SideNote};
+    use crate::core::step::PvmStep;
+    use crate::core::tracing::Blake2bMemOp;
+    use crate::side_note::SideNote;
     use alloc::collections::BTreeSet;
     use alloc::vec::Vec;
-
-    /// The per-step fields the chain-side walkers read — timestamp plus
-    /// the two optional memory accesses — implemented by both step forms,
-    /// so the budgeted cutter and the write replay are ONE code path each
-    /// and the full and compact chain representations cut and thread
-    /// identically by construction.
-    trait StepView {
-        fn ts(&self) -> u64;
-        fn read_access(&self) -> Option<&MemAccess>;
-        fn write_access(&self) -> Option<&MemAccess>;
-        fn witness_write(&self) -> Option<&WitnessWrite>;
-    }
-
-    impl StepView for PvmStep {
-        fn ts(&self) -> u64 {
-            self.timestamp
-        }
-        fn read_access(&self) -> Option<&MemAccess> {
-            self.mem_read.as_ref()
-        }
-        fn write_access(&self) -> Option<&MemAccess> {
-            self.mem_write.as_ref()
-        }
-        fn witness_write(&self) -> Option<&WitnessWrite> {
-            self.witness.as_deref()
-        }
-    }
-
-    impl StepView for CompactStep {
-        fn ts(&self) -> u64 {
-            self.timestamp
-        }
-        fn read_access(&self) -> Option<&MemAccess> {
-            self.mem_read.as_ref()
-        }
-        fn write_access(&self) -> Option<&MemAccess> {
-            self.mem_write.as_ref()
-        }
-        fn witness_write(&self) -> Option<&WitnessWrite> {
-            self.witness.as_deref()
-        }
-    }
-
-    /// Borrowed chain-wide fields common to the two chain holders
-    /// ([`SideNote`] and [`CompactTrace`]): the program-static parts and
-    /// the BLAKE2b precompile's call/mem-op streams. Both cursors, both
-    /// budgeted cutters, and the segment assembly take this view, so a
-    /// window built from either holder flows through identical code.
-    struct ChainParts<'a> {
-        code: &'a [u8],
-        bitmask: &'a [u8],
-        jump_table: &'a [u32],
-        blake2b_calls: &'a [crate::chips::blake2b::Blake2bCall],
-        blake2b_mem_ops: &'a [crate::core::tracing::Blake2bMemOp],
-        /// `None` for a sparse image without one, whose segments proving
-        /// refuses.
-        memory_layout: Option<crate::chips::memory_page::MemoryLayout>,
-    }
-
-    impl<'a> From<&'a SideNote> for ChainParts<'a> {
-        fn from(full: &'a SideNote) -> Self {
-            Self {
-                code: &full.code,
-                bitmask: &full.bitmask,
-                jump_table: &full.jump_table,
-                blake2b_calls: &full.blake2b_calls,
-                blake2b_mem_ops: &full.blake2b_mem_ops,
-                memory_layout: full.memory_layout(),
-            }
-        }
-    }
-
-    impl<'a> From<&'a CompactTrace> for ChainParts<'a> {
-        fn from(full: &'a CompactTrace) -> Self {
-            Self {
-                code: &full.code,
-                bitmask: &full.bitmask,
-                jump_table: &full.jump_table,
-                blake2b_calls: &full.blake2b_calls,
-                blake2b_mem_ops: &full.blake2b_mem_ops,
-                memory_layout: Some(full.memory_layout),
-            }
-        }
-    }
 
     /// Content-budgeted segmentation: split the trace into maximal windows
     /// holding BOTH budgets — at most `max_steps` steps AND at most
@@ -174,27 +78,6 @@ mod prover {
         max_steps: usize,
         max_pages: usize,
     ) -> Vec<(usize, usize)> {
-        segment_bounds_budgeted_impl(&full.steps, &ChainParts::from(full), max_steps, max_pages)
-    }
-
-    /// [`segment_bounds_budgeted`] over a [`CompactTrace`] — the same walk
-    /// over the same fields (a compact step carries the identical
-    /// timestamp + memory accesses), so the cut is bit-identical to the
-    /// full holder's for the same traced run.
-    pub fn segment_bounds_budgeted_compact(
-        full: &CompactTrace,
-        max_steps: usize,
-        max_pages: usize,
-    ) -> Vec<(usize, usize)> {
-        segment_bounds_budgeted_impl(&full.steps, &ChainParts::from(full), max_steps, max_pages)
-    }
-
-    fn segment_bounds_budgeted_impl<S: StepView>(
-        steps: &[S],
-        parts: &ChainParts<'_>,
-        max_steps: usize,
-        max_pages: usize,
-    ) -> Vec<(usize, usize)> {
         /// Advance `cursor` past every op with `ts_of(op) <= ts`, handing
         /// the ones AT `ts` to `push`. Each stream is ts-sorted (the tracer
         /// appends in step order), so one monotone cursor per stream visits
@@ -218,12 +101,12 @@ mod prover {
         let mut bounds = Vec::new();
         let mut cb = 0;
         let mut ranges: Vec<(u32, u32)> = Vec::new();
-        for step in steps {
-            let ts = step.ts();
+        for step in &full.steps {
+            let ts = step.timestamp;
             ranges.clear();
             step_ranges(step, &mut ranges);
             take_at(
-                parts.blake2b_mem_ops,
+                &full.blake2b_mem_ops,
                 &mut cb,
                 ts,
                 |o| o.ts,
@@ -239,35 +122,29 @@ mod prover {
     }
 
     /// The step's own touched ranges: its optional memory read + write.
-    fn step_ranges<S: StepView>(s: &S, out: &mut Vec<(u32, u32)>) {
-        if let Some(r) = s.read_access() {
+    fn step_ranges(s: &PvmStep, out: &mut Vec<(u32, u32)>) {
+        if let Some(r) = &s.mem_read {
             out.push((r.address, r.size as u32));
         }
-        if let Some(w) = s.write_access() {
+        if let Some(w) = &s.mem_write {
             out.push((w.address, w.size as u32));
         }
-        if let Some(w) = s.witness_write() {
+        if let Some(w) = &s.witness {
             out.push((w.address, w.bytes.len() as u32));
         }
     }
 
-    // Per-stream touched ranges of one precompile op — the page-accounting
-    // knowledge shared by the offline walker above and the online
-    // [`TraceStream`] windower, so the two count identical pages for the
-    // same op by construction.
+    // Per-stream touched ranges of one precompile op.
     fn blake2b_op_ranges(o: &Blake2bMemOp, out: &mut Vec<(u32, u32)>) {
         out.push((o.h_ptr, o.h_bytes.len() as u32));
         out.push((o.m_ptr, o.m_bytes.len() as u32));
     }
 
-    /// The incremental budgeted-cut decision — ONE code path behind the
-    /// offline [`segment_bounds_budgeted`] walk and the online
-    /// [`TraceStream`] windower, so an online cut is bit-identical to the
-    /// offline cut of the same trace by construction. Feed each step's
-    /// touched ranges in order; the cutter reports the window(s) the step
-    /// closed. Page accounting mirrors
-    /// [`crate::page_merkle::touched_pages`] (same `add_range`
-    /// granularity), exactly as the offline walker always did.
+    /// The incremental budgeted-cut decision behind
+    /// [`segment_bounds_budgeted`]. Feed each step's touched ranges in
+    /// order; the cutter reports the window(s) the step closed. Page
+    /// accounting mirrors [`crate::page_merkle::touched_pages`] (same
+    /// `add_range` granularity).
     struct BudgetedCutter {
         max_steps: usize,
         max_pages: usize,
@@ -281,8 +158,7 @@ mod prover {
     type ClosedWindows = (Option<(usize, usize)>, Option<(usize, usize)>);
 
     impl BudgetedCutter {
-        /// Panics if either budget is zero (the historical
-        /// `segment_bounds_budgeted` contract).
+        /// Panics if either budget is zero.
         fn new(max_steps: usize, max_pages: usize) -> Self {
             assert!(max_steps > 0, "max_steps must be non-zero");
             assert!(max_pages > 0, "max_pages must be non-zero");
@@ -411,38 +287,18 @@ mod prover {
         b: usize,
         mem: SegmentMemory,
     ) -> SideNote {
+        let ts_lo = full.steps[a].timestamp;
         let ts_hi = full.steps.get(b).map(|s| s.timestamp).unwrap_or(u64::MAX);
-        assemble_segment(
-            &ChainParts::from(full),
-            full.steps[a..b].to_vec(),
-            full.steps[a].regs_before,
-            mem,
-            ts_hi,
-        )
-    }
-
-    /// Assemble a window's `SideNote` from its already-materialized full
-    /// steps, its entering register file, its entering memory image, and
-    /// the exclusive timestamp bound of the next window. The single
-    /// assembly path behind [`build_segment`] (full holder) and
-    /// [`CompactSegmentCursor::side_note`] (compact holder): whatever
-    /// produced the inputs, the window flows through identical filtering
-    /// and ingestion, so the two chain representations yield equal
-    /// segments by construction.
-    fn assemble_segment(
-        parts: &ChainParts<'_>,
-        steps: Vec<PvmStep>,
-        initial_regs: [u64; NUM_REGS],
-        mem: SegmentMemory,
-        ts_hi: u64,
-    ) -> SideNote {
-        let ts_lo = steps[0].timestamp;
         let in_window = move |ts: u64| ts >= ts_lo && ts < ts_hi;
 
-        let sn = SideNote::new(steps, parts.code.to_vec(), parts.bitmask.to_vec())
-            .with_jump_table(parts.jump_table.to_vec())
-            .with_initial_regs(initial_regs);
-        let sn = match parts.memory_layout {
+        let sn = SideNote::new(
+            full.steps[a..b].to_vec(),
+            full.code.to_vec(),
+            full.bitmask.to_vec(),
+        )
+        .with_jump_table(full.jump_table.to_vec())
+        .with_initial_regs(full.steps[a].regs_before);
+        let sn = match full.memory_layout() {
             Some(layout) => sn.with_memory_layout(layout),
             None => sn,
         };
@@ -451,7 +307,7 @@ mod prover {
             SegmentMemory::Sparse(memory) => sn.with_sparse_memory(memory),
         };
 
-        let (bc, bm) = filter_pair(parts.blake2b_calls, parts.blake2b_mem_ops, |m| {
+        let (bc, bm) = filter_pair(&full.blake2b_calls, &full.blake2b_mem_ops, |m| {
             in_window(m.ts)
         });
         sn.blake2b_calls = bc;
@@ -520,20 +376,18 @@ mod prover {
     type PendingWrite = (u64, u32, [u8; 64], u8);
 
     /// The step's regular store, and the bytes a witness-input call
-    /// wrote, a buffer's worth a write, as pending writes. Generic over the
-    /// step form ([`StepView`]) so the full and compact replay paths
-    /// enumerate identical writes.
-    fn writes_of_step<S: StepView>(s: &S, out: &mut Vec<PendingWrite>) {
-        if let Some(w) = s.write_access() {
+    /// wrote, a buffer's worth a write, as pending writes.
+    fn writes_of_step(s: &PvmStep, out: &mut Vec<PendingWrite>) {
+        if let Some(w) = &s.mem_write {
             let sz = w.size as usize;
             let mut buf = [0u8; 64];
             buf[..sz].copy_from_slice(&w.value.to_le_bytes()[..sz]);
-            out.push((s.ts(), w.address, buf, sz as u8));
+            out.push((s.timestamp, w.address, buf, sz as u8));
         }
-        if let Some(w) = s.witness_write() {
+        if let Some(w) = &s.witness {
             for (index, chunk) in w.bytes.chunks(64).enumerate() {
                 let address = w.address + 64 * index as u32;
-                out.push(write_of_bytes(s.ts(), address, chunk));
+                out.push(write_of_bytes(s.timestamp, address, chunk));
             }
         }
     }
@@ -610,9 +464,8 @@ mod prover {
         applied_upto: u64,
         /// Index of the first step not yet applied to `mem`.
         steps_at: usize,
-        /// Per-stream indices of the first precompile output write not yet
-        /// applied to `mem`.
-        streams: StreamCursors,
+        /// Index of the first BLAKE2b output write not yet applied to `mem`.
+        blake2b_at: usize,
     }
 
     impl<'a> SegmentCursor<'a> {
@@ -627,7 +480,7 @@ mod prover {
                 mem,
                 applied_upto: 0,
                 steps_at: 0,
-                streams: StreamCursors::default(),
+                blake2b_at: 0,
             }
         }
 
@@ -670,573 +523,18 @@ mod prover {
                 writes_of_step(s, &mut writes);
                 self.steps_at += 1;
             }
-            self.streams
-                .drain_below(&ChainParts::from(full), ts_lo, &mut writes);
+            while let Some(m) = full.blake2b_mem_ops.get(self.blake2b_at) {
+                if m.ts >= ts_lo {
+                    break;
+                }
+                writes.push(write_of_bytes(m.ts, m.h_ptr, &m.out_bytes));
+                self.blake2b_at += 1;
+            }
             match &mut self.mem {
                 SegmentMemory::Dense(memory) => apply_writes(memory, writes),
                 SegmentMemory::Sparse(memory) => apply_sparse_writes(memory, writes),
             }
             self.applied_upto = ts_lo;
-        }
-    }
-
-    /// Per-stream indices of the first precompile output write not yet
-    /// applied to a cursor's carried image, with the drain that advances
-    /// them. Shared by [`SegmentCursor`] and [`CompactSegmentCursor`], so
-    /// the two thread identical precompile writes.
-    #[derive(Default)]
-    struct StreamCursors {
-        blake2b: usize,
-    }
-
-    impl StreamCursors {
-        /// Push every not-yet-applied precompile output write with
-        /// `ts < ts_lo`; [`apply_writes`] sorts the batch by ts.
-        fn drain_below(&mut self, parts: &ChainParts<'_>, ts_lo: u64, out: &mut Vec<PendingWrite>) {
-            drain_stream(
-                parts.blake2b_mem_ops,
-                &mut self.blake2b,
-                ts_lo,
-                |m| write_of_bytes(m.ts, m.h_ptr, &m.out_bytes),
-                |m| m.ts,
-                out,
-            );
-        }
-    }
-
-    /// [`SegmentCursor`] over a [`CompactTrace`]: threads BOTH the memory
-    /// image and the REGISTER FILE forward across a chain's windows, and
-    /// materializes each requested window's full steps
-    /// ([`expand_steps`] — window-local, dropped with the window's
-    /// `SideNote`), so the chips consume ordinary [`PvmStep`]s while the
-    /// chain-wide holder stays compact.
-    ///
-    /// Equivalence: the yielded `SideNote` equals
-    /// `segment_side_note(&full_side_note, a, b)` field for field (unit-
-    /// pinned by `compact_cursor_matches_segment_side_note`) — the memory
-    /// threading is `StreamCursors` + the same step-write enumeration
-    /// (both step forms carry identical `mem_write`s), the register file
-    /// is exact because a step's whole register delta is its
-    /// [`crate::core::step::RegWrite`] (tracer-verified), and the assembly
-    /// is `assemble_segment`, the same path the full holder runs.
-    ///
-    /// Same visiting contract as [`SegmentCursor`]: ascending window
-    /// starts, skipped windows advance the state without building them.
-    pub struct CompactSegmentCursor<'a> {
-        full: &'a CompactTrace,
-        /// The carried image: `full.initial_memory` with every write at
-        /// `ts < applied_upto` applied.
-        mem: Vec<u8>,
-        /// The carried register file: `full.initial_regs` with every step
-        /// reg-write at `ts < applied_upto` applied — the file ENTERING
-        /// the first unapplied step.
-        regs: [u64; NUM_REGS],
-        /// Exclusive timestamp bound of the writes already applied.
-        applied_upto: u64,
-        /// Index of the first step not yet applied to `mem`/`regs`.
-        steps_at: usize,
-        /// Per-stream indices of the first precompile output write not yet
-        /// applied to `mem`.
-        streams: StreamCursors,
-    }
-
-    impl<'a> CompactSegmentCursor<'a> {
-        /// Start a pass over `full`'s windows from its initial memory and
-        /// initial register file.
-        pub fn new(full: &'a CompactTrace) -> Self {
-            Self {
-                full,
-                mem: full.initial_memory.clone(),
-                regs: full.initial_regs,
-                applied_upto: 0,
-                steps_at: 0,
-                streams: StreamCursors::default(),
-            }
-        }
-
-        /// The segment `SideNote` for `[a, b)` — field-identical to
-        /// slicing the expanded full trace. Panics on an invalid range or
-        /// a window starting before one already yielded.
-        pub fn side_note(&mut self, a: usize, b: usize) -> SideNote {
-            assert!(
-                a < b && b <= self.full.steps.len(),
-                "invalid segment range [{a}, {b}) over {} steps",
-                self.full.steps.len()
-            );
-            let ts_lo = self.full.steps[a].timestamp;
-            assert!(
-                ts_lo >= self.applied_upto,
-                "windows must be visited in ascending order: window start ts {ts_lo} \
-                 precedes the image already advanced to ts {}",
-                self.applied_upto
-            );
-            self.advance_to(ts_lo);
-            let ts_hi = self
-                .full
-                .steps
-                .get(b)
-                .map(|s| s.timestamp)
-                .unwrap_or(u64::MAX);
-            // The carried file IS the file entering step `a`: timestamps
-            // are strictly increasing, so exactly the steps before `a`
-            // have ts < ts_lo and their reg writes are already applied.
-            let steps = expand_steps(&self.full.steps[a..b], self.regs);
-            assemble_segment(
-                &ChainParts::from(self.full),
-                steps,
-                self.regs,
-                SegmentMemory::Dense(self.mem.clone()),
-                ts_hi,
-            )
-        }
-
-        /// Apply every not-yet-applied write with `ts < ts_lo`: step
-        /// memory writes + register writes in one walk (each step applied
-        /// exactly once), then the precompile output streams — the same
-        /// enumeration [`SegmentCursor::advance_to`] performs, plus the
-        /// register threading the compact form requires.
-        fn advance_to(&mut self, ts_lo: u64) {
-            let full = self.full;
-            let mut writes: Vec<PendingWrite> = Vec::new();
-            while let Some(s) = full.steps.get(self.steps_at) {
-                if s.timestamp >= ts_lo {
-                    break;
-                }
-                writes_of_step(s, &mut writes);
-                if let Some(rw) = s.reg_write {
-                    self.regs[rw.index as usize] = rw.value;
-                }
-                self.steps_at += 1;
-            }
-            self.streams
-                .drain_below(&ChainParts::from(full), ts_lo, &mut writes);
-            apply_writes(&mut self.mem, writes);
-            self.applied_upto = ts_lo;
-        }
-    }
-
-    /// Advance `at` past every op with `ts_of(op) < ts_lo`, pushing each
-    /// one's pending write. The stream is ts-sorted, so the monotone cursor
-    /// visits every op exactly once across a whole pass.
-    fn drain_stream<T>(
-        ops: &[T],
-        at: &mut usize,
-        ts_lo: u64,
-        to_write: impl Fn(&T) -> PendingWrite,
-        ts_of: impl Fn(&T) -> u64,
-        out: &mut Vec<PendingWrite>,
-    ) {
-        while *at < ops.len() && ts_of(&ops[*at]) < ts_lo {
-            out.push(to_write(&ops[*at]));
-            *at += 1;
-        }
-    }
-
-    /// One traced step plus the precompile call/mem-op pair its ECALL
-    /// recorded — at most one pair, on at most one stream (a step is at
-    /// most one ECALL; the invariant the ts-sorted streams rest on). The
-    /// unit a [`StepSource`] hands the [`TraceStream`] windower.
-    pub struct StepArrival {
-        pub(crate) step: CompactStep,
-        pub(crate) blake2b: Option<(Blake2bCall, Blake2bMemOp)>,
-    }
-
-    impl StepArrival {
-        /// The step's touched ranges — its own read/write plus its
-        /// precompile op's buffers, via the same per-stream helpers the
-        /// offline budgeted walk uses, so online page accounting counts
-        /// exactly what [`segment_bounds_budgeted`] counts.
-        fn ranges(&self, out: &mut Vec<(u32, u32)>) {
-            out.clear();
-            step_ranges(&self.step, out);
-            if let Some((_, o)) = &self.blake2b {
-                blake2b_op_ranges(o, out);
-            }
-        }
-
-        /// Every attached op must carry the step's own timestamp — the
-        /// binding that makes online "ops at this step" equal the offline
-        /// walk's ts-filtered `take_at`.
-        fn assert_ts_consistent(&self) {
-            let ts = self.step.timestamp;
-            debug_assert!(self.blake2b.as_ref().is_none_or(|(_, o)| o.ts == ts));
-        }
-    }
-
-    /// A producer of traced steps for [`TraceStream`] — the seam that lets
-    /// the windower run over a live [`TracingPvm`] ([`TracingSource`]) in
-    /// production and over hand-built fixtures in the equivalence tests.
-    pub trait StepSource {
-        /// The next traced step with its ECALL records, or `None` once the
-        /// run terminated.
-        fn next_arrival(&mut self) -> Option<StepArrival>;
-        /// Register file entering the first produced step; meaningful once
-        /// at least one arrival was produced.
-        fn initial_regs(&self) -> [u64; NUM_REGS];
-    }
-
-    /// The live [`StepSource`]: pumps a [`TracingPvm`] one
-    /// [`TracingPvm::step_with_precompiles`] iteration per arrival —
-    /// identical execution to `run_with_precompiles` (the loop over the same
-    /// method) — draining the recorded step and its precompile records out
-    /// of the tracer as they land, so the tracer holds no trace at all:
-    /// the windower's current window is the only step storage anywhere.
-    pub struct TracingSource {
-        tracer: TracingPvm,
-        done: bool,
-    }
-
-    impl TracingSource {
-        pub fn new(tracer: TracingPvm) -> Self {
-            Self {
-                tracer,
-                done: false,
-            }
-        }
-    }
-
-    /// Take the (at most one) freshly recorded `(call, mem_op)` pair off a
-    /// tracer stream. The source drains after every step, so a stream
-    /// holds 0 or 1 pairs here.
-    fn pop_pair<C, M>(calls: &mut Vec<C>, ops: &mut Vec<M>) -> Option<(C, M)> {
-        debug_assert_eq!(calls.len(), ops.len());
-        debug_assert!(calls.len() <= 1);
-        Some((calls.pop()?, ops.pop()?))
-    }
-
-    impl StepSource for TracingSource {
-        fn next_arrival(&mut self) -> Option<StepArrival> {
-            if self.done {
-                return None;
-            }
-            if self.tracer.step_with_precompiles().is_some() {
-                self.done = true;
-            }
-            let step = self
-                .tracer
-                .take_step()
-                .expect("every pumped iteration records exactly one step");
-            debug_assert_eq!(self.tracer.num_steps(), 0);
-            let t = &mut self.tracer;
-            Some(StepArrival {
-                step,
-                blake2b: pop_pair(&mut t.blake2b_records, &mut t.blake2b_mem_ops).map(|(r, m)| {
-                    (
-                        Blake2bCall {
-                            h: r.h,
-                            m: r.m,
-                            t: r.t,
-                            f: r.f,
-                        },
-                        m,
-                    )
-                }),
-            })
-        }
-
-        fn initial_regs(&self) -> [u64; NUM_REGS] {
-            self.tracer.initial_regs()
-        }
-    }
-
-    /// One window's accumulating storage: its compact steps plus its
-    /// precompile call/mem-op stream slices, exactly the per-window share
-    /// of what a [`CompactTrace`] holds chain-wide.
-    #[derive(Default)]
-    struct WindowBuf {
-        steps: Vec<CompactStep>,
-        blake2b_calls: Vec<Blake2bCall>,
-        blake2b_mem_ops: Vec<Blake2bMemOp>,
-    }
-
-    impl WindowBuf {
-        fn push(&mut self, arr: StepArrival) {
-            self.steps.push(arr.step);
-            if let Some((c, m)) = arr.blake2b {
-                self.blake2b_calls.push(c);
-                self.blake2b_mem_ops.push(m);
-            }
-        }
-
-        /// The window's stream slices as a [`ChainParts`] view. Handing
-        /// pre-sliced streams through [`assemble_segment`] yields exactly
-        /// what filtering the full streams yields: every op here has its
-        /// ts inside the window, so the assembly's `in_window` filter
-        /// passes each one, in the same (step) order.
-        fn parts<'a>(
-            &'a self,
-            code: &'a [u8],
-            bitmask: &'a [u8],
-            jump_table: &'a [u32],
-            memory_layout: crate::chips::memory_page::MemoryLayout,
-        ) -> ChainParts<'a> {
-            ChainParts {
-                code,
-                bitmask,
-                jump_table,
-                blake2b_calls: &self.blake2b_calls,
-                blake2b_mem_ops: &self.blake2b_mem_ops,
-                memory_layout: Some(memory_layout),
-            }
-        }
-
-        /// The window's precompile OUTPUT writes as pending writes — the
-        /// same per-stream mapping [`StreamCursors::drain_below`] applies
-        /// when a cursor advances past these ops.
-        fn pending_writes(&self, out: &mut Vec<PendingWrite>) {
-            for m in &self.blake2b_mem_ops {
-                out.push(write_of_bytes(m.ts, m.h_ptr, &m.out_bytes));
-            }
-        }
-    }
-
-    /// A closed window: its step bounds, the exclusive timestamp bound of
-    /// the next window (`None` until the successor step's ts is known;
-    /// `u64::MAX` for the chain's last window — exactly the offline
-    /// `full.steps.get(b).map(ts).unwrap_or(MAX)`), and its buffered
-    /// content.
-    struct ClosedWindow {
-        bounds: (usize, usize),
-        ts_hi: Option<u64>,
-        buf: WindowBuf,
-    }
-
-    /// The streaming chain driver: runs a [`StepSource`] (production: a
-    /// live [`TracingPvm`] via [`TracingSource`]) and cuts windows ONLINE
-    /// with the same `BudgetedCutter` decisions the offline
-    /// [`segment_bounds_budgeted`] walk makes, yielding each window's
-    /// `SideNote` as the tracer completes it and dropping it before the
-    /// next — so a multi-million-step chain is NEVER resident: peak step
-    /// storage is one window's compact steps (plus the window-local
-    /// expansion during [`Self::side_note`]), instead of the whole
-    /// [`CompactTrace`] (~1 GiB at 7.8M steps).
-    ///
-    /// Equivalence: the cut shares the offline cutter's decision path
-    /// (bit-identical bounds); the entering memory image and register
-    /// file are threaded forward with the same write enumeration
-    /// `CompactSegmentCursor::advance_to` performs (batched per window);
-    /// and the assembly is `assemble_segment` — so every yielded window
-    /// is field-identical to the compact cursor's over the same traced
-    /// run (unit-pinned by the `trace_stream_*` equivalence tests).
-    ///
-    /// Contract: call [`Self::next_window`] repeatedly; after each
-    /// `Some(bounds)`, optionally call [`Self::side_note`] before the next
-    /// `next_window` call retires the window — skipped windows advance the
-    /// carried state without expansion, the cursor pattern's sparse-probe
-    /// economy.
-    pub struct TraceStream<S: StepSource> {
-        source: S,
-        code: Vec<u8>,
-        bitmask: Vec<u8>,
-        jump_table: Vec<u32>,
-        memory_layout: crate::chips::memory_page::MemoryLayout,
-        cutter: BudgetedCutter,
-        /// The carried image: the initial memory with every retired
-        /// window's writes applied — the image ENTERING the current
-        /// window, as [`CompactSegmentCursor`] carries it.
-        mem: Vec<u8>,
-        /// The carried register file entering the current window.
-        regs: [u64; NUM_REGS],
-        regs_seeded: bool,
-        /// The window currently accumulating arrivals.
-        acc: WindowBuf,
-        /// A step-budget-closed window awaiting its successor's ts.
-        pending: Option<ClosedWindow>,
-        /// A fully resolved window not yet handed to the caller.
-        ready: Option<ClosedWindow>,
-        /// The window handed out by the last `next_window`, retired (its
-        /// writes applied to the carried state) on the next call.
-        current: Option<ClosedWindow>,
-        exhausted: bool,
-        ranges_scratch: Vec<(u32, u32)>,
-        steps_seen: usize,
-    }
-
-    impl<S: StepSource> TraceStream<S> {
-        /// Windower over `source` with the `(seg_steps, page_budget)` cut;
-        /// `page_budget == 0` means the uniform step cut ([`super::
-        /// segment_bounds`]), realized as an unbounded page budget — the
-        /// budgeted walk degenerates to exactly the uniform bounds.
-        /// `initial_memory` is the image the trace starts from (the
-        /// pre-run flat_mem); `code`/`bitmask`/`jump_table` and
-        /// `memory_layout` the program-static fields every window shares.
-        #[allow(clippy::too_many_arguments)]
-        pub fn new(
-            source: S,
-            code: Vec<u8>,
-            bitmask: Vec<u8>,
-            jump_table: Vec<u32>,
-            memory_layout: crate::chips::memory_page::MemoryLayout,
-            initial_memory: Vec<u8>,
-            seg_steps: usize,
-            page_budget: usize,
-        ) -> Self {
-            let max_pages = if page_budget == 0 {
-                usize::MAX
-            } else {
-                page_budget
-            };
-            Self {
-                source,
-                code,
-                bitmask,
-                jump_table,
-                memory_layout,
-                cutter: BudgetedCutter::new(seg_steps, max_pages),
-                mem: initial_memory,
-                regs: [0u64; NUM_REGS],
-                regs_seeded: false,
-                acc: WindowBuf::default(),
-                pending: None,
-                ready: None,
-                current: None,
-                exhausted: false,
-                ranges_scratch: Vec::new(),
-                steps_seen: 0,
-            }
-        }
-
-        /// Advance to the next window: retire the previous one (apply its
-        /// writes to the carried image + register file) and run the
-        /// source until a window completes. Returns its step bounds, or
-        /// `None` when the trace is exhausted.
-        pub fn next_window(&mut self) -> Option<(usize, usize)> {
-            if let Some(w) = self.current.take() {
-                self.retire(w);
-            }
-            loop {
-                if let Some(w) = self.ready.take() {
-                    let bounds = w.bounds;
-                    self.current = Some(w);
-                    return Some(bounds);
-                }
-                if self.exhausted {
-                    // Flush: a step-budget-closed window awaiting a
-                    // successor that never came (its exclusive ts bound is
-                    // MAX), else the final partial window the cutter still
-                    // holds open.
-                    if let Some(mut p) = self.pending.take() {
-                        p.ts_hi = Some(u64::MAX);
-                        self.ready = Some(p);
-                        continue;
-                    }
-                    if let Some(bounds) = self.cutter.finish() {
-                        debug_assert_eq!(bounds.1 - bounds.0, self.acc.steps.len());
-                        self.ready = Some(ClosedWindow {
-                            bounds,
-                            ts_hi: Some(u64::MAX),
-                            buf: core::mem::take(&mut self.acc),
-                        });
-                        continue;
-                    }
-                    return None;
-                }
-                match self.source.next_arrival() {
-                    Some(arr) => self.on_arrival(arr),
-                    None => self.exhausted = true,
-                }
-            }
-        }
-
-        /// The current window's step bounds (the last `next_window`
-        /// return). Panics with no current window.
-        pub fn bounds(&self) -> (usize, usize) {
-            self.current
-                .as_ref()
-                .expect("no current window: call next_window first")
-                .bounds
-        }
-
-        /// Assemble the current window's `SideNote` — field-identical to
-        /// [`CompactSegmentCursor::side_note`] over the same traced run
-        /// (same entering state threading, same `assemble_segment`).
-        /// The expansion is window-local and dropped with the returned
-        /// `SideNote`. Panics with no current window.
-        pub fn side_note(&mut self) -> SideNote {
-            let w = self
-                .current
-                .as_ref()
-                .expect("no current window: call next_window first");
-            let steps = expand_steps(&w.buf.steps, self.regs);
-            assemble_segment(
-                &w.buf.parts(
-                    &self.code,
-                    &self.bitmask,
-                    &self.jump_table,
-                    self.memory_layout,
-                ),
-                steps,
-                self.regs,
-                SegmentMemory::Dense(self.mem.clone()),
-                w.ts_hi.expect("a current window's ts bound is resolved"),
-            )
-        }
-
-        /// Steps consumed so far; the trace's total length once
-        /// `next_window` has returned `None`.
-        pub fn steps_seen(&self) -> usize {
-            self.steps_seen
-        }
-
-        fn on_arrival(&mut self, arr: StepArrival) {
-            if !self.regs_seeded {
-                self.regs = self.source.initial_regs();
-                self.regs_seeded = true;
-            }
-            arr.assert_ts_consistent();
-            let ts = arr.step.timestamp;
-            // A step-budget-closed window's exclusive ts bound is this
-            // step's ts (offline: `full.steps[b].timestamp`).
-            if let Some(mut p) = self.pending.take() {
-                p.ts_hi = Some(ts);
-                debug_assert!(self.ready.is_none());
-                self.ready = Some(p);
-            }
-            let mut ranges = core::mem::take(&mut self.ranges_scratch);
-            arr.ranges(&mut ranges);
-            let (before, after) = self.cutter.feed(&ranges);
-            self.ranges_scratch = ranges;
-            if let Some(bounds) = before {
-                // Page-budget close: the accumulated steps end BEFORE this
-                // step, so its ts is the closed window's exclusive bound.
-                // Can't collide with a pending resolution above: a pending
-                // window empties the accumulator, and the page close
-                // requires an accumulated step.
-                debug_assert!(self.ready.is_none());
-                debug_assert_eq!(bounds.1 - bounds.0, self.acc.steps.len());
-                self.ready = Some(ClosedWindow {
-                    bounds,
-                    ts_hi: Some(ts),
-                    buf: core::mem::take(&mut self.acc),
-                });
-            }
-            self.acc.push(arr);
-            self.steps_seen += 1;
-            if let Some(bounds) = after {
-                debug_assert!(self.pending.is_none());
-                debug_assert_eq!(bounds.1 - bounds.0, self.acc.steps.len());
-                self.pending = Some(ClosedWindow {
-                    bounds,
-                    ts_hi: None,
-                    buf: core::mem::take(&mut self.acc),
-                });
-            }
-        }
-
-        /// Apply a retired window's writes to the carried state — the
-        /// same enumeration [`CompactSegmentCursor::advance_to`] performs
-        /// (step stores + register writes in one walk, then the
-        /// precompile output streams), batched per window.
-        fn retire(&mut self, w: ClosedWindow) {
-            let mut writes: Vec<PendingWrite> = Vec::new();
-            for s in &w.buf.steps {
-                writes_of_step(s, &mut writes);
-                if let Some(rw) = s.reg_write {
-                    self.regs[rw.index as usize] = rw.value;
-                }
-            }
-            w.buf.pending_writes(&mut writes);
-            apply_writes(&mut self.mem, writes);
         }
     }
 
@@ -1265,10 +563,7 @@ mod prover {
 }
 
 #[cfg(feature = "prover")]
-pub use prover::{
-    CompactSegmentCursor, SegmentCursor, StepArrival, StepSource, TraceStream, TracingSource,
-    segment_bounds_budgeted, segment_bounds_budgeted_compact, segment_side_note,
-};
+pub use prover::{SegmentCursor, segment_bounds_budgeted, segment_side_note};
 #[cfg(feature = "prover")]
 pub(crate) use prover::{replay_sparse_writes, replay_writes};
 
@@ -1379,8 +674,7 @@ mod tests {
     /// register history is CONSISTENT (a non-zero seeded file threaded
     /// through per-step `reg_write`s that rotate across indices, with one
     /// no-write step and one taken branch), so every step has a distinct
-    /// file AND the trace converts to compact form — the compact-cursor
-    /// equivalence tests reuse this fixture.
+    /// file.
     fn threaded_trace() -> SideNote {
         use crate::chips::blake2b::Blake2bCall;
         use crate::core::tracing::Blake2bMemOp;
@@ -1553,356 +847,5 @@ mod tests {
         let mut cursor = crate::segment::SegmentCursor::new(&full);
         cursor.side_note(4, 8);
         cursor.side_note(0, 4);
-    }
-
-    /// The compact holder for a full fixture: steps converted one-to-one
-    /// (`to_compact` panics if the fixture's register history were not
-    /// step-consistent), streams and program-static fields carried over.
-    fn compact_of(full: &SideNote) -> crate::side_note::CompactTrace {
-        crate::side_note::CompactTrace {
-            steps: full.steps.iter().map(|s| s.to_compact()).collect(),
-            initial_regs: full.steps[0].regs_before,
-            code: full.code.to_vec(),
-            bitmask: full.bitmask.to_vec(),
-            initial_memory: full.initial_memory.clone(),
-            jump_table: full.jump_table.to_vec(),
-            blake2b_calls: full.blake2b_calls.clone(),
-            blake2b_mem_ops: full.blake2b_mem_ops.clone(),
-            memory_layout: full.memory_layout().expect("a layout"),
-        }
-    }
-
-    /// The W2.2 soundness bar: every window a [`CompactSegmentCursor`]
-    /// yields equals the full-trace slice field for field — including
-    /// every `PvmStep` field (snapshots rebuilt from the threaded register
-    /// file; `assert_windows_equal`'s steps equality is `PvmStep`'s derived
-    /// `PartialEq`), the entering image (with `replay_writes`' resize
-    /// growth) and the entering registers. The fixture crosses register
-    /// writes, a branch, and precompile records over the window
-    /// boundaries.
-    #[test]
-    fn compact_cursor_matches_segment_side_note() {
-        let full = threaded_trace();
-        let compact = compact_of(&full);
-        let bounds = segment_bounds(full.steps.len(), 4);
-        assert_eq!(bounds.len(), 3);
-        let mut cursor = crate::segment::CompactSegmentCursor::new(&compact);
-        let mut windows = Vec::new();
-        for &(a, b) in &bounds {
-            let via_compact = cursor.side_note(a, b);
-            assert_windows_equal(&via_compact, &segment_side_note(&full, a, b));
-            windows.push(via_compact);
-        }
-        // Non-vacuity: the register threading is actually exercised — the
-        // windows enter with three DISTINCT non-zero files, and in-window
-        // steps carry register writes the expansion must apply.
-        assert_ne!(windows[0].initial_regs, windows[1].initial_regs);
-        assert_ne!(windows[1].initial_regs, windows[2].initial_regs);
-        assert!(windows.iter().all(|w| w.initial_regs[1] != 0));
-        assert!(
-            windows[1].steps.iter().any(|s| s.reg_write.is_some()),
-            "fixture must place register writes inside the windows"
-        );
-    }
-
-    /// Skipping windows must thread BOTH carried states across the gap:
-    /// jumping straight to the last window applies the gap's register
-    /// writes and memory writes (step stores + precompile outputs) without
-    /// materializing the intervening windows.
-    #[test]
-    fn compact_cursor_skips_windows_without_building_them() {
-        let full = threaded_trace();
-        let compact = compact_of(&full);
-        let bounds = segment_bounds(full.steps.len(), 4);
-        let (a, b) = bounds[2];
-        let mut cursor = crate::segment::CompactSegmentCursor::new(&compact);
-        assert_windows_equal(&cursor.side_note(a, b), &segment_side_note(&full, a, b));
-    }
-
-    #[test]
-    #[should_panic(expected = "ascending order")]
-    fn compact_cursor_rejects_backward_windows() {
-        let full = threaded_trace();
-        let compact = compact_of(&full);
-        let mut cursor = crate::segment::CompactSegmentCursor::new(&compact);
-        cursor.side_note(4, 8);
-        cursor.side_note(0, 4);
-    }
-
-    /// The budgeted cut must be bit-identical over the two holder forms —
-    /// the pinned allowlist assumes producer and measurement cut the same
-    /// windows regardless of which representation they walked.
-    #[test]
-    fn compact_budgeted_bounds_match_full() {
-        for full in [spray_trace(), threaded_trace()] {
-            let compact = compact_of(&full);
-            for (max_steps, max_pages) in [(12, 2), (5, usize::MAX >> 1), (4, 1)] {
-                assert_eq!(
-                    segment_bounds_budgeted_compact(&compact, max_steps, max_pages),
-                    segment_bounds_budgeted(&full, max_steps, max_pages),
-                    "cut diverged at budgets ({max_steps}, {max_pages})"
-                );
-            }
-        }
-    }
-
-    /// Test-only [`StepSource`]: replays a hand-built full-trace fixture
-    /// as arrivals — each step with the precompile pair recorded at its
-    /// ts — so the ONLINE windower can be driven over the same synthetic
-    /// fixtures the offline paths are pinned on (records crossing window
-    /// boundaries, resize growth).
-    struct ReplaySource {
-        arrivals: std::collections::VecDeque<crate::segment::StepArrival>,
-        initial_regs: [u64; NUM_REGS],
-    }
-
-    impl ReplaySource {
-        fn from_side_note(full: &SideNote) -> Self {
-            fn pair_at<C: Clone, M: Clone>(
-                calls: &[C],
-                ops: &[M],
-                ts: u64,
-                ts_of: impl Fn(&M) -> u64,
-            ) -> Option<(C, M)> {
-                ops.iter()
-                    .position(|m| ts_of(m) == ts)
-                    .map(|i| (calls[i].clone(), ops[i].clone()))
-            }
-            let arrivals = full
-                .steps
-                .iter()
-                .map(|s| {
-                    let ts = s.timestamp;
-                    crate::segment::StepArrival {
-                        step: s.to_compact(),
-                        blake2b: pair_at(&full.blake2b_calls, &full.blake2b_mem_ops, ts, |m| m.ts),
-                    }
-                })
-                .collect();
-            Self {
-                arrivals,
-                initial_regs: full.steps[0].regs_before,
-            }
-        }
-    }
-
-    impl crate::segment::StepSource for ReplaySource {
-        fn next_arrival(&mut self) -> Option<crate::segment::StepArrival> {
-            self.arrivals.pop_front()
-        }
-        fn initial_regs(&self) -> [u64; NUM_REGS] {
-            self.initial_regs
-        }
-    }
-
-    /// A [`TraceStream`] over `full` replayed with the given cut.
-    fn stream_of(
-        full: &SideNote,
-        seg_steps: usize,
-        page_budget: usize,
-    ) -> crate::segment::TraceStream<ReplaySource> {
-        crate::segment::TraceStream::new(
-            ReplaySource::from_side_note(full),
-            full.code.to_vec(),
-            full.bitmask.to_vec(),
-            full.jump_table.to_vec(),
-            full.memory_layout().expect("a layout"),
-            full.initial_memory.clone(),
-            seg_steps,
-            page_budget,
-        )
-    }
-
-    /// The W2(a) equivalence bar, synthetic side: over the threaded
-    /// fixture (precompile records crossing both boundaries, resize
-    /// growth past the image) the ONLINE windower's cut
-    /// and windows must equal the offline path — the uniform cut
-    /// (`page_budget = 0`) checked window-by-window against
-    /// `segment_side_note`, field for field.
-    #[test]
-    fn trace_stream_matches_offline_windows_on_uniform_cut() {
-        let full = threaded_trace();
-        let bounds = segment_bounds(full.steps.len(), 4);
-        assert_eq!(bounds.len(), 3);
-        let mut stream = stream_of(&full, 4, 0);
-        let mut streamed_bounds = Vec::new();
-        while let Some((a, b)) = stream.next_window() {
-            streamed_bounds.push((a, b));
-            assert_windows_equal(&stream.side_note(), &segment_side_note(&full, a, b));
-        }
-        assert_eq!(streamed_bounds, bounds, "online uniform cut diverged");
-        assert_eq!(stream.steps_seen(), full.steps.len());
-    }
-
-    /// The synthetic budgeted side: online cut bit-identical to
-    /// `segment_bounds_budgeted` AND every window field-identical, on
-    /// both fixtures across page budgets that trigger page closes,
-    /// step closes, and the degenerate huge budget.
-    #[test]
-    fn trace_stream_budgeted_cut_and_windows_match_offline() {
-        for full in [spray_trace(), threaded_trace()] {
-            for (max_steps, max_pages) in [(12, 2), (5, usize::MAX >> 1), (4, 1), (1, 3)] {
-                let offline = segment_bounds_budgeted(&full, max_steps, max_pages);
-                let mut cursor = crate::segment::SegmentCursor::new(&full);
-                let mut stream = stream_of(&full, max_steps, max_pages);
-                let mut online = Vec::new();
-                while let Some((a, b)) = stream.next_window() {
-                    online.push((a, b));
-                    assert_windows_equal(&stream.side_note(), &cursor.side_note(a, b));
-                }
-                assert_eq!(
-                    online, offline,
-                    "cut diverged at budgets ({max_steps}, {max_pages})"
-                );
-            }
-        }
-    }
-
-    /// Skipped windows must advance the carried state exactly like the
-    /// cursor's skip-advance: assembling only the LAST window after
-    /// skipping the rest yields the same window a full offline slice
-    /// does — the sparse-probe pattern the measurement passes rely on.
-    #[test]
-    fn trace_stream_skips_windows_without_building_them() {
-        let full = threaded_trace();
-        let bounds = segment_bounds(full.steps.len(), 4);
-        let (a, b) = bounds[2];
-        let mut stream = stream_of(&full, 4, 0);
-        while let Some(w) = stream.next_window() {
-            if w == (a, b) {
-                assert_windows_equal(&stream.side_note(), &segment_side_note(&full, a, b));
-                return;
-            }
-        }
-        panic!("stream never reached the probe window");
-    }
-
-    /// The W2(a) equivalence bar, LIVE side: a real multi-window program
-    /// (blake2b ECALLs at page-striding pointers, register-moving Add64s)
-    /// pumped through [`TracingSource`] must cut and assemble exactly
-    /// what the run-to-completion compact holder + cursor produce over an
-    /// identical interpreter — pinning the live arrival plumbing (the
-    /// step→ECALL-record association) the replay tests can't see.
-    #[test]
-    fn trace_stream_live_tracer_matches_offline_compact_path() {
-        use crate::core::tracing::TracingPvm;
-        use vos_pvm::instruction::Opcode;
-        use vos_pvm::interpreter::Interpreter;
-
-        // The precompile id as a two-byte little-endian immediate.
-        let [id_lo, id_hi, ..] = crate::core::tracing::ECALL_BLAKE2B_COMPRESS.to_le_bytes();
-        // Ecalli <BLAKE2b>; (φ7 += φ11); Ecalli; add; Ecalli; Trap — h_ptr
-        // strides one page per call so a small page budget cuts between
-        // the calls, and each output lands where a later window's
-        // entering image must carry it.
-        let code = vec![
-            Opcode::Ecalli as u8,
-            id_lo,
-            id_hi,
-            Opcode::Add64 as u8,
-            0x07 | (11 << 4),
-            7,
-            Opcode::Ecalli as u8,
-            id_lo,
-            id_hi,
-            Opcode::Add64 as u8,
-            0x07 | (11 << 4),
-            7,
-            Opcode::Ecalli as u8,
-            id_lo,
-            id_hi,
-            Opcode::Trap as u8,
-        ];
-        let bitmask = vec![1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1];
-        let mut regs = [0u64; NUM_REGS];
-        let h_base = u64::from(vos_pvm::PVM_ZONE_SIZE);
-        regs[7] = h_base; // h_ptr — strides by φ[11] per Add64
-        regs[8] = h_base + 0x4000; // m_ptr — fixed
-        regs[9] = 0; // t_low
-        regs[10] = 1; // f flag
-        regs[11] = 0x1000; // page stride
-        let flat_mem = vec![0u8; h_base as usize + 0x5000];
-        let interp = || {
-            Interpreter::new(
-                code.clone(),
-                bitmask.clone(),
-                vec![],
-                regs,
-                flat_mem.clone(),
-                10_000,
-            )
-        };
-
-        // Offline: run to completion, hold the compact chain form.
-        let mut tracing = TracingPvm::new(interp());
-        let _ = tracing.run_with_precompiles();
-        let blake2b_calls = tracing
-            .blake2b_calls()
-            .iter()
-            .map(|c| crate::chips::blake2b::Blake2bCall {
-                h: c.h,
-                m: c.m,
-                t: c.t,
-                f: c.f,
-            })
-            .collect();
-        let blake2b_mem_ops = std::mem::take(&mut tracing.blake2b_mem_ops);
-        let (steps, initial_regs) = tracing.into_compact();
-        assert_eq!(steps.len(), 6, "fixture shape drifted");
-        let compact = crate::side_note::CompactTrace {
-            steps,
-            initial_regs,
-            code: code.clone(),
-            bitmask: bitmask.clone(),
-            initial_memory: flat_mem.clone(),
-            jump_table: vec![],
-            blake2b_calls,
-            blake2b_mem_ops,
-            memory_layout: crate::chips::memory_page::MemoryLayout::writable(),
-        };
-
-        for (seg_steps, page_budget) in [(2usize, 0usize), (6, 2), (4, 2)] {
-            let offline = if page_budget == 0 {
-                segment_bounds(compact.steps.len(), seg_steps)
-            } else {
-                segment_bounds_budgeted_compact(&compact, seg_steps, page_budget)
-            };
-            let mut cursor = crate::segment::CompactSegmentCursor::new(&compact);
-            let mut stream = crate::segment::TraceStream::new(
-                crate::segment::TracingSource::new(TracingPvm::new(interp())),
-                code.clone(),
-                bitmask.clone(),
-                vec![],
-                crate::chips::memory_page::MemoryLayout::writable(),
-                flat_mem.clone(),
-                seg_steps,
-                page_budget,
-            );
-            let mut online = Vec::new();
-            let mut windows = Vec::new();
-            while let Some((a, b)) = stream.next_window() {
-                online.push((a, b));
-                let via_stream = stream.side_note();
-                assert_windows_equal(&via_stream, &cursor.side_note(a, b));
-                windows.push(via_stream);
-            }
-            assert_eq!(
-                online, offline,
-                "live cut diverged at budgets ({seg_steps}, {page_budget})"
-            );
-            // Non-vacuity: a real multi-window chain whose later windows'
-            // entering images carry the earlier blake2b outputs.
-            assert!(windows.len() >= 2, "fixture must cut into a real chain");
-            assert!(
-                windows[0].blake2b_calls.len() == 1,
-                "window 0 must hold the first blake2b call"
-            );
-            let out0 = windows[0].blake2b_mem_ops[0].out_bytes;
-            assert_eq!(
-                windows.last().unwrap().initial_memory[h_base as usize..h_base as usize + 0x40],
-                out0,
-                "a later window's entering image must carry window 0's blake2b output"
-            );
-        }
     }
 }

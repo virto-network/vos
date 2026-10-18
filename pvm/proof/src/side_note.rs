@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use std::collections::HashMap;
 
-use crate::core::step::{CompactStep, NUM_REGS, PvmStep, expand_steps};
+use crate::core::step::{NUM_REGS, PvmStep};
 
 /// Prover's side note used for tracking additional data for trace generation.
 pub struct SideNote {
@@ -141,63 +141,6 @@ pub struct SideNote {
     /// through [`Self::memory_layout`]; attached by
     /// [`Self::with_memory_layout`].
     memory_layout: Option<crate::chips::memory_page::MemoryLayout>,
-}
-
-/// The chain-side trace holder: everything a chain pass needs from a traced
-/// run — the program-static fields, the initial memory/register state, and
-/// the BLAKE2b precompile's call/mem-op streams — with the steps in
-/// [`CompactStep`] form (no per-step register snapshots), so a
-/// multi-million-step chain resides at ~2.6× less than a full [`SideNote`].
-///
-/// Windows are materialized per segment by
-/// [`crate::segment::CompactSegmentCursor`], which threads the memory image
-/// and the register file forward and yields `SideNote`s identical to
-/// slicing a full trace ([`crate::segment::segment_side_note`]) — the
-/// chips never see this type. Single-proof paths expand the whole run via
-/// [`Self::into_side_note`] instead.
-pub struct CompactTrace {
-    /// The execution trace in compact form (ts-ascending, one per step).
-    pub steps: Vec<CompactStep>,
-    /// Register file entering `steps[0]` (the interpreter's seeded file) —
-    /// the base the per-step [`crate::core::step::RegWrite`]s thread from.
-    pub initial_regs: [u64; NUM_REGS],
-    /// Program bytecode.
-    pub code: Vec<u8>,
-    /// Bitmask for instruction validation.
-    pub bitmask: Vec<u8>,
-    /// Initial memory state (flat_mem entering the traced run).
-    pub initial_memory: Vec<u8>,
-    /// Program's jump_table (program-static, shared by all segments).
-    pub jump_table: Vec<u32>,
-    /// The BLAKE2b precompile's call/mem-op streams, exactly as a full
-    /// `SideNote` carries them (parallel 1:1, ts-ascending).
-    pub blake2b_calls: Vec<crate::chips::blake2b::Blake2bCall>,
-    pub blake2b_mem_ops: Vec<crate::core::tracing::Blake2bMemOp>,
-    /// The pages the program may touch (program-static).
-    pub memory_layout: crate::chips::memory_page::MemoryLayout,
-}
-
-impl CompactTrace {
-    pub fn num_steps(&self) -> usize {
-        self.steps.len()
-    }
-
-    /// Expand into the full `SideNote` the single-proof paths hold: steps
-    /// with snapshots rebuilt from `initial_regs` and the streams moved
-    /// over. Note
-    /// `SideNote::initial_regs` stays at its all-zero default (as on the
-    /// historical assembly path); `prove` seeds it from
-    /// `steps[0].regs_before`.
-    pub fn into_side_note(self) -> SideNote {
-        let steps = expand_steps(&self.steps, self.initial_regs);
-        let mut sn = SideNote::new(steps, self.code, self.bitmask)
-            .with_memory(self.initial_memory)
-            .with_jump_table(self.jump_table)
-            .with_memory_layout(self.memory_layout);
-        sn.blake2b_calls = self.blake2b_calls;
-        sn.blake2b_mem_ops = self.blake2b_mem_ops;
-        sn
-    }
 }
 
 /// One listed page's entering and exit byte images (each `PAGE_SIZE` bytes).

@@ -30,9 +30,8 @@
 //! A *deployed* verifier sees only the proof + the program commitment
 //! (not the trace) and uses the side-note-free `verify_standalone` from
 //! the separate `no_std` `vos-pvm-proof-verifier` crate. Executions too large
-//! for one proof are proved as a chain — see [`verify_chain`], the
-//! [`segment`] cut helpers, and the `prover-extension` crate for the
-//! streaming / CAS deployment.
+//! for one proof are proved as a chain — see [`verify_chain`] and the
+//! [`segment`] cut helpers.
 //!
 //! ## Crate layout
 //!
@@ -73,8 +72,7 @@
 //!
 //! - **Trace** — [`TracingPvm::into_side_note`][into_side_note] (a
 //!   run's whole trace) or [`SideNote::new`] from a hand-built step
-//!   trace; [`TracingPvm::into_compact`][into_compact] /
-//!   [`segment::TraceStream`] for the chain / streaming paths.
+//!   trace.
 //! - **Prove** — [`prove`] (STANDARD) or [`prove_mobile`] (low-latency
 //!   MOBILE); [`prove_with_config`] for a custom [`PcsConfig`]; all three
 //!   under the legacy format 36. [`prove_format`] proves under any admitted
@@ -88,11 +86,10 @@
 //!   verifier pins.
 //! - **Large executions** — the [`segment`] cut helpers,
 //!   [`canonical_profile_for`], and [`prove_canonical`] produce a
-//!   chain of equal-shape segments; the `prover-extension` crate wraps
-//!   these with CAS publishing, allowlists, and async jobs.
+//!   chain of equal-shape segments.
 //!
-//! Core types: [`Proof`], [`SegmentState`], [`SideNote`],
-//! [`CompactTrace`], [`PcsPolicy`], [`PcsConfig`], [`FriConfig`].
+//! Core types: [`Proof`], [`SegmentState`], [`SideNote`], [`PcsPolicy`],
+//! [`PcsConfig`], [`FriConfig`].
 //!
 //! Proofs name their format, an entry of the [`format`](mod@format) registry, which
 //! selects their channel, parameters and encodings at run time; a verifier
@@ -100,10 +97,9 @@
 //! marked `#[doc(hidden)]`, and the sub-modules ([`chips`], [`core`],
 //! [`trace`], [`proof`], …), are **internal — their shapes change
 //! without notice**; they are public only for the verifier crate, the
-//! `prover-extension`, and the AIR-column derives.
+//! recursion, and the AIR-column derives.
 //!
 //! [into_side_note]: crate::core::tracing::TracingPvm::into_side_note
-//! [into_compact]: crate::core::tracing::TracingPvm::into_compact
 
 #![cfg_attr(not(feature = "prover"), no_std)]
 // In verifier-only builds (--no-default-features), prover-only modules are
@@ -567,17 +563,15 @@ pub use prove::{
     program_commitment_for_shape, prove, prove_canonical, prove_canonical_format, prove_chain,
     prove_chain_format, prove_format, prove_kernel, prove_mobile, prove_shaped, prove_with_config,
 };
-// Advanced / internal prove surface: the compact-trace floor variant, the
-// profiling variants, the thread-pool installer, and the explicit-component
-// harness entry.  Public for the prover extension + tests; hidden from docs
-// so the top-level page stays the happy path.
+// Advanced / internal prove surface: the profiling variants, the thread-pool
+// installer, and the explicit-component harness entry. Public for tests;
+// hidden from docs so the top-level page stays the happy path.
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::{
-    NaturalFloors, ProveProfile, canonical_profile_for_bounds_compact, install_thread_pool,
-    natural_log_sizes_for, prepare_side_note_for_verification, production_pcs_config,
-    production_pcs_config_mobile, prove_profiled, prove_profiled_with_config,
-    prove_with_explicit_components,
+    ProveProfile, install_thread_pool, natural_log_sizes_for, prepare_side_note_for_verification,
+    production_pcs_config, production_pcs_config_mobile, prove_profiled,
+    prove_profiled_with_config, prove_with_explicit_components,
 };
 #[cfg(feature = "debug-internals")]
 pub use prove::{
@@ -585,7 +579,7 @@ pub use prove::{
     debug_claimed_sums_streaming, prove_chip_isolated_format,
 };
 #[cfg(feature = "prover")]
-pub use side_note::{CompactTrace, SideNote};
+pub use side_note::SideNote;
 pub use stwo::core::fri::FriConfig;
 pub use stwo::core::pcs::PcsConfig;
 // ── Verify (prover-side, with the SideNote): the stable surface ───────

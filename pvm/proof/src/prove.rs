@@ -41,10 +41,9 @@ mod profile;
 mod shaped;
 
 pub use canonical::{
-    NaturalFloors, canonical_profile_for, canonical_profile_for_bounds,
-    canonical_profile_for_bounds_compact, natural_log_sizes_for, program_commitment_for_profile,
-    program_commitment_for_profile_format, prove_canonical, prove_canonical_format, prove_chain,
-    prove_chain_format,
+    canonical_profile_for, canonical_profile_for_bounds, natural_log_sizes_for,
+    program_commitment_for_profile, program_commitment_for_profile_format, prove_canonical,
+    prove_canonical_format, prove_chain, prove_chain_format,
 };
 #[cfg(feature = "debug-internals")]
 pub use debug::{

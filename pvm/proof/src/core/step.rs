@@ -105,14 +105,14 @@ pub struct RegWrite {
     pub value: u64,
 }
 
-/// A [`PvmStep`] without the two register-file snapshots — the chain-side
-/// step form. The snapshots are ~208 of a full step's ~360 bytes and are
+/// A [`PvmStep`] without the two register-file snapshots — the form the
+/// tracer records. The snapshots are ~208 of a full step's ~360 bytes and are
 /// redundant across a trace: `regs_before` of step k+1 equals `regs_after`
 /// of step k (the tracer's continuity invariant — nothing mutates registers
 /// between steps), and within a step only [`Self::reg_write`] changes the
-/// file. A window's full steps are rebuilt by [`expand_steps`] from the
-/// register file entering the window, so the chips keep consuming
-/// [`PvmStep`] unchanged while a multi-million-step chain holds ~2.6× less.
+/// file. Full steps are rebuilt by [`expand_steps`] from the entering
+/// register file, so the chips keep consuming [`PvmStep`] unchanged while
+/// a multi-million-step run is recorded in ~2.6× less.
 #[cfg(feature = "prover")]
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactStep {
