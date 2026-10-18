@@ -23,6 +23,17 @@
 //! the verify call (the least of `<runs>`), its time, the decode's, the
 //! instantiation's, the host allocations and the memory's pages; a tampered
 //! copy (one byte flipped at the middle) must not be accepted.
+//!
+//! ```text
+//! vos-final-verifier-wasm-run <blob.wasm> <client|pvf> judge <fixtures>
+//! vos-final-verifier-wasm-run <blob.wasm> <client|pvf> statements <name.input>...
+//! ```
+//!
+//! `judge`: every golden fixture under `<fixtures>` judged by the blob's
+//! `judge`, failing when a verdict is not the recorded one (`just
+//! judge-wasm`). `statements`: each judgement's input beside its proof,
+//! `<name>.proof`, as the end-to-end tests write them, failing when one is
+//! refused.
 
 use std::time::{Duration, Instant};
 
@@ -248,7 +259,9 @@ fn run(args: &[String]) -> Result<()> {
         start.elapsed()
     );
     let linker = linker(&engine)?;
-    let judged = |name: &str, input: &[u8]| -> Result<(u32, u64, String)> {
+    // A judgement's instructions, where the kernel lets this thread count
+    // its own (`perf_event_paranoid` at most 2); the verdicts without.
+    let judged = |name: &str, input: &[u8]| -> Result<(u32, Option<u64>, String)> {
         let (mut store, instance, memory) = instantiate(&engine, &module, &linker, semantics)?;
         let call = instance.get_typed_func::<(u32, u32), u32>(&mut store, "judge")?;
         let ptr = write_input(&mut store, memory, input)?;
@@ -256,12 +269,21 @@ fn run(args: &[String]) -> Result<()> {
             .observe_self()
             .exclude_kernel(true)
             .exclude_hv(true)
-            .build()?;
-        instructions.enable()?;
+            .build()
+            .ok();
+        if let Some(counter) = &mut instructions {
+            counter.enable()?;
+        }
         let code = call
             .call(&mut store, (ptr, input.len() as u32))
             .with_context(|| format!("{name}: the call"))?;
-        instructions.disable()?;
+        let instructions = match &mut instructions {
+            Some(counter) => {
+                counter.disable()?;
+                Some(counter.read()?)
+            }
+            None => None,
+        };
         let mut id = String::new();
         if code == 0 {
             let at = instance
@@ -271,8 +293,9 @@ fn run(args: &[String]) -> Result<()> {
             memory.read(&store, at as usize, &mut bytes)?;
             id = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
         }
-        Ok((code, instructions.read()?, id))
+        Ok((code, instructions, id))
     };
+    let count = |instructions: Option<u64>| instructions.map_or("-".into(), |n| n.to_string());
     match runs.as_str() {
         "judge" => {
             let [directory] = proofs else {
@@ -283,9 +306,10 @@ fn run(args: &[String]) -> Result<()> {
             for fixture in &fixtures {
                 let (code, instructions, id) = judged(&fixture.name, &fixture.bytes())?;
                 println!(
-                    "JUDGE fixture={} expected={:#x} code={code:#x} instructions={instructions} \
-                     id={id}",
-                    fixture.name, fixture.verdict
+                    "JUDGE fixture={} expected={:#x} code={code:#x} instructions={} id={id}",
+                    fixture.name,
+                    fixture.verdict,
+                    count(instructions),
                 );
                 differ += usize::from(code != fixture.verdict);
             }
@@ -301,7 +325,8 @@ fn run(args: &[String]) -> Result<()> {
                 let proof = std::fs::read(path.replace(".input", ".proof"))?;
                 let (code, instructions, id) = judged(path, &[input, proof].concat())?;
                 println!(
-                    "STATEMENT file={path} code={code:#x} instructions={instructions} id={id}"
+                    "STATEMENT file={path} code={code:#x} instructions={} id={id}",
+                    count(instructions)
                 );
                 if code != 0 {
                     bail!("{path}: refused, {code:#x}");

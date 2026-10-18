@@ -39,15 +39,24 @@ vectors:
 # its shape, the kernels' leaves and the window kernel's folds proved on
 # the recursion AIR, its whole run folded and wrapped under format 28 and
 # verified by the final verifier, and the fixtures checked against their
-# generator.
+# generator and judged in Wasm.
 # Memory-heavy: two threads fit under a 24 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
 # them; the verifier's suite runs in `test`. The settlement verifier's own
 # tests check its channel copy against the prover's.
-test-proof: build-guests build-test-actors
+test-proof: build-guests build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --tests -- --test-threads=2
     cd pvm/proof/settlement-verifier; cargo test
+
+# The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
+# verifier's blob built as a runtime builds it, under the PVF's semantics and
+# the client's: every verdict the recorded one, as natively and on the
+# JAM-only host (`vos-statement`'s fixtures test).
+judge-wasm:
+    cd pvm/proof/final-verifier/wasm/blob; cargo build --release
+    cd pvm/proof/final-verifier/wasm/run; cargo build --release
+    for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_final_verifier_wasm.wasm $semantics judge pvm/proof/fixtures }
 
 # The proof fixtures under `pvm/proof/fixtures` (`proving.md` A.6), written
 # anew by their generator, `pvm/proof/tests/fixtures.rs`: at a format bump,
