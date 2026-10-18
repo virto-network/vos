@@ -3634,9 +3634,10 @@ end to end; 5.14b's review folded first.
 - **The window** (`window_kernel`'s `the_window_wraps`): 26 segments
   proved in their classes and verified in their leaves (291 s), 25 folds
   (46 s), the wrap (5.58 s, 2.5 GiB heap, 123,686 bytes): 5.7 minutes in
-  all, against 3–5 projected. Its `Statement` (rootless; its anchors'
-  roots are in its arguments, bound through its output) recomputes the
-  run's io-hash; a venue pinning its program accepts it natively and on
+  all, against 3–5 projected. Its `Statement` (rootless, `public_args`
+  empty: its space and anchors, `anchor_i` and `anchor_j`, are in its
+  output, bound through the io-hash but checked by no venue) recomputes
+  the run's io-hash; a venue pinning its program accepts it natively and on
   the JAM-only host (96.1M gas, 460 KiB heap), its id `d4df8c31…`.
 - **The solvency predicate** (`kernel_shape`'s `the_predicate_wraps`,
   `areas`): its 1,658 steps cut in three class-0 segments (3.7–5.0 s each,
@@ -3699,3 +3700,170 @@ end to end; 5.14b's review folded first.
 - `pvm/proof/recair/tests/wrap.rs`: the guest's runner shared.
 - `docs/design/proving.md` §3.6, §6, A.6; `recursion-air.md` §8, §10's
   step 8; `slice-5-proving.md` 5.15's gate.
+
+## Step 5.15b: 5.15's review folded
+
+On `vos-core` from `5ad07549`.
+
+### The relations in the order drawn (its own commit)
+
+- **Found while regenerating the fixtures:** `just fixtures` (no features)
+  wrote other wraps than the committed ones, which `test-proof` (with
+  `debug-internals`) found current. `AllLookupElements` kept the drawn
+  relations in a `BTreeMap` keyed by `TypeId`, and a leaf circuit is
+  compiled over `relation_challenges()`'s order: a type's id moves with
+  the crate's features, so a kernel's program id did too, between builds
+  of one prover.
+- **Fixed:** the relations kept in the order the channel drew them (a
+  `Vec`, a linear lookup over at most twenty); a test holds
+  `relation_challenges()` to the channel's draw order. The wraps written
+  anew, now the same bytes with and without `debug-internals` (both
+  checked); the wrap's own circuit, and so the final verifier's pinned
+  root, unchanged.
+
+### F1, the blocker: a rootless statement replayed under another space
+
+- **The defect:** the id hashes the space, and only a root binds it. A
+  rootless statement's space was free (the space check vacuous), so an
+  accepted one resubmitted under another space had a new id, missed
+  `seen`, and verified again: the window's statement, rootless, could be
+  applied twice.
+- **The rule:** a rootless statement belongs to no space; a statement
+  claiming a space must read a root of it. `judge` refuses a rootless
+  statement whose space is not `SpaceId::NONE` (zero) as
+  `Refusal::Space` (`0x4`). In the crate's docs, `proving.md` §3.6.
+- **`admit`** holds the checks before the proof (`Admitted`: the id and
+  the words); `judge` is `admit` then `Admitted::verify`.
+- **The window's statement** (`the_window_wraps`) and the predicate's
+  state `SpaceId::NONE`.
+- **The twelfth fixture,** "rootless, another space": `S` without its
+  roots, its space still claimed, `0x4` at every venue (below).
+
+### F2, the dropped carry
+
+- The window kernel's public arguments and roots are not in its io-hash
+  yet (the SDK's support is needed): its statement is rootless,
+  `public_args` empty, and its space and anchors (`anchor_i`, `anchor_j`)
+  are in its output. `judge` never checks them; the Clerk's handler must,
+  until the kernel states its roots. Carried to slice 6 below, and in
+  `slice-5-proving.md`.
+- 5.15's line on the window's statement corrected: its anchors are in its
+  output, not its arguments.
+
+### F3, fuzzing with an oracle
+
+- **The oracle** (`golden::Golden::assert_is_golden`): a proof a target
+  finds accepted must be the golden wrap by value, its postcard
+  re-encoding the golden bytes. Not its bytes: postcard reads a varint in
+  any length, so an accepted encoding may differ (venues key on the
+  statement id for that). Not its statement: the verifier returns the
+  words it was given, so that held of any acceptance, and 5.15's
+  assertion was vacuous. A second accepted proof of the golden words would
+  be a part of the proof the transcript does not bind. The golden wrap's
+  bytes are checked to be postcard's own encoding of it.
+- **`statement_decode`,** a new target: arbitrary bytes through
+  `Statement::decode` (one that decodes re-encodes to the bytes),
+  `Input::decode_prefix` (the input re-encodes to the prefix it took) and
+  `judge_bytes` (an acceptance holds the venue's rules: format 28, the
+  program the pin, a rootless statement of no space, a rooted one's roots
+  of its space and anchored, the id the statement's and unseen; and the
+  proof the golden wrap, its statement the golden one).
+- **Seeds:** `examples/seed.rs` writes the three wraps and every
+  fixture's judgement and statement into the corpora.
+- **Run** [measured, `cargo fuzz`, 10 minutes each, one core each, the
+  three at once]: `final_verifier_bytes` 848,213 runs (1,411 a second,
+  4,141 edges, a corpus of 502); `final_verifier_mutate` at up to 1,024
+  bytes of mutations, 29,400 runs (48 a second, 4,459 edges, a corpus of
+  797); `statement_decode` 834,076 runs (1,387 a second, 4,563 edges, a
+  corpus of 704). No crash, no panic, no acceptance but the golden wrap's.
+  Logs under the job's `tmp/s5/5.15b-fuzz-*`.
+- **`prove_verify_roundtrip`** no longer built (`Interpreter::new` lost its
+  seventh argument, `TracingPvm::new_conformance` is `new`): fixed; it
+  builds and ran a minute clean (22 proved runs).
+
+### F4, the JAM guest
+
+- A judgement's checks before the proof run first (`Input::admit`), so a
+  statement the venue refuses costs no lookup; then a proof longer than
+  `MAX_PROOF_BYTES` is refused before `Vec::with_capacity` and
+  `historical_lookup` (`0x102` for a judgement, as natively; `UNDECODABLE`
+  for words). A test runs both modes with a proof one byte too long: no
+  lookup.
+- Its docs: the pin and the venue's state come in the payload only for the
+  test harness; a real service reads them from its own state.
+
+### F5, A.6's wording
+
+- A proof of other words fails at the interaction PoW (`0x108`) with
+  probability 255/256 (8 bits), or otherwise at the logup sums (`0x109`).
+
+### F6, `just judge-wasm`
+
+- Builds the Wasm blob and its runner and judges every fixture under the
+  PVF's semantics and the client's, failing on a verdict not recorded; in
+  `test-proof`'s dependencies. The runner counts instructions only where
+  the kernel lets a thread count its own, the verdicts regardless.
+
+### The fixtures, judged again
+
+| fixture | recorded | native | Wasm PVF | Wasm client | JAM-only host |
+|---|---|---|---|---|---|
+| valid | 0 | 0 | 0, 38.39M instr. | 0, 37.86M | 0, 96.4M gas |
+| tampered | `0x112` | `0x112` | `0x112`, 25.4M | `0x112`, 25.0M | `0x112`, 67.1M |
+| wrong program | `0x108` | `0x108` | `0x108`, 3.15M | `0x108`, 3.10M | `0x108`, 17.5M |
+| unanchored root | `0x5` | `0x5` | `0x5` | `0x5` | `0x5`, < 0.1M |
+| prefix | `0x109` | `0x109` | `0x109`, 3.20M | `0x109`, 3.15M | `0x109`, 17.5M |
+| mid-way | `0x109` | `0x109` | `0x109`, 3.18M | `0x109`, 3.14M | `0x109`, 17.4M |
+| repeated | `0x6` | `0x6` | `0x6` | `0x6` | `0x6`, 0.1M |
+| unaccepted format | `0x2` | `0x2` | `0x2` | `0x2` | `0x2`, < 0.1M |
+| wrong io-hash | `0x108` | `0x108` | `0x108`, 3.15M | `0x108`, 3.10M | `0x108`, 17.5M |
+| another program than the pin | `0x3` | `0x3` | `0x3` | `0x3` | `0x3`, < 0.1M |
+| another space | `0x4` | `0x4` | `0x4` | `0x4` | `0x4`, 0.1M |
+| rootless, another space | `0x4` | `0x4` | `0x4` | `0x4` | `0x4`, < 0.1M |
+
+The accepted id, `26b4468e…`, is the same at all three (the program id
+moved with the relations' order). `wrap.proof` is 124,025 bytes,
+`statements.cases` 5.8 KB.
+
+### End to end, again
+
+[measured, `--features debug-internals` as `test-proof` runs them]
+- **The window** (`the_window_wraps`), its statement now of no space: 26
+  segments in their leaves (288 s), 25 folds (46 s), the wrap (6.89 s,
+  123,840 bytes); accepted natively, on the JAM-only host (96.3M gas) and
+  in Wasm (38.33M instructions under the PVF's semantics, 37.80M the
+  client's); its id `d0f4ca16…` (the program id moved with the relations'
+  order).
+- **The predicate** (`the_predicate_wraps`): 39 s, the wrap 121,098 bytes;
+  accepted natively, on the JAM-only host (94.5M gas) and in Wasm (37.72M
+  / 37.20M); its id `44b617ee…`.
+
+### Gates
+
+[measured, under `systemd-run` at 14 GiB with `nice -n 10`,
+`CARGO_INCREMENTAL=0`]
+- **`just check`** green: 1,113 tests (1,111 at 5.15); clippy clean; the
+  builds without std, the guest among them.
+- **`cargo test -p vos-statement --features fixtures`:** its unit tests,
+  every fixture judged natively and on the JAM-only host as recorded, the
+  over-long proof refused before its lookup.
+- **The fixtures' stale test:** green with and without `debug-internals`.
+- **`just judge-wasm`:** twelve of twelve under both semantics.
+- **Every venue judges every fixture alike:** twelve of twelve, at four
+  venues.
+
+### Carried to later steps
+
+- **Slice 6:** the window kernel states its public arguments and roots in
+  its io-hash once the SDK supports it; until then the Clerk's handler
+  checks the window's space and anchors (`anchor_i`, `anchor_j`, in its
+  output) against its anchored roots, since `judge` cannot.
+
+### Outside the step's files
+
+- `pvm/proof/src/lookups/mod.rs`, `recair/src/verifier/shape.rs`: the
+  relations' order.
+- `justfile`: `judge-wasm`, a dependency of `test-proof`.
+- `pvm/proof/final-verifier/wasm/run`: its modes documented, its counting
+  best-effort.
+- `docs/design/proving.md` §3.6, A.6; `slice-5-proving.md` 5.15.

@@ -706,6 +706,19 @@ M0's milestone review left these before the recursion builds on them.
     of folds, a 5.58 s wrap), the predicate's three in 39 s; both
     statements accepted natively, in Wasm (38.3M instructions) and on the
     JAM-only host (96.1–96.3M gas).
+- **Review folded** (5.15b, `slice-5-progress.md`): a rootless statement
+  belongs to no space, its space the zero id or refused (`0x4`), so an
+  accepted one cannot be replayed under another space's id; a twelfth
+  fixture, judged alike at every venue; the fuzz targets' oracle (an
+  accepted proof is the golden wrap by value) and a target for
+  `vos-statement`'s decoders; the JAM guest refusing a proof over 256 KiB
+  before its lookup; `just judge-wasm` in `test-proof`; a kernel's program
+  id the same in every build (the drawn relations in the order drawn).
+- **Carried to slice 6:** the window kernel's public arguments and roots
+  are not in its io-hash until the SDK supports them. Its statement is
+  rootless and its space and anchors (`anchor_i`, `anchor_j`) are in its
+  output, which `judge` never checks: the Clerk's handler must check them
+  against its anchored roots until the kernel states its roots.
 - **Estimate:** about 2 weeks.
 
 ### 5.16 Acceptance

@@ -412,9 +412,20 @@ pub struct Statement {
     `public_args`, `output` and `roots`;
   - the venue authenticates `format` (accepted), the roots (equal to
     anchored space roots, §7) and `space` (equal to every
-    `RootRead.space`).
-  - A rootless statement has no space binding, and its handler must not
-    treat it as the space's.
+    `RootRead.space`, or the zero id for a rootless statement).
+- **A rootless statement belongs to no space; a statement claiming a space
+  must read a root of it.** Only a root binds the space: the proof states
+  none, and the id hashes it. Were a rootless statement's space free, one
+  accepted proof would make a new id under each space and pass the repeat
+  check again: a settlement applied twice. The venue refuses a rootless
+  statement whose space is not the zero id (`SpaceId::NONE`), as
+  `Refusal::Space` (`0x4`).
+- **A kernel that does not state its roots** carries what it read in its
+  output, which no venue checks: its handler must. The window kernel is
+  one, until the SDK puts a kernel's public arguments and roots in its
+  io-hash (slice 6): its statement is rootless, `public_args` empty, and
+  its space and anchors (`anchor_i`, `anchor_j`) are in its output, which
+  the Clerk's handler checks against its anchored roots.
 - **Repeats:** a venue refuses a statement id it has seen. A kernel whose
   legitimate statements can repeat carries a nonce in `public_args`.
   A venue keys on the statement id, never on the proof's bytes or their
@@ -422,8 +433,9 @@ pub struct Statement {
   encodings, and many proofs state one statement.
 - **The venue's check, built** (slice 5's 5.15, `vos_statement::judge`),
   in order: the format (accepted, and 28, the one the final verifier
-  reads); the statement's program against the venue's pin; every root's
-  space against the statement's; every root anchored; the io-hash
+  reads); the statement's program against the venue's pin; the space,
+  every root's the statement's and a rootless statement's none; every root
+  anchored; the io-hash
   recomputed from the fields and the id from it; a repeat; then the final
   proof (at most 256 KiB, one postcard encoding and nothing after it)
   against the pinned program id and the recomputed io-hash. **The program
@@ -938,33 +950,41 @@ Every venue judges them alike. A generator makes them, regenerated at
 each format bump, and stores them under `pvm/proof/fixtures` (about
 1.2 MB). M0 promised it and did not build it; slice 5's 5.8.0 does.
 
-**Built** (slice 5's 5.15) [measured]: the generator
-(`pvm/proof/tests/fixtures.rs`) proves a small kernel stating a fixed
+**Built** (slice 5's 5.15, its review folded in 5.15b) [measured]: the
+generator (`pvm/proof/tests/fixtures.rs`) proves a small kernel stating a fixed
 statement `S` (two roots of its space, a nonce, an output) in three
-segments, folds them and wraps the root (`wrap.proof`, 123,833 bytes), and
+segments, folds them and wraps the root (`wrap.proof`, 124,025 bytes), and
 wraps two roots that are not a whole run as a cheating prover would, the
 wrap's checks failing (`wrap-prefix.proof`, `wrap-midway.proof`). The cases
-(`statements.cases`, 5.5 KB), each a venue's state, a statement, a proof or
+(`statements.cases`, 5.8 KB), each a venue's state, a statement, a proof or
 a patch of one, and its verdict:
 
 | case | verdict | native | Wasm (PVF, client) | JAM-only host |
 |---|---|---|---|---|
-| valid | accepted | accepted | accepted, 38.3M / 37.8M instructions | accepted, 96.3M gas |
-| tampered (a byte flipped) | `0x112` Stwo, Merkle | `0x112` | `0x112` | `0x112`, 67.0M |
+| valid | accepted | accepted | accepted, 38.4M / 37.9M instructions | accepted, 96.4M gas |
+| tampered (a byte flipped) | `0x112` Stwo, Merkle | `0x112` | `0x112` | `0x112`, 67.1M |
 | wrong program (the venue pins another, the wrap is this kernel's) | `0x108` interaction PoW | `0x108` | `0x108` | `0x108`, 17.5M |
-| unanchored root (an older window's) | `0x5` | `0x5` | `0x5` | `0x5`, 0.1M |
-| prefix (no halt) | `0x109` logup | `0x109` | `0x109` | `0x109`, 17.7M |
-| mid-way (no entry, labelled from 0) | `0x109` logup | `0x109` | `0x109` | `0x109`, 17.7M |
-| repeated | `0x6` | `0x6` | `0x6` | `0x6`, 0.2M |
-| unaccepted format (30) | `0x2` | `0x2` | `0x2` | `0x2`, 0.1M |
+| unanchored root (an older window's) | `0x5` | `0x5` | `0x5` | `0x5`, < 0.1M |
+| prefix (no halt) | `0x109` logup | `0x109` | `0x109` | `0x109`, 17.5M |
+| mid-way (no entry, labelled from 0) | `0x109` logup | `0x109` | `0x109` | `0x109`, 17.4M |
+| repeated | `0x6` | `0x6` | `0x6` | `0x6`, 0.1M |
+| unaccepted format (30) | `0x2` | `0x2` | `0x2` | `0x2`, < 0.1M |
 | wrong io-hash (the output changed) | `0x108` interaction PoW | `0x108` | `0x108` | `0x108`, 17.5M |
-| another program than the pin | `0x3` | `0x3` | `0x3` | `0x3`, 0.1M |
+| another program than the pin | `0x3` | `0x3` | `0x3` | `0x3`, < 0.1M |
 | another space | `0x4` | `0x4` | `0x4` | `0x4`, 0.1M |
+| rootless, another space (`S` without its roots, its space still claimed) | `0x4` | `0x4` | `0x4` | `0x4`, < 0.1M |
 
 The accepted statement's id is the same at every venue. A refused proof's
-class is the first check it fails: the words are mixed before the
-interaction PoW, so a proof of other words falls short there; a wrap
-proved over a refused root does not balance its logup sums.
+class is the first check it fails. The words are mixed before the
+interaction PoW (8 bits), so a proof of other words fails there (`0x108`)
+with probability 255/256, or otherwise at the logup sums (`0x109`); a wrap
+proved over a refused root does not balance its logup sums. A judgement
+refused before its proof costs no proof lookup on the JAM-only host, and a
+proof longer than 256 KiB is refused before its lookup. The generator makes
+the same bytes in every build of the prover: a kernel's program id does not
+depend on the features a build turns on (the drawn relations are kept in
+the order drawn, never in `TypeId` order). `just judge-wasm` (in
+`test-proof`) judges the fixtures in Wasm.
 
 **A.7 Budgets per node (M1: measured, then pinned).** Heavy tests run
 under `systemd-run` with these caps as `MemoryMax`.
