@@ -46,7 +46,7 @@ use vos_pvm_recair::verifier::SegmentShape;
 use vos_pvm_recair::verifier::witness::digest_wires;
 use vos_pvm_recair::{Context, NoValue};
 
-use crate::common::print_rows;
+use crate::common::{assert_transcript_is, print_rows};
 use common::kernel::{blob, entry};
 
 /// The run's segments, their leaves, the program and the fold circuit.
@@ -204,20 +204,7 @@ fn a_fold_of_two_leaves_states_their_run() {
         let mut context = Context::<SecureField>::new();
         let outputs = context.guess_pair(child.output);
         let verified = verify_child(&mut context, run.fold.child, &child.proof, outputs);
-        let permutations = verified.channel.transcript().permutations();
-        assert_eq!(permutations.len(), data.transcript.records.len());
-        for (i, (permutation, record)) in permutations
-            .iter()
-            .zip(&data.transcript.records)
-            .enumerate()
-        {
-            let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
-            assert_eq!(
-                *permutation,
-                vos_pvm_recair::value::wires_of(words),
-                "permutation {i}"
-            );
-        }
+        assert_transcript_is(verified.channel.transcript(), &data.transcript);
     }
 
     let mut context = Context::<SecureField>::with_outputs(2);

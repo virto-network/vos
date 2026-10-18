@@ -13,7 +13,9 @@ use std::sync::OnceLock;
 
 use vos_pvm_compiler::leaf::QUERIES;
 
-use crate::common::{WINDOW_LOG_SIZES, WINDOW_MASK, bump, position_of, print_rows};
+use crate::common::{
+    WINDOW_LOG_SIZES, WINDOW_MASK, assert_transcript_is, bump, is_refused, position_of, print_rows,
+};
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::pcs::Commitment;
@@ -103,20 +105,7 @@ fn compares_leaf_verifies_proves_and_verifies() {
     let mut context = Context::<SecureField>::new();
     let verified = verify_segment(&mut context, &compare.shape, &compare.values);
 
-    let permutations = verified.channel.transcript().permutations();
-    assert_eq!(permutations.len(), data.transcript.records.len());
-    for (i, (permutation, record)) in permutations
-        .iter()
-        .zip(&data.transcript.records)
-        .enumerate()
-    {
-        let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
-        assert_eq!(
-            *permutation,
-            vos_pvm_recair::value::wires_of(words),
-            "permutation {i}"
-        );
-    }
+    assert_transcript_is(verified.channel.transcript(), &data.transcript);
     for (bits, &answer) in verified.draws.queries.iter().zip(&verified.answers) {
         let position = position_of(&context, bits);
         let index = data.query_positions.binary_search(&position).unwrap();
@@ -219,14 +208,10 @@ fn compares_leaf_refuses_each_tamper() {
     let mut context = Context::<SecureField>::new().lenient();
     verify_segment(&mut context, &compare.shape, &values);
     let finalized = context.finalize().expect("the wiring checks");
-    let refused = match vos_pvm_recair::prove(&finalized.circuit, &finalized.witness) {
-        Err(_) => true,
-        Ok(proof) => {
-            let (_, hash) = vos_pvm_recair::circuit_commitment(&finalized.circuit).unwrap();
-            vos_pvm_recair::verify(proof, &hash).is_err()
-        }
-    };
-    assert!(refused, "a tampered witness proves and verifies");
+    assert!(
+        is_refused(&finalized),
+        "a tampered witness proves and verifies"
+    );
 }
 
 /// A panic's message, whether its payload is static or formatted.

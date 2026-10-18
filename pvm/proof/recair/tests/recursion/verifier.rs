@@ -28,7 +28,10 @@
 
 use std::sync::OnceLock;
 
-use crate::common::{WINDOW_LOG_SIZES, WINDOW_MASK, bump, position_of, print_rows};
+use crate::common::{
+    self, WINDOW_LOG_SIZES, WINDOW_MASK, assert_transcript_is, bump, is_refused, position_of,
+    print_rows,
+};
 use num_traits::{One, Zero};
 use stwo::core::channel::{Channel as _, MerkleChannel};
 use stwo::core::fields::m31::BaseField;
@@ -119,57 +122,13 @@ impl Real {
 
 fn fixture() -> &'static Real {
     static FIXTURE: OnceLock<Real> = OnceLock::new();
-    FIXTURE.get_or_init(|| {
-        let bytes = std::fs::read(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../fixtures/segment-35.proof"
-        ))
-        .expect("the format-35 fixture");
-        Real::new(postcard::from_bytes(&bytes).expect("a proof"))
-    })
+    FIXTURE.get_or_init(|| Real::new(common::segment_fixture()))
 }
 
 /// A run proved over all 25 chips, the ones it does not use padded.
 fn full_shape() -> &'static Real {
     static FULL: OnceLock<Real> = OnceLock::new();
-    FULL.get_or_init(|| {
-        use vos_pvm::instruction::Opcode;
-        use vos_pvm::interpreter::Interpreter;
-        use vos_pvm_proof::core::tracing::TracingPvm;
-
-        let mut code = Vec::new();
-        let mut bitmask = Vec::new();
-        for register in 2..8 {
-            code.extend_from_slice(&[Opcode::Add64 as u8, 0x10 | (register - 1), register]);
-            bitmask.extend_from_slice(&[1, 0, 0]);
-        }
-        code.push(Opcode::Trap as u8);
-        bitmask.push(1);
-        let mut registers = [0u64; vos_pvm::PVM_REGISTER_COUNT];
-        registers[0] = 100;
-        registers[1] = 1;
-        let memory = vec![0u8; 64 * 1024];
-        let pvm = Interpreter::new(
-            code.clone(),
-            bitmask.clone(),
-            vec![],
-            registers,
-            memory.clone(),
-            10_000,
-        );
-        let mut tracing = TracingPvm::new(pvm);
-        tracing.run();
-        let mut side_note =
-            vos_pvm_proof::SideNote::new(tracing.into_trace(), code, bitmask).with_memory(memory);
-        let proof = vos_pvm_proof::prove_canonical_format(
-            &mut side_note,
-            &[],
-            &vos_pvm_proof::format::SEGMENT,
-        )
-        .expect("proves");
-        assert_eq!(proof.component_mask, chip_idx::ALL);
-        Real::new(proof)
-    })
+    FULL.get_or_init(|| Real::new(common::full_shape_proof().clone()))
 }
 
 fn value(context: &Context<SecureField>, var: Var) -> SecureField {
@@ -192,20 +151,7 @@ fn verifies_as_natively(real: &Real) -> Context<SecureField> {
     let verified = verify_segment(&mut context, &real.shape, &real.values);
     let data = &real.data;
 
-    let permutations = verified.channel.transcript().permutations();
-    assert_eq!(permutations.len(), data.transcript.records.len());
-    for (i, (permutation, record)) in permutations
-        .iter()
-        .zip(&data.transcript.records)
-        .enumerate()
-    {
-        let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
-        assert_eq!(
-            *permutation,
-            vos_pvm_recair::value::wires_of(words),
-            "permutation {i}"
-        );
-    }
+    assert_transcript_is(verified.channel.transcript(), &data.transcript);
 
     let draws = &verified.draws;
     for (drawn, native) in draws.relations.iter().zip(real.challenges()) {
@@ -425,14 +371,10 @@ fn a_tampered_witness_proved_is_refused() {
     verify_segment(&mut context, &real.shape, &values);
     assert!(!context.mismatches().is_empty());
     let finalized = context.finalize().expect("the wiring checks");
-    let refused = match vos_pvm_recair::prove(&finalized.circuit, &finalized.witness) {
-        Err(_) => true,
-        Ok(proof) => {
-            let (_, hash) = vos_pvm_recair::circuit_commitment(&finalized.circuit).unwrap();
-            vos_pvm_recair::verify(proof, &hash).is_err()
-        }
-    };
-    assert!(refused, "a tampered witness proves and verifies");
+    assert!(
+        is_refused(&finalized),
+        "a tampered witness proves and verifies"
+    );
 }
 
 // ── The shape ──────────────────────────────────────────────────────────────

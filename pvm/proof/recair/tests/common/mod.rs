@@ -5,12 +5,17 @@
 
 pub mod kernel;
 
+use std::sync::OnceLock;
+
 use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_recair::gadgets::{TranscriptGadget, leaf_hash, node};
 use vos_pvm_recair::verifier::witness::pack;
-use vos_pvm_recair::{Bit, Context, Message, P2Handle, Qm31Op, Value, Var};
+use vos_pvm_recair::{
+    Bit, Context, Finalized, Message, P2Handle, Qm31Op, Value, Var, circuit_commitment, prove,
+    verify,
+};
 
 /// SplitMix64.
 pub struct Rng(u64);
@@ -234,4 +239,104 @@ pub fn position_of(context: &Context<SecureField>, bits: &[Bit]) -> usize {
 /// `value` moved by one.
 pub fn bump(value: &mut SecureField) {
     *value += SecureField::one();
+}
+
+/// The circuit's transcript is `transcript`, the native verifier's recorded
+/// one, permutation for permutation.
+pub fn assert_transcript_is(
+    circuit: &TranscriptGadget<SecureField>,
+    transcript: &vos_pvm_proof::RecursionTranscript,
+) {
+    let permutations = circuit.permutations();
+    assert_eq!(permutations.len(), transcript.records.len());
+    for (i, (permutation, record)) in permutations.iter().zip(&transcript.records).enumerate() {
+        let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
+        assert_eq!(
+            *permutation,
+            vos_pvm_recair::value::wires_of(words),
+            "permutation {i}"
+        );
+    }
+}
+
+/// Proves `finalized` and verifies the proof against its circuit's hash:
+/// the hash and the proof.
+pub fn prove_and_verify(
+    finalized: &Finalized<SecureField>,
+) -> (vos_pvm_poseidon2::Digest, vos_pvm_recair::RecairProof) {
+    let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
+    let proof = prove(&finalized.circuit, &finalized.witness).expect("proves");
+    verify(proof.clone(), &hash).expect("verifies");
+    (hash, proof)
+}
+
+/// Whether `finalized`'s witness does not prove, or its proof does not
+/// verify.
+pub fn is_refused(finalized: &Finalized<SecureField>) -> bool {
+    match prove(&finalized.circuit, &finalized.witness) {
+        Err(_) => true,
+        Ok(proof) => {
+            let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
+            verify(proof, &hash).is_err()
+        }
+    }
+}
+
+/// The format-35 segment fixture's proof.
+pub fn segment_fixture() -> vos_pvm_proof::Proof {
+    let bytes = std::fs::read(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../fixtures/segment-35.proof"
+    ))
+    .expect("the format-35 fixture");
+    postcard::from_bytes(&bytes).expect("a proof")
+}
+
+/// A run of six Add64s proved under format 35 over all 25 chips, the ones
+/// it does not use padded; proved once a test binary.
+pub fn full_shape_proof() -> &'static vos_pvm_proof::Proof {
+    use vos_pvm::instruction::Opcode;
+    use vos_pvm::interpreter::Interpreter;
+    use vos_pvm_proof::core::tracing::TracingPvm;
+
+    static FULL: OnceLock<vos_pvm_proof::Proof> = OnceLock::new();
+    FULL.get_or_init(|| {
+        let mut code = Vec::new();
+        let mut bitmask = Vec::new();
+        for register in 2..8 {
+            code.extend_from_slice(&[Opcode::Add64 as u8, 0x10 | (register - 1), register]);
+            bitmask.extend_from_slice(&[1, 0, 0]);
+        }
+        code.push(Opcode::Trap as u8);
+        bitmask.push(1);
+        let mut registers = [0u64; vos_pvm::PVM_REGISTER_COUNT];
+        registers[0] = 100;
+        registers[1] = 1;
+        let memory = vec![0u8; 64 * 1024];
+        let pvm = Interpreter::new(
+            code.clone(),
+            bitmask.clone(),
+            vec![],
+            registers,
+            memory.clone(),
+            10_000,
+        );
+        let mut tracing = TracingPvm::new(pvm);
+        tracing.run();
+        let mut side_note =
+            vos_pvm_proof::SideNote::new(tracing.into_trace(), code, bitmask).with_memory(memory);
+        let started = std::time::Instant::now();
+        let proof = vos_pvm_proof::prove_canonical_format(
+            &mut side_note,
+            &[],
+            &vos_pvm_proof::format::SEGMENT,
+        )
+        .expect("proves");
+        eprintln!(
+            "proved over every chip in {:.1}s",
+            started.elapsed().as_secs_f64()
+        );
+        assert_eq!(proof.component_mask, vos_pvm_proof::chip_idx::ALL);
+        proof
+    })
 }

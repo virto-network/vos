@@ -1,7 +1,7 @@
 //! `p2` against `vos_pvm_poseidon2` in every mode, and a tamper refused per
 //! component and per mode.
 
-use crate::common;
+use crate::common::{self, prove_and_verify};
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
@@ -10,7 +10,7 @@ use vos_pvm_poseidon2::{
 };
 use vos_pvm_recair::gadgets::{TranscriptGadget, leaf_hash, node};
 use vos_pvm_recair::trace::MainTrace;
-use vos_pvm_recair::{Context, Finalized, Message, P2Mode, circuit_commitment, prove, verify};
+use vos_pvm_recair::{Context, Finalized, Message, P2Mode, circuit_commitment, verify};
 use vos_pvm_recair_air::{p2, qm31};
 
 use common::{Rng, digest_wires, words};
@@ -147,10 +147,7 @@ fn modes_circuit() -> Finalized<SecureField> {
 /// row satisfies the AIR.
 #[test]
 fn p2_equals_the_reference_permutation_in_every_mode() {
-    let finalized = modes_circuit();
-    let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
-    let proof = prove(&finalized.circuit, &finalized.witness).expect("proves");
-    verify(proof, &hash).expect("verifies");
+    prove_and_verify(&modes_circuit());
 }
 
 /// Why a proof of `finalized` whose main trace `tamper` changed is refused,
@@ -373,11 +370,7 @@ fn honest_proof() -> (vos_pvm_poseidon2::Digest, vos_pvm_recair::RecairProof) {
     let d = context.h8(c, a, b, [a, b]);
     let e = context.add(d, c);
     context.set_outputs(&[e]);
-    let finalized = context.finalize().unwrap();
-    let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
-    let proof = prove(&finalized.circuit, &finalized.witness).unwrap();
-    verify(proof.clone(), &hash).unwrap();
-    (hash, proof)
+    prove_and_verify(&context.finalize().unwrap())
 }
 
 /// Stwo's refusal when the constraints, evaluated at the OODS point over the

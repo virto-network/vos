@@ -36,7 +36,7 @@ use vos_pvm_recair::{Context, NoValue};
 
 use crate::common;
 
-use crate::common::print_rows;
+use crate::common::{assert_transcript_is, print_rows};
 use common::kernel::{IO, blob, entry};
 
 /// A segment's proof, its leaf circuit and the native verifier's record.
@@ -172,20 +172,7 @@ fn a_leaf_states_its_segment() {
         &segment.leaf.shape,
         &values.segment,
     );
-    let permutations = verified.channel.transcript().permutations();
-    assert_eq!(permutations.len(), segment.data.transcript.records.len());
-    for (i, (permutation, record)) in permutations
-        .iter()
-        .zip(&segment.data.transcript.records)
-        .enumerate()
-    {
-        let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
-        assert_eq!(
-            *permutation,
-            vos_pvm_recair::value::wires_of(words),
-            "permutation {i}"
-        );
-    }
+    assert_transcript_is(verified.channel.transcript(), &segment.data.transcript);
 
     // The leaf's own rows, past the segment's verification.
     let own = context.piece_rows();

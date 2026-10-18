@@ -16,7 +16,7 @@
 //! tests 1 and 2 on every chip. A synthetic component covers what the chips
 //! do not: an inverse of a trace expression.
 
-use crate::common;
+use crate::common::{self, prove_and_verify};
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -799,9 +799,7 @@ fn the_compiled_shape_proves_and_verifies() {
         wiring.finalize().expect("the wiring checks").circuit,
         filled.circuit
     );
-    let proof = vos_pvm_recair::prove(&filled.circuit, &filled.witness).expect("proves");
-    let (_, hash) = vos_pvm_recair::circuit_commitment(&filled.circuit).unwrap();
-    vos_pvm_recair::verify(proof, &hash).expect("verifies");
+    prove_and_verify(&filled);
 }
 
 /// A segment proof's OODS data, as the in-AIR verifier receives it.
@@ -985,56 +983,13 @@ fn check_real(proof: &Proof) {
 
 #[test]
 fn the_fixtures_composition_is_compiled() {
-    let bytes = std::fs::read(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../fixtures/segment-35.proof"
-    ))
-    .expect("the format-35 fixture");
-    let proof: Proof = postcard::from_bytes(&bytes).expect("a proof");
-    check_real(&proof);
+    check_real(&common::segment_fixture());
 }
 
 /// A run proved over all 25 chips, the ones it does not use padded.
 #[test]
 fn a_full_shape_proofs_composition_is_compiled() {
-    use vos_pvm::instruction::Opcode;
-    use vos_pvm::interpreter::Interpreter;
-    use vos_pvm_proof::core::tracing::TracingPvm;
-
-    let mut code = Vec::new();
-    let mut bitmask = Vec::new();
-    for register in 2..8 {
-        code.extend_from_slice(&[Opcode::Add64 as u8, 0x10 | (register - 1), register]);
-        bitmask.extend_from_slice(&[1, 0, 0]);
-    }
-    code.push(Opcode::Trap as u8);
-    bitmask.push(1);
-    let mut registers = [0u64; vos_pvm::PVM_REGISTER_COUNT];
-    registers[0] = 100;
-    registers[1] = 1;
-    let memory = vec![0u8; 64 * 1024];
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        registers,
-        memory.clone(),
-        10_000,
-    );
-    let mut tracing = TracingPvm::new(pvm);
-    tracing.run();
-    let mut side_note =
-        vos_pvm_proof::SideNote::new(tracing.into_trace(), code, bitmask).with_memory(memory);
-    let started = std::time::Instant::now();
-    let proof =
-        vos_pvm_proof::prove_canonical_format(&mut side_note, &[], &vos_pvm_proof::format::SEGMENT)
-            .expect("proves");
-    eprintln!(
-        "proved over every chip in {:.1}s",
-        started.elapsed().as_secs_f64()
-    );
-    assert_eq!(proof.component_mask, chip_idx::ALL);
-    check_real(&proof);
+    check_real(common::full_shape_proof());
 }
 
 // ── A synthetic component: what the chips do not exercise ──────────────────
