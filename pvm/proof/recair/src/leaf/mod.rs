@@ -112,10 +112,16 @@ pub struct LeafValues<V> {
     pub segment: SegmentValues<V>,
     pub program: [V; 2],
     pub fold_word: [V; 2],
-    pub position: V,
+    /// The positions the prover states, `first` and `last`: equal in a
+    /// leaf.
+    pub first: V,
+    pub last: V,
     /// The flags the prover states, each 0 or 1.
     pub entry: V,
     pub halt: V,
+    /// The io-hash's 16 limbs the prover states, four a wire: each lane is
+    /// checked against φ9..12's bytes.
+    pub io_hash: [V; 4],
 }
 
 /// A leaf's wires: its output digest and its flags.
@@ -222,8 +228,9 @@ fn assert_ts_nonzero<V: Value>(context: &mut Context<V>, ts: [Var; 2]) {
 }
 
 /// φ9..12's 32 bytes, each range-checked to 8 bits, as the io-hash's 16
-/// limbs `b0 + 256·b1`, four a wire.
-fn io_hash<V: Value>(context: &mut Context<V>, boundary: &[Var]) -> [Var; 4] {
+/// limbs `b0 + 256·b1`: `stated`, four a wire, each lane checked against
+/// its limb.
+fn io_hash<V: Value>(context: &mut Context<V>, boundary: &[Var], stated: &[V; 4]) -> [Var; 4] {
     let wires = &boundary[wires::IO_HASH];
     for &wire in wires {
         for lane in 0..4 {
@@ -242,9 +249,7 @@ fn io_hash<V: Value>(context: &mut Context<V>, boundary: &[Var]) -> [Var; 4] {
             };
             (wires[limb / 2], lanes)
         });
-        let values =
-            limbs.map(|(wire, lanes)| context.value(wire).lane_sum(lanes.map(BaseField::from)));
-        let packed = context.guess(pack4(values));
+        let packed = context.guess(stated[k]);
         for (j, (wire, lanes)) in limbs.into_iter().enumerate() {
             let limb = lane_sum(context, wire, lanes);
             assert_lane(context, packed, j, limb);
@@ -299,8 +304,8 @@ impl LeafCircuit {
         let program = values.program.map(|value| context.guess(value));
         let fold_word = values.fold_word.map(|value| context.guess(value));
         let scalars = context.guess(pack4([
-            values.position,
-            values.position,
+            values.first,
+            values.last,
             values.entry,
             values.halt,
         ]));
@@ -344,7 +349,7 @@ impl LeafCircuit {
             ],
         );
         context.piece("leaf: io-hash");
-        let io_hash = io_hash(context, boundary);
+        let io_hash = io_hash(context, boundary, &values.io_hash);
 
         context.piece("leaf: digests");
         let digests = [wires::entry(), wires::exit()].map(|state| {
@@ -425,13 +430,16 @@ impl LeafCircuit {
             fold_word,
         };
         let m31 = |value: u32| SecureField::from(BaseField::from(value));
+        let limbs = pack(&io_hash_limbs(&output.io_hash));
         let values = LeafValues {
             segment,
             program: digest_wires(&program),
             fold_word: digest_wires(&fold_word),
-            position: m31(position),
+            first: m31(position),
+            last: m31(position),
             entry: m31(output.entry.into()),
             halt: m31(output.halt.into()),
+            io_hash: core::array::from_fn(|k| limbs[k]),
         };
         Ok((values, output))
     }
@@ -446,9 +454,11 @@ impl<V: Value> LeafValues<V> {
             segment: SegmentValues::blank(shape),
             program: [zero; 2],
             fold_word: [zero; 2],
-            position: zero,
+            first: zero,
+            last: zero,
             entry: zero,
             halt: zero,
+            io_hash: [zero; 4],
         }
     }
 }

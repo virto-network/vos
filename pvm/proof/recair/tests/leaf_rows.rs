@@ -1,7 +1,8 @@
 //! A derivation's leaf rows (`vos_pvm_compiler::leaf`) held to the built
-//! leaves: its tables are the AIR's, and its bound is at least the leaf
-//! circuit's finalized rows on every shape tried, exactly its `p2` and `h8`
-//! rows, its `qm31` rows within the slack it names.
+//! leaves: its tables are the AIR's, its terms are the built leaf's piece by
+//! piece, and its bound is the leaf circuit's rows on every shape tried,
+//! exactly its `p2` and `h8` rows, its `qm31` rows plus the finalizing
+//! allowance it names, which covers the finalized rows.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -165,7 +166,8 @@ impl Rng {
 }
 
 /// The bound holds every leaf built: the window kernel's class-1 shape, the
-/// full shape, and shapes of random chips and sizes; `p2` and `h8` exactly.
+/// full shape, and shapes of random chips and sizes; every piece's term the
+/// built piece's rows, `p2` and `h8` exactly.
 #[test]
 fn the_bound_holds_the_built_leaves() {
     let window: [u32; 25] = [
@@ -234,11 +236,12 @@ fn the_bound_holds_the_built_leaves() {
             ("context", terms.context, piece("context")),
             ("leaf", terms.leaf, leaf_piece),
         ] {
-            if term != built {
-                eprintln!("  {name}: bound {term:?}, built {built:?}");
-            }
+            assert_eq!(term, built, "{mask:#x}: {name}");
         }
-        assert!(bound[1] - FINALIZE >= rows[1], "{mask:#x}: qm31");
+        assert_eq!(terms.rows(), rows, "{mask:#x}: the terms' rows");
+        assert_eq!(bound[0], rows[0], "{mask:#x}: p2");
+        assert_eq!(bound[2], rows[2], "{mask:#x}: h8");
+        assert_eq!(bound[1], rows[1] + FINALIZE, "{mask:#x}: qm31");
         assert!(bound[1] >= finalized[1], "{mask:#x}: qm31 finalized");
         assert!(finalized[1] - rows[1] <= FINALIZE, "{mask:#x}: finalizing");
     }

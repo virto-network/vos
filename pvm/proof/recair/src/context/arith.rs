@@ -110,7 +110,9 @@ impl<V: Value> Context<V> {
     }
 
     /// `a⁻¹`, one row: `a·b = 1`, with `b` guessed and yielded by the row,
-    /// whose output uses `one`. `a` must not be zero.
+    /// whose output uses `one`. Zero has no inverse: its guess is zero, so
+    /// the row's output is zero, not one, a refused witness (a lenient
+    /// context's [`super::Mismatch`]) rather than a failure to build.
     pub fn inverse(&mut self, a: Var) -> Var {
         let value = self.value(a).inverse();
         let b = self.guess(value);

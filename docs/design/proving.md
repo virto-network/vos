@@ -404,6 +404,13 @@ pub struct Statement {
   `Derivation`'s transpiler version), with each class's preprocessed root
   and leaf circuit: an install derives without the prover's stack. Venues
   store and compare it; they never compute it.
+- **Who computes the id a venue pins:** it needs the recursion stack (a
+  class's preprocessed root is a commitment to its trace at its sizes, and
+  a leaf circuit's hash commits its padded wiring), so the prover role, or
+  a build tool with that stack, computes it from the kernel and its install
+  record. A venue takes the pinned id as governance input, set by whoever
+  admits the kernel, and trusts it as such: anyone with the stack can
+  recompute it and check the pin.
 - **Formats are chosen at run time,** so a verifier accepts two during a
   transition: a proof's format number selects its channel and parameters
   from the registry (A.4).
@@ -776,7 +783,11 @@ output).**
   - The io-hash's 16 limbs come from φ9..12's bound bytes by linear
     gates, `b0 + 256·b1`.
 - **A state digest** hashes 148 words, in order: the 13 registers (8
-  bytes each), pc (4), ts (8), the memory root (32).
+  bytes each), pc (4), ts (8), the memory root (32). A segment state's
+  `memory_commitment`, the prover's blake3 of the flat memory, is left out
+  on purpose: no committed column binds it and no transcript mixes it, so
+  a digest over it would bind nothing. Memory continuity is the memory
+  root's, which the boundary chips bind.
 - **A node outputs** one 8-word Poseidon2-M31 digest, the leaf sponge over
   its preimage's 52 words, in this order, each field on whole wires of
   four:

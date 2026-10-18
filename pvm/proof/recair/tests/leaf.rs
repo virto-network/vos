@@ -14,9 +14,10 @@
 //! - **Each flag's conditions, negated, refused:** an entry flag over
 //!   another entry pc, ts, register or image root, or over a segment that
 //!   starts mid-run; a halt flag over a segment that does not end at the
-//!   halt; a flag of two.
+//!   halt; a flag of two; `first` other than `last`; an initial ts of zero.
 //! - **The boundary bytes:** a tampered byte is refused, and an io-hash byte
-//!   of 256 is refused by its range check.
+//!   of 256 is refused by its range check; a stated io-hash limb other than
+//!   its bytes' is refused.
 
 use std::sync::OnceLock;
 
@@ -344,10 +345,63 @@ fn each_flags_conditions_negated_are_refused() {
     let mut two = values.clone();
     two.halt = m31(2);
     assert_eq!(refusals(&whole.leaf, &two), ["leaf: flags"]);
+
+    // A leaf's positions are one: `first` other than `last`.
+    let mut range = values.clone();
+    range.last = range.first + m31(1);
+    assert_eq!(refusals(&whole.leaf, &range), ["leaf: flags"]);
+}
+
+/// A segment starting at ts 0, its eight bytes zero, is refused by the
+/// leaf's inverse, a mismatch and not a panic, after the PoW the moved
+/// transcript fails; the entry flag is cleared, so only the ts check
+/// speaks among the leaf's.
+#[test]
+fn an_initial_ts_of_zero_is_refused() {
+    let run = run();
+    let (mut values, _) = run.tail.values(1);
+    assert!(refusals(&run.tail.leaf, &values).is_empty());
+    // ts in's two wires, 53 and 54.
+    for wire in [53, 54] {
+        values.segment.boundary[wire] = m31(0);
+    }
+    let mut context = Context::<SecureField>::with_outputs(2).lenient();
+    let wires = run.tail.leaf.verify(&mut context, &values);
+    context.set_outputs(&wires.digest);
+    let flags: Vec<_> = context
+        .mismatches()
+        .iter()
+        .filter(|mismatch| mismatch.piece == "leaf: flags")
+        .collect();
+    assert_eq!(flags.len(), 1, "{flags:?}");
+    assert_eq!(flags[0].expected, SecureField::one(), "the inverse's one");
+    assert_eq!(flags[0].computed, m31(0));
+    assert_eq!(context.mismatches()[0].piece, "pow");
+}
+
+/// A stated io-hash limb other than its bytes' is refused, in each lane.
+#[test]
+fn a_tampered_io_hash_limb_is_refused() {
+    let run = run();
+    let (values, _) = run.whole.values(0);
+    for wire in 0..4 {
+        for lane in 0..4 {
+            let mut tampered = values.clone();
+            let mut limbs = [BaseField::from(0); 4];
+            limbs[lane] = BaseField::from(1);
+            tampered.io_hash[wire] += SecureField::from_m31_array(limbs);
+            assert_eq!(
+                refusals(&run.whole.leaf, &tampered),
+                ["leaf: io-hash"],
+                "wire {wire}, lane {lane}"
+            );
+        }
+    }
 }
 
 /// A tampered boundary byte is refused: the transcript moves, so the PoW
-/// fails. An io-hash byte of 256 is refused by its range check as well.
+/// fails. With the io-hash's limb stated from the tampered byte, a byte of
+/// 256 is refused by its range check as well.
 #[test]
 fn a_tampered_boundary_byte_is_refused() {
     let run = run();
@@ -357,6 +411,7 @@ fn a_tampered_boundary_byte_is_refused() {
     for (delta, range_checked) in [(1, false), (256, true)] {
         let mut tampered = values.clone();
         tampered.segment.boundary[44] += m31(delta);
+        tampered.io_hash[0] += m31(delta);
         let pieces = refusals(&whole.leaf, &tampered);
         assert_eq!(pieces.first(), Some(&"pow"), "{delta}: {pieces:?}");
         assert_eq!(

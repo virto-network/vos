@@ -740,3 +740,12 @@ its gate. This slice's sharpest:
   shape, its `p2` sat within about 1% of 2^16 [model]; 5.8.0's rule moved
   the segment format to 35 (40 queries, PoW 24), and the built topology's
   `p2` is 12.0% under 2^16 [measured, 5.11].
+- **A class whose two-sample chips share the lifting height** (a design
+  gap, found at 5.12): at the lifting height a two-sample column's
+  periodicity sample falls on its second sample's point, so those samples
+  leave DEEP's `h8` blocks for one-sample `qm31` rows. The window kernel's
+  chips all at one size take 155.5k `qm31` rows, past 2^17 [measured]; a
+  BLAKE2B-heavy kernel, whose BLAKE2B chips are the largest, can reach it
+  in a derived class, and derive refuses it. The options, for later: a
+  policy that keeps the largest chip alone at the top (a `POLICY` bump), or
+  DEEP blocks that take coinciding samples.
