@@ -1,5 +1,59 @@
 # A VOS statement verifier pallet for Kreivo
 
+**Superseded in parts.** The built venue, slice 6's plan
+(`../../slice-6-on-chain.md`) and `../../spaces-pallet.md` (the pallet's
+handoff design, which replaces this note's pallet) supersede parts of this
+note:
+1. **§1, Kreivo's facts** (e4b2af3, stable2603, velocity 12, 500 ms
+   blocks): Kreivo master `87f8728` runs stable2606-2 from crates.io,
+   velocity 3 (2 s blocks) with block bundling; one core gives about
+   666 ms and 3.33 MiB a block.
+2. **§2, the interface:** the built `Statement` is `{ format: u32, program:
+   ProgramId ([u32; 8]), space, public_args, output, roots }`, with no
+   `shape_class`; `io_digest` is the io-hash; the id is
+   `H("vos/statement/v1" ‖ program ‖ space ‖ io_hash)`, without the
+   format.
+3. **§2, `RootKind { SpaceWindow = 0, Carried = 1 }`:** `{ Space = 0 }`,
+   1 reserved for Poseidon2; `Carried` retired by the carried commitment
+   (the owner's decision 6, 2026-10-19).
+4. **§1 and §2, the check order's "the program taken from the proof"
+   (modesto's):** the program id is the venue's pin, never the caller's or
+   the proof's.
+5. **§3, "Programs are tied to one format, since the id includes the
+   channel", and §7's migration by new ids:** the program id covers the
+   segment format, not the final one; a venue accepts final formats as a
+   set.
+6. **§4, the clock "RelaychainData's block number / WindowLength" and
+   `AnchorGrace`:** windows are Unix time from the space's genesis
+   (decision 2); `MaxRootAge` alone.
+7. **§4, "chain-bound attests read the agent root at the last window
+   cut":** they read to the space root.
+8. **§6, the 250 ms weight placeholder and `MaxProofLen = 512 KiB`:**
+   3.99 ms measured unmasked on a laptop (×1.3–1.4 masked [est]);
+   `MaxProofLen` 256 KiB; a proof's length counts as proof_size, so about
+   20 a block on one core, and length sets the fee (about 0.43 UNITS a
+   proof).
+9. **§7, `PROOF_FORMAT_VERSION` 24/25 as a cargo feature:** formats are
+   chosen at run time from the registry.
+10. **§8, the toolchain and pin ("vos-core pins stwo e1286720"):** the pin
+    is olanod/stwo `ab294189`; the stack builds on Kreivo's stable 1.94.1
+    for `wasm32v1-none` with no change and adds 75.7 KiB compressed
+    [measured, `../slice-6/spike6c-kreivo.md`].
+11. **§9's table, "Blake2s: software in Wasm":** Blake2b-256; JAM serves no
+    hash.
+12. **§10 Q11, "P2: the Clerk handler (slice 6)":** the Clerk follows
+    slice 6.
+13. **The home, frame-contrib:** `pallet-spaces` in Kreivo, the verifier
+    vendored with a sync check (decision 9); frame-contrib later.
+14. **§3, the space registry (`register_space(space_id, binding,
+    controller, anchor_keys)`, anchor keys signing directly) and §6's
+    fees:** a space registered from its genesis with a sovereign account
+    that pays; an authorities map of the nodes' sr25519 accounts paired
+    with ed25519 anchor keys; a refundable deposit on `submit`
+    (decisions 11, 12; `spaces-pallet.md`).
+15. **§5's `Verified` expiry for every statement:** a rootless statement's
+    `Seen` entry never expires.
+
 Design note for slice 5 planning, 2026-10-16. Read-only research: nothing was built or changed.
 
 **Paths:**
