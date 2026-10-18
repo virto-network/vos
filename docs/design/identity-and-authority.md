@@ -340,9 +340,8 @@ primitives built first don't preclude them. A space opts in.
 - **One pool shared by many spaces,** not one per space. The anonymity
   set is everyone who uses it.
 - **Its costs on JAM:**
-  - a pool on JAM verifies every spend in refine, about 10.7M cycles
-    each today, so about 90 spends fit a package of 1e9 gas until
-    proofs aggregate;
+  - a final proof costs about 100M gas of refine, so about 50 fit a
+    work package's 5e9;
   - scanning notes held on JAM needs the JAM light client in the
     personal space.
 - **An anonymous input** travels the client path without a session:
@@ -408,19 +407,35 @@ an agent, but approving a payment is a member's grant like any other.
 - **Missing is a root for the space,** not just for each agent:
   - a space has many agents, each with its committed root;
   - its representative agent keeps a space-level root over its agents'
-    roots, per window.
+    roots, per window: a committed map keyed `(agent, kind, w)`, the
+    value an agent's root at its cut of w, itself cut at `B_w + D` (the
+    window's boundary plus a close delay of `min(L/5, 2 min)`); the space
+    root is `S_w = BLAKE2b-256("vos/space/v1" ‖ space ‖ w ‖ A_rep)`, over
+    the representative's agent root at that cut (`slice-6-on-chain.md`,
+    pin D).
 - **Windows** run at a fixed cadence, minutes apart. A root that moved
-  only on activity would leak activity.
+  only on activity would leak activity. They are Unix time from the
+  space's genesis, whose hash is the `SpaceId` and which freezes the
+  clock: `w = ⌊(t − origin)/length⌋`, the length per space in [2, 60]
+  minutes, default 10.
 - **What an anchor gives an outsider:**
-  - the space's own builder submits its space-level root, so the anchor
-    gives outsiders ordering;
+  - the representative's leader signs the anchor with one registered
+    node key and submits it to the space's one anchor venue: on Kreivo
+    through the node's own sr25519 authority account, the space's
+    sovereign account paying (`spaces-pallet.md`; a budget per window
+    bounds what a compromised node key can spend); or the JAM statements
+    service. The anchor gives outsiders ordering;
   - integrity comes only from a proof that names the anchor.
+- **A venue anchors only a window its own clock has closed;** every
+  deadline between parties is the venue's time.
 - **Cost:**
-  - an anchor is a work package per window per space, a few million gas;
-  - a claim verified on chain also pays its verifier, about 10.7M cycles
-    for the settlement verifier measured in slice 1;
+  - on Kreivo an anchor is a ~170-byte extrinsic, a statement about 4 ms
+    of ref_time unmasked [measured] and about 0.43 UNITS of length fee,
+    plus a refundable deposit, all paid by the space's sovereign account;
+    on JAM a statement is about 100M gas of refine;
   - "this root is in the sequence" is a witnessed read in the
-    representative agent's state, which slice 4 made cheap.
+    representative agent's state, which slice 4 made cheap: on JAM,
+    later; on Kreivo the pallet stores the anchors.
 - **Statements disclose only their return value:**
   - "this window's net settlement with space B is X";
   - "this account's balance is at least Y";
@@ -429,12 +444,17 @@ an agent, but approving a payment is a member's grant like any other.
   private one.**
   - An unmasked STARK opens parts of its trace, so a settlement proof
     sent to JAM would leak the space's ledger to the world.
-  - Masking (the pinned Stwo has none) therefore leads the prover
-    track (core model §11.4), with hiding commitments for public
-    outputs, fixed proof shapes and aggregation after it.
+  - The final proof is masked (format 39, slice 6); aggregation (the
+    recursion) and fixed shapes came first, in slice 5.
 
 ## 12. The root space and the registry of spaces
 
+- **Kreivo's `pallet-spaces`** (`spaces-pallet.md`, built by the Kreivo
+  teammate, to replace pallet-communities later) holds the first
+  registry: spaces registered from their genesis, each with a sovereign
+  account and a map of its authorities, formats and programs with a
+  7-day delay under the Virto community; the JAM statements service
+  holds its own; a JAM registry agent comes later.
 - **A registry agent on JAM,** public:
   - spaces register a name, their representative agent and their policy
     declaration;
@@ -455,7 +475,8 @@ an agent, but approving a payment is a member's grant like any other.
     spaces other than Virto above X, plus a sunset date.
 - **A space's own keys** (its builder's signing key, behind
   `package::identity(service)`) rotate by a governance decision applied
-  in accumulate.
+  in accumulate; on Kreivo, the controller (an `AccountId`) rotates the
+  authorities and anchor keys.
 - **Exit and disputes** need rules, not yet designed. A space's name on
   exit is released only after its deposit's delay, so exit cannot be
   used to squat.
@@ -508,7 +529,8 @@ A design and implementation review (2026-10-15) found:
 - **Epochs plus short expiries** (§5).
 - **First credentials:** membership, then solvency (§7).
 - **Postponed:** full privacy, personal spaces, the shared pool, the
-  relay layer and the device prover (§8).
+  relay layer and the holder-side prover for personal spaces (§8); the
+  credential AIR and the device profile are slice 7's (`proving.md` §8).
 - **Registry:** a charter with handover triggers, a delay on version
   changes, pseudonymous registration (§12).
 - **Who pays:**
@@ -560,5 +582,6 @@ A design and implementation review (2026-10-15) found:
    - anonymous origins with scoped nullifiers on the client path.
 4. **The registry and the root space,** with the JAM light client.
 5. **Postponed, opt-in per space:** personal spaces, the shared pool,
-   the device prover, the relay layer and note discovery, with
+   the holder-side prover for personal spaces, the relay layer and note
+   discovery, with
    cipher-clerk's note redesign as their first application.
