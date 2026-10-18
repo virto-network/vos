@@ -2,7 +2,7 @@
 //! AIRs whose proofs sample many columns across the preprocessed, main,
 //! interaction and composition trees.
 
-use super::{
+use super::preflight::{
     ProofProtocolShape, derive_protocol_degree_shape, expected_fiat_shamir_query_count,
     replay_query_positions,
 };

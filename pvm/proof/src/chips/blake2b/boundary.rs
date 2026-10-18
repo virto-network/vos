@@ -51,9 +51,9 @@ use crate::{
 };
 
 use super::columns::CompressionColumns;
-use super::{ScheduleColumns, add_compression_core, read_schedule};
+use super::compression::{ScheduleColumns, add_compression_core, read_schedule};
 #[cfg(feature = "prover")]
-use super::{
+use super::compression::{
     add_compression_interaction_core, build_compression_rows, fill_compression_trace,
     fill_schedule_preprocessed,
 };

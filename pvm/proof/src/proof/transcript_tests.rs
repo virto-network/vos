@@ -6,6 +6,7 @@ use crate::framework_access::{
     AllLookupElements, boundary_relation_challenges, draw_all_lookup_elements,
 };
 use crate::poseidon2::Poseidon2M31Channel;
+use stwo::core::channel::Channel;
 use stwo::core::fields::m31::{BaseField, P};
 
 fn state(register: u64) -> SegmentState {
