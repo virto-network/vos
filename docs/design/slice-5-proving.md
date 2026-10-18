@@ -14,6 +14,10 @@ Plan, draft 8.
 - **Draft 8 replaces draft 7.** It folds in Fable's review of draft 7
   (`research/slice-5/plan7-review.md`, R1–R11) and the owner's word on
   pushing the Stwo fork (2026-10-16).
+- **Slice 5 is closed** (2026-10-18, at `a314fed6`, its acceptance
+  record): M0 and M1 accepted, `slice-5-progress.md`, "Slice 5
+  accepted". 5.6's phone run waits on the owner's team (slice 7); what
+  leaves the slice is in that file's "Carried out of slice 5".
 - **M0 is done** (`slice-5-progress.md`, "M0 acceptance"). Where its outcome
   changed M1's premises, M1's opening and its steps say so.
 - **M0's milestone review is folded in.** Its stale docs are fixed, and
@@ -735,6 +739,12 @@ M0's milestone review left these before the recursion builds on them.
   - the end review (Fable);
   - the code-quality review (Opus);
   - a cleanup step.
+- **Passed** (`slice-5-progress.md`, "Slice 5 accepted") [measured]:
+  `ci-full` green (1,780 tests, 2,037 s), `judge-wasm` 13 of 13, the
+  checker loop 36 of 36; the window's recursion 41.6% of its segments'
+  proving and the predicate's 94.3%; every leaf, fold and wrap within
+  A.7; 96.3M / 94.5M JAM gas, 38.3M / 37.7M Wasm instructions, 123,840 /
+  121,098 bytes. The reviews are 5.16a (Fable) and 5.16b–c (Opus).
 
 ## Estimates
 
