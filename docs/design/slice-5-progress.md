@@ -2427,3 +2427,125 @@ Also:
 - `pvm/proof/recair/Cargo.toml`: postcard and vos-pvm for the tests.
 - `docs/design/recursion-air.md` §0, §3 and §5: the hardened counts and
   what the compiler found.
+
+## Step 5.10a: the segment format 35
+
+5.8.0's rule, on 5.9's count: `p2`'s headroom was 1.1%, under 10%, so a
+segment format with fewer queries and more PoW is registered, and with it
+the AIR drops what 5.9's compiler found no constraint reads. On `vos-core`
+from `b739bc9e`.
+
+### The formats
+
+| number | proofs | parameters | counts [model] | status |
+|---|---|---|---|---|
+| 35 | segments, Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 104 / 62 (62.857) | admitted |
+| 36 | segments, Blake2s, legacy encodings; `PROOF_FORMAT_VERSION` | the proof's own (MOBILE: 2, 38, 20, 1, 0, none) | 96 / 57 (57.49) | admitted |
+| 37 | device proofs | 1, 86, 20, 1, 0, 8 | 106 / 62 (62.13) | reserved |
+| 32 | leaves and folds | 2, 44, 20, 1, 0, 8 | 108 / 63 (63.37) | reserved, unchanged |
+| 31, 33, 34 | retired | — | — | refused as retired |
+
+- **35** counts 62.857 proven bits and 104 conjectured at the segment
+  reference shape (`security.rs`), Fable's 62.86 and 104; 44 queries at
+  PoW 20 gave 62.79 on the same shape. The format tests pin both, and
+  that 35's count is at least 44 queries' at PoW 20.
+- **A deviation: 33 and 34 move too.** The brief kept format 33's fixture,
+  but dropping columns changes the segment AIR, which 33 and 34 name as
+  well as 31: a 33 proof made before would not verify after. The
+  registry's rule is that a number names one AIR, as at 5.5's renumbering,
+  so the legacy format takes 36 (`PROOF_FORMAT_VERSION`) and the device
+  format 37, and 31, 33 and 34 are retired. 32 proves the recursion AIR
+  and keeps its number and its 44 queries. Nothing outside `pvm/proof`
+  names a format number.
+- **Updated:** `format.rs`'s table and docs, `proof.rs`'s history,
+  `proving.md` §4 and A.4, `SECURITY.md`, `recursion-air.md` §3 and §5,
+  and the tests that named 31 and 33 (the verifier's `formats` and
+  `standalone`, `recursion_seams`, the program-id words, the refine tests,
+  `recair`'s `modes`). Unregistered numbers in the tests are now 38. A
+  kernel program's id carries its format's number, so the id's golden
+  vector (`program_id.rs`) moves.
+
+### The AIR
+
+**Dropped from CpuChip** (`chips/cpu/columns.rs`, `trace_fill.rs`,
+`constraints/{divrem,row}.rs`), with 5.9's compiler test as the check:
+- **Fifteen main columns, not sixteen:** `Gas` (8), `RegAWritten`,
+  `ShiftOp`, and the unused limb of `PartNZTimesIndH` and
+  `ValRPartNZTimesIndH` (limb 0: the helpers now index `i - 1`),
+  `PartNZMsbTimesIndH`, `MemByteActiveMonoH` (limb 7) and
+  `PartNZMsbLoTimesIndH` (limb 3). 5.9's text said sixteen; its pinned list
+  held fifteen.
+- **The next-row masks of `Timestamp` and `Pc`** (12 samples): the
+  ProgramExecution logup carries pc and timestamp continuity.
+- **Gas is dropped, not constrained:** the AIR proves no gas accounting
+  and an out-of-gas exit is never proven. Recorded in `proving.md` §3.2.
+- **The shape:** 4,882 → 4,867 main columns, 8,039 → 8,024 in full (the
+  window kernel's 8,024 → 8,009), 9,047 → 9,020 samples; constraints
+  (5,177) and gate rows (29,443) unchanged, chip by chip. The segment
+  reference shape's sampled values are 9,020.
+- **5.9's unread-sample test** now asserts there are none.
+- **A test's premise gone:** `refine_bundle`'s nested test asserted that a
+  different gas budget gives a different main-trace commitment, which only
+  the unconstrained `Gas` column made true. The same run under another
+  budget now proves to the same child proof; the test says so, and that
+  the bundle's gas limit and transcript differ. The replay's
+  `arguments/gas` refusal, already tested, is what binds the budget.
+
+### Measured
+
+[measured, Intel Core Ultra 7 155H]
+- **The grind** (`SimdBackend`'s Poseidon2-M31 grind, 8 rayon threads,
+  128 grinds each, an example in a scratch worktree): PoW 24 takes 0.43 s
+  on average (median 0.26 s, 95th percentile 1.44 s, at most 2.4 s); PoW
+  20 0.028 s; 35–38M nonces a second. The plan's 0.4 s is the mean; Fable's
+  1.4 s is about the 95th percentile.
+- **The window kernel** (`window_kernel`, one test thread, load average
+  rising to 9): 632,800 steps, 26 segments proved in 208 s, **8.0 s a
+  segment** on average (5.8.0: 394 s at load 10–14, 291 s less loaded),
+  peak RSS 6.9 GiB; the chain verifies natively in 1.8 s. The grind is
+  about 5% of a segment.
+- **The leaf's rows** (`research/slice-5/count-35.log`, the 5.9 count crate
+  re-run on this AIR with segments at 40 queries and PoW 24) [model]:
+  - **the window kernel's class-1 leaf: 59,300 / 102,849 / 46,080**,
+    2^16 / 2^17 / 2^16; `p2` has 6,236 rows (9.5%) to spare. Per query
+    `p2` 1,354 (leaf hashes 1,004, paths 84, FRI 266), once 5,082;
+  - at format 31's 44 queries and PoW 20 over the new width: 64,717
+    (1.2% spare; 64,824 over the old width);
+  - class 0's 58,218 / 102,727 / 46,040; the full 25-chip shape's 59,396 /
+    101,336 / 46,440 (9.4%); with segment FRI fold step 3 53,036 /
+    109,569 / 46,080;
+  - the fold and its fixed point unchanged (34,461 / 46,038 / 4,048 at
+    2^[16, 17, 16]); a kernel leaf fits the padded shape up to about 9,033
+    columns.
+
+### Tests
+
+- **5.9's suggested addition** to
+  `a_miscompiled_gate_fails_both_equivalence_tests_on_every_chip`: beside a
+  flipped coefficient and a dropped term (150 each), `a` and `b` swapped
+  in rows whose coefficients differ (115), an operand re-pointed to its
+  neighbouring input (150), and a relation's `z` and `α` swapped in every
+  row (24 of the 25 chips, those that read both). Each fails tests 1 and 2, the first
+  mutation of each kind on a chip through a `Context`.
+- **Fixtures** (`just fixtures`): `segment-35.*` and `segment-36.*` in place
+  of 31's and 33's. Their preprocessed roots are 31's and 33's byte for
+  byte; the proofs are 937,165 and 856,054 bytes (1,012,413 and 856,513
+  before). The stale test passes.
+
+### Gates
+
+[measured, each under `systemd-run` at 14 GiB with `nice -n 10`,
+`CARGO_INCREMENTAL=0` and 8 jobs]
+- **`just check`** green: 1,049 tests.
+- **`just test-proof`**'s suites, one test thread: green, 573 tests in 51
+  binaries, 17 minutes; the 19 `*_gate` binaries' 105 tests among them,
+  `window_kernel`'s 4, `fixtures`' 2 and the settlement verifier's.
+- **`just clippy`** clean.
+- Not run: `test-bench-proof` (not this step's gate).
+
+### Outside the step's files
+
+- `pvm/proof/verifier/tests/refine_bundle.rs`: the gas premise above.
+- `docs/design/research/slice-5/count-35.log`: the count crate's output
+  under a header saying how it was ported; the crate stays uncommitted, as
+  for `count-hardened.log`.

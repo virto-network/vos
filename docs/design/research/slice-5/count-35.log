@@ -1,0 +1,297 @@
+# count-35.log: the gate-count model for format 35, the baseline for 5.10
+# and 5.11.
+#
+# The spike's gate-count crate (`spikes/s5-recair/count` on branch
+# `spike/s5-recair` at a2784b49), ported as for `count-hardened.log` and re-run
+# on vos-core at 5.10a, the segment AIR of formats 35 to 37: 25 chips, without
+# the fifteen CPU columns and twelve next-row masks no constraint read. Ported
+# in a scratch worktree, not committed:
+# - the chips are the AIR's 25, in `chip_idx` order; the window kernel's shape
+#   is mask 0x01f9ffff (23 chips, every one but POPCOUNT and BITCOUNT) and the
+#   full shape 0x01ffffff;
+# - the log sizes are the window kernel's classes 1 (2^15 steps, 8 pages) and
+#   0 (2^12, 8) as derive gave them in 5.8.0's window run; POPCOUNT and
+#   BITCOUNT at their table size, 8;
+# - a leaf verifies a segment at format 35's parameters (blowup 4, 40
+#   queries, PoW 24, interaction PoW 8, FRI fold step 1, last layer degree
+#   1); the window kernel's class 1 is also counted at format 31's 44 queries
+#   and PoW 20, over the new width. A fold verifies leaves and folds at
+#   format 32's (44 queries, PoW 20);
+# - the recursion AIR's components are vos-recair-air's (5.8).
+# The gate counts do not depend on the log sizes; the leaf, fold and wrap
+# models do. Counts [measured], rows [model], memory and time [projected], as
+# `recursion-air.md` tags them.
+# Run on the Intel Core Ultra 7 155H, release build.
+
+# 1. Our chips through the recording evaluator
+
+## window kernel shape, class 1 (2^15 steps, 8 pages): mask 0x01f9ffff, 23 chips
+| chip | log | pre | main | inter | constraints | max deg | fractions | relations | gates raw / fused | main offsets | inter offsets |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| CPU | 15 | 0 | 580 | 192 | 815 | 3 | 96 | 17 | 3761 / 2850 | 1×[0, 1] 579×[0] | 4×[-1, 0] 188×[0] |
+| BLAKE2B | 14 | 44 | 1744 | 1344 | 2043 | 3 | 671 | 4 | 17591 / 12307 | 354×[0, 1] 1390×[0] | 4×[-1, 0] 1340×[0] |
+| BLAKE2B_BOUNDARY | 16 | 43 | 951 | 436 | 1022 | 3 | 217 | 3 | 8125 / 5341 | 338×[0, 1] 613×[0] | 4×[-1, 0] 432×[0] |
+| MEMORY | 18 | 0 | 54 | 4 | 66 | 3 | 1 | 1 | 277 / 202 | 19×[0, 1] 35×[0] | 4×[-1, 0] |
+| MEMORY_PAGE | 9 | 21 | 590 | 520 | 480 | 3 | 259 | 3 | 6441 / 4876 | 149×[0, 1] 441×[0] | 4×[-1, 0] 516×[0] |
+| MEMORY_MERKLE | 8 | 0 | 268 | 12 | 80 | 3 | 5 | 2 | 1248 / 709 | 268×[0] | 4×[-1, 0] 8×[0] |
+| MEMORY_ROOT_BOUNDARY | 4 | 0 | 65 | 4 | 2 | 2 | 1 | 1 | 148 / 76 | 65×[0] | 4×[-1, 0] |
+| REGISTER_MEMORY | 17 | 0 | 59 | 4 | 64 | 2 | 1 | 1 | 262 / 191 | 19×[0, 1] 40×[0] | 4×[-1, 0] |
+| REGISTER_MEMORY_BOUNDARY | 4 | 0 | 10 | 4 | 1 | 2 | 1 | 1 | 35 / 19 | 10×[0] | 4×[-1, 0] |
+| REGISTER_MEMORY_CLOSING | 4 | 0 | 18 | 4 | 1 | 2 | 1 | 1 | 50 / 26 | 18×[0] | 4×[-1, 0] |
+| PROGRAM_BOUNDARY | 4 | 0 | 25 | 4 | 1 | 3 | 2 | 1 | 68 / 37 | 25×[0] | 4×[-1, 0] |
+| PROGRAM_MEMORY | 16 | 38 | 1 | 4 | 2 | 1 | 1 | 1 | 93 / 48 | 1×[0] | 4×[-1, 0] |
+| JUMP_TABLE | 8 | 9 | 1 | 4 | 2 | 1 | 1 | 1 | 35 / 19 | 1×[0] | 4×[-1, 0] |
+| WITNESS_INPUT | 16 | 0 | 22 | 16 | 31 | 3 | 8 | 3 | 178 / 126 | 16×[0, 1] 6×[0] | 4×[-1, 0] 12×[0] |
+| RANGE_MULTIPLICITY_256 | 8 | 1 | 1 | 4 | 1 | 1 | 1 | 1 | 19 / 10 | 1×[0] | 4×[-1, 0] |
+| BITWISE_LOOKUP | 8 | 3 | 1 | 4 | 1 | 1 | 1 | 1 | 23 / 12 | 1×[0] | 4×[-1, 0] |
+| POWER_OF_TWO | 6 | 9 | 1 | 4 | 1 | 1 | 1 | 1 | 35 / 18 | 1×[0] | 4×[-1, 0] |
+| BYTE_TO_BITS | 8 | 9 | 1 | 4 | 1 | 1 | 1 | 1 | 35 / 18 | 1×[0] | 4×[-1, 0] |
+| MUL | 15 | 0 | 162 | 132 | 191 | 3 | 66 | 2 | 1123 / 830 | 162×[0] | 4×[-1, 0] 128×[0] |
+| BITWISE | 15 | 0 | 63 | 36 | 66 | 3 | 18 | 2 | 486 / 353 | 63×[0] | 4×[-1, 0] 32×[0] |
+| COMPARE | 15 | 0 | 34 | 20 | 24 | 3 | 10 | 2 | 193 / 141 | 34×[0] | 4×[-1, 0] 16×[0] |
+| DIVREM | 15 | 0 | 213 | 196 | 279 | 3 | 98 | 2 | 1634 / 1199 | 213×[0] | 4×[-1, 0] 192×[0] |
+| BITWISE_AND_BYTE | 16 | 3 | 1 | 4 | 1 | 1 | 1 | 1 | 23 / 12 | 1×[0] | 4×[-1, 0] |
+window kernel shape, class 1 (2^15 steps, 8 pages): columns pre 180 + main 4865 + inter 2956 + composition 8 = 8009; samples 8997 (+ periodicity); constraints 5175; fractions 1462; max degree 3; relations 20 (tuple sizes sum 612); OODS gates over the shape: raw 41883 fused 29420 (24296 adds, 17565 muls, 22 negs, 0 inverses; 218 distinct constants, 9624 inputs)
+window kernel shape, class 0 (2^12 steps, 8 pages): columns pre 180 + main 4865 + inter 2956 + composition 8 = 8009; samples 8997 (+ periodicity); constraints 5175; fractions 1462; max degree 3; relations 20 (tuple sizes sum 612); OODS gates over the shape: raw 41883 fused 29420 (24296 adds, 17565 muls, 22 negs, 0 inverses; 218 distinct constants, 9624 inputs)
+
+## full shape (25 chips), class 1 sizes: mask 0x01ffffff, 25 chips
+| chip | log | pre | main | inter | constraints | max deg | fractions | relations | gates raw / fused | main offsets | inter offsets |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| CPU | 15 | 0 | 580 | 192 | 815 | 3 | 96 | 17 | 3761 / 2850 | 1×[0, 1] 579×[0] | 4×[-1, 0] 188×[0] |
+| BLAKE2B | 14 | 44 | 1744 | 1344 | 2043 | 3 | 671 | 4 | 17591 / 12307 | 354×[0, 1] 1390×[0] | 4×[-1, 0] 1340×[0] |
+| BLAKE2B_BOUNDARY | 16 | 43 | 951 | 436 | 1022 | 3 | 217 | 3 | 8125 / 5341 | 338×[0, 1] 613×[0] | 4×[-1, 0] 432×[0] |
+| MEMORY | 18 | 0 | 54 | 4 | 66 | 3 | 1 | 1 | 277 / 202 | 19×[0, 1] 35×[0] | 4×[-1, 0] |
+| MEMORY_PAGE | 9 | 21 | 590 | 520 | 480 | 3 | 259 | 3 | 6441 / 4876 | 149×[0, 1] 441×[0] | 4×[-1, 0] 516×[0] |
+| MEMORY_MERKLE | 8 | 0 | 268 | 12 | 80 | 3 | 5 | 2 | 1248 / 709 | 268×[0] | 4×[-1, 0] 8×[0] |
+| MEMORY_ROOT_BOUNDARY | 4 | 0 | 65 | 4 | 2 | 2 | 1 | 1 | 148 / 76 | 65×[0] | 4×[-1, 0] |
+| REGISTER_MEMORY | 17 | 0 | 59 | 4 | 64 | 2 | 1 | 1 | 262 / 191 | 19×[0, 1] 40×[0] | 4×[-1, 0] |
+| REGISTER_MEMORY_BOUNDARY | 4 | 0 | 10 | 4 | 1 | 2 | 1 | 1 | 35 / 19 | 10×[0] | 4×[-1, 0] |
+| REGISTER_MEMORY_CLOSING | 4 | 0 | 18 | 4 | 1 | 2 | 1 | 1 | 50 / 26 | 18×[0] | 4×[-1, 0] |
+| PROGRAM_BOUNDARY | 4 | 0 | 25 | 4 | 1 | 3 | 2 | 1 | 68 / 37 | 25×[0] | 4×[-1, 0] |
+| PROGRAM_MEMORY | 16 | 38 | 1 | 4 | 2 | 1 | 1 | 1 | 93 / 48 | 1×[0] | 4×[-1, 0] |
+| JUMP_TABLE | 8 | 9 | 1 | 4 | 2 | 1 | 1 | 1 | 35 / 19 | 1×[0] | 4×[-1, 0] |
+| WITNESS_INPUT | 16 | 0 | 22 | 16 | 31 | 3 | 8 | 3 | 178 / 126 | 16×[0, 1] 6×[0] | 4×[-1, 0] 12×[0] |
+| RANGE_MULTIPLICITY_256 | 8 | 1 | 1 | 4 | 1 | 1 | 1 | 1 | 19 / 10 | 1×[0] | 4×[-1, 0] |
+| BITWISE_LOOKUP | 8 | 3 | 1 | 4 | 1 | 1 | 1 | 1 | 23 / 12 | 1×[0] | 4×[-1, 0] |
+| POWER_OF_TWO | 6 | 9 | 1 | 4 | 1 | 1 | 1 | 1 | 35 / 18 | 1×[0] | 4×[-1, 0] |
+| POPCOUNT | 8 | 2 | 1 | 4 | 1 | 1 | 1 | 1 | 21 / 11 | 1×[0] | 4×[-1, 0] |
+| BITCOUNT | 8 | 3 | 1 | 4 | 1 | 1 | 1 | 1 | 23 / 12 | 1×[0] | 4×[-1, 0] |
+| BYTE_TO_BITS | 8 | 9 | 1 | 4 | 1 | 1 | 1 | 1 | 35 / 18 | 1×[0] | 4×[-1, 0] |
+| MUL | 15 | 0 | 162 | 132 | 191 | 3 | 66 | 2 | 1123 / 830 | 162×[0] | 4×[-1, 0] 128×[0] |
+| BITWISE | 15 | 0 | 63 | 36 | 66 | 3 | 18 | 2 | 486 / 353 | 63×[0] | 4×[-1, 0] 32×[0] |
+| COMPARE | 15 | 0 | 34 | 20 | 24 | 3 | 10 | 2 | 193 / 141 | 34×[0] | 4×[-1, 0] 16×[0] |
+| DIVREM | 15 | 0 | 213 | 196 | 279 | 3 | 98 | 2 | 1634 / 1199 | 213×[0] | 4×[-1, 0] 192×[0] |
+| BITWISE_AND_BYTE | 16 | 3 | 1 | 4 | 1 | 1 | 1 | 1 | 23 / 12 | 1×[0] | 4×[-1, 0] |
+full shape (25 chips), class 1 sizes: columns pre 185 + main 4867 + inter 2964 + composition 8 = 8024; samples 9020 (+ periodicity); constraints 5177; fractions 1464; max degree 3; relations 20 (tuple sizes sum 612); OODS gates over the shape: raw 41927 fused 29443 (24319 adds, 17584 muls, 24 negs, 0 inverses; 218 distinct constants, 9649 inputs)
+COMPARE alone (log 12, one preprocessed sequence column): 34 main + 20 inter; 24 constraints, 10 fractions, OODS gates raw 193 fused 141
+
+# 2. The recursion AIR's components
+| component | pre | main | inter | total | constraints | max degree | fractions | OODS gates raw / fused | main offsets | inter offsets |
+|---|---|---|---|---|---|---|---|---|---|---|
+| p2 | 33 | 309 | 12 | 354 | 303 | 3 | 5 | 2551 / 1932 | 16×[-1, 0] 293×[0] | 4×[-1, 0] 8×[0] |
+| qm31 | 17 | 16 | 8 | 41 | 3 | 3 | 4 | 123 / 71 | 16×[0] | 4×[-1, 0] 4×[0] |
+| h8 | 7 | 36 | 12 | 55 | 7 | 3 | 6 | 158 / 89 | 36×[0] | 4×[-1, 0] 8×[0] |
+recursion AIR OODS gates (all three, shared constants): raw 2832 fused 2092; 313 constraints
+
+# 3. Sizing
+
+## prover throughput, measured runs
+| run | committed cells | extended cells | time s | ext cells / s | RSS MiB | B / ext cell |
+|---|---|---|---|---|---|---|
+| fold-b2 (4b) | 265.5M | 1062M | 18.72 | 57M | 8995 | 8.9 |
+| fold-b1 (4b) | 265.5M | 531M | 10.45 | 51M | 5347 | 10.6 |
+| root-b4-q35 (4b) | 206.2M | 825M | 12.75 | 65M | 6967 | 8.9 |
+| root-b8-q24 (4b) | 206.2M | 1650M | 17.72 | 93M | 11332 | 7.2 |
+| chip-c1 (4b) | 73.9M | 296M | 3.66 | 81M | 3076 | 10.9 |
+| c320 log16 b64 (4a) | 21.5M | 1376M | 13 | 106M | 6554 | 5.0 |
+| c320 log20 b8 (4a) | 343.9M | 2751M | 25 | 110M | 13107 | 5.0 |
+projection range: 51–110M extended cells/s, 5.0–10.9 B per extended cell
+segment committed cells, window kernel class 1: 230.4M
+segment committed cells, window kernel class 0: 123.0M
+segment committed cells, full shape class 1: 230.4M
+window kernel class 1 leaf WITHOUT the H8 component (every DEEP sample one fused gate): p2 59300 / qm31 471489 → 2^16 / 2^19
+  its cells 48.9M at tallest 2^19
+
+### verify COMPARE alone (63 columns): lifting 2^15, composition bound 2^13, 13 FRI layers (heights [15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3]), 71 DEEP samples at 3 points; H8 runs 7 a query (56 samples clean), 15 samples by fused gates
+| term | per query | × 40 queries | once |
+|---|---|---|---|
+| p2: leaf hashes, four trees | 11 | 440 | |
+| p2: Merkle paths, four trees | 60 | 2400 | |
+| p2: FRI leaves and paths | 143 | 5720 | |
+| qm31: query limb and 31 bits | 63 | 2520 | |
+| qm31: query point from bits | 60 | 2400 | |
+| qm31: DEEP, per point | 18 | 720 | |
+| qm31: DEEP, samples off the H8 runs | 15 | 600 | |
+| h8: DEEP, 8-sample runs | 7 | 280 | |
+| qm31: FRI folds and twiddles | 91 | 3640 | |
+| p2: channel | | | 84 |
+| qm31: OODS constraints (compiled) | | | 141 |
+| qm31: composition accumulation | | | 24 |
+| qm31: relation challenge powers | | | 15 |
+| qm31: logup sum and claimed sums | | | 3 |
+| qm31: OODS point, vanishing, composition check | | | 42 |
+| qm31: DEEP sums of sampled values | | | 183 |
+| qm31: proof-of-work checks | | | 64 |
+| **rows** | p2 214 / qm31 247 / h8 7 | | p2 8644 / qm31 10352 / h8 280 total |
+
+### verify window kernel class 1 (8009 columns): lifting 2^21, composition bound 2^19, 19 FRI layers (heights [21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3]), 9985 DEEP samples at 18 points; H8 runs 1152 a query (9216 samples clean), 769 samples by fused gates
+| term | per query | × 40 queries | once |
+|---|---|---|---|
+| p2: leaf hashes, four trees | 1004 | 40160 | |
+| p2: Merkle paths, four trees | 84 | 3360 | |
+| p2: FRI leaves and paths | 266 | 10640 | |
+| qm31: query limb and 31 bits | 63 | 2520 | |
+| qm31: query point from bits | 84 | 3360 | |
+| qm31: DEEP, per point | 108 | 4320 | |
+| qm31: DEEP, samples off the H8 runs | 769 | 30760 | |
+| h8: DEEP, 8-sample runs | 1152 | 46080 | |
+| qm31: FRI folds and twiddles | 133 | 5320 | |
+| p2: channel | | | 5082 |
+| qm31: OODS constraints (compiled) | | | 29420 |
+| qm31: composition accumulation | | | 5175 |
+| qm31: relation challenge powers | | | 573 |
+| qm31: logup sum and claimed sums | | | 25 |
+| qm31: OODS point, vanishing, composition check | | | 54 |
+| qm31: DEEP sums of sampled values | | | 20458 |
+| qm31: proof-of-work checks | | | 64 |
+| **rows** | p2 1354 / qm31 1157 / h8 1152 | | p2 59242 / qm31 102049 / h8 46080 total |
+
+### verify window kernel class 1, format 31's 44 queries and PoW 20 (8009 columns): lifting 2^21, composition bound 2^19, 19 FRI layers (heights [21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3]), 9985 DEEP samples at 18 points; H8 runs 1152 a query (9216 samples clean), 769 samples by fused gates
+| term | per query | × 44 queries | once |
+|---|---|---|---|
+| p2: leaf hashes, four trees | 1004 | 44176 | |
+| p2: Merkle paths, four trees | 84 | 3696 | |
+| p2: FRI leaves and paths | 266 | 11704 | |
+| qm31: query limb and 31 bits | 63 | 2772 | |
+| qm31: query point from bits | 84 | 3696 | |
+| qm31: DEEP, per point | 108 | 4752 | |
+| qm31: DEEP, samples off the H8 runs | 769 | 33836 | |
+| h8: DEEP, 8-sample runs | 1152 | 50688 | |
+| qm31: FRI folds and twiddles | 133 | 5852 | |
+| p2: channel | | | 5083 |
+| qm31: OODS constraints (compiled) | | | 29420 |
+| qm31: composition accumulation | | | 5175 |
+| qm31: relation challenge powers | | | 573 |
+| qm31: logup sum and claimed sums | | | 25 |
+| qm31: OODS point, vanishing, composition check | | | 54 |
+| qm31: DEEP sums of sampled values | | | 20458 |
+| qm31: proof-of-work checks | | | 72 |
+| **rows** | p2 1354 / qm31 1157 / h8 1152 | | p2 64659 / qm31 106685 / h8 50688 total |
+
+### verify window kernel class 1, segment FRI fold step 3 (8009 columns): lifting 2^21, composition bound 2^19, 7 FRI layers (heights [21, 18, 15, 12, 9, 6, 3]), 9985 DEEP samples at 18 points; H8 runs 1152 a query (9216 samples clean), 769 samples by fused gates
+| term | per query | × 40 queries | once |
+|---|---|---|---|
+| p2: leaf hashes, four trees | 1004 | 40160 | |
+| p2: Merkle paths, four trees | 84 | 3360 | |
+| p2: FRI leaves and paths | 110 | 4400 | |
+| qm31: query limb and 31 bits | 63 | 2520 | |
+| qm31: query point from bits | 84 | 3360 | |
+| qm31: DEEP, per point | 108 | 4320 | |
+| qm31: DEEP, samples off the H8 runs | 769 | 30760 | |
+| h8: DEEP, 8-sample runs | 1152 | 46080 | |
+| qm31: FRI folds and twiddles | 301 | 12040 | |
+| p2: channel | | | 5058 |
+| qm31: OODS constraints (compiled) | | | 29420 |
+| qm31: composition accumulation | | | 5175 |
+| qm31: relation challenge powers | | | 573 |
+| qm31: logup sum and claimed sums | | | 25 |
+| qm31: OODS point, vanishing, composition check | | | 54 |
+| qm31: DEEP sums of sampled values | | | 20458 |
+| qm31: proof-of-work checks | | | 64 |
+| **rows** | p2 1198 / qm31 1325 / h8 1152 | | p2 52978 / qm31 108769 / h8 46080 total |
+
+### verify window kernel class 0 (8009 columns): lifting 2^20, composition bound 2^18, 18 FRI layers (heights [20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3]), 9985 DEEP samples at 18 points; H8 runs 1151 a query (9208 samples clean), 777 samples by fused gates
+| term | per query | × 40 queries | once |
+|---|---|---|---|
+| p2: leaf hashes, four trees | 1004 | 40160 | |
+| p2: Merkle paths, four trees | 80 | 3200 | |
+| p2: FRI leaves and paths | 243 | 9720 | |
+| qm31: query limb and 31 bits | 63 | 2520 | |
+| qm31: query point from bits | 80 | 3200 | |
+| qm31: DEEP, per point | 108 | 4320 | |
+| qm31: DEEP, samples off the H8 runs | 777 | 31080 | |
+| h8: DEEP, 8-sample runs | 1151 | 46040 | |
+| qm31: FRI folds and twiddles | 126 | 5040 | |
+| p2: channel | | | 5080 |
+| qm31: OODS constraints (compiled) | | | 29420 |
+| qm31: composition accumulation | | | 5175 |
+| qm31: relation challenge powers | | | 573 |
+| qm31: logup sum and claimed sums | | | 25 |
+| qm31: OODS point, vanishing, composition check | | | 52 |
+| qm31: DEEP sums of sampled values | | | 20458 |
+| qm31: proof-of-work checks | | | 64 |
+| **rows** | p2 1327 / qm31 1154 / h8 1151 | | p2 58160 / qm31 101927 / h8 46040 total |
+
+### verify full 25-chip shape, class 1 sizes (8024 columns): lifting 2^21, composition bound 2^19, 19 FRI layers (heights [21, 20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3]), 10016 DEEP samples at 18 points; H8 runs 1161 a query (9288 samples clean), 728 samples by fused gates
+| term | per query | × 40 queries | once |
+|---|---|---|---|
+| p2: leaf hashes, four trees | 1006 | 40240 | |
+| p2: Merkle paths, four trees | 84 | 3360 | |
+| p2: FRI leaves and paths | 266 | 10640 | |
+| qm31: query limb and 31 bits | 63 | 2520 | |
+| qm31: query point from bits | 84 | 3360 | |
+| qm31: DEEP, per point | 108 | 4320 | |
+| qm31: DEEP, samples off the H8 runs | 728 | 29120 | |
+| h8: DEEP, 8-sample runs | 1161 | 46440 | |
+| qm31: FRI folds and twiddles | 133 | 5320 | |
+| p2: channel | | | 5098 |
+| qm31: OODS constraints (compiled) | | | 29443 |
+| qm31: composition accumulation | | | 5177 |
+| qm31: relation challenge powers | | | 573 |
+| qm31: logup sum and claimed sums | | | 27 |
+| qm31: OODS point, vanishing, composition check | | | 54 |
+| qm31: DEEP sums of sampled values | | | 20558 |
+| qm31: proof-of-work checks | | | 64 |
+| **rows** | p2 1356 / qm31 1116 / h8 1161 | | p2 59338 / qm31 100536 / h8 46440 total |
+
+## the padded shape and the fold's fixed point (inner parameters)
+| circuit | rows p2 / qm31 / h8 | padded | tallest | committed cells | memory | time |
+|---|---|---|---|---|---|---|
+| leaf: COMPARE alone | 8702 / 11152 / 280 | 2^14 / 2^14 / 2^9 | 2^14 | 6.6M | 0.12–0.27 GiB | 0.2–0.5 s |
+| leaf: window kernel class 1 | 59300 / 102849 / 46080 | 2^16 / 2^17 / 2^16 | 2^17 | 33.2M | 0.62–1.35 GiB | 1.2–2.6 s |
+| leaf: window kernel class 1, format 31's 44 queries and PoW 20 | 64717 / 107485 / 50688 | 2^16 / 2^17 / 2^16 | 2^17 | 33.2M | 0.62–1.35 GiB | 1.2–2.6 s |
+| leaf: window kernel class 1, segment FRI fold step 3 | 53036 / 109569 / 46080 | 2^16 / 2^17 / 2^16 | 2^17 | 33.2M | 0.62–1.35 GiB | 1.2–2.6 s |
+| leaf: window kernel class 0 | 58218 / 102727 / 46040 | 2^16 / 2^17 / 2^16 | 2^17 | 33.2M | 0.62–1.35 GiB | 1.2–2.6 s |
+| leaf: full 25-chip shape, class 1 sizes | 59396 / 101336 / 46440 | 2^16 / 2^17 / 2^16 | 2^17 | 33.2M | 0.62–1.35 GiB | 1.2–2.6 s |
+
+### verify a child of the padded shape [16, 17, 16] (458 columns): lifting 2^20, composition bound 2^18, 18 FRI layers (heights [20, 19, 18, 17, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3]), 514 DEEP samples at 4 points; H8 runs 46 a query (368 samples clean), 146 samples by fused gates
+| term | per query | × 44 queries | once |
+|---|---|---|---|
+| p2: leaf hashes, four trees | 61 | 2684 | |
+| p2: Merkle paths, four trees | 80 | 3520 | |
+| p2: FRI leaves and paths | 243 | 10692 | |
+| qm31: query limb and 31 bits | 63 | 2772 | |
+| qm31: query point from bits | 80 | 3520 | |
+| qm31: DEEP, per point | 24 | 1056 | |
+| qm31: DEEP, samples off the H8 runs | 146 | 6424 | |
+| h8: DEEP, 8-sample runs | 46 | 2024 | |
+| qm31: FRI folds and twiddles | 126 | 5544 | |
+| p2: channel | | | 316 |
+| qm31: OODS constraints (compiled) | | | 2092 |
+| qm31: composition accumulation | | | 313 |
+| qm31: relation challenge powers | | | 3 |
+| qm31: logup sum and claimed sums | | | 5 |
+| qm31: OODS point, vanishing, composition check | | | 52 |
+| qm31: DEEP sums of sampled values | | | 1112 |
+| qm31: proof-of-work checks | | | 72 |
+| **rows** | p2 384 / qm31 439 / h8 46 | | p2 17212 / qm31 22965 / h8 2024 total |
+fixed-point iteration 1: shape 2^[16, 17, 16] → the fold needs p2 34461 / qm31 46038 / h8 4048 → shape 2^[16, 17, 16]
+fixed point: 2^[16, 17, 16]; the fold uses 53% / 35% / 6% of p2 / qm31 / h8 rows
+| fold (padded shape) | 34461 / 46038 / 4048 | 2^16 / 2^16 / 2^12 | 2^16 | 26.6M | 0.50–1.08 GiB | 1.0–2.1 s |
+padded shape cells 33.2M at tallest 2^17: every leaf and fold proves this many
+from the COMPARE leaf, iteration 1: shape 2^[14, 14, 9] → fold needs p2 27849 / qm31 41696 / h8 4224 → 2^[15, 16, 13]
+from the COMPARE leaf, iteration 2: shape 2^[15, 16, 13] → fold needs p2 32169 / qm31 44184 / h8 4224 → 2^[15, 16, 13]
+  the fold's own fixed point: 2^[15, 16, 13], 15.3M cells, tallest 2^16
+leaf headroom: the window kernel's leaf fits the shape up to ~9033 columns (+1024);                      at 9161 it needs p2 65636 / qm31 105155 / h8 51840
+a fold child has 458 committed columns (57 preprocessed, 361 main, 32 interaction, 8 composition)
+if leaf and fold proofs fold FRI 3 steps: the fold needs p2 21741 / qm31 60822 / h8 4048; the wrap p2 10872 / qm31 30437
+column headroom: a child may grow by ~2560 single-sample columns before the fold outgrows the shape                      (at +2624: p2 65949 / qm31 56548 / h8 32912)
+slopes (window kernel, 8009 columns): per column per query 56.2 cells (44.4 leaf hashing, 11.8 DEEP);              per column once 506 cells (282 OODS, composition and DEEP sums; 225 channel);              width-free per query 139808 cells
+vos poseidon2::permute, scalar, one thread: 680 ns (M31(1196891411))
+a leaf proof commits ≈25M permutations: 17.0 s on one thread at that speed, 2.1 s on 8
+
+## the final wrap: a 1-to-1 node over the root fold
+| circuit | rows p2 / qm31 / h8 | padded | tallest | committed cells | memory | time |
+|---|---|---|---|---|---|---|
+| wrap (blowup 64) | 17232 / 23045 / 2024 | 2^15 / 2^15 / 2^11 | 2^15 | 13.3M | 3.97–8.66 GiB | 7.7–16.8 s |
+wrap: tallest 2^15, 458 committed columns, 4 FRI layers; JAM gas by spike 4a's fitted model (Blake2s software) 81.1M, Blake2b-256 software ×1.05 = 85.2M, through VOS's 0x400 ×0.79 = 64.1M; masked ×1.37–1.40 = 117–119M; proof ≈ 122 KB unmasked, ≈ 164–170 KB masked; extended cells 852M
