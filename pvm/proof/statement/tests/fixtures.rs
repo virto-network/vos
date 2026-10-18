@@ -27,6 +27,7 @@ fn load() -> Vec<Fixture> {
         "unaccepted format",
         "wrong io-hash",
         "rootless, another space",
+        "the same run, another accepted format",
     ] {
         assert!(names.contains(&name), "the fixture {name:?}");
     }

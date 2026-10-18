@@ -161,6 +161,17 @@ mod tests {
             5
         );
         assert_eq!(refusal(|i| i.policy.seen.push(i.statement.id())), 6);
+        // A venue in a transition accepts a second final format; the run
+        // accepted under it is the same statement under this one.
+        assert_eq!(
+            refusal(|i| {
+                let mut other = i.statement.clone();
+                other.format = FORMAT + 10;
+                i.policy.formats.push(other.format);
+                i.policy.seen.push(other.id());
+            }),
+            6
+        );
         // A rootless statement needs no anchor, and belongs to no space:
         // one claiming a space is refused, since nothing binds it and each
         // space would give the same proof another id.

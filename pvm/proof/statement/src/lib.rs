@@ -37,6 +37,15 @@
 //! many encodings (`vos_final_verifier::decode`), and many proofs state one
 //! statement.
 //!
+//! **The id does not hash the format.** The format is a checked field, as
+//! the space is, but which final proof states a run is not part of what it
+//! states: a venue accepts two final formats during a transition, and one
+//! run wrapped under each is one statement, refused the second time. The
+//! program id does not move with the final format (it covers the segment
+//! format only), so an id that hashed the format would give one run an id
+//! per format, and a venue's repeat check would let it be applied once
+//! under each.
+//!
 //! **The encoding** is SCALE: the format and the program id's eight words as
 //! little-endian `u32`s, the space's 32 bytes, then `public_args`, `output`
 //! and `roots` as the io-hash encodes them: a byte vector a compact length
@@ -225,9 +234,9 @@ impl Statement {
         blake2b_256(&[IO_DOMAIN, &io])
     }
 
-    /// `BLAKE2b-256("vos/statement/v1" ‖ format ‖ program ‖ space ‖
-    /// io_hash)`, the format a little-endian `u32` and the program id its
-    /// 32 bytes.
+    /// `BLAKE2b-256("vos/statement/v1" ‖ program ‖ space ‖ io_hash)`, the
+    /// program id its 32 bytes: not the format, which a venue checks but
+    /// which does not change what is stated (the crate's docs).
     pub fn id(&self) -> StatementId {
         self.id_of(&self.io_hash())
     }
@@ -235,7 +244,6 @@ impl Statement {
     fn id_of(&self, io_hash: &[u8; 32]) -> StatementId {
         StatementId(blake2b_256(&[
             ID_DOMAIN,
-            &self.format.to_le_bytes(),
             &self.program.to_bytes(),
             &self.space.0,
             io_hash,
@@ -449,8 +457,8 @@ mod tests {
     }
 
     /// The encoding, field by field, and its decode; the io-hash over its
-    /// tail; the id over the format, the program, the space and the
-    /// io-hash; and both pinned.
+    /// tail; the id over the program, the space and the io-hash; and both
+    /// pinned.
     #[test]
     fn the_encoding_the_io_hash_and_the_id() {
         let statement = statement();
@@ -481,7 +489,7 @@ mod tests {
         let io_hash = statement.io_hash();
         assert_eq!(
             statement.id().0,
-            blake2b_256(&[b"vos/statement/v1", &bytes[..68], &io_hash])
+            blake2b_256(&[b"vos/statement/v1", &bytes[4..68], &io_hash])
         );
         assert_eq!(
             hex(&io_hash),
@@ -489,7 +497,7 @@ mod tests {
         );
         assert_eq!(
             hex(&statement.id().0),
-            "143db435d3cdd4901aca106e1de777924cfd5dd7ef930b3cc6e1f637c40dfb2a"
+            "06925f7b01859fcd284bc0361259628064e86ccb0a570ef81be0742d2f4a7dbe"
         );
     }
 
@@ -514,14 +522,19 @@ mod tests {
         assert_eq!(Statement::decode(&long), Err(DecodeError::Noncanonical));
     }
 
-    /// Each field moves the io-hash or the id: the format, the program and
-    /// the space only the id, the rest both.
+    /// Each field but the format moves the io-hash or the id: the program
+    /// and the space only the id, the rest both. The format moves neither:
+    /// one run under two final formats is one statement.
     #[test]
     fn every_field_is_bound() {
         let base = statement();
+        let mut reformatted = base.clone();
+        reformatted.format = FORMAT + 1;
+        assert_eq!(reformatted.io_hash(), base.io_hash());
+        assert_eq!(reformatted.id(), base.id());
+
         type Change = fn(&mut Statement);
-        let changes: [(&str, bool, Change); 9] = [
-            ("format", false, |s| s.format = 30),
+        let changes: [(&str, bool, Change); 8] = [
             ("program", false, |s| s.program.0[7] += 1),
             ("space", false, |s| s.space.0[0] ^= 1),
             ("public_args", true, |s| s.public_args.push(0)),

@@ -308,6 +308,13 @@ fn the_fixtures_are_judged() {
 /// - **rootless, another space:** `S` without its roots, its space still
 ///   claimed: a rootless statement belongs to no space, since nothing
 ///   binds it there and each space would give one proof another id.
+/// - **the same run, another accepted format:** `S` at a venue in a
+///   transition, accepting format 28 and a successor, which accepted `S`'s
+///   run under the successor: the same statement, refused as a repeat,
+///   since the id does not hash the format. The successor is 38, a number
+///   no format holds; this verifier reads 28 alone, so the case records the
+///   successor's acceptance as the id the venue keeps, which is all its
+///   repeat check reads.
 mod statements {
     use stwo::core::fields::qm31::SecureField;
     use vos_final_verifier::WrapProof;
@@ -328,6 +335,9 @@ mod statements {
     use super::{load, record, standard_program};
 
     const SPACE: SpaceId = SpaceId([0xA1; 32]);
+    /// A final format a venue in a transition accepts beside 28: a number
+    /// no format holds.
+    const SUCCESSOR: u32 = 38;
     /// The run's cuts: the io-hash set in the first two, the halt in the
     /// last.
     const CUTS: [(usize, usize); 3] = [(0, 2), (2, 5), (5, 6)];
@@ -546,6 +556,20 @@ mod statements {
                 None,
                 input(&|i| i.statement.roots.clear()),
                 |code| code == 4,
+            ),
+            (
+                "the same run, another accepted format",
+                "wrap.proof",
+                None,
+                input(&|i| {
+                    let successor = Statement {
+                        format: SUCCESSOR,
+                        ..i.statement.clone()
+                    };
+                    i.policy.formats.push(SUCCESSOR);
+                    i.policy.seen.push(successor.id());
+                }),
+                |code| code == 6,
             ),
         ];
         let proofs = [
