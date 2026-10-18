@@ -53,35 +53,6 @@ pub use record::Recording;
 use crate::context::{Context, Var};
 use crate::value::Value;
 
-/// The segment AIR's chips, by `vos_pvm_proof::chip_idx`.
-pub const CHIP_NAMES: [&str; vos_pvm_proof::chip_idx::COUNT] = [
-    "CPU",
-    "BLAKE2B",
-    "BLAKE2B_BOUNDARY",
-    "MEMORY",
-    "MEMORY_PAGE",
-    "MEMORY_MERKLE",
-    "MEMORY_ROOT_BOUNDARY",
-    "REGISTER_MEMORY",
-    "REGISTER_MEMORY_BOUNDARY",
-    "REGISTER_MEMORY_CLOSING",
-    "PROGRAM_BOUNDARY",
-    "PROGRAM_MEMORY",
-    "JUMP_TABLE",
-    "WITNESS_INPUT",
-    "RANGE_MULTIPLICITY_256",
-    "BITWISE_LOOKUP",
-    "POWER_OF_TWO",
-    "POPCOUNT",
-    "BITCOUNT",
-    "BYTE_TO_BITS",
-    "MUL",
-    "BITWISE",
-    "COMPARE",
-    "DIVREM",
-    "BITWISE_AND_BYTE",
-];
-
 /// A value the verifier holds at the OODS point, which the compiled circuit
 /// reads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]

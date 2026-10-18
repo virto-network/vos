@@ -190,166 +190,144 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
     BASE_COMPONENTS
 }
 
-// Ordering rule: all consumers of a lookup table must be listed BEFORE the table
-// chip itself.  Table chips populate their multiplicity column by reading counts
-// that consumers accumulate into SideNote during trace generation.
+/// The segment AIR's chips, once: their indices ([`chip_idx`]), their
+/// names, the components the prover and the verifier walk
+/// (`BASE_COMPONENTS`) and the dispatch from an index to a chip's type
+/// (`visit_chip`), all in this order.
+macro_rules! chips {
+    ($($(#[$doc:meta])* $index:ident = $chip:path,)*) => {
+        /// Indices into `BASE_COMPONENTS` for chips referenced by name in
+        /// `ChipActivity::is_active`, `Proof::component_mask` bit positions,
+        /// and other bit-position-sensitive sites (e.g. the boundary-binding
+        /// check in `boundary_binding`, which the standalone verifier also
+        /// uses — hence public and feature-ungated).
+        pub mod chip_idx {
+            chips!(@index 0usize; $($(#[$doc])* $index,)*);
+
+            /// The number of chips.
+            pub const COUNT: usize = [$(stringify!($index)),*].len();
+
+            /// Each chip's name, its index's.
+            pub const NAMES: [&str; COUNT] = [$(stringify!($index)),*];
+
+            /// Every chip, as a component mask.
+            pub const ALL: u32 = ((1u64 << COUNT) - 1) as u32;
+
+            /// The chips a trace may leave out: each is active only when its
+            /// opcodes or its precompile occur. A row needing one makes a request
+            /// that only the chip answers, its multiplicity a flag the program's
+            /// committed code fixes, so a proof without the chip balances only if
+            /// no row needs it.
+            pub const OPTIONAL: u32 = 1 << BLAKE2B
+                | 1 << JUMP_TABLE
+                | 1 << WITNESS_INPUT
+                | 1 << POPCOUNT
+                | 1 << BITCOUNT
+                | 1 << MUL
+                | 1 << BITWISE
+                | 1 << COMPARE
+                | 1 << DIVREM;
+
+            /// The chips every proof holds: the CPU, the memory and register
+            /// ledgers and their boundaries, the program's memory and boundary, the
+            /// page Merkle chips and the fixed tables. A kernel's shape without one
+            /// is refused.
+            pub const ALWAYS: u32 = ALL & !OPTIONAL;
+
+            /// The canonical forcing set: the chips whose log size the program
+            /// commitment depends on and a run's rows vary, padded to a profile's
+            /// floors by canonical proving.
+            pub const FORCING: u32 = 1 << BLAKE2B | 1 << BLAKE2B_BOUNDARY | 1 << MEMORY_PAGE;
+        }
+
+        #[cfg(feature = "prover")]
+        const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[$(&$chip),*];
+
+        #[cfg(not(feature = "prover"))]
+        const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[$(&$chip),*];
+
+        /// Calls `visitor` with the chip at `index`.
+        ///
+        /// # Panics
+        /// When `index` is no chip's.
+        pub(crate) fn visit_chip<V: ChipVisitor>(index: usize, visitor: V) -> V::Output {
+            match index {
+                $(chip_idx::$index => visitor.visit(&$chip),)*
+                _ => panic!("no chip at index {index}"),
+            }
+        }
+    };
+    (@index $n:expr; $(#[$doc:meta])* $index:ident, $($rest:tt)*) => {
+        $(#[$doc])*
+        pub const $index: usize = $n;
+        chips!(@index $n + 1; $($rest)*);
+    };
+    (@index $n:expr;) => {};
+}
+
+/// What [`visit_chip`] does with a chip, generic over its type.
+pub(crate) trait ChipVisitor {
+    type Output;
+    fn visit<C: framework::BuiltInComponent>(self, chip: &C) -> Self::Output;
+}
+
+// Ordering rule: all consumers of a lookup table must be listed BEFORE the
+// table chip itself. Table chips populate their multiplicity column by
+// reading counts that consumers accumulate into SideNote during trace
+// generation.
 //
 // The `chip_idx::OPTIONAL` chips are skipped when no step needs them. Both
 // prover and verifier must agree on inclusion — `active_components` is the
 // single source of truth and is deterministic from `SideNote`.
-/// Indices into `BASE_COMPONENTS` for chips referenced by name in
-/// `ChipActivity::is_active`, `Proof::component_mask` bit positions,
-/// and other bit-position-sensitive sites (e.g. the boundary-binding
-/// check in `boundary_binding`, which the standalone verifier also
-/// uses — hence public and feature-ungated).
-///
-/// Indexed positions are coupled to the declaration order of
-/// `BASE_COMPONENTS`. If you reorder the array, update these constants
-/// at the same time — the trailing length assertion catches a
-/// shortened array but not a within-bounds reorder. The named
-/// constants double as documentation for which chip each match arm
-/// in `is_active` refers to.
-pub mod chip_idx {
-    pub const CPU: usize = 0;
-    pub const BLAKE2B: usize = 1;
-    pub const BLAKE2B_BOUNDARY: usize = 2;
-    pub const MEMORY: usize = 3;
-    pub const MEMORY_PAGE: usize = 4;
-    pub const MEMORY_MERKLE: usize = 5;
-    pub const MEMORY_ROOT_BOUNDARY: usize = 6;
-    pub const REGISTER_MEMORY: usize = 7;
-    pub const REGISTER_MEMORY_BOUNDARY: usize = 8;
-    pub const REGISTER_MEMORY_CLOSING: usize = 9;
-    pub const PROGRAM_BOUNDARY: usize = 10;
-    pub const PROGRAM_MEMORY: usize = 11;
-    pub const JUMP_TABLE: usize = 12;
-    /// The witness input's bytes.  Before the range table: its trace-gen
-    /// counts the bytes and addresses it range-checks.
-    pub const WITNESS_INPUT: usize = 13;
-    pub const RANGE_MULTIPLICITY_256: usize = 14;
-    pub const BITWISE_LOOKUP: usize = 15;
-    pub const POWER_OF_TWO: usize = 16;
-    pub const POPCOUNT: usize = 17;
-    pub const BITCOUNT: usize = 18;
-    pub const BYTE_TO_BITS: usize = 19;
-    pub const MUL: usize = 20;
-    pub const BITWISE: usize = 21;
-    pub const COMPARE: usize = 22;
-    pub const DIVREM: usize = 23;
+chips! {
+    CPU = chips::CpuChip,
+    /// Optional: the BLAKE2b precompile's calls.
+    BLAKE2B = chips::Blake2bChip,
+    /// The memory-page Merkle tree's BLAKE2b compressions.
+    BLAKE2B_BOUNDARY = chips::Blake2bBoundaryChip,
+    MEMORY = chips::MemoryChip,
+    /// Per-page boundary writes and reads, and the leaves' hashes.
+    MEMORY_PAGE = chips::MemoryPageChip,
+    /// The Merkle tree's merge rows.
+    MEMORY_MERKLE = chips::MemoryMerkleChip,
+    /// The roots, bound to the public ones.
+    MEMORY_ROOT_BOUNDARY = chips::MemoryRootBoundaryChip,
+    REGISTER_MEMORY = chips::RegisterMemoryChip,
+    REGISTER_MEMORY_BOUNDARY = chips::RegisterMemoryBoundaryChip,
+    /// Pins the final registers.
+    REGISTER_MEMORY_CLOSING = chips::RegisterMemoryClosingChip,
+    PROGRAM_BOUNDARY = chips::ProgramBoundaryChip,
+    /// The committed program, consumed per step by the CPU.
+    PROGRAM_MEMORY = chips::ProgramMemoryChip,
+    /// Optional: the jump table, for dynamic jumps.
+    JUMP_TABLE = chips::JumpTableChip,
+    /// Optional: the witness input's bytes.  Before the range table: its
+    /// trace-gen counts the bytes and addresses it range-checks.
+    WITNESS_INPUT = chips::WitnessInputChip,
+    RANGE_MULTIPLICITY_256 = chips::RangeMultiplicity256,
+    BITWISE_LOOKUP = chips::BitwiseLookupChip,
+    POWER_OF_TWO = chips::PowerOfTwoChip,
+    /// Optional: the per-byte popcount table.
+    POPCOUNT = chips::PopcountChip,
+    /// Optional: the per-byte (lz, tz) table.
+    BITCOUNT = chips::BitcountChip,
+    /// The per-byte 8-bit decomposition table.
+    BYTE_TO_BITS = chips::ByteToBitsChip,
+    /// Optional: MultiplicationLookup's consumer.
+    MUL = chips::MulChip,
+    /// Optional: BitwiseLookup's consumer, and the BitwiseAnd nibble
+    /// lookups' producer.
+    BITWISE = chips::BitwiseChip,
+    /// Optional: CompareLookup's consumer, and Range256 lookups' producer.
+    COMPARE = chips::CompareChip,
+    /// Optional: DivRemLookup's consumer.
+    DIVREM = chips::DivRemChip,
     /// 2^16-row byte-wide AND table.  Placed last: it is a receiver whose
     /// multiplicity counts are accumulated by the two blake2b chips during
     /// their trace-gen (idx 1/2), so it must be generated after all its
-    /// consumers (BASE_COMPONENTS ordering rule).
-    pub const BITWISE_AND_BYTE: usize = 24;
-    /// Total entries expected in `BASE_COMPONENTS`. Trailing const-time
-    /// assertion in `lib.rs` checks this against the actual array length.
-    pub const COUNT: usize = BITWISE_AND_BYTE + 1;
-
-    /// Every chip, as a component mask.
-    pub const ALL: u32 = ((1u64 << COUNT) - 1) as u32;
-
-    /// The chips a trace may leave out: each is active only when its
-    /// opcodes or its precompile occur. A row needing one makes a request
-    /// that only the chip answers, its multiplicity a flag the program's
-    /// committed code fixes, so a proof without the chip balances only if
-    /// no row needs it.
-    pub const OPTIONAL: u32 = 1 << BLAKE2B
-        | 1 << JUMP_TABLE
-        | 1 << WITNESS_INPUT
-        | 1 << POPCOUNT
-        | 1 << BITCOUNT
-        | 1 << MUL
-        | 1 << BITWISE
-        | 1 << COMPARE
-        | 1 << DIVREM;
-
-    /// The chips every proof holds: the CPU, the memory and register
-    /// ledgers and their boundaries, the program's memory and boundary, the
-    /// page Merkle chips and the fixed tables. A kernel's shape without one
-    /// is refused.
-    pub const ALWAYS: u32 = ALL & !OPTIONAL;
-
-    /// The canonical forcing set: the chips whose log size the program
-    /// commitment depends on and a run's rows vary, padded to a profile's
-    /// floors by canonical proving.
-    pub const FORCING: u32 = 1 << BLAKE2B | 1 << BLAKE2B_BOUNDARY | 1 << MEMORY_PAGE;
+    /// consumers (the ordering rule).
+    BITWISE_AND_BYTE = chips::BitwiseAndByteChip,
 }
-
-#[cfg(feature = "prover")]
-const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
-    &chips::CpuChip,
-    &chips::Blake2bChip, // OPTIONAL — gated by !side_note.blake2b_calls.is_empty()
-    &chips::Blake2bBoundaryChip, // proves the memory-page Merkle blake2b compressions
-    &chips::MemoryChip,
-    &chips::MemoryPageChip,   // per-page boundary writes/reads + leaf hashes
-    &chips::MemoryMerkleChip, // Merkle merge rows
-    &chips::MemoryRootBoundaryChip, // root sink (bound to public roots)
-    &chips::RegisterMemoryChip,
-    &chips::RegisterMemoryBoundaryChip,
-    &chips::RegisterMemoryClosingChip, // pins proof.final_state.registers
-    &chips::ProgramBoundaryChip,
-    &chips::ProgramMemoryChip, // the committed program, consumed per step by CpuChip
-    &chips::JumpTableChip,     // producer of jump_table[] lookups
-    &chips::WitnessInputChip,  // OPTIONAL — a witness input's bytes, gated by their calls
-    &chips::RangeMultiplicity256,
-    &chips::BitwiseLookupChip,
-    &chips::PowerOfTwoChip,
-    &chips::PopcountChip,       // per-byte popcount lookup table
-    &chips::BitcountChip,       // per-byte (lz, tz) lookup table
-    &chips::ByteToBitsChip,     // per-byte 8-bit decomposition lookup table
-    &chips::MulChip,            // consumer of MultiplicationLookup
-    &chips::BitwiseChip,        // consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
-    &chips::CompareChip,        // consumer of CompareLookup, producer of Range256 lookups
-    &chips::DivRemChip,         // consumer of DivRemLookup
-    &chips::BitwiseAndByteChip, // byte-wide AND table — consumed by the two blake2b chips
-];
-
-#[cfg(feature = "prover")]
-const _: () = {
-    assert!(
-        BASE_COMPONENTS.len() == chip_idx::COUNT,
-        "BASE_COMPONENTS length must match chip_idx::COUNT — chip added or removed without \
-         updating the constants in chip_idx",
-    );
-};
-
-#[cfg(not(feature = "prover"))]
-const BASE_COMPONENTS: &[&dyn framework::MachineComponent] = &[
-    &chips::CpuChip,
-    &chips::Blake2bChip,
-    &chips::Blake2bBoundaryChip,
-    &chips::MemoryChip,
-    &chips::MemoryPageChip,
-    &chips::MemoryMerkleChip,
-    &chips::MemoryRootBoundaryChip,
-    &chips::RegisterMemoryChip,
-    &chips::RegisterMemoryBoundaryChip,
-    &chips::RegisterMemoryClosingChip, // pins proof.final_state.registers
-    &chips::ProgramBoundaryChip,
-    &chips::ProgramMemoryChip,
-    &chips::JumpTableChip,
-    &chips::WitnessInputChip,
-    &chips::RangeMultiplicity256,
-    &chips::BitwiseLookupChip,
-    &chips::PowerOfTwoChip,
-    &chips::PopcountChip,
-    &chips::BitcountChip,
-    &chips::ByteToBitsChip, // per-byte 8-bit decomposition lookup table
-    &chips::MulChip,
-    &chips::BitwiseChip, // consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
-    &chips::CompareChip, // consumer of CompareLookup, producer of Range256 lookups
-    &chips::DivRemChip,  // consumer of DivRemLookup
-    &chips::BitwiseAndByteChip,
-];
-
-#[cfg(not(feature = "prover"))]
-const _: () = {
-    assert!(
-        BASE_COMPONENTS.len() == chip_idx::COUNT,
-        "BASE_COMPONENTS length must match chip_idx::COUNT — chip added or removed without \
-         updating the constants in chip_idx",
-    );
-};
 
 /// Deterministic, side-note-driven filter on `BASE_COMPONENTS`.
 /// Returns the components active for THIS trace, in declaration order.

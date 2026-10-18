@@ -53,7 +53,7 @@ impl Recording {
     /// values do not matter; it must hold every relation the chip uses.
     pub fn chip(chip_idx: usize, log_size: u32, lookup: &AllLookupElements) -> Self {
         Self::new(
-            super::CHIP_NAMES[chip_idx],
+            vos_pvm_proof::chip_idx::NAMES[chip_idx],
             log_size,
             drive_chip_oods(chip_idx, log_size, lookup, InfoEvaluator::empty()),
             drive_chip_oods(chip_idx, log_size, lookup, ExprEvaluator::new()),

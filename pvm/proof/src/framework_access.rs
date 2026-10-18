@@ -167,55 +167,38 @@ pub fn drive_chip_oods<E: stwo_constraint_framework::EvalAtRow>(
     lookup: &AllLookupElements,
     eval: E,
 ) -> E {
-    use crate::chips::*;
     use crate::framework::BuiltInComponent;
     use crate::framework::eval::BuiltInComponentEval;
     use crate::lookups::ComponentLookupElements;
     use stwo_constraint_framework::FrameworkEval;
 
-    fn run<C: BuiltInComponent, E: stwo_constraint_framework::EvalAtRow>(
-        chip: &C,
+    struct Drive<'a, E> {
         log_size: u32,
-        lookup: &AllLookupElements,
+        lookup: &'a AllLookupElements,
         eval: E,
-    ) -> E {
-        let ce = BuiltInComponentEval::<C> {
-            component: chip,
-            log_size,
-            lookup_elements: <C as BuiltInComponent>::LookupElements::get(lookup),
-        };
-        FrameworkEval::evaluate(&ce, eval)
     }
 
-    use crate::chip_idx as cx;
-    match chip_idx {
-        cx::CPU => run(&CpuChip, log_size, lookup, eval),
-        cx::BLAKE2B => run(&Blake2bChip, log_size, lookup, eval),
-        cx::BLAKE2B_BOUNDARY => run(&Blake2bBoundaryChip, log_size, lookup, eval),
-        cx::MEMORY => run(&MemoryChip, log_size, lookup, eval),
-        cx::MEMORY_PAGE => run(&MemoryPageChip, log_size, lookup, eval),
-        cx::MEMORY_MERKLE => run(&MemoryMerkleChip, log_size, lookup, eval),
-        cx::MEMORY_ROOT_BOUNDARY => run(&MemoryRootBoundaryChip, log_size, lookup, eval),
-        cx::REGISTER_MEMORY => run(&RegisterMemoryChip, log_size, lookup, eval),
-        cx::REGISTER_MEMORY_BOUNDARY => run(&RegisterMemoryBoundaryChip, log_size, lookup, eval),
-        cx::REGISTER_MEMORY_CLOSING => run(&RegisterMemoryClosingChip, log_size, lookup, eval),
-        cx::PROGRAM_BOUNDARY => run(&ProgramBoundaryChip, log_size, lookup, eval),
-        cx::PROGRAM_MEMORY => run(&ProgramMemoryChip, log_size, lookup, eval),
-        cx::JUMP_TABLE => run(&JumpTableChip, log_size, lookup, eval),
-        cx::WITNESS_INPUT => run(&WitnessInputChip, log_size, lookup, eval),
-        cx::RANGE_MULTIPLICITY_256 => run(&RangeMultiplicity256, log_size, lookup, eval),
-        cx::BITWISE_LOOKUP => run(&BitwiseLookupChip, log_size, lookup, eval),
-        cx::POWER_OF_TWO => run(&PowerOfTwoChip, log_size, lookup, eval),
-        cx::POPCOUNT => run(&PopcountChip, log_size, lookup, eval),
-        cx::BITCOUNT => run(&BitcountChip, log_size, lookup, eval),
-        cx::BYTE_TO_BITS => run(&ByteToBitsChip, log_size, lookup, eval),
-        cx::MUL => run(&MulChip, log_size, lookup, eval),
-        cx::BITWISE => run(&BitwiseChip, log_size, lookup, eval),
-        cx::COMPARE => run(&CompareChip, log_size, lookup, eval),
-        cx::DIVREM => run(&DivRemChip, log_size, lookup, eval),
-        cx::BITWISE_AND_BYTE => run(&BitwiseAndByteChip, log_size, lookup, eval),
-        _ => panic!("drive_chip_oods: invalid chip_idx {chip_idx}"),
+    impl<E: stwo_constraint_framework::EvalAtRow> crate::ChipVisitor for Drive<'_, E> {
+        type Output = E;
+
+        fn visit<C: BuiltInComponent>(self, chip: &C) -> E {
+            let ce = BuiltInComponentEval::<C> {
+                component: chip,
+                log_size: self.log_size,
+                lookup_elements: <C as BuiltInComponent>::LookupElements::get(self.lookup),
+            };
+            FrameworkEval::evaluate(&ce, self.eval)
+        }
     }
+
+    crate::visit_chip(
+        chip_idx,
+        Drive {
+            log_size,
+            lookup,
+            eval,
+        },
+    )
 }
 
 /// Functions for creating verifier-side component structures.

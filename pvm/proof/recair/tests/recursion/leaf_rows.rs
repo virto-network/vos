@@ -85,7 +85,7 @@ fn the_tables_are_the_airs() {
     }
     for component in &layout.components {
         let chip = &CHIPS[component.chip];
-        let name = compile::CHIP_NAMES[component.chip];
+        let name = vos_pvm_proof::chip_idx::NAMES[component.chip];
         assert_eq!(
             usize::from(chip.preprocessed),
             component.preprocessed_indices.len(),
