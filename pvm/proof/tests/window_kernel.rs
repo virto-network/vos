@@ -12,7 +12,9 @@
 //! against its program, its io-hash the run's. Its first four segments and
 //! its last verify in their classes' leaves, which prove and verify; the
 //! first four's leaves fold into a tree, two folds of two leaves and a fold
-//! of the two folds, each proved and verified.
+//! of the two folds, each proved and verified. The whole run's leaves fold
+//! into one root, which the final wrap proves under format 28 and the final
+//! verifier verifies.
 
 mod common;
 
@@ -690,4 +692,104 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
     assert_eq!(root.fold_word, word);
     assert_eq!(first.exit_digest, second.entry_digest);
     assert_eq!(end.io_hash, trace.io_hash);
+}
+
+/// The whole window wrapped: every segment proved in its class and verified
+/// in its leaf, the leaves folded in adjacent pairs, an odd node carried up,
+/// to one root stating the whole run (its entry, its halt, its io-hash);
+/// the root wrapped under format 28 on the Blake2b-256 channel within 2^17
+/// rows and 8 GiB of heap, and verified by `vos-final-verifier`, its
+/// statement the program's id and the run's io-hash. The wrap's proof
+/// (postcard) and its public words (24 little-endian u32s) are written
+/// under the target's tmp directory, `wrap/window.proof` and
+/// `wrap/window.words`, for the Wasm and JAM harnesses.
+#[test]
+fn the_window_wraps() {
+    use vos_recair::wrap::{self, WrapCircuit};
+
+    let instance = instance();
+    let kernel = run(&instance.arguments.encode());
+    let trace = traced(&kernel);
+    let (program, entry) = vos_recair::leaf::kernel_program(
+        &kernel.blob,
+        &kernel.record,
+        vos_pvm_compiler::TRANSPILER_VERSION,
+        &SEGMENT,
+    )
+    .expect("the kernel's program");
+    let cut = &program.shape.classes[CUT];
+    let bounds =
+        segment_bounds_budgeted(&trace.side_note, 1 << cut.log_steps, usize::from(cut.pages));
+    let fold = vos_recair::fold::FoldCircuit::new();
+    let word = vos_recair::fold::FoldCircuit::word();
+    let started = Instant::now();
+    let mut cursor = SegmentCursor::new(&trace.side_note);
+    let mut nodes: Vec<common::NodeRun> = (0..bounds.len())
+        .map(|position| {
+            let (class, proof) = prove_at_first_class(&mut cursor, bounds[position], &program);
+            common::prove_leaf(&program, &entry, class, &proof, position as u32, word)
+        })
+        .collect();
+    eprintln!(
+        "{} segments proved in their leaves in {:.0}s",
+        nodes.len(),
+        started.elapsed().as_secs_f64()
+    );
+    let started = Instant::now();
+    let mut folds = 0;
+    while nodes.len() > 1 {
+        let mut level = Vec::with_capacity(nodes.len().div_ceil(2));
+        let mut pending = nodes.into_iter();
+        while let Some(left) = pending.next() {
+            match pending.next() {
+                Some(right) => {
+                    level.push(common::prove_fold(&fold, &program, &left, &right, word));
+                    folds += 1;
+                }
+                None => level.push(left),
+            }
+        }
+        nodes = level;
+    }
+    eprintln!("{folds} folds in {:.0}s", started.elapsed().as_secs_f64());
+    let root = nodes.pop().expect("the root");
+    let output = root.output;
+    assert_eq!((output.first, output.last), (0, bounds.len() as u32 - 1));
+    assert!(output.entry && output.halt, "the whole run");
+    assert_eq!(output.io_hash, trace.io_hash);
+
+    let circuit = WrapCircuit::get();
+    let proved = vos_recair::fold::Proved {
+        proof: &root.proof,
+        output: &root.output,
+    };
+    let (values, statement) = circuit
+        .values(proved, &program.id_preimage())
+        .expect("the root's values");
+    let context = circuit.build(&values);
+    let finalized = context.finalize().expect("the wrap's wiring checks");
+    let log_sizes = finalized.circuit.log_sizes();
+    assert_eq!(log_sizes, vos_final_verifier::LOG_SIZES);
+    assert!(log_sizes.iter().all(|&log| log <= 17));
+    let words = wrap::public_words(&finalized);
+    let (proof, proving, peak_mib) =
+        common::measured(|| wrap::prove(&finalized).expect("the wrap proves"));
+    let bytes = postcard::to_allocvec(&proof).expect("encodes");
+    eprintln!(
+        "the window's wrap: {log_sizes:?} log sizes, proved in {:.2}s, its peak heap {peak_mib} \
+         MiB, {} bytes",
+        proving.as_secs_f64(),
+        bytes.len()
+    );
+    assert!(peak_mib <= 8 << 10, "{peak_mib} MiB");
+    let verified = vos_final_verifier::verify_bytes(&bytes, &words).expect("the wrap verifies");
+    assert_eq!(verified, statement);
+    assert_eq!(statement.program, program.id().0.map(|word| word.0));
+    assert_eq!(statement.io_hash, trace.io_hash);
+
+    let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
+    std::fs::create_dir_all(&directory).expect("the wrap's directory");
+    std::fs::write(directory.join("window.proof"), &bytes).expect("writes the proof");
+    let words: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    std::fs::write(directory.join("window.words"), words).expect("writes the words");
 }

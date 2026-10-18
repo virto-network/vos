@@ -1,0 +1,21 @@
+[workspace]
+
+# Measures the final verifier's Wasm blob (`../blob`) under wasmtime 35.0.0
+# (the version polkadot-sdk stable2603 pins), configured as
+# sc-executor-wasmtime configures it: the client's semantics (block import
+# and benchmarking) or the PVF's (validation: stack-depth metering, NaN
+# canonicalization), with sp-io's freeing-bump host allocator. Retired
+# instructions by `perf_event`.
+[package]
+name = "vos-final-verifier-wasm-run"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[dependencies]
+wasmtime = { version = "=35.0.0", default-features = false, features = ["cranelift", "gc", "gc-null", "parallel-compilation", "pooling-allocator", "threads", "runtime", "std"] }
+sc-allocator = "39"
+wasm-instrument = { version = "0.4", default-features = false }
+anyhow = "1"
+perf-event2 = "0.7"

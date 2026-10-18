@@ -1,0 +1,29 @@
+[workspace]
+
+# The final verifier as a Wasm blob built the way a Substrate runtime is:
+# `wasm32-unknown-unknown`, `-C target-cpu=mvp`, `-Z build-std=core,alloc`
+# (substrate-wasm-builder's fallback when `wasm32v1-none` is absent), memory
+# imported, and every allocation through sp-io's host allocator ABI
+# (`ext_allocator_{malloc,free}_version_1`), as `RuntimeAllocator` does.
+# Its own workspace: stwo resolves verify-only. Build with
+# `cargo build --release` here; `../run` measures it.
+[package]
+name = "vos-final-verifier-wasm"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+vos-final-verifier = { path = "../.." }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+debug = false

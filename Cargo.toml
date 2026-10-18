@@ -37,6 +37,9 @@ exclude = [
     # The on-chain settlement verifier pins stwo without default features in
     # its own workspace, so prover features never co-resolve into it.
     "pvm/proof/settlement-verifier",
+    # The final verifier's Wasm blob and its measuring runner: each its own
+    # workspace, the blob verify-only for wasm32, the runner on wasmtime.
+    "pvm/proof/final-verifier/wasm",
     # Throwaway measurement code from the design runs.
     "spikes",
 ]

@@ -15,6 +15,9 @@
 //! - **The final verifier refuses** a tampered wrap proof, on FRI at fold
 //!   step 3 and on the Blake2b-256 trees and channel, and every malformed
 //!   shape cleanly, with an error.
+//! - **On the JAM-only host** the final verifier, a refine program
+//!   (`final-verify.elf`, built by `just check-no-std`), accepts the wrap
+//!   within 150M gas, and refuses a tampered one or other words.
 
 mod common;
 
@@ -672,4 +675,120 @@ fn the_final_verifier_refuses_a_malformed_shape() {
         vos_final_verifier::verify_bytes(&[1, 2, 3], &words),
         Err(Error::Decode)
     ));
+}
+
+/// The guest's verdicts.
+const ACCEPT: u64 = 1;
+const REJECT: u64 = 0;
+
+/// What the guest reports: its verdict, the gas left at its start, after
+/// the proof's lookup, after its decode and at its end; the proof's
+/// length; its heap's peak, high-water mark and allocations; a refusal's
+/// text.
+#[derive(Debug)]
+struct GuestReport {
+    verdict: u64,
+    gas: [u64; 4],
+    peak_live: u64,
+    high_water: u64,
+    allocs: u64,
+    error: String,
+}
+
+/// The final verifier run as a JAM refine program on the JAM-only host
+/// (PolkaJam's prices), the words as work item 0's payload and the proof
+/// as a preimage of the running service: its gas and its report.
+fn run_on_jam(program: &[u8], words: &[u32; PUBLIC_WORDS], proof: &[u8]) -> (u64, GuestReport) {
+    use std::collections::BTreeMap;
+    use std::sync::Arc;
+    use stwo::core::vcs::blake2b_hash::Blake2bHasher;
+    use vos_pvm::refine_host::{JamItem, JamRefine, Preimages, RefineContext};
+
+    const SERVICE: u64 = 7;
+    struct Store(BTreeMap<[u8; 32], Vec<u8>>);
+    impl Preimages for Store {
+        fn preimage(&self, service: u64, hash: &[u8; 32]) -> Option<Vec<u8>> {
+            (service == SERVICE)
+                .then(|| self.0.get(hash).cloned())
+                .flatten()
+        }
+    }
+    let hash = Blake2bHasher::hash_parts(&[proof]).0;
+    let mut payload: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    payload.extend_from_slice(&hash);
+    payload.extend_from_slice(&(proof.len() as u32).to_le_bytes());
+    let jam = JamRefine {
+        service: SERVICE,
+        items: vec![JamItem {
+            payload,
+            imports: Vec::new(),
+        }],
+        preimages: Some(Arc::new(Store(BTreeMap::from([(hash, proof.to_vec())])))),
+        ..JamRefine::default()
+    };
+    let context = RefineContext::load(program, &[], 10_000_000_000).expect("loads the verifier");
+    let run = context.try_run_jam(jam).expect("the JAM-only host");
+    let invocation = &run.invocation;
+    assert_ne!(invocation.registers[7], 0xDEAD, "the verifier panicked");
+    let bytes = invocation.output_bounded(4096).expect("the guest's report");
+    let word = |i: usize| u64::from_le_bytes(bytes[8 * i..8 * i + 8].try_into().unwrap());
+    let error_len = (word(9) as usize).min(192);
+    let report = GuestReport {
+        verdict: word(0),
+        gas: [word(1), word(2), word(3), word(4)],
+        peak_live: word(6),
+        high_water: word(7),
+        allocs: word(8),
+        error: String::from_utf8_lossy(&bytes[80..80 + error_len]).into_owned(),
+    };
+    (invocation.gas_used, report)
+}
+
+/// The final verifier on the JAM-only host: the wrap accepted within 150M
+/// gas, its phases reported; a proof tampered at its middle byte, and
+/// other words, refused without a panic.
+#[test]
+fn the_wrap_verifies_on_the_jam_only_host() {
+    let elf_path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../../target/riscv64em-vos/release/final-verify.elf"
+    );
+    let elf = std::fs::read(elf_path).unwrap_or_else(|error| {
+        panic!("final-verify.elf missing ({error}); run `just check-no-std`")
+    });
+    let program = vos_pvm_compiler::link_elf_spi(&elf).expect("links the verifier");
+    let one = one_segment();
+    let bytes = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
+    let (gas, report) = run_on_jam(&program, &one.wrapped.words, &bytes);
+    let [start, lookup, decode, end] = report.gas;
+    eprintln!(
+        "the wrap on the JAM-only host: {gas} gas ({:.1}M): lookup {}, decode {}, verify {}; \
+         {} bytes, program {} bytes (ELF {}); heap peak {} KiB, high water {} KiB, {} allocations",
+        gas as f64 / 1e6,
+        start - lookup,
+        lookup - decode,
+        decode - end,
+        bytes.len(),
+        program.len(),
+        elf.len(),
+        report.peak_live >> 10,
+        report.high_water >> 10,
+        report.allocs,
+    );
+    assert_eq!(report.verdict, ACCEPT, "{}", report.error);
+    assert!(gas <= 150_000_000, "{gas} gas");
+
+    let mut tampered = bytes.clone();
+    tampered[bytes.len() / 2] ^= 1;
+    let (gas, report) = run_on_jam(&program, &one.wrapped.words, &tampered);
+    eprintln!(
+        "a tampered byte: verdict {}, {gas} gas: {}",
+        report.verdict, report.error
+    );
+    assert_ne!(report.verdict, ACCEPT);
+    let mut words = one.wrapped.words;
+    words[3] ^= 1;
+    let (gas, report) = run_on_jam(&program, &words, &bytes);
+    eprintln!("other words: {gas} gas: {}", report.error);
+    assert_eq!(report.verdict, REJECT);
 }

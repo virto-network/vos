@@ -1,0 +1,12 @@
+[build]
+target = "wasm32-unknown-unknown"
+
+[target.wasm32-unknown-unknown]
+rustflags = [
+    "-C", "target-cpu=mvp",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--export=__heap_base",
+]
+
+[unstable]
+build-std = ["core", "alloc"]

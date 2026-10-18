@@ -130,14 +130,16 @@ check-no-faults:
 # installs wasm32.
 # The final verifier, on the recursion AIR's bodies, for the embedded target,
 # for wasm32 with every nightly feature refused (its source builds on stable),
-# and for the PVM with the standard library built from source.
+# and for the PVM with the standard library built from source, with its JAM
+# refine program (`final-verify.elf`), which `vos-recair`'s wrap test runs on
+# the JAM-only host.
 check-no-std:
     cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
     cargo build -p vos-final-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-final-verifier --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
-    cargo build -p vos-final-verifier --release --target pvm/proof/final-verifier/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+    cargo build -p vos-final-verifier --release --features pvm-guest --target pvm/proof/final-verifier/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the

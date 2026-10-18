@@ -5,6 +5,17 @@ version.workspace = true
 license = "Apache-2.0"
 description = "The final wrap's verifier: a format-28 proof against its 24 public words, the program id and the io-hash. no_std, for x86, wasm32 and the PVM."
 
+[features]
+# The verifier as a JAM refine program (`src/bin/final-verify.rs`), for the
+# PVM target only: no_main, its own allocator and panic handler.
+pvm-guest = []
+
+[[bin]]
+name = "final-verify"
+required-features = ["pvm-guest"]
+test = false
+bench = false
+
 [dependencies]
 # Without features: no std, and none of the prover's nightly SIMD.
 stwo = { workspace = true }

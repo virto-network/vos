@@ -85,8 +85,10 @@ vos-pvm-proof-verifier = { workspace = true }
 cipher-clerk = { workspace = true, features = ["settlement"] }
 vos-tree = { workspace = true }
 # The kernels' leaves: a segment verified in its leaf circuit, proved and
-# verified on the recursion AIR.
+# verified on the recursion AIR; and the window's wrap, verified by the
+# final verifier.
 vos-recair = { workspace = true }
+vos-final-verifier = { workspace = true }
 
 # Both examples demonstrate the prover end-to-end; mark them
 # prover-only so a verifier-only build (`--no-default-features`) skips
