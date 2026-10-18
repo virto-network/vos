@@ -77,10 +77,10 @@ pub enum Column {
     #[size = 8]
     #[mask_next_row]
     PrevValue,
-    /// BOUND boolean: 1 iff the next ledger row is real AND accesses the same
-    /// register.  No longer a free witness — pinned by the sortedness gadget
-    /// (`IsSameRegNext · key_diff = 0` and the range-checked `OrderDelta`), and
-    /// it gates the cross-row `prev_value` value binding.
+    /// Bound boolean: 1 iff the next ledger row is real and accesses the same
+    /// register. Pinned by the sortedness gadget (`IsSameRegNext · key_diff =
+    /// 0` and the range-checked `OrderDelta`); it gates the cross-row
+    /// `prev_value` value binding.
     #[size = 1]
     IsSameRegNext,
     /// 1 if padding row (beyond real ledger entries).  `#[mask_next_row]` so a
@@ -189,7 +189,7 @@ impl BuiltInComponent for RegisterMemoryChip {
         let both_real_h = crate::trace::trace_eval!(trace_eval, Column::BothRealH);
         let order_val_h = crate::trace::trace_eval!(trace_eval, Column::OrderValH);
 
-        // `key_same` (= IsSameRegNext) is now a BOUND boolean: it can be 1 only
+        // `key_same` (= IsSameRegNext) is a bound boolean: it can be 1 only
         // when this row and its successor are both real and same-register.
         eval.add_constraint(is_same_reg[0].clone() * (is_same_reg[0].clone() - E::F::one()));
         eval.add_constraint(is_same_reg[0].clone() * is_pad[0].clone());

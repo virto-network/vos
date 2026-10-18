@@ -70,9 +70,9 @@ pub enum Column {
     #[size = 1]
     #[mask_next_row]
     PrevValue,
-    /// BOUND boolean: 1 iff the next ledger row is real AND accesses the same
-    /// address.  No longer a free witness — pinned by the sortedness gadget
-    /// and it gates the cross-row `prev_value` value binding.
+    /// Bound boolean: 1 iff the next ledger row is real and accesses the same
+    /// address. Pinned by the sortedness gadget; it gates the cross-row
+    /// `prev_value` value binding.
     #[size = 1]
     IsSameAddrNext,
     /// 1 if padding row.  `#[mask_next_row]` so a row can tell whether its

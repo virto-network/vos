@@ -137,9 +137,9 @@ pub(in crate::chips::cpu) fn compare<E: EvalAtRow>(eval: &mut E, trace_eval: &Tr
     // COMPARE: SetLtU via subtraction carry analysis
     // cmp_carry chain: val_b + ~val_d + 1 (same as sub)
     // cmp_lt_flag = 1 - cmp_carry[7] (unsigned: a < b iff no final carry)
-    // For SetLtU (compare_op=0): result = cmp_lt_flag (zero-extended to 64-bit)
-    // For SetLtS (compare_op=1): needs sign bit analysis (prover-trusted for now)
-    // For CmovIz/Nz, Min/Max: prover-trusted (constrained result via execution semantics)
+    // SetLtU: result = cmp_lt_flag, zero-extended.
+    // SetLtS: result = cmp_lt_s_flag, bound below by the sign bits.
+    // CmovIz/Nz and Min/Max: result bound below to the selected operand.
     // ════════════════════════════════════════════════════════════════════
     let is_cmp_or_branch = is_compare(trace_eval) + is_branch(trace_eval);
     // The cmp_carry chain + cmp_lt_flag derivation live in CompareChip.

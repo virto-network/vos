@@ -54,8 +54,8 @@ stay within the degree bound.
 
 The dangerous variant is inserting **one** emission, or inserting in a
 position that splits an existing pair: `(A,B), (C,D)` → `(A,B), (X,C), (D,…)`.
-Now `(X,C)` and `(D,next)` are new pair shapes, and a tuple combination
-that was fine before may now exceed the degree bound — even though every
+Then `(X,C)` and `(D,next)` are new pair shapes, and a tuple combination
+that was within the degree bound may exceed it — even though every
 emission individually is degree-bounded.
 
 **Rule.** Add new emissions at the **end** of `add_constraints` (and

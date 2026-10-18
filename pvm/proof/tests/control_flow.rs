@@ -218,8 +218,8 @@ fn prove_unlikely() {
 // 32 bits.  imm_y is the SECOND immediate, distinct from step.imm =
 // imm_x (the load value).
 //
-// Only the JUMP target is bound; the LOAD side (`regs[ra] = imm_x`) is
-// prover-trusted.
+// The load side, `regs[ra] = imm_x`, binds the row's Result to its
+// ImmBytes.
 #[test]
 fn load_imm_jump_ind_positive_smoke() {
     let mut regs = [0u64; PVM_REGISTER_COUNT];

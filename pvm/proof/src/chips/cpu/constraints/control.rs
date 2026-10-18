@@ -100,10 +100,9 @@ pub(in crate::chips::cpu) fn next_pc<E: EvalAtRow>(eval: &mut E, trace_eval: &Tr
     let branch_target = crate::trace::trace_eval!(trace_eval, Column::BranchTarget);
     let next_pc = crate::trace::trace_eval!(trace_eval, Column::NextPc);
 
-    // Sequential next PC = pc + 1 + skip_len (as a 4-byte value)
-    // For simplicity, constrain the low byte: seq_next_pc[0] = pc[0] + 1 + skip_len
-    // Full multi-byte addition would need a carry chain on 4 bytes.
-    // For now: constrain that next_pc equals either branch_target (taken) or sequential (not taken).
+    // A jump or a taken branch continues at branch_target; every other
+    // real row at pc + 1 + skip_len, all four bytes with their carries
+    // (`branch_conditions`).
 
     // For unconditional jumps: next_pc = branch_target
     for i in 0..4 {

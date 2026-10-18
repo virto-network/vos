@@ -126,7 +126,7 @@ pub enum Column {
     #[size = 1]
     IsPadding,
 
-    // ── Stwo-v2.x degree-flatten helpers ──
+    // ── Degree-flatten helpers ──
     //
     // The chip's degree bound admits degree ≤ 3, which the paired logup
     // constraints use; the body stays at degree ≤ 2. Several MulChip

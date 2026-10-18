@@ -84,16 +84,6 @@ pub(in crate::chips::cpu) fn divrem<E: EvalAtRow>(eval: &mut E, trace_eval: &Tra
     let div_active_rem_h = crate::trace::trace_eval!(trace_eval, Column::DivActiveRemH);
     let is_div_rem_32_h = crate::trace::trace_eval!(trace_eval, Column::IsDivRem32bitH);
     // ════════════════════════════════════════════════════════════════════
-    // SHIFT: prover-computed result checked via inverse relationship
-    // For ShloL (shift_op=0): result = (val_b << shift_amount) mod 2^64
-    //   Equivalently: result = val_b * 2^shift_amount mod 2^64
-    //   We can't constrain multiplication by a power of 2 easily without
-    //   a power-of-2 lookup table. Shifts remain prover-trusted for now.
-    //   The result bytes are range-checked which prevents arbitrary values
-    //   but doesn't prove the shift relationship.
-    // ════════════════════════════════════════════════════════════════════
-
-    // ════════════════════════════════════════════════════════════════════
     // DIVREM: quotient * divisor + remainder = dividend
     // dividend = val_b, divisor = val_d
     // For div (op 0,1): result = quotient. For rem (op 2,3): result = remainder.
@@ -158,7 +148,7 @@ pub(in crate::chips::cpu) fn zero_divisor<E: EvalAtRow>(eval: &mut E, trace_eval
     // ════════════════════════════════════════════════════════════════════
     // Byte-wise val_d zero-check + DivByZero result binding
     //
-    // Closes two related soundness gaps with shared infrastructure:
+    // Binds two related values with shared infrastructure:
     //   (a) ValDIsZero ⇔ (val_d == 0) — both directions pinned, so
     //       CmovIz / CmovNz fire as the interpreter does.  (Pinning
     //       only the `=1 ⇒ val_d=0` direction, gated on is_compare,

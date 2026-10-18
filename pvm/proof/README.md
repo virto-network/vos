@@ -38,7 +38,7 @@ cargo run -p vos-pvm-proof --example multi_segment --release
 ```
 
 Read [SECURITY.md](SECURITY.md) before accepting proofs in production. It
-defines the trust boundary and the remaining prover-trusted operations.
+defines the trust boundary and what the AIR binds.
 [docs/status.md](docs/status.md) tracks constraint coverage, while
 [src/chips/cpu/CONSTRAINTS.md](src/chips/cpu/CONSTRAINTS.md) explains the AIR
 and its shared lookup tables.

@@ -836,7 +836,7 @@ pub enum Column {
     #[size = 1]
     FlagByte9,
 
-    // ── Stwo-v2.x degree-flatten helpers ──
+    // ── Degree-flatten helpers ──
     //
     // CpuChip's natural form has dozens of `is_real · is_op · is_width
     // · …` selector chains gated against linear bodies; with all

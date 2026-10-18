@@ -53,7 +53,7 @@ use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
 ///    — closing the lying-METADATA attack (gate: `tests/boundary_binding.rs`).
 /// 2. column → trace: this chip's RegVal column is pinned to the trace's
 ///    actual final register value by `RegisterMemoryChip` read-consistency,
-///    which is now SOUND against a from-scratch prover — the closing read
+///    which is sound against a from-scratch prover: the closing read
 ///    sorts last (max ts) via the ledger's `(reg, ts)` sortedness gadget, its
 ///    `is_write = 0` is bound by the logup tuple, and the cross-row
 ///    `prev_value` binding forces its value to equal the previous (= last
