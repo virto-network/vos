@@ -4,16 +4,8 @@
 //! any format of the recursion AIR on its channel ([`prove_on`]), the wrap's
 //! (28) on Blake2b-256, which `vos-pvm-final-verifier` verifies.
 //!
-//! **The transcript**, as the prover runs it and the verifier replays it:
-//! 1. the proof's domain, the format and the PCS configuration, then the
-//!    components' log sizes (`vos_pvm_proof::proof::mix_statement_header`);
-//! 2. the preprocessed root, then the main trace's root;
-//! 3. the outputs' values, in their addresses' order, which the public logup
-//!    terms read, before any challenge is drawn;
-//! 4. the interaction PoW nonce;
-//! 5. the `Gate` relation's challenges;
-//! 6. the three claimed sums, then the interaction root; then Stwo's
-//!    protocol.
+//! **The transcript** is the recursion AIR's
+//! ([`vos_pvm_recair_air::transcript`]), its public values the outputs'.
 //!
 //! The verifier pins the circuit by its hash
 //! ([`vos_pvm_recair_air::circuit_hash`]), which binds the preprocessed root, the
@@ -41,9 +33,8 @@ use vos_pvm_proof::proof::{
     mix_statement_header,
 };
 use vos_pvm_recair_air::gate::{GATE_WIDTH, Layout, public_logup_sum};
-use vos_pvm_recair_air::{
-    Components, GateRelation, LOG_CONSTRAINT_EXPANSION, LogSizes, preprocessed_log_sizes,
-};
+use vos_pvm_recair_air::transcript::{Prefix, replay_prefix};
+use vos_pvm_recair_air::{Components, GateRelation, LOG_CONSTRAINT_EXPANSION, LogSizes};
 
 use crate::circuit::{Circuit, WiringError};
 use crate::context::Witness;
@@ -261,20 +252,19 @@ where
     })
 }
 
-/// Each tree's column log sizes, the preprocessed tree's in its commitment
-/// order.
-pub(crate) fn committed_log_sizes(
-    components: &Components,
-    log_sizes: &LogSizes,
-) -> TreeVec<Vec<u32>> {
-    let mut sizes = TreeVec::concat_cols(
-        components
-            .as_dyn()
-            .into_iter()
-            .map(|component| component.trace_log_degree_bounds()),
-    );
-    sizes[0] = preprocessed_log_sizes(log_sizes);
-    sizes
+/// `proof`'s transcript between its header and Stwo's protocol, its public
+/// values its outputs.
+pub(crate) fn prefix<'a>(
+    proof: &'a RecairProof,
+    log_sizes: &'a [Vec<u32>; 3],
+) -> Prefix<'a, P2Hash> {
+    let commitments = &proof.stark_proof.commitments;
+    Prefix {
+        roots: [commitments[0], commitments[1], commitments[2]],
+        log_sizes,
+        public: &proof.outputs,
+        claimed_sums: &proof.claimed_sums,
+    }
 }
 
 /// The bounds a proof's vectors must meet before any is indexed.
@@ -373,12 +363,12 @@ pub fn verify(proof: RecairProof, circuit_hash: &Digest) -> Result<(), VerifyErr
     // The layout and the security count do not depend on the challenges.
     let config = format.pcs_config();
     let layout = Components::new(&GateRelation::dummy(), &log_sizes, &proof.claimed_sums);
-    let trace_log_sizes = committed_log_sizes(&layout, &log_sizes);
+    let trace_log_sizes = vos_pvm_recair_air::committed_log_sizes(&log_sizes);
     let (protocol, mut shape) = vos_pvm_proof::framework_access::preflight_component_dimensions(
         &config,
         stark,
         &layout.as_dyn(),
-        &trace_log_sizes,
+        &TreeVec(trace_log_sizes.to_vec()),
     )?;
     shape.relation_width = GATE_WIDTH as u64;
     check_format_security(format, &config, &shape)?;
@@ -386,13 +376,12 @@ pub fn verify(proof: RecairProof, circuit_hash: &Digest) -> Result<(), VerifyErr
     let channel = &mut Poseidon2M31Channel::default();
     mix_statement_header(channel, format.number, &config, &log_sizes);
     let scheme = &mut CommitmentSchemeVerifier::<P2MerkleChannel>::new(config);
-    scheme.commit(stark.commitments[0], &trace_log_sizes[0], channel);
-    scheme.commit(stark.commitments[1], &trace_log_sizes[1], channel);
-    channel.mix_felts(&proof.outputs);
-    check_interaction_pow(channel, format, proof.interaction_pow)?;
-    let relation = GateRelation::draw(channel);
-    channel.mix_felts(&proof.claimed_sums);
-    scheme.commit(stark.commitments[2], &trace_log_sizes[2], channel);
+    let relation = replay_prefix(
+        channel,
+        scheme,
+        prefix(&proof, &trace_log_sizes),
+        |channel| check_interaction_pow(channel, format, proof.interaction_pow),
+    )?;
 
     let layout = Layout::node(proof.outputs.len() as u32);
     let total = proof.claimed_sums.iter().copied().sum::<SecureField>()

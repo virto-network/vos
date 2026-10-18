@@ -24,6 +24,7 @@ pub mod gate;
 pub mod h8;
 pub mod p2;
 pub mod qm31;
+pub mod transcript;
 
 use alloc::vec::Vec;
 

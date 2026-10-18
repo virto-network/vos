@@ -27,23 +27,23 @@ use std::sync::OnceLock;
 
 use num_traits::{One, Zero};
 use stwo::core::air::Component;
-use stwo::core::channel::Channel as _;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
-use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig};
+use stwo::core::pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec};
 use vos_pvm_proof::format::LEAF_FOLD_LOG_SIZES;
 use vos_pvm_proof::framework_access::{AllLookupElements, air_layout};
 use vos_pvm_proof::poseidon2::{P2MerkleChannel, Poseidon2M31Channel};
 use vos_pvm_proof::proof::{check_format_security, check_interaction_pow, mix_statement_header};
 use vos_pvm_proof::{RecursionData, SampleLayout, sample_layout_of};
 use vos_pvm_recair_air::gate::{FIRST_OUTPUT_ADDRESS, GATE_WIDTH, U_ADDRESS};
+use vos_pvm_recair_air::transcript::replay_prefix;
 use vos_pvm_recair_air::{Components, GateRelation, LogSizes, h8, p2, qm31};
 
 use crate::circuit::Qm31Op;
 use crate::compile::{self, Recording};
 use crate::context::{Context, Var};
 use crate::gadgets::TranscriptGadget;
-use crate::prove::{FORMAT, RecairProof, circuit_hash_of, committed_log_sizes, hashed_params};
+use crate::prove::{FORMAT, RecairProof, circuit_hash_of, hashed_params, prefix};
 use crate::value::Value;
 use crate::verifier::bits::linear;
 use crate::verifier::channel::Channel;
@@ -77,7 +77,7 @@ fn components(log_sizes: &LogSizes) -> Components {
 fn sample_layout(log_sizes: &LogSizes, config: &PcsConfig) -> SampleLayout {
     let components = components(log_sizes);
     let dyns = components.as_dyn();
-    let committed = committed_log_sizes(&components, log_sizes);
+    let committed = TreeVec(vos_pvm_recair_air::committed_log_sizes(log_sizes).to_vec());
     let mut security_shape = air_layout(config, &dyns, &committed)
         .expect("the recursion AIR's layout")
         .security_shape(&dyns);
@@ -194,14 +194,14 @@ pub fn recursion_data(
     let channel = &mut Poseidon2M31Channel::recording(recorder.clone());
     mix_statement_header(channel, FORMAT.number, &config, &proof.log_sizes);
     let scheme = &mut CommitmentSchemeVerifier::<P2MerkleChannel>::new(config);
-    let trace_log_sizes = committed_log_sizes(&components(&proof.log_sizes), &proof.log_sizes);
-    scheme.commit(root, &trace_log_sizes[0], channel);
-    scheme.commit(stark.commitments[1], &trace_log_sizes[1], channel);
-    channel.mix_felts(&proof.outputs);
-    check_interaction_pow(channel, FORMAT, proof.interaction_pow).expect("verified");
-    let relation = GateRelation::draw(channel);
-    channel.mix_felts(&proof.claimed_sums);
-    scheme.commit(stark.commitments[2], &trace_log_sizes[2], channel);
+    let trace_log_sizes = vos_pvm_recair_air::committed_log_sizes(&proof.log_sizes);
+    let relation = replay_prefix(
+        channel,
+        scheme,
+        prefix(proof, &trace_log_sizes),
+        |channel| check_interaction_pow(channel, FORMAT, proof.interaction_pow),
+    )
+    .expect("verified");
     let components = Components::new(&relation, &proof.log_sizes, &proof.claimed_sums);
     let dyns: Vec<&dyn Component> = components.as_dyn().to_vec();
     Ok(vos_pvm_proof::replay_stark(

@@ -9,14 +9,8 @@
 //! io-hash's 16 limbs, sit at its addresses 0–23, one word a wire, with zero,
 //! one and `u` after them ([`LAYOUT`]).
 //!
-//! **The transcript**, as `vos-pvm-recair`'s prover runs it:
-//! 1. the domain, the format and the PCS configuration, then the log sizes;
-//! 2. the preprocessed root, then the main trace's root;
-//! 3. the 24 public words, each as the QM31 `(w, 0, 0, 0)`;
-//! 4. the interaction PoW nonce;
-//! 5. the `Gate` relation's challenges;
-//! 6. the three claimed sums, then the interaction root; then Stwo's
-//!    protocol.
+//! **The transcript** is the recursion AIR's (`vos_pvm_recair_air::transcript`),
+//! its public values the 24 words, each the QM31 `(w, 0, 0, 0)`.
 //!
 //! The claimed sums, `u`'s public use and each public word's add to zero:
 //! that is what binds the words to the circuit's wires (`vos_pvm_recair_air::gate`).
@@ -62,7 +56,8 @@ use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::{Blake2bMerkleChannel, Blake2bMerkleHasher};
 use stwo::core::verifier::VerificationError;
 use vos_pvm_recair_air::gate::{Layout, public_logup_sum};
-use vos_pvm_recair_air::{Components, GateRelation, LOG_CONSTRAINT_EXPANSION, LogSizes};
+use vos_pvm_recair_air::transcript::{Prefix, replay_prefix};
+use vos_pvm_recair_air::{Components, LOG_CONSTRAINT_EXPANSION, LogSizes};
 
 pub use constants::{LOG_SIZES, PREPROCESSED_ROOT};
 pub use vos_pvm_recair_air;
@@ -250,21 +245,28 @@ pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement
         return Err(Error::Circuit);
     }
 
-    let [preprocessed, main, interaction] = vos_pvm_recair_air::committed_log_sizes(&LOG_SIZES);
+    let log_sizes = vos_pvm_recair_air::committed_log_sizes(&LOG_SIZES);
     let channel = &mut Blake2bChannel::default();
     mix_header(channel);
     let scheme = &mut CommitmentSchemeVerifier::<Blake2bMerkleChannel>::new(CONFIG);
-    scheme.commit(stark.commitments[0], &preprocessed, channel);
-    scheme.commit(stark.commitments[1], &main, channel);
     let public: Vec<SecureField> = words.iter().map(|&word| embed(word)).collect();
-    channel.mix_felts(&public);
-    if !channel.verify_pow_nonce(INTERACTION_POW_BITS, proof.interaction_pow) {
-        return Err(Error::InteractionPow);
-    }
-    channel.mix_u64(proof.interaction_pow);
-    let relation = GateRelation::draw(channel);
-    channel.mix_felts(&proof.claimed_sums);
-    scheme.commit(stark.commitments[2], &interaction, channel);
+    let prefix = Prefix {
+        roots: [
+            stark.commitments[0],
+            stark.commitments[1],
+            stark.commitments[2],
+        ],
+        log_sizes: &log_sizes,
+        public: &public,
+        claimed_sums: &proof.claimed_sums,
+    };
+    let relation = replay_prefix(channel, scheme, prefix, |channel| {
+        if !channel.verify_pow_nonce(INTERACTION_POW_BITS, proof.interaction_pow) {
+            return Err(Error::InteractionPow);
+        }
+        channel.mix_u64(proof.interaction_pow);
+        Ok(())
+    })?;
 
     let total = proof.claimed_sums.iter().copied().sum::<SecureField>()
         + public_logup_sum(&relation, LAYOUT.public_terms(public));
@@ -274,7 +276,7 @@ pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement
 
     let components = Components::new(&relation, &LOG_SIZES, &proof.claimed_sums);
     let dyns = components.as_dyn();
-    check_samples(&dyns, preprocessed.len(), stark)?;
+    check_samples(&dyns, log_sizes[0].len(), stark)?;
     stwo::core::verifier::verify(&dyns, channel, scheme, proof.stark_proof)
         .map_err(Error::Stark)?;
     Ok(statement)
