@@ -82,6 +82,12 @@ opt-level = 3
 [profile.test.package.vos-pvm-compiler]
 opt-level = 3
 
+# The final wrap hashes with Blake2b-256 (RustCrypto's `blake2`): its
+# Merkle trees and its PoW grind.
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.test.package.blake2]
+opt-level = 3
 [profile.dev.package.stwo]
 opt-level = 3
 [profile.test.package.stwo]
@@ -133,6 +139,7 @@ vos-pvm-precompiles = { path = "pvm/proof/precompiles" }
 vos-pvm-poseidon2 = { path = "pvm/proof/poseidon2" }
 vos-recair-air = { path = "pvm/proof/recair-air" }
 vos-recair = { path = "pvm/proof/recair" }
+vos-final-verifier = { path = "pvm/proof/final-verifier" }
 vos-pvm = { path = "pvm/runtime" }
 vos-pvm-compiler = { path = "pvm/compiler" }
 vos-pvm-program = { path = "pvm/program" }

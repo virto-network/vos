@@ -22,6 +22,9 @@
 //! - [`fold`] is a fold node: two children of the padded shape, leaves or
 //!   folds, verified, their circuits, program and run checked, and the node
 //!   output their run states.
+//! - [`wrap`] is the final wrap: a tree's root verified, its circuit,
+//!   program and run checked, the program id and io-hash its public words,
+//!   proved under format 28 on the Blake2b-256 channel.
 
 pub mod circuit;
 pub mod compile;
@@ -33,6 +36,7 @@ pub mod prove;
 pub mod trace;
 pub mod value;
 pub mod verifier;
+pub mod wrap;
 
 pub use circuit::{Circuit, Entry, Qm31Op, WiringError};
 pub use context::{Bit, Context, Finalized, Message, Mismatch, P2Handle, P2Row, Var, Witness};

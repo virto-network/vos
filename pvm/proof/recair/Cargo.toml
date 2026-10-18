@@ -7,6 +7,9 @@ description = "The recursion AIR's prover: circuits built by a Context, their wi
 
 [dependencies]
 vos-recair-air = { workspace = true }
+# The wrap's proof, its public words and its layout, which the prover
+# produces and the final verifier reads.
+vos-final-verifier = { workspace = true }
 vos-pvm-poseidon2 = { workspace = true }
 # The Poseidon2-M31 channel and its SIMD backend, the format registry, the
 # transcript's header and the security accounting.

@@ -36,6 +36,8 @@
 
 pub mod child;
 
+use std::sync::OnceLock;
+
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
@@ -62,7 +64,7 @@ pub const CIRCUITS: usize = MAX_LEAF_CIRCUITS + 1;
 
 /// The first leaf-circuit hash's wire in the id's preimage, after the
 /// kernel's digest and the slot's version and count; each hash two wires.
-const FIRST_HASH_WIRE: usize = (ID_WORDS - 8 * MAX_LEAF_CIRCUITS) / 4;
+pub(crate) const FIRST_HASH_WIRE: usize = (ID_WORDS - 8 * MAX_LEAF_CIRCUITS) / 4;
 
 /// The fold circuit.
 pub struct FoldCircuit {
@@ -105,15 +107,59 @@ pub struct Proved<'a> {
 }
 
 /// A child's wires the fold's own checks read.
-struct ChildWires {
-    hash: [Var; 2],
-    preimage: Vec<Var>,
-    circuit: Vec<Bit>,
+pub(crate) struct ChildWires {
+    pub hash: [Var; 2],
+    pub preimage: Vec<Var>,
+    pub circuit: Vec<Bit>,
+}
+
+/// A child's proof verified, its output digest's two wires the proof's
+/// outputs; its circuit hash recomputed from its preprocessed root and its
+/// circuit bits guessed, under `pieces[0]`; its preimage re-hashed to its
+/// output digest, under `pieces[1]`.
+pub(crate) fn verify_node<V: Value>(
+    context: &mut Context<V>,
+    shape: &ChildShape,
+    child: &FoldChild<V>,
+    pieces: [&'static str; 2],
+) -> ChildWires {
+    let output = context.guess_pair(child.output);
+    let verified = verify_child(context, shape, &child.proof, output);
+    context.piece(pieces[0]);
+    let hash = circuit_hash(context, &shape.log_sizes, verified.preprocessed_root);
+    let circuit = child
+        .circuit
+        .iter()
+        .map(|&bit| {
+            let bit = context.guess(bit);
+            context.assert_bit(bit)
+        })
+        .collect();
+    context.piece(pieces[1]);
+    let preimage: Vec<Var> = child.preimage.iter().map(|&v| context.guess(v)).collect();
+    let digest = leaf_hash(context, &preimage, PREIMAGE_WORDS).digest;
+    for (digest, output) in digest.into_iter().zip(output) {
+        context.assert_eq(digest, output);
+    }
+    ChildWires {
+        hash,
+        preimage,
+        circuit,
+    }
+}
+
+/// The program's leaf-circuit hashes in the id's preimage `program`, two
+/// wires each.
+pub(crate) fn leaf_circuit_wires(program: &[Var]) -> impl Iterator<Item = [Var; 2]> + '_ {
+    (0..MAX_LEAF_CIRCUITS).map(move |k| {
+        let wire = FIRST_HASH_WIRE + 2 * k;
+        [program[wire], program[wire + 1]]
+    })
 }
 
 /// `Σ bits = 1` and, for each bit, `bit·(hash − candidate) = 0`: `hash` is
 /// the candidate the one set bit picks.
-fn assert_one_of<V: Value>(
+pub(crate) fn assert_one_of<V: Value>(
     context: &mut Context<V>,
     hash: [Var; 2],
     candidates: &[[Var; 2]],
@@ -154,29 +200,12 @@ impl FoldCircuit {
     /// caller.
     pub fn verify<V: Value>(&self, context: &mut Context<V>, values: &FoldValues<V>) -> [Var; 2] {
         let children = values.children.each_ref().map(|child| {
-            let output = context.guess_pair(child.output);
-            let verified = verify_child(context, self.child, &child.proof, output);
-            context.piece("fold: circuit");
-            let hash = circuit_hash(context, &self.child.log_sizes, verified.preprocessed_root);
-            let circuit = child
-                .circuit
-                .iter()
-                .map(|&bit| {
-                    let bit = context.guess(bit);
-                    context.assert_bit(bit)
-                })
-                .collect();
-            context.piece("fold: preimage");
-            let preimage: Vec<Var> = child.preimage.iter().map(|&v| context.guess(v)).collect();
-            let digest = leaf_hash(context, &preimage, PREIMAGE_WORDS).digest;
-            for (digest, output) in digest.into_iter().zip(output) {
-                context.assert_eq(digest, output);
-            }
-            ChildWires {
-                hash,
-                preimage,
-                circuit,
-            }
+            verify_node(
+                context,
+                self.child,
+                child,
+                ["fold: circuit", "fold: preimage"],
+            )
         });
 
         context.piece("fold: program");
@@ -190,13 +219,7 @@ impl FoldCircuit {
 
         context.piece("fold: circuit");
         let fold_word = context.guess_pair(values.fold_word);
-        let candidates: Vec<[Var; 2]> = (0..MAX_LEAF_CIRCUITS)
-            .map(|k| {
-                let wire = FIRST_HASH_WIRE + 2 * k;
-                [program[wire], program[wire + 1]]
-            })
-            .chain([fold_word])
-            .collect();
+        let candidates: Vec<[Var; 2]> = leaf_circuit_wires(&program).chain([fold_word]).collect();
         for child in &children {
             for (&wire, fold_word) in child.preimage[preimage::FOLD_WORD].iter().zip(fold_word) {
                 context.assert_eq(wire, fold_word);
@@ -289,6 +312,13 @@ impl FoldCircuit {
         P2Hash(hash.map(|word| BaseField::from(word.value())))
     }
 
+    /// [`FoldCircuit::hash`] of the fold circuit over the padded shape,
+    /// computed once: `H_fold`, the wrap's constant.
+    pub fn word() -> P2Hash {
+        static WORD: OnceLock<P2Hash> = OnceLock::new();
+        *WORD.get_or_init(|| Self::new().hash())
+    }
+
     /// The values of a fold of `left` and `right`, valid proofs of the
     /// padded shape, under the program whose id's preimage is `program`
     /// and the fold word `fold_word`; and the output they state.
@@ -306,32 +336,10 @@ impl FoldCircuit {
         program: &IdPreimage,
         fold_word: P2Hash,
     ) -> Result<(FoldValues<SecureField>, NodeOutput), WitnessError> {
-        let hashes = program.leaf_circuits.hashes();
-        let child = |proved: Proved<'_>| -> Result<FoldChild<SecureField>, WitnessError> {
-            let proof = ChildValues::from_proof(self.child, proved.proof)?;
-            let root = proved.proof.stark_proof.commitments[0];
-            let hash = circuit_hash_of(&proved.proof.log_sizes, &root);
-            let hash = P2Hash(hash.map(|word| BaseField::from(word.value())));
-            let choice = hashes
-                .iter()
-                .position(|&leaf| leaf == hash)
-                .or((hash == fold_word).then_some(MAX_LEAF_CIRCUITS));
-            let output: [SecureField; 2] = proved
-                .proof
-                .outputs
-                .clone()
-                .try_into()
-                .expect("a node's two output wires");
-            Ok(FoldChild {
-                proof,
-                output,
-                preimage: proved.output.preimage_wires(),
-                circuit: core::array::from_fn(|k| {
-                    SecureField::from(BaseField::from(u32::from(choice == Some(k))))
-                }),
-            })
-        };
-        let children = [child(left)?, child(right)?];
+        let children = [
+            FoldChild::of(self.child, left, program, fold_word)?,
+            FoldChild::of(self.child, right, program, fold_word)?,
+        ];
         let mut output = NodeOutput::fold(left.output, right.output);
         output.program = P2Hash(program.id().0);
         output.fold_word = fold_word;
@@ -345,17 +353,68 @@ impl FoldCircuit {
     }
 }
 
+impl FoldChild<SecureField> {
+    /// The values of `proved`, a valid proof of `shape`, as a node under the
+    /// program whose id's preimage is `program` and the fold word
+    /// `fold_word`. Its circuit is the first of the program's leaf circuits
+    /// its hash equals, or W; one that is neither sets no bit, which a
+    /// circuit refuses.
+    ///
+    /// # Panics
+    /// When the proof does not verify natively.
+    pub fn of(
+        shape: &ChildShape,
+        proved: Proved<'_>,
+        program: &IdPreimage,
+        fold_word: P2Hash,
+    ) -> Result<Self, WitnessError> {
+        let proof = ChildValues::from_proof(shape, proved.proof)?;
+        let root = proved.proof.stark_proof.commitments[0];
+        let hash = circuit_hash_of(&proved.proof.log_sizes, &root);
+        let hash = P2Hash(hash.map(|word| BaseField::from(word.value())));
+        let choice = program
+            .leaf_circuits
+            .hashes()
+            .iter()
+            .position(|&leaf| leaf == hash)
+            .or((hash == fold_word).then_some(MAX_LEAF_CIRCUITS));
+        let output: [SecureField; 2] = proved
+            .proof
+            .outputs
+            .clone()
+            .try_into()
+            .expect("a node's two output wires");
+        Ok(Self {
+            proof,
+            output,
+            preimage: proved.output.preimage_wires(),
+            circuit: core::array::from_fn(|k| {
+                SecureField::from(BaseField::from(u32::from(choice == Some(k))))
+            }),
+        })
+    }
+}
+
+impl<V: Value> FoldChild<V> {
+    /// The layout of a node's values over `shape`, every value zero (or no
+    /// value).
+    pub fn blank(shape: &ChildShape) -> Self {
+        let zero = V::from_qm31(SecureField::zero());
+        Self {
+            proof: ChildValues::blank(shape),
+            output: [zero; 2],
+            preimage: [zero; preimage::WIRES],
+            circuit: [zero; CIRCUITS],
+        }
+    }
+}
+
 impl<V: Value> FoldValues<V> {
     /// The layout of a fold's values over children of `shape`, every value
     /// zero (or no value).
     pub fn blank(shape: &ChildShape) -> Self {
         let zero = V::from_qm31(SecureField::zero());
-        let child = FoldChild {
-            proof: ChildValues::blank(shape),
-            output: [zero; 2],
-            preimage: [zero; preimage::WIRES],
-            circuit: [zero; CIRCUITS],
-        };
+        let child = FoldChild::blank(shape);
         Self {
             children: [child.clone(), child],
             program: [zero; PROGRAM_WIRES],

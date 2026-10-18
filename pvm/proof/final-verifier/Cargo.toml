@@ -3,9 +3,17 @@ name = "vos-final-verifier"
 edition.workspace = true
 version.workspace = true
 license = "Apache-2.0"
-description = "The final wrap's verifier: no_std, for x86, wasm32 and the PVM. A skeleton until the wrap exists."
+description = "The final wrap's verifier: a format-28 proof against its 24 public words, the program id and the io-hash. no_std, for x86, wasm32 and the PVM."
 
 [dependencies]
 # Without features: no std, and none of the prover's nightly SIMD.
 stwo = { workspace = true }
 vos-recair-air = { workspace = true }
+num-traits = { version = "0.2", default-features = false }
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+postcard = { version = "1", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# Format 28's registry entry and the segment transcript's header, which this
+# crate's constants and header must equal.
+vos-pvm-proof = { workspace = true }
