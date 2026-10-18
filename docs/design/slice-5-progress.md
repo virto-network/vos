@@ -3965,18 +3965,200 @@ client's; `just clippy` green; the fixtures' stale test (`kernel
 fixtures::the_fixtures_are_the_generators`) green with and without
 `debug-internals`, every fixture byte-identical.
 
+## Slice 5 accepted
+
+**On the slice's code (`8e496e39`: 5.16c's tip `0bfd9022`, the
+`test-proof` fix and the end-to-end tests' reporting).** Every run on the
+shared Intel Core Ultra 7 155H (22 threads, 62 GiB), under `systemd-run` at
+16 GiB with `nice -n 10` and `CARGO_INCREMENTAL=0`. The machine was
+shared: its one-minute load average 3–22 during `ci-full` (its own builds
+and other sessions'), 3–7 during the measured runs, 1–5 during the loop.
+
+### What slice 5 delivered
+
+**M0, the foundation** (`ce72c226` to `36eac7cf`, recorded in
+[M0 acceptance](#m0-acceptance)): Stwo from the owner's fork; the reference
+Poseidon2 and a packed hasher; the format registry with both bit counts;
+the witness input `0x401`, the run's ends and the io-hash; the AIR audit's
+hardening; a shape per kernel; slice 4's carried items.
+
+**M1, the recursion, unmasked, in tests** (`e021f40c` to `0bfd9022`):
+
+| step | what | commits |
+|---|---|---|
+| 5.8.0 | The window kernel on the line (cipher-clerk v0.3.0, `vos_tree::verify_encoded`), the A.6 fixture generator; one Poseidon2 crate, one transcript prefix, one page tree, the CPU split | 7296c540 to c5059177 on two tracks, merged by cd1e261a and 7ce00449 |
+| 5.8 | The gate VM: `p2`, `qm31` and `h8` with the `Gate` relation, the context and its finalizing | c1de1a51..15f98b6e |
+| 5.9 | The baseline re-counted on the hardened AIR; the gate compiler | f68c6b30, b739bc9e |
+| 5.10a | Segment format 35 (40 queries, PoW 24); 15 unread CPU columns dropped; legacy 36, devices 37 | 2232c930, bc1f4f70 |
+| 5.10 | The in-AIR verifier's pieces: the Poseidon2 channel, lifted Merkle, FRI, DEEP, the logup sums | 5ab6866e, 19a5892b |
+| 5.11 | The first feasibility gate: COMPARE's leaf, the kernel leaf's rows per term | 60ac71e1, 0bf371a2 |
+| 5.12 | The kernel leaves, one circuit per (kernel, class), and the program id's leaf hashes | 84394f55, d689b7fa |
+| 5.13 | The fold, one circuit for every program, at its fixed point | b745381e |
+| 5.14 | The wrap under format 28 (Blake2b-256, fold step 3, affine DEEP batching) and `vos-final-verifier` | dbd3eb76..cc4463c1 |
+| 5.15 | `vos-statement`, the golden fixtures at four venues, both statements end to end, the fuzz targets | 0e867e9f..5ad07549 |
+| 5.15b | The relations in draw order, the rootless rule, the fuzz oracle, `just judge-wasm` | 2ef8f36b..8a66fc3a |
+| 5.16a | The end review (Fable): the statement id without the format; the design docs | 60ba6e3d, 2b62d419 |
+| 5.16b–c | The code-quality review (Opus), folded: net −8,757 then +51 lines, proof bytes unchanged | 2b9b59ce..0bfd9022 |
+| 5.16 | `test-proof` within 16 GiB; the end-to-end tests report each node | 5552dff2, 8e496e39 |
+
+5.6, the phone run, waits on the owner's team (slice 7).
+
+### Gates
+
+- **`just ci-full` green, 2,037 s:** 108 test binaries, 1,780 tests.
+  - `ci`: 101 binaries, 1,225 tests, 545 s (its builds warm from the run
+    below).
+  - `test-proof`: 5 binaries, 553 tests (the library 89, `gates` 221,
+    `isa` 212, `kernel` 31), 1,467 s; `kernel` alone 933 s. Its
+    `judge-wasm` judged the 13 fixtures as recorded under both semantics.
+  - `test-bench-proof`: 2 tests, 25 s.
+- **`just judge-wasm`:** 13 of 13 under the PVF's semantics and the
+  client's (inside `test-proof`); the valid fixture's id `406628d2…c972`.
+- **The checker loop with workflows:** seeds 601–612 across the three
+  exactly-once tests. All 36 runs green, 944 s. 2,741 tours, none
+  failed, across 23 leader stops mid-await and 23 mid-computation.
+- **Failed first, and fixed** (5552dff2): the first `ci-full` ended at
+  1,226 s in `kernel_shape`, the OOM killer's (16 GiB): `test-proof` ran
+  `kernel` two tests at a time, and two window-sized runs together
+  outgrew the cap (its recipe said 24 GiB). `kernel` now runs one test at a
+  time and the rest two; the recipe is documented at 16 GiB, and the rerun
+  above is on it. `ci` had passed in that run.
+
+### Measured
+
+Each run alone, one test thread, its proving on every core
+(`window_kernel::the_window_wraps` and `kernel_shape::the_predicate_wraps`,
+`--features debug-internals` as `test-proof` builds them); heap is the
+counting allocator's peak over the allocations before the proof, the
+process's peak the scope's [measured unless tagged].
+
+**Segment proving, format 35 (Poseidon2-M31, 2/40/24, interaction PoW 8),
+per kernel:**
+
+| kernel | segments | class | time each | peak heap | process peak |
+|---|---|---|---|---|---|
+| the window (632,800 steps, 23 chips) | 23 | 1 (2^15 steps) | 6.67–10.71 s, median 8.16 s | 4.79 GiB | 9.2 GiB |
+| | 3 | 0 (2^12) | 3.75–4.60 s | 2.55 GiB | |
+| | 26 | | 204.9 s summed | | |
+| `areas` (1,658 steps) | 3 | 0 | 4.29–4.80 s, 13.4 s summed | 2.51 GiB | 7.9 GiB |
+
+- Against A.7 (≤ 24 GiB, ≤ 8 s): memory well within; the class-1 median
+  is 8.16 s at a load of 3–7, where M0 measured format 31 at 6.79 s
+  (load 2–3) and 5.12 a class-1 segment at 6.82 s. Within the budget on a
+  quiet machine, not on this one.
+
+**The recursion, against A.7:**
+
+| node | the window | `areas` | A.7's budget |
+|---|---|---|---|
+| leaf | 26: 1.41–1.70 s, median 1.55 s; 942 MiB; **0.15–0.22×** a class-1 segment (median 0.19×), 0.33–0.40× a class-0 | 3: 1.53–1.56 s; 942 MiB; 0.33–0.36× | ≤ 4 GiB; ≤ 1× the segment (target 0.13–0.5×) |
+| fold | 25: 38.6 s summed, 1.54 s each on average; 942 MiB | 2: 1.60 s, 1.59 s; 942 MiB | ≤ 4 GiB; ≤ the leaf's |
+| wrap | 6.62 s; 2.44 GiB; 2^14 / 2^15 / 2^11 rows | 4.86 s; 2.44 GiB; the same rows | ≤ 8 GiB; ≤ 2^17; 4.4–9.5 s [projected] |
+| end to end | 324 s (5.4 min): segments and leaves 265 s, folds 44 s, the wrap and the checks after it | 38 s | 3–5 min [projected] |
+
+Every node within its memory and row budgets, and every leaf and fold
+within its time budget. A fold takes a leaf's time and heap: both prove the
+padded shape.
+
+**Recursion as a share of segment proving** (the leaves', folds' and
+wrap's proving over the segments'):
+
+| statement | segments | leaves | folds | wrap | recursion | share |
+|---|---|---|---|---|---|---|
+| the window (26 segments) | 204.9 s | 40.1 s | 38.6 s | 6.6 s | 85.3 s | **41.6%** |
+| `areas` (3 segments) | 13.4 s | 4.6 s | 3.2 s | 4.9 s | 12.7 s | **94.3%** |
+
+- Counting the whole of each leaf's and fold's call (its values, its
+  circuit built and finalized, and the test's native checks) as well, the
+  window's recursion is about 111 s, 54% [measured, as the wall time less
+  the segments'].
+- A small kernel's recursion is its fixed costs: a leaf proves the padded
+  shape whatever its segment, and every run takes one wrap. `areas`' three
+  class-0 segments of 552 steps cost about what their recursion does; the
+  window's class-1 segments are five times their leaves.
+
+**The final proof and its verification:**
+
+| | the window | `areas` |
+|---|---|---|
+| the wrap's bytes (postcard) | 123,840 | 121,098 |
+| JAM gas on the JAM-only host, judged (`judge`: admission, the lookup, the decode, the verify) | **96.3M** (lookup 0.15M; heap 460 KiB) | **94.5M** (lookup 0.13M; 456 KiB) |
+| JAM gas through `0x400` | not wired | not wired |
+| Wasm, judged (the statement), PVF / client | **38.33M / 37.80M** instructions | **37.72M / 37.20M** |
+| Wasm, verify alone, PVF / client | 38.30M / 37.77M; 2.3 / 2.1 ms | 37.70M / 37.18M; 2.2 / 2.1 ms |
+| the statement's id | `780b24e7…` | `de293e80…` |
+
+- **Through `0x400`:** the venue's guest hashes Blake2b-256 in software;
+  routing it through `0x400` needs a compression hook in the fork's
+  hasher, carried to slice 6 with the fixed-layout decode. Spike 4a's
+  model put the final proof at 64.1M through `0x400` against 85.2M in
+  software, ×0.79 [model]; at that factor the window's 96.3M would be about
+  76M [projected].
+- Against 5.14's gate (≤ 150M) and goal 3: 36% below; 13% above the 85M
+  target, which the decode and the hook account for.
+- Wasm, pinned to one core; the instructions are the least of five runs
+  for the verify, one for the judgement. JAM gas is 2.51× the PVF's
+  instructions.
+
+### Deviations from the plan, and their decisions
+
+M0's are in [its entry](#deviations-from-the-plan-and-their-decisions);
+in brief, with M1's:
+- **Poseidon2-M31 kept past 5.2's gate** (the owner, 2026-10-16): proving
+  1.75–1.85× Blake2s against the 1.5× gate, judged on a segment's total
+  cost with its leaf instead. The Blake2s fallback was dropped; M1's leaf
+  (0.19× its segment) bears the choice out.
+- **The AIR audit and its hardening (5.5b), not in the plan:** the operand
+  binding found open at 5.5's review; G1–G4 and page permissions closed,
+  each with a forgery gate run first on the unfixed AIR; 483 columns.
+- **Ristretto removed** (the owner's): unsound chips; 32 chips to 25, and
+  slice 7's bignum chip replaces them.
+- **The formats renumbered, so that a number names one AIR:** segments
+  26 → 31 → **35**, legacy Blake2s 24 → 33 → **36**, devices 29 → 34 →
+  **37**; leaves and folds **32** and the wrap **28** unchanged. 5.10a's
+  dropped columns moved 31, 33 and 34 together.
+- **A shape per kernel saves 0.2%, not 30%:** the 30% was Ristretto's. The
+  shape stays for identity and the leaf's constants.
+- **40 queries with PoW 24** (5.10a, 5.8.0's rule): at 44 queries the
+  kernel leaf's `p2` had 1.1% headroom; at 40 it is 12.0% under 2^16,
+  for 62.86 proven bits against 62.79.
+- **Affine DEEP batching** in the fork (5.14): batched by powers, format 28
+  stayed at 74.7 proven bits under the 80 floor; affine batching's term
+  takes it to 82.6 (146 conjectured), with `DIVERGENCE-011` and `-012`
+  open for the audit.
+- **The statement's rules** (5.15b, 5.16a): a rootless statement belongs
+  to no space (`0x4` otherwise), so an accepted one cannot be replayed
+  under another space's id; and the statement id leaves out the format, so
+  a run accepted under one final format is a repeat under its successor.
+  Each with its fixture at every venue.
+- **Four removals** (the owner's, 5.16b): `settlement-verifier` and
+  `verifier-wasm-bench` retired, the compact/streaming trace path deleted,
+  the public API no workspace crate uses removed, and the spike toy-AIR
+  tests deleted. The quality review's other two (the relabel seam for the
+  retired formats 18/19, merging the fuzz target's grow/shrink/clear) were
+  not taken.
+
+### Pointers
+
+- **The external audit's scope:** [The external audit](#the-external-audit),
+  before value rides on a proof; its owner and timing are open.
+- **What leaves the slice:** [Carried out of slice 5](#carried-out-of-slice-5),
+  to slice 6 (masking, the venue binding, the pallet, the recursion AIR's
+  forgery gates), to slice 7 (the phone, the device profile) and to the
+  owner.
+
 ## Carried out of slice 5
 
 Every item the slice carries, in one place; the steps' own sections say
 what they took and point here.
 
-### Within the slice: 5.16's remaining steps
+### The code-quality list, the rest
 
-- **The acceptance gates:** `ci-full`, `test-proof`, the checker loop and
-  A.7's rows; then the code-quality review.
-- **The code-quality list, the rest:** what 5.16c leaves (its "Not
-  taken here"): the compiler's own chip list, the interaction side's row
-  view, `record_step`, and the review's remaining medium and low items.
+To the cleanup before master: what 5.16c leaves (its "Not taken here"):
+the compiler's own chip list, the interaction side's row view,
+`record_step`, and the review's remaining medium and low items; and the
+two removals not taken (the relabel seam for formats 18/19, the fuzz
+target's grow/shrink/clear as one).
 
 ### To slice 6
 
@@ -4031,7 +4213,11 @@ what they took and point here.
   leaf or a fold.
 - **Prover time:** the ALU chips pad to the class's steps and
   WITNESS_INPUT pads to 2^16 in every segment; narrower capacities, or
-  WITNESS_INPUT in the entry class alone, are open.
+  WITNESS_INPUT in the entry class alone, are open. A.7's 8 s a class-1
+  segment held on a quiet machine (6.8 s) but not at the acceptance's load
+  (median 8.16 s); a small kernel's recursion is its fixed costs (`areas`:
+  94% of its segments' proving, a padded-shape leaf a segment and one
+  wrap), which a leaf over several small segments would amortize.
 - **Recorded, unfixed:** C-DJUMP (an invalid dynamic jump cannot be
   proved; no kernel needs it); the ledgers' 2^27-step gap; a BLAKE2b
   pointer within 256 bytes of 2^32; refine slices' page permissions,
