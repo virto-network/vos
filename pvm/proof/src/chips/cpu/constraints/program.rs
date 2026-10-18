@@ -149,9 +149,7 @@ pub(in crate::chips::cpu) fn flag_bits<E: EvalAtRow>(
         let fb3 = crate::trace::trace_eval!(trace_eval, Column::FlagByte3);
         let fb4 = crate::trace::trace_eval!(trace_eval, Column::FlagByte4);
         let fb5 = crate::trace::trace_eval!(trace_eval, Column::FlagByte5);
-        // Reread/define individual-flag bit expressions for each byte.
-        // Most flags live in module-scope `let`s near the top of
-        // add_constraints; the rest are local to this block.
+        // Read the individual-flag bit expressions for each byte.
         let f_is_jump_p55 = crate::trace::trace_eval!(trace_eval, Column::IsJump);
         let f_is_div_rem_p55 = crate::trace::trace_eval!(trace_eval, Column::IsDivRem);
         let f_is_load_p55 = crate::trace::trace_eval!(trace_eval, Column::IsLoad);

@@ -140,8 +140,7 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
 
         // Phi7Bool ↔ Phi7 (its bytes' sum, zero exactly when the
         // register is) tie, gated only by is_real.
-        // Phi7Bool boolean enforced unconditionally in the helper block
-        // above.
+        // Phi7Bool is boolean on every row (`registers::register_helpers`).
         // If Phi7Bool = 0, then Phi7's bytes are 0.
         let _ = phi7_inv;
         let phi7_sum = phi7
@@ -190,8 +189,8 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
             eval.add_constraint(is_blake_ecall[0].clone() * phi11[i].clone());
         }
 
-        // Phi7Bool / IsBlakeEcall booleans enforced unconditionally in
-        // the helper block above.
+        // Phi7Bool and IsBlakeEcall are boolean on every row
+        // (`registers::register_helpers`).
     }
 }
 

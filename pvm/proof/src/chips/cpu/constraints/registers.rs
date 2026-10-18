@@ -221,8 +221,8 @@ pub(in crate::chips::cpu) fn register_accesses<E: EvalAtRow>(
             &tuple_a,
         ));
 
-        // IsTruncated identity binding.  Boolean property enforced
-        // unconditionally in the helper block above.
+        // IsTruncated identity binding; its boolean property is
+        // `register_helpers`'.
         let is_truncated = crate::trace::trace_eval!(trace_eval, Column::IsTruncated);
         // is_truncated = is_32bit · (is_add+is_sub+is_mul+is_div_rem).
         // is_real · is_32bit lifted into Real32bitH so the constraint
@@ -356,7 +356,6 @@ pub(in crate::chips::cpu) fn register_accesses<E: EvalAtRow>(
             &tuple,
         ));
 
-        // IsReg booleans enforced unconditionally in the helper block
-        // above.
+        // The IsReg booleans are `register_helpers`'.
     }
 }

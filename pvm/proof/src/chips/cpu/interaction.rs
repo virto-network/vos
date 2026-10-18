@@ -364,7 +364,7 @@ pub(super) fn generate_interaction_trace(
     // steps.  The actor's a0/a1/a2/a3 map to PVM φ[7/8/9/10].  The
     // `Column::Phi*` names are slot labels that do not match the register
     // mapping (h_ptr=Phi10, m_ptr=Phi11, t_low=Phi12, f_flag=Phi7) —
-    // see `mod.rs::ECALL_REG_IDXS` for the slot-to-register mapping that
+    // see `ECALL_REG_IDXS` below for the slot-to-register mapping that
     // aligns with `trace_fill.rs`'s sources.
     let is_blake_ecall = crate::trace::original_base_column!(component_trace, Column::IsBlakeEcall);
     let phi7 = crate::trace::original_base_column!(component_trace, Column::Phi7);

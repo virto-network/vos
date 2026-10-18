@@ -15,8 +15,8 @@ test = false
 bench = false
 
 [dependencies]
-# The settlement window, its accounts hashed with the `blake2` crate: without
-# `pvm-precompile`, which names a shim of the Ristretto precompiles.
+# The settlement window, its accounts hashed with the `blake2` crate, without
+# cipher-clerk's `pvm-precompile` feature.
 cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3.0", default-features = false, features = ["settlement"] }
 vos-sdk = { workspace = true }
 vos-tree = { path = "../../tree" }

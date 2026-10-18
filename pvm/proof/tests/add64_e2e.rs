@@ -1,9 +1,8 @@
 #![cfg(feature = "prover")]
 
+use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
-// Memory is now flat_mem in Interpreter
-use vos_pvm::PVM_REGISTER_COUNT;
 
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{SideNote, prove, verify};

@@ -320,7 +320,7 @@ where
         ));
     }
 
-    // Boundary public-input binding (format v5): each boundary chip's
+    // Boundary public-input binding: each boundary chip's
     // claimed sum must equal the value recomputed from the proof's
     // public boundary states with the drawn lookup elements. This
     // is what BINDS `proof.{initial,final}_state` to the committed

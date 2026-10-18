@@ -1,5 +1,5 @@
-//! The recursion AIR's prover (`docs/design/recursion-air.md` §1–2, §10 step
-//! 1): the gate VM.
+//! The recursion AIR's prover (`docs/design/recursion-air.md` §1–2): the
+//! gate VM.
 //!
 //! - [`Context`] builds a circuit: witness values flow through the wiring,
 //!   constants are fixed by gates, outputs are yielded at reserved addresses.

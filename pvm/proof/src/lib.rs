@@ -1,7 +1,7 @@
 //! # vos-pvm-proof — zero-knowledge prover and verifier for PVM bytecode
 //!
 //! A STARK proving system for the **PVM** instruction set used by
-//! the Polkadot Virtual Machine and the Kunekt actor runtime.
+//! the Polkadot Virtual Machine and the VOS actor runtime.
 //! Adapted from the Nexus zkVM (Stwo / Circle-STARK over M31),
 //! retargeted at PVM via the `vos_pvm` interpreter and ECALL host-call
 //! protocol.
@@ -198,10 +198,9 @@ pub fn all_components() -> &'static [&'static dyn framework::MachineProverCompon
 // chip itself.  Table chips populate their multiplicity column by reading counts
 // that consumers accumulate into SideNote during trace generation.
 //
-// Blake2bChip is OPTIONAL.  Skipped when no blake2b ECALL fired in the
-// trace.  Saves ~10% prove time and ~57% proof size on workloads that don't
-// hash.  Both prover and verifier must agree on inclusion — `active_components`
-// is the single source of truth and is deterministic from `SideNote`.
+// The `chip_idx::OPTIONAL` chips are skipped when no step needs them. Both
+// prover and verifier must agree on inclusion — `active_components` is the
+// single source of truth and is deterministic from `SideNote`.
 /// Indices into `BASE_COMPONENTS` for chips referenced by name in
 /// `ChipActivity::is_active`, `Proof::component_mask` bit positions,
 /// and other bit-position-sensitive sites (e.g. the boundary-binding
@@ -295,7 +294,7 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::RegisterMemoryBoundaryChip,
     &chips::RegisterMemoryClosingChip, // pins proof.final_state.registers
     &chips::ProgramBoundaryChip,
-    &chips::ProgramMemoryChip, // producer-only until the CpuChip consumer is added
+    &chips::ProgramMemoryChip, // the committed program, consumed per step by CpuChip
     &chips::JumpTableChip,     // producer of jump_table[] lookups
     &chips::WitnessInputChip,  // OPTIONAL — a witness input's bytes, gated by their calls
     &chips::RangeMultiplicity256,
@@ -303,11 +302,11 @@ const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[
     &chips::PowerOfTwoChip,
     &chips::PopcountChip,       // per-byte popcount lookup table
     &chips::BitcountChip,       // per-byte (lz, tz) lookup table
-    &chips::ByteToBitsChip, // per-byte 8-bit decomposition lookup table (dormant until consumers are added)
-    &chips::MulChip,        // consumer of MultiplicationLookup
-    &chips::BitwiseChip,    // consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
-    &chips::CompareChip,    // consumer of CompareLookup, producer of Range256 lookups
-    &chips::DivRemChip,     // consumer of DivRemLookup
+    &chips::ByteToBitsChip,     // per-byte 8-bit decomposition lookup table
+    &chips::MulChip,            // consumer of MultiplicationLookup
+    &chips::BitwiseChip,        // consumer of BitwiseLookup, producer of BitwiseAnd nibble lookups
+    &chips::CompareChip,        // consumer of CompareLookup, producer of Range256 lookups
+    &chips::DivRemChip,         // consumer of DivRemLookup
     &chips::BitwiseAndByteChip, // byte-wide AND table — consumed by the two blake2b chips
 ];
 
@@ -366,13 +365,10 @@ const _: () = {
 /// public side_note is an input to `verify`).
 ///
 /// Skipping a chip is safe iff all of its lookup producers and consumers
-/// have multiplicity 0 across the trace.  For Blake2bChip: no calls in
+/// have multiplicity 0 across the trace. For Blake2bChip: no calls in
 /// `side_note.blake2b_calls` ⇒ no Blake2b producers/consumers fire on
-/// CpuChip or MemoryChip ⇒ all relevant lookup balances stay 0=0.
-///
-/// Index 1 in `BASE_COMPONENTS` is Blake2bChip — skipping that index is
-/// the current implementation.  When more chips become conditional,
-/// each gains a corresponding index check.
+/// CpuChip or MemoryChip ⇒ all relevant lookup balances stay 0=0. Each
+/// `chip_idx::OPTIONAL` chip has its arm in `ChipActivity::is_active`.
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub fn active_components(

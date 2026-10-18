@@ -408,7 +408,7 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
         trace.fill_columns_bytes(row, &val_d_partial_nz, Column::ValDPartialNZ);
         // SignBitB/D are pinned to bit 7 of the multiplexed source
         // byte (val_b[7] in 64-bit, val_b[3] in 32-bit) via nibble-AND
-        // lookups at the end of add_constraints.
+        // lookups (`constraints::signs::sign_nibbles`).
         // Compute the source byte explicitly and derive the sign +
         // hi-nibble + lo-nibble from it; bit-31-of-u64 and bit-63-of-u64
         // give the same answer when val_b[4..8] are constrained to 0

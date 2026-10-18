@@ -123,8 +123,8 @@ pub fn production_pcs_config() -> PcsConfig {
     PcsConfig {
         pow_bits: 20,
         fri_config: FriConfig::new(0, 4, 19, 1),
-        // Stwo v2.x lifted protocol; `None` lets `try_get_lifting_log_size`
-        // default it to `log_trace_size`.  See pvm/proof/STWO_2.2.0_MIGRATION.md.
+        // The lifted protocol; `None` lets `try_get_lifting_log_size`
+        // default it to `log_trace_size`.
         lifting_log_size: None,
         deep_batching: stwo::core::pcs::DeepBatching::Powers,
     }
@@ -136,14 +136,9 @@ pub fn production_pcs_config() -> PcsConfig {
 /// times; only the first effective call wins (we use a `OnceLock`
 /// guard around `ThreadPoolBuilder::build_global`).
 ///
-/// Why cap at all?  At log14 MOBILE config on a 22-logical-core
-/// desktop we measured (median of 3):
-///   - default 22 threads: 2.26 s prove
-///   - 10 threads:         1.83 s prove   (-19%)
-///   - 8 threads:          1.88 s prove   (-17%)
-/// Past ~10 threads memory-bandwidth contention overtakes parallel
-/// gains.  Cap = `min(logical_cpus, 10)` matches phones (4-8 cores
-/// → no cap) and keeps desktops in the sweet spot.
+/// Past about 10 threads, memory-bandwidth contention overtakes the
+/// parallel gains, so the cap is `min(logical_cpus, 10)`: phones (4-8
+/// cores) run uncapped.
 ///
 /// Returns the number of threads the pool ended up with.
 pub fn install_thread_pool() -> usize {
@@ -174,8 +169,6 @@ pub fn install_thread_pool() -> usize {
 /// (~850 KB at log14).  Same conjectured 96-bit security
 /// (`pow_bits + n_queries · log_blowup_factor = 20 + 38·2 = 96`).
 ///
-/// At log14 on a 22-core desktop: 2.10 s prove (vs 5.23 s with the
-/// standard config) — fast enough to beat Nexus zkVM 2.x's 2.37 s.
 /// Verifier-side, callers must use `PcsPolicy::MOBILE` (or
 /// stricter) when verifying proofs produced with this config.
 pub fn production_pcs_config_mobile() -> PcsConfig {
@@ -196,7 +189,7 @@ pub(crate) struct Target {
 }
 
 impl Target {
-    /// Format 24 at a configuration of the caller's.
+    /// Format 36 at a configuration of the caller's.
     pub fn legacy(config: PcsConfig) -> Self {
         Self {
             format: &crate::format::LEGACY_SEGMENT,
@@ -238,11 +231,8 @@ pub fn prove_format(
 /// Prove using the MOBILE PCS config — the recommended path for
 /// latency-sensitive flows like *private tap-to-pay*.
 ///
-/// Same 96-bit conjectured security as `prove()` but ~2× faster on
-/// real PVM workloads (a curve-arithmetic workload: ~0.7 s vs ~1.4 s on
-/// the reference Intel Core Ultra 7 155H).  Cost: proof size ~1.6×
-/// larger.  Acceptable trade for tap-to-pay where prove time
-/// dominates user experience.
+/// Same 96-bit conjectured security as `prove()` but about 2× faster on
+/// real PVM workloads, for proofs about 1.6× larger.
 ///
 /// Verifier-side, callers MUST use `verify_with_pcs_policy(proof,
 /// side_note, &PcsPolicy::MOBILE)` (or stricter) — the default
@@ -445,8 +435,7 @@ fn prove_impl(
 /// Chip-isolated prove path.  Bypasses `active_components` so
 /// callers can pick an arbitrary component slice — used by the chip-rewrite
 /// validation harness to prove a single high-bound chip + its lookup
-/// closure without dragging in always-active CpuChip.  See
-/// `STWO_PHASE_I_BLAKE2B.md`.  Proofs produced here have
+/// closure without dragging in always-active CpuChip.  Proofs produced here have
 /// `component_mask = 0` and are not verifiable via `verify_standalone`;
 /// pair only with `verify_with_explicit_components`.
 pub fn prove_with_explicit_components(
@@ -871,8 +860,7 @@ where
     // memory ledgers, …) only read those, so they run on
     // rayon with shared `&SideNote`.  Mirrors the producer/consumer
     // split already used by interaction-trace generation a few stages
-    // below.  Measured saving on a log17 curve-arithmetic workload (MOBILE):
-    // ~130 ms → ~70 ms of trace_gen.
+    // below.
     let t = Instant::now();
     let traces = generate_component_traces(side_note, components, sizes.floors());
     let log_sizes: Vec<u32> = traces.iter().map(ComponentTrace::log_size).collect();
@@ -989,10 +977,6 @@ where
     // own owned `ComponentTrace`, so the bodies are independent.  Only
     // `tree_builder.extend_evals` is mutating, so we do that
     // sequentially after the parallel pass.
-    //
-    // Measured win on a log17 curve-arithmetic workload (MOBILE config):
-    // ~140 ms → ~50–70 ms with the default thread pool cap (10
-    // threads); brings total prove time from 0.71 s to ~0.62 s.
     let t = Instant::now();
     #[allow(clippy::type_complexity)]
     let interaction_results: Vec<(

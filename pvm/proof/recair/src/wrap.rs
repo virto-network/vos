@@ -5,7 +5,7 @@
 //! **What it checks of the root,** a node of the padded shape (format 32), a
 //! fold's or, for a run of one segment, a leaf's:
 //! - its proof, verified with its output digest's two wires as the proof's
-//!   outputs (5.10's pieces over the recursion AIR, as a fold verifies a
+//!   outputs (the in-circuit verifier's pieces, as a fold verifies a
 //!   child);
 //! - **the circuit set:** its circuit hash, recomputed from its preprocessed
 //!   root, is one of the program's leaf-circuit hashes or `H_fold`

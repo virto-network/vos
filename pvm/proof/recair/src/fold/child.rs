@@ -3,7 +3,7 @@
 //!
 //! **What a child's circuit is built for** ([`ChildShape`]): the recursion
 //! AIR's three components at the padded log sizes
-//! ([`LEAF_FOLD_LOG_SIZES`]), their constraints compiled by 5.9's compiler
+//! ([`LEAF_FOLD_LOG_SIZES`]), their constraints compiled by the gate compiler
 //! from the components' own `evaluate`, the `Gate` relation the one drawn,
 //! under format 32's parameters. Every child has this shape, a leaf or a
 //! fold: what tells them apart is the preprocessed root, which a child's

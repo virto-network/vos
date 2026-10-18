@@ -587,15 +587,13 @@ fn verify_standalone_on<MC: PcsStack>(
             "log sizes len mismatch".to_string(),
         ));
     }
-    // v7: reject `initial_state.timestamp < 1` per segment (the
-    // production consumer verifies single proofs here, not only the chain
-    // wrapper).  Step timestamps start at 1, so `initial_ts ≥ 1` excludes the
+    // Reject `initial_state.timestamp < 1` per segment (the production
+    // consumer verifies single proofs here, not only the chain wrapper).  Step timestamps start at 1, so `initial_ts ≥ 1` excludes the
     // ts=0 per-page boundary writes from being forged as real steps, and (with
     // the CpuChip ts-chain) lands every step ts in [initial_ts, final_ts).
     if proof.initial_state.timestamp < 1 {
         return Err(VerificationError::InvalidStructure(
-            "initial_state.timestamp must be >= 1 (memory-boundary anchoring, format v7)"
-                .to_string(),
+            "initial_state.timestamp must be >= 1 (memory-boundary anchoring)".to_string(),
         ));
     }
 
@@ -639,7 +637,7 @@ fn verify_standalone_on<MC: PcsStack>(
         ));
     }
 
-    // Boundary public-input binding (format v5): each boundary chip's
+    // Boundary public-input binding: each boundary chip's
     // claimed sum must equal the value recomputed from the proof's
     // public boundary states with the drawn lookup elements. This
     // BINDS `proof.{initial,final}_state` to the committed boundary
@@ -648,7 +646,7 @@ fn verify_standalone_on<MC: PcsStack>(
     // columns are pinned to the trace by CpuChip program-execution
     // chaining; the register columns (and the voucher io-hash read from
     // `final_state.registers[9..13]`) are pinned to the trace by
-    // `RegisterMemoryChip` read-consistency (v6: a cross-row
+    // `RegisterMemoryChip` read-consistency (a cross-row
     // `#[mask_next_row]` `prev_value` binding, a range-checked
     // `(reg, ts)` sortedness gadget, and an `is_write` tuple limb),
     // which is sound against a from-scratch prover (gate:

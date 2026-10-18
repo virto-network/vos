@@ -70,8 +70,8 @@ pub(in crate::chips::cpu) fn byte_ops<E: EvalAtRow>(eval: &mut E, trace_eval: &T
 
     // ════════════════════════════════════════════════════════════════════
     // BITMANIP — SIGN_EXTEND_8 / SIGN_EXTEND_16  (ground constraints only;
-    // the sign-bit-pinning AND lookups live just before finalize_logup
-    // — see "Sign-extend nibble lookups" near end of add_constraints).
+    // the sign-bit-pinning AND lookups are `sign_extend_nibbles`, emitted
+    // last, before finalize_logup).
     // ════════════════════════════════════════════════════════════════════
     let is_sign_ext_8 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt8);
     let is_sign_ext_16 = crate::trace::trace_eval!(trace_eval, Column::IsSignExt16);
@@ -112,13 +112,13 @@ pub(in crate::chips::cpu) fn count_set_bits<E: EvalAtRow>(eval: &mut E, trace_ev
     //   result[0] = sum(BytePopcount[0..N])  (N = 4 if Is32Bit else 8)
     //   result[1..8] = 0
     //   per-byte popcount lookup `(val_d[i], BytePopcount[i]) ∈ popcount`
-    //     emitted further below near the other lookups.
+    //     emitted in `lookups::table_lookups`.
     // ════════════════════════════════════════════════════════════════════
     let is_count_set_bits = crate::trace::trace_eval!(trace_eval, Column::IsCountSetBits);
     let byte_popcount = crate::trace::trace_eval!(trace_eval, Column::BytePopcount);
     // 64-bit case: result[0] = sum of all 8 byte-popcount witnesses.
     // 32-bit case: result[0] = sum of low 4 byte-popcount witnesses.
-    // is_64bit is defined at the top of add_constraints as 1 - is_32bit.
+    // is_64bit = 1 - is_32bit.
     let mut sum_lo4 = byte_popcount[0].clone();
     for i in 1..4 {
         sum_lo4 += byte_popcount[i].clone();

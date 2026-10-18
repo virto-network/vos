@@ -304,7 +304,8 @@ pub enum Column {
     // do NOT match the PVM register each slot holds — each slot's SOURCE
     // is a different register than its name implies.  See
     // `chips/cpu/trace_fill.rs`'s Blake2b block and
-    // `chips/cpu/{mod,interaction}.rs::ECALL_REG_IDXS` for the canonical
+    // `ECALL_REG_IDXS` in `chips/cpu/constraints/host_call.rs` and
+    // `chips/cpu/interaction.rs` for the canonical
     // slot ↔ register mapping.
     //
     /// h_ptr slot (sourced from φ\[7\]; low 4 bytes flow into the

@@ -185,8 +185,8 @@ pub(in crate::chips::cpu) fn active_bytes<E: EvalAtRow>(eval: &mut E, trace_eval
     // and its active bytes are too.
     {
         let mem_size = crate::trace::trace_eval!(trace_eval, Column::MemSize);
-        // Per-byte MemByteActive boolean is enforced unconditionally in
-        // the control-flow helper block above.
+        // Per-byte MemByteActive is boolean on every row
+        // (`control::control_flow_helpers`).
         // Monotonicity.
         for i in 0..WORD_SIZE - 1 {
             eval.add_constraint(mem_byte_active_mono_h[i].clone());
@@ -419,9 +419,8 @@ pub(in crate::chips::cpu) fn indirect_address<E: EvalAtRow>(eval: &mut E, trace_
         let is_mem_indirect_local = crate::trace::trace_eval!(trace_eval, Column::IsMemIndirect);
         let mem_addr_carry = crate::trace::trace_eval!(trace_eval, Column::MemAddrCarry);
         let imm_bytes_local = crate::trace::trace_eval!(trace_eval, Column::ImmBytes);
-        // Per-byte mem_addr_carry boolean is enforced unconditionally
-        // in the residual helper block above (forcing the range even on
-        // non-indirect rows where the chain is dormant).
+        // Per-byte mem_addr_carry is boolean on every row
+        // (`row::shared_helpers`), even where the chain is dormant.
         // Add-with-carry chain (gated on is_mem_indirect).
         for i in 0..4 {
             let carry_in = if i == 0 {

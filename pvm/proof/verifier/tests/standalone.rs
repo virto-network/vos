@@ -1,10 +1,9 @@
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
+use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
 use vos_pvm_proof::pcs::PcsStack;
-// Memory is now flat_mem in Interpreter
-use vos_pvm::PVM_REGISTER_COUNT;
 
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{Proof, SideNote, prove};
@@ -353,7 +352,7 @@ fn standalone_verify_rejects_wrong_commitment() {
     );
 }
 
-// Phase 42: format_version is checked first, before any cryptographic
+// format_version is checked first, before any cryptographic
 // work.  A proof with a mismatched format_version (simulating a future-
 // AIR proof presented to today's verifier, or a deserialized older
 // proof that lacks the field — serde-default 0) is rejected immediately.
@@ -418,7 +417,7 @@ fn standalone_verify_rejects_format_version_mismatch() {
     );
 }
 
-// Phase 49: pcs_config policy floor.  A proof generated with a
+// pcs_config policy floor.  A proof generated with a
 // weaker PcsConfig (lower pow_bits / fewer FRI queries / smaller
 // blowup) than PcsPolicy::STANDARD must be rejected by the
 // default verify_standalone path before any cryptographic work.
@@ -510,7 +509,7 @@ fn standalone_verify_accepts_weak_pcs_config_with_relaxed_policy() {
     .expect("relaxed-policy verify must accept the weak proof");
 }
 
-// Phase 43: log_size cap test.  We don't need to forge a giant proof
+// log_size cap test.  We don't need to forge a giant proof
 // — just call the variant with an unrealistically tight cap and check
 // the early rejection fires.
 #[test]
@@ -548,7 +547,7 @@ fn standalone_verify_rejects_oversized_log_size() {
 
 #[test]
 fn standalone_verify_rejects_zero_format_version() {
-    // Pre-Phase-42 serialized proofs (which lack the field) deserialize
+    // Serialized proofs that lack the field deserialize
     // with serde default 0 → must be rejected.  Simulate by setting the
     // field to 0 directly.
     let code = vec![Opcode::Trap as u8];

@@ -1,5 +1,5 @@
-//! The first feasibility gate (`recursion-air.md` §10, step 4): COMPARE's
-//! leaf, and the window kernel leaf's rows.
+//! The leaves' feasibility (`recursion-air.md` §10): COMPARE's leaf, and
+//! the window kernel leaf's rows.
 //!
 //! - **COMPARE's leaf:** a chip-isolated COMPARE proof of format 35, verified
 //!   natively and in a circuit, the circuit proved and verified; its rows

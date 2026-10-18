@@ -5,7 +5,7 @@
 //! These mirror `ledger_readconsistency_gate.rs` / `blake2b_boundary_gate.rs`:
 //! build an HONEST single-chip component trace, tamper the finalized trace (or
 //! the listed page set) exactly as a from-scratch prover would, and assert the
-//! chip's AIR constraints REJECT it.  Each targets a distinct Phase-A soundness
+//! chip's AIR constraints REJECT it.  Each targets a distinct soundness
 //! property of the memory-root binding:
 //!
 //!   - entering-image (`ts=0` boundary write) forgery  → cross-row prev_value

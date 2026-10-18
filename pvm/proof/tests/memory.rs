@@ -2,7 +2,6 @@
 
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
-// Memory is now flat_mem in Interpreter
 use vos_pvm::{PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 
 use vos_pvm_proof::core::tracing::TracingPvm;

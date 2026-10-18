@@ -5,8 +5,7 @@
 //! These tests validate `prove_with_explicit_components` /
 //! `verify_with_explicit_components`: prove each chip's AIR in isolation
 //! and check the expected accept (self-balancing lookups) or open-chain
-//! reject (producer with no consumer in scope).  See
-//! `pvm/proof/STWO_PHASE_I_BLAKE2B.md` for background.
+//! reject (producer with no consumer in scope).
 //!
 //! The smoke test below uses only bound-1 chips (already at degree ≤ 2)
 //! on the lifted protocol.  If it fails, the harness wiring itself is

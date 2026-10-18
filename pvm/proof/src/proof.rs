@@ -29,210 +29,8 @@ pub use transcript::{
 /// format of [`crate::format`]. A proof's `format_version` names its entry
 /// there, and verifiers refuse a number the registry does not admit.
 ///
-/// History, before the registry, one number per build:
-///   1 — Rotate / BitManip / 32-bit-shift / Sbrk all bound;
-///       PROG_MEMORY_N_FLAGS = 48; 14 components.
-///   2 — `RegisterMemoryClosingChip` added at index 6,
-///       shifting every higher chip index by +1; closes the register-
-///       memory ledger by consuming a synthetic per-register read at
-///       `closing_ts = last_step.timestamp + 1`, pinning the final
-///       register COLUMN to the trace's true final register values.
-///       The FS-transcript also mixes `final_state.registers`, making
-///       a finished proof tamper-evident. (See the SCOPE note in
-///       `chips/register_memory_closing.rs`: the mix does NOT bind the
-///       separate metadata FIELD against a from-scratch prover.) Older
-///       proofs reject at the `format_version` gate.
-///   3 — FS-transcript also mixes
-///       `proof.initial_state.registers` (before the existing
-///       `final_state.registers` mix) — same tamper-evidence on the
-///       initial side; the boundary chip already commits `initial_regs`
-///       in its trace.
-///   4 — Boundary pc + timestamp join the FS mix (after the register
-///       mixes; order: initial regs, final regs, initial pc, initial
-///       ts, final pc, final ts). Their in-circuit commitments already
-///       existed — ProgramBoundaryChip commits (InitialPc,
-///       InitialTimestamp) and (FinalNextPc, FinalNextTimestamp),
-///       telescoped through CpuChip's program-execution relation. So
-///       the mix extends the SAME tamper-evidence the registers have to
-///       pc and timestamp; `verify_chain`'s whole-struct boundary
-///       equality stops comparing pure metadata for those fields.
-///       LIMITATION (shared with the register mix since v2): the mix is
-///       tamper-evidence, NOT a binding constraint — a from-scratch
-///       prover can still ship self-consistent boundary metadata that
-///       differs from the committed columns. True binding needs a
-///       boundary public-input constraint (the conservation-of-value
-///       chain-verification project). `memory_commitment` is weaker
-///       still — computed outside the circuit, not even mixed.
-///   5 — Boundary public-input binding (metadata→column): closes the
-///       v2–v4 metadata-vs-column gap. Verifiers recompute each boundary
-///       chip's logup claimed sum from `proof.{initial,final}_state`
-///       (registers, pc, timestamp) with the FS-drawn lookup elements
-///       and require equality with `proof.claimed_sums` — binding the
-///       metadata fields to the committed boundary COLUMNS. A
-///       from-scratch prover that commits honest columns and ships lying
-///       metadata is now rejected (gate: `tests/boundary_binding.rs`).
-///       pc/timestamp become genuine bound public inputs (their columns
-///       are pinned to the trace by CpuChip program-execution chaining).
-///       REGISTERS are bound metadata→column only: their column→trace
-///       link is `RegisterMemoryChip` read-consistency, which is NOT
-///       enforced cross-row (a separate, pre-existing gap — a malicious
-///       prover can still forge the closing read's value and hence the
-///       io-hash; see `chips/register_memory_closing.rs` and
-///       `docs/plans/roadmap.md`). No AIR change — the
-///       proof bytes an honest prover produces are unchanged apart from
-///       this version field; the bump exists because older verifiers
-///       ACCEPT metadata forgeries that v5 verifiers reject, and proofs
-///       over EMPTY traces (which bind nothing) now reject. The
-///       standalone verifier additionally requires `component_mask` to
-///       contain the three binding chips and to popcount-match
-///       `num_components`. `memory_commitment` remains outside the
-///       binding (no committed column; see `segment.rs`).
-///   6 — Register/RAM ledger read-consistency bound (closes the v5
-///       register column→trace gap). `RegisterMemoryChip` and `MemoryChip`
-///       gain a cross-row `prev_value` binding (`#[mask_next_row]`) and a
-///       `(key, ts)` sortedness range-check (self-contained 24-bit
-///       decomposition), and the register ledger tuple gains an `is_write`
-///       limb (17→18; CpuChip / boundary / closing producers + the verifier
-///       boundary-binding recompute updated). The B5 register read-run merge
-///       is disabled (one entry per row). So a from-scratch prover can no
-///       longer forge a register/RAM read — in particular the closing read
-///       that pins `final_state.registers` / the actor io-hash is now
-///       sound. AIR change: new columns + the wider register relation, so
-///       the proof bytes differ (gate: `tests/ledger_readconsistency_gate.rs`).
-///       `memory_commitment` is still outside the binding.
-///   7 — In-circuit RAM-image binding (closes the memory-continuity
-///       gap `memory_commitment` left open). RAM is committed as a page-keyed
-///       blake2b Merkle tree; per segment the prover proves a boundary
-///       multiproof binding the entering page images to `initial_state
-///       .memory_root` and the exit images to `final_state.memory_root`
-///       (`Memory{Page,Merkle,RootBoundary}Chip` + `Blake2bBoundaryChip`), and
-///       the RAM ledger forces every accessed address into a listed page
-///       (per-page ts=0 boundary write + closing read, group-start/end
-///       constraints). The roots join the FS mix and `MemoryRootBoundaryChip`'s
-///       claimed sum is bound to them closed-form (`boundary_binding`). So
-///       `verify_chain_standalone(proofs, commitment, expected_initial_root)`
-///       becomes sound for memory continuity, not only tamper-evident. New
-///       components (`COUNT` 28 → 31, `MemoryBoundaryChip` deleted), a wider
-///       `MemoryAccess` tuple (`is_closing`), and a new `MerkleNode` relation,
-///       so the proof bytes differ.
-///   8 — Ristretto memory-op `ts` binding (closes the
-///       money-path ts-forgery gap where the three ristretto memory producers
-///       set `ts` as a free witness). CpuChip gains five `Is{110..114}Ecall`
-///       gates that emit a `RistrettoCall` (RELATION A) producer + register
-///       reads (φ\[7,8,9\]) per ristretto ECALL step; RistrettoEcallChip moves
-///       to a uniform 96-row preprocessed period that consumes RELATION A at a
-///       preprocessed-pinned `InitGate` (so its block `ts` == the chained CpuChip
-///       step ts ∈ [initial_ts, final_ts), excluding 0 and `closing_ts`) and
-///       re-emits the anchored ts to the two comb chips via `RistrettoFixedScalarTs`
-///       / `RistrettoFixedOutTs` (Tier-2); the comb chips consume those and add
-///       intra-call ts/ptr equality + per-byte authenticated `Addr`. Three new
-///       relations, a wider CpuChip, and restructured ristretto chips — no new
-///       CHIPS (`COUNT` unchanged at 31) — so the proof bytes differ and older
-///       verifiers must reject.
-///   10 — Register/RAM ledger ordering deltas widen from 24 to 28 bits. The
-///        former hidden `2^24` timestamp ceiling made long software-arithmetic
-///        actor traces unprovable at their terminal segment. Twenty-eight bits
-///        cover the canonical 100M-gas actor-proof budget while remaining well
-///        below the M31 modulus, preserving the wrapped-negative rejection the
-///        sortedness proof relies on. AIR column counts change, so older
-///        verifiers must reject. Version 9 was already assigned to the
-///        Poseidon2-M31 PCS variant of format 8.
-///   12 — Gray Paper v0.8.0 unary-opcode table: removes the retired `sbrk`
-///        opcode and renumbers CountSetBits64 through ReverseBytes from
-///        102..=111 to 101..=110. Program identities and opcode-bound CPU
-///        traces change, so v10 native-channel proofs must be rejected.
-///        Version 11 was the Poseidon2-M31 PCS variant of format 10.
-///   13 — Poseidon2-M31 PCS variant of format 12.
-///   14 — ISA-profile-bound program memory. Every authenticated instruction
-///        tuple now carries the container-derived profile (standard v0.8 or
-///        frozen capability manifest), and opcode decoding uses that profile.
-///        This prevents valid service Tasks from being reinterpreted under
-///        the shifted v0.8 unary table during proof tracing. CpuChip and
-///        ProgramMemoryChip each gain one column/lookup limb.
-///   15 — Poseidon2-M31 PCS variant of format 14.
-///   16 — Standard host-call continuation and scalar-memory address binding.
-///        CpuChip commits whether a policy-supported ECALLI was acknowledged,
-///        constrains handled/cause PCs across segment boundaries, and binds the
-///        supported-call policy through ProgramMemory. ProgramMemory also
-///        authenticates the exact cryptographic precompile dispatch ID; every
-///        continued precompile row must select exactly that handler-call
-///        relation, while lifecycle/VOS stubs select none. This widens the
-///        program-memory tuple from 33 to 34 limbs. Standard load/store rows
-///        also prove that their full scalar range stays outside the protected
-///        low 64 KiB and does not wrap through 2^32. CPU/ProgramMemory columns
-///        and the program-memory lookup tuple change, so older proofs reject.
-///   17 — Poseidon2-M31 PCS variant of format 16.
-///   18 — Standard Refine proof-closure generation. Individual STARKs remain
-///        single-program machine-slice proofs; the new boundary bundle binds
-///        their exact outer/inner program identities, proof shapes, order,
-///        sparse memory states, and calls 9..=14 before/after transcript.
-///        Sparse entering images also replace the dense nearly-4-GiB Refine
-///        witness representation. Older proof/bundle combinations reject.
-///   19 — Poseidon2-M31 PCS variant of format 18.
-///   20 — Full PCS configuration is Fiat–Shamir-bound, including the lifting
-///        `Option` discriminant; proof-side verification also uses the exact
-///        AIR-derived lifted shape.
-///   21 — Poseidon2-M31 PCS variant of format 20.
-///   22 — Single ISA profile. The ISA-profile limb leaves CpuChip and the
-///        ProgramMemory preprocessed table (the program-memory tuple drops
-///        from 34 to 33 limbs), so program commitments change. A continued
-///        host call must select exactly one precompile relation; lifecycle
-///        stubs no longer continue. Older proofs reject.
-///   23 — Poseidon2-M31 PCS variant of format 22.
-///   24 — Dispatch-committed host-call policy. CpuChip drops the
-///        acknowledgment alias and the policy bit, which the committed
-///        precompile dispatch already implies; ProgramMemory drops the policy
-///        column (the program-memory tuple drops from 33 to 32 limbs), so
-///        program commitments change. Older proofs reject.
-///   25 — Poseidon2-M31 PCS variant of format 24.
-///   26–30 — the registry's ([`crate::format`]) on format 24's AIR: 26
-///        Poseidon2-M31 segments, 27 leaves and folds, 28 the wrap, 29
-///        device proofs, 30 credential proofs.
-///   31–34 — the registry's on the hardened segment AIR, which retires 24,
-///        26, 27 and 29 (28 and 30 prove other AIRs and keep their numbers).
-///        A run's ends and its witness input: a halting step continues at
-///        the halt address, so a segment's final pc is the halt address
-///        exactly when it ends at a halt; a kernel's witness-input call
-///        (0x401, dispatch 101) writes its count to φ7, at most φ8, and
-///        `WitnessInputChip` (index 13) writes exactly its bytes; the
-///        register ledger sorts a register's reads before its writes within
-///        a timestamp. The Ristretto and scalar chips removed: CpuChip drops
-///        its five `Is{110..114}Ecall` selectors, the eight chips and their
-///        eleven relations leave the AIR (`COUNT` 25, `BITWISE_AND_BYTE` at
-///        index 24) and ids 110–114 are no precompile. The AIR audit's
-///        hardening: MulChip and DivRemChip Range256-check every product
-///        byte, quotient and remainder byte, high half and carry their
-///        chains read, and booleanize the magnitude chains' carries, so each
-///        chain holds over the integers; DivRemChip pins the schoolbook's
-///        high half per operation (zero, signed correction with the
-///        `MIN / −1` overflow, or floor division for an arithmetic shift,
-///        flagged by the DivRem tuple's new `is_shar_r`, which flag byte 0's
-///        bit 3 commits in place of the implied `is_mul_upper`).
-///        Blake2bChip holds `IsReal` across a compression, refuses the
-///        trailing partial block, and derives its addresses by byte carries
-///        on every row. CpuChip: boolean add/sub and pc carries; a padding
-///        row's flag bytes zero, its flags and emission gates with them;
-///        equality bound both ways; signed min/max results; an 8-byte
-///        immediate store's high word (ImmYBytes and ProgramMemory's
-///        ImmYCanon carry 5 bytes, the program-memory tuple 37 limbs); a
-///        trap stays at its pc; ProgramMemory serves only instruction
-///        starts (a preprocessed IsInstruction); NextTimestamp
-///        range-checked; φ10's non-zeroness by its bytes' sum; 32-bit
-///        BLAKE2b pointers; the ImmAlt shifts' operand swap. The register
-///        ledger drops its merged read slots and starts each register's
-///        chain at its ts = 0 write. MemoryPageChip carries the program's
-///        layout as preprocessed regions and proves each page's permission,
-///        which MemoryChip enforces on every access. Program commitments
-///        change.
-///   35–37 — the registry's on the segment AIR without the columns and
-///        masks no constraint reads, which retires 31, 33 and 34. CpuChip
-///        drops `Gas` (the AIR proves no gas accounting), `RegAWritten`,
-///        `ShiftOp`, the unused limb of `PartNZTimesIndH`,
-///        `PartNZMsbTimesIndH`, `PartNZMsbLoTimesIndH`, `MemByteActiveMonoH`
-///        and `ValRPartNZTimesIndH`, and the next-row masks of `Timestamp`
-///        and `Pc`: 15 main columns and 27 samples. Segments (35) take 40
-///        queries and 24 bits of PoW; 36 is the legacy Blake2s format, 37
-///        the device format.
+/// What each format number changed: `docs/status.md`, "Proof format
+/// history".
 pub const PROOF_FORMAT_VERSION: u32 = crate::format::LEGACY_SEGMENT_NUMBER;
 
 /// Exact number of commitment trees in this generation of the Stwo proof:
@@ -276,7 +74,7 @@ pub struct SegmentState {
     pub timestamp: u64,
     pub registers: [u64; 13],
     pub memory_commitment: [u8; 32], // blake3(flat_mem); computed outside the circuit, unbound
-    /// Page-Merkle root of the RAM image AT THIS boundary (format v7):
+    /// Page-Merkle root of the RAM image AT THIS boundary:
     /// bound in-circuit by the boundary multiproof + `MemoryRootBoundaryChip`,
     /// so cross-segment continuity (`final_state == next.initial_state`)
     /// genuinely forces memory continuity.  A segment binds `initial_state
@@ -1081,10 +879,8 @@ pub const STANDARD_MIN_FRI_QUERIES: usize = 19;
 pub const STANDARD_MIN_FRI_LOG_BLOWUP: u32 = 4;
 
 // ── Mobile / low-latency policy ────────────────────────────────────
-// Track B: trades proof size for prove speed.
-// Target: low-power devices where the prove-time-vs-proof-size
-// curve favours faster prove.  ~2.5× faster than STANDARD on the
-// reference bench at log14, ~1.4× larger proof.
+// Trades proof size for prove speed, for low-power devices: about 2.5×
+// faster than STANDARD at log14, for a proof about 1.4× larger.
 
 /// PoW bits floor for the mobile policy (same as STANDARD —
 /// PoW-grind cost is fixed per prove and doesn't help mobile when

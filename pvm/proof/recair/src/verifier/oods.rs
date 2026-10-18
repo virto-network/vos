@@ -1,5 +1,5 @@
 //! OODS (`recursion-air.md` §4.5): the composition check through the
-//! compiled gates (slice 5's 5.9), as Stwo's verifier makes it.
+//! compiled gates (`recursion-air.md` §3), as Stwo's verifier makes it.
 //!
 //! - The compiled constraints at the sampled values, folded under the
 //!   composition coefficient as `PointEvaluationAccumulator` folds them,

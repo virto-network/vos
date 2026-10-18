@@ -19,7 +19,7 @@
 //!   next-row masks no constraint reads, and 32's leaves verify it. The
 //!   numbers that named its earlier forms are [`RETIRED`]: refused, and never
 //!   registered again. 24 to 27 and 29 named it before its hardening (the
-//!   witness input, the Ristretto chips removed, the AIR audit's fixes); 31,
+//!   witness input, the removal of the curve chips, the AIR audit's fixes); 31,
 //!   33 and 34 named the hardened form with those columns, 31 at 44 queries.
 //!   28, 30 and 32 prove the recursion AIR (`vos-recair-air`) and keep their
 //!   numbers.
@@ -29,11 +29,11 @@
 //!   word at a time, and its parameters are the proof's own under the 96-bit
 //!   conjectured floor.
 //! - **28, 30, 32, 35 and 37** use the lossless encodings
-//!   ([`Encoding::Lossless`]) and exactly their parameters. 30, 32 and 37 are
-//!   registered and refused until their AIRs and channels exist. 32's AIR and
-//!   channel exist: `vos-recair` proves and verifies its proofs natively,
-//!   pinning each circuit by its hash, and this registry refuses it, as no
-//!   verifier outside the recursion reads a leaf or a fold. 28 is admitted:
+//!   ([`Encoding::Lossless`]) and exactly their parameters. 30 and 37 are
+//!   registered and refused until their AIRs and channels exist. 32 is
+//!   registered and refused although its AIR and channel exist: `vos-recair`
+//!   proves and verifies its proofs natively, pinning each circuit by its
+//!   hash, and no verifier outside the recursion reads a leaf or a fold. 28 is admitted:
 //!   `vos-recair` proves the wrap on the fork's Blake2b-256 channel and
 //!   `vos-final-verifier` verifies it, fold step 3 reviewed in the fork. A
 //!   segment verifier takes only a segment format ([`admitted_segment`]).
@@ -58,8 +58,8 @@
 //!   [`crate::security`] counts 82.6 at 20 queries (80 needs 19). Batching is
 //!   not in a proof's bytes: a verifier sets it from the format
 //!   ([`Format::verifier_config`]).
-//! - **The wrap is unmasked** until slice 6: `masked` says what its proofs
-//!   are, and masking it is a format change.
+//! - **The wrap is unmasked:** `masked` says what its proofs are, and
+//!   masking it is a format change.
 //! - **The bit counts** are [`crate::security`]'s, at each entry's reference
 //!   shape; the verifier counts again at the proof's own shape and refuses a
 //!   proof below either floor.

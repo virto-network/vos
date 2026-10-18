@@ -41,9 +41,9 @@
 //!   (init_pc, init_ts) / (final_pc, final_ts) columns are pinned to the
 //!   trace by CpuChip's `#[mask_next_row]` program-execution chaining +
 //!   telescoping. So pc/timestamp are genuine bound public inputs.
-//! - **registers: fully bound (v6).** The
+//! - **registers: fully bound.** The
 //!   `RegisterMemory{Boundary,Closing}Chip` register columns are pinned
-//!   to the trace by `RegisterMemoryChip` read-consistency, which is now
+//!   to the trace by `RegisterMemoryChip` read-consistency, which is
 //!   sound against a from-scratch prover: a cross-row `#[mask_next_row]`
 //!   `prev_value` binding, a range-checked `(reg, ts)` sortedness gadget,
 //!   and an `is_write` tuple limb together force the closing read's value
@@ -55,13 +55,12 @@
 //!   binding entirely.
 //!
 //! A consequence of the closing-chip equality: a proof over an EMPTY
-//! trace (no steps, all-zero boundary metadata) is now rejected — the
+//! trace (no steps, all-zero boundary metadata) is rejected — the
 //! closing chip emits no tuples (claimed sum 0) while the expected sum
-//! over thirteen (r, 0, 0) tuples is non-zero. (Empty proofs previously
-//! verified: the boundary chip's thirteen (r, 0, 0) seeds were exactly
-//! cancelled by the ledger's ts=0 initial-write rows, so the relation
-//! balanced with no closing emissions; the closing-chip equality is what
-//! now rejects them. Empty traces assert nothing useful anyway.)
+//! over thirteen (r, 0, 0) tuples is non-zero. Without that equality the
+//! boundary chip's thirteen (r, 0, 0) seeds would cancel against the
+//! ledger's ts=0 initial-write rows, and the relation balance with no
+//! closing emissions.
 
 use alloc::vec::Vec;
 
@@ -115,7 +114,7 @@ pub struct BoundaryChipPositions {
     pub register_boundary: usize,
     pub register_closing: usize,
     pub program_boundary: usize,
-    /// Position of `MemoryRootBoundaryChip` (format v7), which
+    /// Position of `MemoryRootBoundaryChip`, which
     /// consumes the single root `MerkleNode` `(0, 0, initial_root, final_root)`.
     pub memory_root_boundary: usize,
 }

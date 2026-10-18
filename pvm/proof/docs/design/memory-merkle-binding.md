@@ -1,4 +1,4 @@
-# Phase A design: in-circuit Merkle binding of the RAM boundary (`initial_root`/`final_root`)
+# In-circuit Merkle binding of the RAM boundary (`initial_root`/`final_root`)
 
 Replaces the unbound `memory_commitment = blake3(flat image)` metadata with
 Merkle roots of the RAM that are **bound in-circuit**, so chain verification
@@ -202,10 +202,8 @@ as the shared touched-set function. Deletion fallout (review-enumerated):
 arrays, `chips/mod.rs` re-export, the per-address ts=0 injection block in
 `memory.rs`, the positional `debug_claimed_sums` name table, dead
 `side_note.num_initial_mem_entries`, and the explicit-components test
-harnesses (`chip_isolated.rs`, `comb_value_sweep.rs`,
-`ledger_readconsistency_gate.rs`, `memory*.rs`, `register_ledger_negative.rs`,
-`bitmanip.rs`, `control_flow.rs`, `prove_vos_actor.rs`) which must carry the
-new chip cluster wherever real memory traffic flows through a slice.
+harnesses, which must carry the new chip cluster wherever real memory
+traffic flows through a slice.
 
 ## 3. New chips
 
@@ -384,89 +382,3 @@ expected_initial_root)`:
 - mask missing any of the four new chips → REJECTED;
 - boundary-override harness (`prove_with_boundary_override`) extended to
   ship forged roots over honest columns → REJECTED.
-
-## Appendix A — Prerequisite step 0.2: ristretto mem-op ts binding
-
-**SUPERSEDED by the dedicated design `ristretto-ts-binding.md` (v4 — converged,
-adversarially validated over two rounds, implementation-ready). The multiplicity
-problem this appendix flags is solved there (universal anchor + kind-aware
-tier-2). Read that doc to implement; the notes below are kept for context.**
-
-**Status: NOT YET BUILT — design done (see `ristretto-ts-binding.md`).**
-
-### The gap (verified in code)
-
-The three ristretto-family memory producers emit `MemoryAccessLookupElements`
-tuples `(addr[4], value[1], ts[8], is_write[1])` whose **`ts` limbs are free
-witness columns** with no binding to a genuine ECALL step timestamp (contrast
-blake2b, which binds `CallTs` via `Blake2bCallLookupElements` carrying the
-step ts):
-- `RistrettoEcallChip` (`ristretto_ecall.rs:82-113`): only IsReal/IsWrite
-  booleans constrained; `ts` packed straight into the tuple.
-- `RistrettoCombScalarBoundaryChip` (`ristretto_comb_scalar_boundary.rs`):
-  free `Ts`.
-- `RistrettoCombCompressOutputChip` (`ristretto_comb_compress_output.rs`):
-  free `Ts`.
-
-A from-scratch prover sets a ristretto output-write tuple's `ts` to **0**
-(collides with the §2 per-page ts=0 boundary write → entry forgery) or to
-**closing_ts** (sorts just before the §2 closing read → exit forgery). With
-CpuChip step timestamps now chained (commit `515c5b4`), the fix only has to
-prove every ristretto mem-op ts is a genuine ristretto-ECALL step timestamp:
-that lands it in `[initial_ts, final_ts)`, excluding both 0 (`< initial_ts`,
-since `initial_ts ≥ 1`) and `closing_ts` (`= final_ts`, never a step ts).
-
-**Money-path relevance (verified):** all three chips are ACTIVE on the
-voucher/clerk conservation proof — cipher-clerk's Schnorr signatures and
-Pedersen commitments use fixed-basepoint mult (`crypto/sig.rs:54-63,91-122`,
-`crypto/commit.rs:36-50`), which routes through the comb family
-(`side_note.rs:530-538`, gated active at `lib.rs:411-415`), plus variable-base
-+ scalar_reduce_wide + scalar_binop through `RistrettoEcallChip`. So the fix
-must cover all three chips.
-
-### The mechanism (call relation, mirror of blake2b)
-
-A new `RistrettoCallLookupElements` relation carrying the ECALL step ts (and
-ideally the output_ptr, to also pin the address). CpuChip detects ristretto
-ECALL steps (imm ∈ the 5 ECALL ids — needs a new `IsRistrettoEcall` column +
-pointer snapshot columns, parallel to `IsBlakeEcall`/`Phi*`) and PRODUCES one
-tuple per ristretto ECALL step. The handling chip(s) CONSUME one per call.
-
-### The open problem (why it needs its own pass)
-
-The consumer multiplicity is split across chips by ECALL kind, and the split
-is **not derivable from the opcode**:
-- variable-base scalar_mult / point_add / scalar_reduce_wide / scalar_binop:
-  `RistrettoEcallChip` handles all 96 mem-ops (consumer count k = 1);
-- **fixed-base** scalar_mult: `RistrettoEcallChip` handles the 32 point reads,
-  `RistrettoCombScalarBoundaryChip` the 32 scalar reads,
-  `RistrettoCombCompressOutputChip` the 32 output writes (k = 3).
-
-`ECALL_RISTRETTO_SCALAR_MULT` covers both fixed and variable; fixed-vs-variable
-is decided at runtime by whether the point argument equals the basepoint
-(`tracing.rs:132-142`), which CpuChip cannot see. So CpuChip cannot emit a
-per-step multiplicity of "k chips will consume this call." Candidate
-resolutions to evaluate in the dedicated pass:
-1. **Universal anchor:** `RistrettoEcallChip` handles ≥ the input/point reads
-   of EVERY ristretto call, so CpuChip produces +1 per ristretto ECALL step
-   and `RistrettoEcallChip` consumes −1 per call (clean 1:1). The comb chips'
-   ts is then bound **separately** by threading a ts limb through the existing
-   comb cross-chip relations (`RistrettoCombScalarBoundary`,
-   `RistrettoCombCompressOutput`) so their ts is forced equal to a value the
-   anchor/comb chain already vouches for — needs verifying those relations'
-   producers are themselves ts-bound (avoid circularity: both ends read
-   side_note today).
-2. **Per-role relations** keyed by output_ptr / a role discriminator so each
-   chip consumes a distinct tuple and CpuChip produces all of them — but
-   CpuChip still can't tell which roles exist for a SCALAR_MULT step.
-3. **Intra-call ts-equality prerequisite:** whichever option, confirm each
-   chip forces all rows of one call block to share a single `Ts` (mask-next-row
-   within the block) — else binding one row per call leaves the other 95 free.
-
-### Deliverables for the dedicated pass
-
-Deep-read the exact row/call-block layout + call-boundary preprocessed signals
-of all three chips and the comb cross-chip relations; pick a resolution;
-adversarially review it (free-ts entry/exit forgery REJECTED; honest money
-path still balances); validate with the ristretto chip-isolated tests + a
-`voucher_check_smoke` prove/verify (207s). Format bump folds into v7.

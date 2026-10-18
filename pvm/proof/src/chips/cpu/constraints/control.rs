@@ -118,8 +118,7 @@ pub(in crate::chips::cpu) fn next_pc<E: EvalAtRow>(eval: &mut E, trace_eval: &Tr
         );
     }
 
-    // branch_taken boolean is enforced unconditionally in the
-    // control-flow helper block above.
+    // branch_taken is boolean on every row (`control_flow_helpers`).
 }
 
 /// The branch conditions, and the sequential next PC.

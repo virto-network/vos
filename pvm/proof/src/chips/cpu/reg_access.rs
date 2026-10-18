@@ -152,9 +152,10 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     // blake2b ECALL reads φ[7], φ[8], φ[9], φ[10] at this step's
     // ts.  The actor's a0/a1/a2/a3 (h_ptr/m_ptr/
     // t_low/f_flag) map to PVM φ[7/8/9/10] via grey-transpiler's
-    // `map_register`.  CpuChip's `ECALL_REG_IDXS` (in `mod.rs` and
-    // `interaction.rs`) emits register-file producers at [10, 7, 8, 9]
-    // — matching this ledger consumer per blake2b ECALL step.
+    // `map_register`.  CpuChip's `ECALL_REG_IDXS` (in
+    // `constraints/host_call.rs` and `interaction.rs`) emits register-file
+    // producers at [10, 7, 8, 9] — matching this ledger consumer per blake2b
+    // ECALL step.
     // ECALL register-read ledger consumers.
     // These must match the producers CpuChip emits gated by the matching
     // Is*Ecall column, otherwise the register-memory logup balance breaks.

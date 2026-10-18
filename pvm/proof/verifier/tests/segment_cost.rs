@@ -1,5 +1,5 @@
-//! Measure the two goal-metrics for a *single light
-//! segment* (Track A's unit of work, and one inner proof of Track B):
+//! Measure the two costs of a *single light segment* (a direct on-chain
+//! proof's unit of work, and one leaf of a recursive run):
 //!   1. VERIFY COST — serialized proof size (bincode, the on-wire format) +
 //!      native `verify_standalone` wall-time.
 //!   2. LIGHT-LEAF PROVE PEAK RAM — `VmHWM` (peak resident set) of one
@@ -16,10 +16,10 @@
 //! `SimdBackend`. The harness prints which it ran.
 //!
 //! Run (one measurement per process so `VmHWM` is clean):
-//!   STEPS=7    cargo test -p vos-pvm-proof-verifier --release --test measure_finish_line \
+//!   STEPS=7    cargo test -p vos-pvm-proof-verifier --release --test segment_cost \
 //!                measure -- --exact --nocapture
 //!   STEPS=7 FORMAT=35 cargo test -p vos-pvm-proof-verifier --release \
-//!                --test measure_finish_line measure -- --exact --nocapture
+//!                --test segment_cost measure -- --exact --nocapture
 
 use std::time::Instant;
 
@@ -77,8 +77,8 @@ fn measure() {
     // The memory chip commits one row per 256-byte page, so the initial memory
     // size sets the memory commitment's log_size (4 MiB = 16384 pages = log14)
     // and, for a compute-light program, the whole proof. `MEM_KIB` knobs it so
-    // a low-memory program (the realistic Track-A case) can be measured apart
-    // from the memory floor. Default 4096 KiB matches the original harness.
+    // a low-memory program can be measured apart from the memory floor.
+    // Default 4096 KiB.
     let mem_kib: usize = std::env::var("MEM_KIB")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -106,9 +106,9 @@ fn measure() {
     let mut sn = SideNote::new(trace, code, bitmask).with_memory(initial_memory);
 
     // SHAPE=natural → `prove_format` (only the chips this trace activates, at
-    // natural sizes — the Track-A direct-on-chain path, which does NOT recurse
-    // and so needs no full canonical shape). Default → `prove_canonical_format`
-    // (all chips forced, the Track-B / federation-allowlist shape).
+    // natural sizes — the direct on-chain path, which does NOT recurse and so
+    // needs no full canonical shape). Default → `prove_canonical_format` (all
+    // chips forced, the shape a recursive run's leaves take).
     let natural = std::env::var("SHAPE").as_deref() == Ok("natural");
     let shape = if natural { "natural" } else { "canonical" };
 

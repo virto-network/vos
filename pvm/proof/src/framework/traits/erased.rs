@@ -84,7 +84,7 @@ pub trait MachineProverComponent: MachineComponent {
     fn generate_component_trace_immut(&self, side_note: &SideNote) -> ComponentTrace;
 
     /// Canonical-shape variant of `generate_component_trace` threading a
-    /// per-chip `min_log_size` floor (federation wire-through W0; see
+    /// per-chip `min_log_size` floor (see
     /// `BuiltInProverComponent::generate_main_trace_min`).  The
     /// preprocessed trace is built at the (possibly forced) main `log_size`,
     /// so a forcing-set chip's preprocessed columns track the canonical

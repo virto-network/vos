@@ -1,7 +1,7 @@
 //! The format registry at the verifier: every admitted format round-trips
 //! and verifies in one build, a proof is refused under another format than
 //! its own, the interaction PoW is checked, and a proof below a floor is
-//! refused. Format 31 proves on the Poseidon2-M31 channel, its PoW and
+//! refused. Format 35 proves on the Poseidon2-M31 channel, its PoW and
 //! interaction PoW ground on `SimdBackend`.
 
 use std::sync::OnceLock;

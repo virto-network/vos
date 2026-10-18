@@ -1,4 +1,4 @@
-//! Step 5.8's gates: the degree audit, a three-component multi-fraction
+//! The recursion AIR's gates: the degree audit, a three-component multi-fraction
 //! logup at three log sizes, and a 10k-gate circuit.
 
 mod common;

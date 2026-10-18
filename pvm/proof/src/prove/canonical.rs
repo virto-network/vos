@@ -15,7 +15,7 @@ use crate::pcs::PcsStack;
 use crate::proof::Proof;
 use crate::side_note::SideNote;
 
-/// Canonical-shape proving (federation wire-through W0).
+/// Canonical-shape proving.
 ///
 /// Proves with the FULL `BASE_COMPONENTS` set present (constant
 /// `component_mask`, all [`chip_idx::COUNT`](crate::chip_idx::COUNT) bits) and
@@ -181,7 +181,7 @@ pub fn prove_chain_format(
     Some((profile, proofs))
 }
 
-/// Canonical-shape profiling (federation wire-through W0): the NATURAL
+/// Canonical-shape profiling: the NATURAL
 /// (unforced) main-trace `log_size` each of the given components would use for
 /// `side_note`. The per-segment max of these over a full trace is the
 /// `min_log_size` profile `prove_canonical` pads to (so every segment's forced
