@@ -9,8 +9,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use vos_final_verifier::PUBLIC_WORDS;
 use vos_pvm::refine_host::{JamItem, JamRefine, Preimages, RefineContext};
+use vos_pvm_final_verifier::PUBLIC_WORDS;
 use vos_statement::model::Input;
 
 /// The guest's verdicts.

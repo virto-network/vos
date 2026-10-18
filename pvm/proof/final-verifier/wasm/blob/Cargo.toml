@@ -8,7 +8,7 @@
 # Its own workspace: stwo resolves verify-only. Build with
 # `cargo build --release` here; `../run` measures it.
 [package]
-name = "vos-final-verifier-wasm"
+name = "vos-pvm-final-verifier-wasm"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
@@ -18,7 +18,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-vos-final-verifier = { path = "../.." }
+vos-pvm-final-verifier = { path = "../.." }
 vos-statement = { path = "../../../statement" }
 
 [profile.release]

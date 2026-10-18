@@ -17,7 +17,7 @@
 //! the claimed sums, `u`'s use and each output's add to zero; then Stwo's
 //! protocol, as a segment's ([`verify_rest`]).
 //!
-//! **The circuit hash** ([`circuit_hash`]) is [`vos_recair_air::circuit_hash`]
+//! **The circuit hash** ([`circuit_hash`]) is [`vos_pvm_recair_air::circuit_hash`]
 //! in rows: one transcript absorption, from the zero digest, of the format's
 //! constant words and the preprocessed root's wires.
 
@@ -36,8 +36,8 @@ use vos_pvm_proof::framework_access::{AllLookupElements, air_layout};
 use vos_pvm_proof::poseidon2::{P2MerkleChannel, Poseidon2M31Channel};
 use vos_pvm_proof::proof::{check_format_security, check_interaction_pow, mix_statement_header};
 use vos_pvm_proof::{RecursionData, SampleLayout, sample_layout_of};
-use vos_recair_air::gate::{FIRST_OUTPUT_ADDRESS, GATE_WIDTH, U_ADDRESS};
-use vos_recair_air::{Components, GateRelation, LogSizes, h8, p2, qm31};
+use vos_pvm_recair_air::gate::{FIRST_OUTPUT_ADDRESS, GATE_WIDTH, U_ADDRESS};
+use vos_pvm_recair_air::{Components, GateRelation, LogSizes, h8, p2, qm31};
 
 use crate::circuit::Qm31Op;
 use crate::compile::{self, Recording};
@@ -355,7 +355,7 @@ pub fn verify_child<V: Value>(
 }
 
 /// The circuit hash of a format-32 circuit at `log_sizes` whose
-/// preprocessed root is the wires `root`: [`vos_recair_air::circuit_hash`]'s
+/// preprocessed root is the wires `root`: [`vos_pvm_recair_air::circuit_hash`]'s
 /// one absorption, its constant words then the root's.
 pub fn circuit_hash<V: Value>(
     context: &mut Context<V>,
@@ -363,7 +363,7 @@ pub fn circuit_hash<V: Value>(
     root: [Var; 2],
 ) -> [Var; 2] {
     let prefix: Vec<BaseField> =
-        vos_recair_air::circuit_hash_prefix(FORMAT.number, hashed_params(FORMAT), log_sizes)
+        vos_pvm_recair_air::circuit_hash_prefix(FORMAT.number, hashed_params(FORMAT), log_sizes)
             .iter()
             .map(|word| BaseField::from(word.value()))
             .collect();

@@ -18,9 +18,9 @@ use stwo::prover::backend::simd::qm31::PackedSecureField;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo_constraint_framework::LogupTraceGenerator;
-use vos_recair_air::gate::GateRelation;
-use vos_recair_air::p2::{self, P2Mode};
-use vos_recair_air::{h8, qm31};
+use vos_pvm_recair_air::gate::GateRelation;
+use vos_pvm_recair_air::p2::{self, P2Mode};
+use vos_pvm_recair_air::{h8, qm31};
 
 use crate::circuit::{Circuit, Entry, signed};
 use crate::context::Witness;

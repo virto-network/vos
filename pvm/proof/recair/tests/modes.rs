@@ -8,15 +8,15 @@ use stwo::core::fields::qm31::SecureField;
 use vos_pvm_poseidon2::{
     LeafSponge, M31, N_STATE, Observer, PermKind, Transcript, compress, u64_limbs,
 };
-use vos_recair::gadgets::{TranscriptGadget, leaf_hash, node};
-use vos_recair::trace::MainTrace;
-use vos_recair::{Context, Finalized, Message, P2Mode, circuit_commitment, prove, verify};
-use vos_recair_air::{p2, qm31};
+use vos_pvm_recair::gadgets::{TranscriptGadget, leaf_hash, node};
+use vos_pvm_recair::trace::MainTrace;
+use vos_pvm_recair::{Context, Finalized, Message, P2Mode, circuit_commitment, prove, verify};
+use vos_pvm_recair_air::{p2, qm31};
 
 use common::{Rng, digest_wires, pack, words};
 
 /// The digest wires' values of a handle.
-fn digest_of(context: &Context<SecureField>, digest: [vos_recair::Var; 2]) -> [SecureField; 2] {
+fn digest_of(context: &Context<SecureField>, digest: [vos_pvm_recair::Var; 2]) -> [SecureField; 2] {
     digest.map(|var| context.value(var))
 }
 
@@ -159,7 +159,7 @@ fn refusal(
     tamper: impl FnOnce(&mut MainTrace),
 ) -> Option<String> {
     let (_, hash) = circuit_commitment(&finalized.circuit).expect("the wiring checks");
-    match vos_recair::prove::prove_with(&finalized.circuit, &finalized.witness, tamper) {
+    match vos_pvm_recair::prove::prove_with(&finalized.circuit, &finalized.witness, tamper) {
         Err(error) => Some(format!("prover: {error:?}")),
         Ok(proof) => verify(proof, &hash).err().map(|error| error.to_string()),
     }
@@ -328,7 +328,7 @@ fn an_h8_tamper_is_refused() {
     context.add(sink, sink);
     let finalized = context.finalize().unwrap();
     assert!(!refused(&finalized, |_| {}), "the honest trace proves");
-    use vos_recair_air::h8::main;
+    use vos_pvm_recair_air::h8::main;
     // Row 1: its accumulator is row 0's output, a wire; moving it and the
     // output by `μ` times as much keeps the row's constraints.
     let row = 1;
@@ -356,13 +356,14 @@ fn an_h8_tamper_is_refused() {
 }
 
 fn finalized_column(finalized: &Finalized<SecureField>, column: usize, row: usize) -> BaseField {
-    vos_recair::trace::main_trace(&finalized.circuit, &finalized.witness).columns[2][column][row]
+    vos_pvm_recair::trace::main_trace(&finalized.circuit, &finalized.witness).columns[2][column]
+        [row]
 }
 
-type Tamper = Box<dyn Fn(&mut vos_recair::RecairProof)>;
+type Tamper = Box<dyn Fn(&mut vos_pvm_recair::RecairProof)>;
 
 /// A small circuit over every component, its hash, and an honest proof.
-fn honest_proof() -> (vos_pvm_poseidon2::Digest, vos_recair::RecairProof) {
+fn honest_proof() -> (vos_pvm_poseidon2::Digest, vos_pvm_recair::RecairProof) {
     let mut context = Context::<SecureField>::with_outputs(1);
     let a = context.guess(SecureField::from_u32_unchecked(5, 6, 7, 8));
     let b = context.mul(a, a);
@@ -389,8 +390,8 @@ const OODS_MISMATCH: &str = "OODS value does not match the trace OODS values";
 /// the same the edit reaches Stwo's own checks.
 fn past_the_query_count(
     hash: &vos_pvm_poseidon2::Digest,
-    proof: &vos_recair::RecairProof,
-    edit: impl Fn(&mut vos_recair::RecairProof, SecureField),
+    proof: &vos_pvm_recair::RecairProof,
+    edit: impl Fn(&mut vos_pvm_recair::RecairProof, SecureField),
 ) -> String {
     for k in 1..=256 {
         let mut tampered = proof.clone();

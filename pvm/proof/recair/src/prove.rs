@@ -2,7 +2,7 @@
 //! under format 32 (`vos_pvm_proof::format::LEAF_FOLD`), the recursion AIR's
 //! format for leaves and folds, at its exact parameters; and proving under
 //! any format of the recursion AIR on its channel ([`prove_on`]), the wrap's
-//! (28) on Blake2b-256, which `vos-final-verifier` verifies.
+//! (28) on Blake2b-256, which `vos-pvm-final-verifier` verifies.
 //!
 //! **The transcript**, as the prover runs it and the verifier replays it:
 //! 1. the proof's domain, the format and the PCS configuration, then the
@@ -16,7 +16,7 @@
 //!    protocol.
 //!
 //! The verifier pins the circuit by its hash
-//! ([`vos_recair_air::circuit_hash`]), which binds the preprocessed root, the
+//! ([`vos_pvm_recair_air::circuit_hash`]), which binds the preprocessed root, the
 //! log sizes and the format's parameters.
 
 use num_traits::Zero;
@@ -40,8 +40,8 @@ use vos_pvm_proof::proof::{
     PROOF_COMMITMENT_TREE_COUNT, check_format_security, check_interaction_pow,
     mix_statement_header,
 };
-use vos_recair_air::gate::{GATE_WIDTH, Layout, public_logup_sum};
-use vos_recair_air::{
+use vos_pvm_recair_air::gate::{GATE_WIDTH, Layout, public_logup_sum};
+use vos_pvm_recair_air::{
     Components, GateRelation, LOG_CONSTRAINT_EXPANSION, LogSizes, preprocessed_log_sizes,
 };
 
@@ -122,7 +122,7 @@ fn digest_of_root(root: &P2Hash) -> Digest {
 
 /// The hash of a circuit whose preprocessed tree has `root`, at `log_sizes`.
 pub fn circuit_hash_of(log_sizes: &LogSizes, root: &P2Hash) -> Digest {
-    vos_recair_air::circuit_hash(
+    vos_pvm_recair_air::circuit_hash(
         FORMAT.number,
         hashed_params(FORMAT),
         log_sizes,

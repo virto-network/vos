@@ -15,10 +15,10 @@ use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::framework_access::{AllLookupElements, draw_all_lookup_elements};
 use vos_pvm_proof::poseidon2::{P2Hash, PermKind, Poseidon2M31Channel};
 use vos_pvm_proof::{chip_idx, sample_layout};
-use vos_recair::compile::{self, Recording};
-use vos_recair::leaf::{LeafCircuit, LeafValues, State};
-use vos_recair::verifier::SegmentShape;
-use vos_recair::{Context, NoValue};
+use vos_pvm_recair::compile::{self, Recording};
+use vos_pvm_recair::leaf::{LeafCircuit, LeafValues, State};
+use vos_pvm_recair::verifier::SegmentShape;
+use vos_pvm_recair::{Context, NoValue};
 
 /// The relations `mask`'s chips draw, by name, in draw order.
 fn drawn(mask: u32) -> (Vec<String>, AllLookupElements) {
@@ -124,7 +124,7 @@ fn the_tables_are_the_airs() {
             "{name}"
         );
     }
-    assert_eq!(leaf::PADDED, vos_recair::leaf::PADDED_ROWS);
+    assert_eq!(leaf::PADDED, vos_pvm_recair::leaf::PADDED_ROWS);
     assert_eq!(SEGMENT.params.n_queries, leaf::QUERIES);
     assert_eq!(SEGMENT.params.log_blowup, 2);
     assert_eq!(SEGMENT.params.fold_step, 1);

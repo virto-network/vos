@@ -1,5 +1,5 @@
 //! Fuzz target: the golden wrap mutated, by its bytes and by its structure,
-//! then verified against its public words (`vos_final_verifier::verify`
+//! then verified against its public words (`vos_pvm_final_verifier::verify`
 //! and `verify_bytes`).
 //!
 //! The input is a list of mutations ([`Mutation`], `arbitrary`): byte flips,
@@ -30,7 +30,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::line::LinePoly;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
-use vos_final_verifier::WrapProof;
+use vos_pvm_final_verifier::WrapProof;
 
 /// Where in the proof a structural mutation lands.
 #[derive(Arbitrary, Debug, Clone, Copy)]
@@ -330,18 +330,18 @@ fn apply_bytes(bytes: &mut Vec<u8>, mutation: &Mutation) {
 
 fuzz_target!(|mutations: Vec<Mutation>| {
     let golden = golden::golden();
-    let mut proof: WrapProof = vos_final_verifier::decode(&golden.proof).expect("decodes");
+    let mut proof: WrapProof = vos_pvm_final_verifier::decode(&golden.proof).expect("decodes");
     for mutation in &mutations {
         apply(&mut proof, mutation);
     }
-    if vos_final_verifier::verify(proof.clone(), &golden.words).is_ok() {
+    if vos_pvm_final_verifier::verify(proof.clone(), &golden.words).is_ok() {
         golden.assert_is_golden(&proof);
     }
     let mut bytes = postcard::to_allocvec(&proof).expect("encodes");
     for mutation in &mutations {
         apply_bytes(&mut bytes, mutation);
     }
-    if vos_final_verifier::verify_bytes(&bytes, &golden.words).is_ok() {
-        golden.assert_is_golden(&vos_final_verifier::decode(&bytes).expect("decodes"));
+    if vos_pvm_final_verifier::verify_bytes(&bytes, &golden.words).is_ok() {
+        golden.assert_is_golden(&vos_pvm_final_verifier::decode(&bytes).expect("decodes"));
     }
 });

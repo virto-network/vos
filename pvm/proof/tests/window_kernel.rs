@@ -595,7 +595,7 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
     let kernel = run(&instance.arguments.encode());
     let trace = traced(&kernel);
     let ((program, entry), elapsed, peak) = common::measured(|| {
-        vos_recair::leaf::kernel_program(
+        vos_pvm_recair::leaf::kernel_program(
             &kernel.blob,
             &kernel.record,
             vos_pvm_compiler::TRANSPILER_VERSION,
@@ -613,7 +613,7 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
     let bounds =
         segment_bounds_budgeted(&trace.side_note, 1 << cut.log_steps, usize::from(cut.pages));
     let last = bounds.len() - 1;
-    let fold = vos_recair::fold::FoldCircuit::new();
+    let fold = vos_pvm_recair::fold::FoldCircuit::new();
     let (word, elapsed, _) = common::measured(|| fold.hash());
     eprintln!("the fold circuit's hash in {:.1}s", elapsed.as_secs_f64());
     let mut cursor = SegmentCursor::new(&trace.side_note);
@@ -699,7 +699,7 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
 /// carried up, to one root stating the whole run (its entry, its halt, its
 /// io-hash); the root wrapped under format 28 on the Blake2b-256 channel
 /// within 2^17 rows and 8 GiB of heap, and verified by
-/// `vos-final-verifier`, its statement the program's id and the run's
+/// `vos-pvm-final-verifier`, its statement the program's id and the run's
 /// io-hash. The window's `vos_statement::Statement` (rootless, so of no
 /// space: its space and anchors are in its output, which no venue checks;
 /// its handler must) recomputes that io-hash, and a venue pinning the
@@ -712,7 +712,7 @@ fn the_window_wraps() {
     let instance = instance();
     let kernel = run(&instance.arguments.encode());
     let trace = traced(&kernel);
-    let (program, entry) = vos_recair::leaf::kernel_program(
+    let (program, entry) = vos_pvm_recair::leaf::kernel_program(
         &kernel.blob,
         &kernel.record,
         vos_pvm_compiler::TRANSPILER_VERSION,
@@ -722,8 +722,8 @@ fn the_window_wraps() {
     let cut = &program.shape.classes[CUT];
     let bounds =
         segment_bounds_budgeted(&trace.side_note, 1 << cut.log_steps, usize::from(cut.pages));
-    let fold = vos_recair::fold::FoldCircuit::new();
-    let word = vos_recair::fold::FoldCircuit::word();
+    let fold = vos_pvm_recair::fold::FoldCircuit::new();
+    let word = vos_pvm_recair::fold::FoldCircuit::word();
     let started = Instant::now();
     let mut cursor = SegmentCursor::new(&trace.side_note);
     let mut nodes: Vec<common::NodeRun> = (0..bounds.len())

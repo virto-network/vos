@@ -13,8 +13,8 @@
 //! selectors, addresses and multiplicities. Every constraint is of degree at
 //! most 3, and each component finalizes its fractions in pairs.
 //!
-//! The crate is `no_std` and depends on no prover: the prover (`vos-recair`)
-//! and the final verifier (`vos-final-verifier`) share it.
+//! The crate is `no_std` and depends on no prover: the prover (`vos-pvm-recair`)
+//! and the final verifier (`vos-pvm-final-verifier`) share it.
 
 #![no_std]
 

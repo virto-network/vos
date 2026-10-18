@@ -1,4 +1,4 @@
-//! The wrap circuit's constants, pinned: `vos-recair`'s wrap test computes
+//! The wrap circuit's constants, pinned: `vos-pvm-recair`'s wrap test computes
 //! them from the circuit and refuses a change here that is not the
 //! circuit's.
 

@@ -1,6 +1,6 @@
 //! The final wrap (`proving.md` §3.5, A.3; `recursion-air.md` §7): a 1-to-1
 //! node over a tree's root, proved under format 28 on the Blake2b-256
-//! channel, which `vos-final-verifier` verifies against 24 public words.
+//! channel, which `vos-pvm-final-verifier` verifies against 24 public words.
 //!
 //! **What it checks of the root,** a node of the padded shape (format 32), a
 //! fold's or, for a run of one segment, a leaf's:
@@ -32,11 +32,11 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
-use vos_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
+use vos_pvm_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
 use vos_pvm_proof::format::WRAP;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{ID_WORDS, IdPreimage};
-use vos_recair_air::gate::Layout;
+use vos_pvm_recair_air::gate::Layout;
 
 use crate::context::{Context, Finalized, Var};
 use crate::fold::child::ChildShape;
@@ -53,7 +53,7 @@ use crate::verifier::witness::{digest_wires, pack};
 
 /// The wrap's reserved wires: its 24 public words at 0–23, then zero, one
 /// and `u`.
-pub const LAYOUT: Layout = vos_final_verifier::LAYOUT;
+pub const LAYOUT: Layout = vos_pvm_final_verifier::LAYOUT;
 
 /// The wrap circuit: its constants are the root's shape and `H_fold`.
 pub struct WrapCircuit {
@@ -153,7 +153,7 @@ impl WrapCircuit {
     }
 
     /// Its preprocessed tree's root on format 28's Blake2b-256 trees: what
-    /// `vos-final-verifier` pins.
+    /// `vos-pvm-final-verifier` pins.
     pub fn preprocessed_root(&self) -> Blake2bHash {
         crate::prove::preprocessed_root_on::<Blake2bMerkleChannel>(&WRAP, &self.topology().circuit)
             .expect("the wrap's wiring checks")

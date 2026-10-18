@@ -20,8 +20,8 @@ use vos_pvm_proof::{
     PcsPolicy, Proof, RecursionData, SideNote, chip_idx, extract_recursion_data,
     prove_chip_isolated_format, verify_with_explicit_components,
 };
-use vos_recair::verifier::{SegmentShape, SegmentValues, verify_segment};
-use vos_recair::{Bit, Context, NoValue, Value};
+use vos_pvm_recair::verifier::{SegmentShape, SegmentValues, verify_segment};
+use vos_pvm_recair::{Bit, Context, NoValue, Value};
 
 // ── COMPARE's leaf ─────────────────────────────────────────────────────────
 
@@ -125,7 +125,7 @@ fn compares_leaf_verifies_proves_and_verifies() {
         let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
         assert_eq!(
             *permutation,
-            vos_recair::value::wires_of(words),
+            vos_pvm_recair::value::wires_of(words),
             "permutation {i}"
         );
     }
@@ -148,11 +148,11 @@ fn compares_leaf_verifies_proves_and_verifies() {
 
     let finalized = context.finalize().expect("the wiring checks");
     let started = std::time::Instant::now();
-    let proof = vos_recair::prove(&finalized.circuit, &finalized.witness).expect("proves");
+    let proof = vos_pvm_recair::prove(&finalized.circuit, &finalized.witness).expect("proves");
     let proving = started.elapsed();
-    let (_, hash) = vos_recair::circuit_commitment(&finalized.circuit).unwrap();
+    let (_, hash) = vos_pvm_recair::circuit_commitment(&finalized.circuit).unwrap();
     let started = std::time::Instant::now();
-    vos_recair::verify(proof, &hash).expect("verifies");
+    vos_pvm_recair::verify(proof, &hash).expect("verifies");
     eprintln!(
         "COMPARE's leaf, padded to 2^{:?}: proved in {:.3}s, verified in {:.3}s",
         finalized.circuit.log_sizes(),
@@ -235,11 +235,11 @@ fn compares_leaf_refuses_each_tamper() {
     let mut context = Context::<SecureField>::new().lenient();
     verify_segment(&mut context, &compare.shape, &values);
     let finalized = context.finalize().expect("the wiring checks");
-    let refused = match vos_recair::prove(&finalized.circuit, &finalized.witness) {
+    let refused = match vos_pvm_recair::prove(&finalized.circuit, &finalized.witness) {
         Err(_) => true,
         Ok(proof) => {
-            let (_, hash) = vos_recair::circuit_commitment(&finalized.circuit).unwrap();
-            vos_recair::verify(proof, &hash).is_err()
+            let (_, hash) = vos_pvm_recair::circuit_commitment(&finalized.circuit).unwrap();
+            vos_pvm_recair::verify(proof, &hash).is_err()
         }
     };
     assert!(refused, "a tampered witness proves and verifies");

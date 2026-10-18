@@ -317,16 +317,16 @@ fn the_fixtures_are_judged() {
 ///   repeat check reads.
 mod statements {
     use stwo::core::fields::qm31::SecureField;
-    use vos_final_verifier::WrapProof;
     use vos_pvm::instruction::Opcode;
+    use vos_pvm_final_verifier::WrapProof;
     use vos_pvm_proof::format::SEGMENT;
     use vos_pvm_proof::kernel::trace_kernel;
     use vos_pvm_proof::program_id::{KernelEntry, KernelProgram};
     use vos_pvm_proof::prove_shaped;
     use vos_pvm_proof::segment::SegmentCursor;
-    use vos_recair::Context;
-    use vos_recair::fold::{FoldCircuit, Proved};
-    use vos_recair::wrap::{self, WrapCircuit};
+    use vos_pvm_recair::Context;
+    use vos_pvm_recair::fold::{FoldCircuit, Proved};
+    use vos_pvm_recair::wrap::{self, WrapCircuit};
     use vos_statement::fixtures::{CASES, Case, Patch};
     use vos_statement::model::{Input, Policy};
     use vos_statement::{FORMAT, ProgramId, RootRead, SpaceId, Statement, StatementId};
@@ -406,7 +406,7 @@ mod statements {
     pub fn generate() -> Vec<(String, Vec<u8>)> {
         let base = statement();
         let blob = kernel(&base.io_hash());
-        let (program, entry): (KernelProgram, KernelEntry) = vos_recair::leaf::kernel_program(
+        let (program, entry): (KernelProgram, KernelEntry) = vos_pvm_recair::leaf::kernel_program(
             &blob,
             &record(&blob),
             vos_pvm_compiler::TRANSPILER_VERSION,

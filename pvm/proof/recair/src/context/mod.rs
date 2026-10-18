@@ -47,8 +47,8 @@ use std::collections::{BTreeMap, HashMap};
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
-use vos_recair_air::gate::{Layout, U_VALUE};
-use vos_recair_air::p2::P2Mode;
+use vos_pvm_recair_air::gate::{Layout, U_VALUE};
+use vos_pvm_recair_air::p2::P2Mode;
 
 use crate::circuit::{Circuit, Qm31Op};
 use crate::value::{Value, embed};

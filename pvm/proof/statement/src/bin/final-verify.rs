@@ -18,7 +18,7 @@
 //! - the proof, postcard, as a preimage of the running service, read by
 //!   `historical_lookup`: only once a judgement's checks before the proof
 //!   pass, and only when its length is at most
-//!   `vos_final_verifier::MAX_PROOF_BYTES`, refused before any allocation
+//!   `vos_pvm_final_verifier::MAX_PROOF_BYTES`, refused before any allocation
 //!   or lookup otherwise.
 //!
 //! Output (φ7 address, φ8 length): [`Report`], every field a little-endian
@@ -37,7 +37,7 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 
-use vos_final_verifier::PUBLIC_WORDS;
+use vos_pvm_final_verifier::PUBLIC_WORDS;
 use vos_statement::model::Input;
 use vos_statement::{Admitted, Refusal, StatementId};
 
@@ -496,8 +496,8 @@ fn verify(report: &mut Report) -> u64 {
             Err(refusal) => return report.judged(Err(refusal)),
         },
     };
-    if proof_len > vos_final_verifier::MAX_PROOF_BYTES {
-        let error = vos_final_verifier::Error::Length;
+    if proof_len > vos_pvm_final_verifier::MAX_PROOF_BYTES {
+        let error = vos_pvm_final_verifier::Error::Length;
         return match check {
             Check::Words(_) => {
                 report.refuse(&error);
@@ -528,12 +528,12 @@ fn verify(report: &mut Report) -> u64 {
 
     match check {
         Check::Words(words) => {
-            let Ok(proof) = vos_final_verifier::decode(&bytes) else {
+            let Ok(proof) = vos_pvm_final_verifier::decode(&bytes) else {
                 return UNDECODABLE;
             };
             drop(bytes);
             report.gas_after_decode = gas_left();
-            match vos_final_verifier::verify(proof, &words) {
+            match vos_pvm_final_verifier::verify(proof, &words) {
                 Ok(_) => ACCEPT,
                 Err(error) => report.refuse(&error),
             }

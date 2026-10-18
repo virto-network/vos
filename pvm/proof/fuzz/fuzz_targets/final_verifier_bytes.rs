@@ -1,5 +1,5 @@
 //! Fuzz target: arbitrary bytes as a wrap proof, against the golden wrap's
-//! public words (`vos_final_verifier::verify_bytes`).
+//! public words (`vos_pvm_final_verifier::verify_bytes`).
 //!
 //! Property: **no panic, no abort**, and **nothing accepted but the golden
 //! wrap:** bytes that verify decode to it, their re-encoding its bytes
@@ -20,7 +20,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let golden = golden::golden();
-    if vos_final_verifier::verify_bytes(data, &golden.words).is_ok() {
-        golden.assert_is_golden(&vos_final_verifier::decode(data).expect("decodes"));
+    if vos_pvm_final_verifier::verify_bytes(data, &golden.words).is_ok() {
+        golden.assert_is_golden(&vos_pvm_final_verifier::decode(data).expect("decodes"));
     }
 });

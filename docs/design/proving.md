@@ -316,7 +316,7 @@ attribution). Its full design is `recursion-air.md`.
   - A fold uses under half of the shape, so a child could grow by about
     3,200 columns before the fold outgrows it.
   - A kernel that does not fit is refused (§3.3).
-- **Built** [measured, slice 5's 5.13; `vos-recair`'s `fold`]:
+- **Built** [measured, slice 5's 5.13; `vos-pvm-recair`'s `fold`]:
   - a child's verification is 16,065 / 21,394 / 2,024 rows (its lifting
     height 2^19, 17 FRI layers, 486 sampled values at 3 points), and the
     fold's own work 37 `p2` and 74 `qm31` rows: **32,167 / 42,896 /
@@ -500,13 +500,13 @@ pub struct Statement {
   from the registry (A.4). The statement id leaves the format out, so the
   transition is not a replay (above).
 - **The crates,** under `pvm/proof/`:
-  - `recair` (`vos-recair`): the recursion prover and its `Context`;
-  - `recair-air` (`vos-recair-air`): the components' constraint bodies,
+  - `recair` (`vos-pvm-recair`): the recursion prover and its `Context`;
+  - `recair-air` (`vos-pvm-recair-air`): the components' constraint bodies,
     no_std, with no prover dependency;
-  - `final-verifier` (`vos-final-verifier`): no_std, for x86, wasm32
+  - `final-verifier` (`vos-pvm-final-verifier`): no_std, for x86, wasm32
     and riscv64em-javm;
   - `statement` (`vos-statement`): the types, the encoding, the io-hash
-    and the id, and the venue's check over `vos-final-verifier`, with no
+    and the id, and the venue's check over `vos-pvm-final-verifier`, with no
     other vos dependency, so Kreivo can depend on it; its `model` is a
     venue as plain data, which the fixtures are judged against, and its
     JAM refine program (`final-verify.elf`) is the venue on the JAM-only
@@ -592,7 +592,7 @@ last for decades.**
   - the fork's divergences (the Blake2b channel, fold step 3, affine DEEP
     batching, the completeness backport);
   - the security tool's counts (`security.rs`);
-  - the leaf's binding, the wrap, `vos-final-verifier` and
+  - the leaf's binding, the wrap, `vos-pvm-final-verifier` and
     `vos-statement`, and `derive` with the program id's derivation.
 
   Its owner and timing are the owner's to set, and open
@@ -805,7 +805,7 @@ that narrows the inner proof makes folds cheaper too.
 | slice | milestone | content | estimate |
 |---|---|---|---|
 | **5** | **M0 Foundation** | our Stwo fork pinned, with the completeness fix and no_std gating; a shape per kernel; formats chosen at run time, with lossless encodings; the inner parameters, interaction PoW and both bit counts; the witness-input precompile, the halt pc and the io-hash with roots; the reference Poseidon2, a SIMD hasher and the channel gate; the phone run (not run: pending the owner's team) | 6–9 weeks |
-| **5** | **M1 The recursion, unmasked, in tests** | a preparation step (slice 5's 5.8.0: the window kernel on the line, the fixture generator, shared code, the inner parameters recounted); then `recursion-air.md` §10's eight steps: the gate VM; the gate compiler; the in-AIR verifier's pieces; COMPARE's leaf; the window kernel's and the solvency predicate's leaves; the fold and the fixed point; the final wrap with the Blake2b channel and `vos-final-verifier`; end to end with `vos-statement` and the golden fixtures | 18–26 weeks, plus reviews |
+| **5** | **M1 The recursion, unmasked, in tests** | a preparation step (slice 5's 5.8.0: the window kernel on the line, the fixture generator, shared code, the inner parameters recounted); then `recursion-air.md` §10's eight steps: the gate VM; the gate compiler; the in-AIR verifier's pieces; COMPARE's leaf; the window kernel's and the solvency predicate's leaves; the fold and the fixed point; the final wrap with the Blake2b channel and `vos-pvm-final-verifier`; end to end with `vos-statement` and the golden fixtures | 18–26 weeks, plus reviews |
 | **6** | **M2 Masking** | R1–R8 on the wrap and on device proofs; 248-bit salts; leakage and soundness gates | 6–8 weeks |
 | **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo pallet (P0 and P1); the JAM verifier agent | 8–12 weeks |
 | **7** | **M4 Credential AIR** | the Poseidon2 root kind; the zkPVM Poseidon2 chip; the credential AIR with PRF passkeys; a phone gate | 6–10 weeks |
@@ -972,10 +972,10 @@ counts as conjectured / proven at the reference shape [model]:
   next-row masks no constraint reads (§3.2); 28, 30 and 32 prove the
   recursion AIR, 32's leaves verifying the segment AIR. A reserved entry is
   refused until its AIR and channel exist. 32's exist from slice 5's 5.8:
-  `vos-recair` proves and verifies its proofs natively, and the registry
+  `vos-pvm-recair` proves and verifies its proofs natively, and the registry
   refuses it, as no verifier outside the recursion reads a leaf or a fold.
-  28 is admitted from slice 5's 5.14: `vos-recair` proves the wrap and
-  `vos-final-verifier` verifies it; a segment verifier takes only a
+  28 is admitted from slice 5's 5.14: `vos-pvm-recair` proves the wrap and
+  `vos-pvm-final-verifier` verifies it; a segment verifier takes only a
   segment format.
 - **Masking the wrap** (slice 6) changes its proofs, so it takes a new
   number or a bump of 28.

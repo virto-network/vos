@@ -4,7 +4,7 @@
 //! - [`Context`] builds a circuit: witness values flow through the wiring,
 //!   constants are fixed by gates, outputs are yielded at reserved addresses.
 //! - [`Circuit::check_wiring`] is the static check the `Gate` relation's
-//!   soundness rests on (`vos_recair_air::gate`): each used address yielded
+//!   soundness rests on (`vos_pvm_recair_air::gate`): each used address yielded
 //!   exactly once, and the multiplicities' absolute sum below `p`.
 //! - [`trace`] lays out the three components' preprocessed, main and
 //!   interaction columns; a `p2` padding row holds the permutation of zero.
@@ -44,4 +44,4 @@ pub use prove::{
     ProveError, RecairProof, VerifyError, circuit_commitment, circuit_hash_of, prove, verify,
 };
 pub use value::{NoValue, Value};
-pub use vos_recair_air::p2::P2Mode;
+pub use vos_pvm_recair_air::p2::P2Mode;

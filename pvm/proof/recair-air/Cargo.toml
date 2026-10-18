@@ -1,5 +1,5 @@
 [package]
-name = "vos-recair-air"
+name = "vos-pvm-recair-air"
 edition.workspace = true
 version.workspace = true
 license = "Apache-2.0"

@@ -9,7 +9,7 @@
 //! io-hash's 16 limbs, sit at its addresses 0–23, one word a wire, with zero,
 //! one and `u` after them ([`LAYOUT`]).
 //!
-//! **The transcript**, as `vos-recair`'s prover runs it:
+//! **The transcript**, as `vos-pvm-recair`'s prover runs it:
 //! 1. the domain, the format and the PCS configuration, then the log sizes;
 //! 2. the preprocessed root, then the main trace's root;
 //! 3. the 24 public words, each as the QM31 `(w, 0, 0, 0)`;
@@ -19,7 +19,7 @@
 //!    protocol.
 //!
 //! The claimed sums, `u`'s public use and each public word's add to zero:
-//! that is what binds the words to the circuit's wires (`vos_recair_air::gate`).
+//! that is what binds the words to the circuit's wires (`vos_pvm_recair_air::gate`).
 //!
 //! **The proof's shape is checked before any Stwo call** (`check_shape`):
 //! the trees' count, every column's sample count, and every M31 limb
@@ -61,11 +61,11 @@ use stwo::core::proof::StarkProof;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::{Blake2bMerkleChannel, Blake2bMerkleHasher};
 use stwo::core::verifier::VerificationError;
-use vos_recair_air::gate::{Layout, public_logup_sum};
-use vos_recair_air::{Components, GateRelation, LOG_CONSTRAINT_EXPANSION, LogSizes};
+use vos_pvm_recair_air::gate::{Layout, public_logup_sum};
+use vos_pvm_recair_air::{Components, GateRelation, LOG_CONSTRAINT_EXPANSION, LogSizes};
 
 pub use constants::{LOG_SIZES, PREPROCESSED_ROOT};
-pub use vos_recair_air;
+pub use vos_pvm_recair_air;
 
 /// The format the wrap's proofs carry (`vos_pvm_proof::format::WRAP`).
 pub const FORMAT: u32 = 28;
@@ -250,7 +250,7 @@ pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement
         return Err(Error::Circuit);
     }
 
-    let [preprocessed, main, interaction] = vos_recair_air::committed_log_sizes(&LOG_SIZES);
+    let [preprocessed, main, interaction] = vos_pvm_recair_air::committed_log_sizes(&LOG_SIZES);
     let channel = &mut Blake2bChannel::default();
     mix_header(channel);
     let scheme = &mut CommitmentSchemeVerifier::<Blake2bMerkleChannel>::new(CONFIG);

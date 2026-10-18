@@ -2490,18 +2490,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "vos-final-verifier"
-version = "0.1.0"
-dependencies = [
- "num-traits",
- "postcard",
- "serde",
- "stwo",
- "vos-pvm-proof",
- "vos-recair-air",
-]
-
-[[package]]
 name = "vos-jam"
 version = "0.1.0"
 dependencies = [
@@ -2619,6 +2607,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-pvm-final-verifier"
+version = "0.1.0"
+dependencies = [
+ "num-traits",
+ "postcard",
+ "serde",
+ "stwo",
+ "vos-pvm-proof",
+ "vos-pvm-recair-air",
+]
+
+[[package]]
 name = "vos-pvm-poseidon2"
 version = "0.1.0"
 
@@ -2651,15 +2651,15 @@ dependencies = [
  "serde",
  "stwo",
  "stwo-constraint-framework",
- "vos-final-verifier",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-final-verifier",
  "vos-pvm-poseidon2",
  "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-pvm-proof-derive",
  "vos-pvm-proof-verifier",
- "vos-recair",
+ "vos-pvm-recair",
  "vos-statement",
  "vos-testkit",
  "vos-tree",
@@ -2691,14 +2691,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "vos-raft"
-version = "0.1.0"
-dependencies = [
- "proptest",
-]
-
-[[package]]
-name = "vos-recair"
+name = "vos-pvm-recair"
 version = "0.1.0"
 dependencies = [
  "bincode",
@@ -2707,26 +2700,33 @@ dependencies = [
  "serde",
  "stwo",
  "stwo-constraint-framework",
- "vos-final-verifier",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-final-verifier",
  "vos-pvm-poseidon2",
  "vos-pvm-program",
  "vos-pvm-proof",
  "vos-pvm-proof-verifier",
- "vos-recair-air",
+ "vos-pvm-recair-air",
  "vos-statement",
  "vos-wire",
 ]
 
 [[package]]
-name = "vos-recair-air"
+name = "vos-pvm-recair-air"
 version = "0.1.0"
 dependencies = [
  "num-traits",
  "stwo",
  "stwo-constraint-framework",
  "vos-pvm-poseidon2",
+]
+
+[[package]]
+name = "vos-raft"
+version = "0.1.0"
+dependencies = [
+ "proptest",
 ]
 
 [[package]]
@@ -2754,9 +2754,9 @@ name = "vos-statement"
 version = "0.1.0"
 dependencies = [
  "blake2",
- "vos-final-verifier",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-final-verifier",
  "vos-pvm-precompiles",
 ]
 

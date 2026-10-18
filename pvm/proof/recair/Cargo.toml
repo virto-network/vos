@@ -1,15 +1,15 @@
 [package]
-name = "vos-recair"
+name = "vos-pvm-recair"
 edition.workspace = true
 version.workspace = true
 license = "Apache-2.0"
 description = "The recursion AIR's prover: circuits built by a Context, their wiring checked, traced, proved and verified on the Poseidon2-M31 channel."
 
 [dependencies]
-vos-recair-air = { workspace = true }
+vos-pvm-recair-air = { workspace = true }
 # The wrap's proof, its public words and its layout, which the prover
 # produces and the final verifier reads.
-vos-final-verifier = { workspace = true }
+vos-pvm-final-verifier = { workspace = true }
 vos-pvm-poseidon2 = { workspace = true }
 # The Poseidon2-M31 channel and its SIMD backend, the format registry, the
 # transcript's header and the security accounting.

@@ -7,8 +7,8 @@ pub mod kernel;
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
-use vos_recair::gadgets::{TranscriptGadget, leaf_hash, node};
-use vos_recair::{Context, Message, P2Handle, Qm31Op, Value, Var};
+use vos_pvm_recair::gadgets::{TranscriptGadget, leaf_hash, node};
+use vos_pvm_recair::{Context, Message, P2Handle, Qm31Op, Value, Var};
 
 /// SplitMix64.
 pub struct Rng(u64);

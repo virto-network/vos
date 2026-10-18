@@ -6,8 +6,8 @@ mod common;
 
 use stwo::core::fields::m31::P;
 use stwo::core::fields::qm31::SecureField;
-use vos_recair::circuit::{Entry, WiringError, signed};
-use vos_recair::{Context, NoValue, P2Mode, ProveError, circuit_commitment, prove, verify};
+use vos_pvm_recair::circuit::{Entry, WiringError, signed};
+use vos_pvm_recair::{Context, NoValue, P2Mode, ProveError, circuit_commitment, prove, verify};
 
 use common::random_circuit;
 
@@ -51,7 +51,7 @@ fn the_wiring_alone_is_the_filled_wiring() {
     }
 }
 
-fn honest() -> vos_recair::Circuit {
+fn honest() -> vos_pvm_recair::Circuit {
     random_circuit::<NoValue>(3, 500)
         .finalize()
         .unwrap()
@@ -60,7 +60,7 @@ fn honest() -> vos_recair::Circuit {
 
 /// The entry of `circuit`'s `qm31` rows that is a use of an address yielded
 /// with at least `uses` uses: its row, operand and address.
-fn a_use(circuit: &vos_recair::Circuit, uses: i64) -> (usize, usize, u32) {
+fn a_use(circuit: &vos_pvm_recair::Circuit, uses: i64) -> (usize, usize, u32) {
     let yielded: std::collections::HashMap<u32, i64> = circuit
         .entries()
         .filter(|entry| entry.multiplicity < 0)

@@ -468,7 +468,7 @@ fn a_chain_not_ending_at_the_halt_is_refused() {
 #[test]
 fn a_predicates_leaf_proves_and_verifies() {
     let (kernel, _, shape) = areas();
-    let (program, entry) = vos_recair::leaf::kernel_program(
+    let (program, entry) = vos_pvm_recair::leaf::kernel_program(
         &kernel.blob,
         &kernel.record,
         vos_pvm_compiler::TRANSPILER_VERSION,
@@ -497,17 +497,17 @@ fn a_predicates_leaf_proves_and_verifies() {
 /// `areas`, the solvency predicate's kind, end to end: its run cut in three
 /// segments of class 0, each verified in its leaf, the leaves folded to one
 /// root stating the whole run, wrapped under format 28 and verified by
-/// `vos-final-verifier`; its statement (rootless, its output the areas'
+/// `vos-pvm-final-verifier`; its statement (rootless, its output the areas'
 /// sum) recomputes the run's io-hash, and a venue pinning its program
 /// accepts it, natively and on the JAM-only host. The wrap and the
 /// judgement's input are written for the Wasm harness,
 /// `wrap/predicate.{proof,words,input}` under the target's tmp directory.
 #[test]
 fn the_predicate_wraps() {
-    use vos_recair::fold::FoldCircuit;
+    use vos_pvm_recair::fold::FoldCircuit;
 
     let (kernel, _, shape) = areas();
-    let (program, entry) = vos_recair::leaf::kernel_program(
+    let (program, entry) = vos_pvm_recair::leaf::kernel_program(
         &kernel.blob,
         &kernel.record,
         vos_pvm_compiler::TRANSPILER_VERSION,

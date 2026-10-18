@@ -298,8 +298,8 @@ pub struct NodeRun {
     pub finalized: [usize; 3],
     pub proving: std::time::Duration,
     pub peak_mib: u64,
-    pub proof: vos_recair::RecairProof,
-    pub output: vos_recair::leaf::NodeOutput,
+    pub proof: vos_pvm_recair::RecairProof,
+    pub output: vos_pvm_recair::leaf::NodeOutput,
 }
 
 /// `proof`, a segment of `program`'s class `class`, verified in its leaf at
@@ -319,17 +319,17 @@ pub fn prove_leaf(
     use stwo::core::fields::qm31::SecureField;
     use vos_pvm_proof::poseidon2::P2Hash;
     use vos_pvm_proof::program_id::LeafCircuits;
-    use vos_recair::leaf::{LeafCircuit, PADDED_ROWS};
-    use vos_recair::verifier::witness::digest_wires;
+    use vos_pvm_recair::leaf::{LeafCircuit, PADDED_ROWS};
+    use vos_pvm_recair::verifier::witness::digest_wires;
 
     let leaf = LeafCircuit::of_class(program, entry, class);
     let (values, output) = leaf
         .values(proof, P2Hash(program.id().0), fold_word, position)
         .expect("the segment's values");
 
-    let mut transcript = vos_recair::Context::<SecureField>::new();
+    let mut transcript = vos_pvm_recair::Context::<SecureField>::new();
     let verified =
-        vos_recair::verifier::verify_segment(&mut transcript, &leaf.shape, &values.segment);
+        vos_pvm_recair::verifier::verify_segment(&mut transcript, &leaf.shape, &values.segment);
     let records = vos_pvm_proof::extract_recursion_data(proof)
         .transcript
         .records;
@@ -339,7 +339,7 @@ pub fn prove_leaf(
         let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
         assert_eq!(
             *permutation,
-            vos_recair::value::wires_of(words),
+            vos_pvm_recair::value::wires_of(words),
             "permutation {i}"
         );
     }
@@ -374,7 +374,7 @@ pub fn prove_leaf(
     let filled = context
         .finalize_to(Some(PADDED_ROWS))
         .expect("the wiring checks");
-    let (_, hash) = vos_recair::circuit_commitment(&filled.circuit).expect("checks");
+    let (_, hash) = vos_pvm_recair::circuit_commitment(&filled.circuit).expect("checks");
     let LeafCircuits::Hashes(hashes) = &program.leaf_circuits else {
         panic!("a program with its leaf circuits")
     };
@@ -385,13 +385,13 @@ pub fn prove_leaf(
     );
 
     let (leaf_proof, proving, peak_mib) =
-        measured(|| vos_recair::prove(&filled.circuit, &filled.witness).expect("proves"));
+        measured(|| vos_pvm_recair::prove(&filled.circuit, &filled.witness).expect("proves"));
     assert_eq!(
         leaf_proof.outputs,
         digest_wires(&output.digest()).to_vec(),
         "the leaf states the native output"
     );
-    vos_recair::verify(leaf_proof.clone(), &hash).expect("the leaf verifies");
+    vos_pvm_recair::verify(leaf_proof.clone(), &hash).expect("the leaf verifies");
     NodeRun {
         rows,
         finalized,
@@ -409,15 +409,15 @@ pub fn prove_leaf(
 /// finalized, proving time and peak heap (0 unless the binary installs
 /// [`Counting`]), its proof and output.
 pub fn prove_fold(
-    fold: &vos_recair::fold::FoldCircuit,
+    fold: &vos_pvm_recair::fold::FoldCircuit,
     program: &vos_pvm_proof::program_id::KernelProgram,
     left: &NodeRun,
     right: &NodeRun,
     fold_word: vos_pvm_proof::poseidon2::P2Hash,
 ) -> NodeRun {
-    use vos_recair::fold::Proved;
-    use vos_recair::leaf::PADDED_ROWS;
-    use vos_recair::verifier::witness::digest_wires;
+    use vos_pvm_recair::fold::Proved;
+    use vos_pvm_recair::leaf::PADDED_ROWS;
+    use vos_pvm_recair::verifier::witness::digest_wires;
 
     fn proved(node: &NodeRun) -> Proved<'_> {
         Proved {
@@ -440,14 +440,14 @@ pub fn prove_fold(
         .finalize_to(Some(PADDED_ROWS))
         .expect("the wiring checks");
     let (fold_proof, proving, peak_mib) =
-        measured(|| vos_recair::prove(&filled.circuit, &filled.witness).expect("proves"));
+        measured(|| vos_pvm_recair::prove(&filled.circuit, &filled.witness).expect("proves"));
     assert_eq!(
         fold_proof.outputs,
         digest_wires(&output.digest()).to_vec(),
         "the fold states the native output"
     );
     let hash = fold_word.0.map(|word| vos_pvm_poseidon2::M31::new(word.0));
-    vos_recair::verify(fold_proof.clone(), &hash).expect("the fold verifies");
+    vos_pvm_recair::verify(fold_proof.clone(), &hash).expect("the fold verifies");
     NodeRun {
         rows,
         finalized,
@@ -460,17 +460,17 @@ pub fn prove_fold(
 
 /// `root`, the root of a whole run of `program`, wrapped under format 28 on
 /// the Blake2b-256 channel within 2^17 rows and 8 GiB of heap, and verified
-/// by `vos-final-verifier`, its statement the program's id and the root's
+/// by `vos-pvm-final-verifier`, its statement the program's id and the root's
 /// io-hash: the proof's bytes (postcard) and its public words.
 pub fn wrap_root(
     name: &str,
     program: &vos_pvm_proof::program_id::KernelProgram,
     root: &NodeRun,
-) -> (Vec<u8>, [u32; vos_final_verifier::PUBLIC_WORDS]) {
-    use vos_recair::wrap::{self, WrapCircuit};
+) -> (Vec<u8>, [u32; vos_pvm_final_verifier::PUBLIC_WORDS]) {
+    use vos_pvm_recair::wrap::{self, WrapCircuit};
 
     let circuit = WrapCircuit::get();
-    let proved = vos_recair::fold::Proved {
+    let proved = vos_pvm_recair::fold::Proved {
         proof: &root.proof,
         output: &root.output,
     };
@@ -482,7 +482,7 @@ pub fn wrap_root(
         .finalize()
         .expect("the wrap's wiring checks");
     let log_sizes = finalized.circuit.log_sizes();
-    assert_eq!(log_sizes, vos_final_verifier::LOG_SIZES);
+    assert_eq!(log_sizes, vos_pvm_final_verifier::LOG_SIZES);
     assert!(log_sizes.iter().all(|&log| log <= 17));
     let words = wrap::public_words(&finalized);
     let (proof, proving, peak_mib) = measured(|| wrap::prove(&finalized).expect("the wrap proves"));
@@ -494,7 +494,7 @@ pub fn wrap_root(
         bytes.len()
     );
     assert!(peak_mib <= 8 << 10, "{peak_mib} MiB");
-    let verified = vos_final_verifier::verify_bytes(&bytes, &words).expect("the wrap verifies");
+    let verified = vos_pvm_final_verifier::verify_bytes(&bytes, &words).expect("the wrap verifies");
     assert_eq!(verified, statement);
     assert_eq!(statement.program, program.id().0.map(|word| word.0));
     assert_eq!(statement.io_hash, root.output.io_hash);
@@ -549,7 +549,7 @@ pub fn judged_statement(
 pub fn write_wrap(
     name: &str,
     proof: &[u8],
-    words: &[u32; vos_final_verifier::PUBLIC_WORDS],
+    words: &[u32; vos_pvm_final_verifier::PUBLIC_WORDS],
     input: &vos_statement::model::Input,
 ) {
     let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");

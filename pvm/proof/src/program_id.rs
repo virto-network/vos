@@ -36,7 +36,7 @@
 //!    bytes).
 //!
 //! **The leaf-circuit slot:** version 1 holds each class's leaf circuit's
-//! hash, in the classes' order (`vos_recair::leaf`, the prover role's);
+//! hash, in the classes' order (`vos_pvm_recair::leaf`, the prover role's);
 //! version 0 holds none, a program whose leaves are not built.
 //!
 //! **Both hashes** are the recursion AIR's `p2` leaf mode: eight words a

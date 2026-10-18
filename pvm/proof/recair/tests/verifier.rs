@@ -37,21 +37,21 @@ use vos_pvm_proof::format::{Format, LEAF_FOLD, SEGMENT, SecurityFloor};
 use vos_pvm_proof::pcs::{FsChannel, StarkProofAny};
 use vos_pvm_proof::poseidon2::{P2Hash, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel};
 use vos_pvm_proof::{Proof, RecursionData, chip_idx, extract_recursion_data};
-use vos_recair::gadgets::TranscriptGadget;
-use vos_recair::verifier::bits::{
+use vos_pvm_recair::gadgets::TranscriptGadget;
+use vos_pvm_recair::verifier::bits::{
     assert_trailing_zeros, assert_u16_limbs, check_word_bits, guess_bits,
 };
-use vos_recair::verifier::channel::{Channel, u64_wire};
-use vos_recair::verifier::circle::{Point, domain_point};
-use vos_recair::verifier::fri::{FriCommitment, verify_query};
-use vos_recair::verifier::logup::{BoundaryRelations, Challenges};
-use vos_recair::verifier::merkle::{ExpandError, expand_decommitment, verify_opening};
-use vos_recair::verifier::stark::{CompiledInput, preprocessed_bits};
-use vos_recair::verifier::witness::digest_wires;
-use vos_recair::verifier::{
+use vos_pvm_recair::verifier::channel::{Channel, u64_wire};
+use vos_pvm_recair::verifier::circle::{Point, domain_point};
+use vos_pvm_recair::verifier::fri::{FriCommitment, verify_query};
+use vos_pvm_recair::verifier::logup::{BoundaryRelations, Challenges};
+use vos_pvm_recair::verifier::merkle::{ExpandError, expand_decommitment, verify_opening};
+use vos_pvm_recair::verifier::stark::{CompiledInput, preprocessed_bits};
+use vos_pvm_recair::verifier::witness::digest_wires;
+use vos_pvm_recair::verifier::{
     SegmentShape, SegmentValues, ShapeMismatch, WitnessError, deep, logup, oods, verify_segment,
 };
-use vos_recair::{Bit, Context, NoValue, Var};
+use vos_pvm_recair::{Bit, Context, NoValue, Var};
 
 /// A real proof, its circuit's shape, its values and the native verifier's
 /// record of it.
@@ -219,7 +219,7 @@ fn verifies_as_natively(real: &Real) -> Context<SecureField> {
         let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
         assert_eq!(
             *permutation,
-            vos_recair::value::wires_of(words),
+            vos_pvm_recair::value::wires_of(words),
             "permutation {i}"
         );
     }
@@ -250,7 +250,7 @@ fn verifies_as_natively(real: &Real) -> Context<SecureField> {
     context
 }
 
-fn print_rows(name: &str, context: &Context<impl vos_recair::Value>) {
+fn print_rows(name: &str, context: &Context<impl vos_pvm_recair::Value>) {
     eprintln!("{name}: {:?} rows (p2, qm31, h8)", context.rows());
     for (piece, rows) in context.piece_rows() {
         eprintln!("  {piece}: {rows:?}");
@@ -315,14 +315,14 @@ fn the_verifier_circuit_proves_and_verifies() {
     verify_segment(&mut context, &real.shape, &real.values);
     let finalized = context.finalize().expect("the wiring checks");
     let started = std::time::Instant::now();
-    let proof = vos_recair::prove(&finalized.circuit, &finalized.witness).expect("proves");
+    let proof = vos_pvm_recair::prove(&finalized.circuit, &finalized.witness).expect("proves");
     eprintln!(
         "the fixture's verifier circuit, {:?} rows, proved in {:.2}s",
         finalized.circuit.log_sizes(),
         started.elapsed().as_secs_f64()
     );
-    let (_, hash) = vos_recair::circuit_commitment(&finalized.circuit).unwrap();
-    vos_recair::verify(proof, &hash).expect("verifies");
+    let (_, hash) = vos_pvm_recair::circuit_commitment(&finalized.circuit).unwrap();
+    vos_pvm_recair::verify(proof, &hash).expect("verifies");
 }
 
 // ── Tampers, composed ──────────────────────────────────────────────────────
@@ -399,7 +399,7 @@ fn every_tamper_is_refused_by_its_check() {
         &real.proof.final_state,
     );
     bytes[3] ^= 1;
-    values.boundary[0] = vos_recair::verifier::witness::pack(
+    values.boundary[0] = vos_pvm_recair::verifier::witness::pack(
         &bytes[..4]
             .iter()
             .map(|&b| BaseField::from(b as u32))
@@ -455,11 +455,11 @@ fn a_tampered_witness_proved_is_refused() {
     verify_segment(&mut context, &real.shape, &values);
     assert!(!context.mismatches().is_empty());
     let finalized = context.finalize().expect("the wiring checks");
-    let refused = match vos_recair::prove(&finalized.circuit, &finalized.witness) {
+    let refused = match vos_pvm_recair::prove(&finalized.circuit, &finalized.witness) {
         Err(_) => true,
         Ok(proof) => {
-            let (_, hash) = vos_recair::circuit_commitment(&finalized.circuit).unwrap();
-            vos_recair::verify(proof, &hash).is_err()
+            let (_, hash) = vos_pvm_recair::circuit_commitment(&finalized.circuit).unwrap();
+            vos_pvm_recair::verify(proof, &hash).is_err()
         }
     };
     assert!(refused, "a tampered witness proves and verifies");

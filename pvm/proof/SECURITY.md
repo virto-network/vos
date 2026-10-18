@@ -14,7 +14,7 @@ There are two verifying paths:
   formats 35 and 36. Peers and tests use it; so do the refine bundles.
 - **A statement,** a kernel's whole run: its segments (35) verified in
   leaves, folded (32), the root wrapped (28), the wrap verified by
-  `vos-final-verifier` and judged by `vos-statement`. This is what a venue
+  `vos-pvm-final-verifier` and judged by `vos-statement`. This is what a venue
   (a chain's pallet, the JAM agent) accepts.
 
 ## Formats and their bit counts
@@ -141,7 +141,7 @@ states, is an end-to-end refine acceptance.
 
 ## Trust boundary: a statement
 
-- **The wrap's verifier pins its own circuit.** `vos-final-verifier`
+- **The wrap's verifier pins its own circuit.** `vos-pvm-final-verifier`
   holds the wrap's preprocessed root, its log sizes and format 28's
   configuration as constants (the DEEP batching from the format, never
   from the proof). It refuses bytes over 256 KiB, a non-canonical or
@@ -242,7 +242,7 @@ Required before value rides on a proof. Its scope:
   gate), the claimed-sum handling, the `Gate` relation's signed
   multiplicities, the fold;
 - the leaf's binding (its entry constants, the io-hash's range checks),
-  the wrap, `vos-final-verifier` and `vos-statement`;
+  the wrap, `vos-pvm-final-verifier` and `vos-statement`;
 - `derive` (layout to preprocessed columns, its refusals) and the program
   id's derivation;
 - later, the masking and the public sums' re-cut.

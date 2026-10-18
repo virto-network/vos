@@ -38,12 +38,12 @@ use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{IdPreimage, LeafCircuits};
 use vos_pvm_proof::prove_canonical_format;
 use vos_pvm_proof::segment::SegmentCursor;
-use vos_recair::fold::child::{self, verify_child};
-use vos_recair::fold::{FoldCircuit, FoldValues, Proved};
-use vos_recair::leaf::{LeafCircuit, NodeOutput, PADDED_ROWS, State, preimage};
-use vos_recair::verifier::SegmentShape;
-use vos_recair::verifier::witness::digest_wires;
-use vos_recair::{Context, NoValue, RecairProof, Value};
+use vos_pvm_recair::fold::child::{self, verify_child};
+use vos_pvm_recair::fold::{FoldCircuit, FoldValues, Proved};
+use vos_pvm_recair::leaf::{LeafCircuit, NodeOutput, PADDED_ROWS, State, preimage};
+use vos_pvm_recair::verifier::SegmentShape;
+use vos_pvm_recair::verifier::witness::digest_wires;
+use vos_pvm_recair::{Context, NoValue, RecairProof, Value};
 
 use common::kernel::{blob, entry};
 
@@ -137,7 +137,7 @@ impl Run {
             .values(&self.segments[segment], program, word, position)
             .expect("the segment's values");
         let finalized = leaf.finalize(&values);
-        let proof = vos_recair::prove(&finalized.circuit, &finalized.witness).expect("proves");
+        let proof = vos_pvm_recair::prove(&finalized.circuit, &finalized.witness).expect("proves");
         Node { proof, output }
     }
 
@@ -163,7 +163,7 @@ impl Run {
     fn node(&self, left: &Node, right: &Node) -> Node {
         let (values, output) = self.values(left, right, &self.program);
         let finalized = self.fold.finalize(&values);
-        let proof = vos_recair::prove(&finalized.circuit, &finalized.witness).expect("proves");
+        let proof = vos_pvm_recair::prove(&finalized.circuit, &finalized.witness).expect("proves");
         Node { proof, output }
     }
 }
@@ -236,7 +236,7 @@ fn a_fold_of_two_leaves_states_their_run() {
             let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
             assert_eq!(
                 *permutation,
-                vos_recair::value::wires_of(words),
+                vos_pvm_recair::value::wires_of(words),
                 "permutation {i}"
             );
         }
@@ -254,7 +254,7 @@ fn a_fold_of_two_leaves_states_their_run() {
     let fold = &tree.folds[0];
     assert_eq!(fold.output, output);
     assert_eq!(fold.proof.outputs, digest_wires(&output.digest()).to_vec());
-    vos_recair::verify(fold.proof.clone(), &digest_of(&run.word)).expect("verifies");
+    vos_pvm_recair::verify(fold.proof.clone(), &digest_of(&run.word)).expect("verifies");
 }
 
 /// A tree over the four segments: a fold of the two folds states the whole
@@ -295,16 +295,16 @@ fn a_tree_over_four_segments_states_the_run() {
         filled.circuit,
         "the wiring without values"
     );
-    let (_, hash) = vos_recair::circuit_commitment(&filled.circuit).expect("checks");
+    let (_, hash) = vos_pvm_recair::circuit_commitment(&filled.circuit).expect("checks");
     assert_eq!(hash, digest_of(&run.word), "the fold circuit's hash");
     let started = std::time::Instant::now();
-    let proof = vos_recair::prove(&filled.circuit, &filled.witness).expect("proves");
+    let proof = vos_pvm_recair::prove(&filled.circuit, &filled.witness).expect("proves");
     eprintln!(
         "a fold of two folds proved in {:.2}s",
         started.elapsed().as_secs_f64()
     );
     assert_eq!(proof.outputs, digest_wires(&output.digest()).to_vec());
-    vos_recair::verify(proof, &hash).expect("verifies");
+    vos_pvm_recair::verify(proof, &hash).expect("verifies");
 }
 
 /// The program: a wrong one, a leaf carrying a wrong program id, and a
@@ -374,10 +374,11 @@ fn a_foreign_fold_word_or_a_wrong_choice_is_refused() {
     assert_eq!(refusals(&run.fold, &claimed), ["fold: circuit"]);
     // No circuit at all, and two.
     let mut none = values.clone();
-    none.children[0].circuit = [SecureField::default(); vos_recair::fold::CIRCUITS];
+    none.children[0].circuit = [SecureField::default(); vos_pvm_recair::fold::CIRCUITS];
     assert_eq!(refusals(&run.fold, &none), ["fold: circuit"]);
     let mut two = values.clone();
-    two.children[0].circuit[vos_recair::fold::CIRCUITS - 1] = SecureField::from(BaseField::from(1));
+    two.children[0].circuit[vos_pvm_recair::fold::CIRCUITS - 1] =
+        SecureField::from(BaseField::from(1));
     assert_eq!(refusals(&run.fold, &two), ["fold: circuit"]);
 }
 
@@ -421,9 +422,9 @@ fn a_gap_or_broken_continuity_is_refused() {
     let finalized = context
         .finalize_to(Some(PADDED_ROWS))
         .expect("the wiring checks");
-    let refused = match vos_recair::prove(&finalized.circuit, &finalized.witness) {
+    let refused = match vos_pvm_recair::prove(&finalized.circuit, &finalized.witness) {
         Err(_) => true,
-        Ok(proof) => vos_recair::verify(proof, &digest_of(&run.word)).is_err(),
+        Ok(proof) => vos_pvm_recair::verify(proof, &digest_of(&run.word)).is_err(),
     };
     assert!(refused, "a broken fold proves and verifies");
 }

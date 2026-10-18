@@ -9,11 +9,11 @@ use std::time::Instant;
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::FrameworkEval;
 use stwo_constraint_framework::expr::{BaseExpr, ExprEvaluator, ExtExpr};
-use vos_recair::{circuit_commitment, prove, verify};
-use vos_recair_air::gate::GateRelation;
-use vos_recair_air::h8::H8Eval;
-use vos_recair_air::p2::P2Eval;
-use vos_recair_air::qm31::Qm31Eval;
+use vos_pvm_recair::{circuit_commitment, prove, verify};
+use vos_pvm_recair_air::gate::GateRelation;
+use vos_pvm_recair_air::h8::H8Eval;
+use vos_pvm_recair_air::p2::P2Eval;
+use vos_pvm_recair_air::qm31::Qm31Eval;
 
 use common::random_circuit;
 
@@ -99,8 +99,8 @@ fn the_degree_audit_passes() {
                 relation: relation.clone(),
             }
             .evaluate(ExprEvaluator::new()),
-            &vos_recair_air::p2::PREPROCESSED[..],
-            vos_recair_air::p2::N_CONSTRAINTS,
+            &vos_pvm_recair_air::p2::PREPROCESSED[..],
+            vos_pvm_recair_air::p2::N_CONSTRAINTS,
         ),
         (
             "qm31",
@@ -109,8 +109,8 @@ fn the_degree_audit_passes() {
                 relation: relation.clone(),
             }
             .evaluate(ExprEvaluator::new()),
-            &vos_recair_air::qm31::PREPROCESSED[..],
-            vos_recair_air::qm31::N_CONSTRAINTS,
+            &vos_pvm_recair_air::qm31::PREPROCESSED[..],
+            vos_pvm_recair_air::qm31::N_CONSTRAINTS,
         ),
         (
             "h8",
@@ -119,8 +119,8 @@ fn the_degree_audit_passes() {
                 relation,
             }
             .evaluate(ExprEvaluator::new()),
-            &vos_recair_air::h8::PREPROCESSED[..],
-            vos_recair_air::h8::N_CONSTRAINTS,
+            &vos_pvm_recair_air::h8::PREPROCESSED[..],
+            vos_pvm_recair_air::h8::N_CONSTRAINTS,
         ),
     ];
     for (name, recorded, preprocessed, n_constraints) in &recorded {
@@ -177,9 +177,9 @@ fn a_three_component_multi_fraction_logup_proves_at_three_log_sizes() {
 
 /// A circuit of 8 to 32 rows in each component, every row's fractions
 /// live.
-fn small_circuit() -> vos_recair::Context<SecureField> {
-    use vos_recair::gadgets::{TranscriptGadget, leaf_hash, node};
-    use vos_recair::{Context, Message};
+fn small_circuit() -> vos_pvm_recair::Context<SecureField> {
+    use vos_pvm_recair::gadgets::{TranscriptGadget, leaf_hash, node};
+    use vos_pvm_recair::{Context, Message};
 
     let mut rng = common::Rng::new(5);
     let mut context = Context::<SecureField>::with_outputs(1);

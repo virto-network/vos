@@ -24,7 +24,7 @@ name = "fixtures"
 required-features = ["fixtures"]
 
 [dependencies]
-vos-final-verifier = { workspace = true }
+vos-pvm-final-verifier = { workspace = true }
 # BLAKE2b-256, the io-hash's and the id's; without std.
 blake2 = { version = "0.10", default-features = false }
 

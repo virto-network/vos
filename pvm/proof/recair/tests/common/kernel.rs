@@ -2,7 +2,7 @@
 //! halts, traced from the loader's layout.
 
 use vos_pvm_proof::program_id::ENTRY_TIMESTAMP;
-use vos_recair::leaf::State;
+use vos_pvm_recair::leaf::State;
 
 /// The kernel's io-hash words, φ9..12; φ12's sign-extends, so its high
 /// bytes are 0xff.

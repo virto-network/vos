@@ -8,7 +8,7 @@ default:
 # prover library, wire types. The node runs the
 # agent, so it is tested with it.
 test:
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-recair-air -p vos-recair -p vos-final-verifier -p vos-statement --features vos-statement/fixtures
+    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-recair -p vos-pvm-final-verifier -p vos-statement --features vos-statement/fixtures
     cargo test -p vos-pvm-proof --lib
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
@@ -54,7 +54,7 @@ test-proof: build-test-actors judge-wasm
 judge-wasm:
     cd pvm/proof/final-verifier/wasm/blob; cargo build --release
     cd pvm/proof/final-verifier/wasm/run; cargo build --release
-    for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_final_verifier_wasm.wasm $semantics judge pvm/proof/fixtures }
+    for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm $semantics judge pvm/proof/fixtures }
 
 # The proof fixtures under `pvm/proof/fixtures` (`proving.md` A.6), written
 # anew by their generator, `pvm/proof/tests/fixtures.rs`: at a format bump,
@@ -133,14 +133,14 @@ check-no-faults:
 # venue check over it, for the embedded target, for wasm32 with every
 # nightly feature refused (their source builds on stable), and for the PVM
 # with the standard library built from source, with the venue's JAM refine
-# program (`final-verify.elf`), which `vos-recair`'s wrap test and the
+# program (`final-verify.elf`), which `vos-pvm-recair`'s wrap test and the
 # fixtures' and the end-to-end tests run on the JAM-only host.
 check-no-std:
     cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
-    cargo build -p vos-final-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
-    with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-final-verifier --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
+    cargo build -p vos-pvm-final-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
+    with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-pvm-final-verifier --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
     cargo build -p vos-statement --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-statement --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
     cargo build -p vos-statement --release --features pvm-guest --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
@@ -153,7 +153,7 @@ check-no-std:
 # library tests, and the lints of other feature sets.
 check: fmt-check doc-check check-no-std build-test-actors build-agent
     cargo clippy --workspace --all-targets --quiet -- -D warnings
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-recair-air -p vos-recair -p vos-final-verifier -p vos-statement --features vos-statement/fixtures
+    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-recair -p vos-pvm-final-verifier -p vos-statement --features vos-statement/fixtures
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 
 # Everything but the prover suites: before a merge, and at the end of each

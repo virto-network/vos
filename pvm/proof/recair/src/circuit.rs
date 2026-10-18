@@ -1,12 +1,12 @@
 //! A circuit: the components' wiring, which the preprocessed columns hold,
-//! and its static check (`vos_recair_air::gate`).
+//! and its static check (`vos_pvm_recair_air::gate`).
 
 use std::collections::BTreeMap;
 use std::fmt;
 
 use stwo::core::fields::m31::{BaseField, P};
-use vos_recair_air::gate::Layout;
-use vos_recair_air::p2::P2Mode;
+use vos_pvm_recair_air::gate::Layout;
+use vos_pvm_recair_air::p2::P2Mode;
 
 /// An operand's entry in the `Gate` relation. A multiplicity of zero leaves
 /// the relation untouched, whatever the address.
@@ -185,7 +185,7 @@ impl Circuit {
         p2.chain(qm31).chain(h8).chain(public)
     }
 
-    /// The static check of `vos_recair_air::gate`: every component a power of
+    /// The static check of `vos_pvm_recair_air::gate`: every component a power of
     /// two of at least [`MIN_ROWS`] rows, no chained first row, every address
     /// below `p`, every used address yielded exactly once with the
     /// multiplicity of its uses, and the absolute multiplicities' sum below

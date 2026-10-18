@@ -1,5 +1,5 @@
 //! ```text
-//! vos-final-verifier-wasm-run <blob.wasm> <client|pvf> <runs> <name.proof>...
+//! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> <runs> <name.proof>...
 //! ```
 //!
 //! Each `<name>.proof` (a wrap proof, postcard) beside its `<name>.words`
@@ -25,8 +25,8 @@
 //! copy (one byte flipped at the middle) must not be accepted.
 //!
 //! ```text
-//! vos-final-verifier-wasm-run <blob.wasm> <client|pvf> judge <fixtures>
-//! vos-final-verifier-wasm-run <blob.wasm> <client|pvf> statements <name.input>...
+//! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> judge <fixtures>
+//! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> statements <name.input>...
 //! ```
 //!
 //! `judge`: every golden fixture under `<fixtures>` judged by the blob's

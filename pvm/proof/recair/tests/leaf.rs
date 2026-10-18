@@ -30,9 +30,9 @@ use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::HALT_PC;
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::{Proof, RecursionData, extract_recursion_data, prove_canonical_format};
-use vos_recair::leaf::{LeafCircuit, LeafValues, NodeOutput, PADDED_ROWS, State};
-use vos_recair::verifier::SegmentShape;
-use vos_recair::{Context, NoValue, Value};
+use vos_pvm_recair::leaf::{LeafCircuit, LeafValues, NodeOutput, PADDED_ROWS, State};
+use vos_pvm_recair::verifier::SegmentShape;
+use vos_pvm_recair::{Context, NoValue, Value};
 
 mod common;
 
@@ -165,7 +165,7 @@ fn a_leaf_states_its_segment() {
     ];
     assert_eq!(
         digest,
-        vos_recair::verifier::witness::digest_wires(&output.digest())
+        vos_pvm_recair::verifier::witness::digest_wires(&output.digest())
     );
     assert_eq!(context.value(wires.entry.var()), SecureField::one());
     assert_eq!(context.value(wires.halt.var()), SecureField::one());
@@ -173,8 +173,11 @@ fn a_leaf_states_its_segment() {
 
     // The transcript is the native recorder's, permutation for permutation.
     let mut transcript = Context::<SecureField>::new();
-    let verified =
-        vos_recair::verifier::verify_segment(&mut transcript, &segment.leaf.shape, &values.segment);
+    let verified = vos_pvm_recair::verifier::verify_segment(
+        &mut transcript,
+        &segment.leaf.shape,
+        &values.segment,
+    );
     let permutations = verified.channel.transcript().permutations();
     assert_eq!(permutations.len(), segment.data.transcript.records.len());
     for (i, (permutation, record)) in permutations
@@ -185,7 +188,7 @@ fn a_leaf_states_its_segment() {
         let words = record.output.map(|w| vos_pvm_poseidon2::M31::new(w.0));
         assert_eq!(
             *permutation,
-            vos_recair::value::wires_of(words),
+            vos_pvm_recair::value::wires_of(words),
             "permutation {i}"
         );
     }
@@ -226,9 +229,9 @@ fn a_leaf_states_its_segment() {
         "the wiring without values"
     );
     let started = std::time::Instant::now();
-    let proof = vos_recair::prove(&filled.circuit, &filled.witness).expect("proves");
+    let proof = vos_pvm_recair::prove(&filled.circuit, &filled.witness).expect("proves");
     let proving = started.elapsed();
-    let (_, hash) = vos_recair::circuit_commitment(&filled.circuit).unwrap();
+    let (_, hash) = vos_pvm_recair::circuit_commitment(&filled.circuit).unwrap();
     assert_eq!(
         segment.leaf.hash().0.map(|word| word.0),
         hash.map(|word| word.value()),
@@ -236,9 +239,9 @@ fn a_leaf_states_its_segment() {
     );
     assert_eq!(
         proof.outputs,
-        vos_recair::verifier::witness::digest_wires(&output.digest()).to_vec()
+        vos_pvm_recair::verifier::witness::digest_wires(&output.digest()).to_vec()
     );
-    vos_recair::verify(proof, &hash).expect("verifies");
+    vos_pvm_recair::verify(proof, &hash).expect("verifies");
     eprintln!(
         "the small kernel's leaf, padded to 2^{:?}: proved in {:.2}s",
         filled.circuit.log_sizes(),
@@ -264,7 +267,7 @@ fn a_cut_runs_leaves_continue_each_other() {
         assert!(refusals(&segment.leaf, values).is_empty());
         assert_eq!(
             digest(&segment.leaf, values),
-            vos_recair::verifier::witness::digest_wires(&output.digest())
+            vos_pvm_recair::verifier::witness::digest_wires(&output.digest())
         );
     }
 }

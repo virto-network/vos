@@ -3142,18 +3142,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
-name = "vos-final-verifier"
+name = "vos-pvm-final-verifier"
 version = "0.1.0"
 dependencies = [
  "num-traits",
  "postcard",
  "serde",
  "stwo",
- "vos-recair-air",
+ "vos-pvm-recair-air",
 ]
 
 [[package]]
-name = "vos-final-verifier-wasm-run"
+name = "vos-pvm-final-verifier-wasm-run"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -3169,7 +3169,7 @@ name = "vos-pvm-poseidon2"
 version = "0.1.0"
 
 [[package]]
-name = "vos-recair-air"
+name = "vos-pvm-recair-air"
 version = "0.1.0"
 dependencies = [
  "num-traits",
@@ -3183,7 +3183,7 @@ name = "vos-statement"
 version = "0.1.0"
 dependencies = [
  "blake2",
- "vos-final-verifier",
+ "vos-pvm-final-verifier",
 ]
 
 [[package]]

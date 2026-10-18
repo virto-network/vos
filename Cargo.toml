@@ -120,17 +120,17 @@ opt-level = 3
 [profile.test.package.vos-pvm-poseidon2]
 opt-level = 3
 # The recursion AIR's prover: its tests prove.
-[profile.dev.package.vos-recair-air]
+[profile.dev.package.vos-pvm-recair-air]
 opt-level = 3
-[profile.test.package.vos-recair-air]
+[profile.test.package.vos-pvm-recair-air]
 opt-level = 3
 [profile.dev.package.vos-statement]
 opt-level = 3
 [profile.test.package.vos-statement]
 opt-level = 3
-[profile.dev.package.vos-recair]
+[profile.dev.package.vos-pvm-recair]
 opt-level = 3
-[profile.test.package.vos-recair]
+[profile.test.package.vos-pvm-recair]
 opt-level = 3
 
 [workspace.dependencies]
@@ -142,9 +142,9 @@ vos-pvm-proof-derive = { path = "pvm/proof/derive" }
 vos-pvm-proof-verifier = { path = "pvm/proof/verifier" }
 vos-pvm-precompiles = { path = "pvm/proof/precompiles" }
 vos-pvm-poseidon2 = { path = "pvm/proof/poseidon2" }
-vos-recair-air = { path = "pvm/proof/recair-air" }
-vos-recair = { path = "pvm/proof/recair" }
-vos-final-verifier = { path = "pvm/proof/final-verifier" }
+vos-pvm-recair-air = { path = "pvm/proof/recair-air" }
+vos-pvm-recair = { path = "pvm/proof/recair" }
+vos-pvm-final-verifier = { path = "pvm/proof/final-verifier" }
 vos-statement = { path = "pvm/proof/statement" }
 vos-pvm = { path = "pvm/runtime" }
 vos-pvm-compiler = { path = "pvm/compiler" }

@@ -3,7 +3,7 @@
 //! recursion AIR's padded shape, 2^16 `p2`, 2^17 `qm31` and 2^16 `h8` rows.
 //!
 //! **A bound, without building the circuit.** The leaf is the in-AIR
-//! verifier of a segment of the class (`vos_recair::verifier`) plus its own
+//! verifier of a segment of the class (`vos_pvm_recair::verifier`) plus its own
 //! work, and its rows follow from the shape by the verifier's structure:
 //! - **the chips' AIR** ([`CHIPS`], [`RELATIONS`]): each chip's preprocessed
 //!   columns, its main and interaction columns as runs of masks, the
@@ -522,7 +522,7 @@ fn deep(trees: &[Vec<Column>; 4], lifting: u32) -> Deep {
     }
 
     // The powers of `α` the chains and the constants read, as
-    // `vos_recair::verifier::deep::prepare` takes them.
+    // `vos_pvm_recair::verifier::deep::prepare` takes them.
     let (mut powers, mut conjugates) = (BTreeSet::new(), BTreeSet::new());
     let mut point_rows = 0;
     for (point, exponents) in &by_point {
@@ -564,7 +564,7 @@ fn deep(trees: &[Vec<Column>; 4], lifting: u32) -> Deep {
     }
 }
 
-/// A leaf's rows by the verifier's pieces, as `vos_recair`'s context counts
+/// A leaf's rows by the verifier's pieces, as `vos_pvm_recair`'s context counts
 /// them (`Context::piece`): `[p2, qm31, h8]` each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Terms {
@@ -775,7 +775,7 @@ mod tests {
         }
     }
 
-    /// The window kernel's class-1 leaf, as `vos_recair` builds it: its rows
+    /// The window kernel's class-1 leaf, as `vos_pvm_recair` builds it: its rows
     /// by piece, its DEEP plan's 16 points, and the finalizing's allowance.
     #[test]
     fn the_window_kernels_leaf_is_counted() {

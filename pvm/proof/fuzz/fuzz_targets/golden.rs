@@ -4,7 +4,7 @@
 
 use std::sync::OnceLock;
 
-use vos_final_verifier::PUBLIC_WORDS;
+use vos_pvm_final_verifier::PUBLIC_WORDS;
 
 pub struct Golden {
     /// Its canonical encoding: postcard's, minimal varints. The mutation
@@ -23,7 +23,7 @@ impl Golden {
     /// words it was given, so that holds of any acceptance. A second proof
     /// of the golden words would be a part of the proof the transcript does
     /// not bind, which no mutation should find.
-    pub fn assert_is_golden(&self, proof: &vos_final_verifier::WrapProof) {
+    pub fn assert_is_golden(&self, proof: &vos_pvm_final_verifier::WrapProof) {
         let bytes = postcard::to_allocvec(proof).expect("encodes");
         assert!(
             bytes == self.proof,
@@ -40,13 +40,14 @@ pub fn golden() -> &'static Golden {
             .into_iter()
             .find(|fixture| fixture.name == "valid")
             .expect("the valid fixture");
-        let words = vos_final_verifier::Statement {
+        let words = vos_pvm_final_verifier::Statement {
             program: valid.input.program.0,
             io_hash: valid.input.statement.io_hash(),
         }
         .words();
-        vos_final_verifier::verify_bytes(&valid.proof, &words).expect("the golden wrap verifies");
-        let decoded = vos_final_verifier::decode(&valid.proof).expect("decodes");
+        vos_pvm_final_verifier::verify_bytes(&valid.proof, &words)
+            .expect("the golden wrap verifies");
+        let decoded = vos_pvm_final_verifier::decode(&valid.proof).expect("decodes");
         assert_eq!(
             postcard::to_allocvec(&decoded).expect("encodes"),
             valid.proof,

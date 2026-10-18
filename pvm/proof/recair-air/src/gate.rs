@@ -20,7 +20,7 @@
 //! constants are made from it and from `one`.
 //!
 //! **The circuit's builder checks two things statically,** on the
-//! preprocessed columns alone (`vos-recair`'s wiring check):
+//! preprocessed columns alone (`vos-pvm-recair`'s wiring check):
 //! 1. every address that any operand or public term uses is yielded exactly
 //!    once, with the multiplicity `−k` of its `k` uses;
 //! 2. the sum of the absolute multiplicities, the public uses among them, is

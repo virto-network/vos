@@ -21,7 +21,7 @@
 //!   registered again. 24 to 27 and 29 named it before its hardening (the
 //!   witness input, the removal of the curve chips, the AIR audit's fixes); 31,
 //!   33 and 34 named the hardened form with those columns, 31 at 44 queries.
-//!   28, 30 and 32 prove the recursion AIR (`vos-recair-air`) and keep their
+//!   28, 30 and 32 prove the recursion AIR (`vos-pvm-recair-air`) and keep their
 //!   numbers.
 //! - **36** is the Blake2s segment format the default entry points produce,
 //!   kept while the refine bundles, the chain proofs and their tests use it.
@@ -31,11 +31,11 @@
 //! - **28, 30, 32, 35 and 37** use the lossless encodings
 //!   ([`Encoding::Lossless`]) and exactly their parameters. 30 and 37 are
 //!   registered and refused until their AIRs and channels exist. 32 is
-//!   registered and refused although its AIR and channel exist: `vos-recair`
+//!   registered and refused although its AIR and channel exist: `vos-pvm-recair`
 //!   proves and verifies its proofs natively, pinning each circuit by its
 //!   hash, and no verifier outside the recursion reads a leaf or a fold. 28 is admitted:
-//!   `vos-recair` proves the wrap on the fork's Blake2b-256 channel and
-//!   `vos-final-verifier` verifies it, fold step 3 reviewed in the fork. A
+//!   `vos-pvm-recair` proves the wrap on the fork's Blake2b-256 channel and
+//!   `vos-pvm-final-verifier` verifies it, fold step 3 reviewed in the fork. A
 //!   segment verifier takes only a segment format ([`admitted_segment`]).
 //! - **The inner formats** grind 8 bits of interaction PoW. Segments (35)
 //!   take 40 queries and 24 bits of PoW: 62.86 proven bits, the query term

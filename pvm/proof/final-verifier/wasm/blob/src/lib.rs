@@ -19,7 +19,7 @@ extern crate alloc;
 
 use core::alloc::{GlobalAlloc, Layout};
 
-use vos_final_verifier::PUBLIC_WORDS;
+use vos_pvm_final_verifier::PUBLIC_WORDS;
 
 // ── sp-io's host allocator ABI, as `RuntimeAllocator` uses it ───────────
 
@@ -93,10 +93,10 @@ pub extern "C" fn verify(ptr: u32, len: u32) -> u32 {
     let Some((words, proof)) = split(input(ptr, len)) else {
         return 3;
     };
-    let Ok(proof) = vos_final_verifier::decode(proof) else {
+    let Ok(proof) = vos_pvm_final_verifier::decode(proof) else {
         return 2;
     };
-    match vos_final_verifier::verify(proof, &words) {
+    match vos_pvm_final_verifier::verify(proof, &words) {
         Ok(_) => 1,
         Err(_) => 0,
     }
@@ -104,7 +104,7 @@ pub extern "C" fn verify(ptr: u32, len: u32) -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn decode(ptr: u32, len: u32) -> u32 {
-    split(input(ptr, len)).is_some_and(|(_, proof)| vos_final_verifier::decode(proof).is_ok())
+    split(input(ptr, len)).is_some_and(|(_, proof)| vos_pvm_final_verifier::decode(proof).is_ok())
         as u32
 }
 

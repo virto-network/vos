@@ -2,7 +2,7 @@
 //! [`Statement`], its canonical encoding, its io-hash and its id, and
 //! [`judge`], the venue's check of a final proof against it.
 //!
-//! **What binds what.** The final proof (`vos-final-verifier`, format 28)
+//! **What binds what.** The final proof (`vos-pvm-final-verifier`, format 28)
 //! states two public inputs, the program id and the io-hash. The io-hash is
 //! BLAKE2b-256 of `vos/io/v1` and the statement's `public_args`, `output` and
 //! `roots` in their SCALE encoding, as the kernel computes it at its halt
@@ -34,7 +34,7 @@
 //!
 //! **Keys.** A venue remembers what it accepted by the statement's id
 //! ([`Statement::id`]), never by the proof's bytes or their hash: a proof has
-//! many encodings (`vos_final_verifier::decode`), and many proofs state one
+//! many encodings (`vos_pvm_final_verifier::decode`), and many proofs state one
 //! statement.
 //!
 //! **The id does not hash the format.** The format is a checked field, as
@@ -74,7 +74,7 @@ use blake2::{Blake2b, Digest};
 
 pub use codec::DecodeError;
 use codec::Reader;
-pub use vos_final_verifier;
+pub use vos_pvm_final_verifier;
 
 /// The io-hash's domain (`vos_pvm_precompiles::io::IO_HASH_DOMAIN`).
 pub const IO_DOMAIN: &[u8] = b"vos/io/v1";
@@ -82,7 +82,7 @@ pub const IO_DOMAIN: &[u8] = b"vos/io/v1";
 pub const ID_DOMAIN: &[u8] = b"vos/statement/v1";
 
 /// The format of the final proofs [`judge`] reads.
-pub const FORMAT: u32 = vos_final_verifier::FORMAT;
+pub const FORMAT: u32 = vos_pvm_final_verifier::FORMAT;
 
 /// The bytes of a [`RootRead`]'s encoding.
 pub(crate) const ROOT_READ_BYTES: usize = 1 + 32 + 8 + 32;
@@ -295,13 +295,13 @@ pub enum Refusal {
     Repeated,
     /// The final proof is refused against the venue's program id and the
     /// io-hash recomputed from the statement.
-    Proof(vos_final_verifier::Error),
+    Proof(vos_pvm_final_verifier::Error),
 }
 
 impl Refusal {
     /// The refusal's class, as every venue reports it: never 0, which
     /// reports an acceptance. A refused proof is `0x100` and the final
-    /// verifier's code (`vos_final_verifier::Error::code`).
+    /// verifier's code (`vos_pvm_final_verifier::Error::code`).
     pub fn code(&self) -> u32 {
         match self {
             Self::Statement(_) => 1,
@@ -342,14 +342,14 @@ pub fn code(verdict: &Result<StatementId, Refusal>) -> u32 {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admitted {
     pub id: StatementId,
-    pub words: [u32; vos_final_verifier::PUBLIC_WORDS],
+    pub words: [u32; vos_pvm_final_verifier::PUBLIC_WORDS],
 }
 
 impl Admitted {
     /// The final proof in `proof`'s bytes, verified against the admitted
     /// words; the statement's id when accepted.
     pub fn verify(&self, proof: &[u8]) -> Result<StatementId, Refusal> {
-        vos_final_verifier::verify_bytes(proof, &self.words).map_err(Refusal::Proof)?;
+        vos_pvm_final_verifier::verify_bytes(proof, &self.words).map_err(Refusal::Proof)?;
         Ok(self.id)
     }
 }
@@ -394,7 +394,7 @@ pub fn admit(
     if venue.seen(&id) {
         return Err(Refusal::Repeated);
     }
-    let words = vos_final_verifier::Statement {
+    let words = vos_pvm_final_verifier::Statement {
         program: program.0,
         io_hash,
     }

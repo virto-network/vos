@@ -7,7 +7,7 @@
 # canonicalization), with sp-io's freeing-bump host allocator. Retired
 # instructions by `perf_event`.
 [package]
-name = "vos-final-verifier-wasm-run"
+name = "vos-pvm-final-verifier-wasm-run"
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"

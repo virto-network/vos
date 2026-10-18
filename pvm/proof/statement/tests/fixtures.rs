@@ -11,7 +11,7 @@ mod jam;
 use vos_statement::Refusal;
 use vos_statement::fixtures::{self, Fixture};
 use vos_statement::model::judge_bytes;
-use vos_statement::vos_final_verifier::{self, MAX_PROOF_BYTES};
+use vos_statement::vos_pvm_final_verifier::{self, MAX_PROOF_BYTES};
 
 fn load() -> Vec<Fixture> {
     let fixtures = fixtures::load(&fixtures::directory());
@@ -94,7 +94,7 @@ fn a_proof_too_long_is_refused_before_its_lookup() {
     let native = vos_statement::code(&valid.input.judge(&long));
     assert_eq!(
         native,
-        Refusal::Proof(vos_final_verifier::Error::Length).code()
+        Refusal::Proof(vos_pvm_final_verifier::Error::Length).code()
     );
 
     let (_, report) = jam::run(&program, &jam::judge_request(&valid.input), &long);
@@ -102,7 +102,7 @@ fn a_proof_too_long_is_refused_before_its_lookup() {
     assert_eq!(report.verdict, jam::REJECT);
     assert_eq!(report.gas[1], 0, "no lookup");
 
-    let words = vos_final_verifier::Statement {
+    let words = vos_pvm_final_verifier::Statement {
         program: valid.input.program.0,
         io_hash: valid.input.statement.io_hash(),
     }

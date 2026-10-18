@@ -48,7 +48,7 @@ native verifier, and the build of slice 5's M1.
    The window kernel's 22 chips, 4,223 constraints and 1,109 fractions compile
    to 26,812 QM31 gate rows [measured]; per-relation challenges, next-row masks,
    paired and unpaired logup and intermediates need no special case. On the
-   hardened AIR (25 chips, 5,177 constraints) the built compiler (`vos-recair`'s
+   hardened AIR (25 chips, 5,177 constraints) the built compiler (`vos-pvm-recair`'s
    `compile`, slice 5's 5.9) emits 29,443 rows and 573 `α`-power rows, the
    re-baselined count exactly (`R/count-hardened.log`) [measured].
 4. **A leaf verifying the window kernel's segment** (8,009 columns, blowup 4,
@@ -394,7 +394,7 @@ shape is fixed, and a circuit pins it.
   query position is verified twice, harmlessly.
 - **The witness builder** expands Stwo's decommitment, whose `hash_witness`
   sends each sibling once across queries
-  (`ST/stwo/src/core/vcs_lifted/verifier.rs:155-185`): `vos-recair`'s
+  (`ST/stwo/src/core/vcs_lifted/verifier.rs:155-185`): `vos-pvm-recair`'s
   `expand_decommitment` replays that walk and records each query's full path,
   and the FRI layers' siblings likewise.
 - **Query bits** come from the drawn word: limb extraction, a 31-bit
@@ -457,7 +457,7 @@ permutations; 1,091 `h8`; 1,139 QM31 [model].
 
 ### 4.8 Built
 
-`vos-recair`'s `verifier` (slice 5's 5.10) builds §4.1–§4.6 as pieces on a
+`vos-pvm-recair`'s `verifier` (slice 5's 5.10) builds §4.1–§4.6 as pieces on a
 `Context`, composed in the native verifier's order; on real format-35
 proofs its transcript is the native recorder's permutation for
 permutation, and a tamper is refused by the check the native verifier
@@ -483,7 +483,7 @@ refuses it with. What the build found against the model:
   shape holds no boundary chip and its logup check is the claimed sums'
   total, as `verify_with_explicit_components` checks it. The class-1 topology's rows
   are pinned term by term beside the model (`recair/tests/leaves.rs`).
-- **The kernel leaves** (slice 5's 5.12, `vos-recair`'s `leaf`): the window
+- **The kernel leaves** (slice 5's 5.12, `vos-pvm-recair`'s `leaf`): the window
   kernel's real segments verified in their classes' leaves, which prove and
   verify. The leaf's own work is 45 `p2` rows (the two state digests, 19
   permutations each, and the output's 7) and 535 `qm31` (the flags 85, the
@@ -615,7 +615,7 @@ multiverifier structure (`UP/circuit_multiverifier/src/verify.rs:52-90`):
 - **Memory and time per fold:** those of the padded shape, 0.6–1.4 GiB and
   1.2–2.6 s, plus its Poseidon2 commitment [projected].
 
-**Built** (slice 5's 5.13, `vos-recair`'s `fold`) [measured]:
+**Built** (slice 5's 5.13, `vos-pvm-recair`'s `fold`) [measured]:
 - **A child's verification** is 5.10's pieces over the recursion AIR: its
   three components compiled by 5.9's compiler from their own `evaluate`
   (p2's 303 constraints in 1,935 rows, `qm31`'s 3 in 74, `h8`'s 7 in 92,
@@ -682,7 +682,7 @@ and fold layout of §1.1 is unchanged.
   18 queries and 4 FRI layers. The fit is on a proxy of at most 400 columns
   and a trivial AIR; 458 columns and 313 degree-3 constraints are a mild
   extrapolation, well under the 150M gate.
-- **Built** (slice 5's 5.14, `vos-recair`'s `wrap`) [measured]: the root's
+- **Built** (slice 5's 5.14, `vos-pvm-recair`'s `wrap`) [measured]: the root's
   verification is a fold child's (`fold::verify_node`), plus the program id
   from its 44-word preimage, the one-hot choice among the program's leaf
   circuits and `H_fold` (a constant), `W = H_fold`, the three lanes of the
@@ -697,15 +697,15 @@ and fold layout of §1.1 is unchanged.
   the wrap to about 280 columns and about 67M gas [model], at the price of a
   second component set.
 
-## 8. `vos-final-verifier`
+## 8. `vos-pvm-final-verifier`
 
 At `pvm/proof/final-verifier`, no_std, for x86, wasm32 and riscv64em-javm
 (`proving.md` §3.6). The source uses no nightly feature: it builds on stable
 for x86 and wasm32, and the JAM build runs on the pinned nightly with
 build-std. It holds:
-- **`vos-recair-air`** (`pvm/proof/recair-air`), the three components'
+- **`vos-pvm-recair-air`** (`pvm/proof/recair-air`), the three components'
   constraint bodies, no_std, with no prover dependency, shared with the
-  prover `vos-recair` (`pvm/proof/recair`; the bodies `SP/count/src/rec.rs`
+  prover `vos-pvm-recair` (`pvm/proof/recair`; the bodies `SP/count/src/rec.rs`
   states);
 - the wrap's constants: its preprocessed root, component log sizes, column
   ids, the parameters of §7, the format number;
@@ -792,13 +792,13 @@ Ordered so feasibility is retired first. Weeks are engineer-weeks
 
 | # | deliverable | tests | gate | weeks |
 |---|---|---|---|---|
-| 1 | **The gate VM:** `vos-recair` (`pvm/proof/recair`) with `Context` and its static checks (§1.1), the three components and their trace generation, padding rows filled, the `Gate` relation with signed multiplicities, constants, padding, preprocessing, the circuit hash; the bodies of §1 in `vos-recair-air` | random circuits proved and verified natively on the Poseidon2 channel; yields exactly once; tamper per component and mode; the permutation against `poseidon2::permute` | a 10k-gate circuit proves and verifies; degree ≤ 3 audited; a three-component multi-fraction logup at three log sizes proves (§11, R5); `vos-final-verifier`'s skeleton builds no_std (stable for x86 and wasm32, the pinned nightly for JAM) | 3–4 |
+| 1 | **The gate VM:** `vos-pvm-recair` (`pvm/proof/recair`) with `Context` and its static checks (§1.1), the three components and their trace generation, padding rows filled, the `Gate` relation with signed multiplicities, constants, padding, preprocessing, the circuit hash; the bodies of §1 in `vos-pvm-recair-air` | random circuits proved and verified natively on the Poseidon2 channel; yields exactly once; tamper per component and mode; the permutation against `poseidon2::permute` | a 10k-gate circuit proves and verifies; degree ≤ 3 audited; a three-component multi-fraction logup at three log sizes proves (§11, R5); `vos-pvm-final-verifier`'s skeleton builds no_std (stable for x86 and wasm32, the pinned nightly for JAM) | 3–4 |
 | 2 | **The gate compiler**, beside step 1 | §3's four tests on all 25 chips | 25/25 equivalent; counts within 1% of the count re-baselined on the hardened AIR (`SP/count` re-run; `SP/logs/count.log` predates it) | 1–2 |
 | 3 | **The in-AIR verifier's pieces:** channel, lifted Merkle with `expand_decommitment`, FRI (fold step 1), DEEP with `h8`, OODS, logup sums | each against the native code on recorded data; transcript equality with `Poseidon2M31Channel`'s recorder | every piece accepts real data and refuses each tamper | 3–4 |
 | 4 | **COMPARE's leaf** (first gate), and **the window kernel leaf's topology** (`Context<NoValue>`, no proof) | a COMPARE proof verified in circuit, the circuit proved and verified natively; tampered OODS sample, queried value, sibling, FRI value and nonce refused; the topology's rows pinned per term of the re-baselined count, not only in total | accepted; rows within 15% of 8,644 / 10,352 / 280 (format 35, 40 queries); ≤ 1 s; the topology within 2^16 / 2^17 / 2^16. **Passed** (slice 5's 5.11): 7,732 / 10,279 / 240, 0.21–0.24 s; the topology 57,655 / 101,638 / 46,000 | 1–2 |
 | 5 | **The window kernel's leaf**, and the solvency predicate's: boundary states mixed as bytes, entry and exit digests, the flags, the A.3 output | spike 3's real segment on the Poseidon2 channel; in-circuit and native transcripts equal; a tampered boundary byte refused | rows within the padded shape; ≤ 4 GiB; ≤ 1× the segment's proving (target 0.13–0.5×) | 2–3 |
 | 6 | **The fold and the fixed point** | a fold of two leaves, a fold of two folds within the constant shape; a tree over four segments; refusals: wrong program, gap, broken continuity, prefix, mid-start, wrong child circuit, a child carrying a foreign word, a leaf carrying a wrong program id | the fold verifies two folds in the shape; memory and time of a leaf. **Passed** (slice 5's 5.13): 32,167 / 42,896 / 4,048, 1.5 s, 942 MiB | 2–3 |
-| 7 | **The final wrap:** Blake2b-256 Merkle and channel in our Stwo fork, fold step 3 admitted, the wrap circuit, `vos-final-verifier` | the fork's Fable review, then its push to olanod/stwo; tamper tests on fold step 3 and Blake2b; Wasm and JAM-only host verification | ≤ 150M gas unmasked on the JAM-only host; ≤ 2^17 rows; ≤ 8 GiB unmasked. **Passed** (slice 5's 5.14): 96.4M gas, 2^15 tallest, 2.5 GiB heap, 5.45 s | 3–4 |
+| 7 | **The final wrap:** Blake2b-256 Merkle and channel in our Stwo fork, fold step 3 admitted, the wrap circuit, `vos-pvm-final-verifier` | the fork's Fable review, then its push to olanod/stwo; tamper tests on fold step 3 and Blake2b; Wasm and JAM-only host verification | ≤ 150M gas unmasked on the JAM-only host; ≤ 2^17 rows; ≤ 8 GiB unmasked. **Passed** (slice 5's 5.14): 96.4M gas, 2^15 tallest, 2.5 GiB heap, 5.45 s | 3–4 |
 | 8 | **End to end:** `vos-statement`, the window statement and the solvency predicate, golden fixtures (A.6) | every venue judges the fixtures alike | both statements verified natively, in Wasm and on JAM. **Passed** (slice 5's 5.15): eleven fixtures judged alike natively, in Wasm (PVF and client) and on the JAM-only host; both statements accepted at all three | 2 |
 | | **total** | | | **17–24** |
 

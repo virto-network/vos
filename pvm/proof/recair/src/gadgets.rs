@@ -12,7 +12,7 @@ use vos_pvm_poseidon2::{DRAW_DOMAIN, RATE};
 
 use crate::context::{Bit, Context, Message, P2Handle, P2Row, Var};
 use crate::value::Value;
-use vos_recair_air::p2::P2Mode;
+use vos_pvm_recair_air::p2::P2Mode;
 
 fn zero_message<V: Value>() -> Message<V> {
     Message::Free(V::from_qm31(SecureField::zero()))

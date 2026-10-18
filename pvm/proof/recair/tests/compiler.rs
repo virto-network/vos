@@ -39,10 +39,10 @@ use vos_pvm_proof::framework_access::{
 };
 use vos_pvm_proof::poseidon2::Poseidon2M31Channel;
 use vos_pvm_proof::{Proof, reconstruct_oods_for_recursion};
-use vos_recair::compile::{
+use vos_pvm_recair::compile::{
     self, Compiled, OodsValues, Operand, Recording, Row, compose, compose_values,
 };
-use vos_recair::{Context, NoValue, Value, Var};
+use vos_pvm_recair::{Context, NoValue, Value, Var};
 
 use common::Rng;
 
@@ -472,13 +472,13 @@ fn every_sample_a_chip_reads_moves_its_combination() {
 }
 
 /// The recursion AIR's three components, a fold's child's AIR
-/// (`vos_recair::fold::child`), at the padded shape's log sizes: tests 1
+/// (`vos_pvm_recair::fold::child`), at the padded shape's log sizes: tests 1
 /// and 2, each compiled constraint its recording's at random points over
 /// M31 and QM31 values, emitted and evaluated, and each component's
 /// combination the verifier's; and test 3, every input moving it.
 #[test]
 fn the_recursion_airs_components_compile_to_their_recordings() {
-    use vos_recair_air::{GateRelation, h8, p2, qm31};
+    use vos_pvm_recair_air::{GateRelation, h8, p2, qm31};
     let mut channel = Poseidon2M31Channel::default();
     channel.mix_u64(13);
     let gate = GateRelation::draw(&mut channel);
@@ -799,9 +799,9 @@ fn the_compiled_shape_proves_and_verifies() {
         wiring.finalize().expect("the wiring checks").circuit,
         filled.circuit
     );
-    let proof = vos_recair::prove(&filled.circuit, &filled.witness).expect("proves");
-    let (_, hash) = vos_recair::circuit_commitment(&filled.circuit).unwrap();
-    vos_recair::verify(proof, &hash).expect("verifies");
+    let proof = vos_pvm_recair::prove(&filled.circuit, &filled.witness).expect("proves");
+    let (_, hash) = vos_pvm_recair::circuit_commitment(&filled.circuit).unwrap();
+    vos_pvm_recair::verify(proof, &hash).expect("verifies");
 }
 
 /// A segment proof's OODS data, as the in-AIR verifier receives it.
