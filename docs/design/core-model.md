@@ -706,8 +706,10 @@ The Local (replica-only) lane is deferred until a use case needs it.
   read, scan and write of a refine is witnessed against the root the
   chain stores (section 12).
 - Hashing inside the PVM uses the hash precompile (section 11.2).
-- No global state root on VOS. Agents deployed on JAM keep one, over
-  their whole keyspace.
+- Every agent has a root on both hosts: committed rows sit under `0x03`,
+  VOS keeps one tree per agent over them, and that tree is the node at
+  `0x03` of a JAM agent's whole-keyspace tree. A space has a root per
+  window, built by its representative (`proving.md` §7).
 
 ### 9.4 Merge lane
 
@@ -889,11 +891,9 @@ outbox sequence numbers, which receivers deduplicate.
   delivered as witnesses (rows plus a `BatchProof` against `CommittedMap`
   roots). Plain fields and tables have no root, so the macro rejects any
   use of them.
-- **Outputs:**
-  - **public:** the return value, the roots before and after, and the
-    program hash;
-  - **private:** its writes to committed fields, bound by the root after.
-    The enclosing command applies them as ordinary writes.
+- **Outputs:** public: the statement, its program id, space, `#[public]`
+  arguments, output and the roots it read (`proving.md` §3.6); writes are
+  not built.
 - A live call runs that same kernel as an inner machine, so what runs is
   what gets proven. The agent records the program hash, the witness and the
   output with the agent's replicated state. The record is internal to the
@@ -907,9 +907,10 @@ outbox sequence numbers, which receivers deduplicate.
     changes, before the message enters the log. Refine sees only verified
     claims, and a batch never stalls on a verification that takes seconds.
   - On JAM, an on-chain agent's refine runs the verifier program itself,
-    and its accumulate applies the public output. The settlement verifier
-    takes 10.68M instructions and about 29M gas under Gray Paper 0.8.0 for
-    one segment (slice 1). A whole window needs aggregation (section 11.4).
+    and its accumulate applies the public output. A window's segments
+    fold into one final proof (slice 5): 96.4M JAM gas unmasked, about
+    116–119M masked with postcard [measured], verified in a JAM
+    statements service's refine.
 
 ### 11.2 Precompiles [decided direction; prototyped in S5b]
 
@@ -948,6 +949,11 @@ outbox sequence numbers, which receivers deduplicate.
 
 ### 11.3 Cost and size guideline [proposed]
 
+The proving figures below are S5's measurements of the retired segment
+formats. The current ones are `proving.md` A.7 and `slice-5-progress.md`
+("Slice 5 accepted", "Measured"): on format 35 a class-1 segment proves in
+6.7–10.7 s at 4.79 GiB of heap.
+
 - **Prover memory per segment** ≈ 4.6 GiB + 170 KiB × steps + 39 MiB ×
   compressions (S5, S5b). Steps include the 66 a compression takes, so a
   compression costs about 50 MiB in all. Segments are sized to the prover's memory, not to
@@ -981,13 +987,12 @@ Status today (checked in the code, not only by the review):
 - **Not hiding.** The pinned Stwo revision has no zero-knowledge masking
   (no randomized trace or blinding). STARK openings can leak information
   about the trace, and so about private inputs.
-- **Witness-free verification is incomplete.** A STARK-only verifier exists
-  (`verify_refine_bundle_authenticated`), but it reports "replay required":
-  host-call boundaries and machine states are not proven inside the proof.
-  Full soundness today needs a replay with the private arguments. S5's
-  verify figures are replay verification.
-- **The arguments are exposed by commitment.** The bundle carries a plain
-  hash of the arguments, which is not hiding.
+- **Witness-free verification:** a statement's final proof binds the
+  whole run (its entry, its halt and its io-hash). The refine-bundle path
+  (format 36) is retired by the owner's decision of 2026-10-19, and
+  deleted at slice 6's 6.9.
+- **No plain hash of private inputs leaves:** the io-hash covers the
+  public arguments, the output and the roots.
 
 Requirements before any proof leaves a space:
 
@@ -998,16 +1003,19 @@ Requirements before any proof leaves a space:
    pure (section 11.1), so their only host calls are precompiles, which
    are already in-AIR (S5b).
 3. **No plain hash of private inputs** in anything published.
-4. **A minimal published format.** A published proof carries only:
+4. **A minimal published format** (met by the statement, slice 5, and
+   format 39, slice 6). A published proof carries only:
    - the public output: the return value, the roots and the program hash;
    - a fixed shape class.
 
    Today's bundle also carries the gas limit, host boundaries and
    per-slice machine states, which must stay out.
-5. **Fixed shape classes:** segment counts and trace sizes are padded to a
+5. **Fixed shape classes** (met by the shape per kernel and the padded
+   fold shape, slice 5): segment counts and trace sizes are padded to a
    few canonical shapes (the existing canonical-shape work), so a proof
    does not reveal how busy a window was.
-6. **Window aggregation** for on-chain verification. A window is many
+6. **Window aggregation** for on-chain verification (met by the
+   recursion, slice 5). A window is many
    segments, and it must fit a JAM work package and the on-chain verifier's
    gas.
 
@@ -1067,7 +1075,8 @@ These form a prover track that runs alongside the core slices (section 16).
       which is how the builder learns where pages live;
     - solicits the program preimages the package names.
     - It verifies nothing else: the builder is trusted for the batch's
-      content until proofs (slice 5).
+      content; statements are verified by the statements service
+      (slice 6), batches are not proved.
   - **Root continuity serializes an agent's packages.** The builder
     chains them, and recovers from a refused, late or foreign package.
   - **Pages:**
@@ -1148,8 +1157,7 @@ These form a prover track that runs alongside the core slices (section 16).
     the actors installed for JAM. Its recompiler, the kernel setting now
     granted, fails at start on the laptop: PolkaVM's sandbox reads every
     CPU's L3 cache entry, which its low-power cores lack.
-- **Next:** the per-space aggregate-balance agent that accepts settlement
-  proofs (Clerk settlement), once the privacy track's aggregation exists.
+- **Next:** the Clerk's settlement follows slice 6.
 
 ## 13. Portability [decided direction]
 
@@ -1315,14 +1323,17 @@ prototypes exist where noted.
 
 7. Chained segments on the refine path, sized by prover memory (S5, S5b).
 8. Reduce the BLAKE2b chip's memory per compression (S5b).
-9. Zero-knowledge proving (section 11.4, requirement 1). It needs a newer
-   Stwo, and moving Stwo also frees the workspace toolchain: the pinned
-   revision builds only on nightlies up to mid-2025.
-10. Witness-free verification of attestable programs, with no plain hash of
-    private inputs (requirements 2 and 3).
-11. The minimal published proof format and fixed shape classes
-    (requirements 4 and 5).
-12. Window aggregation for on-chain verification (requirement 6).
+9. ~~Zero-knowledge proving (section 11.4, requirement 1).~~ The final
+   proof is masked in slice 6 (format 39, `proving.md` §5), on the pinned
+   Stwo fork with no Stwo move.
+10. ~~Witness-free verification of attestable programs, with no plain hash
+    of private inputs (requirements 2 and 3).~~ Done by the statement
+    (slice 5).
+11. ~~The minimal published proof format and fixed shape classes
+    (requirements 4 and 5).~~ Done by the statement and the shape per
+    kernel (slice 5).
+12. ~~Window aggregation for on-chain verification (requirement 6).~~ Done
+    by the recursion (slice 5).
 13. ~~Move Ristretto and the scalar operations (ids 110–114) into the VOS
     range.~~ Removed instead: their chips and ids are gone from the prover,
     the runtime and the shims; a generic bignum chip (slice 7) takes their
@@ -1412,9 +1423,10 @@ knowledge and aggregation are the longest work and gate goal 8.
    cold reads.
 5. ~~The context API of the actor framework (section 6.2).~~ Decided for
    v1 in `slice-2-one-node.md`.
-6. Zero-knowledge proving: the approach in the prover and its chips, and
-   its cost.
-7. Window aggregation: recursion or another scheme, and its on-chain gas.
+6. ~~Zero-knowledge proving: the approach in the prover and its chips, and
+   its cost.~~ Variant (c) on the final wrap (`proving.md` §5).
+7. ~~Window aggregation: recursion or another scheme, and its on-chain
+   gas.~~ The recursion (`recursion-air.md`).
 8. Refining on any replica with read-set validation: when it becomes
    necessary.
 9. Licensing model, metering, bytecode visibility.
