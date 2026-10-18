@@ -31,6 +31,12 @@
 //! Every tree is nonempty, so the Merkle verifier checks each tree's queried
 //! values before the DEEP answers read them.
 //!
+//! **The bytes** ([`decode`]) are one postcard encoding of a [`WrapProof`],
+//! at most [`MAX_PROOF_BYTES`] long and with nothing after it. Postcard does
+//! not require its varints minimal, so one proof has many encodings: a
+//! proof's bytes, or their hash, are no key for it. A venue keys what it has
+//! accepted on the statement's id (`vos-statement`), never on the proof.
+//!
 //! The crate is `no_std`, uses no nightly feature, and builds on stable for
 //! x86 and wasm32 and on the pinned nightly for the PVM.
 
@@ -87,6 +93,11 @@ pub const CONFIG: PcsConfig = PcsConfig {
 /// Format 28's interaction PoW.
 pub const INTERACTION_POW_BITS: u32 = 8;
 
+/// The longest wrap proof [`decode`] reads, in bytes: a bound on a venue's
+/// decode and verify work, which a weight is charged by. A wrap proof is
+/// 122–125 KB.
+pub const MAX_PROOF_BYTES: usize = 256 << 10;
+
 /// The trees a Stwo proof commits: preprocessed, main, interaction and
 /// composition.
 const TREES: usize = 4;
@@ -139,8 +150,10 @@ impl Statement {
 /// Why a wrap proof is refused.
 #[derive(Clone, Debug)]
 pub enum Error {
-    /// The bytes do not decode as a wrap proof.
+    /// The bytes do not decode as exactly one wrap proof.
     Decode,
+    /// The bytes are longer than [`MAX_PROOF_BYTES`].
+    Length,
     /// A public word out of its range.
     PublicWords,
     /// Another format, configuration or log sizes.
@@ -163,6 +176,7 @@ impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Decode => f.write_str("the bytes are not a wrap proof"),
+            Self::Length => f.write_str("the bytes are longer than a wrap proof"),
             Self::PublicWords => f.write_str("a public word is out of its range"),
             Self::Format => f.write_str("the proof is not of format 28 at the wrap's log sizes"),
             Self::Circuit => f.write_str("the proof is of another circuit"),
@@ -175,11 +189,51 @@ impl core::fmt::Display for Error {
     }
 }
 
-/// Verifies the wrap proof in `bytes` (postcard) against the public
+impl Error {
+    /// The refusal's class, a byte every venue reports alike: its variant,
+    /// and a Stwo refusal's kind (`0x10` and up).
+    pub fn code(&self) -> u8 {
+        match self {
+            Self::Decode => 1,
+            Self::Length => 2,
+            Self::PublicWords => 3,
+            Self::Format => 4,
+            Self::Circuit => 5,
+            Self::Shape(_) => 6,
+            Self::Noncanonical => 7,
+            Self::InteractionPow => 8,
+            Self::Logup => 9,
+            Self::Stark(error) => {
+                0x10 | match error {
+                    VerificationError::InvalidStructure(_) => 1,
+                    VerificationError::Merkle(_) => 2,
+                    VerificationError::OodsNotMatching => 3,
+                    VerificationError::Fri(_) => 4,
+                    VerificationError::ProofOfWork => 5,
+                    VerificationError::InvalidLiftingLogSize(_) => 6,
+                    VerificationError::InvalidCanonicCosetLogSize(_) => 7,
+                }
+            }
+        }
+    }
+}
+
+/// The wrap proof in `bytes`: at most [`MAX_PROOF_BYTES`], one postcard
+/// encoding and nothing after it.
+pub fn decode(bytes: &[u8]) -> Result<WrapProof, Error> {
+    if bytes.len() > MAX_PROOF_BYTES {
+        return Err(Error::Length);
+    }
+    match postcard::take_from_bytes(bytes) {
+        Ok((proof, [])) => Ok(proof),
+        _ => Err(Error::Decode),
+    }
+}
+
+/// Verifies the wrap proof in `bytes` ([`decode`]) against the public
 /// `words`, and returns the statement they make.
 pub fn verify_bytes(bytes: &[u8], words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
-    let proof: WrapProof = postcard::from_bytes(bytes).map_err(|_| Error::Decode)?;
-    verify(proof, words)
+    verify(decode(bytes)?, words)
 }
 
 /// Verifies `proof` against the public `words`, and returns the statement

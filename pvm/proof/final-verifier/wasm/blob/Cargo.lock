@@ -564,7 +564,6 @@ dependencies = [
 name = "vos-final-verifier-wasm"
 version = "0.1.0"
 dependencies = [
- "postcard",
  "vos-final-verifier",
 ]
 

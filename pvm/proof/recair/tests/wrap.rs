@@ -26,8 +26,11 @@ use std::time::Instant;
 
 use stwo::core::fields::m31::{BaseField, P};
 use stwo::core::fields::qm31::SecureField;
+use stwo::core::fri::FriVerificationError;
 use stwo::core::poly::line::LinePoly;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
+use stwo::core::vcs_lifted::verifier::MerkleVerificationError;
+use stwo::core::verifier::VerificationError;
 use vos_final_verifier::{Error, PUBLIC_WORDS, Statement, WrapProof};
 use vos_pvm_proof::Proof;
 use vos_pvm_proof::format::{SEGMENT, WRAP};
@@ -530,24 +533,64 @@ fn the_final_verifier_refuses_a_tampered_wrap() {
     ));
 }
 
-/// Every malformed shape is refused with an error, before Stwo indexes the
-/// proof: the trees' counts, a column's samples, a tree's columns, the
-/// queried values, FRI's layers and last layer, a noncanonical limb, and
-/// the format, configuration and log sizes.
+/// Every malformed shape is refused with an error, each by the check meant
+/// for it: the trees' counts, a column's samples and a tree's columns by the
+/// shape's check, before Stwo indexes the proof; a noncanonical limb; the
+/// format, configuration and log sizes; and by Stwo's own errors the
+/// queried values' columns and values (the Merkle verifier's shape check),
+/// FRI's layer count, a layer's witness and the last layer's degree.
 #[test]
 fn the_final_verifier_refuses_a_malformed_shape() {
     let one = one_segment();
     let words = one.wrapped.words;
     type Malform = Box<dyn Fn(&mut WrapProof)>;
-    let shapes: Vec<(&str, Malform)> = vec![
+    type Expect = fn(&Error) -> bool;
+    let shape: Expect = |error| matches!(error, Error::Shape(_));
+    let noncanonical: Expect = |error| matches!(error, Error::Noncanonical);
+    let format: Expect = |error| matches!(error, Error::Format);
+    let queried: Expect = |error| {
+        matches!(
+            error,
+            Error::Stark(VerificationError::Merkle(
+                MerkleVerificationError::QueriedValuesShapeMismatch
+            ))
+        )
+    };
+    let layers: Expect = |error| {
+        matches!(
+            error,
+            Error::Stark(VerificationError::Fri(
+                FriVerificationError::InvalidNumFriLayers
+            ))
+        )
+    };
+    let witness: Expect = |error| {
+        matches!(
+            error,
+            Error::Stark(VerificationError::Fri(
+                FriVerificationError::InnerLayerEvaluationsInvalid { inner_layer: 0 }
+            ))
+        )
+    };
+    let last: Expect = |error| {
+        matches!(
+            error,
+            Error::Stark(VerificationError::Fri(
+                FriVerificationError::LastLayerDegreeInvalid
+            ))
+        )
+    };
+    let shapes: Vec<(&str, Expect, Malform)> = vec![
         (
             "a commitment fewer",
+            shape,
             Box::new(|p| {
                 p.stark_proof.0.commitments.pop();
             }),
         ),
         (
             "a commitment more",
+            shape,
             Box::new(|p| {
                 let extra = p.stark_proof.0.commitments[0];
                 p.stark_proof.0.commitments.push(extra);
@@ -555,68 +598,80 @@ fn the_final_verifier_refuses_a_malformed_shape() {
         ),
         (
             "a tree of samples fewer",
+            shape,
             Box::new(|p| {
                 p.stark_proof.0.sampled_values.pop();
             }),
         ),
         (
             "a column's sample fewer",
+            shape,
             Box::new(|p| {
                 p.stark_proof.0.sampled_values[1][0].pop();
             }),
         ),
         (
             "a column's sample more",
+            shape,
             Box::new(|p| p.stark_proof.0.sampled_values[2][3].push(SecureField::default())),
         ),
         (
             "a composition column's sample fewer",
+            shape,
             Box::new(|p| {
                 p.stark_proof.0.sampled_values[3][7].pop();
             }),
         ),
         (
             "a column of samples fewer",
+            shape,
             Box::new(|p| {
                 p.stark_proof.0.sampled_values[1].pop();
             }),
         ),
         (
             "a preprocessed column's samples empty",
+            shape,
             Box::new(|p| p.stark_proof.0.sampled_values[0][0].clear()),
         ),
         (
             "a decommitment fewer",
+            shape,
             Box::new(|p| {
                 p.stark_proof.0.decommitments.pop();
             }),
         ),
         (
             "a tree of queried values fewer",
+            shape,
             Box::new(|p| {
                 p.stark_proof.0.queried_values.pop();
             }),
         ),
         (
             "a column of queried values fewer",
+            queried,
             Box::new(|p| {
                 p.stark_proof.0.queried_values[2].pop();
             }),
         ),
         (
             "a queried value fewer",
+            queried,
             Box::new(|p| {
                 p.stark_proof.0.queried_values[0][4].pop();
             }),
         ),
         (
             "an inner FRI layer fewer",
+            layers,
             Box::new(|p| {
                 p.stark_proof.0.fri_proof.inner_layers.pop();
             }),
         ),
         (
             "an inner FRI layer more",
+            layers,
             Box::new(|p| {
                 let extra = p.stark_proof.0.fri_proof.inner_layers[0].clone();
                 p.stark_proof.0.fri_proof.inner_layers.push(extra);
@@ -624,12 +679,14 @@ fn the_final_verifier_refuses_a_malformed_shape() {
         ),
         (
             "a FRI witness value fewer",
+            witness,
             Box::new(|p| {
                 p.stark_proof.0.fri_proof.inner_layers[0].fri_witness.pop();
             }),
         ),
         (
             "a last layer twice as long",
+            last,
             Box::new(|p| {
                 let mut coeffs = p.stark_proof.0.fri_proof.last_layer_poly.to_vec();
                 coeffs.extend(coeffs.clone());
@@ -638,6 +695,7 @@ fn the_final_verifier_refuses_a_malformed_shape() {
         ),
         (
             "a noncanonical sampled value",
+            noncanonical,
             Box::new(|p| {
                 p.stark_proof.0.sampled_values[1][0][0] =
                     SecureField::from_m31_array([BaseField::from_u32_unchecked(P); 4])
@@ -645,36 +703,72 @@ fn the_final_verifier_refuses_a_malformed_shape() {
         ),
         (
             "a noncanonical queried value",
+            noncanonical,
             Box::new(|p| {
                 p.stark_proof.0.queried_values[1][0][0] = BaseField::from_u32_unchecked(P)
             }),
         ),
         (
             "a noncanonical claimed sum",
+            noncanonical,
             Box::new(|p| {
                 p.claimed_sums[0] =
                     SecureField::from_m31_array([BaseField::from_u32_unchecked(P + 3); 4])
             }),
         ),
-        ("another format", Box::new(|p| p.format_version = 32)),
-        ("other log sizes", Box::new(|p| p.log_sizes[2] += 1)),
+        (
+            "another format",
+            format,
+            Box::new(|p| p.format_version = 32),
+        ),
+        ("other log sizes", format, Box::new(|p| p.log_sizes[2] += 1)),
         (
             "another configuration",
+            format,
             Box::new(|p| p.stark_proof.0.config.fri_config.n_queries = 21),
         ),
     ];
-    for (name, malform) in shapes {
+    for (name, expect, malform) in shapes {
         let mut proof = one.wrapped.proof.clone();
         malform(&mut proof);
-        let error = vos_final_verifier::verify(proof, &words)
-            .expect_err(name)
-            .to_string();
+        let error = vos_final_verifier::verify(proof, &words).expect_err(name);
         eprintln!("{name}: {error}");
+        assert!(expect(&error), "{name}: {error}");
     }
+}
+
+/// The bytes: undecodable bytes, a byte after the proof and bytes over
+/// [`vos_final_verifier::MAX_PROOF_BYTES`] are refused. Postcard's varints
+/// need not be minimal, so the proof re-encoded with a longer varint is
+/// another byte string that verifies: a proof's bytes are no key for it.
+#[test]
+fn the_final_verifier_reads_one_bounded_encoding() {
+    let one = one_segment();
+    let words = one.wrapped.words;
+    let bytes = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
     assert!(matches!(
         vos_final_verifier::verify_bytes(&[1, 2, 3], &words),
         Err(Error::Decode)
     ));
+    let mut trailing = bytes.clone();
+    trailing.push(0);
+    assert!(matches!(
+        vos_final_verifier::verify_bytes(&trailing, &words),
+        Err(Error::Decode)
+    ));
+    let mut long = bytes.clone();
+    long.resize(vos_final_verifier::MAX_PROOF_BYTES + 1, 0);
+    assert!(matches!(
+        vos_final_verifier::verify_bytes(&long, &words),
+        Err(Error::Length)
+    ));
+    // The format version, 28, is the first varint: one byte, or two.
+    assert_eq!(bytes[0], 28);
+    let overlong = [&[28 | 0x80, 0][..], &bytes[1..]].concat();
+    assert_eq!(
+        vos_final_verifier::verify_bytes(&overlong, &words).expect("verifies"),
+        one.wrapped.statement
+    );
 }
 
 /// The guest's verdicts.

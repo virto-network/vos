@@ -19,7 +19,6 @@ crate-type = ["cdylib"]
 
 [dependencies]
 vos-final-verifier = { path = "../.." }
-postcard = { version = "1", default-features = false, features = ["alloc"] }
 
 [profile.release]
 opt-level = 3

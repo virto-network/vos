@@ -191,7 +191,7 @@ impl Analysis {
             return None;
         }
         let mut folds = alloc::vec::Vec::new();
-        let mut remaining = shape.log_degree_bound - params.log_last_layer;
+        let mut remaining = shape.log_degree_bound.checked_sub(params.log_last_layer)?;
         while remaining > 0 {
             let step = params.fold_step.min(remaining);
             folds.push(step);

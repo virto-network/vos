@@ -25,7 +25,7 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 
-use vos_final_verifier::{PUBLIC_WORDS, WrapProof};
+use vos_final_verifier::PUBLIC_WORDS;
 
 /// The verifier's own stack, in `.bss`: the standard program's stack is
 /// the read-only zone's offset, 64 KiB. Its pages written say how much
@@ -431,7 +431,7 @@ fn verify(report: &mut Report) -> u64 {
     unsafe { bytes.set_len(proof_len) };
     report.gas_after_lookup = gas_left();
 
-    let Ok(proof) = postcard::from_bytes::<WrapProof>(&bytes) else {
+    let Ok(proof) = vos_final_verifier::decode(&bytes) else {
         return UNDECODABLE;
     };
     drop(bytes);
