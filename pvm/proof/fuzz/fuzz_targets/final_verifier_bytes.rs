@@ -1,15 +1,14 @@
 //! Fuzz target: arbitrary bytes as a wrap proof, against the golden wrap's
 //! public words (`vos_final_verifier::verify_bytes`).
 //!
-//! Property: **no panic, no abort.** Whatever the bytes, the verifier
-//! returns a verdict: a refusal for anything but the golden wrap's
-//! encodings. Seed the corpus with the golden wrap so the fuzzer starts
-//! from a proof that decodes:
+//! Property: **no panic, no abort**, and **nothing accepted but the golden
+//! wrap:** bytes that verify decode to it, their re-encoding its bytes
+//! (`golden::Golden::assert_is_golden`). Seed the corpus with the golden
+//! wrap so the fuzzer starts from a proof that decodes:
 //!
 //! ```text
-//! cd pvm/proof
-//! mkdir -p fuzz/corpus/final_verifier_bytes
-//! cp fixtures/wrap*.proof fuzz/corpus/final_verifier_bytes/
+//! cd pvm/proof/fuzz
+//! cargo run --example seed
 //! cargo fuzz run final_verifier_bytes -- -max_total_time=600 -max_len=262145
 //! ```
 
@@ -21,7 +20,7 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     let golden = golden::golden();
-    if let Ok(statement) = vos_final_verifier::verify_bytes(data, &golden.words) {
-        assert_eq!(statement.words(), golden.words);
+    if vos_final_verifier::verify_bytes(data, &golden.words).is_ok() {
+        golden.assert_is_golden(&vos_final_verifier::decode(data).expect("decodes"));
     }
 });

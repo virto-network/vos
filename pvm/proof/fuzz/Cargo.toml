@@ -52,3 +52,9 @@ name = "final_verifier_mutate"
 path = "fuzz_targets/final_verifier_mutate.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "statement_decode"
+path = "fuzz_targets/statement_decode.rs"
+test = false
+doc = false

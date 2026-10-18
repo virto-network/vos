@@ -20,8 +20,8 @@
 //!     cargo fuzz run prove_verify_roundtrip -- -max_total_time=300
 //!
 //! Corpus seeds in `corpus/prove_verify_roundtrip/` accumulate
-//! over runs; each seed is a `FuzzInput` Postcard / arbitrary
-//! encoding of (code, bitmask, regs, gas, max_steps).
+//! over runs; each seed is a `FuzzInput`'s `arbitrary` encoding (code,
+//! registers). The gas bounds the run.
 
 #![no_main]
 
@@ -40,7 +40,6 @@ use vos_pvm_proof_verifier::verify_standalone;
 /// shifts coverage toward shorter executions; widening makes each
 /// case more expensive.
 const MAX_CODE_BYTES: usize = 64;
-const MAX_STEPS: u8 = 16;
 const FLAT_MEM_BYTES: usize = 64 * 1024; // 64 KiB
 
 #[derive(Debug, Arbitrary)]
@@ -93,9 +92,8 @@ fuzz_target!(|input: FuzzInput| {
         regs,
         vec![0u8; FLAT_MEM_BYTES],
         100_000,
-        MAX_STEPS,
     );
-    let mut tracing = TracingPvm::new_conformance(pvm);
+    let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run();
     let steps = tracing.into_trace();
     if steps.is_empty() {

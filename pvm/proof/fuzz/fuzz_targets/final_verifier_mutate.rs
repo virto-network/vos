@@ -9,9 +9,11 @@
 //! limb among them), a hash changed, a nonce, a configuration field, a log
 //! size or the format set.
 //!
-//! Property: **no panic, no abort**, and a mutated proof that verifies
-//! states the golden words. The shape check stands before every Stwo call
-//! that would index the proof; this target is what holds it to that.
+//! Property: **no panic, no abort**, and **a mutated proof that verifies is
+//! the golden one** by value (`golden::Golden::assert_is_golden`): the
+//! mutations that cancel out, or rewrite a varint longer. The shape check
+//! stands before every Stwo call that would index the proof; this target is
+//! what holds it to that.
 //!
 //! ```text
 //! cd pvm/proof
@@ -332,14 +334,14 @@ fuzz_target!(|mutations: Vec<Mutation>| {
     for mutation in &mutations {
         apply(&mut proof, mutation);
     }
-    if let Ok(statement) = vos_final_verifier::verify(proof.clone(), &golden.words) {
-        assert_eq!(statement.words(), golden.words);
+    if vos_final_verifier::verify(proof.clone(), &golden.words).is_ok() {
+        golden.assert_is_golden(&proof);
     }
     let mut bytes = postcard::to_allocvec(&proof).expect("encodes");
     for mutation in &mutations {
         apply_bytes(&mut bytes, mutation);
     }
-    if let Ok(statement) = vos_final_verifier::verify_bytes(&bytes, &golden.words) {
-        assert_eq!(statement.words(), golden.words);
+    if vos_final_verifier::verify_bytes(&bytes, &golden.words).is_ok() {
+        golden.assert_is_golden(&vos_final_verifier::decode(&bytes).expect("decodes"));
     }
 });
