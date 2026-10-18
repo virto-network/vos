@@ -505,8 +505,7 @@ pub(crate) fn decode_branch_target(decoded_args: &args::Args) -> u32 {
     }
 }
 
-/// Reconstruct memory access from opcode, args, and register state.
-/// Returns (mem_read, mem_write).
+/// `base + offset` as a PVM address, modulo 2^32.
 #[inline]
 fn wrapping_effective_address(base: u64, offset: u64) -> u32 {
     // PVM addresses are cyclic N_2^32 values. Truncate each decoded operand
@@ -515,358 +514,78 @@ fn wrapping_effective_address(base: u64, offset: u64) -> u32 {
     (base as u32).wrapping_add(offset as u32)
 }
 
+/// A step's memory access, from its opcode, its arguments and its
+/// registers: `(mem_read, mem_write)`.
 pub(crate) fn decode_mem_access(
     opcode: Opcode,
     decoded_args: &args::Args,
     regs_before: &[u64; PVM_REGISTER_COUNT],
     regs_after: &[u64; PVM_REGISTER_COUNT],
 ) -> (Option<MemAccess>, Option<MemAccess>) {
-    match opcode {
-        // Direct loads (A.5.6): addr = imm, result in ra
-        Opcode::LoadU8 | Opcode::LoadI8 => {
-            if let args::Args::RegImm { ra, imm } = decoded_args {
-                let addr = *imm as u32;
-                let value = regs_after[*ra];
-                return (
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 1,
-                    }),
-                    None,
-                );
-            }
+    use Opcode::*;
+    use args::Args::{RegImm, RegTwoImm, TwoImm, TwoRegImm};
+    let size: u8 = match opcode {
+        LoadU8 | LoadI8 | LoadIndU8 | LoadIndI8 | StoreU8 | StoreIndU8 | StoreImmU8
+        | StoreImmIndU8 => 1,
+        LoadU16 | LoadI16 | LoadIndU16 | LoadIndI16 | StoreU16 | StoreIndU16 | StoreImmU16
+        | StoreImmIndU16 => 2,
+        LoadU32 | LoadI32 | LoadIndU32 | LoadIndI32 | StoreU32 | StoreIndU32 | StoreImmU32
+        | StoreImmIndU32 => 4,
+        LoadU64 | LoadIndU64 | StoreU64 | StoreIndU64 | StoreImmU64 | StoreImmIndU64 => 8,
+        _ => return (None, None),
+    };
+    // A load's value is the register it wrote; a store's, the low `size`
+    // bytes of what it stored.
+    let load = |address: u32, ra: usize| {
+        let value = regs_after[ra];
+        (
+            Some(MemAccess {
+                address,
+                value,
+                size,
+            }),
+            None,
+        )
+    };
+    let store = |address: u32, value: u64| {
+        let value = value & (u64::MAX >> (64 - 8 * u32::from(size)));
+        (
+            None,
+            Some(MemAccess {
+                address,
+                value,
+                size,
+            }),
+        )
+    };
+    match (opcode, decoded_args) {
+        // Direct (A.5.6): addr = imm; a store's value from ra.
+        (LoadU8 | LoadI8 | LoadU16 | LoadI16 | LoadU32 | LoadI32 | LoadU64, RegImm { ra, imm }) => {
+            load(*imm as u32, *ra)
         }
-        Opcode::LoadU16 | Opcode::LoadI16 => {
-            if let args::Args::RegImm { ra, imm } = decoded_args {
-                let addr = *imm as u32;
-                let value = regs_after[*ra];
-                return (
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 2,
-                    }),
-                    None,
-                );
-            }
+        (StoreU8 | StoreU16 | StoreU32 | StoreU64, RegImm { ra, imm }) => {
+            store(*imm as u32, regs_before[*ra])
         }
-        Opcode::LoadU32 | Opcode::LoadI32 => {
-            if let args::Args::RegImm { ra, imm } = decoded_args {
-                let addr = *imm as u32;
-                let value = regs_after[*ra];
-                return (
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 4,
-                    }),
-                    None,
-                );
-            }
+        // Indirect (A.5.10): addr = φ[rb] + imm; a store's value from ra.
+        (
+            LoadIndU8 | LoadIndI8 | LoadIndU16 | LoadIndI16 | LoadIndU32 | LoadIndI32 | LoadIndU64,
+            TwoRegImm { ra, rb, imm },
+        ) => load(wrapping_effective_address(regs_before[*rb], *imm), *ra),
+        (StoreIndU8 | StoreIndU16 | StoreIndU32 | StoreIndU64, TwoRegImm { ra, rb, imm }) => store(
+            wrapping_effective_address(regs_before[*rb], *imm),
+            regs_before[*ra],
+        ),
+        // Store immediate (A.5.4): addr = imm_x, value = imm_y.
+        (StoreImmU8 | StoreImmU16 | StoreImmU32 | StoreImmU64, TwoImm { imm_x, imm_y }) => {
+            store(*imm_x as u32, *imm_y)
         }
-        Opcode::LoadU64 => {
-            if let args::Args::RegImm { ra, imm } = decoded_args {
-                let addr = *imm as u32;
-                let value = regs_after[*ra];
-                return (
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 8,
-                    }),
-                    None,
-                );
-            }
-        }
-        // Direct stores (A.5.6): addr = imm, value from ra
-        Opcode::StoreU8 => {
-            if let args::Args::RegImm { ra, imm } = decoded_args {
-                let addr = *imm as u32;
-                let value = regs_before[*ra] & 0xFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 1,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreU16 => {
-            if let args::Args::RegImm { ra, imm } = decoded_args {
-                let addr = *imm as u32;
-                let value = regs_before[*ra] & 0xFFFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 2,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreU32 => {
-            if let args::Args::RegImm { ra, imm } = decoded_args {
-                let addr = *imm as u32;
-                let value = regs_before[*ra] & 0xFFFF_FFFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 4,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreU64 => {
-            if let args::Args::RegImm { ra, imm } = decoded_args {
-                let addr = *imm as u32;
-                let value = regs_before[*ra];
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 8,
-                    }),
-                );
-            }
-        }
-        // Indirect loads (A.5.10): addr = φ[rb] + imm, result in ra
-        Opcode::LoadIndU8 | Opcode::LoadIndI8 => {
-            if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*rb], *imm);
-                let value = regs_after[*ra];
-                return (
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 1,
-                    }),
-                    None,
-                );
-            }
-        }
-        Opcode::LoadIndU16 | Opcode::LoadIndI16 => {
-            if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*rb], *imm);
-                let value = regs_after[*ra];
-                return (
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 2,
-                    }),
-                    None,
-                );
-            }
-        }
-        Opcode::LoadIndU32 | Opcode::LoadIndI32 => {
-            if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*rb], *imm);
-                let value = regs_after[*ra];
-                return (
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 4,
-                    }),
-                    None,
-                );
-            }
-        }
-        Opcode::LoadIndU64 => {
-            if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*rb], *imm);
-                let value = regs_after[*ra];
-                return (
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 8,
-                    }),
-                    None,
-                );
-            }
-        }
-        // Indirect stores (A.5.10): addr = φ[rb] + imm, value from ra
-        Opcode::StoreIndU8 => {
-            if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*rb], *imm);
-                let value = regs_before[*ra] & 0xFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 1,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreIndU16 => {
-            if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*rb], *imm);
-                let value = regs_before[*ra] & 0xFFFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 2,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreIndU32 => {
-            if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*rb], *imm);
-                let value = regs_before[*ra] & 0xFFFF_FFFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 4,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreIndU64 => {
-            if let args::Args::TwoRegImm { ra, rb, imm } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*rb], *imm);
-                let value = regs_before[*ra];
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 8,
-                    }),
-                );
-            }
-        }
-        // Store immediate (A.5.4): addr = imm_x, value = imm_y
-        Opcode::StoreImmU8 => {
-            if let args::Args::TwoImm { imm_x, imm_y } = decoded_args {
-                let addr = *imm_x as u32;
-                let value = *imm_y & 0xFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 1,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreImmU16 => {
-            if let args::Args::TwoImm { imm_x, imm_y } = decoded_args {
-                let addr = *imm_x as u32;
-                let value = *imm_y & 0xFFFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 2,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreImmU32 => {
-            if let args::Args::TwoImm { imm_x, imm_y } = decoded_args {
-                let addr = *imm_x as u32;
-                let value = *imm_y & 0xFFFF_FFFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 4,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreImmU64 => {
-            if let args::Args::TwoImm { imm_x, imm_y } = decoded_args {
-                let addr = *imm_x as u32;
-                let value = *imm_y;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 8,
-                    }),
-                );
-            }
-        }
-        // Store immediate indirect (A.5.7): addr = φ[ra] + imm_x, value = imm_y
-        Opcode::StoreImmIndU8 => {
-            if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*ra], *imm_x);
-                let value = *imm_y & 0xFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 1,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreImmIndU16 => {
-            if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*ra], *imm_x);
-                let value = *imm_y & 0xFFFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 2,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreImmIndU32 => {
-            if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*ra], *imm_x);
-                let value = *imm_y & 0xFFFF_FFFF;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 4,
-                    }),
-                );
-            }
-        }
-        Opcode::StoreImmIndU64 => {
-            if let args::Args::RegTwoImm { ra, imm_x, imm_y } = decoded_args {
-                let addr = wrapping_effective_address(regs_before[*ra], *imm_x);
-                let value = *imm_y;
-                return (
-                    None,
-                    Some(MemAccess {
-                        address: addr,
-                        value,
-                        size: 8,
-                    }),
-                );
-            }
-        }
-        _ => {}
+        // Store immediate indirect (A.5.7): addr = φ[ra] + imm_x, value = imm_y.
+        (
+            StoreImmIndU8 | StoreImmIndU16 | StoreImmIndU32 | StoreImmIndU64,
+            RegTwoImm { ra, imm_x, imm_y },
+        ) => store(wrapping_effective_address(regs_before[*ra], *imm_x), *imm_y),
+        _ => (None, None),
     }
-    (None, None)
 }
 
 #[cfg(all(test, feature = "prover"))]
