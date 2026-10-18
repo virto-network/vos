@@ -21,7 +21,7 @@
 //! The claimed sums, `u`'s public use and each public word's add to zero:
 //! that is what binds the words to the circuit's wires (`vos_recair_air::gate`).
 //!
-//! **The proof's shape is checked before any Stwo call** ([`check_shape`]):
+//! **The proof's shape is checked before any Stwo call** (`check_shape`):
 //! the trees' count, every column's sample count, and every M31 limb
 //! canonical. Stwo's verifier refuses a malformed FRI proof, Merkle witness
 //! or queried-value shape with an error, but it indexes the sampled values by
@@ -279,8 +279,8 @@ fn secure_is_canonical(value: &SecureField) -> bool {
 /// The shape every proof of the wrap AIR has, whatever its challenges: four
 /// trees of commitments, sampled values, decommitments and queried values,
 /// and every M31 limb canonical. The sampled values' columns are checked
-/// against the components' masks by [`check_samples`].
-pub fn check_shape(stark: &StarkProof<Blake2bMerkleHasher>) -> Result<(), Error> {
+/// against the components' masks by `check_samples`.
+fn check_shape(stark: &StarkProof<Blake2bMerkleHasher>) -> Result<(), Error> {
     if stark.commitments.len() != TREES {
         return Err(Error::Shape("four commitments"));
     }

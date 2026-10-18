@@ -680,6 +680,16 @@ and fold layout of §1.1 is unchanged.
   18 queries and 4 FRI layers. The fit is on a proxy of at most 400 columns
   and a trivial AIR; 458 columns and 313 degree-3 constraints are a mild
   extrapolation, well under the 150M gate.
+- **Built** (slice 5's 5.14, `vos-recair`'s `wrap`) [measured]: the root's
+  verification is a fold child's (`fold::verify_node`), plus the program id
+  from its 44-word preimage, the one-hot choice among the program's leaf
+  circuits and `H_fold` (a constant), `W = H_fold`, the three lanes of the
+  run, and the 24 public words a lane each: **16,083 / 21,489 / 2,024**
+  rows finalized, **2^14 / 2^15 / 2^11** (the model's), `p2` 98.2% full.
+  A run of one segment has no fold: its leaf is the root, and the circuit
+  set admits it. Proved in **5.45 s at a 2.5 GiB heap** (the window
+  kernel's); **122–125 KB**; **96.4M JAM gas** (decode 16.0M, verify
+  80.3M), **38.2M Wasm instructions**.
 - **A narrower wrap**, if gas must fall further: the wrap's own AIR need not be
   the fold's. A `p2` at two rows a permutation (about 180 columns) would bring
   the wrap to about 280 columns and about 67M gas [model], at the price of a
@@ -711,6 +721,18 @@ build-std. It holds:
 and 208 KB as a Wasm blob [measured]; the recursion AIR's constraints (313,
 about 2k QM31 operations) and the statement add tens of kilobytes:
 about 0.4 MB PVM, 0.25–0.3 MB Wasm [projected].
+
+**Built** (slice 5's 5.14) [measured]: `verify(proof, words)` returns the
+program id and the io-hash the 24 words state. It checks the format, the
+configuration (the batching from the format) and the log sizes, the
+proof's shape before any Stwo call (four trees of commitments, samples,
+decommitments and queried values; every column's samples against the
+components' masks; every limb canonical), the preprocessed root against
+its constant, the header and the interaction PoW, then the logup sums with
+the 24 words' and `u`'s public terms, then Stwo's verifier, the components
+built once. The statement's decode is 5.15's. **469 KB** as a PVM program,
+**292 KB** as a Wasm blob; on the JAM-only host it runs as a refine program
+(`final-verify.elf`).
 
 ## 9. What to adapt, from where
 
@@ -765,7 +787,7 @@ Ordered so feasibility is retired first. Weeks are engineer-weeks
 | 4 | **COMPARE's leaf** (first gate), and **the window kernel leaf's topology** (`Context<NoValue>`, no proof) | a COMPARE proof verified in circuit, the circuit proved and verified natively; tampered OODS sample, queried value, sibling, FRI value and nonce refused; the topology's rows pinned per term of the re-baselined count, not only in total | accepted; rows within 15% of 8,644 / 10,352 / 280 (format 35, 40 queries); ≤ 1 s; the topology within 2^16 / 2^17 / 2^16. **Passed** (slice 5's 5.11): 7,732 / 10,279 / 240, 0.21–0.24 s; the topology 57,655 / 101,638 / 46,000 | 1–2 |
 | 5 | **The window kernel's leaf**, and the solvency predicate's: boundary states mixed as bytes, entry and exit digests, the flags, the A.3 output | spike 3's real segment on the Poseidon2 channel; in-circuit and native transcripts equal; a tampered boundary byte refused | rows within the padded shape; ≤ 4 GiB; ≤ 1× the segment's proving (target 0.13–0.5×) | 2–3 |
 | 6 | **The fold and the fixed point** | a fold of two leaves, a fold of two folds within the constant shape; a tree over four segments; refusals: wrong program, gap, broken continuity, prefix, mid-start, wrong child circuit, a child carrying a foreign word, a leaf carrying a wrong program id | the fold verifies two folds in the shape; memory and time of a leaf. **Passed** (slice 5's 5.13): 32,167 / 42,896 / 4,048, 1.5 s, 942 MiB | 2–3 |
-| 7 | **The final wrap:** Blake2b-256 Merkle and channel in our Stwo fork, fold step 3 admitted, the wrap circuit, `vos-final-verifier` | the fork's Fable review, then its push to olanod/stwo; tamper tests on fold step 3 and Blake2b; Wasm and JAM-only host verification | ≤ 150M gas unmasked on the JAM-only host; ≤ 2^17 rows; ≤ 8 GiB unmasked | 3–4 |
+| 7 | **The final wrap:** Blake2b-256 Merkle and channel in our Stwo fork, fold step 3 admitted, the wrap circuit, `vos-final-verifier` | the fork's Fable review, then its push to olanod/stwo; tamper tests on fold step 3 and Blake2b; Wasm and JAM-only host verification | ≤ 150M gas unmasked on the JAM-only host; ≤ 2^17 rows; ≤ 8 GiB unmasked. **Passed** (slice 5's 5.14): 96.4M gas, 2^15 tallest, 2.5 GiB heap, 5.45 s | 3–4 |
 | 8 | **End to end:** `vos-statement`, the window statement and the solvency predicate, golden fixtures (A.6) | every venue judges the fixtures alike | both statements verified natively, in Wasm and on JAM | 2 |
 | | **total** | | | **17–24** |
 

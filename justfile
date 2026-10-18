@@ -37,7 +37,9 @@ vectors:
 # `debug-internals`, the re-runs of the test actors' kernels from their
 # attests on the agent's model, the settlement window's kernel proved over
 # its shape, the kernels' leaves and the window kernel's folds proved on
-# the recursion AIR, and the fixtures checked against their generator.
+# the recursion AIR, its whole run folded and wrapped under format 28 and
+# verified by the final verifier, and the fixtures checked against their
+# generator.
 # Memory-heavy: two threads fit under a 24 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
@@ -68,7 +70,7 @@ export MIMALLOC_ALLOW_THP := "0"
 # Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
-    for manifest in ([agent/default agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/settlement-verifier pvm/proof/verifier-wasm-bench spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+    for manifest in ([agent/default agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/settlement-verifier pvm/proof/verifier-wasm-bench pvm/proof/final-verifier/wasm spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
 # item.

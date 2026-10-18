@@ -333,8 +333,8 @@ attribution). Its full design is `recursion-air.md`.
   component is 2^15 rows [model].
 - **Parameters** (format 28): blowup 64, 20 queries, PoW 26, interaction
   PoW 8, fold step 3, a 2^6 last layer, and **affine DEEP batching** (an
-  independent coefficient a sampled value). That is 146 conjectured and 80
-  proven bits [model].
+  independent coefficient a sampled value). That is 146 conjectured and 82
+  proven bits (82.6; 80 needs 19 queries) [model].
 - **Why affine batching:** Stwo batches the sampled values by powers of one
   coefficient, and that term's error is the values' count times a
   proximity-gap error that grows with the blowup. At blowup 64 it caps the
@@ -347,8 +347,13 @@ attribution). Its full design is `recursion-air.md`.
     1.11×;
   - **blowup 8 with 41 queries,** about 1.97×.
 
-  Until affine batching exists, the security tool counts format 28 as
-  built, 74 proven bits, and reports it below its floor.
+  **Decided at 5.14: affine batching,** built in our fork for the
+  configurations that ask for it (`PcsConfig::deep_batching`, its
+  `DIVERGENCE-012`) and off by default, so no other format's proofs
+  change. A proof does not carry its batching: a verifier takes it from
+  the format. The security tool counts its batching term as `ε_lin(k)`
+  (BCIKS20 Theorem 1.6), and its first FRI round as the fork folds it, by
+  `2^fold_step` with the circle fold in it (`DIVERGENCE-011`).
 - **Masked,** with variant (c).
 - **The final channel** [decided]: Blake2b-256 Merkle trees and a
   Blake2b Fiat–Shamir transcript. This is new code in our Stwo fork.
@@ -359,8 +364,19 @@ attribution). Its full design is `recursion-air.md`.
   - 117–119M masked;
   - about 122 KB unmasked;
   - 2.2–4.9 GiB to prove at blowup 64 [projected].
-- **Fold step above 1:** the pinned Stwo implements it; the format admits
-  it only after a review plus tamper tests.
+- **Built** (slice 5's 5.14) [measured], unmasked:
+  - **96.4M JAM gas** on the JAM-only host, Blake2b-256 in software: the
+    proof's postcard decode 16.0M of it, the verify 80.3M; a 469 KB PVM
+    program, a 339 KiB heap peak;
+  - **38.2M retired Wasm instructions** under the PVF's semantics (37.7M
+    the client's), 2.1 ms, a 292 KB blob;
+  - **122–125 KB** (the window kernel's 123,686 bytes);
+  - **5.45 s and a 2.5 GiB heap** to prove the window kernel's wrap;
+  - the levers left: a fixed-layout decode (most of the 16.0M) and
+    Blake2b through `0x400`, which needs a compression hook in the fork's
+    hasher.
+- **Fold step above 1:** the pinned Stwo implements it; our fork's review
+  and tamper tests admitted it for format 28 (slice 5's 5.14).
 - **Its public inputs** are the program id (8 M31) and the io-hash (its
   32 bytes as 16 limbs of 16 bits): 24 words, at the wrap's reserved
   addresses 0–23 (A.3).
@@ -475,7 +491,7 @@ last for decades.**
 | segment proofs (format 35) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.86) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
 | device and credential proofs (37, 30; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin | blowup 2 (log 1), 86 queries, PoW 20, plus interaction PoW 8 | 106 / 62 |
-| the final wrap (28) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 80, 74 as built |
+| the final wrap (28) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
@@ -683,7 +699,7 @@ that narrows the inner proof makes folds cheaper too.
 | the window kernel's leaf is too big (`p2` about 64.8k of 2^16 at 44 queries [model]) | recounted on the hardened shape (5.8.0, 5.10), its topology counted (5.11), then its leaf proved within A.7; otherwise fewer queries with more PoW (PoW 24 and 40 queries, about −6k `p2` rows), FRI fold step 3 in inner proofs, `p2` at 2^17 (+70% cells), or narrower chips | slice 5, M1 |
 | the final wrap misses its gas or size | the real wrap verified on the JAM-only host (≤ 150M unmasked) and in the Wasm harness | slice 5, M1 |
 | the multi-step FRI path, or the new Blake2b channel, is unsound | a review plus tamper tests before the format admits them | slice 5, M1 |
-| the wrap misses its 80 proven bits | 74.7 at blowup 64 with powers-of-one DEEP batching [model]; affine batching in the fork for format 28 (about 1.06× verify), or a 6-bit batching PoW (1.11×), or blowup 8 with 41 queries (1.97×), decided at 5.14 | slice 5, M1 |
+| the wrap misses its 80 proven bits | 74.7 at blowup 64 with powers-of-one DEEP batching [model]; **retired at 5.14:** affine batching in the fork for format 28, 82.6 proven bits [model] | slice 5, M1 |
 | masking the wrap costs more than (c)'s factor | one masked wrap: ≤ 24 GiB, ≤ 200M gas; leakage and soundness tests | slice 6 |
 | the credential AIR misses sub-second | masked auth and payment proofs on a real flagship | slice 7 |
 | the signature chips' cost or soundness | a gate ladder per chip; a phone run | slice 7 |
@@ -839,7 +855,7 @@ counts as conjectured / proven at the reference shape [model]:
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
 | 36 | segments, legacy encodings | Blake2s | the proof's own, at least 96 conjectured bits (MOBILE: 2, 38, 20, 1, 0, none) | 96 / — | 96 / 57 | admitted |
 | 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
-| 28 | the final wrap, masked | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 74 as built | reserved |
+| 28 | the final wrap (unmasked until slice 6) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
 | 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 
 - **Each entry** holds its channel, its encodings, its parameters, the DEEP
@@ -857,10 +873,14 @@ counts as conjectured / proven at the reference shape [model]:
 - **35 to 37 name the segment AIR,** hardened and without the columns and
   next-row masks no constraint reads (§3.2); 28, 30 and 32 prove the
   recursion AIR, 32's leaves verifying the segment AIR. A reserved entry is
-  refused until its AIR and channel exist, and 28 until affine batching
-  does. 32's exist from slice 5's 5.8: `vos-recair` proves and verifies its
-  proofs natively, and the registry the segment verifiers read refuses it
-  until the leaf pins its padded shape.
+  refused until its AIR and channel exist. 32's exist from slice 5's 5.8:
+  `vos-recair` proves and verifies its proofs natively, and the registry
+  refuses it, as no verifier outside the recursion reads a leaf or a fold.
+  28 is admitted from slice 5's 5.14: `vos-recair` proves the wrap and
+  `vos-final-verifier` verifies it; a segment verifier takes only a
+  segment format.
+- **Masking the wrap** (slice 6) changes its proofs, so it takes a new
+  number or a bump of 28.
 - **24 to 27, 29, 31, 33 and 34 are retired.** 24 to 27 and 29 named the
   segment AIR before its hardening, and 31, 33 and 34 the hardened AIR
   with its unread columns (31 at 44 queries), so they are refused and
@@ -906,7 +926,7 @@ under `systemd-run` with these caps as `MemoryMax`.
 | segment (the window kernel's) | its class | ≤ 24 GiB | ≤ 8 s, once the SIMD hasher lands |
 | leaf | ≤ the padded shape | ≤ 4 GiB | 1.2–2.6 s [projected]; ≤ 1× the segment's proving (target 0.13–0.5×) |
 | fold | the padded shape | ≤ 4 GiB; 942 MiB of heap [measured] | 1.2–2.6 s [projected]; ≤ the leaf's; 1.5 s [measured] |
-| wrap | ≤ 2^17 | ≤ 8 GiB unmasked | 4.4–9.5 s [projected] |
+| wrap | ≤ 2^17; 2^14 / 2^15 / 2^11 [measured] | ≤ 8 GiB unmasked; a 2.5 GiB heap [measured] | 4.4–9.5 s [projected]; 5.45 s [measured] |
 
 A window of 16 segments proves end to end in about 3–5 minutes
 [projected].

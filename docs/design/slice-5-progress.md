@@ -3305,3 +3305,213 @@ and the fold's rows fitting the shape it proves at.
   what was built), §3.6 (the id's two levels), A.7's fold row;
   `recursion-air.md` §6 (what was built) and §10's step 6;
   `slice-5-proving.md` 5.13's gate.
+
+## Step 5.14: the final wrap
+
+`recursion-air.md` §10's step 7, on `vos-core` from `b745381e`: Stwo
+from the fork's `vos/wrap` (5.14a's Blake2b-256 channel, fold step 3
+reviewed, affine DEEP batching), format 28 admitted, the wrap circuit over
+a tree's root, `vos-final-verifier` complete, and the wrap measured on the
+JAM-only host and in Wasm.
+
+### The fold's two missing refusals, first (their own commit)
+
+- **The same leaf as both children** is refused by `fold: adjacency` (and
+  `fold: continuity` after it): its position does not follow itself.
+- **One segment relabelled at positions 1 and 2** is adjacent, and
+  refused by `fold: continuity` alone: its exit is not its own entry.
+
+### The pin and format 28 (`pvm/proof/src/{format,security}.rs`)
+
+- **Stwo at `ab294189`** (`vos/wrap`), in the workspace, the settlement
+  verifier and `verifier-wasm-bench`'s locks.
+- **A format's batching** is `FormatParams::batching`, Stwo's
+  `DeepBatching`: `Format::pcs_config` sets `deep_batching` from it, and
+  every verifier takes it from the format (`Format::verifier_config`),
+  never from a proof, whose config deserializes as `Powers`
+  (`#[serde(skip)]`). 35, 36 and 32 stay `Powers`; their proofs and the
+  fixtures are byte-identical (`fixtures`' generator test, `recursion_seams`).
+- **The security tool's fold rounds** (the fork's `DIVERGENCE-011`): the
+  first round folds by `2^fold_step`, the circle fold in it, so the rounds
+  are `fold_step` each from `log_k − log_last`, the last by what remains
+  (`[3, 3, 3, 1]` at log 16 to 2^6; `[1; 16]` at fold step 1, as before).
+  **Affine batching's term** is `ε_lin(k)` (BCIKS20 Theorem 1.6, soundcalc
+  `2af5e7df`), not `(B − 1)·ε_lin(k)`.
+- **Format 28 at 146 / 82** (82.60 at 20 queries; 80 needs 19; batched by
+  powers it stays 74.71 at 18 or 20 queries, 80 needing blowup 8 and 41),
+  every fold-step-1 format's counts unchanged (30, 32, 35, 36, 37 at 106 /
+  62, 108 / 63, 104 / 62, 96 / 57, 106 / 62).
+- **Admitted;** a segment verifier takes only a segment format
+  (`format::admitted_segment`), so 28's number on a segment proof is
+  refused as not naming segment proofs. `masked` is false: masking the
+  wrap (slice 6) is a format change.
+
+### The recursion AIR's layout (`recair-air/src/gate.rs`, `recair/src/context`)
+
+- **`Layout`:** a node's zero, one and `u` at 0–2 and its outputs from 3;
+  the wrap's outputs from 0, then zero, one and `u` (`proving.md` A.3).
+  The `Context` (`with_layout`), the wiring check, finalize's uses and
+  padding, and the public terms (`Layout::public_terms`) read it.
+- **`Context::set_output_lanes`:** an output a lane of a packed wire, one
+  `qm31` row (`out = Σ λ_j·c_j` written to the reserved address), so a
+  public word is the M31 `(w, 0, 0, 0)`.
+- **`prove_on::<MC>(format, …)`** proves under any recursion-AIR format on
+  its channel; `preprocessed_root_on` commits a circuit's preprocessed
+  tree there. `prove` is `prove_on::<P2MerkleChannel>(&LEAF_FOLD, …)`.
+
+### The wrap (`recair/src/wrap.rs`)
+
+- **`WrapCircuit`,** one, its constants the root's shape (`ChildShape::padded`)
+  and `H_fold` (`FoldCircuit::word`, the fold circuit's hash, computed
+  once). The root is a fold child's (`fold::verify_node`, now shared:
+  its proof, its circuit hash and bits, its preimage re-hashed).
+- **Its checks:** the program id recomputed from its 44-word preimage (a
+  witness) and equal to the root's; the root's circuit hash one-hot among
+  the program's four leaf-circuit hashes and `H_fold`; the root's W equal
+  to `H_fold`; `first = 0`, the entry flag 1, the halt flag 1, each a lane
+  of the scalars' wire; `last` free.
+- **One segment:** a run of one segment has no fold, so its leaf is the
+  root: the circuit set admits a leaf of the program as the fold does.
+- **Its public words:** the root's program id (8) and io-hash limbs (16),
+  a lane each of the preimage's wires, at 0–23.
+- **Its rows** [measured]: `wrap: circuit` 5 / 29, `wrap: preimage` 7 / 2,
+  `wrap: program` 6 / 2, `wrap: run` 0 / 3, `wrap: public` 0 / 24 beyond
+  the root's verification; **16,083 / 21,489 / 2,024** finalized, **2^14 /
+  2^15 / 2^11** (the model's 2^14 / 2^15 / 2^11), `p2` 301 rows short of
+  full.
+- **Proved** under format 28 on the Blake2b-256 channel (`wrap::prove`),
+  a `vos_final_verifier::WrapProof`.
+
+### `vos-final-verifier` (`pvm/proof/final-verifier`)
+
+- **`verify(proof, words)`** returns the `Statement` (program id, io-hash)
+  the 24 words state, each program word below `p` and each limb below
+  2^16. The wrap circuit is pinned by `PREPROCESSED_ROOT` and `LOG_SIZES`
+  (`constants.rs`), which `vos-recair`'s test computes from the circuit.
+- **The transcript,** as `prove_on` runs it: the header (domain, 28, the
+  configuration, the log sizes; a test holds it to
+  `mix_statement_header`), the preprocessed and main roots, the 24 words,
+  the interaction PoW, the `Gate` relation, the claimed sums and the
+  interaction root; then the logup sums with the words' and `u`'s public
+  terms; then Stwo's verifier.
+- **The shape before any Stwo call:** the format, the configuration and
+  the log sizes; four commitments, trees of samples, decommitments and
+  queried values; every limb canonical; the preprocessed root; and, once
+  the components are built (once), every column's samples against their
+  masks and the composition's eight. What that closes, of Fable's 5.14a
+  list: `core/verifier.rs`'s `commitments.last().unwrap()`, the mask
+  indexing in `eval_composition_polynomial_at_point`, and `pcs/verifier.rs`'s
+  `zip_eq`s; `quotients.rs`'s assert at height 0 is unreachable, every tree
+  nonempty, so the Merkle verifier checks each tree's queried values first.
+- **no_std,** stable for x86 and wasm32 (`-Zallow-features=`), the pinned
+  nightly with build-std for the PVM; with `--features pvm-guest`, a JAM
+  refine program (`src/bin/final-verify.rs`, linked with `pvm/guest/pvm.ld`
+  by its build script), built by `just check-no-std`.
+- **The Wasm harness** (`final-verifier/wasm`): the blob, built as a
+  runtime is (MVP, build-std, memory imported, sp-io's allocator ABI), and
+  its runner on wasmtime 35 as sc-executor-wasmtime runs a call, PVF or
+  client, counting retired instructions; spike 4a's, on the real verifier.
+
+### Tests
+
+- **`recair/tests/wrap.rs`** (`just check`), on the small kernel of the
+  fold's test:
+  - the circuit pinned: its rows by piece, its log sizes and preprocessed
+    root the final verifier's constants, format 28's entry the verifier's;
+  - a run of one segment wrapped through its leaf, its statement the
+    program's id and the run's io-hash; other words refused;
+  - the run cut in four, its leaves folded to a root, wrapped and
+    verified;
+  - refusals by their check: a root without its halt (the first segment
+    alone), without its entry (the last at position 0), at first 1 (`wrap:
+    run`, and proved, it does not verify); a root carrying a foreign W, a
+    root whose circuit is not the program's (`wrap: circuit`), a root
+    carrying another kernel's id (`wrap: program`); a tampered root proof
+    (`pow`, `logup`, `oods`, `merkle`, `fri`);
+  - **tampers end to end,** each refused by the final verifier with an
+    error: FRI at fold step 3 (a first-layer and an inner-layer value, an
+    inner layer's root and Merkle witness, the last layer) and the
+    Blake2b-256 trees and channel (the main and composition roots, a trace
+    Merkle witness, a queried and a sampled value, the PoW and interaction
+    nonces, a claimed sum, the preprocessed root);
+  - **every malformed shape a clean refusal:** a commitment fewer or more,
+    a tree of samples fewer, a column's sample fewer or more (a trace's and
+    the composition's), a column of samples fewer, a preprocessed column's
+    samples empty, a decommitment or a tree of queried values fewer, a
+    column of queried values or a value fewer, an inner FRI layer fewer or
+    more, a FRI witness value fewer, a last layer twice as long, a
+    noncanonical sampled value, queried value or claimed sum, another
+    format, log sizes or configuration, undecodable bytes;
+  - **the JAM-only host:** `final-verify.elf` accepts the one-segment
+    wrap within 150M gas, refuses a byte flipped at the proof's middle (a
+    root mismatch, 67.1M gas) and other words (the interaction PoW, 17.6M),
+    and never panics.
+- **`fold.rs`:** the two refusals above.
+- **`pvm/proof` `format` and `security`:** format 28 pinned at 146 / 82,
+  affine against powers, the verifier's batching from the format, the
+  rounds as Stwo folds them.
+- **`final-verifier`:** its header and constants format 28's; a
+  statement's words round-trip, a word out of range refused.
+- **`test-proof`:** `window_kernel`'s `the_window_wraps`: the whole
+  window's 26 segments proved in their classes and verified in their
+  leaves (470 s), folded in adjacent pairs, an odd node carried up, to one
+  root (25 folds, 54 s) stating the run, its entry, its halt and its
+  io-hash; wrapped, proved and verified natively; the proof and its words
+  written to `target/tmp/wrap/` for the harnesses.
+
+### Gates
+
+[measured, under `systemd-run` at 14 GiB with `nice -n 10`,
+`CARGO_INCREMENTAL=0`; the Wasm run pinned to one core]
+- **Gas:** **96.4M** on the JAM-only host (gate 150M; target about 85M):
+  the proof's lookup 0.07M, its postcard decode **16.0M**, the verify
+  **80.3M**; Blake2b-256 in software (JAM serves no hash). The program
+  469 KB (749 KB ELF); a 339 KiB heap peak, 904 KiB high-water, 7,687
+  allocations.
+- **Wasm** (the window's wrap): **38.2M** retired instructions under the
+  PVF's semantics, 37.7M the client's; 2.1 ms; the blob **292 KB**; 34
+  pages; 7,685 host allocations. JAM gas is 2.52× the Wasm instructions
+  (spike 4a's 2.43).
+- **Rows:** 2^14 / 2^15 / 2^11, tallest 2^15 (gate 2^17).
+- **Proving:** the window's wrap **5.45 s at a 2.5 GiB heap** (gate 8 GiB;
+  expected 4.4–9.5 s); the small kernel's 6.8 s.
+- **Bytes:** **123,686** (the window's), 122,203–125,202 across the tests
+  (the queries' duplicates vary); the model's about 122 KB.
+- **`just check`** green: 1,101 tests (1,090 at 5.13); clippy clean, the
+  final verifier's guest with it; the builds without std, stable wasm32
+  among them.
+- **`test-proof`, the suites this step touches:** `window_kernel` (its six
+  tests, `the_window_wraps` among them, 641 s), `kernel_shape`,
+  `fixtures`, `recursion_seams`, `chip_isolated`, `precompiles`,
+  `settle_fixture`, `boundary_binding`, `poseidon2_m31_channel`,
+  `qm31_constraints`, and the settlement verifier's own, green under
+  14 GiB with one thread.
+- **Against the target:** 85M was spike 4a's proxy plus the model; the
+  wrap is 13% above it, the gate 36% below. The levers: a fixed-layout
+  decode (most of the 16.0M) and Blake2b through `0x400`, which needs a
+  compression hook in the fork's Blake2b hasher (about −20%, spike 4a).
+
+### Carried to later steps
+
+- **5.15:** `vos-statement` and the io-hash recomputation in the final
+  verifier; the solvency predicate's tree; the golden fixtures (A.6) with
+  the wrap's.
+- **Slice 6:** masking the wrap is a format change (a new number, or 28
+  bumped); the `0x400` and Kreivo `blake2_256` hooks; a fixed-layout
+  decode.
+- **The fork:** `DIVERGENCE-011` and `-012` stay open for the external
+  audit (the affine batching citation and count).
+
+### Outside the step's files
+
+- `Cargo.toml`: the pin; `blake2` at opt-level 3 in the dev and test
+  profiles (the wrap's trees and grind: 52 s to 6.8 s in tests); the
+  Wasm harness excluded.
+- `pvm/proof/src/{proof.rs,refine_codec.rs,verify.rs,verify/recursion.rs}`,
+  `verifier/src/lib.rs`: `admitted_segment` and `verifier_config`.
+- `pvm/proof/{benches,tests,src/**/tests}`, `settlement-verifier`:
+  `deep_batching` in their `PcsConfig` literals.
+- `justfile`: `check-no-std` builds `final-verify.elf`; `fmt-check` reads
+  the Wasm harness.
+- `docs/design/proving.md` §3.5, §4, the risks, A.4, A.7;
+  `recursion-air.md` §7, §8, §10's step 7; `slice-5-proving.md` 5.14's gate.

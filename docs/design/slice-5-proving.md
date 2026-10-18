@@ -663,7 +663,7 @@ M0's milestone review left these before the recursion builds on them.
   - a 1-to-1 node over the root;
   - blowup 64, 20 queries, PoW 26, interaction PoW 8, fold step 3, a
     2^6 last layer, with affine DEEP batching;
-  - 146 conjectured and 80 proven bits [model];
+  - 146 conjectured and 82 proven bits [model];
   - it checks the root's W against the fold circuit's hash, its
     constant;
   - its public words, the program id and the io-hash, sit at reserved
@@ -679,6 +679,9 @@ M0's milestone review left these before the recursion builds on them.
     64M through `0x400`);
   - at most 2^17 rows;
   - at most 8 GiB unmasked (expected 4.4–9.5 s).
+  - **Passed** (`slice-5-progress.md` 5.14) [measured]: 96.4M gas
+    (decode 16.0M), 38.2M Wasm instructions, 2^14 / 2^15 / 2^11 rows, a
+    2.5 GiB heap, 5.45 s, 122–125 KB; format 28 at 146 / 82.
 - **Closing gate:** Fable's review of the fork change, then its push to
   olanod/stwo.
 - **Estimate:** 3–4 weeks.
