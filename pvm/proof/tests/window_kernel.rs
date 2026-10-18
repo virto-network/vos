@@ -700,13 +700,13 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
 /// io-hash); the root wrapped under format 28 on the Blake2b-256 channel
 /// within 2^17 rows and 8 GiB of heap, and verified by
 /// `vos-final-verifier`, its statement the program's id and the run's
-/// io-hash. The window's `vos_statement::Statement` (rootless: its anchors'
-/// roots are in its arguments, bound through its output) recomputes that
-/// io-hash, and a venue pinning the program accepts it, natively and on the
-/// JAM-only host. The wrap's proof (postcard), its public words (24
-/// little-endian u32s) and the judgement's input are written under the
-/// target's tmp directory, `wrap/window.{proof,words,input}`, for the Wasm
-/// harness.
+/// io-hash. The window's `vos_statement::Statement` (rootless, so of no
+/// space: its space and anchors are in its output, which no venue checks;
+/// its handler must) recomputes that io-hash, and a venue pinning the
+/// program accepts it, natively and on the JAM-only host. The wrap's proof
+/// (postcard), its public words (24 little-endian u32s) and the judgement's
+/// input are written under the target's tmp directory,
+/// `wrap/window.{proof,words,input}`, for the Wasm harness.
 #[test]
 fn the_window_wraps() {
     let instance = instance();
@@ -765,7 +765,9 @@ fn the_window_wraps() {
         vos_statement::Statement {
             format: vos_statement::FORMAT,
             program: vos_statement::ProgramId(program.id().0.map(|word| word.0)),
-            space: vos_statement::SpaceId(SPACE),
+            // Rootless: of no space. The window's space and anchors are
+            // in its output, for the handler to check.
+            space: vos_statement::SpaceId::NONE,
             public_args: Vec::new(),
             output: instance.expected.encode(),
             roots: Vec::new(),

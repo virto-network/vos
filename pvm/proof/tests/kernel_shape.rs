@@ -554,8 +554,8 @@ fn the_predicate_wraps() {
         vos_statement::Statement {
             format: vos_statement::FORMAT,
             program: vos_statement::ProgramId(program.id().0.map(|word| word.0)),
-            // Rootless: its space is bound by nothing.
-            space: vos_statement::SpaceId([0; 32]),
+            // Rootless: of no space.
+            space: vos_statement::SpaceId::NONE,
             public_args: Vec::new(),
             output: kernel.trace.output.clone(),
             roots: Vec::new(),

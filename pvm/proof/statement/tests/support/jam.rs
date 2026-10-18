@@ -16,6 +16,7 @@ use vos_statement::model::Input;
 /// The guest's verdicts.
 pub const ACCEPT: u64 = 1;
 pub const REJECT: u64 = 0;
+pub const UNDECODABLE: u64 = 4;
 
 const SERVICE: u64 = 7;
 

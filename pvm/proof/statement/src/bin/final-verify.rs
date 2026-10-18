@@ -9,12 +9,17 @@
 //!   - 0: the 24 public words (each a little-endian `u32`), which the proof
 //!     is verified against;
 //!   - 1: a judgement's input (`vos_statement::model::Input`): the program
-//!     id the venue pinned, its state and the statement;
+//!     id the venue pinned, its state and the statement. The pin and the
+//!     state come in the payload only for the test harness; a real service
+//!     reads them from its own state, never from what a work item carries;
 //!
 //!   then the proof's Blake2b-256 hash and its length (`u32`,
 //!   little-endian);
 //! - the proof, postcard, as a preimage of the running service, read by
-//!   `historical_lookup`.
+//!   `historical_lookup`: only once a judgement's checks before the proof
+//!   pass, and only when its length is at most
+//!   `vos_final_verifier::MAX_PROOF_BYTES`, refused before any allocation
+//!   or lookup otherwise.
 //!
 //! Output (φ7 address, φ8 length): [`Report`], every field a little-endian
 //! `u64`: the verdict, the gas left at each phase, the heap's figures, a
@@ -34,6 +39,7 @@ use core::fmt::Write;
 
 use vos_final_verifier::PUBLIC_WORDS;
 use vos_statement::model::Input;
+use vos_statement::{Admitted, Refusal, StatementId};
 
 /// The verifier's own stack, in `.bss`: the standard program's stack is
 /// the read-only zone's offset, 64 KiB. Its pages written say how much
@@ -367,6 +373,18 @@ impl Report {
         }
     }
 
+    /// A judgement's verdict: its code, an accepted statement's id.
+    fn judged(&mut self, verdict: Result<StatementId, Refusal>) -> u64 {
+        self.code = u64::from(vos_statement::code(&verdict));
+        match verdict {
+            Ok(id) => {
+                self.id = id.0;
+                ACCEPT
+            }
+            Err(refusal) => self.refuse(&refusal),
+        }
+    }
+
     fn refuse(&mut self, error: &dyn core::fmt::Display) -> u64 {
         let mut cursor = Cursor {
             buf: &mut self.error,
@@ -422,6 +440,13 @@ enum Request {
     Judge(Input),
 }
 
+/// What the proof is checked against: the words alone, or a judgement's
+/// statement its checks before the proof admitted.
+enum Check {
+    Words([u32; PUBLIC_WORDS]),
+    Judge(Admitted),
+}
+
 /// The payload: its request, the proof's hash and its length.
 fn request(payload: &[u8]) -> Option<(Request, [u8; 32], usize)> {
     let (&mode, body) = payload.split_first()?;
@@ -464,6 +489,23 @@ fn verify(report: &mut Report) -> u64 {
         return BAD_PAYLOAD;
     };
     report.proof_len = proof_len as u64;
+    let check = match request {
+        Request::Words(words) => Check::Words(words),
+        Request::Judge(input) => match input.admit() {
+            Ok(admitted) => Check::Judge(admitted),
+            Err(refusal) => return report.judged(Err(refusal)),
+        },
+    };
+    if proof_len > vos_final_verifier::MAX_PROOF_BYTES {
+        let error = vos_final_verifier::Error::Length;
+        return match check {
+            Check::Words(_) => {
+                report.refuse(&error);
+                UNDECODABLE
+            }
+            Check::Judge(_) => report.judged(Err(Refusal::Proof(error))),
+        };
+    }
 
     let mut bytes: Vec<u8> = Vec::with_capacity(proof_len);
     let found = hostcall!(
@@ -484,8 +526,8 @@ fn verify(report: &mut Report) -> u64 {
     unsafe { bytes.set_len(proof_len) };
     report.gas_after_lookup = gas_left();
 
-    match request {
-        Request::Words(words) => {
+    match check {
+        Check::Words(words) => {
             let Ok(proof) = vos_final_verifier::decode(&bytes) else {
                 return UNDECODABLE;
             };
@@ -496,17 +538,7 @@ fn verify(report: &mut Report) -> u64 {
                 Err(error) => report.refuse(&error),
             }
         }
-        Request::Judge(input) => {
-            let verdict = input.judge(&bytes);
-            report.code = u64::from(vos_statement::code(&verdict));
-            match verdict {
-                Ok(id) => {
-                    report.id = id.0;
-                    ACCEPT
-                }
-                Err(refusal) => report.refuse(&refusal),
-            }
-        }
+        Check::Judge(admitted) => report.judged(admitted.verify(&bytes)),
     }
 }
 

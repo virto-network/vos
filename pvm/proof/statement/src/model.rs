@@ -10,7 +10,8 @@ use alloc::vec::Vec;
 
 use crate::codec::{self, Reader};
 use crate::{
-    DecodeError, ProgramId, Refusal, RootRead, Statement, StatementId, Venue, decode_program, judge,
+    Admitted, DecodeError, ProgramId, Refusal, RootRead, Statement, StatementId, Venue, admit,
+    decode_program, judge,
 };
 
 /// A venue's state as lists.
@@ -97,6 +98,11 @@ impl Input {
         Ok((input, reader.used()))
     }
 
+    /// [`admit`] on this input.
+    pub fn admit(&self) -> Result<Admitted, Refusal> {
+        admit(&self.policy, &self.program, &self.statement)
+    }
+
     /// [`judge`] on this input and `proof`.
     pub fn judge(&self, proof: &[u8]) -> Result<StatementId, Refusal> {
         judge(&self.policy, &self.program, &self.statement, proof)
@@ -155,11 +161,20 @@ mod tests {
             5
         );
         assert_eq!(refusal(|i| i.policy.seen.push(i.statement.id())), 6);
-        // A rootless statement needs no anchor.
+        // A rootless statement needs no anchor, and belongs to no space:
+        // one claiming a space is refused, since nothing binds it and each
+        // space would give the same proof another id.
         assert_eq!(
             refusal(|i| {
                 i.statement.roots.clear();
                 i.policy.anchors.clear();
+            }),
+            4
+        );
+        assert_eq!(
+            refusal(|i| {
+                i.statement.roots.clear();
+                i.statement.space = crate::SpaceId::NONE;
             }),
             0x100 | 1
         );

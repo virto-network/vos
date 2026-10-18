@@ -8,8 +8,10 @@
 #[path = "support/jam.rs"]
 mod jam;
 
+use vos_statement::Refusal;
 use vos_statement::fixtures::{self, Fixture};
 use vos_statement::model::judge_bytes;
+use vos_statement::vos_final_verifier::{self, MAX_PROOF_BYTES};
 
 fn load() -> Vec<Fixture> {
     let fixtures = fixtures::load(&fixtures::directory());
@@ -24,6 +26,7 @@ fn load() -> Vec<Fixture> {
         "repeated",
         "unaccepted format",
         "wrong io-hash",
+        "rootless, another space",
     ] {
         assert!(names.contains(&name), "the fixture {name:?}");
     }
@@ -74,4 +77,36 @@ fn every_fixture_is_judged_on_the_jam_only_host_as_recorded() {
             assert!(gas <= 150_000_000, "{gas} gas");
         }
     }
+}
+
+/// A proof longer than `MAX_PROOF_BYTES` is refused on the JAM-only host
+/// before the guest allocates it or looks it up, in both of its modes; a
+/// judgement's code is the one a venue reports natively.
+#[test]
+fn a_proof_too_long_is_refused_before_its_lookup() {
+    let (program, _) = jam::program();
+    let valid = load()
+        .into_iter()
+        .find(|fixture| fixture.name == "valid")
+        .expect("the valid fixture");
+    let long = vec![0; MAX_PROOF_BYTES + 1];
+    let native = vos_statement::code(&valid.input.judge(&long));
+    assert_eq!(
+        native,
+        Refusal::Proof(vos_final_verifier::Error::Length).code()
+    );
+
+    let (_, report) = jam::run(&program, &jam::judge_request(&valid.input), &long);
+    assert_eq!(report.code, u64::from(native));
+    assert_eq!(report.verdict, jam::REJECT);
+    assert_eq!(report.gas[1], 0, "no lookup");
+
+    let words = vos_final_verifier::Statement {
+        program: valid.input.program.0,
+        io_hash: valid.input.statement.io_hash(),
+    }
+    .words();
+    let (_, report) = jam::run(&program, &jam::words_request(&words), &long);
+    assert_eq!(report.verdict, jam::UNDECODABLE, "{}", report.error);
+    assert_eq!(report.gas[1], 0, "no lookup");
 }

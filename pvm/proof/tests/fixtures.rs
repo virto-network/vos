@@ -304,7 +304,10 @@ fn the_fixtures_are_judged() {
 /// - **wrong io-hash:** `S` with its output changed;
 /// - **another program than the pin:** the statement names another program
 ///   than the one the venue pinned;
-/// - **another space:** a root of another space than `S`'s.
+/// - **another space:** a root of another space than `S`'s;
+/// - **rootless, another space:** `S` without its roots, its space still
+///   claimed: a rootless statement belongs to no space, since nothing
+///   binds it there and each space would give one proof another id.
 mod statements {
     use stwo::core::fields::qm31::SecureField;
     use vos_final_verifier::WrapProof;
@@ -535,6 +538,13 @@ mod statements {
                 "wrap.proof",
                 None,
                 input(&|i| i.statement.roots[1].space = SpaceId([0xB2; 32])),
+                |code| code == 4,
+            ),
+            (
+                "rootless, another space",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.roots.clear()),
                 |code| code == 4,
             ),
         ];

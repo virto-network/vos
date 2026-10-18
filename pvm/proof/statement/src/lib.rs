@@ -10,13 +10,19 @@
 //! fields through it. The venue binds the rest:
 //! - **the format,** one it accepts and this verifier reads;
 //! - **the program,** against the id the venue pinned;
-//! - **the space,** equal to every root's;
+//! - **the space,** equal to every root's, or [`SpaceId::NONE`] for a
+//!   rootless statement;
 //! - **the roots,** each anchored for its space and window (`proving.md`
 //!   §7);
 //! - **repeats,** a statement id it has accepted before refused.
 //!
-//! A rootless statement has no space binding: its handler must not treat it
-//! as the space's.
+//! **A rootless statement belongs to no space; a statement claiming a space
+//! must read a root of it.** The id hashes the space, and only a root binds
+//! it: the proof states none, so a rootless statement's space is whatever
+//! its submitter writes. Were any space allowed, one accepted proof would
+//! make a new id under each, and a venue's repeat check would let it be
+//! applied again. [`judge`] refuses a rootless statement whose space is not
+//! [`SpaceId::NONE`] ([`Refusal::Space`]).
 //!
 //! **The program id is the venue's, never the caller's.** [`judge`] takes it
 //! as `program`, the id the venue pinned for the kernel whose handler will
@@ -100,6 +106,12 @@ impl ProgramId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SpaceId(pub [u8; 32]);
 
+impl SpaceId {
+    /// No space: a rootless statement's, the only one [`judge`] accepts for
+    /// it (the crate's docs).
+    pub const NONE: Self = Self([0; 32]);
+}
+
 /// A root a kernel read: of what kind, whose space, as of which window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RootRead {
@@ -138,7 +150,8 @@ pub struct Statement {
     pub format: u32,
     /// The kernel's program id, a public input of the proof.
     pub program: ProgramId,
-    /// The space every root is of, which the venue checks.
+    /// The space every root is of, which the venue checks; [`SpaceId::NONE`]
+    /// when there are no roots.
     pub space: SpaceId,
     /// The kernel's `#[public]` arguments, in their canonical encoding.
     pub public_args: Vec<u8>,
@@ -265,7 +278,8 @@ pub enum Refusal {
     Format,
     /// The statement's program is not the one the venue pinned.
     Program,
-    /// A root of another space than the statement's.
+    /// A root of another space than the statement's, or a rootless
+    /// statement claiming a space.
     Space,
     /// A root the venue has not anchored: stale, or unknown.
     Unanchored,
@@ -299,7 +313,9 @@ impl core::fmt::Display for Refusal {
             Self::Statement(error) => write!(f, "the statement: {error}"),
             Self::Format => f.write_str("the format is not accepted"),
             Self::Program => f.write_str("the statement's program is not the pinned one"),
-            Self::Space => f.write_str("a root is of another space"),
+            Self::Space => {
+                f.write_str("a root is of another space, or a rootless statement claims one")
+            }
             Self::Unanchored => f.write_str("a root is not anchored"),
             Self::Repeated => f.write_str("the statement was accepted before"),
             Self::Proof(error) => write!(f, "the proof: {error}"),
@@ -313,33 +329,53 @@ pub fn code(verdict: &Result<StatementId, Refusal>) -> u32 {
     verdict.as_ref().map_or_else(Refusal::code, |_| 0)
 }
 
-/// The venue's check of `proof`, a final proof's bytes, against `statement`;
-/// its id, when accepted. The venue records the id after it.
+/// A statement the venue's checks before the proof admit: its id, and the
+/// public words its proof must state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Admitted {
+    pub id: StatementId,
+    pub words: [u32; vos_final_verifier::PUBLIC_WORDS],
+}
+
+impl Admitted {
+    /// The final proof in `proof`'s bytes, verified against the admitted
+    /// words; the statement's id when accepted.
+    pub fn verify(&self, proof: &[u8]) -> Result<StatementId, Refusal> {
+        vos_final_verifier::verify_bytes(proof, &self.words).map_err(Refusal::Proof)?;
+        Ok(self.id)
+    }
+}
+
+/// The venue's checks of `statement` before its proof: the words its proof
+/// must state, and its id.
 ///
 /// `program` is the id the venue pinned for the kernel whose handler acts
 /// on the statement, never one the caller supplies (the crate's docs).
 ///
-/// In order: the format; the statement's program against `program`; every
-/// root's space against the statement's; every root anchored; the io-hash
-/// recomputed from the fields and the id from it; a repeat; then the proof,
-/// verified against `program` and the recomputed io-hash.
-pub fn judge(
+/// In order: the format; the statement's program against `program`; the
+/// space, every root's equal to the statement's and a rootless statement's
+/// [`SpaceId::NONE`]; every root anchored; the io-hash recomputed from the
+/// fields and the id from it; a repeat.
+pub fn admit(
     venue: &impl Venue,
     program: &ProgramId,
     statement: &Statement,
-    proof: &[u8],
-) -> Result<StatementId, Refusal> {
+) -> Result<Admitted, Refusal> {
     if statement.format != FORMAT || !venue.accepts(statement.format) {
         return Err(Refusal::Format);
     }
     if statement.program != *program {
         return Err(Refusal::Program);
     }
-    if statement
-        .roots
-        .iter()
-        .any(|root| root.space != statement.space)
-    {
+    let spaced = if statement.roots.is_empty() {
+        statement.space == SpaceId::NONE
+    } else {
+        statement
+            .roots
+            .iter()
+            .all(|root| root.space == statement.space)
+    };
+    if !spaced {
         return Err(Refusal::Space);
     }
     if !statement.roots.iter().all(|root| venue.anchored(root)) {
@@ -355,8 +391,24 @@ pub fn judge(
         io_hash,
     }
     .words();
-    vos_final_verifier::verify_bytes(proof, &words).map_err(Refusal::Proof)?;
-    Ok(id)
+    Ok(Admitted { id, words })
+}
+
+/// The venue's check of `proof`, a final proof's bytes, against `statement`;
+/// its id, when accepted. The venue records the id after it.
+///
+/// `program` is the id the venue pinned for the kernel whose handler acts
+/// on the statement, never one the caller supplies (the crate's docs).
+///
+/// [`admit`]'s checks, then the proof, verified against `program` and the
+/// recomputed io-hash.
+pub fn judge(
+    venue: &impl Venue,
+    program: &ProgramId,
+    statement: &Statement,
+    proof: &[u8],
+) -> Result<StatementId, Refusal> {
+    admit(venue, program, statement)?.verify(proof)
 }
 
 #[cfg(test)]
