@@ -1,8 +1,11 @@
 #![cfg(feature = "prover")]
 
-//! The segment fixtures under `pvm/proof/fixtures` (`proving.md` A.6), and
-//! their generator. For each admitted segment format, a fixed small
-//! kernel's run proved as one segment of its program:
+//! The fixtures under `pvm/proof/fixtures` (`proving.md` A.6), and their
+//! generator: the segment fixtures, and the golden statements every venue
+//! judges ([`statements`]).
+//!
+//! For each admitted segment format, a fixed small kernel's run proved as
+//! one segment of its program:
 //! - `segment-<n>.proof`, the proof, which verifies;
 //! - `segment-<n>.root`, its class's preprocessed root, which a venue
 //!   verifies it against;
@@ -89,20 +92,30 @@ fn directory() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures")
 }
 
+/// `load_imm`: a register set to a small constant.
+fn load(register: u8, value: u8) -> Vec<u8> {
+    vec![Opcode::LoadImm as u8, register, value, 0, 0, 0]
+}
+
 /// The kernel: two constants, their product and sum, then a halt with an
 /// empty output.
 fn kernel() -> Vec<u8> {
-    let load = |register: u8, value: u8| [Opcode::LoadImm as u8, register, value, 0, 0, 0];
+    standard_program(&[
+        load(2, 5),
+        load(3, 7),
+        vec![Opcode::Mul64 as u8, 3 << 4 | 2, 4],
+        vec![Opcode::Add64 as u8, 4 << 4 | 2, 5],
+        load(8, 0),
+        vec![Opcode::JumpInd as u8, 0],
+    ])
+}
+
+/// A standard program of `instructions`, laid out as the loader lays it
+/// out.
+fn standard_program(instructions: &[Vec<u8>]) -> Vec<u8> {
     let mut code = Vec::new();
     let mut starts = Vec::new();
-    for instruction in [
-        &load(2, 5)[..],
-        &load(3, 7),
-        &[Opcode::Mul64 as u8, 3 << 4 | 2, 4],
-        &[Opcode::Add64 as u8, 4 << 4 | 2, 5],
-        &load(8, 0),
-        &[Opcode::JumpInd as u8, 0],
-    ] {
+    for instruction in instructions {
         starts.push(code.len());
         code.extend_from_slice(instruction);
     }
@@ -124,17 +137,21 @@ fn kernel() -> Vec<u8> {
     .expect("a standard program")
 }
 
-/// The kernel's program under `format`.
-fn program(blob: &[u8], format: &'static Format) -> KernelProgram {
-    let record = vos_wire::records::Kernel {
+/// A kernel's record, as its install would make it.
+fn record(blob: &[u8]) -> vos_wire::records::Kernel {
+    vos_wire::records::Kernel {
         method: MethodId(1),
         program: ProgramHash::of(blob),
         image_root: vos_pvm_program::parse_standard_program(blob)
             .and_then(|program| program.image_root())
             .expect("an image root"),
         shape: kernel_shape(blob).expect("a shape"),
-    };
-    common::kernel_program(blob, &record, format)
+    }
+}
+
+/// The kernel's program under `format`.
+fn program(blob: &[u8], format: &'static Format) -> KernelProgram {
+    common::kernel_program(blob, &record(blob), format)
 }
 
 /// One format's fixtures, by file name.
@@ -206,15 +223,17 @@ fn proof(n: u32, patch: Option<&str>) -> Proof {
 fn the_fixtures_are_the_generators() {
     let write = std::env::var(MODE).is_ok_and(|mode| mode == "write");
     let mut stale = Vec::new();
-    for (format, other) in FORMATS {
-        for (name, bytes) in generate(format, other) {
-            if write {
-                std::fs::create_dir_all(directory()).expect("the fixtures' directory");
-                std::fs::write(directory().join(&name), &bytes).expect("writes");
-                eprintln!("{name}: {} bytes", bytes.len());
-            } else if std::fs::read(directory().join(&name)).ok().as_ref() != Some(&bytes) {
-                stale.push(name);
-            }
+    let generated = FORMATS
+        .into_iter()
+        .flat_map(|(format, other)| generate(format, other))
+        .chain(statements::generate());
+    for (name, bytes) in generated {
+        if write {
+            std::fs::create_dir_all(directory()).expect("the fixtures' directory");
+            std::fs::write(directory().join(&name), &bytes).expect("writes");
+            eprintln!("{name}: {} bytes", bytes.len());
+        } else if std::fs::read(directory().join(&name)).ok().as_ref() != Some(&bytes) {
+            stale.push(name);
         }
     }
     assert!(
@@ -254,5 +273,299 @@ fn the_fixtures_are_judged() {
         eprintln!("{n}: under the wrong format: {error}");
         let error = verify_kernel_segment(wrong, &program).unwrap_err();
         assert!(error.to_string().contains("format"), "{error}");
+    }
+}
+
+/// The golden statements (`proving.md` A.6), which every venue judges
+/// alike: natively, in Wasm and on the JAM-only host (`vos-statement`'s
+/// fixtures test, the Wasm harness's `judge`).
+///
+/// The kernel states a fixed statement `S`: it sets φ9..12 to `S`'s
+/// io-hash, an output of its own, two roots of its space read, then halts.
+/// Its run, cut in three segments, is proved at its class, its leaves folded
+/// to a root and the root wrapped: `wrap.proof`. Two roots that are not a
+/// whole run, wrapped as a cheating prover would (the wrap circuit's checks
+/// failing, proved anyway): `wrap-prefix.proof`, the first two segments,
+/// which set the io-hash but never halt; `wrap-midway.proof`, the last two,
+/// labelled from position 0, which never start at the entry.
+///
+/// The venue pins the kernel's program id, accepts format 28, anchors `S`'s
+/// two roots and has accepted one other statement. The cases
+/// (`statements.cases`), each a venue's state, a statement and a proof:
+/// - **valid:** `S` and its wrap, accepted;
+/// - **tampered:** a byte of the wrap flipped;
+/// - **wrong program:** the venue pins another program, which the statement
+///   names, and the wrap is this kernel's;
+/// - **unanchored root:** `S` with its first root an older window's,
+///   which the venue does not anchor;
+/// - **prefix**, **mid-way:** `S` with the wraps of a part of the run;
+/// - **repeated:** `S` after the venue accepted it;
+/// - **unaccepted format:** `S` under format 30;
+/// - **wrong io-hash:** `S` with its output changed;
+/// - **another program than the pin:** the statement names another program
+///   than the one the venue pinned;
+/// - **another space:** a root of another space than `S`'s.
+mod statements {
+    use stwo::core::fields::qm31::SecureField;
+    use vos_final_verifier::WrapProof;
+    use vos_pvm::instruction::Opcode;
+    use vos_pvm_proof::format::SEGMENT;
+    use vos_pvm_proof::kernel::trace_kernel;
+    use vos_pvm_proof::program_id::{KernelEntry, KernelProgram};
+    use vos_pvm_proof::prove_shaped;
+    use vos_pvm_proof::segment::SegmentCursor;
+    use vos_recair::Context;
+    use vos_recair::fold::{FoldCircuit, Proved};
+    use vos_recair::wrap::{self, WrapCircuit};
+    use vos_statement::fixtures::{CASES, Case, Patch};
+    use vos_statement::model::{Input, Policy};
+    use vos_statement::{FORMAT, ProgramId, RootRead, SpaceId, Statement, StatementId};
+
+    use super::common::{self, NodeRun};
+    use super::{load, record, standard_program};
+
+    const SPACE: SpaceId = SpaceId([0xA1; 32]);
+    /// The run's cuts: the io-hash set in the first two, the halt in the
+    /// last.
+    const CUTS: [(usize, usize); 3] = [(0, 2), (2, 5), (5, 6)];
+
+    fn root(window: u64, byte: u8) -> RootRead {
+        RootRead {
+            kind: 1,
+            space: SPACE,
+            window,
+            root: [byte; 32],
+        }
+    }
+
+    /// `S`, its program left to fill.
+    fn statement() -> Statement {
+        Statement {
+            format: FORMAT,
+            program: ProgramId([0; 8]),
+            space: SPACE,
+            public_args: b"nonce 7".to_vec(),
+            output: b"the statement's output".to_vec(),
+            roots: vec![root(41, 0x41), root(42, 0x42)],
+        }
+    }
+
+    /// The kernel stating `io_hash`: φ8, the output's length, 0; φ9..12 the
+    /// io-hash's bytes, eight a register, little-endian; then the halt.
+    fn kernel(io_hash: &[u8; 32]) -> Vec<u8> {
+        let mut instructions = vec![load(8, 0)];
+        for (register, bytes) in (9..).zip(io_hash.chunks_exact(8)) {
+            let mut instruction = vec![Opcode::LoadImm64 as u8, register];
+            instruction.extend_from_slice(bytes);
+            instructions.push(instruction);
+        }
+        instructions.push(vec![Opcode::JumpInd as u8, 0]);
+        standard_program(&instructions)
+    }
+
+    fn proved(node: &NodeRun) -> Proved<'_> {
+        Proved {
+            proof: &node.proof,
+            output: &node.output,
+        }
+    }
+
+    /// The wrap of `root`, proved: as the circuit requires it, or, with
+    /// `lenient`, over a root its checks refuse, as a cheating prover would.
+    fn wrap_of(root: &NodeRun, program: &KernelProgram, lenient: bool) -> WrapProof {
+        let circuit = WrapCircuit::get();
+        let (values, _) = circuit
+            .values(proved(root), &program.id_preimage())
+            .expect("the root's values");
+        let mut context = Context::<SecureField>::with_layout(wrap::LAYOUT);
+        if lenient {
+            context = context.lenient();
+        }
+        let lanes = circuit.verify(&mut context, &values);
+        context.set_output_lanes(&lanes);
+        let pieces: Vec<&str> = context.mismatches().iter().map(|m| m.piece).collect();
+        assert_eq!(!pieces.is_empty(), lenient, "{pieces:?}");
+        let finalized = context.finalize().expect("the wrap's wiring checks");
+        wrap::prove(&finalized).expect("the wrap proves")
+    }
+
+    /// The fixtures, by file name.
+    pub fn generate() -> Vec<(String, Vec<u8>)> {
+        let base = statement();
+        let blob = kernel(&base.io_hash());
+        let (program, entry): (KernelProgram, KernelEntry) = vos_recair::leaf::kernel_program(
+            &blob,
+            &record(&blob),
+            vos_pvm_compiler::TRANSPILER_VERSION,
+            &SEGMENT,
+        )
+        .expect("the kernel's program");
+        let trace = trace_kernel(&blob, &[], 1_000).expect("halts");
+        assert_eq!(trace.side_note.steps.len(), CUTS[2].1);
+        assert_eq!(trace.io_hash, base.io_hash());
+        let shape = program.shape.segment(0).expect("class 0");
+        let mut cursor = SegmentCursor::new(&trace.side_note);
+        let segments: Vec<_> = CUTS
+            .iter()
+            .map(|&(a, b)| {
+                prove_shaped(&mut cursor.side_note(a, b), &shape, &SEGMENT).expect("proves")
+            })
+            .collect();
+        let word = FoldCircuit::word();
+        let fold = FoldCircuit::new();
+        let leaf = |segment: usize, position: u32| {
+            common::prove_leaf(&program, &entry, 0, &segments[segment], position, word)
+        };
+        let leaves: Vec<NodeRun> = (0..CUTS.len()).map(|s| leaf(s, s as u32)).collect();
+        let fold_of = |left: &NodeRun, right: &NodeRun| {
+            common::prove_fold(&fold, &program, left, right, word)
+        };
+
+        let head = fold_of(&leaves[0], &leaves[1]);
+        let whole = fold_of(&head, &leaves[2]);
+        assert!(whole.output.entry && whole.output.halt);
+        assert!(head.output.entry && !head.output.halt);
+        assert_eq!(head.output.io_hash, base.io_hash(), "the prefix states S");
+        let tail = fold_of(&leaf(1, 0), &leaf(2, 1));
+        assert!(!tail.output.entry && tail.output.halt && tail.output.first == 0);
+
+        let encode = |proof: &WrapProof| postcard::to_allocvec(proof).expect("encodes");
+        let valid = encode(&wrap_of(&whole, &program, false));
+        let prefix = encode(&wrap_of(&head, &program, true));
+        let midway = encode(&wrap_of(&tail, &program, true));
+
+        let pinned = ProgramId(program.id().0.map(|word| word.0));
+        let other = ProgramId(pinned.0.map(|word| (word + 1) % ((1 << 31) - 1)));
+        let s = Statement {
+            program: pinned,
+            ..base
+        };
+        let policy = Policy {
+            formats: vec![FORMAT],
+            anchors: s.roots.clone(),
+            seen: vec![StatementId(vos_statement::blake2b_256(&[
+                b"an earlier statement",
+            ]))],
+        };
+        let input = |change: &dyn Fn(&mut Input)| {
+            let mut input = Input {
+                program: pinned,
+                policy: policy.clone(),
+                statement: s.clone(),
+            };
+            change(&mut input);
+            input
+        };
+        let mut flipped = valid.clone();
+        flipped[valid.len() / 2] ^= 1;
+        type Class = fn(u32) -> bool;
+        let accepted: Class = |code| code == 0;
+        let by_proof: Class = |code| code >> 8 == 1;
+        let by_words: Class = |code| code == 0x108 || code == 0x109;
+        let cases: Vec<(&str, &str, Option<Patch>, Input, Class)> = vec![
+            ("valid", "wrap.proof", None, input(&|_| {}), accepted),
+            (
+                "tampered",
+                "wrap.proof",
+                Some(Patch::between(&valid, &flipped)),
+                input(&|_| {}),
+                by_proof,
+            ),
+            (
+                "wrong program",
+                "wrap.proof",
+                None,
+                input(&|i| {
+                    i.program = other;
+                    i.statement.program = other;
+                }),
+                by_words,
+            ),
+            (
+                "unanchored root",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.roots[0] = root(40, 0x40)),
+                |code| code == 5,
+            ),
+            (
+                "prefix",
+                "wrap-prefix.proof",
+                None,
+                input(&|_| {}),
+                by_proof,
+            ),
+            (
+                "mid-way",
+                "wrap-midway.proof",
+                None,
+                input(&|_| {}),
+                by_proof,
+            ),
+            (
+                "repeated",
+                "wrap.proof",
+                None,
+                input(&|i| i.policy.seen.push(i.statement.id())),
+                |code| code == 6,
+            ),
+            (
+                "unaccepted format",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.format = 30),
+                |code| code == 2,
+            ),
+            (
+                "wrong io-hash",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.output.push(0)),
+                by_words,
+            ),
+            (
+                "another program than the pin",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.program = other),
+                |code| code == 3,
+            ),
+            (
+                "another space",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.roots[1].space = SpaceId([0xB2; 32])),
+                |code| code == 4,
+            ),
+        ];
+        let proofs = [
+            ("wrap.proof", &valid),
+            ("wrap-prefix.proof", &prefix),
+            ("wrap-midway.proof", &midway),
+        ];
+        let cases: Vec<Case> = cases
+            .into_iter()
+            .map(|(name, file, patch, input, class)| {
+                let proof = proofs.iter().find(|(f, _)| *f == file).unwrap().1;
+                let proof = patch
+                    .as_ref()
+                    .map_or(proof.clone(), |patch| patch.apply(proof));
+                let verdict = vos_statement::code(&input.judge(&proof));
+                assert!(class(verdict), "{name}: {verdict:#x}");
+                eprintln!("{name}: {verdict:#x}");
+                Case {
+                    name: name.into(),
+                    proof: file.into(),
+                    patch,
+                    input,
+                    verdict,
+                }
+            })
+            .collect();
+        proofs
+            .into_iter()
+            .map(|(name, bytes)| (name.to_string(), bytes.clone()))
+            .chain([(CASES.to_string(), vos_statement::fixtures::encode(&cases))])
+            .collect()
     }
 }

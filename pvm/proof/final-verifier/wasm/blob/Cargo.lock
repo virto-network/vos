@@ -565,6 +565,7 @@ name = "vos-final-verifier-wasm"
 version = "0.1.0"
 dependencies = [
  "vos-final-verifier",
+ "vos-statement",
 ]
 
 [[package]]
@@ -579,4 +580,12 @@ dependencies = [
  "stwo",
  "stwo-constraint-framework",
  "vos-pvm-poseidon2",
+]
+
+[[package]]
+name = "vos-statement"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "vos-final-verifier",
 ]

@@ -1,12 +1,15 @@
-//! The final verifier as a runtime-style Wasm blob.
+//! The final verifier and the venue's check over it as a runtime-style
+//! Wasm blob.
 //!
 //! Exports, called the way a runtime API is (the host allocates the input
-//! with the runtime's allocator and passes `(ptr, len)`); the input is the
-//! 24 public words (each a little-endian `u32`), then the wrap proof
-//! (postcard):
-//! - `verify(ptr, len) -> u32`: 1 accept, 0 refuse, 2 undecodable, 3 a
-//!   short input;
-//! - `decode(ptr, len) -> u32`: the decode alone, 1 if it decodes.
+//! with the runtime's allocator and passes `(ptr, len)`):
+//! - `verify(ptr, len) -> u32`, the input the 24 public words (each a
+//!   little-endian `u32`), then the wrap proof (postcard): 1 accept, 0
+//!   refuse, 2 undecodable, 3 a short input;
+//! - `decode(ptr, len) -> u32`: the decode alone, 1 if it decodes;
+//! - `judge(ptr, len) -> u32`, the input a judgement's
+//!   (`vos_statement::model::judge_bytes`): its code, 0 accepted; the
+//!   accepted statement's id is then at `statement_id()`, 32 bytes.
 //!
 //! Blake2b-256 is computed in the blob.
 
@@ -101,6 +104,24 @@ pub extern "C" fn verify(ptr: u32, len: u32) -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn decode(ptr: u32, len: u32) -> u32 {
-    split(input(ptr, len))
-        .is_some_and(|(_, proof)| vos_final_verifier::decode(proof).is_ok()) as u32
+    split(input(ptr, len)).is_some_and(|(_, proof)| vos_final_verifier::decode(proof).is_ok())
+        as u32
+}
+
+/// The last accepted statement's id.
+static mut STATEMENT_ID: [u8; 32] = [0; 32];
+
+#[unsafe(no_mangle)]
+pub extern "C" fn judge(ptr: u32, len: u32) -> u32 {
+    let verdict = vos_statement::model::judge_bytes(input(ptr, len));
+    if let Ok(id) = &verdict {
+        // SAFETY: an instance runs one call at a time.
+        unsafe { STATEMENT_ID = id.0 };
+    }
+    vos_statement::code(&verdict)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn statement_id() -> u32 {
+    core::ptr::addr_of!(STATEMENT_ID) as u32
 }

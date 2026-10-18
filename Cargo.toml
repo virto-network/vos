@@ -24,6 +24,7 @@ members = [
     "pvm/proof/recair-air",
     "pvm/proof/recair",
     "pvm/proof/final-verifier",
+    "pvm/proof/statement",
     "pvm/proof/derive",
     "pvm/proof/verifier",
     "pvm/bench",
@@ -126,6 +127,10 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.vos-recair-air]
 opt-level = 3
+[profile.dev.package.vos-statement]
+opt-level = 3
+[profile.test.package.vos-statement]
+opt-level = 3
 [profile.dev.package.vos-recair]
 opt-level = 3
 [profile.test.package.vos-recair]
@@ -143,6 +148,7 @@ vos-pvm-poseidon2 = { path = "pvm/proof/poseidon2" }
 vos-recair-air = { path = "pvm/proof/recair-air" }
 vos-recair = { path = "pvm/proof/recair" }
 vos-final-verifier = { path = "pvm/proof/final-verifier" }
+vos-statement = { path = "pvm/proof/statement" }
 vos-pvm = { path = "pvm/runtime" }
 vos-pvm-compiler = { path = "pvm/compiler" }
 vos-pvm-program = { path = "pvm/program" }

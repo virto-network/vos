@@ -89,6 +89,9 @@ vos-tree = { workspace = true }
 # final verifier.
 vos-recair = { workspace = true }
 vos-final-verifier = { workspace = true }
+# The golden statements: their types, the venue's check, the fixtures'
+# encoding, and the venue's JAM refine program on the JAM-only host.
+vos-statement = { workspace = true, features = ["fixtures"] }
 
 # Both examples demonstrate the prover end-to-end; mark them
 # prover-only so a verifier-only build (`--no-default-features`) skips

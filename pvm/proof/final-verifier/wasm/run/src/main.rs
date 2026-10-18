@@ -229,14 +229,13 @@ fn median(mut values: Vec<Duration>) -> Duration {
 
 fn run(args: &[String]) -> Result<()> {
     let [blob, semantics, runs, proofs @ ..] = args else {
-        bail!("usage: <verifier.wasm> <client|pvf> <runs> <name.proof>...");
+        bail!("usage: <verifier.wasm> <client|pvf> <runs|judge|statements> <file>...");
     };
     let semantics = match semantics.as_str() {
         "client" => Semantics::Client,
         "pvf" => Semantics::Pvf,
         other => bail!("unknown semantics {other}"),
     };
-    let runs: usize = runs.parse()?;
     let blob = std::fs::read(blob)?;
     let prepared = prepare(&blob, semantics)?;
     let engine = engine(semantics)?;
@@ -249,7 +248,71 @@ fn run(args: &[String]) -> Result<()> {
         start.elapsed()
     );
     let linker = linker(&engine)?;
+    let judged = |name: &str, input: &[u8]| -> Result<(u32, u64, String)> {
+        let (mut store, instance, memory) = instantiate(&engine, &module, &linker, semantics)?;
+        let call = instance.get_typed_func::<(u32, u32), u32>(&mut store, "judge")?;
+        let ptr = write_input(&mut store, memory, input)?;
+        let mut instructions = perf_event::Builder::new(perf_event::events::Hardware::INSTRUCTIONS)
+            .observe_self()
+            .exclude_kernel(true)
+            .exclude_hv(true)
+            .build()?;
+        instructions.enable()?;
+        let code = call
+            .call(&mut store, (ptr, input.len() as u32))
+            .with_context(|| format!("{name}: the call"))?;
+        instructions.disable()?;
+        let mut id = String::new();
+        if code == 0 {
+            let at = instance
+                .get_typed_func::<(), u32>(&mut store, "statement_id")?
+                .call(&mut store, ())?;
+            let mut bytes = [0u8; 32];
+            memory.read(&store, at as usize, &mut bytes)?;
+            id = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        }
+        Ok((code, instructions.read()?, id))
+    };
+    match runs.as_str() {
+        "judge" => {
+            let [directory] = proofs else {
+                bail!("judge: one fixtures directory");
+            };
+            let fixtures = vos_statement::fixtures::load(std::path::Path::new(directory));
+            let mut differ = 0;
+            for fixture in &fixtures {
+                let (code, instructions, id) = judged(&fixture.name, &fixture.bytes())?;
+                println!(
+                    "JUDGE fixture={} expected={:#x} code={code:#x} instructions={instructions} \
+                     id={id}",
+                    fixture.name, fixture.verdict
+                );
+                differ += usize::from(code != fixture.verdict);
+            }
+            if differ > 0 {
+                bail!("{differ} of {} fixtures judged otherwise", fixtures.len());
+            }
+            println!("{} fixtures judged as recorded", fixtures.len());
+            return Ok(());
+        }
+        "statements" => {
+            for path in proofs {
+                let input = std::fs::read(path)?;
+                let proof = std::fs::read(path.replace(".input", ".proof"))?;
+                let (code, instructions, id) = judged(path, &[input, proof].concat())?;
+                println!(
+                    "STATEMENT file={path} code={code:#x} instructions={instructions} id={id}"
+                );
+                if code != 0 {
+                    bail!("{path}: refused, {code:#x}");
+                }
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
 
+    let runs: usize = runs.parse()?;
     for path in proofs {
         let proof = std::fs::read(path)?;
         let mut input = std::fs::read(path.replace(".proof", ".words"))?;

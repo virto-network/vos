@@ -19,3 +19,5 @@ sc-allocator = "39"
 wasm-instrument = { version = "0.4", default-features = false }
 anyhow = "1"
 perf-event2 = "0.7"
+# The golden fixtures and the judgements' inputs.
+vos-statement = { path = "../../../statement", features = ["fixtures"] }

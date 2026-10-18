@@ -1,0 +1,36 @@
+[package]
+name = "vos-statement"
+edition.workspace = true
+version.workspace = true
+license = "Apache-2.0"
+description = "A proved statement as a venue judges it: its types, its canonical encoding, its io-hash and id, and the venue's check of a final proof against it. no_std, with no dependency on VOS beyond the final verifier."
+
+[features]
+# The golden fixtures' reader (`fixtures`), for the venues' harnesses: std.
+fixtures = []
+# The venue as a JAM refine program (`src/bin/final-verify.rs`), for the
+# PVM target only: no_main, its own allocator and panic handler.
+pvm-guest = []
+
+[[bin]]
+name = "final-verify"
+required-features = ["pvm-guest"]
+test = false
+bench = false
+
+# The golden fixtures judged natively and on the JAM-only host.
+[[test]]
+name = "fixtures"
+required-features = ["fixtures"]
+
+[dependencies]
+vos-final-verifier = { workspace = true }
+# BLAKE2b-256, the io-hash's and the id's; without std.
+blake2 = { version = "0.10", default-features = false }
+
+[dev-dependencies]
+# The io-hash a kernel computes, which a statement's must equal.
+vos-pvm-precompiles = { workspace = true }
+# The JAM-only host the guest runs on, and its linker.
+vos-pvm = { workspace = true }
+vos-pvm-compiler = { workspace = true }

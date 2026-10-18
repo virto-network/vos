@@ -8,7 +8,7 @@ default:
 # prover library, wire types. The node runs the
 # agent, so it is tested with it.
 test:
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-recair-air -p vos-recair -p vos-final-verifier
+    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-recair-air -p vos-recair -p vos-final-verifier -p vos-statement --features vos-statement/fixtures
     cargo test -p vos-pvm-proof --lib
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
@@ -130,18 +130,21 @@ check-no-faults:
 # the same embedded target, where no dependency has std either, and for
 # wasm32, the target of an on-chain verifier; the workspace's toolchain file
 # installs wasm32.
-# The final verifier, on the recursion AIR's bodies, for the embedded target,
-# for wasm32 with every nightly feature refused (its source builds on stable),
-# and for the PVM with the standard library built from source, with its JAM
-# refine program (`final-verify.elf`), which `vos-recair`'s wrap test runs on
-# the JAM-only host.
+# The final verifier, on the recursion AIR's bodies, and the statement's
+# venue check over it, for the embedded target, for wasm32 with every
+# nightly feature refused (their source builds on stable), and for the PVM
+# with the standard library built from source, with the venue's JAM refine
+# program (`final-verify.elf`), which `vos-recair`'s wrap test and the
+# fixtures' and the end-to-end tests run on the JAM-only host.
 check-no-std:
     cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target wasm32-unknown-unknown
     cargo build -p vos-final-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-final-verifier --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
-    cargo build -p vos-final-verifier --release --features pvm-guest --target pvm/proof/final-verifier/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+    cargo build -p vos-statement --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
+    with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-statement --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
+    cargo build -p vos-statement --release --features pvm-guest --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the
@@ -153,7 +156,7 @@ check-no-std:
 check: fmt-check doc-check check-no-std build-test-actors build-agent
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cd pvm/proof/settlement-verifier; cargo clippy --all-targets --quiet -- -D warnings
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-recair-air -p vos-recair -p vos-final-verifier
+    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-recair-air -p vos-recair -p vos-final-verifier -p vos-statement --features vos-statement/fixtures
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 
 # Everything but the prover suites: before a merge, and at the end of each

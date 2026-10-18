@@ -10,7 +10,8 @@
 //! The kernels are the `kernels` test actor's (`just build-test-actors`):
 //! `digest` hashes its input through the BLAKE2b precompile, as the window
 //! kernel does, and `areas` computes over its input and hashes only its
-//! io-hash, as a solvency predicate; its run verifies in its leaf.
+//! io-hash, as a solvency predicate; its run verifies in its leaf, and
+//! end to end, its leaves folded and wrapped, as a venue judges it.
 
 mod common;
 
@@ -491,4 +492,76 @@ fn a_predicates_leaf_proves_and_verifies() {
     );
     assert!(leaf.output.entry && leaf.output.halt);
     assert_eq!(leaf.output.io_hash, kernel.trace.io_hash);
+}
+
+/// `areas`, the solvency predicate's kind, end to end: its run cut in three
+/// segments of class 0, each verified in its leaf, the leaves folded to one
+/// root stating the whole run, wrapped under format 28 and verified by
+/// `vos-final-verifier`; its statement (rootless, its output the areas'
+/// sum) recomputes the run's io-hash, and a venue pinning its program
+/// accepts it, natively and on the JAM-only host. The wrap and the
+/// judgement's input are written for the Wasm harness,
+/// `wrap/predicate.{proof,words,input}` under the target's tmp directory.
+#[test]
+fn the_predicate_wraps() {
+    use vos_recair::fold::FoldCircuit;
+
+    let (kernel, _, shape) = areas();
+    let (program, entry) = vos_recair::leaf::kernel_program(
+        &kernel.blob,
+        &kernel.record,
+        vos_pvm_compiler::TRANSPILER_VERSION,
+        &SEGMENT,
+    )
+    .expect("the kernel's program");
+    let steps = kernel.trace.side_note.steps.len();
+    let cuts = [
+        (0, steps / 3),
+        (steps / 3, 2 * steps / 3),
+        (2 * steps / 3, steps),
+    ];
+    let word = FoldCircuit::word();
+    let mut cursor = SegmentCursor::new(&kernel.trace.side_note);
+    let leaves: Vec<common::NodeRun> = (0..cuts.len())
+        .map(|position| {
+            let (a, b) = cuts[position];
+            let (proof, segment, _) = common::measured(|| {
+                prove_shaped(&mut cursor.side_note(a, b), &shape, &SEGMENT).unwrap()
+            });
+            let leaf = common::prove_leaf(&program, &entry, 0, &proof, position as u32, word);
+            eprintln!(
+                "areas: segment {position} ({a}..{b}) proved in {:.2}s; its leaf in {:.2}s",
+                segment.as_secs_f64(),
+                leaf.proving.as_secs_f64()
+            );
+            leaf
+        })
+        .collect();
+    let fold = FoldCircuit::new();
+    let head = common::prove_fold(&fold, &program, &leaves[0], &leaves[1], word);
+    let root = common::prove_fold(&fold, &program, &head, &leaves[2], word);
+    eprintln!(
+        "areas: two folds in {:.2}s and {:.2}s",
+        head.proving.as_secs_f64(),
+        root.proving.as_secs_f64()
+    );
+    assert_eq!((root.output.first, root.output.last), (0, 2));
+    assert!(root.output.entry && root.output.halt, "the whole run");
+    assert_eq!(root.output.io_hash, kernel.trace.io_hash);
+
+    let (bytes, words) = common::wrap_root("areas", &program, &root);
+    let input = common::judged_statement(
+        vos_statement::Statement {
+            format: vos_statement::FORMAT,
+            program: vos_statement::ProgramId(program.id().0.map(|word| word.0)),
+            // Rootless: its space is bound by nothing.
+            space: vos_statement::SpaceId([0; 32]),
+            public_args: Vec::new(),
+            output: kernel.trace.output.clone(),
+            roots: Vec::new(),
+        },
+        &kernel.trace.io_hash,
+        &bytes,
+    );
+    common::write_wrap("predicate", &bytes, &words, &input);
 }

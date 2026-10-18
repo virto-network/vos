@@ -1,6 +1,6 @@
 [workspace]
 
-# The final verifier as a Wasm blob built the way a Substrate runtime is:
+# The final verifier and the venue's check over it as a Wasm blob built the way a Substrate runtime is:
 # `wasm32-unknown-unknown`, `-C target-cpu=mvp`, `-Z build-std=core,alloc`
 # (substrate-wasm-builder's fallback when `wasm32v1-none` is absent), memory
 # imported, and every allocation through sp-io's host allocator ABI
@@ -19,6 +19,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 vos-final-verifier = { path = "../.." }
+vos-statement = { path = "../../../statement" }
 
 [profile.release]
 opt-level = 3

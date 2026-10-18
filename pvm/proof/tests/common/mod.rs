@@ -7,6 +7,10 @@
 
 #![allow(dead_code)]
 
+/// The venue's JAM refine program on the JAM-only host.
+#[path = "../../statement/tests/support/jam.rs"]
+pub mod jam;
+
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
@@ -451,5 +455,111 @@ pub fn prove_fold(
         peak_mib,
         proof: fold_proof,
         output,
+    }
+}
+
+/// `root`, the root of a whole run of `program`, wrapped under format 28 on
+/// the Blake2b-256 channel within 2^17 rows and 8 GiB of heap, and verified
+/// by `vos-final-verifier`, its statement the program's id and the root's
+/// io-hash: the proof's bytes (postcard) and its public words.
+pub fn wrap_root(
+    name: &str,
+    program: &vos_pvm_proof::program_id::KernelProgram,
+    root: &NodeRun,
+) -> (Vec<u8>, [u32; vos_final_verifier::PUBLIC_WORDS]) {
+    use vos_recair::wrap::{self, WrapCircuit};
+
+    let circuit = WrapCircuit::get();
+    let proved = vos_recair::fold::Proved {
+        proof: &root.proof,
+        output: &root.output,
+    };
+    let (values, statement) = circuit
+        .values(proved, &program.id_preimage())
+        .expect("the root's values");
+    let finalized = circuit
+        .build(&values)
+        .finalize()
+        .expect("the wrap's wiring checks");
+    let log_sizes = finalized.circuit.log_sizes();
+    assert_eq!(log_sizes, vos_final_verifier::LOG_SIZES);
+    assert!(log_sizes.iter().all(|&log| log <= 17));
+    let words = wrap::public_words(&finalized);
+    let (proof, proving, peak_mib) = measured(|| wrap::prove(&finalized).expect("the wrap proves"));
+    let bytes = postcard::to_allocvec(&proof).expect("encodes");
+    eprintln!(
+        "{name}'s wrap: {log_sizes:?} log sizes, proved in {:.2}s, its peak heap {peak_mib} MiB, \
+         {} bytes",
+        proving.as_secs_f64(),
+        bytes.len()
+    );
+    assert!(peak_mib <= 8 << 10, "{peak_mib} MiB");
+    let verified = vos_final_verifier::verify_bytes(&bytes, &words).expect("the wrap verifies");
+    assert_eq!(verified, statement);
+    assert_eq!(statement.program, program.id().0.map(|word| word.0));
+    assert_eq!(statement.io_hash, root.output.io_hash);
+    (bytes, words)
+}
+
+/// `statement`, the run's: its io-hash the run's `io_hash`, judged against
+/// the wrap `proof` by a venue that pins its program, accepts format 28 and
+/// anchors its roots, natively and on the JAM-only host by the venue's
+/// refine program; the judgement's input.
+pub fn judged_statement(
+    statement: vos_statement::Statement,
+    io_hash: &[u8],
+    proof: &[u8],
+) -> vos_statement::model::Input {
+    assert_eq!(statement.io_hash()[..], io_hash[..]);
+    let input = vos_statement::model::Input {
+        program: statement.program,
+        policy: vos_statement::model::Policy {
+            formats: vec![vos_statement::FORMAT],
+            anchors: statement.roots.clone(),
+            seen: Vec::new(),
+        },
+        statement,
+    };
+    let id = input.judge(proof).expect("the venue accepts the statement");
+    assert_eq!(id, input.statement.id());
+    let (program, _) = jam::program();
+    let (gas, report) = jam::run(&program, &jam::judge_request(&input), proof);
+    let [start, lookup, _, end] = report.gas;
+    eprintln!(
+        "judged on the JAM-only host: {gas} gas ({:.1}M), lookup {}, the judgement {}; heap \
+         peak {} KiB; id {}",
+        gas as f64 / 1e6,
+        start - lookup,
+        lookup - end,
+        report.peak_live >> 10,
+        id.0.iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>(),
+    );
+    assert_eq!(report.verdict, jam::ACCEPT, "{}", report.error);
+    assert_eq!(report.code, 0);
+    assert_eq!(report.id, id.0);
+    assert!(gas <= 150_000_000, "{gas} gas");
+    input
+}
+
+/// A wrap's proof (postcard), its public words (24 little-endian `u32`s)
+/// and its judgement's input, under the target's tmp directory as
+/// `wrap/<name>.{proof,words,input}`, for the Wasm harness.
+pub fn write_wrap(
+    name: &str,
+    proof: &[u8],
+    words: &[u32; vos_final_verifier::PUBLIC_WORDS],
+    input: &vos_statement::model::Input,
+) {
+    let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
+    std::fs::create_dir_all(&directory).expect("the wrap's directory");
+    let words: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    for (extension, bytes) in [
+        ("proof", proof),
+        ("words", &words),
+        ("input", &input.encode()),
+    ] {
+        std::fs::write(directory.join(format!("{name}.{extension}")), bytes).expect("writes");
     }
 }

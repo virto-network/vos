@@ -694,19 +694,21 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
     assert_eq!(end.io_hash, trace.io_hash);
 }
 
-/// The whole window wrapped: every segment proved in its class and verified
-/// in its leaf, the leaves folded in adjacent pairs, an odd node carried up,
-/// to one root stating the whole run (its entry, its halt, its io-hash);
-/// the root wrapped under format 28 on the Blake2b-256 channel within 2^17
-/// rows and 8 GiB of heap, and verified by `vos-final-verifier`, its
-/// statement the program's id and the run's io-hash. The wrap's proof
-/// (postcard) and its public words (24 little-endian u32s) are written
-/// under the target's tmp directory, `wrap/window.proof` and
-/// `wrap/window.words`, for the Wasm and JAM harnesses.
+/// The whole window, end to end: every segment proved in its class and
+/// verified in its leaf, the leaves folded in adjacent pairs, an odd node
+/// carried up, to one root stating the whole run (its entry, its halt, its
+/// io-hash); the root wrapped under format 28 on the Blake2b-256 channel
+/// within 2^17 rows and 8 GiB of heap, and verified by
+/// `vos-final-verifier`, its statement the program's id and the run's
+/// io-hash. The window's `vos_statement::Statement` (rootless: its anchors'
+/// roots are in its arguments, bound through its output) recomputes that
+/// io-hash, and a venue pinning the program accepts it, natively and on the
+/// JAM-only host. The wrap's proof (postcard), its public words (24
+/// little-endian u32s) and the judgement's input are written under the
+/// target's tmp directory, `wrap/window.{proof,words,input}`, for the Wasm
+/// harness.
 #[test]
 fn the_window_wraps() {
-    use vos_recair::wrap::{self, WrapCircuit};
-
     let instance = instance();
     let kernel = run(&instance.arguments.encode());
     let trace = traced(&kernel);
@@ -758,38 +760,18 @@ fn the_window_wraps() {
     assert!(output.entry && output.halt, "the whole run");
     assert_eq!(output.io_hash, trace.io_hash);
 
-    let circuit = WrapCircuit::get();
-    let proved = vos_recair::fold::Proved {
-        proof: &root.proof,
-        output: &root.output,
-    };
-    let (values, statement) = circuit
-        .values(proved, &program.id_preimage())
-        .expect("the root's values");
-    let context = circuit.build(&values);
-    let finalized = context.finalize().expect("the wrap's wiring checks");
-    let log_sizes = finalized.circuit.log_sizes();
-    assert_eq!(log_sizes, vos_final_verifier::LOG_SIZES);
-    assert!(log_sizes.iter().all(|&log| log <= 17));
-    let words = wrap::public_words(&finalized);
-    let (proof, proving, peak_mib) =
-        common::measured(|| wrap::prove(&finalized).expect("the wrap proves"));
-    let bytes = postcard::to_allocvec(&proof).expect("encodes");
-    eprintln!(
-        "the window's wrap: {log_sizes:?} log sizes, proved in {:.2}s, its peak heap {peak_mib} \
-         MiB, {} bytes",
-        proving.as_secs_f64(),
-        bytes.len()
+    let (bytes, words) = common::wrap_root("the window", &program, &root);
+    let input = common::judged_statement(
+        vos_statement::Statement {
+            format: vos_statement::FORMAT,
+            program: vos_statement::ProgramId(program.id().0.map(|word| word.0)),
+            space: vos_statement::SpaceId(SPACE),
+            public_args: Vec::new(),
+            output: instance.expected.encode(),
+            roots: Vec::new(),
+        },
+        &trace.io_hash,
+        &bytes,
     );
-    assert!(peak_mib <= 8 << 10, "{peak_mib} MiB");
-    let verified = vos_final_verifier::verify_bytes(&bytes, &words).expect("the wrap verifies");
-    assert_eq!(verified, statement);
-    assert_eq!(statement.program, program.id().0.map(|word| word.0));
-    assert_eq!(statement.io_hash, trace.io_hash);
-
-    let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
-    std::fs::create_dir_all(&directory).expect("the wrap's directory");
-    std::fs::write(directory.join("window.proof"), &bytes).expect("writes the proof");
-    let words: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-    std::fs::write(directory.join("window.words"), words).expect("writes the words");
+    common::write_wrap("window", &bytes, &words, &input);
 }

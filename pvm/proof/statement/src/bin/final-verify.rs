@@ -1,18 +1,25 @@
-//! The final verifier as a JAM refine program (`--features pvm-guest`,
-//! built by `just check-no-std` for the PVM target): it verifies a wrap
-//! proof the way a JAM service would, and reports its gas by phase.
+//! The venue as a JAM refine program (`--features pvm-guest`, built by
+//! `just check-no-std` for the PVM target): it verifies a final proof the
+//! way a JAM service would, or judges a statement with it as a venue does,
+//! and reports its gas by phase.
 //!
 //! Input, as a JAM work item gives it:
-//! - work item 0's payload (`fetch`, kind 13), [`PAYLOAD_LEN`] bytes: the
-//!   24 public words (each a little-endian `u32`), the proof's Blake2b-256
-//!   hash and its length (`u32`, little-endian);
+//! - work item 0's payload (`fetch`, kind 13), at most 16 KiB: a mode byte,
+//!   then
+//!   - 0: the 24 public words (each a little-endian `u32`), which the proof
+//!     is verified against;
+//!   - 1: a judgement's input (`vos_statement::model::Input`): the program
+//!     id the venue pinned, its state and the statement;
+//!
+//!   then the proof's Blake2b-256 hash and its length (`u32`,
+//!   little-endian);
 //! - the proof, postcard, as a preimage of the running service, read by
 //!   `historical_lookup`.
 //!
 //! Output (φ7 address, φ8 length): [`Report`], every field a little-endian
-//! `u64`: the verdict, the gas left at each phase, the heap's figures and a
-//! refusal's text. Blake2b-256 is computed in software: JAM serves no
-//! hash.
+//! `u64`: the verdict, the gas left at each phase, the heap's figures, a
+//! refusal's text, and a judgement's code and accepted statement id.
+//! Blake2b-256 is computed in software: JAM serves no hash.
 
 #![no_std]
 #![no_main]
@@ -26,6 +33,7 @@ use core::cell::UnsafeCell;
 use core::fmt::Write;
 
 use vos_final_verifier::PUBLIC_WORDS;
+use vos_statement::model::Input;
 
 /// The verifier's own stack, in `.bss`: the standard program's stack is
 /// the read-only zone's offset, 64 KiB. Its pages written say how much
@@ -298,8 +306,12 @@ fn gas_left() -> u64 {
 
 // ── The verify ──────────────────────────────────────────────────────────
 
-/// The payload: the public words, the proof's hash and its length.
-pub const PAYLOAD_LEN: usize = 4 * PUBLIC_WORDS + 32 + 4;
+/// The payload's buffer: a judgement's input holds the statement.
+const PAYLOAD_MAX: usize = 16 << 10;
+
+/// The payload's modes, its first byte.
+const WORDS: u8 = 0;
+const JUDGE: u8 = 1;
 
 /// Verdicts.
 const ACCEPT: u64 = 1;
@@ -312,7 +324,7 @@ struct Static<T>(UnsafeCell<T>);
 // SAFETY: a PVM invocation is single-threaded.
 unsafe impl<T> Sync for Static<T> {}
 
-static PAYLOAD: Static<[u8; 256]> = Static(UnsafeCell::new([0; 256]));
+static PAYLOAD: Static<[u8; PAYLOAD_MAX]> = Static(UnsafeCell::new([0; PAYLOAD_MAX]));
 static REPORT: Static<Report> = Static(UnsafeCell::new(Report::new()));
 static PANIC: Static<[u8; 512]> = Static(UnsafeCell::new([0; 512]));
 
@@ -330,6 +342,10 @@ pub struct Report {
     allocs: u64,
     error_len: u64,
     error: [u8; 192],
+    /// A judgement's code (`vos_statement::code`).
+    code: u64,
+    /// An accepted statement's id.
+    id: [u8; 32],
 }
 
 impl Report {
@@ -346,7 +362,19 @@ impl Report {
             allocs: 0,
             error_len: 0,
             error: [0; 192],
+            code: u64::MAX,
+            id: [0; 32],
         }
+    }
+
+    fn refuse(&mut self, error: &dyn core::fmt::Display) -> u64 {
+        let mut cursor = Cursor {
+            buf: &mut self.error,
+            len: 0,
+        };
+        let _ = write!(cursor, "{error}");
+        self.error_len = cursor.len as u64;
+        REJECT
     }
 }
 
@@ -388,6 +416,33 @@ extern "C" fn verify_main() -> Output {
     }
 }
 
+/// What the payload asks.
+enum Request {
+    Words([u32; PUBLIC_WORDS]),
+    Judge(Input),
+}
+
+/// The payload: its request, the proof's hash and its length.
+fn request(payload: &[u8]) -> Option<(Request, [u8; 32], usize)> {
+    let (&mode, body) = payload.split_first()?;
+    let (request, rest) = match mode {
+        WORDS => {
+            let (words, rest) = body.split_at_checked(4 * PUBLIC_WORDS)?;
+            let words = core::array::from_fn(|i| {
+                u32::from_le_bytes(words[4 * i..4 * i + 4].try_into().unwrap())
+            });
+            (Request::Words(words), rest)
+        }
+        JUDGE => {
+            let (input, used) = Input::decode_prefix(body).ok()?;
+            (Request::Judge(input), &body[used..])
+        }
+        _ => return None,
+    };
+    let [hash @ .., l0, l1, l2, l3] = <[u8; 36]>::try_from(rest).ok()?;
+    Some((request, hash, u32::from_le_bytes([l0, l1, l2, l3]) as usize))
+}
+
 fn verify(report: &mut Report) -> u64 {
     // SAFETY: single-threaded; nothing else borrows the payload buffer.
     let payload = unsafe { &mut *PAYLOAD.0.get() };
@@ -402,14 +457,12 @@ fn verify(report: &mut Report) -> u64 {
             0
         ]
     );
-    if len != PAYLOAD_LEN as u64 {
+    if len > payload.len() as u64 {
         return BAD_PAYLOAD;
     }
-    let words: [u32; PUBLIC_WORDS] =
-        core::array::from_fn(|i| u32::from_le_bytes(payload[4 * i..4 * i + 4].try_into().unwrap()));
-    let at = 4 * PUBLIC_WORDS;
-    let hash: [u8; 32] = payload[at..at + 32].try_into().unwrap();
-    let proof_len = u32::from_le_bytes(payload[at + 32..at + 36].try_into().unwrap()) as usize;
+    let Some((request, hash, proof_len)) = request(&payload[..len as usize]) else {
+        return BAD_PAYLOAD;
+    };
     report.proof_len = proof_len as u64;
 
     let mut bytes: Vec<u8> = Vec::with_capacity(proof_len);
@@ -431,22 +484,28 @@ fn verify(report: &mut Report) -> u64 {
     unsafe { bytes.set_len(proof_len) };
     report.gas_after_lookup = gas_left();
 
-    let Ok(proof) = vos_final_verifier::decode(&bytes) else {
-        return UNDECODABLE;
-    };
-    drop(bytes);
-    report.gas_after_decode = gas_left();
-
-    match vos_final_verifier::verify(proof, &words) {
-        Ok(_) => ACCEPT,
-        Err(error) => {
-            let mut cursor = Cursor {
-                buf: &mut report.error,
-                len: 0,
+    match request {
+        Request::Words(words) => {
+            let Ok(proof) = vos_final_verifier::decode(&bytes) else {
+                return UNDECODABLE;
             };
-            let _ = write!(cursor, "{error}");
-            report.error_len = cursor.len as u64;
-            REJECT
+            drop(bytes);
+            report.gas_after_decode = gas_left();
+            match vos_final_verifier::verify(proof, &words) {
+                Ok(_) => ACCEPT,
+                Err(error) => report.refuse(&error),
+            }
+        }
+        Request::Judge(input) => {
+            let verdict = input.judge(&bytes);
+            report.code = u64::from(vos_statement::code(&verdict));
+            match verdict {
+                Ok(id) => {
+                    report.id = id.0;
+                    ACCEPT
+                }
+                Err(refusal) => report.refuse(&refusal),
+            }
         }
     }
 }
