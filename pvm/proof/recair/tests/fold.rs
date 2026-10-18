@@ -13,10 +13,11 @@
 //!   values is the filled one's, and its rows fit the padded shape.
 //! - **Refusals, each by its intended check:** a wrong program and a leaf
 //!   carrying a wrong program id (`fold: program`); a gap (`fold:
-//!   adjacency`); broken continuity (`fold: continuity`); a wrong child
-//!   circuit and a child carrying a foreign W (`fold: circuit`); a tampered
-//!   child preimage, and a prefix or a mid-run start claiming the flag its
-//!   run lacks (`fold: preimage`). A prefix and a mid-run start state no
+//!   adjacency`), and the same leaf as both children; broken continuity
+//!   (`fold: continuity`), and one segment relabelled at two adjacent
+//!   positions; a wrong child circuit and a child carrying a foreign W
+//!   (`fold: circuit`); a tampered child preimage, and a prefix or a mid-run
+//!   start claiming the flag its run lacks (`fold: preimage`). A prefix and a mid-run start state no
 //!   halt and no entry, which the wrap refuses. A refused fold, proved, does
 //!   not verify.
 //! - **A tampered child proof** is refused by the check the native verifier
@@ -380,9 +381,10 @@ fn a_foreign_fold_word_or_a_wrong_choice_is_refused() {
     assert_eq!(refusals(&run.fold, &two), ["fold: circuit"]);
 }
 
-/// The run: a gap between the children's positions, and children that do
-/// not continue each other, refused in the circuit and, proved, by the
-/// fold's verifier.
+/// The run: a gap between the children's positions, children that do not
+/// continue each other, the same leaf as both children, and the same
+/// segment relabelled at two adjacent positions, refused in the circuit
+/// and, proved, by the fold's verifier.
 #[test]
 fn a_gap_or_broken_continuity_is_refused() {
     let tree = tree();
@@ -397,6 +399,20 @@ fn a_gap_or_broken_continuity_is_refused() {
     let (values, _) = run.values(left, &skip, &run.program);
     assert_eq!(refusals(&run.fold, &values), ["fold: continuity"]);
 
+    // The same leaf as both children: its position does not follow itself.
+    let (values, _) = run.values(left, left, &run.program);
+    assert_eq!(
+        refusals(&run.fold, &values),
+        ["fold: adjacency", "fold: continuity"]
+    );
+    // The same segment relabelled at positions 1 and 2: adjacent, but its
+    // exit is not its own entry.
+    let relabelled = run.leaf(1, 2, id(&run.program), run.word);
+    let (values, _) = run.values(&tree.leaves[1], &relabelled, &run.program);
+    assert_eq!(refusals(&run.fold, &values), ["fold: continuity"]);
+
+    // The third segment at position 1, again.
+    let (values, _) = run.values(left, &skip, &run.program);
     // Proved, the refused witness does not verify as the fold circuit: its
     // `Gate` relation does not balance.
     let mut context = Context::<SecureField>::with_outputs(2).lenient();
