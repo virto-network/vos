@@ -40,12 +40,15 @@ vectors:
 # the recursion AIR, its whole run folded and wrapped under format 28 and
 # verified by the final verifier, and the fixtures checked against their
 # generator and judged in Wasm.
-# Memory-heavy: two threads fit under a 24 GiB limit, e.g.
-# `systemd-run --user --scope -p MemoryMax=24G -p MemorySwapMax=0 just test-proof`.
+# Memory-heavy: the library, `gates` and `isa` run two tests at a time, and
+# `kernel`, whose window runs each take several GiB, one at a time, so the
+# recipe fits under a 16 GiB limit, e.g.
+# `systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
 # them; the verifier's suite runs in `test`.
 test-proof: build-test-actors judge-wasm
-    cargo test -p vos-pvm-proof --features debug-internals --tests -- --test-threads=2
+    cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
+    cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --test-threads=1
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
 # verifier's blob built as a runtime builds it, under the PVF's semantics and
