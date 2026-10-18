@@ -2,6 +2,14 @@
 
 Plan, draft 2, written for slice 5 before the owner chose proving first.
 Its slice number is set when it is scheduled; it follows slice 6.
+
+**What changed since this draft:** proving came first (slices 5 and 6);
+slice 6 builds the statements, the space roots and anchors (Unix-time
+windows from the genesis, one venue per space), the carried commitment
+that replaces two-anchor reads, `&self` reads by a served witness, a JAM
+statements service and the design of Kreivo's spaces pallet. The steps
+below, renumbered C.0–C.8, are re-read against them where marked; the
+rest of the draft stands as written.
 - **Draft 1** followed the owner's choice of proving plus the Clerk.
 - **Draft 2** folds Fable's review of draft 1:
   - why settlement by statement is safe;
@@ -14,26 +22,17 @@ Its slice number is set when it is scheduled; it follows slice 6.
 
 ## What the survey found
 
-A survey of the code (the context brief, 2026-10-15):
-- **No proving is wired into VOS:** the prover proves PVM traces, but
-  neither the agent nor the node uses it, and no derived kernel has ever
-  been proved.
-- **No zero-knowledge:** the pinned Stwo has no masking, and upstream's
-  new home shows no ZK mode.
-- **The on-chain verify cost is unknown:** every figure (10.7M cycles,
-  ~29M gas) verifies a one-column toy proof, while a real segment has
-  ~15,800 columns.
-- **The Clerk needs pieces VOS lacks:**
-  - transport between spaces;
-  - space-level roots and anchors;
-  - reads of committed rows inside kernels;
-  - the JAM agents.
+Proving is built: the recursion folds a window into one final proof
+(slice 5; 8,039 columns in the full segment AIR; 96.4M gas, 38M Wasm
+instructions unmasked); slice 6 masks it and builds roots, anchors,
+`&self` reads and the venues.
+- **The Clerk still needs** transport between spaces and its settlement
+  handler at the venue; the space-level roots, the anchors and the reads
+  of committed rows inside kernels come with slice 6.
 
 ## The split
 
-- **Slice 5: the Clerk across spaces, with settlement by statement,** plus the spikes and
-  designs proving needs.
-- **Slice 6: proving the statements.**
+The owner chose proving first; the Clerk follows slice 6.
 
 **Why settlement by statement is safe:**
 - **The pairing rule:** `reconcile` accepts only two statements whose
@@ -54,10 +53,11 @@ A survey of the code (the context brief, 2026-10-15):
 adds a proof without changing it:
 - reads are witnessed rows and paths;
 - the roots are in the `Attest` record;
-- the public output is fixed, including the rows commitment (5.4).
+- the public output is fixed, including the rows commitment (C.4).
 
 **Clerk first** also settles what reshapes proving: how many rows a
-window reads, the witness channel (arguments are capped at 64 KiB), the
+window reads, the witness channel (the argument cap stays; a statement's
+rows arrive as a served witness by hash, under `Limits::served`), the
 public output and the anchor hierarchy.
 
 ## Goals
@@ -73,9 +73,13 @@ public output and the anchor hierarchy.
 
 ## Steps
 
-5.0 runs beside 5.1. 5.4 waits on spikes 1 and 3.
+C.0 runs beside C.1. C.4 waits on spikes 1 and 3.
 
-### 5.0 Spikes, each with its decision rule
+### C.0 Spikes, each with its decision rule
+
+**Done:** a real segment on JAM (spike 4a: not viable; a final proof
+instead); masking (spikes 2 and 6a); a window statement proved (spike 3,
+slice 5's 5.15).
 
 1. **Verify one real segment on JAM.**
    - **What:** a refine-path segment made on the Poseidon2 channel,
@@ -111,7 +115,7 @@ public output and the anchor hierarchy.
      preprocessed root, the kernel hash derived per `TRANSPILER_VERSION`,
      and `ProgramHash`.
 
-### 5.1 The Clerk agent in one space
+### C.1 The Clerk agent in one space
 
 - **Storage:** a `LedgerState` over the SDK's `CommittedMap`s, one table
   per record kind, with point keys only.
@@ -143,10 +147,12 @@ public output and the anchor hierarchy.
 - **Measured:** a transfer's gas on vos-core (the fit check's 175k is
   master's interpreter).
 
-### 5.2 Spaces that know each other (design round first, reviewed by Fable)
+### C.2 Spaces that know each other (design round first, reviewed by Fable)
 
-- **`SpaceId`:** the hash of the space's creation record, bound to its
-  representative's service id on JAM, signed both ways.
+- **`SpaceId`** = the hash of the space's genesis (`vos-anchor`); a
+  founding node key binds a controller at each venue.
+- **Counterparties anchor at the same venue;** a pair on two venues
+  settles once one migrates.
 - **Pair keys qualified by space:** `(sender space, agent)` and
   `(receiver space, agent)`. `Message.from`, `Deliver`, `Acknowledge`
   and `Behind` carry `SpaceId`. That changes the wire, once.
@@ -164,78 +170,64 @@ public output and the anchor hierarchy.
   the source, not the type.
 - **Backpressure:** rate caps per peer space on the fan-in path.
 
-### 5.3 Payments between spaces
+### C.3 Payments between spaces
 
-- `payment::send` and `receive` through 5.2's transport;
+- **Time between spaces is the venue's:** a deadline between parties in
+  different spaces (a payment's expiry, a timeout, an exposure deadline)
+  is the venue's chain time, never a window number or a space's clock.
+- **Latency:** authorization is instant, the counterparty crediting
+  within its exposure cap; trustless settlement takes about
+  `L/2 + D + t_prove + inclusion`.
+- `payment::send` and `receive` through C.2's transport;
 - the suspense account for refused payments, with its bounce helper;
 - **Tests** across two spaces: payments in flight, replays, refusals,
   and suspense.
 - **Measured:** a payment's latency between spaces.
 
-### 5.4 Windows, anchors and the statement (design round first, reviewed by Fable)
+### C.4 Windows, anchors and the statement (design round first, reviewed by Fable)
 
-- **The cut:** windows bound to the pair's sequence numbers.
+- **The cut:** windows are the space's Unix-time clock; the per-pair
+  sequence cut lives in the pair's rows and the statement's output.
   - A states "sent through sequence s"; B states "credited through s".
   - Exactly-once ordering makes that well defined, and the anchor root
     proves the rows at that cut.
-  - Time-based anchors alone never reconcile under continuous traffic.
-  - The cut also defines idle and spanning windows.
-- **Anchors:**
-  - a space-level root over its agents' roots, at a fixed cadence
-    (minutes), on a schedule taken from JAM's time through the
-    builder's JAM node;
-  - the path map root → agent root → space root is built and checked.
-- **The carry-forward of past-anchor reads:**
-  - each window's statement takes its earlier rows as those the previous
-    statement read;
-  - the public output carries a **commitment to the rows it read at its
-    later anchor**;
-  - the JAM agent keeps that commitment per (A, B, currency) and checks
-    that the next statement starts from it.
-  - cipher-clerk's `NetFlow` gains it, or is wrapped.
-- **Absence at a past anchor:** a pseudo-account row carries its creation
-  window, witnessed under the current root, so a row created after the
-  earlier anchor counts from zero by its own stamp. The tree keeps no old
-  versions.
-- **Completeness of the journals:** pseudo-account rows are keyed (peer,
-  currency, journal) in an `Ordered` map, so a range proof shows the set
-  is whole. That map cannot take the private transform. An incomplete set
-  is a liveness failure, since the counterparty's statement won't match,
-  not theft.
+- **Anchors:** a space-level root over its agents' roots per window, and
+  the path map root → agent root → space root, are slice 6's.
+- **The carried commitment:** the handler keeps per (A, B, currency) a
+  commitment to the last settled cumulative state; the kernel takes it as
+  a `#[public]` argument, the old values privately, and reads the current
+  rows at one anchored cut. No old tree or anchor is kept; the
+  creation-window stamp is not needed. cipher-clerk's `NetFlow` gains it,
+  or is wrapped.
+- **Completeness of the journals:** under decision 4's aggregate rows, a
+  pair reads two rows; the range proof over journals is not needed.
 - **The statement:**
   - an attestable method reading witnessed committed rows (core model
     §11.1's committed-field witnesses into kernels; reads are witnessed
     rows and paths, and the roots go into the `Attest` record);
   - it runs `settlement::window`;
-  - its witness channel lifts the 64 KiB argument cap.
+  - the argument cap stays; a statement's rows arrive as a served
+    witness by hash, under `Limits::served`.
 
-### 5.5 The JAM agents
+### C.5 The venues
 
-- **A representative agent per space on JAM:** it publishes the space's
-  anchors and submits its statements.
-- **Transfer-carried inputs:**
-  - a public JAM agent takes no origin from its builder, so it receives
-    chain-authenticated transfers from representatives, with payloads as
-    preimages;
-  - core model §12 lists this as unbuilt, so it is a step of its own.
-- **The aggregate-balance agent:**
-  - it keeps the last settled anchor and the rows commitment per
-    (A, B, currency);
+- **Settlement on Kreivo first,** a `ClerkSettle` handler in
+  `pallet-spaces` (the Kreivo teammate's); the JAM statements service
+  beside it.
+- **Spaces register at the venue from their genesis,** with a sovereign
+  account.
+- **The settlement handler:**
+  - it keeps the carried commitment per (A, B, currency);
   - it reconciles pairs, moves the nets, and refuses an aggregate below
     zero;
-  - a space's aggregate is funded and withdrawn by transfers of JAM
-    tokens;
-  - its builder is run by the root space at first, which can delay
-    inputs but never forge them.
-- **Registration stand-in:** self-registration by first transfer. The
-  representative's service id registers itself, with its `SpaceId` in
-  the memo; the builder fills no table.
-- **Tests:**
-  - the JAM comparison suite;
-  - a PolkaJam testnet run with two spaces settling a window.
-- **Measured:** the aggregate agent's gas per statement.
+  - it is two-sided, as every value-moving handler is (Fable's review of
+    slice 6's design round, finding 9).
+- **Tests:** two spaces settling a window at the venue.
+- **Measured:** the settlement handler's weight or gas per statement.
 
-### 5.6 Per-target limits (the owner's decision)
+### C.6 Per-target limits (the owner's decision)
+
+**Done in slice 5.**
 
 - **A JAM profile:**
   - per-step effect caps about 31 times smaller than VOS's, sized so the
@@ -247,7 +239,10 @@ public output and the anchor hierarchy.
   count, and each kernel's bound on software BLAKE2b on JAM.
 - **One page price everywhere,** unchanged.
 
-### 5.7 The carried items
+### C.7 The carried items
+
+**Done in slice 5:** the JAM limits, DA, the heap per invocation, the
+measurements, Ristretto removed.
 
 - **DA:** re-export a waiting workflow's pages before retention, or fail
   it deterministically (pages lost).
@@ -258,7 +253,7 @@ public output and the anchor hierarchy.
 - **PolkaJam:** a re-probe on upgrade, and the recompiler run once the
   owner's kernel setting is in place.
 - **Carried on, by name:**
-  - **the private key transform:** not needed here, since 5.4 needs an
+  - **the private key transform:** not needed here, since C.4 needs an
     iterating map;
   - **Ristretto ids 110–114 in the prover:** removed in slice 5, chips
     and ids; the Clerk doesn't need them, and slice 7's generic bignum
@@ -266,7 +261,7 @@ public output and the anchor hierarchy.
   - **the identity design's step 3** (credentials, anonymous origins):
     slice 6 or later, with a holder-side prover.
 
-### 5.8 Acceptance
+### C.8 Acceptance
 
 - **Gates:**
   - `ci-full`;
@@ -282,7 +277,8 @@ public output and the anchor hierarchy.
 
 ## Decisions for the owner
 
-1. **The split:** Clerk first (recommended), or proving first.
+1. **The split:** the owner chose proving first; the Clerk follows
+   slice 6.
 2. **Settlement by statement in slice 5,** safe for the reconcile reason
    above.
 3. **The Clerk's owners before the identity agent:** device keys as an
@@ -305,9 +301,10 @@ override:**
 
 ## Risks
 
-- **A real proof's verification may not fit JAM.** Spike 1 decides it
-  first, and the slice-5 shape survives either answer.
-- **Masking may need a Stwo move** and a toolchain change.
+- ~~A real proof's verification may not fit JAM.~~ Retired: the final
+  proof fits (96.4M gas).
+- ~~Masking may need a Stwo move and a toolchain change.~~ Retired: it
+  needed no Stwo move (spike 6a).
 - **Transport between spaces and the cut** are the largest new protocol
   surfaces; each gets a design round and a Fable review.
 - **Window statements over many journals** may exceed one segment, about
