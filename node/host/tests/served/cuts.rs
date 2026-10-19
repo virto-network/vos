@@ -25,9 +25,9 @@ use std::time::Duration;
 use vos_checker::calls::install_at_leader;
 use vos_checker::programs::{actor, method, package, table_tag};
 use vos_checker::{ANSWERED, Mode, wait_until};
-use vos_node::Reply;
 use vos_node::roots;
 use vos_node::store::Snapshot;
+use vos_node::{Node, Reply};
 use vos_wire::abi::{AttestError, Rows};
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, InstanceId, Principal, Session};
@@ -221,6 +221,21 @@ impl Alongside for Cuts {
             }
             scope.spawn(move || self.sample(cluster, agents, done));
         });
+    }
+
+    /// The reads started at `agent`: those its reader answered as started,
+    /// and one more when the run ended on a retry of a read that had
+    /// started, its tag the next one, noted when it ended.
+    fn workflows(&self, node: &Node, agent: AgentId) -> u64 {
+        let recorded = self
+            .started
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(at, _)| *at == agent)
+            .count() as u64;
+        let snapshot = node.store().snapshot();
+        recorded + u64::from(noted(&snapshot, agent, recorded).is_some())
     }
 
     fn check(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])]) {

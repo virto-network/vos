@@ -74,6 +74,11 @@ pub(crate) trait Alongside: Sync {
     fn clock(&self) -> Option<WindowClock>;
     fn run(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])], done: &AtomicBool);
     fn check(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])]);
+    /// The workflows it started at `agent`, as `node` holds them, beside
+    /// the tours'.
+    fn workflows(&self, _node: &Node, _agent: AgentId) -> u64 {
+        0
+    }
 }
 
 pub(crate) fn exactly_once(
@@ -160,7 +165,7 @@ pub(crate) fn exactly_once(
         methods.value,
     );
     let touring = &clients[2 * at_each..];
-    let toured = check_tours(&cluster, touring, sent_forwarding, sent_touring);
+    let toured = check_tours(&cluster, touring, sent_forwarding, sent_touring, alongside);
     check_forwards(
         &cluster,
         forwarding,
@@ -230,13 +235,15 @@ fn check_counters(cluster: &Cluster, seconds: &[Client], sent: &[u64], value: Me
 /// done once, and of one that failed once or not at all; its requests and
 /// messages went once, each request answered once. Every workflow started
 /// once, and none lives on. `forwarded` are what each agent's forwarding
-/// client sent, `started` the tours each touring client started. Answers
+/// client sent, `started` the tours each touring client started, beside
+/// the workflows `alongside` started at its agent. Answers
 /// the tours' messages on each agent's pair with the next, by agent.
 fn check_tours(
     cluster: &Cluster,
     touring: &[Client],
     forwarded: &[u64],
     started: &[u64],
+    alongside: Option<&dyn Alongside>,
 ) -> Vec<u64> {
     let mut messages = vec![0; forwarded.len()];
     for (at, client) in touring.iter().enumerate() {
@@ -278,9 +285,10 @@ fn check_tours(
                 client.number
             );
             messages[at] = held;
+            let beside = alongside.map_or(0, |alongside| alongside.workflows(&node, agent));
             assert_eq!(
                 mark(agent, &keys::next_workflow()),
-                started[at],
+                started[at] + beside,
                 "every tour started once"
             );
             let pins = keys::workflow_pins_prefix();
