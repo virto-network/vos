@@ -719,7 +719,10 @@ mod heavy {
         static N: OnceLock<usize> = OnceLock::new();
         *N.get_or_init(|| {
             let n = crate::common::leakage::heavy_n("LEAKAGE_WRAP_N", 16);
-            assert!(n >= 16, "LEAKAGE_WRAP_N {n}: below 16 the unmasked control passes");
+            assert!(
+                n >= 16,
+                "LEAKAGE_WRAP_N {n}: below 16 the unmasked control passes"
+            );
             n
         })
     }
