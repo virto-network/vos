@@ -3,10 +3,10 @@
 //! windows at one version; and a leader change between a cut and its
 //! close, which finds every replica holding the cut's proofs.
 //!
-//! Each space here has windows of two minutes, the shortest a venue
-//! registers, with a boundary `B_0` some seconds after the cluster starts;
-//! the tests move nodes' clocks across boundaries by their offsets rather
-//! than wait. A cut, its build and its proofs are the model's terms
+//! Each space here has windows of an hour, the longest a venue registers,
+//! its first boundary `B_0` most of an hour after the cluster starts, so
+//! no boundary passes however slowly a loaded machine runs a test: the
+//! tests move nodes' clocks across boundaries by their offsets. A cut, its build and its proofs are the model's terms
 //! (`tests/cuts/model.rs`); the close is the representative's `Closed`,
 //! which no node sends yet, so "before the close" is any time after the
 //! cut.
@@ -27,20 +27,16 @@ use vos_wire::keys;
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::{PendingRead, unstored, unversioned};
 use vos_wire::result::{Outcome, WorkResult};
-use vos_wire::vos_anchor::MIN_LENGTH_MS;
+use vos_wire::vos_anchor::MAX_LENGTH_MS;
 use vos_wire::{Decode, Encode, WindowClock};
 
 use crate::common::{ALICE, COUNTER, Cluster, Rows, compacting, log_start, wait_until};
 
-/// How far after the cluster starts its first boundary falls.
-const LEAD_MS: u64 = 30_000;
-
-/// A space's clock of two-minute windows whose first boundary, `B_0`, is
-/// `LEAD_MS` from now.
+/// A space's clock of hour-long windows, now a minute into window 0.
 fn clock() -> WindowClock {
     WindowClock {
-        origin_ms: vos_node::wall_clock() + LEAD_MS - MIN_LENGTH_MS,
-        length_ms: MIN_LENGTH_MS,
+        origin_ms: vos_node::wall_clock() - 60_000,
+        length_ms: MAX_LENGTH_MS,
     }
 }
 
@@ -75,10 +71,17 @@ fn version(node: &Node, agent: AgentId) -> u64 {
     vos_checker::applied(node.store(), agent, &keys::version()).unwrap_or(0)
 }
 
+/// `agent`'s applied index as `node`'s store holds it: the index written
+/// in the commit of its apply. The node's own count of it moves once that
+/// commit returns, so a row an apply wrote can be read before it does.
+fn stored_applied(node: &Node, agent: AgentId) -> u64 {
+    node.store().snapshot().applied(agent).unwrap().unwrap_or(0)
+}
+
 /// The work results of `agent`'s log on `node` past index `after`, through
-/// its applied index: each with its index.
+/// its applied index in the store: each with its index.
 fn results(node: &Node, agent: AgentId, after: u64) -> Vec<(u64, WorkResult)> {
-    let through = node.applied(agent).unwrap_or(0);
+    let through = stored_applied(node, agent);
     (after + 1..=through)
         .filter_map(|index| {
             let entry = node.store().log_entry(agent, index).unwrap()?;
@@ -107,7 +110,7 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     let node = cluster.node(leader);
-    let applied = node.applied(agent).unwrap();
+    let applied = stored_applied(node, agent);
     for number in (1..=3).filter(|number| *number != leader) {
         set_clock(&cluster, number, b0 + 2_000);
     }
@@ -127,7 +130,7 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     assert!(result.time < b0, "timed at the trailing leader's clock");
     assert!(cuts(node, agent).is_empty(), "and cutting nothing");
     let before = version(node, agent);
-    let applied = node.applied(agent).unwrap();
+    let applied = stored_applied(node, agent);
 
     set_clock(&cluster, leader, b0 + 500);
     let reading = clock_of(&cluster, leader);
@@ -153,7 +156,7 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
             cuts(cluster.node(number), agent) == BTreeMap::from([(0, before)])
         });
     }
-    let marked = node.applied(agent).unwrap();
+    let marked = stored_applied(node, agent);
     std::thread::sleep(Duration::from_secs(1));
     assert!(
         results(node, agent, marked).is_empty(),
@@ -170,7 +173,7 @@ fn an_agent_of_no_space_gets_no_marker() {
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     let node = cluster.node(leader);
-    let applied = node.applied(agent).unwrap();
+    let applied = stored_applied(node, agent);
     let boundary = WindowClock::DEFAULT
         .boundary(
             WindowClock::DEFAULT
@@ -201,7 +204,7 @@ fn a_leaders_clock_jumping_ahead_cuts_every_window_it_passes_at_one_version() {
     let leader = cluster.leader(agent);
     let node = cluster.node(leader);
     let before = version(node, agent);
-    let ahead = clock.boundary(2).unwrap() + MIN_LENGTH_MS / 2;
+    let ahead = clock.boundary(2).unwrap() + MAX_LENGTH_MS / 2;
     set_clock(&cluster, leader, ahead);
     wait_until("the leader's replica records cut(2)", || {
         cuts(node, agent).contains_key(&2)
