@@ -310,14 +310,16 @@ pub const WRAP_REFERENCE: SecurityShape = SecurityShape {
 /// pair column of four interaction columns; the composition's four columns
 /// whole where the split one had eight; and the FRI mask's eight. The salts
 /// are never sampled.
-const MASKED_WRAP_SAMPLED_COLUMNS: u64 = (3 * 4 + 2 * 4) + 4 + 8 - 8;
+const MASKED_WRAP_SAMPLED_COLUMNS: u64 = (3 * 4 + 2 * 4) + 4 - 8 + 8;
 
 /// The wrap masked under variant (c), format 39's reference: the AIR of
 /// [`WRAP_REFERENCE`] at its tallest component's 2^15 rows, its columns at
 /// degree bound 2^16, its composition whole at 2^17 and sampled at `π(z)`
 /// ([`SecurityShape::variant_c`]), plus what the masking commits beside it.
 /// Every sampled column is counted at two samples, as [`WRAP_REFERENCE`]
-/// counts its own. R2's blinding adds a fraction a row a component on a
+/// counts its own, though the FRI mask and the composition are sampled once
+/// each: `sampled_values` bounds the built batch from above, and enters only
+/// the count by powers. R2's blinding adds a fraction a row a component on a
 /// relation nothing else uses: `p2`'s pairs with its lone fraction, and
 /// `qm31`'s and `h8`'s take a new pair column and its constraint each.
 pub const MASKED_WRAP_REFERENCE: SecurityShape = SecurityShape {

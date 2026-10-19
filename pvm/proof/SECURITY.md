@@ -39,10 +39,10 @@ reference shape, from the security tool (`src/security.rs`):
   the format tests; no one outside has reviewed them.
 - A verifier rejects a number the registry does not admit, a retired one
   (24 to 27, 29, 31, 33, 34, and 40, the blowup-64 masked wrap a measured
-  proof was made under, never registered) among them, and a proof on another channel
-  than its format's. Under every format but 36 the proof's configuration
-  must equal the format's, and its counts at its own shape must reach the
-  floors.
+  proof was made under, never registered) among them, and a proof on
+  another channel than its format's. Under every format but 36 the proof's
+  configuration must equal the format's, and its counts at its own shape
+  must reach the floors.
 
 **End to end, the proven bound is the weakest inner format's: 62.86 bits,
 not the wrap's 82.6.** Forging a leaf's segment forges the statement. The
@@ -223,11 +223,15 @@ open items both wraps' counts rest on:
   list the tool counts must equal the one the fork's `FriVerifier::commit`
   derives from the largest column.
 - **DIVERGENCE-012:** affine DEEP batching, opt-in per format (28 and 39),
-  counted as `ε_lin(k)` by BCIKS20 Theorem 1.6. It carries the wrap from
-  74.7 to 82.6 proven bits, and needs a cryptographer's review of the
-  citation and the count: if it is wrong, the wrap is at 74.7, below its
-  80-bit floor (the end-to-end bound, 62.86, is the inner formats' either
-  way).
+  counted as `ε_lin(k)` by BCIKS20 Theorem 1.6. soundcalc calls it *linear
+  batching* (`pcs.py`'s `_get_batching_error`, `johnson_bound.py`'s
+  `get_error_linear`) and cites only BCHKS25; the BCIKS20 names are ours,
+  so the audit checks that Theorem 1.6's correlated agreement for affine
+  spaces carries BCHKS25 Theorem 4.2's improved `ε_lin`. It carries the
+  wrap from 74.7 to 82.6 proven bits, and needs a cryptographer's review of
+  the citation and the count: if it is wrong, the wrap is at 74.7, below
+  its 80-bit floor (the end-to-end bound, 62.86, is the inner formats'
+  either way).
   - **Format 39 rests on it more:** batched by powers, the batching term
     caps 39 at 76.14 (73.64 at blowup 64), and at 28's own parameters
     under masking that term is the one that binds (81.74).
@@ -275,14 +279,18 @@ masking variant (c) (`docs/design/research/slice-5/spike2-masking.md` §3b,
   count (23 queries 80.84, 24 82.70).
 - **The reference shape** counts R2's blinding (12 main and 8 interaction
   columns, 2 constraints, a fraction a row a component) and the FRI mask's
-  8 columns as designed, every column at two samples; it must equal the
-  shape derived from the built masked components. The blinding's own
+  8 columns as designed, every column at two samples. The FRI mask and the
+  composition are sampled once each, so `sampled_values` bounds the built
+  batch from above and enters only the count by powers. The shape derived
+  from the built masked components must equal it in every other field, and
+  sample no more values. The blinding's own
   soundness (a pole argument in the challenges) is counted only as logup
   fractions.
 - **The masked verifier's shape** comes from its own layout (`k = 4N`
   whole, `j = 1`), never from the helpers that subtract Stwo's
-  composition split (DIVERGENCE-004), which would count `k = 2N` and
-  overstate the batching term by about 1 bit.
+  composition split (DIVERGENCE-004), which would put FRI's dimension at
+  `2N` (`log_degree_bound` `m+1`) and overstate the batching term by about
+  1 bit.
 
 ## The external audit
 

@@ -504,8 +504,11 @@ taken, 6.0d's docs applied, and the plan carries their results.
 - **by powers** (DIVERGENCE-012 falling): 39 caps at **76.14** (76.136)
   at blowup 32 and **73.64** at blowup 64, however many queries; only
   blowup 8 reaches 80, at 43 queries. The plan and spike 6b say 76.15 and
-  73.65: R's 8 columns add 8 sampled values to the batch by powers
-  (`log2(963/955)` = 0.012 bits). The affine count does not see them.
+  73.65: R's 8 columns, at two samples each, add 8 values over the
+  spike's 4-column R to the batch by powers (`log2(963/955)` = 0.012
+  bits). The affine count does not see them. The two-sample convention
+  overcounts R and the composition, which pin B samples once each:
+  `sampled_values` is an upper bound on the built batch.
 
 **Docs:** `pvm/proof/SECURITY.md` (39's row, 40 among the retired, the
 masked count and what it rests on, DIVERGENCE-011's round list `[3, 3, 3,
@@ -525,3 +528,25 @@ printed tables were not ported: they are spike 6b's record.
 
 **Commits:** `cbe03ea7` the tool; `7924e135` format 39, its tests and
 `SECURITY.md`; `413910fe` and this line, the record.
+
+**Review:** Fable ACCEPT, every number reproduced independently, the
+76.14 flag confirmed; Opus, no defects. Folded in one commit:
+- **Fable 1 (low, doc):** `sampled_values` stated as an upper bound
+  (R and the composition counted at two samples, sampled once under pin
+  B) in `MASKED_WRAP_REFERENCE`'s doc and `SECURITY.md`; the plan's 6.2
+  test (and 6.4's check) compare the built shape's `sampled_values ≤`
+  the reference's, every other field `==`;
+- **Fable 2 (low, doc):** `security.rs`'s module doc and `SECURITY.md`'s
+  DIVERGENCE-012 name soundcalc's path, *linear batching*
+  (`_get_batching_error` → `get_error_linear`, BCHKS25 Theorem 4.2): the
+  BCIKS20 names are ours, so the audit checks that Theorem 1.6's
+  affine-space correlated agreement carries BCHKS25's `ε_lin`;
+- **Opus (nits):** a test doc ("a `j` above the degree bound is
+  refused"), the split helpers' effect stated as FRI's dimension at `2N`
+  (`log_degree_bound` `m+1`), `MASKED_WRAP_SAMPLED_COLUMNS` written in its
+  doc's order as `(3·4 + 2·4) + 4 − 8 + 8` (the review's `(4 − 8)`
+  underflows a `u64` constant), a `SECURITY.md` reflow.
+
+**6.1 accepted.**
+
+**Gates after the fold:** `just check` green (1,113 tests, 0 failed).

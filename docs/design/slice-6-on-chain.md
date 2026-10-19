@@ -677,9 +677,13 @@ Throwaway code on local branches; each with a gate and a fallback.
     layout (their columns, blinding columns, constraints, fractions and
     sampled values, R's 8 among them; k = 4N whole, j = 1), never through
     `framework_access`' split-subtracting helpers, equals
-    `MASKED_WRAP_REFERENCE`, and counts 82.69–82.70, as
+    `MASKED_WRAP_REFERENCE` in every field but `sampled_values`, which is
+    at most the reference's (the reference counts every column at two
+    samples, R and the composition among them, where pin B samples those
+    once), and counts 82.69–82.70, as
     `the_reference_shapes_are_the_segment_airs` does for segments. A
-    mismatch corrects the reference in this step, and 6.1's pin with it.
+    mismatch corrects the reference in this step, and 6.1's pin with it;
+    6.4's check of the verifier's shape compares the same way.
 - **Gate:** format 32 untouched, byte for byte; the reference shape equal
   to the built one.
 - **Estimate:** 0.5–1 week.

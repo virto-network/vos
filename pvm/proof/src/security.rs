@@ -18,7 +18,12 @@
 //!   [`DeepBatching::Powers`]), `(B - 1) · ε_lin(k)`, `B` the sampled values,
 //!   the proximity gap for curves (BCIKS20 Theorem 6.2); with an independent
 //!   coefficient a value ([`DeepBatching::Affine`]), `ε_lin(k)`, the gap for
-//!   affine spaces (BCIKS20 Theorem 1.6), as `soundcalc` counts it;
+//!   affine spaces (BCIKS20 Theorem 1.6), as `soundcalc` counts it.
+//!   `soundcalc` calls the latter *linear batching* (`pcs.py`'s
+//!   `_get_batching_error`, `johnson_bound.py`'s `get_error_linear`) and
+//!   cites only BCHKS25; the BCIKS20 theorem names are ours, so an audit
+//!   checks that Theorem 1.6's correlated agreement for affine spaces
+//!   carries BCHKS25 Theorem 4.2's `ε_lin`, as `soundcalc` assumes;
 //! - **each FRI fold** (`_get_commit_phase_error`): `(f - 1) · ε_lin(k / F_i)`,
 //!   `f` the round's folding factor and `F_i` the product of the factors
 //!   through it. Stwo's first round folds the circle to the line and the line
@@ -79,7 +84,8 @@
 //! depend on how many functions it batches, and a batch by powers counts
 //! them in `B`. Salt columns are never sampled and enter no term. A masked
 //! shape is read from its own layout: `framework_access`' shape subtracts
-//! Stwo's composition split, which would count `k = 2N`.
+//! Stwo's composition split, which would put FRI's dimension at `2N`
+//! (`log_degree_bound` `m+1`).
 //!
 //! The arithmetic is IEEE-754 double precision with only the basic operations,
 //! so every verifier computes the same counts.
@@ -524,7 +530,7 @@ mod tests {
     }
 
     /// Variant (c) moves the levels and doubles the DEEP term, and nothing
-    /// else: a `j` the circle's doublings cannot reach is refused.
+    /// else: a `j` above the degree bound is refused.
     #[test]
     fn variant_c_moves_the_levels_and_doubles_the_deep_term() {
         let params = FormatParams {
