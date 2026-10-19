@@ -5,6 +5,11 @@
 //! proof) and its statement alone, and `anchor_decode` with `vos-anchor`'s
 //! golden vectors, their geneses, an anchor and a migration of each.
 //!
+//! Those four corpora are cleared first: a masked fixture regenerated is
+//! another honest proof of the same words, so a proof of an earlier
+//! fixture left in a corpus verifies, and the targets' oracle (every
+//! accepted proof the golden one) refuses it.
+//!
 //! ```text
 //! cd pvm/proof/fuzz
 //! cargo run --example seed
@@ -21,6 +26,19 @@ const MASKED_HEADER: usize = 4 * 11;
 
 fn main() {
     let corpus = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+    for target in [
+        "final_verifier_bytes",
+        "masked_bytes",
+        "statement_decode",
+        "anchor_decode",
+    ] {
+        match std::fs::remove_dir_all(corpus.join(target)) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                panic!("clears the {target} corpus: {error}")
+            }
+            _ => {}
+        }
+    }
     let write = |target: &str, name: &str, bytes: &[u8]| {
         let directory = corpus.join(target);
         std::fs::create_dir_all(&directory).expect("the corpus' directory");
