@@ -1,5 +1,5 @@
 //! The masking's soundness and leakage gates (`docs/design/slice-6-on-chain.md`,
-//! step 6.6; `research/slice-5/spike2-masking.md` §5, as `masking-review.md`
+//! "The masking's gates"; `research/slice-5/spike2-masking.md` §5, as `masking-review.md`
 //! amends it) on small circuits of the recursion AIR, each proof verified
 //! by the final verifier's masked verifier over the set and channel it was
 //! proved on. The gates the earlier steps hold are theirs: the degree
@@ -50,9 +50,11 @@ use stwo::prover::poly::circle::{PolyOps, SecureEvaluation};
 use stwo::prover::secure_column::SecureColumnByCoords;
 use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masked::{Claim, replay, verify_masked};
+use vos_pvm_poseidon2::{M31, N_STATE};
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::proof::mix_statement_header;
+use vos_pvm_recair::circuit::Qm31Wiring;
 use vos_pvm_recair::masked::{
     MaskRng, MaskStats, MaskedTrace, prove_masked, prove_masked_unchecked, verifier_format,
 };
@@ -185,6 +187,9 @@ where
 /// The column classes R1 must check on a set: each masked column with
 /// samples (the main and interaction trees'), by its level, its quotient's
 /// lift and its offsets from the out-of-domain point, each class once.
+/// It reads the points from `sample_points`, as R1 does: it holds R1's walk
+/// over the classes, not the sample points themselves (those are
+/// `masked.rs`' tests and the verifier's).
 fn column_classes(set: &WrapComponents, format: &Format) -> usize {
     let pins = vos_pvm_recair::masked::mask_pins(&format.masking.expect("masked"));
     let z = CirclePoint::<SecureField>::get_point(98_765);
@@ -292,49 +297,133 @@ fn refused_both_ways(
             .expect("a forced proof");
     let error = verify::<Blake2bMerkleChannel>(&format, &forced).expect_err(name);
     eprintln!("{name}: refused by the prover; forced, by the verifier: {error}");
+    assert!(
+        matches!(
+            error,
+            Error::Stark(stwo::core::verifier::VerificationError::OodsNotMatching)
+        ),
+        "{name}: {error}"
+    );
 }
 
-/// `finalized` with its `p2` rows turned so that a chained row is row 0,
-/// reading the last row at offset −1: the same constraints over the cyclic
-/// domain and the same relation, which the wiring check refuses only
-/// because it never chains row 0.
+/// `finalized` with one component's rows turned left by `by`: the same
+/// constraints over the cyclic domain and the same relation (a `p2` row
+/// chained to its predecessor stays after it, across the domain's end).
+fn rotated(
+    finalized: &Finalized<SecureField>,
+    component: usize,
+    by: usize,
+) -> (Circuit, Witness<SecureField>) {
+    let (mut circuit, mut witness) = (finalized.circuit.clone(), finalized.witness.clone());
+    match component {
+        0 => {
+            circuit.p2.rotate_left(by);
+            witness.p2.rotate_left(by);
+        }
+        1 => {
+            circuit.qm31.rotate_left(by);
+            witness.qm31.rotate_left(by);
+        }
+        _ => {
+            circuit.h8.rotate_left(by);
+            witness.h8.rotate_left(by);
+        }
+    }
+    (circuit, witness)
+}
+
+/// `finalized`'s `p2` rows turned so that row 0 is a chained row whose
+/// output no gate reads by the relation: row 0 reads the last row at
+/// offset −1, a layout the wiring check refuses only because it never
+/// chains row 0.
 fn chained_row_first(finalized: &Finalized<SecureField>) -> (Circuit, Witness<SecureField>) {
     let chained = finalized
         .circuit
         .p2
         .iter()
-        .position(|row| row.mode.is_some_and(|mode| mode.is_chained()))
-        .expect("a chained row");
-    let (mut circuit, mut witness) = (finalized.circuit.clone(), finalized.witness.clone());
-    circuit.p2.rotate_left(chained);
-    witness.p2.rotate_left(chained);
+        .position(|row| {
+            row.mode.is_some_and(|mode| mode.is_chained()) && row.out_multiplicity == [0, 0]
+        })
+        .expect("a chained row of an unread output");
+    rotated(finalized, 0, chained)
+}
+
+/// `finalized`'s `qm31` rows turned so that the first and the last rows are
+/// padding (no coefficient, no relation entry): a broken `out` there breaks
+/// the gate's constraint alone.
+fn qm31_padding_at_both_ends(
+    finalized: &Finalized<SecureField>,
+) -> (Circuit, Witness<SecureField>) {
+    let padding = Qm31Wiring::default();
+    let rows = &finalized.circuit.qm31;
+    let first = rows
+        .iter()
+        .position(|row| *row == padding)
+        .expect("padding rows");
+    assert!(rows.len() - first >= 2, "two padding rows");
+    let (circuit, witness) = rotated(finalized, 1, first + 1);
+    assert_eq!(circuit.qm31[0], padding);
+    assert_eq!(circuit.qm31[rows.len() - 1], padding);
     (circuit, witness)
 }
 
-/// The column of `p2`'s first last-round S-box output, read by a chained
-/// row at offset −1 (format 39's twice-sampled `p2` columns are these).
-const LAST_ROUND_OUT: usize = 269;
+/// Row `row`'s `p2` permutation recomputed from its input with the first
+/// word plus 1: every S-box of the row holds, and only what reads its
+/// input (the chaining to the previous row) breaks.
+fn input_plus_one(main: &mut MainTrace, row: usize) {
+    let columns = &mut main.columns[0];
+    let mut input: [M31; N_STATE] =
+        core::array::from_fn(|word| M31::new(columns[p2::main::INPUT + word][row].0));
+    input[0] = M31::new((input[0].value() + 1) % stwo::core::fields::m31::P);
+    let mut permutation = vec![M31::ZERO; p2::main::M];
+    p2::permutation_columns(input, &mut permutation);
+    for (column, word) in permutation.iter().enumerate() {
+        columns[column][row] = BaseField::from_u32_unchecked(word.value());
+    }
+}
 
 /// Soundness 3: one broken constraint on the first row, the last row and
 /// the wrap row of each component is refused by the prover's own check,
-/// and a proof forced past it is refused by the verifier. The wrap row:
-/// the `p2` rows turned so that row 0 is chained and reads the last row
-/// across the domain's end, which an honest proof keeps.
+/// and a proof forced past it by the verifier's out-of-domain check. A
+/// `qm31` row is broken on padding rows turned to both ends, so that no
+/// relation entry moves. The wrap row: the `p2` rows turned so that row 0
+/// is chained and reads the last row across the domain's end, which an
+/// honest proof keeps; then row 0's permutation recomputed from another
+/// input, so that only its chaining to the last row breaks.
 #[test]
 fn a_broken_constraint_on_the_first_last_or_wrap_row_is_refused() {
     let finalized = circuit(11);
     let last = (1 << LOG_SIZE) - 1;
+    let (qm31_circuit, qm31_witness) = qm31_padding_at_both_ends(&finalized);
     let constrained = [
-        ("p2's first S-box", 0, p2::main::SBOXES),
-        ("qm31's out", 1, qm31::N_MAIN - 4),
-        ("h8's first Horner step", 2, h8::main::Q),
+        (
+            "p2's first S-box",
+            0,
+            p2::main::SBOXES,
+            &finalized.circuit,
+            &finalized.witness,
+        ),
+        (
+            "qm31's out on padding",
+            1,
+            qm31::N_MAIN - 4,
+            &qm31_circuit,
+            &qm31_witness,
+        ),
+        (
+            "h8's first Horner step",
+            2,
+            h8::main::Q,
+            &finalized.circuit,
+            &finalized.witness,
+        ),
     ];
-    for (name, component, column) in constrained {
+    for (name, component, column, circuit, witness) in constrained {
         for (row_name, row) in [("first", 0), ("last", last)] {
             refused_both_ways(
                 &format!("{name} on the {row_name} row"),
-                &finalized.circuit,
-                &finalized.witness,
+                circuit,
+                witness,
                 |main| main.columns[component][column][row] += BaseField::one(),
             );
         }
@@ -347,16 +436,10 @@ fn a_broken_constraint_on_the_first_last_or_wrap_row_is_refused() {
             .expect("row 0 chained to the last row proves");
     verify::<Blake2bMerkleChannel>(&format, &honest).expect("and verifies");
     refused_both_ways(
-        "the wrap row's input (row 0, chained to the last)",
+        "the wrap row's chaining (row 0's permutation of another input)",
         &circuit,
         &witness,
-        |main| main.columns[0][p2::main::INPUT][0] += BaseField::one(),
-    );
-    refused_both_ways(
-        "the output the wrap row reads (the last row's)",
-        &circuit,
-        &witness,
-        |main| main.columns[0][LAST_ROUND_OUT][last] += BaseField::one(),
+        |main| input_plus_one(main, 0),
     );
 }
 

@@ -1,16 +1,17 @@
 //! The masking's statistical leakage gates on a small circuit
-//! (`docs/design/slice-6-on-chain.md`, step 6.6), at N proofs a witness:
+//! (`docs/design/slice-6-on-chain.md`, "The masking's gates"), at N proofs
+//! a witness:
 //! 64 in `just check`, 2,000 under `heavy-gates` (`just test-proof`).
 //!
 //! - **Witness indistinguishability (leakage 2):** the honest prover's
 //!   published values do not depend on the witness. N proofs of one
 //!   witness against N of another under the same public inputs (a zero
 //!   witness and a random one; two amounts differing by 1): per field a
-//!   two-sample χ² on 16 buckets of the value's top bits, and one pooled
+//!   two-sample χ² on 16 buckets of the value's top bits (4 at N ≤ 64), and one pooled
 //!   two-sample KS over every value. The control: the unmasked prover fails
 //!   the same test.
 //! - **Uniformity (leakage 3):** each field of the zero witness's N proofs
-//!   against uniform M31, one-sample χ².
+//!   against uniform M31, one-sample χ² (exact at N ≤ 64).
 //!
 //! The family's error rate is 10^-3, Bonferroni over every field
 //! (`common::leakage`). The proofs are seeded, one seed a proof, so a run
@@ -23,8 +24,8 @@ use rayon::prelude::*;
 
 use crate::common::Rng;
 use crate::common::leakage::{
-    Fields, Verdicts, chi2_survival, chi2_two_sample, chi2_uniform, indistinguishable,
-    ks_two_sample, published, uniform,
+    Fields, Verdicts, chi2_survival, chi2_two_sample, chi2_uniform, exact_uniform_tail,
+    indistinguishable, ks_two_sample, published, uniform,
 };
 use crate::masked_prover::format;
 
@@ -192,6 +193,13 @@ fn the_statistics_are_calibrated() {
     assert!(chi2_two_sample(&low, &high) < 1e-12);
     assert!(ks_two_sample(low.clone(), high) < 1e-12);
     assert!(chi2_uniform(&low) < 1e-12);
+    // The exact tail: two draws over four buckets land in one with
+    // probability 1/4 (`Σ o² = 4`), else in two (`Σ o² = 2`).
+    let tail = exact_uniform_tail(2, 4);
+    assert!((tail[0] - 1.0).abs() < 1e-12 && (tail[2] - 1.0).abs() < 1e-12);
+    assert!((tail[3] - 0.25).abs() < 1e-12 && (tail[4] - 0.25).abs() < 1e-12);
+    let tail = exact_uniform_tail(64, 4);
+    assert!((tail[0] - 1.0).abs() < 1e-9, "{}", tail[0]);
 }
 
 /// Leakage 2: the masked prover's published values do not depend on the

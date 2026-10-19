@@ -288,11 +288,13 @@ guard, not evidence of it: the soundness gates (acceptance at every size
 on both channels, a broken constraint on the first, last and wrap rows
 refused forced, the lifted preprocessed columns, the blinding unable to
 cancel an unbalanced relation, malformed proofs refused without a panic)
-and the statistical leakage gates (per field a χ² on 16 buckets and a
-pooled two-sample KS between witnesses, uniformity, α = 10^-3 over the
-family with Bonferroni) find gross leaks only: at 2,000 small-circuit
-proofs a witness a field leaking about 0.13 in total variation, at the
-real wrap's 32 a field nearly fixed by the witness.
+and the statistical leakage gates (per field a χ² on 16 buckets, 4 at 64
+proofs or fewer, and a pooled two-sample KS between witnesses;
+uniformity, exact at 64 or fewer; α = 10^-3 over the family with
+Bonferroni) find gross leaks only: at 2,000 small-circuit proofs a witness
+a field leaking about 0.13 in total variation; at the real wrap's 32, by
+uniformity, a field leaking about 0.6, and between witnesses only a field
+fixed by the witness.
 
 ## The external audit
 

@@ -683,7 +683,6 @@ mod heavy {
     use super::*;
 
     use std::path::{Path, PathBuf};
-    use std::sync::OnceLock;
 
     use crate::common::leakage::{Fields, Key, Verdicts, indistinguishable, published, uniform};
     use crate::wrap::whole_run_root;
@@ -784,12 +783,16 @@ mod heavy {
         assert!(!control.refused().is_empty(), "the unmasked wrap passes");
     }
 
-    /// Leakage 3 on the real wrap: each published field uniform over M31.
+    /// Leakage 3 on the real wrap: each published field of either witness's
+    /// proofs uniform over M31 (exact at N = 32). Against a leak the two
+    /// witnesses share, this is the real wrap's sharper test: at N = 32 the
+    /// two-sample test finds only a field nearly fixed by the witness.
     #[test]
     fn heavy_the_masked_wraps_openings_are_uniform() {
-        let [a, _] = witnesses();
+        let [a, b] = witnesses();
         let mut verdicts = Verdicts::new("leakage 3, the real wrap");
         uniform(&mut verdicts, &a.fields, N);
+        uniform(&mut verdicts, &b.fields, N);
         verdicts.report();
         let refused = verdicts.refused();
         assert!(refused.is_empty(), "{:?}", &refused[..refused.len().min(8)]);
@@ -841,18 +844,48 @@ mod heavy {
             .to_path_buf()
     }
 
+    /// A cost at `most` witness hashes, by the least-squares line through
+    /// the seeds' `(hashes, cost)`: the worst shape's, extrapolated.
+    fn at_worst(hashes: &[f64], costs: &[f64], most: f64) -> f64 {
+        let n = hashes.len() as f64;
+        let (mean_h, mean_c) = (
+            hashes.iter().sum::<f64>() / n,
+            costs.iter().sum::<f64>() / n,
+        );
+        let covariance: f64 = hashes
+            .iter()
+            .zip(costs)
+            .map(|(h, c)| (h - mean_h) * (c - mean_c))
+            .sum();
+        let variance: f64 = hashes.iter().map(|h| (h - mean_h).powi(2)).sum();
+        mean_c + covariance / variance * (most - mean_h)
+    }
+
     /// The verify gates as the maximum over 12 seeds of the one-segment
     /// run's masked wrap ([`gate_proofs`]): on the JAM-only host the decode at most 4M gas
     /// and the verify at most 125M; in Wasm (the final verifier's blob,
     /// `just judge-wasm`) at most 50M instructions under the PVF's
-    /// semantics. Each seed's Merkle witness is reported against the most
-    /// 24 distinct queries can take.
+    /// semantics. Each seed's witness hashes are held to the most 24
+    /// distinct queries can take, and each gate also to its cost there,
+    /// extrapolated along the seeds' fit.
     #[test]
     fn heavy_the_verify_gates_hold_over_seeds() {
         let (program, _) = jam::program();
         let (proofs, words) = gate_proofs();
         let request = jam::words_request(masked::FORMAT, words);
         let mut phases = Vec::new();
+        let mut hashes = Vec::new();
+        // The most witness hashes 24 distinct queries can take, no sibling
+        // shared: each trace tree at the lifting height (the preprocessed
+        // one at its own, 16 + 5), and each FRI layer's tree, its domain
+        // less the packed leaf of 4 values, less the level a query's coset
+        // pair fills (domains 22, 19, 16, 13 for fold step 3).
+        let most_trees = most_witness_hashes(masked::LOG_DEGREE_BOUND + 5, 24) * 3
+            + most_witness_hashes(16 + 5, 24);
+        let fri_bounds: Vec<usize> = (0..4u32)
+            .map(|layer| most_witness_hashes(masked::LOG_DEGREE_BOUND + 5 - 3 * layer - 3, 24))
+            .collect();
+        let most = (most_trees + fri_bounds.iter().sum::<usize>()) as f64;
         let mut files = Vec::new();
         for (seed, bytes) in proofs.iter().enumerate() {
             let (gas, report) = jam::run(&program, &request, bytes);
@@ -872,15 +905,28 @@ mod heavy {
                 .chain(&fri.inner_layers)
                 .map(|layer| layer.decommitment.hash_witness.len())
                 .sum();
-            let most = most_witness_hashes(masked::LOG_DEGREE_BOUND + 5, 24) * 3
-                + most_witness_hashes(16 + 5, 24);
+            let fri_layers: Vec<usize> = std::iter::once(&fri.first_layer)
+                .chain(&fri.inner_layers)
+                .map(|layer| layer.decommitment.hash_witness.len())
+                .collect();
+            for (layer, (&hashes, &bound)) in fri_layers.iter().zip(&fri_bounds).enumerate() {
+                assert!(
+                    hashes <= bound,
+                    "FRI layer {layer}: {hashes} hashes, at most {bound}"
+                );
+            }
+            assert!(
+                trees <= most_trees,
+                "{trees} trace-tree hashes, at most {most_trees}"
+            );
             eprintln!(
                 "seed {seed}: {gas} gas, decode {decode}, verify {verify}; {} bytes; {queries} \
-                 distinct queries; {trees} trace-tree witness hashes (at most {most} for 24 \
+                 distinct queries; {trees} trace-tree witness hashes (at most {most_trees} for 24 \
                  queries), {fri_hashes} FRI",
                 bytes.len()
             );
             phases.push((decode, verify));
+            hashes.push((trees + fri_hashes) as f64);
             let name = format!("gate-{seed:02}");
             write(&name, masked::FORMAT, bytes, words);
             files.push(
@@ -891,32 +937,39 @@ mod heavy {
         }
         let decode = phases.iter().map(|&(decode, _)| decode).max().unwrap();
         let verify = phases.iter().map(|&(_, verify)| verify).max().unwrap();
-        eprintln!("the maximum over {GATE_SEEDS} seeds: decode {decode}, verify {verify}");
+        let worst = |costs: &[f64]| at_worst(&hashes, costs, most);
+        let decode_worst = worst(&phases.iter().map(|&(d, _)| d as f64).collect::<Vec<_>>());
+        let verify_worst = worst(&phases.iter().map(|&(_, v)| v as f64).collect::<Vec<_>>());
+        eprintln!(
+            "the maximum over {GATE_SEEDS} seeds: decode {decode}, verify {verify}; at the worst \
+             shape ({most} witness hashes), by the seeds' fit: decode {decode_worst:.0}, verify \
+             {verify_worst:.0}"
+        );
         assert!(decode <= 4_000_000, "decode {decode} gas");
         assert!(verify <= 125_000_000, "verify {verify} gas");
+        assert!(
+            decode_worst <= 4e6,
+            "decode {decode_worst} gas at the worst shape"
+        );
+        assert!(
+            verify_worst <= 125e6,
+            "verify {verify_worst} gas at the worst shape"
+        );
 
         let wasm = workspace().join("pvm/proof/final-verifier/wasm");
         let runner = wasm.join("run/target/release/vos-pvm-final-verifier-wasm-run");
         let blob = wasm
             .join("blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm");
-        // On a hybrid CPU each core kind counts with its own PMU: a thread
-        // moved to another kind counts nothing there, so the runner is held
-        // to the performance cores.
-        let mut command = match std::fs::read_to_string("/sys/devices/cpu_core/cpus") {
-            Ok(cores) => {
-                let mut taskset = std::process::Command::new("taskset");
-                taskset.args(["-c", cores.trim()]).arg(&runner);
-                taskset
-            }
-            Err(_) => std::process::Command::new(&runner),
-        };
-        let output = command
+        let output = std::process::Command::new(&runner)
             .arg(&blob)
             .args(["pvf", "1"])
             .args(&files)
             .output()
             .unwrap_or_else(|error| {
-                panic!("{} ({error}); run `just judge-wasm`", runner.display())
+                panic!(
+                    "{} cannot run ({error}); `just judge-wasm` builds it",
+                    runner.display()
+                )
             });
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
@@ -936,8 +989,16 @@ mod heavy {
             instructions.iter().all(|&count| count > 0),
             "{instructions:?}"
         );
-        let most = *instructions.iter().max().unwrap();
-        eprintln!("the maximum over {GATE_SEEDS} seeds: {most} instructions");
-        assert!(most <= 50_000_000, "{most} Wasm instructions");
+        let max = *instructions.iter().max().unwrap();
+        let wasm_worst = worst(&instructions.iter().map(|&n| n as f64).collect::<Vec<_>>());
+        eprintln!(
+            "the maximum over {GATE_SEEDS} seeds: {max} instructions; at the worst shape, by \
+             the seeds' fit: {wasm_worst:.0}"
+        );
+        assert!(max <= 50_000_000, "{max} Wasm instructions");
+        assert!(
+            wasm_worst <= 50e6,
+            "{wasm_worst} Wasm instructions at the worst shape"
+        );
     }
 }

@@ -20,6 +20,9 @@
 //!   NaNs canonicalized, a 256 MiB native stack, memory
 //!   `Dynamic { maximum_pages: 2080 }`.
 //!
+//! Compiled for an explicit target with pinned ISA flags (`RESULT`'s `isa`),
+//! and held to the performance cores of a hybrid CPU.
+//!
 //! Prints, per proof, the user-mode instructions this thread retires over
 //! the verify call (the least of `<runs>`), its time, the decode's, the
 //! instantiation's, the host allocations and the memory's pages; a tampered
@@ -93,8 +96,48 @@ impl<T> AllocatorMemory for Access<'_, T> {
     }
 }
 
+/// The ISA flags the blob is compiled with, the same on every host that has
+/// them, so a count does not move with the host's CPU features: x86-64-v3,
+/// the level of Polkadot's reference validator hardware.
+#[cfg(target_arch = "x86_64")]
+const ISA_FLAGS: [&str; 11] = [
+    "has_sse3",
+    "has_ssse3",
+    "has_sse41",
+    "has_sse42",
+    "has_popcnt",
+    "has_avx",
+    "has_avx2",
+    "has_bmi1",
+    "has_bmi2",
+    "has_lzcnt",
+    "has_fma",
+];
+
+/// The target the blob is compiled for and its flags, as `RESULT` reports
+/// them.
+fn isa() -> String {
+    #[cfg(target_arch = "x86_64")]
+    return format!("x86_64+{}", ISA_FLAGS.join(","));
+    #[cfg(not(target_arch = "x86_64"))]
+    return "host".into();
+}
+
 fn engine(semantics: Semantics) -> Result<Engine> {
     let mut config = Config::new();
+    // An explicit target: the host's features are not detected, only the
+    // pinned flags enabled.
+    #[cfg(target_arch = "x86_64")]
+    {
+        config.target("x86_64-unknown-linux-gnu")?;
+        for flag in ISA_FLAGS {
+            // SAFETY: each flag names an x86-64 extension; the engine checks
+            // the host has it before running code compiled with it.
+            unsafe {
+                config.cranelift_flag_enable(flag);
+            }
+        }
+    }
     config.cranelift_opt_level(OptLevel::SpeedAndSize);
     config.cranelift_nan_canonicalization(semantics == Semantics::Pvf);
     config.max_wasm_stack(match semantics {
@@ -447,14 +490,15 @@ fn run(args: &[String]) -> Result<()> {
             min(&instantiation),
         );
         println!(
-            "RESULT file={path} semantics={} bytes={} verify_us_min={} verify_us_median={} decode_us_min={} \
-             instantiate_us_min={} allocations={allocations} pages={pages} \
+            "RESULT file={path} semantics={} isa={} bytes={} verify_us_min={} verify_us_median={} \
+             decode_us_min={} instantiate_us_min={} allocations={allocations} pages={pages} \
              instructions={instr_min} cycles={cycles_min}",
             if semantics == Semantics::Pvf {
                 "pvf"
             } else {
                 "client"
             },
+            isa(),
             proof.len(),
             min(&verify).as_micros(),
             median(verify).as_micros(),
@@ -477,8 +521,57 @@ fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
+/// The CPUs of the list `list` (`0-11`, `0,2,4-7`).
+fn cpus(list: &str) -> Vec<usize> {
+    list.trim()
+        .split(',')
+        .filter(|range| !range.is_empty())
+        .flat_map(|range| match range.split_once('-') {
+            Some((from, to)) => {
+                let (from, to) = (from.parse().unwrap_or(0), to.parse().unwrap_or(0));
+                (from..=to).collect::<Vec<usize>>()
+            }
+            None => range.parse().into_iter().collect(),
+        })
+        .collect()
+}
+
+/// Holds this thread, and the threads it spawns, to the performance cores
+/// it may run on: on a hybrid CPU each core kind counts instructions with
+/// its own PMU, and a thread moved to another kind counts nothing there.
+/// Nothing on a CPU of one kind.
+fn pin_to_performance_cores() -> Result<()> {
+    let Ok(list) = std::fs::read_to_string("/sys/devices/cpu_core/cpus") else {
+        return Ok(());
+    };
+    // SAFETY: a zeroed `cpu_set_t` is empty; the calls read and write it.
+    unsafe {
+        let mut allowed: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, size_of::<libc::cpu_set_t>(), &mut allowed) != 0 {
+            bail!("sched_getaffinity: {}", std::io::Error::last_os_error());
+        }
+        let mut pinned: libc::cpu_set_t = std::mem::zeroed();
+        let mut chosen = Vec::new();
+        for cpu in cpus(&list) {
+            if cpu < libc::CPU_SETSIZE as usize && libc::CPU_ISSET(cpu, &allowed) {
+                libc::CPU_SET(cpu, &mut pinned);
+                chosen.push(cpu);
+            }
+        }
+        if chosen.is_empty() {
+            bail!("no performance core among the allowed CPUs");
+        }
+        if libc::sched_setaffinity(0, size_of::<libc::cpu_set_t>(), &pinned) != 0 {
+            bail!("sched_setaffinity: {}", std::io::Error::last_os_error());
+        }
+        println!("pinned to the performance cores {chosen:?}");
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    pin_to_performance_cores()?;
     // The PVF's execute thread: 2 MiB plus the native stack maximum
     // (`polkadot/node/core/pvf/execute-worker/src/lib.rs:553-556`).
     std::thread::Builder::new()

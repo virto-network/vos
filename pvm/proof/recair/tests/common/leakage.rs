@@ -1,8 +1,9 @@
-//! The leakage gates' statistics (`docs/design/slice-6-on-chain.md`, step
-//! 6.6): a masked proof's published values field by field, and the tests
+//! The leakage gates' statistics (`docs/design/slice-6-on-chain.md`, "The
+//! masking's gates"): a masked proof's published values field by field, and the tests
 //! they are held to, each with its p-value:
-//! - per field, a two-sample χ² on 16 buckets of a value's top bits (two
-//!   witnesses' proofs), or a one-sample χ² against uniform M31;
+//! - per field, a two-sample χ² on 16 buckets of a value's top bits (4 for
+//!   at most [`FEW`] values a side; two witnesses' proofs), or a one-sample
+//!   test against uniform M31 (exact for at most [`FEW`] values);
 //! - over every value pooled, a two-sample Kolmogorov–Smirnov test.
 //!
 //! The family-wise error rate is [`ALPHA`] over every statistical test of
@@ -114,20 +115,36 @@ impl Fields {
     }
 }
 
-/// The 16 buckets of M31's top four bits.
-fn buckets(values: &[u32]) -> [f64; 16] {
-    let mut counts = [0.0; 16];
+/// The most values a sample may hold for 4 buckets rather than 16: below
+/// it, 16 buckets hold too few values a bucket for χ²'s asymptotics at the
+/// gates' thresholds (about 10^-8), which then refuse far more often than
+/// they state.
+pub const FEW: usize = 64;
+
+/// The buckets a test of samples of `n` values takes: of M31's top two bits
+/// for at most [`FEW`] values, its top four otherwise.
+fn n_buckets(n: usize) -> usize {
+    if n <= FEW { 4 } else { 16 }
+}
+
+/// `values` in `n` buckets of their top bits (`n` 4 or 16).
+fn buckets(values: &[u32], n: usize) -> Vec<f64> {
+    let shift = 31 - n.trailing_zeros();
+    let mut counts = vec![0.0; n];
     for &value in values {
-        counts[(value >> 27) as usize] += 1.0;
+        counts[(value >> shift) as usize] += 1.0;
     }
     counts
 }
 
-/// The two-sample χ² test of two samples' buckets: the p-value that they
-/// come from one distribution, at one degree of freedom fewer than the
-/// buckets either sample fills.
+/// The two-sample χ² test of two samples' buckets ([`n_buckets`] of the
+/// smaller): the p-value that they come from one distribution, at one
+/// degree of freedom fewer than the buckets either sample fills. At 4
+/// buckets and 32 or 64 values a side its true rate is below the stated one
+/// down to 10^-6 [simulated, 2·10^7 draws each].
 pub fn chi2_two_sample(a: &[u32], b: &[u32]) -> f64 {
-    let (r, s) = (buckets(a), buckets(b));
+    let n = n_buckets(a.len().min(b.len()));
+    let (r, s) = (buckets(a, n), buckets(b, n));
     let (total_r, total_s) = (a.len() as f64, b.len() as f64);
     let (k1, k2) = ((total_s / total_r).sqrt(), (total_r / total_s).sqrt());
     let mut statistic = 0.0;
@@ -144,21 +161,78 @@ pub fn chi2_two_sample(a: &[u32], b: &[u32]) -> f64 {
     chi2_survival(statistic, (filled - 1) as f64)
 }
 
-/// The one-sample χ² test of a sample's buckets against uniform M31: the
-/// last bucket holds one value fewer than the others (`p = 2^31 − 1`).
+/// The one-sample test of a sample's buckets against uniform M31 (each
+/// bucket's share `2^-4` or `2^-2`, the last's one value fewer of `p`,
+/// which no test here can see): for at most [`FEW`] values the exact
+/// multinomial p-value of `Σ o_i²` ([`exact_uniform_tail`]), otherwise χ².
 pub fn chi2_uniform(values: &[u32]) -> f64 {
-    let n = values.len() as f64;
-    let p = f64::from(stwo::core::fields::m31::P);
-    let statistic: f64 = buckets(values)
-        .into_iter()
-        .enumerate()
-        .map(|(bucket, observed)| {
-            let size = if bucket == 15 { (1 << 27) - 1 } else { 1 << 27 };
-            let expected = n * f64::from(size) / p;
-            (observed - expected).powi(2) / expected
-        })
+    let n = values.len();
+    let k = n_buckets(n);
+    let counts = buckets(values, k);
+    if n <= FEW {
+        let squares = counts.iter().map(|&o| (o * o) as usize).sum::<usize>();
+        return exact_uniform_tail(n, k)[squares];
+    }
+    let expected = n as f64 / k as f64;
+    let statistic: f64 = counts
+        .iter()
+        .map(|&observed| (observed - expected).powi(2) / expected)
         .sum();
-    chi2_survival(statistic, 15.0)
+    chi2_survival(statistic, (k - 1) as f64)
+}
+
+/// `P(Σ o_i² ≥ s)` for `s` in `0..=n²`, `o` multinomial of `n` draws over
+/// `k` equal buckets: the χ² statistic is `k·Σ o_i²/n − n`, so its exact
+/// tail. A dynamic program over the buckets, by counts used and squares
+/// summed, each table kept for its `(n, k)`.
+pub fn exact_uniform_tail(n: usize, k: usize) -> std::sync::Arc<Vec<f64>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex, OnceLock};
+    type Tables = Mutex<HashMap<(usize, usize), Arc<Vec<f64>>>>;
+    static TABLES: OnceLock<Tables> = OnceLock::new();
+    let tables = TABLES.get_or_init(Default::default);
+    if let Some(table) = tables.lock().unwrap().get(&(n, k)) {
+        return table.clone();
+    }
+    let ln_factorial: Vec<f64> = (0..=n)
+        .scan(0.0, |sum, i| {
+            if i > 0 {
+                *sum += (i as f64).ln();
+            }
+            Some(*sum)
+        })
+        .collect();
+    let width = n * n + 1;
+    // weights[c][s]: Σ over the buckets so far of Π 1/o_i!, counts summing
+    // to c and squares to s.
+    let mut weights = vec![vec![0.0f64; width]; n + 1];
+    weights[0][0] = 1.0;
+    for _ in 0..k {
+        let mut next = vec![vec![0.0f64; width]; n + 1];
+        for (c, row) in weights.iter().enumerate() {
+            for (s, &weight) in row.iter().enumerate() {
+                if weight == 0.0 {
+                    continue;
+                }
+                for o in 0..=n - c {
+                    let square = s + o * o;
+                    if square < width {
+                        next[c + o][square] += weight * (-ln_factorial[o]).exp();
+                    }
+                }
+            }
+        }
+        weights = next;
+    }
+    let scale = (ln_factorial[n] - n as f64 * (k as f64).ln()).exp();
+    let mut tail = vec![0.0; width + 1];
+    for s in (0..width).rev() {
+        tail[s] = tail[s + 1] + weights[n][s] * scale;
+    }
+    tail.truncate(width);
+    let table = Arc::new(tail);
+    tables.lock().unwrap().insert((n, k), table.clone());
+    table
 }
 
 /// The two-sample Kolmogorov–Smirnov test: the p-value, asymptotic, that
