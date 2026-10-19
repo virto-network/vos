@@ -207,7 +207,11 @@ impl Alongside for Cuts {
         Some(CLOCK)
     }
 
-    fn before(&self, cluster: &Cluster) {
+    fn before(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])]) {
+        let reader = package("reader");
+        for (agent, _) in agents {
+            install_at_leader(|| cluster.leading(*agent), *agent, READER, &reader);
+        }
         let node = cluster.node(1).expect("node 1 runs");
         let representative = node
             .create_representative((1..=NODES).collect())
@@ -221,11 +225,17 @@ impl Alongside for Cuts {
         *self.representative.lock().unwrap() = Some(representative);
     }
 
+    /// The reads `agent`'s reader noted ended on `node`, each a workflow.
+    fn workflows(&self, node: &vos_node::Node, agent: AgentId) -> u64 {
+        let rows = Rows::Table {
+            tag: table_tag("outcomes"),
+            transform: Transform::Hashed,
+        };
+        let (prefix, _) = keys::rows_prefix(READER, rows).expect("a table's rows");
+        node.store().snapshot().scan(agent, &prefix, None).count() as u64
+    }
+
     fn run(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])], done: &AtomicBool) {
-        let reader = package("reader");
-        for (agent, _) in agents {
-            install_at_leader(|| cluster.leading(*agent), *agent, READER, &reader);
-        }
         std::thread::scope(|scope| {
             for (agent, _) in agents {
                 scope.spawn(move || self.write(cluster, *agent, done));
@@ -254,7 +264,7 @@ impl Alongside for Cuts {
         let representative = self.representative.lock().unwrap().expect("created");
         check_agent(cluster, representative);
         let closed = closes(cluster, representative);
-        println!("the representative closed {closed} windows, each at one root on every replica");
+        println!("the representative: S_w the same on every replica at its {closed} latest cuts");
     }
 }
 
@@ -297,9 +307,11 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
             .collect();
         applied.windows(2).all(|pair| pair[0] == pair[1])
             && snapshots.iter().all(|snapshot| {
+                let latest = cuts(snapshot, agent).into_keys().next_back();
                 [keys::dirty_prefix(), keys::undo_prefix()]
                     .iter()
                     .all(|prefix| snapshot.scan(agent, prefix, None).next().is_none())
+                    && roots::latest_built(snapshot, agent).unwrap() == latest
             })
     });
     let recorded = cuts(&snapshots[0], agent);

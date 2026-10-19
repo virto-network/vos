@@ -74,7 +74,12 @@ pub(crate) trait Alongside: Sync {
     fn clock(&self) -> Option<WindowClock>;
     /// What it sets up once the run's agents are, before any client or
     /// fault.
-    fn before(&self, _cluster: &Cluster) {}
+    fn before(&self, _cluster: &Cluster, _agents: &[(AgentId, [u8; 32])]) {}
+    /// The workflows it started at `agent`, as `node` holds them ended:
+    /// beside the tours, in the agent's count of workflows.
+    fn workflows(&self, _node: &Node, _agent: AgentId) -> u64 {
+        0
+    }
     fn run(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])], done: &AtomicBool);
     fn check(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])]);
 }
@@ -95,7 +100,7 @@ pub(crate) fn exactly_once(
     let methods = Methods::of(&schema(&actor("counter")));
     let agents = agents(&cluster, rounds.as_ref());
     if let Some(alongside) = alongside {
-        alongside.before(&cluster);
+        alongside.before(&cluster, &agents);
     }
     // At each agent, one client forwarding to the next agent's inbox and a
     // second incrementing a counter of its own: batches mix their
@@ -166,7 +171,9 @@ pub(crate) fn exactly_once(
         methods.value,
     );
     let touring = &clients[2 * at_each..];
-    let toured = check_tours(&cluster, touring, sent_forwarding, sent_touring);
+    let others =
+        |node: &Node, agent| alongside.map_or(0, |alongside| alongside.workflows(node, agent));
+    let toured = check_tours(&cluster, touring, sent_forwarding, sent_touring, &others);
     check_forwards(
         &cluster,
         forwarding,
@@ -235,7 +242,8 @@ fn check_counters(cluster: &Cluster, seconds: &[Client], sent: &[u64], value: Me
 /// rounds, and this agent's own, tally every amount of a tour that ended
 /// done once, and of one that failed once or not at all; its requests and
 /// messages went once, each request answered once. Every workflow started
-/// once, and none lives on. `forwarded` are what each agent's forwarding
+/// once, and none lives on, beside the workflows `others` counts ended at
+/// a replica. `forwarded` are what each agent's forwarding
 /// client sent, `started` the tours each touring client started. Answers
 /// the tours' messages on each agent's pair with the next, by agent.
 fn check_tours(
@@ -243,6 +251,7 @@ fn check_tours(
     touring: &[Client],
     forwarded: &[u64],
     started: &[u64],
+    others: &dyn Fn(&Node, AgentId) -> u64,
 ) -> Vec<u64> {
     let mut messages = vec![0; forwarded.len()];
     for (at, client) in touring.iter().enumerate() {
@@ -284,11 +293,9 @@ fn check_tours(
                 client.number
             );
             messages[at] = held;
-            assert_eq!(
-                mark(agent, &keys::next_workflow()),
-                started[at],
-                "every tour started once"
-            );
+            wait_until("every other workflow ends", ANSWERED, || {
+                mark(agent, &keys::next_workflow()) == started[at] + others(&node, agent)
+            });
             let pins = keys::workflow_pins_prefix();
             assert_eq!(node.store().snapshot().scan(agent, &pins, None).count(), 0);
         }
