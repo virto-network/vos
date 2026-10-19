@@ -20,19 +20,10 @@ fn precompile_agrees_with_software_on_every_host() {
         let (jam, jam_steps) = run_jam(&precompile, &args);
         assert_eq!(jam, expected, "JAM fallback, {n} hashes");
 
-        let (trace, traced) =
-            vos_pvm_proof::trace_refine_with_output(&precompile, &args, GAS, 32).expect("trace");
-        assert_eq!(
-            traced.as_deref(),
-            Some(&expected[..]),
-            "traced output, {n} hashes"
-        );
-        let steps: usize = trace.slices.iter().map(|s| s.side_note.num_steps()).sum();
-        let calls: usize = trace
-            .slices
-            .iter()
-            .map(|s| s.side_note.blake2b_calls.len())
-            .sum();
+        let trace = vos_pvm_proof::kernel::trace_program(&precompile, &args, GAS).expect("trace");
+        assert_eq!(trace.output, expected, "traced output, {n} hashes");
+        let steps = trace.side_note.num_steps();
+        let calls = trace.side_note.blake2b_calls.len();
         assert_eq!(calls as u64, n, "one chip call per hash");
         assert!(
             (steps as u64) * 10 < jam_steps,

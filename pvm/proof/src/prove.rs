@@ -518,9 +518,8 @@ enum ProofTranscriptGeneration {
     PreConfigRelabel,
 }
 
-/// Generate the exact producer/consumer main traces used by both the STARK
-/// prover and Refine's deterministic replay binding. Keeping this as one
-/// implementation prevents replay from checking a lookalike witness layout.
+/// The components' main traces: the producers in order, filling the side
+/// note's multiplicities, then the consumers in parallel.
 fn generate_component_traces(
     side_note: &mut SideNote,
     components: &[&dyn crate::framework::MachineProverComponent],
@@ -562,9 +561,8 @@ fn generate_component_traces(
         .collect()
 }
 
-/// Derive the exact public boundary states shipped by the production prover.
-/// Refine replay compares these before STARK verification, including both the
-/// sparse-image hash and in-AIR page-Merkle roots.
+/// The boundary states a proof ships: the sparse-image hashes and the
+/// page-Merkle roots the boundary chips bind.
 fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
     let (root_before, root_after) = segment_memory_roots(side_note);
     let initial_state = if side_note.steps.is_empty() {
@@ -607,113 +605,6 @@ fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
         }
     };
     (initial_state, final_state)
-}
-
-/// Exact replay-derived statement prefix. Equality of the main commitment
-/// binds every generated witness column; ordinary STARK verification then
-/// proves the interaction/composition/FRI suffix against that exact root.
-pub(crate) struct ReplayTraceBinding {
-    pub component_mask: u32,
-    pub log_sizes: Vec<u32>,
-    pub preprocessed_commitment: crate::pcs::Commitment,
-    pub main_commitment: crate::pcs::Commitment,
-    pub initial_state: SegmentState,
-    pub final_state: SegmentState,
-}
-
-/// Recompute a trace's exact preprocessed/main commitments without generating
-/// interaction traces, composition columns, FRI layers, or a replacement
-/// proof. Used only to bind Refine child proofs to deterministic native replay.
-pub(crate) fn replay_trace_binding(
-    side_note: &mut SideNote,
-    target: Target,
-) -> Result<ReplayTraceBinding, ProvingError> {
-    crate::with_stack!(target.format.channel, Stack => {
-        replay_trace_binding_on::<Stack>(side_note, target)
-    }, unbuilt => Err(ProvingError::FormatNotAdmitted(target.format.number)))
-}
-
-fn replay_trace_binding_on<MC: PcsStack>(
-    side_note: &mut SideNote,
-    target: Target,
-) -> Result<ReplayTraceBinding, ProvingError>
-where
-    SimdBackend: BackendForChannel<MC>,
-{
-    use crate::pcs::ProofHash;
-    let config = target.config;
-    if config.fri_config.log_blowup_factor > crate::proof::MAX_RECOMMIT_LOG_BLOWUP {
-        return Err(ProvingError::NOT_SATISFIED);
-    }
-    prepare_side_note_for_verification(side_note);
-    validate_memory_witnesses(side_note)?;
-    side_note.ingest_memory_pages();
-    let components_owned = super::active_components(side_note);
-    let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
-    let component_mask = super::active_component_mask(side_note);
-    let traces = generate_component_traces(side_note, components, &[]);
-    let log_sizes: Vec<u32> = traces.iter().map(ComponentTrace::log_size).collect();
-    let max_constraint_log_degree_bound = components
-        .iter()
-        .zip(&log_sizes)
-        .map(|(component, &log_size)| component.max_constraint_log_degree_bound(log_size))
-        .max()
-        .ok_or(ProvingError::NOT_SATISFIED)?;
-    if crate::proof::derive_protocol_degree_shape(&config, max_constraint_log_degree_bound).is_err()
-    {
-        return Err(ProvingError::NOT_SATISFIED);
-    }
-    for &log_size in &log_sizes {
-        if log_size < crate::proof::MIN_PROOF_LOG_SIZE {
-            return Err(ProvingError::NOT_SATISFIED);
-        }
-        let Some(extended) = log_size.checked_add(config.fri_config.log_blowup_factor) else {
-            return Err(ProvingError::NOT_SATISFIED);
-        };
-        if extended > crate::proof::MAX_EXTENDED_LOG_SIZE
-            || config
-                .lifting_log_size
-                .is_some_and(|lifting| lifting < extended)
-        {
-            return Err(ProvingError::NOT_SATISFIED);
-        }
-    }
-    let Some(domain_log_size) =
-        max_constraint_log_degree_bound.checked_add(config.fri_config.log_blowup_factor)
-    else {
-        return Err(ProvingError::NOT_SATISFIED);
-    };
-    if domain_log_size > crate::proof::MAX_EXTENDED_LOG_SIZE {
-        return Err(ProvingError::NOT_SATISFIED);
-    }
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(domain_log_size)
-            .circle_domain()
-            .half_coset,
-    );
-    let channel = &mut MC::C::default();
-    crate::proof::mix_statement_header(channel, target.format.number, &config, &log_sizes);
-    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
-    let mut tree_builder = scheme.tree_builder();
-    for trace in &traces {
-        tree_builder.extend_evals(trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX));
-    }
-    tree_builder.commit(channel);
-    let mut tree_builder = scheme.tree_builder();
-    for trace in &traces {
-        tree_builder.extend_evals(trace.to_circle_evaluation(ORIGINAL_TRACE_IDX));
-    }
-    tree_builder.commit(channel);
-    let roots = scheme.roots();
-    let (initial_state, final_state) = derive_segment_states(side_note);
-    Ok(ReplayTraceBinding {
-        component_mask,
-        log_sizes,
-        preprocessed_commitment: roots[PREPROCESSED_TRACE_IDX].into_commitment(),
-        main_commitment: roots[ORIGINAL_TRACE_IDX].into_commitment(),
-        initial_state,
-        final_state,
-    })
 }
 
 /// Prove with caller-supplied boundary metadata in place of the

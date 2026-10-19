@@ -1,9 +1,10 @@
 //! A compiled guest mixing branches, comparisons, signed arithmetic, shifts
-//! and memory proves end to end on the refine path, and its output matches
-//! the same computation done natively.
+//! and memory proves end to end, and its output matches the same
+//! computation done natively.
 
 use vos_pvm_bench::{GAS, guest_program, run_vos};
-use vos_pvm_proof::{prove_refine, trace_refine_with_output, verify_refine_bundle_replayed};
+use vos_pvm_proof::kernel::trace_program;
+use vos_pvm_proof::{format, prove, verify};
 
 /// The guest's computation (`guests/diverse`).
 fn diverse(seed: i64) -> i64 {
@@ -32,9 +33,10 @@ fn diverse_guest_proves_end_to_end() {
         let expected = diverse(seed).to_le_bytes();
         assert_eq!(run_vos(&program, &args), expected, "seed {seed}");
 
-        let (trace, output) = trace_refine_with_output(&program, &args, GAS, 8).expect("trace");
-        assert_eq!(output.as_deref(), Some(&expected[..]), "traced output");
-        let bundle = prove_refine(trace).expect("prove");
-        verify_refine_bundle_replayed(&bundle, &program, &args, GAS).expect("verify");
+        let mut trace = trace_program(&program, &args, GAS).expect("trace");
+        assert_eq!(trace.output, expected, "traced output");
+        let proof = prove(&mut trace.side_note).expect("prove");
+        assert_eq!(proof.format_version, format::SEGMENT.number);
+        verify(proof, &trace.side_note).expect("verify");
     }
 }

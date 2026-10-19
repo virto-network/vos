@@ -10,6 +10,9 @@
 //! so the re-run reads what the live run read, call by call, and ends with
 //! the same output and io-hash; one that reads less than the record, or
 //! does not halt, is refused.
+//!
+//! [`trace_program`] runs any standard program on its arguments the same
+//! way, for a proof of a run that reads no witness input.
 
 use alloc::vec::Vec;
 
@@ -53,10 +56,12 @@ pub enum KernelTraceError {
     Unread { read: usize, input: usize },
 }
 
-/// Kernel `blob` loaded as the agent loads it, with `gas`: its machine at
-/// its first step, its initial memory, and its layout's permissions.
+/// Program `blob` loaded as the agent loads it, on `arguments` with `gas`:
+/// its machine at its first step, its initial memory, and its layout's
+/// permissions.
 fn load(
     blob: &[u8],
+    arguments: &[u8],
     gas: u64,
 ) -> Result<
     (
@@ -67,12 +72,14 @@ fn load(
     KernelTraceError,
 > {
     let program = vos_pvm::spi::parse_standard_program(blob).ok_or(KernelTraceError::Program)?;
-    let layout = program.layout(&[]).ok_or(KernelTraceError::Program)?;
+    let layout = program
+        .layout(arguments)
+        .ok_or(KernelTraceError::Program)?;
     let mut memory = Memory::sparse(1 << 32);
     let pages = memory.pages();
     let page = u64::from(vos_pvm::PVM_PAGE_SIZE);
     let mapped = memory.set_page_range(0, pages, PERM_NONE)
-        && [layout.ro, layout.rw, layout.stack]
+        && [layout.ro, layout.args, layout.rw, layout.stack]
             .into_iter()
             .filter(|region| region.size > 0)
             .all(|region| {
@@ -88,6 +95,7 @@ fn load(
     }
     for (base, data) in [
         (layout.ro.base, layout.ro_data),
+        (layout.args.base, layout.args_data),
         (layout.rw.base, layout.rw_data),
     ] {
         if !data.is_empty() {
@@ -113,7 +121,7 @@ fn load(
 /// jump table, initial memory and layout, and no step. What its
 /// preprocessed roots are computed from.
 pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
-    let (machine, image, permissions) = load(blob, 0)?;
+    let (machine, image, permissions) = load(blob, &[], 0)?;
     Ok(TracingPvm::new(machine)
         .into_side_note()
         .with_sparse_memory(image)
@@ -124,7 +132,27 @@ pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
 /// agent runs it: the standard layout with no arguments, φ0 the halt
 /// address, φ1 the stack's top, φ7 the argument window and φ8 0.
 pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, KernelTraceError> {
-    let (machine, image, permissions) = load(blob, gas)?;
+    trace(blob, &[], input, gas)
+}
+
+/// Run standard program `blob` with `gas` on `arguments`, mapped read-only
+/// in its argument window, with no witness input: φ7 the window and φ8
+/// its length.
+pub fn trace_program(
+    blob: &[u8],
+    arguments: &[u8],
+    gas: u64,
+) -> Result<KernelTrace, KernelTraceError> {
+    trace(blob, arguments, &[], gas)
+}
+
+fn trace(
+    blob: &[u8],
+    arguments: &[u8],
+    input: &[u8],
+    gas: u64,
+) -> Result<KernelTrace, KernelTraceError> {
+    let (machine, image, permissions) = load(blob, arguments, gas)?;
     let mut tracer = TracingPvm::new(machine)
         .with_witness_input(input.to_vec())
         .ok_or(KernelTraceError::Input)?;

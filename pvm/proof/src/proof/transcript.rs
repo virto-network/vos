@@ -27,9 +27,7 @@ const PROOF_FS_DOMAIN_WORD_1: u64 = u64::from_le_bytes(*b"STARK/FS");
 const PRE_CONFIG_FS_FORMAT_VERSION: u32 = 18;
 
 /// Bind the proof protocol domain and exact format generation into a Fiat–
-/// Shamir channel. This prefix authenticates the STARK statement transcript;
-/// Refine's outer bundle transcript additionally authenticates machine
-/// identities, native boundary witnesses, and ordered child identities.
+/// Shamir channel. This prefix authenticates the STARK statement transcript.
 pub fn mix_proof_fs_domain(channel: &mut impl Channel, format_version: u32, config: &PcsConfig) {
     channel.mix_u64(PROOF_FS_DOMAIN_WORD_0);
     channel.mix_u64(PROOF_FS_DOMAIN_WORD_1);

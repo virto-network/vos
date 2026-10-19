@@ -27,9 +27,9 @@ pub struct SideNote {
     /// that are read without a prior write.
     pub initial_memory: Vec<u8>,
     /// Canonical sorted non-zero pages for a sparse 32-bit memory image.
-    /// Mutually exclusive with `initial_memory`; Refine proof tracing uses
-    /// this form so the high stack/input pages never imply a dense 4 GiB
-    /// allocation.
+    /// Mutually exclusive with `initial_memory`; a traced standard program
+    /// ([`crate::kernel`]) takes this form, so the high stack and argument
+    /// pages never imply a dense 4 GiB allocation.
     pub sparse_initial_memory: Option<crate::SparseMemoryImage>,
     /// Number of initial memory entries injected (set by MemoryChip).
     pub num_initial_mem_entries: usize,

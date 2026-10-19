@@ -13,17 +13,18 @@
 //!
 //! ## Quick start
 //!
-//! Trace a standard program's refine run, prove it, verify the proof:
+//! Trace a standard program's run, prove it, verify the proof:
 //!
 //! ```no_run
-//! use vos_pvm_proof::{prove_refine, trace_refine_with_output, verify_refine_bundle_replayed};
+//! use vos_pvm_proof::kernel::trace_program;
+//! use vos_pvm_proof::{prove, verify};
 //!
 //! # fn example(program: &[u8], arguments: &[u8]) {
-//! // `gas` bounds the run; the output is read back, up to 32 bytes.
+//! // `gas` bounds the run.
 //! let gas = 1_000_000_000;
-//! let (trace, _output) = trace_refine_with_output(program, arguments, gas, 32).expect("trace");
-//! let bundle = prove_refine(trace).expect("prove");
-//! verify_refine_bundle_replayed(&bundle, program, arguments, gas).expect("verify");
+//! let mut side_note = trace_program(program, arguments, gas).expect("trace").side_note;
+//! let proof = prove(&mut side_note).expect("prove");
+//! verify(proof, &side_note).expect("verify");
 //! # }
 //! ```
 //!
@@ -140,8 +141,6 @@ mod framework;
 pub mod framework_access;
 mod lookups;
 pub mod proof;
-pub mod refine;
-pub mod refine_codec;
 pub mod segment;
 pub mod sparse_memory;
 pub mod trace;
@@ -500,25 +499,6 @@ pub(crate) fn active_components_verifier(
 pub use format::Format;
 pub use pcs::{Commitment, StarkProofAny};
 pub use proof::{PROOF_FORMAT_VERSION, PcsPolicy, Proof, SegmentState};
-pub use refine::{
-    MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, MAX_REFINE_PROOF_SLICES,
-    REFINE_BUNDLE_FORMAT_VERSION, REFINE_CHILD_COMMITMENT_COUNT, RefineBundleVerification,
-    RefineHostBoundary, RefineMachineId, RefineProgramId, RefineProofBundle, RefineProofSlice,
-    RefineSliceExit, refine_arguments_commitment, refine_bundle_cardinality_is_valid,
-    refine_bundle_commitment, refine_bundle_execution_commitment, refine_bundle_terminal_public_io,
-    refine_program_id,
-};
-#[cfg(feature = "prover")]
-pub use refine::{
-    RefineObservedRun, RefineTraceBundle, RefineTraceError, RefineTraceSlice, prove_refine,
-    refine_trace_execution_commitment, trace_refine, trace_refine_observed,
-    trace_refine_with_output, verify_refine_bundle_replayed,
-};
-pub use refine_codec::{
-    MAX_REFINE_PROOF_BUNDLE_ALLOCATION_BYTES, MAX_REFINE_PROOF_BUNDLE_WIRE_BYTES,
-    REFINE_PROOF_BUNDLE_CODEC_VERSION, RefineProofCodecError, decode_refine_proof_bundle,
-    encode_refine_proof_bundle,
-};
 pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemoryPage};
 // The per-policy FRI floor constants + the policy checker: used by callers
 // that assemble a custom `PcsPolicy`; hidden from the top-level page.
