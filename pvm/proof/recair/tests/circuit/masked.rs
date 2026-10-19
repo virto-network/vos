@@ -18,12 +18,12 @@ use vos_pvm_proof::framework_access::{
     AllLookupElements, draw_all_lookup_elements, drive_chip_oods,
 };
 use vos_pvm_proof::security::{SecurityShape, proven_count};
+use vos_pvm_recair::masked::MASKED_WRAP_PINS;
 use vos_pvm_recair_air::gate::{GATE_WIDTH, GateRelation};
 use vos_pvm_recair_air::h8::H8Eval;
 use vos_pvm_recair_air::masked::{
-    BlindRelation, MASKED_WRAP_PINS, MaskedComponent, MaskedComponents, MaskedEval, WrapComponents,
-    air_log_size, committed_log_sizes, composition_log_degree_bound, composition_point,
-    sample_points,
+    BlindRelation, MaskedComponent, MaskedComponents, MaskedEval, WrapComponents, air_log_size,
+    committed_log_sizes, composition_log_degree_bound, composition_point, sample_points,
 };
 use vos_pvm_recair_air::p2::P2Eval;
 use vos_pvm_recair_air::qm31::Qm31Eval;

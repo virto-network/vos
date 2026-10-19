@@ -1,6 +1,8 @@
 //! The final wrap (`proving.md` §3.5, A.3; `recursion-air.md` §7): a 1-to-1
-//! node over a tree's root, proved under format 28 on the Blake2b-256
-//! channel, which `vos-pvm-final-verifier` verifies against 24 public words.
+//! node over a tree's root, proved masked under format 39 on the Blake2b-256
+//! channel ([`prove`]), or unmasked under format 28, which
+//! `vos-pvm-final-verifier` verifies against 24 public words
+//! ([`prove_unmasked`]).
 //!
 //! **What it checks of the root,** a node of the padded shape (format 32), a
 //! fold's or, for a run of one segment, a leaf's:
@@ -31,9 +33,9 @@ use std::sync::OnceLock;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
-use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
+use stwo::core::vcs_lifted::blake2b_merkle::{Blake2bMerkleChannel, Blake2bMerkleHasher};
 use vos_pvm_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
-use vos_pvm_proof::format::WRAP;
+use vos_pvm_proof::format::{MASKED_WRAP, WRAP};
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{ID_WORDS, IdPreimage};
 use vos_pvm_recair_air::gate::Layout;
@@ -45,7 +47,8 @@ use crate::fold::{
 };
 use crate::gadgets::leaf_hash;
 use crate::leaf::preimage;
-use crate::prove::{ProveError, prove_on};
+use crate::masked::{MaskRng, MaskStats};
+use crate::prove::{ProveError, RecairProof, prove_masked_on, prove_on};
 use crate::trace::MainTrace;
 use crate::value::{NoValue, Value};
 use crate::verifier::WitnessError;
@@ -195,27 +198,55 @@ impl<V: Value> WrapValues<V> {
     }
 }
 
-/// Proves a finalized wrap circuit under format 28, on the Blake2b-256
-/// channel.
+/// Proves a finalized wrap circuit masked under format 39, on the Blake2b-256
+/// channel, from the operating system's randomness.
 pub fn prove(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError> {
-    prove_with(finalized, |_| {})
+    prove_masked(finalized, &MaskRng::new(), |_| {}).map(|(proof, _)| proof)
 }
 
-/// [`prove`], with the main trace passed through `tamper` before it is
-/// committed: a seam for the refusal tests.
-pub fn prove_with(
+/// [`prove`] from `rng`, with the main trace passed through `tamper` before
+/// it is masked; and what the prove measured.
+pub fn prove_masked(
+    finalized: &Finalized<SecureField>,
+    rng: &MaskRng,
+    tamper: impl FnOnce(&mut MainTrace),
+) -> Result<(WrapProof, MaskStats), ProveError> {
+    let (proof, stats) = prove_masked_on::<Blake2bMerkleChannel>(
+        &MASKED_WRAP,
+        &finalized.circuit,
+        &finalized.witness,
+        rng,
+        tamper,
+    )?;
+    Ok((wrap_proof(proof), stats))
+}
+
+/// Proves a finalized wrap circuit unmasked under format 28, on the
+/// Blake2b-256 channel: what the tests and the fixtures verify until the
+/// venues take format 39.
+pub fn prove_unmasked(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError> {
+    prove_unmasked_with(finalized, |_| {})
+}
+
+/// [`prove_unmasked`], with the main trace passed through `tamper` before it
+/// is committed: a seam for the refusal tests.
+pub fn prove_unmasked_with(
     finalized: &Finalized<SecureField>,
     tamper: impl FnOnce(&mut MainTrace),
 ) -> Result<WrapProof, ProveError> {
     let proof =
         prove_on::<Blake2bMerkleChannel>(&WRAP, &finalized.circuit, &finalized.witness, tamper)?;
-    Ok(WrapProof {
+    Ok(wrap_proof(proof))
+}
+
+fn wrap_proof(proof: RecairProof<Blake2bMerkleHasher>) -> WrapProof {
+    WrapProof {
         format_version: proof.format_version,
         log_sizes: proof.log_sizes,
         interaction_pow: proof.interaction_pow,
         claimed_sums: proof.claimed_sums,
         stark_proof: proof.stark_proof,
-    })
+    }
 }
 
 /// The public words a finalized wrap circuit's witness states.

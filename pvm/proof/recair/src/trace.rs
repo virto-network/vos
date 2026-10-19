@@ -300,28 +300,44 @@ impl MainTrace {
         circuit: &Circuit,
         relation: &GateRelation,
     ) -> [(Evaluations, SecureField); 3] {
+        self.interaction_with(circuit, relation, [None; 3])
+    }
+
+    /// [`MainTrace::interaction`], with a component's `extra` fraction a row
+    /// after its own: the masked wrap's blinding.
+    pub fn interaction_with(
+        &self,
+        circuit: &Circuit,
+        relation: &GateRelation,
+        extra: [Option<FirstRowFraction>; 3],
+    ) -> [(Evaluations, SecureField); 3] {
         let log_sizes = circuit.log_sizes();
         let fractions = self.fractions(circuit);
         core::array::from_fn(|component| {
             let log_size = log_sizes[component];
             let rows = &fractions[component];
             let positions = storage_positions(log_size);
-            let n_fractions = rows[0].len();
             let term = |f: &Fraction| {
                 let [l0, l1, l2, l3] = f.limbs;
                 let denominator: SecureField = relation.0.combine(&[f.address, l0, l1, l2, l3]);
                 (SecureField::from(f.multiplicity), denominator)
             };
+            let n_fractions = rows[0].len() + usize::from(extra[component].is_some());
+            // The `i`-th fraction of `row`: its own, then the extra one.
+            let fraction = |row: usize, i: usize| match rows[row].get(i) {
+                Some(own) => Some(term(own)),
+                None => extra[component]
+                    .filter(|_| i == rows[row].len())
+                    .map(|e| e.at(row)),
+            };
             let mut generator = LogupTraceGenerator::new(log_size);
             for pair in (0..n_fractions).step_by(2) {
                 let mut stored = vec![(SecureField::zero(), SecureField::one()); rows.len()];
-                for (row, fractions) in rows.iter().enumerate() {
-                    let (n0, d0) = term(&fractions[pair]);
-                    stored[positions[row]] = match fractions.get(pair + 1) {
-                        Some(second) => {
-                            let (n1, d1) = term(second);
-                            (n0 * d1 + n1 * d0, d0 * d1)
-                        }
+                for row in 0..rows.len() {
+                    let (n0, d0) =
+                        fraction(row, pair).unwrap_or((SecureField::zero(), SecureField::one()));
+                    stored[positions[row]] = match fraction(row, pair + 1) {
+                        Some((n1, d1)) => (n0 * d1 + n1 * d0, d0 * d1),
                         None => (n0, d0),
                     };
                 }
@@ -337,5 +353,26 @@ impl MainTrace {
             }
             generator.finalize_last()
         })
+    }
+}
+
+/// A fraction on every row of a component, its numerator `numerator` at the
+/// coset's first row and zero on every other: `b / combine_B(1)`, the
+/// masked wrap's blinding of a claimed sum (`vos_pvm_recair_air::masked`).
+#[derive(Clone, Copy, Debug)]
+pub struct FirstRowFraction {
+    pub numerator: SecureField,
+    pub denominator: SecureField,
+}
+
+impl FirstRowFraction {
+    /// The fraction at coset row `row`.
+    fn at(&self, row: usize) -> (SecureField, SecureField) {
+        let numerator = if row == 0 {
+            self.numerator
+        } else {
+            SecureField::zero()
+        };
+        (numerator, self.denominator)
     }
 }

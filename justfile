@@ -127,6 +127,17 @@ check-no-faults:
     cargo build -p vos-cli
     if ((^target/debug/vos --version) | str contains "faults") { error make { msg: "a plain build of vos injects faults" } } else { print "no faults in a plain build of vos" }
 
+# The masked prover's seeded randomness (`vos-pvm-recair`'s `seeded-masks`,
+# `MaskRng::Seeded`) reaches no production build: no normal or build edge
+# of the `vos` command, the node or the agent enables it (the fixtures'
+# generator and the prover's tests enable it on a dev edge), and the proof
+# crate's `debug-internals` does not imply it.
+check-no-seeded-masks:
+    for package in [vos-cli vos-node] { if (cargo tree -p $package -e features,no-dev | str contains 'feature "seeded-masks"') { error make { msg: $"($package)'s build enables seeded masks" } } }
+    if (cargo tree --manifest-path agent/default/Cargo.toml -e features,no-dev | str contains 'feature "seeded-masks"') { error make { msg: "the agent's build enables seeded masks" } }
+    if (open pvm/proof/Cargo.toml | get features.debug-internals | any {|feature| $feature | str contains 'seeded-masks' }) { error make { msg: "debug-internals implies seeded masks" } }
+    print "no seeded masks in a production build"
+
 # The builds without std. vos-raft for an embedded target, on core and alloc
 # alone, built from the toolchain's source. The proof verifier, which reads
 # every admitted format, with the proof crate's verifier path under it: both are `no_std`
@@ -159,14 +170,14 @@ check-no-std:
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-no-std build-test-actors build-agent
+check: fmt-check doc-check check-no-std check-no-seeded-masks build-test-actors build-agent
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-recair -p vos-pvm-final-verifier -p vos-anchor -p vos-statement --features vos-anchor/vectors,vos-statement/fixtures
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
-ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults
+ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks
 
 # The gate before merging: `ci` plus the prover suites, the soundness gates
 # and the bench tests that prove. Run it under a memory limit.

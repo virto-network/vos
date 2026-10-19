@@ -59,6 +59,12 @@ fn the_unmasked_counts_do_not_move() {
             format.number
         );
         assert_eq!(format.masked, [30, 37, 39].contains(&format.number));
+        assert_eq!(
+            format.masking.is_some(),
+            format.number == MASKED_WRAP.number,
+            "format {}",
+            format.number
+        );
         if format.number != MASKED_WRAP.number {
             assert_eq!(
                 security_bits(&format.params, &format.reference).unwrap(),
@@ -261,4 +267,31 @@ fn the_masked_wrap_needs_affine_batching() {
         error.contains("76 proven bits, below format 39's floor of 80"),
         "{error}"
     );
+}
+
+/// Format 39's masking (pin A, R6): 8 salt columns a tree, an 8-column `R`,
+/// and `h = 256` within its static bounds: at least `2(4|O| + q(|O| + 1))`,
+/// the randomizer's revealed functionals at `q` queries and `|O| = 2`
+/// offsets (160), and at most `N/4` and `2N/3` for every component, the
+/// smallest `h8`'s `N = 2^11`.
+#[test]
+fn the_masked_wraps_masking_meets_its_bounds() {
+    let masking = MASKED_WRAP.masking.unwrap();
+    assert_eq!(masking, MASKED_WRAP_MASKING);
+    assert_eq!(
+        (
+            masking.salt_columns,
+            masking.fri_mask_columns,
+            masking.log_mask_rows
+        ),
+        (8, 8, 8)
+    );
+    let h = 1usize << masking.log_mask_rows;
+    let offsets = 2;
+    let revealed = 2 * (4 * offsets + MASKED_WRAP.params.n_queries * (offsets + 1));
+    assert_eq!(revealed, 160);
+    assert!(h >= revealed);
+    let smallest = 1usize << 11;
+    assert!(4 * h <= smallest && 3 * h <= 2 * smallest);
+    assert!(31 * masking.salt_columns >= 248);
 }

@@ -142,7 +142,8 @@ struct Wrapped {
 /// Wraps `root` under `program`, proves it and verifies it natively.
 fn wrapped(root: &Node, program: &IdPreimage, name: &str) -> Wrapped {
     let started = Instant::now();
-    let (proof, statement, words) = tree::wrap(root, program).expect("proves");
+    let (proof, statement, words) =
+        tree::wrap_with(root, program, wrap::prove_unmasked).expect("proves");
     assert_eq!(words, statement.words());
     let bytes = postcard::to_allocvec(&proof).expect("encodes");
     eprintln!(
@@ -342,7 +343,7 @@ fn a_root_without_its_ends_is_refused() {
     context.set_output_lanes(&lanes);
     let finalized = context.finalize().expect("the wiring checks");
     let words = wrap::public_words(&finalized);
-    let refused = match wrap::prove(&finalized) {
+    let refused = match wrap::prove_unmasked(&finalized) {
         Err(_) => true,
         Ok(proof) => vos_pvm_final_verifier::verify(proof, &words).is_err(),
     };

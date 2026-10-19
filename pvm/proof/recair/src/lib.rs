@@ -24,7 +24,12 @@
 //!   output their run states.
 //! - [`wrap`] is the final wrap: a tree's root verified, its circuit,
 //!   program and run checked, the program id and io-hash its public words,
-//!   proved under format 28 on the Blake2b-256 channel.
+//!   proved masked under format 39 on the Blake2b-256 channel, or unmasked
+//!   under format 28.
+//! - [`masked`] is the masked prover (masking variant (c)), over any
+//!   component set and Merkle channel: the masks, salts, blinding and FRI
+//!   mask in pin B's order, R1 checked on the transcript, the randomness
+//!   hedged.
 //! - [`tree`] proves a run's tree node by node: leaves, folds, the wrap.
 
 pub mod circuit;
@@ -33,6 +38,7 @@ pub mod context;
 pub mod fold;
 pub mod gadgets;
 pub mod leaf;
+pub mod masked;
 pub mod prove;
 pub mod trace;
 pub mod tree;

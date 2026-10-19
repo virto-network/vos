@@ -54,6 +54,8 @@ fn only_checked_wirings_are_committed() {
         "pvm/proof/recair/src/fold/child.rs",
         "pvm/proof/recair/src/fold/mod.rs",
         "pvm/proof/recair/tests/gates/forge.rs",
+        // The generic masked prover's `p2`-only set, its wiring checked.
+        "pvm/proof/recair/tests/circuit/masked_prover.rs",
         "pvm/proof/recair/tests/gates/pins.rs",
     ];
     let mut callers = Vec::new();

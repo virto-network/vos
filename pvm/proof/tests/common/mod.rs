@@ -6,6 +6,9 @@
 /// The venue's JAM refine program on the JAM-only host.
 #[path = "../../statement/tests/support/jam.rs"]
 pub mod jam;
+/// The tests' masked verifier, until the final verifier reads format 39.
+#[path = "../../recair/tests/support/masked_verifier.rs"]
+pub mod masked_verifier;
 
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
@@ -501,7 +504,8 @@ pub fn prove_fold(
 /// the Blake2b-256 channel within 2^17 rows and 8 GiB of heap, and verified
 /// by `vos-pvm-final-verifier`, its statement the program's id and the root's
 /// io-hash: the proof's bytes (postcard) and its public words; its proving
-/// time and peak heap added to `wrap`.
+/// time and peak heap added to `wrap`. The same witness is proved masked
+/// under format 39 as well ([`masked_wrap`]).
 pub fn wrap_root(
     name: &str,
     program: &vos_pvm_proof::program_id::KernelProgram,
@@ -522,7 +526,8 @@ pub fn wrap_root(
     assert_eq!(log_sizes, vos_pvm_final_verifier::LOG_SIZES);
     assert!(log_sizes.iter().all(|&log| log <= 17));
     let words = wrap::public_words(&finalized);
-    let (proof, proving, peak_mib) = measured(|| wrap::prove(&finalized).expect("the wrap proves"));
+    let (proof, proving, peak_mib) =
+        measured(|| wrap::prove_unmasked(&finalized).expect("the wrap proves"));
     let bytes = postcard::to_allocvec(&proof).expect("encodes");
     eprintln!(
         "{name}'s wrap: {log_sizes:?} log sizes, proved in {:.2}s, its peak heap {peak_mib} MiB, \
@@ -536,7 +541,103 @@ pub fn wrap_root(
     assert_eq!(verified, statement);
     assert_eq!(statement.program, program.id().0.map(|word| word.0));
     assert_eq!(statement.io_hash, root.node.output.io_hash);
+    masked_wrap(name, &finalized, &words);
     (bytes, words)
+}
+
+/// The process's peak resident set (`VmHWM`) in MiB, reset to the present
+/// one first when `reset`.
+fn resident_peak_mib(reset: bool) -> u64 {
+    if reset {
+        // Writing 5 resets this process's peak resident set.
+        std::fs::write("/proc/self/clear_refs", "5").expect("the peak resets");
+    }
+    let status = std::fs::read_to_string("/proc/self/status").expect("the process's status");
+    let kib: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmHWM:"))
+        .and_then(|rest| rest.trim().trim_end_matches("kB").trim().parse().ok())
+        .expect("VmHWM");
+    kib >> 10
+}
+
+/// A finalized wrap circuit's witness proved masked under format 39
+/// (`vos_pvm_recair::wrap::prove`), within 4.5 GiB of heap and 8 GiB of
+/// resident memory, and verified by the tests' masked verifier, its
+/// preprocessed root format 28's (pin A): its proving time, R1's time and
+/// the revealed rows printed with the load average.
+fn masked_wrap(
+    name: &str,
+    finalized: &vos_pvm_recair::Finalized<stwo::core::fields::qm31::SecureField>,
+    words: &[u32; vos_pvm_final_verifier::PUBLIC_WORDS],
+) {
+    use masked_verifier::{Claim, verify_masked};
+    use stwo::core::fields::m31::BaseField;
+    use stwo::core::fields::qm31::SecureField;
+    use stwo::core::vcs::blake2b_hash::Blake2bHash;
+    use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
+    use vos_pvm_proof::format::MASKED_WRAP;
+    use vos_pvm_recair::masked::MaskRng;
+    use vos_pvm_recair_air::gate::{GateRelation, public_logup_sum};
+    use vos_pvm_recair_air::masked::{BlindRelation, WrapComponents};
+
+    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    resident_peak_mib(true);
+    let ((proof, stats), proving, peak_mib) = measured(|| {
+        vos_pvm_recair::wrap::prove_masked(finalized, &MaskRng::new(), |_| {})
+            .expect("the masked wrap proves")
+    });
+    let resident_mib = resident_peak_mib(false);
+    let bytes = postcard::to_allocvec(&proof).expect("encodes");
+    eprintln!(
+        "{name}'s masked wrap (format 39): proved in {:.2}s, its peak heap {peak_mib} MiB, the \
+         process's peak resident {resident_mib} MiB, {} bytes (postcard); R1 {:.1} ms, {} rows \
+         revealed of h = 256, {} attempt(s); load {}",
+        proving.as_secs_f64(),
+        bytes.len(),
+        stats.rank_check.as_secs_f64() * 1e3,
+        stats.revealed_rows,
+        stats.attempts,
+        load.trim(),
+    );
+    assert!(peak_mib <= 4608, "{peak_mib} MiB of heap");
+    assert!(resident_mib <= 8 << 10, "{resident_mib} MiB resident");
+    assert!(stats.revealed_rows <= 256, "{stats:?}");
+    assert_eq!(proof.format_version, MASKED_WRAP.number);
+    assert_eq!(
+        proof.stark_proof.commitments[0],
+        Blake2bHash(vos_pvm_final_verifier::PREPROCESSED_ROOT)
+    );
+
+    let public: Vec<SecureField> = words
+        .iter()
+        .map(|&word| SecureField::from(BaseField::from_u32_unchecked(word)))
+        .collect();
+    let public_sum = |relation: &GateRelation| {
+        public_logup_sum(
+            relation,
+            vos_pvm_final_verifier::LAYOUT.public_terms(public.iter().copied()),
+        )
+    };
+    let layout = WrapComponents::build(
+        &GateRelation::dummy(),
+        &BlindRelation::dummy(),
+        &proof.log_sizes,
+        &[SecureField::default(); 3],
+    );
+    verify_masked::<Blake2bMerkleChannel, WrapComponents>(
+        &Claim {
+            format: &MASKED_WRAP,
+            log_sizes: &proof.log_sizes,
+            public: &public,
+            public_sum: Some(&public_sum),
+            interaction_pow: proof.interaction_pow,
+            claimed_sums: &proof.claimed_sums,
+        },
+        &layout,
+        proof.stark_proof,
+    )
+    .expect("the masked wrap verifies");
 }
 
 /// `statement`, the run's: its io-hash the run's `io_hash`, judged against

@@ -54,7 +54,9 @@ pub const COMPOSITION_COLUMNS: usize = SECURE_EXTENSION_DEGREE;
 
 relation!(BlindRelation, 1);
 
-/// What a masked format commits beside the AIR's columns.
+/// What a masked format commits beside the AIR's columns: the trees' layout
+/// its masking pins (`vos_pvm_proof::format::Masking`, whose entry for
+/// format 39 `vos-pvm-recair` reads as `MASKED_WRAP_PINS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaskPins {
     /// The salt columns at the end of each salted tree (main, interaction,
@@ -64,14 +66,6 @@ pub struct MaskPins {
     /// the composition's own.
     pub fri_mask_columns: usize,
 }
-
-/// Format 39's: 8 salt columns (248 bits) a tree, and an `R` of 8 columns,
-/// whose 8 independent DEEP coefficients span QM31 over M31 but with
-/// probability about `p^-5` (R3 by construction).
-pub const MASKED_WRAP_PINS: MaskPins = MaskPins {
-    salt_columns: 8,
-    fri_mask_columns: 8,
-};
 
 /// A component masked: its body, then its blinding columns and their one
 /// fraction on [`BlindRelation`], then its fractions finalized in pairs, at
@@ -120,6 +114,14 @@ pub trait MaskedComponents: Sized {
     type Relations;
 
     fn draw_relations(channel: &mut impl Channel) -> Self::Relations;
+
+    /// Pin B's fifth step, the masked transcript's challenges: the set's
+    /// relations, then [`BlindRelation`].
+    fn draw(channel: &mut impl Channel) -> (Self::Relations, BlindRelation) {
+        let relations = Self::draw_relations(channel);
+        let blind = BlindRelation::draw(channel);
+        (relations, blind)
+    }
 
     /// The set at `log_sizes` with its claimed sums, `None` when either
     /// count is not the set's.
@@ -430,6 +432,12 @@ mod tests {
 
     /// Format 28's and 39's log sizes.
     const LOG_SIZES: LogSizes = [14, 15, 11];
+
+    /// Pin A's: 8 salt columns a tree and an `R` of 8.
+    const MASKED_WRAP_PINS: MaskPins = MaskPins {
+        salt_columns: 8,
+        fri_mask_columns: 8,
+    };
 
     fn wrap() -> WrapComponents {
         WrapComponents::build(

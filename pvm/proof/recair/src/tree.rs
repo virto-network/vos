@@ -2,11 +2,13 @@
 //! leaf, the fold of two nodes, and the wrap of the root. Every node is of
 //! the padded shape.
 
+use stwo::core::fields::qm31::SecureField;
 use vos_pvm_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
 use vos_pvm_proof::Proof;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::IdPreimage;
 
+use crate::context::Finalized;
 use crate::fold::{FoldCircuit, Proved};
 use crate::leaf::{LeafCircuit, NodeOutput};
 use crate::prove::{ProveError, RecairProof};
@@ -82,15 +84,25 @@ pub fn fold(
 }
 
 /// The wrap of `root` under the program whose id's preimage is `program`,
-/// proved: its proof, the statement it carries and its public words.
+/// proved masked under format 39 ([`wrap::prove`]): its proof, the statement
+/// it carries and its public words.
 pub fn wrap(
     root: &Node,
     program: &IdPreimage,
+) -> Result<(WrapProof, Statement, [u32; PUBLIC_WORDS]), TreeError> {
+    wrap_with(root, program, wrap::prove)
+}
+
+/// [`wrap()`], proved by `prove`.
+pub fn wrap_with(
+    root: &Node,
+    program: &IdPreimage,
+    prove: impl FnOnce(&Finalized<SecureField>) -> Result<WrapProof, ProveError>,
 ) -> Result<(WrapProof, Statement, [u32; PUBLIC_WORDS]), TreeError> {
     let circuit = WrapCircuit::get();
     let (values, statement) = circuit.values(root.proved(), program)?;
     let finalized = circuit.finalize(&values);
     let words = wrap::public_words(&finalized);
-    let proof = wrap::prove(&finalized)?;
+    let proof = prove(&finalized)?;
     Ok((proof, statement, words))
 }

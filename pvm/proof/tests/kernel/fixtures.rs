@@ -365,7 +365,7 @@ mod statements {
         let pieces: Vec<&str> = context.mismatches().iter().map(|m| m.piece).collect();
         assert_eq!(!pieces.is_empty(), lenient, "{pieces:?}");
         let finalized = context.finalize().expect("the wrap's wiring checks");
-        wrap::prove(&finalized).expect("the wrap proves")
+        wrap::prove_unmasked(&finalized).expect("the wrap proves")
     }
 
     /// The fixtures, by file name.

@@ -75,7 +75,10 @@
 //!   batching term binding, at twice the prover's memory. Its proofs are a
 //!   fixed layout ([`ProofBytes::FixedLayout`]); 28's are postcard.
 //! - **`masked`** says what a format's proofs are: masking a format's proofs
-//!   is a format change.
+//!   is a format change. A masked format whose masking is built pins it
+//!   ([`Format::masking`], [`Masking`]): its salt and FRI-mask columns and
+//!   its randomizer's size, which a prover and a verifier take from the
+//!   format, never from a proof.
 //! - **The bit counts** are [`crate::security`]'s, at each entry's reference
 //!   shape; the verifier counts again at the proof's own shape and refuses a
 //!   proof below either floor.
@@ -187,6 +190,23 @@ impl FormatParams {
     }
 }
 
+/// A masked format's masking (`masking-review.md` R6): what its trees commit
+/// beside the AIR's columns, and the randomizer's size. A prover masks with
+/// it and a verifier lays the trees out by it; neither reads it from a
+/// proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Masking {
+    /// The uniform salt columns at the end of each salted tree (main,
+    /// interaction, composition), never sampled.
+    pub salt_columns: usize,
+    /// The FRI mask `R`'s uniform base columns, in the composition tree
+    /// after the composition's own, sampled at the out-of-domain point.
+    pub fri_mask_columns: usize,
+    /// `log2 h`: each masked column is `f + v_H·r`, `r` of `h` random
+    /// coefficients.
+    pub log_mask_rows: u32,
+}
+
 /// The least counts a verifier accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SecurityFloor {
@@ -206,6 +226,10 @@ pub struct Format {
     pub params: FormatParams,
     pub bytes: ProofBytes,
     pub masked: bool,
+    /// The masking's pins, for a masked format whose masking is built; `None`
+    /// for an unmasked format, and for the masked formats reserved before
+    /// their masking (30, 37).
+    pub masking: Option<Masking>,
     pub floor: SecurityFloor,
     pub status: Status,
     /// The shape [`Format::bits`] is counted at.
@@ -399,6 +423,7 @@ pub const LEGACY_SEGMENT: Format = Format {
     },
     bytes: ProofBytes::Postcard,
     masked: false,
+    masking: None,
     floor: SecurityFloor {
         conjectured: crate::proof::MIN_CONJECTURED_SECURITY_BITS,
         proven: 0,
@@ -419,6 +444,7 @@ pub const SEGMENT: Format = Format {
     params: SEGMENT_PARAMS,
     bytes: ProofBytes::Postcard,
     masked: false,
+    masking: None,
     floor: INNER_FLOOR,
     status: Status::Admitted,
     reference: SEGMENT_REFERENCE,
@@ -442,6 +468,7 @@ pub const LEAF_FOLD: Format = Format {
     params: LEAF_FOLD_PARAMS,
     bytes: ProofBytes::Postcard,
     masked: false,
+    masking: None,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: LEAF_FOLD_REFERENCE,
@@ -467,6 +494,7 @@ pub const WRAP: Format = Format {
     },
     bytes: ProofBytes::Postcard,
     masked: false,
+    masking: None,
     floor: SecurityFloor {
         conjectured: 100,
         proven: 80,
@@ -477,6 +505,17 @@ pub const WRAP: Format = Format {
         conjectured: 146,
         proven: 82,
     },
+};
+
+/// Format 39's masking (pin A): 8 salt columns a tree (248 bits); an `R` of 8
+/// columns, whose 8 independent DEEP coefficients span QM31 over M31 but
+/// with probability about `p^-5`, so R3 holds without a check; and `h = 256`,
+/// at least `2(4|O| + q(|O| + 1)) = 160` for `q = 24` queries and `|O| = 2`
+/// offsets, and at most a quarter of the smallest component's `2^11` rows.
+pub const MASKED_WRAP_MASKING: Masking = Masking {
+    salt_columns: 8,
+    fri_mask_columns: 8,
+    log_mask_rows: 8,
 };
 
 /// The final wrap, masked: see the module's notes.
@@ -492,6 +531,7 @@ pub const MASKED_WRAP: Format = Format {
     },
     bytes: ProofBytes::FixedLayout,
     masked: true,
+    masking: Some(MASKED_WRAP_MASKING),
     floor: WRAP.floor,
     status: Status::Reserved,
     reference: MASKED_WRAP_REFERENCE,
@@ -509,6 +549,7 @@ pub const DEVICE_PROOF: Format = Format {
     params: DEVICE,
     bytes: ProofBytes::Postcard,
     masked: true,
+    masking: None,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: DEVICE_REFERENCE,
@@ -526,6 +567,7 @@ pub const CREDENTIAL_PROOF: Format = Format {
     params: DEVICE,
     bytes: ProofBytes::Postcard,
     masked: true,
+    masking: None,
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: CREDENTIAL_REFERENCE,

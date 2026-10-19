@@ -33,12 +33,14 @@ use vos_pvm_proof::proof::{
     mix_statement_header,
 };
 use vos_pvm_recair_air::gate::{GATE_WIDTH, Layout, public_logup_sum};
+use vos_pvm_recair_air::masked::WrapComponents;
 use vos_pvm_recair_air::transcript::{Prefix, replay_prefix};
 use vos_pvm_recair_air::{Components, GateRelation, LOG_CONSTRAINT_EXPANSION, LogSizes};
 
 use crate::circuit::{Circuit, WiringError};
 use crate::context::Witness;
-use crate::trace::{self, Evaluations, MainTrace};
+use crate::masked::{self, MaskRng, MaskStats, MaskedTrace};
+use crate::trace::{self, Evaluations, FirstRowFraction, MainTrace};
 
 /// The format a recursion AIR proof carries.
 pub const FORMAT: &Format = &LEAF_FOLD;
@@ -81,6 +83,13 @@ pub enum ProveError {
     Wiring(WiringError),
     /// Stwo refused, as it does a witness that breaks a constraint.
     Stwo(ProvingError),
+    /// R1 refused every attempt's masks
+    /// ([`crate::masked::MAX_ATTEMPTS`]).
+    MaskRank,
+    /// The masking cannot be laid out for the format and the component set.
+    Masking(&'static str),
+    /// The operating system's randomness is unavailable.
+    Entropy,
 }
 
 impl core::fmt::Display for ProveError {
@@ -88,6 +97,9 @@ impl core::fmt::Display for ProveError {
         match self {
             Self::Wiring(error) => write!(f, "the wiring: {error}"),
             Self::Stwo(error) => write!(f, "Stwo proving: {error}"),
+            Self::MaskRank => f.write_str("the masks' revealed functionals stayed dependent"),
+            Self::Masking(what) => write!(f, "the masking: {what}"),
+            Self::Entropy => f.write_str("no randomness from the operating system"),
         }
     }
 }
@@ -194,6 +206,9 @@ pub fn prove_on<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
+    if format.masked {
+        return Err(ProveError::Masking("a masked format proves masked"));
+    }
     circuit.check_wiring().map_err(ProveError::Wiring)?;
     let log_sizes = circuit.log_sizes();
     let config = format.pcs_config();
@@ -250,6 +265,62 @@ where
         claimed_sums,
         stark_proof,
     })
+}
+
+/// Proves `witness` over `circuit`, whose wiring must check, masked under
+/// `format`, a masked format of the recursion AIR, on `MC`
+/// ([`masked::prove_masked`] over [`WrapComponents`]), its randomness from
+/// `rng`; the main trace passed through `tamper` before it is masked.
+pub fn prove_masked_on<MC: MerkleChannel>(
+    format: &Format,
+    circuit: &Circuit,
+    witness: &Witness<SecureField>,
+    rng: &MaskRng,
+    tamper: impl FnOnce(&mut MainTrace),
+) -> Result<(RecairProof<MC::H>, MaskStats), ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    circuit.check_wiring().map_err(ProveError::Wiring)?;
+    let log_sizes = circuit.log_sizes();
+    let mut main = trace::main_trace(circuit, witness);
+    tamper(&mut main);
+    let main_columns = main
+        .columns
+        .iter()
+        .zip(log_sizes)
+        .map(|(columns, log_size)| trace::evaluations(columns, log_size))
+        .collect();
+    let interaction = |relation: &GateRelation, blinding: &[FirstRowFraction]| {
+        let extra = core::array::from_fn(|component| blinding.get(component).copied());
+        main.interaction_with(circuit, relation, extra).into()
+    };
+    let (proof, stats) = masked::prove_masked::<MC, WrapComponents>(
+        format,
+        MaskedTrace {
+            log_sizes: &log_sizes,
+            preprocessed: preprocessed_evaluations(circuit),
+            main: main_columns,
+            public: &witness.outputs,
+            interaction: &interaction,
+        },
+        rng,
+    )?;
+    let claimed_sums = proof
+        .claimed_sums
+        .try_into()
+        .map_err(|_| ProveError::Masking("a claimed sum a component"))?;
+    Ok((
+        RecairProof {
+            format_version: format.number,
+            log_sizes,
+            outputs: witness.outputs.clone(),
+            interaction_pow: proof.interaction_pow,
+            claimed_sums,
+            stark_proof: proof.stark_proof,
+        },
+        stats,
+    ))
 }
 
 /// `proof`'s transcript between its header and Stwo's protocol, its public

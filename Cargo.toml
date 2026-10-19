@@ -133,6 +133,15 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.vos-pvm-recair]
 opt-level = 3
+# The masked wrap's randomness: ChaCha20 streams for every mask and salt.
+[profile.dev.package.rand_chacha]
+opt-level = 3
+[profile.test.package.rand_chacha]
+opt-level = 3
+[profile.dev.package.ppv-lite86]
+opt-level = 3
+[profile.test.package.ppv-lite86]
+opt-level = 3
 
 [workspace.dependencies]
 # Exact: the workspace nightly is a 1.90 pre-release, which a later fjall

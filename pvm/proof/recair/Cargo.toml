@@ -20,8 +20,25 @@ stwo = { workspace = true, features = ["std", "prover", "parallel"] }
 stwo-constraint-framework = { workspace = true, features = ["std", "prover", "parallel"] }
 num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }
+# The masked wrap's randomness (pin C's R4): ChaCha20 seeded with the
+# BLAKE2b-256 of the OS's bytes, the witness digest and the attempt; and its
+# parallel masking and salts, written into packed columns.
+rand = { version = "0.8", default-features = false }
+rand_chacha = "0.3"
+getrandom = "0.2"
+blake2 = "0.10"
+bytemuck = "1"
+rayon = { workspace = true }
+
+[features]
+# The masked prover's seeded randomness (`MaskRng::Seeded`), for the
+# fixtures' generator alone: no production build enables it (`just
+# check-no-seeded-masks`).
+seeded-masks = []
 
 [dev-dependencies]
+# The masked prover's tests reproduce a proof byte for byte from a seed.
+vos-pvm-recair = { path = ".", features = ["seeded-masks"] }
 bincode = "1"
 # The compiler's tests: a segment proof's OODS data, from the fixture and
 # from a run proved over every chip.
