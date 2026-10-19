@@ -550,3 +550,80 @@ printed tables were not ported: they are spike 6b's record.
 **6.1 accepted.**
 
 **Gates after the fold:** `just check` green (1,113 tests, 0 failed).
+
+## Step 6.2: the masked AIR variant
+
+**The split** (`pvm/proof/recair-air/src/{lib,p2,qm31,h8}.rs`): a
+`Body` trait (`FrameworkEval` plus `body()`: the columns, constraints and
+relation entries, the fractions not yet finalized); each component's
+`evaluate` is `body()` then `finalize_logup_in_pairs()`.
+Behaviour-preserving: the stale-fixture test below.
+
+**`masked.rs`** (new, no_std), ported from spike 6a (`c95b46c9`):
+- `MASKED_LOG_CONSTRAINT_EXPANSION = 2`; `BlindRelation`
+  (`relation!(_, 1)`); `MaskedEval<B: Body>`: the body, 4 blinding main
+  columns, one fraction `combine_ef(b) / combine_B(1)`, the pairs, at
+  `log_size + 2`;
+- the `MaskedComponents` trait: a component set's relations (drawn right
+  before `BlindRelation`), its constructor from relations, blinding, log
+  sizes and claimed sums (`None` on a count not the set's), its log sizes,
+  its preprocessed tree and its components; `WrapComponents` is the
+  recursion AIR's (`p2`, `qm31`, `h8`). Where the spike hard-coded the
+  three components' widths, every function here reads the set;
+- `MaskedComponent` (committed bounds `+1`); `MaskPins` (salt and `R`
+  columns) with `MASKED_WRAP_PINS` (8 and 8, pin A);
+- `committed_log_sizes` (all four trees: 57 / 381 / 48 / 20, salts, the
+  composition and `R` at `m+2`), `air_log_size` (`m+1`, the components'
+  own tallest column), `composition_log_degree_bound` (`m+2`),
+  `composition_point` (π(z): one doubling, from the two levels),
+  `sample_points` and `composition_oods_eval`, each `Option`, no panic
+  path (the preprocessed indices are checked before Stwo's
+  `mask_points` indexes them).
+
+Wrap-only: leaves, folds and `LOG_CONSTRAINT_EXPANSION` (1) untouched;
+the blinding columns exist only in `MaskedEval`.
+
+**The degree audits [measured]** (`recair/tests/circuit/masked.rs`):
+- masked `p2` 303 constraints, degrees `[0, 0, 143, 160]`; `qm31` 4,
+  `[0, 1, 0, 3]`; `h8` 8, `[0, 1, 1, 6]`: every one ≤ 3, as spike 6a;
+- **R5:** the 25 segment chips, each driven through `drive_chip_oods`
+  (preprocessed columns from an `InfoEvaluator`, counted as columns):
+  5,177 constraints (`SEGMENT_REFERENCE`'s), by degree `[0, 23, 4395,
+  759]`, none above 3. (c)'s premise holds for slice 7's segments.
+
+**The masked reference shape from the built components:** read from
+`WrapComponents`' own layout, never `framework_access`: `k` the largest
+committed bound (17, whole), the masked level 16, the composition 17, the
+components' 315 constraints, their fractions from `logup_counts` ((6 <<
+14) + (5 << 15) + (7 << 11)), the relations' widest (`Gate`'s 5), `j` from
+`composition_point`'s doublings (1), and `sampled_values` as the DEEP
+quotient batches pin B's sample points: a two-sample column batches a
+third value, its periodicity sample (`deep_values_of_column`). Equal to
+`MASKED_WRAP_REFERENCE` in every field but `sampled_values`: **538**
+built against the reference's 964 bound (57 preprocessed, 357 + 3·16
+main, 28 + 3·12 interaction, 4 + 8 composition and `R`). Count 82.6999
+[model], the reference's. No correction to the reference or to 6.1's pin.
+
+**Static checks:** only `MaskedEval` adds to `BlindRelation` (each
+unmasked component's `logup_counts` hold `Gate` alone, each masked one
+`2^n` blinding fractions; no other recair-air module names it, and
+`masked.rs` has one relation entry); no source under `recair/src/{leaf,
+fold,verifier}` names `masked::` or the blinding relation.
+
+**Note for the review:** `framework_access`' `security_shape` sums the
+samples, not the values the DEEP quotient batches (a two-sample column
+batches 3): the segment AIR at 2^20 and 2^16 has 9,020 samples and 10,016
+values [measured]. It enters only the count by powers, which the segment
+formats use: with 10,016, 35 stays 62.857, 36 goes 57.495 → 57.485, 37
+62.129 → 62.104 [model]; every pinned count (62, 57, 62) and floor holds.
+Left as found, for the review to place: correcting it moves
+`SEGMENT_REFERENCE`.
+
+**Gates:** format 32 untouched: `the_fixtures_are_the_generators` (leaf,
+fold and wrap fixtures, `H_fold`, the program ids) passes byte for byte
+(200 s); the reference shape equal to the built one but for the bounded
+`sampled_values`; `just check` green (1,121 tests, 0 failed), the
+recair-air module building no_std for thumbv7em and wasm32.
+
+**Commits:** `13ac14c5` the split; `d1b646d6` `masked.rs` and its tests;
+this record.
