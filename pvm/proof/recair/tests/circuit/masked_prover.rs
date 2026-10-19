@@ -404,9 +404,9 @@ impl MaskedComponents for P2Only {
         let &[claimed_sum] = claimed_sums else {
             return None;
         };
-        Some(vec![Box::new(Rebound {
-            layout: &self.p2,
-            eval: MaskedEval::new(
+        let p2 = Rebound::new(
+            &self.p2,
+            MaskedEval::new(
                 P2Eval {
                     log_size: self.log_sizes[0],
                     relation: relation.clone(),
@@ -414,7 +414,8 @@ impl MaskedComponents for P2Only {
                 blind,
             ),
             claimed_sum,
-        })])
+        )?;
+        Some(vec![Box::new(p2)])
     }
 }
 

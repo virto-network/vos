@@ -151,7 +151,8 @@ pub trait MaskedComponents: Sized {
     /// The components laid out as `self`, their constraints evaluated under
     /// `relations`, `blind` and `claimed_sums` ([`Rebound`]): the verifier's
     /// set once the challenges are drawn, without laying it out again. `None`
-    /// when the count of claimed sums is not the set's.
+    /// when the count of claimed sums is not the set's, or an evaluation is
+    /// not at its layout's log size ([`Rebound::new`]).
     fn bind<'a>(
         &'a self,
         relations: &Self::Relations,
@@ -169,9 +170,28 @@ pub trait MaskedComponents: Sized {
 /// columns `layout` lays out. Its evaluation at a point is
 /// `FrameworkComponent`'s, everything else `layout`'s.
 pub struct Rebound<'a, E: FrameworkEval> {
-    pub layout: &'a FrameworkComponent<E>,
-    pub eval: E,
-    pub claimed_sum: SecureField,
+    layout: &'a FrameworkComponent<E>,
+    eval: E,
+    claimed_sum: SecureField,
+}
+
+impl<'a, E: FrameworkEval> Rebound<'a, E> {
+    /// `layout` evaluated by `eval` with `claimed_sum`; `None` unless `eval`
+    /// is at `layout`'s log size and constraint bound.
+    pub fn new(
+        layout: &'a FrameworkComponent<E>,
+        eval: E,
+        claimed_sum: SecureField,
+    ) -> Option<Self> {
+        (eval.log_size() == layout.log_size()
+            && eval.max_constraint_log_degree_bound()
+                == Component::max_constraint_log_degree_bound(layout))
+        .then_some(Self {
+            layout,
+            eval,
+            claimed_sum,
+        })
+    }
 }
 
 impl<E: FrameworkEval> Component for Rebound<'_, E> {
@@ -541,41 +561,40 @@ impl MaskedComponents for WrapComponents {
             return None;
         };
         let [p2_size, qm31_size, h8_size] = self.log_sizes;
-        Some(alloc::vec![
-            Box::new(Rebound {
-                layout: &self.p2,
-                eval: MaskedEval::new(
-                    p2::P2Eval {
-                        log_size: p2_size,
-                        relation: relation.clone(),
-                    },
-                    blind,
-                ),
-                claimed_sum: p2_sum,
-            }),
-            Box::new(Rebound {
-                layout: &self.qm31,
-                eval: MaskedEval::new(
-                    qm31::Qm31Eval {
-                        log_size: qm31_size,
-                        relation: relation.clone(),
-                    },
-                    blind,
-                ),
-                claimed_sum: qm31_sum,
-            }),
-            Box::new(Rebound {
-                layout: &self.h8,
-                eval: MaskedEval::new(
-                    h8::H8Eval {
-                        log_size: h8_size,
-                        relation: relation.clone(),
-                    },
-                    blind,
-                ),
-                claimed_sum: h8_sum,
-            }),
-        ])
+        let p2 = Rebound::new(
+            &self.p2,
+            MaskedEval::new(
+                p2::P2Eval {
+                    log_size: p2_size,
+                    relation: relation.clone(),
+                },
+                blind,
+            ),
+            p2_sum,
+        )?;
+        let qm31 = Rebound::new(
+            &self.qm31,
+            MaskedEval::new(
+                qm31::Qm31Eval {
+                    log_size: qm31_size,
+                    relation: relation.clone(),
+                },
+                blind,
+            ),
+            qm31_sum,
+        )?;
+        let h8 = Rebound::new(
+            &self.h8,
+            MaskedEval::new(
+                h8::H8Eval {
+                    log_size: h8_size,
+                    relation: relation.clone(),
+                },
+                blind,
+            ),
+            h8_sum,
+        )?;
+        Some(alloc::vec![Box::new(p2), Box::new(qm31), Box::new(h8)])
     }
 }
 
@@ -766,6 +785,14 @@ mod tests {
         let layout = wrap();
         let bound = layout.bind(&relation, &blind, &claimed_sums).unwrap();
         assert!(layout.bind(&relation, &blind, &claimed_sums[..2]).is_none());
+        let other_size = MaskedEval::new(
+            p2::P2Eval {
+                log_size: LOG_SIZES[0] + 1,
+                relation: relation.clone(),
+            },
+            &blind,
+        );
+        assert!(Rebound::new(&layout.p2, other_size, claimed_sums[0]).is_none());
         let built = WrapComponents::build(&relation, &blind, &LOG_SIZES, &claimed_sums);
         let z = SECURE_FIELD_CIRCLE_GEN.mul(11);
         let points = sample_points(&layout, z, &MASKED_WRAP_PINS).unwrap();
