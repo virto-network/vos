@@ -117,7 +117,7 @@ fn main() {
     agent.replica.store.compact().unwrap();
 
     // The apply path with no cut pending: results of random writes in
-    // window 0, each built once applied.
+    // window 0, no build running, as the pending phase's.
     let rounds = 100u64;
     let mut took = [Duration::ZERO; 2];
     for round in 0..rounds {
@@ -125,8 +125,9 @@ fn main() {
         let (elapsed, undone) = agent.apply(&entry);
         assert_eq!(undone, 0, "no undo row with no cut pending");
         took[0] += elapsed;
-        agent.replica.build_all(10_000);
     }
+    agent.replica.build_all(10_000);
+    agent.replica.store.compact().unwrap();
     // Then with a cut pending: a result crossing B_0 records cut(0), and
     // no build runs while the later results apply, so each rewrite of a
     // row written before the cut keeps an undo row.
