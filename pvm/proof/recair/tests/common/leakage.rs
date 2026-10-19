@@ -26,6 +26,19 @@ pub const ALPHA: f64 = 1e-3;
 /// witness pairs and the uniformity; on the real wrap, the same two.
 pub const TESTS: f64 = 4.0;
 
+/// The proofs a witness under `heavy-gates`: the environment's `var` if it
+/// is set (`just slice-gate` sets the full N), else `medium`
+/// (`just test-proof`).
+#[cfg(feature = "heavy-gates")]
+pub fn heavy_n(var: &str, medium: usize) -> usize {
+    match std::env::var(var) {
+        Ok(n) => n
+            .parse()
+            .unwrap_or_else(|_| panic!("{var}: a count of proofs, not {n:?}")),
+        Err(_) => medium,
+    }
+}
+
 /// A field's place in a proof: its kind, its tree or FRI layer, its column
 /// and its index there.
 pub type Key = (Kind, usize, usize, usize);

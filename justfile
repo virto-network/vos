@@ -50,8 +50,10 @@ vectors:
 # They cover every admitted format, the Poseidon2-M31 segment format among
 # them; the verifier's suite runs in `test`.
 # Then the masking's heavy gates (`vos-pvm-recair`'s `heavy-gates`): the
-# leakage tests at full N (2,000 proofs a witness on the small circuit, 32
-# on the real wrap), the masked acceptance above 2^16 rows, and the final
+# leakage tests at a medium N (500 proofs a witness on the small circuit, 16
+# on the real wrap; `LEAKAGE_N` and `LEAKAGE_WRAP_N` set others, and
+# `slice-gate` the full 2,000 and 32), the masked acceptance above 2^16
+# rows, and the final
 # verifier's decode, verify and Wasm gates as the maximum over 12 seeds of
 # the masked wrap (on the JAM-only host's `final-verify.elf`, built by
 # `check-no-std`, and `judge-wasm`'s blob), one test at a time.
@@ -285,14 +287,15 @@ fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode pro
 fuzz-replay:
     cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{fuzz_targets}}" | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target $"replay/($target)" -- -runs=0 } }
 
-# Each target five minutes from its corpus, seeded from the fixtures and the
-# anchor's vectors, the checked-in corpus beside it: no crash. One at a time;
+# Each target `secs` seconds from its corpus (a minute in `ci-full`, five in
+# `slice-gate`: `just fuzz 300`), seeded from the fixtures and the anchor's
+# vectors, the checked-in corpus beside it: no crash. One at a time;
 # the sanitized targets with debug assertions and overflow checks (`-a`),
 # the prove target optimized and without a sanitizer, its proving too slow
 # under either.
-fuzz:
+fuzz secs="60":
     cd pvm/proof/fuzz; cargo run --release --example seed
-    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{fuzz_targets}}" | split row ' ') { let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"replay/($target)" -- -max_total_time=300 -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
+    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{fuzz_targets}}" | split row ' ') { let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"replay/($target)" -- -max_total_time={{secs}} -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the
@@ -309,10 +312,21 @@ check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-form
 # planned stage of work.
 ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats check-kit fuzz-replay
 
-# The gate before merging: `ci` plus the prover suites, the soundness gates,
-# the bench tests that prove and the fuzz targets' runs. Run it under a
-# memory limit.
-ci-full: ci test-proof test-bench-proof fuzz
+# The gate at a milestone: `ci` plus the prover suites, the soundness gates
+# (the leakage tests at their medium N), the bench tests that prove and the
+# fuzz targets a minute each. Run it under a 12 GiB limit, e.g.
+# `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just ci-full`.
+# Run alone on the machine, its builds may take `CARGO_BUILD_JOBS` 8 to 12:
+# the proving tests keep their own thread limits (`test-proof`'s
+# `--test-threads`), so the peak stays under the cap.
+ci-full: ci test-proof test-bench-proof (fuzz "60")
+
+# The gate at a slice's end: `ci-full`'s, with the leakage tests at their
+# full N (2,000 proofs a witness on the small circuit, 32 on the real wrap)
+# and the fuzz targets five minutes each. Under the same limit.
+slice-gate: ci test-bench-proof
+    with-env { LEAKAGE_N: "2000", LEAKAGE_WRAP_N: "32" } { just test-proof }
+    just fuzz 300
 
 # Use the repository's hooks: fmt and clippy before commits, `just ci`
 # before pushes.

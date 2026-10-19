@@ -198,8 +198,8 @@ every input by construction:
   below with what guards it. Two had no guard and are the fork's fix
   (DIVERGENCE-013).
 - **Fuzzing:** seven targets (`fuzz/`), a checked-in corpus replayed by
-  `just check` (`just fuzz-replay`), and `just fuzz`, five minutes a target,
-  in `ci-full`.
+  `just check` (`just fuzz-replay`), and `just fuzz`, a minute a target in
+  `ci-full` and five in `slice-gate`.
 
 ### Stwo's verify path, audited
 
@@ -371,7 +371,8 @@ as the prover does, and the real and simulated batches differ by an
 `R`-quotient, so FRI's transcript, its unsalted layer trees included, has
 one distribution; no check runs for it. The masking's
 gates (`vos-pvm-recair`'s `masked_gates`, `leakage` and the masked wrap's
-tests; at full N under `heavy-gates` in `just test-proof`) are a regression
+tests; at a medium N under `heavy-gates` in `just test-proof`, at full N
+in `just slice-gate`) are a regression
 guard, not evidence of it: the soundness gates (acceptance at every size
 on both channels, a broken constraint on the first, last and wrap rows
 refused forced, the lifted preprocessed columns, the blinding unable to

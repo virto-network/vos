@@ -1,7 +1,7 @@
 //! The masking's statistical leakage gates on a small circuit
 //! (`docs/design/slice-6-on-chain.md`, "The masking's gates"), at N proofs
-//! a witness:
-//! 64 in `just check`, 2,000 under `heavy-gates` (`just test-proof`).
+//! a witness: 64 in `just check`; under `heavy-gates`, 500 in `just
+//! test-proof` and 2,000 in `just slice-gate` (`LEAKAGE_N`).
 //!
 //! - **Witness indistinguishability (leakage 2):** the honest prover's
 //!   published values do not depend on the witness. N proofs of one
@@ -12,6 +12,14 @@
 //!   the same test.
 //! - **Uniformity (leakage 3):** each field of the zero witness's N proofs
 //!   against uniform M31, one-sample χ² (exact at N ≤ 64).
+//!
+//! Their power [est; simulated at N = 2,000, scaled to other N by √N]: at
+//! N = 2,000 the per-field χ² finds, with 90% power, a leak spread over the
+//! buckets at total variation 0.133 and one concentrated in a bucket at
+//! 0.081, and the pooled KS a common shift of the CDF of about 1.9·10^-3;
+//! at N = 500 (`test-proof`), about 0.27 spread, 0.16 concentrated and a
+//! shift of 3.8·10^-3; at N = 64 only a concentrated leak of 0.73 or more.
+//! A regression guard against gross leaks, not evidence of zero knowledge.
 //!
 //! The family's error rate is 10^-3, Bonferroni over every field
 //! (`common::leakage`). The proofs are seeded, one seed a proof, so a run
@@ -38,12 +46,24 @@ use vos_pvm_recair::masked::MaskRng;
 use vos_pvm_recair::prove::{prove_masked_on, prove_on};
 use vos_pvm_recair::{Context, Finalized, circuit_commitment};
 
-/// The proofs a witness: the tier's.
-pub(crate) const N: usize = if cfg!(feature = "heavy-gates") {
-    2_000
-} else {
-    64
-};
+/// The proofs a witness: 64 in `just check`; under `heavy-gates`,
+/// `LEAKAGE_N` proofs, [`MEDIUM`] unless it is set.
+pub(crate) fn n() -> usize {
+    #[cfg(feature = "heavy-gates")]
+    {
+        static N: OnceLock<usize> = OnceLock::new();
+        *N.get_or_init(|| crate::common::leakage::heavy_n("LEAKAGE_N", MEDIUM))
+    }
+    #[cfg(not(feature = "heavy-gates"))]
+    {
+        64
+    }
+}
+
+/// The proofs a witness `just test-proof` takes; `just slice-gate` sets
+/// `LEAKAGE_N` to 2,000.
+#[cfg(feature = "heavy-gates")]
+const MEDIUM: usize = 500;
 
 /// The private circuit's witness: four private QM31 values.
 #[derive(Clone, Copy, Debug)]
@@ -156,10 +176,10 @@ fn witnesses() -> &'static [Fields; 3] {
             );
         }
         let started = std::time::Instant::now();
-        let proofs = [Witness::zero(), random, random.plus_one()].map(|w| masked(&w, N));
+        let proofs = [Witness::zero(), random, random.plus_one()].map(|w| masked(&w, n()));
         eprintln!(
             "{} masked proofs of each of 3 witnesses in {:.1}s, {} fields each",
-            N,
+            n(),
             started.elapsed().as_secs_f64(),
             proofs[0].0.len()
         );
@@ -209,8 +229,8 @@ fn the_statistics_are_calibrated() {
 fn the_masked_openings_do_not_depend_on_the_witness() {
     let [zero, random, amount] = witnesses();
     let mut verdicts = Verdicts::new("leakage 2, the small circuit");
-    indistinguishable(&mut verdicts, "zero/random", zero, random, N);
-    indistinguishable(&mut verdicts, "amount/amount+1", random, amount, N);
+    indistinguishable(&mut verdicts, "zero/random", zero, random, n());
+    indistinguishable(&mut verdicts, "amount/amount+1", random, amount, n());
     verdicts.report();
     let refused = verdicts.refused();
     assert!(refused.is_empty(), "{:?}", &refused[..refused.len().min(8)]);
@@ -219,9 +239,9 @@ fn the_masked_openings_do_not_depend_on_the_witness() {
     indistinguishable(
         &mut control,
         "zero/random",
-        &unmasked(&Witness::zero(), N),
-        &unmasked(&Witness::random(1), N),
-        N,
+        &unmasked(&Witness::zero(), n()),
+        &unmasked(&Witness::random(1), n()),
+        n(),
     );
     control.report();
     assert!(!control.refused().is_empty(), "the unmasked prover passes");
@@ -233,7 +253,7 @@ fn the_masked_openings_do_not_depend_on_the_witness() {
 fn the_masked_openings_are_uniform() {
     let [zero, ..] = witnesses();
     let mut verdicts = Verdicts::new("leakage 3, the small circuit");
-    uniform(&mut verdicts, zero, N);
+    uniform(&mut verdicts, zero, n());
     verdicts.report();
     let refused = verdicts.refused();
     assert!(refused.is_empty(), "{:?}", &refused[..refused.len().min(8)]);

@@ -16,8 +16,19 @@
 //! - **No hidden state** of the run is in any carrier of the proof (leakage
 //!   4).
 //! - **Under `heavy-gates`** (`just test-proof`): leakage 2, 3 and 5 on the
-//!   real wrap at 32 proofs a witness, and the verify gates (decode, verify
-//!   and the PVF's Wasm instructions) as the maximum over 12 seeds.
+//!   real wrap at 16 proofs a witness (32 in `just slice-gate`,
+//!   `LEAKAGE_WRAP_N`), and the verify gates (decode, verify and the PVF's
+//!   Wasm instructions) as the maximum over 12 seeds.
+//!
+//! The real wrap's leakage power [est; exact for uniformity, simulated for
+//! the two-sample test]: at N = 32 the two-sample test finds only a field
+//! fixed by the witness, and exact uniformity a leak concentrated in a
+//! bucket at total variation 0.59 (90% power); at N = 16, the same fixed
+//! field, and a concentrated leak at about 0.83. N = 16 is the least at
+//! which the unmasked control still fails: a fixed field in two buckets
+//! is χ² = 2N on one degree of freedom, p 1.5·10^-8 at 16 against the
+//! control's threshold of about 2.1·10^-8 (8,763 of its 11,685 refused at
+//! 16 [measured]).
 
 use crate::jam;
 use crate::wrap::{one_segment, values_of};
@@ -702,8 +713,16 @@ mod heavy {
     use vos_pvm_proof::program_id::IdPreimage;
     use vos_pvm_recair::tree::Node;
 
-    /// Proofs a witness.
-    const N: usize = 32;
+    /// Proofs a witness: `LEAKAGE_WRAP_N`, 16 unless it is set; at least
+    /// 16, the least at which the unmasked control fails.
+    fn n() -> usize {
+        static N: OnceLock<usize> = OnceLock::new();
+        *N.get_or_init(|| {
+            let n = crate::common::leakage::heavy_n("LEAKAGE_WRAP_N", 16);
+            assert!(n >= 16, "LEAKAGE_WRAP_N {n}: below 16 the unmasked control passes");
+            n
+        })
+    }
     /// The seeds the verify gates are the maximum over.
     const GATE_SEEDS: usize = 12;
 
@@ -720,7 +739,7 @@ mod heavy {
         let started = Instant::now();
         let mut fields = Fields::default();
         let mut first = Vec::new();
-        for seed in 0..N as u64 {
+        for seed in 0..n() as u64 {
             let (proof, _) =
                 wrap::prove_masked(&finalized, MaskRng::Seeded(seed), |_| {}).expect("proves");
             let values = published(&proof.stark_proof, &proof.claimed_sums);
@@ -730,14 +749,15 @@ mod heavy {
             }
         }
         eprintln!(
-            "{name}: {N} masked wraps in {:.1}s, {} fields each",
+            "{name}: {} masked wraps in {:.1}s, {} fields each",
+            n(),
             started.elapsed().as_secs_f64(),
             fields.0.len()
         );
         let control = wrap::prove_unmasked(&finalized).expect("proves");
         let control = published(&control.stark_proof, &control.claimed_sums);
         let mut unmasked = Fields::default();
-        for _ in 0..N {
+        for _ in 0..n() {
             unmasked.add(&control);
         }
         Proofs {
@@ -786,26 +806,26 @@ mod heavy {
     fn heavy_the_masked_wraps_openings_do_not_depend_on_the_witness() {
         let [a, b] = witnesses();
         let mut verdicts = Verdicts::new("leakage 2, the real wrap");
-        indistinguishable(&mut verdicts, "6000/6001", &a.fields, &b.fields, N);
+        indistinguishable(&mut verdicts, "6000/6001", &a.fields, &b.fields, n());
         verdicts.report();
         let refused = verdicts.refused();
         assert!(refused.is_empty(), "{:?}", &refused[..refused.len().min(8)]);
         let mut control = Verdicts::new("leakage 2's control on the real wrap, unmasked");
-        indistinguishable(&mut control, "6000/6001", &a.unmasked, &b.unmasked, N);
+        indistinguishable(&mut control, "6000/6001", &a.unmasked, &b.unmasked, n());
         control.report();
         assert!(!control.refused().is_empty(), "the unmasked wrap passes");
     }
 
     /// Leakage 3 on the real wrap: each published field of either witness's
-    /// proofs uniform over M31 (exact at N = 32). Against a leak the two
-    /// witnesses share, this is the real wrap's sharper test: at N = 32 the
+    /// proofs uniform over M31 (exact at N ≤ 64). Against a leak the two
+    /// witnesses share, this is the real wrap's sharper test: at N ≤ 64 the
     /// two-sample test finds only a field nearly fixed by the witness.
     #[test]
     fn heavy_the_masked_wraps_openings_are_uniform() {
         let [a, b] = witnesses();
         let mut verdicts = Verdicts::new("leakage 3, the real wrap");
-        uniform(&mut verdicts, &a.fields, N);
-        uniform(&mut verdicts, &b.fields, N);
+        uniform(&mut verdicts, &a.fields, n());
+        uniform(&mut verdicts, &b.fields, n());
         verdicts.report();
         let refused = verdicts.refused();
         assert!(refused.is_empty(), "{:?}", &refused[..refused.len().min(8)]);
