@@ -3,7 +3,6 @@
 //! pending cut's build still needs, what the builder targets, and the
 //! roots and proofs a cut's build leaves. The terms are the model's
 //! ([`model`]).
-#![cfg(feature = "cuts")]
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -13,11 +12,14 @@ mod model;
 use std::collections::BTreeMap;
 
 use vos_node::roots::{self, AgentStore};
+use vos_node::storage::Change;
 use vos_tree::BatchProof;
 use vos_wire::Encode;
+use vos_wire::defaults::MAX_CUTS;
 use vos_wire::ids::RequestId;
 use vos_wire::keys;
 use vos_wire::records::{PendingRead, stored_versioned};
+use vos_wire::result::Write;
 
 use model::{
     AGENT, CLOCK, Committed, Entry, History, MAPS, Replica, SPACE, check_proof, cuts, pending,
@@ -236,7 +238,8 @@ fn a_builder_lagging_across_two_boundaries_builds_each_cut_as_a_rebuild_would() 
 /// result. A result exactly at a boundary crosses it; one a millisecond
 /// before does not. A later result at the mark, as a trailing leader times
 /// its batches, cuts nothing; one timed before the mark applies nothing.
-/// A cut, once recorded, never moves.
+/// A cut, once recorded, never moves. A result crossing more than
+/// `MAX_CUTS` boundaries cuts the newest `MAX_CUTS` windows alone.
 #[test]
 fn a_clock_jump_cuts_every_window_it_crosses_at_one_version() {
     let dir = tempfile::tempdir().unwrap();
@@ -271,6 +274,26 @@ fn a_clock_jump_cuts_every_window_it_crosses_at_one_version() {
     for window in 5..=14 {
         assert_eq!(jumps.recorded.get(&window), Some(&before));
     }
+    // A jump past `MAX_CUTS` boundaries cuts the newest `MAX_CUTS` alone,
+    // and the older windows are never cut.
+    let skipped = 5;
+    let before = jumps.replica.version();
+    let into = 15 + MAX_CUTS + skipped;
+    jumps.step(into * CLOCK.length_ms + 500, true);
+    let new: Vec<u64> = jumps
+        .recorded
+        .range(15..)
+        .map(|(window, _)| *window)
+        .collect();
+    assert_eq!(new, (15 + skipped..into).collect::<Vec<_>>());
+    assert!(jumps.recorded.range(15..).all(|(_, cut)| *cut == before));
+    jumps.step((into + 1) * CLOCK.length_ms, true);
+    assert_eq!(
+        jumps.recorded.range(15..15 + skipped).count(),
+        0,
+        "skipped for good"
+    );
+    assert!(jumps.recorded.contains_key(&into));
 }
 
 /// A replica applying results one at a time, and the cuts it recorded.
@@ -401,4 +424,117 @@ fn replicas_agree_whatever_undo_rows_each_holds() {
         a.scan(AGENT, &keys::cut_proofs(), None).count(),
         b.scan(AGENT, &keys::cut_proofs(), None).count()
     );
+}
+
+/// A record stored in part, one or two of the target, the space and the
+/// clock, is corrupt: the agent's apply applies no later result, crossing
+/// a boundary or not, and writes nothing.
+#[test]
+fn a_record_stored_in_part_applies_nothing() {
+    let record = Entry::install(100, SPACE).writes;
+    for held in 1..7u8 {
+        let dir = tempfile::tempdir().unwrap();
+        let replica = Replica::open(dir.path());
+        let part = record
+            .iter()
+            .enumerate()
+            .filter(|(at, _)| held & (1 << at) != 0)
+            .map(|(_, write)| write.clone())
+            .collect();
+        let first = Entry {
+            time: 100,
+            writes: part,
+            ..Entry::default()
+        };
+        assert!(replica.apply(1, &first.result(0)), "the part applies");
+        let rows = replicated(&replica.snapshot());
+        for (index, time) in [(2, 500), (3, 1_500)] {
+            let (_, written, applied) =
+                replica.accumulate(&Entry::at(time, writes(time)).result(1));
+            assert!(!applied, "{held:03b}: a result at {time}");
+            assert!(written.is_empty(), "nothing written");
+            assert!(!replica.apply(index, &Entry::at(time, writes(time)).result(1)));
+        }
+        assert_eq!(replicated(&replica.snapshot()), rows, "{held:03b}");
+        assert_eq!(replica.version(), 1);
+    }
+}
+
+/// A cut whose version the tree is already built at, as when a build at
+/// the latest version lands just before the crossing result: its build
+/// reads no dirty row and finishes it alone, its root and its window's
+/// proofs; the next build goes on to the latest version. A result's
+/// writes naming a committed row twice keep one undo row of it.
+#[test]
+fn a_cut_built_already_is_finished_alone() {
+    let history = history(10);
+    let dir = tempfile::tempdir().unwrap();
+    let replica = Replica::open(dir.path());
+    apply(&replica, &history, 1, 9);
+    assert_eq!(replica.build_all(BATCH), vec![9]);
+    apply(&replica, &history, 10, 10);
+    assert_eq!(
+        replica.build_read(BATCH),
+        Some((9, 0)),
+        "the cut, no dirty row read"
+    );
+    let snapshot = replica.snapshot();
+    assert_eq!(
+        roots::cut_root(&snapshot, AGENT, 0).unwrap(),
+        Some((history.root(9), 9))
+    );
+    for (id, (window, read)) in history.requests(10) {
+        let proof = roots::cut_proof(&snapshot, AGENT, id)
+            .unwrap()
+            .expect("a proof");
+        check_proof(&history, &proof, window, 9, &read);
+    }
+    assert_eq!(replica.build(BATCH), Some(10));
+    assert_eq!(replica.build(BATCH), None);
+
+    // A cut pending again, and a committed row written twice in one
+    // result.
+    let snapshot = replica.snapshot();
+    let (row, stored) = model::scan(&snapshot, &keys::committed_all())[0].clone();
+    let cut = Write {
+        key: keys::cut(5),
+        value: Some(vos_wire::records::stored(&10u64.encode())),
+    };
+    let twice = |value: u8| Write {
+        key: row.clone(),
+        value: Some(vec![value]),
+    };
+    let undo = roots::undo(&snapshot, AGENT, &[cut, twice(1), twice(2)]).unwrap();
+    assert_eq!(
+        undo,
+        vec![Write {
+            key: keys::undo(5, &row),
+            value: Some(stored)
+        }]
+    );
+}
+
+/// An undo row of a window already built, as an apply racing the cut's
+/// finishing commit leaves, makes a build due, which deletes it.
+#[test]
+fn an_orphaned_undo_row_is_swept() {
+    let history = history(12);
+    let dir = tempfile::tempdir().unwrap();
+    let replica = Replica::open(dir.path());
+    apply(&replica, &history, 1, 12);
+    assert_eq!(replica.build_all(BATCH), vec![9, 12]);
+    let orphan = Write {
+        key: keys::undo(0, &row(MAPS[0], &0u64.to_be_bytes())),
+        value: Some(vec![1]),
+    };
+    let change = Change::Tree {
+        agent: AGENT,
+        epoch: 0,
+        writes: vec![orphan],
+    };
+    smol::block_on(replica.writer.commit(vec![change])).unwrap();
+    assert_eq!(undos(&replica.snapshot()).len(), 1);
+    assert_eq!(replica.build(BATCH), Some(12));
+    assert!(undos(&replica.snapshot()).is_empty(), "swept");
+    assert_eq!(replica.build(BATCH), None);
 }

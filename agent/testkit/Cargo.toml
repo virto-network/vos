@@ -6,11 +6,6 @@ license.workspace = true
 description = "A native host for VOS actor programs: the reference model of the default agent."
 publish = false
 
-[features]
-# The acceptance tests of window cuts, written ahead of the cuts
-# themselves: test-only, and gone once they pass.
-cuts = []
-
 [dependencies]
 blake2 = "0.10"
 vos-pvm = { workspace = true }

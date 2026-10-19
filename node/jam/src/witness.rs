@@ -11,10 +11,19 @@ use crate::Error;
 use crate::simulate::Simulation;
 use crate::store::View;
 
-/// The witness of `simulation` against `view`'s root.
+/// The witness of `simulation` against `view`'s root. The agent's record,
+/// its target, space and clock, is served whole whenever any of it is
+/// read: the agent reads it whole, and traps on a part.
 pub(crate) fn witness(view: &View, simulation: &Simulation) -> Result<StateWitness, Error> {
+    let record = [
+        vos_wire::keys::target(),
+        vos_wire::keys::space(),
+        vos_wire::keys::clock(),
+    ];
+    let reads_record = record.iter().any(|key| simulation.reads.contains(key));
+    let extra = record.iter().filter(|_| reads_record);
     let mut keys: BTreeMap<&[u8], Opened> = BTreeMap::new();
-    for key in &simulation.reads {
+    for key in simulation.reads.iter().chain(extra) {
         let opened = match (view.get(key)?, view.leaf(key)?) {
             (Some(value), Some(leaf)) => Opened::Value {
                 salt: leaf.salt,

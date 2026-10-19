@@ -30,10 +30,10 @@ use vos_wire::result::{Outcome, WorkResult};
 use vos_wire::vos_anchor::MIN_LENGTH_MS;
 use vos_wire::{Decode, Encode, WindowClock};
 
-use crate::common::{ALICE, COUNTER, Cluster, wait_until};
+use crate::common::{ALICE, COUNTER, Cluster, Rows, compacting, log_start, wait_until};
 
 /// How far after the cluster starts its first boundary falls.
-const LEAD_MS: u64 = 20_000;
+const LEAD_MS: u64 = 30_000;
 
 /// A space's clock of two-minute windows whose first boundary, `B_0`, is
 /// `LEAD_MS` from now.
@@ -92,8 +92,9 @@ fn results(node: &Node, agent: AgentId, after: u64) -> Vec<(u64, WorkResult)> {
 }
 
 /// The leader's `Cut` marker for an idle agent. While the leader's clock
-/// trails `B_0` it appends none, though every follower's clock is past it:
-/// no cut is recorded. Once its own clock passes `B_0` it appends one
+/// trails `B_0` it appends none, though every follower's clock is past it,
+/// and an input's result is timed at its clock, before `B_0`: no cut is
+/// recorded. Once its own clock passes `B_0` it appends one
 /// empty work result, timed at its clock (at or past `B_0`, never `B_0`
 /// itself when its clock is later), and every replica records `cut(0)` at
 /// the agent's version before it. No second marker comes in the same
@@ -106,7 +107,6 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     let node = cluster.node(leader);
-    let before = version(node, agent);
     let applied = node.applied(agent).unwrap();
     for number in (1..=3).filter(|number| *number != leader) {
         set_clock(&cluster, number, b0 + 2_000);
@@ -118,6 +118,16 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
         "a trailing leader cuts nothing"
     );
     assert!(results(node, agent, applied).is_empty(), "nor appends");
+    // An input: its result timed at the leader's clock, before `B_0`.
+    write(&cluster, agent, 1..=1);
+    let written = results(node, agent, applied);
+    let [(_, result)] = &written[..] else {
+        panic!("one result: {written:?}");
+    };
+    assert!(result.time < b0, "timed at the trailing leader's clock");
+    assert!(cuts(node, agent).is_empty(), "and cutting nothing");
+    let before = version(node, agent);
+    let applied = node.applied(agent).unwrap();
 
     set_clock(&cluster, leader, b0 + 500);
     let reading = clock_of(&cluster, leader);
@@ -318,31 +328,19 @@ fn settled(node: &Node, agent: AgentId) -> Settled {
     settled.unwrap()
 }
 
-/// A leader change between a cut and its close. A pending request of
-/// window 0 reads sixteen rows of the counter's committed map; the clocks
-/// pass `B_0`; every replica records `cut(0)` at the version the agent
-/// stood at, builds there, and persists the request's proof: the rows as
-/// they stood at the cut, with their salts, under one proof against the
-/// root at the cut, the same bytes on every replica. Later writes rewrite
-/// those rows. Then the leader stops: the new leader's replica, and the
-/// third, still hold the proof unchanged, of window 0 (no re-cut), and the
-/// old leader's, restarted, holds it too.
-#[test]
-fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
-    let clock = clock();
-    let b0 = clock.boundary(0).unwrap();
-    let asking = Arc::new(Asking::default());
-    let hooks = Arc::clone(&asking);
-    let mut cluster = Cluster::in_space(3, Some(clock), move |_, config| {
-        config.hooks = hooks.clone();
-    });
-    let agent = cluster.counter_agent(&[1, 2, 3]);
-    write(&cluster, agent, 1..=20);
-    let leader = cluster.leader(agent);
-    let map = entries(cluster.node(leader), agent);
-
-    // The request: twelve rows the writes reach, four they never do.
-    let present: Vec<Vec<u8>> = settled(cluster.node(leader), agent)
+/// A pending request of the current window, recorded by the leader's batch
+/// of request `sequence`, once every running replica holds it: sixteen
+/// rows of the counter's committed map, twelve the writes reach and four
+/// they never do.
+fn ask(
+    cluster: &Cluster,
+    agent: AgentId,
+    asking: &Asking,
+    sequence: u64,
+) -> (RequestId, PendingRead) {
+    let leader = cluster.node(cluster.leader(agent));
+    let map = entries(leader, agent);
+    let present: Vec<Vec<u8>> = settled(leader, agent)
         .2
         .into_keys()
         .filter(|row| row.starts_with(&keys::committed_rows(&map)))
@@ -366,12 +364,10 @@ fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
     };
     *asking.request.lock().unwrap() = Some((agent, id, read.clone()));
     asking.armed.store(true, Ordering::SeqCst);
-    write(&cluster, agent, 21..=21);
-    for number in 1..=3 {
+    write(cluster, agent, sequence..=sequence);
+    for (_, node) in cluster.running() {
         wait_until("every replica holds the request", || {
-            cluster
-                .node(number)
-                .store()
+            node.store()
                 .snapshot()
                 .get(agent, &keys::request(0, id))
                 .unwrap()
@@ -379,6 +375,87 @@ fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
         });
     }
     asking.armed.store(false, Ordering::SeqCst);
+    (id, read)
+}
+
+/// A replica down across a cut builds it on its return, by the log or by
+/// a snapshot of the leader's state: the request's proof and the root at
+/// the cut the same bytes as every other replica's, though the rows it
+/// reads were rewritten after the cut before the replica came back.
+#[test]
+fn a_replica_down_across_a_cut_holds_its_proofs_on_return() {
+    for by_snapshot in [false, true] {
+        let clock = clock();
+        let b0 = clock.boundary(0).unwrap();
+        let asking = Arc::new(Asking::default());
+        let hooks = Arc::clone(&asking);
+        let mut cluster = Cluster::in_space(3, Some(clock), move |number, config| {
+            config.hooks = hooks.clone();
+            if by_snapshot {
+                compacting(number, config);
+            }
+        });
+        let agent = cluster.counter_agent(&[1, 2, 3]);
+        write(&cluster, agent, 1..=10);
+        let (_, follower) = cluster.leader_and_follower(agent);
+        let stopped_at = cluster.node(follower).applied(agent).unwrap();
+        cluster.stop(follower);
+        let (id, _) = ask(&cluster, agent, &asking, 11);
+        write(&cluster, agent, 12..=20);
+        for number in 1..=3 {
+            set_clock(&cluster, number, b0 + 1_000);
+        }
+        write(&cluster, agent, 21..=60);
+        let leading = cluster.leader(agent);
+        let node = cluster.node(leading);
+        let mut proof = None;
+        wait_until("the leader's replica builds the cut", || {
+            proof = roots::cut_proof(&node.store().snapshot(), agent, id).unwrap();
+            proof.is_some()
+        });
+        let root = roots::cut_root(&node.store().snapshot(), agent, 0).unwrap();
+        if by_snapshot {
+            cluster.compacted_past(leading, agent, stopped_at);
+        }
+        cluster.start(follower);
+        let back = cluster.node(follower);
+        wait_until("the replica returns and builds the cut", || {
+            back.applied(agent) >= cluster.node(leading).applied(agent)
+                && roots::cut_proof(&back.store().snapshot(), agent, id)
+                    .unwrap()
+                    .is_some()
+        });
+        let snapshot = back.store().snapshot();
+        assert_eq!(roots::cut_proof(&snapshot, agent, id).unwrap(), proof);
+        assert_eq!(roots::cut_root(&snapshot, agent, 0).unwrap(), root);
+        if by_snapshot {
+            assert!(log_start(back, agent) > stopped_at, "installed a snapshot");
+        }
+        same_state(&cluster, agent);
+    }
+}
+
+/// A leader change between a cut and its close. A pending request of
+/// window 0 reads sixteen rows of the counter's committed map; the clocks
+/// pass `B_0`; every replica records `cut(0)` at the version the agent
+/// stood at, builds there, and persists the request's proof: the rows as
+/// they stood at the cut, with their salts, under one proof against the
+/// root at the cut, the same bytes on every replica. Later writes rewrite
+/// those rows. Then the leader stops: the new leader's replica, and the
+/// third, still hold the proof unchanged, of window 0 (no re-cut), and the
+/// old leader's, restarted, holds it too.
+#[test]
+fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
+    let clock = clock();
+    let b0 = clock.boundary(0).unwrap();
+    let asking = Arc::new(Asking::default());
+    let hooks = Arc::clone(&asking);
+    let mut cluster = Cluster::in_space(3, Some(clock), move |_, config| {
+        config.hooks = hooks.clone();
+    });
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    write(&cluster, agent, 1..=20);
+    let (id, read) = ask(&cluster, agent, &asking, 21);
     write(&cluster, agent, 22..=30);
 
     // The state at the cut: nothing applies between it and `B_0`.
@@ -463,5 +540,31 @@ fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
         roots::cut_proof(&restarted.store().snapshot(), agent, id).unwrap(),
         Some(proof)
     );
-    cluster.converged(agent);
+    same_state(&cluster, agent);
+}
+
+/// `agent`'s replicated rows on `node` and its applied index, from one
+/// store snapshot: its own but the dirty and seed rows its builder
+/// consumes at its own pace, its instances', and its committed rows.
+fn replicated(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
+    let snapshot = node.store().snapshot();
+    let local = [keys::dirty_prefix(), keys::seed_prefix()];
+    let rows = [[0x00u8], [0x01], [0x03]]
+        .iter()
+        .flat_map(|prefix| snapshot.scan(agent, prefix, None).map(Result::unwrap))
+        .filter(|(key, _)| !local.iter().any(|prefix| key.starts_with(prefix)))
+        .collect();
+    (snapshot.applied(agent).unwrap(), rows)
+}
+
+/// Every running replica holds the same replicated rows at the same
+/// applied index.
+fn same_state(cluster: &Cluster, agent: AgentId) {
+    wait_until("every replica holds the same rows", || {
+        let views: Vec<_> = cluster
+            .running()
+            .map(|(_, node)| replicated(node, agent))
+            .collect();
+        views.len() > 1 && views.windows(2).all(|pair| pair[0] == pair[1])
+    });
 }

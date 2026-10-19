@@ -375,7 +375,7 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | window of time t | `w = ⌊(t − origin_ms) / length_ms⌋`; t < origin_ms has none |
 | boundary | `B_w = origin_ms + (w+1)·length_ms` |
 | length | `length_ms` ∈ [120,000, 3,600,000], default 600,000 (decision 2); the venue refuses another at registration |
-| `cut(w)` | the agent's state version before the first applied result with time ≥ `B_w` |
+| `cut(w)` | the agent's state version before the first applied result with time ≥ `B_w`: a result timed t, after the agent's batch-time mark p, records it for every w with p < `B_w` ≤ t, once the record its first install wrote names a space (the install itself cuts nothing, so only windows past the agent's first install are cut); of more than `MAX_CUTS` (32, a consensus constant) such windows, the newest 32 alone, the older never cut |
 | agent root | the vos-tree root over the agent's committed rows `0x03 ‖ instance ‖ tag ‖ transform ‖ key' → value` (pin E); empty: `H("vos/tree/empty")` |
 | representative's rows | a `CommittedMap<RepKey, [u8; 32]>`, `RepKey = agent (4, BE) ‖ kind (1) ‖ w (8, BE)`, the value the agent's root at `cut(w)`; kind 0 is pin E's Blake2b tree; rows older than `w − 2` deleted |
 | representative's clock | `(origin_ms + D, length_ms)`, `D = min(length_ms / 5, 120,000)`: its own `cut_rep(w)` at `B_w + D` is the close of w |
@@ -495,7 +495,9 @@ Rests on decisions 5, 6 and 8.
      the arguments ‖ served and records the `Attest`; the workflow's
      record keeps the attest's return, never the served bytes.
 - **A window not closed in time:** a pending request of window w whose
-  `Closed { w }` has not been applied when `cut(w+1)` is is re-cut at w+1:
+  `Closed { w }` has not been applied when the next cut recorded after w
+  is, is re-cut there (w+1, unless a clock jump past `MAX_CUTS` skipped
+  it):
   its `rows_proof` regenerated at the new cut, the old one dropped, its
   `AgentRoot` for w+1 marked pending. After 2 re-cuts the workflow sees
   `AttestError::NotClosed`. A representative returning after several
@@ -987,17 +989,23 @@ lands.
     at or past it; it never synthesizes a time, so a trailing leader cuts
     late, never wrongly;
   - **apply** of the first entry with time ≥ `B_w` records `cut(w)` for
-    every boundary it crosses (one version for several after a clock jump);
+    every boundary it crosses (one version for several after a clock jump,
+    at most the newest `MAX_CUTS`); the shared apply, on both hosts,
+    reading the agent's record (target, space, clock) from the state
+    before the result's steps; a record stored in part applies nothing;
   - **the builder** targets `min(latest, the earliest unbuilt cut)`;
   - **`undo(w, key)`** rows are node-local, written by the node's apply
     wrapper, never by the agent's `apply`: for a committed write while
     `cut(w)` is unbuilt and the key's current version ≤ `cut(w)`; the cut's
     build reads them and skips dirty rows past `cut(w)`;
-  - **the proofs:** after the cut's build, every replica generates
-    `rows_proof` for each pending request of w (deterministic bytes) and
-    persists it as a local row under `Owner::Tree`, keyed by request, in
-    the commit that marks the cut built;
-  - the agent root at `cut(w)` kept for the two latest windows;
+  - **the proofs:** after the cut's build, every replica persists, for
+    each pending request of w, its `CutProof` (the rows with their salts
+    and values at the cut, the root, the version, and the `rows_proof`;
+    deterministic bytes) as a local row under `Owner::Tree`, keyed by
+    request, in the commit that marks the cut built: later writes
+    overwrite the values, and builds delete the seeds, before `Served` is
+    assembled;
+  - the agent root at `cut(w)` kept for the two latest built cuts;
   - **an agent of no space** (`keys::space` = `NONE`, 6.10) runs no cuts;
   - **witness builders** serve `keys::target`, `keys::space` and
     `keys::clock` together whenever they serve one: the default agent
@@ -1064,7 +1072,7 @@ lands.
   `Closed { w, rep_root, paths }` pair message an agent, sent by the hook
   that signs the anchor; missed windows closed on return within
   `MaxRootAge`; pin E's re-cut of a request whose `Closed` has not
-  arrived by `cut(w+1)`.
+  arrived by the next cut recorded after w.
 - **Tests:** three nodes, three agents and the representative: every
   agent reports; an agent whose clock leads by more than L − D (its w+1
   row leaves `S_w` alone); an agent that misses the close (its statement

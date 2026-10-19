@@ -12,7 +12,8 @@
 //!   result applied with a time at or past `B_w`, the window's boundary.
 //!   A result timed t, applied after one timed p (the agent's batch-time
 //!   mark), records `cut(w)` = its version − 1 for every w with
-//!   p < `B_w` ≤ t, once the agent's record names a space;
+//!   p < `B_w` ≤ t, once the agent's record names a space, at most the
+//!   newest `MAX_CUTS` of them;
 //! - **the cut's build**: the build whose target is `cut(w)`; it is done
 //!   once the replica holds the agent's root at `cut(w)`
 //!   ([`roots::cut_root`]), the root over the committed values the agent
@@ -35,6 +36,7 @@ use vos_node::store::{Fjall, Snapshot};
 use vos_tree::{Blake2b, Hash, Hasher, Leaf, value_hash};
 use vos_wire::abi::cap::Target;
 use vos_wire::apply::{Host, State, apply};
+use vos_wire::defaults::MAX_CUTS;
 use vos_wire::ids::{AgentId, InstanceId, MapId, RequestId, WorkflowId};
 use vos_wire::keys::{self, Transform};
 use vos_wire::records::{PendingRead, unstored, unversioned};
@@ -265,6 +267,12 @@ impl Replica {
     /// One build, as the node's builder runs one, in batches of `batch`
     /// keys: the version it built at, or `None` when none was due.
     pub fn build(&self, batch: usize) -> Option<u64> {
+        self.build_read(batch).map(|(version, _)| version)
+    }
+
+    /// One build, as [`Replica::build`] runs it: the version it built at,
+    /// and the dirty rows it read.
+    pub fn build_read(&self, batch: usize) -> Option<(u64, u64)> {
         let mut build = Build::start(&self.store, AGENT)
             .unwrap()?
             .in_batches_of(batch);
@@ -272,7 +280,7 @@ impl Replica {
         while let Some(change) = build.next_batch().unwrap() {
             smol::block_on(self.writer.commit(vec![change])).unwrap();
         }
-        Some(target)
+        Some((target, build.dirty_read()))
     }
 
     /// Builds one after another until none is due: the version each built
@@ -409,22 +417,28 @@ impl History {
 
     /// The cuts the agent must have recorded through `version`: each window
     /// whose boundary a result crossed, after the agent's record named a
-    /// space, at the version before that result.
+    /// space, at the version before that result; of a result crossing more
+    /// than `MAX_CUTS` boundaries, the newest `MAX_CUTS` alone.
     pub fn cuts(&self, version: u64) -> BTreeMap<u64, u64> {
         let mut cuts = BTreeMap::new();
         let mut spaced = false;
         let mut mark = 0;
         for (at, entry) in (1..=version).zip(&self.entries) {
             if spaced {
+                let mut crossed = Vec::new();
                 let mut window = CLOCK.window(mark).map_or(0, |window| window);
                 while let Some(boundary) = CLOCK.boundary(window) {
                     if boundary > entry.time {
                         break;
                     }
                     if boundary > mark {
-                        cuts.insert(window, at - 1);
+                        crossed.push(window);
                     }
                     window += 1;
+                }
+                let skipped = crossed.len().saturating_sub(MAX_CUTS as usize);
+                for window in &crossed[skipped..] {
+                    cuts.insert(*window, at - 1);
                 }
             }
             spaced |= entry.writes.iter().any(|write| {

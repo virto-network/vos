@@ -5,10 +5,11 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use smol::future::FutureExt;
+use vos_wire::Encode;
 use vos_wire::batch::{Batch, Work};
 use vos_wire::keys;
 use vos_wire::records::unstored;
-use vos_wire::result::{Step, WorkResult, Write as StateWrite};
+use vos_wire::result::{Step, WorkResult, Write as StateWrite, split_output};
 
 use super::{Ended, Leader, is_due, leads};
 use crate::blobs::{Held, Keep, blob_ref};
@@ -20,13 +21,15 @@ use crate::stats::Histogram;
 use crate::store::{BlobRef, EntryKind, LARGE_RESULT, LogEntry, Snapshot};
 
 impl Leader {
-    /// Refine `batch`, dry-run accumulate on the same state, propose the
-    /// result, and wait until this replica applied it.
+    /// Refine `batch`, or take `marker`, a `Cut` marker, as its result
+    /// unrefined; dry-run accumulate on the same state, propose the result,
+    /// and wait until this replica applied it.
     pub(super) async fn execute(
         &mut self,
         snapshot: Arc<Snapshot>,
         batch: Batch,
         blobs: Vec<BlobRef>,
+        marker: Option<WorkResult>,
     ) -> Result<Ended, Fault> {
         let id = self.id;
         let started = Instant::now();
@@ -34,9 +37,15 @@ impl Leader {
         let stats = &self.inner.stats;
         stats.batch_inputs.record(inputs);
         let work = Arc::new(Work::Batch(batch));
-        let (output, refine_gas) = self
-            .refine(Arc::clone(&snapshot), Arc::clone(&work))
-            .await?;
+        let (output, refine_gas) = match marker {
+            Some(marker) => (marker.encode(), 0),
+            None => {
+                let (output, gas) = self
+                    .refine(Arc::clone(&snapshot), Arc::clone(&work))
+                    .await?;
+                (self.with_request(&snapshot, output)?, gas)
+            }
+        };
         let result: WorkResult = pvm::decode(&output)?;
         // The inputs' steps' gas: a workflow's due step is no input's.
         let step_gas: u64 = result
@@ -157,6 +166,22 @@ impl Leader {
             Some(true) => Ok(Ended::Done(result)),
             _ => Ok(Ended::Skipped),
         }
+    }
+
+    /// `output`, a refine's, with the step a test's hook adds to its
+    /// result, if it adds one ([`Leader::requested`]).
+    fn with_request(&self, snapshot: &Snapshot, output: Vec<u8>) -> Result<Vec<u8>, Fault> {
+        let (mut result, pages) = split_output(&output)
+            .ok_or_else(|| Fault::Agent("the refine's output does not decode".into()))?;
+        let Some(step) = self.requested(snapshot, result.time)? else {
+            return Ok(output);
+        };
+        result.steps.push(step);
+        let mut output = result.encode();
+        if !pages.is_empty() {
+            pages.encode_to(&mut output);
+        }
+        Ok(output)
     }
 
     /// Refine `work`, a batch's, on an executor, unless the refine hook

@@ -10,12 +10,16 @@
 //! - **a cut's build and its proofs:** from the commit that records a cut
 //!   to the commit that marks it built, the build of the writes since the
 //!   last complete build and the proofs of 100 pending requests of 16 rows
-//!   each. Gate: at most 1 s on a 1M-row agent.
+//!   each. Gate: at most 1 s on a 1M-row agent;
 //!
-//! `cargo bench -p vos-node --features cuts --bench cuts -- <keys> [writes]`:
-//! a map of `keys` keys (1,000,000), built; `writes` committed writes
-//! (20,000, a second's at the builder's rate) applied before the cut and
-//! built by it.
+//!   The ratio to the bench's own cost with no cut pending is printed
+//!   beside it, the reading that holds on another machine;
+//! - its proofs' part, generated again from the tree at the cut, apart.
+//!
+//! `cargo bench -p vos-node --bench cuts -- <keys> [writes]`: a map of
+//! `keys` keys (1,000,000), built; `writes` committed writes (10,000, the
+//! most one build batch takes, the backlog a builder keeping up holds at a
+//! cut) applied before the cut and built by it.
 
 use std::time::{Duration, Instant};
 
@@ -83,7 +87,7 @@ impl Agent {
 fn main() {
     let args = support::args();
     let keys: u64 = args.first().map_or(1_000_000, |keys| keys.parse().unwrap());
-    let before_cut: u64 = args.get(1).map_or(20_000, |writes| writes.parse().unwrap());
+    let before_cut: u64 = args.get(1).map_or(10_000, |writes| writes.parse().unwrap());
     let dir = support::data_dir("cuts-bench");
     let mut agent = Agent {
         replica: Replica::open(&dir),
@@ -141,8 +145,9 @@ fn main() {
     );
     let with_cut = ACCUMULATE_US + pending_cut;
     println!(
-        "apply path: a committed write {none:.2} µs with no cut pending, {pending_cut:.2} µs with one ({undone} undo rows); \
+        "apply path: a committed write {none:.2} µs with no cut pending, {pending_cut:.2} µs with one ({undone} undo rows, {:.2}×); \
          with accumulate's {ACCUMULATE_US} µs, {with_cut:.2} µs against the gate of {WRITE_GATE_US:.1} µs: {}",
+        pending_cut / none,
         if with_cut <= WRITE_GATE_US {
             "within"
         } else {
@@ -185,6 +190,21 @@ fn main() {
         builds += 1;
     }
     let took = started.elapsed();
+    // The proofs alone: each request's leaves and proof off the tree at
+    // the cut, which no build has moved since.
+    let snapshot = agent.replica.snapshot();
+    let tree = roots::AgentStore::open(&snapshot, AGENT).unwrap();
+    let proving = Instant::now();
+    for (_, (_, read)) in model::requests(&snapshot) {
+        for row in &read.rows {
+            vos_tree::NodeStore::leaf(&tree, row).unwrap();
+        }
+        vos_tree::BatchProof::generate(&tree, &read.rows).unwrap();
+    }
+    println!(
+        "the proofs alone, generated again from the tree at the cut: {:.1} ms",
+        proving.elapsed().as_secs_f64() * 1e3
+    );
     println!(
         "a cut's build and {REQUESTS} proofs of {ROWS} rows on {keys} keys, {before_cut} writes before it: {:.0} ms in {builds} builds, against the gate of {} ms: {}",
         took.as_secs_f64() * 1e3,

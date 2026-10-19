@@ -16,7 +16,13 @@
 //! on another state version, timed before the agent's latest, or holding
 //! a new session whose creation time is far from its own or past a cap,
 //! applies nothing at all: refine refuses such a session, so the result
-//! was not refined on this state as it says.
+//! was not refined on this state as it says. Nor does one applied to an
+//! agent whose record (its target, space and clock, which its first
+//! install writes together) is stored in part: the state is corrupt.
+//!
+//! In an agent of a space, a result records the cut of each window whose
+//! boundary its time crosses ([`cut_windows`]): `cut(w)`, the state version
+//! before it ([`keys::cut`]).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -26,6 +32,7 @@ use crate::keys::Due;
 use crate::records::{SessionMark, stored, stored_versioned, unstored};
 use crate::result::{InputRef, Page, Run, Step, WorkResult};
 use crate::{Decode, Encode, defaults, expiry, keys};
+use crate::{SpaceId, WindowClock};
 
 /// The agent's rows as apply reads and writes them, each as stored.
 pub trait State {
@@ -82,6 +89,10 @@ impl Apply<'_> {
         if result.time < latest || stale(result) || !self.within_caps(result) {
             return false;
         }
+        // Read before the steps: the install that writes it cuts nothing.
+        let Some(clock) = self.record() else {
+            return false;
+        };
         if result.time > latest {
             self.put(&keys::batch_time(), &result.time.encode());
         }
@@ -105,8 +116,33 @@ impl Apply<'_> {
         if committed && let Host::Vos { .. } = self.host {
             self.put(&keys::seed(next), &result.seed);
         }
+        if let Some((first, last)) =
+            clock.and_then(|clock| cut_windows(&clock, latest, result.time))
+        {
+            for window in first..=last {
+                self.put(&keys::cut(window), &version.encode());
+            }
+        }
         self.put(&keys::version(), &next.encode());
         true
+    }
+
+    /// The clock of the agent's space, `Some(None)` for an agent of no
+    /// space or none yet; `None` when its record is stored in part, or does
+    /// not decode.
+    fn record(&mut self) -> Option<Option<WindowClock>> {
+        let rows = [keys::target(), keys::space(), keys::clock()].map(|key| self.state.read(&key));
+        match rows {
+            [None, None, None] => Some(None),
+            [Some(target), Some(space), Some(clock)] => {
+                let value = |bytes: &[u8]| unstored(bytes).map(<[u8]>::to_vec);
+                crate::abi::cap::Target::decode_exact(&value(&target)?)?;
+                let space = SpaceId::decode_exact(&value(&space)?)?;
+                let clock = WindowClock::decode_exact(&value(&clock)?)?;
+                Some((space != SpaceId::NONE).then_some(clock))
+            }
+            _ => None,
+        }
     }
 
     /// A step's session, created when the step is its first, at `time`.
@@ -302,6 +338,19 @@ impl Apply<'_> {
             (Some(hash), Host::Jam) => self.put(&row, &hash),
         }
     }
+}
+
+/// The windows a result timed `time` cuts, after one timed `mark`, the
+/// agent's batch-time mark, on `clock`: each w with `mark < B_w ≤ time`, at
+/// most the newest [`defaults::MAX_CUTS`] of them; the first and the last,
+/// or none.
+pub fn cut_windows(clock: &WindowClock, mark: u64, time: u64) -> Option<(u64, u64)> {
+    // The last: the window before the one holding `time`.
+    let last = clock.window(time)?.checked_sub(1)?;
+    // The first: the window holding `mark`, whose boundary is past it.
+    let first = clock.window(mark).unwrap_or(0);
+    let first = first.max(last.saturating_sub(defaults::MAX_CUTS - 1));
+    (first <= last).then_some((first, last))
 }
 
 /// The sessions `result`'s ran steps name whole: those it creates, each as

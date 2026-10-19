@@ -28,6 +28,10 @@
 //! by a crash or a moved epoch, leaves every row it wrote either matching or
 //! under a key still dirty, and the next build, at a later version, rewrites
 //! what changed.
+//!
+//! In an agent of a space a build runs at the earliest window cut pending
+//! instead, and the commit that finishes it keeps the root and the pending
+//! requests' proofs there ([`cut_root`], [`cut_proof`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
@@ -44,6 +48,10 @@ use crate::group::Shared;
 use crate::node::Inner;
 use crate::storage::Change;
 use crate::store::{Fjall, Snapshot};
+
+mod cuts;
+
+pub use cuts::{CutProof, ReadRow, cut_proof, cut_root, undo};
 
 /// The most distinct keys one batch rebuilds.
 pub(crate) const BATCH: usize = 10_000;
@@ -253,59 +261,6 @@ pub fn rows_match_tree(snapshot: &Snapshot, agent: AgentId) -> Result<bool, Erro
     Ok(stored(keys::tree_nodes())? == nodes && stored(keys::tree_leaves())? == leaves)
 }
 
-/// A row a request reads, by its full key, with its leaf's salt and bare
-/// value, or `None` when absent: as `Served` carries it.
-pub type ReadRow = (Vec<u8>, Option<([u8; 16], Vec<u8>)>);
-
-/// What every replica persists for a pending request once its window's cut
-/// is built ([`keys::cut_proof`]): the window, the cut's version and the
-/// agent's root there, and each row the request reads, by its full key in
-/// the request's order, with its leaf's salt and bare value at the cut
-/// (`None`: absent), and one [`BatchProof`] of them against that root, as
-/// encoded. Its bytes are the same on every replica.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct CutProof {
-    pub window: u64,
-    pub version: u64,
-    pub agent_root: Hash,
-    pub rows: Vec<ReadRow>,
-    pub rows_proof: Vec<u8>,
-}
-
-/// The node-local rows the node's apply commits beside `writes`, the rows
-/// accumulate made of a work result, as `snapshot` holds the agent's
-/// state before them: for each committed row `writes` overwrite or delete
-/// whose current version is at or before a cut whose build is pending,
-/// its stored bytes as [`keys::undo`] of that window. A cut `writes`
-/// record themselves counts. Never written by the agent's apply: whether
-/// a build is pending is the replica's own.
-pub fn undo(snapshot: &Snapshot, agent: AgentId, writes: &[Write]) -> Result<Vec<Write>, Error> {
-    let _ = (snapshot, agent, writes);
-    todo!("6.12: the node's undo rows")
-}
-
-/// The agent's root at the window `window`'s cut and the cut's version,
-/// once the cut's build is done, while it is among the two latest cuts.
-pub fn cut_root(
-    snapshot: &Snapshot,
-    agent: AgentId,
-    window: u64,
-) -> Result<Option<(Hash, u64)>, Error> {
-    let _ = (snapshot, agent, window);
-    todo!("6.12: the root at a cut")
-}
-
-/// The rows and proof this replica persisted for `request` at its window's
-/// cut, once that cut is built.
-pub fn cut_proof(
-    snapshot: &Snapshot,
-    agent: AgentId,
-    request: vos_wire::ids::RequestId,
-) -> Result<Option<CutProof>, Error> {
-    let _ = (snapshot, agent, request);
-    todo!("6.12: a pending request's proof")
-}
-
 /// A committed map's latest root, the state version it holds, and a proof
 /// of some keys against it.
 #[derive(Clone, Debug)]
@@ -381,8 +336,14 @@ impl<'a> AgentStore<'a> {
         }
     }
 
+    /// A row as this store's writes leave it, else as the snapshot holds
+    /// it.
     fn read<T: Decode>(&self, key: &[u8], what: &'static str) -> Result<Option<T>, Error> {
-        let Some(bytes) = self.snapshot.get(self.agent, key)? else {
+        let bytes = match self.writes.get(key) {
+            Some(written) => written.clone(),
+            None => self.snapshot.get(self.agent, key)?,
+        };
+        let Some(bytes) = bytes else {
             return Ok(None);
         };
         T::decode_exact(&bytes)
@@ -437,55 +398,80 @@ impl NodeStore for AgentStore<'_> {
 /// Committed rows' keys to rebuild, sorted.
 type Keys = BTreeSet<Vec<u8>>;
 
-/// A build of the agent's root at its state version, a batch at a time.
+/// A build of the agent's root, a batch at a time: at its state version,
+/// or at the earliest cut pending, whichever comes first.
 pub struct Build {
     store: Fjall,
     agent: AgentId,
     epoch: u8,
+    /// The version it builds at.
     version: u64,
-    /// The agent's state at `version`.
+    /// The cut it builds, when it builds one: at its version.
+    cut: Option<cuts::Cut>,
+    /// The agent's state, as the build started.
     at: Snapshot,
     batch: usize,
     /// The last dirty row read.
     cursor: Vec<u8>,
+    /// Where the dirty rows past `version` start.
+    bound: Vec<u8>,
     /// The seeds through this version are deleted.
     seeds_through: u64,
     /// How many dirty rows were read.
     read: u64,
     /// The tree's top as the build last wrote it, once it has.
     top: Option<Option<Child>>,
+    /// Undo rows of cuts already built, deleted by the first batch.
+    orphans: Vec<Vec<u8>>,
     done: bool,
 }
 
 impl Build {
-    /// A build of `agent`'s root at the state version `store` holds now,
-    /// or `None` when no write waits for one.
+    /// A build of `agent`'s root at the earliest cut pending, or else at
+    /// the state version `store` holds now; `None` when nothing waits for
+    /// one: no committed write, no cut and no orphaned undo row.
     pub fn start(store: &Fjall, agent: AgentId) -> Result<Option<Self>, Error> {
         let at = store.snapshot();
         let from = built(&at, agent)?;
-        let pending = |prefix: Vec<u8>, after: Vec<u8>| -> Result<bool, Error> {
-            Ok(at
-                .scan(agent, &prefix, Some(&after))
-                .next()
-                .transpose()?
-                .is_some())
+        let cut = cuts::pending(&at, agent)?.first().copied();
+        let version = match cut {
+            Some(cut) if cut.version < from => return Err(Error::Corrupt("a cut behind the tree")),
+            Some(cut) => cut.version,
+            None => state_version(&at, agent)?,
         };
-        if !pending(keys::dirty_prefix(), keys::dirty_from(from + 1))?
-            && !pending(keys::seed_prefix(), keys::seed(from))?
-        {
+        let orphans = cuts::orphans(&at, agent)?;
+        let bound = keys::dirty_from(version + 1);
+        let dirty = at
+            .scan(
+                agent,
+                &keys::dirty_prefix(),
+                Some(&keys::dirty_from(from + 1)),
+            )
+            .next()
+            .transpose()?
+            .is_some_and(|(key, _)| key < bound);
+        let seeds = at
+            .scan(agent, &keys::seed_prefix(), Some(&keys::seed(from)))
+            .next()
+            .transpose()?
+            .is_some();
+        if !dirty && !seeds && cut.is_none() && orphans.is_empty() {
             return Ok(None);
         }
         Ok(Some(Self {
             store: store.clone(),
             agent,
             epoch: at.epoch(agent)?,
-            version: state_version(&at, agent)?,
+            version,
+            cut,
             at,
             batch: BATCH,
             cursor: keys::dirty_from(from + 1),
+            bound,
             seeds_through: from,
             read: 0,
             top: None,
+            orphans,
             done: false,
         }))
     }
@@ -524,11 +510,13 @@ impl Build {
             return Err(Error::Moved);
         }
         let mut seeds = HashMap::new();
-        let mut writes = BTreeMap::new();
+        let before = root_row(&fresh, self.agent)?;
+        let mut tree = AgentStore::new(
+            &fresh,
+            self.agent,
+            before.as_ref().and_then(|row| row.top.clone()),
+        );
         if !batch.is_empty() {
-            let before = root_row(&fresh, self.agent)?;
-            let top = before.as_ref().and_then(|row| row.top.clone());
-            let mut tree = AgentStore::new(&fresh, self.agent, top);
             let leaves = batch
                 .into_iter()
                 .map(|key| {
@@ -538,16 +526,19 @@ impl Build {
                 .collect::<Result<Vec<_>, Error>>()?;
             vos_tree::update(&Blake2b, &mut tree, &leaves)?;
             // Until the last batch, the root stays the last complete build's.
-            let root = before.map_or_else(|| empty_root(&Blake2b), |row| row.root);
+            let root = before
+                .as_ref()
+                .map_or_else(|| empty_root(&Blake2b), |row| row.root);
             let row = RootRow {
                 top: tree.top.clone(),
                 root,
             };
-            writes.extend(tree.writes);
-            writes.insert(keys::tree_root(), Some(row.encode()));
-            self.top = Some(tree.top);
+            tree.writes.insert(keys::tree_root(), Some(row.encode()));
+            self.top = Some(tree.top.clone());
         }
+        let mut writes = BTreeMap::new();
         writes.extend(rows.into_iter().map(|row| (row, None)));
+        writes.extend(self.orphans.drain(..).map(|row| (row, None)));
         // The seeds of the versions whose dirty rows are all read. A batch
         // before the last keeps its cursor version's seed even once that
         // version's rows are read: an interrupted build then always leaves
@@ -570,8 +561,9 @@ impl Build {
         }
         self.seeds_through = self.seeds_through.max(through);
         if last {
-            self.finish(&fresh, &mut writes)?;
+            self.finish(&fresh, before, &mut tree, &mut writes)?;
         }
+        writes.extend(tree.writes);
         Ok(Some(Change::Tree {
             agent: self.agent,
             epoch: self.epoch,
@@ -582,40 +574,53 @@ impl Build {
         }))
     }
 
-    /// The last batch's root row, complete at the build's version: the
-    /// tree as this build left it, or as an earlier build cut short left
-    /// it, which has no write past it, or this build would have touched
-    /// it. Then the version the tree is built through.
+    /// The last batch's writes: the root row, complete at the build's
+    /// version, from the tree as this build left it, or as an earlier
+    /// build cut short left it, which has no write past it, or this build
+    /// would have touched it; the version the tree is built through; and,
+    /// building a cut, what finishes it ([`cuts::finish`]).
     fn finish(
         &mut self,
         fresh: &Snapshot,
+        before: Option<RootRow>,
+        tree: &mut AgentStore<'_>,
         writes: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     ) -> Result<(), Error> {
         let top = match self.top.take() {
             Some(top) => Some(top),
-            None => root_row(fresh, self.agent)?
-                .filter(RootRow::building)
-                .map(|row| row.top),
+            None => before.filter(RootRow::building).map(|row| row.top),
         };
         if let Some(top) = top {
             let row = RootRow::complete(top);
-            writes.insert(keys::tree_root(), Some(row.encode()));
+            tree.writes.insert(keys::tree_root(), Some(row.encode()));
         }
         writes.insert(keys::built(), Some(self.version.encode()));
+        if let Some(cut) = self.cut {
+            let root = tree
+                .top
+                .as_ref()
+                .map_or_else(|| empty_root(&Blake2b), |top| *top.hash());
+            cuts::finish([&self.at, fresh], self.agent, cut, tree, root, writes)?;
+        }
         self.done = true;
         Ok(())
     }
 
     /// The next keys to rebuild, sorted, and the dirty rows read for them:
-    /// rows read until `batch` keys, or as many rows as [`ROWS_PER_KEY`]
-    /// allows them, or none remain; and whether none remains.
+    /// rows through the build's version read until `batch` keys, or as
+    /// many rows as [`ROWS_PER_KEY`] allows them, or none remain; and
+    /// whether none remains.
     fn read_batch(&mut self) -> Result<(Keys, Vec<Vec<u8>>, bool), Error> {
         let mut batch = Keys::new();
         let mut found = 0;
         let mut rows = Vec::new();
         let prefix = keys::dirty_prefix();
         let after = self.cursor.clone();
-        let mut scan = self.at.scan(self.agent, &prefix, Some(&after));
+        let bound = &self.bound;
+        let mut scan = self
+            .at
+            .scan(self.agent, &prefix, Some(&after))
+            .take_while(|row| row.as_ref().is_ok_and(|(key, _)| key < bound) || row.is_err());
         let last = loop {
             if found == self.batch || rows.len() == self.batch * ROWS_PER_KEY {
                 break scan.next().is_none();
@@ -637,9 +642,14 @@ impl Build {
 
     /// The leaf of the committed row `key` at the build's version: its
     /// bare value's commitment under the salt of the version that wrote it,
-    /// or `None` if deleted.
+    /// or `None` if absent there. Building a cut, the value at the cut
+    /// ([`cuts::at_cut`]).
     fn leaf(&self, seeds: &mut HashMap<u64, [u8; 32]>, key: &[u8]) -> Result<Option<Leaf>, Error> {
-        let Some(bytes) = self.at.get(self.agent, key)? else {
+        let bytes = match self.cut {
+            Some(cut) => cuts::at_cut(&self.at, self.agent, cut, key)?,
+            None => self.at.get(self.agent, key)?,
+        };
+        let Some(bytes) = bytes else {
             return Ok(None);
         };
         let (version, value) = unstored(&bytes)
@@ -703,28 +713,32 @@ pub(crate) async fn build(inner: Arc<Inner>, shared: Arc<Shared>) {
     }
 }
 
+/// Builds one after another until none is due: a cut's, the next cut's,
+/// then the latest version's.
 async fn run(inner: &Inner, shared: &Shared) -> Result<(), Error> {
     let agent = shared.agent;
-    let Some(mut build) = Build::start(&inner.store, agent)? else {
-        return Ok(());
-    };
     while !shared.state().stopped {
-        let (returned, change) = inner
-            .offload(move || {
-                let change = build.next_batch();
-                (build, change)
-            })
-            .await
-            .ok_or_else(|| Error::Halted("the executors stopped".into()))?;
-        build = returned;
-        let Some(change) = change? else {
+        let Some(mut build) = Build::start(&inner.store, agent)? else {
             return Ok(());
         };
-        if let Err(refusal) = inner.storage.commit(vec![change]).await {
-            return Err(match inner.store.snapshot().epoch(agent) {
-                Ok(epoch) if epoch != build.epoch() => Error::Moved,
-                _ => Error::Halted(refusal),
-            });
+        while !shared.state().stopped {
+            let (returned, change) = inner
+                .offload(move || {
+                    let change = build.next_batch();
+                    (build, change)
+                })
+                .await
+                .ok_or_else(|| Error::Halted("the executors stopped".into()))?;
+            build = returned;
+            let Some(change) = change? else {
+                break;
+            };
+            if let Err(refusal) = inner.storage.commit(vec![change]).await {
+                return Err(match inner.store.snapshot().epoch(agent) {
+                    Ok(epoch) if epoch != build.epoch() => Error::Moved,
+                    _ => Error::Halted(refusal),
+                });
+            }
         }
     }
     Ok(())

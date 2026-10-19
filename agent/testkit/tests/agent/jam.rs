@@ -28,7 +28,6 @@ use vos_wire::result::{Outcome, Outgoing, PAGE, Step, WorkResult, digest, split_
 use vos_wire::{Decode, Encode, defaults};
 
 mod agreement;
-#[cfg(feature = "cuts")]
 mod cuts;
 mod driven;
 
@@ -53,7 +52,6 @@ struct Ran {
     exported: usize,
     /// The keys its witness opens, and the rows of its scanned ranges.
     witnessed: usize,
-    #[cfg_attr(not(feature = "cuts"), allow(dead_code))]
     witness: WitnessKeys,
     scanned: usize,
     /// The batch's inputs, its budget, and the package's own work as the

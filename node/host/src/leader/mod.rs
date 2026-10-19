@@ -6,6 +6,7 @@
 //! receiver finds this agent behind it.
 
 mod batch;
+mod cut;
 mod execute;
 mod outbox;
 mod settle;
@@ -124,6 +125,8 @@ enum Taken {
     Inputs(Vec<Pending>),
     /// A sweep due: a batch with no inputs, which sweeps.
     Sweep,
+    /// A `Cut` marker due: an empty result, unrefined.
+    Marker,
     /// No input: the windows due go again.
     Rounds,
 }
@@ -182,6 +185,12 @@ impl Leader {
             let pending = match taken {
                 Taken::Inputs(pending) => Some(pending),
                 Taken::Sweep => Some(Vec::new()),
+                Taken::Marker => {
+                    if !self.marker().await {
+                        return false;
+                    }
+                    None
+                }
                 Taken::Rounds => None,
             };
             match pending {
@@ -272,6 +281,12 @@ impl Leader {
                 smol::future::yield_now().await;
                 return Some(Taken::Sweep);
             }
+            // A window's boundary passed with no entry past it: a marker.
+            let cut = self.cut_wait();
+            if cut == Some(Duration::ZERO) {
+                smol::future::yield_now().await;
+                return Some(Taken::Marker);
+            }
             // A receiver found this agent behind it: windows go again.
             if behind {
                 return Some(Taken::Rounds);
@@ -296,7 +311,7 @@ impl Leader {
                 Woke::Round
             };
             let recheck = async {
-                match sweep {
+                match [sweep, cut].into_iter().flatten().min() {
                     Some(wait) => smol::Timer::after(wait).await,
                     None => std::future::pending().await,
                 };

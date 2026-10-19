@@ -159,6 +159,8 @@ impl Alongside for Cuts {
     }
 
     fn run(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])], done: &AtomicBool) {
+        // One request a window, named by it: every batch of the window
+        // records the same row again, which changes nothing.
         let asks: Arc<Asks> = Arc::new(|_: AgentId, time: u64| {
             let window = CLOCK.window(time)?;
             Some((

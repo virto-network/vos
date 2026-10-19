@@ -147,9 +147,9 @@ fn check(round: Round, last: &mut u64) -> bool {
         "round {round}: the cuts"
     );
     let requests = history.requests(version);
+    let recorded = cuts(&before);
     let between = requests.iter().any(|(id, (window, _))| {
-        cuts(&before).contains_key(window)
-            && roots::cut_proof(&before, AGENT, *id).unwrap().is_none()
+        recorded.contains_key(window) && roots::cut_proof(&before, AGENT, *id).unwrap().is_none()
     });
     drop(before);
     replica.build_all(BATCH);

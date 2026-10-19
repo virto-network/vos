@@ -207,7 +207,8 @@ pub trait Hooks: Send + Sync {
     /// a `Cut` marker, which stays empty: a pending request of the window
     /// `time` falls in, which the batch's result then records
     /// ([`vos_wire::keys::request`]) as a workflow's step asking for a read
-    /// at the cut does. A test's stand-in for that step.
+    /// at the cut does. A test's stand-in for that step, which goes once
+    /// workflows ask for themselves.
     fn request_at_cut(
         &self,
         agent: AgentId,

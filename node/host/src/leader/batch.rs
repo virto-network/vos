@@ -93,7 +93,7 @@ impl Leader {
             })
             .collect();
         self.inner.stats.prepare.took(taken.elapsed());
-        match self.execute(snapshot, batch, blobs).await {
+        match self.execute(snapshot, batch, blobs, None).await {
             Ok(Ended::Done(result)) => {
                 self.skipped = false;
                 self.max_inputs = self.inner.settings.max_inputs;
@@ -220,7 +220,7 @@ impl Leader {
     /// A batch's time: the node's clock, held at the agent's time, `floor`,
     /// while the clock trails it. Leadership stays: every replica would
     /// trail an agent a fast clock once led.
-    fn time(&mut self, floor: u64) -> u64 {
+    pub(super) fn time(&mut self, floor: u64) -> u64 {
         let clock = (self.inner.clock)();
         let trailing = floor > clock.saturating_add(CLOCK_BOUND);
         if trailing && !self.trailing {
@@ -241,7 +241,7 @@ impl Leader {
 
     /// A batch the node failed: put it back whole and wait before the next
     /// try. No input is to blame, so none is dropped.
-    async fn retry(&mut self, pending: Vec<Pending>, fault: Fault) {
+    pub(super) async fn retry(&mut self, pending: Vec<Pending>, fault: Fault) {
         let wait = self.backoff.next();
         tracing::error!(
             agent = self.id.0,

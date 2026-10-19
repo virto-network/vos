@@ -56,7 +56,6 @@ impl Cluster {
 
     /// Nodes 1..=count on the hub, as [`Cluster::tuned`] makes them, of a
     /// space founded with `clock`, or (`None`) of no space.
-    #[cfg_attr(not(feature = "cuts"), allow(dead_code))]
     pub fn in_space(
         count: u8,
         clock: Option<WindowClock>,

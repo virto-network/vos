@@ -18,6 +18,10 @@ pub const SWEEP_LIMIT: usize = 32;
 pub const MAX_SESSIONS: u64 = 1 << 16;
 /// The most sessions one key holds at an agent.
 pub const MAX_KEY_SESSIONS: u64 = 64;
+/// The most window cuts one work result records: a result whose time
+/// crosses more boundaries cuts the newest this many windows, and the
+/// older ones are never cut. A consensus constant, on every host.
+pub const MAX_CUTS: u64 = 32;
 
 // An expired session's batch time is past its t0 plus the skew: it was
 // created within the skew of t0, so a collected session can never be

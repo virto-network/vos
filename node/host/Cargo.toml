@@ -9,9 +9,6 @@ description = "The VOS node host: storage, the leader loops and ingress."
 # Faults a test injects into a running node (`vos_node::faults`): never
 # in a production build.
 faults = []
-# The acceptance tests and gate benches of window cuts, written ahead of
-# the cuts themselves: test-only, and gone once they pass.
-cuts = []
 
 [dependencies]
 fjall = { workspace = true }
@@ -73,7 +70,6 @@ harness = false
 [[test]]
 name = "cut_crash"
 harness = false
-required-features = ["cuts"]
 
 [[bench]]
 name = "acceptance"
@@ -106,4 +102,3 @@ harness = false
 [[bench]]
 name = "cuts"
 harness = false
-required-features = ["cuts"]
