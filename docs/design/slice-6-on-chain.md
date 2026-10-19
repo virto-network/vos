@@ -638,7 +638,8 @@ Throwaway code on local branches; each with a gate and a fallback.
   blinding.
 - **Tests:** every unmasked format's pinned bits unchanged (28 at 146 /
   82.60); 39 at 146 / 82 (82.69–82.70); the least-query grid pinned for
-  A and B; the masked wrap needs affine batching (by powers: 76.14).
+  A and B; the masked wrap needs affine batching (by powers: 76.98, at
+  the 538 batched values 6.2 counts).
 - **Review (Fable), what it must check** (spike 6b §4):
   - DIVERGENCE-012's citation and the affine premise in pin B's order;
   - DIVERGENCE-011's round list `[3,3,3,2]` at log k = 17 against the
@@ -648,7 +649,7 @@ Throwaway code on local branches; each with a gate and a fallback.
   - R3 met by an 8-column R (pin C), with R's 8 sampled values in the
     shape (the count is expected unchanged: the query term binds).
 - **Fallback, if DIVERGENCE-012 falls:** a batching-phase PoW of at least
-  4 bits at blowup 32 (a new number), or blowup 8 with 43 queries (about
+  4 bits at blowup 32 (a new number), or blowup 8 with 41 queries (about
   2× verify).
 - **Estimate:** 0.5–1 week.
 
@@ -669,7 +670,10 @@ Throwaway code on local branches; each with a gate and a fallback.
     constraints, `qm31` 4, `h8` 8 [measured]);
   - a static check that only `MaskedEval` uses `BlindRelation`;
   - **R5 for slice 7, cheaply:** the same static degree audit over the 25
-    segment chips under (c);
+    segment chips under (c) [done: 5,177 constraints, none above 3]. What
+    slice 7's masked segments need beyond it (6.2's review): an
+    active-chip mask parameter on `MaskedComponents`, and a finalize hook
+    on `Body` if a chip stops finalizing in pairs;
   - the stale-fixture test: leaf, fold and wrap fixtures, `H_fold` and the
     program ids byte for byte;
   - **the masked reference shape from the built components:** the masked
@@ -677,10 +681,9 @@ Throwaway code on local branches; each with a gate and a fallback.
     layout (their columns, blinding columns, constraints, fractions and
     sampled values, R's 8 among them; k = 4N whole, j = 1), never through
     `framework_access`' split-subtracting helpers, equals
-    `MASKED_WRAP_REFERENCE` in every field but `sampled_values`, which is
-    at most the reference's (the reference counts every column at two
-    samples, R and the composition among them, where pin B samples those
-    once), and counts 82.69–82.70, as
+    `MASKED_WRAP_REFERENCE` field for field (`B` the values the DEEP
+    quotient batches, 538: a column sampled twice batches a third, its
+    periodicity value; `c` 3), and counts 82.69–82.70, as
     `the_reference_shapes_are_the_segment_airs` does for segments. A
     mismatch corrects the reference in this step, and 6.1's pin with it;
     6.4's check of the verifier's shape compares the same way.
@@ -697,6 +700,12 @@ Throwaway code on local branches; each with a gate and a fallback.
     `MaskLayout`, parallel `mask_columns`, `commit_salted` writing the salts
     straight into packed SIMD columns (spike 6a's 0.8 s a tree was the
     collect), pin B's order;
+  - **from 6.2's review:** the masking's pins (`MaskPins`' salt and `R`
+    columns, and `h`) on `Format` for a masked number (R6), `MASKED_WRAP_PINS`
+    read from it and `the_masked_reference_shape_is_the_built_wraps` its
+    guard; a provided `MaskedComponents::draw(channel) -> (Relations,
+    BlindRelation)` writing pin B's step 5 once; a prover-side extension
+    trait for `ComponentProver`;
   - R1 with pin C's bounded retry; R4's hedged RNG; R with 8 columns and
     no R3 check; the test seam;
   - `wrap::prove` for format 39 replacing `stwo::prover::prove` at
@@ -731,6 +740,12 @@ Throwaway code on local branches; each with a gate and a fallback.
     20), the samples against the sample points, the composition tree's
     columns, before any Stwo call; the spike's call to format 28's
     `check_shape` replaced by format 39's own;
+  - the proof's `log_sizes` checked equal to the format's pin (`[14, 15,
+    11]`) before `MaskedComponents::new`, which cannot; the salts, `R` and
+    `h` taken from the format (6.3), never from the proof;
+  - **the shape tied to the transcript:** `n_deep_values` of the
+    verifier's own sample points asserted equal to 538, the reference's
+    `B`;
   - **the trust boundary, named:** the two facts the masked verifier
     leaves to Stwo, each pinned by the format and tested: the tree widths
     that `verify_values` zips against (a proof of another width refused by
@@ -1487,7 +1502,7 @@ fees are the teammate's.
 | risk | gate | when |
 |---|---|---|
 | a forgery accepted by the recursion AIR forces a successor to format 32 and a re-pin everywhere | 6.8, from the first day, before any venue pins an id | M2 |
-| DIVERGENCE-012 falls, leaving the masked wrap under 80 proven bits (76.14 by powers) | 6.1's Fable review; fallback a batching-phase PoW ≥ 4 bits or blowup 8 with 43 queries | 6.1 |
+| DIVERGENCE-012 falls, leaving the masked wrap under 80 proven bits (76.98 by powers) | 6.1's Fable review; fallback a batching-phase PoW ≥ 4 bits or blowup 8 with 41 queries | 6.1 |
 | the zero-knowledge argument rests on R1, R2, R4 and the 8-column R; the statistics find only gross leaks | 6.6's gates with their power stated, and Fable's transcript review; the audit before value | 6.6 |
 | a column miscount leaves format 39's bits wrong | 6.2's shape from the built components | 6.2 |
 | the masked prover's time (×2.6–2.9, Blake2b Merkle at lifting 22) | 6.3's gate; packed salts (−2 s [est]); the wrap is about 2–5% of a window statement | 6.3 |

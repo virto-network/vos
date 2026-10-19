@@ -508,7 +508,10 @@ taken, 6.0d's docs applied, and the plan carries their results.
   spike's 4-column R to the batch by powers (`log2(963/955)` = 0.012
   bits). The affine count does not see them. The two-sample convention
   overcounts R and the composition, which pin B samples once each:
-  `sampled_values` is an upper bound on the built batch.
+  `sampled_values` is an upper bound on the built batch. **Superseded at
+  6.2's fold:** the reference counts the batch exactly, 538 values, and
+  the caps are **76.98** and **74.48**, blowup 8 reaching 80 at 41
+  queries.
 
 **Docs:** `pvm/proof/SECURITY.md` (39's row, 40 among the retired, the
 masked count and what it rests on, DIVERGENCE-011's round list `[3, 3, 3,
@@ -627,3 +630,69 @@ recair-air module building no_std for thumbv7em and wasm32.
 
 **Commits:** `13ac14c5` the split; `d1b646d6` `masked.rs` and its tests;
 this record.
+
+**Review:** Fable ACCEPT, no soundness defect, the masked transcript's
+geometry re-derived independently (π(z) as the composition's point, the
+lifted reads, the widths, the 28 twice-sampled columns); Opus, clean but
+for quality items. Folded:
+- **Fable 1 (medium, count), the note above, fixed:** `security_shape`
+  counts `B` as the values the DEEP quotient batches
+  (`deep_values_of_column`: the fork draws one coefficient a value, and a
+  twice-sampled column batches its periodicity value).
+  `SEGMENT_REFERENCE.sampled_values` 9,020 → **10,016** (the device
+  reference inherits it), held by `the_reference_shapes_are_the_segment_airs`.
+  36 counts 57.485 and 37 62.104 [model], 35 62.857, every pinned count
+  and floor unchanged; 32's parameters on the segment shape count 62.74
+  (was 62.80), their batching term binding (`proving.md`'s two sentences
+  corrected). `MASKED_WRAP_REFERENCE` takes the exact batch, **538**
+  (`(57 + 373 + 40 + 4 + 8) + 2·(16 + 3·4)`), where 6.1 bounded it by 964:
+  the test now holds the built shape equal to the reference field for
+  field. 6.1's pin moves with it: by powers 39 caps at **76.98** at blowup
+  32 and **74.48** at blowup 64 [model] (still below 80; the fallback is a
+  batching-phase PoW of 4 bits at blowup 32, 6 at 64, or blowup 8 at **41**
+  queries, was 43). Updated in `format.rs`, `format_masked_tests.rs`,
+  `SECURITY.md` (a paragraph on `B`), the plan (6.1's test, the risk row,
+  6.2's test) and 6.1's entry above. The plan's 6.4 asserts
+  `n_deep_values` of the verifier's samples equal to 538.
+- **Fable 2 (low):** `c` counted as `B` is: the most DEEP values of one
+  column, 3 for a twice-sampled column (its periodicity value an opening
+  at a third point); `security.rs` states it, and every reference with
+  previous-row reads (segment, leaf and fold, wrap, masked wrap,
+  credential) carries 3. No count moves at the second decimal.
+- **Fable 3 (low):** `each_evaluation_is_its_body_and_its_pairs` in
+  recair-air: each component's `evaluate` equals its `body()` and
+  `finalize_logup_in_pairs()` on a recording evaluator, constraint for
+  constraint and intermediate for intermediate (a dev-dependency on
+  constraint-framework's `prover` feature for the recording evaluator), so
+  `just check` holds the split, not only the fixtures.
+- **Fable 4 (low):** the masked audit reads each component's preprocessed
+  columns from an `InfoEvaluator` (and checks them equal to its list), as
+  R5 does; the audit's degree walk refuses any name that is neither a
+  column, an intermediate nor one of the recording evaluator's constants
+  (`claimed_sum`, `column_size`, `<relation>_z`, `<relation>_alpha<i>`).
+  The 25 chips pass it too.
+- **Fable 5 / Opus 3:** one `MASKED_COLUMN_EXPANSION = 1`;
+  `committed_log_sizes` and `air_log_size` read `MaskedComponent`'s bounds,
+  the preprocessed tree adds the constant: one rule in one place.
+- **Fable 6 (forward):** recorded in the plan: `MaskPins` and `h` on
+  `Format` (R6) and a provided `draw(channel) -> (Relations,
+  BlindRelation)` (6.3); the verifier checks `log_sizes` against the
+  format's pin before `new` (6.4); slice 7's active-chip mask and a
+  finalize hook on `Body` (6.2's R5 line).
+- **Fable 7 / Opus 1:** the rustfmt-bound source match dropped; the scan
+  for the blinding relation moved to `recair/tests/circuit/masked.rs`
+  (`only_the_masked_module_names_the_blinding_relation`, over
+  `recair-air/src` but `masked.rs`), one `sources()` walker shared with the
+  leaves-and-folds check.
+- **Opus 2:** R5 asserts its histogram, `[0, 23, 4395, 759]`.
+- **Opus 4, 5:** `Body: FrameworkEval + Sync`; `masked.rs`' module doc cites
+  `proving.md` §5, `masking-review.md` and the registry; the tests
+  `the_masked_trees_match_pin_a`, `the_sample_points_match_pin_b`.
+
+**Gates after the fold:** the stale-fixture test byte for byte; `just
+check` green (1,123 tests, 0 failed).
+
+**Commits of the fold:** `1ba943a1` the count; `81811bdc` the AIR and its tests;
+this record and the plan's edits.
+
+**6.2 accepted.**
