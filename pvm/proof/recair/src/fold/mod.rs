@@ -159,7 +159,7 @@ pub(crate) fn leaf_circuit_wires(program: &[Var]) -> impl Iterator<Item = [Var; 
 
 /// `Σ bits = 1` and, for each bit, `bit·(hash − candidate) = 0`: `hash` is
 /// the candidate the one set bit picks.
-pub(crate) fn assert_one_of<V: Value>(
+pub fn assert_one_of<V: Value>(
     context: &mut Context<V>,
     hash: [Var; 2],
     candidates: &[[Var; 2]],
