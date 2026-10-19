@@ -1433,6 +1433,13 @@ The fixtures unchanged.
 
 **Commit:** `d3a7beeb`.
 
+**The review** (Opus): ACCEPT, one Low, folded in `b353d8ba`: `Rebound`'s
+fields private, `Rebound::new` refusing (`None`) an evaluation not at its
+layout's log size and constraint bound, used by `WrapComponents::bind`
+and the `P2Only` test set; a test of the refusal.
+
+**6.6b accepted.**
+
 ## Step 6.7: panic-freedom by construction, and fuzzing in CI
 
 **The lints** (`vos-pvm-final-verifier`, `vos-statement`, `vos-anchor`):
