@@ -13,7 +13,8 @@
 //!   A result timed t, applied after one timed p (the agent's batch-time
 //!   mark), records `cut(w)` = its version − 1 for every w with
 //!   p < `B_w` ≤ t, once the agent's record names a space, at most the
-//!   newest `MAX_CUTS` of them;
+//!   newest `MAX_CUTS` of them; a recording whose first window is w
+//!   deletes those of every window before `w − CUT_KEEP`;
 //! - **the cut's build**: the build whose target is `cut(w)`; it is done
 //!   once the replica holds the agent's root at `cut(w)`
 //!   ([`roots::cut_root`]), the root over the committed values the agent
@@ -36,7 +37,7 @@ use vos_node::store::{Fjall, Snapshot};
 use vos_tree::{Blake2b, Hash, Hasher, Leaf, value_hash};
 use vos_wire::abi::cap::Target;
 use vos_wire::apply::{Host, State, apply};
-use vos_wire::defaults::MAX_CUTS;
+use vos_wire::defaults::{CUT_KEEP, MAX_CUTS};
 use vos_wire::ids::{AgentId, InstanceId, MapId, RequestId, WorkflowId};
 use vos_wire::keys::{self, Transform};
 use vos_wire::records::{PendingRead, unstored};
@@ -415,7 +416,8 @@ impl History {
     /// The cuts the agent must have recorded through `version`: each window
     /// whose boundary a result crossed, after the agent's record named a
     /// space, at the version before that result; of a result crossing more
-    /// than `MAX_CUTS` boundaries, the newest `MAX_CUTS` alone.
+    /// than `MAX_CUTS` boundaries, the newest `MAX_CUTS` alone; none of a
+    /// window more than `CUT_KEEP` before the first a later result cut.
     pub fn cuts(&self, version: u64) -> BTreeMap<u64, u64> {
         let mut cuts = BTreeMap::new();
         let mut spaced = false;
@@ -436,6 +438,9 @@ impl History {
                 let skipped = crossed.len().saturating_sub(MAX_CUTS as usize);
                 for window in &crossed[skipped..] {
                     cuts.insert(*window, at - 1);
+                }
+                if let Some(first) = crossed.get(skipped) {
+                    cuts.retain(|window, _| window + CUT_KEEP >= *first);
                 }
             }
             spaced |= entry.writes.iter().any(|write| {

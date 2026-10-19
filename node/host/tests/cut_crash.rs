@@ -149,7 +149,10 @@ fn check(round: Round, last: &mut u64) -> bool {
     let requests = history.requests(version);
     let recorded = cuts(&before);
     let between = requests.iter().any(|(id, (window, _))| {
-        recorded.contains_key(window) && roots::cut_proof(&before, AGENT, *id).unwrap().is_none()
+        recorded.contains_key(window)
+            && roots::cut_proof_at(&before, AGENT, *id, *window)
+                .unwrap()
+                .is_none()
     });
     drop(before);
     replica.build_all(BATCH);
@@ -173,7 +176,7 @@ fn check(round: Round, last: &mut u64) -> bool {
         let Some((_, cut)) = latest.iter().find(|(kept, _)| kept == window) else {
             continue;
         };
-        let proof = roots::cut_proof(&snapshot, AGENT, *id)
+        let proof = roots::cut_proof_at(&snapshot, AGENT, *id, *window)
             .unwrap()
             .unwrap_or_else(|| panic!("round {round}: no proof of {id:?}"));
         check_proof(&history, &proof, *window, *cut, read);

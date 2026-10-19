@@ -25,16 +25,13 @@ use vos_wire::{Decode, WindowClock};
 pub const NODES: NodeNumber = 3;
 
 /// Stops a leader loop once, after its commit and before its answers;
-/// holds the node's refines, or its commits, while asked; and, once set,
-/// has the leader serve the reads its replica proved at their cuts with
-/// a stand-in for the space's representative.
+/// and holds the node's refines, or its commits, while asked.
 #[derive(Default)]
 pub struct Trip {
     pub armed: AtomicBool,
     pub tripped: AtomicBool,
     pub refines: Gate,
     pub commits: Gate,
-    pub stand_in: AtomicBool,
 }
 
 impl Hooks for Trip {
@@ -53,10 +50,6 @@ impl Hooks for Trip {
 
     fn before_commit(&self) {
         self.commits.pass();
-    }
-
-    fn stand_in_representative(&self) -> bool {
-        self.stand_in.load(Ordering::SeqCst)
     }
 }
 

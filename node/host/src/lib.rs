@@ -203,14 +203,20 @@ pub trait Hooks: Send + Sync {
         Duration::ZERO
     }
 
-    /// Whether the leader serves the reads at a window's cut its replica
-    /// has proved with a stand-in for the space's representative: a tree of
-    /// the one row of the agent's root at the cut, which the node builds
-    /// itself ([`roots::stand_in`]). A node holds no other path of an
-    /// agent's root to the space's root, so without it no read is served,
-    /// and each ends at its deadline.
-    fn stand_in_representative(&self) -> bool {
-        false
+    /// Whether `agent`'s leader reports its root at window `window`'s cut
+    /// to the space's representative now: false holds the report, as a
+    /// leader slow to send it would, until the hook says otherwise.
+    fn report(&self, agent: AgentId, window: u64) -> bool {
+        let _ = (agent, window);
+        true
+    }
+
+    /// Before the representative's leader, its cut of `window` built and
+    /// its anchor handed to the venue, proposes the window's close: false
+    /// stops the leader there, as a crash would.
+    fn close(&self, agent: AgentId, window: u64) -> bool {
+        let _ = (agent, window);
+        true
     }
 
     /// Before the storage thread commits: true makes the commit fail with

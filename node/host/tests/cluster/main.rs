@@ -14,6 +14,7 @@ mod membership;
 mod messages;
 mod queries;
 mod replication;
+mod representative;
 mod roots;
 mod snapshots;
 mod workflows;

@@ -336,6 +336,8 @@ impl Limits {
 // The caps above size every step's result and every batch's floor, so each
 // target's limits stay within them.
 const _: () = assert!(JAM.within(&VOS));
+// A close's paths, a message each, fit a step on every target.
+const _: () = assert!(crate::defaults::CLOSE_PATHS <= JAM.messages);
 const _: () = assert!(VOS.attest <= REQUEST && VOS.attest <= REPLY);
 
 /// Why an install was refused, its failure's detail: under

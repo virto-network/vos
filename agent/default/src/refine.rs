@@ -6,6 +6,7 @@
 mod admin;
 mod base;
 mod batch;
+mod closes;
 mod inputs;
 mod invocation;
 mod jam;

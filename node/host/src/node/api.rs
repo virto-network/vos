@@ -123,6 +123,23 @@ impl Node {
         )
     }
 
+    /// Create the space's representative replicated on `replicas`: on the
+    /// space's first founding node alone, once. Blocks until a majority of
+    /// them hold its record.
+    pub fn create_representative(&self, replicas: Vec<NodeNumber>) -> Result<AgentId, CallError> {
+        let inner = Arc::clone(&self.inner);
+        smol::block_on(
+            self.inner
+                .runtime
+                .spawn(async move { inner.create_representative(replicas).await }),
+        )
+    }
+
+    /// The space's representative, when the space has a genesis.
+    pub fn representative(&self) -> Option<AgentId> {
+        self.inner.representative()
+    }
+
     /// Replace `agent`'s replica `remove` by node `add`: the replicas once
     /// the change committed.
     pub fn replace(

@@ -31,6 +31,8 @@ vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
 vos-raft = { workspace = true }
 vos-tree = { workspace = true }
+# Where the space's representative anchors its roots.
+vos-venue = { workspace = true }
 vos-wire = { workspace = true }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "ring"] }
 
@@ -38,6 +40,8 @@ webpki = { package = "rustls-webpki", version = "0.103", default-features = fals
 # Its integration tests only: never its unit tests, which build a second
 # vos-node the checker's types do not unify with.
 vos-checker = { path = "../checker" }
+# A kernel run alone, as an attest runs it.
+vos-testkit = { path = "../../agent/testkit" }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 proptest = "1"
 tempfile = "3"

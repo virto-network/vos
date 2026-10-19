@@ -271,6 +271,27 @@ impl Cluster {
         agent
     }
 
+    /// The space's representative on `replicas`, created at node 1, the
+    /// space's first founding node, with its actor installed, once every
+    /// replica runs its group.
+    pub fn representative(&self, replicas: &[NodeNumber]) -> AgentId {
+        let agent = self
+            .node(1)
+            .create_representative(replicas.to_vec())
+            .unwrap();
+        wait_until("every replica runs the representative", || {
+            replicas
+                .iter()
+                .all(|number| self.node(*number).applied(agent).is_some())
+        });
+        self.install_package(
+            agent,
+            vos_wire::served::REPRESENTATIVE,
+            &vos_checker::programs::representative_package(),
+        );
+        agent
+    }
+
     /// An agent on `replicas`, as [`Cluster::agent`] makes it, with the
     /// counter installed.
     pub fn counter_agent(&self, replicas: &[NodeNumber]) -> AgentId {

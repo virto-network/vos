@@ -112,6 +112,8 @@ impl Node {
             hooks: config.hooks,
             clock: config.clock,
             node_id,
+            node_key: SigningKey::from_bytes(&secret),
+            venue: config.venue,
             number,
             numbers: config
                 .space

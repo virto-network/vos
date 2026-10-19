@@ -120,6 +120,55 @@ impl Inner {
         self: &Arc<Self>,
         replicas: Vec<NodeNumber>,
     ) -> Result<AgentId, CallError> {
+        let replicas = self.replicas(replicas)?;
+        let mut next = self.next_agent.lock().await;
+        let agent = CreationRecord::agent_id(self.number, *next);
+        if *next >= 1 << 24 || agent == crate::store::NODE_AGENT {
+            return Err(CallError::Failed(
+                "this node's agent ids are exhausted".into(),
+            ));
+        }
+        let created = self.create(agent, replicas).await;
+        // Its record stored, the id is taken, confirmed or not.
+        if !matches!(created, Err(CallError::Failed(_))) {
+            *next += 1;
+        }
+        drop(next);
+        created
+    }
+
+    /// Create the space's representative on `replicas` (this node alone
+    /// when empty): only on the space's first founding node, whose agent 0
+    /// it is, and once. Answered as [`Inner::create_agent`] is.
+    pub(crate) async fn create_representative(
+        self: &Arc<Self>,
+        replicas: Vec<NodeNumber>,
+    ) -> Result<AgentId, CallError> {
+        let Some(agent) = self.representative() else {
+            return Err(CallError::Failed(
+                "a space without a genesis has no representative".into(),
+            ));
+        };
+        if CreationRecord::creator_of(agent) != self.number {
+            return Err(CallError::Failed(format!(
+                "node {} creates the representative",
+                CreationRecord::creator_of(agent)
+            )));
+        }
+        let replicas = self.replicas(replicas)?;
+        // Held, so no other creation here races it.
+        let next = self.next_agent.lock().await;
+        if self.directory.get(agent).is_some() {
+            return Err(CallError::Failed("the representative exists".into()));
+        }
+        let created = self.create(agent, replicas).await;
+        drop(next);
+        created
+    }
+
+    /// The replicas a creation names, sorted, each a node of the space;
+    /// this node alone when none.
+    fn replicas(&self, replicas: Vec<NodeNumber>) -> Result<Vec<NodeNumber>, CallError> {
         let mut replicas = if replicas.is_empty() {
             vec![self.number]
         } else {
@@ -136,13 +185,16 @@ impl Inner {
                 "node {node} is not in the space"
             )));
         }
-        let mut next = self.next_agent.lock().await;
-        let agent = CreationRecord::agent_id(self.number, *next);
-        if *next >= 1 << 24 || agent == crate::store::NODE_AGENT {
-            return Err(CallError::Failed(
-                "this node's agent ids are exhausted".into(),
-            ));
-        }
+        Ok(replicas)
+    }
+
+    /// Create agent `agent` on `replicas`, its record and placement stored
+    /// here and announced: answered once a majority of them hold it.
+    async fn create(
+        self: &Arc<Self>,
+        agent: AgentId,
+        replicas: Vec<NodeNumber>,
+    ) -> Result<AgentId, CallError> {
         let record = CreationRecord {
             agent,
             replicas,
@@ -163,8 +215,6 @@ impl Inner {
             ])
             .await
             .map_err(CallError::Failed)?;
-        *next += 1;
-        drop(next);
         self.learn(record.clone(), placement);
         self.announce(agent);
         if !self.held_by_majority(&record).await {
@@ -238,7 +288,13 @@ impl Inner {
                 .map_err(CallError::Failed)?;
             references.push(reference);
         }
-        let (space, clock) = self.space_and_clock();
+        let (space, mut clock) = self.space_and_clock();
+        // The representative's cut of a window closes it.
+        if self.representative() == Some(agent) {
+            clock = clock.representative().ok_or_else(|| {
+                CallError::Failed("the space's clock has no representative's".into())
+            })?;
+        }
         let admin = Admin::Install {
             instance,
             derivation,

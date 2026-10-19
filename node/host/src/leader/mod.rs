@@ -6,6 +6,7 @@
 //! receiver finds this agent behind it.
 
 mod batch;
+mod close;
 mod cut;
 mod execute;
 mod outbox;
@@ -118,6 +119,8 @@ struct Leader {
     /// When it last told senders whose messages the queue dropped full
     /// that they are behind.
     told: Option<Instant>,
+    /// The windows whose anchors this leadership handed to the venue.
+    anchored: std::collections::BTreeSet<u64>,
 }
 
 /// What an idle leader takes.
@@ -128,8 +131,8 @@ enum Taken {
     Sweep,
     /// A `Cut` marker due: an empty result, unrefined.
     Marker,
-    /// Reads proved at their cuts due: a batch with no inputs, which serves
-    /// them.
+    /// Reads proved at their cuts, reports or closes due: a batch with no
+    /// inputs, which makes them.
     Serve,
     /// No input: the windows due go again.
     Rounds,
@@ -145,6 +148,9 @@ enum Woke {
     Round,
     /// It looks again at its due index, or tells more senders.
     Recheck,
+    /// Its replica's root builder finished a window's cut: a report, a
+    /// close or a read may be due.
+    Built,
 }
 
 /// How a batch ended.
@@ -177,6 +183,7 @@ impl Leader {
             sweeps: Sweeps::default(),
             ended: None,
             told: None,
+            anchored: std::collections::BTreeSet::new(),
         }
     }
 
@@ -247,6 +254,7 @@ impl Leader {
     async fn take(&mut self) -> Option<Taken> {
         let mut waited = false;
         loop {
+            let built = self.shared.state().cuts_built;
             let (told, queued, untold, behind) = {
                 let mut queue = lock(&self.agent.queue);
                 if queue.stopped {
@@ -291,8 +299,8 @@ impl Leader {
                 smol::future::yield_now().await;
                 return Some(Taken::Marker);
             }
-            // A read proved at its cut, while the cut's wait rechecks.
-            if self.serve_due() {
+            // A read proved at its cut, a report or a close.
+            if self.serve_due() || self.duties_due() {
                 smol::future::yield_now().await;
                 return Some(Taken::Serve);
             }
@@ -326,6 +334,11 @@ impl Leader {
                 };
                 Woke::Recheck
             };
+            let shared = &self.shared;
+            let finished = async {
+                shared.wait(|state| state.cuts_built != built).await;
+                Woke::Built
+            };
             // Senders still to tell: told at a `Behind`'s pace.
             let told = self.told;
             let tell = async {
@@ -337,11 +350,18 @@ impl Leader {
                 }
                 Woke::Recheck
             };
-            match woken.or(lost).or(round).or(recheck).or(tell).await {
+            match woken
+                .or(lost)
+                .or(round)
+                .or(recheck)
+                .or(tell)
+                .or(finished)
+                .await
+            {
                 Woke::Queue => waited = true,
                 Woke::Lost => return None,
                 Woke::Round => return Some(Taken::Rounds),
-                Woke::Recheck => {}
+                Woke::Recheck | Woke::Built => {}
             }
         }
         if waited {

@@ -3,16 +3,19 @@
 //! stopped, nodes cut off, clocks jumping, snapshots installed), with a
 //! writer at each agent rewriting rows of the reader's committed map, and
 //! a reader starting workflows that read sixteen of them at their window's
-//! cut ([`vos_wire::abi::Op::AttestAt`]), each served by its leader with a
-//! stand-in for the space's representative.
+//! cut ([`vos_wire::abi::Op::AttestAt`]). The space's representative,
+//! replicated on the three nodes, closes each window at `B_w + D`, 400 ms
+//! here: each read is served by its leader once its window is closed, or
+//! at the next window its read was re-cut to.
 //!
 //! Beside the run's own checks: undo rows were held during it, by some
 //! replica, and none is left once every replica has built; every replica
 //! records the same cuts, and holds the same replicated rows, its
 //! node-local ones (undo rows, roots at cuts, proofs) apart; the roots at
-//! the two latest cuts are the same on every replica; every read ended, many
-//! served and stated, none refused by its kernel, and no request or proof
-//! is left on any replica.
+//! the two latest cuts are the same on every replica, the representative's
+//! among them, so `S_w` is; every read ended, many served and stated
+//! against the representative's root at its cut, none refused by its
+//! kernel, and no request or proof is left on any replica.
 //!
 //! `CUTS_FULL` adds the workflows' tours, the checker loop's run;
 //! `EXACTLY_ONCE_SEED` picks the seed.
@@ -79,6 +82,8 @@ struct Cuts {
     undo_held: Mutex<u64>,
     /// The reads started, each by its agent and its tag.
     started: Mutex<Vec<(AgentId, u64)>>,
+    /// The space's representative.
+    representative: Mutex<Option<AgentId>>,
 }
 
 impl Cuts {
@@ -202,17 +207,24 @@ impl Alongside for Cuts {
         Some(CLOCK)
     }
 
+    fn before(&self, cluster: &Cluster) {
+        let node = cluster.node(1).expect("node 1 runs");
+        let representative = node
+            .create_representative((1..=NODES).collect())
+            .expect("the representative");
+        install_at_leader(
+            || cluster.leading(representative),
+            representative,
+            vos_wire::served::REPRESENTATIVE,
+            &vos_checker::programs::representative_package(),
+        );
+        *self.representative.lock().unwrap() = Some(representative);
+    }
+
     fn run(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])], done: &AtomicBool) {
         let reader = package("reader");
         for (agent, _) in agents {
             install_at_leader(|| cluster.leading(*agent), *agent, READER, &reader);
-        }
-        for number in 1..=NODES {
-            cluster
-                .slot(number)
-                .trip
-                .stand_in
-                .store(true, Ordering::SeqCst);
         }
         std::thread::scope(|scope| {
             for (agent, _) in agents {
@@ -239,6 +251,10 @@ impl Alongside for Cuts {
             check_agent(cluster, *agent);
         }
         assert!(served > 0, "no read served");
+        let representative = self.representative.lock().unwrap().expect("created");
+        check_agent(cluster, representative);
+        let closed = closes(cluster, representative);
+        println!("the representative closed {closed} windows, each at one root on every replica");
     }
 }
 
@@ -264,7 +280,8 @@ fn replicated(snapshot: &Snapshot, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Once every replica applies as far as the others and has built every
-/// cut and its latest version: the same cuts, dozens of them, and the same
+/// cut and its latest version: the same cuts, through dozens of windows,
+/// those of the last `CUT_KEEP` kept alone, and the same
 /// replicated rows; the same roots at the two latest cuts; no undo row, no
 /// pending request and no request's proof left, every read answered.
 fn check_agent(cluster: &Cluster, agent: AgentId) {
@@ -286,12 +303,23 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
             })
     });
     let recorded = cuts(&snapshots[0], agent);
-    println!("agent {}: {} cuts", agent.0, recorded.len());
-    assert!(
-        recorded.len() >= 10,
-        "agent {}: {} cuts",
+    let serving = snapshots[0]
+        .get(agent, &keys::serving())
+        .unwrap()
+        .and_then(|bytes| u64::decode(unstored(&bytes)?).ok())
+        .map_or(0, |(window, _)| window);
+    println!(
+        "agent {}: cuts through window {serving}, {} kept",
         agent.0,
         recorded.len()
+    );
+    assert!(serving >= 10, "agent {}: cut through {serving}", agent.0);
+    assert!(
+        recorded
+            .keys()
+            .all(|window| window + vos_wire::defaults::CUT_KEEP >= serving),
+        "agent {}: the cuts kept {recorded:?}",
+        agent.0
     );
     let rows = replicated(&snapshots[0], agent);
     for snapshot in &snapshots[1..] {
@@ -327,6 +355,36 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
             );
         }
     }
+}
+
+/// The windows whose closes every replica of the representative holds
+/// alike, each with its root at its cut, so the space's root `S_w` is the
+/// same on every replica: the two latest cuts it keeps the root of.
+fn closes(cluster: &Cluster, representative: AgentId) -> usize {
+    let snapshots: Vec<Snapshot> = (1..=NODES)
+        .map(|number| cluster.node(number).unwrap().store().snapshot())
+        .collect();
+    let windows: Vec<u64> = cuts(&snapshots[0], representative)
+        .into_keys()
+        .rev()
+        .take(2)
+        .collect();
+    for window in &windows {
+        let space_roots: Vec<_> = snapshots
+            .iter()
+            .map(|snapshot| {
+                let (root, _) = roots::cut_root(snapshot, representative, *window)
+                    .unwrap()
+                    .expect("the root at the cut");
+                vos_wire::vos_anchor::space_root(&cluster.space.id(), *window, &root)
+            })
+            .collect();
+        assert!(
+            space_roots.windows(2).all(|pair| pair[0] == pair[1]),
+            "S_{window} differs between replicas"
+        );
+    }
+    windows.len()
 }
 
 /// Every read `agent`'s reader started ended on every replica, its end
@@ -384,6 +442,7 @@ fn cuts_apply_once_and_replicas_agree_through_failures() {
     let cuts = Cuts {
         undo_held: Mutex::new(0),
         started: Mutex::new(Vec::new()),
+        representative: Mutex::new(None),
     };
     let rounds = std::env::var_os("CUTS_FULL").map(|_| Rounds::load());
     exactly_once(Mode::OneAtATime, 0x5eed_0612, rounds, Some(&cuts));

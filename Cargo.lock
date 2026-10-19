@@ -2555,7 +2555,9 @@ dependencies = [
  "vos-pvm-compiler",
  "vos-pvm-program",
  "vos-raft",
+ "vos-testkit",
  "vos-tree",
+ "vos-venue",
  "vos-wire",
 ]
 
@@ -2795,6 +2797,15 @@ dependencies = [
  "proptest",
  "vos-pvm-codec",
  "vos-pvm-precompiles",
+]
+
+[[package]]
+name = "vos-venue"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "vos-anchor",
+ "vos-statement",
 ]
 
 [[package]]

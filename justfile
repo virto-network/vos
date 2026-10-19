@@ -75,7 +75,7 @@ export MIMALLOC_ALLOW_THP := "0"
 # Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
-    for manifest in ([agent/default agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+    for manifest in ([agent/default agent/representative agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
 # item.
@@ -104,11 +104,15 @@ build-test-actors:
 build-agent:
     cd agent/default; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
 
+# The space's representative, built with the guest toolchain in `pvm/guest`.
+build-representative:
+    cd agent/representative; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
+
 # The SDK, its macros' restrictions, the test actors on the testkit, the
 # default agent against it, the checker's own model, the node running the
 # agent, the network between nodes, and the `vos` command.
-test-agent: build-test-actors build-agent
-    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
+test-agent: build-test-actors build-agent build-representative
+    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-venue -p vos-net -p vos-cli
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
 
@@ -159,10 +163,10 @@ check-no-std:
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-no-std build-test-actors build-agent
+check: fmt-check doc-check check-no-std build-test-actors build-agent build-representative
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-recair -p vos-pvm-final-verifier -p vos-anchor -p vos-statement --features vos-anchor/vectors,vos-statement/fixtures
-    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
+    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-venue -p vos-net -p vos-cli
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.

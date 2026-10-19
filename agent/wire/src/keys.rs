@@ -143,6 +143,11 @@ enum Row {
     Clock = 0x1a,
     Cut = 0x1b,
     Request = 0x1c,
+    Reported = 0x1d,
+    Closed = 0x1e,
+    Moved = 0x1f,
+    Serving = 0x20,
+    CloseMark = 0x21,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -157,6 +162,7 @@ enum TreeRow {
     Undo = 0x04,
     CutRoot = 0x05,
     CutProof = 0x06,
+    Closing = 0x07,
 }
 
 impl TreeRow {
@@ -523,9 +529,22 @@ pub fn cut_root_entry(key: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(rest.try_into().ok()?))
 }
 
-/// A pending request's rows and their proof at its window's cut,
-/// node-local, written in the commit that marks the cut built.
-pub fn cut_proof(id: RequestId) -> Vec<u8> {
+/// A pending request's rows and their proof at window `window`'s cut,
+/// node-local, written in the commit that marks the cut built: one for the
+/// window it was asked in, and one for each window a re-cut moved it to.
+pub fn cut_proof(id: RequestId, window: u64) -> Vec<u8> {
+    TreeRow::CutProof.key(
+        &[
+            &id.workflow.0.to_be_bytes()[..],
+            &id.awaits.to_be_bytes(),
+            &window.to_be_bytes(),
+        ]
+        .concat(),
+    )
+}
+
+/// The prefix of the [`cut_proof`] rows of request `id`, in window order.
+pub fn cut_proofs_of(id: RequestId) -> Vec<u8> {
     TreeRow::CutProof.key(&[&id.workflow.0.to_be_bytes()[..], &id.awaits.to_be_bytes()].concat())
 }
 
@@ -534,15 +553,89 @@ pub fn cut_proofs() -> Vec<u8> {
     TreeRow::CutProof.prefix().to_vec()
 }
 
-/// The request a [`cut_proof`] key names; `None` for any other key.
-pub fn cut_proof_entry(key: &[u8]) -> Option<RequestId> {
+/// The request and window a [`cut_proof`] key names; `None` for any other
+/// key.
+pub fn cut_proof_entry(key: &[u8]) -> Option<(RequestId, u64)> {
     let rest = key.strip_prefix(&TreeRow::CutProof.prefix())?;
-    let rest: &[u8; 16] = rest.try_into().ok()?;
+    let rest: &[u8; 24] = rest.try_into().ok()?;
     let word = |at: usize| u64::from_be_bytes(rest[at..at + 8].try_into().unwrap_or_default());
-    Some(RequestId {
-        workflow: WorkflowId(word(0)),
-        awaits: word(8),
-    })
+    Some((
+        RequestId {
+            workflow: WorkflowId(word(0)),
+            awaits: word(8),
+        },
+        word(16),
+    ))
+}
+
+/// The last window whose root at its cut the agent reported to its
+/// space's representative, and the representative's id
+/// ([`crate::batch::Input::Report`]): replicated, written by the report's
+/// step. A report of that window or an earlier one sends nothing, and a
+/// `Closed` comes only from that agent.
+pub fn reported() -> Vec<u8> {
+    Row::Reported.prefix().to_vec()
+}
+
+/// The representative's close of the window `window` as the agent holds
+/// it ([`crate::served::ClosedRow`]): the representative's root at its cut
+/// of the window, and the agent's row's salt and path there. Replicated,
+/// written by the step of the representative's `Closed`; a second one for
+/// the window is ignored.
+pub fn closed(window: u64) -> Vec<u8> {
+    key(&[&Row::Closed.prefix(), &window.to_be_bytes()])
+}
+
+/// The prefix of every [`closed`] row, in window order.
+pub fn closed_prefix() -> Vec<u8> {
+    Row::Closed.prefix().to_vec()
+}
+
+/// The window whose cut serves the pending requests the window `window`'s
+/// cut served, once that window went unclosed: its requests' re-cut. Apply
+/// writes it with the next cut recorded after `window`'s, when the
+/// representative's `Closed` of `window` has not been applied by then
+/// ([`crate::apply`]). Replicated.
+pub fn moved(window: u64) -> Vec<u8> {
+    key(&[&Row::Moved.prefix(), &window.to_be_bytes()])
+}
+
+/// The window of the latest cut recorded whose requests it serves: the
+/// first of the windows the latest recording cut. Replicated, written by
+/// apply with the cuts.
+pub fn serving() -> Vec<u8> {
+    Row::Serving.prefix().to_vec()
+}
+
+/// The representative's mark of the closes it has sent
+/// ([`crate::batch::Input::Close`]): the window, and the last agent sent
+/// its path for it. Replicated.
+pub fn close_mark() -> Vec<u8> {
+    Row::CloseMark.prefix().to_vec()
+}
+
+/// The representative's close of the window `window`, node-local, written
+/// by the commit that finishes its cut's build: its root there, and the
+/// path of each agent that asked for one ([`crate::served::Closing`]).
+pub fn closing(window: u64) -> Vec<u8> {
+    TreeRow::Closing.key(&window.to_be_bytes())
+}
+
+/// The prefix of every [`closing`] row, in window order.
+pub fn closings() -> Vec<u8> {
+    TreeRow::Closing.prefix().to_vec()
+}
+
+/// The window a [`closing`] key names; `None` for any other key.
+pub fn closing_entry(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(&TreeRow::Closing.prefix())?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
+}
+
+/// The window a [`closed`] key names; `None` for any other key.
+pub fn closed_entry(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(&Row::Closed.prefix())?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
 }
 
 /// The prefix of an instance's struct and table rows.

@@ -375,9 +375,10 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | window of time t | `w = ⌊(t − origin_ms) / length_ms⌋`; t < origin_ms has none |
 | boundary | `B_w = origin_ms + (w+1)·length_ms` |
 | length | `length_ms` ∈ [120,000, 3,600,000], default 600,000 (decision 2); the venue refuses another at registration |
-| `cut(w)` | the agent's state version before the first applied result with time ≥ `B_w`: a result timed t, after the agent's batch-time mark p, records it for every w with p < `B_w` ≤ t, once the record its first install wrote names a space (the install itself cuts nothing, so only windows past the agent's first install are cut); of more than `MAX_CUTS` (32, a consensus constant) such windows, the newest 32 alone, the older never cut. The rows are never deleted in 6.12; the pruning rule (apply deleting `cut(w')` for `w' < w − K`, K ≥ 2 plus the re-cut depth) is 6.14's to decide |
+| `cut(w)` | the agent's state version before the first applied result with time ≥ `B_w`: a result timed t, after the agent's batch-time mark p, records it for every w with p < `B_w` ≤ t, once the record its first install wrote names a space (the install itself cuts nothing, so only windows past the agent's first install are cut); of more than `MAX_CUTS` (32, a consensus constant) such windows, the newest 32 alone, the older never cut. A recording whose first window is w deletes the `cut`, `moved` and `closed` rows of every window before `w − CUT_KEEP`, `CUT_KEEP = 2 + RECUTS = 4` (a consensus constant; decided in 6.14): a read lives from its window w₀ to its deadline `B_{w₀+3}`, so no row older serves one, and a replica down longer than that skips those cuts, its reads re-cut or ended `NotClosed` as everyone's |
+| the representative | the agent `agent_id(first founding node, 0)`: serial 0, which no node gives an agent otherwise; created on that node (`Node::create_representative`), its actor `vos-representative` (`agent/representative`) installed at instance 0 with the representative's clock |
 | agent root | the vos-tree root over the agent's committed rows `0x03 ‖ instance ‖ tag ‖ transform ‖ key' → value` (pin E); empty: `H("vos/tree/empty")` |
-| representative's rows | a `CommittedMap<RepKey, [u8; 32]>`, `RepKey = agent (4, BE) ‖ kind (1) ‖ w (8, BE)`, the value the agent's root at `cut(w)`; kind 0 is pin E's Blake2b tree; rows older than `w − 2` deleted |
+| representative's rows | a `CommittedMap<RepKey, [u8; 32]>`, `RepKey = agent (4, BE) ‖ kind (1) ‖ w (8, BE)`, the value the agent's root at `cut(w)`; kind 0 is pin E's Blake2b tree; an agent's rows older than `w − 2` deleted by its report of w. Beside it a plain table `asked`, `w (8, BE) ‖ agent (4, BE)`, of the agents whose reads wait on w's close |
 | representative's clock | `(origin_ms + D, length_ms)`, `D = min(length_ms / 5, 120,000)`: its own `cut_rep(w)` at `B_w + D` is the close of w |
 | space root | `S_w = BLAKE2b-256("vos/space/v1" ‖ space (32) ‖ w (8, LE) ‖ A_rep (32))`, `A_rep` the representative's agent root at `cut_rep(w)` |
 | `VenueId` | Kreivo: its genesis hash; JAM: `BLAKE2b-256("vos/venue/jam" ‖ JAM genesis hash ‖ service id (4, LE))` |
@@ -507,41 +508,61 @@ Rests on decisions 5, 6 and 8.
      each a committed row of the instance (`Reads`); range reads are out
      of scope.
   2. The agent's cut build generates its `rows_proof` (6.12), and its
-     leader's `AgentRoot { agent, kind, w, root, pending: true }` reaches
-     the representative on their pair.
-  3. **The paths' return:** after `cut_rep(w)`'s build, in the same hook
-     that signs the anchor, the representative's leader sends each agent
-     with pending requests one pair message, exactly-once:
-     `Closed { w, rep_root, paths: Vec<(RequestId, [u8; 16], Vec<u8>)> }`,
-     each a leaf's salt and a `BatchProof` for `RepKey(agent, 0, w)`
-     against `rep_root`. The agent's apply stores each salt and path as a
-     replicated row keyed by request (`keys::space_path(request)`) and
-     ignores a duplicate `Closed` for a window it holds.
+     leader, woken by the builder's finishing commit (`Woke::Built`),
+     proposes a system input `Report { to, w, root, pending }`, whose step
+     sends the representative's `report` the
+     `AgentRoot { kind, w, root, pending }` (the agent the message's
+     sender) on their pair, exactly-once, once a window
+     (`keys::reported`), only once the node knows the representative.
+     The representative stores `root` under `RepKey(agent, 0, w)` and,
+     with `pending`, the agent under `asked`.
+  3. **The paths' return:** the representative's own cut build at
+     `cut_rep(w)` keeps, beside its root, the salt and `BatchProof` of
+     `RepKey(agent, 0, w)` for each agent that asked whose row the cut
+     holds (`keys::closing(w)`, node-local, the same bytes on every
+     replica). Its leader, woken as an agent's is, signs the anchor of
+     `S_w` with its node key and hands it to the venue (a repeat of the
+     same root is the venue's `Again`), then proposes
+     `Close { w, rep_root, paths }`, whose step sends each agent past the
+     close mark (`keys::close_mark`, at most 8 a close, in agent order)
+     one pair message, exactly-once:
+     `Closed { w, rep_root, rep_salt, space_path }`. One path an agent
+     and window, not one a request: the representative learns of no
+     request, and every read of the agent at w reads the same row. The
+     agent's apply stores it as a replicated row keyed by window
+     (`keys::closed(w)`), only from the representative it reported to,
+     and ignores a second `Closed` for a window it holds.
   4. The agent's leader assembles `Served` from the two and proposes a
      system input `Resume { window, request, served: Option<Vec<u8>> }`,
      the bytes `Served`'s encoding, bounded by `Limits::served` and not
-     `REQUEST`, `None` when the cut proved no rows for it or they pass
-     the cap (`AttestError::Unserved`); refine checks the served header
-     and row keys against the agent, its space, the window and the
-     request, else `Unserved`, runs the kernel live on the arguments ‖
-     served and records the `Attest`; the workflow resumes with
+     `REQUEST`, `None` when they pass the cap (`AttestError::Unserved`);
+     refine checks the served header and row keys against the agent, its
+     space, the window and the request, and `rep_root`, `rep_salt` and
+     `space_path` against the `closed` row of the served window, else
+     `Unserved`, so the live `Attested::Done` a workflow acts on is as
+     true as the replicated close, not as the leader serving it; then
+     runs the kernel live on the arguments ‖ served and records the
+     `Attest`; the workflow resumes with
      `Attested::{Done(output), Failed(AttestError)}`, a kernel's trap
      `Failed`; its record keeps that answer, never the served bytes. The
      kernel's gas and the attest's price come out of the resumed step's
      limit; the agent's work on the rows, `SERVED_BYTE` (64) a byte
      [measured, 6.13], out of the batch's budget, as a precompile's
-     serving is. Until 6.14 only a test's stand-in gives the path
-     (`Hooks::stand_in_representative`: a one-row representative's tree
-     the node builds); without it a read ends `NotClosed`.
-- **A window not closed in time:** a pending request of window w whose
-  `Closed { w }` has not been applied when the next cut recorded after w
-  is, is re-cut there (w+1, unless a clock jump past `MAX_CUTS` skipped
-  it):
-  its `rows_proof` regenerated at the new cut, the old one dropped, its
-  `AgentRoot` for w+1 marked pending. After 2 re-cuts the workflow sees
+     serving is.
+- **A window not closed in time:** apply, recording the cuts whose first
+  window is w′, re-cuts the reads the latest earlier cut w serves when
+  `closed(w)` is not there: `moved(w) = w′` (replicated). The cut at w′
+  proves them again, its proof kept beside the one at w
+  (`cut_proof(request, window)`), and the agent's report of w′ marks it
+  pending. A read is served at the first window of its chain (its own,
+  then each it moved to) whose cut this replica built and whose close
+  the agent holds: a close that comes after the re-cut still serves it
+  at its own window. Its deadline `B_{w₀+3}` (`READ_WINDOWS = 1 +
+  RECUTS`) comes when its third re-cut would: the workflow sees
   `AttestError::NotClosed`. A representative returning after several
   boundaries closes them at one version without the agents' late rows;
-  their requests take this path.
+  their reads take this path. A read asked in a window a clock's jump
+  past `MAX_CUTS` left uncut is past its deadline already.
 - **The caps:** `Limits::attest` keeps capping the caller's arguments (64
   KiB on VOS, 2 KiB on JAM), and the kernel's whole return
   (`KernelReturn`'s encoding). `Limits::served` caps a `Resume`'s `Served`:
@@ -1109,7 +1130,7 @@ lands.
   actor); the node's cut hook (an agent's leader sends
   `AgentRoot { agent, kind, w, root, pending }` on its pair after the cut's
   build; the representative's leader sends `Closed`, pin E); the agent's
-  apply of `Closed` (`keys::space_path(request)`) and the request's re-cut;
+  apply of `Closed` (`keys::closed(w)`) and the request's re-cut;
   `node/venue` (new, `vos-venue`: `trait VenueClient { id, anchor,
   submit, anchored }`, `ModelVenue` over `vos_statement::model`).
 - **Design:** pin D's representative: its committed map keyed
@@ -1117,33 +1138,46 @@ lands.
   `S_w` from its agent root; the anchor signed by its leader's node key
   and handed to the venue client; `space_path` generated by the same held
   build, only for agents that asked (`pending`), and returned in one
-  `Closed { w, rep_root, paths }` pair message an agent, sent by the hook
-  that signs the anchor; missed windows closed on return within
+  `Closed { w, rep_root, rep_salt, space_path }` pair message an agent,
+  after the anchor is signed; missed windows closed on return within
   `MaxRootAge`; pin E's re-cut of a request whose `Closed` has not
   arrived by the next cut recorded after w.
   - **The leader learns a cut's build has finished:** the builder's
     finishing commit wakes the leader (a `Woke::Built` from the builder's
     loop to the leader's `take`), which then sends `AgentRoot`; nothing
     wakes it there in 6.12.
-  - **Pruning `cut(w)` rows** [open, decided here]: 6.12 never deletes
-    them (one replicated row a window, a leaf in JAM's state each). The
-    rule to decide: apply, recording `cut(w)`, deletes `cut(w')` for
-    `w' < w − K`, K ≥ 2 plus the re-cut depth. `pending()` reads past the
-    latest built cut and is unaffected; a replica down longer than K
-    windows skips those cuts, whose requests re-cut or end `NotClosed`.
-  - **The served path bound in refine** (6.13's review): `serves` also
-    requires `served.rep_root`, `rep_salt` and `space_path` to equal the
-    request's stored `Closed` rows (`keys::space_path(request)`), so the
-    live `Attested::Done` a workflow acts on is as true as the replicated
-    close, not as the leader serving it; Pin E's step 4 says so. A test
-    pins that the representative's `roots` map stores exactly
-    `representative_row`'s key bytes and a bare 32-byte value, as the
-    prologue checks them (the stand-in builds its leaf by hand).
-  - **Catch-up by log across many windows**: each committed write of the
-    replayed log writes one undo row per cut still pending, and each cut
-    costs a build pass; a node-local cap (build the newest K pending cuts
-    only, drop the others' undo rows) would bound it, at the cost of which
-    replicas hold which proofs: decide here.
+  - **Pruning `cut(w)` rows** [decided]: apply, recording the cuts whose
+    first window is w, deletes the `cut`, `moved` and `closed` rows of
+    every window before `w − CUT_KEEP`, `CUT_KEEP = 2 + RECUTS = 4`, a
+    consensus constant. A read lives from its window w₀ to its deadline
+    `B_{w₀+3}`, its serving window at most w₀ + 2, so no row before
+    `w − 4` serves a live read, and one window more covers a close's lag.
+    No scan: the windows deleted run from `CUT_KEEP` before the latest
+    earlier recording's first window through the batch-time mark's, past
+    which no earlier recording cut, at most `CUT_KEEP + MAX_CUTS + 1`
+    rows, each read before it is deleted (JAM's witness serves it).
+    `pending()` reads past the latest built cut and is unaffected; a
+    replica down longer than four windows skips those cuts, whose reads
+    re-cut or end `NotClosed` as on every replica; their undo rows go as
+    orphans once a later cut is built. A `Closed` of a window already
+    pruned is not taken.
+  - **The served path bound in refine** (6.13's review): `serves`
+    requires `served.window` to be in the request's chain and
+    `served.rep_root`, `rep_salt` and `space_path` to equal that window's
+    `closed` row; `a_report_is_stored_as_a_read_proves_it` pins that the
+    representative's `roots` map stores exactly `representative_row`'s key
+    bytes and a bare 32-byte value, its `asked` table the key the node
+    reads, and its `report` the method id the agents call.
+  - **Catch-up by log across many windows** [decided: no node-local
+    cap]: the pruning bounds it already. A replica replaying its log
+    applies each recording's deletes as it goes, so the cuts pending
+    behind its builder are never more than `CUT_KEEP` windows' and one
+    recording's (`MAX_CUTS` at one version after a jump): each committed
+    write of the replay writes at most that many undo rows, and each cut a
+    build pass. A cap would bound it no further in the common case and
+    would make replicas hold different proofs, so a leader change would
+    find some reads unprovable; the jump's worst case, 32 cuts at one
+    version, each with its own undo rows, is left to 6.19's ops note.
 - **Tests:** three nodes, three agents and the representative: every
   agent reports; an agent whose clock leads by more than L − D (its w+1
   row leaves `S_w` alone); an agent that misses the close (its statement
@@ -1156,7 +1190,9 @@ lands.
 - **Expected outcomes for a missed close, stated:** an agent that misses
   the close, and every pending request when the representative is down
   across three windows, is re-cut at the next window and resumes there;
-  after 2 re-cuts the workflow sees `AttestError::NotClosed`.
+  after 2 re-cuts the workflow sees `AttestError::NotClosed`. An agent
+  whose clock leads by more than L − D re-cuts each read before its close
+  comes, and is served at the read's own window when the close does.
 - **Gates:** the checker loop with the representative; `S_w` equal on
   every replica.
 - **Dep:** 6.12, 6.13; decision 7. **Estimate:** 1.5–2 weeks.

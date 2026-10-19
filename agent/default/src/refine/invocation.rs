@@ -21,7 +21,7 @@ use vos_wire::batch::{Await, Body};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, WorkflowId};
 use vos_wire::records::{Installed, PendingRead};
 use vos_wire::result::{Attest, Attested, InstanceGas, KernelReturn, Outcome, Outgoing};
-use vos_wire::served::Served;
+use vos_wire::served::{ClosedRow, Served};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
 
 use super::base::{Base, Corrupt, Meter, role_byte};
@@ -706,9 +706,9 @@ impl<'a> Invocation<'a> {
         {
             return (Attested::Failed(AttestError::Failed), 0);
         }
-        if !self.serves(instance, window, request, &served) {
+        let Some(at) = self.serves(instance, window, request, &served) else {
             return (Attested::Failed(AttestError::Unserved), 0);
-        }
+        };
         let Ok(installed) = self.installed(instance) else {
             return (Attested::Failed(AttestError::Unknown), 0);
         };
@@ -740,7 +740,7 @@ impl<'a> Invocation<'a> {
         self.attests_counted += cap::AT_CUT;
         self.attests.push(Attest {
             program,
-            window: Some(window),
+            window: Some(at),
             witness_input: run.witness_input,
             output: parts.output.clone(),
             public_args: parts.public_args,
@@ -749,35 +749,52 @@ impl<'a> Invocation<'a> {
         (Attested::Done(parts.output), spent)
     }
 
-    /// Whether `served` is what the request of window `window` by `request`
-    /// asked for: within the target's cap, of this agent and its space, of
-    /// the window, of the request's instance and its rows, in order.
-    fn serves(&self, instance: InstanceId, window: u64, request: RequestId, bytes: &[u8]) -> bool {
+    /// The window whose cut serves the request asked in window `window` by
+    /// `request` when `served` is what it asked for: within the target's
+    /// cap, of this agent and its space, of the window it was asked in or
+    /// one its re-cuts moved it to ([`keys::moved`]), of the request's
+    /// instance and its rows, in order, and with the representative's
+    /// root, salt and path the agent holds of that window's close
+    /// ([`keys::closed`]).
+    fn serves(
+        &self,
+        instance: InstanceId,
+        window: u64,
+        request: RequestId,
+        bytes: &[u8],
+    ) -> Option<u64> {
         if bytes.len() > self.limits.served {
-            return false;
+            return None;
         }
-        let Ok(Some(asked)) = self.read_state(&keys::request(window, request)) else {
-            return false;
-        };
-        let Ok((asked, _)) = PendingRead::decode(&asked) else {
-            return false;
-        };
-        let Ok((served, used)) = Served::decode(bytes) else {
-            return false;
-        };
+        let asked = self.read_state(&keys::request(window, request)).ok()??;
+        let (asked, _) = PendingRead::decode(&asked).ok()?;
+        let (served, used) = Served::decode(bytes).ok()?;
+        let at = served.window;
+        let windows = vos_wire::served::serving_windows(window, |window| {
+            let moved = self.read_state(&keys::moved(window)).ok()??;
+            u64::decode_exact(&moved)
+        });
+        if !windows.contains(&at) {
+            return None;
+        }
+        let closed = self.read_state(&keys::closed(at)).ok()??;
+        let closed = ClosedRow::decode_exact(&closed)?;
         let space = matches!(self.space(), Ok(Some((space, _))) if space == served.space);
-        used == bytes.len()
+        let holds = used == bytes.len()
             && space
             && served.agent == self.base.agent
-            && served.window == window
             && served.instance == instance
             && asked.instance == instance
+            && served.rep_root == closed.rep_root
+            && served.rep_salt == closed.rep_salt
+            && served.space_path == closed.space_path
             && served.rows.len() == asked.rows.len()
             && served
                 .rows
                 .iter()
                 .zip(&asked.rows)
-                .all(|((row, _), asked)| row == asked)
+                .all(|((row, _), asked)| row == asked);
+        holds.then_some(at)
     }
 
     /// A workflow's pause: a sleep until a time, or a request of another

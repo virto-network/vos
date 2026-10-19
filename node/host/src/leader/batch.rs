@@ -9,6 +9,7 @@ use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
 
+use super::close::Closes;
 use super::sweep::{due_rows, first_due};
 use super::{Ended, Leader};
 use crate::fault::{Fault, read};
@@ -26,7 +27,12 @@ impl Leader {
         let taken = Instant::now();
         // Whether to sweep, and what reads to serve, are decided below, on
         // the batch's state.
-        pending.retain(|item| !matches!(item, Pending::Sweep(_) | Pending::Resume { .. }));
+        pending.retain(|item| {
+            !matches!(
+                item,
+                Pending::Sweep(_) | Pending::Resume { .. } | Pending::Duty(_)
+            )
+        });
         let snapshot = Arc::new(self.inner.store.snapshot());
         let before = Arc::clone(&snapshot);
         // The batch is refined on this state, at its version and no earlier
@@ -75,8 +81,20 @@ impl Leader {
                 }
             }
         }
-        match self.resumes(&snapshot) {
-            Ok(resumes) => pending.extend(resumes),
+        let duties = self
+            .resumes(&snapshot)
+            .and_then(|resumes| Ok((resumes, self.reports(&snapshot)?)))
+            .and_then(|(resumes, reports)| Ok((resumes, reports, self.closes(&snapshot)?)));
+        match duties {
+            Ok((resumes, reports, Closes::Due(closes))) => {
+                pending.extend(resumes);
+                pending.extend(reports);
+                pending.extend(closes);
+            }
+            Ok((.., Closes::Stopped)) => {
+                self.agent.requeue(pending);
+                return false;
+            }
             Err(fault) => {
                 self.retry(pending, fault).await;
                 return true;

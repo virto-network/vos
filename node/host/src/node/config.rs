@@ -56,6 +56,9 @@ pub struct Config {
     /// The space this node runs in. Without one, it is a space of one, as
     /// node 0.
     pub space: Option<Space>,
+    /// The venue the space's representative anchors its roots at, when
+    /// this node leads it: the anchor signed by this node's key.
+    pub venue: Option<Arc<dyn vos_venue::VenueClient>>,
     /// How the node reaches the other nodes of its space.
     pub peers: Peers,
     /// Where the peer endpoint binds, when not the address its space
@@ -139,6 +142,7 @@ impl Config {
             clock: Arc::new(wall_clock),
             ingress_tls: None,
             space: None,
+            venue: None,
             peer_bind: None,
             quic_idle: vos_net::quic::IDLE,
             peers: Peers::Quic,

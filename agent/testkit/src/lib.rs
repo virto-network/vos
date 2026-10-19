@@ -10,6 +10,7 @@
 //! linked; and [`node`], what a VOS node serves the agent beyond the
 //! runtime's host.
 
+mod closes;
 mod invocation;
 mod memory;
 pub mod node;
@@ -336,6 +337,11 @@ impl Testkit {
         self.state.insert(key, value);
     }
 
+    /// Delete a row of the agent's state, as a node's apply deletes it.
+    pub fn delete_row(&mut self, key: &[u8]) {
+        self.state.remove(key);
+    }
+
     /// The bytes of a page workflow `id`'s snapshot stores.
     pub fn page(&self, id: WorkflowId, index: u32) -> Option<&[u8]> {
         self.pages.get(&(id, index)).map(Vec::as_slice)
@@ -471,6 +477,19 @@ impl Testkit {
                 None => self.consumed(Outcome::Done(Vec::new())),
             },
             Body::Wait { workflow, awaiting } => self.wait(from, *workflow, *awaiting),
+            Body::Closed {
+                window,
+                rep_root,
+                rep_salt,
+                space_path,
+            } => {
+                let row = vos_wire::served::ClosedRow {
+                    rep_root: *rep_root,
+                    rep_salt: *rep_salt,
+                    space_path: space_path.clone(),
+                };
+                self.closed(from, *window, row)
+            }
         }
     }
 
