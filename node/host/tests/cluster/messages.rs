@@ -66,10 +66,14 @@ impl Cluster {
         vos_checker::applied(self.node(at).store(), agent, key)
     }
 
-    /// The runs of the steps `agent` applied at node `at` for `input`.
+    /// The runs of the steps `agent` applied at node `at` for `input`: its
+    /// log read through the applied index the store holds, written in the
+    /// apply's own commit, as the state the callers wait on is; the node's
+    /// count of it moves only once that commit returns.
     fn runs(&self, at: NodeNumber, agent: AgentId, input: &InputRef) -> Vec<Run> {
         let node = self.node(at);
-        (1..=node.applied(agent).unwrap_or(0))
+        let applied = node.store().snapshot().applied(agent).unwrap();
+        (1..=applied.unwrap_or(0))
             .filter_map(|index| node.store().log_entry(agent, index).unwrap())
             .filter(|entry| entry.kind == EntryKind::Result)
             .flat_map(|entry| WorkResult::decode(&entry.body).unwrap().0.steps)
