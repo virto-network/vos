@@ -195,3 +195,6 @@ printed tables were not ported: they are spike 6b's record.
 `cargo test -p vos-pvm-proof --no-default-features --lib`: 96 passed.
 
 **Gates:** `just check` green (1,113 tests, 0 failed).
+
+**Commits:** `cbe03ea7` the tool; `7924e135` format 39, its tests and
+`SECURITY.md`; `413910fe` and this line, the record.
