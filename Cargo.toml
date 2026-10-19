@@ -52,12 +52,6 @@ exclude = [
 [patch.crates-io]
 lsm-tree = { git = "https://github.com/olanod/lsm-tree", rev = "d0791931a96ff2be9b23af4e0d1ef17a330ed9f2" }
 
-# A temporary local pin, replaced by the re-pin to the pushed rev: the Stwo
-# fork's `vos/verify-panics` (c3ec981, the DEEP quotient's degenerate lines
-# refused) from its local worktree.
-[patch."https://github.com/olanod/stwo"]
-stwo = { path = "/home/daniel/src/virto/stwo-s6-panics/crates/stwo" }
-stwo-constraint-framework = { path = "/home/daniel/src/virto/stwo-s6-panics/crates/constraint-framework" }
 
 [workspace.package]
 version = "0.1.0"
@@ -193,8 +187,8 @@ cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3
 # Declared without features: workspace features are additive, and the
 # verifier-only build must stay free of std and rayon. The prover adds
 # `std,prover,parallel` through vos-pvm-proof's `prover` feature.
-stwo = { git = "https://github.com/olanod/stwo", rev = "ab294189b34fac653e0a753971c69a0d39d01d16", default-features = false }
-stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "ab294189b34fac653e0a753971c69a0d39d01d16", default-features = false }
+stwo = { git = "https://github.com/olanod/stwo", rev = "c3ec981357a0053e373e00f1057ec5a62675f7eb", default-features = false }
+stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "c3ec981357a0053e373e00f1057ec5a62675f7eb", default-features = false }
 
 num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }

@@ -27,7 +27,7 @@ vos-statement = { path = "../statement", features = ["fixtures"] }
 # decodes them.
 vos-anchor = { path = "../anchor", features = ["vectors"] }
 postcard = { version = "1", features = ["alloc"] }
-stwo = { git = "https://github.com/olanod/stwo", rev = "ab294189b34fac653e0a753971c69a0d39d01d16", default-features = false }
+stwo = { git = "https://github.com/olanod/stwo", rev = "c3ec981357a0053e373e00f1057ec5a62675f7eb", default-features = false }
 
 # Skip the test profile's default panic strategy override;
 # libfuzzer-sys requires panic=abort on its own targets.
@@ -79,10 +79,3 @@ name = "anchor_decode"
 path = "fuzz_targets/anchor_decode.rs"
 test = false
 doc = false
-
-# A temporary local pin, replaced by the re-pin to the pushed rev: the Stwo
-# fork's `vos/verify-panics` (c3ec981, the DEEP quotient's degenerate lines
-# refused) from its local worktree.
-[patch."https://github.com/olanod/stwo"]
-stwo = { path = "/home/daniel/src/virto/stwo-s6-panics/crates/stwo" }
-stwo-constraint-framework = { path = "/home/daniel/src/virto/stwo-s6-panics/crates/constraint-framework" }

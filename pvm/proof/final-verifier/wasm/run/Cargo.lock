@@ -1419,6 +1419,8 @@ version = "0.15.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
 dependencies = [
+ "allocator-api2",
+ "equivalent",
  "foldhash 0.1.5",
  "serde",
 ]
@@ -1432,8 +1434,6 @@ dependencies = [
  "allocator-api2",
  "equivalent",
  "foldhash 0.2.0",
- "serde",
- "serde_core",
 ]
 
 [[package]]
@@ -2823,6 +2823,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stwo"
 version = "2.2.0"
+source = "git+https://github.com/olanod/stwo?rev=c3ec981357a0053e373e00f1057ec5a62675f7eb#c3ec981357a0053e373e00f1057ec5a62675f7eb"
 dependencies = [
  "blake2",
  "blake3",
@@ -2830,7 +2831,7 @@ dependencies = [
  "cfg-if",
  "educe 0.5.11",
  "fnv",
- "hashbrown 0.16.1",
+ "hashbrown 0.15.5",
  "hex",
  "indexmap 2.14.2",
  "itertools 0.12.1",
@@ -2847,8 +2848,9 @@ dependencies = [
 [[package]]
 name = "stwo-constraint-framework"
 version = "2.2.0"
+source = "git+https://github.com/olanod/stwo?rev=c3ec981357a0053e373e00f1057ec5a62675f7eb#c3ec981357a0053e373e00f1057ec5a62675f7eb"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.15.5",
  "itertools 0.12.1",
  "num-traits",
  "rand",
