@@ -40,6 +40,11 @@ pub enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    /// The space the nodes run in.
+    Space {
+        #[command(subcommand)]
+        command: SpaceCommand,
+    },
     /// Agents, with the node's admin token.
     Agent {
         #[command(subcommand)]
@@ -105,6 +110,36 @@ pub struct RunArgs {
     /// space lists for this node, as behind port forwarding.
     #[arg(long)]
     pub peer_bind: Option<SocketAddr>,
+}
+
+#[derive(Subcommand)]
+pub enum SpaceCommand {
+    /// Found the space of a space file: its genesis, of the nodes it lists
+    /// and a clock, written once beside it (`<space>.genesis`), never
+    /// replaced. The space's id, its genesis's hash, is printed.
+    ///
+    /// Found it before creating any agent: an agent records its space at
+    /// its first install, for good, so one created before the founding
+    /// belongs to no space forever. Then copy `<space>.genesis` beside
+    /// every node's space file and restart the nodes.
+    Up {
+        /// The space file: number, key, peer address and ingress address
+        /// per line.
+        #[arg(long)]
+        space: PathBuf,
+        /// The founding node's data directory, its node stopped: the
+        /// founding is refused when its store holds an agent.
+        #[arg(long)]
+        data: PathBuf,
+        /// Each window's length, in milliseconds: from 120,000 to
+        /// 3,600,000.
+        #[arg(long, default_value_t = vos_wire::vos_anchor::DEFAULT_LENGTH_MS)]
+        window_ms: u64,
+        /// Where window 0 starts, in milliseconds since the Unix epoch: the
+        /// founding time by default.
+        #[arg(long)]
+        origin_ms: Option<u64>,
+    },
 }
 
 #[derive(Subcommand)]

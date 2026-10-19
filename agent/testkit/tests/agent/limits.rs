@@ -11,7 +11,7 @@ use vos_wire::batch::{Admin, Input};
 use vos_wire::ids::{InstanceId, MethodId, ProgramHash, WorkflowId};
 use vos_wire::records::{Derivation, Workflow, WorkflowState};
 use vos_wire::result::Outcome;
-use vos_wire::{Encode, keys};
+use vos_wire::{Encode, SpaceId, WindowClock, keys};
 
 use crate::common::{AGENT, ALICE, COUNTER, MINTER, Node, Sessions, ran};
 
@@ -28,6 +28,8 @@ fn install(instance: InstanceId, derivation: Derivation, target: Target) -> Inpu
         derivation,
         roles: vec![(b"minter".to_vec(), MINTER)],
         target,
+        space: vos_wire::SpaceId::NONE,
+        clock: vos_wire::WindowClock::DEFAULT,
     })
 }
 
@@ -320,6 +322,97 @@ fn an_install_for_another_target_than_its_agents_is_refused() {
             let recorded: Target = node.value(&keys::target()).expect("the agent's target");
             assert_eq!(recorded, first);
         }
+    }
+}
+
+/// An agent belongs to one space, whose clock is frozen, which its first
+/// install names: an install naming another space, or another clock, is
+/// refused, `Space`, its detail the agent's space and clock, and writes no
+/// record, on every host as in the model. A refused first install names
+/// none.
+#[test]
+fn an_install_into_another_space_than_its_agents_is_refused() {
+    let (counter, shop) = (actor("counter"), actor("shop"));
+    let space = SpaceId([0xa1; 32]);
+    let clock = WindowClock {
+        origin_ms: 1_760_000_000_000,
+        length_ms: 600_000,
+    };
+    let other_clock = WindowClock {
+        length_ms: 120_000,
+        ..clock
+    };
+    for (mut node, target) in [(Node::new(), Target::Vos), (Node::jam(true), Target::Jam)] {
+        let mut kit = Testkit::new(AGENT);
+        let (counter_hash, shop_hash) = (node.add(&counter), node.add(&shop));
+        let in_space = |instance, program, target, space, clock| {
+            Input::Admin(Admin::Install {
+                instance,
+                derivation: vos_testkit::programs::bare(program),
+                roles: vec![(b"minter".to_vec(), MINTER)],
+                target,
+                space,
+                clock,
+            })
+        };
+        // The shop's heap is past JAM's pages: refused there, it names no
+        // space.
+        let other = SpaceId([0xb2; 32]);
+        let installs = [
+            (
+                InstanceId(5),
+                shop_hash,
+                &shop,
+                Target::Jam,
+                other,
+                other_clock,
+            ),
+            (COUNTER, counter_hash, &counter, target, space, clock),
+            (InstanceId(2), counter_hash, &counter, target, other, clock),
+            (
+                InstanceId(3),
+                counter_hash,
+                &counter,
+                target,
+                space,
+                other_clock,
+            ),
+            (InstanceId(4), counter_hash, &counter, target, space, clock),
+        ];
+        let inputs = installs
+            .iter()
+            .map(|&(instance, hash, _, target, space, clock)| {
+                in_space(instance, hash, target, space, clock)
+            })
+            .collect();
+        let models: Vec<_> = installs
+            .iter()
+            .map(|&(instance, _, program, target, space, clock)| {
+                kit.install_in(space, clock, target, instance, program, &[], &[])
+            })
+            .collect();
+        let result = node.batch(0, inputs);
+        let outcomes: Vec<&Outcome> = result.steps.iter().map(|step| &ran(step).outcome).collect();
+        assert!(matches!(
+            outcomes[0],
+            Outcome::Failed {
+                code: Failure::Cap,
+                ..
+            }
+        ));
+        assert!(models[0].is_err());
+        let refused = Refused::Space { space, clock };
+        for at in [1, 4] {
+            assert!(matches!(outcomes[at], Outcome::Done(_)), "{target:?} {at}");
+            assert_eq!(models[at], Ok(()));
+        }
+        for at in [2, 3] {
+            assert_eq!(outcomes[at], &refusal(refused), "{target:?} {at}");
+            assert_eq!(models[at], Err(InstallError::Refused(refused)));
+            assert!(node.get(&keys::installed(installs[at].0)).is_none());
+        }
+        assert_eq!(node.value::<SpaceId>(&keys::space()), Some(space));
+        assert_eq!(node.value::<WindowClock>(&keys::clock()), Some(clock));
     }
 }
 

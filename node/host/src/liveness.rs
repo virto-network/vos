@@ -284,6 +284,7 @@ impl Inner {
         };
         if let Err(refusal) = peer::check(
             &self.numbers,
+            &self.space_and_clock().0,
             from,
             (Class::Liveness, stream),
             &message,

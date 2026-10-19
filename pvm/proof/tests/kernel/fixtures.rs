@@ -302,7 +302,7 @@ mod statements {
     use vos_pvm_recair::wrap::{self, WrapCircuit};
     use vos_statement::fixtures::{CASES, Case, Patch};
     use vos_statement::model::{Input, Policy};
-    use vos_statement::{FORMAT, ProgramId, RootRead, SpaceId, Statement, StatementId};
+    use vos_statement::{FORMAT, ProgramId, RootKind, RootRead, SpaceId, Statement, StatementId};
 
     use super::common::{self, NodeRun};
     use super::{load, record};
@@ -317,7 +317,7 @@ mod statements {
 
     fn root(window: u64, byte: u8) -> RootRead {
         RootRead {
-            kind: 1,
+            kind: RootKind::Space,
             space: SPACE,
             window,
             root: [byte; 32],

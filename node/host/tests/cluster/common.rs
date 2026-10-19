@@ -86,6 +86,11 @@ impl Cluster {
         let space = space(&programs.agent, &dirs, |number| {
             format!("http://node-{number}")
         });
+        // A space founded as `vos space up` founds it.
+        let genesis = space
+            .found(vos_wire::WindowClock::DEFAULT, 0, [7; 16])
+            .unwrap();
+        let space = space.with_genesis(genesis).unwrap();
         let mut cluster = Self {
             hub: Hub::new(7),
             quic,

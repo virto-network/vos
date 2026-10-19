@@ -18,7 +18,7 @@ use vos_node::{Config, Node, Space};
 use vos_wire::ids::MethodId;
 use vos_wire::schema::Schema;
 
-use args::{Cli, Command, KeyCommand, NodeCommand, RunArgs};
+use args::{Cli, Command, KeyCommand, NodeCommand, RunArgs, SpaceCommand};
 use call::read_workflow;
 
 /// mimalloc, unless built without it: a thread frees memory another thread
@@ -73,6 +73,7 @@ fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Node { command } => command.run(),
         Command::Key { command } => command.run(),
+        Command::Space { command } => command.run(),
         Command::Agent { command } => command.run(),
         Command::Install(install) => install.run(),
         Command::Role(role) => role.run(),
@@ -130,6 +131,60 @@ impl RunArgs {
         loop {
             std::thread::park();
         }
+    }
+}
+
+impl SpaceCommand {
+    fn run(self) -> Result<(), String> {
+        let SpaceCommand::Up {
+            space,
+            data,
+            window_ms,
+            origin_ms,
+        } = self;
+        let listed = Space::read(&space)?;
+        let store = data.join(vos_node::STORE);
+        if store.exists() {
+            let agents = vos_node::store::Fjall::open(&store)
+                .and_then(|store| store.agents())
+                .map_err(|error| format!("{}: {error:?}", store.display()))?;
+            if !agents.is_empty() {
+                return Err(format!(
+                    "{}: the node holds {} agents, which belong to no space for good: \
+                     found the space before creating any agent",
+                    data.display(),
+                    agents.len()
+                ));
+            }
+        }
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis() as u64;
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce).map_err(|error| error.to_string())?;
+        let clock = vos_wire::WindowClock {
+            origin_ms: origin_ms.unwrap_or(time),
+            length_ms: window_ms,
+        };
+        if clock.origin_ms > time {
+            eprintln!(
+                "vos: windows start {} ms from now: until then every venue refuses the space's anchors",
+                clock.origin_ms - time
+            );
+        }
+        let genesis = listed.found(clock, time, nonce)?;
+        let path = vos_node::write_genesis(&space, &genesis)?;
+        eprintln!(
+            "vos: the space's genesis is in {}: copy it beside every node's space file, \
+             and restart the nodes, before creating any agent",
+            path.display()
+        );
+        println!(
+            "{}",
+            hex::encode(vos_wire::vos_anchor::space_id(&genesis).0)
+        );
+        Ok(())
     }
 }
 

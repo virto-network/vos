@@ -712,6 +712,7 @@ mod tests {
             time: 0,
             program: vos_wire::ids::ProgramHash([0; 32]),
             accumulate_gas: 0,
+            space: vos_wire::SpaceId::NONE,
         });
         assert!(should_answer(&created, 3, 2));
     }

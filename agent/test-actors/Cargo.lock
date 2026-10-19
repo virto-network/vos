@@ -317,10 +317,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-anchor"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+]
+
+[[package]]
 name = "vos-pvm-codec"
 version = "0.1.0"
 dependencies = [
  "thiserror",
+ "vos-anchor",
  "vos-pvm-codec-derive",
 ]
 
@@ -375,6 +383,7 @@ dependencies = [
 name = "vos-wire"
 version = "0.1.0"
 dependencies = [
+ "vos-anchor",
  "vos-pvm-codec",
  "vos-pvm-precompiles",
  "vos-pvm-program",

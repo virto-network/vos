@@ -89,6 +89,8 @@ impl Node {
             derivation: vos_testkit::programs::bare(program),
             roles: vec![],
             target: Target::Vos,
+            space: vos_wire::SpaceId::NONE,
+            clock: vos_wire::WindowClock::DEFAULT,
         })
     }
 

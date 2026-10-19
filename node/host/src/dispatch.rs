@@ -119,11 +119,12 @@ impl Inner {
         ) {
             let inner = Arc::clone(self);
             let space = Arc::clone(&self.numbers);
+            let (ours, _) = self.space_and_clock();
             self.spawn(async move {
                 let checked = inner
                     .offload(move || {
                         let checked =
-                            peer::check(&space, from, (class, stream), &message, |_| None);
+                            peer::check(&space, &ours, from, (class, stream), &message, |_| None);
                         (checked, message)
                     })
                     .await;
@@ -144,9 +145,15 @@ impl Inner {
             });
             return;
         }
-        let checked = peer::check(&self.numbers, from, (class, stream), &message, |agent| {
-            self.followed(agent)
-        });
+        let (ours, _) = self.space_and_clock();
+        let checked = peer::check(
+            &self.numbers,
+            &ours,
+            from,
+            (class, stream),
+            &message,
+            |agent| self.followed(agent),
+        );
         if let Err(refusal) = checked {
             self.drops.count(refusal);
             tracing::debug!(from, ?refusal, "a peer's message was dropped");

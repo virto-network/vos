@@ -518,15 +518,20 @@ pub struct Statement {
     no_std, with no prover dependency;
   - `final-verifier` (`vos-pvm-final-verifier`): no_std, for x86, wasm32
     and riscv64em-javm;
+  - `anchor` (`vos-anchor`): `SpaceId` and the genesis it hashes, the
+    window clock, root kinds, anchors, and the digests a venue checks
+    signatures over (the space root, the anchor, the registration, a JAM
+    venue's id), no_std, with BLAKE2b its one dependency, and the golden
+    vectors every venue computes alike;
   - `statement` (`vos-statement`): the types, the encoding, the io-hash
     and the id, and the venue's check over `vos-pvm-final-verifier`, with no
-    other vos dependency, so Kreivo can depend on it; its `model` is a
-    venue as plain data, which the fixtures are judged against, and its
-    JAM refine program (`final-verify.elf`) is the venue on the JAM-only
-    host;
+    other vos dependency than `vos-anchor`, which it re-exports, so Kreivo
+    can depend on it; its `model` is a venue as plain data, which the
+    fixtures are judged against, and its JAM refine program
+    (`final-verify.elf`) is the venue on the JAM-only host;
   - the golden fixtures, under `fixtures` (A.6).
 
-  Every venue uses the last three. The source uses no nightly feature:
+  Every venue uses the last four. The source uses no nightly feature:
   it builds on stable for x86 and wasm32, and the JAM build runs on the
   pinned nightly with build-std.
 

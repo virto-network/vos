@@ -39,7 +39,7 @@ pub use node::{
     ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, ReplaceError, Reply, STORE,
     wall_clock,
 };
-pub use space::{Space, SpaceNode};
+pub use space::{Space, SpaceNode, genesis_path, read_genesis, write_genesis};
 
 use std::collections::HashMap;
 use std::future::Future;

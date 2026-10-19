@@ -16,6 +16,7 @@ use vos_statement::model::Input;
 /// The guest's verdicts.
 pub const ACCEPT: u64 = 1;
 pub const REJECT: u64 = 0;
+pub const BAD_PAYLOAD: u64 = 2;
 pub const UNDECODABLE: u64 = 4;
 
 const SERVICE: u64 = 7;
@@ -23,7 +24,8 @@ const SERVICE: u64 = 7;
 /// What the guest reports: its verdict, the gas left at its start, after
 /// the proof's lookup, after its decode and at its end; the proof's
 /// length; its heap's peak, high-water mark and allocations; a refusal's
-/// text; a judgement's code and an accepted statement's id.
+/// text; a judgement's code and an accepted statement's id; a golden
+/// vector's digests.
 #[derive(Debug)]
 pub struct GuestReport {
     pub verdict: u64,
@@ -34,6 +36,7 @@ pub struct GuestReport {
     pub error: String,
     pub code: u64,
     pub id: [u8; 32],
+    pub digests: Vec<u8>,
 }
 
 /// The guest, linked: `target/riscv64em-vos/release/final-verify.elf` of
@@ -67,8 +70,23 @@ pub fn judge_request(input: &Input) -> Vec<u8> {
     [&[1][..], &input.encode()].concat()
 }
 
+/// A request to compute a golden vector's digests: its encoding.
+pub fn anchors_request(vector: &[u8]) -> Vec<u8> {
+    [&[2][..], vector].concat()
+}
+
 /// The guest run on `request` and `proof`: its gas and its report.
 pub fn run(program: &[u8], request: &[u8], proof: &[u8]) -> (u64, GuestReport) {
+    let hash = vos_statement::blake2b_256(&[proof]);
+    let mut payload = request.to_vec();
+    payload.extend_from_slice(&hash);
+    payload.extend_from_slice(&(proof.len() as u32).to_le_bytes());
+    run_payload(program, payload, Some(proof))
+}
+
+/// The guest run on `payload` as work item 0's, `proof` a preimage of the
+/// service if any: its gas and its report.
+pub fn run_payload(program: &[u8], payload: Vec<u8>, proof: Option<&[u8]>) -> (u64, GuestReport) {
     struct Store(BTreeMap<[u8; 32], Vec<u8>>);
     impl Preimages for Store {
         fn preimage(&self, service: u64, hash: &[u8; 32]) -> Option<Vec<u8>> {
@@ -77,17 +95,14 @@ pub fn run(program: &[u8], request: &[u8], proof: &[u8]) -> (u64, GuestReport) {
                 .flatten()
         }
     }
-    let hash = vos_statement::blake2b_256(&[proof]);
-    let mut payload = request.to_vec();
-    payload.extend_from_slice(&hash);
-    payload.extend_from_slice(&(proof.len() as u32).to_le_bytes());
+    let preimages = proof.map(|proof| (vos_statement::blake2b_256(&[proof]), proof.to_vec()));
     let jam = JamRefine {
         service: SERVICE,
         items: vec![JamItem {
             payload,
             imports: Vec::new(),
         }],
-        preimages: Some(Arc::new(Store(BTreeMap::from([(hash, proof.to_vec())])))),
+        preimages: Some(Arc::new(Store(preimages.into_iter().collect()))),
         ..JamRefine::default()
     };
     let context = RefineContext::load(program, &[], 10_000_000_000).expect("loads the guest");
@@ -106,6 +121,7 @@ pub fn run(program: &[u8], request: &[u8], proof: &[u8]) -> (u64, GuestReport) {
         error: String::from_utf8_lossy(&bytes[80..80 + error_len]).into_owned(),
         code: word(34),
         id: bytes[280..312].try_into().unwrap(),
+        digests: bytes[312..472].to_vec(),
     };
     (invocation.gas_used, report)
 }

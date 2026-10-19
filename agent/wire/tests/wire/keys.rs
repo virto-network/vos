@@ -111,6 +111,8 @@ fn keys_keep_their_bytes() {
     );
     assert_eq!(keys::workflow_pins_entry(&keys::workflow(workflow)), None);
     assert_eq!(keys::target(), [0x00, 0x18]);
+    assert_eq!(keys::space(), [0x00, 0x19]);
+    assert_eq!(keys::clock(), [0x00, 0x1a]);
 }
 
 /// A sweep's rows: those due by its time, earliest first, as many as it

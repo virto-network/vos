@@ -164,6 +164,15 @@ pub(crate) struct Counters {
 }
 
 impl Inner {
+    /// The space the node's agents belong to, and the clock that numbers
+    /// its windows: its genesis's, or no space and the default clock.
+    pub(crate) fn space_and_clock(&self) -> (vos_wire::SpaceId, vos_wire::WindowClock) {
+        self.space.as_ref().map_or(
+            (vos_wire::SpaceId::NONE, vos_wire::WindowClock::DEFAULT),
+            |space| (space.id(), space.clock()),
+        )
+    }
+
     pub(crate) fn run(&self, id: AgentId) -> Option<Arc<Run>> {
         lock(&self.runs).get(&id).cloned()
     }

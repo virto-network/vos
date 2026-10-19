@@ -2453,6 +2453,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
+name = "vos-anchor"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+]
+
+[[package]]
 name = "vos-checker"
 version = "0.1.0"
 dependencies = [
@@ -2529,6 +2536,7 @@ dependencies = [
  "fjall",
  "futures-rustls",
  "getrandom 0.2.17",
+ "hex",
  "httparse",
  "mimalloc",
  "proptest",
@@ -2581,6 +2589,7 @@ version = "0.1.0"
 dependencies = [
  "proptest",
  "thiserror",
+ "vos-anchor",
  "vos-pvm-codec-derive",
 ]
 
@@ -2753,7 +2762,7 @@ dependencies = [
 name = "vos-statement"
 version = "0.1.0"
 dependencies = [
- "blake2",
+ "vos-anchor",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-pvm-final-verifier",
@@ -2791,6 +2800,7 @@ name = "vos-wire"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "vos-anchor",
  "vos-pvm",
  "vos-pvm-codec",
  "vos-pvm-precompiles",

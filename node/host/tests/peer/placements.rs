@@ -28,6 +28,7 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
         time: 0,
         program: ProgramHash([0; 32]),
         accumulate_gas: 0,
+        space: OURS,
     };
     let creator = record.creator;
     let check = |from, placement: Placement| {
@@ -37,6 +38,7 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
         };
         peer::check(
             &SPACE,
+            &OURS,
             from,
             (Class::Requests, u64::from(agent.0)),
             &message,
@@ -72,6 +74,7 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
     assert_eq!(
         peer::check(
             &SPACE,
+            &OURS,
             3,
             (Class::Requests, u64::from(agent.0)),
             &relayed,
@@ -87,6 +90,28 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
         ..later
     };
     assert_eq!(check(3, stranger), Err(Refusal::NotTheCreator));
+    // A record of another space, or of none, from its very creator.
+    for space in [vos_wire::SpaceId([0xb2; 32]), vos_wire::SpaceId::NONE] {
+        let other = CreationRecord {
+            space,
+            ..record.clone()
+        };
+        let message = PeerMessage::Directory {
+            placement: Placement::created(&other),
+            record: other,
+        };
+        assert_eq!(
+            peer::check(
+                &SPACE,
+                &OURS,
+                creator,
+                (Class::Requests, u64::from(agent.0)),
+                &message,
+                |_| None,
+            ),
+            Err(Refusal::OtherSpace)
+        );
+    }
 }
 
 /// A placement replaces a held one it outranks, except that none takes

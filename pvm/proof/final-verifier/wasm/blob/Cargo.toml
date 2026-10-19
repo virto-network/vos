@@ -20,6 +20,8 @@ crate-type = ["cdylib"]
 [dependencies]
 vos-pvm-final-verifier = { path = "../.." }
 vos-statement = { path = "../../../statement" }
+# The golden vectors' digests, `anchor_digests`.
+vos-anchor = { path = "../../../anchor", features = ["vectors"] }
 
 [profile.release]
 opt-level = 3

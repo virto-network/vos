@@ -17,6 +17,8 @@ quick_cache = { version = "0.6.24", default-features = false }
 event-listener = "5"
 futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 getrandom = "0.2"
+# The space's genesis file, in hex.
+hex = "0.4"
 httparse = "1"
 rcgen = { version = "0.13", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }

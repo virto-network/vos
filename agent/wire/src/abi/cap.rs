@@ -311,8 +311,9 @@ const _: () = assert!(JAM.within(&VOS));
 const _: () = assert!(VOS.attest <= REQUEST && VOS.attest <= REPLY);
 
 /// Why an install was refused, its failure's detail: under
-/// [`super::Failure::Target`] its target, under [`super::Failure::Cap`] the
-/// static past its target's limits.
+/// [`super::Failure::Target`] its target, under [`super::Failure::Space`]
+/// its space and clock, under [`super::Failure::Cap`] the static past its
+/// target's limits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Refused {
     /// The agent's target, recorded or its host's, which the install did
@@ -335,6 +336,13 @@ pub enum Refused {
         gas: u64,
         most: u64,
     },
+    /// The agent's space and clock, recorded at its first install, which
+    /// the install did not name.
+    #[codec(index = 5)]
+    Space {
+        space: crate::SpaceId,
+        clock: crate::WindowClock,
+    },
 }
 
 impl Refused {
@@ -342,6 +350,7 @@ impl Refused {
     pub const fn failure(&self) -> super::Failure {
         match self {
             Refused::Target { .. } => super::Failure::Target,
+            Refused::Space { .. } => super::Failure::Space,
             _ => super::Failure::Cap,
         }
     }
@@ -369,6 +378,17 @@ impl core::fmt::Display for Refused {
                 "attestable method {:#010x} declares gas {gas}, past the {most} a kernel runs with on its target",
                 method.0
             ),
+            Refused::Space { space, clock } => {
+                write!(f, "the agent belongs to space ")?;
+                for byte in space.0 {
+                    write!(f, "{byte:02x}")?;
+                }
+                write!(
+                    f,
+                    " with windows of {} ms from {} ms, and every instance installed into it names them",
+                    clock.length_ms, clock.origin_ms
+                )
+            }
         }
     }
 }

@@ -22,7 +22,10 @@
 //! its submitter writes. Were any space allowed, one accepted proof would
 //! make a new id under each, and a venue's repeat check would let it be
 //! applied again. [`judge`] refuses a rootless statement whose space is not
-//! [`SpaceId::NONE`] ([`Refusal::Space`]).
+//! [`SpaceId::NONE`], and a rooted one whose space is ([`Refusal::Space`]):
+//! no space has the id `NONE`, and an agent of no space states no root, so
+//! a root of `NONE` is never one a venue anchored, and is refused as a
+//! claim before any anchor is looked up.
 //!
 //! **The program id is the venue's, never the caller's.** [`judge`] takes it
 //! as `program`, the id the venue pinned for the kernel whose handler will
@@ -51,10 +54,12 @@
 //! and `roots` as the io-hash encodes them: a byte vector a compact length
 //! then its bytes, the roots a compact count then each [`RootRead`] as its
 //! kind byte, its space, its window as eight little-endian bytes and its
-//! root. A decode is canonical, so a statement has one encoding.
+//! root. A decode is canonical, an unknown root kind refused, so a statement
+//! has one encoding.
 //!
 //! The crate is `no_std` and depends on nothing of VOS beyond the final
-//! verifier, so a chain's runtime (Kreivo's pallet) can depend on it.
+//! verifier and `vos-anchor` (the space's types, re-exported), so a chain's
+//! runtime (Kreivo's pallet) can depend on it.
 
 #![no_std]
 
@@ -62,18 +67,14 @@ extern crate alloc;
 #[cfg(feature = "fixtures")]
 extern crate std;
 
-mod codec;
 #[cfg(feature = "fixtures")]
 pub mod fixtures;
 pub mod model;
 
 use alloc::vec::Vec;
 
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
-
-pub use codec::DecodeError;
-use codec::Reader;
+use vos_anchor::codec::{self, Reader};
+pub use vos_anchor::{self, DecodeError, RootKind, RootRead, SpaceId, VenueId, blake2b_256};
 pub use vos_pvm_final_verifier;
 
 /// The io-hash's domain (`vos_pvm_precompiles::io::IO_HASH_DOMAIN`).
@@ -83,18 +84,6 @@ pub const ID_DOMAIN: &[u8] = b"vos/statement/v1";
 
 /// The format of the final proofs [`judge`] reads.
 pub const FORMAT: u32 = vos_pvm_final_verifier::FORMAT;
-
-/// The bytes of a [`RootRead`]'s encoding.
-pub(crate) const ROOT_READ_BYTES: usize = 1 + 32 + 8 + 32;
-
-/// BLAKE2b-256 of `parts`, concatenated.
-pub fn blake2b_256(parts: &[&[u8]]) -> [u8; 32] {
-    let mut hasher = Blake2b::<U32>::new();
-    for part in parts {
-        hasher.update(part);
-    }
-    hasher.finalize().into()
-}
 
 /// A kernel's program id: eight M31 words, each below `p`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -108,43 +97,6 @@ impl ProgramId {
             chunk.copy_from_slice(&word.to_le_bytes());
         }
         bytes
-    }
-}
-
-/// A space's id.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct SpaceId(pub [u8; 32]);
-
-impl SpaceId {
-    /// No space: a rootless statement's, the only one [`judge`] accepts for
-    /// it (the crate's docs).
-    pub const NONE: Self = Self([0; 32]);
-}
-
-/// A root a kernel read: of what kind, whose space, as of which window.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct RootRead {
-    pub kind: u8,
-    pub space: SpaceId,
-    pub window: u64,
-    pub root: [u8; 32],
-}
-
-impl RootRead {
-    fn encode_to(&self, out: &mut Vec<u8>) {
-        out.push(self.kind);
-        out.extend_from_slice(&self.space.0);
-        out.extend_from_slice(&self.window.to_le_bytes());
-        out.extend_from_slice(&self.root);
-    }
-
-    fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        Ok(Self {
-            kind: reader.u8()?,
-            space: SpaceId(reader.array()?),
-            window: reader.u64()?,
-            root: reader.array()?,
-        })
     }
 }
 
@@ -211,7 +163,7 @@ impl Statement {
         let space = SpaceId(reader.array()?);
         let public_args = reader.bytes()?;
         let output = reader.bytes()?;
-        let count = reader.count(ROOT_READ_BYTES)?;
+        let count = reader.count(RootRead::BYTES)?;
         let roots = (0..count)
             .map(|_| RootRead::decode_from(reader))
             .collect::<Result<_, _>>()?;
@@ -286,8 +238,8 @@ pub enum Refusal {
     Format,
     /// The statement's program is not the one the venue pinned.
     Program,
-    /// A root of another space than the statement's, or a rootless
-    /// statement claiming a space.
+    /// A root of another space than the statement's, a rootless statement
+    /// claiming a space, or a rooted one claiming none.
     Space,
     /// A root the venue has not anchored: stale, or unknown.
     Unanchored,
@@ -322,7 +274,9 @@ impl core::fmt::Display for Refusal {
             Self::Format => f.write_str("the format is not accepted"),
             Self::Program => f.write_str("the statement's program is not the pinned one"),
             Self::Space => {
-                f.write_str("a root is of another space, or a rootless statement claims one")
+                f.write_str(
+                "a root is of another space, a rootless statement claims one, or a rooted one claims none",
+            )
             }
             Self::Unanchored => f.write_str("a root is not anchored"),
             Self::Repeated => f.write_str("the statement was accepted before"),
@@ -361,8 +315,8 @@ impl Admitted {
 /// on the statement, never one the caller supplies (the crate's docs).
 ///
 /// In order: the format; the statement's program against `program`; the
-/// space, every root's equal to the statement's and a rootless statement's
-/// [`SpaceId::NONE`]; every root anchored; the io-hash recomputed from the
+/// space, a rootless statement's [`SpaceId::NONE`] and a rooted
+/// statement's not, every root's equal to it; every root anchored; the io-hash recomputed from the
 /// fields and the id from it; a repeat.
 pub fn admit(
     venue: &impl Venue,
@@ -378,10 +332,11 @@ pub fn admit(
     let spaced = if statement.roots.is_empty() {
         statement.space == SpaceId::NONE
     } else {
-        statement
-            .roots
-            .iter()
-            .all(|root| root.space == statement.space)
+        statement.space != SpaceId::NONE
+            && statement
+                .roots
+                .iter()
+                .all(|root| root.space == statement.space)
     };
     if !spaced {
         return Err(Refusal::Space);
@@ -434,13 +389,13 @@ mod tests {
             output: (0..100).collect(),
             roots: vec![
                 RootRead {
-                    kind: 1,
+                    kind: RootKind::Space,
                     space,
                     window: 41,
                     root: [0x41; 32],
                 },
                 RootRead {
-                    kind: 1,
+                    kind: RootKind::Space,
                     space,
                     window: 42,
                     root: [0x42; 32],
@@ -476,7 +431,7 @@ mod tests {
             .roots
             .iter()
             .map(|root| vos_pvm_precompiles::RootRead {
-                kind: root.kind,
+                kind: vos_pvm_precompiles::RootKind::try_from(root.kind as u8).unwrap(),
                 space: root.space.0,
                 window: root.window,
                 root: root.root,
@@ -493,11 +448,11 @@ mod tests {
         );
         assert_eq!(
             hex(&io_hash),
-            "46a7161512387eab75ff585a8252b365ef60ab11489db391ba184665b0118bdf"
+            "e5aed594c742205ea5778f886a3646c2c67b0ec4397743d5dfb363e95c23a32d"
         );
         assert_eq!(
             hex(&statement.id().0),
-            "06925f7b01859fcd284bc0361259628064e86ccb0a570ef81be0742d2f4a7dbe"
+            "2a98ff7d11931d67f5b8d3b46b173c0b045a6ea7c08791931093a0fe2f01c0ab"
         );
     }
 
@@ -522,6 +477,34 @@ mod tests {
         assert_eq!(Statement::decode(&long), Err(DecodeError::Noncanonical));
     }
 
+    /// A root of an unknown kind is refused at decode: the statement, and a
+    /// venue's judgement of it, before any other check.
+    #[test]
+    fn an_unknown_root_kind_is_refused_at_decode() {
+        let bytes = statement().encode();
+        // The second root's kind byte: after the roots' count and the first.
+        let at = bytes.len() - RootRead::BYTES;
+        assert_eq!(bytes[at], RootKind::Space as u8);
+        for kind in [1, 2, 0xff] {
+            let mut unknown = bytes.clone();
+            unknown[at] = kind;
+            assert_eq!(Statement::decode(&unknown), Err(DecodeError::Noncanonical));
+        }
+    }
+
+    /// The kernel's root kinds are the statement's, byte for byte: each
+    /// byte names the same kind, or none, in both.
+    #[test]
+    fn the_kernels_root_kinds_are_the_statements() {
+        for byte in 0..=u8::MAX {
+            assert_eq!(
+                RootKind::from_u8(byte).map(|kind| kind as u8),
+                vos_pvm_precompiles::RootKind::from_u8(byte).map(|kind| kind as u8),
+                "{byte}"
+            );
+        }
+    }
+
     /// Each field but the format moves the io-hash or the id: the program
     /// and the space only the id, the rest both. The format moves neither:
     /// one run under two final formats is one statement.
@@ -534,12 +517,11 @@ mod tests {
         assert_eq!(reformatted.id(), base.id());
 
         type Change = fn(&mut Statement);
-        let changes: [(&str, bool, Change); 8] = [
+        let changes: [(&str, bool, Change); 7] = [
             ("program", false, |s| s.program.0[7] += 1),
             ("space", false, |s| s.space.0[0] ^= 1),
             ("public_args", true, |s| s.public_args.push(0)),
             ("output", true, |s| s.output[99] ^= 1),
-            ("a root's kind", true, |s| s.roots[0].kind = 2),
             ("a root's window", true, |s| s.roots[1].window += 1),
             ("a root", true, |s| s.roots[1].root[31] ^= 1),
             ("the roots' order", true, |s| s.roots.swap(0, 1)),

@@ -8,11 +8,11 @@
 
 use alloc::vec::Vec;
 
-use crate::codec::{self, Reader};
 use crate::{
     Admitted, DecodeError, ProgramId, Refusal, RootRead, Statement, StatementId, Venue, admit,
     decode_program, judge,
 };
+use vos_anchor::codec::{self, Reader};
 
 /// A venue's state as lists.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -77,7 +77,7 @@ impl Input {
         let program = decode_program(&mut reader)?;
         let count = reader.count(4)?;
         let formats = (0..count).map(|_| reader.u32()).collect::<Result<_, _>>()?;
-        let count = reader.count(crate::ROOT_READ_BYTES)?;
+        let count = reader.count(RootRead::BYTES)?;
         let anchors = (0..count)
             .map(|_| RootRead::decode_from(&mut reader))
             .collect::<Result<_, _>>()?;
@@ -188,6 +188,18 @@ mod tests {
                 i.statement.space = crate::SpaceId::NONE;
             }),
             0x100 | 1
+        );
+        // A rooted statement claiming no space, its roots of none too,
+        // anchored: refused as a claim, before any anchor is looked up.
+        assert_eq!(
+            refusal(|i| {
+                i.statement.space = crate::SpaceId::NONE;
+                for root in &mut i.statement.roots {
+                    root.space = crate::SpaceId::NONE;
+                }
+                i.policy.anchors = i.statement.roots.clone();
+            }),
+            4
         );
         assert_eq!(judge_bytes(&bytes[..40]).unwrap_err().code(), 1);
     }

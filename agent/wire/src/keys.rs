@@ -135,6 +135,8 @@ enum Row {
     LiveWorkflows = 0x16,
     WorkflowPins = 0x17,
     Target = 0x18,
+    Space = 0x19,
+    Clock = 0x1a,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: a committed
@@ -421,6 +423,18 @@ pub fn installed_prefix() -> Vec<u8> {
 /// must ([`crate::abi::cap::Target`]).
 pub fn target() -> Vec<u8> {
     Row::Target.prefix().to_vec()
+}
+
+/// The space the agent belongs to ([`crate::SpaceId`]), which its first
+/// install names and every later one must.
+pub fn space() -> Vec<u8> {
+    Row::Space.prefix().to_vec()
+}
+
+/// The clock that numbers the agent's windows ([`crate::WindowClock`]), its
+/// space's, which its first install names and every later one must.
+pub fn clock() -> Vec<u8> {
+    Row::Clock.prefix().to_vec()
 }
 
 /// A principal's role byte in this agent.

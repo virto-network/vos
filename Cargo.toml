@@ -25,6 +25,7 @@ members = [
     "pvm/proof/recair",
     "pvm/proof/final-verifier",
     "pvm/proof/statement",
+    "pvm/proof/anchor",
     "pvm/proof/derive",
     "pvm/proof/verifier",
     "pvm/bench",
@@ -146,6 +147,7 @@ vos-pvm-recair-air = { path = "pvm/proof/recair-air" }
 vos-pvm-recair = { path = "pvm/proof/recair" }
 vos-pvm-final-verifier = { path = "pvm/proof/final-verifier" }
 vos-statement = { path = "pvm/proof/statement" }
+vos-anchor = { path = "pvm/proof/anchor" }
 vos-pvm = { path = "pvm/runtime" }
 vos-pvm-compiler = { path = "pvm/compiler" }
 vos-pvm-program = { path = "pvm/program" }

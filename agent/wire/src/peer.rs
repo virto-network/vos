@@ -13,6 +13,7 @@ use alloc::vec::Vec;
 
 use scale::{Decode, Encode};
 
+use crate::SpaceId;
 use crate::batch::Message;
 use crate::ids::{AgentId, ProgramHash};
 use crate::ingress::{Call, Response};
@@ -147,6 +148,9 @@ pub struct CreationRecord {
     /// Accumulate's gas, the same on every replica, so every replica
     /// applies the same writes.
     pub accumulate_gas: u64,
+    /// The space it belongs to, its genesis's hash; [`SpaceId::NONE`] on a
+    /// node whose space has no genesis.
+    pub space: SpaceId,
 }
 
 impl CreationRecord {

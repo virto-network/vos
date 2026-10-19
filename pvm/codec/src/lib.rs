@@ -14,6 +14,8 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 
+#[cfg(feature = "anchor")]
+mod anchor;
 mod error;
 
 pub use error::DecodeError;

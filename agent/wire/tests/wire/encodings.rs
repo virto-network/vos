@@ -170,8 +170,21 @@ fn installs_keep_their_bytes() {
         derivation: derivation.clone(),
         roles: vec![(b"m".to_vec(), 7)],
         target: Target::Jam,
+        space: vos_wire::SpaceId([0xa1; 32]),
+        clock: vos_wire::WindowClock {
+            origin_ms: 0x0102_0304_0506_0708,
+            length_ms: 600_000,
+        },
     };
-    let fields = [&5u32.to_le_bytes()[..], &derived, &roles, &[1]].concat();
+    // The space's 32 bytes, then the clock's origin and length, each a
+    // little-endian `u64`, as `vos-anchor` encodes them.
+    let space = [
+        &[0xa1; 32][..],
+        &[8, 7, 6, 5, 4, 3, 2, 1],
+        &600_000u64.to_le_bytes(),
+    ]
+    .concat();
+    let fields = [&5u32.to_le_bytes()[..], &derived, &roles, &[1], &space].concat();
     assert_eq!(admin.encode(), [&[0][..], &fields].concat());
 
     let installed = Installed {
@@ -665,6 +678,7 @@ fn peer_messages_keep_their_bytes() {
         time: 0,
         program: ProgramHash([0; 32]),
         accumulate_gas: 0,
+        space: vos_wire::SpaceId::NONE,
     };
     let order = Order {
         term: 2,
