@@ -70,7 +70,7 @@ impl Witnessed {
                 .map(|row| {
                     (
                         row.key.as_slice(),
-                        value_hash(&Blake2b, &row.salt, committed(&row.key, &row.value)),
+                        value_hash(&Blake2b, &row.salt, leaf_bytes(&row.key, &row.value)),
                     )
                 })
                 .collect();
@@ -168,7 +168,7 @@ impl Witnessed {
 fn commitment(key: &[u8], opened: &Opened) -> Option<Hash> {
     match opened {
         Opened::Absent => None,
-        Opened::Value { salt, value } => Some(value_hash(&Blake2b, salt, committed(key, value))),
+        Opened::Value { salt, value } => Some(value_hash(&Blake2b, salt, leaf_bytes(key, value))),
         Opened::Written(value_hash) => Some(*value_hash),
     }
 }
@@ -177,7 +177,7 @@ fn commitment(key: &[u8], opened: &Opened) -> Option<Hash> {
 /// which the witness carries and apply reads: a committed row's bare
 /// value, as a VOS node's root commits it ([`leaf_value`]). Traps on a
 /// committed row stored as no value row.
-fn committed<'a>(key: &[u8], stored: &'a [u8]) -> &'a [u8] {
+fn leaf_bytes<'a>(key: &[u8], stored: &'a [u8]) -> &'a [u8] {
     leaf_value(key, stored).expect("a committed row stored as a value row")
 }
 
@@ -231,11 +231,11 @@ pub(crate) fn run(agent: AgentId, package: Package) -> Vec<u8> {
         .writes
         .into_iter()
         .map(|(key, value)| {
-            let commitment = value.map(|value| {
+            let committed = value.map(|value| {
                 let salt = salt(&Blake2b, &seed, &key);
-                value_hash(&Blake2b, &salt, committed(&key, &value))
+                value_hash(&Blake2b, &salt, leaf_bytes(&key, &value))
             });
-            (key, commitment)
+            (key, committed)
         })
         .collect();
     let mut tree = witnessed.tree;

@@ -326,9 +326,11 @@ pub fn committed(map: &MapId, transformed: &[u8]) -> Vec<u8> {
 }
 
 /// Whether `key` is a committed map's value row, whose value carries the
-/// version that wrote it: decided by its first byte.
+/// version that wrote it: decided by its first byte alone. Every key under
+/// `0x03` is one; anything else stored there is corrupt, and reading it as
+/// a value row fails ([`crate::records::leaf_value`]).
 pub fn is_committed(key: &[u8]) -> bool {
-    key.len() > COMMITTED_PREFIX && key[0] == Owner::Committed as u8
+    key.first() == Some(&(Owner::Committed as u8))
 }
 
 /// The map and transformed key a value row's key names; `None` for any
@@ -417,14 +419,20 @@ pub fn built() -> Vec<u8> {
     TreeRow::Built.prefix().to_vec()
 }
 
-/// The prefixes of everything an instance owns, its struct and tables', and
-/// its committed maps'; its ABI reaches nothing else.
+/// The prefix of an instance's struct and table rows.
+pub fn instance_rows(instance: InstanceId) -> Vec<u8> {
+    key(&[&[Owner::Instance as u8], &instance.0.to_be_bytes()])
+}
+
+/// The prefix of an instance's committed maps' rows.
+pub fn instance_committed(instance: InstanceId) -> Vec<u8> {
+    key(&[&[Owner::Committed as u8], &instance.0.to_be_bytes()])
+}
+
+/// The prefixes of everything an instance owns, [`instance_rows`] and
+/// [`instance_committed`]; its ABI reaches nothing else.
 pub fn instance_prefixes(instance: InstanceId) -> [Vec<u8>; 2] {
-    let id = instance.0.to_be_bytes();
-    [
-        key(&[&[Owner::Instance as u8], &id]),
-        key(&[&[Owner::Committed as u8], &id]),
-    ]
+    [instance_rows(instance), instance_committed(instance)]
 }
 
 /// The program an instance runs.

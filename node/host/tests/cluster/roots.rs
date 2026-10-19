@@ -28,7 +28,7 @@ fn entries(node: &Node, agent: AgentId) -> MapId {
     let tag = table_tag("entries");
     node.store()
         .snapshot()
-        .scan(agent, &keys::instance_prefixes(COUNTER)[1], None)
+        .scan(agent, &keys::instance_committed(COUNTER), None)
         .find_map(|row| {
             let (key, _) = row.unwrap();
             keys::committed_entry(&key)

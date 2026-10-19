@@ -6,6 +6,7 @@ use vos_wire::batch::Batch;
 use vos_wire::ids::{AgentId, InstanceId, MapId, ProgramHash, Session, SessionId, WorkflowId};
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer};
 use vos_wire::keys::{self, Due, Transform};
+use vos_wire::records::{leaf_value, stored};
 use vos_wire::result::WorkResult;
 
 use crate::strategies::*;
@@ -229,6 +230,14 @@ proptest! {
         } else {
             prop_assert_eq!(keys::row(map.instance, rows, &key), Err(Failure::Cap));
         }
+        // Every key under 0x03 is committed, however short; one too short
+        // to name a map and a key is no value row, and no leaf reads it.
+        for short in [vec![0x03], keys::committed_rows(&map)] {
+            prop_assert!(keys::is_committed(&short));
+            prop_assert_eq!(keys::committed_entry(&short), None);
+        }
+        let short = stored(&[1]);
+        prop_assert_eq!(leaf_value(&[0x03, 1], &short), None);
         let leaf = keys::tree_leaf(&value);
         prop_assert_eq!(keys::committed_entry(&leaf), None);
         prop_assert!(!keys::is_committed(&leaf));

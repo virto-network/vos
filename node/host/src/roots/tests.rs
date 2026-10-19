@@ -419,11 +419,25 @@ where
         .map_or_else(|| empty_root(&Blake2b), |node| *node.hash())
 }
 
+/// Rows of owners beside `0x03` on both sides of it, for JAM's tree.
+fn siblings(round: u64) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+    let table = keys::table_rows(InstanceId(1), 5, Transform::Hashed);
+    BTreeMap::from([
+        (
+            [table, Transform::Hashed.apply(&round.to_be_bytes())].concat(),
+            Some(stored(&round.encode())),
+        ),
+        (keys::instance_struct(InstanceId(2)), Some(stored(&[7]))),
+        (vec![0x04, round as u8], Some(stored(&[8]))),
+    ])
+}
+
 /// The agent's root is the node of JAM's tree over the whole keyspace at
 /// `0x03`, and each committed map's root the node at the map's prefix,
 /// byte for byte: over random rows of maps of two instances and either
-/// transform, among rows of every other owner, written over several
-/// versions and built in batches of any size; over one row; and over none.
+/// transform, among rows of other owners, written over several versions
+/// and built in batches of any size; over one row; and over none, among
+/// rows of other owners still.
 #[test]
 fn roots_are_nodes_of_jams_tree() {
     let maps = [
@@ -451,7 +465,15 @@ fn roots_are_nodes_of_jams_tree() {
             let writes: Vec<Committed> = (0..count)
                 .map(|_| {
                     let target = maps[random.below(maps.len() as u64) as usize];
-                    let raw = key(random.below(64));
+                    // Among them the longest ordered key, its zero bytes
+                    // escaped past one block, and a key beside its own
+                    // extension, which the escape keeps prefix-free.
+                    let raw = match random.below(16) {
+                        0 => vec![0; vos_wire::abi::cap::ORDERED_KEY],
+                        1 => vec![1],
+                        2 => vec![1, 0],
+                        _ => key(random.below(64)),
+                    };
                     let value = (case == 1 || random.below(5) != 0).then(|| random.next().encode());
                     (target, raw, value)
                 })
@@ -477,14 +499,12 @@ fn roots_are_nodes_of_jams_tree() {
                 })
                 .map(|row| (row.key, row.value))
                 .collect();
-            let table = keys::table_rows(InstanceId(1), 5, Transform::Hashed);
-            on_jam.insert(
-                [table, Transform::Hashed.apply(&round.to_be_bytes())].concat(),
-                Some(stored(&round.encode())),
-            );
-            on_jam.insert(keys::instance_struct(InstanceId(2)), Some(stored(&[7])));
-            on_jam.insert(vec![0x04, round as u8], Some(stored(&[8])));
+            on_jam.extend(siblings(round));
             jam.write(on_jam, &seed(agent.version)).unwrap();
+        }
+        if rounds == 0 {
+            // No committed row, in a tree that holds others.
+            jam.write(siblings(0), &seed(0)).unwrap();
         }
         agent.build([1, 7, super::BATCH][(case % 3) as usize]);
         let snapshot = agent.store.snapshot();
@@ -512,8 +532,6 @@ fn roots_are_nodes_of_jams_tree() {
                 "one row: its leaf"
             );
         }
-        if rounds > 0 {
-            assert_ne!(jam.root().unwrap(), root_vos, "JAM's tree holds more");
-        }
+        assert_ne!(jam.root().unwrap(), root_vos, "JAM's tree holds more");
     }
 }

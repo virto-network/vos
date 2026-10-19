@@ -715,8 +715,10 @@ The Local (replica-only) lane is deferred until a use case needs it.
   writing version's seed and the full key; JAM's whole-keyspace tree
   hashes `0x03` leaves the same way (its witness still carries the stored
   rows), so the agent's root is the node at `0x03` of JAM's tree, and a
-  map's the node at its prefix. A space has a root per window, built by
-  its representative (`proving.md` §7).
+  map's the node at its prefix. Every key under `0x03` is a committed
+  value row; anything else stored there is corrupt, and both hosts fail on
+  it. A space has a root per window, built by its representative
+  (`proving.md` §7).
 
 ### 9.4 Merge lane
 

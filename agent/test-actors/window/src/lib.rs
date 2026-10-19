@@ -40,7 +40,8 @@ pub const REFUSED_J: u8 = 4;
 pub const WINDOW: u8 = 16;
 
 /// The space's accounts: the committed map of hashed keys, tag 1, of the
-/// agent's instance 0, which the rows are read from.
+/// agent's instance 0, which the rows are read from. It stands in for the
+/// map an attestable `&self` view names from its struct's field.
 pub const ACCOUNTS: (InstanceId, Rows) = (
     InstanceId(0),
     Rows::Committed {
