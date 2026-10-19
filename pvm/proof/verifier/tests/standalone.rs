@@ -1,22 +1,22 @@
 use stwo::core::proof::StarkProof;
-use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
 use vos_pvm_proof::pcs::PcsStack;
+use vos_pvm_proof::poseidon2::{P2MerkleChannel, P2MerkleHasher};
 
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{Proof, SideNote, prove};
 use vos_pvm_proof_verifier::{CommitmentHash, verify_standalone};
 
-/// The Blake2s Stark proof of a format-36 proof.
-fn stark(proof: &mut Proof) -> &mut StarkProof<Blake2sMerkleHasher> {
-    Blake2sMerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Blake2s proof")
+/// The Poseidon2-M31 Stark proof of a format-35 proof.
+fn stark(proof: &mut Proof) -> &mut StarkProof<P2MerkleHasher> {
+    P2MerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Poseidon2-M31 proof")
 }
 
 /// [`stark`], read only.
-fn stark_ref(proof: &Proof) -> &StarkProof<Blake2sMerkleHasher> {
-    Blake2sMerkleChannel::stark(&proof.stark_proof).expect("a Blake2s proof")
+fn stark_ref(proof: &Proof) -> &StarkProof<P2MerkleHasher> {
+    P2MerkleChannel::stark(&proof.stark_proof).expect("a Poseidon2-M31 proof")
 }
 
 fn assert_hostile_proof_rejected_without_panic(
@@ -283,8 +283,7 @@ fn standalone_verify_add64() {
     // Per-vector bounds alone used to permit multi-gigabyte Cartesian
     // products. Keep every individual vector within its protocol ceiling but
     // exceed the named aggregate heap budget; both owned-proof verifier
-    // funnels must reject before entering Stwo. Refine's borrowed bundle
-    // funnel separately runs the same check before cloning children.
+    // funnels must reject before entering Stwo.
     let mut aggregate = proof;
     aggregate.pcs_config.fri_config.n_queries = vos_pvm_proof::proof::MAX_FRI_QUERIES;
     stark(&mut aggregate).0.config = aggregate.pcs_config;
@@ -343,7 +342,7 @@ fn standalone_verify_rejects_wrong_commitment() {
     let proof = prove(&mut side_note).expect("proving failed");
 
     // Use a wrong commitment
-    let wrong_commitment = vos_pvm_proof_verifier::CommitmentHash::Blake2s(Default::default());
+    let wrong_commitment = vos_pvm_proof_verifier::CommitmentHash::Poseidon2M31(Default::default());
 
     let result = verify_standalone(proof, wrong_commitment);
     assert!(
@@ -417,15 +416,11 @@ fn standalone_verify_rejects_format_version_mismatch() {
     );
 }
 
-// pcs_config policy floor.  A proof generated with a
-// weaker PcsConfig (lower pow_bits / fewer FRI queries / smaller
-// blowup) than PcsPolicy::STANDARD must be rejected by the
-// default verify_standalone path before any cryptographic work.
+// A proof's parameters are its format's: one weakened below the floors,
+// its outer and embedded configs both relabelled, is refused before any
+// cryptographic work.
 #[test]
 fn standalone_verify_rejects_weak_pcs_config() {
-    use stwo::core::{fri::FriConfig, pcs::PcsConfig};
-    use vos_pvm_proof::prove_with_config;
-
     let code = vec![Opcode::Trap as u8];
     let bitmask = vec![1];
     let registers = [0u64; PVM_REGISTER_COUNT];
@@ -442,71 +437,18 @@ fn standalone_verify_rejects_weak_pcs_config() {
     tracing.run();
     let steps = tracing.into_trace();
 
-    // Prove with a config below STANDARD policy: pow_bits = 0, only
-    // 1 FRI query.  Honest prover output but at "test-grade" security.
-    let weak_config = PcsConfig {
-        pow_bits: 0,
-        fri_config: FriConfig::new(0, 4, 1, 1),
-        lifting_log_size: None,
-        deep_batching: Default::default(),
-    };
     let mut side_note = SideNote::new(steps, code, bitmask);
-    let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
+    let proof = prove(&mut side_note).expect("proving failed");
     let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
+    let weak = mutate_pcs_config(proof, |config| config.pow_bits = 0);
 
-    let err = vos_pvm_proof_verifier::verify_standalone(proof, preprocessed_commitment)
-        .expect_err("default verify_standalone must reject weak pcs_config");
+    let err = vos_pvm_proof_verifier::verify_standalone(weak, preprocessed_commitment)
+        .expect_err("verify_standalone must refuse a weakened config");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("pow_bits") || msg.contains("n_queries"),
-        "expected pcs_config policy rejection, got: {msg}"
+        msg.contains("below format 35's floor"),
+        "expected the format's floor, got: {msg}"
     );
-}
-
-#[test]
-fn standalone_verify_accepts_weak_pcs_config_with_relaxed_policy() {
-    use stwo::core::{fri::FriConfig, pcs::PcsConfig};
-    use vos_pvm_proof::prove_with_config;
-
-    let code = vec![Opcode::Trap as u8];
-    let bitmask = vec![1];
-    let registers = [0u64; PVM_REGISTER_COUNT];
-
-    let pvm = Interpreter::new(
-        code.clone(),
-        bitmask.clone(),
-        vec![],
-        registers,
-        vec![0u8; 4 * 1024 * 1024],
-        1000,
-    );
-    let mut tracing = TracingPvm::new(pvm);
-    tracing.run();
-    let steps = tracing.into_trace();
-
-    let weak_config = PcsConfig {
-        pow_bits: 0,
-        fri_config: FriConfig::new(0, 4, 1, 1),
-        lifting_log_size: None,
-        deep_batching: Default::default(),
-    };
-    let mut side_note = SideNote::new(steps, code, bitmask);
-    let proof = prove_with_config(&mut side_note, weak_config).expect("proving failed");
-    let preprocessed_commitment = proof.preprocessed_commitment().unwrap();
-
-    // Relaxed policy that allows weaker configs (e.g. for test
-    // harnesses).  The proof must verify under this policy.
-    let test_policy = vos_pvm_proof_verifier::PcsPolicy {
-        min_pow_bits: 0,
-        min_fri_queries: 1,
-        min_fri_log_blowup: 4,
-    };
-    vos_pvm_proof_verifier::verify_standalone_with_pcs_policy(
-        proof,
-        preprocessed_commitment,
-        &test_policy,
-    )
-    .expect("relaxed-policy verify must accept the weak proof");
 }
 
 // log_size cap test.  We don't need to forge a giant proof

@@ -12,8 +12,8 @@
 //! broken and no chip-isolated validation can proceed.
 
 use vos_pvm_proof::{
-    FriConfig, PcsConfig, PcsPolicy, SideNote, chips, harness::MachineProverComponent,
-    prove_with_explicit_components, verify_with_explicit_components,
+    SideNote, chips, harness::MachineProverComponent, prove_with_explicit_components,
+    verify_with_explicit_components,
 };
 
 /// Minimal bound-1-only configuration.  These chips all declare
@@ -48,15 +48,7 @@ const BOUND1_HARNESS_COMPONENTS: &[&'static dyn MachineProverComponent] =
 fn harness_smoke_bound1_only() {
     let mut side_note = SideNote::new(Vec::new(), Vec::new(), Vec::new());
 
-    // Minimal valid PcsConfig — fast prove for a smoke test.
-    let config = PcsConfig {
-        pow_bits: 5,
-        fri_config: FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-        deep_batching: Default::default(),
-    };
-
-    let proof = prove_with_explicit_components(&mut side_note, config, BOUND1_HARNESS_COMPONENTS)
+    let proof = prove_with_explicit_components(&mut side_note, BOUND1_HARNESS_COMPONENTS)
         .expect("harness smoke: prove failed on bound-1 AIR — wiring bug");
 
     // Build the verifier-trait slice via upcast.
@@ -66,21 +58,11 @@ fn harness_smoke_bound1_only() {
             .map(|c| *c as &dyn vos_pvm_proof::harness::MachineComponent)
             .collect();
 
-    // Cheap policy matching the cheap PcsConfig — production verify
-    // would use PcsPolicy::STANDARD; the harness accepts its own cheap
-    // config to keep chip-isolated validation cycles fast.
-    let policy = PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-
     verify_with_explicit_components(
         proof,
         &side_note,
         &verifier_components,
         BOUND1_HARNESS_COMPONENTS,
-        &policy,
     )
     .expect("harness smoke: verify failed on bound-1 AIR — wiring bug");
 }
@@ -130,16 +112,9 @@ fn harness_blake2b_isolated() {
         f: true,
     });
 
-    let config = PcsConfig {
-        pow_bits: 5,
-        fri_config: FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-        deep_batching: Default::default(),
-    };
-
     let components: &[&'static dyn MachineProverComponent] = &[&chips::Blake2bChip];
 
-    let proof = prove_with_explicit_components(&mut side_note, config, components).expect(
+    let proof = prove_with_explicit_components(&mut side_note, components).expect(
         "Blake2bChip harness: prove failed — chip-flatten regression \
                  (the OODS sanity check fired; degree ≥ 3 constraint slipped in)",
     );
@@ -149,19 +124,8 @@ fn harness_blake2b_isolated() {
         .map(|c| *c as &dyn vos_pvm_proof::harness::MachineComponent)
         .collect();
 
-    let policy = PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-
-    let verify_result = verify_with_explicit_components(
-        proof,
-        &side_note,
-        &verifier_components,
-        components,
-        &policy,
-    );
+    let verify_result =
+        verify_with_explicit_components(proof, &side_note, &verifier_components, components);
 
     // Expect open-chain rejection (lookups don't close without producer chips).
     use stwo::core::verifier::VerificationError;
@@ -199,16 +163,9 @@ fn harness_blake2b_boundary_isolated() {
         f: true,
     });
 
-    let config = PcsConfig {
-        pow_bits: 5,
-        fri_config: FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-        deep_batching: Default::default(),
-    };
-
     let components: &[&'static dyn MachineProverComponent] = &[&chips::Blake2bBoundaryChip];
 
-    let proof = prove_with_explicit_components(&mut side_note, config, components).expect(
+    let proof = prove_with_explicit_components(&mut side_note, components).expect(
         "Blake2bBoundaryChip harness: prove failed — IsReal anchor / production / \
          shared-core-under-distinct-prefix regression (OODS sanity check fired)",
     );
@@ -218,19 +175,8 @@ fn harness_blake2b_boundary_isolated() {
         .map(|c| *c as &dyn vos_pvm_proof::harness::MachineComponent)
         .collect();
 
-    let policy = PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-
-    let verify_result = verify_with_explicit_components(
-        proof,
-        &side_note,
-        &verifier_components,
-        components,
-        &policy,
-    );
+    let verify_result =
+        verify_with_explicit_components(proof, &side_note, &verifier_components, components);
 
     use stwo::core::verifier::VerificationError;
     match verify_result {
@@ -280,12 +226,6 @@ fn harness_cpuchip_isolated_add64() {
     let steps = tracing.into_trace();
 
     let mut side_note = SideNote::new(steps, code, bitmask);
-    let config = PcsConfig {
-        pow_bits: 5,
-        fri_config: FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-        deep_batching: Default::default(),
-    };
 
     // Just CpuChip — if its flatten is OK, prove succeeds and verify
     // rejects on lookup imbalance.  If its flatten has a degree or
@@ -293,7 +233,7 @@ fn harness_cpuchip_isolated_add64() {
     // OODS sanity check.
     let components: &[&'static dyn MachineProverComponent] = &[&chips::CpuChip];
 
-    prove_with_explicit_components(&mut side_note, config, components)
+    prove_with_explicit_components(&mut side_note, components)
         .expect("CpuChip-only prove failed — chip flatten regression");
 }
 

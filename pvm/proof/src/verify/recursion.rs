@@ -29,7 +29,7 @@ pub struct ComponentOodsMask {
 
 /// The OODS data reconstructed from a real canonical segment proof by replaying
 /// the verifier's Fiat-Shamir transcript (the channel-affecting steps of
-/// `verify_with_options_explicit_components` + the stwo verifier head) — the
+/// `verify_components` + the stwo verifier head) — the
 /// inputs the recursion verifier-AIR re-evaluates the inner composition against,
 /// plus the proof's own `composition_oods_eval` (the DEEP-ALI ground truth).
 pub struct OodsReconstruction {

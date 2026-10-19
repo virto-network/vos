@@ -1,11 +1,10 @@
-//! Proving the BLAKE2b precompile on the Gray Paper refine path.
+//! Proving the BLAKE2b precompile in a segment proof (format 35).
 //!
 //! `precompile prove <n>`: trace, prove, encode and verify n hashes. Run one
 //! size per process: peak RSS is per process, and proving needs 4–24 GiB.
 //! `precompile tamper <n> call-input|memory-output|unacknowledged`: corrupt a
-//! recorded call; proving or verification must reject it.
-//! `precompile tamper-stark <n>`: corrupt a call input and verify each child
-//! STARK alone, without replay.
+//! recorded call; proving, or verification against the honest run's
+//! program, must reject it.
 //! `precompile native`: the native cost of serving one compression, in
 //! nanoseconds and time-stamp-counter cycles, and the gas the guest pays
 //! for one compression in software on a JAM host. The VOS price is set from
@@ -16,8 +15,8 @@
 use std::time::Instant;
 
 use vos_pvm_bench::GAS;
-use vos_pvm_proof::refine_codec::encode_refine_proof_bundle;
-use vos_pvm_proof::{prove_refine, trace_refine_with_output, verify_refine_bundle_replayed};
+use vos_pvm_proof::kernel::trace_program;
+use vos_pvm_proof::{prove, verify};
 
 fn peak_rss_mib() -> f64 {
     std::fs::read_to_string("/proc/self/status")
@@ -32,26 +31,23 @@ fn peak_rss_mib() -> f64 {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let spi = vos_pvm_bench::guest_program("hash-precompile");
+    let trace = |arguments: &[u8]| trace_program(&spi, arguments, GAS).expect("trace");
     match args.get(1).map(String::as_str).unwrap_or_default() {
         "prove" => {
-            let spi = vos_pvm_bench::guest_program("hash-precompile");
             let n: u64 = args[2].parse().unwrap();
             let arguments = n.to_le_bytes();
             let started = Instant::now();
-            let (trace, _) = trace_refine_with_output(&spi, &arguments, GAS, 32).expect("trace");
+            let mut side_note = trace(&arguments).side_note;
             let traced = started.elapsed();
-            let steps: usize = trace.slices.iter().map(|s| s.side_note.num_steps()).sum();
-            let calls: usize = trace
-                .slices
-                .iter()
-                .map(|s| s.side_note.blake2b_calls.len())
-                .sum();
+            let steps = side_note.num_steps();
+            let calls = side_note.blake2b_calls.len();
             let started = Instant::now();
-            let bundle = prove_refine(trace).expect("prove");
+            let proof = prove(&mut side_note).expect("prove");
             let proved = started.elapsed();
-            let bytes = encode_refine_proof_bundle(&bundle).expect("encode");
+            let bytes = postcard::to_allocvec(&proof).expect("encode");
             let started = Instant::now();
-            verify_refine_bundle_replayed(&bundle, &spi, &arguments, GAS).expect("verify");
+            verify(proof, &side_note).expect("verify");
             let verified = started.elapsed();
             println!(
                 "{n} hashes: {steps} steps, {calls} precompile calls; trace {:.2} s, prove {:.2} s, \
@@ -66,13 +62,11 @@ fn main() {
         "tamper" => {
             // Corrupt the recorded compression input (or its output bytes in
             // the memory ledger); proving or verification must reject it.
-            let spi = vos_pvm_bench::guest_program("hash-precompile");
             let n: u64 = args[2].parse().unwrap();
             let what = args[3].as_str();
             let arguments = n.to_le_bytes();
-            let (mut trace, _) =
-                trace_refine_with_output(&spi, &arguments, GAS, 32).expect("trace");
-            let note = &mut trace.slices[0].side_note;
+            let honest = trace(&arguments).side_note;
+            let mut note = trace(&arguments).side_note;
             match what {
                 "call-input" => note.blake2b_calls[0].h[0] ^= 1,
                 "memory-output" => note.blake2b_mem_ops[0].out_bytes[0] ^= 1,
@@ -84,8 +78,7 @@ fn main() {
                 _ => panic!("tamper call-input|memory-output|unacknowledged"),
             }
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                prove_refine(trace)
-                    .map(|bundle| verify_refine_bundle_replayed(&bundle, &spi, &arguments, GAS))
+                prove(&mut note).map(|proof| verify(proof, &honest))
             }));
             match outcome {
                 Ok(Ok(Ok(()))) => println!("{what}: ACCEPTED (unsound)"),
@@ -94,31 +87,8 @@ fn main() {
                 Err(_) => println!("{what}: rejected (prover panicked)"),
             }
         }
-        "tamper-stark" => {
-            // Corrupt one compression input, prove, then verify each child
-            // STARK alone against an honest trace's public data: no replay.
-            let spi = vos_pvm_bench::guest_program("hash-precompile");
-            let n: u64 = args[2].parse().unwrap();
-            let arguments = n.to_le_bytes();
-            let (mut trace, _) =
-                trace_refine_with_output(&spi, &arguments, GAS, 32).expect("trace");
-            trace.slices[0].side_note.blake2b_calls[0].h[0] ^= 1;
-            let bundle = match prove_refine(trace) {
-                Ok(bundle) => bundle,
-                Err(error) => return println!("call-input: rejected at proving: {error:?}"),
-            };
-            let (honest, _) = trace_refine_with_output(&spi, &arguments, GAS, 32).expect("trace");
-            for (slice, observed) in bundle.slices.iter().zip(honest.slices) {
-                let mut side_note = observed.side_note;
-                vos_pvm_proof::prepare_side_note_for_verification(&mut side_note);
-                match vos_pvm_proof::verify(slice.proof.clone(), &side_note) {
-                    Ok(()) => println!("call-input: STARK ACCEPTED without replay"),
-                    Err(error) => println!("call-input: STARK rejected without replay: {error}"),
-                }
-            }
-        }
         "native" => native(),
-        _ => panic!("usage: precompile prove <n> | tamper <n> <what> | tamper-stark <n> | native"),
+        _ => panic!("usage: precompile prove <n> | tamper <n> <what> | native"),
     }
 }
 

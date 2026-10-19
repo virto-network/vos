@@ -11,7 +11,7 @@ different gaps:
 - **Tap-to-pay single proof** (~24k steps): RAM is already fine; the open
   question is ARM wall-clock. Estimated **~3.5–7 s on a flagship phone**
   (composed from SIMD-width/clock/bandwidth factors vs the 0.86 s x86
-  MOBILE bench — needs an on-device measurement to confirm).
+  format 36's MOBILE bench — needs an on-device measurement to confirm).
 - **Conservation-transition chain prove** (~7.8M steps): was **~26–29 GB
   peak per segment** — the original wall. As of 2026-07-14 the production
   cut is content-budgeted (32k steps / 8 pages) and a window proves at
@@ -217,9 +217,9 @@ lowers to NEON; vos-pvm-proof itself has no intrinsics. Setup-level items:
   flags, and pre-wires the `aarch64-unknown-linux-gnu` linker; the
   Android section is commented (NDK paths are machine-specific). PGO
   profile is x86-trained; retrain on-device.
-- MOBILE PcsPolicy is doubly right on ARM (4× smaller committed domain
-  = compute *and* LPDDR-bandwidth relief); STANDARD and MOBILE are the
-  same 96 conjectured bits (20 PoW + blowup·queries = 76).
+- A low blowup (format 37's 2¹; 36's former MOBILE 2²) is doubly right
+  on ARM (a smaller committed domain = compute *and* LPDDR-bandwidth
+  relief).
 - Expect Blake2s/Merkle's share of prove time to rise vs x86 (portable
   SIMD pays the 128-bit width tax; the M31 mul degrades less).
 
@@ -257,11 +257,11 @@ Emulated smoke (correctness only — qemu timings are meaningless):
 
 On the device: push
 `target/aarch64-unknown-linux-gnu/release/mobile_bench` and run
-`./mobile_bench 14` (arg = log₂ steps). It traces, proves under the
-MOBILE config, verifies, and prints per-stage wall-clock plus peak RSS
-(`VmHWM`). Reference x86 point to beat (Core Ultra 7 155H,
-target-cpu=native, idle box): log14 prove ≈ 1.7 s, peak RSS 1.3 GiB —
-and note the number is badly load-sensitive (~10× under a saturated
+`./mobile_bench 14` (arg = log₂ steps). It traces, proves under format
+35, verifies, and prints per-stage wall-clock plus peak RSS (`VmHWM`).
+Reference x86 point, under the retired format 36's MOBILE config (Core
+Ultra 7 155H, target-cpu=native, idle box): log14 prove ≈ 1.7 s, peak RSS
+1.3 GiB — and note the number is badly load-sensitive (~10× under a saturated
 box), so bench on an idle, cooled phone. The glibc binary runs on
 linux-gnu userlands (Termux glibc / proot included); stock Android
 needs `--target aarch64-linux-android` with the NDK clang linker (see

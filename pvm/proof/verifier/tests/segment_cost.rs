@@ -11,15 +11,11 @@
 //! one-segment program — `prove_canonical_format` proves the whole trace as one
 //! segment).
 //!
-//! `FORMAT` names the format the segment proves under: 36 (the default), the
-//! legacy Blake2s one, or 35, the Poseidon2-M31 one; both prove on
-//! `SimdBackend`. The harness prints which it ran.
+//! The segment proves under format 35, on `SimdBackend`.
 //!
 //! Run (one measurement per process so `VmHWM` is clean):
 //!   STEPS=7    cargo test -p vos-pvm-proof-verifier --release --test segment_cost \
 //!                measure -- --exact --nocapture
-//!   STEPS=7 FORMAT=35 cargo test -p vos-pvm-proof-verifier --release \
-//!                --test segment_cost measure -- --exact --nocapture
 
 use std::time::Instant;
 
@@ -63,11 +59,7 @@ fn measure() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(7);
-    let format = std::env::var("FORMAT")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .and_then(vos_pvm_proof::format::lookup)
-        .unwrap_or(&vos_pvm_proof::format::LEGACY_SEGMENT);
+    let format = &vos_pvm_proof::format::SEGMENT;
     let path = format!("format {} ({:?})/simd", format.number, format.channel);
 
     let (code, bitmask) = build_chain(steps);

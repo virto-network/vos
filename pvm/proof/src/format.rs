@@ -11,26 +11,22 @@
 //! | 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
 //! | 32 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
 //! | 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 |
-//! | 36 | segments, legacy encodings | Blake2s | the proof's own, 96 conjectured bits or more | 96 / — | MOBILE: 96 / 57 |
 //! | 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
 //! | 39 | the final wrap, masked | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
 //!
 //! - **The segment AIR** is the one every segment, leaf and device format
-//!   names: 35, 36 and 37 name its current form, without the columns and
+//!   names: 35 and 37 name its current form, without the columns and
 //!   next-row masks no constraint reads, and 32's leaves verify it. The
 //!   numbers that named its earlier forms are [`RETIRED`]: refused, and never
 //!   registered again. 24 to 27 and 29 named it before its hardening (the
 //!   witness input, the removal of the curve chips, the AIR audit's fixes); 31,
-//!   33 and 34 named the hardened form with those columns, 31 at 44 queries.
+//!   33 and 34 named the hardened form with those columns, 31 at 44 queries;
+//!   36 named its legacy Blake2s form, below the proven floor.
 //!   28, 30, 32 and 39 prove the recursion AIR (`vos-pvm-recair-air`) and
 //!   keep their numbers.
-//! - **36** is the Blake2s segment format the default entry points produce,
-//!   kept while the refine bundles, the chain proofs and their tests use it.
-//!   Its transcript has no interaction PoW and mixes the boundary states a
-//!   word at a time, and its parameters are the proof's own under the 96-bit
-//!   conjectured floor.
-//! - **28, 30, 32, 35, 37 and 39** use the lossless encodings
-//!   ([`Encoding::Lossless`]) and exactly their parameters. 30 and 37 are
+//! - **Every format** takes exactly its parameters, mixes the boundary
+//!   states as the boundary chips' bytes and grinds its interaction PoW
+//!   before the relation challenges. 30 and 37 are
 //!   registered and refused until their AIRs and channels exist, and 39 until
 //!   its masked AIR, prover and verifier do. 32 is registered and refused
 //!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
@@ -105,18 +101,6 @@ pub enum ChannelKind {
     Poseidon2M31,
     Blake2sM31,
     Blake2b256,
-}
-
-/// How values enter a format's hashes and transcript.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Encoding {
-    /// Format 36's: the boundary states mixed a word at a time, and no
-    /// interaction PoW.
-    Legacy,
-    /// The boundary states as the boundary chips' bytes, one M31 a byte, in
-    /// one run; every other u64 as four 16-bit limbs (a u32 two); and the
-    /// interaction PoW before the relation challenges.
-    Lossless,
 }
 
 /// How a format's DEEP quotient batches its sampled values: by powers of one
@@ -220,9 +204,7 @@ pub struct Format {
     pub number: u32,
     pub kind: ProofKind,
     pub channel: ChannelKind,
-    pub encoding: Encoding,
-    /// The parameters a proof must carry exactly, but for format 36, which
-    /// takes the proof's own and records MOBILE's here.
+    /// The parameters a proof must carry exactly.
     pub params: FormatParams,
     pub bytes: ProofBytes,
     pub masked: bool,
@@ -240,11 +222,6 @@ pub struct Format {
 }
 
 impl Format {
-    /// Whether a proof's parameters must equal [`Format::params`].
-    pub const fn exact_params(&self) -> bool {
-        matches!(self.encoding, Encoding::Lossless)
-    }
-
     /// The format's configuration, its DEEP batching among it.
     pub const fn pcs_config(&self) -> PcsConfig {
         self.params.pcs_config()
@@ -270,10 +247,6 @@ impl Format {
         self.bits.conjectured >= self.floor.conjectured && self.bits.proven >= self.floor.proven
     }
 }
-
-/// The number the default prover produces: the legacy Blake2s segment
-/// format.
-pub const LEGACY_SEGMENT_NUMBER: u32 = 36;
 
 /// Every segment AIR's widest relation (`Blake2bCompression`, 265 limbs),
 /// rounded up.
@@ -407,40 +380,10 @@ const INNER_FLOOR: SecurityFloor = SecurityFloor {
     proven: 60,
 };
 
-pub const LEGACY_SEGMENT: Format = Format {
-    number: LEGACY_SEGMENT_NUMBER,
-    kind: ProofKind::Segment,
-    channel: ChannelKind::Blake2s,
-    encoding: Encoding::Legacy,
-    params: FormatParams {
-        log_blowup: 2,
-        n_queries: 38,
-        pow_bits: 20,
-        fold_step: 1,
-        log_last_layer: 0,
-        interaction_pow_bits: 0,
-        batching: DeepBatching::Powers,
-    },
-    bytes: ProofBytes::Postcard,
-    masked: false,
-    masking: None,
-    floor: SecurityFloor {
-        conjectured: crate::proof::MIN_CONJECTURED_SECURITY_BITS,
-        proven: 0,
-    },
-    status: Status::Admitted,
-    reference: SEGMENT_REFERENCE,
-    bits: SecurityBits {
-        conjectured: 96,
-        proven: 57,
-    },
-};
-
 pub const SEGMENT: Format = Format {
     number: 35,
     kind: ProofKind::Segment,
     channel: ChannelKind::Poseidon2M31,
-    encoding: Encoding::Lossless,
     params: SEGMENT_PARAMS,
     bytes: ProofBytes::Postcard,
     masked: false,
@@ -464,7 +407,6 @@ pub const LEAF_FOLD: Format = Format {
     number: 32,
     kind: ProofKind::LeafFold,
     channel: ChannelKind::Poseidon2M31,
-    encoding: Encoding::Lossless,
     params: LEAF_FOLD_PARAMS,
     bytes: ProofBytes::Postcard,
     masked: false,
@@ -482,7 +424,6 @@ pub const WRAP: Format = Format {
     number: 28,
     kind: ProofKind::Wrap,
     channel: ChannelKind::Blake2b256,
-    encoding: Encoding::Lossless,
     params: FormatParams {
         log_blowup: 6,
         n_queries: 20,
@@ -523,7 +464,6 @@ pub const MASKED_WRAP: Format = Format {
     number: 39,
     kind: ProofKind::Wrap,
     channel: ChannelKind::Blake2b256,
-    encoding: Encoding::Lossless,
     params: FormatParams {
         log_blowup: 5,
         n_queries: 24,
@@ -545,7 +485,6 @@ pub const DEVICE_PROOF: Format = Format {
     number: 37,
     kind: ProofKind::Device,
     channel: ChannelKind::Blake2sM31,
-    encoding: Encoding::Lossless,
     params: DEVICE,
     bytes: ProofBytes::Postcard,
     masked: true,
@@ -563,7 +502,6 @@ pub const CREDENTIAL_PROOF: Format = Format {
     number: 30,
     kind: ProofKind::Credential,
     channel: ChannelKind::Blake2sM31,
-    encoding: Encoding::Lossless,
     params: DEVICE,
     bytes: ProofBytes::Postcard,
     masked: true,
@@ -578,12 +516,11 @@ pub const CREDENTIAL_PROOF: Format = Format {
 };
 
 /// Every registered format, by number.
-pub const REGISTRY: [Format; 7] = [
+pub const REGISTRY: [Format; 6] = [
     WRAP,
     CREDENTIAL_PROOF,
     LEAF_FOLD,
     SEGMENT,
-    LEGACY_SEGMENT,
     DEVICE_PROOF,
     MASKED_WRAP,
 ];
@@ -594,12 +531,16 @@ pub const REGISTRY: [Format; 7] = [
 ///   the segment AIR before its hardening; 31, 33 and 34, the segment,
 ///   legacy and device formats of the hardened AIR with the columns no
 ///   constraint reads;
+/// - **36, below the floor:** the legacy Blake2s segment format of the
+///   current AIR, its parameters the proof's own under a 96-bit conjectured
+///   floor, 57 proven bits at its MOBILE shape, below the inner formats'
+///   60; its boundary states mixed a word at a time and no interaction PoW;
 /// - **40, never registered:** the masked wrap at blowup 64 and 20 queries,
 ///   proved and measured as a candidate for 39. A proof was made under it,
 ///   so no later format takes it.
 ///
 /// So a number names one AIR and one set of parameters.
-pub const RETIRED: [u32; 9] = [24, 25, 26, 27, 29, 31, 33, 34, 40];
+pub const RETIRED: [u32; 10] = [24, 25, 26, 27, 29, 31, 33, 34, 36, 40];
 
 /// The entry for `number`, admitted or not.
 pub fn lookup(number: u32) -> Option<&'static Format> {
@@ -711,12 +652,18 @@ mod tests {
                 (30, 106, 62),
                 (32, 108, 63),
                 (35, 104, 62),
-                (36, 96, 57),
                 (37, 106, 62),
                 (39, 146, 82),
             ]
         );
         assert!(REGISTRY.iter().all(Format::meets_floors));
+        // Every format grinds an interaction PoW: the prover always grinds
+        // and the verifier always checks one.
+        assert!(
+            REGISTRY
+                .iter()
+                .all(|format| format.interaction_pow_bits() > 0)
+        );
     }
 
     /// The unrounded counts the parameters were chosen by: the segments'
@@ -807,13 +754,13 @@ mod tests {
         assert_eq!(WRAP.verifier_config(&carried), WRAP.pcs_config());
         assert_eq!(WRAP.pcs_config().deep_batching, DeepBatching::Affine);
         assert!(crate::proof::check_format_security(&WRAP, &carried, &WRAP_REFERENCE).is_ok());
-        for format in [SEGMENT, LEAF_FOLD, LEGACY_SEGMENT] {
+        for format in [SEGMENT, LEAF_FOLD] {
             assert_eq!(format.pcs_config().deep_batching, DeepBatching::Powers);
         }
     }
 
-    /// Every number names one entry; only 28, 35 and 36 are admitted, and a
-    /// segment verifier takes 35 and 36 alone; the retired numbers are
+    /// Every number names one entry; only 28 and 35 are admitted, and a
+    /// segment verifier takes 35 alone; the retired numbers are
     /// refused as retired and name no entry; every other number is refused.
     #[test]
     fn the_registry_numbers_round_trip() {
@@ -821,11 +768,11 @@ mod tests {
             assert_eq!(lookup(format.number), Some(&format));
             assert_eq!(
                 admitted(format.number).is_ok(),
-                [28, 35, 36].contains(&format.number)
+                [WRAP.number, SEGMENT.number].contains(&format.number)
             );
             assert_eq!(
                 admitted_segment(format.number).is_ok(),
-                [35, 36].contains(&format.number)
+                format.number == SEGMENT.number
             );
             assert!(!RETIRED.contains(&format.number), "{}", format.number);
         }
@@ -839,7 +786,7 @@ mod tests {
             assert!(lookup(number).is_none());
             assert!(admitted(number).is_err());
         }
-        assert_eq!(LEGACY_SEGMENT.number, crate::proof::PROOF_FORMAT_VERSION);
+        assert_eq!(SEGMENT.number, crate::proof::PROOF_FORMAT_VERSION);
     }
 
     /// A proof below either floor is refused: fewer queries than the
@@ -885,14 +832,5 @@ mod tests {
         stronger.fri_config.n_queries = 41;
         let error = check(&SEGMENT, &stronger, &SEGMENT_REFERENCE).unwrap_err();
         assert!(error.contains("differ from format 35"), "{error}");
-
-        // Format 36 takes its own parameters at its conjectured floor.
-        let standard = PcsConfig {
-            pow_bits: 20,
-            fri_config: FriConfig::new(0, 4, 19, 1),
-            lifting_log_size: None,
-            deep_batching: Default::default(),
-        };
-        assert!(check(&LEGACY_SEGMENT, &standard, &SEGMENT_REFERENCE).is_ok());
     }
 }

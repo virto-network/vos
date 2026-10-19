@@ -17,22 +17,20 @@ pub use transcript::{
     check_format_security, check_interaction_pow, format_security_bits, mix_boundary_states,
     mix_proof_fs_domain, mix_statement_header, replay_prefix,
 };
-mod policy;
 mod preflight;
-pub use policy::*;
 pub use preflight::{
     ProofProtocolShape, derive_protocol_degree_shape, expected_fiat_shamir_query_count,
     preflight_proof_dimensions, preflight_proof_structure, preflight_proof_structure_readonly,
     proof_owned_bytes, stark_fields_are_canonical,
 };
 
-/// The format the default prover produces: the legacy Blake2s segment
-/// format of [`crate::format`]. A proof's `format_version` names its entry
-/// there, and verifiers refuse a number the registry does not admit.
+/// The format the default prover produces: the segment format of
+/// [`crate::format`]. A proof's `format_version` names its entry there, and
+/// verifiers refuse a number the registry does not admit.
 ///
 /// What each format number changed: `docs/status.md`, "Proof format
 /// history".
-pub const PROOF_FORMAT_VERSION: u32 = crate::format::LEGACY_SEGMENT_NUMBER;
+pub const PROOF_FORMAT_VERSION: u32 = crate::format::SEGMENT.number;
 
 /// Exact number of commitment trees in this generation of the Stwo proof:
 /// preprocessed, main, interaction, and split composition.
@@ -56,9 +54,9 @@ pub const MAX_FRI_QUERIES: usize = 256;
 pub const MAX_EXTENDED_LOG_SIZE: u32 = 30;
 /// Proof-side verification regenerates the preprocessed tree from a trusted
 /// SideNote. Larger blowups turn a small hostile proof into exponential local
-/// recommitment work; production STANDARD uses 4 and MOBILE uses 2.
+/// recommitment work; the segment format uses 2.
 pub const MAX_RECOMMIT_LOG_BLOWUP: u32 = 4;
-/// Network/refine protocol cap for a child component's unextended trace.
+/// Protocol cap for a component's unextended trace.
 pub const MAX_PROOF_LOG_SIZE: u32 = 24;
 /// Bound proof-owned Merkle witnesses before hashing or allocation-heavy work.
 pub const MAX_MERKLE_WITNESS_HASHES: usize = MAX_FRI_QUERIES * MAX_EXTENDED_LOG_SIZE as usize;
@@ -94,8 +92,7 @@ pub struct Proof {
     #[serde(default = "proof_format_version_default")]
     pub format_version: u32,
     pub stark_proof: StarkProofAny,
-    /// The interaction PoW nonce (A.1's fourth item); 0 under a format
-    /// without one.
+    /// The interaction PoW nonce (A.1's fourth item).
     #[serde(default)]
     pub interaction_pow: u64,
     pub claimed_sums: Vec<SecureField>,
@@ -158,26 +155,20 @@ impl Proof {
     /// `compute_io_hash` equality check, the intended "unbound proof"
     /// rejection.
     pub fn public_io_hash(&self) -> [u8; 32] {
-        public_io_hash_from_registers(&self.final_state.registers)
+        let mut out = [0u8; 32];
+        for (bytes, word) in out
+            .chunks_exact_mut(8)
+            .zip(&self.final_state.registers[9..13])
+        {
+            bytes.copy_from_slice(&word.to_le_bytes());
+        }
+        out
     }
 
     /// The program commitment: the preprocessed tree's root.
     pub fn preprocessed_commitment(&self) -> Option<crate::pcs::Commitment> {
         self.stark_proof.commitment(0)
     }
-}
-
-/// Exact inverse of the standard guest a2..a5 public-I/O register encoding.
-///
-/// Kept shared between finished proofs and the prover's same-run Refine
-/// observation so those two paths cannot silently disagree about word order
-/// or endianness.
-pub(crate) fn public_io_hash_from_registers(registers: &[u64; 13]) -> [u8; 32] {
-    let mut out = [0u8; 32];
-    for (index, word) in registers[9..13].iter().enumerate() {
-        out[index * 8..index * 8 + 8].copy_from_slice(&word.to_le_bytes());
-    }
-    out
 }
 
 /// The admitted format a proof names, with its Stwo proof in that format's

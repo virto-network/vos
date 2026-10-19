@@ -16,7 +16,7 @@
 
 extern crate alloc;
 
-use alloc::{boxed::Box, collections::BTreeMap, format, string::ToString, vec::Vec};
+use alloc::{boxed::Box, format, string::ToString, vec::Vec};
 use num_traits::Zero;
 use stwo::core::{
     air::Component,
@@ -28,7 +28,7 @@ use stwo_constraint_framework::{PREPROCESSED_TRACE_IDX, TraceLocationAllocator};
 
 // A proof's format selects its channel at run time; one build reads every
 // admitted format.
-use vos_pvm_proof::format::{Encoding, Format};
+use vos_pvm_proof::format::Format;
 use vos_pvm_proof::pcs::{PcsStack, ProofHash};
 
 // The proof type, the format registry `verify_standalone` admits a proof's
@@ -37,25 +37,8 @@ pub use vos_pvm_proof::format;
 pub use vos_pvm_proof::program_id::{
     ENTRY_TIMESTAMP, HALT_PC, KernelEntry, KernelProgram, LeafCircuits, ProgramId,
 };
-pub use vos_pvm_proof::refine::{
-    MAX_REFINE_CHILD_COMPONENTS, MAX_REFINE_HOST_BOUNDARIES, MAX_REFINE_PROOF_SLICES,
-    REFINE_BUNDLE_FORMAT_VERSION, REFINE_CHILD_COMMITMENT_COUNT, RefineBundleVerification,
-    RefineMachineId, RefineProgramId, RefineProofBundle, RefineSliceExit,
-    refine_arguments_commitment, refine_bundle_cardinality_is_valid, refine_bundle_commitment,
-    refine_bundle_execution_commitment, refine_bundle_terminal_public_io, refine_program_id,
-};
 pub use vos_pvm_proof::shape::{KernelShape, SegmentClass};
 pub use vos_pvm_proof::{PROOF_FORMAT_VERSION, Proof};
-// PcsPolicy floor — see SECURITY.md "Proof shape". `check_min_security` /
-// `conjectured_security_bits` / `MIN_CONJECTURED_SECURITY_BITS` are the
-// conjectured-security floor the DEFAULT `verify_standalone` path enforces
-// (accepts any 96-bit-secure shape, STANDARD and MOBILE both); the per-field
-// `PcsPolicy` + `check_pcs_policy` are the exact-pin path.
-pub use vos_pvm_proof::proof::{
-    MIN_CONJECTURED_SECURITY_BITS, PcsPolicy, STANDARD_MIN_FRI_LOG_BLOWUP,
-    STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS, check_min_security, check_pcs_policy,
-    conjectured_security_bits,
-};
 
 use vos_pvm_proof::framework_access::{
     AllLookupElements, create_verifier_components, draw_all_lookup_elements,
@@ -78,267 +61,6 @@ pub use vos_pvm_proof::pcs::Commitment as CommitmentHash;
 /// `verify_standalone_with_max_log_size` with an explicit bound.
 pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
 
-/// Trusted mapping from an exact Refine machine/program identity and proof
-/// shape to its preprocessed-trace commitment.
-///
-/// The mapping must come from an authenticated program catalog or equivalent
-/// admission record, never from the presented bundle itself. A PVM program's
-/// preprocessed commitment also depends on its selected component/log-size
-/// profile and exact PCS configuration, so the complete shape (including an
-/// explicit lifting choice) is part of the lookup key.
-pub trait RefineProgramCommitmentResolver {
-    fn resolve_preprocessed_commitment(
-        &self,
-        identity: RefineMachineId,
-        proof_format_version: u32,
-        component_mask: u32,
-        log_sizes: &[u32],
-        pcs_config: &stwo::core::pcs::PcsConfig,
-    ) -> Option<CommitmentHash>;
-}
-
-impl<F> RefineProgramCommitmentResolver for F
-where
-    F: Fn(RefineMachineId, u32, u32, &[u32], &stwo::core::pcs::PcsConfig) -> Option<CommitmentHash>,
-{
-    fn resolve_preprocessed_commitment(
-        &self,
-        identity: RefineMachineId,
-        proof_format_version: u32,
-        component_mask: u32,
-        log_sizes: &[u32],
-        pcs_config: &stwo::core::pcs::PcsConfig,
-    ) -> Option<CommitmentHash> {
-        self(
-            identity,
-            proof_format_version,
-            component_mask,
-            log_sizes,
-            pcs_config,
-        )
-    }
-}
-
-/// Verify every child STARK and the canonical Refine boundary transcript.
-///
-/// This deliberately returns [`RefineBundleVerification::ReplayRequired`]
-/// rather than `()` or `true`: a proof-only verifier cannot bind the bundle's
-/// native machine-state hashes and exit reasons to the child proof statements,
-/// or establish the native semantics of host calls 9..=14. Prover-enabled
-/// hosts close those boundaries with
-/// `vos_pvm_proof::verify_refine_bundle_replayed`, using exact outer
-/// program/argument bytes and gas. `program_commitments` must be a trusted
-/// external mapping; requiring it prevents a valid proof for an arbitrary
-/// program from being relabelled with a different
-/// [`RefineMachineId::program`](RefineMachineId::program).
-pub fn verify_refine_bundle_authenticated<R: RefineProgramCommitmentResolver + ?Sized>(
-    bundle: &RefineProofBundle,
-    expected_outer_program: RefineProgramId,
-    expected_arguments_commitment: [u8; 32],
-    expected_gas_limit: u64,
-    program_commitments: &R,
-) -> Result<RefineBundleVerification, VerificationError> {
-    // Must precede transcript construction, resolver callbacks, proof clones,
-    // and cryptographic work. Every collection length encoded as u32 in the
-    // transcript is bounded here.
-    if !refine_bundle_cardinality_is_valid(bundle) {
-        return Err(VerificationError::InvalidStructure(
-            "Refine bundle cardinality is noncanonical".to_string(),
-        ));
-    }
-    if bundle.format_version != REFINE_BUNDLE_FORMAT_VERSION {
-        return Err(VerificationError::InvalidStructure(
-            "Refine bundle format version mismatch".to_string(),
-        ));
-    }
-    if bundle.outer_program != expected_outer_program
-        || bundle.arguments_commitment != expected_arguments_commitment
-        || bundle.gas_limit != expected_gas_limit
-    {
-        return Err(VerificationError::InvalidStructure(
-            "Refine invocation identity/arguments/gas mismatch".to_string(),
-        ));
-    }
-    if bundle.transcript_commitment != refine_bundle_commitment(bundle) {
-        return Err(VerificationError::InvalidStructure(
-            "Refine transcript commitment mismatch".to_string(),
-        ));
-    }
-    let mut identities = BTreeMap::<(u32, u64), RefineProgramId>::new();
-    for (index, slice) in bundle.slices.iter().enumerate() {
-        if slice.order != index as u32 {
-            return Err(VerificationError::InvalidStructure(
-                "Refine machine slices are reordered".to_string(),
-            ));
-        }
-        match slice.identity {
-            RefineMachineId::Outer { program } if program == bundle.outer_program => {}
-            RefineMachineId::Outer { .. } => {
-                return Err(VerificationError::InvalidStructure(
-                    "Refine outer slice has the wrong program identity".to_string(),
-                ));
-            }
-            RefineMachineId::Inner {
-                slot,
-                generation,
-                program,
-            } => {
-                if identities
-                    .insert((slot, generation), program)
-                    .is_some_and(|previous| previous != program)
-                {
-                    return Err(VerificationError::InvalidStructure(
-                        "Refine inner slot/generation aliases two programs".to_string(),
-                    ));
-                }
-            }
-        }
-        let Some(actual_program_commitment) = slice.proof.preprocessed_commitment() else {
-            return Err(VerificationError::InvalidStructure(
-                "Refine child proof has no preprocessed commitment".to_string(),
-            ));
-        };
-        let Some(expected_program_commitment) = program_commitments
-            .resolve_preprocessed_commitment(
-                slice.identity,
-                slice.proof.format_version,
-                slice.proof.component_mask,
-                &slice.proof.log_sizes,
-                &slice.proof.pcs_config,
-            )
-        else {
-            return Err(VerificationError::InvalidStructure(
-                "Refine machine/program proof shape has no trusted commitment".to_string(),
-            ));
-        };
-        if actual_program_commitment != expected_program_commitment {
-            return Err(VerificationError::InvalidStructure(
-                "Refine child proof does not match its trusted program commitment".to_string(),
-            ));
-        }
-    }
-
-    if !matches!(bundle.slices[0].identity, RefineMachineId::Outer { .. }) {
-        return Err(VerificationError::InvalidStructure(
-            "Refine closure must start in the outer runtime".to_string(),
-        ));
-    }
-    // Walk the closure in execution order. This proves structural coverage,
-    // not host semantics: every handled outer host exit has exactly one
-    // boundary, only INVOKE may enclose one inner slice, and every other
-    // slice is the next outer continuation. A final handled host call can
-    // end in Panic/OutOfGas during native dispatch without another machine
-    // slice; replay is what proves that terminal transition.
-    let mut slice_index = 0usize;
-    let mut boundary_index = 0usize;
-    while slice_index < bundle.slices.len() {
-        let outer = &bundle.slices[slice_index];
-        if !matches!(outer.identity, RefineMachineId::Outer { .. }) {
-            return Err(VerificationError::InvalidStructure(
-                "Refine inner slice is outside an INVOKE boundary".to_string(),
-            ));
-        }
-        let RefineSliceExit::HostCall(call) = outer.exit else {
-            if slice_index + 1 != bundle.slices.len()
-                || outer.exit != bundle.result
-                || boundary_index != bundle.host_boundaries.len()
-            {
-                return Err(VerificationError::InvalidStructure(
-                    "Refine terminal result or slice coverage is noncanonical".to_string(),
-                ));
-            }
-            slice_index += 1;
-            continue;
-        };
-        let Ok(call) = u8::try_from(call) else {
-            return Err(VerificationError::InvalidStructure(
-                "Refine outer host call is outside the standard call range".to_string(),
-            ));
-        };
-        if !(9..=14).contains(&call) {
-            return Err(VerificationError::InvalidStructure(
-                "Refine outer host call is outside the standard call range".to_string(),
-            ));
-        }
-        let Some(boundary) = bundle.host_boundaries.get(boundary_index) else {
-            return Err(VerificationError::InvalidStructure(
-                "Refine outer host call has no matching boundary".to_string(),
-            ));
-        };
-        let expected_before = slice_index + 1;
-        if boundary.call != call || boundary.slices_before as usize != expected_before {
-            return Err(VerificationError::InvalidStructure(
-                "Refine host boundary does not match its outer call".to_string(),
-            ));
-        }
-        if boundary.registers_before != outer.proof.final_state.registers {
-            return Err(VerificationError::InvalidStructure(
-                "Refine host boundary input registers differ from the child proof exit".to_string(),
-            ));
-        }
-        let expected_after = if call == 13 {
-            match bundle.slices.get(expected_before) {
-                Some(slice) if matches!(slice.identity, RefineMachineId::Inner { .. }) => {
-                    expected_before + 1
-                }
-                _ => expected_before,
-            }
-        } else {
-            expected_before
-        };
-        if boundary.slices_after as usize != expected_after {
-            return Err(VerificationError::InvalidStructure(
-                "Refine host boundary encloses a noncanonical slice range".to_string(),
-            ));
-        }
-        if let Some(next_outer) = bundle.slices.get(expected_after)
-            && (!matches!(next_outer.identity, RefineMachineId::Outer { .. })
-                || boundary.registers_after != next_outer.proof.initial_state.registers)
-        {
-            return Err(VerificationError::InvalidStructure(
-                "Refine host boundary output registers differ from the next outer proof entry"
-                    .to_string(),
-            ));
-        }
-        boundary_index += 1;
-        slice_index = expected_after;
-
-        if slice_index == bundle.slices.len()
-            && (expected_after != expected_before
-                || !matches!(
-                    bundle.result,
-                    RefineSliceExit::Panic | RefineSliceExit::OutOfGas
-                )
-                || boundary_index != bundle.host_boundaries.len())
-        {
-            return Err(VerificationError::InvalidStructure(
-                "Refine final host transition/result is noncanonical".to_string(),
-            ));
-        }
-    }
-    if boundary_index != bundle.host_boundaries.len() {
-        return Err(VerificationError::InvalidStructure(
-            "Refine bundle has an extra host boundary".to_string(),
-        ));
-    }
-
-    // Perform expensive cryptographic verification only after all bounded
-    // structural checks. The checked access above makes an empty commitment
-    // vector a normal hostile-input error rather than a panic.
-    for slice in &bundle.slices {
-        let Some(program_commitment) = slice.proof.preprocessed_commitment() else {
-            return Err(VerificationError::InvalidStructure(
-                "Refine child proof has no preprocessed commitment".to_string(),
-            ));
-        };
-        verify_standalone(slice.proof.clone(), program_commitment)?;
-    }
-
-    Ok(RefineBundleVerification::ReplayRequired {
-        transcript_commitment: bundle.transcript_commitment,
-    })
-}
-
 /// Verify a PVM execution proof.
 ///
 /// # Arguments
@@ -353,11 +75,7 @@ pub fn verify_standalone(
     proof: Proof,
     preprocessed_commitment: CommitmentHash,
 ) -> Result<(), VerificationError> {
-    // Default: the conjectured-security floor, which accepts any 96-bit-secure
-    // shape (STANDARD and MOBILE both) while rejecting degenerate FRI shapes.
-    // `None` selects that floor; the strict `verify_standalone_with_pcs_policy`
-    // path passes an exact `PcsPolicy`.
-    verify_standalone_shaped(proof, preprocessed_commitment, DEFAULT_MAX_LOG_SIZE, None)
+    verify_standalone_shaped(proof, preprocessed_commitment, DEFAULT_MAX_LOG_SIZE)
 }
 
 /// Same as `verify_standalone` but with a caller-supplied per-component
@@ -375,42 +93,17 @@ pub fn verify_standalone_with_max_log_size(
     preprocessed_commitment: CommitmentHash,
     max_log_size: u32,
 ) -> Result<(), VerificationError> {
-    // Shares `verify_standalone`'s default FRI-shape floor (conjectured
-    // security). Only the log_size cap differs.
-    verify_standalone_shaped(proof, preprocessed_commitment, max_log_size, None)
+    verify_standalone_shaped(proof, preprocessed_commitment, max_log_size)
 }
 
-/// Enforce a custom `PcsPolicy` (FRI shape + PoW floor)
-/// on `proof.pcs_config`.  The default `verify_standalone` accepts any shape
-/// meeting the conjectured-security floor; reach for this to pin an EXACT
-/// shape (stricter deployments) or to accept a looser test-harness shape.
-/// See SECURITY.md "Proof shape".
-pub fn verify_standalone_with_pcs_policy(
-    proof: Proof,
-    preprocessed_commitment: CommitmentHash,
-    policy: &PcsPolicy,
-) -> Result<(), VerificationError> {
-    verify_standalone_shaped(
-        proof,
-        preprocessed_commitment,
-        DEFAULT_MAX_LOG_SIZE,
-        Some(policy),
-    )
-}
-
-/// Shared verify funnel. `policy` selects the FRI-shape floor: `None` = the
-/// conjectured-security floor (the default paths — accepts STANDARD and
-/// MOBILE), `Some(p)` = an exact `PcsPolicy` pin (the strict `*_with_pcs_policy`
-/// path). The public `verify_standalone*` entry points funnel here.
+/// Shared verify funnel: the public `verify_standalone*` entry points
+/// funnel here.
 fn verify_standalone_shaped(
     mut proof: Proof,
     preprocessed_commitment: CommitmentHash,
     max_log_size: u32,
-    policy: Option<&PcsPolicy>,
 ) -> Result<(), VerificationError> {
     let format = preflight_standalone(&mut proof, max_log_size)?;
-    vos_pvm_proof::proof::check_shape_policy(format, &proof.pcs_config, policy)
-        .map_err(VerificationError::InvalidStructure)?;
     vos_pvm_proof::with_stack!(format.channel, Stack => {
         verify_standalone_on::<Stack>(proof, format, preprocessed_commitment)
     }, unbuilt => Err(VerificationError::InvalidStructure(format!(
@@ -560,10 +253,8 @@ fn verify_standalone_on<MC: PcsStack>(
     )?;
     // The format's floors, counted at this proof's own parameters and
     // shape, and its exact parameters.
-    if format.encoding == Encoding::Lossless {
-        vos_pvm_proof::proof::check_format_security(format, &proof.pcs_config, &security_shape)
-            .map_err(VerificationError::InvalidStructure)?;
-    }
+    vos_pvm_proof::proof::check_format_security(format, &proof.pcs_config, &security_shape)
+        .map_err(VerificationError::InvalidStructure)?;
 
     if proof.claimed_sums.len() != proof.num_components {
         return Err(VerificationError::InvalidStructure(
@@ -597,9 +288,8 @@ fn verify_standalone_on<MC: PcsStack>(
     // proof with the boundary and closing chips) and the interaction PoW
     // precede the relation elements, which therefore depend on the claimed
     // boundary states. `memory_commitment` stays unmixed (computed outside
-    // the circuit). The proof's own PCS config: a legacy proof carries its
-    // own, and every other format's equals the format's, checked above; the
-    // DEEP batching is the format's, which a proof does not carry.
+    // the circuit). The proof's own PCS config, the format's, checked above;
+    // the DEEP batching is the format's, which a proof does not carry.
     let verifier_channel = &mut MC::C::default();
     let commitment_scheme =
         &mut CommitmentSchemeVerifier::<MC>::new(format.verifier_config(&proof.pcs_config));
@@ -762,15 +452,7 @@ pub fn verify_chain_standalone(
     // Each segment verifies standalone against the SAME program commitment:
     // no side note, and program identity is pinned across the whole chain.
     for proof in proofs {
-        // The conjectured-security floor, so a canonical MOBILE chain
-        // (`vos_pvm_proof::prove_chain`) verifies without the caller naming
-        // `PcsPolicy::MOBILE`.
-        verify_standalone_shaped(
-            proof.clone(),
-            preprocessed_commitment,
-            DEFAULT_MAX_LOG_SIZE,
-            None,
-        )?;
+        verify_standalone_shaped(proof.clone(), preprocessed_commitment, DEFAULT_MAX_LOG_SIZE)?;
     }
     Ok(proofs[proofs.len() - 1].final_state.memory_root)
 }

@@ -10,7 +10,7 @@ use stwo::core::{
 };
 
 use super::{Proof, SegmentState};
-use crate::format::{Encoding, Format, FormatParams};
+use crate::format::{Format, FormatParams};
 use crate::lookups::AllLookupElements;
 use crate::pcs::{FsChannel, PcsStack};
 use crate::security::{SecurityBits, SecurityShape};
@@ -27,9 +27,7 @@ const PROOF_FS_DOMAIN_WORD_1: u64 = u64::from_le_bytes(*b"STARK/FS");
 const PRE_CONFIG_FS_FORMAT_VERSION: u32 = 18;
 
 /// Bind the proof protocol domain and exact format generation into a Fiat–
-/// Shamir channel. This prefix authenticates the STARK statement transcript;
-/// Refine's outer bundle transcript additionally authenticates machine
-/// identities, native boundary witnesses, and ordered child identities.
+/// Shamir channel. This prefix authenticates the STARK statement transcript.
 pub fn mix_proof_fs_domain(channel: &mut impl Channel, format_version: u32, config: &PcsConfig) {
     channel.mix_u64(PROOF_FS_DOMAIN_WORD_0);
     channel.mix_u64(PROOF_FS_DOMAIN_WORD_1);
@@ -64,61 +62,29 @@ pub fn mix_statement_header(
 
 /// A.1's third item: the boundary states, after the main trace's root and
 /// before any relation challenge, so the challenges depend on them and the
-/// boundary binding's public logup terms are bound.
-///
-/// - [`Encoding::Lossless`]: the boundary chips' own bytes
-///   ([`crate::boundary_binding::boundary_state_bytes`]), one M31 a byte, as
-///   one run of 296.
-/// - [`Encoding::Legacy`]: format 36's, a u64 at a time: the registers in
-///   and out, pc and ts in, pc and ts out, then each memory root as four
-///   little-endian u64s.
+/// boundary binding's public logup terms are bound: the boundary chips' own
+/// bytes ([`crate::boundary_binding::boundary_state_bytes`]), one M31 a byte,
+/// as one run of 296.
 pub fn mix_boundary_states(
     channel: &mut impl FsChannel,
-    encoding: Encoding,
     initial: &SegmentState,
     final_state: &SegmentState,
 ) {
-    match encoding {
-        Encoding::Lossless => {
-            channel.mix_bytes(&crate::boundary_binding::boundary_state_bytes(
-                initial,
-                final_state,
-            ));
-        }
-        Encoding::Legacy => {
-            for register in initial.registers.iter().chain(&final_state.registers) {
-                channel.mix_u64(*register);
-            }
-            channel.mix_u64(u64::from(initial.pc));
-            channel.mix_u64(initial.timestamp);
-            channel.mix_u64(u64::from(final_state.pc));
-            channel.mix_u64(final_state.timestamp);
-            for root in [&initial.memory_root, &final_state.memory_root] {
-                for chunk in root.chunks_exact(8) {
-                    channel.mix_u64(u64::from_le_bytes(chunk.try_into().unwrap()));
-                }
-            }
-        }
-    }
+    channel.mix_bytes(&crate::boundary_binding::boundary_state_bytes(
+        initial,
+        final_state,
+    ));
 }
 
 /// A.1's fourth item, on the verifier's side: the interaction PoW nonce must
 /// meet the format's bits on the channel as it stands after the boundary
-/// states, and is then mixed. A format without an interaction PoW takes the
-/// nonce 0 and mixes nothing.
+/// states, and is then mixed.
 pub fn check_interaction_pow(
     channel: &mut impl Channel,
     format: &Format,
     nonce: u64,
 ) -> Result<(), String> {
     let bits = format.interaction_pow_bits();
-    if bits == 0 {
-        return if nonce == 0 {
-            Ok(())
-        } else {
-            Err("format carries no interaction PoW, but the proof has a nonce".into())
-        };
-    }
     if !channel.verify_pow_nonce(bits, nonce) {
         return Err(format!("interaction PoW nonce does not meet {bits} bits"));
     }
@@ -151,12 +117,7 @@ pub fn replay_prefix<MC: PcsStack>(
     for idx in [PREPROCESSED_TRACE_IDX, ORIGINAL_TRACE_IDX] {
         commitment_scheme.commit(stark.commitments[idx], &log_sizes[idx], channel);
     }
-    mix_boundary_states(
-        channel,
-        format.encoding,
-        &proof.initial_state,
-        &proof.final_state,
-    );
+    mix_boundary_states(channel, &proof.initial_state, &proof.final_state);
     check_interaction_pow(channel, format, proof.interaction_pow)?;
     let lookup_elements = draw(channel);
     channel.mix_felts(&proof.claimed_sums);
@@ -195,9 +156,9 @@ pub fn format_security_bits(
 }
 
 /// Refuse a proof whose counts, at its own parameters and shape, fall below
-/// its format's floors; and, under a format with exact parameters, one whose
-/// parameters are not the format's. Counts first, so a weakened proof is
-/// refused for its security whatever else differs.
+/// its format's floors, and one whose parameters are not the format's.
+/// Counts first, so a weakened proof is refused for its security whatever
+/// else differs.
 pub fn check_format_security(
     format: &Format,
     config: &PcsConfig,
@@ -216,7 +177,7 @@ pub fn check_format_security(
             bits.proven, format.number, format.floor.proven
         ));
     }
-    if format.exact_params() && format.verifier_config(config) != format.pcs_config() {
+    if format.verifier_config(config) != format.pcs_config() {
         return Err(format!(
             "proof parameters differ from format {}'s",
             format.number

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm::instruction::Opcode;
 use vos_pvm_compiler::shape::kernel_shape;
-use vos_pvm_proof::format::{Format, LEGACY_SEGMENT, SEGMENT};
+use vos_pvm_proof::format::{Format, SEGMENT, WRAP};
 use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::pcs::{Commitment, StarkProofAny};
 use vos_pvm_proof::program_id::KernelProgram;
@@ -41,11 +41,8 @@ use vos_pvm_proof_verifier::{verify_kernel_segment, verify_standalone};
 use vos_wire::ids::{MethodId, ProgramHash};
 
 /// The admitted segment formats, each with the one its wrong-format
-/// fixture is relabelled to.
-const FORMATS: [(&Format, u32); 2] = [
-    (&SEGMENT, LEGACY_SEGMENT.number),
-    (&LEGACY_SEGMENT, SEGMENT.number),
-];
+/// fixture is relabelled to: the wrap's, admitted but no segment format.
+const FORMATS: [(&Format, u32); 1] = [(&SEGMENT, WRAP.number)];
 
 /// Set to `write` to write the fixtures instead of comparing them.
 const MODE: &str = "VOS_FIXTURES";

@@ -13,7 +13,7 @@ use stwo_constraint_framework::TraceLocationAllocator;
 
 use stwo::prover::backend::{BackendForChannel, simd::SimdBackend};
 
-use crate::format::{Encoding, Format};
+use crate::format::Format;
 use crate::pcs::{FsChannel, PcsStack};
 
 use crate::trace::eval::PREPROCESSED_TRACE_IDX;
@@ -78,35 +78,6 @@ pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
 /// verify_standalone` needs no side note at all, only the program's
 /// preprocessed commitment.)
 pub fn verify(proof: Proof, side_note: &SideNote) -> Result<(), VerificationError> {
-    // Default: the conjectured-security floor, which accepts any 96-bit-secure
-    // shape (STANDARD and MOBILE both). `None` selects that floor; the strict
-    // `verify_with_pcs_policy` path passes an exact `PcsPolicy` instead.
-    verify_with_shape(proof, side_note, DEFAULT_MAX_LOG_SIZE, None)
-}
-
-/// Enforce a custom `PcsPolicy` (FRI shape + PoW floor)
-/// on `proof.pcs_config`.  The default `verify` accepts any shape meeting the
-/// conjectured-security floor; reach for this to pin an EXACT shape (stricter
-/// deployments) or to accept a looser test-harness shape.  See SECURITY.md
-/// "Proof shape".
-pub fn verify_with_pcs_policy(
-    proof: Proof,
-    side_note: &SideNote,
-    policy: &crate::proof::PcsPolicy,
-) -> Result<(), VerificationError> {
-    verify_with_shape(proof, side_note, DEFAULT_MAX_LOG_SIZE, Some(policy))
-}
-
-/// Shared component-setup funnel for the SideNote verify paths. `policy`
-/// selects the FRI-shape floor: `None` = the conjectured-security floor (the
-/// default `verify` paths — accepts STANDARD and MOBILE), `Some(p)` = an exact
-/// `PcsPolicy` pin (the strict `*_with_pcs_policy` paths).
-fn verify_with_shape(
-    proof: Proof,
-    side_note: &SideNote,
-    max_log_size: u32,
-    policy: Option<&crate::proof::PcsPolicy>,
-) -> Result<(), VerificationError> {
     let expected_component_mask = super::active_component_mask(side_note);
     if proof.component_mask != expected_component_mask {
         return Err(VerificationError::InvalidStructure(format!(
@@ -127,11 +98,9 @@ fn verify_with_shape(
     let boundary_positions = crate::boundary_binding::boundary_positions_in_mask(
         super::active_component_mask(side_note),
     );
-    verify_with_options_explicit_components(
+    verify_components(
         proof,
         side_note,
-        max_log_size,
-        policy,
         components,
         prover_components,
         boundary_positions,
@@ -147,10 +116,6 @@ fn verify_with_shape(
 /// extends `MachineComponent`, so callers usually have one slice and pass
 /// it twice (once via `as &dyn MachineComponent` upcast, once raw).
 ///
-/// `policy` lets the harness use a cheap `PcsConfig` for fast chip-rewrite
-/// validation cycles (e.g. `pow_bits = 5`) without tripping the production
-/// `PcsPolicy::STANDARD` floor.
-///
 /// The boundary-binding claimed-sum check is SKIPPED on this path (the
 /// caller's arbitrary chip slice has no stable component positions);
 /// chip-isolated proofs are not verifiable across a trust boundary
@@ -160,35 +125,22 @@ pub fn verify_with_explicit_components(
     side_note: &SideNote,
     components: &[&dyn crate::framework::MachineComponent],
     prover_components: &[&dyn crate::framework::MachineProverComponent],
-    policy: &crate::proof::PcsPolicy,
 ) -> Result<(), VerificationError> {
-    verify_with_options_explicit_components(
-        proof,
-        side_note,
-        DEFAULT_MAX_LOG_SIZE,
-        Some(policy),
-        components,
-        prover_components,
-        None,
-    )
+    verify_components(proof, side_note, components, prover_components, None)
 }
 
-fn verify_with_options_explicit_components(
+fn verify_components(
     mut proof: Proof,
     side_note: &SideNote,
-    max_log_size: u32,
-    policy: Option<&crate::proof::PcsPolicy>,
     components: &[&dyn crate::framework::MachineComponent],
     prover_components: &[&dyn crate::framework::MachineProverComponent],
     boundary_positions: Option<crate::boundary_binding::BoundaryChipPositions>,
 ) -> Result<(), VerificationError> {
     // The format the proof names, admitted and with its Stark proof on the
-    // format's channel, and every log size under `max_log_size` (so a
+    // format's channel, and every log size under `DEFAULT_MAX_LOG_SIZE` (so a
     // malicious prover can't force a giant Merkle commitment phase), before
-    // any cryptographic work; then the FRI shape under `policy`.
-    let format = crate::proof::preflight_proof_structure(&mut proof, max_log_size)
-        .map_err(VerificationError::InvalidStructure)?;
-    crate::proof::check_shape_policy(format, &proof.pcs_config, policy)
+    // any cryptographic work.
+    let format = crate::proof::preflight_proof_structure(&mut proof, DEFAULT_MAX_LOG_SIZE)
         .map_err(VerificationError::InvalidStructure)?;
     if proof.pcs_config.fri_config.log_blowup_factor > crate::proof::MAX_RECOMMIT_LOG_BLOWUP {
         return Err(VerificationError::InvalidStructure(format!(
@@ -257,10 +209,8 @@ where
         &expected_log_sizes,
     )
     .map_err(VerificationError::InvalidStructure)?;
-    if format.encoding == Encoding::Lossless {
-        crate::proof::check_format_security(format, &config, &security_shape)
-            .map_err(VerificationError::InvalidStructure)?;
-    }
+    crate::proof::check_format_security(format, &config, &security_shape)
+        .map_err(VerificationError::InvalidStructure)?;
 
     verify_preprocessed_trace::<MC>(
         stark,

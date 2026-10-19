@@ -565,10 +565,9 @@ last for decades.**
 
 - **The counts** are the security tool's (`pvm/proof/src/security.rs`) at
   each format's reference shape [model], pinned by the format tests.
-- **The numbers:** 35 to 37 name the segment AIR (36 is the legacy
-  Blake2s segment format the default prover produces). 24 to 27, 29, 31,
-  33 and 34, which named its earlier forms, are retired: refused, and
-  never registered again.
+- **The numbers:** 35 and 37 name the segment AIR; the default prover
+  produces 35. 24 to 27, 29, 31, 33, 34 and 36, which named its earlier
+  forms, are retired: refused, and never registered again.
 - **The inner grind:** a segment's PoW 24 costs 0.43 s on average on 8
   threads (median 0.26 s, 95th percentile 1.44 s), against 0.028 s at 20
   [measured, 128 grinds each, SIMD]; interaction PoW 8 is negligible.
@@ -590,12 +589,9 @@ last for decades.**
   conjectured bits against a quantum prover, so post-quantum readiness
   rests on the conjectured count. All counts are the security tool's own
   [model], pinned by tests and not yet reviewed outside.
-- **Format 36,** the legacy Blake2s segment format the default prover and
-  the refine bundles still produce, is at 96 / 57: below the 60-bit proven
-  floor. It is admitted for the legacy path alone and never wrapped into a
-  published statement; its retirement, or the refine path's move to 35,
-  is carried out of slice 5 (`slice-5-progress.md`, "Carried out of
-  slice 5").
+- **Format 36,** the legacy Blake2s segment format, counted 96 / 57:
+  below the 60-bit proven floor. It is retired with the refine-bundle path
+  that used it (slice 6's 6.9); the default prover produces 35.
 - **Salts:** 8 M31 (248 bits).
 - **Interaction PoW** applies to every proof with logup, folds included.
 - **An external audit,** before value rides on a proof, of:
@@ -1055,26 +1051,20 @@ counts as conjectured / proven at the reference shape [model]:
 |---|---|---|---|---|---|---|
 | 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 | admitted |
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
-| 36 | segments, legacy encodings | Blake2s | the proof's own, at least 96 conjectured bits (MOBILE: 2, 38, 20, 1, 0, none) | 96 / — | 96 / 57 | admitted |
 | 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 | 28 | the final wrap, unmasked (tests only) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | reserved; admitted at slice 6's 6.4 |
 | 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 
-- **Each entry** holds its channel, its encodings, its parameters, the DEEP
-  batching its proven floor assumes and both bit counts.
-- **32, 35 and 37 use A.3's encodings** and exactly their parameters, as
-  do 28 and 30.
+- **Each entry** holds its channel, its parameters, the DEEP batching its
+  proven floor assumes and both bit counts.
+- **Every entry uses A.3's encodings** and exactly its parameters.
 - **35 takes fewer queries and more PoW than 32** (40 and 24 bits against
   44 and 20): a kernel leaf's rows grow with the segment's width times its
   queries, and a fold verifies under half the recursion AIR's shape. On the
   segment shape 35's count is its query term's, 62.86; 32's parameters give
   62.74, their batching term binding.
-- **36 is the legacy segment format** the default prover produces, kept
-  while the refine bundles and chain proofs use it: no interaction PoW,
-  the boundary states mixed a word at a time, and the proof's own
-  parameters under the 96-bit conjectured floor.
-- **35 to 37 name the segment AIR,** hardened and without the columns and
+- **35 and 37 name the segment AIR,** hardened and without the columns and
   next-row masks no constraint reads (§3.2); 28, 30 and 32 prove the
   recursion AIR, 32's leaves verifying the segment AIR. A reserved entry is
   refused until its AIR and channel exist. 32's exist from slice 5's 5.8:
@@ -1087,12 +1077,16 @@ counts as conjectured / proven at the reference shape [model]:
   names one AIR and one set of parameters". 40, spike 6a's blowup-64
   shape, is retired unregistered; 38 stays unassigned, the fixtures' "a
   number no format holds".
-- **24 to 27, 29, 31, 33, 34 and 40 are retired.** 24 to 27 and 29 named
-  the segment AIR before its hardening, and 31, 33 and 34 the hardened AIR
-  with its unread columns (31 at 44 queries); 40 was never registered,
-  but spike 6a's measured masked wrap at blowup 64 was made under it. They
-  are refused and never registered again: a number names one AIR and one
-  set of parameters.
+- **24 to 27, 29, 31, 33, 34, 36 and 40 are retired.** 24 to 27 and 29
+  named the segment AIR before its hardening, and 31, 33 and 34 the
+  hardened AIR with its unread columns (31 at 44 queries); 36 named the
+  legacy Blake2s segment format, the default prover's and the refine
+  bundles' until slice 6's 6.9: its parameters the proof's own under a
+  96-bit conjectured floor, no interaction PoW and the boundary states
+  mixed a word at a time, 57 proven bits at its MOBILE shape, below the
+  60-bit floor; 40 was never registered, but spike 6a's measured masked
+  wrap at blowup 64 was made under it. They are refused and never
+  registered again: a number names one AIR and one set of parameters.
 
 **A.5 What may leave the prover role (slice 6):**
 - the `Statement`;

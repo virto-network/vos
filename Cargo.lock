@@ -2577,6 +2577,7 @@ dependencies = [
  "blake2",
  "libc",
  "lz4_flex 0.11.6",
+ "postcard",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-pvm-program",

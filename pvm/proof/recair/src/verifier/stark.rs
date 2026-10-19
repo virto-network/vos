@@ -1,4 +1,4 @@
-//! What every verifier circuit shares, for a proof of any AIR on a lossless
+//! What every verifier circuit shares, for a proof of any AIR on a
 //! Poseidon2-M31 format at FRI fold step 1: its geometry ([`StarkShape`]:
 //! the trees' orders and heights, the samples, DEEP's plan, FRI's layers and
 //! the compiled constraints), the values past the AIR's own prefix
@@ -13,7 +13,7 @@
 
 use stwo::core::pcs::PcsConfig;
 use vos_pvm_proof::SampleLayout;
-use vos_pvm_proof::format::{ChannelKind, Encoding, Format};
+use vos_pvm_proof::format::{ChannelKind, Format};
 
 use crate::compile::{Compiled, Input};
 use crate::context::{Bit, Context, Var};
@@ -94,7 +94,7 @@ impl StarkShape {
     /// `layout`.
     ///
     /// # Panics
-    /// When the format is not a lossless Poseidon2-M31 format at fold step
+    /// When the format is not a Poseidon2-M31 format at fold step
     /// 1, last layer degree bound 0 and no fixed lifting height, with both
     /// PoWs; when a compiled component's columns are not the layout's; when
     /// a trace tree is not at the lifting height, or the preprocessed tree
@@ -110,11 +110,6 @@ impl StarkShape {
             format.channel,
             ChannelKind::Poseidon2M31,
             "the Poseidon2-M31 channel"
-        );
-        assert_eq!(
-            format.encoding,
-            Encoding::Lossless,
-            "the lossless encodings"
         );
         assert_eq!(config.fri_config.fold_step, 1, "FRI at fold step 1");
         assert_eq!(

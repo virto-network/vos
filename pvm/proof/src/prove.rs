@@ -3,8 +3,6 @@ use stwo::{
         ColumnVec,
         channel::Channel,
         fields::{m31::BaseField, qm31::SecureField},
-        fri::FriConfig,
-        pcs::PcsConfig,
         poly::circle::CanonicCoset,
     },
     prover::{
@@ -109,22 +107,6 @@ impl core::fmt::Display for ProvingError {
 
 impl std::error::Error for ProvingError {}
 
-/// 96-bit security: blowup=16, 19 FRI queries, 20-bit PoW.
-///
-/// Conservative shape that minimises proof size (~600 KB at log14).
-/// Suitable for server-side proving where prove time is less critical
-/// than the on-disk / on-chain proof footprint.
-pub fn production_pcs_config() -> PcsConfig {
-    PcsConfig {
-        pow_bits: 20,
-        fri_config: FriConfig::new(0, 4, 19, 1),
-        // The lifted protocol; `None` lets `try_get_lifting_log_size`
-        // default it to `log_trace_size`.
-        lifting_log_size: None,
-        deep_batching: stwo::core::pcs::DeepBatching::Powers,
-    }
-}
-
 /// Cap rayon's global thread pool at a sensible default for our
 /// workload, unless the user has explicitly set `RAYON_NUM_THREADS`
 /// or initialised their own pool.  Idempotent — safe to call many
@@ -157,57 +139,32 @@ pub fn install_thread_pool() -> usize {
     })
 }
 
-/// 96-bit security: blowup=4, 38 FRI queries, 20-bit PoW.
-///
-/// Mobile / low-latency shape: ~2.5× faster prove than
-/// `production_pcs_config()` at the cost of ~1.4× larger proof
-/// (~850 KB at log14).  Same conjectured 96-bit security
-/// (`pow_bits + n_queries · log_blowup_factor = 20 + 38·2 = 96`).
-///
-/// Verifier-side, callers must use `PcsPolicy::MOBILE` (or
-/// stricter) when verifying proofs produced with this config.
-pub fn production_pcs_config_mobile() -> PcsConfig {
-    PcsConfig {
-        pow_bits: 20,
-        fri_config: FriConfig::new(0, 2, 38, 1),
-        lifting_log_size: None,
-        deep_batching: stwo::core::pcs::DeepBatching::Powers,
-    }
-}
-
-/// What the prover produces: a format, and the configuration its proof
-/// carries.
+/// What the prover produces: an admitted format, at its parameters.
 #[derive(Clone, Copy)]
 pub(crate) struct Target {
     pub format: &'static Format,
-    pub config: PcsConfig,
 }
 
 impl Target {
-    /// Format 36 at a configuration of the caller's.
-    pub fn legacy(config: PcsConfig) -> Self {
-        Self {
-            format: &crate::format::LEGACY_SEGMENT,
-            config,
-        }
-    }
+    /// The segment format, what the default entry points produce.
+    pub const SEGMENT: Self = Self {
+        format: &crate::format::SEGMENT,
+    };
 
-    /// An admitted format, at its parameters; the prover is told only
-    /// formats a verifier accepts.
+    /// An admitted format; the prover is told only formats a verifier
+    /// accepts.
     pub fn of(format: &'static Format) -> Result<Self, ProvingError> {
         if format.status != Status::Admitted {
             return Err(ProvingError::FormatNotAdmitted(format.number));
         }
-        Ok(Self {
-            format,
-            config: format.pcs_config(),
-        })
+        Ok(Self { format })
     }
 }
 
+/// Prove under the segment format (35), over the trace's natural shape.
 pub fn prove(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
     install_thread_pool();
-    let (proof, _) = prove_impl(side_note, Target::legacy(production_pcs_config()), false)?;
+    let (proof, _) = prove_impl(side_note, Target::SEGMENT, false)?;
     Ok(proof)
 }
 
@@ -223,46 +180,10 @@ pub fn prove_format(
     Ok(proof)
 }
 
-/// Prove using the MOBILE PCS config — the recommended path for
-/// latency-sensitive flows like *private tap-to-pay*.
-///
-/// Same 96-bit conjectured security as `prove()` but about 2× faster on
-/// real PVM workloads, for proofs about 1.6× larger.
-///
-/// Verifier-side, callers MUST use `verify_with_pcs_policy(proof,
-/// side_note, &PcsPolicy::MOBILE)` (or stricter) — the default
-/// `verify()` enforces the STANDARD policy and rejects MOBILE
-/// proofs.
-pub fn prove_mobile(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
-    install_thread_pool();
-    let (proof, _) = prove_impl(
-        side_note,
-        Target::legacy(production_pcs_config_mobile()),
-        false,
-    )?;
-    Ok(proof)
-}
-
-pub fn prove_with_config(
-    side_note: &mut SideNote,
-    config: PcsConfig,
-) -> Result<Proof, ProvingError> {
-    install_thread_pool();
-    let (proof, _) = prove_impl(side_note, Target::legacy(config), false)?;
-    Ok(proof)
-}
-
+/// [`prove`], with each phase's time and the trace's shape.
 pub fn prove_profiled(side_note: &mut SideNote) -> Result<(Proof, ProveProfile), ProvingError> {
     install_thread_pool();
-    prove_impl(side_note, Target::legacy(production_pcs_config()), true)
-}
-
-pub fn prove_profiled_with_config(
-    side_note: &mut SideNote,
-    config: PcsConfig,
-) -> Result<(Proof, ProveProfile), ProvingError> {
-    install_thread_pool();
-    prove_impl(side_note, Target::legacy(config), true)
+    prove_impl(side_note, Target::SEGMENT, true)
 }
 
 /// The entering / exit RAM page-Merkle roots for this segment, from
@@ -435,12 +356,11 @@ fn prove_impl(
 /// pair only with `verify_with_explicit_components`.
 pub fn prove_with_explicit_components(
     side_note: &mut SideNote,
-    config: PcsConfig,
     components: &[&'static dyn crate::framework::MachineProverComponent],
 ) -> Result<Proof, ProvingError> {
     install_thread_pool();
     let (proof, _) =
-        prove_impl_with_components(side_note, Target::legacy(config), false, components, 0, &[])?;
+        prove_impl_with_components(side_note, Target::SEGMENT, false, components, 0, &[])?;
     Ok(proof)
 }
 
@@ -518,9 +438,8 @@ enum ProofTranscriptGeneration {
     PreConfigRelabel,
 }
 
-/// Generate the exact producer/consumer main traces used by both the STARK
-/// prover and Refine's deterministic replay binding. Keeping this as one
-/// implementation prevents replay from checking a lookalike witness layout.
+/// The components' main traces: the producers in order, filling the side
+/// note's multiplicities, then the consumers in parallel.
 fn generate_component_traces(
     side_note: &mut SideNote,
     components: &[&dyn crate::framework::MachineProverComponent],
@@ -562,9 +481,8 @@ fn generate_component_traces(
         .collect()
 }
 
-/// Derive the exact public boundary states shipped by the production prover.
-/// Refine replay compares these before STARK verification, including both the
-/// sparse-image hash and in-AIR page-Merkle roots.
+/// The boundary states a proof ships: the sparse-image hashes and the
+/// page-Merkle roots the boundary chips bind.
 fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
     let (root_before, root_after) = segment_memory_roots(side_note);
     let initial_state = if side_note.steps.is_empty() {
@@ -609,113 +527,6 @@ fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
     (initial_state, final_state)
 }
 
-/// Exact replay-derived statement prefix. Equality of the main commitment
-/// binds every generated witness column; ordinary STARK verification then
-/// proves the interaction/composition/FRI suffix against that exact root.
-pub(crate) struct ReplayTraceBinding {
-    pub component_mask: u32,
-    pub log_sizes: Vec<u32>,
-    pub preprocessed_commitment: crate::pcs::Commitment,
-    pub main_commitment: crate::pcs::Commitment,
-    pub initial_state: SegmentState,
-    pub final_state: SegmentState,
-}
-
-/// Recompute a trace's exact preprocessed/main commitments without generating
-/// interaction traces, composition columns, FRI layers, or a replacement
-/// proof. Used only to bind Refine child proofs to deterministic native replay.
-pub(crate) fn replay_trace_binding(
-    side_note: &mut SideNote,
-    target: Target,
-) -> Result<ReplayTraceBinding, ProvingError> {
-    crate::with_stack!(target.format.channel, Stack => {
-        replay_trace_binding_on::<Stack>(side_note, target)
-    }, unbuilt => Err(ProvingError::FormatNotAdmitted(target.format.number)))
-}
-
-fn replay_trace_binding_on<MC: PcsStack>(
-    side_note: &mut SideNote,
-    target: Target,
-) -> Result<ReplayTraceBinding, ProvingError>
-where
-    SimdBackend: BackendForChannel<MC>,
-{
-    use crate::pcs::ProofHash;
-    let config = target.config;
-    if config.fri_config.log_blowup_factor > crate::proof::MAX_RECOMMIT_LOG_BLOWUP {
-        return Err(ProvingError::NOT_SATISFIED);
-    }
-    prepare_side_note_for_verification(side_note);
-    validate_memory_witnesses(side_note)?;
-    side_note.ingest_memory_pages();
-    let components_owned = super::active_components(side_note);
-    let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
-    let component_mask = super::active_component_mask(side_note);
-    let traces = generate_component_traces(side_note, components, &[]);
-    let log_sizes: Vec<u32> = traces.iter().map(ComponentTrace::log_size).collect();
-    let max_constraint_log_degree_bound = components
-        .iter()
-        .zip(&log_sizes)
-        .map(|(component, &log_size)| component.max_constraint_log_degree_bound(log_size))
-        .max()
-        .ok_or(ProvingError::NOT_SATISFIED)?;
-    if crate::proof::derive_protocol_degree_shape(&config, max_constraint_log_degree_bound).is_err()
-    {
-        return Err(ProvingError::NOT_SATISFIED);
-    }
-    for &log_size in &log_sizes {
-        if log_size < crate::proof::MIN_PROOF_LOG_SIZE {
-            return Err(ProvingError::NOT_SATISFIED);
-        }
-        let Some(extended) = log_size.checked_add(config.fri_config.log_blowup_factor) else {
-            return Err(ProvingError::NOT_SATISFIED);
-        };
-        if extended > crate::proof::MAX_EXTENDED_LOG_SIZE
-            || config
-                .lifting_log_size
-                .is_some_and(|lifting| lifting < extended)
-        {
-            return Err(ProvingError::NOT_SATISFIED);
-        }
-    }
-    let Some(domain_log_size) =
-        max_constraint_log_degree_bound.checked_add(config.fri_config.log_blowup_factor)
-    else {
-        return Err(ProvingError::NOT_SATISFIED);
-    };
-    if domain_log_size > crate::proof::MAX_EXTENDED_LOG_SIZE {
-        return Err(ProvingError::NOT_SATISFIED);
-    }
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(domain_log_size)
-            .circle_domain()
-            .half_coset,
-    );
-    let channel = &mut MC::C::default();
-    crate::proof::mix_statement_header(channel, target.format.number, &config, &log_sizes);
-    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
-    let mut tree_builder = scheme.tree_builder();
-    for trace in &traces {
-        tree_builder.extend_evals(trace.to_circle_evaluation(PREPROCESSED_TRACE_IDX));
-    }
-    tree_builder.commit(channel);
-    let mut tree_builder = scheme.tree_builder();
-    for trace in &traces {
-        tree_builder.extend_evals(trace.to_circle_evaluation(ORIGINAL_TRACE_IDX));
-    }
-    tree_builder.commit(channel);
-    let roots = scheme.roots();
-    let (initial_state, final_state) = derive_segment_states(side_note);
-    Ok(ReplayTraceBinding {
-        component_mask,
-        log_sizes,
-        preprocessed_commitment: roots[PREPROCESSED_TRACE_IDX].into_commitment(),
-        main_commitment: roots[ORIGINAL_TRACE_IDX].into_commitment(),
-        initial_state,
-        final_state,
-    })
-}
-
 /// Prove with caller-supplied boundary metadata in place of the
 /// trace-derived `proof.{initial,final}_state`: the chips commit the
 /// honest trace columns, but the FS-transcript mix and the shipped
@@ -741,7 +552,7 @@ pub fn prove_with_boundary_override(
     let component_mask = super::active_component_mask(side_note);
     let (proof, _) = prove_impl_with_components_overridden(
         side_note,
-        Target::legacy(production_pcs_config()),
+        Target::SEGMENT,
         false,
         components,
         component_mask,
@@ -766,7 +577,7 @@ pub fn prove_pre_config_relabel_for_test(side_note: &mut SideNote) -> Result<Pro
     let component_mask = super::active_component_mask(side_note);
     let (proof, _) = prove_impl_with_components_overridden(
         side_note,
-        Target::legacy(production_pcs_config()),
+        Target::SEGMENT,
         false,
         components,
         component_mask,
@@ -817,8 +628,8 @@ where
     use std::time::Instant;
     use stwo::core::proof_of_work::GrindOps;
 
-    let config = target.config;
     let format = target.format;
+    let config = format.pcs_config();
 
     // This must precede memory-page ingestion and every component trace
     // allocation: malformed/fault traces are a caller-boundary error, not an
@@ -948,18 +759,10 @@ where
     // with the drawn challenges, binds them against a from-scratch prover
     // (see `boundary_binding`). Every proof mixes them, chip-isolated
     // harnesses' too, so the verifier replays one transcript prefix.
-    crate::proof::mix_boundary_states(
-        prover_channel,
-        format.encoding,
-        &initial_state,
-        &final_state,
-    );
-    let mut interaction_pow = 0;
-    let bits = format.interaction_pow_bits();
-    if bits > 0 {
-        interaction_pow = <SimdBackend as GrindOps<MC::C>>::grind(prover_channel, bits);
-        prover_channel.mix_u64(interaction_pow);
-    }
+    crate::proof::mix_boundary_states(prover_channel, &initial_state, &final_state);
+    let interaction_pow =
+        <SimdBackend as GrindOps<MC::C>>::grind(prover_channel, format.interaction_pow_bits());
+    prover_channel.mix_u64(interaction_pow);
 
     let mut lookup_elements = AllLookupElements::default();
     components.iter().for_each(|c| {

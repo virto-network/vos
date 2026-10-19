@@ -21,8 +21,8 @@ use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::pcs::Commitment;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::{
-    PcsPolicy, Proof, RecursionData, SideNote, chip_idx, extract_recursion_data,
-    prove_chip_isolated_format, verify_with_explicit_components,
+    Proof, RecursionData, SideNote, chip_idx, extract_recursion_data, prove_chip_isolated_format,
+    verify_with_explicit_components,
 };
 use vos_pvm_recair::verifier::{SegmentShape, SegmentValues, verify_segment};
 use vos_pvm_recair::{Context, NoValue};
@@ -70,13 +70,7 @@ fn compare() -> &'static Compare {
             .iter()
             .map(|&c| c as &dyn vos_pvm_proof::harness::MachineComponent)
             .collect();
-        let config = SEGMENT.pcs_config();
-        let policy = PcsPolicy {
-            min_pow_bits: config.pow_bits,
-            min_fri_queries: config.fri_config.n_queries,
-            min_fri_log_blowup: config.fri_config.log_blowup_factor,
-        };
-        verify_with_explicit_components(proof.clone(), &side_note, &verifier, &components, &policy)
+        verify_with_explicit_components(proof.clone(), &side_note, &verifier, &components)
             .expect("verifies natively");
 
         let Some(Commitment::Poseidon2M31(root)) = proof.preprocessed_commitment() else {

@@ -18,7 +18,7 @@ use crate::common;
 use common::*;
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
-use vos_pvm_proof::{SideNote, active_components, production_pcs_config, prove, verify};
+use vos_pvm_proof::{SideNote, active_components, prove, verify};
 
 #[test]
 fn the_closing_flag_has_no_say_in_verification() {
@@ -45,12 +45,8 @@ fn the_closing_flag_has_no_say_in_verification() {
     // The production component set proven with the flag cleared, under the
     // production mask: its closing chip carries no rows.
     let components = active_components(&cleared_note);
-    let mut emptied = vos_pvm_proof::prove_with_explicit_components(
-        &mut cleared_note,
-        production_pcs_config(),
-        &components,
-    )
-    .expect("the prove with the flag cleared completes");
+    let mut emptied = vos_pvm_proof::prove_with_explicit_components(&mut cleared_note, &components)
+        .expect("the prove with the flag cleared completes");
     assert!(!cleared_note.closing_chip_active);
     emptied.component_mask = honest.component_mask;
     let mut edited = emptied.clone();

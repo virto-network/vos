@@ -471,4 +471,7 @@ one number per build, and what each changed.
        and `Pc`: 15 main columns and 27 samples. Segments (35) take 40
        queries and 24 bits of PoW; 36 is the legacy Blake2s format, 37
        the device format.
+  36 retired — the legacy Blake2s segment format, 57 proven bits at its
+       MOBILE shape, below the 60-bit floor, with the refine-bundle path
+       that produced it; the default prover produces 35.
 ```

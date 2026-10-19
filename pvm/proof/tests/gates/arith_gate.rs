@@ -35,7 +35,7 @@ use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::harness::{MachineComponent, MachineProverComponent};
 use vos_pvm_proof::pcs::ChannelRef;
 use vos_pvm_proof::trace::component::ComponentTrace;
-use vos_pvm_proof::{AirColumn, PcsPolicy, SideNote, chips};
+use vos_pvm_proof::{AirColumn, SideNote, chips};
 
 // ── A chip whose trace the adversary rewrites ────────────────────────────
 
@@ -239,11 +239,7 @@ fn prove_forged(
     }
     let provers: &'static [&'static dyn MachineProverComponent] = Box::leak(provers.into());
     let proved = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        vos_pvm_proof::prove_with_explicit_components(
-            &mut side_note,
-            vos_pvm_proof::production_pcs_config(),
-            provers,
-        )
+        vos_pvm_proof::prove_with_explicit_components(&mut side_note, provers)
     }));
     let proof = match proved {
         Ok(Ok(proof)) => proof,
@@ -252,14 +248,8 @@ fn prove_forged(
     };
     let verifiers: Vec<&dyn MachineComponent> =
         real.iter().map(|c| *c as &dyn MachineComponent).collect();
-    vos_pvm_proof::verify_with_explicit_components(
-        proof,
-        &side_note,
-        &verifiers,
-        &real,
-        &PcsPolicy::STANDARD,
-    )
-    .map_err(|e| format!("verifier refused: {e:?}"))
+    vos_pvm_proof::verify_with_explicit_components(proof, &side_note, &verifiers, &real)
+        .map_err(|e| format!("verifier refused: {e:?}"))
 }
 
 fn assert_refused(result: Result<(), String>) {

@@ -434,7 +434,7 @@ mod tests {
             |p| p.shape.classes[1].log_steps += 1,
             |p| p.shape.classes[1].pages += 1,
             |p| p.shape.classes[0].log_sizes[3] += 1,
-            |p| p.format = crate::format::LEGACY_SEGMENT.number,
+            |p| p.format = crate::format::DEVICE_PROOF.number,
             |p| {
                 if let Commitment::Poseidon2M31(hash) = &mut p.preprocessed_roots[1] {
                     hash.0[7] = BaseField::from(7);
@@ -457,7 +457,7 @@ mod tests {
     #[test]
     fn a_malformed_program_is_refused() {
         let mut blake = program();
-        blake.format = crate::format::LEGACY_SEGMENT.number;
+        blake.preprocessed_roots[0] = Commitment::Blake2s(Default::default());
         assert!(blake.check().unwrap_err().contains("channel"));
         let mut short = program();
         short.preprocessed_roots.pop();
