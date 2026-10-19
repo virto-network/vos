@@ -12,7 +12,7 @@
 //! - [`ANOTHER_CIRCUIT`]: the proof's preprocessed tree is not the pinned
 //!   circuit's.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::circle::CirclePoint;
@@ -26,7 +26,7 @@ use stwo::core::verifier::PREPROCESSED_TRACE_IDX;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::{CommitmentSchemeProver, ComponentProver, ComponentProvers};
-use vos_pvm_poseidon2::{Digest, M31, N_STATE};
+use vos_pvm_poseidon2::{Digest, M31, N_STATE, apply_external_round_matrix};
 use vos_pvm_proof::poseidon2::{P2MerkleChannel, P2MerkleHasher};
 use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair::circuit::{Circuit, Entry};
@@ -51,18 +51,6 @@ pub struct Forgery {
     pub outputs: Vec<SecureField>,
 }
 
-impl Clone for Forgery {
-    fn clone(&self) -> Self {
-        Self {
-            circuit: self.circuit.clone(),
-            trace: MainTrace {
-                columns: self.trace.columns.clone(),
-            },
-            outputs: self.outputs.clone(),
-        }
-    }
-}
-
 /// A value's four limbs.
 fn limbs(value: SecureField) -> [BaseField; 4] {
     value.to_m31_array()
@@ -79,6 +67,17 @@ fn word(value: BaseField) -> M31 {
 fn base(word: M31) -> BaseField {
     BaseField::from(word.value())
 }
+
+/// Where an `h8` row's inputs (`acc`, `σ`, `μ`, the two sample wires) and
+/// its output start in its main columns.
+const H8_STARTS: [usize; 6] = [
+    h8::main::ACC,
+    h8::main::STEP,
+    h8::main::MU,
+    h8::main::V,
+    h8::main::V + 4,
+    h8::main::OUT,
+];
 
 /// Where an entry's value sits in the main trace.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -163,17 +162,7 @@ impl Forgery {
             }
             Slot::P2Bit { row } => SecureField::from(p2_columns[p2::main::B][row]),
             Slot::Qm31 { row, i } => at(qm31_columns, 4 * i, row),
-            Slot::H8 { row, i } => {
-                let start = [
-                    h8::main::ACC,
-                    h8::main::STEP,
-                    h8::main::MU,
-                    h8::main::V,
-                    h8::main::V + 4,
-                    h8::main::OUT,
-                ][i];
-                at(h8_columns, start, row)
-            }
+            Slot::H8 { row, i } => at(h8_columns, H8_STARTS[i], row),
         }
     }
 
@@ -191,18 +180,48 @@ impl Forgery {
             Slot::P2Output { .. } => {}
             Slot::P2Bit { row } => p2_columns[p2::main::B][row] = limbs(value)[0],
             Slot::Qm31 { row, i } => put(qm31_columns, 4 * i, row),
-            Slot::H8 { row, i } => {
-                let start = [
-                    h8::main::ACC,
-                    h8::main::STEP,
-                    h8::main::MU,
-                    h8::main::V,
-                    h8::main::V + 4,
-                    h8::main::OUT,
-                ][i];
-                put(h8_columns, start, row)
+            Slot::H8 { row, i } => put(h8_columns, H8_STARTS[i], row),
+        }
+    }
+
+    /// The entries whose value differs from their address's yield's, and
+    /// the outputs stated otherwise: where the relation does not balance.
+    pub fn unbalanced(&self) -> Vec<String> {
+        let yields = self.yields();
+        let mut unbalanced: Vec<String> = self
+            .slots()
+            .into_iter()
+            .filter(|(entry, slot)| {
+                entry.multiplicity > 0
+                    && yields
+                        .get(&entry.address)
+                        .is_some_and(|&value| value != self.get(*slot))
+            })
+            .map(|(entry, slot)| format!("{slot:?} at {}", entry.address))
+            .collect();
+        let layout = self.circuit.layout;
+        for (i, &output) in self.outputs.iter().enumerate() {
+            let address = layout.output(i as u32);
+            if yields.get(&address).is_some_and(|&value| value != output) {
+                unbalanced.push(format!("output {i}"));
             }
         }
+        unbalanced
+    }
+
+    /// `qm31` row `row`'s operand `i` (`a`, `b`, `c`, `out`).
+    pub fn qm31(&self, row: usize, i: usize) -> SecureField {
+        self.get(Slot::Qm31 { row, i })
+    }
+
+    /// Sets `qm31` row `row`'s operand `i` to `value`.
+    pub fn set_qm31(&mut self, row: usize, i: usize, value: SecureField) {
+        self.set(Slot::Qm31 { row, i }, value);
+    }
+
+    /// Sets lane `lane` (0–7) of `p2` row `row`'s message to `value`.
+    pub fn set_message_lane(&mut self, row: usize, lane: usize, value: BaseField) {
+        self.trace.columns[0][p2::main::M + lane][row] = value;
     }
 
     /// Each yielded address's value, as the trace holds it at its yield.
@@ -214,17 +233,45 @@ impl Forgery {
             .collect()
     }
 
-    /// The forger's balancing: every use the trace can carry, and every
-    /// output stated, takes its yield's value, so the `Gate` relation
-    /// balances wherever a `p2` output is not a use; the gates whose operands
-    /// moved no longer hold.
+    /// The forger's balancing, so the `Gate` relation balances: a wire that
+    /// a `p2` row's output must equal (a Merkle root, say) takes the first
+    /// such output's value at its yield, unless a `p2` row's output yields
+    /// it, and every other such row is made to state the wire's value
+    /// ([`Forgery::force_output`]); then every use the trace can carry, and
+    /// every output stated, takes its yield's value. The gates whose
+    /// operands moved, and the forced rows' last rounds, no longer hold.
     pub fn balance(&mut self) {
         self.balance_except(&[]);
     }
 
     fn balance_except(&mut self, forged: &[(usize, usize)]) {
+        let slots = self.slots();
+        let yield_slots: HashMap<u32, Slot> = slots
+            .iter()
+            .filter(|(entry, _)| entry.multiplicity < 0)
+            .map(|&(entry, slot)| (entry.address, slot))
+            .collect();
+        let mut taken: HashSet<u32> = HashSet::new();
+        for &(entry, slot) in &slots {
+            let Slot::P2Output { row, w } = slot else {
+                continue;
+            };
+            if entry.multiplicity <= 0 {
+                continue;
+            }
+            let Some(&at) = yield_slots.get(&entry.address) else {
+                continue;
+            };
+            let value = self.get(slot);
+            if !matches!(at, Slot::P2Output { .. }) && taken.insert(entry.address) {
+                self.set(at, value);
+            } else if self.get(at) != value {
+                let wanted = self.get(at);
+                self.force_output(row, w, wanted);
+            }
+        }
         let yields = self.yields();
-        for (entry, slot) in self.slots() {
+        for (entry, slot) in slots {
             if let Slot::Qm31 { row, i } = slot
                 && forged.contains(&(row, i))
             {
@@ -247,7 +294,8 @@ impl Forgery {
     /// [`Forgery::balance`], then every `qm31` row whose output it yields
     /// recomputed from its operands, until nothing moves: a forged value
     /// carried through the gates below it to the outputs, every gate there
-    /// holding.
+    /// holding. `h8` rows are not recomputed: a forgery carried through one
+    /// would leave it stale, and its refusal would be that row's.
     pub fn settle(&mut self) {
         self.settle_except(&[]);
     }
@@ -263,21 +311,8 @@ impl Forgery {
                 if wiring.operands[3].multiplicity >= 0 {
                     continue;
                 }
-                let [a, b, c, out] = core::array::from_fn(|i| self.get(Slot::Qm31 { row, i }));
-                let op = wiring.op;
-                let k = |k: BaseField| SecureField::from(k);
-                let lanes: SecureField = limbs(c)
-                    .into_iter()
-                    .zip(op.lanes)
-                    .map(|(limb, lane)| SecureField::from(limb * lane))
-                    .sum();
-                let pointwise = qm31_of(core::array::from_fn(|j| limbs(a)[j] * limbs(b)[j]));
-                let computed = k(op.k_m) * a * b
-                    + k(op.k_p) * pointwise
-                    + k(op.k_a) * a
-                    + k(op.k_b) * b
-                    + k(op.k_c) * c
-                    + lanes;
+                let [a, b, c, out] = core::array::from_fn(|i| self.qm31(row, i));
+                let computed = wiring.op.apply(a, b, c);
                 if computed != out {
                     self.set(Slot::Qm31 { row, i: 3 }, computed);
                     moved = true;
@@ -287,6 +322,27 @@ impl Forgery {
                 return;
             }
         }
+    }
+
+    /// Row `row`'s output wire `w` made `value`, its other words kept: the
+    /// last round's S-box outputs rewritten through the external matrix's
+    /// inverse, so those S-boxes no longer hold.
+    pub fn force_output(&mut self, row: usize, w: usize, value: SecureField) {
+        let mut output = self.p2_output(row).map(base);
+        for (j, limb) in limbs(value).into_iter().enumerate() {
+            output[4 * w + j] = limb;
+        }
+        let sboxes = external_matrix_inverse().map(|line| {
+            line.iter()
+                .zip(&output)
+                .map(|(&a, &b)| a * b)
+                .sum::<BaseField>()
+        });
+        let last_round = p2::N_SBOXES - N_STATE;
+        for (j, value) in sboxes.into_iter().enumerate() {
+            self.trace.columns[0][p2::main::SBOXES + 2 * (last_round + j) + 1][row] = value;
+        }
+        debug_assert_eq!(self.p2_output(row).map(base), output);
     }
 
     /// Row `row`'s permutation input, read from its columns.
@@ -390,9 +446,52 @@ impl Forgery {
     }
 }
 
+/// The inverse of the permutation's external matrix, by Gauss–Jordan over
+/// its columns.
+fn external_matrix_inverse() -> [[BaseField; N_STATE]; N_STATE] {
+    let mut matrix = [[BaseField::from(0); N_STATE]; N_STATE];
+    for column in 0..N_STATE {
+        let mut unit = [BaseField::from(0); N_STATE];
+        unit[column] = BaseField::from(1);
+        apply_external_round_matrix(&mut unit);
+        for (line, value) in matrix.iter_mut().zip(unit) {
+            line[column] = value;
+        }
+    }
+    let mut inverse = [[BaseField::from(0); N_STATE]; N_STATE];
+    for (i, line) in inverse.iter_mut().enumerate() {
+        line[i] = BaseField::from(1);
+    }
+    for column in 0..N_STATE {
+        let pivot = (column..N_STATE)
+            .find(|&line| matrix[line][column] != BaseField::from(0))
+            .expect("the external matrix is invertible");
+        matrix.swap(column, pivot);
+        inverse.swap(column, pivot);
+        let scale = matrix[column][column].inverse();
+        for j in 0..N_STATE {
+            matrix[column][j] *= scale;
+            inverse[column][j] *= scale;
+        }
+        for line in 0..N_STATE {
+            let factor = matrix[line][column];
+            if line == column || factor == BaseField::from(0) {
+                continue;
+            }
+            for j in 0..N_STATE {
+                let (a, b) = (matrix[column][j], inverse[column][j]);
+                matrix[line][j] -= factor * a;
+                inverse[line][j] -= factor * b;
+            }
+        }
+    }
+    inverse
+}
+
 /// Stwo's `prove_ex` at the pin without its closing check that the trace
 /// meets the constraints: the composition committed and the values opened
-/// whatever the trace.
+/// whatever the trace. It mirrors the pinned fork's `prove_ex` line for line
+/// and is to be compared with it again whenever the pin moves.
 fn prove_unchecked(
     components: &[&dyn ComponentProver<SimdBackend>],
     channel: &mut <P2MerkleChannel as MerkleChannel>::C,

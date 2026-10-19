@@ -12,7 +12,11 @@
 //!   each candidate in turn, the empty slot of a short program among them;
 //!   no bit; two bits; one half on two candidates;
 //! - **in the fold,** a child whose circuit is not among the program's
-//!   claiming the program's first slot.
+//!   claiming the program's first slot;
+//! - **in the wrap,** a root whose circuit is neither the program's nor
+//!   the fold's claiming the program's first slot: refused by the wrap's
+//!   circuit check alone (the wrap proves on the Blake2b channel, which the
+//!   forger does not, so its proof is not forged here).
 
 use num_traits::{One, Zero};
 use stwo::core::fields::FieldExpOps;
@@ -24,14 +28,16 @@ use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{IdPreimage, LeafCircuits};
 use vos_pvm_proof::prove_canonical_format;
 use vos_pvm_proof::segment::SegmentCursor;
-use vos_pvm_recair::fold::{CIRCUITS, FoldCircuit, assert_one_of};
+use vos_pvm_recair::fold::{CIRCUITS, FoldCircuit};
+use vos_pvm_recair::gadgets::assert_one_of;
 use vos_pvm_recair::leaf::{LeafCircuit, PADDED_ROWS};
 use vos_pvm_recair::tree;
 use vos_pvm_recair::verifier::SegmentShape;
+use vos_pvm_recair::wrap::{LAYOUT, WrapCircuit};
 use vos_pvm_recair::{Context, Finalized};
 
 use crate::common::Rng;
-use crate::common::kernel::{blob, entry};
+use crate::common::kernel::{blob, entry, whole_run};
 use crate::forge::{DEEP_ALI, Forgery, LOGUP, assert_accepted, assert_refused, hash_of};
 
 /// The candidates: three hashes and an empty slot, as a short program's
@@ -213,4 +219,47 @@ fn a_fold_child_of_a_circuit_outside_the_program_is_refused() {
         .expect("the wiring checks");
     let word = word.0.map(|limb| vos_pvm_poseidon2::M31::new(limb.0));
     assert_both_refused(&finalized, &word, "a fold child outside the program");
+}
+
+/// In the wrap: the whole run's leaf as the root, under a program whose one
+/// leaf circuit is not the leaf's, claiming the program's first slot. The
+/// wrap's circuit check refuses it, and no other; under a program whose
+/// slot is the leaf's circuit, nothing is refused.
+#[test]
+fn a_wrap_root_of_a_circuit_outside_the_program_is_refused() {
+    let proof = whole_run();
+    let leaf = LeafCircuit::new(SegmentShape::of(proof), entry(&blob()));
+    let wrap = WrapCircuit::get();
+    let program = |hash: P2Hash| IdPreimage {
+        kernel: P2Hash(core::array::from_fn(|i| BaseField::from(3_000 + i as u32))),
+        leaf_circuits: LeafCircuits::Hashes(vec![hash]),
+    };
+    let pieces = |values: &vos_pvm_recair::wrap::WrapValues<SecureField>| {
+        let mut context = Context::<SecureField>::with_layout(LAYOUT).lenient();
+        let lanes = wrap.verify(&mut context, values);
+        context.set_output_lanes(&lanes);
+        let mut pieces: Vec<_> = context
+            .mismatches()
+            .iter()
+            .map(|mismatch| mismatch.piece)
+            .collect();
+        pieces.dedup();
+        pieces
+    };
+
+    let own = program(leaf.hash());
+    let node = tree::leaf(&leaf, proof, id(&own), wrap.fold_word, 0).expect("proves");
+    let (values, _) = wrap.values(node.proved(), &own).expect("the root's values");
+    assert!(pieces(&values).is_empty(), "the root's own program");
+
+    let other = program(P2Hash(core::array::from_fn(|i| {
+        BaseField::from(7_000 + i as u32)
+    })));
+    let node = tree::leaf(&leaf, proof, id(&other), wrap.fold_word, 0).expect("proves");
+    let (mut values, _) = wrap
+        .values(node.proved(), &other)
+        .expect("the root's values");
+    assert!(values.root.circuit.iter().all(|bit| bit.is_zero()));
+    values.root.circuit[0] = SecureField::one();
+    assert_eq!(pieces(&values), ["wrap: circuit"]);
 }

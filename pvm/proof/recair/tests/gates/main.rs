@@ -8,13 +8,15 @@
 //!   child or in the swapped order;
 //! - [`multiplicities`]: the `Gate` relation's signed multiplicities, a use
 //!   carrying another value than its yield, a yield consumed once more than
-//!   it counts, a second yield, a public use added or dropped;
+//!   it counts, a negative multiplicity (a second yield), a public use added
+//!   or dropped;
 //! - [`one_of`]: `assert_one_of`'s choice outside its set, in a small
-//!   circuit and in the fold;
+//!   circuit, in the fold and in the wrap;
 //! - [`lanes`]: a message wire's lanes its absorbing row leaves unread, free
-//!   to the prover, which no circuit of the tree reads;
+//!   to the prover, which the static check refuses any circuit to read;
 //! - [`boundary_bytes`]: a leaf's boundary byte of 256 or more where the
-//!   leaf does not range-check it.
+//!   leaf does not range-check it;
+//! - [`pins`]: no circuit is committed but through the static check.
 
 #[path = "../common/mod.rs"]
 mod common;
@@ -26,3 +28,4 @@ mod lanes;
 mod multiplicities;
 mod one_of;
 mod p2_modes;
+mod pins;

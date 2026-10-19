@@ -15,7 +15,14 @@
 //! - **the claimed sums,** forged to match those terms and to add to zero:
 //!   the composition at the OODS point refuses them (`oods`);
 //! - **proved,** as built, the leaf's `Gate` relation does not balance, and
-//!   the verifier refuses it.
+//!   the verifier refuses it; balanced, the gates whose wires moved break
+//!   their constraints, and the verifier refuses that.
+//!
+//! The `logup` refusal is the Fiat–Shamir binding as much as the byte
+//! tuple: the moved transcript moves every challenge after the boundary,
+//! so the public terms differ from the claimed sums for both reasons. The
+//! tuple alone is checked natively too: under the proof's own challenges,
+//! an alias's public terms do not match the claimed sums.
 
 use std::sync::OnceLock;
 
@@ -25,18 +32,17 @@ use stwo::core::fields::qm31::SecureField;
 use vos_pvm_poseidon2::{M31, N_STATE, PermKind, permute, pow_passes};
 use vos_pvm_proof::boundary_binding::BOUNDARY_STATE_BYTES;
 use vos_pvm_proof::format::SEGMENT;
-use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::poseidon2::P2Hash;
-use vos_pvm_proof::segment::SegmentCursor;
-use vos_pvm_proof::{RecursionData, extract_recursion_data, prove_canonical_format};
+use vos_pvm_proof::{RecursionData, extract_recursion_data};
 use vos_pvm_recair::leaf::{LeafCircuit, LeafValues, PADDED_ROWS};
-use vos_pvm_recair::verifier::SegmentShape;
 use vos_pvm_recair::verifier::channel::u64_wire;
+use vos_pvm_recair::verifier::logup::{self, BoundaryRelations, Challenges};
 use vos_pvm_recair::verifier::witness::pack;
+use vos_pvm_recair::verifier::{SegmentShape, verify_segment};
 use vos_pvm_recair::{Context, Mismatch};
 
-use crate::common::kernel::{blob, entry};
-use crate::forge::{Forgery, LOGUP, assert_refused};
+use crate::common::kernel::{blob, entry, whole_run};
+use crate::forge::{DEEP_ALI, Forgery, LOGUP, assert_refused};
 
 /// The whole run's segment, its leaf, the native verifier's record and the
 /// honest leaf's values.
@@ -49,20 +55,15 @@ struct Whole {
 fn whole() -> &'static Whole {
     static WHOLE: OnceLock<Whole> = OnceLock::new();
     WHOLE.get_or_init(|| {
-        let blob = blob();
-        let trace = trace_kernel(&blob, &[], 1_000).expect("halts");
-        let steps = trace.side_note.steps.len();
-        let mut cursor = SegmentCursor::new(&trace.side_note);
-        let proof =
-            prove_canonical_format(&mut cursor.side_note(0, steps), &[], &SEGMENT).expect("proves");
-        let leaf = LeafCircuit::new(SegmentShape::of(&proof), entry(&blob));
+        let proof = whole_run();
+        let leaf = LeafCircuit::new(SegmentShape::of(proof), entry(&blob()));
         let word = |base: u32| P2Hash(core::array::from_fn(|i| BaseField::from(base + i as u32)));
         let (values, output) = leaf
-            .values(&proof, word(1_000), word(2_000), 0)
+            .values(proof, word(1_000), word(2_000), 0)
             .expect("the proof's values");
         assert!(output.entry && output.halt);
         Whole {
-            data: extract_recursion_data(&proof),
+            data: extract_recursion_data(proof),
             leaf,
             values,
         }
@@ -182,7 +183,7 @@ fn forge_claimed_sums(values: &mut LeafValues<SecureField>) {
 /// The fields' byte ranges outside φ9..12, by name, in the boundary's
 /// order, and whether a field is an integer (an alias is the same one).
 fn fields() -> Vec<(&'static str, core::ops::Range<usize>, bool)> {
-    vec![
+    let fields = vec![
         ("φ1 in", 8..16, true),
         ("φ0 out", 104..112, true),
         ("φ8 out", 104 + 64..104 + 72, true),
@@ -192,7 +193,9 @@ fn fields() -> Vec<(&'static str, core::ops::Range<usize>, bool)> {
         ("ts out", 224..232, true),
         ("the memory root in", 232..264, false),
         ("the memory root out", 264..296, false),
-    ]
+    ];
+    assert_eq!(fields.last().expect("a field").1.end, BOUNDARY_STATE_BYTES);
+    fields
 }
 
 /// The forgeries: a field's first byte plus 256, and an integer field's
@@ -268,33 +271,111 @@ fn a_boundary_byte_of_256_or_more_is_refused() {
     }
 }
 
-/// Two forgeries proved, as built: the leaf's relation does not balance.
+/// The leaf over `values`, built leniently and finalized at the padded
+/// shape.
+fn finalized(values: &LeafValues<SecureField>) -> vos_pvm_recair::Finalized<SecureField> {
+    let mut context = Context::<SecureField>::with_outputs(2).lenient();
+    let wires = whole().leaf.verify(&mut context, values);
+    context.set_outputs(&wires.digest);
+    context
+        .finalize_to(Some(PADDED_ROWS))
+        .expect("the wiring checks")
+}
+
+/// Forgeries proved: an alias of φ0 out and a root's byte, its sums forged,
+/// as built (the leaf's relation does not balance); the alias balanced (its
+/// gates break).
 #[test]
 fn a_forged_boundary_byte_proved_is_refused() {
     let whole = whole();
     let hash = whole.leaf.hash().0.map(|limb| M31::new(limb.0));
     let forgeries = forgeries();
-    let picks = [
-        forgeries
+    let alias = forgeries
+        .iter()
+        .find(|(what, _)| what.starts_with("φ0 out: byte"))
+        .expect("an alias of φ0 out");
+    let root = forgeries
+        .iter()
+        .find(|(what, _)| what.starts_with("the memory root out"))
+        .expect("the memory root out");
+
+    let alias_values = forged(&alias.1);
+    let mut root_values = forged(&root.1);
+    forge_claimed_sums(&mut root_values);
+    for ((what, _), values) in [(alias, &alias_values), (root, &root_values)] {
+        let forgery = Forgery::honest(&finalized(values));
+        assert_refused(forgery.prove(), &hash, LOGUP, what);
+    }
+    let mut balanced = Forgery::honest(&finalized(&alias_values));
+    balanced.balance();
+    let unbalanced = balanced.unbalanced();
+    assert!(
+        unbalanced.is_empty(),
+        "{:?}",
+        &unbalanced[..unbalanced.len().min(12)]
+    );
+    assert_refused(
+        balanced.prove(),
+        &hash,
+        DEEP_ALI,
+        &format!("{}, balanced", alias.0),
+    );
+}
+
+/// The byte tuple alone: under the proof's own relation challenges, the
+/// boundary chips' public terms over an alias do not match the claimed
+/// sums, which they match over the honest bytes.
+#[test]
+fn an_alias_misses_the_claimed_sums_under_the_proofs_challenges() {
+    let whole = whole();
+    let shape = &whole.leaf.shape;
+    let terms = shape.boundary.as_ref().expect("a segment's boundary chips");
+    let mut context = Context::<SecureField>::new();
+    let verified = verify_segment(&mut context, shape, &whole.values.segment);
+    let challenges: Vec<[SecureField; 2]> = verified
+        .draws
+        .relations
+        .iter()
+        .map(|relation| relation.map(|wire| context.value(wire)))
+        .collect();
+    let check = |bytes: &[BaseField]| {
+        let mut context = Context::<SecureField>::new().lenient();
+        let sums: Vec<_> = whole
+            .values
+            .segment
+            .stark
+            .claimed_sums
             .iter()
-            .find(|(what, _)| what.starts_with("φ0 out: byte"))
-            .expect("an alias of φ0 out"),
-        forgeries
-            .iter()
-            .find(|(what, _)| what.starts_with("the memory root out"))
-            .expect("the memory root out"),
-    ];
-    for (pick, (what, bytes)) in picks.into_iter().enumerate() {
-        let mut values = forged(bytes);
-        if pick == 1 {
-            forge_claimed_sums(&mut values);
-        }
-        let mut context = Context::<SecureField>::with_outputs(2).lenient();
-        let wires = whole.leaf.verify(&mut context, &values);
-        context.set_outputs(&wires.digest);
-        let finalized = context
-            .finalize_to(Some(PADDED_ROWS))
-            .expect("the wiring checks");
-        assert_refused(Forgery::honest(&finalized).prove(), &hash, LOGUP, what);
+            .map(|&sum| context.guess(sum))
+            .collect();
+        let boundary: Vec<_> = pack(bytes)
+            .into_iter()
+            .map(|wire| context.guess(wire))
+            .collect();
+        let [register, program, merkle] = terms.relations.map(|r| {
+            let [z, alpha] = challenges[r].map(|value| context.guess(value));
+            Challenges { z, alpha }
+        });
+        logup::check(
+            &mut context,
+            &sums,
+            &terms.positions,
+            &boundary,
+            &BoundaryRelations {
+                register_memory: register,
+                program_execution: program,
+                merkle_node: merkle,
+            },
+        );
+        context.mismatches().len()
+    };
+    assert_eq!(check(&bytes_of(&whole.values)), 0, "the honest bytes");
+    let aliases: Vec<_> = forgeries()
+        .into_iter()
+        .filter(|(what, _)| what.contains("one less above"))
+        .collect();
+    assert!(!aliases.is_empty());
+    for (what, bytes) in aliases {
+        assert!(check(&bytes) > 0, "{what}");
     }
 }

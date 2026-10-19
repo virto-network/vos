@@ -13,18 +13,20 @@
 //!   check refuses, proved by a prover that skips it, is another circuit's;
 //!   pinned by its own hash, the relation still does not balance, whatever
 //!   the values;
-//! - **a second yield:** a wiring that balances in the relation with two
-//!   values at one address. The static check refuses it and no pinned
-//!   hash is of an unchecked wiring, so the verifier refuses it as another
-//!   circuit; the relation alone would not, which is why the check is
-//!   static and the circuit hash pins it.
+//! - **a negative multiplicity,** a use turned into a yield: the
+//!   multiplicities are preprocessed, so a forger's only form of it is a
+//!   wiring with a second yield, balanced in the relation with two values at
+//!   one address. The static check refuses it and no pinned hash is of an
+//!   unchecked wiring, so the verifier refuses it as another circuit; the
+//!   relation alone would not, which is why the check is static and the
+//!   circuit hash pins it.
 
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_recair::circuit::{Circuit, Entry, WiringError};
 use vos_pvm_recair::{Context, Finalized, ProveError, Var, circuit_commitment, prove};
-use vos_pvm_recair_air::gate::public_logup_sum;
+use vos_pvm_recair_air::gate::{Layout, public_logup_sum};
 
 use crate::common::Rng;
 use crate::forge::{
@@ -68,15 +70,38 @@ fn addition(finalized: &Finalized<SecureField>, x: Var) -> usize {
     row_of(circuit, [Some(y), Some(x.address()), None])
 }
 
-/// The sum the verifier checks: the claimed sums and the public terms.
+/// The sum the verifier checks: the claimed sums and the public terms
+/// at `layout`'s addresses.
 fn total(
     relation: &vos_pvm_recair_air::GateRelation,
+    layout: Layout,
     outputs: &[SecureField],
     sums: &[SecureField; 3],
 ) -> SecureField {
-    let layout = vos_pvm_recair_air::gate::Layout::node(outputs.len() as u32);
     sums.iter().copied().sum::<SecureField>()
         + public_logup_sum(relation, layout.public_terms(outputs.iter().copied()))
+}
+
+/// The addition's `b` (and `c`, when `on_c`) set to `x_value`, its output
+/// `y + x_value`, carried to the outputs; its `b` and `c`, and the operands
+/// `forged` besides, left as set. The forged sum.
+fn add_another_x(
+    forgery: &mut Forgery,
+    row: usize,
+    x_value: SecureField,
+    on_c: bool,
+    forged: &[(usize, usize)],
+) -> SecureField {
+    forgery.set_qm31(row, 1, x_value);
+    if on_c {
+        forgery.set_qm31(row, 2, x_value);
+    }
+    let z = forgery.qm31(row, 0) + x_value;
+    forgery.set_qm31(row, 3, z);
+    let mut frozen = vec![(row, 1), (row, 2)];
+    frozen.extend_from_slice(forged);
+    forgery.settle_except(&frozen);
+    z
 }
 
 /// A forger's value other than `x`'s.
@@ -99,18 +124,7 @@ fn a_use_carrying_another_value_is_refused() {
     );
     let row = addition(&finalized, x);
     let mut forgery = Forgery::honest(&finalized);
-    let other = other_value();
-    // The main columns of a `qm31` row: `a`, `b`, `c`, `out`, four limbs each.
-    let qm31 = &mut forgery.trace.columns[1];
-    for (j, limb) in other.to_m31_array().into_iter().enumerate() {
-        qm31[4 + j][row] = limb;
-    }
-    let y = SecureField::from_m31_array(core::array::from_fn(|j| qm31[j][row]));
-    let z = y + other;
-    for (j, limb) in z.to_m31_array().into_iter().enumerate() {
-        qm31[12 + j][row] = limb;
-    }
-    forgery.settle_except(&[(row, 1)]);
+    let z = add_another_x(&mut forgery, row, other_value(), false, &[]);
     assert_eq!(forgery.outputs[1], z, "the forged sum is stated");
     assert_refused(
         forgery.prove(),
@@ -119,10 +133,11 @@ fn a_use_carrying_another_value_is_refused() {
         "a use carrying another value",
     );
 
+    let layout = forgery.circuit.layout;
     let proof = forgery.prove_with_sums(|relation, outputs, sums| {
-        let off = total(relation, outputs, sums);
+        let off = total(relation, layout, outputs, sums);
         sums[1] -= off;
-        assert!(total(relation, outputs, sums).is_zero());
+        assert!(total(relation, layout, outputs, sums).is_zero());
     });
     assert_refused(proof, &hash, DEEP_ALI, "the same, its claimed sum balanced");
 }
@@ -138,7 +153,7 @@ fn a_public_use_added_or_dropped_is_refused() {
     assert_refused(added.prove(), &hash, LOGUP, "an output added");
     // The added output's value the wire's at its address, a third output's.
     let mut added = Forgery::honest(&finalized);
-    let next = vos_pvm_recair_air::gate::Layout::node(3).output(2);
+    let next = Layout::node(3).output(2);
     let value = added.yields()[&next];
     added.outputs.push(value);
     assert_refused(
@@ -188,9 +203,7 @@ fn a_yield_consumed_once_more_is_refused() {
     );
     for value in [finalized.witness.qm31[row][1], other_value()] {
         let mut forgery = Forgery::honest(&forged);
-        for (j, limb) in value.to_m31_array().into_iter().enumerate() {
-            forgery.trace.columns[1][8 + j][row] = limb;
-        }
+        forgery.set_qm31(row, 2, value);
         let proof = forgery.prove();
         assert_refused(
             proof.clone(),
@@ -241,18 +254,7 @@ fn a_second_yield_is_refused_by_the_pin() {
     );
 
     let mut forgery = Forgery::honest(&forged);
-    let other = other_value();
-    let qm31 = &mut forgery.trace.columns[1];
-    for (j, limb) in other.to_m31_array().into_iter().enumerate() {
-        qm31[4 + j][row] = limb;
-        qm31[8 + j][row] = limb;
-    }
-    let y = SecureField::from_m31_array(core::array::from_fn(|j| qm31[j][row]));
-    let z = y + other;
-    for (j, limb) in z.to_m31_array().into_iter().enumerate() {
-        qm31[12 + j][row] = limb;
-    }
-    forgery.settle_except(&[(mul, 1), (row, 1), (row, 2)]);
+    let z = add_another_x(&mut forgery, row, other_value(), true, &[(mul, 1)]);
     assert_eq!(forgery.outputs[1], z, "y plus another x is stated");
     let proof = forgery.prove();
     assert_refused(proof.clone(), &hash, ANOTHER_CIRCUIT, "a second yield");
