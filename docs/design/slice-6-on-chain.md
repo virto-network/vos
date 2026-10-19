@@ -309,9 +309,12 @@ from the proof.
 
 - **R4, hedged:** ChaCha20 seeded with
   `BLAKE2b-256("vos/mask/seed/v1" ‖ 32 OS bytes ‖ witness digest ‖ attempt as u32 LE)`;
-  the witness digest is `BLAKE2b-256` of the root node's proof bytes and
-  its output preimage [proposed detail]. Every mask, salt, R column and
-  blinding value is drawn from it.
+  the witness digest is `BLAKE2b-256("vos/mask/witness/v1" ‖ each main
+  column's BLAKE2b-256)`, over the unmasked main columns in commitment
+  order, every private value of the witness among them, whatever the
+  component set [built at 6.3; proposed first as the root node's proof
+  bytes and output preimage, which only the wrap has]. Every mask, salt,
+  R column and blinding value is drawn from it.
 - **R1:** for every column class (level, quotient lift, offset set), the
   randomizer's revealed functionals (4 an OODS point, the decommitments,
   the composition's shifted reads) have full row rank over M31.

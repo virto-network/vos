@@ -697,6 +697,154 @@ this record and the plan's edits.
 
 **6.2 accepted.**
 
+## Step 6.3: the masked prover
+
+**The format's pins (R6)** (`pvm/proof/src/format.rs`): `Masking {
+salt_columns, fri_mask_columns, log_mask_rows }` and `Format.masking:
+Option<Masking>`, 39's `MASKED_WRAP_MASKING` (8, 8, 8: `h = 256`), `None`
+for every unmasked format and for 30 and 37, masked but reserved before
+their masking. The type is named `Masking`, not the plan's `MaskPins`:
+`vos-pvm-recair-air`'s `MaskPins` (salt and `R` columns, the trees'
+layout) stays, since the AIR crate does not depend on the registry;
+`MASKED_WRAP_PINS` moved from it to `vos_pvm_recair::masked`, a constant
+read from `MASKED_WRAP.masking`, so
+`the_masked_reference_shape_is_the_built_wraps` now guards the format's
+pins. A test holds 39's `h` within pin A's bounds: at least `2(4·2 +
+24·3) = 160`, at most `N/4` and `2N/3` of `h8`'s `2^11`.
+
+**The AIR's side** (`recair-air/src/masked.rs`): the provided
+`MaskedComponents::draw(channel) -> (Relations, BlindRelation)`, pin B's
+step 5 written once, used by the prover and the tests' verifier.
+
+**The prover** (`pvm/proof/recair/src/masked/`, ported from spike 6a's
+`c95b46c9`, `5227bf6c`):
+- `prove_masked::<MC: MerkleChannel, C: MaskedProvers>(format,
+  MaskedTrace, &MaskRng)`: a `MaskedTrace` is a set's log sizes, its
+  preprocessed and main columns, its public values and its interaction trace
+  (a closure of the relations and each component's blinding fraction).
+  Pin B's order; nothing names the wrap. `MaskedProvers`, the prover-side
+  extension of `MaskedComponents`, gives the set's `ComponentProver`s, each
+  lifted one level by a local wrapper over recair-air's `MaskedComponent`
+  (one lifting rule); `WrapComponents` implements it;
+- `MaskLayout` (`layout.rs`), its asserts errors (`h ≤ N/4`, a lost
+  coefficient, `v_H·r` not spanning exactly `h` basis elements) plus a new
+  one (`v_H·r`'s positions overlapping `f`'s); the layouts built once a
+  size, in parallel, across attempts; `mask_columns` in parallel, a seed a
+  column;
+- `commit_salted` (`salts.rs`): each salt column written straight into
+  packed SIMD lanes (`bytemuck` over `PackedM31`), 2^16-word chunks each
+  from its own ChaCha20 stream, in parallel; the value `p` drawn again. `R`'s
+  8 columns from the same sampler, as uniform coefficients at the
+  composition's level;
+- **R4** (`rng.rs`): `MaskRng::{Os, Seeded(u64)}`, the seeded variant only
+  under `cfg(any(test, feature = "seeded-masks"))`, `MaskRng::new()` the
+  OS's; an attempt's ChaCha20 seed is pin C's
+  `BLAKE2b-256("vos/mask/seed/v1" ‖ 32 OS bytes ‖ witness digest ‖ attempt
+  LE)`, fresh OS bytes each attempt. **Deviation (pin C's [proposed
+  detail]):** the witness digest is `BLAKE2b-256("vos/mask/witness/v1" ‖
+  each unmasked main column's BLAKE2b-256)`, not the root node's proof
+  bytes and output preimage: the generic prover has no root node, and every
+  private value is in its main columns. Pin C amended;
+- **R1** (`rank.rs`), ported: the classes collected, then checked in
+  parallel, by forward elimination; the AIR's level and each column's rows'
+  level read from the set (the spike's `composition − 1`). Checked after
+  the prover's own out-of-domain check, so an invalid witness is refused
+  as such, never retried; a deficient transcript discarded and every mask
+  drawn again, at most `MAX_ATTEMPTS = 8`, then `ProveError::MaskRank`;
+- R with 8 columns, no R3 check (pin C);
+- every spike `assert`/`expect` an error: `ProveError::{MaskRank,
+  Masking(&str), Entropy}`; a format without its masking, a set refusing
+  its sizes, a composition of another size, sample points that do not fit
+  the trees, and **a salt given a sample point**, each refused before
+  `prove_values`;
+- the blinding (R2): one QM31 a component on its first row, uniform but
+  the last, which makes them sum to zero. A set of one component is left
+  unblinded (its sum must cancel the public terms alone).
+
+**The recursion AIR's path** (`prove.rs`, `wrap.rs`, `tree.rs`,
+`trace.rs`): `prove_masked_on::<MC>(format, circuit, witness, rng,
+tamper)` (the wiring checked first); `MainTrace::interaction_with(..,
+[Option<FirstRowFraction>; 3])`, `interaction` its `[None; 3]`, the
+blinding fraction taken lazily (no allocation on the leaves' and folds'
+path). `wrap::prove` is format 39's, from the OS's randomness, replacing
+`stwo::prover::prove` for the wrap; `wrap::prove_masked(finalized, rng,
+tamper)` returns its `MaskStats`; format 28's path is
+`wrap::prove_unmasked(_with)`, which the recursion tests, `wrap_root` and
+the fixtures' generator call until the venues take 39 (6.4, 6.5).
+`tree::wrap` proves 39, `tree::wrap_with(.., prove)` either. `prove_on`
+refuses a masked format.
+
+**The test seam's build check** (`just check-no-seeded-masks`, in `check`
+and `ci`): `cargo tree -e features,no-dev` of `vos-cli`, `vos-node` and the
+agent shows no `seeded-masks`, and `pvm/proof`'s `debug-internals` does not
+name it. The node has no `prover` feature yet: 6.18's adds its build to
+the list. `vos-pvm-recair`'s own tests enable the feature through a dev
+dependency on itself (verified absent from the `no-dev` tree).
+
+**The tests' masked verifier** (`recair/tests/support/masked_verifier.rs`,
+test-only until 6.4's): pin B replayed over any set and channel, on
+`CommitmentSchemeVerifier::{commit, verify_values}`; included by path in
+`vos-pvm-recair`'s circuit tests and `vos-pvm-proof`'s kernel tests.
+
+**Tests** (`recair/tests/circuit/masked_prover.rs`, small circuits at
+`2^9` rows a component, a test format of blowup 4, 4 queries, `h = 64`;
+1.2 s in all):
+- the mask invariant at `2^6` to `2^17`: `(f' − f)/v_H` on `2N` points off
+  `H` interpolates to exactly `h` coefficients in the size-`h` basis, so
+  `f' = f` on `H` (Stwo's SIMD backend evaluates no polynomial on a domain
+  smaller than its own, so `H` is reached through the divisibility);
+  `MaskLayout::new` refuses `h > N/4`;
+- R1 refuses `h = 64` at 24 queries (`ProveError::MaskRank` after 8
+  attempts) and passes at 4 (1 attempt, rows ≤ 64);
+- `fri_mask_coefficients_independent`: `prove_values`' draw replayed (the
+  tests' verifier to the DEEP coefficients): an 8-column `R`'s span QM31 on
+  4 transcripts; a 4-column `R`'s, a dependent one planted, are caught;
+- an invalid witness (a `qm31` limb, a `p2` S-box) refused by the prover
+  (`ConstraintsNotSatisfied`), and format 28 refused by the masked path;
+- **generic:** a `p2`-only set (`P2Only`, the test's own
+  `MaskedComponents` + `MaskedProvers`) proved and verified on
+  `Blake2sMerkleChannel` under a format no registry holds; a tampered
+  sample and a tampered salt refused;
+- two proofs of one witness: the preprocessed root shared, the 3 masked
+  roots and every blinded claimed sum different; `MaskRng::Seeded(7)`
+  reproduces the proof's bytes, `Seeded(8)` does not.
+
+**The gate:** the window kernel's real masked wrap, in `wrap_root`
+(`the_window_wraps`, `test-proof`; also `areas`), under `systemd-run
+--user --scope -p MemoryMax=16G -p MemorySwapMax=0 nice -n 10`, verified by
+the tests' verifier, its preprocessed root format 28's (pin A) [measured]:
+
+| run | prove | heap peak | process peak resident | bytes (postcard) | R1 | revealed rows | attempts | load (1 min) | format 28, same run |
+|---|---|---|---|---|---|---|---|---|---|
+| 1 | 12.85 s | 3,627 MiB | 6,161 MiB | 161,263 | 46.8 ms | 80 of 256 | 1 | 14.28 | 5.52 s |
+| 2 (R1 parallel) | 13.56 s | 3,627 MiB | 6,097 MiB | 160,584 | 13.4 ms | 80 of 256 | 1 | 21.69 | 11.31 s |
+
+- heap 3.54 GiB ≤ 4.5 (spike 3.45 GiB: the spike measured 3,531 MiB);
+  process ≤ 8 GiB (`VmHWM`, reset through `/proc/self/clear_refs` before the
+  prove: it holds the window's live data too); R1 ≤ 50 ms in both runs,
+  13.4 ms with the classes in parallel;
+- **≤ 15 s quiet: not measured quiet.** The machine ran other agents'
+  builds, load 14–22; at load 14 the masked wrap took 12.85 s against
+  format 28's 5.52 s in the same run (2.33×; spike 6a's best 28 3.88 s,
+  which would put 39 near 9 s quiet [est]);
+- the process peak's assertion: `wrap_root` now asserts heap ≤ 4,608 MiB,
+  resident ≤ 8 GiB and the revealed rows ≤ `h`; the times are printed, not
+  asserted, as the 28 wrap's are.
+
+**Gates:** the stale-fixture test (`the_fixtures_are_the_generators`) byte
+for byte, formats 28 and 32 untouched (143 s); `just check` green
+(1,174 tests, 0 failed), `check-no-seeded-masks` in it; clippy with
+`debug-internals` clean.
+
+**Commits:** `aec03f92` the prover, its pins, its tests and the gate; this
+record and pin C's amendment.
+
+**For the review (Fable):** the witness digest's deviation (above); the
+retry draws fresh OS bytes and the attempt index each time, and R1 runs
+after the out-of-domain check; a one-component set is unblinded; the test
+seam is a `pub` variant behind `cfg`; `tree::wrap` now proves 39 (no
+production caller yet; 6.18's worker will be one).
+
 ## Step 6.8: the recursion AIR's forgery gates
 
 **Built** on `s6/forgery` (from `27967322`): a new test binary,
