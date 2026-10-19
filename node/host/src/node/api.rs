@@ -140,6 +140,28 @@ impl Node {
         self.inner.representative()
     }
 
+    /// This node's anchor keys, oldest first: its node key, then each
+    /// rotation's. Its leadership of the representative signs with the
+    /// newest the venue lists.
+    pub fn anchor_keys(&self) -> Vec<[u8; 32]> {
+        self.inner.anchor_keys.public()
+    }
+
+    /// Make an anchor key, kept durably before it is returned, for the
+    /// space's controller to register at the venue (`add_authority`): the
+    /// node signs with it once the venue lists it, and the controller then
+    /// removes the old one. [`crate::rotate_anchor_key`] makes one for a
+    /// stopped node.
+    pub fn rotate_anchor_key(&self) -> Result<[u8; 32], Error> {
+        let inner = Arc::clone(&self.inner);
+        smol::block_on(
+            self.inner
+                .runtime
+                .spawn(async move { inner.anchor_keys.rotate(&inner.storage).await }),
+        )
+        .map_err(Error::Data)
+    }
+
     /// Replace `agent`'s replica `remove` by node `add`: the replicas once
     /// the change committed.
     pub fn replace(

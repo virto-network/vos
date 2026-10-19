@@ -35,6 +35,7 @@ pub(super) enum NodeRow {
     Placement = 0x0c,
     Incarnation = 0x0d,
     VoteFloor = 0x0e,
+    AnchorKey = 0x0f,
 }
 
 pub(super) fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {

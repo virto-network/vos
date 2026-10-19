@@ -124,6 +124,10 @@ struct Leader {
     /// The anchors this leadership has still to hand the venue, by window:
     /// the representative's root at the cut.
     unanchored: std::collections::BTreeMap<u64, [u8; 32]>,
+    /// The window whose anchor this leadership last alerted it could not
+    /// sign, or the venue would not take yet for want of a key or a
+    /// resumption: alerted once a window.
+    alerted: Option<u64>,
 }
 
 /// What an idle leader takes.
@@ -188,6 +192,7 @@ impl Leader {
             told: None,
             anchored: std::collections::BTreeSet::new(),
             unanchored: std::collections::BTreeMap::new(),
+            alerted: None,
         }
     }
 

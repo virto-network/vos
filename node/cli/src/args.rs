@@ -88,6 +88,24 @@ pub enum NodeCommand {
         #[command(flatten)]
         node: NodeArgs,
     },
+    /// The keys a node signs its space's anchors with.
+    AnchorKey {
+        #[command(subcommand)]
+        command: AnchorKeyCommand,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum AnchorKeyCommand {
+    /// Make a new anchor key, kept in the node's store, and print its
+    /// public key for the space's controller to register at each venue
+    /// (`add_authority`). The node signs with it once a venue lists it;
+    /// the controller then removes the old key (`remove_anchor_key`).
+    Rotate {
+        /// The node's data directory, its node stopped.
+        #[arg(long)]
+        data: PathBuf,
+    },
 }
 
 #[derive(clap::Args)]

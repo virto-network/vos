@@ -8,13 +8,19 @@
 //! and pin F say a venue checks: the anchor rule (a registered,
 //! unsuspended space; a registered key; the signature; `Last < w < now_w`;
 //! the root no older than `MaxRootAge`) and `judge`. A second root for one
-//! `(space, kind, w)` is kept as evidence and suspends the space.
+//! `(space, kind, w)` is kept as evidence and suspends the space. Its
+//! anchor keys are kept by space, the founding ones first, added and
+//! removed as `spaces-pallet.md`'s controller does, and `resume` lifts a
+//! suspension once neither equivocating key is registered.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceGenesis, SpaceId, VenueId, WindowClock};
+use vos_anchor::{
+    Anchor, MAX_FOUNDING_KEYS, MAX_ROOT_AGE_MS, RootRead, SpaceGenesis, SpaceId, VenueId,
+    WindowClock,
+};
 use vos_statement::model::{Policy, Range, Space};
 use vos_statement::{Pin, ProgramId, Refusal, Statement, StatementId, Venue};
 
@@ -29,6 +35,9 @@ pub trait VenueClient: Send + Sync {
     /// Whether `root` is anchored, its space's root of its kind at its
     /// window.
     fn anchored(&self, root: &RootRead) -> bool;
+    /// The anchor keys `space` has registered here (Kreivo's `AnchorKeys`):
+    /// none when it is not registered, or the venue cannot say.
+    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]>;
 }
 
 /// An anchor the venue took.
@@ -68,6 +77,7 @@ pub enum AnchorRefusal {
 /// A space a venue registered.
 struct Registered {
     clock: WindowClock,
+    /// Its anchor keys: the founding ones, then those added.
     keys: Vec<[u8; 32]>,
     start: u64,
     last: Option<u64>,
@@ -191,6 +201,58 @@ impl ModelVenue {
             .is_some_and(|space| space.suspended)
     }
 
+    /// Add `key` to `space`'s anchor keys, as the controller's
+    /// `add_authority` pairs one: false when the space is not registered,
+    /// the key is registered already, or it holds [`MAX_FOUNDING_KEYS`]
+    /// (Kreivo's `MaxAnchorKeys`).
+    pub fn add_anchor_key(&self, space: &SpaceId, key: [u8; 32]) -> bool {
+        let mut state = self.state();
+        let Some(space) = state.spaces.get_mut(space) else {
+            return false;
+        };
+        if space.keys.contains(&key) || space.keys.len() >= MAX_FOUNDING_KEYS {
+            return false;
+        }
+        space.keys.push(key);
+        true
+    }
+
+    /// Remove `key` from `space`'s anchor keys, as the controller's
+    /// `remove_anchor_key` does: false when it is not one.
+    pub fn remove_anchor_key(&self, space: &SpaceId, key: &[u8; 32]) -> bool {
+        let mut state = self.state();
+        let Some(space) = state.spaces.get_mut(space) else {
+            return false;
+        };
+        let before = space.keys.len();
+        space.keys.retain(|held| held != key);
+        space.keys.len() < before
+    }
+
+    /// Lift `space`'s suspension, as the controller's `resume` does: only
+    /// once neither signer of any of its equivocations is still one of its
+    /// anchor keys, which then clears its evidence. Whether it is active.
+    pub fn resume(&self, space: &SpaceId) -> bool {
+        let mut state = self.state();
+        let state = &mut *state;
+        let Some(registered) = state.spaces.get_mut(space) else {
+            return false;
+        };
+        let signed_by_a_key = state
+            .evidence
+            .iter()
+            .filter(|(held, _)| held.space == *space)
+            .any(|(held, other)| {
+                registered.keys.contains(&held.signer) || registered.keys.contains(&other.signer)
+            });
+        if signed_by_a_key {
+            return !registered.suspended;
+        }
+        registered.suspended = false;
+        state.evidence.retain(|(held, _)| held.space != *space);
+        true
+    }
+
     /// The equivocations kept: each the anchor held and the other.
     pub fn evidence(&self) -> Vec<(Anchor, Anchor)> {
         self.state().evidence.clone()
@@ -295,6 +357,14 @@ impl VenueClient for ModelVenue {
 
     fn anchored(&self, root: &RootRead) -> bool {
         held(&self.state(), root, (self.now)())
+    }
+
+    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
+        self.state()
+            .spaces
+            .get(space)
+            .map(|space| space.keys.clone())
+            .unwrap_or_default()
     }
 }
 

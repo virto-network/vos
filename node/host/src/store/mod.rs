@@ -276,6 +276,21 @@ impl Fjall {
             .and_then(|seed| seed[..].try_into().ok()))
     }
 
+    /// The seeds of the anchor keys the node made past its first, its
+    /// node key's, oldest first: secret, never served.
+    pub fn anchor_secrets(&self) -> Result<Vec<[u8; 32]>> {
+        let prefix = node_record(NodeRow::AnchorKey, &[]);
+        let mut seeds = Vec::new();
+        for row in self.system().prefix(&prefix) {
+            let (_, seed) = row.into_inner()?;
+            match seed[..].try_into() {
+                Ok(seed) => seeds.push(seed),
+                Err(_) => tracing::error!("an unreadable anchor key; it is not used"),
+            }
+        }
+        Ok(seeds)
+    }
+
     /// The node's last run, as its pair heartbeat numbered it.
     pub fn incarnation(&self) -> Result<u64> {
         Ok(self

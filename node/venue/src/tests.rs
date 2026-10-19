@@ -185,3 +185,57 @@ fn a_statement_is_judged_against_the_anchors() {
         "judged to the proof"
     );
 }
+
+/// A space's anchor keys, added and removed: a key added anchors, a key
+/// removed no longer does, and the listing follows both.
+#[test]
+fn anchor_keys_are_added_and_removed() {
+    let f = fixture();
+    let founding = |by: usize| f.keys[by].verifying_key().to_bytes();
+    assert_eq!(f.venue.anchor_keys(&f.space), [founding(0), founding(1)]);
+    let added = SigningKey::from_bytes(&[9; 32]);
+    let key = added.verifying_key().to_bytes();
+    let mut anchor = f.anchor(3, 1, 0);
+    anchor.signer = key;
+    anchor.signature = added.sign(&anchor.digest(&VENUE)).to_bytes();
+    assert_eq!(f.venue.anchor(&anchor), Err(AnchorRefusal::Key));
+    assert!(f.venue.add_anchor_key(&f.space, key));
+    assert!(!f.venue.add_anchor_key(&f.space, key), "registered already");
+    assert_eq!(f.venue.anchor(&anchor), Ok(Anchored::New));
+    assert!(f.venue.remove_anchor_key(&f.space, &founding(0)));
+    assert!(!f.venue.remove_anchor_key(&f.space, &founding(0)));
+    assert_eq!(f.venue.anchor_keys(&f.space), [founding(1), key]);
+    assert_eq!(f.venue.anchor(&f.anchor(4, 1, 0)), Err(AnchorRefusal::Key));
+    assert!(f.venue.anchor_keys(&SpaceId([8; 32])).is_empty());
+    assert!(!f.venue.add_anchor_key(&SpaceId([8; 32]), key));
+}
+
+/// A suspended space resumes only once neither equivocating key is
+/// registered: its evidence cleared, it anchors again by another key.
+#[test]
+fn a_suspended_space_resumes_without_its_equivocating_keys() {
+    let f = fixture();
+    let founding = |by: usize| f.keys[by].verifying_key().to_bytes();
+    f.venue.anchor(&f.anchor(3, 1, 0)).unwrap();
+    assert_eq!(
+        f.venue.anchor(&f.anchor(3, 2, 1)),
+        Err(AnchorRefusal::Equivocation)
+    );
+    assert!(f.venue.remove_anchor_key(&f.space, &founding(0)));
+    assert!(!f.venue.resume(&f.space), "the second signer is registered");
+    assert!(f.venue.suspended(&f.space));
+    let rotated = SigningKey::from_bytes(&[9; 32]);
+    assert!(
+        f.venue
+            .add_anchor_key(&f.space, rotated.verifying_key().to_bytes())
+    );
+    assert!(f.venue.remove_anchor_key(&f.space, &founding(1)));
+    assert!(f.venue.resume(&f.space));
+    assert!(!f.venue.suspended(&f.space));
+    assert!(f.venue.evidence().is_empty());
+    let mut anchor = f.anchor(4, 1, 0);
+    anchor.signer = rotated.verifying_key().to_bytes();
+    anchor.signature = rotated.sign(&anchor.digest(&VENUE)).to_bytes();
+    assert_eq!(f.venue.anchor(&anchor), Ok(Anchored::New));
+    assert!(f.venue.anchored(&f.read(3, 1)), "the first root held");
+}

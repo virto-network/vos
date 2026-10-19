@@ -1,6 +1,7 @@
 //! The VOS node host: its storage and, on one process, every agent it
 //! runs (`Node`).
 
+mod anchor_keys;
 pub mod blobs;
 
 #[cfg(test)]
@@ -35,6 +36,7 @@ pub mod store;
 pub mod tls;
 mod workflows;
 
+pub use anchor_keys::rotate_anchor_key;
 pub use node::{
     ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, ReplaceError, Reply, STORE,
     wall_clock,

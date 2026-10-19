@@ -64,6 +64,20 @@ impl Cluster {
         Self::build(count, false, clock, Box::new(tuning))
     }
 
+    /// Nodes 1..=count on the hub, as [`Cluster::in_space`] makes them, of
+    /// a space founded with `clock` by `founders` alone.
+    pub fn founded_by(
+        count: u8,
+        founders: &[NodeNumber],
+        clock: WindowClock,
+        tuning: impl Fn(NodeNumber, &mut Config) + Send + Sync + 'static,
+    ) -> Self {
+        let founders = founders.to_vec();
+        Self::build_founded(count, false, Some(clock), Box::new(tuning), |number| {
+            founders.contains(&number)
+        })
+    }
+
     /// Nodes 1..=count over QUIC on localhost.
     pub fn over_quic(count: u8) -> Self {
         Self::build(count, true, Some(WindowClock::DEFAULT), Box::new(|_, _| {}))
@@ -98,6 +112,16 @@ impl Cluster {
     }
 
     fn build(count: u8, quic: bool, clock: Option<WindowClock>, tuning: Tuning) -> Self {
+        Self::build_founded(count, quic, clock, tuning, |_| true)
+    }
+
+    fn build_founded(
+        count: u8,
+        quic: bool,
+        clock: Option<WindowClock>,
+        tuning: Tuning,
+        founding: impl Fn(NodeNumber) -> bool,
+    ) -> Self {
         let programs = Arc::new(Programs::load());
         let dirs: Vec<tempfile::TempDir> =
             (0..count).map(|_| tempfile::tempdir().unwrap()).collect();
@@ -106,7 +130,8 @@ impl Cluster {
         });
         // A space founded as `vos space up` founds it.
         if let Some(clock) = clock {
-            let genesis = space.found(clock, 0, [7; 16]).unwrap();
+            let mut genesis = space.found(clock, 0, [7; 16]).unwrap();
+            genesis.nodes.retain(|(number, _)| founding(*number));
             space = space.with_genesis(genesis).unwrap();
         }
         let mut cluster = Self {
