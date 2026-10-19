@@ -827,6 +827,12 @@ Throwaway code on local branches; each with a gate and a fallback.
   venues' accepted set {39} (28 only under `test-formats` and the model
   venue's test policy) is the one gate, and this step's transition and
   adversarial cases hold it.
+- **The build check** (6.4's review), once `vos-statement` drops the
+  verifier's `test-formats`: `just check-no-test-formats` beside
+  `check-no-seeded-masks`, `cargo tree --workspace -e features,no-dev`
+  and the stand-alone manifests (the Wasm blob among them) showing no
+  `feature "test-formats"`; `vos-statement`'s `fixtures` and test features
+  do not imply it.
 - **Review:** Fable as well: the check order, the accepted set and the
   adversarial cases are protocol every venue inherits (a proof checked
   before `seen` is a denial-of-service vector).
@@ -875,6 +881,17 @@ Throwaway code on local branches; each with a gate and a fallback.
   leaks (an unmasked column, a reused mask, an unblinded sum), not
   evidence of zero knowledge: that is the argument's, R1 on every proof
   in the programmable random-oracle model, which Fable's review checks.
+- **The verify gates on a bound** (6.4's review): 6.4's decode (≤ 4M gas)
+  and PVF (≤ 50M Wasm instructions) gates were one proof's, within a few
+  percent of their limits, and the Merkle witnesses vary by about 10%
+  with the query draw; this step measures them on a worst-shape proof (24
+  distinct queries, no shared siblings) or as the maximum over at least
+  10 seeds. **Unaligned loads** are legal on JAM's PVM (its loads index
+  memory by byte, with no alignment condition), so
+  `+unaligned-scalar-mem` in `riscv64em-vos.json` is a codegen lever for
+  the guest's decode and verify gas (one load where LLVM now emits four
+  byte loads and shifts), measured here or at 6.19; it does nothing for
+  the Wasm gate.
 - **Review:** Fable on the masked transcript as built (pin B), with R1–R4
   and the leakage results. The zero-knowledge argument stays conditional
   on the programmable random-oracle model and R1 on every proof; the
@@ -892,6 +909,15 @@ Throwaway code on local branches; each with a gate and a fallback.
   `verify` (`vcs_lifted`, `pcs`, `fri`, `verify_values`) listed in
   `pvm/proof/SECURITY.md` with the shape check that guards it. One that no
   check can guard becomes a fork fix (Fable review, then push).
+- **The fork fix for the last proof-reachable Stwo panics** (6.4's
+  review): `fri_answers` → `denominator_inverses` → `CM31::batch_inverse`
+  asserts on a zero DEEP denominator (a sample point's conjugate line
+  through a queried point: about 2^70 hashes of grinding [est]), and
+  `complex_conjugate_line_coeffs`' `assert_ne!(y, ȳ)` (2^-62 a draw):
+  each a `VerificationError::InvalidStructure`, with a unit test from a
+  constructed point pair; a DIVERGENCE line in `SECURITY.md`; the fork
+  re-pinned (`Cargo.lock`, `fuzz/Cargo.toml`) and pushed after Fable's
+  review. Format 28's path and upstream alike.
 - **Fuzzing:** the five targets plus a masked-bytes target and an
   `Anchor` decode target; a checked-in corpus replayed in `just check`;
   `just fuzz` (5 minutes a target) in `ci-full`.
@@ -1395,6 +1421,9 @@ fees are the teammate's.
   past `MaxRootAge` refused; a PolkaJam testnet run (`just
   jam-statements-testnet`): deploy, register, anchor, submit the masked
   fixture, read the verdicts back.
+- **Unaligned loads** (6.4's review): legal on JAM's PVM, so the service's
+  target may take `+unaligned-scalar-mem` for its decode and verify gas,
+  if 6.6 has not measured it.
 - **Gates:** refine ≤ 150M gas a statement (6.0b: 118.7M [measured]);
   PolkaJam's refine gas equal to the JAM-only host's for one statement;
   accumulate ≤ 2M gas a report; the service under 4,000,000 bytes;
@@ -1535,6 +1564,10 @@ fees are the teammate's.
       `Fjall::open` refuses on a mismatch, so a store written before a
       layout change (6.11 moved committed rows under `0x03`) fails to open
       instead of hiding its rows.
+  23. **The decode's allocator** (6.4's review): format 39's decode costs
+      about 3.7M gas on the JAM-only host, most of it the guest's
+      allocator over the proof's 1,012 column vectors (Stwo's shape), not
+      the layout; a venue's allocator is the remaining lever.
 - **Then the slice's own cleanup:** the Opus code-quality review of slice
   6's code, folded the same way.
 - **Docs:** `proving.md` draft 6, `core-model.md`, `identity-and-authority.md`,

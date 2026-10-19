@@ -1017,6 +1017,48 @@ require (unaligned loads are legal), a lever for 6.19's service build;
 `vos-statement` still links 28 (`test-formats`) until 6.5; the fuzz
 golden for 39 is a test's output, not a checked-in fixture, until 6.5.
 
+**Commits:** `21109480` the step; `975e21ff` this record.
+
+**Review:** Fable ACCEPT (pin B replayed mix for mix against the prover;
+every proof-shaped `zip_eq`, index and `unwrap` in `verify_values` closed
+by `check_shape` first; the layout canonical and bounded before
+allocation; the dispatch never sniffs), five low findings; Opus, no
+blockers. Folded (`1fb3f717`):
+- **Fable 2:** a third fact left to Stwo, named in `masked.rs` and
+  `SECURITY.md`: FRI's bound is the last tree's height less the blowup, so
+  the composition tree is the last and tallest commitment
+  (`LOG_DEGREE_BOUND` 17; the test holds the tallest column and the whole
+  composition tree at it);
+- **Fable 3, taken:** the layout pins each column's samples
+  (`masked::samples`: 0, 1 or 2 as the format lays them out, a test
+  holding it to the sample points column for column) and reads one queried
+  count a tree; `encode` returns `None` for a proof the layout cannot hold
+  (other samples, unequal queried columns), and the decode refuses those
+  shapes itself. Re-measured [measured]: proof 149,828 → **145,796 B**;
+  decode 3,758,064 → **3,708,866 gas** (the counts were not the cost);
+  verify 105,790,413; total 109,580,903; Wasm under the PVF's semantics
+  **47,412,124** instructions (unchanged); proving 10.1 s at load;
+- **Fable 1, 4, 5 and the unaligned-load lever, into the plan:** 6.7 the
+  fork fix for the last proof-reachable panics (`fri_answers`'
+  zero-denominator inverse, about 2^70 hashes [est]; the conjugate line's
+  `assert_ne!`); 6.5 `check-no-test-formats`; 6.6 the decode and PVF gates
+  on a worst-shape proof or the maximum over ≥ 10 seeds, and
+  `+unaligned-scalar-mem` legal on JAM's PVM, measured there or at 6.19
+  (6.19 notes it);
+- **Opus:** `SECURITY.md`'s masking opening (39 masked, every other proof
+  unmasked); one `samples_fit`; `LOG_DEGREE_BOUND` in `HEIGHT`,
+  `FRI_ROUNDS`' doc and the tests; the claimed sums read into an array;
+  `encode`'s `CAPACITY`; the writer's bytes returned; `unmasked` on
+  `masked::TREES`; `Decoded::into_proof` in the fuzz golden; the fuzz
+  paths honour `CARGO_TARGET_DIR`; two doc lines reflowed; the plan's 6.22
+  item 23: the decode's remaining lever is the allocator over the proof's
+  1,012 column vectors, not the layout.
+
+**Gates after the fold:** `just check` green (1,193 tests, 0 failed, on
+6.11's merge); clippy clean; the fuzz crate builds.
+
+**6.4 accepted.**
+
 ## Step 6.8: the recursion AIR's forgery gates
 
 **Built** on `s6/forgery` (from `27967322`): a new test binary,
@@ -1360,3 +1402,187 @@ service carries no test mode of `final-verify.elf` (mode 2 reports
 
 **`just check` after both merges** (at `85c1853b`): green, 1,168 passed,
 0 failed.
+
+## Step 6.11: the agent root, committed rows under `0x03`
+
+Worktree `.worktrees/s6-roots`, branch `s6/roots` off `vos-core` `85c1853b`. Not pushed.
+
+**Built:**
+- **The keyspace (`agent/wire/src/keys.rs`):** `Owner::Committed = 0x03`; a
+  committed row is `0x03 ‖ instance (4) ‖ tag (4) ‖ transform (1) ‖ key'`, no
+  `Part` byte (`Part::Committed` gone; `COMMITTED_PREFIX` = 10, `TABLE_PREFIX`
+  stays 11). `is_committed` and `committed_entry` decide from the first byte;
+  `owned_by` accepts `0x01 ‖ instance` and `0x03 ‖ instance`;
+  `instance_prefix` became `instance_prefixes` (both); `committed_all()` =
+  `[0x03]`, the agent root's keys. `rows_prefix`/`row` give the ABI the new
+  prefix for `Rows::Committed`, so a handler's committed-map ops and scans
+  land under `0x03`.
+- **Dirty rows** name the committed row whole: `00 11 ‖ version ‖ row`
+  (`dirty(version, row)`, `dirty_entry → (version, row)`; one byte more a
+  row than `map_key ‖ key'`); `map_key` gone.
+- **The builder's rows:** one tree per agent: `tree_node(level, prefix)`,
+  `tree_leaf(row key)`, one `tree_root()` (`02 02`, one `RootRow`) and one
+  `built()` (`02 03`) watermark; `tree_roots`/`tree_root_entry` gone.
+- **`records::leaf_value(key, stored)`**: the bytes a leaf commits, the bare
+  value for a `0x03` key (format byte and version stripped), the stored bytes
+  otherwise.
+- **`vos_tree::node_at(store, prefix)`**: the node at a byte prefix (the
+  subtree over exactly the keys under it), walking branches below the
+  prefix's bit length and checking the shared bits; `None` when no key starts
+  with it.
+- **`node/host/src/roots`:** `AgentStore` (was `MapStore`, no map) over the
+  agent's tree, from its top or any node; `Build` reads every dirty row into
+  one sorted key set a batch, one `vos_tree::update` a batch, one `RootRow`;
+  `finish` completes the tree this build touched or one a cut-short build
+  left part-way. Leaves: `Leaf::salted(seed of the writing version, full row
+  key, bare value)`. `agent_root(snapshot, agent) → (root, version)`
+  (`Building` while a build is part-way); `root(snapshot, agent, map)` = the
+  node at `committed_rows(map)`; `prove` opens full row keys under the map's
+  node (`Proven.leaves` keys are full rows now); `rows_match_tree(snapshot,
+  agent)`.
+  - **Mid-build semantics (for Fable):** a map none of whose writes waits is
+    read from the tree's top as it stands (its keys a build took were rebuilt
+    from their values at that build's version, which nothing later changed);
+    a map with a waiting write, and the agent's root, are `Building` until
+    the build ends. Before, a map whose own tree was part-way was `Building`
+    even with no write waiting; now one whose writes a cut-short build fully
+    consumed answers at the agent's version.
+- **JAM:** `node/jam/src/store.rs` `stage` and `agent/default/src/refine/jam.rs`
+  (the witness's claims, scanned range rows, the writes' root-after) hash
+  `leaf_value(key, stored)`: `0x03` leaves the bare value with VOS's salt
+  (`salt(seed, full key)`), the witness still carrying stored bytes for
+  apply; a `0x03` row that is no value row traps (refine) or is `Corrupt`
+  (builder). The salt of a deleted row is no longer computed. `Store::write`
+  (`#[doc(hidden)]`) stages and commits rows for tests.
+- **The window kernel** (`agent/test-actors/window`): its rows are the
+  committed rows of `ACCOUNTS` (instance 0, tag 1, hashed), keys built by
+  `keys::row`, so its multiproofs are against the agent's tree (map root =
+  agent root for an agent holding that map alone). The test's fixture tree
+  is over the same full keys; `inversion` searches the whole key for its
+  flipped bit (the shared prefix pushes the first difference past bit 80).
+- **Docs:** `core-model.md` §9.3 (one tree per agent, a map's root its node,
+  `Building`, the `0x03` bullet in the present tense).
+
+**Tests:**
+- **VOS ≡ JAM** (`roots::tests::roots_are_nodes_of_jams_tree`, vos-jam a
+  dev-dependency of vos-node): 10 cases, random committed writes over 4 maps
+  (two instances, both transforms) across 1–4 versions, built in batches of
+  1, 7 or 10,000, with table, struct and `0x04` rows beside them on JAM: the
+  agent root = JAM's node at `0x03`, every map root = JAM's node at its
+  prefix, both = the root from scratch; one row (a leaf at `0x03`); none
+  (empty root, absent node).
+- `vos-tree`: `the_node_at_a_prefix_is_the_tree_over_its_keys` (proptest
+  256: keys under fixed-width prefixes, every prefix length 0–3 and random
+  probes; none, one, many).
+- ownership: `instance_keys_never_meet_system_keys_or_other_instances` now
+  with committed rows and prefixes (owned only by their instance) and
+  dirty, seed, tree and `[0x03]` keys (owned by none); the key layout pinned
+  byte for byte; every row key prefix-free with the new tree rows.
+- builder: the four unit tests on one tree (agent root checked beside each
+  map's; a cut-short build: `Building` for the waiting map and the agent,
+  the consumed map answering at the agent's version); `tree_crash` (12
+  rounds killed and torn mid-build, resumed to the agent root and each map
+  root from scratch, rows on the tree); the cluster's roots tests (full-key
+  leaves, agent root).
+- `vos-jam`: `a_long_ordered_keys_leaf_counts_two_compressions`: a committed
+  row at a 64-byte ordered key of zeros (escaped to 130 B, row 140 B, leaf
+  preimage 187 B) hashes in 2 compressions, as `gas::leaf` counts; 64 bytes
+  of ones and a 32-byte hashed key, 1.
+- the comparison suite (testkit `jam::agreement`, `driven`) unchanged and
+  green; replica comparisons (`cluster/common.rs`, `fault_suite.rs`) and
+  the crash tests read `0x03` too.
+
+**Gates:**
+- **`just check` green** (second run, after the testkit's native witness
+  check `shows()` learnt the bare-value leaf: the first run failed there,
+  `packages_agree_with_vos_on_scans_and_committed_maps`, the refine itself
+  agreeing): 89 test binaries, 1,171 tests [measured]. Logs
+  `6.11-check.log` (the failure), `6.11-check2.log`.
+- **The checker loop, short:** `EXACTLY_ONCE_SEED` 611, 612, 613 × the three
+  exactly-once tests (`vos-node --test served exactly_once`): 9 of 9 green,
+  271 s [measured] (`6.11-checker.log`). Also `fault_suite` (five
+  processes, replica rows compared with `0x03`): green, 160 s.
+- **Fixtures:** none move (the segment kernel is hand-assembled and the
+  statements' roots synthetic): `the_fixtures_are_the_generators` and
+  `the_fixtures_are_judged` green, no regeneration.
+- **The window kernel** (its attest's trace, same machine, before at
+  `85c1853b` / after) [measured]: steps 632,800 → 643,587 (+1.70%),
+  compressions 651 → 651 (+0%), witness input 25,989 → 26,309 B (+320: 10 B
+  a key, 16 keys, 2 proofs), kernel 69,101 → 69,391 B. Within 5%. The
+  proving tests (`proves`, `folds`, `wraps`) not run (test-proof, milestone).
+- **The builder** (`cargo bench -p vos-node --bench tree -- 1000000 20000
+  30`, binaries of both commits, the same machine; it was shared with other
+  agents' builds, load 2–20, so pairs were run together or back to back)
+  [measured]:
+
+  | run | rows/s built, before → after | from scratch µs/key | most behind |
+  |---|---|---|---|
+  | quiet pair (load 2–3) | 19,890 → 19,357 (−2.7%) | 26.70 → 28.41 | 28 → 48 |
+  | concurrent pair 1 | 15,831 → 15,408 | 73.63 → 74.74 | 115 → 140 |
+  | concurrent pair 2 | 12,966 → 14,650 | 58.38 → 62.00 | 186 → 150 |
+  | concurrent pair 3 | 17,639 → 16,282 | 48.78 → 55.69 | 58 → 106 |
+
+  Rows built a second within 10% (−2.7% quiet, −0.2% over the concurrent
+  pairs' mean); at 20k offered (19.6k delivered by the applier in the after
+  run) the builder keeps up as before (19.4k vs 19.9k built, 8.0k vs 3.0k
+  rows left at the end, caught up in 0.30 s vs 0.15 s). A build from scratch
+  is about 6% slower in every pair [est, not profiled]: node and leaf row
+  keys grow 1 byte only, but node row values grow about 20 B (each `Child`
+  names a branch prefix or leaf key at least 10 bytes longer, levels
+  starting past bit 80), and the salt and leaf hashes run over keys 10
+  bytes longer. Sequential runs under load 10–20 (pairs 1–3 of the first
+  attempt, 9–13k rows/s both ways) were discarded as noise.
+
+**For Fable:**
+- the mid-build rule in `map_top` (a map with no waiting write answers from
+  the partial top; a waiting map and the agent root are `Building`), and the
+  test that now asserts it (`a_map_left_part_way_is_finished_without_a_write`);
+- `waits` still caps its scan at `BATCH` dirty rows (past it, "waits");
+- dirty rows carry the whole committed row (`0x03 ‖ …`), so a dirty row
+  names no map without parsing the row;
+- JAM's leaf rule keyed on the first byte only (`leaf_value`), both in the
+  refine (claims, ranges, root-after) and the builder's store; a `0x03`
+  row that is no value row traps;
+- the window kernel's rows bound to a constant map (`ACCOUNTS`: instance 0,
+  tag 1, hashed) rather than an argument;
+- no migration of stores written before (the keyspace changed; there is
+  no deployed state).
+
+**Commit:** `802ccc36` (one commit, 33 files, +871 −405).
+
+**Reviews:** Fable ACCEPT (`6.11-fable.md`: `node_at` correct, the
+equality test strong enough, finding 10's list complete, the mid-build rule
+sound; one minor finding, three nits); Opus ACCEPT (naming, a named
+committed prefix, the from-scratch cause corrected above).
+
+**The fold** (`2d0db7fc`, 10 files, +89 −37):
+- Fable 1: `is_committed` decides from the first byte alone, so a `0x03`
+  key too short to name a map and a key is still read as a value row and
+  fails (`leaf_value` None: JAM `Corrupt`, refine trap, builder `Corrupt`)
+  instead of being hashed as a plain row on JAM alone; `committed_entry`
+  keeps its length checks. Round-trip asserts: `is_committed(&[0x03])` and
+  of a bare map prefix true, `committed_entry` of both None,
+  `leaf_value(&[0x03, 1], &stored(&[1]))` None. Pin E and core-model §9.3:
+  every key under `0x03` is a committed value row; anything else stored
+  there is corrupt, and both hosts fail on it.
+- Fable 2: `roots_are_nodes_of_jams_tree` gives the no-committed-row case
+  JAM's sibling rows too (`siblings`), and draws a 64-byte zero `Ordered`
+  key and the pair `[1]`/`[1, 0]` among the random keys (3 in 16).
+- Fable 3: the window actor's `ACCOUNTS` doc: it stands in for the map an
+  attestable `&self` view names (6.13).
+- Fable 4: the plan's 6.22 gains a store layout version that `Fjall::open`
+  refuses on mismatch; 6.11's builder gate reads "keeps up at 20k committed
+  writes a second offered (19.6k delivered), no regression past 10%".
+- Opus: the refine's `committed(key, stored)` renamed `leaf_bytes` (the
+  local back to `committed`); `keys::instance_rows` and
+  `keys::instance_committed`, `instance_prefixes` their pair, the
+  `[0]`/`[1]` callers named.
+- `just check` green after the fold: 1,171 tests (`6.11-check3.log`).
+
+Commits: `802ccc36` (the step), `2d0db7fc` (the fold).
+
+**Merged** into `vos-core` as `65052f1c`, with one conflict in the plan's
+6.22: its items 21 (6.9's leftovers) and 22 (the store layout version)
+both kept. `just check` after the merge: green, 1,192 passed.
+
+**6.11 accepted.**
