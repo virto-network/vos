@@ -6,6 +6,11 @@ license = "Apache-2.0"
 description = "A proved statement as a venue judges it: its types, its canonical encoding, its io-hash and id, and the venue's check of a final proof against it. no_std, with no dependency on VOS beyond the final verifier."
 
 [features]
+# Format 28, the unmasked wrap, linked beside 39 (the final verifier's
+# `test-formats`): the tests' and the fixtures' format, for the test builds
+# of the venues' harnesses. No production build enables it (`just
+# check-no-test-formats`), and neither `fixtures` nor `pvm-guest` implies it.
+test-formats = ["vos-pvm-final-verifier/test-formats"]
 # The golden fixtures' reader (`fixtures`), for the venues' harnesses: std.
 fixtures = ["vos-anchor/vectors"]
 # The venue as a JAM refine program (`src/bin/final-verify.rs`), for the
@@ -18,18 +23,28 @@ required-features = ["pvm-guest"]
 test = false
 bench = false
 
+# The same program linking format 28 beside 39, for the test policy's
+# fixtures (`final-verify-test.elf`).
+[[bin]]
+name = "final-verify-test"
+required-features = ["pvm-guest", "test-formats"]
+test = false
+bench = false
+
 # The golden fixtures judged natively and on the JAM-only host.
 [[test]]
 name = "fixtures"
 required-features = ["fixtures"]
 
 [dependencies]
-# Format 28, the final proofs `judge` reads.
-vos-pvm-final-verifier = { workspace = true, features = ["test-formats"] }
+# The final proofs `judge` reads: format 39, and 28 under `test-formats`.
+vos-pvm-final-verifier = { workspace = true }
 # A space's id, its roots and their encodings, re-exported.
 vos-anchor = { workspace = true }
 
 [dev-dependencies]
+# The tests judge format 28's fixtures beside 39's.
+vos-pvm-final-verifier = { workspace = true, features = ["test-formats"] }
 # The io-hash a kernel computes, which a statement's must equal.
 vos-pvm-precompiles = { workspace = true }
 # The JAM-only host the guest runs on, and its linker.

@@ -464,18 +464,26 @@ pub struct Statement {
   A venue keys on the statement id, never on the proof's bytes or their
   hash: postcard's varints need not be minimal, so one proof has many
   encodings, and many proofs state one statement.
-- **The venue's check, built** (slice 5's 5.15, `vos_statement::judge`),
-  in order: the format (accepted, and 28, the one the final verifier
-  reads); the statement's program against the venue's pin; the space,
-  every root's the statement's and a rootless statement's none; every root
-  anchored; the io-hash
-  recomputed from the fields and the id from it; a repeat; then the final
-  proof (at most 256 KiB, one postcard encoding and nothing after it)
-  against the pinned program id and the recomputed io-hash. **The program
-  id is the venue's argument, never the caller's:** a venue that verified
-  against the statement's or the proof's id would accept any kernel's
-  proof. Each refusal has a class every venue reports alike
+- **The venue's check, built** (slice 5's 5.15, `vos_statement::judge`;
+  slice 6's 6.5, pin F), in order: the format (one the venue accepts and
+  the build links: 39, and 28 only under `test-formats`, which no
+  production build enables); the statement's program against the venue's
+  pin; the venue, when the pin says the program is venue-bound: the first
+  32 bytes of `public_args` the venue's id (`Refusal::Venue`, `0x7`); the
+  space, every root's the statement's and a rootless statement's none; every
+  root anchored, within the space's range at the venue (from its
+  registration to its migration away) and not past `MaxRootAge`; the
+  io-hash recomputed from the fields and the id from it; a repeat; then the
+  final proof (at most 256 KiB, the format's own decode and nothing after
+  it) against the pinned program id and the recomputed io-hash. **The
+  program id is the venue's argument, never the caller's:** a venue that
+  verified against the statement's or the proof's id would accept any
+  kernel's proof. Each refusal has a class every venue reports alike
   (`Refusal::code`, the final verifier's `Error::code` under it).
+- **`Seen` and time** (`vos_statement::seen_expiry`): a rooted statement's
+  entry may be dropped once its newest root is past `MaxRootAge`
+  (`B_w + MaxRootAge`), since a replay then fails `0x5`; a rootless
+  statement's never expires, since it has no anchor to fail.
 - **Low-entropy fields:** anything in `output` or `public_args` derived
   from private data is a nullifier or a salted commitment, never a plain
   hash of a guessable value.
@@ -1162,6 +1170,42 @@ the same bytes in every build of the prover: a kernel's program id does not
 depend on the features a build turns on (the drawn relations are kept in
 the order drawn, never in `TypeId` order). `just judge-wasm` (in
 `test-proof`) judges the fixtures in Wasm.
+
+**At format 39** (slice 6's 6.5) [measured]: the generator wraps `S`'s
+run under format 39, masked from the seeded test seam (`MaskRng::Seeded`,
+so the bytes are its own every run: `wrap.proof`, 145,796 bytes), and under
+28 (`wrap-28.proof`, 123,797 bytes); the two cheating wraps under 39; and a
+second kernel's rootless statement `S0`, one segment wrapped under 39
+(`wrap-rootless.proof`). `S` is a venue-bound program's: its `public_args`
+are the venue's id and a nonce. The production venue accepts {39}, the
+test venue {28, 39}; each registers `S`'s space from window 40 and judges
+at window 42's boundary. 29 cases (`statements.cases`, 18 KB), each but the
+three accepted a replay of an accepted statement with one thing changed;
+every verdict the same natively (both formats linked), in Wasm (the
+production blob, 39 alone, and the test blob; PVF and client) and on the
+JAM-only host (`final-verify.elf`, 39 alone, and `final-verify-test.elf`).
+A build linking 39 alone refuses a statement of 28 as `0x2`, its first
+check:
+
+| case | verdict | JAM-only host, production |
+|---|---|---|
+| valid; rootless (`S0`) | accepted | 109.7M; 109.8M gas |
+| format 28 at the test venue | accepted (`0x2` where 28 is not linked) | test guest 96.5M |
+| tampered; tampered, format 28 at the test venue | `0x112` | 70.0M; test guest 67.2M |
+| wrong program; wrong io-hash; the nonce | `0x108` | 14.0M |
+| prefix; mid-way | `0x109` | 14.2M |
+| unaccepted format (30); format 28 at a production venue | `0x2` | 0.1M |
+| another program than the pin | `0x3` | 0.1M |
+| another space; the space; rootless, another space; rooted, of no space | `0x4` | 0.1M |
+| unanchored root; a root's window; a root; migrated before a root's window; registered after a root's window; rooted, replayed past MaxRootAge | `0x5` | 0.1M |
+| repeated; rootless, replayed past MaxRootAge; accepted under 39, replayed under 28; accepted under 28, replayed under 39 | `0x6` | 0.1M |
+| another venue's statement; replayed at another venue | `0x7` | 0.1M |
+
+The transition holds both ways: `S` accepted under one format is the same
+statement under the other, refused as a repeat. Past `MaxRootAge` a rooted
+replay is unanchored (its `Seen` entry and anchors dropped) and a rootless
+one is repeated (its entry kept). The production guest's program is 523,362
+bytes (the test guest's 610,809), within 512 KiB and JAM's 4,000,000.
 
 **A.7 Budgets per node (M1: measured, then pinned).** Heavy tests run
 under `systemd-run` with these caps as `MemoryMax`.

@@ -791,7 +791,7 @@ fn the_window_wraps() {
     totals.report("the window");
     let input = common::judged_statement(
         vos_statement::Statement {
-            format: vos_statement::FORMAT,
+            format: vos_pvm_final_verifier::unmasked::FORMAT,
             program: vos_statement::ProgramId(program.id().0.map(|word| word.0)),
             // Rootless: of no space. The window's space and anchors are
             // in its output, for the handler to check.

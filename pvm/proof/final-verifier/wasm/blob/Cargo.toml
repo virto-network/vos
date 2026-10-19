@@ -6,7 +6,10 @@
 # imported, and every allocation through sp-io's host allocator ABI
 # (`ext_allocator_{malloc,free}_version_1`), as `RuntimeAllocator` does.
 # Its own workspace: stwo resolves verify-only. Build with
-# `cargo build --release` here; `../run` measures it.
+# `cargo build --release` here, the production blob, linking format 39
+# alone; with `--features test-formats` (into another target directory), the
+# test blob, linking format 28 beside it for the test policy's fixtures.
+# `../run` measures them.
 [package]
 name = "vos-pvm-final-verifier-wasm"
 version = "0.1.0"
@@ -16,6 +19,11 @@ publish = false
 
 [lib]
 crate-type = ["cdylib"]
+
+[features]
+# Format 28 beside 39: the test blob's (`just judge-wasm`). The production
+# blob never enables it (`just check-no-test-formats`).
+test-formats = ["vos-statement/test-formats"]
 
 [dependencies]
 vos-pvm-final-verifier = { path = "../.." }

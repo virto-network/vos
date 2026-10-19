@@ -248,21 +248,33 @@ fn the_fixtures_are_judged() {
 
 /// The golden statements (`proving.md` A.6), which every venue judges
 /// alike: natively, in Wasm and on the JAM-only host (`vos-statement`'s
-/// fixtures test, the Wasm harness's `judge`).
+/// fixtures test, the Wasm harness's `judge`), each build by the formats it
+/// links (`vos_statement::fixtures::Fixture::verdict_linking`).
 ///
 /// The kernel states a fixed statement `S`: it sets φ9..12 to `S`'s
-/// io-hash, an output of its own, two roots of its space read, then halts.
-/// Its run, cut in three segments, is proved at its class, its leaves folded
-/// to a root and the root wrapped: `wrap.proof`. Two roots that are not a
-/// whole run, wrapped as a cheating prover would (the wrap circuit's checks
-/// failing, proved anyway): `wrap-prefix.proof`, the first two segments,
-/// which set the io-hash but never halt; `wrap-midway.proof`, the last two,
-/// labelled from position 0, which never start at the entry.
+/// io-hash, an output of its own, two roots of its space read and its
+/// `public_args` the venue's id and a nonce, as a venue-bound program's,
+/// then halts. Its run, cut in three segments, is proved at its class, its
+/// leaves folded to a root and the root wrapped under format 39, masked
+/// from the seeded test seam (`MaskRng::Seeded`, so the bytes are the
+/// generator's every run): `wrap.proof`; and under format 28:
+/// `wrap-28.proof`. Two roots that are not a whole run, wrapped under 39 as
+/// a cheating prover would (the wrap circuit's checks failing, proved
+/// anyway): `wrap-prefix.proof`, the first two segments, which set the
+/// io-hash but never halt; `wrap-midway.proof`, the last two, labelled from
+/// position 0, which never start at the entry. A second kernel states a
+/// rootless statement `S0`, of no space, in one segment, its leaf wrapped
+/// under 39: `wrap-rootless.proof`.
 ///
-/// The venue pins the kernel's program id, accepts format 28, anchors `S`'s
-/// two roots and has accepted one other statement. The cases
-/// (`statements.cases`), each a venue's state, a statement and a proof:
-/// - **valid:** `S` and its wrap, accepted;
+/// The production venue pins the kernel's program id, venue-bound, accepts
+/// format 39, registers `S`'s space from window 40, anchors `S`'s two roots
+/// (windows 41 and 42), judges at window 42's boundary and has accepted one
+/// other statement. The test venue is the same and accepts 28 beside 39.
+/// The cases (`statements.cases`), each a venue's state, a statement and a
+/// proof, each but the valid ones a replay of a valid statement with one
+/// thing changed:
+/// - **valid:** `S` and its wrap, accepted; **rootless:** `S0` and its
+///   wrap, accepted (its own program pinned);
 /// - **tampered:** a byte of the wrap flipped;
 /// - **wrong program:** the venue pins another program, which the statement
 ///   names, and the wrap is this kernel's;
@@ -271,24 +283,39 @@ fn the_fixtures_are_judged() {
 /// - **prefix**, **mid-way:** `S` with the wraps of a part of the run;
 /// - **repeated:** `S` after the venue accepted it;
 /// - **unaccepted format:** `S` under format 30;
+/// - **format 28 at a production venue:** `S` under 28, with its wrap;
 /// - **wrong io-hash:** `S` with its output changed;
 /// - **another program than the pin:** the statement names another program
 ///   than the one the venue pinned;
 /// - **another space:** a root of another space than `S`'s;
+/// - **the space:** `S` claiming another space than its roots';
 /// - **rootless, another space:** `S` without its roots, its space still
 ///   claimed: a rootless statement belongs to no space, since nothing
-///   binds it there and each space would give one proof another id.
-/// - **the same run, another accepted format:** `S` at a venue in a
-///   transition, accepting format 28 and a successor, which accepted `S`'s
-///   run under the successor: the same statement, refused as a repeat,
-///   since the id does not hash the format. The successor is 38, a number
-///   no format holds; this verifier reads 28 alone, so the case records the
-///   successor's acceptance as the id the venue keeps, which is all its
-///   repeat check reads.
+///   binds it there and each space would give one proof another id;
+/// - **rooted, of no space:** `S` claiming `SpaceId::NONE`, its roots of
+///   none too and anchored: no space has the id `NONE`;
+/// - **another venue's statement:** `S` with `public_args` naming another
+///   venue; **replayed at another venue:** `S` at a venue of another id;
+/// - **a root's window**, **a root:** `S` with its second root's window, or
+///   a byte of it, changed;
+/// - **the nonce:** `S` with its nonce changed, which the proof's words
+///   bind;
+/// - **migrated before a root's window:** the venue's range for `S`'s
+///   space ends at window 42; **registered after a root's window:** it
+///   starts at 42;
+/// - **rooted, replayed past MaxRootAge:** `S` accepted, then the venue's
+///   time past its newest root's `MaxRootAge`: its `Seen` entry and its
+///   anchors dropped, it is unanchored;
+/// - **rootless, replayed past MaxRootAge:** `S0` accepted, then the same
+///   time passed: its `Seen` entry kept, it is repeated;
+/// - **the test policy:** `S` under 28 at the test venue, accepted; its
+///   wrap's byte flipped; and the transition both ways, `S` accepted under
+///   39 and replayed under 28, and accepted under 28 and replayed under 39,
+///   each repeated, since the id does not hash the format.
 mod statements {
     use stwo::core::fields::qm31::SecureField;
     use vos_pvm::instruction::Opcode;
-    use vos_pvm_final_verifier::WrapProof;
+    use vos_pvm_final_verifier::{WrapProof, masked, unmasked};
     use vos_pvm_proof::format::SEGMENT;
     use vos_pvm_proof::kernel::trace_kernel;
     use vos_pvm_proof::program_id::{KernelEntry, KernelProgram};
@@ -296,21 +323,35 @@ mod statements {
     use vos_pvm_proof::segment::SegmentCursor;
     use vos_pvm_recair::Context;
     use vos_pvm_recair::fold::FoldCircuit;
+    use vos_pvm_recair::masked::MaskRng;
     use vos_pvm_recair::wrap::{self, WrapCircuit};
     use vos_statement::fixtures::{CASES, Case, Patch};
-    use vos_statement::model::{Input, Policy};
-    use vos_statement::{FORMAT, ProgramId, RootKind, RootRead, SpaceId, Statement, StatementId};
+    use vos_statement::model::{Input, Policy, Space};
+    use vos_statement::{
+        MAX_ROOT_AGE_MS, Pin, ProgramId, RootKind, RootRead, SpaceId, Statement, StatementId,
+        VenueId, WindowClock,
+    };
 
     use super::common::{self, NodeRun};
-    use super::{load, record};
+    use super::record;
 
     const SPACE: SpaceId = SpaceId([0xA1; 32]);
-    /// A final format a venue in a transition accepts beside 28: a number
-    /// no format holds.
-    const SUCCESSOR: u32 = 38;
+    const OTHER_SPACE: SpaceId = SpaceId([0xB2; 32]);
+    /// The masks' seed: the masked wraps are the generator's byte for byte.
+    const SEED: u64 = 0x6_05;
     /// The run's cuts: the io-hash set in the first two, the halt in the
     /// last.
     const CUTS: [(usize, usize); 3] = [(0, 2), (2, 5), (5, 6)];
+    /// The space's clock: windows of 10 minutes from the Unix epoch.
+    const CLOCK: WindowClock = WindowClock::DEFAULT;
+    /// The venues' time: window 42's boundary, so windows 41 and 42 are
+    /// closed and anchored.
+    const NOW: u64 = 43 * 600_000;
+
+    /// The venue: a JAM service's.
+    fn venue() -> VenueId {
+        VenueId::jam(&[0x4A; 32], 7)
+    }
 
     fn root(window: u64, byte: u8) -> RootRead {
         RootRead {
@@ -321,22 +362,35 @@ mod statements {
         }
     }
 
-    /// `S`, its program left to fill.
+    /// `S`, its program left to fill: venue-bound, its `public_args` the
+    /// venue's id and a nonce.
     fn statement() -> Statement {
         Statement {
-            format: FORMAT,
+            format: masked::FORMAT,
             program: ProgramId([0; 8]),
             space: SPACE,
-            public_args: b"nonce 7".to_vec(),
+            public_args: [&venue().0[..], b"nonce 7"].concat(),
             output: b"the statement's output".to_vec(),
             roots: vec![root(41, 0x41), root(42, 0x42)],
+        }
+    }
+
+    /// `S0`, its program left to fill: rootless, of no space.
+    fn rootless() -> Statement {
+        Statement {
+            format: masked::FORMAT,
+            program: ProgramId([0; 8]),
+            space: SpaceId::NONE,
+            public_args: [&venue().0[..], b"nonce 8"].concat(),
+            output: b"the rootless statement's output".to_vec(),
+            roots: Vec::new(),
         }
     }
 
     /// The kernel stating `io_hash`: φ8, the output's length, 0; φ9..12 the
     /// io-hash's bytes, eight a register, little-endian; then the halt.
     fn kernel(io_hash: &[u8; 32]) -> Vec<u8> {
-        let mut instructions = vec![load(8, 0)];
+        let mut instructions = vec![super::load(8, 0)];
         for (register, bytes) in (9..).zip(io_hash.chunks_exact(8)) {
             let mut instruction = vec![Opcode::LoadImm64 as u8, register];
             instruction.extend_from_slice(bytes);
@@ -346,9 +400,41 @@ mod statements {
         common::standard_program(&instructions)
     }
 
-    /// The wrap of `root`, proved: as the circuit requires it, or, with
+    /// A kernel stating `statement`: its program, its entry and its run's
+    /// segments, cut at `cuts`.
+    fn proved(
+        statement: &Statement,
+        cuts: &[(usize, usize)],
+    ) -> (KernelProgram, KernelEntry, Vec<vos_pvm_proof::Proof>) {
+        let blob = kernel(&statement.io_hash());
+        let (program, entry) = vos_pvm_recair::leaf::kernel_program(
+            &blob,
+            &record(&blob),
+            vos_pvm_compiler::TRANSPILER_VERSION,
+            &SEGMENT,
+        )
+        .expect("the kernel's program");
+        let trace = trace_kernel(&blob, &[], 1_000).expect("halts");
+        assert_eq!(trace.side_note.steps.len(), cuts[cuts.len() - 1].1);
+        assert_eq!(trace.io_hash, statement.io_hash());
+        let shape = program.shape.segment(0).expect("class 0");
+        let mut cursor = SegmentCursor::new(&trace.side_note);
+        let segments = cuts
+            .iter()
+            .map(|&(a, b)| {
+                prove_shaped(&mut cursor.side_note(a, b), &shape, &SEGMENT).expect("proves")
+            })
+            .collect();
+        (program, entry, segments)
+    }
+
+    /// The finalized wrap of `root`: as the circuit requires it, or, with
     /// `lenient`, over a root its checks refuse, as a cheating prover would.
-    fn wrap_of(root: &NodeRun, program: &KernelProgram, lenient: bool) -> WrapProof {
+    fn finalized(
+        root: &NodeRun,
+        program: &KernelProgram,
+        lenient: bool,
+    ) -> vos_pvm_recair::Finalized<SecureField> {
         let circuit = WrapCircuit::get();
         let (values, _) = circuit
             .values(root.node.proved(), &program.id_preimage())
@@ -361,32 +447,34 @@ mod statements {
         context.set_output_lanes(&lanes);
         let pieces: Vec<&str> = context.mismatches().iter().map(|m| m.piece).collect();
         assert_eq!(!pieces.is_empty(), lenient, "{pieces:?}");
-        let finalized = context.finalize().expect("the wrap's wiring checks");
-        wrap::prove_unmasked(&finalized).expect("the wrap proves")
+        context.finalize().expect("the wrap's wiring checks")
+    }
+
+    /// The wrap of `root` under format 39, masked from the seeded seam: its
+    /// fixed layout.
+    fn masked_wrap(root: &NodeRun, program: &KernelProgram, lenient: bool) -> Vec<u8> {
+        let (proof, _) = wrap::prove_masked(
+            &finalized(root, program, lenient),
+            MaskRng::Seeded(SEED),
+            |_| {},
+        )
+        .expect("the wrap proves");
+        assert_eq!(proof.format_version, masked::FORMAT);
+        wrap::proof_bytes(&proof).expect("the fixed layout holds it")
+    }
+
+    /// The wrap of `root` under format 28: postcard.
+    fn unmasked_wrap(root: &NodeRun, program: &KernelProgram) -> Vec<u8> {
+        let proof: WrapProof =
+            wrap::prove_unmasked(&finalized(root, program, false)).expect("the wrap proves");
+        assert_eq!(proof.format_version, unmasked::FORMAT);
+        postcard::to_allocvec(&proof).expect("encodes")
     }
 
     /// The fixtures, by file name.
     pub fn generate() -> Vec<(String, Vec<u8>)> {
         let base = statement();
-        let blob = kernel(&base.io_hash());
-        let (program, entry): (KernelProgram, KernelEntry) = vos_pvm_recair::leaf::kernel_program(
-            &blob,
-            &record(&blob),
-            vos_pvm_compiler::TRANSPILER_VERSION,
-            &SEGMENT,
-        )
-        .expect("the kernel's program");
-        let trace = trace_kernel(&blob, &[], 1_000).expect("halts");
-        assert_eq!(trace.side_note.steps.len(), CUTS[2].1);
-        assert_eq!(trace.io_hash, base.io_hash());
-        let shape = program.shape.segment(0).expect("class 0");
-        let mut cursor = SegmentCursor::new(&trace.side_note);
-        let segments: Vec<_> = CUTS
-            .iter()
-            .map(|&(a, b)| {
-                prove_shaped(&mut cursor.side_note(a, b), &shape, &SEGMENT).expect("proves")
-            })
-            .collect();
+        let (program, entry, segments) = proved(&base, &CUTS);
         let word = FoldCircuit::word();
         let fold = FoldCircuit::new();
         let leaf = |segment: usize, position: u32| {
@@ -409,10 +497,17 @@ mod statements {
         let tail = fold_of(&leaf(1, 0), &leaf(2, 1));
         assert!(!tail.node.output.entry && tail.node.output.halt && tail.node.output.first == 0);
 
-        let encode = |proof: &WrapProof| postcard::to_allocvec(proof).expect("encodes");
-        let valid = encode(&wrap_of(&whole, &program, false));
-        let prefix = encode(&wrap_of(&head, &program, true));
-        let midway = encode(&wrap_of(&tail, &program, true));
+        let valid = masked_wrap(&whole, &program, false);
+        let prefix = masked_wrap(&head, &program, true);
+        let midway = masked_wrap(&tail, &program, true);
+        let valid_28 = unmasked_wrap(&whole, &program);
+
+        let lone = rootless();
+        let (lone_program, lone_entry, lone_segments) = proved(&lone, &[(0, 6)]);
+        let lone_leaf =
+            common::prove_leaf(&lone_program, &lone_entry, 0, &lone_segments[0], 0, word);
+        assert!(lone_leaf.node.output.entry && lone_leaf.node.output.halt);
+        let valid_rootless = masked_wrap(&lone_leaf, &lone_program, false);
 
         let pinned = ProgramId(program.id().0.map(|word| word.0));
         let other = ProgramId(pinned.0.map(|word| (word + 1) % ((1 << 31) - 1)));
@@ -420,24 +515,70 @@ mod statements {
             program: pinned,
             ..base
         };
-        let policy = Policy {
-            formats: vec![FORMAT],
-            anchors: s.roots.clone(),
-            seen: vec![StatementId(vos_statement::blake2b_256(&[
-                b"an earlier statement",
-            ]))],
+        let s0 = Statement {
+            program: ProgramId(lone_program.id().0.map(|word| word.0)),
+            ..lone
+        };
+        let production = {
+            let mut policy = Policy::new(venue(), NOW, &[masked::FORMAT]);
+            policy.spaces.push(Space {
+                id: SPACE,
+                clock: CLOCK,
+                range: (40, None),
+            });
+            policy.anchors = s.roots.clone();
+            policy.seen.push((
+                StatementId(vos_statement::blake2b_256(&[b"an earlier statement"])),
+                u64::MAX,
+            ));
+            policy
+        };
+        let test = Policy {
+            formats: vec![unmasked::FORMAT, masked::FORMAT],
+            ..production.clone()
         };
         let input = |change: &dyn Fn(&mut Input)| {
             let mut input = Input {
-                program: pinned,
-                policy: policy.clone(),
+                pin: Pin {
+                    program: pinned,
+                    venue_bound: true,
+                },
+                policy: production.clone(),
                 statement: s.clone(),
             };
             change(&mut input);
             input
         };
-        let mut flipped = valid.clone();
-        flipped[valid.len() / 2] ^= 1;
+        let rootless_input = |change: &dyn Fn(&mut Input)| {
+            input(&|i| {
+                i.pin.program = s0.program;
+                i.statement = s0.clone();
+                change(i);
+            })
+        };
+        // The venue's time past the newest root's `MaxRootAge`.
+        let past = CLOCK.boundary(42).unwrap() + MAX_ROOT_AGE_MS + 1;
+        let under_28 = |i: &mut Input| i.statement.format = unmasked::FORMAT;
+        // `S` accepted under `format`'s wrap at the test venue, then recorded.
+        let accepted_under = |format: u32, proof: &[u8]| {
+            let accepted = input(&|i| {
+                i.policy = test.clone();
+                i.statement.format = format;
+            });
+            let id = accepted.judge(proof).expect("S accepted");
+            assert_eq!(id, s.id(), "S under {format}");
+            let mut policy = accepted.policy;
+            policy.record(&accepted.statement);
+            policy
+        };
+        let after_39 = accepted_under(masked::FORMAT, &valid);
+        let after_28 = accepted_under(unmasked::FORMAT, &valid_28);
+
+        let flip = |bytes: &Vec<u8>| {
+            let mut flipped = bytes.clone();
+            flipped[bytes.len() / 2] ^= 1;
+            Patch::between(bytes, &flipped)
+        };
         type Class = fn(u32) -> bool;
         let accepted: Class = |code| code == 0;
         let by_proof: Class = |code| code >> 8 == 1;
@@ -445,9 +586,16 @@ mod statements {
         let cases: Vec<(&str, &str, Option<Patch>, Input, Class)> = vec![
             ("valid", "wrap.proof", None, input(&|_| {}), accepted),
             (
+                "rootless",
+                "wrap-rootless.proof",
+                None,
+                rootless_input(&|_| {}),
+                accepted,
+            ),
+            (
                 "tampered",
                 "wrap.proof",
-                Some(Patch::between(&valid, &flipped)),
+                Some(flip(&valid)),
                 input(&|_| {}),
                 by_proof,
             ),
@@ -456,7 +604,7 @@ mod statements {
                 "wrap.proof",
                 None,
                 input(&|i| {
-                    i.program = other;
+                    i.pin.program = other;
                     i.statement.program = other;
                 }),
                 by_words,
@@ -486,7 +634,7 @@ mod statements {
                 "repeated",
                 "wrap.proof",
                 None,
-                input(&|i| i.policy.seen.push(i.statement.id())),
+                input(&|i| i.policy.record(&i.statement.clone())),
                 |code| code == 6,
             ),
             (
@@ -494,6 +642,13 @@ mod statements {
                 "wrap.proof",
                 None,
                 input(&|i| i.statement.format = 30),
+                |code| code == 2,
+            ),
+            (
+                "format 28 at a production venue",
+                "wrap-28.proof",
+                None,
+                input(&under_28),
                 |code| code == 2,
             ),
             (
@@ -514,7 +669,14 @@ mod statements {
                 "another space",
                 "wrap.proof",
                 None,
-                input(&|i| i.statement.roots[1].space = SpaceId([0xB2; 32])),
+                input(&|i| i.statement.roots[1].space = OTHER_SPACE),
+                |code| code == 4,
+            ),
+            (
+                "the space",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.space = OTHER_SPACE),
                 |code| code == 4,
             ),
             (
@@ -525,24 +687,132 @@ mod statements {
                 |code| code == 4,
             ),
             (
-                "the same run, another accepted format",
+                "rooted, of no space",
                 "wrap.proof",
                 None,
                 input(&|i| {
-                    let successor = Statement {
-                        format: SUCCESSOR,
-                        ..i.statement.clone()
-                    };
-                    i.policy.formats.push(SUCCESSOR);
-                    i.policy.seen.push(successor.id());
+                    i.statement.space = SpaceId::NONE;
+                    for root in &mut i.statement.roots {
+                        root.space = SpaceId::NONE;
+                    }
+                    i.policy.spaces[0].id = SpaceId::NONE;
+                    i.policy.anchors = i.statement.roots.clone();
                 }),
+                |code| code == 4,
+            ),
+            (
+                "another venue's statement",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.public_args[31] ^= 1),
+                |code| code == 7,
+            ),
+            (
+                "replayed at another venue",
+                "wrap.proof",
+                None,
+                input(&|i| i.policy.venue = VenueId::jam(&[0x4A; 32], 8)),
+                |code| code == 7,
+            ),
+            (
+                "a root's window",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.roots[1].window = 43),
+                |code| code == 5,
+            ),
+            (
+                "a root",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.roots[1].root[31] ^= 1),
+                |code| code == 5,
+            ),
+            (
+                "the nonce",
+                "wrap.proof",
+                None,
+                input(&|i| *i.statement.public_args.last_mut().unwrap() ^= 1),
+                by_words,
+            ),
+            (
+                "migrated before a root's window",
+                "wrap.proof",
+                None,
+                input(&|i| i.policy.spaces[0].range = (40, Some(42))),
+                |code| code == 5,
+            ),
+            (
+                "registered after a root's window",
+                "wrap.proof",
+                None,
+                input(&|i| i.policy.spaces[0].range = (42, None)),
+                |code| code == 5,
+            ),
+            (
+                "rooted, replayed past MaxRootAge",
+                "wrap.proof",
+                None,
+                input(&|i| {
+                    i.policy.record(&i.statement.clone());
+                    i.policy.advance(past);
+                }),
+                |code| code == 5,
+            ),
+            (
+                "rootless, replayed past MaxRootAge",
+                "wrap-rootless.proof",
+                None,
+                rootless_input(&|i| {
+                    i.policy.record(&i.statement.clone());
+                    i.policy.advance(past);
+                }),
+                |code| code == 6,
+            ),
+            (
+                "format 28 at the test venue",
+                "wrap-28.proof",
+                None,
+                input(&|i| {
+                    i.policy = test.clone();
+                    under_28(i);
+                }),
+                accepted,
+            ),
+            (
+                "tampered, format 28 at the test venue",
+                "wrap-28.proof",
+                Some(flip(&valid_28)),
+                input(&|i| {
+                    i.policy = test.clone();
+                    under_28(i);
+                }),
+                by_proof,
+            ),
+            (
+                "accepted under 39, replayed under 28",
+                "wrap-28.proof",
+                None,
+                input(&|i| {
+                    i.policy = after_39.clone();
+                    under_28(i);
+                }),
+                |code| code == 6,
+            ),
+            (
+                "accepted under 28, replayed under 39",
+                "wrap.proof",
+                None,
+                input(&|i| i.policy = after_28.clone()),
                 |code| code == 6,
             ),
         ];
         let proofs = [
             ("wrap.proof", &valid),
+            ("wrap-rootless.proof", &valid_rootless),
             ("wrap-prefix.proof", &prefix),
             ("wrap-midway.proof", &midway),
+            ("wrap-28.proof", &valid_28),
         ];
         let cases: Vec<Case> = cases
             .into_iter()

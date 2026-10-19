@@ -17,7 +17,6 @@
 //! this target is what holds them to that.
 //!
 //! ```text
-//! cargo test -p vos-pvm-recair --test recursion masked
 //! cd pvm/proof/fuzz
 //! cargo fuzz run final_verifier_mutate -- -max_total_time=600
 //! ```

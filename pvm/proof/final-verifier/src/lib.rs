@@ -13,7 +13,7 @@
 //! - **39** ([`masked`]), the masked wrap: what production venues accept,
 //!   and the only one a build links by default. Its bytes are a fixed
 //!   layout ([`masked::decode`]): one encoding a proof;
-//! - **28** ([`unmasked`], under the `test-formats` feature), the unmasked
+//! - **28** (`unmasked`, under the `test-formats` feature), the unmasked
 //!   wrap: the tests' and the fixtures', never a production venue's. Its
 //!   bytes are postcard's.
 //!

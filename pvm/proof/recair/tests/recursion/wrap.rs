@@ -748,12 +748,13 @@ fn the_final_verifier_reads_one_bounded_encoding() {
     );
 }
 
-/// The final verifier on the JAM-only host: the wrap accepted within 150M
-/// gas, its phases reported; a proof tampered at its middle byte, and
-/// other words, refused without a panic.
+/// The final verifier on the JAM-only host, by the test guest (format 28
+/// beside 39): the wrap accepted within 150M gas, its phases reported; a
+/// proof tampered at its middle byte, and other words, refused without a
+/// panic.
 #[test]
 fn the_wrap_verifies_on_the_jam_only_host() {
-    let (program, elf_len) = jam::program();
+    let (program, elf_len) = jam::test_program();
     let one = one_segment();
     let bytes = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
     let request = jam::words_request(unmasked::FORMAT, &one.wrapped.words);

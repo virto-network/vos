@@ -112,7 +112,7 @@ never re-implements their encodings.
 | `ProgramId` | `[u32; 8]` (8 M31 words) | `vos_statement::ProgramId` |
 | `StatementId` | `[u8; 32]`, returned by `judge` | `vos_statement::StatementId` |
 | `Statement` | VOS canonical bytes (not SCALE) | `vos_statement::Statement::decode` |
-| verdict | `judge(&venue, &program, &statement, proof) -> Result<StatementId, Refusal>`; `Refusal::code() -> u32` | `vos_statement::{judge, Venue, Refusal}` |
+| verdict | `judge(&venue, &pin, &statement, proof) -> Result<StatementId, Refusal>`, `pin` a `Pin { program, venue_bound }`; `Refusal::code() -> u32` | `vos_statement::{judge, Pin, Venue, Refusal}` |
 
 - **The `Venue` the pallet implements over its storage:**
   - `id()`: the `VenueId`;
@@ -133,8 +133,8 @@ never re-implements their encodings.
   | 7 | venue |
   | `0x100 \| e` | proof, where e is the final verifier's code |
 
-  - Code 7 and `Venue::id` land in VOS step 6.5. Until the vendored tag
-    has them, the pallet compiles against the tag the `VENDOR` file names.
+  - Code 7, `Venue::id` and `Pin` landed in VOS step 6.5; the pallet
+    compiles against the tag the `VENDOR` file names.
 
 ## 4. Configuration
 
@@ -324,7 +324,8 @@ and it reports through events:
    reports 2 at every venue;
 8. `program = statement.program` when `Programs` has it active now, else
    refusal 3;
-9. `judge(&StorageVenue, &program, &statement, &proof)`. Inside it run the
+9. `judge(&StorageVenue, &Pin { program, venue_bound }, &statement, &proof)`,
+   `venue_bound` the program's `ProgramInfo`. Inside it run the
    format again, the venue prefix when `venue_bound`, the space rule,
    anchored, the io-hash, unseen, and the proof.
 
@@ -335,7 +336,7 @@ The outcome:
 
 | Outcome | Storage | Deposit | Events |
 |---|---|---|---|
-| `Ok(id)` | `Seen[id]` = `u64::MAX` if rootless, else `B_wmax + MaxRootAge` (newest root's window). That entry and the `Accepted` event are the whole of `Record`: it stores nothing else; later handlers add their own storage | released | `Accepted` |
+| `Ok(id)` | `Seen[id]` = `u64::MAX` if rootless, else `B_wmax + MaxRootAge` (newest root's window; `vos_statement::seen_expiry`). That entry and the `Accepted` event are the whole of `Record`: it stores nothing else; later handlers add their own storage | released | `Accepted` |
 | refusal 6 (repeated) | – | released | `Refused { code: 6 }`. A race between two nodes is not punished |
 | any other refusal | – | transferred to `ForfeitTo` | `Refused { code }`, `DepositForfeited` |
 

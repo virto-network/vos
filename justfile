@@ -51,14 +51,19 @@ test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --test-threads=1
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
-# verifier's blob built as a runtime builds it, under the PVF's semantics and
-# the client's: every verdict the recorded one, as natively and on the
-# JAM-only host (`vos-statement`'s fixtures test); and `vos-anchor`'s golden
-# vectors computed by the same blob, every digest the pinned bytes.
+# verifier's blobs built as a runtime builds them, under the PVF's semantics
+# and the client's: the production blob (format 39 alone, a statement of 28
+# refused as a format it does not link) and the test blob (`test-formats`,
+# 28 beside it), every verdict the one its build reaches, as natively and on
+# the JAM-only host (`vos-statement`'s fixtures test); and `vos-anchor`'s
+# golden vectors computed by the production blob, every digest the pinned
+# bytes.
 judge-wasm:
     cd pvm/proof/final-verifier/wasm/blob; cargo build --release
+    cd pvm/proof/final-verifier/wasm/blob; cargo build --release --features test-formats --target-dir target/test-formats
     cd pvm/proof/final-verifier/wasm/run; cargo build --release
-    for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm $semantics judge pvm/proof/fixtures }
+    for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm $semantics judge pvm/proof/fixtures 39 }
+    for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm $semantics judge pvm/proof/fixtures 28,39 }
     for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm $semantics anchors }
 
 # The proof fixtures under `pvm/proof/fixtures` (`proving.md` A.6), written
@@ -132,12 +137,29 @@ check-no-faults:
 # of any workspace member, nor of the workspaces built apart (the agent,
 # the fuzz targets, the final verifier's Wasm blob and its runner), enables
 # it (the prover's tests enable it on a dev edge), and the proof crate's
-# `debug-internals` does not imply it.
+# `debug-internals` does not imply it. Each package's enabled features are
+# read (`{f}`), so a feature that enables it through another is caught.
 check-no-seeded-masks:
-    if (cargo tree --workspace -e features,no-dev | str contains 'feature "seeded-masks"') { error make { msg: "a workspace member's build enables seeded masks" } }
-    for manifest in [agent/default pvm/proof/fuzz pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { if (cargo tree --manifest-path $"($manifest)/Cargo.toml" -e features,no-dev | str contains 'feature "seeded-masks"') { error make { msg: $"($manifest)'s build enables seeded masks" } } }
+    if (cargo tree --workspace -e no-dev -f '{p} {f}' --prefix none | str contains 'seeded-masks') { error make { msg: "a workspace member's build enables seeded masks" } }
+    for manifest in [agent/default pvm/proof/fuzz pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { if (cargo tree --manifest-path $"($manifest)/Cargo.toml" -e no-dev -f '{p} {f}' --prefix none | str contains 'seeded-masks') { error make { msg: $"($manifest)'s build enables seeded masks" } } }
     if (open pvm/proof/Cargo.toml | get features.debug-internals | any {|feature| $feature | str contains 'seeded-masks' }) { error make { msg: "debug-internals implies seeded masks" } }
     print "no seeded masks in a production build"
+
+# Format 28, the unmasked wrap (`vos-pvm-final-verifier`'s and
+# `vos-statement`'s `test-formats`), reaches no production build: no normal
+# or build edge of any workspace member, nor of the workspaces built apart
+# that venues or nodes run (the agent, the final verifier's Wasm blob, its
+# runner), enables it (the tests enable it on dev edges, the harnesses' test
+# builds by name), each package's enabled features read (`{f}`), so a
+# feature that enables it through another is caught; and neither
+# `vos-statement`'s `fixtures` nor its `pvm-guest` implies it. The fuzz
+# targets, built apart, fuzz format 28's decode and verifier too, and are no
+# venue.
+check-no-test-formats:
+    if (cargo tree --workspace -e no-dev -f '{p} {f}' --prefix none | str contains 'test-formats') { error make { msg: "a workspace member's build enables test-formats" } }
+    for manifest in [agent/default pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { if (cargo tree --manifest-path $"($manifest)/Cargo.toml" -e no-dev -f '{p} {f}' --prefix none | str contains 'test-formats') { error make { msg: $"($manifest)'s build enables test-formats" } } }
+    for feature in [fixtures pvm-guest] { if (open pvm/proof/statement/Cargo.toml | get features | get $feature | any {|implied| $implied | str contains 'test-formats' }) { error make { msg: $"vos-statement's ($feature) implies test-formats" } } }
+    print "no test formats in a production build"
 
 # The builds without std. vos-raft for an embedded target, on core and alloc
 # alone, built from the toolchain's source. The proof verifier, which reads
@@ -151,8 +173,11 @@ check-no-seeded-masks:
 # target, for wasm32 with every nightly feature refused (their source
 # builds on stable), and for the PVM
 # with the standard library built from source, with the venue's JAM refine
-# program (`final-verify.elf`), which `vos-pvm-recair`'s wrap test and the
-# fixtures' and the end-to-end tests run on the JAM-only host.
+# program, which `vos-pvm-recair`'s wrap tests and the fixtures' and the
+# end-to-end tests run on the JAM-only host: `final-verify.elf`, the
+# production venue's, linking format 39 alone, and `final-verify-test.elf`,
+# linking 28 beside it for the test policy's fixtures. The final verifier and
+# `vos-statement` build here without `test-formats`.
 check-no-std:
     cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
@@ -163,7 +188,8 @@ check-no-std:
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-anchor --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
     cargo build -p vos-statement --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-statement --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
-    cargo build -p vos-statement --release --features pvm-guest --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+    cargo build -p vos-statement --release --features pvm-guest --bin final-verify --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+    cargo build -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the
@@ -171,14 +197,14 @@ check-no-std:
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-no-std check-no-seeded-masks build-test-actors build-agent
+check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats build-test-actors build-agent
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-recair -p vos-pvm-final-verifier -p vos-anchor -p vos-statement --features vos-anchor/vectors,vos-statement/fixtures
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
-ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks
+ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats
 
 # The gate before merging: `ci` plus the prover suites, the soundness gates
 # and the bench tests that prove. Run it under a memory limit.

@@ -1,7 +1,9 @@
-//! The venue's JAM refine program (`final-verify.elf`, built by `just
-//! check-no-std`) on the JAM-only host, at PolkaJam's prices: the request
-//! as work item 0's payload and the proof as a preimage of the running
-//! service. Shared by the tests that run it, each including this file.
+//! The venue's JAM refine program (`final-verify.elf`, linking format 39
+//! alone, and `final-verify-test.elf`, linking 28 beside it; both built by
+//! `just check-no-std`) on the JAM-only host, at PolkaJam's prices: the
+//! request as work item 0's payload and the proof as a preimage of the
+//! running service. Shared by the tests that run it, each including this
+//! file.
 
 #![allow(dead_code)]
 
@@ -39,15 +41,27 @@ pub struct GuestReport {
     pub digests: Vec<u8>,
 }
 
-/// The guest, linked: `target/riscv64em-vos/release/final-verify.elf` of
-/// the workspace holding the crate that includes this file.
+/// The production guest, linking format 39 alone, linked: its program and
+/// its ELF's length.
 pub fn program() -> (Vec<u8>, usize) {
+    guest("final-verify")
+}
+
+/// The test guest, linking format 28 beside 39, linked: its program and its
+/// ELF's length.
+pub fn test_program() -> (Vec<u8>, usize) {
+    guest("final-verify-test")
+}
+
+/// `target/riscv64em-vos/release/<name>.elf` of the workspace holding the
+/// crate that includes this file, linked.
+fn guest(name: &str) -> (Vec<u8>, usize) {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = manifest
         .ancestors()
         .find(|dir| dir.join("Cargo.lock").exists() && dir.join("pvm").is_dir())
         .expect("the workspace's root");
-    let path = root.join("target/riscv64em-vos/release/final-verify.elf");
+    let path = root.join(format!("target/riscv64em-vos/release/{name}.elf"));
     let elf = std::fs::read(&path).unwrap_or_else(|error| {
         panic!(
             "{} missing ({error}); run `just check-no-std`",

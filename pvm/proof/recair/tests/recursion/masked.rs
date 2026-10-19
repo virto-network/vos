@@ -439,23 +439,31 @@ fn the_layout_refuses_truncations_and_trailing_bytes() {
     }
 }
 
-/// The masked wrap on the JAM-only host: accepted within 125M gas of
-/// verify and 4M of decode (format 28's postcard: 19.9M), its phases
-/// reported beside format 28's on the same witness; a proof tampered at its
-/// middle byte, and other words, refused without a panic.
+/// The masked wrap on the JAM-only host, by the production guest (format
+/// 39 alone): accepted within 125M gas of verify and 4M of decode (format
+/// 28's postcard: 19.9M), its phases reported beside format 28's on the
+/// same witness, by the test guest (28 beside 39); a proof tampered at its
+/// middle byte, and other words, refused without a panic; 28 refused by the
+/// production guest as a format it does not link.
 #[test]
 fn the_masked_wrap_verifies_on_the_jam_only_host() {
     let (program, elf_len) = jam::program();
+    let (test_program, test_elf_len) = jam::test_program();
     let masked = masked_wrap();
     let one = one_segment();
     let unmasked_bytes = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
     let mut phases = Vec::new();
-    for (format, bytes) in [
-        (unmasked::FORMAT, &unmasked_bytes),
-        (masked::FORMAT, &masked.bytes),
+    for (format, bytes, program, elf_len) in [
+        (
+            unmasked::FORMAT,
+            &unmasked_bytes,
+            &test_program,
+            test_elf_len,
+        ),
+        (masked::FORMAT, &masked.bytes, &program, elf_len),
     ] {
         let request = jam::words_request(format, &masked.words);
-        let (gas, report) = jam::run(&program, &request, bytes);
+        let (gas, report) = jam::run(program, &request, bytes);
         let [start, lookup, decode, end] = report.gas;
         let (decode, verify) = (lookup - decode, decode - end);
         eprintln!(
@@ -495,4 +503,9 @@ fn the_masked_wrap_verifies_on_the_jam_only_host() {
     );
     eprintln!("other words: {gas} gas: {}", report.error);
     assert_eq!(report.verdict, jam::REJECT);
+
+    let request = jam::words_request(unmasked::FORMAT, &masked.words);
+    let (_, report) = jam::run(&program, &request, &unmasked_bytes);
+    assert_eq!(report.verdict, jam::UNDECODABLE, "{}", report.error);
+    assert_eq!(report.error, Error::Format.to_string());
 }

@@ -1,5 +1,6 @@
 //! The final verifier and the venue's check over it as a runtime-style
-//! Wasm blob.
+//! Wasm blob: the production blob links format 39 alone; under
+//! `test-formats`, the test blob links 28 beside it.
 //!
 //! Exports, called the way a runtime API is (the host allocates the input
 //! with the runtime's allocator and passes `(ptr, len)`):

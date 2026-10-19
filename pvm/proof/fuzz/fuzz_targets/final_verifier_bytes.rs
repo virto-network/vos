@@ -9,7 +9,6 @@
 //! from proofs that decode:
 //!
 //! ```text
-//! cargo test -p vos-pvm-recair --test recursion masked
 //! cd pvm/proof/fuzz
 //! cargo run --example seed
 //! cargo fuzz run final_verifier_bytes -- -max_total_time=600 -max_len=262145

@@ -1,9 +1,7 @@
-//! The golden wraps: format 28's (`pvm/proof/fixtures`, the `valid` case)
-//! and format 39's (the one-segment run's masked wrap, which
-//! `vos-pvm-recair`'s masked wrap tests write under the workspace's
-//! `target/tmp/wrap/one-segment-39.{proof,words}`): each its proof's bytes,
-//! the 24 public words it verifies against, and the oracle for a proof a
-//! target finds accepted. Each target uses what it reads of it.
+//! The golden wraps, the fixtures' (`pvm/proof/fixtures`): format 39's two
+//! accepted statements' and format 28's: each its proof's bytes, the 24
+//! public words it verifies against, and the oracle for a proof a target
+//! finds accepted. Each target uses what it reads of it.
 
 #![allow(dead_code)]
 
@@ -79,84 +77,48 @@ impl Golden {
     }
 }
 
-pub fn golden() -> &'static Golden {
-    static GOLDEN: OnceLock<Golden> = OnceLock::new();
-    GOLDEN.get_or_init(|| {
-        let fixtures = vos_statement::fixtures::load(&vos_statement::fixtures::directory());
-        let valid = fixtures
-            .into_iter()
-            .find(|fixture| fixture.name == "valid")
-            .expect("the valid fixture");
-        let words = vos_pvm_final_verifier::Statement {
-            program: valid.input.program.0,
-            io_hash: valid.input.statement.io_hash(),
-        }
-        .words();
-        vos_pvm_final_verifier::unmasked::verify_bytes(&valid.proof, &words)
-            .expect("the golden wrap verifies");
-        let decoded = vos_pvm_final_verifier::unmasked::decode(&valid.proof).expect("decodes");
-        assert_eq!(
-            postcard::to_allocvec(&decoded).expect("encodes"),
-            valid.proof,
-            "the golden wrap's encoding is postcard's own"
-        );
-        Golden {
-            format: vos_pvm_final_verifier::unmasked::FORMAT,
-            proof: valid.proof,
-            words,
-        }
+/// The golden of the fixture `name` (`pvm/proof/fixtures`): its proof, the
+/// words its statement makes under its pin, checked to verify and to be its
+/// format's own encoding.
+fn of_fixture(name: &str) -> Golden {
+    let fixtures = vos_statement::fixtures::load(&vos_statement::fixtures::directory());
+    let fixture = fixtures
+        .into_iter()
+        .find(|fixture| fixture.name == name)
+        .unwrap_or_else(|| panic!("the fixture {name:?}"));
+    let format = fixture.input.statement.format;
+    let words = vos_pvm_final_verifier::Statement {
+        program: fixture.input.pin.program.0,
+        io_hash: fixture.input.statement.io_hash(),
+    }
+    .words();
+    let golden = Golden {
+        format,
+        proof: fixture.proof,
+        words,
+    };
+    assert!(
+        golden.verify_bytes(&golden.proof),
+        "{name}: the golden verifies"
+    );
+    let decoded = golden.decode(&golden.proof).expect("decodes");
+    assert_eq!(
+        golden.encode(&decoded).as_ref(),
+        Some(&golden.proof),
+        "{name}: the golden's encoding is its format's own"
+    );
+    golden
+}
+
+/// The goldens: format 39's rooted statement (`valid`) and rootless one
+/// (`rootless`), and format 28's (`format 28 at the test venue`).
+pub fn goldens() -> &'static [Golden; 3] {
+    static GOLDENS: OnceLock<[Golden; 3]> = OnceLock::new();
+    GOLDENS.get_or_init(|| {
+        [
+            of_fixture("valid"),
+            of_fixture("rootless"),
+            of_fixture("format 28 at the test venue"),
+        ]
     })
-}
-
-/// The format-39 golden: the one-segment run's masked wrap, as
-/// `vos-pvm-recair`'s masked wrap tests write it (`cargo test -p
-/// vos-pvm-recair --test recursion masked` first).
-pub fn golden_39() -> &'static Golden {
-    static GOLDEN: OnceLock<Golden> = OnceLock::new();
-    GOLDEN.get_or_init(|| {
-        let directory = masked_directory();
-        let read = |extension: &str| {
-            let path = directory.join(format!("one-segment-39.{extension}"));
-            std::fs::read(&path).unwrap_or_else(|error| {
-                panic!(
-                    "{} ({error}): run `cargo test -p vos-pvm-recair --test recursion masked` \
-                     first, with this `CARGO_TARGET_DIR` if the workspace's is elsewhere",
-                    path.display()
-                )
-            })
-        };
-        let proof = read("proof");
-        let bytes = read("words");
-        let words: [u32; PUBLIC_WORDS] = core::array::from_fn(|i| {
-            u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().expect("a word"))
-        });
-        vos_pvm_final_verifier::masked::verify_bytes(&proof, &words)
-            .expect("the golden masked wrap verifies");
-        let decoded = vos_pvm_final_verifier::masked::decode(&proof).expect("decodes");
-        assert_eq!(
-            vos_pvm_final_verifier::masked::encode(&decoded),
-            Some(proof.clone()),
-            "the fixed layout is the one encoding"
-        );
-        Golden {
-            format: vos_pvm_final_verifier::masked::FORMAT,
-            proof,
-            words,
-        }
-    })
-}
-
-/// Where `vos-pvm-recair`'s masked wrap tests write the format-39 golden:
-/// `wrap` under the workspace's target directory's `tmp`, the workspace's
-/// `target` unless `CARGO_TARGET_DIR` names another.
-pub fn masked_directory() -> std::path::PathBuf {
-    std::env::var_os("CARGO_TARGET_DIR")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target"))
-        .join("tmp/wrap")
-}
-
-/// Both goldens.
-pub fn goldens() -> [&'static Golden; 2] {
-    [golden(), golden_39()]
 }

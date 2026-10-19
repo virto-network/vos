@@ -26,13 +26,15 @@
 //! copy (one byte flipped at the middle) must not be accepted.
 //!
 //! ```text
-//! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> judge <fixtures>
+//! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> judge <fixtures> <formats>
 //! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> anchors
 //! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> statements <name.input>...
 //! ```
 //!
 //! `judge`: every golden fixture under `<fixtures>` judged by the blob's
-//! `judge`, failing when a verdict is not the recorded one (`just
+//! `judge`, failing when a verdict is not the one a build linking
+//! `<formats>` reaches (comma-separated: `39` for the production blob,
+//! `28,39` for the test blob; `Fixture::verdict_linking`) (`just
 //! judge-wasm`). `anchors`: every golden vector of `vos-anchor` computed by
 //! the blob's `anchor_digests`, failing when its digests are not the pinned
 //! bytes, or when a vector cut short is not refused (`just judge-wasm`).
@@ -302,25 +304,33 @@ fn run(args: &[String]) -> Result<()> {
     let count = |instructions: Option<u64>| instructions.map_or("-".into(), |n| n.to_string());
     match runs.as_str() {
         "judge" => {
-            let [directory] = proofs else {
-                bail!("judge: one fixtures directory");
+            let [directory, formats] = proofs else {
+                bail!("judge: one fixtures directory, then the formats the blob links");
             };
+            let linked = formats
+                .split(',')
+                .map(str::parse)
+                .collect::<Result<Vec<u32>, _>>()
+                .context("the formats, comma-separated")?;
             let fixtures = vos_statement::fixtures::load(std::path::Path::new(directory));
             let mut differ = 0;
             for fixture in &fixtures {
+                let expected = fixture.verdict_linking(&linked);
                 let (code, instructions, id) = judged(&fixture.name, &fixture.bytes())?;
                 println!(
-                    "JUDGE fixture={} expected={:#x} code={code:#x} instructions={} id={id}",
+                    "JUDGE fixture={:?} expected={expected:#x} code={code:#x} instructions={} id={id}",
                     fixture.name,
-                    fixture.verdict,
                     count(instructions),
                 );
-                differ += usize::from(code != fixture.verdict);
+                differ += usize::from(code != expected);
             }
             if differ > 0 {
                 bail!("{differ} of {} fixtures judged otherwise", fixtures.len());
             }
-            println!("{} fixtures judged as recorded", fixtures.len());
+            println!(
+                "{} fixtures judged as recorded, linking {linked:?}",
+                fixtures.len()
+            );
             return Ok(());
         }
         "anchors" => {

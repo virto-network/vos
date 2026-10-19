@@ -2,19 +2,22 @@
 //! [`Statement`], its canonical encoding, its io-hash and its id, and
 //! [`judge`], the venue's check of a final proof against it.
 //!
-//! **What binds what.** The final proof (`vos-pvm-final-verifier`, format 28)
-//! states two public inputs, the program id and the io-hash. The io-hash is
-//! BLAKE2b-256 of `vos/io/v1` and the statement's `public_args`, `output` and
-//! `roots` in their SCALE encoding, as the kernel computes it at its halt
-//! (`vos_pvm_precompiles::compute_io_hash`): the proof binds those three
-//! fields through it. The venue binds the rest:
-//! - **the format,** one it accepts and this verifier reads;
-//! - **the program,** against the id the venue pinned;
+//! **What binds what.** The final proof (`vos-pvm-final-verifier`, format 39;
+//! 28 under `test-formats`) states two public inputs, the program id and the
+//! io-hash. The io-hash is BLAKE2b-256 of `vos/io/v1` and the statement's
+//! `public_args`, `output` and `roots` in their SCALE encoding, as the
+//! kernel computes it at its halt (`vos_pvm_precompiles::compute_io_hash`):
+//! the proof binds those three fields through it. The venue binds the rest:
+//! - **the format,** one it accepts and this build links ([`LINKED`]);
+//! - **the program,** against the id the venue pinned ([`Pin`]);
+//! - **the venue,** for a venue-bound program: the first 32 bytes of
+//!   `public_args` the venue's id ([`Refusal::Venue`]);
 //! - **the space,** equal to every root's, or [`SpaceId::NONE`] for a
 //!   rootless statement;
-//! - **the roots,** each anchored for its space and window (`proving.md`
-//!   §7);
-//! - **repeats,** a statement id it has accepted before refused.
+//! - **the roots,** each anchored for its space and window, within the
+//!   space's range at the venue (`proving.md` §7);
+//! - **repeats,** a statement id it has accepted before refused, under the
+//!   `Seen` rule ([`seen_expiry`]).
 //!
 //! **A rootless statement belongs to no space; a statement claiming a space
 //! must read a root of it.** The id hashes the space, and only a root binds
@@ -28,17 +31,39 @@
 //! claim before any anchor is looked up.
 //!
 //! **The program id is the venue's, never the caller's.** [`judge`] takes it
-//! as `program`, the id the venue pinned for the kernel whose handler will
+//! in a [`Pin`], the id the venue pinned for the kernel whose handler will
 //! act on the statement: governance input, set when the kernel was admitted,
 //! which anyone with the recursion stack can recompute from the kernel. The
 //! statement's own `program` field must equal it. A venue that verified
 //! against the statement's or the proof's program id instead would accept
 //! any kernel's proof, a statement of the attacker's own program.
 //!
+//! **A venue-bound program's statements are one venue's.** The pin says
+//! whether the program is venue-bound (`#[attestable(venue_bound)]`): its
+//! kernel takes the venue's id as its first public argument, so
+//! `public_args[..32]` is the venue the statement was made for, bound by
+//! the io-hash. A venue refuses one naming another ([`Refusal::Venue`]), so
+//! a statement accepted at one venue is not accepted, and handled, at
+//! another. A program that is not venue-bound states nothing of the venue;
+//! its statements are accepted at every venue that pins it.
+//!
+//! **Formats.** [`judge`] reads a statement's proof under the statement's
+//! format, through the final verifier's dispatch, when the venue accepts it
+//! and this build links it ([`LINKED`]): format 39 alone, and 28 beside it
+//! only under the `test-formats` feature, which no production build
+//! enables (`just check-no-test-formats`). So the accepted set is the one
+//! gate between format 28 and a production venue.
+//!
 //! **Keys.** A venue remembers what it accepted by the statement's id
 //! ([`Statement::id`]), never by the proof's bytes or their hash: a proof has
 //! many encodings under format 28 (`vos_pvm_final_verifier::unmasked::decode`),
 //! and many proofs state one statement.
+//!
+//! **`Seen` and time** ([`seen_expiry`]): a rooted statement's entry may be
+//! dropped once its newest root is past [`MAX_ROOT_AGE_MS`], since a replay
+//! then fails as unanchored. A rootless statement's entry never expires: it
+//! has no anchor to fail, so a dropped entry would let it be accepted, and
+//! handled, again.
 //!
 //! **The id does not hash the format.** The format is a checked field, as
 //! the space is, but which final proof states a run is not part of what it
@@ -74,7 +99,10 @@ pub mod model;
 use alloc::vec::Vec;
 
 use vos_anchor::codec::{self, Reader};
-pub use vos_anchor::{self, DecodeError, RootKind, RootRead, SpaceId, VenueId, blake2b_256};
+pub use vos_anchor::{
+    self, DecodeError, MAX_ROOT_AGE_MS, RootKind, RootRead, SpaceId, VenueId, WindowClock,
+    blake2b_256,
+};
 pub use vos_pvm_final_verifier;
 
 /// The io-hash's domain (`vos_pvm_precompiles::io::IO_HASH_DOMAIN`).
@@ -82,9 +110,10 @@ pub const IO_DOMAIN: &[u8] = b"vos/io/v1";
 /// The statement id's domain.
 pub const ID_DOMAIN: &[u8] = b"vos/statement/v1";
 
-/// The format of the final proofs [`judge`] reads: format 28, the unmasked
-/// wrap, which the verifier links under its `test-formats` feature.
-pub const FORMAT: u32 = vos_pvm_final_verifier::unmasked::FORMAT;
+/// The final formats this build reads: 39, and 28 under the `test-formats`
+/// feature (`vos_pvm_final_verifier::LINKED`). A venue refuses a statement
+/// of any other as [`Refusal::Format`], whatever it accepts.
+pub const LINKED: &[u32] = vos_pvm_final_verifier::LINKED;
 
 /// A kernel's program id: eight M31 words, each below `p`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -219,15 +248,54 @@ pub(crate) fn decode_program(reader: &mut Reader<'_>) -> Result<ProgramId, Decod
 /// The M31 modulus.
 const P: u32 = (1 << 31) - 1;
 
-/// What a venue knows: the formats it accepts, its anchored roots and the
-/// statements it has accepted.
+/// What a venue pinned for a kernel whose handler acts on its statements:
+/// the program id, and whether the program is venue-bound.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct Pin {
+    /// The kernel's program id, the one its proofs are verified against.
+    pub program: ProgramId,
+    /// Whether the program is venue-bound (`#[attestable(venue_bound)]`): its
+    /// statements' `public_args` start with the venue's id.
+    pub venue_bound: bool,
+}
+
+/// What a venue knows: its id, the formats it accepts, its anchored roots
+/// and the statements it has accepted.
 pub trait Venue {
+    /// Its id: on Kreivo its genesis hash; on JAM `VenueId::jam`'s.
+    fn id(&self) -> VenueId;
     /// Whether it accepts final proofs of `format`.
     fn accepts(&self, format: u32) -> bool;
-    /// Whether `root` is the anchored root of its space at its window.
+    /// Whether `root` is the anchored root of its space at its window: the
+    /// window within the space's range at this venue (from its registration
+    /// to its migration away, if any) and the root not past
+    /// [`MAX_ROOT_AGE_MS`] by the venue's time.
     fn anchored(&self, root: &RootRead) -> bool;
-    /// Whether it has accepted the statement `id`.
+    /// Whether it holds a `Seen` entry for the statement `id`
+    /// ([`seen_expiry`]).
     fn seen(&self, id: &StatementId) -> bool;
+}
+
+/// When a venue may drop the `Seen` entry of `statement`, accepted: the
+/// venue's time in milliseconds past which a replay fails without it, or
+/// `u64::MAX` for never.
+///
+/// A rooted statement's entry lasts until its newest root is past
+/// [`MAX_ROOT_AGE_MS`] (`B_w + MaxRootAge`, `clock` its space's): a replay
+/// after it is refused as [`Refusal::Unanchored`], since no venue anchors a
+/// root past that age. A rootless statement's never expires: it has no
+/// anchor to fail, so a dropped entry would let it be accepted, and
+/// handled, again; their count is bounded by what a submit costs. A
+/// boundary past `u64`'s range keeps the entry for ever too.
+pub fn seen_expiry(statement: &Statement, clock: &WindowClock) -> u64 {
+    statement
+        .roots
+        .iter()
+        .map(|root| root.window)
+        .max()
+        .and_then(|window| clock.boundary(window))
+        .and_then(|boundary| boundary.checked_add(MAX_ROOT_AGE_MS))
+        .unwrap_or(u64::MAX)
 }
 
 /// Why a venue refuses a statement.
@@ -235,17 +303,21 @@ pub trait Venue {
 pub enum Refusal {
     /// The statement does not decode.
     Statement(DecodeError),
-    /// A format the venue does not accept, or this verifier does not read.
+    /// A format the venue does not accept, or this build does not link.
     Format,
     /// The statement's program is not the one the venue pinned.
     Program,
     /// A root of another space than the statement's, a rootless statement
     /// claiming a space, or a rooted one claiming none.
     Space,
-    /// A root the venue has not anchored: stale, or unknown.
+    /// A root the venue has not anchored: stale, outside the space's range
+    /// at the venue, or unknown.
     Unanchored,
     /// A statement the venue has accepted before.
     Repeated,
+    /// A venue-bound program's statement whose `public_args` do not start
+    /// with this venue's id.
+    Venue,
     /// The final proof is refused against the venue's program id and the
     /// io-hash recomputed from the statement.
     Proof(vos_pvm_final_verifier::Error),
@@ -263,6 +335,7 @@ impl Refusal {
             Self::Space => 4,
             Self::Unanchored => 5,
             Self::Repeated => 6,
+            Self::Venue => 7,
             Self::Proof(error) => 0x100 | u32::from(error.code()),
         }
     }
@@ -281,6 +354,7 @@ impl core::fmt::Display for Refusal {
             }
             Self::Unanchored => f.write_str("a root is not anchored"),
             Self::Repeated => f.write_str("the statement was accepted before"),
+            Self::Venue => f.write_str("the statement is bound to another venue"),
             Self::Proof(error) => write!(f, "the proof: {error}"),
         }
     }
@@ -292,19 +366,21 @@ pub fn code(verdict: &Result<StatementId, Refusal>) -> u32 {
     verdict.as_ref().map_or_else(Refusal::code, |_| 0)
 }
 
-/// A statement the venue's checks before the proof admit: its id, and the
-/// public words its proof must state.
+/// A statement the venue's checks before the proof admit: its format, its
+/// id, and the public words its proof must state.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admitted {
+    /// The statement's format: one the venue accepts and this build links.
+    pub format: u32,
     pub id: StatementId,
     pub words: [u32; vos_pvm_final_verifier::PUBLIC_WORDS],
 }
 
 impl Admitted {
-    /// The final proof in `proof`'s bytes, verified against the admitted
-    /// words; the statement's id when accepted.
+    /// The final proof in `proof`'s bytes, verified under the admitted
+    /// format against the admitted words; the statement's id when accepted.
     pub fn verify(&self, proof: &[u8]) -> Result<StatementId, Refusal> {
-        vos_pvm_final_verifier::verify(FORMAT, &[FORMAT], proof, &self.words)
+        vos_pvm_final_verifier::verify(self.format, &[self.format], proof, &self.words)
             .map_err(Refusal::Proof)?;
         Ok(self.id)
     }
@@ -313,23 +389,26 @@ impl Admitted {
 /// The venue's checks of `statement` before its proof: the words its proof
 /// must state, and its id.
 ///
-/// `program` is the id the venue pinned for the kernel whose handler acts
-/// on the statement, never one the caller supplies (the crate's docs).
+/// `pin` is what the venue pinned for the kernel whose handler acts on the
+/// statement, never what the caller supplies (the crate's docs).
 ///
-/// In order: the format; the statement's program against `program`; the
-/// space, a rootless statement's [`SpaceId::NONE`] and a rooted
-/// statement's not, every root's equal to it; every root anchored; the io-hash recomputed from the
-/// fields and the id from it; a repeat.
-pub fn admit(
-    venue: &impl Venue,
-    program: &ProgramId,
-    statement: &Statement,
-) -> Result<Admitted, Refusal> {
-    if statement.format != FORMAT || !venue.accepts(statement.format) {
+/// In order (pin F): the format, accepted by the venue and linked in this
+/// build; the statement's program against the pin's; the venue, the first
+/// 32 bytes of `public_args` its id, if the program is venue-bound; the
+/// space, a rootless statement's [`SpaceId::NONE`] and a rooted statement's
+/// not, every root's equal to it; every root anchored; the io-hash
+/// recomputed from the fields and the id from it; a repeat. Each before the
+/// proof, which is the costly check: a venue that verified first would
+/// spend a verify on every replay.
+pub fn admit(venue: &impl Venue, pin: &Pin, statement: &Statement) -> Result<Admitted, Refusal> {
+    if !LINKED.contains(&statement.format) || !venue.accepts(statement.format) {
         return Err(Refusal::Format);
     }
-    if statement.program != *program {
+    if statement.program != pin.program {
         return Err(Refusal::Program);
+    }
+    if pin.venue_bound && statement.public_args.get(..32) != Some(&venue.id().0[..]) {
+        return Err(Refusal::Venue);
     }
     let spaced = if statement.roots.is_empty() {
         statement.space == SpaceId::NONE
@@ -352,28 +431,34 @@ pub fn admit(
         return Err(Refusal::Repeated);
     }
     let words = vos_pvm_final_verifier::Statement {
-        program: program.0,
+        program: pin.program.0,
         io_hash,
     }
     .words();
-    Ok(Admitted { id, words })
+    Ok(Admitted {
+        format: statement.format,
+        id,
+        words,
+    })
 }
 
 /// The venue's check of `proof`, a final proof's bytes, against `statement`;
-/// its id, when accepted. The venue records the id after it.
+/// its id, when accepted. The venue records the id after it, under the
+/// `Seen` rule ([`seen_expiry`]).
 ///
-/// `program` is the id the venue pinned for the kernel whose handler acts
-/// on the statement, never one the caller supplies (the crate's docs).
+/// `pin` is what the venue pinned for the kernel whose handler acts on the
+/// statement, never what the caller supplies (the crate's docs).
 ///
-/// [`admit`]'s checks, then the proof, verified against `program` and the
-/// recomputed io-hash.
+/// [`admit`]'s checks, then the proof (at most 256 KiB, the format's own
+/// decode, nothing after it), verified against the pinned program id and
+/// the recomputed io-hash.
 pub fn judge(
     venue: &impl Venue,
-    program: &ProgramId,
+    pin: &Pin,
     statement: &Statement,
     proof: &[u8],
 ) -> Result<StatementId, Refusal> {
-    admit(venue, program, statement)?.verify(proof)
+    admit(venue, pin, statement)?.verify(proof)
 }
 
 #[cfg(test)]
@@ -384,7 +469,7 @@ mod tests {
     pub(crate) fn statement() -> Statement {
         let space = SpaceId([0xa1; 32]);
         Statement {
-            format: FORMAT,
+            format: vos_pvm_final_verifier::masked::FORMAT,
             program: ProgramId(core::array::from_fn(|i| 1_000 + i as u32)),
             space,
             public_args: vec![7, 7, 7],
@@ -421,7 +506,7 @@ mod tests {
         let statement = statement();
         let bytes = statement.encode();
         assert_eq!(bytes.len(), 4 + 32 + 32 + 1 + 3 + 2 + 100 + 1 + 2 * 73);
-        assert_eq!(&bytes[..4], &28u32.to_le_bytes());
+        assert_eq!(&bytes[..4], &39u32.to_le_bytes());
         assert_eq!(&bytes[4..8], &1_000u32.to_le_bytes());
         assert_eq!(&bytes[68..72], &[3 << 2, 7, 7, 7]);
         assert_eq!(&bytes[72..74], &[0x91, 0x01]);
@@ -514,7 +599,7 @@ mod tests {
     fn every_field_is_bound() {
         let base = statement();
         let mut reformatted = base.clone();
-        reformatted.format = FORMAT + 1;
+        reformatted.format = 28;
         assert_eq!(reformatted.io_hash(), base.io_hash());
         assert_eq!(reformatted.id(), base.id());
 
@@ -538,5 +623,29 @@ mod tests {
         let mut moved = base.clone();
         moved.public_args.push(moved.output.remove(0));
         assert_ne!(moved.io_hash(), base.io_hash());
+    }
+
+    /// The `Seen` rule: a rooted statement's entry lasts until its newest
+    /// root is past `MaxRootAge`, whichever order its roots are in; a
+    /// rootless statement's, and one whose boundary overflows, for ever.
+    #[test]
+    fn a_seen_entry_expires_with_its_newest_root_and_a_rootless_one_never() {
+        let clock = WindowClock {
+            origin_ms: 1_000,
+            length_ms: 600_000,
+        };
+        let mut rooted = statement();
+        let newest = 1_000 + 43 * 600_000 + MAX_ROOT_AGE_MS;
+        assert_eq!(seen_expiry(&rooted, &clock), newest);
+        rooted.roots.swap(0, 1);
+        assert_eq!(seen_expiry(&rooted, &clock), newest);
+        rooted.roots[0].window = u64::MAX;
+        assert_eq!(seen_expiry(&rooted, &clock), u64::MAX);
+        let rootless = Statement {
+            space: SpaceId::NONE,
+            roots: Vec::new(),
+            ..statement()
+        };
+        assert_eq!(seen_expiry(&rootless, &clock), u64::MAX);
     }
 }

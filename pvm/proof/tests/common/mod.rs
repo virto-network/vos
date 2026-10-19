@@ -634,27 +634,32 @@ fn write_wrap_files(
 }
 
 /// `statement`, the run's: its io-hash the run's `io_hash`, judged against
-/// the wrap `proof` by a venue that pins its program, accepts format 28 and
-/// anchors its roots, natively and on the JAM-only host by the venue's
-/// refine program; the judgement's input.
+/// the wrap `proof` by a test venue that pins its program, accepts format
+/// 28 and anchors its roots, natively and on the JAM-only host by the
+/// venue's test refine program (`final-verify-test.elf`, which links 28);
+/// the judgement's input.
 pub fn judged_statement(
     statement: vos_statement::Statement,
     io_hash: &[u8],
     proof: &[u8],
 ) -> vos_statement::model::Input {
     assert_eq!(statement.io_hash()[..], io_hash[..]);
+    assert!(statement.roots.is_empty(), "a rootless statement");
     let input = vos_statement::model::Input {
-        program: statement.program,
-        policy: vos_statement::model::Policy {
-            formats: vec![vos_statement::FORMAT],
-            anchors: statement.roots.clone(),
-            seen: Vec::new(),
+        pin: vos_statement::Pin {
+            program: statement.program,
+            venue_bound: false,
         },
+        policy: vos_statement::model::Policy::new(
+            vos_statement::VenueId([0; 32]),
+            0,
+            &[vos_pvm_final_verifier::unmasked::FORMAT],
+        ),
         statement,
     };
     let id = input.judge(proof).expect("the venue accepts the statement");
     assert_eq!(id, input.statement.id());
-    let (program, _) = jam::program();
+    let (program, _) = jam::test_program();
     let (gas, report) = jam::run(&program, &jam::judge_request(&input), proof);
     let [start, lookup, _, end] = report.gas;
     eprintln!(

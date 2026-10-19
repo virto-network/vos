@@ -3153,7 +3153,6 @@ name = "vos-pvm-final-verifier"
 version = "0.1.0"
 dependencies = [
  "num-traits",
- "postcard",
  "serde",
  "stwo",
  "vos-pvm-recair-air",
