@@ -11,7 +11,7 @@ There are two verifying paths:
 
 - **A segment proof,** verified by `vos-pvm-proof-verifier`
   (`verify_standalone`, `verify_kernel_segment`, the chain verifiers):
-  formats 35 and 36. Peers and tests use it; so do the refine bundles.
+  format 35. Peers and tests use it.
 - **A statement,** a kernel's whole run: its segments (35) verified in
   leaves, folded (32), the root wrapped (28), the wrap verified by
   `vos-pvm-final-verifier` and judged by `vos-statement`. This is what a venue
@@ -26,7 +26,6 @@ reference shape, from the security tool (`src/security.rs`):
 | format | proofs | channel | counts | floors | status |
 |---|---|---|---|---|---|
 | 35 | segments, hardened AIR | Poseidon2-M31 | 104 / 62.86 | 100 / 60 | admitted |
-| 36 | segments, legacy encodings | Blake2s | 96 / 57.49 (at MOBILE) | 96 / — | admitted, legacy only |
 | 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | reserved: proved and verified inside the recursion, refused by every outside verifier |
 | 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | reserved: refused until its masked AIR, prover and verifier exist |
@@ -42,28 +41,21 @@ reference shape, from the security tool (`src/security.rs`):
   column sampled at two points, the periodicity value the fork adds
   (`deep_values_of_column`); `c`, the most of one column, is counted the
   same way, 3. The segment shape batches 10,016 values over 9,020 samples,
-  so 36 counts 57.485 and 37 62.104 (by samples, 57.495 and 62.129); 35's
-  query term binds, 62.86 either way.
+  so 37 counts 62.104 (by samples, 62.129); 35's query term binds, 62.86
+  either way.
 - A verifier rejects a number the registry does not admit, a retired one
-  (24 to 27, 29, 31, 33, 34, and 40, the blowup-64 masked wrap a measured
-  proof was made under, never registered) among them, and a proof on
-  another channel than its format's. Under every format but 36 the proof's
-  configuration must equal the format's, and its counts at its own shape
-  must reach the floors.
+  (24 to 27, 29, 31, 33, 34; 36, the legacy segment format, whose 57
+  proven bits at its MOBILE shape were below the 60-bit floor; and 40, the
+  blowup-64 masked wrap a measured proof was made under, never registered)
+  among them, and a proof on another channel than its format's. The
+  proof's configuration must equal the format's, and its counts at its own
+  shape must reach the floors.
 
 **End to end, the proven bound is the weakest inner format's: 62.86 bits,
 not the wrap's 82.6.** Forging a leaf's segment forges the statement. The
 conjectured bound is 104. Under Grover's heuristic that is about 31 proven
 and 52 conjectured bits against a quantum prover: post-quantum readiness
 rests on the conjectured count.
-
-**Format 36** is below the 60-bit proven floor (57 at its MOBILE shape;
-the proof carries its own parameters, held only to 96 conjectured bits and
-a `PcsPolicy`). The default prover entry points and the refine bundles
-still produce it. It is admitted for that legacy path alone and has never
-been published in a statement: a leaf verifies a Poseidon2-M31 segment
-proof of the format its circuit holds as a constant, 35. Its
-retirement, or the refine path's move to 35, is open.
 
 ## The segment AIR
 
@@ -103,9 +95,7 @@ retirement, or the refine path's move to 35, is open.
   regions (read-only data and the argument window readable; read-write data,
   heap and stack writable; nothing else mapped) are preprocessed constants
   of MemoryPageChip, so they enter the preprocessed root: a store to a
-  read-only page, or an access to an unmapped one, does not prove. Refine
-  machine slices, whose pages change permission at run time, prove on a
-  writable layout; refine's replay binds their permissions.
+  read-only page, or an access to an unmapped one, does not prove.
 - **No chip-isolated proof verifies standalone:** a proof with
   `component_mask = 0` (the explicit-components test path) names no
   boundary chips, and `verify_standalone` refuses it before any
@@ -117,36 +107,16 @@ retirement, or the refine path's move to 35, is open.
 | input to `verify_standalone(proof, hash)` | trusted? | |
 |---|---|---|
 | `proof.format_version` | no | an admitted number, on its format's channel |
-| `proof.interaction_pow` | no | checked against the format's bits before any relation challenge; 0 under format 36 |
+| `proof.interaction_pow` | no | checked against the format's bits before any relation challenge |
 | `proof.stark_proof` | no | verified by Stwo, after a hostile-input preflight of every nested length |
 | `proof.claimed_sums` | no | must sum to zero; the boundary chips' must equal the sums recomputed from the boundary states |
 | `proof.log_sizes` | no | capped by `DEFAULT_MAX_LOG_SIZE` (overridable) |
 | `proof.initial_state`, `proof.final_state` | bound | registers, pc and ts bound to the committed boundary columns and to the trace; `memory_root` to the in-AIR page tree of the images; `memory_commitment` is unbound metadata |
-| `proof.pcs_config` | no | the format's exactly, but under 36, where `PcsPolicy` sets the floor; Fiat–Shamir-bound |
+| `proof.pcs_config` | no | the format's exactly; Fiat–Shamir-bound |
 | `hash`, the preprocessed root | **yes** | the class's program identity: its code, layout and permissions, at its shape. For a kernel, the install's record derives it, and the program id covers it |
 
 The preflight, the format checks, the root against `hash`, the logup sum,
 the boundary binding, then Stwo's verifier, in that order.
-
-### Refine bundles (format 36 children)
-
-`RefineProofBundle` is an ordered closure of single-program child proofs.
-Its transcript binds the outer artifact hash, the invocation's arguments
-and gas, every inner `(slot, generation, program-hash)`, each child's
-format, shape and commitments, the sparse state and page commitments, the
-host calls 9 to 14 with their registers and state hashes, and the exit.
-Production artifacts use `encode_refine_proof_bundle` /
-`decode_refine_proof_bundle`, which cap the bytes before parsing and charge
-every declared vector against an allocation budget before reserving it.
-
-`verify_refine_bundle_authenticated` needs a trusted mapping from each
-machine identity, format, shape and `PcsConfig` to its preprocessed root,
-so a proof of other code or parameters cannot be relabelled with a signed
-program hash. It returns `ReplayRequired`: it does not bind the recorded
-native state hashes or exits to the child statements, nor prove calls 9
-to 14's state changes. Only `verify_refine_bundle_replayed`, which reruns
-the committed program and regenerates each child's roots and boundary
-states, is an end-to-end refine acceptance.
 
 ## Trust boundary: a statement
 
@@ -345,8 +315,6 @@ Who performs it, and when, is open.
   salted fields.
 - [ ] **Cap the submission's length** before decoding it; key accepted
   statements on the statement id.
-- [ ] **Accept format 36 only on the legacy paths,** with a `PcsPolicy`;
-  never as a statement.
 - [ ] **Publish a segment's expected shape and boundary** where a segment
   proof is verified directly; set `max_log_size` to the honest shapes.
 - [ ] **Plan for liveness failures:** a fallback or another prover.

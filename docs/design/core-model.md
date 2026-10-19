@@ -990,8 +990,7 @@ Status today (checked in the code, not only by the review):
   about the trace, and so about private inputs.
 - **Witness-free verification:** a statement's final proof binds the
   whole run (its entry, its halt and its io-hash). The refine-bundle path
-  (format 36) is retired by the owner's decision of 2026-10-19, and
-  deleted at slice 6's 6.9.
+  (format 36) is retired, and deleted.
 - **No plain hash of private inputs leaves:** the io-hash covers the
   public arguments, the output and the roots.
 

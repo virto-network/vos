@@ -12,10 +12,11 @@ or retaining the prover's trace.
 ## Prove and verify
 
 ```rust
-use vos_pvm_proof::{program_commitment_of_proof, prove_mobile, trace_blob};
+use vos_pvm_proof::kernel::trace_program;
+use vos_pvm_proof::{program_commitment_of_proof, prove};
 
-let mut trace = trace_blob(&pvm_program, gas_limit).expect("valid PVM program");
-let proof = prove_mobile(&mut trace).expect("proof");
+let mut trace = trace_program(&pvm_program, &arguments, gas_limit).expect("a halting run");
+let proof = prove(&mut trace.side_note).expect("proof");
 let program = program_commitment_of_proof(&proof);
 
 vos_pvm_proof_verifier::verify_standalone(proof, program).expect("valid proof");

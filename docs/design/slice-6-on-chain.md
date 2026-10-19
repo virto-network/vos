@@ -1433,10 +1433,8 @@ fees are the teammate's.
      `chips!` and the compiler both read;
   2. **R5's rest:** the row view on the interaction side
      (`ComponentTrace`), and the program-memory consumer's flag sums;
-  3. **item 11,** one `record_step` for `observed_step` and
-     `TracingPvm::step`: gone with the refine-bundle path (6.9); if a
-     caller survives, unified with the tracer's checked arithmetic, a
-     behaviour change on invalid traces only, tested;
+  3. **item 11:** gone at 6.9: `observed_step` was deleted with the
+     refine-bundle path, and `TracingPvm::step` is the one step recorder;
   4. **item 14:** one `chips_of_mask` for the six mask-to-components
      selections;
   5. **item 15:** the preprocessed commit and twiddles built once
@@ -1464,7 +1462,8 @@ fees are the teammate's.
       `statement_header_words()`;
   13. **item 25:** `Blake2bRecord` as `Blake2bCall`; `P2Hash` ↔ `Digest`
       by `From`; the BLAKE2b call's register list once; the 28-bit
-      ordering decomposition once (`refine_codec`'s copies gone with 6.9);
+      ordering decomposition once (`memory.rs`, `register_memory.rs`);
+      `refine_codec`'s `encode_*` copies gone at 6.9;
   14. **item 26:** the CPU columns `Phi10/11/12/7` renamed
       `HPtr/MPtr/TLow/Flag`;
   15. **item 28's rest:** bare format numbers in tests and docs named by
@@ -1482,7 +1481,7 @@ fees are the teammate's.
       the precompiles crate's needless `blake2b` feature;
   19. **item 35:** the long functions split (`leaf::deep`, `derive::kernel`,
       `compile::program::lower`, `DeepPlan::new`, `verify_rest`;
-      `verify_refine_bundle_authenticated` gone with 6.9) and
+      `verify_refine_bundle_authenticated` gone at 6.9) and
       `Derived::derivation(elf)` for the four `Derivation::new` sites;
   20. **the two removals:** the relabel seam for the retired formats 18
       and 19 (with its test); the fuzz target `final_verifier_mutate`'s

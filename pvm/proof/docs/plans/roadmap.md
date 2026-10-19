@@ -257,11 +257,11 @@ Emulated smoke (correctness only — qemu timings are meaningless):
 
 On the device: push
 `target/aarch64-unknown-linux-gnu/release/mobile_bench` and run
-`./mobile_bench 14` (arg = log₂ steps). It traces, proves under the
-MOBILE config, verifies, and prints per-stage wall-clock plus peak RSS
-(`VmHWM`). Reference x86 point to beat (Core Ultra 7 155H,
-target-cpu=native, idle box): log14 prove ≈ 1.7 s, peak RSS 1.3 GiB —
-and note the number is badly load-sensitive (~10× under a saturated
+`./mobile_bench 14` (arg = log₂ steps). It traces, proves under format
+35, verifies, and prints per-stage wall-clock plus peak RSS (`VmHWM`).
+Reference x86 point, under the retired format 36's MOBILE config (Core
+Ultra 7 155H, target-cpu=native, idle box): log14 prove ≈ 1.7 s, peak RSS
+1.3 GiB — and note the number is badly load-sensitive (~10× under a saturated
 box), so bench on an idle, cooled phone. The glibc binary runs on
 linux-gnu userlands (Termux glibc / proot included); stock Android
 needs `--target aarch64-linux-android` with the NDK clang linker (see
