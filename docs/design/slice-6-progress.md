@@ -1263,6 +1263,131 @@ green (95 test binaries, 1,215 tests over both stages). `just judge-wasm`:
 
 **6.5 accepted.**
 
+## Step 6.7: panic-freedom by construction, and fuzzing in CI
+
+**The lints** (`vos-pvm-final-verifier`, `vos-statement`, `vos-anchor`):
+`clippy::unwrap_used`, `expect_used`, `indexing_slicing`, `panic` and
+`arithmetic_side_effects` denied outside the tests
+(`#![cfg_attr(not(test), deny(..))]` in each `lib.rs`; a probe index made
+the build fail). 54 hits fixed or allowed in place:
+- fixed: the public words through `as_chunks` and `split_first_chunk`;
+  `replay`'s trees and roots destructured (`Shape` otherwise), 28's
+  commitments likewise; FRI's rounds and layer count by `checked_sub`;
+  the queried columns by `chunks_exact`; the anchor codec's `array` by
+  `first_chunk`, `u8` by a one-byte array, the compact's width and the
+  bytes left without unchecked arithmetic, the genesis' node order by
+  `is_sorted_by`; `judge_bytes`' proof by `get`; 28's degree bound by
+  checked arithmetic;
+- allowed, each with its reason: QM31's modular addition (the logup sums,
+  39 and 28); the compact's big-integer mode (`width` at most 8 past
+  `get_mut`); `vos-statement`'s `fixtures` reader (std, the harnesses',
+  never a venue's).
+
+**The fork's verify path, audited** at the pin (`ab294189`): 29 rows in
+`SECURITY.md` (§ Panic-freedom), every index, `unwrap`, `expect`,
+`zip_eq`, `assert` and unchecked arithmetic reachable from format 39's
+`verify_masked` and 28's `verify` (`verifier.rs`, `pcs/{verifier,
+quotients,utils}.rs`, `vcs_lifted/verifier.rs`, `fri.rs`, `queries.rs`,
+`circle.rs`, `air/components.rs`, the constraint framework's point
+evaluation), each with its guard: the shape checks (27 rows guarded by
+the shape, the verifier's own values or a draw's probability: 2^-108 and
+2^-123 for two inversions) and **two with none**, the fork's fix.
+
+**The fork's fix** (`vos/verify-panics` `c3ec981` on `ab294189`, in
+`~/src/virto/stwo-s6-panics`, **not pushed**: Fable's review first):
+`complex_conjugate_line_coeffs` returns `InvalidStructure` for a sample
+point whose `y` is its own conjugate (upstream's `assert_ne!`, 2^-62 a
+draw); `denominator_inverses` for a conjugate line through the queried
+point (upstream's zero inverse); `column_line_coeffs`,
+`quotient_constants`, `accumulate_row_quotients` and `fri_answers` pass
+the error on, the prover's callers `expect` it (and vos-core's recursion
+witness, `column_line_coeffs`). A unit test each from a constructed point
+(y in CM31; `q + u·I`, `q` the queried point). DIVERGENCE-013 in the
+fork's log and `SECURITY.md`. The fork's stwo suite (`--features
+prover`, 308 tests) and its workspace clippy (all features) green.
+- **Finding, against 6.4's review:** the zero denominator is unreachable
+  for z on the circle with Im(z.y) ≠ 0, not about 2^70 hashes: it needs
+  Im(z) isotropic, and an isotropic Im(z) ≠ 0 with Re(z)·Im(z) = 0 (the
+  circle) makes |Re(z)|² = 0 against |Re(z)|² + (2+i)|Im(z)|² = 1 (the
+  proof in `denominator_inverses`' doc). The conjugate line's assert is
+  the one proof-reachable panic at the pin; both are now errors.
+
+**The temporary pin** (`dad6402d`, marked TEMPORARY LOCAL PIN): stwo and
+the constraint framework `[patch]`ed to the fork worktree's path in the
+workspace, the fuzz crate and the Wasm blob and runner; the re-pin to the
+pushed rev replaces it.
+
+**Fuzzing** (`pvm/proof/fuzz`), seven targets:
+- the plan's five are the four before (`final_verifier_bytes`,
+  `final_verifier_mutate`, its mutations now in `mutation.rs`,
+  `statement_decode`, `prove_verify_roundtrip`) and the structure-aware
+  target 6.4's review asked for, **`masked_shape`**; with
+  **`masked_bytes`** and **`anchor_decode`**:
+  - **`masked_bytes`:** format 39's layout past its pinned header, and
+    whole; one encoding, nothing accepted but a golden;
+  - **`masked_shape`:** the 39 goldens' queried parts remade within the
+    layout's bounds, the transcript-bound parts kept, so every input
+    reaches `verify_values`' Merkle checks, the DEEP answers and FRI's
+    decommitments (`shape.rs`);
+  - **`anchor_decode`:** `SpaceGenesis`, `Anchor`, `Migrate` and `Vector`
+    decoded, one encoding each; the clock's window and boundary
+    consistent;
+- `prove_verify_roundtrip`'s gas 100,000 → 2,000; its runs need
+  `target-cpu=native`, which `cargo fuzz`'s RUSTFLAGS replaced: without it
+  one proof took over 10 minutes (the 2026-10-18 `slow-unit` artifact),
+  with it about 8 s;
+- the seed writes `masked_bytes`' and `anchor_decode`'s corpora;
+- **the checked-in corpus** `fuzz/replay/<target>/` (cmin'd, at most 200
+  inputs of at most 4 KiB a target, 880 files, 266 KB), replayed by `just
+  fuzz-replay` in `check` and `ci` (`-O -s none`, native); **`just fuzz`**
+  (five minutes a target from the corpus, beside the replay set) in
+  `ci-full`; `cargo run --example paths` lists what each input reaches.
+
+**Runs** [measured, 300 s each, six at once under one 16 GiB scope, the
+machine loaded]: no crash, no panic, nothing accepted but a golden.
+
+| target | runs | cov | corpus |
+|---|---|---|---|
+| `final_verifier_bytes` | 137,463 | 5,585 | 617 |
+| `final_verifier_mutate` | 1,234 | 5,916 | 702 |
+| `statement_decode` | 97,829 | 6,018 | 542 |
+| `masked_bytes` | 39,970 | 4,213 | 163 |
+| `masked_shape` (`-len_control=0`) | 3,979 | 4,393 | 281 |
+| `anchor_decode` | 9,173,521 | 409 | 74 |
+| `prove_verify_roundtrip` (`-O -s none`, native) | 37 | 16,166 | 20 |
+
+**The paths the corpus covers** (`examples/paths`):
+- 39 by bytes: `Format` (every header word), `Decode`, `Noncanonical`,
+  `Shape` (four commitments, a tree's sampled columns, four trees of
+  sampled values); 28: `Decode`, `Format`;
+- 39 and 28 mutated: `Format`, `Noncanonical`, `Circuit`,
+  `InteractionPow`, `Logup`, the shapes (four trees or commitments, a
+  column's samples, a tree's queried columns, FRI's layers), OODS, PoW,
+  Merkle (queried-value shape, root, witness short and long), FRI (first
+  and inner layers' evaluations and commitments, the layer count), and
+  accepted (mutations that cancel);
+- 39 reshaped: `Noncanonical`, Merkle (shape, root, witness short and
+  long), FRI's first and inner layers' evaluations and commitments,
+  accepted;
+- the venue: `Statement(Short, Noncanonical)`, `Format`, `Program`,
+  `Venue`, `Space`, `Unanchored`, `Repeated`, `Proof(Decode, Format,
+  Noncanonical, Shape)`;
+- the anchor: each decoder's `Short`, `Noncanonical`, `Trailing` and a
+  decode;
+- not covered: FRI's last layer (its evaluations; its degree, held by the
+  layout), the two degenerate DEEP lines (the fork's unit tests).
+
+**Gates:** `just check` green (fmt, docs, the builds without std, both
+feature checks, `fuzz-replay` over the 880 inputs, workspace clippy, the
+tests) but for one test seen failing once under load,
+`cluster::messages::a_reply_outlives_its_leader_stopping` (`left: 0,
+right: 1` at `messages.rs:560`), which passed alone three times and in its
+whole binary (85 of 85); the stage it stopped rerun in full: 424 passed,
+0 failed. The three crates' tests green with and without `test-formats`.
+
+**Commits:** `dad6402d` the temporary local pin; `7bf98c05` the step; this record.
+The fork: `c3ec981` on `vos/verify-panics`, unpushed.
+
 ## Step 6.8: the recursion AIR's forgery gates
 
 **Built** on `s6/forgery` (from `27967322`): a new test binary,
