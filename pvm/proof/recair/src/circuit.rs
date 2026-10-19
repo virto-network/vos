@@ -1,12 +1,14 @@
 //! A circuit: the components' wiring, which the preprocessed columns hold,
 //! and its static check (`vos_pvm_recair_air::gate`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use stwo::core::fields::m31::{BaseField, P};
 use vos_pvm_recair_air::gate::Layout;
 use vos_pvm_recair_air::p2::P2Mode;
+
+use crate::value::{Value, embed};
 
 /// An operand's entry in the `Gate` relation. A multiplicity of zero leaves
 /// the relation untouched, whatever the address.
@@ -49,6 +51,35 @@ pub struct Qm31Op {
     pub k_b: BaseField,
     pub k_c: BaseField,
     pub lanes: [BaseField; 4],
+}
+
+impl Qm31Op {
+    /// The gate's output over `a`, `b` and `c`.
+    pub fn apply<V: Value>(&self, a: V, b: V, c: V) -> V {
+        let k = |k: BaseField| V::from_qm31(embed(k));
+        k(self.k_m) * a * b
+            + k(self.k_p) * a.pointwise_mul(b)
+            + k(self.k_a) * a
+            + k(self.k_b) * b
+            + k(self.k_c) * c
+            + c.lane_sum(self.lanes)
+    }
+
+    /// The lanes the gate reads of operand `i` (`a`, `b`, `c`): every lane
+    /// under a product or the operand's own coefficient, lane `j` of `c`
+    /// under `λ_j`.
+    pub fn reads(&self, i: usize) -> [bool; 4] {
+        let zero = BaseField::from(0);
+        let product = i < 2 && (self.k_m != zero || self.k_p != zero);
+        let own = [self.k_a, self.k_b, self.k_c][i] != zero;
+        if product || own {
+            [true; 4]
+        } else if i == 2 {
+            self.lanes.map(|lane| lane != zero)
+        } else {
+            [false; 4]
+        }
+    }
 }
 
 /// A `qm31` row's wiring.
@@ -97,6 +128,16 @@ pub enum WiringError {
     Unbalanced { address: u32, total: i64 },
     /// The absolute multiplicities sum to `p` or more.
     TotalMultiplicity(u128),
+    /// A `qm31` row reads an operand that is no wire (address 0,
+    /// multiplicity 0): a value no other operand sees, injected into the
+    /// gate.
+    FreeOperandRead { row: usize, operand: usize },
+    /// A `p2` row other than a node absorbs a lane of a message that is no
+    /// wire: only a Merkle sibling is free.
+    FreeMessageAbsorbed { row: usize },
+    /// An operand reads a lane of a wire that every `p2` row absorbing it
+    /// leaves unread and no gate computes: a lane the prover chooses.
+    UnreadLaneRead { address: u32, lane: usize },
 }
 
 impl fmt::Display for WiringError {
@@ -119,6 +160,18 @@ impl fmt::Display for WiringError {
                 write!(
                     f,
                     "the multiplicities' absolute values sum to {total}, not below p"
+                )
+            }
+            Self::FreeOperandRead { row, operand } => {
+                write!(f, "qm31 row {row} reads its free operand {operand}")
+            }
+            Self::FreeMessageAbsorbed { row } => {
+                write!(f, "p2 row {row} absorbs a free message outside a node")
+            }
+            Self::UnreadLaneRead { address, lane } => {
+                write!(
+                    f,
+                    "lane {lane} of address {address} is read, which no row absorbs and no gate computes"
                 )
             }
         }
@@ -189,8 +242,167 @@ impl Circuit {
     /// two of at least [`MIN_ROWS`] rows, no chained first row, every address
     /// below `p`, every used address yielded exactly once with the
     /// multiplicity of its uses, and the absolute multiplicities' sum below
-    /// `p`.
+    /// `p`; and every read bound ([`Circuit::check_reads`]).
     pub fn check_wiring(&self) -> Result<WiringStats, WiringError> {
+        let stats = self.check_relation()?;
+        self.check_reads()?;
+        Ok(stats)
+    }
+
+    /// Every value a gate reads is a wire's, or a lane some row absorbs:
+    /// - no `qm31` row reads an operand that is no wire (multiplicity 0, at
+    ///   address 0 or at an address another entry holds), under a
+    ///   coefficient or a lane;
+    /// - no `p2` row but a node (whose free message is a Merkle sibling)
+    ///   absorbs a lane of a message that is no wire;
+    /// - no operand reads a lane of a wire that every `p2` row absorbing it
+    ///   leaves unread and that no gate computes: such a lane is the
+    ///   prover's, held at no value by the relation or a constraint.
+    ///
+    /// A wire some gate yields with no use (multiplicity 0 at its own
+    /// address) is a guess read once, and stays admitted.
+    pub fn check_reads(&self) -> Result<(), WiringError> {
+        // A read with no multiplicity is a guess read once only at an
+        // address no wire holds; at a wire's (the free slots' address 0
+        // among them, the zero wire's), it is a value the relation does not
+        // tie to that wire. Entries with no multiplicity hold no address: a
+        // `p2` row whose output no gate uses states address 0 and 1.
+        let wires: HashSet<u32> = self
+            .entries()
+            .filter(|entry| entry.multiplicity != 0)
+            .map(|entry| entry.address)
+            .collect();
+        let free = |entry: &Entry| {
+            entry.multiplicity == 0 && (entry.address == 0 || wires.contains(&entry.address))
+        };
+        for (row, wiring) in self.qm31.iter().enumerate() {
+            for (operand, entry) in wiring.operands[..3].iter().enumerate() {
+                if free(entry) && wiring.op.reads(operand).contains(&true) {
+                    return Err(WiringError::FreeOperandRead { row, operand });
+                }
+            }
+        }
+        for (row, wiring) in self.p2.iter().enumerate() {
+            let node = wiring.mode == Some(P2Mode::Node);
+            let absorbs_free = (0..2).any(|w| {
+                free(&wiring.m[w]) && (0..4).any(|j| wiring.act[4 * w + j] != BaseField::from(0))
+            });
+            if wiring.mode.is_some() && !node && absorbs_free {
+                return Err(WiringError::FreeMessageAbsorbed { row });
+            }
+        }
+        if let Some((address, lane)) = self.unread_lane_reads().first() {
+            return Err(WiringError::UnreadLaneRead {
+                address: *address,
+                lane: *lane,
+            });
+        }
+        Ok(())
+    }
+
+    /// Each read of a lane of a wire that every `p2` row absorbing it leaves
+    /// unread, the wire computed by no gate: its address and lane.
+    ///
+    /// A lane is absorbed by a message slot whose `act` reads it, or by a
+    /// node row, which reads its whole message. A wire is computed when some
+    /// gate's output is at its address, a yield or a use. Readers: a `qm31`
+    /// operand ([`Qm31Op::reads`]); an `h8` input, whole; a node's bit, its
+    /// lane 0; a public use, whole.
+    pub fn unread_lane_reads(&self) -> Vec<(u32, usize)> {
+        let mut absorbed: HashMap<u32, [bool; 4]> = HashMap::new();
+        let mut partial: HashSet<u32> = HashSet::new();
+        let mut computed: HashSet<u32> = HashSet::new();
+        for wiring in &self.p2 {
+            for w in 0..2 {
+                let entry = wiring.m[w];
+                if entry.multiplicity == 0 {
+                    continue;
+                }
+                let lanes: [bool; 4] = core::array::from_fn(|j| {
+                    wiring.mode == Some(P2Mode::Node) || wiring.act[4 * w + j] != BaseField::from(0)
+                });
+                let all = absorbed.entry(entry.address).or_default();
+                for (all, lane) in all.iter_mut().zip(lanes) {
+                    *all |= lane;
+                }
+                if lanes.contains(&false) {
+                    partial.insert(entry.address);
+                }
+            }
+            for w in 0..2 {
+                if wiring.out_multiplicity[w] != 0 {
+                    computed.insert(wiring.out_address.wrapping_add(w as u32));
+                }
+            }
+        }
+        computed.extend(
+            self.qm31
+                .iter()
+                .map(|wiring| wiring.operands[3])
+                .chain(self.h8.iter().map(|wiring| wiring.out))
+                .filter(|entry| entry.multiplicity != 0)
+                .map(|entry| entry.address),
+        );
+        if partial.iter().all(|address| computed.contains(address)) {
+            return Vec::new();
+        }
+
+        let mut reads = Vec::new();
+        let mut read = |entry: Entry, lanes: [bool; 4]| {
+            if entry.multiplicity == 0
+                || !partial.contains(&entry.address)
+                || computed.contains(&entry.address)
+            {
+                return;
+            }
+            let all = absorbed[&entry.address];
+            reads.extend(
+                (0..4)
+                    .filter(|&j| lanes[j] && !all[j])
+                    .map(|j| (entry.address, j)),
+            );
+        };
+        for wiring in &self.qm31 {
+            for (i, &entry) in wiring.operands[..3].iter().enumerate() {
+                read(entry, wiring.op.reads(i));
+            }
+        }
+        for wiring in &self.h8 {
+            for &address in &wiring.inputs {
+                read(
+                    Entry {
+                        address,
+                        multiplicity: 1,
+                    },
+                    [true; 4],
+                );
+            }
+        }
+        for wiring in &self.p2 {
+            if wiring.mode == Some(P2Mode::Node) {
+                let bit = Entry {
+                    address: wiring.bit_address,
+                    multiplicity: 1,
+                };
+                read(bit, [true, false, false, false]);
+            }
+        }
+        let layout = self.layout;
+        for address in (0..layout.n_outputs)
+            .map(|i| layout.output(i))
+            .chain([layout.u()])
+        {
+            let public = Entry {
+                address,
+                multiplicity: 1,
+            };
+            read(public, [true; 4]);
+        }
+        reads
+    }
+
+    /// The relation's part of [`Circuit::check_wiring`].
+    fn check_relation(&self) -> Result<WiringStats, WiringError> {
         for (component, rows) in [
             ("p2", self.p2.len()),
             ("qm31", self.qm31.len()),

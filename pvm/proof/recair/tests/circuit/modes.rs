@@ -47,9 +47,10 @@ fn modes_circuit() -> Finalized<SecureField> {
             .map(|wire| context.guess(wire))
             .collect();
         let leaf = leaf_hash(&mut context, &wires, n);
-        // The leaf yields its wires; another gate reads the last.
+        // The leaf yields its wires; another gate reads the last's first
+        // lane, which the leaf absorbs.
         if let Some(&last) = wires.last() {
-            context.add(last, last);
+            context.limb(last, 0);
         }
         let mut sponge = LeafSponge::default();
         sponge.absorb(words(&values));

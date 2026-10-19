@@ -26,6 +26,12 @@
 //! 2. the sum of the absolute multiplicities, the public uses among them, is
 //!    below `p`.
 //!
+//! It also refuses a read of what is no wire's value: an operand that is
+//! free (address and multiplicity 0) under a coefficient, a free message
+//! absorbed outside a node row, and a lane of a wire that every row
+//! absorbing it leaves unread and no gate computes. The relation cannot see
+//! those reads; the check makes every read of a committed circuit bound.
+//!
 //! # Why it is sound
 //!
 //! Fix the circuit, so its addresses and multiplicities, and let the prover

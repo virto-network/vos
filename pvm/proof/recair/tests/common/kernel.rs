@@ -44,3 +44,21 @@ pub fn entry(blob: &[u8]) -> State {
         memory_root: program.image_root().expect("an image root"),
     }
 }
+
+/// The kernel's whole run proved as one segment under format 35, once a
+/// test binary.
+pub fn whole_run() -> &'static vos_pvm_proof::Proof {
+    static WHOLE: std::sync::OnceLock<vos_pvm_proof::Proof> = std::sync::OnceLock::new();
+    WHOLE.get_or_init(|| {
+        let blob = blob();
+        let trace = vos_pvm_proof::kernel::trace_kernel(&blob, &[], 1_000).expect("halts");
+        let steps = trace.side_note.steps.len();
+        let mut cursor = vos_pvm_proof::segment::SegmentCursor::new(&trace.side_note);
+        vos_pvm_proof::prove_canonical_format(
+            &mut cursor.side_note(0, steps),
+            &[],
+            &vos_pvm_proof::format::SEGMENT,
+        )
+        .expect("proves")
+    })
+}

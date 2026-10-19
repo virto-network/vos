@@ -233,7 +233,7 @@ fn small_circuit() -> vos_pvm_recair::Context<SecureField> {
     }
     let mut transcript = TranscriptGadget::new(&context);
     for i in 0..4 {
-        let leaf = leaf_hash(&mut context, &wires[i..i + 3], 10);
+        let leaf = leaf_hash(&mut context, &wires[i..i + 3], 12);
         let bit = context.guess(SecureField::from(stwo::core::fields::m31::BaseField::from(
             i as u32 % 2,
         )));

@@ -51,10 +51,11 @@ use crate::leaf::{NodeOutput, PADDED_ROWS, PREIMAGE_WORDS, preimage};
 use crate::prove::{RecairProof, circuit_hash_of};
 use crate::value::Value;
 use crate::verifier::WitnessError;
-use crate::verifier::bits::linear;
 use crate::verifier::witness::{digest_wires, pack};
 
 use child::{ChildShape, ChildValues, circuit_hash, verify_child};
+
+pub use crate::gadgets::assert_one_of;
 
 /// The program id's preimage's wires.
 pub const PROGRAM_WIRES: usize = ID_WORDS / 4;
@@ -155,28 +156,6 @@ pub(crate) fn leaf_circuit_wires(program: &[Var]) -> impl Iterator<Item = [Var; 
         let wire = FIRST_HASH_WIRE + 2 * k;
         [program[wire], program[wire + 1]]
     })
-}
-
-/// `Σ bits = 1` and, for each bit, `bit·(hash − candidate) = 0`: `hash` is
-/// the candidate the one set bit picks.
-pub(crate) fn assert_one_of<V: Value>(
-    context: &mut Context<V>,
-    hash: [Var; 2],
-    candidates: &[[Var; 2]],
-    bits: &[Bit],
-) {
-    assert_eq!(bits.len(), candidates.len(), "a bit a candidate");
-    let terms: Vec<(BaseField, Var)> = bits
-        .iter()
-        .map(|bit| (BaseField::one(), bit.var()))
-        .collect();
-    let one = context.one();
-    linear(context, &terms, Some(one));
-    for (&bit, candidate) in bits.iter().zip(candidates) {
-        for (&wire, &candidate) in hash.iter().zip(candidate) {
-            context.assert_eq_if(bit, wire, candidate);
-        }
-    }
 }
 
 /// A constant wire of four M31 lanes.
