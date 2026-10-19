@@ -1359,6 +1359,80 @@ the merge with 6.7: green, 1,228 passed.
 
 **6.6 accepted.**
 
+## Step 6.6b: the final verifier's Wasm count, headroom
+
+6.6 put the masked verify at 49.6M Wasm instructions at the worst shape
+against the 50M gate, the host allocator's malloc/free calls about 22% of
+it. 6.7's checks moved it to 49.78M. Stwo unchanged.
+
+**Where the allocations were** [measured: a native build of the verifier
+under a counting allocator with a backtrace a call, seed 9; its count
+equals the blob's host calls within 1%]: 10,715 a decode and verify:
+- decode 1,015: 988 column vectors (482 sampled columns with samples, 506
+  queried columns), the rest the trees', witnesses' and layers' vectors,
+  all of them `CommitmentSchemeProof`'s fields, by value;
+- **the component set laid out twice**, 2,104 + 2,100: `verify_with`'s
+  layout (dummy relations, for the shape before the transcript) and
+  `replay`'s set under the drawn relations, each three
+  `FrameworkComponent::new`s whose `InfoEvaluator` runs every body;
+- **the sample points made twice**, 537 + 537: at zero for the shape, at
+  `z` for `verify_values`;
+- the composition at `z` 574 (the constraint framework's
+  `PointEvaluator`); Stwo's `verify_values` 3,656.
+
+**Built:**
+- `MaskedComponents::bind` (`vos-pvm-recair-air`): the set laid out once,
+  evaluated under the drawn relations and the proof's claimed sums by
+  `Rebound` components, each the layout's `FrameworkComponent` for its
+  columns, masks and preprocessed columns and another evaluation of the
+  same body for its constraints, `FrameworkComponent`'s evaluation at a
+  point over the layout's columns. A layout depends on no relation or
+  claimed sum. `replay` binds `layout` instead of building `C::new`.
+- `sample_points_from_zero`: the points at `z` from those at zero in place,
+  each point at zero its mask's offset from the identity, so `z` (and
+  `π(z)` for the composition's coordinates) added to it gives
+  `sample_points(set, z)` exactly. `replay` makes the points once; the
+  second `samples_fit` (the same lengths) is gone.
+- Tests: the points from zero equal `sample_points` at two points; the
+  bound layout's composition at a point equals the set built under the
+  same relations and claimed sums (and differs from the unbound
+  layout's), its metadata the built set's.
+- `SECURITY.md` row 5: format 39's evaluation is `Rebound`, the same code
+  over the layout's columns, the same guard.
+
+**Measured** [measured; the 12 gate proofs of 6.6 (seeds 1,000–1,011),
+before at `2276ed9a` and after, the same machine]:
+
+| | before | after |
+|---|---|---|
+| host allocations a verify (Wasm) | 10,646–10,658 | 7,962–7,974 |
+| Wasm, PVF, max over seeds | 48,117,322 | 44,778,408 |
+| **Wasm at the worst shape** (2,768 hashes, the seeds' fit) | **49,776,401** | **46,433,907** |
+| JAM decode max (worst) | 1,814,035 (1.83M) | 1,814,057 (1.83M) |
+| JAM verify max (worst) | 89,645,290 (92.71M) | 82,753,115 (85.84M) |
+| JAM guest allocations | 10,641–10,653 | 7,957–7,969 |
+| production program (ELF) | 481,761 B (795,288) | 485,237 B (807,832) |
+
+The Wasm runner pinned to the performance cores at x86-64-v3; the seeds'
+counts repeat. 7.1% under the gate at the worst shape (target ≤ 47.5M).
+
+**What remains** (seed 9, 7,976 native): Stwo's `verify_values` 3,656; the
+one layout 2,126 (the constraint framework's `InfoEvaluator`, an
+`ArithmeticCounter` allocation an operation, and the preprocessed ids);
+decode 1,006 (988 the columns `CommitmentSchemeProof` takes by value); the
+composition at `z` 579 (`PointEvaluator`'s masks, `sub_tree`); the sample
+points 557 (482 the columns `verify_values` takes by value); ours about 50.
+A further cut is the fork's: the layout's `InfoEvaluator` (about 2,100,
+about 2.1M instructions) or `verify_values`' own vectors.
+
+**Gates** [measured]: `just check` green, 1,247 passed, 0 failed (the
+fuzz corpus replayed among it); `just judge-wasm`: 31 of 31 fixtures as
+recorded by each blob under each semantics, valid 44,276,308 instructions
+under the PVF's (47,616,003 at 6.7), the three anchor vectors as pinned.
+The fixtures unchanged.
+
+**Commit:** `d3a7beeb`.
+
 ## Step 6.7: panic-freedom by construction, and fuzzing in CI
 
 **The lints** (`vos-pvm-final-verifier`, `vos-statement`, `vos-anchor`):
