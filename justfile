@@ -218,6 +218,56 @@ check-no-std:
     cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --quiet -- -D warnings
     cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --features test-formats --target-dir target/test-formats --quiet -- -D warnings
 
+# The verifier kit (`pvm/proof/kit/vos_kit.py`), which a chain's runtime
+# vendors (Kreivo's `vendor/vos-verifier/`, `spaces-pallet.md` §3), written
+# into `dir`: `vos-anchor`, `vos-statement`, `vos-pvm-final-verifier`,
+# `vos-pvm-recair-air` and `vos-pvm-poseidon2` with concrete manifests (Stwo
+# a git dependency at the pin, without default features; `test-formats`
+# and `pvm-guest` left in VOS), the golden fixtures, the conformance
+# vectors and a `VENDOR` file naming the commit (and the tag) and the
+# tree's hash. From the working tree, or from `rev`, a tag or a commit: a
+# release vendors from a tag.
+vendor-verifier dir rev="":
+    if "{{rev}}" == "" { python3 -I pvm/proof/kit/vos_kit.py vendor {{dir}} } else { python3 -I pvm/proof/kit/vos_kit.py vendor {{dir}} --rev {{rev}} }
+
+# A vendored kit checked against the commit its `VENDOR` names: the tree's
+# hash, then the kit vendored anew from that commit by its own script, the
+# fixtures and the conformance vectors with it, every file compared; here
+# against this checkout, a kit vendored at a commit accepted. A consumer
+# runs `pvm/proof/kit/vos-sync.sh`, copied outside its kit, which pins VOS's
+# repository and runs the tag's script, never the kit's own:
+# `scripts/vos-sync.sh vendor/vos-verifier` (`spaces-pallet.md` §3.1).
+vos-sync dir:
+    python3 -I pvm/proof/kit/vos_kit.py sync {{dir}} --vos . --allow-untagged --scratch target/kit/scratch
+
+# The kit as Kreivo builds it: vendored from the working tree into a
+# workspace of its own, built alone and `--locked` (on the kit's lockfile,
+# `pvm/proof/kit/Cargo.lock`) for `wasm32v1-none` on Kreivo's stable
+# toolchain (1.94.1, the target installed as Kreivo's CI installs it), no
+# `std` feature enabled in any crate it links; `vos-statement`'s `fixtures`
+# reader built for the host; and the sync check's own test
+# (`pvm/proof/kit/check.py`): a one-byte change in a vendored file refused,
+# the kit's own script never trusted, `VENDOR`'s tag required and checked.
+check-kit: _kit-workspace
+    cd target/kit/build; cargo +1.94.1 build --workspace --target wasm32v1-none --locked --quiet
+    cd target/kit/build; let std = (cargo +1.94.1 tree --workspace -e normal --target wasm32v1-none -f '{p}|{f}' --prefix none --locked | lines | where {|line| $line | split row '|' | last | split row ',' | any {|feature| $feature == 'std' } } | uniq); if ($std | is-not-empty) { error make { msg: $"std reaches the kit: ($std | str join ', ')" } } else { print "no std feature in the kit's wasm32v1-none build" }
+    cd target/kit/build; cargo +1.94.1 build -p vos-statement --features fixtures --locked --quiet
+    python3 -I pvm/proof/kit/check.py --scratch target/kit/sync
+
+# The kit's lockfile, after its crates' dependencies change: VOS's own
+# lockfile, pruned to what the kit links.
+kit-lock: _kit-workspace
+    cp Cargo.lock target/kit/build/Cargo.lock
+    cd target/kit/build; cargo +1.94.1 build --workspace --target wasm32v1-none --quiet
+    cp target/kit/build/Cargo.lock pvm/proof/kit/Cargo.lock
+
+_kit-workspace:
+    if not ((do { rustup target list --installed --toolchain 1.94.1 } | complete).stdout | lines | any {|target| $target == 'wasm32v1-none' }) { rustup toolchain install 1.94.1 --profile minimal --target wasm32v1-none --no-self-update }
+    rm -rf target/kit/build
+    python3 -I pvm/proof/kit/vos_kit.py vendor target/kit/build/vendor/vos-verifier
+    {workspace: {resolver: "3", members: (glob target/kit/build/vendor/vos-verifier/*/Cargo.toml | each {|manifest| $manifest | path dirname | path relative-to ($env.PWD | path join target/kit/build) } | sort)}} | to toml | save -f target/kit/build/Cargo.toml
+    cp pvm/proof/kit/Cargo.lock target/kit/build/Cargo.lock
+
 # The fuzz targets (`pvm/proof/fuzz`, built apart with `cargo fuzz`): the
 # final verifier on arbitrary bytes, on the golden wraps mutated, on format
 # 39's layout past its header and on its queried parts reshaped within the
@@ -246,18 +296,18 @@ fuzz:
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the
-# builds without std, the workspace's lints, and the suites of the node, the agent, vos-raft and the crates under them.
+# builds without std, the verifier kit, the workspace's lints, and the suites of the node, the agent, vos-raft and the crates under them.
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats build-test-actors build-agent build-representative fuzz-replay
+check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-kit build-test-actors build-agent build-representative fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-recair -p vos-pvm-final-verifier -p vos-anchor -p vos-statement --features vos-anchor/vectors,vos-statement/fixtures
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-venue -p vos-net -p vos-cli
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
-ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats fuzz-replay
+ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats check-kit fuzz-replay
 
 # The gate before merging: `ci` plus the prover suites, the soundness gates,
 # the bench tests that prove and the fuzz targets' runs. Run it under a

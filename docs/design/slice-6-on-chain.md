@@ -402,7 +402,7 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | `VenueId` | Kreivo: its genesis hash; JAM: `BLAKE2b-256("vos/venue/jam" ‖ JAM genesis hash ‖ service id (4, LE))` |
 | anchor digest | `BLAKE2b-256("vos/anchor/v1" ‖ venue ‖ space ‖ w (8, LE) ‖ kind (1) ‖ root)`, ed25519 by a registered anchor key |
 | registration | a founding key's ed25519 signature over `BLAKE2b-256("vos/space/register" ‖ venue ‖ space ‖ controller (32) ‖ start_window (8, LE))`; the venue takes the genesis itself and computes the id, so it learns the clock and the founding keys from the hash. The first window the space anchors at the venue is signed, so nobody who sees a registration can resubmit it with a start that keeps the space from ever anchoring; the venue also bounds it, `now_w − MaxRootAge / length_ms ≤ start_window ≤ now_w + 1` by its own time |
-| controller | an `AccountId` (32 bytes) at each venue: a person, a multisig, a pass account or a community account; it rotates the authorities and anchor keys and migrates the space |
+| controller | an `AccountId` (32 bytes) at each venue: a person, a multisig, a pass account or a community account; it rotates the authorities and anchor keys and migrates the space. Anchor-key rotation is not yet supported on VOS's side: a node signs anchors with its node key, and only founding nodes replicate the representative (6.14), so a key the controller adds is used by no node until 6.14b |
 | sovereign account | on Kreivo, `PalletId(*b"kv/space").into_sub_account_truncating(space)` (`b"modl" ‖ b"kv/space" ‖ space[0..20]`): derivable from the genesis before registration, so the founder funds it first; it holds the registration deposit and pays every fee and `submit` deposit of the space's authorities, within a spend budget per window that the controller sets and the venue enforces before inclusion, so a compromised node key cannot drain it (`spaces-pallet.md` §7) |
 | authorities | on Kreivo, a map `(space, account) → anchor key`: each node's own sr25519 account, paired with its ed25519 anchor key, set by the controller; an authority signs `anchor` and `submit`, and the sovereign account pays (`spaces-pallet.md` §7). On JAM, the registered anchor keys alone |
 | migration | `Migrate`, by the controller at each venue; each venue refuses anchors outside its range |
@@ -412,8 +412,11 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 key; the signature; `Last < w < now_w` (gaps allowed; the open window,
 `now_w` itself, cannot be anchored), `now − B_w ≤ MaxRootAge`, w within the
 venue's range. A second root for one `(space, kind, w)` is
-stored as evidence and suspends the space until the controller rotates its
-keys; anyone may submit the second signed anchor.
+stored as evidence and suspends the space until the controller removes
+both signing keys (`resume`); anyone may submit the second signed anchor.
+Until 6.14b no other key can anchor: a space whose equivocating keys are
+all its founding keys (always so with a single founder) recovers only by
+migrating to a new genesis, another space.
 
 **What an anchor gives:** ordering and non-equivocation, not integrity: a
 space can anchor any root of its own making. So every value-moving handler
@@ -1293,6 +1296,41 @@ lands.
   inherits.
 - **Dep:** 6.13, 6.14; decision 6. **Estimate:** 1–2 weeks.
 
+### 6.14b A rotatable anchor key (F)
+
+6.14 signs anchors with the representative's leader's node key (its
+PeerId key, which cannot rotate) and keeps the representative's replicas
+to founding nodes, so a venue's anchor-key rotation (`spaces-pallet.md`
+`add_authority`, `remove_anchor_key`, `resume`) reaches no node, and a
+single-founder space that equivocates is dead at its venue.
+- **Files:** the node's key store (`node/host`: an anchor key beside the
+  node key); `node/host/src/leader/close.rs` (the signer);
+  `agent/representative` and the node's replica rule; `vos-venue`
+  (`VenueClient::anchor_keys(space)`, `ModelVenue`'s keys by space, added
+  and removed); `node/cli` (`vos node anchor-key rotate`).
+- **Design:**
+  - a separate ed25519 anchor key per node in its key store; a founding
+    node's first anchor key is the key its genesis names, so existing
+    spaces anchor as before;
+  - the leader signs with the key the venue lists for it: it reads the
+    space's registered anchor keys (Kreivo's `AnchorKeys`, the model's
+    set) and signs with its own key among them, refusing to sign
+    otherwise (an alert, never a guess);
+  - any node holding a registered anchor key may replicate the
+    representative, not founding nodes alone;
+  - `vos node anchor-key rotate` makes a new key and prints it, for the
+    controller's `add_authority(space, who, Some(key))`; the node signs
+    with the new key once the venue lists it, and the controller then
+    removes the old one.
+- **Tests:** a rotation end to end on the model venue (anchors before,
+  during and after, no window missed); an equivocation in a
+  single-founder space resumed after the rotation; a leader whose key the
+  venue does not list refuses to sign; a non-founding node with a
+  registered key replicating the representative and anchoring after a
+  failover; the key store's crash between the rotation and the venue's
+  listing.
+- **Dep:** 6.14; `spaces-pallet.md` §6. **Estimate:** 1–1.5 weeks.
+
 ### M3a acceptance
 
 - **Gates:** `ci-full`, `test-proof`, the checker loop with cuts and the
@@ -1324,7 +1362,11 @@ fees are the teammate's.
 - **The sync check:** `just vos-sync <dir>` recomputes the vendored
   tree's hash against the tag `VENDOR` names, and regenerates the
   conformance vectors and the golden fixtures from that tag, refusing any
-  difference. It runs in a Kreivo checkout as in vos-core.
+  difference. It runs in a Kreivo checkout as in vos-core. Built as
+  `pvm/proof/kit/vos_kit.py` (Python 3.11 and git, nothing of Rust),
+  which the kit carries: the sync vendors the kit anew from the commit
+  `VENDOR` names, by that commit's own script, the fixtures and vectors as
+  committed there, and compares every file (`spaces-pallet.md` §3.1).
 - **Tests:** a `just check` test builds the vendored tree alone for
   `wasm32v1-none` on stable (Kreivo's toolchain, 1.94.1) and refuses a
   `std` feature reaching it; the sync check refuses a one-byte change in a
@@ -1351,8 +1393,9 @@ fees are the teammate's.
   (`parity-scale-codec` as a std, test-only dependency, outside the
   vendored tree).
 - **The vectors:** `conformance/spaces.json`, G1–G18 (`spaces-pallet.md`
-  §10), generated by running each scenario through the mock over our
-  fixtures: the format-39 fixture (G6), one mutant per refusal class
+  §10), committed in VOS and named in `vos_kit.py`'s `CONFORMANCE`, so the
+  kit carries them and the sync check holds them to the tag's; generated
+  by running each scenario through the mock over our fixtures: the format-39 fixture (G6), one mutant per refusal class
   (G7), the repeat (G8), the rootless and rooted replays past
   `MaxRootAge` (G9), the budget (G13), and every call G1–G12 left
   uncovered (G14–G18: `migrate`, the controller and keys, `set_status`,
@@ -1791,11 +1834,11 @@ fees are the teammate's.
 | M2 line (6.1–6.6) | 5–7.5 |
 | M2 beside the line (6.7–6.9) | 3–5 |
 | M2 acceptance | 0.5 |
-| M3a (6.10–6.15 and acceptance) | 8.5–13.5 |
+| M3a (6.10–6.15, 6.14b and acceptance) | 9.5–15 |
 | M3b (6.16, 6.17, 6.17b and acceptance) | 4–5.5 |
 | M3c (6.18–6.21) | 6–9.5 |
 | acceptance, reviews and the slice-5 rest (6.22) | 3.5–5 |
-| **slice 6, engineer-weeks** | **32–48.5** |
+| **slice 6, engineer-weeks** | **33–50** |
 
 - **The critical path:** 6.0a → 6.10 → 6.11 → 6.12 → 6.13 → 6.14 → 6.15 →
   6.18 → 6.20 → 6.21 → 6.22, about **16–26 weeks** of calendar with three
@@ -1849,7 +1892,8 @@ fees are the teammate's.
 6. **History:** no tree history past a cut (W1), and spans by a carried
    per-pair commitment at the venue (S3); `RootKind { Space }` only.
 7. **The space root:** the representative agent; anchors signed by one
-   registered node key; the controller rotates the keys (6.14).
+   registered node key; the controller rotates the keys (6.14; the
+   node's side of rotation, 6.14b).
 8. **F2:** migration ranges for rooted statements, and a per-program
    `venue_bound` flag checked on `public_args[0..32]`; no `vos/io/v2`.
 9. **Kreivo's dependency path:** the verifier stack vendored into Kreivo

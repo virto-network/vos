@@ -58,7 +58,7 @@ lsm-tree = { git = "https://github.com/olanod/lsm-tree", rev = "d0791931a96ff2be
 version = "0.1.0"
 edition = "2024"
 license = "AGPL-3.0-or-later"
-repository = "https://github.com/virto-network/vos"
+repository = "https://codeberg.org/Virto/VOS"
 homepage = "https://github.com/virto-network/vos"
 authors = ["Daniel Olano <daniel@olanod.com>"]
 readme = "README.md"
