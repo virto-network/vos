@@ -96,6 +96,10 @@ codes! {
         /// on one host, and every instance installed into it takes its
         /// target ([`super::cap::Target`]).
         Target = 13,
+        /// An install named another space, or another clock, than its
+        /// agent's: an agent belongs to one space, whose clock is frozen in
+        /// its genesis.
+        Space = 14,
     }
 }
 

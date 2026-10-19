@@ -8,7 +8,7 @@ use vos_wire::batch::Admin;
 use vos_wire::records::{Derivation, Installed};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::Schema;
-use vos_wire::{Decode, Encode, keys};
+use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
 
 use super::base::{Base, Corrupt, Source};
 use super::inputs::consumed;
@@ -27,24 +27,44 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
             derivation,
             roles,
             target,
+            space,
+            clock,
         } => {
             let reply = derivation.encode();
-            let Ok(agent) = agent_target(base) else {
+            let Ok(agent) = agent_record(base) else {
                 return failed(Outcome::failed(Failure::Trapped));
             };
-            let installed = match install(agent, host_target(base), derivation, roles, target) {
-                Ok(installed) => installed,
-                Err(outcome) => return failed(outcome),
-            };
+            if let Some(refused) = agent.and_then(|agent| other_space(agent, space, clock)) {
+                return failed(Outcome::Failed {
+                    code: refused.failure(),
+                    detail: refused.encode(),
+                });
+            }
+            let agent_target = agent.map(|agent| agent.target);
+            let installed =
+                match install(agent_target, host_target(base), derivation, roles, target) {
+                    Ok(installed) => installed,
+                    Err(outcome) => return failed(outcome),
+                };
             let mut writes = alloc::vec![Write {
                 key: keys::installed(instance),
                 value: Some(installed.encode()),
             }];
             if agent.is_none() {
-                writes.push(Write {
-                    key: keys::target(),
-                    value: Some(target.encode()),
-                });
+                writes.extend([
+                    Write {
+                        key: keys::target(),
+                        value: Some(target.encode()),
+                    },
+                    Write {
+                        key: keys::space(),
+                        value: Some(space.encode()),
+                    },
+                    Write {
+                        key: keys::clock(),
+                        value: Some(clock.encode()),
+                    },
+                ]);
             }
             (writes, reply)
         }
@@ -68,12 +88,46 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
     Step::Ran(run)
 }
 
-/// The agent's target, which its first install recorded; none before it.
-fn agent_target(base: &Base) -> Result<Option<Target>, Corrupt> {
-    base.read(&keys::target())?
-        .map(|bytes| Target::decode(&bytes).map(|(target, _)| target))
-        .transpose()
-        .map_err(|_| Corrupt)
+/// What an agent's first install recorded: its target, its space and its
+/// space's clock.
+#[derive(Clone, Copy)]
+struct AgentRecord {
+    target: Target,
+    space: SpaceId,
+    clock: WindowClock,
+}
+
+/// The agent's record, none before its first install: all three rows, or
+/// none of them.
+fn agent_record(base: &Base) -> Result<Option<AgentRecord>, Corrupt> {
+    fn row<T: Decode>(base: &Base, key: &[u8]) -> Result<Option<T>, Corrupt> {
+        base.read(key)?
+            .map(|bytes| T::decode_exact(&bytes).ok_or(Corrupt))
+            .transpose()
+    }
+    match (
+        row(base, &keys::target())?,
+        row(base, &keys::space())?,
+        row(base, &keys::clock())?,
+    ) {
+        (Some(target), Some(space), Some(clock)) => Ok(Some(AgentRecord {
+            target,
+            space,
+            clock,
+        })),
+        (None, None, None) => Ok(None),
+        _ => Err(Corrupt),
+    }
+}
+
+/// The refusal of an install naming `space` and `clock` into `agent`, when
+/// either is not the agent's: an agent belongs to one space, whose clock is
+/// frozen.
+fn other_space(agent: AgentRecord, space: SpaceId, clock: WindowClock) -> Option<Refused> {
+    (agent.space != space || agent.clock != clock).then_some(Refused::Space {
+        space: agent.space,
+        clock: agent.clock,
+    })
 }
 
 /// The target the host running the refine serves, if it serves one alone:

@@ -33,6 +33,8 @@ fn a_kernels_argument_window_is_unmapped() {
         mut derivation,
         roles,
         target,
+        space,
+        clock,
     }) = actors.install_ledger(&mut node)
     else {
         unreachable!("an install")
@@ -45,6 +47,8 @@ fn a_kernels_argument_window_is_unmapped() {
             derivation,
             roles,
             target,
+            space,
+            clock,
         })],
     );
     let checksum = method(&actors.ledger, "checksum");
@@ -77,6 +81,8 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
         derivation,
         roles,
         target,
+        space,
+        clock,
     }) = actors.install_ledger(&mut node)
     else {
         unreachable!("an install")
@@ -90,6 +96,8 @@ fn an_install_binds_each_kernel_to_an_attestable_method() {
             },
             roles: roles.clone(),
             target,
+            space,
+            clock,
         })
     };
     let checksum = derivation.kernels[0].clone();
@@ -157,6 +165,8 @@ fn derived_kernels_run_in_the_agent() {
             derivation: derivation(&package("kernels"), &derived),
             roles: vec![],
             target,
+            space: vos_wire::SpaceId::NONE,
+            clock: vos_wire::WindowClock::default(),
         });
         node.add(&derived.actor);
         for (_, kernel) in &kernels {

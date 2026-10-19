@@ -8,10 +8,14 @@ description = "SCALE codec without compact encoding. Fixed-width LE integers, u3
 [features]
 default = ["std"]
 std = ["thiserror/std"]
+# Encodings of `vos-anchor`'s space id and window clock, which agents'
+# records name.
+anchor = ["dep:vos-anchor"]
 
 [dependencies]
 thiserror = { version = "2", default-features = false }
 scale-derive = { package = "vos-pvm-codec-derive", path = "../codec-derive" }
+vos-anchor = { path = "../proof/anchor", optional = true }
 
 [dev-dependencies]
 proptest = "1"

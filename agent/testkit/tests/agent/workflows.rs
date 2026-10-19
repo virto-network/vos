@@ -127,6 +127,8 @@ impl Flows {
             derivation: vos_testkit::programs::bare(self.node.add(shop)),
             roles: vec![],
             target,
+            space: vos_wire::SpaceId::NONE,
+            clock: vos_wire::WindowClock::default(),
         })
     }
 
@@ -148,6 +150,8 @@ impl Flows {
             derivation: derivation(&vos_testkit::programs::package(package), &derived),
             roles: vec![],
             target: Target::Vos,
+            space: vos_wire::SpaceId::NONE,
+            clock: vos_wire::WindowClock::default(),
         })
     }
 

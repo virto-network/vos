@@ -368,6 +368,8 @@ mod tests {
                 },
                 roles: Vec::new(),
                 target: Target::Vos,
+                space: vos_wire::SpaceId::NONE,
+                clock: vos_wire::WindowClock::default(),
             })],
         });
         let programs = |agent, work| AgentPrograms::new(&blobs, AgentId(agent), work);

@@ -120,6 +120,8 @@ impl Actors {
                 derivation: package.derivation.clone(),
                 roles: vec![],
                 target: Target::Jam,
+                space: vos_wire::SpaceId::NONE,
+                clock: vos_wire::WindowClock::default(),
             })
         };
         vec![install(COUNTER, &self.counter), install(SHOP, &self.shop)]

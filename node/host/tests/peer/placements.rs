@@ -28,6 +28,7 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
         time: 0,
         program: ProgramHash([0; 32]),
         accumulate_gas: 0,
+        space: vos_wire::SpaceId::NONE,
     };
     let creator = record.creator;
     let check = |from, placement: Placement| {

@@ -11,14 +11,42 @@ use vos_checker::hooks::carries;
 use vos_checker::programs::actor;
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Hooks, Node, Reply};
-use vos_wire::Encode;
 use vos_wire::abi::Refusal;
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::{Call, Contact, NodeId, Response};
 use vos_wire::peer::{NodeNumber, PeerMessage};
+use vos_wire::{Encode, SpaceId, WindowClock, keys};
 
 use crate::common::{COUNTER, Cluster, WithholdBlobs, replaced, retired, wait_until};
+
+/// An agent belongs to its nodes' space: its creation record names the
+/// space's id, and its first install records the id and the space's clock,
+/// on every replica.
+#[test]
+fn an_agent_belongs_to_its_nodes_space() {
+    let cluster = Cluster::new(3);
+    let space = cluster.space.id();
+    assert_ne!(space, SpaceId::NONE);
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    for number in 1..=3 {
+        let store = cluster.node(number).store();
+        let records = store.agents().unwrap();
+        let record = records.iter().find(|record| record.agent == agent).unwrap();
+        assert_eq!(record.space, space, "node {number}");
+        wait_until("the install applied", || {
+            vos_checker::applied::<SpaceId>(store, agent, &keys::space()).is_some()
+        });
+        assert_eq!(
+            vos_checker::applied::<SpaceId>(store, agent, &keys::space()),
+            Some(space)
+        );
+        assert_eq!(
+            vos_checker::applied::<WindowClock>(store, agent, &keys::clock()),
+            Some(cluster.space.clock())
+        );
+    }
+}
 
 #[test]
 fn an_agent_created_on_three_nodes_applies_alike_on_each() {

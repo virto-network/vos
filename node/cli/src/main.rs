@@ -18,7 +18,7 @@ use vos_node::{Config, Node, Space};
 use vos_wire::ids::MethodId;
 use vos_wire::schema::Schema;
 
-use args::{Cli, Command, KeyCommand, NodeCommand, RunArgs};
+use args::{Cli, Command, KeyCommand, NodeCommand, RunArgs, SpaceCommand};
 use call::read_workflow;
 
 /// mimalloc, unless built without it: a thread frees memory another thread
@@ -73,6 +73,7 @@ fn run(cli: Cli) -> Result<(), String> {
     match cli.command {
         Command::Node { command } => command.run(),
         Command::Key { command } => command.run(),
+        Command::Space { command } => command.run(),
         Command::Agent { command } => command.run(),
         Command::Install(install) => install.run(),
         Command::Role(role) => role.run(),
@@ -130,6 +131,38 @@ impl RunArgs {
         loop {
             std::thread::park();
         }
+    }
+}
+
+impl SpaceCommand {
+    fn run(self) -> Result<(), String> {
+        let SpaceCommand::Up {
+            space,
+            window_ms,
+            origin_ms,
+        } = self;
+        let listed = Space::read(&space)?;
+        if listed.genesis().is_some() {
+            return Err(format!(
+                "{}: the space has a genesis already, and it never changes",
+                vos_node::genesis_path(&space).display()
+            ));
+        }
+        let time = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis() as u64;
+        let mut nonce = [0u8; 16];
+        getrandom::getrandom(&mut nonce).map_err(|error| error.to_string())?;
+        let clock = vos_wire::WindowClock {
+            origin_ms: origin_ms.unwrap_or(time),
+            length_ms: window_ms,
+        };
+        let genesis = listed.found(clock, time, nonce)?;
+        let path = vos_node::write_genesis(&space, &genesis)?;
+        eprintln!("vos: the space's genesis is in {}", path.display());
+        println!("{}", hex::encode(genesis.id().0));
+        Ok(())
     }
 }
 

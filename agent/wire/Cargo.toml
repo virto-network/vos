@@ -6,7 +6,9 @@ license.workspace = true
 description = "Wire types shared by the VOS node, the default agent program and the actor SDK."
 
 [dependencies]
-scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features = false }
+scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features = false, features = ["anchor"] }
+# The space an agent belongs to, and the clock that numbers its windows.
+vos-anchor = { path = "../../pvm/proof/anchor" }
 vos-pvm-program = { workspace = true }
 # The key transforms every table's rows are keyed by.
 vos-tree = { workspace = true }

@@ -28,6 +28,7 @@ pub mod expiry;
 
 pub use scale;
 pub use scale::{Decode, DecodeError, Encode};
+pub use vos_anchor::{self, SpaceGenesis, SpaceId, WindowClock};
 
 /// The node's and the agent's defaults. Each is a constant, cheap to change.
 pub mod defaults;

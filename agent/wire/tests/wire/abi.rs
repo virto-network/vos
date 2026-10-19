@@ -290,6 +290,7 @@ fn codes_keep_their_values() {
         (Failure::Unloadable, 11),
         (Failure::Expired, 12),
         (Failure::Target, 13),
+        (Failure::Space, 14),
     ];
     for (failure, code) in failures {
         assert_eq!(failure.code(), code);
@@ -309,7 +310,7 @@ fn codes_keep_their_values() {
         assert_eq!(Refusal::from_code(code), Some(refusal));
         assert_eq!(refusal.encode(), code.to_le_bytes());
     }
-    for outside in [0u32, 14, u32::MAX] {
+    for outside in [0u32, 15, u32::MAX] {
         assert!(Failure::decode(&outside.to_le_bytes()).is_err());
     }
     // An install's refusal, its failure's detail.
@@ -317,6 +318,24 @@ fn codes_keep_their_values() {
     let target = Refused::Target { agent: Target::Jam };
     assert_eq!(target.encode(), [0, 1]);
     assert_eq!(target.failure(), Failure::Target);
+    let space = Refused::Space {
+        space: vos_wire::SpaceId([0xa1; 32]),
+        clock: vos_wire::WindowClock {
+            origin_ms: 1,
+            length_ms: 600_000,
+        },
+    };
+    assert_eq!(
+        space.encode(),
+        [
+            &[5u8][..],
+            &[0xa1; 32],
+            &1u64.to_le_bytes(),
+            &600_000u64.to_le_bytes()
+        ]
+        .concat()
+    );
+    assert_eq!(space.failure(), Failure::Space);
     let gas = Refused::KernelGas {
         method: vos_wire::ids::MethodId(3),
         gas: 5,

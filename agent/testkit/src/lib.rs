@@ -18,7 +18,6 @@ mod workflows;
 
 use std::collections::BTreeMap;
 
-use vos_wire::Decode;
 use vos_wire::abi::cap::{Limits, Refused, Target};
 use vos_wire::abi::{Failure, Kind};
 use vos_wire::batch::{Await, Body};
@@ -27,6 +26,7 @@ use vos_wire::keys;
 use vos_wire::records::versioned;
 use vos_wire::result::{Attest, CommittedWrite, InstanceGas, Outcome, Outgoing, Page, Write};
 use vos_wire::schema::{Schema, SchemaError};
+use vos_wire::{Decode, SpaceId, WindowClock};
 
 use invocation::{Call, Invocation};
 
@@ -42,9 +42,10 @@ pub enum InstallError {
     Duplicate(MethodId),
     /// A role name the schema uses has no role byte.
     UnmappedRole(Vec<u8>),
-    /// The install's target is not its agent's, or its program's statics
-    /// pass its target's limits: its kernels, its bytes, the pages it may
-    /// write, or the gas an attestable method declares for its kernel.
+    /// The install's space or clock is not its agent's, its target is not
+    /// its agent's, or its program's statics pass its target's limits: its
+    /// kernels, its bytes, the pages it may write, or the gas an attestable
+    /// method declares for its kernel.
     Refused(Refused),
 }
 
@@ -120,6 +121,9 @@ pub struct Testkit {
     pub uncovered: bool,
     /// The target its first install named, which every later one must.
     target: Option<Target>,
+    /// The space and clock its first install named, which every later one
+    /// must.
+    space: Option<(SpaceId, WindowClock)>,
     instances: BTreeMap<InstanceId, Installed>,
     members: BTreeMap<Principal, u8>,
     state: BTreeMap<Vec<u8>, Vec<u8>>,
@@ -131,6 +135,16 @@ pub struct Testkit {
     steps: u32,
 }
 
+/// The space and clock of an agent whose node has no genesis, which the
+/// installs name unless a test names another ([`Testkit::install_in`]).
+pub const SPACELESS: (SpaceId, WindowClock) = (
+    SpaceId::NONE,
+    WindowClock {
+        origin_ms: 0,
+        length_ms: vos_wire::vos_anchor::DEFAULT_LENGTH_MS,
+    },
+);
+
 impl Testkit {
     pub fn new(agent: AgentId) -> Self {
         Self {
@@ -141,6 +155,7 @@ impl Testkit {
             budget: u64::MAX,
             uncovered: false,
             target: None,
+            space: None,
             instances: BTreeMap::new(),
             members: BTreeMap::new(),
             state: BTreeMap::new(),
@@ -174,7 +189,24 @@ impl Testkit {
         kernels: &[(MethodId, &[u8])],
         roles: &[(&str, u8)],
     ) -> Result<(), InstallError> {
-        self.install_with_heap(target, instance, program, 0, kernels, roles)
+        self.install_with_heap(SPACELESS, target, instance, program, 0, kernels, roles)
+    }
+
+    /// [`Testkit::install_for`] into an agent of `space`, whose windows
+    /// `clock` numbers: refused for another space or clock than the
+    /// agent's, which its first install names, before anything else.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_in(
+        &mut self,
+        space: SpaceId,
+        clock: WindowClock,
+        target: Target,
+        instance: InstanceId,
+        program: &[u8],
+        kernels: &[(MethodId, &[u8])],
+        roles: &[(&str, u8)],
+    ) -> Result<(), InstallError> {
+        self.install_with_heap((space, clock), target, instance, program, 0, kernels, roles)
     }
 
     /// Install what an ELF derived ([`programs::derived`]) for `target`:
@@ -193,6 +225,7 @@ impl Testkit {
             .map(|(method, kernel)| (MethodId(*method), kernel.as_slice()))
             .collect();
         self.install_with_heap(
+            SPACELESS,
             target,
             instance,
             &derived.actor,
@@ -202,8 +235,10 @@ impl Testkit {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn install_with_heap(
         &mut self,
+        space: (SpaceId, WindowClock),
         target: Target,
         instance: InstanceId,
         program: &[u8],
@@ -211,6 +246,9 @@ impl Testkit {
         kernels: &[(MethodId, &[u8])],
         roles: &[(&str, u8)],
     ) -> Result<(), InstallError> {
+        if let Some((space, clock)) = self.space.filter(|&agent| agent != space) {
+            return Err(InstallError::Refused(Refused::Space { space, clock }));
+        }
         if let Some(agent) = self.target.filter(|&agent| agent != target) {
             return Err(InstallError::Refused(Refused::Target { agent }));
         }
@@ -247,6 +285,7 @@ impl Testkit {
         statics_within(program, pages, &schema, kernels.len(), target.limits())
             .map_err(InstallError::Refused)?;
         self.target = Some(target);
+        self.space = Some(space);
         let installed = Installed {
             program: program.to_vec(),
             schema,

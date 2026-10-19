@@ -11,8 +11,10 @@ use vos_wire::ids::{AgentId, InstanceId, ProgramHash};
 use vos_wire::ingress::Unplaced;
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 use vos_wire::records::Derivation;
+use vos_wire::{SpaceId, WindowClock};
 
 use super::{Answered, CallError, Inner, Pending, ReplaceError};
+use crate::Space;
 use crate::blobs::Keep;
 use crate::group::Local;
 use crate::storage::Change;
@@ -150,6 +152,7 @@ impl Inner {
             time: (self.clock)(),
             program: self.program_hash,
             accumulate_gas: self.settings.accumulate_gas,
+            space: self.space.as_ref().map_or(SpaceId::NONE, Space::id),
         };
         let placement = Placement::created(&record);
         self.storage
@@ -242,6 +245,11 @@ impl Inner {
             derivation,
             roles,
             target: Target::Vos,
+            space: self.space.as_ref().map_or(SpaceId::NONE, Space::id),
+            clock: self
+                .space
+                .as_ref()
+                .map_or_else(WindowClock::default, Space::clock),
         };
         let (answer, reply) = smol::channel::bounded(1);
         self.push(

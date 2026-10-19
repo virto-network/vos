@@ -142,6 +142,53 @@ fn new_key(dir: &Path, name: &str) -> String {
     path
 }
 
+/// `vos space up` founds a space once: its genesis, of the nodes the space
+/// file lists, beside it, the id printed its hash; a second founding, or a
+/// window a venue would not register, is refused.
+#[test]
+fn a_space_is_founded_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("space");
+    let file = path.to_str().unwrap();
+    std::fs::write(
+        &path,
+        format!(
+            "1 {} 127.0.0.1:7800 http://127.0.0.1:7700\n2 {} 127.0.0.1:7801 http://127.0.0.1:7701\n",
+            "11".repeat(32),
+            "22".repeat(32)
+        ),
+    )
+    .unwrap();
+    let refused = vos_fails(["space", "up", "--space", file, "--window-ms", "60000"]);
+    assert!(refused.contains("120000"), "{refused}");
+    assert!(!dir.path().join("space.genesis").exists());
+
+    let id = vos([
+        "space",
+        "up",
+        "--space",
+        file,
+        "--window-ms",
+        "120000",
+        "--origin-ms",
+        "5000",
+    ]);
+    let space = vos_node::Space::read(&path).unwrap();
+    let genesis = space.genesis().expect("the genesis beside the space file");
+    assert_eq!(id, hex::encode(space.id().0));
+    assert_eq!(genesis.nodes, [(1, [0x11; 32]), (2, [0x22; 32])]);
+    assert_eq!(
+        space.clock(),
+        vos_wire::WindowClock {
+            origin_ms: 5_000,
+            length_ms: 120_000
+        }
+    );
+    let refused = vos_fails(["space", "up", "--space", file]);
+    assert!(refused.contains("never changes"), "{refused}");
+    assert_eq!(vos_node::Space::read(&path).unwrap().id(), space.id());
+}
+
 #[test]
 fn a_client_calls_an_agent_the_operator_installed() {
     let dir = tempfile::tempdir().unwrap();
