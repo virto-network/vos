@@ -1770,10 +1770,7 @@ fees are the teammate's.
       store's system partition naming the keyspace layout, which
       `Fjall::open` refuses on a mismatch, so a store written before a
       layout change (6.11 moved committed rows under `0x03`) fails to open
-      instead of hiding its rows. Beside it, `snapshot_crash`'s
-      `Fjall::open` after a torn kill failing `AlreadyExists` under load
-      (6.15's `just check`, 2 of 9 runs): found and fixed, or the test's
-      flake explained.
+      instead of hiding its rows.
   23. **The decode's allocator** (6.4's review): format 39's decode costs
       about 3.7M gas on the JAM-only host, most of it the guest's
       allocator over the proof's 1,012 column vectors (Stwo's shape), not

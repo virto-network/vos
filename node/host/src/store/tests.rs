@@ -503,3 +503,32 @@ fn logs_round_trip() {
     let reopened = Fjall::open(dir.path()).unwrap();
     assert_eq!(reopened.log_entry(A, 7).unwrap().unwrap().term, 3);
 }
+
+/// A store whose creation a kill cut short, its `version` marker not yet
+/// written or written empty, after its lock, its keyspaces' folder and its
+/// first journal: it opens, as a new store, and keeps what is then written;
+/// a store whose creation finished keeps its rows.
+#[test]
+fn a_store_whose_creation_was_cut_short_opens() {
+    for marker in [None, Some(&b""[..])] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        std::fs::write(path.join("lock"), b"").unwrap();
+        std::fs::create_dir(path.join("keyspaces")).unwrap();
+        std::fs::write(path.join("0.jnl"), [0u8; 64]).unwrap();
+        if let Some(marker) = marker {
+            std::fs::write(path.join("version"), marker).unwrap();
+        }
+        let store = Fjall::open(path).unwrap();
+        let mut batch = store.batch();
+        batch.apply(A, 0, 1, &[put(row(0, 1), b"one")]);
+        batch.commit(PersistMode::SyncAll).unwrap();
+        drop(store);
+        let store = Fjall::open(path).unwrap();
+        assert_eq!(
+            store.snapshot().get(A, &row(0, 1)).unwrap().as_deref(),
+            Some(&b"one"[..]),
+            "{marker:?}"
+        );
+    }
+}

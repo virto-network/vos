@@ -356,11 +356,48 @@ fn sync_journals(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Clear a store fjall began creating and never finished: one whose
+/// `version` marker, which fjall writes last, is missing or empty. Such a
+/// store holds no data, but fjall takes it for a new one and its creation
+/// fails on the journal or lock the interrupted creation left
+/// (`AlreadyExists`), so a node killed during its store's creation could
+/// never open it again. fjall's own entries (its journals, its lock, its
+/// keyspaces' folder and the empty marker) are removed, and the directory
+/// synced, so the creation starts over.
+fn clear_unfinished(dir: &Path) -> Result<()> {
+    let finished = std::fs::metadata(dir.join("version")).is_ok_and(|marker| marker.len() > 0);
+    if finished {
+        return Ok(());
+    }
+    let mut cleared = false;
+    for entry in std::fs::read_dir(dir)? {
+        let path = entry?.path();
+        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        if name == "keyspaces" && path.is_dir() {
+            std::fs::remove_dir_all(&path)?;
+        } else if name == "lock"
+            || name == "version"
+            || path.extension().is_some_and(|extension| extension == "jnl")
+        {
+            std::fs::remove_file(&path)?;
+        } else {
+            continue;
+        }
+        cleared = true;
+    }
+    if cleared {
+        tracing::warn!(?dir, "cleared a store whose creation was cut short");
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 impl Fjall {
     /// Open the store at `path` with `tuning`, as [`Fjall::open`] does.
     #[doc(hidden)]
     pub fn open_tuned(path: impl AsRef<Path>, tuning: Tuning) -> Result<Self> {
         if path.as_ref().exists() {
+            clear_unfinished(path.as_ref())?;
             sync_journals(path.as_ref())?;
         }
         let db = Database::builder(path.as_ref())
