@@ -2374,3 +2374,92 @@ Commits: `b353d8ba`, `01e7937b` (6.6b's fold and record), `9c19ff5e`,
 this record.
 
 **M2 accepted.**
+
+## Step 6.14: the representative and the anchors
+
+On `s6/roots` (from `3aa04c8c`). The full record is the step's log.
+
+- **Built:** `vos-representative` (`agent/representative`), the space's
+  agent 0 of its first founding node, replicated on founding nodes alone,
+  installed on the representative's clock (origin + `D`, `D = min(L/5, 2
+  min)`), its committed roots keyed agent ‖ kind ‖ w and its asks; an
+  agent's leader, woken by its builder's finished cut (`Woke::Built`),
+  reports its root at the cut once a window (`Input::Report`); the
+  representative's cut keeps each asking agent's path (`keys::closing`),
+  its leader signs the anchor of `S_w` with its node key for the venue and
+  sends each agent one `Closed` (`Input::Close`, by its mark, eight a
+  close); the agent keeps the close by window (`keys::closed`) from its
+  representative alone; apply re-cuts an unclosed window's reads at the
+  next cut (`keys::moved`) and prunes cut, re-cut and close rows past
+  `CUT_KEEP` = 4; a read served at the first window of its chain closed
+  and proved, a proof kept a window; `serves` binds the served window,
+  `rep_root`, `rep_salt` and `space_path` to the agent's close.
+  `vos-venue`: `VenueClient` and `ModelVenue` (the anchor rule, repeats,
+  equivocation kept as evidence and the space suspended, `judge`). The
+  stand-in representative deleted.
+- **Priced** [measured]: `SEND` 5,300 and `PAUSE` 9,000 (the larger agent's
+  send 4,095 of 5,000 and wait 7,078 of 8,000 failed their spare).
+- **Checker loop** (seeds 6141–6144, the three exactly-once tests and the
+  cuts run with `CUTS_FULL`, the representative on three nodes): green
+  after two fixes the run surfaced, the cuts check waiting for each
+  replica's latest cut built, and the reader installed before the run's
+  faults (`Alongside::before`); 101–205 reads an agent, none unserved or
+  refused by a kernel.
+- **The review** (Opus): ACCEPT, one medium and lows, folded (`aec48096`):
+  an agent's report removes its own asks with its stale rows, no other
+  agent's; an anchor settled on its taking or a refusal for good, the
+  venue's `Open` tried again at the next batch in window order;
+  `serving_windows` follows at most `RECUTS` moves; the served runs anchor
+  at a `ModelVenue`, the cuts check asserting no evidence and each anchor
+  `S_w` over the replicas' roots; the representative's replicas founding
+  nodes alone; closing scans the window's asks; Pin D, Pin E and 6.17b
+  amended.
+
+**Merged** into `vos-core` as `57ddc47b`. The conflicts kept both sides:
+the cluster cut tests keep vos-core's hour-long windows and the applied
+index the store holds (`representative.rs` reads the same clock, so `D` is
+two minutes); the served run keeps vos-core's count of the reads it
+started beside the tours (`a46956a4`) and 6.14's `Alongside::before`.
+`vos-venue`, written before 6.5's `vos-statement`, took its API after the
+merge (`da93992a`): `Pin`, `Venue::id`, `Policy::new` at the linked formats, the
+registered spaces in the policy, `Seen` recorded by `Policy::record`.
+`just check` after both merges [measured]: green, 91 suites, 1,264
+passed, 0 failed, `check-kit` among them.
+
+**6.14 accepted.**
+
+## Step 6.16: the verifier kit and the spaces pallet's design
+
+On `s6/kit` (from `2276ed9a`). The full record is the step's log.
+
+- **Built:** `just vendor-verifier` writes `vos-anchor`, `vos-statement`,
+  `vos-pvm-final-verifier`, `vos-pvm-recair-air` and `vos-pvm-poseidon2`
+  with concrete manifests (each other by path, Stwo a git dependency at
+  `c3ec9813` without default features; no dev-dependencies, tests or bins;
+  `test-formats` and `pvm-guest` dropped), the golden fixtures, the
+  conformance vectors' hook (6.17), a hashed `.gitattributes` and a
+  `VENDOR` file naming the repository, the commit, its tag and the tree's
+  BLAKE2b-256. `vos_kit.py sync` checks the hash, vendors the kit anew
+  from `VENDOR`'s tag by that tag's script and refuses any file's
+  difference; `vos-sync.sh`, kept outside the kit, pins VOS's Codeberg
+  repository, checks the tag (resolved without lazy fetch to exactly the
+  commit) and runs the tag's script, never the kit's own. `just check-kit`
+  (in `check` and `ci`) builds the kit alone for `wasm32v1-none` on 1.94.1,
+  `--locked` on its lockfile (`just kit-lock`), refuses a `std` feature in
+  any crate it links, and checks tampered, untagged, malformed, moved and
+  unknown-tag kits refused. `workspace.package.repository` the Codeberg
+  repository.
+- **Docs:** `spaces-pallet.md` §3 takes 6.10's genesis, `MaxRootAge` equal
+  to `MAX_ROOT_AGE_MS`, `seen_expiry`'s clock, a suspended space's roots
+  unanchored; §3.1 the kit and its bootstrap; §6.5's raise extends every
+  finite `Seen` expiry; §13 questions 11 and 12 (key rotation not yet
+  supported). Pin D amended and a new step, 6.14b, a rotatable anchor key.
+- **Measured** [measured]: `just check-kit` 42 s; a Kreivo-style sync 6.7 s.
+- **The review** (Opus): REVISE (two high: a kit checking itself, an
+  untagged commit accepted; three medium; three low), folded in
+  `97dbe618`; the re-check ACCEPT.
+
+**Merged** into `vos-core` as `699cad27` (the `check` recipe's prerequisites
+both sides', `check-kit` beside `build-representative`).
+
+**6.16 accepted.**
