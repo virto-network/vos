@@ -2248,3 +2248,129 @@ On `s6/roots` (from `59eb975b`). The full record is the step's log.
 Commits: `19b86fbc` (the step), `3aa04c8c` (the fold).
 
 **6.13 accepted.**
+
+## M2 accepted: the final wrap masked
+
+M2 is 6.1–6.9 and 6.6b: format 39, the masked wrap, its prover, its final
+verifier and fixed layout, `vos-statement` at the accepted set {39}, the
+masking's gates, panic-freedom and fuzzing, the recursion AIR's forgery
+gates, format 36 retired. Its acceptance (the plan's "M2 acceptance") at
+`vos-core` `a46956a4`.
+
+**The masked wrap per statement, against format 28** [measured; each
+statement's kernel test alone (`--exact`, one test thread, its proving on
+every core, `--features debug-internals`), under a 12 GiB scope, the
+machine shared with other agents; heap is the counting allocator's peak,
+resident the process's `VmHWM` reset before the prove; gas on the JAM-only
+host (39 by `final-verify.elf`, 28 by `final-verify-test.elf`); Wasm the
+production blob (39) and the test blob (28) under the PVF's semantics,
+pinned to the performance cores at x86-64-v3]:
+
+| | the window, 39 | the window, 28 | `areas`, 39 | `areas`, 28 |
+|---|---|---|---|---|
+| prove | 7.44 s (load 6.8) | 4.55 s | 8.37–8.40 s (load 7.4–7.8); 14.5, 16.8 s at 7.2–9.1 | 5.28–5.96 s |
+| heap peak | 3,627 MiB | 2,498 MiB | 3,627 MiB | 2,498 MiB |
+| process peak resident | 4,079 MiB | | 3,849–3,890 MiB | |
+| R1 | 7.7 ms | | 6.1–8.0 ms | |
+| revealed rows, attempts | 80 of 256, 1 | | 80 of 256, 1 | |
+| bytes | 148,868 | 122,085 | 144,260–147,844 | 121,098 |
+| JAM decode | 1,815,193 | 13,279,989 | 1,804,345 | 13,211,151 |
+| JAM verify | 82,980,239 | 66,177,415 | 81,042,863 | 65,851,402 |
+| JAM total (the guest) | 84,879,480 | 79,534,547 | 82,930,068 | 79,139,441 |
+| Wasm instructions (PVF) | 44,917,286 | 37,977,763 | 43,849,890 | 37,787,387 |
+| host allocations (Wasm) | 7,974 | 7,698 | 7,962 | 7,698 |
+
+- The gas and Wasm columns are of the proof each run wrote (the window's
+  148,868 B, `areas`' 144,260 B). At the worst shape (6.6b, the 12 gate
+  seeds' fit to 2,768 witness hashes): Wasm 46.43M of 50M, JAM verify
+  85.84M (target 125M), decode 1.83M (4M).
+- **"≤ 15 s quiet": not measured quiet.** Every run shared the machine
+  (load 6.8–9.1 at the wrap; a quiet start, 2.3, rose with the run's own
+  segments). The masked wrap took 7.44–8.40 s against 28's 4.55–5.96 s in
+  the same runs, 1.4–1.7×; the two slow runs (14.5 s, 16.8 s) at the
+  highest loads still fit. Accepted at 7.44–8.40 s under load, as Fable's
+  review allows.
+- A statement's masked wrap is its witness's alone: `areas` (3 segments)
+  and the window (27) prove one wrap circuit at the same log sizes, so
+  their time, heap and bytes agree within the run's noise and the masks.
+
+**Gates** [measured]:
+- **`ci`** (inside `just ci-full`, at `4aba1f07`): green, 110 suites,
+  1,349 passed, 0 failed.
+- **`test-proof`** (its own run, at `e575f10e`'s recipe): green, 14
+  suites, 552 passed, 0 failed, 2,632 s; its `judge-wasm` 31 of 31
+  fixtures as recorded under each blob and semantics, the anchor vectors
+  as pinned; the masking's heavy gates (leakage at full N, acceptance at
+  `[17,15,12]`, the verify gates over 12 seeds) among them.
+  - **Failed first, and fixed** (`e575f10e`): under 12 GiB the `kernel`
+    binary was OOM-killed three times in a window test (12 GiB peak; alone,
+    the window's wrap peaks at 9.4 GiB), on heap earlier tests had freed
+    and glibc's arenas kept, and on `reads`' million-row fixture (6.13),
+    held for the process's life. The prover tests now hand a finished
+    proof's freed heap back (`malloc_trim` in `measured`), and the recipe
+    runs each window test, and `reads`, in a process of its own; its doc
+    says 12 GiB.
+- **`test-bench-proof`:** green, 2 passed, 21 s.
+- **`just fuzz`:** the seven targets five minutes each, no crash (2,122 s).
+  - **Failed first, and fixed** (`4a48740f`): `final_verifier_bytes`
+    accepted a proof "not the golden one": the local corpus held proofs of
+    the fixtures before their regeneration (`2f0ad042`), each another
+    honest proof of the same words. The seed example now clears the four
+    corpora it seeds before seeding them.
+- **The checker loop:** seeds 6201–6212 × the three exactly-once tests
+  (`vos-node --test served exactly_once`, workflows touring): 36 of 36
+  green, load 3.2–6.8 at their starts. The cuts run with tours
+  (`CUTS_FULL`, through every fault, 2-s windows), seeds 6201–6206: 6 of 6
+  green, 86–145 cuts an agent, 144–235 reads an agent (served, or not
+  served in time, none unserved), 799–968 samples holding undo rows.
+  - **Failed first, and fixed** (`a46956a4`): the cuts run with tours
+    failed 3 of 3 at "every tour started once" (351 against 108): since
+    6.13 its reads start workflows at the same agents, which
+    `next_workflow` counts beside the tours. `check_tours` now adds the
+    workflows the run alongside started (`Alongside::workflows`: the reads
+    answered as started, and one more when the run ended on a started
+    read's retry, noted under the next tag).
+- **`just check` at the head** (`a46956a4`): green, 1,247 passed, 0
+  failed.
+- **A flake fixed** (`9c19ff5e`):
+  `messages::a_reply_outlives_its_leader_stopping` (`left: 0, right: 1`,
+  seen under load at 6.7): the test waited on the store's value and outbox,
+  then read the runs through the node's applied count, which moves only
+  once the apply's commit returns; the runs are now read through the
+  applied index the store holds, as 6.12's cut-marker test was fixed. Not
+  reproduced on demand (12 runs alone on one core, 12 four at a time:
+  green), fixed by the same mechanism.
+
+**Folds before the gates:**
+- **6.6b's review** (Opus ACCEPT, one Low): `b353d8ba` (above).
+- **Areas' masked wrap** (`4aba1f07`): `wrap_root` always proves format 39
+  beside 28, so `test-proof` measures it per statement (6.3's review had
+  left it to the window alone).
+
+**Milestone review: Fable ACCEPT** (`M2-fable.md`): no soundness or
+zero-knowledge defect, nothing opened beyond the counted points; every
+per-step finding folded. Its findings, folded:
+- **1 (Low):** the gates run and this table, above; the quiet prove
+  recorded as not measured quiet.
+- **2 (Low)** (`3494eab5`): pin C as built: both test seams under
+  `cfg(feature = "seeded-masks")` alone, `MaskRng`'s `Default`,
+  `prove_masked_unchecked` named; R3's argument written in pin C and
+  `SECURITY.md`'s zero-knowledge paragraph (R witness-independent; with
+  rank-4 coefficients, about 2^-155 from failing, the real and simulated
+  batches differ by an R-quotient, so FRI's transcript, its unsalted layer
+  trees included, has one distribution; no check runs).
+- **3 (Low)** (`2f0ad042`): the witness digest binds the format's channel
+  by its pinned tag (`ChannelKind`, `repr(u8)`, explicit discriminants),
+  not the Merkle channel's type name; the seeded 39 fixtures regenerated
+  once, the stale test byte for byte after (`statements.cases` and the
+  four `wrap*.proof` at 39).
+- **4 (Info):** no action.
+- **5 (Info)** (`3494eab5`): `SECURITY.md`'s audit scope names the
+  least-term convention against a union bound (about 81.2 bits for 39;
+  24 queries the robust pin).
+
+Commits: `b353d8ba`, `01e7937b` (6.6b's fold and record), `9c19ff5e`,
+`2f0ad042`, `3494eab5`, `4aba1f07`, `e575f10e`, `4a48740f`, `a46956a4`,
+this record.
+
+**M2 accepted.**
