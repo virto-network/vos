@@ -1487,6 +1487,21 @@ fees are the teammate's.
       and 19 (with its test); the fuzz target `final_verifier_mutate`'s
       `Grow`/`Shrink`/`Clear` as one variant, 6.7's corpus regenerated
       after it.
+  21. **6.9's leftovers:**
+      - the runtime's observed refine path, the deleted collector its only
+        caller: `RefineContext::run_observed` with `RefineObservation`,
+        `RefineHostPhase`, `RefineMachineIdentity`,
+        `InnerMachines::invoke_observed`, `InnerMachineObservation`,
+        `Machine::continue_observed`, the `Option<Observer>` through
+        `refine_host`'s `dispatch`, and their tests; `Machine::resume_observed`
+        and `Interpreter::run_observed` stay (`pvm/bench` uses them);
+      - `with_stack!`'s `ChannelKind::Blake2s` arm routed to `$unbuilt`, no
+        format naming the channel; the Blake2s variants of `ChannelKind`,
+        `StarkProofAny` and `Commitment` stay until the next segment
+        format's successor, as removing them shifts 35's postcard indices;
+      - before master: `spikes/s5-attestable` and
+        `spikes/s5-precompile/harness` deleted (they call the deleted
+        refine API).
 - **Then the slice's own cleanup:** the Opus code-quality review of slice
   6's code, folded the same way.
 - **Docs:** `proving.md` draft 6, `core-model.md`, `identity-and-authority.md`,

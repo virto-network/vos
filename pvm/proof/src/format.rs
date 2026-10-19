@@ -616,6 +616,13 @@ mod tests {
             ]
         );
         assert!(REGISTRY.iter().all(Format::meets_floors));
+        // Every format grinds an interaction PoW: the prover always grinds
+        // and the verifier always checks one.
+        assert!(
+            REGISTRY
+                .iter()
+                .all(|format| format.interaction_pow_bits() > 0)
+        );
     }
 
     /// The unrounded counts the parameters were chosen by: the segments'

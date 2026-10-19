@@ -156,8 +156,9 @@ pub fn format_security_bits(
 }
 
 /// Refuse a proof whose counts, at its own parameters and shape, fall below
-/// its format's floors, and one whose parameters are not the format's. Counts first, so a weakened proof is
-/// refused for its security whatever else differs.
+/// its format's floors, and one whose parameters are not the format's.
+/// Counts first, so a weakened proof is refused for its security whatever
+/// else differs.
 pub fn check_format_security(
     format: &Format,
     config: &PcsConfig,
