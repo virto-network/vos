@@ -35,6 +35,7 @@ use vos_pvm_recair_air::gate::public_logup_sum;
 use vos_pvm_recair_air::transcript::{Prefix, replay_prefix};
 use vos_pvm_recair_air::{Components, LOG_CONSTRAINT_EXPANSION};
 
+use crate::masked::TREES;
 use crate::{
     Error, LAYOUT, LOG_SIZES, MAX_PROOF_BYTES, PREPROCESSED_ROOT, PUBLIC_WORDS, Statement,
     WrapProof, embed, mix_header, secure_is_canonical, stark_is_canonical,
@@ -58,10 +59,6 @@ pub const CONFIG: PcsConfig = PcsConfig {
 
 /// Format 28's interaction PoW.
 pub const INTERACTION_POW_BITS: u32 = 8;
-
-/// The trees a Stwo proof commits: preprocessed, main, interaction and
-/// composition.
-const TREES: usize = 4;
 
 /// The format-28 proof in `bytes`: at most [`MAX_PROOF_BYTES`], its format
 /// word 28, one postcard encoding and nothing after it.

@@ -224,19 +224,22 @@ open items both wraps' counts rest on:
 
 ## Masking
 
-None yet in a proof. Every proof is unmasked: the wrap's witness
-(digests, positions, the io-hash, the fold word) and its trace are in the
-clear. Segment, leaf and fold proofs must never leave the prover role.
+Format 39's wraps are masked; every other proof (28's wraps, segments,
+leaves, folds) is unmasked: its witness (digests, positions, the io-hash,
+the fold word) and its trace are in the clear, and segment, leaf and fold
+proofs must never leave the prover role.
 
 **Format 39,** the masked wrap, is admitted: `vos-pvm-recair-air`'s masked
 AIR, `vos-pvm-recair`'s masked prover and `vos-pvm-final-verifier`'s masked
 verifier (pin B's transcript, every pin the format's, the shape checked
-before any Stwo call; the two facts it leaves to Stwo, the trees' widths
-`verify_values` zips and the FRI rounds `FriVerifier::commit` derives,
-each pinned and tested), its bytes a fixed layout with one encoding a
-proof. Its count is the security tool's under
-masking variant (c) (`docs/design/research/slice-5/spike2-masking.md` §3b,
-`docs/design/research/slice-6/spike6b-masked-bits.md`):
+before any Stwo call), its bytes a fixed layout with one encoding a proof.
+The verifier leaves three facts to Stwo, each pinned and tested: the
+trees' widths `verify_values` zips; the FRI rounds `FriVerifier::commit`
+derives from the largest column (`[3, 3, 3, 2]`); and FRI's degree bound,
+the last committed tree's height less the blowup (17), so the composition
+tree is the last and tallest commitment. Its count is the security tool's
+under masking variant (c) (`docs/design/research/slice-5/spike2-masking.md`
+§3b, `docs/design/research/slice-6/spike6b-masked-bits.md`):
 
 - **What (c) moves:** every main and interaction column is `f + v_H·r`, of
   degree bound `2N` for a tallest component of `N` rows; the composition

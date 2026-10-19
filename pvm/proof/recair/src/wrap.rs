@@ -253,10 +253,10 @@ fn wrap_proof(proof: RecairProof<Blake2bMerkleHasher>) -> WrapProof {
 /// (`vos_pvm_proof::format::Format::bytes`): format 39's fixed layout
 /// (`vos_pvm_final_verifier::masked::encode`), the one encoding its
 /// verifier reads, or postcard's; `None` for a format the registry does not
-/// hold.
+/// hold, or a proof its layout cannot hold.
 pub fn proof_bytes(proof: &WrapProof) -> Option<Vec<u8>> {
     match lookup(proof.format_version)?.bytes {
-        ProofBytes::FixedLayout => Some(vos_pvm_final_verifier::masked::encode(proof)),
+        ProofBytes::FixedLayout => vos_pvm_final_verifier::masked::encode(proof),
         ProofBytes::Postcard => postcard::to_allocvec(proof).ok(),
     }
 }

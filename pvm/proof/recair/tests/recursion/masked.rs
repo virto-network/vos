@@ -138,7 +138,7 @@ fn the_masked_wrap_verifies_under_the_registrys_entry() {
         FRI_ROUNDS
     );
     assert_eq!(
-        fri_rounds(17, &masked::CONFIG.fri_config).unwrap(),
+        fri_rounds(masked::LOG_DEGREE_BOUND, &masked::CONFIG.fri_config).unwrap(),
         FRI_ROUNDS
     );
 
@@ -148,10 +148,10 @@ fn the_masked_wrap_verifies_under_the_registrys_entry() {
         proof.stark_proof.commitments[0],
         Blake2bHash(PREPROCESSED_ROOT_39)
     );
-    assert_eq!(masked.bytes, masked::encode(proof));
+    assert_eq!(Some(&masked.bytes), masked::encode(proof).as_ref());
     assert!(masked.bytes.len() < MAX_PROOF_BYTES);
     let decoded = masked::decode(&masked.bytes).expect("decodes");
-    assert_eq!(masked::encode(&decoded), masked.bytes);
+    assert_eq!(masked::encode(&decoded), Some(masked.bytes.clone()));
     let statement = Statement::from_words(&masked.words).unwrap();
     assert_eq!(
         masked::verify_bytes(&masked.bytes, &masked.words).expect("verifies"),
@@ -175,7 +175,7 @@ fn the_masked_wrap_verifies_under_the_registrys_entry() {
             &mut Blake2bChannel::default(),
             masked::CONFIG.fri_config,
             fri,
-            CirclePolyDegreeBound::new(17),
+            CirclePolyDegreeBound::new(masked::LOG_DEGREE_BOUND),
         )
         .map(|_| ())
     };
@@ -274,7 +274,10 @@ fn every_masked_field_tampered_is_refused() {
         tamper(&mut tampered);
         let bytes = masked::encode(&tampered);
         let as_proof = refusal(|| masked::verify(tampered, &words));
-        let as_bytes = refusal(|| masked::verify_bytes(&bytes, &words));
+        let as_bytes = match &bytes {
+            Some(bytes) => refusal(|| masked::verify_bytes(bytes, &words)),
+            None => Ok(Error::Shape("no fixed layout holds it")),
+        };
         match (as_proof, as_bytes) {
             (Ok(proof), Ok(bytes)) => eprintln!(
                 "{name}: refused, {proof} ({:#x}); its bytes {bytes} ({:#x})",
@@ -363,7 +366,10 @@ fn another_salt_count_or_r_width_is_refused() {
         widen(&mut proof);
         let bytes = masked::encode(&proof);
         let as_proof = refusal(|| masked::verify(proof, &words)).unwrap();
-        let as_bytes = refusal(|| masked::verify_bytes(&bytes, &words)).unwrap();
+        let as_bytes = match &bytes {
+            Some(bytes) => refusal(|| masked::verify_bytes(bytes, &words)).unwrap(),
+            None => Error::Shape("no fixed layout holds it"),
+        };
         eprintln!("{name}: {as_proof}; its bytes {as_bytes}");
         assert!(matches!(as_proof, Error::Shape(_)), "{name}: {as_proof}");
         assert!(matches!(as_bytes, Error::Shape(_)), "{name}: {as_bytes}");

@@ -26,8 +26,8 @@
 //!   keep their numbers.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
-//!   before the relation challenges. 30 and 37 are
-//!   registered and refused until their AIRs and channels exist. 32 is registered and refused
+//!   before the relation challenges. 30 and 37 are registered and refused
+//!   until their AIRs and channels exist. 32 is registered and refused
 //!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
 //!   its proofs natively, pinning each circuit by its hash, and no verifier
 //!   outside the recursion reads a leaf or a fold. 28 is admitted:

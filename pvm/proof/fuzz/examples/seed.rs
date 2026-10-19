@@ -26,11 +26,16 @@ fn main() {
         let bytes = std::fs::read(directory.join(name)).expect("the wrap");
         write("final_verifier_bytes", name, &bytes);
     }
-    let masked =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target/tmp/wrap/one-segment-39.proof");
+    // `vos-pvm-recair`'s masked wrap tests write it under the workspace's
+    // target directory: `target` unless `CARGO_TARGET_DIR` names another.
+    let masked = std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target"))
+        .join("tmp/wrap/one-segment-39.proof");
     let bytes = std::fs::read(&masked).unwrap_or_else(|error| {
         panic!(
-            "{} ({error}): run `cargo test -p vos-pvm-recair --test recursion masked` first",
+            "{} ({error}): run `cargo test -p vos-pvm-recair --test recursion masked` first, \
+             with this `CARGO_TARGET_DIR` if the workspace's is elsewhere",
             masked.display()
         )
     });

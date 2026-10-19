@@ -28,16 +28,20 @@
 //! none); FRI's layers the rounds its degree bound folds in, its last layer
 //! the format's; every M31 limb canonical.
 //!
-//! **The trust boundary:** two facts the verifier leaves to Stwo, each
+//! **The trust boundary:** three facts the verifier leaves to Stwo, each
 //! pinned by the format and tested.
 //! - `verify_values` zips the sample points with the sampled values, and
 //!   its trees with the decommitments and queried values: the trees'
 //!   widths ([`crate::TREE_WIDTHS`]) and counts, which [`check_shape`]
 //!   holds every proof to first;
-//! - `FriVerifier::commit` derives FRI's rounds from the largest committed
-//!   column (17: [`FRI_ROUNDS`], `[3, 3, 3, 2]`), which [`fri_rounds`]
-//!   derives as it does and the security count (`vos_pvm_proof::security`)
-//!   is taken at.
+//! - `verify_values` takes FRI's degree bound as the last committed tree's
+//!   height less the blowup, so the composition tree must be the last
+//!   commitment and the tallest ([`LOG_DEGREE_BOUND`], 17): held by
+//!   `committed_log_sizes`, which lays it out last, and by the test that the
+//!   tallest committed column is at 17;
+//! - `FriVerifier::commit` derives FRI's rounds from that bound
+//!   ([`FRI_ROUNDS`], `[3, 3, 3, 2]`), which [`fri_rounds`] derives as it
+//!   does and the security count (`vos_pvm_proof::security`) is taken at.
 //!
 //! And the shape is tied to the transcript: the values the verifier's own
 //! sample points batch are the format's ([`DEEP_VALUES`], 538, the
@@ -112,9 +116,34 @@ pub const LOG_MASK_ROWS: u32 = 8;
 /// value (`MASKED_WRAP_REFERENCE.sampled_values`).
 pub const DEEP_VALUES: usize = 538;
 
-/// FRI's folding rounds at format 39's degree bound, 2^17, to its 2^6 last
-/// layer: the first with the circle fold in it ([`fri_rounds`]).
+/// FRI's degree bound under format 39: the composition's, committed whole
+/// at `m + 2` for the wrap's tallest component of `2^15` rows.
+pub const LOG_DEGREE_BOUND: u32 = 17;
+
+/// FRI's folding rounds at format 39's degree bound, 2^[`LOG_DEGREE_BOUND`],
+/// to its 2^6 last layer: the first with the circle fold in it
+/// ([`fri_rounds`]).
 pub const FRI_ROUNDS: [u32; 4] = [3, 3, 3, 2];
+
+/// Format 39's samples of column `column` of tree `tree`, as its sample
+/// points lay them out: every preprocessed column once; in the main tree
+/// the 16 `p2` columns its last round also reads at the previous row (every
+/// other one from 269) twice, the rest once, the 8 salts never; in the
+/// interaction tree each component's running sum (4 columns) twice, the
+/// rest once, the salts never; in the composition tree its 4 coordinates
+/// and `R`'s 8 once, the salts never. The decode reads exactly these;
+/// [`check_shape`] holds every proof to the sample points themselves.
+pub const fn samples(tree: usize, column: usize) -> usize {
+    match (tree, column) {
+        (0, 0..57) => 1,
+        (1, 269..301) if column & 1 == 1 => 2,
+        (1, 0..373) => 1,
+        (2, 8..12 | 20..24 | 36..40) => 2,
+        (2, 0..40) => 1,
+        (3, 0..12) => 1,
+        _ => 0,
+    }
+}
 
 /// A masked format, as its verifier pins it: nothing here is read from a
 /// proof.
@@ -214,6 +243,21 @@ pub struct Claim<'a, R, Hash> {
     pub claimed_sums: &'a [SecureField],
 }
 
+/// Each column of `values` holds one value for each of its sample points.
+fn samples_fit<P, V>(
+    points: &TreeVec<ColumnVec<Vec<P>>>,
+    values: &TreeVec<ColumnVec<Vec<V>>>,
+) -> bool {
+    points.len() == values.len()
+        && points.iter().zip(values.iter()).all(|(points, values)| {
+            points.len() == values.len()
+                && points
+                    .iter()
+                    .zip(values)
+                    .all(|(points, values)| points.len() == values.len())
+        })
+}
+
 /// The shape every proof of `format` has, whatever its challenges, before
 /// any Stwo call: four trees of commitments, decommitments, sampled and
 /// queried values; each tree's sampled and queried columns its committed
@@ -243,17 +287,7 @@ pub fn check_shape<H: MerkleHasherLifted>(
             "the component set's trees are not the format's",
         ));
     }
-    let samples_fit = points
-        .iter()
-        .zip(stark.sampled_values.iter())
-        .all(|(points, values)| {
-            points.len() == values.len()
-                && points
-                    .iter()
-                    .zip(values)
-                    .all(|(points, values)| points.len() == values.len())
-        });
-    if !samples_fit {
+    if !samples_fit(points, &stark.sampled_values) {
         return Err(Error::Shape(
             "a column's samples are not its sample points'",
         ));
@@ -364,14 +398,7 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
             "the sample points' DEEP values are not the format's",
         ));
     }
-    let fits = points
-        .iter()
-        .zip(proof.sampled_values.iter())
-        .all(|(points, values)| {
-            points.len() == values.len()
-                && points.iter().zip(values).all(|(p, v)| p.len() == v.len())
-        });
-    if !fits {
+    if !samples_fit(&points, &proof.sampled_values) {
         return Err(Error::Shape(
             "a column's samples are not its sample points'",
         ));
@@ -431,8 +458,10 @@ pub fn decode(bytes: &[u8]) -> Result<WrapProof, Error> {
 }
 
 /// `proof`'s fixed layout: what the prover emits for format 39, and the one
-/// encoding [`decode`] reads.
-pub fn encode(proof: &WrapProof) -> Vec<u8> {
+/// encoding [`decode`] reads; `None` for a proof the layout cannot hold (a
+/// column of other samples than [`samples`], a tree whose queried columns
+/// differ in length), which no verifier would accept.
+pub fn encode(proof: &WrapProof) -> Option<Vec<u8>> {
     crate::layout::encode(proof)
 }
 
@@ -494,7 +523,9 @@ mod tests {
     use stwo::core::channel::Blake2bChannel;
 
     /// The wrap's set at format 39's pins: the trees' widths 57 / 381 / 48 /
-    /// 20 and 538 DEEP values, as pinned.
+    /// 20 and 538 DEEP values, as pinned; the composition tree the last and
+    /// at FRI's degree bound, the tallest; every column's samples
+    /// [`samples`]'.
     #[test]
     fn the_pinned_shape_is_the_wrap_components() {
         let layout = WrapComponents::build(
@@ -505,7 +536,19 @@ mod tests {
         );
         assert_eq!(shape_of(&layout, &PINS), Some((TREE_WIDTHS, DEEP_VALUES)));
         let trees = committed_log_sizes(&layout, &PINS).unwrap();
-        assert_eq!(trees.iter().flatten().max(), Some(&17));
+        assert_eq!(trees.iter().flatten().max(), Some(&LOG_DEGREE_BOUND));
+        assert!(trees[3].iter().all(|&level| level == LOG_DEGREE_BOUND));
+        let points = sample_points(&layout, CirclePoint::zero(), &PINS).unwrap();
+        for (tree, columns) in points.iter().enumerate() {
+            for (column, points) in columns.iter().enumerate() {
+                assert_eq!(
+                    points.len(),
+                    samples(tree, column),
+                    "tree {tree}, column {column}"
+                );
+            }
+            assert_eq!(samples(tree, columns.len()), 0, "past tree {tree}");
+        }
     }
 
     /// FRI's rounds at 2^17 to a 2^6 last layer in steps of 3: `[3, 3, 3,
@@ -513,7 +556,10 @@ mod tests {
     /// proof.
     #[test]
     fn fri_rounds_fold_as_commit_does() {
-        assert_eq!(fri_rounds(17, &CONFIG.fri_config).unwrap(), FRI_ROUNDS);
+        assert_eq!(
+            fri_rounds(LOG_DEGREE_BOUND, &CONFIG.fri_config).unwrap(),
+            FRI_ROUNDS
+        );
         let config = |fold_step, log_last_layer_degree_bound| FriConfig {
             fold_step,
             log_last_layer_degree_bound,

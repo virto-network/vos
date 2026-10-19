@@ -339,7 +339,9 @@ fuzz_target!(|mutations: Vec<Mutation>| {
         if golden.verify(proof.clone()) {
             golden.assert_is_golden(&proof);
         }
-        let mut bytes = golden.encode(&proof);
+        let mut bytes = golden
+            .encode(&proof)
+            .unwrap_or_else(|| golden.proof.clone());
         for mutation in &mutations {
             apply_bytes(&mut bytes, mutation);
         }

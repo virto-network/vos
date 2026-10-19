@@ -213,6 +213,10 @@ impl Decoded {
         &self.proof
     }
 
+    pub fn into_proof(self) -> WrapProof {
+        self.proof
+    }
+
     /// Verifies the proof under its format against the public `words`, and
     /// returns the statement they make.
     pub fn verify(self, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {

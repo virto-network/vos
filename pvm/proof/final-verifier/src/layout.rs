@@ -2,12 +2,15 @@
 //! FixedLayout`).
 //!
 //! The fields in a fixed order, every integer little-endian at its width,
-//! no varints; every vector a `u32` count, then its items. Each count is
-//! checked against the format's pin (equal) or bound (at most), and against
-//! the bytes left, before anything is allocated for it; nothing follows the
-//! last field. An M31 limb is a `u32` below `p`. So a proof has one
-//! encoding: decode and [`encode`] are inverse on every byte string decode
-//! accepts.
+//! no varints; a vector whose length the proof chooses a `u32` count, then
+//! its items, and one whose length the format fixes its items alone. Each
+//! count is checked against the format's pin (equal) or bound (at most), and
+//! against the bytes left, before anything is allocated for it; nothing
+//! follows the last field. An M31 limb is a `u32` below `p`. So a proof has
+//! one encoding: decode and [`encode`] are inverse on every byte string
+//! decode accepts, and `encode` refuses a proof the layout cannot hold (a
+//! column of other samples than the format's, a tree's queried columns of
+//! unequal lengths).
 //!
 //! In order:
 //! - the header: the format (`u32`); the log sizes (3 `u32`); the
@@ -17,11 +20,13 @@
 //!   format checked first; then the interaction PoW nonce (`u64`) and the 3
 //!   claimed sums (4 limbs each);
 //! - the 4 commitments (32 bytes each);
-//! - the sampled values: 4 trees, each its columns, each its samples (at
-//!   most 2), 4 limbs each;
+//! - the sampled values: 4 trees, each its columns (pinned), each column
+//!   the samples the format fixes for it ([`crate::masked::samples`]: 0, 1
+//!   or 2), 4 limbs each;
 //! - the 4 trees' Merkle decommitments: each its witness hashes;
-//! - the queried values: 4 trees, each its columns, each its values (at
-//!   most a query each), a limb each;
+//! - the queried values: 4 trees, each its columns (pinned) and one count of
+//!   values a column (at most a query), then the columns' values, a limb
+//!   each;
 //! - the PoW nonce (`u64`);
 //! - FRI's first layer, then its inner layers (their count pinned): each its
 //!   witness values (4 limbs each), its Merkle witness hashes and its
@@ -45,7 +50,7 @@ use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleHasher;
 use stwo::core::vcs_lifted::verifier::MerkleDecommitmentLifted;
 
-use crate::masked::{CONFIG, FORMAT, FRI_ROUNDS, TREES};
+use crate::masked::{CONFIG, FORMAT, FRI_ROUNDS, LOG_DEGREE_BOUND, TREES, samples};
 use crate::{Error, LOG_SIZES, MAX_PROOF_BYTES, TREE_WIDTHS, WrapProof};
 
 /// A hash's bytes.
@@ -53,13 +58,10 @@ const HASH: usize = 32;
 /// An M31 limb's.
 const LIMB: usize = 4;
 
-/// The most samples a column has: at its row and its previous row.
-const MAX_SAMPLES: usize = 2;
 /// The most values a queried column has: one a query.
 const MAX_QUERIES: usize = CONFIG.fri_config.n_queries;
-/// The tallest tree's height: the composition's degree bound, 2^17, under
-/// the blowup.
-const HEIGHT: usize = 17 + CONFIG.fri_config.log_blowup_factor as usize;
+/// The tallest tree's height: FRI's degree bound under the blowup.
+const HEIGHT: usize = (LOG_DEGREE_BOUND + CONFIG.fri_config.log_blowup_factor) as usize;
 /// The most hashes a Merkle witness holds: a sibling a query a level.
 const MAX_WITNESS_HASHES: usize = MAX_QUERIES * HEIGHT;
 /// The most values a FRI layer's witness holds: the rest of each query's
@@ -180,15 +182,6 @@ impl<'a> Reader<'a> {
         Ok(items)
     }
 
-    fn bases(&mut self, count: usize) -> Result<Vec<BaseField>, Error> {
-        let limbs = self.items::<LIMB>(count)?;
-        let mut bases = Vec::with_capacity(count);
-        if !read_limbs(limbs, &mut bases) {
-            return Err(Error::Noncanonical);
-        }
-        Ok(bases)
-    }
-
     fn secures(&mut self, count: usize) -> Result<Vec<SecureField>, Error> {
         let limbs = count
             .checked_mul(SECURE_EXTENSION_DEGREE)
@@ -227,27 +220,34 @@ impl<'a> Reader<'a> {
         })
     }
 
-    /// A tree's columns, `width` of them, each a count of at most `bound`
-    /// items read by `column`.
-    fn columns<T>(
-        &mut self,
-        width: usize,
-        bound: usize,
-        what: &'static str,
-        mut column: impl FnMut(&mut Self, usize) -> Result<Vec<T>, Error>,
-    ) -> Result<Vec<Vec<T>>, Error> {
-        let width = self.pinned(width, what)?;
-        // Each column holds at least its count.
-        if width
-            .checked_mul(LIMB)
-            .is_none_or(|len| len > self.bytes.len())
-        {
-            return Err(Error::Decode);
-        }
+    /// Tree `tree`'s sampled values: its `width` columns (pinned), each the
+    /// samples the format fixes for it.
+    fn sampled_tree(&mut self, tree: usize, width: usize) -> Result<Vec<Vec<SecureField>>, Error> {
+        let width = self.pinned(width, "a tree's sampled columns")?;
         let mut columns = Vec::with_capacity(width);
-        for _ in 0..width {
-            let count = self.count(bound)?;
-            columns.push(column(self, count)?);
+        for column in 0..width {
+            columns.push(self.secures(samples(tree, column))?);
+        }
+        Ok(columns)
+    }
+
+    /// A tree's queried values: its `width` columns (pinned) and one count
+    /// of values a column, at most a query each, then the columns' values.
+    fn queried_tree(&mut self, width: usize) -> Result<Vec<Vec<BaseField>>, Error> {
+        let width = self.pinned(width, "a tree's queried columns")?;
+        let rows = self.count(MAX_QUERIES)?;
+        let limbs = self.items::<LIMB>(width.checked_mul(rows).ok_or(Error::Decode)?)?;
+        let mut columns = Vec::with_capacity(width);
+        let mut canonical = true;
+        for column in 0..width {
+            let mut values = Vec::with_capacity(rows);
+            if let Some(limbs) = limbs.get(column * rows..(column + 1) * rows) {
+                canonical &= read_limbs(limbs, &mut values);
+            }
+            columns.push(values);
+        }
+        if !canonical {
+            return Err(Error::Noncanonical);
         }
         Ok(columns)
     }
@@ -268,20 +268,14 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<WrapProof, Error> {
         }
     }
     let interaction_pow = reader.u64()?;
-    let claimed = reader.secures(3)?;
-    let claimed_sums = [claimed[0], claimed[1], claimed[2]];
+    let claimed_sums = reader.secures(3)?.try_into().map_err(|_| Error::Decode)?;
 
     let count = reader.pinned(TREES, "four commitments")?;
     let commitments = reader.hashes(count)?;
     reader.pinned(TREES, "four trees of sampled values")?;
     let mut sampled_values = Vec::with_capacity(TREES);
-    for width in TREE_WIDTHS {
-        sampled_values.push(reader.columns(
-            width,
-            MAX_SAMPLES,
-            "a tree's sampled columns",
-            Reader::secures,
-        )?);
+    for (tree, width) in TREE_WIDTHS.into_iter().enumerate() {
+        sampled_values.push(reader.sampled_tree(tree, width)?);
     }
     let count = reader.pinned(TREES, "four decommitments")?;
     let mut decommitments = Vec::with_capacity(count);
@@ -293,12 +287,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<WrapProof, Error> {
     reader.pinned(TREES, "four trees of queried values")?;
     let mut queried_values = Vec::with_capacity(TREES);
     for width in TREE_WIDTHS {
-        queried_values.push(reader.columns(
-            width,
-            MAX_QUERIES,
-            "a tree's queried columns",
-            Reader::bases,
-        )?);
+        queried_values.push(reader.queried_tree(width)?);
     }
     let proof_of_work = reader.u64()?;
     let first_layer = reader.fri_layer()?;
@@ -384,43 +373,53 @@ impl Writer {
     }
 }
 
-/// `proof` in the module's layout.
-pub(crate) fn encode(proof: &WrapProof) -> Vec<u8> {
+/// The bytes reserved for an encoding: a format-39 proof is about 150 KB.
+const CAPACITY: usize = 160 << 10;
+
+/// `proof` in the module's layout; `None` for a proof it cannot hold: a
+/// column of other samples than the format fixes, or a tree whose queried
+/// columns differ in length.
+pub(crate) fn encode(proof: &WrapProof) -> Option<Vec<u8>> {
     let stark = &proof.stark_proof;
     let config = &stark.config;
-    let writer = &mut Writer {
-        bytes: Vec::with_capacity(160 << 10),
+    let mut writer = Writer {
+        bytes: Vec::with_capacity(CAPACITY),
     };
     writer.u32(proof.format_version);
-    proof
-        .log_sizes
-        .iter()
-        .for_each(|&log_size| writer.u32(log_size));
+    for &log_size in &proof.log_sizes {
+        writer.u32(log_size);
+    }
     writer.u32(config.pow_bits);
     writer.count(config.fri_config.n_queries);
     writer.u32(config.fri_config.log_blowup_factor);
     writer.u32(config.fri_config.log_last_layer_degree_bound);
     writer.u32(config.fri_config.fold_step);
-    match config.lifting_log_size {
+    let lifting = match config.lifting_log_size {
         None => [0, 0],
         Some(size) => [1, size],
+    };
+    for word in lifting {
+        writer.u32(word);
     }
-    .into_iter()
-    .for_each(|word| writer.u32(word));
     writer.u64(proof.interaction_pow);
-    proof
-        .claimed_sums
-        .iter()
-        .for_each(|value| writer.secure(value));
+    for value in &proof.claimed_sums {
+        writer.secure(value);
+    }
 
     writer.count(stark.commitments.len());
-    stark.commitments.iter().for_each(|hash| writer.hash(hash));
+    for hash in stark.commitments.iter() {
+        writer.hash(hash);
+    }
     writer.count(stark.sampled_values.len());
-    for tree in stark.sampled_values.iter() {
-        writer.count(tree.len());
-        for column in tree {
-            writer.count(column.len());
-            column.iter().for_each(|value| writer.secure(value));
+    for (tree, columns) in stark.sampled_values.iter().enumerate() {
+        writer.count(columns.len());
+        for (column, values) in columns.iter().enumerate() {
+            if values.len() != samples(tree, column) {
+                return None;
+            }
+            for value in values {
+                writer.secure(value);
+            }
         }
     }
     writer.count(stark.decommitments.len());
@@ -428,25 +427,29 @@ pub(crate) fn encode(proof: &WrapProof) -> Vec<u8> {
         writer.hashes(&decommitment.hash_witness);
     }
     writer.count(stark.queried_values.len());
-    for tree in stark.queried_values.iter() {
-        writer.count(tree.len());
-        for column in tree {
-            writer.count(column.len());
-            column.iter().for_each(|value| writer.base(value));
+    for columns in stark.queried_values.iter() {
+        let rows = columns.first().map_or(0, Vec::len);
+        if columns.iter().any(|values| values.len() != rows) {
+            return None;
+        }
+        writer.count(columns.len());
+        writer.count(rows);
+        for value in columns.iter().flatten() {
+            writer.base(value);
         }
     }
     writer.u64(stark.proof_of_work);
     let fri = &stark.fri_proof;
     writer.fri_layer(&fri.first_layer);
     writer.count(fri.inner_layers.len());
-    fri.inner_layers
-        .iter()
-        .for_each(|layer| writer.fri_layer(layer));
+    for layer in &fri.inner_layers {
+        writer.fri_layer(layer);
+    }
     writer.count(fri.last_layer_poly.iter().count());
-    fri.last_layer_poly
-        .iter()
-        .for_each(|value| writer.secure(value));
-    core::mem::take(&mut writer.bytes)
+    for value in fri.last_layer_poly.iter() {
+        writer.secure(value);
+    }
+    Some(writer.bytes)
 }
 
 #[cfg(test)]
@@ -454,6 +457,10 @@ mod tests {
     use super::*;
 
     use crate::masked::FORMAT;
+
+    fn encode_ok(proof: &WrapProof) -> Vec<u8> {
+        encode(proof).expect("the layout holds it")
+    }
 
     /// A change to a proof.
     type Change = fn(&mut WrapProof);
@@ -484,9 +491,10 @@ mod tests {
                 sampled_values: TreeVec(
                     TREE_WIDTHS
                         .iter()
-                        .map(|&width| {
-                            (0..width as u32)
-                                .map(|i| alloc::vec![value(i); (i % 3) as usize])
+                        .enumerate()
+                        .map(|(tree, &width)| {
+                            (0..width)
+                                .map(|i| alloc::vec![value(i as u32); samples(tree, i)])
                                 .collect()
                         })
                         .collect(),
@@ -528,9 +536,9 @@ mod tests {
     /// Decode and encode are inverse: the bytes re-encode to themselves.
     #[test]
     fn the_layout_round_trips() {
-        let bytes = encode(&smallest());
+        let bytes = encode_ok(&smallest());
         let decoded = decode(&bytes).unwrap();
-        assert_eq!(encode(&decoded), bytes);
+        assert_eq!(encode_ok(&decoded), bytes);
         assert_eq!(decoded.stark_proof.config, CONFIG);
     }
 
@@ -538,7 +546,7 @@ mod tests {
     /// the last field.
     #[test]
     fn every_truncation_and_trailing_byte_is_refused() {
-        let bytes = encode(&smallest());
+        let bytes = encode_ok(&smallest());
         for len in 0..bytes.len() {
             assert_decode_err(
                 &bytes[..len],
@@ -593,12 +601,12 @@ mod tests {
             let mut proof = base.clone();
             change(&mut proof);
             assert_decode_err(
-                &encode(&proof),
+                &encode_ok(&proof),
                 |error| matches!(error, Error::Format),
                 what,
             );
         }
-        let mut bytes = encode(&base);
+        let mut bytes = encode_ok(&base);
         // The lifting words other than none's.
         bytes[36] = 2;
         assert_decode_err(
@@ -613,7 +621,7 @@ mod tests {
     #[test]
     fn every_count_is_pinned_or_bounded() {
         let base = smallest();
-        let cases: [(&str, Change); 12] = [
+        let cases: [(&str, Change); 11] = [
             ("a commitment more", |p| {
                 p.stark_proof.0.commitments.push(Blake2bHash::default())
             }),
@@ -626,9 +634,6 @@ mod tests {
             ("a salt's column more", |p| {
                 p.stark_proof.0.sampled_values[3].push(Vec::new())
             }),
-            ("three samples", |p| {
-                p.stark_proof.0.sampled_values[2][0] = alloc::vec![SecureField::default(); 3]
-            }),
             ("a decommitment fewer", |p| {
                 p.stark_proof.0.decommitments.pop();
             }),
@@ -640,7 +645,10 @@ mod tests {
                 p.stark_proof.0.queried_values[3].pop();
             }),
             ("a value a query too many", |p| {
-                p.stark_proof.0.queried_values[0][0] = alloc::vec![BaseField::default(); 25]
+                for column in &mut p.stark_proof.0.queried_values[0] {
+                    column.push(BaseField::default());
+                    column.resize(25, BaseField::default());
+                }
             }),
             ("an inner layer more", |p| {
                 let extra = p.stark_proof.0.fri_proof.inner_layers[0].clone();
@@ -659,13 +667,13 @@ mod tests {
             let mut proof = base.clone();
             change(&mut proof);
             assert_decode_err(
-                &encode(&proof),
+                &encode_ok(&proof),
                 |error| matches!(error, Error::Shape(_)),
                 what,
             );
         }
         // A count no bytes follow: refused before its items are allocated.
-        let mut bytes = encode(&base);
+        let mut bytes = encode_ok(&base);
         let at = 4 * (1 + 3 + 7) + 8 + 3 * LIMB * SECURE_EXTENSION_DEGREE;
         bytes.truncate(at + 4 + TREES * HASH + 4);
         bytes.extend_from_slice(&(TREE_WIDTHS[0] as u32).to_le_bytes());
@@ -703,10 +711,34 @@ mod tests {
             let mut proof = base.clone();
             change(&mut proof, p);
             assert_decode_err(
-                &encode(&proof),
+                &encode_ok(&proof),
                 |error| matches!(error, Error::Noncanonical),
                 what,
             );
+        }
+    }
+
+    /// The layout holds no column of other samples than the format fixes
+    /// and no tree of queried columns of unequal lengths: `encode` refuses
+    /// them, and no decode produces them.
+    #[test]
+    fn encode_refuses_what_the_layout_cannot_hold() {
+        let base = smallest();
+        let cases: [(&str, Change); 3] = [
+            ("a sample more", |p| {
+                p.stark_proof.0.sampled_values[2][0].push(SecureField::default())
+            }),
+            ("a salt sampled", |p| {
+                p.stark_proof.0.sampled_values[1][380].push(SecureField::default())
+            }),
+            ("a queried column longer", |p| {
+                p.stark_proof.0.queried_values[1][7].push(BaseField::default())
+            }),
+        ];
+        for (what, change) in cases {
+            let mut proof = base.clone();
+            change(&mut proof);
+            assert!(encode(&proof).is_none(), "{what}");
         }
     }
 }

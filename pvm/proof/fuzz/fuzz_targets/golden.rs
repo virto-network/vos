@@ -33,16 +33,17 @@ impl Golden {
     /// not bind, which no mutation should find.
     pub fn assert_is_golden(&self, proof: &vos_pvm_final_verifier::WrapProof) {
         assert!(
-            self.encode(proof) == self.proof,
+            self.encode(proof).as_ref() == Some(&self.proof),
             "an accepted proof that is not the golden one"
         );
     }
 
-    /// `proof` in the golden's format's encoding.
-    pub fn encode(&self, proof: &vos_pvm_final_verifier::WrapProof) -> Vec<u8> {
+    /// `proof` in the golden's format's encoding; `None` for a proof 39's
+    /// layout cannot hold.
+    pub fn encode(&self, proof: &vos_pvm_final_verifier::WrapProof) -> Option<Vec<u8>> {
         match self.format {
             vos_pvm_final_verifier::masked::FORMAT => vos_pvm_final_verifier::masked::encode(proof),
-            _ => postcard::to_allocvec(proof).expect("encodes"),
+            _ => Some(postcard::to_allocvec(proof).expect("encodes")),
         }
     }
 
@@ -52,7 +53,7 @@ impl Golden {
         bytes: &[u8],
     ) -> Result<vos_pvm_final_verifier::WrapProof, vos_pvm_final_verifier::Error> {
         vos_pvm_final_verifier::decode(self.format, vos_pvm_final_verifier::LINKED, bytes)
-            .map(|decoded| decoded.proof().clone())
+            .map(vos_pvm_final_verifier::Decoded::into_proof)
     }
 
     /// Verifies `proof` under the golden's format against its words.
@@ -113,13 +114,13 @@ pub fn golden() -> &'static Golden {
 pub fn golden_39() -> &'static Golden {
     static GOLDEN: OnceLock<Golden> = OnceLock::new();
     GOLDEN.get_or_init(|| {
-        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../target/tmp/wrap");
+        let directory = masked_directory();
         let read = |extension: &str| {
             let path = directory.join(format!("one-segment-39.{extension}"));
             std::fs::read(&path).unwrap_or_else(|error| {
                 panic!(
-                    "{} ({error}): run `cargo test -p vos-pvm-recair --test recursion masked` first",
+                    "{} ({error}): run `cargo test -p vos-pvm-recair --test recursion masked` \
+                     first, with this `CARGO_TARGET_DIR` if the workspace's is elsewhere",
                     path.display()
                 )
             })
@@ -134,7 +135,7 @@ pub fn golden_39() -> &'static Golden {
         let decoded = vos_pvm_final_verifier::masked::decode(&proof).expect("decodes");
         assert_eq!(
             vos_pvm_final_verifier::masked::encode(&decoded),
-            proof,
+            Some(proof.clone()),
             "the fixed layout is the one encoding"
         );
         Golden {
@@ -143,6 +144,16 @@ pub fn golden_39() -> &'static Golden {
             words,
         }
     })
+}
+
+/// Where `vos-pvm-recair`'s masked wrap tests write the format-39 golden:
+/// `wrap` under the workspace's target directory's `tmp`, the workspace's
+/// `target` unless `CARGO_TARGET_DIR` names another.
+pub fn masked_directory() -> std::path::PathBuf {
+    std::env::var_os("CARGO_TARGET_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../target"))
+        .join("tmp/wrap")
 }
 
 /// Both goldens.

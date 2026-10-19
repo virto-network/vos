@@ -19,11 +19,11 @@
 //!   - 2: a golden vector of `vos-anchor` (`vos_anchor::vectors::Vector`'s
 //!     encoding), and nothing after it: its digests are computed, and no
 //!     proof is read;
-//! - the proof, in its format's encoding, as a preimage of the running service, read by
-//!   `historical_lookup`: only once a judgement's checks before the proof
-//!   pass, and only when its length is at most
-//!   `vos_pvm_final_verifier::MAX_PROOF_BYTES`, refused before any allocation
-//!   or lookup otherwise.
+//! - the proof, in its format's encoding, as a preimage of the running
+//!   service, read by `historical_lookup`: only once a judgement's checks
+//!   before the proof pass, and only when its length is at most
+//!   `vos_pvm_final_verifier::MAX_PROOF_BYTES`, refused before any
+//!   allocation or lookup otherwise.
 //!
 //! Output (φ7 address, φ8 length): [`Report`], every field a little-endian
 //! `u64`: the verdict, the gas left at each phase, the heap's figures, a
