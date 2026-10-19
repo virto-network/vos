@@ -501,14 +501,13 @@ pub fn prove_fold(
 /// the Blake2b-256 channel within 2^17 rows and 8 GiB of heap, and verified
 /// by `vos-pvm-final-verifier`, its statement the program's id and the root's
 /// io-hash: the proof's bytes (postcard) and its public words; its proving
-/// time and peak heap added to `wrap`. With `masked`, the same witness is
-/// proved masked under format 39 as well ([`masked_wrap`]).
+/// time and peak heap added to `wrap`. The same witness is proved masked
+/// under format 39 as well ([`masked_wrap`]).
 pub fn wrap_root(
     name: &str,
     program: &vos_pvm_proof::program_id::KernelProgram,
     root: &NodeRun,
     wrap: &mut Tally,
-    masked: bool,
 ) -> (Vec<u8>, [u32; vos_pvm_final_verifier::PUBLIC_WORDS]) {
     use vos_pvm_recair::wrap::{self, WrapCircuit};
 
@@ -540,9 +539,7 @@ pub fn wrap_root(
     assert_eq!(verified, statement);
     assert_eq!(statement.program, program.id().0.map(|word| word.0));
     assert_eq!(statement.io_hash, root.node.output.io_hash);
-    if masked {
-        masked_wrap(name, &finalized, &words);
-    }
+    masked_wrap(name, &finalized, &words);
     (bytes, words)
 }
 
