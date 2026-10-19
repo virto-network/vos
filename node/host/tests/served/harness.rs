@@ -15,28 +15,26 @@ use vos_checker::{Log, Nodes};
 use vos_net::memory::Hub;
 use vos_node::client::Target;
 use vos_node::{CallError, Config, Hooks, Node, Peers, Space};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, Session, SessionId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, SessionId};
 use vos_wire::keys;
 use vos_wire::peer::NodeNumber;
-use vos_wire::records::{PendingRead, SessionMark, unstored};
+use vos_wire::records::{SessionMark, unstored};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, WindowClock};
 
 pub const NODES: NodeNumber = 3;
 
-/// The pending request a leader's batch records, by its agent and time.
-pub type Asks = dyn Fn(AgentId, u64) -> Option<(RequestId, PendingRead)> + Send + Sync;
-
 /// Stops a leader loop once, after its commit and before its answers;
-/// holds the node's refines, or its commits, while asked; and has the
-/// leader's batches record the pending requests `asks` gives.
+/// holds the node's refines, or its commits, while asked; and, once set,
+/// has the leader serve the reads its replica proved at their cuts with
+/// a stand-in for the space's representative.
 #[derive(Default)]
 pub struct Trip {
     pub armed: AtomicBool,
     pub tripped: AtomicBool,
     pub refines: Gate,
     pub commits: Gate,
-    pub asks: Mutex<Option<Arc<Asks>>>,
+    pub stand_in: AtomicBool,
 }
 
 impl Hooks for Trip {
@@ -57,9 +55,8 @@ impl Hooks for Trip {
         self.commits.pass();
     }
 
-    fn request_at_cut(&self, agent: AgentId, time: u64) -> Option<(RequestId, PendingRead)> {
-        let asks = self.asks.lock().unwrap().clone()?;
-        asks(agent, time)
+    fn stand_in_representative(&self) -> bool {
+        self.stand_in.load(Ordering::SeqCst)
     }
 }
 

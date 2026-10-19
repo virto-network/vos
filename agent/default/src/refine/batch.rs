@@ -9,13 +9,15 @@ use vos_wire::abi::Failure;
 use vos_wire::batch::{Batch, Body, Input, Message};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Session, WorkflowId};
 use vos_wire::records::{SessionMark, Workflow};
-use vos_wire::result::{ResultWriter, Run, Step};
+use vos_wire::result::{InputRef, Outcome, ResultWriter, Run, Step};
 use vos_wire::{defaults, keys};
 
 use super::Call;
 use super::admin::admin;
 use super::base::Base;
-use super::inputs::{acknowledge, called, failed_in_refine, message, out_of_order, sweep};
+use super::inputs::{
+    acknowledge, called, consumed, failed_in_refine, message, out_of_order, sweep,
+};
 use super::sessions::{ByName, Counts, Held, admit, by_name};
 use super::workflows::{self, Floor};
 use crate::host::gas;
@@ -170,23 +172,42 @@ fn plan(base: &Base, pairs: &BTreeMap<AgentId, u64>, input: &Input, handler: boo
             sequence,
             body: Body::Reply { awaiting, .. },
         }) if out_of_order(base, pairs, *from, *sequence).is_none() => {
-            match workflows::resumed(base, *from, awaiting) {
-                Err(_) => None,
-                Ok(Some((workflow, bytes))) => {
-                    // One that could never run fails at once, running none.
-                    let kept = workflows::kept(base, &workflow, bytes);
-                    let (reserve, limit) = kept.unwrap_or((reserve, 0));
-                    Some(Plan {
-                        reserve,
-                        limit,
-                        resumes: Some((workflow, kept)),
-                        runs: kept.is_some(),
-                    })
-                }
-                Ok(None) => plain(0),
-            }
+            resuming(base, workflows::resumed(base, *from, awaiting), reserve)
         }
+        Input::Resume {
+            window, request, ..
+        } => resuming(base, workflows::attesting(base, *window, request), reserve),
         _ => plain(0),
+    }
+}
+
+/// The plan of an input that resumes the workflow `found`, if any, with
+/// its record's stored length: what the meter keeps for its step, or, for
+/// one that could never run, which fails at once running none, the input's
+/// `reserve` alone.
+fn resuming(
+    base: &Base,
+    found: Result<Option<(Workflow, u64)>, Failure>,
+    reserve: u64,
+) -> Option<Plan> {
+    match found {
+        Err(_) => None,
+        Ok(Some((workflow, bytes))) => {
+            let kept = workflows::kept(base, &workflow, bytes);
+            let (reserve, limit) = kept.unwrap_or((reserve, 0));
+            Some(Plan {
+                reserve,
+                limit,
+                resumes: Some((workflow, kept)),
+                runs: kept.is_some(),
+            })
+        }
+        Ok(None) => Some(Plan {
+            reserve,
+            limit: 0,
+            resumes: None,
+            runs: false,
+        }),
     }
 }
 
@@ -274,6 +295,19 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
             Input::Admin(admin) => Stepped::new(self::admin(base, admin), None),
             Input::Ack { to, sequence } => Stepped::new(acknowledge(to, sequence), None),
             Input::Sweep { due } => sweep(base, &due),
+            Input::Resume {
+                request, served, ..
+            } => {
+                let input = InputRef::Resume { request };
+                match plan.resumes {
+                    Some((workflow, kept)) => {
+                        let resume = workflows::Resume::Served(served);
+                        let id = request.workflow;
+                        workflows::resume_step(base, index, input, id, workflow, resume, kept, 0)
+                    }
+                    None => Stepped::ran(consumed(input, Outcome::Done(Vec::new()))),
+                }
+            }
         };
         let Some(due) = batched.take(base, stepped, plan.reserve, plan.runs) else {
             break;

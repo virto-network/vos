@@ -11,9 +11,10 @@ impl Counter {
         Self { value: 0 }
     }
 
-    #[attestable]
-    pub fn reads_state(&self, by: u64) -> u64 {
-        self.value + by
+    #[msg]
+    pub async fn add(&mut self, #[public] by: u64) -> u64 {
+        self.value += by;
+        self.value
     }
 }
 

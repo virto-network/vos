@@ -19,12 +19,12 @@ use vos_pvm::ExitReason;
 use vos_pvm::refine::{Machine, MemoryModel, PreparedProgram};
 use vos_pvm::spi::StandardLayout;
 use vos_wire::abi::cap::{self, Limits};
-use vos_wire::abi::{self, Failure, Kind, Op, code, price};
+use vos_wire::abi::{self, AttestError, Failure, Kind, Op, code, price};
 use vos_wire::batch::{Answer, Await};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, WorkflowId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, RequestId, WorkflowId};
 use vos_wire::keys::{self, Due};
 use vos_wire::records::{Snapshot, Workflow, WorkflowState};
-use vos_wire::result::{InstanceGas, Outcome, Outgoing, PAGE, Page, Write, digest};
+use vos_wire::result::{Attested, InstanceGas, Outcome, Outgoing, PAGE, Page, Write, digest};
 use vos_wire::{Decode, Encode, defaults};
 
 use crate::invocation::{Call, Ended, Invocation};
@@ -32,6 +32,13 @@ use crate::memory::precompile;
 use crate::{Step, Testkit, split_writes};
 
 type Rows = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
+
+/// What a workflow's step resumes with: its input, or the rows its read at
+/// a cut is served (`None`: unserved), which its kernel runs on first.
+enum Resume {
+    Input(Vec<u8>),
+    Served(Option<Vec<u8>>),
+}
 
 /// How a step left its workflow: paused and captured, or ended.
 enum Left {
@@ -200,8 +207,28 @@ impl Testkit {
             WorkflowState::Ready(input) | WorkflowState::Preempted(input) => input.clone(),
             WorkflowState::Awaiting { .. } => Answer::failed(Failure::TimedOut).encode(),
             WorkflowState::Sleeping { .. } => Vec::new(),
+            WorkflowState::Attesting { .. } => Attested::Failed(AttestError::NotClosed).encode(),
         };
-        self.step(id, workflow, resume)
+        self.step(id, workflow, Resume::Input(resume))
+    }
+
+    /// The step a read at window `window`'s cut, `request`, served
+    /// (`None`: unserved) makes: the step of the workflow awaiting it,
+    /// before its deadline, or one that runs nothing.
+    pub fn resume_read(
+        &mut self,
+        window: u64,
+        request: RequestId,
+        served: Option<Vec<u8>>,
+    ) -> Step {
+        let workflow = self.workflow(request.workflow).filter(|workflow| {
+            matches!(workflow.state, WorkflowState::Attesting { counter, window: at, deadline, .. }
+                if counter == request.awaits && at == window && self.time < deadline)
+        });
+        match workflow {
+            Some(workflow) => self.step(request.workflow, workflow, Resume::Served(served)),
+            None => self.quick(Rows::new()),
+        }
     }
 
     /// The step a row of the due index makes at `at` when it names a
@@ -234,7 +261,7 @@ impl Testkit {
             matches!(workflow.state, WorkflowState::Awaiting { agent, counter, deadline }
                 if agent == from && counter == awaiting.counter && self.time < deadline)
         })?;
-        Some(self.step(awaiting.workflow, workflow, answer.encode()))
+        Some(self.step(awaiting.workflow, workflow, Resume::Input(answer.encode())))
     }
 
     /// A wait from `from` for workflow `id`'s result: answered now if it
@@ -265,13 +292,24 @@ impl Testkit {
         step
     }
 
-    /// A step of workflow `id` with `resume` as its input; one that could
-    /// never run in a batch of the budget fails at once, past a cap.
-    fn step(&mut self, id: WorkflowId, mut workflow: Workflow, resume: Vec<u8>) -> Step {
+    /// A step of workflow `id` with `resume`, its read at a cut's kernel run
+    /// first when served; one that could never run in a batch of the budget
+    /// fails at once, past a cap. The request of a read it awaited goes.
+    fn step(&mut self, id: WorkflowId, mut workflow: Workflow, resume: Resume) -> Step {
         let index = self.steps;
         self.steps += 1;
         let mut step = Step::consumed(Outcome::Done(Vec::new()));
         let mut rows = Rows::new();
+        if let WorkflowState::Attesting {
+            counter, window, ..
+        } = workflow.state
+        {
+            let request = RequestId {
+                workflow: id,
+                awaits: counter,
+            };
+            rows.insert(keys::request(window, request), None);
+        }
         if !self.fits(&workflow) {
             let outcome = Outcome::failed(Failure::Cap);
             step.outcome = outcome.clone();
@@ -286,7 +324,30 @@ impl Testkit {
             workflow: id,
             counter: workflow.awaits,
         });
-        let left = self.run_step(&mut invocation, id, &workflow, &resume);
+        let (resume, spent) = match (resume, &workflow.state) {
+            (
+                Resume::Served(served),
+                WorkflowState::Attesting {
+                    counter,
+                    window,
+                    method,
+                    arguments,
+                    ..
+                },
+            ) => {
+                let request = RequestId {
+                    workflow: id,
+                    awaits: *counter,
+                };
+                let call = (*window, *method, arguments.as_slice());
+                let (answer, spent) =
+                    invocation.at_cut(workflow.instance, request, call, served, workflow.gas);
+                (answer.encode(), spent)
+            }
+            (Resume::Served(_), _) => unreachable!("served a workflow that reads at no cut"),
+            (Resume::Input(input), _) => (input, 0),
+        };
+        let left = self.run_step(&mut invocation, id, &workflow, &resume, spent);
         step.instances = invocation.instances.clone();
         step.gas_used = invocation.gas_used;
         let mut stored = Vec::new();
@@ -300,13 +361,14 @@ impl Testkit {
             Ok(Left::Paused(state, captured)) => {
                 keep_effects(&mut rows, &mut step);
                 let at = match state {
-                    WorkflowState::Awaiting { deadline, .. } => deadline,
+                    WorkflowState::Awaiting { deadline, .. }
+                    | WorkflowState::Attesting { deadline, .. } => deadline,
                     WorkflowState::Sleeping { until } => until,
                     // Due in the next millisecond, so its row moves.
                     WorkflowState::Preempted(_) => self.time + 1,
                     _ => unreachable!("a step pauses awaiting, asleep or preempted"),
                 };
-                if let WorkflowState::Awaiting { .. } = state {
+                if let WorkflowState::Awaiting { .. } | WorkflowState::Attesting { .. } = state {
                     workflow.awaits += 1;
                 }
                 Self::move_due(&mut rows, id, &mut workflow, at);
@@ -390,13 +452,15 @@ impl Testkit {
     }
 
     /// Restore workflow `id`'s machine, run it through the step with
-    /// `resume` as its input, and capture it if it paused.
+    /// `resume` as its input, `spent` of its limit already spent on its read
+    /// at a cut, and capture it if it paused.
     fn run_step(
         &self,
         invocation: &mut Invocation,
         id: WorkflowId,
         workflow: &Workflow,
         resume: &[u8],
+        spent: u64,
     ) -> Result<Left, Failure> {
         // Its target keeps its pages for a time: past it, it ends.
         let holds = workflow
@@ -476,7 +540,7 @@ impl Testkit {
             arguments: resume,
         };
         let resumed = *machine.registers();
-        let ended = invocation.workflow(&mut machine, call, workflow.gas, pending)?;
+        let ended = invocation.workflow(&mut machine, call, workflow.gas, pending, spent)?;
         // The pages the step wrote, among those the program may write, the
         // rest of its heap among them.
         let runs = [(layout.rw, heap), (layout.stack, 0)].map(|(region, more)| {
@@ -648,23 +712,26 @@ fn preempt_or_fail(
 impl Invocation<'_> {
     /// Run a workflow's machine, `call` its method by its owner on the
     /// step's input, through its step a unit at a time, the host call
-    /// `pending` first: effect-free code on the share of `limit`, each
-    /// effectful unit from its first effect with the whole limit, a call of
-    /// this agent's an await. Its own gas goes to its instance, as a
-    /// handler's.
+    /// `pending` first: effect-free code on the share of `limit`, `spent` of
+    /// it already gone to its read at a cut, each effectful unit from its
+    /// first effect with the whole limit, a call of this agent's an await.
+    /// Its own gas goes to its instance, as a handler's.
     pub(crate) fn workflow(
         &mut self,
         machine: &mut Machine,
         call: Call,
         limit: u64,
         pending: Option<u64>,
+        spent: u64,
     ) -> Result<Ended, Failure> {
-        set_gas(machine, limit);
+        set_gas(machine, limit.saturating_sub(spent));
+        // A read's kernel run is the step's move: a share it left spent
+        // preempts the step, its statement kept.
         let mut share = Share {
             limit,
             allotted: limit,
             effectful: false,
-            served: false,
+            served: spent > 0,
         };
         self.instances.push(InstanceGas {
             instance: call.instance,

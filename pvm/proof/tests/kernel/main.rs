@@ -14,5 +14,6 @@ mod fixtures;
 mod kernel_shape;
 mod program_identity;
 mod prove_chain;
+mod reads;
 mod recursion_seams;
 mod window_kernel;

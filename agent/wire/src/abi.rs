@@ -46,7 +46,7 @@ use alloc::vec::Vec;
 
 use scale::{Decode, Encode};
 
-pub use codes::{Failure, Refusal, code};
+pub use codes::{AttestError, Failure, Refusal, code};
 
 use crate::keys::Transform;
 
@@ -68,7 +68,8 @@ pub enum Kind {
     /// A `&self` handler, on applied state, outside the log.
     #[codec(index = 1)]
     Query = 1,
-    /// An `#[attestable]` method: no operations at all.
+    /// An `#[attestable]` method of no public argument that reads no root:
+    /// its kernel returns its output alone. No operations at all.
     #[codec(index = 2)]
     Attestable = 2,
     /// A `#[workflow]` method: routed in the actor's program as a handler
@@ -76,6 +77,17 @@ pub enum Kind {
     /// instance's state it reaches only inside a section ([`Op::Open`]).
     #[codec(index = 3)]
     Workflow = 3,
+    /// An `#[attestable]` method that states public arguments, a venue's
+    /// or its own `#[public]` ones, and reads no root: its kernel returns
+    /// its statement's parts ([`crate::result::KernelReturn`]).
+    #[codec(index = 4)]
+    Stating = 4,
+    /// An `#[attestable]` `&self` method: run at a window's cut
+    /// ([`Op::AttestAt`]), its kernel reads the rows served there after its
+    /// arguments, and returns its statement's parts, the space's root among
+    /// them.
+    #[codec(index = 5)]
+    Reading = 5,
 }
 
 impl Kind {
@@ -89,6 +101,11 @@ impl Kind {
     /// at install, and a workflow as a workflow.
     pub const fn is_handler(self) -> bool {
         matches!(self, Kind::Command | Kind::Query)
+    }
+
+    /// Whether a method of this kind runs as its kernel, bound at install.
+    pub const fn is_attestable(self) -> bool {
+        matches!(self, Kind::Attestable | Kind::Stating | Kind::Reading)
     }
 }
 
@@ -255,6 +272,21 @@ operations! {
         /// first batch at or past it, and later than the batch that sleeps, so
         /// a sleep's row in the due index always lies ahead of its step.
         Sleep = 0x532,
+        /// A read of the workflow's instance's committed rows at its
+        /// window's cut, through an attestable `&self` method: φ7 the
+        /// method, φ8/φ9 its arguments, φ10/φ11 the rows it reads, the
+        /// SCALE encoding of their full keys ([`crate::keys::committed`]),
+        /// strictly increasing. Refused at once, without pausing, φ7 0 and
+        /// φ8 an [`AttestError`]: an agent of no space, a malformed read
+        /// set, an unknown method or arguments past the target's cap.
+        /// Otherwise its step records the request of the batch time's
+        /// window ([`crate::keys::request`]), and the workflow pauses until
+        /// a [`crate::batch::Input::Resume`] serves the rows proved at the
+        /// window's cut, or [`crate::defaults::READ_WINDOWS`] windows pass:
+        /// its input then an encoded [`crate::result::Attested`], the
+        /// kernel's output on the arguments and the served rows, or why
+        /// there is none.
+        AttestAt = 0x533,
 
         /// A workflow's section on its instance's state, as the instance
         /// itself, with no role check: φ7 the instance, which must be the
@@ -272,8 +304,8 @@ operations! {
 }
 
 /// Whether operation `op` is an effect a workflow makes: a call, a send, a
-/// request or a wait for a result, a section on its instance's state, or
-/// its result. A workflow's unit, the code between two awaits, is preempted
+/// request or a wait for a result, a read at its window's cut, a section on
+/// its instance's state, or its result. A workflow's unit, the code between two awaits, is preempted
 /// only before its first effect, and from it runs to its next await with
 /// the step's whole limit. A section's reads count too: a value read and
 /// then written within one unit stays atomic. Every other operation a
@@ -281,7 +313,14 @@ operations! {
 pub const fn is_effect(op: Op) -> bool {
     matches!(
         op,
-        Op::Call | Op::Send | Op::Request | Op::Result | Op::Reply | Op::Fail | Op::Open
+        Op::Call
+            | Op::Send
+            | Op::Request
+            | Op::Result
+            | Op::AttestAt
+            | Op::Reply
+            | Op::Fail
+            | Op::Open
     )
 }
 
@@ -292,7 +331,7 @@ pub const fn is_effect(op: Op) -> bool {
 /// ([`in_section`]); outside one, a row operation fails the invocation.
 pub const fn allowed(kind: Kind, op: Op) -> bool {
     match kind {
-        Kind::Attestable => false,
+        Kind::Attestable | Kind::Stating | Kind::Reading => false,
         Kind::Workflow => matches!(
             op,
             Op::Input
@@ -311,6 +350,7 @@ pub const fn allowed(kind: Kind, op: Op) -> bool {
                 | Op::Request
                 | Op::Result
                 | Op::Sleep
+                | Op::AttestAt
                 | Op::Open
                 | Op::Close
         ),
@@ -392,7 +432,7 @@ pub mod price {
     /// The request's arguments, copied out with a `poke`.
     pub const INPUT: u64 = 2_500;
     pub const RANDOM: u64 = 6_000;
-    pub const CALLER: u64 = 6_000;
+    pub const CALLER: u64 = 6_200;
     pub const LOG: u64 = 4_000;
     pub const SEND: u64 = 5_000;
     /// A pause: its message, its await and its row in the due index.
@@ -404,10 +444,24 @@ pub mod price {
     pub const PUT: u64 = 64_000;
     /// A nested call or attest acquires a machine.
     pub const MACHINE: u64 = 60_000;
+    /// An attest acquires a machine, and records its statement: its
+    /// witness input, its output, its public arguments and its roots.
+    pub const ATTEST: u64 = 66_000;
     pub const PER_BYTE: u64 = 24;
     /// A key's transform, hashing it and escaping it, or its inverse: a
     /// zero byte doubles under the escape and costs the most.
     pub const KEY_BYTE: u64 = 90;
+
+    /// What the agent's check of a kernel's statement parts costs the
+    /// caller, the parts `len` bytes: their io-hash, a block of 128 bytes a
+    /// compression, and two more for its domain and lengths.
+    pub const fn io_hash(len: usize) -> u64 {
+        IO_HASH_BLOCK * (len as u64 / 128 + 2)
+    }
+
+    /// The agent's io-hash of a kernel's statement parts, for each block it
+    /// compresses.
+    pub const IO_HASH_BLOCK: u64 = 8_000;
 
     /// An operation's price, before its bytes.
     pub const fn of(op: Op) -> u64 {
@@ -416,9 +470,10 @@ pub mod price {
             Op::Put | Op::Delete => PUT,
             Op::Scan => SCAN,
             Op::Send => SEND,
-            Op::Request | Op::Result | Op::Sleep => PAUSE,
+            Op::Request | Op::Result | Op::Sleep | Op::AttestAt => PAUSE,
             Op::Open | Op::Close => SECTION,
-            Op::Call | Op::Attest => MACHINE,
+            Op::Call => MACHINE,
+            Op::Attest => ATTEST,
             Op::Random => RANDOM,
             Op::Caller => CALLER,
             Op::Log => LOG,

@@ -406,7 +406,8 @@ pub struct Statement {
     pub format: FormatVersion,       // the final format; the venue checks it is accepted
     pub program: ProgramId,          // a public input of the proof
     pub space: SpaceId,              // checked by the venue against every RootRead
-    pub public_args: Vec<u8>,        // the kernel's #[public] arguments, canonical encoding
+    pub public_args: Vec<u8>,        // in order: the venue (venue-bound), the reader
+                                     // (AgentId, InstanceId) (`&self`), each #[public] argument
     pub output: Vec<u8>,             // opaque; the handler for `program` decodes it
     pub roots: Vec<RootRead>,        // { kind, space, window, root }
 }

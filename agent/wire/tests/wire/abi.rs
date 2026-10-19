@@ -27,7 +27,7 @@ fn kinds_reach_only_their_operations() {
         Op::Attest,
         Op::SelfId,
     ];
-    let pauses = [Op::Request, Op::Result, Op::Sleep];
+    let pauses = [Op::Request, Op::Result, Op::Sleep, Op::AttestAt];
     let sections = [Op::Open, Op::Close];
     let writes = [Op::Put, Op::Delete, Op::Send, Op::Attest];
     // A workflow attests nothing, and does not ask who called.
@@ -37,7 +37,9 @@ fn kinds_reach_only_their_operations() {
     for op in handlers {
         assert!(abi::allowed(Kind::Command, op));
         assert_eq!(abi::allowed(Kind::Query, op), !writes.contains(&op));
-        assert!(!abi::allowed(Kind::Attestable, op));
+        for kind in [Kind::Attestable, Kind::Stating, Kind::Reading] {
+            assert!(!abi::allowed(kind, op));
+        }
         assert_eq!(abi::allowed(Kind::Workflow, op), !stateful.contains(&op));
         assert_eq!(
             abi::in_section(op),
@@ -54,7 +56,7 @@ fn kinds_reach_only_their_operations() {
     }
     let every: Vec<Op> = handlers.into_iter().chain(pauses).chain(sections).collect();
     assert_eq!(every, Op::ALL, "every operation is classed, in id order");
-    for unknown in [0, 5, 0x480, 0x4ff, 0x507, 0x524, 0x52f, 0x533, 0x542, 0x5ff] {
+    for unknown in [0, 5, 0x480, 0x4ff, 0x507, 0x524, 0x52f, 0x534, 0x542, 0x5ff] {
         assert_eq!(Op::from_id(unknown), None, "{unknown:#x}");
     }
     // A workflow's rows and a close only inside a section; inside one, its
@@ -89,7 +91,7 @@ fn operations_are_their_ids() {
         ids,
         [
             0x500, 0x501, 0x502, 0x503, 0x504, 0x505, 0x506, 0x510, 0x511, 0x512, 0x513, 0x520,
-            0x521, 0x522, 0x523, 0x530, 0x531, 0x532, 0x540, 0x541
+            0x521, 0x522, 0x523, 0x530, 0x531, 0x532, 0x533, 0x540, 0x541
         ]
     );
 }
@@ -97,11 +99,25 @@ fn operations_are_their_ids() {
 /// A kind's index is its encoding's byte, which the agent passes in φ8.
 #[test]
 fn kinds_index_as_they_encode() {
-    for kind in [Kind::Command, Kind::Query, Kind::Attestable, Kind::Workflow] {
+    let kinds = [
+        Kind::Command,
+        Kind::Query,
+        Kind::Attestable,
+        Kind::Workflow,
+        Kind::Stating,
+        Kind::Reading,
+    ];
+    for kind in kinds {
         assert_eq!(kind.encode(), [kind.index()]);
+        assert_eq!(
+            kind.is_handler(),
+            matches!(kind, Kind::Command | Kind::Query)
+        );
+        assert_eq!(
+            kind.is_attestable(),
+            matches!(kind, Kind::Attestable | Kind::Stating | Kind::Reading)
+        );
     }
-    assert!(Kind::Command.is_handler() && Kind::Query.is_handler());
-    assert!(!Kind::Attestable.is_handler() && !Kind::Workflow.is_handler());
 }
 
 /// Every operation a workflow may use is classed: an effect, which a unit
@@ -115,6 +131,7 @@ fn a_workflows_operations_are_effects_or_not() {
         Op::Send,
         Op::Request,
         Op::Result,
+        Op::AttestAt,
         Op::Reply,
         Op::Fail,
         Op::Open,
@@ -239,7 +256,9 @@ fn kinds_encode_as_the_index_the_agent_passes() {
     assert_eq!(Kind::Query.encode(), [1]);
     assert_eq!(Kind::Attestable.encode(), [2]);
     assert_eq!(Kind::Workflow.encode(), [3]);
-    assert!(Kind::decode(&[4]).is_err());
+    assert_eq!(Kind::Stating.encode(), [4]);
+    assert_eq!(Kind::Reading.encode(), [5]);
+    assert!(Kind::decode(&[6]).is_err());
 }
 
 /// A row operation's rows register: the tag, the transform's tag, then the

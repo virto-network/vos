@@ -3,9 +3,11 @@
 
 use alloc::vec::Vec;
 
+use vos_wire::Decode;
 use vos_wire::abi::{Failure, cap, precompile};
 use vos_wire::defaults;
 use vos_wire::ids::ProgramHash;
+use vos_wire::result::KernelReturn;
 
 use crate::machines::{self, ARGUMENTS, Exit, Machine};
 use crate::refine::base::Meter;
@@ -30,10 +32,11 @@ pub(crate) fn serve_precompile(
     machine.precompile(id)
 }
 
-/// A kernel's run: its output, the bytes it read through its witness
-/// input, and the gas it used.
+/// A kernel's run: its output, the io-hash it left in φ9..φ12, the bytes it
+/// read through its witness input, and the gas it used.
 pub(crate) struct KernelRun {
     pub output: Vec<u8>,
+    pub io_hash: [u8; 32],
     pub witness_input: Vec<u8>,
     pub gas_used: u64,
 }
@@ -43,19 +46,30 @@ pub(crate) struct KernelRun {
 /// through its witness input from `input`; output by the halt convention, at
 /// most `output` bytes, and no host calls but precompiles and the witness
 /// input, which the agent serves. An input past a work result's cap is
-/// refused.
+/// refused. A failed run's error comes with the gas it used.
 pub(crate) fn kernel(
     meter: &Meter,
     program: &ProgramHash,
     input: &[u8],
     gas: u64,
     output: usize,
-) -> Result<KernelRun, Failure> {
+) -> Result<KernelRun, (Failure, u64)> {
     if input.len() > cap::WORK_RESULT {
-        return Err(Failure::Cap);
+        return Err((Failure::Cap, 0));
     }
-    let mut machine = machines::pinned(&program.0, 0)?;
+    let mut machine = machines::pinned(&program.0, 0).map_err(|code| (code.into(), 0))?;
     machine.set_gas(gas);
+    run(meter, &mut machine, input, gas, output).map_err(|code| (code, gas - machine.gas()))
+}
+
+/// [`kernel`]'s run on `machine`, loaded with `gas`.
+fn run(
+    meter: &Meter,
+    machine: &mut Machine,
+    input: &[u8],
+    gas: u64,
+    output: usize,
+) -> Result<KernelRun, Failure> {
     machine.set_register(7, ARGUMENTS);
     machine.set_register(8, 0);
     let mut read = 0;
@@ -76,7 +90,7 @@ pub(crate) fn kernel(
                 read += machine.witness_input(rest)?;
             }
             Exit::Host(id) if precompile::price(id).is_some() => {
-                serve_precompile(meter, &mut machine, id)?;
+                serve_precompile(meter, machine, id)?;
             }
             Exit::Halt => {
                 let gas_used = gas - machine.gas();
@@ -85,8 +99,13 @@ pub(crate) fn kernel(
                     return Err(Failure::Cap);
                 }
                 let output = machine.peek(machine.register(7), len).ok_or(Failure::Cap)?;
+                let mut io_hash = [0u8; 32];
+                for (word, register) in io_hash.chunks_exact_mut(8).zip(9..) {
+                    word.copy_from_slice(&machine.register(register).to_le_bytes());
+                }
                 return Ok(KernelRun {
                     output,
+                    io_hash,
                     witness_input: input[..read].to_vec(),
                     gas_used,
                 });
@@ -94,6 +113,15 @@ pub(crate) fn kernel(
             Exit::OutOfGas => return Err(Failure::OutOfGas),
             _ => return Err(Failure::Trapped),
         }
+    }
+}
+
+/// A kernel's return as its statement's parts, decoded whole, their
+/// io-hash the one it left; `None` otherwise, a kernel's bug.
+pub(crate) fn parts(returned: &[u8], io_hash: &[u8; 32]) -> Option<KernelReturn> {
+    match KernelReturn::decode(returned) {
+        Ok((parts, used)) if used == returned.len() && parts.io_hash() == *io_hash => Some(parts),
+        _ => None,
     }
 }
 

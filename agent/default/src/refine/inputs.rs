@@ -91,7 +91,7 @@ pub(crate) fn message(
         Body::Reply { awaiting, answer } => match resumes {
             Some((workflow, kept)) => {
                 let id = awaiting.workflow;
-                let resume = answer.encode();
+                let resume = workflows::Resume::Input(answer.encode());
                 workflows::resume_step(base, index, input, id, workflow, resume, kept, 0)
             }
             None => Stepped::ran(consumed(input, Outcome::Done(Vec::new()))),

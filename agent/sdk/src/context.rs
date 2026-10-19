@@ -8,13 +8,17 @@ use core::future::{IntoFuture, Ready, ready};
 use core::marker::PhantomData;
 use core::time::Duration;
 
-use vos_wire::abi::Failure;
+use alloc::vec::Vec;
+
+use vos_wire::abi::{AttestError, Failure};
 use vos_wire::batch::Answer;
 use vos_wire::ids::{AgentId, InstanceId, Principal, WorkflowId};
-use vos_wire::{Decode, DecodeError, Encode};
+use vos_wire::result::Attested;
+use vos_wire::{Decode, DecodeError, Encode, keys};
 
 use crate::host;
 use crate::state::{self, New, Tables};
+use crate::table::Read;
 
 /// A handler of an actor, as a message another actor can send.
 pub trait Method: Encode {
@@ -30,6 +34,15 @@ pub trait QueryMethod: Method {}
 
 /// An `#[attestable]` method, run as its kernel.
 pub trait AttestableMethod: Encode {
+    type Actor;
+    const ID: u32;
+    type Output: Decode;
+}
+
+/// An `#[attestable]` `&self` method: run as its kernel at a window's cut,
+/// on its instance's committed rows as they stood there
+/// ([`Workflow::attest_at_cut`]).
+pub trait AtCutMethod: Encode {
     type Actor;
     const ID: u32;
     type Output: Decode;
@@ -416,6 +429,26 @@ impl<A> Workflow<A> {
     }
 }
 
+impl<A: Tables + New> Workflow<A> {
+    /// Read the workflow's instance's committed rows at the cut of the
+    /// current window, through attestable `&self` method `call`: the rows
+    /// [`AtCut::reads`] names are proved there, then served to the method's
+    /// kernel, which checks them against the space's root and runs on them.
+    /// Awaited, it pauses until the window's cut is built and closed, and
+    /// returns the kernel's output, or why there is none
+    /// ([`AttestError`]). The run is recorded as the step's attest, for a
+    /// prover; the workflow's record never holds the served rows.
+    pub fn attest_at_cut<M: AtCutMethod<Actor = A>>(&mut self, call: M) -> AtCut<A, M> {
+        let (_, instance) = self.me();
+        AtCut {
+            instance,
+            call,
+            reads: Vec::new(),
+            _actor: PhantomData,
+        }
+    }
+}
+
 impl<A: Encode + Decode + Tables + New> Workflow<A> {
     /// Read the state of the workflow's instance, its tables included, in
     /// a section: `f`'s result. A new instance's state when none is stored.
@@ -511,6 +544,54 @@ impl<M: WorkflowMethod> IntoFuture for Start<M> {
             Ok(_) => Err(RequestError::Undecodable),
             Err(error) => Err(error),
         })
+    }
+}
+
+/// A read at a window's cut, awaited for its kernel's output.
+#[must_use = "a read at a cut is asked when awaited"]
+pub struct AtCut<A, M> {
+    instance: InstanceId,
+    call: M,
+    reads: Vec<Read>,
+    _actor: PhantomData<fn() -> A>,
+}
+
+impl<A: Tables + New, M> AtCut<A, M> {
+    /// The rows the method reads, named by `f` through the actor's committed
+    /// maps ([`crate::table::CommittedMap::read`]), in any order: the
+    /// method's view answers these alone. A row named twice is refused
+    /// ([`AttestError::Reads`]).
+    pub fn reads(mut self, f: impl FnOnce(&A) -> Vec<Read>) -> Self {
+        let mut maps = A::new();
+        maps.bind_tables();
+        self.reads = f(&maps);
+        self
+    }
+}
+
+impl<A, M: AtCutMethod> IntoFuture for AtCut<A, M> {
+    type Output = Result<M::Output, AttestError>;
+    type IntoFuture = Ready<Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        let rows: Result<Vec<Vec<u8>>, _> = self
+            .reads
+            .iter()
+            .map(|read| keys::row(self.instance, read.rows, &read.key))
+            .collect();
+        let Ok(mut rows) = rows else {
+            return ready(Err(AttestError::Reads));
+        };
+        rows.sort_unstable();
+        let returned = host::attest_at(M::ID, &self.call.encode(), &rows.encode())
+            .map_err(|code| AttestError::from_code(code).unwrap_or(AttestError::Undecodable))
+            .and_then(|input| match decode::<Attested>(&input) {
+                Some(Attested::Done(output)) => Ok(output),
+                Some(Attested::Failed(error)) => Err(error),
+                None => Err(AttestError::Undecodable),
+            })
+            .and_then(|output| decode::<M::Output>(&output).ok_or(AttestError::Undecodable));
+        ready(returned)
     }
 }
 

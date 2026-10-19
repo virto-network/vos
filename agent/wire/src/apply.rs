@@ -302,7 +302,7 @@ impl Apply<'_> {
             InputRef::Message { from, sequence } => {
                 self.put(&keys::pair_in(from), &sequence.encode());
             }
-            InputRef::Admin | InputRef::Due { .. } => {}
+            InputRef::Admin | InputRef::Due { .. } | InputRef::Resume { .. } => {}
             InputRef::Ack { to, sequence } => {
                 // Monotonic and idempotent: a stale ack does nothing, one
                 // past what was sent stops there, and one ack clears at most

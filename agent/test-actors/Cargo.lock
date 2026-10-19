@@ -3,6 +3,14 @@
 version = 4
 
 [[package]]
+name = "accounts"
+version = "0.1.0"
+dependencies = [
+ "cipher-clerk",
+ "vos-sdk",
+]
+
+[[package]]
 name = "blake2"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -191,6 +199,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "reader"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
+]
+
+[[package]]
 name = "rounds"
 version = "0.1.0"
 dependencies = [
@@ -358,6 +373,7 @@ version = "0.1.0"
 dependencies = [
  "vos-pvm-precompiles",
  "vos-sdk-macros",
+ "vos-tree",
  "vos-wire",
 ]
 

@@ -12,7 +12,7 @@
 //!   while any live workflow names it, whatever an upgrade installed since,
 //!   and after, when nothing names it any more.
 
-use vos_wire::abi::{Kind, cap};
+use vos_wire::abi::cap;
 use vos_wire::records::Derivation;
 use vos_wire::schema::Schema;
 
@@ -41,7 +41,7 @@ pub fn derive(elf: &[u8]) -> Result<Installable, Error> {
     if let Some(method) = schema
         .methods
         .iter()
-        .find(|method| method.kind == Kind::Attestable && method.gas.is_some_and(|gas| gas > most))
+        .find(|method| method.kind.is_attestable() && method.gas.is_some_and(|gas| gas > most))
     {
         return Err(Error::Package(format!(
             "attestable method `{}` declares gas {}, past the {most} a kernel runs with on JAM",

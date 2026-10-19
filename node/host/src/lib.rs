@@ -203,19 +203,14 @@ pub trait Hooks: Send + Sync {
         Duration::ZERO
     }
 
-    /// As the leader of `agent` makes a batch of inputs timed `time`, never
-    /// a `Cut` marker, which stays empty: a pending request of the window
-    /// `time` falls in, which the batch's result then records
-    /// ([`vos_wire::keys::request`]) as a workflow's step asking for a read
-    /// at the cut does. A test's stand-in for that step, which goes once
-    /// workflows ask for themselves.
-    fn request_at_cut(
-        &self,
-        agent: AgentId,
-        time: u64,
-    ) -> Option<(vos_wire::ids::RequestId, vos_wire::records::PendingRead)> {
-        let _ = (agent, time);
-        None
+    /// Whether the leader serves the reads at a window's cut its replica
+    /// has proved with a stand-in for the space's representative: a tree of
+    /// the one row of the agent's root at the cut, which the node builds
+    /// itself ([`roots::stand_in`]). A node holds no other path of an
+    /// agent's root to the space's root, so without it no read is served,
+    /// and each ends at its deadline.
+    fn stand_in_representative(&self) -> bool {
+        false
     }
 
     /// Before the storage thread commits: true makes the commit fail with

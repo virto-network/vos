@@ -1,0 +1,5 @@
+error: only an #[attestable] method is `venue_bound`: its statements bind a venue
+  --> tests/compile_fail/venue_bound_handler.rs:14:11
+   |
+14 |     #[msg(venue_bound)]
+   |           ^^^^^^^^^^^

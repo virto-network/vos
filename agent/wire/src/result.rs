@@ -3,9 +3,12 @@
 use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
-use crate::abi::{Failure, Refusal, cap};
+use crate::abi::{AttestError, Failure, Refusal, cap};
 use crate::batch::{Answer, Await, Body};
-use crate::ids::{AgentId, InstanceId, MapId, ProgramHash, SessionId, SessionRef, WorkflowId};
+use crate::ids::{
+    AgentId, InstanceId, MapId, ProgramHash, RequestId, SessionId, SessionRef, WorkflowId,
+};
+use crate::vos_anchor::RootRead;
 
 /// What one refine produced. Steps are in dispatch order; accumulate applies
 /// their writes in that order. Inputs not covered by a step were not
@@ -279,6 +282,10 @@ pub enum InputRef {
     /// goes or moves with the step.
     #[codec(index = 4)]
     Due { workflow: WorkflowId },
+    /// A read at a window's cut served ([`crate::batch::Input::Resume`]):
+    /// the step of the workflow awaiting it, if it still does.
+    #[codec(index = 5)]
+    Resume { request: RequestId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -345,16 +352,69 @@ impl Outgoing {
 }
 
 /// An attestable method run in this step, kept so the run can be proven
-/// later. Its input may be private: work results stay in the space's log
-/// and are never published as they are.
+/// later: the statement's parts, which its proof's io-hash binds
+/// (`vos_pvm_precompiles::compute_io_hash`), as the kernel returned them.
+/// Its input may be private: work results stay in the space's log and are
+/// never published as they are.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Attest {
     pub program: ProgramHash,
+    /// The window whose cut it read at, for a read at a cut
+    /// ([`crate::abi::Op::AttestAt`]); `None` for a plain attest.
+    pub window: Option<u64>,
     /// The bytes the kernel read through its witness input
     /// ([`crate::abi::precompile::WITNESS_INPUT`]), in call order: its
-    /// arguments, which its prologue reads whole. A prover's re-run serves
-    /// it the same bytes, so the two runs read alike. Within the attest's
-    /// cap, and at most a work result's ([`crate::abi::cap::WORK_RESULT`]).
+    /// arguments, then, at a cut, the served rows' encoding
+    /// ([`crate::served::Served`]), which its prologue reads whole. A
+    /// prover's re-run serves it the same bytes, so the two runs read
+    /// alike. Within the attest's cap and the served rows', and at most a
+    /// work result's ([`crate::abi::cap::WORK_RESULT`]).
     pub witness_input: Vec<u8>,
     pub output: Vec<u8>,
+    /// Its public arguments: the venue's, the reader's and its `#[public]`
+    /// arguments' encodings, in that order; empty for a method of none.
+    pub public_args: Vec<u8>,
+    /// The roots it read, in order: one space root at a cut, none for a
+    /// rootless method.
+    pub roots: Vec<RootRead>,
+}
+
+/// What a workflow's read at a window's cut ([`crate::abi::Op::AttestAt`])
+/// resumes it with: the kernel's output, or why there is none.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum Attested {
+    #[codec(index = 0)]
+    Done(Vec<u8>),
+    #[codec(index = 1)]
+    Failed(AttestError),
+}
+
+/// What a kernel of statement parts returns at its halt, encoded: its
+/// public arguments, its output and the roots it read, over which φ9..φ12
+/// hold its io-hash. A kernel of a method with no public argument that
+/// reads no root returns its output alone.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct KernelReturn {
+    pub public_args: Vec<u8>,
+    pub output: Vec<u8>,
+    pub roots: Vec<RootRead>,
+}
+
+impl KernelReturn {
+    /// The io-hash over its parts.
+    pub fn io_hash(&self) -> [u8; 32] {
+        let roots: Vec<vos_pvm_precompiles::RootRead> = self
+            .roots
+            .iter()
+            .map(|root| vos_pvm_precompiles::RootRead {
+                kind: match root.kind {
+                    crate::vos_anchor::RootKind::Space => vos_pvm_precompiles::RootKind::Space,
+                },
+                space: root.space.0,
+                window: root.window,
+                root: root.root,
+            })
+            .collect();
+        vos_pvm_precompiles::compute_io_hash(&self.public_args, &self.output, &roots)
+    }
 }

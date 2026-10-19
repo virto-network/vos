@@ -534,6 +534,17 @@ pub fn cut_proofs() -> Vec<u8> {
     TreeRow::CutProof.prefix().to_vec()
 }
 
+/// The request a [`cut_proof`] key names; `None` for any other key.
+pub fn cut_proof_entry(key: &[u8]) -> Option<RequestId> {
+    let rest = key.strip_prefix(&TreeRow::CutProof.prefix())?;
+    let rest: &[u8; 16] = rest.try_into().ok()?;
+    let word = |at: usize| u64::from_be_bytes(rest[at..at + 8].try_into().unwrap_or_default());
+    Some(RequestId {
+        workflow: WorkflowId(word(0)),
+        awaits: word(8),
+    })
+}
+
 /// The prefix of an instance's struct and table rows.
 pub fn instance_rows(instance: InstanceId) -> Vec<u8> {
     key(&[&[Owner::Instance as u8], &instance.0.to_be_bytes()])

@@ -1,0 +1,5 @@
+error: only an #[attestable] method's arguments are `#[public]`
+  --> tests/compile_fail/public_on_a_handler.rs:15:33
+   |
+15 |     pub async fn add(&mut self, #[public] by: u64) -> u64 {
+   |                                 ^^^^^^^^^

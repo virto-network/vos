@@ -21,6 +21,7 @@ pub mod peer;
 pub mod records;
 pub mod result;
 pub mod schema;
+pub mod served;
 
 /// When a session's row in the due index is due: sessions are filed by the
 /// bucket of their last activity, so one sweep collects many.

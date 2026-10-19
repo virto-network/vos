@@ -1,5 +1,0 @@
-error: an #[attestable] method takes no `self`: it sees only its arguments
-  --> tests/compile_fail/attestable_with_self.rs:15:24
-   |
-15 |     pub fn reads_state(&self, by: u64) -> u64 {
-   |                        ^^^^^

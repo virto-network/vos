@@ -10,6 +10,8 @@ use vos_wire::abi::{Failure, Rows, cap, price};
 use vos_wire::ids::InstanceId;
 use vos_wire::keys;
 use vos_wire::records::unversioned;
+use vos_wire::result::KernelReturn;
+use vos_wire::{Decode, Encode};
 
 /// The value applied state holds under `key`: in a committed map's value
 /// row, without the version that wrote it.
@@ -58,28 +60,38 @@ pub(crate) fn precompile(machine: &mut Machine, id: u64) -> Result<(), Failure> 
         .ok_or(Failure::Trapped)
 }
 
-/// A kernel's run: its output, the bytes it read through its witness
-/// input, and the gas it used.
+/// A kernel's run: its output, the io-hash it left in φ9..φ12, the bytes it
+/// read through its witness input, and the gas it used.
 pub(crate) struct KernelRun {
     pub output: Vec<u8>,
+    pub io_hash: [u8; 32],
     pub witness_input: Vec<u8>,
     pub gas_used: u64,
+    /// The precompile calls it made.
+    pub compressions: u64,
 }
 
 /// Run an attestable method's kernel: laid out with no arguments, which it
 /// reads through its witness input from `input`, output by the halt
 /// convention, and no host calls but precompiles. An input past a work
-/// result's cap is refused.
+/// result's cap is refused. A failed run's error comes with the gas it
+/// used.
 pub(crate) fn kernel(
     program: &[u8],
     input: &[u8],
     gas: u64,
     output: usize,
-) -> Result<KernelRun, Failure> {
-    let mut witness = WitnessInput::new(input).ok_or(Failure::Cap)?;
-    let mut machine = Machine::load(program, &[], gas).map_err(|_| Failure::Trapped)?;
+) -> Result<KernelRun, (Failure, u64)> {
+    let mut witness = WitnessInput::new(input).ok_or((Failure::Cap, 0))?;
+    let mut machine = Machine::load(program, &[], gas).map_err(|_| (Failure::Trapped, 0))?;
+    let failed = |machine: &Machine, code| Err((code, gas - machine.gas_remaining()));
+    let mut compressions = 0;
     loop {
-        match machine.try_resume().map_err(|_| Failure::Trapped)? {
+        let exit = match machine.try_resume() {
+            Ok(exit) => exit,
+            Err(_) => return failed(&machine, Failure::Trapped),
+        };
+        match exit {
             ExitReason::HostCall(WITNESS_INPUT) => {
                 let mut registers = *machine.registers();
                 let mut left = machine.gas_remaining();
@@ -88,26 +100,77 @@ pub(crate) fn kernel(
                 machine.charge(spent);
                 match served {
                     Ok(_) => *machine.registers_mut() = registers,
-                    Err(WitnessFault::OutOfGas) => return Err(Failure::OutOfGas),
-                    Err(WitnessFault::Unwritable) => return Err(Failure::Trapped),
+                    Err(WitnessFault::OutOfGas) => return failed(&machine, Failure::OutOfGas),
+                    Err(WitnessFault::Unwritable) => return failed(&machine, Failure::Trapped),
                 }
             }
             ExitReason::HostCall(id) if vos_pvm::precompile::is_precompile(id) => {
-                precompile(&mut machine, id)?;
+                compressions += 1;
+                if let Err(code) = precompile(&mut machine, id) {
+                    return failed(&machine, code);
+                }
             }
             ExitReason::Halt => {
+                let mut io_hash = [0u8; 32];
+                for (word, register) in io_hash.chunks_exact_mut(8).zip(&machine.registers()[9..13])
+                {
+                    word.copy_from_slice(&register.to_le_bytes());
+                }
                 let invocation = machine.finish(ExitReason::Halt);
-                let output = invocation.output_bounded(output).ok_or(Failure::Cap)?;
+                let Some(output) = invocation.output_bounded(output) else {
+                    return Err((Failure::Cap, invocation.gas_used));
+                };
                 return Ok(KernelRun {
                     output,
+                    io_hash,
                     witness_input: witness.read().to_vec(),
                     gas_used: invocation.gas_used,
+                    compressions,
                 });
             }
-            ExitReason::OutOfGas => return Err(Failure::OutOfGas),
-            _ => return Err(Failure::Trapped),
+            ExitReason::OutOfGas => return failed(&machine, Failure::OutOfGas),
+            _ => return failed(&machine, Failure::Trapped),
         }
     }
+}
+
+/// The io-hash of a statement's parts: BLAKE2b-256 of the domain and each
+/// part's SCALE encoding, a byte vector's and the roots' count a compact.
+pub(crate) fn io_hash(parts: &KernelReturn) -> [u8; 32] {
+    let mut hasher = Blake2b::<U32>::new().chain_update(b"vos/io/v1");
+    for bytes in [&parts.public_args, &parts.output] {
+        hasher.update(compact(bytes.len()));
+        hasher.update(bytes);
+    }
+    hasher.update(compact(parts.roots.len()));
+    for root in &parts.roots {
+        hasher.update(root.encode());
+    }
+    hasher.finalize().into()
+}
+
+/// A length's SCALE compact encoding.
+fn compact(len: usize) -> Vec<u8> {
+    let len = len as u64;
+    match len {
+        0..=0x3f => vec![(len as u8) << 2],
+        0x40..=0x3fff => (((len as u16) << 2) | 1).to_le_bytes().to_vec(),
+        0x4000..=0x3fff_ffff => (((len as u32) << 2) | 2).to_le_bytes().to_vec(),
+        _ => {
+            let bytes = len.to_le_bytes();
+            let width = 8 - len.leading_zeros() as usize / 8;
+            let mut out = vec![(((width - 4) as u8) << 2) | 3];
+            out.extend_from_slice(&bytes[..width]);
+            out
+        }
+    }
+}
+
+/// A kernel's return decoded whole as its statement's parts, their io-hash
+/// the one it left; `None` otherwise.
+pub(crate) fn parts(returned: &[u8], left: &[u8; 32]) -> Option<KernelReturn> {
+    let (parts, used) = KernelReturn::decode(returned).ok()?;
+    (used == returned.len() && io_hash(&parts) == *left).then_some(parts)
 }
 
 /// The 32 bytes of [`Op::Random`]: BLAKE2b-256 of the batch seed, the step's

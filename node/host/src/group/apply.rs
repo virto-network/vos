@@ -148,12 +148,15 @@ async fn apply_one(inner: &Inner, shared: &Shared, index: u64) -> Result<(), Fau
             let took = writes.iter().any(|write| write.key == keys::version());
             shared.record_outcome(index, took);
             // The values a pending cut's build still needs, kept beside the
-            // writes that overwrite them: this replica's own rows, decided
-            // on the state the writes apply to.
+            // writes that overwrite them, and the proofs of the requests
+            // they answer, gone: this replica's own rows, decided on the
+            // state the writes apply to.
             if took {
                 let undo = crate::roots::undo(&snapshot, agent, &writes)
                     .map_err(|error| Fault::Infrastructure(format!("the undo rows: {error}")))?;
+                let answered = crate::roots::answered(&writes);
                 writes.extend(undo);
+                writes.extend(answered);
             }
             if let Some(result) = result {
                 rest.push(Change::LastResult {

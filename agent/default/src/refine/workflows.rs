@@ -14,12 +14,12 @@
 use alloc::vec::Vec;
 
 use vos_pvm_program::REGISTER_COUNT;
-use vos_wire::abi::{Failure, Kind, cap};
+use vos_wire::abi::{AttestError, Failure, Kind, cap};
 use vos_wire::batch::{Answer, Await};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, WorkflowId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, WorkflowId};
 use vos_wire::keys::{self, Due};
 use vos_wire::records::{Snapshot, Workflow, WorkflowState};
-use vos_wire::result::{InputRef, Outcome, Outgoing, Page, Run};
+use vos_wire::result::{Attested, InputRef, Outcome, Outgoing, Page, Run};
 use vos_wire::{Decode, Encode, defaults};
 
 use super::base::Base;
@@ -72,6 +72,32 @@ pub(crate) fn resumed(
         matches!(workflow.state, WorkflowState::Awaiting { agent, counter, deadline }
             if agent == from && counter == awaiting.counter && base.time < deadline)
     }))
+}
+
+/// The workflow a read at window `window`'s cut, `request`, resumes, with
+/// its record's stored length: the one awaiting that read, before its
+/// deadline. A read it no longer awaits resumes none, and is consumed and
+/// dropped.
+pub(crate) fn attesting(
+    base: &Base,
+    window: u64,
+    request: &RequestId,
+) -> Result<Option<(Workflow, u64)>, Failure> {
+    Ok(paid(base, request.workflow)?.filter(|(workflow, _)| {
+        matches!(workflow.state, WorkflowState::Attesting { counter, window: at, deadline, .. }
+            if counter == request.awaits && at == window && base.time < deadline)
+    }))
+}
+
+/// What a workflow's step resumes with.
+pub(crate) enum Resume {
+    /// The input its machine resumes with: its arguments, an answer, or
+    /// nothing.
+    Input(Vec<u8>),
+    /// Its read at a window's cut served, its rows' encoding, or `None`
+    /// unserved: the kernel runs on them first, and the machine resumes
+    /// with its answer ([`Attested`]).
+    Served(Option<Vec<u8>>),
 }
 
 /// What the agent keeps of the meter for a step of `workflow`, and takes
@@ -302,8 +328,12 @@ pub(crate) fn due(
                 let resume = match state {
                     WorkflowState::Ready(input) | WorkflowState::Preempted(input) => input.clone(),
                     WorkflowState::Awaiting { .. } => Answer::failed(Failure::TimedOut).encode(),
+                    WorkflowState::Attesting { .. } => {
+                        Attested::Failed(AttestError::NotClosed).encode()
+                    }
                     _ => Vec::new(),
                 };
+                let resume = Resume::Input(resume);
                 let kept = kept(base, &workflow, bytes);
                 let (keep, reserve, handler) = match kept {
                     Some((reserve, limit)) => {
@@ -399,10 +429,10 @@ enum Left {
     Failed(Failure),
 }
 
-/// A step of workflow `id` resumed by `input`, with `resume` its encoded
-/// input, on what the meter `kept` for it ([`kept`]), and `floor` below it
-/// for the batch's inputs: run, or, when it could never run in a batch of
-/// this budget, failed at once with [`Failure::Cap`].
+/// A step of workflow `id` resumed by `input`, with `resume`, on what the
+/// meter `kept` for it ([`kept`]), and `floor` below it for the batch's
+/// inputs: run, or, when it could never run in a batch of this budget,
+/// failed at once with [`Failure::Cap`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn resume_step(
     base: &Base,
@@ -410,7 +440,7 @@ pub(crate) fn resume_step(
     input: InputRef,
     id: WorkflowId,
     workflow: Workflow,
-    resume: Vec<u8>,
+    resume: Resume,
     kept: Option<(u64, u64)>,
     floor: u64,
 ) -> Stepped {
@@ -428,13 +458,30 @@ fn unfit(base: &Base, input: InputRef, id: WorkflowId, mut workflow: Workflow) -
     let outcome = Outcome::failed(Failure::Cap);
     let mut run = consumed(input, outcome.clone());
     let mut rows = Overlay::new();
+    drop_request(id, &workflow, &mut rows);
     run.pages = end(base, id, &mut workflow, outcome, &mut rows, &mut run);
     run.writes = split_writes(rows).0;
     Stepped::ran(run)
 }
 
+/// The request of workflow `id`'s read at a cut, if it awaits one, gone:
+/// whatever its step does next, the read is answered.
+fn drop_request(id: WorkflowId, workflow: &Workflow, rows: &mut Overlay) {
+    if let WorkflowState::Attesting {
+        counter, window, ..
+    } = workflow.state
+    {
+        let request = RequestId {
+            workflow: id,
+            awaits: counter,
+        };
+        rows.insert(keys::request(window, request), None);
+    }
+}
+
 /// Restore workflow `id`'s machine, run it through its step with `resume`
-/// as its input, and capture it if it paused. Its first step enters the
+/// as its input, `spent` of its share already spent on its read at a cut,
+/// and capture it if it paused. Its first step enters the
 /// actor program at its start, as a handler does: the method in φ7, the
 /// workflow's kind in φ8 and its arguments' length in φ9. A machine resumed
 /// from a pause has the input's length in φ7; one preempted resumes as it
@@ -446,6 +493,7 @@ fn run(
     workflow: &Workflow,
     resume: &[u8],
     share: &mut Share,
+    spent: u64,
 ) -> Left {
     // Past what its target keeps of its pages, it ends without them.
     if workflow
@@ -482,7 +530,7 @@ fn run(
         method: workflow.method,
         arguments: resume,
     };
-    let ended = invocation.workflow(&mut machine, call, share, pending);
+    let ended = invocation.workflow(&mut machine, call, share, pending, spent);
     match ended {
         Ok(Ended::Paused(pause)) => {
             let held = snapshot.map_or(&[][..], |snapshot| &snapshot.pages);
@@ -521,9 +569,10 @@ fn run(
     }
 }
 
-/// A step of workflow `id`, resumed by `input` with `resume`, its encoded
-/// input: restored, run on its `share` until it pauses, is preempted, ends
-/// or fails, and captured.
+/// A step of workflow `id`, resumed by `input` with `resume`: its read at a
+/// cut's kernel run first, when served, then its machine restored, run on
+/// its `share` until it pauses, is preempted, ends or fails, and captured.
+/// The request of a read it awaited goes.
 ///
 /// Its calls' effects, its messages and its snapshot commit together; a
 /// preempted step's are its earlier units', as its last unit made none. A
@@ -538,7 +587,7 @@ fn step(
     input: InputRef,
     id: WorkflowId,
     mut workflow: Workflow,
-    resume: Vec<u8>,
+    resume: Resume,
     mut share: Share,
 ) -> Stepped {
     let mut invocation = Invocation::new(base, index, Kind::Workflow);
@@ -547,11 +596,44 @@ fn step(
         workflow: id,
         counter: workflow.awaits,
     });
-    let left = run(base, &mut invocation, id, &workflow, &resume, &mut share);
+    let (resume, spent) = match (resume, &workflow.state) {
+        (
+            Resume::Served(served),
+            WorkflowState::Attesting {
+                counter,
+                window,
+                method,
+                arguments,
+                ..
+            },
+        ) => {
+            let request = RequestId {
+                workflow: id,
+                awaits: *counter,
+            };
+            let call = (*window, *method, arguments.as_slice());
+            let limit = share.limit();
+            let (answer, spent) =
+                invocation.at_cut(workflow.instance, request, call, served, limit);
+            (answer.encode(), spent)
+        }
+        (Resume::Served(_), _) => unreachable!("served a workflow that reads at no cut"),
+        (Resume::Input(input), _) => (input, 0),
+    };
+    let left = run(
+        base,
+        &mut invocation,
+        id,
+        &workflow,
+        &resume,
+        &mut share,
+        spent,
+    );
     let mut run = consumed(input, Outcome::Done(Vec::new()));
     run.instances = core::mem::take(&mut invocation.instances);
     run.gas_used = invocation.gas_used;
     let mut rows = Overlay::new();
+    drop_request(id, &workflow, &mut rows);
     let mut stored = Vec::new();
     // The step's effects, kept when it paused or ended with its result.
     let keep_effects = |invocation: Invocation, rows: &mut Overlay, run: &mut Run| {
@@ -573,7 +655,7 @@ fn step(
             registers,
         } => {
             keep_effects(invocation, &mut rows, &mut run);
-            if let Pause::Await { .. } = pause {
+            if let Pause::Await { .. } | Pause::Attesting(_) = pause {
                 workflow.awaits += 1;
             }
             move_due(&mut rows, id, &mut workflow, pause.due(base.time));

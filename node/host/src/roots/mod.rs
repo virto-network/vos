@@ -51,7 +51,7 @@ use crate::store::{Fjall, Snapshot};
 
 mod cuts;
 
-pub use cuts::{CutProof, ReadRow, cut_proof, cut_root, undo};
+pub use cuts::{CutProof, ReadRow, answered, cut_proof, cut_root, latest_built, stand_in, undo};
 
 /// The most distinct keys one batch rebuilds.
 pub(crate) const BATCH: usize = 10_000;

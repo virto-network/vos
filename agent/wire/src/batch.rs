@@ -4,7 +4,9 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::abi::Failure;
-use crate::ids::{AgentId, InstanceId, MethodId, Principal, ProgramHash, Session, WorkflowId};
+use crate::ids::{
+    AgentId, InstanceId, MethodId, Principal, ProgramHash, RequestId, Session, WorkflowId,
+};
 use crate::ingress::Grant;
 use crate::keys::Due;
 use crate::records::Derivation;
@@ -127,6 +129,19 @@ pub enum Input {
         from: AgentId,
         sequence: u64,
         awaiting: Option<Await>,
+    },
+    /// A read at window `window`'s cut, `request`, served: the encoded
+    /// [`crate::served::Served`] of its rows proved at the cut, or `None`
+    /// when the cut could not prove them or they pass the target's
+    /// [`crate::abi::cap::Limits::served`]. Refine runs the kernel on the
+    /// call's arguments and the served bytes, and resumes the workflow
+    /// with its output, if it still awaits that request. The node puts it
+    /// in a batch once its replica has built the cut.
+    #[codec(index = 6)]
+    Resume {
+        window: u64,
+        request: RequestId,
+        served: Option<Vec<u8>>,
     },
 }
 
