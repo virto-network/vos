@@ -3,3 +3,5 @@ target/
 corpus/
 artifacts/
 coverage/
+# Resolved afresh by each build, and by `just check-no-seeded-masks`.
+Cargo.lock

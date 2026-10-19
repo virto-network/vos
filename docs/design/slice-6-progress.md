@@ -845,6 +845,62 @@ after the out-of-domain check; a one-component set is unblinded; the test
 seam is a `pub` variant behind `cfg`; `tree::wrap` now proves 39 (no
 production caller yet; 6.18's worker will be one).
 
+**Review:** Fable ACCEPT (no soundness or zero-knowledge defect; pin B's
+order, every opening R1 counts and the R1 matrix re-derived from the fork;
+the retry a public event; the seam unreachable from production), four low
+findings and two forward notes; Opus, no blockers. Folded:
+- **Fable 1:** `check-no-seeded-masks` is `cargo tree --workspace -e
+  features,no-dev` (no root to remember), plus the workspaces built apart
+  (`agent/default`, `pvm/proof/fuzz`, `final-verifier/wasm/{run,blob}`),
+  and the `debug-internals` line;
+- **Fable 2:** the witness digest binds the statement: the format's number,
+  configuration, masking and interaction PoW, the log sizes, the Merkle
+  channel's name (`type_name::<MC>()`) and the public values, before the
+  main columns' digests, so one witness under two formats or channels from
+  a replayed OS state never reuses a mask. Pin C amended;
+- **Fable 3:** `full_rank` unit tests in `rank.rs`: the `h` points of the
+  order-`h` subgroup are dependent, a coset of `h` points off the trace
+  domain independent, one point too many refused by its rows;
+  `rank_m31`'s own; the out-of-domain points deduplicated by `contains`,
+  not adjacent-only;
+- **Fable 4a:** `prove_masked`'s doc states a one-component set is
+  unblinded, its claimed sum to be checked against a public total; the
+  `P2Only` test says its verifier checks none (it tests the transcript);
+- **Fable 4b, forward notes:** the plan's 6.5 records that the venues'
+  accepted set {39} is the one gate keeping 28 out of production, the
+  prover side open (`prove_unmasked`, `prove_on(&WRAP, …)`); its R5 line
+  (6.2) gains slice 7's size floor (`log_size ≥ log_mask_rows + 2`) and the
+  segments' 128 revealed rows; 6.4's `log_sizes` and widths line names the
+  tests' verifier's `fits` check as the model;
+- **Opus 1, 2:** `mask_columns` takes `&[&CircleCoefficients]` (no clone of
+  the main columns an attempt); `MaskLayout::mask` writes into
+  `BaseColumn::zeros(..)` through `as_mut_slice()`;
+- **Opus 3:** caller faults have variants of their own,
+  `ProveError::{UnmaskedFormat, MaskedFormat, TraceShape(&str)}`
+  (`prove_on` refuses a masked format as `MaskedFormat`); `Masking(&str)`
+  keeps the layout's refusals, each fragment reworded as a sentence;
+- **Opus 4, 5:** the seam's comments name only the prover's tests (a dev
+  edge) until 6.5 wires the generator; the tests' verifier's header says it
+  is for integration tests and that 6.4 deletes it;
+- **Opus 6:** `MaskRng` keeps `Default` (`Os`), loses `new`, is passed by
+  value, and `Seeded` is under `cfg(feature = "seeded-masks")` alone;
+- **Opus 8:** `wrap_root` takes `masked`, the window's run alone proving
+  the masked wrap (not `areas`); the never-failing `revealed_rows ≤ 256`
+  is `≤ 160`, pin A's count.
+
+**The gate after the fold** [measured]: the window's masked wrap 9.90 s at
+load 7.8 (format 28's 4.45 s in the same run), heap 3,627 MiB, resident
+6,235 MiB, 162,037 bytes, R1 7.3 ms, 80 rows, 1 attempt. Under 15 s; the
+load still not quiet.
+
+**Gates after the fold:** `just check` green (1,173 tests, 0 failed, on
+6.9's merge); clippy with `debug-internals` clean. The fuzz crate's
+`Cargo.lock`, which the seam's check resolves, is ignored.
+
+**Commits of the fold:** `823449be`; this record.
+
+**6.3 accepted.**
+
 ## Step 6.8: the recursion AIR's forgery gates
 
 **Built** on `s6/forgery` (from `27967322`): a new test binary,
@@ -966,6 +1022,118 @@ second yield shows why: an id computed over an unchecked wiring is a
 malicious verifying key for that id). In the plan.
 
 **6.8 accepted.**
+
+## Step 6.9: format 36 retired, the refine-bundle path deleted
+
+Branch `s6/fmt36` (worktree `.worktrees/s6-fmt36`) off `vos-core`
+`85c1853b`; merged into `vos-core` as `af330a2c`.
+
+**Commits:** `78b35749` the refine-bundle path deleted (+102 −4,552);
+`cfe30c59` format 36 retired (+205 −1,236); `0399fa05` the docs (+50
+−86); +352 −5,869 over 54 files; `b9957a18` the review's fold.
+
+**Deleted:**
+- `pvm/proof/src/refine.rs` and `refine/` (`collector.rs` with
+  `observed_step`, `encode.rs`, `prover.rs`, `tests.rs`), `refine_codec.rs`
+  and its tests, and their re-exports (`prove_refine`, `trace_refine*`,
+  `verify_refine_bundle_replayed`, `RefineProofBundle`,
+  `encode/decode_refine_proof_bundle`);
+- `vos-pvm-proof-verifier`: `verify_refine_bundle_authenticated`,
+  `RefineProgramCommitmentResolver`, the refine re-exports,
+  `tests/refine_bundle.rs`;
+- `prove.rs`'s `replay_trace_binding` and `ReplayTraceBinding`;
+  `proof.rs`'s `public_io_hash_from_registers` folded into
+  `Proof::public_io_hash`;
+- with 36: `format::LEGACY_SEGMENT`, `LEGACY_SEGMENT_NUMBER`, `Encoding`
+  (only `Lossless` was left, so the enum, `Format.encoding` and
+  `exact_params` went: every format takes exactly its parameters);
+  `proof/policy.rs` whole (`PcsPolicy`, `check_pcs_policy`,
+  `check_shape_policy`, `check_min_security`,
+  `MIN_CONJECTURED_SECURITY_BITS`, STANDARD/MOBILE), which existed for 36's
+  free parameters; `prove_mobile`, `prove_with_config`,
+  `prove_profiled_with_config`, `production_pcs_config(_mobile)`,
+  `Target::legacy`; `verify_with_pcs_policy`,
+  `verify_standalone_with_pcs_policy`; the zero-bits branch of
+  `check_interaction_pow` (every format grinds 8 bits);
+- the fixtures `segment-36.{proof,root}` and
+  `segment-36-{tampered,wrong-format}.patch`.
+
+**Changed:**
+- `prove`, `prove_profiled`, `prove_canonical`,
+  `program_commitment_for_profile`, `prove_chain`,
+  `prove_with_explicit_components` (its config parameter dropped),
+  `prove_with_boundary_override` and the relabel seam produce 35
+  (`Target::SEGMENT`); `PROOF_FORMAT_VERSION` is `SEGMENT.number`;
+  `verify_with_explicit_components` lost its policy parameter;
+- `RETIRED` = `[24, 25, 26, 27, 29, 31, 33, 34, 36, 40]`, 36's reason in its
+  doc (the legacy Blake2s segment format, 57 proven bits at its MOBILE
+  shape, below the inner formats' 60);
+- `kernel.rs`: `load` takes arguments (the window mapped read-only);
+  `trace_program(blob, arguments, gas)` beside `trace_kernel` (kernels'
+  identities unchanged);
+- `pvm/bench`: `precompile_agreement`, `diverse_proof`,
+  `precompile_tamper` and `bin/precompile` trace with `trace_program` and
+  prove and verify under 35; the tamper test proves the tampered trace and
+  verifies against the honest one; `tamper-stark` merged into `tamper`;
+- the fixture generator: `FORMATS = [(&SEGMENT, WRAP.number)]`; 35's
+  wrong-format patch relabelled 36 → 28 (refused as "does not name segment
+  proofs"); 35's proof, root and tampered patch unchanged;
+- the tests on 36 moved to 35 (`precompiles`, `chip_isolated`,
+  `arith_gate`, `host_verify_boundary_gate`, `alu`, recair `leaves`, the
+  verifier's `standalone`, `formats`, `segment_cost`, `program_id`), the
+  policy tests and `prove_mobile_smoke` deleted; `benches/prove.rs` on 35,
+  its PCS-config and security sweeps deleted; `bin/mobile_bench` on 35;
+- docs: `proving.md` A.4 (36's row dropped, the retired list takes it),
+  §4's note, the numbers note; `core-model.md` §11.4 (doc-fixes 12);
+  `SECURITY.md`; `pvm/proof/README.md`'s example; `docs/status.md`;
+  `docs/plans/roadmap.md`.
+
+**Gates:**
+- no producer or verifier of 36: the grep for `LEGACY_SEGMENT`,
+  `Encoding::Legacy`, `Target::legacy`, `PcsPolicy`, `prove_mobile`,
+  `prove_with_config`, `production_pcs_config`, `verify_with_pcs_policy`,
+  `refine_codec`, `RefineProofBundle`, `verify_refine_bundle`,
+  `prove_refine`, `trace_refine`, `check_min_security` finds only `spikes/`;
+  36 is in the code only in `RETIRED` and its doc;
+- `pvm/bench` on 35: `precompile_agreement`, `just test-bench-proof`
+  (`diverse_proof`, `precompile_tamper`) pass; `precompile prove 10`: 3,395
+  steps, prove 3.37 s, verify 0.33 s, 1,717 KiB, peak RSS 1,439 MiB
+  [measured, release, format 35]; `precompile tamper 1 call-input` refused
+  ("claimed logup sum is not zero");
+- `just check` green; the proof suites (`--lib --bins --test gates --test
+  isa`, debug-internals: 78, 221, 208 + 3 after the test actors were
+  built); `--test kernel` filtered to `fixtures`, `prove_chain`,
+  `chain_standalone`, `program_identity`: 11 pass, the generator matching
+  every fixture. The full `test-proof` is left to M2's acceptance.
+
+**For 6.22** (quality items gone with the deleted files): item 11
+(`observed_step`, `TracingPvm::step` the one recorder), item 25's first
+sub-item (`refine_codec` ≡ `refine/encode`; entry 13's 28-bit
+decomposition is in `memory.rs` and `register_memory.rs`), item 35's
+`verify_refine_bundle_authenticated`.
+
+**Left:** the runtime's observed refine path (`RefineContext::run_observed`
+and its types, `InnerMachines::invoke_observed`,
+`Machine::continue_observed`; `Machine::resume_observed` still used by
+`pvm/bench`); `ChannelKind::Blake2s`, `StarkProofAny::Blake2s` and
+`Commitment::Blake2s` (removing them moves postcard's variant indices and
+every 35 proof's bytes); `spikes/s5-attestable` and
+`spikes/s5-precompile/harness`, which no longer build.
+
+**Review:** Opus ACCEPT with small fixes, folded in `b9957a18`: every
+format's `interaction_pow_bits() > 0` asserted; `transcript.rs`'s long doc
+line rewrapped; `roadmap.md` names format 36's MOBILE bench; the plan's
+6.22 gains entry 21 (the runtime's observed refine path deleted, keeping
+`Machine::resume_observed` and `Interpreter::run_observed`; `with_stack!`'s
+Blake2s arm to `$unbuilt`; the two refine spikes deleted before master).
+Gates: clippy (all targets, debug-internals), the format tests (13),
+`doc-check`, `fmt-check` green.
+
+**The merge** (`af330a2c`): one conflict in `format.rs`, 6.3's `masking:
+None` on the deleted `LEGACY_SEGMENT`, resolved by dropping the block;
+`just check` after the merge 1,170 passed.
+
+**6.9 accepted.**
 
 ## Step 6.10: `vos-anchor` and the space's genesis
 
