@@ -165,7 +165,7 @@ fn a_statement_is_judged_against_the_anchors() {
     let f = fixture();
     let program = ProgramId([5; 8]);
     let statement = Statement {
-        format: vos_statement::FORMAT,
+        format: vos_statement::LINKED[0],
         program,
         space: f.space,
         public_args: vec![1],
@@ -174,7 +174,10 @@ fn a_statement_is_judged_against_the_anchors() {
     };
     let code = |verdict: Result<StatementId, Refusal>| vos_statement::code(&verdict);
     assert_eq!(code(f.venue.submit(&statement, &[0])), 3, "not pinned");
-    f.venue.pin(program);
+    f.venue.pin(Pin {
+        program,
+        venue_bound: false,
+    });
     assert_eq!(code(f.venue.submit(&statement, &[0])), 5, "not anchored");
     f.venue.anchor(&f.anchor(3, 1, 0)).unwrap();
     assert!(

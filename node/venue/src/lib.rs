@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 use vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceGenesis, SpaceId, VenueId, WindowClock};
-use vos_statement::model::Policy;
-use vos_statement::{ProgramId, Refusal, Statement, StatementId};
+use vos_statement::model::{Policy, Range, Space};
+use vos_statement::{Pin, ProgramId, Refusal, Statement, StatementId, Venue};
 
 /// What a node asks of a venue.
 pub trait VenueClient: Send + Sync {
@@ -74,12 +74,11 @@ struct Registered {
     suspended: bool,
 }
 
-#[derive(Default)]
 struct State {
     policy: Policy,
     spaces: BTreeMap<SpaceId, Registered>,
-    /// The programs whose statements it judges.
-    pins: Vec<ProgramId>,
+    /// What it pinned for the programs whose statements it judges.
+    pins: Vec<Pin>,
     /// Each equivocation: the anchor held, and the other.
     evidence: Vec<(Anchor, Anchor)>,
     /// The anchors held, by space, kind and window.
@@ -100,7 +99,11 @@ struct View<'a> {
     now: u64,
 }
 
-impl vos_statement::Venue for View<'_> {
+impl Venue for View<'_> {
+    fn id(&self) -> VenueId {
+        self.state.policy.venue
+    }
+
     fn accepts(&self, format: u32) -> bool {
         self.state.policy.formats.contains(&format)
     }
@@ -110,7 +113,7 @@ impl vos_statement::Venue for View<'_> {
     }
 
     fn seen(&self, id: &StatementId) -> bool {
-        self.state.policy.seen.contains(id)
+        self.state.policy.seen(id)
     }
 }
 
@@ -128,15 +131,15 @@ fn held(state: &State, root: &RootRead, now: u64) -> bool {
 }
 
 impl ModelVenue {
-    /// A venue named `id`, accepting final proofs of the current format,
-    /// timed by `now` (milliseconds since the Unix epoch).
+    /// A venue named `id`, accepting final proofs of the formats this
+    /// build links, timed by `now` (milliseconds since the Unix epoch).
     pub fn new(id: VenueId, now: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
         let state = State {
-            policy: Policy {
-                formats: vec![vos_statement::FORMAT],
-                ..Policy::default()
-            },
-            ..State::default()
+            policy: Policy::new(id, now(), vos_statement::LINKED),
+            spaces: BTreeMap::new(),
+            pins: Vec::new(),
+            evidence: Vec::new(),
+            anchors: BTreeMap::new(),
         };
         Self {
             id,
@@ -162,13 +165,22 @@ impl ModelVenue {
             last: None,
             suspended: false,
         };
-        self.state().spaces.insert(space, registered);
+        let mut state = self.state();
+        state.spaces.insert(space, registered);
+        state.policy.spaces.push(Space {
+            id: space,
+            clock: genesis.clock,
+            range: Range {
+                from: start,
+                until: None,
+            },
+        });
         space
     }
 
-    /// Judge statements of `program`.
-    pub fn pin(&self, program: ProgramId) {
-        self.state().pins.push(program);
+    /// Judge statements of `pin`'s program.
+    pub fn pin(&self, pin: Pin) {
+        self.state().pins.push(pin);
     }
 
     /// Whether `space` is suspended.
@@ -265,15 +277,19 @@ impl VenueClient for ModelVenue {
         let mut state = self.state();
         // A program it pinned none for is refused as `judge` refuses
         // another program than the pinned one, after the format.
-        let program = state
+        let pin = state
             .pins
             .iter()
-            .find(|pinned| **pinned == statement.program)
+            .find(|pinned| pinned.program == statement.program)
             .copied()
-            .unwrap_or(ProgramId([u32::MAX; 8]));
+            .unwrap_or(Pin {
+                program: ProgramId([u32::MAX; 8]),
+                venue_bound: false,
+            });
         let view = View { state: &state, now };
-        let id = vos_statement::judge(&view, &program, statement, proof)?;
-        state.policy.seen.push(id);
+        let id = vos_statement::judge(&view, &pin, statement, proof)?;
+        state.policy.now_ms = now;
+        state.policy.record(statement);
         Ok(id)
     }
 
