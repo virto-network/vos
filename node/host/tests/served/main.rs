@@ -5,6 +5,7 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod cuts;
 mod exactly_once;
 mod faults;
 mod forwarding;

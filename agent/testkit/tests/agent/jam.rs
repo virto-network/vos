@@ -28,6 +28,7 @@ use vos_wire::result::{Outcome, Outgoing, PAGE, Step, WorkResult, digest, split_
 use vos_wire::{Decode, Encode, defaults};
 
 mod agreement;
+mod cuts;
 mod driven;
 
 use crate::common::{
@@ -51,6 +52,7 @@ struct Ran {
     exported: usize,
     /// The keys its witness opens, and the rows of its scanned ranges.
     witnessed: usize,
+    witness: WitnessKeys,
     scanned: usize,
     /// The batch's inputs, its budget, and the package's own work as the
     /// builder estimated it.
@@ -233,6 +235,7 @@ impl Paired {
             imported,
             exported: pages,
             witnessed: witness.keys.len(),
+            witness: witness.keys,
             scanned: witness.ranges.iter().map(|range| range.rows.len()).sum(),
             inputs,
             budget,

@@ -53,6 +53,15 @@ pub enum SessionRef {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct WorkflowId(pub u64);
 
+/// A read at a window's cut that a workflow asked for: the workflow, and
+/// the await it suspends at. One await asks once, so the pair names one
+/// request for good, whichever window it is served at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
+pub struct RequestId {
+    pub workflow: WorkflowId,
+    pub awaits: u64,
+}
+
 /// A method of an actor, numbered by its schema.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub struct MethodId(pub u32);

@@ -136,7 +136,7 @@ async fn apply_one(inner: &Inner, shared: &Shared, index: u64) -> Result<(), Fau
             let term = entry.term;
             let body = body(inner, agent, entry, index).await?;
             let result = WorkResult::decode(&body).ok().map(|(result, _)| result);
-            let writes = if inner.hooks.fail_apply(agent, index, &body) {
+            let mut writes = if inner.hooks.fail_apply(agent, index, &body) {
                 Vec::new()
             } else {
                 let seed = result.as_ref().map(|result| result.seed);
@@ -147,6 +147,14 @@ async fn apply_one(inner: &Inner, shared: &Shared, index: u64) -> Result<(), Fau
             };
             let took = writes.iter().any(|write| write.key == keys::version());
             shared.record_outcome(index, took);
+            // The values a pending cut's build still needs, kept beside the
+            // writes that overwrite them: this replica's own rows, decided
+            // on the state the writes apply to.
+            if took {
+                let undo = crate::roots::undo(&snapshot, agent, &writes)
+                    .map_err(|error| Fault::Infrastructure(format!("the undo rows: {error}")))?;
+                writes.extend(undo);
+            }
             if let Some(result) = result {
                 rest.push(Change::LastResult {
                     agent,

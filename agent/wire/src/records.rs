@@ -301,6 +301,16 @@ pub struct SessionMark {
     pub time: u64,
 }
 
+/// A pending request of a window ([`crate::keys::request`]): the instance
+/// whose committed rows it reads, and the rows, by their full keys
+/// ([`crate::keys::committed`]), strictly increasing. Every replica proves
+/// them at the window's cut once its tree is built there.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct PendingRead {
+    pub instance: InstanceId,
+    pub rows: Vec<Vec<u8>>,
+}
+
 /// Every value the agent stores begins with this byte. Gray Paper storage
 /// deletes a key written with an empty value; the byte keeps an empty
 /// value present, as the actor ABI allows.

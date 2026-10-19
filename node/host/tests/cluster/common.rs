@@ -2,7 +2,7 @@
 
 use std::ops::RangeInclusive;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
@@ -17,7 +17,7 @@ use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
 use vos_wire::peer::{NodeNumber, PeerMessage};
 use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode};
+use vos_wire::{Decode, Encode, WindowClock};
 
 pub const COUNTER: InstanceId = InstanceId(1);
 pub const ALICE: Principal = Principal::Client([1; 32]);
@@ -38,17 +38,35 @@ pub struct Cluster {
     tuning: Tuning,
     /// Alice's session, for the calls the test makes.
     pub session: Session,
+    /// How far each node's clock is set ahead of its own, by node, from
+    /// node 1.
+    pub offsets: Vec<Arc<AtomicI64>>,
 }
 
 impl Cluster {
     /// Nodes 1..=count on the hub, as the harness configures them.
     pub fn new(count: u8) -> Self {
-        Self::build(count, false, Box::new(|_, _| {}))
+        Self::build(
+            count,
+            false,
+            Some(WindowClock::DEFAULT),
+            Box::new(|_, _| {}),
+        )
+    }
+
+    /// Nodes 1..=count on the hub, as [`Cluster::tuned`] makes them, of a
+    /// space founded with `clock`, or (`None`) of no space.
+    pub fn in_space(
+        count: u8,
+        clock: Option<WindowClock>,
+        tuning: impl Fn(NodeNumber, &mut Config) + Send + Sync + 'static,
+    ) -> Self {
+        Self::build(count, false, clock, Box::new(tuning))
     }
 
     /// Nodes 1..=count over QUIC on localhost.
     pub fn over_quic(count: u8) -> Self {
-        Self::build(count, true, Box::new(|_, _| {}))
+        Self::build(count, true, Some(WindowClock::DEFAULT), Box::new(|_, _| {}))
     }
 
     /// Nodes 1..=count on the hub, each config tuned by `tuning` past the
@@ -60,7 +78,7 @@ impl Cluster {
         count: u8,
         tuning: impl Fn(NodeNumber, &mut Config) + Send + Sync + 'static,
     ) -> Self {
-        Self::build(count, false, Box::new(tuning))
+        Self::build(count, false, Some(WindowClock::DEFAULT), Box::new(tuning))
     }
 
     /// Nodes 1..=count on the hub, each with hooks of its own: the
@@ -79,18 +97,18 @@ impl Cluster {
         Self::tuned(count, move |_, config| config.hooks = hooks.clone())
     }
 
-    fn build(count: u8, quic: bool, tuning: Tuning) -> Self {
+    fn build(count: u8, quic: bool, clock: Option<WindowClock>, tuning: Tuning) -> Self {
         let programs = Arc::new(Programs::load());
         let dirs: Vec<tempfile::TempDir> =
             (0..count).map(|_| tempfile::tempdir().unwrap()).collect();
-        let space = space(&programs.agent, &dirs, |number| {
+        let mut space = space(&programs.agent, &dirs, |number| {
             format!("http://node-{number}")
         });
         // A space founded as `vos space up` founds it.
-        let genesis = space
-            .found(vos_wire::WindowClock::DEFAULT, 0, [7; 16])
-            .unwrap();
-        let space = space.with_genesis(genesis).unwrap();
+        if let Some(clock) = clock {
+            let genesis = space.found(clock, 0, [7; 16]).unwrap();
+            space = space.with_genesis(genesis).unwrap();
+        }
         let mut cluster = Self {
             hub: Hub::new(7),
             quic,
@@ -105,6 +123,7 @@ impl Cluster {
                 name: [1; 16],
                 t0: vos_node::wall_clock(),
             },
+            offsets: (0..count).map(|_| Arc::default()).collect(),
         };
         for number in 1..=count {
             cluster.start(number);
@@ -123,9 +142,13 @@ impl Cluster {
         };
         config.election_timeout_ms = (300, 600);
         config.heartbeat_ms = 10;
-        // Each node's own clock, a few milliseconds apart.
+        // Each node's own clock, a few milliseconds apart, and as far
+        // ahead as the test sets it.
         let skew = u64::from(number) * 7;
-        config.clock = Arc::new(move || vos_node::wall_clock() + skew);
+        let offset = Arc::clone(&self.offsets[usize::from(number) - 1]);
+        config.clock = Arc::new(move || {
+            (vos_node::wall_clock() + skew).saturating_add_signed(offset.load(Ordering::SeqCst))
+        });
         (self.tuning)(number, &mut config);
         config
     }

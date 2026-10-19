@@ -383,7 +383,7 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | window of time t | `w = ⌊(t − origin_ms) / length_ms⌋`; t < origin_ms has none |
 | boundary | `B_w = origin_ms + (w+1)·length_ms` |
 | length | `length_ms` ∈ [120,000, 3,600,000], default 600,000 (decision 2); the venue refuses another at registration |
-| `cut(w)` | the agent's state version before the first applied result with time ≥ `B_w` |
+| `cut(w)` | the agent's state version before the first applied result with time ≥ `B_w`: a result timed t, after the agent's batch-time mark p, records it for every w with p < `B_w` ≤ t, once the record its first install wrote names a space (the install itself cuts nothing, so only windows past the agent's first install are cut); of more than `MAX_CUTS` (32, a consensus constant) such windows, the newest 32 alone, the older never cut. The rows are never deleted in 6.12; the pruning rule (apply deleting `cut(w')` for `w' < w − K`, K ≥ 2 plus the re-cut depth) is 6.14's to decide |
 | agent root | the vos-tree root over the agent's committed rows `0x03 ‖ instance ‖ tag ‖ transform ‖ key' → value` (pin E); empty: `H("vos/tree/empty")` |
 | representative's rows | a `CommittedMap<RepKey, [u8; 32]>`, `RepKey = agent (4, BE) ‖ kind (1) ‖ w (8, BE)`, the value the agent's root at `cut(w)`; kind 0 is pin E's Blake2b tree; rows older than `w − 2` deleted |
 | representative's clock | `(origin_ms + D, length_ms)`, `D = min(length_ms / 5, 120,000)`: its own `cut_rep(w)` at `B_w + D` is the close of w |
@@ -503,7 +503,9 @@ Rests on decisions 5, 6 and 8.
      the arguments ‖ served and records the `Attest`; the workflow's
      record keeps the attest's return, never the served bytes.
 - **A window not closed in time:** a pending request of window w whose
-  `Closed { w }` has not been applied when `cut(w+1)` is is re-cut at w+1:
+  `Closed { w }` has not been applied when the next cut recorded after w
+  is, is re-cut there (w+1, unless a clock jump past `MAX_CUTS` skipped
+  it):
   its `rows_proof` regenerated at the new cut, the old one dropped, its
   `AgentRoot` for w+1 marked pending. After 2 re-cuts the workflow sees
   `AttestError::NotClosed`. A representative returning after several
@@ -1033,17 +1035,23 @@ lands.
     at or past it; it never synthesizes a time, so a trailing leader cuts
     late, never wrongly;
   - **apply** of the first entry with time ≥ `B_w` records `cut(w)` for
-    every boundary it crosses (one version for several after a clock jump);
+    every boundary it crosses (one version for several after a clock jump,
+    at most the newest `MAX_CUTS`); the shared apply, on both hosts,
+    reading the agent's record (target, space, clock) from the state
+    before the result's steps; a record stored in part applies nothing;
   - **the builder** targets `min(latest, the earliest unbuilt cut)`;
   - **`undo(w, key)`** rows are node-local, written by the node's apply
     wrapper, never by the agent's `apply`: for a committed write while
     `cut(w)` is unbuilt and the key's current version ≤ `cut(w)`; the cut's
     build reads them and skips dirty rows past `cut(w)`;
-  - **the proofs:** after the cut's build, every replica generates
-    `rows_proof` for each pending request of w (deterministic bytes) and
-    persists it as a local row under `Owner::Tree`, keyed by request, in
-    the commit that marks the cut built;
-  - the agent root at `cut(w)` kept for the two latest windows;
+  - **the proofs:** after the cut's build, every replica persists, for
+    each pending request of w, its `CutProof` (the rows with their salts
+    and values at the cut, the root, the version, and the `rows_proof`;
+    deterministic bytes) as a local row under `Owner::Tree`, keyed by
+    request, in the commit that marks the cut built: later writes
+    overwrite the values, and builds delete the seeds, before `Served` is
+    assembled;
+  - the agent root at `cut(w)` kept for the two latest built cuts;
   - **an agent of no space** (`keys::space` = `NONE`, 6.10) runs no cuts;
   - **witness builders** serve `keys::target`, `keys::space` and
     `keys::clock` together whenever they serve one: the default agent
@@ -1082,7 +1090,12 @@ lands.
   review). A program id's leaf-circuit hashes are computed in the prover
   role, over a wiring the relation alone does not check (6.8's second
   yield): an id is trusted only as recomputed from the blob, never as
-  submitted (6.8's review).
+  submitted (6.8's review). The ask validates its `PendingRead.rows`
+  (strictly increasing, so sorted and distinct; each `keys::is_committed` and under
+  `0x03 ‖ instance`; bounded in count) and refuses it otherwise: a cut's
+  build leaves a request it cannot read unproved (6.12), but none should
+  reach it. 6.13's real ask replaces 6.12's test hook
+  (`Hooks::request_at_cut`), which it deletes.
 - **Tests:** existing rootless attestables unchanged; a `&self` read
   accepted; a key outside the read set traps; a tampered row, a wrong
   agent root, a wrong window, a missing representative row, a row of
@@ -1113,7 +1126,22 @@ lands.
   `Closed { w, rep_root, paths }` pair message an agent, sent by the hook
   that signs the anchor; missed windows closed on return within
   `MaxRootAge`; pin E's re-cut of a request whose `Closed` has not
-  arrived by `cut(w+1)`.
+  arrived by the next cut recorded after w.
+  - **The leader learns a cut's build has finished:** the builder's
+    finishing commit wakes the leader (a `Woke::Built` from the builder's
+    loop to the leader's `take`), which then sends `AgentRoot`; nothing
+    wakes it there in 6.12.
+  - **Pruning `cut(w)` rows** [open, decided here]: 6.12 never deletes
+    them (one replicated row a window, a leaf in JAM's state each). The
+    rule to decide: apply, recording `cut(w)`, deletes `cut(w')` for
+    `w' < w − K`, K ≥ 2 plus the re-cut depth. `pending()` reads past the
+    latest built cut and is unaffected; a replica down longer than K
+    windows skips those cuts, whose requests re-cut or end `NotClosed`.
+  - **Catch-up by log across many windows**: each committed write of the
+    replayed log writes one undo row per cut still pending, and each cut
+    costs a build pass; a node-local cap (build the newest K pending cuts
+    only, drop the others' undo rows) would bound it, at the cost of which
+    replicas hold which proofs: decide here.
 - **Tests:** three nodes, three agents and the representative: every
   agent reports; an agent whose clock leads by more than L − D (its w+1
   row leaves `S_w` alone); an agent that misses the close (its statement
@@ -1411,9 +1439,17 @@ fees are the teammate's.
     rootless entries never expire (pin F);
   - accepted program ids (and their venue-bound flags) are constants,
     changed by redeploy; `VenueId` per pin D;
+  - **the agent's cut rows on JAM**: one `cut(w)` leaf a window in the
+    service's state, never deleted until 6.14's pruning rule lands, and
+    at most `MAX_CUTS` new adjacent leaves a package;
   - the service carries none of `final-verify.elf`'s test modes (mode 2,
     the anchor vectors, reports `ACCEPT` with no statement); otherwise
     accumulate records a verdict only when its `code` is 0.
+- **Ops note (6.12's cuts):** a replica catching up by log across many
+  windows writes one undo row per pending cut for each committed write it
+  replays, and builds each cut in turn; by snapshot it does none of
+  this. The runbook says so; 6.14 decides whether a node-local cap
+  bounds it.
 - **Tests:** first, a 256 KiB extrinsic submitted, refined and read;
   every fixture judged alike on the JAM-only host; anchors, an anchor
   signed by an unregistered key, equivocation, migration; a default-agent

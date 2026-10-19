@@ -67,6 +67,10 @@ harness = false
 name = "tree_crash"
 harness = false
 
+[[test]]
+name = "cut_crash"
+harness = false
+
 [[bench]]
 name = "acceptance"
 harness = false
@@ -93,4 +97,8 @@ harness = false
 
 [[bench]]
 name = "tree"
+harness = false
+
+[[bench]]
+name = "cuts"
 harness = false

@@ -3,7 +3,9 @@
 use proptest::prelude::*;
 use vos_wire::abi::{self, Failure, Rows};
 use vos_wire::batch::Batch;
-use vos_wire::ids::{AgentId, InstanceId, MapId, ProgramHash, Session, SessionId, WorkflowId};
+use vos_wire::ids::{
+    AgentId, InstanceId, MapId, ProgramHash, RequestId, Session, SessionId, WorkflowId,
+};
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs, Transfer};
 use vos_wire::keys::{self, Due, Transform};
 use vos_wire::records::{leaf_value, stored};
@@ -101,6 +103,7 @@ proptest! {
         let instance = InstanceId(instance);
         let map = MapId { instance, tag, transform: Transform::Hashed };
         let row = keys::committed(&map, &Transform::Hashed.apply(&tag.to_be_bytes()));
+        let request = RequestId { workflow: WorkflowId(sequence), awaits: session };
         let owned = [
             keys::instance_struct(instance),
             keys::table_prefix(instance, tag),
@@ -133,6 +136,11 @@ proptest! {
             keys::tree_root(),
             keys::built(),
             keys::committed_all(),
+            keys::cut(sequence),
+            keys::request(sequence, request),
+            keys::undo(sequence, &row),
+            keys::cut_root(sequence),
+            keys::cut_proof(request),
         ];
         for key in &system {
             prop_assert!(!keys::owned_by(key, instance));
@@ -193,6 +201,11 @@ proptest! {
                 keys::tree_leaf(&keys::committed(&map, &transformed)),
                 keys::tree_root(),
                 keys::built(),
+                keys::cut(number),
+                keys::request(number, RequestId { workflow: WorkflowId(u64::from(a)), awaits: u64::from(b) }),
+                keys::undo(number, &keys::committed(&map, &transformed)),
+                keys::cut_root(number),
+                keys::cut_proof(RequestId { workflow: WorkflowId(number), awaits: u64::from(a) }),
             ]);
             if let Some(prefix) = prefix {
                 rows.push(keys::tree_node(level, &prefix));

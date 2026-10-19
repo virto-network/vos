@@ -15,7 +15,7 @@ use vos_tree::Blake2b;
 
 use crate::abi::{Failure, Rows, cap};
 use crate::ids::{
-    AgentId, InstanceId, MapId, Principal, ProgramHash, Session, SessionId, WorkflowId,
+    AgentId, InstanceId, MapId, Principal, ProgramHash, RequestId, Session, SessionId, WorkflowId,
 };
 
 /// Who owns a row, its key's first byte: the agent itself, one of its
@@ -141,6 +141,8 @@ enum Row {
     Target = 0x18,
     Space = 0x19,
     Clock = 0x1a,
+    Cut = 0x1b,
+    Request = 0x1c,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -152,6 +154,9 @@ enum TreeRow {
     Leaf = 0x01,
     Root = 0x02,
     Built = 0x03,
+    Undo = 0x04,
+    CutRoot = 0x05,
+    CutProof = 0x06,
 }
 
 impl TreeRow {
@@ -417,6 +422,116 @@ pub fn tree_root() -> Vec<u8> {
 /// row is left through it.
 pub fn built() -> Vec<u8> {
     TreeRow::Built.prefix().to_vec()
+}
+
+/// The state version of the window `window`'s cut: the version before the
+/// first work result applied with a time at or past the window's boundary
+/// ([`crate::WindowClock::boundary`]). Apply writes it, for every window
+/// that result's time crosses, in an agent of a space; it is replicated,
+/// and never rewritten.
+pub fn cut(window: u64) -> Vec<u8> {
+    key(&[&Row::Cut.prefix(), &window.to_be_bytes()])
+}
+
+/// The prefix of the cuts, in window order.
+pub fn cuts() -> Vec<u8> {
+    Row::Cut.prefix().to_vec()
+}
+
+/// The window a [`cut`] key names; `None` for any other key.
+pub fn cut_entry(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(&Row::Cut.prefix())?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
+}
+
+/// A pending request of the window `window` ([`crate::records::PendingRead`]):
+/// replicated, written by the workflow step that asks.
+pub fn request(window: u64, id: RequestId) -> Vec<u8> {
+    key(&[
+        &Row::Request.prefix(),
+        &window.to_be_bytes(),
+        &id.workflow.0.to_be_bytes(),
+        &id.awaits.to_be_bytes(),
+    ])
+}
+
+/// The prefix of every pending request, in window order.
+pub fn request_prefix() -> Vec<u8> {
+    Row::Request.prefix().to_vec()
+}
+
+/// The prefix of the window `window`'s pending requests.
+pub fn requests(window: u64) -> Vec<u8> {
+    key(&[&Row::Request.prefix(), &window.to_be_bytes()])
+}
+
+/// The window and request a [`request`] key names; `None` for any other
+/// key.
+pub fn request_entry(key: &[u8]) -> Option<(u64, RequestId)> {
+    let rest = key.strip_prefix(&Row::Request.prefix())?;
+    let rest: &[u8; 24] = rest.try_into().ok()?;
+    let word = |at: usize| u64::from_be_bytes(rest[at..at + 8].try_into().unwrap_or_default());
+    Some((
+        word(0),
+        RequestId {
+            workflow: WorkflowId(word(8)),
+            awaits: word(16),
+        },
+    ))
+}
+
+/// The value the committed row `row` held at the window `window`'s cut,
+/// its stored bytes, kept by the node while that cut's build is pending
+/// and a later write overwrites the row. Node-local: the node's apply
+/// writes it beside the agent's writes, and the cut's build deletes it.
+pub fn undo(window: u64, row: &[u8]) -> Vec<u8> {
+    TreeRow::Undo.key(&[&window.to_be_bytes()[..], row].concat())
+}
+
+/// The prefix of the window `window`'s [`undo`] rows.
+pub fn undos(window: u64) -> Vec<u8> {
+    TreeRow::Undo.key(&window.to_be_bytes())
+}
+
+/// The prefix of every [`undo`] row.
+pub fn undo_prefix() -> Vec<u8> {
+    TreeRow::Undo.prefix().to_vec()
+}
+
+/// The window and committed row an [`undo`] key names; `None` for any
+/// other key.
+pub fn undo_entry(key: &[u8]) -> Option<(u64, &[u8])> {
+    let rest = key.strip_prefix(&TreeRow::Undo.prefix())?;
+    let (window, row) = rest.split_first_chunk::<8>()?;
+    is_committed(row).then(|| (u64::from_be_bytes(*window), row))
+}
+
+/// The agent's root at the window `window`'s cut, and the cut's version,
+/// once the cut's build is done: node-local, kept for the two latest cuts.
+pub fn cut_root(window: u64) -> Vec<u8> {
+    TreeRow::CutRoot.key(&window.to_be_bytes())
+}
+
+/// The prefix of every [`cut_root`] row.
+pub fn cut_roots() -> Vec<u8> {
+    TreeRow::CutRoot.prefix().to_vec()
+}
+
+/// The window a [`cut_root`] key names; `None` for any other key.
+pub fn cut_root_entry(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(&TreeRow::CutRoot.prefix())?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
+}
+
+/// A pending request's rows and their proof at its window's cut,
+/// node-local, written in the commit that marks the cut built.
+pub fn cut_proof(id: RequestId) -> Vec<u8> {
+    TreeRow::CutProof.key(&[&id.workflow.0.to_be_bytes()[..], &id.awaits.to_be_bytes()].concat())
+}
+
+/// The prefix of every [`cut_proof`] row.
+pub fn cut_proofs() -> Vec<u8> {
+    TreeRow::CutProof.prefix().to_vec()
 }
 
 /// The prefix of an instance's struct and table rows.
@@ -716,6 +831,21 @@ pub fn acked(to: AgentId) -> Vec<u8> {
 /// The agent's state version: applied, non-skipped work results.
 pub fn version() -> Vec<u8> {
     Row::Version.prefix().to_vec()
+}
+
+/// Whether `key` is a replicated row, the same on every replica at one
+/// applied version: the agent's own rows but the dirty and seed rows its
+/// root builder consumes at its own pace, its instances' rows and its
+/// committed rows; never the root builder's node-local rows under
+/// `0x02`.
+pub fn is_replicated(key: &[u8]) -> bool {
+    match key.first() {
+        Some(&owner) if owner == Owner::System as u8 => {
+            !key.starts_with(&Row::Dirty.prefix()) && !key.starts_with(&Row::Seed.prefix())
+        }
+        Some(&owner) => owner == Owner::Instance as u8 || owner == Owner::Committed as u8,
+        None => false,
+    }
 }
 
 /// Whether `key` lies inside `instance`'s own state: under

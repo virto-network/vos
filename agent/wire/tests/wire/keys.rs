@@ -3,7 +3,7 @@
 use vos_wire::Encode;
 use vos_wire::abi::{self, Failure, Rows};
 use vos_wire::ids::{
-    AgentId, InstanceId, MapId, Principal, ProgramHash, Session, SessionId, WorkflowId,
+    AgentId, InstanceId, MapId, Principal, ProgramHash, RequestId, Session, SessionId, WorkflowId,
 };
 use vos_wire::keys::{self, Due, Transform};
 
@@ -207,6 +207,74 @@ fn committed_keys_keep_their_bytes() {
     assert_eq!(keys::tree_leaves(), [0x02, 0x01]);
     assert_eq!(keys::tree_root(), [0x02, 0x02]);
     assert_eq!(keys::built(), [0x02, 0x03]);
+    let request = RequestId {
+        workflow: WorkflowId(0x1112_1314_1516_1718),
+        awaits: 0x2122_2324_2526_2728,
+    };
+    let (workflow, awaits) = (
+        [0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18],
+        [0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27, 0x28],
+    );
+    assert_eq!(
+        keys::cut(0x0102_0304_0506_0708),
+        cat(&[&[0x00, 0x1b], &version])
+    );
+    assert_eq!(keys::cuts(), [0x00, 0x1b]);
+    assert_eq!(keys::cut_entry(&keys::cut(9)), Some(9));
+    assert_eq!(
+        keys::request(0x0102_0304_0506_0708, request),
+        cat(&[&[0x00, 0x1c], &version, &workflow, &awaits])
+    );
+    assert_eq!(keys::request_prefix(), [0x00, 0x1c]);
+    assert_eq!(
+        keys::requests(0x0102_0304_0506_0708),
+        cat(&[&[0x00, 0x1c], &version])
+    );
+    assert_eq!(
+        keys::request_entry(&keys::request(3, request)),
+        Some((3, request))
+    );
+    assert_eq!(
+        keys::undo(0x0102_0304_0506_0708, &row),
+        cat(&[&[0x02, 0x04], &version, &row])
+    );
+    assert_eq!(
+        keys::undos(0x0102_0304_0506_0708),
+        cat(&[&[0x02, 0x04], &version])
+    );
+    assert_eq!(keys::undo_prefix(), [0x02, 0x04]);
+    assert_eq!(
+        keys::cut_root(0x0102_0304_0506_0708),
+        cat(&[&[0x02, 0x05], &version])
+    );
+    assert_eq!(keys::cut_roots(), [0x02, 0x05]);
+    assert_eq!(
+        keys::cut_proof(request),
+        cat(&[&[0x02, 0x06], &workflow, &awaits])
+    );
+    assert_eq!(keys::cut_proofs(), [0x02, 0x06]);
+    assert_eq!(keys::cut_entry(&keys::cut_root(9)), None);
+    assert_eq!(keys::cut_root_entry(&keys::cut_root(9)), Some(9));
+    assert_eq!(keys::cut_root_entry(&keys::cut(9)), None);
+    assert_eq!(keys::undo_entry(&keys::undo(9, &row)), Some((9, &row[..])));
+    assert_eq!(keys::undo_entry(&keys::cut_root(9)), None);
+    for (key, replicated) in [
+        (keys::cut(9), true),
+        (keys::request(9, request), true),
+        (keys::version(), true),
+        (row.clone(), true),
+        (keys::instance_struct(InstanceId(1)), true),
+        (keys::dirty(9, &row), false),
+        (keys::seed(9), false),
+        (keys::undo(9, &row), false),
+        (keys::cut_root(9), false),
+        (keys::cut_proof(request), false),
+        (keys::built(), false),
+        (Vec::new(), false),
+    ] {
+        assert_eq!(keys::is_replicated(&key), replicated, "{key:?}");
+    }
+    assert_eq!(keys::request_entry(&keys::cut(9)), None);
     // The hashed transform: the first 16 bytes of BLAKE2b-256 over
     // `vos/tree/key` and the key, then the key escaped.
     let hashed = Transform::Hashed.apply(&[7, 0]);
