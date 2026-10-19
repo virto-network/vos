@@ -72,9 +72,7 @@ fn load(
     KernelTraceError,
 > {
     let program = vos_pvm::spi::parse_standard_program(blob).ok_or(KernelTraceError::Program)?;
-    let layout = program
-        .layout(arguments)
-        .ok_or(KernelTraceError::Program)?;
+    let layout = program.layout(arguments).ok_or(KernelTraceError::Program)?;
     let mut memory = Memory::sparse(1 << 32);
     let pages = memory.pages();
     let page = u64::from(vos_pvm::PVM_PAGE_SIZE);

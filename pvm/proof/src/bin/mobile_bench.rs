@@ -1,8 +1,7 @@
 //! Minimal on-device proving benchmark: trace + prove + verify a tiny
-//! ADD-chain fixture under the MOBILE PCS config, reporting wall-clock
+//! ADD-chain fixture under the segment format (35), reporting wall-clock
 //! times and peak RSS.  This is the artifact to cross-compile and push
-//! to a phone for the ARM bring-up numbers (reference x86 point:
-//! log14 MOBILE ≈ 1.5 s with target-cpu=native).
+//! to a phone for the ARM bring-up numbers.
 //!
 //! ```text
 //! cargo build --release -p vos-pvm-proof --bin mobile_bench \
@@ -18,7 +17,7 @@ use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
 
 use vos_pvm_proof::core::tracing::TracingPvm;
-use vos_pvm_proof::{PcsPolicy, SideNote, prove_mobile, verify_with_pcs_policy};
+use vos_pvm_proof::{SideNote, prove, verify};
 
 /// `n` sequential ADD64 instructions (registers cycled to avoid data
 /// hazards) followed by Trap — the same fixture shape as the
@@ -57,7 +56,7 @@ fn main() {
         .unwrap_or(14);
     let n_steps = 1usize << log_size;
     println!(
-        "mobile_bench: arch={} log_size={log_size} ({n_steps} steps), MOBILE config",
+        "mobile_bench: arch={} log_size={log_size} ({n_steps} steps), format 35",
         std::env::consts::ARCH
     );
 
@@ -84,15 +83,14 @@ fn main() {
     let mut side_note = SideNote::new(steps, code, bitmask);
     let trace_time = t.elapsed();
 
-    // Prove (MOBILE PCS config: blowup=4, q=38, pow=20 — 96 bits).
     let t = std::time::Instant::now();
-    let proof = prove_mobile(&mut side_note).expect("prove_mobile failed");
+    let proof = prove(&mut side_note).expect("prove failed");
     let prove_time = t.elapsed();
 
-    // Verify under the matching policy: a cheap cross-ISA correctness
-    // gate — a NEON/codegen bug shows up here as a rejected proof.
+    // Verify: a cheap cross-ISA correctness gate — a NEON/codegen bug shows
+    // up here as a rejected proof.
     let t = std::time::Instant::now();
-    verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE).expect("verify failed");
+    verify(proof, &side_note).expect("verify failed");
     let verify_time = t.elapsed();
 
     println!("trace  = {trace_time:>10.2?}");

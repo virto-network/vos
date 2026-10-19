@@ -5,7 +5,7 @@ use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::Interpreter;
 
 use vos_pvm_proof::core::tracing::TracingPvm;
-use vos_pvm_proof::{PcsPolicy, prove, prove_mobile, verify, verify_with_pcs_policy};
+use vos_pvm_proof::{prove, verify};
 
 use crate::common::{prove_and_verify, prove_three_reg, trace_three_reg};
 
@@ -45,25 +45,6 @@ fn run_two_reg_imm(
 #[test]
 fn prove_add64() {
     prove_three_reg(Opcode::Add64, 2, 0, 1, 100, 200, 300);
-}
-
-/// Smoke test for the MOBILE prover entry point.  Exercises
-/// `prove_mobile()` + `verify_with_pcs_policy(MOBILE)` end-to-end on
-/// the simplest workload (a single Add64) so the public API stays
-/// regression-tested even when no real-actor benchmark is run in CI.
-#[test]
-fn prove_mobile_smoke() {
-    let mut regs = [0u64; PVM_REGISTER_COUNT];
-    regs[0] = 100;
-    regs[1] = 200;
-    let steps = trace_three_reg(Opcode::Add64, 2, 0, 1, regs);
-    let code = vec![Opcode::Add64 as u8, 0x10, 2, Opcode::Trap as u8];
-    let bitmask = vec![1, 0, 0, 1];
-
-    let mut side_note = vos_pvm_proof::SideNote::new(steps, code, bitmask);
-    let proof = prove_mobile(&mut side_note).expect("MOBILE proving failed");
-    verify_with_pcs_policy(proof, &side_note, &PcsPolicy::MOBILE)
-        .expect("MOBILE verification failed");
 }
 
 #[test]

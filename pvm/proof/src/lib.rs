@@ -74,12 +74,11 @@
 //! - **Trace** — [`TracingPvm::into_side_note`][into_side_note] (a
 //!   run's whole trace) or [`SideNote::new`] from a hand-built step
 //!   trace.
-//! - **Prove** — [`prove`] (STANDARD) or [`prove_mobile`] (low-latency
-//!   MOBILE); [`prove_with_config`] for a custom [`PcsConfig`]; all three
-//!   under the legacy format 36. [`prove_format`] proves under any admitted
-//!   format of the [`format`](mod@format) registry, at its parameters.
-//! - **Verify** — [`verify`] / [`verify_with_pcs_policy`] (prover-side,
-//!   with the SideNote); [`verify_chain`] for a segment chain. The
+//! - **Prove** — [`prove`], under the segment format 35;
+//!   [`prove_format`] under any admitted format of the
+//!   [`format`](mod@format) registry, at its parameters.
+//! - **Verify** — [`verify`] (prover-side, with the SideNote);
+//!   [`verify_chain`] for a segment chain. The
 //!   side-note-free deployer verifier is `verify_standalone` in the
 //!   `vos-pvm-proof-verifier` crate.
 //! - **Identity** — [`program_commitment_of_proof`] /
@@ -89,8 +88,8 @@
 //!   [`canonical_profile_for_bounds`], and [`prove_canonical`] produce a
 //!   chain of equal-shape segments.
 //!
-//! Core types: [`Proof`], [`SegmentState`], [`SideNote`], [`PcsPolicy`],
-//! [`PcsConfig`], [`FriConfig`].
+//! Core types: [`Proof`], [`SegmentState`], [`SideNote`], [`PcsConfig`],
+//! [`FriConfig`].
 //!
 //! Proofs name their format, an entry of the [`format`](mod@format) registry, which
 //! selects their channel, parameters and encodings at run time; a verifier
@@ -498,27 +497,20 @@ pub(crate) fn active_components_verifier(
 
 pub use format::Format;
 pub use pcs::{Commitment, StarkProofAny};
-pub use proof::{PROOF_FORMAT_VERSION, PcsPolicy, Proof, SegmentState};
-pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemoryPage};
-// The per-policy FRI floor constants + the policy checker: used by callers
-// that assemble a custom `PcsPolicy`; hidden from the top-level page.
-#[doc(hidden)]
-pub use proof::{
-    STANDARD_MIN_FRI_LOG_BLOWUP, STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS, check_pcs_policy,
-};
+pub use proof::{PROOF_FORMAT_VERSION, Proof, SegmentState};
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::{prove_pre_config_relabel_for_test, prove_with_boundary_override};
+pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemoryPage};
 // ── Prove: the stable surface ────────────────────────────────────────
-// Single proof: `prove` / `prove_mobile` / `prove_with_config`.
+// Single proof: `prove` / `prove_format`.
 // Segment chain: `canonical_profile_for_bounds` derives the forcing
 // profile, `prove_canonical` proves each window to one shape.
 #[cfg(feature = "prover")]
 pub use prove::{
     KernelSegment, ProvingError, canonical_profile_for_bounds, program_commitment_for_profile,
     program_commitment_for_profile_format, program_commitment_for_shape, prove, prove_canonical,
-    prove_canonical_format, prove_chain, prove_format, prove_kernel, prove_mobile, prove_shaped,
-    prove_with_config,
+    prove_canonical_format, prove_chain, prove_format, prove_kernel, prove_shaped,
 };
 // Advanced / internal prove surface: the profiling variants, the thread-pool
 // installer, and the explicit-component harness entry. Public for tests;
@@ -526,8 +518,7 @@ pub use prove::{
 #[doc(hidden)]
 #[cfg(feature = "prover")]
 pub use prove::{
-    ProveProfile, install_thread_pool, prepare_side_note_for_verification, production_pcs_config,
-    production_pcs_config_mobile, prove_profiled, prove_profiled_with_config,
+    ProveProfile, install_thread_pool, prepare_side_note_for_verification, prove_profiled,
     prove_with_explicit_components,
 };
 #[cfg(feature = "debug-internals")]
@@ -542,7 +533,7 @@ pub use stwo::core::pcs::PcsConfig;
 // The side-note-FREE deployer verifier lives in the `vos-pvm-proof-verifier` crate
 // (`verify_standalone`) — no_std, no prover deps.
 #[cfg(feature = "prover")]
-pub use verify::{DEFAULT_MAX_LOG_SIZE, verify, verify_chain, verify_with_pcs_policy};
+pub use verify::{DEFAULT_MAX_LOG_SIZE, verify, verify_chain};
 // Advanced verify surface (explicit components)
 // and the recursion seams the in-AIR verifier is checked against.
 #[doc(hidden)]

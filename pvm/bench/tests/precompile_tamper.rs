@@ -15,7 +15,11 @@ fn accepted(
     program: &[u8],
     arguments: &[u8],
 ) -> bool {
-    let trace = || trace_program(program, arguments, GAS).expect("trace").side_note;
+    let trace = || {
+        trace_program(program, arguments, GAS)
+            .expect("trace")
+            .side_note
+    };
     let honest = trace();
     let mut side_note = trace();
     tamper(&mut side_note);

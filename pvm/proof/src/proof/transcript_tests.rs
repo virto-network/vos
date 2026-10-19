@@ -1,7 +1,7 @@
 //! The lossless boundary encoding and the interaction PoW.
 
 use super::*;
-use crate::format::{LEGACY_SEGMENT, SEGMENT};
+use crate::format::SEGMENT;
 use crate::framework_access::{
     AllLookupElements, boundary_relation_challenges, draw_all_lookup_elements,
 };
@@ -28,7 +28,7 @@ fn challenges(
     final_state: &SegmentState,
 ) -> [(SecureField, SecureField); 3] {
     let channel = &mut Poseidon2M31Channel::default();
-    mix_boundary_states(channel, SEGMENT.encoding, initial, final_state);
+    mix_boundary_states(channel, initial, final_state);
     let mut lookups = AllLookupElements::default();
     draw_all_lookup_elements(&mut lookups, channel, u32::MAX);
     boundary_relation_challenges(&lookups)
@@ -78,7 +78,7 @@ fn the_boundary_run_is_the_chips_bytes() {
 }
 
 /// The interaction PoW: a ground nonce passes and is mixed, another
-/// nonce is refused; a format without one takes only the nonce 0.
+/// nonce is refused.
 #[test]
 fn the_interaction_pow_is_checked() {
     let mut channel = Poseidon2M31Channel::default();
@@ -93,16 +93,5 @@ fn the_interaction_pow_is_checked() {
     assert!(check_interaction_pow(&mut channel.clone(), &SEGMENT, wrong).is_err());
     let mut mixed = channel.clone();
     check_interaction_pow(&mut mixed, &SEGMENT, nonce).unwrap();
-    assert_ne!(
-        mixed.clone().draw_secure_felt(),
-        channel.clone().draw_secure_felt()
-    );
-
-    let mut legacy = channel.clone();
-    check_interaction_pow(&mut legacy, &LEGACY_SEGMENT, 0).unwrap();
-    assert_eq!(
-        legacy.draw_secure_felt(),
-        channel.clone().draw_secure_felt()
-    );
-    assert!(check_interaction_pow(&mut channel, &LEGACY_SEGMENT, nonce.max(1)).is_err());
+    assert_ne!(mixed.draw_secure_felt(), channel.draw_secure_felt());
 }

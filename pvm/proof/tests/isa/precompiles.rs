@@ -70,21 +70,8 @@ fn prove_blake2b_precompile() {
     let _exit = tracing.run_with_precompiles();
     let mut side_note = tracing.into_side_note().with_memory(flat_mem);
 
-    let config = vos_pvm_proof::PcsConfig {
-        pow_bits: 5,
-        fri_config: vos_pvm_proof::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-        deep_batching: Default::default(),
-    };
-    let proof =
-        vos_pvm_proof::prove_with_config(&mut side_note, config).expect("blake2b proving failed");
-    let policy = vos_pvm_proof::PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    vos_pvm_proof::verify_with_pcs_policy(proof, &side_note, &policy)
-        .expect("blake2b verification failed");
+    let proof = vos_pvm_proof::prove(&mut side_note).expect("blake2b proving failed");
+    vos_pvm_proof::verify(proof, &side_note).expect("blake2b verification failed");
     eprintln!("Blake2b precompile: PROVED!");
 }
 
@@ -116,20 +103,8 @@ fn prove_vos_halt_jump_without_a_program_jump_table() {
     let mut side_note = tracing.into_side_note();
     assert!(side_note.jump_table.is_empty());
 
-    let config = vos_pvm_proof::PcsConfig {
-        pow_bits: 5,
-        fri_config: vos_pvm_proof::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-        deep_batching: Default::default(),
-    };
-    let proof = vos_pvm_proof::prove_with_config(&mut side_note, config)
-        .expect("the terminal halt jump must prove");
-    let policy = vos_pvm_proof::PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    vos_pvm_proof::verify_with_pcs_policy(proof, &side_note, &policy)
+    let proof = vos_pvm_proof::prove(&mut side_note).expect("the terminal halt jump must prove");
+    vos_pvm_proof::verify(proof, &side_note)
         .expect("the terminal halt jump must verify without a jump-table row");
 }
 
@@ -225,22 +200,8 @@ fn prove_blake2b_via_ecall() {
     }
     side_note.blake2b_mem_ops = blake2b_mem_ops;
 
-    let config = vos_pvm_proof::PcsConfig {
-        pow_bits: 5,
-        fri_config: vos_pvm_proof::FriConfig::new(0, 1, 3, 1),
-        lifting_log_size: None,
-        deep_batching: Default::default(),
-    };
-    let proof = vos_pvm_proof::prove_with_config(&mut side_note, config).expect("proving failed");
-    // Test config uses pow_bits=5 / fri_log_blowup=0, well below the
-    // STANDARD policy floor.  Use a permissive policy so the verify
-    // step exercises the algebraic check, not the policy gate.
-    let policy = vos_pvm_proof::PcsPolicy {
-        min_pow_bits: 5,
-        min_fri_queries: 3,
-        min_fri_log_blowup: 0,
-    };
-    vos_pvm_proof::verify_with_pcs_policy(proof, &side_note, &policy).expect("verification failed");
+    let proof = vos_pvm_proof::prove(&mut side_note).expect("proving failed");
+    vos_pvm_proof::verify(proof, &side_note).expect("verification failed");
     eprintln!(
         "Blake2b via ECALL: PROVED! ({} CPU steps + {} chip rows)",
         side_note.steps.len(),

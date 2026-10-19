@@ -28,21 +28,20 @@ use crate::side_note::SideNote;
 /// `verify_chain_standalone`: the per-segment active set is constant (full
 /// mask) and the preprocessed-bearing chips' `log_size`s are pinned.
 ///
-/// Uses the MOBILE PCS config (the federation policy — verifiers must use
-/// `PcsPolicy::MOBILE`).  `min_log_sizes` shorter than the component count
-/// is zero-padded; a 0 floor means "natural size" (the fixed-table chips,
-/// already uniform, need no floor).  Forced sizes MUST stay `<=
-/// DEFAULT_MAX_LOG_SIZE` (24) or the verifier rejects.
+/// Proves under the segment format (35). `min_log_sizes` shorter than the
+/// component count is zero-padded; a 0 floor means "natural size" (the
+/// fixed-table chips, already uniform, need no floor). Forced sizes MUST
+/// stay `<= DEFAULT_MAX_LOG_SIZE` (24) or the verifier rejects.
 pub fn prove_canonical(
     side_note: &mut SideNote,
     min_log_sizes: &[u32],
 ) -> Result<Proof, ProvingError> {
-    prove_canonical_format(side_note, min_log_sizes, &crate::format::LEGACY_SEGMENT)
+    prove_canonical_format(side_note, min_log_sizes, &crate::format::SEGMENT)
 }
 
-/// [`prove_canonical`] under `format`, at its parameters (format 36's are
-/// MOBILE's); [`ProvingError::FormatNotAdmitted`] on a format the registry
-/// does not admit.
+/// [`prove_canonical`] under `format`, at its parameters;
+/// [`ProvingError::FormatNotAdmitted`] on a format the registry does not
+/// admit.
 pub fn prove_canonical_format(
     side_note: &mut SideNote,
     min_log_sizes: &[u32],
@@ -93,7 +92,7 @@ pub fn program_commitment_for_profile(
     side_note: &SideNote,
     log_sizes: &[u32],
 ) -> Option<crate::commitment::ProgramCommitment> {
-    program_commitment_for_profile_format(side_note, log_sizes, &crate::format::LEGACY_SEGMENT)
+    program_commitment_for_profile_format(side_note, log_sizes, &crate::format::SEGMENT)
 }
 
 /// [`program_commitment_for_profile`] under `format`; `None` on a format the
@@ -126,7 +125,7 @@ where
         return None;
     }
 
-    let config = target.config;
+    let config = target.format.pcs_config();
     let max_constraint_log_degree_bound = components
         .iter()
         .zip(log_sizes)
@@ -165,8 +164,7 @@ pub fn prove_chain(full: &SideNote, bounds: &[(usize, usize)]) -> Option<(Vec<u3
     let mut cursor = crate::segment::SegmentCursor::new(full);
     for &(a, b) in bounds {
         let mut sn = cursor.side_note(a, b);
-        proofs
-            .push(prove_canonical_format(&mut sn, &profile, &crate::format::LEGACY_SEGMENT).ok()?);
+        proofs.push(prove_canonical_format(&mut sn, &profile, &crate::format::SEGMENT).ok()?);
     }
     Some((profile, proofs))
 }

@@ -6,9 +6,7 @@
 //! `prove_chain` derives ONE forcing profile over the window bounds and proves
 //! every window to it, so all segments share one program commitment. The
 //! resulting per-segment proofs then verify trustlessly via
-//! `verify_chain_standalone` against that single commitment — accepted by the
-//! DEFAULT verifier (the conjectured-security floor), with NO `PcsPolicy::MOBILE`
-//! at the call site even though canonical proving uses the MOBILE PCS config.
+//! `verify_chain_standalone` against that single commitment, under format 35.
 
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
@@ -91,12 +89,11 @@ fn prove_chain_verifies_as_canonical_chain() {
         );
     }
 
-    // The DEFAULT trustless chain verifier accepts the MOBILE canonical chain —
-    // no PcsPolicy::MOBILE needed (the conjectured-security floor accepts it).
+    // The trustless chain verifier accepts the canonical chain.
     let expected_root = proofs[0].initial_state.memory_root;
     assert_ne!(expected_root, [0; 32], "the high sparse page is root-bound");
     let final_root = verify_chain_standalone(&proofs, commit, expected_root)
-        .expect("honest canonical chain must verify standalone under the default floor");
+        .expect("honest canonical chain must verify standalone");
     assert_eq!(
         final_root,
         proofs.last().unwrap().final_state.memory_root,

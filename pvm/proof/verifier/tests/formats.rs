@@ -50,22 +50,18 @@ fn side_note() -> SideNote {
 
 /// One proof under `format` and the side note it was proved over, made once.
 fn proved(format: &'static Format) -> &'static (Proof, SideNote) {
-    static LEGACY: OnceLock<(Proof, SideNote)> = OnceLock::new();
     static SEGMENT: OnceLock<(Proof, SideNote)> = OnceLock::new();
-    let cell = match format.number {
-        36 => &LEGACY,
-        35 => &SEGMENT,
-        number => panic!("format {number} is not proved here"),
-    };
-    cell.get_or_init(|| {
+    assert_eq!(format.number, format::SEGMENT.number, "proved here: 35");
+    SEGMENT.get_or_init(|| {
         let mut side_note = side_note();
         let proof = vos_pvm_proof::prove_format(&mut side_note, format).expect("proves");
         (proof, side_note)
     })
 }
 
-fn admitted() -> [&'static Format; 2] {
-    [&format::LEGACY_SEGMENT, &format::SEGMENT]
+/// The admitted segment formats.
+fn admitted() -> [&'static Format; 1] {
+    [&format::SEGMENT]
 }
 
 fn refused_standalone(proof: Proof, expected: &str) {
@@ -94,10 +90,6 @@ fn every_admitted_format_round_trips() {
         assert_eq!(proof.format_version, format.number);
         assert_eq!(proof.stark_proof.channel(), format.channel);
         assert_eq!(proof.pcs_config, format.pcs_config());
-        assert_eq!(
-            proof.interaction_pow != 0,
-            format.interaction_pow_bits() > 0
-        );
         let commitment = program_commitment_of_proof(proof);
         assert_eq!(commitment.channel(), format.channel);
 
@@ -114,9 +106,8 @@ fn every_admitted_format_round_trips() {
 }
 
 /// A proof is refused under every other number: a registered format the
-/// registry does not admit, the other admitted segment format (whose channel
-/// its Stark proof is not on), the wrap's (admitted, but not a segment
-/// format), a retired number, and an unregistered one.
+/// registry does not admit, the wrap's (admitted, but not a segment format),
+/// a retired number, and an unregistered one.
 #[test]
 fn a_proof_under_one_format_is_refused_under_another() {
     for format in admitted() {
@@ -148,8 +139,7 @@ fn a_proof_under_one_format_is_refused_under_another() {
 }
 
 /// The interaction PoW is checked: a format-35 proof with a nonce its
-/// channel does not accept is refused, and a format-36 proof, which has
-/// none, is refused with a nonce.
+/// channel does not accept is refused.
 #[test]
 fn the_interaction_pow_is_checked() {
     let (proof, side_note) = proved(&format::SEGMENT);
@@ -172,11 +162,6 @@ fn the_interaction_pow_is_checked() {
         proof.interaction_pow
     ));
     refused_both(wrong, side_note, "interaction PoW");
-
-    let (legacy, side_note) = proved(&format::LEGACY_SEGMENT);
-    let mut nonced = legacy.clone();
-    nonced.interaction_pow = 1;
-    refused_both(nonced, side_note, "no interaction PoW");
 }
 
 /// The verifier's channel just before the interaction PoW, replayed from the
@@ -197,7 +182,6 @@ fn transcript_before_interaction_pow(proof: &Proof) -> Poseidon2M31Channel {
     }
     vos_pvm_proof::proof::mix_boundary_states(
         &mut channel,
-        format::SEGMENT.encoding,
         &proof.initial_state,
         &proof.final_state,
     );
@@ -229,62 +213,16 @@ fn a_proof_below_a_floor_is_refused() {
     refused_both(with_pow(25), side_note, "differ from format 35");
 }
 
-/// A policy pins every format's shape: a format-35 proof, at blowup 4, is
-/// refused under STANDARD's floor of blowup 16, with and without the side
-/// note, and verifies under MOBILE's.
-#[test]
-fn a_policy_pins_every_formats_shape() {
-    use vos_pvm_proof::proof::PcsPolicy;
-    let (proof, side_note) = proved(&format::SEGMENT);
-    let commitment = program_commitment_of_proof(proof);
-    let standalone = vos_pvm_proof_verifier::verify_standalone_with_pcs_policy(
-        proof.clone(),
-        commitment,
-        &PcsPolicy::STANDARD,
-    )
-    .expect_err("refused");
-    assert!(
-        standalone
-            .to_string()
-            .contains("log_blowup_factor 2 < policy minimum 4")
-    );
-    let prover_side =
-        vos_pvm_proof::verify_with_pcs_policy(proof.clone(), side_note, &PcsPolicy::STANDARD)
-            .expect_err("refused");
-    assert!(
-        prover_side
-            .to_string()
-            .contains("log_blowup_factor 2 < policy minimum 4")
-    );
-
-    vos_pvm_proof_verifier::verify_standalone_with_pcs_policy(
-        proof.clone(),
-        commitment,
-        &PcsPolicy::MOBILE,
-    )
-    .expect("verifies");
-    vos_pvm_proof::verify_with_pcs_policy(proof.clone(), side_note, &PcsPolicy::MOBILE)
-        .expect("verifies");
-}
-
-/// The counts of a real proof, at its own shape, clear format 35's floors;
-/// format 36's carry its conjectured 96.
+/// The counts of a real proof, at its own shape, clear format 35's floors.
 #[test]
 fn the_bit_counts_are_counted_at_the_proofs_shape() {
     let segment = proof_security_bits(&proved(&format::SEGMENT).0).unwrap();
-    let legacy = proof_security_bits(&proved(&format::LEGACY_SEGMENT).0).unwrap();
     assert_eq!(
-        (segment, legacy),
-        (
-            SecurityBits {
-                conjectured: 104,
-                proven: 63,
-            },
-            SecurityBits {
-                conjectured: 96,
-                proven: 57,
-            },
-        )
+        segment,
+        SecurityBits {
+            conjectured: 104,
+            proven: 63,
+        }
     );
     assert!(segment.proven >= format::SEGMENT.floor.proven);
 }

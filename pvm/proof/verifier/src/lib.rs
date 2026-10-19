@@ -28,7 +28,7 @@ use stwo_constraint_framework::{PREPROCESSED_TRACE_IDX, TraceLocationAllocator};
 
 // A proof's format selects its channel at run time; one build reads every
 // admitted format.
-use vos_pvm_proof::format::{Encoding, Format};
+use vos_pvm_proof::format::Format;
 use vos_pvm_proof::pcs::{PcsStack, ProofHash};
 
 // The proof type, the format registry `verify_standalone` admits a proof's
@@ -39,16 +39,6 @@ pub use vos_pvm_proof::program_id::{
 };
 pub use vos_pvm_proof::shape::{KernelShape, SegmentClass};
 pub use vos_pvm_proof::{PROOF_FORMAT_VERSION, Proof};
-// PcsPolicy floor — see SECURITY.md "Proof shape". `check_min_security` /
-// `conjectured_security_bits` / `MIN_CONJECTURED_SECURITY_BITS` are the
-// conjectured-security floor the DEFAULT `verify_standalone` path enforces
-// (accepts any 96-bit-secure shape, STANDARD and MOBILE both); the per-field
-// `PcsPolicy` + `check_pcs_policy` are the exact-pin path.
-pub use vos_pvm_proof::proof::{
-    MIN_CONJECTURED_SECURITY_BITS, PcsPolicy, STANDARD_MIN_FRI_LOG_BLOWUP,
-    STANDARD_MIN_FRI_QUERIES, STANDARD_MIN_POW_BITS, check_min_security, check_pcs_policy,
-    conjectured_security_bits,
-};
 
 use vos_pvm_proof::framework_access::{
     AllLookupElements, create_verifier_components, draw_all_lookup_elements,
@@ -85,11 +75,7 @@ pub fn verify_standalone(
     proof: Proof,
     preprocessed_commitment: CommitmentHash,
 ) -> Result<(), VerificationError> {
-    // Default: the conjectured-security floor, which accepts any 96-bit-secure
-    // shape (STANDARD and MOBILE both) while rejecting degenerate FRI shapes.
-    // `None` selects that floor; the strict `verify_standalone_with_pcs_policy`
-    // path passes an exact `PcsPolicy`.
-    verify_standalone_shaped(proof, preprocessed_commitment, DEFAULT_MAX_LOG_SIZE, None)
+    verify_standalone_shaped(proof, preprocessed_commitment, DEFAULT_MAX_LOG_SIZE)
 }
 
 /// Same as `verify_standalone` but with a caller-supplied per-component
@@ -107,42 +93,17 @@ pub fn verify_standalone_with_max_log_size(
     preprocessed_commitment: CommitmentHash,
     max_log_size: u32,
 ) -> Result<(), VerificationError> {
-    // Shares `verify_standalone`'s default FRI-shape floor (conjectured
-    // security). Only the log_size cap differs.
-    verify_standalone_shaped(proof, preprocessed_commitment, max_log_size, None)
+    verify_standalone_shaped(proof, preprocessed_commitment, max_log_size)
 }
 
-/// Enforce a custom `PcsPolicy` (FRI shape + PoW floor)
-/// on `proof.pcs_config`.  The default `verify_standalone` accepts any shape
-/// meeting the conjectured-security floor; reach for this to pin an EXACT
-/// shape (stricter deployments) or to accept a looser test-harness shape.
-/// See SECURITY.md "Proof shape".
-pub fn verify_standalone_with_pcs_policy(
-    proof: Proof,
-    preprocessed_commitment: CommitmentHash,
-    policy: &PcsPolicy,
-) -> Result<(), VerificationError> {
-    verify_standalone_shaped(
-        proof,
-        preprocessed_commitment,
-        DEFAULT_MAX_LOG_SIZE,
-        Some(policy),
-    )
-}
-
-/// Shared verify funnel. `policy` selects the FRI-shape floor: `None` = the
-/// conjectured-security floor (the default paths — accepts STANDARD and
-/// MOBILE), `Some(p)` = an exact `PcsPolicy` pin (the strict `*_with_pcs_policy`
-/// path). The public `verify_standalone*` entry points funnel here.
+/// Shared verify funnel: the public `verify_standalone*` entry points
+/// funnel here.
 fn verify_standalone_shaped(
     mut proof: Proof,
     preprocessed_commitment: CommitmentHash,
     max_log_size: u32,
-    policy: Option<&PcsPolicy>,
 ) -> Result<(), VerificationError> {
     let format = preflight_standalone(&mut proof, max_log_size)?;
-    vos_pvm_proof::proof::check_shape_policy(format, &proof.pcs_config, policy)
-        .map_err(VerificationError::InvalidStructure)?;
     vos_pvm_proof::with_stack!(format.channel, Stack => {
         verify_standalone_on::<Stack>(proof, format, preprocessed_commitment)
     }, unbuilt => Err(VerificationError::InvalidStructure(format!(
@@ -292,10 +253,8 @@ fn verify_standalone_on<MC: PcsStack>(
     )?;
     // The format's floors, counted at this proof's own parameters and
     // shape, and its exact parameters.
-    if format.encoding == Encoding::Lossless {
-        vos_pvm_proof::proof::check_format_security(format, &proof.pcs_config, &security_shape)
-            .map_err(VerificationError::InvalidStructure)?;
-    }
+    vos_pvm_proof::proof::check_format_security(format, &proof.pcs_config, &security_shape)
+        .map_err(VerificationError::InvalidStructure)?;
 
     if proof.claimed_sums.len() != proof.num_components {
         return Err(VerificationError::InvalidStructure(
@@ -329,9 +288,8 @@ fn verify_standalone_on<MC: PcsStack>(
     // proof with the boundary and closing chips) and the interaction PoW
     // precede the relation elements, which therefore depend on the claimed
     // boundary states. `memory_commitment` stays unmixed (computed outside
-    // the circuit). The proof's own PCS config: a legacy proof carries its
-    // own, and every other format's equals the format's, checked above; the
-    // DEEP batching is the format's, which a proof does not carry.
+    // the circuit). The proof's own PCS config, the format's, checked above;
+    // the DEEP batching is the format's, which a proof does not carry.
     let verifier_channel = &mut MC::C::default();
     let commitment_scheme =
         &mut CommitmentSchemeVerifier::<MC>::new(format.verifier_config(&proof.pcs_config));
@@ -494,15 +452,7 @@ pub fn verify_chain_standalone(
     // Each segment verifies standalone against the SAME program commitment:
     // no side note, and program identity is pinned across the whole chain.
     for proof in proofs {
-        // The conjectured-security floor, so a canonical MOBILE chain
-        // (`vos_pvm_proof::prove_chain`) verifies without the caller naming
-        // `PcsPolicy::MOBILE`.
-        verify_standalone_shaped(
-            proof.clone(),
-            preprocessed_commitment,
-            DEFAULT_MAX_LOG_SIZE,
-            None,
-        )?;
+        verify_standalone_shaped(proof.clone(), preprocessed_commitment, DEFAULT_MAX_LOG_SIZE)?;
     }
     Ok(proofs[proofs.len() - 1].final_state.memory_root)
 }
