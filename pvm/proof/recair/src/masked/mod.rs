@@ -233,6 +233,9 @@ pub struct MaskStats {
     pub attempts: u32,
     /// R1 on the accepted attempt.
     pub rank_check: Duration,
+    /// The column classes R1 checked: every masked column's level, its
+    /// quotient's lift and its offsets, each once.
+    pub classes: usize,
     /// The most functionals one column class revealed, against `h`.
     pub revealed_rows: usize,
 }
@@ -252,6 +255,37 @@ pub fn prove_masked<MC: MerkleChannel, C: MaskedProvers>(
     format: &Format,
     trace: MaskedTrace<'_, C::Relations>,
     rng: MaskRng,
+) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_checked::<MC, C>(format, trace, rng, true)
+}
+
+/// [`prove_masked`] without the prover's out-of-domain check of the
+/// constraints: a witness that breaks one is proved all the same, so the
+/// soundness tests can hand the verifier a forced proof. Only the prover's
+/// tests have it, on the dev edge that gives them [`MaskRng::Seeded`]
+/// (`seeded-masks`); no production build does.
+#[cfg(feature = "seeded-masks")]
+pub fn prove_masked_unchecked<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    trace: MaskedTrace<'_, C::Relations>,
+    rng: MaskRng,
+) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_checked::<MC, C>(format, trace, rng, false)
+}
+
+/// [`prove_masked`], the out-of-domain check of the constraints made when
+/// `check_constraints`.
+fn prove_masked_checked<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    trace: MaskedTrace<'_, C::Relations>,
+    rng: MaskRng,
+    check_constraints: bool,
 ) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
 where
     SimdBackend: BackendForChannel<MC>,
@@ -312,6 +346,7 @@ where
         log_sizes: trace.log_sizes,
         public: trace.public,
         interaction: trace.interaction,
+        check_constraints,
     };
     for attempt in 0..MAX_ATTEMPTS {
         let mut stream = rng.attempt(&witness, attempt)?;
@@ -336,6 +371,7 @@ struct Setup<'a, R> {
     log_sizes: &'a [u32],
     public: &'a [SecureField],
     interaction: &'a Interaction<'a, R>,
+    check_constraints: bool,
 }
 
 /// An attempt's proof and what it measured, `None` when R1 refuses its
@@ -362,6 +398,7 @@ where
         log_sizes,
         public,
         interaction,
+        check_constraints,
     } = *setup;
     let pins = mask_pins(&masking);
     let config = format.pcs_config();
@@ -520,13 +557,14 @@ where
     let composition_value = air::composition_oods_eval(&stark_proof.sampled_values).ok_or(
         ProveError::Masking("the composition's coordinates are not sampled once each"),
     )?;
-    if composition_value
-        != components.eval_composition_polynomial_at_point(
-            oods_point,
-            &stark_proof.sampled_values,
-            random_coeff,
-            air_level,
-        )
+    if check_constraints
+        && composition_value
+            != components.eval_composition_polynomial_at_point(
+                oods_point,
+                &stark_proof.sampled_values,
+                random_coeff,
+                air_level,
+            )
     {
         return Err(ProveError::Stwo(ProvingError::ConstraintsNotSatisfied));
     }
@@ -546,6 +584,7 @@ where
     let stats = MaskStats {
         attempts: 0,
         rank_check: started.elapsed(),
+        classes: revealed.classes,
         revealed_rows: revealed.rows,
     };
     if !revealed.independent {

@@ -353,6 +353,24 @@ under masking variant (c) (`docs/design/research/slice-5/spike2-masking.md`
   `2N` (`log_degree_bound` `m+1`) and overstate the batching term by about
   1 bit.
 
+**Zero knowledge** is the argument's: honest-verifier zero knowledge of
+the masked IOP, so zero knowledge in the programmable random-oracle model,
+conditional on R1 (the randomizer's revealed functionals of full rank),
+which the prover checks on every transcript and retries on. The masking's
+gates (`vos-pvm-recair`'s `masked_gates`, `leakage` and the masked wrap's
+tests; at full N under `heavy-gates` in `just test-proof`) are a regression
+guard, not evidence of it: the soundness gates (acceptance at every size
+on both channels, a broken constraint on the first, last and wrap rows
+refused forced, the lifted preprocessed columns, the blinding unable to
+cancel an unbalanced relation, malformed proofs refused without a panic)
+and the statistical leakage gates (per field a χ² on 16 buckets, 4 at 64
+proofs or fewer, and a pooled two-sample KS between witnesses;
+uniformity, exact at 64 or fewer; α = 10^-3 over the family with
+Bonferroni) find gross leaks only: at 2,000 small-circuit proofs a witness
+a field leaking about 0.13 in total variation; at the real wrap's 32, by
+uniformity, a field leaking about 0.6, and between witnesses only a field
+fixed by the witness.
+
 ## The external audit
 
 Required before value rides on a proof. Its scope:
@@ -370,7 +388,9 @@ Required before value rides on a proof. Its scope:
   the wrap, `vos-pvm-final-verifier` and `vos-statement`;
 - `derive` (layout to preprocessed columns, its refusals) and the program
   id's derivation;
-- later, the masking and the public sums' re-cut.
+- the masking: the masked transcript (pin B), R1 to R4, the blinding's
+  soundness, and the zero-knowledge argument's premises; later, the public
+  sums' re-cut.
 
 Who performs it, and when, is open.
 

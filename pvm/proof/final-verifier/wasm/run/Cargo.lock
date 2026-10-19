@@ -3161,6 +3161,7 @@ name = "vos-pvm-final-verifier-wasm-run"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "perf-event2",
  "sc-allocator",
  "vos-statement",

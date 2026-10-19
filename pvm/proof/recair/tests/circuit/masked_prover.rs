@@ -43,12 +43,16 @@ use vos_pvm_recair_air::masked::{BlindRelation, MaskedComponents, MaskedEval, Wr
 use vos_pvm_recair_air::p2::{self, P2Eval};
 
 /// Each component's rows in the small circuits.
-const LOG_SIZE: u32 = 9;
+pub(crate) const LOG_SIZE: u32 = 9;
 
 /// A masked format for the small circuits, of no registered number: blowup
 /// 4, `n_queries` queries, `h = 2^log_mask_rows` and an `R` of
 /// `fri_mask_columns`.
-fn small_format(log_mask_rows: u32, fri_mask_columns: usize, n_queries: usize) -> Format {
+pub(crate) fn small_format(
+    log_mask_rows: u32,
+    fri_mask_columns: usize,
+    n_queries: usize,
+) -> Format {
     Format {
         number: 0x7e57,
         params: FormatParams {
@@ -71,18 +75,18 @@ fn small_format(log_mask_rows: u32, fri_mask_columns: usize, n_queries: usize) -
 
 /// The small format R1 passes: `h = 64` against `2(4·2 + 4·3) = 40`
 /// revealed rows.
-fn format() -> Format {
+pub(crate) fn format() -> Format {
     small_format(6, 8, 4)
 }
 
 /// A random circuit over every gate, each component at `2^LOG_SIZE` rows.
-fn circuit(seed: u64) -> Finalized<SecureField> {
+pub(crate) fn circuit(seed: u64) -> Finalized<SecureField> {
     random_circuit::<SecureField>(seed, 300)
         .finalize_to(Some([1 << LOG_SIZE; 3]))
         .expect("the wiring checks")
 }
 
-fn prove(
+pub(crate) fn prove(
     format: &Format,
     finalized: &Finalized<SecureField>,
     rng: MaskRng,
@@ -99,7 +103,7 @@ fn prove(
 
 /// The recursion AIR's set at the proof's sizes, under any relations: its
 /// trees' layout.
-fn wrap_layout(log_sizes: &[u32; 3]) -> WrapComponents {
+pub(crate) fn wrap_layout(log_sizes: &[u32; 3]) -> WrapComponents {
     WrapComponents::build(
         &GateRelation::dummy(),
         &BlindRelation::dummy(),
@@ -110,7 +114,7 @@ fn wrap_layout(log_sizes: &[u32; 3]) -> WrapComponents {
 
 /// Verifies a masked proof of a small circuit, its outputs at a node's
 /// layout.
-fn verify(
+pub(crate) fn verify(
     format: &Format,
     proof: &RecairProof<<Blake2bMerkleChannel as MerkleChannel>::H>,
 ) -> Result<(), Error> {

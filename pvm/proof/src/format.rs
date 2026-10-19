@@ -762,7 +762,7 @@ mod tests {
         }
     }
 
-    /// Every number names one entry; only 28 and 35 are admitted, and a
+    /// Every number names one entry; only 28, 35 and 39 are admitted, and a
     /// segment verifier takes 35 alone; the retired numbers are
     /// refused as retired and name no entry; every other number is refused.
     #[test]
@@ -771,7 +771,7 @@ mod tests {
             assert_eq!(lookup(format.number), Some(&format));
             assert_eq!(
                 admitted(format.number).is_ok(),
-                [WRAP.number, SEGMENT.number].contains(&format.number)
+                [WRAP.number, SEGMENT.number, MASKED_WRAP.number].contains(&format.number)
             );
             assert_eq!(
                 admitted_segment(format.number).is_ok(),

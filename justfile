@@ -46,9 +46,16 @@ vectors:
 # `systemd-run --user --scope -p MemoryMax=16G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
 # them; the verifier's suite runs in `test`.
+# Then the masking's heavy gates (`vos-pvm-recair`'s `heavy-gates`): the
+# leakage tests at full N (2,000 proofs a witness on the small circuit, 32
+# on the real wrap), the masked acceptance above 2^16 rows, and the final
+# verifier's decode, verify and Wasm gates as the maximum over 12 seeds of
+# the masked wrap (on the JAM-only host's `final-verify.elf`, built by
+# `check-no-std`, and `judge-wasm`'s blob), one test at a time.
 test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
     cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --test-threads=1
+    cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion -- leakage heavy --test-threads=1
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
 # verifier's blobs built as a runtime builds them, under the PVF's semantics
@@ -139,8 +146,9 @@ check-no-faults:
 _no-feature feature +args:
     if (cargo tree {{args}} -e no-dev --target all -f '{f}' --prefix none | lines | each {|line| $line | str replace ' (*)' '' | split row ',' } | flatten | any {|enabled| $enabled == '{{feature}}' }) { error make { msg: "cargo tree {{args}} enables {{feature}}" } }
 
-# The masked prover's seeded randomness (`vos-pvm-recair`'s `seeded-masks`,
-# `MaskRng::Seeded`) reaches no production build: no normal or build edge
+# The masked prover's test seams (`vos-pvm-recair`'s `seeded-masks`: the
+# seeded randomness `MaskRng::Seeded` and the forced proof
+# `prove_masked_unchecked`) reach no production build: no normal or build edge
 # of any workspace member, nor of the workspaces built apart (the agent,
 # the fuzz targets, the final verifier's Wasm blob and its runner), enables
 # it (the prover's tests enable it on a dev edge), and the proof crate's

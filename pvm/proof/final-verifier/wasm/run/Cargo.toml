@@ -19,6 +19,8 @@ sc-allocator = "39"
 wasm-instrument = { version = "0.4", default-features = false }
 anyhow = "1"
 perf-event2 = "0.7"
+# The runner held to the performance cores of a hybrid CPU.
+libc = "0.2"
 # The golden fixtures and the judgements' inputs.
 vos-statement = { path = "../../../statement", features = ["fixtures"] }
 
