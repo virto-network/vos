@@ -5,10 +5,12 @@
 //! `cipher_clerk::settlement::window` over them. The kernel derived from it
 //! is what a proof of a window proves.
 //!
-//! A row is keyed by its account's id under the hashed transform
-//! (`vos_tree::keys::hashed`), and its value is cipher-clerk's encoding of
-//! the account. The tree hashes through the BLAKE2b compression precompile;
-//! cipher-clerk derives the pseudo-accounts' ids with the `blake2` crate.
+//! A row is the account's in the space's committed map [`ACCOUNTS`] of
+//! hashed keys: its key in the agent's tree is the map's committed row,
+//! `0x03 ‖ instance ‖ tag ‖ transform ‖ hashed(id)` (`vos_sdk::keys::row`),
+//! and its value is cipher-clerk's encoding of the account. The tree
+//! hashes through the BLAKE2b compression precompile; cipher-clerk derives
+//! the pseudo-accounts' ids with the `blake2` crate.
 
 #![no_std]
 
@@ -21,8 +23,10 @@ use cipher_clerk::codec;
 use cipher_clerk::kernel::Value;
 use cipher_clerk::settlement::{Anchor, NetFlow, Reads};
 use cipher_clerk::types::Account;
+use vos_sdk::abi::Rows;
+use vos_sdk::keys::{self, Transform};
 use vos_sdk::prelude::*;
-use vos_tree::{Blake2b, Hash, Salt, keys};
+use vos_tree::{Blake2b, Hash, Salt};
 
 /// A value does not decode.
 pub const MALFORMED: u8 = 1;
@@ -34,6 +38,16 @@ pub const REFUSED_I: u8 = 3;
 pub const REFUSED_J: u8 = 4;
 /// `window` refused the rows: this plus its error's index.
 pub const WINDOW: u8 = 16;
+
+/// The space's accounts: the committed map of hashed keys, tag 1, of the
+/// agent's instance 0, which the rows are read from.
+pub const ACCOUNTS: (InstanceId, Rows) = (
+    InstanceId(0),
+    Rows::Committed {
+        tag: 1,
+        transform: Transform::Hashed,
+    },
+);
 
 /// A row as a version of the tree holds it: its leaf's salt and its value.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -160,7 +174,8 @@ fn statement(
             }
             None => (None, None),
         };
-        keys.push(keys::hashed(&Blake2b, &at_j.id.0));
+        let (instance, rows) = ACCOUNTS;
+        keys.push(keys::row(instance, rows, &at_j.id.0).map_err(|_| MALFORMED)?);
         commitments.push((commitment_i, commitment_j));
         reads.push(Reads { at_i, at_j });
     }

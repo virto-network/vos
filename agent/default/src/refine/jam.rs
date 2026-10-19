@@ -6,7 +6,8 @@
 //! computed on state the package does not show. The batch runs as on a VOS
 //! node, then refine applies its work result as a VOS node's accumulate
 //! does, and computes the root after from the witness, every row it
-//! writes a leaf salted by the batch's seed. It exports the pages the
+//! writes a leaf salted by the batch's seed, a committed row's leaf over
+//! its bare value as a VOS node's root has it. It exports the pages the
 //! result stores, then the result, and returns the roots
 //! ([`vos_wire::package`]).
 
@@ -17,6 +18,7 @@ use vos_tree::{Blake2b, Hash, PartialTree, salt, value_hash};
 use vos_wire::apply::{Host, State, apply};
 use vos_wire::ids::{AgentId, WorkflowId};
 use vos_wire::package::{JamOutput, Opened, Package, SEGMENT, ScannedRange, StateWitness};
+use vos_wire::records::leaf_value;
 use vos_wire::result::{PAGE, WorkResult, digest};
 use vos_wire::{Decode, Encode};
 
@@ -50,7 +52,7 @@ impl Witnessed {
         );
         let claims: Vec<(&[u8], Option<Hash>)> = keys
             .iter()
-            .map(|(key, opened)| (key.as_slice(), commitment(opened)))
+            .map(|(key, opened)| (key.as_slice(), commitment(key, opened)))
             .collect();
         let tree = proof
             .verify(&Blake2b, root, &claims)
@@ -68,7 +70,7 @@ impl Witnessed {
                 .map(|row| {
                     (
                         row.key.as_slice(),
-                        value_hash(&Blake2b, &row.salt, &row.value),
+                        value_hash(&Blake2b, &row.salt, committed(&row.key, &row.value)),
                     )
                 })
                 .collect();
@@ -163,12 +165,20 @@ impl Witnessed {
 }
 
 /// What the witness claims of a key: its value's commitment, or absence.
-fn commitment(opened: &Opened) -> Option<Hash> {
+fn commitment(key: &[u8], opened: &Opened) -> Option<Hash> {
     match opened {
         Opened::Absent => None,
-        Opened::Value { salt, value } => Some(value_hash(&Blake2b, salt, value)),
+        Opened::Value { salt, value } => Some(value_hash(&Blake2b, salt, committed(key, value))),
         Opened::Written(value_hash) => Some(*value_hash),
     }
+}
+
+/// The bytes the leaf of the row `key` commits, from the row as stored,
+/// which the witness carries and apply reads: a committed row's bare
+/// value, as a VOS node's root commits it ([`leaf_value`]). Traps on a
+/// committed row stored as no value row.
+fn committed<'a>(key: &[u8], stored: &'a [u8]) -> &'a [u8] {
+    leaf_value(key, stored).expect("a committed row stored as a value row")
 }
 
 /// The rows the work result's apply writes, over the witness.
@@ -221,9 +231,11 @@ pub(crate) fn run(agent: AgentId, package: Package) -> Vec<u8> {
         .writes
         .into_iter()
         .map(|(key, value)| {
-            let committed =
-                value.map(|value| value_hash(&Blake2b, &salt(&Blake2b, &seed, &key), &value));
-            (key, committed)
+            let commitment = value.map(|value| {
+                let salt = salt(&Blake2b, &seed, &key);
+                value_hash(&Blake2b, &salt, committed(&key, &value))
+            });
+            (key, commitment)
         })
         .collect();
     let mut tree = witnessed.tree;

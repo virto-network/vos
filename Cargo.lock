@@ -2549,6 +2549,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "vos-checker",
+ "vos-jam",
  "vos-net",
  "vos-pvm",
  "vos-pvm-compiler",

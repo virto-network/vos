@@ -17,6 +17,7 @@ use fjall::{Database, Keyspace, KeyspaceCreateOptions, Readable, Snapshot};
 use vos_tree::{Blake2b, Child, Hash, Leaf, Node, NodeStore, stored_root, update};
 use vos_wire::apply::{Host, State, apply};
 use vos_wire::ids::WorkflowId;
+use vos_wire::records::leaf_value;
 use vos_wire::result::WorkResult;
 use vos_wire::{Decode, Encode};
 
@@ -101,6 +102,17 @@ impl Store {
     /// The root over the whole keyspace.
     pub fn root(&self) -> Result<Hash, Error> {
         self.view().root()
+    }
+
+    /// Write `writes`, made by a work result with `seed`, as a package's
+    /// do: the rows, their leaves, and the root after, which it returns.
+    /// For tests that hold the tree against a VOS node's.
+    #[doc(hidden)]
+    pub fn write(&self, writes: Writes, seed: &[u8; 32]) -> Result<Hash, Error> {
+        let pending = self.view().stage(writes, seed)?;
+        let root = pending.root;
+        self.commit(pending)?;
+        Ok(root)
     }
 
     /// Commit `pending`, durably, in one batch: refused, `Error::Root`,
@@ -217,17 +229,23 @@ impl View {
     }
 
     /// `writes`, made by a work result with `seed`, staged over this view:
-    /// the rows, their leaves, each salted by it, and the root after.
+    /// the rows, their leaves, each salted by it, and the root after. A
+    /// committed row's leaf commits its bare value, as a VOS node's
+    /// ([`leaf_value`]).
     pub(crate) fn stage(&self, writes: Writes, seed: &[u8; 32]) -> Result<Pending, Error> {
         let leaves: Vec<(&[u8], Option<Leaf>)> = writes
             .iter()
             .map(|(key, value)| {
-                let leaf = value
-                    .as_ref()
-                    .map(|value| Leaf::salted(&Blake2b, seed, key, value));
-                (key.as_slice(), leaf)
+                let leaf = match value {
+                    Some(value) => {
+                        let value = leaf_value(key, value).ok_or(Error::Corrupt("a value row"))?;
+                        Some(Leaf::salted(&Blake2b, seed, key, value))
+                    }
+                    None => None,
+                };
+                Ok((key.as_slice(), leaf))
             })
-            .collect();
+            .collect::<Result<_, Error>>()?;
         let base = self.root()?;
         let mut tree = self.tree();
         let root = update(&Blake2b, &mut tree, &leaves)?;

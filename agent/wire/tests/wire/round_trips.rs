@@ -98,10 +98,18 @@ proptest! {
         member in principal(),
     ) {
         let instance = InstanceId(instance);
-        let owned = [keys::instance_struct(instance), keys::table_prefix(instance, tag)];
+        let map = MapId { instance, tag, transform: Transform::Hashed };
+        let row = keys::committed(&map, &Transform::Hashed.apply(&tag.to_be_bytes()));
+        let owned = [
+            keys::instance_struct(instance),
+            keys::table_prefix(instance, tag),
+            keys::committed_rows(&map),
+            row.clone(),
+        ];
         for key in &owned {
             prop_assert!(keys::owned_by(key, instance));
             prop_assert_eq!(keys::owned_by(key, InstanceId(other)), other == instance.0);
+            prop_assert!(keys::instance_prefixes(instance).iter().any(|prefix| key.starts_with(prefix)));
         }
         let system = [
             keys::installed(instance),
@@ -118,6 +126,12 @@ proptest! {
             keys::pair_out(AgentId(agent)),
             keys::acked(AgentId(agent)),
             keys::version(),
+            keys::dirty(sequence, &row),
+            keys::seed(sequence),
+            keys::tree_leaf(&row),
+            keys::tree_root(),
+            keys::built(),
+            keys::committed_all(),
         ];
         for key in &system {
             prop_assert!(!keys::owned_by(key, instance));
@@ -173,14 +187,14 @@ proptest! {
                 keys::page(WorkflowId(number), a),
                 keys::workflow_pins(&ProgramHash(triple.key)),
                 keys::key_sessions(&triple.key),
-                keys::dirty(number, &map, &transformed),
+                keys::dirty(number, &keys::committed(&map, &transformed)),
                 keys::seed(number),
-                keys::tree_leaf(&map, &transformed),
-                keys::tree_root(&map),
+                keys::tree_leaf(&keys::committed(&map, &transformed)),
+                keys::tree_root(),
                 keys::built(),
             ]);
             if let Some(prefix) = prefix {
-                rows.push(keys::tree_node(&map, level, &prefix));
+                rows.push(keys::tree_node(level, &prefix));
             }
         }
         for row in &rows {
@@ -200,12 +214,13 @@ proptest! {
         prop_assert_eq!(map.transform.raw(&transformed), Some(key.clone()));
         let value = keys::committed(&map, &transformed);
         prop_assert!(value.starts_with(&keys::committed_rows(&map)));
+        prop_assert!(value.starts_with(&keys::committed_all()));
         prop_assert!(keys::owned_by(&value, map.instance));
         prop_assert_eq!(keys::committed_entry(&value), Some((map, transformed.as_slice())));
-        let dirty = keys::dirty(version, &map, &transformed);
+        let dirty = keys::dirty(version, &value);
         prop_assert!(dirty.starts_with(&keys::dirty_from(version)));
         prop_assert!(dirty.starts_with(&keys::dirty_prefix()));
-        prop_assert_eq!(keys::dirty_entry(&dirty), Some((version, map, transformed.as_slice())));
+        prop_assert_eq!(keys::dirty_entry(&dirty), Some((version, value.as_slice())));
         prop_assert_eq!(keys::committed_entry(&dirty), None);
         prop_assert!(keys::is_committed(&value) && !keys::is_committed(&dirty));
         let rows = Rows::Committed { tag: map.tag, transform: map.transform };
@@ -214,9 +229,9 @@ proptest! {
         } else {
             prop_assert_eq!(keys::row(map.instance, rows, &key), Err(Failure::Cap));
         }
-        let root = keys::tree_root(&map);
-        prop_assert!(root.starts_with(&keys::tree_roots()));
-        prop_assert_eq!(keys::tree_root_entry(&root), Some(map));
+        let leaf = keys::tree_leaf(&value);
+        prop_assert_eq!(keys::committed_entry(&leaf), None);
+        prop_assert!(!keys::is_committed(&leaf));
         let table = [keys::table_rows(map.instance, map.tag, map.transform), transformed].concat();
         prop_assert_eq!(keys::committed_entry(&table), None);
         prop_assert!(!keys::is_committed(&table));

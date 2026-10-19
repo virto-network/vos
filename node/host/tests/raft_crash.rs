@@ -154,9 +154,10 @@ fn check(round: Round) {
     let applied = store.snapshot().applied(AGENT).unwrap().unwrap_or(0);
     assert_eq!(rows.applied, applied);
     // One prefix.
-    let state: BTreeMap<_, _> = store
-        .snapshot()
-        .scan(AGENT, &keys::instance_prefix(InstanceId(0)), None)
+    let view = store.snapshot();
+    let state: BTreeMap<_, _> = keys::instance_prefixes(InstanceId(0))
+        .iter()
+        .flat_map(|prefix| view.scan(AGENT, prefix, None))
         .map(Result::unwrap)
         .collect();
     assert!(

@@ -408,11 +408,11 @@ impl Testkit {
         }
         for write in &step.committed {
             let row = keys::committed(&write.map, &write.key);
+            let dirty = keys::dirty(self.version, &row);
             match &write.value {
                 Some(value) => self.state.insert(row, versioned(self.version, value)),
                 None => self.state.remove(&row),
             };
-            let dirty = keys::dirty(self.version, &write.map, &write.key);
             self.state.insert(dirty, Vec::new());
         }
         if !step.committed.is_empty() {

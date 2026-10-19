@@ -2,11 +2,13 @@
 
 //! The settlement window's kernel, the `window` test actor's (`just
 //! build-test-actors`): a space's pseudo-account rows, checked against the
-//! committed-map roots of a window's two anchors by a vos-tree multiproof
-//! each, and `cipher_clerk::settlement::window` over them.
+//! roots of a window's two anchors by a vos-tree multiproof each, and
+//! `cipher_clerk::settlement::window` over them.
 //!
 //! The space's map holds a million rows at two versions, eight journals'
-//! pseudo-account pairs among them. The method runs live on the agent's
+//! pseudo-account pairs among them, each keyed by its committed row
+//! (`0x03 ‖ instance ‖ tag ‖ transform ‖ key'`): the tree over them is the
+//! agent's, whose root the anchors hold. The method runs live on the agent's
 //! reference model; its kernel re-runs from the attest to the same output,
 //! proves over its shape on the segment format, and verifies as a chain
 //! against its program, its io-hash the run's. Its first four segments and
@@ -38,7 +40,8 @@ use vos_testkit::programs::{derivation, derived, method, package};
 use vos_tree::{BatchProof, Blake2b, Decode, Leaf, MemStore, keys};
 use vos_wire::Encode;
 use vos_wire::abi::cap::Target;
-use vos_wire::ids::{AgentId, InstanceId, Principal, ProgramHash};
+use vos_wire::ids::{AgentId, InstanceId, MapId, Principal, ProgramHash};
+use vos_wire::keys::Transform;
 use vos_wire::result::{Attest, Outcome};
 
 const GAS: u64 = 1 << 32;
@@ -169,9 +172,21 @@ fn instance() -> &'static Instance {
     INSTANCE.get_or_init(build)
 }
 
-/// A row's key: its account's id under the hashed transform.
+/// The space's accounts, as the window actor's `ACCOUNTS` names them.
+const ACCOUNTS: MapId = MapId {
+    instance: InstanceId(0),
+    tag: 1,
+    transform: Transform::Hashed,
+};
+
+/// The committed row of `id` in the accounts: its key in the tree.
+fn row(id: &[u8]) -> Vec<u8> {
+    vos_wire::keys::committed(&ACCOUNTS, &keys::hashed(&Blake2b, id))
+}
+
+/// A row's key: its account's committed row.
 fn key(account: &Account<Value>) -> Vec<u8> {
-    keys::hashed(&Blake2b, &account.id.0)
+    row(&account.id.0)
 }
 
 fn build() -> Instance {
@@ -184,7 +199,7 @@ fn build() -> Instance {
             let (mut id, mut value) = ([0u8; 16], vec![0u8; width]);
             rng.fill(&mut id);
             rng.fill(&mut value);
-            (keys::hashed(&Blake2b, &id), value)
+            (row(&id), value)
         })
         .collect();
     build_over(accounts, others, 1_000)
@@ -308,7 +323,7 @@ fn inversion() -> Instance {
     let parted = (0..present.len() * 8)
         .find(|&level| bit(&present, level) != bit(&absent, level))
         .expect("distinct keys");
-    let flipped = (parted + 1..128)
+    let flipped = (parted + 1..present.len() * 8)
         .find(|&level| {
             bit(&absent, level) != bit(&present, level)
                 && bit(&absent, level) != bit(&absent, parted)

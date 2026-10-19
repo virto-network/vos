@@ -333,9 +333,14 @@ fn with_shop(backend: PvmBackend, actors: &Actors) -> (Paired, Vec<u8>) {
 type WitnessKeys = Vec<(Vec<u8>, Opened)>;
 
 /// Whether `package`'s witness verifies against its root, natively: its
-/// keys under its multiproof, and each range complete.
+/// keys under its multiproof, and each range complete. A committed row's
+/// leaf commits its bare value.
 fn shows(package: &Package) -> bool {
     use vos_tree::value_hash;
+    use vos_wire::records::leaf_value;
+    let commitment = |key: &[u8], salt: &[u8; 16], value: &[u8]| {
+        value_hash(&Blake2b, salt, leaf_value(key, value).expect("a value row"))
+    };
     let witness = &package.witness;
     let claims: Vec<(&[u8], Option<Hash>)> = witness
         .keys
@@ -343,7 +348,7 @@ fn shows(package: &Package) -> bool {
         .map(|(key, opened)| {
             let claim = match opened {
                 Opened::Absent => None,
-                Opened::Value { salt, value } => Some(value_hash(&Blake2b, salt, value)),
+                Opened::Value { salt, value } => Some(commitment(key, salt, value)),
                 Opened::Written(hash) => Some(*hash),
             };
             (key.as_slice(), claim)
@@ -360,7 +365,7 @@ fn shows(package: &Package) -> bool {
             .map(|row| {
                 (
                     row.key.as_slice(),
-                    value_hash(&Blake2b, &row.salt, &row.value),
+                    commitment(&row.key, &row.salt, &row.value),
                 )
             })
             .collect();

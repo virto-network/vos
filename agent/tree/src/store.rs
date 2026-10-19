@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::hash::{Hasher, empty_root};
+use crate::keys::{bit, prefix_of};
 use crate::{Error, Hash, Leaf};
 
 /// A subtree, as its parent's row names it.
@@ -79,6 +80,36 @@ pub fn stored_root<S: NodeStore, H: Hasher>(hasher: &H, store: &S) -> Result<Has
     Ok(store
         .top()?
         .map_or_else(|| empty_root(hasher), |top| *top.hash()))
+}
+
+/// The node of the tree in `store` at the byte prefix `prefix`: the root of
+/// the subtree over exactly the keys that start with it, `None` when no key
+/// does. A branch's level is the first bit at which its keys differ, so the
+/// keys sharing a prefix are the leaves of one node, whose hash is the root
+/// of the tree over those keys alone.
+pub fn node_at<S: NodeStore>(store: &S, prefix: &[u8]) -> Result<Option<Child>, S::Error> {
+    let bits = prefix.len() * 8;
+    let mut next = store.top()?;
+    while let Some(child) = next {
+        let (level, place) = match &child {
+            Child::Leaf { key, .. } => return Ok(key.starts_with(prefix).then_some(child)),
+            Child::Branch { level, prefix, .. } => (*level, prefix),
+        };
+        // The branch's keys share their first `level` bits, `place`.
+        let shared = usize::from(level).min(bits) as u16;
+        if prefix_of(place, shared) != prefix_of(prefix, shared) {
+            return Ok(None);
+        }
+        if usize::from(level) >= bits {
+            return Ok(Some(child));
+        }
+        let node = load(store, level, place)?;
+        next = Some(match bit(prefix, level) {
+            0 => node.left,
+            _ => node.right,
+        });
+    }
+    Ok(None)
 }
 
 /// The rows the tree in a store reaches from its top.

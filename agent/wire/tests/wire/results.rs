@@ -341,7 +341,7 @@ fn a_result_applies_to_each_hosts_rows() {
     let committed = keys::committed(&map, &[4]);
     assert_eq!(vos.0[&committed], stored_versioned(1, &[5]));
     assert_eq!(jam.0[&committed], vos.0[&committed]);
-    let only_vos = [keys::dirty(1, &map, &[4]), keys::seed(1)];
+    let only_vos = [keys::dirty(1, &committed), keys::seed(1)];
     for key in &only_vos {
         assert!(vos.0.contains_key(key) && !jam.0.contains_key(key));
     }

@@ -99,6 +99,8 @@
 //! and hashes; one per leaf, by its key, holding its salt and `vh`; and the
 //! top reference. [`update`] rewrites the rows on the paths of a batch of
 //! written keys, reading every row it needs before it writes any.
+//! [`node_at`] finds the node at a byte prefix: the subtree over the keys
+//! that start with it, the root of the tree over them alone.
 
 #![no_std]
 
@@ -122,7 +124,7 @@ pub use hash::{Blake2b, Hasher, branch_hash, empty_root, leaf_hash, salt, value_
 pub use proof::{BatchProof, Entry, PartialTree};
 pub use range::RangeProof;
 pub use scale::{Decode, Encode};
-pub use store::{Child, MemStore, Node, NodeStore, Rows, reachable, stored_root};
+pub use store::{Child, MemStore, Node, NodeStore, Rows, node_at, reachable, stored_root};
 pub use update::update;
 
 /// A BLAKE2b-256 digest.

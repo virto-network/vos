@@ -531,10 +531,10 @@ fn committed_writes_leave_value_dirty_and_seed_rows() {
             transform = Some(write.map.transform);
         }
         for write in &run.committed {
-            assert!(
-                node.state
-                    .contains_key(&keys::dirty(version, &write.map, &write.key))
-            );
+            assert!(node.state.contains_key(&keys::dirty(
+                version,
+                &keys::committed(&write.map, &write.key)
+            )));
         }
         assert_eq!(
             node.get(&keys::seed(version)),
@@ -559,6 +559,7 @@ fn committed_writes_leave_value_dirty_and_seed_rows() {
     // The rows themselves, as the testkit keeps them.
     let kept = |key: &Vec<u8>| {
         key.first() == Some(&0x01)
+            || keys::is_committed(key)
             || key.starts_with(&keys::dirty_prefix())
             || key.starts_with(&keys::seed_prefix())
     };
@@ -596,11 +597,10 @@ fn state_the_agent_did_not_write_fails_only_the_steps_that_read_it() {
             sessions.request(ALICE, LEDGER, mint, (2u64, 20u64)),
         ],
     );
-    let counter = keys::instance_prefix(COUNTER);
     let rows: Vec<Vec<u8>> = node
         .state
         .keys()
-        .filter(|key| key.starts_with(&counter))
+        .filter(|key| keys::owned_by(key, COUNTER))
         .cloned()
         .collect();
     assert!(!rows.is_empty());
@@ -610,7 +610,7 @@ fn state_the_agent_did_not_write_fails_only_the_steps_that_read_it() {
     let balances: Vec<Vec<u8>> = node
         .state
         .keys()
-        .filter(|key| key.starts_with(&keys::instance_prefix(LEDGER)))
+        .filter(|key| keys::owned_by(key, LEDGER))
         .cloned()
         .collect();
     node.state.insert(balances.last().unwrap().clone(), vec![]);
@@ -729,6 +729,7 @@ proptest! {
             .iter()
             .filter(|(key, _)| {
                 key.first() == Some(&0x01)
+                    || keys::is_committed(key)
                     || key.starts_with(&keys::dirty_prefix())
                     || key.starts_with(&keys::seed_prefix())
             })

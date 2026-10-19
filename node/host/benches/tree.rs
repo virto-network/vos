@@ -52,13 +52,14 @@ fn rows(version: u64, keys: &[u64], committed: bool) -> Vec<Write> {
     for key in keys {
         let key = MAP.transform.apply(&key.to_be_bytes());
         if committed {
+            let row = keys::committed(&MAP, &key);
             rows.push(Write {
-                key: keys::committed(&MAP, &key),
-                value: Some(stored(&versioned(version, &value))),
+                key: keys::dirty(version, &row),
+                value: Some(stored(&[])),
             });
             rows.push(Write {
-                key: keys::dirty(version, &MAP, &key),
-                value: Some(stored(&[])),
+                key: row,
+                value: Some(stored(&versioned(version, &value))),
             });
         } else {
             rows.push(Write {

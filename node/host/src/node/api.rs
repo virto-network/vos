@@ -251,10 +251,11 @@ impl Node {
         &self.inner.store
     }
 
-    /// The latest root of `agent`'s committed map `map`, the state version
-    /// it holds, and a proof of `keys` against it, from one storage
-    /// snapshot. Refused as building while a build is part-way through the
-    /// map.
+    /// The latest root of `agent`'s committed map `map`, the node of the
+    /// agent's tree at the map's prefix, the state version it holds, and a
+    /// proof of `keys` against it, from one storage snapshot. Refused as
+    /// building while a build is part-way through the tree and a write to
+    /// the map waits.
     pub fn prove<K: AsRef<[u8]>>(
         &self,
         agent: AgentId,

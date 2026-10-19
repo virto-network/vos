@@ -9,7 +9,7 @@ use std::time::Duration;
 use vos_checker::calls::done;
 use vos_checker::programs::table_tag;
 use vos_node::Node;
-use vos_node::roots::{self, MapStore};
+use vos_node::roots::{self, AgentStore};
 use vos_node::store::PersistMode;
 use vos_tree::{Blake2b, Hash, value_hash};
 use vos_wire::Encode;
@@ -28,7 +28,7 @@ fn entries(node: &Node, agent: AgentId) -> MapId {
     let tag = table_tag("entries");
     node.store()
         .snapshot()
-        .scan(agent, &keys::instance_prefix(COUNTER), None)
+        .scan(agent, &keys::instance_prefixes(COUNTER)[1], None)
         .find_map(|row| {
             let (key, _) = row.unwrap();
             keys::committed_entry(&key)
@@ -90,29 +90,38 @@ fn settled(node: &Node, agent: AgentId) -> Option<(Hash, u64)> {
     }
 }
 
-/// On `node`: the root is the one from scratch over the value rows, each
-/// leaf commits its row's value, every node and leaf row is on the tree,
-/// and a proof of present and absent keys verifies.
+/// On `node`: the map's root and the agent's are the ones from scratch
+/// over the value rows, each leaf at its row's key committing the row's
+/// bare value, every node and leaf row is on the tree, and a proof of
+/// present and absent keys verifies.
 fn check(node: &Node, agent: AgentId, root: Hash) {
     let map = entries(node, agent);
     let snapshot = node.store().snapshot();
-    let tree = MapStore::open(&snapshot, agent, map).unwrap();
+    let tree = AgentStore::open(&snapshot, agent).unwrap();
     let prefix = keys::committed_rows(&map);
     let mut leaves = Vec::new();
-    for row in snapshot.scan(agent, &prefix, None) {
+    for row in snapshot.scan(agent, &keys::committed_all(), None) {
         let (key, value) = row.unwrap();
         let (_, value) = unversioned(unstored(&value).unwrap()).unwrap();
-        let key = key[prefix.len()..].to_vec();
         let leaf = vos_tree::NodeStore::leaf(&tree, &key)
             .unwrap()
             .expect("a leaf");
         assert_eq!(value_hash(&Blake2b, &leaf.salt, value), leaf.value_hash);
         leaves.push((key, leaf.value_hash));
     }
-    assert!(leaves.len() > 100, "{} entries", leaves.len());
-    assert_eq!(vos_tree::root(&Blake2b, &leaves), root);
+    let of_map: Vec<_> = leaves
+        .iter()
+        .filter(|(key, _)| key.starts_with(&prefix))
+        .cloned()
+        .collect();
+    assert!(of_map.len() > 100, "{} entries", of_map.len());
+    assert_eq!(vos_tree::root(&Blake2b, &of_map), root);
+    assert_eq!(
+        roots::agent_root(&snapshot, agent).unwrap().0,
+        vos_tree::root(&Blake2b, &leaves)
+    );
     assert!(
-        roots::rows_match_tree(&snapshot, agent, map).unwrap(),
+        roots::rows_match_tree(&snapshot, agent).unwrap(),
         "rows off the tree"
     );
     let stored = |prefix: Vec<u8>| snapshot.scan(agent, &prefix, None).count();
