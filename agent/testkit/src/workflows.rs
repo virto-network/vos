@@ -725,11 +725,13 @@ impl Invocation<'_> {
         spent: u64,
     ) -> Result<Ended, Failure> {
         set_gas(machine, limit.saturating_sub(spent));
+        // A read's kernel run is the step's move: a share it left spent
+        // preempts the step, its statement kept.
         let mut share = Share {
             limit,
             allotted: limit,
             effectful: false,
-            served: false,
+            served: spent > 0,
         };
         self.instances.push(InstanceGas {
             instance: call.instance,

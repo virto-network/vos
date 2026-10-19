@@ -89,7 +89,8 @@ impl Invocation<'_> {
     /// step's input, through its step from where its snapshot left it, the
     /// host call `pending` first: until it pauses, is preempted, ends or
     /// fails. Its own gas goes to its instance, as a handler's, with
-    /// `spent`, what its read at a cut's kernel took of its share.
+    /// `spent`, what its read at a cut's kernel took of its share: a move,
+    /// so a share it leaves spent preempts the step.
     pub(crate) fn workflow(
         &mut self,
         machine: &mut Machine,
@@ -99,6 +100,9 @@ impl Invocation<'_> {
         spent: u64,
     ) -> Result<Ended, Failure> {
         machine.set_gas(share.limit.saturating_sub(spent));
+        // A read's kernel run is the step's move: a share it left spent
+        // preempts the step, its statement kept, rather than failing it.
+        share.served = spent > 0;
         self.instances.push(InstanceGas {
             instance: call.instance,
             gas: 0,

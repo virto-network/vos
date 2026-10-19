@@ -457,7 +457,8 @@ Rests on decisions 5, 6 and 8.
   before a variable one where SCALE has a compact (6.13).
 - **The io-hash is unchanged:** `BLAKE2b-256("vos/io/v1" ‖ SCALE(public_args) ‖ SCALE(output) ‖ SCALE(roots))`.
 - **The kernel's halt:** its returned bytes are
-  `SCALE(KernelReturn { public_args, output, roots })`, and φ9..12 the
+  `KernelReturn { public_args, output, roots }`'s encoding (the
+  workspace codec's, as `Served`'s below: `u32` lengths), and φ9..12 the
   io-hash over them. The agent splits them, recomputes the io-hash and
   compares it with φ9..12; a mismatch fails the attest (a kernel bug).
   A `Kind::Attestable` kernel returns its output alone, unchecked as
@@ -466,7 +467,7 @@ Rests on decisions 5, 6 and 8.
   [measured, 6.13].
 - **The record:**
   `Attest { program, window: Option<u64>, witness_input: Vec<u8>, output, public_args, roots: Vec<RootRead> }`,
-  `witness_input` the arguments ‖ `SCALE(Served)` for an at-cut attest;
+  `witness_input` the arguments ‖ `Served`'s encoding for an at-cut attest;
   the kernel reads it through `0x401`. The final proof's hash arrives
   later as a `Proven { id, proof }` input.
 - **The served witness**, SCALE, carried inline in the `Resume` input
@@ -488,6 +489,13 @@ Rests on decisions 5, 6 and 8.
   computes `S_w`, and states
   `RootRead { kind: Space, space, window: w, root: S_w }`. A failure
   traps: the attest fails, and the workflow sees the error.
+- **What a statement binds of its reader:** `public_args` carries the
+  `(agent, instance)` whose rows it read, not the program installed there:
+  a kernel states over any instance's rows of a map of its tag, and a
+  map's tag derives from its name. That is within "an anchor gives no
+  integrity: the space is trusted for its own state"; a venue's handler
+  knows what program each `(agent, instance)` it trusts runs (6.13's
+  review). Binding the install's program hash is a later slice's.
 - **When:**
   1. `ctx.attest_at_cut(call).reads(|r| …).await` from a workflow step
      (`Op::AttestAt`) records a pending request of window w and pauses
@@ -511,7 +519,7 @@ Rests on decisions 5, 6 and 8.
      ignores a duplicate `Closed` for a window it holds.
   4. The agent's leader assembles `Served` from the two and proposes a
      system input `Resume { window, request, served: Option<Vec<u8>> }`,
-     the bytes `SCALE(Served)` bounded by `Limits::served` and not
+     the bytes `Served`'s encoding, bounded by `Limits::served` and not
      `REQUEST`, `None` when the cut proved no rows for it or they pass
      the cap (`AttestError::Unserved`); refine checks the served header
      and row keys against the agent, its space, the window and the
@@ -536,7 +544,7 @@ Rests on decisions 5, 6 and 8.
   their requests take this path.
 - **The caps:** `Limits::attest` keeps capping the caller's arguments (64
   KiB on VOS, 2 KiB on JAM), and the kernel's whole return
-  (`SCALE(KernelReturn)`). `Limits::served` caps a `Resume`'s `Served`:
+  (`KernelReturn`'s encoding). `Limits::served` caps a `Resume`'s `Served`:
   128 KiB on VOS (about 155 rows [est, 6.0a]), 32 KiB on JAM (6.13)
   inside CE 133's package bound (pin F); JAM's step effects then take
   about 65M of a package's own work, a 24th of VOS's, its worst step
@@ -1088,8 +1096,11 @@ lands.
   `cap.rs`'s asserts.
 - **Gate:** within 10% of 6.0a's measured costs: a row 19.07
   compressions and 842 B; the path 14 compressions (+1 for `S_w`) and
-  590 B at 1,024 agents; 16 rows 205,841 steps. An at-cut attest's
-  weight-2 rule holds with `cap.rs`'s asserts.
+  590 B at 1,024 agents; the 16-row prologue 205,841 steps (measured:
+  20.07 with the view's key hash, 862 B, 14 (+1), 590 B, 210,019 steps,
+  +2.0%). The kernel's sixteen keyed reads through its view, about 2,400
+  steps each (6.0a read by position), are 6.18's to cost. An at-cut
+  attest's weight-2 rule holds with `cap.rs`'s asserts.
 - **Dep:** 6.0a, 6.10, 6.11, 6.12; decision 8. **Estimate:** 2–3 weeks.
 
 ### 6.14 The representative and the anchors (F)
@@ -1120,6 +1131,14 @@ lands.
     `w' < w − K`, K ≥ 2 plus the re-cut depth. `pending()` reads past the
     latest built cut and is unaffected; a replica down longer than K
     windows skips those cuts, whose requests re-cut or end `NotClosed`.
+  - **The served path bound in refine** (6.13's review): `serves` also
+    requires `served.rep_root`, `rep_salt` and `space_path` to equal the
+    request's stored `Closed` rows (`keys::space_path(request)`), so the
+    live `Attested::Done` a workflow acts on is as true as the replicated
+    close, not as the leader serving it; Pin E's step 4 says so. A test
+    pins that the representative's `roots` map stores exactly
+    `representative_row`'s key bytes and a bare 32-byte value, as the
+    prologue checks them (the stand-in builds its leaf by hand).
   - **Catch-up by log across many windows**: each committed write of the
     replayed log writes one undo row per cut still pending, and each cut
     costs a build pass; a node-local cap (build the newest K pending cuts

@@ -583,13 +583,28 @@ fn split_writes(overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> (Vec<Write>, Vec
     (writes, committed)
 }
 
+/// A kernel's run as an attest runs it ([`run_kernel`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KernelRan {
+    pub output: Vec<u8>,
+    /// What it left in φ9..φ12.
+    pub io_hash: [u8; 32],
+    pub gas_used: u64,
+    /// Its precompile calls.
+    pub compressions: u64,
+}
+
 /// Run kernel `program` on `input`, its witness input, with `gas`, as an
-/// attest runs it: its output and the io-hash it left in φ9..φ12, or why it
-/// failed.
-pub fn run_kernel(program: &[u8], input: &[u8], gas: u64) -> Result<(Vec<u8>, [u8; 32]), Failure> {
+/// attest runs it, or why it failed.
+pub fn run_kernel(program: &[u8], input: &[u8], gas: u64) -> Result<KernelRan, Failure> {
     let run =
         memory::kernel(program, input, gas, vos_wire::abi::cap::REPLY).map_err(|(code, _)| code)?;
-    Ok((run.output, run.io_hash))
+    Ok(KernelRan {
+        output: run.output,
+        io_hash: run.io_hash,
+        gas_used: run.gas_used,
+        compressions: run.compressions,
+    })
 }
 
 /// Decode a reply as `T`.

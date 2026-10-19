@@ -694,6 +694,9 @@ impl<'a> Invocation<'a> {
         let Some(served) = served else {
             return (Attested::Failed(AttestError::Unserved), 0);
         };
+        if served.len() > self.limits.served {
+            return (Attested::Failed(AttestError::Unserved), 0);
+        }
         // The agent's work on the rows, the batch's: out of it, as a
         // kernel out of its precompiles' serving.
         if !self

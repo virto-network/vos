@@ -67,6 +67,8 @@ pub(crate) struct KernelRun {
     pub io_hash: [u8; 32],
     pub witness_input: Vec<u8>,
     pub gas_used: u64,
+    /// The precompile calls it made.
+    pub compressions: u64,
 }
 
 /// Run an attestable method's kernel: laid out with no arguments, which it
@@ -83,6 +85,7 @@ pub(crate) fn kernel(
     let mut witness = WitnessInput::new(input).ok_or((Failure::Cap, 0))?;
     let mut machine = Machine::load(program, &[], gas).map_err(|_| (Failure::Trapped, 0))?;
     let failed = |machine: &Machine, code| Err((code, gas - machine.gas_remaining()));
+    let mut compressions = 0;
     loop {
         let exit = match machine.try_resume() {
             Ok(exit) => exit,
@@ -102,6 +105,7 @@ pub(crate) fn kernel(
                 }
             }
             ExitReason::HostCall(id) if vos_pvm::precompile::is_precompile(id) => {
+                compressions += 1;
                 if let Err(code) = precompile(&mut machine, id) {
                     return failed(&machine, code);
                 }
@@ -121,6 +125,7 @@ pub(crate) fn kernel(
                     io_hash,
                     witness_input: witness.read().to_vec(),
                     gas_used: invocation.gas_used,
+                    compressions,
                 });
             }
             ExitReason::OutOfGas => return failed(&machine, Failure::OutOfGas),

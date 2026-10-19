@@ -23,17 +23,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use vos_checker::calls::install_at_leader;
-use vos_checker::programs::{actor, method, package};
+use vos_checker::programs::{actor, method, package, table_tag};
 use vos_checker::{ANSWERED, Mode, wait_until};
 use vos_node::Reply;
 use vos_node::roots;
 use vos_node::store::Snapshot;
-use vos_wire::abi::AttestError;
-use vos_wire::abi::Failure;
+use vos_wire::abi::{AttestError, Rows};
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, InstanceId, Principal, Session, WorkflowId};
-use vos_wire::keys;
-use vos_wire::records::{Workflow, WorkflowState, unstored};
+use vos_wire::ids::{AgentId, InstanceId, Principal, Session};
+use vos_wire::keys::{self, Transform};
+use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, WindowClock};
 
@@ -78,8 +77,8 @@ fn session(cluster: &Cluster, key: u8, name: u128) -> Session {
 struct Cuts {
     /// How often a sample found undo rows on some replica.
     undo_held: Mutex<u64>,
-    /// The reads started, by agent.
-    started: Mutex<Vec<(AgentId, WorkflowId)>>,
+    /// The reads started, each by its agent and its tag.
+    started: Mutex<Vec<(AgentId, u64)>>,
 }
 
 impl Cuts {
@@ -134,7 +133,8 @@ impl Cuts {
     /// Start reads of `agent`'s reader at their window's cut until `done`,
     /// a few a window, each in a session of its own's next request.
     fn read(&self, cluster: &Cluster, agent: AgentId, done: &AtomicBool) {
-        let sum_at_cut = method(&actor("reader"), "sum_at_cut");
+        let sum_noted = method(&actor("reader"), "sum_noted");
+        let mut tag = 0u64;
         let mut name = 0u128;
         let mut session = None;
         let mut sequence = 0;
@@ -153,8 +153,8 @@ impl Cuts {
                 sequence,
                 caller: Principal::Client([8; 32]),
                 instance: READER,
-                method: sum_at_cut,
-                arguments: read_keys().encode(),
+                method: sum_noted,
+                arguments: (tag, read_keys()).encode(),
             };
             let Some(node) = cluster
                 .leader(agent)
@@ -163,8 +163,9 @@ impl Cuts {
                 continue;
             };
             match smol::block_on(node.call(agent, request)) {
-                Ok(Reply::Ran(Outcome::Started(id))) => {
-                    self.started.lock().unwrap().push((agent, id));
+                Ok(Reply::Ran(Outcome::Started(_))) => {
+                    self.started.lock().unwrap().push((agent, tag));
+                    tag += 1;
                     sequence += 1;
                 }
                 Ok(_) => session = None,
@@ -229,10 +230,10 @@ impl Alongside for Cuts {
         let started = self.started.lock().unwrap().clone();
         let mut served = 0;
         for (agent, _) in agents {
-            let reads: Vec<WorkflowId> = started
+            let reads: Vec<u64> = started
                 .iter()
                 .filter(|(at, _)| at == agent)
-                .map(|(_, id)| *id)
+                .map(|(_, tag)| *tag)
                 .collect();
             served += check_reads(cluster, *agent, &reads);
             check_agent(cluster, *agent);
@@ -328,11 +329,11 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
     }
 }
 
-/// Every read `agent`'s reader started ended on every replica, its record
-/// read or, a clock's jump past its keeping, collected: those read served
-/// and stated, not served in time, or, of a window such a jump left uncut,
-/// unserved; none refused by its kernel. How many were read served.
-fn check_reads(cluster: &Cluster, agent: AgentId, reads: &[WorkflowId]) -> usize {
+/// Every read `agent`'s reader started ended on every replica, its end
+/// noted under its tag in the reader's state: served and stated, not served
+/// in time, or, of a window a clock's jump left uncut, unserved; none
+/// refused by its kernel. How many were served.
+fn check_reads(cluster: &Cluster, agent: AgentId, reads: &[u64]) -> usize {
     let nodes: Vec<_> = (1..=NODES)
         .map(|number| cluster.node(number).unwrap())
         .collect();
@@ -341,47 +342,38 @@ fn check_reads(cluster: &Cluster, agent: AgentId, reads: &[WorkflowId]) -> usize
         outcomes.clear();
         nodes.iter().all(|node| {
             let snapshot = node.store().snapshot();
-            reads.iter().all(|id| match ended(&snapshot, agent, *id) {
-                Some(Some(outcome)) => {
-                    outcomes.insert(*id, outcome);
+            reads.iter().all(|tag| match noted(&snapshot, agent, *tag) {
+                Some(code) => {
+                    outcomes.insert(*tag, code);
                     true
                 }
-                Some(None) => true,
                 None => false,
             })
         })
     });
-    let failed = |error: AttestError| Outcome::Failed {
-        code: Failure::Handler,
-        detail: error.encode(),
-    };
-    let count =
-        |of: &dyn Fn(&Outcome) -> bool| outcomes.values().filter(|outcome| of(outcome)).count();
-    let served = count(&|outcome| matches!(outcome, Outcome::Done(_)));
-    let late = count(&|outcome| *outcome == failed(AttestError::NotClosed));
-    let unserved = count(&|outcome| *outcome == failed(AttestError::Unserved));
+    let count = |code: u32| outcomes.values().filter(|noted| **noted == code).count();
+    let served = count(0);
+    let late = count(AttestError::NotClosed.code());
+    let unserved = count(AttestError::Unserved.code());
     println!(
-        "agent {}: {} reads, {} collected, {served} served, {late} not served in time, \
-         {unserved} unserved",
+        "agent {}: {} reads, {served} served, {late} not served in time, {unserved} unserved",
         agent.0,
         reads.len(),
-        reads.len() - outcomes.len(),
     );
-    assert_eq!(served + late + unserved, outcomes.len(), "{outcomes:?}");
+    assert_eq!(served + late + unserved, reads.len(), "{outcomes:?}");
     served
 }
 
-/// Workflow `id`'s outcome in `snapshot` once it ended, `Some(None)` once
-/// it is collected, or `None` while it runs.
-fn ended(snapshot: &Snapshot, agent: AgentId, id: WorkflowId) -> Option<Option<Outcome>> {
-    let Some(bytes) = snapshot.get(agent, &keys::workflow(id)).unwrap() else {
-        return Some(None);
+/// The end the reader noted for its read `tag` in `snapshot`: 0 served,
+/// else its error's code.
+fn noted(snapshot: &Snapshot, agent: AgentId, tag: u64) -> Option<u32> {
+    let rows = Rows::Table {
+        tag: table_tag("outcomes"),
+        transform: Transform::Hashed,
     };
-    let record = Workflow::decode(unstored(&bytes)?).ok()?.0;
-    match record.state {
-        WorkflowState::Ended(outcome) => Some(Some(outcome)),
-        _ => None,
-    }
+    let key = keys::row(READER, rows, &tag.to_be_bytes()).unwrap();
+    let bytes = snapshot.get(agent, &key).unwrap()?;
+    Some(u32::decode(unstored(&bytes)?).ok()?.0)
 }
 
 /// The exactly-once run with window cuts, its replicas' states equal

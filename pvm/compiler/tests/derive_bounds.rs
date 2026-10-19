@@ -179,8 +179,8 @@ fn crafted() -> Vec<u8> {
 
     // Read-only data: the schema, then the attestables' table, the words
     // and the jump table.
-    let schema = [b"VOSS".as_slice(), &0u32.to_le_bytes()].concat();
-    let rodata_at = SCHEMA + 8;
+    let schema = no_methods();
+    let rodata_at = SCHEMA + schema.len() as u64;
     let attest = rodata_at;
     let words_at = attest + 16;
     let jumps_at = words_at + 8 * WORDS as u64;
@@ -269,8 +269,8 @@ fn a_kernel_jumping_into_its_prologue_is_refused() {
     .into_iter()
     .flat_map(u32::to_le_bytes)
     .collect();
-    let schema = [b"VOSS".as_slice(), &0u32.to_le_bytes()].concat();
-    let attest = SCHEMA + 8;
+    let schema = no_methods();
+    let attest = SCHEMA + schema.len() as u64;
     let rodata = [1u64.to_le_bytes(), entry.to_le_bytes()].concat();
     let strtab = b"\0entry\0_start\0VOS_ATTEST\0".to_vec();
     let symtab = [
@@ -299,4 +299,16 @@ fn a_kernel_jumping_into_its_prologue_is_refused() {
             .contains("splits a relocated AUIPC+JALR call pair"),
         "{refused}"
     );
+}
+
+/// A schema section of no method, padded to eight bytes: it reads, and
+/// declares no method `Reading`.
+fn no_methods() -> Vec<u8> {
+    [
+        b"VOSS".as_slice(),
+        &4u32.to_le_bytes(),
+        &0u32.to_le_bytes(),
+        &[0; 4],
+    ]
+    .concat()
 }

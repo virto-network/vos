@@ -13,6 +13,8 @@ use vos_sdk::prelude::*;
 pub struct Reader {
     statements: u64,
     notes: Table<u32, u32>,
+    /// Each noted read's end, by its tag: 0 served, else its error's code.
+    outcomes: Table<u64, u32>,
     entries: CommittedMap<u64, u64>,
     names: CommittedMap<u32, Vec<u8>, Ordered>,
 }
@@ -23,6 +25,7 @@ impl Reader {
         Self {
             statements: 0,
             notes: Table::default(),
+            outcomes: Table::default(),
             entries: CommittedMap::default(),
             names: CommittedMap::default(),
         }
@@ -153,6 +156,47 @@ impl Reader {
         count
     }
 
+    /// `sum_at_cut`, its end noted under `tag` in the reader's state,
+    /// which outlives the workflow's record: 0 served, else its error's
+    /// code, which it returns. It ends with it, so the note commits.
+    #[workflow]
+    pub async fn sum_noted(ctx: &mut Workflow<Self>, tag: u64, keys: Vec<u64>) -> u32 {
+        let reads = keys.clone();
+        let read = ctx
+            .attest_at_cut(reader::SumEntries { keys })
+            .reads(|reader: &Reader| reads.iter().map(|key| reader.entries.read(key)).collect())
+            .await;
+        let code = read.map_or_else(|error| error.code(), |_| 0);
+        ctx.update(|reader: &mut Reader| reader.outcomes.insert(&tag, &code));
+        code
+    }
+
+    /// `spin` of `key` for `rounds` at the cut, on a step limit of 2M.
+    #[workflow(gas = 2_000_000)]
+    pub async fn spin_at_cut(
+        ctx: &mut Workflow<Self>,
+        key: u64,
+        rounds: u64,
+    ) -> Result<u64, AttestError> {
+        ctx.attest_at_cut(reader::Spin { key, rounds })
+            .reads(|reader: &Reader| alloc::vec![reader.entries.read(&key)])
+            .await
+    }
+
+    /// Attest `padded` `count` times, each `len` bytes: how many.
+    #[msg(gas = 100_000_000)]
+    pub async fn attest_padded(&mut self, ctx: &mut Command<Self>, count: u32, len: u32) -> u32 {
+        for index in 0..count {
+            ctx.attest(reader::Padded {
+                tag: index as u8,
+                len,
+            })
+            .await
+            .unwrap_or_default();
+        }
+        count
+    }
+
     /// Attest `stamped` and `ordered`: their outputs.
     #[msg]
     #[allow(clippy::too_many_arguments)]
@@ -209,6 +253,23 @@ impl Reader {
     pub fn stamped(#[public] nonce: u64, secret: u64) -> u64 {
         let _ = nonce;
         secret.wrapping_mul(secret)
+    }
+
+    /// The entry under `key` mixed `rounds` times: as long a kernel as
+    /// asked.
+    #[attestable]
+    pub fn spin(&self, key: u64, rounds: u64) -> u64 {
+        let mut x = self.entries.get(&key).unwrap_or(0);
+        for round in 0..rounds {
+            x = core::hint::black_box(x.wrapping_mul(31).wrapping_add(round));
+        }
+        x
+    }
+
+    /// A rootless statement `len` bytes long, its tag public.
+    #[attestable]
+    pub fn padded(#[public] tag: u8, len: u32) -> Vec<u8> {
+        alloc::vec![tag; len as usize]
     }
 
     /// A rootless statement of two public arguments around a private one.

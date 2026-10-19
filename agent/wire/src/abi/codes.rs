@@ -144,7 +144,9 @@ codes! {
         /// Its arguments past the target's [`super::cap::Limits::attest`].
         Cap = 4,
         /// The kernel trapped, ran out of gas, passed its output's cap, or
-        /// returned other than its statement's parts with their io-hash.
+        /// returned other than its statement's parts with their io-hash; or
+        /// its batch's budget could not pay serving it the rows, when no
+        /// step that ran a handler came before it in the batch.
         Failed = 5,
         /// Its window's cut did not prove the rows, or what the leader
         /// served is not the request's: past the target's

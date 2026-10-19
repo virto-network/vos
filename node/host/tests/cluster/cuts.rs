@@ -133,8 +133,10 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
 
     set_clock(&cluster, leader, b0 + 500);
     let reading = clock_of(&cluster, leader);
+    // The cut row may show in the store before the node's applied index
+    // passes the marker: wait for both.
     wait_until("the leader's replica records cut(0)", || {
-        cuts(node, agent).contains_key(&0)
+        cuts(node, agent).contains_key(&0) && !results(node, agent, applied).is_empty()
     });
     let after = clock_of(&cluster, leader);
     assert_eq!(cuts(node, agent), BTreeMap::from([(0, before)]));

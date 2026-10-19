@@ -238,16 +238,15 @@ fn invocation_heap(elf: &mut LinkedElf) -> Result<u32, DeriveError> {
 
 /// Whether each attestable entry reads the rows served at a window's cut
 /// exactly when the schema, its section's bytes `schema`, declares its
-/// method `Reading`, when the schema reads.
+/// method `Reading`: an ELF with attestable entries and a schema that
+/// does not read is refused.
 fn reads_as_declared(schema: &[u8], entries: &[(u32, u64, Input)]) -> Result<(), DeriveError> {
     if entries.is_empty() {
         return Ok(());
     }
     let table = |why: String| DeriveError::Table(why);
-    // A schema that does not read derives still: an install refuses it.
-    let Ok(schema) = vos_wire::schema::Schema::read(schema) else {
-        return Ok(());
-    };
+    let schema = vos_wire::schema::Schema::read(schema)
+        .map_err(|error| table(format!("the schema does not read: {error:?}")))?;
     for &(method, _, input) in entries {
         let kind = schema
             .method(vos_wire::ids::MethodId(method))
