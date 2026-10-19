@@ -478,6 +478,15 @@ impl MaskedComponents for Unlifted {
     fn components(&self) -> Vec<&dyn Component> {
         self.0.components()
     }
+
+    fn bind<'a>(
+        &'a self,
+        relation: &GateRelation,
+        blind: &BlindRelation,
+        claimed_sums: &[SecureField],
+    ) -> Option<Vec<Box<dyn Component + 'a>>> {
+        self.0.bind(relation, blind, claimed_sums)
+    }
 }
 
 /// Soundness 6: the preprocessed columns verify at `n + 1`, as the prover

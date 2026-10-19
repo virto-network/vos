@@ -39,7 +39,9 @@ use vos_pvm_recair::prove::prove_masked_on;
 use vos_pvm_recair::trace::{self, FirstRowFraction};
 use vos_pvm_recair::{Finalized, ProveError, RecairProof};
 use vos_pvm_recair_air::gate::{GateRelation, Layout, public_logup_sum};
-use vos_pvm_recair_air::masked::{BlindRelation, MaskedComponents, MaskedEval, WrapComponents};
+use vos_pvm_recair_air::masked::{
+    BlindRelation, MaskedComponents, MaskedEval, Rebound, WrapComponents,
+};
 use vos_pvm_recair_air::p2::{self, P2Eval};
 
 /// Each component's rows in the small circuits.
@@ -391,6 +393,28 @@ impl MaskedComponents for P2Only {
 
     fn components(&self) -> Vec<&dyn Component> {
         vec![&self.p2]
+    }
+
+    fn bind<'a>(
+        &'a self,
+        relation: &GateRelation,
+        blind: &BlindRelation,
+        claimed_sums: &[SecureField],
+    ) -> Option<Vec<Box<dyn Component + 'a>>> {
+        let &[claimed_sum] = claimed_sums else {
+            return None;
+        };
+        Some(vec![Box::new(Rebound {
+            layout: &self.p2,
+            eval: MaskedEval::new(
+                P2Eval {
+                    log_size: self.log_sizes[0],
+                    relation: relation.clone(),
+                },
+                blind,
+            ),
+            claimed_sum,
+        })])
     }
 }
 

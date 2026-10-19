@@ -22,6 +22,7 @@
 //! here is generic over the component set ([`MaskedComponents`]);
 //! [`WrapComponents`] is the recursion AIR's.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::array::from_fn;
 
@@ -31,10 +32,14 @@ use stwo::core::air::accumulation::PointEvaluationAccumulator;
 use stwo::core::air::{Component, Components};
 use stwo::core::channel::Channel;
 use stwo::core::circle::CirclePoint;
+use stwo::core::constraints::coset_vanishing;
+use stwo::core::fields::FieldExpOps;
 use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use stwo::core::pcs::TreeVec;
+use stwo::core::poly::circle::CanonicCoset;
 use stwo_constraint_framework::{
-    EvalAtRow, FrameworkComponent, FrameworkEval, RelationEntry, TraceLocationAllocator, relation,
+    EvalAtRow, FrameworkComponent, FrameworkEval, PREPROCESSED_TRACE_IDX, PointEvaluator,
+    RelationEntry, TraceLocationAllocator, relation,
 };
 
 use crate::{Body, GateRelation, LogSizes, h8, p2, preprocessed_ids, qm31};
@@ -142,6 +147,81 @@ pub trait MaskedComponents: Sized {
     /// The components in commitment order, their bounds at their rows'
     /// level: wrap each in [`MaskedComponent`] for the committed levels.
     fn components(&self) -> Vec<&dyn Component>;
+
+    /// The components laid out as `self`, their constraints evaluated under
+    /// `relations`, `blind` and `claimed_sums` ([`Rebound`]): the verifier's
+    /// set once the challenges are drawn, without laying it out again. `None`
+    /// when the count of claimed sums is not the set's.
+    fn bind<'a>(
+        &'a self,
+        relations: &Self::Relations,
+        blind: &BlindRelation,
+        claimed_sums: &[SecureField],
+    ) -> Option<Vec<Box<dyn Component + 'a>>>;
+}
+
+/// A component laid out once, its constraints evaluated by another
+/// evaluation of the same layout: the verifier lays its set out before the
+/// relations are drawn, and evaluates it under the drawn relations and the
+/// proof's claimed sums. A layout (the columns, masks and preprocessed
+/// columns `FrameworkComponent::new` reads off an evaluation) depends on
+/// neither, so `eval`, differing from `layout`'s only in them, reads the
+/// columns `layout` lays out. Its evaluation at a point is
+/// `FrameworkComponent`'s, everything else `layout`'s.
+pub struct Rebound<'a, E: FrameworkEval> {
+    pub layout: &'a FrameworkComponent<E>,
+    pub eval: E,
+    pub claimed_sum: SecureField,
+}
+
+impl<E: FrameworkEval> Component for Rebound<'_, E> {
+    fn n_constraints(&self) -> usize {
+        self.layout.n_constraints()
+    }
+
+    fn max_constraint_log_degree_bound(&self) -> u32 {
+        self.layout.max_constraint_log_degree_bound()
+    }
+
+    fn trace_log_degree_bounds(&self) -> TreeVec<ColumnVec<u32>> {
+        self.layout.trace_log_degree_bounds()
+    }
+
+    fn mask_points(
+        &self,
+        point: CirclePoint<SecureField>,
+        max_log_degree_bound: u32,
+    ) -> TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>> {
+        self.layout.mask_points(point, max_log_degree_bound)
+    }
+
+    fn preprocessed_column_indices(&self) -> ColumnVec<usize> {
+        Component::preprocessed_column_indices(self.layout)
+    }
+
+    fn evaluate_constraint_quotients_at_point(
+        &self,
+        point: CirclePoint<SecureField>,
+        mask: &TreeVec<ColumnVec<Vec<SecureField>>>,
+        evaluation_accumulator: &mut PointEvaluationAccumulator,
+        max_log_degree_bound: u32,
+    ) {
+        let preprocessed = self
+            .layout
+            .preprocessed_column_indices()
+            .iter()
+            .map(|&index| &mask[PREPROCESSED_TRACE_IDX][index])
+            .collect();
+        let mut columns = mask.sub_tree(self.layout.trace_locations());
+        columns[PREPROCESSED_TRACE_IDX] = preprocessed;
+        self.eval.evaluate(PointEvaluator::new(
+            columns,
+            evaluation_accumulator,
+            coset_vanishing(CanonicCoset::new(max_log_degree_bound).coset, point).inverse(),
+            self.eval.log_size(),
+            self.claimed_sum,
+        ));
+    }
 }
 
 /// A component whose main and interaction columns, and the preprocessed
@@ -313,6 +393,34 @@ pub fn sample_points(
     Some(points)
 }
 
+/// [`sample_points`] at `oods_point` made from `points`, the set's sample
+/// points at `CirclePoint::zero()`, in place. Each point at zero is its
+/// mask's offset from it, the group's identity: `oods_point` added to it,
+/// and [`composition_point`] to the composition's coordinates', gives each
+/// point exactly, without laying the masks out again. `None` where
+/// [`sample_points`] is.
+pub fn sample_points_from_zero(
+    points: &mut TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+    set: &impl MaskedComponents,
+    oods_point: CirclePoint<SecureField>,
+) -> Option<()> {
+    let at_composition = composition_point(set, oods_point)?;
+    let composition_tree = points.len().checked_sub(1)?;
+    for (tree, columns) in points.iter_mut().enumerate() {
+        for (column, column_points) in columns.iter_mut().enumerate() {
+            let base = if tree == composition_tree && column < COMPOSITION_COLUMNS {
+                at_composition
+            } else {
+                oods_point
+            };
+            for point in column_points {
+                *point = base + *point;
+            }
+        }
+    }
+    Some(())
+}
+
 /// The composition's value at its point, from its coordinates' samples, the
 /// first [`COMPOSITION_COLUMNS`] of the last tree. `None` unless each holds
 /// exactly one.
@@ -421,6 +529,53 @@ impl MaskedComponents for WrapComponents {
 
     fn components(&self) -> Vec<&dyn Component> {
         alloc::vec![&self.p2, &self.qm31, &self.h8]
+    }
+
+    fn bind<'a>(
+        &'a self,
+        relation: &GateRelation,
+        blind: &BlindRelation,
+        claimed_sums: &[SecureField],
+    ) -> Option<Vec<Box<dyn Component + 'a>>> {
+        let &[p2_sum, qm31_sum, h8_sum] = claimed_sums else {
+            return None;
+        };
+        let [p2_size, qm31_size, h8_size] = self.log_sizes;
+        Some(alloc::vec![
+            Box::new(Rebound {
+                layout: &self.p2,
+                eval: MaskedEval::new(
+                    p2::P2Eval {
+                        log_size: p2_size,
+                        relation: relation.clone(),
+                    },
+                    blind,
+                ),
+                claimed_sum: p2_sum,
+            }),
+            Box::new(Rebound {
+                layout: &self.qm31,
+                eval: MaskedEval::new(
+                    qm31::Qm31Eval {
+                        log_size: qm31_size,
+                        relation: relation.clone(),
+                    },
+                    blind,
+                ),
+                claimed_sum: qm31_sum,
+            }),
+            Box::new(Rebound {
+                layout: &self.h8,
+                eval: MaskedEval::new(
+                    h8::H8Eval {
+                        log_size: h8_size,
+                        relation: relation.clone(),
+                    },
+                    blind,
+                ),
+                claimed_sum: h8_sum,
+            }),
+        ])
     }
 }
 
@@ -576,6 +731,92 @@ mod tests {
         // running sum.
         let twice = points.iter().flatten().filter(|c| c.len() == 2).count();
         assert_eq!(twice, 16 + 3 * 4);
+    }
+
+    /// The sample points at `z` made from those at zero are
+    /// [`sample_points`]' at `z`, point for point.
+    #[test]
+    fn the_sample_points_from_zero_are_the_sample_points() {
+        let wrap = wrap();
+        for z in [
+            SECURE_FIELD_CIRCLE_GEN.mul(7),
+            SECURE_FIELD_CIRCLE_GEN.mul(0x1234_5678_9abc),
+        ] {
+            let mut points = sample_points(&wrap, CirclePoint::zero(), &MASKED_WRAP_PINS).unwrap();
+            sample_points_from_zero(&mut points, &wrap, z).unwrap();
+            assert_eq!(
+                points.0,
+                sample_points(&wrap, z, &MASKED_WRAP_PINS).unwrap().0
+            );
+        }
+    }
+
+    /// The wrap laid out under dummy relations and bound to drawn ones
+    /// evaluates its composition at a point as the set built under them:
+    /// the same value for the same samples, and the same metadata.
+    #[test]
+    fn a_bound_layout_evaluates_as_the_set_built_anew() {
+        let mut channel = stwo::core::channel::Blake2bChannel::default();
+        let (relation, blind) = WrapComponents::draw(&mut channel);
+        let claimed_sums = [
+            channel.draw_secure_felt(),
+            channel.draw_secure_felt(),
+            channel.draw_secure_felt(),
+        ];
+        let layout = wrap();
+        let bound = layout.bind(&relation, &blind, &claimed_sums).unwrap();
+        assert!(layout.bind(&relation, &blind, &claimed_sums[..2]).is_none());
+        let built = WrapComponents::build(&relation, &blind, &LOG_SIZES, &claimed_sums);
+        let z = SECURE_FIELD_CIRCLE_GEN.mul(11);
+        let points = sample_points(&layout, z, &MASKED_WRAP_PINS).unwrap();
+        let samples = TreeVec(
+            points
+                .iter()
+                .map(|columns| {
+                    columns
+                        .iter()
+                        .map(|column| {
+                            column
+                                .iter()
+                                .map(|_| channel.draw_secure_felt())
+                                .collect::<Vec<_>>()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>(),
+        );
+        let coefficient = channel.draw_secure_felt();
+        let air_level = air_log_size(&layout).unwrap();
+        let evaluate = |components: Vec<&dyn Component>| {
+            let lifted: Vec<MaskedComponent<'_, dyn Component>> = components
+                .into_iter()
+                .map(|inner| MaskedComponent { inner })
+                .collect();
+            Components {
+                components: lifted.iter().map(|c| c as &dyn Component).collect(),
+                n_preprocessed_columns: points[0].len(),
+            }
+            .eval_composition_polynomial_at_point(z, &samples, coefficient, air_level)
+        };
+        let rebound = evaluate(bound.iter().map(|c| &**c).collect());
+        assert_eq!(rebound, evaluate(built.components()));
+        assert_ne!(rebound, evaluate(layout.components()));
+        for (bound, built) in bound.iter().zip(built.components()) {
+            assert_eq!(bound.n_constraints(), built.n_constraints());
+            assert_eq!(
+                bound.max_constraint_log_degree_bound(),
+                built.max_constraint_log_degree_bound()
+            );
+            assert_eq!(
+                bound.trace_log_degree_bounds().0,
+                built.trace_log_degree_bounds().0
+            );
+            assert_eq!(bound.mask_points(z, 16).0, built.mask_points(z, 16).0);
+            assert_eq!(
+                bound.preprocessed_column_indices(),
+                built.preprocessed_column_indices()
+            );
+        }
     }
 
     /// The composition's value from exactly one sample a coordinate.

@@ -67,7 +67,7 @@ use vos_pvm_recair_air::GateRelation;
 use vos_pvm_recair_air::gate::public_logup_sum;
 use vos_pvm_recair_air::masked::{
     BlindRelation, MaskPins, MaskedComponent, MaskedComponents, WrapComponents, air_log_size,
-    committed_log_sizes, composition_oods_eval, sample_points,
+    committed_log_sizes, composition_oods_eval, sample_points, sample_points_from_zero,
 };
 
 use crate::{
@@ -328,7 +328,10 @@ pub struct Replayed<MC: MerkleChannel> {
 /// every check before Stwo's PCS done: the header, the shape
 /// ([`check_shape`]), the circuit, the interaction PoW, the logup sums, the
 /// sample points' DEEP values and the composition at the out-of-domain
-/// point.
+/// point. The set is laid out once: its sample points made at zero for the
+/// shape and moved to the out-of-domain point, its constraints evaluated
+/// under the drawn relations by binding them to `layout`
+/// ([`MaskedComponents::bind`]).
 pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     format: &MaskedFormat<'_>,
     claim: &Claim<'_, C::Relations, <MC::H as MerkleHasherLifted>::Hash>,
@@ -347,9 +350,9 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     }
     let trees = committed_log_sizes(layout, &format.pins)
         .ok_or(Error::Shape("the component set's trees"))?;
-    let shape = sample_points(layout, CirclePoint::zero(), &format.pins)
+    let mut points = sample_points(layout, CirclePoint::zero(), &format.pins)
         .ok_or(Error::Shape("the component set's sample points"))?;
-    check_shape(format, &trees, &shape, proof)?;
+    check_shape(format, &trees, &points, proof)?;
     let [
         preprocessed_tree,
         main_tree,
@@ -405,27 +408,22 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
         }
     }
 
-    let set = C::new(&relations, &blind, format.log_sizes, claim.claimed_sums)
+    let set = layout
+        .bind(&relations, &blind, claim.claimed_sums)
         .ok_or(Error::Shape("a claimed sum for each component"))?;
     let random_coeff = channel.draw_secure_felt();
     scheme.commit(composition_root, composition_tree, &mut channel);
     let oods_point = CirclePoint::<SecureField>::get_random_point(&mut channel);
-    let points = sample_points(&set, oods_point, &format.pins)
+    sample_points_from_zero(&mut points, layout, oods_point)
         .ok_or(Error::Shape("the component set's sample points"))?;
     if deep_values(&points) != format.deep_values {
         return Err(Error::Shape(
             "the sample points' DEEP values are not the format's",
         ));
     }
-    if !samples_fit(&points, &proof.sampled_values) {
-        return Err(Error::Shape(
-            "a column's samples are not its sample points'",
-        ));
-    }
     let lifted: Vec<MaskedComponent<'_, dyn Component>> = set
-        .components()
-        .into_iter()
-        .map(|inner| MaskedComponent { inner })
+        .iter()
+        .map(|inner| MaskedComponent { inner: &**inner })
         .collect();
     let components = Components {
         components: lifted.iter().map(|c| c as &dyn Component).collect(),
@@ -433,7 +431,7 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     };
     let composition = composition_oods_eval(&proof.sampled_values)
         .ok_or(Error::Shape("the composition's samples"))?;
-    let air_level = air_log_size(&set).ok_or(Error::Shape("the AIR's level"))?;
+    let air_level = air_log_size(layout).ok_or(Error::Shape("the AIR's level"))?;
     if composition
         != components.eval_composition_polynomial_at_point(
             oods_point,
