@@ -7,7 +7,9 @@
 //!   `out = k_m·a·b + k_p·(a⊙b) + k_a·a + k_b·b + k_c·c + Σ_j λ_j·c_j`;
 //! - [`h8`]: the DEEP accumulator over eight M31 samples;
 //! - [`gate`]: the `Gate` relation `(address, l0, l1, l2, l3)` that wires
-//!   them, with signed, preprocessed multiplicities, and why it is sound.
+//!   them, with signed, preprocessed multiplicities, and why it is sound;
+//! - [`masked`]: the three as the masked wrap proves them, masked, blinded
+//!   and at a constraint bound of `4N`; leaves and folds never use it.
 //!
 //! A circuit is the components' preprocessed columns: its coefficients,
 //! selectors, addresses and multiplicities. Every constraint is of degree at
@@ -22,6 +24,7 @@ extern crate alloc;
 
 pub mod gate;
 pub mod h8;
+pub mod masked;
 pub mod p2;
 pub mod qm31;
 pub mod transcript;
@@ -46,8 +49,8 @@ pub const LOG_CONSTRAINT_EXPANSION: u32 = 1;
 
 /// A component's body: its columns, constraints and relation entries, its
 /// fractions not yet finalized. A component's own `evaluate` finalizes them
-/// in pairs; an evaluation that adds fractions of its own runs the body
-/// first.
+/// in pairs; the masked wrap's ([`masked::MaskedEval`]) adds its blinding
+/// fraction first.
 pub trait Body: FrameworkEval + Clone + Sync {
     fn body<E: EvalAtRow>(&self, eval: &mut E);
 }

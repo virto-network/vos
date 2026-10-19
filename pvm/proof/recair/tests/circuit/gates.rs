@@ -73,7 +73,7 @@ impl Degrees<'_> {
 
 /// Each constraint's degree, the preprocessed columns at degree 1 (or 0, to
 /// compare with constraint-framework's own count).
-fn degrees(recorded: &ExprEvaluator, preprocessed: &[&str]) -> Vec<usize> {
+pub(crate) fn degrees(recorded: &ExprEvaluator, preprocessed: &[&str]) -> Vec<usize> {
     let mut degrees = Degrees {
         recorded,
         preprocessed,

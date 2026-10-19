@@ -7,4 +7,5 @@ mod common;
 mod compiler;
 mod gate_vm;
 mod gates;
+mod masked;
 mod modes;
