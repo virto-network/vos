@@ -1179,7 +1179,7 @@ second kernel's rootless statement `S0`, one segment wrapped under 39
 (`wrap-rootless.proof`). `S` is a venue-bound program's: its `public_args`
 are the venue's id and a nonce. The production venue accepts {39}, the
 test venue {28, 39}; each registers `S`'s space from window 40 and judges
-at window 42's boundary. 29 cases (`statements.cases`, 18 KB), each but the
+at window 42's boundary. 31 cases (`statements.cases`, 19 KB), each but the
 three accepted a replay of an accepted statement with one thing changed;
 every verdict the same natively (both formats linked), in Wasm (the
 production blob, 39 alone, and the test blob; PVF and client) and on the
@@ -1192,7 +1192,7 @@ check:
 | valid; rootless (`S0`) | accepted | 109.7M; 109.8M gas |
 | format 28 at the test venue | accepted (`0x2` where 28 is not linked) | test guest 96.5M |
 | tampered; tampered, format 28 at the test venue | `0x112` | 70.0M; test guest 67.2M |
-| wrong program; wrong io-hash; the nonce | `0x108` | 14.0M |
+| wrong program; wrong io-hash; the nonce; the roots' order; a root dropped | `0x108` | 14.0M |
 | prefix; mid-way | `0x109` | 14.2M |
 | unaccepted format (30); format 28 at a production venue | `0x2` | 0.1M |
 | another program than the pin | `0x3` | 0.1M |
@@ -1204,8 +1204,9 @@ check:
 The transition holds both ways: `S` accepted under one format is the same
 statement under the other, refused as a repeat. Past `MaxRootAge` a rooted
 replay is unanchored (its `Seen` entry and anchors dropped) and a rootless
-one is repeated (its entry kept). The production guest's program is 523,362
-bytes (the test guest's 610,809), within 512 KiB and JAM's 4,000,000.
+one is repeated (its entry kept). The production guest's program is 523,607
+bytes (the test guest's 611,088), within JAM's 4,000,000-byte bound on a
+service's code, its only size bound.
 
 **A.7 Budgets per node (M1: measured, then pinned).** Heavy tests run
 under `systemd-run` with these caps as `MemoryMax`.

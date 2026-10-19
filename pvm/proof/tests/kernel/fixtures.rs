@@ -298,8 +298,9 @@ fn the_fixtures_are_judged() {
 ///   venue; **replayed at another venue:** `S` at a venue of another id;
 /// - **a root's window**, **a root:** `S` with its second root's window, or
 ///   a byte of it, changed;
-/// - **the nonce:** `S` with its nonce changed, which the proof's words
-///   bind;
+/// - **the nonce:** `S` with its nonce changed; **the roots' order:** its
+///   two roots swapped; **a root dropped:** its second root left out; each
+///   bound by the proof's words through the io-hash;
 /// - **migrated before a root's window:** the venue's range for `S`'s
 ///   space ends at window 42; **registered after a root's window:** it
 ///   starts at 42;
@@ -326,7 +327,7 @@ mod statements {
     use vos_pvm_recair::masked::MaskRng;
     use vos_pvm_recair::wrap::{self, WrapCircuit};
     use vos_statement::fixtures::{CASES, Case, Patch};
-    use vos_statement::model::{Input, Policy, Space};
+    use vos_statement::model::{Input, Policy, Range, Space};
     use vos_statement::{
         MAX_ROOT_AGE_MS, Pin, ProgramId, RootKind, RootRead, SpaceId, Statement, StatementId,
         VenueId, WindowClock,
@@ -524,7 +525,10 @@ mod statements {
             policy.spaces.push(Space {
                 id: SPACE,
                 clock: CLOCK,
-                range: (40, None),
+                range: Range {
+                    from: 40,
+                    until: None,
+                },
             });
             policy.anchors = s.roots.clone();
             policy.seen.push((
@@ -559,6 +563,11 @@ mod statements {
         // The venue's time past the newest root's `MaxRootAge`.
         let past = CLOCK.boundary(42).unwrap() + MAX_ROOT_AGE_MS + 1;
         let under_28 = |i: &mut Input| i.statement.format = unmasked::FORMAT;
+        // `S` under 28 at the test venue.
+        let at_test_venue_28 = |i: &mut Input| {
+            i.policy = test.clone();
+            under_28(i);
+        };
         // `S` accepted under `format`'s wrap at the test venue, then recorded.
         let accepted_under = |format: u32, proof: &[u8]| {
             let accepted = input(&|i| {
@@ -634,7 +643,7 @@ mod statements {
                 "repeated",
                 "wrap.proof",
                 None,
-                input(&|i| i.policy.record(&i.statement.clone())),
+                input(&|i| i.policy.record(&i.statement)),
                 |code| code == 6,
             ),
             (
@@ -736,17 +745,43 @@ mod statements {
                 by_words,
             ),
             (
+                "the roots' order",
+                "wrap.proof",
+                None,
+                input(&|i| i.statement.roots.swap(0, 1)),
+                by_words,
+            ),
+            (
+                "a root dropped",
+                "wrap.proof",
+                None,
+                input(&|i| {
+                    i.statement.roots.pop();
+                }),
+                by_words,
+            ),
+            (
                 "migrated before a root's window",
                 "wrap.proof",
                 None,
-                input(&|i| i.policy.spaces[0].range = (40, Some(42))),
+                input(&|i| {
+                    i.policy.spaces[0].range = Range {
+                        from: 40,
+                        until: Some(42),
+                    }
+                }),
                 |code| code == 5,
             ),
             (
                 "registered after a root's window",
                 "wrap.proof",
                 None,
-                input(&|i| i.policy.spaces[0].range = (42, None)),
+                input(&|i| {
+                    i.policy.spaces[0].range = Range {
+                        from: 42,
+                        until: None,
+                    }
+                }),
                 |code| code == 5,
             ),
             (
@@ -754,7 +789,7 @@ mod statements {
                 "wrap.proof",
                 None,
                 input(&|i| {
-                    i.policy.record(&i.statement.clone());
+                    i.policy.record(&i.statement);
                     i.policy.advance(past);
                 }),
                 |code| code == 5,
@@ -764,7 +799,7 @@ mod statements {
                 "wrap-rootless.proof",
                 None,
                 rootless_input(&|i| {
-                    i.policy.record(&i.statement.clone());
+                    i.policy.record(&i.statement);
                     i.policy.advance(past);
                 }),
                 |code| code == 6,
@@ -773,20 +808,14 @@ mod statements {
                 "format 28 at the test venue",
                 "wrap-28.proof",
                 None,
-                input(&|i| {
-                    i.policy = test.clone();
-                    under_28(i);
-                }),
+                input(&at_test_venue_28),
                 accepted,
             ),
             (
                 "tampered, format 28 at the test venue",
                 "wrap-28.proof",
                 Some(flip(&valid_28)),
-                input(&|i| {
-                    i.policy = test.clone();
-                    under_28(i);
-                }),
+                input(&at_test_venue_28),
                 by_proof,
             ),
             (

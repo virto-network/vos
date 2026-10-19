@@ -3,11 +3,11 @@
 //! way a JAM service would, or judges a statement with it as a venue does,
 //! and reports its gas by phase.
 //!
-//! Two builds of it (`src/guest.rs`): `final-verify.elf`, the production
-//! venue's, linking format 39 alone; and `final-verify-test.elf`
-//! (`--features pvm-guest,test-formats`, `src/bin/final-verify-test.rs`),
-//! linking format 28 beside it, for the test policy's fixtures. Each
-//! refuses to build under the other's features.
+//! Two builds of it (`src/bin/guest`): `final-verify.elf`, the production
+//! venue's, linking format 39 alone, which refuses to build under
+//! `test-formats`; and `final-verify-test.elf` (`--features
+//! pvm-guest,test-formats`, `src/bin/final-verify-test.rs`), linking format
+//! 28 beside it, for the test policy's fixtures.
 //!
 //! Input, as a JAM work item gives it:
 //! - work item 0's payload (`fetch`, kind 13), at most 16 KiB: a mode byte,
@@ -44,5 +44,7 @@
 
 extern crate alloc;
 
-#[path = "../guest.rs"]
+#[cfg(feature = "test-formats")]
+compile_error!("final-verify links format 39 alone: build final-verify-test under test-formats");
+
 mod guest;

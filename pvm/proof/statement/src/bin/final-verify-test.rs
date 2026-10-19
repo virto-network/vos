@@ -7,5 +7,4 @@
 
 extern crate alloc;
 
-#[path = "../guest.rs"]
 mod guest;

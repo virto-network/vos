@@ -1,5 +1,5 @@
 //! Seeds the corpora of the targets that start from the golden fixtures
-//! (`pvm/proof/fixtures`): `final_verifier_bytes` with the wraps,
+//! (`pvm/proof/fixtures`): `final_verifier_bytes` with every wrap there,
 //! `statement_decode` with every fixture's judgement (its input, then its
 //! proof) and its statement alone.
 //!
@@ -20,16 +20,20 @@ fn main() {
         std::fs::write(directory.join(name), bytes).expect("writes");
     };
     let directory = fixtures::directory();
-    for name in [
-        "wrap.proof",
-        "wrap-rootless.proof",
-        "wrap-prefix.proof",
-        "wrap-midway.proof",
-        "wrap-28.proof",
-    ] {
-        let bytes = std::fs::read(directory.join(name)).expect("the wrap");
-        write("final_verifier_bytes", name, &bytes);
+    let mut wraps = 0;
+    for entry in std::fs::read_dir(&directory).expect("the fixtures' directory") {
+        let path = entry.expect("an entry").path();
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        if name.starts_with("wrap") && name.ends_with(".proof") {
+            let bytes = std::fs::read(&path).expect("the wrap");
+            write("final_verifier_bytes", name, &bytes);
+            wraps += 1;
+        }
     }
+    assert!(wraps > 0, "no wrap under {}", directory.display());
     let all = fixtures::load(&directory);
     for fixture in &all {
         let name = fixture.name.replace([' ', ','], "-");

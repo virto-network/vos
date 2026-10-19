@@ -541,7 +541,11 @@ Rests on decisions 5, 6 and 8.
   rootless statement's entry never expires:** it has no anchor to fail,
   so a pruned entry would let it be accepted, and handled, again. Their
   count is bounded by what a submit costs (decision 11). The same rule at
-  every venue.
+  every venue. **`MaxRootAge` is never raised in place;** a raise is a
+  migration that first prunes anchors older than the old bound: a `Seen`
+  entry's expiry was computed with the old bound, while `anchored`
+  recomputes the age with the new one, so an anchor not yet pruned would
+  be fresh again after its entry was dropped, and a replay accepted.
 - **Kreivo's `submit`** (`spaces-pallet.md` §6.3, the teammate's to
   build): the bounded lengths (statement 64 KiB, proof 256 KiB); the pause
   flag; the paying space active and the signer one of its authorities;
@@ -1436,7 +1440,15 @@ fees are the teammate's.
     (`slot × 6 s` from JAM's genesis time) before storing it. For a
     verdict it checks the roots anchored and the id unseen, and records.
     It prunes anchors and rooted `Seen` entries past `MaxRootAge`;
-    rootless entries never expire (pin F);
+    rootless entries never expire (pin F). `MaxRootAge` is never raised
+    in place; a raise is a migration that first prunes anchors older than
+    the old bound (pin F);
+  - **a replay's cost on JAM** (6.5's review): refine reads no state, so
+    it cannot check `seen`; a replayed statement costs a full refine
+    (about 110M gas) before accumulate refuses it `6`. The defence there
+    is the package's core-time cost to whoever submits it, not `seen`;
+  - **an undecodable statement** is code 1 in the `Verdict`, as at the
+    pallet (`final-verify.elf`'s harness reports it `BAD_PAYLOAD`);
   - accepted program ids (and their venue-bound flags) are constants,
     changed by redeploy; `VenueId` per pin D;
   - **the agent's cut rows on JAM**: one `cut(w)` leaf a window in the
@@ -1462,7 +1474,11 @@ fees are the teammate's.
   if 6.6 has not measured it.
 - **Gates:** refine ≤ 150M gas a statement (6.0b: 118.7M [measured]);
   PolkaJam's refine gas equal to the JAM-only host's for one statement;
-  accumulate ≤ 2M gas a report; the service under 4,000,000 bytes;
+  accumulate ≤ 2M gas a report; the service under 4,000,000 bytes, its
+  only size bound (512 KiB binds nothing here: the service may cross it
+  freely, with ed25519, the items and accumulate; 6.5's verifier-only
+  guest is 523,362 B); a package within CE 133's 204,802 B; the guest's
+  `.bss` (a 64 MiB arena and a 1 MiB stack) within JAM's refine memory;
   PolkaJam v0.8.0 pinned (sha256 `e90c8ccd…`).
 - **Dep:** 6.0b, 6.5, 6.10. **Estimate:** 2.5–3 weeks (the new deploy
   tooling takes the upper bound).
@@ -1657,7 +1673,6 @@ fees are the teammate's.
 | an anchor refused as `WindowInFuture` near a boundary and lost | the client reads the venue's time first, waits and resubmits (design §9; G4; 6.17b) | 6.17b |
 | a registration resubmitted with another `start_window` | the window in the registration digest, and bounded (pin D; G1) | 6.10, 6.17 |
 | the `kreivo` venue used before the pallet meets the vectors | unselectable in production configuration until the deferred Kreivo gates (1)–(2) pass | 6.17b |
-| the JAM program over 512 KiB (538,683 B with both formats) | 6.0b: 500,205 B masked-only at opt 3; a dedicated service (4,000,000 B) regardless | 6.0b, 6.19 |
 | a JAM package over CE 133's 204,802 B is refused at submission (statements and the agent's builder) | the proof as an extrinsic, measured first; `fit.rs`'s payload bound; `fetch` per-kind prices | 6.19 |
 | the worker lags the window cadence | 6.18's throughput gate; L bounded below by it; the prover-time levers | 6.18 |
 | a masked format iteration re-pins every venue | 39 lands once at 6.4, before 6.17 and 6.19; any later change takes a new number | 6.4 |

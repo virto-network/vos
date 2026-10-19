@@ -367,16 +367,26 @@ pub fn code(verdict: &Result<StatementId, Refusal>) -> u32 {
 }
 
 /// A statement the venue's checks before the proof admit: its format, its
-/// id, and the public words its proof must state.
+/// id, and the public words its proof must state. Only [`admit`] makes one,
+/// so a proof is verified against a statement its checks passed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Admitted {
-    /// The statement's format: one the venue accepts and this build links.
-    pub format: u32,
-    pub id: StatementId,
-    pub words: [u32; vos_pvm_final_verifier::PUBLIC_WORDS],
+    format: u32,
+    id: StatementId,
+    words: [u32; vos_pvm_final_verifier::PUBLIC_WORDS],
 }
 
 impl Admitted {
+    /// The statement's format: one the venue accepts and this build links.
+    pub fn format(&self) -> u32 {
+        self.format
+    }
+
+    /// The statement's id.
+    pub fn id(&self) -> StatementId {
+        self.id
+    }
+
     /// The final proof in `proof`'s bytes, verified under the admitted
     /// format against the admitted words; the statement's id when accepted.
     pub fn verify(&self, proof: &[u8]) -> Result<StatementId, Refusal> {
@@ -407,7 +417,7 @@ pub fn admit(venue: &impl Venue, pin: &Pin, statement: &Statement) -> Result<Adm
     if statement.program != pin.program {
         return Err(Refusal::Program);
     }
-    if pin.venue_bound && statement.public_args.get(..32) != Some(&venue.id().0[..]) {
+    if pin.venue_bound && !statement.public_args.starts_with(&venue.id().0) {
         return Err(Refusal::Venue);
     }
     let spaced = if statement.roots.is_empty() {

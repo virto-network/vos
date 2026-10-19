@@ -12,27 +12,6 @@ use vos_statement::model::Input;
 use vos_statement::vos_anchor::vectors::{Digests, Vector};
 use vos_statement::{Admitted, Refusal, StatementId};
 
-/// `final-verify` links format 39 alone, `final-verify-test` format 28
-/// beside it: a build of either under the other's features fails here.
-const _: () = assert!(
-    same(env!("CARGO_BIN_NAME").as_bytes(), b"final-verify-test") == cfg!(feature = "test-formats"),
-    "final-verify links format 39 alone; final-verify-test, under test-formats, 28 beside it"
-);
-
-const fn same(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut i = 0;
-    while i < a.len() {
-        if a[i] != b[i] {
-            return false;
-        }
-        i += 1;
-    }
-    true
-}
-
 /// The verifier's own stack, in `.bss`: the standard program's stack is
 /// the read-only zone's offset, 64 KiB. Its pages written say how much
 /// the verify needs.

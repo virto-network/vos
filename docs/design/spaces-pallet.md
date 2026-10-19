@@ -363,6 +363,11 @@ The outcome:
 - Never prune `Seen` entries at `u64::MAX`.
 - Keep `Last`, and keep `Equivocations` until `resume`.
 - Bounded by the remaining weight, with a cursor.
+- `MaxRootAge` is never raised in place; a raise is a migration that first
+  prunes anchors older than the old bound. A `Seen` entry's expiry was
+  computed with the old bound while `anchored` reads the new one, so an
+  anchor the cursor has not reached would be fresh again after its entry
+  was pruned, and a replay accepted (pin F).
 
 ## 7. Fees: the sovereign account pays for its authorities
 

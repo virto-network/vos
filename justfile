@@ -132,16 +132,22 @@ check-no-faults:
     cargo build -p vos-cli
     if ((^target/debug/vos --version) | str contains "faults") { error make { msg: "a plain build of vos injects faults" } } else { print "no faults in a plain build of vos" }
 
+# Fails when the build `cargo tree <args>` resolves (its normal and build
+# edges, for every target) enables `feature` in any package: each package's
+# enabled features (`{f}`) compared whole, so one a feature enables through
+# another is caught.
+_no-feature feature +args:
+    if (cargo tree {{args}} -e no-dev --target all -f '{f}' --prefix none | lines | each {|line| $line | str replace ' (*)' '' | split row ',' } | flatten | any {|enabled| $enabled == '{{feature}}' }) { error make { msg: "cargo tree {{args}} enables {{feature}}" } }
+
 # The masked prover's seeded randomness (`vos-pvm-recair`'s `seeded-masks`,
 # `MaskRng::Seeded`) reaches no production build: no normal or build edge
 # of any workspace member, nor of the workspaces built apart (the agent,
 # the fuzz targets, the final verifier's Wasm blob and its runner), enables
 # it (the prover's tests enable it on a dev edge), and the proof crate's
-# `debug-internals` does not imply it. Each package's enabled features are
-# read (`{f}`), so a feature that enables it through another is caught.
+# `debug-internals` does not imply it.
 check-no-seeded-masks:
-    if (cargo tree --workspace -e no-dev -f '{p} {f}' --prefix none | str contains 'seeded-masks') { error make { msg: "a workspace member's build enables seeded masks" } }
-    for manifest in [agent/default pvm/proof/fuzz pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { if (cargo tree --manifest-path $"($manifest)/Cargo.toml" -e no-dev -f '{p} {f}' --prefix none | str contains 'seeded-masks') { error make { msg: $"($manifest)'s build enables seeded masks" } } }
+    just _no-feature seeded-masks --workspace
+    for manifest in [agent/default pvm/proof/fuzz pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature seeded-masks --manifest-path $"($manifest)/Cargo.toml" }
     if (open pvm/proof/Cargo.toml | get features.debug-internals | any {|feature| $feature | str contains 'seeded-masks' }) { error make { msg: "debug-internals implies seeded masks" } }
     print "no seeded masks in a production build"
 
@@ -150,15 +156,13 @@ check-no-seeded-masks:
 # or build edge of any workspace member, nor of the workspaces built apart
 # that venues or nodes run (the agent, the final verifier's Wasm blob, its
 # runner), enables it (the tests enable it on dev edges, the harnesses' test
-# builds by name), each package's enabled features read (`{f}`), so a
-# feature that enables it through another is caught; and neither
-# `vos-statement`'s `fixtures` nor its `pvm-guest` implies it. The fuzz
-# targets, built apart, fuzz format 28's decode and verifier too, and are no
-# venue.
+# builds by name); and `vos-statement`'s `fixtures` and `pvm-guest` do not
+# imply it. The fuzz targets, built apart, fuzz format 28's decode and
+# verifier too, and are no venue.
 check-no-test-formats:
-    if (cargo tree --workspace -e no-dev -f '{p} {f}' --prefix none | str contains 'test-formats') { error make { msg: "a workspace member's build enables test-formats" } }
-    for manifest in [agent/default pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { if (cargo tree --manifest-path $"($manifest)/Cargo.toml" -e no-dev -f '{p} {f}' --prefix none | str contains 'test-formats') { error make { msg: $"($manifest)'s build enables test-formats" } } }
-    for feature in [fixtures pvm-guest] { if (open pvm/proof/statement/Cargo.toml | get features | get $feature | any {|implied| $implied | str contains 'test-formats' }) { error make { msg: $"vos-statement's ($feature) implies test-formats" } } }
+    just _no-feature test-formats --workspace
+    for manifest in [agent/default pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature test-formats --manifest-path $"($manifest)/Cargo.toml" }
+    just _no-feature test-formats -p vos-statement --features fixtures,pvm-guest
     print "no test formats in a production build"
 
 # The builds without std. vos-raft for an embedded target, on core and alloc

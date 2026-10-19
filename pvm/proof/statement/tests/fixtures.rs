@@ -47,6 +47,8 @@ fn load() -> Vec<Fixture> {
         "a root's window",
         "a root",
         "the nonce",
+        "the roots' order",
+        "a root dropped",
         "migrated before a root's window",
         "registered after a root's window",
         "rooted, replayed past MaxRootAge",
@@ -125,21 +127,16 @@ fn every_fixture_is_judged_on_the_jam_only_host_as_recorded() {
 }
 
 /// The production guest's program, linking format 39 alone, within JAM's
-/// 4,000,000-byte bound on a service's code; its size beside 512 KiB and the
-/// test guest's.
+/// 4,000,000-byte bound on a service's code, its only size bound; and
+/// smaller than the test guest's, which links 28 beside it.
 #[test]
 fn the_production_program_fits_jams_code_bound() {
     let (program, elf) = jam::program();
     let (test, test_elf) = jam::test_program();
     eprintln!(
-        "final-verify: program {} B (ELF {elf} B), {} 512 KiB; final-verify-test: program {} B \
-         (ELF {test_elf} B)",
+        "final-verify: program {} B (ELF {elf} B); final-verify-test: program {} B (ELF \
+         {test_elf} B)",
         program.len(),
-        if program.len() <= 512 << 10 {
-            "within"
-        } else {
-            "over"
-        },
         test.len(),
     );
     assert!(program.len() <= 4_000_000, "{} bytes", program.len());
