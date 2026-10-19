@@ -1388,6 +1388,44 @@ whole binary (85 of 85); the stage it stopped rerun in full: 424 passed,
 **Commits:** `dad6402d` the temporary local pin; `7bf98c05` the step; this record.
 The fork: `c3ec981` on `vos/verify-panics`, unpushed.
 
+**Reviews:** Fable on the fork's fix: push; the coordinator pushed
+`vos/verify-panics` (`c3ec9813`) to olanod/stwo. Opus ACCEPT with four
+Low findings and four Info (`6.7-review.md`), folded:
+- **the re-pin** (`bdb34aff`): stwo and the constraint framework at
+  `c3ec9813` in the workspace and the fuzz crate, the four `[patch]`
+  blocks gone, no absolute path left from the pin; the three lockfiles
+  1d23a02e's but for the source rev (**L2:** the path patch had moved
+  stwo's `hashbrown`, 0.16.1 → 0.17.1 at the root and 0.15.5 → 0.16.1 in
+  the runner; now unmoved; the runner keeps 6.6's `libc`); SECURITY.md's
+  pin and DIVERGENCE-013;
+- **L1:** row 30, FRI's line-fold inversions (`fold_line`,
+  `fold_circle_into_line`), guarded by the verifier's own domains; "6, 7,
+  20 and 30" the only inversions;
+- **L3:** the JAM program's payload (`as_chunks::<4>`, `get(used..)`, a
+  `get_mut` and saturating cursor, the payload's length by `get`) and the
+  Wasm blob's words (`as_chunks`) and malloc size (checked), both roots
+  under the denies, linted by `just check-no-std` for their targets (the
+  guest's two bins, the blob with and without `test-formats`); the guest's
+  allocator allowed with its reason (sums of `Layout` sizes and arena
+  offsets), `Request`'s size difference allowed;
+- **L4:** `unreachable`, `todo` and `unimplemented` denied too; no
+  `assert!` outside the tests, `split_at`/`copy_from_slice` once at equal
+  lengths (SECURITY.md);
+- **Info:** `shape.rs`'s bounds from `masked::CONFIG` and
+  `LOG_DEGREE_BOUND`; `just fuzz`'s sanitized targets under `-a`; the
+  recursion witness's `expect` names its precondition; the replay's cost
+  (about 38 s warm, 35 s of it the prove target's three inputs) kept in
+  `check`.
+
+**Gates after the fold** (`d6545360`) [measured]: `just check` green,
+1,228 passed, 0 failed (`RUST_TEST_THREADS=4` under 12 GiB; a first run
+at the default threads was OOM-killed at 12 GiB in the recursion tests);
+`just judge-wasm`: 31 of 31 fixtures as recorded by each blob under each
+semantics, valid 47,616,003 instructions, the three anchor vectors as
+pinned.
+
+**6.7 accepted.**
+
 ## Step 6.8: the recursion AIR's forgery gates
 
 **Built** on `s6/forgery` (from `27967322`): a new test binary,
