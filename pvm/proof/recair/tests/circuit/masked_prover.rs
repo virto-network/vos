@@ -3,11 +3,14 @@
 //! the proof reveals, the FRI mask's DEEP coefficients span QM31, an invalid
 //! witness is refused, the prover runs on another channel and component set,
 //! every masked root and claimed sum is fresh, and the seeded seam
-//! reproduces a proof byte for byte. Each proof is verified by the tests'
-//! masked verifier (`tests/support/masked_verifier.rs`).
+//! reproduces a proof byte for byte. Each proof is verified by the final
+//! verifier's masked verifier (`vos_pvm_final_verifier::masked`), over the
+//! set and channel it was proved on, under the format as the verifier pins
+//! it (`vos_pvm_recair::masked::verifier_format`).
 
 use crate::common::random_circuit;
-use crate::masked_verifier::{Claim, replay, verify_masked};
+use vos_pvm_final_verifier::Error;
+use vos_pvm_final_verifier::masked::{Claim, replay, verify_masked};
 
 use num_traits::{One, Zero};
 use stwo::core::air::Component;
@@ -30,6 +33,7 @@ use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
 use vos_pvm_proof::format::{DeepBatching, Format, FormatParams, MASKED_WRAP, Masking};
 use vos_pvm_recair::masked::{
     MaskLayout, MaskRng, MaskedProof, MaskedProvers, MaskedTrace, prove_masked, rank_m31,
+    verifier_format,
 };
 use vos_pvm_recair::prove::prove_masked_on;
 use vos_pvm_recair::trace::{self, FirstRowFraction};
@@ -109,23 +113,25 @@ fn wrap_layout(log_sizes: &[u32; 3]) -> WrapComponents {
 fn verify(
     format: &Format,
     proof: &RecairProof<<Blake2bMerkleChannel as MerkleChannel>::H>,
-) -> Result<(), String> {
+) -> Result<(), Error> {
     let public_sum = |relation: &GateRelation| {
         public_logup_sum(
             relation,
             Layout::node(proof.outputs.len() as u32).public_terms(proof.outputs.iter().copied()),
         )
     };
+    let layout = wrap_layout(&proof.log_sizes);
     verify_masked::<Blake2bMerkleChannel, WrapComponents>(
+        &verifier_format(format, &proof.log_sizes, &layout).expect("a masked format"),
         &Claim {
-            format,
             log_sizes: &proof.log_sizes,
+            circuit: None,
             public: &proof.outputs,
             public_sum: Some(&public_sum),
             interaction_pow: proof.interaction_pow,
             claimed_sums: &proof.claimed_sums,
         },
-        &wrap_layout(&proof.log_sizes),
+        &layout,
         proof.stark_proof.clone(),
     )
 }
@@ -239,16 +245,18 @@ fn fri_mask_coefficients(
         )
     };
     let claim = Claim {
-        format,
         log_sizes: &proof.log_sizes,
+        circuit: None,
         public: &proof.outputs,
         public_sum: Some(&public_sum),
         interaction_pow: proof.interaction_pow,
         claimed_sums: &proof.claimed_sums,
     };
+    let layout = wrap_layout(&proof.log_sizes);
     let mut channel = replay::<Blake2bMerkleChannel, WrapComponents>(
+        &verifier_format(format, &proof.log_sizes, &layout).expect("a masked format"),
         &claim,
-        &wrap_layout(&proof.log_sizes),
+        &layout,
         &proof.stark_proof,
     )
     .unwrap()
@@ -427,11 +435,13 @@ fn the_masked_prover_is_generic() {
         &[SecureField::zero()],
     )
     .unwrap();
-    let claim = |proof: &MaskedProof<_>| -> Result<(), String> {
+    let pinned = verifier_format(&format, &log_sizes, &layout).expect("a masked format");
+    let claim = |proof: &MaskedProof<_>| -> Result<(), Error> {
         verify_masked::<Blake2sMerkleChannel, P2Only>(
+            &pinned,
             &Claim {
-                format: &format,
                 log_sizes: &log_sizes,
+                circuit: None,
                 public: &finalized.witness.outputs,
                 public_sum: None,
                 interaction_pow: proof.interaction_pow,

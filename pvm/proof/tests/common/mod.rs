@@ -6,9 +6,6 @@
 /// The venue's JAM refine program on the JAM-only host.
 #[path = "../../statement/tests/support/jam.rs"]
 pub mod jam;
-/// The tests' masked verifier, until the final verifier reads format 39.
-#[path = "../../recair/tests/support/masked_verifier.rs"]
-pub mod masked_verifier;
 
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
@@ -538,7 +535,8 @@ pub fn wrap_root(
     );
     assert!(peak_mib <= 8 << 10, "{peak_mib} MiB");
     wrap.add(proving, peak_mib);
-    let verified = vos_pvm_final_verifier::verify_bytes(&bytes, &words).expect("the wrap verifies");
+    let verified =
+        vos_pvm_final_verifier::unmasked::verify_bytes(&bytes, &words).expect("the wrap verifies");
     assert_eq!(verified, statement);
     assert_eq!(statement.program, program.id().0.map(|word| word.0));
     assert_eq!(statement.io_hash, root.node.output.io_hash);
@@ -566,23 +564,19 @@ fn resident_peak_mib(reset: bool) -> u64 {
 
 /// A finalized wrap circuit's witness proved masked under format 39
 /// (`vos_pvm_recair::wrap::prove`), within 4.5 GiB of heap and 8 GiB of
-/// resident memory, its revealed functionals within pin A's count, and
-/// verified by the tests' masked verifier, its preprocessed root format 28's
-/// (pin A): its proving time and R1's printed with the load average.
+/// resident memory, its revealed functionals within pin A's count, its
+/// bytes the fixed layout, and verified by the final verifier's masked
+/// verifier, its preprocessed root format 39's (pin A): its proving time and
+/// R1's printed with the load average, and its bytes written for the Wasm
+/// harness as `wrap/<name>-39.{proof,format,words}`.
 fn masked_wrap(
     name: &str,
     finalized: &vos_pvm_recair::Finalized<stwo::core::fields::qm31::SecureField>,
     words: &[u32; vos_pvm_final_verifier::PUBLIC_WORDS],
 ) {
-    use masked_verifier::{Claim, verify_masked};
-    use stwo::core::fields::m31::BaseField;
-    use stwo::core::fields::qm31::SecureField;
     use stwo::core::vcs::blake2b_hash::Blake2bHash;
-    use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
-    use vos_pvm_proof::format::MASKED_WRAP;
+    use vos_pvm_final_verifier::masked;
     use vos_pvm_recair::masked::MaskRng;
-    use vos_pvm_recair_air::gate::{GateRelation, public_logup_sum};
-    use vos_pvm_recair_air::masked::{BlindRelation, WrapComponents};
 
     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
     resident_peak_mib(true);
@@ -591,11 +585,11 @@ fn masked_wrap(
             .expect("the masked wrap proves")
     });
     let resident_mib = resident_peak_mib(false);
-    let bytes = postcard::to_allocvec(&proof).expect("encodes");
+    let bytes = vos_pvm_recair::wrap::proof_bytes(&proof).expect("format 39's bytes");
     eprintln!(
         "{name}'s masked wrap (format 39): proved in {:.2}s, its peak heap {peak_mib} MiB, the \
-         process's peak resident {resident_mib} MiB, {} bytes (postcard); R1 {:.1} ms, {} rows \
-         revealed of h = 256, {} attempt(s); load {}",
+         process's peak resident {resident_mib} MiB, {} bytes (fixed layout); R1 {:.1} ms, {} \
+         rows revealed of h = 256, {} attempt(s); load {}",
         proving.as_secs_f64(),
         bytes.len(),
         stats.rank_check.as_secs_f64() * 1e3,
@@ -608,41 +602,35 @@ fn masked_wrap(
     // Pin A's count of the revealed functionals: `2(4|O| + q(|O| + 1))`
     // at `q = 24` and `|O| = 2`, the budget `h = 256` covers twice.
     assert!(stats.revealed_rows <= 160, "{stats:?}");
-    assert_eq!(proof.format_version, MASKED_WRAP.number);
+    assert_eq!(proof.format_version, masked::FORMAT);
     assert_eq!(
         proof.stark_proof.commitments[0],
-        Blake2bHash(vos_pvm_final_verifier::PREPROCESSED_ROOT)
+        Blake2bHash(vos_pvm_final_verifier::PREPROCESSED_ROOT_39)
     );
+    let verified = masked::verify_bytes(&bytes, words).expect("the masked wrap verifies");
+    assert_eq!(verified.words(), *words);
+    write_wrap_files(&format!("{name}-39"), masked::FORMAT, &bytes, words);
+}
 
-    let public: Vec<SecureField> = words
-        .iter()
-        .map(|&word| SecureField::from(BaseField::from_u32_unchecked(word)))
-        .collect();
-    let public_sum = |relation: &GateRelation| {
-        public_logup_sum(
-            relation,
-            vos_pvm_final_verifier::LAYOUT.public_terms(public.iter().copied()),
-        )
-    };
-    let layout = WrapComponents::build(
-        &GateRelation::dummy(),
-        &BlindRelation::dummy(),
-        &proof.log_sizes,
-        &[SecureField::default(); 3],
-    );
-    verify_masked::<Blake2bMerkleChannel, WrapComponents>(
-        &Claim {
-            format: &MASKED_WRAP,
-            log_sizes: &proof.log_sizes,
-            public: &public,
-            public_sum: Some(&public_sum),
-            interaction_pow: proof.interaction_pow,
-            claimed_sums: &proof.claimed_sums,
-        },
-        &layout,
-        proof.stark_proof,
-    )
-    .expect("the masked wrap verifies");
+/// A wrap's proof, its format (a little-endian `u32`) and its public words
+/// (24 little-endian `u32`s), under the target's tmp directory as
+/// `wrap/<name>.{proof,format,words}`, for the Wasm harness.
+fn write_wrap_files(
+    name: &str,
+    format: u32,
+    proof: &[u8],
+    words: &[u32; vos_pvm_final_verifier::PUBLIC_WORDS],
+) {
+    let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
+    std::fs::create_dir_all(&directory).expect("the wrap's directory");
+    let words: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    for (extension, bytes) in [
+        ("proof", proof),
+        ("format", &format.to_le_bytes()[..]),
+        ("words", &words),
+    ] {
+        std::fs::write(directory.join(format!("{name}.{extension}")), bytes).expect("writes");
+    }
 }
 
 /// `statement`, the run's: its io-hash the run's `io_hash`, judged against
@@ -687,25 +675,18 @@ pub fn judged_statement(
     input
 }
 
-/// A wrap's proof (postcard), its public words (24 little-endian `u32`s)
-/// and its judgement's input, under the target's tmp directory as
-/// `wrap/<name>.{proof,words,input}`, for the Wasm harness.
+/// A format-28 wrap's proof (postcard), its format, its public words and its
+/// judgement's input, under the target's tmp directory as
+/// `wrap/<name>.{proof,format,words,input}`, for the Wasm harness.
 pub fn write_wrap(
     name: &str,
     proof: &[u8],
     words: &[u32; vos_pvm_final_verifier::PUBLIC_WORDS],
     input: &vos_statement::model::Input,
 ) {
+    write_wrap_files(name, vos_pvm_final_verifier::unmasked::FORMAT, proof, words);
     let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
-    std::fs::create_dir_all(&directory).expect("the wrap's directory");
-    let words: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
-    for (extension, bytes) in [
-        ("proof", proof),
-        ("words", &words),
-        ("input", &input.encode()),
-    ] {
-        std::fs::write(directory.join(format!("{name}.{extension}")), bytes).expect("writes");
-    }
+    std::fs::write(directory.join(format!("{name}.input")), input.encode()).expect("writes");
 }
 
 /// `instructions` as code, each one's start marked in the bitmask, with no

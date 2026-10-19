@@ -27,13 +27,16 @@
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
 //!   before the relation challenges. 30 and 37 are
-//!   registered and refused until their AIRs and channels exist, and 39 until
-//!   its masked AIR, prover and verifier do. 32 is registered and refused
+//!   registered and refused until their AIRs and channels exist. 32 is registered and refused
 //!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
 //!   its proofs natively, pinning each circuit by its hash, and no verifier
 //!   outside the recursion reads a leaf or a fold. 28 is admitted:
 //!   `vos-pvm-recair` proves the wrap on the fork's Blake2b-256 channel and
-//!   `vos-pvm-final-verifier` verifies it, fold step 3 reviewed in the fork. A
+//!   `vos-pvm-final-verifier` verifies it (under its `test-formats`
+//!   feature), fold step 3 reviewed in the fork. 39 is admitted: the masked
+//!   wrap, `vos-pvm-recair`'s masked prover and `vos-pvm-final-verifier`'s
+//!   masked verifier, its bytes a fixed layout ([`ProofBytes::FixedLayout`]);
+//!   production venues accept it alone. A
 //!   segment verifier takes only a segment format ([`admitted_segment`]).
 //! - **The inner formats** grind 8 bits of interaction PoW. Segments (35)
 //!   take 40 queries and 24 bits of PoW: 62.86 proven bits, the query term
@@ -473,7 +476,7 @@ pub const MASKED_WRAP: Format = Format {
     masked: true,
     masking: Some(MASKED_WRAP_MASKING),
     floor: WRAP.floor,
-    status: Status::Reserved,
+    status: Status::Admitted,
     reference: MASKED_WRAP_REFERENCE,
     bits: SecurityBits {
         conjectured: 146,

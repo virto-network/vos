@@ -146,7 +146,7 @@ mod tests {
             let mut changed = input.clone();
             change(&mut changed);
             let mut bytes = changed.encode();
-            bytes.extend_from_slice(&[1, 2, 3]);
+            bytes.extend_from_slice(&[28, 1, 2]);
             judge_bytes(&bytes).unwrap_err().code()
         };
         assert_eq!(refusal(|_| {}), 0x100 | 1, "undecodable proof bytes");

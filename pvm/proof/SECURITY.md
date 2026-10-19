@@ -27,8 +27,8 @@ reference shape, from the security tool (`src/security.rs`):
 |---|---|---|---|---|---|
 | 35 | segments, hardened AIR | Poseidon2-M31 | 104 / 62.86 | 100 / 60 | admitted |
 | 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | reserved: proved and verified inside the recursion, refused by every outside verifier |
-| 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted |
-| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | reserved: refused until its masked AIR, prover and verifier exist |
+| 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted: the tests' and the fixtures', linked by the final verifier under `test-formats` alone |
+| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | admitted: what production venues accept |
 | 37, 30 | device and credential proofs | Blake2s-M31 | 106 / 62.10, 62.52 | 100 / 60 | reserved |
 
 - **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
@@ -228,8 +228,13 @@ None yet in a proof. Every proof is unmasked: the wrap's witness
 (digests, positions, the io-hash, the fold word) and its trace are in the
 clear. Segment, leaf and fold proofs must never leave the prover role.
 
-**Format 39,** the masked wrap, is registered and refused until its masked
-AIR, prover and verifier exist. Its count is the security tool's under
+**Format 39,** the masked wrap, is admitted: `vos-pvm-recair-air`'s masked
+AIR, `vos-pvm-recair`'s masked prover and `vos-pvm-final-verifier`'s masked
+verifier (pin B's transcript, every pin the format's, the shape checked
+before any Stwo call; the two facts it leaves to Stwo, the trees' widths
+`verify_values` zips and the FRI rounds `FriVerifier::commit` derives,
+each pinned and tested), its bytes a fixed layout with one encoding a
+proof. Its count is the security tool's under
 masking variant (c) (`docs/design/research/slice-5/spike2-masking.md` §3b,
 `docs/design/research/slice-6/spike6b-masked-bits.md`):
 

@@ -125,6 +125,10 @@ opt-level = 3
 opt-level = 3
 [profile.test.package.vos-pvm-recair-air]
 opt-level = 3
+[profile.dev.package.vos-pvm-final-verifier]
+opt-level = 3
+[profile.test.package.vos-pvm-final-verifier]
+opt-level = 3
 [profile.dev.package.vos-statement]
 opt-level = 3
 [profile.test.package.vos-statement]

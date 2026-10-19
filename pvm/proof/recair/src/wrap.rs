@@ -35,7 +35,7 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::{Blake2bMerkleChannel, Blake2bMerkleHasher};
 use vos_pvm_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
-use vos_pvm_proof::format::{MASKED_WRAP, WRAP};
+use vos_pvm_proof::format::{MASKED_WRAP, ProofBytes, WRAP, lookup};
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{ID_WORDS, IdPreimage};
 use vos_pvm_recair_air::gate::Layout;
@@ -246,6 +246,18 @@ fn wrap_proof(proof: RecairProof<Blake2bMerkleHasher>) -> WrapProof {
         interaction_pow: proof.interaction_pow,
         claimed_sums: proof.claimed_sums,
         stark_proof: proof.stark_proof,
+    }
+}
+
+/// A wrap proof's bytes as its format lays them out
+/// (`vos_pvm_proof::format::Format::bytes`): format 39's fixed layout
+/// (`vos_pvm_final_verifier::masked::encode`), the one encoding its
+/// verifier reads, or postcard's; `None` for a format the registry does not
+/// hold.
+pub fn proof_bytes(proof: &WrapProof) -> Option<Vec<u8>> {
+    match lookup(proof.format_version)?.bytes {
+        ProofBytes::FixedLayout => Some(vos_pvm_final_verifier::masked::encode(proof)),
+        ProofBytes::Postcard => postcard::to_allocvec(proof).ok(),
     }
 }
 

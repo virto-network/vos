@@ -1,14 +1,22 @@
-//! The golden wrap (`pvm/proof/fixtures`, the `valid` case): its proof's
-//! bytes, the 24 public words it verifies against, and the oracle for a
-//! proof a target finds accepted.
+//! The golden wraps: format 28's (`pvm/proof/fixtures`, the `valid` case)
+//! and format 39's (the one-segment run's masked wrap, which
+//! `vos-pvm-recair`'s masked wrap tests write under the workspace's
+//! `target/tmp/wrap/one-segment-39.{proof,words}`): each its proof's bytes,
+//! the 24 public words it verifies against, and the oracle for a proof a
+//! target finds accepted. Each target uses what it reads of it.
+
+#![allow(dead_code)]
 
 use std::sync::OnceLock;
 
 use vos_pvm_final_verifier::PUBLIC_WORDS;
 
 pub struct Golden {
-    /// Its canonical encoding: postcard's, minimal varints. The mutation
-    /// target's starting point, and what an accepted proof re-encodes to.
+    /// Its format.
+    pub format: u32,
+    /// Its canonical encoding: postcard's, minimal varints, for 28; the
+    /// fixed layout, its one encoding, for 39. The mutation target's
+    /// starting point, and what an accepted proof re-encodes to.
     pub proof: Vec<u8>,
     pub words: [u32; PUBLIC_WORDS],
 }
@@ -24,11 +32,49 @@ impl Golden {
     /// of the golden words would be a part of the proof the transcript does
     /// not bind, which no mutation should find.
     pub fn assert_is_golden(&self, proof: &vos_pvm_final_verifier::WrapProof) {
-        let bytes = postcard::to_allocvec(proof).expect("encodes");
         assert!(
-            bytes == self.proof,
+            self.encode(proof) == self.proof,
             "an accepted proof that is not the golden one"
         );
+    }
+
+    /// `proof` in the golden's format's encoding.
+    pub fn encode(&self, proof: &vos_pvm_final_verifier::WrapProof) -> Vec<u8> {
+        match self.format {
+            vos_pvm_final_verifier::masked::FORMAT => vos_pvm_final_verifier::masked::encode(proof),
+            _ => postcard::to_allocvec(proof).expect("encodes"),
+        }
+    }
+
+    /// The proof in `bytes` under the golden's format.
+    pub fn decode(
+        &self,
+        bytes: &[u8],
+    ) -> Result<vos_pvm_final_verifier::WrapProof, vos_pvm_final_verifier::Error> {
+        vos_pvm_final_verifier::decode(self.format, vos_pvm_final_verifier::LINKED, bytes)
+            .map(|decoded| decoded.proof().clone())
+    }
+
+    /// Verifies `proof` under the golden's format against its words.
+    pub fn verify(&self, proof: vos_pvm_final_verifier::WrapProof) -> bool {
+        match self.format {
+            vos_pvm_final_verifier::masked::FORMAT => {
+                vos_pvm_final_verifier::masked::verify(proof, &self.words).is_ok()
+            }
+            _ => vos_pvm_final_verifier::unmasked::verify(proof, &self.words).is_ok(),
+        }
+    }
+
+    /// Verifies `bytes` under the golden's format against its words, the
+    /// format the statement's, as a venue dispatches.
+    pub fn verify_bytes(&self, bytes: &[u8]) -> bool {
+        vos_pvm_final_verifier::verify(
+            self.format,
+            vos_pvm_final_verifier::LINKED,
+            bytes,
+            &self.words,
+        )
+        .is_ok()
     }
 }
 
@@ -45,17 +91,61 @@ pub fn golden() -> &'static Golden {
             io_hash: valid.input.statement.io_hash(),
         }
         .words();
-        vos_pvm_final_verifier::verify_bytes(&valid.proof, &words)
+        vos_pvm_final_verifier::unmasked::verify_bytes(&valid.proof, &words)
             .expect("the golden wrap verifies");
-        let decoded = vos_pvm_final_verifier::decode(&valid.proof).expect("decodes");
+        let decoded = vos_pvm_final_verifier::unmasked::decode(&valid.proof).expect("decodes");
         assert_eq!(
             postcard::to_allocvec(&decoded).expect("encodes"),
             valid.proof,
             "the golden wrap's encoding is postcard's own"
         );
         Golden {
+            format: vos_pvm_final_verifier::unmasked::FORMAT,
             proof: valid.proof,
             words,
         }
     })
+}
+
+/// The format-39 golden: the one-segment run's masked wrap, as
+/// `vos-pvm-recair`'s masked wrap tests write it (`cargo test -p
+/// vos-pvm-recair --test recursion masked` first).
+pub fn golden_39() -> &'static Golden {
+    static GOLDEN: OnceLock<Golden> = OnceLock::new();
+    GOLDEN.get_or_init(|| {
+        let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../target/tmp/wrap");
+        let read = |extension: &str| {
+            let path = directory.join(format!("one-segment-39.{extension}"));
+            std::fs::read(&path).unwrap_or_else(|error| {
+                panic!(
+                    "{} ({error}): run `cargo test -p vos-pvm-recair --test recursion masked` first",
+                    path.display()
+                )
+            })
+        };
+        let proof = read("proof");
+        let bytes = read("words");
+        let words: [u32; PUBLIC_WORDS] = core::array::from_fn(|i| {
+            u32::from_le_bytes(bytes[4 * i..4 * i + 4].try_into().expect("a word"))
+        });
+        vos_pvm_final_verifier::masked::verify_bytes(&proof, &words)
+            .expect("the golden masked wrap verifies");
+        let decoded = vos_pvm_final_verifier::masked::decode(&proof).expect("decodes");
+        assert_eq!(
+            vos_pvm_final_verifier::masked::encode(&decoded),
+            proof,
+            "the fixed layout is the one encoding"
+        );
+        Golden {
+            format: vos_pvm_final_verifier::masked::FORMAT,
+            proof,
+            words,
+        }
+    })
+}
+
+/// Both goldens.
+pub fn goldens() -> [&'static Golden; 2] {
+    [golden(), golden_39()]
 }

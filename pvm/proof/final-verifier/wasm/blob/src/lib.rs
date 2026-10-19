@@ -3,9 +3,10 @@
 //!
 //! Exports, called the way a runtime API is (the host allocates the input
 //! with the runtime's allocator and passes `(ptr, len)`):
-//! - `verify(ptr, len) -> u32`, the input the 24 public words (each a
-//!   little-endian `u32`), then the wrap proof (postcard): 1 accept, 0
-//!   refuse, 2 undecodable, 3 a short input;
+//! - `verify(ptr, len) -> u32`, the input the proof's format (a
+//!   little-endian `u32`, one the blob links), the 24 public words (each a
+//!   little-endian `u32`), then the wrap proof in its format's encoding: 1
+//!   accept, 0 refuse, 2 undecodable, 3 a short input;
 //! - `decode(ptr, len) -> u32`: the decode alone, 1 if it decodes;
 //! - `judge(ptr, len) -> u32`, the input a judgement's
 //!   (`vos_statement::model::judge_bytes`): its code, 0 accepted; the
@@ -83,23 +84,28 @@ fn input<'a>(ptr: u32, len: u32) -> &'a [u8] {
     unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) }
 }
 
-/// The input's words and its proof's bytes.
-fn split(bytes: &[u8]) -> Option<([u32; PUBLIC_WORDS], &[u8])> {
+/// The input's format, its words and its proof's bytes.
+fn split(bytes: &[u8]) -> Option<(u32, [u32; PUBLIC_WORDS], &[u8])> {
+    let (format, bytes) = bytes.split_first_chunk::<4>()?;
     let (words, proof) = bytes.split_at_checked(4 * PUBLIC_WORDS)?;
     let words =
         core::array::from_fn(|i| u32::from_le_bytes(words[4 * i..4 * i + 4].try_into().unwrap()));
-    Some((words, proof))
+    Some((u32::from_le_bytes(*format), words, proof))
+}
+
+fn decoded(format: u32, proof: &[u8]) -> Option<vos_pvm_final_verifier::Decoded> {
+    vos_pvm_final_verifier::decode(format, vos_pvm_final_verifier::LINKED, proof).ok()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn verify(ptr: u32, len: u32) -> u32 {
-    let Some((words, proof)) = split(input(ptr, len)) else {
+    let Some((format, words, proof)) = split(input(ptr, len)) else {
         return 3;
     };
-    let Ok(proof) = vos_pvm_final_verifier::decode(proof) else {
+    let Some(proof) = decoded(format, proof) else {
         return 2;
     };
-    match vos_pvm_final_verifier::verify(proof, &words) {
+    match proof.verify(&words) {
         Ok(_) => 1,
         Err(_) => 0,
     }
@@ -107,8 +113,7 @@ pub extern "C" fn verify(ptr: u32, len: u32) -> u32 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn decode(ptr: u32, len: u32) -> u32 {
-    split(input(ptr, len)).is_some_and(|(_, proof)| vos_pvm_final_verifier::decode(proof).is_ok())
-        as u32
+    split(input(ptr, len)).is_some_and(|(format, _, proof)| decoded(format, proof).is_some()) as u32
 }
 
 /// The last accepted statement's id.

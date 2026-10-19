@@ -111,7 +111,11 @@ fn a_proof_too_long_is_refused_before_its_lookup() {
         io_hash: valid.input.statement.io_hash(),
     }
     .words();
-    let (_, report) = jam::run(&program, &jam::words_request(&words), &long);
+    let (_, report) = jam::run(
+        &program,
+        &jam::words_request(vos_statement::FORMAT, &words),
+        &long,
+    );
     assert_eq!(report.verdict, jam::UNDECODABLE, "{}", report.error);
     assert_eq!(report.gas[1], 0, "no lookup");
 }

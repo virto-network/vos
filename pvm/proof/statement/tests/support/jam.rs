@@ -58,9 +58,10 @@ pub fn program() -> (Vec<u8>, usize) {
     (program, elf.len())
 }
 
-/// A request to verify a proof against `words`.
-pub fn words_request(words: &[u32; PUBLIC_WORDS]) -> Vec<u8> {
+/// A request to verify a proof of `format` against `words`.
+pub fn words_request(format: u32, words: &[u32; PUBLIC_WORDS]) -> Vec<u8> {
     let mut request = vec![0];
+    request.extend(format.to_le_bytes());
     request.extend(words.iter().flat_map(|word| word.to_le_bytes()));
     request
 }

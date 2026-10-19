@@ -56,7 +56,8 @@ fuzz_target!(|data: &[u8]| {
     assert!(!input.policy.seen(&id));
 
     let golden = golden::golden();
-    let proof = vos_statement::vos_pvm_final_verifier::decode(&data[used..]).expect("decodes");
+    let proof =
+        vos_statement::vos_pvm_final_verifier::unmasked::decode(&data[used..]).expect("decodes");
     golden.assert_is_golden(&proof);
     let words = vos_statement::vos_pvm_final_verifier::Statement {
         program: statement.program.0,

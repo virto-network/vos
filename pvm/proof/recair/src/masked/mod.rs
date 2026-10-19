@@ -65,6 +65,7 @@ use stwo::prover::{
     ProvingError, Trace,
 };
 use stwo_constraint_framework::Relation;
+use vos_pvm_final_verifier::masked::{MaskedFormat, shape_of};
 use vos_pvm_proof::format::{Format, MASKED_WRAP, Masking};
 use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair_air::masked::{
@@ -96,6 +97,32 @@ pub const MASKED_WRAP_PINS: MaskPins = match &MASKED_WRAP.masking {
     Some(masking) => mask_pins(masking),
     None => panic!("format 39 pins its masking"),
 };
+
+/// A masked registry entry as its verifier pins it
+/// (`vos_pvm_final_verifier::masked::MaskedFormat`): its number, its
+/// configuration and interaction PoW, its masking, `log_sizes`, and the
+/// trees' widths and DEEP values of the component set laid out as `layout`
+/// at them. `None` for an unmasked format or a set whose masks do not fit
+/// its trees.
+pub fn verifier_format<'a>(
+    format: &Format,
+    log_sizes: &'a [u32],
+    layout: &impl MaskedComponents,
+) -> Option<MaskedFormat<'a>> {
+    let masking = format.masking?;
+    let pins = mask_pins(&masking);
+    let (tree_widths, deep_values) = shape_of(layout, &pins)?;
+    Some(MaskedFormat {
+        number: format.number,
+        config: format.pcs_config(),
+        interaction_pow_bits: format.interaction_pow_bits(),
+        pins,
+        log_mask_rows: masking.log_mask_rows,
+        log_sizes,
+        tree_widths,
+        deep_values,
+    })
+}
 
 /// A component set's provers: what the masked prover evaluates the
 /// composition with, beside [`MaskedComponents`]' verifier-side view.

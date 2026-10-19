@@ -86,10 +86,8 @@ vos-tree = { workspace = true }
 # verified on the recursion AIR; and the window's wrap, verified by the
 # final verifier.
 vos-pvm-recair = { workspace = true }
-vos-pvm-final-verifier = { workspace = true }
-# The masked wrap's component set, which the tests' masked verifier lays
-# out.
-vos-pvm-recair-air = { workspace = true }
+# Format 28's verifier beside format 39's: the fixtures' wraps are 28.
+vos-pvm-final-verifier = { workspace = true, features = ["test-formats"] }
 # The golden statements: their types, the venue's check, the fixtures'
 # encoding, and the venue's JAM refine program on the JAM-only host.
 vos-statement = { workspace = true, features = ["fixtures"] }

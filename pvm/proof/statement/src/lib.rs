@@ -37,8 +37,8 @@
 //!
 //! **Keys.** A venue remembers what it accepted by the statement's id
 //! ([`Statement::id`]), never by the proof's bytes or their hash: a proof has
-//! many encodings (`vos_pvm_final_verifier::decode`), and many proofs state one
-//! statement.
+//! many encodings under format 28 (`vos_pvm_final_verifier::unmasked::decode`),
+//! and many proofs state one statement.
 //!
 //! **The id does not hash the format.** The format is a checked field, as
 //! the space is, but which final proof states a run is not part of what it
@@ -82,8 +82,9 @@ pub const IO_DOMAIN: &[u8] = b"vos/io/v1";
 /// The statement id's domain.
 pub const ID_DOMAIN: &[u8] = b"vos/statement/v1";
 
-/// The format of the final proofs [`judge`] reads.
-pub const FORMAT: u32 = vos_pvm_final_verifier::FORMAT;
+/// The format of the final proofs [`judge`] reads: format 28, the unmasked
+/// wrap, which the verifier links under its `test-formats` feature.
+pub const FORMAT: u32 = vos_pvm_final_verifier::unmasked::FORMAT;
 
 /// A kernel's program id: eight M31 words, each below `p`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -303,7 +304,8 @@ impl Admitted {
     /// The final proof in `proof`'s bytes, verified against the admitted
     /// words; the statement's id when accepted.
     pub fn verify(&self, proof: &[u8]) -> Result<StatementId, Refusal> {
-        vos_pvm_final_verifier::verify_bytes(proof, &self.words).map_err(Refusal::Proof)?;
+        vos_pvm_final_verifier::verify(FORMAT, &[FORMAT], proof, &self.words)
+            .map_err(Refusal::Proof)?;
         Ok(self.id)
     }
 }

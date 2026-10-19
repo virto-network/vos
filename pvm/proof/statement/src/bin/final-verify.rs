@@ -6,8 +6,9 @@
 //! Input, as a JAM work item gives it:
 //! - work item 0's payload (`fetch`, kind 13), at most 16 KiB: a mode byte,
 //!   then
-//!   - 0: the 24 public words (each a little-endian `u32`), which the proof
-//!     is verified against;
+//!   - 0: the proof's format (a little-endian `u32`, one this build links:
+//!     `vos_pvm_final_verifier::LINKED`) and the 24 public words (each a
+//!     little-endian `u32`), which the proof is verified against;
 //!   - 1: a judgement's input (`vos_statement::model::Input`): the program
 //!     id the venue pinned, its state and the statement. The pin and the
 //!     state come in the payload only for the test harness; a real service
@@ -18,7 +19,7 @@
 //!   - 2: a golden vector of `vos-anchor` (`vos_anchor::vectors::Vector`'s
 //!     encoding), and nothing after it: its digests are computed, and no
 //!     proof is read;
-//! - the proof, postcard, as a preimage of the running service, read by
+//! - the proof, in its format's encoding, as a preimage of the running service, read by
 //!   `historical_lookup`: only once a judgement's checks before the proof
 //!   pass, and only when its length is at most
 //!   `vos_pvm_final_verifier::MAX_PROOF_BYTES`, refused before any allocation
@@ -445,14 +446,14 @@ extern "C" fn verify_main() -> Output {
 
 /// What the payload asks.
 enum Request {
-    Words([u32; PUBLIC_WORDS]),
+    Words(u32, [u32; PUBLIC_WORDS]),
     Judge(Input),
 }
 
-/// What the proof is checked against: the words alone, or a judgement's
-/// statement its checks before the proof admitted.
+/// What the proof is checked against: the words alone under a format, or a
+/// judgement's statement its checks before the proof admitted.
 enum Check {
-    Words([u32; PUBLIC_WORDS]),
+    Words(u32, [u32; PUBLIC_WORDS]),
     Judge(Admitted),
 }
 
@@ -461,11 +462,12 @@ fn request(payload: &[u8]) -> Option<(Request, [u8; 32], usize)> {
     let (&mode, body) = payload.split_first()?;
     let (request, rest) = match mode {
         WORDS => {
+            let (format, body) = body.split_first_chunk::<4>()?;
             let (words, rest) = body.split_at_checked(4 * PUBLIC_WORDS)?;
             let words = core::array::from_fn(|i| {
                 u32::from_le_bytes(words[4 * i..4 * i + 4].try_into().unwrap())
             });
-            (Request::Words(words), rest)
+            (Request::Words(u32::from_le_bytes(*format), words), rest)
         }
         JUDGE => {
             let (input, used) = Input::decode_prefix(body).ok()?;
@@ -512,7 +514,7 @@ fn verify(report: &mut Report) -> u64 {
     };
     report.proof_len = proof_len as u64;
     let check = match request {
-        Request::Words(words) => Check::Words(words),
+        Request::Words(format, words) => Check::Words(format, words),
         Request::Judge(input) => match input.admit() {
             Ok(admitted) => Check::Judge(admitted),
             Err(refusal) => return report.judged(Err(refusal)),
@@ -521,7 +523,7 @@ fn verify(report: &mut Report) -> u64 {
     if proof_len > vos_pvm_final_verifier::MAX_PROOF_BYTES {
         let error = vos_pvm_final_verifier::Error::Length;
         return match check {
-            Check::Words(_) => {
+            Check::Words(..) => {
                 report.refuse(&error);
                 UNDECODABLE
             }
@@ -549,13 +551,22 @@ fn verify(report: &mut Report) -> u64 {
     report.gas_after_lookup = gas_left();
 
     match check {
-        Check::Words(words) => {
-            let Ok(proof) = vos_pvm_final_verifier::decode(&bytes) else {
-                return UNDECODABLE;
+        Check::Words(format, words) => {
+            let decoded = match vos_pvm_final_verifier::decode(
+                format,
+                vos_pvm_final_verifier::LINKED,
+                &bytes,
+            ) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    report.gas_after_decode = gas_left();
+                    report.refuse(&error);
+                    return UNDECODABLE;
+                }
             };
             drop(bytes);
             report.gas_after_decode = gas_left();
-            match vos_pvm_final_verifier::verify(proof, &words) {
+            match decoded.verify(&words) {
                 Ok(_) => ACCEPT,
                 Err(error) => report.refuse(&error),
             }

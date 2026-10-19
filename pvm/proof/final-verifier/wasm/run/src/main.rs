@@ -2,9 +2,10 @@
 //! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> <runs> <name.proof>...
 //! ```
 //!
-//! Each `<name>.proof` (a wrap proof, postcard) beside its `<name>.words`
-//! (the 24 public words, little-endian `u32`s), as the window kernel's wrap
-//! test writes them. Runs the final verifier's blob as sc-executor-wasmtime
+//! Each `<name>.proof` (a wrap proof, in its format's encoding) beside its
+//! `<name>.format` (the format, a little-endian `u32`) and `<name>.words`
+//! (the 24 public words, little-endian `u32`s), as the wrap tests write
+//! them. Runs the final verifier's blob as sc-executor-wasmtime
 //! runs a runtime call (`substrate/client/executor/wasmtime/src/runtime.rs`
 //! at polkadot-sdk stable2603):
 //! - wasmtime 35.0.0, Cranelift `SpeedAndSize`, every post-MVP extension off;
@@ -386,7 +387,8 @@ fn run(args: &[String]) -> Result<()> {
     let runs: usize = runs.parse()?;
     for path in proofs {
         let proof = std::fs::read(path)?;
-        let mut input = std::fs::read(path.replace(".proof", ".words"))?;
+        let mut input = std::fs::read(path.replace(".proof", ".format"))?;
+        input.extend(std::fs::read(path.replace(".proof", ".words"))?);
         input.extend_from_slice(&proof);
         let (mut instantiation, mut verify, mut decode) = (Vec::new(), Vec::new(), Vec::new());
         let mut allocations = 0;

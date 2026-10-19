@@ -11,5 +11,6 @@ mod fold;
 mod leaf;
 mod leaf_rows;
 mod leaves;
+mod masked;
 mod verifier;
 mod wrap;

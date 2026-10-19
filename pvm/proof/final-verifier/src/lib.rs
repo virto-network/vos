@@ -1,35 +1,38 @@
-//! The final wrap's verifier (`recursion-air.md` §8, `proving.md` §3.5–3.6).
+//! The final wrap's verifier (`recursion-air.md` §8, `proving.md` §3.5–3.6,
+//! `slice-6-on-chain.md` pins A and B).
 //!
-//! A wrap proof is format 28: the recursion AIR's three components at the
-//! wrap circuit's log sizes, proved on the Blake2b-256 channel and Merkle
-//! trees with blowup 64, 20 queries, PoW 26, interaction PoW 8, FRI fold
-//! step 3, a 2^6 last layer and affine DEEP batching. The wrap circuit is
-//! pinned by its preprocessed tree's root ([`PREPROCESSED_ROOT`]) and its log
-//! sizes ([`LOG_SIZES`]); its 24 public words, the program id (8) and the
-//! io-hash's 16 limbs, sit at its addresses 0–23, one word a wire, with zero,
-//! one and `u` after them ([`LAYOUT`]).
+//! A wrap proof states the recursion AIR's three components at the wrap
+//! circuit's log sizes ([`LOG_SIZES`]), proved on the Blake2b-256 channel
+//! and Merkle trees. Its 24 public words, the program id (8) and the
+//! io-hash's 16 limbs, sit at the circuit's addresses 0–23, one word a wire,
+//! with zero, one and `u` after them ([`LAYOUT`]). The claimed sums, `u`'s
+//! public use and each public word's add to zero: that is what binds the
+//! words to the circuit's wires (`vos_pvm_recair_air::gate`).
 //!
-//! **The transcript** is the recursion AIR's (`vos_pvm_recair_air::transcript`),
-//! its public values the 24 words, each the QM31 `(w, 0, 0, 0)`.
+//! **Two formats** (`vos_pvm_proof::format`):
+//! - **39** ([`masked`]), the masked wrap: what production venues accept,
+//!   and the only one a build links by default. Its bytes are a fixed
+//!   layout ([`masked::decode`]): one encoding a proof;
+//! - **28** ([`unmasked`], under the `test-formats` feature), the unmasked
+//!   wrap: the tests' and the fixtures', never a production venue's. Its
+//!   bytes are postcard's.
 //!
-//! The claimed sums, `u`'s public use and each public word's add to zero:
-//! that is what binds the words to the circuit's wires (`vos_pvm_recair_air::gate`).
+//! **Dispatch is by the statement's format** ([`verify`], [`decode`]): a
+//! venue passes the format its statement names and the set it accepts; a
+//! format outside the set, or one this build does not link ([`LINKED`]), is
+//! refused, and that format's decode checks the proof's own header against
+//! it. The format is never read from the proof's bytes, whose encodings
+//! differ.
 //!
-//! **The proof's shape is checked before any Stwo call** (`check_shape`):
-//! the trees' count, every column's sample count, and every M31 limb
-//! canonical. Stwo's verifier refuses a malformed FRI proof, Merkle witness
-//! or queried-value shape with an error, but it indexes the sampled values by
-//! the components' masks, zips the trees' decommitments and queried values
-//! with its own trees, and takes the composition tree as the last
-//! commitment: each a panic on a proof whose shape is other than the AIR's.
-//! Every tree is nonempty, so the Merkle verifier checks each tree's queried
-//! values before the DEEP answers read them.
+//! **Every proof's shape is checked before any Stwo call**: Stwo's verifier
+//! refuses a malformed FRI proof, Merkle witness or queried-value shape with
+//! an error, but it indexes the sampled values by the components' masks,
+//! zips the trees' decommitments and queried values with its own trees, and
+//! takes the composition tree as the last commitment: each a panic on a
+//! proof whose shape is other than the AIR's.
 //!
-//! **The bytes** ([`decode`]) are one postcard encoding of a [`WrapProof`],
-//! at most [`MAX_PROOF_BYTES`] long and with nothing after it. Postcard does
-//! not require its varints minimal, so one proof has many encodings: a
-//! proof's bytes, or their hash, are no key for it. A venue keys what it has
-//! accepted on the statement's id (`vos-statement`), never on the proof.
+//! A venue keys what it has accepted on the statement's id (`vos-statement`),
+//! never on the proof.
 //!
 //! The crate is `no_std`, uses no nightly feature, and builds on stable for
 //! x86 and wasm32 and on the pinned nightly for the PVM.
@@ -39,31 +42,26 @@
 extern crate alloc;
 
 mod constants;
+mod layout;
+pub mod masked;
+#[cfg(feature = "test-formats")]
+pub mod unmasked;
 
-use alloc::vec::Vec;
-
-use num_traits::Zero;
 use serde::{Deserialize, Serialize};
-use stwo::core::air::Component;
-use stwo::core::channel::{Blake2bChannel, Channel};
-use stwo::core::circle::CirclePoint;
+use stwo::core::channel::Channel;
 use stwo::core::fields::m31::{BaseField, P};
-use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
-use stwo::core::fri::FriConfig;
-use stwo::core::pcs::{CommitmentSchemeVerifier, DeepBatching, PcsConfig};
+use stwo::core::fields::qm31::SecureField;
+use stwo::core::pcs::PcsConfig;
 use stwo::core::proof::StarkProof;
-use stwo::core::vcs::blake2b_hash::Blake2bHash;
-use stwo::core::vcs_lifted::blake2b_merkle::{Blake2bMerkleChannel, Blake2bMerkleHasher};
+use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleHasher;
 use stwo::core::verifier::VerificationError;
-use vos_pvm_recair_air::gate::{Layout, public_logup_sum};
-use vos_pvm_recair_air::transcript::{Prefix, replay_prefix};
-use vos_pvm_recair_air::{Components, LOG_CONSTRAINT_EXPANSION, LogSizes};
+use vos_pvm_recair_air::LogSizes;
+use vos_pvm_recair_air::gate::Layout;
 
-pub use constants::{LOG_SIZES, PREPROCESSED_ROOT};
+pub use constants::{
+    LOG_SIZES, MAX_PROOF_BYTES, PREPROCESSED_ROOT, PREPROCESSED_ROOT_39, TREE_WIDTHS,
+};
 pub use vos_pvm_recair_air;
-
-/// The format the wrap's proofs carry (`vos_pvm_proof::format::WRAP`).
-pub const FORMAT: u32 = 28;
 
 /// The wrap's public words: the program id's 8, then the io-hash's 16 limbs.
 pub const PUBLIC_WORDS: usize = 24;
@@ -72,32 +70,14 @@ pub const PUBLIC_WORDS: usize = 24;
 /// one and `u`.
 pub const LAYOUT: Layout = Layout::wrap(PUBLIC_WORDS as u32);
 
-/// Format 28's PCS configuration, affine DEEP batching among it.
-pub const CONFIG: PcsConfig = PcsConfig {
-    pow_bits: 26,
-    fri_config: FriConfig {
-        log_last_layer_degree_bound: 6,
-        log_blowup_factor: 6,
-        n_queries: 20,
-        fold_step: 3,
-    },
-    lifting_log_size: None,
-    deep_batching: DeepBatching::Affine,
-};
+/// The formats this build verifies: 39, and 28 under `test-formats`.
+#[cfg(not(feature = "test-formats"))]
+pub const LINKED: &[u32] = &[masked::FORMAT];
+/// The formats this build verifies: 39, and 28 under `test-formats`.
+#[cfg(feature = "test-formats")]
+pub const LINKED: &[u32] = &[unmasked::FORMAT, masked::FORMAT];
 
-/// Format 28's interaction PoW.
-pub const INTERACTION_POW_BITS: u32 = 8;
-
-/// The longest wrap proof [`decode`] reads, in bytes: a bound on a venue's
-/// decode and verify work, which a weight is charged by. A wrap proof is
-/// 122–125 KB.
-pub const MAX_PROOF_BYTES: usize = 256 << 10;
-
-/// The trees a Stwo proof commits: preprocessed, main, interaction and
-/// composition.
-const TREES: usize = 4;
-
-/// A wrap proof.
+/// A wrap proof, of either format: its encodings differ, its fields do not.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WrapProof {
     pub format_version: u32,
@@ -145,17 +125,18 @@ impl Statement {
 /// Why a wrap proof is refused.
 #[derive(Clone, Debug)]
 pub enum Error {
-    /// The bytes do not decode as exactly one wrap proof.
+    /// The bytes do not decode as exactly one proof of the format.
     Decode,
     /// The bytes are longer than [`MAX_PROOF_BYTES`].
     Length,
     /// A public word out of its range.
     PublicWords,
-    /// Another format, configuration or log sizes.
+    /// A format outside the accepted set or this build, or a proof of
+    /// another format, configuration or log sizes.
     Format,
     /// Another circuit: the preprocessed root is not the wrap's.
     Circuit,
-    /// The proof's shape is not the wrap AIR's.
+    /// The proof's shape is not the format's.
     Shape(&'static str),
     /// An M31 limb at or above `p`.
     Noncanonical,
@@ -170,10 +151,12 @@ pub enum Error {
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Decode => f.write_str("the bytes are not a wrap proof"),
+            Self::Decode => f.write_str("the bytes are not a wrap proof of the format"),
             Self::Length => f.write_str("the bytes are longer than a wrap proof"),
             Self::PublicWords => f.write_str("a public word is out of its range"),
-            Self::Format => f.write_str("the proof is not of format 28 at the wrap's log sizes"),
+            Self::Format => f.write_str(
+                "the format is not accepted, or the proof is not of it at the wrap's log sizes",
+            ),
             Self::Circuit => f.write_str("the proof is of another circuit"),
             Self::Shape(what) => write!(f, "the proof's shape: {what}"),
             Self::Noncanonical => f.write_str("the proof has a noncanonical M31 limb"),
@@ -213,73 +196,62 @@ impl Error {
     }
 }
 
-/// The wrap proof in `bytes`: at most [`MAX_PROOF_BYTES`], one postcard
-/// encoding and nothing after it.
-pub fn decode(bytes: &[u8]) -> Result<WrapProof, Error> {
-    if bytes.len() > MAX_PROOF_BYTES {
-        return Err(Error::Length);
-    }
-    match postcard::take_from_bytes(bytes) {
-        Ok((proof, [])) => Ok(proof),
-        _ => Err(Error::Decode),
-    }
+/// A wrap proof decoded under the format a statement names.
+#[derive(Clone, Debug)]
+pub struct Decoded {
+    format: u32,
+    proof: WrapProof,
 }
 
-/// Verifies the wrap proof in `bytes` ([`decode`]) against the public
-/// `words`, and returns the statement they make.
-pub fn verify_bytes(bytes: &[u8], words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
-    verify(decode(bytes)?, words)
-}
-
-/// Verifies `proof` against the public `words`, and returns the statement
-/// they make: the program id and the io-hash.
-pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
-    let statement = Statement::from_words(words)?;
-    check_header(&proof)?;
-    check_shape(&proof.stark_proof)?;
-    if !proof.claimed_sums.iter().all(secure_is_canonical) {
-        return Err(Error::Noncanonical);
-    }
-    let stark = &proof.stark_proof;
-    if stark.commitments[0] != Blake2bHash(PREPROCESSED_ROOT) {
-        return Err(Error::Circuit);
+impl Decoded {
+    /// The format it was decoded under.
+    pub fn format(&self) -> u32 {
+        self.format
     }
 
-    let log_sizes = vos_pvm_recair_air::committed_log_sizes(&LOG_SIZES);
-    let channel = &mut Blake2bChannel::default();
-    mix_header(channel);
-    let scheme = &mut CommitmentSchemeVerifier::<Blake2bMerkleChannel>::new(CONFIG);
-    let public: Vec<SecureField> = words.iter().map(|&word| embed(word)).collect();
-    let prefix = Prefix {
-        roots: [
-            stark.commitments[0],
-            stark.commitments[1],
-            stark.commitments[2],
-        ],
-        log_sizes: &log_sizes,
-        public: &public,
-        claimed_sums: &proof.claimed_sums,
-    };
-    let relation = replay_prefix(channel, scheme, prefix, |channel| {
-        if !channel.verify_pow_nonce(INTERACTION_POW_BITS, proof.interaction_pow) {
-            return Err(Error::InteractionPow);
+    pub fn proof(&self) -> &WrapProof {
+        &self.proof
+    }
+
+    /// Verifies the proof under its format against the public `words`, and
+    /// returns the statement they make.
+    pub fn verify(self, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
+        match self.format {
+            masked::FORMAT => masked::verify(self.proof, words),
+            #[cfg(feature = "test-formats")]
+            unmasked::FORMAT => unmasked::verify(self.proof, words),
+            _ => Err(Error::Format),
         }
-        channel.mix_u64(proof.interaction_pow);
-        Ok(())
-    })?;
-
-    let total = proof.claimed_sums.iter().copied().sum::<SecureField>()
-        + public_logup_sum(&relation, LAYOUT.public_terms(public));
-    if !total.is_zero() {
-        return Err(Error::Logup);
     }
+}
 
-    let components = Components::new(&relation, &LOG_SIZES, &proof.claimed_sums);
-    let dyns = components.as_dyn();
-    check_samples(&dyns, log_sizes[0].len(), stark)?;
-    stwo::core::verifier::verify(&dyns, channel, scheme, proof.stark_proof)
-        .map_err(Error::Stark)?;
-    Ok(statement)
+/// The proof in `bytes` under `format`, the statement's: refused unless
+/// `format` is in `accepted` and linked in this build ([`LINKED`]); then
+/// that format's own decode, at most [`MAX_PROOF_BYTES`], which checks the
+/// proof's header against it.
+pub fn decode(format: u32, accepted: &[u32], bytes: &[u8]) -> Result<Decoded, Error> {
+    if !accepted.contains(&format) {
+        return Err(Error::Format);
+    }
+    let proof = match format {
+        masked::FORMAT => masked::decode(bytes)?,
+        #[cfg(feature = "test-formats")]
+        unmasked::FORMAT => unmasked::decode(bytes)?,
+        _ => return Err(Error::Format),
+    };
+    Ok(Decoded { format, proof })
+}
+
+/// Verifies the proof in `bytes` under `format`, the statement's, against
+/// the public `words` ([`decode`], then [`Decoded::verify`]), and returns
+/// the statement they make.
+pub fn verify(
+    format: u32,
+    accepted: &[u32],
+    bytes: &[u8],
+    words: &[u32; PUBLIC_WORDS],
+) -> Result<Statement, Error> {
+    decode(format, accepted, bytes)?.verify(words)
 }
 
 /// The QM31 `(w, 0, 0, 0)`.
@@ -287,40 +259,31 @@ fn embed(word: u32) -> SecureField {
     SecureField::from(BaseField::from_u32_unchecked(word))
 }
 
-/// The format, the configuration and the log sizes: the wrap's. A proof's
-/// configuration does not carry its DEEP batching, so its batching is not
-/// compared.
-fn check_header(proof: &WrapProof) -> Result<(), Error> {
-    let config = PcsConfig {
-        deep_batching: CONFIG.deep_batching,
-        ..proof.stark_proof.config
-    };
-    if proof.format_version != FORMAT || config != CONFIG || proof.log_sizes != LOG_SIZES {
-        return Err(Error::Format);
-    }
-    Ok(())
-}
-
 /// A.1's first item: the domain, the format and the PCS configuration, then
 /// each component's log size (`vos_pvm_proof::proof::mix_statement_header`).
-fn mix_header(channel: &mut impl Channel) {
-    let fri = CONFIG.fri_config;
+pub fn mix_header(channel: &mut impl Channel, format: u32, config: &PcsConfig, log_sizes: &[u32]) {
+    let fri = config.fri_config;
     for word in [
         u64::from_le_bytes(*b"VOS/PVM/"),
         u64::from_le_bytes(*b"STARK/FS"),
-        u64::from(FORMAT),
-        u64::from(CONFIG.pow_bits),
+        u64::from(format),
+        u64::from(config.pow_bits),
         fri.n_queries as u64,
         u64::from(fri.log_blowup_factor),
         u64::from(fri.log_last_layer_degree_bound),
         u64::from(fri.fold_step),
-        // No lifting log size.
-        0,
-    ]
-    .into_iter()
-    .chain(LOG_SIZES.map(u64::from))
-    {
+    ] {
         channel.mix_u64(word);
+    }
+    match config.lifting_log_size {
+        None => channel.mix_u64(0),
+        Some(lifting) => {
+            channel.mix_u64(1);
+            channel.mix_u64(u64::from(lifting));
+        }
+    }
+    for &log_size in log_sizes {
+        channel.mix_u64(u64::from(log_size));
     }
 }
 
@@ -332,25 +295,13 @@ fn secure_is_canonical(value: &SecureField) -> bool {
     value.to_m31_array().iter().all(base_is_canonical)
 }
 
-/// The shape every proof of the wrap AIR has, whatever its challenges: four
-/// trees of commitments, sampled values, decommitments and queried values,
-/// and every M31 limb canonical. The sampled values' columns are checked
-/// against the components' masks by `check_samples`.
-fn check_shape(stark: &StarkProof<Blake2bMerkleHasher>) -> Result<(), Error> {
-    if stark.commitments.len() != TREES {
-        return Err(Error::Shape("four commitments"));
-    }
-    if stark.sampled_values.len() != TREES {
-        return Err(Error::Shape("four trees of sampled values"));
-    }
-    if stark.decommitments.len() != TREES {
-        return Err(Error::Shape("four decommitments"));
-    }
-    if stark.queried_values.len() != TREES {
-        return Err(Error::Shape("four trees of queried values"));
-    }
+/// Every M31 limb of a proof canonical: its sampled and queried values, its
+/// FRI witnesses and last layer.
+fn stark_is_canonical(
+    stark: &StarkProof<impl stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted>,
+) -> bool {
     let fri = &stark.fri_proof;
-    let canonical = stark
+    stark
         .sampled_values
         .iter()
         .flatten()
@@ -365,66 +316,12 @@ fn check_shape(stark: &StarkProof<Blake2bMerkleHasher>) -> Result<(), Error> {
         && core::iter::once(&fri.first_layer)
             .chain(&fri.inner_layers)
             .all(|layer| layer.fri_witness.iter().all(secure_is_canonical))
-        && fri.last_layer_poly.iter().all(secure_is_canonical);
-    if !canonical {
-        return Err(Error::Noncanonical);
-    }
-    Ok(())
-}
-
-/// Every column's sampled values, one a mask point: the components' masks
-/// for the three traces (a preprocessed column one, at the OODS point), and
-/// one for each of the composition polynomial's columns.
-fn check_samples(
-    components: &[&dyn Component],
-    n_preprocessed: usize,
-    stark: &StarkProof<Blake2bMerkleHasher>,
-) -> Result<(), Error> {
-    let air = stwo::core::air::Components {
-        components: components.to_vec(),
-        n_preprocessed_columns: n_preprocessed,
-    };
-    let max_log_degree_bound = LOG_SIZES.iter().max().copied().unwrap_or(0)
-        + LOG_CONSTRAINT_EXPANSION
-        - stwo::core::verifier::COMPOSITION_LOG_SPLIT;
-    let mut masks = air.mask_points(CirclePoint::zero(), max_log_degree_bound, false);
-    masks.push(alloc::vec![alloc::vec![CirclePoint::zero()]; 2 * SECURE_EXTENSION_DEGREE]);
-    let matches = masks.len() == stark.sampled_values.len()
-        && masks
-            .iter()
-            .zip(stark.sampled_values.iter())
-            .all(|(tree, values)| {
-                tree.len() == values.len()
-                    && tree
-                        .iter()
-                        .zip(values)
-                        .all(|(points, values)| points.len() == values.len())
-            });
-    if !matches {
-        return Err(Error::Shape("a column's samples are not its mask's"));
-    }
-    Ok(())
+        && fri.last_layer_poly.iter().all(secure_is_canonical)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The header is the segment transcript's, on format 28's
-    /// configuration and the wrap's log sizes; the constants are format
-    /// 28's registry entry.
-    #[test]
-    fn the_header_and_the_constants_are_format_28s() {
-        let wrap = &vos_pvm_proof::format::WRAP;
-        assert_eq!(wrap.number, FORMAT);
-        assert_eq!(wrap.pcs_config(), CONFIG);
-        assert_eq!(wrap.interaction_pow_bits(), INTERACTION_POW_BITS);
-        let mut ours = Blake2bChannel::default();
-        mix_header(&mut ours);
-        let mut theirs = Blake2bChannel::default();
-        vos_pvm_proof::proof::mix_statement_header(&mut theirs, FORMAT, &CONFIG, &LOG_SIZES);
-        assert_eq!(ours.digest(), theirs.digest());
-    }
 
     #[test]
     fn a_statements_words_round_trip() {
@@ -447,5 +344,30 @@ mod tests {
             Statement::from_words(&beyond),
             Err(Error::PublicWords)
         ));
+    }
+
+    /// Format 39's preprocessed root is format 28's (pin A): its columns at
+    /// `n + 1` under blowup 32 are format 28's at `n + 6`.
+    #[test]
+    fn the_masked_preprocessed_root_is_format_28s() {
+        assert_eq!(PREPROCESSED_ROOT_39, PREPROCESSED_ROOT);
+    }
+
+    /// A format outside the accepted set, or one this build does not link,
+    /// is refused before its bytes are read.
+    #[test]
+    fn dispatch_is_by_the_accepted_set() {
+        assert!(matches!(
+            decode(masked::FORMAT, &[], &[]),
+            Err(Error::Format)
+        ));
+        assert!(matches!(decode(40, &[40], &[]), Err(Error::Format)));
+        assert!(matches!(
+            decode(masked::FORMAT, &[masked::FORMAT], &[]),
+            Err(Error::Decode)
+        ));
+        assert!(LINKED.contains(&masked::FORMAT));
+        #[cfg(not(feature = "test-formats"))]
+        assert_eq!(LINKED, [39]);
     }
 }

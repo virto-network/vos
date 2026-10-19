@@ -8,8 +8,10 @@ description = "The recursion AIR's prover: circuits built by a Context, their wi
 [dependencies]
 vos-pvm-recair-air = { workspace = true }
 # The wrap's proof, its public words and its layout, which the prover
-# produces and the final verifier reads.
+# produces and the final verifier reads; format 39's fixed layout.
 vos-pvm-final-verifier = { workspace = true }
+# Format 28's bytes.
+postcard = { version = "1", features = ["alloc"] }
 vos-pvm-poseidon2 = { workspace = true }
 # The Poseidon2-M31 channel and its SIMD backend, the format registry, the
 # transcript's header and the security accounting.
@@ -40,9 +42,8 @@ seeded-masks = []
 # The masked prover's tests reproduce a proof byte for byte from a seed.
 vos-pvm-recair = { path = ".", features = ["seeded-masks"] }
 bincode = "1"
-# The compiler's tests: a segment proof's OODS data, from the fixture and
-# from a run proved over every chip.
-postcard = { version = "1", features = ["alloc"] }
+# Format 28's verifier, the unmasked wrap the recursion tests prove.
+vos-pvm-final-verifier = { workspace = true, features = ["test-formats"] }
 vos-pvm = { workspace = true }
 # A small kernel, laid out as the loader lays it out.
 vos-pvm-program = { workspace = true }

@@ -3,8 +3,6 @@
 
 #[path = "../common/mod.rs"]
 mod common;
-#[path = "../support/masked_verifier.rs"]
-mod masked_verifier;
 
 mod compiler;
 mod gate_vm;

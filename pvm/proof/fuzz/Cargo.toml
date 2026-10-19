@@ -20,8 +20,8 @@ vos-pvm = { path = "../../runtime" }
 vos-pvm-proof = { path = ".." }
 vos-pvm-proof-verifier = { path = "../verifier" }
 # The final verifier on the bytes a venue receives: arbitrary bytes, and the
-# golden wrap's bytes and structure mutated.
-vos-pvm-final-verifier = { path = "../final-verifier" }
+# golden wraps' bytes and structure mutated, formats 28 and 39.
+vos-pvm-final-verifier = { path = "../final-verifier", features = ["test-formats"] }
 vos-statement = { path = "../statement", features = ["fixtures"] }
 postcard = { version = "1", features = ["alloc"] }
 stwo = { git = "https://github.com/olanod/stwo", rev = "ab294189b34fac653e0a753971c69a0d39d01d16", default-features = false }

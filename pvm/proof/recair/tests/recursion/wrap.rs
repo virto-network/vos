@@ -32,7 +32,7 @@ use stwo::core::poly::line::LinePoly;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::verifier::MerkleVerificationError;
 use stwo::core::verifier::VerificationError;
-use vos_pvm_final_verifier::{Error, PUBLIC_WORDS, Statement, WrapProof};
+use vos_pvm_final_verifier::{Error, PUBLIC_WORDS, Statement, WrapProof, unmasked};
 use vos_pvm_proof::Proof;
 use vos_pvm_proof::format::{SEGMENT, WRAP};
 use vos_pvm_proof::kernel::trace_kernel;
@@ -55,10 +55,10 @@ const CUTS: [(usize, usize); 4] = [(0, 1), (1, 3), (3, 5), (5, 6)];
 const WHOLE: (usize, usize) = (0, 6);
 
 /// A run's segments under a program of their leaves' circuits.
-struct Run {
+pub(crate) struct Run {
     segments: Vec<Proof>,
     leaves: Vec<LeafCircuit>,
-    program: IdPreimage,
+    pub(crate) program: IdPreimage,
 }
 
 fn program_of(leaves: &[LeafCircuit], kernel: u32) -> IdPreimage {
@@ -133,10 +133,10 @@ impl Run {
 }
 
 /// A wrap, proved: its proof, its public words and its statement.
-struct Wrapped {
-    proof: WrapProof,
-    words: [u32; PUBLIC_WORDS],
-    statement: Statement,
+pub(crate) struct Wrapped {
+    pub(crate) proof: WrapProof,
+    pub(crate) words: [u32; PUBLIC_WORDS],
+    pub(crate) statement: Statement,
 }
 
 /// Wraps `root` under `program`, proves it and verifies it natively.
@@ -152,7 +152,7 @@ fn wrapped(root: &Node, program: &IdPreimage, name: &str) -> Wrapped {
         bytes.len()
     );
     assert_eq!(
-        vos_pvm_final_verifier::verify_bytes(&bytes, &words).expect("verifies"),
+        unmasked::verify_bytes(&bytes, &words).expect("verifies"),
         statement
     );
     Wrapped {
@@ -163,13 +163,13 @@ fn wrapped(root: &Node, program: &IdPreimage, name: &str) -> Wrapped {
 }
 
 /// The whole run as one segment, its leaf at position 0, and its wrap.
-struct OneSegment {
-    run: Run,
-    root: Node,
-    wrapped: Wrapped,
+pub(crate) struct OneSegment {
+    pub(crate) run: Run,
+    pub(crate) root: Node,
+    pub(crate) wrapped: Wrapped,
 }
 
-fn one_segment() -> &'static OneSegment {
+pub(crate) fn one_segment() -> &'static OneSegment {
     static ONE: OnceLock<OneSegment> = OnceLock::new();
     ONE.get_or_init(|| {
         let run = Run::new(&[WHOLE], 6_000);
@@ -201,7 +201,7 @@ fn refusals(values: &WrapValues<SecureField>) -> Vec<&'static str> {
 }
 
 /// The wrap's values over `root` under `program`.
-fn values_of(root: &Node, program: &IdPreimage) -> WrapValues<SecureField> {
+pub(crate) fn values_of(root: &Node, program: &IdPreimage) -> WrapValues<SecureField> {
     WrapCircuit::get()
         .values(root.proved(), program)
         .expect("the root's values")
@@ -253,12 +253,9 @@ fn the_wrap_circuit_is_pinned() {
         Blake2bHash(vos_pvm_final_verifier::PREPROCESSED_ROOT)
     );
 
-    assert_eq!(WRAP.number, vos_pvm_final_verifier::FORMAT);
-    assert_eq!(WRAP.pcs_config(), vos_pvm_final_verifier::CONFIG);
-    assert_eq!(
-        WRAP.interaction_pow_bits(),
-        vos_pvm_final_verifier::INTERACTION_POW_BITS
-    );
+    assert_eq!(WRAP.number, unmasked::FORMAT);
+    assert_eq!(WRAP.pcs_config(), unmasked::CONFIG);
+    assert_eq!(WRAP.interaction_pow_bits(), unmasked::INTERACTION_POW_BITS);
     assert_eq!(wrap.fold_word, FoldCircuit::new().hash());
 }
 
@@ -283,7 +280,7 @@ fn a_one_segment_run_wraps_through_its_leaf() {
     for word in [0, 7, 8, 23] {
         let mut words = one.wrapped.words;
         words[word] ^= 1;
-        let error = vos_pvm_final_verifier::verify(one.wrapped.proof.clone(), &words).unwrap_err();
+        let error = unmasked::verify(one.wrapped.proof.clone(), &words).unwrap_err();
         // The words are mixed before the interaction PoW, so another word
         // moves the transcript: the nonce falls short, or, past it, the
         // public terms do not balance.
@@ -345,7 +342,7 @@ fn a_root_without_its_ends_is_refused() {
     let words = wrap::public_words(&finalized);
     let refused = match wrap::prove_unmasked(&finalized) {
         Err(_) => true,
-        Ok(proof) => vos_pvm_final_verifier::verify(proof, &words).is_err(),
+        Ok(proof) => unmasked::verify(proof, &words).is_err(),
     };
     assert!(refused, "a root without its halt wraps and verifies");
 }
@@ -501,16 +498,14 @@ fn the_final_verifier_refuses_a_tampered_wrap() {
     for (name, tamper) in tampers {
         let mut proof = one.wrapped.proof.clone();
         tamper(&mut proof);
-        let error = vos_pvm_final_verifier::verify(proof, &words)
-            .expect_err(name)
-            .to_string();
+        let error = unmasked::verify(proof, &words).expect_err(name).to_string();
         eprintln!("{name}: {error}");
     }
     // The preprocessed root: another circuit.
     let mut proof = one.wrapped.proof.clone();
     flip(&mut proof.stark_proof.0.commitments[0]);
     assert!(matches!(
-        vos_pvm_final_verifier::verify(proof, &words),
+        unmasked::verify(proof, &words),
         Err(Error::Circuit)
     ));
 }
@@ -713,7 +708,7 @@ fn the_final_verifier_refuses_a_malformed_shape() {
     for (name, expect, malform) in shapes {
         let mut proof = one.wrapped.proof.clone();
         malform(&mut proof);
-        let error = vos_pvm_final_verifier::verify(proof, &words).expect_err(name);
+        let error = unmasked::verify(proof, &words).expect_err(name);
         eprintln!("{name}: {error}");
         assert!(expect(&error), "{name}: {error}");
     }
@@ -729,26 +724,26 @@ fn the_final_verifier_reads_one_bounded_encoding() {
     let words = one.wrapped.words;
     let bytes = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
     assert!(matches!(
-        vos_pvm_final_verifier::verify_bytes(&[1, 2, 3], &words),
+        unmasked::verify_bytes(&[28, 1, 2], &words),
         Err(Error::Decode)
     ));
     let mut trailing = bytes.clone();
     trailing.push(0);
     assert!(matches!(
-        vos_pvm_final_verifier::verify_bytes(&trailing, &words),
+        unmasked::verify_bytes(&trailing, &words),
         Err(Error::Decode)
     ));
     let mut long = bytes.clone();
     long.resize(vos_pvm_final_verifier::MAX_PROOF_BYTES + 1, 0);
     assert!(matches!(
-        vos_pvm_final_verifier::verify_bytes(&long, &words),
+        unmasked::verify_bytes(&long, &words),
         Err(Error::Length)
     ));
     // The format version, 28, is the first varint: one byte, or two.
     assert_eq!(bytes[0], 28);
     let overlong = [&[28 | 0x80, 0][..], &bytes[1..]].concat();
     assert_eq!(
-        vos_pvm_final_verifier::verify_bytes(&overlong, &words).expect("verifies"),
+        unmasked::verify_bytes(&overlong, &words).expect("verifies"),
         one.wrapped.statement
     );
 }
@@ -761,7 +756,7 @@ fn the_wrap_verifies_on_the_jam_only_host() {
     let (program, elf_len) = jam::program();
     let one = one_segment();
     let bytes = postcard::to_allocvec(&one.wrapped.proof).expect("encodes");
-    let request = jam::words_request(&one.wrapped.words);
+    let request = jam::words_request(unmasked::FORMAT, &one.wrapped.words);
     let (gas, report) = jam::run(&program, &request, &bytes);
     let [start, lookup, decode, end] = report.gas;
     eprintln!(
@@ -791,7 +786,11 @@ fn the_wrap_verifies_on_the_jam_only_host() {
     assert_ne!(report.verdict, jam::ACCEPT);
     let mut words = one.wrapped.words;
     words[3] ^= 1;
-    let (gas, report) = jam::run(&program, &jam::words_request(&words), &bytes);
+    let (gas, report) = jam::run(
+        &program,
+        &jam::words_request(unmasked::FORMAT, &words),
+        &bytes,
+    );
     eprintln!("other words: {gas} gas: {}", report.error);
     assert_eq!(report.verdict, jam::REJECT);
 }

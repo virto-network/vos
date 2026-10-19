@@ -1,6 +1,7 @@
-//! Fuzz target: the golden wrap mutated, by its bytes and by its structure,
-//! then verified against its public words (`vos_pvm_final_verifier::verify`
-//! and `verify_bytes`).
+//! Fuzz target: the golden wraps, formats 28 and 39, mutated by their bytes
+//! and by their structure, then verified against their public words, each
+//! under its format (`vos_pvm_final_verifier::{unmasked, masked}::verify`,
+//! and the bytes through `vos_pvm_final_verifier::verify`).
 //!
 //! The input is a list of mutations ([`Mutation`], `arbitrary`): byte flips,
 //! insertions, removals and truncations of the encoding; and, on the
@@ -11,12 +12,13 @@
 //!
 //! Property: **no panic, no abort**, and **a mutated proof that verifies is
 //! the golden one** by value (`golden::Golden::assert_is_golden`): the
-//! mutations that cancel out, or rewrite a varint longer. The shape check
-//! stands before every Stwo call that would index the proof; this target is
-//! what holds it to that.
+//! mutations that cancel out, or rewrite a postcard varint longer. The
+//! shape checks stand before every Stwo call that would index the proof;
+//! this target is what holds them to that.
 //!
 //! ```text
-//! cd pvm/proof
+//! cargo test -p vos-pvm-recair --test recursion masked
+//! cd pvm/proof/fuzz
 //! cargo fuzz run final_verifier_mutate -- -max_total_time=600
 //! ```
 
@@ -329,19 +331,20 @@ fn apply_bytes(bytes: &mut Vec<u8>, mutation: &Mutation) {
 }
 
 fuzz_target!(|mutations: Vec<Mutation>| {
-    let golden = golden::golden();
-    let mut proof: WrapProof = vos_pvm_final_verifier::decode(&golden.proof).expect("decodes");
-    for mutation in &mutations {
-        apply(&mut proof, mutation);
-    }
-    if vos_pvm_final_verifier::verify(proof.clone(), &golden.words).is_ok() {
-        golden.assert_is_golden(&proof);
-    }
-    let mut bytes = postcard::to_allocvec(&proof).expect("encodes");
-    for mutation in &mutations {
-        apply_bytes(&mut bytes, mutation);
-    }
-    if vos_pvm_final_verifier::verify_bytes(&bytes, &golden.words).is_ok() {
-        golden.assert_is_golden(&vos_pvm_final_verifier::decode(&bytes).expect("decodes"));
+    for golden in golden::goldens() {
+        let mut proof: WrapProof = golden.decode(&golden.proof).expect("decodes");
+        for mutation in &mutations {
+            apply(&mut proof, mutation);
+        }
+        if golden.verify(proof.clone()) {
+            golden.assert_is_golden(&proof);
+        }
+        let mut bytes = golden.encode(&proof);
+        for mutation in &mutations {
+            apply_bytes(&mut bytes, mutation);
+        }
+        if golden.verify_bytes(&bytes) {
+            golden.assert_is_golden(&golden.decode(&bytes).expect("decodes"));
+        }
     }
 });

@@ -24,7 +24,8 @@ name = "fixtures"
 required-features = ["fixtures"]
 
 [dependencies]
-vos-pvm-final-verifier = { workspace = true }
+# Format 28, the final proofs `judge` reads.
+vos-pvm-final-verifier = { workspace = true, features = ["test-formats"] }
 # A space's id, its roots and their encodings, re-exported.
 vos-anchor = { workspace = true }
 
