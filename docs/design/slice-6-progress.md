@@ -1142,9 +1142,9 @@ its first check (`Fixture::verdict_linking`):
   rootless 109.8M, 28 at the test venue 96.5M (test guest), tampered
   70.0M, the words' refusals 14.0–14.2M, every refusal before the proof
   0.1M;
-- **the JAM program's size:** production **523,362 B** (ELF 847,536 B):
-  within 512 KiB (524,288 B) by 926 B, and JAM's 4,000,000 B; the test
-  guest 610,809 B (ELF 966,040 B; 6.4's two-format program was 608,634 B).
+- **the JAM program's size:** production **523,362 B** (ELF 847,536 B),
+  within JAM's 4,000,000 B (512 KiB binds nothing: the review below); the
+  test guest 610,809 B (ELF 966,040 B; 6.4's two-format program was 608,634 B).
   A test holds the production program within 4,000,000 B and smaller than
   the test one.
 
@@ -1194,8 +1194,8 @@ runs, `final_verifier_mutate` 1,234, `statement_decode` 45,088, no crash.
 - the model's `anchored` holds the age by the venue's `now_ms`, so
   `anchored` and the `Seen` expiry meet at `now = B_wmax + MaxRootAge`
   (both still alive);
-- the production guest is 926 B under 512 KiB: 6.19's service build, or
-  any code the judgement gains, may cross it (4,000,000 B is JAM's bound).
+- the production guest's size against 512 KiB (4,000,000 B is JAM's
+  bound).
 
 **Gates:** `just check` green (88 test binaries, 1,199 passed, 0 failed;
 a first run failed `doc-check` on the final verifier's intra-doc link to
@@ -1205,7 +1205,63 @@ the test-proof binaries (`gates`, `isa`, `kernel`) build. The milestone's
 `test-proof` (the kernels' end-to-end judgements now on the test guest) is
 not run here.
 
-**Commits:** `152f4902` the step; this record.
+**Commits:** `152f4902` the step; `057a134c` this record.
+
+**Reviews:** Fable ACCEPT (`6.5-fable.md`: pin F's order as built, `seen`
+before the proof on every host with state; the `Seen` rule and the anchor
+age meeting at `now = B_wmax + MaxRootAge`, no race from lazy pruning,
+since `anchored` reads the age live; refusing an unlinked format `0x2`
+whatever the policy; every field of the id and io-hash preimages
+replayed; the `{f}` build checks catching a feature enabled through
+another; one guest, two bins; two low findings, three nits, three notes for
+6.19); Opus, no correctness defects. Folded (`4202ae3f`):
+- **Fable 1:** `MaxRootAge` is never raised in place; a raise is a
+  migration that first prunes anchors older than the old bound (a `Seen`
+  expiry computed with the old bound, `anchored` with the new, would make
+  an unpruned anchor fresh again after its entry was dropped): pin F,
+  `spaces-pallet.md` §6.5, 6.19;
+- **Fable 2:** `Admitted`'s fields private, `format()` and `id()` its
+  accessors, so only `admit` makes one and `verify` cannot be reached
+  around its checks;
+- **Fable 3, 6, 7, into 6.19:** an undecodable statement is code 1 in the
+  service's `Verdict`, as at the pallet; the service's binding bounds are
+  4,000,000 B of code, refine ≤ 150M and accumulate ≤ 2M gas, CE 133's
+  204,802 B and the guest's `.bss` against JAM's refine memory, so it may
+  cross 512 KiB freely; the plan's risk row "the JAM program over 512 KiB"
+  retired, and the 512 KiB comparison dropped from this entry, `proving.md`
+  and the size test; on JAM refine reads no `Seen`, so a replay costs a
+  full refine (about 110M gas) before accumulate's `6`: the defence there
+  is the package's cost, not `seen`;
+- **Fable 4, Opus 2, 3:** the build checks are one private recipe
+  (`_no-feature`): `cargo tree … -e no-dev --target all -f '{f}'`, each
+  package's features split and compared whole, for every target;
+  `vos-statement`'s `fixtures` and `pvm-guest` checked by `cargo tree -p
+  vos-statement --features fixtures,pvm-guest` (each refusal checked: the
+  blob, `vos-statement` and `vos-pvm-recair` under the feature fail it);
+- **Fable 5:** two fixtures, the roots' order swapped and a root dropped,
+  `0x108` at every venue (31 cases, `statements.cases` 19,252 B; the
+  proofs byte-identical);
+- **Opus 1:** `final-verify` refuses `test-formats` by `compile_error!`
+  (the `CARGO_BIN_NAME` assert gone); the guest at `src/bin/guest/mod.rs`;
+- **Opus 4–8:** `let spaces = &self.spaces`; the venue prefix by
+  `starts_with`; the generator's three `statement.clone()`s dropped and the
+  test venue's closure named once; the model's `Range { from, until }` with
+  `contains`, `Space::encode_to`/`decode_from`, a redundant annotation
+  dropped; the fuzz seed reads every `wrap*.proof` under the fixtures (the
+  segment proof is no wrap).
+
+**Gates after the fold** [measured]: `just check` green but for one test
+of 6.12's merged before it, `cuts::an_idle_agents_leader_appends_one_marker_at_its_own_clock`
+(`node/host/tests/cluster/cuts.rs:141`, "one result appended: []": the
+marker's result not yet read when `cut(0)` is), which passed alone three
+times and in the whole `cluster` binary twice; that stage rerun in full:
+green (95 test binaries, 1,215 tests over both stages). `just judge-wasm`:
+31 of 31 fixtures as recorded by each blob under each semantics; valid
+47,443,507 instructions under the PVF's semantics; the two new cases about
+5.7M. The JAM-only host: 31 of 31 on both guests; the production program
+523,607 B (ELF 847,872 B), the test guest's 611,088 B.
+
+**6.5 accepted.**
 
 ## Step 6.8: the recursion AIR's forgery gates
 
