@@ -123,3 +123,75 @@ draft's old name is left in `docs/`.
 
 Running. It picks the subxt release that reads stable2606-2's metadata,
 or the raw JSON-RPC fallback, for 6.17b.
+
+## Step 6.1: format 39 and the masked security count
+
+**The tool** (`pvm/proof/src/security.rs`), ported from spike 6b
+(`1b76b028`):
+- `SecurityShape::composition_point_doublings` (`j`): the DEEP term is
+  multiplied by `2^j`; 0 in every unmasked shape (the registry's and
+  `framework_access`' `security_shape`), and a `j` above the degree bound
+  is refused;
+- `SecurityShape::variant_c()`: from the tallest component's `m`, the
+  degree bound `m+2`, the trace length `m+1`, the composition bound `m+2`,
+  `j = 1`. It moves only the levels; what the masking commits beside the
+  AIR's columns is the caller's to add;
+- the search for the best multiplicity is one `Analysis::best`, the other
+  terms a named `OtherTerms`; a test-only `term_bits` reports every term
+  at the `m` the count is taken at.
+
+**The entry** (`pvm/proof/src/format.rs`):
+- `ProofBytes::{Postcard, FixedLayout}`, a new `Format` field (pin A):
+  every existing format `Postcard`, 39 `FixedLayout`;
+- `MASKED_WRAP`, number 39, pin A's parameters (blowup 32, 24 queries,
+  PoW 26, interaction PoW 8, fold step 3, last layer 2^6, affine
+  batching, Blake2b-256, `Lossless`), masked, floors 100 / 80,
+  `Reserved`;
+- `MASKED_WRAP_REFERENCE`: `WRAP_REFERENCE.variant_c()` plus R2's
+  blinding (12 main and 8 interaction columns, 2 constraints, fractions
+  6, 5 and 7 a row) and the composition's columns as pin A commits them
+  (4 whole and R's 8, where the split composition had 8). Every sampled
+  column at two samples, as `WRAP_REFERENCE` counts its own: 2 × (458 +
+  24) = 964 sampled values, against the spike's 956 with a 4-column R;
+- `RETIRED` gains 40, its reason in the doc: never registered, but spike
+  6a's measured masked wrap at blowup 64 was made under it. The refusal
+  now reads "no format takes it again" (the old "its AIR is superseded"
+  was untrue of 40).
+
+**The counts [model]:**
+
+| shape | m | query | batching | fold | ALI | DEEP | logup | count |
+|---|---|---|---|---|---|---|---|---|
+| 39 (blowup 32, 24 queries) | 5 | **82.70** | 82.79 | 82.98 | 108.38 | 97.68 | 111.60 | 146 / 82 (82.6999) |
+| (c) at 28's parameters (shape B) | 4 | 82.60 | **81.74** | 81.93 | 107.70 | 97.00 | 111.60 | 146 / 81 |
+
+- every unmasked format's pinned bits unchanged: 28 at 146 / 82
+  (82.60), 30 106 / 62, 32 108 / 63, 35 104 / 62, 36 96 / 57, 37
+  106 / 62;
+- the least queries that clear 100 / 80 masked, pinned: blowup 16 PoW 26
+  28; blowup 32 PoW 20 / 24 / 26 / 28 25 / 24 / 23 / 22, and 23 at fold
+  step 2 or a 2^8 last layer; blowup 64 19 (PoW 26 or 28, fold 2 or 3).
+  39's own least is 23 (80.84);
+- the interaction PoW does not bind 39 (logup 111.60 with it, above 100
+  without it, the count the same);
+- **by powers** (DIVERGENCE-012 falling): 39 caps at **76.14** (76.136)
+  at blowup 32 and **73.64** at blowup 64, however many queries; only
+  blowup 8 reaches 80, at 43 queries. The plan and spike 6b say 76.15 and
+  73.65: R's 8 columns add 8 sampled values to the batch by powers
+  (`log2(963/955)` = 0.012 bits). The affine count does not see them.
+
+**Docs:** `pvm/proof/SECURITY.md` (39's row, 40 among the retired, the
+masked count and what it rests on, DIVERGENCE-011's round list `[3, 3, 3,
+2]` and its 0.19-bit margin, DIVERGENCE-012's caps, premise and
+fallbacks, the audit's scope); `proving.md` A.4's retired list gains 40
+(`doc-fixes.md` 31, its 36 half left for 6.9).
+
+**Tests:** `format_masked_tests.rs` (6: the unmasked counts unmoved and 39's
+reference, 39's counts and terms, (c) at 28's parameters, the
+least-query grid, the interaction PoW, affine batching needed), and in
+`security.rs` the round list `[3, 3, 3, 2]` at `log k = 17` and
+`variant_c`'s levels and DEEP doubling. The spike's cost proxies and
+printed tables were not ported: they are spike 6b's record.
+`cargo test -p vos-pvm-proof --no-default-features --lib`: 96 passed.
+
+**Gates:** `just check` green (1,113 tests, 0 failed).
