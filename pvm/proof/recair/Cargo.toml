@@ -33,10 +33,16 @@ bytemuck = "1"
 rayon = { workspace = true }
 
 [features]
-# The masked prover's seeded randomness (`MaskRng::Seeded`), for the
-# prover's tests (a dev edge): no production build enables it (`just
-# check-no-seeded-masks`).
+# The masked prover's test seams, for the prover's tests (a dev edge): its
+# seeded randomness (`MaskRng::Seeded`) and a proof forced past its own
+# check of the constraints (`prove_masked_unchecked`). No production build
+# enables it (`just check-no-seeded-masks`).
 seeded-masks = []
+# The masking's heavy gates, for `just test-proof`: the statistical leakage
+# tests at full N (2,000 proofs a witness on the small circuit, 32 on the
+# real wrap), the masked acceptance above 2^16 rows, and the final
+# verifier's gas and Wasm gates over seeds. No code of the crate's.
+heavy-gates = []
 
 [dev-dependencies]
 # The masked prover's tests reproduce a proof byte for byte from a seed.

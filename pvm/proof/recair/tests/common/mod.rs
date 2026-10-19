@@ -4,6 +4,7 @@
 #![allow(dead_code)]
 
 pub mod kernel;
+pub mod leakage;
 
 use std::sync::OnceLock;
 

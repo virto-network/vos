@@ -144,3 +144,66 @@ pub(crate) fn witness_digest(statement: &Statement<'_>, main: &[Evaluations]) ->
     }
     hasher.finalize().into()
 }
+
+#[cfg(test)]
+mod tests {
+    use stwo::core::fields::m31::BaseField;
+    use stwo::core::poly::circle::CanonicCoset;
+    use stwo::prover::backend::simd::column::BaseColumn;
+    use stwo::prover::poly::circle::CircleEvaluation;
+    use vos_pvm_proof::format::MASKED_WRAP;
+
+    use super::*;
+
+    fn column(values: &[u32]) -> Evaluations {
+        let domain = CanonicCoset::new(4).circle_domain();
+        vec![CircleEvaluation::new(
+            domain,
+            values
+                .iter()
+                .map(|&value| BaseField::from(value))
+                .collect::<BaseColumn>(),
+        )]
+    }
+
+    /// R4 against a replayed state: one OS state hedged with two witnesses
+    /// differing in one value, or with one witness under two channels or
+    /// public values, seeds two other streams; the same witness and state
+    /// seed one.
+    #[test]
+    fn a_replayed_state_draws_other_masks_for_another_witness() {
+        use rand::RngCore;
+        let masking = MASKED_WRAP.masking.unwrap();
+        let public = [SecureField::from(BaseField::from(7))];
+        let statement = |channel, public| Statement {
+            format: &MASKED_WRAP,
+            masking: &masking,
+            log_sizes: &[4],
+            channel,
+            public,
+        };
+        let values: Vec<u32> = (0..16).collect();
+        let mut amount = values.clone();
+        amount[3] += 1;
+        let digests = [
+            witness_digest(&statement("blake2b", &public), &[column(&values)]),
+            witness_digest(&statement("blake2b", &public), &[column(&amount)]),
+            witness_digest(&statement("blake2s", &public), &[column(&values)]),
+            witness_digest(&statement("blake2b", &[]), &[column(&values)]),
+        ];
+        let first_word = |digest: &[u8; 32], attempt| {
+            MaskRng::Seeded(5)
+                .attempt(digest, attempt)
+                .unwrap()
+                .next_u64()
+        };
+        let words: Vec<u64> = digests.iter().map(|digest| first_word(digest, 0)).collect();
+        for (i, a) in words.iter().enumerate() {
+            for b in &words[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(first_word(&digests[0], 0), words[0]);
+        assert_ne!(first_word(&digests[0], 1), words[0]);
+    }
+}

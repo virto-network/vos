@@ -7,6 +7,8 @@ mod common;
 mod compiler;
 mod gate_vm;
 mod gates;
+mod leakage;
 mod masked;
+mod masked_gates;
 mod masked_prover;
 mod modes;

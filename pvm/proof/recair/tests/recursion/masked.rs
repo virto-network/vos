@@ -13,6 +13,11 @@
 //! - **The bytes:** truncations and a trailing byte refused.
 //! - **On the JAM-only host** the venue's refine program accepts it within
 //!   format 39's gas, and refuses a tampered byte and other words.
+//! - **No hidden state** of the run is in any carrier of the proof (leakage
+//!   4).
+//! - **Under `heavy-gates`** (`just test-proof`): leakage 2, 3 and 5 on the
+//!   real wrap at 32 proofs a witness, and the verify gates (decode, verify
+//!   and the PVF's Wasm instructions) as the maximum over 12 seeds.
 
 use crate::jam;
 use crate::wrap::{one_segment, values_of};
@@ -495,4 +500,444 @@ fn the_masked_wrap_verifies_on_the_jam_only_host() {
     );
     eprintln!("other words: {gas} gas: {}", report.error);
     assert_eq!(report.verdict, jam::REJECT);
+}
+
+/// A hidden value, as each carrier would hold it: `aligned` its
+/// little-endian words, for the carriers made of 32-bit words (the fixed
+/// layout, the public words), where every field starts at a word's
+/// boundary; `postcard` its postcard encoding, or `None` where that is
+/// shorter than 4 bytes (a chance hit in a proof's bytes).
+struct Needle {
+    name: String,
+    aligned: Vec<u8>,
+    postcard: Option<Vec<u8>>,
+}
+
+impl Needle {
+    fn new(name: String, aligned: Vec<u8>, postcard: Vec<u8>) -> Self {
+        Self {
+            name,
+            aligned,
+            postcard: (postcard.len() >= 4).then_some(postcard),
+        }
+    }
+
+    /// A 64-bit word: whole, and each 32-bit half, those below 2^16 left
+    /// out (a small count a layout holds is no hidden state).
+    fn words(name: String, value: u64) -> Vec<Self> {
+        let encode = |value: u64| postcard::to_allocvec(&value).expect("encodes");
+        let mut needles = Vec::new();
+        if value >= 1 << 16 {
+            needles.push(Self::new(
+                name.clone(),
+                value.to_le_bytes().to_vec(),
+                encode(value),
+            ));
+        }
+        for (half, word) in [(0, value as u32), (1, (value >> 32) as u32)] {
+            if word >= 1 << 16 {
+                needles.push(Self::new(
+                    format!("{name}, half {half}"),
+                    word.to_le_bytes().to_vec(),
+                    encode(u64::from(word)),
+                ));
+            }
+        }
+        needles
+    }
+
+    /// A digest's bytes, held as they are.
+    fn digest(name: String, bytes: &[u8]) -> Self {
+        Self::new(name, bytes.to_vec(), bytes.to_vec())
+    }
+
+    /// M31 limbs, each a word.
+    fn limbs(name: String, limbs: &[BaseField]) -> Self {
+        Self::new(
+            name,
+            limbs.iter().flat_map(|limb| limb.0.to_le_bytes()).collect(),
+            limbs
+                .iter()
+                .flat_map(|limb| postcard::to_allocvec(&limb.0).expect("encodes"))
+                .collect(),
+        )
+    }
+}
+
+/// Leakage 4: no hidden state of the run is in any carrier of its masked
+/// wrap (its fixed-layout bytes, its postcard encoding, its public words):
+/// neither the segment's step count (its final timestamp), its pcs, its
+/// registers but φ9..12 (the io-hash's, public), its memory roots and
+/// `memory_commitment` at both ends, nor the root proof's commitments and
+/// claimed sums (the wrap's private witness), nor a plain BLAKE2b-256 of the
+/// run's arguments (this kernel runs on none).
+#[test]
+fn no_hidden_state_is_in_the_masked_wraps_carriers() {
+    use blake2::digest::consts::U32;
+    use blake2::{Blake2b, Digest};
+    let masked = masked_wrap();
+    let one = one_segment();
+    let segment = &one.run.segments[0];
+    let mut needles = Vec::new();
+    for (end, state) in [
+        ("initial", &segment.initial_state),
+        ("final", &segment.final_state),
+    ] {
+        needles.extend(Needle::words(format!("{end} timestamp"), state.timestamp));
+        needles.extend(Needle::words(format!("{end} pc"), u64::from(state.pc)));
+        for (i, &register) in state.registers.iter().enumerate() {
+            if !(9..=12).contains(&i) {
+                needles.extend(Needle::words(format!("{end} φ{i}"), register));
+            }
+        }
+        needles.push(Needle::digest(
+            format!("{end} memory root"),
+            &state.memory_root,
+        ));
+        needles.push(Needle::digest(
+            format!("{end} memory commitment"),
+            &state.memory_commitment,
+        ));
+    }
+    let root = &one.root.proof;
+    for (tree, commitment) in root.stark_proof.commitments.iter().enumerate() {
+        needles.push(Needle::limbs(
+            format!("the root proof's root {tree}"),
+            &commitment.0,
+        ));
+    }
+    for (component, sum) in root.claimed_sums.iter().enumerate() {
+        needles.push(Needle::limbs(
+            format!("the root proof's claimed sum {component}"),
+            &sum.to_m31_array(),
+        ));
+    }
+    needles.push(Needle::digest(
+        "BLAKE2b-256 of the run's arguments".into(),
+        &Blake2b::<U32>::digest(b""),
+    ));
+
+    let words: Vec<u8> = masked.words.iter().flat_map(|w| w.to_le_bytes()).collect();
+    let postcard = postcard::to_allocvec(&masked.proof).expect("encodes");
+    let aligned = |bytes: &[u8], needle: &[u8]| {
+        (0..bytes.len().saturating_sub(needle.len()) + 1)
+            .step_by(4)
+            .any(|at| bytes[at..].starts_with(needle))
+    };
+    let mut found = Vec::new();
+    for needle in &needles {
+        for (carrier, bytes) in [("the fixed layout", &masked.bytes), ("the words", &words)] {
+            if aligned(bytes, &needle.aligned) {
+                found.push(format!("{} in {carrier}", needle.name));
+            }
+        }
+        if let Some(encoded) = &needle.postcard
+            && postcard
+                .windows(encoded.len())
+                .any(|window| window == encoded)
+        {
+            found.push(format!("{} in postcard", needle.name));
+        }
+    }
+    eprintln!(
+        "{} needles ({} in postcard) over the fixed layout ({} B), postcard ({} B) and the \
+         words: {} found",
+        needles.len(),
+        needles
+            .iter()
+            .filter(|needle| needle.postcard.is_some())
+            .count(),
+        masked.bytes.len(),
+        postcard.len(),
+        found.len()
+    );
+    assert!(needles.len() > 20, "{} needles", needles.len());
+    assert!(found.is_empty(), "{found:#?}");
+
+    // The control: the search finds each value where it is public, the
+    // segment proof's and the root proof's postcard encodings (but the
+    // halves of a word, which postcard holds whole, and the arguments'
+    // hash, which no proof holds).
+    let holders = [
+        postcard::to_allocvec(segment).expect("encodes"),
+        postcard::to_allocvec(root).expect("encodes"),
+    ];
+    let missed: Vec<&str> = needles
+        .iter()
+        .filter(|needle| !needle.name.contains("half") && !needle.name.contains("arguments"))
+        .filter(|needle| {
+            let encoded = needle.postcard.as_ref().expect("encoded");
+            !holders
+                .iter()
+                .any(|bytes| bytes.windows(encoded.len()).any(|window| window == encoded))
+        })
+        .map(|needle| needle.name.as_str())
+        .collect();
+    assert!(missed.is_empty(), "the control misses {missed:?}");
+}
+
+/// The masking's heavy gates on the real wrap (`heavy-gates`, `just
+/// test-proof`).
+#[cfg(feature = "heavy-gates")]
+mod heavy {
+    use super::*;
+
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
+
+    use crate::common::leakage::{Fields, Key, Verdicts, indistinguishable, published, uniform};
+    use crate::wrap::whole_run_root;
+    use vos_pvm_proof::program_id::IdPreimage;
+    use vos_pvm_recair::tree::Node;
+
+    /// Proofs a witness.
+    const N: usize = 32;
+    /// The seeds the verify gates are the maximum over.
+    const GATE_SEEDS: usize = 12;
+
+    /// A wrap witness's N masked proofs: their fields and the first two
+    /// proofs'; and its unmasked wrap's fields, N times.
+    struct Proofs {
+        fields: Fields,
+        first: Vec<Vec<(Key, u32)>>,
+        unmasked: Fields,
+    }
+
+    fn proofs_of(name: &str, root: &Node, program: &IdPreimage) -> Proofs {
+        let finalized = WrapCircuit::get().finalize(&values_of(root, program));
+        let started = Instant::now();
+        let mut fields = Fields::default();
+        let mut first = Vec::new();
+        for seed in 0..N as u64 {
+            let (proof, _) =
+                wrap::prove_masked(&finalized, MaskRng::Seeded(seed), |_| {}).expect("proves");
+            let values = published(&proof.stark_proof, &proof.claimed_sums);
+            fields.add(&values);
+            if first.len() < 2 {
+                first.push(values);
+            }
+        }
+        eprintln!(
+            "{name}: {N} masked wraps in {:.1}s, {} fields each",
+            started.elapsed().as_secs_f64(),
+            fields.0.len()
+        );
+        let control = wrap::prove_unmasked(&finalized).expect("proves");
+        let control = published(&control.stark_proof, &control.claimed_sums);
+        let mut unmasked = Fields::default();
+        for _ in 0..N {
+            unmasked.add(&control);
+        }
+        Proofs {
+            fields,
+            first,
+            unmasked,
+        }
+    }
+
+    /// The one-segment run's masked wrap from [`GATE_SEEDS`] seeds of its
+    /// own (from 1,000): each proof's bytes, and the public words.
+    fn gate_proofs() -> &'static (Vec<Vec<u8>>, [u32; PUBLIC_WORDS]) {
+        static PROOFS: OnceLock<(Vec<Vec<u8>>, [u32; PUBLIC_WORDS])> = OnceLock::new();
+        PROOFS.get_or_init(|| {
+            let one = one_segment();
+            let finalized = WrapCircuit::get().finalize(&values_of(&one.root, &one.run.program));
+            let bytes = (1_000..1_000 + GATE_SEEDS as u64)
+                .map(|seed| {
+                    let (proof, _) = wrap::prove_masked(&finalized, MaskRng::Seeded(seed), |_| {})
+                        .expect("proves");
+                    wrap::proof_bytes(&proof).expect("format 39's bytes")
+                })
+                .collect();
+            (bytes, wrap::public_words(&finalized))
+        })
+    }
+
+    /// The two witnesses: the one-segment run's root under kernel 6,000,
+    /// and under 6,001 (`whole_run_root`): their public words differ in the
+    /// program id alone.
+    fn witnesses() -> &'static [Proofs; 2] {
+        static PROOFS: OnceLock<[Proofs; 2]> = OnceLock::new();
+        PROOFS.get_or_init(|| {
+            let one = one_segment();
+            let (root, program) = whole_run_root(6_001);
+            [
+                proofs_of("kernel 6000", &one.root, &one.run.program),
+                proofs_of("kernel 6001", &root, &program),
+            ]
+        })
+    }
+
+    /// Leakage 2 on the real wrap: each published field of the two
+    /// witnesses' masked wraps alike; the unmasked control fails.
+    #[test]
+    fn heavy_the_masked_wraps_openings_do_not_depend_on_the_witness() {
+        let [a, b] = witnesses();
+        let mut verdicts = Verdicts::new("leakage 2, the real wrap");
+        indistinguishable(&mut verdicts, "6000/6001", &a.fields, &b.fields, N);
+        verdicts.report();
+        let refused = verdicts.refused();
+        assert!(refused.is_empty(), "{:?}", &refused[..refused.len().min(8)]);
+        let mut control = Verdicts::new("leakage 2's control on the real wrap, unmasked");
+        indistinguishable(&mut control, "6000/6001", &a.unmasked, &b.unmasked, N);
+        control.report();
+        assert!(!control.refused().is_empty(), "the unmasked wrap passes");
+    }
+
+    /// Leakage 3 on the real wrap: each published field uniform over M31.
+    #[test]
+    fn heavy_the_masked_wraps_openings_are_uniform() {
+        let [a, _] = witnesses();
+        let mut verdicts = Verdicts::new("leakage 3, the real wrap");
+        uniform(&mut verdicts, &a.fields, N);
+        verdicts.report();
+        let refused = verdicts.refused();
+        assert!(refused.is_empty(), "{:?}", &refused[..refused.len().min(8)]);
+    }
+
+    /// Leakage 5 on the real wrap: two proofs of one witness share no
+    /// opening, nor do two witnesses' proofs from one seed.
+    #[test]
+    fn heavy_every_opening_of_the_masked_wrap_is_fresh() {
+        let [a, b] = witnesses();
+        let shared = |x: &[(Key, u32)], y: &[(Key, u32)]| {
+            let y: std::collections::BTreeMap<_, _> = y.iter().copied().collect();
+            x.iter()
+                .filter(|(key, value)| y.get(key) == Some(value))
+                .count()
+        };
+        assert!(a.first[0].len() > 10_000);
+        assert_eq!(
+            shared(&a.first[0], &a.first[1]),
+            0,
+            "one witness, two seeds"
+        );
+        assert_eq!(
+            shared(&a.first[0], &b.first[0]),
+            0,
+            "two witnesses, one seed"
+        );
+        eprintln!(
+            "{} openings: none shared between seeds 0 and 1 of one witness, nor between \
+             two witnesses at seed 0",
+            a.first[0].len()
+        );
+    }
+
+    /// The witness hashes a lifted Merkle tree of `height` can decommit for
+    /// `queries` distinct queries, no sibling shared: at each level, a hash
+    /// for each queried node, at most the level's pairs.
+    fn most_witness_hashes(height: u32, queries: usize) -> usize {
+        (0..height)
+            .map(|level| queries.min(1 << (height - level - 1)))
+            .sum()
+    }
+
+    fn workspace() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .find(|dir| dir.join("Cargo.lock").exists() && dir.join("pvm").is_dir())
+            .expect("the workspace's root")
+            .to_path_buf()
+    }
+
+    /// The verify gates as the maximum over 12 seeds of the one-segment
+    /// run's masked wrap ([`gate_proofs`]): on the JAM-only host the decode at most 4M gas
+    /// and the verify at most 125M; in Wasm (the final verifier's blob,
+    /// `just judge-wasm`) at most 50M instructions under the PVF's
+    /// semantics. Each seed's Merkle witness is reported against the most
+    /// 24 distinct queries can take.
+    #[test]
+    fn heavy_the_verify_gates_hold_over_seeds() {
+        let (program, _) = jam::program();
+        let (proofs, words) = gate_proofs();
+        let request = jam::words_request(masked::FORMAT, words);
+        let mut phases = Vec::new();
+        let mut files = Vec::new();
+        for (seed, bytes) in proofs.iter().enumerate() {
+            let (gas, report) = jam::run(&program, &request, bytes);
+            assert_eq!(report.verdict, jam::ACCEPT, "seed {seed}: {}", report.error);
+            let [_, lookup, decoded, end] = report.gas;
+            let (decode, verify) = (lookup - decoded, decoded - end);
+            let proof = masked::decode(bytes).expect("decodes");
+            let stark = &proof.stark_proof;
+            let queries = stark.queried_values[1][0].len();
+            let trees: usize = stark
+                .decommitments
+                .iter()
+                .map(|decommitment| decommitment.hash_witness.len())
+                .sum();
+            let fri = &stark.fri_proof;
+            let fri_hashes: usize = std::iter::once(&fri.first_layer)
+                .chain(&fri.inner_layers)
+                .map(|layer| layer.decommitment.hash_witness.len())
+                .sum();
+            let most = most_witness_hashes(masked::LOG_DEGREE_BOUND + 5, 24) * 3
+                + most_witness_hashes(16 + 5, 24);
+            eprintln!(
+                "seed {seed}: {gas} gas, decode {decode}, verify {verify}; {} bytes; {queries} \
+                 distinct queries; {trees} trace-tree witness hashes (at most {most} for 24 \
+                 queries), {fri_hashes} FRI",
+                bytes.len()
+            );
+            phases.push((decode, verify));
+            let name = format!("gate-{seed:02}");
+            write(&name, masked::FORMAT, bytes, words);
+            files.push(
+                Path::new(env!("CARGO_TARGET_TMPDIR"))
+                    .join("wrap")
+                    .join(format!("{name}.proof")),
+            );
+        }
+        let decode = phases.iter().map(|&(decode, _)| decode).max().unwrap();
+        let verify = phases.iter().map(|&(_, verify)| verify).max().unwrap();
+        eprintln!("the maximum over {GATE_SEEDS} seeds: decode {decode}, verify {verify}");
+        assert!(decode <= 4_000_000, "decode {decode} gas");
+        assert!(verify <= 125_000_000, "verify {verify} gas");
+
+        let wasm = workspace().join("pvm/proof/final-verifier/wasm");
+        let runner = wasm.join("run/target/release/vos-pvm-final-verifier-wasm-run");
+        let blob = wasm
+            .join("blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm");
+        // On a hybrid CPU each core kind counts with its own PMU: a thread
+        // moved to another kind counts nothing there, so the runner is held
+        // to the performance cores.
+        let mut command = match std::fs::read_to_string("/sys/devices/cpu_core/cpus") {
+            Ok(cores) => {
+                let mut taskset = std::process::Command::new("taskset");
+                taskset.args(["-c", cores.trim()]).arg(&runner);
+                taskset
+            }
+            Err(_) => std::process::Command::new(&runner),
+        };
+        let output = command
+            .arg(&blob)
+            .args(["pvf", "1"])
+            .args(&files)
+            .output()
+            .unwrap_or_else(|error| {
+                panic!("{} ({error}); run `just judge-wasm`", runner.display())
+            });
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success(),
+            "{stdout}{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let instructions: Vec<u64> = stdout
+            .lines()
+            .filter(|line| line.starts_with("RESULT "))
+            .filter_map(|line| line.split("instructions=").nth(1))
+            .filter_map(|rest| rest.split_whitespace().next()?.parse().ok())
+            .collect();
+        eprintln!("Wasm under the PVF's semantics: {instructions:?}");
+        assert_eq!(instructions.len(), GATE_SEEDS);
+        assert!(
+            instructions.iter().all(|&count| count > 0),
+            "{instructions:?}"
+        );
+        let most = *instructions.iter().max().unwrap();
+        eprintln!("the maximum over {GATE_SEEDS} seeds: {most} instructions");
+        assert!(most <= 50_000_000, "{most} Wasm instructions");
+    }
 }

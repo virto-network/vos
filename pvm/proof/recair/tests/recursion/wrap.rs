@@ -56,7 +56,7 @@ const WHOLE: (usize, usize) = (0, 6);
 
 /// A run's segments under a program of their leaves' circuits.
 pub(crate) struct Run {
-    segments: Vec<Proof>,
+    pub(crate) segments: Vec<Proof>,
     leaves: Vec<LeafCircuit>,
     pub(crate) program: IdPreimage,
 }
@@ -177,6 +177,16 @@ pub(crate) fn one_segment() -> &'static OneSegment {
         let wrapped = wrapped(&root, &run.program, "one segment");
         OneSegment { run, root, wrapped }
     })
+}
+
+/// The whole run as one segment under the program id of kernel `kernel`:
+/// its root, a leaf at position 0, and the program. Kernels 6,000 (the
+/// one-segment run's) and 6,001 differ in the program id alone, so their
+/// roots are two witnesses of the wrap whose public words differ in it.
+#[cfg(feature = "heavy-gates")]
+pub(crate) fn whole_run_root(kernel: u32) -> (Node, IdPreimage) {
+    let run = Run::new(&[WHOLE], kernel);
+    (run.honest_leaf(0, 0), run.program)
 }
 
 /// The run cut in four segments, under a program of their leaves.

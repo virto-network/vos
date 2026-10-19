@@ -23,10 +23,11 @@ use stwo::core::utils::bit_reverse_index;
 use stwo::core::verifier::PREPROCESSED_TRACE_IDX;
 use vos_pvm_recair_air::masked::MASKED_COLUMN_EXPANSION;
 
-/// What R1 found: the most functionals one class revealed, and whether every
-/// class's had full row rank.
+/// What R1 found: the column classes it checked, the most functionals one
+/// class revealed, and whether every class's had full row rank.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Revealed {
+    pub classes: usize,
     pub rows: usize,
     pub independent: bool,
 }
@@ -148,7 +149,11 @@ pub(crate) fn revealed_functionals(
     let independent = classes
         .par_iter()
         .all(|class| full_rank(class.log_size, log_mask_rows, &class.secure, &class.base));
-    Some(Revealed { rows, independent })
+    Some(Revealed {
+        classes: classes.len(),
+        rows,
+        independent,
+    })
 }
 
 /// Whether the functionals `r ↦ (v_H·r)(p)` at `secure` (four M31 rows a
