@@ -13,6 +13,11 @@ stwo-constraint-framework = { workspace = true }
 num-traits = { version = "0.2", default-features = false }
 vos-pvm-poseidon2 = { workspace = true }
 
+[dev-dependencies]
+# The recording evaluator, which holds each component's evaluation to its
+# body and its pairs.
+stwo-constraint-framework = { workspace = true, features = ["std", "prover"] }
+
 [lints.clippy]
 # The bodies are indexed by limb, word and round.
 needless_range_loop = { level = "allow", priority = 0 }

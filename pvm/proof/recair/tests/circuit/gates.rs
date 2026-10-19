@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use stwo::core::fields::qm31::SecureField;
-use stwo_constraint_framework::FrameworkEval;
 use stwo_constraint_framework::expr::{BaseExpr, ExprEvaluator, ExtExpr};
+use stwo_constraint_framework::{FrameworkEval, InfoEvaluator};
 use vos_pvm_recair::{circuit_commitment, prove, verify};
 use vos_pvm_recair_air::gate::GateRelation;
 use vos_pvm_recair_air::h8::H8Eval;
@@ -20,12 +20,25 @@ use common::random_circuit;
 /// Degrees over the recording evaluator's expressions, each intermediate's
 /// computed once: constraint-framework's `degree_bound` recomputes an
 /// intermediate at every reference, which the Poseidon2 body's nested
-/// rounds make exponential. A preprocessed column is a column, of degree 1;
-/// the relation's challenges and the logup's shift are constants.
+/// rounds make exponential. A preprocessed column is a column, of degree 1
+/// (or 0, to compare with constraint-framework's own count); the relation's
+/// challenges and the logup's shift are constants, and no other name is
+/// read.
 struct Degrees<'a> {
     recorded: &'a ExprEvaluator,
     preprocessed: &'a [&'a str],
+    preprocessed_degree: usize,
     memo: HashMap<String, usize>,
+}
+
+/// The constants the recording evaluator names: the logup's shift, its
+/// claimed sum over its column size, and each relation's challenges,
+/// `<relation>_z` and `<relation>_alpha<i>`.
+fn is_constant(name: &str) -> bool {
+    let alpha = name
+        .rsplit_once("_alpha")
+        .is_some_and(|(_, index)| !index.is_empty() && index.bytes().all(|b| b.is_ascii_digit()));
+    matches!(name, "claimed_sum" | "column_size") || name.ends_with("_z") || alpha
 }
 
 impl Degrees<'_> {
@@ -37,8 +50,14 @@ impl Degrees<'_> {
             self.base(expr)
         } else if let Some(expr) = self.recorded.ext_intermediates.get(name) {
             self.ext(expr)
+        } else if self.preprocessed.contains(&name) {
+            self.preprocessed_degree
         } else {
-            usize::from(self.preprocessed.contains(&name))
+            assert!(
+                is_constant(name),
+                "{name}: no column, intermediate or constant"
+            );
+            0
         };
         self.memo.insert(name.to_string(), degree);
         degree
@@ -71,18 +90,37 @@ impl Degrees<'_> {
     }
 }
 
-/// Each constraint's degree, the preprocessed columns at degree 1 (or 0, to
-/// compare with constraint-framework's own count).
-pub(crate) fn degrees(recorded: &ExprEvaluator, preprocessed: &[&str]) -> Vec<usize> {
+/// Each constraint's degree, the preprocessed columns at
+/// `preprocessed_degree`.
+fn degrees_with(
+    recorded: &ExprEvaluator,
+    preprocessed: &[&str],
+    preprocessed_degree: usize,
+) -> Vec<usize> {
     let mut degrees = Degrees {
         recorded,
         preprocessed,
+        preprocessed_degree,
         memo: HashMap::new(),
     };
     recorded
         .constraints
         .iter()
         .map(|constraint| degrees.ext(constraint))
+        .collect()
+}
+
+/// Each constraint's degree, the preprocessed columns at degree 1.
+pub(crate) fn degrees(recorded: &ExprEvaluator, preprocessed: &[&str]) -> Vec<usize> {
+    degrees_with(recorded, preprocessed, 1)
+}
+
+/// The preprocessed columns an evaluation reads, as an [`InfoEvaluator`]
+/// records them.
+pub(crate) fn preprocessed_of(info: &InfoEvaluator) -> Vec<String> {
+    info.preprocessed_columns
+        .iter()
+        .map(|column| column.id.clone())
         .collect()
 }
 
@@ -139,7 +177,7 @@ fn the_degree_audit_passes() {
         // (no nested intermediates).
         if recorded.intermediates.is_empty() && recorded.ext_intermediates.is_empty() {
             assert_eq!(
-                degrees(recorded, &[]),
+                degrees_with(recorded, preprocessed, 0),
                 recorded.constraint_degree_bounds(),
                 "{name}"
             );

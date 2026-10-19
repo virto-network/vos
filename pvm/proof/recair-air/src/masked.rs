@@ -1,6 +1,6 @@
 //! The recursion AIR as the masked wrap proves it: masking variant (c)
-//! (`research/slice-5/spike2-masking.md` §3b; format 39, `slice-6-on-chain.md`
-//! pin A).
+//! (`docs/design/proving.md` §5; `research/slice-5/masking-review.md`), the
+//! AIR of format 39 in `vos_pvm_proof::format`'s registry.
 //!
 //! - **Constraint bound `log_size + 2`**
 //!   ([`MASKED_LOG_CONSTRAINT_EXPANSION`]): every main and interaction
@@ -41,6 +41,10 @@ use crate::{Body, GateRelation, LogSizes, h8, p2, preprocessed_ids, qm31};
 
 /// The constraint bound over the log size: `4N`, the composition whole.
 pub const MASKED_LOG_CONSTRAINT_EXPANSION: u32 = 2;
+
+/// The committed degree bound over the log size: `2N`, a column `f + v_H·r`
+/// (the preprocessed ones extended to the same level, unmasked).
+pub const MASKED_COLUMN_EXPANSION: u32 = 1;
 
 /// A component's blinding columns: one QM31.
 pub const BLIND_COLUMNS: usize = SECURE_EXTENSION_DEGREE;
@@ -157,7 +161,7 @@ impl<C: Component + ?Sized> Component for MaskedComponent<'_, C> {
     fn trace_log_degree_bounds(&self) -> TreeVec<ColumnVec<u32>> {
         self.inner
             .trace_log_degree_bounds()
-            .map_cols(|log_size| log_size + 1)
+            .map_cols(|log_size| log_size + MASKED_COLUMN_EXPANSION)
     }
 
     fn mask_points(
@@ -191,10 +195,15 @@ impl<C: Component + ?Sized> Component for MaskedComponent<'_, C> {
 /// The level the AIR is evaluated at, its tallest masked column's: `m + 1`.
 pub fn air_log_size(set: &impl MaskedComponents) -> Option<u32> {
     set.components()
-        .iter()
-        .flat_map(|component| component.trace_log_degree_bounds().0.into_iter().flatten())
-        .max()?
-        .checked_add(1)
+        .into_iter()
+        .flat_map(|inner| {
+            MaskedComponent { inner }
+                .trace_log_degree_bounds()
+                .0
+                .into_iter()
+                .flatten()
+        })
+        .max()
 }
 
 /// The composition's degree bound, FRI's `k`: `m + 2`.
@@ -219,16 +228,13 @@ pub fn committed_log_sizes(
     let preprocessed = set
         .preprocessed_log_sizes()
         .into_iter()
-        .map(|log_size| log_size.checked_add(1))
+        .map(|log_size| log_size.checked_add(MASKED_COLUMN_EXPANSION))
         .collect::<Option<Vec<u32>>>()?;
-    let components = set.components();
     let mut trace = [Vec::new(), Vec::new()];
-    for component in &components {
-        let bounds = component.trace_log_degree_bounds();
+    for inner in set.components() {
+        let bounds = MaskedComponent { inner }.trace_log_degree_bounds();
         for (tree, columns) in trace.iter_mut().zip(1..) {
-            for &log_size in bounds.get(columns).map(Vec::as_slice).unwrap_or(&[]) {
-                tree.push(log_size.checked_add(1)?);
-            }
+            tree.extend(bounds.get(columns).into_iter().flatten());
         }
     }
     let [mut main, mut interaction] = trace;
@@ -440,7 +446,7 @@ mod tests {
     /// `m + 2`. The main and interaction levels are the components' own,
     /// lifted one level ([`MaskedComponent`]).
     #[test]
-    fn the_masked_trees_are_pin_as() {
+    fn the_masked_trees_match_pin_a() {
         let wrap = wrap();
         let trees = committed_log_sizes(&wrap, &MASKED_WRAP_PINS).unwrap();
         assert_eq!(
@@ -498,8 +504,8 @@ mod tests {
 
     /// The blinding's one fraction a row is the masked evaluation's alone:
     /// no component's own evaluation adds to [`BlindRelation`], and each
-    /// masked one adds exactly one fraction a row to it; no other module of
-    /// the crate names it, and this one adds to it in [`MaskedEval`] only.
+    /// masked one adds exactly one fraction a row to it (`vos-pvm-recair`'s
+    /// circuit tests check that no other source names it).
     #[test]
     fn only_the_masked_evaluation_uses_the_blinding_relation() {
         let blind = BlindRelation::dummy();
@@ -532,29 +538,12 @@ mod tests {
             assert_eq!(counts.get(name), Some(&(1 << log_size)));
             assert_eq!(counts.len(), 2);
         }
-
-        let relation = ["Blind", "Relation"].concat();
-        for (module, source) in [
-            ("lib", include_str!("lib.rs")),
-            ("gate", include_str!("gate.rs")),
-            ("p2", include_str!("p2.rs")),
-            ("qm31", include_str!("qm31.rs")),
-            ("h8", include_str!("h8.rs")),
-            ("transcript", include_str!("transcript.rs")),
-        ] {
-            assert!(!source.contains(&relation), "{module} names it");
-        }
-        let own = include_str!("masked.rs");
-        let body = own.split("#[cfg(test)]").next().unwrap();
-        let entry = ["RelationEntry::new(\n", "            &self.", "blind"].concat();
-        assert_eq!(body.matches(&entry).count(), 1);
-        assert_eq!(body.matches("add_to_relation").count(), 1);
     }
 
     /// The masks at the AIR's level, the composition's coordinates at
     /// `π(z)`, `R` at `z`, no salt sampled; a column at most twice.
     #[test]
-    fn the_sample_points_are_pin_bs() {
+    fn the_sample_points_match_pin_b() {
         let wrap = wrap();
         let z = SECURE_FIELD_CIRCLE_GEN.mul(7);
         let points = sample_points(&wrap, z, &MASKED_WRAP_PINS).unwrap();

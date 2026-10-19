@@ -51,7 +51,7 @@ pub const LOG_CONSTRAINT_EXPANSION: u32 = 1;
 /// fractions not yet finalized. A component's own `evaluate` finalizes them
 /// in pairs; the masked wrap's ([`masked::MaskedEval`]) adds its blinding
 /// fraction first.
-pub trait Body: FrameworkEval + Clone + Sync {
+pub trait Body: FrameworkEval + Sync {
     fn body<E: EvalAtRow>(&self, eval: &mut E);
 }
 
@@ -195,6 +195,50 @@ impl Components {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use stwo_constraint_framework::expr::ExprEvaluator;
+
+    /// Each component's evaluation is its body and its fractions finalized
+    /// in pairs, expression for expression: what the masked evaluation
+    /// builds on.
+    #[test]
+    fn each_evaluation_is_its_body_and_its_pairs() {
+        fn check<B: Body>(name: &str, component: B) {
+            let evaluated = component.evaluate(ExprEvaluator::new());
+            let mut split = ExprEvaluator::new();
+            component.body(&mut split);
+            split.finalize_logup_in_pairs();
+            assert!(!split.constraints.is_empty(), "{name}");
+            assert_eq!(evaluated.constraints, split.constraints, "{name}");
+            assert_eq!(evaluated.intermediates, split.intermediates, "{name}");
+            assert_eq!(
+                evaluated.ext_intermediates, split.ext_intermediates,
+                "{name}"
+            );
+        }
+        let relation = GateRelation::dummy();
+        check(
+            "p2",
+            p2::P2Eval {
+                log_size: 4,
+                relation: relation.clone(),
+            },
+        );
+        check(
+            "qm31",
+            qm31::Qm31Eval {
+                log_size: 4,
+                relation: relation.clone(),
+            },
+        );
+        check(
+            "h8",
+            h8::H8Eval {
+                log_size: 4,
+                relation,
+            },
+        );
+    }
 
     /// The column counts of `recursion-air.md` §1.2: 57 preprocessed, 361
     /// main and 32 interaction columns.
