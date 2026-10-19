@@ -28,6 +28,17 @@ fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
     }
 }
 
+/// Whether `source` names `needle` as a whole identifier: Stwo's
+/// `new_with_preprocessed_columns(` is another function.
+fn calls(source: &str, needle: &str) -> bool {
+    source.match_indices(needle).any(|(at, _)| {
+        !source[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|c| c.is_alphanumeric() || c == '_')
+    })
+}
+
 #[test]
 fn only_checked_wirings_are_committed() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -57,7 +68,7 @@ fn only_checked_wirings_are_committed() {
         }
         let source = std::fs::read_to_string(path).unwrap_or_default();
         for needle in ["preprocessed_columns(", "circuit_hash("] {
-            if source.contains(needle) {
+            if calls(&source, needle) {
                 callers.push(format!("{relative}: {needle}"));
             }
         }
