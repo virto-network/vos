@@ -440,7 +440,8 @@ Rests on decisions 5, 6 and 8.
   leaf the bare value with `salt(seed, full key)`; JAM's whole-keyspace
   tree hashes `0x03` leaves the same way. The VOS agent root is then the
   node of JAM's tree at prefix `0x03`, byte for byte; a map root is the
-  node at its prefix.
+  node at its prefix. Every key under `0x03` is a committed value row;
+  anything else stored there is corrupt, and both hosts fail on it.
 - **The method:**
   `#[attestable(gas = N)] fn f(&self, #[public] a: A, …, b: B) -> O`.
   `&mut self` stays refused. `self` is a generated read-only view whose
@@ -990,9 +991,9 @@ lands.
   one row and none; the existing comparison suite; ownership refusals on
   `0x03` keys; the builder's crash-resume to the same root; a 64-byte
   `Ordered` key's leaf counted as two compressions.
-- **Gates:** the checker loop; the builder at ≥ 20k committed writes a
-  second (no regression past 10%); the window kernel's steps and
-  compressions within 5% of before.
+- **Gates:** the checker loop; the builder keeps up at 20k committed
+  writes a second offered (19.6k delivered), no regression past 10%; the
+  window kernel's steps and compressions within 5% of before.
 - **Dep:** decision 5. **Estimate:** 1.5–2.5 weeks.
 
 ### 6.12 Window cuts and the held build (F)
@@ -1529,6 +1530,11 @@ fees are the teammate's.
       - before master: `spikes/s5-attestable` and
         `spikes/s5-precompile/harness` deleted (they call the deleted
         refine API).
+  22. **A store layout version** (6.11's review): a row in the node
+      store's system partition naming the keyspace layout, which
+      `Fjall::open` refuses on a mismatch, so a store written before a
+      layout change (6.11 moved committed rows under `0x03`) fails to open
+      instead of hiding its rows.
 - **Then the slice's own cleanup:** the Opus code-quality review of slice
   6's code, folded the same way.
 - **Docs:** `proving.md` draft 6, `core-model.md`, `identity-and-authority.md`,

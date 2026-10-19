@@ -81,7 +81,7 @@ fn a_unit_with_a_section_is_never_preempted() {
             due(&result, 1)
                 .writes
                 .iter()
-                .all(|write| { !write.key.starts_with(&keys::instance_prefix(SHOP)) })
+                .all(|write| { !keys::owned_by(&write.key, SHOP) })
         );
         assert_eq!(
             ended(&flows.record(1)),

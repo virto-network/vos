@@ -112,7 +112,7 @@ fn scans_stay_inside_their_prefix_and_agent() {
         "a cursor before the prefix starts at the prefix"
     );
     assert_eq!(
-        rows(&view, A, &keys::instance_prefix(InstanceId(1)), None),
+        rows(&view, A, &keys::instance_rows(InstanceId(1)), None),
         all
     );
     assert_eq!(

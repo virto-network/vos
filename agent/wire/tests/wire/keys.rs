@@ -27,8 +27,19 @@ fn keys_keep_their_bytes() {
         [0x01, 0x11, 0x22, 0x33, 0x44, 0x01, 0xa1, 0xb2, 0xc3, 0xd4]
     );
     assert_eq!(
-        keys::instance_prefix(instance),
+        keys::instance_rows(instance),
         [0x01, 0x11, 0x22, 0x33, 0x44]
+    );
+    assert_eq!(
+        keys::instance_committed(instance),
+        [0x03, 0x11, 0x22, 0x33, 0x44]
+    );
+    assert_eq!(
+        keys::instance_prefixes(instance),
+        [
+            vec![0x01, 0x11, 0x22, 0x33, 0x44],
+            vec![0x03, 0x11, 0x22, 0x33, 0x44]
+        ]
     );
     assert_eq!(
         keys::installed(instance),
@@ -167,17 +178,15 @@ fn committed_keys_keep_their_bytes() {
     );
     assert_eq!(
         keys::committed_rows(&map),
-        [
-            0x01, 0x11, 0x22, 0x33, 0x44, 0x02, 0xa1, 0xb2, 0xc3, 0xd4, 0x01
-        ]
+        [0x03, 0x11, 0x22, 0x33, 0x44, 0xa1, 0xb2, 0xc3, 0xd4, 0x01]
     );
+    assert_eq!(keys::committed_rows(&map).len(), keys::COMMITTED_PREFIX);
+    assert_eq!(keys::committed_all(), [0x03]);
+    let row = keys::committed(&map, &key);
+    assert_eq!(row, cat(&[&keys::committed_rows(&map), &key]));
     assert_eq!(
-        keys::committed(&map, &key),
-        cat(&[&keys::committed_rows(&map), &key])
-    );
-    assert_eq!(
-        keys::dirty(0x0102_0304_0506_0708, &map, &key),
-        cat(&[&[0x00, 0x11], &version, &id, &key])
+        keys::dirty(0x0102_0304_0506_0708, &row),
+        cat(&[&[0x00, 0x11], &version, &[0x03], &id, &key])
     );
     assert_eq!(keys::dirty_prefix(), [0x00, 0x11]);
     assert_eq!(
@@ -190,16 +199,13 @@ fn committed_keys_keep_their_bytes() {
     );
     assert_eq!(keys::seed_prefix(), [0x00, 0x12]);
     assert_eq!(
-        keys::tree_node(&map, 0x0102, &[0xee, 0xf0]),
-        cat(&[&[0x02, 0x00], &id, &[0x01, 0x02, 0xee, 0xf0]])
+        keys::tree_node(0x0102, &[0xee, 0xf0]),
+        [0x02, 0x00, 0x01, 0x02, 0xee, 0xf0]
     );
-    assert_eq!(keys::tree_nodes(&map), cat(&[&[0x02, 0x00], &id]));
-    assert_eq!(
-        keys::tree_leaf(&map, &key),
-        cat(&[&[0x02, 0x01], &id, &key])
-    );
-    assert_eq!(keys::tree_leaves(&map), cat(&[&[0x02, 0x01], &id]));
-    assert_eq!(keys::tree_root(&map), cat(&[&[0x02, 0x02], &id]));
+    assert_eq!(keys::tree_nodes(), [0x02, 0x00]);
+    assert_eq!(keys::tree_leaf(&row), cat(&[&[0x02, 0x01], &row]));
+    assert_eq!(keys::tree_leaves(), [0x02, 0x01]);
+    assert_eq!(keys::tree_root(), [0x02, 0x02]);
     assert_eq!(keys::built(), [0x02, 0x03]);
     // The hashed transform: the first 16 bytes of BLAKE2b-256 over
     // `vos/tree/key` and the key, then the key escaped.

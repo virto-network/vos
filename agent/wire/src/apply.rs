@@ -246,7 +246,7 @@ impl Apply<'_> {
                 None => self.delete(&row),
             }
             if let Host::Vos { .. } = self.host {
-                self.put(&keys::dirty(version, &item.map, &item.key), &[]);
+                self.put(&keys::dirty(version, &row), &[]);
             }
         }
         for page in &run.pages {

@@ -347,3 +347,18 @@ pub fn unversioned(bytes: &[u8]) -> Option<(u64, &[u8])> {
     let (version, value) = bytes.split_first_chunk::<8>()?;
     Some((u64::from_le_bytes(*version), value))
 }
+
+/// The bytes the leaf of the row `key` commits, from the row as stored: a
+/// committed row's bare value, without its format byte and the version
+/// that wrote it, so its leaf is the same on every host; any other row's
+/// stored bytes whole. `None` for a committed row not stored as a value
+/// row.
+pub fn leaf_value<'a>(key: &[u8], stored: &'a [u8]) -> Option<&'a [u8]> {
+    if crate::keys::is_committed(key) {
+        unstored(stored)
+            .and_then(unversioned)
+            .map(|(_, value)| value)
+    } else {
+        Some(stored)
+    }
+}

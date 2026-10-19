@@ -247,3 +247,53 @@ pub(crate) fn own(package: &Package, simulation: &Simulation) -> u64 {
         + ROW * rows
         + WRITE * writes
 }
+
+#[cfg(test)]
+mod tests {
+    use core::cell::Cell;
+
+    use vos_tree::{Blake2b, Hash, Hasher, leaf_hash};
+    use vos_wire::abi::Rows;
+    use vos_wire::ids::InstanceId;
+    use vos_wire::keys::{self, Transform};
+
+    use super::{compressions, leaf};
+    use crate::gas::cap;
+
+    /// BLAKE2b, counting the compressions its hashes make: one per 128-byte
+    /// block of input.
+    struct Counting(Cell<u64>);
+
+    impl Hasher for Counting {
+        fn hash(&self, tag: &[u8], parts: &[&[u8]]) -> Hash {
+            let len = tag.len() + parts.iter().map(|part| part.len()).sum::<usize>();
+            self.0.set(self.0.get() + compressions(len));
+            Blake2b.hash(tag, parts)
+        }
+    }
+
+    /// The compressions of the leaf of `raw`'s committed row, as hashed
+    /// and as estimated, which agree.
+    fn leaf_compressions(raw: &[u8], transform: Transform) -> u64 {
+        let rows = Rows::Committed { tag: 2, transform };
+        let row = keys::row(InstanceId(1), rows, raw).unwrap();
+        let counting = Counting(Cell::new(0));
+        leaf_hash(&counting, &row, &[0; 32]);
+        assert_eq!(counting.0.get(), leaf(row.len()), "{} bytes", row.len());
+        counting.0.get()
+    }
+
+    /// A committed row's leaf at an ordered key of 64 bytes, its zero bytes
+    /// escaped, outgrows one block: two compressions, counted as two. At
+    /// 64 bytes with none, and at a hashed key of 32, it takes one.
+    #[test]
+    fn a_long_ordered_keys_leaf_counts_two_compressions() {
+        let zeros = [0; cap::ORDERED_KEY];
+        assert_eq!(leaf_compressions(&zeros, Transform::Ordered), 2);
+        assert_eq!(
+            leaf_compressions(&[1; cap::ORDERED_KEY], Transform::Ordered),
+            1
+        );
+        assert_eq!(leaf_compressions(&[7; 32], Transform::Hashed), 1);
+    }
+}

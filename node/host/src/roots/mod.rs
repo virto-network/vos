@@ -1,19 +1,24 @@
-//! Committed maps' roots: each map's tree, kept as rows beside its value
-//! rows, built in the background from the dirty rows accumulate leaves, and
-//! the proofs it serves.
+//! The agent's root: one tree over its committed rows, the keys under
+//! `0x03` ([`keys::committed`]), kept as rows beside them, built in the
+//! background from the dirty rows accumulate leaves, and the proofs it
+//! serves. A leaf commits its row's bare value, salted from the seed of the
+//! version that wrote it and the row's whole key, as JAM's tree over the
+//! whole keyspace commits it, so the agent's root is the node of JAM's tree
+//! at `0x03`, and a committed map's root the node at the map's prefix, in
+//! either tree ([`vos_tree::node_at`]).
 //!
 //! A [`Build`] runs at the agent's state version V, from one store snapshot
 //! at V, over every version past the last complete build's, W. It reads
 //! the dirty rows of those versions in batches of at most `BATCH` keys,
 //! and gives each key's leaf the value its row holds at V, salted from the
-//! seed of the version that wrote it. Each batch rewrites its keys' paths,
-//! map by map, with [`vos_tree::update`], reading the trees' rows from a
-//! newer snapshot (only builds write them), and deletes the dirty rows it
-//! read and the seeds of the versions whose rows it has all read. It is
-//! one [`Change::Tree`], which the writer refuses once the agent's epoch
-//! has moved. The last batch writes each map's root at V and moves W to V.
-//! No build holds, or commits, more than a batch's worth of rows, however
-//! far behind it starts.
+//! seed of the version that wrote it. Each batch rewrites its keys' paths
+//! with [`vos_tree::update`], reading the tree's rows from a newer snapshot
+//! (only builds write them), and deletes the dirty rows it read and the
+//! seeds of the versions whose rows it has all read. It is one
+//! [`Change::Tree`], which the writer refuses once the agent's epoch has
+//! moved. The last batch writes the agent's root at V and moves W to V. No
+//! build holds, or commits, more than a batch's worth of rows, however far
+//! behind it starts.
 //!
 //! One invariant carries correctness: every tree row whose subtree holds no
 //! dirty key matches the value rows at the version the build reads. A batch
@@ -27,7 +32,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
-use vos_tree::{BatchProof, Blake2b, Child, Hash, Leaf, Node, NodeStore, empty_root};
+use vos_tree::{BatchProof, Blake2b, Child, Hash, Leaf, Node, NodeStore, empty_root, node_at};
 use vos_wire::ids::{AgentId, MapId};
 use vos_wire::keys;
 use vos_wire::records::{unstored, unversioned};
@@ -57,8 +62,9 @@ pub enum Error {
     /// The agent's epoch moved under the build: a snapshot was installed,
     /// or the agent retired.
     Moved,
-    /// The map's tree is part-way through a build: its rows match no root
-    /// until the build's last batch.
+    /// The tree is part-way through a build: its rows match no root until
+    /// the build's last batch, and a map's match none while a write to it
+    /// waits.
     Building,
     /// The node could not run or commit a batch.
     Halted(String),
@@ -71,7 +77,7 @@ impl std::fmt::Display for Error {
             Error::Tree(error) => write!(f, "the tree refused: {error}"),
             Error::Corrupt(what) => write!(f, "{what} does not read back"),
             Error::Moved => f.write_str("the agent's epoch moved"),
-            Error::Building => f.write_str("the map's tree is part-way through a build"),
+            Error::Building => f.write_str("the tree is part-way through a build"),
             Error::Halted(why) => write!(f, "the build stopped: {why}"),
         }
     }
@@ -91,9 +97,9 @@ impl From<vos_tree::Error> for Error {
     }
 }
 
-/// A map's root row: the tree's top, and the root its last complete build
-/// left. Between a build's batches the top has moved on and the root has
-/// not.
+/// The agent's root row: the tree's top, and the root its last complete
+/// build left. Between a build's batches the top has moved on and the root
+/// has not.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub(crate) struct RootRow {
     pub(crate) top: Option<Child>,
@@ -115,13 +121,9 @@ impl RootRow {
     }
 }
 
-/// A map's root row, as `snapshot` holds it.
-pub(crate) fn root_row(
-    snapshot: &Snapshot,
-    agent: AgentId,
-    map: &MapId,
-) -> Result<Option<RootRow>, Error> {
-    let Some(bytes) = snapshot.get(agent, &keys::tree_root(map))? else {
+/// The agent's root row, as `snapshot` holds it.
+pub(crate) fn root_row(snapshot: &Snapshot, agent: AgentId) -> Result<Option<RootRow>, Error> {
+    let Some(bytes) = snapshot.get(agent, &keys::tree_root())? else {
         return Ok(None);
     };
     RootRow::decode_exact(&bytes)
@@ -129,34 +131,17 @@ pub(crate) fn root_row(
         .ok_or(Error::Corrupt("a root row"))
 }
 
-/// A map's root and the state version it holds, as `snapshot` has them:
-/// the agent's version when none of the map's writes waits for a build,
-/// else the last complete build's.
-pub fn root(snapshot: &Snapshot, agent: AgentId, map: &MapId) -> Result<(Hash, u64), Error> {
-    let root = match root_row(snapshot, agent, map)? {
+/// The agent's root, over its committed rows, and the state version it
+/// holds, as `snapshot` has them: the agent's version when no committed
+/// write waits for a build, else the last complete build's.
+pub fn agent_root(snapshot: &Snapshot, agent: AgentId) -> Result<(Hash, u64), Error> {
+    let root = match root_row(snapshot, agent)? {
         Some(row) if row.building() => return Err(Error::Building),
         Some(row) => row.root,
         None => empty_root(&Blake2b),
     };
     let built = built(snapshot, agent)?;
-    // The writes past the last complete build, a batch's worth at most:
-    // past that, the map is taken to have some among them.
-    let (prefix, after) = (keys::dirty_prefix(), keys::dirty_from(built + 1));
-    let mut pending = snapshot.scan(agent, &prefix, Some(&after)).take(BATCH);
-    let mut scanned = 0;
-    let waits = loop {
-        match pending.next().transpose()? {
-            None => break scanned == BATCH,
-            Some((key, _)) => {
-                scanned += 1;
-                let (_, of, _) = keys::dirty_entry(&key).ok_or(Error::Corrupt("a dirty row"))?;
-                if of == *map {
-                    break true;
-                }
-            }
-        }
-    };
-    let version = if waits {
+    let version = if waits(snapshot, agent, built, None)? {
         built
     } else {
         state_version(snapshot, agent)?
@@ -164,7 +149,68 @@ pub fn root(snapshot: &Snapshot, agent: AgentId, map: &MapId) -> Result<(Hash, u
     Ok((root, version))
 }
 
-/// The version every map's tree is built through.
+/// A committed map's root, the node of the agent's tree at the map's
+/// prefix, and the state version it holds, as `snapshot` has them.
+pub fn root(snapshot: &Snapshot, agent: AgentId, map: &MapId) -> Result<(Hash, u64), Error> {
+    let (top, version) = map_top(snapshot, agent, map)?;
+    let root = top.map_or_else(|| empty_root(&Blake2b), |top| *top.hash());
+    Ok((root, version))
+}
+
+/// The node at `map`'s prefix, `None` while the map is empty, and the
+/// state version it holds: the agent's version when none of the map's
+/// writes waits for a build, else the last complete build's. While a build
+/// is part-way, a map none of whose writes waits is read from the tree's
+/// top as it stands: every key of the map a build has taken was rebuilt
+/// from its value at the build's version, which no later write changed.
+/// One whose writes wait matches no root until the build ends.
+fn map_top(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    map: &MapId,
+) -> Result<(Option<Child>, u64), Error> {
+    let row = root_row(snapshot, agent)?;
+    let built = built(snapshot, agent)?;
+    let waits = waits(snapshot, agent, built, Some(map))?;
+    if waits && row.as_ref().is_some_and(RootRow::building) {
+        return Err(Error::Building);
+    }
+    let tree = AgentStore::new(snapshot, agent, row.and_then(|row| row.top));
+    let top = node_at(&tree, &keys::committed_rows(map))?;
+    let version = if waits {
+        built
+    } else {
+        state_version(snapshot, agent)?
+    };
+    Ok((top, version))
+}
+
+/// Whether a committed write past `built`, to `map` or (`None`) to any
+/// map, waits for a build. Past a batch's worth of dirty rows, the map is
+/// taken to have some among them.
+fn waits(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    built: u64,
+    map: Option<&MapId>,
+) -> Result<bool, Error> {
+    let rows = map.map_or_else(keys::committed_all, keys::committed_rows);
+    let (prefix, after) = (keys::dirty_prefix(), keys::dirty_from(built + 1));
+    let mut pending = snapshot.scan(agent, &prefix, Some(&after)).take(BATCH);
+    let mut scanned = 0;
+    loop {
+        let Some((key, _)) = pending.next().transpose()? else {
+            return Ok(scanned == BATCH);
+        };
+        scanned += 1;
+        let (_, row) = keys::dirty_entry(&key).ok_or(Error::Corrupt("a dirty row"))?;
+        if row.starts_with(&rows) {
+            return Ok(true);
+        }
+    }
+}
+
+/// The version the agent's tree is built through.
 fn built(snapshot: &Snapshot, agent: AgentId) -> Result<u64, Error> {
     match snapshot.get(agent, &keys::built())? {
         Some(bytes) => match u64::decode(&bytes) {
@@ -186,11 +232,11 @@ fn state_version(snapshot: &Snapshot, agent: AgentId) -> Result<u64, Error> {
     }
 }
 
-/// Whether a map's stored node and leaf rows are exactly those its tree
+/// Whether the agent's stored node and leaf rows are exactly those its tree
 /// reaches from its top.
 #[doc(hidden)]
-pub fn rows_match_tree(snapshot: &Snapshot, agent: AgentId, map: MapId) -> Result<bool, Error> {
-    let tree = MapStore::open(snapshot, agent, map)?;
+pub fn rows_match_tree(snapshot: &Snapshot, agent: AgentId) -> Result<bool, Error> {
+    let tree = AgentStore::open(snapshot, agent)?;
     let reached = vos_tree::reachable(&tree)?;
     let stored = |prefix: Vec<u8>| -> Result<BTreeSet<Vec<u8>>, Error> {
         snapshot
@@ -204,7 +250,7 @@ pub fn rows_match_tree(snapshot: &Snapshot, agent: AgentId, map: MapId) -> Resul
         .map(|(level, prefix)| [&level.to_be_bytes()[..], prefix].concat())
         .collect();
     let leaves: BTreeSet<Vec<u8>> = reached.leaves.into_iter().collect();
-    Ok(stored(keys::tree_nodes(&map))? == nodes && stored(keys::tree_leaves(&map))? == leaves)
+    Ok(stored(keys::tree_nodes())? == nodes && stored(keys::tree_leaves())? == leaves)
 }
 
 /// A committed map's latest root, the state version it holds, and a proof
@@ -214,31 +260,36 @@ pub struct Proven {
     pub root: Hash,
     pub version: u64,
     pub proof: BatchProof,
-    /// Each key asked for: its key in the tree (transformed), and its leaf
-    /// at `version` when present, whose salt opens the value's commitment.
+    /// Each key asked for: its key in the tree, its committed row's
+    /// ([`keys::committed`]), and its leaf at `version` when present, whose
+    /// salt opens the value's commitment.
     pub leaves: Vec<(Vec<u8>, Option<Leaf>)>,
 }
 
 /// The proof of `keys`, raw as the map's handler wrote them, from one
-/// storage snapshot.
+/// storage snapshot, against the map's root: the node of the agent's tree
+/// at its prefix.
 pub(crate) fn prove<K: AsRef<[u8]>>(
     snapshot: &Snapshot,
     agent: AgentId,
     map: MapId,
     keys: &[K],
 ) -> Result<Proven, Error> {
-    let (root, version) = root(snapshot, agent, &map)?;
-    let store = MapStore::open(snapshot, agent, map)?;
-    let transformed: Vec<Vec<u8>> = keys
+    let (top, version) = map_top(snapshot, agent, &map)?;
+    let root = top
+        .as_ref()
+        .map_or_else(|| empty_root(&Blake2b), |top| *top.hash());
+    let store = AgentStore::new(snapshot, agent, top);
+    let rows: Vec<Vec<u8>> = keys
         .iter()
-        .map(|key| map.transform.apply(key.as_ref()))
+        .map(|key| keys::committed(&map, &map.transform.apply(key.as_ref())))
         .collect();
-    let proof = BatchProof::generate(&store, &transformed)?;
-    let leaves = transformed
+    let proof = BatchProof::generate(&store, &rows)?;
+    let leaves = rows
         .into_iter()
-        .map(|key| {
-            let leaf = store.leaf(&key)?;
-            Ok((key, leaf))
+        .map(|row| {
+            let leaf = store.leaf(&row)?;
+            Ok((row, leaf))
         })
         .collect::<Result<_, Error>>()?;
     Ok(Proven {
@@ -249,28 +300,29 @@ pub(crate) fn prove<K: AsRef<[u8]>>(
     })
 }
 
-/// One map's tree over a store snapshot: reads from the snapshot, writes
-/// gathered for one commit. [`vos_tree::update`] reads every row it needs
-/// before it writes any, so the snapshot never lags the writes.
-pub struct MapStore<'a> {
+/// The agent's tree over a store snapshot, from a top: the tree's own, or
+/// a node of it, a map's. Reads come from the snapshot, writes are gathered
+/// for one commit. [`vos_tree::update`] reads every row it needs before it
+/// writes any, so the snapshot never lags the writes.
+pub struct AgentStore<'a> {
     snapshot: &'a Snapshot,
     agent: AgentId,
-    map: MapId,
     top: Option<Child>,
     writes: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
 }
 
-impl<'a> MapStore<'a> {
-    pub fn open(snapshot: &'a Snapshot, agent: AgentId, map: MapId) -> Result<Self, Error> {
-        let top = root_row(snapshot, agent, &map)?.and_then(|row| row.top);
-        Ok(Self::new(snapshot, agent, map, top))
+impl<'a> AgentStore<'a> {
+    /// The tree from the top its root row holds.
+    pub fn open(snapshot: &'a Snapshot, agent: AgentId) -> Result<Self, Error> {
+        let top = root_row(snapshot, agent)?.and_then(|row| row.top);
+        Ok(Self::new(snapshot, agent, top))
     }
 
-    fn new(snapshot: &'a Snapshot, agent: AgentId, map: MapId, top: Option<Child>) -> Self {
+    /// The tree below `top`.
+    pub fn new(snapshot: &'a Snapshot, agent: AgentId, top: Option<Child>) -> Self {
         Self {
             snapshot,
             agent,
-            map,
             top,
             writes: BTreeMap::new(),
         }
@@ -286,7 +338,7 @@ impl<'a> MapStore<'a> {
     }
 }
 
-impl NodeStore for MapStore<'_> {
+impl NodeStore for AgentStore<'_> {
     type Error = Error;
 
     fn top(&self) -> Result<Option<Child>, Error> {
@@ -294,11 +346,11 @@ impl NodeStore for MapStore<'_> {
     }
 
     fn node(&self, level: u16, prefix: &[u8]) -> Result<Option<Node>, Error> {
-        self.read(&keys::tree_node(&self.map, level, prefix), "a node row")
+        self.read(&keys::tree_node(level, prefix), "a node row")
     }
 
     fn leaf(&self, key: &[u8]) -> Result<Option<Leaf>, Error> {
-        self.read(&keys::tree_leaf(&self.map, key), "a leaf row")
+        self.read(&keys::tree_leaf(key), "a leaf row")
     }
 
     fn set_top(&mut self, top: Option<Child>) -> Result<(), Error> {
@@ -307,33 +359,32 @@ impl NodeStore for MapStore<'_> {
     }
 
     fn put_node(&mut self, level: u16, prefix: &[u8], node: Node) -> Result<(), Error> {
-        let key = keys::tree_node(&self.map, level, prefix);
+        let key = keys::tree_node(level, prefix);
         self.writes.insert(key, Some(node.encode()));
         Ok(())
     }
 
     fn delete_node(&mut self, level: u16, prefix: &[u8]) -> Result<(), Error> {
-        self.writes
-            .insert(keys::tree_node(&self.map, level, prefix), None);
+        self.writes.insert(keys::tree_node(level, prefix), None);
         Ok(())
     }
 
     fn put_leaf(&mut self, key: &[u8], leaf: Leaf) -> Result<(), Error> {
-        let key = keys::tree_leaf(&self.map, key);
+        let key = keys::tree_leaf(key);
         self.writes.insert(key, Some(leaf.encode()));
         Ok(())
     }
 
     fn delete_leaf(&mut self, key: &[u8]) -> Result<(), Error> {
-        self.writes.insert(keys::tree_leaf(&self.map, key), None);
+        self.writes.insert(keys::tree_leaf(key), None);
         Ok(())
     }
 }
 
-/// Keys to rebuild, by map, each map's sorted.
-type Keys = BTreeMap<MapId, BTreeSet<Vec<u8>>>;
+/// Committed rows' keys to rebuild, sorted.
+type Keys = BTreeSet<Vec<u8>>;
 
-/// A build of an agent's roots at its state version, a batch at a time.
+/// A build of the agent's root at its state version, a batch at a time.
 pub struct Build {
     store: Fjall,
     agent: AgentId,
@@ -348,13 +399,13 @@ pub struct Build {
     seeds_through: u64,
     /// How many dirty rows were read.
     read: u64,
-    /// Each map the build touched, with its tree's top as last written.
-    tops: BTreeMap<MapId, Option<Child>>,
+    /// The tree's top as the build last wrote it, once it has.
+    top: Option<Option<Child>>,
     done: bool,
 }
 
 impl Build {
-    /// A build of `agent`'s roots at the state version `store` holds now,
+    /// A build of `agent`'s root at the state version `store` holds now,
     /// or `None` when no write waits for one.
     pub fn start(store: &Fjall, agent: AgentId) -> Result<Option<Self>, Error> {
         let at = store.snapshot();
@@ -381,7 +432,7 @@ impl Build {
             cursor: keys::dirty_from(from + 1),
             seeds_through: from,
             read: 0,
-            tops: BTreeMap::new(),
+            top: None,
             done: false,
         }))
     }
@@ -415,14 +466,14 @@ impl Build {
         }
         let mut seeds = HashMap::new();
         let mut writes = BTreeMap::new();
-        for (map, rebuilt) in batch {
-            let before = root_row(&fresh, self.agent, &map)?;
+        if !batch.is_empty() {
+            let before = root_row(&fresh, self.agent)?;
             let top = before.as_ref().and_then(|row| row.top.clone());
-            let mut tree = MapStore::new(&fresh, self.agent, map, top);
-            let leaves = rebuilt
+            let mut tree = AgentStore::new(&fresh, self.agent, top);
+            let leaves = batch
                 .into_iter()
                 .map(|key| {
-                    let leaf = self.leaf(&mut seeds, &map, &key)?;
+                    let leaf = self.leaf(&mut seeds, &key)?;
                     Ok((key, leaf))
                 })
                 .collect::<Result<Vec<_>, Error>>()?;
@@ -434,19 +485,19 @@ impl Build {
                 root,
             };
             writes.extend(tree.writes);
-            writes.insert(keys::tree_root(&map), Some(row.encode()));
-            self.tops.insert(map, tree.top);
+            writes.insert(keys::tree_root(), Some(row.encode()));
+            self.top = Some(tree.top);
         }
         writes.extend(rows.into_iter().map(|row| (row, None)));
         // The seeds of the versions whose dirty rows are all read. A batch
         // before the last keeps its cursor version's seed even once that
         // version's rows are read: an interrupted build then always leaves
         // a seed past the watermark, so the next build starts and finishes
-        // the maps it left part-way.
+        // the tree it left part-way.
         let through = if last {
             self.version
         } else {
-            let (version, _, _) =
+            let (version, _) =
                 keys::dirty_entry(&self.cursor).ok_or(Error::Corrupt("a dirty row"))?;
             version.saturating_sub(1)
         };
@@ -472,37 +523,33 @@ impl Build {
         }))
     }
 
-    /// The last batch's root rows, each complete at the build's version:
-    /// every map the build touched, and every map an earlier build cut
-    /// short left part-way, which has no write past it, or this build would
-    /// have touched it. Then the version every tree is built through.
+    /// The last batch's root row, complete at the build's version: the
+    /// tree as this build left it, or as an earlier build cut short left
+    /// it, which has no write past it, or this build would have touched
+    /// it. Then the version the tree is built through.
     fn finish(
         &mut self,
         fresh: &Snapshot,
         writes: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     ) -> Result<(), Error> {
-        for row in fresh.scan(self.agent, &keys::tree_roots(), None) {
-            let (key, _) = row?;
-            let map = keys::tree_root_entry(&key).ok_or(Error::Corrupt("a root row"))?;
-            if let Some(row) = root_row(fresh, self.agent, &map)?
-                && row.building()
-            {
-                self.tops.entry(map).or_insert(row.top);
-            }
-        }
-        for (map, top) in core::mem::take(&mut self.tops) {
+        let top = match self.top.take() {
+            Some(top) => Some(top),
+            None => root_row(fresh, self.agent)?
+                .filter(RootRow::building)
+                .map(|row| row.top),
+        };
+        if let Some(top) = top {
             let row = RootRow::complete(top);
-            writes.insert(keys::tree_root(&map), Some(row.encode()));
+            writes.insert(keys::tree_root(), Some(row.encode()));
         }
         writes.insert(keys::built(), Some(self.version.encode()));
         self.done = true;
         Ok(())
     }
 
-    /// The next keys to rebuild, by map and sorted, and the dirty rows read
-    /// for them: rows read until `batch` keys, or as many rows as
-    /// [`ROWS_PER_KEY`] allows them, or none remain; and whether none
-    /// remains.
+    /// The next keys to rebuild, sorted, and the dirty rows read for them:
+    /// rows read until `batch` keys, or as many rows as [`ROWS_PER_KEY`]
+    /// allows them, or none remain; and whether none remains.
     fn read_batch(&mut self) -> Result<(Keys, Vec<Vec<u8>>, bool), Error> {
         let mut batch = Keys::new();
         let mut found = 0;
@@ -518,8 +565,8 @@ impl Build {
                 break true;
             };
             let (row, _) = row?;
-            let (_, map, key) = keys::dirty_entry(&row).ok_or(Error::Corrupt("a dirty row"))?;
-            if batch.entry(map).or_default().insert(key.to_vec()) {
+            let (_, key) = keys::dirty_entry(&row).ok_or(Error::Corrupt("a dirty row"))?;
+            if batch.insert(key.to_vec()) {
                 found += 1;
             }
             self.cursor.clone_from(&row);
@@ -529,15 +576,11 @@ impl Build {
         Ok((batch, rows, last))
     }
 
-    /// The leaf of `key` at the build's version: its value's commitment
-    /// under the salt of the version that wrote it, or `None` if deleted.
-    fn leaf(
-        &self,
-        seeds: &mut HashMap<u64, [u8; 32]>,
-        map: &MapId,
-        key: &[u8],
-    ) -> Result<Option<Leaf>, Error> {
-        let Some(bytes) = self.at.get(self.agent, &keys::committed(map, key))? else {
+    /// The leaf of the committed row `key` at the build's version: its
+    /// bare value's commitment under the salt of the version that wrote it,
+    /// or `None` if deleted.
+    fn leaf(&self, seeds: &mut HashMap<u64, [u8; 32]>, key: &[u8]) -> Result<Option<Leaf>, Error> {
+        let Some(bytes) = self.at.get(self.agent, key)? else {
             return Ok(None);
         };
         let (version, value) = unstored(&bytes)
@@ -558,7 +601,7 @@ impl Build {
     }
 }
 
-/// Build `shared`'s agent's roots after its applies that leave dirty rows,
+/// Build `shared`'s agent's root after its applies that leave dirty rows,
 /// until its group stops: one build at a time, each at the latest state
 /// version, so builds coalesce the applies made meanwhile. The batches run
 /// on the executors, off the apply path. The first build runs at once,

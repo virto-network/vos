@@ -1,17 +1,18 @@
 //! The builder against roots from scratch: batches of any size, builds
-//! cut short, and builds across an epoch change.
+//! cut short, and builds across an epoch change; and the agent's root and
+//! its maps' against JAM's tree over the whole keyspace.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use vos_tree::{Blake2b, Leaf, value_hash};
+use vos_tree::{Blake2b, Leaf, NodeStore, empty_root, node_at, value_hash};
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, MapId};
 use vos_wire::keys::{self, Transform};
 use vos_wire::records::{stored, versioned};
 use vos_wire::result::Write;
 
-use super::{Build, Error, prove, root, rows_match_tree};
+use super::{Build, Error, agent_root, prove, root, rows_match_tree};
 use crate::NoHooks;
 use crate::storage::{Change, StorageThread};
 use crate::store::{Fjall, HardState, Membership, Switch};
@@ -62,23 +63,23 @@ impl Agent {
     }
 
     /// A work result's committed writes, each a raw key and a value or
-    /// a deletion, at the next version.
-    fn apply(&mut self, writes: &[Committed]) {
+    /// a deletion, at the next version: the rows it applied.
+    fn apply(&mut self, writes: &[Committed]) -> Vec<Write> {
         self.applied += 1;
         self.version += 1;
         let version = self.version;
         let mut rows = Vec::new();
         for (map, key, value) in writes {
-            let transformed = map.transform.apply(key);
+            let row = keys::committed(map, &map.transform.apply(key));
             rows.push(Write {
-                key: keys::committed(map, &transformed),
+                key: keys::dirty(version, &row),
+                value: Some(stored(&[])),
+            });
+            rows.push(Write {
+                key: row,
                 value: value
                     .as_ref()
                     .map(|value| stored(&versioned(version, value))),
-            });
-            rows.push(Write {
-                key: keys::dirty(version, map, &transformed),
-                value: Some(stored(&[])),
             });
             match value {
                 Some(value) => self
@@ -101,9 +102,10 @@ impl Agent {
             agent: AGENT,
             epoch: self.epoch,
             index: self.applied,
-            writes: rows,
+            writes: rows.clone(),
         })
         .unwrap();
+        rows
     }
 
     /// Run a build to its end, `batch` keys at a time.
@@ -117,15 +119,16 @@ impl Agent {
         }
     }
 
-    /// The root of `map` from scratch over its values, each salted
+    /// The root from scratch over the values of `map`, or (`None`) of
+    /// every map, each leaf at its committed row's key, its value salted
     /// from the seed of the version that wrote it.
-    fn expected(&self, map: MapId) -> vos_tree::Hash {
+    fn expected_of(&self, map: Option<MapId>) -> vos_tree::Hash {
         let leaves: BTreeMap<Vec<u8>, vos_tree::Hash> = self
             .values
             .iter()
-            .filter(|((at, _), _)| *at == map)
-            .map(|((_, key), (version, value))| {
-                let key = map.transform.apply(key);
+            .filter(|((at, _), _)| map.is_none_or(|map| *at == map))
+            .map(|((at, key), (version, value))| {
+                let key = keys::committed(at, &at.transform.apply(key));
                 let leaf = Leaf::salted(&Blake2b, &seed(*version), &key, value);
                 (key, leaf.value_hash)
             })
@@ -134,17 +137,25 @@ impl Agent {
         vos_tree::root(&Blake2b, &leaves)
     }
 
-    /// The map's root is the one from scratch at the agent's version,
-    /// its rows are exactly the tree's, and no dirty or seed row is
-    /// left.
+    fn expected(&self, map: MapId) -> vos_tree::Hash {
+        self.expected_of(Some(map))
+    }
+
+    /// The map's root and the agent's are the ones from scratch at the
+    /// agent's version, the tree's rows are exactly those it reaches, and
+    /// no dirty or seed row is left.
     fn check(&self, map: MapId) {
         let snapshot = self.store.snapshot();
         assert_eq!(
             root(&snapshot, AGENT, &map).unwrap(),
             (self.expected(map), self.version)
         );
+        assert_eq!(
+            agent_root(&snapshot, AGENT).unwrap(),
+            (self.expected_of(None), self.version)
+        );
         assert!(
-            rows_match_tree(&snapshot, AGENT, map).unwrap(),
+            rows_match_tree(&snapshot, AGENT).unwrap(),
             "rows off the tree"
         );
         let stored = |prefix: Vec<u8>| snapshot.scan(AGENT, &prefix, None).count();
@@ -215,7 +226,7 @@ fn builds_reach_the_root_from_scratch_in_any_batches() {
                 {
                     assert_eq!(value_hash(&Blake2b, salt, value), *commitment);
                 }
-                assert_eq!(*key, target.transform.apply(raw));
+                assert_eq!(*key, keys::committed(&target, &target.transform.apply(raw)));
             }
         }
     }
@@ -223,8 +234,9 @@ fn builds_reach_the_root_from_scratch_in_any_batches() {
 
 /// A build stopped part-way, its batches committed until then, is
 /// finished by a later build, after more applies: the root from scratch,
-/// with no row off the tree. Between its batches the map proves nothing,
-/// while a map it never touched proves against its root.
+/// with no row off the tree. Between its batches neither the agent's root
+/// nor a map with writes waiting proves anything, while a map with none
+/// proves against its root.
 #[test]
 fn a_build_cut_short_is_finished_by_the_next() {
     let dir = tempfile::tempdir().unwrap();
@@ -253,6 +265,7 @@ fn a_build_cut_short_is_finished_by_the_next() {
         root(&snapshot, AGENT, &target),
         Err(Error::Building)
     ));
+    assert!(matches!(agent_root(&snapshot, AGENT), Err(Error::Building)));
     assert!(matches!(
         prove(&snapshot, AGENT, target, &[key(1)]),
         Err(Error::Building)
@@ -277,8 +290,9 @@ fn a_build_cut_short_is_finished_by_the_next() {
 }
 
 /// A build cut short after its batches consumed a map's every dirty row
-/// leaves that map part-way; the next build finishes it though it has no
-/// write left to touch it.
+/// leaves the tree part-way: that map's root is its values', the agent's
+/// none until the next build, which finishes the tree though it has no
+/// write of that map left to touch it.
 #[test]
 fn a_map_left_part_way_is_finished_without_a_write() {
     let dir = tempfile::tempdir().unwrap();
@@ -295,10 +309,16 @@ fn a_map_left_part_way_is_finished_without_a_write() {
         .unwrap()
         .in_batches_of(2);
     agent.commit(build.next_batch().unwrap().unwrap()).unwrap();
+    let snapshot = agent.store.snapshot();
+    assert_eq!(
+        root(&snapshot, AGENT, &early).unwrap(),
+        (agent.expected(early), agent.version)
+    );
     assert!(matches!(
-        root(&agent.store.snapshot(), AGENT, &early),
+        root(&snapshot, AGENT, &late),
         Err(Error::Building)
     ));
+    assert!(matches!(agent_root(&snapshot, AGENT), Err(Error::Building)));
     drop(build);
     agent.apply(&[(late, key(4), Some(vec![4]))]);
     agent.build(super::BATCH);
@@ -326,7 +346,7 @@ fn a_build_across_an_epoch_change_is_refused() {
     // The leader's state, the agent's rows as they are, staged into
     // epoch 1 and switched to, as a snapshot install does.
     let snapshot = agent.store.snapshot();
-    let owners = [[0x00], [0x01], [0x02]];
+    let owners = [[0x00], [0x01], [0x02], [0x03]];
     let rows: Vec<_> = owners
         .iter()
         .flat_map(|owner| snapshot.scan(AGENT, owner, None))
@@ -369,4 +389,149 @@ fn a_build_across_an_epoch_change_is_refused() {
     assert!(agent.store.stale_epochs(AGENT).unwrap().is_empty());
     agent.build(super::BATCH);
     agent.check(target);
+}
+
+/// splitmix64: random rows, reproducible.
+struct Random(u64);
+
+impl Random {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    fn below(&mut self, bound: u64) -> u64 {
+        self.next() % bound
+    }
+}
+
+/// The hash of the node of `tree` at `prefix`, the empty tree's when no
+/// key starts with it.
+fn node_hash<S: NodeStore>(tree: &S, prefix: &[u8]) -> vos_tree::Hash
+where
+    S::Error: std::fmt::Debug,
+{
+    node_at(tree, prefix)
+        .unwrap()
+        .map_or_else(|| empty_root(&Blake2b), |node| *node.hash())
+}
+
+/// Rows of owners beside `0x03` on both sides of it, for JAM's tree.
+fn siblings(round: u64) -> BTreeMap<Vec<u8>, Option<Vec<u8>>> {
+    let table = keys::table_rows(InstanceId(1), 5, Transform::Hashed);
+    BTreeMap::from([
+        (
+            [table, Transform::Hashed.apply(&round.to_be_bytes())].concat(),
+            Some(stored(&round.encode())),
+        ),
+        (keys::instance_struct(InstanceId(2)), Some(stored(&[7]))),
+        (vec![0x04, round as u8], Some(stored(&[8]))),
+    ])
+}
+
+/// The agent's root is the node of JAM's tree over the whole keyspace at
+/// `0x03`, and each committed map's root the node at the map's prefix,
+/// byte for byte: over random rows of maps of two instances and either
+/// transform, among rows of other owners, written over several versions
+/// and built in batches of any size; over one row; and over none, among
+/// rows of other owners still.
+#[test]
+fn roots_are_nodes_of_jams_tree() {
+    let maps = [
+        map(5, Transform::Hashed),
+        map(5, Transform::Ordered),
+        map(6, Transform::Hashed),
+        MapId {
+            instance: InstanceId(2),
+            tag: 5,
+            transform: Transform::Ordered,
+        },
+    ];
+    let mut random = Random(0x0611);
+    for case in 0..10u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agent = Agent::new(dir.path());
+        let jam = vos_jam::Store::temporary().unwrap();
+        let rounds = match case {
+            0 => 0,
+            1 => 1,
+            _ => 1 + random.below(4),
+        };
+        for round in 0..rounds {
+            let count = if case == 1 { 1 } else { 1 + random.below(40) };
+            let writes: Vec<Committed> = (0..count)
+                .map(|_| {
+                    let target = maps[random.below(maps.len() as u64) as usize];
+                    // Among them the longest ordered key, its zero bytes
+                    // escaped past one block, and a key beside its own
+                    // extension, which the escape keeps prefix-free.
+                    let raw = match random.below(16) {
+                        0 => vec![0; vos_wire::abi::cap::ORDERED_KEY],
+                        1 => vec![1],
+                        2 => vec![1, 0],
+                        _ => key(random.below(64)),
+                    };
+                    let value = (case == 1 || random.below(5) != 0).then(|| random.next().encode());
+                    (target, raw, value)
+                })
+                .collect();
+            // A key written twice in one result keeps its last value, as
+            // a step's overlay does.
+            let writes: BTreeMap<(MapId, Vec<u8>), Option<Vec<u8>>> = writes
+                .into_iter()
+                .map(|(target, raw, value)| ((target, raw), value))
+                .collect();
+            let writes: Vec<Committed> = writes
+                .into_iter()
+                .map(|((target, raw), value)| (target, raw, value))
+                .collect();
+            let rows = agent.apply(&writes);
+            // JAM keeps the same rows but the dirty and seed rows, and
+            // rows of the other owners beside them.
+            let mut on_jam: BTreeMap<Vec<u8>, Option<Vec<u8>>> = rows
+                .into_iter()
+                .filter(|row| {
+                    !row.key.starts_with(&keys::dirty_prefix())
+                        && !row.key.starts_with(&keys::seed_prefix())
+                })
+                .map(|row| (row.key, row.value))
+                .collect();
+            on_jam.extend(siblings(round));
+            jam.write(on_jam, &seed(agent.version)).unwrap();
+        }
+        if rounds == 0 {
+            // No committed row, in a tree that holds others.
+            jam.write(siblings(0), &seed(0)).unwrap();
+        }
+        agent.build([1, 7, super::BATCH][(case % 3) as usize]);
+        let snapshot = agent.store.snapshot();
+        let view = jam.view();
+        let tree = view.tree();
+        let (root_vos, version) = agent_root(&snapshot, AGENT).unwrap();
+        assert_eq!(version, agent.version);
+        assert_eq!(root_vos, agent.expected_of(None), "case {case}");
+        assert_eq!(
+            root_vos,
+            node_hash(&tree, &keys::committed_all()),
+            "case {case}: the agent's root"
+        );
+        for target in maps {
+            assert_eq!(
+                root(&snapshot, AGENT, &target).unwrap().0,
+                node_hash(&tree, &keys::committed_rows(&target)),
+                "case {case}: {target:?}'s root"
+            );
+        }
+        if case == 1 {
+            let leaf = node_at(&tree, &keys::committed_all()).unwrap();
+            assert!(
+                matches!(leaf, Some(vos_tree::Child::Leaf { .. })),
+                "one row: its leaf"
+            );
+        }
+        assert_ne!(jam.root().unwrap(), root_vos, "JAM's tree holds more");
+    }
 }

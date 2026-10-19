@@ -511,7 +511,7 @@ fn stores_agree(stores: &[(usize, &Fjall)], agent: AgentId, settled: u64) {
         .iter()
         .map(|(node, store, raft)| {
             let snapshot = store.snapshot();
-            let state = [[0x00u8], [0x01]]
+            let state = [[0x00u8], [0x01], [0x03]]
                 .iter()
                 .flat_map(|prefix| {
                     snapshot

@@ -1,13 +1,14 @@
 //! Tree shapes: depth under each transform, the deepest paths, and the
 //! format's known answers.
 
+use proptest::prelude::*;
 use vos_tree::{
-    BatchProof, Entry, Hash, MemStore, branch_hash, empty_root, keys, leaf_hash, root, salt,
-    value_hash,
+    BatchProof, Entry, Hash, MemStore, branch_hash, empty_root, keys, leaf_hash, node_at, root,
+    salt, value_hash,
 };
 
 use crate::common::{
-    H, Model, apply, check, claims, commitments, leaf, row_key, scratch, store_of,
+    H, Model, apply, check, claims, commitments, leaf, raw_key, row_key, scratch, store_of,
 };
 
 /// The number of branches on `key`'s path, its proof verified.
@@ -148,4 +149,47 @@ fn known_answers() {
         "893cfa8ac124a265b35ec8a85295d1877eeac3ec3c178bc397046f60a31f7f8f",
     ];
     assert_eq!(answers, pinned);
+}
+
+/// A key under one of a few fixed-width prefixes, as an agent's keyspace
+/// lays out owners and maps: an owner byte, a map byte, then an ordered
+/// key.
+fn prefixed_key() -> impl Strategy<Value = Vec<u8>> {
+    let byte = || prop::sample::select(vec![0x00u8, 0x01, 0x03, 0x80, 0xFF]);
+    (byte(), byte(), raw_key())
+        .prop_map(|(owner, map, raw)| [&[owner, map][..], &keys::ordered(&raw)].concat())
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(256))]
+
+    /// The node at a byte prefix is the tree over the keys under it alone:
+    /// its hash their tree's root, the empty prefix's the whole tree's, and
+    /// none where no key starts with it, over no key, one, or many.
+    #[test]
+    fn the_node_at_a_prefix_is_the_tree_over_its_keys(
+        keys in prop::collection::btree_set(prefixed_key(), 0..40),
+        probes in prop::collection::vec(prop::collection::vec(any::<u8>(), 0..3), 0..8),
+    ) {
+        let model: Model = keys.iter().map(|key| (key.clone(), leaf(key, 1, key))).collect();
+        let store = store_of(&model);
+        let mut prefixes: Vec<Vec<u8>> = probes;
+        for key in &keys {
+            prefixes.extend((0..=3).map(|len| key[..len].to_vec()));
+        }
+        for prefix in prefixes {
+            let under: Model = model
+                .iter()
+                .filter(|(key, _)| key.starts_with(&prefix))
+                .map(|(key, leaf)| (key.clone(), *leaf))
+                .collect();
+            let node = node_at(&store, &prefix).unwrap();
+            prop_assert_eq!(node.is_none(), under.is_empty(), "{:?}", prefix);
+            if let Some(node) = node {
+                prop_assert_eq!(*node.hash(), scratch(&under), "{:?}", prefix);
+            }
+        }
+        let whole = node_at(&store, &[]).unwrap();
+        prop_assert_eq!(whole.map_or_else(|| empty_root(&H), |top| *top.hash()), scratch(&model));
+    }
 }

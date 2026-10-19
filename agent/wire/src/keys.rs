@@ -19,23 +19,27 @@ use crate::ids::{
 };
 
 /// Who owns a row, its key's first byte: the agent itself, one of its
-/// instances, or the node's root builder.
+/// instances, the node's root builder, or an instance's committed maps.
+///
+/// Committed rows have an owner byte of their own, so the agent's
+/// committed rows are exactly the keys under `0x03`: in a tree over the
+/// whole keyspace, the node at that prefix is the tree over them alone,
+/// the agent's root, and the node at a map's prefix is the map's root.
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum Owner {
     System = 0x00,
     Instance = 0x01,
     Tree = 0x02,
+    Committed = 0x03,
 }
 
-/// An instance's row, after its id: its struct state, a table's row, or a
-/// committed map's.
+/// An instance's row, after its id: its struct state or a table's row.
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum Part {
     Struct = 0x00,
     Table = 0x01,
-    Committed = 0x02,
 }
 
 /// How a table's keys become its row keys, as a Substrate map's hasher
@@ -139,8 +143,8 @@ enum Row {
     Clock = 0x1a,
 }
 
-/// The root builder's rows, each tagged after [`Owner::Tree`]: a committed
-/// map's, then the map's id, and the agent's own.
+/// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
+/// the agent's one tree over its committed rows.
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum TreeRow {
@@ -151,8 +155,12 @@ enum TreeRow {
 }
 
 impl TreeRow {
-    fn key(self, map: &MapId, rest: &[u8]) -> Vec<u8> {
-        key(&[&[Owner::Tree as u8, self as u8], &map_key(map), rest])
+    const fn prefix(self) -> [u8; 2] {
+        [Owner::Tree as u8, self as u8]
+    }
+
+    fn key(self, rest: &[u8]) -> Vec<u8> {
+        key(&[&self.prefix(), rest])
     }
 }
 
@@ -190,44 +198,67 @@ pub fn table_prefix(instance: InstanceId, tag: u32) -> Vec<u8> {
 /// The prefix of a table's rows: each row's key follows it, transformed.
 pub fn table_rows(instance: InstanceId, tag: u32, transform: Transform) -> Vec<u8> {
     let mut prefix = Vec::with_capacity(TABLE_PREFIX);
-    prefix_into(Part::Table, instance, tag, transform, &mut prefix);
+    prefix_into(Kind::Table, instance, tag, transform, &mut prefix);
     prefix
 }
 
-/// The length of a table's or committed map's prefix.
+/// The length of a table's prefix, the longest a table's or committed
+/// map's rows have.
 pub const TABLE_PREFIX: usize = 1 + 4 + 1 + 4 + 1;
 
-/// Append the prefix of a table's or committed map's rows to `out`.
+/// The length of a committed map's prefix: its owner byte, `0x03`, then the
+/// map's id.
+pub const COMMITTED_PREFIX: usize = 1 + MAP_LEN;
+
+/// Which keyed rows of an instance: a table's, or a committed map's.
+#[derive(Clone, Copy)]
+enum Kind {
+    Table,
+    Committed,
+}
+
+/// Append the prefix of a table's or committed map's rows to `out`: a
+/// table's under its instance, `0x01 ‖ instance ‖ 0x01 ‖ tag ‖ transform`;
+/// a committed map's under its own owner, `0x03 ‖ instance ‖ tag ‖
+/// transform`.
 fn prefix_into(
-    part: Part,
+    kind: Kind,
     instance: InstanceId,
     tag: u32,
     transform: Transform,
     out: &mut Vec<u8>,
 ) {
-    out.push(Owner::Instance as u8);
-    out.extend_from_slice(&instance.0.to_be_bytes());
-    out.push(part as u8);
+    match kind {
+        Kind::Table => {
+            out.push(Owner::Instance as u8);
+            out.extend_from_slice(&instance.0.to_be_bytes());
+            out.push(Part::Table as u8);
+        }
+        Kind::Committed => {
+            out.push(Owner::Committed as u8);
+            out.extend_from_slice(&instance.0.to_be_bytes());
+        }
+    }
     out.extend_from_slice(&tag.to_be_bytes());
     out.push(transform.tag());
 }
 
-/// The part, tag and transform of the rows `rows` names; `None` for the
-/// struct.
-fn table_of(rows: Rows) -> Option<(Part, u32, Transform)> {
+/// The kind, tag and transform of the keyed rows `rows` names; `None` for
+/// the struct.
+fn table_of(rows: Rows) -> Option<(Kind, u32, Transform)> {
     match rows {
         Rows::Struct => None,
-        Rows::Table { tag, transform } => Some((Part::Table, tag, transform)),
-        Rows::Committed { tag, transform } => Some((Part::Committed, tag, transform)),
+        Rows::Table { tag, transform } => Some((Kind::Table, tag, transform)),
+        Rows::Committed { tag, transform } => Some((Kind::Committed, tag, transform)),
     }
 }
 
 /// The prefix of the rows `rows` names in `instance`'s state, and their
 /// transform; `None` for the struct, which is one row.
 pub fn rows_prefix(instance: InstanceId, rows: Rows) -> Option<(Vec<u8>, Transform)> {
-    let (part, tag, transform) = table_of(rows)?;
+    let (kind, tag, transform) = table_of(rows)?;
     let mut prefix = Vec::with_capacity(TABLE_PREFIX);
-    prefix_into(part, instance, tag, transform, &mut prefix);
+    prefix_into(kind, instance, tag, transform, &mut prefix);
     Some((prefix, transform))
 }
 
@@ -236,7 +267,7 @@ pub fn rows_prefix(instance: InstanceId, rows: Rows) -> Option<(Vec<u8>, Transfo
 /// is not empty fails the invocation ([`Failure::Trapped`]); an ordered key
 /// past [`cap::ORDERED_KEY`] exceeds a cap ([`Failure::Cap`]).
 pub fn row(instance: InstanceId, rows: Rows, key: &[u8]) -> Result<Vec<u8>, Failure> {
-    let Some((part, tag, transform)) = table_of(rows) else {
+    let Some((kind, tag, transform)) = table_of(rows) else {
         return if key.is_empty() {
             Ok(instance_struct(instance))
         } else {
@@ -247,24 +278,16 @@ pub fn row(instance: InstanceId, rows: Rows, key: &[u8]) -> Result<Vec<u8>, Fail
         return Err(Failure::Cap);
     }
     let mut row = Vec::with_capacity(TABLE_PREFIX + transform.room(key));
-    prefix_into(part, instance, tag, transform, &mut row);
+    prefix_into(kind, instance, tag, transform, &mut row);
     transform.append(key, &mut row);
     Ok(row)
 }
 
-/// The length of a committed map's id in its rows' keys.
+/// The length of a committed map's id in its rows' keys: the instance, the
+/// tag, then the transform.
 const MAP_LEN: usize = 4 + 4 + 1;
 
-/// A committed map's id as its rows' keys carry it: the instance, the tag,
-/// then the transform.
-fn map_key(map: &MapId) -> [u8; MAP_LEN] {
-    let mut bytes = [0u8; MAP_LEN];
-    bytes[..4].copy_from_slice(&map.instance.0.to_be_bytes());
-    bytes[4..8].copy_from_slice(&map.tag.to_be_bytes());
-    bytes[8] = map.transform.tag();
-    bytes
-}
-
+/// The map a committed row's key names after its owner byte.
 fn map_of(bytes: &[u8]) -> Option<MapId> {
     let bytes: &[u8; MAP_LEN] = bytes.get(..MAP_LEN)?.try_into().ok()?;
     Some(MapId {
@@ -274,18 +297,25 @@ fn map_of(bytes: &[u8]) -> Option<MapId> {
     })
 }
 
-/// The prefix of a committed map's value rows.
+/// The prefix of every committed row of the agent: the keys its root is
+/// over.
+pub fn committed_all() -> Vec<u8> {
+    [Owner::Committed as u8].to_vec()
+}
+
+/// The prefix of a committed map's value rows: the place of its root in
+/// the agent's tree.
 pub fn committed_rows(map: &MapId) -> Vec<u8> {
     committed(map, &[])
 }
 
 /// A committed map's value row, by its key already transformed (`key'`):
-/// the value with the state version that wrote it
-/// ([`crate::records::versioned`]).
+/// `0x03 ‖ instance ‖ tag ‖ transform ‖ key'`, its value the value with
+/// the state version that wrote it ([`crate::records::versioned`]).
 pub fn committed(map: &MapId, transformed: &[u8]) -> Vec<u8> {
-    let mut row = Vec::with_capacity(TABLE_PREFIX + transformed.len());
+    let mut row = Vec::with_capacity(COMMITTED_PREFIX + transformed.len());
     prefix_into(
-        Part::Committed,
+        Kind::Committed,
         map.instance,
         map.tag,
         map.transform,
@@ -296,37 +326,34 @@ pub fn committed(map: &MapId, transformed: &[u8]) -> Vec<u8> {
 }
 
 /// Whether `key` is a committed map's value row, whose value carries the
-/// version that wrote it.
+/// version that wrote it: decided by its first byte alone. Every key under
+/// `0x03` is one; anything else stored there is corrupt, and reading it as
+/// a value row fails ([`crate::records::leaf_value`]).
 pub fn is_committed(key: &[u8]) -> bool {
-    key.len() > TABLE_PREFIX && key[0] == Owner::Instance as u8 && key[5] == Part::Committed as u8
+    key.first() == Some(&(Owner::Committed as u8))
 }
 
 /// The map and transformed key a value row's key names; `None` for any
 /// other key.
 pub fn committed_entry(key: &[u8]) -> Option<(MapId, &[u8])> {
-    let (prefix, key) = key.split_first_chunk::<TABLE_PREFIX>()?;
-    if prefix[0] != Owner::Instance as u8 || prefix[5] != Part::Committed as u8 {
+    let (prefix, key) = key.split_first_chunk::<COMMITTED_PREFIX>()?;
+    if prefix[0] != Owner::Committed as u8 || key.is_empty() {
         return None;
     }
-    let map = MapId {
-        instance: InstanceId(u32::from_be_bytes(prefix[1..5].try_into().ok()?)),
-        tag: u32::from_be_bytes(prefix[6..10].try_into().ok()?),
-        transform: Transform::from_tag(prefix[10])?,
-    };
-    Some((map, key))
+    Some((map_of(&prefix[1..])?, key))
 }
 
-/// A committed key accumulate wrote at `version`, for the root builder:
-/// one row per write, so later writes never share a row with earlier ones.
-/// The version comes first: the rows a build consumed, whose deletions an
-/// LSM keeps a while, all lie before the versions it has yet to build.
-pub fn dirty(version: u64, map: &MapId, key: &[u8]) -> Vec<u8> {
-    let mut row = Vec::with_capacity(2 + 8 + MAP_LEN + key.len());
-    row.extend_from_slice(&Row::Dirty.prefix());
-    row.extend_from_slice(&version.to_be_bytes());
-    row.extend_from_slice(&map_key(map));
-    row.extend_from_slice(key);
-    row
+/// A committed row accumulate wrote at `version`, by its key `row`
+/// ([`committed`]), for the root builder: one row per write, so later
+/// writes never share a row with earlier ones. The version comes first:
+/// the rows a build consumed, whose deletions an LSM keeps a while, all
+/// lie before the versions it has yet to build.
+pub fn dirty(version: u64, row: &[u8]) -> Vec<u8> {
+    let mut dirty = Vec::with_capacity(2 + 8 + row.len());
+    dirty.extend_from_slice(&Row::Dirty.prefix());
+    dirty.extend_from_slice(&version.to_be_bytes());
+    dirty.extend_from_slice(row);
+    dirty
 }
 
 /// Where the dirty rows of `version` and later start.
@@ -339,13 +366,12 @@ pub fn dirty_prefix() -> Vec<u8> {
     Row::Dirty.prefix().to_vec()
 }
 
-/// The version, map and transformed key a dirty row's key names; `None`
-/// for any other key.
-pub fn dirty_entry(key: &[u8]) -> Option<(u64, MapId, &[u8])> {
+/// The version and committed row a dirty row's key names; `None` for any
+/// other key.
+pub fn dirty_entry(key: &[u8]) -> Option<(u64, &[u8])> {
     let rest = key.strip_prefix(&Row::Dirty.prefix())?;
-    let version = u64::from_be_bytes(rest.get(..8)?.try_into().ok()?);
-    let map = map_of(&rest[8..])?;
-    Some((version, map, &rest[8 + MAP_LEN..]))
+    let (version, row) = rest.split_first_chunk::<8>()?;
+    is_committed(row).then(|| (u64::from_be_bytes(*version), row))
 }
 
 /// The seed of the work result that made `version`, kept while a committed
@@ -360,53 +386,53 @@ pub fn seed_prefix() -> Vec<u8> {
     Row::Seed.prefix().to_vec()
 }
 
-/// A branch of a committed map's tree, by its level and prefix
+/// A branch of the agent's tree, by its level and prefix
 /// ([`vos_tree::NodeStore`]): the prefix's length follows from the level.
-pub fn tree_node(map: &MapId, level: u16, prefix: &[u8]) -> Vec<u8> {
-    TreeRow::Node.key(map, &[&level.to_be_bytes()[..], prefix].concat())
+pub fn tree_node(level: u16, prefix: &[u8]) -> Vec<u8> {
+    TreeRow::Node.key(&[&level.to_be_bytes()[..], prefix].concat())
 }
 
-/// The prefix of a committed map's branch rows.
-pub fn tree_nodes(map: &MapId) -> Vec<u8> {
-    TreeRow::Node.key(map, &[])
+/// The prefix of the tree's branch rows.
+pub fn tree_nodes() -> Vec<u8> {
+    TreeRow::Node.prefix().to_vec()
 }
 
-/// A leaf of a committed map's tree, by its transformed key.
-pub fn tree_leaf(map: &MapId, key: &[u8]) -> Vec<u8> {
-    TreeRow::Leaf.key(map, key)
+/// A leaf of the agent's tree, by its committed row's key.
+pub fn tree_leaf(key: &[u8]) -> Vec<u8> {
+    TreeRow::Leaf.key(key)
 }
 
-/// The prefix of a committed map's leaf rows.
-pub fn tree_leaves(map: &MapId) -> Vec<u8> {
-    TreeRow::Leaf.key(map, &[])
+/// The prefix of the tree's leaf rows.
+pub fn tree_leaves() -> Vec<u8> {
+    TreeRow::Leaf.prefix().to_vec()
 }
 
-/// A committed map's tree's top, and its root as its last complete build
-/// left it.
-pub fn tree_root(map: &MapId) -> Vec<u8> {
-    TreeRow::Root.key(map, &[])
+/// The tree's top, and the agent's root as the last complete build left
+/// it.
+pub fn tree_root() -> Vec<u8> {
+    TreeRow::Root.prefix().to_vec()
 }
 
-/// The prefix of every committed map's root row.
-pub fn tree_roots() -> Vec<u8> {
-    [Owner::Tree as u8, TreeRow::Root as u8].to_vec()
-}
-
-/// The map a root row's key names; `None` for any other key.
-pub fn tree_root_entry(key: &[u8]) -> Option<MapId> {
-    let rest = key.strip_prefix(&[Owner::Tree as u8, TreeRow::Root as u8])?;
-    (rest.len() == MAP_LEN).then(|| map_of(rest)).flatten()
-}
-
-/// The version through which every committed map's tree is built: no dirty
-/// or seed row is left through it.
+/// The version through which the agent's tree is built: no dirty or seed
+/// row is left through it.
 pub fn built() -> Vec<u8> {
-    [Owner::Tree as u8, TreeRow::Built as u8].to_vec()
+    TreeRow::Built.prefix().to_vec()
 }
 
-/// The prefix of everything an instance owns; its ABI reaches nothing else.
-pub fn instance_prefix(instance: InstanceId) -> Vec<u8> {
+/// The prefix of an instance's struct and table rows.
+pub fn instance_rows(instance: InstanceId) -> Vec<u8> {
     key(&[&[Owner::Instance as u8], &instance.0.to_be_bytes()])
+}
+
+/// The prefix of an instance's committed maps' rows.
+pub fn instance_committed(instance: InstanceId) -> Vec<u8> {
+    key(&[&[Owner::Committed as u8], &instance.0.to_be_bytes()])
+}
+
+/// The prefixes of everything an instance owns, [`instance_rows`] and
+/// [`instance_committed`]; its ABI reaches nothing else.
+pub fn instance_prefixes(instance: InstanceId) -> [Vec<u8>; 2] {
+    [instance_rows(instance), instance_committed(instance)]
 }
 
 /// The program an instance runs.
@@ -692,7 +718,14 @@ pub fn version() -> Vec<u8> {
     Row::Version.prefix().to_vec()
 }
 
-/// Whether `key` lies inside `instance`'s own state.
+/// Whether `key` lies inside `instance`'s own state: under
+/// `0x01 ‖ instance` or `0x03 ‖ instance`.
 pub fn owned_by(key: &[u8], instance: InstanceId) -> bool {
-    key.starts_with(&instance_prefix(instance))
+    match key.split_first() {
+        Some((&owner, rest)) => {
+            (owner == Owner::Instance as u8 || owner == Owner::Committed as u8)
+                && rest.starts_with(&instance.0.to_be_bytes())
+        }
+        None => false,
+    }
 }

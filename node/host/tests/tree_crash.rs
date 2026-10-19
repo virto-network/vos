@@ -8,9 +8,9 @@
 //! the store; later rounds tear the journal's tail first, which may cut a
 //! build between batches. After each, a build to the end gives:
 //!
-//! - the root of the tree over the values at the recovered version, each
-//!   leaf salted from the seed of the version that wrote it, at that
-//!   version;
+//! - the agent's root, the root of the tree over the values at the
+//!   recovered version, each leaf salted from the seed of the version that
+//!   wrote it, and each map's, at that version;
 //! - exactly the tree's node and leaf rows, and no dirty or seed row;
 //! - the state of every apply reported, but for a tear's reach.
 
@@ -85,14 +85,14 @@ fn writes(version: u64) -> Vec<(MapId, Vec<u8>, Option<Vec<u8>>)> {
 fn rows(version: u64) -> Vec<Write> {
     let mut rows = Vec::new();
     for (map, key, value) in writes(version) {
-        let transformed = map.transform.apply(&key);
+        let row = keys::committed(&map, &map.transform.apply(&key));
         rows.push(Write {
-            key: keys::committed(&map, &transformed),
-            value: value.map(|value| stored(&versioned(version, &value))),
+            key: keys::dirty(version, &row),
+            value: Some(stored(&[])),
         });
         rows.push(Write {
-            key: keys::dirty(version, &map, &transformed),
-            value: Some(stored(&[])),
+            key: row,
+            value: value.map(|value| stored(&versioned(version, &value))),
         });
     }
     rows.push(Write {
@@ -136,8 +136,8 @@ fn writer(dir: &Path) {
     }
 }
 
-/// A map's values, by transformed key: each value and the version that
-/// wrote it.
+/// A map's values, by their committed rows' keys: each value and the
+/// version that wrote it.
 type Values = BTreeMap<Vec<u8>, (u64, Vec<u8>)>;
 
 /// Each map's values at `version`.
@@ -146,7 +146,7 @@ fn values(version: u64) -> BTreeMap<MapId, Values> {
     for at in 1..=version {
         for (map, key, value) in writes(at) {
             let held = values.entry(map).or_default();
-            let key = map.transform.apply(&key);
+            let key = keys::committed(&map, &map.transform.apply(&key));
             match value {
                 Some(value) => held.insert(key, (at, value)),
                 None => held.remove(&key),
@@ -183,39 +183,46 @@ fn check(round: Round, last: &mut u64) -> bool {
         "round {round}: at {version}, but {reported} was reported applied"
     );
     let before = store.snapshot();
-    let cut = MAPS.iter().any(|map| {
-        matches!(
-            roots::root(&before, AGENT, map),
-            Err(roots::Error::Building)
-        )
-    });
+    let cut = matches!(
+        roots::agent_root(&before, AGENT),
+        Err(roots::Error::Building)
+    );
     drop(before);
     let writer = StorageThread::spawn(store.clone(), Arc::new(NoHooks));
     build(&store, &writer);
     let snapshot = store.snapshot();
     let expected = values(version);
-    for map in MAPS {
-        // A round killed before its first apply recovers at version 0, with
-        // no values in either map.
-        let leaves: Vec<(Vec<u8>, Hash)> = expected
-            .get(&map)
-            .into_iter()
-            .flatten()
+    // A round killed before its first apply recovers at version 0, with no
+    // values in either map.
+    let leaves = |of: Option<MapId>| -> Vec<(Vec<u8>, Hash)> {
+        let mut leaves: Vec<(Vec<u8>, Hash)> = expected
+            .iter()
+            .filter(|(map, _)| of.is_none_or(|of| of == **map))
+            .flat_map(|(_, values)| values)
             .map(|(key, (at, value))| {
                 let leaf = Leaf::salted(&Blake2b, &seed(*at), key, value);
                 (key.clone(), leaf.value_hash)
             })
             .collect();
+        leaves.sort();
+        leaves
+    };
+    assert_eq!(
+        roots::agent_root(&snapshot, AGENT).unwrap(),
+        (vos_tree::root(&Blake2b, &leaves(None)), version),
+        "round {round}: the agent's root"
+    );
+    for map in MAPS {
         assert_eq!(
             roots::root(&snapshot, AGENT, &map).unwrap(),
-            (vos_tree::root(&Blake2b, &leaves), version),
+            (vos_tree::root(&Blake2b, &leaves(Some(map))), version),
             "round {round}: the root of {map:?}"
         );
-        assert!(
-            roots::rows_match_tree(&snapshot, AGENT, map).unwrap(),
-            "round {round}: rows of {map:?} off the tree"
-        );
     }
+    assert!(
+        roots::rows_match_tree(&snapshot, AGENT).unwrap(),
+        "round {round}: rows off the tree"
+    );
     for prefix in [keys::dirty_prefix(), keys::seed_prefix()] {
         assert!(
             snapshot.scan(AGENT, &prefix, None).next().is_none(),

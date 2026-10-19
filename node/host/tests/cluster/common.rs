@@ -502,7 +502,7 @@ pub fn rows(node: &Node, agent: AgentId) -> Rows {
 pub fn applied_rows(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
     let snapshot = node.store().snapshot();
     let applied = snapshot.applied(agent).unwrap();
-    let rows = [[0x00u8], [0x01]]
+    let rows = [[0x00u8], [0x01], [0x03]]
         .iter()
         .flat_map(|prefix| {
             snapshot
