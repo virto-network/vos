@@ -400,7 +400,7 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | boundary | `B_w = origin_ms + (w+1)·length_ms` |
 | length | `length_ms` ∈ [120,000, 3,600,000], default 600,000 (decision 2); the venue refuses another at registration |
 | `cut(w)` | the agent's state version before the first applied result with time ≥ `B_w`: a result timed t, after the agent's batch-time mark p, records it for every w with p < `B_w` ≤ t, once the record its first install wrote names a space (the install itself cuts nothing, so only windows past the agent's first install are cut); of more than `MAX_CUTS` (32, a consensus constant) such windows, the newest 32 alone, the older never cut. A recording whose first window is w deletes the `cut`, `moved` and `closed` rows of every window before `w − CUT_KEEP`, `CUT_KEEP = 2 + RECUTS = 4` (a consensus constant; decided in 6.14): a read lives from its window w₀ to its deadline `B_{w₀+3}`, so no row older serves one, and a replica down longer than that skips those cuts, its reads re-cut or ended `NotClosed` as everyone's |
-| the representative | the agent `agent_id(first founding node, 0)`: serial 0, which no node gives an agent otherwise; created on that node (`Node::create_representative`), its actor `vos-representative` (`agent/representative`) installed at instance 0 with the representative's clock. Its replicas are founding nodes, whose keys a venue registers as anchor keys: the node refuses another in its creation and its replacements |
+| the representative | the agent `agent_id(first founding node, 0)`: serial 0, which no node gives an agent otherwise; created on that node (`Node::create_representative`), its actor `vos-representative` (`agent/representative`) installed at instance 0 with the representative's clock. It is created on founding nodes, whose genesis keys a venue registers as anchor keys; a replacement adds any node holding a key the venue lists for the space (without a venue, a genesis key): the node added refuses it otherwise, as a node that cannot run an agent's program does |
 | agent root | the vos-tree root over the agent's committed rows `0x03 ‖ instance ‖ tag ‖ transform ‖ key' → value` (pin E); empty: `H("vos/tree/empty")` |
 | representative's rows | a `CommittedMap<RepKey, [u8; 32]>`, `RepKey = agent (4, BE) ‖ kind (1) ‖ w (8, BE)`, the value the agent's root at `cut(w)`; kind 0 is pin E's Blake2b tree; an agent's rows older than `w − 2` deleted by its report of w. Beside it a plain table `asked`, `w (8, BE) ‖ agent (4, BE)`, of the agents whose reads wait on w's close; an agent's asks go with its rows, so no report touches another agent's |
 | representative's clock | `(origin_ms + D, length_ms)`, `D = min(length_ms / 5, 120,000)`: its own `cut_rep(w)` at `B_w + D` is the close of w |
@@ -408,7 +408,8 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | `VenueId` | Kreivo: its genesis hash; JAM: `BLAKE2b-256("vos/venue/jam" ‖ JAM genesis hash ‖ service id (4, LE))` |
 | anchor digest | `BLAKE2b-256("vos/anchor/v1" ‖ venue ‖ space ‖ w (8, LE) ‖ kind (1) ‖ root)`, ed25519 by a registered anchor key |
 | registration | a founding key's ed25519 signature over `BLAKE2b-256("vos/space/register" ‖ venue ‖ space ‖ controller (32) ‖ start_window (8, LE))`; the venue takes the genesis itself and computes the id, so it learns the clock and the founding keys from the hash. The first window the space anchors at the venue is signed, so nobody who sees a registration can resubmit it with a start that keeps the space from ever anchoring; the venue also bounds it, `now_w − MaxRootAge / length_ms ≤ start_window ≤ now_w + 1` by its own time |
-| controller | an `AccountId` (32 bytes) at each venue: a person, a multisig, a pass account or a community account; it rotates the authorities and anchor keys and migrates the space. Anchor-key rotation is not yet supported on VOS's side: a node signs anchors with its node key, and only founding nodes replicate the representative (6.14), so a key the controller adds is used by no node until 6.14b |
+| controller | an `AccountId` (32 bytes) at each venue: a person, a multisig, a pass account or a community account; it rotates the authorities and anchor keys and migrates the space |
+| anchor keys | each node's, in its store, oldest first: its node key, which a founding node's genesis names, then each `vos node anchor-key rotate` makes (6.14b). The representative's leader signs with the newest of its own the venue lists (`VenueClient::anchor_keys`: Kreivo's `AnchorKeys`, the model's set), and signs nothing when it lists none, alerting "replace this replica, or list one of its keys": that window waits, and the later ones behind it, until one is listed, or the space resumes after a `Suspended`, and is settled unsent past `B_w + MaxRootAge`. A wait survives a leader change only within the windows whose representative cut rows the replicas keep (`CUT_KEEP`): a new leadership takes up every window up to the close mark whose cut it keeps and whose root the venue does not hold. A rotation: the node makes the key and prints it; the controller registers it (`add_authority`); the node signs with it once listed; the controller removes the old one |
 | sovereign account | on Kreivo, `PalletId(*b"kv/space").into_sub_account_truncating(space)` (`b"modl" ‖ b"kv/space" ‖ space[0..20]`): derivable from the genesis before registration, so the founder funds it first; it holds the registration deposit and pays every fee and `submit` deposit of the space's authorities, within a spend budget per window that the controller sets and the venue enforces before inclusion, so a compromised node key cannot drain it (`spaces-pallet.md` §7) |
 | authorities | on Kreivo, a map `(space, account) → anchor key`: each node's own sr25519 account, paired with its ed25519 anchor key, set by the controller; an authority signs `anchor` and `submit`, and the sovereign account pays (`spaces-pallet.md` §7). On JAM, the registered anchor keys alone |
 | migration | `Migrate`, by the controller at each venue; each venue refuses anchors outside its range |
@@ -420,9 +421,9 @@ key; the signature; `Last < w < now_w` (gaps allowed; the open window,
 venue's range. A second root for one `(space, kind, w)` is
 stored as evidence and suspends the space until the controller removes
 both signing keys (`resume`); anyone may submit the second signed anchor.
-Until 6.14b no other key can anchor: a space whose equivocating keys are
-all its founding keys (always so with a single founder) recovers only by
-migrating to a new genesis, another space.
+A space whose equivocating keys are all its founding keys (always so with
+a single founder) recovers by rotation: its nodes rotate, the controller
+registers the new keys, removes the old and resumes it (6.14b).
 
 **What an anchor gives:** ordering and non-equivocation, not integrity: a
 space can anchor any root of its own making. So every value-moving handler
@@ -1305,37 +1306,64 @@ lands.
 
 ### 6.14b A rotatable anchor key (F)
 
-6.14 signs anchors with the representative's leader's node key (its
-PeerId key, which cannot rotate) and keeps the representative's replicas
+6.14 signed anchors with the representative's leader's node key (its
+PeerId key, which cannot rotate) and kept the representative's replicas
 to founding nodes, so a venue's anchor-key rotation (`spaces-pallet.md`
-`add_authority`, `remove_anchor_key`, `resume`) reaches no node, and a
-single-founder space that equivocates is dead at its venue.
-- **Files:** the node's key store (`node/host`: an anchor key beside the
-  node key); `node/host/src/leader/close.rs` (the signer);
-  `agent/representative` and the node's replica rule; `vos-venue`
-  (`VenueClient::anchor_keys(space)`, `ModelVenue`'s keys by space, added
-  and removed); `node/cli` (`vos node anchor-key rotate`).
-- **Design:**
-  - a separate ed25519 anchor key per node in its key store; a founding
-    node's first anchor key is the key its genesis names, so existing
-    spaces anchor as before;
-  - the leader signs with the key the venue lists for it: it reads the
-    space's registered anchor keys (Kreivo's `AnchorKeys`, the model's
-    set) and signs with its own key among them, refusing to sign
-    otherwise (an alert, never a guess);
-  - any node holding a registered anchor key may replicate the
-    representative, not founding nodes alone;
-  - `vos node anchor-key rotate` makes a new key and prints it, for the
-    controller's `add_authority(space, who, Some(key))`; the node signs
-    with the new key once the venue lists it, and the controller then
-    removes the old one.
-- **Tests:** a rotation end to end on the model venue (anchors before,
-  during and after, no window missed); an equivocation in a
-  single-founder space resumed after the rotation; a leader whose key the
-  venue does not list refuses to sign; a non-founding node with a
-  registered key replicating the representative and anchoring after a
-  failover; the key store's crash between the rotation and the venue's
-  listing.
+`add_authority`, `remove_anchor_key`, `resume`) reached no node, and a
+single-founder space that equivocated was dead at its venue.
+- **Files:** the node's key store (`node/host/src/anchor_keys.rs`: the
+  node key, then each rotation's, in the store's node rows,
+  `NodeRow::AnchorKey`); `node/host/src/leader/close.rs` (the signer);
+  the node's replica rule (`node/host/src/node/directory.rs`,
+  `admin.rs`); `vos-venue` (`VenueClient::anchor_keys(space)`,
+  `ModelVenue`'s keys by space, added, removed, and `resume`);
+  `node/cli` (`vos node anchor-key rotate`).
+- **Design, as built:**
+  - a node's anchor keys are its node key, the first, which a founding
+    node's genesis names, so existing spaces anchor as before, then each
+    rotation's, a separate ed25519 key kept durably in the store (a synced
+    commit) before its public half is shown;
+  - the leader reads the space's registered anchor keys (Kreivo's
+    `AnchorKeys`, the model's set) at each anchor and signs with the
+    newest of its own among them; with none listed it signs nothing and
+    alerts (an error, once a window), never a guess. That window waits in
+    order, as one the venue has not yet closed does, and so do the venue's
+    refusals that the controller lifts (`Key`, a key removed meanwhile, and
+    `Suspended`): each is tried again at the representative's next batch,
+    so a window is anchored once a key is listed or the space resumed,
+    within `MaxRootAge`; one past `B_w + MaxRootAge` by the leader's clock
+    is settled unsent. A new leadership takes up the windows an earlier one
+    left waiting: every window up to the close mark whose cut root the
+    replica keeps (about `CUT_KEEP` windows) and whose `S_w` the venue
+    does not hold, so a wait survives a failover or a replacement only
+    within those windows. The alert says to replace the replica or list one
+    of its keys: no leadership moves off a replica whose key is delisted;
+  - the representative is created on founding nodes; a replacement adds
+    any node holding a key the venue lists for the space (without a venue,
+    a genesis key): the node added answers the placement that it cannot
+    run the agent otherwise, and the replacement is refused
+    (`Unplaced::CannotRun`);
+  - `vos node anchor-key rotate --data <dir>`, its node stopped, makes a
+    key and prints it for the controller's `add_authority(space, who,
+    Some(key))`; `Node::rotate_anchor_key` does so on a running node. The
+    node signs with the new key once the venue lists it, and the
+    controller then removes the old one. Old keys stay in the store; the
+    newest listed is the one used.
+- **Tests:** a rotation end to end on the model venue (three founding
+  nodes: anchors before, during and after, windows 0–3 each anchored);
+  an equivocation in a single-founder space resumed after the rotation
+  (`resume` refused while the equivocating key is registered, the window
+  closed while suspended waiting and anchored after); a leader
+  whose key the venue does not list signs nothing, and anchors the window
+  it held back once a key is listed; a node that did not found the space,
+  refused as a replica until its key is registered, replicating the
+  representative and anchoring after a failover; the rotation's process
+  killed once it printed the key, before the venue lists it: the node
+  keeps the key, signs with its old one until the new is listed; a waiting
+  anchor taken up by the next leader after the unlisted one stops. The
+  venue's own: keys added and removed, `resume`; the CLI's rotation; a
+  rotation numbering past an unreadable key's row, never overwriting the
+  newest.
 - **Dep:** 6.14; `spaces-pallet.md` §6. **Estimate:** 1–1.5 weeks.
 
 ### M3a acceptance
@@ -1431,6 +1459,13 @@ fees are the teammate's.
   batch** (6.14): `VenueClient::anchor` must not block there. The Kreivo
   client queues the extrinsic and answers at once (taken, refused for
   good, or `Open`: tried again at the next batch, in window order).
+- **The anchor's waits cost fees at Kreivo** (6.14b's review): every
+  `Suspended` or `Key` retry is a failed `anchor` extrinsic the sovereign
+  pays. `VenueClient` exposes the space's status (`Spaces[space]`, which
+  the client reads already) and the leader waits without submitting while
+  it is suspended; a `Key` refusal is retried only once the `anchor_keys`
+  listing changes, or once a window. A window past `B_w + MaxRootAge` by
+  the leader's clock is settled locally, unsent (built in 6.14b).
 - **Files:** `node/venue/kreivo` (in `vos-venue`, behind a `kreivo`
   feature); the operator and controller tooling over the same `calls`
   layer: `vosx space venue register` (call 0, the founder's signature over
@@ -1900,8 +1935,8 @@ fees are the teammate's.
 6. **History:** no tree history past a cut (W1), and spans by a carried
    per-pair commitment at the venue (S3); `RootKind { Space }` only.
 7. **The space root:** the representative agent; anchors signed by one
-   registered node key; the controller rotates the keys (6.14; the
-   node's side of rotation, 6.14b).
+   registered anchor key; the controller rotates the keys, and the node
+   signs with its newest key the venue lists (6.14, 6.14b).
 8. **F2:** migration ranges for rooted statements, and a per-program
    `venue_bound` flag checked on `public_args[0..32]`; no `vos/io/v2`.
 9. **Kreivo's dependency path:** the verifier stack vendored into Kreivo

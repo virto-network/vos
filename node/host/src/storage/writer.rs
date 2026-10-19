@@ -407,6 +407,7 @@ impl Staged {
                 epoch,
                 writes,
             } => batch.rows(*agent, *epoch, writes),
+            Change::AnchorKey { number, seed } => batch.anchor_secret(*number, seed),
         }
     }
 }

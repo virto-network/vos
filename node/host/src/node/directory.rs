@@ -460,9 +460,26 @@ impl Inner {
             &PeerMessage::DirectoryAck {
                 agent,
                 order,
-                runs: record.program == self.program_hash,
+                runs: self.could_run_here(&record),
             },
         );
+    }
+
+    /// Whether this node could run the agent `record` creates: its agent
+    /// program the node's, and, for the space's representative, an anchor
+    /// key of this node's registered with the space.
+    fn could_run_here(&self, record: &CreationRecord) -> bool {
+        if record.program != self.program_hash {
+            return false;
+        }
+        if self.representative() == Some(record.agent) && !self.may_represent() {
+            tracing::info!(
+                agent = record.agent.0,
+                "this node holds no anchor key the space registered: it cannot replicate the representative"
+            );
+            return false;
+        }
+        true
     }
 
     /// Ask `from`, whose group sent Raft traffic for `agent` that found no

@@ -62,11 +62,8 @@ impl Inner {
         {
             return unplaced(Unplaced::NotInTheSpace);
         }
-        if self.representative() == Some(agent) && !self.founding(add) {
-            return Err(ReplaceError::Call(CallError::Failed(format!(
-                "node {add} holds no anchor key: the representative runs on founding nodes"
-            ))));
-        }
+        // The representative's: `add` says it could run it only while it
+        // holds an anchor key the space registered (`on_directory`).
         if !self.could_run(agent, add, CAPABLE).await {
             return unplaced(Unplaced::CannotRun);
         }
@@ -144,7 +141,9 @@ impl Inner {
 
     /// Create the space's representative on `replicas` (this node alone
     /// when empty): only on the space's first founding node, whose agent 0
-    /// it is, and once. Answered as [`Inner::create_agent`] is.
+    /// it is, and once, on founding nodes, whose genesis keys a venue
+    /// registers with the space; a replacement may add any node holding a
+    /// registered anchor key. Answered as [`Inner::create_agent`] is.
     pub(crate) async fn create_representative(
         self: &Arc<Self>,
         replicas: Vec<NodeNumber>,
@@ -163,7 +162,7 @@ impl Inner {
         let replicas = self.replicas(replicas)?;
         if let Some(node) = replicas.iter().find(|node| !self.founding(**node)) {
             return Err(CallError::Failed(format!(
-                "node {node} holds no anchor key: the representative runs on founding nodes"
+                "node {node} did not found the space: the representative is created on founding nodes"
             )));
         }
         // Held, so no other creation here races it.

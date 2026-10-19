@@ -3,7 +3,8 @@
 //! representative ([`Input::Report`]), saying whether reads wait on the
 //! close. The representative's leader, once its replica has built its own
 //! cut of the window, which closes it, signs the anchor of the space's
-//! root `S_w` with this node's key and hands it to the venue, then sends
+//! root `S_w` with the newest of this node's anchor keys the venue lists
+//! and hands it to the venue, then sends
 //! each agent that asked its path ([`Input::Close`]). Both are proposed
 //! from the replica's state, never queued, and sent once: refine sends
 //! nothing for a window its mark has passed ([`keys::reported`],
@@ -15,7 +16,7 @@ use vos_wire::batch::Input;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
 use vos_wire::served::Closing;
-use vos_wire::vos_anchor::{Anchor, RootKind, space_root};
+use vos_wire::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootKind, RootRead, space_root};
 use vos_wire::{Decode, defaults};
 
 use super::Leader;
@@ -101,6 +102,10 @@ impl Leader {
     /// in window order, each window's anchor handed to the venue first
     /// ([`Leader::anchor_due`]).
     pub(super) fn closes(&mut self, snapshot: &Snapshot) -> Result<Closes, Fault> {
+        if !self.seeded {
+            self.seeded = true;
+            self.seed_waiting(snapshot)?;
+        }
         let unsent = unsent(snapshot, self.id, self.represents())?;
         let first = unsent.first().map(|(window, _)| *window);
         self.anchored
@@ -138,15 +143,76 @@ impl Leader {
         Ok(Closes::Due(due))
     }
 
+    /// Take up, at a leadership's start, the anchors an earlier one left
+    /// waiting: every window up to the close mark whose cut this replica
+    /// still keeps (its last [`defaults::CUT_KEEP`] or so) and
+    /// whose root the venue does not hold anchored. Its close was sent, so
+    /// no unsent close names it; the root is the representative's at its
+    /// cut, the one its close carried.
+    fn seed_waiting(&mut self, snapshot: &Snapshot) -> Result<(), Fault> {
+        let Some(venue) = self.inner.venue.clone() else {
+            return Ok(());
+        };
+        if !self.represents() {
+            return Ok(());
+        }
+        let Some((through, _)) =
+            read::<(u64, Option<AgentId>)>(snapshot, self.id, &keys::close_mark())?
+        else {
+            return Ok(());
+        };
+        let (space, _) = self.inner.space_and_clock();
+        for row in snapshot.scan(self.id, &keys::cut_roots(), None) {
+            let (key, value) = row?;
+            let Some(window) = keys::cut_root_entry(&key).filter(|window| *window <= through)
+            else {
+                continue;
+            };
+            let Some((root, _)) = <([u8; 32], u64)>::decode_exact(&value) else {
+                return Err(fault(roots::Error::Corrupt("a cut root")));
+            };
+            let closing = roots::closing_of(snapshot, self.id, window).map_err(fault)?;
+            if closing.is_some_and(|closing| closing.root != root) {
+                return Err(fault(roots::Error::Corrupt(
+                    "a close whose root is not its cut's",
+                )));
+            }
+            let held = venue.anchored(&RootRead {
+                kind: RootKind::Space,
+                space,
+                window,
+                root: space_root(&space, window, &root),
+            });
+            if !held {
+                self.unanchored.entry(window).or_insert(root);
+            }
+        }
+        Ok(())
+    }
+
     /// Hand the venue the anchors this leadership has not settled, in
-    /// window order, until one is refused for now: a window the venue's
-    /// clock has not yet closed, which the next batch tries again, with the
-    /// later ones behind it, so none passes it. One taken, or refused for
-    /// good, is settled; the close goes on either way, and a statement over
-    /// an unanchored root is refused at the venue.
+    /// window order, until one waits: a window the venue's clock has not
+    /// yet closed, an anchor no key of this node's can sign, or one the
+    /// venue will not take until its controller acts (a key registered, the
+    /// space resumed). The next batch tries again, with the later ones
+    /// behind it, so none passes it. A window past `MaxRootAge` by this
+    /// node's clock is settled here, unsent: no venue takes it. One taken,
+    /// or refused for good, is
+    /// settled; the close goes on either way, and a statement over an
+    /// unanchored root is refused at the venue.
     fn anchor_due(&mut self) {
+        let (_, clock) = self.inner.space_and_clock();
         while let Some((&window, &root)) = self.unanchored.first_key_value() {
-            if !self.anchor(window, &root) {
+            let now = (self.inner.clock)();
+            let aged = clock
+                .boundary(window)
+                .is_some_and(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS);
+            if aged {
+                tracing::error!(
+                    window,
+                    "the space's root waited past `MaxRootAge`; no venue takes it now"
+                );
+            } else if !self.anchor(window, &root) {
                 return;
             }
             self.unanchored.remove(&window);
@@ -155,28 +221,34 @@ impl Leader {
     }
 
     /// Sign the anchor of the space's root of window `window`, over the
-    /// representative's root at its cut `rep_root`, with this node's key,
-    /// and hand it to the venue: whether that settled it, taken or refused
-    /// for good. Synchronous, inside the batch: a venue's client queues and
-    /// answers at once.
-    fn anchor(&self, window: u64, rep_root: &[u8; 32]) -> bool {
-        let Some(venue) = &self.inner.venue else {
+    /// representative's root at its cut `rep_root`, with the newest of this
+    /// node's anchor keys the venue lists, and hand it to the venue:
+    /// whether that settled it, taken or refused for good. With no key of
+    /// this node's listed it signs nothing, and alerts. Synchronous, inside
+    /// the batch: a venue's client queues and answers at once.
+    fn anchor(&mut self, window: u64, rep_root: &[u8; 32]) -> bool {
+        let Some(venue) = self.inner.venue.clone() else {
             return true;
         };
         let (space, _) = self.inner.space_and_clock();
+        let Some(key) = self.inner.anchor_keys.listed(&venue.anchor_keys(&space)) else {
+            self.alert(
+                window,
+                "the venue lists none of this node's anchor keys; the space's root is not signed \
+                 until it lists one: replace this replica of the representative, or list one of \
+                 its keys (`vos node anchor-key rotate`, then the controller's `add_authority`)",
+            );
+            return false;
+        };
         let mut anchor = Anchor {
             space,
             window,
             kind: RootKind::Space,
             root: space_root(&space, window, rep_root),
-            signer: self.inner.node_key.verifying_key().to_bytes(),
+            signer: key.verifying_key().to_bytes(),
             signature: [0; 64],
         };
-        anchor.signature = self
-            .inner
-            .node_key
-            .sign(&anchor.digest(&venue.id()))
-            .to_bytes();
+        anchor.signature = key.sign(&anchor.digest(&venue.id())).to_bytes();
         match venue.anchor(&anchor) {
             Ok(anchored) => {
                 tracing::debug!(window, ?anchored, "anchored the space's root");
@@ -189,10 +261,33 @@ impl Leader {
                 );
                 false
             }
+            Err(AnchorRefusal::Key) => {
+                self.alert(
+                    window,
+                    "the venue no longer lists the anchor key signed with; anchoring again",
+                );
+                false
+            }
+            Err(AnchorRefusal::Suspended) => {
+                self.alert(
+                    window,
+                    "the space is suspended at the venue, for an equivocation, until its \
+                     controller removes both keys and resumes it; anchoring again",
+                );
+                false
+            }
             Err(refusal) => {
                 tracing::error!(window, ?refusal, "the venue refused the space's root");
                 true
             }
+        }
+    }
+
+    /// Alert, once a window, that `window`'s anchor waits.
+    fn alert(&mut self, window: u64, why: &str) {
+        if self.alerted != Some(window) {
+            self.alerted = Some(window);
+            tracing::error!(window, "{why}");
         }
     }
 }

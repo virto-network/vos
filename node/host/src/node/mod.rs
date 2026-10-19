@@ -103,9 +103,10 @@ pub(crate) struct Inner {
     pub(crate) hooks: Arc<dyn Hooks>,
     pub(crate) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     pub(crate) node_id: NodeId,
-    /// The node's key, whose public half is its id: it signs the anchors
-    /// the space's representative leads here.
-    pub(crate) node_key: ed25519_dalek::SigningKey,
+    /// The keys the anchors of the space's representative, led here, are
+    /// signed with: the node key, whose public half is its id, then each
+    /// rotation's.
+    pub(crate) anchor_keys: crate::anchor_keys::AnchorKeys,
     /// Where the representative's leader here anchors its roots.
     pub(crate) venue: Option<Arc<dyn vos_venue::VenueClient>>,
     /// This node's number in its space.
@@ -185,6 +186,30 @@ impl Inner {
             .as_ref()
             .and_then(|space| space.genesis())
             .and_then(vos_wire::served::representative)
+    }
+
+    /// The anchor keys the space has registered: the venue's listing, or,
+    /// without a venue, the founding keys its genesis names, those a venue
+    /// registers with it.
+    pub(crate) fn registered_anchor_keys(&self) -> Vec<[u8; 32]> {
+        let (space, _) = self.space_and_clock();
+        match &self.venue {
+            Some(venue) => venue.anchor_keys(&space),
+            None => self
+                .space
+                .as_ref()
+                .and_then(|space| space.genesis())
+                .map(|genesis| genesis.nodes.iter().map(|(_, key)| *key).collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Whether this node may replicate the space's representative: it
+    /// holds one of the space's registered anchor keys.
+    pub(crate) fn may_represent(&self) -> bool {
+        self.anchor_keys
+            .listed(&self.registered_anchor_keys())
+            .is_some()
     }
 
     pub(crate) fn run(&self, id: AgentId) -> Option<Arc<Run>> {

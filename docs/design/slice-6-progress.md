@@ -2648,3 +2648,51 @@ the totals' monotonicity standing for the cut's order inside the kernel,
 the handler's `w_last` outside it).
 
 **6.15 accepted.**
+
+## Step 6.14b: a rotatable anchor key
+
+On `s6/anchor-key` (from `1b7cdd2a`). The full record is the step's log.
+
+- **Built:** a node's anchor keys in its store (`anchor_keys.rs`): its
+  node key, which a founding node's genesis names, then each rotation's,
+  an ed25519 seed under the node row `AnchorKey` (`0x0f`), committed and
+  synced before it is used or shown, numbered past the last row stored
+  (an unreadable one's too), never reused. `Node::rotate_anchor_key` on a
+  running node, `vos node anchor-key rotate --data <dir>` on a stopped one.
+  The representative's leader signs each anchor with the newest of its
+  keys the venue lists (`VenueClient::anchor_keys`); with none listed it
+  signs nothing and alerts once a window ("replace this replica, or list
+  one of its keys"), the window waiting in order as an `Open` one does,
+  and so do the venue's `Key` and `Suspended` refusals; a window past
+  `B_w + MaxRootAge` by the leader's clock settles unsent. A replacement
+  adds any node holding a listed key, the node added refusing the
+  representative otherwise (`Unplaced::CannotRun`). `ModelVenue` keeps
+  anchor keys by space: `add_anchor_key`, `remove_anchor_key`, `resume`
+  (only once neither equivocating signer is listed; clears the evidence).
+- **Tests:** `cluster::anchor_keys`: a rotation anchoring every window, an
+  unlisted leader signing nothing, a single founder resumed after an
+  equivocation (its window waiting through the suspension, anchored after
+  `resume` by the new key), a node that did not found the space
+  representing it after a failover, a rotation killed before the venue
+  lists its key, a waiting anchor taken up after a leader change; a
+  rotation numbered past an unreadable key's row.
+- **Docs:** Pin D (the anchor keys row, the representative's replica rule,
+  recovery by rotation), `spaces-pallet.md` §6, §9 and q12, 6.17b's
+  Kreivo client waits.
+- **Gates** [measured]: `just check` green (91 suites, 1,274 passed after
+  the fold); the checker loop, seeds 6145–6147 × the three exactly-once
+  tests and the cuts run with `CUTS_FULL`: 4 of 4 green each seed.
+- **The review** (Opus): ACCEPT, one medium and three lows, folded
+  (`ee3d4ad9`): a new leadership of the representative takes up the
+  anchors an earlier one left waiting (each window up to the close mark
+  whose cut root the replica keeps and whose `S_w` the venue does not
+  hold), so a wait survives a leader change within `CUT_KEEP` windows; the
+  alert's wording; the key numbering; 6.17b's waits.
+
+**Merged** into `vos-core`. The conflicts in `vos-venue` kept both sides:
+6.15's `ModelVenue::migrate` (G14, `MigrateRefusal`) and the space's
+range beside 6.14b's anchor keys by space and `resume`.
+`just check` after the merge [measured]: green, 92 suites, 1,284 passed,
+0 failed.
+
+**6.14b accepted.**

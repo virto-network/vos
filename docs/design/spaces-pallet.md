@@ -330,6 +330,17 @@ compact, and the vectors are `BoundedVec<u8, _>`.
 | 18 | `set_paused(flags: u8)` | `EmergencyOrigin` | immediate |
 | 19 | `set_status(space: SpaceId, blocked: bool)` | `StatusOrigin` | `Blocked`; unblocking sets `Active`, or `Suspended` if the space has `Equivocations` |
 
+**Anchor keys, as VOS nodes use them:** a node signs anchors with the
+newest of its own anchor keys that `AnchorKeys` lists for the space, the
+first its node key (a founding node's genesis key), and signs nothing when
+none is listed. `vos node anchor-key rotate` makes a node a new key; the
+controller registers it (`add_authority`), the node signs with it once
+listed, and the controller removes the old (`remove_anchor_key`, or the
+same `add_authority` update). A node replicates the space's representative
+only while it holds a listed key. After an equivocation, `resume` follows
+the removal of both signing keys, so a space of one founder rotates its
+key first (§13, question 12).
+
 `AnchorArg` is pin D's `Anchor`:
 `{ space: [u8;32], window: u64, kind: u8, root: [u8;32], signer: [u8;32], signature: [u8;64] }`,
 where `signer` is the ed25519 anchor key and `signature` is ed25519 over
@@ -619,6 +630,9 @@ The node's client (`vos-venue`, feature `kreivo`):
 `twox128("Spaces") ++ twox128(item) ++ hashed key`:
 - `Spaces[space]`: status, range, sovereign;
 - `Authorities[space][self]`;
+- `AnchorKeys[space]`: `VenueClient::anchor_keys`, the keys the
+  representative's leader may sign with (the newest of its own listed) and
+  that let a node replicate the representative;
 - `Anchors[space][0][w]`: `VenueClient::anchored`;
 - `Last[space][0]`;
 - `Seen[id]`;
@@ -767,18 +781,30 @@ fold-in (S2).
     - **Recommended: unanchored,** the same rule for both: a space
       governance blocked is not one whose state a handler should act on.
 12. **Anchor keys beyond the founding ones.**
-    - **Anchor-key rotation is not yet supported on VOS's side.** VOS
-      anchors with the representative's leader's node key, which cannot
-      rotate, and the representative's replicas are founding nodes alone
-      (VOS step 6.14). A key paired by `add_authority` is used by no VOS
-      node, and `resume` needs both equivocating keys gone: a space whose
-      equivocating keys are all its founding keys (always so with a
-      single founder) cannot anchor here again, and recovers only by
-      migrating to a new genesis, another space.
-    - VOS plans the node's side as step 6.14b: a rotatable ed25519 anchor
-      key per node (the genesis keys the first), the leader signing with
-      the key `AnchorKeys` lists for it, any node with a registered key a
-      replica, and `vos node anchor-key rotate` paired with the
-      controller's `add_authority`.
+    - **Anchor-key rotation is supported on VOS's side** (VOS step
+      6.14b). Each node keeps its ed25519 anchor keys in its store, the
+      first its node key, which a founding node's genesis names; `vos node
+      anchor-key rotate` makes another and prints it. The representative's
+      leader reads the space's `AnchorKeys` and signs with the newest of
+      its keys listed there, and signs nothing (an alert) when none is.
+      Any node holding a key `AnchorKeys` lists may replicate the
+      representative, not founding nodes alone.
+    - The rotation: the node makes the key; the controller pairs it with
+      the node's authority (`add_authority`, which replaces the
+      authority's paired key, or, for a founding key, adds it beside); the
+      node signs with it once it is listed; the controller then removes the
+      old key (`remove_anchor_key`). Anchors go on throughout: a window
+      the node cannot sign waits, and is anchored in order once a key is
+      listed, within `MaxRootAge`. A wait survives a change of the
+      representative's leader only within the last `CUT_KEEP` (4) windows,
+      whose cuts the replicas keep; a leader whose key is delisted keeps
+      leading and signing nothing, so the operator replaces that replica or
+      lists one of its keys.
+    - A single-founder space that equivocates recovers at its venue: the
+      node rotates, the controller registers the new key, removes the
+      founding one and calls `resume`, and the space anchors again with
+      the new key.
     - **Recommended:** keep the pallet's rotation calls as designed; they
-      are what 6.14b uses.
+      are what VOS's rotation uses. An `add_authority` update, which lists
+      the new key and drops the old in one call, rotates with no window
+      lost: the node holds the new key before the call.
