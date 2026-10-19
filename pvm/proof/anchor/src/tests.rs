@@ -40,7 +40,7 @@ fn a_genesis_encodes_field_by_field() {
     assert_eq!(bytes, expected);
     assert_eq!(SpaceGenesis::decode(&bytes), Ok(genesis.clone()));
     assert_eq!(
-        genesis.id().0,
+        space_id(&genesis).0,
         blake2b_256(&[b"vos/space/id", &expected]),
         "the id hashes the bytes a venue is given"
     );
@@ -48,7 +48,9 @@ fn a_genesis_encodes_field_by_field() {
 
 /// A genesis decode refuses what is not one canonical genesis of its
 /// version: another version, a byte short, a byte more, the count in a
-/// longer compact mode, a count past the input.
+/// longer compact mode, a count past the input, no node, node numbers not
+/// strictly ascending. Its encoding writes its version whatever the field
+/// holds.
 #[test]
 fn a_genesis_decode_is_canonical() {
     let bytes = genesis().encode();
@@ -66,6 +68,20 @@ fn a_genesis_decode_is_canonical() {
     assert_eq!(refused(&long), DecodeError::Noncanonical);
     let past = [&bytes[..1], &[60 << 2], &bytes[2..]].concat();
     assert_eq!(refused(&past), DecodeError::Short);
+    // The nodes: none; one number twice; two out of order.
+    let mut none = genesis();
+    none.nodes.clear();
+    assert_eq!(refused(&none.encode()), DecodeError::Noncanonical);
+    type Nodes = fn(&mut Vec<(NodeNumber, [u8; 32])>);
+    let unordered: [Nodes; 2] = [|nodes| nodes[1].0 = 1, |nodes| nodes.swap(0, 1)];
+    for change in unordered {
+        let mut other = genesis();
+        change(&mut other.nodes);
+        assert_eq!(refused(&other.encode()), DecodeError::Noncanonical);
+    }
+    let mut versioned = genesis();
+    versioned.version = 2;
+    assert_eq!(versioned.encode(), bytes);
 }
 
 /// Window w holds `[B_{w-1}, B_w)`: the origin opens window 0, a time
@@ -129,8 +145,9 @@ fn registrable_lengths() {
     ] {
         assert_eq!(clock(length).registrable(), registrable, "{length}");
     }
-    assert!(WindowClock::default().registrable());
-    assert_eq!(WindowClock::default().length_ms, 600_000);
+    assert!(WindowClock::DEFAULT.registrable());
+    assert_eq!(WindowClock::DEFAULT.length_ms, 600_000);
+    assert_eq!(WindowClock::default(), WindowClock::DEFAULT);
 }
 
 /// The representative's clock lags by a fifth of a window, at most two
@@ -204,7 +221,7 @@ fn an_unknown_root_kind_is_refused_at_decode() {
 /// writes its preimage.
 #[test]
 fn every_digest_is_its_preimages() {
-    let space = genesis().id();
+    let space = space_id(&genesis());
     let venue = VenueId([0x4b; 32]);
     let rep_root = [0x33; 32];
     let s_w = space_root(&space, 0x0102_0304_0506_0708, &rep_root);
@@ -272,10 +289,10 @@ fn every_field_is_bound() {
     for (name, change) in changes {
         let mut changed = base.clone();
         change(&mut changed);
-        assert_ne!(changed.id(), base.id(), "{name}");
+        assert_ne!(space_id(&changed), space_id(&base), "{name}");
     }
 
-    let space = base.id();
+    let space = space_id(&base);
     let (venue, other_venue) = (VenueId([1; 32]), VenueId([2; 32]));
     let other_space = SpaceId([3; 32]);
     let root = space_root(&space, 9, &[4; 32]);

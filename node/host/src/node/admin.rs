@@ -11,10 +11,8 @@ use vos_wire::ids::{AgentId, InstanceId, ProgramHash};
 use vos_wire::ingress::Unplaced;
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 use vos_wire::records::Derivation;
-use vos_wire::{SpaceId, WindowClock};
 
 use super::{Answered, CallError, Inner, Pending, ReplaceError};
-use crate::Space;
 use crate::blobs::Keep;
 use crate::group::Local;
 use crate::storage::Change;
@@ -152,7 +150,7 @@ impl Inner {
             time: (self.clock)(),
             program: self.program_hash,
             accumulate_gas: self.settings.accumulate_gas,
-            space: self.space.as_ref().map_or(SpaceId::NONE, Space::id),
+            space: self.space_and_clock().0,
         };
         let placement = Placement::created(&record);
         self.storage
@@ -240,16 +238,14 @@ impl Inner {
                 .map_err(CallError::Failed)?;
             references.push(reference);
         }
+        let (space, clock) = self.space_and_clock();
         let admin = Admin::Install {
             instance,
             derivation,
             roles,
             target: Target::Vos,
-            space: self.space.as_ref().map_or(SpaceId::NONE, Space::id),
-            clock: self
-                .space
-                .as_ref()
-                .map_or_else(WindowClock::default, Space::clock),
+            space,
+            clock,
         };
         let (answer, reply) = smol::channel::bounded(1);
         self.push(

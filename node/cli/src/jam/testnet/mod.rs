@@ -121,7 +121,7 @@ impl Actors {
                 roles: vec![],
                 target: Target::Jam,
                 space: vos_wire::SpaceId::NONE,
-                clock: vos_wire::WindowClock::default(),
+                clock: vos_wire::WindowClock::DEFAULT,
             })
         };
         vec![install(COUNTER, &self.counter), install(SHOP, &self.shop)]

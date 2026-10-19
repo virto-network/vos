@@ -18,6 +18,13 @@
 //! is the genesis's canonical encoding in hex; a `#` starts a comment.
 //! Without it, a space has no id ([`SpaceId::NONE`]): its agents belong to
 //! no space, and anchor nothing.
+//!
+//! An agent records its space at its first install, for good: an agent of
+//! a space with no genesis belongs to no space forever. So a space is
+//! founded before its first agent: `vos space up` on one node's space file,
+//! before any agent is created, then `<space file>.genesis` copied beside
+//! every node's space file, and the nodes restarted. A node refuses an
+//! agent's record that names another space than its own.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -41,6 +48,8 @@ pub struct SpaceNode {
 pub struct Space {
     nodes: Vec<SpaceNode>,
     genesis: Option<SpaceGenesis>,
+    /// Its genesis's hash, or [`SpaceId::NONE`].
+    id: SpaceId,
 }
 
 /// The genesis file beside the space file at `space`: its name with
@@ -59,13 +68,7 @@ fn parse_genesis(text: &str) -> Result<SpaceGenesis, String> {
         .map(|line| line.split('#').next().unwrap_or_default())
         .flat_map(str::split_whitespace)
         .collect();
-    if !digits.len().is_multiple_of(2) || !digits.bytes().all(|digit| digit.is_ascii_hexdigit()) {
-        return Err("a genesis in hex".into());
-    }
-    let bytes: Vec<u8> = (0..digits.len())
-        .step_by(2)
-        .map(|at| u8::from_str_radix(&digits[at..at + 2], 16).expect("hex digits"))
-        .collect();
+    let bytes = hex::decode(&digits).map_err(|_| "a genesis in hex".to_string())?;
     SpaceGenesis::decode(&bytes).map_err(|error| format!("the genesis: {error}"))
 }
 
@@ -87,11 +90,7 @@ pub fn read_genesis(space: &Path) -> Result<Option<SpaceGenesis>, String> {
 pub fn write_genesis(space: &Path, genesis: &SpaceGenesis) -> Result<PathBuf, String> {
     use std::io::Write;
     let path = genesis_path(space);
-    let text: String = genesis
-        .encode()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let text = hex::encode(genesis.encode());
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -128,11 +127,13 @@ impl Space {
         Ok(Self {
             nodes,
             genesis: None,
+            id: SpaceId::NONE,
         })
     }
 
     /// The space with its genesis: each founding node that the space still
-    /// lists holds the key it was founded with.
+    /// lists holds the key it was founded with. A space that lists none of
+    /// its founders, every one of them replaced, is the same space.
     pub fn with_genesis(mut self, genesis: SpaceGenesis) -> Result<Self, String> {
         for (number, key) in &genesis.nodes {
             if let Some(node) = self.node(*number)
@@ -143,19 +144,19 @@ impl Space {
                 ));
             }
         }
+        self.id = vos_wire::vos_anchor::space_id(&genesis);
         self.genesis = Some(genesis);
         Ok(self)
     }
 
+    /// Its genesis, once founded.
     pub fn genesis(&self) -> Option<&SpaceGenesis> {
         self.genesis.as_ref()
     }
 
     /// The space's id, its genesis's hash; [`SpaceId::NONE`] without one.
     pub fn id(&self) -> SpaceId {
-        self.genesis
-            .as_ref()
-            .map_or(SpaceId::NONE, SpaceGenesis::id)
+        self.id
     }
 
     /// The clock that numbers the space's windows, its genesis's; the
@@ -163,12 +164,13 @@ impl Space {
     pub fn clock(&self) -> WindowClock {
         self.genesis
             .as_ref()
-            .map_or_else(WindowClock::default, |genesis| genesis.clock)
+            .map_or(WindowClock::DEFAULT, |genesis| genesis.clock)
     }
 
     /// A genesis founding this space: its nodes as listed, `clock`, the
-    /// founder's `time` and `nonce`. The clock's length must be one a venue
-    /// registers.
+    /// founder's `time` and `nonce`. A venue must be able to register it:
+    /// the clock's length one it registers, and 1 to
+    /// [`vos_wire::vos_anchor::MAX_FOUNDING_KEYS`] nodes.
     pub fn found(
         &self,
         clock: WindowClock,
@@ -181,6 +183,13 @@ impl Space {
                 clock.length_ms,
                 vos_wire::vos_anchor::MIN_LENGTH_MS,
                 vos_wire::vos_anchor::MAX_LENGTH_MS
+            ));
+        }
+        let founders = self.nodes.len();
+        if !(1..=vos_wire::vos_anchor::MAX_FOUNDING_KEYS).contains(&founders) {
+            return Err(format!(
+                "{founders} nodes: a venue registers a space of 1 to {} founding nodes",
+                vos_wire::vos_anchor::MAX_FOUNDING_KEYS
             ));
         }
         let mut nodes: Vec<(NodeNumber, [u8; 32])> = self
@@ -321,7 +330,7 @@ mod tests {
         let space = Space::read(&path).unwrap();
         assert_eq!(space.genesis(), None);
         assert_eq!(space.id(), SpaceId::NONE);
-        assert_eq!(space.clock(), WindowClock::default());
+        assert_eq!(space.clock(), WindowClock::DEFAULT);
 
         let clock = WindowClock {
             origin_ms: 1_000,
@@ -337,8 +346,8 @@ mod tests {
 
         let space = Space::read(&path).unwrap();
         assert_eq!(space.genesis(), Some(&genesis));
-        assert_eq!(space.id(), genesis.id());
-        assert_ne!(space.id(), again.id());
+        assert_eq!(space.id(), vos_wire::vos_anchor::space_id(&genesis));
+        assert_ne!(space.id(), vos_wire::vos_anchor::space_id(&again));
         assert_eq!(space.clock(), clock);
 
         let short = WindowClock {
@@ -346,6 +355,22 @@ mod tests {
             length_ms: 60_000,
         };
         assert!(space.found(short, 1_000, [9; 16]).is_err());
+
+        // A venue registers 1 to 16 founders.
+        let nodes = |count: u8| {
+            (1..=count)
+                .map(|number| SpaceNode {
+                    number,
+                    key: [number; 32],
+                    peer: "10.0.0.1:7800".parse().unwrap(),
+                    ingress: "x".into(),
+                })
+                .collect()
+        };
+        for (count, founded) in [(0, false), (1, true), (16, true), (17, false)] {
+            let space = Space::new(nodes(count)).unwrap();
+            assert_eq!(space.found(clock, 0, [0; 16]).is_ok(), founded, "{count}");
+        }
     }
 
     /// A genesis file that is not one genesis in hex, or whose founding
@@ -356,7 +381,7 @@ mod tests {
         let path = dir.path().join("space");
         std::fs::write(&path, format!("1 {} 10.0.0.1:7800 x\n", "01".repeat(32))).unwrap();
         let space = Space::read(&path).unwrap();
-        let genesis = space.found(WindowClock::default(), 0, [0; 16]).unwrap();
+        let genesis = space.found(WindowClock::DEFAULT, 0, [0; 16]).unwrap();
         let hex: String = genesis
             .encode()
             .iter()
@@ -371,7 +396,10 @@ mod tests {
             assert!(Space::read(&path).is_err(), "{bad}");
         }
         std::fs::write(genesis_path(&path), format!("# the genesis\n{hex}\n")).unwrap();
-        assert_eq!(Space::read(&path).unwrap().id(), genesis.id());
+        assert_eq!(
+            Space::read(&path).unwrap().id(),
+            vos_wire::vos_anchor::space_id(&genesis)
+        );
 
         let mut other = genesis.clone();
         other.nodes[0].1 = [7; 32];

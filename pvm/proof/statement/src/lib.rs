@@ -22,7 +22,10 @@
 //! its submitter writes. Were any space allowed, one accepted proof would
 //! make a new id under each, and a venue's repeat check would let it be
 //! applied again. [`judge`] refuses a rootless statement whose space is not
-//! [`SpaceId::NONE`] ([`Refusal::Space`]).
+//! [`SpaceId::NONE`], and a rooted one whose space is ([`Refusal::Space`]):
+//! no space has the id `NONE`, and an agent of no space states no root, so
+//! a root of `NONE` is never one a venue anchored, and is refused as a
+//! claim before any anchor is looked up.
 //!
 //! **The program id is the venue's, never the caller's.** [`judge`] takes it
 //! as `program`, the id the venue pinned for the kernel whose handler will
@@ -235,8 +238,8 @@ pub enum Refusal {
     Format,
     /// The statement's program is not the one the venue pinned.
     Program,
-    /// A root of another space than the statement's, or a rootless
-    /// statement claiming a space.
+    /// A root of another space than the statement's, a rootless statement
+    /// claiming a space, or a rooted one claiming none.
     Space,
     /// A root the venue has not anchored: stale, or unknown.
     Unanchored,
@@ -271,7 +274,9 @@ impl core::fmt::Display for Refusal {
             Self::Format => f.write_str("the format is not accepted"),
             Self::Program => f.write_str("the statement's program is not the pinned one"),
             Self::Space => {
-                f.write_str("a root is of another space, or a rootless statement claims one")
+                f.write_str(
+                "a root is of another space, a rootless statement claims one, or a rooted one claims none",
+            )
             }
             Self::Unanchored => f.write_str("a root is not anchored"),
             Self::Repeated => f.write_str("the statement was accepted before"),
@@ -310,8 +315,8 @@ impl Admitted {
 /// on the statement, never one the caller supplies (the crate's docs).
 ///
 /// In order: the format; the statement's program against `program`; the
-/// space, every root's equal to the statement's and a rootless statement's
-/// [`SpaceId::NONE`]; every root anchored; the io-hash recomputed from the
+/// space, a rootless statement's [`SpaceId::NONE`] and a rooted
+/// statement's not, every root's equal to it; every root anchored; the io-hash recomputed from the
 /// fields and the id from it; a repeat.
 pub fn admit(
     venue: &impl Venue,
@@ -327,10 +332,11 @@ pub fn admit(
     let spaced = if statement.roots.is_empty() {
         statement.space == SpaceId::NONE
     } else {
-        statement
-            .roots
-            .iter()
-            .all(|root| root.space == statement.space)
+        statement.space != SpaceId::NONE
+            && statement
+                .roots
+                .iter()
+                .all(|root| root.space == statement.space)
     };
     if !spaced {
         return Err(Refusal::Space);

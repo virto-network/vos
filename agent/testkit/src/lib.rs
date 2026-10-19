@@ -137,13 +137,7 @@ pub struct Testkit {
 
 /// The space and clock of an agent whose node has no genesis, which the
 /// installs name unless a test names another ([`Testkit::install_in`]).
-pub const SPACELESS: (SpaceId, WindowClock) = (
-    SpaceId::NONE,
-    WindowClock {
-        origin_ms: 0,
-        length_ms: vos_wire::vos_anchor::DEFAULT_LENGTH_MS,
-    },
-);
+pub const SPACELESS: (SpaceId, WindowClock) = (SpaceId::NONE, WindowClock::DEFAULT);
 
 impl Testkit {
     pub fn new(agent: AgentId) -> Self {

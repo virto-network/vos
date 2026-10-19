@@ -349,9 +349,10 @@ Rests on decisions 1, 2, 5, 6, 7, 11 and 12. The Kreivo side of it is
 
 ```rust
 // pvm/proof/anchor (vos-anchor): no_std, depends on blake2 only.
+pub type NodeNumber = u8;                    // one byte in SCALE(genesis)
 pub struct SpaceGenesis {
     pub version: u8,                         // 1
-    pub nodes: Vec<(NodeNumber, [u8; 32])>,  // founding node keys: the first anchor keys
+    pub nodes: Vec<(NodeNumber, [u8; 32])>,  // founding node keys, numbers strictly ascending: the first anchor keys
     pub clock: WindowClock,                  // frozen: a space with another clock is another space
     pub time: u64,                           // ms since the Unix epoch, the founder's clock
     pub nonce: [u8; 16],
@@ -368,7 +369,9 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 
 | item | definition |
 |---|---|
-| `SpaceId` | `BLAKE2b-256("vos/space/id" ‖ SCALE(genesis))` |
+| `SpaceId` | `BLAKE2b-256("vos/space/id" ‖ SCALE(genesis))`; `SCALE(genesis)` is the version, a compact count of nodes, each its number (1 byte) and key (32), the clock's origin and length, the time (each 8, LE) and the nonce (16); a decode refuses no node and numbers not strictly ascending |
+| founding keys | 1 to 16 (`MAX_FOUNDING_KEYS`, Kreivo's `MaxAnchorKeys`): `vos space up` founds no other, a venue registers no other; the decode reads any count |
+| a space without a genesis | `SpaceId::NONE`: its agents record no space at their first install, for good, run no cuts and refuse `attest_at_cut`. So a space is founded before its first agent: `vos space up` on a stopped founding node holding no agent, then `<space file>.genesis` copied beside every node's space file and the nodes restarted. A node refuses an agent's record naming another space than its own |
 | window of time t | `w = ⌊(t − origin_ms) / length_ms⌋`; t < origin_ms has none |
 | boundary | `B_w = origin_ms + (w+1)·length_ms` |
 | length | `length_ms` ∈ [120,000, 3,600,000], default 600,000 (decision 2); the venue refuses another at registration |
@@ -518,7 +521,7 @@ Rests on decisions 5, 6 and 8.
   `public_args[..32]` is not the venue.
 - **`judge`, in order:** the format accepted; the program equals the pin;
   the venue prefix if venue-bound; the space rule (rootless: `NONE`;
-  otherwise every root's space the statement's); every root anchored
+  otherwise the space is not `NONE` and every root's is the statement's); every root anchored
   (within the venue's migration range); the io-hash recomputed and the id;
   unseen; the proof (at most 256 KiB, the format's own decode, nothing
   after it) against the pinned program id and the recomputed io-hash.
@@ -978,7 +981,11 @@ lands.
     `rows_proof` for each pending request of w (deterministic bytes) and
     persists it as a local row under `Owner::Tree`, keyed by request, in
     the commit that marks the cut built;
-  - the agent root at `cut(w)` kept for the two latest windows.
+  - the agent root at `cut(w)` kept for the two latest windows;
+  - **an agent of no space** (`keys::space` = `NONE`, 6.10) runs no cuts;
+  - **witness builders** serve `keys::target`, `keys::space` and
+    `keys::clock` together whenever they serve one: the default agent
+    traps on a partial set (6.10's review).
 - **The brief starts from the first test.** The crash between the cut and
   its proofs, run under the checker, is written before the implementation,
   as the step's brief, and the implementer builds to it.
@@ -1007,7 +1014,10 @@ lands.
   representative: a one-entry representative tree the node builds itself.
   Witness decoding hits a class's page budget before its step budget
   (6.0a: 11 segments for 206k steps): a larger-page class for `&self`
-  kernels or decode in place, measured with 6.18.
+  kernels or decode in place, measured with 6.18. An agent of no space
+  refuses `attest_at_cut` at request time (`AttestError::NoSpace`), so a
+  spaceless node's statements are rootless by construction (6.10's
+  review).
 - **Tests:** existing rootless attestables unchanged; a `&self` read
   accepted; a key outside the read set traps; a tampered row, a wrong
   agent root, a wrong window, a missing representative row, a row of
@@ -1062,6 +1072,9 @@ lands.
   `CommittedMap<Account, Balance>` and
   `#[attestable] fn at_least(&self, #[public] commitment: Commitment, #[public] threshold: u64, salt: [u8; 16], account: Account) -> bool`,
   the account public only as a salted commitment.
+- **The fixtures' next regeneration** adds a code-4 case: a rooted
+  statement claiming `SpaceId::NONE`, its roots of `NONE` and anchored
+  (pin F's space rule, 6.10's review).
 - **The window kernel restated** under decision 6 (S3): cumulative pair
   rows, `c_prev` as a `#[public]` argument, the old cumulative values
   private, the current rows read at one cut; output `(net, seq, c_new)`;
@@ -1119,6 +1132,10 @@ fees are the teammate's.
   `wasm32v1-none` on stable (Kreivo's toolchain, 1.94.1) and refuses a
   `std` feature reaching it; the sync check refuses a one-byte change in a
   vendored file.
+- **`spaces-pallet.md` §3** takes 6.10's decisions: `SpaceGenesis`'s
+  nodes as a compact count, then each its number (1 byte) and ed25519 key
+  (32), numbers strictly ascending, 1 to 16 founding keys
+  (`MAX_FOUNDING_KEYS`).
 - **Dep:** 6.10. **Estimate:** 1–1.5 weeks.
 
 ### 6.17 The reference mock and the conformance vectors (F)
@@ -1324,7 +1341,10 @@ fees are the teammate's.
     It prunes anchors and rooted `Seen` entries past `MaxRootAge`;
     rootless entries never expire (pin F);
   - accepted program ids (and their venue-bound flags) are constants,
-    changed by redeploy; `VenueId` per pin D.
+    changed by redeploy; `VenueId` per pin D;
+  - the service carries none of `final-verify.elf`'s test modes (mode 2,
+    the anchor vectors, reports `ACCEPT` with no statement); otherwise
+    accumulate records a verdict only when its `code` is 0.
 - **Tests:** first, a 256 KiB extrinsic submitted, refined and read;
   every fixture judged alike on the JAM-only host; anchors, an anchor
   signed by an unregistered key, equivocation, migration; a default-agent

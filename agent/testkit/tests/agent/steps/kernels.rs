@@ -166,7 +166,7 @@ fn derived_kernels_run_in_the_agent() {
             roles: vec![],
             target,
             space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::default(),
+            clock: vos_wire::WindowClock::DEFAULT,
         });
         node.add(&derived.actor);
         for (_, kernel) in &kernels {

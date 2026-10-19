@@ -128,7 +128,7 @@ impl Flows {
             roles: vec![],
             target,
             space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::default(),
+            clock: vos_wire::WindowClock::DEFAULT,
         })
     }
 
@@ -151,7 +151,7 @@ impl Flows {
             roles: vec![],
             target: Target::Vos,
             space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::default(),
+            clock: vos_wire::WindowClock::DEFAULT,
         })
     }
 

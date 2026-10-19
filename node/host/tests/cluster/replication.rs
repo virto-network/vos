@@ -9,8 +9,9 @@ use std::time::Duration;
 use vos_checker::calls::done;
 use vos_checker::hooks::carries;
 use vos_checker::programs::actor;
+use vos_node::peer::Refusal as PeerRefusal;
 use vos_node::store::EntryKind;
-use vos_node::{CallError, Hooks, Node, Reply};
+use vos_node::{CallError, Hooks, Node, Reply, Space};
 use vos_wire::abi::Refusal;
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
@@ -46,6 +47,32 @@ fn an_agent_belongs_to_its_nodes_space() {
             Some(cluster.space.clock())
         );
     }
+}
+
+/// A node of another space, though the space file lists it, holds no
+/// replica of an agent whose record names this space: it refuses the
+/// record, and the agent runs on the other two.
+#[test]
+fn a_node_of_another_space_refuses_its_agents() {
+    let cluster = Cluster::tuned(3, |number, config| {
+        if number == 3 {
+            let listed = config.space.take().unwrap();
+            let other = Space::new(listed.nodes().to_vec()).unwrap();
+            let genesis = other.found(WindowClock::DEFAULT, 0, [8; 16]).unwrap();
+            config.space = Some(other.with_genesis(genesis).unwrap());
+        }
+    });
+    let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
+    wait_until("node 3 refuses the agent's record", || {
+        cluster.node(3).dropped(PeerRefusal::OtherSpace) > 0
+    });
+    wait_until("nodes 1 and 2 run the group", || {
+        [1, 2]
+            .iter()
+            .all(|number| cluster.node(*number).applied(agent).is_some())
+    });
+    assert!(cluster.node(3).applied(agent).is_none());
+    assert!(cluster.node(3).store().agents().unwrap().is_empty());
 }
 
 #[test]

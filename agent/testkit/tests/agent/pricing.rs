@@ -497,7 +497,7 @@ fn the_start_reserves_cover_decoding_a_batch() {
                     roles: vec![],
                     target: Target::Vos,
                     space: vos_wire::SpaceId::NONE,
-                    clock: vos_wire::WindowClock::default(),
+                    clock: vos_wire::WindowClock::DEFAULT,
                 })
             })
             .collect()

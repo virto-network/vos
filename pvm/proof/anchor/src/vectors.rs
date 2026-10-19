@@ -100,8 +100,9 @@ impl Vector {
         Ok(vector)
     }
 
+    /// Its digests, as a venue computes them.
     pub fn digests(&self) -> Digests {
-        let space = self.genesis.id();
+        let space = crate::space_id(&self.genesis);
         let space_root = space_root(&space, self.window, &self.rep_root);
         Digests {
             space,
@@ -131,9 +132,10 @@ fn counting<const N: usize>(from: u8) -> [u8; N] {
     core::array::from_fn(|i| from.wrapping_add(i as u8))
 }
 
-/// The golden vectors: one founder at window 0; three founders at a window
-/// of today's, its first window the one before; and every integer at its
-/// top, 64 founders (a two-byte count).
+/// The golden vectors: one founder at window 0; three founders at window
+/// 2,966,001 of a two-minute clock, its first window the one before; and
+/// every integer at its top, 64 founders (a two-byte count, more than a
+/// venue registers: the encoding's vector, not a registrable genesis).
 pub fn golden() -> Vec<Golden> {
     alloc::vec![
         Golden {

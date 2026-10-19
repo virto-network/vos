@@ -27,6 +27,7 @@ fn a_forwarded_call_comes_from_a_replica_on_its_agent_s_requests_stream() {
     assert_eq!(
         peer::check(
             &SPACE,
+            &OURS,
             2,
             (Class::Consensus, u64::from(AGENT.0)),
             &forward,
@@ -71,6 +72,7 @@ fn each_message_comes_on_its_class_and_a_raft_message_on_its_agent_s_stream() {
     assert_eq!(
         peer::check(
             &SPACE,
+            &OURS,
             2,
             (Class::Bulk, u64::from(AGENT.0)),
             &append,
@@ -79,7 +81,7 @@ fn each_message_comes_on_its_class_and_a_raft_message_on_its_agent_s_stream() {
         Err(Refusal::WrongClass)
     );
     assert_eq!(
-        peer::check(&SPACE, 2, (Class::Consensus, 8), &append, unfollowed),
+        peer::check(&SPACE, &OURS, 2, (Class::Consensus, 8), &append, unfollowed),
         Err(Refusal::WrongStream)
     );
     let bytes = b"a blob".to_vec();
@@ -88,11 +90,11 @@ fn each_message_comes_on_its_class_and_a_raft_message_on_its_agent_s_stream() {
         bytes,
     };
     assert_eq!(
-        peer::check(&SPACE, 2, (Class::Consensus, 0), &blob, unfollowed),
+        peer::check(&SPACE, &OURS, 2, (Class::Consensus, 0), &blob, unfollowed),
         Err(Refusal::WrongClass)
     );
     assert_eq!(
-        peer::check(&SPACE, 2, (Class::Bulk, 3), &blob, unfollowed),
+        peer::check(&SPACE, &OURS, 2, (Class::Bulk, 3), &blob, unfollowed),
         Ok(())
     );
 }

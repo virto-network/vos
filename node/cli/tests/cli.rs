@@ -143,13 +143,16 @@ fn new_key(dir: &Path, name: &str) -> String {
 }
 
 /// `vos space up` founds a space once: its genesis, of the nodes the space
-/// file lists, beside it, the id printed its hash; a second founding, or a
-/// window a venue would not register, is refused.
+/// file lists, beside it, the id printed its hash; a second founding, a
+/// window a venue would not register, or a founding node that holds an
+/// agent already, is refused.
 #[test]
 fn a_space_is_founded_once() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("space");
     let file = path.to_str().unwrap();
+    let data = dir.path().join("node");
+    let data = data.to_str().unwrap();
     std::fs::write(
         &path,
         format!(
@@ -159,20 +162,18 @@ fn a_space_is_founded_once() {
         ),
     )
     .unwrap();
-    let refused = vos_fails(["space", "up", "--space", file, "--window-ms", "60000"]);
+    let up = |more: &[&str]| -> Vec<String> {
+        ["space", "up", "--space", file, "--data", data]
+            .iter()
+            .chain(more)
+            .map(|arg| arg.to_string())
+            .collect()
+    };
+    let refused = vos_fails(up(&["--window-ms", "60000"]));
     assert!(refused.contains("120000"), "{refused}");
     assert!(!dir.path().join("space.genesis").exists());
 
-    let id = vos([
-        "space",
-        "up",
-        "--space",
-        file,
-        "--window-ms",
-        "120000",
-        "--origin-ms",
-        "5000",
-    ]);
+    let id = vos(up(&["--window-ms", "120000", "--origin-ms", "5000"]));
     let space = vos_node::Space::read(&path).unwrap();
     let genesis = space.genesis().expect("the genesis beside the space file");
     assert_eq!(id, hex::encode(space.id().0));
@@ -184,9 +185,35 @@ fn a_space_is_founded_once() {
             length_ms: 120_000
         }
     );
-    let refused = vos_fails(["space", "up", "--space", file]);
+    let refused = vos_fails(up(&[]));
     assert!(refused.contains("never changes"), "{refused}");
     assert_eq!(vos_node::Space::read(&path).unwrap().id(), space.id());
+}
+
+/// A node that holds an agent founds no space: its agent recorded no space
+/// at its first install, for good.
+#[test]
+fn a_node_holding_agents_founds_no_space() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut node, data, url) = single_node(dir.path());
+    vos(["agent", "create", "--node", &url, "--data", &data]);
+    node.running.kill();
+    let path = dir.path().join("space");
+    std::fs::write(
+        &path,
+        format!("1 {} 127.0.0.1:7800 http://127.0.0.1:7700\n", node.key),
+    )
+    .unwrap();
+    let refused = vos_fails([
+        "space",
+        "up",
+        "--space",
+        path.to_str().unwrap(),
+        "--data",
+        &data,
+    ]);
+    assert!(refused.contains("before creating any agent"), "{refused}");
+    assert!(!dir.path().join("space.genesis").exists());
 }
 
 #[test]

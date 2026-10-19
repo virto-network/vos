@@ -88,7 +88,7 @@ impl Cluster {
         });
         // A space founded as `vos space up` founds it.
         let genesis = space
-            .found(vos_wire::WindowClock::default(), 0, [7; 16])
+            .found(vos_wire::WindowClock::DEFAULT, 0, [7; 16])
             .unwrap();
         let space = space.with_genesis(genesis).unwrap();
         let mut cluster = Self {

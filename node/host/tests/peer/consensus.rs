@@ -25,7 +25,7 @@ fn deliver(
     };
     let arrived = decode(&sent.encode())?;
     let way = (peer::class(&sent), peer::stream(&sent));
-    peer::check(&SPACE, from, way, &arrived, unfollowed)?;
+    peer::check(&SPACE, &OURS, from, way, &arrived, unfollowed)?;
     let PeerMessage::Raft { message, .. } = arrived else {
         unreachable!("a Raft message stays one");
     };

@@ -169,7 +169,7 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
                         roles,
                         target,
                         space: vos_wire::SpaceId::NONE,
-                        clock: vos_wire::WindowClock::default(),
+                        clock: vos_wire::WindowClock::DEFAULT,
                     })
                 }
             ),

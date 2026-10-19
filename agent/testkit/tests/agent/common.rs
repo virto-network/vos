@@ -471,7 +471,7 @@ impl Actors {
             roles: vec![(b"minter".to_vec(), MINTER)],
             target,
             space: vos_wire::SpaceId::NONE,
-            clock: vos_wire::WindowClock::default(),
+            clock: vos_wire::WindowClock::DEFAULT,
         })
     }
 
@@ -619,7 +619,7 @@ pub fn install_for(target: Target, instance: InstanceId, program: ProgramHash) -
         roles: vec![],
         target,
         space: vos_wire::SpaceId::NONE,
-        clock: vos_wire::WindowClock::default(),
+        clock: vos_wire::WindowClock::DEFAULT,
     })
 }
 

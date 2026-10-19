@@ -67,6 +67,8 @@ fn forward() -> PeerMessage {
 }
 
 const SPACE: [NodeNumber; 4] = [1, 2, 3, 4];
+/// The space's id.
+const OURS: vos_wire::SpaceId = vos_wire::SpaceId([0xa1; 32]);
 
 /// A placement of `replicas`, the configuration before it `before`,
 /// announced at `term` and `index`, committed or not, and not joint.
@@ -105,5 +107,5 @@ fn check(
     followed: impl FnOnce(AgentId) -> Option<(NodeNumber, u64)>,
 ) -> Result<(), Refusal> {
     let way = (peer::class(message), peer::stream(message));
-    peer::check(space, from, way, message, followed)
+    peer::check(space, &OURS, from, way, message, followed)
 }

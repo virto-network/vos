@@ -18,7 +18,9 @@ use crate::blake2b::Blake2b256;
 pub const IO_HASH_DOMAIN: &[u8] = b"vos/io/v1";
 
 /// What a root is of, its byte in the io-hash: `vos-anchor`'s `RootKind`,
-/// byte for byte. One kind is known; any other byte is refused.
+/// byte for byte, defined again here so this crate stays dependency-free
+/// (`vos-statement`'s tests check the two agree on every byte). One kind is
+/// known; any other byte is refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum RootKind {

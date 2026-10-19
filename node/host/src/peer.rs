@@ -29,11 +29,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use vos_net::Class;
 use vos_raft::{AppendResult, EntryKind, LogEntry, Message};
-use vos_wire::Decode;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{
     self, CreationRecord, NodeNumber, PeerMessage, Placement, Raft, SnapshotChunk,
 };
+use vos_wire::{Decode, SpaceId};
 
 /// The wire's message for the core's.
 pub fn to_wire(message: &Message<NodeNumber>) -> Raft {
@@ -267,10 +267,13 @@ pub enum Refusal {
     /// sender sends it again, told it is behind once the queue drained, or
     /// at its round.
     Full = 13,
+    /// An agent's creation record naming another space than the node's:
+    /// an agent belongs to one space, and its replicas to it.
+    OtherSpace = 14,
 }
 
 impl Refusal {
-    pub const ALL: [Refusal; 14] = [
+    pub const ALL: [Refusal; 15] = [
         Refusal::Undecodable,
         Refusal::Stranger,
         Refusal::NotTheLeaderNamed,
@@ -285,6 +288,7 @@ impl Refusal {
         Refusal::Unmatched,
         Refusal::Unplaced,
         Refusal::Full,
+        Refusal::OtherSpace,
     ];
 }
 
@@ -346,10 +350,11 @@ pub fn decode(frame: &[u8]) -> Result<PeerMessage, Refusal> {
 }
 
 /// Check what `from` sent on `class` and `stream` against `space`, the
-/// nodes configured in the space. `followed` gives the leader a replica of
-/// an agent follows and its term, if it follows one.
+/// nodes configured in the space, and `ours`, its id. `followed` gives the
+/// leader a replica of an agent follows and its term, if it follows one.
 pub fn check(
     space: &[NodeNumber],
+    ours: &SpaceId,
     from: NodeNumber,
     (class, stream): (Class, u64),
     message: &PeerMessage,
@@ -372,6 +377,7 @@ pub fn check(
         // of its replicas, which holds the creator's; then from a node of
         // the placement, or of the configuration it supersedes: a leader
         // removing itself.
+        PeerMessage::Directory { record, .. } if record.space != *ours => Err(Refusal::OtherSpace),
         PeerMessage::Directory { record, placement } => {
             let creator = CreationRecord::creator_of(record.agent);
             let from_creator = record.creator == from && creator == from;

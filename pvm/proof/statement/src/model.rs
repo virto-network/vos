@@ -189,6 +189,18 @@ mod tests {
             }),
             0x100 | 1
         );
+        // A rooted statement claiming no space, its roots of none too,
+        // anchored: refused as a claim, before any anchor is looked up.
+        assert_eq!(
+            refusal(|i| {
+                i.statement.space = crate::SpaceId::NONE;
+                for root in &mut i.statement.roots {
+                    root.space = crate::SpaceId::NONE;
+                }
+                i.policy.anchors = i.statement.roots.clone();
+            }),
+            4
+        );
         assert_eq!(judge_bytes(&bytes[..40]).unwrap_err().code(), 1);
     }
 }

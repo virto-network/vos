@@ -75,6 +75,9 @@ pub const DEFAULT_LENGTH_MS: u64 = 600_000;
 /// How long past its window's boundary a venue accepts and keeps an anchor:
 /// a day, with no separate grace.
 pub const MAX_ROOT_AGE_MS: u64 = 86_400_000;
+/// The most founding keys a genesis a venue registers holds; it holds at
+/// least one.
+pub const MAX_FOUNDING_KEYS: usize = 16;
 /// The most the representative's clock lags the space's.
 pub const MAX_REPRESENTATIVE_DELAY_MS: u64 = 120_000;
 
@@ -100,18 +103,21 @@ pub struct WindowClock {
 }
 
 impl Default for WindowClock {
-    /// The Unix epoch as its origin, and the default length.
     fn default() -> Self {
-        Self {
-            origin_ms: 0,
-            length_ms: DEFAULT_LENGTH_MS,
-        }
+        Self::DEFAULT
     }
 }
 
 impl WindowClock {
     /// The bytes of its encoding.
     pub const BYTES: usize = 16;
+
+    /// The default clock: the Unix epoch as its origin, and the default
+    /// length. A node whose space has no genesis names it.
+    pub const DEFAULT: Self = Self {
+        origin_ms: 0,
+        length_ms: DEFAULT_LENGTH_MS,
+    };
 
     /// The window holding time `t` (milliseconds since the Unix epoch):
     /// `⌊(t − origin_ms) / length_ms⌋`; none before the origin, or for a
@@ -152,6 +158,7 @@ impl WindowClock {
         out.extend_from_slice(&self.length_ms.to_le_bytes());
     }
 
+    /// A clock, read from `reader`: any origin and length.
     pub fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         Ok(Self {
             origin_ms: reader.u64()?,
@@ -163,10 +170,12 @@ impl WindowClock {
 /// A space's founding record: its id is its hash ([`space_id`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SpaceGenesis {
-    /// [`GENESIS_VERSION`].
+    /// [`GENESIS_VERSION`], the one its encoding writes whatever this
+    /// holds.
     pub version: u8,
-    /// The founding nodes' numbers and ed25519 keys: the space's first
-    /// anchor keys.
+    /// The founding nodes' numbers and ed25519 keys, by ascending number:
+    /// the space's first anchor keys. A venue registers 1 to
+    /// [`MAX_FOUNDING_KEYS`].
     pub nodes: Vec<(NodeNumber, [u8; 32])>,
     /// The space's clock: a space with another clock is another space.
     pub clock: WindowClock,
@@ -177,16 +186,18 @@ pub struct SpaceGenesis {
 }
 
 impl SpaceGenesis {
-    /// Its canonical encoding: the version; the nodes, a compact count then
-    /// each its number and key; the clock; the time; the nonce.
+    /// Its canonical encoding: [`GENESIS_VERSION`]; the nodes, a compact
+    /// count then each its number (1 byte) and key; the clock; the time;
+    /// the nonce.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.encode_to(&mut out);
         out
     }
 
+    /// [`SpaceGenesis::encode`], appended to `out`.
     pub fn encode_to(&self, out: &mut Vec<u8>) {
-        out.push(self.version);
+        out.push(GENESIS_VERSION);
         codec::compact(out, self.nodes.len() as u64);
         for (number, key) in &self.nodes {
             out.push(*number);
@@ -197,8 +208,10 @@ impl SpaceGenesis {
         out.extend_from_slice(&self.nonce);
     }
 
-    /// The genesis `bytes` encode, all of them, canonically, of version
-    /// [`GENESIS_VERSION`].
+    /// The genesis `bytes` encode, all of them, canonically: of version
+    /// [`GENESIS_VERSION`], with at least one node, their numbers strictly
+    /// ascending, so one set of founders has one encoding. How many a venue
+    /// registers is the venue's check ([`MAX_FOUNDING_KEYS`]).
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut reader = Reader::new(bytes);
         let genesis = Self::decode_from(&mut reader)?;
@@ -213,9 +226,12 @@ impl SpaceGenesis {
             return Err(DecodeError::Noncanonical);
         }
         let count = reader.count(1 + 32)?;
-        let nodes = (0..count)
+        let nodes: Vec<(NodeNumber, [u8; 32])> = (0..count)
             .map(|_| Ok((reader.u8()?, reader.array()?)))
             .collect::<Result<_, DecodeError>>()?;
+        if nodes.is_empty() || nodes.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+            return Err(DecodeError::Noncanonical);
+        }
         Ok(Self {
             version,
             nodes,
@@ -223,11 +239,6 @@ impl SpaceGenesis {
             time: reader.u64()?,
             nonce: reader.array()?,
         })
-    }
-
-    /// Its space's id.
-    pub fn id(&self) -> SpaceId {
-        space_id(self)
     }
 }
 
@@ -282,6 +293,7 @@ impl RootKind {
         }
     }
 
+    /// A kind, read from `reader`, an unknown byte refused.
     pub fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         Self::from_u8(reader.u8()?).ok_or(DecodeError::Noncanonical)
     }

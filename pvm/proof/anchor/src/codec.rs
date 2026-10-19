@@ -49,6 +49,7 @@ pub struct Reader<'a> {
 }
 
 impl<'a> Reader<'a> {
+    /// A reader at the start of `bytes`.
     pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, at: 0 }
     }
@@ -58,6 +59,7 @@ impl<'a> Reader<'a> {
         self.at
     }
 
+    /// The next `n` bytes.
     pub fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         let end = self.at.checked_add(n).ok_or(DecodeError::Short)?;
         let bytes = self.bytes.get(self.at..end).ok_or(DecodeError::Short)?;
@@ -65,18 +67,22 @@ impl<'a> Reader<'a> {
         Ok(bytes)
     }
 
+    /// The next `N` bytes, as an array.
     pub fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
         Ok(self.take(N)?.try_into().expect("N bytes"))
     }
 
+    /// A byte.
     pub fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
     }
 
+    /// A little-endian `u32`.
     pub fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_le_bytes(self.array()?))
     }
 
+    /// A little-endian `u64`.
     pub fn u64(&mut self) -> Result<u64, DecodeError> {
         Ok(u64::from_le_bytes(self.array()?))
     }
