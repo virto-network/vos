@@ -795,7 +795,11 @@ fold-in (S2).
       node signs with it once it is listed; the controller then removes the
       old key (`remove_anchor_key`). Anchors go on throughout: a window
       the node cannot sign waits, and is anchored in order once a key is
-      listed, within `MaxRootAge`.
+      listed, within `MaxRootAge`. A wait survives a change of the
+      representative's leader only within the last `CUT_KEEP` (4) windows,
+      whose cuts the replicas keep; a leader whose key is delisted keeps
+      leading and signing nothing, so the operator replaces that replica or
+      lists one of its keys.
     - A single-founder space that equivocates recovers at its venue: the
       node rotates, the controller registers the new key, removes the
       founding one and calls `resume`, and the space anchors again with

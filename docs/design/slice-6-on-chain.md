@@ -409,7 +409,7 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | anchor digest | `BLAKE2b-256("vos/anchor/v1" ‖ venue ‖ space ‖ w (8, LE) ‖ kind (1) ‖ root)`, ed25519 by a registered anchor key |
 | registration | a founding key's ed25519 signature over `BLAKE2b-256("vos/space/register" ‖ venue ‖ space ‖ controller (32) ‖ start_window (8, LE))`; the venue takes the genesis itself and computes the id, so it learns the clock and the founding keys from the hash. The first window the space anchors at the venue is signed, so nobody who sees a registration can resubmit it with a start that keeps the space from ever anchoring; the venue also bounds it, `now_w − MaxRootAge / length_ms ≤ start_window ≤ now_w + 1` by its own time |
 | controller | an `AccountId` (32 bytes) at each venue: a person, a multisig, a pass account or a community account; it rotates the authorities and anchor keys and migrates the space |
-| anchor keys | each node's, in its store, oldest first: its node key, which a founding node's genesis names, then each `vos node anchor-key rotate` makes (6.14b). The representative's leader signs with the newest of its own the venue lists (`VenueClient::anchor_keys`: Kreivo's `AnchorKeys`, the model's set), and signs nothing, an alert, when it lists none: that window waits, and the later ones behind it, until one is listed. A rotation: the node makes the key and prints it; the controller registers it (`add_authority`); the node signs with it once listed; the controller removes the old one |
+| anchor keys | each node's, in its store, oldest first: its node key, which a founding node's genesis names, then each `vos node anchor-key rotate` makes (6.14b). The representative's leader signs with the newest of its own the venue lists (`VenueClient::anchor_keys`: Kreivo's `AnchorKeys`, the model's set), and signs nothing when it lists none, alerting "replace this replica, or list one of its keys": that window waits, and the later ones behind it, until one is listed, or the space resumes after a `Suspended`, and is settled unsent past `B_w + MaxRootAge`. A wait survives a leader change only within the windows whose representative cut rows the replicas keep (`CUT_KEEP`): a new leadership takes up every window up to the close mark whose cut it keeps and whose root the venue does not hold. A rotation: the node makes the key and prints it; the controller registers it (`add_authority`); the node signs with it once listed; the controller removes the old one |
 | sovereign account | on Kreivo, `PalletId(*b"kv/space").into_sub_account_truncating(space)` (`b"modl" ‖ b"kv/space" ‖ space[0..20]`): derivable from the genesis before registration, so the founder funds it first; it holds the registration deposit and pays every fee and `submit` deposit of the space's authorities, within a spend budget per window that the controller sets and the venue enforces before inclusion, so a compromised node key cannot drain it (`spaces-pallet.md` §7) |
 | authorities | on Kreivo, a map `(space, account) → anchor key`: each node's own sr25519 account, paired with its ed25519 anchor key, set by the controller; an authority signs `anchor` and `submit`, and the sovereign account pays (`spaces-pallet.md` §7). On JAM, the registered anchor keys alone |
 | migration | `Migrate`, by the controller at each venue; each venue refuses anchors outside its range |
@@ -1331,7 +1331,13 @@ single-founder space that equivocated was dead at its venue.
     refusals that the controller lifts (`Key`, a key removed meanwhile, and
     `Suspended`): each is tried again at the representative's next batch,
     so a window is anchored once a key is listed or the space resumed,
-    within `MaxRootAge`;
+    within `MaxRootAge`; one past `B_w + MaxRootAge` by the leader's clock
+    is settled unsent. A new leadership takes up the windows an earlier one
+    left waiting: every window up to the close mark whose cut root the
+    replica keeps (about `CUT_KEEP` windows) and whose `S_w` the venue
+    does not hold, so a wait survives a failover or a replacement only
+    within those windows. The alert says to replace the replica or list one
+    of its keys: no leadership moves off a replica whose key is delisted;
   - the representative is created on founding nodes; a replacement adds
     any node holding a key the venue lists for the space (without a venue,
     a genesis key): the node added answers the placement that it cannot
@@ -1346,14 +1352,18 @@ single-founder space that equivocated was dead at its venue.
 - **Tests:** a rotation end to end on the model venue (three founding
   nodes: anchors before, during and after, windows 0–3 each anchored);
   an equivocation in a single-founder space resumed after the rotation
-  (`resume` refused while the equivocating key is registered); a leader
+  (`resume` refused while the equivocating key is registered, the window
+  closed while suspended waiting and anchored after); a leader
   whose key the venue does not list signs nothing, and anchors the window
   it held back once a key is listed; a node that did not found the space,
   refused as a replica until its key is registered, replicating the
   representative and anchoring after a failover; the rotation's process
   killed once it printed the key, before the venue lists it: the node
-  keeps the key, signs with its old one until the new is listed. The
-  venue's own: keys added and removed, `resume`; the CLI's rotation.
+  keeps the key, signs with its old one until the new is listed; a waiting
+  anchor taken up by the next leader after the unlisted one stops. The
+  venue's own: keys added and removed, `resume`; the CLI's rotation; a
+  rotation numbering past an unreadable key's row, never overwriting the
+  newest.
 - **Dep:** 6.14; `spaces-pallet.md` §6. **Estimate:** 1–1.5 weeks.
 
 ### M3a acceptance
@@ -1449,6 +1459,13 @@ fees are the teammate's.
   batch** (6.14): `VenueClient::anchor` must not block there. The Kreivo
   client queues the extrinsic and answers at once (taken, refused for
   good, or `Open`: tried again at the next batch, in window order).
+- **The anchor's waits cost fees at Kreivo** (6.14b's review): every
+  `Suspended` or `Key` retry is a failed `anchor` extrinsic the sovereign
+  pays. `VenueClient` exposes the space's status (`Spaces[space]`, which
+  the client reads already) and the leader waits without submitting while
+  it is suspended; a `Key` refusal is retried only once the `anchor_keys`
+  listing changes, or once a window. A window past `B_w + MaxRootAge` by
+  the leader's clock is settled locally, unsent (built in 6.14b).
 - **Files:** `node/venue/kreivo` (in `vos-venue`, behind a `kreivo`
   feature); the operator and controller tooling over the same `calls`
   layer: `vosx space venue register` (call 0, the founder's signature over

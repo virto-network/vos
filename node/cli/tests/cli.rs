@@ -240,8 +240,8 @@ fn an_anchor_key_is_rotated_on_a_stopped_node() {
         .anchor_secrets()
         .unwrap()
         .iter()
-        .map(|seed| {
-            let key = ed25519_dalek::SigningKey::from_bytes(seed).verifying_key();
+        .map(|(_, seed)| {
+            let key = ed25519_dalek::SigningKey::from_bytes(&seed.unwrap()).verifying_key();
             key.to_bytes()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))

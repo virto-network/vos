@@ -276,19 +276,37 @@ impl Fjall {
             .and_then(|seed| seed[..].try_into().ok()))
     }
 
-    /// The seeds of the anchor keys the node made past its first, its
-    /// node key's, oldest first: secret, never served.
-    pub fn anchor_secrets(&self) -> Result<Vec<[u8; 32]>> {
+    /// The anchor keys the node made past its first, its node key's, by
+    /// number, oldest first: each seed, secret and never served, or `None`
+    /// where its row is unreadable. A number is never reused, so the next
+    /// key takes the last number plus one, past an unreadable row too.
+    pub fn anchor_secrets(&self) -> Result<Vec<(u64, Option<[u8; 32]>)>> {
         let prefix = node_record(NodeRow::AnchorKey, &[]);
         let mut seeds = Vec::new();
         for row in self.system().prefix(&prefix) {
-            let (_, seed) = row.into_inner()?;
-            match seed[..].try_into() {
-                Ok(seed) => seeds.push(seed),
-                Err(_) => tracing::error!("an unreadable anchor key; it is not used"),
+            let (key, seed) = row.into_inner()?;
+            let Some(number) = key.get(prefix.len()..).and_then(be_u64) else {
+                tracing::error!("an anchor key's row is misnamed; it is not used");
+                continue;
+            };
+            let seed = seed[..].try_into().ok();
+            if seed.is_none() {
+                tracing::error!(number, "an unreadable anchor key; it is not used");
             }
+            seeds.push((number, seed));
         }
         Ok(seeds)
+    }
+
+    /// Make anchor key `number`'s row unreadable, as a torn write might.
+    #[cfg(test)]
+    pub(crate) fn corrupt_anchor_secret(&self, number: u64) {
+        self.system()
+            .insert(
+                node_record(NodeRow::AnchorKey, &number.to_be_bytes()),
+                [0u8; 5],
+            )
+            .unwrap();
     }
 
     /// The node's last run, as its pair heartbeat numbered it.

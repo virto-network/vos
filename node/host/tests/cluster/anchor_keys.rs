@@ -46,6 +46,32 @@ fn anchored(anchoring: &Anchoring, cluster: &Cluster, clock: &WindowClock, windo
     anchor.unwrap()
 }
 
+/// Set the clocks past `window`'s close and wait until node `number`'s
+/// replica of the representative has sent it, anchored or not.
+fn closed(
+    anchoring: &Anchoring,
+    cluster: &Cluster,
+    clock: &WindowClock,
+    (number, representative): (u8, AgentId),
+    window: u64,
+) {
+    anchoring.set_clocks(
+        cluster,
+        clock.boundary(window).unwrap() + delay(clock) + 1_000,
+    );
+    wait_until(
+        &format!("the representative closes window {window}"),
+        || {
+            vos_checker::applied::<(u64, Option<AgentId>)>(
+                cluster.node(number).store(),
+                representative,
+                &keys::close_mark(),
+            )
+            .is_some_and(|(closed, _)| closed >= window)
+        },
+    );
+}
+
 /// The windows the venue holds anchored, in order.
 fn windows(anchoring: &Anchoring, cluster: &Cluster) -> Vec<u64> {
     anchoring
@@ -130,15 +156,7 @@ fn an_unlisted_leader_signs_nothing() {
     let stranger = SigningKey::from_bytes(&[9; 32]).verifying_key().to_bytes();
     assert!(venue.add_anchor_key(&space, stranger));
     assert!(venue.remove_anchor_key(&space, &founding));
-    anchoring.set_clocks(&cluster, clock.boundary(0).unwrap() + delay(&clock) + 1_000);
-    wait_until("the representative closes window 0", || {
-        vos_checker::applied::<(u64, Option<AgentId>)>(
-            cluster.node(1).store(),
-            representative,
-            &keys::close_mark(),
-        )
-        .is_some()
-    });
+    closed(&anchoring, &cluster, &clock, (1, representative), 0);
     assert!(windows(&anchoring, &cluster).is_empty(), "nothing signed");
     let key = cluster.node(1).rotate_anchor_key().unwrap();
     assert!(venue.add_anchor_key(&space, key));
@@ -152,15 +170,38 @@ fn an_unlisted_leader_signs_nothing() {
     assert!(anchors.iter().all(|anchor| anchor.signer == key));
 }
 
+/// An anchor left waiting survives a leader change: the leader's keys are
+/// not listed, the other replicas' are; it closes window 0, signing
+/// nothing, and stops. The new leader takes up window 0 from its replica's
+/// cut, and anchors it, then window 1, with its own key.
+#[test]
+fn a_waiting_anchor_survives_a_leader_change() {
+    let (anchoring, mut cluster, clock, representative) = space(3);
+    let space = cluster.space.id();
+    let leader = cluster.leader(representative);
+    let unlisted = cluster.node(leader).anchor_keys()[0];
+    assert!(anchoring.venue.remove_anchor_key(&space, &unlisted));
+    closed(&anchoring, &cluster, &clock, (leader, representative), 0);
+    assert!(windows(&anchoring, &cluster).is_empty(), "nothing signed");
+    cluster.stop(leader);
+    let next = cluster.leader(representative);
+    let key = cluster.node(next).anchor_keys()[0];
+    assert_eq!(anchored(&anchoring, &cluster, &clock, 1).signer, key);
+    let anchors = anchoring.venue.anchors(&space);
+    assert_eq!(windows(&anchoring, &cluster), [0, 1], "window 0 taken up");
+    assert!(anchors.iter().all(|anchor| anchor.signer == key));
+}
+
 /// An equivocation in a space of one founder: a second root of window 0,
 /// signed by its only anchor key, suspends the space. The node, stopped,
 /// rotates its key as `vos node anchor-key rotate` does; the controller
 /// registers the new key, cannot resume while the equivocating key is
-/// registered, removes it and resumes; the node's next window is
-/// anchored by the new key.
+/// registered, and removes it. The window that closes while the space is
+/// suspended waits, unanchored; once resumed, it is anchored by the new key,
+/// then the next.
 #[test]
 fn a_single_founder_resumes_after_an_equivocation() {
-    let (anchoring, mut cluster, clock, _) = space(1);
+    let (anchoring, mut cluster, clock, representative) = space(1);
     let space = cluster.space.id();
     let venue = &anchoring.venue;
     let founding = cluster.node(1).anchor_keys()[0];
@@ -188,10 +229,18 @@ fn a_single_founder_resumes_after_an_equivocation() {
     assert!(venue.add_anchor_key(&space, rotated));
     assert!(!venue.resume(&space), "the equivocating key is registered");
     assert!(venue.remove_anchor_key(&space, &founding));
+    closed(&anchoring, &cluster, &clock, (1, representative), 1);
+    assert_eq!(
+        windows(&anchoring, &cluster),
+        [0],
+        "suspended: window 1 waits"
+    );
     assert!(venue.resume(&space));
-    assert_eq!(anchored(&anchoring, &cluster, &clock, 1).signer, rotated);
+    assert_eq!(anchored(&anchoring, &cluster, &clock, 2).signer, rotated);
     assert!(!venue.suspended(&space));
-    assert_eq!(windows(&anchoring, &cluster), [0, 1]);
+    let anchors = venue.anchors(&space);
+    assert_eq!(windows(&anchoring, &cluster), [0, 1, 2]);
+    assert_eq!(anchors[1].signer, rotated);
 }
 
 /// A node that did not found the space replicates the representative once

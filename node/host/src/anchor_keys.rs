@@ -18,28 +18,46 @@ use crate::{lock, random};
 
 /// A node's anchor keys, oldest first: the node key, then each rotation's.
 pub(crate) struct AnchorKeys {
-    keys: Mutex<Vec<SigningKey>>,
+    held: Mutex<Held>,
     /// Held across a rotation's commit, so two rotations number their
     /// keys apart.
     rotating: smol::lock::Mutex<()>,
 }
 
+struct Held {
+    keys: Vec<SigningKey>,
+    /// The number the next rotation's key takes: past every one stored,
+    /// an unreadable one's too.
+    next: u64,
+}
+
+/// The number after the last of `stored`, as [`Fjall::anchor_secrets`]
+/// lists them: 1 with none.
+fn next_number(stored: &[(u64, Option<[u8; 32]>)]) -> u64 {
+    stored.last().map_or(1, |(number, _)| number + 1)
+}
+
 impl AnchorKeys {
     /// The keys `store` holds past the node key, whose seed is `secret`.
     pub(crate) fn load(secret: &[u8; 32], store: &Fjall) -> Result<Self, fjall::Error> {
+        let stored = store.anchor_secrets()?;
         let keys = std::iter::once(*secret)
-            .chain(store.anchor_secrets()?)
+            .chain(stored.iter().filter_map(|(_, seed)| *seed))
             .map(|seed| SigningKey::from_bytes(&seed))
             .collect();
         Ok(Self {
-            keys: Mutex::new(keys),
+            held: Mutex::new(Held {
+                keys,
+                next: next_number(&stored),
+            }),
             rotating: smol::lock::Mutex::new(()),
         })
     }
 
     /// Their public halves, oldest first.
     pub(crate) fn public(&self) -> Vec<[u8; 32]> {
-        lock(&self.keys)
+        lock(&self.held)
+            .keys
             .iter()
             .map(|key| key.verifying_key().to_bytes())
             .collect()
@@ -48,7 +66,8 @@ impl AnchorKeys {
     /// The newest key among `listed`, the anchor keys a venue registered:
     /// none when it lists none of them.
     pub(crate) fn listed(&self, listed: &[[u8; 32]]) -> Option<SigningKey> {
-        lock(&self.keys)
+        lock(&self.held)
+            .keys
             .iter()
             .rev()
             .find(|key| listed.contains(&key.verifying_key().to_bytes()))
@@ -59,14 +78,16 @@ impl AnchorKeys {
     /// shown: its public half.
     pub(crate) async fn rotate(&self, storage: &StorageThread) -> Result<[u8; 32], String> {
         let _rotating = self.rotating.lock().await;
-        let number = lock(&self.keys).len() as u64;
+        let number = lock(&self.held).next;
         let seed = random();
         storage
             .commit(vec![Change::AnchorKey { number, seed }])
             .await?;
         let key = SigningKey::from_bytes(&seed);
         let public = key.verifying_key().to_bytes();
-        lock(&self.keys).push(key);
+        let mut held = lock(&self.held);
+        held.keys.push(key);
+        held.next = number + 1;
         Ok(public)
     }
 }
@@ -91,10 +112,48 @@ pub fn rotate_anchor_key(data: impl AsRef<Path>) -> Result<[u8; 32], String> {
             path.display()
         ));
     }
-    let number = store.anchor_secrets().map_err(failed)?.len() as u64 + 1;
+    let number = next_number(&store.anchor_secrets().map_err(failed)?);
     let seed: [u8; 32] = random();
     let mut batch = store.batch();
     batch.anchor_secret(number, &seed);
     batch.commit(PersistMode::SyncAll).map_err(failed)?;
     Ok(SigningKey::from_bytes(&seed).verifying_key().to_bytes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unreadable key's number is never reused: the next rotation
+    /// numbers past it, so it cannot overwrite the newest key.
+    #[test]
+    fn a_rotation_numbers_past_an_unreadable_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::STORE);
+        let store = Fjall::open(&path).unwrap();
+        let mut batch = store.batch();
+        batch.node_secret(&[1; 32]);
+        batch.anchor_secret(1, &[2; 32]);
+        batch.anchor_secret(2, &[3; 32]);
+        batch.commit(PersistMode::SyncAll).unwrap();
+        store.corrupt_anchor_secret(1);
+        drop(store);
+        let made = rotate_anchor_key(dir.path()).unwrap();
+        let store = Fjall::open(&path).unwrap();
+        let stored = store.anchor_secrets().unwrap();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(stored[0], (1, None), "the unreadable row kept as it was");
+        assert_eq!(stored[1], (2, Some([3; 32])), "the newest key kept");
+        let (number, seed) = stored[2];
+        assert_eq!(number, 3);
+        assert_eq!(
+            SigningKey::from_bytes(&seed.unwrap())
+                .verifying_key()
+                .to_bytes(),
+            made
+        );
+        let keys = AnchorKeys::load(&[1; 32], &store).unwrap();
+        assert_eq!(keys.public().len(), 3, "the node key and the two readable");
+        assert_eq!(lock(&keys.held).next, 4);
+    }
 }
