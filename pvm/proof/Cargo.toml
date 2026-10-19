@@ -70,6 +70,8 @@ blake3 = { version = "1", optional = true }
 
 [dev-dependencies]
 vos-pvm-compiler = { workspace = true }
+# The tests' heap handed back between proofs (`malloc_trim`).
+libc = "0.2"
 # The agent's reference model and the test actors it runs (`just
 # build-test-actors`): a kernel's live run, which the prover's re-run of
 # it must match.

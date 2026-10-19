@@ -277,7 +277,20 @@ pub fn measured<T>(work: impl FnOnce() -> T) -> (T, std::time::Duration, u64) {
     let started = std::time::Instant::now();
     let result = work();
     let elapsed = started.elapsed();
+    trim();
     (result, elapsed, ((PEAK.load(Relaxed) - base) >> 20) as u64)
+}
+
+/// The heap a finished proof freed, handed back to the system: glibc keeps
+/// its threads' arenas' free pages otherwise, and a binary proving one
+/// window after another outgrows its memory limit on pages it no longer
+/// uses.
+fn trim() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    // SAFETY: `malloc_trim` only releases free memory.
+    unsafe {
+        libc::malloc_trim(0);
+    }
 }
 
 /// Proofs of one kind in a run: how many, their proving time summed and
