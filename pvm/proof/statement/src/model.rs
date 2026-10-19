@@ -8,11 +8,11 @@
 
 use alloc::vec::Vec;
 
-use crate::codec::{self, Reader};
 use crate::{
     Admitted, DecodeError, ProgramId, Refusal, RootRead, Statement, StatementId, Venue, admit,
     decode_program, judge,
 };
+use vos_anchor::codec::{self, Reader};
 
 /// A venue's state as lists.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -77,7 +77,7 @@ impl Input {
         let program = decode_program(&mut reader)?;
         let count = reader.count(4)?;
         let formats = (0..count).map(|_| reader.u32()).collect::<Result<_, _>>()?;
-        let count = reader.count(crate::ROOT_READ_BYTES)?;
+        let count = reader.count(RootRead::BYTES)?;
         let anchors = (0..count)
             .map(|_| RootRead::decode_from(&mut reader))
             .collect::<Result<_, _>>()?;

@@ -15,6 +15,9 @@
 //!
 //!   then the proof's Blake2b-256 hash and its length (`u32`,
 //!   little-endian);
+//!   - 2: a golden vector of `vos-anchor` (`vos_anchor::vectors::Vector`'s
+//!     encoding), and nothing after it: its digests are computed, and no
+//!     proof is read;
 //! - the proof, postcard, as a preimage of the running service, read by
 //!   `historical_lookup`: only once a judgement's checks before the proof
 //!   pass, and only when its length is at most
@@ -23,7 +26,8 @@
 //!
 //! Output (φ7 address, φ8 length): [`Report`], every field a little-endian
 //! `u64`: the verdict, the gas left at each phase, the heap's figures, a
-//! refusal's text, and a judgement's code and accepted statement id.
+//! refusal's text, a judgement's code and accepted statement id, and a
+//! vector's digests.
 //! Blake2b-256 is computed in software: JAM serves no hash.
 
 #![no_std]
@@ -39,6 +43,7 @@ use core::fmt::Write;
 
 use vos_pvm_final_verifier::PUBLIC_WORDS;
 use vos_statement::model::Input;
+use vos_statement::vos_anchor::vectors::{Digests, Vector};
 use vos_statement::{Admitted, Refusal, StatementId};
 
 /// The verifier's own stack, in `.bss`: the standard program's stack is
@@ -318,6 +323,7 @@ const PAYLOAD_MAX: usize = 16 << 10;
 /// The payload's modes, its first byte.
 const WORDS: u8 = 0;
 const JUDGE: u8 = 1;
+const ANCHORS: u8 = 2;
 
 /// Verdicts.
 const ACCEPT: u64 = 1;
@@ -352,6 +358,8 @@ pub struct Report {
     code: u64,
     /// An accepted statement's id.
     id: [u8; 32],
+    /// A golden vector's digests.
+    digests: [u8; Digests::BYTES],
 }
 
 impl Report {
@@ -370,6 +378,7 @@ impl Report {
             error: [0; 192],
             code: u64::MAX,
             id: [0; 32],
+            digests: [0; Digests::BYTES],
         }
     }
 
@@ -485,7 +494,20 @@ fn verify(report: &mut Report) -> u64 {
     if len > payload.len() as u64 {
         return BAD_PAYLOAD;
     }
-    let Some((request, hash, proof_len)) = request(&payload[..len as usize]) else {
+    let payload = &payload[..len as usize];
+    if let [ANCHORS, vector @ ..] = payload {
+        return match Vector::decode(vector) {
+            Ok(vector) => {
+                report.digests = vector.digests().to_bytes();
+                ACCEPT
+            }
+            Err(error) => {
+                report.refuse(&error);
+                BAD_PAYLOAD
+            }
+        };
+    }
+    let Some((request, hash, proof_len)) = request(payload) else {
         return BAD_PAYLOAD;
     };
     report.proof_len = proof_len as u64;

@@ -1,0 +1,14 @@
+[package]
+name = "vos-anchor"
+edition.workspace = true
+version.workspace = true
+license = "Apache-2.0"
+description = "A space's identity, its window clock, its roots and their anchors at a venue: the types, their canonical SCALE encodings and the digests a venue checks signatures over. no_std, with BLAKE2b its one dependency."
+
+[features]
+# The golden vectors (`vectors`), which the venues' harnesses compute.
+vectors = []
+
+[dependencies]
+# BLAKE2b-256, every digest's; without std.
+blake2 = { version = "0.10", default-features = false }

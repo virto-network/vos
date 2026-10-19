@@ -4,9 +4,9 @@
 //! `io_hash = BLAKE2b-256(IO_HASH_DOMAIN ‖ public_args ‖ output ‖ roots)`,
 //! each field in its SCALE encoding: a byte vector a compact length then its
 //! bytes, the roots a compact count then each [`RootRead`] as its fields
-//! encode, a byte for its kind, the space's 32 bytes, the window as eight
-//! little-endian bytes and the root's 32. So a venue that decodes a
-//! statement re-encodes its fields to the same bytes.
+//! encode, a byte for its kind ([`RootKind`]), the space's 32 bytes, the
+//! window as eight little-endian bytes and the root's 32. So a venue that
+//! decodes a statement re-encodes its fields to the same bytes.
 //!
 //! A kernel computes it through the BLAKE2b precompile and leaves it in
 //! φ9..φ12 at its halt, eight little-endian bytes a register; a venue
@@ -17,10 +17,41 @@ use crate::blake2b::Blake2b256;
 /// The io-hash's domain, absorbed first.
 pub const IO_HASH_DOMAIN: &[u8] = b"vos/io/v1";
 
+/// What a root is of, its byte in the io-hash: `vos-anchor`'s `RootKind`,
+/// byte for byte. One kind is known; any other byte is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RootKind {
+    /// A space root `S_w` over its representative's Blake2b tree.
+    Space = 0,
+}
+
+impl RootKind {
+    /// The kind byte `byte` names; none for an unknown one.
+    pub const fn from_u8(byte: u8) -> Option<Self> {
+        match byte {
+            0 => Some(Self::Space),
+            _ => None,
+        }
+    }
+}
+
+/// A byte no [`RootKind`] has.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct UnknownRootKind(pub u8);
+
+impl TryFrom<u8> for RootKind {
+    type Error = UnknownRootKind;
+
+    fn try_from(byte: u8) -> Result<Self, UnknownRootKind> {
+        Self::from_u8(byte).ok_or(UnknownRootKind(byte))
+    }
+}
+
 /// A root a kernel read: of what kind, whose space, as of which window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RootRead {
-    pub kind: u8,
+    pub kind: RootKind,
     pub space: [u8; 32],
     pub window: u64,
     pub root: [u8; 32],
@@ -37,7 +68,7 @@ pub fn compute_io_hash(public_args: &[u8], output: &[u8], roots: &[RootRead]) ->
     }
     hasher.update(compact(roots.len() as u64).as_slice());
     for root in roots {
-        hasher.update(&[root.kind]);
+        hasher.update(&[root.kind as u8]);
         hasher.update(&root.space);
         hasher.update(&root.window.to_le_bytes());
         hasher.update(&root.root);
@@ -114,7 +145,7 @@ mod tests {
     fn the_io_hash_is_blake2b_of_the_encoded_fields() {
         use blake2::digest::{Digest, consts::U32};
         let root = RootRead {
-            kind: 1,
+            kind: RootKind::Space,
             space: [0xa1; 32],
             window: 0x0102_0304_0506_0708,
             root: [0xb2; 32],
@@ -123,7 +154,7 @@ mod tests {
         encoded.extend_from_slice(b"vos/io/v1");
         encoded.extend_from_slice(&[3 << 2, 1, 2, 3]);
         encoded.extend_from_slice(&[0]);
-        encoded.extend_from_slice(&[1 << 2, 1]);
+        encoded.extend_from_slice(&[1 << 2, 0]);
         encoded.extend_from_slice(&root.space);
         encoded.extend_from_slice(&[8, 7, 6, 5, 4, 3, 2, 1]);
         encoded.extend_from_slice(&root.root);
@@ -140,6 +171,17 @@ mod tests {
         ];
         for (index, hash) in hashes.iter().enumerate() {
             assert!(!hashes[..index].contains(hash), "{index}");
+        }
+    }
+
+    /// One root kind is known, as the byte 0; every other byte is refused.
+    #[test]
+    fn an_unknown_root_kind_is_refused() {
+        assert_eq!(RootKind::Space as u8, 0);
+        assert_eq!(RootKind::try_from(0), Ok(RootKind::Space));
+        for byte in 1..=u8::MAX {
+            assert_eq!(RootKind::from_u8(byte), None);
+            assert_eq!(RootKind::try_from(byte), Err(UnknownRootKind(byte)));
         }
     }
 }

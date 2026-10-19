@@ -9,7 +9,10 @@
 //! - `decode(ptr, len) -> u32`: the decode alone, 1 if it decodes;
 //! - `judge(ptr, len) -> u32`, the input a judgement's
 //!   (`vos_statement::model::judge_bytes`): its code, 0 accepted; the
-//!   accepted statement's id is then at `statement_id()`, 32 bytes.
+//!   accepted statement's id is then at `statement_id()`, 32 bytes;
+//! - `anchor_digests(ptr, len) -> u32`, the input a golden vector of
+//!   `vos-anchor` (`vos_anchor::vectors::Vector`'s encoding): 1 when it
+//!   decodes, its digests then at `digests()`, 160 bytes; 0 otherwise.
 //!
 //! Blake2b-256 is computed in the blob.
 
@@ -124,4 +127,23 @@ pub extern "C" fn judge(ptr: u32, len: u32) -> u32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn statement_id() -> u32 {
     core::ptr::addr_of!(STATEMENT_ID) as u32
+}
+
+/// The last golden vector's digests.
+static mut DIGESTS: [u8; vos_anchor::vectors::Digests::BYTES] =
+    [0; vos_anchor::vectors::Digests::BYTES];
+
+#[unsafe(no_mangle)]
+pub extern "C" fn anchor_digests(ptr: u32, len: u32) -> u32 {
+    let Ok(vector) = vos_anchor::vectors::Vector::decode(input(ptr, len)) else {
+        return 0;
+    };
+    // SAFETY: an instance runs one call at a time.
+    unsafe { DIGESTS = vector.digests().to_bytes() };
+    1
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn digests() -> u32 {
+    core::ptr::addr_of!(DIGESTS) as u32
 }

@@ -1,7 +1,8 @@
-//! The SCALE pieces a statement encodes with: fixed-width little-endian
-//! integers, fixed arrays as their bytes, and a compact length before a
-//! sequence. A decode is canonical: a compact in its shortest mode, nothing
-//! longer than the input, so a statement has one encoding.
+//! The SCALE pieces the anchor types and a statement encode with:
+//! fixed-width little-endian integers, fixed arrays as their bytes, and a
+//! compact length before a sequence. A decode is canonical: a compact in its
+//! shortest mode, an enum's byte one of its values, nothing longer than the
+//! input, so a value has one encoding.
 
 use alloc::vec::Vec;
 
@@ -10,7 +11,8 @@ use alloc::vec::Vec;
 pub enum DecodeError {
     /// The input ends inside a value.
     Short,
-    /// A compact not in its shortest mode, or a value out of its range.
+    /// A compact not in its shortest mode, or a value out of its range: an
+    /// enum's unknown byte among them.
     Noncanonical,
     /// Bytes left after the value.
     Trailing,
@@ -27,7 +29,7 @@ impl core::fmt::Display for DecodeError {
 }
 
 /// A length's SCALE compact encoding.
-pub(crate) fn compact(out: &mut Vec<u8>, value: u64) {
+pub fn compact(out: &mut Vec<u8>, value: u64) {
     match value {
         0..=0x3f => out.push((value as u8) << 2),
         0x40..=0x3fff => out.extend_from_slice(&(((value as u16) << 2) | 1).to_le_bytes()),
@@ -40,47 +42,47 @@ pub(crate) fn compact(out: &mut Vec<u8>, value: u64) {
     }
 }
 
-/// Bytes read in order.
-pub(crate) struct Reader<'a> {
+/// Bytes read in order, each read refusing what the input does not hold.
+pub struct Reader<'a> {
     bytes: &'a [u8],
     at: usize,
 }
 
 impl<'a> Reader<'a> {
-    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+    pub fn new(bytes: &'a [u8]) -> Self {
         Self { bytes, at: 0 }
     }
 
     /// The bytes read so far.
-    pub(crate) fn used(&self) -> usize {
+    pub fn used(&self) -> usize {
         self.at
     }
 
-    pub(crate) fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+    pub fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
         let end = self.at.checked_add(n).ok_or(DecodeError::Short)?;
         let bytes = self.bytes.get(self.at..end).ok_or(DecodeError::Short)?;
         self.at = end;
         Ok(bytes)
     }
 
-    pub(crate) fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+    pub fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
         Ok(self.take(N)?.try_into().expect("N bytes"))
     }
 
-    pub(crate) fn u8(&mut self) -> Result<u8, DecodeError> {
+    pub fn u8(&mut self) -> Result<u8, DecodeError> {
         Ok(self.take(1)?[0])
     }
 
-    pub(crate) fn u32(&mut self) -> Result<u32, DecodeError> {
+    pub fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_le_bytes(self.array()?))
     }
 
-    pub(crate) fn u64(&mut self) -> Result<u64, DecodeError> {
+    pub fn u64(&mut self) -> Result<u64, DecodeError> {
         Ok(u64::from_le_bytes(self.array()?))
     }
 
     /// A compact, in its shortest mode.
-    pub(crate) fn compact(&mut self) -> Result<u64, DecodeError> {
+    pub fn compact(&mut self) -> Result<u64, DecodeError> {
         let first = self.u8()?;
         let (value, least) = match first & 3 {
             0 => (u64::from(first >> 2), 0),
@@ -113,7 +115,7 @@ impl<'a> Reader<'a> {
     }
 
     /// A count of items at least `item` bytes each, which the input holds.
-    pub(crate) fn count(&mut self, item: usize) -> Result<usize, DecodeError> {
+    pub fn count(&mut self, item: usize) -> Result<usize, DecodeError> {
         let count = self.compact()?;
         let left = (self.bytes.len() - self.at) as u64;
         if count.saturating_mul(item as u64) > left {
@@ -123,13 +125,13 @@ impl<'a> Reader<'a> {
     }
 
     /// A byte vector: its compact length, then its bytes.
-    pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
+    pub fn bytes(&mut self) -> Result<Vec<u8>, DecodeError> {
         let len = self.count(1)?;
         Ok(self.take(len)?.to_vec())
     }
 
     /// Nothing is left.
-    pub(crate) fn finish(&self) -> Result<(), DecodeError> {
+    pub fn finish(&self) -> Result<(), DecodeError> {
         if self.at == self.bytes.len() {
             Ok(())
         } else {

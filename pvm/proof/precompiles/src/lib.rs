@@ -36,4 +36,4 @@ pub use blake2b::{
 #[cfg(feature = "blake2b")]
 pub mod io;
 #[cfg(feature = "blake2b")]
-pub use io::{RootRead, compute_io_hash};
+pub use io::{RootKind, RootRead, UnknownRootKind, compute_io_hash};

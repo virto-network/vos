@@ -15,8 +15,8 @@ use alloc::vec::Vec;
 use std::path::{Path, PathBuf};
 
 use crate::DecodeError;
-use crate::codec::{self, Reader};
 use crate::model::Input;
+use vos_anchor::codec::{self, Reader};
 
 /// The cases' file.
 pub const CASES: &str = "statements.cases";

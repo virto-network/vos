@@ -26,14 +26,17 @@
 //!
 //! ```text
 //! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> judge <fixtures>
+//! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> anchors
 //! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> statements <name.input>...
 //! ```
 //!
 //! `judge`: every golden fixture under `<fixtures>` judged by the blob's
 //! `judge`, failing when a verdict is not the recorded one (`just
-//! judge-wasm`). `statements`: each judgement's input beside its proof,
-//! `<name>.proof`, as the end-to-end tests write them, failing when one is
-//! refused.
+//! judge-wasm`). `anchors`: every golden vector of `vos-anchor` computed by
+//! the blob's `anchor_digests`, failing when its digests are not the pinned
+//! bytes, or when a vector cut short is not refused (`just judge-wasm`).
+//! `statements`: each judgement's input beside its proof, `<name>.proof`,
+//! as the end-to-end tests write them, failing when one is refused.
 
 use std::time::{Duration, Instant};
 
@@ -240,7 +243,7 @@ fn median(mut values: Vec<Duration>) -> Duration {
 
 fn run(args: &[String]) -> Result<()> {
     let [blob, semantics, runs, proofs @ ..] = args else {
-        bail!("usage: <verifier.wasm> <client|pvf> <runs|judge|statements> <file>...");
+        bail!("usage: <verifier.wasm> <client|pvf> <runs|judge|anchors|statements> <file>...");
     };
     let semantics = match semantics.as_str() {
         "client" => Semantics::Client,
@@ -317,6 +320,49 @@ fn run(args: &[String]) -> Result<()> {
                 bail!("{differ} of {} fixtures judged otherwise", fixtures.len());
             }
             println!("{} fixtures judged as recorded", fixtures.len());
+            return Ok(());
+        }
+        "anchors" => {
+            if !proofs.is_empty() {
+                bail!("anchors: no files");
+            }
+            let hex =
+                |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
+            let vectors = vos_statement::vos_anchor::vectors::golden();
+            for golden in &vectors {
+                let encoded = golden.vector.encode();
+                let computed = |input: &[u8]| -> Result<Option<Vec<u8>>> {
+                    let (mut store, instance, memory) =
+                        instantiate(&engine, &module, &linker, semantics)?;
+                    let call =
+                        instance.get_typed_func::<(u32, u32), u32>(&mut store, "anchor_digests")?;
+                    let ptr = write_input(&mut store, memory, input)?;
+                    if call.call(&mut store, (ptr, input.len() as u32))? != 1 {
+                        return Ok(None);
+                    }
+                    let at = instance
+                        .get_typed_func::<(), u32>(&mut store, "digests")?
+                        .call(&mut store, ())?;
+                    let mut bytes = vec![0u8; vos_statement::vos_anchor::vectors::Digests::BYTES];
+                    memory.read(&store, at as usize, &mut bytes)?;
+                    Ok(Some(bytes))
+                };
+                let digests = computed(&encoded)?
+                    .with_context(|| format!("{}: the vector refused", golden.name))?;
+                println!("ANCHORS vector={:?} digests={}", golden.name, hex(&digests));
+                if hex(&digests) != golden.digests {
+                    bail!(
+                        "{}: digests {} not the pinned {}",
+                        golden.name,
+                        hex(&digests),
+                        golden.digests
+                    );
+                }
+                if computed(&encoded[..encoded.len() - 1])?.is_some() {
+                    bail!("{}: a vector cut short decoded", golden.name);
+                }
+            }
+            println!("{} vectors computed as pinned", vectors.len());
             return Ok(());
         }
         "statements" => {

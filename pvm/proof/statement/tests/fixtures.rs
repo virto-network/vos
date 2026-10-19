@@ -3,7 +3,10 @@
 //! refine program (`final-verify.elf`, built by `just check-no-std`); the
 //! Wasm harness judges them with `judge` (`final-verifier/wasm/run`). Each
 //! verdict is its fixture's: the same acceptance, or the same refusal's
-//! class, and an accepted statement's id the same.
+//! class, and an accepted statement's id the same. `vos-anchor`'s golden
+//! vectors alike: each vector's digests the pinned bytes, by the same
+//! program on the JAM-only host (natively, `vos-anchor`'s own test; in Wasm,
+//! the harness's `anchors`).
 
 #[path = "support/jam.rs"]
 mod jam;
@@ -11,6 +14,7 @@ mod jam;
 use vos_statement::Refusal;
 use vos_statement::fixtures::{self, Fixture};
 use vos_statement::model::judge_bytes;
+use vos_statement::vos_anchor::vectors;
 use vos_statement::vos_pvm_final_verifier::{self, MAX_PROOF_BYTES};
 
 fn load() -> Vec<Fixture> {
@@ -110,4 +114,31 @@ fn a_proof_too_long_is_refused_before_its_lookup() {
     let (_, report) = jam::run(&program, &jam::words_request(&words), &long);
     assert_eq!(report.verdict, jam::UNDECODABLE, "{}", report.error);
     assert_eq!(report.gas[1], 0, "no lookup");
+}
+
+/// On the JAM-only host: each golden vector of `vos-anchor` decoded and its
+/// digests computed by the guest, the pinned bytes; a vector cut short
+/// refused.
+#[test]
+fn the_anchor_vectors_are_computed_on_the_jam_only_host_as_pinned() {
+    let (program, _) = jam::program();
+    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
+    for golden in vectors::golden() {
+        let vector = golden.vector.encode();
+        let (gas, report) = jam::run_payload(&program, jam::anchors_request(&vector), None);
+        eprintln!("{}: {:.2}M gas", golden.name, gas as f64 / 1e6);
+        assert_eq!(
+            report.verdict,
+            jam::ACCEPT,
+            "{}: {}",
+            golden.name,
+            report.error
+        );
+        assert_eq!(hex(&report.digests), golden.digests, "{}", golden.name);
+        assert_eq!(report.digests, golden.vector.digests().to_bytes());
+
+        let short = jam::anchors_request(&vector[..vector.len() - 1]);
+        let (_, report) = jam::run_payload(&program, short, None);
+        assert_eq!(report.verdict, jam::BAD_PAYLOAD, "{}", golden.name);
+    }
 }
