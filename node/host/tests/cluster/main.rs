@@ -7,6 +7,8 @@
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod common;
+#[cfg(feature = "cuts")]
+mod cuts;
 mod large_results;
 mod liveness;
 mod membership;

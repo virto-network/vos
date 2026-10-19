@@ -24,7 +24,7 @@ use vos_checker::{
 use vos_node::Node;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::result::Outcome;
-use vos_wire::{Decode, Encode, keys};
+use vos_wire::{Decode, Encode, WindowClock, keys};
 
 use crate::faults::faults;
 use crate::harness::{Cluster, NODES, query};
@@ -67,14 +67,28 @@ pub(crate) fn tallied(
     check_tallies(touring, &tallies, total)
 }
 
-fn exactly_once(mode: Mode, default_seed: u64, rounds: Option<Rounds>) {
+/// What a run does beside its clients: its space's clock, if it founds
+/// one; what it runs while they do, until `done`; and what it checks once
+/// every replica holds every request.
+pub(crate) trait Alongside: Sync {
+    fn clock(&self) -> Option<WindowClock>;
+    fn run(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])], done: &AtomicBool);
+    fn check(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])]);
+}
+
+pub(crate) fn exactly_once(
+    mode: Mode,
+    default_seed: u64,
+    rounds: Option<Rounds>,
+    alongside: Option<&dyn Alongside>,
+) {
     let seed = std::env::var("EXACTLY_ONCE_SEED")
         .ok()
         .and_then(|seed| seed.parse().ok())
         .unwrap_or(default_seed);
     println!("seed {seed}");
     let mut random = Random::new(seed);
-    let cluster = Cluster::new(seed);
+    let cluster = Cluster::founded(seed, alongside.and_then(Alongside::clock));
     let methods = Methods::of(&schema(&actor("counter")));
     let agents = agents(&cluster, rounds.as_ref());
     // At each agent, one client forwarding to the next agent's inbox and a
@@ -95,6 +109,10 @@ fn exactly_once(mode: Mode, default_seed: u64, rounds: Option<Rounds>) {
             let previous = &forwarding[(at + forwarding.len() - 1) % forwarding.len()];
             let (cluster, done) = (&cluster, &done);
             scope.spawn(move || client.read(cluster, done, previous));
+        }
+        if let Some(alongside) = alongside {
+            let (cluster, agents, done) = (&cluster, &agents, &done);
+            scope.spawn(move || alongside.run(cluster, agents, done));
         }
         let ending = Ending(&done, &cluster);
         faults(&cluster, &clients, &mut random);
@@ -166,6 +184,9 @@ fn exactly_once(mode: Mode, default_seed: u64, rounds: Option<Rounds>) {
     println!("snapshots installed: {installed}");
     assert!(installed > 0, "no node caught up by a snapshot");
     assert!(across > 0, "no message crossed nodes");
+    if let Some(alongside) = alongside {
+        alongside.check(&cluster, &agents);
+    }
 }
 
 /// The run's agents, each created at a node of its own and replicated on
@@ -317,15 +338,15 @@ fn check_forwards(
 
 #[test]
 fn one_request_at_a_time_applies_once_through_failures() {
-    exactly_once(Mode::OneAtATime, 0x5eed_0001, None);
+    exactly_once(Mode::OneAtATime, 0x5eed_0001, None, None);
 }
 
 #[test]
 fn pipelined_requests_apply_once_through_failures() {
-    exactly_once(Mode::Pipelined, 0x5eed_0002, None);
+    exactly_once(Mode::Pipelined, 0x5eed_0002, None, None);
 }
 
 #[test]
 fn workflows_apply_once_through_failures() {
-    exactly_once(Mode::OneAtATime, 0x5eed_0003, Some(Rounds::load()));
+    exactly_once(Mode::OneAtATime, 0x5eed_0003, Some(Rounds::load()), None);
 }

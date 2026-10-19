@@ -15,23 +15,28 @@ use vos_checker::{Log, Nodes};
 use vos_net::memory::Hub;
 use vos_node::client::Target;
 use vos_node::{CallError, Config, Hooks, Node, Peers, Space};
-use vos_wire::Decode;
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session, SessionId};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, Session, SessionId};
 use vos_wire::keys;
 use vos_wire::peer::NodeNumber;
-use vos_wire::records::{SessionMark, unstored};
+use vos_wire::records::{PendingRead, SessionMark, unstored};
 use vos_wire::result::Outcome;
+use vos_wire::{Decode, WindowClock};
 
 pub const NODES: NodeNumber = 3;
 
-/// Stops a leader loop once, after its commit and before its answers; and
-/// holds the node's refines, or its commits, while asked.
+/// The pending request a leader's batch records, by its agent and time.
+pub type Asks = dyn Fn(AgentId, u64) -> Option<(RequestId, PendingRead)> + Send + Sync;
+
+/// Stops a leader loop once, after its commit and before its answers;
+/// holds the node's refines, or its commits, while asked; and has the
+/// leader's batches record the pending requests `asks` gives.
 #[derive(Default)]
 pub struct Trip {
     pub armed: AtomicBool,
     pub tripped: AtomicBool,
     pub refines: Gate,
     pub commits: Gate,
+    pub asks: Mutex<Option<Arc<Asks>>>,
 }
 
 impl Hooks for Trip {
@@ -50,6 +55,11 @@ impl Hooks for Trip {
 
     fn before_commit(&self) {
         self.commits.pass();
+    }
+
+    fn request_at_cut(&self, agent: AgentId, time: u64) -> Option<(RequestId, PendingRead)> {
+        let asks = self.asks.lock().unwrap().clone()?;
+        asks(agent, time)
     }
 }
 
@@ -89,6 +99,12 @@ pub struct Cluster {
 
 impl Cluster {
     pub fn new(seed: u64) -> Self {
+        Self::founded(seed, None)
+    }
+
+    /// The cluster, its space founded with `clock` when given: a clock of
+    /// any length, which no venue need register.
+    pub fn founded(seed: u64, clock: Option<WindowClock>) -> Self {
         let agent = agent();
         let dirs: Vec<tempfile::TempDir> =
             (1..=NODES).map(|_| tempfile::tempdir().unwrap()).collect();
@@ -97,9 +113,16 @@ impl Cluster {
         let ingresses: Vec<SocketAddr> = (1..=NODES)
             .map(|_| SocketAddr::from(([127, 0, 0, 1], free_tcp_port())))
             .collect();
-        let space = space(&agent, &dirs, |number| {
+        let mut space = space(&agent, &dirs, |number| {
             format!("http://{}", ingresses[usize::from(number) - 1])
         });
+        if let Some(clock) = clock {
+            let mut genesis = space
+                .found(WindowClock::DEFAULT, vos_node::wall_clock(), [11; 16])
+                .unwrap();
+            genesis.clock = clock;
+            space = space.with_genesis(genesis).unwrap();
+        }
         let slots: Vec<Slot> = dirs
             .into_iter()
             .zip(ingresses)

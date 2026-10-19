@@ -203,6 +203,20 @@ pub trait Hooks: Send + Sync {
         Duration::ZERO
     }
 
+    /// As the leader of `agent` makes a batch of inputs timed `time`, never
+    /// a `Cut` marker, which stays empty: a pending request of the window
+    /// `time` falls in, which the batch's result then records
+    /// ([`vos_wire::keys::request`]) as a workflow's step asking for a read
+    /// at the cut does. A test's stand-in for that step.
+    fn request_at_cut(
+        &self,
+        agent: AgentId,
+        time: u64,
+    ) -> Option<(vos_wire::ids::RequestId, vos_wire::records::PendingRead)> {
+        let _ = (agent, time);
+        None
+    }
+
     /// Before the storage thread commits: true makes the commit fail with
     /// nothing written, as fjall's first failure does (it then refuses
     /// every later commit, so the node stops).

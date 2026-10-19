@@ -253,6 +253,59 @@ pub fn rows_match_tree(snapshot: &Snapshot, agent: AgentId) -> Result<bool, Erro
     Ok(stored(keys::tree_nodes())? == nodes && stored(keys::tree_leaves())? == leaves)
 }
 
+/// A row a request reads, by its full key, with its leaf's salt and bare
+/// value, or `None` when absent: as `Served` carries it.
+pub type ReadRow = (Vec<u8>, Option<([u8; 16], Vec<u8>)>);
+
+/// What every replica persists for a pending request once its window's cut
+/// is built ([`keys::cut_proof`]): the window, the cut's version and the
+/// agent's root there, and each row the request reads, by its full key in
+/// the request's order, with its leaf's salt and bare value at the cut
+/// (`None`: absent), and one [`BatchProof`] of them against that root, as
+/// encoded. Its bytes are the same on every replica.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CutProof {
+    pub window: u64,
+    pub version: u64,
+    pub agent_root: Hash,
+    pub rows: Vec<ReadRow>,
+    pub rows_proof: Vec<u8>,
+}
+
+/// The node-local rows the node's apply commits beside `writes`, the rows
+/// accumulate made of a work result, as `snapshot` holds the agent's
+/// state before them: for each committed row `writes` overwrite or delete
+/// whose current version is at or before a cut whose build is pending,
+/// its stored bytes as [`keys::undo`] of that window. A cut `writes`
+/// record themselves counts. Never written by the agent's apply: whether
+/// a build is pending is the replica's own.
+pub fn undo(snapshot: &Snapshot, agent: AgentId, writes: &[Write]) -> Result<Vec<Write>, Error> {
+    let _ = (snapshot, agent, writes);
+    todo!("6.12: the node's undo rows")
+}
+
+/// The agent's root at the window `window`'s cut and the cut's version,
+/// once the cut's build is done, while it is among the two latest cuts.
+pub fn cut_root(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    window: u64,
+) -> Result<Option<(Hash, u64)>, Error> {
+    let _ = (snapshot, agent, window);
+    todo!("6.12: the root at a cut")
+}
+
+/// The rows and proof this replica persisted for `request` at its window's
+/// cut, once that cut is built.
+pub fn cut_proof(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    request: vos_wire::ids::RequestId,
+) -> Result<Option<CutProof>, Error> {
+    let _ = (snapshot, agent, request);
+    todo!("6.12: a pending request's proof")
+}
+
 /// A committed map's latest root, the state version it holds, and a proof
 /// of some keys against it.
 #[derive(Clone, Debug)]
@@ -442,6 +495,12 @@ impl Build {
     pub fn in_batches_of(mut self, keys: usize) -> Self {
         self.batch = keys.max(1);
         self
+    }
+
+    /// The state version the build builds the tree at: the agent's latest,
+    /// or the earliest cut not yet built, whichever comes first.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// The agent's epoch the build reads and writes.

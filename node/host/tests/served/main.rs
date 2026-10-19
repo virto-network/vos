@@ -5,6 +5,8 @@
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "cuts")]
+mod cuts;
 mod exactly_once;
 mod faults;
 mod forwarding;
