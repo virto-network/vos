@@ -30,7 +30,9 @@ use alloc::vec::Vec;
 
 use stwo::core::fields::qm31::SecureField;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
-use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
+use stwo_constraint_framework::{
+    EvalAtRow, FrameworkComponent, FrameworkEval, TraceLocationAllocator,
+};
 
 pub use gate::GateRelation;
 use vos_pvm_poseidon2::{Digest, M31, Transcript, u32_limbs, u64_limbs};
@@ -41,6 +43,14 @@ pub type LogSizes = [u32; 3];
 /// A constraint's degree is at most 3, so its quotient's is at most twice
 /// the trace's: one more than the log size.
 pub const LOG_CONSTRAINT_EXPANSION: u32 = 1;
+
+/// A component's body: its columns, constraints and relation entries, its
+/// fractions not yet finalized. A component's own `evaluate` finalizes them
+/// in pairs; an evaluation that adds fractions of its own runs the body
+/// first.
+pub trait Body: FrameworkEval + Clone + Sync {
+    fn body<E: EvalAtRow>(&self, eval: &mut E);
+}
 
 /// The circuit hash's domain: "VOS/RECA", "IR/CIRCT" as little-endian
 /// u64s.

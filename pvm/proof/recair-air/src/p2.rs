@@ -44,8 +44,8 @@ use vos_pvm_poseidon2::{
     apply_external_round_matrix, apply_internal_round_matrix,
 };
 
-use crate::LOG_CONSTRAINT_EXPANSION;
 use crate::gate::GateRelation;
+use crate::{Body, LOG_CONSTRAINT_EXPANSION};
 
 /// How a row's input is formed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -214,6 +214,14 @@ impl FrameworkEval for P2Eval {
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        self.body(&mut eval);
+        eval.finalize_logup_in_pairs();
+        eval
+    }
+}
+
+impl Body for P2Eval {
+    fn body<E: EvalAtRow>(&self, eval: &mut E) {
         let pre: [E::F; 33] = from_fn(|i| {
             eval.get_preprocessed_column(PreProcessedColumnId {
                 id: PREPROCESSED[i].to_string(),
@@ -229,18 +237,18 @@ impl FrameworkEval for P2Eval {
         let mut prev_sboxes: [E::F; N_STATE] = from_fn(|_| E::F::zero());
         apply_external_round_matrix(&mut state);
         for round in 0..N_HALF_FULL_ROUNDS {
-            full_round(&mut eval, &mut state, round, &mut prev_sboxes);
+            full_round(eval, &mut state, round, &mut prev_sboxes);
         }
         for &constant in &INTERNAL_ROUND_CONSTS {
             let y = eval.add_intermediate(state[0].clone() + E::F::from(base(constant)));
-            state[0] = sbox(&mut eval, y, false).0;
+            state[0] = sbox(eval, y, false).0;
             apply_internal_round_matrix::<_, BaseField>(&mut state);
             for word in state.iter_mut() {
                 *word = eval.add_intermediate(word.clone());
             }
         }
         for round in N_HALF_FULL_ROUNDS..FULL_ROUNDS {
-            full_round(&mut eval, &mut state, round, &mut prev_sboxes);
+            full_round(eval, &mut state, round, &mut prev_sboxes);
         }
         let output = state;
         // The previous row's output: the same external matrix over its last
@@ -331,8 +339,6 @@ impl FrameworkEval for P2Eval {
                 values,
             ));
         }
-        eval.finalize_logup_in_pairs();
-        eval
     }
 }
 

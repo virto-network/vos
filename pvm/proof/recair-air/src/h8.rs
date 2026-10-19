@@ -20,8 +20,8 @@ use num_traits::One;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{EvalAtRow, FrameworkEval, RelationEntry};
 
-use crate::LOG_CONSTRAINT_EXPANSION;
 use crate::gate::GateRelation;
+use crate::{Body, LOG_CONSTRAINT_EXPANSION};
 
 /// The preprocessed columns, in commitment order: the addresses of `acc`,
 /// `σ`, `μ`, the two sample wires and the output, and the output's
@@ -81,6 +81,14 @@ impl FrameworkEval for H8Eval {
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        self.body(&mut eval);
+        eval.finalize_logup_in_pairs();
+        eval
+    }
+}
+
+impl Body for H8Eval {
+    fn body<E: EvalAtRow>(&self, eval: &mut E) {
         let pre: [E::F; 7] = from_fn(|i| {
             eval.get_preprocessed_column(PreProcessedColumnId {
                 id: PREPROCESSED[i].to_string(),
@@ -124,7 +132,5 @@ impl FrameworkEval for H8Eval {
                 &[pre[address].clone(), l0, l1, l2, l3],
             ));
         }
-        eval.finalize_logup_in_pairs();
-        eval
     }
 }

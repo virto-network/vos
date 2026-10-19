@@ -18,8 +18,8 @@ use num_traits::Zero;
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{EvalAtRow, FrameworkEval, RelationEntry};
 
-use crate::LOG_CONSTRAINT_EXPANSION;
 use crate::gate::GateRelation;
+use crate::{Body, LOG_CONSTRAINT_EXPANSION};
 
 /// The preprocessed columns, in commitment order: the five coefficients, the
 /// four lane coefficients, the operands' addresses and multiplicities, each
@@ -80,6 +80,14 @@ impl FrameworkEval for Qm31Eval {
     }
 
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
+        self.body(&mut eval);
+        eval.finalize_logup_in_pairs();
+        eval
+    }
+}
+
+impl Body for Qm31Eval {
+    fn body<E: EvalAtRow>(&self, eval: &mut E) {
         let pre: [E::F; 17] = from_fn(|i| {
             eval.get_preprocessed_column(PreProcessedColumnId {
                 id: PREPROCESSED[i].to_string(),
@@ -113,7 +121,5 @@ impl FrameworkEval for Qm31Eval {
                 &[pre[pre::ADDR + i].clone(), l0, l1, l2, l3],
             ));
         }
-        eval.finalize_logup_in_pairs();
-        eval
     }
 }
