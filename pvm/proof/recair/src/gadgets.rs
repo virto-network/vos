@@ -1,6 +1,7 @@
 //! The Poseidon2 modes as a circuit uses them, each the `vos_pvm_poseidon2`
 //! mode it mirrors: a Merkle leaf's sponge ([`leaf_hash`]), a path step
-//! ([`node`]), and the Fiat-Shamir transcript ([`TranscriptGadget`]).
+//! ([`node`]), and the Fiat-Shamir transcript ([`TranscriptGadget`]); and
+//! a one-hot choice among candidate hashes ([`assert_one_of`]).
 //!
 //! Values travel packed, four M31 limbs a wire, so a block of eight is two
 //! wires.
@@ -12,6 +13,7 @@ use vos_pvm_poseidon2::{DRAW_DOMAIN, RATE};
 
 use crate::context::{Bit, Context, Message, P2Handle, P2Row, Var};
 use crate::value::Value;
+use crate::verifier::bits::linear;
 use vos_pvm_recair_air::p2::P2Mode;
 
 fn zero_message<V: Value>() -> Message<V> {
@@ -200,5 +202,27 @@ impl<V: Value> TranscriptGadget<V> {
         });
         self.permutations.push(second.state);
         second
+    }
+}
+
+/// `Σ bits = 1` and, for each bit, `bit·(hash − candidate) = 0`: `hash` is
+/// the candidate the one set bit picks.
+pub fn assert_one_of<V: Value>(
+    context: &mut Context<V>,
+    hash: [Var; 2],
+    candidates: &[[Var; 2]],
+    bits: &[Bit],
+) {
+    assert_eq!(bits.len(), candidates.len(), "a bit a candidate");
+    let terms: Vec<(BaseField, Var)> = bits
+        .iter()
+        .map(|bit| (BaseField::one(), bit.var()))
+        .collect();
+    let one = context.one();
+    linear(context, &terms, Some(one));
+    for (&bit, candidate) in bits.iter().zip(candidates) {
+        for (&wire, &candidate) in hash.iter().zip(candidate) {
+            context.assert_eq_if(bit, wire, candidate);
+        }
     }
 }

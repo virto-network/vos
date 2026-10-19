@@ -14,7 +14,7 @@ use stwo::core::fields::qm31::SecureField;
 use super::dag::{Dag, Node, Op};
 use crate::circuit::Qm31Op;
 use crate::context::{Context, Var};
-use crate::value::{Value, embed};
+use crate::value::Value;
 
 /// A gate's operand.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -310,13 +310,7 @@ impl Row {
             Row::Inverse(a) => Value::inverse(value(a)),
             Row::Gate { op, operands } => {
                 let [a, b, c] = operands.map(|o| o.as_ref().map_or(SecureField::zero(), value));
-                let k = |k: BaseField| embed(k);
-                k(op.k_m) * a * b
-                    + k(op.k_p) * a.pointwise_mul(b)
-                    + k(op.k_a) * a
-                    + k(op.k_b) * b
-                    + k(op.k_c) * c
-                    + c.lane_sum(op.lanes)
+                op.apply(a, b, c)
             }
         }
     }

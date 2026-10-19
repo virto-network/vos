@@ -148,10 +148,12 @@ pub fn random_circuit<V: Value>(seed: u64, gates: usize) -> Context<V> {
                 wires.push(context.h8(acc, step, mu, [v0, v1]));
             }
             12 => {
+                // A wire absorbed in part is a fresh guess: no other gate
+                // reads the lanes the leaf leaves unread.
                 let n_values = rng.below(20);
                 let row: Vec<Var> = (0..n_values.div_ceil(4))
-                    .map(|_| {
-                        if rng.below(2) == 0 {
+                    .map(|w| {
+                        if rng.below(2) == 0 && 4 * (w + 1) <= n_values {
                             rng.pick(&wires)
                         } else {
                             let value = V::from_qm31(rng.qm31());
@@ -179,7 +181,14 @@ pub fn random_circuit<V: Value>(seed: u64, gates: usize) -> Context<V> {
             14 => {
                 let n_values = rng.below(20);
                 let values: Vec<Var> = (0..n_values.div_ceil(4))
-                    .map(|_| rng.pick(&wires))
+                    .map(|w| {
+                        if 4 * (w + 1) <= n_values {
+                            rng.pick(&wires)
+                        } else {
+                            let value = V::from_qm31(rng.qm31());
+                            context.guess(value)
+                        }
+                    })
                     .collect();
                 transcript.absorb(&mut context, &values, n_values);
                 wires.extend(transcript.squeeze(&mut context));

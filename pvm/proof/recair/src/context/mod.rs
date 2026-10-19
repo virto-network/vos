@@ -536,13 +536,7 @@ impl<V: Value> Context<V> {
             None => V::from_qm31(SecureField::zero()),
         };
         let [va, vb, vc] = [value(a), value(b), value(c)];
-        let k = |k: BaseField| V::from_qm31(embed(k));
-        let computed = k(op.k_m) * va * vb
-            + k(op.k_p) * va.pointwise_mul(vb)
-            + k(op.k_a) * va
-            + k(op.k_b) * vb
-            + k(op.k_c) * vc
-            + vc.lane_sum(op.lanes);
+        let computed = op.apply(va, vb, vc);
         let mut slots = [Slot::FREE; 4];
         for (slot, operand) in slots.iter_mut().zip(operands) {
             if let Some(var) = operand {

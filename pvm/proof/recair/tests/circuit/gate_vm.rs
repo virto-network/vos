@@ -4,7 +4,7 @@
 
 use crate::common;
 
-use stwo::core::fields::m31::P;
+use stwo::core::fields::m31::{BaseField, P};
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_recair::circuit::{Entry, WiringError, signed};
 use vos_pvm_recair::{Context, NoValue, P2Mode, ProveError, circuit_commitment, prove, verify};
@@ -230,4 +230,71 @@ fn a_multiplicity_is_below_p() {
             "{multiplicity}"
         );
     }
+}
+
+/// The static check refuses a read of a value that is no wire: a `qm31`
+/// row's free operand under a coefficient or a lane, and a free message
+/// absorbed by a `p2` row other than a node. A node's free message, a
+/// Merkle sibling, is admitted.
+#[test]
+fn a_read_of_no_wire_is_refused() {
+    let circuit = honest();
+    let free = |entry: &Entry| entry.multiplicity == 0 && entry.address == 0;
+    let (row, operand) = circuit
+        .qm31
+        .iter()
+        .enumerate()
+        .find_map(|(row, wiring)| {
+            (0..3)
+                .find(|&i| free(&wiring.operands[i]))
+                .map(|i| (row, i))
+        })
+        .expect("a row with a free operand");
+    let mut read = circuit.clone();
+    match operand {
+        0 => read.qm31[row].op.k_a = BaseField::from(1),
+        1 => read.qm31[row].op.k_b = BaseField::from(1),
+        _ => read.qm31[row].op.k_c = BaseField::from(1),
+    }
+    assert_eq!(
+        read.check_wiring(),
+        Err(WiringError::FreeOperandRead { row, operand })
+    );
+    let row = circuit
+        .qm31
+        .iter()
+        .position(|wiring| free(&wiring.operands[2]))
+        .expect("a row with a free c");
+    let mut lane = circuit.clone();
+    lane.qm31[row].op.lanes[1] = BaseField::from(1);
+    assert_eq!(
+        lane.check_wiring(),
+        Err(WiringError::FreeOperandRead { row, operand: 2 })
+    );
+
+    assert!(
+        circuit
+            .p2
+            .iter()
+            .any(|wiring| wiring.mode == Some(P2Mode::Node)
+                && (free(&wiring.m[0]) || free(&wiring.m[1]))),
+        "a node with a free sibling, admitted"
+    );
+    let (row, lane) = circuit
+        .p2
+        .iter()
+        .enumerate()
+        .find_map(|(row, wiring)| {
+            let absorbing = wiring.mode.is_some() && wiring.mode != Some(P2Mode::Node);
+            (0..8)
+                .find(|&j| absorbing && free(&wiring.m[j / 4]))
+                .map(|j| (row, j))
+        })
+        .expect("a row with a free message");
+    let mut absorbed = circuit.clone();
+    absorbed.p2[row].act[lane] = BaseField::from(1);
+    assert_eq!(
+        absorbed.check_wiring(),
+        Err(WiringError::FreeMessageAbsorbed { row })
+    );
 }
