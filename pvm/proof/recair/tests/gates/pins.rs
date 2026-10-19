@@ -1,7 +1,8 @@
 //! Only checked wirings are pinned: a circuit's preprocessed columns
 //! (`trace::preprocessed_columns`) and its hash
-//! (`vos_pvm_recair_air::circuit_hash`) are computed nowhere in the
-//! workspace's sources but `recair`'s `prove.rs`, whose
+//! (`vos_pvm_recair_air::circuit_hash`, however it is named at the call)
+//! are computed nowhere in the workspace's sources but `recair`'s
+//! `prove.rs` (the fold's in-AIR child hash aside), whose
 //! `preprocessed_root_on` runs `Circuit::check_wiring` first, and the
 //! gates' forger. A second yield, which the relation alone balances
 //! (`multiplicities`), is refused because of it.
@@ -38,6 +39,9 @@ fn only_checked_wirings_are_committed() {
         "pvm/proof/recair/src/prove.rs",
         "pvm/proof/recair/src/trace.rs",
         "pvm/proof/recair-air/src/lib.rs",
+        // The in-AIR child hash: a fold's gates over a child's root wires.
+        "pvm/proof/recair/src/fold/child.rs",
+        "pvm/proof/recair/src/fold/mod.rs",
         "pvm/proof/recair/tests/gates/forge.rs",
         "pvm/proof/recair/tests/gates/pins.rs",
     ];
@@ -52,7 +56,7 @@ fn only_checked_wirings_are_committed() {
             continue;
         }
         let source = std::fs::read_to_string(path).unwrap_or_default();
-        for needle in ["preprocessed_columns(", "recair_air::circuit_hash("] {
+        for needle in ["preprocessed_columns(", "circuit_hash("] {
             if source.contains(needle) {
                 callers.push(format!("{relative}: {needle}"));
             }

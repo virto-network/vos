@@ -298,3 +298,56 @@ fn a_read_of_no_wire_is_refused() {
         Err(WiringError::FreeMessageAbsorbed { row })
     );
 }
+
+/// A read with no multiplicity at an address another entry holds, a free
+/// value in a wire's guise, is refused: a `qm31` operand under a
+/// coefficient, and a message absorbed outside a node.
+#[test]
+fn a_disguised_free_read_is_refused() {
+    let circuit = honest();
+    let held = circuit
+        .entries()
+        .find(|entry| entry.multiplicity > 0 && entry.address > 2)
+        .expect("a used wire")
+        .address;
+    let row = circuit
+        .qm31
+        .iter()
+        .position(|wiring| wiring.operands[2].multiplicity == 0)
+        .expect("a row with a free c");
+    let mut read = circuit.clone();
+    read.qm31[row].operands[2] = Entry {
+        address: held,
+        multiplicity: 0,
+    };
+    read.qm31[row].op.k_c = BaseField::from(1);
+    assert_eq!(
+        read.check_wiring(),
+        Err(WiringError::FreeOperandRead { row, operand: 2 })
+    );
+    let (row, lane) = circuit
+        .p2
+        .iter()
+        .enumerate()
+        .find_map(|(row, wiring)| {
+            let absorbing = wiring.mode.is_some() && wiring.mode != Some(P2Mode::Node);
+            (0..8)
+                .find(|&j| {
+                    absorbing
+                        && wiring.m[j / 4].multiplicity == 0
+                        && wiring.act[j] == BaseField::from(0)
+                })
+                .map(|j| (row, j))
+        })
+        .expect("a row with a free message");
+    let mut absorbed = circuit.clone();
+    absorbed.p2[row].m[lane / 4] = Entry {
+        address: held,
+        multiplicity: 0,
+    };
+    absorbed.p2[row].act[lane] = BaseField::from(1);
+    assert_eq!(
+        absorbed.check_wiring(),
+        Err(WiringError::FreeMessageAbsorbed { row })
+    );
+}

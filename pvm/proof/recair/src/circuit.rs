@@ -250,8 +250,9 @@ impl Circuit {
     }
 
     /// Every value a gate reads is a wire's, or a lane some row absorbs:
-    /// - no `qm31` row reads an operand that is no wire (address 0,
-    ///   multiplicity 0), under a coefficient or a lane;
+    /// - no `qm31` row reads an operand that is no wire (multiplicity 0, at
+    ///   address 0 or at an address another entry holds), under a
+    ///   coefficient or a lane;
     /// - no `p2` row but a node (whose free message is a Merkle sibling)
     ///   absorbs a lane of a message that is no wire;
     /// - no operand reads a lane of a wire that every `p2` row absorbing it
@@ -261,7 +262,19 @@ impl Circuit {
     /// A wire some gate yields with no use (multiplicity 0 at its own
     /// address) is a guess read once, and stays admitted.
     pub fn check_reads(&self) -> Result<(), WiringError> {
-        let free = |entry: &Entry| entry.multiplicity == 0 && entry.address == 0;
+        // A read with no multiplicity is a guess read once only at an
+        // address no wire holds; at a wire's (the free slots' address 0
+        // among them, the zero wire's), it is a value the relation does not
+        // tie to that wire. Entries with no multiplicity hold no address: a
+        // `p2` row whose output no gate uses states address 0 and 1.
+        let wires: HashSet<u32> = self
+            .entries()
+            .filter(|entry| entry.multiplicity != 0)
+            .map(|entry| entry.address)
+            .collect();
+        let free = |entry: &Entry| {
+            entry.multiplicity == 0 && (entry.address == 0 || wires.contains(&entry.address))
+        };
         for (row, wiring) in self.qm31.iter().enumerate() {
             for (operand, entry) in wiring.operands[..3].iter().enumerate() {
                 if free(entry) && wiring.op.reads(operand).contains(&true) {
