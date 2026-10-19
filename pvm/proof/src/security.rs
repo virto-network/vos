@@ -27,15 +27,19 @@
 //!   remains, to the last layer (the fork's `DIVERGENCE-011`);
 //! - **ALI** (`circuits/deep_ali.py`, Theorem 8 of eprint 2022/1216):
 //!   `L · C / |F|`, `C` the constraints combined by powers of one coefficient;
-//! - **DEEP**: `L · (d·(k + c - 1) + (k - 1)) / (|F| - k - D)`, `k` the
-//!   tallest trace column's length, `c` the most samples of one column,
+//! - **DEEP**: `2^j · L · (d·(k + c - 1) + (k - 1)) / (|F| - k - D)`, `k`
+//!   the tallest trace column's length, `c` the most samples of one column,
 //!   `D` the evaluation domain's size, and `d` the constraint degree, taken
 //!   as `2^(l_C - l_k) + 1` with `l_C` the composition polynomial's log degree
 //!   bound and `l_k = log2 k`. Stwo bounds a component of `2^l` rows whose
 //!   constraints have degree `d_i` by `2^l · 2^⌈log2(d_i - 1)⌉ ≤ 2^l_C`, so
 //!   `d_i · 2^l ≤ 2^l_C + k = d · k`: the term is counted at a degree at least
 //!   every component's, exact for degree 2 and 3 when the tallest component
-//!   sets `l_C`, and larger otherwise, which only lowers the count;
+//!   sets `l_C`, and larger otherwise, which only lowers the count. `j` is
+//!   how often the out-of-domain point is doubled before the composition is
+//!   sampled there, 0 in Stwo's protocol: the identity is then checked at a
+//!   point uniform on the circle's `j`-fold doubling image, `2^j` times
+//!   smaller than the circle, so its error is at most `2^j` times larger;
 //! - **logup** (`lookups/logup.py`, univariate): `N · S / |F|`, `N` the
 //!   fractions over all rows and `S` the widest relation, times
 //!   `2^-interaction_pow_bits`, the grind drawn before the relation
@@ -61,6 +65,21 @@
 //! tests, `n = k / ρ` and `θ` the proximity parameter `γ`. It is checked at
 //! `γ`'s limit, `1 - γ > √ρ` for every `m`, so it holds at whatever `m` the
 //! count is taken.
+//!
+//! **Masking variant (c)** ([`SecurityShape::variant_c`],
+//! `research/slice-5/spike2-masking.md` §3b) moves an AIR whose tallest
+//! component has `N = 2^m` rows to other levels; every formula stays.
+//! Every main and interaction column is committed as `f + v_H·r`, of degree
+//! bound `2N`, so `k = 2N` in the DEEP term. The constraint bound is `4N`
+//! and the composition is committed whole, never split, so FRI tests
+//! dimension `4N` at the format's rate (FRI's `log_blowup`), and `d = 3`.
+//! The composition is sampled at `π(z)`, the doubling of the out-of-domain
+//! point, so `j = 1`. The masked columns, the FRI mask and the blinding
+//! columns are batched with the rest: an affine batch's error does not
+//! depend on how many functions it batches, and a batch by powers counts
+//! them in `B`. Salt columns are never sampled and enter no term. A masked
+//! shape is read from its own layout: `framework_access`' shape subtracts
+//! Stwo's composition split, which would count `k = 2N`.
 //!
 //! The arithmetic is IEEE-754 double precision with only the basic operations,
 //! so every verifier computes the same counts.
@@ -88,6 +107,30 @@ pub struct SecurityShape {
     pub logup_fractions: u64,
     /// The widest relation's tuple, `S`.
     pub relation_width: u64,
+    /// How often the out-of-domain point is doubled before the composition
+    /// is sampled there, `j`: 0 in Stwo's protocol, 1 under masking variant
+    /// (c).
+    pub composition_point_doublings: u32,
+}
+
+impl SecurityShape {
+    /// The same AIR proved under masking variant (c), from its tallest
+    /// component's `2^m` rows (`log_trace_length`): its columns masked to
+    /// degree bound `2^(m+1)`, its composition whole at `2^(m+2)`, which FRI
+    /// tests, and sampled at `π(z)`. Only the levels move: what the masking
+    /// commits beside the AIR's columns (the blinding columns, the FRI mask,
+    /// the composition's columns whole rather than split) and the blinding's
+    /// constraints and fractions are the caller's to add.
+    pub const fn variant_c(self) -> Self {
+        let m = self.log_trace_length;
+        Self {
+            log_degree_bound: m + 2,
+            log_trace_length: m + 1,
+            log_composition_degree_bound: m + 2,
+            composition_point_doublings: 1,
+            ..self
+        }
+    }
 }
 
 /// A proof's two counts, in bits.
@@ -124,22 +167,29 @@ pub fn proven_bits(params: &FormatParams, shape: &SecurityShape) -> Option<u32> 
 /// shape outside the analysis or a count below 0.
 pub fn proven_count(params: &FormatParams, shape: &SecurityShape) -> Option<f64> {
     let analysis = Analysis::new(params, shape)?;
-    // `query(m)` rises with `m` and `rest(m)` falls, so their least is
-    // unimodal: find the first `m` where the query term reaches the rest.
-    let (mut low, mut high) = (M_MIN, M_MAX);
-    while low < high {
-        let mid = low + (high - low) / 2;
-        if analysis.query_bits(mid) >= analysis.other_bits(mid) {
-            high = mid;
-        } else {
-            low = mid + 1;
-        }
-    }
-    let best = [low.saturating_sub(1).max(M_MIN), low]
-        .into_iter()
-        .map(|m| analysis.bits_at(m))
-        .fold(f64::NEG_INFINITY, f64::max);
+    let (_, best) = analysis.best();
     (best.is_finite() && best >= 0.0).then_some(best)
+}
+
+/// Each term in bits at the multiplicity the proven count is taken at.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TermBits {
+    pub m: u32,
+    pub query: f64,
+    pub other: OtherTerms,
+}
+
+/// [`TermBits`] for `params` at `shape`, `None` outside the analysis.
+#[cfg(test)]
+pub(crate) fn term_bits(params: &FormatParams, shape: &SecurityShape) -> Option<TermBits> {
+    let analysis = Analysis::new(params, shape)?;
+    let (m, _) = analysis.best();
+    Some(TermBits {
+        m,
+        query: analysis.query_bits(m),
+        other: analysis.other_terms(m),
+    })
 }
 
 /// BCHKS25 Theorem 4.2 takes `m ≥ 3`.
@@ -151,6 +201,26 @@ const M_MAX: u32 = 1 << 20;
 fn field_size() -> f64 {
     let p = ((1u64 << 31) - 1) as f64;
     p * p * p * p
+}
+
+/// Every term but the query phase's, in bits.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct OtherTerms {
+    /// The DEEP batching.
+    pub batching: f64,
+    /// The worst FRI fold.
+    pub folds: f64,
+    pub ali: f64,
+    pub deep: f64,
+    pub logup: f64,
+}
+
+impl OtherTerms {
+    fn least(&self) -> f64 {
+        [self.batching, self.folds, self.ali, self.deep, self.logup]
+            .into_iter()
+            .fold(f64::INFINITY, f64::min)
+    }
 }
 
 struct Analysis {
@@ -175,6 +245,7 @@ impl Analysis {
             || shape.log_degree_bound > 30
             || shape.log_trace_length > shape.log_composition_degree_bound
             || shape.log_degree_bound <= params.log_last_layer
+            || shape.composition_point_doublings > shape.log_degree_bound
             || params.fold_step == 0
         {
             return None;
@@ -241,8 +312,29 @@ impl Analysis {
         self.pow_bits - self.queries * log2(1.0 - self.gamma(m))
     }
 
-    /// The least of every term but the query phase's.
-    fn other_bits(&self, m: u32) -> f64 {
+    /// The multiplicity the count is taken at, and the count there.
+    /// `query(m)` rises with `m` and the rest falls, so their least is
+    /// unimodal: the best `m` is the first where the query term reaches the
+    /// rest, or the one before it.
+    fn best(&self) -> (u32, f64) {
+        let (mut low, mut high) = (M_MIN, M_MAX);
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if self.query_bits(mid) >= self.other_terms(mid).least() {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        [low.saturating_sub(1).max(M_MIN), low]
+            .into_iter()
+            .map(|m| (m, self.bits_at(m)))
+            .fold((M_MIN, f64::NEG_INFINITY), |best, at| {
+                if at.1 > best.1 { at } else { best }
+            })
+    }
+
+    fn other_terms(&self, m: u32) -> OtherTerms {
         let shape = &self.shape;
         let field = field_size();
         let batched = match self.batching {
@@ -266,21 +358,25 @@ impl Analysis {
         let degree =
             pow2((shape.log_composition_degree_bound - shape.log_trace_length) as i32) + 1.0;
         let domain = pow2((shape.log_degree_bound + self.log_blowup) as i32);
-        let deep = list
+        let deep = pow2(shape.composition_point_doublings as i32)
+            * list
             * (degree * (k + shape.max_samples_per_column.max(1) as f64 - 1.0) + (k - 1.0))
             / (field - k - domain);
         let logup = shape.logup_fractions.max(1) as f64 * shape.relation_width.max(1) as f64
             / field
             * pow2(-(self.interaction_pow_bits as i32));
-        [batching, folds, ali, deep, logup]
-            .into_iter()
-            .map(|error| -log2(error))
-            .fold(f64::INFINITY, f64::min)
+        OtherTerms {
+            batching: -log2(batching),
+            folds: -log2(folds),
+            ali: -log2(ali),
+            deep: -log2(deep),
+            logup: -log2(logup),
+        }
     }
 
     fn bits_at(&self, m: u32) -> f64 {
         let query = self.query_bits(m);
-        let other = self.other_bits(m);
+        let other = self.other_terms(m).least();
         if query < other { query } else { other }
     }
 }
@@ -350,6 +446,7 @@ mod tests {
             constraints: 1,
             logup_fractions: 1,
             relation_width: 1,
+            composition_point_doublings: 0,
         };
         // k = 16, n = 32, √ρ·n ≈ 22.6: c = 6 passes, c = 7 does not.
         assert!(proven_count(&params, &shape(6)).is_some());
@@ -378,6 +475,7 @@ mod tests {
             constraints: 1,
             logup_fractions: 1,
             relation_width: 1,
+            composition_point_doublings: 0,
         };
         let analysis = Analysis::new(&params, &shape).unwrap();
         let at = |m| analysis.query_bits(m);
@@ -408,6 +506,7 @@ mod tests {
             constraints: 313,
             logup_fractions: 1 << 20,
             relation_width: 5,
+            composition_point_doublings: 0,
         };
         let folds = |fold_step, log_last_layer| {
             Analysis::new(&params(fold_step, log_last_layer), &shape)
@@ -418,5 +517,58 @@ mod tests {
         assert_eq!(folds(3, 7), [3, 3, 3]);
         assert_eq!(folds(1, 0), [1; 16]);
         assert_eq!(folds(4, 0), [4; 4]);
+        // Under variant (c) the wrap's FRI tests 2^17: one round more.
+        let masked = Analysis::new(&params(3, 6), &shape.variant_c()).unwrap();
+        assert_eq!(masked.log_k, 17);
+        assert_eq!(masked.folds, [3, 3, 3, 2]);
+    }
+
+    /// Variant (c) moves the levels and doubles the DEEP term, and nothing
+    /// else: a `j` the circle's doublings cannot reach is refused.
+    #[test]
+    fn variant_c_moves_the_levels_and_doubles_the_deep_term() {
+        let params = FormatParams {
+            log_blowup: 5,
+            n_queries: 24,
+            pow_bits: 26,
+            fold_step: 3,
+            log_last_layer: 6,
+            interaction_pow_bits: 8,
+            batching: DeepBatching::Affine,
+        };
+        let shape = SecurityShape {
+            log_degree_bound: 16,
+            log_trace_length: 15,
+            log_composition_degree_bound: 17,
+            sampled_values: 916,
+            max_samples_per_column: 2,
+            constraints: 313,
+            logup_fractions: 1 << 20,
+            relation_width: 5,
+            composition_point_doublings: 0,
+        };
+        let masked = shape.variant_c();
+        assert_eq!(
+            masked,
+            SecurityShape {
+                log_degree_bound: 17,
+                log_trace_length: 16,
+                log_composition_degree_bound: 17,
+                composition_point_doublings: 1,
+                ..shape
+            }
+        );
+        let deep =
+            |shape: &SecurityShape| Analysis::new(&params, shape).unwrap().other_terms(5).deep;
+        let doubled = deep(&SecurityShape {
+            composition_point_doublings: 0,
+            ..masked
+        }) - deep(&masked);
+        assert!((doubled - 1.0).abs() < 1e-9, "{doubled}");
+        let unreachable = SecurityShape {
+            composition_point_doublings: 18,
+            ..masked
+        };
+        assert!(proven_count(&params, &unreachable).is_none());
     }
 }

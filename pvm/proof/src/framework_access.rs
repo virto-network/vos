@@ -91,7 +91,9 @@ pub fn air_layout(
 }
 
 impl AirLayout {
-    /// The shape [`crate::security`] counts at.
+    /// The shape [`crate::security`] counts at, under Stwo's unmasked
+    /// protocol: the composition split and sampled at the out-of-domain
+    /// point itself.
     ///
     /// The logup fractions are bounded from the interaction tree: each QM31
     /// column, four of its base columns, finalizes at most two fractions a
@@ -120,6 +122,7 @@ impl AirLayout {
                 .map(|&log_size| (1u64 << log_size) / 2)
                 .fold(0u64, u64::saturating_add),
             relation_width: crate::lookups::MAX_RELATION_WIDTH as u64,
+            composition_point_doublings: 0,
         }
     }
 }
