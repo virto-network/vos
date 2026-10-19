@@ -13,8 +13,9 @@ The kit holds:
   reads (`../fixtures` from its manifest);
 - `conformance/`: the conformance vectors, once VOS ships them;
 - this script, `vos_kit.py`;
-- `VENDOR`: the repository, the commit (and the tag, when vendored at one)
-  and the tree's hash.
+- `VENDOR`: the repository (for information), the commit, the tag, the
+  Stwo pin and the tree's hash;
+- `.gitattributes`, so a checkout keeps the kit's bytes.
 
 Usage, in a VOS checkout (`just vendor-verifier`, `just vos-sync`):
 
@@ -22,21 +23,26 @@ Usage, in a VOS checkout (`just vendor-verifier`, `just vos-sync`):
 
 writes the kit into `<dir>`: from the working tree, or from `--rev`'s
 commit. A kit vendored from uncommitted sources says so in `VENDOR`, and no
-sync accepts it: a release vendors from a tag.
+sync accepts it; a release vendors from a tag, and a sync refuses a kit
+that names none (`--allow-untagged`, against a local clone alone, for
+VOS's own checks).
 
-In a Kreivo checkout, as in VOS:
+    python3 -I vos_kit.py sync <dir> [--vos <local clone or https:// URL>] [--scratch <dir>]
 
-    python3 -I vendor/vos-verifier/vos_kit.py sync vendor/vos-verifier \\
-        [--vos <a VOS clone, or its URL>] [--scratch <dir>]
+recomputes the tree's hash against `VENDOR`'s, checks that the tag
+`VENDOR` names is the commit it names (fetching nothing the clone lacks),
+then vendors the kit anew from that tag, by the tag's own copy of this
+script, and refuses any difference, file by file: the sources, the
+manifests, the fixtures, the conformance vectors and `VENDOR` itself.
+`--vos` defaults to VOS's canonical repository, cloned bare without blobs;
+`VENDOR`'s repository is never used. `--scratch` is where the clone and
+the reference kit go (default: the system's temporary directory); the
+sync removes what it wrote there. Python 3.11 or later and git, nothing of
+Rust.
 
-recomputes the tree's hash against `VENDOR`'s, then vendors the kit anew
-from the commit `VENDOR` names, by that commit's own script, and refuses
-any difference, file by file: the sources, the manifests, the fixtures,
-the conformance vectors and `VENDOR` itself. `--vos` defaults to the
-repository `VENDOR` names, cloned without its blobs; a local clone must
-hold the commit. `--scratch` is where the clone and the reference kit go
-(default: the system's temporary directory); the sync removes what it
-wrote there. It needs Python 3.11 or later and git, and nothing of Rust.
+A consumer never runs the kit's own copy of this script, which the kit's
+changes could replace: `vos-sync.sh`, kept outside the kit, takes the
+script from the tag in VOS's canonical repository and runs that.
 """
 
 import argparse
@@ -44,6 +50,7 @@ import fnmatch
 import hashlib
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -65,9 +72,14 @@ CRATES = [
     ("vos-pvm-poseidon2", "pvm/proof/poseidon2"),
 ]
 
-# Features of a vendored crate that only its bins use, left in VOS with
-# them: `vos-statement`'s `pvm-guest` builds the JAM refine program.
-DROPPED_FEATURES = {"vos-statement": ["pvm-guest"]}
+# Features left in VOS: `vos-statement`'s `pvm-guest` builds the JAM refine
+# program, a bin; `test-formats` links format 28, the unmasked wrap, which no
+# production venue accepts. Their code compiles out of the kit, and an
+# optional dependency only they enabled goes with them.
+DROPPED_FEATURES = {
+    "vos-statement": ["pvm-guest", "test-formats"],
+    "vos-pvm-final-verifier": ["test-formats"],
+}
 
 # The golden fixtures `vos-statement`'s `fixtures` reader takes: the final
 # proofs and the cases.
@@ -82,6 +94,14 @@ CONFORMANCE: list[tuple[str, str]] = []
 # The kit's own files, beside the crates.
 VENDOR = "VENDOR"
 KIT_SCRIPT = "vos_kit.py"
+
+# VOS's canonical repository, which a sync clones unless `--vos` names
+# another: never the kit's `VENDOR`, which the kit's own changes could
+# rewrite.
+CANONICAL = "https://codeberg.org/Virto/VOS.git"
+
+# A tag's name in `VENDOR`.
+TAG = r"[A-Za-z0-9._/][A-Za-z0-9._/-]*"
 
 # The tree hash's domain.
 TREE_DOMAIN = b"vos/kit/tree/v1"
@@ -177,8 +197,9 @@ def worktree(repo: Path) -> Tree:
 
 def at(repo: Path, rev: str) -> Tree:
     """The files of commit `rev`, a tag or a commit."""
-    commit = git(repo, "rev-parse", "--verify", f"{rev}^{{commit}}").decode().strip()
     tag = rev if git_ok(repo, "rev-parse", "--verify", "--quiet", f"refs/tags/{rev}") else None
+    name = f"refs/tags/{rev}" if tag else rev
+    commit = git(repo, "rev-parse", "--verify", f"{name}^{{commit}}").decode().strip()
     archive = git(repo, "archive", "--format=tar", commit, "--", *sources())
     files = {}
     with tarfile.open(fileobj=io.BytesIO(archive), mode="r:") as tar:
@@ -305,19 +326,33 @@ class Manifests:
                     for name, spec in entries.items()
                 }
         features = dict(manifest.get("features", {}))
+        # A dropped feature's code compiles out: it stays an expected cfg
+        # value, so a source that reads it builds without a warning.
+        expected = []
         for feature in DROPPED_FEATURES.get(crate, []):
             if features.pop(feature, None) is None:
                 raise KitError(f"{crate}: no feature {feature} to leave in VOS")
-            for path in self.tree.under(f"{directory}/src"):
-                if path.startswith(f"{directory}/src/bin/"):
-                    continue
-                if f'feature = "{feature}"'.encode() in self.tree.files[path]:
-                    raise KitError(f"{path} reads feature {feature}, which the kit leaves in VOS")
-        names = {
-            name
-            for entries in sections.values()
-            for name, spec in entries.items()
+            if any(
+                f'feature = "{feature}"'.encode() in self.tree.files[path]
+                for path in self.tree.under(f"{directory}/src")
+                if not path.startswith(f"{directory}/src/bin/")
+            ):
+                expected.append(feature)
+        for feature, enables in features.items():
+            for item in enables:
+                target, _, enabled = item.partition("/")
+                if enabled in DROPPED_FEATURES.get(target.rstrip("?"), []):
+                    raise KitError(f"{crate}: feature {feature} enables {item}, which the kit leaves in VOS")
+        referenced = {
+            item.removeprefix("dep:").split("/")[0].rstrip("?")
+            for enables in features.values()
+            for item in enables
         }
+        for entries in sections.values():
+            for name in [name for name, spec in entries.items() if spec.get("optional")]:
+                if name not in referenced:
+                    del entries[name]
+        names = {name for entries in sections.values() for name in entries}
         for feature, enables in features.items():
             for item in enables:
                 dependency = item.removeprefix("dep:").split("/")[0].rstrip("?")
@@ -342,7 +377,17 @@ class Manifests:
             if self.lints is None:
                 raise KitError(f"{crate}: lints inherit no workspace lints")
             lints = self.lints
-        for tool, entries in (lints or {}).items():
+        lints = {tool: dict(entries) for tool, entries in (lints or {}).items()}
+        if expected:
+            rust = lints.setdefault("rust", {})
+            if "unexpected_cfgs" in rust:
+                raise KitError(f"{crate}: its own unexpected_cfgs lint and dropped features")
+            values = ", ".join(f'"{feature}"' for feature in expected)
+            rust["unexpected_cfgs"] = {
+                "level": "warn",
+                "check-cfg": [f"cfg(feature, values({values}))"],
+            }
+        for tool, entries in lints.items():
             lines += table(f"lints.{tool}", entries)
         return ("\n".join(lines).rstrip("\n") + "\n").encode()
 
@@ -383,6 +428,8 @@ def kit(tree: Tree) -> dict[str, bytes]:
     for path, name in CONFORMANCE:
         files[f"conformance/{name}"] = tree.read(path)
     files[KIT_SCRIPT] = tree.read(SCRIPT)
+    # A checkout that converts line endings would change the kit's bytes.
+    files[".gitattributes"] = b"* -text\n"
 
     lines = [
         "# The VOS verifier kit: the crates a venue links to judge VOS",
@@ -464,23 +511,35 @@ def vendor(arguments) -> None:
     print(f"vendored VOS {tree.tag or tree.commit} into {arguments.dir}: {tree_hash(files)}{note}")
 
 
-def vos_repository(spec: str, scratch: Path) -> Path:
-    if Path(spec).is_dir():
-        path = Path(spec).resolve()
-        if not git_ok(path, "rev-parse", "--git-dir"):
-            raise KitError(f"{spec} is not a git repository")
-        return path
-    if not spec:
-        raise KitError("VENDOR names no repository: pass --vos")
-    clone = scratch / "vos.git"
-    done = subprocess.run(
-        ["git", "clone", "--quiet", "--bare", "--filter=blob:none", spec, str(clone)],
+def vos_repository(spec: str, scratch: Path) -> tuple[Path, bool]:
+    """The VOS repository to sync against, and whether it is local: an
+    `https://` URL, cloned bare without blobs, or a local clone, which only
+    `--vos` names."""
+    if spec.startswith("https://"):
+        clone = scratch / "vos.git"
+        done = subprocess.run(
+            ["git", "clone", "--quiet", "--bare", "--filter=blob:none", "--", spec, str(clone)],
+            capture_output=True,
+            check=False,
+        )
+        if done.returncode != 0:
+            raise KitError(f"cloning {spec}: {done.stderr.decode(errors='replace').strip()}")
+        return clone, False
+    path = Path(spec)
+    if not path.is_dir() or not git_ok(path, "rev-parse", "--git-dir"):
+        raise KitError(f"{spec} is neither an https:// URL nor a local git repository")
+    return path.resolve(), True
+
+
+def no_lazy_fetch(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    """`git args` in `repo`, fetching no missing object: a partial clone
+    otherwise asks the server for any commit by its hash."""
+    return subprocess.run(
+        ["git", "-C", str(repo), *args],
         capture_output=True,
         check=False,
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
     )
-    if done.returncode != 0:
-        raise KitError(f"cloning {spec}: {done.stderr.decode(errors='replace').strip()}")
-    return clone
 
 
 def sync(arguments) -> None:
@@ -490,7 +549,15 @@ def sync(arguments) -> None:
         raise KitError(f"{directory} has no VENDOR file")
     vendored = tomllib.loads(files[VENDOR].decode())
     if vendored.get("dirty"):
-        raise KitError("the kit was vendored from uncommitted sources: vendor it from a commit")
+        raise KitError("the kit was vendored from uncommitted sources: vendor it from a tag")
+    commit = vendored.get("commit", "")
+    if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise KitError(f"VENDOR's commit {commit!r} is not 40 hex digits")
+    tag = vendored.get("tag")
+    if tag is not None and (not isinstance(tag, str) or not re.fullmatch(TAG, tag)):
+        raise KitError(f"VENDOR's tag {tag!r} is not a tag name")
+    if tag is None and not arguments.allow_untagged:
+        raise KitError("VENDOR names no tag: a kit is vendored from a VOS tag")
     computed = tree_hash(files)
     if computed != vendored.get("tree"):
         raise KitError(
@@ -502,15 +569,19 @@ def sync(arguments) -> None:
         Path(arguments.scratch).mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix="vos-sync-", dir=arguments.scratch))
     try:
-        repo = vos_repository(arguments.vos or vendored.get("repository", ""), scratch)
-        commit = vendored["commit"]
-        if not git_ok(repo, "cat-file", "-e", f"{commit}^{{commit}}"):
+        repo, local = vos_repository(arguments.vos or CANONICAL, scratch)
+        if tag is None and not local:
+            raise KitError("an untagged kit syncs against a local clone alone")
+        if tag is not None:
+            tagged = no_lazy_fetch(repo, "rev-parse", "--verify", "--quiet", f"refs/tags/{tag}^{{commit}}")
+            if tagged.returncode != 0:
+                raise KitError(f"{repo} holds no tag {tag}")
+            if tagged.stdout.decode().strip() != commit:
+                raise KitError(
+                    f"tag {tag} is {tagged.stdout.decode().strip()} in {repo}, VENDOR says {commit}"
+                )
+        elif no_lazy_fetch(repo, "cat-file", "-e", f"{commit}^{{commit}}").returncode != 0:
             raise KitError(f"{repo} holds no commit {commit}: fetch it")
-        tag = vendored.get("tag")
-        if tag:
-            tagged = git(repo, "rev-parse", "--verify", f"refs/tags/{tag}^{{commit}}").decode().strip()
-            if tagged != commit:
-                raise KitError(f"tag {tag} is {tagged} in {repo}, VENDOR says {commit}")
         tool = scratch / "tool" / KIT_SCRIPT
         tool.parent.mkdir()
         tool.write_bytes(git(repo, "show", f"{commit}:{SCRIPT}"))
@@ -553,7 +624,10 @@ def main() -> int:
     vendoring.add_argument("--rev", help="a tag or commit (default: the working tree)")
     syncing = commands.add_parser("sync", help="check a kit against the commit VENDOR names")
     syncing.add_argument("dir")
-    syncing.add_argument("--vos", help="a VOS clone or its URL (default: VENDOR's repository)")
+    syncing.add_argument("--vos", help=f"a local VOS clone, or an https:// URL (default: {CANONICAL})")
+    syncing.add_argument(
+        "--allow-untagged", action="store_true", help="accept a kit vendored at a commit (a local clone only)"
+    )
     syncing.add_argument("--scratch", help="where the clone and the reference kit go")
     hashing = commands.add_parser("hash", help="print a kit's tree hash")
     hashing.add_argument("dir")

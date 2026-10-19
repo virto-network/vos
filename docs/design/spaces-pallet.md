@@ -156,37 +156,69 @@ VOS writes the kit; Kreivo vendors it whole and edits none of it.
     stay in VOS; `[lib] test = false`, so `cargo test --workspace` in
     Kreivo, which takes path dependencies under its root as members,
     builds none);
+  - **no `test-formats` feature:** format 28, the unmasked wrap, which no
+    production venue accepts, stays in VOS with the JAM program's
+    `pvm-guest`; its code compiles out of the kit, so no Kreivo build can
+    link it;
   - `fixtures/`: the golden fixtures, the final proofs and
     `statements.cases`, which `vos-statement`'s `fixtures` feature (std,
-    tests and benchmarks only) reads beside the crates;
+    tests and benchmarks only) reads beside the crates. Its cases record
+    the verdicts of a build linking 28 and 39; the kit links 39 alone, so
+    a case of format 28 is refused as `Format` (2), as
+    `Fixture::verdict_linking` gives it;
   - `conformance/`: §10's vectors, from VOS step 6.17;
   - `vos_kit.py`, the vendoring and sync script;
-  - `VENDOR`: the repository, the commit (and its tag, for a release),
-    the Stwo pin and the tree's hash, BLAKE2b-256 over every other file
-    by path.
+  - `.gitattributes` (`* -text`), so a checkout converting line endings
+    keeps the kit's bytes;
+  - `VENDOR`: the repository (for information), the commit, its tag, the
+    Stwo pin and the tree's hash, BLAKE2b-256 over every other file by
+    path.
 - **Built:** the five crates build alone, with no default features, for
-  `wasm32v1-none` on Kreivo's stable 1.94.1, and no crate they link has a
-  `std` feature (VOS's `just check-kit`). The runtime depends on
-  `vos-statement` and `vos-anchor` by path, with `default-features = false`.
-- **Vendored** in a VOS checkout: `just vendor-verifier <dir> <tag>`
-  (`python3 -I pvm/proof/kit/vos_kit.py vendor <dir> --rev <tag>`). Without
-  a revision it vendors the working tree, and `VENDOR` says so if that
-  differs from its commit; no sync accepts such a kit.
-- **The sync check**, in a Kreivo checkout (e.g. a `just vos-sync`
-  recipe and CI), with Python 3.11 and git alone:
+  `wasm32v1-none` on Kreivo's stable 1.94.1, `--locked`, and no crate they
+  link has a `std` feature (VOS's `just check-kit`; the target ships core
+  and alloc alone, so a crate needing std fails the build itself). The
+  runtime depends on `vos-statement` and `vos-anchor` by path, with
+  `default-features = false`. **Kreivo's own feature unification is
+  outside VOS's check:** a feature another runtime crate enables on a
+  shared dependency (`serde`, `num-traits`, `hashbrown`) reaches the kit
+  too, so Kreivo's runtime build is the gate there.
+- **Vendored** in a VOS checkout from a tag:
+  `just vendor-verifier <dir> <tag>`
+  (`python3 -I pvm/proof/kit/vos_kit.py vendor <dir> --rev <tag>`).
+  Without a revision it vendors the working tree, and `VENDOR` says so if
+  that differs from its commit; no sync accepts such a kit, nor one that
+  names no tag.
+- **The sync check never trusts the kit's own script,** which a change to
+  the kit could replace. Kreivo copies `pvm/proof/kit/vos-sync.sh` from
+  the VOS tag into its own tree, outside `vendor/` (e.g.
+  `scripts/vos-sync.sh`, under CODEOWNERS), and runs it in CI and a
+  `just vos-sync` recipe, with bash, git and Python 3.11:
 
   ```
-  python3 -I vendor/vos-verifier/vos_kit.py sync vendor/vos-verifier [--vos <a VOS clone or its URL>]
+  scripts/vos-sync.sh vendor/vos-verifier [<a local VOS clone>]
   ```
 
-  It recomputes the tree's hash against `VENDOR`'s, then vendors the kit
-  anew from the commit `VENDOR` names, by that commit's own script (the
-  fixtures and the vectors with it), and refuses any difference, file by
-  file, `VENDOR` included; a tag must name that commit. `--vos` defaults
-  to `VENDOR`'s repository, cloned without blobs into a scratch
-  directory (`--scratch`, removed after). In VOS, `just vos-sync <dir>`
-  runs the same check against the checkout itself. A re-pin is a new
-  vendor at a new tag and a sync, never an edit under `vendor/`.
+  The bootstrap pins VOS's canonical repository
+  (`https://codeberg.org/Virto/VOS.git`), clones it bare without blobs
+  (or takes a local clone given as its argument), checks that the tag
+  `VENDOR` names is there, and runs `vos_kit.py` as that tag holds it:
+  - **the tree's hash** against `VENDOR`'s;
+  - **`VENDOR`'s names:** a tag is required (a name of `A–Z a–z 0–9 . _ /
+    -`, not starting with `-`), the commit 40 hex digits, and the tag
+    resolved, fetching nothing the clone lacks (`GIT_NO_LAZY_FETCH=1`),
+    to exactly that commit: a fork's commit, a pull request's or an
+    unreviewed branch's is refused even where the server would hand it
+    out by hash;
+  - **the kit vendored anew** from the tag by the tag's script, the
+    fixtures and the vectors with it, and every file compared, `VENDOR`
+    included.
+
+  `VENDOR`'s repository is never used: `vos_kit.py sync` itself clones
+  the canonical URL unless `--vos` names a local clone or another
+  `https://` URL. In VOS, `just vos-sync <dir>` runs the check against
+  the checkout itself, a kit vendored at a commit accepted there alone.
+  A re-pin is a new vendor at a new tag and a sync, never an edit under
+  `vendor/`.
 
 ## 4. Configuration
 
@@ -418,8 +450,11 @@ The outcome:
 - Keep `Last`, and keep `Equivocations` until `resume`.
 - Bounded by the remaining weight, with a cursor.
 - `MaxRootAge` is never raised in place; a raise is a VOS change of
-  `MAX_ROOT_AGE_MS`, a new kit, and a migration that first prunes anchors
-  older than the old bound. A `Seen` entry's expiry was
+  `MAX_ROOT_AGE_MS`, a new kit, and a migration that, before the new bound
+  takes effect, prunes anchors older than the old bound and adds
+  `new − old` to every finite `Seen` expiry: an anchor still fresh stays
+  anchored until `B_w + new`, and its statements' entries must last as
+  long. A `Seen` entry's expiry was
   computed with the old bound while `anchored` reads the new one, so an
   anchor the cursor has not reached would be fresh again after its entry
   was pruned, and a replay accepted (pin F).
@@ -732,12 +767,18 @@ fold-in (S2).
     - **Recommended: unanchored,** the same rule for both: a space
       governance blocked is not one whose state a handler should act on.
 12. **Anchor keys beyond the founding ones.**
-    - VOS anchors with the representative's leader's node key, and the
-      representative's replicas are founding nodes alone (VOS step 6.14),
-      so only founding keys sign anchors today. A key paired by
-      `add_authority` is never used by a VOS node, and a space whose
-      founding keys are all removed (`resume` after an equivocation by
-      both) cannot anchor until VOS rotates a node's anchor key.
-    - **Recommended:** keep the pallet's rotation as designed, which a
-      later VOS key rotation needs, and document that a space keeps at
-      least one founding key until then.
+    - **Anchor-key rotation is not yet supported on VOS's side.** VOS
+      anchors with the representative's leader's node key, which cannot
+      rotate, and the representative's replicas are founding nodes alone
+      (VOS step 6.14). A key paired by `add_authority` is used by no VOS
+      node, and `resume` needs both equivocating keys gone: a space whose
+      equivocating keys are all its founding keys (always so with a
+      single founder) cannot anchor here again, and recovers only by
+      migrating to a new genesis, another space.
+    - VOS plans the node's side as step 6.14b: a rotatable ed25519 anchor
+      key per node (the genesis keys the first), the leader signing with
+      the key `AnchorKeys` lists for it, any node with a registered key a
+      replica, and `vos node anchor-key rotate` paired with the
+      controller's `add_authority`.
+    - **Recommended:** keep the pallet's rotation calls as designed; they
+      are what 6.14b uses.
