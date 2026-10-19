@@ -455,11 +455,11 @@ pub struct Statement {
   statement whose space is not the zero id (`SpaceId::NONE`), as
   `Refusal::Space` (`0x4`).
 - **A kernel that does not state its roots** carries what it read in its
-  output, which no venue checks: its handler must. The window kernel is
-  one, until the SDK puts a kernel's public arguments and roots in its
-  io-hash (slice 6): its statement is rootless, `public_args` empty, and
-  its space and anchors (`anchor_i`, `anchor_j`) are in its output, which
-  the Clerk's handler checks against its anchored roots.
+  output, which no venue checks: its handler must. A `&self` kernel states
+  its root: the window kernel reads its rows at one cut and states `S_w`,
+  its public arguments the reader, the pair and the carried commitment
+  `c_prev`, its output `(net, seq, c_new)` naming no anchor
+  (`slice-6-on-chain.md`, 6.15).
 - **Repeats:** a venue refuses a statement id it has seen. A kernel whose
   legitimate statements can repeat carries a nonce in `public_args`.
   A venue keys on the statement id, never on the proof's bytes or their

@@ -95,6 +95,10 @@ vos-pvm-final-verifier = { workspace = true, features = ["test-formats"] }
 # The golden statements: their types, the venue's check, the fixtures'
 # encoding, and the venue's JAM refine program on the JAM-only host.
 vos-statement = { workspace = true, features = ["fixtures"] }
+# Statements at a cut judged at the model venue: the space's anchors
+# signed by its founding key.
+vos-venue = { workspace = true }
+ed25519-dalek = "2"
 
 # Both examples demonstrate the prover end-to-end; mark them
 # prover-only so a verifier-only build (`--no-default-features`) skips

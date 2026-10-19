@@ -539,7 +539,7 @@ fn the_predicate_wraps() {
     );
     assert_eq!(root.node.output.io_hash, kernel.trace.io_hash);
 
-    let (bytes, words) = common::wrap_root("areas", &program, &root, &mut totals.wrap);
+    let (bytes, words, _) = common::wrap_root("areas", &program, &root, &mut totals.wrap);
     totals.report("areas");
     let input = common::judged_statement(
         vos_statement::Statement {

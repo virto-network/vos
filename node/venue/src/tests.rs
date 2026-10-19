@@ -185,3 +185,30 @@ fn a_statement_is_judged_against_the_anchors() {
         "judged to the proof"
     );
 }
+
+/// A migration away ends the space's range here: its roots at or past
+/// the migration's window are no longer anchored, those before still are,
+/// and its anchors at or past it are refused. A migration from another
+/// venue, or of a space not registered, changes nothing.
+#[test]
+fn a_migration_ends_the_range() {
+    let f = fixture();
+    assert_eq!(f.venue.anchor(&f.anchor(3, 1, 0)), Ok(Anchored::New));
+    assert_eq!(f.venue.anchor(&f.anchor(4, 1, 0)), Ok(Anchored::New));
+    let away = |from: VenueId, space: SpaceId| Migrate {
+        space,
+        from,
+        to: VenueId([0x55; 32]),
+        from_window: 4,
+    };
+    assert!(!f.venue.migrate(&away(VenueId([1; 32]), f.space)));
+    assert!(!f.venue.migrate(&away(VENUE, SpaceId([8; 32]))));
+    assert!(f.venue.anchored(&f.read(4, 1)));
+    assert!(f.venue.migrate(&away(VENUE, f.space)));
+    assert!(f.venue.anchored(&f.read(3, 1)));
+    assert!(!f.venue.anchored(&f.read(4, 1)));
+    assert_eq!(
+        f.venue.anchor(&f.anchor(5, 1, 0)),
+        Err(AnchorRefusal::Window)
+    );
+}

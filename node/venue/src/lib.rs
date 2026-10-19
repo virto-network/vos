@@ -7,14 +7,17 @@
 //! anchors and the statements it accepted as lists, and checks what pin D
 //! and pin F say a venue checks: the anchor rule (a registered,
 //! unsuspended space; a registered key; the signature; `Last < w < now_w`;
-//! the root no older than `MaxRootAge`) and `judge`. A second root for one
-//! `(space, kind, w)` is kept as evidence and suspends the space.
+//! the root no older than `MaxRootAge`; the window within the space's
+//! range here, which a migration away ends) and `judge`. A second root for
+//! one `(space, kind, w)` is kept as evidence and suspends the space.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceGenesis, SpaceId, VenueId, WindowClock};
+use vos_anchor::{
+    Anchor, MAX_ROOT_AGE_MS, Migrate, RootRead, SpaceGenesis, SpaceId, VenueId, WindowClock,
+};
 use vos_statement::model::{Policy, Range, Space};
 use vos_statement::{Pin, ProgramId, Refusal, Statement, StatementId, Venue};
 
@@ -52,8 +55,8 @@ pub enum AnchorRefusal {
     Key,
     /// The signature is not the signer's over the anchor's digest.
     Signature,
-    /// The window is not past the last anchored, or before the space's
-    /// start: refused for good.
+    /// The window is not past the last anchored, before the space's
+    /// start, or at or past its migration away: refused for good.
     Window,
     /// The window is the space's open one, or later, by the venue's clock:
     /// refused until the venue's time passes its boundary.
@@ -69,7 +72,7 @@ pub enum AnchorRefusal {
 struct Registered {
     clock: WindowClock,
     keys: Vec<[u8; 32]>,
-    start: u64,
+    range: Range,
     last: Option<u64>,
     suspended: bool,
 }
@@ -118,7 +121,8 @@ impl Venue for View<'_> {
 }
 
 /// Whether `state` holds `root` anchored at `now`: its space registered and
-/// not suspended, the root no older than `MaxRootAge`.
+/// not suspended, its window within the space's range here, the root no
+/// older than `MaxRootAge`.
 fn held(state: &State, root: &RootRead, now: u64) -> bool {
     let Some(space) = state.spaces.get(&root.space) else {
         return false;
@@ -127,7 +131,10 @@ fn held(state: &State, root: &RootRead, now: u64) -> bool {
         .clock
         .boundary(root.window)
         .is_some_and(|boundary| now.saturating_sub(boundary) <= MAX_ROOT_AGE_MS);
-    !space.suspended && fresh && state.policy.anchors.contains(root)
+    !space.suspended
+        && space.range.contains(root.window)
+        && fresh
+        && state.policy.anchors.contains(root)
 }
 
 impl ModelVenue {
@@ -158,10 +165,14 @@ impl ModelVenue {
     /// founding keys its anchor keys. Its id.
     pub fn register(&self, genesis: &SpaceGenesis, start: u64) -> SpaceId {
         let space = vos_anchor::space_id(genesis);
+        let range = Range {
+            from: start,
+            until: None,
+        };
         let registered = Registered {
             clock: genesis.clock,
             keys: genesis.nodes.iter().map(|(_, key)| *key).collect(),
-            start,
+            range,
             last: None,
             suspended: false,
         };
@@ -170,12 +181,34 @@ impl ModelVenue {
         state.policy.spaces.push(Space {
             id: space,
             clock: genesis.clock,
-            range: Range {
-                from: start,
-                until: None,
-            },
+            range,
         });
         space
+    }
+
+    /// A space's migration away from this venue, its controller's: the
+    /// space's range here ends before `from_window`, so neither its anchors
+    /// nor the roots of its statements at or past it are taken. Whether it
+    /// named a registered space migrating from here.
+    pub fn migrate(&self, migrate: &Migrate) -> bool {
+        if migrate.from != self.id {
+            return false;
+        }
+        let mut state = self.state();
+        let Some(space) = state.spaces.get_mut(&migrate.space) else {
+            return false;
+        };
+        space.range.until = Some(migrate.from_window);
+        let range = space.range;
+        if let Some(space) = state
+            .policy
+            .spaces
+            .iter_mut()
+            .find(|space| space.id == migrate.space)
+        {
+            space.range = range;
+        }
+        true
     }
 
     /// Judge statements of `pin`'s program.
@@ -245,8 +278,8 @@ impl VenueClient for ModelVenue {
             space.suspended = true;
             return Err(AnchorRefusal::Equivocation);
         }
-        let within =
-            anchor.window >= space.start && space.last.is_none_or(|last| last < anchor.window);
+        let within = space.range.contains(anchor.window)
+            && space.last.is_none_or(|last| last < anchor.window);
         if !within {
             return Err(AnchorRefusal::Window);
         }

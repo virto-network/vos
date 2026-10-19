@@ -9,7 +9,9 @@ mod common;
 #[global_allocator]
 static ALLOCATOR: common::Counting = common::Counting;
 
+mod balance;
 mod chain_standalone;
+mod cut;
 mod fixtures;
 mod kernel_shape;
 mod program_identity;

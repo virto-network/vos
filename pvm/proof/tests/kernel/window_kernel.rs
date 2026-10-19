@@ -1,515 +1,454 @@
 #![cfg(feature = "prover")]
 
 //! The settlement window's kernel, the `window` test actor's (`just
-//! build-test-actors`): a space's pseudo-account rows, checked against the
-//! roots of a window's two anchors by a vos-tree multiproof each, and
-//! `cipher_clerk::settlement::window` over them.
+//! build-test-actors`), under a carried commitment: it opens `c_prev`, the
+//! venue's commitment to a pair's cumulative sums at its last settlement,
+//! with the sums and the salt, privately; reads the space's pseudo-account
+//! rows with the peer at one window's cut, served and checked against the
+//! space's root by the SDK's prologue; and states `(net, seq, c_new)`, the
+//! net since, the next sequence number and the commitment to the new sums,
+//! rooted at the cut and naming no anchor.
 //!
-//! The space's map holds a million rows at two versions, eight journals'
-//! pseudo-account pairs among them, each keyed by its committed row
-//! (`0x03 ‖ instance ‖ tag ‖ transform ‖ key'`): the tree over them is the
-//! agent's, whose root the anchors hold. The method runs live on the agent's
-//! reference model; its kernel re-runs from the attest to the same output,
-//! proves over its shape on the segment format, and verifies as a chain
-//! against its program, its io-hash the run's. Its first four segments and
-//! its last verify in their classes' leaves, which prove and verify; the
-//! first four's leaves fold into a tree, two folds of two leaves and a fold
-//! of the two folds, each proved and verified. The whole run's leaves fold
-//! into one root, which the final wrap proves under format 28 and the final
-//! verifier verifies.
+//! The agent's map holds a million rows, eight journals' pseudo-account
+//! pairs among them, under a representative's tree of 1,024 agents' roots.
+//! The method runs live on the agent's reference model at the cut; its
+//! kernel re-runs from the attest to the same statement, proves over its
+//! shape and verifies as a chain against its program; its leaves and folds
+//! prove and verify; and its whole run, folded to one root, wraps under
+//! format 28 and masked under 39, whose statement the model venue judges
+//! against the space's anchors: accepted, and refused as each thing it
+//! binds is changed.
 
 use crate::common;
+use crate::cut::{
+    self, AGENT, AGENTS, Cut, INSTANCE, ROWS, Rng, Venue, WINDOW, genesis, read_live, traced,
+};
 
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use cipher_clerk::codec;
 use cipher_clerk::conventions::PseudoAccount;
 use cipher_clerk::ids::JournalId;
 use cipher_clerk::kernel::Value;
-use cipher_clerk::settlement::{Anchor, Reads, WindowError, window};
 use cipher_clerk::types::{Account, Layer};
+use vos_pvm_final_verifier::masked;
 use vos_pvm_proof::format::SEGMENT;
-use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
 use vos_pvm_proof::program_id::KernelEntry;
 use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
-use vos_pvm_proof::{Proof, ProvingError, program_commitment_of_proof, prove_kernel, prove_shaped};
+use vos_pvm_proof::{Proof, program_commitment_of_proof, prove_kernel};
 use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment};
-use vos_testkit::Testkit;
-use vos_testkit::programs::{derivation, derived, method, package};
-use vos_tree::{BatchProof, Blake2b, Decode, Leaf, MemStore, keys};
-use vos_wire::Encode;
-use vos_wire::abi::cap::Target;
-use vos_wire::ids::{AgentId, InstanceId, MapId, Principal, ProgramHash};
-use vos_wire::keys::Transform;
-use vos_wire::result::{Attest, Outcome};
+use vos_statement::{Pin, ProgramId, Statement};
+use vos_testkit::programs::table_tag;
+use vos_tree::{Blake2b, Hasher};
+use vos_venue::{AnchorRefusal, VenueClient};
+use vos_wire::abi::AttestError;
+use vos_wire::ids::MapId;
+use vos_wire::keys::{self, Transform};
+use vos_wire::served::Served;
+use vos_wire::vos_anchor::{Migrate, RootRead, VenueId, space_id, space_root};
+use vos_wire::{Encode, SpaceId};
 
-const GAS: u64 = 1 << 32;
-const ROWS: usize = 1_000_000;
-const JOURNALS: usize = 8;
-const SPACE: [u8; 32] = [0xA1; 32];
+const JOURNALS: u64 = 8;
 const PEER: [u8; 32] = [0xB2; 32];
 const OPERATOR: [u8; 32] = [0x0C; 32];
 const CURRENCY: u32 = 840;
-const WINDOW_I: u64 = 41;
-const WINDOW_J: u64 = 42;
 /// The class a run is cut at: segments of up to 2^15 steps.
 const CUT: usize = 1;
+/// The venue the statements are judged at.
+const VENUE: VenueId = VenueId([0x7e; 32]);
 
-/// splitmix64: the other rows' bytes, reproducible.
-struct Rng(u64);
+/// Spike 6.0a's measured costs [measured, slice-6-progress.md]: a row's
+/// compressions (with the one its view's read hashes the key with, 6.13)
+/// and witness bytes; the path's compressions (with `S_w`'s) and bytes.
+const SPIKE_ROW_COMPRESSIONS: f64 = 19.07 + 1.0;
+const SPIKE_ROW_BYTES: f64 = 842.0;
+const SPIKE_PATH_COMPRESSIONS: f64 = 15.0;
+const SPIKE_PATH_BYTES: f64 = 590.0;
 
-impl Rng {
-    fn next(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
+/// A pair's state as `c_prev` opens it (`window::Carried`): its salt, its
+/// outgoing and incoming sums, its sequence number.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Carried {
+    salt: [u8; 16],
+    sent: i128,
+    received: i128,
+    seq: u64,
+}
+
+impl Carried {
+    fn encode(&self) -> Vec<u8> {
+        ((self.salt, self.sent), (self.received, self.seq)).encode()
     }
 
-    fn fill(&mut self, out: &mut [u8]) {
-        for chunk in out.chunks_mut(8) {
-            chunk.copy_from_slice(&self.next().to_le_bytes()[..chunk.len()]);
+    /// The pair's commitment to it (`window::commitment`).
+    fn commitment(&self, peer: &[u8; 32], currency: u32) -> [u8; 32] {
+        Blake2b.hash(
+            b"vos/test/window/pair",
+            &[
+                peer,
+                &currency.to_le_bytes(),
+                &self.salt,
+                &self.sent.to_le_bytes(),
+                &self.received.to_le_bytes(),
+                &self.seq.to_le_bytes(),
+            ],
+        )
+    }
+}
+
+/// The last settlement's state the tests carry: the sums below the rows'.
+const CARRIED: Carried = Carried {
+    salt: [0x11; 16],
+    sent: 3_000,
+    received: 2_500,
+    seq: 6,
+};
+/// The next commitment's salt.
+const SALT: [u8; 16] = [0x22; 16];
+
+/// The kernel's statement: `(net, seq, c_new)`.
+type Settlement = (i128, u64, [u8; 32]);
+
+/// Journal `k`: its id, increasing with `k`.
+fn journal(k: u64) -> [u8; 16] {
+    let mut journal = [0u8; 16];
+    journal[..8].copy_from_slice(&(0x4a4f_0000 + k).to_be_bytes());
+    journal[8] = 0x5a;
+    journal
+}
+
+/// The pseudo-accounts with the peer: journal `k`'s outgoing account,
+/// whose credits are what the space sent the peer, and its incoming one,
+/// whose debits what it received, both cumulative. Journal 0 never
+/// received: its incoming account is absent.
+fn accounts() -> Vec<Account<Value>> {
+    (0..JOURNALS)
+        .flat_map(|k| {
+            let journal = JournalId(journal(k));
+            let n = k + 1;
+            let at = |pseudo: PseudoAccount, dr: u64, cr: u64| {
+                let mut account: Account<Value> = pseudo.open(OPERATOR);
+                let settled = &mut account.balances[Layer::Settled.as_index()];
+                settled.dr = Value(dr);
+                settled.cr = Value(cr);
+                account.timestamp = 1_000 + n;
+                account
+            };
+            let outgoing = at(
+                PseudoAccount::outgoing_to(journal, PEER, CURRENCY),
+                0,
+                1_250 * n + 3,
+            );
+            let incoming = (k != 0).then(|| {
+                at(
+                    PseudoAccount::incoming_from(journal, PEER, CURRENCY),
+                    820 * n,
+                    0,
+                )
+            });
+            [Some(outgoing), incoming]
+        })
+        .flatten()
+        .collect()
+}
+
+/// The window actor's committed map.
+fn map() -> MapId {
+    MapId {
+        instance: INSTANCE,
+        tag: table_tag("accounts"),
+        transform: Transform::Hashed,
+    }
+}
+
+/// An account's full row key in the map, by its id.
+fn row(id: &[u8]) -> Vec<u8> {
+    keys::committed(&map(), &Transform::Hashed.apply(id))
+}
+
+/// An account's value as the map stores it: its cipher-clerk encoding,
+/// encoded as the SDK encodes a byte vector.
+fn value(account: &Account<Value>) -> Vec<u8> {
+    codec::to_bytes(account).encode()
+}
+
+/// The space the tests' agent belongs to: [`genesis`] 1's.
+fn space() -> SpaceId {
+    space_id(&genesis(1))
+}
+
+/// The agent's map: the pseudo-accounts among `rows` rows, the others
+/// random, under a representative's tree of `agents` agents' roots, the
+/// agent's held unless not `reported`.
+fn cut_of(rows: usize, agents: u32, reported: bool) -> Cut {
+    let accounts = accounts();
+    let width = value(&accounts[0]).len();
+    let mut rng = Rng(0x5eed_0000 + rows as u64);
+    let others = (accounts.len()..rows)
+        .map(|_| {
+            let (mut id, mut bytes) = ([0u8; 16], vec![0u8; width]);
+            rng.fill(&mut id);
+            rng.fill(&mut bytes);
+            (row(&id), bytes)
+        })
+        .collect();
+    let known = accounts
+        .iter()
+        .map(|account| (row(&account.id.0), value(account)))
+        .collect();
+    Cut::new(space(), known, others, agents, reported)
+}
+
+/// A small map: the window's rows among 256.
+fn small() -> Cut {
+    cut_of(256, 8, true)
+}
+
+/// A million rows under 1,024 agents' roots, as spike 6.0a's.
+fn large() -> Cut {
+    let started = Instant::now();
+    let cut = cut_of(ROWS, AGENTS, true);
+    eprintln!(
+        "the fixture: {ROWS} rows, {AGENTS} agents' roots, built in {:.1}s",
+        started.elapsed().as_secs_f64()
+    );
+    cut
+}
+
+/// The arguments of `settle_at_cut` over `journals`, from `carried` to
+/// `salt`, `c_prev` given.
+fn arguments(c_prev: [u8; 32], carried: &Carried, journals: &[[u8; 16]]) -> Vec<u8> {
+    [
+        (PEER, CURRENCY, c_prev).encode(),
+        carried.encode(),
+        (SALT, journals.to_vec()).encode(),
+    ]
+    .concat()
+}
+
+/// The journals `0..count`.
+fn journals(count: u64) -> Vec<[u8; 16]> {
+    (0..count).map(journal).collect()
+}
+
+/// What the window over `journals` states from `carried`, computed here
+/// from the accounts: the sums of the journals' outgoing and incoming
+/// rows' settled nets, the net since `carried`, and the next state.
+fn expected(carried: &Carried, journals: &[[u8; 16]]) -> (Settlement, Carried) {
+    let (mut sent, mut received) = (0i128, 0i128);
+    for account in accounts() {
+        let pseudo = PseudoAccount::of(&account).expect("a pseudo-account");
+        if !journals.contains(&pseudo.journal.0) {
+            continue;
+        }
+        match pseudo.flow {
+            cipher_clerk::conventions::Flow::Outgoing => sent += account.net(Layer::Settled),
+            cipher_clerk::conventions::Flow::Incoming => received += account.net(Layer::Settled),
         }
     }
-}
-
-/// Journal `k`'s pseudo-account pair at both anchors: the outgoing
-/// account's credits and the incoming account's debits grew in between.
-/// Journal 0's incoming account was opened inside the window, so it is
-/// absent at the first anchor.
-fn pair(k: usize) -> [(Option<Account<Value>>, Account<Value>); 2] {
-    let mut journal = [0u8; 16];
-    journal[..8].copy_from_slice(&(0x4a4f_0000 + k as u64).to_be_bytes());
-    journal[8] = 0x5a;
-    let journal = JournalId(journal);
-    let n = k as u64 + 1;
-    let at = |pseudo: PseudoAccount, dr: u64, cr: u64, timestamp: u64| {
-        let mut account: Account<Value> = pseudo.open(OPERATOR);
-        let settled = &mut account.balances[Layer::Settled.as_index()];
-        settled.dr = Value(dr);
-        settled.cr = Value(cr);
-        account.timestamp = timestamp;
-        account
+    let next = Carried {
+        salt: SALT,
+        sent,
+        received,
+        seq: carried.seq + 1,
     };
-    let outgoing = PseudoAccount::outgoing_to(journal, PEER, CURRENCY);
-    let incoming = PseudoAccount::incoming_from(journal, PEER, CURRENCY);
-    [
-        (
-            Some(at(outgoing, 0, 1_000 * n, 100 + n)),
-            at(outgoing, 0, 1_000 * n + 250 * n + 3, 1_000 + n),
-        ),
-        (
-            (k != 0).then(|| at(incoming, 700 * n, 0, 100 + n)),
-            at(incoming, 700 * n + 120 * n, 0, 1_000 + n),
-        ),
-    ]
+    let net = (sent - carried.sent) - (received - carried.received);
+    ((net, next.seq, next.commitment(&PEER, CURRENCY)), next)
 }
 
-/// The tree's version at `seed` after `writes`, each value salted from it.
-fn put(store: &mut MemStore, seed: &[u8; 32], writes: &[(Vec<u8>, Vec<u8>)]) -> [u8; 32] {
-    let mut leaves: Vec<(Vec<u8>, Option<Leaf>)> = writes
-        .iter()
-        .map(|(key, value)| (key.clone(), Some(Leaf::salted(&Blake2b, seed, key, value))))
-        .collect();
-    leaves.sort_by(|a, b| a.0.cmp(&b.0));
-    let mut root = [0; 32];
-    for batch in leaves.chunks(1 << 16) {
-        root = vos_tree::update(&Blake2b, store, batch).expect("the tree updates");
-    }
-    root
-}
-
-/// A row as `state` takes it (`window::Row`): its read at the first
-/// anchor, absent for an account opened inside the window, then at the
-/// second, each its leaf's salt and its value.
-type Row = (Option<([u8; 16], Vec<u8>)>, ([u8; 16], Vec<u8>));
-
-/// The kernel's statuses (`window`'s constants): a value that does not
-/// decode, rows out of key order, rows the first or the second anchor's
-/// proof refuses, and `WINDOW` plus the index of `window`'s error.
-const MALFORMED: u8 = 1;
-const UNORDERED: u8 = 2;
-const REFUSED_I: u8 = 3;
-const REFUSED_J: u8 = 4;
-const WINDOW: u8 = 16;
-
-/// `state`'s arguments, the proofs each a `BatchProof`'s encoding.
-#[derive(Clone)]
-struct Arguments {
-    space: [u8; 32],
-    window_i: u64,
-    root_i: [u8; 32],
-    window_j: u64,
-    root_j: [u8; 32],
-    rows: Vec<Row>,
-    proof_i: Vec<u8>,
-    proof_j: Vec<u8>,
-}
-
-impl Arguments {
-    fn encode(&self) -> Vec<u8> {
-        (
-            (self.space, self.window_i, self.root_i),
-            (self.window_j, self.root_j, self.rows.clone()),
-            (self.proof_i.clone(), self.proof_j.clone()),
-        )
-            .encode()
-    }
-}
-
-/// A window's arguments, and the output its kernel gives.
-struct Instance {
-    arguments: Arguments,
-    expected: Vec<u8>,
-}
-
-/// The window over the eight journals' rows in a map of [`ROWS`] rows,
-/// built once.
-fn instance() -> &'static Instance {
-    static INSTANCE: OnceLock<Instance> = OnceLock::new();
-    INSTANCE.get_or_init(build)
-}
-
-/// The space's accounts, as the window actor's `ACCOUNTS` names them.
-const ACCOUNTS: MapId = MapId {
-    instance: InstanceId(0),
-    tag: 1,
-    transform: Transform::Hashed,
-};
-
-/// The committed row of `id` in the accounts: its key in the tree.
-fn row(id: &[u8]) -> Vec<u8> {
-    vos_wire::keys::committed(&ACCOUNTS, &keys::hashed(&Blake2b, id))
-}
-
-/// A row's key: its account's committed row.
-fn key(account: &Account<Value>) -> Vec<u8> {
-    row(&account.id.0)
-}
-
-fn build() -> Instance {
-    let accounts: Vec<(Option<Account<Value>>, Account<Value>)> =
-        (0..JOURNALS).flat_map(pair).collect();
-    let mut rng = Rng(0x5eed_0000 + ROWS as u64);
-    let width = codec::to_bytes(&accounts[0].1).len();
-    let others: Vec<(Vec<u8>, Vec<u8>)> = (accounts.len()..ROWS)
-        .map(|_| {
-            let (mut id, mut value) = ([0u8; 16], vec![0u8; width]);
-            rng.fill(&mut id);
-            rng.fill(&mut value);
-            (row(&id), value)
-        })
-        .collect();
-    build_over(accounts, others, 1_000)
-}
-
-/// The window over `accounts`' rows in a map that also holds `others`, at
-/// two versions: the first holds the accounts present at the first anchor;
-/// at the second the accounts grew and the first `changed` others changed.
-fn build_over(
-    accounts: Vec<(Option<Account<Value>>, Account<Value>)>,
-    others: Vec<(Vec<u8>, Vec<u8>)>,
-    changed: usize,
-) -> Instance {
-    let (seed_i, seed_j) = ([1u8; 32], [2u8; 32]);
-    let mut store = MemStore::default();
-    let mut writes = others.clone();
-    writes.extend(
-        accounts
-            .iter()
-            .filter_map(|(at_i, _)| at_i.as_ref())
-            .map(|at_i| (key(at_i), codec::to_bytes(at_i))),
-    );
-    let root_i = put(&mut store, &seed_i, &writes);
-    let mut accounts: Vec<&(Option<Account<Value>>, Account<Value>)> = accounts.iter().collect();
-    accounts.sort_by_key(|(_, at_j)| key(at_j));
-    let keys: Vec<Vec<u8>> = accounts.iter().map(|(_, at_j)| key(at_j)).collect();
-    let proof_i = BatchProof::generate(&store, &keys).expect("proves");
-
-    let mut writes: Vec<(Vec<u8>, Vec<u8>)> = others
-        .into_iter()
-        .take(changed)
-        .map(|(key, mut value)| {
-            value[0] ^= 0xff;
-            (key, value)
-        })
-        .collect();
-    writes.extend(
-        accounts
-            .iter()
-            .map(|(_, at_j)| (key(at_j), codec::to_bytes(at_j))),
-    );
-    let root_j = put(&mut store, &seed_j, &writes);
-    let proof_j = BatchProof::generate(&store, &keys).expect("proves");
-
-    let rows: Vec<Row> = accounts
-        .iter()
-        .zip(&keys)
-        .map(|((at_i, at_j), key)| {
-            (
-                at_i.as_ref().map(|at_i| {
-                    (
-                        vos_tree::salt(&Blake2b, &seed_i, key),
-                        codec::to_bytes(at_i),
-                    )
-                }),
-                (
-                    vos_tree::salt(&Blake2b, &seed_j, key),
-                    codec::to_bytes(at_j),
-                ),
-            )
-        })
-        .collect();
-    let reads: Vec<Reads> = accounts
-        .iter()
-        .map(|(at_i, at_j)| Reads {
-            at_i: at_i.clone(),
-            at_j: at_j.clone(),
-        })
-        .collect();
-    let flow = window(
-        SPACE,
-        Anchor {
-            window: WINDOW_I,
-            root: root_i,
-        },
-        Anchor {
-            window: WINDOW_J,
-            root: root_j,
-        },
-        &reads,
+/// A settlement at the cut through `settle_at_cut`, its rows served from
+/// `cut` and changed by `serve`.
+fn settle(
+    cut: &Cut,
+    c_prev: [u8; 32],
+    carried: &Carried,
+    journals: &[[u8; 16]],
+    serve: impl FnOnce(&mut Served),
+) -> cut::Live {
+    read_live(
+        cut,
+        "window",
+        "settle_at_cut",
+        &arguments(c_prev, carried, journals),
+        serve,
     )
-    .expect("the window's statement");
-    let mut expected = vec![0u8];
-    expected.extend_from_slice(&codec::to_bytes(&flow));
-    Instance {
-        arguments: Arguments {
-            space: SPACE,
-            window_i: WINDOW_I,
-            root_i,
-            window_j: WINDOW_J,
-            root_j,
-            rows,
-            proof_i: proof_i.encode(),
-            proof_j: proof_j.encode(),
+}
+
+/// The honest settlement from [`CARRIED`] over every journal.
+fn honest(cut: &Cut) -> cut::Live {
+    settle(
+        cut,
+        CARRIED.commitment(&PEER, CURRENCY),
+        &CARRIED,
+        &journals(JOURNALS),
+        |_| {},
+    )
+}
+
+/// The window settles at a cut: its statement the net since the carried
+/// state, the next sequence number and the commitment to the new sums; its
+/// public arguments the reader's agent and instance, the peer, the currency
+/// and `c_prev`; its one root the space's at the cut; live ≡ traced. The
+/// next settlement, from the state the first reached and the same rows,
+/// states a net of nothing.
+#[test]
+fn the_window_settles_at_a_cut() {
+    let cut = small();
+    let c_prev = CARRIED.commitment(&PEER, CURRENCY);
+    let live = honest(&cut);
+    let (settlement, next) = expected(&CARRIED, &journals(JOURNALS));
+    assert_eq!(live.output::<Settlement>(), Ok(settlement));
+    assert!(settlement.0 > 0, "the space owes the peer");
+    let attest = live.attest();
+    assert_eq!(attest.window, Some(WINDOW));
+    assert_eq!(
+        attest.public_args,
+        [
+            (AGENT, INSTANCE).encode(),
+            (PEER, CURRENCY, c_prev).encode()
+        ]
+        .concat()
+    );
+    assert_eq!(attest.roots, [cut.root()]);
+    let (kernel, _) = cut::kernel_of("window", attest);
+    traced(attest, &kernel);
+
+    let again = settle(&cut, settlement.2, &next, &journals(JOURNALS), |_| {});
+    let (settlement, _) = expected(&next, &journals(JOURNALS));
+    assert_eq!(settlement.0, 0);
+    assert_eq!(again.output::<Settlement>(), Ok(settlement));
+    assert_eq!(settlement.1, CARRIED.seq + 2);
+}
+
+/// A carried state that does not open `c_prev` traps the kernel, so no
+/// statement is made: another salt, other sums, another sequence number,
+/// and `c_prev` of another pair; and so do journals out of order.
+#[test]
+fn a_carried_state_that_does_not_open_is_refused() {
+    let cut = small();
+    let c_prev = CARRIED.commitment(&PEER, CURRENCY);
+    let all = journals(JOURNALS);
+    let changes = [
+        Carried {
+            salt: [0x12; 16],
+            ..CARRIED
         },
-        expected,
+        Carried {
+            sent: CARRIED.sent - 1,
+            ..CARRIED
+        },
+        Carried {
+            received: CARRIED.received + 1,
+            ..CARRIED
+        },
+        Carried {
+            seq: CARRIED.seq + 1,
+            ..CARRIED
+        },
+    ];
+    for carried in changes {
+        let live = settle(&cut, c_prev, &carried, &all, |_| {});
+        assert_eq!(
+            live.output::<Settlement>(),
+            Err(AttestError::Failed),
+            "{carried:?}"
+        );
     }
+    let another = CARRIED.commitment(&[0xB3; 32], CURRENCY);
+    let live = settle(&cut, another, &CARRIED, &all, |_| {});
+    assert_eq!(live.output::<Settlement>(), Err(AttestError::Failed));
+    let mut unordered = all.clone();
+    unordered.swap(0, 1);
+    let live = settle(&cut, c_prev, &CARRIED, &unordered, |_| {});
+    assert_eq!(live.output::<Settlement>(), Err(AttestError::Failed));
 }
 
-/// A key's bit at `level`, most significant first, a bit past its end
-/// reading 0.
-fn bit(key: &[u8], level: usize) -> u8 {
-    key.get(level / 8)
-        .map_or(0, |byte| (byte >> (7 - level % 8)) & 1)
-}
-
-/// Journal 0's window over a map of three rows, where the first anchor's
-/// proof ends the paths of its two claims, one present and one absent, in
-/// the opposite of their keys' order.
-///
-/// The outgoing account's key `p` is present at both anchors, the incoming
-/// account's `a` only at the second; they first differ at bit `d`. The map
-/// also holds `p` with a later bit `l` flipped, where `a`'s bit differs
-/// from `p`'s and from its own at `d`: at the first anchor the tree is one
-/// branch at `l`, and `a`, parting from both leaves at `d`, where no branch
-/// splits, ends on the side of `l` opposite to the one its order puts it.
-fn inversion() -> Instance {
-    let accounts = pair(0);
-    let present = key(&accounts[0].1);
-    let absent = key(&accounts[1].1);
-    let parted = (0..present.len() * 8)
-        .find(|&level| bit(&present, level) != bit(&absent, level))
-        .expect("distinct keys");
-    let flipped = (parted + 1..present.len() * 8)
-        .find(|&level| {
-            bit(&absent, level) != bit(&present, level)
-                && bit(&absent, level) != bit(&absent, parted)
-        })
-        .expect("a bit past the first difference");
-    let mut other = present.clone();
-    other[flipped / 8] ^= 0x80 >> (flipped % 8);
-    assert_ne!(
-        absent < present,
-        bit(&absent, flipped) < bit(&present, flipped),
-        "the keys' order is not the paths'"
-    );
-    let value = codec::to_bytes(&accounts[0].1);
-    build_over(accounts.to_vec(), vec![(other, value)], 0)
-}
-
-/// The process's peak resident memory, for the log: A.7 caps a segment's.
-fn peak_rss_mib() -> u64 {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
-            line.split_whitespace().nth(1)?.parse::<u64>().ok()
-        })
-        .map_or(0, |kib| kib / 1024)
-}
-
-/// The window kernel, as its install records it, and its attest from a
-/// live run of `state` on `arguments`.
-struct Kernel {
-    blob: Vec<u8>,
-    record: vos_wire::records::Kernel,
-    attest: Attest,
-}
-
-fn run(arguments: &[u8]) -> Kernel {
-    let derived = derived("window");
-    let install = derivation(&package("window"), &derived);
-    let mut kit = Testkit::new(AgentId(7));
-    kit.install_derived(Target::Vos, InstanceId(9), &derived, &[])
-        .expect("installs");
-    let step = kit.command(
-        Principal::Client([1; 32]),
-        InstanceId(9),
-        method(&derived.actor, "state"),
-        arguments,
-    );
-    assert!(
-        matches!(step.outcome, Outcome::Done(_)),
-        "{:?}",
-        step.outcome
-    );
-    let attest = step.attests.into_iter().next().expect("an attest");
-    let blob = derived
-        .kernels
-        .iter()
-        .map(|(_, kernel)| kernel)
-        .find(|kernel| ProgramHash::of(kernel) == attest.program)
-        .expect("the derived kernel")
-        .clone();
-    let record = install
-        .kernels
-        .iter()
-        .find(|kernel| kernel.program == attest.program)
-        .expect("its install's record")
-        .clone();
-    Kernel {
-        blob,
-        record,
-        attest,
-    }
-}
-
-fn traced(kernel: &Kernel) -> KernelTrace {
-    let trace = trace_kernel(&kernel.blob, &kernel.attest.witness_input, GAS).expect("re-runs");
-    assert_eq!(trace.output, kernel.attest.output);
-    trace
-}
-
-/// Rows the anchors' roots do not hold are refused, and the window states
-/// nothing: a value the second anchor's root does not commit, and a row
-/// claimed absent at the first anchor that is present there.
+/// Rows the cut does not prove trap the prologue or the view: a row's value
+/// tampered; a row the agent's root holds, claimed absent; the agent's root
+/// with no row in the representative's tree (it missed the close); and a
+/// key the read did not name, which the view refuses.
 #[test]
-fn rows_off_the_roots_are_refused() {
-    let instance = instance();
-    let mut arguments = instance.arguments.clone();
-    arguments.rows[0].1.0[0] ^= 1;
-    let refused = run(&arguments.encode());
-    assert_eq!(refused.attest.output, vec![REFUSED_J].encode());
-    traced(&refused);
-
-    let mut arguments = instance.arguments.clone();
-    let present = arguments
-        .rows
-        .iter()
-        .position(|row| row.0.is_some())
-        .unwrap();
-    arguments.rows[present].0 = None;
-    let refused = run(&arguments.encode());
-    assert_eq!(refused.attest.output, vec![REFUSED_I].encode());
-}
-
-/// A proof tampered with or cut short is refused, and so are rows out of
-/// key order, a value that does not decode, and rows `window` refuses.
-#[test]
-fn bad_proofs_and_rows_are_refused() {
-    let instance = instance();
-    let refused = |change: &dyn Fn(&mut Arguments)| {
-        let mut arguments = instance.arguments.clone();
-        change(&mut arguments);
-        let kernel = run(&arguments.encode());
-        traced(&kernel);
-        kernel.attest.output
+fn rows_off_the_cut_are_refused() {
+    let cut = small();
+    let c_prev = CARRIED.commitment(&PEER, CURRENCY);
+    let all = journals(JOURNALS);
+    let refused = |serve: &dyn Fn(&mut Served)| {
+        settle(&cut, c_prev, &CARRIED, &all, serve).output::<Settlement>()
     };
-    let status = |status: u8| vec![status].encode();
-    // The last byte: of the last entry's hash or value commitment.
-    let tampered = |proof: &mut Vec<u8>| {
-        let last = proof.len() - 1;
-        proof[last] ^= 1;
+    let present = |served: &Served| {
+        served
+            .rows
+            .iter()
+            .position(|(_, held)| held.is_some())
+            .unwrap()
     };
-    assert_eq!(refused(&|a| tampered(&mut a.proof_i)), status(REFUSED_I));
-    assert_eq!(refused(&|a| tampered(&mut a.proof_j)), status(REFUSED_J));
     assert_eq!(
-        refused(&|a| {
-            a.proof_i.pop();
+        refused(&|served| {
+            let at = present(served);
+            let (_, value) = served.rows[at].1.as_mut().unwrap();
+            let last = value.len() - 1;
+            value[last] ^= 1;
         }),
-        status(REFUSED_I)
+        Err(AttestError::Failed),
+        "a tampered row"
     );
     assert_eq!(
-        refused(&|a| a.proof_j.truncate(a.proof_j.len() / 2)),
-        status(REFUSED_J)
+        refused(&|served| {
+            let at = present(served);
+            served.rows[at].1 = None;
+        }),
+        Err(AttestError::Failed),
+        "a present row claimed absent"
     );
-    assert_eq!(refused(&|a| a.rows.swap(0, 1)), status(UNORDERED));
-    assert_eq!(refused(&|a| a.rows[3].1.1.truncate(5)), status(MALFORMED));
+    let missed = cut_of(256, 8, false);
     assert_eq!(
-        refused(&|a| a.space = PEER),
-        status(WINDOW + WindowError::SameSpace as u8)
+        settle(&missed, c_prev, &CARRIED, &all, |_| {}).output::<Settlement>(),
+        Err(AttestError::Failed),
+        "the agent's row missing from the representative's"
     );
-}
-
-/// Claims whose paths end in the proof in the opposite of their keys'
-/// order are accepted, as `vos_tree` accepts them: an absent key parting
-/// from a subtree at a bit no branch splits on.
-#[test]
-fn claims_ending_out_of_key_order_are_accepted() {
-    let instance = inversion();
-    let arguments = &instance.arguments;
-    let claims: Vec<(Vec<u8>, Option<[u8; 32]>)> = arguments
-        .rows
-        .iter()
-        .map(|(at_i, at_j)| {
-            let account: Account<Value> = codec::from_bytes(&at_j.1).expect("an account");
-            let commitment = at_i
-                .as_ref()
-                .map(|(salt, value)| vos_tree::value_hash(&Blake2b, salt, value));
-            (key(&account), commitment)
-        })
-        .collect();
-    let proof = BatchProof::decode_exact(&arguments.proof_i).expect("a proof");
-    proof
-        .verify(&Blake2b, &arguments.root_i, &claims)
-        .expect("vos_tree accepts");
-    let kernel = run(&arguments.encode());
-    assert_eq!(kernel.attest.output, instance.expected.encode());
-    traced(&kernel);
+    // The kernel reads every journal's rows; the read names the first
+    // journal's alone.
+    let ids: Vec<[u8; 16]> = [
+        PseudoAccount::outgoing_to(JournalId(all[0]), PEER, CURRENCY),
+        PseudoAccount::incoming_from(JournalId(all[0]), PEER, CURRENCY),
+    ]
+    .iter()
+    .map(|pseudo| pseudo.id().0)
+    .collect();
+    let live = read_live(
+        &cut,
+        "window",
+        "settle_reading",
+        &[arguments(c_prev, &CARRIED, &all), ids.encode()].concat(),
+        |_| {},
+    );
+    assert_eq!(
+        live.output::<Settlement>(),
+        Err(AttestError::Failed),
+        "a key outside the read set"
+    );
 }
 
 /// The window's kernel re-runs from its attest to the window's statement,
 /// proves over its shape cut at class 1's budgets, each segment at the
-/// first class that holds it, and verifies as a chain against its program.
+/// first class that holds it, and verifies as a chain against its program,
+/// its io-hash over its public arguments, its output and its root.
 #[test]
 fn the_window_proves_and_verifies_over_its_shape() {
     let started = Instant::now();
-    let instance = instance();
-    let kernel = run(&instance.arguments.encode());
-    assert_eq!(kernel.attest.output, instance.expected.encode());
-    let trace = traced(&kernel);
-    let program = common::kernel_program(&kernel.blob, &kernel.record, &SEGMENT);
+    let live = honest(&large());
+    let attest = live.attest();
+    let (blob, record) = cut::kernel_of("window", attest);
+    let trace = traced(attest, &blob);
+    let program = common::kernel_program(&blob, &record, &SEGMENT);
     let shape = &program.shape;
     eprintln!(
-        "window: {} steps, {} compressions, witness input {} B, kernel {} B, \
-         chips {:#x} ({} of {}) ({:.1}s)",
+        "window: {} steps, {} compressions, witness input {} B, kernel {} B, chips {:#x} ({} of \
+         {}) ({:.1}s)",
         trace.side_note.steps.len(),
         trace.side_note.blake2b_calls.len(),
-        kernel.attest.witness_input.len(),
-        kernel.blob.len(),
+        attest.witness_input.len(),
+        blob.len(),
         shape.components,
         shape.components.count_ones(),
         vos_pvm_proof::chip_idx::COUNT,
@@ -525,10 +464,9 @@ fn the_window_proves_and_verifies_over_its_shape() {
     let started = Instant::now();
     let segments = prove_kernel(&trace.side_note, shape, CUT, &SEGMENT).expect("proves");
     eprintln!(
-        "proved {} segments in {:.1}s, peak RSS {} MiB",
+        "proved {} segments in {:.1}s",
         segments.len(),
         started.elapsed().as_secs_f64(),
-        peak_rss_mib()
     );
     for (index, segment) in segments.iter().enumerate() {
         assert_eq!(
@@ -548,53 +486,37 @@ fn the_window_proves_and_verifies_over_its_shape() {
         segments[0].class
     );
     let proofs: Vec<Proof> = segments.into_iter().map(|segment| segment.proof).collect();
-    let entry = KernelEntry::of(&program, &kernel.blob).expect("the program's blob");
-    let started = Instant::now();
+    let entry = KernelEntry::of(&program, &blob).expect("the program's blob");
     let registers = verify_kernel_chain(proofs, &program, &entry).expect("verifies");
-    eprintln!("chain verified in {:.2}s", started.elapsed().as_secs_f64());
     let io_hash: Vec<u8> = registers[9..13]
         .iter()
         .flat_map(|word| word.to_le_bytes())
         .collect();
     assert_eq!(io_hash, trace.io_hash);
-    // No public arguments and no roots: the window's statement is bound
-    // only through its output, the `NetFlow`'s fields.
+    let roots: Vec<vos_pvm_precompiles::RootRead> = attest
+        .roots
+        .iter()
+        .map(|root| vos_pvm_precompiles::RootRead {
+            kind: vos_pvm_precompiles::RootKind::try_from(root.kind as u8).unwrap(),
+            space: root.space.0,
+            window: root.window,
+            root: root.root,
+        })
+        .collect();
     assert_eq!(
         io_hash,
-        vos_pvm_precompiles::compute_io_hash(&[], &instance.expected.encode(), &[])
+        vos_pvm_precompiles::compute_io_hash(&attest.public_args, &attest.output, &roots)
     );
 }
 
-/// Window `[a, b)` of the run proved at the first class of `program`'s
-/// shape that holds it, as `prove_kernel` proves it, and the class.
-fn prove_at_first_class(
-    cursor: &mut SegmentCursor<'_>,
-    (a, b): (usize, usize),
-    program: &vos_pvm_proof::program_id::KernelProgram,
-) -> (usize, Proof) {
-    let steps = (b - a).next_power_of_two().trailing_zeros();
-    for (class, sizes) in program.shape.classes.iter().enumerate() {
-        if steps > u32::from(sizes.log_steps) {
-            continue;
-        }
-        let shape = program.shape.segment(class).unwrap();
-        match prove_shaped(&mut cursor.side_note(a, b), &shape, &SEGMENT) {
-            Ok(proof) => return (class, proof),
-            Err(ProvingError::Shape { .. }) => continue,
-            Err(error) => panic!("{error}"),
-        }
-    }
-    panic!("no class holds [{a}, {b})")
-}
-
 /// The window's kernel's leaves and folds: its program finalized with its
-/// leaf circuits; its first four segments (the entry's, class 0, then
-/// class-1 windows of the 32k cut) and its last (class 0, the halt), each
-/// verified in its class's leaf as natively, the leaf within the padded
-/// shape, proved and verified. The first states the entry, the last the
-/// halt and the run's io-hash; the first's exit digest is the second's
-/// entry digest. A class-1 leaf proves in at most 4 GiB of heap and in at
-/// most the time of its segment's proving.
+/// leaf circuits; its first four segments (the entry's, then class-1
+/// windows of the 32k cut) and its last (the halt), each verified in its
+/// class's leaf as natively, the leaf within the padded shape, proved and
+/// verified. The first states the entry, the last the halt and the run's
+/// io-hash; the first's exit digest is the second's entry digest. A class-1
+/// leaf proves in at most 4 GiB of heap and in at most the time of its
+/// segment's proving.
 ///
 /// The first four leaves fold: two folds of two leaves, then a fold of the
 /// two folds, the root of the run's first four segments, each within the
@@ -603,13 +525,14 @@ fn prove_at_first_class(
 /// time of a class-1 segment's proving.
 #[test]
 fn the_windows_leaves_and_folds_prove_and_verify() {
-    let instance = instance();
-    let kernel = run(&instance.arguments.encode());
-    let trace = traced(&kernel);
+    let live = honest(&large());
+    let attest = live.attest();
+    let (blob, record) = cut::kernel_of("window", attest);
+    let trace = traced(attest, &blob);
     let ((program, entry), elapsed, peak) = common::measured(|| {
         vos_pvm_recair::leaf::kernel_program(
-            &kernel.blob,
-            &kernel.record,
+            &blob,
+            &record,
             vos_pvm_compiler::TRANSPILER_VERSION,
             &SEGMENT,
         )
@@ -621,9 +544,13 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
         elapsed.as_secs_f64(),
         &program.id().to_bytes()[..8]
     );
-    let cut = &program.shape.classes[CUT];
-    let bounds =
-        segment_bounds_budgeted(&trace.side_note, 1 << cut.log_steps, usize::from(cut.pages));
+    let class = &program.shape.classes[CUT];
+    let bounds = segment_bounds_budgeted(
+        &trace.side_note,
+        1 << class.log_steps,
+        usize::from(class.pages),
+    );
+    assert!(bounds.len() > 4, "{} segments", bounds.len());
     let last = bounds.len() - 1;
     let fold = vos_pvm_recair::fold::FoldCircuit::new();
     let (word, elapsed, _) = common::measured(|| fold.hash());
@@ -633,7 +560,7 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
     let mut slowest = std::time::Duration::ZERO;
     for position in [0, 1, 2, 3, last] {
         let ((class, proof), segment, segment_peak) =
-            common::measured(|| prove_at_first_class(&mut cursor, bounds[position], &program));
+            common::measured(|| cut::prove_at_first_class(&mut cursor, bounds[position], &program));
         let leaf = common::prove_leaf(&program, &entry, class, &proof, position as u32, word);
         eprintln!(
             "segment {position} ({:?}, class {class}) proved in {:.2}s, its peak heap \
@@ -662,10 +589,13 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
         .iter()
         .map(|(class, leaf)| (*class, leaf.node.output))
         .collect();
-    let [(_, first), (second_class, second), .., (_, end)] = outputs[..] else {
+    let [(_, first), (_, second), .., (_, end)] = outputs[..] else {
         unreachable!()
     };
-    assert_eq!(second_class, CUT, "the second segment is a class-1 window");
+    assert!(
+        outputs[1..4].iter().any(|(class, _)| *class == CUT),
+        "a class-1 window among the first four"
+    );
     assert!(first.entry && !first.halt);
     assert!(!second.entry && !second.halt);
     assert!(!end.entry && end.halt);
@@ -706,102 +636,231 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
     assert_eq!(end.io_hash, trace.io_hash);
 }
 
-/// The whole window, end to end: every segment proved in its class and
-/// verified in its leaf, the leaves folded in adjacent pairs, an odd node
-/// carried up, to one root stating the whole run (its entry, its halt, its
-/// io-hash); the root wrapped under format 28 on the Blake2b-256 channel
-/// within 2^17 rows and 8 GiB of heap, and verified by
-/// `vos-pvm-final-verifier`, its statement the program's id and the run's
-/// io-hash. The window's `vos_statement::Statement` (rootless, so of no
-/// space: its space and anchors are in its output, which no venue checks;
-/// its handler must) recomputes that io-hash, and a venue pinning the
-/// program accepts it, natively and on the JAM-only host. The wrap's proof
-/// (postcard), its public words (24 little-endian u32s) and the judgement's
-/// input are written under the target's tmp directory,
-/// `wrap/window.{proof,words,input}`, for the Wasm harness.
-#[test]
-fn the_window_wraps() {
-    let instance = instance();
-    let kernel = run(&instance.arguments.encode());
-    let trace = traced(&kernel);
-    let (program, entry) = vos_pvm_recair::leaf::kernel_program(
-        &kernel.blob,
-        &kernel.record,
-        vos_pvm_compiler::TRANSPILER_VERSION,
-        &SEGMENT,
-    )
-    .expect("the kernel's program");
-    let cut = &program.shape.classes[CUT];
-    let bounds =
-        segment_bounds_budgeted(&trace.side_note, 1 << cut.log_steps, usize::from(cut.pages));
-    let fold = vos_pvm_recair::fold::FoldCircuit::new();
-    let word = vos_pvm_recair::fold::FoldCircuit::word();
-    let mut totals = common::Totals::default();
-    let started = Instant::now();
-    let mut cursor = SegmentCursor::new(&trace.side_note);
-    let mut nodes = Vec::with_capacity(bounds.len());
-    for (position, &bound) in bounds.iter().enumerate() {
-        let ((class, proof), segment, segment_peak) =
-            common::measured(|| prove_at_first_class(&mut cursor, bound, &program));
-        let leaf = common::prove_leaf(&program, &entry, class, &proof, position as u32, word);
-        eprintln!(
-            "segment {position} ({bound:?}, class {class}) proved in {:.2}s, its peak heap \
-             {segment_peak} MiB; its leaf in {:.2}s, its peak heap {} MiB",
-            segment.as_secs_f64(),
-            leaf.proving.as_secs_f64(),
-            leaf.peak_mib,
-        );
-        totals.segments.add(segment, segment_peak);
-        totals.leaves.add(leaf.proving, leaf.peak_mib);
-        nodes.push(leaf);
-    }
+/// What a read at the cut costs, on the million-row map: steps,
+/// compressions and witness bytes of the window over journals 1–7 (fourteen
+/// rows, all present) less those over journal 1 (two), over twelve: a row's;
+/// the space path's compressions (its check and `S_w`'s) and bytes (the
+/// path, the leaf's salt and the two roots). Each within a fifth of spike
+/// 6.0a's.
+fn measure(cut: &Cut) {
+    let c_prev = CARRIED.commitment(&PEER, CURRENCY);
+    let run = |journals: &[[u8; 16]]| {
+        let live = settle(cut, c_prev, &CARRIED, journals, |_| {});
+        let attest = live.attest().clone();
+        let (blob, _) = cut::kernel_of("window", &attest);
+        let trace = traced(&attest, &blob);
+        (
+            trace.side_note.steps.len(),
+            trace.side_note.blake2b_calls.len(),
+            attest.witness_input.len(),
+            live.served,
+        )
+    };
+    let fourteen: Vec<[u8; 16]> = (1..JOURNALS).map(journal).collect();
+    let (two_steps, two_compressions, two_bytes, two_served) = run(&fourteen[..1]);
+    let (steps, compressions, bytes, _) = run(&fourteen);
+    let per = |more: usize, less: usize| (more - less) as f64 / 12.0;
+    let row_compressions = per(compressions, two_compressions);
+    let row_bytes = per(bytes, two_bytes);
+    let row_steps = per(steps, two_steps);
+    let path_compressions = cut::path_compressions(&two_served) as f64;
+    let path_bytes = cut::path_bytes(&two_served) as f64;
     eprintln!(
-        "{} segments proved in their leaves in {:.0}s",
-        nodes.len(),
-        started.elapsed().as_secs_f64()
+        "two rows: {two_steps} steps, {two_compressions} compressions, witness {two_bytes} B; \
+         fourteen rows: {steps} steps, {compressions} compressions, witness {bytes} B"
     );
-    let started = Instant::now();
-    while nodes.len() > 1 {
-        let mut level = Vec::with_capacity(nodes.len().div_ceil(2));
-        let mut pending = nodes.into_iter();
-        while let Some(left) = pending.next() {
-            match pending.next() {
-                Some(right) => {
-                    let node = common::prove_fold(&fold, &program, &left, &right, word);
-                    totals.folds.add(node.proving, node.peak_mib);
-                    level.push(node);
-                }
-                None => level.push(left),
-            }
-        }
-        nodes = level;
-    }
     eprintln!(
-        "{} folds in {:.0}s",
-        totals.folds.count,
-        started.elapsed().as_secs_f64()
+        "a row: {row_compressions:.2} compressions, {row_bytes:.0} B, {row_steps:.0} steps; the \
+         path: {} compressions (+1 for S_w), {path_bytes} B",
+        path_compressions - 1.0,
     );
-    let root = nodes.pop().expect("the root");
-    let output = root.node.output;
-    assert_eq!((output.first, output.last), (0, bounds.len() as u32 - 1));
-    assert!(output.entry && output.halt, "the whole run");
-    assert_eq!(output.io_hash, trace.io_hash);
+    let within = |measured: f64, spike: f64| measured <= spike * 1.2;
+    assert!(
+        within(row_compressions, SPIKE_ROW_COMPRESSIONS),
+        "{row_compressions}"
+    );
+    assert!(within(row_bytes, SPIKE_ROW_BYTES), "{row_bytes}");
+    assert!(
+        within(path_compressions, SPIKE_PATH_COMPRESSIONS),
+        "{path_compressions}"
+    );
+    assert!(within(path_bytes, SPIKE_PATH_BYTES), "{path_bytes}");
+}
 
-    let (bytes, words) = common::wrap_root("the window", &program, &root, &mut totals.wrap);
-    totals.report("the window");
-    let input = common::judged_statement(
-        vos_statement::Statement {
-            format: vos_pvm_final_verifier::unmasked::FORMAT,
-            program: vos_statement::ProgramId(program.id().0.map(|word| word.0)),
-            // Rootless: of no space. The window's space and anchors are
-            // in its output, for the handler to check.
-            space: vos_statement::SpaceId::NONE,
-            public_args: Vec::new(),
-            output: instance.expected.encode(),
-            roots: Vec::new(),
-        },
-        &trace.io_hash,
-        &bytes,
+/// The window end to end on the million-row map: its costs measured
+/// ([`measure`]); its sixteen-row run, at most 1M steps, proved whole,
+/// folded to one root and wrapped under format 28 and masked under 39; and
+/// its statement (the reader's agent and instance, the peer, the currency
+/// and `c_prev` public, `(net, seq, c_new)` its output, `S_w` its root)
+/// judged at the model venue, which pins the kernel's program and holds
+/// `S_w` anchored by the space's founding key.
+///
+/// Accepted, and then refused as a repeat; and refused, each at a venue
+/// that differs in one thing or a statement that does:
+/// - **an unanchored root:** a venue that holds no anchor of the space;
+/// - **another window:** the statement's root claimed at the window
+///   before, which the venue does not hold; and, at a venue whose space
+///   anchored that root there too, by the proof's words;
+/// - **another space:** the statement claiming a space its root is not of;
+///   and its root claimed of a second space of the founder's, anchored
+///   there, by the proof's words;
+/// - **a missing representative row:** the space's root anchored over a
+///   representative's tree without the agent's row;
+/// - **a tampered row:** the net a tampered row would make, by the proof's
+///   words (the row itself traps the prologue, [`rows_off_the_cut_are_refused`]);
+/// - **a venue mismatch:** a venue of another id, at which the anchor
+///   signed for this one is refused and the root is unanchored;
+/// - **a window outside the migration range:** the space migrated away
+///   from this venue at the statement's window.
+///
+/// A key outside the read set traps the view, so no statement is made of
+/// it ([`rows_off_the_cut_are_refused`]).
+#[test]
+fn the_window_is_stated_at_the_model_venue() {
+    let cut = large();
+    measure(&cut);
+    let live = honest(&cut);
+    let attest = live.attest().clone();
+    let representative = cut.representative.clone();
+    let missing = cut::Representative::new(AGENT, WINDOW, cut.agent_root, AGENTS, false);
+    drop((live, cut));
+    let (blob, record) = cut::kernel_of("window", &attest);
+    let trace = traced(&attest, &blob);
+    let steps = trace.side_note.steps.len();
+    eprintln!(
+        "the window: {steps} steps, {} compressions, witness input {} B",
+        trace.side_note.blake2b_calls.len(),
+        attest.witness_input.len()
     );
-    common::write_wrap("window", &bytes, &words, &input);
+    assert!(steps <= 1_000_000, "{steps} steps");
+
+    let started = Instant::now();
+    let (program, root, segments, mut totals) =
+        cut::prove_whole("the window", &blob, &record, &trace, CUT);
+    drop(trace);
+    let (_, _, proof) = common::wrap_root("the window", &program, &root, &mut totals.wrap);
+    totals.report("the window");
+    eprintln!(
+        "the window: {segments} segments, proved end to end in {:.0}s",
+        started.elapsed().as_secs_f64()
+    );
+
+    let program = ProgramId(program.id().0.map(|word| word.0));
+    let statement = Statement {
+        format: masked::FORMAT,
+        program,
+        space: space(),
+        public_args: attest.public_args.clone(),
+        output: attest.output.clone(),
+        roots: attest.roots.clone(),
+    };
+    let root = statement.roots[0];
+    assert_eq!(
+        root.root,
+        space_root(&space(), WINDOW, &representative.root)
+    );
+    let venue = |id: VenueId| {
+        let venue = Venue::new(id, &[genesis(1), genesis(2)]);
+        venue.venue.pin(Pin {
+            program,
+            venue_bound: false,
+        });
+        venue
+    };
+    let anchored = || {
+        let venue = venue(VENUE);
+        venue.anchor(&root).expect("anchored");
+        venue
+    };
+    let code = |venue: &Venue, statement: &Statement| {
+        vos_statement::code(&venue.venue.submit(statement, &proof))
+    };
+    let by_words = |code: u32| code == 0x108 || code == 0x109;
+
+    let accepting = anchored();
+    assert_eq!(code(&accepting, &statement), 0, "accepted");
+    assert_eq!(code(&accepting, &statement), 6, "a repeat");
+
+    assert_eq!(code(&venue(VENUE), &statement), 5, "an unanchored root");
+
+    let before = RootRead {
+        window: WINDOW - 1,
+        ..root
+    };
+    let at_another_window = Statement {
+        roots: vec![before],
+        ..statement.clone()
+    };
+    assert_eq!(code(&anchored(), &at_another_window), 5, "another window");
+    let both = venue(VENUE);
+    both.anchor(&before).expect("anchored at the window before");
+    both.anchor(&root).expect("anchored");
+    assert!(
+        by_words(code(&both, &at_another_window)),
+        "another window, anchored"
+    );
+
+    let second = space_id(&genesis(2));
+    let claimed = Statement {
+        space: second,
+        ..statement.clone()
+    };
+    assert_eq!(code(&anchored(), &claimed), 4, "another space");
+    let of_second = RootRead {
+        space: second,
+        ..root
+    };
+    let moved = Statement {
+        space: second,
+        roots: vec![of_second],
+        ..statement.clone()
+    };
+    let there = anchored();
+    there
+        .anchor(&of_second)
+        .expect("anchored in the second space");
+    assert!(by_words(code(&there, &moved)), "another space, anchored");
+
+    let without = venue(VENUE);
+    without
+        .anchor(&RootRead {
+            root: space_root(&space(), WINDOW, &missing.root),
+            ..root
+        })
+        .expect("anchored without the agent's row");
+    assert_eq!(
+        code(&without, &statement),
+        5,
+        "a missing representative row"
+    );
+
+    let (net, seq, c_new) = vos_wire::Decode::decode(&statement.output)
+        .map(|(settlement, _): (Settlement, _)| settlement)
+        .expect("the settlement");
+    let tampered = Statement {
+        output: (net + 1, seq, c_new).encode(),
+        ..statement.clone()
+    };
+    assert!(by_words(code(&anchored(), &tampered)), "a tampered row");
+
+    let elsewhere = venue(VenueId([0x7f; 32]));
+    assert_eq!(
+        elsewhere.anchor_for(&root, VENUE),
+        Err(AnchorRefusal::Signature),
+        "an anchor signed for another venue"
+    );
+    assert_eq!(code(&elsewhere, &statement), 5, "a venue mismatch");
+
+    let migrated = anchored();
+    assert!(migrated.venue.migrate(&Migrate {
+        space: space(),
+        from: VENUE,
+        to: VenueId([0x7f; 32]),
+        from_window: WINDOW,
+    }));
+    assert_eq!(
+        code(&migrated, &statement),
+        5,
+        "a window outside the migration range"
+    );
 }

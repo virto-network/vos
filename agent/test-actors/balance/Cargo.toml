@@ -1,0 +1,19 @@
+[package]
+name = "balance"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "balance"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vos-sdk = { workspace = true }
+vos-tree = { path = "../../tree" }

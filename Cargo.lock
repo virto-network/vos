@@ -2657,6 +2657,7 @@ dependencies = [
  "bincode",
  "blake3",
  "cipher-clerk",
+ "ed25519-dalek",
  "impl-trait-for-tuples",
  "libc",
  "num-traits",
@@ -2677,6 +2678,7 @@ dependencies = [
  "vos-statement",
  "vos-testkit",
  "vos-tree",
+ "vos-venue",
  "vos-wire",
 ]
 

@@ -5,7 +5,7 @@
 [workspace]
 members = [
     "counter", "ledger", "caller", "tracker", "shop", "rounds", "kernels", "tainted", "bounds", "wide",
-    "bulky", "greedy", "window", "reader", "accounts",
+    "bulky", "greedy", "window", "reader", "accounts", "balance",
 ]
 resolver = "3"
 

@@ -35,11 +35,13 @@ vectors:
 
 # Prover integration suites, including the soundness gates behind
 # `debug-internals`, the re-runs of the test actors' kernels from their
-# attests on the agent's model, the settlement window's kernel proved over
-# its shape, the kernels' leaves and the window kernel's folds proved on
-# the recursion AIR, its whole run folded and wrapped under format 28 and
-# verified by the final verifier, and the fixtures checked against their
-# generator and judged in Wasm.
+# attests on the agent's model, the settlement window's kernel read at a
+# cut and proved over its shape, the kernels' leaves and the window
+# kernel's folds proved on the recursion AIR, the window's and the
+# balance's whole runs folded and wrapped under format 28 and masked under
+# 39, their statements judged at the model venue against the space's
+# anchors, and the fixtures checked against their generator and judged in
+# Wasm.
 # Memory-heavy: the library, `gates` and `isa` run two tests at a time, and
 # `kernel`, whose window runs each take several GiB, one at a time: each
 # window test (up to about 9 GiB at its peak) and `reads` (a million-row

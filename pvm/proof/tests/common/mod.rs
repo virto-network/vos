@@ -515,13 +515,17 @@ pub fn prove_fold(
 /// by `vos-pvm-final-verifier`, its statement the program's id and the root's
 /// io-hash: the proof's bytes (postcard) and its public words; its proving
 /// time and peak heap added to `wrap`. The same witness is proved masked
-/// under format 39 as well ([`masked_wrap`]).
+/// under format 39 as well ([`masked_wrap`]): its bytes, the fixed layout.
 pub fn wrap_root(
     name: &str,
     program: &vos_pvm_proof::program_id::KernelProgram,
     root: &NodeRun,
     wrap: &mut Tally,
-) -> (Vec<u8>, [u32; vos_pvm_final_verifier::PUBLIC_WORDS]) {
+) -> (
+    Vec<u8>,
+    [u32; vos_pvm_final_verifier::PUBLIC_WORDS],
+    Vec<u8>,
+) {
     use vos_pvm_recair::wrap::{self, WrapCircuit};
 
     let circuit = WrapCircuit::get();
@@ -552,8 +556,8 @@ pub fn wrap_root(
     assert_eq!(verified, statement);
     assert_eq!(statement.program, program.id().0.map(|word| word.0));
     assert_eq!(statement.io_hash, root.node.output.io_hash);
-    masked_wrap(name, &finalized, &words);
-    (bytes, words)
+    let masked = masked_wrap(name, &finalized, &words);
+    (bytes, words, masked)
 }
 
 /// The process's peak resident set (`VmHWM`) in MiB, reset to the present
@@ -578,12 +582,12 @@ fn resident_peak_mib(reset: bool) -> u64 {
 /// bytes the fixed layout, and verified by the final verifier's masked
 /// verifier, its preprocessed root format 39's (pin A): its proving time and
 /// R1's printed with the load average, and its bytes written for the Wasm
-/// harness as `wrap/<name>-39.{proof,format,words}`.
+/// harness as `wrap/<name>-39.{proof,format,words}`: the bytes.
 fn masked_wrap(
     name: &str,
     finalized: &vos_pvm_recair::Finalized<stwo::core::fields::qm31::SecureField>,
     words: &[u32; vos_pvm_final_verifier::PUBLIC_WORDS],
-) {
+) -> Vec<u8> {
     use stwo::core::vcs::blake2b_hash::Blake2bHash;
     use vos_pvm_final_verifier::masked;
     use vos_pvm_recair::masked::MaskRng;
@@ -620,6 +624,7 @@ fn masked_wrap(
     let verified = masked::verify_bytes(&bytes, words).expect("the masked wrap verifies");
     assert_eq!(verified.words(), *words);
     write_wrap_files(&format!("{name}-39"), masked::FORMAT, &bytes, words);
+    bytes
 }
 
 /// A wrap's proof, its format (a little-endian `u32`) and its public words

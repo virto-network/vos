@@ -11,6 +11,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "balance"
+version = "0.1.0"
+dependencies = [
+ "vos-sdk",
+ "vos-tree",
+]
+
+[[package]]
 name = "blake2"
 version = "0.10.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,208 +1,227 @@
-//! An actor that states settlement windows: its attestable method checks a
-//! space's pseudo-account rows against the committed-map roots of a window's
-//! two anchors, by a vos-tree multiproof each, checked from its encoding as
-//! it is read (`vos_tree::verify_encoded`), then runs
-//! `cipher_clerk::settlement::window` over them. The kernel derived from it
-//! is what a proof of a window proves.
+//! An actor that states settlement windows with a peer space, under a
+//! carried commitment: the space's pseudo-account rows with the peer in a
+//! currency are cumulative, so what it owes the peer since its last
+//! settlement is how much more its `outgoing_to(peer)` rows grew than its
+//! `incoming_from(peer)` rows since then. The venue's handler keeps, per
+//! pair and currency, a commitment `c` to the cumulative sums the last
+//! settlement reached ([`commitment`]); a statement opens it privately,
+//! reads the current rows at one window's cut, and states the net since,
+//! the pair's next sequence number and the commitment to the new sums.
 //!
-//! A row is the account's in the space's committed map [`ACCOUNTS`] of
-//! hashed keys: its key in the agent's tree is the map's committed row,
-//! `0x03 ‖ instance ‖ tag ‖ transform ‖ hashed(id)` (`vos_sdk::keys::row`),
-//! and its value is cipher-clerk's encoding of the account. The tree
-//! hashes through the BLAKE2b compression precompile; cipher-clerk derives
-//! the pseudo-accounts' ids with the `blake2` crate.
+//! The kernel's public arguments are the reader's `(agent, instance)`, the
+//! peer, the currency and `c_prev`; the sums `c_prev` commits to, its salt
+//! and the next commitment's salt are private; its root is the space's
+//! root at the cut, and its output `(net, seq, c_new)` names no anchor.
+//!
+//! `cipher_clerk::settlement::window` takes two anchors and reads at both;
+//! this kernel nets the delta itself, as the Clerk's own window will once it
+//! takes one cut and a carried state.
 
 #![no_std]
 
 extern crate alloc;
 
-use alloc::vec;
-use alloc::vec::Vec;
-
 use cipher_clerk::codec;
+use cipher_clerk::conventions::{Flow, PseudoAccount};
+use cipher_clerk::ids::JournalId;
 use cipher_clerk::kernel::Value;
-use cipher_clerk::settlement::{Anchor, NetFlow, Reads};
-use cipher_clerk::types::Account;
-use vos_sdk::abi::Rows;
-use vos_sdk::keys::{self, Transform};
+use cipher_clerk::types::{Account, Layer};
 use vos_sdk::prelude::*;
-use vos_tree::{Blake2b, Hash, Salt};
+use vos_tree::{Blake2b, Hasher};
 
-/// A value does not decode.
-pub const MALFORMED: u8 = 1;
-/// The rows are not in strictly increasing key order.
-pub const UNORDERED: u8 = 2;
-/// The proof at the first anchor refuses the rows.
-pub const REFUSED_I: u8 = 3;
-/// The proof at the second anchor refuses the rows.
-pub const REFUSED_J: u8 = 4;
-/// `window` refused the rows: this plus its error's index.
-pub const WINDOW: u8 = 16;
+/// The commitment's domain.
+pub const COMMITMENT_DOMAIN: &[u8] = b"vos/test/window/pair";
 
-/// The space's accounts: the committed map of hashed keys, tag 1, of the
-/// agent's instance 0, which the rows are read from. It stands in for the
-/// map an attestable `&self` view names from its struct's field.
-pub const ACCOUNTS: (InstanceId, Rows) = (
-    InstanceId(0),
-    Rows::Committed {
-        tag: 1,
-        transform: Transform::Hashed,
-    },
-);
-
-/// A row as a version of the tree holds it: its leaf's salt and its value.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Read {
-    pub salt: Salt,
-    pub value: Vec<u8>,
+/// A pair's cumulative sums at its last settlement, as its commitment
+/// opens: the commitment's salt, the sums of its outgoing and its incoming
+/// rows' settled nets, and the settlement's sequence number.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct Carried {
+    pub salt: [u8; 16],
+    pub sent: i128,
+    pub received: i128,
+    pub seq: u64,
 }
 
-/// One pseudo-account's rows at the window's anchors: at the first unless
-/// the account was created inside the window, and at the second. Rows come
-/// in their keys' order.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct Row {
-    pub at_i: Option<Read>,
-    pub at_j: Read,
+/// A window's statement: what the space owes the peer since the last
+/// settlement, net (negative when it is owed), the settlement's sequence
+/// number, and the commitment to the sums it reached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Settlement {
+    pub net: i128,
+    pub seq: u64,
+    pub c_new: [u8; 32],
+}
+
+/// `BLAKE2b-256(COMMITMENT_DOMAIN ‖ peer ‖ currency ‖ salt ‖ sent ‖
+/// received ‖ seq)`, the integers little-endian: the pair's state, bound to
+/// the pair, hidden by its salt. A pair's first settlement opens the
+/// commitment to `Carried::default()`.
+pub fn commitment(peer: &[u8; 32], currency: u32, carried: &Carried) -> [u8; 32] {
+    Blake2b.hash(
+        COMMITMENT_DOMAIN,
+        &[
+            peer,
+            &currency.to_le_bytes(),
+            &carried.salt,
+            &carried.sent.to_le_bytes(),
+            &carried.received.to_le_bytes(),
+            &carried.seq.to_le_bytes(),
+        ],
+    )
+}
+
+/// The pseudo-accounts `journals` keep with `peer` in `currency`: each
+/// journal's outgoing and incoming account.
+pub fn pseudo_accounts(
+    journals: &[[u8; 16]],
+    peer: &[u8; 32],
+    currency: u32,
+) -> impl Iterator<Item = PseudoAccount> {
+    journals.iter().flat_map(move |journal| {
+        let journal = JournalId(*journal);
+        [
+            PseudoAccount::outgoing_to(journal, *peer, currency),
+            PseudoAccount::incoming_from(journal, *peer, currency),
+        ]
+    })
 }
 
 #[actor]
 pub struct Window {
-    statements: u64,
+    /// The space's accounts, cipher-clerk's encoding, by their ids.
+    accounts: CommittedMap<[u8; 16], Vec<u8>>,
 }
 
 #[messages]
 impl Window {
     pub fn new() -> Self {
-        Self { statements: 0 }
-    }
-
-    /// Attest the window over the witnessed rows: the kernel's output.
-    #[msg(gas = 100_000_000)]
-    #[allow(clippy::too_many_arguments)]
-    pub async fn state(
-        &mut self,
-        ctx: &mut Command<Self>,
-        space: [u8; 32],
-        window_i: u64,
-        root_i: [u8; 32],
-        window_j: u64,
-        root_j: [u8; 32],
-        rows: Vec<Row>,
-        proof_i: Vec<u8>,
-        proof_j: Vec<u8>,
-    ) -> Vec<u8> {
-        let output = ctx
-            .attest(window::Settle {
-                space,
-                window_i,
-                root_i,
-                window_j,
-                root_j,
-                rows,
-                proof_i,
-                proof_j,
-            })
-            .await
-            .unwrap_or_default();
-        self.statements += 1;
-        output
-    }
-
-    /// The window statement over the rows, each anchor's proof a
-    /// `vos_tree::BatchProof`'s encoding: a status byte, `0` followed by the
-    /// `NetFlow`'s encoding, or why there is none.
-    #[attestable]
-    #[allow(clippy::too_many_arguments)]
-    pub fn settle(
-        space: [u8; 32],
-        window_i: u64,
-        root_i: [u8; 32],
-        window_j: u64,
-        root_j: [u8; 32],
-        rows: Vec<Row>,
-        proof_i: Vec<u8>,
-        proof_j: Vec<u8>,
-    ) -> Vec<u8> {
-        let anchor_i = Anchor {
-            window: window_i,
-            root: root_i,
-        };
-        let anchor_j = Anchor {
-            window: window_j,
-            root: root_j,
-        };
-        match statement(space, anchor_i, anchor_j, &rows, &proof_i, &proof_j) {
-            Ok(flow) => {
-                let mut out = vec![0];
-                out.extend_from_slice(&codec::to_bytes(&flow));
-                out
-            }
-            Err(status) => vec![status],
+        Self {
+            accounts: CommittedMap::default(),
         }
     }
-}
 
-/// A read's account, and the claim its key's leaf makes: the commitment
-/// to its value under its salt.
-fn account(read: &Read) -> Result<(Account<Value>, Hash), u8> {
-    let account = codec::from_bytes::<Account<Value>>(&read.value).ok_or(MALFORMED)?;
-    Ok((
-        account,
-        vos_tree::value_hash(&Blake2b, &read.salt, &read.value),
-    ))
-}
+    /// Put each account, cipher-clerk's encoding, under its id.
+    #[msg(gas = 100_000_000)]
+    pub async fn put(&mut self, accounts: Vec<Vec<u8>>) -> u32 {
+        for bytes in &accounts {
+            let account = codec::from_bytes::<Account<Value>>(bytes).expect("an account");
+            self.accounts.insert(&account.id.0, bytes);
+        }
+        accounts.len() as u32
+    }
 
-/// The window statement over the rows, each checked against its anchor's
-/// root: present at the second anchor, and at the first, or absent there.
-fn statement(
-    space: [u8; 32],
-    anchor_i: Anchor,
-    anchor_j: Anchor,
-    rows: &[Row],
-    proof_i: &[u8],
-    proof_j: &[u8],
-) -> Result<NetFlow, u8> {
-    let mut keys = Vec::with_capacity(rows.len());
-    let mut commitments = Vec::with_capacity(rows.len());
-    let mut reads = Vec::with_capacity(rows.len());
-    for row in rows {
-        let (at_j, commitment_j) = account(&row.at_j)?;
-        let (at_i, commitment_i) = match &row.at_i {
-            Some(read) => {
-                let (at_i, commitment_i) = account(read)?;
-                (Some(at_i), Some(commitment_i))
+    /// The window with `peer` in `currency` since the settlement `c_prev`
+    /// commits to, at the cut of the window it asks in: both pseudo-accounts
+    /// of each of `journals` read.
+    #[workflow(gas = 100_000_000)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn settle_at_cut(
+        ctx: &mut Workflow<Self>,
+        peer: [u8; 32],
+        currency: u32,
+        c_prev: [u8; 32],
+        carried: Carried,
+        salt: [u8; 16],
+        journals: Vec<[u8; 16]>,
+    ) -> Result<Settlement, AttestError> {
+        let ids: Vec<[u8; 16]> = pseudo_accounts(&journals, &peer, currency)
+            .map(|pseudo| pseudo.id().0)
+            .collect();
+        ctx.attest_at_cut(window::Settle {
+            peer,
+            currency,
+            c_prev,
+            carried,
+            salt,
+            journals,
+        })
+        .reads(|window: &Window| ids.iter().map(|id| window.accounts.read(id)).collect())
+        .await
+    }
+
+    /// `settle_at_cut`, its read naming the accounts `reads` alone.
+    #[workflow(gas = 100_000_000)]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn settle_reading(
+        ctx: &mut Workflow<Self>,
+        peer: [u8; 32],
+        currency: u32,
+        c_prev: [u8; 32],
+        carried: Carried,
+        salt: [u8; 16],
+        journals: Vec<[u8; 16]>,
+        reads: Vec<[u8; 16]>,
+    ) -> Result<Settlement, AttestError> {
+        ctx.attest_at_cut(window::Settle {
+            peer,
+            currency,
+            c_prev,
+            carried,
+            salt,
+            journals,
+        })
+        .reads(|window: &Window| reads.iter().map(|id| window.accounts.read(id)).collect())
+        .await
+    }
+
+    /// The settlement with `peer` in `currency` since `c_prev`: `carried`
+    /// opens it, and each of `journals`, strictly increasing, is read for
+    /// its two pseudo-accounts, an absent one counting nothing. Its rows'
+    /// settled nets summed are the new cumulative sums; the net is the
+    /// outgoing sum's growth less the incoming's; `c_new` commits to the
+    /// new sums under `salt` at the next sequence number. A `carried` that
+    /// does not open `c_prev`, journals out of order, or a row that is not
+    /// the pseudo-account its key names trap.
+    #[attestable(gas = 50_000_000)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn settle(
+        &self,
+        #[public] peer: [u8; 32],
+        #[public] currency: u32,
+        #[public] c_prev: [u8; 32],
+        carried: Carried,
+        salt: [u8; 16],
+        journals: Vec<[u8; 16]>,
+    ) -> Settlement {
+        assert!(
+            commitment(&peer, currency, &carried) == c_prev,
+            "the carried state opens c_prev"
+        );
+        assert!(
+            journals.windows(2).all(|pair| pair[0] < pair[1]),
+            "journals strictly increasing"
+        );
+        let (mut sent, mut received) = (0i128, 0i128);
+        for pseudo in pseudo_accounts(&journals, &peer, currency) {
+            let Some(bytes) = self.accounts.get(&pseudo.id().0) else {
+                continue;
+            };
+            let account = codec::from_bytes::<Account<Value>>(&bytes).expect("an account");
+            assert!(
+                PseudoAccount::of(&account) == Some(pseudo),
+                "the pseudo-account its key names"
+            );
+            let net = account.net(Layer::Settled);
+            match pseudo.flow {
+                Flow::Outgoing => sent += net,
+                Flow::Incoming => received += net,
             }
-            None => (None, None),
-        };
-        let (instance, rows) = ACCOUNTS;
-        keys.push(keys::row(instance, rows, &at_j.id.0).map_err(|_| MALFORMED)?);
-        commitments.push((commitment_i, commitment_j));
-        reads.push(Reads { at_i, at_j });
+        }
+        let seq = carried.seq.checked_add(1).expect("a next sequence number");
+        Settlement {
+            net: (sent - carried.sent) - (received - carried.received),
+            seq,
+            c_new: commitment(
+                &peer,
+                currency,
+                &Carried {
+                    salt,
+                    sent,
+                    received,
+                    seq,
+                },
+            ),
+        }
     }
-    if !keys.windows(2).all(|pair| pair[0] < pair[1]) {
-        return Err(UNORDERED);
-    }
-    let claims = |at: fn(&(Option<Hash>, Hash)) -> Option<Hash>| -> Vec<(&[u8], Option<Hash>)> {
-        keys.iter()
-            .zip(&commitments)
-            .map(|(key, commitment)| (key.as_slice(), at(commitment)))
-            .collect()
-    };
-    vos_tree::verify_encoded(
-        &Blake2b,
-        proof_i,
-        &anchor_i.root,
-        &claims(|(at_i, _)| *at_i),
-    )
-    .map_err(|_| REFUSED_I)?;
-    vos_tree::verify_encoded(
-        &Blake2b,
-        proof_j,
-        &anchor_j.root,
-        &claims(|(_, at_j)| Some(*at_j)),
-    )
-    .map_err(|_| REFUSED_J)?;
-    cipher_clerk::settlement::window(space, anchor_i, anchor_j, &reads)
-        .map_err(|error| WINDOW + error as u8)
 }
