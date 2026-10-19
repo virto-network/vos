@@ -1032,7 +1032,10 @@ lands.
   kernels or decode in place, measured with 6.18. An agent of no space
   refuses `attest_at_cut` at request time (`AttestError::NoSpace`), so a
   spaceless node's statements are rootless by construction (6.10's
-  review).
+  review). A program id's leaf-circuit hashes are computed in the prover
+  role, over a wiring the relation alone does not check (6.8's second
+  yield): an id is trusted only as recomputed from the blob, never as
+  submitted (6.8's review).
 - **Tests:** existing rootless attestables unchanged; a `&self` read
   accepted; a key outside the read set traps; a tampered row, a wrong
   agent root, a wrong window, a missing representative row, a row of
@@ -1312,7 +1315,11 @@ fees are the teammate's.
   kernel, the predicate and `balance`, `H_fold`, and the wrap's roots (28
   and 39) as repository constants, recomputed in `test-proof` under both
   feature sets and, through the `program-id` tool, on aarch64 (`just
-  repro-aarch64`, under qemu-user or an ARM host).
+  repro-aarch64`, under qemu-user or an ARM host). It pins the known
+  programs' constants; it does not make a submitted id trustworthy: a
+  venue or installer trusts an id only by recomputing it from the blob
+  (6.8's review: an id computed over an unchecked wiring is a malicious
+  verifying key for that id).
 - **Tests:** a restart mid-proof leaves one proof; a duplicate submission
   is accepted once; a leader change; a dead statement skipped; an io-hash
   mismatch refused.

@@ -696,3 +696,235 @@ check` green (1,123 tests, 0 failed).
 this record and the plan's edits.
 
 **6.2 accepted.**
+
+## Step 6.8: the recursion AIR's forgery gates
+
+**Built** on `s6/forgery` (from `27967322`): a new test binary,
+`pvm/proof/recair/tests/gates/`, each gate a malicious prover.
+
+**The malicious prover** (`gates/forge.rs`): a copy of `prove_on` that
+skips `check_wiring` and Stwo's closing `ConstraintsNotSatisfied` check (a
+copy of the pinned `prove_ex` without the comparison, every piece public
+in the fork; its doc says to re-check it when the pin moves), and states
+any outputs and, optionally, any claimed sums. Helpers: `balance` (every
+use carries its yield's value), `settle` (balance, then recompute every
+`qm31` row whose output is a yield, to a fixpoint: no `h8` fixpoint, said
+in its doc), `rewrite_input` (a `p2` row's permutation over a chosen
+input), `force_output`. The refusals by name: `LOGUP` (the claimed sums
+and the public terms do not add to zero), `DEEP_ALI` (Stwo's
+`OodsNotMatching`), `ANOTHER_CIRCUIT` (the proof is of another circuit).
+The control: the forger proves honest traces that verify.
+
+**The gates (20 tests):**
+- **`p2`'s modes and chaining** (`p2_modes.rs`): a circuit ending in each
+  mode, its last row computed by each other mode's rule (40 of 42 pairs
+  differ), a leaf's second block continued from another leaf's row, a leaf
+  restarted midway, an absorption chained from the zero digest, a Merkle
+  node over another child or in the order its bit does not pick: each
+  balanced, each `DEEP_ALI`. The forger's mode model equals the AIR's on
+  every honest row.
+- **The signed multiplicities, R12** (`multiplicities.rs`): a use carrying
+  another value → `LOGUP` (`DEEP_ALI` with the claimed sum moved); an
+  output added (the wire's own value too) or dropped → `LOGUP`; a yield
+  consumed once more: `check_wiring`'s `Unbalanced`, its proof
+  `ANOTHER_CIRCUIT`, `LOGUP` under its own hash; a second yield, balanced:
+  `YieldedTwice`, `ANOTHER_CIRCUIT`, and accepted under its own hash
+  (asserted). The plan's "negative multiplicity" is this gate: a
+  multiplicity is preprocessed, so its only form is a use turned yield.
+  The relation sees multiplicities, not yields; §1.1's design (the single
+  yield per address is static, the circuit hash pins the wiring) refuses
+  it, because every pinned hash comes through `check_wiring`.
+- **`assert_one_of`** (`one_of.rs`): a small circuit (3 candidates and an
+  empty slot): a hash outside the set with a bit on each candidate, no bit,
+  two bits, ½ on two → `LOGUP` as built, `DEEP_ALI` balanced; the fold,
+  a child claiming a slot its program does not hold → `["fold: circuit"]`,
+  `LOGUP` / `DEEP_ALI` against `H_fold`; the wrap's → exactly
+  `["wrap: circuit"]` (not proved: the forger is `P2`-channel, the wrap
+  Blake2b).
+- **The lanes** (`lanes.rs`): an unread lane set nonzero is accepted with
+  the honest statement (it states nothing); a circuit reading lane 1 is
+  refused at `finalize` (`UnreadLaneRead { lane: 1 }`); the window
+  kernel's leaf, a small kernel's leaf, the fold and the wrap finalize
+  (40 / 80 / 176 / 88 rows absorbing in part).
+- **The boundary bytes** (`boundary_bytes.rs`): `b + 256` at a byte of
+  every field outside φ9..12 and three aliases `(b + 256, b' − 1)`, 12
+  forgeries, the interaction PoW reground over the moved transcript →
+  `logup`, `oods` with the sums forged; proved → `LOGUP`; one balanced
+  leaf forgery (the φ0-out alias; its 40 query paths forced to one root) →
+  `DEEP_ALI`; under the proof's own challenges each alias misses the
+  claimed sums natively. "logup" here is the Fiat–Shamir binding as much
+  as the tuple (the module doc).
+- **The pins** (`pins.rs`): no source in the workspace calls
+  `preprocessed_columns(` or `circuit_hash(` (however imported) but
+  `prove.rs`, the definitions, the in-AIR child hash (`fold/{mod,child}.rs`)
+  and the forger.
+
+**In the compiler** (Fable 1, 2): `Circuit::check_reads`, run by
+`check_wiring` (so `circuit_commitment`, `prove_on` and `finalize_to`
+refuse): `UnreadLaneRead` (the lane audit, `Circuit::unread_lane_reads`),
+`FreeOperandRead` (a `qm31` operand of multiplicity 0 under a coefficient
+or λ) and `FreeMessageAbsorbed` (a `p2` message of multiplicity 0 with a
+nonzero `act` outside a Node row), at address 0 or at any address a wire
+holds; a guess read once stays admitted only at an address of its own.
+Only entries of nonzero multiplicity hold an address, public uses
+included: the re-review asked for "any multiplicity", which refused a
+valid `p2` row with no output use (its out addresses 0 and 1 stated, the
+`one` wire's row in an h8-only circuit). No production circuit changed;
+the test circuits that read unread lanes absorb whole wires. Also:
+`assert_one_of` moved to `gadgets` (`pub use` in `fold`), `Qm31Op::apply`
+and `reads` shared by the context, `compile/program.rs` and the forger.
+
+**Verdict:** no forgery accepted; M2 not stopped.
+
+**Cost [measured]:** the gates 20 tests, ≈74 s, 3.6 GiB peak, in `just
+check`.
+
+**Gates:** the stale-fixture test byte for byte (370 s, 4.0 GiB); recair
+circuit 26/26, gates 20/20, recursion 48/48; `just check` green at
+`b7740589` (1,130 passed), `e51d7081` (1,134) and `8ac8b135` (1,135), 0
+failed.
+
+**Commits:** `b7740589` the gates; `3d5efc86` the fold's sources and
+circuit tests, `e51d7081` its gates and docs; `8ac8b135` the re-review's
+fixes. Merged into `vos-core` as `17102cf5`, `recursion-air.md`'s §11
+conflict resolved: R12 6.8's text, R13 the measured masking costs.
+`b59435fb` at the merge: `pins.rs` matches whole identifiers, so Stwo's
+`new_with_preprocessed_columns` (the masked components' allocator) is not
+a caller.
+
+**Review:** Fable, accept after fixes (every refusal re-derived from the
+verifier's source, the gates re-run); Opus, cleanups. Folded:
+- **Fable 1, 2 (medium):** the lane audit and the two unchecked members of
+  the second-yield class moved into `check_wiring`, above; refusal tests
+  in `circuit/gate_vm.rs`.
+- **Fable 3 (low):** `pins.rs`, above.
+- **Fable 4 (low):** the balanced leaf forgery and the native tuple check,
+  above.
+- **Fable 5, 6, 7 (low):** the negative multiplicity named; the wrap's
+  `assert_one_of` gated; `settle`'s missing `h8` fixpoint noted.
+- **Opus:** R12's row rewritten; the forger's helpers
+  (`qm31`/`set_qm31`/`set_message_lane`, `add_another_x`, `H8_STARTS`,
+  no `Clone` on `Forgery`); `common::kernel::whole_run()` shared; `fields()`
+  asserts its end at `BOUNDARY_STATE_BYTES`.
+- **The re-check:** merge after two fixes, both in `8ac8b135`: a free read
+  at a used wire's address refused (`a_disguised_free_read_is_refused`),
+  with the deviation above; `pins.rs` matching `circuit_hash(` however
+  imported.
+
+**Carried:** to 6.13 / 6.18: a program id's leaf-circuit hashes are
+computed in the prover role; 6.18's gate pins the known constants, but a
+venue trusts a submitted id only by recomputing it from the blob (the
+second yield shows why: an id computed over an unchecked wiring is a
+malicious verifying key for that id). In the plan.
+
+**6.8 accepted.**
+
+## Step 6.10: `vos-anchor` and the space's genesis
+
+**Built** on `s6/roots` (from `423ec694`):
+- **`pvm/proof/anchor` (`vos-anchor`)**, no_std, `blake2` its one
+  dependency, SCALE by hand and canonical (`codec.rs` moved here from
+  `vos-statement`, public). Pin D's types: `SpaceGenesis` (a decode
+  refusing any version but 1, a non-shortest count, no node, numbers not
+  strictly ascending, a short or trailing input; its encoding writes
+  `GENESIS_VERSION`), `WindowClock` (`window`, `boundary`, `registrable`
+  120,000–3,600,000 ms, `representative`, `DEFAULT` origin 0 and 600,000
+  ms), `SpaceId` (`NONE`), `VenueId` (`jam`), `RootKind { Space = 0 }`
+  (every other byte `Noncanonical`), `RootRead`, `Anchor`, `Migrate`; the
+  digests `space_id`, `space_root` (`S_w`), `anchor_digest`,
+  `register_digest` (with `start_window`); the constants, among them
+  `MAX_FOUNDING_KEYS` (16). Feature `vectors`: the golden vectors.
+- **`vos-statement`** re-exports it, its own codec, `SpaceId`, `RootRead`
+  and `blake2` gone; a statement of an unknown root kind is refused at
+  decode (code 1 at every venue). `admit`'s space rule: a rooted statement
+  claims a space other than `NONE` (code 4; pin F's rule amended).
+- **`vos-pvm-precompiles`:** the kernel's own `RootKind` with its `u8`
+  wire form (the crate stays dependency-free); both kinds agree on all 256
+  bytes (a statement test).
+- **Wire and agent:** `vos-pvm-codec` feature `anchor`; `vos-wire`
+  re-exports; `CreationRecord.space`; `Admin::Install` gains `space` and
+  `clock`; `keys::space()` = `00 19`, `keys::clock()` = `00 1a`;
+  `Failure::Space = 14`, `Refused::Space`. The default agent writes target,
+  space and clock once, at the first install (a partial set is `Corrupt`),
+  and refuses a later install naming another space or clock before the
+  target check; the testkit's model the same.
+- **Node:** `<space file>.genesis` beside the space file (hex, written
+  once); `Space::{genesis, id, clock, found}`, its id cached; without a
+  genesis `SpaceId::NONE` and the default clock. `peer::check` refuses a
+  record naming another space (`Refusal::OtherSpace`).
+- **`vos space up --space <file> [--window-ms] [--origin-ms] [--data]`:**
+  founds the genesis of 1 to 16 listed nodes, refuses a non-registrable
+  length, an existing genesis and a founding node that holds an agent,
+  warns on an origin past the founding time, prints the id and the
+  founding procedure (found before the first agent, copy
+  `<space>.genesis` beside every node's space file, restart).
+- **Fixtures regenerated** (their roots were kind 1): the wrap proofs and
+  `statements.cases`; the segment fixtures byte-identical (142 s,
+  release [measured]).
+
+**Venues** (3 golden vectors: one founder at window 0; three founders at
+w 2,966,001 from 2,966,000; every integer at its top with 64 founders, a
+two-byte count): natively (and an independent Python recomputation at
+pinning); in Wasm (`just judge-wasm`, PVF and client semantics, a vector
+cut short refused; blob 311,263 B [measured]); in the PVM, `final-verify.elf`
+mode 2 on the JAM-only host (0.10M / 0.12M / 0.46M gas [measured]; ELF
+811,720 B). The 13 statement fixtures judged as recorded at every venue.
+
+**Pin D / `spaces-pallet.md`:** byte for byte, no disagreement.
+Under-specified in both: `NodeNumber`'s width inside `SCALE(genesis)`,
+now `pub type NodeNumber = u8` in Pin D.
+
+**Tests:** `vos-anchor` (14: encodings field by field, canonical decode,
+windows at their edges, registrable lengths, the representative's clock,
+unknown root kinds, every digest its preimage, no domain a prefix of
+another, migration, the golden vectors); the codec's encodings; the
+statement's (unknown kind, the kinds agree, a rooted `NONE` refused);
+precompiles; wire bytes; the testkit's
+`an_install_into_another_space_than_its_agents_is_refused` (VOS node and
+JAM-only host); node `a_space_keeps_its_genesis_beside_its_file`,
+`a_wrong_genesis_is_refused`, the peer refusals; cluster
+`an_agent_belongs_to_its_nodes_space` and a member founded under another
+genesis holding no replica; CLI `a_space_is_founded_once`, the founder
+bounds (0, 1, 16, 17), a founding node holding an agent.
+
+**Gates:** `just check` green at `6936e9cb` (1,134 passed, 0 failed; no_std
+`vos-anchor` for thumbv7em and wasm32) and at `9476dc13` (1,136 passed, 0
+failed); `just judge-wasm`; the stale-fixture test and
+`the_fixtures_are_judged` (fixtures unchanged by the fold).
+
+**Commits:** `ca8fbb14` `vos-anchor`, `vos-statement`, precompiles, the
+venues' harnesses, the fixtures, `proving.md` §3.6; `6936e9cb` the genesis
+(codec, wire, default agent, testkit, node, `vos space up`); `9476dc13`
+the fold. Merged into `vos-core` as `85c1853b`.
+
+**Review:** Fable ACCEPT with fixes (all 15 golden digests recomputed
+independently, every preimage and encoding agreeing with Pin D and
+`spaces-pallet.md`); Opus, sound with findings. Folded in `9476dc13`:
+- **Fable 1:** a rooted statement claiming `NONE` refused as `Space`,
+  above.
+- **Fable 2:** `peer::check` and `Refusal::OtherSpace`, above.
+- **Fable 3, Opus 2:** `space up --data` and the founding procedure in
+  Pin D, the help, the output and `space.rs`'s doc; write-once kept, no
+  adoption from `NONE`.
+- **Fable 4, 5:** founders 1 to 16 and `NodeNumber = u8` pinned in Pin D
+  (the 64-founder vector stays: it pins the encoding).
+- **Fable 8, 9:** `GENESIS_VERSION` written; the origin warning;
+  `with_genesis`'s doc.
+- **Opus:** the genesis decode's refusals, above; `hex` in `space.rs`;
+  `space up`'s duplicate check dropped (`create_new` refuses);
+  `WindowClock::DEFAULT` (the testkit, the node, the JAM testnet);
+  `Inner::space_and_clock`; `SpaceGenesis::id` removed for `space_id`;
+  docs.
+
+**Carried** (in the plan): 6.12 / 6.13: an agent of no space runs no cuts
+and refuses `attest_at_cut` (`AttestError::NoSpace`); witness builders
+serve target, space and clock together. 6.15: a code-4 fixture (a rooted
+statement claiming `NONE`) at the next regeneration. 6.16: the founder
+bound 1 to 16 and `NodeNumber` `u8` into `spaces-pallet.md` §3. 6.19: the
+service carries no test mode of `final-verify.elf` (mode 2 reports
+`ACCEPT` with no statement), or accumulate requires `code == 0`.
+
+**6.10 accepted.**
+
+**`just check` after both merges** (at `85c1853b`): green, 1,168 passed,
+0 failed.
