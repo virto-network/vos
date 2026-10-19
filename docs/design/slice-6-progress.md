@@ -1263,6 +1263,102 @@ green (95 test binaries, 1,215 tests over both stages). `just judge-wasm`:
 
 **6.5 accepted.**
 
+## Step 6.6: the masking's gates
+
+Branch `s6/gates` (from `vos-core` `4e4b168d`). The full record is the
+step's log; the transcript note for Fable, pin B step by step with R1–R4,
+`6.6-transcript.md`.
+
+**Built:**
+- `masked::prove_masked_unchecked` (under `seeded-masks` only): the prover
+  without its out-of-domain check, so a test hands the verifier a forced
+  proof; `check-no-seeded-masks` covers it. `MaskStats::classes`, the
+  column classes R1 checked. Feature `heavy-gates` (no code) for the
+  full-N tests, which `just test-proof` runs.
+- The tests (`recair/tests/circuit/masked_gates.rs`, `circuit/leakage.rs`,
+  `common/leakage.rs`, `recursion/masked.rs`); what 6.2–6.4 held (S1, S4,
+  S5, S7, S10) reused, not duplicated.
+- `+unaligned-scalar-mem` in `riscv64em-vos.json`: the JAM refine
+  program's ELF 962,768 → 906,904 B, every JAM-host test green on it.
+- A `test-proof` failure from before fixed: the registry's round-trip test
+  admits 39.
+
+**Soundness gates** [measured]:
+- **S2:** the small format at `[8,8,8]` … `[12,12,12]` and three mixed
+  sizes, on Blake2b-256 and Poseidon2-M31, all verify, R1 in one attempt;
+  `[17,15,12]` on both channels under `heavy-gates`.
+- **S3:** `p2`, `qm31` and `h8` tampered at rows 0 and N−1 and across the
+  wrap row: the prover refuses, the forced proof is refused by
+  `OodsNotMatching`.
+- **S6:** a verifier laying the preprocessed columns at `n` refuses a
+  proof committed at `n+1`, no panic.
+- **S8:** an unbalanced `qm31` relation refused by the logup total; with
+  `b_0` set to cancel it, refused by the prover and, forced, by
+  `OodsNotMatching`.
+- **S9:** 80 malformed shapes (75 of the proof, 5 of the claim; the step
+  commit's message says 87): every one an error, none a panic.
+
+**Leakage gates** [measured] (α 10^-3 over the four statistical tests,
+Bonferroni within each):
+- **R1** on every class, both channels, every size: the classes equal those
+  the sample points define (2 uniform, 6 mixed and the wrap).
+- **Witness indistinguishability:** a private-witness circuit, small N = 64
+  (7,546 hypotheses) and N = 2,000 (`heavy-gates`, 6,000 proofs), smallest
+  p 2.4e-4 and 2.7e-4; the real wrap, N = 32, one-segment roots under
+  kernels 6,000 and 6,001 (a deviation: their public words differ in the
+  program id), 15,161 hypotheses, smallest 1.7e-3; 0 refused each. The
+  unmasked control: 3,159 of 3,441 and 10,936 of 11,685 refused.
+- **Uniformity:** 0 refused at every size; hidden states: none of 26
+  needles found in the fixed layout, postcard or public words (all but the
+  halves and the arguments' hash found in the unmasked postcard); fresh
+  randomness: no opening shared between two proofs, of one witness or one
+  seed; the claimed sums' control; the varying shape each proof's coins'.
+- **Power** [est]: regression guards for gross leaks, not evidence of zero
+  knowledge (R1 on every proof is the argument): at N = 2,000 a spread leak
+  of total variation 0.133 (90%), a concentrated one 0.081.
+
+**The verify gates** [measured], the one-segment masked wrap at 12 seeds,
+each on the JAM-only host and by the Wasm blob under the PVF's semantics:
+
+| build | decode max | verify max | Wasm (PVF) max |
+|---|---|---|---|
+| `+e,+m` | 3,753,586 | 107,205,040 | 47,953,712 |
+| `+unaligned-scalar-mem` | 1,854,534 | 88,841,110 | (same blob) |
+
+On this hybrid CPU a thread on an E-core counts nothing on the P-core PMU;
+the runner is held to the performance cores.
+
+**Commits:** `03be35ce` (the gates), `cde8d399` (the unaligned loads),
+`c743e6ee` (the round-trip test). `just check` green (1,206, 0 failed);
+`just test-proof` green (550, 0 failed).
+
+**The review** (Opus), folded in `edb9729d`:
+- χ² at 4 buckets for 64 values or fewer a side, the one-sample test exact
+  there (a multinomial DP over Σ o²), the two-sample test's rate simulated
+  below nominal; the real wrap's uniformity over both witnesses (30,320
+  hypotheses); power restated in `SECURITY.md`;
+- S3's forced proofs refused by `OodsNotMatching` alone: `qm31` broken on
+  padding rows turned to both ends, the wrap row's permutation recomputed
+  from another input (the second wrap case dropped);
+- the Wasm runner holds itself to the performance cores
+  (`sched_setaffinity`) and compiles for `x86_64-unknown-linux-gnu` at
+  x86-64-v3, its flags in `RESULT` (`isa=`): counts equal the host's
+  (47,953,714 on seed 9; 48,560,787 at v2);
+- **the Wasm margin:** the host allocator's 10,632–10,644
+  malloc/free calls a verify cost 10.5M instructions (21.9%: an in-guest
+  bump allocator, built apart, gives 47.95M → 37.45M on seed 9); the
+  verify gates asserted at the worst shape along the seeds' fit (2,768
+  witness hashes: 1,732 trace, 1,036 FRI): **Wasm 49,617,103** of 50M,
+  decode 1,871,887, verify 91,910,997 [est, extrapolated; asserted].
+
+**After the fold** [measured]: `just check` green (1,206, 0 failed); the
+heavy tests unchanged in verdict (wrap N = 32 at 4 buckets: smallest p
+1.1e-4 and 4.5e-6, 0 refused; the unmasked control 8,764 of 11,685
+refused). **Merged** into `vos-core` as `8e0dc742`; `just check` after
+the merge with 6.7: green, 1,228 passed.
+
+**6.6 accepted.**
+
 ## Step 6.7: panic-freedom by construction, and fuzzing in CI
 
 **The lints** (`vos-pvm-final-verifier`, `vos-statement`, `vos-anchor`):
@@ -1953,6 +2049,86 @@ Commits: `802ccc36` (the step), `2d0db7fc` (the fold).
 both kept. `just check` after the merge: green, 1,192 passed.
 
 **6.11 accepted.**
+
+## Step 6.12: window cuts and the held build
+
+Worktree `.worktrees/s6-roots`, branch `s6/roots`. The full record is the
+step's log. The tests first (`60eb3583`, brief `6.12-tests.md`), reviewed
+by Fable: READY TO BUILD TO (`6.12-tests-fable.md`), its 13 decisions and
+§5's test fixes followed.
+
+**Built:**
+- **The shared apply, both hosts** (`agent/wire/src/apply.rs`): the
+  agent's record (target, space, clock) read from the state before the
+  result's steps; a record stored in part, or one that does not decode,
+  applies nothing; in an agent of a space, `cut(w)` = the version before
+  the result for each w with `p < B_w ≤ t` (p the batch-time mark), by
+  arithmetic, at most the newest `MAX_CUTS` = 32. The install cuts nothing.
+- **`roots/cuts.rs`:** `CutProof` (rows, salts, values, root, version, the
+  proof's encoding), node-local undo rows (`undo(w, row)` = a committed
+  row's stored bytes when the writes touch it at a version ≤ a pending
+  cut), `at_cut`, `finish` (the root at the cut, the two latest kept, the
+  window's undo rows dropped, each pending request's proof off the tree as
+  the last batch leaves it); orphaned undo rows swept.
+- **`Build`** targets the earliest pending cut, else the latest version;
+  a cut already built is finished alone; a cut behind `built` is
+  `Corrupt`. The builder builds until nothing is due; cut rows wake it.
+- **The node's apply** writes undo rows on the applier's snapshot, only
+  when the result applied, never in the dry run.
+- **The leader** (`leader/cut.rs`): `cut_wait` to the first boundary after
+  an idle agent's mark; the marker, an empty `WorkResult` at the agent's
+  version timed by the leader's own clock, proposed through `execute`.
+- **JAM:** the record witnessed whole whenever the simulation read any of
+  it. The `cuts` feature gone: every cut test runs in `just check`.
+- **Docs:** Pin D's `cut(w)` row, Pin E's re-cut, 6.12–6.14 in the plan,
+  `core-model.md` §9.3.
+
+**Deviation** (judged required by Fable): the request hook's step is an
+`InputRef::Due` step, not `Admin`: `settle` pairs a result's non-due steps
+with the batch's inputs in order, so an `Admin` step would answer an
+uncovered input. A test seam; 6.13 deleted it.
+
+**Gates** [measured]: `just check` green, 96 suites, 1,186 tests; the
+checker loop (seeds 6121–6123 × the three exactly-once tests and the cuts
+run through all faults, 2-s windows) 12 of 12 green, 101–135 cuts an
+agent; `cut_crash` 12 rounds, 7 killed between a cut and its proofs, all
+resumed. The benches (load 12–14): a committed write with a cut pending
+5.85–6.71 µs against the 8.6 µs gate; a cut's build with 100 proofs
+382–412 ms against 1 s (1,175 ms behind 100 un-compacted builds: a known
+sensitivity, not a gate failure).
+
+**Commits:** `2c99857e` (the step), `cd784524` (the bench's phases).
+
+**The reviews:** Fable ACCEPT (`6.12-fable.md`: no protocol or
+determinism defect, nine findings, none blocking); Opus: no correctness
+defect, quality findings. **The fold** (`59eb975b`):
+- Fable 1: `cuts::finish` skips and logs a request that does not decode or
+  names no committed value row, the same on every replica, so the cut's
+  root and the other proofs land; the plan's 6.13 validates
+  `PendingRead.rows`;
+- Fable 2–4, 8, 9: the pruning rule, the catch-up cap, `Woke::Built` and
+  the cut leaves on JAM carried in the plan (6.14, 6.19); the
+  leader-change test waits for equal agent roots; §9.3's node-local rule;
+- Opus: the hook asked first and the output re-encoded only on `Some`; the
+  served cuts run tours workflows only under `CUTS_FULL`; a marker applied
+  as no writes backs off, `Leader::ended_by` shared; the cut and undo key
+  parsers pinned; `committed_value` deleted.
+
+**After the fold:** `just check` green, 1,187 tests; the checker with
+`CUTS_FULL` 12 of 12 in 733 s (117–142 cuts an agent).
+
+**Merged** into `vos-core` as `d991efd3`. `just check` after the merge
+failed once in `cuts::an_idle_agents_leader_appends_one_marker_at_its_own_clock`
+("one result appended: []"): the test read the log through the node's
+count of applied entries, which moves only once the apply's commit
+returns, and two-minute windows let a slow start pass a boundary. Fixed
+in `0c82a3c5` (merged as `4213c513`): the applied index read from the
+snapshot that commits the cut, windows of an hour with `B_0` most of an
+hour off; starved on one core, 13 of 15 and 12 of 12 failures before, 0 of
+12 after. 6.13's fold (merged in `2276ed9a`) has the test wait for the
+marker's result as for its cut.
+
+**6.12 accepted.**
 
 ## Step 6.13: `&self` attestables and the public-input model
 
