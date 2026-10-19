@@ -901,6 +901,122 @@ load still not quiet.
 
 **6.3 accepted.**
 
+## Step 6.4: the masked final verifier and the fixed-layout decode
+
+**The verifier** (`pvm/proof/final-verifier/src/`, no_std):
+- `masked.rs`: `verify_masked::<MC, C>(format, claim, layout, proof)` over
+  any masked component set and Merkle channel, pin B's transcript on
+  `CommitmentSchemeVerifier::{commit, verify_values}` (`replay` up to the
+  DEEP coefficients, which the prover's tests reuse); `MaskedFormat`, every
+  pin the format's (number, configuration and batching, interaction PoW,
+  salts, `R`, `h`, log sizes, the trees' widths, the DEEP values), none read
+  from the proof; `verify`/`verify_with` the wrap's on Blake2b-256;
+- **before any Stwo call:** the proof's log sizes and configuration the
+  format's (`Format`), before the set is built at them; the set's trees the
+  format's widths 57 / 381 / 48 / 20; `check_shape`: four trees of
+  commitments, decommitments, sampled and queried values, each tree's
+  sampled and queried columns its width, every column's samples one a
+  sample point (the composition tree's 4 coordinates and `R`'s 8 one each,
+  its salts none), FRI's inner layers its rounds after the first, the last
+  layer `2^6`, every limb canonical; then the circuit (the preprocessed
+  root `PREPROCESSED_ROOT_39`);
+- **the shape tied to the transcript:** the DEEP values of the verifier's
+  own sample points at `z` checked equal to 538 (`DEEP_VALUES`);
+- **the trust boundary, named** in the module's doc: the trees' widths
+  `verify_values` zips (pinned, held by `check_shape` first) and the FRI
+  rounds `FriVerifier::commit` derives from the largest column
+  (`FRI_ROUNDS` `[3, 3, 3, 2]`, `fri_rounds` deriving them as commit does);
+- `unmasked.rs`: format 28, moved whole, under the `test-formats` feature
+  (postcard optional with it); its decode now reads the format word first
+  (`Format` on another);
+- **dispatch by the statement's format:** `decode(format, accepted, bytes)`
+  then `Decoded::verify(words)`, `verify(format, accepted, bytes, words)`;
+  a format outside the set or not linked (`LINKED`: `[39]`, `[28, 39]` under
+  `test-formats`) is `Format`; never sniffed;
+- `layout.rs`, **format 39's bytes:** fixed order, little-endian, `u32`
+  counts, no varints; the header (format first, then log sizes and the
+  configuration word for word) the format's or `Format`; every count its
+  pin (4 trees, the widths, 3 inner layers, 64 last-layer coefficients) or
+  bound (2 samples, 24 values a queried column, 528 witness hashes, 192 FRI
+  witness values), `Shape` otherwise, and checked against the bytes left
+  before any allocation; a limb at or above `p` `Noncanonical`; nothing
+  after the last field. Decode and `encode` are inverse: one encoding a
+  proof. Limbs are read eight a basic block (the PVM charges a block for
+  its loads' latency and its branch);
+- constants: `LOG_SIZES`, `PREPROCESSED_ROOT_39` (equal to 28's, its own
+  test), `TREE_WIDTHS`, `MAX_PROOF_BYTES` 256 KiB.
+
+**The registry and the prover:** format 39 `Admitted` (`format.rs`,
+`SECURITY.md`); `security::fri_rounds` public; `wrap::proof_bytes` emits a
+wrap proof by its format's `ProofBytes` (39's fixed layout through the
+verifier's `encode`); `masked::verifier_format(format, log_sizes, layout)`
+the registry's entry as the verifier pins it.
+
+**The consumers:** `vos-statement` judges 28 through the dispatch, the
+verifier's `test-formats` on (6.5 moves it to the accepted set, and the
+venue builds to 39 alone); `final-verify.elf`'s words mode and the Wasm
+blob's `verify`/`decode` carry the format before the words (the runner
+reads `<name>.format`); the tests' masked verifier
+(`recair/tests/support/masked_verifier.rs`) deleted, its users on the
+final verifier's.
+
+**Tests** (`recair/tests/recursion/masked.rs`, the one-segment run's root
+wrapped masked from `MaskRng::Seeded(39)`, 8.1 s, 149,828 B, postcard
+160,821 B; and the crate's unit tests):
+- the verifier's constants the registry's entry for 39
+  (`verifier_format(&MASKED_WRAP, ..) == masked::MASKED_WRAP`), status
+  `Admitted`, bytes `FixedLayout`, the circuit's root; FRI's rounds the
+  security tool's, `fri_rounds`' and the only count `FriVerifier::commit`
+  accepts (3 inner layers; 2 and 4 `InvalidNumFriLayers`);
+- spike 6a's 14 tamper cases, each refused with an error as a proof and
+  through its bytes, none a panic (OODS `0x13`, Merkle `0x12`, PoW
+  `0x15`, logup `0x9`, shape `0x6`, interaction PoW `0x8`, format `0x4`);
+- a verifier at 7 or 9 salts or an `R` of 7 or 9 refuses: with 39's widths
+  (`Shape`: its set's trees), with the widths its pins lay out (`Shape`: the
+  proof's samples); a salt or `R` column more or fewer in the proof
+  refused by the shape and at decode;
+- cross-format both ways, by bytes and as proofs: `Format` (`0x4`);
+- the layout: every truncation and a trailing byte on a pin-shaped proof
+  (`Decode`), a spread of truncations and every trailing byte value on the
+  real one, the header's every field (`Format`), every count (`Shape`), a
+  count the bytes cannot back (`Decode`), each limb kind (`Noncanonical`);
+- the window's masked wrap (`test-proof`, `tests/common`) verified by the
+  final verifier from its fixed-layout bytes, written for the Wasm harness.
+
+**Fuzzing:** `final_verifier_bytes` and `final_verifier_mutate` run both
+goldens, 28's (the fixture) and 39's (the masked test's, under
+`target/tmp/wrap`; 6.5's fixtures replace it), each under its own format
+through the dispatch; the seed adds 39's. Built and run 180 s each:
+497,961 and 6,683 runs, no crash.
+
+**The gate** [measured], the one-segment wrap, `final-verify.elf` (28 and
+39 linked, program 608,634 B), JAM-only host:
+
+| format | total gas | lookup | decode | verify | bytes | heap peak |
+|---|---|---|---|---|---|---|
+| 28 (postcard) | 95,414,225 | 75,420 | 15,716,460 | 79,622,140 | 122,528 | 338 KiB |
+| **39 (fixed layout)** | **109,638,368** | 82,458 | **3,758,064** | **105,797,641** | 149,828 | 368 KiB |
+
+- verify 105.8M ≤ 125M; decode 3.76M ≤ 4M (postcard 19.9M at 6.0b; a
+  first, per-limb decode measured 6.48M: the PVM's per-block costs, 25 for
+  a load and 20 for a branch, are paid per item; the decode's floor is now
+  its 1,012 column allocations and the `memcpy` of 2,456 hashes);
+- Wasm (`wasm/run`, wasmtime 35): **47,413,788 instructions under the
+  PVF's semantics** (≤ 50M), 41,236,828 the client's; 28's 37,996,938 and
+  37,454,553; verify 2.6–4.7 ms;
+- builds: thumbv7em (`-Zbuild-std`) and wasm32 (`-Zallow-features=`) on the
+  pinned nightly, wasm32 and thumbv7em on stable 1.94.1, riscv64em (the
+  guest).
+
+**Gates:** `just check` green (1,189 tests, 0 failed); clippy clean.
+
+**For the review (Fable):** the margins are thin (decode 6%, PVF 5%); the
+guest's target (`riscv64em-vos.json`) has no `+unaligned-scalar-mem`, so
+every limb and hash is read a byte at a time, which the JAM PVM does not
+require (unaligned loads are legal), a lever for 6.19's service build;
+`vos-statement` still links 28 (`test-formats`) until 6.5; the fuzz
+golden for 39 is a test's output, not a checked-in fixture, until 6.5.
+
 ## Step 6.8: the recursion AIR's forgery gates
 
 **Built** on `s6/forgery` (from `27967322`): a new test binary,
