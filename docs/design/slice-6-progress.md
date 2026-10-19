@@ -2474,43 +2474,61 @@ On `vos-core` (from `1b7cdd2a`).
   `at_least(&self, #[public] commitment, #[public] threshold, salt, account) -> bool`,
   the commitment `BLAKE2b-256("vos/test/balance/account" ‖ salt ‖ account)`
   checked in the kernel (a mismatch traps), so the account is public only
-  through it.
+  through it. Its doc says what the commitment does not hide: one
+  commitment stated at several thresholds bounds the balance, and a reused
+  commitment links its statements.
 - **The window kernel restated under decision 6 (S3)**
-  (`agent/test-actors/window`): `settle(&self, #[public] peer,
-  #[public] currency, #[public] c_prev, carried, salt, journals) ->
-  Settlement { net, seq, c_new }`. `c = BLAKE2b-256("vos/test/window/pair"
-  ‖ peer ‖ currency ‖ salt ‖ sent ‖ received ‖ seq)`, the sums of the
-  pair's outgoing and incoming pseudo-accounts' settled nets (cumulative
-  rows); `carried` (the old sums, seq and salt) opens `c_prev` privately or
-  the kernel traps; each journal's two pseudo-accounts are read at the one
-  cut through the view (absent counting nothing, a decoy trapping); `net`
-  the outgoing growth less the incoming, `c_new` the new sums at `seq + 1`
-  under the private `salt`. Rooted (`S_w`), no anchor in its output. The
-  peer and the currency are public beside `c_prev` (design-roots §5.1's
-  `PairKey`): the handler finds the pair's `c` by them, and the commitment
-  binds them. `cipher_clerk::settlement::window` takes two anchors, so the
-  test actor nets the delta itself; the library change (one cut, a carried
-  state, `NetFlow` without anchors, `SameSpace` moved to the handler) is
-  recorded for the Clerk's slice in `clerk-across-spaces.md` C.4.
-- **`vos-venue`:** `ModelVenue::migrate(&Migrate)` ends a space's range at
-  the migration's window; a root outside the range is not anchored, and an
-  anchor at or past it is refused (`Window`); test
-  `a_migration_ends_the_range`.
+  (`agent/test-actors/window`): the pair's two aggregate rows (decision 4:
+  an outgoing and an incoming pseudo-account in one aggregate journal, ids
+  derived from the peer and the currency);
+  `settle(&self, #[public] peer, #[public] currency, #[public] c_prev, carried, salt) -> Settlement { net, seq, c_new }`.
+  `c = BLAKE2b-256("vos/test/window/pair" ‖ peer ‖ currency ‖ salt ‖
+  out_dr ‖ out_cr ‖ in_dr ‖ in_cr ‖ seq)`, the rows' running debit and
+  credit totals, each of which only grows; `carried` opens `c_prev`
+  privately, every total read must be at least the carried one (so a cut
+  older than the carried state's settles nothing), the net is what the
+  space owes at the new totals less at the carried, `c_new` the new totals
+  at `seq + 1` under the private `salt`. Rooted (`S_w`), no anchor in its
+  output. The peer and the currency are public beside `c_prev`: the
+  handler finds the pair's `c` by them, and `c` binds them; `c` does not
+  bind the stating space (the handler keys by the statement's space, which
+  `S_w` binds). `cipher_clerk::settlement::window` takes two anchors and
+  per-journal rows, so the test actor nets the delta itself; the library
+  change, and the handler's `(c, w_last)` with its rule that a statement's
+  root is past `w_last`, are recorded for the Clerk's slice in
+  `clerk-across-spaces.md` C.4 and C.5.
+- **`vos-venue`:** `ModelVenue::migrate(&Migrate) -> Result<(),
+  MigrateRefusal>` (`spaces-pallet.md` call 5, G14): it ends a space's
+  range at the migration's window, once (`AlreadyMigrated`), from a window
+  past every one anchored and not before the venue's next (`Window`),
+  leaving this venue for another (`Venue`); a root outside the range is not
+  anchored, and an anchor at or past it is refused (`Window`).
 - **The kernel tests** (`pvm/proof/tests/kernel`): `cut.rs`, shared by
   `reads`, `window_kernel` and `balance`: an agent's tree, a
   representative's tree of agents' roots (with or without the agent's
   row), the read served, the agent's report and the representative's
   `Closed` applied on the testkit before the `Resume`, the whole run
   proved to one root, and a founder-keyed space registered and anchored at
-  the `ModelVenue`. `common::wrap_root` returns the masked (39) bytes too.
-  `window_kernel`'s two-anchor tests (`rows_off_the_roots`, `bad_proofs`,
-  `claims_ending_out_of_key_order`, `the_window_wraps`) are replaced: the
-  kernel no longer verifies proofs itself, the SDK's prologue does.
+  the `ModelVenue`, its time settable. `common::wrap_root` returns the
+  masked (39) bytes too. `window_kernel`'s two-anchor tests are replaced:
+  the kernel no longer verifies proofs itself, the SDK's prologue does.
+- **`just test-reads`** (in `check` and `test-agent`): the live runs of the
+  window, the balance and a 256-row `reads` case, with no proving, so a
+  change of the served contract fails `check`.
 - **A pre-existing failure fixed:** `reads`' live runs resumed with no
   `Closed` row, so since 6.14's binding of the served path to the close
-  every read was `Unserved` (`reads` runs only in `test-proof`, last run
-  at M2, before 6.14 merged). `cut::read_live` applies the report and the
-  close first.
+  every read was `Unserved` (`reads` ran only in `test-proof`, last at M2,
+  before 6.14 merged; the live node serves only closed reads, so no product
+  bug). `cut::read_live` applies the report and the close first.
+- **Another, fixed** (`255179ea`): `vos-node`'s `snapshot_crash` failed
+  under load (`Fjall::open`: `AlreadyExists`). fjall 3.1.12 writes its
+  `version` marker last, after its lock, its keyspaces' folder and `0.jnl`,
+  and takes a store without the marker for a new one, whose creation then
+  fails on what the interrupted creation left: a node killed during its
+  store's creation could never open it again. `Fjall::open_tuned` clears
+  fjall's own entries of a store whose marker is missing or empty and syncs
+  the directory before it opens; `a_store_whose_creation_was_cut_short_opens`
+  (both markers) fails without the fix.
 - **The code-4 fixture** (a rooted statement claiming `SpaceId::NONE`, its
   roots `NONE` and anchored) is in `statements.cases` since 6.5 ("rooted,
   of no space", code 4, judged alike at every venue); nothing to
@@ -2520,82 +2538,113 @@ On `vos-core` (from `1b7cdd2a`).
 - `window_kernel`: `the_window_settles_at_a_cut` (the statement, its public
   arguments `(agent, instance) ‖ (peer, currency, c_prev)`, its root `S_w`,
   live ≡ traced; the next settlement from `c_new` states net 0, seq + 2);
-  `a_carried_state_that_does_not_open_is_refused` (another salt, sums, seq,
-  pair; journals out of order: `Failed`); `rows_off_the_cut_are_refused`
-  (a tampered row, a present row claimed absent, the agent's row missing
-  from the representative's tree, a key outside the read set:
-  `Failed`); `the_window_proves_and_verifies_over_its_shape` (the chain's
-  io-hash over the public arguments, output and root);
-  `the_windows_leaves_and_folds_prove_and_verify`;
+  `a_carried_state_that_does_not_open_is_refused` (another salt, each
+  total, seq; `c_prev` of another peer or currency); `an_older_cut_is_refused`
+  (a carried state that opens but whose totals, each in turn, are above
+  the rows'); `rows_off_the_cut_are_refused` (a tampered row, a present
+  row claimed absent, the agent's row missing from the representative's
+  tree, a key outside the read set); all `Failed`.
+  `the_window_proves_and_verifies_over_its_shape` (the chain's io-hash over
+  the public arguments, output and root);
+  `the_windows_leaves_and_folds_prove_and_verify` (its three segments'
+  leaves, folded to the whole run's root);
   `the_window_is_stated_at_the_model_venue` (below).
 - `balance`: `a_balance_is_stated_at_a_cut` (thresholds below, at and
   above, an absent account; the account in no public byte);
   `a_commitment_that_does_not_open_is_refused`;
   `a_balance_is_accepted_at_the_model_venue` (proved, wrapped masked,
   accepted; another threshold or commitment refused by the proof's words).
+- `vos-venue`: `a_migration_ends_the_range` (every refusal, the range, the
+  anchor past it refused).
 - **Judged at the model venue** (the window's masked proof, format 39;
   the venue pins the program and holds `S_w` anchored by the founder's
-  key): accepted (0), then a repeat (6); an unanchored root (5); another
-  window (5; anchored there too, 0x108/0x109 by the proof's words);
-  another space (4; its root anchored in a second space of the founder's,
-  by the words); a missing representative row, `S_w` anchored over a tree
-  without the agent's row (5); a tampered row's net (by the words); a
-  venue mismatch, the anchor signed for this venue refused at another as
-  `Signature` and the root there unanchored (5); a window outside the
-  migration range, migrated away at w (5). A key outside the read set and
-  a tampered served row trap the kernel, so no statement exists of them.
+  key), each case and the check that refuses it: accepted (0), a repeat
+  (6); an unanchored root (5); another window, unanchored (5), and
+  anchored there too, by the io-hash (0x108); another space, the space rule
+  (4), and its root anchored in a second space of the founder's, by the
+  io-hash (0x108); a missing representative row, `S_w` anchored over a
+  tree without the agent's row, so the statement's root is unanchored (5);
+  a tampered output (0x108); a venue mismatch, the anchor digest binding
+  the venue (`Signature` at another, the root unanchored there, 5; code 7
+  is the fixtures', the kernel not venue-bound); a window outside the
+  migration range, migrated before its anchor (the anchor `Window`, the
+  statement 5). A tampered served row and a key outside the read set trap
+  the kernel, so no statement exists of them.
 - **Latency** (`vos-node` cluster,
   `representative::a_read_is_stated_within_a_window_and_its_close`): three
   nodes, L = 2 min, D = 24 s, the clocks run from `B_0 − 2 s`.
 
 **Measured** [measured; a million-row map under 1,024 agents' roots,
-w = 2,966,000; the machine shared, load 5.4–8.8]:
+w = 2,966,000; the machine shared, load 5–16]:
 
 | | 6.0a | 6.15 | |
 |---|---|---|---|
-| a row: compressions | 19.07 (+1 the view's key hash: 20.07) | 20.75 | +3.4% |
-| a row: witness bytes | 842 | 878 | +4.3% |
+| a row: compressions (`reads`, sixteen less one) | 19.07 (+1 the view's key hash: 20.07) | 20.07 | 0 |
+| a row: witness bytes | 842 | 862 | +2.4% |
 | the path: compressions | 14 (+1 `S_w`) | 14 (+1) | 0 |
 | the path: bytes (path, salt, roots) | 590 | 590 | 0 |
 
-- a row (journals 1–7, fourteen rows, less journal 1, two, over twelve):
-  23,948 steps (6.13's view read 14,230: the rest the pseudo-account ids,
-  cipher-clerk's software BLAKE2b, and `PseudoAccount::of`);
-- **the restated window** (eight journals, fifteen rows present and one
-  absent): **387,824 steps** (gate ≤ 1M), 350 compressions, witness input
-  14,750 B, kernel 74,284 B; **15 segments** at the 32k class; proved end
-  to end in **264 s**: segments 159.7 s (peak heap 4,792 MiB), 15 leaves
-  29.4 s, 14 folds 27.5 s, the wrap 5.9 s (28) and **13.7 s masked (39,
-  146,052 B, heap 3,627 MiB, resident 3,831 MiB)**;
+- a row is `reads`' (`reads_at_a_cut_measure`, its gate a tenth of
+  6.0a's); the window reads two;
+- **the restated window** (two aggregate rows): **67,147 steps** (gate ≤
+  1M), 56 compressions, witness input 2,401 B, kernel 70,734 B; **3
+  segments** (two class-1, the halt at class 0); proved end to end in
+  **103 s** at load 8–16: segments 40.5 s (peak heap 4,792 MiB), 3 leaves
+  10.6 s, 2 folds 7.6 s, the wrap 7.0 s (28) and **24.8 s masked (39,
+  148,356 B, heap 3,627 MiB, resident 3,895 MiB)**;
+- the first restatement, eight journals' sixteen rows (before the
+  review): 387,824 steps, 15 segments, 264 s end to end at load 5–9, a
+  row 20.75 compressions and 878 B (+3.4%, +4.3%), about 24k steps (the
+  pseudo-account ids by cipher-clerk's software BLAKE2b). Pin D's
+  settlement estimate counts `t_prove` about 3.5 min: one prover took 4.4
+  min at sixteen rows and 1.7 min at two;
 - `balance`: 21,733 steps, 19 compressions, witness 856 B, one segment
   (12.4 s), its leaf 2.2 s, the masked wrap 10.4 s, 147,076 B;
-- `reads` after the refactor, as at 6.13: a row 20.07 compressions and
-  862 B, the path 14 (+1) and 590 B, the sixteen-row prologue 210,019
-  steps;
 - **latency** from `B_0`: the anchor of `S_0` at the venue in **24.04 s**,
   the read's `Attest` in the agent's log in **24.09 s** (D 24 s; bound
   D + 10 s = 34 s). From a read asked at any time in window w, at most
   L + 24.1 s ≤ L + D + 10 s; the statement is then at the venue after
-  `t_prove` (264 s here for the window, one prover, no pipelining) and an
-  inclusion.
+  `t_prove` and an inclusion.
 
-**Gates:** within 20% of 6.0a (+3.4%, +4.3%, 0, 0): pass; the restated
-window ≤ 1M steps (387,824): pass; latency ≤ L + D + 10 s at L = 2 min
-(24.1 s from `B_w`, so L + 24.1 s ≤ L + 34 s): pass.
+**Gates:** within 20% of 6.0a (0, +2.4%, 0, 0): pass; the restated
+window ≤ 1M steps (67,147): pass; latency ≤ L + D + 10 s at L = 2 min
+(24.1 s from `B_w`): pass.
+
+**Commits:** `4fce524e` (the step), `255179ea` (the store's cut-short
+creation), the review's fold and this record.
+
+**The review** (Opus): REVISE (small), folded:
+- **M1:** the carried state bound neither which rows were summed (a
+  private list of journals) nor when (an older anchored cut): now the
+  pair's two aggregate rows, keyed by the pair, and running totals no
+  statement may lower; the handler's `(c, w_last)` and its later-window
+  rule in `clerk-across-spaces.md` C.5; tests of an older cut and of each
+  total.
+- **M2:** `ModelVenue::migrate` was repeatable, retroactive and took
+  `to` = itself: now as call 5 and G14; the migration case migrates before
+  the anchor.
+- **M3:** `snapshot_crash`'s failure was fjall's cut-short creation, fixed
+  (above).
+- **Lows:** each venue case names its check; the words' refusal pinned to
+  0x108; a `c_prev` of another currency; the balance's commitment
+  documented; the live tests in `check`; `t_prove` against Pin D's
+  estimate recorded. Binding the stating space into `c` is left to the
+  Clerk's handler, which keys by it.
+
+**Gates after the fold:** `just check` green: every recipe and suite
+before `test-reads` (97 suites, 1,267 passed, 0 failed), then
+`test-reads`, its four test threads killed past 12 GiB at once, set to one
+and run alone: 7 passed in 78 s. The changed proving tests run once each,
+one at a time under 12 GiB:
+`the_window_proves_and_verifies_over_its_shape`,
+`the_windows_leaves_and_folds_prove_and_verify`,
+`the_window_is_stated_at_the_model_venue`,
+`a_balance_is_accepted_at_the_model_venue`: green.
 
 **For Fable:** the restated public inputs (the peer and currency public
-beside `c_prev`; `c` binding the pair, the sums, the seq and a salt; the
-sums signed `i128` nets in the library's sense; a first settlement opening
-`commitment(Carried::default())`), and the completeness of journals left
-to the handler's reconcile as before.
+beside `c_prev`; `c` binding the pair, the four running totals, the seq
+and a salt; a first settlement opening `commitment(Carried::default())`;
+the totals' monotonicity standing for the cut's order inside the kernel,
+the handler's `w_last` outside it).
 
-**`just check`:** green but for one test: fmt, docs, clippy, no-std, the
-kit, the workspace's suites, then the agent's suites (`vos-sdk` to
-`vos-cli`) run again whole after `vos-node`'s `snapshot_crash` failed once
-under load, green, 35 suites, 458 passed, the latency test among them.
-`snapshot_crash` failed in 2 of 9 runs (both under load, round 0 or later,
-`Fjall::open` after a torn kill: `AlreadyExists`), 7 of 7 alone green: a
-pre-existing flake in the store's reopen after a torn write, untouched by
-this step, carried to 6.22's store item. The proving tests ran one at a
-time under 12 GiB (`test-proof`'s recipe runs each `window_kernel` test
-in a process of its own; `balance` beside the light tests).
+**6.15 accepted.**

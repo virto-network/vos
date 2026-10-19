@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey};
 use vos_pvm_proof::format::SEGMENT;
@@ -485,20 +486,31 @@ pub fn genesis(nonce: u8) -> SpaceGenesis {
 /// The model venue, its time fixed a second past [`WINDOW`]'s close.
 pub struct Venue {
     pub venue: ModelVenue,
+    now: Arc<AtomicU64>,
 }
 
 impl Venue {
-    /// A venue of id `id`, its time a second past [`WINDOW`]'s close
-    /// (`B_w + D`), with the spaces `geneses` found registered from the
-    /// window before [`WINDOW`].
+    /// A venue of id `id`, its time [`Venue::closed`], with the spaces
+    /// `geneses` found registered from the window before [`WINDOW`].
     pub fn new(id: VenueId, geneses: &[SpaceGenesis]) -> Self {
-        let representative = CLOCK.representative().unwrap();
-        let close = CLOCK.boundary(WINDOW).unwrap() + representative.origin_ms - CLOCK.origin_ms;
-        let venue = ModelVenue::new(id, Arc::new(move || close + 1_000));
+        let now = Arc::new(AtomicU64::new(Self::closed()));
+        let read = Arc::clone(&now);
+        let venue = ModelVenue::new(id, Arc::new(move || read.load(Ordering::SeqCst)));
         for genesis in geneses {
             venue.register(genesis, WINDOW - 1);
         }
-        Self { venue }
+        Self { venue, now }
+    }
+
+    /// A second past [`WINDOW`]'s close, `B_w + D`.
+    pub fn closed() -> u64 {
+        let representative = CLOCK.representative().unwrap();
+        CLOCK.boundary(WINDOW).unwrap() + representative.origin_ms - CLOCK.origin_ms + 1_000
+    }
+
+    /// The venue's time set to `now`.
+    pub fn set_now(&self, now: u64) {
+        self.now.store(now, Ordering::SeqCst);
     }
 
     /// `root` anchored, signed by the founder for the venue `signed_for`.

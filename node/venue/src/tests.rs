@@ -186,29 +186,51 @@ fn a_statement_is_judged_against_the_anchors() {
     );
 }
 
-/// A migration away ends the space's range here: its roots at or past
-/// the migration's window are no longer anchored, those before still are,
-/// and its anchors at or past it are refused. A migration from another
-/// venue, or of a space not registered, changes nothing.
+/// A migration away ends the space's range: its anchors at or past the
+/// migration's window are refused, and its roots there are not anchored,
+/// those before still are. Refused: a migration from another venue, to
+/// this one, of a space not registered, from a window anchored here or
+/// before the venue's next, and a second one.
 #[test]
 fn a_migration_ends_the_range() {
     let f = fixture();
     assert_eq!(f.venue.anchor(&f.anchor(3, 1, 0)), Ok(Anchored::New));
     assert_eq!(f.venue.anchor(&f.anchor(4, 1, 0)), Ok(Anchored::New));
-    let away = |from: VenueId, space: SpaceId| Migrate {
+    // The venue's clock is in window 5: its next is 6.
+    let away = |from: VenueId, to: VenueId, space: SpaceId, from_window: u64| Migrate {
         space,
         from,
-        to: VenueId([0x55; 32]),
-        from_window: 4,
+        to,
+        from_window,
     };
-    assert!(!f.venue.migrate(&away(VenueId([1; 32]), f.space)));
-    assert!(!f.venue.migrate(&away(VENUE, SpaceId([8; 32]))));
-    assert!(f.venue.anchored(&f.read(4, 1)));
-    assert!(f.venue.migrate(&away(VENUE, f.space)));
-    assert!(f.venue.anchored(&f.read(3, 1)));
-    assert!(!f.venue.anchored(&f.read(4, 1)));
+    let there = VenueId([0x55; 32]);
+    for (migrate, refusal) in [
+        (
+            away(VenueId([1; 32]), there, f.space, 7),
+            MigrateRefusal::Venue,
+        ),
+        (away(VENUE, VENUE, f.space, 7), MigrateRefusal::Venue),
+        (
+            away(VENUE, there, SpaceId([8; 32]), 7),
+            MigrateRefusal::Unregistered,
+        ),
+        (away(VENUE, there, f.space, 4), MigrateRefusal::Window),
+        (away(VENUE, there, f.space, 5), MigrateRefusal::Window),
+    ] {
+        assert_eq!(f.venue.migrate(&migrate), Err(refusal), "{migrate:?}");
+    }
+    assert_eq!(f.venue.migrate(&away(VENUE, there, f.space, 7)), Ok(()));
     assert_eq!(
-        f.venue.anchor(&f.anchor(5, 1, 0)),
+        f.venue.migrate(&away(VENUE, there, f.space, 8)),
+        Err(MigrateRefusal::AlreadyMigrated)
+    );
+    assert!(f.venue.anchored(&f.read(4, 1)));
+    f.now
+        .store(f.clock.boundary(7).unwrap() + 1, Ordering::SeqCst);
+    assert_eq!(f.venue.anchor(&f.anchor(6, 1, 0)), Ok(Anchored::New));
+    assert_eq!(
+        f.venue.anchor(&f.anchor(7, 1, 0)),
         Err(AnchorRefusal::Window)
     );
+    assert!(!f.venue.anchored(&f.read(7, 1)));
 }

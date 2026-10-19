@@ -68,6 +68,20 @@ pub enum AnchorRefusal {
     Equivocation,
 }
 
+/// Why a venue refuses a space's migration away.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MigrateRefusal {
+    /// The space is not registered.
+    Unregistered,
+    /// It names another venue to leave, or this one to go to.
+    Venue,
+    /// The space migrated away already.
+    AlreadyMigrated,
+    /// Its window is at or before one anchored, before the venue's next
+    /// window, or before the space's start here.
+    Window,
+}
+
 /// A space a venue registered.
 struct Registered {
     clock: WindowClock,
@@ -186,18 +200,33 @@ impl ModelVenue {
         space
     }
 
-    /// A space's migration away from this venue, its controller's: the
-    /// space's range here ends before `from_window`, so neither its anchors
-    /// nor the roots of its statements at or past it are taken. Whether it
-    /// named a registered space migrating from here.
-    pub fn migrate(&self, migrate: &Migrate) -> bool {
-        if migrate.from != self.id {
-            return false;
+    /// A space's migration away from this venue, its controller's
+    /// (`spaces-pallet.md` call 5): the space's range here ends before
+    /// `from_window`, so neither its anchors nor the roots of its
+    /// statements at or past it are taken. Refused unless it names a
+    /// registered space leaving this venue for another, once, from a window
+    /// past every one anchored and not before the venue's next.
+    pub fn migrate(&self, migrate: &Migrate) -> Result<(), MigrateRefusal> {
+        if migrate.from != self.id || migrate.to == self.id {
+            return Err(MigrateRefusal::Venue);
         }
+        let now = (self.now)();
         let mut state = self.state();
-        let Some(space) = state.spaces.get_mut(&migrate.space) else {
-            return false;
-        };
+        let space = state
+            .spaces
+            .get_mut(&migrate.space)
+            .ok_or(MigrateRefusal::Unregistered)?;
+        if space.range.until.is_some() {
+            return Err(MigrateRefusal::AlreadyMigrated);
+        }
+        let next = space
+            .clock
+            .window(now)
+            .map_or(0, |open| open.saturating_add(1));
+        let anchored = space.last.is_some_and(|last| migrate.from_window <= last);
+        if anchored || migrate.from_window < next || migrate.from_window < space.range.from {
+            return Err(MigrateRefusal::Window);
+        }
         space.range.until = Some(migrate.from_window);
         let range = space.range;
         if let Some(space) = state
@@ -208,7 +237,7 @@ impl ModelVenue {
         {
             space.range = range;
         }
-        true
+        Ok(())
     }
 
     /// Judge statements of `pin`'s program.

@@ -372,7 +372,10 @@ fn clear_unfinished(dir: &Path) -> Result<()> {
     let mut cleared = false;
     for entry in std::fs::read_dir(dir)? {
         let path = entry?.path();
-        let name = path.file_name().and_then(|name| name.to_str()).unwrap_or("");
+        let name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
         if name == "keyspaces" && path.is_dir() {
             std::fs::remove_dir_all(&path)?;
         } else if name == "lock"

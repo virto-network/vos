@@ -199,21 +199,28 @@ slice 5's 5.15).
   rows at one anchored cut. No old tree or anchor is kept; the
   creation-window stamp is not needed. cipher-clerk's `NetFlow` gains it,
   or is wrapped.
-  - **Slice 6's model of it** (6.15, the `window` test actor): public
-    arguments the reader's `(agent, instance)`, the peer, the currency
-    and `c_prev`; `c = BLAKE2b-256(domain ‖ peer ‖ currency ‖ salt ‖
-    sent ‖ received ‖ seq)`, the sums of the pair's outgoing and incoming
-    pseudo-accounts' settled nets; private the opening of `c_prev` and the
-    next salt; output `(net, seq, c_new)`, rooted at the cut, no anchor in
-    it. The peer and the currency are public so the handler finds the
-    pair's `c` by them; the commitment binds them too.
+  - **Slice 6's model of it** (6.15, the `window` test actor): the pair's
+    two aggregate rows (decision 4), an outgoing and an incoming
+    pseudo-account in one aggregate journal, their ids derived from the
+    peer and the currency; `c = BLAKE2b-256(domain ‖ peer ‖ currency ‖
+    salt ‖ out_dr ‖ out_cr ‖ in_dr ‖ in_cr ‖ seq)`, the rows' running debit
+    and credit totals, each of which only grows (a net may fall, on a
+    bounce's debit); public the reader's `(agent, instance)`, the peer, the
+    currency and `c_prev`; private the opening of `c_prev` and the next
+    salt; the kernel traps unless every total is at least the carried one,
+    so a cut older than the carried state's settles nothing; output
+    `(net, seq, c_new)`, rooted at the cut, no anchor in it. The peer and
+    the currency are public so the handler finds the pair's `c` by them;
+    the commitment binds them too. It does not bind the stating space: the
+    handler keys `c` by the statement's space, which `S_w` binds.
   - **The library change, this slice's:** `settlement::window(space,
-    anchor_i, anchor_j, reads)` takes two anchors and reads at both; the
-    test actor nets the delta itself. cipher-clerk's window takes one cut
-    and a carried state (the sums, the sequence number, the salts), drops
+    anchor_i, anchor_j, reads)` takes two anchors and per-journal rows; the
+    test actor nets the delta itself. cipher-clerk's window takes one cut,
+    the pair's aggregate rows and a carried state (the totals, the sequence
+    number, the salts), refuses a total below the carried one, drops
     `RowsOutOfOrder` and the anchors from `NetFlow`, and keeps its decoy
-    and repeat checks; the refusal of a pair with the space itself moves
-    to the handler, which knows the statement's space.
+    check; the refusal of a pair with the space itself moves to the
+    handler, which knows the statement's space.
 - **Completeness of the journals:** under decision 4's aggregate rows, a
   pair reads two rows; the range proof over journals is not needed.
 - **The statement:**
@@ -232,7 +239,10 @@ slice 5's 5.15).
 - **Spaces register at the venue from their genesis,** with a sovereign
   account.
 - **The settlement handler:**
-  - it keeps the carried commitment per (A, B, currency);
+  - it keeps the carried commitment per (A, B, currency) beside the
+    window of the pair's last settlement, `(c, w_last)`, and takes a
+    statement only when its `c_prev` is `c` and its root's window is past
+    `w_last`, so the cuts a pair settles at are ordered;
   - it reconciles pairs, moves the nets, and refuses an aggregate below
     zero;
   - it is two-sided, as every value-moving handler is (Fable's review of

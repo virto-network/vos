@@ -136,6 +136,7 @@ test-agent: build-test-actors build-agent build-representative
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-venue -p vos-net -p vos-cli
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
+    just test-reads
 
 # The default agent as a service on a local PolkaJam testnet, which it
 # starts and stops: a workflow suspended in one work package and resumed in
@@ -309,6 +310,14 @@ check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-form
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-recair -p vos-pvm-final-verifier -p vos-anchor -p vos-statement --features vos-anchor/vectors,vos-statement/fixtures
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-venue -p vos-net -p vos-cli
+    just test-reads
+
+# The live runs of reads at a cut on the agent's model, with no proving:
+# the window's, the balance's and a small map's reads, re-traced, and the
+# kernels' refusals, so a change of the served contract fails `check`.
+# One at a time: four at once were killed past 12 GiB.
+test-reads:
+    cargo test -p vos-pvm-proof --test kernel -- --test-threads=1 window_kernel::the_window_settles_at_a_cut window_kernel::a_carried_state_that_does_not_open_is_refused window_kernel::an_older_cut_is_refused window_kernel::rows_off_the_cut_are_refused balance::a_balance_is_stated_at_a_cut balance::a_commitment_that_does_not_open_is_refused reads::a_read_at_a_cut_re_runs_as_its_live_run
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.

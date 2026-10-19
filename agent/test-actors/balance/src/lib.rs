@@ -1,6 +1,13 @@
 //! Balances read at a window's cut: whether an account held at least a
 //! threshold there, stated against the space's root with the account
 //! public only as a salted commitment to it.
+//!
+//! The commitment hides the account, not the balance's bits: statements of
+//! one commitment at several thresholds bound the balance, a binary search
+//! by whoever may ask for them, and every statement of a reused commitment
+//! is linkable to the others; a fresh salt for each statement unlinks them. The
+//! commitment binds neither the space nor the map; the root `S_w` binds the
+//! space.
 
 #![no_std]
 
