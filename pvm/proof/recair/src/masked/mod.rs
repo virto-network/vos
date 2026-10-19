@@ -313,7 +313,6 @@ where
             format,
             masking: &masking,
             log_sizes: trace.log_sizes,
-            channel: core::any::type_name::<MC>(),
             public: trace.public,
         },
         &trace.main,

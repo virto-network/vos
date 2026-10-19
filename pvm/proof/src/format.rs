@@ -97,13 +97,15 @@ pub enum ProofKind {
     Credential,
 }
 
-/// The Merkle hash and Fiat–Shamir channel of a format.
+/// The Merkle hash and Fiat–Shamir channel of a format. Its tag (`as u8`)
+/// is pinned: the masked prover's witness digest binds it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum ChannelKind {
-    Blake2s,
-    Poseidon2M31,
-    Blake2sM31,
-    Blake2b256,
+    Blake2s = 0,
+    Poseidon2M31 = 1,
+    Blake2sM31 = 2,
+    Blake2b256 = 3,
 }
 
 /// How a format's DEEP quotient batches its sampled values: by powers of one

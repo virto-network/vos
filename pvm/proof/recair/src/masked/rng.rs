@@ -4,7 +4,7 @@
 //! Each attempt's stream is ChaCha20 seeded with
 //! `BLAKE2b-256("vos/mask/seed/v1" ‖ 32 OS bytes ‖ witness digest ‖ attempt as u32 LE)`,
 //! the witness digest binding the statement (the format, its configuration
-//! and masking, the log sizes, the Merkle channel, the public values) and the
+//! and masking, its channel, the log sizes, the public values) and the
 //! main columns. Two proofs from one replayed OS state differ when their
 //! witnesses or their statements do, so one witness proved under two formats
 //! or channels never reuses a mask; two proofs of one witness differ when the
@@ -71,15 +71,13 @@ pub(crate) struct Statement<'a> {
     pub format: &'a Format,
     pub masking: &'a Masking,
     pub log_sizes: &'a [u32],
-    /// The Merkle channel's name.
-    pub channel: &'a str,
     pub public: &'a [SecureField],
 }
 
 /// The witness digest R4 hedges with: `BLAKE2b-256` of the domain, the
 /// statement's words (the format's number, its configuration, its masking
-/// and interaction PoW, each log size, as u64 little-endian; the channel's
-/// name, its length first; each public value's 4 limbs, as u32
+/// and interaction PoW, its channel's tag, each log size, as u64
+/// little-endian; each public value's 4 limbs, as u32
 /// little-endian), then each main column's digest in commitment order, a
 /// column's the `BLAKE2b-256` of its values, 4 bytes little-endian each in
 /// Stwo's storage order. Every private value of the witness is in the main
@@ -116,6 +114,7 @@ pub(crate) fn witness_digest(statement: &Statement<'_>, main: &[Evaluations]) ->
         lifting,
         batching,
         u64::from(statement.format.interaction_pow_bits()),
+        statement.format.channel as u64,
         masking.salt_columns as u64,
         masking.fri_mask_columns as u64,
         u64::from(masking.log_mask_rows),
@@ -127,12 +126,9 @@ pub(crate) fn witness_digest(statement: &Statement<'_>, main: &[Evaluations]) ->
             .log_sizes
             .iter()
             .map(|&log_size| u64::from(log_size)),
-    )
-    .chain([statement.channel.len() as u64])
-    {
+    ) {
         hasher.update(word.to_le_bytes());
     }
-    hasher.update(statement.channel.as_bytes());
     hasher.update((statement.public.len() as u64).to_le_bytes());
     for value in statement.public {
         for limb in value.to_m31_array() {
@@ -151,7 +147,7 @@ mod tests {
     use stwo::core::poly::circle::CanonicCoset;
     use stwo::prover::backend::simd::column::BaseColumn;
     use stwo::prover::poly::circle::CircleEvaluation;
-    use vos_pvm_proof::format::MASKED_WRAP;
+    use vos_pvm_proof::format::{ChannelKind, Format, MASKED_WRAP};
 
     use super::*;
 
@@ -175,21 +171,24 @@ mod tests {
         use rand::RngCore;
         let masking = MASKED_WRAP.masking.unwrap();
         let public = [SecureField::from(BaseField::from(7))];
-        let statement = |channel, public| Statement {
-            format: &MASKED_WRAP,
+        let poseidon = Format {
+            channel: ChannelKind::Poseidon2M31,
+            ..MASKED_WRAP
+        };
+        let statement = |format, public| Statement {
+            format,
             masking: &masking,
             log_sizes: &[4],
-            channel,
             public,
         };
         let values: Vec<u32> = (0..16).collect();
         let mut amount = values.clone();
         amount[3] += 1;
         let digests = [
-            witness_digest(&statement("blake2b", &public), &[column(&values)]),
-            witness_digest(&statement("blake2b", &public), &[column(&amount)]),
-            witness_digest(&statement("blake2s", &public), &[column(&values)]),
-            witness_digest(&statement("blake2b", &[]), &[column(&values)]),
+            witness_digest(&statement(&MASKED_WRAP, &public), &[column(&values)]),
+            witness_digest(&statement(&MASKED_WRAP, &public), &[column(&amount)]),
+            witness_digest(&statement(&poseidon, &public), &[column(&values)]),
+            witness_digest(&statement(&MASKED_WRAP, &[]), &[column(&values)]),
         ];
         let first_word = |digest: &[u8; 32], attempt| {
             MaskRng::Seeded(5)
