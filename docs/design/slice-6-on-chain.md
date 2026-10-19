@@ -311,14 +311,15 @@ from the proof.
   `BLAKE2b-256("vos/mask/seed/v1" ‖ 32 OS bytes ‖ witness digest ‖ attempt as u32 LE)`;
   the witness digest is `BLAKE2b-256("vos/mask/witness/v1" ‖ the
   statement ‖ each main column's BLAKE2b-256)`: the statement's words (the
-  format's number, its configuration, masking and interaction PoW, the log
-  sizes), the Merkle channel's name and the public values, then the
+  format's number, its configuration, masking and interaction PoW, its
+  channel's pinned tag, the log sizes) and the public values, then the
   unmasked main columns in commitment order, every private value of the
   witness among them, whatever the component set; so one witness proved
   under two formats or channels from a replayed OS state never reuses a
   mask [built at 6.3, the statement bound at its review; proposed first as
   the root node's proof bytes and output preimage, which only the wrap
-  has]. Every mask, salt,
+  has; the channel bound by its type's name until M2, whose text the
+  compiler does not promise]. Every mask, salt,
   R column and blinding value is drawn from it.
 - **R1:** for every column class (level, quotient lift, offset set), the
   randomizer's revealed functionals (4 an OODS point, the decommitments,
@@ -334,15 +335,24 @@ from the proof.
   `fri_mask_coefficients_independent` (spike 6a) stays as a test over the
   generic small circuit, with 4- and 8-column masks, so the argument is
   exercised: at 4 columns it finds the singular draws a forced coefficient
-  plants.
+  plants. **Why nothing more is needed:** R is witness-independent, so the
+  simulator draws it as the prover does; with rank-4 coefficients the real
+  and the simulated batches differ by an R-quotient (a function vanishing
+  at z and at every query), which R's quotients reach, so the two batches
+  have one distribution and FRI's whole transcript, its unsalted layer
+  trees included, follows. No rank condition on R's own revealed
+  functionals is needed, and no check runs.
 - **A retry leaks nothing:** whether a transcript passes R1 is a function
   of public coins and the format, not the witness, so the conditioning is
   a public event a simulator reproduces.
 - **Generic:** R1, the R3 test and the masking take the component set and
   the `MerkleChannel` as parameters; nothing names the wrap.
-- **The test seam:** `MaskRng::Seeded(u64)` has a constructor only under
-  `cfg(any(test, feature = "seeded-masks"))`; `MaskRng::new` takes no
-  parameter that selects it, so no build reaches it from production code.
+- **The test seams,** both under `cfg(feature = "seeded-masks")` alone:
+  `MaskRng::Seeded(u64)` (the production default is `MaskRng::default()`,
+  `Os`, and nothing else selects a variant), and
+  `masked::prove_masked_unchecked`, the prover without its out-of-domain
+  check, which hands the verifier a forced proof. No build reaches either
+  from production code.
   **The build check** (in `just check`, beside `check-no-faults`):
   `cargo tree -e features,no-dev -i vos-pvm-recair` for each production
   binary (`vos-cli`, the agent, the node with `prover`) shows no

@@ -364,7 +364,12 @@ under masking variant (c) (`docs/design/research/slice-5/spike2-masking.md`
 **Zero knowledge** is the argument's: honest-verifier zero knowledge of
 the masked IOP, so zero knowledge in the programmable random-oracle model,
 conditional on R1 (the randomizer's revealed functionals of full rank),
-which the prover checks on every transcript and retries on. The masking's
+which the prover checks on every transcript and retries on, and on the FRI
+mask `R`'s DEEP coefficients being of rank 4 (all but about 2^-155 of
+draws, its 8 columns): `R` is witness-independent, so a simulator draws it
+as the prover does, and the real and simulated batches differ by an
+`R`-quotient, so FRI's transcript, its unsalted layer trees included, has
+one distribution; no check runs for it. The masking's
 gates (`vos-pvm-recair`'s `masked_gates`, `leakage` and the masked wrap's
 tests; at full N under `heavy-gates` in `just test-proof`) are a regression
 guard, not evidence of it: the soundness gates (acceptance at every size
@@ -388,7 +393,10 @@ Required before value rides on a proof. Its scope:
 - the fork's divergences: the Blake2b channel, fold step 3, affine DEEP
   batching, the completeness backport;
 - the security tool's counts (`src/security.rs`), variant (c)'s among
-  them;
+  them. The tool takes soundcalc's convention, the least term binds; a
+  union bound over the terms puts format 39 at about 81.2 bits, still
+  above 80, but it would not hold at 23 queries, so the 24-query pin is
+  the robust one;
 - the recursion AIR: the in-AIR verifier, the gate compiler (constraint ≡
   gate), the claimed-sum handling, the `Gate` relation's signed
   multiplicities, the fold;
