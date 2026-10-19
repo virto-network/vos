@@ -26,17 +26,24 @@ reference shape, from the security tool (`src/security.rs`):
 | format | proofs | channel | counts | floors | status |
 |---|---|---|---|---|---|
 | 35 | segments, hardened AIR | Poseidon2-M31 | 104 / 62.86 | 100 / 60 | admitted |
-| 36 | segments, legacy encodings | Blake2s | 96 / 57 (at MOBILE) | 96 / — | admitted, legacy only |
+| 36 | segments, legacy encodings | Blake2s | 96 / 57.49 (at MOBILE) | 96 / — | admitted, legacy only |
 | 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | reserved: proved and verified inside the recursion, refused by every outside verifier |
 | 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | reserved: refused until its masked AIR, prover and verifier exist |
-| 37, 30 | device and credential proofs | Blake2s-M31 | 106 / 62 | 100 / 60 | reserved |
+| 37, 30 | device and credential proofs | Blake2s-M31 | 106 / 62.10, 62.52 | 100 / 60 | reserved |
 
 - **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
   conjecture, refuted as stated in 2025; the parameters carry a margin for
   its salvaged form). **Proven** bits are the Johnson-bound count with the
   DEEP, ALI and logup terms. The counts are the tool's own model, pinned by
   the format tests; no one outside has reviewed them.
+- **The batch `B`** the count by powers takes is every value the DEEP
+  quotient batches, one coefficient each: a column's samples and, for a
+  column sampled at two points, the periodicity value the fork adds
+  (`deep_values_of_column`); `c`, the most of one column, is counted the
+  same way, 3. The segment shape batches 10,016 values over 9,020 samples,
+  so 36 counts 57.485 and 37 62.104 (by samples, 57.495 and 62.129); 35's
+  query term binds, 62.86 either way.
 - A verifier rejects a number the registry does not admit, a retired one
   (24 to 27, 29, 31, 33, 34, and 40, the blowup-64 masked wrap a measured
   proof was made under, never registered) among them, and a proof on
@@ -233,16 +240,17 @@ open items both wraps' counts rest on:
   its 80-bit floor (the end-to-end bound, 62.86, is the inner formats'
   either way).
   - **Format 39 rests on it more:** batched by powers, the batching term
-    caps 39 at 76.14 (73.64 at blowup 64), and at 28's own parameters
-    under masking that term is the one that binds (81.74).
+    caps 39 at 76.98 (74.48 at blowup 64), at its 538 batched values, and
+    at 28's own parameters under masking that term is the one that binds
+    (81.74).
   - **Its premise in the masked transcript:** every batched function, the
     masked columns' quotients, the FRI mask's and the blinding columns'
     among them, is committed and every sample mixed before the affine
     coefficients are drawn; the masked verifier takes the batching from
     the format, never from the proof.
   - **If it falls,** format 39 needs a new number: a batching-phase PoW of
-    at least 4 bits at blowup 32, or blowup 8 with 43 queries (about twice
-    the verify).
+    at least 4 bits at blowup 32 (6 at blowup 64), or blowup 8 with 41
+    queries (about twice the verify).
 
 ## Masking
 
@@ -279,11 +287,11 @@ masking variant (c) (`docs/design/research/slice-5/spike2-masking.md` §3b,
   count (23 queries 80.84, 24 82.70).
 - **The reference shape** counts R2's blinding (12 main and 8 interaction
   columns, 2 constraints, a fraction a row a component) and the FRI mask's
-  8 columns as designed, every column at two samples. The FRI mask and the
-  composition are sampled once each, so `sampled_values` bounds the built
-  batch from above and enters only the count by powers. The shape derived
-  from the built masked components must equal it in every other field, and
-  sample no more values. The blinding's own
+  8 columns as designed, and the batch exactly: 538 values, one a sampled
+  column and a periodicity value more for each of the 28 columns sampled
+  twice (the composition and the FRI mask once each, the salts never). It
+  is the shape a test derives from the built masked components, field for
+  field. The blinding's own
   soundness (a pole argument in the challenges) is counted only as logup
   fractions.
 - **The masked verifier's shape** comes from its own layout (`k = 4N`

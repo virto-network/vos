@@ -60,7 +60,7 @@
 //!   [`crate::security`] counts 82.6 at 20 queries (80 needs 19). Batching is
 //!   not in a proof's bytes: a verifier sets it from the format
 //!   ([`Format::verifier_config`]). 39 needs it too: batched by powers, it
-//!   caps at 76.14 at blowup 32 and 73.64 at blowup 64.
+//!   caps at 76.98 at blowup 32 and 74.48 at blowup 64.
 //! - **The masked wrap** (39) is 28's AIR under masking variant (c)
 //!   (`research/slice-5/spike2-masking.md` §3b; [`crate::security`] counts
 //!   it): every main and interaction column masked to twice its rows'
@@ -263,8 +263,8 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
     log_degree_bound: 20,
     log_trace_length: 20,
     log_composition_degree_bound: 21,
-    sampled_values: 9_020,
-    max_samples_per_column: 2,
+    sampled_values: 10_016,
+    max_samples_per_column: 3,
     constraints: 5_177,
     logup_fractions: 1_553_989_632,
     relation_width: SEGMENT_RELATION_WIDTH,
@@ -282,13 +282,14 @@ pub const DEVICE_REFERENCE: SecurityShape = SecurityShape {
 
 /// The recursion AIR's padded shape (`recursion-air.md` §0, §1.2): `p2`,
 /// `qm31` and `h8` at 2^16, 2^17 and 2^16 rows; 458 columns, each counted at
-/// two samples; 313 constraints of degree 3; 5, 4 and 6 fractions a row.
+/// two DEEP values (an upper bound: the batch holds 486), a column at most
+/// three; 313 constraints of degree 3; 5, 4 and 6 fractions a row.
 pub const LEAF_FOLD_REFERENCE: SecurityShape = SecurityShape {
     log_degree_bound: 18,
     log_trace_length: 17,
     log_composition_degree_bound: 19,
     sampled_values: 2 * 458,
-    max_samples_per_column: 2,
+    max_samples_per_column: 3,
     constraints: 313,
     logup_fractions: (5 << 16) + (4 << 17) + (6 << 16),
     relation_width: RECURSION_RELATION_WIDTH,
@@ -305,25 +306,25 @@ pub const WRAP_REFERENCE: SecurityShape = SecurityShape {
     ..LEAF_FOLD_REFERENCE
 };
 
-/// The columns the masked wrap samples beyond [`WRAP_REFERENCE`]'s 458:
-/// R2's blinding, four main columns a component and, on `qm31` and `h8`, a
-/// pair column of four interaction columns; the composition's four columns
-/// whole where the split one had eight; and the FRI mask's eight. The salts
-/// are never sampled.
-const MASKED_WRAP_SAMPLED_COLUMNS: u64 = (3 * 4 + 2 * 4) + 4 - 8 + 8;
+/// The values the masked wrap's DEEP quotient batches, exactly: one for
+/// each sampled column (57 preprocessed, 373 main and 40 interaction
+/// columns, the composition's 4 whole and the FRI mask's 8; the salts are
+/// never sampled), and two more for each of the 28 columns read at the
+/// previous row, `p2`'s 16 and each component's running sum, sampled twice
+/// and given a periodicity value.
+const MASKED_WRAP_DEEP_VALUES: u64 = (57 + 373 + 40 + 4 + 8) + 2 * (16 + 3 * 4);
 
 /// The wrap masked under variant (c), format 39's reference: the AIR of
 /// [`WRAP_REFERENCE`] at its tallest component's 2^15 rows, its columns at
 /// degree bound 2^16, its composition whole at 2^17 and sampled at `π(z)`
-/// ([`SecurityShape::variant_c`]), plus what the masking commits beside it.
-/// Every sampled column is counted at two samples, as [`WRAP_REFERENCE`]
-/// counts its own, though the FRI mask and the composition are sampled once
-/// each: `sampled_values` bounds the built batch from above, and enters only
-/// the count by powers. R2's blinding adds a fraction a row a component on a
-/// relation nothing else uses: `p2`'s pairs with its lone fraction, and
-/// `qm31`'s and `h8`'s take a new pair column and its constraint each.
+/// ([`SecurityShape::variant_c`]), plus what the masking commits beside it:
+/// the shape of the built masked components, which a test derives. The batch
+/// is counted exactly (`MASKED_WRAP_DEEP_VALUES`); it enters only the count
+/// by powers. R2's blinding adds a fraction a row a component on a relation
+/// nothing else uses: `p2`'s pairs with its lone fraction, and `qm31`'s and
+/// `h8`'s take a new pair column and its constraint each.
 pub const MASKED_WRAP_REFERENCE: SecurityShape = SecurityShape {
-    sampled_values: WRAP_REFERENCE.sampled_values + 2 * MASKED_WRAP_SAMPLED_COLUMNS,
+    sampled_values: MASKED_WRAP_DEEP_VALUES,
     constraints: WRAP_REFERENCE.constraints + 2,
     logup_fractions: (6 << 14) + (5 << 15) + (7 << 11),
     ..WRAP_REFERENCE.variant_c()
@@ -336,7 +337,7 @@ pub const CREDENTIAL_REFERENCE: SecurityShape = SecurityShape {
     log_trace_length: 14,
     log_composition_degree_bound: 16,
     sampled_values: 2 * 354,
-    max_samples_per_column: 2,
+    max_samples_per_column: 3,
     constraints: 303,
     logup_fractions: 5 << 14,
     relation_width: RECURSION_RELATION_WIDTH,
@@ -688,7 +689,7 @@ mod tests {
         let segment = count(&SEGMENT.params, &SEGMENT_REFERENCE);
         assert!((62.85..62.86).contains(&segment), "{segment}");
         let at_44 = count(&LEAF_FOLD.params, &SEGMENT_REFERENCE);
-        assert!((62.79..62.80).contains(&at_44), "{at_44}");
+        assert!((62.74..62.75).contains(&at_44), "{at_44}");
         for format in [DEVICE_PROOF, CREDENTIAL_PROOF] {
             let fewer = FormatParams {
                 n_queries: format.params.n_queries - 1,

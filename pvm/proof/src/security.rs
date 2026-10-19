@@ -15,7 +15,7 @@
 //!   `γ = 1 - √ρ - η` and the gap `η = √ρ / (2m)`;
 //! - **the DEEP batching** of every sampled value into one quotient
 //!   (`_get_batching_error`): by powers of one coefficient (Stwo's,
-//!   [`DeepBatching::Powers`]), `(B - 1) · ε_lin(k)`, `B` the sampled values,
+//!   [`DeepBatching::Powers`]), `(B - 1) · ε_lin(k)`, `B` the batched values,
 //!   the proximity gap for curves (BCIKS20 Theorem 6.2); with an independent
 //!   coefficient a value ([`DeepBatching::Affine`]), `ε_lin(k)`, the gap for
 //!   affine spaces (BCIKS20 Theorem 1.6), as `soundcalc` counts it.
@@ -33,7 +33,7 @@
 //! - **ALI** (`circuits/deep_ali.py`, Theorem 8 of eprint 2022/1216):
 //!   `L · C / |F|`, `C` the constraints combined by powers of one coefficient;
 //! - **DEEP**: `2^j · L · (d·(k + c - 1) + (k - 1)) / (|F| - k - D)`, `k`
-//!   the tallest trace column's length, `c` the most samples of one column,
+//!   the tallest trace column's length, `c` the most values of one column,
 //!   `D` the evaluation domain's size, and `d` the constraint degree, taken
 //!   as `2^(l_C - l_k) + 1` with `l_C` the composition polynomial's log degree
 //!   bound and `l_k = log2 k`. Stwo bounds a component of `2^l` rows whose
@@ -103,9 +103,14 @@ pub struct SecurityShape {
     pub log_trace_length: u32,
     /// `log2` of the composition polynomial's degree bound.
     pub log_composition_degree_bound: u32,
-    /// Every sampled value the DEEP quotient batches, `B`.
+    /// Every value the DEEP quotient batches, `B`: each sample, and for a
+    /// column sampled at two points (one read at the previous row) the
+    /// periodicity value the batch adds, one coefficient each (the fork's
+    /// `deep_values_of_column`).
     pub sampled_values: u64,
-    /// The most samples of one column, `c`.
+    /// The most values of one column, `c`, counted as `sampled_values`
+    /// counts them: 3 for a column sampled at two points, whose periodicity
+    /// value is an opening at a third.
     pub max_samples_per_column: u64,
     /// The constraints combined into the composition polynomial, `C`.
     pub constraints: u64,

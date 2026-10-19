@@ -574,7 +574,7 @@ last for decades.**
   segment's width times its queries. At 44 over the window kernel's 8,009
   columns the leaf needs 64,717 of `p2`'s 65,536 rows; at 40, 59,300, 9.5%
   to spare [model, `count-35.log`]. PoW 24 keeps the proven count, 62.86
-  against 62.79.
+  against 62.74 at 44 queries and PoW 20, where the batching term binds.
 - **Devices:** 86 is the least query count whose proven count clears 60 by
   2 bits; 84 gave 61.2.
 
@@ -1062,8 +1062,9 @@ counts as conjectured / proven at the reference shape [model]:
   do 28 and 30.
 - **35 takes fewer queries and more PoW than 32** (40 and 24 bits against
   44 and 20): a kernel leaf's rows grow with the segment's width times its
-  queries, and a fold verifies under half the recursion AIR's shape. The
-  proven count is the query term's either way, 62.86 against 62.79.
+  queries, and a fold verifies under half the recursion AIR's shape. On the
+  segment shape 35's count is its query term's, 62.86; 32's parameters give
+  62.74, their batching term binding.
 - **36 is the legacy segment format** the default prover produces, kept
   while the refine bundles and chain proofs use it: no interaction PoW,
   the boundary states mixed a word at a time, and the proof's own

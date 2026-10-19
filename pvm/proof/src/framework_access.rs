@@ -9,7 +9,7 @@ use stwo::core::{
     air::{Component, Components},
     circle::CirclePoint,
     fields::qm31::SecureField,
-    pcs::{PcsConfig, TreeVec},
+    pcs::{PcsConfig, TreeVec, quotients::deep_values_of_column},
     proof::StarkProof,
     vcs_lifted::merkle_hasher::MerkleHasherLifted,
 };
@@ -95,6 +95,10 @@ impl AirLayout {
     /// protocol: the composition split and sampled at the out-of-domain
     /// point itself.
     ///
+    /// The values the DEEP quotient batches, `B`, and the most of one
+    /// column, `c`, count a column's samples and, for a column sampled at
+    /// two points, the periodicity value the batch adds.
+    ///
     /// The logup fractions are bounded from the interaction tree: each QM31
     /// column, four of its base columns, finalizes at most two fractions a
     /// row (`finalize_logup_in_pairs`), so a base column of `2^l` rows holds
@@ -110,9 +114,19 @@ impl AirLayout {
                 .max()
                 .unwrap_or(0),
             log_composition_degree_bound: self.composition_log_degree_bound,
-            sampled_values: self.samples.iter().flatten().map(|&n| n as u64).sum(),
-            max_samples_per_column: self.samples.iter().flatten().copied().max().unwrap_or(0)
-                as u64,
+            sampled_values: self
+                .samples
+                .iter()
+                .flatten()
+                .map(|&n| deep_values_of_column(n) as u64)
+                .sum(),
+            max_samples_per_column: self
+                .samples
+                .iter()
+                .flatten()
+                .map(|&n| deep_values_of_column(n))
+                .max()
+                .unwrap_or(0) as u64,
             constraints: components
                 .iter()
                 .map(|component| component.n_constraints() as u64)

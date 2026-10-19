@@ -84,7 +84,7 @@ fn the_unmasked_counts_do_not_move() {
     assert_eq!(
         MASKED_WRAP_REFERENCE,
         SecurityShape {
-            sampled_values: 2 * (458 + 24),
+            sampled_values: 538,
             constraints: 313 + 2,
             logup_fractions: (6 << 14) + (5 << 15) + (7 << 11),
             ..levels
@@ -222,16 +222,16 @@ fn the_interaction_pow_does_not_bind() {
 }
 
 /// Format 39 rests on affine batching (`DIVERGENCE-012`), as 28 does.
-/// Batched by powers, the batching term caps it at 76.14 at blowup 32 and
-/// 73.64 at blowup 64, however many queries are taken; only blowup 8, with
-/// 43 queries, reaches 80. The verifier's check says so.
+/// Batched by powers, the batching term caps it at 76.98 at blowup 32 and
+/// 74.48 at blowup 64, however many queries are taken; only blowup 8, with
+/// 41 queries, reaches 80. The verifier's check says so.
 #[test]
 fn the_masked_wrap_needs_affine_batching() {
     let powers = |log_blowup, n_queries| FormatParams {
         batching: DeepBatching::Powers,
         ..masked(log_blowup, n_queries, 26, 3, 6)
     };
-    for (log_blowup, low, high) in [(5, 76.13, 76.14), (6, 73.63, 73.64)] {
+    for (log_blowup, low, high) in [(5, 76.97, 76.98), (6, 74.47, 74.48)] {
         for n_queries in [24, 256] {
             let cap = count(&powers(log_blowup, n_queries), &MASKED_WRAP_REFERENCE);
             assert!(
@@ -245,7 +245,7 @@ fn the_masked_wrap_needs_affine_batching() {
             count(&powers(log_blowup, n_queries), &MASKED_WRAP_REFERENCE) >= 80.0
         })
     };
-    assert_eq!([6, 5, 4, 3].map(least), [None, None, None, Some(43)]);
+    assert_eq!([6, 5, 4, 3].map(least), [None, None, None, Some(41)]);
 
     let by_powers = Format {
         params: powers(5, 24),
