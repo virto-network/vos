@@ -11,12 +11,222 @@ Throwaway code on local branches, each spike with its gate and fallback
 
 ### 6.0a: the in-kernel prologue, measured before the keyspace changes
 
-Running. It sets `Limits::served` and the served witness's transport.
+**Built** on `spike/s6-prologue` (`9c284405`, from `27967322`; local, not
+pushed, throwaway):
+- **`agent/test-actors/prologue`:** attestable methods that run a
+  prototype prologue on a hand-assembled `Served`: the rows' `BatchProof`
+  against `agent_root` by `verify_encoded`, each row key required to start
+  `0x03 ‖ instance`; the space path `RepKey(agent, 0, w) → agent_root`
+  against `rep_root`; `S_w`; `public_args`; the io-hash with one
+  `RootRead`. The kernel returns `SCALE(KernelReturn)`, capped at
+  `Limits::attest`. Three kernels: `holds` (one row, a balance),
+  `window` (16 rows, summed) and `probe` (each part switched on or off, to
+  cost them by difference);
+- **the SDK (spike only):** `runtime::{Root, Rooted, attested_rooted}`,
+  and `#[messages]` routing a method that returns `Rooted` to it, so the
+  halt's φ9..12 is the io-hash over the three parts, as pin E has it;
+- **the fixture:** the agent's map at 1,000,000 rows under R4's full key
+  (the +10 B a leaf counted), cipher-clerk accounts as values; the
+  representative's tree at 1,024 agents × windows w−2..w (3,072 rows,
+  escaped `RepKey`s, seed-derived salts), w = 2,966,000, agent 517;
+- **tests** (`pvm/proof/tests/kernel/prologue.rs`): `the_prologue_measures`,
+  `the_prologue_refuses` and `the_prologue_proves`, all passing
+  [measured].
+
+**Measured** (format 35 segments) [measured]:
+
+| run | steps | compressions | witness input |
+|---|---|---|---|
+| `holds` (1 row, full prologue) | 33,302 | 40 | 1,710 B |
+| `window` (16 rows, full prologue) | 205,841 | 326 | 14,331 B |
+| probe 1 row: none / rows / rows+path | 9,488 / 23,559 / 32,755 | 2 / 26 / 40 | 1,704 B |
+| probe 16 rows: none / rows / rows+path | 39,821 / 197,011 / 206,223 | 2 / 312 / 326 | 14,333 B |
+
+- **the path** at 1,024 agents: 9,196 steps and **14 compressions** (12
+  branches, the leaf and its `vh`), `S_w` one more; `space_path` **506 B**,
+  **590 B** with the leaf's salt and the two roots;
+- **a row** ((`window` − `holds`) / 15): **19.07 compressions**, **842 B**,
+  11,503 steps (about 9,540 the multiproof's, 2,020 the decode and the
+  body); the first row pays the multiproof's shared top (24 compressions,
+  14,071 steps);
+- **the baseline** (decode, `S_w`, `public_args`, the io-hash): 9,488
+  steps, 2 compressions;
+- **proving** (a shared machine, so the times are noisy): `holds` 2
+  segments in 16.3 s, peak heap 4,791 MiB; `window` 11 segments (9 of
+  class 1, 2 of class 0) in 182 s, 4,791 / 2,548 MiB. The chain verifies
+  against the program with the io-hash recomputed from the split return.
+  The recursion was not run (optional);
+- **refusals:** the kernel traps on a row's value flipped, the rows' proof
+  tampered, the space path tampered, `rep_root` changed and the leaf's
+  salt changed.
+
+**Against the estimates** (`design-roots` §5.5): the path was about 13
+compressions and 0.45 KB [est], 14 and 506 B measured, since the
+representative keeps three windows an agent (+1.6 levels) and the escaped
+`RepKey` is 33 B; a row about 20 and 812 B [est], 19.07 and 842 B with
+R4's 10 B. **Scaling of the path** [est]: +1 compression, +36 B and about
+650 steps a doubling of agents: about 17–18 and 0.7 KB at 10k agents,
+about 24 (+1) and 0.95 KB at 1M, still within the gate.
+
+**Gates:**
+
+| gate | bound | measured | verdict |
+|---|---|---|---|
+| the path at 1,024 agents | ≤ 30 compressions, ≤ 1 KiB | 14 (+1 for `S_w`), 506 B (590 B with salt and roots) | pass |
+| a row | ≤ 25 compressions, ≤ 1 KiB | 19.07, 842 B | pass |
+| the 16-row kernel | ≤ 1M steps | 205,841 (asserted) | pass |
+
+No fallback: `verify_encoded` spends about 500–650 steps a compression on
+byte handling, a 6.13 lever if the 1M-step target tightens, not a blocker.
+
+**The transport: inline** [read]. No host call lets a step's refine read
+a blob by hash: the actor ops have none (`agent/wire/src/abi.rs`); the
+agent's `historical_lookup` is answered by `AgentPrograms` for pinned or
+installing programs only (`node/host/src/pvm.rs`), the testkit alike; no
+batch `Input` names a blob; slice 4's 4.4a `LargeResult` carries refine's
+output, never its input. A blob path needs a `Resume { served: BlobRef }`,
+`AgentPrograms` answering the hashes a batch names, a lookup into the
+kernel's input, and on JAM a solicit, a provide and availability.
+
+**The decisions it settles:**
+- **`Limits::served` = 128 KiB on VOS,** the `Served` inline in the
+  `Resume` input under that cap and not `REQUEST`; `witness_input` = the
+  arguments ‖ `SCALE(Served)`, held inline in the `Attest` record. 128 KiB
+  holds about 155 rows, about 2,970 compressions and 1.8M steps [est, from
+  the measured costs], under JAM's 4,096-compression kernel cap; at a
+  1M-step window target a kernel reads about 84 rows (71 KB) [est];
+- **an at-cut attest counts 2 against `Limits::attests`** (the review's
+  correction of the log's "`ATTESTS` 8 for `attest_at_cut`"): `cap.rs`'s
+  attest term `16 × (REQUEST + REPLY + 40)` = 2,097,792 then bounds it,
+  since 8 × (64 Ki + 128 Ki + 64 Ki + 40) = 2,097,472 [arithmetic];
+- **JAM's `Limits::served`** is its own, 32 KiB [proposed; 6.13 sets it],
+  inside CE 133's package bound (6.0b).
+
+**Findings for the plan** (pin E, applied in `e50bb030`): `Served` and
+`Closed` carry the representative leaf's salt (`rep_salt`, seed-derived;
+a zero salt would break "JAM's tree hashes `0x03` leaves the same way");
+the prologue checks each row key's `0x03 ‖ instance` prefix; witness
+decoding hits a class's page budget (8 pages at class 1) before its step
+budget, so the 16-row kernel takes 11 segments for 206k steps (the first
+four class-1 segments hold 10–19k steps each): a larger-page class for
+`&self` kernels or decode in place, measured with 6.18.
 
 ### 6.0b: the JAM venue's program and PolkaJam
 
-Running. It decides the proof's transport on JAM (the work item's payload
-or a preimage).
+**Built** on `spike/s6-jam` (`c4095bf2`, from `spike/s6-mask`
+`5227bf6c`; local, not pushed, throwaway): a `masked-only` feature in
+`vos-pvm-final-verifier` (`masked::verify_any` dispatches 39 alone) and
+`vos-statement` (`Admitted::verify` through it, so neither 28 nor 40
+links); a `jam-service` feature (PolkaJam probe only: the proof in the
+work item's payload, fetched whole into the heap, and an `accumulate`
+that stores each refine output); `pvm/proof/statement/tests/spike_jam.rs`,
+each ELF linked by `link_elf_spi` and run on the JAM-only host on spike
+6a's 162,762 B format-39 proof. Release profile (fat LTO, one codegen
+unit), nightly-2025-07-14.
+
+**The masked-only program** [measured]:
+
+| build | ELF B | program B | vs 524,288 | total gas | decode | verify |
+|---|---|---|---|---|---|---|
+| 28, 39, 40, opt 3 (spike 6a's) | 869,592 | 538,683 | 14,395 over | 118,751,802 | 20,292,196 | 98,374,425 |
+| **39 alone, opt 3** | 807,816 | **500,205** | **24,083 under** | **118,745,936** | 20,292,196 | 98,368,559 |
+| 39 alone, opt `s` | 587,232 | 275,227 | 249,061 under | 165,760,063 | 27,337,533 | 138,336,891 |
+| 39 alone, opt `z` | 671,008 | 238,422 | 285,866 under | 307,606,241 | 62,418,479 | 245,063,442 |
+| 39 alone + `jam-service`, opt 3 | 812,824 | 502,454 | 21,834 under | 118,740,340 | 20,292,185 | 98,362,949 |
+
+- every run accepted; heap peak 370 KiB, high water 982 KiB;
+- dropping 28 and 40 saves 38,478 B (−7.1%) and no gas;
+- `s` costs +39.6% gas (over 6.19's 150M gate) and `z` ×2.59 for bytes no
+  cap needs: **opt 3 stays the venue's build**;
+- stripping does not apply: the ELF's extra bytes are its symbols and the
+  relocations `link_elf_spi` reads; stripped copies link to larger
+  programs (+2.2–2.4 KB), and the stripped `z` build does not run.
+
+**Gate (informative): passes** at opt 3, 500,205 B under 512 KiB. The
+review: this does not make an actor-hosted venue possible, since 118.7M
+gas breaks `MAX_HANDLER_GAS` (100M) whatever the bytes, and 6.19's
+service (ed25519, the items, accumulate) will likely pass 512 KiB; moot
+under the 4,000,000 B service cap.
+
+**PolkaJam v0.8.0** [measured]: `paritytech/polkajam-releases` `v0.8.0`
+(2026-10-16), `polkajam-v0.8.0-linux-x86_64.tgz`, sha256
+`e90c8ccd07d392c91a12da6db59bfb916f2c0158928c97468a51461f9ecfdfeb`,
+under `~/.cache/vos/polkajam/v0.8.0/` (nothing in the repository fetches
+it). `polkajam` and `jamt` 0.1.29, GP 0.8.0; `jamt` and the testnet binary
+byte-identical to `nightly-2026-10-13`, only `polkajam` differs. On the
+interpreter (the recompiler still waits for owner action A2):
+- **`just jam-testnet` runs the agent:** its two actors installed, the
+  workflow across three later packages (70 pages exported, 104 imported),
+  all 8 packages landed at their first attempt, each work result read back
+  from DA equal to the simulation's and the VOS node's, the chain's root
+  the builder's, no testnet error; refines 0.24M–39.1M gas (JAM-only
+  host). **No fallback version is needed;**
+- **one statement's refine,** the masked-only service (opt 3, program
+  502,454 B) deployed on the testnet, one 174,080 B work item carrying the
+  proof, accumulate storing the verdict, read back:
+
+| | PolkaJam v0.8.0 | JAM-only host | Δ |
+|---|---|---|---|
+| verdict | accept | accept | |
+| start → end | **118,707,974** | **118,697,388** | +10,586 |
+| fetch (16 KiB probe + 170 KiB) | 52,648 | 42,062 | +10,586 |
+| decode | 20,292,292 | 20,292,292 | 0 |
+| verify | 98,363,034 | 98,363,034 | 0 |
+
+- **instruction gas agrees to the unit;** the whole difference is
+  `fetch`'s price: GP 0.8.0 prices a payload (case 13) at 95 + 96 a KiB
+  (`definitions.tex`) [read], the JAM-only host at 10 + 40 a KiB, so
+  (95−10)·2 + (96−40)·186 = 10,586 exactly. The host's linear fit was made
+  on one length, an import segment (171 gas, flat in GP), so it is right
+  for imports only; 6.19 takes GP's per-kind table (the review);
+- refine is within the testnet's 1e9 and 6.19's 150M (118.7M); the package
+  landed about 13 s after submission.
+
+**The proof's transport** [read, measured]: Gray Paper 0.8.0 bounds no
+single payload, only the bundle's sum by W_B = 13,791,360 B. But JAM-NP
+CE 133 (work-package submission) caps its first message, `Core Index ++
+Work-Package`, at 2 + 200·1024 = **204,802 B**, extrinsics travelling in a
+second message under W_B alone (CE 146 alike). PolkaJam enforces it: with
+this package's 269 B of overhead, **a 204,533 B payload is accepted and
+204,534 B refused** ("Message size 204803 outside expected range
+0..=204802", 12 refusals in the debug log), deterministic on the second
+testnet; on the first, submissions of 201,584–201,600 B failed
+intermittently, unexplained, so any cap keeps a margin. The 174,080 B
+item (and 201,584 B ones) landed with verdict accept. **Pin F's 256 KiB
+proof does not fit a payload.**
+
+**The decisions it settles** (the review agreeing with the log's option 1,
+for a reason the log did not give):
+- **the proof as the `Submit` item's extrinsic, the statement in its
+  payload:** under W_B, outside CE 133's bound, one package, no
+  solicit, provide or availability step, and pin F's bounds uniform at
+  every venue (a payload would leave as little as about 136 KiB for the
+  proof beside a 64 KiB statement). Read by `fetch` case 4 (85 + 96 a
+  KiB, about 16K gas for 160 KB [est]);
+- **submitted through PolkaJam's `submitWorkPackage` RPC** with the
+  extrinsics beside the package (JIP-2, in the binary's strings; `jamt
+  item` takes none), not a CE 133 client of our own (the review's
+  correction of the log's tooling cost);
+- **[read], not [measured]:** no extrinsic over 200 KiB has landed yet, so
+  6.19 measures one first (256 KiB, refined, read with case 4); the
+  fallback is the payload with a JAM proof cap of at most 196 KiB −
+  |statement|;
+- the preimage path stays for the harness alone; opt-level 3; PolkaJam
+  v0.8.0 pinned at its sha256; `fetch` priced by GP 0.8.0's per-kind
+  table with PolkaJam ≡ JAM-only host to the unit as 6.19's gate.
+
+**A pre-existing defect, found by the review:** the default agent's JAM
+builder checks the wrong bound. `node/jam/src/live/` submits each
+package with `jamt item <payload>`, the payload the whole batch and its
+witness, and `node/jam/src/builder/fit.rs` checks only `payload +
+segments·4,104 ≤ MAX_INPUT` (12 MiB, W_B). A package whose payload passes
+about 200 KiB is built and then refused by every guarantor, `jamt`
+reporting only "Failed to submit … to even a single proxy/guarantor".
+Slices 4 and 5's payloads were small; 6.13's inline served on a
+JAM-hosted agent, or any batch of large inputs, will meet it. **Carried,
+owned by 6.19:** `fits` bounds the payload and the package's framing
+within 204,800 B as well, and an input whose own witness cannot fit is
+refused or moved to an extrinsic through the same submitter.
 
 ### 6.0d: the docs
 
@@ -121,8 +331,125 @@ draft's old name is left in `docs/`.
 
 ### 6.0e: a Rust client on a Kreivo dev chain
 
-Running. It picks the subxt release that reads stable2606-2's metadata,
-or the raw JSON-RPC fallback, for 6.17b.
+**Built** on `spike/s6-kclient` (`c47481f9`, from `27967322`; local, not
+pushed, throwaway): `spikes/s6-kclient`, a standalone workspace on
+nightly-2025-07-14. The runtime: Kreivo master `87f8728`, unmodified,
+built with `-p kreivo-runtime` (stable 1.94.1, `wasm32v1-none`, 9 min 14
+s): `kreivo_runtime.compact.compressed.wasm`, 2,111,517 B; the client
+checks it is pristine (45 pallets, no index 90). The node:
+`polkadot-omni-node` from `polkadot-stable2606-2` (1.24.2-72284b37a23),
+its sha256 checked as Kreivo's CI does.
+
+**The dev chain:** `omni-node --dev` works, so chopsticks was not needed.
+`chain-spec-builder … named-preset development` (`dev_genesis(2281)`),
+then `--dev --dev-block-time 2000`. Aura (sr25519), `u32` block numbers,
+instant seal (best = finalized), `kreivo-parachain` spec 134,
+transaction version 13, metadata V16 (of 14, 15, 16), `Timestamp.Now` on
+the wall clock.
+
+**The round trip** [measured]:
+1. **the call by hand:** `[0, 7] ++ SCALE(Vec<u8>)` (System,
+   `remark_with_event`, both checked against the metadata), 20 B, through
+   a `RawCall` payload whose `EncodeAsFields` writes the bytes verbatim;
+   `call_data` and the call inside the included extrinsic are asserted
+   byte-identical to them. The pinned `[90, call] ++ SCALE(args)` calls
+   go this way;
+2. **the nonce** by `AccountNonceApi`;
+3. **the envelope from the live metadata:**
+   `DefaultExtrinsicParamsBuilder::new().mortal(64).nonce(n)`, signed by
+   the sr25519 dev key `alice`: a v4 extrinsic of 127 B, its explicit
+   extension bytes `00 3500 00 00 00`;
+4. **inclusion** by `submit_and_watch`: block 4, extrinsic index 2, found
+   by hashing the block's body;
+5. **the event** from `System.Events` read as a raw key, delimited
+   against the live metadata, filtered by `ApplyExtrinsic(2)`:
+   `System::Remarked` decoded by its pinned layout, sender = Alice and
+   hash = `blake2_256(remark)` asserted;
+6. **raw storage:** `System.Account[alice]` decoded by hand, the nonce
+   asserted up by 1; `Timestamp.Now` read raw;
+7. **the fee:** 667,629,076 planck for 127 B.
+
+A second run (nonce 1 → 2) and a run on another runtime build passed
+alike.
+
+**Gate: passes.** The round trip works with **subxt and subxt-signer
+0.51.1** (frame-decode 0.18.1, jsonrpsee 0.26.1), `PolkadotConfig`
+unchanged, no `#[subxt]` macro needed; the raw JSON-RPC fallback was
+not needed, so 6.17b takes its lower estimate (1.5 weeks).
+
+**Kreivo's transaction extensions,** in metadata order (version 0;
+extrinsic versions 4 and 5, subxt encodes 4): `PassAuthenticate`
+(explicit `Option<AuthenticateParams>`, sent as None), `CheckNonZeroSender`,
+`CheckSpecVersion`, `CheckTxVersion`, `CheckGenesis`, `CheckMortality`,
+`CheckNonce`, `CheckWeight`, `ChargeAssetTxPayment` (the whole fee stack
+shows as its inner identifier and data, so `ChargeSpaceFee` keeping them,
+`spaces-pallet.md` §7, leaves the envelope unchanged, as the design
+assumes) and `DynamicMaxBlockWeight`.
+
+**The decisions it settles for 6.17b:**
+- **`PassAuthenticate` pinned** to None as a typed `TransactionExtension`:
+  subxt has no support for it and encodes it only through frame-decode's
+  fallback ("an unknown extension whose type holds an `Option` is None"),
+  which a subxt bump or a type change in frame-contrib could alter
+  silently;
+- **the live extension list checked** against the expected ten in order,
+  and an unknown one refused before signing (the review's addition: a new
+  extension such as `CheckMetadataHash` would otherwise be defaulted or
+  the extrinsic rejected without a clear error);
+- the `calls` layer needs only `RawCall` on top of subxt.
+
+**Left open** (the review, not blockers): the workspace build is
+untested (subxt's crates behind `kreivo`, VOS on tokio 1.50 where the
+spike resolved 1.53.3), so 6.17b's first act is the dependency and `just
+check`; `--dev` seals instantly, so finality lag and reorgs are the mock
+transport's to test.
+
+### The review
+
+Opus, read-only, on the three logs and branches against the plan at
+`bcd4f5b9`, by reading the code (`cap.rs`, `invocation.rs`, `host.rs`,
+`node/host/src/pvm.rs`, `node/jam/src/{gas.rs,builder/fit.rs,live/}`,
+`refine_host/jam.rs`), recomputing the arithmetic and grepping the
+testnet logs and GP 0.8.0's `definitions.tex`. **All three gates pass as
+claimed and the numbers are sound.** Its corrections and additions:
+- **6.0a's `ATTESTS` 8 rule** was ambiguous (8 at-cut and 8 plain records
+  would be about 3.1 MB against the 2.1 MB term): an at-cut attest counts
+  2 against `Limits::attests` instead. Even with no rule, 16 plain and 1
+  at-cut hold (STEP margin 343 KB, WORKFLOW 153 KB). The kernel's whole
+  return is capped at `Limits::attest`, the 40 B framing is re-derived for
+  `window` and `roots`, and the workflow's record keeps the attest's
+  return, never the `Resume`'s served bytes (`WORKFLOW_ROWS` and
+  `gas.rs`'s `RECORD` size it at `REQUEST`);
+- **`rep_salt`, not a zero salt,** carried in `Closed` as well as
+  `Served`; JAM's own `Limits::served` (32 KiB proposed), with
+  `JAM.within(&VOS)`, `gas::effects(&cap::JAM)` and `WORST_JAM_STEP`
+  gaining the term;
+- **6.0a's untested refusals** (a row of another instance, an absent row,
+  a wrong `served.agent`) are 6.13's tests;
+- **6.0b's tooling cost:** `submitWorkPackage`, not a CE 133 client; the
+  extrinsic transport is [read] until 6.19 measures one;
+- **CE 133 binds the default agent's builder** (above), carried to 6.19;
+- **6.0e:** the extension list checked as well as `PassAuthenticate`
+  pinned; the workspace integration untested.
+
+Its plan edits (pin E's E1–E7, pin F's F1, 6.0's outputs, 6.13's S13a–d,
+6.17b's S17a–c, 6.19's S19a–e, risks R1–R3, decisions D1–D3), with 6.1's
+powers cap at 76.14 (not 76.15) and the consequences they carry (6.13's
+files, 6.18's traced re-run and 6.20's carriers on the inline served;
+the dedicated-service decision no longer citing the 512 KiB cap; M3b at
+4–5.5 weeks and the slice at 32–48.5, so `proving.md` §11's "about
+76–118" total stays within its rounding), applied in `e50bb030`.
+`doc-fixes.md`'s items that 6.0a and 6.0b overturn were amended there:
+`proving.md` 3, 21 and 32 and the Clerk's 5 to the inline served witness
+(at 6.13; 21 is the measurement now), `proving.md` 20 to the extrinsic
+transport (at 6.19). The texts 6.0d applied from items 3, 20 and the
+Clerk's 5 (`proving.md` §3.2 and §6, `clerk-across-spaces.md`) still
+read "by hash" and "6.0b decides" until those steps.
+
+**Commits:** `e50bb030` the plan and `doc-fixes.md`; this entry.
+
+**6.0 done:** the three spikes passed their gates with no fallback
+taken, 6.0d's docs applied, and the plan carries their results.
 
 ## Step 6.1: format 39 and the masked security count
 
