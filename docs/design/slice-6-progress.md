@@ -1059,6 +1059,154 @@ blockers. Folded (`1fb3f717`):
 
 **6.4 accepted.**
 
+## Step 6.5: `vos-statement` at the accepted set, the fixtures, the harnesses
+
+**`vos-statement`** (pin F):
+- **the accepted set:** `admit`'s `format != FORMAT` gone (`FORMAT` with
+  it); a statement's format must be one the venue accepts and one this
+  build links (`LINKED`, the final verifier's: `[39]`, `[28, 39]` under
+  `test-formats`), else `Format` (2); `Admitted` carries the format, and
+  the proof is read under it through the verifier's dispatch;
+- **`Pin { program, venue_bound }`** in place of the bare id, in `admit`,
+  `judge` and the model's `Input`; `Venue::id() -> VenueId`;
+  `Refusal::Venue` (code 7): a venue-bound program's statement whose
+  `public_args[..32]` is not the venue's id (a shorter one included);
+- **the order:** the format; the program; the venue if venue-bound; the
+  space; every root anchored (`Venue::anchored` now names the space's range
+  and `MaxRootAge`); the io-hash and the id; unseen; the proof;
+- **`seen_expiry(statement, clock)`**, pin F's `Seen` rule: a rooted
+  statement's entry until `B_wmax + MaxRootAge` (its newest root, whatever
+  the roots' order), a rootless one's `u64::MAX`, never; a boundary past
+  `u64` keeps it for ever too;
+- **`test-formats`** its own feature (the verifier's), off in every normal
+  build; the crate's tests enable it on a dev edge; `fixtures` and
+  `pvm-guest` do not imply it.
+
+**The model** (`model.rs`): `Policy` gains the venue's id, its time
+(`now_ms`), the registered spaces (`Space { id, clock, range: (from_w,
+Option<until_w>) }`, the end exclusive: a migration's `from_window`), and
+`Seen` entries with their expiry; `anchored` is a registered space, the
+window within its range, `now − B_w ≤ MaxRootAge`, and the root listed;
+`record` inserts under the `Seen` rule, `advance(now)` drops anchors past
+`MaxRootAge` and entries past their expiry; `Input`'s encoding carries
+them (a flag byte 0 or 1, else `Noncanonical`).
+
+**The fixtures**, regenerated (`pvm/proof/tests/kernel/fixtures.rs`;
+80 s [measured]): `S` (venue-bound, `public_args` the venue's id and a
+nonce, two roots) wrapped under 39 from the seeded seam (`MaskRng::Seeded`,
+`vos-pvm-proof`'s dev edge enabling `seeded-masks`): `wrap.proof` 145,796
+B; under 28: `wrap-28.proof` 123,797 B; the cheating wraps under 39
+(`wrap-prefix.proof` 146,052 B, `wrap-midway.proof` 147,076 B: the masked
+prover proves the lenient trace, the verifier refuses it `0x109`); a second
+kernel's rootless `S0`, one segment, its leaf wrapped under 39:
+`wrap-rootless.proof` 146,052 B; `statements.cases` 18,057 B, 29 cases.
+The stale test holds every file byte for byte under the seed (a second run:
+`the_fixtures_are_the_generators` and `the_fixtures_are_judged` green); the
+segment fixtures unchanged. The production venue accepts {39}, the test
+venue {28, 39}; both register `S`'s space from window 40 (the default
+clock) and judge at window 42's boundary. Each case but the three accepted
+is a replay of an accepted statement with one thing changed:
+
+| field | case | code |
+|---|---|---|
+| the space | the space; another space (a root's); rootless, another space | `0x4` |
+| no space (6.10's carried case) | rooted, of no space (`S` claiming `NONE`, its roots `NONE`, registered and anchored) | `0x4` |
+| the format | unaccepted format (30); format 28 at a production venue | `0x2` |
+| the venue | another venue's statement (`public_args[31]`); replayed at another venue | `0x7` |
+| a root's window; a root | a root's window (42 → 43); a root (a byte); unanchored root | `0x5` |
+| the nonce | the nonce (`public_args`' last byte) | `0x108` |
+| the program | another program than the pin | `0x3` |
+| the migration range | migrated before a root's window (`(40, Some(42))`); registered after it (`(42, None)`) | `0x5` |
+| time | rooted, replayed past MaxRootAge (`Seen` and anchors dropped) | `0x5` |
+| time | rootless, replayed past MaxRootAge (`Seen` kept) | `0x6` |
+| the transition, test policy | accepted under 39, replayed under 28; accepted under 28, replayed under 39 (each accepted first by `judge`, then `record`ed) | `0x6` |
+
+and, as before: valid, rootless, format 28 at the test venue (accepted);
+tampered (`0x112`), tampered under 28 at the test venue (`0x112`); wrong
+program and wrong io-hash (`0x108`); prefix and mid-way (`0x109`);
+repeated (`0x6`). The old transition case (successor 38, recorded by id)
+is replaced by the real one under {28, 39}.
+
+**Every fixture judged alike** [measured]: the recorded verdict is a build
+linking 28 and 39; one linking 39 alone refuses a statement of 28 as `0x2`,
+its first check (`Fixture::verdict_linking`):
+- natively (the crate's tests, both linked): 29 of 29;
+- **Wasm** (`just judge-wasm`): the production blob (39 alone, 323,079 B)
+  and the test blob (`--features test-formats`, 392,315 B), each under the
+  PVF's semantics and the client's, 29 of 29 each; valid 47,443,561
+  instructions under the PVF's semantics (≤ 50M), 46,764,990 the client's;
+  rootless 47,506,951; 28 at the test venue 38,314,404 (test blob); a
+  refusal before the proof about 11,700;
+- **the JAM-only host:** `final-verify.elf` (39 alone) and
+  `final-verify-test.elf` (28 beside it), 29 of 29 each; valid 109.7M gas,
+  rootless 109.8M, 28 at the test venue 96.5M (test guest), tampered
+  70.0M, the words' refusals 14.0–14.2M, every refusal before the proof
+  0.1M;
+- **the JAM program's size:** production **523,362 B** (ELF 847,536 B):
+  within 512 KiB (524,288 B) by 926 B, and JAM's 4,000,000 B; the test
+  guest 610,809 B (ELF 966,040 B; 6.4's two-format program was 608,634 B).
+  A test holds the production program within 4,000,000 B and smaller than
+  the test one.
+
+**The builds:** `final-verify` and `final-verify-test` are one program
+(`src/guest.rs`), two bins; a build of either under the other's features
+fails at compile time (a `const` assert on `CARGO_BIN_NAME` and
+`test-formats`; checked: `final-verify` under `test-formats` refused).
+`check-no-std` builds both, the final verifier and `vos-statement` without
+`test-formats` for thumbv7em and wasm32. The Wasm blob gains a
+`test-formats` feature (`vos-statement`'s), built into
+`target/test-formats` by `judge-wasm`; the runner's `judge` takes the
+formats the blob links (`39`, `28,39`). The runner's lock drops postcard.
+
+**`just check-no-test-formats`** (in `check` and `ci`, beside
+`check-no-seeded-masks`): every package's enabled features
+(`cargo tree -e no-dev -f '{p} {f}'`) of the workspace and of the agent,
+the Wasm blob and its runner, none `test-formats`; `vos-statement`'s
+`fixtures` and `pvm-guest` do not imply it. The fuzz crate, built apart,
+fuzzes 28 too and is no venue. `cargo tree -e features` without `-i` shows
+only the features a dependency's declaration names, not those enabled
+through another feature (the blob with `--features test-formats` showed
+none), so both checks now read `{f}`: `check-no-seeded-masks` had the same
+gap.
+
+**The consumers:** the recursion tests run 28 on the test guest and 39 on
+the production guest, which refuses 28 as `Format` in its words mode; the
+kernels' end-to-end judgements (`judged_statement`, 28, rootless, not
+venue-bound) on the test guest; the fuzz goldens are the fixtures' (39's
+`valid` and `rootless`, 28's), `statement_decode`'s oracle each accepted
+statement's format linked and accepted, its pin, its venue prefix if
+venue-bound, the proof the golden of its format and words; the seed reads
+the five wraps. Each target 60 s [measured]: `final_verifier_bytes` 72,550
+runs, `final_verifier_mutate` 1,234, `statement_decode` 45,088, no crash.
+
+**Docs:** `proving.md` §3.6 (the check order, `Seen` and time) and A.6
+(the cases at 39, the table); `spaces-pallet.md` (`judge(&venue, &pin, …)`,
+`Pin`, code 7 landed, `seen_expiry`).
+
+**For the review (Fable):**
+- the format check refuses an unlinked format as `0x2` even when the
+  venue's policy accepts it, so a production venue's verdicts on 28 never
+  depend on its policy;
+- `Admitted::verify` passes `&[format]` as the accepted set, after `admit`
+  checked the venue accepts it;
+- `public_args[..32]` compares the raw bytes: the venue's id is the
+  kernel's first `#[public]` argument, SCALE of `[u8; 32]` its 32 bytes;
+- the model's `anchored` holds the age by the venue's `now_ms`, so
+  `anchored` and the `Seen` expiry meet at `now = B_wmax + MaxRootAge`
+  (both still alive);
+- the production guest is 926 B under 512 KiB: 6.19's service build, or
+  any code the judgement gains, may cross it (4,000,000 B is JAM's bound).
+
+**Gates:** `just check` green (88 test binaries, 1,199 passed, 0 failed;
+a first run failed `doc-check` on the final verifier's intra-doc link to
+`unmasked`, a module no longer built without `test-formats`, now plain
+text); `just judge-wasm`; the fixtures' stale and judged tests;
+the test-proof binaries (`gates`, `isa`, `kernel`) build. The milestone's
+`test-proof` (the kernels' end-to-end judgements now on the test guest) is
+not run here.
+
+**Commits:** `152f4902` the step; this record.
+
 ## Step 6.8: the recursion AIR's forgery gates
 
 **Built** on `s6/forgery` (from `27967322`): a new test binary,
