@@ -189,7 +189,9 @@ check-no-test-formats:
 # end-to-end tests run on the JAM-only host: `final-verify.elf`, the
 # production venue's, linking format 39 alone, and `final-verify-test.elf`,
 # linking 28 beside it for the test policy's fixtures. The final verifier and
-# `vos-statement` build here without `test-formats`.
+# `vos-statement` build here without `test-formats`. The guest's two bins and
+# the Wasm blob, crate roots the workspace's lints do not reach, are linted
+# here under the verify path's denies.
 check-no-std:
     cargo build -p vos-raft --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     cargo build -p vos-pvm-proof-verifier --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
@@ -202,6 +204,10 @@ check-no-std:
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-statement --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
     cargo build -p vos-statement --release --features pvm-guest --bin final-verify --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
     cargo build -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+    cargo clippy -p vos-statement --release --features pvm-guest --bin final-verify --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --quiet -- -D warnings
+    cargo clippy -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --quiet -- -D warnings
+    cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --quiet -- -D warnings
+    cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --features test-formats --target-dir target/test-formats --quiet -- -D warnings
 
 # The fuzz targets (`pvm/proof/fuzz`, built apart with `cargo fuzz`): the
 # final verifier on arbitrary bytes, on the golden wraps mutated, on format
@@ -222,11 +228,12 @@ fuzz-replay:
 
 # Each target five minutes from its corpus, seeded from the fixtures and the
 # anchor's vectors, the checked-in corpus beside it: no crash. One at a time;
+# the sanitized targets with debug assertions and overflow checks (`-a`),
 # the prove target optimized and without a sanitizer, its proving too slow
 # under either.
 fuzz:
     cd pvm/proof/fuzz; cargo run --release --example seed
-    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{fuzz_targets}}" | split row ' ') { let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [] }; cargo fuzz run ...$build $target $"corpus/($target)" $"replay/($target)" -- -max_total_time=300 -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
+    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{fuzz_targets}}" | split row ' ') { let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [-a] }; cargo fuzz run ...$build $target $"corpus/($target)" $"replay/($target)" -- -max_total_time=300 -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the

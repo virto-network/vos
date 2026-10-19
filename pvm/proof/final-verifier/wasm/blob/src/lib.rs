@@ -19,6 +19,19 @@
 //! Blake2b-256 is computed in the blob.
 
 #![no_std]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::arithmetic_side_effects,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
+    )
+)]
 
 extern crate alloc;
 
@@ -50,8 +63,13 @@ unsafe impl GlobalAlloc for RuntimeAllocator {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let align = layout.align();
         let size = layout.size();
-        let ptr = unsafe { ext_allocator_malloc_version_1((size + align.saturating_sub(8)) as u32) }
-            as *mut u8;
+        let Some(bytes) = size
+            .checked_add(align.saturating_sub(8))
+            .and_then(|bytes| u32::try_from(bytes).ok())
+        else {
+            return core::ptr::null_mut();
+        };
+        let ptr = unsafe { ext_allocator_malloc_version_1(bytes) } as *mut u8;
         let offset = ptr.align_offset(align);
         if offset > Offset::MAX as usize || ptr.is_null() {
             return core::ptr::null_mut();
@@ -89,8 +107,11 @@ fn input<'a>(ptr: u32, len: u32) -> &'a [u8] {
 fn split(bytes: &[u8]) -> Option<(u32, [u32; PUBLIC_WORDS], &[u8])> {
     let (format, bytes) = bytes.split_first_chunk::<4>()?;
     let (words, proof) = bytes.split_at_checked(4 * PUBLIC_WORDS)?;
-    let words =
-        core::array::from_fn(|i| u32::from_le_bytes(words[4 * i..4 * i + 4].try_into().unwrap()));
+    let (chunks, _) = words.as_chunks::<4>();
+    let mut words = [0; PUBLIC_WORDS];
+    for (word, bytes) in words.iter_mut().zip(chunks) {
+        *word = u32::from_le_bytes(*bytes);
+    }
     Some((u32::from_le_bytes(*format), words, proof))
 }
 

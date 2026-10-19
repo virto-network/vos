@@ -47,7 +47,10 @@
         clippy::expect_used,
         clippy::indexing_slicing,
         clippy::panic,
-        clippy::arithmetic_side_effects
+        clippy::arithmetic_side_effects,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented
     )
 )]
 

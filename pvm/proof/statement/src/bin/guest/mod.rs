@@ -91,16 +91,37 @@ static HEAP: Heap = Heap {
 };
 
 /// A request's class (`Some`, its block 2^class bytes) or a page run.
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`, a page \
+              run's within it) and arena offsets below `ARENA_BYTES`, its index a class \
+              `class_of` bounds by `MAX_SMALL_SHIFT`, and a free never exceeds what is live"
+)]
 fn class_of(layout: &Layout) -> Option<u32> {
     let need = layout.size().max(layout.align()).max(1 << MIN_SHIFT);
     let shift = usize::BITS - (need - 1).leading_zeros();
     (shift <= MAX_SMALL_SHIFT && layout.align() <= PAGE).then_some(shift)
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`, a page \
+              run's within it) and arena offsets below `ARENA_BYTES`, its index a class \
+              `class_of` bounds by `MAX_SMALL_SHIFT`, and a free never exceeds what is live"
+)]
 fn round_page(n: usize) -> usize {
     n.div_ceil(PAGE) * PAGE
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`, a page \
+              run's within it) and arena offsets below `ARENA_BYTES`, its index a class \
+              `class_of` bounds by `MAX_SMALL_SHIFT`, and a free never exceeds what is live"
+)]
 impl Heap {
     fn base(&self) -> usize {
         self.arena.get() as usize
@@ -142,6 +163,13 @@ impl Heap {
     }
 }
 
+#[allow(
+    clippy::arithmetic_side_effects,
+    clippy::indexing_slicing,
+    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`, a page \
+              run's within it) and arena offsets below `ARENA_BYTES`, its index a class \
+              `class_of` bounds by `MAX_SMALL_SHIFT`, and a free never exceeds what is live"
+)]
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let state = self.state();
@@ -379,9 +407,12 @@ struct Cursor<'a> {
 
 impl Write for Cursor<'_> {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
-        let take = s.len().min(self.buf.len() - self.len);
-        self.buf[self.len..self.len + take].copy_from_slice(&s.as_bytes()[..take]);
-        self.len += take;
+        let free = self.buf.get_mut(self.len..).unwrap_or_default();
+        let take = s.len().min(free.len());
+        for (to, &from) in free.iter_mut().zip(s.as_bytes()) {
+            *to = from;
+        }
+        self.len = self.len.saturating_add(take);
         Ok(())
     }
 }
@@ -410,6 +441,7 @@ extern "C" fn verify_main() -> Output {
 }
 
 /// What the payload asks.
+#[allow(clippy::large_enum_variant, reason = "one a run, never moved")]
 enum Request {
     Words(u32, [u32; PUBLIC_WORDS]),
     Judge(Input),
@@ -429,14 +461,17 @@ fn request(payload: &[u8]) -> Option<(Request, [u8; 32], usize)> {
         WORDS => {
             let (format, body) = body.split_first_chunk::<4>()?;
             let (words, rest) = body.split_at_checked(4 * PUBLIC_WORDS)?;
-            let words = core::array::from_fn(|i| {
-                u32::from_le_bytes(words[4 * i..4 * i + 4].try_into().unwrap())
-            });
+            let (words, _) = words.as_chunks::<4>();
+            let mut out = [0; PUBLIC_WORDS];
+            for (word, bytes) in out.iter_mut().zip(words) {
+                *word = u32::from_le_bytes(*bytes);
+            }
+            let words = out;
             (Request::Words(u32::from_le_bytes(*format), words), rest)
         }
         JUDGE => {
             let (input, used) = Input::decode_prefix(body).ok()?;
-            (Request::Judge(input), &body[used..])
+            (Request::Judge(input), body.get(used..)?)
         }
         _ => return None,
     };
@@ -458,10 +493,9 @@ fn verify(report: &mut Report) -> u64 {
             0
         ]
     );
-    if len > payload.len() as u64 {
+    let Some(payload) = usize::try_from(len).ok().and_then(|len| payload.get(..len)) else {
         return BAD_PAYLOAD;
-    }
-    let payload = &payload[..len as usize];
+    };
     if let [ANCHORS, vector @ ..] = payload {
         return match Vector::decode(vector) {
             Ok(vector) => {

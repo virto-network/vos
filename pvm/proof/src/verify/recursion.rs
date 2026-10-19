@@ -578,7 +578,8 @@ pub fn replay_stark(
         );
         let flat: alloc::vec::Vec<_> = swr.iter().flatten().collect();
         let batches = ColumnSampleBatch::new_vec(&flat);
-        let lcs = column_line_coeffs(&batches).expect("column_line_coeffs");
+        let lcs = column_line_coeffs(&batches)
+            .expect("a verified proof's sample points have conjugate lines: y outside CM31");
         batches
             .iter()
             .zip(lcs)

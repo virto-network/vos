@@ -7,14 +7,17 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::fri::FriLayerProof;
 use stwo::core::vcs::blake2b_hash::Blake2bHash;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleHasher;
+use vos_pvm_final_verifier::masked::{CONFIG, LOG_DEGREE_BOUND};
 use vos_pvm_final_verifier::WrapProof;
 
 /// The most values a queried column holds: one a query.
-const QUERIES: usize = 24;
+const QUERIES: usize = CONFIG.fri_config.n_queries;
+/// The tallest tree's height: FRI's degree bound under the blowup.
+const HEIGHT: usize = (LOG_DEGREE_BOUND + CONFIG.fri_config.log_blowup_factor) as usize;
 /// The most hashes a Merkle witness holds: a sibling a query a level.
-const WITNESS_HASHES: usize = QUERIES * 22;
+const WITNESS_HASHES: usize = QUERIES * HEIGHT;
 /// The most values a FRI layer's witness holds.
-const FRI_WITNESS: usize = QUERIES << 3;
+const FRI_WITNESS: usize = QUERIES << CONFIG.fri_config.fold_step;
 
 /// A limb, `p` itself (noncanonical) among them.
 fn limb(u: &mut Unstructured<'_>) -> Result<BaseField> {

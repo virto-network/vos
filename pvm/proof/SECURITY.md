@@ -179,12 +179,18 @@ final verifier, `vos-statement` and `vos-anchor` must be panic-free on
 every input by construction:
 
 - **The crates' own code:** outside their tests, `clippy::unwrap_used`,
-  `expect_used`, `indexing_slicing`, `panic` and `arithmetic_side_effects`
-  are denied (`#![cfg_attr(not(test), deny(..))]` in each `lib.rs`). Each
-  allowance is in place with its reason: QM31's modular addition (the logup
-  sums, twice), the compact's big-integer mode (`width` 4 to 8 once
-  checked), and `vos-statement`'s `fixtures` reader, the harnesses' (std,
-  never a venue's).
+  `expect_used`, `indexing_slicing`, `panic`, `arithmetic_side_effects`,
+  `unreachable`, `todo` and `unimplemented` are denied
+  (`#![cfg_attr(not(test), deny(..))]` in each `lib.rs`, and in the
+  venue's JAM program's two bins and the Wasm blob, which `just
+  check-no-std` lints for their targets). Each allowance is in place with
+  its reason: QM31's modular addition (the logup sums, twice), the
+  compact's big-integer mode (`width` 4 to 8 once checked), `vos-statement`'s
+  `fixtures` reader (the harnesses', std, never a venue's), and the JAM
+  program's allocator (sums of `Layout` sizes and arena offsets). No lint
+  covers `assert!`: the crates hold none outside their tests. `split_at`
+  and `copy_from_slice`, which no lint covers either, appear once, at
+  lengths equal by construction (`codec.rs`'s big-integer mode).
 - **Stwo's code at the pin:** every index, `unwrap`, `expect`, `zip_eq`,
   `assert` and unchecked arithmetic reachable from format 39's
   `masked::verify_masked` (its `replay`, then `verify_values`) and format
@@ -238,8 +244,10 @@ computes from the format, never read from the proof.
 | 27 | `SparseEvaluation::new`'s `assert!`s; `fold_circle`'s `assert!`, `buffer[0]`, `fold_step − 1`; `fold_line`'s `assert!(n ≥ 2)`, `eval[j]`; `fold_circle_into_line`'s `dst[i]` | ours: subsets of `2^fold_step` built just before, fold step 3 |
 | 28 | `build_merkle_verification_inputs`: `next().unwrap()`, `merkle_values[..]`; `domain.log_size() − leaf_log_size` | ours: one value a decommitment position, whole subsets of `2^3` ≥ a packed leaf of `2^2`; packing only on domains of at least `2^2` |
 | 29 | `decommit_last_layer`: `zip`, `LinePoly::eval_at_point` | the last layer's `checked_log_size` in `commit` (and 64 coefficients pinned) |
+| 30 | `fold_line`'s and `fold_circle_into_line`'s twiddle inversions (`x.inverse()`, `p.y.inverse()`) | ours: points of canonic cosets (y ≠ 0: y is 0 only at points of order at most 2) and of their line domains (x is 0 only at order-4 points, a domain of 2; FRI stops at the last layer's domain, at least 2^7) |
 
-Field inversions elsewhere on the path (M31, QM31) are only 6, 7 and 20.
+Field inversions elsewhere on the path (M31, QM31) are only 6, 7, 20 and
+30.
 The channel's draws and `verify_pow_nonce` index nothing from the proof.
 
 ### The corpus
