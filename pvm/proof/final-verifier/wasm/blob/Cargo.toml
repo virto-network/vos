@@ -37,3 +37,10 @@ lto = "fat"
 codegen-units = 1
 panic = "abort"
 debug = false
+
+# A temporary local pin, replaced by the re-pin to the pushed rev: the Stwo
+# fork's `vos/verify-panics` (c3ec981, the DEEP quotient's degenerate lines
+# refused) from its local worktree.
+[patch."https://github.com/olanod/stwo"]
+stwo = { path = "/home/daniel/src/virto/stwo-s6-panics/crates/stwo" }
+stwo-constraint-framework = { path = "/home/daniel/src/virto/stwo-s6-panics/crates/constraint-framework" }

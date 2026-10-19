@@ -578,7 +578,7 @@ pub fn replay_stark(
         );
         let flat: alloc::vec::Vec<_> = swr.iter().flatten().collect();
         let batches = ColumnSampleBatch::new_vec(&flat);
-        let lcs = column_line_coeffs(&batches);
+        let lcs = column_line_coeffs(&batches).expect("column_line_coeffs");
         batches
             .iter()
             .zip(lcs)

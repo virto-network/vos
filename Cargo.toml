@@ -52,6 +52,13 @@ exclude = [
 [patch.crates-io]
 lsm-tree = { git = "https://github.com/olanod/lsm-tree", rev = "d0791931a96ff2be9b23af4e0d1ef17a330ed9f2" }
 
+# A temporary local pin, replaced by the re-pin to the pushed rev: the Stwo
+# fork's `vos/verify-panics` (c3ec981, the DEEP quotient's degenerate lines
+# refused) from its local worktree.
+[patch."https://github.com/olanod/stwo"]
+stwo = { path = "/home/daniel/src/virto/stwo-s6-panics/crates/stwo" }
+stwo-constraint-framework = { path = "/home/daniel/src/virto/stwo-s6-panics/crates/constraint-framework" }
+
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
