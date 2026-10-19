@@ -447,25 +447,29 @@ Rests on decisions 5, 6 and 8.
   io-hash over them. The agent splits them, recomputes the io-hash and
   compares it with φ9..12; a mismatch fails the attest (a kernel bug).
 - **The record:**
-  `Attest { program, window: Option<u64>, witness_input: Vec<u8>, served: Option<BlobHash>, output, public_args, roots: Vec<RootRead> }`.
-  The kernel reads `witness_input ‖ blob(served)` through `0x401`. The
-  final proof's hash arrives later as a `Proven { id, proof }` input.
-- **The served witness**, SCALE, a content-addressed blob:
+  `Attest { program, window: Option<u64>, witness_input: Vec<u8>, output, public_args, roots: Vec<RootRead> }`,
+  `witness_input` the arguments ‖ `SCALE(Served)` for an at-cut attest;
+  the kernel reads it through `0x401`. The final proof's hash arrives
+  later as a `Proven { id, proof }` input.
+- **The served witness**, SCALE, carried inline in the `Resume` input
+  (6.0a: no host call reaches a blob at refine):
 
   ```rust
   pub struct Served {
       pub space: SpaceId, pub window: u64, pub agent: AgentId, pub instance: InstanceId,
       pub agent_root: [u8; 32],   // A at cut(w)
       pub rep_root: [u8; 32],     // A_rep at cut_rep(w)
+      pub rep_salt: [u8; 16],     // the representative leaf's salt, from its seed
       pub space_path: Vec<u8>,    // BatchProof: RepKey(agent, 0, w) → agent_root, against rep_root
       pub rows: Vec<(Vec<u8>, Option<([u8; 16], Vec<u8>)>)>,  // full row keys in order; None: absent
       pub rows_proof: Vec<u8>,    // one BatchProof against agent_root
   }
   ```
-- **The prologue** verifies `rows_proof` against `agent_root` and
-  `space_path` against `rep_root`, computes `S_w`, and states
-  `RootRead { kind: Space, space, window: w, root: S_w }`. A failure traps:
-  the attest fails, and the workflow sees the error.
+- **The prologue** checks each row key starts `0x03 ‖ instance`, verifies
+  `rows_proof` against `agent_root` and `space_path` against `rep_root`,
+  computes `S_w`, and states
+  `RootRead { kind: Space, space, window: w, root: S_w }`. A failure
+  traps: the attest fails, and the workflow sees the error.
 - **When:**
   1. `ctx.attest_at_cut(call).reads(|r| …).await` from a workflow step
      records a pending request of window w. A malformed or duplicate key
@@ -476,15 +480,16 @@ Rests on decisions 5, 6 and 8.
   3. **The paths' return:** after `cut_rep(w)`'s build, in the same hook
      that signs the anchor, the representative's leader sends each agent
      with pending requests one pair message, exactly-once:
-     `Closed { w, rep_root, paths: Vec<(RequestId, Vec<u8>)> }`, each path
-     a `BatchProof` for `RepKey(agent, 0, w)` against `rep_root`. The
-     agent's apply stores each path as a replicated row keyed by request
-     (`keys::space_path(request)`) and ignores a duplicate `Closed` for a
-     window it holds.
-  4. The agent's leader assembles `Served` from the two, stores it as a
-     content-addressed blob, and proposes a system input
-     `Resume { request, served: BlobHash }`; refine fetches the blob,
-     runs the kernel live and records the `Attest`.
+     `Closed { w, rep_root, paths: Vec<(RequestId, [u8; 16], Vec<u8>)> }`,
+     each a leaf's salt and a `BatchProof` for `RepKey(agent, 0, w)`
+     against `rep_root`. The agent's apply stores each salt and path as a
+     replicated row keyed by request (`keys::space_path(request)`) and
+     ignores a duplicate `Closed` for a window it holds.
+  4. The agent's leader assembles `Served` from the two and proposes a
+     system input `Resume { request, served: Served }`, bounded by
+     `Limits::served` and not `REQUEST`; refine runs the kernel live on
+     the arguments ‖ served and records the `Attest`; the workflow's
+     record keeps the attest's return, never the served bytes.
 - **A window not closed in time:** a pending request of window w whose
   `Closed { w }` has not been applied when `cut(w+1)` is is re-cut at w+1:
   its `rows_proof` regenerated at the new cut, the old one dropped, its
@@ -493,10 +498,14 @@ Rests on decisions 5, 6 and 8.
   boundaries closes them at one version without the agents' late rows;
   their requests take this path.
 - **The caps:** `Limits::attest` keeps capping the caller's arguments (64
-  KiB on VOS, 2 KiB on JAM). A new `Limits::served` caps the blob: 256 KiB
-  as a byte ceiling [proposed; 6.0a sets it], the kernel's declared gas the
-  real bound. The record holds the hash, so `cap.rs`'s work-result
-  arithmetic is unchanged.
+  KiB on VOS, 2 KiB on JAM), and the kernel's whole return
+  (`SCALE(KernelReturn)`). `Limits::served` caps a `Resume`'s `Served`:
+  128 KiB on VOS (about 155 rows [est, 6.0a]), JAM's own (32 KiB
+  [proposed; 6.13 sets it]) inside CE 133's package bound (pin F). An
+  at-cut attest counts 2 against `Limits::attests`, so `cap.rs`'s attest
+  term bounds it unchanged: 8 × (REQUEST + 128 KiB + REPLY + 40) =
+  2,097,472 ≤ 2,097,792 [6.0a]. The per-attest framing (40 B) is
+  re-derived for `window` and `roots`.
 - **Retention (W1):** none past the cut. A request made in window w reads
   at `cut(w)`: at most one window of latency.
 
@@ -528,11 +537,13 @@ Rests on decisions 5, 6 and 8.
   released; a repeat (`6`) releases it, since two nodes can race; any other
   refusal forfeits it to the treasury. A refusal before the proof refunds
   to the early weight.
-- **JAM:** refine runs every check but `anchored` and `seen` (it reads no
-  state) and the proof, and outputs `Verdict { id, program, space, roots,
-  code }`; accumulate checks `anchored` and `seen` and records, under the
-  same `Seen` rule. A fixture
-  fails exactly one check, so every venue reports the same class.
+- **JAM:** the statement in the `Submit` item's payload, the proof its
+  extrinsic (JAM-NP CE 133 bounds a package at 204,802 B [6.0b]); refine
+  runs every check but `anchored` and `seen` (it reads no state) and the
+  proof, and outputs `Verdict { id, program, space, roots, code }`;
+  accumulate checks `anchored` and `seen` and records, under the same
+  `Seen` rule. A fixture fails exactly one check, so every venue reports
+  the same class.
 
 ## M2: the final wrap masked
 
@@ -562,8 +573,10 @@ Throwaway code on local branches; each with a gate and a fallback.
     a blob to a step's refine at resume (slice 4's 4.4a path). If it
     cannot, the fallback is inline: `Limits::served` 128 KiB and `ATTESTS`
     8 for `attest_at_cut`, keeping `cap.rs`'s asserts.
-  - **Output:** `Limits::served`'s value and the transport, in the step's
-    log.
+  - **Output [done]:** transport inline; `Limits::served` 128 KiB on VOS,
+    an at-cut attest counting 2; a row 19.07 compressions and 842 B, the
+    path 14 (+1 for `S_w`) and 590 B at 1,024 agents, 16 rows 205,841
+    steps [measured].
 - **6.0b The JAM venue's program and PolkaJam.**
   - **Build** `final-verify.elf` from spike 6a's branch with format 39
     alone, at opt-levels 3, `s` and `z`, stripped, fat LTO and one codegen
@@ -578,12 +591,10 @@ Throwaway code on local branches; each with a gate and a fallback.
     pins the last version that does, and the step records why.
   - **The proof's transport on JAM, decided by the evidence:** read Gray
     Paper 0.8.0's bound on a work item's payload (the bundle's W_B is
-    13,791,360 bytes) and submit one 170 KB item to PolkaJam. If it fits,
-    6.19 carries the proof in the `Submit` item's payload, one package and
-    no protocol step; a preimage needs a solicit in accumulate, a provide
-    and its availability before refine can look it up, and buys only
-    deduplication, which a proof never needs. The preimage path then stays
-    for the harness alone. The step's log records which.
+    13,791,360 bytes) and submit one 170 KB item to PolkaJam. **[done]** A
+    170 KB item fits, but JAM-NP CE 133 caps a package at 204,802 B,
+    under pin F's 256 KiB: 6.19 carries the proof as the item's
+    extrinsic, the preimage path for the harness alone.
 - **6.0d The docs.** Copy the staged research into `research/slice-6/`;
   open `slice-6-progress.md`; apply `doc-fixes.md`'s items tagged [now]
   and [decision N] (the decisions are taken); the [step 6.x] items land
@@ -607,6 +618,8 @@ Throwaway code on local branches; each with a gate and a fallback.
   - **Fallback:** raw JSON-RPC (`author_submitAndWatchExtrinsic`,
     `state_getStorage`) with the calls SCALE-encoded by hand, since their
     shapes are ours; 6.17b's estimate takes its upper bound.
+  - **Output [done]:** the round trip with subxt and subxt-signer 0.51.1
+    on omni-node stable2606-2 and Kreivo 87f8728 (spec 134); no fallback.
 - **Reviews:** Opus on the spikes' logs.
 - **Estimate:** 1.5–2 weeks (6.0a 3–5 days, 6.0b 1–2, 6.0d 1, 6.0e 1–2).
 
@@ -625,7 +638,7 @@ Throwaway code on local branches; each with a gate and a fallback.
   blinding.
 - **Tests:** every unmasked format's pinned bits unchanged (28 at 146 /
   82.60); 39 at 146 / 82 (82.69–82.70); the least-query grid pinned for
-  A and B; the masked wrap needs affine batching (by powers: 76.15).
+  A and B; the masked wrap needs affine batching (by powers: 76.14).
 - **Review (Fable), what it must check** (spike 6b §4):
   - DIVERGENCE-012's citation and the affine premise in pin B's order;
   - DIVERGENCE-011's round list `[3,3,3,2]` at log k = 17 against the
@@ -982,17 +995,26 @@ lands.
   (`attested(public_args, output, roots, io_hash)`, the prologue
   `verify_served`); the SDK's workflow context (`attest_at_cut`);
   `agent/wire/src/{result,abi/cap}.rs` (`Attest`, `Limits::served`, the
-  `Resume` input); `agent/default/src/refine/invocation.rs` (fetch the blob,
-  run the kernel on `witness_input ‖ served`, split `KernelReturn`, check
-  the io-hash, record the `Attest`).
+  `Resume` input); `agent/default/src/refine/invocation.rs` (run the
+  kernel on the arguments ‖ served, split `KernelReturn`, check the
+  io-hash, record the `Attest`); `node/jam/src/gas.rs` (JAM's served in
+  `effects`, `RECORD` unchanged).
 - **Design:** pin E. Until 6.14, a test-only stub stands for the
   representative: a one-entry representative tree the node builds itself.
+  Witness decoding hits a class's page budget before its step budget
+  (6.0a: 11 segments for 206k steps): a larger-page class for `&self`
+  kernels or decode in place, measured with 6.18.
 - **Tests:** existing rootless attestables unchanged; a `&self` read
   accepted; a key outside the read set traps; a tampered row, a wrong
-  agent root, a wrong window and a missing representative row each trap;
-  the order of `public_args`; the venue prefix; live ≡ traced with a served
-  input; the JAM path under its 2 KiB argument cap; `cap.rs`'s asserts.
-- **Gate:** 6.0a's per-row and per-path costs reproduced within 10%.
+  agent root, a wrong window, a missing representative row, a row of
+  another instance and a wrong `rep_salt` each trap; an absent row
+  (`None`) proved; the order of `public_args`; the venue prefix; live ≡
+  traced with a served input; the JAM path under its 2 KiB argument cap;
+  `cap.rs`'s asserts.
+- **Gate:** within 10% of 6.0a's measured costs: a row 19.07
+  compressions and 842 B; the path 14 compressions (+1 for `S_w`) and
+  590 B at 1,024 agents; 16 rows 205,841 steps. An at-cut attest's
+  weight-2 rule holds with `cap.rs`'s asserts.
 - **Dep:** 6.0a, 6.10, 6.11, 6.12; decision 8. **Estimate:** 2–3 weeks.
 
 ### 6.14 The representative and the anchors (F)
@@ -1147,8 +1169,9 @@ fees are the teammate's.
   pinned call bytes, storage keys and event decoding of
   `spaces-pallet.md` §9) and a `Transport` trait (submit signed call
   bytes, follow to inclusion, read events and raw storage), with a subxt
-  transport at the release 6.0e recorded (raw JSON-RPC if 6.0e fell back)
-  and a mock transport over 6.17's model.
+  transport (subxt and subxt-signer =0.51.1, sr25519; `RawCall` payloads;
+  tested on omni-node stable2606-2 and Kreivo 87f8728, spec 134) and a
+  mock transport over 6.17's model.
 - **Design:**
   - **the key (decision 12):** one sr25519 Kreivo account key per node,
     generated and held in the node's key store beside its ed25519 node
@@ -1156,7 +1179,10 @@ fees are the teammate's.
     an authority paired with the node's anchor key; the node holds no
     balance: the space's sovereign account pays;
   - `anchor` and `submit` built from the pinned bytes, the envelope from
-    Kreivo's live metadata; the verdict from `Accepted` or
+    Kreivo's live metadata; `PassAuthenticate` pinned to None by a typed
+    extension, never by frame-decode's fallback, and the live extension
+    list checked against the expected ten in order, an unknown one
+    refused before signing; the verdict from `Accepted` or
     `Refused { code }` mapped to `Refusal`'s codes, `Refused { 6 }` as
     accepted, the errors mapped per the design's §9: before sending an
     anchor, the client reads `Timestamp.Now` and waits until the venue's
@@ -1189,7 +1215,8 @@ fees are the teammate's.
 - **Gates:** every vector passes through the client; every error and
   refusal code mapped; no double submission under a reconnect.
 - **Review:** Fable as well, for the key handling.
-- **Dep:** 6.0e, 6.17; decision 12. **Estimate:** 1.5–2 weeks.
+- **Dep:** 6.0e, 6.17; decision 12. **Estimate:** 1.5 weeks (6.0e
+  needed no fallback); the workspace build behind `kreivo` first.
 
 ### M3b acceptance
 
@@ -1238,10 +1265,10 @@ fees are the teammate's.
     E), its id; skip it as dead when its anchor would pass `MaxRootAge`,
     by the venue's time (pin D's rule),
     before the proof ends;
-  - re-run traced on `witness_input ‖ served`; the output and the io-hash
-    checked against the record; segments, leaves, folds and the masked
-    wrap; the proof into the blob store; `Proven { id, proof }` back to
-    the agent;
+  - re-run traced on `witness_input` (the arguments ‖ served at a cut);
+    the output and the io-hash checked against the record; segments,
+    leaves, folds and the masked wrap; the proof into the blob store;
+    `Proven { id, proof }` back to the agent;
   - wait for the anchor at the space's venue; submit through the space's
     `VenueClient` (the model venue here; Kreivo's from 6.17b; JAM's from
     6.19); `Repeated` counts as accepted; a backlog report.
@@ -1265,15 +1292,22 @@ fees are the teammate's.
 - **Files:** `pvm/proof/statement/service` (new, `vos-statement-service`),
   built for riscv64em-javm like the default agent; the JAM-only host's
   harness (`statement/tests/support/jam.rs`) gains accumulate;
+  `pvm/runtime/src/refine_host/jam.rs` (`fetch` priced by GP 0.8.0's
+  per-kind table, `definitions.tex`'s C_Y, in place of the 10 + 40 a KiB
+  fit); `node/jam/src/builder/fit.rs` (a package's payload within CE
+  133's 204,800 B as well as W_B);
   `node/venue`'s JAM client through `node/jam`; **new tooling** in
   `node/jam`: deploying a second service beside the default agent (or
   alone) in `testnet.sh`, and a client that submits `Register`, `Anchor`
   and `Submit` items and reads the verdicts back.
 - **Design:**
   - work items `Register`, `Migrate`, `Anchor`, `Submit { statement,
-    proof }`, the proof (≤ 256 KiB) in the item's payload, as 6.0b decided
-    by the Gray Paper's bound; a preimage (`historical_lookup`) only if
-    6.0b found the payload cannot carry it;
+    proof }`: the statement in the `Submit` item's payload and the proof
+    (≤ 256 KiB) as its extrinsic, read by `fetch` case 4, since JAM-NP
+    CE 133 caps a package at 204,802 B [6.0b, measured]; submitted
+    through PolkaJam's `submitWorkPackage` RPC with its extrinsics
+    (`jamt item` takes none); the fallback the payload, with a JAM proof
+    cap of at most 196 KiB − |statement|;
   - **refine** verifies an anchor's or a registration's ed25519 signature
     against the key it names, and runs pin F's stateless checks and the
     proof for a statement; it outputs a `Verdict` (≤ 48 KiB a report);
@@ -1287,23 +1321,27 @@ fees are the teammate's.
     rootless entries never expire (pin F);
   - accepted program ids (and their venue-bound flags) are constants,
     changed by redeploy; `VenueId` per pin D.
-- **Tests:** every fixture judged alike on the JAM-only host; anchors,
-  an anchor signed by an unregistered key, equivocation, migration; a
-  rootless replay past `MaxRootAge` refused; a PolkaJam testnet run (`just
+- **Tests:** first, a 256 KiB extrinsic submitted, refined and read;
+  every fixture judged alike on the JAM-only host; anchors, an anchor
+  signed by an unregistered key, equivocation, migration; a default-agent
+  batch over 200 KiB of payload split by the builder; a rootless replay
+  past `MaxRootAge` refused; a PolkaJam testnet run (`just
   jam-statements-testnet`): deploy, register, anchor, submit the masked
   fixture, read the verdicts back.
-- **Gates:** refine ≤ 150M gas a statement; accumulate ≤ 2M gas a report;
-  the service under 4,000,000 bytes.
+- **Gates:** refine ≤ 150M gas a statement (6.0b: 118.7M [measured]);
+  PolkaJam's refine gas equal to the JAM-only host's for one statement;
+  accumulate ≤ 2M gas a report; the service under 4,000,000 bytes;
+  PolkaJam v0.8.0 pinned (sha256 `e90c8ccd…`).
 - **Dep:** 6.0b, 6.5, 6.10. **Estimate:** 2.5–3 weeks (the new deploy
   tooling takes the upper bound).
 
 ### 6.20 The carrier audit (R7)
 
 - **The carriers:** `Attest` and work results, `RefinePayload`, the JAM
-  anchor chain and work reports, blobs (served witnesses, proofs), logs
-  and tracing, the worker's job table, Kreivo extrinsics and JAM work
-  items, the tests' `target/tmp/wrap/` writes, `CPU_DUMP` and every
-  environment-driven debug output.
+  anchor chain and work reports, `Resume` inputs (served witnesses), blobs
+  (proofs), logs and tracing, the worker's job table, Kreivo extrinsics
+  and JAM work items, the tests' `target/tmp/wrap/` writes, `CPU_DUMP`
+  and every environment-driven debug output.
 - **Gate:** in a full run of 6.21, a byte search over every carrier that
   leaves the prover role finds no segment, leaf or fold proof, no served
   row, no plain hash of private arguments, no step count, memory root or
@@ -1445,12 +1483,12 @@ fees are the teammate's.
 | risk | gate | when |
 |---|---|---|
 | a forgery accepted by the recursion AIR forces a successor to format 32 and a re-pin everywhere | 6.8, from the first day, before any venue pins an id | M2 |
-| DIVERGENCE-012 falls, leaving the masked wrap under 80 proven bits (76.15 by powers) | 6.1's Fable review; fallback a batching-phase PoW ≥ 4 bits or blowup 8 with 43 queries | 6.1 |
+| DIVERGENCE-012 falls, leaving the masked wrap under 80 proven bits (76.14 by powers) | 6.1's Fable review; fallback a batching-phase PoW ≥ 4 bits or blowup 8 with 43 queries | 6.1 |
 | the zero-knowledge argument rests on R1, R2, R4 and the 8-column R; the statistics find only gross leaks | 6.6's gates with their power stated, and Fable's transcript review; the audit before value | 6.6 |
 | a column miscount leaves format 39's bits wrong | 6.2's shape from the built components | 6.2 |
 | the masked prover's time (×2.6–2.9, Blake2b Merkle at lifting 22) | 6.3's gate; packed salts (−2 s [est]); the wrap is about 2–5% of a window statement | 6.3 |
 | the in-kernel prologue costs more than estimated | 6.0a, before the keyspace changes | 6.0 |
-| the served blob cannot reach a step's refine | 6.0a's reading (the blob peer-fetch exists: `dispatch.rs`, `store/entry.rs`); fallback inline at 128 KiB with 8 attests | 6.0 |
+| the inline served overflows a work result or a JAM package | `Limits::served` per target, an at-cut attest weighing 2, `cap.rs`'s asserts, JAM's served inside CE 133 | 6.13 |
 | the keyspace change breaks VOS ≡ JAM or replication | 6.11's equivalence tests and the checker loop; Fable | 6.11 |
 | the cut, the `undo` rows or the held build fail under a crash or a failover | 6.12's acceptance tests, the first written before the code; the checker loop; Fable | 6.12 |
 | the representative's close and the paths' return under a failover or a skewed clock | rows keyed by w (pin D); `Closed` and the re-cut (pin E); 6.14's tests | 6.14 |
@@ -1464,8 +1502,8 @@ fees are the teammate's.
 | an anchor refused as `WindowInFuture` near a boundary and lost | the client reads the venue's time first, waits and resubmits (design §9; G4; 6.17b) | 6.17b |
 | a registration resubmitted with another `start_window` | the window in the registration digest, and bounded (pin D; G1) | 6.10, 6.17 |
 | the `kreivo` venue used before the pallet meets the vectors | unselectable in production configuration until the deferred Kreivo gates (1)–(2) pass | 6.17b |
-| the JAM program over 512 KiB (538,683 B with both formats) | a dedicated service (4,000,000 B); 6.0b measures the masked-only build | 6.0b, 6.19 |
-| PolkaJam 0.8.0 or its gas model differs from the JAM-only host; a 170 KB work item | 6.0b's probe, gas comparison and payload check | 6.0b |
+| the JAM program over 512 KiB (538,683 B with both formats) | 6.0b: 500,205 B masked-only at opt 3; a dedicated service (4,000,000 B) regardless | 6.0b, 6.19 |
+| a JAM package over CE 133's 204,802 B is refused at submission (statements and the agent's builder) | the proof as an extrinsic, measured first; `fit.rs`'s payload bound; `fetch` per-kind prices | 6.19 |
 | the worker lags the window cadence | 6.18's throughput gate; L bounded below by it; the prover-time levers | 6.18 |
 | a masked format iteration re-pins every venue | 39 lands once at 6.4, before 6.17 and 6.19; any later change takes a new number | 6.4 |
 | randomized proofs against byte-for-byte fixtures | the seeded test seam and its build check (pin C) | 6.3, 6.5 |
@@ -1480,16 +1518,16 @@ fees are the teammate's.
 | M2 beside the line (6.7–6.9) | 3–5 |
 | M2 acceptance | 0.5 |
 | M3a (6.10–6.15 and acceptance) | 8.5–13.5 |
-| M3b (6.16, 6.17, 6.17b and acceptance) | 4–6 |
+| M3b (6.16, 6.17, 6.17b and acceptance) | 4–5.5 |
 | M3c (6.18–6.21) | 6–9.5 |
 | acceptance, reviews and the slice-5 rest (6.22) | 3.5–5 |
-| **slice 6, engineer-weeks** | **32–49** |
+| **slice 6, engineer-weeks** | **32–48.5** |
 
 - **The critical path:** 6.0a → 6.10 → 6.11 → 6.12 → 6.13 → 6.14 → 6.15 →
   6.18 → 6.20 → 6.21 → 6.22, about **16–26 weeks** of calendar with three
   tracks.
 - **Beside it:** M2 (6.1–6.9), about 5.5–8 weeks on its line, must land
-  before 6.18; M3b from 6.10's end (6.17 also after 6.5), 4–6 weeks,
+  before 6.18; M3b from 6.10's end (6.17 also after 6.5), 4–5.5 weeks,
   reaching 6.21 with slack; the JAM service (6.19) from 6.5.
 - **Review latency** (Opus on every step, Fable on seventeen) is not in
   these figures.
@@ -1598,22 +1636,27 @@ and the owner to confirm. The mock and the client follow the defaults.
   2^-155, for about 64 MiB of prover heap, 384 B of proof and under 1% of
   gas over 4 columns [est]; the check survives as a test on the small
   circuit.
-- **The JAM service's proof in the work item's payload,** unless 6.0b's
-  reading of Gray Paper 0.8.0 finds it cannot carry 170 KB.
+- **The JAM service's proof as the `Submit` item's extrinsic,** the
+  statement in its payload (6.0b: CE 133 caps the package at 204,802 B,
+  below pin F's 256 KiB; a uniform bound at every venue).
+- **Opt-level 3 for the venue's verifier** (6.0b: `s` +39.6% gas, `z`
+  ×2.59, for bytes no cap needs).
 - **The masking's code** in vos-core's `recair`, `recair-air` and
   `final-verifier`, over the fork's public API.
 - **The fixed-layout decode** in format 39.
 - **Production venues accept masked final formats only;** 28 is a test
   format.
 - **The JAM venue a dedicated service:** an actor in the default agent
-  breaks `MAX_HANDLER_GAS` (100M against 118.7M), the 512 KiB program cap,
-  the 2 KiB message cap, and has no preimage access. Refine verifies;
-  accumulate checks anchors and repeats (its 10M gas a report cannot
-  verify).
+  breaks `MAX_HANDLER_GAS` (100M against 118.7M) whatever its bytes (the
+  masked-only verifier alone is 500,205 B, under the 512 KiB program cap
+  [6.0b]), the 2 KiB message cap, and has no preimage access. Refine
+  verifies; accumulate checks anchors and repeats (its 10M gas a report
+  cannot verify).
 - **The kernel returns the statement's parts at its halt,** and the
   record holds them (Fable's blocker).
-- **The served witness by hash** through the blob path (Fable's finding 2),
-  unless 6.0a finds otherwise.
+- **The served witness inline in the `Resume` input** under
+  `Limits::served` (6.0a: no host call reads a blob at refine; a blob path
+  needs a new input kind, a lookup and JAM provisioning).
 - **The `Cut` marker timed at the leader's clock** (finding 6).
 - **The representative's rows keyed `(agent, kind, w)`** (findings 3, 11).
 - **The worker is the agent's leader,** its job table local, the venue's

@@ -32,7 +32,10 @@ roots and its review.
    `Limits::attest` (64 KiB on VOS, 2 KiB on JAM); a statement's served
    witness travels as a blob by hash, under `Limits::served` and the
    kernel's declared gas (slice 6); 4 MiB stays the ceiling of the
-   kernel's whole input".
+   kernel's whole input". **Amended by 6.0a** [step 6.13]: the served
+   witness travels inline in the `Resume` input, under `Limits::served`
+   (128 KiB on VOS, JAM's own) and the kernel's declared gas; the text
+   applied at 6.0d (a blob by hash) is replaced with it.
 4. **§3.5, "Masked with variant (c), in slice 6 … masking takes a new
    final format"** (l.361-362) [now]. Replace with: "Masked as format 39
    (variant (c), A.4): blowup 32, 24 queries, PoW 26, interaction PoW 8,
@@ -142,10 +145,17 @@ roots and its review.
     if 6.0b found the payload cannot carry it). An actor in the default agent
     cannot host it: `MAX_HANDLER_GAS` 100M, a 512 KiB program cap
     (538,683 B with both formats linked), 2 KiB messages, no preimage
-    access."
+    access." **Amended by 6.0b** [step 6.19]: the statement rides in its
+    work item's payload and the proof as the item's extrinsic (JAM-NP CE
+    133 caps a package at 204,802 B); the default agent cannot host it for
+    `MAX_HANDLER_GAS` (118.7M against 100M) whatever its bytes (the
+    masked-only verifier is 500,205 B, under 512 KiB). The text applied at
+    6.0d is replaced with it.
 21. **§7, "a few dozen more compressions per statement"** (l.682)
-    [step 6.0a]. Replace with the measurement (about 13 compressions and
-    0.45 KB for the path at 1,024 agents [est]).
+    [step 6.13]. Replace with 6.0a's measurement: the path 14
+    compressions (+1 for `S_w`) and 590 B at 1,024 agents, a row 19.07
+    compressions and 842 B [measured] (the estimate was about 13 and
+    0.45 KB).
 22. **§7, "Latency … The window length Kreivo runs is decided in slice 6"**
     (l.686-687) [decision 2]. Replace with: "windows are Unix time from the
     space's genesis, `w = ⌊(t − origin)/length⌋`, the clock frozen in the
@@ -205,9 +215,10 @@ roots and its review.
     (decision 3), and drop 36's row from the table.
 32. **A.5, "Slice 6 adds the window, then the final proof's hash."**
     (l.998) [step 6.13]. Replace with the record:
-    `Attest { program, window, witness_input, served, output, public_args, roots }`,
-    the served witness a blob by hash; the final proof's hash arrives as a
-    `Proven { id, proof }` input.
+    `Attest { program, window, witness_input, output, public_args, roots }`,
+    `witness_input` the arguments ‖ the served witness for an at-cut
+    attest (6.0a: inline, not a blob by hash); the final proof's hash
+    arrives as a `Proven { id, proof }` input.
 33. **A.6, "slice 6's masked format adds the case the other way round"**
     (l.1050-1051) [step 6.5]. Replace with: "the transition runs both ways
     between 28 and 39 under the test policy; production venues accept 39
@@ -466,6 +477,8 @@ with these items.
    and 5.4's "its witness channel lifts the 64 KiB argument cap"
    (l.209) [now]. Replace with: "the argument cap stays; a statement's
    rows arrive as a served witness by hash, under `Limits::served`".
+   **Amended by 6.0a** [step 6.13]: "inline in the `Resume` input", not
+   "by hash"; the text applied at 6.0d is replaced with it.
 6. **5.0's spikes** (l.77-111) [now]. Mark done: a real segment on JAM
    (spike 4a: not viable; a final proof instead), masking (spikes 2, 6a),
    a window statement proved (spike 3, slice 5's 5.15).
