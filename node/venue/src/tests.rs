@@ -77,8 +77,9 @@ impl Fixture {
 }
 
 /// An anchor past the last and before the open window is taken, by either
-/// founding key, and again as `Again`; the windows it may not take: the
-/// open one, one at or before the last, one before the start; another
+/// founding key, and again as `Again`; the windows it may not take: one at
+/// or before the last, one before the start, and, until its boundary
+/// passes, the open one; another
 /// signer, a signature over another venue's digest, an unregistered space.
 #[test]
 fn the_anchor_rule() {
@@ -87,13 +88,21 @@ fn the_anchor_rule() {
     assert!(f.venue.anchored(&f.read(3, 1)));
     assert_eq!(f.venue.anchor(&f.anchor(3, 1, 1)), Ok(Anchored::Again));
     assert_eq!(f.venue.anchor(&f.anchor(5, 1, 1)), Ok(Anchored::New));
-    for window in [4, 6, 1] {
+    for window in [4, 1] {
         assert_eq!(
             f.venue.anchor(&f.anchor(window, 1, 0)),
             Err(AnchorRefusal::Window),
             "window {window}"
         );
     }
+    assert_eq!(f.venue.anchor(&f.anchor(6, 1, 0)), Err(AnchorRefusal::Open));
+    f.now
+        .store(f.clock.boundary(6).unwrap() + 1, Ordering::SeqCst);
+    assert_eq!(
+        f.venue.anchor(&f.anchor(6, 1, 0)),
+        Ok(Anchored::New),
+        "once past"
+    );
     let mut stranger = f.anchor(5, 2, 0);
     let other = SigningKey::from_bytes(&[9; 32]);
     stranger.signer = other.verifying_key().to_bytes();

@@ -10,6 +10,7 @@
 //! [`keys::close_mark`]).
 
 use ed25519_dalek::Signer;
+use vos_venue::AnchorRefusal;
 use vos_wire::batch::Input;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
@@ -97,15 +98,21 @@ impl Leader {
     }
 
     /// The representative's closes due on `snapshot`, at most [`CLOSES`]
-    /// in window order: each window's anchor handed to the venue first,
-    /// once a leadership.
+    /// in window order, each window's anchor handed to the venue first
+    /// ([`Leader::anchor_due`]).
     pub(super) fn closes(&mut self, snapshot: &Snapshot) -> Result<Closes, Fault> {
-        let mut due = Vec::new();
-        for (window, closing) in unsent(snapshot, self.id, self.represents())? {
-            if !self.anchored.contains(&window) {
-                self.anchor(window, &closing.root);
-                self.anchored.insert(window);
+        let unsent = unsent(snapshot, self.id, self.represents())?;
+        let first = unsent.first().map(|(window, _)| *window);
+        self.anchored
+            .retain(|window| first.is_some_and(|first| *window >= first));
+        for (window, closing) in &unsent {
+            if !self.anchored.contains(window) {
+                self.unanchored.entry(*window).or_insert(closing.root);
             }
+        }
+        self.anchor_due();
+        let mut due = Vec::new();
+        for (window, closing) in unsent {
             if !self.inner.hooks.close(self.id, window) {
                 return Ok(Closes::Stopped);
             }
@@ -131,13 +138,30 @@ impl Leader {
         Ok(Closes::Due(due))
     }
 
+    /// Hand the venue the anchors this leadership has not settled, in
+    /// window order, until one is refused for now: a window the venue's
+    /// clock has not yet closed, which the next batch tries again, with the
+    /// later ones behind it, so none passes it. One taken, or refused for
+    /// good, is settled; the close goes on either way, and a statement over
+    /// an unanchored root is refused at the venue.
+    fn anchor_due(&mut self) {
+        while let Some((&window, &root)) = self.unanchored.first_key_value() {
+            if !self.anchor(window, &root) {
+                return;
+            }
+            self.unanchored.remove(&window);
+            self.anchored.insert(window);
+        }
+    }
+
     /// Sign the anchor of the space's root of window `window`, over the
     /// representative's root at its cut `rep_root`, with this node's key,
-    /// and hand it to the venue. The venue's refusal is logged: the close
-    /// goes on, and a statement over an unanchored root is refused there.
-    fn anchor(&self, window: u64, rep_root: &[u8; 32]) {
+    /// and hand it to the venue: whether that settled it, taken or refused
+    /// for good. Synchronous, inside the batch: a venue's client queues and
+    /// answers at once.
+    fn anchor(&self, window: u64, rep_root: &[u8; 32]) -> bool {
         let Some(venue) = &self.inner.venue else {
-            return;
+            return true;
         };
         let (space, _) = self.inner.space_and_clock();
         let mut anchor = Anchor {
@@ -154,9 +178,20 @@ impl Leader {
             .sign(&anchor.digest(&venue.id()))
             .to_bytes();
         match venue.anchor(&anchor) {
-            Ok(anchored) => tracing::debug!(window, ?anchored, "anchored the space's root"),
+            Ok(anchored) => {
+                tracing::debug!(window, ?anchored, "anchored the space's root");
+                true
+            }
+            Err(AnchorRefusal::Open) => {
+                tracing::info!(
+                    window,
+                    "the venue has not closed the window yet; anchoring again"
+                );
+                false
+            }
             Err(refusal) => {
-                tracing::warn!(window, ?refusal, "the venue refused the space's root");
+                tracing::error!(window, ?refusal, "the venue refused the space's root");
+                true
             }
         }
     }

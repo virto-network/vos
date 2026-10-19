@@ -119,8 +119,11 @@ struct Leader {
     /// When it last told senders whose messages the queue dropped full
     /// that they are behind.
     told: Option<Instant>,
-    /// The windows whose anchors this leadership handed to the venue.
+    /// The windows still to close whose anchors this leadership settled.
     anchored: std::collections::BTreeSet<u64>,
+    /// The anchors this leadership has still to hand the venue, by window:
+    /// the representative's root at the cut.
+    unanchored: std::collections::BTreeMap<u64, [u8; 32]>,
 }
 
 /// What an idle leader takes.
@@ -184,6 +187,7 @@ impl Leader {
             ended: None,
             told: None,
             anchored: std::collections::BTreeSet::new(),
+            unanchored: std::collections::BTreeMap::new(),
         }
     }
 

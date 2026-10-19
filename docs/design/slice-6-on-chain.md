@@ -376,9 +376,9 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | boundary | `B_w = origin_ms + (w+1)·length_ms` |
 | length | `length_ms` ∈ [120,000, 3,600,000], default 600,000 (decision 2); the venue refuses another at registration |
 | `cut(w)` | the agent's state version before the first applied result with time ≥ `B_w`: a result timed t, after the agent's batch-time mark p, records it for every w with p < `B_w` ≤ t, once the record its first install wrote names a space (the install itself cuts nothing, so only windows past the agent's first install are cut); of more than `MAX_CUTS` (32, a consensus constant) such windows, the newest 32 alone, the older never cut. A recording whose first window is w deletes the `cut`, `moved` and `closed` rows of every window before `w − CUT_KEEP`, `CUT_KEEP = 2 + RECUTS = 4` (a consensus constant; decided in 6.14): a read lives from its window w₀ to its deadline `B_{w₀+3}`, so no row older serves one, and a replica down longer than that skips those cuts, its reads re-cut or ended `NotClosed` as everyone's |
-| the representative | the agent `agent_id(first founding node, 0)`: serial 0, which no node gives an agent otherwise; created on that node (`Node::create_representative`), its actor `vos-representative` (`agent/representative`) installed at instance 0 with the representative's clock |
+| the representative | the agent `agent_id(first founding node, 0)`: serial 0, which no node gives an agent otherwise; created on that node (`Node::create_representative`), its actor `vos-representative` (`agent/representative`) installed at instance 0 with the representative's clock. Its replicas are founding nodes, whose keys a venue registers as anchor keys: the node refuses another in its creation and its replacements |
 | agent root | the vos-tree root over the agent's committed rows `0x03 ‖ instance ‖ tag ‖ transform ‖ key' → value` (pin E); empty: `H("vos/tree/empty")` |
-| representative's rows | a `CommittedMap<RepKey, [u8; 32]>`, `RepKey = agent (4, BE) ‖ kind (1) ‖ w (8, BE)`, the value the agent's root at `cut(w)`; kind 0 is pin E's Blake2b tree; an agent's rows older than `w − 2` deleted by its report of w. Beside it a plain table `asked`, `w (8, BE) ‖ agent (4, BE)`, of the agents whose reads wait on w's close |
+| representative's rows | a `CommittedMap<RepKey, [u8; 32]>`, `RepKey = agent (4, BE) ‖ kind (1) ‖ w (8, BE)`, the value the agent's root at `cut(w)`; kind 0 is pin E's Blake2b tree; an agent's rows older than `w − 2` deleted by its report of w. Beside it a plain table `asked`, `w (8, BE) ‖ agent (4, BE)`, of the agents whose reads wait on w's close; an agent's asks go with its rows, so no report touches another agent's |
 | representative's clock | `(origin_ms + D, length_ms)`, `D = min(length_ms / 5, 120,000)`: its own `cut_rep(w)` at `B_w + D` is the close of w |
 | space root | `S_w = BLAKE2b-256("vos/space/v1" ‖ space (32) ‖ w (8, LE) ‖ A_rep (32))`, `A_rep` the representative's agent root at `cut_rep(w)` |
 | `VenueId` | Kreivo: its genesis hash; JAM: `BLAKE2b-256("vos/venue/jam" ‖ JAM genesis hash ‖ service id (4, LE))` |
@@ -522,7 +522,9 @@ Rests on decisions 5, 6 and 8.
      holds (`keys::closing(w)`, node-local, the same bytes on every
      replica). Its leader, woken as an agent's is, signs the anchor of
      `S_w` with its node key and hands it to the venue (a repeat of the
-     same root is the venue's `Again`), then proposes
+     same root is the venue's `Again`; a refusal for now, the venue's
+     clock still in the window, is tried again at the next batch, the
+     later windows behind it), then proposes
      `Close { w, rep_root, paths }`, whose step sends each agent past the
      close mark (`keys::close_mark`, at most 8 a close, in agent order)
      one pair message, exactly-once:
@@ -554,9 +556,10 @@ Rests on decisions 5, 6 and 8.
   `closed(w)` is not there: `moved(w) = w′` (replicated). The cut at w′
   proves them again, its proof kept beside the one at w
   (`cut_proof(request, window)`), and the agent's report of w′ marks it
-  pending. A read is served at the first window of its chain (its own,
-  then each it moved to) whose cut this replica built and whose close
-  the agent holds: a close that comes after the re-cut still serves it
+  pending. Refine accepts any window of the read's chain (its own, then
+  each it moved to, at most `RECUTS` moves) whose close the agent holds;
+  serving it at the first whose cut its replica built is the leader's
+  choice, not a rule: a close that comes after the re-cut still serves it
   at its own window. Its deadline `B_{w₀+3}` (`READ_WINDOWS = 1 +
   RECUTS`) comes when its third re-cut would: the workflow sees
   `AttestError::NotClosed`. A representative returning after several
@@ -1311,6 +1314,10 @@ fees are the teammate's.
 
 ### 6.17b The node's Kreivo client (F)
 
+- **The anchor is handed over inside the representative's leader's
+  batch** (6.14): `VenueClient::anchor` must not block there. The Kreivo
+  client queues the extrinsic and answers at once (taken, refused for
+  good, or `Open`: tried again at the next batch, in window order).
 - **Files:** `node/venue/kreivo` (in `vos-venue`, behind a `kreivo`
   feature); the operator and controller tooling over the same `calls`
   layer: `vosx space venue register` (call 0, the founder's signature over

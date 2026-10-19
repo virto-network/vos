@@ -24,7 +24,10 @@
 //! cut with their salts, under one proof against that root ([`CutProof`]):
 //! the same bytes on every replica. The space's representative's also keeps
 //! its close of the window: its root, and the path of each agent that asked
-//! ([`keys::closing`]). An undo row an apply wrote racing that commit, of a
+//! ([`keys::closing`]); the same bytes on every replica that builds the cut
+//! within a few windows, since the asks are a plain table read where the
+//! build starts, and pruned: a replica far behind omits paths only dead
+//! reads need. An undo row an apply wrote racing that commit, of a
 //! window built, is garbage the next build deletes, as are a request's
 //! proof once it is answered and a close once sent.
 
@@ -435,8 +438,12 @@ fn closing(
     root: Hash,
 ) -> Result<Closing, Error> {
     let prefix = keys::table_rows(REPRESENTATIVE, ASKED_TAG, Transform::Ordered);
+    // The window's asks: its key escaped, without the terminator the whole
+    // key's escape ends with, is a prefix of each.
+    let mut escaped = Transform::Ordered.apply(&window.to_be_bytes());
+    escaped.truncate(escaped.len() - 2);
     let mut paths = Vec::new();
-    for row in at.scan(agent, &prefix, None) {
+    for row in at.scan(agent, &[&prefix[..], &escaped].concat(), None) {
         let (key, _) = row?;
         let raw = Transform::Ordered.raw(&key[prefix.len()..]);
         let Some((asked, of)) = raw.as_deref().and_then(asked_entry) else {

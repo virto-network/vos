@@ -84,7 +84,14 @@ struct Cuts {
     started: Mutex<Vec<(AgentId, u64)>>,
     /// The space's representative.
     representative: Mutex<Option<AgentId>>,
+    /// The representative's roots at its cuts, as its replicas held them,
+    /// by window; and any window two replicas held two roots of.
+    rep_roots: Mutex<RepRoots>,
 }
+
+/// The representative's roots at its cuts by window, and the windows two
+/// replicas held two roots of.
+type RepRoots = (BTreeMap<u64, [u8; 32]>, Vec<u64>);
 
 impl Cuts {
     /// Rewrite rows of `agent`'s reader's committed map until `done`, in a
@@ -197,6 +204,24 @@ impl Cuts {
             if held {
                 *self.undo_held.lock().unwrap() += 1;
             }
+            let representative = *self.representative.lock().unwrap();
+            for node in (1..=NODES).filter_map(|number| cluster.node(number)) {
+                let snapshot = node.store().snapshot();
+                let Some(representative) = representative else {
+                    break;
+                };
+                for window in cuts(&snapshot, representative).into_keys() {
+                    let Ok(Some((root, _))) = roots::cut_root(&snapshot, representative, window)
+                    else {
+                        continue;
+                    };
+                    let mut held = self.rep_roots.lock().unwrap();
+                    let (roots, differ) = &mut *held;
+                    if *roots.entry(window).or_insert(root) != root {
+                        differ.push(window);
+                    }
+                }
+            }
             std::thread::sleep(Duration::from_millis(2));
         }
     }
@@ -265,6 +290,46 @@ impl Alongside for Cuts {
         check_agent(cluster, representative);
         let closed = closes(cluster, representative);
         println!("the representative: S_w the same on every replica at its {closed} latest cuts");
+        self.check_anchors(cluster, representative);
+    }
+}
+
+impl Cuts {
+    /// The venue holds no second root of any window, and, once the
+    /// representative's latest cut is anchored, every anchor of a window
+    /// whose root at the cut the run saw is `S_w` over that root; no two
+    /// replicas held two roots of one window.
+    fn check_anchors(&self, cluster: &Cluster, representative: AgentId) {
+        let space = cluster.space.id();
+        let node = cluster.node(1).unwrap();
+        let latest = roots::latest_built(&node.store().snapshot(), representative)
+            .unwrap()
+            .expect("a cut built");
+        wait_until("the representative's latest cut anchored", ANSWERED, || {
+            cluster
+                .venue
+                .anchors(&space)
+                .iter()
+                .any(|anchor| anchor.window >= latest)
+        });
+        assert!(cluster.venue.evidence().is_empty(), "no equivocation");
+        let (roots, differ) = &*self.rep_roots.lock().unwrap();
+        assert!(differ.is_empty(), "replicas' roots differ at {differ:?}");
+        let anchors = cluster.venue.anchors(&space);
+        let mut checked = 0;
+        for anchor in &anchors {
+            if let Some(root) = roots.get(&anchor.window) {
+                let expected = vos_wire::vos_anchor::space_root(&space, anchor.window, root);
+                assert_eq!(anchor.root, expected, "S_{} anchored", anchor.window);
+                checked += 1;
+            }
+        }
+        println!(
+            "the venue: {} anchors, one a window, {checked} checked against the replicas' roots, \
+             no evidence",
+            anchors.len()
+        );
+        assert!(checked > 0, "no anchor checked");
     }
 }
 
@@ -455,6 +520,7 @@ fn cuts_apply_once_and_replicas_agree_through_failures() {
         undo_held: Mutex::new(0),
         started: Mutex::new(Vec::new()),
         representative: Mutex::new(None),
+        rep_roots: Mutex::new((BTreeMap::new(), Vec::new())),
     };
     let rounds = std::env::var_os("CUTS_FULL").map(|_| Rounds::load());
     exactly_once(Mode::OneAtATime, 0x5eed_0612, rounds, Some(&cuts));

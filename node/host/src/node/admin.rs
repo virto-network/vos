@@ -62,6 +62,11 @@ impl Inner {
         {
             return unplaced(Unplaced::NotInTheSpace);
         }
+        if self.representative() == Some(agent) && !self.founding(add) {
+            return Err(ReplaceError::Call(CallError::Failed(format!(
+                "node {add} holds no anchor key: the representative runs on founding nodes"
+            ))));
+        }
         if !self.could_run(agent, add, CAPABLE).await {
             return unplaced(Unplaced::CannotRun);
         }
@@ -156,6 +161,11 @@ impl Inner {
             )));
         }
         let replicas = self.replicas(replicas)?;
+        if let Some(node) = replicas.iter().find(|node| !self.founding(**node)) {
+            return Err(CallError::Failed(format!(
+                "node {node} holds no anchor key: the representative runs on founding nodes"
+            )));
+        }
         // Held, so no other creation here races it.
         let next = self.next_agent.lock().await;
         if self.directory.get(agent).is_some() {
@@ -164,6 +174,15 @@ impl Inner {
         let created = self.create(agent, replicas).await;
         drop(next);
         created
+    }
+
+    /// Whether node `number` founded the space: its key, in the genesis, a
+    /// venue registers as an anchor key.
+    fn founding(&self, number: NodeNumber) -> bool {
+        self.space
+            .as_ref()
+            .and_then(|space| space.genesis())
+            .is_some_and(|genesis| genesis.nodes.iter().any(|(node, _)| *node == number))
     }
 
     /// The replicas a creation names, sorted, each a node of the space;

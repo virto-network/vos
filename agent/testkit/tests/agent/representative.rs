@@ -95,7 +95,7 @@ fn asked(window: u64, agent: AgentId) -> Vec<u8> {
 /// use; a report stores the reporting agent's root under
 /// `representative_row(agent, Space, w)`, its value the bare root, and an
 /// ask under `w ‖ agent`; a later report of the agent drops its rows of
-/// windows before `w − 2`, and every agent's asks of them. The model agrees
+/// windows before `w − 2` and its asks with them, never another agent's. The model agrees
 /// on each step.
 #[test]
 fn a_report_is_stored_as_a_read_proves_it() {
@@ -111,7 +111,7 @@ fn a_report_is_stored_as_a_read_proves_it() {
     let (a, b) = (AgentId(0x0100_0007), AgentId(0x0200_0003));
     let inputs = vec![
         report(a, 1, 5, [5; 32], true),
-        report(b, 1, 5, [6; 32], false),
+        report(b, 1, 5, [6; 32], true),
         report(a, 2, 6, [7; 32], false),
     ];
     let result = node.batch(1_000, inputs.clone());
@@ -145,7 +145,8 @@ fn a_report_is_stored_as_a_read_proves_it() {
         Some(vec![7; 32])
     );
     assert!(node.get(&asked(5, a)).is_some());
-    assert!(node.get(&asked(5, b)).is_none());
+    assert!(node.get(&asked(5, b)).is_some());
+    assert!(node.get(&asked(6, a)).is_none(), "not pending");
 
     // Window 8: `a`'s rows before window 6 go, and every ask of them.
     node.batch(2_000, vec![report(a, 3, 8, [8; 32], true)]);

@@ -48,8 +48,8 @@ impl Representative {
     /// An agent's report of `root`, its root of `kind` at window
     /// `window`'s cut, the agent its sender; with `pending`, its reads wait
     /// on the window's close. Its rows of windows before `window − KEPT`
-    /// go, and every agent's asks of those windows. A report from no agent,
-    /// or of a kind but the space's, is dropped.
+    /// go, and its asks of those windows with them; no other agent's. A
+    /// report from no agent, or of a kind but the space's, is dropped.
     #[msg]
     pub async fn report(
         &mut self,
@@ -82,17 +82,12 @@ impl Representative {
             .map(|(key, _)| key)
             .take_while(|(of, (_, at))| *of == agent.0 && *at < oldest)
             .collect();
+        // An agent's asks go with its rows: a report touches no other
+        // agent's.
         for key in &stale {
+            let (of, (_, at)) = *key;
             self.roots.remove(key);
-        }
-        let stale: Vec<(u64, u32)> = self
-            .asked
-            .iter(None)
-            .map(|(key, _)| key)
-            .take_while(|(at, _)| *at < oldest)
-            .collect();
-        for key in &stale {
-            self.asked.remove(key);
+            self.asked.remove(&(at, of));
         }
     }
 }

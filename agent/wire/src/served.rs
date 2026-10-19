@@ -121,10 +121,11 @@ pub fn representative(genesis: &crate::SpaceGenesis) -> Option<AgentId> {
 /// order: its own, then each its re-cuts moved it to ([`keys::moved`]), as
 /// `moved` reads them. The last is the cut its pending read waits on; any
 /// whose close the agent holds serves it. At most
-/// [`crate::defaults::CUT_KEEP`] moves are followed: none lies further.
+/// [`crate::defaults::RECUTS`] moves are followed: a third is recorded only
+/// at or past the read's deadline.
 pub fn serving_windows(window: u64, mut moved: impl FnMut(u64) -> Option<u64>) -> Vec<u64> {
     let mut windows = alloc::vec![window];
-    for _ in 0..crate::defaults::CUT_KEEP {
+    for _ in 0..crate::defaults::RECUTS {
         let at = *windows.last().expect("one window");
         match moved(at) {
             Some(next) if next > at => windows.push(next),

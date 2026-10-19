@@ -85,6 +85,10 @@ pub struct Cluster {
     pub offset: Arc<AtomicI64>,
     /// Clients stop at their next request while it is set.
     pub paused: AtomicBool,
+    /// The venue the space anchors at, its own time the clients' (the
+    /// wall's, and every node's shared offset), the space registered from
+    /// window 0 when it has a genesis.
+    pub venue: Arc<vos_venue::ModelVenue>,
 }
 
 impl Cluster {
@@ -93,7 +97,7 @@ impl Cluster {
     }
 
     /// The cluster, its space founded with `clock` when given: a clock of
-    /// any length, which no venue need register.
+    /// any length, which the model venue registers whatever it is.
     pub fn founded(seed: u64, clock: Option<WindowClock>) -> Self {
         let agent = agent();
         let dirs: Vec<tempfile::TempDir> =
@@ -132,6 +136,17 @@ impl Cluster {
             .iter()
             .map(|slot| Target::loopback(&format!("http://{}", slot.ingress)).unwrap())
             .collect();
+        let offset = Arc::new(AtomicI64::new(0));
+        let venue_offset = Arc::clone(&offset);
+        let venue = Arc::new(vos_venue::ModelVenue::new(
+            vos_wire::vos_anchor::VenueId([0x7e; 32]),
+            Arc::new(move || {
+                vos_node::wall_clock().saturating_add_signed(venue_offset.load(Ordering::SeqCst))
+            }),
+        ));
+        if let Some(genesis) = space.genesis() {
+            venue.register(genesis, 0);
+        }
         let cluster = Self {
             hub: Hub::new(seed),
             space,
@@ -139,8 +154,9 @@ impl Cluster {
             slots,
             targets,
             log: Log::default(),
-            offset: Arc::new(AtomicI64::new(0)),
+            offset,
             paused: AtomicBool::new(false),
+            venue,
         };
         for number in 1..=NODES {
             cluster.start(number);
@@ -171,6 +187,7 @@ impl Cluster {
         config.executors = 2;
         config.hooks = slot.trip.clone();
         config.space = Some(self.space.clone());
+        config.venue = Some(self.venue.clone());
         config.peers = Peers::Hub(self.hub.clone());
         config.election_timeout_ms = (40, 80);
         config.heartbeat_ms = 10;

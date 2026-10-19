@@ -52,9 +52,12 @@ pub enum AnchorRefusal {
     Key,
     /// The signature is not the signer's over the anchor's digest.
     Signature,
-    /// The window is not past the last anchored, before the space's open
-    /// window, and at or past its start.
+    /// The window is not past the last anchored, or before the space's
+    /// start: refused for good.
     Window,
+    /// The window is the space's open one, or later, by the venue's clock:
+    /// refused until the venue's time passes its boundary.
+    Open,
     /// The window's boundary is older than `MaxRootAge`.
     Age,
     /// Another root of the space's kind at the window is anchored: this
@@ -230,12 +233,17 @@ impl VenueClient for ModelVenue {
             space.suspended = true;
             return Err(AnchorRefusal::Equivocation);
         }
-        let open = space.clock.window(now);
-        let within = anchor.window >= space.start
-            && space.last.is_none_or(|last| last < anchor.window)
-            && open.is_some_and(|open| anchor.window < open);
+        let within =
+            anchor.window >= space.start && space.last.is_none_or(|last| last < anchor.window);
         if !within {
             return Err(AnchorRefusal::Window);
+        }
+        if space
+            .clock
+            .window(now)
+            .is_none_or(|open| anchor.window >= open)
+        {
+            return Err(AnchorRefusal::Open);
         }
         let boundary = space.clock.boundary(anchor.window);
         if boundary.is_none_or(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS) {
