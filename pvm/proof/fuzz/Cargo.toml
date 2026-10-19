@@ -23,6 +23,9 @@ vos-pvm-proof-verifier = { path = "../verifier" }
 # golden wraps' bytes and structure mutated, formats 28 and 39.
 vos-pvm-final-verifier = { path = "../final-verifier", features = ["test-formats"] }
 vos-statement = { path = "../statement", features = ["fixtures"] }
+# A space's genesis, anchors, migrations and golden vectors, as a venue
+# decodes them.
+vos-anchor = { path = "../anchor", features = ["vectors"] }
 postcard = { version = "1", features = ["alloc"] }
 stwo = { git = "https://github.com/olanod/stwo", rev = "ab294189b34fac653e0a753971c69a0d39d01d16", default-features = false }
 
@@ -56,6 +59,24 @@ doc = false
 [[bin]]
 name = "statement_decode"
 path = "fuzz_targets/statement_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "masked_bytes"
+path = "fuzz_targets/masked_bytes.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "masked_shape"
+path = "fuzz_targets/masked_shape.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "anchor_decode"
+path = "fuzz_targets/anchor_decode.rs"
 test = false
 doc = false
 

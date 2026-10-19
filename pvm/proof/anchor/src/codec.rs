@@ -35,9 +35,10 @@ pub fn compact(out: &mut Vec<u8>, value: u64) {
         0x40..=0x3fff => out.extend_from_slice(&(((value as u16) << 2) | 1).to_le_bytes()),
         0x4000..=0x3fff_ffff => out.extend_from_slice(&(((value as u32) << 2) | 2).to_le_bytes()),
         _ => {
-            let width = 8 - value.leading_zeros() as usize / 8;
-            out.push((((width - 4) as u8) << 2) | 3);
-            out.extend_from_slice(&value.to_le_bytes()[..width]);
+            // 4 to 8 bytes: the value is at least 2^30.
+            let width = 8usize.saturating_sub(value.leading_zeros() as usize / 8);
+            out.push(((width.saturating_sub(4) as u8) << 2) | 3);
+            out.extend(value.to_le_bytes().into_iter().take(width));
         }
     }
 }
@@ -69,12 +70,16 @@ impl<'a> Reader<'a> {
 
     /// The next `N` bytes, as an array.
     pub fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
-        Ok(self.take(N)?.try_into().expect("N bytes"))
+        self.take(N)?
+            .first_chunk()
+            .copied()
+            .ok_or(DecodeError::Short)
     }
 
     /// A byte.
     pub fn u8(&mut self) -> Result<u8, DecodeError> {
-        Ok(self.take(1)?[0])
+        let [byte] = self.array()?;
+        Ok(byte)
     }
 
     /// A little-endian `u32`.
@@ -101,18 +106,7 @@ impl<'a> Reader<'a> {
                 let word = u32::from_le_bytes([first, rest[0], rest[1], rest[2]]);
                 (u64::from(word >> 2), 0x4000)
             }
-            _ => {
-                let width = usize::from(first >> 2) + 4;
-                if width > 8 {
-                    return Err(DecodeError::Noncanonical);
-                }
-                let mut bytes = [0u8; 8];
-                bytes[..width].copy_from_slice(self.take(width)?);
-                let value = u64::from_le_bytes(bytes);
-                // The big-integer mode only past 2^30, and in its fewest bytes.
-                let least = (1u64 << (8 * (width - 1))).max(0x4000_0000);
-                (value, least)
-            }
+            _ => self.big_integer(first)?,
         };
         if value < least {
             return Err(DecodeError::Noncanonical);
@@ -120,10 +114,27 @@ impl<'a> Reader<'a> {
         Ok(value)
     }
 
+    /// A compact's big-integer mode after its first byte: its value, and
+    /// the least value the mode takes in that many bytes.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "`width` is `first >> 2` and 4, at most 67, and at most 8 past `get_mut`, so `8·(width − 1)` is 24 to 56"
+    )]
+    fn big_integer(&mut self, first: u8) -> Result<(u64, u64), DecodeError> {
+        let width = usize::from(first >> 2) + 4;
+        let mut bytes = [0u8; 8];
+        let value = bytes.get_mut(..width).ok_or(DecodeError::Noncanonical)?;
+        value.copy_from_slice(self.take(width)?);
+        let value = u64::from_le_bytes(bytes);
+        // The big-integer mode only past 2^30, and in its fewest bytes.
+        let least = (1u64 << (8 * (width - 1))).max(0x4000_0000);
+        Ok((value, least))
+    }
+
     /// A count of items at least `item` bytes each, which the input holds.
     pub fn count(&mut self, item: usize) -> Result<usize, DecodeError> {
         let count = self.compact()?;
-        let left = (self.bytes.len() - self.at) as u64;
+        let left = self.bytes.len().saturating_sub(self.at) as u64;
         if count.saturating_mul(item as u64) > left {
             return Err(DecodeError::Short);
         }

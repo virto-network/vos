@@ -84,9 +84,23 @@
 //!
 //! The crate is `no_std` and depends on nothing of VOS beyond the final
 //! verifier and `vos-anchor` (the space's types, re-exported), so a chain's
-//! runtime (Kreivo's pallet) can depend on it.
+//! runtime (Kreivo's pallet) can depend on it. No input panics it: outside
+//! its tests and the harnesses' fixtures reader, an index, a slice, an
+//! `unwrap`, an `expect`, a `panic!` or an arithmetic that can overflow is
+//! a lint error, each one left allowed in place with the reason it cannot
+//! fail.
 
 #![no_std]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 extern crate alloc;
 #[cfg(feature = "fixtures")]

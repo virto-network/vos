@@ -9,6 +9,9 @@ use std::sync::OnceLock;
 
 use vos_pvm_final_verifier::PUBLIC_WORDS;
 
+/// Format 39's header in its fixed layout: the format and ten words.
+pub const MASKED_HEADER: usize = 4 * 11;
+
 pub struct Golden {
     /// Its format.
     pub format: u32,

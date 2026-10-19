@@ -18,6 +18,16 @@
 //! The generator (`pvm/proof/tests/kernel/fixtures.rs`) writes them, and refuses
 //! fixtures it no longer makes.
 
+#![allow(
+    clippy::panic,
+    clippy::expect_used,
+    clippy::indexing_slicing,
+    clippy::arithmetic_side_effects,
+    reason = "the harnesses' reader (std, `fixtures`), never a venue's: it reads the files this \
+              repository writes, and a missing or malformed one fails the harness (`load`'s \
+              panics)"
+)]
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use std::path::{Path, PathBuf};

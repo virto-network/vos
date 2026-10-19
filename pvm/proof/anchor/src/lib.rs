@@ -34,9 +34,22 @@
 //! prefix of another, so no preimage of one digest is a preimage of another.
 //!
 //! The crate is `no_std` and depends on BLAKE2b alone, so a chain's runtime
-//! can vendor it with nothing else.
+//! can vendor it with nothing else. No input panics it: outside its tests,
+//! an index, a slice, an `unwrap`, an `expect`, a `panic!` or an arithmetic
+//! that can overflow is a lint error, each one left allowed in place with
+//! the reason it cannot fail.
 
 #![no_std]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 extern crate alloc;
 
@@ -229,7 +242,7 @@ impl SpaceGenesis {
         let nodes: Vec<(NodeNumber, [u8; 32])> = (0..count)
             .map(|_| Ok((reader.u8()?, reader.array()?)))
             .collect::<Result<_, DecodeError>>()?;
-        if nodes.is_empty() || nodes.windows(2).any(|pair| pair[0].0 >= pair[1].0) {
+        if nodes.is_empty() || !nodes.is_sorted_by(|a, b| a.0 < b.0) {
             return Err(DecodeError::Noncanonical);
         }
         Ok(Self {

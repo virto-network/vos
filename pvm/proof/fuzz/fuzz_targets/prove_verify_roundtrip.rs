@@ -41,6 +41,9 @@ use vos_pvm_proof_verifier::verify_standalone;
 /// case more expensive.
 const MAX_CODE_BYTES: usize = 64;
 const FLAT_MEM_BYTES: usize = 64 * 1024; // 64 KiB
+/// The gas a run gets: a looping program's trace stays a few thousand
+/// steps, proved in seconds.
+const GAS: vos_pvm::Gas = 2_000;
 
 #[derive(Debug, Arbitrary)]
 struct FuzzInput {
@@ -91,7 +94,7 @@ fuzz_target!(|input: FuzzInput| {
         vec![],
         regs,
         vec![0u8; FLAT_MEM_BYTES],
-        100_000,
+        GAS,
     );
     let mut tracing = TracingPvm::new(pvm);
     let _exit = tracing.run();

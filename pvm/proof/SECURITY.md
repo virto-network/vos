@@ -175,21 +175,96 @@ the boundary binding, then Stwo's verifier, in that order.
 
 A FRAME runtime cannot catch a panic (no unwinding on wasm32 without std;
 a panic aborts the block's import), so no guard can wrap the verifier. The
-final verifier and `vos-statement` must be panic-free on every input by
-construction: the shape and sample checks refuse before Stwo's indexing,
-`unwrap`s and `zip_eq`s are reached, the statement's decode bounds every
-count by the bytes left, and the fork returns an error where upstream
-panicked on duplicate queries.
-The evidence is three ten-minute fuzz campaigns (`fuzz/`) with an oracle;
-a CI fuzz job, and an audit of every index and `unwrap` on the verify path
-at the pin, are open.
+final verifier, `vos-statement` and `vos-anchor` must be panic-free on
+every input by construction:
+
+- **The crates' own code:** outside their tests, `clippy::unwrap_used`,
+  `expect_used`, `indexing_slicing`, `panic` and `arithmetic_side_effects`
+  are denied (`#![cfg_attr(not(test), deny(..))]` in each `lib.rs`). Each
+  allowance is in place with its reason: QM31's modular addition (the logup
+  sums, twice), the compact's big-integer mode (`width` 4 to 8 once
+  checked), and `vos-statement`'s `fixtures` reader, the harnesses' (std,
+  never a venue's).
+- **Stwo's code at the pin:** every index, `unwrap`, `expect`, `zip_eq`,
+  `assert` and unchecked arithmetic reachable from format 39's
+  `masked::verify_masked` (its `replay`, then `verify_values`) and format
+  28's `unmasked::verify` (`stwo::core::verifier::verify`) is in the table
+  below with what guards it. Two had no guard and are the fork's fix
+  (DIVERGENCE-013).
+- **Fuzzing:** seven targets (`fuzz/`), a checked-in corpus replayed by
+  `just check` (`just fuzz-replay`), and `just fuzz`, five minutes a target,
+  in `ci-full`.
+
+### Stwo's verify path, audited
+
+"Shape" is the verifier's check before any Stwo call: format 39's
+`check_shape` and `samples_fit` (four trees of commitments, sampled values,
+decommitments and queried values; each tree's sampled and queried columns
+its pinned width; each column's samples its sample points; FRI's inner
+layers its rounds; the last layer `2^6`; every limb canonical), and its
+fixed layout's pins and bounds; format 28's `check_shape` (four of each,
+every limb canonical) and `check_samples` (every tree's columns and every
+column's samples the components' masks). "Ours" is a value the verifier
+computes from the format, never read from the proof.
+
+| # | site (`crates/stwo/src/core/…`) | guard |
+|---|---|---|
+| 1 | `verifier.rs` `verify_ex` (28): `trees[PREPROCESSED_TRACE_IDX]` | ours: three trees committed in `replay_prefix` before the call |
+| 2 | `verify_ex`: `composition_log_degree_bound() − COMPOSITION_LOG_SPLIT`, `lifting_log_size − log_blowup_factor` | ours: the components at the pinned log sizes (17 − 1), no lifting log size (the header's) |
+| 3 | `verify_ex`: `commitments.last().unwrap()` | shape: four commitments |
+| 4 | `air/components.rs` `mask_points`: `mask_points[0]`, `preprocessed_mask_points[idx]` | ours: the circuit's preprocessed indices, below the preprocessed tree's columns the verifier committed |
+| 5 | `eval_composition_polynomial_at_point` → `constraint-framework` `evaluate_constraint_quotients_at_point`: `mask[0][idx]`, `sub_tree`'s `assert_eq!` and `get_chunk().unwrap()`, `PointEvaluator::next_mask`'s `mask[interaction][col_index]`, `assert_eq!(mask.len(), N)`, `try_into().unwrap()` | shape: each tree's sampled columns and each column's samples the components' masks (39 `check_shape` + `samples_fit`, 28 `check_samples`) |
+| 6 | the same: `coset_vanishing(..).inverse()` | z on the QM31 circle at a point of the trace's coset: about 2^-108 a draw, no grinding reaches it |
+| 7 | `circle.rs` `get_random_point`: `(1 + t²).inverse()` | t = ±i: 2^-123 a draw |
+| 8 | `pcs/verifier.rs` `commit`: `log_size + log_blowup_factor`; `vcs_lifted` `MerkleVerifierLifted::new`'s `assert!` | ours: the trees' log sizes and the format's configuration, no lifting log size, so the height is the tallest column |
+| 9 | `verify_values`: `zip_cols` (`zip_eq` trees, `zip_eq` columns) of sample points × sampled values | shape: four trees, each tree's columns and each column's samples |
+| 10 | `verify_values`: `trees.last().unwrap()`, `trees[0].height`, `lifting_log_size − log_blowup_factor` | ours: four trees committed by the verifier, each at least the blowup tall |
+| 11 | `pcs/utils.rs` `prepare_preprocessed_query_positions`: the shifts | ours: the trees' heights (20, 22) |
+| 12 | `verify_values`: `zip_eq` trees × decommitments × queried values × query positions | shape: four decommitments and four queried trees |
+| 13 | `vcs_lifted/verifier.rs` `verify`: `col_vals[idx]` | the fork's `QueriedValuesShapeMismatch` (`ca20894`) first: one column a committed column, one value a query |
+| 14 | `verify`: `chunk[0]`, `chunk[1]`, `unreachable!` on `idx & 1` | `chunk_by` yields non-empty runs of at most a sibling pair |
+| 15 | `verify`: the root layer's `try_into().unwrap()` | ours: the positions drawn below `2^height` (tree 0's mapped into its height), 24 of them, so one root remains; a witness too short or long is an error |
+| 16 | `pcs/quotients.rs` `fri_answers`: `assert!` every queried column one value a query; `col[idx]` | every tree's Merkle `verify` (13) passed first, tree 0's on as many positions |
+| 17 | `build_samples_with_randomness_and_periodicity`: `expect(ONE_COEFFICIENT_A_VALUE)` | ours: the affine coefficients drawn by `n_deep_values` over the same samples (powers are unbounded) |
+| 18 | `accumulate_row_quotients`: `queried_values_at_row[column_index]`; `zip_eq` of a batch's columns × its line coefficients | shape: the sampled columns (whose indices these are) and the queried columns both the trees' widths (28: the Merkle check, 13, holds the queried); the coefficients built from the same batch |
+| 19 | `constraints.rs` `complex_conjugate_line_coeffs`: `assert_ne!(z.y, conj(z.y))` | **none at the pin**: Im(z.y) = 0, about 2^-62 a draw, z grindable. The fork's fix: `InvalidStructure` (DIVERGENCE-013) |
+| 20 | `denominator_inverses` → `CM31::batch_inverse` → `inverse()`'s zero `assert!` | **none at the pin**. The fork's fix: `InvalidStructure` (DIVERGENCE-013). Unreachable for z on the circle with Im(z.y) ≠ 0: the line vanishes at a base-field circle point only if Im(z) is isotropic, which no circle point's is (proved in its doc) |
+| 21 | `fri_answers`: `lifting_domain.at(bit_reverse_index(position, ..))` | ours: positions drawn below `2^lifting_log_size` |
+| 22 | `fri.rs` `FriVerifier::commit`: `CanonicCoset::new(..)`'s `try_new().unwrap()`, `LineDomain::new`'s `assert!`, `n_inner_layers − 1` | ours: the degree bound from the verifier's tallest tree (22 − 5); the subtraction only inside the loop over the layers; a wrong layer count is `InvalidNumFriLayers`, a last layer of another size `LastLayerDegreeInvalid` |
+| 23 | `FriConfig::new`'s `assert!`s; `draw_queries`' `(1 << log_size) − 1` and `try_into().unwrap()` | ours: the format's configuration; `u32` into `usize` |
+| 24 | `decommit`: `expect("queries not sampled")` | sampled in the same `verify_values` |
+| 25 | first and inner layers' `verify`: `assert_eq!(queries.log_domain_size, ..)`; `Queries::fold`'s `assert!` | ours: the queries drawn on the first layer's domain and folded by the steps `commit` derived |
+| 26 | `compute_decommitment_positions_and_rebuild_evals`: `subset_queries[0]`, `query_evals.next().unwrap()` | non-empty `chunk_by` runs; one evaluation a query (`fri_answers`' one a position, then the folds' one a folded query); a short witness is an error, a long one too |
+| 27 | `SparseEvaluation::new`'s `assert!`s; `fold_circle`'s `assert!`, `buffer[0]`, `fold_step − 1`; `fold_line`'s `assert!(n ≥ 2)`, `eval[j]`; `fold_circle_into_line`'s `dst[i]` | ours: subsets of `2^fold_step` built just before, fold step 3 |
+| 28 | `build_merkle_verification_inputs`: `next().unwrap()`, `merkle_values[..]`; `domain.log_size() − leaf_log_size` | ours: one value a decommitment position, whole subsets of `2^3` ≥ a packed leaf of `2^2`; packing only on domains of at least `2^2` |
+| 29 | `decommit_last_layer`: `zip`, `LinePoly::eval_at_point` | the last layer's `checked_log_size` in `commit` (and 64 coefficients pinned) |
+
+Field inversions elsewhere on the path (M31, QM31) are only 6, 7 and 20.
+The channel's draws and `verify_pow_nonce` index nothing from the proof.
+
+### The corpus
+
+`fuzz/replay/<target>/` holds each target's corpus, minimized by
+`cargo fuzz cmin` after a five-minute run and kept small; `just
+fuzz-replay` (in `just check`) runs every input once; `cargo run --example
+paths` lists what each input reaches. The paths it covers are recorded in
+`docs/design/slice-6-progress.md` (6.7).
 
 ## The Stwo fork's open divergences
 
 The workspace pins olanod/stwo at `ab294189` (`vos/wrap`). Its divergence
 log (`.claude/skills/paper-implementation-divergence-log.md`) holds two
-open items both wraps' counts rest on:
+open items both wraps' counts rest on, and one the verifier's
+panic-freedom does:
 
+- **DIVERGENCE-013:** the DEEP quotient's degenerate lines refused, not
+  asserted: `complex_conjugate_line_coeffs` and `denominator_inverses`
+  return `VerificationError::InvalidStructure` where upstream panicked (a
+  sample point whose `y` is its own conjugate; a conjugate line through a
+  queried point), each with a unit test from a constructed point. The
+  accepted set is unchanged. Branch `vos/verify-panics` (`c3ec981`), on
+  `ab294189`; pinned for now by a local `[patch]`, re-pinned to the pushed
+  rev after its review.
 - **DIVERGENCE-011:** the first FRI round folds by `2^fold_step`, the
   circle fold in it. The security tool counts it so; a model counting the
   circle fold as its own round would differ by about 0.8 bits on the fold

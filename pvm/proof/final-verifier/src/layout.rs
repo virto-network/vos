@@ -239,9 +239,12 @@ impl<'a> Reader<'a> {
         let limbs = self.items::<LIMB>(width.checked_mul(rows).ok_or(Error::Decode)?)?;
         let mut columns = Vec::with_capacity(width);
         let mut canonical = true;
-        for column in 0..width {
+        // `rows` limbs a column; none at all when `rows` is 0, so the chunk
+        // size 1 then reads nothing.
+        let mut chunks = limbs.chunks_exact(rows.max(1));
+        for _ in 0..width {
             let mut values = Vec::with_capacity(rows);
-            if let Some(limbs) = limbs.get(column * rows..(column + 1) * rows) {
+            if let Some(limbs) = chunks.next() {
                 canonical &= read_limbs(limbs, &mut values);
             }
             columns.push(values);

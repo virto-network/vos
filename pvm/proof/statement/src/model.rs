@@ -279,7 +279,10 @@ fn flag(reader: &mut Reader<'_>) -> Result<bool, DecodeError> {
 /// [`Refusal::Statement`] when the input does not decode.
 pub fn judge_bytes(bytes: &[u8]) -> Result<StatementId, Refusal> {
     let (input, used) = Input::decode_prefix(bytes).map_err(Refusal::Statement)?;
-    input.judge(&bytes[used..])
+    let proof = bytes
+        .get(used..)
+        .ok_or(Refusal::Statement(DecodeError::Short))?;
+    input.judge(proof)
 }
 
 #[cfg(test)]

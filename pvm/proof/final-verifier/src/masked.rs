@@ -222,7 +222,7 @@ pub fn fri_rounds(log_degree_bound: u32, config: &FriConfig) -> Option<Vec<u32>>
     while remaining > 0 {
         let fold = step.min(remaining);
         rounds.push(fold);
-        remaining -= fold;
+        remaining = remaining.checked_sub(fold)?;
     }
     Some(rounds)
 }
@@ -303,7 +303,7 @@ pub fn check_shape<H: MerkleHasherLifted>(
     let fri = &format.config.fri_config;
     let degree_bound = trees.iter().flatten().max().copied().unwrap_or(0);
     let rounds = fri_rounds(degree_bound, fri).ok_or(Error::Shape("FRI's rounds"))?;
-    if stark.fri_proof.inner_layers.len() + 1 != rounds.len() {
+    if Some(stark.fri_proof.inner_layers.len()) != rounds.len().checked_sub(1) {
         return Err(Error::Shape("FRI's layers are not its rounds"));
     }
     if stark.fri_proof.last_layer_poly.checked_log_size() != Some(fri.log_last_layer_degree_bound) {
@@ -350,13 +350,28 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     let shape = sample_points(layout, CirclePoint::zero(), &format.pins)
         .ok_or(Error::Shape("the component set's sample points"))?;
     check_shape(format, &trees, &shape, proof)?;
+    let [
+        preprocessed_tree,
+        main_tree,
+        interaction_tree,
+        composition_tree,
+    ] = trees.as_slice()
+    else {
+        return Err(Error::Shape("four trees"));
+    };
+    let &[
+        preprocessed_root,
+        main_root,
+        interaction_root,
+        composition_root,
+    ] = proof.commitments.as_slice()
+    else {
+        return Err(Error::Shape("four commitments"));
+    };
     if !claim.claimed_sums.iter().all(secure_is_canonical) {
         return Err(Error::Noncanonical);
     }
-    if claim
-        .circuit
-        .is_some_and(|root| proof.commitments[0] != root)
-    {
+    if claim.circuit.is_some_and(|root| preprocessed_root != root) {
         return Err(Error::Circuit);
     }
 
@@ -368,8 +383,8 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
         format.log_sizes,
     );
     let mut scheme = CommitmentSchemeVerifier::<MC>::new(format.config);
-    scheme.commit(proof.commitments[0], &trees[0], &mut channel);
-    scheme.commit(proof.commitments[1], &trees[1], &mut channel);
+    scheme.commit(preprocessed_root, preprocessed_tree, &mut channel);
+    scheme.commit(main_root, main_tree, &mut channel);
     channel.mix_felts(claim.public);
     if !channel.verify_pow_nonce(format.interaction_pow_bits, claim.interaction_pow) {
         return Err(Error::InteractionPow);
@@ -377,8 +392,12 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     channel.mix_u64(claim.interaction_pow);
     let (relations, blind) = C::draw(&mut channel);
     channel.mix_felts(claim.claimed_sums);
-    scheme.commit(proof.commitments[2], &trees[2], &mut channel);
+    scheme.commit(interaction_root, interaction_tree, &mut channel);
     if let Some(public_sum) = claim.public_sum {
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "QM31's addition is modular: it neither overflows nor panics"
+        )]
         let total =
             claim.claimed_sums.iter().copied().sum::<SecureField>() + public_sum(&relations);
         if !total.is_zero() {
@@ -389,7 +408,7 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     let set = C::new(&relations, &blind, format.log_sizes, claim.claimed_sums)
         .ok_or(Error::Shape("a claimed sum for each component"))?;
     let random_coeff = channel.draw_secure_felt();
-    scheme.commit(proof.commitments[3], &trees[3], &mut channel);
+    scheme.commit(composition_root, composition_tree, &mut channel);
     let oods_point = CirclePoint::<SecureField>::get_random_point(&mut channel);
     let points = sample_points(&set, oods_point, &format.pins)
         .ok_or(Error::Shape("the component set's sample points"))?;
@@ -410,7 +429,7 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
         .collect();
     let components = Components {
         components: lifted.iter().map(|c| c as &dyn Component).collect(),
-        n_preprocessed_columns: trees[0].len(),
+        n_preprocessed_columns: preprocessed_tree.len(),
     };
     let composition = composition_oods_eval(&proof.sampled_values)
         .ok_or(Error::Shape("the composition's samples"))?;

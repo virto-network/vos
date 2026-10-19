@@ -36,8 +36,24 @@
 //!
 //! The crate is `no_std`, uses no nightly feature, and builds on stable for
 //! x86 and wasm32 and on the pinned nightly for the PVM.
+//!
+//! **No input panics it:** outside its tests, an index, a slice, an
+//! `unwrap`, an `expect`, a `panic!` or an arithmetic that can overflow is a
+//! lint error, each one left allowed in place with the reason it cannot
+//! fail. Stwo's own sites on the verify path, and the shape checks that
+//! guard them, are listed in `pvm/proof/SECURITY.md`.
 
 #![no_std]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::indexing_slicing,
+        clippy::panic,
+        clippy::arithmetic_side_effects
+    )
+)]
 
 extern crate alloc;
 
@@ -99,25 +115,34 @@ impl Statement {
     /// Its 24 public words: the program id, then the io-hash's bytes in
     /// pairs, `b0 + 256·b1`.
     pub fn words(&self) -> [u32; PUBLIC_WORDS] {
-        core::array::from_fn(|i| match i {
-            0..8 => self.program[i],
-            _ => {
-                let limb = i - 8;
-                u32::from(self.io_hash[2 * limb]) | u32::from(self.io_hash[2 * limb + 1]) << 8
-            }
-        })
+        let (pairs, _) = self.io_hash.as_chunks::<2>();
+        let limbs = pairs
+            .iter()
+            .map(|&pair| u32::from(u16::from_le_bytes(pair)));
+        let mut words = [0; PUBLIC_WORDS];
+        for (word, value) in words.iter_mut().zip(self.program.into_iter().chain(limbs)) {
+            *word = value;
+        }
+        words
     }
 
     /// The statement whose words are `words`: each program word below `p`,
     /// each io-hash limb below 2^16.
     pub fn from_words(words: &[u32; PUBLIC_WORDS]) -> Result<Self, Error> {
-        let (program, limbs) = words.split_at(8);
-        if program.iter().any(|&word| word >= P) || limbs.iter().any(|&limb| limb >> 16 != 0) {
+        let (program, limbs) = words.split_first_chunk::<8>().ok_or(Error::PublicWords)?;
+        if program.iter().any(|&word| word >= P) {
             return Err(Error::PublicWords);
         }
+        let mut io_hash = [0; 32];
+        let (pairs, _) = io_hash.as_chunks_mut::<2>();
+        for (pair, &limb) in pairs.iter_mut().zip(limbs) {
+            *pair = u16::try_from(limb)
+                .map_err(|_| Error::PublicWords)?
+                .to_le_bytes();
+        }
         Ok(Self {
-            program: core::array::from_fn(|i| program[i]),
-            io_hash: core::array::from_fn(|i| (limbs[i / 2] >> (8 * (i % 2))) as u8),
+            program: *program,
+            io_hash,
         })
     }
 }

@@ -195,24 +195,50 @@ check-no-std:
     cargo build -p vos-statement --release --features pvm-guest --bin final-verify --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
     cargo build -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
 
+# The fuzz targets (`pvm/proof/fuzz`, built apart with `cargo fuzz`): the
+# final verifier on arbitrary bytes, on the golden wraps mutated, on format
+# 39's layout past its header and on its queried parts reshaped within the
+# layout's bounds; the statement's and the space's decoders and the venue's
+# check; and prove-then-verify on random programs. A target's property is
+# no panic and nothing accepted but a golden.
+fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode"
+
+# Each target's checked-in corpus (`pvm/proof/fuzz/replay`) run once, every
+# input, optimized and without a sanitizer: no crash. `cargo run --example
+# paths` there lists what each input reaches. `cargo fuzz` sets RUSTFLAGS,
+# which replaces the host's `target-cpu=native` (`.cargo/config.toml`), so
+# the recipes pass it again: without it the prover's SIMD falls back to its
+# generic code, and one proof takes many minutes.
+fuzz-replay:
+    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{fuzz_targets}}" | split row ' ') { cargo fuzz run -O -s none --target-dir target/no-sanitizer $target $"replay/($target)" -- -runs=0 } }
+
+# Each target five minutes from its corpus, seeded from the fixtures and the
+# anchor's vectors, the checked-in corpus beside it: no crash. One at a time;
+# the prove target optimized and without a sanitizer, its proving too slow
+# under either.
+fuzz:
+    cd pvm/proof/fuzz; cargo run --release --example seed
+    cd pvm/proof/fuzz; with-env { RUSTFLAGS: "-C target-cpu=native" } { for target in ("{{fuzz_targets}}" | split row ' ') { let build = if $target == "prove_verify_roundtrip" { [-O -s none --target-dir target/no-sanitizer] } else { [] }; cargo fuzz run ...$build $target $"corpus/($target)" $"replay/($target)" -- -max_total_time=300 -max_len=262145 -len_control=0 -rss_limit_mb=8192 -timeout=600 } }
+
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the
 # builds without std, the workspace's lints, and the suites of the node, the agent, vos-raft and the crates under them.
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats build-test-actors build-agent
+check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats build-test-actors build-agent fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-recair -p vos-pvm-final-verifier -p vos-anchor -p vos-statement --features vos-anchor/vectors,vos-statement/fixtures
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-net -p vos-cli
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
-ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats
+ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats fuzz-replay
 
-# The gate before merging: `ci` plus the prover suites, the soundness gates
-# and the bench tests that prove. Run it under a memory limit.
-ci-full: ci test-proof test-bench-proof
+# The gate before merging: `ci` plus the prover suites, the soundness gates,
+# the bench tests that prove and the fuzz targets' runs. Run it under a
+# memory limit.
+ci-full: ci test-proof test-bench-proof fuzz
 
 # Use the repository's hooks: fmt and clippy before commits, `just ci`
 # before pushes.

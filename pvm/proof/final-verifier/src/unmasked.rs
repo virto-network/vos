@@ -93,7 +93,10 @@ pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement
         return Err(Error::Noncanonical);
     }
     let stark = &proof.stark_proof;
-    if stark.commitments[0] != Blake2bHash(PREPROCESSED_ROOT) {
+    let &[preprocessed, main, interaction, _] = stark.commitments.as_slice() else {
+        return Err(Error::Shape("four commitments"));
+    };
+    if preprocessed != Blake2bHash(PREPROCESSED_ROOT) {
         return Err(Error::Circuit);
     }
 
@@ -103,11 +106,7 @@ pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement
     let scheme = &mut CommitmentSchemeVerifier::<Blake2bMerkleChannel>::new(CONFIG);
     let public: Vec<SecureField> = words.iter().map(|&word| embed(word)).collect();
     let prefix = Prefix {
-        roots: [
-            stark.commitments[0],
-            stark.commitments[1],
-            stark.commitments[2],
-        ],
+        roots: [preprocessed, main, interaction],
         log_sizes: &log_sizes,
         public: &public,
         claimed_sums: &proof.claimed_sums,
@@ -120,6 +119,10 @@ pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement
         Ok(())
     })?;
 
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "QM31's addition is modular: it neither overflows nor panics"
+    )]
     let total = proof.claimed_sums.iter().copied().sum::<SecureField>()
         + public_logup_sum(&relation, LAYOUT.public_terms(public));
     if !total.is_zero() {
@@ -183,9 +186,12 @@ fn check_samples(
         components: components.to_vec(),
         n_preprocessed_columns: n_preprocessed,
     };
-    let max_log_degree_bound = LOG_SIZES.iter().max().copied().unwrap_or(0)
-        + LOG_CONSTRAINT_EXPANSION
-        - stwo::core::verifier::COMPOSITION_LOG_SPLIT;
+    let max_log_degree_bound = LOG_SIZES
+        .iter()
+        .max()
+        .and_then(|log_size| log_size.checked_add(LOG_CONSTRAINT_EXPANSION))
+        .and_then(|bound| bound.checked_sub(stwo::core::verifier::COMPOSITION_LOG_SPLIT))
+        .ok_or(Error::Shape("the composition's degree bound"))?;
     let mut masks = air.mask_points(CirclePoint::zero(), max_log_degree_bound, false);
     masks.push(alloc::vec![alloc::vec![CirclePoint::zero()]; 2 * SECURE_EXTENSION_DEGREE]);
     let matches = masks.len() == stark.sampled_values.len()
