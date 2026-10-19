@@ -1,0 +1,19 @@
+[package]
+name = "accounts"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "accounts"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3.0", default-features = false, features = ["settlement"] }
+vos-sdk = { workspace = true }

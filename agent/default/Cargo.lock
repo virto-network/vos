@@ -195,6 +195,7 @@ version = "0.1.0"
 dependencies = [
  "vos-pvm-precompiles",
  "vos-sdk-macros",
+ "vos-tree",
  "vos-wire",
 ]
 

@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 use vos_wire::abi::cap::{Limits, Refused, Target};
-use vos_wire::abi::{Failure, Kind, cap};
+use vos_wire::abi::{Failure, cap};
 use vos_wire::batch::Admin;
 use vos_wire::records::{Derivation, Installed};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
@@ -193,13 +193,13 @@ fn package(derivation: Derivation, roles: Vec<(Vec<u8>, u8)>, target: Target) ->
     };
     for kernel in &installed.derivation.kernels {
         let schema = installed.schema.method(kernel.method)?;
-        if schema.kind != Kind::Attestable {
+        if !schema.kind.is_attestable() {
             return None;
         }
     }
     let mut attestables = 0;
     for method in &installed.schema.methods {
-        if method.kind == Kind::Attestable {
+        if method.kind.is_attestable() {
             attestables += 1;
             installed.kernel(method.id)?;
         }
@@ -249,7 +249,7 @@ fn within(installed: &Installed, limits: &Limits) -> Option<Result<(), Refused>>
         .schema
         .methods
         .iter()
-        .filter(|method| method.kind == Kind::Attestable)
+        .filter(|method| method.kind.is_attestable())
         .find_map(|method| Some((method.id, method.gas.filter(|&gas| gas > most)?)));
     Some(match declared {
         Some((method, gas)) => Err(Refused::KernelGas { method, gas, most }),

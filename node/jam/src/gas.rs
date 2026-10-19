@@ -158,7 +158,10 @@ const MESSAGE_FRAMING: usize = 40;
 /// What a step's effects at `limits` add to its package's own work, at
 /// most: its writes in the work result and applied, each row salted,
 /// committed and put; each message in the result and in its outbox row; and
-/// each attest, its arguments and output, in the result. The rows a step
+/// its attests in the result, each its witness input and its kernel's
+/// return, hashed for its io-hash: as many plain ones as `limits` allow, or
+/// as many at a window's cut, each counting [`cap::AT_CUT`], its witness
+/// input holding the served rows too, whichever is more. The rows a step
 /// writes are as many as its limit, or as its gas pays for at the most a
 /// workflow's step may use, twice a handler's largest limit, whichever is
 /// fewer.
@@ -175,7 +178,12 @@ pub const fn effects(limits: &Limits) -> u64 {
     let message = limits.message + MESSAGE_FRAMING;
     let messages =
         limits.messages as u64 * (result_bytes(message) + written(OUTBOX_KEY, Some(message)));
-    let attests = limits.attests as u64 * result_bytes(2 * limits.attest + MESSAGE_FRAMING);
+    let checked = COMPRESSION * compressions(limits.attest);
+    let plain =
+        limits.attests as u64 * (result_bytes(2 * limits.attest + cap::ATTEST_FRAMING) + checked);
+    let at_cut = (limits.attests / cap::AT_CUT) as u64
+        * (result_bytes(2 * limits.attest + limits.served + cap::ATTEST_FRAMING) + checked);
+    let attests = if plain > at_cut { plain } else { at_cut };
     writes + messages + attests
 }
 

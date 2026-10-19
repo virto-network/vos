@@ -79,10 +79,20 @@ const PAGE: u64 = vos_pvm::PVM_PAGE_SIZE as u64;
 /// request's.
 const ARGUMENTS: u64 = vos_wire::abi::cap::REQUEST as u64;
 
-/// The pages a kernel's prologue reads its arguments into, past its
-/// read-write data: room for one byte more than [`ARGUMENTS`], so an input
-/// that fills them is too long, and the prologue traps.
-const ARGUMENT_PAGES: u64 = (ARGUMENTS + 1).div_ceil(PAGE);
+/// The most bytes the input of a kernel that reads at a window's cut
+/// holds: its arguments, then the served rows.
+const SERVED_INPUT: u64 = ARGUMENTS + vos_wire::abi::cap::SERVED as u64;
+
+/// What one witness-input call of a kernel that reads at a window's cut
+/// asks for at most: a request's bytes, as any kernel's whole arguments,
+/// so a segment holding the call touches no more pages than the shapes'
+/// classes give one reading its arguments at once.
+const SERVED_CHUNK: u64 = ARGUMENTS;
+
+/// The `VOS_ATTEST` entry's method word: the method's id in its low 32
+/// bits, and this bit for a `&self` method, whose kernel reads, after its
+/// arguments, the rows a node serves it at a window's cut.
+const READS_SERVED: u64 = 1 << 32;
 
 /// The largest ELF a derivation reads: an install's body.
 pub const MAX_ELF: usize = 64 << 20;
@@ -176,9 +186,11 @@ pub fn derive(elf: &[u8]) -> Result<Derived, DeriveError> {
     let heap = invocation_heap(&mut linked)?;
     let actor = spi_blob(transpile_with(&linked, Link::Whole)?)?;
     let graph = Graph::new(&linked);
-    let kernels: Vec<(u32, Vec<u8>)> = attestables(&linked)?
+    let entries = attestables(&linked)?;
+    reads_as_declared(&schema, &entries)?;
+    let kernels: Vec<(u32, Vec<u8>)> = entries
         .into_iter()
-        .map(|(method, entry)| Ok((method, kernel(&graph, method, entry)?)))
+        .map(|(method, entry, input)| Ok((method, kernel(&graph, method, entry, input)?)))
         .collect::<Result<_, DeriveError>>()?;
     let shapes = kernels
         .iter()
@@ -224,9 +236,69 @@ fn invocation_heap(elf: &mut LinkedElf) -> Result<u32, DeriveError> {
     Ok(((end.next_multiple_of(PAGE) - kept) / PAGE) as u32)
 }
 
-/// The ELF's attestable methods and their entries, from its `VOS_ATTEST`
-/// table, by method id: none without the table.
-fn attestables(elf: &LinkedElf) -> Result<Vec<(u32, u64)>, DeriveError> {
+/// Whether each attestable entry reads the rows served at a window's cut
+/// exactly when the schema, its section's bytes `schema`, declares its
+/// method `Reading`, when the schema reads.
+fn reads_as_declared(schema: &[u8], entries: &[(u32, u64, Input)]) -> Result<(), DeriveError> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let table = |why: String| DeriveError::Table(why);
+    // A schema that does not read derives still: an install refuses it.
+    let Ok(schema) = vos_wire::schema::Schema::read(schema) else {
+        return Ok(());
+    };
+    for &(method, _, input) in entries {
+        let kind = schema
+            .method(vos_wire::ids::MethodId(method))
+            .map(|method| method.kind);
+        let served = kind == Some(vos_wire::abi::Kind::Reading);
+        if served != (input == Input::Served) {
+            return Err(table(format!(
+                "method {method:#010x}'s entry and its schema disagree on whether it reads \
+                 the rows served at a window's cut"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// What a kernel reads through its witness input: its arguments alone, or
+/// after them the rows a node serves it at a window's cut.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Input {
+    Arguments,
+    Served,
+}
+
+impl Input {
+    /// The most bytes its prologue reads.
+    const fn most(self) -> u64 {
+        match self {
+            Input::Arguments => ARGUMENTS,
+            Input::Served => SERVED_INPUT,
+        }
+    }
+
+    /// The pages its prologue reads into, past the kernel's read-write
+    /// data: room for one byte more than [`Input::most`], so an input that
+    /// fills them is too long, and the prologue traps.
+    const fn pages(self) -> u64 {
+        (self.most() + 1).div_ceil(PAGE)
+    }
+
+    /// What one witness-input call asks for at most, where it is bounded.
+    const fn chunk(self) -> Option<u64> {
+        match self {
+            Input::Arguments => None,
+            Input::Served => Some(SERVED_CHUNK),
+        }
+    }
+}
+
+/// The ELF's attestable methods, their entries and what their kernels read,
+/// from its `VOS_ATTEST` table, by method id: none without the table.
+fn attestables(elf: &LinkedElf) -> Result<Vec<(u32, u64, Input)>, DeriveError> {
     let table = |why: &str| DeriveError::Table(why.to_string());
     let Some(symbol) = elf
         .symbols
@@ -263,18 +335,26 @@ fn attestables(elf: &LinkedElf) -> Result<Vec<(u32, u64)>, DeriveError> {
         .collect();
     let mut entries = BTreeMap::new();
     for (index, entry) in bytes.chunks_exact(ATTEST_ENTRY as usize).enumerate() {
-        let method = u64::from_le_bytes(entry[..8].try_into().expect("eight bytes"));
+        let word = u64::from_le_bytes(entry[..8].try_into().expect("eight bytes"));
         let raw = u64::from_le_bytes(entry[8..].try_into().expect("eight bytes"));
         let address = relocated.get(&entry_at(index)).copied().unwrap_or(raw);
-        let method = u32::try_from(method).map_err(|_| table("a method id past 32 bits"))?;
+        let input = match word & !u64::from(u32::MAX) {
+            0 => Input::Arguments,
+            READS_SERVED => Input::Served,
+            _ => return Err(table("a method word past its id and its served bit")),
+        };
+        let method = word as u32;
         if !in_ranges(&elf.code_ranges, address) {
             return Err(table(&format!("method {method:#010x}'s entry is no code")));
         }
-        if entries.insert(method, address).is_some() {
+        if entries.insert(method, (address, input)).is_some() {
             return Err(table(&format!("method {method:#010x} has two entries")));
         }
     }
-    Ok(entries.into_iter().collect())
+    Ok(entries
+        .into_iter()
+        .map(|(method, (address, input))| (method, address, input))
+        .collect())
 }
 
 /// What reaches what in an ELF, sorted once: its functions and data
@@ -610,8 +690,8 @@ fn overlapping(sorted: &[(u64, u64)], ranges: &[(u64, u64)]) -> Vec<(u64, u64)> 
 
 /// The kernel of attestable `method`, whose entry is at `entry`: its code
 /// and data what the entry reaches, linked with an instruction-0 prologue
-/// that calls it.
-fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError> {
+/// that reads its `input` and calls it.
+fn kernel(graph: &Graph, method: u32, entry: u64, input: Input) -> Result<Vec<u8>, DeriveError> {
     let elf = graph.elf;
     let reached = Reached::walk(graph, entry);
 
@@ -632,8 +712,9 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
         .max()
         .unwrap_or(0)
         .next_multiple_of(16);
-    let arguments = argument_pages(elf)?;
-    code_sections.push((0, prologue, prologue_code(arguments)));
+    let arguments = argument_pages(elf, input)?;
+    let head = Prologue::new(arguments, input);
+    code_sections.push((0, prologue, head.code.clone()));
 
     // The data reached, the rest zeros: the read-only data as long as its
     // last object, in as many zones as the actor's, so the read-write data
@@ -679,14 +760,14 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
             .collect()
     };
     let mut call_targets = pairs(&elf.call_targets);
-    call_targets.insert(prologue + CALL_AT, entry);
+    call_targets.insert(prologue + head.call_at, entry);
     // The ELF's targets in the spans, the prologue's own, and where the
     // kernel's branches and jumps land, the prologue included, which the
     // ELF's targets cannot name: it lies past the ELF's code.
     let control_flow_targets: HashSet<u64> = spans
         .iter()
         .flat_map(|&(start, end)| graph.targets.range(start..end).copied())
-        .chain([prologue, prologue + RETURN_AT])
+        .chain([prologue, prologue + head.return_at])
         .chain(direct_targets(&code_sections))
         .collect();
     let abs_code_ptrs = within(&graph.pointers, |&(at, _, _)| at, &objects)
@@ -721,7 +802,7 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
         entry_vaddr: prologue,
         // The argument pages, zeros past the read-write data, then the
         // linked program's own zero pages.
-        heap_pages: elf.heap_pages + ARGUMENT_PAGES as u32,
+        heap_pages: elf.heap_pages + input.pages() as u32,
         ..LinkedElf::default()
     };
 
@@ -746,7 +827,7 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
     let [_, rw, _] = vos_pvm_program::StandardHeader::read(&blob)
         .and_then(|header| header.regions())
         .ok_or_else(|| TranspileError::InvalidSection("a kernel's layout".into()))?;
-    let pages = u64::from(elf.heap_pages) + ARGUMENT_PAGES;
+    let pages = u64::from(elf.heap_pages) + input.pages();
     if rw.base + rw.size != arguments + pages * PAGE {
         return Err(TranspileError::InvalidSection(format!(
             "a kernel's argument pages at {arguments:#x} are not its read-write data's last"
@@ -756,11 +837,11 @@ fn kernel(graph: &Graph, method: u32, entry: u64) -> Result<Vec<u8>, DeriveError
     Ok(blob)
 }
 
-/// Where a kernel derived from `elf` reads its arguments: the page past its
+/// Where a kernel derived from `elf` reads its `input`: the page past its
 /// read-write data, where the standard layout places it, as
 /// [`crate::linker::spi_blob`] lays the data out. Below 2^31, so the
 /// prologue loads it with `lui` and `addi`.
-fn argument_pages(elf: &LinkedElf) -> Result<u64, DeriveError> {
+fn argument_pages(elf: &LinkedElf, input: Input) -> Result<u64, DeriveError> {
     let ro_len = match elf.ro_data.len() as u64 {
         0 => 0,
         len => elf.ro_base.saturating_sub(Z_Z) + len,
@@ -771,7 +852,7 @@ fn argument_pages(elf: &LinkedElf) -> Result<u64, DeriveError> {
         len => elf.rw_base + len,
     };
     let arguments = rw_end.next_multiple_of(PAGE);
-    if arguments + ARGUMENT_PAGES * PAGE > 1 << 31 {
+    if arguments + input.pages() * PAGE > 1 << 31 {
         return Err(TranspileError::InvalidSection(format!(
             "a kernel's argument pages at {arguments:#x} lie past 2^31"
         ))
@@ -780,103 +861,133 @@ fn argument_pages(elf: &LinkedElf) -> Result<u64, DeriveError> {
     Ok(arguments)
 }
 
-/// Where [`prologue_code`]'s call to the entry lies, and where the entry
-/// returns to.
-const CALL_AT: u64 = 76;
-const RETURN_AT: u64 = 84;
-
 /// The prologue at a kernel's instruction 0, as an attestable program's
-/// `_start`. It keeps the halt address; reads the input through the
+/// `_start`, and where in it its call to the entry lies and the entry
+/// returns to. It keeps the halt address; reads the input through the
 /// witness input into the argument pages at `arguments` until a call
-/// returns 0, and traps if it filled them; calls the entry on the bytes
-/// read, with 32 bytes of its stack for the io-hash; then returns to the
-/// halt address with the entry's output in φ7 and φ8 and the io-hash in φ9
-/// to φ12, eight little-endian bytes a register.
-fn prologue_code(arguments: u64) -> Vec<u8> {
-    const RA: u32 = 1;
-    const SP: u32 = 2;
-    const T0: u32 = 5;
-    const T1: u32 = 6;
-    const T2: u32 = 7;
-    const S0: u32 = 8;
-    const S1: u32 = 9;
-    const A0: u32 = 10;
-    const A1: u32 = 11;
-    const A2: u32 = 12;
-    let i_type = |opcode: u32, funct3: u32, rd: u32, rs1: u32, imm: i32| {
-        ((imm as u32) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
-    };
-    let addi = |rd, rs1, imm| i_type(op::OP_IMM, 0, rd, rs1, imm);
-    let ld = |rd, rs1, imm| i_type(op::LOAD, 3, rd, rs1, imm);
-    let jalr = |rd, rs1| i_type(op::JALR, 0, rd, rs1, 0);
-    let r_type = |funct7: u32, rd: u32, rs1: u32, rs2: u32| {
-        (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (rd << 7) | op::OP
-    };
-    let add = |rd, rs1, rs2| r_type(0, rd, rs1, rs2);
-    let sub = |rd, rs1, rs2| r_type(0x20, rd, rs1, rs2);
-    let branch = |funct3: u32, rs1: u32, rs2: u32, offset: i32| {
-        let imm = offset as u32;
-        ((imm >> 12 & 1) << 31)
-            | ((imm >> 5 & 0x3f) << 25)
-            | (rs2 << 20)
-            | (rs1 << 15)
-            | (funct3 << 12)
-            | ((imm >> 1 & 0xf) << 8)
-            | ((imm >> 11 & 1) << 7)
-            | op::BRANCH
-    };
-    let jal = |rd: u32, offset: i32| {
-        let imm = offset as u32;
-        ((imm >> 20 & 1) << 31)
-            | ((imm >> 1 & 0x3ff) << 21)
-            | ((imm >> 11 & 1) << 20)
-            | ((imm >> 12 & 0xff) << 12)
-            | (rd << 7)
-            | op::JAL
-    };
-    // `lui` and `addi`: a value below 2^31, its low twelve bits signed.
-    let load = |rd: u32, value: u64| {
-        let upper = ((value + 0x800) >> 12) as u32;
-        let lower = (value as i32) - ((upper << 12) as i32);
-        [(upper << 12) | (rd << 7) | op::LUI, addi(rd, rd, lower)]
-    };
-    const MARK: u32 = 0x801 << 20 | 1 << 12 | op::SYSTEM;
-    const ECALL: u32 = op::SYSTEM;
-    const UNIMP: u32 = 0xc000_1073;
-    let [buffer_hi, buffer_lo] = load(S1, arguments);
-    let [room_hi, room_lo] = load(T2, ARGUMENTS + 1);
-    let code = [
-        addi(S0, RA, 0), // 0: the halt address
-        buffer_hi,       // 4: the argument pages
-        buffer_lo,
-        addi(T1, 0, 0), // 12: the bytes read
-        room_hi,        // 16: their room
-        room_lo,
-        add(A0, S1, T1), // 24: the next read's destination
-        sub(A1, T2, T1), // its capacity
-        addi(T0, 0, vos_pvm::precompile::WITNESS_INPUT as i32),
-        MARK,
-        ECALL,                 // 40: the witness input
-        branch(0, A0, 0, 12),  // 44: 0, the end of input: to 56
-        add(T1, T1, A0),       // 48
-        jal(0, -28),           // 52: to 24
-        branch(7, T1, T2, 56), // 56: room filled, too long: to 112
-        addi(A0, S1, 0),       // 60: the arguments
-        addi(A1, T1, 0),       // their length
-        addi(SP, SP, -32),     // 68: the io-hash's place
-        addi(A2, SP, 0),
-        (RA << 7) | op::AUIPC, // 76, CALL_AT: auipc ra, 0, the call to the entry
-        jalr(RA, RA),
-        ld(A2, SP, 0), // 84, RETURN_AT: the io-hash, φ9 to φ12
-        ld(A2 + 1, SP, 8),
-        ld(A2 + 2, SP, 16),
-        ld(A2 + 3, SP, 24),
-        addi(SP, SP, 32), // 100
-        addi(RA, S0, 0),
-        jalr(0, RA), // 108: to the halt address
-        UNIMP,       // 112
-    ];
-    code.into_iter().flat_map(u32::to_le_bytes).collect()
+/// returns 0, at most [`Input::chunk`] bytes a call where that bounds it,
+/// and traps if it filled them; calls the entry on the bytes read, with 32
+/// bytes of its stack for the io-hash; then returns to the halt address
+/// with the entry's output in φ7 and φ8 and the io-hash in φ9 to φ12, eight
+/// little-endian bytes a register.
+struct Prologue {
+    code: Vec<u8>,
+    call_at: u64,
+    return_at: u64,
+}
+
+impl Prologue {
+    fn new(arguments: u64, input: Input) -> Self {
+        const RA: u32 = 1;
+        const SP: u32 = 2;
+        const T0: u32 = 5;
+        const T1: u32 = 6;
+        const T2: u32 = 7;
+        const S0: u32 = 8;
+        const S1: u32 = 9;
+        const A0: u32 = 10;
+        const A1: u32 = 11;
+        const A2: u32 = 12;
+        const A3: u32 = 13;
+        const BEQ: u32 = 0;
+        const BLTU: u32 = 6;
+        const BGEU: u32 = 7;
+        let i_type = |opcode: u32, funct3: u32, rd: u32, rs1: u32, imm: i32| {
+            ((imm as u32) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
+        };
+        let addi = |rd, rs1, imm| i_type(op::OP_IMM, 0, rd, rs1, imm);
+        let ld = |rd, rs1, imm| i_type(op::LOAD, 3, rd, rs1, imm);
+        let jalr = |rd, rs1| i_type(op::JALR, 0, rd, rs1, 0);
+        let r_type = |funct7: u32, rd: u32, rs1: u32, rs2: u32| {
+            (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (rd << 7) | op::OP
+        };
+        let add = |rd, rs1, rs2| r_type(0, rd, rs1, rs2);
+        let sub = |rd, rs1, rs2| r_type(0x20, rd, rs1, rs2);
+        let branch = |funct3: u32, rs1: u32, rs2: u32, offset: i32| {
+            let imm = offset as u32;
+            ((imm >> 12 & 1) << 31)
+                | ((imm >> 5 & 0x3f) << 25)
+                | (rs2 << 20)
+                | (rs1 << 15)
+                | (funct3 << 12)
+                | ((imm >> 1 & 0xf) << 8)
+                | ((imm >> 11 & 1) << 7)
+                | op::BRANCH
+        };
+        let jal = |rd: u32, offset: i32| {
+            let imm = offset as u32;
+            ((imm >> 20 & 1) << 31)
+                | ((imm >> 1 & 0x3ff) << 21)
+                | ((imm >> 11 & 1) << 20)
+                | ((imm >> 12 & 0xff) << 12)
+                | (rd << 7)
+                | op::JAL
+        };
+        // `lui` and `addi`: a value below 2^31, its low twelve bits signed.
+        let load = |rd: u32, value: u64| {
+            let upper = ((value + 0x800) >> 12) as u32;
+            let lower = (value as i32) - ((upper << 12) as i32);
+            [(upper << 12) | (rd << 7) | op::LUI, addi(rd, rd, lower)]
+        };
+        // The offset in bytes from instruction `from` to instruction `to`.
+        let offset = |from: usize, to: usize| 4 * (to as i32 - from as i32);
+        const MARK: u32 = 0x801 << 20 | 1 << 12 | op::SYSTEM;
+        const ECALL: u32 = op::SYSTEM;
+        const UNIMP: u32 = 0xc000_1073;
+
+        // The halt address, the argument pages, the bytes read, their room,
+        // and the most a call asks for.
+        let mut code = vec![addi(S0, RA, 0)];
+        code.extend(load(S1, arguments));
+        code.push(addi(T1, 0, 0));
+        code.extend(load(T2, input.most() + 1));
+        if let Some(chunk) = input.chunk() {
+            code.extend(load(A3, chunk));
+        }
+        // The next read's destination and capacity, bounded by the chunk.
+        let next = code.len();
+        code.push(add(A0, S1, T1));
+        code.push(sub(A1, T2, T1));
+        if input.chunk().is_some() {
+            code.push(branch(BLTU, A1, A3, 8));
+            code.push(addi(A1, A3, 0));
+        }
+        code.push(addi(T0, 0, vos_pvm::precompile::WITNESS_INPUT as i32));
+        code.push(MARK);
+        code.push(ECALL);
+        // 0, the end of input: on to the length's check.
+        let ended = code.len();
+        code.push(0);
+        code.push(add(T1, T1, A0));
+        let back = code.len();
+        code.push(jal(0, offset(back, next)));
+        code[ended] = branch(BEQ, A0, 0, offset(ended, code.len()));
+        // Room filled: too long, to the trap.
+        let filled = code.len();
+        code.push(0);
+        code.push(addi(A0, S1, 0)); // the arguments
+        code.push(addi(A1, T1, 0)); // their length
+        code.push(addi(SP, SP, -32)); // the io-hash's place
+        code.push(addi(A2, SP, 0));
+        let call_at = code.len();
+        code.push((RA << 7) | op::AUIPC); // auipc ra, 0: the call to the entry
+        code.push(jalr(RA, RA));
+        let return_at = code.len();
+        code.push(ld(A2, SP, 0)); // the io-hash, φ9 to φ12
+        code.push(ld(A2 + 1, SP, 8));
+        code.push(ld(A2 + 2, SP, 16));
+        code.push(ld(A2 + 3, SP, 24));
+        code.push(addi(SP, SP, 32));
+        code.push(addi(RA, S0, 0));
+        code.push(jalr(0, RA)); // to the halt address
+        code[filled] = branch(BGEU, T1, T2, offset(filled, code.len()));
+        code.push(UNIMP);
+        Self {
+            code: code.into_iter().flat_map(u32::to_le_bytes).collect(),
+            call_at: 4 * call_at as u64,
+            return_at: 4 * return_at as u64,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -904,7 +1015,7 @@ mod tests {
         const ENTRY: u64 = 0x10_0000;
         let derived = |id| {
             let elf = LinkedElf::text(ENTRY, calling(id));
-            kernel(&Graph::new(&elf), 7, ENTRY)
+            kernel(&Graph::new(&elf), 7, ENTRY, Input::Arguments)
         };
         for id in 110..=114 {
             match derived(id) {

@@ -9,7 +9,7 @@ use vos_wire::Encode;
 use vos_wire::batch::{Batch, Work};
 use vos_wire::keys;
 use vos_wire::records::unstored;
-use vos_wire::result::{Step, WorkResult, Write as StateWrite, split_output};
+use vos_wire::result::{Step, WorkResult, Write as StateWrite};
 
 use super::{Ended, Leader, is_due, leads};
 use crate::blobs::{Held, Keep, blob_ref};
@@ -33,20 +33,15 @@ impl Leader {
     ) -> Result<Ended, Fault> {
         let id = self.id;
         let started = Instant::now();
-        let (version, time, inputs) = (batch.version, batch.time, batch.inputs.len() as u64);
+        let (version, inputs) = (batch.version, batch.inputs.len() as u64);
         let stats = &self.inner.stats;
         stats.batch_inputs.record(inputs);
         let work = Arc::new(Work::Batch(batch));
         let (output, refine_gas) = match marker {
             Some(marker) => (marker.encode(), 0),
             None => {
-                let (output, gas) = self
-                    .refine(Arc::clone(&snapshot), Arc::clone(&work))
-                    .await?;
-                match self.requested(&snapshot, time)? {
-                    Some(step) => (with_step(output, step)?, gas),
-                    None => (output, gas),
-                }
+                self.refine(Arc::clone(&snapshot), Arc::clone(&work))
+                    .await?
             }
         };
         let result: WorkResult = pvm::decode(&output)?;
@@ -236,19 +231,6 @@ impl Leader {
         self.inner.stats.ran(stage, running, finished);
         output
     }
-}
-
-/// `output`, a refine's, with `step`, a test's hook's, added to its
-/// result ([`Leader::requested`]).
-fn with_step(output: Vec<u8>, step: Step) -> Result<Vec<u8>, Fault> {
-    let (mut result, pages) = split_output(&output)
-        .ok_or_else(|| Fault::Agent("the refine's output does not decode".into()))?;
-    result.steps.push(step);
-    let mut output = result.encode();
-    if !pages.is_empty() {
-        pages.encode_to(&mut output);
-    }
-    Ok(output)
 }
 
 /// The batch `work` carries.

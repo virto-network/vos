@@ -128,6 +128,12 @@ fn status(record: &WorkflowHead, reader: Principal) -> WorkflowStatus {
             deadline: *deadline,
         },
         WorkflowState::Sleeping { until } => WorkflowStatus::Sleeping { until: *until },
+        WorkflowState::Attesting {
+            window, deadline, ..
+        } => WorkflowStatus::Attesting {
+            window: *window,
+            deadline: *deadline,
+        },
         WorkflowState::Ended(outcome) => WorkflowStatus::Ended(outcome.clone()),
     }
 }

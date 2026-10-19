@@ -30,7 +30,10 @@ impl Leader {
         let mut steps = result.steps.iter().filter(|step| !is_due(step));
         for item in pending {
             let Some(step) = steps.next() else {
-                rest.push(item);
+                // A read served goes again from the state, if it waits still.
+                if !matches!(item, Pending::Resume { .. }) {
+                    rest.push(item);
+                }
                 continue;
             };
             match item {
@@ -58,7 +61,7 @@ impl Leader {
                     reply: reply(step),
                     at: self.applied,
                 })),
-                Pending::Sweep(_) => {}
+                Pending::Sweep(_) | Pending::Resume { .. } => {}
                 Pending::Message(message) | Pending::Failed(message) => match step {
                     Step::Ran(_) => {
                         self.marks.insert(message.from, message.sequence);

@@ -27,19 +27,19 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use vos_tree::{BatchProof, Hash, NodeStore};
+use vos_tree::{BatchProof, Blake2b, Hash, Hasher, Leaf, MemStore, NodeStore};
 use vos_wire::ids::{AgentId, RequestId};
 use vos_wire::keys;
 use vos_wire::records::{PendingRead, unstored, unversioned};
 use vos_wire::result::Write;
+use vos_wire::served::representative_row;
+use vos_wire::vos_anchor::RootKind;
 use vos_wire::{Decode, Encode, scale};
 
 use super::{AgentStore, Error};
 use crate::store::Snapshot;
 
-/// A row a request reads, by its full key, with its leaf's salt and bare
-/// value, or `None` when absent: as `Served` carries it.
-pub type ReadRow = (Vec<u8>, Option<([u8; 16], Vec<u8>)>);
+pub use vos_wire::served::ReadRow;
 
 /// What every replica persists for a pending request once its window's cut
 /// is built ([`keys::cut_proof`]): the window, the cut's version and the
@@ -80,7 +80,7 @@ fn cut_roots(snapshot: &Snapshot, agent: AgentId) -> Result<BTreeMap<u64, CutRoo
 }
 
 /// The window of the latest cut this replica built.
-pub(super) fn latest_built(snapshot: &Snapshot, agent: AgentId) -> Result<Option<u64>, Error> {
+pub fn latest_built(snapshot: &Snapshot, agent: AgentId) -> Result<Option<u64>, Error> {
     Ok(cut_roots(snapshot, agent)?.keys().next_back().copied())
 }
 
@@ -108,22 +108,47 @@ pub(super) fn pending(snapshot: &Snapshot, agent: AgentId) -> Result<Vec<Cut>, E
         .collect()
 }
 
-/// The undo rows of windows this replica has built: garbage an apply
-/// racing a cut's finishing commit left.
+/// The undo rows of windows this replica has built, and the proofs of
+/// requests answered: garbage an apply racing a cut's finishing commit
+/// left.
 pub(super) fn orphans(snapshot: &Snapshot, agent: AgentId) -> Result<Vec<Vec<u8>>, Error> {
-    let Some(latest) = latest_built(snapshot, agent)? else {
-        return Ok(Vec::new());
-    };
     let mut orphans = Vec::new();
-    for row in snapshot.scan(agent, &keys::undo_prefix(), None) {
-        let (key, _) = row?;
-        let (window, _) = keys::undo_entry(&key).ok_or(Error::Corrupt("an undo row's key"))?;
-        if window > latest {
-            break;
+    if let Some(latest) = latest_built(snapshot, agent)? {
+        for row in snapshot.scan(agent, &keys::undo_prefix(), None) {
+            let (key, _) = row?;
+            let (window, _) = keys::undo_entry(&key).ok_or(Error::Corrupt("an undo row's key"))?;
+            if window > latest {
+                break;
+            }
+            orphans.push(key);
         }
-        orphans.push(key);
+    }
+    for row in snapshot.scan(agent, &keys::cut_proofs(), None) {
+        let (key, value) = row?;
+        let id = keys::cut_proof_entry(&key).ok_or(Error::Corrupt("a cut proof's key"))?;
+        // A proof's encoding starts with its window.
+        let window = u64::decode(&value)
+            .map_err(|_| Error::Corrupt("a cut proof"))?
+            .0;
+        if snapshot.get(agent, &keys::request(window, id))?.is_none() {
+            orphans.push(key);
+        }
     }
     Ok(orphans)
+}
+
+/// The node-local rows the node's apply deletes beside `writes`: the
+/// proof of each pending request they delete, now answered.
+pub fn answered(writes: &[Write]) -> Vec<Write> {
+    writes
+        .iter()
+        .filter(|write| write.value.is_none())
+        .filter_map(|write| keys::request_entry(&write.key))
+        .map(|(_, id)| Write {
+            key: keys::cut_proof(id),
+            value: None,
+        })
+        .collect()
 }
 
 /// The node-local rows the node's apply commits beside `writes`, the rows
@@ -320,4 +345,22 @@ fn prove(
         rows,
         rows_proof: proof.encode(),
     })
+}
+
+/// A stand-in for the space's representative at window `window`
+/// ([`crate::Hooks::stand_in_representative`]): the tree of the one row of
+/// `agent`'s root there, `agent_root`, salted from a fixed seed. Its root,
+/// the row's salt and the row's path, as a served read carries them.
+pub fn stand_in(
+    agent: AgentId,
+    window: u64,
+    agent_root: &Hash,
+) -> Result<(Hash, [u8; 16], Vec<u8>), Error> {
+    let row = representative_row(agent, RootKind::Space, window);
+    let seed = vos_tree::Blake2b.hash(b"vos/representative/stand-in", &[]);
+    let leaf = Leaf::salted(&Blake2b, &seed, &row, agent_root);
+    let mut tree = MemStore::default();
+    let root = vos_tree::update(&Blake2b, &mut tree, &[(row.as_slice(), Some(leaf))])?;
+    let path = BatchProof::generate(&tree, &[row])?.encode();
+    Ok((root, leaf.salt, path))
 }

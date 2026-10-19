@@ -5,8 +5,8 @@ use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message, Request};
 use vos_wire::ids::{
-    AgentId, InstanceId, MapId, MethodId, Principal, ProgramHash, Session, SessionId, SessionRef,
-    WorkflowId,
+    AgentId, InstanceId, MapId, MethodId, Principal, ProgramHash, RequestId, Session, SessionId,
+    SessionRef, WorkflowId,
 };
 use vos_wire::ingress::Grant;
 use vos_wire::jam::WorkError;
@@ -15,7 +15,8 @@ use vos_wire::records::{Derivation, Kernel, SegmentClass, Shape};
 use vos_wire::result::{
     Attest, CommittedWrite, InputRef, InstanceGas, Outcome, Outgoing, Page, Run, Step, Write,
 };
-use vos_wire::{Decode, Encode};
+use vos_wire::vos_anchor::{RootKind, RootRead};
+use vos_wire::{Decode, Encode, SpaceId};
 
 pub(crate) fn bytes() -> impl Strategy<Value = Vec<u8>> {
     prop::collection::vec(any::<u8>(), 0..300)
@@ -176,6 +177,16 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
         (principal(), any::<Option<u8>>())
             .prop_map(|(principal, role)| Input::Admin(Admin::SetRole(Grant { principal, role }))),
         prop::collection::vec((any::<u64>(), due()), 0..4).prop_map(|due| Input::Sweep { due }),
+        (any::<u64>(), any::<(u64, u64)>(), prop::option::of(bytes())).prop_map(
+            |(window, (workflow, awaits), served)| Input::Resume {
+                window,
+                request: RequestId {
+                    workflow: WorkflowId(workflow),
+                    awaits,
+                },
+                served,
+            }
+        ),
     ]
 }
 
@@ -204,6 +215,12 @@ pub(crate) fn step() -> impl Strategy<Value = Step> {
         any::<u64>().prop_map(|id| InputRef::Due {
             workflow: WorkflowId(id),
         }),
+        any::<(u64, u64)>().prop_map(|(workflow, awaits)| InputRef::Resume {
+            request: RequestId {
+                workflow: WorkflowId(workflow),
+                awaits,
+            },
+        }),
     ];
     let outcome = prop_oneof![
         bytes().prop_map(Outcome::Done),
@@ -228,12 +245,31 @@ pub(crate) fn step() -> impl Strategy<Value = Step> {
         to: AgentId(to),
         body,
     });
-    let attest =
-        (any::<[u8; 32]>(), bytes(), bytes()).prop_map(|(program, witness_input, output)| Attest {
-            program: ProgramHash(program),
-            witness_input,
-            output,
+    let root =
+        (any::<[u8; 32]>(), any::<u64>(), any::<[u8; 32]>()).prop_map(|(space, window, root)| {
+            RootRead {
+                kind: RootKind::Space,
+                space: SpaceId(space),
+                window,
+                root,
+            }
         });
+    let attest = (
+        any::<[u8; 32]>(),
+        any::<Option<u64>>(),
+        (bytes(), bytes(), bytes()),
+        prop::collection::vec(root, 0..2),
+    )
+        .prop_map(
+            |(program, window, (witness_input, output, public_args), roots)| Attest {
+                program: ProgramHash(program),
+                window,
+                witness_input,
+                output,
+                public_args,
+                roots,
+            },
+        );
     let ran = (
         input.clone(),
         outcome,

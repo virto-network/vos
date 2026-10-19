@@ -12,6 +12,8 @@ vos-pvm = { workspace = true }
 # For `programs` only: linking and deriving the guest programs tests and
 # benches load.
 vos-pvm-compiler = { workspace = true }
+# The tree's longest key, which a read at a cut's rows are held to.
+vos-tree = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]
@@ -21,7 +23,6 @@ tempfile = "3"
 vos-jam = { workspace = true }
 vos-pvm-precompiles = { path = "../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
 vos-pvm-program = { workspace = true }
-vos-tree = { workspace = true }
 
 [[bench]]
 name = "batch"

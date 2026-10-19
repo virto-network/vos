@@ -191,6 +191,9 @@ pub fn read_workflow(read: &WorkflowArgs) -> Result<(), String> {
             format!("awaiting {} until {deadline}", agent.0)
         }
         WorkflowStatus::Sleeping { until } => format!("sleeping until {until}"),
+        WorkflowStatus::Attesting { window, deadline } => {
+            format!("reading at window {window}'s cut until {deadline}")
+        }
         WorkflowStatus::Ended(outcome) => said(&Response::Ran { outcome, at: 0 })?,
     };
     println!("{line}");

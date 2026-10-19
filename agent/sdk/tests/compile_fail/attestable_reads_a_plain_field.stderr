@@ -1,0 +1,5 @@
+error[E0609]: no field `value` on type `&CounterView`
+  --> tests/compile_fail/attestable_reads_a_plain_field.rs:18:14
+   |
+18 |         self.value + by
+   |              ^^^^^ unknown field

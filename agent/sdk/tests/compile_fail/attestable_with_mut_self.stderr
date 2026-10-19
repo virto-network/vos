@@ -1,0 +1,5 @@
+error: an #[attestable] method takes `&self` at most: it reads its instance's committed rows at a window's cut, and writes nothing
+  --> tests/compile_fail/attestable_with_mut_self.rs:17:19
+   |
+17 |     pub fn writes(&mut self, key: u32) -> u64 {
+   |                   ^^^^^^^^^

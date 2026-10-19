@@ -8,11 +8,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vos_wire::batch::Batch;
-use vos_wire::ids::RequestId;
 use vos_wire::keys;
-use vos_wire::records::PendingRead;
-use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
-use vos_wire::{Encode, SpaceId, WindowClock};
+use vos_wire::result::WorkResult;
+use vos_wire::{SpaceId, WindowClock};
 
 use super::{Ended, Leader};
 use crate::fault::{Fault, read};
@@ -129,39 +127,4 @@ impl Leader {
             }
         }
     }
-
-    /// The step a test's hook adds to a refined batch's result timed
-    /// `time`: the pending request it names, in the window of `time`
-    /// ([`crate::Hooks::request_at_cut`]). A workflow's due step in form,
-    /// so it answers no input.
-    pub(super) fn requested(&self, snapshot: &Snapshot, time: u64) -> Result<Option<Step>, Fault> {
-        let Some((id, read)) = self.inner.hooks.request_at_cut(self.id, time) else {
-            return Ok(None);
-        };
-        let Some(window) = space_clock(snapshot, self.id)?.and_then(|clock| clock.window(time))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(request_step(window, id, &read)))
-    }
-}
-
-/// A step recording `read` as `id`'s pending request of `window`.
-fn request_step(window: u64, id: RequestId, read: &PendingRead) -> Step {
-    Step::Ran(Run {
-        input: InputRef::Due {
-            workflow: id.workflow,
-        },
-        outcome: Outcome::Done(Vec::new()),
-        instances: Vec::new(),
-        writes: vec![Write {
-            key: keys::request(window, id),
-            value: Some(read.encode()),
-        }],
-        committed: Vec::new(),
-        messages: Vec::new(),
-        attests: Vec::new(),
-        pages: Vec::new(),
-        gas_used: 0,
-    })
 }

@@ -253,6 +253,11 @@ fn committed_keys_keep_their_bytes() {
         cat(&[&[0x02, 0x06], &workflow, &awaits])
     );
     assert_eq!(keys::cut_proofs(), [0x02, 0x06]);
+    assert_eq!(
+        keys::cut_proof_entry(&keys::cut_proof(request)),
+        Some(request)
+    );
+    assert_eq!(keys::cut_proof_entry(&keys::cut_root(9)), None);
     assert_eq!(keys::cut_entry(&keys::cut_root(9)), None);
     assert_eq!(keys::cut_root_entry(&keys::cut_root(9)), Some(9));
     assert_eq!(keys::cut_root_entry(&keys::cut(9)), None);
@@ -331,4 +336,23 @@ fn page_rows_name_their_page() {
     assert_eq!(keys::page_entry(&key), Some((WorkflowId(7), 9)));
     assert_eq!(keys::page_entry(&key[..key.len() - 1]), None);
     assert_eq!(keys::page_entry(&keys::workflow(WorkflowId(7))), None);
+}
+
+/// The representative's map: its tag the one its field's name derives,
+/// and its rows keyed `agent (4, BE) ‖ kind ‖ w (8, BE)`, ordered.
+#[test]
+fn the_representatives_rows_keep_their_bytes() {
+    use vos_wire::served::{
+        REPRESENTATIVE_ROOTS, REPRESENTATIVE_TAG, representative_map, representative_row,
+    };
+    use vos_wire::vos_anchor::RootKind;
+    assert_eq!(
+        REPRESENTATIVE_TAG,
+        vos_wire::ids::derive_id("vos/table/", REPRESENTATIVE_ROOTS)
+    );
+    let raw = [&7u32.to_be_bytes()[..], &[0], &9u64.to_be_bytes()].concat();
+    assert_eq!(
+        representative_row(vos_wire::ids::AgentId(7), RootKind::Space, 9),
+        keys::committed(&representative_map(), &Transform::Ordered.apply(&raw))
+    );
 }

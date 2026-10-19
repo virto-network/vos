@@ -110,6 +110,10 @@ pub enum WorkflowStatus {
     /// Ended: its result, or why it failed.
     #[codec(index = 4)]
     Ended(Outcome),
+    /// Awaiting its read at window `window`'s cut until `deadline`, by the
+    /// agent's time.
+    #[codec(index = 5)]
+    Attesting { window: u64, deadline: u64 },
 }
 
 /// Which applied state a query reads.

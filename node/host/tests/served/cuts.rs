@@ -1,42 +1,44 @@
 //! The checker's exactly-once run with window cuts: windows of two seconds,
 //! so a run crosses dozens of boundaries through its failures (leaders
 //! stopped, nodes cut off, clocks jumping, snapshots installed), with a
-//! writer at each agent rewriting rows of the counter's committed map, and
-//! every leader's batches recording a pending request of their window that
-//! reads sixteen of them ([`vos_node::Hooks::request_at_cut`]).
+//! writer at each agent rewriting rows of the reader's committed map, and
+//! a reader starting workflows that read sixteen of them at their window's
+//! cut ([`vos_wire::abi::Op::AttestAt`]), each served by its leader with a
+//! stand-in for the space's representative.
 //!
 //! Beside the run's own checks: undo rows were held during it, by some
 //! replica, and none is left once every replica has built; every replica
 //! records the same cuts, and holds the same replicated rows, its
 //! node-local ones (undo rows, roots at cuts, proofs) apart; the roots at
-//! the two latest cuts are the same on every replica, and each pending
-//! request of those windows has the same proof on every replica, verifying
-//! against that root.
+//! the two latest cuts are the same on every replica; every read ended, many
+//! served and stated, none refused by its kernel, and no request or proof
+//! is left on any replica.
 //!
 //! `CUTS_FULL` adds the workflows' tours, the checker loop's run;
 //! `EXACTLY_ONCE_SEED` picks the seed.
 
 use std::collections::BTreeMap;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vos_checker::programs::{actor, method, table_tag};
+use vos_checker::calls::install_at_leader;
+use vos_checker::programs::{actor, method, package};
 use vos_checker::{ANSWERED, Mode, wait_until};
 use vos_node::Reply;
 use vos_node::roots;
 use vos_node::store::Snapshot;
-use vos_tree::{Blake2b, Hash};
+use vos_wire::abi::AttestError;
+use vos_wire::abi::Failure;
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, MapId, Principal, RequestId, Session, WorkflowId};
-use vos_wire::keys::{self, Transform};
-use vos_wire::records::{PendingRead, unstored};
+use vos_wire::ids::{AgentId, InstanceId, Principal, Session, WorkflowId};
+use vos_wire::keys;
+use vos_wire::records::{Workflow, WorkflowState, unstored};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, WindowClock};
 
 use crate::exactly_once::{Alongside, exactly_once};
-use crate::harness::{Asks, Cluster, NODES};
-use vos_checker::COUNTER;
+use crate::harness::{Cluster, NODES};
 use vos_checker::rounds::Rounds;
 
 /// Windows of two seconds: no venue registers them, and none is asked to.
@@ -44,46 +46,47 @@ const CLOCK: WindowClock = WindowClock {
     origin_ms: 0,
     length_ms: 2_000,
 };
-/// The writers' keys in the counter's committed map.
+/// The writers' keys in the reader's committed map.
 const KEYS: u64 = 200;
+/// The reader, installed in every agent of the run.
+const READER: InstanceId = InstanceId(9);
 
-/// The counter's committed map.
-fn entries() -> MapId {
-    MapId {
-        instance: COUNTER,
-        tag: table_tag("entries"),
-        transform: Transform::Hashed,
-    }
-}
-
-/// The sixteen rows each request reads: twelve the writers write, four
-/// they never do.
-fn read_rows() -> Vec<Vec<u8>> {
-    let mut rows: Vec<Vec<u8>> = (0..16u64)
+/// The sixteen keys each read names: twelve the writers write, four they
+/// never do.
+fn read_keys() -> Vec<u64> {
+    (0..16u64)
         .map(|index| {
-            let key = if index < 12 {
+            if index < 12 {
                 index * 13 % KEYS
             } else {
                 KEYS + index
-            };
-            keys::committed(&entries(), &Transform::Hashed.apply(&key.encode()))
+            }
         })
-        .collect();
-    rows.sort();
-    rows
+        .collect()
 }
 
-/// The cuts, the writers and the sampler of undo rows.
+/// A client's session of its own at `agent`, keyed `key`, the `name`th.
+fn session(cluster: &Cluster, key: u8, name: u128) -> Session {
+    Session {
+        key: [key; 32],
+        name: name.to_le_bytes(),
+        t0: vos_node::wall_clock().saturating_add_signed(cluster.offset.load(Ordering::SeqCst)),
+    }
+}
+
+/// The cuts, the writers, the readers and the sampler of undo rows.
 struct Cuts {
     /// How often a sample found undo rows on some replica.
     undo_held: Mutex<u64>,
+    /// The reads started, by agent.
+    started: Mutex<Vec<(AgentId, WorkflowId)>>,
 }
 
 impl Cuts {
-    /// Rewrite rows of `agent`'s committed map until `done`, in a session
-    /// of its own, started again whenever the agent refuses it.
+    /// Rewrite rows of `agent`'s reader's committed map until `done`, in a
+    /// session of its own, started again whenever the agent refuses it.
     fn write(&self, cluster: &Cluster, agent: AgentId, done: &AtomicBool) {
-        let set_entries = method(&actor("counter"), "set_entries");
+        let set_entries = method(&actor("reader"), "set_entries");
         let mut name = 0u128;
         let mut session = None;
         let mut sequence = 0;
@@ -95,12 +98,7 @@ impl Cuts {
             let current = *session.get_or_insert_with(|| {
                 name += 1;
                 sequence = 1;
-                Session {
-                    key: [9; 32],
-                    name: name.to_le_bytes(),
-                    t0: vos_node::wall_clock()
-                        .saturating_add_signed(cluster.offset.load(Ordering::SeqCst)),
-                }
+                self::session(cluster, 9, name)
             });
             let writes: Vec<(u64, Option<u64>)> = (0..8u64)
                 .map(|index| {
@@ -112,7 +110,7 @@ impl Cuts {
                 session: current,
                 sequence,
                 caller: Principal::Client([9; 32]),
-                instance: COUNTER,
+                instance: READER,
                 method: set_entries,
                 arguments: writes.encode(),
             };
@@ -129,6 +127,48 @@ impl Cuts {
                 Err(_) => {
                     std::thread::sleep(Duration::from_millis(20));
                 }
+            }
+        }
+    }
+
+    /// Start reads of `agent`'s reader at their window's cut until `done`,
+    /// a few a window, each in a session of its own's next request.
+    fn read(&self, cluster: &Cluster, agent: AgentId, done: &AtomicBool) {
+        let sum_at_cut = method(&actor("reader"), "sum_at_cut");
+        let mut name = 0u128;
+        let mut session = None;
+        let mut sequence = 0;
+        while !done.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(300));
+            if cluster.paused.load(Ordering::SeqCst) {
+                continue;
+            }
+            let current = *session.get_or_insert_with(|| {
+                name += 1;
+                sequence = 1;
+                self::session(cluster, 8, name)
+            });
+            let request = Request {
+                session: current,
+                sequence,
+                caller: Principal::Client([8; 32]),
+                instance: READER,
+                method: sum_at_cut,
+                arguments: read_keys().encode(),
+            };
+            let Some(node) = cluster
+                .leader(agent)
+                .and_then(|number| cluster.node(number))
+            else {
+                continue;
+            };
+            match smol::block_on(node.call(agent, request)) {
+                Ok(Reply::Ran(Outcome::Started(id))) => {
+                    self.started.lock().unwrap().push((agent, id));
+                    sequence += 1;
+                }
+                Ok(_) => session = None,
+                Err(_) => {}
             }
         }
     }
@@ -162,27 +202,21 @@ impl Alongside for Cuts {
     }
 
     fn run(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])], done: &AtomicBool) {
-        // One request a window, named by it: every batch of the window
-        // records the same row again, which changes nothing.
-        let asks: Arc<Asks> = Arc::new(|_: AgentId, time: u64| {
-            let window = CLOCK.window(time)?;
-            Some((
-                RequestId {
-                    workflow: WorkflowId(window),
-                    awaits: 0,
-                },
-                PendingRead {
-                    instance: COUNTER,
-                    rows: read_rows(),
-                },
-            ))
-        });
+        let reader = package("reader");
+        for (agent, _) in agents {
+            install_at_leader(|| cluster.leading(*agent), *agent, READER, &reader);
+        }
         for number in 1..=NODES {
-            *cluster.slot(number).trip.asks.lock().unwrap() = Some(asks.clone());
+            cluster
+                .slot(number)
+                .trip
+                .stand_in
+                .store(true, Ordering::SeqCst);
         }
         std::thread::scope(|scope| {
             for (agent, _) in agents {
                 scope.spawn(move || self.write(cluster, *agent, done));
+                scope.spawn(move || self.read(cluster, *agent, done));
             }
             scope.spawn(move || self.sample(cluster, agents, done));
         });
@@ -192,9 +226,18 @@ impl Alongside for Cuts {
         let held = *self.undo_held.lock().unwrap();
         println!("samples holding undo rows: {held}");
         assert!(held > 0, "no replica held an undo row");
+        let started = self.started.lock().unwrap().clone();
+        let mut served = 0;
         for (agent, _) in agents {
+            let reads: Vec<WorkflowId> = started
+                .iter()
+                .filter(|(at, _)| at == agent)
+                .map(|(_, id)| *id)
+                .collect();
+            served += check_reads(cluster, *agent, &reads);
             check_agent(cluster, *agent);
         }
+        assert!(served > 0, "no read served");
     }
 }
 
@@ -221,11 +264,8 @@ fn replicated(snapshot: &Snapshot, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 /// Once every replica applies as far as the others and has built every
 /// cut and its latest version: the same cuts, dozens of them, and the same
-/// replicated rows; the same roots at the two latest cuts; each pending
-/// request of a cut window the same proof everywhere, at its window's cut,
-/// of the rows it reads, verifying against its root, the root kept at that
-/// cut while it is kept; no undo row left. Leaders cut idle agents' windows
-/// meanwhile, so the latest cuts may hold no request.
+/// replicated rows; the same roots at the two latest cuts; no undo row, no
+/// pending request and no request's proof left, every read answered.
 fn check_agent(cluster: &Cluster, agent: AgentId) {
     let nodes: Vec<_> = (1..=NODES)
         .map(|number| cluster.node(number).unwrap())
@@ -266,9 +306,7 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
             agent.0
         );
     }
-    let latest: Vec<u64> = recorded.keys().rev().take(2).copied().collect();
-    let mut roots: BTreeMap<u64, (Hash, u64)> = BTreeMap::new();
-    for window in &latest {
+    for window in recorded.keys().rev().take(2) {
         let root = roots::cut_root(&snapshots[0], agent, *window).unwrap();
         let root = root.unwrap_or_else(|| panic!("agent {}: cut({window}) kept", agent.0));
         assert_eq!(root.1, recorded[window]);
@@ -278,58 +316,72 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
                 Some(root)
             );
         }
-        roots.insert(*window, root);
     }
-    let mut proven = 0;
-    for row in snapshots[0].scan(agent, &keys::request_prefix(), None) {
-        let (key, value) = row.unwrap();
-        let (window, id) = keys::request_entry(&key).unwrap();
-        let read = PendingRead::decode(unstored(&value).unwrap()).unwrap().0;
-        if !recorded.contains_key(&window) {
-            continue;
-        }
-        let proof = roots::cut_proof(&snapshots[0], agent, id).unwrap();
-        for snapshot in &snapshots[1..] {
-            assert_eq!(
-                roots::cut_proof(snapshot, agent, id).unwrap(),
-                proof,
-                "{id:?}"
+    for snapshot in &snapshots {
+        for prefix in [keys::request_prefix(), keys::cut_proofs()] {
+            assert!(
+                snapshot.scan(agent, &prefix, None).next().is_none(),
+                "agent {}: a request or its proof left",
+                agent.0
             );
         }
-        let Some(proof) = proof else {
-            continue;
-        };
-        assert_eq!(
-            (proof.window, proof.version),
-            (window, recorded[&window]),
-            "agent {}: {id:?}'s cut",
-            agent.0
-        );
-        if let Some((root, _)) = roots.get(&window) {
-            assert_eq!(proof.agent_root, *root, "the root at cut({window})");
-        }
-        assert_eq!(
-            proof
-                .rows
-                .iter()
-                .map(|(row, _)| row.clone())
-                .collect::<Vec<_>>(),
-            read.rows
-        );
-        let claims: Vec<(Vec<u8>, Option<Hash>)> = proof
-            .rows
-            .iter()
-            .map(|(row, held)| {
-                let held = held
-                    .as_ref()
-                    .map(|(salt, value)| vos_tree::value_hash(&Blake2b, salt, value));
-                (row.clone(), held)
-            })
-            .collect();
-        vos_tree::verify_encoded(&Blake2b, &proof.rows_proof, &proof.agent_root, &claims).unwrap();
-        proven += 1;
     }
-    assert!(proven > 0, "agent {}: no request proved", agent.0);
+}
+
+/// Every read `agent`'s reader started ended on every replica, its record
+/// read or, a clock's jump past its keeping, collected: those read served
+/// and stated, not served in time, or, of a window such a jump left uncut,
+/// unserved; none refused by its kernel. How many were read served.
+fn check_reads(cluster: &Cluster, agent: AgentId, reads: &[WorkflowId]) -> usize {
+    let nodes: Vec<_> = (1..=NODES)
+        .map(|number| cluster.node(number).unwrap())
+        .collect();
+    let mut outcomes = BTreeMap::new();
+    wait_until("every read ends on every replica", ANSWERED, || {
+        outcomes.clear();
+        nodes.iter().all(|node| {
+            let snapshot = node.store().snapshot();
+            reads.iter().all(|id| match ended(&snapshot, agent, *id) {
+                Some(Some(outcome)) => {
+                    outcomes.insert(*id, outcome);
+                    true
+                }
+                Some(None) => true,
+                None => false,
+            })
+        })
+    });
+    let failed = |error: AttestError| Outcome::Failed {
+        code: Failure::Handler,
+        detail: error.encode(),
+    };
+    let count =
+        |of: &dyn Fn(&Outcome) -> bool| outcomes.values().filter(|outcome| of(outcome)).count();
+    let served = count(&|outcome| matches!(outcome, Outcome::Done(_)));
+    let late = count(&|outcome| *outcome == failed(AttestError::NotClosed));
+    let unserved = count(&|outcome| *outcome == failed(AttestError::Unserved));
+    println!(
+        "agent {}: {} reads, {} collected, {served} served, {late} not served in time, \
+         {unserved} unserved",
+        agent.0,
+        reads.len(),
+        reads.len() - outcomes.len(),
+    );
+    assert_eq!(served + late + unserved, outcomes.len(), "{outcomes:?}");
+    served
+}
+
+/// Workflow `id`'s outcome in `snapshot` once it ended, `Some(None)` once
+/// it is collected, or `None` while it runs.
+fn ended(snapshot: &Snapshot, agent: AgentId, id: WorkflowId) -> Option<Option<Outcome>> {
+    let Some(bytes) = snapshot.get(agent, &keys::workflow(id)).unwrap() else {
+        return Some(None);
+    };
+    let record = Workflow::decode(unstored(&bytes)?).ok()?.0;
+    match record.state {
+        WorkflowState::Ended(outcome) => Some(Some(outcome)),
+        _ => None,
+    }
 }
 
 /// The exactly-once run with window cuts, its replicas' states equal
@@ -339,6 +391,7 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
 fn cuts_apply_once_and_replicas_agree_through_failures() {
     let cuts = Cuts {
         undo_held: Mutex::new(0),
+        started: Mutex::new(Vec::new()),
     };
     let rounds = std::env::var_os("CUTS_FULL").map(|_| Rounds::load());
     exactly_once(Mode::OneAtATime, 0x5eed_0612, rounds, Some(&cuts));

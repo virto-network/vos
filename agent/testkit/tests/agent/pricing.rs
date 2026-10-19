@@ -24,7 +24,8 @@ use crate::common::{
 #[test]
 fn every_operation_pays_for_its_serving() {
     use vos_wire::abi::price::{
-        self, GET, INPUT, KEY_BYTE, LOG, MACHINE, OPERATION, PER_BYTE, PUT, RANDOM, SCAN, SEND,
+        self, ATTEST, GET, INPUT, KEY_BYTE, LOG, MACHINE, OPERATION, PER_BYTE, PUT, RANDOM, SCAN,
+        SEND,
     };
     let (actors, node, _, _) = setup();
     let ops = actors.method(COUNTER, "ops");
@@ -229,9 +230,9 @@ fn every_operation_pays_for_its_serving() {
         short.push("send");
     }
     let attest = |count: u32| vec![(LEDGER, audits, count.encode())];
-    let cost = MACHINE as i64 + (unpaid(attest(16)) - unpaid(attest(0))) / 16;
-    println!("attest: charged {MACHINE}, costs the agent {cost}");
-    if cost > MACHINE as i64 * 4 / 5 {
+    let cost = ATTEST as i64 + (unpaid(attest(16)) - unpaid(attest(0))) / 16;
+    println!("attest: charged {ATTEST}, costs the agent {cost}");
+    if cost > ATTEST as i64 * 4 / 5 {
         short.push("attest");
     }
     assert!(short.is_empty(), "priced without a fifth spare: {short:?}");

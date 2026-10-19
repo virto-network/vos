@@ -1,8 +1,9 @@
 //! How an invocation ended, and where a workflow's step paused.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
-use vos_wire::ids::AgentId;
+use vos_wire::ids::{AgentId, MethodId};
 use vos_wire::records::WorkflowState;
 
 /// How an invocation ended, short of failing the whole step.
@@ -15,7 +16,8 @@ pub(crate) enum Ended {
 }
 
 /// Where a workflow's step paused: awaiting another agent's answer to
-/// await `counter` until a deadline, asleep until a time, or preempted
+/// await `counter` until a deadline, asleep until a time, awaiting its read
+/// at a window's cut, or preempted
 /// between two awaits, before the host call `pending` when it was not
 /// served. A step preempted out of gas `idle`, having served no call and
 /// written no page since it resumed, moved only if its registers or its
@@ -29,10 +31,23 @@ pub(crate) enum Pause {
     Sleep {
         until: u64,
     },
+    /// Awaiting its read at a window's cut: apart, so a pause, which every
+    /// nested call's frame holds room for, stays small.
+    Attesting(Box<Attesting>),
     Preempted {
         pending: Option<u64>,
         idle: bool,
     },
+}
+
+/// A workflow awaiting its read at window `window`'s cut, at await
+/// `counter`, through attestable `method` on `arguments`, until `deadline`.
+pub(crate) struct Attesting {
+    pub(crate) counter: u64,
+    pub(crate) window: u64,
+    pub(crate) method: MethodId,
+    pub(crate) arguments: Vec<u8>,
+    pub(crate) deadline: u64,
 }
 
 impl Pause {
@@ -42,6 +57,7 @@ impl Pause {
     pub(crate) fn due(&self, time: u64) -> u64 {
         match self {
             Pause::Await { deadline, .. } => *deadline,
+            Pause::Attesting(attesting) => attesting.deadline,
             Pause::Sleep { until } => *until,
             Pause::Preempted { .. } => time.saturating_add(1),
         }
@@ -68,6 +84,22 @@ impl Pause {
                 deadline,
             },
             Pause::Sleep { until } => WorkflowState::Sleeping { until },
+            Pause::Attesting(attesting) => {
+                let Attesting {
+                    counter,
+                    window,
+                    method,
+                    arguments,
+                    deadline,
+                } = *attesting;
+                WorkflowState::Attesting {
+                    counter,
+                    window,
+                    method,
+                    arguments,
+                    deadline,
+                }
+            }
             Pause::Preempted { .. } => WorkflowState::Preempted(input.to_vec()),
         }
     }

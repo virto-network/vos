@@ -696,3 +696,30 @@ check` green (1,123 tests, 0 failed).
 this record and the plan's edits.
 
 **6.2 accepted.**
+
+## Step 6.13: `&self` attestables and the public-input model
+
+On `s6/roots` (from `59eb975b`). The full record is the step's log.
+
+- **Built:** `#[attestable]` on `&self` reading the generated
+  `<Actor>View` (`ServedMap`s), `#[public]` arguments and `venue_bound`;
+  schema kinds `Stating` and `Reading` beside `Attestable`; the SDK's
+  `verify_served` prologue and `attested(public_args, output, roots,
+  io_hash)`; `Workflow::attest_at_cut(..).reads(..)` over `Op::AttestAt`,
+  refused at once (`NoSpace`, `Unknown`, `Cap`, `Reads`) or paused until
+  `B_{w+3}` (`NotClosed`); `Input::Resume` served by the leader once its
+  replica built the cut (a stand-in representative until 6.14), checked by
+  refine (`Unserved`), run on arguments ‖ served, the `Attest` recorded with
+  window, public arguments and `S_w`; derivation of `Reading` kernels with
+  192 KiB of argument pages read 64 KiB a call; `Hooks::request_at_cut`
+  deleted; JAM's `Limits::served` 32 KiB and its effects.
+- **Measured** [measured], against 6.0a on a million-row map and 1,024
+  agents: a row 20.07 compressions (19.07 and the view's key hash) and 862 B;
+  the path 14 (+1) compressions and 590 B; the sixteen-row prologue 210,019
+  steps (+2.0%), the kernel with its sixteen view reads 248,914 (+21%, 2,432
+  steps a read); 11 segments at the 32k class, 5 cut short by its 8 pages.
+- **Priced** [measured]: `ATTEST` 66,000 apart from a call's machine,
+  `CALLER` 6,200, the parts' io-hash 8,000 a block, a served byte 64 of the
+  batch's budget (41.5 measured).
+- **Checker:** the served cuts run reads through every fault, 198 of 262
+  served, none failed.

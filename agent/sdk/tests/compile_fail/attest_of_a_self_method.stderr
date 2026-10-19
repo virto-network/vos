@@ -1,0 +1,37 @@
+error[E0277]: the trait bound `counter::Entry: AttestableMethod` is not satisfied
+  --> tests/compile_fail/attest_of_a_self_method.rs:19:20
+   |
+19 |         ctx.attest(counter::Entry { key }).await.unwrap_or(0)
+   |             ------ ^^^^^^^^^^^^^^^^^^^^^^ the trait `AttestableMethod` is not implemented for `counter::Entry`
+   |             |
+   |             required by a bound introduced by this call
+   |
+note: required by a bound in `vos_sdk::context::Command::<A>::attest`
+  --> src/context.rs
+   |
+   |     pub async fn attest<M: AttestableMethod<Actor = A>>(
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Command::<A>::attest`
+
+error[E0277]: the trait bound `counter::Entry: AttestableMethod` is not satisfied
+  --> tests/compile_fail/attest_of_a_self_method.rs:19:9
+   |
+19 |         ctx.attest(counter::Entry { key }).await.unwrap_or(0)
+   |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the trait `AttestableMethod` is not implemented for `counter::Entry`
+   |
+note: required by a bound in `vos_sdk::context::Command::<A>::attest`
+  --> src/context.rs
+   |
+   |     pub async fn attest<M: AttestableMethod<Actor = A>>(
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Command::<A>::attest`
+
+error[E0277]: the trait bound `counter::Entry: AttestableMethod` is not satisfied
+  --> tests/compile_fail/attest_of_a_self_method.rs:19:44
+   |
+19 |         ctx.attest(counter::Entry { key }).await.unwrap_or(0)
+   |                                            ^^^^^ the trait `AttestableMethod` is not implemented for `counter::Entry`
+   |
+note: required by a bound in `vos_sdk::context::Command::<A>::attest`
+  --> src/context.rs
+   |
+   |     pub async fn attest<M: AttestableMethod<Actor = A>>(
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^^^^ required by this bound in `Command::<A>::attest`

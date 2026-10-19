@@ -24,8 +24,9 @@ impl Leader {
     /// Run one batch to its end. False when a hook stops the leader.
     pub(super) async fn run(&mut self, mut pending: Vec<Pending>) -> bool {
         let taken = Instant::now();
-        // Whether to sweep is decided below, on the batch's state.
-        pending.retain(|item| !matches!(item, Pending::Sweep(_)));
+        // Whether to sweep, and what reads to serve, are decided below, on
+        // the batch's state.
+        pending.retain(|item| !matches!(item, Pending::Sweep(_) | Pending::Resume { .. }));
         let snapshot = Arc::new(self.inner.store.snapshot());
         let before = Arc::clone(&snapshot);
         // The batch is refined on this state, at its version and no earlier
@@ -72,6 +73,13 @@ impl Leader {
                     self.retry(pending, fault).await;
                     return true;
                 }
+            }
+        }
+        match self.resumes(&snapshot) {
+            Ok(resumes) => pending.extend(resumes),
+            Err(fault) => {
+                self.retry(pending, fault).await;
+                return true;
             }
         }
         if pending.is_empty() {

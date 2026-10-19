@@ -4,9 +4,13 @@
 
 use alloc::vec::Vec;
 use core::future::Future;
+
 use core::mem::ManuallyDrop;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
+use vos_wire::result::KernelReturn;
+use vos_wire::served::{Served, representative_row, space_root};
+use vos_wire::vos_anchor::{RootKind, RootRead};
 
 /// The invocation's arguments, decoded as `T`. Arguments that do not
 /// decode trap, which fails the step.
@@ -101,29 +105,116 @@ impl Output {
 /// output.
 pub type Entry = unsafe extern "C" fn(*const u8, u64, *mut [u8; 32]) -> Output;
 
-/// An attestable method's end: its encoded `output`, leaked for the host,
-/// and its io-hash ([`vos_pvm_precompiles::compute_io_hash`]) written at
-/// `io_hash`. Its arguments are all private and it reads no root, so the
-/// public arguments and the roots are empty.
+/// The end of an attestable method of no public argument that reads no
+/// root: its encoded `output`, leaked for the host, and its io-hash
+/// ([`vos_pvm_precompiles::compute_io_hash`]) written at `io_hash`, over
+/// empty public arguments and no root.
 ///
 /// # Safety
 ///
 /// `io_hash` must point at 32 writable bytes.
-pub unsafe fn attested(output: Vec<u8>, io_hash: *mut [u8; 32]) -> Output {
+pub unsafe fn attested_output(output: Vec<u8>, io_hash: *mut [u8; 32]) -> Output {
     let hash = vos_pvm_precompiles::compute_io_hash(&[], &output, &[]);
     // SAFETY: the caller's contract.
     unsafe { io_hash.write(hash) };
     Output::leak(output)
 }
 
+/// An attestable method's end: its statement's parts, `public_args`, its
+/// encoded `output` and the `roots` it read, encoded as a
+/// [`KernelReturn`] and leaked for the host, and their io-hash written at
+/// `io_hash`.
+///
+/// # Safety
+///
+/// `io_hash` must point at 32 writable bytes.
+pub unsafe fn attested(
+    public_args: Vec<u8>,
+    output: Vec<u8>,
+    roots: Vec<RootRead>,
+    io_hash: *mut [u8; 32],
+) -> Output {
+    let parts = KernelReturn {
+        public_args,
+        output,
+        roots,
+    };
+    // SAFETY: the caller's contract.
+    unsafe { io_hash.write(parts.io_hash()) };
+    Output::leak(crate::Encode::encode(&parts))
+}
+
+/// The rows a read at a window's cut is served, decoded from the whole of
+/// `input`, the witness input past the arguments: kept for the rest of the
+/// kernel's run, which its view's maps answer from. Bytes that are not one
+/// [`Served`] trap.
+pub fn served(input: &[u8]) -> &'static Served {
+    let served = match <Served as crate::Decode>::decode(input) {
+        Ok((served, used)) if used == input.len() => served,
+        _ => panic!("undecodable served rows"),
+    };
+    alloc::boxed::Box::leak(alloc::boxed::Box::new(served))
+}
+
+/// The prologue of a kernel that reads at a window's cut: `served`'s rows,
+/// each of its instance's committed rows and strictly increasing by key,
+/// checked against the agent's root by one multiproof; the agent's root
+/// against the representative's root by its space path, its leaf's value
+/// committed with `rep_salt`; and the space root `S_w` over the
+/// representative's root, the root read it states. A refusal traps, which
+/// fails the attest.
+pub fn verify_served(served: &Served) -> RootRead {
+    let prefix = vos_wire::keys::instance_committed(served.instance);
+    let mut claims: Vec<(&[u8], Option<vos_tree::Hash>)> = Vec::with_capacity(served.rows.len());
+    for (index, (key, read)) in served.rows.iter().enumerate() {
+        assert!(key.starts_with(&prefix), "a row of another instance");
+        assert!(
+            index == 0 || served.rows[index - 1].0 < *key,
+            "rows out of order"
+        );
+        let commitment = read
+            .as_ref()
+            .map(|(salt, value)| vos_tree::value_hash(&vos_tree::Blake2b, salt, value));
+        claims.push((key.as_slice(), commitment));
+    }
+    vos_tree::verify_encoded(
+        &vos_tree::Blake2b,
+        &served.rows_proof,
+        &served.agent_root,
+        &claims,
+    )
+    .expect("the rows' proof");
+    let row = representative_row(served.agent, RootKind::Space, served.window);
+    let commitment = vos_tree::value_hash(&vos_tree::Blake2b, &served.rep_salt, &served.agent_root);
+    vos_tree::verify_encoded(
+        &vos_tree::Blake2b,
+        &served.space_path,
+        &served.rep_root,
+        &[(row.as_slice(), Some(commitment))],
+    )
+    .expect("the space path");
+    RootRead {
+        kind: RootKind::Space,
+        space: served.space,
+        window: served.window,
+        root: space_root(&served.space, served.window, &served.rep_root),
+    }
+}
+
 /// An attestable method of the actor and its entry, which `#[messages]`
 /// generates as `__vos_attest_<method>`: the root a kernel is derived from
-/// at install, by what the entry reaches.
+/// at install, by what the entry reaches. The method's id is the word's low
+/// 32 bits; [`READS_SERVED`] marks a `&self` method.
 #[repr(C)]
 pub struct Attestable {
     pub method: u64,
     pub entry: Entry,
 }
+
+/// The bit of an [`Attestable`]'s method word that marks a `&self` method:
+/// its kernel reads, after its arguments, the rows served at a window's
+/// cut, which an install's derivation gives room for.
+pub const READS_SERVED: u64 = 1 << 32;
 
 /// An actor program: `actor_program!(crate_name::module)`, naming the
 /// module `#[messages]` generates, with a heap of [`PROGRAM_HEAP`] or

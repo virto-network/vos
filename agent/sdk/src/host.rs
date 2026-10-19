@@ -363,6 +363,28 @@ pub fn result(agent: u32, workflow: u64, within: u64) -> Vec<u8> {
     resumed(len)
 }
 
+/// A workflow's read at its window's cut through attestable `method` on
+/// `arguments`, of the rows `reads` encodes: it pauses, and returns the
+/// encoded [`vos_wire::result::Attested`] once the agent resumes it; or,
+/// refused at once, the [`vos_wire::abi::AttestError`] code.
+pub fn attest_at(method: u32, arguments: &[u8], reads: &[u8]) -> Result<Vec<u8>, u32> {
+    let (len, refused) = ecalli!(
+        Op::AttestAt.id(),
+        [
+            u64::from(method),
+            ptr(arguments),
+            arguments.len() as u64,
+            ptr(reads),
+            reads.len() as u64,
+            0
+        ]
+    );
+    match refused {
+        0 => Ok(resumed(len)),
+        code => Err(code as u32),
+    }
+}
+
 /// Pause a workflow until a batch at or past `time`.
 pub fn sleep(time: u64) {
     ecalli!(Op::Sleep.id(), [time, 0, 0, 0, 0, 0]);

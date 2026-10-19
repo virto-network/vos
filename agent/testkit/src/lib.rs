@@ -213,13 +213,26 @@ impl Testkit {
         derived: &vos_pvm_compiler::Derived,
         roles: &[(&str, u8)],
     ) -> Result<(), InstallError> {
+        self.install_derived_in(SPACELESS, target, instance, derived, roles)
+    }
+
+    /// [`Testkit::install_derived`] into an agent of `space`, whose
+    /// windows `clock` numbers, as [`Testkit::install_in`].
+    pub fn install_derived_in(
+        &mut self,
+        (space, clock): (SpaceId, WindowClock),
+        target: Target,
+        instance: InstanceId,
+        derived: &vos_pvm_compiler::Derived,
+        roles: &[(&str, u8)],
+    ) -> Result<(), InstallError> {
         let kernels: Vec<(MethodId, &[u8])> = derived
             .kernels
             .iter()
             .map(|(method, kernel)| (MethodId(*method), kernel.as_slice()))
             .collect();
         self.install_with_heap(
-            SPACELESS,
+            (space, clock),
             target,
             instance,
             &derived.actor,
@@ -254,7 +267,10 @@ impl Testkit {
             .map(|(name, role)| (name.as_bytes().to_vec(), *role))
             .collect();
         for (index, (method, _)) in kernels.iter().enumerate() {
-            if schema.method(*method).map(|bound| bound.kind) != Some(Kind::Attestable) {
+            if !schema
+                .method(*method)
+                .is_some_and(|bound| bound.kind.is_attestable())
+            {
                 return Err(InstallError::Unmatched(*method));
             }
             if kernels[..index].iter().any(|(bound, _)| bound == method) {
@@ -262,8 +278,7 @@ impl Testkit {
             }
         }
         for method in &schema.methods {
-            if method.kind == Kind::Attestable
-                && !kernels.iter().any(|(bound, _)| *bound == method.id)
+            if method.kind.is_attestable() && !kernels.iter().any(|(bound, _)| *bound == method.id)
             {
                 return Err(InstallError::Unbound(method.id));
             }
@@ -528,7 +543,7 @@ fn statics_within(
         return Ok(());
     };
     for method in &schema.methods {
-        if method.kind == Kind::Attestable
+        if method.kind.is_attestable()
             && let Some(gas) = method.gas.filter(|&gas| gas > most)
         {
             return Err(Refused::KernelGas {
@@ -566,6 +581,15 @@ fn split_writes(overlay: BTreeMap<Vec<u8>, Option<Vec<u8>>>) -> (Vec<Write>, Vec
         }
     }
     (writes, committed)
+}
+
+/// Run kernel `program` on `input`, its witness input, with `gas`, as an
+/// attest runs it: its output and the io-hash it left in φ9..φ12, or why it
+/// failed.
+pub fn run_kernel(program: &[u8], input: &[u8], gas: u64) -> Result<(Vec<u8>, [u8; 32]), Failure> {
+    let run =
+        memory::kernel(program, input, gas, vos_wire::abi::cap::REPLY).map_err(|(code, _)| code)?;
+    Ok((run.output, run.io_hash))
 }
 
 /// Decode a reply as `T`.

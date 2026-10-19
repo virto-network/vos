@@ -1,36 +1,38 @@
 //! Window cuts on replicated agents: the leader's `Cut` marker for an idle
 //! agent, timed at its own clock; a fast clock's jump cutting several
-//! windows at one version; and a leader change between a cut and its
-//! close, which finds every replica holding the cut's proofs.
+//! windows at one version; and reads at a cut, the reader's workflows'
+//! (`agent/test-actors/reader`): a replica down across a cut, and a leader
+//! change between a cut and its close, each finding every replica holding
+//! the cut's proofs; and a read served by its leader and stated.
 //!
 //! Each space here has windows of two minutes, the shortest a venue
 //! registers, with a boundary `B_0` some seconds after the cluster starts;
 //! the tests move nodes' clocks across boundaries by their offsets rather
 //! than wait. A cut, its build and its proofs are the model's terms
-//! (`tests/cuts/model.rs`); the close is the representative's `Closed`,
-//! which no node sends yet, so "before the close" is any time after the
-//! cut.
+//! (`tests/cuts/model.rs`); the close is the representative's `Closed`.
+//! A node holds no representative's path but a test's stand-in
+//! ([`vos_node::Hooks::stand_in_representative`]): without it no read is
+//! served, so "before the close" is any time after the cut.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use vos_checker::programs::table_tag;
+use vos_checker::programs::{actor, method, package, table_tag};
 use vos_node::roots::{self, AgentStore, CutProof, ReadRow};
 use vos_node::store::EntryKind;
 use vos_node::{CallError, Hooks, Node, Reply};
 use vos_tree::{Blake2b, Hash, NodeStore};
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, MapId, RequestId, WorkflowId};
-use vos_wire::keys;
+use vos_wire::ids::{AgentId, InstanceId, MapId, MethodId, RequestId};
+use vos_wire::keys::{self, Transform};
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::{PendingRead, unstored, unversioned};
 use vos_wire::result::{Outcome, WorkResult};
 use vos_wire::vos_anchor::MIN_LENGTH_MS;
 use vos_wire::{Decode, Encode, WindowClock};
 
-use crate::common::{ALICE, COUNTER, Cluster, Rows, compacting, log_start, wait_until};
+use crate::common::{ALICE, Cluster, Rows, compacting, log_start, wait_until};
 
 /// How far after the cluster starts its first boundary falls.
 const LEAD_MS: u64 = 30_000;
@@ -104,7 +106,7 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     let clock = clock();
     let b0 = clock.boundary(0).unwrap();
     let cluster = Cluster::in_space(3, Some(clock), |_, _| {});
-    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let agent = reader_agent(&cluster, &[1, 2, 3]);
     let leader = cluster.leader(agent);
     let node = cluster.node(leader);
     let applied = node.applied(agent).unwrap();
@@ -224,43 +226,32 @@ fn a_leaders_clock_jumping_ahead_cuts_every_window_it_passes_at_one_version() {
     }
 }
 
-/// The request hook: the leader's batches record `request` while armed,
-/// for the agent it names.
-#[derive(Default)]
-struct Asking {
-    armed: AtomicBool,
-    request: Mutex<Option<(AgentId, RequestId, PendingRead)>>,
+/// The reader, installed beside the counter.
+const READER: InstanceId = InstanceId(2);
+
+/// An agent on `replicas` with the counter and the reader installed.
+fn reader_agent(cluster: &Cluster, replicas: &[NodeNumber]) -> AgentId {
+    let agent = cluster.counter_agent(replicas);
+    cluster.install_package(agent, READER, &package("reader"));
+    agent
 }
 
-impl Hooks for Asking {
-    fn request_at_cut(&self, agent: AgentId, _: u64) -> Option<(RequestId, PendingRead)> {
-        if !self.armed.load(Ordering::SeqCst) {
-            return None;
-        }
-        let held = self.request.lock().unwrap();
-        let (asker, id, read) = held.as_ref()?;
-        (*asker == agent).then(|| (*id, read.clone()))
+/// The reader's method `name`.
+fn reader(name: &str) -> MethodId {
+    method(&actor("reader"), name)
+}
+
+/// The reader's committed map, `entries`.
+fn entries() -> MapId {
+    MapId {
+        instance: READER,
+        tag: table_tag("entries"),
+        transform: Transform::Hashed,
     }
 }
 
-/// The counter's committed map, `entries`, of the transform its rows on
-/// `node` name.
-fn entries(node: &Node, agent: AgentId) -> MapId {
-    let tag = table_tag("entries");
-    node.store()
-        .snapshot()
-        .scan(agent, &keys::instance_committed(COUNTER), None)
-        .find_map(|row| {
-            let (key, _) = row.unwrap();
-            keys::committed_entry(&key)
-                .map(|(map, _)| map)
-                .filter(|map| map.tag == tag)
-        })
-        .expect("a value row of the committed map")
-}
-
 /// Request `sequence` of the cluster's session: 25 puts and deletes in the
-/// committed map, over 300 keys that come back.
+/// reader's committed map, over 300 keys that come back.
 fn writes(cluster: &Cluster, sequence: u64) -> Request {
     let writes: Vec<(u64, Option<u64>)> = (0..25u64)
         .map(|index| {
@@ -272,28 +263,37 @@ fn writes(cluster: &Cluster, sequence: u64) -> Request {
         session: cluster.session,
         sequence,
         caller: ALICE,
-        instance: COUNTER,
-        method: cluster.programs.method("set_entries"),
+        instance: READER,
+        method: reader("set_entries"),
         arguments: writes.encode(),
+    }
+}
+
+/// `request` at `agent`'s leader, followed as it moves: its outcome.
+fn call(cluster: &Cluster, agent: AgentId, request: Request) -> Outcome {
+    let mut backoff = Duration::from_millis(10);
+    let until = Instant::now() + Duration::from_secs(20);
+    loop {
+        let node = cluster.node(cluster.leader(agent));
+        match smol::block_on(node.call(agent, request.clone())) {
+            Ok(Reply::Ran(outcome)) => return outcome,
+            Err(CallError::NotLeader(_) | CallError::TimedOut) if Instant::now() < until => {
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_millis(500));
+            }
+            other => panic!("sequence {}: {other:?}", request.sequence),
+        }
     }
 }
 
 /// Each request of `sequences` at `agent`'s leader, followed as it moves.
 fn write(cluster: &Cluster, agent: AgentId, sequences: std::ops::RangeInclusive<u64>) {
     for sequence in sequences {
-        let mut backoff = Duration::from_millis(10);
-        let until = Instant::now() + Duration::from_secs(20);
-        loop {
-            let node = cluster.node(cluster.leader(agent));
-            match smol::block_on(node.call(agent, writes(cluster, sequence))) {
-                Ok(Reply::Ran(Outcome::Done(_))) => break,
-                Err(CallError::NotLeader(_) | CallError::TimedOut) if Instant::now() < until => {
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(Duration::from_millis(500));
-                }
-                other => panic!("sequence {sequence}: {other:?}"),
-            }
-        }
+        let outcome = call(cluster, agent, writes(cluster, sequence));
+        assert!(
+            matches!(outcome, Outcome::Done(_)),
+            "sequence {sequence}: {outcome:?}"
+        );
     }
 }
 
@@ -328,43 +328,49 @@ fn settled(node: &Node, agent: AgentId) -> Settled {
     settled.unwrap()
 }
 
-/// A pending request of the current window, recorded by the leader's batch
-/// of request `sequence`, once every running replica holds it: sixteen
-/// rows of the counter's committed map, twelve the writes reach and four
-/// they never do.
-fn ask(
-    cluster: &Cluster,
-    agent: AgentId,
-    asking: &Asking,
-    sequence: u64,
-) -> (RequestId, PendingRead) {
+/// A read of the current window by the reader's workflow `sum_at_cut`,
+/// started by request `sequence`, once every running replica holds its
+/// request: sixteen rows of the reader's committed map, twelve the writes
+/// reach and four they never do.
+fn ask(cluster: &Cluster, agent: AgentId, sequence: u64) -> (RequestId, PendingRead) {
     let leader = cluster.node(cluster.leader(agent));
-    let map = entries(leader, agent);
-    let present: Vec<Vec<u8>> = settled(leader, agent)
+    let map = entries();
+    let present: Vec<u64> = settled(leader, agent)
         .2
         .into_keys()
-        .filter(|row| row.starts_with(&keys::committed_rows(&map)))
+        .filter_map(|row| {
+            let transformed = row.strip_prefix(&keys::committed_rows(&map)[..])?;
+            let raw = Transform::Hashed.raw(transformed)?;
+            Some(u64::from_be_bytes(raw.try_into().ok()?))
+        })
         .take(12)
         .collect();
-    let mut rows = present.clone();
-    for row in present.iter().take(4) {
-        let mut absent = row.clone();
-        absent[keys::COMMITTED_PREFIX] ^= 0xff;
-        rows.push(absent);
-    }
-    rows.sort();
-    rows.dedup();
+    assert_eq!(present.len(), 12, "twelve rows written");
+    let keys: Vec<u64> = present.iter().copied().chain(1_000..1_004).collect();
+    let start = Request {
+        session: cluster.session,
+        sequence,
+        caller: ALICE,
+        instance: READER,
+        method: reader("sum_at_cut"),
+        arguments: keys.encode(),
+    };
+    let Outcome::Started(workflow) = call(cluster, agent, start) else {
+        panic!("the read did not start");
+    };
     let id = RequestId {
-        workflow: WorkflowId(1),
+        workflow,
         awaits: 0,
     };
+    let mut rows: Vec<Vec<u8>> = keys
+        .iter()
+        .map(|key| keys::committed(&map, &Transform::Hashed.apply(&key.to_be_bytes())))
+        .collect();
+    rows.sort();
     let read = PendingRead {
-        instance: COUNTER,
+        instance: READER,
         rows,
     };
-    *asking.request.lock().unwrap() = Some((agent, id, read.clone()));
-    asking.armed.store(true, Ordering::SeqCst);
-    write(cluster, agent, sequence..=sequence);
     for (_, node) in cluster.running() {
         wait_until("every replica holds the request", || {
             node.store()
@@ -374,7 +380,6 @@ fn ask(
                 .is_some()
         });
     }
-    asking.armed.store(false, Ordering::SeqCst);
     (id, read)
 }
 
@@ -387,20 +392,17 @@ fn a_replica_down_across_a_cut_holds_its_proofs_on_return() {
     for by_snapshot in [false, true] {
         let clock = clock();
         let b0 = clock.boundary(0).unwrap();
-        let asking = Arc::new(Asking::default());
-        let hooks = Arc::clone(&asking);
         let mut cluster = Cluster::in_space(3, Some(clock), move |number, config| {
-            config.hooks = hooks.clone();
             if by_snapshot {
                 compacting(number, config);
             }
         });
-        let agent = cluster.counter_agent(&[1, 2, 3]);
+        let agent = reader_agent(&cluster, &[1, 2, 3]);
         write(&cluster, agent, 1..=10);
         let (_, follower) = cluster.leader_and_follower(agent);
         let stopped_at = cluster.node(follower).applied(agent).unwrap();
         cluster.stop(follower);
-        let (id, _) = ask(&cluster, agent, &asking, 11);
+        let (id, _) = ask(&cluster, agent, 11);
         write(&cluster, agent, 12..=20);
         for number in 1..=3 {
             set_clock(&cluster, number, b0 + 1_000);
@@ -448,14 +450,10 @@ fn a_replica_down_across_a_cut_holds_its_proofs_on_return() {
 fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
     let clock = clock();
     let b0 = clock.boundary(0).unwrap();
-    let asking = Arc::new(Asking::default());
-    let hooks = Arc::clone(&asking);
-    let mut cluster = Cluster::in_space(3, Some(clock), move |_, config| {
-        config.hooks = hooks.clone();
-    });
-    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let mut cluster = Cluster::in_space(3, Some(clock), |_, _| {});
+    let agent = reader_agent(&cluster, &[1, 2, 3]);
     write(&cluster, agent, 1..=20);
-    let (id, read) = ask(&cluster, agent, &asking, 21);
+    let (id, read) = ask(&cluster, agent, 21);
     write(&cluster, agent, 22..=30);
 
     // The state at the cut: nothing applies between it and `B_0`.
@@ -548,6 +546,102 @@ fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
             .collect();
         roots.iter().all(Option::is_some) && roots.windows(2).all(|pair| pair[0] == pair[1])
     });
+}
+
+/// Has the leader serve the reads its replica proved, with a stand-in for
+/// the space's representative.
+struct StandIn;
+
+impl Hooks for StandIn {
+    fn stand_in_representative(&self) -> bool {
+        true
+    }
+}
+
+/// A read served by its leader. The reader's workflow reads sixteen rows of
+/// its committed map at window 0's cut; the clocks pass `B_0`; once the
+/// leader's replica has built the cut, it serves the rows with their proof
+/// and the stand-in's path, and the workflow's step runs the kernel on them:
+/// it ends with the sum of the values at the cut, though later writes
+/// rewrote them, and its step states the read: the window, the reader and
+/// the keys as public arguments, and `S_0` over the stand-in's root of the
+/// agent's root at the cut. Every replica then holds neither the request
+/// nor its proof, and the same rows.
+#[test]
+fn a_read_at_a_cut_is_served_by_its_leader() {
+    let clock = clock();
+    let b0 = clock.boundary(0).unwrap();
+    let cluster = Cluster::in_space(3, Some(clock), |_, config| {
+        config.hooks = std::sync::Arc::new(StandIn);
+    });
+    let agent = reader_agent(&cluster, &[1, 2, 3]);
+    write(&cluster, agent, 1..=20);
+    let (id, read) = ask(&cluster, agent, 21);
+    let (root, at_cut, values) = settled(cluster.node(cluster.leader(agent)), agent);
+    let sum = read
+        .rows
+        .iter()
+        .filter_map(|row| values.get(row))
+        .map(|(_, value)| u64::decode(value).unwrap().0)
+        .fold(0u64, u64::wrapping_add);
+    let leader = cluster.leader(agent);
+    let applied = cluster.node(leader).applied(agent).unwrap();
+    for number in 1..=3 {
+        set_clock(&cluster, number, b0 + 1_000);
+    }
+    write(&cluster, agent, 22..=30);
+    let node = cluster.node(leader);
+    let mut ended = None;
+    wait_until("the read is served and its workflow ends", || {
+        let record: Option<vos_wire::records::Workflow> =
+            vos_checker::applied(node.store(), agent, &keys::workflow(id.workflow));
+        ended = record.and_then(|record| match record.state {
+            vos_wire::records::WorkflowState::Ended(outcome) => Some(outcome),
+            _ => None,
+        });
+        ended.is_some()
+    });
+    assert_eq!(ended, Some(Outcome::Done(sum.encode())));
+    let attest = results(node, agent, applied)
+        .into_iter()
+        .flat_map(|(_, result)| result.steps)
+        .find_map(|step| match step {
+            vos_wire::result::Step::Ran(run)
+                if run.input == (vos_wire::result::InputRef::Resume { request: id }) =>
+            {
+                run.attests.into_iter().next()
+            }
+            _ => None,
+        })
+        .expect("the read's attest");
+    let (rep_root, _, _) = roots::stand_in(agent, 0, &root).unwrap();
+    let keys_read: Vec<u64> = vos_wire::Decode::decode(&attest.witness_input).unwrap().0;
+    let mut public_args = (agent, READER).encode();
+    public_args.extend(keys_read.encode());
+    assert_eq!(attest.window, Some(0));
+    assert_eq!(attest.output, sum.encode());
+    assert_eq!(attest.public_args, public_args);
+    assert_eq!(
+        attest.roots,
+        [vos_wire::vos_anchor::RootRead {
+            kind: vos_wire::vos_anchor::RootKind::Space,
+            space: cluster.space.id(),
+            window: 0,
+            root: vos_wire::vos_anchor::space_root(&cluster.space.id(), 0, &rep_root),
+        }]
+    );
+    assert_eq!(cuts(node, agent).get(&0), Some(&at_cut));
+    for (_, node) in cluster.running() {
+        wait_until("every replica answers the request", || {
+            let snapshot = node.store().snapshot();
+            snapshot
+                .get(agent, &keys::request(0, id))
+                .unwrap()
+                .is_none()
+                && roots::cut_proof(&snapshot, agent, id).unwrap().is_none()
+        });
+    }
+    same_state(&cluster, agent);
 }
 
 /// `agent`'s replicated rows on `node` ([`keys::is_replicated`]) and its

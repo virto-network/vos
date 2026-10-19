@@ -86,8 +86,10 @@ fn a_result_written_step_by_step_is_the_work_result_encoding() {
 }
 
 /// A step at every cap, with as many writes (committed ones, the larger)
-/// and instances as `gas` pays for, and a request's reply.
-fn largest_step(gas: u64) -> Step {
+/// and instances as `gas` pays for, and a request's reply: its attests
+/// plain, or, `at_cut`, each at a window's cut, its served rows in its
+/// witness input, as many as count to the cap.
+fn largest_step(gas: u64, at_cut: bool) -> Step {
     use abi::cap;
     let largest_await = Await {
         workflow: WorkflowId(u64::MAX),
@@ -146,11 +148,16 @@ fn largest_step(gas: u64) -> Step {
                 },
             }])
             .collect(),
-        attests: (0..cap::ATTESTS)
+        attests: (0..cap::ATTESTS / if at_cut { cap::AT_CUT } else { 1 })
             .map(|_| Attest {
                 program: ProgramHash([0; 32]),
-                witness_input: vec![0; cap::REQUEST],
+                window: Some(u64::MAX),
+                witness_input: vec![0; cap::REQUEST + if at_cut { cap::SERVED } else { 0 }],
+                // Its kernel's whole return, at most a reply: its output
+                // alone, or its parts with their lengths' prefixes.
                 output: vec![0; cap::REPLY],
+                public_args: Vec::new(),
+                roots: Vec::new(),
             })
             .collect(),
         pages: vec![],
@@ -169,12 +176,18 @@ fn the_largest_step_fits_its_bound() {
         workflow: WorkflowId(u64::MAX),
         counter: u64::MAX,
     };
-    assert!(largest_step(MAX_HANDLER_GAS).encode().len() <= cap::STEP_RESULT);
+    for at_cut in [false, true] {
+        assert!(largest_step(MAX_HANDLER_GAS, at_cut).encode().len() <= cap::STEP_RESULT);
+    }
 
     // A workflow's step: its calls' effects, its record, holding its
     // largest input, a preempted one's answer, and a hash for every page it
     // may hold, its rows, and an entry for each page it drops or stores.
-    let effects = largest_step(2 * MAX_HANDLER_GAS).encode().len();
+    let effects = [false, true]
+        .map(|at_cut| largest_step(2 * MAX_HANDLER_GAS, at_cut).encode().len())
+        .into_iter()
+        .max()
+        .unwrap();
     let largest_answer = Answer::Failed {
         code: Failure::Handler,
         detail: vec![0; cap::REPLY],

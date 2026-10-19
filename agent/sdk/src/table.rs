@@ -228,6 +228,80 @@ rows_handle!(
     Committed
 );
 
+impl<K: TableKey, V, T: KeyTransform> CommittedMap<K, V, T> {
+    /// Its row under `key`, as a read at a window's cut names it
+    /// ([`crate::context::AtCut::reads`]).
+    pub fn read(&self, key: &K) -> Read {
+        Read {
+            rows: self.rows(),
+            key: encoded(key),
+        }
+    }
+}
+
+/// A row a read at a window's cut names: a committed map's, by its raw key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Read {
+    pub(crate) rows: Rows,
+    pub(crate) key: Vec<u8>,
+}
+
+/// A committed map as an attestable `&self` method's view holds it: its
+/// rows answered from the rows served at a window's cut, which the kernel's
+/// prologue checked against the space's root
+/// ([`crate::runtime::verify_served`]). A row the read named is its value
+/// there, or absent; any other traps, as a read outside the set the
+/// workflow named fails the attest. It neither iterates nor writes.
+pub struct ServedMap<K, V, T = DefaultTransform> {
+    tag: Tag,
+    served: &'static vos_wire::served::Served,
+    _rows: PhantomData<fn(K, T) -> V>,
+}
+
+impl<K, V, T: KeyTransform> ServedMap<K, V, T> {
+    /// The map of tag `tag` over the rows `served`.
+    pub fn bound(tag: Tag, served: &'static vos_wire::served::Served) -> Self {
+        Self {
+            tag,
+            served,
+            _rows: PhantomData,
+        }
+    }
+}
+
+impl<K: TableKey, V: Decode, T: KeyTransform> ServedMap<K, V, T> {
+    /// The served row under `key`: its value at the cut, or `None` when it
+    /// was absent there. A row that does not decode reads as absent, as a
+    /// committed map's does; a key the read did not name traps.
+    pub fn get(&self, key: &K) -> Option<V> {
+        let bytes = self.held(key)?;
+        V::decode(bytes).ok().map(|(value, _)| value)
+    }
+
+    /// Whether the row under `key` was present at the cut; a key the read
+    /// did not name traps.
+    pub fn contains(&self, key: &K) -> bool {
+        self.held(key).is_some()
+    }
+
+    fn held(&self, key: &K) -> Option<&'static [u8]> {
+        let served = self.served;
+        let rows = Rows::Committed {
+            tag: self.tag.0,
+            transform: T::TRANSFORM,
+        };
+        let row = keys::row(served.instance, rows, &encoded(key)).expect("a row's key");
+        let at = served
+            .rows
+            .binary_search_by(|(served, _)| served.as_slice().cmp(&row))
+            .unwrap_or_else(|_| panic!("a read outside the rows served"));
+        served.rows[at]
+            .1
+            .as_ref()
+            .map(|(_, value)| value.as_slice())
+    }
+}
+
 fn encoded<K: TableKey>(key: &K) -> Vec<u8> {
     let mut bytes = Vec::new();
     key.encode_key(&mut bytes);

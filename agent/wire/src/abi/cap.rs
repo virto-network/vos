@@ -25,6 +25,18 @@ pub const STORED_ROW: usize = 8 + crate::keys::TABLE_PREFIX + 16 + 2 * KEY + 2 +
 pub const MESSAGES: usize = 16;
 pub const MESSAGE: usize = 64 << 10;
 pub const ATTESTS: usize = 16;
+/// The rows a read at a window's cut is served, inline in its
+/// [`crate::batch::Input::Resume`]: about 155 rows of a million-row map,
+/// whose proofs take about 2,970 compressions, within a kernel's bound on
+/// JAM.
+pub const SERVED: usize = 128 << 10;
+/// What an attest at a window's cut counts against [`Limits::attests`]: its
+/// witness input holds the served rows too, so it weighs two plain ones.
+pub const AT_CUT: usize = 2;
+/// An attest's record beside its witness input and its kernel's return: the
+/// program (32 bytes), the window (9), and the lengths of the input, the
+/// output, the public arguments and the roots (4 each).
+pub const ATTEST_FRAMING: usize = 64;
 pub const WORK_RESULT: usize = 4 << 20;
 /// The pages a workflow's program, its actor's, may write, its data,
 /// heap and stack: a start of a workflow of a larger one fails.
@@ -82,8 +94,15 @@ pub const fn step_result(gas: u64) -> usize {
         + (1 + (gas / price::MACHINE) as usize) * 12
         + MESSAGES * (MESSAGE + 40)
         + (REPLY + 40)
-        + ATTESTS * (REQUEST + REPLY + 40)
+        + ATTESTS * (REQUEST + REPLY + ATTEST_FRAMING)
 }
+
+// An attest at a window's cut, its served rows in its witness input, is no
+// larger than the [`AT_CUT`] plain attests it counts as, so the attests'
+// term above bounds any step's.
+const _: () = assert!(
+    REQUEST + SERVED + REPLY + ATTEST_FRAMING <= AT_CUT * (REQUEST + REPLY + ATTEST_FRAMING)
+);
 
 /// The most a handler's step adds to a work result. An install's record
 /// is under [`STEP_WRITES`] too.
@@ -153,10 +172,15 @@ pub struct Limits {
     pub messages: usize,
     /// A message's arguments.
     pub message: usize,
-    /// The attests a step makes.
+    /// The attests a step makes, one at a window's cut counting
+    /// [`AT_CUT`].
     pub attests: usize,
-    /// An attest's arguments, and its output.
+    /// An attest's arguments, and its kernel's whole return: its output, or
+    /// its statement's parts.
     pub attest: usize,
+    /// The served rows of a read at a window's cut, inline in its
+    /// [`crate::batch::Input::Resume`]: past it, the read is unserved.
+    pub served: usize,
     /// The pages a workflow's program may write, its data, heap and stack:
     /// a start of a workflow of a larger one fails.
     pub workflow_pages: usize,
@@ -194,6 +218,7 @@ pub const VOS: Limits = Limits {
     message: MESSAGE,
     attests: ATTESTS,
     attest: REQUEST,
+    served: SERVED,
     workflow_pages: WORKFLOW_PAGES,
     step_pages: STEP_PAGES,
     held_pages: HELD_PAGES,
@@ -211,12 +236,13 @@ pub const JAM_PAGES_KEPT: u64 = (28 - 1) * 24 * 60 * 60 * 1000;
 
 /// A JAM service's limits. What a step leaves in its work result its
 /// package pays for beyond its batch's budget, in software: at VOS's caps a
-/// step's effects take up to about 1.4e9 gas of that own work, past a work
-/// package's refine gas; at these about 39M, a 35th, which an agent's
+/// step's effects take up to about 1.6e9 gas of that own work, past a work
+/// package's refine gas; at these about 65M, a 24th, which an agent's
 /// builder asserts leaves its worst step a package, every page it may hold
 /// restored, stored and dropped. Its messages and attests carry a 32nd of
-/// the bytes, half as many; its writes a 16th of the bytes, in at most 128
-/// rows. A workflow holds a ninth of the pages, and writes a 32nd of them
+/// the bytes, half as many; a read at a window's cut is served a quarter of
+/// the rows, well inside a package's bound; its writes a 16th of the bytes,
+/// in at most 128 rows. A workflow holds a ninth of the pages, and writes a 32nd of them
 /// in a step; an actor's program writes at most a 16th of them, and loads
 /// within a step's reserve. A kernel hashes about a 40th of what the most
 /// gas a handler may request pays for.
@@ -238,6 +264,7 @@ pub const JAM: Limits = Limits {
     message: 2 << 10,
     attests: 8,
     attest: 2 << 10,
+    served: 32 << 10,
     workflow_pages: 256,
     step_pages: 256 << 10,
     held_pages: 64,
@@ -294,6 +321,7 @@ impl Limits {
             && self.message <= other.message
             && self.attests <= other.attests
             && self.attest <= other.attest
+            && self.served <= other.served
             && self.workflow_pages <= other.workflow_pages
             && self.step_pages <= other.step_pages
             && self.held_pages <= other.held_pages

@@ -125,3 +125,35 @@ codes! {
         KeySessionsFull = 6,
     }
 }
+
+codes! {
+    /// Why a workflow's read at its window's cut
+    /// ([`super::Op::AttestAt`]) returned no output: refused when it asked
+    /// (`NoSpace`, `Reads`, `Unknown`, `Cap`), or failed once its rows were
+    /// served, or never were.
+    pub enum AttestError {
+        /// The agent belongs to no space, or its clock numbers no window
+        /// yet: it runs no cuts, so its statements are rootless.
+        NoSpace = 1,
+        /// The rows it reads are none, past
+        /// [`crate::defaults::MAX_READS`], not strictly increasing, or not
+        /// each a committed row of the workflow's instance.
+        Reads = 2,
+        /// No attestable method of the instance's by that id.
+        Unknown = 3,
+        /// Its arguments past the target's [`super::cap::Limits::attest`].
+        Cap = 4,
+        /// The kernel trapped, ran out of gas, passed its output's cap, or
+        /// returned other than its statement's parts with their io-hash.
+        Failed = 5,
+        /// Its window's cut did not prove the rows, or what the leader
+        /// served is not the request's: past the target's
+        /// [`super::cap::Limits::served`], or of another agent, instance,
+        /// window, space or read set.
+        Unserved = 6,
+        /// Not served within [`crate::defaults::READ_WINDOWS`] windows.
+        NotClosed = 7,
+        /// The output did not decode as the method's type: the SDK's own.
+        Undecodable = 8,
+    }
+}

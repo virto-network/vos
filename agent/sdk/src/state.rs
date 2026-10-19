@@ -18,6 +18,15 @@ pub trait New {
     fn new() -> Self;
 }
 
+/// The view of an actor's state an attestable `&self` method reads: its
+/// committed maps alone, each answering from the rows served at a window's
+/// cut ([`crate::table::ServedMap`]). `#[actor]` generates it, as
+/// `<Actor>View`.
+pub trait View {
+    /// The view over `served`, each map bound to its tag.
+    fn served(served: &'static vos_wire::served::Served) -> Self;
+}
+
 /// The instance's state, or a new instance's when none is stored. State
 /// that does not decode traps.
 pub fn load<A: Encode + Decode + Tables + New>() -> A {

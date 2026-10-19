@@ -77,21 +77,28 @@ impl Share {
     fn used(&self, machine: &Machine) -> u64 {
         self.allotted - machine.gas()
     }
+
+    /// The step's limit.
+    pub(crate) fn limit(&self) -> u64 {
+        self.limit
+    }
 }
 
 impl Invocation<'_> {
     /// Run a workflow's machine, `call` its method by its owner on the
     /// step's input, through its step from where its snapshot left it, the
     /// host call `pending` first: until it pauses, is preempted, ends or
-    /// fails. Its own gas goes to its instance, as a handler's.
+    /// fails. Its own gas goes to its instance, as a handler's, with
+    /// `spent`, what its read at a cut's kernel took of its share.
     pub(crate) fn workflow(
         &mut self,
         machine: &mut Machine,
         call: Call,
         share: &mut Share,
         pending: Option<u64>,
+        spent: u64,
     ) -> Result<Ended, Failure> {
-        machine.set_gas(share.limit);
+        machine.set_gas(share.limit.saturating_sub(spent));
         self.instances.push(InstanceGas {
             instance: call.instance,
             gas: 0,

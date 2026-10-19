@@ -20,7 +20,8 @@ pub mod table;
 
 pub use alloc::vec::Vec;
 pub use vos_sdk_macros::{actor, messages};
-pub use vos_wire::{Decode, Encode, abi, keys, scale};
+pub use vos_wire::vos_anchor::VenueId;
+pub use vos_wire::{Decode, Encode, abi, keys, scale, served};
 
 /// What an actor crate needs in scope: the macros, the contexts, tables
 /// and committed maps, and the names the derived encodings use.
@@ -32,5 +33,7 @@ pub mod prelude {
     pub use crate::context::{CallError, Command, Level, Query, Ref, RequestError, Workflow};
     pub use crate::table::{CommittedMap, Hashed, Ordered, Table};
     pub use crate::{Decode, Encode, actor, messages, scale};
+    pub use vos_wire::abi::AttestError;
     pub use vos_wire::ids::{AgentId, InstanceId, Principal, WorkflowId};
+    pub use vos_wire::vos_anchor::VenueId;
 }

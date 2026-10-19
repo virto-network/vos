@@ -273,6 +273,21 @@ pub enum WorkflowState {
     /// still the one [`crate::abi::Op::Input`] gives it.
     #[codec(index = 4)]
     Preempted(Vec<u8>),
+    /// Awaiting, at await `counter`, its read at window `window`'s cut
+    /// ([`crate::abi::Op::AttestAt`]), whose request
+    /// ([`crate::keys::request`]) names its rows: once served, its step
+    /// runs attestable `method`'s kernel on `arguments` and the served
+    /// rows. Unserved by `deadline`, it resumes
+    /// [`crate::abi::AttestError::NotClosed`]. Its record never holds the
+    /// served rows.
+    #[codec(index = 5)]
+    Attesting {
+        counter: u64,
+        window: u64,
+        method: MethodId,
+        arguments: Vec<u8>,
+        deadline: u64,
+    },
 }
 
 /// A workflow's machine between steps, restored with Gray Paper calls
@@ -301,10 +316,12 @@ pub struct SessionMark {
     pub time: u64,
 }
 
-/// A pending request of a window ([`crate::keys::request`]): the instance
+/// A pending request of a window ([`crate::keys::request`]), a workflow's
+/// read at the window's cut ([`crate::abi::Op::AttestAt`]): the instance
 /// whose committed rows it reads, and the rows, by their full keys
-/// ([`crate::keys::committed`]), strictly increasing. Every replica proves
-/// them at the window's cut once its tree is built there.
+/// ([`crate::keys::committed`]), strictly increasing, each under the
+/// instance's prefix. Every replica proves them at the window's cut once
+/// its tree is built there.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct PendingRead {
     pub instance: InstanceId,

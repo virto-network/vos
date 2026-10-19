@@ -22,6 +22,15 @@ pub const MAX_KEY_SESSIONS: u64 = 64;
 /// crosses more boundaries cuts the newest this many windows, and the
 /// older ones are never cut. A consensus constant, on every host.
 pub const MAX_CUTS: u64 = 32;
+/// The most rows one read at a window's cut names
+/// ([`crate::abi::Op::AttestAt`]): about what [`crate::abi::cap::SERVED`]
+/// holds, each row's share of the proof included.
+pub const MAX_READS: usize = 256;
+/// How many windows a read at a window's cut waits to be served: one asked
+/// in window `w` that no [`crate::batch::Input::Resume`] has served by the
+/// boundary `B_{w + READ_WINDOWS}` ends
+/// [`crate::abi::AttestError::NotClosed`].
+pub const READ_WINDOWS: u64 = 3;
 
 // An expired session's batch time is past its t0 plus the skew: it was
 // created within the skew of t0, so a collected session can never be
@@ -151,6 +160,13 @@ pub const fn min_refine_gas(max_inputs: usize) -> u64 {
 /// 600 of its gas and the batch's budget this much, so one step hashes
 /// at most about 4 MiB in a refine of the default budget, on any host.
 pub const PRECOMPILE_SERVING: u64 = 27_000;
+/// The agent's own work on each byte of the rows a read at a window's cut
+/// is served ([`crate::batch::Input::Resume`]), beyond decoding its batch:
+/// decoding and checking them against its request, and handing them to
+/// the kernel. It is the batch's, taken from its budget as a precompile's
+/// serving is, never the workflow's gas. Measured by the testkit's
+/// `serving_a_read_pays_for_itself`.
+pub const SERVED_BYTE: u64 = 64;
 /// The most outbox entries one acknowledgement clears, bounding an ack
 /// step's accumulate work, far inside its gas; the node acks again for
 /// the rest.

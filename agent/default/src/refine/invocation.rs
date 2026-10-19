@@ -8,7 +8,7 @@ mod memory;
 mod scan;
 mod units;
 
-pub(crate) use ended::{Ended, Pause};
+pub(crate) use ended::{Attesting, Ended, Pause};
 pub(crate) use units::Share;
 
 use alloc::collections::BTreeMap;
@@ -16,18 +16,39 @@ use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use vos_wire::abi::cap::{self, Limits};
-use vos_wire::abi::{self, Failure, Kind, Op, Rows, code, precompile, price};
+use vos_wire::abi::{self, AttestError, Failure, Kind, Op, Rows, code, precompile, price};
 use vos_wire::batch::{Await, Body};
-use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, WorkflowId};
-use vos_wire::records::Installed;
-use vos_wire::result::{Attest, InstanceGas, Outcome, Outgoing};
-use vos_wire::{Encode, defaults, keys};
+use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, RequestId, WorkflowId};
+use vos_wire::records::{Installed, PendingRead};
+use vos_wire::result::{Attest, Attested, InstanceGas, KernelReturn, Outcome, Outgoing};
+use vos_wire::served::Served;
+use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
 
 use super::base::{Base, Corrupt, Meter, role_byte};
 use super::{Call, Overlay};
 use crate::machines::{self, Exit, Machine};
-use kernel::{kernel, random, serve_precompile};
+use kernel::{kernel, parts, random, serve_precompile};
 use memory::{copy_out, read, read_key, row, window, write};
+
+/// The most bytes of the rows a read at a cut names, as an
+/// [`Op::AttestAt`] passes them: past it, its reads are refused.
+const READS: usize = cap::REQUEST;
+
+/// Whether `rows` are a read at a cut of `instance`'s rows: at least one,
+/// at most [`defaults::MAX_READS`], strictly increasing, each a committed
+/// row of `instance`'s ([`keys::committed_entry`]) no longer than a tree's
+/// key.
+fn valid_reads(instance: InstanceId, rows: &[Vec<u8>]) -> bool {
+    let prefix = keys::instance_committed(instance);
+    !rows.is_empty()
+        && rows.len() <= defaults::MAX_READS
+        && rows.windows(2).all(|pair| pair[0] < pair[1])
+        && rows.iter().all(|row| {
+            row.starts_with(&prefix)
+                && keys::committed_entry(row).is_some()
+                && row.len() <= vos_tree::MAX_KEY
+        })
+}
 
 /// Machines a step may hold at once: a handler and its nested callees, or
 /// a workflow's and its callees. A host's own limit is the same on VOS, so
@@ -58,6 +79,9 @@ pub(crate) struct Invocation<'a> {
     pub(crate) instances: Vec<InstanceGas>,
     pub(crate) messages: Vec<Outgoing>,
     pub(crate) attests: Vec<Attest>,
+    /// What the step's attests count against its limit: one each, an
+    /// attest at a window's cut [`cap::AT_CUT`].
+    attests_counted: usize,
     /// The bytes of state the step has written, and the rows, against
     /// its limits.
     write_bytes: usize,
@@ -82,6 +106,7 @@ impl<'a> Invocation<'a> {
             instances: Vec::new(),
             messages: Vec::new(),
             attests: Vec::new(),
+            attests_counted: 0,
             write_bytes: 0,
             rows_written: 0,
             draws: 0,
@@ -297,7 +322,7 @@ impl<'a> Invocation<'a> {
         self.frames.push(BTreeMap::new());
         let effects = (
             self.messages.len(),
-            self.attests.len(),
+            (self.attests.len(), self.attests_counted),
             self.write_bytes,
             self.rows_written,
         );
@@ -324,9 +349,10 @@ impl<'a> Invocation<'a> {
             Ended::Paused(_) => unreachable!("only a workflow pauses"),
         };
         if failed.is_some() {
-            let (messages, attests, written, rows) = effects;
+            let (messages, (attests, counted), written, rows) = effects;
             self.messages.truncate(messages);
             self.attests.truncate(attests);
+            self.attests_counted = counted;
             self.write_bytes = written;
             self.rows_written = rows;
         }
@@ -455,6 +481,7 @@ impl<'a> Invocation<'a> {
                 }
                 *outcome = Some(Ended::Paused(self.pause(machine, op)?));
             }
+            Op::AttestAt => self.ask_at_cut(machine, instance, outcome)?,
             // A workflow's section: on its own instance, never two at once.
             Op::Open => {
                 if self.section || r[7] != u64::from(instance.0) {
@@ -489,15 +516,19 @@ impl<'a> Invocation<'a> {
         let r = machine.registers();
         let method = MethodId(r[7] as u32);
         let call_arguments = read(machine, r[8], r[9], self.limits.attest)?;
-        if self.attests.len() == self.limits.attests {
+        if self.attests_counted + 1 > self.limits.attests {
             return Err(Failure::Cap);
         }
         let installed = installed.ok_or(Failure::Unknown)?;
         let program = installed.kernel(method).ok_or(Failure::Unknown)?;
-        let declared = installed
-            .schema
-            .method(method)
-            .and_then(|schema| schema.gas);
+        let schema = installed.schema.method(method).ok_or(Failure::Unknown)?;
+        // A method that reads at a window's cut runs there alone.
+        let stating = match schema.kind {
+            Kind::Attestable => false,
+            Kind::Stating => true,
+            _ => return Err(Failure::Unknown),
+        };
+        let declared = schema.gas;
         let gas = [self.limits, installed.target.limits()]
             .iter()
             .filter_map(|limits| limits.kernel_limit(declared))
@@ -508,19 +539,242 @@ impl<'a> Invocation<'a> {
             &call_arguments,
             gas,
             self.limits.attest,
-        )?;
+        )
+        .map_err(|(code, _)| code)?;
         if !machine.charge(run.gas_used) {
             return Err(Failure::OutOfGas);
         }
-        copy_out(machine, &run.output, r[10], 0, r[11])?;
-        machine.set_register(7, run.output.len() as u64);
+        // Its output alone, or its statement's parts, their io-hash the
+        // one it left: a kernel's bug fails the step.
+        let parts = if stating {
+            if !machine.charge(price::io_hash(run.output.len())) {
+                return Err(Failure::OutOfGas);
+            }
+            parts(&run.output, &run.io_hash).ok_or(Failure::Trapped)?
+        } else {
+            KernelReturn {
+                public_args: Vec::new(),
+                output: run.output,
+                roots: Vec::new(),
+            }
+        };
+        copy_out(machine, &parts.output, r[10], 0, r[11])?;
+        machine.set_register(7, parts.output.len() as u64);
         machine.set_register(8, 0);
+        self.attests_counted += 1;
         self.attests.push(Attest {
             program,
+            window: None,
             witness_input: run.witness_input,
-            output: run.output,
+            output: parts.output,
+            public_args: parts.public_args,
+            roots: parts.roots,
         });
         Ok(())
+    }
+
+    /// [`Op::AttestAt`]: a workflow's read of its instance's committed rows
+    /// at the cut of the batch time's window, through attestable `&self`
+    /// method φ7 on the arguments at φ8/φ9, of the rows at φ10/φ11. Its
+    /// request recorded, the workflow pauses; refused at once, φ7 0 and φ8
+    /// the [`AttestError`]. Apart, reading its own registers.
+    #[cold]
+    #[inline(never)]
+    fn ask_at_cut(
+        &mut self,
+        machine: &mut Machine,
+        instance: InstanceId,
+        outcome: &mut Option<Ended>,
+    ) -> Result<(), Failure> {
+        if outcome.is_some() {
+            return Err(Failure::Trapped);
+        }
+        match self.asked(machine, instance)? {
+            Ok(pause) => *outcome = Some(Ended::Paused(pause)),
+            Err(refused) => {
+                machine.set_register(7, 0);
+                machine.set_register(8, refused.code().into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The pause of [`Op::AttestAt`]'s read, its request recorded, or why
+    /// it is refused.
+    fn asked(
+        &mut self,
+        machine: &mut Machine,
+        instance: InstanceId,
+    ) -> Result<Result<Pause, AttestError>, Failure> {
+        let r = machine.registers();
+        let method = MethodId(r[7] as u32);
+        let awaiting = self.awaits.expect("only a workflow reads at a cut");
+        let Some((_, clock)) = self.space()? else {
+            return Ok(Err(AttestError::NoSpace));
+        };
+        let Some(window) = clock.window(self.base.time) else {
+            return Ok(Err(AttestError::NoSpace));
+        };
+        let installed = self.installed(instance)?;
+        let reading = installed
+            .schema
+            .method(method)
+            .is_some_and(|schema| schema.kind == Kind::Reading);
+        if !reading || installed.kernel(method).is_none() {
+            return Ok(Err(AttestError::Unknown));
+        }
+        if r[9] > self.limits.attest as u64 {
+            return Ok(Err(AttestError::Cap));
+        }
+        let arguments = read(machine, r[8], r[9], self.limits.attest)?;
+        if r[11] > READS as u64 {
+            return Ok(Err(AttestError::Reads));
+        }
+        let reads = read(machine, r[10], r[11], READS)?;
+        let rows = match <Vec<Vec<u8>>>::decode(&reads) {
+            Ok((rows, used)) if used == reads.len() && valid_reads(instance, &rows) => rows,
+            _ => return Ok(Err(AttestError::Reads)),
+        };
+        let request = RequestId {
+            workflow: awaiting.workflow,
+            awaits: awaiting.counter,
+        };
+        let key = keys::request(window, request);
+        let value = PendingRead { instance, rows }.encode();
+        self.write_bytes += key.len() + value.len();
+        self.rows_written += 1;
+        if self.write_bytes > self.limits.step_writes || self.rows_written > self.limits.step_rows {
+            return Err(Failure::Cap);
+        }
+        self.frames
+            .last_mut()
+            .expect("a frame")
+            .insert(key, Some(value));
+        let deadline = clock
+            .boundary(window.saturating_add(defaults::READ_WINDOWS))
+            .unwrap_or(u64::MAX);
+        Ok(Ok(Pause::Attesting(alloc::boxed::Box::new(Attesting {
+            counter: awaiting.counter,
+            window,
+            method,
+            arguments,
+            deadline,
+        }))))
+    }
+
+    /// The agent's space and clock, through the refine's earlier steps:
+    /// `None` for an agent of no space.
+    fn space(&self) -> Result<Option<(SpaceId, WindowClock)>, Failure> {
+        let space = self.read_state(&keys::space())?;
+        let clock = self.read_state(&keys::clock())?;
+        let (Some(space), Some(clock)) = (space, clock) else {
+            return Ok(None);
+        };
+        let space = SpaceId::decode(&space).map_err(|_| Failure::Trapped)?.0;
+        let clock = WindowClock::decode(&clock).map_err(|_| Failure::Trapped)?.0;
+        Ok((space != SpaceId::NONE).then_some((space, clock)))
+    }
+
+    /// A workflow's read at window `window`'s cut, awaited at `counter` by
+    /// `id`, its rows `served` (`None`: unserved): attestable `method`'s
+    /// kernel run on `arguments` then the served rows, within the step's
+    /// `limit`, its statement recorded as the step's attest. The answer the
+    /// workflow resumes with, and the gas its machine pays for it: the
+    /// attest's price, the kernel's gas and the check of its parts.
+    #[inline(never)]
+    pub(crate) fn at_cut(
+        &mut self,
+        instance: InstanceId,
+        request: RequestId,
+        call: (u64, MethodId, &[u8]),
+        served: Option<Vec<u8>>,
+        limit: u64,
+    ) -> (Attested, u64) {
+        let (window, method, arguments) = call;
+        let Some(served) = served else {
+            return (Attested::Failed(AttestError::Unserved), 0);
+        };
+        // The agent's work on the rows, the batch's: out of it, as a
+        // kernel out of its precompiles' serving.
+        if !self
+            .base
+            .meter
+            .take(defaults::SERVED_BYTE * served.len() as u64)
+        {
+            return (Attested::Failed(AttestError::Failed), 0);
+        }
+        if !self.serves(instance, window, request, &served) {
+            return (Attested::Failed(AttestError::Unserved), 0);
+        }
+        let Ok(installed) = self.installed(instance) else {
+            return (Attested::Failed(AttestError::Unknown), 0);
+        };
+        let Some(program) = installed.kernel(method) else {
+            return (Attested::Failed(AttestError::Unknown), 0);
+        };
+        if self.attests_counted + cap::AT_CUT > self.limits.attests {
+            return (Attested::Failed(AttestError::Failed), 0);
+        }
+        let declared = installed
+            .schema
+            .method(method)
+            .and_then(|schema| schema.gas);
+        let gas = [self.limits, installed.target.limits()]
+            .iter()
+            .filter_map(|limits| limits.kernel_limit(declared))
+            .fold(limit.saturating_sub(price::ATTEST), u64::min);
+        let mut input = Vec::with_capacity(arguments.len() + served.len());
+        input.extend_from_slice(arguments);
+        input.extend_from_slice(&served);
+        let run = match kernel(&self.base.meter, &program, &input, gas, self.limits.attest) {
+            Ok(run) => run,
+            Err((_, used)) => return (Attested::Failed(AttestError::Failed), price::ATTEST + used),
+        };
+        let spent = price::ATTEST + run.gas_used + price::io_hash(run.output.len());
+        let Some(parts) = parts(&run.output, &run.io_hash) else {
+            return (Attested::Failed(AttestError::Failed), spent);
+        };
+        self.attests_counted += cap::AT_CUT;
+        self.attests.push(Attest {
+            program,
+            window: Some(window),
+            witness_input: run.witness_input,
+            output: parts.output.clone(),
+            public_args: parts.public_args,
+            roots: parts.roots,
+        });
+        (Attested::Done(parts.output), spent)
+    }
+
+    /// Whether `served` is what the request of window `window` by `request`
+    /// asked for: within the target's cap, of this agent and its space, of
+    /// the window, of the request's instance and its rows, in order.
+    fn serves(&self, instance: InstanceId, window: u64, request: RequestId, bytes: &[u8]) -> bool {
+        if bytes.len() > self.limits.served {
+            return false;
+        }
+        let Ok(Some(asked)) = self.read_state(&keys::request(window, request)) else {
+            return false;
+        };
+        let Ok((asked, _)) = PendingRead::decode(&asked) else {
+            return false;
+        };
+        let Ok((served, used)) = Served::decode(bytes) else {
+            return false;
+        };
+        let space = matches!(self.space(), Ok(Some((space, _))) if space == served.space);
+        used == bytes.len()
+            && space
+            && served.agent == self.base.agent
+            && served.window == window
+            && served.instance == instance
+            && asked.instance == instance
+            && served.rows.len() == asked.rows.len()
+            && served
+                .rows
+                .iter()
+                .zip(&asked.rows)
+                .all(|((row, _), asked)| row == asked)
     }
 
     /// A workflow's pause: a sleep until a time, or a request of another

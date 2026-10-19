@@ -9,6 +9,7 @@ mod batch;
 mod cut;
 mod execute;
 mod outbox;
+mod serve;
 mod settle;
 mod sweep;
 mod window;
@@ -127,6 +128,9 @@ enum Taken {
     Sweep,
     /// A `Cut` marker due: an empty result, unrefined.
     Marker,
+    /// Reads proved at their cuts due: a batch with no inputs, which serves
+    /// them.
+    Serve,
     /// No input: the windows due go again.
     Rounds,
 }
@@ -184,7 +188,7 @@ impl Leader {
         while let Some(taken) = self.take().await {
             let pending = match taken {
                 Taken::Inputs(pending) => Some(pending),
-                Taken::Sweep => Some(Vec::new()),
+                Taken::Sweep | Taken::Serve => Some(Vec::new()),
                 Taken::Marker => {
                     if !self.marker().await {
                         return false;
@@ -286,6 +290,11 @@ impl Leader {
             if cut == Some(Duration::ZERO) {
                 smol::future::yield_now().await;
                 return Some(Taken::Marker);
+            }
+            // A read proved at its cut, while the cut's wait rechecks.
+            if self.serve_due() {
+                smol::future::yield_now().await;
+                return Some(Taken::Serve);
             }
             // A receiver found this agent behind it: windows go again.
             if behind {

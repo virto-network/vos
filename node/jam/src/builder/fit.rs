@@ -584,9 +584,9 @@ mod tests {
         assert_eq!(fitting.next(false, OWN_BOUND, false), Next::Unfit);
     }
 
-    /// A step's effects at JAM's limits take about a thirty-first of their
-    /// own work at VOS's, and its worst step fits a package where VOS's,
-    /// at its caps, would not.
+    /// A step's effects at JAM's limits take about a twenty-fourth of
+    /// their own work at VOS's, and its worst step fits a package where
+    /// VOS's, at its caps, would not.
     #[test]
     fn the_jam_limits_fit_a_package() {
         let (vos, jam) = (gas::effects(&cap::VOS), gas::effects(&cap::JAM));
@@ -597,7 +597,7 @@ mod tests {
             vos as f64 / jam as f64,
             WORST_ENDING + vos,
         );
-        assert!(vos / jam >= 31, "{vos} against {jam}");
+        assert!(vos / jam >= 24, "{vos} against {jam}");
         assert!(WORST_ENDING + vos > usable);
         assert!(WORST_JAM_STEP <= usable);
     }
