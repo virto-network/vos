@@ -53,6 +53,10 @@ pub(crate) enum Pending {
         request: RequestId,
         served: Option<Vec<u8>>,
     },
+    /// An input of the agent's own the leader makes from its replica's
+    /// state for each batch, never queued: a report of its root at a cut,
+    /// or the representative's close of a window.
+    Duty(Input),
 }
 
 impl Pending {
@@ -80,6 +84,7 @@ impl Pending {
                 request: *request,
                 served: served.clone(),
             },
+            Pending::Duty(input) => input.clone(),
         }
     }
 
@@ -92,7 +97,8 @@ impl Pending {
             Pending::Failed(_)
             | Pending::Admin { .. }
             | Pending::Ack { .. }
-            | Pending::Sweep(_) => 0,
+            | Pending::Sweep(_)
+            | Pending::Duty(_) => 0,
         }
     }
 

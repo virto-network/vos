@@ -103,6 +103,11 @@ pub(crate) struct Inner {
     pub(crate) hooks: Arc<dyn Hooks>,
     pub(crate) clock: Arc<dyn Fn() -> u64 + Send + Sync>,
     pub(crate) node_id: NodeId,
+    /// The node's key, whose public half is its id: it signs the anchors
+    /// the space's representative leads here.
+    pub(crate) node_key: ed25519_dalek::SigningKey,
+    /// Where the representative's leader here anchors its roots.
+    pub(crate) venue: Option<Arc<dyn vos_venue::VenueClient>>,
     /// This node's number in its space.
     pub(crate) number: NodeNumber,
     pub(crate) space: Option<Space>,
@@ -171,6 +176,15 @@ impl Inner {
             (vos_wire::SpaceId::NONE, vos_wire::WindowClock::DEFAULT),
             |space| (space.id(), space.clock()),
         )
+    }
+
+    /// The space's representative ([`vos_wire::served::representative`]):
+    /// none without a genesis.
+    pub(crate) fn representative(&self) -> Option<AgentId> {
+        self.space
+            .as_ref()
+            .and_then(|space| space.genesis())
+            .and_then(vos_wire::served::representative)
     }
 
     pub(crate) fn run(&self, id: AgentId) -> Option<Arc<Run>> {

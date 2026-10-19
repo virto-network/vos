@@ -1,0 +1,286 @@
+//! A venue as a VOS node reaches it ([`VenueClient`]): the representative's
+//! leader anchors the space's root of each window it closes, a prover
+//! submits statements, and either asks what is anchored. Its id names the
+//! venue in every anchor's digest.
+//!
+//! [`ModelVenue`] keeps a venue's state as `vos_statement::model` does, its
+//! anchors and the statements it accepted as lists, and checks what pin D
+//! and pin F say a venue checks: the anchor rule (a registered,
+//! unsuspended space; a registered key; the signature; `Last < w < now_w`;
+//! the root no older than `MaxRootAge`) and `judge`. A second root for one
+//! `(space, kind, w)` is kept as evidence and suspends the space.
+
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex, MutexGuard};
+
+use ed25519_dalek::{Signature, VerifyingKey};
+use vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceGenesis, SpaceId, VenueId, WindowClock};
+use vos_statement::model::Policy;
+use vos_statement::{ProgramId, Refusal, Statement, StatementId};
+
+/// What a node asks of a venue.
+pub trait VenueClient: Send + Sync {
+    /// The venue's id, which an anchor's signature binds.
+    fn id(&self) -> VenueId;
+    /// Anchor a space's root of a window.
+    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal>;
+    /// Submit a statement and its final proof: its id once accepted.
+    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, Refusal>;
+    /// Whether `root` is anchored, its space's root of its kind at its
+    /// window.
+    fn anchored(&self, root: &RootRead) -> bool;
+}
+
+/// An anchor the venue took.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Anchored {
+    /// Its root is now the space's at its window.
+    New,
+    /// The venue held that root already: a second leader's anchor, or the
+    /// same leader's again.
+    Again,
+}
+
+/// Why a venue refuses an anchor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorRefusal {
+    /// The space is not registered.
+    Unregistered,
+    /// The space is suspended: it equivocated.
+    Suspended,
+    /// The signer is not one of the space's anchor keys.
+    Key,
+    /// The signature is not the signer's over the anchor's digest.
+    Signature,
+    /// The window is not past the last anchored, or before the space's
+    /// start: refused for good.
+    Window,
+    /// The window is the space's open one, or later, by the venue's clock:
+    /// refused until the venue's time passes its boundary.
+    Open,
+    /// The window's boundary is older than `MaxRootAge`.
+    Age,
+    /// Another root of the space's kind at the window is anchored: this
+    /// one is kept as evidence, and the space is suspended.
+    Equivocation,
+}
+
+/// A space a venue registered.
+struct Registered {
+    clock: WindowClock,
+    keys: Vec<[u8; 32]>,
+    start: u64,
+    last: Option<u64>,
+    suspended: bool,
+}
+
+#[derive(Default)]
+struct State {
+    policy: Policy,
+    spaces: BTreeMap<SpaceId, Registered>,
+    /// The programs whose statements it judges.
+    pins: Vec<ProgramId>,
+    /// Each equivocation: the anchor held, and the other.
+    evidence: Vec<(Anchor, Anchor)>,
+    /// The anchors held, by space, kind and window.
+    anchors: BTreeMap<(SpaceId, u8, u64), Anchor>,
+}
+
+/// A venue modelled in memory, timed by its own clock.
+pub struct ModelVenue {
+    id: VenueId,
+    now: Arc<dyn Fn() -> u64 + Send + Sync>,
+    state: Mutex<State>,
+}
+
+/// The venue's view a judgement reads: a suspended space's roots are not
+/// anchored.
+struct View<'a> {
+    state: &'a State,
+    now: u64,
+}
+
+impl vos_statement::Venue for View<'_> {
+    fn accepts(&self, format: u32) -> bool {
+        self.state.policy.formats.contains(&format)
+    }
+
+    fn anchored(&self, root: &RootRead) -> bool {
+        held(self.state, root, self.now)
+    }
+
+    fn seen(&self, id: &StatementId) -> bool {
+        self.state.policy.seen.contains(id)
+    }
+}
+
+/// Whether `state` holds `root` anchored at `now`: its space registered and
+/// not suspended, the root no older than `MaxRootAge`.
+fn held(state: &State, root: &RootRead, now: u64) -> bool {
+    let Some(space) = state.spaces.get(&root.space) else {
+        return false;
+    };
+    let fresh = space
+        .clock
+        .boundary(root.window)
+        .is_some_and(|boundary| now.saturating_sub(boundary) <= MAX_ROOT_AGE_MS);
+    !space.suspended && fresh && state.policy.anchors.contains(root)
+}
+
+impl ModelVenue {
+    /// A venue named `id`, accepting final proofs of the current format,
+    /// timed by `now` (milliseconds since the Unix epoch).
+    pub fn new(id: VenueId, now: Arc<dyn Fn() -> u64 + Send + Sync>) -> Self {
+        let state = State {
+            policy: Policy {
+                formats: vec![vos_statement::FORMAT],
+                ..Policy::default()
+            },
+            ..State::default()
+        };
+        Self {
+            id,
+            now,
+            state: Mutex::new(state),
+        }
+    }
+
+    fn state(&self) -> MutexGuard<'_, State> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Register the space `genesis` founds, anchoring from `start`: its
+    /// founding keys its anchor keys. Its id.
+    pub fn register(&self, genesis: &SpaceGenesis, start: u64) -> SpaceId {
+        let space = vos_anchor::space_id(genesis);
+        let registered = Registered {
+            clock: genesis.clock,
+            keys: genesis.nodes.iter().map(|(_, key)| *key).collect(),
+            start,
+            last: None,
+            suspended: false,
+        };
+        self.state().spaces.insert(space, registered);
+        space
+    }
+
+    /// Judge statements of `program`.
+    pub fn pin(&self, program: ProgramId) {
+        self.state().pins.push(program);
+    }
+
+    /// Whether `space` is suspended.
+    pub fn suspended(&self, space: &SpaceId) -> bool {
+        self.state()
+            .spaces
+            .get(space)
+            .is_some_and(|space| space.suspended)
+    }
+
+    /// The equivocations kept: each the anchor held and the other.
+    pub fn evidence(&self) -> Vec<(Anchor, Anchor)> {
+        self.state().evidence.clone()
+    }
+
+    /// The anchors held of `space`, in window order.
+    pub fn anchors(&self, space: &SpaceId) -> Vec<Anchor> {
+        self.state()
+            .anchors
+            .iter()
+            .filter(|((of, ..), _)| of == space)
+            .map(|(_, anchor)| *anchor)
+            .collect()
+    }
+}
+
+impl VenueClient for ModelVenue {
+    fn id(&self) -> VenueId {
+        self.id
+    }
+
+    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
+        let now = (self.now)();
+        let mut state = self.state();
+        let state = &mut *state;
+        let space = state
+            .spaces
+            .get_mut(&anchor.space)
+            .ok_or(AnchorRefusal::Unregistered)?;
+        if space.suspended {
+            return Err(AnchorRefusal::Suspended);
+        }
+        if !space.keys.contains(&anchor.signer) {
+            return Err(AnchorRefusal::Key);
+        }
+        let signed = VerifyingKey::from_bytes(&anchor.signer).is_ok_and(|key| {
+            key.verify_strict(
+                &anchor.digest(&self.id),
+                &Signature::from_bytes(&anchor.signature),
+            )
+            .is_ok()
+        });
+        if !signed {
+            return Err(AnchorRefusal::Signature);
+        }
+        let at = (anchor.space, anchor.kind as u8, anchor.window);
+        if let Some(held) = state.anchors.get(&at) {
+            if held.root == anchor.root {
+                return Ok(Anchored::Again);
+            }
+            state.evidence.push((*held, *anchor));
+            space.suspended = true;
+            return Err(AnchorRefusal::Equivocation);
+        }
+        let within =
+            anchor.window >= space.start && space.last.is_none_or(|last| last < anchor.window);
+        if !within {
+            return Err(AnchorRefusal::Window);
+        }
+        if space
+            .clock
+            .window(now)
+            .is_none_or(|open| anchor.window >= open)
+        {
+            return Err(AnchorRefusal::Open);
+        }
+        let boundary = space.clock.boundary(anchor.window);
+        if boundary.is_none_or(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS) {
+            return Err(AnchorRefusal::Age);
+        }
+        space.last = Some(anchor.window);
+        state.anchors.insert(at, *anchor);
+        state.policy.anchors.push(RootRead {
+            kind: anchor.kind,
+            space: anchor.space,
+            window: anchor.window,
+            root: anchor.root,
+        });
+        Ok(Anchored::New)
+    }
+
+    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, Refusal> {
+        let now = (self.now)();
+        let mut state = self.state();
+        // A program it pinned none for is refused as `judge` refuses
+        // another program than the pinned one, after the format.
+        let program = state
+            .pins
+            .iter()
+            .find(|pinned| **pinned == statement.program)
+            .copied()
+            .unwrap_or(ProgramId([u32::MAX; 8]));
+        let view = View { state: &state, now };
+        let id = vos_statement::judge(&view, &program, statement, proof)?;
+        state.policy.seen.push(id);
+        Ok(id)
+    }
+
+    fn anchored(&self, root: &RootRead) -> bool {
+        held(&self.state(), root, (self.now)())
+    }
+}
+
+#[cfg(test)]
+mod tests;

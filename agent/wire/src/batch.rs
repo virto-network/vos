@@ -143,6 +143,30 @@ pub enum Input {
         request: RequestId,
         served: Option<Vec<u8>>,
     },
+    /// The agent's root at window `window`'s cut, `root`, for its space's
+    /// representative `to`, and whether reads wait on its close
+    /// (`pending`): refine sends it to the representative's `report`, once
+    /// a window, after the latest window it reported ([`crate::keys::reported`]).
+    /// The node puts it in a batch once its replica has built the cut.
+    #[codec(index = 7)]
+    Report {
+        to: AgentId,
+        window: u64,
+        root: [u8; 32],
+        pending: bool,
+    },
+    /// The representative's close of window `window`: its root at its cut
+    /// of the window, `rep_root`, and for each agent that asked, its row's
+    /// salt and path against it. Refine sends each agent past the close
+    /// mark ([`crate::keys::close_mark`]) its [`Body::Closed`]. The node
+    /// puts it in a batch once its replica has built the cut, at most
+    /// [`crate::defaults::CLOSE_PATHS`] paths a close.
+    #[codec(index = 8)]
+    Close {
+        window: u64,
+        rep_root: [u8; 32],
+        paths: Vec<(AgentId, [u8; 16], Vec<u8>)>,
+    },
 }
 
 /// A client request, in its session's sequence for this agent.
@@ -187,6 +211,17 @@ pub enum Body {
         workflow: WorkflowId,
         awaiting: Await,
     },
+    /// The space's representative closed window `window`: its root at its
+    /// cut of the window, and the receiver's row's salt and path against
+    /// it, which every read the receiver serves at that window's cut
+    /// carries ([`crate::keys::closed`]).
+    #[codec(index = 3)]
+    Closed {
+        window: u64,
+        rep_root: [u8; 32],
+        rep_salt: [u8; 16],
+        space_path: Vec<u8>,
+    },
 }
 
 impl Body {
@@ -199,6 +234,7 @@ impl Body {
                 Answer::Started(_) => 0,
             },
             Body::Wait { .. } => 0,
+            Body::Closed { space_path, .. } => space_path.len(),
         }
     }
 
@@ -207,7 +243,7 @@ impl Body {
         match self {
             Body::Call { awaiting, .. } => *awaiting,
             Body::Wait { awaiting, .. } => Some(*awaiting),
-            Body::Reply { .. } => None,
+            Body::Reply { .. } | Body::Closed { .. } => None,
         }
     }
 }

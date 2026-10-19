@@ -124,6 +124,31 @@ fn keys_keep_their_bytes() {
     assert_eq!(keys::target(), [0x00, 0x18]);
     assert_eq!(keys::space(), [0x00, 0x19]);
     assert_eq!(keys::clock(), [0x00, 0x1a]);
+    assert_eq!(keys::reported(), [0x00, 0x1d]);
+    assert_eq!(keys::closed(sequence), cat(&[&[0x00, 0x1e], &at]));
+    assert_eq!(keys::closed_prefix(), [0x00, 0x1e]);
+    assert_eq!(keys::closed_entry(&keys::closed(sequence)), Some(sequence));
+    assert_eq!(keys::closed_entry(&keys::moved(sequence)), None);
+    assert_eq!(keys::moved(sequence), cat(&[&[0x00, 0x1f], &at]));
+    assert_eq!(keys::serving(), [0x00, 0x20]);
+    assert_eq!(keys::close_mark(), [0x00, 0x21]);
+    assert_eq!(keys::closing(sequence), cat(&[&[0x02, 0x07], &at]));
+    assert_eq!(keys::closings(), [0x02, 0x07]);
+    assert_eq!(
+        keys::closing_entry(&keys::closing(sequence)),
+        Some(sequence)
+    );
+    assert_eq!(keys::closing_entry(&keys::cut_root(sequence)), None);
+    for replicated in [
+        keys::reported(),
+        keys::closed(1),
+        keys::moved(1),
+        keys::serving(),
+        keys::close_mark(),
+    ] {
+        assert!(keys::is_replicated(&replicated));
+    }
+    assert!(!keys::is_replicated(&keys::closing(1)));
 }
 
 /// A sweep's rows: those due by its time, earliest first, as many as it
@@ -249,13 +274,17 @@ fn committed_keys_keep_their_bytes() {
     );
     assert_eq!(keys::cut_roots(), [0x02, 0x05]);
     assert_eq!(
-        keys::cut_proof(request),
+        keys::cut_proof(request, 0x0102_0304_0506_0708),
+        cat(&[&[0x02, 0x06], &workflow, &awaits, &version])
+    );
+    assert_eq!(
+        keys::cut_proofs_of(request),
         cat(&[&[0x02, 0x06], &workflow, &awaits])
     );
     assert_eq!(keys::cut_proofs(), [0x02, 0x06]);
     assert_eq!(
-        keys::cut_proof_entry(&keys::cut_proof(request)),
-        Some(request)
+        keys::cut_proof_entry(&keys::cut_proof(request, 9)),
+        Some((request, 9))
     );
     assert_eq!(keys::cut_proof_entry(&keys::cut_root(9)), None);
     assert_eq!(keys::cut_entry(&keys::cut_root(9)), None);
@@ -273,7 +302,7 @@ fn committed_keys_keep_their_bytes() {
         (keys::seed(9), false),
         (keys::undo(9, &row), false),
         (keys::cut_root(9), false),
-        (keys::cut_proof(request), false),
+        (keys::cut_proof(request, 9), false),
         (keys::built(), false),
         (Vec::new(), false),
     ] {

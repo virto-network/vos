@@ -29,8 +29,24 @@ pub const MAX_READS: usize = 256;
 /// How many windows a read at a window's cut waits to be served: one asked
 /// in window `w` that no [`crate::batch::Input::Resume`] has served by the
 /// boundary `B_{w + READ_WINDOWS}` ends
-/// [`crate::abi::AttestError::NotClosed`].
-pub const READ_WINDOWS: u64 = 3;
+/// [`crate::abi::AttestError::NotClosed`]: its cut's, and its re-cuts' at
+/// the next [`RECUTS`] windows when the representative's `Closed` has not
+/// come.
+pub const READ_WINDOWS: u64 = 1 + RECUTS;
+/// How many times a pending read whose window went unclosed is re-cut at
+/// the next window before its deadline ends it.
+pub const RECUTS: u64 = 2;
+/// How many windows behind the latest recorded cut the agent keeps its
+/// cut, re-cut and close rows: a cut recording window `w` deletes those of
+/// every window before `w − CUT_KEEP`. It covers a read's whole life, its
+/// window and its [`RECUTS`] re-cuts, and one window more for the close's
+/// lag. A consensus constant, on every host.
+pub const CUT_KEEP: u64 = 2 + RECUTS;
+/// The most paths one of the representative's closes sends, a message
+/// each, within every target's messages a step
+/// ([`crate::abi::cap::Limits::messages`]): a window whose agents asked for
+/// more goes in several.
+pub const CLOSE_PATHS: usize = 8;
 
 // An expired session's batch time is past its t0 plus the skew: it was
 // created within the skew of t0, so a collected session can never be

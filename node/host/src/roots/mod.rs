@@ -51,7 +51,10 @@ use crate::store::{Fjall, Snapshot};
 
 mod cuts;
 
-pub use cuts::{CutProof, ReadRow, answered, cut_proof, cut_root, latest_built, stand_in, undo};
+pub use cuts::{
+    CutProof, ReadRow, answered, closing_of, cut_proof, cut_proof_at, cut_root, latest_built,
+    served_at, serving_windows, undo,
+};
 
 /// The most distinct keys one batch rebuilds.
 pub(crate) const BATCH: usize = 10_000;
@@ -423,6 +426,8 @@ pub struct Build {
     top: Option<Option<Child>>,
     /// Undo rows of cuts already built, deleted by the first batch.
     orphans: Vec<Vec<u8>>,
+    /// The agent is the space's representative.
+    representative: bool,
     done: bool,
 }
 
@@ -472,6 +477,7 @@ impl Build {
             read: 0,
             top: None,
             orphans,
+            representative: false,
             done: false,
         }))
     }
@@ -487,6 +493,19 @@ impl Build {
     /// or the earliest cut not yet built, whichever comes first.
     pub fn version(&self) -> u64 {
         self.version
+    }
+
+    /// Whether the build was of a window's cut, and its last batch is
+    /// taken: its root and its proofs are in that batch's commit.
+    pub fn finished_cut(&self) -> bool {
+        self.done && self.cut.is_some()
+    }
+
+    /// Build as the space's representative's: the commit that finishes a
+    /// cut keeps its close ([`keys::closing`]).
+    pub fn representing(mut self, representative: bool) -> Self {
+        self.representative = representative;
+        self
     }
 
     /// The agent's epoch the build reads and writes.
@@ -600,7 +619,13 @@ impl Build {
                 .top
                 .as_ref()
                 .map_or_else(|| empty_root(&Blake2b), |top| *top.hash());
-            cuts::finish([&self.at, fresh], self.agent, cut, tree, root, writes)?;
+            let finish = cuts::Finish {
+                agent: self.agent,
+                cut,
+                root,
+                representative: self.representative,
+            };
+            finish.write([&self.at, fresh], tree, writes)?;
         }
         self.done = true;
         Ok(())
@@ -718,9 +743,10 @@ pub(crate) async fn build(inner: Arc<Inner>, shared: Arc<Shared>) {
 async fn run(inner: &Inner, shared: &Shared) -> Result<(), Error> {
     let agent = shared.agent;
     while !shared.state().stopped {
-        let Some(mut build) = Build::start(&inner.store, agent)? else {
+        let Some(build) = Build::start(&inner.store, agent)? else {
             return Ok(());
         };
+        let mut build = build.representing(inner.representative() == Some(agent));
         while !shared.state().stopped {
             let (returned, change) = inner
                 .offload(move || {
@@ -738,6 +764,9 @@ async fn run(inner: &Inner, shared: &Shared) -> Result<(), Error> {
                     Ok(epoch) if epoch != build.epoch() => Error::Moved,
                     _ => Error::Halted(refusal),
                 });
+            }
+            if build.finished_cut() {
+                shared.update(|state| state.cuts_built += 1);
             }
         }
     }

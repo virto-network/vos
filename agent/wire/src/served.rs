@@ -13,7 +13,7 @@
 
 use alloc::vec::Vec;
 
-use crate::ids::{AgentId, InstanceId, MapId};
+use crate::ids::{AgentId, InstanceId, MapId, MethodId};
 use crate::keys::{self, Transform};
 use crate::vos_anchor::{RootKind, SpaceId};
 use crate::{Decode, Encode};
@@ -59,6 +59,81 @@ pub const REPRESENTATIVE_ROOTS: &str = "roots";
 /// (`crate::ids::derive_id("vos/table/", "roots")`), a constant so a
 /// kernel's prologue hashes nothing for it.
 pub const REPRESENTATIVE_TAG: u32 = 0x4b14_a09e;
+
+/// The name of the representative's table of the agents that asked for
+/// their paths at a window's close, keyed `w (8, BE) ‖ agent (4, BE)`,
+/// ordered.
+pub const REPRESENTATIVE_ASKED: &str = "asked";
+
+/// The tag [`REPRESENTATIVE_ASKED`] derives.
+pub const ASKED_TAG: u32 = 0xf5ab_2cca;
+
+/// The representative's method an agent's report calls
+/// (`crate::ids::derive_id("vos/method/", "report")`), with an
+/// [`AgentRoot`].
+pub const REPORT: MethodId = MethodId(0xacb0_3e21);
+
+/// The name [`REPORT`] derives from.
+pub const REPORT_NAME: &str = "report";
+
+/// An agent's report of its root at a window's cut, the arguments of the
+/// representative's [`REPORT`]: the root's kind, the window, the root, and
+/// whether reads wait on the window's close. The reporting agent is the
+/// message's sender.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AgentRoot {
+    pub kind: u8,
+    pub window: u64,
+    pub root: [u8; 32],
+    pub pending: bool,
+}
+
+/// The representative's close of a window as an agent holds it
+/// ([`keys::closed`]): the representative's root at its cut of the window,
+/// and the salt and path of the agent's row there. A read served at the
+/// window's cut carries exactly these.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct ClosedRow {
+    pub rep_root: [u8; 32],
+    pub rep_salt: [u8; 16],
+    pub space_path: Vec<u8>,
+}
+
+/// The representative's close of a window as its node keeps it
+/// ([`keys::closing`]), once its cut's build is done: its root at the
+/// cut, and for each agent that asked and whose row the cut holds, in
+/// agent order, the row's salt and a `vos_tree::BatchProof`'s encoding of
+/// it against the root.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct Closing {
+    pub root: [u8; 32],
+    pub paths: Vec<(AgentId, [u8; 16], Vec<u8>)>,
+}
+
+/// The agent that represents a space: the first founding node's agent 0,
+/// a serial no node gives an agent it creates otherwise.
+pub fn representative(genesis: &crate::SpaceGenesis) -> Option<AgentId> {
+    let (founder, _) = genesis.nodes.first()?;
+    Some(crate::peer::CreationRecord::agent_id(*founder, 0))
+}
+
+/// The windows whose cuts may serve a read asked in window `window`, in
+/// order: its own, then each its re-cuts moved it to ([`keys::moved`]), as
+/// `moved` reads them. The last is the cut its pending read waits on; any
+/// whose close the agent holds serves it. At most
+/// [`crate::defaults::RECUTS`] moves are followed: a third is recorded only
+/// at or past the read's deadline.
+pub fn serving_windows(window: u64, mut moved: impl FnMut(u64) -> Option<u64>) -> Vec<u64> {
+    let mut windows = alloc::vec![window];
+    for _ in 0..crate::defaults::RECUTS {
+        let at = *windows.last().expect("one window");
+        match moved(at) {
+            Some(next) if next > at => windows.push(next),
+            _ => break,
+        }
+    }
+    windows
+}
 
 /// The representative's committed map of agents' roots at their cuts.
 pub const fn representative_map() -> MapId {

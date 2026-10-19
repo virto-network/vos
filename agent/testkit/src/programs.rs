@@ -17,7 +17,7 @@ fn guest(path: &str) -> PathBuf {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(path);
     assert!(
         path.exists(),
-        "{}: run `just build-agent build-test-actors`",
+        "{}: run `just build-agent build-representative build-test-actors`",
         path.display()
     );
     path
@@ -26,6 +26,16 @@ fn guest(path: &str) -> PathBuf {
 /// The default agent's ELF.
 pub fn agent_elf() -> PathBuf {
     guest("default/target/riscv64em-vos/release/vos-agent.elf")
+}
+
+/// The space's representative's ELF.
+pub fn representative_elf() -> PathBuf {
+    guest("representative/target/riscv64em-vos/release/vos-representative.elf")
+}
+
+/// The space's representative's package, as its crate builds it.
+pub fn representative_package() -> Vec<u8> {
+    read(&representative_elf())
 }
 
 /// Test actor `name`'s ELF.

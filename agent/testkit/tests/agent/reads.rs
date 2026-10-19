@@ -19,7 +19,7 @@ use vos_testkit::{Testkit, run_kernel};
 use vos_tree::{BatchProof, Blake2b, Leaf, MemStore};
 use vos_wire::abi::cap::{self, Target};
 use vos_wire::abi::{AttestError, Failure, Kind, price};
-use vos_wire::batch::{Admin, Input, Request};
+use vos_wire::batch::{Admin, Body, Input, Message, Request};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, ProgramHash, RequestId, Session, WorkflowId};
 use vos_wire::keys::{self, Due, Transform};
 use vos_wire::records::{PendingRead, Workflow, WorkflowState, unstored, unversioned};
@@ -44,6 +44,8 @@ const SEED: [u8; 32] = [3; 32];
 /// The seed of the representative's tree a test builds.
 const REP_SEED: [u8; 32] = [4; 32];
 const VENUE: VenueId = VenueId([0x7e; 32]);
+/// The space's representative.
+const REPRESENTATIVE: AgentId = AgentId(0x0900_0000);
 
 /// The reader in a node and the model, in an agent of `SPACE` or of none,
 /// and what drives them.
@@ -52,6 +54,10 @@ struct Reads {
     kit: Testkit,
     /// Alice's requests so far, in her session opened at `T0`.
     sequence: u64,
+    /// The representative's messages to the agent so far.
+    closes: u64,
+    /// The last batch's time.
+    time: u64,
     derived: Derived,
 }
 
@@ -84,6 +90,8 @@ impl Reads {
             node,
             kit,
             sequence: 0,
+            closes: 0,
+            time: 0,
             derived,
         }
     }
@@ -137,6 +145,7 @@ impl Reads {
     /// A batch at `time`, refined and accumulated on the node, each step
     /// run on the model too, which must agree.
     fn batch(&mut self, time: u64, inputs: Vec<Input>) -> WorkResult {
+        self.time = time;
         let result = self.node.batch(time, inputs.clone());
         self.kit.batch(time, [0; 32]);
         let listed: BTreeMap<WorkflowId, u64> = inputs
@@ -173,6 +182,18 @@ impl Reads {
                         request,
                         served,
                     } => self.kit.resume_read(*window, *request, served.clone()),
+                    Input::Report {
+                        to,
+                        window,
+                        root,
+                        pending,
+                    } => self.kit.report(*to, *window, *root, *pending),
+                    Input::Message(message) => self.kit.message(message.from, &message.body),
+                    Input::Close {
+                        window,
+                        rep_root,
+                        paths,
+                    } => self.kit.close(*window, *rep_root, paths.clone()),
                     other => panic!("not modelled: {other:?}"),
                 },
                 Step::Swept { .. } | Step::Refused { .. } => {
@@ -184,12 +205,44 @@ impl Reads {
             let run = ran(step);
             assert_eq!(run.outcome, expected.outcome, "step {index}'s outcome");
             assert_eq!(run.writes, expected.writes, "step {index}'s writes");
+            assert_eq!(run.messages, expected.messages, "step {index}'s messages");
             assert_eq!(run.attests, expected.attests, "step {index}'s attests");
             assert_eq!(run.pages, expected.pages, "step {index}'s pages");
             assert_eq!(run.gas_used, expected.gas_used, "step {index}'s gas");
             assert_eq!(run.instances, expected.instances, "step {index}'s gas");
         }
+        self.sync_cuts();
         result
+    }
+
+    /// The rows the node's apply writes and deletes with a cut, which the
+    /// model leaves to it: the serving window, each window's re-cut, and
+    /// the closes it keeps, as the node holds them after a batch.
+    fn sync_cuts(&mut self) {
+        let prefixes = [keys::moved(0)[..2].to_vec(), keys::closed_prefix()];
+        let ours = |key: &Vec<u8>| {
+            prefixes.iter().any(|prefix| key.starts_with(prefix)) || *key == keys::serving()
+        };
+        let held: Vec<Vec<u8>> = self
+            .kit
+            .rows()
+            .into_iter()
+            .map(|(key, _)| key)
+            .filter(&ours)
+            .collect();
+        for key in held {
+            self.kit.delete_row(&key);
+        }
+        let rows: Vec<(Vec<u8>, Vec<u8>)> = self
+            .node
+            .state
+            .iter()
+            .filter(|(key, _)| ours(key))
+            .map(|(key, value)| (key.clone(), unstored(value).unwrap().to_vec()))
+            .collect();
+        for (key, value) in rows {
+            self.kit.set_row(key, value);
+        }
     }
 
     /// Start the reader's workflow `name` at `time`: its id, the ask run
@@ -237,8 +290,10 @@ impl Reads {
 
     /// The rows `read` names served at window `window` from the agent's
     /// committed rows now, under the tree of them, with the path of the
-    /// tree's root in a representative's tree of that root alone.
-    fn served(&self, window: u64, read: &PendingRead) -> Served {
+    /// tree's root in a representative's tree of that root alone; the
+    /// agent's report of the root and the representative's `Closed` of the
+    /// window applied first, unless the agent holds one.
+    fn served(&mut self, window: u64, read: &PendingRead) -> Served {
         let rows = self.committed();
         let (store, agent_root) = tree(
             &SEED,
@@ -248,6 +303,9 @@ impl Reads {
         );
         let (rep_root, rep_salt, space_path) =
             representative(&[(AGENT, window, agent_root)], (AGENT, window));
+        if self.node.get(&keys::closed(window)).is_none() {
+            self.close(window, agent_root, (rep_root, rep_salt, space_path.clone()));
+        }
         Served {
             space: SPACE,
             window,
@@ -269,6 +327,33 @@ impl Reads {
                 .collect(),
             rows_proof: BatchProof::generate(&store, &read.rows).unwrap().encode(),
         }
+    }
+
+    /// The agent's report of `agent_root` at window `window`'s cut, and the
+    /// representative's `Closed` of it, `(rep_root, rep_salt, space_path)`,
+    /// at the last batch's time.
+    fn close(&mut self, window: u64, agent_root: [u8; 32], close: ([u8; 32], [u8; 16], Vec<u8>)) {
+        let (rep_root, rep_salt, space_path) = close;
+        self.closes += 1;
+        let report = Input::Report {
+            to: REPRESENTATIVE,
+            window,
+            root: agent_root,
+            pending: true,
+        };
+        let closed = Input::Message(Message {
+            from: REPRESENTATIVE,
+            sequence: self.closes,
+            body: Body::Closed {
+                window,
+                rep_root,
+                rep_salt,
+                space_path,
+            },
+        });
+        let result = self.batch(self.time, vec![report, closed]);
+        assert_eq!(result.steps.len(), 2, "the close applied");
+        assert!(self.node.get(&keys::closed(window)).is_some(), "closed");
     }
 
     /// The `Resume` of `request`'s read of window `window`, served.
@@ -456,53 +541,79 @@ fn a_key_outside_the_read_set_traps() {
 
 /// Served rows the kernel's prologue refuses, though the agent serves them
 /// as the request's: a row's value changed, the rows' proof tampered, the
-/// agent's root another, the space path tampered, the representative's
-/// root another, a representative's tree without the agent's row, and the
-/// leaf's salt another. Each traps, and the workflow sees the attest fail;
-/// the rows as they are attest.
+/// agent's root another. Each traps, and the workflow sees the attest
+/// fail. The close's parts tampered, the space path, the representative's
+/// root, a representative's tree without the agent's row, or the leaf's
+/// salt, the agent does not serve, as not the close it holds: the workflow
+/// sees the read unserved, and the kernel run on them traps all the same.
+/// The rows as they are attest.
 #[test]
 fn a_tampered_witness_traps_the_kernel() {
     let mut reads = Reads::with(&[(1, 10), (2, 20)]);
-    let tampers: [Change; 7] = [
-        ("a row's value", |served| {
-            served.rows[0].1.as_mut().unwrap().1[0] ^= 1;
-        }),
-        ("the rows' proof", |served| {
-            let last = served.rows_proof.len() - 1;
-            served.rows_proof[last] ^= 1;
-        }),
-        ("the agent's root", |served| served.agent_root[0] ^= 1),
-        ("the space path", |served| {
-            let last = served.space_path.len() - 1;
-            served.space_path[last] ^= 1;
-        }),
-        ("the representative's root", |served| {
-            served.rep_root[0] ^= 1
-        }),
-        ("the representative's row", |served| {
-            let other = AgentId(AGENT.0 + 1);
-            let (root, _, path) = representative(
-                &[(other, served.window, served.agent_root)],
-                (served.agent, served.window),
-            );
-            served.rep_root = root;
-            served.space_path = path;
-        }),
-        ("the leaf's salt", |served| served.rep_salt[0] ^= 1),
+    let tampers: [(Change, AttestError); 7] = [
+        (
+            ("a row's value", |served| {
+                served.rows[0].1.as_mut().unwrap().1[0] ^= 1;
+            }),
+            AttestError::Failed,
+        ),
+        (
+            ("the rows' proof", |served| {
+                let last = served.rows_proof.len() - 1;
+                served.rows_proof[last] ^= 1;
+            }),
+            AttestError::Failed,
+        ),
+        (
+            ("the agent's root", |served| served.agent_root[0] ^= 1),
+            AttestError::Failed,
+        ),
+        (
+            ("the space path", |served| {
+                let last = served.space_path.len() - 1;
+                served.space_path[last] ^= 1;
+            }),
+            AttestError::Unserved,
+        ),
+        (
+            ("the representative's root", |served| {
+                served.rep_root[0] ^= 1
+            }),
+            AttestError::Unserved,
+        ),
+        (
+            ("the representative's row", |served| {
+                let other = AgentId(AGENT.0 + 1);
+                let (root, _, path) = representative(
+                    &[(other, served.window, served.agent_root)],
+                    (served.agent, served.window),
+                );
+                served.rep_root = root;
+                served.space_path = path;
+            }),
+            AttestError::Unserved,
+        ),
+        (
+            ("the leaf's salt", |served| served.rep_salt[0] ^= 1),
+            AttestError::Unserved,
+        ),
     ];
-    for (at, (name, tamper)) in (T0 + 10..).step_by(20).zip(tampers) {
+    let kernel = reads.kernel("sum_entries").to_vec();
+    for (at, ((name, tamper), error)) in (T0 + 10..).step_by(20).zip(tampers) {
         let id = reads.start(at, "sum_at_cut", vec![1u64, 2]);
         let (request, read) = reads.asked(WINDOW, id, 0);
         let mut served = reads.served(WINDOW, &read);
         tamper(&mut served);
+        let input = [vec![1u64, 2].encode(), served.encode()].concat();
+        assert_eq!(
+            run_kernel(&kernel, &input, 1 << 32).err(),
+            Some(Failure::Trapped),
+            "{name}"
+        );
         let resume = reads.resume(WINDOW, request, Some(&served));
         let result = reads.batch(at + 10, vec![resume]);
         assert!(resumed(&result, request).attests.is_empty(), "{name}");
-        assert_eq!(
-            ended(&reads.record(id)),
-            &failed_with(AttestError::Failed),
-            "{name}"
-        );
+        assert_eq!(ended(&reads.record(id)), &failed_with(error), "{name}");
     }
     let id = reads.start(T0 + 500, "sum_at_cut", vec![1u64, 2]);
     let (request, read) = reads.asked(WINDOW, id, 0);
@@ -931,4 +1042,337 @@ fn a_read_whose_kernel_spends_the_step_answers_its_workflow() {
             assert_eq!(ended, failed_with(AttestError::Failed));
         }
     }
+}
+
+/// The start of window `window`.
+fn start_of(window: u64) -> u64 {
+    CLOCK.boundary(window - 1).unwrap()
+}
+
+/// A row of the node's state, decoded.
+fn row<T: Decode>(reads: &Reads, key: &[u8]) -> Option<T> {
+    reads.node.value(key)
+}
+
+/// A batch of nothing but a sweep at `time`, in which apply records the
+/// cuts its time crosses.
+fn tick(reads: &mut Reads, time: u64) {
+    let sweep = reads.node.sweep(time);
+    reads.batch(time, vec![sweep]);
+}
+
+/// The roots of the read `request`'s attest in `result`, and its window.
+fn stated(result: &WorkResult, request: RequestId) -> (Option<u64>, Vec<RootRead>) {
+    let attest = &resumed(result, request).attests[0];
+    (attest.window, attest.roots.clone())
+}
+
+/// A window whose close has not applied by the next cut is re-cut there:
+/// a read asked in window 10, its window cut and unclosed when window 11's
+/// cut is recorded, moves to window 11 ([`keys::moved`]), and is served
+/// and stated at window 11's cut, with window 11's close. A window closed
+/// in time is not re-cut, its read served at its own cut. A close that
+/// comes after the re-cut serves the read at its own window still; a
+/// window it never moved through serves it none.
+#[test]
+fn an_unclosed_window_is_re_cut_at_the_next() {
+    let mut reads = Reads::with(&[(1, 10), (2, 20)]);
+    let id = reads.start(T0 + 10, "sum_at_cut", vec![1u64, 2]);
+    let (request, read) = reads.asked(WINDOW, id, 0);
+    tick(&mut reads, start_of(11) + 5);
+    assert_eq!(row::<u64>(&reads, &keys::serving()), Some(WINDOW));
+    assert_eq!(row::<u64>(&reads, &keys::moved(WINDOW)), None);
+    tick(&mut reads, start_of(12) + 5);
+    assert_eq!(row::<u64>(&reads, &keys::serving()), Some(11));
+    assert_eq!(row::<u64>(&reads, &keys::moved(WINDOW)), Some(11));
+    let served = reads.served(11, &read);
+    let resume = reads.resume(WINDOW, request, Some(&served));
+    let result = reads.batch(start_of(12) + 10, vec![resume]);
+    let (window, roots) = stated(&result, request);
+    assert_eq!(window, Some(11));
+    assert_eq!(roots[0].window, 11);
+    assert_eq!(roots[0].root, space_root(&SPACE, 11, &served.rep_root));
+    assert_eq!(ended(&reads.record(id)), &Outcome::Done(30u64.encode()));
+
+    // Closed in time: no re-cut.
+    let id = reads.start(start_of(12) + 20, "sum_at_cut", vec![1u64, 2]);
+    let (request, read) = reads.asked(12, id, 0);
+    let served = reads.served(12, &read);
+    tick(&mut reads, start_of(13) + 5);
+    tick(&mut reads, start_of(14) + 5);
+    assert_eq!(row::<u64>(&reads, &keys::moved(12)), None);
+    let resume = reads.resume(12, request, Some(&served));
+    let result = reads.batch(start_of(14) + 10, vec![resume]);
+    assert_eq!(stated(&result, request).0, Some(12));
+
+    // Closed after the re-cut: still served at its own window, as at any
+    // window it was moved through; at none past them.
+    let id = reads.start(start_of(14) + 20, "sum_at_cut", vec![1u64, 2]);
+    let (request, read) = reads.asked(14, id, 0);
+    tick(&mut reads, start_of(15) + 5);
+    tick(&mut reads, start_of(16) + 5);
+    assert_eq!(row::<u64>(&reads, &keys::moved(14)), Some(15));
+    let before = reads.served(13, &read);
+    let resume = reads.resume(14, request, Some(&before));
+    let result = reads.batch(start_of(16) + 10, vec![resume]);
+    assert!(
+        resumed(&result, request).attests.is_empty(),
+        "not of its windows"
+    );
+    let id = reads.start(start_of(16) + 20, "sum_at_cut", vec![1u64, 2]);
+    let (request, read) = reads.asked(16, id, 0);
+    tick(&mut reads, start_of(17) + 5);
+    tick(&mut reads, start_of(18) + 5);
+    assert_eq!(row::<u64>(&reads, &keys::moved(16)), Some(17));
+    let late = reads.served(16, &read);
+    let resume = reads.resume(16, request, Some(&late));
+    let result = reads.batch(start_of(18) + 10, vec![resume]);
+    assert_eq!(stated(&result, request).0, Some(16));
+}
+
+/// A read re-cut twice and closed at neither ends `NotClosed` at its
+/// deadline, `B_{w+3}`, when its third re-cut would come.
+#[test]
+fn a_read_re_cut_twice_ends_not_closed() {
+    let mut reads = Reads::with(&[(1, 10)]);
+    let id = reads.start(T0 + 10, "sum_at_cut", vec![1u64]);
+    for window in 11..=13 {
+        tick(&mut reads, start_of(window) + 5);
+    }
+    tick(&mut reads, start_of(14) - 1);
+    assert_eq!(row::<u64>(&reads, &keys::moved(WINDOW)), Some(11));
+    assert_eq!(row::<u64>(&reads, &keys::moved(11)), Some(12));
+    assert!(matches!(
+        reads.record(id).state,
+        WorkflowState::Attesting { .. }
+    ));
+    tick(&mut reads, start_of(14));
+    assert_eq!(
+        ended(&reads.record(id)),
+        &failed_with(AttestError::NotClosed)
+    );
+}
+
+/// A clock's jump past `MAX_CUTS` windows cuts the newest of them: the
+/// window a read was asked in is left uncut and its deadline is past, so
+/// the next sweep ends it `NotClosed`, its request gone.
+#[test]
+fn a_read_a_jump_leaves_uncut_ends_not_closed() {
+    let mut reads = Reads::with(&[(1, 10)]);
+    let id = reads.start(T0 + 10, "sum_at_cut", vec![1u64]);
+    let (request, _) = reads.asked(WINDOW, id, 0);
+    let last = WINDOW + defaults::MAX_CUTS + 5;
+    let first = last + 1 - defaults::MAX_CUTS;
+    tick(&mut reads, start_of(last + 1) + 5);
+    assert_eq!(
+        reads.node.get(&keys::cut(WINDOW)),
+        None,
+        "window 10 not cut"
+    );
+    assert!(reads.node.get(&keys::cut(first)).is_some());
+    assert_eq!(row::<u64>(&reads, &keys::serving()), Some(first));
+    tick(&mut reads, start_of(last + 1) + 6);
+    assert_eq!(
+        ended(&reads.record(id)),
+        &failed_with(AttestError::NotClosed)
+    );
+    assert!(reads.node.get(&keys::request(WINDOW, request)).is_none());
+}
+
+/// A cut recording window `w` deletes the cut, re-cut and close rows of
+/// every window before `w − CUT_KEEP`, and no later one.
+#[test]
+fn old_cut_rows_are_pruned() {
+    let mut reads = Reads::with(&[(1, 10)]);
+    let id = reads.start(T0 + 10, "sum_at_cut", vec![1u64]);
+    let (_, read) = reads.asked(WINDOW, id, 0);
+    reads.served(WINDOW, &read);
+    for window in 11..=20 {
+        tick(&mut reads, start_of(window) + 5);
+    }
+    let first = 19;
+    for window in WINDOW..20 {
+        let kept = window + defaults::CUT_KEEP >= first;
+        assert_eq!(
+            reads.node.get(&keys::cut(window)).is_some(),
+            kept,
+            "cut({window})"
+        );
+        if window > WINDOW && window < 19 {
+            assert_eq!(
+                reads.node.get(&keys::moved(window)).is_some(),
+                kept,
+                "moved({window})"
+            );
+        }
+    }
+    assert!(
+        reads.node.get(&keys::closed(WINDOW)).is_none(),
+        "closed(10)"
+    );
+    // A close of a window pruned is not taken.
+    let stale = Input::Message(Message {
+        from: REPRESENTATIVE,
+        sequence: reads.closes + 1,
+        body: Body::Closed {
+            window: 12,
+            rep_root: [1; 32],
+            rep_salt: [2; 16],
+            space_path: vec![3],
+        },
+    });
+    reads.closes += 1;
+    let time = reads.time;
+    reads.batch(time, vec![stale]);
+    assert!(reads.node.get(&keys::closed(12)).is_none());
+}
+
+/// The agent's report of its root at a window's cut: a call of the
+/// representative's `report` with the window, the root and whether reads
+/// wait, awaiting nothing, and the mark; none again for that window or an
+/// earlier one, none to itself, and none from an agent of no space.
+#[test]
+fn a_report_goes_once_a_window() {
+    let mut reads = Reads::with(&[(1, 10)]);
+    let report = |window, to| Input::Report {
+        to,
+        window,
+        root: [window as u8; 32],
+        pending: window == 3,
+    };
+    let result = reads.batch(T0 + 1, vec![report(3, REPRESENTATIVE)]);
+    let call = vos_wire::served::AgentRoot {
+        kind: 0,
+        window: 3,
+        root: [3; 32],
+        pending: true,
+    };
+    assert_eq!(
+        ran(&result.steps[0]).messages,
+        [vos_wire::result::Outgoing {
+            to: REPRESENTATIVE,
+            body: Body::Call {
+                instance: vos_wire::served::REPRESENTATIVE,
+                method: vos_wire::served::REPORT,
+                arguments: call.encode(),
+                awaiting: None,
+            },
+        }]
+    );
+    assert_eq!(
+        row::<(u64, AgentId)>(&reads, &keys::reported()),
+        Some((3, REPRESENTATIVE))
+    );
+    let result = reads.batch(
+        T0 + 2,
+        vec![
+            report(3, REPRESENTATIVE),
+            report(2, REPRESENTATIVE),
+            report(4, AGENT),
+        ],
+    );
+    assert!(
+        result
+            .steps
+            .iter()
+            .all(|step| ran(step).messages.is_empty())
+    );
+    let result = reads.batch(T0 + 3, vec![report(4, REPRESENTATIVE)]);
+    assert_eq!(ran(&result.steps[0]).messages.len(), 1);
+    let mut spaceless = Reads::new(Target::Vos, SpaceId::NONE);
+    let result = spaceless.batch(T0, vec![report(3, REPRESENTATIVE)]);
+    assert!(ran(&result.steps[0]).messages.is_empty());
+}
+
+/// The representative's close of a window sends each agent that asked its
+/// `Closed`, at most `CLOSE_PATHS` a close in agent order, each once
+/// across closes of the window; an earlier window's close sends nothing.
+#[test]
+fn a_close_sends_each_path_once() {
+    let mut reads = Reads::with(&[(1, 10)]);
+    let count = 2 * defaults::CLOSE_PATHS + 6;
+    let paths: Vec<(AgentId, [u8; 16], Vec<u8>)> = (0..count as u32)
+        .map(|n| (AgentId(0x0300_0000 + n), [n as u8; 16], vec![n as u8; 5]))
+        .collect();
+    let close = |window| Input::Close {
+        window,
+        rep_root: [9; 32],
+        paths: paths.clone(),
+    };
+    let sent = |result: &WorkResult| -> Vec<AgentId> {
+        ran(&result.steps[0])
+            .messages
+            .iter()
+            .map(|message| message.to)
+            .collect()
+    };
+    let result = reads.batch(T0 + 1, vec![close(7), close(7)]);
+    let first: Vec<AgentId> = result
+        .steps
+        .iter()
+        .flat_map(|step| ran(step).messages.iter().map(|message| message.to))
+        .collect();
+    assert_eq!(first.len(), 2 * defaults::CLOSE_PATHS);
+    let second = sent(&reads.batch(T0 + 2, vec![close(7)]));
+    assert_eq!(second.len(), 6);
+    assert_eq!(
+        [first, second].concat(),
+        paths.iter().map(|(agent, ..)| *agent).collect::<Vec<_>>()
+    );
+    assert!(sent(&reads.batch(T0 + 3, vec![close(7)])).is_empty());
+    let result = reads.batch(T0 + 4, vec![close(8), close(6)]);
+    assert_eq!(sent(&result).len(), defaults::CLOSE_PATHS);
+    assert!(ran(&result.steps[1]).messages.is_empty());
+    let empty = Input::Close {
+        window: 9,
+        rep_root: [9; 32],
+        paths: Vec::new(),
+    };
+    reads.batch(T0 + 5, vec![empty]);
+    assert_eq!(
+        row::<(u64, Option<AgentId>)>(&reads, &keys::close_mark()),
+        Some((9, None))
+    );
+}
+
+/// A `Closed` is taken from the representative the agent reported to,
+/// once a window: a second for the window, other bytes, is ignored, and
+/// one from another agent writes nothing.
+#[test]
+fn a_closed_is_taken_once_from_the_representative() {
+    let mut reads = Reads::with(&[(1, 10)]);
+    let closed = |from, sequence, root: u8| {
+        Input::Message(Message {
+            from,
+            sequence,
+            body: Body::Closed {
+                window: WINDOW,
+                rep_root: [root; 32],
+                rep_salt: [0; 16],
+                space_path: vec![root],
+            },
+        })
+    };
+    let other = AgentId(0x0700_0000);
+    reads.batch(T0 + 1, vec![closed(other, 1, 1)]);
+    assert!(
+        reads.node.get(&keys::closed(WINDOW)).is_none(),
+        "not reported to"
+    );
+    let report = Input::Report {
+        to: REPRESENTATIVE,
+        window: WINDOW,
+        root: [0; 32],
+        pending: true,
+    };
+    reads.batch(
+        T0 + 2,
+        vec![report, closed(REPRESENTATIVE, 1, 2), closed(other, 2, 3)],
+    );
+    reads.closes = 1;
+    let held = |reads: &Reads| row::<vos_wire::served::ClosedRow>(reads, &keys::closed(WINDOW));
+    assert_eq!(held(&reads).unwrap().rep_root, [2; 32]);
+    reads.batch(T0 + 3, vec![closed(REPRESENTATIVE, 2, 4)]);
+    reads.closes = 2;
+    assert_eq!(held(&reads).unwrap().rep_root, [2; 32], "the first kept");
 }

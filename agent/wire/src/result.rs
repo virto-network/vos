@@ -286,6 +286,14 @@ pub enum InputRef {
     /// the step of the workflow awaiting it, if it still does.
     #[codec(index = 5)]
     Resume { request: RequestId },
+    /// The agent's report of its root at window `window`'s cut
+    /// ([`crate::batch::Input::Report`]).
+    #[codec(index = 6)]
+    Report { window: u64 },
+    /// The representative's close of window `window`
+    /// ([`crate::batch::Input::Close`]).
+    #[codec(index = 7)]
+    Close { window: u64 },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

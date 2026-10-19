@@ -434,9 +434,9 @@ pub mod price {
     pub const RANDOM: u64 = 6_000;
     pub const CALLER: u64 = 6_200;
     pub const LOG: u64 = 4_000;
-    pub const SEND: u64 = 5_000;
+    pub const SEND: u64 = 5_300;
     /// A pause: its message, its await and its row in the due index.
-    pub const PAUSE: u64 = 8_000;
+    pub const PAUSE: u64 = 9_000;
     /// A row operation hashes its key under a hashed table's transform,
     /// and looks it up in the step's overlays at a random place.
     pub const GET: u64 = 30_000;

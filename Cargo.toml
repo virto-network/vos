@@ -11,6 +11,7 @@ members = [
     "node/cli",
     "node/checker",
     "node/jam",
+    "node/venue",
     "support/vos-raft",
     "support/merkle-crdt",
     "pvm/runtime",
@@ -171,6 +172,7 @@ vos-wire = { path = "agent/wire" }
 vos-tree = { path = "agent/tree" }
 vos-net = { path = "node/net" }
 vos-jam = { path = "node/jam" }
+vos-venue = { path = "node/venue" }
 vos-raft = { path = "support/vos-raft" }
 vos-sdk = { path = "agent/sdk" }
 vos-sdk-macros = { path = "agent/sdk-macros" }

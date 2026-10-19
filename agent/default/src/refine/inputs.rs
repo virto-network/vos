@@ -10,10 +10,12 @@ use vos_wire::ids::{AgentId, Principal};
 use vos_wire::keys::Due;
 use vos_wire::records::Workflow;
 use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Run, Step, Write};
+use vos_wire::served::ClosedRow;
 use vos_wire::{Encode, defaults, keys};
 
 use super::base::{Base, Corrupt};
 use super::batch::{Mark, Stepped};
+use super::closes;
 use super::invocation::Invocation;
 use super::workflows;
 use super::{Call, Overlay};
@@ -98,6 +100,21 @@ pub(crate) fn message(
         },
         Body::Wait { workflow, awaiting } => {
             let run = workflows::wait(base, input, from, workflow, awaiting);
+            Stepped::ran(run)
+        }
+        Body::Closed {
+            window,
+            rep_root,
+            rep_salt,
+            space_path,
+        } => {
+            let row = ClosedRow {
+                rep_root,
+                rep_salt,
+                space_path,
+            };
+            let mut run = consumed(input, Outcome::Done(Vec::new()));
+            run.writes = closes::closed(base, from, window, row);
             Stepped::ran(run)
         }
     };

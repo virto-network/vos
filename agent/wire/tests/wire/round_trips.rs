@@ -140,7 +140,13 @@ proptest! {
             keys::request(sequence, request),
             keys::undo(sequence, &row),
             keys::cut_root(sequence),
-            keys::cut_proof(request),
+            keys::cut_proof(request, sequence),
+            keys::reported(),
+            keys::closed(sequence),
+            keys::moved(sequence),
+            keys::serving(),
+            keys::close_mark(),
+            keys::closing(sequence),
         ];
         for key in &system {
             prop_assert!(!keys::owned_by(key, instance));
@@ -166,6 +172,9 @@ proptest! {
             keys::version(),
             keys::next_workflow(),
             keys::live_workflows(),
+            keys::reported(),
+            keys::serving(),
+            keys::close_mark(),
         ];
         for (a, b, transform, key, number, member, triple, level) in parts {
             let instance = InstanceId(a);
@@ -205,8 +214,12 @@ proptest! {
                 keys::request(number, RequestId { workflow: WorkflowId(u64::from(a)), awaits: u64::from(b) }),
                 keys::undo(number, &keys::committed(&map, &transformed)),
                 keys::cut_root(number),
-                keys::cut_proof(RequestId { workflow: WorkflowId(number), awaits: u64::from(a) }),
+                keys::cut_proof(RequestId { workflow: WorkflowId(number), awaits: u64::from(a) }, u64::from(b)),
+                keys::closed(number),
+                keys::moved(number),
+                keys::closing(number),
             ]);
+
             if let Some(prefix) = prefix {
                 rows.push(keys::tree_node(level, &prefix));
             }

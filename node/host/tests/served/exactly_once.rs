@@ -72,6 +72,9 @@ pub(crate) fn tallied(
 /// every replica holds every request.
 pub(crate) trait Alongside: Sync {
     fn clock(&self) -> Option<WindowClock>;
+    /// What it sets up once the run's agents are, before any client or
+    /// fault.
+    fn before(&self, _cluster: &Cluster, _agents: &[(AgentId, [u8; 32])]) {}
     fn run(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])], done: &AtomicBool);
     fn check(&self, cluster: &Cluster, agents: &[(AgentId, [u8; 32])]);
     /// The workflows it started at `agent`, as `node` holds them, beside
@@ -96,6 +99,9 @@ pub(crate) fn exactly_once(
     let cluster = Cluster::founded(seed, alongside.and_then(Alongside::clock));
     let methods = Methods::of(&schema(&actor("counter")));
     let agents = agents(&cluster, rounds.as_ref());
+    if let Some(alongside) = alongside {
+        alongside.before(&cluster, &agents);
+    }
     // At each agent, one client forwarding to the next agent's inbox and a
     // second incrementing a counter of its own: batches mix their
     // sessions, new and held. With workflows, a third tours the next agent.

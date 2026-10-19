@@ -139,6 +139,9 @@ pub(crate) struct State {
     pub stopped: bool,
     /// The replica has held a committed configuration naming it.
     pub established: bool,
+    /// The window cuts this replica's root builder has finished since the
+    /// group started: the leader reports and closes after each.
+    pub cuts_built: u64,
 }
 
 pub(crate) struct Shared {
@@ -179,6 +182,7 @@ impl Shared {
                 applied_at: None,
                 stopped: false,
                 established: false,
+                cuts_built: 0,
             }),
             changed: event_listener::Event::new(),
             outcomes: Mutex::new(VecDeque::new()),
