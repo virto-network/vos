@@ -6,15 +6,13 @@
 //!   them ([`roots::undo`]), against the same writes with no cut pending.
 //!   Gate: accumulate's 1.05 µs on the JIT (slice 4) plus the store's
 //!   path with a cut pending, at most twice the 4.3 µs a committed write
-//!   costs with none;
+//!   costs with none. The ratio to the bench's own cost with no cut
+//!   pending is printed beside it;
 //! - **a cut's build and its proofs:** from the commit that records a cut
 //!   to the commit that marks it built, the build of the writes since the
 //!   last complete build and the proofs of 100 pending requests of 16 rows
-//!   each. Gate: at most 1 s on a 1M-row agent;
-//!
-//!   The ratio to the bench's own cost with no cut pending is printed
-//!   beside it, the reading that holds on another machine;
-//! - its proofs' part, generated again from the tree at the cut, apart.
+//!   each. Gate: at most 1 s on a 1M-row agent. Its proofs' part,
+//!   generated again from the tree at the cut, is printed apart.
 //!
 //! `cargo bench -p vos-node --bench cuts -- <keys> [writes]`: a map of
 //! `keys` keys (1,000,000), built; `writes` committed writes (10,000, the
@@ -164,7 +162,7 @@ fn main() {
     let mut written = 0;
     let mut asked = 0;
     while written < before_cut || asked < REQUESTS {
-        let count = PER_RESULT.min(before_cut - written.min(before_cut));
+        let count = PER_RESULT.min(before_cut.saturating_sub(written));
         let mut entry = Entry::at(agent.time, random(&mut rng, keys, count, written));
         written += count;
         if asked < REQUESTS {

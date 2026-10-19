@@ -33,7 +33,7 @@ impl Leader {
     ) -> Result<Ended, Fault> {
         let id = self.id;
         let started = Instant::now();
-        let (version, inputs) = (batch.version, batch.inputs.len() as u64);
+        let (version, time, inputs) = (batch.version, batch.time, batch.inputs.len() as u64);
         let stats = &self.inner.stats;
         stats.batch_inputs.record(inputs);
         let work = Arc::new(Work::Batch(batch));
@@ -43,7 +43,10 @@ impl Leader {
                 let (output, gas) = self
                     .refine(Arc::clone(&snapshot), Arc::clone(&work))
                     .await?;
-                (self.with_request(&snapshot, output)?, gas)
+                match self.requested(&snapshot, time)? {
+                    Some(step) => (with_step(output, step)?, gas),
+                    None => (output, gas),
+                }
             }
         };
         let result: WorkResult = pvm::decode(&output)?;
@@ -168,22 +171,6 @@ impl Leader {
         }
     }
 
-    /// `output`, a refine's, with the step a test's hook adds to its
-    /// result, if it adds one ([`Leader::requested`]).
-    fn with_request(&self, snapshot: &Snapshot, output: Vec<u8>) -> Result<Vec<u8>, Fault> {
-        let (mut result, pages) = split_output(&output)
-            .ok_or_else(|| Fault::Agent("the refine's output does not decode".into()))?;
-        let Some(step) = self.requested(snapshot, result.time)? else {
-            return Ok(output);
-        };
-        result.steps.push(step);
-        let mut output = result.encode();
-        if !pages.is_empty() {
-            pages.encode_to(&mut output);
-        }
-        Ok(output)
-    }
-
     /// Refine `work`, a batch's, on an executor, unless the refine hook
     /// fails the batch: its output and gas.
     async fn refine(
@@ -249,6 +236,19 @@ impl Leader {
         self.inner.stats.ran(stage, running, finished);
         output
     }
+}
+
+/// `output`, a refine's, with `step`, a test's hook's, added to its
+/// result ([`Leader::requested`]).
+fn with_step(output: Vec<u8>, step: Step) -> Result<Vec<u8>, Fault> {
+    let (mut result, pages) = split_output(&output)
+        .ok_or_else(|| Fault::Agent("the refine's output does not decode".into()))?;
+    result.steps.push(step);
+    let mut output = result.encode();
+    if !pages.is_empty() {
+        pages.encode_to(&mut output);
+    }
+    Ok(output)
 }
 
 /// The batch `work` carries.

@@ -714,7 +714,8 @@ The Local (replica-only) lane is deferred until a use case needs it.
     `cut(w)`: the builder holds at each pending cut, node-local `undo`
     rows keep values overwritten before the cut's build reads them, and
     the proofs are persisted with the cut, rows and values with them.
-    Nothing is kept past a cut.
+    Nothing node-local outlives the cut's build but its root and the
+    proofs.
 - **On JAM the whole keyspace is one tree** over the rows' keys, so every
   read, scan and write of a refine is witnessed against the root the
   chain stores (section 12).

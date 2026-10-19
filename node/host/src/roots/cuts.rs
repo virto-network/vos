@@ -68,15 +68,11 @@ pub(super) struct Cut {
 
 /// The cuts whose roots this replica keeps, by window.
 fn cut_roots(snapshot: &Snapshot, agent: AgentId) -> Result<BTreeMap<u64, CutRoot>, Error> {
-    let prefix = keys::cut_roots();
     snapshot
-        .scan(agent, &prefix, None)
+        .scan(agent, &keys::cut_roots(), None)
         .map(|row| {
             let (key, value) = row?;
-            let window = key[prefix.len()..]
-                .try_into()
-                .map(u64::from_be_bytes)
-                .map_err(|_| Error::Corrupt("a cut root's key"))?;
+            let window = keys::cut_root_entry(&key).ok_or(Error::Corrupt("a cut root's key"))?;
             let root = CutRoot::decode_exact(&value).ok_or(Error::Corrupt("a cut root"))?;
             Ok((window, root))
         })
@@ -118,15 +114,10 @@ pub(super) fn orphans(snapshot: &Snapshot, agent: AgentId) -> Result<Vec<Vec<u8>
     let Some(latest) = latest_built(snapshot, agent)? else {
         return Ok(Vec::new());
     };
-    let prefix = keys::undo_prefix();
     let mut orphans = Vec::new();
-    for row in snapshot.scan(agent, &prefix, None) {
+    for row in snapshot.scan(agent, &keys::undo_prefix(), None) {
         let (key, _) = row?;
-        let window = key
-            .get(prefix.len()..prefix.len() + 8)
-            .and_then(|bytes| bytes.try_into().ok())
-            .map(u64::from_be_bytes)
-            .ok_or(Error::Corrupt("an undo row's key"))?;
+        let (window, _) = keys::undo_entry(&key).ok_or(Error::Corrupt("an undo row's key"))?;
         if window > latest {
             break;
         }
@@ -258,12 +249,39 @@ pub(super) fn finish(
     }
     for row in at.scan(agent, &keys::requests(cut.window), None) {
         let (key, value) = row?;
-        let (_, id) = keys::request_entry(&key).ok_or(Error::Corrupt("a request's key"))?;
-        let read = unstored(&value)
-            .and_then(PendingRead::decode_exact)
-            .ok_or(Error::Corrupt("a pending request"))?;
-        let proof = prove(at, agent, cut, tree, root, &read)?;
-        writes.insert(keys::cut_proof(id), Some(proof.encode()));
+        let Some((_, id)) = keys::request_entry(&key) else {
+            tracing::warn!(
+                agent = agent.0,
+                "a pending request's key does not read; it is not proved"
+            );
+            continue;
+        };
+        let read = unstored(&value).and_then(PendingRead::decode_exact);
+        let Some(read) = read.filter(|read| read.rows.iter().all(|row| keys::is_committed(row)))
+        else {
+            tracing::warn!(
+                agent = agent.0,
+                ?id,
+                "a pending request does not read as committed rows; it is not proved"
+            );
+            continue;
+        };
+        match prove(at, agent, cut, tree, root, &read) {
+            Ok(proof) => {
+                writes.insert(keys::cut_proof(id), Some(proof.encode()));
+            }
+            // A row the request names that is no value row, or one the tree
+            // holds otherwise: skipped alike on every replica, so the cut's
+            // root and the other proofs still land.
+            Err(Error::Corrupt(what)) => {
+                tracing::warn!(
+                    agent = agent.0,
+                    ?id,
+                    "{what} does not read back; the request is not proved"
+                );
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(())
 }

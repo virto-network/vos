@@ -254,6 +254,26 @@ fn committed_keys_keep_their_bytes() {
     );
     assert_eq!(keys::cut_proofs(), [0x02, 0x06]);
     assert_eq!(keys::cut_entry(&keys::cut_root(9)), None);
+    assert_eq!(keys::cut_root_entry(&keys::cut_root(9)), Some(9));
+    assert_eq!(keys::cut_root_entry(&keys::cut(9)), None);
+    assert_eq!(keys::undo_entry(&keys::undo(9, &row)), Some((9, &row[..])));
+    assert_eq!(keys::undo_entry(&keys::cut_root(9)), None);
+    for (key, replicated) in [
+        (keys::cut(9), true),
+        (keys::request(9, request), true),
+        (keys::version(), true),
+        (row.clone(), true),
+        (keys::instance_struct(InstanceId(1)), true),
+        (keys::dirty(9, &row), false),
+        (keys::seed(9), false),
+        (keys::undo(9, &row), false),
+        (keys::cut_root(9), false),
+        (keys::cut_proof(request), false),
+        (keys::built(), false),
+        (Vec::new(), false),
+    ] {
+        assert_eq!(keys::is_replicated(&key), replicated, "{key:?}");
+    }
     assert_eq!(keys::request_entry(&keys::cut(9)), None);
     // The hashed transform: the first 16 bytes of BLAKE2b-256 over
     // `vos/tree/key` and the key, then the key escaped.

@@ -538,3 +538,59 @@ fn an_orphaned_undo_row_is_swept() {
     assert!(undos(&replica.snapshot()).is_empty(), "swept");
     assert_eq!(replica.build(BATCH), None);
 }
+
+/// A pending request whose row does not decode, names a key that is no
+/// committed row, or one whose value is no value row, is left unproved:
+/// the cut's root and the other requests' proofs still land, alike on
+/// every replica.
+#[test]
+fn a_request_that_does_not_read_is_left_unproved() {
+    let mut history = history(12);
+    let bad = |workflow: u64| RequestId {
+        workflow: vos_wire::ids::WorkflowId(workflow),
+        awaits: 0,
+    };
+    let malformed = row(MAPS[0], &7u64.to_be_bytes())[..keys::COMMITTED_PREFIX].to_vec();
+    let mut short = malformed.clone();
+    short.push(1);
+    let read = |rows: Vec<Vec<u8>>| {
+        PendingRead {
+            instance: model::READER,
+            rows,
+        }
+        .encode()
+    };
+    history.entries[3].writes.extend([
+        Write {
+            key: keys::request(0, bad(901)),
+            value: Some(vec![0xff, 0xff]),
+        },
+        Write {
+            key: keys::request(0, bad(902)),
+            value: Some(read(vec![keys::version()])),
+        },
+        Write {
+            key: short.clone(),
+            value: Some(vec![1]),
+        },
+        Write {
+            key: keys::request(0, bad(903)),
+            value: Some(read(vec![short])),
+        },
+    ]);
+    let dir = tempfile::tempdir().unwrap();
+    let replica = Replica::open(dir.path());
+    apply(&replica, &history, 1, 12);
+    assert_eq!(replica.build_all(BATCH), vec![9, 12]);
+    let snapshot = replica.snapshot();
+    assert!(roots::cut_root(&snapshot, AGENT, 0).unwrap().is_some());
+    for (id, (window, read)) in history.requests(12) {
+        let proof = roots::cut_proof(&snapshot, AGENT, id)
+            .unwrap()
+            .expect("a proof");
+        check_proof(&history, &proof, window, 9, &read);
+    }
+    for id in [901, 902, 903] {
+        assert_eq!(roots::cut_proof(&snapshot, AGENT, bad(id)).unwrap(), None);
+    }
+}

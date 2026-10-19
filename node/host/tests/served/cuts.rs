@@ -12,6 +12,9 @@
 //! the two latest cuts are the same on every replica, and each pending
 //! request of those windows has the same proof on every replica, verifying
 //! against that root.
+//!
+//! `CUTS_FULL` adds the workflows' tours, the checker loop's run;
+//! `EXACTLY_ONCE_SEED` picks the seed.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -207,14 +210,12 @@ fn cuts(snapshot: &Snapshot, agent: AgentId) -> BTreeMap<u64, u64> {
         .collect()
 }
 
-/// `agent`'s replicated rows in `snapshot`: its own but the dirty and seed
-/// rows, its instances' and its committed rows.
+/// `agent`'s replicated rows in `snapshot` ([`keys::is_replicated`]).
 fn replicated(snapshot: &Snapshot, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let local = [keys::dirty_prefix(), keys::seed_prefix()];
     [[0x00u8], [0x01], [0x03]]
         .iter()
         .flat_map(|prefix| snapshot.scan(agent, prefix, None).map(Result::unwrap))
-        .filter(|(key, _)| !local.iter().any(|prefix| key.starts_with(prefix)))
+        .filter(|(key, _)| keys::is_replicated(key))
         .collect()
 }
 
@@ -331,17 +332,14 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
     assert!(proven > 0, "agent {}: no request proved", agent.0);
 }
 
-/// The exactly-once run with workflows and window cuts, its replicas'
-/// states equal though each holds its own undo rows.
+/// The exactly-once run with window cuts, its replicas' states equal
+/// though each holds its own undo rows. With `CUTS_FULL` set, the run
+/// tours workflows as well, as the checker loop runs it.
 #[test]
 fn cuts_apply_once_and_replicas_agree_through_failures() {
     let cuts = Cuts {
         undo_held: Mutex::new(0),
     };
-    exactly_once(
-        Mode::OneAtATime,
-        0x5eed_0612,
-        Some(Rounds::load()),
-        Some(&cuts),
-    );
+    let rounds = std::env::var_os("CUTS_FULL").map(|_| Rounds::load());
+    exactly_once(Mode::OneAtATime, 0x5eed_0612, rounds, Some(&cuts));
 }

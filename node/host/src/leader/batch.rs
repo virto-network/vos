@@ -132,21 +132,30 @@ impl Leader {
                 }
                 self.fail(pending, message);
             }
-            Err(Fault::Storage(message)) => {
+            Err(fault) if self.ended_by(&fault) => return false,
+            Err(fault) => self.retry(pending, fault).await,
+        }
+        true
+    }
+
+    /// Whether `fault` ends this leadership: a failed commit halts the
+    /// node, a broken invariant stops the agent. Said once, here.
+    pub(super) fn ended_by(&self, fault: &Fault) -> bool {
+        match fault {
+            Fault::Storage(message) => {
                 tracing::error!(
                     agent = self.id.0,
                     "a commit failed ({message}); the node stops and needs a restart"
                 );
                 self.inner.halt();
-                return false;
+                true
             }
-            Err(Fault::Invariant(message)) => {
+            Fault::Invariant(message) => {
                 tracing::error!(agent = self.id.0, "{message}; the agent stops");
-                return false;
+                true
             }
-            Err(fault) => self.retry(pending, fault).await,
+            _ => false,
         }
-        true
     }
 
     /// What of `pending` goes into the batch, the marks of its messages'

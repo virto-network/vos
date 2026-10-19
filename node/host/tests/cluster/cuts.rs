@@ -541,18 +541,23 @@ fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
         Some(proof)
     );
     same_state(&cluster, agent);
+    wait_until("every replica builds the same root", || {
+        let roots: Vec<_> = cluster
+            .running()
+            .map(|(_, node)| roots::agent_root(&node.store().snapshot(), agent).ok())
+            .collect();
+        roots.iter().all(Option::is_some) && roots.windows(2).all(|pair| pair[0] == pair[1])
+    });
 }
 
-/// `agent`'s replicated rows on `node` and its applied index, from one
-/// store snapshot: its own but the dirty and seed rows its builder
-/// consumes at its own pace, its instances', and its committed rows.
+/// `agent`'s replicated rows on `node` ([`keys::is_replicated`]) and its
+/// applied index, from one store snapshot.
 fn replicated(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
     let snapshot = node.store().snapshot();
-    let local = [keys::dirty_prefix(), keys::seed_prefix()];
     let rows = [[0x00u8], [0x01], [0x03]]
         .iter()
         .flat_map(|prefix| snapshot.scan(agent, prefix, None).map(Result::unwrap))
-        .filter(|(key, _)| !local.iter().any(|prefix| key.starts_with(prefix)))
+        .filter(|(key, _)| keys::is_replicated(key))
         .collect();
     (snapshot.applied(agent).unwrap(), rows)
 }

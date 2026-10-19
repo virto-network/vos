@@ -324,9 +324,9 @@ struct Staged {
     dirtied: Vec<AgentId>,
     /// The agents the batch retired: nothing of theirs is applied.
     retired: Vec<AgentId>,
-    /// The prefixes of the rows a root build reads: dirty rows, and the
-    /// cuts it builds at.
-    dirty: [Vec<u8>; 2],
+    /// The prefixes of the rows that wake a root build: dirty rows, and
+    /// the cuts it builds at.
+    wakes: [Vec<u8>; 2],
 }
 
 impl Staged {
@@ -336,7 +336,7 @@ impl Staged {
             applied: HashMap::new(),
             dirtied: Vec::new(),
             retired: Vec::new(),
-            dirty: [vos_wire::keys::dirty_prefix(), vos_wire::keys::cuts()],
+            wakes: [vos_wire::keys::dirty_prefix(), vos_wire::keys::cuts()],
         }
     }
 
@@ -367,7 +367,7 @@ impl Staged {
                 batch.apply(*agent, *epoch, *index, writes);
                 raise(&mut self.applied, *agent, *index);
                 if writes.iter().any(|write| {
-                    self.dirty
+                    self.wakes
                         .iter()
                         .any(|prefix| write.key.starts_with(prefix))
                 }) {

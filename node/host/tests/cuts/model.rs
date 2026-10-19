@@ -39,7 +39,7 @@ use vos_wire::apply::{Host, State, apply};
 use vos_wire::defaults::MAX_CUTS;
 use vos_wire::ids::{AgentId, InstanceId, MapId, RequestId, WorkflowId};
 use vos_wire::keys::{self, Transform};
-use vos_wire::records::{PendingRead, unstored, unversioned};
+use vos_wire::records::{PendingRead, unstored};
 use vos_wire::result::{CommittedWrite, InputRef, Outcome, Run, Step, WorkResult, Write};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 
@@ -347,15 +347,12 @@ pub fn undos(snapshot: &Snapshot) -> BTreeMap<(u64, Vec<u8>), Vec<u8>> {
         .collect()
 }
 
-/// The agent's replicated rows: its own but the dirty and seed rows its
-/// root builder consumes, its instances', and its committed rows. Never
-/// the node-local rows under `0x02`.
+/// The agent's replicated rows ([`keys::is_replicated`]).
 pub fn replicated(snapshot: &Snapshot) -> Vec<(Vec<u8>, Vec<u8>)> {
-    let local = [keys::dirty_prefix(), keys::seed_prefix()];
     [[0x00u8], [0x01], [0x03]]
         .iter()
         .flat_map(|prefix| scan(snapshot, prefix))
-        .filter(|(key, _)| !local.iter().any(|prefix| key.starts_with(prefix)))
+        .filter(|(key, _)| keys::is_replicated(key))
         .collect()
 }
 
@@ -502,11 +499,4 @@ pub fn check_proof(history: &History, proof: &CutProof, window: u64, cut: u64, r
         .collect();
     vos_tree::verify_encoded(&Blake2b, &proof.rows_proof, &proof.agent_root, &claims)
         .expect("the rows' proof verifies against the root at the cut");
-}
-
-/// The bare value a stored committed row holds, and its writing version.
-pub fn committed_value(stored: &[u8]) -> (u64, Vec<u8>) {
-    let (version, value) =
-        unversioned(unstored(stored).expect("a stored row")).expect("a value row");
-    (version, value.to_vec())
 }

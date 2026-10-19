@@ -498,6 +498,14 @@ pub fn undo_prefix() -> Vec<u8> {
     TreeRow::Undo.prefix().to_vec()
 }
 
+/// The window and committed row an [`undo`] key names; `None` for any
+/// other key.
+pub fn undo_entry(key: &[u8]) -> Option<(u64, &[u8])> {
+    let rest = key.strip_prefix(&TreeRow::Undo.prefix())?;
+    let (window, row) = rest.split_first_chunk::<8>()?;
+    is_committed(row).then(|| (u64::from_be_bytes(*window), row))
+}
+
 /// The agent's root at the window `window`'s cut, and the cut's version,
 /// once the cut's build is done: node-local, kept for the two latest cuts.
 pub fn cut_root(window: u64) -> Vec<u8> {
@@ -507,6 +515,12 @@ pub fn cut_root(window: u64) -> Vec<u8> {
 /// The prefix of every [`cut_root`] row.
 pub fn cut_roots() -> Vec<u8> {
     TreeRow::CutRoot.prefix().to_vec()
+}
+
+/// The window a [`cut_root`] key names; `None` for any other key.
+pub fn cut_root_entry(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(&TreeRow::CutRoot.prefix())?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
 }
 
 /// A pending request's rows and their proof at its window's cut,
@@ -817,6 +831,21 @@ pub fn acked(to: AgentId) -> Vec<u8> {
 /// The agent's state version: applied, non-skipped work results.
 pub fn version() -> Vec<u8> {
     Row::Version.prefix().to_vec()
+}
+
+/// Whether `key` is a replicated row, the same on every replica at one
+/// applied version: the agent's own rows but the dirty and seed rows its
+/// root builder consumes at its own pace, its instances' rows and its
+/// committed rows; never the root builder's node-local rows under
+/// `0x02`.
+pub fn is_replicated(key: &[u8]) -> bool {
+    match key.first() {
+        Some(&owner) if owner == Owner::System as u8 => {
+            !key.starts_with(&Row::Dirty.prefix()) && !key.starts_with(&Row::Seed.prefix())
+        }
+        Some(&owner) => owner == Owner::Instance as u8 || owner == Owner::Committed as u8,
+        None => false,
+    }
 }
 
 /// Whether `key` lies inside `instance`'s own state: under

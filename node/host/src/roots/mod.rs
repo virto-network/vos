@@ -620,7 +620,7 @@ impl Build {
         let mut scan = self
             .at
             .scan(self.agent, &prefix, Some(&after))
-            .take_while(|row| row.as_ref().is_ok_and(|(key, _)| key < bound) || row.is_err());
+            .take_while(|row| !matches!(row, Ok((key, _)) if key >= bound));
         let last = loop {
             if found == self.batch || rows.len() == self.batch * ROWS_PER_KEY {
                 break scan.next().is_none();

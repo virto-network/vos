@@ -115,19 +115,14 @@ impl Leader {
                 self.backoff.reset();
                 self.inner.hooks.after_commit(self.id, self.applied)
             }
-            Ok(Ended::Lost | Ended::Skipped) => true,
-            Err(Fault::Storage(message)) => {
-                tracing::error!(
-                    agent = self.id.0,
-                    "a commit failed ({message}); the node stops and needs a restart"
-                );
-                self.inner.halt();
-                false
+            Ok(Ended::Lost) => true,
+            // Applied as no writes: tried again after a backoff.
+            Ok(Ended::Skipped) => {
+                let skipped = Fault::Infrastructure("a marker applied as no writes".into());
+                self.retry(Vec::new(), skipped).await;
+                true
             }
-            Err(Fault::Invariant(message)) => {
-                tracing::error!(agent = self.id.0, "{message}; the agent stops");
-                false
-            }
+            Err(fault) if self.ended_by(&fault) => false,
             Err(fault) => {
                 self.retry(Vec::new(), fault).await;
                 true

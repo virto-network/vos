@@ -27,6 +27,7 @@
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
 
+use crate::abi::cap::Target;
 use crate::ids::{Session, SessionId, SessionRef};
 use crate::keys::Due;
 use crate::records::{SessionMark, stored, stored_versioned, unstored};
@@ -136,7 +137,7 @@ impl Apply<'_> {
             [None, None, None] => Some(None),
             [Some(target), Some(space), Some(clock)] => {
                 let value = |bytes: &[u8]| unstored(bytes).map(<[u8]>::to_vec);
-                crate::abi::cap::Target::decode_exact(&value(&target)?)?;
+                Target::decode_exact(&value(&target)?)?;
                 let space = SpaceId::decode_exact(&value(&space)?)?;
                 let clock = WindowClock::decode_exact(&value(&clock)?)?;
                 Some((space != SpaceId::NONE).then_some(clock))

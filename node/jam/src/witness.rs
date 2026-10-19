@@ -20,8 +20,11 @@ pub(crate) fn witness(view: &View, simulation: &Simulation) -> Result<StateWitne
         vos_wire::keys::space(),
         vos_wire::keys::clock(),
     ];
-    let reads_record = record.iter().any(|key| simulation.reads.contains(key));
-    let extra = record.iter().filter(|_| reads_record);
+    let extra: &[Vec<u8>] = if record.iter().any(|key| simulation.reads.contains(key)) {
+        &record
+    } else {
+        &[]
+    };
     let mut keys: BTreeMap<&[u8], Opened> = BTreeMap::new();
     for key in simulation.reads.iter().chain(extra) {
         let opened = match (view.get(key)?, view.leaf(key)?) {
