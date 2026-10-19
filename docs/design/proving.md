@@ -1081,11 +1081,12 @@ counts as conjectured / proven at the reference shape [model]:
   names one AIR and one set of parameters". 40, spike 6a's blowup-64
   shape, is retired unregistered; 38 stays unassigned, the fixtures' "a
   number no format holds".
-- **24 to 27, 29, 31, 33 and 34 are retired.** 24 to 27 and 29 named the
-  segment AIR before its hardening, and 31, 33 and 34 the hardened AIR
-  with its unread columns (31 at 44 queries), so they are refused and
-  never registered again: a number names one AIR and one set of
-  parameters.
+- **24 to 27, 29, 31, 33, 34 and 40 are retired.** 24 to 27 and 29 named
+  the segment AIR before its hardening, and 31, 33 and 34 the hardened AIR
+  with its unread columns (31 at 44 queries); 40 was never registered,
+  but spike 6a's measured masked wrap at blowup 64 was made under it. They
+  are refused and never registered again: a number names one AIR and one
+  set of parameters.
 
 **A.5 What may leave the prover role (slice 6):**
 - the `Statement`;

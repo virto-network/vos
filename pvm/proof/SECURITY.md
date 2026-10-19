@@ -29,6 +29,7 @@ reference shape, from the security tool (`src/security.rs`):
 | 36 | segments, legacy encodings | Blake2s | 96 / 57 (at MOBILE) | 96 / — | admitted, legacy only |
 | 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | reserved: proved and verified inside the recursion, refused by every outside verifier |
 | 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted |
+| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | reserved: refused until its masked AIR, prover and verifier exist |
 | 37, 30 | device and credential proofs | Blake2s-M31 | 106 / 62 | 100 / 60 | reserved |
 
 - **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
@@ -37,7 +38,8 @@ reference shape, from the security tool (`src/security.rs`):
   DEEP, ALI and logup terms. The counts are the tool's own model, pinned by
   the format tests; no one outside has reviewed them.
 - A verifier rejects a number the registry does not admit, a retired one
-  (24 to 27, 29, 31, 33, 34) among them, and a proof on another channel
+  (24 to 27, 29, 31, 33, 34, and 40, the blowup-64 masked wrap a measured
+  proof was made under, never registered) among them, and a proof on another channel
   than its format's. Under every format but 36 the proof's configuration
   must equal the format's, and its counts at its own shape must reach the
   floors.
@@ -209,25 +211,78 @@ at the pin, are open.
 
 The workspace pins olanod/stwo at `ab294189` (`vos/wrap`). Its divergence
 log (`.claude/skills/paper-implementation-divergence-log.md`) holds two
-open items the wrap's count rests on:
+open items both wraps' counts rest on:
 
 - **DIVERGENCE-011:** the first FRI round folds by `2^fold_step`, the
   circle fold in it. The security tool counts it so; a model counting the
-  circle fold as its own round would differ by about 0.8 bits on format
-  28's fold term.
-- **DIVERGENCE-012:** affine DEEP batching, opt-in per format (28 alone),
+  circle fold as its own round would differ by about 0.8 bits on the fold
+  term. Format 39's FRI tests `2^17`, so its rounds are `[3, 3, 3, 2]` to
+  the `2^6` last layer, one more than 28's; its fold term sits 0.19 bits
+  above its batching term (82.98 against 82.79). Under the other model the
+  fold term would bind first, at about 82.2, still above 80. The round
+  list the tool counts must equal the one the fork's `FriVerifier::commit`
+  derives from the largest column.
+- **DIVERGENCE-012:** affine DEEP batching, opt-in per format (28 and 39),
   counted as `ε_lin(k)` by BCIKS20 Theorem 1.6. It carries the wrap from
   74.7 to 82.6 proven bits, and needs a cryptographer's review of the
   citation and the count: if it is wrong, the wrap is at 74.7, below its
   80-bit floor (the end-to-end bound, 62.86, is the inner formats' either
   way).
+  - **Format 39 rests on it more:** batched by powers, the batching term
+    caps 39 at 76.14 (73.64 at blowup 64), and at 28's own parameters
+    under masking that term is the one that binds (81.74).
+  - **Its premise in the masked transcript:** every batched function, the
+    masked columns' quotients, the FRI mask's and the blinding columns'
+    among them, is committed and every sample mixed before the affine
+    coefficients are drawn; the masked verifier takes the batching from
+    the format, never from the proof.
+  - **If it falls,** format 39 needs a new number: a batching-phase PoW of
+    at least 4 bits at blowup 32, or blowup 8 with 43 queries (about twice
+    the verify).
 
 ## Masking
 
-None yet. Every proof is unmasked: the wrap's witness (digests,
-positions, the io-hash, the fold word) and its trace are in the clear.
-Segment, leaf and fold proofs must never leave the prover role. Masking
-the wrap (with a new final format) is slice 6.
+None yet in a proof. Every proof is unmasked: the wrap's witness
+(digests, positions, the io-hash, the fold word) and its trace are in the
+clear. Segment, leaf and fold proofs must never leave the prover role.
+
+**Format 39,** the masked wrap, is registered and refused until its masked
+AIR, prover and verifier exist. Its count is the security tool's under
+masking variant (c) (`docs/design/research/slice-5/spike2-masking.md` §3b,
+`docs/design/research/slice-6/spike6b-masked-bits.md`):
+
+- **What (c) moves:** every main and interaction column is `f + v_H·r`, of
+  degree bound `2N` for a tallest component of `N` rows; the composition
+  is committed whole at `4N`, never split, and sampled at `π(z)`. So FRI
+  tests `k = 4N` at 39's blowup 32, the DEEP term takes `k = 2N`, `d = 3`
+  and a factor 2 for `π(z)`, and every other formula stays. The salts
+  enter no term (Blake2b-256's collision resistance, which the tool does
+  not model, binds them as it binds every tree).
+- **146 / 82.70** at 24 queries, PoW 26, the query term binding at
+  `m = 5`; 23 queries is the least that clears 80 (80.84). The DEEP term
+  is 97.68, ALI 108.38, logup 111.60: the interaction PoW does not bind.
+- **Derived, not cited:** the DEEP term's three (c) inputs (`k = 2N`,
+  `d = 3`, the factor `2^j`), against Theorem 8 of eprint 2022/1216 with
+  the AIR at level `m+1`, the composition at `π(z)` and lifted columns of
+  mixed degree. About 15 bits of slack: a factor of 2^10 would not move
+  the count.
+- **The lifted protocol:** the tool counts the lifted batch as one
+  Reed–Solomon code of dimension `4N`, each masked column's `2N` bound
+  enforced by one more doubling of its lift. Format 28 already rests on
+  this; no paper in the fork's canon analyses the lifted variant.
+- **The integer multiplicity:** counts are taken at the best integer
+  `m ≥ 3`, as soundcalc takes them, so a small parameter move jumps the
+  count (23 queries 80.84, 24 82.70).
+- **The reference shape** counts R2's blinding (12 main and 8 interaction
+  columns, 2 constraints, a fraction a row a component) and the FRI mask's
+  8 columns as designed, every column at two samples; it must equal the
+  shape derived from the built masked components. The blinding's own
+  soundness (a pole argument in the challenges) is counted only as logup
+  fractions.
+- **The masked verifier's shape** comes from its own layout (`k = 4N`
+  whole, `j = 1`), never from the helpers that subtract Stwo's
+  composition split (DIVERGENCE-004), which would count `k = 2N` and
+  overstate the batching term by about 1 bit.
 
 ## The external audit
 
@@ -237,7 +292,8 @@ Required before value rides on a proof. Its scope:
   a forgery gate;
 - the fork's divergences: the Blake2b channel, fold step 3, affine DEEP
   batching, the completeness backport;
-- the security tool's counts (`src/security.rs`);
+- the security tool's counts (`src/security.rs`), variant (c)'s among
+  them;
 - the recursion AIR: the in-AIR verifier, the gate compiler (constraint ≡
   gate), the claimed-sum handling, the `Gate` relation's signed
   multiplicities, the fold;

@@ -13,6 +13,7 @@
 //! | 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 |
 //! | 36 | segments, legacy encodings | Blake2s | the proof's own, 96 conjectured bits or more | 96 / — | MOBILE: 96 / 57 |
 //! | 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
+//! | 39 | the final wrap, masked | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
 //!
 //! - **The segment AIR** is the one every segment, leaf and device format
 //!   names: 35, 36 and 37 name its current form, without the columns and
@@ -21,19 +22,20 @@
 //!   registered again. 24 to 27 and 29 named it before its hardening (the
 //!   witness input, the removal of the curve chips, the AIR audit's fixes); 31,
 //!   33 and 34 named the hardened form with those columns, 31 at 44 queries.
-//!   28, 30 and 32 prove the recursion AIR (`vos-pvm-recair-air`) and keep their
-//!   numbers.
+//!   28, 30, 32 and 39 prove the recursion AIR (`vos-pvm-recair-air`) and
+//!   keep their numbers.
 //! - **36** is the Blake2s segment format the default entry points produce,
 //!   kept while the refine bundles, the chain proofs and their tests use it.
 //!   Its transcript has no interaction PoW and mixes the boundary states a
 //!   word at a time, and its parameters are the proof's own under the 96-bit
 //!   conjectured floor.
-//! - **28, 30, 32, 35 and 37** use the lossless encodings
+//! - **28, 30, 32, 35, 37 and 39** use the lossless encodings
 //!   ([`Encoding::Lossless`]) and exactly their parameters. 30 and 37 are
-//!   registered and refused until their AIRs and channels exist. 32 is
-//!   registered and refused although its AIR and channel exist: `vos-pvm-recair`
-//!   proves and verifies its proofs natively, pinning each circuit by its
-//!   hash, and no verifier outside the recursion reads a leaf or a fold. 28 is admitted:
+//!   registered and refused until their AIRs and channels exist, and 39 until
+//!   its masked AIR, prover and verifier do. 32 is registered and refused
+//!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
+//!   its proofs natively, pinning each circuit by its hash, and no verifier
+//!   outside the recursion reads a leaf or a fold. 28 is admitted:
 //!   `vos-pvm-recair` proves the wrap on the fork's Blake2b-256 channel and
 //!   `vos-pvm-final-verifier` verifies it, fold step 3 reviewed in the fork. A
 //!   segment verifier takes only a segment format ([`admitted_segment`]).
@@ -57,9 +59,23 @@
 //!   affinely when a configuration asks ([`FormatParams::batching`]), and
 //!   [`crate::security`] counts 82.6 at 20 queries (80 needs 19). Batching is
 //!   not in a proof's bytes: a verifier sets it from the format
-//!   ([`Format::verifier_config`]).
-//! - **The wrap is unmasked:** `masked` says what its proofs are, and
-//!   masking it is a format change.
+//!   ([`Format::verifier_config`]). 39 needs it too: batched by powers, it
+//!   caps at 76.14 at blowup 32 and 73.64 at blowup 64.
+//! - **The masked wrap** (39) is 28's AIR under masking variant (c)
+//!   (`research/slice-5/spike2-masking.md` §3b; [`crate::security`] counts
+//!   it): every main and interaction column masked to twice its rows'
+//!   degree, the preprocessed ones left as they are, the composition
+//!   committed whole at four times the tallest component's rows and sampled
+//!   at `π(z)`, R2's blinding, a FRI mask of eight columns and salted trees.
+//!   It takes a number of its own, as a bump of 28 would make one number
+//!   name two sets of parameters. Its FRI runs at blowup 32, where each
+//!   column's own extension is the size 28's is at 64, with 24 queries:
+//!   146 / 82 (82.70), the query term binding; 23 queries is the least that
+//!   clears 80 (80.84). Blowup 64 at 20 queries counts 81.74, its DEEP
+//!   batching term binding, at twice the prover's memory. Its proofs are a
+//!   fixed layout ([`ProofBytes::FixedLayout`]); 28's are postcard.
+//! - **`masked`** says what a format's proofs are: masking a format's proofs
+//!   is a format change.
 //! - **The bit counts** are [`crate::security`]'s, at each entry's reference
 //!   shape; the verifier counts again at the proof's own shape and refuses a
 //!   proof below either floor.
@@ -106,6 +122,18 @@ pub enum Encoding {
 /// values' count. A proof does not carry it: a verifier sets it from the
 /// format ([`Format::verifier_config`]).
 pub use stwo::core::pcs::DeepBatching;
+
+/// How a format's proofs are laid out in bytes when they leave the prover.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProofBytes {
+    /// The proof's serde form, the final wrap's as its postcard encoding:
+    /// varint lengths, whose canonical form a decoder checks by re-encoding.
+    Postcard,
+    /// The fields in a fixed order, little-endian, with explicit u32 counts
+    /// and no varints, every count checked against the format before any
+    /// allocation, nothing after the last field: one encoding a proof.
+    FixedLayout,
+}
 
 /// Whether a verifier accepts a format.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -176,6 +204,7 @@ pub struct Format {
     /// The parameters a proof must carry exactly, but for format 36, which
     /// takes the proof's own and records MOBILE's here.
     pub params: FormatParams,
+    pub bytes: ProofBytes,
     pub masked: bool,
     pub floor: SecurityFloor,
     pub status: Status,
@@ -239,6 +268,7 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
     constraints: 5_177,
     logup_fractions: 1_553_989_632,
     relation_width: SEGMENT_RELATION_WIDTH,
+    composition_point_doublings: 0,
 };
 
 /// Every chip of the segment AIR at 2^16 rows, a phone's segment.
@@ -262,6 +292,7 @@ pub const LEAF_FOLD_REFERENCE: SecurityShape = SecurityShape {
     constraints: 313,
     logup_fractions: (5 << 16) + (4 << 17) + (6 << 16),
     relation_width: RECURSION_RELATION_WIDTH,
+    composition_point_doublings: 0,
 };
 
 /// The wrap (`recursion-air.md` §7): the same AIR at 2^14, 2^15 and 2^11
@@ -272,6 +303,28 @@ pub const WRAP_REFERENCE: SecurityShape = SecurityShape {
     log_composition_degree_bound: 17,
     logup_fractions: (5 << 14) + (4 << 15) + (6 << 11),
     ..LEAF_FOLD_REFERENCE
+};
+
+/// The columns the masked wrap samples beyond [`WRAP_REFERENCE`]'s 458:
+/// R2's blinding, four main columns a component and, on `qm31` and `h8`, a
+/// pair column of four interaction columns; the composition's four columns
+/// whole where the split one had eight; and the FRI mask's eight. The salts
+/// are never sampled.
+const MASKED_WRAP_SAMPLED_COLUMNS: u64 = (3 * 4 + 2 * 4) + 4 + 8 - 8;
+
+/// The wrap masked under variant (c), format 39's reference: the AIR of
+/// [`WRAP_REFERENCE`] at its tallest component's 2^15 rows, its columns at
+/// degree bound 2^16, its composition whole at 2^17 and sampled at `π(z)`
+/// ([`SecurityShape::variant_c`]), plus what the masking commits beside it.
+/// Every sampled column is counted at two samples, as [`WRAP_REFERENCE`]
+/// counts its own. R2's blinding adds a fraction a row a component on a
+/// relation nothing else uses: `p2`'s pairs with its lone fraction, and
+/// `qm31`'s and `h8`'s take a new pair column and its constraint each.
+pub const MASKED_WRAP_REFERENCE: SecurityShape = SecurityShape {
+    sampled_values: WRAP_REFERENCE.sampled_values + 2 * MASKED_WRAP_SAMPLED_COLUMNS,
+    constraints: WRAP_REFERENCE.constraints + 2,
+    logup_fractions: (6 << 14) + (5 << 15) + (7 << 11),
+    ..WRAP_REFERENCE.variant_c()
 };
 
 /// The credential AIR (`proving.md` §8): the recursion AIR's `p2`, 354
@@ -285,6 +338,7 @@ pub const CREDENTIAL_REFERENCE: SecurityShape = SecurityShape {
     constraints: 303,
     logup_fractions: 5 << 14,
     relation_width: RECURSION_RELATION_WIDTH,
+    composition_point_doublings: 0,
 };
 
 /// Segments': fewer queries and more PoW than [`LEAF_FOLD_PARAMS`], for the
@@ -340,6 +394,7 @@ pub const LEGACY_SEGMENT: Format = Format {
         interaction_pow_bits: 0,
         batching: DeepBatching::Powers,
     },
+    bytes: ProofBytes::Postcard,
     masked: false,
     floor: SecurityFloor {
         conjectured: crate::proof::MIN_CONJECTURED_SECURITY_BITS,
@@ -359,6 +414,7 @@ pub const SEGMENT: Format = Format {
     channel: ChannelKind::Poseidon2M31,
     encoding: Encoding::Lossless,
     params: SEGMENT_PARAMS,
+    bytes: ProofBytes::Postcard,
     masked: false,
     floor: INNER_FLOOR,
     status: Status::Admitted,
@@ -381,6 +437,7 @@ pub const LEAF_FOLD: Format = Format {
     channel: ChannelKind::Poseidon2M31,
     encoding: Encoding::Lossless,
     params: LEAF_FOLD_PARAMS,
+    bytes: ProofBytes::Postcard,
     masked: false,
     floor: INNER_FLOOR,
     status: Status::Reserved,
@@ -405,6 +462,7 @@ pub const WRAP: Format = Format {
         interaction_pow_bits: 8,
         batching: DeepBatching::Affine,
     },
+    bytes: ProofBytes::Postcard,
     masked: false,
     floor: SecurityFloor {
         conjectured: 100,
@@ -418,12 +476,35 @@ pub const WRAP: Format = Format {
     },
 };
 
+/// The final wrap, masked: see the module's notes.
+pub const MASKED_WRAP: Format = Format {
+    number: 39,
+    kind: ProofKind::Wrap,
+    channel: ChannelKind::Blake2b256,
+    encoding: Encoding::Lossless,
+    params: FormatParams {
+        log_blowup: 5,
+        n_queries: 24,
+        ..WRAP.params
+    },
+    bytes: ProofBytes::FixedLayout,
+    masked: true,
+    floor: WRAP.floor,
+    status: Status::Reserved,
+    reference: MASKED_WRAP_REFERENCE,
+    bits: SecurityBits {
+        conjectured: 146,
+        proven: 82,
+    },
+};
+
 pub const DEVICE_PROOF: Format = Format {
     number: 37,
     kind: ProofKind::Device,
     channel: ChannelKind::Blake2sM31,
     encoding: Encoding::Lossless,
     params: DEVICE,
+    bytes: ProofBytes::Postcard,
     masked: true,
     floor: INNER_FLOOR,
     status: Status::Reserved,
@@ -440,6 +521,7 @@ pub const CREDENTIAL_PROOF: Format = Format {
     channel: ChannelKind::Blake2sM31,
     encoding: Encoding::Lossless,
     params: DEVICE,
+    bytes: ProofBytes::Postcard,
     masked: true,
     floor: INNER_FLOOR,
     status: Status::Reserved,
@@ -451,22 +533,28 @@ pub const CREDENTIAL_PROOF: Format = Format {
 };
 
 /// Every registered format, by number.
-pub const REGISTRY: [Format; 6] = [
+pub const REGISTRY: [Format; 7] = [
     WRAP,
     CREDENTIAL_PROOF,
     LEAF_FOLD,
     SEGMENT,
     LEGACY_SEGMENT,
     DEVICE_PROOF,
+    MASKED_WRAP,
 ];
 
-/// The numbers whose AIR a later format superseded: 24 and its Poseidon2-M31
-/// variant 25, and 26, 27 and 29, the registry's first segment, leaf and
-/// device formats, all of the segment AIR before its hardening; 31, 33 and
-/// 34, the segment, legacy and device formats of the hardened AIR with the
-/// columns no constraint reads. Each is refused and never registered again,
-/// so a number names one AIR and one set of parameters.
-pub const RETIRED: [u32; 8] = [24, 25, 26, 27, 29, 31, 33, 34];
+/// The numbers no format takes again, each refused:
+/// - **superseded AIRs:** 24 and its Poseidon2-M31 variant 25, and 26, 27
+///   and 29, the registry's first segment, leaf and device formats, all of
+///   the segment AIR before its hardening; 31, 33 and 34, the segment,
+///   legacy and device formats of the hardened AIR with the columns no
+///   constraint reads;
+/// - **40, never registered:** the masked wrap at blowup 64 and 20 queries,
+///   proved and measured as a candidate for 39. A proof was made under it,
+///   so no later format takes it.
+///
+/// So a number names one AIR and one set of parameters.
+pub const RETIRED: [u32; 9] = [24, 25, 26, 27, 29, 31, 33, 34, 40];
 
 /// The entry for `number`, admitted or not.
 pub fn lookup(number: u32) -> Option<&'static Format> {
@@ -482,7 +570,7 @@ pub fn admitted(number: u32) -> Result<&'static Format, alloc::string::String> {
             format.kind
         )),
         None if RETIRED.contains(&number) => Err(alloc::format!(
-            "proof format {number} is retired: its AIR is superseded"
+            "proof format {number} is retired: no format takes it again"
         )),
         None => Err(alloc::format!("proof format {number} is not registered")),
     }
@@ -500,6 +588,10 @@ pub fn admitted_segment(number: u32) -> Result<&'static Format, alloc::string::S
     }
     Ok(format)
 }
+
+#[cfg(test)]
+#[path = "format_masked_tests.rs"]
+mod masked_tests;
 
 #[cfg(test)]
 mod tests {
@@ -576,6 +668,7 @@ mod tests {
                 (35, 104, 62),
                 (36, 96, 57),
                 (37, 106, 62),
+                (39, 146, 82),
             ]
         );
         assert!(REGISTRY.iter().all(Format::meets_floors));
