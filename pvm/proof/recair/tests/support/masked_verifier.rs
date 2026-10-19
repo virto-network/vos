@@ -4,8 +4,10 @@
 //! public API. The venues' verifier is `vos-pvm-final-verifier`'s; this one
 //! checks the prover's proofs until that one reads them.
 //!
-//! Included by path (`vos-pvm-recair`'s unit tests, `vos-pvm-proof`'s kernel
-//! tests), so it names only the crates both have.
+//! Included by path in integration tests (`vos-pvm-recair`'s circuit tests,
+//! `vos-pvm-proof`'s kernel tests), so it names only the crates both have.
+//! Step 6.4's masked final verifier replaces it, and this file is deleted
+//! then.
 
 #![allow(dead_code)]
 

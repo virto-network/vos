@@ -504,13 +504,14 @@ pub fn prove_fold(
 /// the Blake2b-256 channel within 2^17 rows and 8 GiB of heap, and verified
 /// by `vos-pvm-final-verifier`, its statement the program's id and the root's
 /// io-hash: the proof's bytes (postcard) and its public words; its proving
-/// time and peak heap added to `wrap`. The same witness is proved masked
-/// under format 39 as well ([`masked_wrap`]).
+/// time and peak heap added to `wrap`. With `masked`, the same witness is
+/// proved masked under format 39 as well ([`masked_wrap`]).
 pub fn wrap_root(
     name: &str,
     program: &vos_pvm_proof::program_id::KernelProgram,
     root: &NodeRun,
     wrap: &mut Tally,
+    masked: bool,
 ) -> (Vec<u8>, [u32; vos_pvm_final_verifier::PUBLIC_WORDS]) {
     use vos_pvm_recair::wrap::{self, WrapCircuit};
 
@@ -541,7 +542,9 @@ pub fn wrap_root(
     assert_eq!(verified, statement);
     assert_eq!(statement.program, program.id().0.map(|word| word.0));
     assert_eq!(statement.io_hash, root.node.output.io_hash);
-    masked_wrap(name, &finalized, &words);
+    if masked {
+        masked_wrap(name, &finalized, &words);
+    }
     (bytes, words)
 }
 
@@ -563,9 +566,9 @@ fn resident_peak_mib(reset: bool) -> u64 {
 
 /// A finalized wrap circuit's witness proved masked under format 39
 /// (`vos_pvm_recair::wrap::prove`), within 4.5 GiB of heap and 8 GiB of
-/// resident memory, and verified by the tests' masked verifier, its
-/// preprocessed root format 28's (pin A): its proving time, R1's time and
-/// the revealed rows printed with the load average.
+/// resident memory, its revealed functionals within pin A's count, and
+/// verified by the tests' masked verifier, its preprocessed root format 28's
+/// (pin A): its proving time and R1's printed with the load average.
 fn masked_wrap(
     name: &str,
     finalized: &vos_pvm_recair::Finalized<stwo::core::fields::qm31::SecureField>,
@@ -584,7 +587,7 @@ fn masked_wrap(
     let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
     resident_peak_mib(true);
     let ((proof, stats), proving, peak_mib) = measured(|| {
-        vos_pvm_recair::wrap::prove_masked(finalized, &MaskRng::new(), |_| {})
+        vos_pvm_recair::wrap::prove_masked(finalized, MaskRng::default(), |_| {})
             .expect("the masked wrap proves")
     });
     let resident_mib = resident_peak_mib(false);
@@ -602,7 +605,9 @@ fn masked_wrap(
     );
     assert!(peak_mib <= 4608, "{peak_mib} MiB of heap");
     assert!(resident_mib <= 8 << 10, "{resident_mib} MiB resident");
-    assert!(stats.revealed_rows <= 256, "{stats:?}");
+    // Pin A's count of the revealed functionals: `2(4|O| + q(|O| + 1))`
+    // at `q = 24` and `|O| = 2`, the budget `h = 256` covers twice.
+    assert!(stats.revealed_rows <= 160, "{stats:?}");
     assert_eq!(proof.format_version, MASKED_WRAP.number);
     assert_eq!(
         proof.stark_proof.commitments[0],

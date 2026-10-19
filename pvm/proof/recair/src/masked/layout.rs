@@ -128,14 +128,15 @@ impl MaskLayout {
                 "a column of another size than its layout",
             ));
         }
-        let mut coefficients = vec![BaseField::zero(); 2 << self.log_size];
+        let mut column = BaseColumn::zeros(2 << self.log_size);
+        let coefficients = column.as_mut_slice();
         for (value, &position) in poly.coeffs.as_slice().iter().zip(&self.lower) {
             coefficients[position] = *value;
         }
         for &position in &self.upper {
             coefficients[position] = rng.r#gen::<BaseField>();
         }
-        Ok(CircleCoefficients::new(BaseColumn::from_cpu(&coefficients)))
+        Ok(CircleCoefficients::new(column))
     }
 }
 
@@ -156,7 +157,7 @@ pub(crate) fn layouts(
 /// Each of `polys` masked by its size's layout, in parallel, one 32-byte
 /// seed a column drawn from `rng` in order.
 pub(crate) fn mask_columns(
-    polys: &[CircleCoefficients<SimdBackend>],
+    polys: &[&CircleCoefficients<SimdBackend>],
     layouts: &[MaskLayout],
     rng: &mut ChaCha20Rng,
 ) -> Result<Vec<CircleCoefficients<SimdBackend>>, ProveError> {

@@ -212,32 +212,51 @@ pub struct MaskStats {
 
 /// Proves `trace` masked under `format`, a masked format that pins its
 /// masking, as the component set `C` on `MC`'s trees and channel, its
-/// randomness from `rng` hedged with the main columns' digest.
+/// randomness from `rng` hedged with the statement's and the main columns'
+/// digest.
+///
+/// The claimed sums are blinded (R2) by values summing to zero, so their
+/// total is the unblinded one. A set of one component is therefore left
+/// unblinded: its claimed sum is in the clear, and its verifier must check
+/// it against a public total (`claimed + public = 0`), which makes it
+/// public; a verifier that checks no total would leave a witness-dependent
+/// value in the clear.
 pub fn prove_masked<MC: MerkleChannel, C: MaskedProvers>(
     format: &Format,
     trace: MaskedTrace<'_, C::Relations>,
-    rng: &MaskRng,
+    rng: MaskRng,
 ) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
     let masking = match format.masking {
         Some(masking) if format.masked => masking,
-        _ => return Err(ProveError::Masking("the format pins no masking")),
+        _ => return Err(ProveError::UnmaskedFormat),
     };
     if trace.main.len() != trace.log_sizes.len() || trace.log_sizes.is_empty() {
-        return Err(ProveError::Masking("a main trace a component"));
+        return Err(ProveError::TraceShape(
+            "one main trace per component expected",
+        ));
     }
     let composition = trace
         .log_sizes
         .iter()
         .max()
         .and_then(|log_size| log_size.checked_add(MASKED_LOG_CONSTRAINT_EXPANSION))
-        .ok_or(ProveError::Masking("the composition's level"))?;
+        .ok_or(ProveError::TraceShape("a component's log size overflows"))?;
     let lifting = composition + format.params.log_blowup;
     let twiddles =
         SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
-    let witness = rng::witness_digest(&trace.main);
+    let witness = rng::witness_digest(
+        &rng::Statement {
+            format,
+            masking: &masking,
+            log_sizes: trace.log_sizes,
+            channel: core::any::type_name::<MC>(),
+            public: trace.public,
+        },
+        &trace.main,
+    );
     let layouts = layout::layouts(trace.log_sizes, masking.log_mask_rows)?;
     let preprocessed: Vec<CircleCoefficients<SimdBackend>> =
         SimdBackend::interpolate_columns(trace.preprocessed, &twiddles)
@@ -250,8 +269,8 @@ where
             .iter()
             .any(|column| column.domain.log_size() != log_size)
         {
-            return Err(ProveError::Masking(
-                "a main column off its component's size",
+            return Err(ProveError::TraceShape(
+                "a main column of another size than its component",
             ));
         }
         main.push(SimdBackend::interpolate_columns(columns, &twiddles));
@@ -329,13 +348,18 @@ where
     builder.commit(channel);
 
     let blinding = blinding(log_sizes.len(), rng);
-    let mut columns = Vec::new();
-    for ((polys, &log_size), &value) in main.iter().zip(log_sizes).zip(&blinding) {
-        columns.extend(polys.iter().cloned());
-        columns.extend(blinding_polys(value, log_size, twiddles));
-    }
+    let blinding_columns: Vec<Vec<CircleCoefficients<SimdBackend>>> = blinding
+        .iter()
+        .zip(log_sizes)
+        .map(|(&value, &log_size)| blinding_polys(value, log_size, twiddles))
+        .collect();
+    let columns: Vec<&CircleCoefficients<SimdBackend>> = main
+        .iter()
+        .zip(&blinding_columns)
+        .flat_map(|(own, blinding)| own.iter().chain(blinding))
+        .collect();
     let masked = layout::mask_columns(&columns, layouts, rng)?;
-    drop(columns);
+    drop(blinding_columns);
     salts::commit_salted(
         &mut scheme,
         masked,
@@ -364,7 +388,9 @@ where
         .collect();
     let interaction_columns = interaction(&relations, &fractions);
     if interaction_columns.len() != log_sizes.len() {
-        return Err(ProveError::Masking("an interaction trace a component"));
+        return Err(ProveError::TraceShape(
+            "one interaction trace per component expected",
+        ));
     }
     let claimed_sums: Vec<SecureField> = interaction_columns.iter().map(|(_, sum)| *sum).collect();
     let polys = SimdBackend::interpolate_columns(
@@ -374,7 +400,7 @@ where
             .collect(),
         twiddles,
     );
-    let masked = layout::mask_columns(&polys, layouts, rng)?;
+    let masked = layout::mask_columns(&polys.iter().collect::<Vec<_>>(), layouts, rng)?;
     drop(polys);
     channel.mix_felts(&claimed_sums);
     salts::commit_salted(
@@ -386,12 +412,16 @@ where
         channel,
     );
 
-    let set = C::new(&relations, &blind, log_sizes, &claimed_sums)
-        .ok_or(ProveError::Masking("the component set refuses its sizes"))?;
+    let set = C::new(&relations, &blind, log_sizes, &claimed_sums).ok_or(
+        ProveError::TraceShape("the component set refuses its log sizes or claimed sums"),
+    )?;
     if air::composition_log_degree_bound(&set) != Some(composition) {
-        return Err(ProveError::Masking("the set's composition bound"));
+        return Err(ProveError::Masking(
+            "the set's composition bound is not its tallest log size plus 2",
+        ));
     }
-    let air_level = air::air_log_size(&set).ok_or(ProveError::Masking("the AIR's level"))?;
+    let air_level =
+        air::air_log_size(&set).ok_or(ProveError::Masking("the set has no AIR level"))?;
     let lifted: Vec<Lifted<'_>> = set
         .provers()
         .into_iter()
@@ -413,7 +443,9 @@ where
         format.params.log_blowup,
     );
     if composition_poly.log_size() != composition {
-        return Err(ProveError::Masking("the composition's size"));
+        return Err(ProveError::Masking(
+            "the composition polynomial is not at its bound",
+        ));
     }
     let mut polys = composition_poly.into_coordinate_polys().to_vec();
     let seeds: Vec<[u8; 32]> = (0..masking.fri_mask_columns).map(|_| rng.r#gen()).collect();
@@ -432,8 +464,9 @@ where
     );
 
     let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
-    let points = air::sample_points(&set, oods_point, &pins)
-        .ok_or(ProveError::Masking("the set's masks do not fit its trees"))?;
+    let points = air::sample_points(&set, oods_point, &pins).ok_or(ProveError::Masking(
+        "the set's mask points do not fit its trees",
+    ))?;
     let fits = points.len() == scheme.trees.len()
         && points
             .iter()
@@ -447,7 +480,7 @@ where
     });
     if !fits || !salts_unsampled {
         return Err(ProveError::Masking(
-            "the sample points do not fit the trees",
+            "the sample points do not fit the trees, or a salt is sampled",
         ));
     }
     let extended = scheme.prove_values(points.clone(), channel);
@@ -457,8 +490,9 @@ where
         components: lifted.iter().map(|c| c as &dyn Component).collect(),
         n_preprocessed_columns: provers.n_preprocessed_columns,
     };
-    let composition_value = air::composition_oods_eval(&stark_proof.sampled_values)
-        .ok_or(ProveError::Masking("the composition's samples"))?;
+    let composition_value = air::composition_oods_eval(&stark_proof.sampled_values).ok_or(
+        ProveError::Masking("the composition's coordinates are not sampled once each"),
+    )?;
     if composition_value
         != components.eval_composition_polynomial_at_point(
             oods_point,
@@ -479,7 +513,9 @@ where
         lifting,
         masking.log_mask_rows,
     )
-    .ok_or(ProveError::Masking("the revealed functionals' classes"))?;
+    .ok_or(ProveError::Masking(
+        "R1's column classes do not fit the sample points",
+    ))?;
     let stats = MaskStats {
         attempts: 0,
         rank_check: started.elapsed(),

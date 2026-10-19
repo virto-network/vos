@@ -309,11 +309,16 @@ from the proof.
 
 - **R4, hedged:** ChaCha20 seeded with
   `BLAKE2b-256("vos/mask/seed/v1" ‖ 32 OS bytes ‖ witness digest ‖ attempt as u32 LE)`;
-  the witness digest is `BLAKE2b-256("vos/mask/witness/v1" ‖ each main
-  column's BLAKE2b-256)`, over the unmasked main columns in commitment
-  order, every private value of the witness among them, whatever the
-  component set [built at 6.3; proposed first as the root node's proof
-  bytes and output preimage, which only the wrap has]. Every mask, salt,
+  the witness digest is `BLAKE2b-256("vos/mask/witness/v1" ‖ the
+  statement ‖ each main column's BLAKE2b-256)`: the statement's words (the
+  format's number, its configuration, masking and interaction PoW, the log
+  sizes), the Merkle channel's name and the public values, then the
+  unmasked main columns in commitment order, every private value of the
+  witness among them, whatever the component set; so one witness proved
+  under two formats or channels from a replayed OS state never reuses a
+  mask [built at 6.3, the statement bound at its review; proposed first as
+  the root node's proof bytes and output preimage, which only the wrap
+  has]. Every mask, salt,
   R column and blinding value is drawn from it.
 - **R1:** for every column class (level, quotient lift, offset set), the
   randomizer's revealed functionals (4 an OODS point, the decommitments,
@@ -679,7 +684,11 @@ Throwaway code on local branches; each with a gate and a fallback.
     segment chips under (c) [done: 5,177 constraints, none above 3]. What
     slice 7's masked segments need beyond it (6.2's review): an
     active-chip mask parameter on `MaskedComponents`, and a finalize hook
-    on `Body` if a chip stops finalizing in pairs;
+    on `Body` if a chip stops finalizing in pairs; and (6.3's review) a
+    size floor or a per-component `h`, since `MaskLayout::new` needs
+    `log_size ≥ log_mask_rows + 2` (2^10 rows at h = 256) and segment chips
+    run below it; at q = 40 and |O| = 2 the segments reveal 128 rows, within
+    h = 256 with the 2× headroom exactly;
   - the stale-fixture test: leaf, fold and wrap fixtures, `H_fold` and the
     program ids byte for byte;
   - **the masked reference shape from the built components:** the masked
@@ -747,8 +756,10 @@ Throwaway code on local branches; each with a gate and a fallback.
     columns, before any Stwo call; the spike's call to format 28's
     `check_shape` replaced by format 39's own;
   - the proof's `log_sizes` checked equal to the format's pin (`[14, 15,
-    11]`) before `MaskedComponents::new`, which cannot; the salts, `R` and
-    `h` taken from the format (6.3), never from the proof;
+    11]`) before `MaskedComponents::new`, which cannot, and the trees'
+    widths before any Stwo call (the tests' verifier's `fits` check, 6.3,
+    is the model); the salts, `R` and `h` taken from the format (6.3),
+    never from the proof;
   - **the shape tied to the transcript:** `n_deep_values` of the
     verifier's own sample points asserted equal to 538, the reference's
     `B`;
@@ -809,6 +820,12 @@ Throwaway code on local branches; each with a gate and a fallback.
 - **Gate:** every fixture judged alike natively, in Wasm (PVF and client)
   and on the JAM-only host; the JAM program's size recorded against 512
   KiB and 4,000,000 bytes.
+- **Format 28 kept out of production by the accepted set** (6.3's
+  review): the prover side stays open, `wrap::prove_unmasked` and
+  `prove_on(&WRAP, …)` reachable for the tests and the fixtures; the
+  venues' accepted set {39} (28 only under `test-formats` and the model
+  venue's test policy) is the one gate, and this step's transition and
+  adversarial cases hold it.
 - **Review:** Fable as well: the check order, the accepted set and the
   adversarial cases are protocol every venue inherits (a proof checked
   before `seen` is a denial-of-service vector).

@@ -81,7 +81,7 @@ fn circuit(seed: u64) -> Finalized<SecureField> {
 fn prove(
     format: &Format,
     finalized: &Finalized<SecureField>,
-    rng: &MaskRng,
+    rng: MaskRng,
 ) -> Result<RecairProof<<Blake2bMerkleChannel as MerkleChannel>::H>, ProveError> {
     prove_masked_on::<Blake2bMerkleChannel>(
         format,
@@ -199,14 +199,14 @@ fn the_mask_keeps_the_column_on_its_domain() {
 fn r1_refuses_too_small_a_randomizer() {
     let finalized = circuit(1);
     assert!(matches!(
-        prove(&small_format(6, 8, 24), &finalized, &MaskRng::new()),
+        prove(&small_format(6, 8, 24), &finalized, MaskRng::default()),
         Err(ProveError::MaskRank)
     ));
     let (_, stats) = prove_masked_on::<Blake2bMerkleChannel>(
         &format(),
         &finalized.circuit,
         &finalized.witness,
-        &MaskRng::new(),
+        MaskRng::default(),
         |_| {},
     )
     .unwrap();
@@ -277,14 +277,14 @@ fn fri_mask_coefficients_independent() {
     let finalized = circuit(2);
     let eight = format();
     for _ in 0..4 {
-        let proof = prove(&eight, &finalized, &MaskRng::new()).unwrap();
+        let proof = prove(&eight, &finalized, MaskRng::default()).unwrap();
         verify(&eight, &proof).unwrap();
         let coefficients = fri_mask_coefficients(&eight, &proof);
         assert_eq!(coefficients.len(), 8);
         assert!(spans_qm31(&coefficients));
     }
     let four = small_format(6, 4, 4);
-    let proof = prove(&four, &finalized, &MaskRng::new()).unwrap();
+    let proof = prove(&four, &finalized, MaskRng::default()).unwrap();
     verify(&four, &proof).unwrap();
     let mut coefficients = fri_mask_coefficients(&four, &proof);
     assert_eq!(coefficients.len(), 4);
@@ -304,7 +304,7 @@ fn an_invalid_witness_is_refused() {
             &format(),
             &finalized.circuit,
             &finalized.witness,
-            &MaskRng::new(),
+            MaskRng::default(),
             |main| main.columns[component][column][3] += BaseField::one(),
         );
         assert!(
@@ -317,14 +317,16 @@ fn an_invalid_witness_is_refused() {
         );
     }
     assert!(matches!(
-        prove(&vos_pvm_proof::format::WRAP, &finalized, &MaskRng::new()),
-        Err(ProveError::Masking(_))
+        prove(&vos_pvm_proof::format::WRAP, &finalized, MaskRng::default()),
+        Err(ProveError::UnmaskedFormat)
     ));
 }
 
 /// The recursion AIR's `p2` alone: a component set of one, which the masked
 /// prover takes as it takes the wrap's. A set of one is not blinded, its
-/// claimed sum alone in the transcript.
+/// claimed sum in the clear; this test's verifier checks no logup total
+/// (`p2`'s relation does not balance alone), so it tests the transcript,
+/// not zero knowledge.
 struct P2Only {
     p2: FrameworkComponent<MaskedEval<P2Eval>>,
     log_sizes: [u32; 1],
@@ -412,7 +414,7 @@ fn the_masked_prover_is_generic() {
                 public: &finalized.witness.outputs,
                 interaction: &interaction,
             },
-            &MaskRng::new(),
+            MaskRng::default(),
         )
         .unwrap()
         .0
@@ -465,7 +467,7 @@ fn the_masked_prover_is_generic() {
 fn every_masked_value_is_fresh_and_the_seam_reproduces_bytes() {
     let finalized = circuit(5);
     let format = format();
-    let [first, second] = [(); 2].map(|_| prove(&format, &finalized, &MaskRng::new()).unwrap());
+    let [first, second] = [(); 2].map(|_| prove(&format, &finalized, MaskRng::default()).unwrap());
     for proof in [&first, &second] {
         verify(&format, proof).unwrap();
     }
@@ -482,7 +484,7 @@ fn every_masked_value_is_fresh_and_the_seam_reproduces_bytes() {
     }
 
     let bytes =
-        |rng: MaskRng| postcard::to_allocvec(&prove(&format, &finalized, &rng).unwrap()).unwrap();
+        |rng: MaskRng| postcard::to_allocvec(&prove(&format, &finalized, rng).unwrap()).unwrap();
     let seeded = bytes(MaskRng::Seeded(7));
     assert_eq!(seeded, bytes(MaskRng::Seeded(7)));
     assert_ne!(seeded, bytes(MaskRng::Seeded(8)));

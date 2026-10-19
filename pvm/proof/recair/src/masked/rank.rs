@@ -112,11 +112,13 @@ pub(crate) fn revealed_functionals(
 
                 let column_lift = composition.checked_sub(level)?;
                 let shift_lift = air_level.checked_sub(log_size)?;
-                let mut secure: Vec<CirclePoint<SecureField>> = column_points
-                    .iter()
-                    .map(|point| point.repeated_double(column_lift))
-                    .collect();
-                secure.dedup();
+                let mut secure: Vec<CirclePoint<SecureField>> = Vec::new();
+                for point in column_points {
+                    let lifted = point.repeated_double(column_lift);
+                    if !secure.contains(&lifted) {
+                        secure.push(lifted);
+                    }
+                }
                 let mut base: Vec<CirclePoint<BaseField>> = Vec::new();
                 let mut push = |point: CirclePoint<BaseField>| {
                     if !base.contains(&point) {
@@ -229,4 +231,54 @@ pub fn rank_m31(mut rows: Vec<Vec<BaseField>>) -> usize {
         rank += 1;
     }
     rank
+}
+
+#[cfg(test)]
+mod tests {
+    use stwo::core::circle::M31_CIRCLE_GEN;
+
+    use super::*;
+
+    const LOG_SIZE: u32 = 9;
+    const LOG_MASK_ROWS: u32 = 4;
+
+    /// The `h` points of the circle's subgroup of order `h`: a degenerate
+    /// set, on which the size-`h` basis satisfies a relation, so `h`
+    /// functionals there have rank below `h`.
+    #[test]
+    fn the_subgroup_of_order_h_is_dependent() {
+        let generator = M31_CIRCLE_GEN.repeated_double(31 - LOG_MASK_ROWS);
+        let points: Vec<CirclePoint<BaseField>> = (0..1usize << LOG_MASK_ROWS)
+            .map(|k| generator.mul(k as u128))
+            .collect();
+        assert!(!full_rank(LOG_SIZE, LOG_MASK_ROWS, &[], &points));
+    }
+
+    /// The `h` points of a coset off the trace domain, on which the size-`h`
+    /// basis interpolates: full rank; and one more point is one row too many.
+    #[test]
+    fn a_coset_of_h_points_is_independent() {
+        let coset = CanonicCoset::new(LOG_MASK_ROWS).coset;
+        let mut points: Vec<CirclePoint<BaseField>> = coset.iter().collect();
+        assert!(full_rank(LOG_SIZE, LOG_MASK_ROWS, &[], &points));
+        points.truncate(points.len() - 1);
+        let z = CirclePoint::<SecureField>::get_point(98_765);
+        assert!(!full_rank(LOG_SIZE, LOG_MASK_ROWS, &[z], &points));
+        points.truncate(points.len() - 3);
+        assert!(full_rank(LOG_SIZE, LOG_MASK_ROWS, &[z], &points));
+    }
+
+    #[test]
+    fn rank_m31_counts_independent_rows() {
+        let row = |values: [u32; 3]| values.map(BaseField::from).to_vec();
+        assert_eq!(
+            rank_m31(vec![row([1, 2, 3]), row([2, 4, 6]), row([0, 1, 1])]),
+            2
+        );
+        assert_eq!(
+            rank_m31(vec![row([1, 0, 0]), row([0, 1, 0]), row([0, 0, 1])]),
+            3
+        );
+        assert_eq!(rank_m31(vec![row([0, 0, 0])]), 0);
+    }
 }

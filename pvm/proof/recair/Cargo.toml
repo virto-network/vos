@@ -32,7 +32,7 @@ rayon = { workspace = true }
 
 [features]
 # The masked prover's seeded randomness (`MaskRng::Seeded`), for the
-# fixtures' generator alone: no production build enables it (`just
+# prover's tests (a dev edge): no production build enables it (`just
 # check-no-seeded-masks`).
 seeded-masks = []
 

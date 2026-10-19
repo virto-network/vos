@@ -129,12 +129,13 @@ check-no-faults:
 
 # The masked prover's seeded randomness (`vos-pvm-recair`'s `seeded-masks`,
 # `MaskRng::Seeded`) reaches no production build: no normal or build edge
-# of the `vos` command, the node or the agent enables it (the fixtures'
-# generator and the prover's tests enable it on a dev edge), and the proof
-# crate's `debug-internals` does not imply it.
+# of any workspace member, nor of the workspaces built apart (the agent,
+# the fuzz targets, the final verifier's Wasm blob and its runner), enables
+# it (the prover's tests enable it on a dev edge), and the proof crate's
+# `debug-internals` does not imply it.
 check-no-seeded-masks:
-    for package in [vos-cli vos-node] { if (cargo tree -p $package -e features,no-dev | str contains 'feature "seeded-masks"') { error make { msg: $"($package)'s build enables seeded masks" } } }
-    if (cargo tree --manifest-path agent/default/Cargo.toml -e features,no-dev | str contains 'feature "seeded-masks"') { error make { msg: "the agent's build enables seeded masks" } }
+    if (cargo tree --workspace -e features,no-dev | str contains 'feature "seeded-masks"') { error make { msg: "a workspace member's build enables seeded masks" } }
+    for manifest in [agent/default pvm/proof/fuzz pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { if (cargo tree --manifest-path $"($manifest)/Cargo.toml" -e features,no-dev | str contains 'feature "seeded-masks"') { error make { msg: $"($manifest)'s build enables seeded masks" } } }
     if (open pvm/proof/Cargo.toml | get features.debug-internals | any {|feature| $feature | str contains 'seeded-masks' }) { error make { msg: "debug-internals implies seeded masks" } }
     print "no seeded masks in a production build"
 

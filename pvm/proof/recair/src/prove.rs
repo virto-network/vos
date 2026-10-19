@@ -86,6 +86,12 @@ pub enum ProveError {
     /// R1 refused every attempt's masks
     /// ([`crate::masked::MAX_ATTEMPTS`]).
     MaskRank,
+    /// A masked prove under a format that pins no masking.
+    UnmaskedFormat,
+    /// An unmasked prove under a masked format.
+    MaskedFormat,
+    /// The caller's trace does not fit its component set.
+    TraceShape(&'static str),
     /// The masking cannot be laid out for the format and the component set.
     Masking(&'static str),
     /// The operating system's randomness is unavailable.
@@ -98,6 +104,9 @@ impl core::fmt::Display for ProveError {
             Self::Wiring(error) => write!(f, "the wiring: {error}"),
             Self::Stwo(error) => write!(f, "Stwo proving: {error}"),
             Self::MaskRank => f.write_str("the masks' revealed functionals stayed dependent"),
+            Self::UnmaskedFormat => f.write_str("the format pins no masking"),
+            Self::MaskedFormat => f.write_str("a masked format proves through the masked prover"),
+            Self::TraceShape(what) => write!(f, "the trace: {what}"),
             Self::Masking(what) => write!(f, "the masking: {what}"),
             Self::Entropy => f.write_str("no randomness from the operating system"),
         }
@@ -207,7 +216,7 @@ where
     SimdBackend: BackendForChannel<MC>,
 {
     if format.masked {
-        return Err(ProveError::Masking("a masked format proves masked"));
+        return Err(ProveError::MaskedFormat);
     }
     circuit.check_wiring().map_err(ProveError::Wiring)?;
     let log_sizes = circuit.log_sizes();
@@ -275,7 +284,7 @@ pub fn prove_masked_on<MC: MerkleChannel>(
     format: &Format,
     circuit: &Circuit,
     witness: &Witness<SecureField>,
-    rng: &MaskRng,
+    rng: MaskRng,
     tamper: impl FnOnce(&mut MainTrace),
 ) -> Result<(RecairProof<MC::H>, MaskStats), ProveError>
 where
@@ -309,7 +318,7 @@ where
     let claimed_sums = proof
         .claimed_sums
         .try_into()
-        .map_err(|_| ProveError::Masking("a claimed sum a component"))?;
+        .map_err(|_| ProveError::TraceShape("one claimed sum per component expected"))?;
     Ok((
         RecairProof {
             format_version: format.number,

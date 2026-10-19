@@ -772,7 +772,7 @@ fn the_window_wraps() {
     assert!(output.entry && output.halt, "the whole run");
     assert_eq!(output.io_hash, trace.io_hash);
 
-    let (bytes, words) = common::wrap_root("the window", &program, &root, &mut totals.wrap);
+    let (bytes, words) = common::wrap_root("the window", &program, &root, &mut totals.wrap, true);
     totals.report("the window");
     let input = common::judged_statement(
         vos_statement::Statement {

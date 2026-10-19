@@ -201,14 +201,14 @@ impl<V: Value> WrapValues<V> {
 /// Proves a finalized wrap circuit masked under format 39, on the Blake2b-256
 /// channel, from the operating system's randomness.
 pub fn prove(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError> {
-    prove_masked(finalized, &MaskRng::new(), |_| {}).map(|(proof, _)| proof)
+    prove_masked(finalized, MaskRng::default(), |_| {}).map(|(proof, _)| proof)
 }
 
 /// [`prove`] from `rng`, with the main trace passed through `tamper` before
 /// it is masked; and what the prove measured.
 pub fn prove_masked(
     finalized: &Finalized<SecureField>,
-    rng: &MaskRng,
+    rng: MaskRng,
     tamper: impl FnOnce(&mut MainTrace),
 ) -> Result<(WrapProof, MaskStats), ProveError> {
     let (proof, stats) = prove_masked_on::<Blake2bMerkleChannel>(
