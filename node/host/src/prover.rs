@@ -25,7 +25,7 @@ use vos_wire::{Decode, Encode, WindowClock, keys};
 use crate::blobs::{Keep, blob_ref};
 use crate::lock;
 use crate::node::Inner;
-use crate::store::{EntryKind, Fjall, PersistMode};
+use crate::store::{EntryKind, Fjall, NODE_AGENT, PersistMode};
 
 /// How long an idle worker waits before it looks again: for a new record,
 /// an anchor, or a proof another replica sends.
@@ -39,19 +39,27 @@ const REPORT_EVERY: Duration = Duration::from_secs(60);
 #[derive(Default)]
 pub(crate) struct Unrecorded(Mutex<HashMap<AgentId, Proofs>>);
 
-/// Statements' proofs, by statement id.
-type Proofs = BTreeMap<[u8; 32], [u8; 32]>;
+/// Statements' windows and proofs, by statement id.
+type Proofs = BTreeMap<[u8; 32], (u64, [u8; 32])>;
 
 impl Unrecorded {
-    fn add(&self, agent: AgentId, id: [u8; 32], proof: [u8; 32]) {
-        lock(&self.0).entry(agent).or_default().insert(id, proof);
+    fn add(&self, agent: AgentId, window: u64, id: [u8; 32], proof: [u8; 32]) {
+        lock(&self.0)
+            .entry(agent)
+            .or_default()
+            .insert(id, (window, proof));
     }
 
-    /// `agent`'s, each its statement's id and its proof.
-    pub(crate) fn of(&self, agent: AgentId) -> Vec<([u8; 32], [u8; 32])> {
+    /// `agent`'s, each its statement's id, its window and its proof.
+    pub(crate) fn of(&self, agent: AgentId) -> Vec<([u8; 32], u64, [u8; 32])> {
         lock(&self.0)
             .get(&agent)
-            .map(|waiting| waiting.iter().map(|(id, proof)| (*id, *proof)).collect())
+            .map(|waiting| {
+                waiting
+                    .iter()
+                    .map(|(id, (window, proof))| (*id, *window, *proof))
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -78,12 +86,8 @@ impl Host for NodeHost {
         })
     }
 
-    fn led(&self) -> Vec<AgentId> {
-        let agents: Vec<AgentId> = lock(&self.0.runs).keys().copied().collect();
-        agents
-            .into_iter()
-            .filter(|agent| self.leads(*agent))
-            .collect()
+    fn agents(&self) -> Vec<AgentId> {
+        lock(&self.0.runs).keys().copied().collect()
     }
 
     fn applied(&self, agent: AgentId) -> u64 {
@@ -144,9 +148,9 @@ impl Host for NodeHost {
         self.0.blobs.get(&hash.0).ok().flatten()
     }
 
-    fn proven(&self, agent: AgentId, id: &StatementId) -> Option<[u8; 32]> {
+    fn proven(&self, agent: AgentId, window: u64, id: &StatementId) -> Option<[u8; 32]> {
         let snapshot = self.0.store.snapshot();
-        crate::fault::read::<[u8; 32]>(&snapshot, agent, &keys::proven(&id.0))
+        crate::fault::read::<[u8; 32]>(&snapshot, agent, &keys::proven(window, &id.0))
             .ok()
             .flatten()
     }
@@ -155,6 +159,19 @@ impl Host for NodeHost {
         let blob = blob_ref(proof);
         smol::block_on(self.0.blobs.put(blob, Arc::new(proof.to_vec()), Keep::Aged))?;
         Ok(blob.hash)
+    }
+
+    /// A pin under the node's own id, apart from every agent's program
+    /// pins.
+    fn hold(&self, hash: &[u8; 32], held: bool) {
+        let mut batch = self.0.store.batch();
+        match held {
+            true => batch.pin(hash, NODE_AGENT),
+            false => batch.unpin(hash, NODE_AGENT),
+        }
+        if let Err(error) = batch.commit(PersistMode::SyncAll) {
+            tracing::warn!("a proof's pin was not written: {error:?}");
+        }
     }
 
     fn proof(&self, agent: AgentId, hash: &[u8; 32]) -> Option<Vec<u8>> {
@@ -182,8 +199,8 @@ impl Host for NodeHost {
         None
     }
 
-    fn record(&self, agent: AgentId, id: StatementId, proof: [u8; 32]) {
-        self.0.unrecorded.add(agent, id.0, proof);
+    fn record(&self, agent: AgentId, window: u64, id: StatementId, proof: [u8; 32]) {
+        self.0.unrecorded.add(agent, window, id.0, proof);
         if let Some(run) = self.0.run(agent) {
             run.agent.wake();
         }
@@ -237,10 +254,12 @@ impl Jobs for NodeJobs {
         self.0.prover_mark(agent).map_err(failed)
     }
 
+    /// Not synced: the jobs it reads past are, so a mark lost to a crash
+    /// only has the scan read those records again, each to the job it made.
     fn set_watermark(&self, agent: AgentId, index: u64) -> Result<(), String> {
         let mut batch = self.0.batch();
         batch.prover_mark(agent, index);
-        batch.commit(PersistMode::SyncAll).map_err(failed)
+        batch.commit(PersistMode::Buffer).map_err(failed)
     }
 }
 
@@ -267,6 +286,7 @@ pub(crate) fn start(
             return None;
         }
     };
+    inner.proving.store(true, Ordering::SeqCst);
     let thread = std::thread::Builder::new()
         .name("vos-prover".into())
         .spawn(move || work(worker, &stopped))

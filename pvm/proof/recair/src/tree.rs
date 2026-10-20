@@ -10,6 +10,7 @@ use vos_pvm_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{IdPreimage, KernelEntry, KernelProgram};
+use vos_pvm_proof::shape::KernelShape;
 use vos_pvm_proof::{Proof, ProvingError, SideNote};
 
 use crate::context::Finalized;
@@ -84,6 +85,18 @@ impl Stats {
     }
 }
 
+/// The class whose budgets a run of `shape` is cut by: the first of the
+/// most steps, so a run is cut in as few segments as its steps need (a
+/// window its pages overflow is cut again, by `prove_kernel`).
+pub fn cut_class(shape: &KernelShape) -> usize {
+    shape
+        .classes
+        .iter()
+        .enumerate()
+        .max_by_key(|(class, sizes)| (sizes.log_steps, core::cmp::Reverse(*class)))
+        .map_or(0, |(class, _)| class)
+}
+
 /// `run`, a whole run of `program` from `entry` to its halt (its tracer's
 /// side note), proved to one root: cut by the budgets of its class of the
 /// most steps (the first such), its steps and its pages, and
@@ -97,13 +110,7 @@ pub fn prove_run(
     entry: &KernelEntry,
     run: &SideNote,
 ) -> Result<(Node, Stats), TreeError> {
-    let cut = program
-        .shape
-        .classes
-        .iter()
-        .enumerate()
-        .max_by_key(|(class, sizes)| (sizes.log_steps, core::cmp::Reverse(*class)))
-        .map_or(0, |(class, _)| class);
+    let cut = cut_class(&program.shape);
     let started = Instant::now();
     let segments = vos_pvm_proof::prove_kernel(run, &program.shape, cut, &SEGMENT)
         .map_err(TreeError::Segment)?;
@@ -223,4 +230,36 @@ pub fn wrap_with(
     let words = wrap::public_words(&finalized);
     let proof = prove(&finalized)?;
     Ok((proof, statement, words))
+}
+
+#[cfg(test)]
+mod tests {
+    use vos_pvm_proof::shape::{KernelShape, SegmentClass};
+
+    use super::cut_class;
+
+    fn shape(classes: &[(u8, u16)]) -> KernelShape {
+        KernelShape {
+            components: 0,
+            classes: classes
+                .iter()
+                .map(|&(log_steps, pages)| SegmentClass {
+                    log_steps,
+                    pages,
+                    log_sizes: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// A run is cut by its class of the most steps, the first such: the
+    /// derivation's classes, short, 32k and short with room for an
+    /// argument, cut at the 32k one.
+    #[test]
+    fn a_run_is_cut_by_its_class_of_the_most_steps() {
+        assert_eq!(cut_class(&shape(&[(12, 8), (15, 8), (12, 24)])), 1);
+        assert_eq!(cut_class(&shape(&[(15, 8), (15, 24)])), 0);
+        assert_eq!(cut_class(&shape(&[(12, 8)])), 0);
+        assert_eq!(cut_class(&shape(&[])), 0);
+    }
 }

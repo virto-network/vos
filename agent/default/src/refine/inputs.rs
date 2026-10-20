@@ -169,12 +169,12 @@ pub(crate) fn consumed(input: InputRef, outcome: Outcome) -> Run {
     }
 }
 
-/// The step of a statement `id` proved, its final proof the blob `proof`:
+/// The step of a statement `id` of window `window`'s cut proved, its final proof the blob `proof`:
 /// its row ([`keys::proven`]) written when the agent holds none for the
 /// id, so the first proof recorded stays.
-pub(crate) fn proven(base: &Base, id: [u8; 32], proof: [u8; 32]) -> Run {
+pub(crate) fn proven(base: &Base, window: u64, id: [u8; 32], proof: [u8; 32]) -> Run {
     let mut run = consumed(InputRef::Proven { id }, Outcome::Done(Vec::new()));
-    let key = keys::proven(&id);
+    let key = keys::proven(window, &id);
     if let Ok(None) = base.read(&key) {
         run.writes.push(Write {
             key,

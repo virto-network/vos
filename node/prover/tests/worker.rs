@@ -4,13 +4,13 @@
 //! and a record whose re-run is not its statement is refused.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use vos_node_prover::{
-    Host, Jobs, MemoryJobs, Options, ProveError, Prover, REFUSED_RERUN, State, Worker,
+    Host, Jobs, MAX_ATTEMPTS, MemoryJobs, Options, ProveError, Prover, REFUSED_KERNEL,
+    REFUSED_RERUN, State, Worker,
 };
 use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
 use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
@@ -70,6 +70,8 @@ struct Node {
     peers: Arc<Mutex<Vec<Blobs>>>,
     /// The proofs it asked its peers for, which arrive at the next ask.
     asked: Arc<Mutex<BTreeSet<[u8; 32]>>>,
+    /// The proofs it holds pinned.
+    pins: Arc<Mutex<BTreeSet<[u8; 32]>>>,
 }
 
 impl Node {
@@ -80,6 +82,7 @@ impl Node {
             blobs: Arc::default(),
             peers: Arc::default(),
             asked: Arc::default(),
+            pins: Arc::default(),
         }
     }
 
@@ -101,12 +104,8 @@ impl Host for Node {
         self.leads.load(Ordering::SeqCst)
     }
 
-    fn led(&self) -> Vec<AgentId> {
-        if self.leads(AGENT) {
-            vec![AGENT]
-        } else {
-            Vec::new()
-        }
+    fn agents(&self) -> Vec<AgentId> {
+        vec![AGENT]
     }
 
     fn applied(&self, _: AgentId) -> u64 {
@@ -122,7 +121,7 @@ impl Host for Node {
         (*hash == ProgramHash::of(KERNEL)).then(|| KERNEL.to_vec())
     }
 
-    fn proven(&self, _: AgentId, id: &StatementId) -> Option<[u8; 32]> {
+    fn proven(&self, _: AgentId, _: u64, id: &StatementId) -> Option<[u8; 32]> {
         self.agent.lock().unwrap().proven.get(&id.0).copied()
     }
 
@@ -130,6 +129,14 @@ impl Host for Node {
         let key = hash(proof);
         self.blobs.lock().unwrap().insert(key, proof.to_vec());
         Ok(key)
+    }
+
+    fn hold(&self, key: &[u8; 32], held: bool) {
+        let mut pins = self.pins.lock().unwrap();
+        match held {
+            true => pins.insert(*key),
+            false => pins.remove(key),
+        };
     }
 
     fn proof(&self, _: AgentId, key: &[u8; 32]) -> Option<Vec<u8>> {
@@ -151,7 +158,7 @@ impl Host for Node {
     }
 
     /// The leader's next batch records it: at once here.
-    fn record(&self, _: AgentId, id: StatementId, proof: [u8; 32]) {
+    fn record(&self, _: AgentId, _: u64, id: StatementId, proof: [u8; 32]) {
         self.agent
             .lock()
             .unwrap()
@@ -165,13 +172,14 @@ impl Host for Node {
     }
 }
 
-/// A prover whose proofs differ each time, as masked proofs do: it panics
-/// once when told to, as a node stopping mid-proof would, and refuses the
-/// records whose output is `refused`.
+/// A prover whose proofs differ each time, as masked proofs do: once when
+/// told to it never returns, as a node stopped mid-proof; it panics while
+/// told to; and it refuses the records whose output is `refused`.
 #[derive(Default)]
 struct Proofs {
     made: AtomicUsize,
-    crash: AtomicBool,
+    stop: AtomicBool,
+    panics: AtomicBool,
     refused: Mutex<Option<Vec<u8>>>,
 }
 
@@ -181,8 +189,13 @@ impl Prover for Proofs {
     }
 
     fn prove(&self, _: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
-        if self.crash.swap(false, Ordering::SeqCst) {
-            panic!("the node stops mid-proof");
+        if self.stop.swap(false, Ordering::SeqCst) {
+            loop {
+                std::thread::park();
+            }
+        }
+        if self.panics.load(Ordering::SeqCst) {
+            panic!("the prover fails");
         }
         if self.refused.lock().unwrap().as_ref() == Some(&attest.output) {
             return Err(ProveError::Rerun("the io-hash is not the record's".into()));
@@ -321,12 +334,13 @@ fn a_restart_mid_proof_leaves_one_proof() {
         Venue::at(after(3)),
     );
     venue.anchor(3);
-    prover.crash.store(true, Ordering::SeqCst);
+    prover.stop.store(true, Ordering::SeqCst);
     let mut first = worker(&node, &jobs, &prover, &venue);
-    let stopped = std::panic::catch_unwind(AssertUnwindSafe(|| first.step()));
-    assert!(stopped.is_err(), "stopped mid-proof");
-    drop(first);
-    assert_eq!(states(&jobs), [State::Proving]);
+    // The node stops mid-proof: its worker never returns.
+    std::thread::spawn(move || first.step());
+    while states(&jobs) != [State::Proving] {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     assert_eq!(node.blobs(), 0, "no proof kept");
 
     let mut second = worker(&node, &jobs, &prover, &venue);
@@ -337,6 +351,10 @@ fn a_restart_mid_proof_leaves_one_proof() {
     assert_eq!(states(&jobs), [State::Accepted]);
     assert_eq!(prover.made.load(Ordering::SeqCst), 1, "proved once");
     assert_eq!(node.blobs(), 1, "one proof kept");
+    assert!(
+        node.pins.lock().unwrap().is_empty(),
+        "its pin gone once accepted"
+    );
     assert_eq!(agent.lock().unwrap().proven.len(), 1, "one proof recorded");
     assert_eq!(venue.accepted(), 1);
     // Read once: the record makes no second job.
@@ -358,9 +376,17 @@ fn a_duplicate_submission_is_accepted_once() {
         Arc::new(Proofs::default()),
         Venue::at(after(3)),
     );
-    let mut worker = worker(&node, &jobs, &prover, &venue);
+    let retry = Duration::from_millis(300);
+    let options = Options { retry, ..options() };
+    let mut worker = worker_with(&node, &jobs, &prover, &venue, options);
     worker.step().unwrap();
+    let held = |state: &State| {
+        state
+            .proof()
+            .is_some_and(|proof| node.pins.lock().unwrap().contains(&proof))
+    };
     assert!(matches!(states(&jobs)[..], [State::Proved { .. }]));
+    assert!(held(&states(&jobs)[0]), "its proof pinned once proved");
     worker.step().unwrap();
     assert_eq!(
         venue.submissions.load(Ordering::SeqCst),
@@ -375,10 +401,46 @@ fn a_duplicate_submission_is_accepted_once() {
         "its answer lost"
     );
     worker.step().unwrap();
+    assert_eq!(
+        venue.submissions.load(Ordering::SeqCst),
+        1,
+        "not again before its wait"
+    );
+    std::thread::sleep(retry);
+    worker.step().unwrap();
     assert_eq!(states(&jobs), [State::Accepted]);
     assert_eq!(venue.submissions.load(Ordering::SeqCst), 2);
     assert_eq!(venue.accepted(), 1, "accepted once");
     assert_eq!(prover.made.load(Ordering::SeqCst), 1);
+    assert!(
+        node.pins.lock().unwrap().is_empty(),
+        "its pin gone once accepted"
+    );
+}
+
+/// A prover that panics on a statement is caught: the job is queued again,
+/// its attempts counted across restarts, and refused after three.
+#[test]
+fn a_prover_that_panics_gives_up_after_three_attempts() {
+    let agent = Arc::new(Mutex::new(Agent::default()));
+    agent.lock().unwrap().log.push(vec![attest(3, 1)]);
+    let node = Node::new(&agent, true);
+    let (jobs, prover, venue) = (
+        MemoryJobs::default(),
+        Arc::new(Proofs::default()),
+        Venue::at(after(3)),
+    );
+    prover.panics.store(true, Ordering::SeqCst);
+    for attempt in 1..=MAX_ATTEMPTS {
+        let mut worker = worker(&node, &jobs, &prover, &venue);
+        worker.step().unwrap();
+        let (_, job) = jobs.all().unwrap().pop().unwrap();
+        assert_eq!((job.state, job.attempts), (State::Queued, attempt));
+    }
+    let mut worker = worker(&node, &jobs, &prover, &venue);
+    worker.step().unwrap();
+    assert_eq!(states(&jobs), [State::Refused(REFUSED_KERNEL)]);
+    assert_eq!(venue.submissions.load(Ordering::SeqCst), 0);
 }
 
 /// Leadership moves after the first leader proved and recorded a statement,
@@ -399,7 +461,10 @@ fn a_leader_change_proves_nothing_twice() {
     let mut on_b = worker(&b, &b_jobs, &prover, &venue);
     on_a.step().unwrap();
     on_b.step().unwrap();
-    assert!(b_jobs.all().unwrap().is_empty(), "a follower reads nothing");
+    assert!(
+        matches!(states(&b_jobs)[..], [State::Proved { .. }]),
+        "a follower reads the record, the leader's proof recorded"
+    );
     assert_eq!(agent.lock().unwrap().proven.len(), 1);
 
     a.leads.store(false, Ordering::SeqCst);
@@ -413,8 +478,11 @@ fn a_leader_change_proves_nothing_twice() {
         on_b.step().unwrap();
     }
     assert!(
-        matches!(states(&a_jobs)[..], [State::Proved { .. }]),
-        "the old leader holds it"
+        states(&a_jobs)
+            .iter()
+            .all(|state| matches!(state, State::Queued | State::Proved { .. })),
+        "the old leader reads both, submits neither: {:?}",
+        states(&a_jobs)
     );
     assert_eq!(states(&b_jobs), [State::Accepted, State::Accepted]);
     assert_eq!(

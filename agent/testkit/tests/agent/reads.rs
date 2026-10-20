@@ -194,7 +194,7 @@ impl Reads {
                         rep_root,
                         paths,
                     } => self.kit.close(*window, *rep_root, paths.clone()),
-                    Input::Proven { id, proof } => self.kit.proven(*id, *proof),
+                    Input::Proven { window, id, proof } => self.kit.proven(*window, *id, *proof),
                     other => panic!("not modelled: {other:?}"),
                 },
                 Step::Swept { .. } | Step::Refused { .. } => {
@@ -1338,6 +1338,7 @@ fn a_close_sends_each_path_once() {
 fn a_statement_is_recorded_proven_once() {
     let mut reads = Reads::with(&[(1, 10)]);
     let proven = |id: u8, proof: u8| Input::Proven {
+        window: 4,
         id: [id; 32],
         proof: [proof; 32],
     };
@@ -1346,11 +1347,11 @@ fn a_statement_is_recorded_proven_once() {
     assert!(ran(&result.steps[1]).writes.is_empty());
     reads.batch(T0 + 2, vec![proven(1, 0xa3), proven(2, 0xb1)]);
     assert_eq!(
-        row::<[u8; 32]>(&reads, &keys::proven(&[1; 32])),
+        row::<[u8; 32]>(&reads, &keys::proven(4, &[1; 32])),
         Some([0xa1; 32])
     );
     assert_eq!(
-        row::<[u8; 32]>(&reads, &keys::proven(&[2; 32])),
+        row::<[u8; 32]>(&reads, &keys::proven(4, &[2; 32])),
         Some([0xb1; 32])
     );
 }

@@ -153,6 +153,7 @@ impl Node {
             halted: AtomicBool::new(false),
             liveness: crate::liveness::Liveness::new(incarnation),
             unrecorded: crate::prover::Unrecorded::default(),
+            proving: AtomicBool::new(false),
             backlog: Mutex::new(None),
         });
         inner.resume(records, placements);

@@ -161,6 +161,13 @@ fn one_prover_keeps_up_at_the_default_window_length() {
         balances,
         balance.statement().as_secs_f64(),
     );
+    // The window cut at the 32k class: a cut at a short class proves it in
+    // 17 segments, over four times as long.
+    assert!(
+        window.stats.segments <= 4,
+        "{} segments",
+        window.stats.segments
+    );
     for proved in [&window, &balance] {
         assert!(
             proved.resident_mib <= PROVER_MIB,

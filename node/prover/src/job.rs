@@ -17,6 +17,10 @@ pub const REFUSED_RERUN: u32 = 0x1_0001;
 /// program's blob does not derive a kernel, or the kernel does not run.
 pub const REFUSED_KERNEL: u32 = 0x1_0002;
 
+/// The times proving a statement may begin before it is refused
+/// ([`REFUSED_KERNEL`]): a kernel whose proof panics or stops the node.
+pub const MAX_ATTEMPTS: u32 = 3;
+
 /// How far a statement's job has come.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum State {
@@ -70,6 +74,11 @@ pub struct Job {
     pub agent: AgentId,
     /// The log index of the work result that recorded it.
     pub index: u64,
+    /// The window whose cut the attest read at.
+    pub window: u64,
+    /// How many times proving it began: a prover that panics or stops the
+    /// node on it gives up after [`MAX_ATTEMPTS`].
+    pub attempts: u32,
     /// The record, kept until the job finishes: a proof another replica
     /// made may never arrive, and the statement is then proved here.
     pub attest: Option<Attest>,
@@ -91,6 +100,8 @@ impl Job {
         Self {
             agent,
             index,
+            window: attest.window.unwrap_or(0),
+            attempts: 0,
             attest: Some(attest),
             statement: statement.encode(),
             state,

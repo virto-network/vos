@@ -1,33 +1,32 @@
-//! The worker: from the logs of the agents this node leads, each attest at
-//! a window's cut becomes a job; one job at a time is proved; each proof is
-//! kept, recorded in its agent, and submitted once its roots are anchored.
+//! The worker: from the logs of the agents this node replicates, each
+//! attest at a window's cut becomes a job; for the agents it leads, one job
+//! at a time is proved, and each proof is kept, recorded in its agent, and
+//! submitted once its roots are anchored.
 
 use std::collections::{BTreeMap, HashMap};
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
+use vos_venue::vos_statement::{ProgramId, Refusal, Statement, StatementId};
 use vos_venue::{NotAccepted, VenueClient};
 use vos_wire::ids::{AgentId, ProgramHash};
 use vos_wire::result::Attest;
 use vos_wire::{SpaceId, WindowClock};
 
-use crate::job::{Job, REFUSED_KERNEL, REFUSED_RERUN, State, deadline};
+use crate::job::{Job, MAX_ATTEMPTS, REFUSED_KERNEL, REFUSED_RERUN, State, deadline};
 
 /// The final proofs' format: the masked wrap's.
 pub const FORMAT: u32 = vos_venue::vos_statement::vos_pvm_final_verifier::masked::FORMAT;
-
-/// A venue's code for a statement it holds accepted already: counted as
-/// accepted.
-const REPEATED: u32 = 6;
 
 /// What the worker reads of and does to the node it runs on.
 pub trait Host {
     /// Whether this node leads `agent` now: only its leader proves its
     /// records and submits their statements.
     fn leads(&self, agent: AgentId) -> bool;
-    /// The agents this node leads.
-    fn led(&self) -> Vec<AgentId>;
+    /// The agents this node replicates: every replica reads its log into
+    /// jobs, so a new leader holds them already.
+    fn agents(&self) -> Vec<AgentId>;
     /// The last index of `agent`'s log this replica applied.
     fn applied(&self, agent: AgentId) -> u64;
     /// The attests the work result at `index` of `agent`'s log recorded:
@@ -36,17 +35,21 @@ pub trait Host {
     fn attests(&self, agent: AgentId, index: u64) -> Result<Option<Vec<Attest>>, String>;
     /// A program's blob, by its hash: a kernel an attest names.
     fn program(&self, hash: &ProgramHash) -> Option<Vec<u8>>;
-    /// The proof `agent` holds recorded for statement `id`
-    /// (`vos_wire::keys::proven`), as this replica applied it.
-    fn proven(&self, agent: AgentId, id: &StatementId) -> Option<[u8; 32]>;
+    /// The proof `agent` holds recorded for statement `id` of window
+    /// `window`'s cut (`vos_wire::keys::proven`), as this replica applied
+    /// it.
+    fn proven(&self, agent: AgentId, window: u64, id: &StatementId) -> Option<[u8; 32]>;
     /// Keep a final proof: its BLAKE2b-256.
     fn keep(&self, proof: &[u8]) -> Result<[u8; 32], String>;
+    /// Keep the proof `hash` whatever its age (`held`), or no longer: a
+    /// statement's proof is held from its proof until its job finishes.
+    fn hold(&self, hash: &[u8; 32], held: bool);
     /// The proof `hash`, if this node holds it; when not, `agent`'s other
     /// replicas are asked for it.
     fn proof(&self, agent: AgentId, hash: &[u8; 32]) -> Option<Vec<u8>>;
-    /// Have `agent`'s leader record statement `id` proved by `proof`
-    /// (`vos_wire::batch::Input::Proven`).
-    fn record(&self, agent: AgentId, id: StatementId, proof: [u8; 32]);
+    /// Have `agent`'s leader record statement `id` of window `window`'s cut
+    /// proved by `proof` (`vos_wire::batch::Input::Proven`).
+    fn record(&self, agent: AgentId, window: u64, id: StatementId, proof: [u8; 32]);
     /// The space's clock, which numbers the windows its roots are of.
     fn clock(&self) -> WindowClock;
 }
@@ -98,8 +101,9 @@ pub struct Options {
     /// How long a proof another replica made is asked for before it is
     /// proved here.
     pub patience: Duration,
-    /// How many records of an agent's log one step reads.
-    pub scan: u64,
+    /// How long a submission whose answer was lost waits before it goes
+    /// again, doubled each time.
+    pub retry: Duration,
 }
 
 impl Default for Options {
@@ -107,7 +111,7 @@ impl Default for Options {
         Self {
             expected: Duration::from_secs(600),
             patience: Duration::from_secs(60),
-            scan: 256,
+            retry: Duration::from_secs(30),
         }
     }
 }
@@ -159,6 +163,12 @@ pub struct Worker<H, J> {
     programs: HashMap<ProgramHash, ProgramId>,
     /// When each proof another replica made was first asked for.
     asked: HashMap<StatementId, Instant>,
+    /// The statements whose proof another replica made never arrived:
+    /// proved here.
+    unfetched: std::collections::HashSet<StatementId>,
+    /// When each submission whose answer was lost goes again, and the
+    /// wait after that.
+    retries: HashMap<StatementId, (Instant, Duration)>,
     /// The longest proof timed.
     longest: Duration,
     lost: u64,
@@ -178,8 +188,9 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             match job.state {
                 State::Proving => jobs.put(&id, &job.to(State::Queued))?,
                 State::Proved { proof } | State::Submitted { proof } => {
-                    if host.proven(job.agent, &id).is_none() {
-                        host.record(job.agent, id, proof);
+                    host.hold(&proof, true);
+                    if host.proven(job.agent, job.window, &id).is_none() {
+                        host.record(job.agent, job.window, id, proof);
                     }
                 }
                 _ => {}
@@ -193,6 +204,8 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             options,
             programs: HashMap::new(),
             asked: HashMap::new(),
+            unfetched: Default::default(),
+            retries: HashMap::new(),
             longest: Duration::ZERO,
             lost: 0,
         })
@@ -208,16 +221,16 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         &self.jobs
     }
 
-    /// One step: the led agents' new records read into jobs, the proved
-    /// statements whose roots are anchored submitted, then one statement
-    /// proved, the one whose anchor ages first.
+    /// One step: every replicated agent's new records read into jobs,
+    /// through its applied index, the led agents' proved statements whose
+    /// roots are anchored submitted, then one statement proved, the one
+    /// whose anchor ages first.
     pub fn step(&mut self) -> Result<Stepped, String> {
         let mut stepped = Stepped::default();
-        let led = self.host.led();
-        for agent in &led {
-            stepped.read += self.scan(*agent)?;
+        for agent in self.host.agents() {
+            stepped.read += self.scan(agent)?;
         }
-        let jobs = self.jobs.all()?;
+        let jobs = self.follow(self.jobs.all()?)?;
         stepped.submitted = self.submit(&jobs)?;
         if let Some((id, job)) = self.next(&jobs)
             && self.prove(id, job)?
@@ -274,19 +287,22 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             if job.state.finished() && aged {
                 self.jobs.remove(job.agent, &id)?;
                 removed += 1;
+            } else if aged && let Some(proof) = job.state.proof() {
+                self.host.hold(&proof, false);
+                self.jobs.put(&id, &job.to(State::Dead))?;
             }
         }
         Ok(removed)
     }
 
-    /// Read `agent`'s records past its watermark, at most
-    /// [`Options::scan`], into jobs: the new jobs.
+    /// Read `agent`'s records past its watermark, through its applied
+    /// index, into jobs: the new jobs.
     fn scan(&mut self, agent: AgentId) -> Result<usize, String> {
         let applied = self.host.applied(agent);
         let from = self.jobs.watermark(agent)?;
         let mut made = 0;
         let mut through = from;
-        for index in from + 1..=applied.min(from + self.options.scan) {
+        for index in from + 1..=applied {
             let Some(attests) = self.host.attests(agent, index)? else {
                 self.lost += 1;
                 through = index;
@@ -302,7 +318,8 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 if self.jobs.get(agent, &id)?.is_some() {
                     continue;
                 }
-                let state = match self.host.proven(agent, &id) {
+                let window = attest.window.unwrap_or(0);
+                let state = match self.host.proven(agent, window, &id) {
                     Some(proof) => State::Proved { proof },
                     None => State::Queued,
                 };
@@ -319,8 +336,9 @@ impl<H: Host, J: Jobs> Worker<H, J> {
     }
 
     /// The statement `attest` makes: `None` while its kernel's blob is not
-    /// here; a kernel the prover cannot read makes a statement of no
-    /// program, which the prover then refuses.
+    /// here, or its program could not be computed for now; a kernel the
+    /// prover cannot read makes a statement of no program, which the
+    /// prover then refuses.
     fn statement(&mut self, attest: &Attest) -> Result<Option<Statement>, String> {
         let program = match self.programs.get(&attest.program) {
             Some(program) => *program,
@@ -328,10 +346,11 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 let Some(blob) = self.host.program(&attest.program) else {
                     return Ok(None);
                 };
-                let program = self
-                    .prover
-                    .program(&blob)
-                    .unwrap_or(ProgramId([u32::MAX; 8]));
+                let program = match self.prover.program(&blob) {
+                    Ok(program) => program,
+                    Err(ProveError::Kernel(_)) => ProgramId([u32::MAX; 8]),
+                    Err(_) => return Ok(None),
+                };
                 self.programs.insert(attest.program, program);
                 program
             }
@@ -347,6 +366,25 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             output: attest.output.clone(),
             roots: attest.roots.clone(),
         }))
+    }
+
+    /// `jobs`, each queued job of an agent this node follows that its agent
+    /// now records proved taken as proved: a replica's table follows its
+    /// leader's.
+    fn follow(&self, jobs: Vec<(StatementId, Job)>) -> Result<Vec<(StatementId, Job)>, String> {
+        jobs.into_iter()
+            .map(|(id, job)| {
+                if job.state != State::Queued || self.host.leads(job.agent) {
+                    return Ok((id, job));
+                }
+                let Some(proof) = self.host.proven(job.agent, job.window, &id) else {
+                    return Ok((id, job));
+                };
+                let job = job.to(State::Proved { proof });
+                self.jobs.put(&id, &job)?;
+                Ok((id, job))
+            })
+            .collect()
     }
 
     /// Whether `statement`'s anchor passes `MaxRootAge` by the venue's time
@@ -374,11 +412,20 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             .cloned()
     }
 
-    /// Prove `job`: dead when its anchor would age past `MaxRootAge` before
-    /// its proof ends; else proved, its proof kept and recorded, or refused.
+    /// Prove `job`: taken as proved when its agent records it proved by
+    /// another replica; dead when its anchor would age past `MaxRootAge`
+    /// before its proof ends; refused once [`MAX_ATTEMPTS`] proofs of it
+    /// began; else proved, its proof kept, held and recorded, or refused.
     /// False when its kernel's blob is not here, or the prover failed: it
     /// waits, queued.
     fn prove(&mut self, id: StatementId, job: Job) -> Result<bool, String> {
+        let agent = job.agent.0;
+        if let Some(proof) = self.host.proven(job.agent, job.window, &id)
+            && !self.unfetched.contains(&id)
+        {
+            self.jobs.put(&id, &job.to(State::Proved { proof }))?;
+            return Ok(true);
+        }
         let (Some(statement), Some(attest)) = (job.statement(), job.attest.clone()) else {
             self.jobs
                 .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
@@ -386,46 +433,76 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         };
         if self.dead(&statement, self.options.expected.max(self.longest)) {
             tracing::warn!(
-                agent = job.agent.0,
+                agent,
                 "a statement's anchor ages before its proof would end: dead"
             );
             self.jobs.put(&id, &job.to(State::Dead))?;
             return Ok(true);
         }
+        if job.attempts >= MAX_ATTEMPTS {
+            tracing::error!(
+                agent,
+                attempts = job.attempts,
+                "a statement's proof never ended: refused"
+            );
+            self.jobs
+                .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
+            return Ok(true);
+        }
         let Some(kernel) = self.host.program(&attest.program) else {
             return Ok(false);
         };
-        let agent = job.agent.0;
-        let job = job.to(State::Proving);
+        let mut job = job.to(State::Proving);
+        job.attempts += 1;
         self.jobs.put(&id, &job)?;
         let started = Instant::now();
-        let proved = self.prover.prove(&kernel, &attest);
+        let prover = Arc::clone(&self.prover);
+        let proved = std::panic::catch_unwind(AssertUnwindSafe(|| prover.prove(&kernel, &attest)))
+            .unwrap_or_else(|_| Err(ProveError::Failed("the prover panicked".into())));
         let took = started.elapsed();
         match proved {
             Ok(proof) => {
                 self.longest = self.longest.max(took);
+                self.unfetched.remove(&id);
                 let proof = self.host.keep(&proof)?;
-                let recorder = job.agent;
+                self.host.hold(&proof, true);
+                let (recorder, window) = (job.agent, job.window);
                 self.jobs.put(&id, &job.to(State::Proved { proof }))?;
                 tracing::info!(agent, seconds = took.as_secs_f64(), "a statement proved");
-                self.host.record(recorder, id, proof);
+                self.host.record(recorder, window, id, proof);
             }
-            Err(ProveError::Rerun(why)) => {
-                tracing::error!(agent, %why, "a record's re-run is not its statement: refused");
+            Err(ProveError::Rerun(_)) => {
+                tracing::error!(agent, "a record's re-run is not its statement: refused");
                 self.jobs.put(&id, &job.to(State::Refused(REFUSED_RERUN)))?;
             }
-            Err(ProveError::Kernel(why)) => {
-                tracing::error!(agent, %why, "a record's kernel is not provable: refused");
+            Err(ProveError::Kernel(_)) => {
+                tracing::error!(agent, "a record's kernel is not provable: refused");
                 self.jobs
                     .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
             }
-            Err(ProveError::Failed(why)) => {
-                tracing::warn!(agent, %why, "a proof failed: queued again");
+            Err(ProveError::Failed(_)) => {
+                tracing::warn!(
+                    agent,
+                    attempts = job.attempts,
+                    "a proof failed: queued again"
+                );
                 self.jobs.put(&id, &job.to(State::Queued))?;
                 return Ok(false);
             }
         }
         Ok(true)
+    }
+
+    /// `job`, holding `proof`, moved to `state`: the proof held no longer.
+    fn release(
+        &self,
+        id: &StatementId,
+        job: Job,
+        proof: [u8; 32],
+        state: State,
+    ) -> Result<(), String> {
+        self.host.hold(&proof, false);
+        self.jobs.put(id, &job.to(state))
     }
 
     /// Submit the led agents' proved statements that are recorded in their
@@ -458,12 +535,19 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                     agent = job.agent.0,
                     "a proved statement's anchor aged: dead"
                 );
-                self.jobs.put(&id, &job.to(State::Dead))?;
+                self.release(&id, job, proof, State::Dead)?;
                 continue;
             }
             // Recorded in its agent first, so every replica knows it proved.
-            if self.host.proven(job.agent, &id).is_none() {
-                self.host.record(job.agent, id, proof);
+            if self.host.proven(job.agent, job.window, &id).is_none() {
+                self.host.record(job.agent, job.window, id, proof);
+                continue;
+            }
+            if self
+                .retries
+                .get(&id)
+                .is_some_and(|(at, _)| Instant::now() < *at)
+            {
                 continue;
             }
             if !statement.roots.iter().all(|root| self.venue.anchored(root)) {
@@ -474,21 +558,25 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 if asked.elapsed() >= self.options.patience {
                     tracing::warn!(agent = job.agent.0, "a proof never arrived: proved here");
                     self.asked.remove(&id);
+                    self.unfetched.insert(id);
                     let state = if job.attest.is_some() {
                         State::Queued
                     } else {
                         State::Refused(REFUSED_KERNEL)
                     };
-                    self.jobs.put(&id, &job.to(state))?;
+                    self.release(&id, job, proof, state)?;
                 }
                 continue;
             };
             self.asked.remove(&id);
+            self.host.hold(&proof, true);
             let job = job.to(State::Submitted { proof });
             self.jobs.put(&id, &job)?;
             handed += 1;
+            let repeated = Refusal::Repeated.code();
             let state = match self.venue.submit(&statement, &bytes) {
-                Ok(_) | Err(NotAccepted::Refused(REPEATED)) => State::Accepted,
+                Ok(_) => State::Accepted,
+                Err(NotAccepted::Refused(code)) if code == repeated => State::Accepted,
                 Err(NotAccepted::Refused(code)) => {
                     tracing::error!(
                         agent = job.agent.0,
@@ -498,15 +586,22 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                     State::Refused(code)
                 }
                 Err(NotAccepted::Unjudged(why)) => {
+                    let wait = self
+                        .retries
+                        .get(&id)
+                        .map_or(self.options.retry, |(_, wait)| *wait * 2);
+                    self.retries.insert(id, (Instant::now() + wait, wait));
                     tracing::warn!(
                         agent = job.agent.0,
                         ?why,
+                        seconds = wait.as_secs(),
                         "a statement not judged: submitted again later"
                     );
                     continue;
                 }
             };
-            self.jobs.put(&id, &job.to(state))?;
+            self.retries.remove(&id);
+            self.release(&id, job, proof, state)?;
         }
         Ok(handed)
     }

@@ -52,6 +52,10 @@ pub(super) struct Snapshots {
     pub(super) chunks: VecDeque<(NodeNumber, SnapshotChunk)>,
 }
 
+/// The most entries compaction keeps behind the applied index for the
+/// prover's scan.
+const PROVER_HOLD: u64 = 1 << 16;
+
 impl Snapshots {
     /// Whether the snapshot this replica stages arrived whole.
     fn staged(&self) -> bool {
@@ -140,6 +144,9 @@ impl Driver {
         {
             point = point.min(lowest);
         }
+        if let Some(read) = self.unread_by_prover(point) {
+            point = point.min(read);
+        }
         if point <= self.core.status().snap_last_index {
             return;
         }
@@ -169,6 +176,29 @@ impl Driver {
             return;
         }
         self.core.compacted(point);
+    }
+
+    /// While this node's prover runs, the last entry its scan read
+    /// (`prover_mark`), which compaction keeps the entries past: its
+    /// records at a window's cut are read before they go. At most
+    /// [`PROVER_HOLD`] entries are held behind the applied index; past them
+    /// the entries go unread, and an alert says so.
+    fn unread_by_prover(&self, point: u64) -> Option<u64> {
+        if !self.inner.proving.load(Ordering::SeqCst) {
+            return None;
+        }
+        let agent = self.shared.agent;
+        let mark = self.inner.store.prover_mark(agent).ok()?;
+        let floor = self.shared.state().applied.saturating_sub(PROVER_HOLD);
+        if mark < floor.min(point) {
+            tracing::error!(
+                agent = agent.0,
+                mark,
+                floor,
+                "the prover's scan trails the log by more than it holds: records past it go unread"
+            );
+        }
+        Some(mark.max(floor))
     }
 
     /// Stream this replica's state to `to`, which needs entries the log no

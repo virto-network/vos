@@ -147,7 +147,7 @@ proptest! {
             keys::serving(),
             keys::close_mark(),
             keys::closing(sequence),
-            keys::proven(&[agent as u8; 32]),
+            keys::proven(sequence, &[agent as u8; 32]),
         ];
         for key in &system {
             prop_assert!(!keys::owned_by(key, instance));
@@ -219,7 +219,7 @@ proptest! {
                 keys::closed(number),
                 keys::moved(number),
                 keys::closing(number),
-                keys::proven(&triple.key),
+                keys::proven(number, &triple.key),
             ]);
 
             if let Some(prefix) = prefix {

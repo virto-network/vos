@@ -840,10 +840,14 @@ where
         total_interaction_columns,
     };
 
-    // Print on the explicit `profile` flag, or whenever `ZKPVM_PROFILE` is set
-    // in the environment (so the phase breakdown is reachable through paths
-    // that hard-code `profile = false`, e.g. `prove_canonical`).
-    if profile || std::env::var_os("ZKPVM_PROFILE").is_some() {
+    // Print on the explicit `profile` flag, or, in a build with
+    // `debug-internals`, whenever `ZKPVM_PROFILE` is set in the environment
+    // (so the phase breakdown is reachable through paths that hard-code
+    // `profile = false`, e.g. `prove_canonical`). A production build prints
+    // no segment's sizes, which are its step counts, from the environment.
+    let from_environment =
+        cfg!(feature = "debug-internals") && std::env::var_os("ZKPVM_PROFILE").is_some();
+    if profile || from_environment {
         eprintln!("{prof}");
     }
 

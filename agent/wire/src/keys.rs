@@ -625,14 +625,15 @@ pub fn reports(agent: AgentId) -> Vec<u8> {
 }
 
 /// The final proof of the agent's statement `id` (a
-/// `vos_statement::StatementId`), as its prover recorded it
-/// ([`crate::batch::Input::Proven`]): the proof's BLAKE2b-256, a blob in
-/// the prover's store. Replicated, written by the step of the first
-/// `Proven` of the id; a later one is ignored. Every replica learns from it
-/// that the statement is proved, so a new leader proves it again only when
-/// no replica holds the proof.
-pub fn proven(id: &[u8; 32]) -> Vec<u8> {
-    key(&[&Row::Proven.prefix(), id])
+/// `vos_statement::StatementId`) of an attest at window `window`'s cut, as
+/// its prover recorded it ([`crate::batch::Input::Proven`]): the proof's
+/// BLAKE2b-256, a blob in the prover's store. Replicated, written by the
+/// step of the first `Proven` of the id; a later one is ignored. Every
+/// replica learns from it that the statement is proved, so a new leader
+/// proves it again only when no replica holds the proof. Keyed by window
+/// first, so the rows of windows no venue anchors any more go by prefix.
+pub fn proven(window: u64, id: &[u8; 32]) -> Vec<u8> {
+    key(&[&Row::Proven.prefix(), &window.to_be_bytes(), id])
 }
 
 /// The representative's close of the window `window`, node-local, written

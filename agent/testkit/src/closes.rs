@@ -29,10 +29,11 @@ impl Testkit {
         step
     }
 
-    /// The step of the agent's statement `id` proved, its final proof the
+    /// The step of the agent's statement `id` of window `window`'s cut
+    /// proved, its final proof the
     /// blob `proof`: its row written unless the agent holds one for the id.
-    pub fn proven(&mut self, id: [u8; 32], proof: [u8; 32]) -> Step {
-        let key = keys::proven(&id);
+    pub fn proven(&mut self, window: u64, id: [u8; 32], proof: [u8; 32]) -> Step {
+        let key = keys::proven(window, &id);
         if self.state.contains_key(&key) {
             return self.written(Vec::new(), Vec::new());
         }
