@@ -30,8 +30,10 @@ const FAULTS: usize = 16;
 
 /// A follower of `agent` stays down until its leader has compacted the log
 /// past the follower's last entry, so it comes back by a snapshot however
-/// slowly the clients go (within a minute). A skip, or a minute run out, is
-/// logged as such: a later missing snapshot can be traced to it.
+/// slowly the clients go (within three minutes: a loaded host's clients
+/// take more than one to fill a compaction's entries). A skip, or the
+/// minutes run out, is logged as such: a later missing snapshot can be
+/// traced to it.
 fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
     let follower = || {
         let leader = cluster.leader(agent)?;
@@ -52,7 +54,7 @@ fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
     };
     cluster.saw("fault: a follower down past compaction");
     cluster.stop(number);
-    let until = Instant::now() + Duration::from_secs(60);
+    let until = Instant::now() + Duration::from_secs(180);
     loop {
         let compacted = cluster
             .leader(agent)
@@ -62,7 +64,7 @@ fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
             break;
         }
         if Instant::now() >= until {
-            cluster.saw("fault: a follower down past compaction, a minute run out");
+            cluster.saw("fault: a follower down past compaction, the minutes run out");
             break;
         }
         std::thread::sleep(Duration::from_millis(20));

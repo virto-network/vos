@@ -3244,6 +3244,11 @@ test's or its harness's, not a node's:
   ended before the test lost its page on the leader ("the leader halts"
   timed out); one of 1.5 s ended before the upgrade it should sleep
   through. Naps of 5 s and 10 s, and the leader read after the start.
+- **A compaction a minute did not reach.** The served runs hold a follower
+  down until its leader compacts past it, for at most a minute, then
+  check some node caught up by a snapshot; a loaded host's clients filled
+  no compaction in a minute ("no node caught up by a snapshot"). Three
+  minutes.
 - **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
   counted any result past its start; an install applied late is one. A
   marker is an empty result, and only those count.
