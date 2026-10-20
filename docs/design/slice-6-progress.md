@@ -3249,6 +3249,12 @@ test's or its harness's, not a node's:
   check some node caught up by a snapshot; a loaded host's clients filled
   no compaction in a minute ("no node caught up by a snapshot"). Three
   minutes.
+- **An install taken twice.** `replicas_that_never_took_the_install_pool…`
+  checked that only the leader pooled the program; a leader that stopped
+  leading as the install came pooled it too before it answered
+  `NotLeader`, and the install went again at the next. The nodes the
+  install went to are recorded, and those but the one that ran it are
+  restarted, which empties their pools.
 - **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
   counted any result past its start; an install applied late is one. A
   marker is an empty result, and only those count.
