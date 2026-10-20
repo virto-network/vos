@@ -3058,3 +3058,7 @@ On `vos-core` (from `56ab4860`).
     `NotLeader`, as `increment_at_leader` does, for its 14 callers.
 - **On the dev chain again** [measured]: the same checks pass through the
   reconnecting transport.
+- **After the fold:** `just check` at `9dbd6ba8` green, 93 suites, 1,345
+  passed, 0 failed, 12.2 min (12 GiB scope, `nice -n 10`, 8 jobs).
+
+**6.17b accepted.**
