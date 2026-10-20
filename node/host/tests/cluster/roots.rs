@@ -20,7 +20,9 @@ use vos_wire::peer::NodeNumber;
 use vos_wire::records::{unstored, unversioned};
 use vos_wire::result::Write;
 
-use crate::common::{ALICE, COUNTER, Cluster, compacting, log_start, wait_until};
+use crate::common::{
+    ALICE, COUNTER, Cluster, compacting, log_start, old_epochs_dropped, wait_until,
+};
 
 /// The counter's committed map, as its value rows on `node` name it: its
 /// transform is the field's, whichever the SDK's default.
@@ -188,10 +190,7 @@ fn a_follower_caught_up_by_a_snapshot_builds_the_same_root() {
     let caught_up = cluster.node(follower);
     assert!(log_start(caught_up, agent) > 30, "installed a snapshot");
     check(caught_up, agent, root);
-    // Dropped in the background, after the switch.
-    wait_until("the old epoch is dropped", || {
-        caught_up.store().stale_epochs(agent).unwrap().is_empty()
-    });
+    old_epochs_dropped(caught_up, agent);
 }
 
 /// A build that fails, here on a row the builder wrote that does not read

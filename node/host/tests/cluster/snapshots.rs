@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 use vos_checker::calls::done;
 use vos_node::{Hooks, Node};
 
-use crate::common::{Cluster, WithholdBlobs, compacting, log_start, wait_until};
+use crate::common::{
+    Cluster, STAGED_IDLE, WithholdBlobs, compacting, log_start, old_epochs_dropped, wait_until,
+};
 
 #[test]
 fn every_replica_compacts_its_log_as_it_applies() {
@@ -80,10 +82,7 @@ fn a_follower_behind_the_log_catches_up_by_a_snapshot() {
     let last = |node: &Node| node.store().snapshot().last_result(agent).unwrap();
     assert_eq!(last(caught_up), last(cluster.node(leader)));
     assert_eq!(cluster.value(follower, agent), total);
-    // Dropped in the background, after the switch.
-    wait_until("the old epoch is dropped", || {
-        caught_up.store().stale_epochs(agent).unwrap().is_empty()
-    });
+    old_epochs_dropped(caught_up, agent);
 }
 
 /// Slows every snapshot chunk, as a slow link would.
@@ -187,7 +186,9 @@ fn a_snapshot_cut_short_is_sent_again() {
     cluster.start(leader);
     cluster.converged(agent);
     assert_eq!(cluster.value(follower, agent), total);
-    wait_until("no staged rows are left", || {
+    // A stream cut short is dropped once idle for 30 s, if no other
+    // replaces it first.
+    vos_checker::wait_until("no staged rows are left", STAGED_IDLE, || {
         cluster
             .running()
             .all(|(_, node)| node.store().stale_epochs(agent).unwrap().is_empty())

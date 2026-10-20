@@ -29,6 +29,10 @@ pub const ALICE: Principal = Principal::Client([1; 32]);
 /// disk, whose syncs a loaded host holds for seconds at a time.
 pub const WRITER_STALL: Duration = Duration::from_secs(5);
 
+/// Past how long a follower drops a snapshot it staged in part once the
+/// stream stops arriving (30 s).
+pub const STAGED_IDLE: Duration = Duration::from_secs(45);
+
 /// What a test sets in node `number`'s config, past the harness's own.
 type Tuning = Box<dyn Fn(NodeNumber, &mut Config) + Send + Sync>;
 
@@ -673,6 +677,25 @@ pub fn applied_rows(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
 /// through, or a snapshot installed at.
 pub fn log_start(node: &Node, agent: AgentId) -> u64 {
     node.store().raft(agent).unwrap().log_start.0
+}
+
+/// `node` holds no epoch of `agent`'s but its current one: the one a
+/// snapshot's switch left, dropped in the background, and any later stream
+/// a loaded host's leader began that the follower no longer needs, dropped
+/// once idle.
+#[track_caller]
+pub fn old_epochs_dropped(node: &Node, agent: AgentId) {
+    let mut stale = Vec::new();
+    let dropped = vos_checker::poll(STAGED_IDLE, || {
+        stale = node.store().stale_epochs(agent).unwrap();
+        stale.is_empty()
+    });
+    let current = node.store().snapshot().epoch(agent).unwrap();
+    assert!(
+        dropped,
+        "the old epochs {stale:?} are left beside the current {current}, the log from {}",
+        log_start(node, agent)
+    );
 }
 
 /// A node no longer replicating `agent` runs no group for it and keeps

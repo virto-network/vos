@@ -3236,7 +3236,10 @@ test's or its harness's, not a node's:
   jump.
 - **A background drop read at once.** A follower caught up by a snapshot
   drops its old epoch in the background after the switch; two tests read
-  it gone at once ("the old epoch is dropped"). They wait for it.
+  it gone at once ("the old epoch is dropped"). They wait for it, and for
+  any later stream a loaded host's leader began and the follower no longer
+  needs, which the follower drops once idle for 30 s: 45 s, naming the
+  epochs left should they stay.
 - **Naps shorter than the setup after them.** A workflow's nap of 1 s
   ended before the test lost its page on the leader ("the leader halts"
   timed out); one of 1.5 s ended before the upgrade it should sleep
