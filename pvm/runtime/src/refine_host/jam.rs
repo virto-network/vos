@@ -308,7 +308,10 @@ mod tests {
             "a segment's fetch"
         );
         assert_eq!(jam_gas::fetch(fetch_kind::ANY_IMPORT, 1 << 20), 171);
-        assert_eq!(jam_gas::fetch(fetch_kind::PAYLOAD, 186 << 10), 95 + 96 * 186);
+        assert_eq!(
+            jam_gas::fetch(fetch_kind::PAYLOAD, 186 << 10),
+            95 + 96 * 186
+        );
         assert_eq!(jam_gas::fetch(fetch_kind::OUR_EXTRINSIC, 1), 85 + 1);
         assert_eq!(jam_gas::fetch(fetch_kind::PARAMETERS, 64), 390);
         assert_eq!(jam_gas::fetch(16, 1 << 20), 80, "past the table");
