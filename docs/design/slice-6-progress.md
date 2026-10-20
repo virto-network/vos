@@ -2886,3 +2886,113 @@ On `vos-core` (from `4447127a`).
   passed, 0 failed, 14.5 min; G1–G18 now 153 steps, `spaces.json` 303 KB.
 
 **6.17 accepted.**
+
+## Step 6.17b: the node's Kreivo client
+
+On `vos-core` (from `56ab4860`).
+
+- **Built, in `vos-venue`:** `kreivo::KreivoVenue: VenueClient`, in two
+  layers:
+  - `kreivo::calls`: the pinned call bytes (`[90, call] ++ SCALE(args)`),
+    the raw storage keys the node reads, the events, errors and stored
+    values by `spaces-pallet.md` §5, §6, §8, written apart from the mock's
+    types so the vectors check one against the other; the sovereign
+    account's derivation;
+  - `kreivo::transport`: the `Transport` trait (sign, send and follow to
+    inclusion, raw storage and keys at the best block) and the `Sender`,
+    which signs a call once with the signer's next nonce and, after a lost
+    answer or a stale nonce, reads the nonce (past it: landed) or sends
+    the same bytes again, signing anew with the same nonce only once the
+    era has ended: a call is included at most once.
+- **The transports:** `kreivo::chain::ChainTransport` behind the `kreivo`
+  feature (subxt and subxt-signer =0.51.1, sr25519, the call as a
+  `RawCall` payload): `KreivoConfig` is Polkadot's types with Kreivo's
+  extensions, `PassAuthenticate` a typed extension that encodes `None`
+  after checking its type is an `Option`; the live list is checked
+  against the ten in order before signing; events read from
+  `System.Events` at the inclusion block by the extrinsic's index. The
+  mock transport (`kreivo::mock::transport`, feature `mock`) runs 6.17's
+  model, each signer's extrinsics its nonce and call, with faults (an
+  answer lost after landing, a send dropped before) and latency. The
+  calls layer, the `Sender` and `KreivoVenue` build without either
+  feature, so `just check` runs them without subxt.
+- **The anchor's hand-over:** `KreivoVenue::anchor` answers from what the
+  worker last read (the space's status, range, anchor keys and `Last`,
+  the venue's time) and queues: `Anchored::Queued`, a refusal for good,
+  or `Open`. One worker thread sends anchors in window order and submits
+  in turn, all as the node's account; it reads `Timestamp.Now` before an
+  anchor and never sends one for a window the venue has not closed, nor
+  while the space is not active or anchors are paused. The errors per §9:
+  14 and 15 done; 16 kept until `Timestamp.Now` passes `B_w` plus a block
+  (`Options::block_ms`); 17 and 18 dead with an alert; 19 and 20 kept;
+  the others and `InvalidTransaction::Payment` an alert. `anchored` reads
+  `Anchors` at the best block (a suspended space's roots, a migrated
+  window or one past `MaxRootAge` not anchored). A funding alert when
+  the paying space's sovereign holds less than 8 submits
+  (`Options::per_submit`, one UNIT by default).
+- **Submits:** before paying, the pause, `Formats`, `Programs` (refusals
+  2 and 3 unsent), `Seen` (a repeat accepted unsent), the paying space's
+  status and its window's budget; the verdict from `Accepted { id }`,
+  `Refused { 6 }` accepted, `Refused { c }` `NotAccepted::Refused(c)`;
+  the configuration's errors and the funds' an alert and
+  `NotAccepted::Unjudged`.
+- **`VenueClient`** gains `status` (`Status::waits` for suspended or
+  blocked), `Anchored::Queued`, and `submit` returning `NotAccepted`
+  (a refusal's code, or unjudged) in place of `Refusal`, since a remote
+  venue reports codes; `vos_venue::code` replaces `vos_statement::code`
+  at its callers.
+- **The leader** (`leader/close.rs`) sends nothing while
+  `VenueClient::status` says the space waits, and after a `Key` refusal
+  hands the anchor over again only once the venue's listing changes or a
+  window later by its clock.
+- **The key (decision 12):** each node's account key, an sr25519 mini
+  secret, made at its first start that asks for it and kept in its store
+  (`NodeRow::VenueAccount`) beside its node key and anchor keys, never
+  one of them; `AccountSeed`'s `Debug` names it only, and it is zeroed
+  when dropped. `Config::venue_with_account` makes the venue's client
+  from it at `Node::open`.
+- **Tooling** (`vos`, feature `kreivo`): `vos node run --venue kreivo
+  --venue-url`, `vos node venue-account`, and `vos space venue register`
+  (the founder's signature over the registration digest by the stopped
+  founding node's key, `start_window` the venue's open window by
+  default), `authority add|remove`, `budget`. `vos_venue::kreivo::
+  selectable` refuses Kreivo in a build without debug assertions, until
+  M3b's deferred gates 1 and 2 pass; `vos node run --venue kreivo` asks
+  it before the feature.
+- **Tests:**
+  - `the_client_passes_every_vector`: G1–G18's 153 steps, each call
+    decoded and encoded again by the client's own types, sent by its
+    `Sender` through the mock transport, the result from its decode of
+    the dispatch error, the events its decode, every storage write read
+    back through the transport, its key rebuilt by the client's builder
+    and its value decoded as the client's type;
+  - `KreivoVenue` over the mock (`kreivo::tests`): taken at once while the
+    chain takes 300 ms; the open window refused, then anchored once the
+    venue's time passes `B_w`; `WindowInFuture` held until `B_w` plus a
+    block, then sent again; a suspended, blocked or paused space sent
+    nothing; the budget's refusal and a short sovereign alerting, a submit
+    over budget unsent; a lost answer not sent again and a dropped send
+    sent again, each included once; an expired send signed again with its
+    nonce; the fixture accepted, its repeat accepted unsent, a tampered
+    proof refused with its class, format 30 refused unsent; every pallet
+    error's fate and `Refused { 6 }`; the production build refusing Kreivo;
+  - the cluster (`tests/cluster/kreivo.rs`, three nodes, each client made
+    from its stored key, the mock with fees and a second an extrinsic):
+    windows 0–2 land once each, in order, every anchor answered in under
+    500 ms; a suspended space sent no anchor until resumed; a refused key
+    handed over once within a window through the idle rechecks, once more
+    a window later, and the windows land once the venue lists it;
+  - the key store: made once, kept, apart from the node and anchor keys,
+    never shown; the founder's signature by the node key;
+  - the envelope's check refuses a moved, missing or added extension.
+- **On a Kreivo dev chain** (6.0e's recipe: omni-node stable2606-2
+  `--dev` with the `development` preset, Kreivo 87f8728, spec 134, no
+  pallet 90; `examples/kreivo_dev.rs` through `ChainTransport` and the
+  `Sender`) [measured]: `System::remark_with_event` as hand-built bytes
+  signed by Alice, included, `System::Remarked` read by the extrinsic's
+  index with Alice and the remark's hash, the nonce up by one; the same
+  nonce again refused `Stale`; a transfer past Alice's balance read as a
+  failed dispatch (`Arithmetic`); an unfunded signer's call refused
+  `Payment`; `Timestamp.Now`, `System.Account[Alice]` and a key listing
+  read raw. The chain's directory under the scratch directory, its PID
+  stopped and the directory removed.

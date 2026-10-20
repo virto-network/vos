@@ -23,6 +23,7 @@
 //!   are `vos_statement::judge`'s, over [`StorageVenue`].
 
 pub mod keys;
+pub mod transport;
 pub mod types;
 
 use std::collections::BTreeMap;
@@ -219,6 +220,11 @@ impl Chain {
     /// A raw entry set, as a test's genesis sets one.
     pub fn set_storage(&mut self, key: Vec<u8>, value: Vec<u8>) {
         self.storage.insert(key, value);
+    }
+
+    /// A raw entry removed, as a test's setup removes one.
+    pub fn remove_storage(&mut self, key: &[u8]) {
+        self.storage.remove(key);
     }
 
     pub fn accounts(&self) -> &BTreeMap<AccountId, Account> {

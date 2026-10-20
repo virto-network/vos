@@ -154,7 +154,7 @@ fn a_balance_is_accepted_at_the_model_venue() {
     });
     venue.anchor(&root).expect("anchored");
     let code = |statement: &Statement| {
-        vos_statement::code(&vos_venue::VenueClient::submit(
+        vos_venue::code(&vos_venue::VenueClient::submit(
             &venue.venue,
             statement,
             &proof,

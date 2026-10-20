@@ -748,7 +748,7 @@ fn the_window_is_stated_at_the_model_venue() {
         venue
     };
     let code = |venue: &Venue, statement: &Statement| {
-        vos_statement::code(&venue.venue.submit(statement, &proof))
+        vos_venue::code(&venue.venue.submit(statement, &proof))
     };
     // The proof refused against the words the statement makes.
     const WORDS: u32 = 0x108;

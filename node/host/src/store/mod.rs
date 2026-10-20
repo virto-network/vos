@@ -276,6 +276,15 @@ impl Fjall {
             .and_then(|seed| seed[..].try_into().ok()))
     }
 
+    /// The seed of the node's own account key at its space's venue, once
+    /// made: secret, never served, never its node key or an anchor key.
+    pub fn venue_account_secret(&self) -> Result<Option<[u8; 32]>> {
+        Ok(self
+            .system()
+            .get(node_record(NodeRow::VenueAccount, &[]))?
+            .and_then(|seed| seed[..].try_into().ok()))
+    }
+
     /// The anchor keys the node made past its first, its node key's, by
     /// number, oldest first: each seed, secret and never served, or `None`
     /// where its row is unreadable. A number is never reused, so the next

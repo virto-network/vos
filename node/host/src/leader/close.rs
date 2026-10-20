@@ -250,8 +250,25 @@ impl Leader {
         let Some(venue) = self.inner.venue.clone() else {
             return true;
         };
-        let (space, _) = self.inner.space_and_clock();
-        let Some(key) = self.inner.anchor_keys.listed(&venue.anchor_keys(&space)) else {
+        let (space, clock) = self.inner.space_and_clock();
+        if venue.status(&space).waits() {
+            self.alert(
+                window,
+                "the space is suspended or blocked at the venue; its anchors wait, unsent, until \
+                 its controller resumes it (after removing both equivocating keys) or the venue \
+                 unblocks it",
+            );
+            return false;
+        }
+        let listing = venue.anchor_keys(&space);
+        let now = (self.inner.clock)();
+        let refused_again = self.key_refused.as_ref().is_some_and(|(listed, at)| {
+            *listed == listing && now.saturating_sub(*at) < clock.length_ms
+        });
+        if refused_again {
+            return false;
+        }
+        let Some(key) = self.inner.anchor_keys.listed(&listing) else {
             self.alert(
                 window,
                 "the venue lists none of this node's anchor keys; the space's root is not signed \
@@ -269,7 +286,9 @@ impl Leader {
             signature: [0; 64],
         };
         anchor.signature = key.sign(&anchor.digest(&venue.id())).to_bytes();
-        match venue.anchor(&anchor) {
+        let answer = venue.anchor(&anchor);
+        self.key_refused = None;
+        match answer {
             Ok(anchored) => {
                 tracing::debug!(window, ?anchored, "anchored the space's root");
                 true
@@ -282,9 +301,11 @@ impl Leader {
                 false
             }
             Err(AnchorRefusal::Key) => {
+                self.key_refused = Some((listing, now));
                 self.alert(
                     window,
-                    "the venue no longer lists the anchor key signed with; anchoring again",
+                    "the venue no longer lists the anchor key signed with; anchoring again once \
+                     its listing changes, or a window later",
                 );
                 false
             }

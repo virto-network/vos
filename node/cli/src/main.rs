@@ -6,6 +6,7 @@ mod call;
 mod jam;
 mod kept;
 mod operator;
+mod venue;
 
 use std::fmt::Display;
 use std::path::Path;
@@ -93,6 +94,17 @@ impl NodeCommand {
                 println!("{}", hex::encode(id.0));
                 Ok(())
             }
+            #[cfg(feature = "kreivo")]
+            NodeCommand::VenueAccount { data } => {
+                let seed = vos_node::venue_account(&data)?;
+                let account = venue::account_of(&seed)?;
+                eprintln!(
+                    "vos: the node's account at Kreivo: have the space's controller register it \
+                     as an authority, paired with the node's anchor key"
+                );
+                println!("{}", hex::encode(account));
+                Ok(())
+            }
             NodeCommand::AnchorKey {
                 command: AnchorKeyCommand::Rotate { data },
             } => {
@@ -125,6 +137,9 @@ impl RunArgs {
         config.ingress_tls = self.tls.ingress();
         config.space = self.space.as_deref().map(Space::read).transpose()?;
         config.peer_bind = self.peer_bind;
+        if let (Some(kind), Some(url)) = (self.venue, &self.venue_url) {
+            config.venue_with_account = Some(venue::anchoring(kind, url, config.space.as_ref())?);
+        }
         #[cfg(feature = "faults")]
         {
             eprintln!("vos: WARNING: this build injects faults; it is for tests only");
@@ -147,56 +162,65 @@ impl RunArgs {
 
 impl SpaceCommand {
     fn run(self) -> Result<(), String> {
-        let SpaceCommand::Up {
-            space,
-            data,
-            window_ms,
-            origin_ms,
-        } = self;
-        let listed = Space::read(&space)?;
-        let store = data.join(vos_node::STORE);
-        if store.exists() {
-            let agents = vos_node::store::Fjall::open(&store)
-                .and_then(|store| store.agents())
-                .map_err(|error| format!("{}: {error:?}", store.display()))?;
-            if !agents.is_empty() {
-                return Err(format!(
-                    "{}: the node holds {} agents, which belong to no space for good: \
-                     found the space before creating any agent",
-                    data.display(),
-                    agents.len()
-                ));
-            }
+        match self {
+            SpaceCommand::Up {
+                space,
+                data,
+                window_ms,
+                origin_ms,
+            } => found(&space, &data, window_ms, origin_ms),
+            #[cfg(feature = "kreivo")]
+            SpaceCommand::Venue { command } => command.run(),
         }
-        let time = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_millis() as u64;
-        let mut nonce = [0u8; 16];
-        getrandom::getrandom(&mut nonce).map_err(|error| error.to_string())?;
-        let clock = vos_wire::WindowClock {
-            origin_ms: origin_ms.unwrap_or(time),
-            length_ms: window_ms,
-        };
-        if clock.origin_ms > time {
-            eprintln!(
-                "vos: windows start {} ms from now: until then every venue refuses the space's anchors",
-                clock.origin_ms - time
-            );
-        }
-        let genesis = listed.found(clock, time, nonce)?;
-        let path = vos_node::write_genesis(&space, &genesis)?;
-        eprintln!(
-            "vos: the space's genesis is in {}: copy it beside every node's space file, \
-             and restart the nodes, before creating any agent",
-            path.display()
-        );
-        println!(
-            "{}",
-            hex::encode(vos_wire::vos_anchor::space_id(&genesis).0)
-        );
-        Ok(())
     }
+}
+
+/// Found the space of the space file `space` on the stopped node whose
+/// data directory is `data` (`vos space up`).
+fn found(space: &Path, data: &Path, window_ms: u64, origin_ms: Option<u64>) -> Result<(), String> {
+    let listed = Space::read(space)?;
+    let store = data.join(vos_node::STORE);
+    if store.exists() {
+        let agents = vos_node::store::Fjall::open(&store)
+            .and_then(|store| store.agents())
+            .map_err(|error| format!("{}: {error:?}", store.display()))?;
+        if !agents.is_empty() {
+            return Err(format!(
+                "{}: the node holds {} agents, which belong to no space for good: \
+                 found the space before creating any agent",
+                data.display(),
+                agents.len()
+            ));
+        }
+    }
+    let time = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| error.to_string())?
+        .as_millis() as u64;
+    let mut nonce = [0u8; 16];
+    getrandom::getrandom(&mut nonce).map_err(|error| error.to_string())?;
+    let clock = vos_wire::WindowClock {
+        origin_ms: origin_ms.unwrap_or(time),
+        length_ms: window_ms,
+    };
+    if clock.origin_ms > time {
+        eprintln!(
+            "vos: windows start {} ms from now: until then every venue refuses the space's anchors",
+            clock.origin_ms - time
+        );
+    }
+    let genesis = listed.found(clock, time, nonce)?;
+    let path = vos_node::write_genesis(space, &genesis)?;
+    eprintln!(
+        "vos: the space's genesis is in {}: copy it beside every node's space file, \
+         and restart the nodes, before creating any agent",
+        path.display()
+    );
+    println!(
+        "{}",
+        hex::encode(vos_wire::vos_anchor::space_id(&genesis).0)
+    );
+    Ok(())
 }
 
 impl KeyCommand {

@@ -18,8 +18,9 @@
 //! signer's always listed, and who paid the fee; its `Budget` writes, whose
 //! spend sums the fees, are left out.
 
+mod client;
 mod mutations;
-mod scenarios;
+pub(super) mod scenarios;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;

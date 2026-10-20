@@ -3,21 +3,34 @@ name = "vos-venue"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "A venue as a VOS node reaches it: anchoring a space's roots, submitting statements, and asking what is anchored; and the model venue the node's tests anchor at."
+description = "A venue as a VOS node reaches it: anchoring a space's roots, submitting statements, and asking what is anchored; the model venue the node's tests anchor at; and the client of Kreivo's spaces pallet."
+
+[features]
+# The reference mock of Kreivo's spaces pallet and a transport over it,
+# for the node's tests.
+mock = []
+# The Kreivo client's chain transport: subxt over a Kreivo node's RPC.
+kreivo = ["dep:scale-info", "dep:subxt", "dep:subxt-signer", "dep:tokio"]
 
 [dependencies]
+blake2 = "0.10"
 ed25519-dalek = "2"
+# The spaces pallet's calls, events and stored values in SCALE, FRAME's
+# bytes; its storage keys hashed as FRAME's hashers do (`twox128`,
+# `twox64`, `blake2_128`).
+parity-scale-codec = { version = "3.7.5", features = ["derive", "std"] }
+tracing = "0.1"
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 vos-anchor = { workspace = true }
 vos-statement = { workspace = true }
+# Kreivo's chain: the envelope from its live metadata, signed with the
+# node's sr25519 account key.
+scale-info = { version = "2.11.6", optional = true, default-features = false }
+subxt = { version = "=0.51.1", optional = true }
+subxt-signer = { version = "=0.51.1", optional = true, features = ["sr25519"] }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time"] }
 
 [dev-dependencies]
-# The reference mock of Kreivo's spaces pallet (`src/kreivo/mock`): its
-# events, stored values and calls through SCALE derives, FRAME's bytes;
-# its storage keys hashed as FRAME's hashers do (`twox128`, `twox64`,
-# `blake2_128`).
-parity-scale-codec = { version = "3.7.5", features = ["derive", "std"] }
-twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
-blake2 = "0.10"
 # The conformance vectors, as JSON.
 serde = { workspace = true }
 serde_json = "1"
@@ -26,3 +39,7 @@ serde_json = "1"
 vos-statement = { workspace = true, features = ["fixtures"] }
 vos-pvm-final-verifier = { workspace = true }
 stwo = { workspace = true }
+
+[[example]]
+name = "kreivo_dev"
+required-features = ["kreivo"]

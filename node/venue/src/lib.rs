@@ -13,6 +13,8 @@
 //! anchor keys are kept by space, the founding ones first, added and
 //! removed as `spaces-pallet.md`'s controller does, and `resume` lifts a
 //! suspension once neither equivocating key is registered.
+//!
+//! [`kreivo::KreivoVenue`] is Kreivo's: the client of its spaces pallet.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -29,16 +31,83 @@ use vos_statement::{Pin, ProgramId, Refusal, Statement, StatementId, Venue};
 pub trait VenueClient: Send + Sync {
     /// The venue's id, which an anchor's signature binds.
     fn id(&self) -> VenueId;
-    /// Anchor a space's root of a window.
+    /// Anchor a space's root of a window. It answers at once: the
+    /// representative's leader hands it over inside its batch.
     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal>;
-    /// Submit a statement and its final proof: its id once accepted.
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, Refusal>;
+    /// Submit a statement and its final proof: its id once accepted, or
+    /// once the venue holds it accepted already.
+    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted>;
     /// Whether `root` is anchored, its space's root of its kind at its
     /// window.
     fn anchored(&self, root: &RootRead) -> bool;
     /// The anchor keys `space` has registered here (Kreivo's `AnchorKeys`):
     /// none when it is not registered, or the venue cannot say.
     fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]>;
+    /// Where `space` stands at the venue, as far as it can say.
+    fn status(&self, space: &SpaceId) -> Status;
+}
+
+/// Where a space stands at a venue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    /// Not registered, or not known yet.
+    Unregistered,
+    /// Anchoring.
+    Active,
+    /// It equivocated: no anchor is taken until its controller removes
+    /// both keys and resumes it.
+    Suspended,
+    /// The venue's governance blocked it.
+    Blocked,
+}
+
+impl Status {
+    /// Whether the venue takes no anchor of the space until someone acts:
+    /// a leader waits, sending nothing.
+    pub fn waits(self) -> bool {
+        matches!(self, Self::Suspended | Self::Blocked)
+    }
+}
+
+/// Why a venue did not accept a statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotAccepted {
+    /// Judged and refused: [`Refusal::code`]'s class.
+    Refused(u32),
+    /// Not judged.
+    Unjudged(Unjudged),
+}
+
+/// Why a venue did not judge a statement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unjudged {
+    /// The node's configuration at the venue: the paying space unknown or
+    /// not active, the node not its authority, submits paused, or a
+    /// statement or proof past the venue's bounds.
+    Configuration,
+    /// The paying space's funds: its sovereign account's balance, or its
+    /// spend budget for the window.
+    Funding,
+    /// Sent, and what became of it unknown: the venue holds no acceptance
+    /// of it.
+    Unknown,
+}
+
+impl From<Refusal> for NotAccepted {
+    fn from(refusal: Refusal) -> Self {
+        Self::Refused(refusal.code())
+    }
+}
+
+/// A submission's verdict as every venue reports it
+/// ([`vos_statement::code`]): 0 accepted, a refusal's class, and
+/// `u32::MAX` unjudged.
+pub fn code(verdict: &Result<StatementId, NotAccepted>) -> u32 {
+    match verdict {
+        Ok(_) => 0,
+        Err(NotAccepted::Refused(code)) => *code,
+        Err(NotAccepted::Unjudged(_)) => u32::MAX,
+    }
 }
 
 /// An anchor the venue took.
@@ -49,6 +118,9 @@ pub enum Anchored {
     /// The venue held that root already: a second leader's anchor, or the
     /// same leader's again.
     Again,
+    /// The venue's client took it to send, and sends it, in window order,
+    /// until the venue holds it or refuses it for good.
+    Queued,
 }
 
 /// Why a venue refuses an anchor.
@@ -394,7 +466,7 @@ impl VenueClient for ModelVenue {
         Ok(Anchored::New)
     }
 
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, Refusal> {
+    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
         let now = (self.now)();
         let mut state = self.state();
         // A program it pinned none for is refused as `judge` refuses
@@ -409,7 +481,7 @@ impl VenueClient for ModelVenue {
                 venue_bound: false,
             });
         let view = View { state: &state, now };
-        let id = vos_statement::judge(&view, &pin, statement, proof)?;
+        let id = vos_statement::judge(&view, &pin, statement, proof).map_err(NotAccepted::from)?;
         state.policy.now_ms = now;
         state.policy.record(statement);
         Ok(id)
@@ -426,9 +498,18 @@ impl VenueClient for ModelVenue {
             .map(|space| space.keys.clone())
             .unwrap_or_default()
     }
+
+    fn status(&self, space: &SpaceId) -> Status {
+        match self.state().spaces.get(space) {
+            None => Status::Unregistered,
+            Some(space) if space.suspended => Status::Suspended,
+            Some(_) => Status::Active,
+        }
+    }
 }
 
-#[cfg(test)]
-mod kreivo;
+pub mod kreivo;
+
+pub use vos_statement;
 #[cfg(test)]
 mod tests;

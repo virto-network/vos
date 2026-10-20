@@ -42,9 +42,10 @@ use crate::tls::IngressTls;
 use crate::{lock, timeout};
 
 pub(crate) use config::Settings;
-pub use config::{Config, Peers};
+pub use config::{Config, Peers, VenueWithAccount};
 pub(crate) use directory::Directory;
 pub use error::{CallError, Error, ReplaceError, Reply};
+pub(crate) use open::venue_account_secret;
 pub use open::{ADMIN_TOKEN, NODE_KEY, STORE, wall_clock};
 pub(crate) use queue::{Agent, Answered, Pending};
 

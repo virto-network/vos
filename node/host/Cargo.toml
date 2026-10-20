@@ -48,6 +48,10 @@ tempfile = "3"
 # JAM's tree over the whole keyspace, which the agent's root is a node of.
 vos-jam = { workspace = true }
 vos-pvm-program = { workspace = true }
+# The mock of Kreivo's spaces pallet, which the Kreivo client's cluster
+# tests anchor at, and its stored values' SCALE.
+vos-venue = { workspace = true, features = ["mock"] }
+parity-scale-codec = "3.7.5"
 # The node's binary runs on mimalloc: its tests run on it too.
 mimalloc = "0.1.52"
 

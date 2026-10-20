@@ -134,6 +134,10 @@ struct Leader {
     /// Whether this leadership has taken up the anchors an earlier one
     /// left waiting.
     seeded: bool,
+    /// The venue's anchor key listing when it last refused this node's
+    /// key, and the node's time then: the anchor goes again once the
+    /// listing changes, or a window later.
+    key_refused: Option<(Vec<[u8; 32]>, u64)>,
 }
 
 /// What an idle leader takes.
@@ -201,6 +205,7 @@ impl Leader {
             anchor_tried: None,
             alerted: None,
             seeded: false,
+            key_refused: None,
         }
     }
 

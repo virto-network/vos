@@ -11,6 +11,7 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use ed25519_dalek::SigningKey;
+use vos_venue::kreivo::AccountSeed;
 
 use crate::storage::{Change, StorageThread};
 use crate::store::{Fjall, PersistMode};
@@ -92,12 +93,10 @@ impl AnchorKeys {
     }
 }
 
-/// Make an anchor key for the node whose data directory is `data`, its
-/// node stopped: kept durably in its store before its public half is
-/// returned, for the space's controller to register. The node signs with
-/// it once a venue lists it.
-pub fn rotate_anchor_key(data: impl AsRef<Path>) -> Result<[u8; 32], String> {
-    let path = data.as_ref().join(crate::STORE);
+/// The store of the stopped node whose data directory is `data`, and its
+/// node key's seed: refused when the node has not run.
+fn stopped(data: &Path) -> Result<(Fjall, [u8; 32]), String> {
+    let path = data.join(crate::STORE);
     let failed = |error: fjall::Error| format!("{}: {error:?}", path.display());
     if !path.exists() {
         return Err(format!(
@@ -106,18 +105,57 @@ pub fn rotate_anchor_key(data: impl AsRef<Path>) -> Result<[u8; 32], String> {
         ));
     }
     let store = Fjall::open(&path).map_err(failed)?;
-    if store.node_secret().map_err(failed)?.is_none() {
+    let Some(secret) = store.node_secret().map_err(failed)? else {
         return Err(format!(
             "{}: the node has no key yet; run it once first",
             path.display()
         ));
-    }
-    let number = next_number(&store.anchor_secrets().map_err(failed)?);
+    };
+    Ok((store, secret))
+}
+
+fn failed(data: &Path) -> impl Fn(fjall::Error) -> String {
+    let path = data.join(crate::STORE);
+    move |error| format!("{}: {error:?}", path.display())
+}
+
+/// Make an anchor key for the node whose data directory is `data`, its
+/// node stopped: kept durably in its store before its public half is
+/// returned, for the space's controller to register. The node signs with
+/// it once a venue lists it.
+pub fn rotate_anchor_key(data: impl AsRef<Path>) -> Result<[u8; 32], String> {
+    let data = data.as_ref();
+    let (store, _) = stopped(data)?;
+    let number = next_number(&store.anchor_secrets().map_err(failed(data))?);
     let seed: [u8; 32] = random();
     let mut batch = store.batch();
     batch.anchor_secret(number, &seed);
-    batch.commit(PersistMode::SyncAll).map_err(failed)?;
+    batch.commit(PersistMode::SyncAll).map_err(failed(data))?;
     Ok(SigningKey::from_bytes(&seed).verifying_key().to_bytes())
+}
+
+/// The account key at its space's venue of the node whose data directory
+/// is `data`, its node stopped: made, and kept durably, if it has none,
+/// for the space's controller to register its account as an authority.
+pub fn venue_account(data: impl AsRef<Path>) -> Result<AccountSeed, String> {
+    let data = data.as_ref();
+    let (store, _) = stopped(data)?;
+    crate::node::venue_account_secret(&store)
+        .map(AccountSeed::new)
+        .map_err(|error| format!("{}: {error:?}", data.display()))
+}
+
+/// The node key of the stopped node whose data directory is `data`, and
+/// its signature over `digest`: a founding node's, registering its space
+/// at a venue.
+pub fn sign_with_node_key(
+    data: impl AsRef<Path>,
+    digest: &[u8; 32],
+) -> Result<([u8; 32], [u8; 64]), String> {
+    use ed25519_dalek::Signer;
+    let (_, secret) = stopped(data.as_ref())?;
+    let key = SigningKey::from_bytes(&secret);
+    Ok((key.verifying_key().to_bytes(), key.sign(digest).to_bytes()))
 }
 
 #[cfg(test)]
@@ -155,5 +193,39 @@ mod tests {
         let keys = AnchorKeys::load(&[1; 32], &store).unwrap();
         assert_eq!(keys.public().len(), 3, "the node key and the two readable");
         assert_eq!(lock(&keys.held).next, 4);
+    }
+
+    /// A node's account key at its venue is made once, kept in its store
+    /// beside its node key and anchor keys, and never one of them; it is
+    /// never shown. A node that has not run has none to make.
+    #[test]
+    fn the_venue_account_is_made_once_and_kept_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(venue_account(dir.path()).is_err(), "no store yet");
+        let path = dir.path().join(crate::STORE);
+        let store = Fjall::open(&path).unwrap();
+        let mut batch = store.batch();
+        batch.node_secret(&[1; 32]);
+        batch.anchor_secret(1, &[2; 32]);
+        batch.commit(PersistMode::SyncAll).unwrap();
+        drop(store);
+        let made = venue_account(dir.path()).unwrap();
+        let again = venue_account(dir.path()).unwrap();
+        assert_eq!(made.secret(), again.secret(), "kept");
+        assert_ne!(*made.secret(), [1; 32], "not the node key");
+        assert_ne!(*made.secret(), [2; 32], "not an anchor key");
+        assert_eq!(format!("{made:?}"), "AccountSeed(..)");
+        let store = Fjall::open(&path).unwrap();
+        assert_eq!(store.venue_account_secret().unwrap(), Some(*made.secret()));
+        assert_eq!(store.anchor_secrets().unwrap(), [(1, Some([2; 32]))]);
+        drop(store);
+        let digest = [9; 32];
+        let (key, signature) = sign_with_node_key(dir.path(), &digest).unwrap();
+        let node = SigningKey::from_bytes(&[1; 32]).verifying_key();
+        assert_eq!(key, node.to_bytes(), "the node key signs");
+        assert!(
+            node.verify_strict(&digest, &ed25519_dalek::Signature::from_bytes(&signature))
+                .is_ok()
+        );
     }
 }

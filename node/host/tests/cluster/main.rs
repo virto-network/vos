@@ -10,6 +10,7 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod anchor_keys;
 mod common;
 mod cuts;
+mod kreivo;
 mod large_results;
 mod liveness;
 mod membership;

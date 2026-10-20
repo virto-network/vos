@@ -224,7 +224,7 @@ impl RuntimeCall {
 }
 
 impl Call {
-    fn within(&self, bounds: &Bounds) -> bool {
+    pub fn within(&self, bounds: &Bounds) -> bool {
         match self {
             Self::Register { genesis, .. } => genesis.len() <= bounds.genesis,
             Self::Submit {
