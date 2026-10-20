@@ -3249,17 +3249,11 @@ test's or its harness's, not a node's:
   check some node caught up by a snapshot; a loaded host's clients filled
   no compaction in a minute ("no node caught up by a snapshot"). Three
   minutes.
-- **An install taken twice.** `replicas_that_never_took_the_install_pool…`
-  checked that only the leader pooled the program; a leader that stopped
-  leading as the install came pooled it too before it answered
-  `NotLeader`, and the install went again at the next. The nodes the
-  install went to are recorded, and those but the one that ran it are
-  restarted, which empties their pools.
-- **A leader slow to take calls.** A node a loaded host's election made
-  leader answered an install `NotLeader` for 20 s, each try waiting out
-  its node's settling (`every_agent_reports_and_one_close_serves_their_reads`,
-  with another worktree building beside the run). The in-process wait,
-  every harness wait's bound, is 30 s.
+- **Another leader pooling the program.** `replicas_that_never_took_the_install_pool…`
+  checks that only the leader pooled the program; a loaded host moved the
+  leader, which pooled it again on the new one (and an install that came
+  to a leader as it stopped leading pooled it there too). Node 1 now leads
+  until the test stops it: the others elect only past 8 s without it.
 - **A batch formed before its calls were queued.** The large-result
   tests queue ten calls behind a held refine for one batch past 2 MiB; a
   loaded host built them slower than the leader's 2 ms linger, and the

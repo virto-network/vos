@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use vos_checker::calls::{done, install_at_leader};
+use vos_checker::calls::done;
 use vos_checker::hooks::carries;
 use vos_checker::programs::actor;
 use vos_node::peer::Refusal as PeerRefusal;
@@ -436,30 +436,17 @@ fn a_follower_fetches_a_blob_from_another_member_when_the_leader_withholds_it() 
 /// at every run.
 #[test]
 fn replicas_that_never_took_the_install_pool_the_program_on_first_use() {
-    let mut cluster = Cluster::new(3);
-    let agent = cluster.agent(&[1, 2, 3]);
-    // The nodes the install went to: one that stopped leading as it came
-    // pooled it too, and is restarted, which empties its pool.
-    let sent = std::cell::RefCell::new(Vec::new());
-    install_at_leader(
-        || {
-            let leader = cluster.leader(agent);
-            sent.borrow_mut().push(leader);
-            cluster.node(leader)
-        },
-        agent,
-        COUNTER,
-        &cluster.programs.counter_elf,
-    );
-    let mut sent = sent.into_inner();
-    let first = sent.pop().expect("an install");
-    sent.retain(|number| *number != first);
-    sent.sort_unstable();
-    sent.dedup();
-    for number in sent {
-        cluster.stop(number);
-        cluster.start(number);
-    }
+    // Node 1 leads until the test stops it: the others elect only past
+    // 8 s without it, longer than a loaded host holds a leader up, so no
+    // other node leads and pools the program meanwhile.
+    let mut cluster = Cluster::tuned(3, |number, config| {
+        if number != 1 {
+            config.election_timeout_ms = (8_000, 10_000);
+        }
+    });
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let first = cluster.leader(agent);
+    assert_eq!(first, 1);
     let program = cluster.node(first).pinned()[0];
     assert!(cluster.node(first).pooled(&program), "the install pools it");
     wait_until("every replica pins the program", || {
