@@ -85,7 +85,8 @@ impl Stats {
 }
 
 /// `run`, a whole run of `program` from `entry` to its halt (its tracer's
-/// side note), proved to one root: cut by its largest class's budgets and
+/// side note), proved to one root: cut by the budgets of its class of the
+/// most steps (the first such), its steps and its pages, and
 /// each segment proved at the first class that holds it
 /// ([`vos_pvm_proof::prove_kernel`]), each verified in its class's leaf at
 /// its position, and the leaves folded in adjacent pairs, an odd node
@@ -96,7 +97,13 @@ pub fn prove_run(
     entry: &KernelEntry,
     run: &SideNote,
 ) -> Result<(Node, Stats), TreeError> {
-    let cut = program.shape.classes.len().saturating_sub(1);
+    let cut = program
+        .shape
+        .classes
+        .iter()
+        .enumerate()
+        .max_by_key(|(class, sizes)| (sizes.log_steps, core::cmp::Reverse(*class)))
+        .map_or(0, |(class, _)| class);
     let started = Instant::now();
     let segments = vos_pvm_proof::prove_kernel(run, &program.shape, cut, &SEGMENT)
         .map_err(TreeError::Segment)?;
