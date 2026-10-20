@@ -49,11 +49,12 @@ vectors:
 # anchors, and the fixtures checked against their generator and judged in
 # Wasm.
 # Memory-heavy: the library, `gates` and `isa` run two tests at a time, and
-# `kernel`, whose window runs each take several GiB, one at a time: each
-# window test (up to about 9 GiB at its peak) and `reads` (a million-row
-# fixture held for the process's life) in a process of its own, as freed
-# heap is not all returned between tests, so the recipe fits under a 12 GiB
-# limit, e.g.
+# `kernel`, whose proving runs each take several GiB, one at a time: each
+# of its tests (a window's up to about 9 GiB at its peak) in a process of
+# its own, and `reads` (a million-row fixture held for the process's life)
+# in one, as freed heap is not all returned between tests (a masked wrap
+# after the balance's, the fixtures' and others' in one process passed 12
+# GiB), so the recipe fits under a 12 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just test-proof`.
 # They cover every admitted format, the Poseidon2-M31 segment format among
 # them; the verifier's suite runs in `test`.
@@ -67,8 +68,7 @@ vectors:
 # `check-no-std`, and `judge-wasm`'s blob), one test at a time.
 test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
-    cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --test-threads=1 --skip reads:: --skip window_kernel::
-    for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel window_kernel:: -- --list --format terse | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
+    for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip reads:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     cargo test -p vos-pvm-proof --features debug-internals --test kernel reads:: -- --test-threads=1
     cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion -- leakage heavy --test-threads=1
 
