@@ -2850,3 +2850,11 @@ On `vos-core` (from `4447127a`).
     a hold keeps the existential deposit free (the vectors stay off that
     edge); funded accounts start with Balances' provider, and providers
     alone are pinned (a hold's consumer is FRAME's own).
+- **Measured** [measured]: generating both files and replaying G1–G18
+  take 0.3 s together; `spaces.json` 277 KB, `mutations.json` 129 KB.
+- **Gates:** `just check` at `b864c9ac` green, 98 suites, 1,292 passed,
+  0 failed, 22.6 min (12 GiB scope, `nice -n 10`, 8 jobs); `check-kit`
+  vendors and syncs the vectors with the kit. Its first run failed:
+  `check.py` vendors at the commit, so the vectors must be committed
+  before it runs.
+- **Reviews:** Opus and Fable (the vectors are the contract), pending.
