@@ -80,10 +80,10 @@ fn a_follower_behind_the_log_catches_up_by_a_snapshot() {
     let last = |node: &Node| node.store().snapshot().last_result(agent).unwrap();
     assert_eq!(last(caught_up), last(cluster.node(leader)));
     assert_eq!(cluster.value(follower, agent), total);
-    assert!(
-        caught_up.store().stale_epochs(agent).unwrap().is_empty(),
-        "the old epoch is dropped"
-    );
+    // Dropped in the background, after the switch.
+    wait_until("the old epoch is dropped", || {
+        caught_up.store().stale_epochs(agent).unwrap().is_empty()
+    });
 }
 
 /// Slows every snapshot chunk, as a slow link would.

@@ -3234,6 +3234,9 @@ test's or its harness's, not a node's:
   none before the sessions expired at a later fault ("no session met the
   clocks' jump"). The faults wait for one, up to `PAUSING`, after the
   jump.
+- **A background drop read at once.** A follower caught up by a snapshot
+  drops its old epoch in the background after the switch; two tests read
+  it gone at once ("the old epoch is dropped"). They wait for it.
 - **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
   counted any result past its start; an install applied late is one. A
   marker is an empty result, and only those count.
