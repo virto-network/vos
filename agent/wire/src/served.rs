@@ -13,7 +13,7 @@
 
 use alloc::vec::Vec;
 
-use crate::ids::{AgentId, InstanceId, MapId, MethodId};
+use crate::ids::{AgentId, InstanceId, MapId};
 use crate::keys::{self, Transform};
 use crate::vos_anchor::{RootKind, SpaceId};
 use crate::{Decode, Encode};
@@ -68,18 +68,15 @@ pub const REPRESENTATIVE_ASKED: &str = "asked";
 /// The tag [`REPRESENTATIVE_ASKED`] derives.
 pub const ASKED_TAG: u32 = 0xf5ab_2cca;
 
-/// The representative's method an agent's report calls
-/// (`crate::ids::derive_id("vos/method/", "report")`), with an
-/// [`AgentRoot`].
-pub const REPORT: MethodId = MethodId(0xacb0_3e21);
+/// How many windows before the one an agent reports the representative
+/// keeps that agent's rows of: the close of a window reads only that
+/// window's rows. A report of window `w` drops the sender's rows, and its
+/// asks, of windows before `w − REPORTS_KEPT`.
+pub const REPORTS_KEPT: u64 = 2;
 
-/// The name [`REPORT`] derives from.
-pub const REPORT_NAME: &str = "report";
-
-/// An agent's report of its root at a window's cut, the arguments of the
-/// representative's [`REPORT`]: the root's kind, the window, the root, and
-/// whether reads wait on the window's close. The reporting agent is the
-/// message's sender.
+/// An agent's report of its root at a window's cut, a [`crate::batch::Body::Report`]:
+/// the root's kind, the window, the root, and whether reads wait on the
+/// window's close. The reporting agent is the message's sender.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRoot {
     pub kind: u8,
@@ -152,6 +149,18 @@ pub fn representative_row(agent: AgentId, kind: RootKind, window: u64) -> Vec<u8
     raw[4] = kind as u8;
     raw[5..].copy_from_slice(&window.to_be_bytes());
     keys::committed(&representative_map(), &Transform::Ordered.apply(&raw))
+}
+
+/// The full key of the representative's ask of `agent` at window `window`:
+/// a row of its table [`REPRESENTATIVE_ASKED`], keyed `w (8, BE) ‖ agent
+/// (4, BE)`, ordered, its value empty.
+pub fn representative_ask(window: u64, agent: AgentId) -> Vec<u8> {
+    let mut raw = [0u8; 12];
+    raw[..8].copy_from_slice(&window.to_be_bytes());
+    raw[8..].copy_from_slice(&agent.0.to_be_bytes());
+    let mut key = keys::table_rows(REPRESENTATIVE, ASKED_TAG, Transform::Ordered);
+    key.extend_from_slice(&Transform::Ordered.apply(&raw));
+    key
 }
 
 /// The space root of window `window` over the representative's root

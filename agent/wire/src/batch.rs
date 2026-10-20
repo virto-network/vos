@@ -145,8 +145,9 @@ pub enum Input {
     },
     /// The agent's root at window `window`'s cut, `root`, for its space's
     /// representative `to`, and whether reads wait on its close
-    /// (`pending`): refine sends it to the representative's `report`, once
-    /// a window, after the latest window it reported ([`crate::keys::reported`]).
+    /// (`pending`): refine sends it to the representative as a
+    /// [`Body::Report`], once a window, after the latest window it reported
+    /// ([`crate::keys::reported`]).
     /// The node puts it in a batch once its replica has built the cut.
     #[codec(index = 7)]
     Report {
@@ -222,6 +223,12 @@ pub enum Body {
         rep_salt: [u8; 16],
         space_path: Vec<u8>,
     },
+    /// The sender's root at a window's cut, for the receiver, its space's
+    /// representative: refine stores it natively in the representative's
+    /// committed map ([`crate::served::representative_row`]), as no
+    /// program's call can, the sender its message's.
+    #[codec(index = 4)]
+    Report(crate::served::AgentRoot),
 }
 
 impl Body {
@@ -233,7 +240,7 @@ impl Body {
                 Answer::Done(bytes) | Answer::Failed { detail: bytes, .. } => bytes.len(),
                 Answer::Started(_) => 0,
             },
-            Body::Wait { .. } => 0,
+            Body::Wait { .. } | Body::Report(_) => 0,
             Body::Closed { space_path, .. } => space_path.len(),
         }
     }
@@ -243,7 +250,7 @@ impl Body {
         match self {
             Body::Call { awaiting, .. } => *awaiting,
             Body::Wait { awaiting, .. } => Some(*awaiting),
-            Body::Reply { .. } | Body::Closed { .. } => None,
+            Body::Reply { .. } | Body::Closed { .. } | Body::Report(_) => None,
         }
     }
 }

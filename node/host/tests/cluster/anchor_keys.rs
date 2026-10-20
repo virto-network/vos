@@ -3,7 +3,8 @@
 //! space resumed after an equivocation by rotating its only key; a leader
 //! whose keys the venue does not list signing nothing; a node that did not
 //! found the space replicating the representative once its key is
-//! registered, and anchoring after a failover; and a rotation whose process
+//! registered, and anchoring after a failover; anchors waiting through a
+//! long wait taken up after a failover; and a rotation whose process
 //! is killed before the venue lists the key, which the node keeps.
 //!
 //! The windows are an hour long (`cuts::clock`), and the tests move the
@@ -14,7 +15,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 use ed25519_dalek::{Signer, SigningKey};
-use vos_node::ReplaceError;
+use vos_node::{ReplaceError, roots};
 use vos_venue::{AnchorRefusal, VenueClient};
 use vos_wire::WindowClock;
 use vos_wire::ids::AgentId;
@@ -190,6 +191,50 @@ fn a_waiting_anchor_survives_a_leader_change() {
     let anchors = anchoring.venue.anchors(&space);
     assert_eq!(windows(&anchoring, &cluster), [0, 1], "window 0 taken up");
     assert!(anchors.iter().all(|anchor| anchor.signer == key));
+}
+
+/// Anchors left waiting through a long wait survive a failover: the venue
+/// lists no replica's key, so windows 0 to 2 close unsigned, past the two
+/// cut roots an agent keeps; every replica has built their cuts; the
+/// leader stops. Once the venue lists the new leader's key, it anchors
+/// every one of them, then window 3.
+#[test]
+fn waiting_anchors_survive_a_failover_through_a_long_wait() {
+    let (anchoring, mut cluster, clock, representative) = space(3);
+    let space = cluster.space.id();
+    let venue = &anchoring.venue;
+    for number in 1..=3 {
+        assert!(venue.remove_anchor_key(&space, &cluster.node(number).anchor_keys()[0]));
+    }
+    let leader = cluster.leader(representative);
+    for window in 0..3 {
+        closed(
+            &anchoring,
+            &cluster,
+            &clock,
+            (leader, representative),
+            window,
+        );
+    }
+    assert!(windows(&anchoring, &cluster).is_empty(), "nothing signed");
+    wait_until("every replica built window 2's cut", || {
+        (1..=3).all(|number| {
+            roots::latest_built(&cluster.node(number).store().snapshot(), representative)
+                .unwrap()
+                .is_some_and(|built| built >= 2)
+        })
+    });
+    cluster.stop(leader);
+    let next = cluster.leader(representative);
+    let key = cluster.node(next).anchor_keys()[0];
+    assert!(venue.add_anchor_key(&space, key));
+    assert_eq!(anchored(&anchoring, &cluster, &clock, 3).signer, key);
+    assert_eq!(
+        windows(&anchoring, &cluster),
+        [0, 1, 2, 3],
+        "every waiting window taken up"
+    );
+    assert!(venue.evidence().is_empty());
 }
 
 /// An equivocation in a space of one founder: a second root of window 0,

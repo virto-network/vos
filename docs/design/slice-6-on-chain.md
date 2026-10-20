@@ -409,7 +409,7 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | anchor digest | `BLAKE2b-256("vos/anchor/v1" ‖ venue ‖ space ‖ w (8, LE) ‖ kind (1) ‖ root)`, ed25519 by a registered anchor key |
 | registration | a founding key's ed25519 signature over `BLAKE2b-256("vos/space/register" ‖ venue ‖ space ‖ controller (32) ‖ start_window (8, LE))`; the venue takes the genesis itself and computes the id, so it learns the clock and the founding keys from the hash. The first window the space anchors at the venue is signed, so nobody who sees a registration can resubmit it with a start that keeps the space from ever anchoring; the venue also bounds it, `now_w − MaxRootAge / length_ms ≤ start_window ≤ now_w + 1` by its own time |
 | controller | an `AccountId` (32 bytes) at each venue: a person, a multisig, a pass account or a community account; it rotates the authorities and anchor keys and migrates the space |
-| anchor keys | each node's, in its store, oldest first: its node key, which a founding node's genesis names, then each `vos node anchor-key rotate` makes (6.14b). The representative's leader signs with the newest of its own the venue lists (`VenueClient::anchor_keys`: Kreivo's `AnchorKeys`, the model's set), and signs nothing when it lists none, alerting "replace this replica, or list one of its keys": that window waits, and the later ones behind it, until one is listed, or the space resumes after a `Suspended`, and is settled unsent past `B_w + MaxRootAge`. A wait survives a leader change only within the windows whose representative cut rows the replicas keep (`CUT_KEEP`): a new leadership takes up every window up to the close mark whose cut it keeps and whose root the venue does not hold. A rotation: the node makes the key and prints it; the controller registers it (`add_authority`); the node signs with it once listed; the controller removes the old one |
+| anchor keys | each node's, in its store, oldest first: its node key, which a founding node's genesis names, then each `vos node anchor-key rotate` makes (6.14b). The representative's leader signs with the newest of its own the venue lists (`VenueClient::anchor_keys`: Kreivo's `AnchorKeys`, the model's set), and signs nothing when it lists none, alerting "replace this replica, or list one of its keys": that window waits, and the later ones behind it, until one is listed, or the space resumes after a `Suspended`, and is settled unsent past `B_w + MaxRootAge`. A wait survives a leader change only within the windows whose representative cut roots the replicas keep (the last `CUT_KEEP`): a new leadership takes up every window up to the close mark whose cut root it keeps and whose root the venue does not hold; a window lost so is a gap, which the venue allows and the Clerk's carried state tolerates. An idle leader tries a waiting anchor again every 2 s. A rotation: the node makes the key and prints it; the controller registers it (`add_authority`); the node signs with it once listed; the controller removes the old one |
 | sovereign account | on Kreivo, `PalletId(*b"kv/space").into_sub_account_truncating(space)` (`b"modl" ‖ b"kv/space" ‖ space[0..20]`): derivable from the genesis before registration, so the founder funds it first; it holds the registration deposit and pays every fee and `submit` deposit of the space's authorities, within a spend budget per window that the controller sets and the venue enforces before inclusion, so a compromised node key cannot drain it (`spaces-pallet.md` §7) |
 | authorities | on Kreivo, a map `(space, account) → anchor key`: each node's own sr25519 account, paired with its ed25519 anchor key, set by the controller; an authority signs `anchor` and `submit`, and the sovereign account pays (`spaces-pallet.md` §7). On JAM, the registered anchor keys alone |
 | migration | `Migrate`, by the controller at each venue; each venue refuses anchors outside its range |
@@ -421,6 +421,9 @@ key; the signature; `Last < w < now_w` (gaps allowed; the open window,
 venue's range. A second root for one `(space, kind, w)` is
 stored as evidence and suspends the space until the controller removes
 both signing keys (`resume`); anyone may submit the second signed anchor.
+A suspended space's roots are not anchored, those anchored before
+included: its anchored windows go dark while it is suspended, and die if
+the suspension outlasts `MaxRootAge`.
 A space whose equivocating keys are all its founding keys (always so with
 a single founder) recovers by rotation: its nodes rotate, the controller
 registers the new keys, removes the old and resumes it (6.14b).
@@ -538,12 +541,16 @@ Rests on decisions 5, 6 and 8.
   2. The agent's cut build generates its `rows_proof` (6.12), and its
      leader, woken by the builder's finishing commit (`Woke::Built`),
      proposes a system input `Report { to, w, root, pending }`, whose step
-     sends the representative's `report` the
-     `AgentRoot { kind, w, root, pending }` (the agent the message's
-     sender) on their pair, exactly-once, once a window
-     (`keys::reported`), only once the node knows the representative.
-     The representative stores `root` under `RepKey(agent, 0, w)` and,
-     with `pending`, the agent under `asked`.
+     sends the representative a `Body::Report(AgentRoot { kind, w, root,
+     pending })` (the agent the message's sender) on their pair,
+     exactly-once, once a window (`keys::reported`), only once the node
+     knows the representative. The representative's refine stores it
+     natively, as it takes a `Closed`: `root` under `RepKey(agent, 0, w)`
+     and, with `pending`, the agent under `asked`, the sender's rows and
+     asks before `w − 2` dropped (`keys::reports(agent)` its last); a
+     report of a window at or before the sender's last, or past the
+     representative's open window + 1, stores nothing. The actor has no
+     `report` method, so no program's call writes these rows.
   3. **The paths' return:** the representative's own cut build at
      `cut_rep(w)` keeps, beside its root, the salt and `BatchProof` of
      `RepKey(agent, 0, w)` for each agent that asked whose row the cut
@@ -617,7 +624,8 @@ Rests on decisions 5, 6 and 8.
 - **`judge`, in order:** the format accepted; the program equals the pin;
   the venue prefix if venue-bound; the space rule (rootless: `NONE`;
   otherwise the space is not `NONE` and every root's is the statement's); every root anchored
-  (within the venue's migration range); the io-hash recomputed and the id;
+  (within the venue's migration range; a suspended space's roots,
+  anchored before or not, are not); the io-hash recomputed and the id;
   unseen; the proof (at most 256 KiB, the format's own decode, nothing
   after it) against the pinned program id and the recomputed io-hash.
 - **`Seen` and time:** a rooted statement's entry may be pruned once its
@@ -1244,7 +1252,7 @@ lands.
     `closed` row; `a_report_is_stored_as_a_read_proves_it` pins that the
     representative's `roots` map stores exactly `representative_row`'s key
     bytes and a bare 32-byte value, its `asked` table the key the node
-    reads, and its `report` the method id the agents call.
+    reads; no program's call of a method named `report` writes them.
   - **Catch-up by log across many windows** [decided: no node-local
     cap]: the pruning bounds it already. A replica replaying its log
     applies each recording's deletes as it goes, so the cuts pending
@@ -1334,9 +1342,13 @@ single-founder space that equivocated was dead at its venue.
     within `MaxRootAge`; one past `B_w + MaxRootAge` by the leader's clock
     is settled unsent. A new leadership takes up the windows an earlier one
     left waiting: every window up to the close mark whose cut root the
-    replica keeps (about `CUT_KEEP` windows) and whose `S_w` the venue
-    does not hold, so a wait survives a failover or a replacement only
-    within those windows. The alert says to replace the replica or list one
+    replica keeps (the representative's last `CUT_KEEP` windows, an
+    agent's two) and whose `S_w` the venue does not hold, so a wait
+    survives a failover or a replacement only within those windows; a
+    window lost so is a gap, which the venue allows and the Clerk's
+    carried state tolerates (the next window settles the same totals).
+    An idle representative's leader hands the venue a waiting anchor
+    again every 2 s, not only at its next batch. The alert says to replace the replica or list one
     of its keys: no leadership moves off a replica whose key is delisted;
   - the representative is created on founding nodes; a replacement adds
     any node holding a key the venue lists for the space (without a venue,
@@ -1651,6 +1663,23 @@ fees are the teammate's.
   replays, and builds each cut in turn; by snapshot it does none of
   this. The runbook says so; 6.14 decides whether a node-local cap
   bounds it.
+- **Ops note (the representative's load, M3a's Fable review):** every
+  agent, idle or not, costs a window a marker, a build, a report (a Raft
+  entry and a pair message) and, at the representative, a committed write
+  its cut then builds: linear in agents (at the builder's 20k rows/s,
+  about 50 s a window at a million agents). A space of tens of thousands
+  of agents is fine as built. The lever: an agent reports only when reads
+  wait on the window or its root changed, since `RepKey(agent, 0, w)` has
+  no consumer but a read's path; a dead agent's three rows stay (harmless).
+- **Ops note (the representative's leader's clock, M3a's Fable review):**
+  a forward jump of Δ records up to `MAX_CUTS` representative cuts at one
+  version, closes them with no paths and moves the close mark past them,
+  so every read of every agent at those windows re-cuts and ends
+  `NotClosed`: an outage of min(Δ, 32 L). A persistent lead of more than
+  D over an agent's leader starves that agent's reads alike. The runbook
+  says so; an alert when an agent's reports keep landing after the close,
+  and later a guard (the representative's marker gated on a quorum of
+  follower clocks past the boundary).
 - **Tests:** first, a 256 KiB extrinsic submitted, refined and read;
   every fixture judged alike on the JAM-only host; anchors, an anchor
   signed by an unregistered key, equivocation, migration; a default-agent

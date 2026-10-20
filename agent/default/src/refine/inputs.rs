@@ -117,6 +117,11 @@ pub(crate) fn message(
             run.writes = closes::closed(base, from, window, row);
             Stepped::ran(run)
         }
+        Body::Report(report) => {
+            let mut run = consumed(input, Outcome::Done(Vec::new()));
+            (run.writes, run.committed) = closes::stored(base, from, report).unwrap_or_default();
+            Stepped::ran(run)
+        }
     };
     stepped.mark = Some(Mark::Pair(from, sequence));
     stepped

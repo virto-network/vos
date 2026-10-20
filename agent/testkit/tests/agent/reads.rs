@@ -1227,9 +1227,9 @@ fn old_cut_rows_are_pruned() {
     assert!(reads.node.get(&keys::closed(12)).is_none());
 }
 
-/// The agent's report of its root at a window's cut: a call of the
-/// representative's `report` with the window, the root and whether reads
-/// wait, awaiting nothing, and the mark; none again for that window or an
+/// The agent's report of its root at a window's cut: a `Body::Report` to
+/// the representative with the window, the root and whether reads wait,
+/// and the mark; none again for that window or an
 /// earlier one, none to itself, and none from an agent of no space.
 #[test]
 fn a_report_goes_once_a_window() {
@@ -1251,12 +1251,7 @@ fn a_report_goes_once_a_window() {
         ran(&result.steps[0]).messages,
         [vos_wire::result::Outgoing {
             to: REPRESENTATIVE,
-            body: Body::Call {
-                instance: vos_wire::served::REPRESENTATIVE,
-                method: vos_wire::served::REPORT,
-                arguments: call.encode(),
-                awaiting: None,
-            },
+            body: Body::Report(call),
         }]
     );
     assert_eq!(

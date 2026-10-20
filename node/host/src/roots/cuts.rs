@@ -306,7 +306,9 @@ pub(super) struct Finish {
 
 impl Finish {
     /// The writes that finish the build: the root at the cut, the cut
-    /// roots kept (this one and the latest before it), the window's undo
+    /// roots kept (this one and the latest before it; the representative's
+    /// latest [`defaults::CUT_KEEP`], so a new leadership takes up every
+    /// anchor still waiting through a long wait), the window's undo
     /// rows dropped, as `fresh` holds them, and the proof of each pending
     /// request the cut serves ([`served_at`]), read off `tree`, the agent's
     /// tree at the cut, its values off `at`; the representative's, its
@@ -318,7 +320,10 @@ impl Finish {
         writes: &mut BTreeMap<Vec<u8>, Option<Vec<u8>>>,
     ) -> Result<(), Error> {
         let Self {
-            agent, cut, root, ..
+            agent,
+            cut,
+            root,
+            representative,
         } = *self;
         writes.insert(
             keys::cut_root(cut.window),
@@ -326,7 +331,12 @@ impl Finish {
         );
         let kept = cut_roots(fresh, agent)?;
         let older = kept.keys().filter(|kept| **kept < cut.window).copied();
-        for stale in older.rev().skip(1) {
+        let older_kept = if representative {
+            defaults::CUT_KEEP - 1
+        } else {
+            1
+        };
+        for stale in older.rev().skip(older_kept as usize) {
             writes.insert(keys::cut_root(stale), None);
         }
         for row in fresh.scan(agent, &keys::undos(cut.window), None) {
@@ -361,7 +371,7 @@ impl Finish {
                 Err(error) => return Err(error),
             }
         }
-        if self.representative {
+        if representative {
             let closing = closing(at, agent, cut.window, tree, root)?;
             writes.insert(keys::closing(cut.window), Some(closing.encode()));
         }

@@ -132,6 +132,10 @@ fn keys_keep_their_bytes() {
     assert_eq!(keys::moved(sequence), cat(&[&[0x00, 0x1f], &at]));
     assert_eq!(keys::serving(), [0x00, 0x20]);
     assert_eq!(keys::close_mark(), [0x00, 0x21]);
+    assert_eq!(
+        keys::reports(AgentId(0x0102_0304)),
+        [0x00, 0x22, 0x01, 0x02, 0x03, 0x04]
+    );
     assert_eq!(keys::closing(sequence), cat(&[&[0x02, 0x07], &at]));
     assert_eq!(keys::closings(), [0x02, 0x07]);
     assert_eq!(

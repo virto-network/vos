@@ -89,6 +89,14 @@ pub(crate) fn body() -> impl Strategy<Value = Body> {
             workflow: WorkflowId(workflow),
             awaiting,
         }),
+        (any::<u8>(), any::<u64>(), any::<[u8; 32]>(), any::<bool>()).prop_map(
+            |(kind, window, root, pending)| Body::Report(vos_wire::served::AgentRoot {
+                kind,
+                window,
+                root,
+                pending,
+            })
+        ),
     ]
 }
 

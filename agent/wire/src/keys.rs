@@ -148,6 +148,7 @@ enum Row {
     Moved = 0x1f,
     Serving = 0x20,
     CloseMark = 0x21,
+    Reports = 0x22,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -612,6 +613,14 @@ pub fn serving() -> Vec<u8> {
 /// its path for it. Replicated.
 pub fn close_mark() -> Vec<u8> {
     Row::CloseMark.prefix().to_vec()
+}
+
+/// The last window whose root agent `agent` reported to this agent, its
+/// space's representative ([`crate::batch::Body::Report`]): replicated,
+/// written by the report's step. A report of that window or an earlier
+/// one stores nothing.
+pub fn reports(agent: AgentId) -> Vec<u8> {
+    key(&[&Row::Reports.prefix(), &agent.0.to_be_bytes()])
 }
 
 /// The representative's close of the window `window`, node-local, written

@@ -124,6 +124,9 @@ struct Leader {
     /// The anchors this leadership has still to hand the venue, by window:
     /// the representative's root at the cut.
     unanchored: std::collections::BTreeMap<u64, [u8; 32]>,
+    /// When it last handed the venue an anchor that then waited: an idle
+    /// leader tries again a recheck later.
+    anchor_tried: Option<Instant>,
     /// The window whose anchor this leadership last alerted it could not
     /// sign, or the venue would not take yet for want of a key or a
     /// resumption: alerted once a window.
@@ -195,6 +198,7 @@ impl Leader {
             told: None,
             anchored: std::collections::BTreeSet::new(),
             unanchored: std::collections::BTreeMap::new(),
+            anchor_tried: None,
             alerted: None,
             seeded: false,
         }
@@ -312,8 +316,10 @@ impl Leader {
                 smol::future::yield_now().await;
                 return Some(Taken::Marker);
             }
-            // A read proved at its cut, a report or a close.
-            if self.serve_due() || self.duties_due() {
+            // A read proved at its cut, a report, a close, or a waiting
+            // anchor to try again.
+            let anchor = self.anchor_wait();
+            if self.serve_due() || self.duties_due() || anchor == Some(Duration::ZERO) {
                 smol::future::yield_now().await;
                 return Some(Taken::Serve);
             }
@@ -341,7 +347,7 @@ impl Leader {
                 Woke::Round
             };
             let recheck = async {
-                match [sweep, cut].into_iter().flatten().min() {
+                match [sweep, cut, anchor].into_iter().flatten().min() {
                     Some(wait) => smol::Timer::after(wait).await,
                     None => std::future::pending().await,
                 };

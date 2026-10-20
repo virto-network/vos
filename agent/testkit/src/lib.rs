@@ -490,6 +490,7 @@ impl Testkit {
                 };
                 self.closed(from, *window, row)
             }
+            Body::Report(report) => self.stored(from, *report),
         }
     }
 

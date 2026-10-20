@@ -336,8 +336,9 @@ first its node key (a founding node's genesis key), and signs nothing when
 none is listed. `vos node anchor-key rotate` makes a node a new key; the
 controller registers it (`add_authority`), the node signs with it once
 listed, and the controller removes the old (`remove_anchor_key`, or the
-same `add_authority` update). A node replicates the space's representative
-only while it holds a listed key. After an equivocation, `resume` follows
+same `add_authority` update). A node may be added as a replica of the
+space's representative only while it holds a listed key (checked when it is
+added). After an equivocation, `resume` follows
 the removal of both signing keys, so a space of one founder rotates its
 key first (§13, question 12).
 

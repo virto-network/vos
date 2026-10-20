@@ -1,18 +1,22 @@
 //! A window's close: an agent's report of its root at the window's cut to
-//! its space's representative, the representative's close sending each
-//! agent that asked its path, and an agent taking its `Closed`.
+//! its space's representative, the representative storing it, the
+//! representative's close sending each agent that asked its path, and an
+//! agent taking its `Closed`.
 
 use alloc::vec::Vec;
 
 use vos_wire::batch::Body;
 use vos_wire::ids::AgentId;
-use vos_wire::result::{InputRef, Outcome, Outgoing, Run, Write};
-use vos_wire::served::{AgentRoot, ClosedRow, REPORT, REPRESENTATIVE};
+use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Run, Write};
+use vos_wire::served::{
+    AgentRoot, ClosedRow, REPORTS_KEPT, REPRESENTATIVE, representative_ask, representative_row,
+};
 use vos_wire::vos_anchor::RootKind;
-use vos_wire::{Decode, Encode, SpaceId, defaults, keys};
+use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
 
+use super::Overlay;
 use super::base::{Base, Corrupt};
-use super::inputs::consumed;
+use super::inputs::{consumed, split_writes};
 
 /// A row through the refine's earlier steps, decoded.
 fn read<T: Decode>(base: &Base, key: &[u8]) -> Result<Option<T>, Corrupt> {
@@ -23,9 +27,8 @@ fn read<T: Decode>(base: &Base, key: &[u8]) -> Result<Option<T>, Corrupt> {
 }
 
 /// The step of an agent's report of `root`, its root at window `window`'s
-/// cut, to its space's representative `to`: a call of the
-/// representative's `report`, which awaits no answer, and the report's
-/// mark ([`keys::reported`]). A window at or before the mark, an agent of
+/// cut, to its space's representative `to`: a [`Body::Report`], and the
+/// report's mark ([`keys::reported`]). A window at or before the mark, an agent of
 /// no space, or one reporting to itself sends nothing.
 pub(crate) fn report(base: &Base, to: AgentId, window: u64, root: [u8; 32], pending: bool) -> Run {
     let input = InputRef::Report { window };
@@ -41,21 +44,14 @@ pub(crate) fn report(base: &Base, to: AgentId, window: u64, root: [u8; 32], pend
     {
         return run;
     }
-    let arguments = AgentRoot {
-        kind: RootKind::Space as u8,
-        window,
-        root,
-        pending,
-    }
-    .encode();
     run.messages.push(Outgoing {
         to,
-        body: Body::Call {
-            instance: REPRESENTATIVE,
-            method: REPORT,
-            arguments,
-            awaiting: None,
-        },
+        body: Body::Report(AgentRoot {
+            kind: RootKind::Space as u8,
+            window,
+            root,
+            pending,
+        }),
     });
     run.writes.push(Write {
         key: keys::reported(),
@@ -135,4 +131,64 @@ pub(crate) fn closed(base: &Base, from: AgentId, window: u64, row: ClosedRow) ->
         key: keys::closed(window),
         value: Some(row.encode()),
     }]
+}
+
+/// What agent `from`'s report writes in this agent, its space's
+/// representative: the root at `representative_row(from, Space, w)`, as a
+/// bare 32-byte value, and with `pending` an ask
+/// ([`representative_ask`]); the sender's rows of windows before
+/// `w −` [`REPORTS_KEPT`] go, and its asks of them, no other agent's; and
+/// the sender's last report ([`keys::reports`]). Nothing for a report of
+/// another kind than the space's, from itself, of a window at or before
+/// the sender's last, or past the one after this agent's open window; nor
+/// in an agent of no space or without the representative installed, nor
+/// when a row it reads does not decode.
+pub(crate) fn stored(
+    base: &Base,
+    from: AgentId,
+    report: AgentRoot,
+) -> Result<(Vec<Write>, Vec<CommittedWrite>), Corrupt> {
+    let nothing = Ok((Vec::new(), Vec::new()));
+    let space = read::<SpaceId>(base, &keys::space())?;
+    let clock = read::<WindowClock>(base, &keys::clock())?;
+    let (Some(space), Some(clock)) = (space, clock) else {
+        return nothing;
+    };
+    let last = read::<u64>(base, &keys::reports(from))?;
+    let window = report.window;
+    let open = clock.window(base.time);
+    let ahead = window > open.map_or(0, |open| open.saturating_add(1));
+    if space == SpaceId::NONE
+        || report.kind != RootKind::Space as u8
+        || from == base.agent
+        || !base.holds(&keys::installed(REPRESENTATIVE))
+        || ahead
+        || last.is_some_and(|last| window <= last)
+    {
+        return nothing;
+    }
+    let mut overlay = Overlay::new();
+    if let (Some(last), Some(oldest)) = (last, window.checked_sub(REPORTS_KEPT)) {
+        // The sender's rows are of its last report's window and the
+        // `REPORTS_KEPT` before it: the rest went with earlier reports.
+        for at in (last.saturating_sub(REPORTS_KEPT)..=last).filter(|at| *at < oldest) {
+            for key in [
+                representative_row(from, RootKind::Space, at),
+                representative_ask(at, from),
+            ] {
+                if base.read(&key)?.is_some() {
+                    overlay.insert(key, None);
+                }
+            }
+        }
+    }
+    overlay.insert(
+        representative_row(from, RootKind::Space, window),
+        Some(report.root.to_vec()),
+    );
+    if report.pending {
+        overlay.insert(representative_ask(window, from), Some(Vec::new()));
+    }
+    overlay.insert(keys::reports(from), Some(window.encode()));
+    Ok(split_writes(overlay))
 }

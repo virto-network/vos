@@ -1,10 +1,13 @@
 //! A window's close in the model: an agent's report of its root at the
-//! window's cut, the representative's close, and an agent's `Closed`.
+//! window's cut, the representative storing it, the representative's
+//! close, and an agent's `Closed`.
 
 use vos_wire::batch::Body;
 use vos_wire::ids::AgentId;
 use vos_wire::result::{Outcome, Outgoing, Write};
-use vos_wire::served::{AgentRoot, ClosedRow, REPORT, REPRESENTATIVE};
+use vos_wire::served::{
+    AgentRoot, ClosedRow, REPORTS_KEPT, REPRESENTATIVE, representative_ask, representative_row,
+};
 use vos_wire::vos_anchor::RootKind;
 use vos_wire::{Decode, Encode, SpaceId, defaults, keys};
 
@@ -36,21 +39,14 @@ impl Testkit {
         if !spaced || to == self.agent || reported.is_some_and(|(last, _)| last >= window) {
             return self.written(Vec::new(), Vec::new());
         }
-        let arguments = AgentRoot {
-            kind: RootKind::Space as u8,
-            window,
-            root,
-            pending,
-        }
-        .encode();
         let call = Outgoing {
             to,
-            body: Body::Call {
-                instance: REPRESENTATIVE,
-                method: REPORT,
-                arguments,
-                awaiting: None,
-            },
+            body: Body::Report(AgentRoot {
+                kind: RootKind::Space as u8,
+                window,
+                root,
+                pending,
+            }),
         };
         let mark = Write {
             key: keys::reported(),
@@ -128,5 +124,61 @@ impl Testkit {
             Vec::new()
         };
         self.written(writes, Vec::new())
+    }
+
+    /// The step of agent `from`'s report in this agent, its space's
+    /// representative: the root under `representative_row(from, Space, w)`
+    /// and, with `pending`, an ask; the sender's rows and asks of windows
+    /// before `w −` [`REPORTS_KEPT`] gone; its last report's mark. Nothing
+    /// for a report of another kind, from itself, of a window at or before
+    /// its last, or past the one after the open window; nor in an agent of
+    /// no space or without the representative installed.
+    pub(crate) fn stored(&mut self, from: AgentId, report: AgentRoot) -> Step {
+        let Some((space, clock)) = self.space else {
+            return self.written(Vec::new(), Vec::new());
+        };
+        let last = self.held::<u64>(&keys::reports(from));
+        let window = report.window;
+        let ahead = window
+            > clock
+                .window(self.time)
+                .map_or(0, |open| open.saturating_add(1));
+        if space == SpaceId::NONE
+            || report.kind != RootKind::Space as u8
+            || from == self.agent
+            || !self.instances.contains_key(&REPRESENTATIVE)
+            || ahead
+            || last.is_some_and(|last| window <= last)
+        {
+            return self.written(Vec::new(), Vec::new());
+        }
+        let mut overlay = std::collections::BTreeMap::new();
+        if let (Some(last), Some(oldest)) = (last, window.checked_sub(REPORTS_KEPT)) {
+            for at in (last.saturating_sub(REPORTS_KEPT)..=last).filter(|at| *at < oldest) {
+                for key in [
+                    representative_row(from, RootKind::Space, at),
+                    representative_ask(at, from),
+                ] {
+                    if self.state.contains_key(&key) {
+                        overlay.insert(key, None);
+                    }
+                }
+            }
+        }
+        overlay.insert(
+            representative_row(from, RootKind::Space, window),
+            Some(report.root.to_vec()),
+        );
+        if report.pending {
+            overlay.insert(representative_ask(window, from), Some(Vec::new()));
+        }
+        overlay.insert(keys::reports(from), Some(window.encode()));
+        let (writes, committed) = crate::split_writes(overlay);
+        self.steps += 1;
+        let mut step = Step::consumed(Outcome::Done(Vec::new()));
+        step.writes = writes;
+        step.committed = committed;
+        self.apply(&step, Vec::new());
+        step
     }
 }

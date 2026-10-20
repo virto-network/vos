@@ -10,6 +10,8 @@
 //! nothing for a window its mark has passed ([`keys::reported`],
 //! [`keys::close_mark`]).
 
+use std::time::{Duration, Instant};
+
 use ed25519_dalek::Signer;
 use vos_venue::AnchorRefusal;
 use vos_wire::batch::Input;
@@ -30,6 +32,11 @@ use crate::store::Snapshot;
 /// [`defaults::CLOSE_PATHS`] paths.
 const CLOSES: usize = 8;
 
+/// How long an idle representative's leader waits before handing the
+/// venue a waiting anchor again: a venue's clock a block behind takes it
+/// within one.
+const ANCHOR_RECHECK: Duration = Duration::from_secs(2);
+
 /// The closes a leader proposes in a batch, or the hook that stopped it.
 pub(super) enum Closes {
     Due(Vec<Pending>),
@@ -48,6 +55,16 @@ impl Leader {
         self.reports(&snapshot)
             .is_ok_and(|reports| !reports.is_empty())
             || unsent(&snapshot, self.id, self.represents()).is_ok_and(|unsent| !unsent.is_empty())
+    }
+
+    /// How long until an idle leader hands the venue a waiting anchor
+    /// again: a recheck after the last try; none while none waits.
+    pub(super) fn anchor_wait(&self) -> Option<Duration> {
+        if self.unanchored.is_empty() {
+            return None;
+        }
+        let since = self.anchor_tried.map_or(ANCHOR_RECHECK, |at| at.elapsed());
+        Some(ANCHOR_RECHECK.saturating_sub(since))
     }
 
     /// Whether this agent is its space's representative.
@@ -144,8 +161,9 @@ impl Leader {
     }
 
     /// Take up, at a leadership's start, the anchors an earlier one left
-    /// waiting: every window up to the close mark whose cut this replica
-    /// still keeps (its last [`defaults::CUT_KEEP`] or so) and
+    /// waiting: every window up to the close mark whose cut root this
+    /// replica still keeps (the representative's last
+    /// [`defaults::CUT_KEEP`] windows) and
     /// whose root the venue does not hold anchored. Its close was sent, so
     /// no unsent close names it; the root is the representative's at its
     /// cut, the one its close carried.
@@ -194,8 +212,9 @@ impl Leader {
     /// window order, until one waits: a window the venue's clock has not
     /// yet closed, an anchor no key of this node's can sign, or one the
     /// venue will not take until its controller acts (a key registered, the
-    /// space resumed). The next batch tries again, with the later ones
-    /// behind it, so none passes it. A window past `MaxRootAge` by this
+    /// space resumed). The next batch tries again, or an idle leader a
+    /// recheck later ([`Leader::anchor_wait`]), with the later ones behind
+    /// it, so none passes it. A window past `MaxRootAge` by this
     /// node's clock is settled here, unsent: no venue takes it. One taken,
     /// or refused for good, is
     /// settled; the close goes on either way, and a statement over an
@@ -213,6 +232,7 @@ impl Leader {
                     "the space's root waited past `MaxRootAge`; no venue takes it now"
                 );
             } else if !self.anchor(window, &root) {
+                self.anchor_tried = Some(Instant::now());
                 return;
             }
             self.unanchored.remove(&window);

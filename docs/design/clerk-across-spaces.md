@@ -243,11 +243,27 @@ slice 5's 5.15).
     window of the pair's last settlement, `(c, w_last)`, and takes a
     statement only when its `c_prev` is `c` and its root's window is past
     `w_last`, so the cuts a pair settles at are ordered;
-  - it reconciles pairs, moves the nets, and refuses an aggregate below
-    zero;
+  - it reconciles progressively: the two spaces cut at different times,
+    so while a transfer is in flight A's claim and B's never agree
+    (`net_A ≠ −net_B`), and a handler that waited for them to agree
+    would never settle under traffic. Per (A, B, currency) it keeps the
+    cumulative claims `C_A = Σ net_A` and `C_B = Σ net_B` and the amount
+    moved `M`, and after each accepted statement moves
+    `x = min(C_A − M, −C_B − M)` from A's sovereign account to B's when
+    `x > 0` (the mirror when both are negative), leaving the rest
+    claimed: each side is bounded by the other's claim, so an over-claim
+    moves nothing past what the other side states, and an under-claim
+    costs the other side liveness alone, within its exposure cap. The
+    `seq` in the output counts settlements (redundant with `c`); it is no
+    message sequence;
+  - `peer` is a space registered at the same venue, and not the
+    statement's space;
+  - it refuses an aggregate below zero;
   - it is two-sided, as every value-moving handler is (Fable's review of
     slice 6's design round, finding 9).
-- **Tests:** two spaces settling a window at the venue.
+- **Tests:** two spaces settling a window at the venue; the ledger's
+  `Settled` debit and credit totals never fall (the kernel's "no total
+  fell" check rests on it), pinned by a test in the Clerk's slice.
 - **Measured:** the settlement handler's weight or gas per statement.
 
 ### C.6 Per-target limits (the owner's decision)
