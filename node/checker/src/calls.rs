@@ -98,8 +98,9 @@ pub fn install_of(instance: InstanceId, elf: &[u8]) -> Install {
 
 /// Package `elf` installed as `instance` of `agent` at the node `leader`
 /// names on each try: sent again while the node it reached no longer
-/// leads, as a client follows its leader. An install sent again
-/// overwrites. It must run.
+/// leads, as a client follows its leader, or once it answered that it may
+/// have run, its node's deadline passed while a loaded host derived the
+/// programs. An install sent again overwrites. It must run.
 #[track_caller]
 pub fn install_at_leader<N: Deref<Target = Node>>(
     leader: impl Fn() -> N,
@@ -107,10 +108,11 @@ pub fn install_at_leader<N: Deref<Target = Node>>(
     instance: InstanceId,
     elf: &[u8],
 ) {
-    let until = Instant::now() + crate::spaces::IN_PROCESS_WAIT;
+    // Past one try's whole deadline, for the next.
+    let until = Instant::now() + 2 * crate::spaces::IN_PROCESS_WAIT;
     loop {
         match smol::block_on(leader().install(agent, instance, elf, Vec::new())) {
-            Err(CallError::NotLeader(_)) if Instant::now() < until => {
+            Err(CallError::NotLeader(_) | CallError::TimedOut) if Instant::now() < until => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             answer => return installed(answer),

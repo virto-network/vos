@@ -3269,6 +3269,11 @@ test's or its harness's, not a node's:
   replica a snapshot caught up leads, within 20 s: within 16 moves now.
 - **The attest's and anchor's latency** from `B_0` bounded by `D + 10 s`
   (34.4 s taken): `D + 30 s`, far within the 120 s window.
+- **An install answered `TimedOut`.** A loaded host derived the
+  install's programs past the node's 30 s answer deadline
+  (`a_program_leaves_the_pool_with_its_last_pin`). `install_at_leader`
+  sends it again then too, as an install sent again overwrites, within
+  twice the in-process wait.
 - **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
   counted any result past its start; an install applied late is one. A
   marker is an empty result, and only those count.
