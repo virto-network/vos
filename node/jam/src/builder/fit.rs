@@ -37,9 +37,12 @@
 //!   attests about 28M, traded against each other by the step's gas).
 //!   [`cap::JAM`]'s are about 35 times fewer.
 //! - **Its exports and imports** are at most a package's segments, and its
-//!   payload at most a package's input. A batch that does not fit loses its
-//!   later inputs, and a sweep its later rows, which wait for the next; a
-//!   batch holds at most [`MAX_INPUTS`].
+//!   payload at most a package's input; the package itself, its payload and
+//!   its imports' references with its framing, within JAM-NP's CE 133 bound
+//!   on a work package a guarantor takes ([`MAX_PACKAGE`]), which a package
+//!   past it fails at submission. A batch that does not fit loses its later
+//!   inputs, and a sweep its later rows, which wait for the next; a batch
+//!   holds at most [`MAX_INPUTS`].
 //!
 //! **Pages in DA:** a workflow whose snapshot holds a page DA no longer
 //! has, by where the store says it was exported, has its rows left out of
@@ -80,6 +83,19 @@ use crate::{Error, gas};
 /// The largest work package input the builder makes: PolkaJam's
 /// `max_input` (`W_B`) is 13,791,360 bytes, imports and all.
 pub(crate) const MAX_INPUT: usize = 12 << 20;
+/// JAM-NP's CE 133 bound on a work package: its first message, the core's
+/// index (2 bytes) and the package, at most 204,802 bytes, so a guarantor
+/// downloads no huge package before it checks its authorization. PolkaJam
+/// enforces it; extrinsics travel apart, under `W_B` alone.
+pub const MAX_PACKAGE: usize = 204_800;
+/// A package's bytes beyond its payload and its imports' references: its
+/// authorization, its context and its item's fixed fields, 269 bytes with
+/// PolkaJam's bootstrap authorizer [6.0b], with room for the refusals one
+/// testnet gave near 201.6 KB that the bound does not explain.
+pub const PACKAGE_FRAMING: usize = 4 << 10;
+/// An import's reference in a work item: a segment root and its index.
+pub const IMPORT_REF: usize = 32 + 2;
+
 /// What a package's refine keeps past its estimate, in parts of a
 /// thousand of its gas.
 pub const MARGIN: u64 = 50;
@@ -179,6 +195,12 @@ impl Prepared {
         (self.simulation.pages + result_segments(self.simulation.encoded.len())) as u32
     }
 
+    /// The package's bytes as CE 133 bounds them, at most: its payload, its
+    /// imports' references and [`PACKAGE_FRAMING`].
+    pub fn package_bytes(&self) -> usize {
+        self.payload.len() + self.segments.len() * IMPORT_REF + PACKAGE_FRAMING
+    }
+
     /// The segments the package imports, from `segments`.
     pub fn imports(&self, segments: &dyn Segments) -> Result<Vec<Vec<u8>>, Error> {
         self.package
@@ -255,7 +277,8 @@ impl Builder {
             };
             let fits = prepared.exports() as usize <= MAX_SEGMENTS
                 && prepared.segments.len() <= MAX_SEGMENTS
-                && prepared.payload.len() + prepared.segments.len() * SEGMENT <= MAX_INPUT;
+                && prepared.payload.len() + prepared.segments.len() * SEGMENT <= MAX_INPUT
+                && prepared.package_bytes() <= MAX_PACKAGE;
             let beyond = prepared.gas - fitting.budget;
             match fitting.next(fits, beyond, shrinks(&inputs)) {
                 Next::Take => {
