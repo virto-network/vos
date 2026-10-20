@@ -3167,3 +3167,67 @@ unchanged by it (`just check-kit`, `just conformance`).
 
 **6.19 accepted.**
 
+
+## Step 6.18: the prover worker and the reproducibility gate
+
+On `s6/worker` (from `9e17ab91`). The full record is the step's log.
+
+- **Built:** `vos-node-prover` (`node/prover`), linked by the node, the
+  masked prover behind its `prover` feature. A node-local table
+  (`NodeRow::ProverJob`, `ProverMark`): each statement's job by id,
+  `queued | proving | proved(proof) | submitted | accepted | refused(code)
+  | dead`, and a watermark per agent. Every replica running a prover reads
+  its log into jobs through its applied index, and compaction keeps the
+  entries past its mark (at most 2^16 behind, then an alert); the leader
+  alone proves and submits. For each attest at a cut: the statement
+  (format 39, the program id recomputed from the kernel's blob) and its
+  id; dead when its anchor would pass `MaxRootAge` by the venue's time
+  (`VenueClient::time`) before the proof ends; the kernel re-run on its
+  witness (output, public arguments, roots and io-hash the record's, else
+  refused); segments at the class of the most steps, leaves, folds and the
+  masked wrap (`vos_pvm_recair::tree::prove_final`); the proof kept and
+  pinned until its job finishes, recorded through the leader
+  (`Input::Proven { window, id, proof }`, `keys::proven(window, id)`,
+  `00 23 ‖ window ‖ id`, the first proof alone); submitted once recorded
+  and anchored, a repeat accepted, a lost answer again after 30 s,
+  doubling. A restart re-queues the job it was proving; a prover's panic
+  is caught, three attempts and the statement is refused; a new leader
+  takes a recorded statement with the proof fetched from a replica, or
+  proves it again past its patience. `JamVenue` answers a statement its
+  service holds seen accepted, unsent.
+- **The reproducibility gate:** `pvm/proof/src/constants.rs` pins the
+  program ids of the window kernel, `balance` and the predicate, `H_fold`
+  and the wrap's roots (28, 39), recomputed in `test-proof` with and
+  without `debug-internals`; `vos program-id <elf> <method>` (and
+  `--circuits`); `just repro-aarch64` (qemu-user, the aarch64 GNU
+  toolchain) [measured]: every id and constant equal on aarch64. They pin
+  the known programs; a venue or an installer trusts an id only by
+  recomputing it from the blob.
+- **Tests:** the worker over a model node (a restart mid-proof leaves one
+  proof; a duplicate submission accepted once; a leader change proving
+  nothing twice; a dead statement skipped; an io-hash mismatch refused; a
+  panicking prover refused after three); the masked prover's checks on
+  real kernel runs; on three nodes, a read's statement proved, recorded and
+  accepted, a recorded statement submitted once across a leader change and
+  a compaction, a record applied during a proof proved with the log
+  compacting every 8 entries.
+- **Throughput gate** [measured, three runs, the machine shared, load
+  10–26]: the window statement 40.3–50.0 s (3 segments 22–25 s, leaves
+  6.5–9.4, folds 3.6–7.4, the masked wrap 8.0–9.7), `balance` 17.9–28.6
+  s, peak resident about 6.0 GiB: three window statements take 121–150 s
+  of a 10-minute window, leaving room for 16–27 `balance` statements. **Pass**; the prover-time
+  levers are not needed. Cut at a short class instead (before `eae5bed6`)
+  the window took 176 s in 17 segments: the gate now asserts at most 4.
+- **The review** (Opus, `6.18-review.md`): accept after F1–F5, every
+  finding folded (`6b7ec21b`): F1 records lost to compaction (every
+  replica scans, compaction held by the mark); F2 `JamVenue::time`; F3
+  JAM's seen read before a submit, resubmissions backed off; F4 proofs
+  pinned; F5 panics caught, attempts counted; F6–F10 the gate's segments,
+  the recipe's names, the sentinel id, debug output, the proven row keyed
+  by window.
+
+Commits: `df8dbee8`, `203115ff`, `10de7680`, `46a23037`, `eae5bed6`, the
+merge of `vos-core` (`331ab890`), the JAM venue's fold (`b8471312`), `6b7ec21b`,
+this record.
+
+**6.18 accepted.**
