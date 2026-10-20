@@ -24,14 +24,17 @@ mod scenarios;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-use parity_scale_codec::Encode;
+use parity_scale_codec::{Decode, DecodeAll, Encode};
 use serde::{Deserialize, Serialize};
 use vos_statement::fixtures::{self, Patch};
 use vos_statement::model::Input;
 use vos_statement::{Statement, VenueId};
 
 use super::mock::keys::{self, Item};
-use super::mock::types::{DispatchError, PALLET_INDEX};
+use super::mock::types::{
+    Active, AnchorRecord, AuthorityInfo, DispatchError, Evidence, PALLET_INDEX, ProgramInfo,
+    SpaceInfo, Spend,
+};
 use super::mock::{Account, Chain, Constants, Origin, Outcome, Payer, Verdict};
 
 /// The vectors' directory, `node/venue/conformance`.
@@ -557,10 +560,51 @@ fn generate() -> [(&'static str, String); 2] {
 
 /// Each vector replayed on a fresh mock from its JSON: its pre-state
 /// loaded, each step run, and what it did the step's expectation.
+/// Whether `T` decodes all of `value`.
+fn decodes<T: Decode>(value: &[u8]) -> bool {
+    T::decode_all(&mut &value[..]).is_ok()
+}
+
+/// An entry checked as its item's: the key's length its hashers' (after
+/// the 32-byte prefix), the value its type's, whole.
+fn typed(entry: &Entry) {
+    let key = unhex(&entry.key);
+    let items = [
+        (Item::Spaces, 32, decodes::<SpaceInfo> as fn(&[u8]) -> bool),
+        (Item::SovereignOf, 16 + 32, decodes::<[u8; 32]>),
+        (Item::Authorities, 32 + 16 + 32, decodes::<AuthorityInfo>),
+        (Item::AnchorKeys, 32 + 32, decodes::<Option<[u8; 32]>>),
+        (Item::Anchors, 32 + 9 + 16, decodes::<AnchorRecord>),
+        (Item::Last, 32 + 9, decodes::<u64>),
+        (Item::Equivocations, 32 + 9 + 16, decodes::<Evidence>),
+        (Item::Budget, 32, decodes::<Spend>),
+        (Item::Formats, 8 + 4, decodes::<Active>),
+        (Item::Programs, 16 + 32, decodes::<ProgramInfo>),
+        (Item::Seen, 32, decodes::<u64>),
+        (Item::Paused, 0, decodes::<u8>),
+    ];
+    let (item, parts, decode) = items
+        .into_iter()
+        .find(|(item, ..)| key.starts_with(&item.prefix()))
+        .unwrap_or_else(|| panic!("{}: no item's key", entry.key));
+    assert_eq!(key.len(), 32 + parts, "{}: {item:?}'s key", entry.key);
+    if let Some(value) = &entry.value {
+        assert!(
+            decode(&unhex(value)),
+            "{}: {item:?}'s value {value}",
+            entry.key
+        );
+    }
+}
+
 fn replay(file: &File, fixtures: &Fixtures) {
     let constants = Constants::kreivo(fixtures.venue);
     assert_eq!(file.constants, ConstantsJson::of(&constants));
     for vector in &file.vectors {
+        vector.pre.storage.iter().for_each(typed);
+        for step in &vector.steps {
+            step.storage.iter().for_each(typed);
+        }
         let mut chain = load(&constants, vector.fees, &vector.pre);
         for (n, expected) in vector.steps.iter().enumerate() {
             let before = chain.clone();

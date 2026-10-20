@@ -862,10 +862,28 @@ fold-in (S2).
       byte fails the call's decode (G11, `undecodable`);
     - a removal by `ProgramsOrigin` (`set_program(_, None)`) sets the
       entry's `until_ms` to `now + ProgramChangeDelay` (or keeps an earlier
-      one), Root's removes it at once (G11); the delay is checked only for a
-      `from_ms` or `until_ms` that differs from the stored entry's;
+      one), Root's removes it at once (G11); its removal of an absent
+      program is Ok, with `ProgramSet`, and writes nothing;
+    - `ProgramsOrigin`'s delay: a change that only sets or shortens a
+      stored entry's `until_ms`, the rest unchanged, needs that `until_ms`
+      at `now + ProgramChangeDelay` or later; any other change, a new entry,
+      a later or cleared `until_ms`, or `venue_bound` switched on an active
+      program among them, needs `from_ms` (and any `until_ms`) at
+      `now + ProgramChangeDelay` or later, else `TooEarly` (G11, G16);
+    - an anchor before the space's `start_window`: `OutOfRange` (G4);
+    - `remove_authority` of an account that is not one: `NotAuthority`
+      (G2); `remove_anchor_key` of an unlisted key: `UnknownAnchorKey`
+      (G15);
+    - `register` while the venue's time is before the genesis's origin:
+      `BadClock` (no vector);
     - `ChargeSpaceFee`'s budget window before the space's origin: window 0
       (no vector).
+    - G14's refusal 5 of a statement whose root's window is at or past
+      `end_window` cannot be told from any unanchored root's: no call
+      anchors a window past `end_window`, so a pallet that ignored the
+      range there would pass it. The range check in `anchored` matters only
+      for an anchor stored before the migration, which `migrate`'s own
+      bound (the next window, past every anchored one) rules out.
     - **Recommended:** as above; another answer regenerates the vectors.
 15. **`dispatch_as_sovereign`'s inner call** is Kreivo's `RuntimeCall`:
     G16's is `Balances` (index 10) `transfer_keep_alive` (3) to a

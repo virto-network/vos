@@ -5,6 +5,7 @@
     "A step: now_ms, then a call (origin: {\"signed\": account} or root, programs (ProgramsOrigin), emergency (EmergencyOrigin), status (StatusOrigin); call: the RuntimeCall's bytes, [90, call_index] ++ SCALE(args), as parts: hex, or {fixture, from, to}, bytes from..to of the kit's fixtures/<fixture>) or on_idle with ample weight.",
     "Each step's expectation: result (ok; {\"module\": i}, DispatchError::Module { index: 90, error: [i, 0, 0, 0] }; bad_origin; funds_unavailable; invalid_payment, InvalidTransaction::Payment in validate, never included; undecodable, the call's bytes refused before dispatch); events, the pallet's Event in SCALE, without the runtime's index; storage, every raw key of the pallet's whose value changed (null: removed); balances, each account's deltas (free, held_registration, held_submit, providers).",
     "fees: false vectors run in the pallet's own mock runtime, no fee pipeline: deposits pinned exactly. fees: true vectors run in Kreivo's runtime with ChargeSpaceFee: free deltas by sign only (+, -, 0; the signer always listed), payer who paid the fee (sovereign or signer), and Budget's writes left out (its spend sums fees, the teammate's weights). The mock charges every fee at fee_bound.",
+    "Balances: in a pallet-level vector every account a step does not list is unchanged; in a fees vector the runtime's fee recipients (the block author, the treasury's share) are not pinned, and only the accounts listed are. A pre-state's consumers exclude the one FRAME's Balances takes for a hold (sovereign F's are 0 though it holds its registration deposit): the teammate's harness keeps its own; providers are pinned as deltas.",
     "Accounts: 'names' labels them. The fixture space F ([0xa1; 32], the fixtures' statements' space) is in every pre-state as storage, since no genesis hashes to its id; space B is registered by call from a genesis of two founders."
   ],
   "constants": {
@@ -33,6 +34,8 @@
     "anchor key 2 (B's founder 2)": "8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
     "anchor key 3": "ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1",
     "anchor key 4": "ca93ac1705187071d67b83c7ff0efe8108e8ec4530575d7726879333dbdabe7c",
+    "anchor key 5": "6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1",
+    "anchor key 6": "8a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17",
     "anchor key 9 (never listed)": "fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618",
     "anchor key F": "dcbe4fdaf43c6146889b82b0e690fc88c12866052ea3ea042b1f7988bca5ae08",
     "authority 1": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
@@ -53,7 +56,7 @@
   "vectors": [
     {
       "id": "G1",
-      "title": "register: the fixture genesis's space registered, its sovereign address `modl ‖ kv/space ‖ space[..20]`, the deposit held; refused: the founder's signature resubmitted with another start_window (BadFounder), a start_window past now_w + 1 or before now_w − MaxRootAge / length_ms (BadStartWindow), a second registration (SpaceExists)",
+      "title": "register: the fixture genesis's space registered, its sovereign address `modl ‖ kv/space ‖ space[..20]`, the deposit held; refused: the founder's signature resubmitted with another start_window (BadFounder), a start_window past now_w + 1 or before now_w − MaxRootAge / length_ms (BadStartWindow), a second registration (SpaceExists); the edges taken, a start_window of now_w + 1 and of now_w − MaxRootAge / length_ms",
       "fees": false,
       "pre": {
         "now_ms": 601005000,
@@ -75,6 +78,14 @@
             "consumers": 0
           },
           {
+            "account": "6d6f646c6b762f73706163654b0c7d2f4d725171ae37115db93378254476616c",
+            "free": "100000000000000",
+            "held_registration": "0",
+            "held_submit": "0",
+            "providers": 1,
+            "consumers": 0
+          },
+          {
             "account": "6d6f646c6b762f7370616365a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
             "free": "100000000000000",
             "held_registration": "500000000000",
@@ -84,6 +95,14 @@
           },
           {
             "account": "6d6f646c6b762f7370616365cc65ab40d4da9c093bf33d1246f1a9a970698603",
+            "free": "100000000000000",
+            "held_registration": "0",
+            "held_submit": "0",
+            "providers": 1,
+            "consumers": 0
+          },
+          {
+            "account": "6d6f646c6b762f7370616365d0ae0bbc5cad3f64bf4069e368c2bc577bd78101",
             "free": "100000000000000",
             "held_registration": "0",
             "held_submit": "0",
@@ -261,6 +280,84 @@
           "events": [],
           "storage": [],
           "balances": []
+        },
+        {
+          "now_ms": 601005000,
+          "origin": {
+            "signed": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+          },
+          "call": [
+            "5a00b1010108018a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c028139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b39440420f0000000000c02709000000000040420f0000000000b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0e9030000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c606d407cd624fcaf2572ab09c538c13a8d04f89fe9e54d375feee5e18b45eadbfebed2bfaef8e7d880fbbd05bab8ee9843d5b84c44566451d7eaa70f1e303f08"
+          ],
+          "result": "ok",
+          "events": [
+            "004b0c7d2f4d725171ae37115db93378254476616cff3e72e70076cee00b560e1a6d6f646c6b762f73706163654b0c7d2f4d725171ae37115db93378254476616cc0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c027090000000000e903000000000000"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0012ee31855cf404173c16688a982d329bed8b443168153b3114542fbecc550a46d6f646c6b762f73706163654b0c7d2f4d725171ae37115db93378254476616c",
+              "value": "4b0c7d2f4d725171ae37115db93378254476616cff3e72e70076cee00b560e1a"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a44b0c7d2f4d725171ae37115db93378254476616cff3e72e70076cee00b560e1a8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+              "value": "00"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a44b0c7d2f4d725171ae37115db93378254476616cff3e72e70076cee00b560e1a8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+              "value": "00"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0dc90e6f82b1c3812e102a180b502f8a04b0c7d2f4d725171ae37115db93378254476616cff3e72e70076cee00b560e1a",
+              "value": "6d6f646c6b762f73706163654b0c7d2f4d725171ae37115db93378254476616cc0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c027090000000000e90300000000000000000002c89bd2230000000000c0bcf7e90a00000000000000000000"
+            }
+          ],
+          "balances": [
+            {
+              "account": "6d6f646c6b762f73706163654b0c7d2f4d725171ae37115db93378254476616c",
+              "free": "-500000000000",
+              "held_registration": "+500000000000",
+              "providers": 1
+            }
+          ]
+        },
+        {
+          "now_ms": 601005000,
+          "origin": {
+            "signed": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a"
+          },
+          "call": [
+            "5a00b1010108018a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c028139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b39440420f0000000000c02709000000000040420f0000000000b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6b6c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c058030000000000008a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5ce55c0bb51465055032e53404c0989a68d4c38b5bb7732dfa5a44a1a2c4c6a7fe4d62c9fd59d4dfc650fad474928764241e314304bbdbd085852ecbee1cd2a402"
+          ],
+          "result": "ok",
+          "events": [
+            "00d0ae0bbc5cad3f64bf4069e368c2bc577bd781010a66b9667784de8c66b4ebf66d6f646c6b762f7370616365d0ae0bbc5cad3f64bf4069e368c2bc577bd78101c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c0270900000000005803000000000000"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0012ee31855cf404173c16688a982d3297cde9fa33a3d369c9092fedc969235cc6d6f646c6b762f7370616365d0ae0bbc5cad3f64bf4069e368c2bc577bd78101",
+              "value": "d0ae0bbc5cad3f64bf4069e368c2bc577bd781010a66b9667784de8c66b4ebf6"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a4d0ae0bbc5cad3f64bf4069e368c2bc577bd781010a66b9667784de8c66b4ebf68139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+              "value": "00"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a4d0ae0bbc5cad3f64bf4069e368c2bc577bd781010a66b9667784de8c66b4ebf68a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+              "value": "00"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0dc90e6f82b1c3812e102a180b502f8a0d0ae0bbc5cad3f64bf4069e368c2bc577bd781010a66b9667784de8c66b4ebf6",
+              "value": "6d6f646c6b762f7370616365d0ae0bbc5cad3f64bf4069e368c2bc577bd78101c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c027090000000000580300000000000000000002c89bd2230000000000c0bcf7e90a00000000000000000000"
+            }
+          ],
+          "balances": [
+            {
+              "account": "6d6f646c6b762f7370616365d0ae0bbc5cad3f64bf4069e368c2bc577bd78101",
+              "free": "-500000000000",
+              "held_registration": "+500000000000",
+              "providers": 1
+            }
+          ]
         }
       ]
     },
@@ -730,7 +827,7 @@
     },
     {
       "id": "G4",
-      "title": "anchor refusals: before the space's start (OutOfRange), older than MaxRootAge (WindowTooOld), the same root again (AlreadyAnchored), a stale w ≤ Last (WindowNotAfterLast), the open window now_w and a later one (WindowInFuture), then now_ms at B_w and the same anchor resubmitted (Anchored); a bad signature (BadAnchorSignature), kind 1 (BadKind), an unlisted key (UnknownAnchorKey), an unknown space (UnknownSpace), now_ms before the origin (BadClock)",
+      "title": "anchor refusals: before the space's start (OutOfRange), older than MaxRootAge (WindowTooOld), exactly MaxRootAge old taken, the same root again (AlreadyAnchored), a stale w ≤ Last (WindowNotAfterLast), the open window now_w and a later one (WindowInFuture), then now_ms at B_w and the same anchor resubmitted (Anchored); a bad signature (BadAnchorSignature), kind 1 (BadKind), an unlisted key (UnknownAnchorKey), an unknown space (UnknownSpace), now_ms before the origin (BadClock)",
       "fees": false,
       "pre": {
         "now_ms": 106000001,
@@ -903,7 +1000,7 @@
           "balances": []
         },
         {
-          "now_ms": 106000001,
+          "now_ms": 106600000,
           "origin": {
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
@@ -917,7 +1014,7 @@
           "storage": [
             {
               "key": "dc90e6f82b1c3812e102a180b502f8a02893c8b379803be566c94f4bfeab5cb2cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e682705db4aa834e90058c4a70573b6a0e61f00000000000000",
-              "value": "0303030303030303030303030303030303030303030303030303030303030303816e510600000000ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1"
+              "value": "030303030303030303030303030303030303030303030303030303030303030340965a0600000000ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1"
             },
             {
               "key": "dc90e6f82b1c3812e102a180b502f8a0d1fa9eeb7f632be41e27bf95f5e77fc9cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e682705db4aa834e900",
@@ -927,7 +1024,7 @@
           "balances": []
         },
         {
-          "now_ms": 106000001,
+          "now_ms": 106600000,
           "origin": {
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
@@ -942,7 +1039,7 @@
           "balances": []
         },
         {
-          "now_ms": 106000001,
+          "now_ms": 106600000,
           "origin": {
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
@@ -957,27 +1054,12 @@
           "balances": []
         },
         {
-          "now_ms": 106000001,
+          "now_ms": 106600000,
           "origin": {
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
           "call": [
-            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eaf00000000000000000404040404040404040404040404040404040404040404040404040404040404ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1421e9a7e710d055f94d2e91d0e7d8e3dfe717d47a5719821aa92b4546e3ed4860fc183f532511e2e496e13ab0937dea0bc2a603d83eec3f3c1a80a3d93034f08"
-          ],
-          "result": {
-            "module": 16
-          },
-          "events": [],
-          "storage": [],
-          "balances": []
-        },
-        {
-          "now_ms": 106000001,
-          "origin": {
-            "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
-          },
-          "call": [
-            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb400000000000000000505050505050505050505050505050505050505050505050505050505050505ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1c186f50ec569943cf10fb19b7fbee01009e93191c441fecb4be53bcf8627705e2804df5fdf8fc21c6d08c647c384f751f29be6d34b4c7864e1bf9fe43a228f0f"
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb000000000000000000404040404040404040404040404040404040404040404040404040404040404ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1e6da34d8d6a84f86973382dda267fa771fb181958b26e2338b08277439e3d73b04dbefb713cc91a963f55a548eaf8fa19e8273e51bd544150cc9504222b2a305"
           ],
           "result": {
             "module": 16
@@ -992,31 +1074,46 @@
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
           "call": [
-            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eaf00000000000000000404040404040404040404040404040404040404040404040404040404040404ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1421e9a7e710d055f94d2e91d0e7d8e3dfe717d47a5719821aa92b4546e3ed4860fc183f532511e2e496e13ab0937dea0bc2a603d83eec3f3c1a80a3d93034f08"
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb500000000000000000505050505050505050505050505050505050505050505050505050505050505ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1e10a491c5d8ff6e98d2fdf22228a8c337fe6f6314a39953431a12119f4ffc5b2cdd41fe747faa29b20a834ac0c39fd6db598e58158dcfc287d85bd2a5268b308"
+          ],
+          "result": {
+            "module": 16
+          },
+          "events": [],
+          "storage": [],
+          "balances": []
+        },
+        {
+          "now_ms": 107200000,
+          "origin": {
+            "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
+          },
+          "call": [
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb000000000000000000404040404040404040404040404040404040404040404040404040404040404ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1e6da34d8d6a84f86973382dda267fa771fb181958b26e2338b08277439e3d73b04dbefb713cc91a963f55a548eaf8fa19e8273e51bd544150cc9504222b2a305"
           ],
           "result": "ok",
           "events": [
-            "06cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e00af000000000000000404040404040404040404040404040404040404040404040404040404040404"
+            "06cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e00b0000000000000000404040404040404040404040404040404040404040404040404040404040404"
           ],
           "storage": [
             {
-              "key": "dc90e6f82b1c3812e102a180b502f8a02893c8b379803be566c94f4bfeab5cb2cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e682705db4aa834e900c128bf1f4e0656aeaf00000000000000",
-              "value": "040404040404040404040404040404040404040404040404040404040404040440965a0600000000ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1"
+              "key": "dc90e6f82b1c3812e102a180b502f8a02893c8b379803be566c94f4bfeab5cb2cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e682705db4aa834e900d718f6c14a8cc37bb000000000000000",
+              "value": "040404040404040404040404040404040404040404040404040404040404040400be630600000000ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1"
             },
             {
               "key": "dc90e6f82b1c3812e102a180b502f8a0d1fa9eeb7f632be41e27bf95f5e77fc9cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e682705db4aa834e900",
-              "value": "af00000000000000"
+              "value": "b000000000000000"
             }
           ],
           "balances": []
         },
         {
-          "now_ms": 106600000,
+          "now_ms": 107200000,
           "origin": {
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
           "call": [
-            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb000000000000000000606060606060606060606060606060606060606060606060606060606060606ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1fd6612af684376bbd184159489a1b0a91d6160d34a1b0fa5c2630421ef7e921b15c3b818bbd383638deebca80ec97a031c3e1a0c07df94fc499530b91a1e5205"
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb100000000000000000606060606060606060606060606060606060606060606060606060606060606ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1532b24ef5f3c28d2d656e3fb871d7723052d5a533be579cdaeb462dc317fcf9ddeb166d8f7c393ba87d25803d36cf019e68e8da84ec9faf8aff7ab9224d5df0f"
           ],
           "result": {
             "module": 12
@@ -1026,12 +1123,12 @@
           "balances": []
         },
         {
-          "now_ms": 106600000,
+          "now_ms": 107200000,
           "origin": {
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
           "call": [
-            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb000000000000000010606060606060606060606060606060606060606060606060606060606060606ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1fc6612af684376bbd184159489a1b0a91d6160d34a1b0fa5c2630421ef7e921b15c3b818bbd383638deebca80ec97a031c3e1a0c07df94fc499530b91a1e5205"
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb100000000000000010606060606060606060606060606060606060606060606060606060606060606ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1522b24ef5f3c28d2d656e3fb871d7723052d5a533be579cdaeb462dc317fcf9ddeb166d8f7c393ba87d25803d36cf019e68e8da84ec9faf8aff7ab9224d5df0f"
           ],
           "result": {
             "module": 13
@@ -1041,12 +1138,12 @@
           "balances": []
         },
         {
-          "now_ms": 106600000,
+          "now_ms": 107200000,
           "origin": {
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
           "call": [
-            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb000000000000000000606060606060606060606060606060606060606060606060606060606060606fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f618d9a38bef74b2a632cb5287f59379693d2f2c84665e344a7954ebc7cf7cba20695efe802e17f65bd361b48525f18fd9789edc80da9ce5ee7c66a7d872073ec20f"
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb100000000000000000606060606060606060606060606060606060606060606060606060606060606fd1724385aa0c75b64fb78cd602fa1d991fdebf76b13c58ed702eac835e9f6188c486320bb4ba4d9fbccfc2d15c5ae625cf82fa12f1b627780c9d99c32e44f275b2246126815b607cf137ff9f982978b2f4bec7287b8602489ecbc93f5d8c50f"
           ],
           "result": {
             "module": 11
@@ -1056,12 +1153,12 @@
           "balances": []
         },
         {
-          "now_ms": 106600000,
+          "now_ms": 107200000,
           "origin": {
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
           "call": [
-            "5a07eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeae00000000000000000606060606060606060606060606060606060606060606060606060606060606ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1fb873dbb17805bb0b9ec3796788f3b7deb8a15bc33d439535481e942d210e0da3f7d88a9b741030a7de16d6b2fe78e4ba9a889fbbdc4dc15a6ec7349f6842602"
+            "5a07eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeaf00000000000000000606060606060606060606060606060606060606060606060606060606060606ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d15c9171132873a853f0a6fcc35ee4942dcb36af3797b908461a2a1870daf373896c5f9702f3585447d631d37942cb5b4719719de21f7879f19243a28332da210e"
           ],
           "result": {
             "module": 1
@@ -1076,7 +1173,7 @@
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
           "call": [
-            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb000000000000000000606060606060606060606060606060606060606060606060606060606060606ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1fc6612af684376bbd184159489a1b0a91d6160d34a1b0fa5c2630421ef7e921b15c3b818bbd383638deebca80ec97a031c3e1a0c07df94fc499530b91a1e5205"
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb100000000000000000606060606060606060606060606060606060606060606060606060606060606ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1522b24ef5f3c28d2d656e3fb871d7723052d5a533be579cdaeb462dc317fcf9ddeb166d8f7c393ba87d25803d36cf019e68e8da84ec9faf8aff7ab9224d5df0f"
           ],
           "result": {
             "module": 3
@@ -1089,7 +1186,7 @@
     },
     {
       "id": "G5",
-      "title": "equivocation by one key: Equivocated and SpaceSuspended, the space's anchors refused (SpaceNotActive), resume refused (StillEquivocating) until the key is removed; by two keys (the failover case): Evidence names both, resume refused until both are removed (the second with its authority)",
+      "title": "equivocation by one key: Equivocated and SpaceSuspended, the space's anchors refused (SpaceNotActive), resume refused (StillEquivocating) until the key is removed; by two keys (the failover case): Evidence names both, resume refused until both are removed (the second with its authority); again with two fresh keys, the second signer's removed first, resume refused until the first's is too",
       "fees": false,
       "pre": {
         "now_ms": 25800000,
@@ -1509,6 +1606,226 @@
           "storage": [
             {
               "key": "dc90e6f82b1c3812e102a180b502f8a0059beb513cfa1bc92e571b304dc28d52cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e682705db4aa834e900cca254008d5f34222500000000000000",
+              "value": null
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0dc90e6f82b1c3812e102a180b502f8a0cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e",
+              "value": "6d6f646c6b762f7370616365cc65ab40d4da9c093bf33d1246f1a9a970698603c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c0270900000000001e000000000000000000000040ad89010000000000c0bcf7e90a00000000000000000000"
+            }
+          ],
+          "balances": []
+        },
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+          },
+          "call": [
+            "5a02cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5ea4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4016e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1"
+          ],
+          "result": "ok",
+          "events": [
+            "02cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5ea4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4016e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a05e0621c4869aa60c02be9adcc98a0d1dcc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eaf805d317f741696b4668050b8f0a130a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+              "value": "016e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a4cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1",
+              "value": "01a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0dc90e6f82b1c3812e102a180b502f8a0cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e",
+              "value": "6d6f646c6b762f7370616365cc65ab40d4da9c093bf33d1246f1a9a970698603c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c0270900000000001e000000000000000000010140ad89010000000000c0bcf7e90a00000000000000000000"
+            }
+          ],
+          "balances": [
+            {
+              "account": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+              "providers": 1
+            }
+          ]
+        },
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+          },
+          "call": [
+            "5a02cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5ea5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5018a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17"
+          ],
+          "result": "ok",
+          "events": [
+            "02cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5ea5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5018a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a05e0621c4869aa60c02be9adcc98a0d1dcc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e6f000dae54c8cd124810dab4617d3ab7a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+              "value": "018a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a4cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e8a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17",
+              "value": "01a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0dc90e6f82b1c3812e102a180b502f8a0cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e",
+              "value": "6d6f646c6b762f7370616365cc65ab40d4da9c093bf33d1246f1a9a970698603c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c0270900000000001e000000000000000000020240ad89010000000000c0bcf7e90a00000000000000000000"
+            }
+          ],
+          "balances": [
+            {
+              "account": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+              "providers": 1
+            }
+          ]
+        },
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"
+          },
+          "call": [
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e2700000000000000001a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1bfc5a0a477c04f72d0b148cda466b25589e03fff24d8e6aef48c6aa25710dadbb38ab61131110425afc5a7b48447999172c0497bbb19c724b30eab8e28f18105"
+          ],
+          "result": "ok",
+          "events": [
+            "06cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e0027000000000000001a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a02893c8b379803be566c94f4bfeab5cb2cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e682705db4aa834e90098f092f86ff393a72700000000000000",
+              "value": "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a40ad8901000000006e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0d1fa9eeb7f632be41e27bf95f5e77fc9cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e682705db4aa834e900",
+              "value": "2700000000000000"
+            }
+          ],
+          "balances": []
+        },
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+          },
+          "call": [
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e2700000000000000001b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b8a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17aff263025fb1f42713fb93699ac48393f47d6f9d2af92df1849a3e2e49eb4b122a1724ed8e52c1fa3a9c0d488dc82d9b05c2c471521294d38980a5d1e31c8c04"
+          ],
+          "result": "ok",
+          "events": [
+            "07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e0027000000000000001a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf18a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17",
+            "08cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0059beb513cfa1bc92e571b304dc28d52cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e682705db4aa834e90098f092f86ff393a72700000000000000",
+              "value": "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf18a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17"
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0dc90e6f82b1c3812e102a180b502f8a0cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e",
+              "value": "6d6f646c6b762f7370616365cc65ab40d4da9c093bf33d1246f1a9a970698603c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c0270900000000001e000000000000000001020240ad89010000000000c0bcf7e90a00000000000000000000"
+            }
+          ],
+          "balances": []
+        },
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+          },
+          "call": [
+            "5a03cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5ea5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+          ],
+          "result": "ok",
+          "events": [
+            "03cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5ea5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a05e0621c4869aa60c02be9adcc98a0d1dcc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e6f000dae54c8cd124810dab4617d3ab7a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+              "value": null
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a4cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e8a875fff1eb38451577acd5afee405456568dd7c89e090863a0557bc7af49f17",
+              "value": null
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0dc90e6f82b1c3812e102a180b502f8a0cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e",
+              "value": "6d6f646c6b762f7370616365cc65ab40d4da9c093bf33d1246f1a9a970698603c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c0270900000000001e000000000000000001010140ad89010000000000c0bcf7e90a00000000000000000000"
+            }
+          ],
+          "balances": [
+            {
+              "account": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+              "providers": -1
+            }
+          ]
+        },
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+          },
+          "call": [
+            "5a06cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e"
+          ],
+          "result": {
+            "module": 23
+          },
+          "events": [],
+          "storage": [],
+          "balances": []
+        },
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+          },
+          "call": [
+            "5a03cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5ea4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"
+          ],
+          "result": "ok",
+          "events": [
+            "03cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5ea4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a05e0621c4869aa60c02be9adcc98a0d1dcc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eaf805d317f741696b4668050b8f0a130a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+              "value": null
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a4cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e6e7a1cdd29b0b78fd13af4c5598feff4ef2a97166e3ca6f2e4fbfccd80505bf1",
+              "value": null
+            },
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0dc90e6f82b1c3812e102a180b502f8a0cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e",
+              "value": "6d6f646c6b762f7370616365cc65ab40d4da9c093bf33d1246f1a9a970698603c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c0270900000000001e000000000000000001000040ad89010000000000c0bcf7e90a00000000000000000000"
+            }
+          ],
+          "balances": [
+            {
+              "account": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+              "providers": -1
+            }
+          ]
+        },
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+          },
+          "call": [
+            "5a06cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e"
+          ],
+          "result": "ok",
+          "events": [
+            "09cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a0059beb513cfa1bc92e571b304dc28d52cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e682705db4aa834e90098f092f86ff393a72700000000000000",
               "value": null
             },
             {
@@ -2222,7 +2539,7 @@
     },
     {
       "id": "G9",
-      "title": "a rootless and a rooted statement accepted; at MaxRootAge + 1 past the newest root's B_w, on_idle prunes the rooted Seen entry and keeps the rootless one; resubmitted, the rootless is refused 6 (released) and the rooted 5 (forfeited)",
+      "title": "a rootless and a rooted statement accepted; at MaxRootAge + 1 past the newest root's B_w, the rooted one resubmitted before on_idle refused 5 (its anchors held but past MaxRootAge); on_idle prunes the rooted Seen entry and keeps the rootless one; resubmitted, the rootless is refused 6 (released) and the rooted 5 (forfeited)",
       "fees": false,
       "pre": {
         "now_ms": 25800000,
@@ -2396,6 +2713,36 @@
         },
         {
           "now_ms": 112200001,
+          "origin": {
+            "signed": "afafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafaf"
+          },
+          "call": [
+            "5a08a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a15904270000002bbb1e4c5810883ca959886418f5e01064d5977bee04b65f5397dd645c564e17a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a19c464b6c29a4bda3ce6aab4eb01d9abf25e6a90d1b4c8cb02273b630b00e58560b6e6f6e63652037587468652073746174656d656e742773206f75747075740800a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a12900000000000000414141414141414141414141414141414141414141414141414141414141414100a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a12a00000000000000424242424242424242424242424242424242424242424242424242424242424212f20800",
+            {
+              "fixture": "wrap.proof",
+              "from": 0,
+              "to": 146564
+            }
+          ],
+          "result": "ok",
+          "events": [
+            "0ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1d729a7f95fb3871bc594b1d01f7d11e61302ff3ff21f1677c4b4f18422c8544f05000000",
+            "0da1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a10088526a740000000000000000000000"
+          ],
+          "storage": [],
+          "balances": [
+            {
+              "account": "6d6f646c6b762f7370616365a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "free": "-500000000000"
+            },
+            {
+              "account": "6d6f646c70792f74727372790000000000000000000000000000000000000000",
+              "free": "+500000000000"
+            }
+          ]
+        },
+        {
+          "now_ms": 112200001,
           "on_idle": true,
           "events": [],
           "storage": [
@@ -2468,7 +2815,7 @@
     },
     {
       "id": "G10",
-      "title": "a non-authority's submit (NotAuthority); set_paused by a signed account (BadOrigin); each pause flag, by the emergency origin, refusing its call (Paused): bit 0 submit, bit 1 anchor, bit 2 register, each other call unpaused; cleared by Root",
+      "title": "a submit whose sovereign cannot hold the deposit (InsufficientSovereignBalance, nothing moved); a non-authority's submit (NotAuthority); set_paused by a signed account (BadOrigin); each pause flag, by the emergency origin, refusing its call (Paused): bit 0 submit, bit 1 anchor, bit 2 register, each other call unpaused; cleared by Root",
       "fees": false,
       "pre": {
         "now_ms": 25800000,
@@ -2506,8 +2853,24 @@
             "consumers": 0
           },
           {
+            "account": "6d6f646c6b762f7370616365d3193daca79e66aa3f71eaa4b4c5191fbdf8a4ca",
+            "free": "251000000000",
+            "held_registration": "500000000000",
+            "held_submit": "0",
+            "providers": 2,
+            "consumers": 0
+          },
+          {
             "account": "6d6f646c70792f74727372790000000000000000000000000000000000000000",
             "free": "1000000000000000",
+            "held_registration": "0",
+            "held_submit": "0",
+            "providers": 1,
+            "consumers": 0
+          },
+          {
+            "account": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+            "free": "0",
             "held_registration": "0",
             "held_submit": "0",
             "providers": 1,
@@ -2548,6 +2911,10 @@
         ],
         "storage": [
           {
+            "key": "dc90e6f82b1c3812e102a180b502f8a0012ee31855cf404173c16688a982d3296c248bdbe71b2801a12ef3237b30e2cc6d6f646c6b762f7370616365d3193daca79e66aa3f71eaa4b4c5191fbdf8a4ca",
+            "value": "d3193daca79e66aa3f71eaa4b4c5191fbdf8a4ca1cf1bcf0c60bf4fdde80b97c"
+          },
+          {
             "key": "dc90e6f82b1c3812e102a180b502f8a0012ee31855cf404173c16688a982d329aa631aaf05247f981b370cab63000f1d6d6f646c6b762f7370616365a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
             "value": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
           },
@@ -2556,8 +2923,20 @@
             "value": "01dcbe4fdaf43c6146889b82b0e690fc88c12866052ea3ea042b1f7988bca5ae08"
           },
           {
+            "key": "dc90e6f82b1c3812e102a180b502f8a05e0621c4869aa60c02be9adcc98a0d1dd3193daca79e66aa3f71eaa4b4c5191fbdf8a4ca1cf1bcf0c60bf4fdde80b97caf805d317f741696b4668050b8f0a130a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4",
+            "value": "00"
+          },
+          {
             "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a4a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1dcbe4fdaf43c6146889b82b0e690fc88c12866052ea3ea042b1f7988bca5ae08",
             "value": "01afafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafaf"
+          },
+          {
+            "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a4d3193daca79e66aa3f71eaa4b4c5191fbdf8a4ca1cf1bcf0c60bf4fdde80b97c8139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394",
+            "value": "00"
+          },
+          {
+            "key": "dc90e6f82b1c3812e102a180b502f8a061942f19046501a330889274ed2170a4d3193daca79e66aa3f71eaa4b4c5191fbdf8a4ca1cf1bcf0c60bf4fdde80b97c8a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c",
+            "value": "00"
           },
           {
             "key": "dc90e6f82b1c3812e102a180b502f8a076275cbb89a8a64373fd9c22e8b4169b03881d1ce3203350d8d56350b6109209a423e03527ee545441e0f564a9566d1591ca96053644201e7288012fe4154d3c",
@@ -2574,10 +2953,34 @@
           {
             "key": "dc90e6f82b1c3812e102a180b502f8a0dc90e6f82b1c3812e102a180b502f8a0a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
             "value": "6d6f646c6b762f7370616365a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c00000000000000000c027090000000000280000000000000000000101000000000000000000c0bcf7e90a00000000000000000000"
+          },
+          {
+            "key": "dc90e6f82b1c3812e102a180b502f8a0dc90e6f82b1c3812e102a180b502f8a0d3193daca79e66aa3f71eaa4b4c5191fbdf8a4ca1cf1bcf0c60bf4fdde80b97c",
+            "value": "6d6f646c6b762f7370616365d3193daca79e66aa3f71eaa4b4c5191fbdf8a4cac0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c040420f0000000000c0270900000000001e000000000000000000010240ad89010000000000c0bcf7e90a00000000000000000000"
           }
         ]
       },
       "steps": [
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4"
+          },
+          "call": [
+            "5a08d3193daca79e66aa3f71eaa4b4c5191fbdf8a4ca1cf1bcf0c60bf4fdde80b97c5904270000002bbb1e4c5810883ca959886418f5e01064d5977bee04b65f5397dd645c564e17a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a19c464b6c29a4bda3ce6aab4eb01d9abf25e6a90d1b4c8cb02273b630b00e58560b6e6f6e63652037587468652073746174656d656e742773206f75747075740800a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a12900000000000000414141414141414141414141414141414141414141414141414141414141414100a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a12a00000000000000424242424242424242424242424242424242424242424242424242424242424212f20800",
+            {
+              "fixture": "wrap.proof",
+              "from": 0,
+              "to": 146564
+            }
+          ],
+          "result": {
+            "module": 21
+          },
+          "events": [],
+          "storage": [],
+          "balances": []
+        },
         {
           "now_ms": 25800000,
           "origin": {
@@ -2824,7 +3227,7 @@
     },
     {
       "id": "G11",
-      "title": "set_program by ProgramsOrigin: from_ms before now + delay, or an until_ms set before it, refused (TooEarly); at now + delay taken; Root at once; a signed account (BadOrigin); a removal by ProgramsOrigin sets until_ms = now + delay, Root's removes at once; a handler other than Record does not decode",
+      "title": "set_program by ProgramsOrigin: from_ms before now + delay, or an until_ms set before it, refused (TooEarly); at now + delay taken; Root at once; a signed account (BadOrigin); a removal by ProgramsOrigin sets until_ms = now + delay, Root's removes at once; a change other than setting or shortening until_ms (venue_bound on an active program) needs from_ms ≥ now + delay (TooEarly); a handler other than Record does not decode",
       "fees": false,
       "pre": {
         "now_ms": 25800000,
@@ -3043,6 +3446,37 @@
               "value": null
             }
           ],
+          "balances": []
+        },
+        {
+          "now_ms": 25800000,
+          "origin": "root",
+          "call": [
+            "5a110b0000000b0000000b0000000b0000000b0000000b0000000b0000000b00000001000140ad89010000000000"
+          ],
+          "result": "ok",
+          "events": [
+            "0f0b0000000b0000000b0000000b0000000b0000000b0000000b0000000b00000001000140ad89010000000000"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a076275cbb89a8a64373fd9c22e8b4169bcb325e270ddc6b73bbea1ab1d254a7cc0b0000000b0000000b0000000b0000000b0000000b0000000b0000000b000000",
+              "value": "000140ad89010000000000"
+            }
+          ],
+          "balances": []
+        },
+        {
+          "now_ms": 25800000,
+          "origin": "programs",
+          "call": [
+            "5a110b0000000b0000000b0000000b0000000b0000000b0000000b0000000b00000001000040ad89010000000000"
+          ],
+          "result": {
+            "module": 22
+          },
+          "events": [],
+          "storage": [],
           "balances": []
         },
         {
@@ -5222,7 +5656,7 @@
         "storage": [
           {
             "key": "dc90e6f82b1c3812e102a180b502f8a0012ee31855cf404173c16688a982d32919d704f359ec59eb9f11cf2544b594096d6f646c6b762f7370616365fbc8a034f49728c2bb4798d2c521feba14813cd0",
-            "value": "ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000ee000000"
+            "value": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
           },
           {
             "key": "dc90e6f82b1c3812e102a180b502f8a0012ee31855cf404173c16688a982d329aa631aaf05247f981b370cab63000f1d6d6f646c6b762f7370616365a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",

@@ -554,7 +554,7 @@ impl Chain {
             }
             Call::SetFormat { format, active } => {
                 let stored: Option<Active> = self.get(&keys::formats(format));
-                self.governed(origin, &active, stored.as_ref())?;
+                self.governed(origin, &active, stored.as_ref(), true)?;
                 self.put(keys::formats(format), &active);
                 events.push(Event::FormatSet { format, active });
                 Ok(())
@@ -967,10 +967,14 @@ impl Chain {
         let stored: Option<ProgramInfo> = self.get(&key);
         match info {
             Some(info) => {
+                let rest_same = stored.is_some_and(|stored| {
+                    stored.handler == info.handler && stored.venue_bound == info.venue_bound
+                });
                 self.governed(
                     origin,
                     &info.active,
                     stored.as_ref().map(|stored| &stored.active),
+                    rest_same,
                 )?;
                 self.put(key, &info);
             }
@@ -995,20 +999,37 @@ impl Chain {
         Ok(())
     }
 
-    /// §6.4: `ProgramsOrigin` sets a `from_ms`, or an `until_ms`, no
-    /// earlier than `now + ProgramChangeDelay`; Root at any time.
-    fn governed(&self, origin: Origin, active: &Active, stored: Option<&Active>) -> Dispatched {
+    /// §6.4: Root at any time; `ProgramsOrigin` only with a delay. A
+    /// change that only sets or shortens a stored entry's `until_ms`, the
+    /// rest of it unchanged (`rest_same`), needs that `until_ms` no
+    /// earlier than `now + ProgramChangeDelay`; any other, a new entry
+    /// among them, needs its `from_ms` (and any `until_ms`) no earlier
+    /// than that.
+    fn governed(
+        &self,
+        origin: Origin,
+        active: &Active,
+        stored: Option<&Active>,
+        rest_same: bool,
+    ) -> Dispatched {
         match origin {
             Origin::Root => Ok(()),
             Origin::Programs => {
                 let at = self
                     .now_ms
                     .saturating_add(self.constants.program_change_delay_ms);
-                let from_set = stored.is_none_or(|stored| stored.from_ms != active.from_ms);
-                let until_set = active
-                    .until_ms
-                    .filter(|until| stored.is_none_or(|stored| stored.until_ms != Some(*until)));
-                if (from_set && active.from_ms < at) || until_set.is_some_and(|until| until < at) {
+                let shortened = stored
+                    .filter(|stored| rest_same && stored.from_ms == active.from_ms)
+                    .and_then(|stored| {
+                        active
+                            .until_ms
+                            .filter(|until| stored.until_ms.is_none_or(|was| *until <= was))
+                    });
+                let early = match shortened {
+                    Some(until) => until < at,
+                    None => active.from_ms < at || active.until_ms.is_some_and(|until| until < at),
+                };
+                if early {
                     return Err(Error::TooEarly.into());
                 }
                 Ok(())

@@ -3,7 +3,9 @@
 //! statement mutants) and format 39's masked fields tampered (spike 6a's
 //! cases, `vos-pvm-recair`'s `every_masked_field_tampered_is_refused`), each
 //! a patch of the `valid` fixture's proof or statement and the code its
-//! judgement reaches at the fixture's venue state.
+//! judgement reaches at the fixture's venue state: `judge`'s on the
+//! fixture's model input, and the mock's `submit` at G7's pre-state, the
+//! two asserted equal.
 
 use serde::Serialize;
 use stwo::core::fields::m31::{BaseField, P};
@@ -13,7 +15,49 @@ use vos_statement::fixtures::Patch;
 use vos_statement::model::Input;
 use vos_statement::{Statement, code};
 
+use parity_scale_codec::Encode;
+
+use super::scenarios::{self, AUTHORITY_F, F};
 use super::{Fixtures, hex};
+use crate::kreivo::mock::types::{Call, Event, RuntimeCall};
+use crate::kreivo::mock::{Chain, Origin, Verdict};
+
+/// A statement's and a proof's code, by the model input's `judge` and by
+/// the mock's `submit` at G7's pre-state, asserted equal.
+struct Judge<'a> {
+    input: &'a Input,
+    chain: Chain,
+}
+
+impl Judge<'_> {
+    fn code(&self, statement: &[u8], proof: &[u8]) -> u32 {
+        let judged = match Statement::decode(statement) {
+            Err(error) => vos_statement::Refusal::Statement(error).code(),
+            Ok(decoded) => code(
+                &Input {
+                    statement: decoded,
+                    ..self.input.clone()
+                }
+                .judge(proof),
+            ),
+        };
+        let call = RuntimeCall::Spaces(Call::Submit {
+            payer: F,
+            statement: statement.to_vec(),
+            proof: proof.to_vec(),
+        });
+        let mut chain = self.chain.clone();
+        let outcome = chain.submit(Origin::Signed(AUTHORITY_F), &call.encode());
+        assert_eq!(outcome.verdict, Verdict::Ok);
+        let submitted = match outcome.events.first() {
+            Some(Event::Refused { code, .. }) => *code,
+            Some(Event::Accepted { .. }) => 0,
+            events => panic!("{events:?}"),
+        };
+        assert_eq!(submitted, judged, "the pallet's path and judge's");
+        judged
+    }
+}
 
 #[derive(Debug, Serialize)]
 pub struct Lists {
@@ -22,6 +66,10 @@ pub struct Lists {
     /// of: its venue state, statement and proof.
     pub base: String,
     pub proof: String,
+    /// The proof file's length and BLAKE2b-256, so a helper reading another
+    /// file fails at once.
+    pub proof_length: usize,
+    pub proof_blake2b_256: String,
     pub statement: String,
     pub proof_mutants: Vec<Mutant>,
     pub statement_mutants: Vec<Mutant>,
@@ -68,9 +116,10 @@ fn splitmix(state: &mut u64) -> u64 {
 /// pseudo-random bytes past them set to 0xff, 0x00, or XOR 0x01 (XOR 0x01
 /// where the byte already holds the value); 7 truncations; 9 zero bytes
 /// appended.
-fn proof_mutants(input: &Input, proof: &[u8]) -> Vec<Mutant> {
+fn proof_mutants(judge: &Judge, proof: &[u8]) -> Vec<Mutant> {
+    let statement = judge.input.statement.encode();
     let judged = |name: String, mutated: Vec<u8>| {
-        let code = code(&input.judge(&mutated));
+        let code = judge.code(&statement, &mutated);
         mutant(name, proof, &mutated, code)
     };
     let mut mutants = Vec::new();
@@ -105,19 +154,11 @@ fn proof_mutants(input: &Input, proof: &[u8]) -> Vec<Mutant> {
 
 /// Spike 6c's statement mutants, against the valid proof: each byte XOR
 /// 0x5a; 5 truncations; `public_args`' compact length claiming 2^30 bytes.
-fn statement_mutants(input: &Input, proof: &[u8]) -> Vec<Mutant> {
+fn statement_mutants(judge: &Judge, proof: &[u8]) -> Vec<Mutant> {
+    let input = judge.input;
     let statement = input.statement.encode();
     let judged = |name: String, mutated: Vec<u8>| {
-        let code = match Statement::decode(&mutated) {
-            Err(error) => vos_statement::Refusal::Statement(error).code(),
-            Ok(decoded) => code(
-                &Input {
-                    statement: decoded,
-                    ..input.clone()
-                }
-                .judge(proof),
-            ),
-        };
+        let code = judge.code(&mutated, proof);
         mutant(name, &statement, &mutated, code)
     };
     let mut mutants = Vec::new();
@@ -158,7 +199,8 @@ fn bump(value: &mut BaseField) {
 
 /// Format 39's masked fields tampered, each re-encoded in the fixed
 /// layout: those it holds as mutants, the others by name.
-fn masked_field_mutants(input: &Input, proof: &[u8]) -> (Vec<Mutant>, Vec<String>) {
+fn masked_field_mutants(judge: &Judge, proof: &[u8]) -> (Vec<Mutant>, Vec<String>) {
+    let statement = judge.input.statement.encode();
     let decoded = masked::decode(proof).expect("the fixture decodes");
     let one = SecureField::from(BaseField::from(1u32));
     type Tamper = Box<dyn Fn(&mut WrapProof)>;
@@ -236,7 +278,7 @@ fn masked_field_mutants(input: &Input, proof: &[u8]) -> (Vec<Mutant>, Vec<String
         tamper(&mut tampered);
         match masked::encode(&tampered) {
             Some(bytes) => {
-                let code = code(&input.judge(&bytes));
+                let code = judge.code(&statement, &bytes);
                 assert_eq!(code >> 8, 1, "{name}: refused by its proof");
                 mutants.push(mutant(name.to_string(), proof, &bytes, code));
             }
@@ -249,15 +291,25 @@ fn masked_field_mutants(input: &Input, proof: &[u8]) -> (Vec<Mutant>, Vec<String
 pub fn lists(fx: &Fixtures) -> Lists {
     let input = &fx.valid;
     let proof = &fx.proof;
-    assert_eq!(code(&input.judge(proof)), 0, "the base is accepted");
-    let proof_mutants = proof_mutants(input, proof);
-    let statement_mutants = statement_mutants(input, proof);
+    let judge = Judge {
+        input,
+        chain: scenarios::g7_chain(fx),
+    };
+    assert_eq!(
+        judge.code(&input.statement.encode(), proof),
+        0,
+        "the base is accepted"
+    );
+    let proof_mutants = proof_mutants(&judge, proof);
+    let statement_mutants = statement_mutants(&judge, proof);
     assert_eq!((proof_mutants.len(), statement_mutants.len()), (120, 284));
-    let (masked_field_mutants, masked_fields_without_bytes) = masked_field_mutants(input, proof);
+    let (masked_field_mutants, masked_fields_without_bytes) = masked_field_mutants(&judge, proof);
     Lists {
         about: ABOUT.iter().map(|line| line.to_string()).collect(),
         base: "valid".to_string(),
         proof: "wrap.proof".to_string(),
+        proof_length: proof.len(),
+        proof_blake2b_256: hex(&vos_statement::blake2b_256(&[proof])),
         statement: hex(&input.statement.encode()),
         proof_mutants,
         statement_mutants,
@@ -269,5 +321,5 @@ pub fn lists(fx: &Fixtures) -> Lists {
 const ABOUT: &[&str] = &[
     "VOS's mutation lists for Kreivo's spaces pallet (docs/design/spaces-pallet.md §10, the in-Wasm sweep of spike 6c), generated in VOS (`just conformance`); the teammate's `#[benchmark(extra)]` runs them through submit inside the runtime, every one refused, none trapping.",
     "Each mutant patches the `valid` case of the kit's fixtures/statements.cases: proof_mutants and masked_field_mutants its proof (fixtures/wrap.proof), statement_mutants its statement (`statement`, hex), against the valid proof. A patch replaces `removed` bytes at `offset` with `inserted` (hex).",
-    "code is the verdict at that case's venue state (its accepted formats, pinned program, registered space and anchored roots: in the pallet, Formats, Programs, Spaces and Anchors as G7's pre-state holds them): 1 a statement that does not decode, 2–7 the venue's checks, 0x100 | e the final verifier's error e.",
+    "code is the verdict at that case's venue state (its accepted formats, pinned program, registered space and anchored roots: in the pallet, Formats, Programs, Spaces and Anchors as G7's pre-state holds them), checked in VOS both by judge on that case and by the mock's submit at G7's pre-state: 1 a statement that does not decode, 2–7 the venue's checks, 0x100 | e the final verifier's error e.",
 ];

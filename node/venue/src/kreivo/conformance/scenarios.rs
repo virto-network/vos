@@ -33,7 +33,7 @@ const UNITS: u128 = 1_000_000_000_000;
 /// The fixtures' time: window 42's boundary of `F`'s clock.
 const NOW: u64 = 43 * 600_000;
 /// The fixture space.
-const F: Space = [0xA1; 32];
+pub const F: Space = [0xA1; 32];
 const F_CLOCK: WindowClock = WindowClock::DEFAULT;
 const B_CLOCK: WindowClock = WindowClock {
     origin_ms: 1_000_000,
@@ -45,7 +45,7 @@ const B_START: u64 = 30;
 const OPERATOR: AccountId = [0x0a; 32];
 const CONTROLLER: AccountId = [0xc0; 32];
 const CONTROLLER_2: AccountId = [0xc2; 32];
-const AUTHORITY_F: AccountId = [0xaf; 32];
+pub const AUTHORITY_F: AccountId = [0xaf; 32];
 const AUTHORITY_1: AccountId = [0xa3; 32];
 const AUTHORITY_2: AccountId = [0xa4; 32];
 const AUTHORITY_3: AccountId = [0xa5; 32];
@@ -59,6 +59,8 @@ const KEY_1: u8 = 1;
 const KEY_2: u8 = 2;
 const KEY_3: u8 = 3;
 const KEY_4: u8 = 4;
+const KEY_5: u8 = 5;
+const KEY_6: u8 = 6;
 const KEY_9: u8 = 9;
 
 fn signing(seed: u8) -> SigningKey {
@@ -77,6 +79,19 @@ fn genesis(clock: WindowClock, nonce: u8) -> SpaceGenesis {
         clock,
         time: clock.origin_ms,
         nonce: [nonce; 16],
+    }
+}
+
+/// A two-founder genesis on `B`'s clock, told apart by `nonce`.
+fn genesis_of(nonce: u8) -> SpaceGenesis {
+    genesis(B_CLOCK, nonce)
+}
+
+fn funded(free: u128) -> Account {
+    Account {
+        free,
+        providers: 1,
+        ..Account::default()
     }
 }
 
@@ -129,11 +144,6 @@ impl<'f> World<'f> {
         let constants = Constants::kreivo(fx.venue);
         let mut chain = Chain::new(constants.clone()).with_fees(fees);
         chain.set_now(NOW);
-        let funded = |free| Account {
-            free,
-            providers: 1,
-            ..Account::default()
-        };
         for who in [OPERATOR, CONTROLLER, CONTROLLER_2, STRANGER] {
             chain.set_account(who, funded(100 * UNITS));
         }
@@ -475,6 +485,12 @@ fn g1(fx: &Fixtures) -> Vector {
     let earliest = now_w - w.constants().max_root_age_ms / B_CLOCK.length_ms;
     assert_eq!(earliest, 856);
     let genesis = b_genesis();
+    // Two more spaces, their sovereigns funded, for the bounds' edges.
+    let (latest, oldest) = (genesis_of(0xb5), genesis_of(0xb6));
+    for edge in [&latest, &oldest] {
+        let sovereign = w.constants().sovereign(&space_of(edge));
+        w.chain.set_account(sovereign, funded(100 * UNITS));
+    }
     w.begin();
     // The founder's signature over window 1000, resubmitted at 999.
     let resubmitted = w.registration(&genesis, now_w - 1, now_w, KEY_1, KEY_1);
@@ -507,13 +523,16 @@ fn g1(fx: &Fixtures) -> Vector {
     let held = w.chain.account(&sovereign).held_registration;
     assert_eq!(held, w.constants().registration_deposit);
     w.register(&genesis, now_w, Expect::Err(Error::SpaceExists));
+    w.register(&latest, now_w + 1, Expect::Ok);
+    w.register(&oldest, earliest, Expect::Ok);
     w.finish(
         "G1",
         "register: the fixture genesis's space registered, its sovereign address \
          `modl ‖ kv/space ‖ space[..20]`, the deposit held; refused: the founder's signature \
          resubmitted with another start_window (BadFounder), a start_window past now_w + 1 or \
          before now_w − MaxRootAge / length_ms (BadStartWindow), a second registration \
-         (SpaceExists)",
+         (SpaceExists); the edges taken, a start_window of now_w + 1 and of \
+         now_w − MaxRootAge / length_ms",
     )
 }
 
@@ -578,8 +597,6 @@ fn g4(fx: &Fixtures) -> Vector {
     // Window 30's root just past MaxRootAge.
     let now = B_CLOCK.boundary(B_START).unwrap() + w.constants().max_root_age_ms + 1;
     w.at(now);
-    let now_w = B_CLOCK.window(now).unwrap();
-    assert_eq!(now_w, 175);
     w.begin();
     let by = AUTHORITY_1;
     w.anchor(
@@ -598,6 +615,11 @@ fn g4(fx: &Fixtures) -> Vector {
         KEY_3,
         Expect::Err(Error::WindowTooOld),
     );
+    // Window 31's root exactly MaxRootAge old: taken.
+    let now = B_CLOCK.boundary(B_START + 1).unwrap() + w.constants().max_root_age_ms;
+    w.at(now);
+    let now_w = B_CLOCK.window(now).unwrap();
+    assert_eq!(now_w, 176);
     w.anchor(by, b(), B_START + 1, root(3), KEY_3, Expect::Ok);
     w.anchor(
         by,
@@ -680,7 +702,7 @@ fn g4(fx: &Fixtures) -> Vector {
     w.finish(
         "G4",
         "anchor refusals: before the space's start (OutOfRange), older than MaxRootAge \
-         (WindowTooOld), the same root again (AlreadyAnchored), a stale w ≤ Last \
+         (WindowTooOld), exactly MaxRootAge old taken, the same root again (AlreadyAnchored), a stale w ≤ Last \
          (WindowNotAfterLast), the open window now_w and a later one (WindowInFuture), then \
          now_ms at B_w and the same anchor resubmitted (Anchored); a bad signature \
          (BadAnchorSignature), kind 1 (BadKind), an unlisted key (UnknownAnchorKey), an unknown \
@@ -737,13 +759,25 @@ fn g5(fx: &Fixtures) -> Vector {
         who: AUTHORITY_1,
     };
     w.controller(remove_authority, Expect::Ok);
+    w.controller(resume.clone(), Expect::Ok);
+    // Two fresh keys, the second signer's removed first: the first's still
+    // listed holds the suspension.
+    w.add_authority(AUTHORITY_2, Some(public(KEY_5)), Expect::Ok);
+    w.add_authority(AUTHORITY_3, Some(public(KEY_6)), Expect::Ok);
+    w.anchor(AUTHORITY_2, b(), 39, root(0x1a), KEY_5, Expect::Ok);
+    w.anchor(AUTHORITY_3, b(), 39, root(0x1b), KEY_6, Expect::Ok);
+    let remove = |who| Call::RemoveAuthority { space: b(), who };
+    w.controller(remove(AUTHORITY_3), Expect::Ok);
+    w.controller(resume.clone(), Expect::Err(Error::StillEquivocating));
+    w.controller(remove(AUTHORITY_2), Expect::Ok);
     w.controller(resume, Expect::Ok);
     w.finish(
         "G5",
         "equivocation by one key: Equivocated and SpaceSuspended, the space's anchors refused \
          (SpaceNotActive), resume refused (StillEquivocating) until the key is removed; by two \
          keys (the failover case): Evidence names both, resume refused until both are removed \
-         (the second with its authority)",
+         (the second with its authority); again with two fresh keys, the second signer's \
+         removed first, resume refused until the first's is too",
     )
 }
 
@@ -763,6 +797,13 @@ fn g6(fx: &Fixtures) -> Vector {
         "submit of the masked format-39 fixture: its two roots anchored, then Accepted { id }, \
          Seen[id] its newest root's B_w + MaxRootAge, the deposit held and released",
     )
+}
+
+/// G7's pre-state: the world, `F`'s two roots anchored.
+pub fn g7_chain(fx: &Fixtures) -> Chain {
+    let mut w = World::new(fx, false);
+    w.anchor_f();
+    w.chain
 }
 
 fn g7(fx: &Fixtures) -> Vector {
@@ -824,6 +865,8 @@ fn g9(fx: &Fixtures) -> Vector {
     w.accept(AUTHORITY_F, F, false);
     let past = F_CLOCK.boundary(42).unwrap() + w.constants().max_root_age_ms + 1;
     w.at(past);
+    // Before the cursor prunes them: the anchors are held but stale.
+    w.refused(fx.statement().encode(), fx.proof.clone(), 5);
     w.on_idle();
     assert!(!w.has(&keys::seen(&fx.statement().id().0)));
     assert!(w.has(&keys::seen(&fx.rootless.statement.id().0)));
@@ -832,15 +875,38 @@ fn g9(fx: &Fixtures) -> Vector {
     w.finish(
         "G9",
         "a rootless and a rooted statement accepted; at MaxRootAge + 1 past the newest root's \
-         B_w, on_idle prunes the rooted Seen entry and keeps the rootless one; resubmitted, the \
+         B_w, the rooted one resubmitted before on_idle refused 5 (its anchors held but past \
+         MaxRootAge); on_idle prunes the rooted Seen entry and keeps the rootless one; resubmitted, the \
          rootless is refused 6 (released) and the rooted 5 (forfeited)",
     )
 }
 
 fn g10(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);
+    // A space whose sovereign, once registered, cannot hold a deposit.
+    let poor = genesis_of(0xc1);
+    let constants = w.constants().clone();
+    let free = constants.registration_deposit
+        + constants.existential_deposit
+        + constants.submit_deposit / 2;
+    w.chain
+        .set_account(constants.sovereign(&space_of(&poor)), funded(free));
+    w.register(&poor, B_START, Expect::Ok);
+    let add = Call::AddAuthority {
+        space: space_of(&poor),
+        who: AUTHORITY_2,
+        anchor_key: None,
+    };
+    w.controller(add, Expect::Ok);
     w.begin();
     let s = fx.statement().encode();
+    w.submit(
+        AUTHORITY_2,
+        space_of(&poor),
+        s.clone(),
+        fx.proof.clone(),
+        Expect::Err(Error::InsufficientSovereignBalance),
+    );
     w.submit(
         STRANGER,
         F,
@@ -894,7 +960,8 @@ fn g10(fx: &Fixtures) -> Vector {
     w.register(&b_genesis(), B_START, Expect::Ok);
     w.finish(
         "G10",
-        "a non-authority's submit (NotAuthority); set_paused by a signed account (BadOrigin); \
+        "a submit whose sovereign cannot hold the deposit (InsufficientSovereignBalance, nothing \
+         moved); a non-authority's submit (NotAuthority); set_paused by a signed account (BadOrigin); \
          each pause flag, by the emergency origin, refusing its call (Paused): bit 0 submit, \
          bit 1 anchor, bit 2 register, each other call unpaused; cleared by Root",
     )
@@ -934,6 +1001,18 @@ fn g11(fx: &Fixtures) -> Vector {
     );
     w.call(Origin::Root, set(p2, None), Expect::Ok);
     assert!(!w.has(&keys::programs(&p2)));
+    // `venue_bound` switched on an active program: not only `until_ms`.
+    let p3 = [11; 8];
+    let bound = |venue_bound| ProgramInfo {
+        venue_bound,
+        ..info(NOW, None)
+    };
+    w.call(Origin::Root, set(p3, Some(bound(true))), Expect::Ok);
+    w.call(
+        Origin::Programs,
+        set(p3, Some(bound(false))),
+        Expect::Err(Error::TooEarly),
+    );
     // A handler other than `Record` does not decode.
     let mut bytes = RuntimeCall::Spaces(set(p1, Some(info(at, None)))).encode();
     let handler = 2 + 32 + 1;
@@ -945,7 +1024,9 @@ fn g11(fx: &Fixtures) -> Vector {
         "set_program by ProgramsOrigin: from_ms before now + delay, or an until_ms set before \
          it, refused (TooEarly); at now + delay taken; Root at once; a signed account \
          (BadOrigin); a removal by ProgramsOrigin sets until_ms = now + delay, Root's removes \
-         at once; a handler other than Record does not decode",
+         at once; a change other than setting or shortening until_ms (venue_bound on an active \
+         program) needs from_ms ≥ now + delay (TooEarly); a handler other than Record does not \
+         decode",
     )
 }
 
@@ -1260,7 +1341,7 @@ fn g18(fx: &Fixtures) -> Vector {
     let taken = genesis(B_CLOCK, 0xb2);
     let sovereign = w.constants().sovereign(&space_of(&taken));
     w.chain
-        .set_storage(keys::sovereign_of(&sovereign), [0xee; 32].encode());
+        .set_storage(keys::sovereign_of(&sovereign), [0xeeu8; 32].encode());
     w.chain.set_account(
         sovereign,
         Account {
@@ -1358,6 +1439,8 @@ pub fn file(fx: &Fixtures) -> File {
         ("anchor key 2 (B's founder 2)", KEY_2),
         ("anchor key 3", KEY_3),
         ("anchor key 4", KEY_4),
+        ("anchor key 5", KEY_5),
+        ("anchor key 6", KEY_6),
         ("anchor key 9 (never listed)", KEY_9),
     ];
     let names = accounts
@@ -1382,5 +1465,6 @@ const ABOUT: &[&str] = &[
     "A step: now_ms, then a call (origin: {\"signed\": account} or root, programs (ProgramsOrigin), emergency (EmergencyOrigin), status (StatusOrigin); call: the RuntimeCall's bytes, [90, call_index] ++ SCALE(args), as parts: hex, or {fixture, from, to}, bytes from..to of the kit's fixtures/<fixture>) or on_idle with ample weight.",
     "Each step's expectation: result (ok; {\"module\": i}, DispatchError::Module { index: 90, error: [i, 0, 0, 0] }; bad_origin; funds_unavailable; invalid_payment, InvalidTransaction::Payment in validate, never included; undecodable, the call's bytes refused before dispatch); events, the pallet's Event in SCALE, without the runtime's index; storage, every raw key of the pallet's whose value changed (null: removed); balances, each account's deltas (free, held_registration, held_submit, providers).",
     "fees: false vectors run in the pallet's own mock runtime, no fee pipeline: deposits pinned exactly. fees: true vectors run in Kreivo's runtime with ChargeSpaceFee: free deltas by sign only (+, -, 0; the signer always listed), payer who paid the fee (sovereign or signer), and Budget's writes left out (its spend sums fees, the teammate's weights). The mock charges every fee at fee_bound.",
+    "Balances: in a pallet-level vector every account a step does not list is unchanged; in a fees vector the runtime's fee recipients (the block author, the treasury's share) are not pinned, and only the accounts listed are. A pre-state's consumers exclude the one FRAME's Balances takes for a hold (sovereign F's are 0 though it holds its registration deposit): the teammate's harness keeps its own; providers are pinned as deltas.",
     "Accounts: 'names' labels them. The fixture space F ([0xa1; 32], the fixtures' statements' space) is in every pre-state as storage, since no genesis hashes to its id; space B is registered by call from a genesis of two founders.",
 ];
