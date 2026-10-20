@@ -2790,6 +2790,4 @@ rotation). Its findings:
 Commits: `7b2c5d0a` (6.14b's merge), `f73a4999` (the fold), `5de84ad7`,
 `7acc49e0` (the gates' recipes), this record.
 
-Milestone review: Fable (running)
-
 **M3a accepted.**
