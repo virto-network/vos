@@ -252,16 +252,6 @@ impl Batch {
             .insert(self.store.system(), node_record(NodeRow::Secret, &[]), seed);
     }
 
-    /// Record the seed of the node's account key `number` at its space's
-    /// venue, numbered from 1 in the order they were made.
-    pub fn venue_account_secret(&mut self, number: u64, seed: &[u8; 32]) {
-        self.batch.insert(
-            self.store.system(),
-            node_record(NodeRow::VenueAccount, &number.to_be_bytes()),
-            seed,
-        );
-    }
-
     /// Record the seed of the node's anchor key `number`, past its first:
     /// numbered from 1, in the order they were made.
     pub fn anchor_secret(&mut self, number: u64, seed: &[u8; 32]) {

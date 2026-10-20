@@ -20,12 +20,6 @@ pub enum Peers {
     Hub(vos_net::memory::Hub),
 }
 
-/// Makes a venue's client from the node's account key at the venue.
-pub type VenueWithAccount = Box<
-    dyn FnOnce(vos_venue::kreivo::AccountSeed) -> Result<Arc<dyn vos_venue::VenueClient>, String>
-        + Send,
->;
-
 /// How a node runs.
 pub struct Config {
     /// The agent program every agent runs, as a standard program.
@@ -65,12 +59,6 @@ pub struct Config {
     /// The venue the space's representative anchors its roots at, when
     /// this node leads it: the anchor signed by this node's key.
     pub venue: Option<Arc<dyn vos_venue::VenueClient>>,
-    /// A venue whose client signs as this node's own account there (a
-    /// Kreivo authority's), made at the node's start from the account's
-    /// key: the node makes that key at its first such start and keeps it
-    /// in its store beside its node key, never the same key, never logged.
-    /// Taken when `venue` is unset.
-    pub venue_with_account: Option<VenueWithAccount>,
     /// How the node reaches the other nodes of its space.
     pub peers: Peers,
     /// Where the peer endpoint binds, when not the address its space
@@ -158,7 +146,6 @@ impl Config {
             ingress_tls: None,
             space: None,
             venue: None,
-            venue_with_account: None,
             peer_bind: None,
             quic_idle: vos_net::quic::IDLE,
             peers: Peers::Quic,

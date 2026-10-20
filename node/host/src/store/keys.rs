@@ -36,7 +36,7 @@ pub(super) enum NodeRow {
     Incarnation = 0x0d,
     VoteFloor = 0x0e,
     AnchorKey = 0x0f,
-    VenueAccount = 0x10,
+    // 0x10 is unused.
 }
 
 pub(super) fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {

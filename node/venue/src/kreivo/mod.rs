@@ -2,21 +2,13 @@
 //! client of it, [`KreivoVenue`], in two layers, [`calls`] (the pinned
 //! call bytes, storage keys and event decoding) and a [`Transport`] (sign
 //! and send a call, follow it to inclusion, read events and raw storage);
-//! `chain`, the transport over a Kreivo node's RPC (feature `kreivo`);
 //! and `mock`, a plain-Rust model of the pallet (feature `mock`, and this
 //! crate's tests), the chain the client's tests run against, and the
 //! conformance vectors G1–G18 it generates, which the Kreivo teammate's
-//! pallet must pass.
-//!
-//! No build reaches Kreivo without the `kreivo-unvetted` feature
-//! ([`selectable`]) until the teammate's pallet passes the vectors in its
-//! own runtime and the end to end run on a Kreivo dev chain (`slice-6-on-chain.md`, M3b's deferred
-//! gates 1 and 2): no space anchors on a chain whose pallet has not met
-//! them.
+//! pallet must pass. The transport over a live Kreivo node is not here:
+//! it implements [`Transport`] (`spaces-pallet.md`, the node-side client).
 
 pub mod calls;
-#[cfg(feature = "kreivo")]
-pub mod chain;
 #[cfg(any(test, feature = "mock"))]
 pub mod mock;
 pub mod transport;
@@ -29,46 +21,3 @@ mod tests;
 
 pub use transport::{Sender, Transport};
 pub use venue::{Alert, Connect, KreivoVenue, Options};
-
-/// A node's Kreivo account key (decision 12): the 32-byte mini secret of
-/// an sr25519 key, made by the node and kept in its store beside its node
-/// key and its anchor keys, never one of them. The controller registers
-/// its account as one of the space's authorities, paired with the node's
-/// anchor key; it holds no balance, the space's sovereign account pays.
-/// Never shown: its `Debug` names it only, and it is zeroed when dropped.
-pub struct AccountSeed(zeroize::Zeroizing<[u8; 32]>);
-
-impl AccountSeed {
-    pub fn new(seed: zeroize::Zeroizing<[u8; 32]>) -> Self {
-        Self(seed)
-    }
-
-    /// The secret, to make the key from.
-    pub fn secret(&self) -> &[u8; 32] {
-        &self.0
-    }
-}
-
-impl std::fmt::Debug for AccountSeed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("AccountSeed(..)")
-    }
-}
-
-/// Whether this build may reach Kreivo: only with the `kreivo-unvetted`
-/// feature, which development, tests and the end to end runs build with
-/// and a release never does, until Kreivo's spaces pallet passes the
-/// conformance vectors in its runtime and the end to end run on a Kreivo
-/// dev chain. `chain::ChainTransport::connect` asks it,
-/// so every node that reaches Kreivo is gated.
-pub fn selectable() -> Result<(), String> {
-    if cfg!(feature = "kreivo-unvetted") {
-        return Ok(());
-    }
-    Err(
-        "this build does not reach Kreivo: its spaces pallet has not yet passed the \
-         conformance vectors in its runtime and the end to end run on a Kreivo dev chain \
-         (the `kreivo-unvetted` feature, never in a release)"
-            .into(),
-    )
-}

@@ -6,7 +6,6 @@ mod call;
 mod jam;
 mod kept;
 mod operator;
-mod venue;
 
 use std::fmt::Display;
 use std::path::Path;
@@ -94,31 +93,6 @@ impl NodeCommand {
                 println!("{}", hex::encode(id.0));
                 Ok(())
             }
-            #[cfg(feature = "kreivo")]
-            NodeCommand::VenueAccount { command } => match command {
-                args::VenueAccountCommand::Show { data } => {
-                    let seed = vos_node::venue_account(&data)?;
-                    eprintln!(
-                        "vos: the node's account at Kreivo: have the space's controller register \
-                         it as an authority, paired with the node's anchor key"
-                    );
-                    println!("{}", hex::encode(venue::account_of(&seed)?));
-                    Ok(())
-                }
-                args::VenueAccountCommand::Rotate { data } => {
-                    let (old, new) = vos_node::rotate_venue_account(&data)?;
-                    if let Some(old) = old {
-                        println!("old {}", hex::encode(venue::account_of(&old)?));
-                    }
-                    println!("new {}", hex::encode(venue::account_of(&new)?));
-                    eprintln!(
-                        "vos: the node signs as the new account from its next start: have the \
-                         controller remove the old authority, then add the new paired with the \
-                         node's anchor key; the node anchors nothing between the two"
-                    );
-                    Ok(())
-                }
-            },
             NodeCommand::AnchorKey {
                 command: AnchorKeyCommand::Rotate { data },
             } => {
@@ -151,9 +125,6 @@ impl RunArgs {
         config.ingress_tls = self.tls.ingress();
         config.space = self.space.as_deref().map(Space::read).transpose()?;
         config.peer_bind = self.peer_bind;
-        if let (Some(kind), Some(url)) = (self.venue, &self.venue_url) {
-            config.venue_with_account = Some(venue::anchoring(kind, url, config.space.as_ref())?);
-        }
         #[cfg(feature = "faults")]
         {
             eprintln!("vos: WARNING: this build injects faults; it is for tests only");
@@ -183,8 +154,6 @@ impl SpaceCommand {
                 window_ms,
                 origin_ms,
             } => found(&space, &data, window_ms, origin_ms),
-            #[cfg(feature = "kreivo")]
-            SpaceCommand::Venue { command } => command.run(),
         }
     }
 }

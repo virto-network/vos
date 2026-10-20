@@ -17,12 +17,6 @@ faults = ["vos-node/faults"]
 # mimalloc as the process's allocator; without it, the system's (which
 # heap tools such as heaptrack, valgrind and sanitizers see).
 mimalloc = ["dep:mimalloc", "dep:libc"]
-# The Kreivo client: `vos node run --venue kreivo`, `vos node
-# venue-account` and `vos space venue`.
-kreivo = ["vos-venue/kreivo"]
-# Lets `vos` reach Kreivo, until its spaces pallet meets the conformance
-# vectors: development and the end to end runs only, never a release.
-kreivo-unvetted = ["kreivo", "vos-venue/kreivo-unvetted"]
 
 [dependencies]
 mimalloc = { version = "0.1.52", optional = true }
