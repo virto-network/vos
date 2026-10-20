@@ -299,22 +299,20 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
         &other,
     );
 
-    // The space migrated away from the venue's next window, then a second
-    // root for its anchored window.
+    // The space migrated away from a window past the venue's next by the
+    // time its item lands, then a second root for its anchored window.
     let next = venue
         .statements
         .now()
-        .map(|now| clock.window(now).unwrap_or(0) + 1)?;
+        .map(|now| clock.window(now).unwrap_or(0) + 2)?;
     let migrate = Migrate {
         space,
         from: venue.id(),
         to: VenueId([0xee; 32]),
         from_window: next,
     };
-    record.note(format!(
-        "migrate from window {next}: {:?}",
-        venue.migrate(&migrate, &controller)
-    ));
+    let migrated = venue.migrate(&migrate, &controller);
+    record.note(format!("migrate from window {next}: {migrated:?}"));
     record.note(format!(
         "a second root for window {start}: {:?}; the space suspended: {:?}",
         venue.anchor(&anchor(start, 2, &founder)),
@@ -331,6 +329,7 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
             return Err(format!("{what}: code {code:#x}").into());
         }
     }
+    migrated.map_err(|refusal| format!("the migration refused: {refusal:?}"))?;
     record.note("every verdict as expected");
     Ok(())
 }
