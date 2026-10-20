@@ -3,9 +3,14 @@ name = "vos-venue"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "A venue as a VOS node reaches it: anchoring a space's roots, submitting statements, and asking what is anchored; and the model venue the node's tests anchor at."
+description = "A venue as a VOS node reaches it: anchoring a space's roots, submitting statements, and asking what is anchored; the model venue the node's tests anchor at, and a JAM statements service."
 
 [dependencies]
 ed25519-dalek = "2"
+# The STARK's refusals a JAM venue's code names.
+stwo = { workspace = true }
 vos-anchor = { workspace = true }
+# A JAM statements service, reached through its client.
+vos-jam = { workspace = true }
 vos-statement = { workspace = true }
+vos-statement-service = { workspace = true }

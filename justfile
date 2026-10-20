@@ -151,6 +151,16 @@ test-agent: build-test-actors build-agent build-representative
 jam-testnet: build-test-actors build-agent
     bash node/jam/testnet.sh
 
+# The JAM statements service on a local PolkaJam testnet, which it starts
+# and stops: deployed, a space registered and a window anchored, the golden
+# fixtures' masked statements submitted with their proofs as extrinsics,
+# each outcome read back, every refine's gas against the JAM-only host's.
+# `bash node/jam/testnet.sh both` deploys it beside the default agent.
+# Outside `ci`, as `jam-testnet` is.
+jam-statements-testnet:
+    cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+    bash node/jam/testnet.sh statements
+
 # A plain build of `vos` carries no faults: building the fault suite's
 # `vos` with the feature must not leak into it, and no workspace member
 # turns the feature on for vos-node.

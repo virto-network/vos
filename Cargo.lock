@@ -2494,6 +2494,9 @@ dependencies = [
  "vos-node",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-statement",
+ "vos-statement-service",
+ "vos-venue",
  "vos-wire",
 ]
 
@@ -2510,6 +2513,8 @@ dependencies = [
  "thiserror",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-program",
+ "vos-statement-service",
  "vos-tree",
  "vos-wire",
 ]
@@ -2827,8 +2832,11 @@ name = "vos-venue"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "stwo",
  "vos-anchor",
+ "vos-jam",
  "vos-statement",
+ "vos-statement-service",
 ]
 
 [[package]]

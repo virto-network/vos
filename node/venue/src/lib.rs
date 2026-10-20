@@ -13,6 +13,9 @@
 //! anchor keys are kept by space, the founding ones first, added and
 //! removed as `spaces-pallet.md`'s controller does, and `resume` lifts a
 //! suspension once neither equivocating key is registered.
+//!
+//! [`jam::JamVenue`] is a JAM statements service (`vos-statement-service`)
+//! on a JAM node, through `vos-jam`'s client.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -428,5 +431,6 @@ impl VenueClient for ModelVenue {
     }
 }
 
+pub mod jam;
 #[cfg(test)]
 mod tests;

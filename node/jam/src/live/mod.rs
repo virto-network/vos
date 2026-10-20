@@ -1,5 +1,7 @@
 //! A PolkaJam node: its JSON-RPC for state and segments, and `jamt` for
-//! services, preimages and work items.
+//! services, preimages and work items; work packages with extrinsics, built
+//! and submitted by RPC ([`package`]), and a JAM statements service's
+//! client ([`statements`]).
 //!
 //! A package goes as a work package of one item, so its exports are the
 //! package's from index 0. Its payload goes in a file, which `jamt item`
@@ -13,7 +15,9 @@
 //! that before a package that needs one.
 
 mod jamt;
+pub mod package;
 mod rpc;
+pub mod statements;
 
 use std::path::PathBuf;
 use std::sync::Arc;
