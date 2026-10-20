@@ -2996,3 +2996,12 @@ On `vos-core` (from `56ab4860`).
   `Payment`; `Timestamp.Now`, `System.Account[Alice]` and a key listing
   read raw. The chain's directory under the scratch directory, its PID
   stopped and the directory removed.
+- **Gates:** `just check` at `74339d67` green but for one run of
+  `snapshots::a_log_compacts_on_its_bytes_and_keeps_a_tail_within_them`
+  (`NotLeader(None)`: a leader change under load during its increments,
+  no venue in it), which passed alone, 7 of 7 in `snapshots::`; the
+  check's remaining suites then green (`cargo test` of the node's crates
+  and `test-reads`), 8.5 min and 11.3 min (12 GiB scope, `nice -n 10`,
+  8 jobs). `just check` now also runs `clippy-kreivo`: `vos-venue` and
+  `vos-cli` with `kreivo` and `mock` linted, and the envelope's tests;
+  `doc-check` documents `vos-venue` with both features.
