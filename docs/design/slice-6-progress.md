@@ -3237,6 +3237,10 @@ test's or its harness's, not a node's:
 - **A background drop read at once.** A follower caught up by a snapshot
   drops its old epoch in the background after the switch; two tests read
   it gone at once ("the old epoch is dropped"). They wait for it.
+- **Naps shorter than the setup after them.** A workflow's nap of 1 s
+  ended before the test lost its page on the leader ("the leader halts"
+  timed out); one of 1.5 s ended before the upgrade it should sleep
+  through. Naps of 5 s and 10 s, and the leader read after the start.
 - **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
   counted any result past its start; an install applied late is one. A
   marker is an empty result, and only those count.

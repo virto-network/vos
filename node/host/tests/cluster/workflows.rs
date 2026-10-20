@@ -230,7 +230,8 @@ fn a_workflow_wakes_on_the_program_only_its_life_pins() {
     let shop = Shop::load();
     let agent = cluster.counter_agent(&[1, 2, 3]);
     shop.install(&cluster, agent);
-    let nap = shop.start(&cluster, agent, 1, "nap", 1_500u64);
+    // A nap long enough to outlast the upgrade on a loaded host.
+    let nap = shop.start(&cluster, agent, 1, "nap", 10_000u64);
     shop.upgrade(&cluster, agent);
     let leader = cluster.node(cluster.leader(agent));
     let program = record(leader, agent, nap).unwrap().program.0;
@@ -353,8 +354,9 @@ fn a_lost_page_halts_the_node_that_lost_it() {
     let shop = Shop::load();
     let agent = cluster.counter_agent(&[1, 2, 3]);
     shop.install(&cluster, agent);
+    // A nap long enough that a loaded host loses the page before its step.
+    let nap = shop.start(&cluster, agent, 1, "nap", 5_000u64);
     let leader = cluster.leader(agent);
-    let nap = shop.start(&cluster, agent, 1, "nap", 1_000u64);
     let node = cluster.node(leader);
     let held = record(node, agent, nap).unwrap().snapshot.unwrap().pages;
     let lost = Write {
