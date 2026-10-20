@@ -36,8 +36,8 @@ use crate::store::{Pending, Store, View};
 
 pub(crate) use fit::MAX_INPUT;
 pub use fit::{
-    MARGIN, MAX_INPUTS, OWN_BOUND, POLKAJAM_REFINE_GAS, Prepared, WORST_ENDING, WORST_JAM_STEP,
-    budget,
+    IMPORT_REF, MARGIN, MAX_INPUTS, MAX_PACKAGE, OWN_BOUND, PACKAGE_FRAMING, POLKAJAM_REFINE_GAS,
+    Prepared, WORST_ENDING, WORST_JAM_STEP, budget,
 };
 
 /// The times the builder makes a batch again before it stops.

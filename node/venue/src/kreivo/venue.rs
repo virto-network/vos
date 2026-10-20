@@ -408,7 +408,9 @@ impl Shared {
             known.read = true;
             known.info = info;
             known.keys = keys;
-            known.last = last;
+            // A venue's last window never goes back: a read begun before
+            // an anchor landed does not undo the anchor seen held.
+            known.last = known.last.max(last);
         }
         let floor = self
             .options

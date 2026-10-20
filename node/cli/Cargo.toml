@@ -40,6 +40,10 @@ vos-node = { path = "../host" }
 vos-node-prover = { workspace = true, optional = true }
 vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
+# The golden fixtures' masked statements, which `vos jam statements` submits
+# to a JAM statements service.
+vos-statement = { workspace = true, features = ["fixtures"] }
+vos-statement-service = { workspace = true }
 vos-venue = { workspace = true }
 vos-wire = { workspace = true }
 

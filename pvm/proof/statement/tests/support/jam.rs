@@ -1,9 +1,10 @@
-//! The venue's JAM refine program (`final-verify.elf`, linking format 39
-//! alone, and `final-verify-test.elf`, linking 28 beside it; both built by
-//! `just check-no-std`) on the JAM-only host, at PolkaJam's prices: the
-//! request as work item 0's payload and the proof as a preimage of the
-//! running service. Shared by the tests that run it, each including this
-//! file.
+//! The venue's JAM programs on the JAM-only host, at PolkaJam's prices:
+//! the refine program (`final-verify.elf`, linking format 39 alone, and
+//! `final-verify-test.elf`, linking 28 beside it), its request as work item
+//! 0's payload and the proof as a preimage of the running service; and any
+//! service's refine and accumulate (`statement-service.elf`'s), each built
+//! by `just check-no-std`. Shared by the tests that run them, each including
+//! this file.
 
 #![allow(dead_code)]
 
@@ -11,9 +12,12 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use vos_pvm::ExitReason;
+use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
+use vos_pvm::refine::PreparedProgram;
 use vos_pvm::refine_host::{JamItem, JamRefine, Preimages, RefineContext};
-use vos_pvm_final_verifier::PUBLIC_WORDS;
 use vos_statement::model::Input;
+use vos_statement::vos_pvm_final_verifier::PUBLIC_WORDS;
 
 /// The guest's verdicts.
 pub const ACCEPT: u64 = 1;
@@ -54,8 +58,8 @@ pub fn test_program() -> (Vec<u8>, usize) {
 }
 
 /// `target/riscv64em-vos/release/<name>.elf` of the workspace holding the
-/// crate that includes this file, linked.
-fn guest(name: &str) -> (Vec<u8>, usize) {
+/// crate that includes this file, linked: its program and its ELF's length.
+pub fn guest(name: &str) -> (Vec<u8>, usize) {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = manifest
         .ancestors()
@@ -115,7 +119,7 @@ pub fn run_payload(program: &[u8], payload: Vec<u8>, proof: Option<&[u8]>) -> (u
         service: SERVICE,
         items: vec![JamItem {
             payload,
-            imports: Vec::new(),
+            ..JamItem::default()
         }],
         preimages: Some(Arc::new(Store(preimages.into_iter().collect()))),
         ..JamRefine::default()
@@ -139,4 +143,50 @@ pub fn run_payload(program: &[u8], payload: Vec<u8>, proof: Option<&[u8]>) -> (u
         digests: bytes[312..472].to_vec(),
     };
     (invocation.gas_used, report)
+}
+
+/// A service's refine of item `jam.item` on the JAM-only host: its exit,
+/// the gas it took and its output.
+#[derive(Debug)]
+pub struct Refined {
+    pub exit: ExitReason,
+    pub gas: u64,
+    pub output: Vec<u8>,
+}
+
+/// `program`'s refine, given `args` (`E(c, i, s, ↕payload, H(p))`) and
+/// `jam`, with `gas`.
+pub fn refine(program: &[u8], args: &[u8], jam: JamRefine, gas: u64) -> Refined {
+    let context = RefineContext::load(program, args, gas).expect("loads the program");
+    let run = context.try_run_jam(jam).expect("the JAM-only host");
+    let invocation = run.invocation;
+    assert_ne!(invocation.registers[7], 0xDEAD, "the program panicked");
+    let output = match invocation.exit {
+        ExitReason::Halt => invocation.output_bounded(1 << 20).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+    Refined {
+        exit: invocation.exit,
+        gas: invocation.gas_used,
+        output,
+    }
+}
+
+/// `program`'s accumulate as service `service` at `slot` over `inputs`
+/// (each `fetch` kind 15's), on `storage`, with `gas`: its exit and the gas
+/// it took. The host charges each call the accumulate host's base, not
+/// PolkaJam's per-call prices.
+pub fn accumulate(
+    program: &PreparedProgram,
+    slot: u64,
+    service: u64,
+    inputs: &[Vec<u8>],
+    storage: &mut impl ServiceStorage,
+    gas: u64,
+) -> (ExitReason, u64) {
+    let invocation = AccumulateContext::load(program, slot, service, inputs, gas, storage)
+        .expect("loads the program at accumulate")
+        .try_run()
+        .expect("the accumulate host");
+    (invocation.exit, invocation.gas_used)
 }

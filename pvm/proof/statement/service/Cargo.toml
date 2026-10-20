@@ -1,0 +1,36 @@
+[package]
+name = "vos-statement-service"
+edition.workspace = true
+version.workspace = true
+license = "Apache-2.0"
+description = "The JAM statements service: a venue on JAM, as a service whose refine checks registrations', migrations' and anchors' signatures and judges statements against their final proofs, and whose accumulate keeps the spaces, their anchors and the statements accepted. no_std; its program for the PVM target."
+
+[features]
+# The service as a JAM program (`src/bin/statement-service.rs`), for the
+# PVM target only: no_main, the venue guests' runtime.
+pvm-guest = []
+
+[[bin]]
+name = "statement-service"
+required-features = ["pvm-guest"]
+test = false
+bench = false
+
+[dependencies]
+# The statement, its venue checks and the final verifier (format 39); the
+# space's types, re-exported.
+vos-statement = { workspace = true }
+# The anchors', registrations' and migrations' signatures, verified at
+# refine.
+ed25519-dalek = { version = "2", default-features = false }
+
+[dev-dependencies]
+# The golden fixtures, judged by the service as by every venue.
+vos-statement = { workspace = true, features = ["fixtures"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+# The JAM-only host the service runs on, refine and accumulate, and its
+# linker.
+vos-pvm = { workspace = true }
+vos-pvm-compiler = { workspace = true }
+# The accumulate inputs' encoding a JAM node gives, which the service reads.
+vos-wire = { workspace = true }

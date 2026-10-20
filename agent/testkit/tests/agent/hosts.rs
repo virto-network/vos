@@ -72,7 +72,8 @@ fn every_program_calls_only_its_surface() {
 /// The JAM-only host charges PolkaJam's prices where they differ from the
 /// Gray Paper's base, as the probe in `spikes/sj-jam-b` measured them:
 /// `gas` 48, `log` 1,000 and answering `WHAT`, a call it does not serve
-/// 1,000, a segment's `fetch` 171, an `export` 3,521, and
+/// 1,000, a segment's `fetch` 171 (Gray Paper 0.8.0's per-kind price of an
+/// import), an `export` 3,521, and
 /// `historical_lookup` 1,125 and 264 a KiB asked for. The runtime's tests
 /// measure each charge. Its segments are the agent's.
 #[test]
@@ -83,7 +84,7 @@ fn the_jam_host_charges_polkajams_prices() {
         (48, 1_000, 1_000)
     );
     assert_eq!(
-        (jam_gas::fetch(SEGMENT as u64), jam_gas::EXPORT),
+        (jam_gas::fetch(6, SEGMENT as u64), jam_gas::EXPORT),
         (171, 3_521)
     );
     assert_eq!(SEGMENT, vos_wire::package::SEGMENT);

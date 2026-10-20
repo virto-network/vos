@@ -3062,3 +3062,108 @@ On `vos-core` (from `56ab4860`).
   passed, 0 failed, 12.2 min (12 GiB scope, `nice -n 10`, 8 jobs).
 
 **6.17b accepted.**
+
+
+## Step 6.19: the JAM statements service
+
+On `s6/jam` (from `4447127a`). The full record is the step's log.
+
+- **Built:** `vos-statement-service` (`pvm/proof/statement/service`), a
+  JAM service for riscv64em on the venue guests' runtime (shared from
+  `vos-statement`'s guest). Items `Register`, `Migrate` (on JAM the
+  controller is an ed25519 key, signing `BLAKE2b-256("vos/space/migrate"
+  ‖ migrate)`), `Anchor` and `Submit`, its statement in the payload (at
+  most 64 KiB, as Kreivo bounds it; past it code 1) and its proof the
+  item's first extrinsic (`fetch` kind 4). Refine verifies the
+  registration's (1 to 16 founders, a registrable clock, a founding
+  signer), the migration's and the anchor's ed25519 signatures and runs
+  pin F's checks but `anchored` and `seen`, then the proof; its `Verdict`
+  at most 2,734 B (a statement of at most 64 roots). Accumulate holds the spaces (clock, controller, keys,
+  range, `Last`, suspension), the anchors and their evidence, `Seen` and
+  each item's outcome keyed by its payload's hash; applies pin D's anchor
+  rule and the registration's start bound at the slot's time (`genesis_ms
+  + slot × 6 s`); records a statement only on a code of 0, its roots
+  anchored and its id unseen. Anchors, rooted `Seen` entries and outcomes
+  are queued by the hour they expire and dropped a few an accumulate; a
+  rootless entry is never queued. A deployment's genesis hash, genesis
+  time and pins are a block of the program's read-only data that
+  `config::configure` fills before deploy: constants, changed by
+  redeploy; the service has no test mode.
+- **The JAM-only host** prices `fetch` by Gray Paper 0.8.0's per-kind
+  table and serves extrinsics (kinds 3, 4); its harness runs a service's
+  refine and accumulate.
+- **The golden fixtures fail one check each:** unanchored root, a root's
+  window and a root now change the venue's anchors, not the statement's
+  roots, which moved the io-hash too: the JAM service, verifying before it
+  reads its state, refused them `0x108` where the other venues refuse
+  `0x5`. Only `statements.cases` changed; the proofs are byte for byte.
+- **The builder** fits a package within CE 133's bound (`MAX_PACKAGE`,
+  204,800 B: payload, imports' references and 4 KiB of framing) as well as
+  `W_B`; a 64-request batch of 256 KiB of arguments splits, 32 in the
+  first package.
+- **Tooling:** `vos-jam` builds a GP 0.8.0 work package by hand, byte for
+  byte `jamt`'s, and submits it with its extrinsics through
+  `submitWorkPackage`; `live::statements` is the service's client;
+  `vos-venue`'s `JamVenue` the service as a node's venue; `vos jam
+  statements` deploys and drives it; `testnet.sh [agent|statements|both]`
+  on PolkaJam v0.8.0, its files and chain under `TMPDIR`; `just
+  jam-statements-testnet`.
+- **Measured** [measured]:
+  - the program 595,247 B (ELF 938,456 B), under the 4,000,000 B bound;
+  - refine, JAM-only host: a masked statement accepted 84.11M gas (the
+    rooted fixture), 83.78M (the rootless one); refused by the proof's
+    words 12.05M; refused before the proof 0.11–0.13M; a 256 KiB extrinsic
+    read and refused by the verifier 0.21M; `Register` 3.17M, `Anchor`
+    3.10M, `Migrate` 3.07M (an ed25519 verify each);
+  - accumulate: 75k–115k gas a report on the JAM-only host (its host calls
+    at the base); 107,910 on PolkaJam for the accepted statement, by the
+    service's own count;
+  - **PolkaJam v0.8.0 testnet (interpreter)**, `just
+    jam-statements-testnet` and `testnet.sh both` (the agent's 8
+    packages, then the service): the 256 KiB extrinsic landed (`0x104`,
+    208,160 gas); a space registered, window 3 anchored, an unlisted key
+    refused `Key`; the rootless masked statement accepted, 83,778,546 gas
+    on PolkaJam and on the JAM-only host, equal to the unit; replayed
+    `0x6`; the rooted one, bound to the fixtures' venue, `0x7`; the space
+    migrated; a second root `Equivocation`, the space suspended; each item
+    about 18 s from submission to its outcome at the finalized block; the
+    testnet logging no error.
+
+**The review** (Opus, accept with fixes), folded:
+- **F1:** a `write` the host refuses (`FULL`) traps, so the whole
+  accumulate reverts; the JAM-only host answers `FULL` for a full storage
+  (`ServiceStorage::full`); pin F and an ops note: the balance above the
+  threshold, alerted on.
+- **F2:** outcomes keyed by `BLAKE2b-256(package hash ‖ payload hash)`, so
+  a later package of the same payload cannot overwrite one;
+  `submit_package` returns the package's hash.
+- **F3:** a `Control { space, nonce, AddKey | RemoveKey | Resume |
+  SetController }` item, the controller's, at the space's next nonce; the
+  equivocators kept in the space's record, a resume as the model venue's;
+  `JamVenue::control`, `status`.
+- **F5:** the service created with a least accumulate gas an item (2M);
+  at most 64 roots a statement (code 1 past it).
+- **F6:** `JamVenue::new` checks the code hash against the configured blob
+  and the configuration's genesis against the chain's, its time from the
+  configuration; pin D: (genesis, service) fixes the code.
+- **F7:** pin F: a statement failing several checks gets its venue's first.
+- **F8:** the CE 133 test isolates the bound; `PACKAGE_FRAMING` exact (269
+  B, jamt's encoding); a package to the service holds at most 17 items,
+  their verdicts within a report; the verdict bound recorded (36,891 B
+  before the roots' cap; commit `c8150c54` said 36,972).
+- **F4**, at the merge onto 6.17b: `JamVenue::anchor` verifies the
+  signature over its digest here and queues the anchor in 6.17b's
+  `AnchorQueue`, answering `Queued` at once (under 10 ms with a stalled
+  node, tested); the queue's worker lands it (`New`/`Again` done; `Window`,
+  `Age`, `Equivocation` dead; `Open` or a transport failure again a slot
+  later, the rest a window later). `status` reads the space's record; a
+  submit's code is `Refused(code)` (6 the venue holding it accepted), a
+  transport failure `Unjudged::Unknown`. The blocking calls a run's tooling
+  makes stay on `Jam`.
+
+**Merged** into `vos-core` (the `check` recipe's tests both sides', the
+manifests' dependencies both sides'); the conformance vectors and the kit
+unchanged by it (`just check-kit`, `just conformance`).
+
+**6.19 accepted.**
+

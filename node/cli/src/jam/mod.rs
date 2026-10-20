@@ -1,6 +1,7 @@
 //! `vos jam`: an agent as a JAM service, built and driven by its builder.
 
 mod reference;
+mod statements;
 mod testnet;
 
 use std::path::{Path, PathBuf};
@@ -25,6 +26,11 @@ pub enum JamCommand {
     /// Run the agent as a service on a running PolkaJam testnet: every
     /// package checked against the chain and a VOS node, and recorded.
     Testnet(testnet::TestnetArgs),
+    /// Deploy the JAM statements service on a running PolkaJam testnet and
+    /// drive it: a 256 KiB extrinsic, a space registered and anchored, the
+    /// golden fixtures' masked statements, a migration and an
+    /// equivocation, each outcome read back and recorded.
+    Statements(statements::StatementsArgs),
 }
 
 /// The service's metadata, as PolkaJam names services by it.
@@ -53,6 +59,7 @@ impl JamCommand {
                 Ok(())
             }
             JamCommand::Testnet(args) => testnet::run(args),
+            JamCommand::Statements(args) => statements::run(args),
         }
     }
 }

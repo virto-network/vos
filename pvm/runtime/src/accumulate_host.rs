@@ -40,6 +40,13 @@ pub trait ServiceStorage {
     /// Set or (with `None`) delete a value, returning the previous value's
     /// length.
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize>;
+    /// Whether writing `value` at `key` would take the service's storage
+    /// past what its balance holds: `write` then answers `FULL` and writes
+    /// nothing, as a JAM node does. A VOS node bounds an agent's storage
+    /// otherwise, and answers it never.
+    fn full(&self, _key: &[u8], _value: Option<&[u8]>) -> bool {
+        false
+    }
     /// Ask for the preimage of `hash`, `len` bytes long: whether the store
     /// takes the request. A VOS node, which keeps its programs itself,
     /// serves none: the call answers `WHAT`.
@@ -238,7 +245,8 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
     }
 
     /// `write`: φ7/φ8 key, φ9/φ10 value (length 0 deletes); φ7 becomes the
-    /// previous value's length, or `NONE`.
+    /// previous value's length, or `NONE`; `FULL`, nothing written, when the
+    /// storage says it is full.
     fn write(&mut self) -> bool {
         let registers = *self.machine.registers();
         let Some(key) = self.machine.read_range(registers[7], registers[8]) else {
@@ -252,6 +260,10 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
                 None => return false,
             }
         };
+        if self.storage.full(&key, value.as_deref()) {
+            self.machine.registers_mut()[7] = result::FULL;
+            return true;
+        }
         let previous = self.storage.write(&key, value.as_deref());
         self.machine.registers_mut()[7] = previous.map_or(result::NONE, |len| len as u64);
         true
@@ -345,6 +357,32 @@ mod tests {
         let mut fetched = [0u8; 11];
         invocation.memory().read_bytes(0x2_0010, &mut fetched);
         assert_eq!(&fetched, b"first input");
+    }
+
+    /// A storage past what its balance holds answers `write` `FULL` and
+    /// keeps nothing.
+    #[test]
+    fn a_full_storage_writes_nothing() {
+        struct Full(BTreeMap<Vec<u8>, Vec<u8>>);
+        impl ServiceStorage for Full {
+            fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+                self.0.read(key)
+            }
+            fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
+                self.0.write(key, value)
+            }
+            fn full(&self, _: &[u8], _: Option<&[u8]>) -> bool {
+                true
+            }
+        }
+        let mut storage = Full(BTreeMap::new());
+        let prepared = PreparedProgram::new(&program(gp_call::LOG as u8)).unwrap();
+        let invocation = AccumulateContext::load(&prepared, 7, 42, &[], 1_000_000, &mut storage)
+            .unwrap()
+            .try_run()
+            .unwrap();
+        assert_eq!(invocation.exit, ExitReason::Halt);
+        assert!(storage.0.is_empty());
     }
 
     #[test]

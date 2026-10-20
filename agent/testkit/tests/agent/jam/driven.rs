@@ -517,6 +517,64 @@ fn the_builder_fits_a_batch_to_a_packages_segments() {
     );
 }
 
+/// A batch whose package would pass CE 133's bound on a work package,
+/// 204,800 bytes past its core's index, loses its later inputs, which a
+/// later package takes: PolkaJam's guarantors refuse a package past it.
+#[test]
+fn the_builder_fits_a_batch_to_ce_133s_package_bound() {
+    let mut driven = Driven::new(Store::temporary().unwrap(), POLKAJAM_REFINE_GAS);
+    let increment = driven.actors.method(COUNTER, "increment");
+    // Requests of 4 KiB of arguments each, 256 KiB together.
+    let requests: Vec<Input> = (0..64)
+        .map(|_| driven.request(COUNTER, increment, vec![7u8; 4096]))
+        .collect();
+    let (time, seed) = (driven.time + 1_000, [1; 32]);
+    let prepared = driven
+        .builder
+        .prepare(
+            &driven.runner,
+            driven.chain.segments(),
+            requests.clone(),
+            time,
+            seed,
+            &[],
+        )
+        .expect("a package");
+    let inputs = prepared.package.batch.inputs.len();
+    println!(
+        "{inputs} of 64 requests of 4 KiB in a package: payload {} B, the package at most {} B",
+        prepared.payload.len(),
+        prepared.package_bytes()
+    );
+    assert!(
+        requests.len() * 4096 > builder::MAX_PACKAGE,
+        "the batch's arguments alone pass the bound"
+    );
+    assert!(inputs < requests.len(), "{inputs} of the requests");
+    assert!(prepared.package_bytes() <= builder::MAX_PACKAGE);
+    // The batch halved on CE 133's bound alone: twice this package passes
+    // it, while twice its own work and its exports fit the gas and the
+    // segments.
+    assert_eq!(inputs * 2, requests.len());
+    assert!(2 * prepared.package_bytes() > builder::MAX_PACKAGE);
+    assert!(2 * (prepared.gas - prepared.package.batch.budget) <= builder::OWN_BOUND);
+    assert!(2 * prepared.exports() as usize <= vos_wire::package::MAX_SEGMENTS);
+    assert!(prepared.payload.len() > builder::MAX_PACKAGE / 4);
+    let rest = requests[inputs..].to_vec();
+    let later = driven
+        .builder
+        .prepare(
+            &driven.runner,
+            driven.chain.segments(),
+            rest,
+            time,
+            seed,
+            &[],
+        )
+        .expect("a later package");
+    assert!(later.package_bytes() <= builder::MAX_PACKAGE);
+}
+
 /// The builder's store outlives it: reopened, it holds the same root and
 /// where the pages it took were exported, so a workflow it suspended
 /// resumes from their imports. The packages it lands solicit what it

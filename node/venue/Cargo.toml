@@ -3,7 +3,7 @@ name = "vos-venue"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "A venue as a VOS node reaches it: anchoring a space's roots, submitting statements, and asking what is anchored; the model venue the node's tests anchor at; and the client of Kreivo's spaces pallet."
+description = "A venue as a VOS node reaches it: anchoring a space's roots, submitting statements, and asking what is anchored; the model venue the node's tests anchor at; the client of Kreivo's spaces pallet; and a JAM statements service."
 
 [features]
 # The reference mock of Kreivo's spaces pallet and a transport over it,
@@ -30,7 +30,10 @@ tracing = "0.1"
 zeroize = "1.8"
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 vos-anchor = { workspace = true }
+# A JAM statements service, reached through its client.
+vos-jam = { workspace = true }
 vos-statement = { workspace = true }
+vos-statement-service = { workspace = true }
 # Kreivo's chain: the envelope from its live metadata, signed with the
 # node's sr25519 account key.
 scale-info = { version = "2.11.6", optional = true, default-features = false }
