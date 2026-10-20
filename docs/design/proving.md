@@ -1144,7 +1144,7 @@ a patch of one, and its verdict:
 | valid | accepted | accepted | accepted, 38.4M / 37.9M instructions | accepted, 96.4M gas |
 | tampered (a byte flipped) | `0x112` Stwo, Merkle | `0x112` | `0x112` | `0x112`, 67.1M |
 | wrong program (the venue pins another, the wrap is this kernel's) | `0x108` interaction PoW | `0x108` | `0x108` | `0x108`, 17.5M |
-| unanchored root (an older window's) | `0x5` | `0x5` | `0x5` | `0x5`, < 0.1M |
+| unanchored root (the venue holds not its first) | `0x5` | `0x5` | `0x5` | `0x5`, < 0.1M |
 | prefix (no halt) | `0x109` logup | `0x109` | `0x109` | `0x109`, 17.5M |
 | mid-way (no entry, labelled from 0) | `0x109` logup | `0x109` | `0x109` | `0x109`, 17.4M |
 | repeated | `0x6` | `0x6` | `0x6` | `0x6`, 0.1M |
