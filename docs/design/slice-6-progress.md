@@ -3350,3 +3350,12 @@ until then.
 - **Gates:** `just check` at `bc218fcd` green: 101 suites, 1,338 passed,
   0 failed (12 GiB scope, `nice -n 10`, 8 jobs). `just conformance`
   rewrote the vectors byte for byte.
+- **The review** (Opus): ready to merge; its findings folded.
+  - The cluster test makes one client per node, however many configs a
+    node's open retries make.
+  - Tag `0x10`'s old layout is documented, and the tag reserved.
+  - Who owns the port is stated: VOS, after the slices; the pallet is the
+    teammate's; the live leg waits on both.
+  - §9.1 notes that the extension reads at finalized blocks only.
+  - The envelope is said to be the transport's.
+  - `core-model.md` Q18 separates what is decided from what is open.

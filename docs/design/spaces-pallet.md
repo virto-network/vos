@@ -600,11 +600,12 @@ As `DispatchError::Module { index: 90, error: [i, 0, 0, 0] }`.
 
 The node's client (`vos-venue`'s `kreivo` module, over a `Transport`, §9.1):
 - builds these calls from the **pinned bytes**: `[90, call_index] ++ SCALE(args)`;
-- builds the envelope (signed extensions, nonce, era) from Kreivo's live
-  metadata;
-- needs no compile-time metadata of the pallet: the call bytes are pinned;
-  reading `System.Events` uses the live metadata to delimit pallet 90's
-  events, whose fields the client then decodes by §8's pinned layout.
+- its transport builds the envelope (signed extensions, nonce, era) from
+  Kreivo's live metadata;
+- needs no compile-time metadata of the pallet: the call bytes are pinned.
+  The transport uses the live metadata to delimit pallet 90's events in
+  `System.Events`, and the client decodes their fields by §8's pinned
+  layout.
 
 | Node action | Call | Signer | Success signal | Errors it maps |
 |---|---|---|---|---|
@@ -663,10 +664,15 @@ submission is replay-safe, and it hardens nonces and cancellation. It is
 written against master's old extension ABI, and vos-core has no extension
 host yet (`core-model.md` §18, open question 18).
 - The node-side Kreivo transport is expected to be a port of that
-  extension onto vos-core's extension host. The extension host is
-  deferred until after VOS's current slices (owner decision 12d), so until
-  the port exists, `KreivoVenue` runs over the mock only, including the
-  Kreivo leg of the end-to-end run.
+  extension onto vos-core's extension host.
+- **Who owns what:**
+  - the port is VOS's work, after the planned slices, once the extension
+    host exists (owner decision 12d);
+  - the pallet is the teammate's;
+  - M3b's deferred gate 2, the live Kreivo leg, waits on both.
+
+  Until then `KreivoVenue` runs over the mock only, including the Kreivo
+  leg of the end-to-end run.
 - `KreivoVenue` reaches the extension by message, through a `Transport`
   implementation. It plugs in through `KreivoVenue::connect`, whose
   `Connect` the client's reader thread calls until Kreivo is reached.
@@ -682,8 +688,11 @@ port adds it):
     prepares the exact V4 signing payload and checks the signature.
   - The node's side adds the key: one 32-byte mini secret per node, kept
     in the node's store beside its ed25519 node key and anchor keys. It is
-    never one of them, never logged, and zeroed when dropped. The
-    `NodeRow` tag `0x10` is left unused for this row.
+    never one of them, never logged, and zeroed when dropped.
+  - The node store's `NodeRow` tag `0x10` is reserved: it held these
+    seeds, a u64 big-endian number mapped to a 32-byte mini secret, and
+    stores from earlier builds may hold such rows. A reuse keeps that
+    layout, or takes a new tag.
   - Rotation adds a numbered row and keeps the old key. The controller
     removes the old authority, then adds the new one paired with the
     anchor key, so the node anchors nothing between the two calls.
@@ -732,8 +741,11 @@ port adds it):
   - Past the era, the transport gives up with `Lost`, so the `Sender`
     reads the nonce again.
 - **Reads.** Raw storage at a block by key, and every key under a prefix.
-  - part: the extension reads by `pallet/item` path, with snapshot-pinned
-    paged maps; the port adds reads by raw key.
+  - part: the extension reads at finalized blocks only, by `pallet/item`
+    path, with snapshot-pinned paged maps.
+  - The port adds reads by raw key, and best-block reads:
+    `Transport::storage`, `keys`, `best` and `chain_nonce` read at the
+    best block.
 - **Reconnect.**
   - ext: the light client reconnects, and a session whose cleanup is
     uncertain is poisoned and dropped.

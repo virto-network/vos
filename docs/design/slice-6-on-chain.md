@@ -68,10 +68,10 @@ here and in `spaces-pallet.md`:
    `set_status`'s unblock, `BadClock` before the origin and "no
    compile-time metadata" in the design; 6.17's stale line removed;
    decision 11's repeat exception; the two-sided rule in the design;
-   6.17b's `vosx space venue` tooling; 6.15 marked F.
+   6.17b's `vosx space venue` tooling (parked since, 12c); 6.15 marked F.
 8. **The deferred Kreivo gates** listed in M3b's acceptance, and the
    `kreivo` venue unselectable in production configuration until they
-   pass.
+   pass (parked since, 12c).
 
 ## Changes from draft 2
 
@@ -1490,8 +1490,10 @@ fees are the teammate's.
   stays design and kit (12b). The transport is expected to be master's
   `extensions/substrate` (sube over smoldot), ported onto vos-core's
   extension host, with `KreivoVenue` reaching it by message through
-  `Transport`. The host is deferred until after the slices (decision
-  12d), so until then Kreivo is mock-only. `spaces-pallet.md` §9.1 lists what that
+  `Transport`. The port is VOS's work after the slices, once the host
+  exists (decision 12d); the pallet is the teammate's; the live Kreivo
+  leg (M3b's deferred gate 2) waits on both, so until then Kreivo is
+  mock-only. `spaces-pallet.md` §9.1 lists what that
   transport must provide, and which parts the extension already covers.
 - **Files:** `node/venue/src/kreivo` (in `vos-venue`): `KreivoVenue:
   VenueClient`, in two layers. `calls` holds the pinned call bytes,
@@ -1907,12 +1909,12 @@ fees are the teammate's.
 | a rootless statement accepted again after its `Seen` entry is pruned | pin F's rule, tested at `MaxRootAge + 1` at every venue (G9) | 6.5, 6.17, 6.19 |
 | the teammate's pallet diverges from the design | the conformance vectors G1–G18 and the mutation lists; the Kreivo leg rerun on a dev chain when the pallet lands | 6.17, after the slice |
 | the design's §13 questions answered otherwise | the mock and the client follow the recommended defaults; another answer regenerates the vectors and touches only `calls` | 6.16–6.17b |
-| the node cannot reach Kreivo (no chain client in the workspace) | 6.0e's probe; master's `extensions/substrate` (sube), ported onto vos-core's extension host, behind `Transport` (decision 12c) | 6.0e, 6.17b |
-| key custody of the nodes' sr25519 keys | decision 12 (one per node, no balance); the requirements in `spaces-pallet.md` §9.1, the teammate's | 6.17b |
+| the node cannot reach Kreivo (no chain client in the workspace) | 6.0e's probe; master's `extensions/substrate` (sube), ported onto vos-core's extension host behind `Transport`: VOS's work after the slices (12c, 12d); the pallet the teammate's; the live leg (M3b's deferred gate 2) waits on both | 6.0e, 6.17b |
+| key custody of the nodes' sr25519 keys | decision 12 (one per node, no balance); the requirements in `spaces-pallet.md` §9.1, for VOS's port | 6.17b |
 | a compromised authority drains the sovereign account at block speed | the spend budget per window, refused before inclusion (design §7; G13) | 6.17 |
 | an anchor refused as `WindowInFuture` near a boundary and lost | the client reads the venue's time first, waits and resubmits (design §9; G4; 6.17b) | 6.17b |
 | a registration resubmitted with another `start_window` | the window in the registration digest, and bounded (pin D; G1) | 6.10, 6.17 |
-| Kreivo used before the pallet meets the vectors | no transport in VOS; the teammate's behind a development-only feature until the deferred Kreivo gates (1)–(2) pass | 6.17b |
+| Kreivo used before the pallet meets the vectors | no transport in VOS; the ported one behind a development-only feature until the deferred Kreivo gates (1)–(2) pass | 6.17b |
 | a JAM package over CE 133's 204,802 B is refused at submission (statements and the agent's builder) | the proof as an extrinsic, measured first; `fit.rs`'s payload bound; `fetch` per-kind prices | 6.19 |
 | the worker lags the window cadence | 6.18's throughput gate; L bounded below by it; the prover-time levers | 6.18 |
 | a masked format iteration re-pins every venue | 39 lands once at 6.4, before 6.17 and 6.19; any later change takes a new number | 6.4 |
