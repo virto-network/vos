@@ -42,7 +42,7 @@ What each §3 API waits on, in VOS's plan:
 | `vos_statement::judge` over an accepted set, `Venue::id`, refusal code 7 | 6.5, landed |
 | format 39's verifier (the masked proofs) | 6.4, landed |
 | the vendored kit, `VENDOR`, the sync check (§3.1) | 6.16, landed |
-| the conformance vectors G1–G18 and the mutation lists | 6.17 |
+| the conformance vectors G1–G18 and the mutation lists | 6.17, landed |
 
 ---
 
@@ -674,6 +674,38 @@ tag's, byte for byte.
   are §8's table (and stores values through derives on §5's types), not
   hand-rolled encodings. It takes `parity-scale-codec` as a std, test-only
   dependency, outside the vendored tree.
+- **The files** (`conformance/` in the kit; in VOS `node/venue/conformance`,
+  written by `just conformance`, refused stale by `just check`):
+  - `spaces.json`: the constants (§4's suggested values, `UNITS =
+    10^12`, `FeeBound = UNITS`, the existential deposit `UNITS / 1000`,
+    `ForfeitTo` the `py/trsry` pallet account), labels for the accounts and
+    anchor keys, and G1–G18. A pre-state is the time, each account's free
+    and held balances (`Registration`, `Submit`) and its providers and
+    consumers, and the pallet's raw storage. A step is a time, then a call
+    (its origin: a signed account, Root, `ProgramsOrigin`,
+    `EmergencyOrigin` or `StatusOrigin`; its bytes as hex parts and byte
+    ranges of the kit's `fixtures/` files, so a proof is not copied into
+    the file once a submit) or `on_idle` with ample weight. Its expectation:
+    the result (`ok`, `{"module": i}`, `bad_origin`, `invalid_payment` in
+    `validate`, `undecodable` before dispatch), the pallet's events in SCALE
+    (without the runtime's index), every raw key whose value changed (`null`
+    removed), and each account's deltas. A `fees` vector also names who paid
+    the fee, and leaves out `Budget`'s writes, whose spend sums fees;
+  - `mutations.json`: spike 6c's proof mutants (120) and statement mutants
+    (284), and format 39's masked fields tampered (12 the fixed layout
+    holds), each a patch of the `valid` fixture's proof or statement and
+    the code its judgement reaches at that fixture's venue state, for the
+    `#[benchmark(extra)]` sweep.
+- **The fixture space:** the fixtures' statements read roots of the space
+  `[0xa1; 32]`, which no genesis hashes to, so every pre-state holds it as
+  storage (registered from window 40 under the default clock, one
+  authority paired with its anchor key) rather than registering it by
+  call 0; another space is registered by call. The venue
+  (`frame_system::block_hash(0)` in the mock runtime) is the fixtures',
+  which their venue-bound statements name.
+- **G7** covers codes 1–5, 7 and `0x1xx`: a repeat (6) releases its
+  deposit (§6.3), so it is G8's. G4 reaches `BadClock` by setting the time
+  before the space's origin, the only way for a registered space.
 
 | Id | Scenario |
 |---|---|
@@ -809,3 +841,33 @@ fold-in (S2).
       are what VOS's rotation uses. An `add_authority` update, which lists
       the new key and drops the old in one call, rotates with no window
       lost: the node holds the new key before the call.
+13. **The budget's correction to the actual fee** (§7, G13).
+    - `post_dispatch` corrects the budget to the actual fee, so eight
+      forfeiting submits spend `8 × (SubmitDeposit + a)` for an actual fee
+      `a ≤ FeeBound`, and the ninth is refused only when
+      `8 × (FeeBound − a) < SubmitDeposit + FeeBound`: at Kreivo's fees it
+      may pass. VOS's mock charges every fee at `FeeBound`, so G13's ninth
+      is refused there.
+    - The options: keep the correction (the budget a bound on actual spend,
+      G13's count read as "the submit past the budget"); or debit the fee
+      bound and never correct it.
+    - **Recommended: debit `FeeBound` and do not correct it,** so the budget
+      bounds spend conservatively and G13 holds as written; the deposit a
+      dispatch released is still credited back.
+14. **Refusals the design leaves unnamed,** each as the mock has it and
+    VOS's vectors pin where they reach one:
+    - `migrate` from a window before the next: `OutOfRange` (G14);
+    - `resume` of a space not suspended: `SpaceNotActive` (no vector);
+    - `BadHandler` is unreachable while `Handler` has one variant: another
+      byte fails the call's decode (G11, `undecodable`);
+    - a removal by `ProgramsOrigin` (`set_program(_, None)`) sets the
+      entry's `until_ms` to `now + ProgramChangeDelay` (or keeps an earlier
+      one), Root's removes it at once (G11); the delay is checked only for a
+      `from_ms` or `until_ms` that differs from the stored entry's;
+    - `ChargeSpaceFee`'s budget window before the space's origin: window 0
+      (no vector).
+    - **Recommended:** as above; another answer regenerates the vectors.
+15. **`dispatch_as_sovereign`'s inner call** is Kreivo's `RuntimeCall`:
+    G16's is `Balances` (index 10) `transfer_keep_alive` (3) to a
+    `MultiAddress::Id`. The pallet's mock runtime places `Balances` at 10
+    for G16 to decode (recommended), or re-encodes that one inner call.

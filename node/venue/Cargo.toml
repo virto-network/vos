@@ -9,3 +9,20 @@ description = "A venue as a VOS node reaches it: anchoring a space's roots, subm
 ed25519-dalek = "2"
 vos-anchor = { workspace = true }
 vos-statement = { workspace = true }
+
+[dev-dependencies]
+# The reference mock of Kreivo's spaces pallet (`src/kreivo/mock`): its
+# events, stored values and calls through SCALE derives, FRAME's bytes;
+# its storage keys hashed as FRAME's hashers do (`twox128`, `twox64`,
+# `blake2_128`).
+parity-scale-codec = { version = "3.7.5", features = ["derive", "std"] }
+twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
+blake2 = "0.10"
+# The conformance vectors, as JSON.
+serde = { workspace = true }
+serde_json = "1"
+# The golden fixtures the vectors submit, and their format-39 proofs'
+# fields, which the mutation lists tamper.
+vos-statement = { workspace = true, features = ["fixtures"] }
+vos-pvm-final-verifier = { workspace = true }
+stwo = { workspace = true }

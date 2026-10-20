@@ -429,4 +429,6 @@ impl VenueClient for ModelVenue {
 }
 
 #[cfg(test)]
+mod kreivo;
+#[cfg(test)]
 mod tests;

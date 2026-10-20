@@ -11,7 +11,8 @@ The kit holds:
   dev-dependencies, tests or bins, which stay in VOS);
 - `fixtures/`: the golden fixtures `vos-statement`'s `fixtures` feature
   reads (`../fixtures` from its manifest);
-- `conformance/`: the conformance vectors, once VOS ships them;
+- `conformance/`: the conformance vectors G1–G18 (`spaces.json`) and the
+  mutation lists (`mutations.json`), which VOS's reference mock generates;
 - this script, `vos_kit.py`;
 - `VENDOR`: the repository (for information), the commit, the tag, the
   Stwo pin and the tree's hash;
@@ -87,9 +88,12 @@ FIXTURES = "pvm/proof/fixtures"
 FIXTURE_FILES = ["statements.cases", "wrap*.proof"]
 
 # The conformance vectors, each its path in VOS and its name under
-# `conformance/`. The generator that writes them adds each file here; the
-# vendor and the sync then carry and check it as every other file.
-CONFORMANCE: list[tuple[str, str]] = []
+# `conformance/`, which the reference mock writes (`just conformance`); the
+# vendor and the sync carry and check them as every other file.
+CONFORMANCE: list[tuple[str, str]] = [
+    ("node/venue/conformance/spaces.json", "spaces.json"),
+    ("node/venue/conformance/mutations.json", "mutations.json"),
+]
 
 # The kit's own files, beside the crates.
 VENDOR = "VENDOR"

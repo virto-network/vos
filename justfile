@@ -95,6 +95,14 @@ judge-wasm:
 fixtures:
     with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators }
 
+# The conformance vectors of Kreivo's spaces pallet and the mutation lists
+# (`node/venue/conformance`, `spaces-pallet.md` §10), written anew by the
+# reference mock (`node/venue/src/kreivo`) over the golden fixtures: after a
+# change of the design, the mock or the fixtures. `check` refuses vectors
+# the mock no longer writes.
+conformance:
+    with-env { VOS_CONFORMANCE: "write" } { cargo test -p vos-venue kreivo::conformance::the_vectors_are_the_generators }
+
 # The tests run on mimalloc as the node's binary does, and as it does with
 # transparent huge pages off.
 export MIMALLOC_ALLOW_THP := "0"
