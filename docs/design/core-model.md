@@ -1469,6 +1469,10 @@ knowledge and aggregation are the longest work and gate goal 8.
     - the node process and its scheduler across agents;
     - storage and networking ownership;
     - ingress;
-    - how native extensions attach: the HTTP and SSH transports, the
-      prover, the Substrate light client. On master they are small
-      capability adapters behind an extension host.
+    - how native extensions attach: the SSH transport and the Substrate
+      light client. On master they are small capability adapters behind
+      an extension host. The extension host is deferred past the current
+      slices.
+    - The HTTP ingress and the prover are built-in node components, not
+      extensions. Proving is essential to VOS, so the prover stays in the
+      node.

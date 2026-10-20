@@ -7,7 +7,9 @@ VOS delivers three things:
 - the verifier crates, packaged for vendoring with a sync check, at VOS
   step 6.16;
 - the conformance vectors in §10, at VOS step 6.17, and a node client
-  tested against a mock of the interface in §9 (6.17b).
+  tested against a mock of the interface in §9 (6.17b); the transport
+  that takes that client to a live Kreivo node is a port of master's
+  substrate extension (§9.1).
 
 The supporting research, with file:line citations, is
 `docs/design/research/slice-6/spaces-pallet-research.md`. `KR` below is Kreivo's `runtime/kreivo/src`
@@ -596,7 +598,7 @@ As `DispatchError::Module { index: 90, error: [i, 0, 0, 0] }`.
 
 ## 9. The interface VOS nodes rely on
 
-The node's client (`vos-venue`, feature `kreivo`):
+The node's client (`vos-venue`'s `kreivo` module, over a `Transport`, §9.1):
 - builds these calls from the **pinned bytes**: `[90, call_index] ++ SCALE(args)`;
 - builds the envelope (signed extensions, nonce, era) from Kreivo's live
   metadata;
@@ -645,6 +647,123 @@ The node's client (`vos-venue`, feature `kreivo`):
 - `System.Events`, filtered by the extrinsic index.
 
 The **mock** VOS tests against implements exactly this table and §6–§8.
+
+### 9.1 The node-side chain transport: master's substrate extension, ported
+
+VOS ships the client's logic, not its chain transport:
+- `KreivoVenue`, the `VenueClient` the node anchors and submits through;
+- its pinned `calls`;
+- the `Sender`, which sends a call at most once;
+- the `Transport` trait under them (`node/venue/src/kreivo/transport.rs`).
+
+**Where the transport comes from.** VOS master already has a Substrate
+integration on `sube`: `extensions/substrate`. It runs sube over the
+smoldot light client and submits externally signed V4 transactions. Its
+submission is replay-safe, and it hardens nonces and cancellation. It is
+written against master's old extension ABI, and vos-core has no extension
+host yet (`core-model.md` §18, open question 18).
+- The node-side Kreivo transport is expected to be a port of that
+  extension onto vos-core's extension host. The extension host is
+  deferred until after VOS's current slices (owner decision 12d), so until
+  the port exists, `KreivoVenue` runs over the mock only, including the
+  Kreivo leg of the end-to-end run.
+- `KreivoVenue` reaches the extension by message, through a `Transport`
+  implementation. It plugs in through `KreivoVenue::connect`, whose
+  `Connect` the client's reader thread calls until Kreivo is reached.
+- An earlier subxt transport, parked unmerged, is
+  `node/venue/src/kreivo/chain.rs` at VOS commit `9e63e5a9`. Its review
+  (`slice-6-progress.md`, step 6.17b) found the behaviours below.
+
+**What the transport must provide** ("ext": master's extension already
+covers it; "part": it covers part, and the port finishes it; unmarked: the
+port adds it):
+- **Signing with the node's sr25519 key.**
+  - ext: signing is external, so no key enters the extension. It
+    prepares the exact V4 signing payload and checks the signature.
+  - The node's side adds the key: one 32-byte mini secret per node, kept
+    in the node's store beside its ed25519 node key and anchor keys. It is
+    never one of them, never logged, and zeroed when dropped. The
+    `NodeRow` tag `0x10` is left unused for this row.
+  - Rotation adds a numbered row and keeps the old key. The controller
+    removes the old authority, then adds the new one paired with the
+    anchor key, so the node anchors nothing between the two calls.
+- **The fee-paying account.** The node's account signs but holds no
+  balance: `ChargeSpaceFee` charges the space's sovereign account (§7).
+  The node's account needs only the provider `add_authority` gives it.
+- **The envelope.**
+  - part: the extension builds a metadata-driven V4 envelope, with a
+    mortal era.
+  - The call goes as its pinned bytes, never as a `pallet/call` path and
+    text fields. The client checks that the call bytes in the payload
+    equal them.
+  - The metadata's extensions must be §7's ten, in order, or nothing is
+    signed.
+  - `PassAuthenticate` is pinned to `None` after its type is checked to
+    be an `Option`.
+- **Nonce and pool.** The `Sender` takes a call as landed only once
+  `System.Account`'s nonce at the best block passes it, never by the
+  pool's count. It never signs again with another nonce while the first
+  may land; it sends the same bytes, and signs anew with the same nonce
+  only after the era ends.
+  - ext: a frozen request, a durable outcome journal, and the exact
+    extrinsic resent on recovery. An automatic nonce stays reserved after
+    an ambiguous submit (`NonceUncertain`) until the finalized nonce
+    advances or the era expires.
+  - The port maps these onto `Transport::nonce`, `chain_nonce`, `sign`
+    and `send`, with `Signed::until` set to the era's last block.
+- **The pool's refusals, classified** as `SendError` from the
+  `1010` / pool answer:
+  - `Payment`;
+  - `Stale` (outdated, stale, bad signature, ancient birth block);
+  - `Future`;
+  - `Call`;
+  - `Other`;
+  - `Lost` for a lost connection, or a watched extrinsic dropped,
+    invalidated or usurped.
+
+  part: the extension folds every invalid transaction into one `Chain`
+  code.
+- **Inclusion.**
+  - part: the extension waits for best-chain inclusion or finality and
+    returns the extrinsic's index and a dispatch outcome. Its events are
+    decoded text, at most 16 of them.
+  - The transport needs pallet 90's events as raw `[event_index] ++
+    fields`, and `ExtrinsicFailed`'s raw `DispatchError`.
+  - Past the era, the transport gives up with `Lost`, so the `Sender`
+    reads the nonce again.
+- **Reads.** Raw storage at a block by key, and every key under a prefix.
+  - part: the extension reads by `pallet/item` path, with snapshot-pinned
+    paged maps; the port adds reads by raw key.
+- **Reconnect.**
+  - ext: the light client reconnects, and a session whose cleanup is
+    uncertain is poisoned and dropped.
+  - A node starts while Kreivo is down: `KreivoVenue::connect` answers
+    every anchor `Open` until the transport is reached.
+- **Transport security.**
+  - ext: no public RPC endpoint; smoldot verifies the chain.
+- **What `KreivoVenue` keeps, which a transport must not undo:**
+  - a refresh never moves a space's last anchored window backwards;
+  - an anchor landed whose record is not yet read stays queued;
+  - nothing is sent for a window the venue has not closed, nor while the
+    space waits.
+- **The release gate.** No release build reaches Kreivo until M3b's
+  deferred gates 1 and 2 pass (`slice-6-on-chain.md`).
+- **The CLI,** over `calls::Call` and the `Sender`:
+  - the node's Kreivo venue;
+  - showing and rotating its account;
+  - `register` (call 0). The founder signs `register_digest(venue, space,
+    controller, start_window)` with the stopped founding node's ed25519
+    key. `start_window` defaults to the venue's open window. The command
+    prints the sovereign account first.
+  - `authority add|remove` (calls 2–3);
+  - `budget` (call 10).
+
+**The contract** is the conformance vectors and the mock:
+- `node/venue/conformance/*.json` and the mock that writes them
+  (`vos-venue`'s `mock` feature; `just conformance` regenerates them);
+- `KreivoVenue`'s tests over the mock (`node/venue/src/kreivo/tests.rs`,
+  `node/host/tests/cluster/kreivo.rs`), which the ported transport must
+  pass against a dev chain carrying the pallet (M3b's deferred gate 2).
 
 ## 10. Conformance vectors
 
