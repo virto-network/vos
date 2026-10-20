@@ -84,11 +84,15 @@ impl Leader {
         let duties = self
             .resumes(&snapshot)
             .and_then(|resumes| Ok((resumes, self.reports(&snapshot)?)))
-            .and_then(|(resumes, reports)| Ok((resumes, reports, self.closes(&snapshot)?)));
+            .and_then(|(resumes, reports)| Ok((resumes, reports, self.proofs(&snapshot)?)))
+            .and_then(|(resumes, reports, proofs)| {
+                Ok((resumes, reports, proofs, self.closes(&snapshot)?))
+            });
         match duties {
-            Ok((resumes, reports, Closes::Due(closes))) => {
+            Ok((resumes, reports, proofs, Closes::Due(closes))) => {
                 pending.extend(resumes);
                 pending.extend(reports);
+                pending.extend(proofs);
                 pending.extend(closes);
             }
             Ok((.., Closes::Stopped)) => {

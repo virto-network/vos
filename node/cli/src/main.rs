@@ -82,7 +82,43 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Query { call, linearizable } => call::query(&call, linearizable),
         Command::Workflow(read) => read_workflow(&read),
         Command::Jam { command } => command.run(),
+        #[cfg(feature = "prover")]
+        Command::ProgramId {
+            elf,
+            method,
+            circuits,
+        } => program_id(elf, method, circuits),
     }
+}
+
+/// `vos program-id`: a kernel's id, or with `circuits` the circuits'
+/// constants, each a line of its name and its values.
+#[cfg(feature = "prover")]
+fn program_id(
+    elf: Option<std::path::PathBuf>,
+    method: Option<String>,
+    circuits: bool,
+) -> Result<(), String> {
+    let line = |values: &[u32]| {
+        values
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    if circuits {
+        for (name, values) in vos_node_prover::program::circuits() {
+            println!("{name} {}", line(&values));
+        }
+        return Ok(());
+    }
+    let (Some(elf), Some(method)) = (elf, method) else {
+        return Err("an ELF and a method, or --circuits".into());
+    };
+    let bytes = std::fs::read(&elf).map_err(|error| format!("{}: {error}", elf.display()))?;
+    let id = vos_node_prover::program::program_id(&bytes, &method)?;
+    println!("{}", line(&id));
+    Ok(())
 }
 
 impl NodeCommand {
@@ -153,6 +189,12 @@ impl RunArgs {
         config.peer_bind = self.peer_bind;
         if let (Some(kind), Some(url)) = (self.venue, &self.venue_url) {
             config.venue_with_account = Some(venue::anchoring(kind, url, config.space.as_ref())?);
+        }
+        #[cfg(feature = "prover")]
+        {
+            config.prover = Some(std::sync::Arc::new(
+                vos_node_prover::masked::MaskedProver::new(),
+            ));
         }
         #[cfg(feature = "faults")]
         {

@@ -306,6 +306,11 @@ impl Agent {
         }
     }
 
+    /// Wake its leader loop: a duty of its own may be due.
+    pub(crate) fn wake(&self) {
+        let _ = self.wake.try_send(());
+    }
+
     pub(crate) fn leading(&self) -> bool {
         lock(&self.queue).leading
     }

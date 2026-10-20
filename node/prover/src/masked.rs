@@ -1,0 +1,161 @@
+//! The production prover: a kernel's run re-traced on its record's
+//! witness and checked against the record, then proved segment by segment,
+//! each segment verified in its class's leaf, the leaves folded to one
+//! root, and the root wrapped masked under format 39 (pin A).
+//!
+//! The kernel's program id is recomputed from its blob alone: its shape
+//! from its code, its image root from its memory, each class's
+//! preprocessed root and leaf circuit from both. An id is never taken from
+//! the record or from another node.
+
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use vos_pvm_proof::format::SEGMENT;
+use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
+use vos_pvm_proof::program_id::{KernelEntry, KernelProgram};
+use vos_pvm_recair::tree::Stats;
+use vos_venue::vos_statement::ProgramId;
+use vos_wire::Decode;
+use vos_wire::ids::{MethodId, ProgramHash};
+use vos_wire::records::Kernel;
+use vos_wire::result::{Attest, KernelReturn};
+
+use crate::worker::{ProveError, Prover};
+
+/// The gas a re-run is given: a kernel's own limit bounds the live run
+/// whose record it repeats, so this bounds nothing an honest record needs.
+const RERUN_GAS: u64 = 1 << 32;
+
+/// A kernel's program and its run's entry, recomputed from its blob.
+type Program = Arc<(KernelProgram, KernelEntry)>;
+
+/// The masked prover, its kernels' programs computed once each.
+#[derive(Default)]
+pub struct MaskedProver {
+    programs: Mutex<HashMap<ProgramHash, Program>>,
+}
+
+/// The install's record of `blob`, a kernel, recomputed from it: its hash,
+/// its shape from its code and its image root.
+pub fn kernel_record(blob: &[u8]) -> Result<Kernel, String> {
+    let shape = vos_pvm_compiler::shape::kernel_shape(blob)
+        .ok_or_else(|| String::from("not a kernel's program"))?;
+    let image_root = vos_pvm_program::parse_standard_program(blob)
+        .and_then(|program| program.image_root())
+        .ok_or_else(|| String::from("not a standard program"))?;
+    Ok(Kernel {
+        method: MethodId(0),
+        program: ProgramHash::of(blob),
+        image_root,
+        shape,
+    })
+}
+
+impl MaskedProver {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// `kernel`'s program and entry, from its blob.
+    pub fn kernel(&self, kernel: &[u8]) -> Result<Program, ProveError> {
+        let hash = ProgramHash::of(kernel);
+        if let Some(program) = self.lock().get(&hash) {
+            return Ok(Arc::clone(program));
+        }
+        let record = kernel_record(kernel).map_err(ProveError::Kernel)?;
+        let program = vos_pvm_recair::leaf::kernel_program(
+            kernel,
+            &record,
+            vos_pvm_compiler::TRANSPILER_VERSION,
+            &SEGMENT,
+        )
+        .map_err(ProveError::Kernel)?;
+        let program = Arc::new(program);
+        self.lock().insert(hash, Arc::clone(&program));
+        Ok(program)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<ProgramHash, Program>> {
+        self.programs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `kernel` re-run on `attest`'s witness: its trace, when the run reads
+    /// the witness whole and returns the record's public arguments, output
+    /// and roots, its io-hash theirs. A kernel of no public part returns its
+    /// output alone, so its record has none.
+    pub fn rerun(&self, kernel: &[u8], attest: &Attest) -> Result<KernelTrace, ProveError> {
+        let trace = trace_kernel(kernel, &attest.witness_input, RERUN_GAS)
+            .map_err(|error| ProveError::Rerun(format!("the kernel does not re-run: {error:?}")))?;
+        let parts = KernelReturn {
+            public_args: attest.public_args.clone(),
+            output: attest.output.clone(),
+            roots: attest.roots.clone(),
+        };
+        let returned = match KernelReturn::decode_exact(&trace.output) {
+            Some(returned) => returned == parts,
+            None => {
+                parts.public_args.is_empty()
+                    && parts.roots.is_empty()
+                    && trace.output == parts.output
+            }
+        };
+        if !returned {
+            return Err(ProveError::Rerun(
+                "the re-run returns other public arguments, output or roots than the record's"
+                    .into(),
+            ));
+        }
+        if trace.io_hash != parts.io_hash() {
+            return Err(ProveError::Rerun(
+                "the re-run's io-hash is not the record's".into(),
+            ));
+        }
+        let read: usize = trace.reads.iter().map(|read| read.count).sum();
+        if read != attest.witness_input.len() {
+            return Err(ProveError::Rerun(format!(
+                "the re-run reads {read} of the witness's {} bytes",
+                attest.witness_input.len()
+            )));
+        }
+        Ok(trace)
+    }
+
+    /// [`Prover::prove`], and what its run's proofs took
+    /// ([`vos_pvm_recair::tree::prove_final`]).
+    pub fn prove_timed(
+        &self,
+        kernel: &[u8],
+        attest: &Attest,
+    ) -> Result<(Vec<u8>, Stats), ProveError> {
+        let program = self.kernel(kernel)?;
+        let (program, entry) = &*program;
+        let trace = self.rerun(kernel, attest)?;
+        vos_pvm_recair::tree::prove_final(program, entry, &trace.side_note).map_err(|error| {
+            use vos_pvm_proof::ProvingError;
+            use vos_pvm_recair::tree::TreeError;
+            match error {
+                // The run does not fit its kernel's shape: no proof of it
+                // can be made.
+                TreeError::Empty
+                | TreeError::Segment(ProvingError::Shape { .. } | ProvingError::MalformedShape) => {
+                    ProveError::Kernel(format!("{error:?}"))
+                }
+                error => ProveError::Failed(format!("{error:?}")),
+            }
+        })
+    }
+}
+
+impl Prover for MaskedProver {
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError> {
+        let program = self.kernel(kernel)?;
+        Ok(ProgramId(program.0.id().0.map(|word| word.0)))
+    }
+
+    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+        self.prove_timed(kernel, attest).map(|(bytes, _)| bytes)
+    }
+}

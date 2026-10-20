@@ -4837,6 +4837,7 @@ dependencies = [
  "vos-checker",
  "vos-jam",
  "vos-node",
+ "vos-node-prover",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-venue",
@@ -4899,6 +4900,7 @@ dependencies = [
  "vos-checker",
  "vos-jam",
  "vos-net",
+ "vos-node-prover",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-pvm-program",
@@ -4908,6 +4910,21 @@ dependencies = [
  "vos-venue",
  "vos-wire",
  "zeroize",
+]
+
+[[package]]
+name = "vos-node-prover"
+version = "0.1.0"
+dependencies = [
+ "tracing",
+ "vos-node-prover",
+ "vos-pvm-compiler",
+ "vos-pvm-program",
+ "vos-pvm-proof",
+ "vos-pvm-recair",
+ "vos-testkit",
+ "vos-venue",
+ "vos-wire",
 ]
 
 [[package]]

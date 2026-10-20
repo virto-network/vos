@@ -23,6 +23,10 @@ kreivo = ["vos-venue/kreivo"]
 # Lets `vos` reach Kreivo, until its spaces pallet meets the conformance
 # vectors: development and the end to end runs only, never a release.
 kreivo-unvetted = ["kreivo", "vos-venue/kreivo-unvetted"]
+# The masked prover: `vos node run` proves the statements of the agents
+# the node leads and submits them at its venue, and `vos program-id`
+# prints a kernel's program id.
+prover = ["vos-node/prover", "dep:vos-node-prover", "vos-node-prover/prove"]
 
 [dependencies]
 mimalloc = { version = "0.1.52", optional = true }
@@ -33,6 +37,7 @@ hex = "0.4"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
 vos-jam = { workspace = true }
 vos-node = { path = "../host" }
+vos-node-prover = { workspace = true, optional = true }
 vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
 vos-venue = { workspace = true }

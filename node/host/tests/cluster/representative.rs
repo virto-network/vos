@@ -120,7 +120,7 @@ fn stated(cluster: &Cluster, window: u64, rep_root: &[u8; 32]) -> RootRead {
 }
 
 /// How workflow `id` of `agent` ended, once it has, on a replica of it.
-fn ended(cluster: &Cluster, agent: AgentId, id: RequestId) -> Outcome {
+pub(crate) fn ended(cluster: &Cluster, agent: AgentId, id: RequestId) -> Outcome {
     let mut ended = None;
     wait_until("the read is served and its workflow ends", || {
         ended = cluster
@@ -141,7 +141,7 @@ fn ended(cluster: &Cluster, agent: AgentId, id: RequestId) -> Outcome {
 
 /// The attests of the steps `request`'s `Resume`s made in `agent`'s log
 /// on `node`, once its log holds one: the workflow's end, the last.
-fn attests(node: &Node, agent: AgentId, request: RequestId) -> Vec<Attest> {
+pub(crate) fn attests(node: &Node, agent: AgentId, request: RequestId) -> Vec<Attest> {
     let mut attests = Vec::new();
     wait_until("the replica applies the read's statement", || {
         attests = logged(node, agent, request);
@@ -165,7 +165,7 @@ fn logged(node: &Node, agent: AgentId, request: RequestId) -> Vec<Attest> {
 }
 
 /// A node running `agent`.
-fn replica(cluster: &Cluster, agent: AgentId) -> &Node {
+pub(crate) fn replica(cluster: &Cluster, agent: AgentId) -> &Node {
     cluster
         .running()
         .find(|(_, node)| node.applied(agent).is_some())
@@ -175,7 +175,7 @@ fn replica(cluster: &Cluster, agent: AgentId) -> &Node {
 
 /// Whether `representative`'s replica on `node` holds `agent`'s root at
 /// `window`'s cut.
-fn holds(node: &Node, representative: AgentId, agent: AgentId, window: u64) -> bool {
+pub(crate) fn holds(node: &Node, representative: AgentId, agent: AgentId, window: u64) -> bool {
     node.store()
         .snapshot()
         .get(

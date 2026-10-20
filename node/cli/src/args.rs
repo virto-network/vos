@@ -76,6 +76,22 @@ pub enum Command {
         #[command(subcommand)]
         command: JamCommand,
     },
+    /// The program id of an actor's attestable method's kernel, derived
+    /// from its ELF as an install derives it: eight M31 words, in decimal.
+    /// With `--circuits`, the circuits' constants instead, each a line of
+    /// its name and its words or bytes.
+    #[cfg(feature = "prover")]
+    ProgramId {
+        /// The actor's package, the ELF its crate built.
+        #[arg(required_unless_present = "circuits")]
+        elf: Option<std::path::PathBuf>,
+        /// The attestable method.
+        #[arg(required_unless_present = "circuits")]
+        method: Option<String>,
+        /// Print `H_FOLD`, `WRAP_ROOT_28` and `WRAP_ROOT_39`, computed.
+        #[arg(long, conflicts_with_all = ["elf", "method"])]
+        circuits: bool,
+    },
 }
 
 #[derive(Subcommand)]
