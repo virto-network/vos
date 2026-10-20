@@ -16,12 +16,12 @@ use super::{PolkaJam, failed};
 use crate::Error;
 
 /// A package's accumulate gas an item: the service's accumulate takes about
-/// 0.1M a statement on the JAM-only host and on PolkaJam [6.19].
+/// 0.1M a statement on the JAM-only host and on PolkaJam, as measured at 6.19.
 pub const ACCUMULATE_GAS: u64 = 10_000_000;
 /// The least accumulate gas a work item to the service may declare, set at
 /// its creation: above its worst item's, a statement of `MAX_ROOTS` roots,
 /// two reads a root at the Gray Paper's prices beside the 0.1M of any item
-/// [est], so no item declaring less starves a report's accumulate.
+/// (an estimate), so no item declaring less starves a report's accumulate.
 pub const MIN_ITEM_GAS: u64 = 2_000_000;
 /// The RPC errors in a row a wait takes before it stops.
 const TRANSIENT: u32 = 10;
