@@ -2696,3 +2696,100 @@ range beside 6.14b's anchor keys by space and `resume`.
 0 failed.
 
 **6.14b accepted.**
+
+## M3a accepted: roots, anchors and `&self` reads, on the model venue
+
+M3a is 6.10–6.15 and 6.14b: `vos-anchor` and the genesis, the agent root
+under `0x03`, window cuts and the held build, `&self` attestables and the
+public-input model, the representative and its anchors, a rotatable anchor
+key, and statements at a cut on the model venue. Its acceptance (the
+plan's "M3a acceptance") at `vos-core` `7acc49e0`.
+
+**Recorded** [measured]:
+- **6.15's statements:** a row 20.07 compressions and 862 B (6.0a: 20.07,
+  842 B), the path 14 (+1 `S_w`) compressions and 590 B; the restated
+  window 67,147 steps in 3 segments, proved end to end in 103 s, its
+  masked wrap 24.8 s and 148,356 B (heap 3,627 MiB); the balance 21,733
+  steps in one segment, its masked wrap 10.4 s and 147,076 B; from `B_0`
+  the anchor of `S_0` at the venue in 24.04 s and the read's `Attest` in
+  24.09 s at L = 2 min, D = 24 s (bound D + 10 s).
+- **The builder's rate** (6.11's bench): 19,357–19,890 rows a second built
+  quiet, 14,650–16,282 under concurrent load; at 20k committed writes a
+  second offered (19.6k delivered) it keeps up, 19.4k built, caught up
+  0.30 s after the load ends.
+- **The cut's cost** (6.12's bench, a million keys, load 12–14): a
+  committed write with a cut pending 5.85–6.71 µs (gate 8.6 µs); a cut's
+  build with 100 proofs of 16 rows 382–412 ms (gate 1 s), the proofs alone
+  80–86 ms.
+
+**Gates** [measured; each under a 12 GiB scope, `nice -n 10`,
+`CARGO_BUILD_JOBS=10`, one heavy run at a time]:
+- **`ci`** (inside `just ci-full`, at `5de84ad7`): green, 107 suites,
+  1,387 passed, 0 failed, about 15.5 min [est: the run's 29.2 min less its
+  `test-proof` part].
+- **`test-proof`** (at `7acc49e0`): green, 42 suites (each kernel test a
+  process), 556 passed, 0 failed, 1,603 s; `judge-wasm` 31 of 31 fixtures
+  as recorded; the leakage tests at their medium N among them.
+- **`test-bench-proof`:** green, 2 passed, 18 s.
+- **`just fuzz 60`:** the seven targets a minute each, no crash, 788 s.
+- **The checker loop with cuts and the representative:** seeds 6301–6312
+  × the three exactly-once tests and the cuts run with `CUTS_FULL` (the
+  representative on three nodes, anchoring at the served harness's
+  `ModelVenue`): 48 of 48 green, 871 s, load 1–10 at their starts. Per run
+  and agent: 87–238 reads, 77–235 served, 3–32 not served in time, 0
+  unserved; 274–716 samples holding undo rows; 5 cut rows kept; the venue
+  61–111 anchors a run, one a window, each checked against the replicas'
+  roots, no evidence.
+- **`just check`** after the fold (`f73a4999`): green, 92 suites, 1,285
+  passed, 0 failed, 12.5 min.
+- **Failed first, and fixed** (rule: fix what is hit):
+  - `ci`'s `test` OOM-killed at 12 GiB in `vos-pvm-recair`'s recursion
+    suite, run on every core with the other crates (`5de84ad7`): `test`
+    and `check` run the crate four at a time (`just test-recair`; 9.3 GiB
+    peak at six).
+  - `test-proof`'s `kernel` binary OOM-killed at 12 GiB in
+    `kernel_shape::a_chain_not_from_the_entry_is_refused`, after the
+    balance's masked wrap, the fixtures and others in one process
+    (`7acc49e0`): every kernel test now runs in a process of its own,
+    `reads`' apart, as the window's did.
+
+**Milestone review: Fable — accept after fixes, folded** (`M3a-fable.md`,
+`f73a4999`): no wrong root, window, row or path gets through any seam
+(lagging replica, leader change, clock jump, pruning, migration, key
+rotation). Its findings:
+- **1 (medium):** any program could rewrite its own agent's
+  representative rows by a `Call` of `report` (`Principal::Agent`): an
+  agent's report is now a `Body::Report` the representative's refine
+  stores natively, as it takes a `Closed` (the row at
+  `representative_row`, the ask, the sender's rows and asks before
+  `w − 2` dropped, `keys::reports(agent)` its last; nothing for a window at
+  or before the last or past the representative's open window + 1, nor in
+  an agent without the representative installed); the actor's `report`
+  is gone. Tests: a program's and a client's call of `report` write
+  nothing; a report two windows ahead stores nothing.
+- **2 (medium):** a waiting anchor survived a leader change for two
+  windows, not `CUT_KEEP`: the representative's cut roots are kept
+  `CUT_KEEP` windows. Test:
+  `waiting_anchors_survive_a_failover_through_a_long_wait` (windows 0–2
+  closed unsigned, the leader stopped, all anchored by the new leader's
+  key once listed, then window 3; it fails keeping two).
+- **3 (medium, docs):** `clerk-across-spaces.md` C.5's handler reconciles
+  progressively (`C_A`, `C_B`, `M`, moving `min(C_A − M, −C_B − M)`), the
+  peer a space registered at the venue and not the statement's, and the
+  Clerk's slice pins `Settled`'s totals never falling.
+- **4 (low):** an idle representative's leader hands the venue a waiting
+  anchor again every 2 s (`anchor_wait`), not only at its next batch.
+- **5, 6 (low):** ops notes in the plan: the representative's load linear
+  in agents (the lever: report only when reads wait or the root changed);
+  a forward jump of its leader's clock cutting up to 32 windows with no
+  paths (an alert, later a quorum-clock guard).
+- **7 (low, docs):** Pin D and F: a suspended space's anchored roots go
+  dark; `spaces-pallet.md` §6: a replica added only while it holds a
+  listed key; Pin E's step 2 as built; `seed_waiting`'s doc.
+
+Commits: `7b2c5d0a` (6.14b's merge), `f73a4999` (the fold), `5de84ad7`,
+`7acc49e0` (the gates' recipes), this record.
+
+Milestone review: Fable (running)
+
+**M3a accepted.**
