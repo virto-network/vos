@@ -272,14 +272,16 @@ fn the_fixtures_are_judged() {
 /// other statement. The test venue is the same and accepts 28 beside 39.
 /// The cases (`statements.cases`), each a venue's state, a statement and a
 /// proof, each but the valid ones a replay of a valid statement with one
-/// thing changed:
+/// thing changed, so each fails one check alone: a venue that verifies the
+/// proof before it reads its state (the JAM service's refine) reaches the
+/// same class as one that reads its state first:
 /// - **valid:** `S` and its wrap, accepted; **rootless:** `S0` and its
 ///   wrap, accepted (its own program pinned);
 /// - **tampered:** a byte of the wrap flipped;
 /// - **wrong program:** the venue pins another program, which the statement
 ///   names, and the wrap is this kernel's;
-/// - **unanchored root:** `S` with its first root an older window's,
-///   which the venue does not anchor;
+/// - **unanchored root:** `S` at a venue that does not anchor its first
+///   root;
 /// - **prefix**, **mid-way:** `S` with the wraps of a part of the run;
 /// - **repeated:** `S` after the venue accepted it;
 /// - **unaccepted format:** `S` under format 30;
@@ -296,8 +298,8 @@ fn the_fixtures_are_judged() {
 ///   none too and anchored: no space has the id `NONE`;
 /// - **another venue's statement:** `S` with `public_args` naming another
 ///   venue; **replayed at another venue:** `S` at a venue of another id;
-/// - **a root's window**, **a root:** `S` with its second root's window, or
-///   a byte of it, changed;
+/// - **a root's window**, **a root:** `S` at a venue that holds its second
+///   root at another window, or another root at its window;
 /// - **the nonce:** `S` with its nonce changed; **the roots' order:** its
 ///   two roots swapped; **a root dropped:** its second root left out; each
 ///   bound by the proof's words through the io-hash;
@@ -622,7 +624,9 @@ mod statements {
                 "unanchored root",
                 "wrap.proof",
                 None,
-                input(&|i| i.statement.roots[0] = root(40, 0x40)),
+                input(&|i| {
+                    i.policy.anchors.remove(0);
+                }),
                 |code| code == 5,
             ),
             (
@@ -727,14 +731,14 @@ mod statements {
                 "a root's window",
                 "wrap.proof",
                 None,
-                input(&|i| i.statement.roots[1].window = 43),
+                input(&|i| i.policy.anchors[1].window = 43),
                 |code| code == 5,
             ),
             (
                 "a root",
                 "wrap.proof",
                 None,
-                input(&|i| i.statement.roots[1].root[31] ^= 1),
+                input(&|i| i.policy.anchors[1].root[31] ^= 1),
                 |code| code == 5,
             ),
             (

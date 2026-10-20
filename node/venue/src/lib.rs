@@ -15,6 +15,9 @@
 //! suspension once neither equivocating key is registered.
 //!
 //! [`kreivo::KreivoVenue`] is Kreivo's: the client of its spaces pallet.
+//!
+//! [`jam::JamVenue`] is a JAM statements service (`vos-statement-service`)
+//! on a JAM node, through `vos-jam`'s client.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -508,6 +511,7 @@ impl VenueClient for ModelVenue {
     }
 }
 
+pub mod jam;
 pub mod kreivo;
 pub mod queue;
 

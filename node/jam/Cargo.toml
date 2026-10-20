@@ -3,7 +3,7 @@ name = "vos-jam"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "An agent on JAM, from its builder's side: its whole keyspace under one tree, on disk, the simulation and witnesses of its packages, the builder's loop, a PolkaJam node, and one emulated in process."
+description = "An agent on JAM, from its builder's side: its whole keyspace under one tree, on disk, the simulation and witnesses of its packages, the builder's loop, a PolkaJam node, and one emulated in process; and a JAM statements service's client, its work packages submitted with their extrinsics."
 
 [dependencies]
 base64 = "0.22"
@@ -15,5 +15,7 @@ serde_json = "1"
 thiserror = "2"
 vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
+vos-pvm-program = { workspace = true }
+vos-statement-service = { workspace = true }
 vos-tree = { workspace = true }
 vos-wire = { workspace = true }

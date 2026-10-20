@@ -8,7 +8,7 @@ default:
 # prover library, wire types. The node runs the
 # agent, so it is tested with it.
 test:
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement --features vos-anchor/vectors,vos-statement/fixtures
+    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures
     just test-recair
     cargo test -p vos-pvm-proof --lib
 
@@ -167,6 +167,16 @@ test-agent: build-test-actors build-agent build-representative
 jam-testnet: build-test-actors build-agent
     bash node/jam/testnet.sh
 
+# The JAM statements service on a local PolkaJam testnet, which it starts
+# and stops: deployed, a space registered and a window anchored, the golden
+# fixtures' masked statements submitted with their proofs as extrinsics,
+# each outcome read back, every refine's gas against the JAM-only host's.
+# `bash node/jam/testnet.sh both` deploys it beside the default agent.
+# Outside `ci`, as `jam-testnet` is.
+jam-statements-testnet:
+    cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+    bash node/jam/testnet.sh statements
+
 # A plain build of `vos` carries no faults: building the fault suite's
 # `vos` with the feature must not leak into it, and no workspace member
 # turns the feature on for vos-node.
@@ -200,13 +210,14 @@ check-no-seeded-masks:
 # or build edge of any workspace member, nor of the workspaces built apart
 # that venues or nodes run (the agent, the final verifier's Wasm blob, its
 # runner), enables it (the tests enable it on dev edges, the harnesses' test
-# builds by name); and `vos-statement`'s `fixtures` and `pvm-guest` do not
-# imply it. The fuzz targets, built apart, fuzz format 28's decode and
+# builds by name); and `vos-statement`'s `fixtures` and `pvm-guest`, and the
+# JAM statements service's program, do not imply it. The fuzz targets, built apart, fuzz format 28's decode and
 # verifier too, and are no venue.
 check-no-test-formats:
     just _no-feature test-formats --workspace
     for manifest in [agent/default pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature test-formats --manifest-path $"($manifest)/Cargo.toml" }
     just _no-feature test-formats -p vos-statement --features fixtures,pvm-guest
+    just _no-feature test-formats -p vos-statement-service --features pvm-guest
     print "no test formats in a production build"
 
 # The builds without std. vos-raft for an embedded target, on core and alloc
@@ -224,8 +235,10 @@ check-no-test-formats:
 # program, which `vos-pvm-recair`'s wrap tests and the fixtures' and the
 # end-to-end tests run on the JAM-only host: `final-verify.elf`, the
 # production venue's, linking format 39 alone, and `final-verify-test.elf`,
-# linking 28 beside it for the test policy's fixtures. The final verifier and
-# `vos-statement` build here without `test-formats`. The guest's two bins and
+# linking 28 beside it for the test policy's fixtures; and the JAM statements
+# service's program, `statement-service.elf`, which its tests run on the
+# JAM-only host, refine and accumulate. The final verifier and
+# `vos-statement` build here without `test-formats`. The guests' bins and
 # the Wasm blob, crate roots the workspace's lints do not reach, are linted
 # here under the verify path's denies.
 check-no-std:
@@ -242,6 +255,8 @@ check-no-std:
     cargo build -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
     cargo clippy -p vos-statement --release --features pvm-guest --bin final-verify --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --quiet -- -D warnings
     cargo clippy -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --quiet -- -D warnings
+    cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+    cargo clippy -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --quiet -- -D warnings
     cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --quiet -- -D warnings
     cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --features test-formats --target-dir target/test-formats --quiet -- -D warnings
 
@@ -331,7 +346,7 @@ fuzz secs="60":
 check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-kit build-test-actors build-agent build-representative fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     just clippy-kreivo
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement --features vos-anchor/vectors,vos-statement/fixtures
+    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures
     just test-recair
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-venue -p vos-net -p vos-cli
     just test-reads

@@ -1306,6 +1306,7 @@ checksum = "70e796c081cee67dc755e1a36a0a172b897fab85fc3f6bc48307991f64e4eca9"
 dependencies = [
  "curve25519-dalek",
  "ed25519",
+ "rand_core 0.6.4",
  "serde",
  "sha2 0.10.9",
  "subtle",
@@ -4839,6 +4840,8 @@ dependencies = [
  "vos-node",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-statement",
+ "vos-statement-service",
  "vos-venue",
  "vos-wire",
 ]
@@ -4856,6 +4859,8 @@ dependencies = [
  "thiserror 2.0.18",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-program",
+ "vos-statement-service",
  "vos-tree",
  "vos-wire",
 ]
@@ -5134,6 +5139,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-statement-service"
+version = "0.1.0"
+dependencies = [
+ "ed25519-dalek",
+ "vos-pvm",
+ "vos-pvm-compiler",
+ "vos-statement",
+ "vos-wire",
+]
+
+[[package]]
 name = "vos-testkit"
 version = "0.1.0"
 dependencies = [
@@ -5176,8 +5192,10 @@ dependencies = [
  "tracing",
  "twox-hash 2.1.5",
  "vos-anchor",
+ "vos-jam",
  "vos-pvm-final-verifier",
  "vos-statement",
+ "vos-statement-service",
  "zeroize",
 ]
 

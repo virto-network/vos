@@ -18,22 +18,37 @@ pub mod jam_gas {
     pub const LOG: Gas = 1_000;
     /// A call PolkaJam does not serve, which answers `WHAT`.
     pub const UNSERVED: Gas = 1_000;
-    /// `fetch`, by the length asked for, fitted to the one length measured,
-    /// a segment's 4,104 bytes: 171, served or answering `NONE`.
-    /// Other lengths are unmeasured.
-    pub const FETCH_BASE: Gas = 10;
-    pub const FETCH_PER_KIB: Gas = 40;
+    /// `fetch` of kind `kind` and `len` bytes asked for: Gray Paper 0.8.0's
+    /// per-kind table (`definitions.tex`, C_Y), a base and a price a KiB
+    /// asked for by kind, served or answering `NONE`; a kind past the
+    /// table's at its "otherwise" price. PolkaJam 0.1.29 charges it to the
+    /// unit: a segment's import 171, a payload's 95 and 96 a KiB.
+    pub const fn fetch(kind: u64, len: u64) -> Gas {
+        let (base, per_kib): (Gas, Gas) = match kind {
+            0 => (390, 0),
+            1 => (103, 0),
+            2 => (80, 96),
+            3 | 4 => (85, 96),
+            5 | 6 => (171, 0),
+            7 => (85, 96),
+            8 => (84, 0),
+            9 => (88, 0),
+            10 => (111, 0),
+            11 => (317, 0),
+            12 => (250, 0),
+            13 => (95, 96),
+            14 => (287, 400),
+            15 => (355, 344),
+            _ => (80, 0),
+        };
+        base.saturating_add(crate::inner::gas::memory(per_kib, len))
+    }
     /// `export`, a segment, measured at 4,096 bytes.
     pub const EXPORT: Gas = 3_521;
     /// `historical_lookup`, by the length asked for: 1,125 for none, 1,203
     /// for 300 bytes, 2,181 for 4 KiB, served or answering `NONE`.
     pub const HISTORICAL_LOOKUP_BASE: Gas = 1_125;
     pub const HISTORICAL_LOOKUP_PER_KIB: Gas = 264;
-
-    /// `fetch` of `len` bytes.
-    pub const fn fetch(len: u64) -> Gas {
-        FETCH_BASE.saturating_add(crate::inner::gas::memory(FETCH_PER_KIB, len))
-    }
 
     /// `historical_lookup` of `len` bytes.
     pub const fn historical_lookup(len: u64) -> Gas {
@@ -52,6 +67,10 @@ pub const MAX_EXPORTS: u64 = 3072;
 mod fetch_kind {
     /// The protocol's parameters, encoded.
     pub(super) const PARAMETERS: u64 = 0;
+    /// Extrinsic φ12 of work item φ11.
+    pub(super) const ANY_EXTRINSIC: u64 = 3;
+    /// Extrinsic φ11 of the running work item.
+    pub(super) const OUR_EXTRINSIC: u64 = 4;
     /// Import φ12 of work item φ11.
     pub(super) const ANY_IMPORT: u64 = 5;
     /// Import φ11 of the running work item.
@@ -85,11 +104,13 @@ pub struct JamRefine {
     pub preimages: Option<alloc::sync::Arc<dyn Preimages>>,
 }
 
-/// A work item of a package: its payload and the segments it imports.
+/// A work item of a package: its payload, the segments it imports and its
+/// extrinsics' data.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct JamItem {
     pub payload: Vec<u8>,
     pub imports: Vec<Vec<u8>>,
+    pub extrinsics: Vec<Vec<u8>>,
 }
 
 /// A JAM-only run: the invocation and the segments it exported, each
@@ -137,11 +158,17 @@ fn serve_jam(
     };
     let answer = match u32::try_from(id) {
         Ok(gp_call::FETCH) => {
-            charge(machine, jam_gas::fetch(r[9]))?;
+            charge(machine, jam_gas::fetch(r[10], r[9]))?;
             let index = |register: u64| usize::try_from(register).unwrap_or(usize::MAX);
             let item = |at: usize| jam.items.get(at);
             let value = match r[10] {
                 fetch_kind::PARAMETERS => Some(jam.parameters.as_slice()),
+                fetch_kind::ANY_EXTRINSIC => item(index(r[11]))
+                    .and_then(|item| item.extrinsics.get(index(r[12])))
+                    .map(Vec::as_slice),
+                fetch_kind::OUR_EXTRINSIC => item(jam.item)
+                    .and_then(|item| item.extrinsics.get(index(r[11])))
+                    .map(Vec::as_slice),
                 fetch_kind::ANY_IMPORT => item(index(r[11]))
                     .and_then(|item| item.imports.get(index(r[12])))
                     .map(Vec::as_slice),
@@ -272,7 +299,22 @@ mod tests {
             (jam_gas::GAS, jam_gas::LOG, jam_gas::UNSERVED),
             (48, 1_000, 1_000)
         );
-        assert_eq!(jam_gas::fetch(SEGMENT as u64), 171, "a segment's fetch");
+        // Gray Paper 0.8.0's `fetch` table, by kind: an import flat, a
+        // payload or an extrinsic by the KiB asked for; the payload's
+        // prices PolkaJam 0.1.29 charged a 186 KiB fetch to the unit.
+        assert_eq!(
+            jam_gas::fetch(fetch_kind::OUR_IMPORT, SEGMENT as u64),
+            171,
+            "a segment's fetch"
+        );
+        assert_eq!(jam_gas::fetch(fetch_kind::ANY_IMPORT, 1 << 20), 171);
+        assert_eq!(
+            jam_gas::fetch(fetch_kind::PAYLOAD, 186 << 10),
+            95 + 96 * 186
+        );
+        assert_eq!(jam_gas::fetch(fetch_kind::OUR_EXTRINSIC, 1), 85 + 1);
+        assert_eq!(jam_gas::fetch(fetch_kind::PARAMETERS, 64), 390);
+        assert_eq!(jam_gas::fetch(16, 1 << 20), 80, "past the table");
         assert_eq!(jam_gas::EXPORT, 3_521);
         assert_eq!(
             [0, 300, 4096].map(jam_gas::historical_lookup),
@@ -328,10 +370,11 @@ mod tests {
                 JamItem {
                     payload: alloc::vec![1, 2, 3],
                     imports: alloc::vec![segment(7)],
+                    ..JamItem::default()
                 },
                 JamItem {
-                    payload: Vec::new(),
                     imports: alloc::vec![segment(8), segment(9)],
+                    ..JamItem::default()
                 },
             ],
             item: 1,
@@ -360,6 +403,39 @@ mod tests {
         assert_eq!(bytes, [2, 3, 0x5a], "copied from the offset");
         let (_, run) = fetch([WINDOW, 0, 64, fetch_kind::PARAMETERS as u32, 0]);
         assert_eq!(run.invocation.registers[7], 12);
+        let (price, _) = fetch([WINDOW, 0, 64, fetch_kind::PARAMETERS as u32, 0]);
+        assert_eq!(price, 390);
+        let (price, _) = fetch([WINDOW, 0, 2048, fetch_kind::PAYLOAD as u32, 0]);
+        assert_eq!(price, 95 + 192, "by the length asked for");
+    }
+
+    #[test]
+    fn the_jam_only_host_fetches_extrinsics() {
+        let jam = JamRefine {
+            items: alloc::vec![
+                JamItem {
+                    extrinsics: alloc::vec![alloc::vec![1; 5]],
+                    ..JamItem::default()
+                },
+                JamItem {
+                    extrinsics: alloc::vec![alloc::vec![2; 3], alloc::vec![3; 4]],
+                    ..JamItem::default()
+                },
+            ],
+            item: 1,
+            ..JamRefine::default()
+        };
+        let fetch = |registers| jam_price(2, registers, jam.clone());
+        let (price, run) = fetch([WINDOW, 0, 1024, fetch_kind::OUR_EXTRINSIC as u32, 1]);
+        assert_eq!(price, 85 + 96, "a KiB asked for");
+        assert_eq!(run.invocation.registers[7], 4);
+        let mut bytes = [0u8; 5];
+        run.invocation.memory().read_bytes(WINDOW, &mut bytes);
+        assert_eq!(bytes, [3, 3, 3, 3, 0x5a], "the running item's second");
+        let (_, run) = fetch([WINDOW, 0, 8, fetch_kind::OUR_EXTRINSIC as u32, 2]);
+        assert_eq!(run.invocation.registers[7], result::NONE, "past them");
+        let (_, run) = fetch([WINDOW, 0, 8, fetch_kind::ANY_EXTRINSIC as u32, 0]);
+        assert_eq!(run.invocation.registers[7], 5, "the first item's first");
     }
 
     #[test]

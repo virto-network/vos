@@ -414,6 +414,7 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | authorities | on Kreivo, a map `(space, account) → anchor key`: each node's own sr25519 account, paired with its ed25519 anchor key, set by the controller; an authority signs `anchor` and `submit`, and the sovereign account pays (`spaces-pallet.md` §7). On JAM, the registered anchor keys alone |
 | migration | `Migrate`, by the controller at each venue; each venue refuses anchors outside its range |
 | `MaxRootAge` | 24 h: an anchor older is refused and pruned; there is no separate grace |
+| JAM's code | the statements service never calls `upgrade`, so (JAM genesis, service id), its `VenueId`, fixes its code and its pins; a node checks the code hash against the configured program it expects before it anchors there (6.19) |
 
 **The venue's anchor rule:** a registered, unsuspended space; a registered
 key; the signature; `Last < w < now_w` (gaps allowed; the open window,
@@ -652,8 +653,14 @@ Rests on decisions 5, 6 and 8.
   runs every check but `anchored` and `seen` (it reads no state) and the
   proof, and outputs `Verdict { id, program, space, roots, code }`;
   accumulate checks `anchored` and `seen` and records, under the same
-  `Seen` rule. A fixture fails exactly one check, so every venue reports
-  the same class.
+  `Seen` rule. The service's balance stays above its storage threshold: a
+  `write` past it answers `FULL`, and the service traps so the whole
+  accumulate reverts; the operator alerts on the balance less the
+  threshold. A fixture fails exactly one check, so every venue reports
+  the same class; a statement failing several gets its venue's first in
+  order, and JAM orders the proof before `anchored` and `seen` (`0x1xx`
+  there, `0x5` or `0x6` elsewhere): only a statement no honest prover
+  makes fails both.
 
 ## M2: the final wrap masked
 
@@ -1658,6 +1665,11 @@ fees are the teammate's.
   - the service carries none of `final-verify.elf`'s test modes (mode 2,
     the anchor vectors, reports `ACCEPT` with no statement); otherwise
     accumulate records a verdict only when its `code` is 0.
+- **Ops note (the service's balance):** junk items' outcomes and rootless
+  `Seen` entries raise the service's storage threshold; a write past its
+  balance traps and reverts the whole accumulate, so the venue stops
+  taking items until it is topped up. Alert on `info`'s balance less the
+  threshold.
 - **Ops note (6.12's cuts):** a replica catching up by log across many
   windows writes one undo row per pending cut for each committed write it
   replays, and builds each cut in turn; by snapshot it does none of
@@ -1698,6 +1710,18 @@ fees are the teammate's.
   guest is 523,362 B); a package within CE 133's 204,802 B; the guest's
   `.bss` (a 64 MiB arena and a 1 MiB stack) within JAM's refine memory;
   PolkaJam v0.8.0 pinned (sha256 `e90c8ccd…`).
+- **As built** (`slice-6-progress.md`, 6.19): on JAM the controller is an
+  ed25519 key, which signs a `Migrate` item and a `Control { space, nonce,
+  AddKey | RemoveKey | Resume | SetController }` (calls 2–4, 6 and 1),
+  each at the space's next nonce, a resume only once neither signer of an
+  equivocation is listed; a statement of more than 64 roots is refused at
+  refine, code 1, and the service is created with a least accumulate gas
+  an item (2M), so no item declaring less starves a report; a deployment's genesis hash,
+  genesis time and pins are a block of the linked program's read-only
+  data, set before it is deployed; each item's outcome is kept under its
+  payload's hash; the golden fixtures each fail one check alone, so the
+  service, verifying the proof before it reads its state, reaches every
+  fixture's class.
 - **Dep:** 6.0b, 6.5, 6.10. **Estimate:** 2.5–3 weeks (the new deploy
   tooling takes the upper bound).
 
