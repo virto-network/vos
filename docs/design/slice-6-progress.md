@@ -3268,6 +3268,12 @@ test's or its harness's, not a node's:
   (`a_program_leaves_the_pool_with_its_last_pin`). `install_at_leader`
   sends it again then too, as an install sent again overwrites, within
   twice the in-process wait.
+- **A follower's last entry read before it stopped.** The served runs'
+  follower held down past compaction was compared with its last entry
+  read just before the stop; a loaded host's stop let it take entries
+  past it, and it came back by the log ("no node caught up by a
+  snapshot", with the compaction logged done). Its bound is the running
+  replicas' last entry, read once it is down.
 - **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
   counted any result past its start; an install applied late is one. A
   marker is an empty result, and only those count.
@@ -3279,7 +3285,9 @@ test's or its harness's, not a node's:
   elect again within 10 s of their leader's node stopping, not 5 s, with
   elections of one to two seconds. Workflows' computations end within
   60 s, not 20 s. The served cut run's reads, three 2 s windows to be
-  served, all ran out ("no read served"): windows of 4 s.
+  served, all ran out ("no read served"): windows of 8 s (4 s still
+  served none in one loaded run of three, each read's proof built on the
+  starved cores).
 - **Diagnosis.** The exactly-once run's convergence wait names what each
   replica holds against what it should.
 

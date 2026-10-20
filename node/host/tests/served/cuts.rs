@@ -1,5 +1,5 @@
-//! The checker's exactly-once run with window cuts: windows of four
-//! seconds, so a run crosses a dozen boundaries or more through its
+//! The checker's exactly-once run with window cuts: windows of eight
+//! seconds, so a run crosses boundary after boundary through its
 //! failures (leaders stopped, nodes cut off, clocks jumping, snapshots
 //! installed), and a read's three windows to be served outlast what a
 //! loaded host adds to a window's close; with a writer at each agent
@@ -45,10 +45,10 @@ use crate::exactly_once::{Alongside, exactly_once};
 use crate::harness::{Cluster, NODES};
 use vos_checker::rounds::Rounds;
 
-/// Windows of four seconds: no venue registers them, and none is asked to.
+/// Windows of eight seconds: no venue registers them, and none is asked to.
 const CLOCK: WindowClock = WindowClock {
     origin_ms: 0,
-    length_ms: 4_000,
+    length_ms: 8_000,
 };
 /// The writers' keys in the reader's committed map.
 const KEYS: u64 = 200;
@@ -362,7 +362,7 @@ fn replicated(snapshot: &Snapshot, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Once every replica applies as far as the others and has built every
-/// cut and its latest version: the same cuts, through a dozen windows or more,
+/// cut and its latest version: the same cuts, through several windows,
 /// those of the last `CUT_KEEP` kept alone, and the same
 /// replicated rows; the same roots at the two latest cuts; no undo row, no
 /// pending request and no request's proof left, every read answered.

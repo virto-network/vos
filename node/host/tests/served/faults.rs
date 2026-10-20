@@ -39,10 +39,14 @@ fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
         let leader = cluster.leader(agent)?;
         (1..=NODES)
             .filter(|number| *number != leader)
-            .find_map(|number| Some((number, cluster.node(number)?.replica(agent)?.last_index)))
+            .find(|number| {
+                cluster
+                    .node(*number)
+                    .is_some_and(|node| node.replica(agent).is_some())
+            })
     };
     let until = Instant::now() + Duration::from_secs(10);
-    let (number, last) = loop {
+    let number = loop {
         if let Some(found) = follower() {
             break found;
         }
@@ -54,6 +58,14 @@ fn follower_down_past_compaction(cluster: &Cluster, agent: AgentId) {
     };
     cluster.saw("fault: a follower down past compaction");
     cluster.stop(number);
+    // The running replicas' last entry, read once it is down: it took
+    // what the leader sent until it stopped, past what it held a moment
+    // before, but nothing past what the leader holds.
+    let last = (1..=NODES)
+        .filter_map(|number| cluster.node(number)?.replica(agent))
+        .map(|status| status.last_index)
+        .max()
+        .unwrap_or(0);
     let until = Instant::now() + Duration::from_secs(180);
     loop {
         let compacted = cluster
