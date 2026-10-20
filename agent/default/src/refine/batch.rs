@@ -17,7 +17,7 @@ use super::admin::admin;
 use super::base::Base;
 use super::closes;
 use super::inputs::{
-    acknowledge, called, consumed, failed_in_refine, message, out_of_order, sweep,
+    acknowledge, called, consumed, failed_in_refine, message, out_of_order, proven, sweep,
 };
 use super::sessions::{ByName, Counts, Held, admit, by_name};
 use super::workflows::{self, Floor};
@@ -320,6 +320,7 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
                 rep_root,
                 paths,
             } => Stepped::ran(closes::close(base, window, rep_root, paths)),
+            Input::Proven { id, proof } => Stepped::ran(proven(base, id, proof)),
         };
         let Some(due) = batched.take(base, stepped, plan.reserve, plan.runs) else {
             break;

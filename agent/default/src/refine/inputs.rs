@@ -169,6 +169,21 @@ pub(crate) fn consumed(input: InputRef, outcome: Outcome) -> Run {
     }
 }
 
+/// The step of a statement `id` proved, its final proof the blob `proof`:
+/// its row ([`keys::proven`]) written when the agent holds none for the
+/// id, so the first proof recorded stays.
+pub(crate) fn proven(base: &Base, id: [u8; 32], proof: [u8; 32]) -> Run {
+    let mut run = consumed(InputRef::Proven { id }, Outcome::Done(Vec::new()));
+    let key = keys::proven(&id);
+    if let Ok(None) = base.read(&key) {
+        run.writes.push(Write {
+            key,
+            value: Some(proof.to_vec()),
+        });
+    }
+    run
+}
+
 fn command(base: &Base, index: u32, input: InputRef, call: Call) -> Run {
     let mut invocation = Invocation::new(base, index, Kind::Command);
     let outcome = invocation.top(call);

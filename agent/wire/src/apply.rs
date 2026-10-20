@@ -337,7 +337,8 @@ impl Apply<'_> {
             | InputRef::Due { .. }
             | InputRef::Resume { .. }
             | InputRef::Report { .. }
-            | InputRef::Close { .. } => {}
+            | InputRef::Close { .. }
+            | InputRef::Proven { .. } => {}
             InputRef::Ack { to, sequence } => {
                 // Monotonic and idempotent: a stale ack does nothing, one
                 // past what was sent stops there, and one ack clears at most
