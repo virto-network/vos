@@ -36,7 +36,7 @@ pub mod store;
 pub mod tls;
 mod workflows;
 
-pub use anchor_keys::{rotate_anchor_key, sign_with_node_key, venue_account};
+pub use anchor_keys::{rotate_anchor_key, rotate_venue_account, sign_with_node_key, venue_account};
 pub use node::{
     ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, ReplaceError, Reply, STORE,
     VenueWithAccount, wall_clock,

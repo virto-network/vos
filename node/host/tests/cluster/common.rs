@@ -384,7 +384,10 @@ impl Cluster {
     /// Each of `sequences` added to `agent`'s counter at node `at`, in
     /// order, each at that sequence of the session whose every earlier
     /// call added its own: each is answered with the sum of the sequences
-    /// through it. That sum at the last.
+    /// through it. That sum at the last. A call `at` refuses for not
+    /// leading goes again at the agent's leader, followed as
+    /// [`Cluster::increment_at_leader`] does: under load an election may
+    /// move it mid-sequence.
     #[track_caller]
     pub fn increments(
         &self,
@@ -396,7 +399,11 @@ impl Cluster {
         for sequence in sequences {
             total = sequence * (sequence + 1) / 2;
             assert_eq!(
-                done(self.increment(at, agent, sequence, sequence)),
+                done(match self.increment(at, agent, sequence, sequence) {
+                    Err(CallError::NotLeader(_)) =>
+                        self.increment_at_leader(agent, sequence, sequence),
+                    reply => reply,
+                }),
                 total,
                 "sequence {sequence}"
             );

@@ -135,14 +135,40 @@ pub fn rotate_anchor_key(data: impl AsRef<Path>) -> Result<[u8; 32], String> {
 }
 
 /// The account key at its space's venue of the node whose data directory
-/// is `data`, its node stopped: made, and kept durably, if it has none,
-/// for the space's controller to register its account as an authority.
+/// is `data`, its node stopped: its newest, made and kept durably if it
+/// has none, for the space's controller to register its account as an
+/// authority.
 pub fn venue_account(data: impl AsRef<Path>) -> Result<AccountSeed, String> {
     let data = data.as_ref();
     let (store, _) = stopped(data)?;
     crate::node::venue_account_secret(&store)
         .map(AccountSeed::new)
         .map_err(|error| format!("{}: {error:?}", data.display()))
+}
+
+/// Make the node whose data directory is `data`, its node stopped, a new
+/// account key at its space's venue, kept durably beside the old, which
+/// stays in the store: the old and the new. The node signs as the new
+/// from its next start; the controller removes the old authority, then
+/// adds the new paired with the node's anchor key (a key paired with one
+/// authority is refused to another), so the node anchors nothing between
+/// the two calls.
+pub fn rotate_venue_account(
+    data: impl AsRef<Path>,
+) -> Result<(Option<AccountSeed>, AccountSeed), String> {
+    let data = data.as_ref();
+    let (store, _) = stopped(data)?;
+    let old = store
+        .venue_account_secrets()
+        .map_err(failed(data))?
+        .into_iter()
+        .rev()
+        .find_map(|(_, seed)| seed)
+        .map(AccountSeed::new);
+    let new = crate::node::new_venue_account(&store)
+        .map(AccountSeed::new)
+        .map_err(|error| format!("{}: {error:?}", data.display()))?;
+    Ok((old, new))
 }
 
 /// The node key of the stopped node whose data directory is `data`, and
@@ -197,7 +223,8 @@ mod tests {
 
     /// A node's account key at its venue is made once, kept in its store
     /// beside its node key and anchor keys, and never one of them; it is
-    /// never shown. A node that has not run has none to make.
+    /// never shown. A rotation makes another, which the node signs as, and
+    /// keeps the old. A node that has not run has none to make.
     #[test]
     fn the_venue_account_is_made_once_and_kept_apart() {
         let dir = tempfile::tempdir().unwrap();
@@ -216,8 +243,28 @@ mod tests {
         assert_ne!(*made.secret(), [2; 32], "not an anchor key");
         assert_eq!(format!("{made:?}"), "AccountSeed(..)");
         let store = Fjall::open(&path).unwrap();
-        assert_eq!(store.venue_account_secret().unwrap(), Some(*made.secret()));
+        let stored = store.venue_account_secrets().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].0, 1);
+        assert_eq!(stored[0].1.as_deref(), Some(made.secret()));
         assert_eq!(store.anchor_secrets().unwrap(), [(1, Some([2; 32]))]);
+        drop(store);
+        let (old, new) = rotate_venue_account(dir.path()).unwrap();
+        assert_eq!(old.unwrap().secret(), made.secret(), "the old one returned");
+        assert_ne!(new.secret(), made.secret());
+        assert_eq!(
+            venue_account(dir.path()).unwrap().secret(),
+            new.secret(),
+            "the newest signs"
+        );
+        let store = Fjall::open(&path).unwrap();
+        let numbers: Vec<u64> = store
+            .venue_account_secrets()
+            .unwrap()
+            .iter()
+            .map(|(number, _)| *number)
+            .collect();
+        assert_eq!(numbers, [1, 2], "the old one kept");
         drop(store);
         let digest = [9; 32];
         let (key, signature) = sign_with_node_key(dir.path(), &digest).unwrap();

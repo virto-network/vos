@@ -8,9 +8,9 @@
 //! conformance vectors G1–G18 it generates, which the Kreivo teammate's
 //! pallet must pass.
 //!
-//! A production node does not select Kreivo ([`selectable`]) until the
-//! teammate's pallet passes the vectors in its own runtime and the end to
-//! end run on a Kreivo dev chain (`slice-6-on-chain.md`, M3b's deferred
+//! No build reaches Kreivo without the `kreivo-unvetted` feature
+//! ([`selectable`]) until the teammate's pallet passes the vectors in its
+//! own runtime and the end to end run on a Kreivo dev chain (`slice-6-on-chain.md`, M3b's deferred
 //! gates 1 and 2): no space anchors on a chain whose pallet has not met
 //! them.
 
@@ -28,7 +28,7 @@ mod conformance;
 mod tests;
 
 pub use transport::{Sender, Transport};
-pub use venue::{Alert, KreivoVenue, Options};
+pub use venue::{Alert, Connect, KreivoVenue, Options};
 
 /// A node's Kreivo account key (decision 12): the 32-byte mini secret of
 /// an sr25519 key, made by the node and kept in its store beside its node
@@ -36,10 +36,10 @@ pub use venue::{Alert, KreivoVenue, Options};
 /// its account as one of the space's authorities, paired with the node's
 /// anchor key; it holds no balance, the space's sovereign account pays.
 /// Never shown: its `Debug` names it only, and it is zeroed when dropped.
-pub struct AccountSeed([u8; 32]);
+pub struct AccountSeed(zeroize::Zeroizing<[u8; 32]>);
 
 impl AccountSeed {
-    pub fn new(seed: [u8; 32]) -> Self {
+    pub fn new(seed: zeroize::Zeroizing<[u8; 32]>) -> Self {
         Self(seed)
     }
 
@@ -55,44 +55,20 @@ impl std::fmt::Debug for AccountSeed {
     }
 }
 
-impl Drop for AccountSeed {
-    fn drop(&mut self) {
-        for byte in &mut self.0 {
-            // SAFETY: a byte of the seed, which this owns.
-            unsafe { std::ptr::write_volatile(byte, 0) };
-        }
+/// Whether this build may reach Kreivo: only with the `kreivo-unvetted`
+/// feature, which development, tests and the end to end runs build with
+/// and a release never does, until Kreivo's spaces pallet passes the
+/// conformance vectors in its runtime and the end to end run on a Kreivo
+/// dev chain. `chain::ChainTransport::connect` asks it,
+/// so every node that reaches Kreivo is gated.
+pub fn selectable() -> Result<(), String> {
+    if cfg!(feature = "kreivo-unvetted") {
+        return Ok(());
     }
-}
-
-/// What a node's build is for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Build {
-    /// Tests and development: built with debug assertions.
-    Dev,
-    /// A production node.
-    Production,
-}
-
-impl Build {
-    /// This build's.
-    pub fn current() -> Self {
-        if cfg!(debug_assertions) {
-            Self::Dev
-        } else {
-            Self::Production
-        }
-    }
-}
-
-/// Whether a node built for `build` may select Kreivo as its space's
-/// venue: in tests and development only, until Kreivo's pallet meets the
-/// conformance vectors in its runtime and the end to end run.
-pub fn selectable(build: Build) -> Result<(), String> {
-    match build {
-        Build::Dev => Ok(()),
-        Build::Production => Err("the `kreivo` venue is not selectable in a production node \
-             until Kreivo's spaces pallet passes the conformance vectors in its runtime and the \
-             end to end run on a Kreivo dev chain"
-            .into()),
-    }
+    Err(
+        "this build does not reach Kreivo: its spaces pallet has not yet passed the \
+         conformance vectors in its runtime and the end to end run on a Kreivo dev chain \
+         (the `kreivo-unvetted` feature, never in a release)"
+            .into(),
+    )
 }

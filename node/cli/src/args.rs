@@ -93,12 +93,34 @@ pub enum NodeCommand {
         #[command(subcommand)]
         command: AnchorKeyCommand,
     },
-    /// Print the node's own account at its space's venue, made and kept in
-    /// its store if it has none: the space's controller registers it as an
-    /// authority (`vos space venue authority add`), paired with the node's
-    /// anchor key. It holds no balance: the space's sovereign account pays.
+    /// The node's own account at its space's venue: the space's controller
+    /// registers it as an authority (`vos space venue authority add`),
+    /// paired with the node's anchor key. It holds no balance: the space's
+    /// sovereign account pays.
     #[cfg(feature = "kreivo")]
     VenueAccount {
+        #[command(subcommand)]
+        command: VenueAccountCommand,
+    },
+}
+
+/// The node's account at its space's venue.
+#[cfg(feature = "kreivo")]
+#[derive(Subcommand)]
+pub enum VenueAccountCommand {
+    /// Print it, made and kept in the node's store if it has none.
+    Show {
+        /// The node's data directory, its node stopped.
+        #[arg(long)]
+        data: PathBuf,
+    },
+    /// Make a new one, kept beside the old, and print both: the node signs
+    /// as the new from its next start. The controller then removes the old
+    /// authority (`vos space venue authority remove`), and adds the new
+    /// paired with the node's anchor key (`authority add`): an anchor key
+    /// paired with one authority is refused to another, so the node
+    /// anchors nothing between the two.
+    Rotate {
         /// The node's data directory, its node stopped.
         #[arg(long)]
         data: PathBuf,

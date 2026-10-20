@@ -1,9 +1,9 @@
 //! The space's venue: the node's client of it (`vos node run --venue`),
 //! the node's account there (`vos node venue-account`), and the operator's
 //! and controller's calls (`vos space venue`), each over the Kreivo
-//! client's pinned calls. Built with the `kreivo` feature; a production
-//! build refuses to select Kreivo until its spaces pallet meets the
-//! conformance vectors.
+//! client's pinned calls. Built with the `kreivo` feature; no build
+//! reaches Kreivo without `kreivo-unvetted`, never in a release, until its
+//! spaces pallet meets the conformance vectors.
 
 use vos_node::{Space, VenueWithAccount};
 
@@ -17,7 +17,7 @@ pub fn anchoring(
     space: Option<&Space>,
 ) -> Result<VenueWithAccount, String> {
     let VenueKind::Kreivo = kind;
-    vos_venue::kreivo::selectable(vos_venue::kreivo::Build::current())?;
+    vos_venue::kreivo::selectable()?;
     let space = space
         .filter(|space| space.genesis().is_some())
         .ok_or("a venue anchors a founded space: `--space`, its genesis beside it")?
@@ -50,7 +50,7 @@ mod kreivo {
     use vos_venue::kreivo::calls::{self, Call, keys};
     use vos_venue::kreivo::chain::{self, ChainTransport};
     use vos_venue::kreivo::transport::{Sent, Transport};
-    use vos_venue::kreivo::{AccountSeed, KreivoVenue, Options, Sender};
+    use vos_venue::kreivo::{AccountSeed, Connect, KreivoVenue, Options, Sender};
     use vos_wire::SpaceId;
 
     use crate::key_bytes;
@@ -58,11 +58,13 @@ mod kreivo {
     pub fn anchoring(url: String, space: SpaceId) -> Result<VenueWithAccount, String> {
         Ok(Box::new(move |seed: AccountSeed| {
             let signer = chain::keypair(seed.secret())?;
-            let transport = ChainTransport::connect(&url, signer)
-                .map_err(|lost| format!("{url}: {}", lost.0))?;
-            let venue =
-                KreivoVenue::connect(Arc::new(transport), &[space], space, Options::default())
-                    .map_err(|lost| format!("{url}: {}", lost.0))?;
+            // Reached on the client's own thread, and again until it is: the
+            // node starts while Kreivo is down.
+            let connect: Connect = Box::new(move || {
+                ChainTransport::connect(&url, signer.clone())
+                    .map(|transport| Arc::new(transport) as Arc<dyn Transport>)
+            });
+            let venue = KreivoVenue::connect(connect, &[space], space, Options::default());
             Ok(Arc::new(venue) as Arc<dyn VenueClient>)
         }))
     }

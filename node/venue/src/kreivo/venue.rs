@@ -3,26 +3,34 @@
 //! The representative's leader hands an anchor over inside its batch, so
 //! [`VenueClient::anchor`] never waits on the chain: it answers from what
 //! the client last read (the space's status, range, anchor keys and last
-//! anchored window, and the venue's time) and queues what it takes. One
-//! worker thread sends the queue in window order, submits in turn, all
-//! signed by the node's one account ([`Sender`]), and reads the watched
-//! spaces again every [`Options::refresh`].
+//! anchored window, and the venue's time) and queues what it takes in an
+//! [`AnchorQueue`], whose worker sends each space's anchors in window
+//! order. A reader thread connects (a node starts while Kreivo is down:
+//! until it is reached, every anchor is `Open`), then reads the watched
+//! spaces every [`Options::refresh`]. Submits go on the caller's thread.
+//! Every call is signed by the node's one account, one at a time
+//! ([`Sender`]).
 //!
-//! The worker never sends an anchor for a window the venue's clock has not
-//! closed (`w < now_w` by `Timestamp.Now`), nor while the space is not
-//! active or anchors are paused: each failed `anchor` is a fee the space's
-//! sovereign account pays. The pallet's errors (`spaces-pallet.md` §9):
-//! 14 `AlreadyAnchored` and 15 `WindowNotAfterLast` done; 16
-//! `WindowInFuture` sent again once the venue's time passes `B_w` plus a
-//! block, never skipped; 17 `WindowTooOld` and 18 `OutOfRange` dead, with
-//! an alert; the configuration's errors and `InvalidTransaction::Payment`
-//! an alert.
+//! An anchor is never sent for a window the venue's clock has not closed
+//! (`w < now_w` by `Timestamp.Now`), nor while the space is not active or
+//! anchors are paused: each failed `anchor` is a fee the space's sovereign
+//! account pays. It is settled only by the venue holding it or a later
+//! window (14 `AlreadyAnchored`, 15 `WindowNotAfterLast`), by an
+//! equivocation, or for good (17 `WindowTooOld`, 18 `OutOfRange`, or past
+//! `MaxRootAge` by the venue's clock); otherwise it is kept: 16
+//! `WindowInFuture` until `Timestamp.Now` passes `B_w` plus a block; 19 and
+//! 20 until the space is active and anchors are not paused; 21 and 27, and
+//! `InvalidTransaction::Payment`, a funding alert, until the next read; the
+//! others (7 `NotAuthority`, 11–13 the key or the signature) an alert, and
+//! again a window later; the pool's other refusals an alert, and again
+//! after a backoff.
 
-use std::collections::{BTreeMap, VecDeque};
-use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use ed25519_dalek::{Signature, VerifyingKey};
 use vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceId, VenueId};
 use vos_statement::{Statement, StatementId};
 
@@ -32,17 +40,19 @@ use super::calls::{
     keys,
 };
 use super::transport::{Invalid, Lost, Sender, Sent, Transport, Unsent};
+use crate::queue::{AnchorQueue, AnchorSend, Fate};
 use crate::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
 
 /// How the client paces itself, and what it takes a submit to cost.
 #[derive(Clone, Debug)]
 pub struct Options {
-    /// How often the worker reads the watched spaces and the venue's time.
+    /// How often the reader reads the watched spaces and the venue's time.
     pub refresh: Duration,
     /// The first wait after a lost connection, doubled up to 32 times it.
     pub backoff: Duration,
-    /// A block's time: after `WindowInFuture`, an anchor waits until the
-    /// venue's time passes the window's boundary by this much.
+    /// A block's time: after `WindowInFuture`, or an anchor landed whose
+    /// record is not read yet, an anchor waits this much of the venue's
+    /// time.
     pub block_ms: u64,
     /// The most one submit takes of the paying space's sovereign account:
     /// `SubmitDeposit` and a fee's bound.
@@ -65,6 +75,9 @@ impl Default for Options {
     }
 }
 
+/// How long an anchor the pool refused waits before it goes again.
+const POOL_BACKOFF: Duration = Duration::from_secs(30);
+
 /// What the client tells an operator: each is logged as an error, once
 /// while it repeats.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -85,7 +98,7 @@ pub enum Alert {
     Configuration { space: SpaceId, what: String },
     /// The paying space's funds: the venue refused the fee
     /// (`InvalidTransaction::Payment`: its sovereign's balance or its
-    /// budget), or its sovereign account holds less than
+    /// budget), its sovereign could not pay (21, 27), or it holds less than
     /// [`Options::funding_submits`] submits.
     Funding { space: SpaceId, what: String },
     /// An answer the client cannot place.
@@ -102,21 +115,8 @@ struct Known {
     keys: Vec<[u8; 32]>,
     /// Its last anchored window (`Last[space][0]`).
     last: Option<u64>,
-    /// The roots the client saw anchored, by window.
+    /// The roots the client saw anchored, by window: the newest [`HELD`].
     held: BTreeMap<u64, [u8; 32]>,
-}
-
-/// An anchor queued, and the venue time it waits for.
-struct Waiting {
-    anchor: Anchor,
-    not_before: u64,
-}
-
-/// A submit for the worker to send, and where its verdict goes.
-struct Job {
-    call: Vec<u8>,
-    id: StatementId,
-    answer: mpsc::Sender<Result<StatementId, NotAccepted>>,
 }
 
 #[derive(Default)]
@@ -126,10 +126,14 @@ struct State {
     /// `Paused`'s flags.
     paused: u8,
     spaces: BTreeMap<SpaceId, Known>,
-    queue: BTreeMap<(SpaceId, u64), Waiting>,
-    submits: VecDeque<Job>,
+    /// The venue time an anchor waits for before it goes again: after
+    /// `WindowInFuture`, or after it landed with its record not yet read.
+    later: BTreeMap<(SpaceId, u64), u64>,
+    /// Anchors that landed with their answers lost: their records are read
+    /// before they go again.
+    landed: BTreeSet<(SpaceId, u64)>,
     alerts: Vec<Alert>,
-    /// When the worker last read the spaces: none to read them now.
+    /// When the reader last read the spaces: none to read them now.
     refreshed: Option<Instant>,
     /// How many times it has read them.
     reads: u64,
@@ -153,61 +157,104 @@ impl State {
         }
     }
 
-    /// `space`, watched from now on: read at the worker's next turn.
+    /// `space`, watched from now on: read at the reader's next turn.
     fn watch(&mut self, space: SpaceId) -> &Known {
         if !self.spaces.contains_key(&space) {
             self.refreshed = None;
         }
         self.spaces.entry(space).or_default()
     }
+
+    /// `anchor` seen anchored.
+    fn held(&mut self, anchor: &Anchor) {
+        let key = (anchor.space, anchor.window);
+        self.later.remove(&key);
+        self.landed.remove(&key);
+        let known = self.spaces.entry(anchor.space).or_default();
+        known.held.insert(anchor.window, anchor.root);
+        while known.held.len() > HELD {
+            known.held.pop_first();
+        }
+        known.last = known.last.max(Some(anchor.window));
+    }
 }
 
+/// How the client reaches Kreivo, made on the reader's thread and made
+/// again until it is reached.
+pub type Connect = Box<dyn FnMut() -> Result<Arc<dyn Transport>, Lost> + Send>;
+
 struct Shared {
-    id: VenueId,
     /// The space whose sovereign account pays this node's submits.
     payer: SpaceId,
-    sender: Sender,
     options: Options,
+    /// Set once Kreivo is reached.
+    sender: OnceLock<Sender>,
+    /// Kreivo's genesis hash, once read.
+    id: OnceLock<VenueId>,
     state: Mutex<State>,
     wake: Condvar,
+    stopping: AtomicBool,
 }
 
 /// Kreivo, through the spaces pallet's client.
 pub struct KreivoVenue {
     shared: Arc<Shared>,
+    queue: AnchorQueue,
 }
 
 impl KreivoVenue {
-    /// The venue `transport` reaches, signing with its account: the spaces
-    /// in `spaces` read once now, before a batch asks, and `payer` the
-    /// space whose sovereign account pays this node's submits. Its worker
-    /// runs until it is dropped.
-    pub fn connect(
+    /// The venue `connect` reaches, signing with its account, on a thread
+    /// of its own: the spaces in `spaces` watched, and `payer` the space
+    /// whose sovereign account pays this node's submits. It runs until it
+    /// is dropped.
+    pub fn connect(connect: Connect, spaces: &[SpaceId], payer: SpaceId, options: Options) -> Self {
+        Self::start(Some(connect), None, spaces, payer, options)
+    }
+
+    /// The venue `transport` reaches, read once now when it can be, before
+    /// a batch asks.
+    pub fn over(
         transport: Arc<dyn Transport>,
         spaces: &[SpaceId],
         payer: SpaceId,
         options: Options,
-    ) -> Result<Self, Lost> {
-        let id = VenueId(transport.genesis()?);
+    ) -> Self {
+        Self::start(None, Some(transport), spaces, payer, options)
+    }
+
+    fn start(
+        connect: Option<Connect>,
+        transport: Option<Arc<dyn Transport>>,
+        spaces: &[SpaceId],
+        payer: SpaceId,
+        options: Options,
+    ) -> Self {
         let mut state = State::default();
         for space in spaces.iter().chain([&payer]) {
             state.watch(*space);
         }
         let shared = Arc::new(Shared {
-            id,
             payer,
-            sender: Sender::new(transport, options.backoff),
-            options,
+            sender: OnceLock::new(),
+            id: OnceLock::new(),
             state: Mutex::new(state),
             wake: Condvar::new(),
+            stopping: AtomicBool::new(false),
+            options,
         });
-        shared.refresh()?;
-        let worker = Arc::clone(&shared);
+        if let Some(transport) = transport {
+            shared.reached(transport);
+            if let Err(Lost(why)) = shared.refresh() {
+                tracing::warn!(%why, "Kreivo is not reachable to read");
+            }
+        }
+        let reader = Arc::clone(&shared);
         std::thread::Builder::new()
             .name("kreivo".into())
-            .spawn(move || worker.run())
-            .map_err(|error| Lost(error.to_string()))?;
-        Ok(Self { shared })
+            .spawn(move || reader.read_on(connect))
+            .expect("Kreivo's reader starts");
+        let queue = AnchorQueue::spawn("kreivo-anchors", KreivoSend(Arc::clone(&shared)));
+        Self { shared, queue }
     }
 
     /// The alerts raised, oldest first.
@@ -222,13 +269,16 @@ impl KreivoVenue {
 
     /// The anchors queued, not yet settled at the venue.
     pub fn queued(&self) -> usize {
-        self.shared.state().queue.len()
+        self.queue.len()
     }
 }
 
 impl Drop for KreivoVenue {
     fn drop(&mut self) {
-        self.shared.sender.stop();
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        if let Some(sender) = self.shared.sender.get() {
+            sender.stop();
+        }
         self.shared.wake.notify_all();
     }
 }
@@ -240,13 +290,36 @@ impl Shared {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn transport(&self) -> &Arc<dyn Transport> {
-        self.sender.transport()
+    fn stopped(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    /// Wait `wait`, or until woken.
+    fn pause(&self, wait: Duration) {
+        let state = self.state();
+        let _ = self.wake.wait_timeout(state, wait);
+    }
+
+    /// Kreivo reached through `transport`: its genesis read, if it can be.
+    fn reached(&self, transport: Arc<dyn Transport>) {
+        if let Ok(genesis) = transport.genesis() {
+            let _ = self.id.set(VenueId(genesis));
+        }
+        let _ = self
+            .sender
+            .set(Sender::new(transport, self.options.backoff));
+    }
+
+    fn transport(&self) -> Result<&Arc<dyn Transport>, Lost> {
+        self.sender
+            .get()
+            .map(Sender::transport)
+            .ok_or_else(|| Lost("Kreivo is not reached yet".into()))
     }
 
     fn read<T: parity_scale_codec::Decode>(&self, key: &[u8]) -> Result<Option<T>, Lost> {
         Ok(self
-            .transport()
+            .transport()?
             .storage(key)?
             .and_then(|bytes| calls::read(&bytes)))
     }
@@ -257,6 +330,43 @@ impl Shared {
             .ok_or_else(|| Lost("no `Timestamp.Now`".into()))?;
         self.state().now = Some(now);
         Ok(now)
+    }
+
+    /// Connect, read Kreivo's genesis, then read the watched spaces every
+    /// refresh, until stopped.
+    fn read_on(&self, mut connect: Option<Connect>) {
+        let mut wait = self.options.backoff;
+        loop {
+            if self.stopped() {
+                return;
+            }
+            let reached = match (self.sender.get(), connect.as_mut()) {
+                (Some(_), _) => Ok(()),
+                (None, Some(connect)) => connect().map(|transport| self.reached(transport)),
+                (None, None) => Err(Lost("no way to reach Kreivo".into())),
+            };
+            let genesis = reached.and_then(|()| match self.id.get() {
+                Some(_) => Ok(()),
+                None => self.transport()?.genesis().map(|genesis| {
+                    let _ = self.id.set(VenueId(genesis));
+                }),
+            });
+            if let Err(Lost(why)) = genesis {
+                tracing::warn!(%why, "Kreivo is not reachable; trying again");
+                self.pause(wait);
+                wait = (wait * 2).min(self.options.backoff * 32);
+                continue;
+            }
+            wait = self.options.backoff;
+            let due = self
+                .state()
+                .refreshed
+                .is_none_or(|at| at.elapsed() >= self.options.refresh);
+            if due && let Err(Lost(why)) = self.refresh() {
+                tracing::warn!(%why, "Kreivo is not reachable to read");
+            }
+            self.pause(self.options.refresh);
+        }
     }
 
     /// Read the venue's time, the pause, and every watched space; alert
@@ -270,7 +380,7 @@ impl Shared {
             let info = self.read::<SpaceInfo>(&keys::spaces(&space.0))?;
             let prefix = keys::anchor_keys_of(&space.0);
             let keys = self
-                .transport()
+                .transport()?
                 .keys(&prefix)?
                 .iter()
                 .filter_map(|key| key.get(prefix.len()..)?.try_into().ok())
@@ -316,81 +426,72 @@ impl Shared {
         Ok(())
     }
 
-    fn run(self: Arc<Self>) {
-        loop {
-            if self.sender.stopped() {
-                return;
-            }
-            let due = self
-                .state()
-                .refreshed
-                .is_none_or(|at| at.elapsed() >= self.options.refresh);
-            if due && let Err(Lost(why)) = self.refresh() {
-                tracing::warn!(%why, "Kreivo is not reachable to read");
-            }
-            let job = self.state().submits.pop_front();
-            if let Some(job) = job {
-                let verdict = self.send_submit(&job);
-                let _ = job.answer.send(verdict);
-                continue;
-            }
-            if self.send_anchor() {
-                continue;
-            }
-            let state = self.state();
-            if state.submits.is_empty() {
-                let _ = self.wake.wait_timeout(state, self.options.refresh);
-            }
-        }
+    /// Whether the venue holds `anchor`'s root at its window.
+    fn holds(&self, anchor: &Anchor) -> Result<bool, Lost> {
+        let key = keys::anchors(&anchor.space.0, anchor.kind as u8, anchor.window);
+        Ok(self
+            .read::<AnchorRecord>(&key)?
+            .is_some_and(|record| record.root == anchor.root))
     }
 
-    /// Send the first anchor queued, when the venue would take it: whether
-    /// it sent one.
-    fn send_anchor(&self) -> bool {
-        let Some((key, anchor, not_before)) = self
-            .state()
-            .queue
-            .first_key_value()
-            .map(|(key, waiting)| (*key, waiting.anchor, waiting.not_before))
-        else {
-            return false;
+    /// Send `anchor`, when the venue would take it.
+    fn send_anchor(&self, anchor: &Anchor) -> Fate {
+        let wait = Fate::Again(self.options.refresh);
+        let (space, window) = (anchor.space, anchor.window);
+        let key = (space, window);
+        let Some(sender) = self.sender.get() else {
+            return wait;
         };
-        let (space, window) = key;
         let Ok(now) = self.venue_now() else {
-            return false;
+            return wait;
         };
+        let landed = self.state().landed.contains(&key);
+        if landed {
+            match self.holds(anchor) {
+                Ok(true) => {
+                    self.state().held(anchor);
+                    return Fate::Done;
+                }
+                Ok(false) => {}
+                Err(_) => return wait,
+            }
+        }
         let mut state = self.state();
         let paused = state.paused & PAUSED_ANCHOR != 0;
-        let Some(info) = state
-            .spaces
-            .get(&space)
-            .and_then(|known| known.info.clone())
-        else {
-            state.queue.remove(&key);
+        let known = state.spaces.get(&space).cloned().unwrap_or_default();
+        let Some(info) = known.info else {
             let what = "the space is not registered".to_string();
             state.alert(Alert::Configuration { space, what });
-            return true;
+            return wait;
         };
         let clock = info.clock();
         let boundary = clock.boundary(window).unwrap_or(u64::MAX);
         if now.saturating_sub(boundary) > MAX_ROOT_AGE_MS {
-            state.queue.remove(&key);
+            state.later.remove(&key);
+            state.landed.remove(&key);
             let error = Error::WindowTooOld;
             state.alert(Alert::Dead {
                 space,
                 window,
                 error,
             });
-            return true;
+            return Fate::Dead;
+        }
+        if known.last.is_some_and(|last| window < last) {
+            state.later.remove(&key);
+            state.landed.remove(&key);
+            return Fate::Done;
         }
         let closed = clock.window(now).is_some_and(|open| window < open);
-        if paused || info.status != SpaceStatus::Active || !closed || now < not_before {
-            return false;
+        let later = state.later.get(&key).is_some_and(|at| now < *at);
+        if paused || info.status != SpaceStatus::Active || !closed || later {
+            return wait;
         }
         drop(state);
-        let sent = self.sender.call(&Call::anchor(&anchor).bytes());
+        let sent = sender.call(&Call::anchor(anchor).bytes());
         let mut state = self.state();
-        let settled = match sent {
+        let window_length = Duration::from_millis(info.length_ms);
+        match sent {
             Ok(Sent::Included(outcome)) => {
                 let anchored = outcome.events.iter().any(|event| {
                     matches!(event, Event::Anchored { space: of, window: w, root, .. }
@@ -401,137 +502,124 @@ impl Shared {
                     .iter()
                     .any(|event| matches!(event, Event::Equivocated { .. }));
                 if anchored {
-                    held(&mut state, &anchor);
-                    true
-                } else if equivocated {
+                    state.held(anchor);
+                    return Fate::Done;
+                }
+                if equivocated {
                     state.alert(Alert::Equivocation { space, window });
-                    true
-                } else {
-                    let error = outcome.failure.and_then(|failure| failure.pallet());
-                    self.anchor_failed(&mut state, &key, error, boundary)
+                    return Fate::Done;
+                }
+                let error = outcome.failure.and_then(|failure| failure.pallet());
+                match answer(error) {
+                    Answer::Done => {
+                        state.later.remove(&key);
+                        state.landed.remove(&key);
+                        Fate::Done
+                    }
+                    Answer::Later => {
+                        state
+                            .later
+                            .insert(key, boundary.saturating_add(self.options.block_ms));
+                        wait
+                    }
+                    Answer::Dead(error) => {
+                        state.alert(Alert::Dead {
+                            space,
+                            window,
+                            error,
+                        });
+                        Fate::Dead
+                    }
+                    Answer::Wait => {
+                        if error == Some(Error::Paused) {
+                            state.paused |= PAUSED_ANCHOR;
+                        }
+                        state.refreshed = None;
+                        wait
+                    }
+                    Answer::Funding(error) => {
+                        let what = format!("an anchor refused: {error:?}");
+                        state.alert(Alert::Funding { space, what });
+                        wait
+                    }
+                    Answer::Configuration => {
+                        let what = format!(
+                            "an anchor refused: {:?}; again a window later",
+                            outcome.failure
+                        );
+                        state.alert(Alert::Configuration { space, what });
+                        Fate::Again(window_length)
+                    }
                 }
             }
             Ok(Sent::Landed) => {
-                drop(state);
-                let record = self.read::<AnchorRecord>(&keys::anchors(&space.0, 0, window));
-                state = self.state();
-                if let Ok(Some(record)) = &record
-                    && record.root == anchor.root
-                {
-                    held(&mut state, &anchor);
-                }
-                true
+                state.landed.insert(key);
+                state
+                    .later
+                    .insert(key, now.saturating_add(self.options.block_ms));
+                wait
             }
             Err(Unsent::Invalid(Invalid::Payment)) => {
                 let what = "the venue refused an anchor's fee".to_string();
                 state.alert(Alert::Funding { space, what });
-                false
+                wait
             }
             Err(Unsent::Invalid(invalid)) => {
-                state.alert(Alert::Unexpected(format!("an anchor refused: {invalid:?}")));
-                true
-            }
-            Err(Unsent::Stopped) => return false,
-        };
-        if settled {
-            state.queue.remove(&key);
-        }
-        settled
-    }
-
-    /// What an anchor's dispatch error makes of it: whether it is settled.
-    fn anchor_failed(
-        &self,
-        state: &mut State,
-        key: &(SpaceId, u64),
-        error: Option<Error>,
-        boundary: u64,
-    ) -> bool {
-        let (space, window) = *key;
-        match anchor_fate(error) {
-            Fate::Done => true,
-            Fate::Later => {
-                if let Some(waiting) = state.queue.get_mut(key) {
-                    waiting.not_before = boundary.saturating_add(self.options.block_ms);
-                }
-                false
-            }
-            Fate::Dead(error) => {
-                state.alert(Alert::Dead {
-                    space,
-                    window,
-                    error,
-                });
-                true
-            }
-            Fate::Inactive => {
-                state.refreshed = None;
-                false
-            }
-            Fate::Paused => {
-                state.paused |= PAUSED_ANCHOR;
-                false
-            }
-            Fate::Configuration(error) => {
-                let what = format!("an anchor refused: {error:?}");
-                state.alert(Alert::Configuration { space, what });
-                true
-            }
-            Fate::Unexpected => {
-                let what = "an anchor failed for a reason not the pallet's".to_string();
+                let what = format!("the pool refused an anchor: {invalid:?}");
                 state.alert(Alert::Unexpected(what));
-                true
+                Fate::Again(POOL_BACKOFF)
             }
+            Err(Unsent::Stopped) => wait,
         }
     }
 
     /// Send a submit: its verdict.
-    fn send_submit(&self, job: &Job) -> Result<StatementId, NotAccepted> {
+    fn send_submit(
+        &self,
+        sender: &Sender,
+        call: &[u8],
+        id: StatementId,
+    ) -> Result<StatementId, NotAccepted> {
         let space = self.payer;
-        let unjudged = |state: &mut State, alert: Alert, why: Unjudged| {
-            state.alert(alert);
+        let unjudged = |alert: Alert, why: Unjudged| {
+            self.state().alert(alert);
             Err(NotAccepted::Unjudged(why))
         };
-        match self.sender.call(&job.call) {
+        match sender.call(call) {
             Ok(Sent::Included(outcome)) => {
-                if let Some(verdict) = judged(&outcome.events, job.id) {
+                if let Some(verdict) = judged(&outcome.events, id) {
                     return verdict;
                 }
-                let mut state = self.state();
                 let error = outcome.failure.and_then(|failure| failure.pallet());
+                let what = format!("a submit refused: {error:?}");
                 match error {
                     Some(Error::InsufficientSovereignBalance | Error::OverBudget) => {
-                        let what = format!("a submit refused: {error:?}");
-                        unjudged(
-                            &mut state,
-                            Alert::Funding { space, what },
-                            Unjudged::Funding,
-                        )
+                        unjudged(Alert::Funding { space, what }, Unjudged::Funding)
                     }
-                    Some(error) => {
-                        let what = format!("a submit refused: {error:?}");
-                        let alert = Alert::Configuration { space, what };
-                        unjudged(&mut state, alert, Unjudged::Configuration)
-                    }
+                    Some(_) => unjudged(
+                        Alert::Configuration { space, what },
+                        Unjudged::Configuration,
+                    ),
                     None => {
                         let what = format!("a submit's outcome unread: {outcome:?}");
-                        unjudged(&mut state, Alert::Unexpected(what), Unjudged::Unknown)
+                        unjudged(Alert::Unexpected(what), Unjudged::Unknown)
                     }
                 }
             }
-            Ok(Sent::Landed) => match self.read::<u64>(&keys::seen(&job.id.0)) {
-                Ok(Some(_)) => Ok(job.id),
+            Ok(Sent::Landed) => match self.read::<u64>(&keys::seen(&id.0)) {
+                Ok(Some(_)) => Ok(id),
                 _ => Err(NotAccepted::Unjudged(Unjudged::Unknown)),
             },
             Err(Unsent::Invalid(Invalid::Payment)) => {
                 let what = "the venue refused a submit's fee".to_string();
-                let alert = Alert::Funding { space, what };
-                unjudged(&mut self.state(), alert, Unjudged::Funding)
+                unjudged(Alert::Funding { space, what }, Unjudged::Funding)
             }
             Err(Unsent::Invalid(invalid)) => {
                 let what = format!("a submit refused: {invalid:?}");
-                let alert = Alert::Configuration { space, what };
-                unjudged(&mut self.state(), alert, Unjudged::Configuration)
+                unjudged(
+                    Alert::Configuration { space, what },
+                    Unjudged::Configuration,
+                )
             }
             Err(Unsent::Stopped) => Err(NotAccepted::Unjudged(Unjudged::Unknown)),
         }
@@ -593,9 +681,18 @@ impl Shared {
     }
 }
 
-/// What becomes of an anchor the chain refused (`spaces-pallet.md` §9).
+/// The anchors' sending, as the queue's worker drives it.
+struct KreivoSend(Arc<Shared>);
+
+impl AnchorSend for KreivoSend {
+    fn send(&self, anchor: &Anchor) -> Fate {
+        self.0.send_anchor(anchor)
+    }
+}
+
+/// What an anchor the chain refused waits for (`spaces-pallet.md` §9).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Fate {
+pub(super) enum Answer {
     /// 14 `AlreadyAnchored`, 15 `WindowNotAfterLast`: the venue holds it,
     /// or a later window.
     Done,
@@ -604,26 +701,27 @@ pub(super) enum Fate {
     Later,
     /// 17 `WindowTooOld`, 18 `OutOfRange`: never taken; an alert.
     Dead(Error),
-    /// 19 `SpaceNotActive`: kept until the space is active again.
-    Inactive,
-    /// 20 `Paused`: kept until anchors are not paused.
-    Paused,
-    /// Any other of the pallet's: the node's configuration, or a bug; an
-    /// alert.
-    Configuration(Error),
-    /// Not the pallet's error: an alert.
-    Unexpected,
+    /// 19 `SpaceNotActive`, 20 `Paused`: kept until the space is active
+    /// and anchors are not paused.
+    Wait,
+    /// 21 `InsufficientSovereignBalance`, 27 `OverBudget`: kept; a
+    /// funding alert.
+    Funding(Error),
+    /// 7 `NotAuthority`, 11–13 the key, the signature, the kind, any
+    /// other, or not the pallet's: kept, an alert, again a window later.
+    Configuration,
 }
 
-pub(super) fn anchor_fate(error: Option<Error>) -> Fate {
+pub(super) fn answer(error: Option<Error>) -> Answer {
     match error {
-        Some(Error::AlreadyAnchored | Error::WindowNotAfterLast) => Fate::Done,
-        Some(Error::WindowInFuture) => Fate::Later,
-        Some(error @ (Error::WindowTooOld | Error::OutOfRange)) => Fate::Dead(error),
-        Some(Error::SpaceNotActive) => Fate::Inactive,
-        Some(Error::Paused) => Fate::Paused,
-        Some(error) => Fate::Configuration(error),
-        None => Fate::Unexpected,
+        Some(Error::AlreadyAnchored | Error::WindowNotAfterLast) => Answer::Done,
+        Some(Error::WindowInFuture) => Answer::Later,
+        Some(error @ (Error::WindowTooOld | Error::OutOfRange)) => Answer::Dead(error),
+        Some(Error::SpaceNotActive | Error::Paused) => Answer::Wait,
+        Some(error @ (Error::InsufficientSovereignBalance | Error::OverBudget)) => {
+            Answer::Funding(error)
+        }
+        _ => Answer::Configuration,
     }
 }
 
@@ -642,22 +740,27 @@ pub(super) fn judged(
     })
 }
 
-/// `anchor` seen anchored.
-fn held(state: &mut State, anchor: &Anchor) {
-    let known = state.spaces.entry(anchor.space).or_default();
-    known.held.insert(anchor.window, anchor.root);
-    while known.held.len() > HELD {
-        known.held.pop_first();
-    }
-    known.last = known.last.max(Some(anchor.window));
-}
-
 impl VenueClient for KreivoVenue {
     fn id(&self) -> VenueId {
-        self.shared.id
+        self.shared.id.get().copied().unwrap_or(VenueId([0; 32]))
     }
 
     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
+        // Signed over the venue's id: one signed before Kreivo was reached
+        // goes again, signed anew.
+        let Some(id) = self.shared.id.get() else {
+            return Err(AnchorRefusal::Open);
+        };
+        let signed = VerifyingKey::from_bytes(&anchor.signer).is_ok_and(|key| {
+            key.verify_strict(
+                &anchor.digest(id),
+                &Signature::from_bytes(&anchor.signature),
+            )
+            .is_ok()
+        });
+        if !signed {
+            return Err(AnchorRefusal::Open);
+        }
         let mut state = self.shared.state();
         let known = state.watch(anchor.space).clone();
         if !known.read {
@@ -683,8 +786,7 @@ impl VenueClient for KreivoVenue {
         if !info.holds(window) {
             return Err(AnchorRefusal::Window);
         }
-        let key = (anchor.space, window);
-        if state.queue.contains_key(&key) {
+        if self.queue.holds(&anchor.space, window) {
             return Ok(Anchored::Queued);
         }
         let clock = info.clock();
@@ -696,44 +798,35 @@ impl VenueClient for KreivoVenue {
         if now.saturating_sub(boundary) > MAX_ROOT_AGE_MS {
             return Err(AnchorRefusal::Age);
         }
-        let waiting = Waiting {
-            anchor: *anchor,
-            not_before: 0,
-        };
-        state.queue.insert(key, waiting);
-        self.shared.wake.notify_all();
+        drop(state);
+        self.queue.push(anchor);
         Ok(Anchored::Queued)
     }
 
     fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
         let id = statement.id();
         let bytes = statement.encode();
+        let space = self.shared.payer;
         if bytes.len() > MAX_STATEMENT_LEN || proof.len() > MAX_PROOF_LEN {
             let what = "a statement or proof past the venue's bounds".to_string();
-            let space = self.shared.payer;
             self.shared
                 .state()
                 .alert(Alert::Configuration { space, what });
             return Err(NotAccepted::Unjudged(Unjudged::Configuration));
         }
+        let Some(sender) = self.shared.sender.get() else {
+            return Err(NotAccepted::Unjudged(Unjudged::Unknown));
+        };
         if let Some(verdict) = self.shared.before_paying(statement, &id) {
             return verdict;
         }
         let call = Call::Submit {
-            payer: self.shared.payer.0,
+            payer: space.0,
             statement: bytes,
             proof: proof.to_vec(),
         }
         .bytes();
-        let (answer, verdict) = mpsc::channel();
-        self.shared
-            .state()
-            .submits
-            .push_back(Job { call, id, answer });
-        self.shared.wake.notify_all();
-        verdict
-            .recv()
-            .unwrap_or(Err(NotAccepted::Unjudged(Unjudged::Unknown)))
+        self.shared.send_submit(sender, &call, id)
     }
 
     fn anchored(&self, root: &RootRead) -> bool {

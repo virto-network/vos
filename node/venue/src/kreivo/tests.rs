@@ -21,8 +21,8 @@ use super::conformance::scenarios::{AUTHORITY_F, F, g7_chain};
 use super::mock::transport::{Fault, MockChain};
 use super::mock::{Account, Chain, Constants, Origin};
 use super::transport::{Included, Lost, SendError, Sent, Signed, Transport};
-use super::venue::{Fate, anchor_fate, judged};
-use super::{Alert, Build, KreivoVenue, Options, Sender, selectable};
+use super::venue::{Answer, answer, judged};
+use super::{Alert, KreivoVenue, Options, Sender, selectable};
 use crate::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
 
 const UNITS: u128 = 1_000_000_000_000;
@@ -141,7 +141,7 @@ impl Setup {
     }
 
     fn venue_over(&self, transport: Arc<dyn Transport>) -> KreivoVenue {
-        KreivoVenue::connect(transport, &[self.space], self.space, options()).unwrap()
+        KreivoVenue::over(transport, &[self.space], self.space, options())
     }
 
     /// The space's root of `window`, signed by its key.
@@ -266,6 +266,9 @@ impl Transport for Lagging {
     }
     fn nonce(&self) -> Result<u64, Lost> {
         self.inner.nonce()
+    }
+    fn chain_nonce(&self) -> Result<u64, Lost> {
+        self.inner.chain_nonce()
     }
     fn sign(&self, call: &[u8], nonce: u64) -> Result<Signed, SendError> {
         self.inner.sign(call, nonce)
@@ -489,6 +492,93 @@ fn a_lost_connection_never_sends_a_call_twice() {
     assert!(venue.alerts().is_empty(), "{:?}", venue.alerts());
 }
 
+/// An anchor whose extrinsic waits in the pool is not taken as landed by
+/// the pool's count: it stays queued, its same bytes sent again. Once the
+/// pool is included, the nonce in the chain's state says it landed and
+/// its record that it is held; one dropped from the pool goes again as the
+/// same bytes and lands once.
+#[test]
+fn a_pooled_anchor_lands_once() {
+    let setup = Setup::new(true);
+    let venue = setup.venue();
+    setup.chain.fault(Fault::Pool);
+    assert_eq!(venue.anchor(&setup.anchor(4, 1)), Ok(Anchored::Queued));
+    wait_until("its bytes are sent again", || setup.anchors_sent() >= 3);
+    assert!(!setup.anchored_window(4));
+    assert_eq!(venue.queued(), 1, "kept while it may land");
+    setup.chain.include_pool();
+    wait_until("the queue empties", || venue.queued() == 0);
+    assert!(setup.anchored_window(4));
+
+    setup.chain.fault(Fault::Pool);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    wait_until("it waits in the pool", || setup.chain.pooled() == 1);
+    setup.chain.drop_pool();
+    wait_until("window 5 lands", || setup.anchored_window(5));
+    let included = setup
+        .chain
+        .included()
+        .iter()
+        .filter(|(origin, call)| *origin == Origin::Signed(NODE) && call[..2] == [PALLET, 7])
+        .count();
+    assert_eq!(included, 2, "each included once");
+}
+
+/// A key removed after its anchor was queued: the venue refuses it
+/// (`UnknownAnchorKey`), the client alerts and keeps it, and does not send
+/// it again within the window.
+#[test]
+fn a_refused_key_keeps_the_anchor_for_a_window() {
+    let setup = Setup::new(true);
+    let venue = setup.venue();
+    setup
+        .chain
+        .with(|chain| chain.set_storage(keys::paused(), vec![2]));
+    read_again(&venue);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    let key = keys::anchor_keys(&setup.space.0, &setup.key.verifying_key().to_bytes());
+    setup.chain.with(|chain| {
+        chain.remove_storage(&key);
+        chain.set_storage(keys::paused(), vec![0]);
+    });
+    wait_until("the key refused", || setup.anchors_sent() == 1);
+    read_again(&venue);
+    std::thread::sleep(A_WHILE);
+    assert_eq!(setup.anchors_sent(), 1, "not again within the window");
+    assert_eq!(venue.queued(), 1, "kept");
+    assert!(
+        venue
+            .alerts()
+            .iter()
+            .any(|alert| matches!(alert, Alert::Configuration { .. }))
+    );
+}
+
+/// A venue whose chain cannot be reached at first: the client starts all
+/// the same, every anchor `Open`; once reached, the anchor lands.
+#[test]
+fn a_venue_reached_late_anchors_once_reached() {
+    let setup = Setup::new(true);
+    let tries = Arc::new(AtomicUsize::new(0));
+    let (chain, counted) = (Arc::clone(&setup.chain), Arc::clone(&tries));
+    let connect: super::venue::Connect = Box::new(move || {
+        if counted.fetch_add(1, Ordering::SeqCst) < 3 {
+            return Err(Lost("down".into()));
+        }
+        Ok(chain.transport(Origin::Signed(NODE)) as Arc<dyn Transport>)
+    });
+    let venue = KreivoVenue::connect(connect, &[setup.space], setup.space, options());
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Err(AnchorRefusal::Open));
+    assert_eq!(venue.status(&setup.space), Status::Unregistered);
+    wait_until("reached and read", || {
+        venue.status(&setup.space) == Status::Active
+    });
+    assert!(tries.load(Ordering::SeqCst) >= 4);
+    assert_eq!(venue.id(), VENUE);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    wait_until("window 5 lands", || setup.anchored_window(5));
+}
+
 /// A sender whose call's answer is lost, and whose era then runs out
 /// before it lands, signs it again with the same nonce: it lands once.
 #[test]
@@ -513,6 +603,9 @@ fn an_expired_send_is_signed_again_with_its_nonce() {
         }
         fn nonce(&self) -> Result<u64, Lost> {
             self.inner.nonce()
+        }
+        fn chain_nonce(&self) -> Result<u64, Lost> {
+            self.inner.chain_nonce()
         }
         fn sign(&self, call: &[u8], nonce: u64) -> Result<Signed, SendError> {
             self.signs.lock().unwrap().push(nonce);
@@ -552,13 +645,12 @@ fn an_expired_send_is_signed_again_with_its_nonce() {
 fn statements_are_judged_through_the_client() {
     let fx = Fixtures::load();
     let chain = MockChain::new(g7_chain(&fx));
-    let venue = KreivoVenue::connect(
+    let venue = KreivoVenue::over(
         chain.transport(Origin::Signed(AUTHORITY_F)),
         &[SpaceId(F)],
         SpaceId(F),
         options(),
-    )
-    .unwrap();
+    );
     let statement = fx.statement();
     let id = statement.id();
     assert_eq!(venue.submit(statement, &fx.proof), Ok(id));
@@ -599,13 +691,12 @@ fn statements_are_judged_through_the_client() {
 fn a_refused_proof_reports_its_class() {
     let fx = Fixtures::load();
     let chain = MockChain::new(g7_chain(&fx));
-    let venue = KreivoVenue::connect(
+    let venue = KreivoVenue::over(
         chain.transport(Origin::Signed(AUTHORITY_F)),
         &[SpaceId(F)],
         SpaceId(F),
         options(),
-    )
-    .unwrap();
+    );
     assert_eq!(
         venue.submit(fx.statement(), &fx.tampered),
         Err(NotAccepted::Refused(fx.tampered_code))
@@ -624,16 +715,16 @@ fn every_error_and_refusal_is_mapped() {
     for index in 0..=27 {
         let error = Error::from_index(index).unwrap();
         let expected = match error {
-            AlreadyAnchored | WindowNotAfterLast => Fate::Done,
-            WindowInFuture => Fate::Later,
-            WindowTooOld | OutOfRange => Fate::Dead(error),
-            SpaceNotActive => Fate::Inactive,
-            Paused => Fate::Paused,
-            _ => Fate::Configuration(error),
+            AlreadyAnchored | WindowNotAfterLast => Answer::Done,
+            WindowInFuture => Answer::Later,
+            WindowTooOld | OutOfRange => Answer::Dead(error),
+            SpaceNotActive | Paused => Answer::Wait,
+            InsufficientSovereignBalance | OverBudget => Answer::Funding(error),
+            _ => Answer::Configuration,
         };
-        assert_eq!(anchor_fate(Some(error)), expected, "{error:?}");
+        assert_eq!(answer(Some(error)), expected, "{error:?}");
     }
-    assert_eq!(anchor_fate(None), Fate::Unexpected);
+    assert_eq!(answer(None), Answer::Configuration);
     let id = vos_statement::StatementId([7; 32]);
     let refused = |code| Event::Refused {
         payer: [0; 32],
@@ -658,15 +749,9 @@ fn every_error_and_refusal_is_mapped() {
     assert_eq!(judged(&[], id), None);
 }
 
-/// A production build refuses to select Kreivo until its pallet meets
-/// the vectors; a test or development build may.
+/// A build reaches Kreivo only with the `kreivo-unvetted` feature, until
+/// its pallet meets the vectors.
 #[test]
-fn a_production_build_refuses_kreivo() {
-    assert!(selectable(Build::Production).is_err());
-    assert_eq!(selectable(Build::Dev), Ok(()));
-    assert_eq!(
-        Build::current(),
-        Build::Dev,
-        "tests build with debug assertions"
-    );
+fn only_an_unvetted_build_reaches_kreivo() {
+    assert_eq!(selectable().is_ok(), cfg!(feature = "kreivo-unvetted"));
 }

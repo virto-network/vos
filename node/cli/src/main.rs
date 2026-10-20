@@ -95,16 +95,30 @@ impl NodeCommand {
                 Ok(())
             }
             #[cfg(feature = "kreivo")]
-            NodeCommand::VenueAccount { data } => {
-                let seed = vos_node::venue_account(&data)?;
-                let account = venue::account_of(&seed)?;
-                eprintln!(
-                    "vos: the node's account at Kreivo: have the space's controller register it \
-                     as an authority, paired with the node's anchor key"
-                );
-                println!("{}", hex::encode(account));
-                Ok(())
-            }
+            NodeCommand::VenueAccount { command } => match command {
+                args::VenueAccountCommand::Show { data } => {
+                    let seed = vos_node::venue_account(&data)?;
+                    eprintln!(
+                        "vos: the node's account at Kreivo: have the space's controller register \
+                         it as an authority, paired with the node's anchor key"
+                    );
+                    println!("{}", hex::encode(venue::account_of(&seed)?));
+                    Ok(())
+                }
+                args::VenueAccountCommand::Rotate { data } => {
+                    let (old, new) = vos_node::rotate_venue_account(&data)?;
+                    if let Some(old) = old {
+                        println!("old {}", hex::encode(venue::account_of(&old)?));
+                    }
+                    println!("new {}", hex::encode(venue::account_of(&new)?));
+                    eprintln!(
+                        "vos: the node signs as the new account from its next start: have the \
+                         controller remove the old authority, then add the new paired with the \
+                         node's anchor key; the node anchors nothing between the two"
+                    );
+                    Ok(())
+                }
+            },
             NodeCommand::AnchorKey {
                 command: AnchorKeyCommand::Rotate { data },
             } => {

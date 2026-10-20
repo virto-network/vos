@@ -509,6 +509,7 @@ impl VenueClient for ModelVenue {
 }
 
 pub mod kreivo;
+pub mod queue;
 
 pub use vos_statement;
 #[cfg(test)]

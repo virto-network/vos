@@ -3005,3 +3005,56 @@ On `vos-core` (from `56ab4860`).
   8 jobs). `just check` now also runs `clippy-kreivo`: `vos-venue` and
   `vos-cli` with `kreivo` and `mock` linted, and the envelope's tests;
   `doc-check` documents `vos-venue` with both features.
+- **The review** (Opus, `6.17b-review.md`): REVISE, every finding folded:
+  - **H1:** `Sent::Landed` was read from `system_accountNextIndex`, which
+    counts the pool: `Transport::chain_nonce` reads `System.Account`'s
+    nonce at the best block for the landed check, the pool's count signs
+    only; an anchor landed whose record is not read stays queued, its
+    record read before it goes again; the mock has a pool (`nonce` counts
+    it, `chain_nonce` does not; `Fault::Pool`, `include_pool`,
+    `drop_pool`), and `a_pooled_anchor_lands_once` shows it kept, landed
+    once included, and sent again once dropped;
+  - **H2:** the chain transport is subxt-rpcs' reconnecting client (a
+    first connection given 30 s); a watch reads the best block every 6 s
+    of silence and gives up once the era has ended, so the `Sender`
+    reads the nonce again; `KreivoVenue::connect` takes a `Connect` that
+    the reader thread calls until Kreivo is reached, every anchor `Open`
+    until then, so a node starts while Kreivo is down
+    (`a_venue_reached_late_anchors_once_reached`); `KreivoVenue::over`
+    takes a transport made already;
+  - **M3:** an anchor is dropped only when the venue holds it or a later
+    window (14, 15, or a `Last` past it), on an equivocation, or for good
+    (17, 18, `MaxRootAge`); 21 and 27 a funding alert, kept; 7 and 11–13,
+    and any other, an alert and again a window later
+    (`a_refused_key_keeps_the_anchor_for_a_window`); the pool's other
+    refusals an alert and again after 30 s; "bad signature" and "ancient
+    birth block" read as stale, and the mock refuses an extrinsic past
+    its era as stale;
+  - **M4:** the replay asserts what each call Ok means from its own
+    arguments: a registration's `SpaceInfo` (sovereign, controller, the
+    genesis's clock, start, registration time) and `SpaceRegistered`; an
+    anchor's `Anchored`, record (root, signer, time) and `Last`, or its
+    equivocation; a submit's payer; an authority's paired key; a budget;
+    every `Spend` at the window of its time. Swapping `SpaceInfo`'s
+    `origin_ms` and `length_ms` in the client fails it at G1;
+  - **L5 and the JAM merge:** the queue is `vos_venue::queue::AnchorQueue`
+    over an `AnchorSend` (`Fate::{Done, Dead, Again(after)}`), its worker
+    sending each space's first anchor in window order, so JAM's client
+    puts its blocking `land` behind it;
+  - **L6:** `selectable` is the `kreivo-unvetted` feature, not
+    `debug_assertions`, asked by `ChainTransport::connect` itself; `vos`
+    has it as `kreivo-unvetted`, the dev chain's example requires it, and
+    `just check`'s `clippy-kreivo` lints with it; it goes once M3b's
+    deferred gates 1 and 2 pass;
+  - **L7:** the seeds are `Zeroizing` (the store's rows, `AccountSeed`,
+    `chain::keypair`'s copy); the accounts are numbered rows,
+    `vos node venue-account show|rotate`, a rotation keeping the old and
+    printing both, the order (remove the old authority, then add the new
+    with the anchor key) and its gap documented; the chain transport takes
+    `wss://`, or `ws://` on this host only;
+  - **L8:** each space's first anchor goes apart: one space's wait holds
+    back only its own windows;
+  - **the flake:** `Cluster::increments` follows the agent's leader on
+    `NotLeader`, as `increment_at_leader` does, for its 14 callers.
+- **On the dev chain again** [measured]: the same checks pass through the
+  reconnecting transport.

@@ -132,8 +132,7 @@ impl Kreivo {
                     ..Options::default()
                 };
                 let transport = chain.transport(Origin::Signed(account));
-                let inner = KreivoVenue::connect(transport, &[space], space, options)
-                    .map_err(|lost| lost.0)?;
+                let inner = KreivoVenue::over(transport, &[space], space, options);
                 let watched = Arc::new(Watched {
                     inner,
                     anchors: AtomicUsize::new(0),

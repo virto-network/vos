@@ -27,6 +27,7 @@ mod tuning;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
+use zeroize::Zeroizing;
 
 use fjall::{Database, Keyspace, KeyspaceCreateOptions, Readable};
 use vos_wire::Decode;
@@ -276,13 +277,26 @@ impl Fjall {
             .and_then(|seed| seed[..].try_into().ok()))
     }
 
-    /// The seed of the node's own account key at its space's venue, once
-    /// made: secret, never served, never its node key or an anchor key.
-    pub fn venue_account_secret(&self) -> Result<Option<[u8; 32]>> {
-        Ok(self
-            .system()
-            .get(node_record(NodeRow::VenueAccount, &[]))?
-            .and_then(|seed| seed[..].try_into().ok()))
+    /// The node's own account keys at its space's venue, by number,
+    /// oldest first: each seed, secret and never served, never its node
+    /// key or an anchor key; an unreadable row's number with none. The node
+    /// signs as the newest; a rotation adds one past the last number.
+    pub fn venue_account_secrets(&self) -> Result<Vec<(u64, Option<Zeroizing<[u8; 32]>>)>> {
+        let prefix = node_record(NodeRow::VenueAccount, &[]);
+        let mut seeds = Vec::new();
+        for row in self.system().prefix(&prefix) {
+            let (key, seed) = row.into_inner()?;
+            let Some(number) = key.get(prefix.len()..).and_then(be_u64) else {
+                tracing::error!("a venue account's row is misnamed; it is not used");
+                continue;
+            };
+            let seed = <[u8; 32]>::try_from(&seed[..]).ok().map(Zeroizing::new);
+            if seed.is_none() {
+                tracing::error!(number, "an unreadable venue account; it is not used");
+            }
+            seeds.push((number, seed));
+        }
+        Ok(seeds)
     }
 
     /// The anchor keys the node made past its first, its node key's, by

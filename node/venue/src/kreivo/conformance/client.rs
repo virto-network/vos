@@ -4,16 +4,21 @@
 //! by the client: the result from its decode of the dispatch error, the
 //! events from its decode of the pallet's, and every storage write as the
 //! client reads it, its key rebuilt by the client's key builders and its
-//! value decoded as the client's type of the item.
+//! value decoded as the client's type of the item; and what each call Ok
+//! means, read from its own arguments (a registration's space, an anchor's
+//! record, a submit's payer, a window's spend), so two fields of one type
+//! swapped in the client's types do not pass.
 
 use std::time::Duration;
 
 use parity_scale_codec::{Decode, Encode};
 
 use super::{Entry, File, Fixtures, ResultJson, SPACES, assemble, directory, hex, load, unhex};
+use vos_anchor::SpaceGenesis;
+
 use crate::kreivo::calls::{
-    self, Active, AnchorRecord, AuthorityInfo, Evidence, Failure, PALLET, ProgramInfo, RuntimeCall,
-    SpaceInfo, Spend, keys,
+    self, Active, AnchorRecord, AuthorityInfo, Call, Event, Evidence, Failure, PALLET, ProgramInfo,
+    RuntimeCall, SpaceInfo, Spend, keys,
 };
 use crate::kreivo::mock::Constants;
 use crate::kreivo::mock::transport::{MockChain, MockTransport};
@@ -120,6 +125,118 @@ fn read_back(transport: &MockTransport, entry: &Entry, at: &str) {
     }
 }
 
+/// The value at `key` as the client reads it, as `T`.
+fn read_as<T: Decode>(transport: &dyn Transport, key: &[u8], at: &str) -> T {
+    let bytes = transport.storage(key).unwrap();
+    calls::read(&bytes.unwrap_or_else(|| panic!("{at}: nothing at {}", hex(key))))
+        .unwrap_or_else(|| panic!("{at}: {} does not decode", hex(key)))
+}
+
+/// What a call Ok did, as the client reads it, from the call's own
+/// arguments: no two fields of one type swapped passes.
+fn means(transport: &dyn Transport, call: &Call, events: &[Event], now_ms: u64, at: &str) {
+    match call {
+        Call::Register {
+            genesis,
+            controller,
+            start_window,
+            ..
+        } => {
+            let genesis = SpaceGenesis::decode(genesis).expect("a registered genesis");
+            let space = vos_anchor::space_id(&genesis);
+            let info: SpaceInfo = read_as(transport, &keys::spaces(&space.0), at);
+            let sovereign = calls::sovereign(&space);
+            assert_eq!(info.sovereign, sovereign, "{at}: the sovereign");
+            assert_eq!(info.controller, *controller, "{at}: the controller");
+            assert_eq!(info.origin_ms, genesis.clock.origin_ms, "{at}: the origin");
+            assert_eq!(info.length_ms, genesis.clock.length_ms, "{at}: the length");
+            assert_eq!(info.start_window, *start_window, "{at}: the start");
+            assert_eq!(info.registered_ms, now_ms, "{at}: registered at");
+            assert_eq!(info.end_window, None, "{at}");
+            assert!(
+                events.contains(&Event::SpaceRegistered {
+                    space: space.0,
+                    sovereign,
+                    controller: *controller,
+                    origin_ms: genesis.clock.origin_ms,
+                    length_ms: genesis.clock.length_ms,
+                    start_window: *start_window,
+                }),
+                "{at}: SpaceRegistered"
+            );
+        }
+        Call::Anchor { anchor } => {
+            let anchored = Event::Anchored {
+                space: anchor.space,
+                kind: anchor.kind,
+                window: anchor.window,
+                root: anchor.root,
+            };
+            if events.contains(&anchored) {
+                let key = keys::anchors(&anchor.space, anchor.kind, anchor.window);
+                let record: AnchorRecord = read_as(transport, &key, at);
+                assert_eq!(record.root, anchor.root, "{at}: the root");
+                assert_eq!(record.signer, anchor.signer, "{at}: the signer");
+                assert_eq!(record.at_ms, now_ms, "{at}: anchored at");
+                let last: u64 = read_as(transport, &keys::last(&anchor.space, anchor.kind), at);
+                assert_eq!(last, anchor.window, "{at}: Last");
+            } else {
+                assert!(
+                    events.iter().any(
+                        |event| matches!(event, Event::Equivocated { space, window, .. }
+                            if *space == anchor.space && *window == anchor.window)
+                    ),
+                    "{at}: an anchor Ok is anchored or equivocates"
+                );
+            }
+        }
+        Call::Submit { payer, .. } => {
+            for event in events {
+                if let Event::Accepted { payer: of, .. } | Event::Refused { payer: of, .. } = event
+                {
+                    assert_eq!(of, payer, "{at}: the payer");
+                }
+            }
+        }
+        Call::AddAuthority {
+            space,
+            who,
+            anchor_key,
+        } => {
+            let info: AuthorityInfo = read_as(transport, &keys::authorities(space, who), at);
+            assert_eq!(info.anchor_key, *anchor_key, "{at}: the paired key");
+        }
+        Call::SetBudget {
+            space,
+            max_spend_per_window,
+        } => {
+            let info: SpaceInfo = read_as(transport, &keys::spaces(space), at);
+            assert_eq!(info.max_spend_per_window, *max_spend_per_window, "{at}");
+        }
+        _ => {}
+    }
+}
+
+/// Every `Budget` written is the window's by the venue's time, through the
+/// space's clock.
+fn spends(transport: &dyn Transport, written: &[Entry], now_ms: u64, at: &str) {
+    let prefix = keys::plain("Spaces", "Budget");
+    for entry in written {
+        let key = unhex(&entry.key);
+        let (true, Some(value)) = (key.starts_with(&prefix), &entry.value) else {
+            continue;
+        };
+        let space: [u8; 32] = array(&key, 32);
+        let spend: Spend = calls::read(&unhex(value)).expect("a spend");
+        let info: SpaceInfo = read_as(transport, &keys::spaces(&space), at);
+        assert_eq!(
+            Some(spend.window),
+            info.clock().window(now_ms),
+            "{at}: the spend's window"
+        );
+    }
+}
+
 /// Every vector, its calls sent through the client over a fresh mock in
 /// the vector's pre-state, does what it says as the client reads it.
 #[test]
@@ -153,15 +270,17 @@ fn the_client_passes_every_vector() {
             }
             let transport = chain.transport(origin.into());
             let sender = Sender::new(transport.clone(), Duration::from_millis(1));
+            let mut events = Vec::new();
             let result = match sender.call(&bytes) {
                 Ok(Sent::Included(outcome)) => {
+                    events.clone_from(&outcome.events);
                     assert!(outcome.unread.is_empty(), "{at}: {:?}", outcome.unread);
-                    let events: Vec<String> = outcome
+                    let encoded: Vec<String> = outcome
                         .events
                         .iter()
                         .map(|event| hex(&event.encode()))
                         .collect();
-                    assert_eq!(events, step.events, "{at}: the events");
+                    assert_eq!(encoded, step.events, "{at}: the events");
                     result_of(outcome.failure)
                 }
                 Err(Unsent::Invalid(Invalid::Payment)) => ResultJson::InvalidPayment,
@@ -172,6 +291,10 @@ fn the_client_passes_every_vector() {
             step.storage
                 .iter()
                 .for_each(|entry| read_back(&transport, entry, &at));
+            if let (Some(RuntimeCall::Spaces(call)), ResultJson::Ok) = (&decoded, result) {
+                means(&*transport, call, &events, step.now_ms, &at);
+            }
+            spends(&*transport, &step.storage, step.now_ms, &at);
             calls += 1;
         }
     }

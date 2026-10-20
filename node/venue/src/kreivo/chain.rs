@@ -19,6 +19,8 @@
 //!   that index.
 //! - **Reads** are raw storage at the best block.
 
+use std::time::Duration;
+
 use subxt::config::transaction_extensions::{
     ChargeAssetTxPayment, ChargeAssetTxPaymentParams, CheckGenesis, CheckMortality,
     CheckMortalityParams, CheckNonce, CheckNonceParams, CheckSpecVersion, CheckTxVersion,
@@ -32,6 +34,7 @@ use subxt::ext::frame_decode::extrinsics::{
 };
 use subxt::ext::scale_encode::{EncodeAsFields, FieldIter, TypeResolver};
 use subxt::ext::scale_value::Value;
+use subxt::rpcs::client::ReconnectingRpcClient;
 use subxt::rpcs::methods::legacy::{LegacyRpcMethods, TransactionStatus};
 use subxt::rpcs::{Error as RpcError, RpcClient};
 use subxt::tx::Payload;
@@ -46,6 +49,32 @@ use super::transport::{Included, Invalid, Lost, SendError, Signed, Transport};
 const ERA: u64 = 64;
 /// The most keys one read of a prefix asks for.
 const PAGE: u32 = 512;
+/// How long a first connection may take.
+const CONNECT: Duration = Duration::from_secs(30);
+/// How often a watch that hears nothing reads the best block, to give up
+/// on an extrinsic past its era.
+const WATCH: Duration = Duration::from_secs(6);
+
+/// Whether `url` keeps the node's traffic private: `wss://`, or `ws://`
+/// to this host.
+fn secure(url: &str) -> Result<(), Lost> {
+    if url.starts_with("wss://") {
+        return Ok(());
+    }
+    let host = url
+        .strip_prefix("ws://")
+        .map(|rest| rest.split(['/', '?']).next().unwrap_or(""))
+        .map(|authority| match authority.strip_prefix('[') {
+            Some(v6) => v6.split(']').next().unwrap_or(""),
+            None => authority.split(':').next().unwrap_or(""),
+        });
+    match host {
+        Some("localhost" | "127.0.0.1" | "::1") => Ok(()),
+        _ => Err(Lost(format!(
+            "{url}: Kreivo is reached over `wss://`, or `ws://` on this host only"
+        ))),
+    }
+}
 
 /// Kreivo's transaction extensions, in the order its runtime declares
 /// them (6.0e, Kreivo 87f8728, spec 134). `ChargeAssetTxPayment` is the
@@ -259,7 +288,8 @@ fn lost(error: impl std::fmt::Display) -> Lost {
 
 /// The account of an sr25519 key whose 32-byte mini secret is `seed`.
 pub fn keypair(seed: &[u8; 32]) -> Result<Keypair, String> {
-    Keypair::from_secret_key(*seed).map_err(|error| error.to_string())
+    let secret = zeroize::Zeroizing::new(*seed);
+    Keypair::from_secret_key(*secret).map_err(|error| error.to_string())
 }
 
 /// The key a secret URI names: a dev key (`//Alice`), a phrase with its
@@ -275,9 +305,13 @@ pub fn account(signer: &Keypair) -> AccountId {
 }
 
 impl ChainTransport {
-    /// Connect to the node at `url` (`ws://` or `wss://`), signing with
-    /// `signer`.
+    /// Connect to the node at `url`, signing with `signer`: `wss://`, or
+    /// `ws://` on this host only. The connection is made again whenever it
+    /// drops. Refused unless this build may select Kreivo
+    /// ([`super::selectable`]).
     pub fn connect(url: &str, signer: Keypair) -> Result<Self, Lost> {
+        super::selectable().map_err(Lost)?;
+        secure(url)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .thread_name("kreivo-rpc")
@@ -285,7 +319,14 @@ impl ChainTransport {
             .build()
             .map_err(lost)?;
         let (client, rpc) = runtime.block_on(async {
-            let rpc = RpcClient::from_insecure_url(url).await.map_err(lost)?;
+            let reconnecting = tokio::time::timeout(
+                CONNECT,
+                ReconnectingRpcClient::builder().build(url.to_string()),
+            )
+            .await
+            .map_err(|_| lost(format!("{url}: not reached in {CONNECT:?}")))?
+            .map_err(lost)?;
+            let rpc = RpcClient::new(reconnecting);
             let client =
                 OnlineClient::from_rpc_client_with_config(KreivoConfig::default(), rpc.clone())
                     .await
@@ -364,7 +405,19 @@ impl ChainTransport {
             .await
             .map_err(refused)?;
         let hash = loop {
-            match progress.next().await {
+            let Ok(next) = tokio::time::timeout(WATCH, progress.next()).await else {
+                let best = self
+                    .rpc
+                    .chain_get_header(None)
+                    .await
+                    .map_err(lost)?
+                    .map(|header| header.number());
+                if best.is_some_and(|best| best > signed.until) {
+                    return Err(lost("its era ended unincluded").into());
+                }
+                continue;
+            };
+            match next {
                 Some(Ok(TransactionStatus::InBlock(hash) | TransactionStatus::Finalized(hash))) => {
                     break hash;
                 }
@@ -433,7 +486,12 @@ fn refused(error: RpcError) -> SendError {
         .unwrap_or_default();
     let invalid = match error.code {
         1010 if data.contains("pay") => Invalid::Payment,
-        1010 if data.contains("outdated") || data.contains("stale") => Invalid::Stale,
+        1010 if ["outdated", "stale", "bad signature", "ancient birth block"]
+            .iter()
+            .any(|said| data.contains(said)) =>
+        {
+            Invalid::Stale
+        }
         1010 if data.contains("future") => Invalid::Future,
         1010 if data.contains("decode") || data.contains("call") => Invalid::Call,
         1010 => Invalid::Other(format!("{}: {data}", error.message)),
@@ -468,6 +526,13 @@ impl Transport for ChainTransport {
         self.runtime
             .block_on(self.rpc.system_account_next_index(&account))
             .map_err(lost)
+    }
+
+    fn chain_nonce(&self) -> Result<u64, Lost> {
+        let info = self.storage(&super::calls::keys::account(&account(&self.signer)))?;
+        Ok(info
+            .and_then(|bytes| super::calls::read::<super::calls::AccountInfo>(&bytes))
+            .map_or(0, |info| info.nonce.into()))
     }
 
     fn sign(&self, call: &[u8], nonce: u64) -> Result<Signed, SendError> {
@@ -528,6 +593,27 @@ mod tests {
             .chain(["CheckMetadataHash"])
             .collect();
         assert!(known_extensions(&added).is_err());
+    }
+
+    /// Kreivo is reached over `wss://`, or `ws://` on this host only.
+    #[test]
+    fn a_remote_node_is_reached_over_tls() {
+        for url in [
+            "wss://kreivo.io",
+            "ws://127.0.0.1:9944",
+            "ws://localhost",
+            "ws://[::1]:9944/",
+        ] {
+            assert!(secure(url).is_ok(), "{url}");
+        }
+        for url in [
+            "ws://kreivo.io:9944",
+            "ws://10.0.0.1",
+            "http://127.0.0.1",
+            "ws://127.0.0.1.evil",
+        ] {
+            assert!(secure(url).is_err(), "{url}");
+        }
     }
 
     /// A dev key's account is its sr25519 public key.

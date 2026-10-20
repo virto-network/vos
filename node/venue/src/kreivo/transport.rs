@@ -2,7 +2,9 @@
 //! there ([`Sender`]): signed once with the signer's next nonce, sent, and
 //! followed to inclusion; after a lost connection, or the pool calling it
 //! stale, sent again as the same bytes, never re-signed with another nonce
-//! while the first may still land, so a call is included at most once.
+//! while the first may still land, so a call is included at most once. It
+//! is taken as landed only once the signer's nonce in the best block's
+//! state passes it, never by the pool's count.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -76,8 +78,12 @@ pub trait Transport: Send + Sync {
     fn genesis(&self) -> Result<[u8; 32], Lost>;
     /// The best block's number.
     fn best(&self) -> Result<u64, Lost>;
-    /// The signer's next nonce at the best block.
+    /// The signer's next nonce to sign with: the best block's, past the
+    /// signer's extrinsics in the pool.
     fn nonce(&self) -> Result<u64, Lost>;
+    /// The signer's nonce in the best block's state (`System.Account`): past
+    /// an extrinsic's only once one of that nonce is included.
+    fn chain_nonce(&self) -> Result<u64, Lost>;
     /// `call`'s bytes signed with `nonce`, the envelope the chain's.
     fn sign(&self, call: &[u8], nonce: u64) -> Result<Signed, SendError>;
     /// Send `signed` and follow it until the best chain includes it.
@@ -158,6 +164,8 @@ pub enum Unsent {
 /// Sends calls for one signer, one at a time.
 pub struct Sender {
     transport: Arc<dyn Transport>,
+    /// Held across a call: the signer's nonces go one call at a time.
+    calling: std::sync::Mutex<()>,
     /// The first wait after a lost connection, doubled up to 32 times it.
     backoff: Duration,
     stopping: Arc<AtomicBool>,
@@ -167,6 +175,7 @@ impl Sender {
     pub fn new(transport: Arc<dyn Transport>, backoff: Duration) -> Self {
         Self {
             transport,
+            calling: std::sync::Mutex::new(()),
             backoff,
             stopping: Arc::new(AtomicBool::new(false)),
         }
@@ -223,10 +232,15 @@ impl Sender {
 
     /// Send `call` (its pinned bytes) signed by this signer, and follow it
     /// until it is included or refused. After a lost answer, or a stale
-    /// nonce, it reads the signer's nonce: past the call's, it landed;
-    /// otherwise the same bytes go again, signed anew with the same nonce
-    /// only once their era has ended, when they can no longer land.
+    /// nonce, it reads the signer's nonce in the best block's state: past
+    /// the call's, it landed; otherwise the same bytes go again, signed
+    /// anew with the same nonce only once their era has ended, when they
+    /// can no longer land. Calls go one at a time.
     pub fn call(&self, call: &[u8]) -> Result<Sent, Unsent> {
+        let _calling = self
+            .calling
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let nonce = self.retry(|| self.transport.nonce())?;
         let mut signed = self.sign(call, nonce)?;
         let mut wait = self.backoff;
@@ -243,7 +257,7 @@ impl Sender {
             }
             std::thread::sleep(wait);
             wait = (wait * 2).min(self.backoff * 32);
-            if self.retry(|| self.transport.nonce())? > nonce {
+            if self.retry(|| self.transport.chain_nonce())? > nonce {
                 return Ok(Sent::Landed);
             }
             if self.retry(|| self.transport.best())? > signed.until {

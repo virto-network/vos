@@ -116,7 +116,7 @@ fmt-check:
 # item.
 doc-check:
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc --workspace --no-deps --quiet }
-    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue --features kreivo,mock --no-deps --quiet }
+    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue --features kreivo-unvetted,mock --no-deps --quiet }
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
@@ -129,8 +129,8 @@ clippy:
 # The Kreivo client's chain transport, behind the `kreivo` feature: it
 # builds, lints clean, and its envelope's checks pass.
 clippy-kreivo:
-    cargo clippy -p vos-venue -p vos-cli --features vos-venue/kreivo,vos-venue/mock,vos-cli/kreivo --all-targets --quiet -- -D warnings
-    cargo test -p vos-venue --features kreivo --lib kreivo::chain
+    cargo clippy -p vos-venue -p vos-cli --features vos-venue/mock,vos-cli/kreivo-unvetted --all-targets --quiet -- -D warnings
+    cargo test -p vos-venue --features kreivo --lib kreivo::
 
 # Fails on any JAR remnant in the PVM crates: its ISA and gas modes, opcodes,
 # exits, capability surface, linker entry points, invocation kernel, CSR
