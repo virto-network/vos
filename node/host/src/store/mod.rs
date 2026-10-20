@@ -123,6 +123,9 @@ struct Partitions {
     blobs: Keyspace,
 }
 
+/// A key's 32-byte seed, zeroed when dropped.
+pub type Secret = Zeroizing<[u8; 32]>;
+
 impl Fjall {
     /// Open the store at `path`. Everything it will recover is synced
     /// first: rows a crashed process left in the page cache could otherwise
@@ -281,7 +284,7 @@ impl Fjall {
     /// oldest first: each seed, secret and never served, never its node
     /// key or an anchor key; an unreadable row's number with none. The node
     /// signs as the newest; a rotation adds one past the last number.
-    pub fn venue_account_secrets(&self) -> Result<Vec<(u64, Option<Zeroizing<[u8; 32]>>)>> {
+    pub fn venue_account_secrets(&self) -> Result<Vec<(u64, Option<Secret>)>> {
         let prefix = node_record(NodeRow::VenueAccount, &[]);
         let mut seeds = Vec::new();
         for row in self.system().prefix(&prefix) {
