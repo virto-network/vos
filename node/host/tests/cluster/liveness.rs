@@ -90,8 +90,7 @@ fn idle_groups_send_nothing_but_the_pair_heartbeat() {
     }
     assert!(quiet, "the groups never went quiet");
     let terms_before = terms(&cluster, &agents);
-    let leader = cluster.leader(agents[0]);
-    assert_eq!(done(cluster.increment(leader, agents[0], 1, 4)), 4);
+    assert_eq!(done(cluster.increment_at_leader(agents[0], 1, 4)), 4);
     assert_eq!(terms(&cluster, &agents), terms_before);
 }
 
@@ -118,7 +117,8 @@ fn quiet_groups_elect_again_when_their_leaders_node_stops() {
         "{} groups led by node {gone} elected again within {took:?}",
         led[usize::from(gone)]
     );
-    assert!(took < Duration::from_secs(5), "{took:?}");
+    // A few elections of one to two seconds, on a loaded host too.
+    assert!(took < Duration::from_secs(10), "{took:?}");
     // Back, its new run is heard, and every group goes quiet again with
     // no term moving.
     cluster.start(gone);
@@ -204,8 +204,8 @@ fn a_restarted_follower_catches_up_its_quiet_groups() {
         .filter(|(_, leader)| *leader != follower)
         .collect();
     cluster.stop(follower);
-    for &(agent, leader) in &led {
-        assert_eq!(done(cluster.increment(leader, agent, 1, 2)), 2);
+    for &(agent, _) in &led {
+        assert_eq!(done(cluster.increment_at_leader(agent, 1, 2)), 2);
     }
     cluster.start(follower);
     for &(agent, _) in &led {
@@ -232,8 +232,7 @@ fn a_flaky_then_cut_link_moves_no_term() {
     cluster.hub.heal();
     std::thread::sleep(Duration::from_millis(1_000));
     assert_eq!(terms(&cluster, &agents), before);
-    let leader = cluster.leader(agents[0]);
-    assert_eq!(done(cluster.increment(leader, agents[0], 1, 7)), 7);
+    assert_eq!(done(cluster.increment_at_leader(agents[0], 1, 7)), 7);
 }
 
 /// A node whose writer stalls stops being vouched for: the quiet groups
@@ -322,6 +321,5 @@ fn an_install_at_a_stalled_leader_times_out() {
             smol::block_on(leader.install(agent, COUNTER, &cluster.programs.counter_elf, vec![]));
         installed.ran()
     });
-    let leader = cluster.leader(agent);
-    assert_eq!(done(cluster.increment(leader, agent, 1, 2)), 2);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, 2)), 2);
 }

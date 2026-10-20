@@ -109,7 +109,11 @@ impl Node {
             .unwrap_or(1);
         let settings = Settings::of(&config);
         let inner = Arc::new(Inner {
-            storage: StorageThread::spawn(store.clone(), Arc::clone(&config.hooks)),
+            storage: StorageThread::spawn_with(
+                store.clone(),
+                Arc::clone(&config.hooks),
+                config.writer_stall,
+            ),
             store,
             machines: Machines {
                 program: Arc::new(program),

@@ -83,6 +83,9 @@ pub struct Config {
     pub election_timeout_ms: (u64, u64),
     /// How often a group's leader sends heartbeats, in milliseconds.
     pub heartbeat_ms: u64,
+    /// How long the node's oldest pending commit may wait before its
+    /// writer counts as stalled, and the groups it leads hand over.
+    pub writer_stall: Duration,
     /// How long a call or an admin command, once queued at the leader,
     /// waits for its answer before it answers that it may have run.
     pub answered: Duration,
@@ -161,6 +164,7 @@ impl Config {
             peers: Peers::Quic,
             election_timeout_ms: (1500, 3000),
             heartbeat_ms: 500,
+            writer_stall: crate::storage::STALL_AFTER,
             answered: Duration::from_secs(30),
             resend_round: Duration::from_secs(1),
             compact_every: 1024,

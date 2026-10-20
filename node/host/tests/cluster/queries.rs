@@ -23,7 +23,7 @@ fn a_linearizable_method_reads_a_write_its_follower_has_not_applied() {
     let (cluster, gates) = Cluster::with_hooks::<Gate>(3);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     cluster.converged(agent);
-    let (leader, follower) = cluster.leader_and_follower(agent);
+    let (_, follower) = cluster.leader_and_follower(agent);
     let address = cluster
         .node(follower)
         .serve("127.0.0.1:0".parse().unwrap())
@@ -41,7 +41,7 @@ fn a_linearizable_method_reads_a_write_its_follower_has_not_applied() {
     };
 
     let closed = gates[usize::from(follower) - 1].close();
-    assert_eq!(done(cluster.increment(leader, agent, 1, 5)), 5);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, 5)), 5);
     let stale = post_within(&target, &path, &query("value"), QUERY_ANSWERED).unwrap();
     assert_eq!(stale.total(), Some(0), "{stale:?}");
     std::thread::scope(|scope| {

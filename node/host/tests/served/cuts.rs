@@ -1,9 +1,11 @@
-//! The checker's exactly-once run with window cuts: windows of two seconds,
-//! so a run crosses dozens of boundaries through its failures (leaders
-//! stopped, nodes cut off, clocks jumping, snapshots installed), with a
-//! writer at each agent rewriting rows of the reader's committed map, and
-//! a reader starting workflows that read sixteen of them at their window's
-//! cut ([`vos_wire::abi::Op::AttestAt`]). The space's representative,
+//! The checker's exactly-once run with window cuts: windows of four
+//! seconds, so a run crosses a dozen boundaries or more through its
+//! failures (leaders stopped, nodes cut off, clocks jumping, snapshots
+//! installed), and a read's three windows to be served outlast what a
+//! loaded host adds to a window's close; with a writer at each agent
+//! rewriting rows of the reader's committed map, and a reader starting
+//! workflows that read sixteen of them at their window's cut
+//! ([`vos_wire::abi::Op::AttestAt`]). The space's representative,
 //! replicated on the three nodes, closes each window at `B_w + D`, 400 ms
 //! here: each read is served by its leader once its window is closed, or
 //! at the next window its read was re-cut to.
@@ -43,10 +45,10 @@ use crate::exactly_once::{Alongside, exactly_once};
 use crate::harness::{Cluster, NODES};
 use vos_checker::rounds::Rounds;
 
-/// Windows of two seconds: no venue registers them, and none is asked to.
+/// Windows of four seconds: no venue registers them, and none is asked to.
 const CLOCK: WindowClock = WindowClock {
     origin_ms: 0,
-    length_ms: 2_000,
+    length_ms: 4_000,
 };
 /// The writers' keys in the reader's committed map.
 const KEYS: u64 = 200;
@@ -360,7 +362,7 @@ fn replicated(snapshot: &Snapshot, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
 }
 
 /// Once every replica applies as far as the others and has built every
-/// cut and its latest version: the same cuts, through dozens of windows,
+/// cut and its latest version: the same cuts, through a dozen windows or more,
 /// those of the last `CUT_KEEP` kept alone, and the same
 /// replicated rows; the same roots at the two latest cuts; no undo row, no
 /// pending request and no request's proof left, every read answered.

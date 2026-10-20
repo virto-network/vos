@@ -189,7 +189,12 @@ impl Cluster {
         config.space = Some(self.space.clone());
         config.venue = Some(self.venue.clone());
         config.peers = Peers::Hub(self.hub.clone());
-        config.election_timeout_ms = (40, 80);
+        // Slow enough that a host starved for a moment moves no leader a
+        // test holds still; the faults move them.
+        config.election_timeout_ms = (1_000, 2_000);
+        // Every node's store shares the host's one disk, whose syncs a
+        // loaded host holds for seconds at a time.
+        config.writer_stall = Duration::from_secs(5);
         config.heartbeat_ms = 10;
         // Logs compacted every few dozen entries: a node that comes back
         // catches up by a snapshot.

@@ -16,12 +16,12 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use vos_checker::programs::{actor, method, package, table_tag};
 use vos_node::roots::{self, AgentStore, CutProof, ReadRow};
 use vos_node::store::EntryKind;
-use vos_node::{CallError, Node, Reply};
+use vos_node::{Node, Reply};
 use vos_tree::{Blake2b, Hash, NodeStore};
 use vos_venue::VenueClient;
 use vos_wire::batch::Request;
@@ -42,13 +42,6 @@ pub(crate) fn clock() -> WindowClock {
         origin_ms: vos_node::wall_clock() - 60_000,
         length_ms: MAX_LENGTH_MS,
     }
-}
-
-/// Each node's clock as the cluster sets it: the wall's, its few
-/// milliseconds of skew, and its offset.
-pub(crate) fn clock_of(cluster: &Cluster, number: NodeNumber) -> u64 {
-    let offset = cluster.offsets[usize::from(number) - 1].load(Ordering::SeqCst);
-    (vos_node::wall_clock() + u64::from(number) * 7).saturating_add_signed(offset)
 }
 
 /// Set node `number`'s clock to read `at` about now.
@@ -137,13 +130,13 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     let applied = stored_applied(node, agent);
 
     set_clock(&cluster, leader, b0 + 500);
-    let reading = clock_of(&cluster, leader);
+    let reading = cluster.clock(leader);
     // The cut row may show in the store before the node's applied index
     // passes the marker: wait for both.
     wait_until("the leader's replica records cut(0)", || {
         cuts(node, agent).contains_key(&0) && !results(node, agent, applied).is_empty()
     });
-    let after = clock_of(&cluster, leader);
+    let after = cluster.clock(leader);
     assert_eq!(cuts(node, agent), BTreeMap::from([(0, before)]));
     let appended = results(node, agent, applied);
     let [(_, marker)] = &appended[..] else {
@@ -181,17 +174,19 @@ fn an_agent_of_no_space_gets_no_marker() {
     let node = cluster.node(leader);
     let applied = stored_applied(node, agent);
     let boundary = WindowClock::DEFAULT
-        .boundary(
-            WindowClock::DEFAULT
-                .window(clock_of(&cluster, leader))
-                .unwrap(),
-        )
+        .boundary(WindowClock::DEFAULT.window(cluster.clock(leader)).unwrap())
         .unwrap();
     for number in 1..=3 {
         set_clock(&cluster, number, boundary + 1_000);
     }
     std::thread::sleep(Duration::from_secs(2));
-    assert!(results(node, agent, applied).is_empty(), "no marker");
+    // A marker is an empty result; the install's, should a loaded host
+    // apply it only now, is not.
+    let appended = results(node, agent, applied);
+    assert!(
+        appended.iter().all(|(_, result)| !result.steps.is_empty()),
+        "no marker: {appended:?}"
+    );
     for number in 1..=3 {
         assert!(cuts(cluster.node(number), agent).is_empty());
     }
@@ -257,9 +252,9 @@ pub(crate) fn entries() -> MapId {
     }
 }
 
-/// Request `sequence` of the cluster's session: 25 puts and deletes in the
-/// reader's committed map, over 300 keys that come back.
-pub(crate) fn writes(cluster: &Cluster, sequence: u64) -> Request {
+/// Request `sequence` of the cluster's session at `agent`: 25 puts and
+/// deletes in the reader's committed map, over 300 keys that come back.
+pub(crate) fn writes(cluster: &Cluster, agent: AgentId, sequence: u64) -> Request {
     let writes: Vec<(u64, Option<u64>)> = (0..25u64)
         .map(|index| {
             let key = (sequence * 37 + index * 11) % 300;
@@ -267,7 +262,7 @@ pub(crate) fn writes(cluster: &Cluster, sequence: u64) -> Request {
         })
         .collect();
     Request {
-        session: cluster.session,
+        session: cluster.session(agent),
         sequence,
         caller: ALICE,
         instance: READER,
@@ -278,25 +273,17 @@ pub(crate) fn writes(cluster: &Cluster, sequence: u64) -> Request {
 
 /// `request` at `agent`'s leader, followed as it moves: its outcome.
 pub(crate) fn call(cluster: &Cluster, agent: AgentId, request: Request) -> Outcome {
-    let mut backoff = Duration::from_millis(10);
-    let until = Instant::now() + Duration::from_secs(20);
-    loop {
-        let node = cluster.node(cluster.leader(agent));
-        match smol::block_on(node.call(agent, request.clone())) {
-            Ok(Reply::Ran(outcome)) => return outcome,
-            Err(CallError::NotLeader(_) | CallError::TimedOut) if Instant::now() < until => {
-                std::thread::sleep(backoff);
-                backoff = (backoff * 2).min(Duration::from_millis(500));
-            }
-            other => panic!("sequence {}: {other:?}", request.sequence),
-        }
+    let sequence = request.sequence;
+    match cluster.call_at_leader(agent, request) {
+        Ok(Reply::Ran(outcome)) => outcome,
+        other => panic!("sequence {sequence}: {other:?}"),
     }
 }
 
 /// Each request of `sequences` at `agent`'s leader, followed as it moves.
 pub(crate) fn write(cluster: &Cluster, agent: AgentId, sequences: std::ops::RangeInclusive<u64>) {
     for sequence in sequences {
-        let outcome = call(cluster, agent, writes(cluster, sequence));
+        let outcome = call(cluster, agent, writes(cluster, agent, sequence));
         assert!(
             matches!(outcome, Outcome::Done(_)),
             "sequence {sequence}: {outcome:?}"
@@ -365,7 +352,7 @@ pub(crate) fn ask_keys(
     assert_eq!(present.len(), 12, "twelve rows written");
     let keys: Vec<u64> = present.iter().copied().chain(1_000..1_004).collect();
     let start = Request {
-        session: cluster.session,
+        session: cluster.session(agent),
         sequence,
         caller: ALICE,
         instance: READER,

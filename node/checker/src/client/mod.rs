@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use ed25519_dalek::SigningKey;
 use vos_node::client::{ClientError, post_within, signed_call};
 use vos_wire::abi::Refusal;
+use vos_wire::defaults::SESSION_SKEW_MS;
 use vos_wire::ids::{AgentId, InstanceId, Session};
 use vos_wire::ingress::{Rejection, Response};
 use vos_wire::peer::NodeNumber;
@@ -20,6 +21,10 @@ use vos_wire::{Decode, Encode};
 
 use crate::model::{ANSWERED, ATTEMPT, COUNTER, INBOX, Methods, Mode, Nodes, SECOND};
 use crate::rounds;
+
+/// The longest a client takes to pause once asked: its request answered,
+/// and the tour it started ended.
+pub const PAUSING: Duration = Duration::from_secs(ANSWERED.as_secs() + tours::TOUR_ENDS.as_secs());
 
 /// The suite's clients: `count` of them, client `number` at agent
 /// `(number - 1) % agents.len()` of `agents`, each with its identity. The
@@ -315,6 +320,23 @@ impl Client {
         (timed, request - timed.first + 1)
     }
 
+    /// The session request `request` opens, timed again should it have
+    /// been timed ahead so long ago that it is stale, a loaded host slow to
+    /// reach it: no request of it was sent, and none is ever sent stale. A
+    /// session timed before the clocks jumped is kept, to meet the jump.
+    fn fresh(&self, nodes: &dyn Nodes, request: u64) {
+        let offset = nodes.offset();
+        let now = vos_node::wall_clock().saturating_add_signed(offset);
+        let stale = self.sessions.lock().unwrap().iter().any(|timed| {
+            timed.first == request
+                && timed.offset == offset
+                && now.saturating_sub(timed.session.t0) > SESSION_SKEW_MS / 2
+        });
+        if stale {
+            self.rotate_at(nodes, request);
+        }
+    }
+
     /// Start a new session at request `first`, in place of any timed
     /// ahead.
     fn rotate_at(&self, nodes: &dyn Nodes, first: u64) {
@@ -376,6 +398,7 @@ impl Client {
             node_at(request + u64::from(self.number), count),
             Ordering::SeqCst,
         );
+        self.fresh(nodes, request);
         let mut tries = 0usize;
         loop {
             assert!(

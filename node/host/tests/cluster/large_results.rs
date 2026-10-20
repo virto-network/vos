@@ -41,10 +41,11 @@ fn cluster(
     })
 }
 
-/// Alice's request filling the counter's rows, at `sequence` of the test's
-/// session.
-fn fill(cluster: &Cluster, sequence: u64) -> Request {
+/// Alice's request filling `agent`'s counter's rows, at `sequence` of the
+/// test's session there.
+fn fill(cluster: &Cluster, agent: AgentId, sequence: u64) -> Request {
     cluster.request_of(
+        agent,
         sequence,
         cluster.programs.method("fill"),
         (ROWS, ROW).encode(),
@@ -73,12 +74,12 @@ fn two_batches(
     let before = node.applied(agent).unwrap();
     let closed = hooks.refines.close();
     let held = hooks.refines.reached();
-    let alone = node.call(agent, fill(cluster, first));
+    let alone = node.call(agent, fill(cluster, agent, first));
     wait_until("the first batch's refine is held", || {
         hooks.refines.reached() > held
     });
     let together: Vec<_> = (first + 1..=first + CALLS)
-        .map(|sequence| node.call(agent, fill(cluster, sequence)))
+        .map(|sequence| node.call(agent, fill(cluster, agent, sequence)))
         .collect();
     drop(closed);
     filled(smol::block_on(alone));
@@ -145,7 +146,7 @@ fn a_large_result_travels_as_a_blob_and_applies_on_every_replica() {
     // A small result stays inline, at the leader now: under load a
     // replica may have taken over while the large ones travelled.
     let leader = cluster.leader(agent);
-    assert_eq!(done(cluster.increment(leader, agent, 12, 5)), 5);
+    assert_eq!(done(cluster.increment_at_leader(agent, 12, 5)), 5);
     let applied = cluster.node(leader).applied(agent).unwrap();
     assert_eq!(
         results(cluster.node(leader), agent, applied..=applied),
@@ -248,7 +249,7 @@ fn large_results_make_a_compaction_due_by_their_blobs() {
             indices[1] - 1
         );
         assert_eq!(
-            done(cluster.increment(leader, agent, sequence, 1)),
+            done(cluster.increment_at_leader(agent, sequence, 1)),
             sequence - 11
         );
     }
@@ -316,7 +317,9 @@ fn a_blob_is_asked_for_again_only_by_a_retry() {
     let before = cluster.node(leader).applied(agent).unwrap();
     for sequence in 1..=5 {
         filled(smol::block_on(
-            cluster.node(leader).call(agent, fill(&cluster, sequence)),
+            cluster
+                .node(leader)
+                .call(agent, fill(&cluster, agent, sequence)),
         ));
     }
     let blobs = large_blobs(cluster.node(leader), agent, before);
@@ -378,7 +381,7 @@ fn a_follower_turns_from_a_leader_lacking_a_blob_to_a_member_holding_it() {
     serving(old).withhold(&[1, 2, 3]);
     cluster.hub.partition(old, follower);
     let before = cluster.node(old).applied(agent).unwrap();
-    let call = cluster.node(old).call(agent, fill(&cluster, 1));
+    let call = cluster.node(old).call(agent, fill(&cluster, agent, 1));
     let mut entry = Vec::new();
     wait_until("the next leader holds the large result's entry", || {
         entry = large_blobs(cluster.node(next), agent, before);
@@ -440,7 +443,7 @@ fn halted_on_a_large_result(
     losing.store(true, Ordering::SeqCst);
     let before = cluster.node(leader).applied(agent).unwrap();
     filled(smol::block_on(
-        cluster.node(leader).call(agent, fill(cluster, 1)),
+        cluster.node(leader).call(agent, fill(cluster, agent, 1)),
     ));
     let [(index, blob)] = large_blobs(cluster.node(leader), agent, before)[..] else {
         panic!("one large result");
@@ -502,7 +505,7 @@ fn a_replica_that_lost_a_committed_entrys_blob_halts_and_fetches_it_again() {
     let (leader, follower) = cluster.leader_and_follower(agent);
     cluster.caught_up(follower, agent, leader);
     let (index, blob) = halted_on_a_large_result(&cluster, &hooks, leader, follower, agent);
-    assert_eq!(done(cluster.increment(leader, agent, 2, 1)), 1);
+    assert_eq!(done(cluster.increment_at_leader(agent, 2, 1)), 1);
     cluster.stop(follower);
     lose_on_disk(&cluster, follower, agent, index, &blob);
     cluster.start(follower);
@@ -567,6 +570,5 @@ fn a_committed_entry_whose_blob_a_replica_lost_stays_committed() {
     }
     cluster.start(leader);
     cluster.converged(agent);
-    let leader = cluster.leader(agent);
-    assert_eq!(done(cluster.increment(leader, agent, 2, 1)), 1);
+    assert_eq!(done(cluster.increment_at_leader(agent, 2, 1)), 1);
 }

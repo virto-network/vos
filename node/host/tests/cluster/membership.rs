@@ -97,7 +97,7 @@ fn a_retired_leader_keeps_its_committed_placement() {
     let mut cluster = Cluster::new(4);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
-    cluster.node(leader).replace(agent, leader, 4).unwrap();
+    cluster.replace(leader, agent, &[1, 2, 3], leader, 4);
     retired(cluster.node(leader), agent);
     let next = cluster.leader(agent);
     // Settled once the next leader has confirmed the removal and announced
@@ -155,13 +155,13 @@ fn the_leader_replaces_itself() {
     let cluster = Cluster::new(4);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
-    assert_eq!(done(cluster.increment(leader, agent, 1, 5)), 5);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, 5)), 5);
     let replicas = cluster.replace(leader, agent, &[1, 2, 3], leader, 4);
     cluster.placed(agent, &replicas);
     retired(cluster.node(leader), agent);
     let next = cluster.leader(agent);
     assert_ne!(next, leader);
-    assert_eq!(done(cluster.increment(next, agent, 2, 1)), 6);
+    assert_eq!(done(cluster.increment_at_leader(agent, 2, 1)), 6);
     cluster.converged(agent);
 }
 
@@ -188,10 +188,10 @@ fn a_retirement_cut_short_finishes_at_the_next_start() {
     let mut cluster = Cluster::new(4);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let (leader, removed) = cluster.leader_and_follower(agent);
-    assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, 3)), 3);
     cluster.converged(agent);
     cluster.stop(removed);
-    cluster.node(leader).replace(agent, removed, 4).unwrap();
+    cluster.replace(leader, agent, &[1, 2, 3], removed, 4);
     let placement = cluster.node(leader).placement(agent).unwrap();
     {
         let store =
@@ -298,7 +298,7 @@ fn a_removed_replica_back_with_its_old_log_disturbs_nothing() {
     let mut cluster = Cluster::new(4);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let (leader, removed) = cluster.leader_and_follower(agent);
-    assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, 3)), 3);
     cluster.converged(agent);
     cluster.stop(removed);
     let replicas = cluster.replace(leader, agent, &[1, 2, 3], removed, 4);
@@ -345,10 +345,21 @@ fn overlapping_replacements_by_a_silent_node_hold_nothing_else_up() {
     cluster.stop(4);
     std::thread::scope(|scope| {
         let cluster = &cluster;
+        // Sent again at the agent's leader should an election move it.
         let replace = move || {
             let started = Instant::now();
-            let replaced = cluster.node(leader).replace(agent, removed, 4);
-            (replaced, started.elapsed())
+            let mut at = leader;
+            loop {
+                match cluster.node(at).replace(agent, removed, 4) {
+                    Err(vos_node::ReplaceError::Call(vos_node::CallError::NotLeader(_)))
+                        if started.elapsed() < Duration::from_secs(20) =>
+                    {
+                        std::thread::sleep(Duration::from_millis(100));
+                        at = cluster.leader(agent);
+                    }
+                    replaced => return (replaced, started.elapsed()),
+                }
+            }
         };
         let first = scope.spawn(replace);
         std::thread::sleep(Duration::from_millis(200));
@@ -362,7 +373,8 @@ fn overlapping_replacements_by_a_silent_node_hold_nothing_else_up() {
                 sequence
             );
             let took = called.elapsed();
-            assert!(took < Duration::from_secs(3), "a call took {took:?}");
+            // Held up, a call would wait out the replacement's 10 s.
+            assert!(took < Duration::from_secs(6), "a call took {took:?}");
             std::thread::sleep(Duration::from_millis(20));
         }
         for replacing in [first, second] {
@@ -375,7 +387,7 @@ fn overlapping_replacements_by_a_silent_node_hold_nothing_else_up() {
                 "{replaced:?}"
             );
             assert!(
-                took < Duration::from_secs(12),
+                took < Duration::from_secs(30),
                 "a replacement took {took:?}"
             );
         }

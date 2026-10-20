@@ -19,7 +19,7 @@ use vos_wire::ingress::{Call, Contact, NodeId, Response};
 use vos_wire::peer::{NodeNumber, PeerMessage};
 use vos_wire::{Encode, SpaceId, WindowClock, keys};
 
-use crate::common::{COUNTER, Cluster, WithholdBlobs, replaced, retired, wait_until};
+use crate::common::{COUNTER, Cluster, WithholdBlobs, retired, wait_until};
 
 /// An agent belongs to its nodes' space: its creation record names the
 /// space's id, and its first install records the id and the space's clock,
@@ -80,10 +80,9 @@ fn an_agent_created_on_three_nodes_applies_alike_on_each() {
     let cluster = Cluster::new(3);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     assert_eq!(agent.0 >> 24, 1, "an id from the creating node's range");
-    let leader = cluster.leader(agent);
     for (sequence, by) in [(1u64, 5u64), (2, 7), (3, 1)] {
         assert_eq!(
-            done(cluster.increment(leader, agent, sequence, by)),
+            done(cluster.increment_at_leader(agent, sequence, by)),
             [5, 12, 13][sequence as usize - 1]
         );
     }
@@ -117,7 +116,7 @@ fn a_forward_at_another_term_is_answered_by_who_leads() {
     // The test stands in for a follower.
     let follower = cluster.impersonate(leader % 3 + 1);
     let call = Call {
-        session: cluster.session,
+        session: cluster.session(agent),
         sequence: 1,
         instance: COUNTER,
         method: cluster.programs.method("increment"),
@@ -229,7 +228,7 @@ fn a_partitioned_follower_catches_up_and_runs_the_program_it_missed() {
     let (leader, follower) = cluster.leader_and_follower(agent);
     cluster.hub.isolate(follower);
     cluster.install(agent);
-    assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, 3)), 3);
     assert!(cluster.node(follower).pinned().is_empty());
     cluster.hub.heal();
     cluster.converged(agent);
@@ -244,11 +243,11 @@ fn a_partitioned_follower_catches_up_and_runs_the_program_it_missed() {
 fn a_restarted_follower_recovers_its_group() {
     let mut cluster = Cluster::new(3);
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    let (leader, follower) = cluster.leader_and_follower(agent);
-    assert_eq!(done(cluster.increment(leader, agent, 1, 2)), 2);
+    let (_, follower) = cluster.leader_and_follower(agent);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, 2)), 2);
     cluster.converged(agent);
     cluster.stop(follower);
-    assert_eq!(done(cluster.increment(leader, agent, 2, 3)), 5);
+    assert_eq!(done(cluster.increment_at_leader(agent, 2, 3)), 5);
     cluster.start(follower);
     cluster.converged(agent);
     assert_eq!(cluster.value(follower, agent), 5);
@@ -265,9 +264,8 @@ fn a_record_reaches_a_node_that_was_down_from_a_replica() {
     // asks node 2 for the record, and the two are a majority.
     cluster.stop(1);
     cluster.start(3);
-    let leader = cluster.leader(agent);
     cluster.install(agent);
-    assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, 3)), 3);
     cluster.converged(agent);
     // The creator back: its re-announcement meets nodes that hold the
     // record, and it catches up.
@@ -289,7 +287,7 @@ fn a_replica_with_another_agent_program_refuses_the_group() {
     cluster.install(agent);
     let leader = cluster.leader(agent);
     assert_ne!(leader, 3);
-    assert_eq!(done(cluster.increment(leader, agent, 1, 4)), 4);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, 4)), 4);
     assert!(
         cluster.node(3).applied(agent).is_none(),
         "node 3 runs no group"
@@ -316,7 +314,7 @@ fn an_input_whose_accumulate_fails_is_isolated_before_the_log() {
     // Queued together, they share a batch until it fails.
     let calls: Vec<_> = [(1u64, 1u64), (2, 666), (3, 2)]
         .into_iter()
-        .map(|(sequence, by)| node.call(agent, cluster.request(sequence, by)))
+        .map(|(sequence, by)| node.call(agent, cluster.request(agent, sequence, by)))
         .collect();
     let replies: Vec<_> = calls.into_iter().map(smol::block_on).collect();
     assert_eq!(done(replies[0].clone()), 1);
@@ -396,10 +394,9 @@ fn a_result_that_applies_as_no_writes_is_retried_not_answered() {
     });
     let cluster = Cluster::hooked(3, hooks.clone());
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    let leader = cluster.leader(agent);
     // The first entry carrying it applies as no writes everywhere; the
     // leader runs its inputs again rather than answer them.
-    assert_eq!(done(cluster.increment(leader, agent, 1, by)), by);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, by)), by);
     assert!(
         hooks.first.lock().unwrap().contains_key(&agent),
         "an apply failed"
@@ -421,7 +418,7 @@ fn a_follower_fetches_a_blob_from_another_member_when_the_leader_withholds_it() 
     let (leader, follower) = cluster.leader_and_follower(agent);
     cluster.hub.isolate(follower);
     cluster.install(agent);
-    assert_eq!(done(cluster.increment(leader, agent, 1, 3)), 3);
+    assert_eq!(done(cluster.increment_at_leader(agent, 1, 3)), 3);
     // The leader no longer serves blobs: the follower must ask the other.
     hooks[usize::from(leader) - 1].withhold(true);
     cluster.hub.heal();
@@ -501,11 +498,7 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
     assert!(cluster.node(node).pooled(&program));
 
     let replace = |agent: AgentId, leader: NodeNumber| {
-        let replicas = replaced(&[1, 2, 3], node, 4);
-        assert_eq!(
-            cluster.node(leader).replace(agent, node, 4).unwrap(),
-            replicas
-        );
+        let replicas = cluster.replace(leader, agent, &[1, 2, 3], node, 4);
         cluster.placed(agent, &replicas);
         retired(cluster.node(node), agent);
     };

@@ -548,6 +548,9 @@ fn a_read_is_stated_within_a_window_and_its_close() {
     assert_eq!(d, 24_000);
     let anchoring = Anchoring::new();
     let cluster = Cluster::in_space(3, Some(clock), anchoring.tuning());
+    // Early in window 0 while the test sets up, which a loaded host may
+    // take a minute or more for: its read must start before `B_0`.
+    anchoring.set_clocks(&cluster, clock.origin_ms + 1_000);
     anchoring.register(&cluster);
     let representative = cluster.representative(&[1, 2, 3]);
     let agent = reader_agent(&cluster, &[1, 2, 3]);

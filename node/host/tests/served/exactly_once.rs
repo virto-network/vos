@@ -328,19 +328,35 @@ fn check_forwards(
             let node = cluster.node(number).unwrap();
             let mark = |agent, key: &[u8]| vos_checker::mark(node.store(), agent, key);
             let counted = |agent, instance| query(&node, agent, instance, value);
-            wait_until("every replica converges", ANSWERED, || {
-                let acked = mark(client.agent, &keys::acked(next_agent));
-                counted(client.agent, COUNTER) == Ok(Outcome::Done(total.encode()))
-                    && counted(next_agent, INBOX) == Ok(Outcome::Done(inbox.encode()))
-                    && acked == messages
-                    && acked == mark(client.agent, &keys::pair_out(next_agent))
-                    && node
-                        .store()
+            let want = (
+                Ok(Outcome::Done(total.encode())),
+                Ok(Outcome::Done(inbox.encode())),
+                messages,
+                messages,
+                0,
+            );
+            let mut seen = None;
+            let converged = vos_checker::poll(ANSWERED, || {
+                let now = (
+                    counted(client.agent, COUNTER),
+                    counted(next_agent, INBOX),
+                    mark(client.agent, &keys::acked(next_agent)),
+                    mark(client.agent, &keys::pair_out(next_agent)),
+                    node.store()
                         .snapshot()
                         .scan(client.agent, &keys::outbox_prefix(), None)
-                        .count()
-                        == 0
+                        .count(),
+                );
+                let done = now == want;
+                seen = Some(now);
+                done
             });
+            assert!(
+                converged,
+                "node {number} never converged on client {at}'s counter, its next agent's \
+                 inbox, its pair's acknowledged and sent marks and its outbox: {seen:?}, \
+                 not {want:?}"
+            );
             // Each message applied once at the receiver, and was sent once.
             assert_eq!(
                 mark(next.agent, &keys::pair_in(client.agent)),

@@ -38,9 +38,9 @@ fn entries(node: &Node, agent: AgentId) -> MapId {
         .expect("a value row of the committed map")
 }
 
-/// Request `sequence` of the cluster's session: puts and deletes in the
-/// committed map, over keys that come back.
-fn writes(cluster: &Cluster, sequence: u64) -> Request {
+/// Request `sequence` of the cluster's session at `agent`: puts and
+/// deletes in the committed map, over keys that come back.
+fn writes(cluster: &Cluster, agent: AgentId, sequence: u64) -> Request {
     let writes: Vec<(u64, Option<u64>)> = (0..25u64)
         .map(|index| {
             let key = (sequence * 37 + index * 11) % 300;
@@ -48,7 +48,7 @@ fn writes(cluster: &Cluster, sequence: u64) -> Request {
         })
         .collect();
     Request {
-        session: cluster.session,
+        session: cluster.session(agent),
         sequence,
         caller: ALICE,
         instance: COUNTER,
@@ -57,15 +57,10 @@ fn writes(cluster: &Cluster, sequence: u64) -> Request {
     }
 }
 
-/// Each request in `sequences`, at node `at`.
-fn write(
-    cluster: &Cluster,
-    at: NodeNumber,
-    agent: AgentId,
-    sequences: std::ops::RangeInclusive<u64>,
-) {
+/// Each request in `sequences`, at `agent`'s leader, followed as it moves.
+fn write(cluster: &Cluster, agent: AgentId, sequences: std::ops::RangeInclusive<u64>) {
     for sequence in sequences {
-        let reply = smol::block_on(cluster.node(at).call(agent, writes(cluster, sequence)));
+        let reply = cluster.call_at_leader(agent, writes(cluster, agent, sequence));
         assert_eq!(done(reply), 25, "sequence {sequence}");
     }
 }
@@ -164,8 +159,7 @@ fn same_root(cluster: &Cluster, agent: AgentId, replicas: &[NodeNumber]) -> Hash
 fn every_replica_builds_the_same_root() {
     let cluster = Cluster::new(3);
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    let leader = cluster.leader(agent);
-    write(&cluster, leader, agent, 1..=60);
+    write(&cluster, agent, 1..=60);
     let root = same_root(&cluster, agent, &[1, 2, 3]);
     for number in 1..=3 {
         check(cluster.node(number), agent, root);
@@ -180,15 +174,15 @@ fn a_follower_caught_up_by_a_snapshot_builds_the_same_root() {
     let mut cluster = Cluster::tuned(3, compacting);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let (leader, follower) = cluster.leader_and_follower(agent);
-    write(&cluster, leader, agent, 1..=10);
+    write(&cluster, agent, 1..=10);
     same_root(&cluster, agent, &[1, 2, 3]);
     cluster.stop(follower);
-    write(&cluster, leader, agent, 11..=40);
+    write(&cluster, agent, 11..=40);
     cluster.compacted_past(leader, agent, 30);
     cluster.start(follower);
     std::thread::scope(|scope| {
         let cluster = &cluster;
-        scope.spawn(move || write(cluster, leader, agent, 41..=70));
+        scope.spawn(move || write(cluster, agent, 41..=70));
     });
     let root = same_root(&cluster, agent, &[1, 2, 3]);
     let caught_up = cluster.node(follower);
@@ -207,7 +201,7 @@ fn a_follower_caught_up_by_a_snapshot_builds_the_same_root() {
 fn a_failed_build_is_tried_again() {
     let cluster = Cluster::new(1);
     let agent = cluster.counter_agent(&[1]);
-    write(&cluster, 1, agent, 1..=8);
+    write(&cluster, agent, 1..=8);
     same_root(&cluster, agent, &[1]);
     let node = cluster.node(1);
     let store = node.store();
@@ -227,7 +221,7 @@ fn a_failed_build_is_tried_again() {
         batch.commit(PersistMode::Buffer).unwrap();
     };
     set_built(vec![0xff]);
-    write(&cluster, 1, agent, 9..=9);
+    write(&cluster, agent, 9..=9);
     std::thread::sleep(Duration::from_millis(300));
     assert!(
         settled(node, agent).is_none(),

@@ -29,8 +29,8 @@ use crate::store::{Fjall, HardState, LogEntry, Membership, Row, Switch};
 use crate::{Hooks, lock, raise};
 
 /// How long the oldest pending commit may wait before the writer counts as
-/// stalled.
-const STALL_AFTER: Duration = Duration::from_secs(1);
+/// stalled, unless the node's config says otherwise.
+pub(crate) const STALL_AFTER: Duration = Duration::from_secs(1);
 
 /// The most bytes of entries and writes one flush takes, once it has any:
 /// a guard, so one large commit cannot hold back every agent for long.
@@ -226,7 +226,9 @@ impl StorageThread {
         Self::spawn_with(store, hooks, STALL_AFTER)
     }
 
-    fn spawn_with(store: Fjall, hooks: Arc<dyn Hooks>, stall_after: Duration) -> Self {
+    /// A writer counted as stalled once its oldest pending commit waited
+    /// `stall_after`.
+    pub(crate) fn spawn_with(store: Fjall, hooks: Arc<dyn Hooks>, stall_after: Duration) -> Self {
         let (sender, receiver) = mpsc::channel::<Commit>();
         let shared = Arc::new(Shared::default());
         let mut writer = Writer::new(store, hooks, Arc::clone(&shared));

@@ -1,26 +1,33 @@
 //! The cluster the tests share, and what they check of it.
 
+use std::collections::HashMap;
 use std::ops::RangeInclusive;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use smol::future::FutureExt;
 use vos_checker::calls::{done, install_at_leader};
 use vos_checker::programs::Programs;
 pub use vos_checker::spaces::wait_in_process as wait_until;
-use vos_checker::spaces::{HeldPort, open_node, space};
+use vos_checker::spaces::{HeldPort, IN_PROCESS_WAIT, open_node, space};
 use vos_net::memory::{Endpoint, Hub};
 use vos_net::{Arrivals, Class, Network};
-use vos_node::{CallError, Config, Hooks, Node, Peers, Reply, Space};
+use vos_node::{CallError, Config, Hooks, Node, Peers, ReplaceError, Reply, Space};
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal, Session};
+use vos_wire::ingress::Unplaced;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 use vos_wire::result::Outcome;
 use vos_wire::{Decode, Encode, WindowClock};
 
 pub const COUNTER: InstanceId = InstanceId(1);
 pub const ALICE: Principal = Principal::Client([1; 32]);
+
+/// How long a node's commit may wait before its writer counts as stalled
+/// and its groups hand over: every node's store shares the host's one
+/// disk, whose syncs a loaded host holds for seconds at a time.
+pub const WRITER_STALL: Duration = Duration::from_secs(5);
 
 /// What a test sets in node `number`'s config, past the harness's own.
 type Tuning = Box<dyn Fn(NodeNumber, &mut Config) + Send + Sync>;
@@ -36,8 +43,11 @@ pub struct Cluster {
     /// Over QUIC, each stopped node's peer port, held until it starts.
     held: Vec<Option<HeldPort>>,
     tuning: Tuning,
-    /// Alice's session, for the calls the test makes.
-    pub session: Session,
+    /// Alice's session at each agent, for the calls the test makes, timed
+    /// at the first of them: a session timed at the cluster's start, or at
+    /// another agent's first call, may be stale by the
+    /// time a loaded host makes its first call.
+    sessions: Mutex<HashMap<AgentId, Session>>,
     /// How far each node's clock is set ahead of its own, by node, from
     /// node 1.
     pub offsets: Vec<Arc<AtomicI64>>,
@@ -84,9 +94,10 @@ impl Cluster {
     }
 
     /// Nodes 1..=count on the hub, each config tuned by `tuning` past the
-    /// harness's own: elections of 300–600 ms, slow enough that a loaded
-    /// host does not let a heartbeat lapse and move a leader a test calls,
-    /// a heartbeat every 10 ms, two executors, and each node's clock a few
+    /// harness's own: elections of one to two seconds, slow enough that a
+    /// host starved for a second does not let a heartbeat lapse and move a
+    /// leader a test calls, a writer stalled only past [`WRITER_STALL`], a
+    /// heartbeat every 10 ms, two executors, and each node's clock a few
     /// milliseconds from the others'.
     pub fn tuned(
         count: u8,
@@ -143,11 +154,7 @@ impl Cluster {
             nodes: (0..count).map(|_| None).collect(),
             held: (0..count).map(|_| None).collect(),
             tuning,
-            session: Session {
-                key: [1; 32],
-                name: [1; 16],
-                t0: vos_node::wall_clock(),
-            },
+            sessions: Mutex::default(),
             offsets: (0..count).map(|_| Arc::default()).collect(),
         };
         for number in 1..=count {
@@ -165,8 +172,9 @@ impl Cluster {
         } else {
             Peers::Hub(self.hub.clone())
         };
-        config.election_timeout_ms = (300, 600);
+        config.election_timeout_ms = (1_000, 2_000);
         config.heartbeat_ms = 10;
+        config.writer_stall = WRITER_STALL;
         // Each node's own clock, a few milliseconds apart, and as far
         // ahead as the test sets it.
         let skew = u64::from(number) * 7;
@@ -257,7 +265,10 @@ impl Cluster {
 
     /// Node `at` replaces `out` by `inn` among `agent`'s replicas,
     /// `before`: answered with the replicas after, in order, which this
-    /// gives back.
+    /// gives back. Refused for not leading, or unanswered, it goes again
+    /// at the agent's leader, as an operator follows it: under load an
+    /// election may move it mid-change. A try after one that went through
+    /// finds `out` gone or `inn` placed, and waits for the change to end.
     #[track_caller]
     pub fn replace(
         &self,
@@ -268,8 +279,41 @@ impl Cluster {
         inn: NodeNumber,
     ) -> Vec<NodeNumber> {
         let after = replaced(before, out, inn);
-        assert_eq!(self.node(at).replace(agent, out, inn).unwrap(), after);
-        after
+        let until = Instant::now() + IN_PROCESS_WAIT;
+        let mut node = at;
+        let mut again = false;
+        loop {
+            match self.node(node).replace(agent, out, inn) {
+                Ok(replicas) => {
+                    assert_eq!(replicas, after);
+                    return after;
+                }
+                Err(ReplaceError::Unplaced(Unplaced::NotAReplica | Unplaced::AlreadyAReplica))
+                    if again =>
+                {
+                    wait_until("the replacement ends", || {
+                        self.node(self.leader(agent))
+                            .placement(agent)
+                            .is_some_and(|placement| {
+                                placement.replicas == after
+                                    && placement.committed
+                                    && !placement.joint
+                            })
+                    });
+                    return after;
+                }
+                Err(
+                    ReplaceError::Call(CallError::NotLeader(_) | CallError::TimedOut)
+                    | ReplaceError::TimedOut
+                    | ReplaceError::Unplaced(Unplaced::InProgress),
+                ) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(100));
+                    node = self.leader(agent);
+                    again = true;
+                }
+                other => panic!("the replacement: {other:?}"),
+            }
+        }
     }
 
     /// Node `number` has applied `agent` as far as node `ahead` had when
@@ -325,11 +369,30 @@ impl Cluster {
         agent
     }
 
-    /// Alice's request adding `by` to the counter, at `sequence` of the
-    /// test's session.
-    pub fn request(&self, sequence: u64, by: u64) -> Request {
+    /// Alice's session at `agent`, timed when the test first asks for it,
+    /// by the clock of the node leading `agent` then, as the test sets it:
+    /// the clock a new session's time must be near.
+    pub fn session(&self, agent: AgentId) -> Session {
+        let mut sessions = self.sessions.lock().unwrap();
+        *sessions.entry(agent).or_insert_with(|| Session {
+            key: [1; 32],
+            name: [1; 16],
+            t0: self.clock(self.leader(agent)),
+        })
+    }
+
+    /// Node `number`'s clock as the cluster sets it: the wall's, its few
+    /// milliseconds of skew, and its offset.
+    pub fn clock(&self, number: NodeNumber) -> u64 {
+        let offset = self.offsets[usize::from(number) - 1].load(Ordering::SeqCst);
+        (vos_node::wall_clock() + u64::from(number) * 7).saturating_add_signed(offset)
+    }
+
+    /// Alice's request adding `by` to `agent`'s counter, at `sequence` of
+    /// the test's session there.
+    pub fn request(&self, agent: AgentId, sequence: u64, by: u64) -> Request {
         Request {
-            session: self.session,
+            session: self.session(agent),
             sequence,
             caller: ALICE,
             instance: COUNTER,
@@ -338,13 +401,19 @@ impl Cluster {
         }
     }
 
-    /// Alice's request of the counter's `method` with `arguments`, at
-    /// `sequence` of the test's session.
-    pub fn request_of(&self, sequence: u64, method: MethodId, arguments: Vec<u8>) -> Request {
+    /// Alice's request of `agent`'s counter's `method` with `arguments`,
+    /// at `sequence` of the test's session there.
+    pub fn request_of(
+        &self,
+        agent: AgentId,
+        sequence: u64,
+        method: MethodId,
+        arguments: Vec<u8>,
+    ) -> Request {
         Request {
             method,
             arguments,
-            ..self.request(sequence, 0)
+            ..self.request(agent, sequence, 0)
         }
     }
 
@@ -355,39 +424,49 @@ impl Cluster {
         sequence: u64,
         by: u64,
     ) -> Result<Reply, CallError> {
-        smol::block_on(self.node(at).call(agent, self.request(sequence, by)))
+        smol::block_on(self.node(at).call(agent, self.request(agent, sequence, by)))
     }
 
-    /// [`Cluster::increment`] at `agent`'s leader, followed when it moves:
-    /// a call sent again at its sequence runs once, and is answered from
-    /// the reply window when it already has. Each retry waits twice as long
-    /// as the last, from 10 ms, so an election has time to end.
-    pub fn increment_at_leader(
-        &self,
-        agent: AgentId,
-        sequence: u64,
-        by: u64,
-    ) -> Result<Reply, CallError> {
+    /// `request` at `agent`'s leader, followed when it moves: a call sent
+    /// again at its sequence runs once, and is answered from the reply
+    /// window when it already has, so one unanswered in time goes again
+    /// too. Each retry waits twice as long as the last, from 10 ms to half
+    /// a second, so an election has time to end, for as long as a test
+    /// waits for the nodes to settle: a starved host may take several
+    /// elections to settle one.
+    pub fn call_at_leader(&self, agent: AgentId, request: Request) -> Result<Reply, CallError> {
+        let until = Instant::now() + IN_PROCESS_WAIT;
         let mut backoff = Duration::from_millis(10);
-        for _ in 0..10 {
-            match self.increment(self.leader(agent), agent, sequence, by) {
-                Err(CallError::NotLeader(_)) => {
+        loop {
+            let node = self.node(self.leader(agent));
+            match smol::block_on(node.call(agent, request.clone())) {
+                Err(CallError::NotLeader(_) | CallError::TimedOut) if Instant::now() < until => {
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_millis(500));
                 }
                 reply => return reply,
             }
         }
-        Err(CallError::TimedOut)
+    }
+
+    /// [`Cluster::increment`] at `agent`'s leader, followed as
+    /// [`Cluster::call_at_leader`] follows it.
+    pub fn increment_at_leader(
+        &self,
+        agent: AgentId,
+        sequence: u64,
+        by: u64,
+    ) -> Result<Reply, CallError> {
+        self.call_at_leader(agent, self.request(agent, sequence, by))
     }
 
     /// Each of `sequences` added to `agent`'s counter at node `at`, in
     /// order, each at that sequence of the session whose every earlier
     /// call added its own: each is answered with the sum of the sequences
     /// through it. That sum at the last. A call `at` refuses for not
-    /// leading goes again at the agent's leader, followed as
-    /// [`Cluster::increment_at_leader`] does: under load an election may
-    /// move it mid-sequence.
+    /// leading, or leaves unanswered in time, goes again at the agent's
+    /// leader, followed as [`Cluster::call_at_leader`] does: under load an
+    /// election may move it mid-sequence.
     #[track_caller]
     pub fn increments(
         &self,
@@ -400,7 +479,7 @@ impl Cluster {
             total = sequence * (sequence + 1) / 2;
             assert_eq!(
                 done(match self.increment(at, agent, sequence, sequence) {
-                    Err(CallError::NotLeader(_)) =>
+                    Err(CallError::NotLeader(_) | CallError::TimedOut) =>
                         self.increment_at_leader(agent, sequence, sequence),
                     reply => reply,
                 }),

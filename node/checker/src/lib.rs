@@ -32,7 +32,7 @@ pub mod spaces;
 pub use vos_testkit::programs;
 
 pub use client::tours::{Touring, check_tallies};
-pub use client::{Client, clients};
+pub use client::{Client, PAUSING, clients};
 pub use model::{ANSWERED, ATTEMPT, COUNTER, INBOX, Log, Methods, Mode, Nodes, SECOND};
 
 use std::time::{Duration, Instant};
@@ -64,7 +64,7 @@ impl Random {
 }
 
 /// Whether `done` holds within `within`, checking every 5 ms.
-fn poll(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+pub fn poll(within: Duration, mut done: impl FnMut() -> bool) -> bool {
     let until = Instant::now() + within;
     loop {
         if done() {

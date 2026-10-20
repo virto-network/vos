@@ -3167,3 +3167,87 @@ unchanged by it (`just check-kit`, `just conformance`).
 
 **6.19 accepted.**
 
+
+## Load-sensitive tests
+
+`vos-node`'s `cluster`, `served` and `cuts` suites, run pinned to two cores
+(`taskset -c 0-1`) with sixteen test threads beside four spinning
+processes and a loop of 256 MiB `dd … conv=fsync` writes on the same disk:
+the load `just check` meets while other worktrees build and prove. Two
+cores alone, or with spinners alone, failed nothing once the elections
+below were slowed; the syncs are what moved leaders. Every failure was the
+test's or its harness's, not a node's:
+
+- **Writer stalls under shared syncs.** Every node of a test shares the
+  host's one disk; a sync held past `STALL_AFTER` (1 s) marks the writer
+  stalled, and the node stops listing the groups it leads, so they elect
+  elsewhere: leaders moved under calls aimed at them (`NotLeader` in
+  `membership`, `roots`, `liveness`, `large_results`, `replication`,
+  `workflows`; "node 1 leads some" timing out). The bound is now
+  `Config::writer_stall`, its default unchanged; both harnesses set 5 s.
+  Open for the owner: a default below the default election timeout
+  (1.5–3 s) hands over every group of a node whose disk is busy for a
+  second.
+- **Elections of 300–600 ms** (`cluster`) and **40–80 ms** (`served`)
+  lapsed when a starved host held a heartbeat; both harnesses now elect in
+  1–2 s (`forwarding::a_leader_whose_clock_trails…` "it goes on leading",
+  `a_resend_of_a_queued_first_call…` `NotLeader`).
+- **Calls at a stale leader.** `Cluster::call_at_leader` sends a request
+  again at the agent's leader on `NotLeader` or `TimedOut` (a resend at its
+  sequence runs once) until the in-process wait (20 s) runs out, where
+  `increment_at_leader` gave up after ten tries (~2.6 s); `increments`,
+  `roots`' writes, the shop's starts and the generic calls of
+  `liveness`, `queries`, `membership`, `large_results`, `replication` and
+  `workflows` follow it. `Cluster::replace` follows the leader too, on
+  `NotLeader`, `InProgress` or `TimedOut` (a leader replacing itself
+  answers that when the next leader's announcement outlasts 2 s): a try
+  after one that went through finds `out` gone or `inn` placed and waits
+  for the final placement. The tests' direct `replace(…).unwrap()`s go
+  through it; the overlapping replacements' thread sends again on
+  `NotLeader`.
+- **A session stale before its first call.** The cluster's session was
+  timed at the cluster's start, once for every agent; creating forty
+  agents, or twenty writes at each of three, on a loaded host took past
+  `SESSION_SKEW_MS` (60 s), and a first call was refused `StaleSession`
+  (`a_flaky_then_cut_link_moves_no_term`, the representative's reads).
+  Each agent's session is timed at its first call now, by its leader's
+  clock as the test sets it.
+- **Real time crossing `B_0`.** `a_read_is_stated_within_a_window_and_its_close`
+  founds 120 s windows a minute before now and must start its read in
+  window 0; a loaded setup took longer ("every replica holds the
+  request"). Its clocks are held early in window 0 while it sets up.
+- **A served client's session timed ahead.** A client times its next
+  session while it uses one, so a clock jump meets sessions timed before
+  it; a loaded host took past `SESSION_SKEW_MS` to reach it, and its first
+  request was rejected `StaleSession` with no jump to explain it
+  (`one_request_at_a_time_applies_once_through_failures`). Before the
+  first request of a session timed ahead goes, one older than half the
+  skew is timed again, unless the clocks jumped since: none of it was
+  sent.
+- **Waiting for clients to pause.** A client pauses between requests,
+  a touring one once its tour ends: up to `ANSWERED` (60 s) and
+  `TOUR_ENDS` (120 s). The wait was `ANSWERED` ("the clients pause" in
+  `workflows_apply_once_through_failures`); it is their sum, `PAUSING`,
+  in the served run and the process suite.
+- **A jump no session met in time.** The run checks that a session timed
+  before every clock jumped met the jump; a loaded host's clients reached
+  none before the sessions expired at a later fault ("no session met the
+  clocks' jump"). The faults wait for one, up to `PAUSING`, after the
+  jump.
+- **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
+  counted any result past its start; an install applied late is one. A
+  marker is an empty result, and only those count.
+- **Deadlines against real time.** The resend-round tests waited 5 s
+  against a 20 s round (6.7 s taken): the round is 60 s, longer than any
+  wait for a delivery, and a delivery needing no round has 15 s. The
+  overlapping replacements' calls had 3 s (4.7 s taken) against the 10 s a
+  held-up call would wait: 6 s, the replacements 30 s. Quiet groups
+  elect again within 10 s of their leader's node stopping, not 5 s, with
+  elections of one to two seconds. Workflows' computations end within
+  60 s, not 20 s. The served cut run's reads, three 2 s windows to be
+  served, all ran out ("no read served"): windows of 4 s.
+- **Diagnosis.** The exactly-once run's convergence wait names what each
+  replica holds against what it should.
+
+Gate: each of `cluster`, `served`, `cuts` 10/10 under that load; `just
+check` green.

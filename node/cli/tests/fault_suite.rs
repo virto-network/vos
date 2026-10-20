@@ -37,7 +37,7 @@ use vos_checker::processes::relay::Link;
 use vos_checker::processes::{Options, PROCESS_WAIT, Processes};
 use vos_checker::programs::package;
 use vos_checker::{
-    ANSWERED, COUNTER, Client, INBOX, Mode, Nodes, Random, SECOND, mark, wait_until,
+    ANSWERED, COUNTER, Client, INBOX, Mode, Nodes, PAUSING, Random, SECOND, mark, wait_until,
 };
 use vos_node::store::Fjall;
 use vos_wire::ids::AgentId;
@@ -391,7 +391,7 @@ fn expire_every_session(run: &Run, clients: &[Client]) {
     run.saw("fault: every session expires");
     space.clients_paused.store(true, Ordering::SeqCst);
     // A client finishes the request it is sending first.
-    wait_until("the clients pause", 2 * ANSWERED, || {
+    wait_until("the clients pause", PAUSING, || {
         clients.iter().all(Client::idle)
     });
     let captured: Vec<Vec<Vec<u8>>> = clients.iter().map(|client| client.capture(space)).collect();

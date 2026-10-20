@@ -36,7 +36,7 @@ impl Cluster {
         by: u64,
     ) -> Result<Reply, CallError> {
         let forward = self.programs.method("forward");
-        let request = self.request_of(sequence, forward, (to.0, COUNTER.0, by).encode());
+        let request = self.request_of(from, sequence, forward, (to.0, COUNTER.0, by).encode());
         smol::block_on(self.node(at).call(from, request))
     }
 
@@ -334,8 +334,7 @@ fn a_message_failing_refine_is_consumed_once_and_never_sent_again() {
 /// next round.
 #[test]
 fn a_gap_is_filled_within_a_round_trip() {
-    let round = Duration::from_secs(20);
-    let cluster = Cluster::tuned(2, move |_, config| config.resend_round = round);
+    let cluster = Cluster::tuned(2, |_, config| config.resend_round = ROUND);
     let sender = cluster.counter_agent(&[1]);
     let target = cluster.counter_agent(&[2]);
     cluster.forward_once(sender, 1, target, 1);
@@ -350,8 +349,8 @@ fn a_gap_is_filled_within_a_round_trip() {
     cluster.delivered((sender, &[1]), (target, &[2]), 111);
     let took = started.elapsed();
     assert!(
-        took < Duration::from_secs(5),
-        "the gap took {took:?}, waiting for a round of {round:?}"
+        took < WITHIN_ROUND,
+        "the gap took {took:?}, waiting for a round of {ROUND:?}"
     );
 }
 
@@ -368,8 +367,13 @@ fn held_receiver(queue: usize, hold: &Arc<Holds>) -> Cluster {
     })
 }
 
-/// A resend round no test waits for.
-const ROUND: Duration = Duration::from_secs(20);
+/// A resend round no test waits for: longer than any wait for a
+/// delivery, so a delivery that needs a round fails its wait.
+const ROUND: Duration = Duration::from_secs(60);
+
+/// What a delivery that needs no round takes at most, on a loaded host
+/// too: well below [`ROUND`], and far above the round trip itself.
+const WITHIN_ROUND: Duration = Duration::from_secs(15);
 
 /// Raises its flag when dropped, so a thread looping until the flag ends
 /// however the test does: a failed wait fails the test rather than leaving
@@ -388,8 +392,12 @@ fn forwarded(cluster: &Cluster, sender: AgentId, target: AgentId, sequences: Ran
     let forwards: Vec<_> = sequences
         .map(|sequence| {
             let forward = cluster.programs.method("forward");
-            let request =
-                cluster.request_of(sequence, forward, (target.0, COUNTER.0, 1u64).encode());
+            let request = cluster.request_of(
+                sender,
+                sequence,
+                forward,
+                (target.0, COUNTER.0, 1u64).encode(),
+            );
             cluster.node(1).call(sender, request)
         })
         .collect();
@@ -422,7 +430,7 @@ fn a_full_queues_drops_go_again_once_it_drained() {
     cluster.delivered((sender, &[1]), (target, &[2]), 11);
     let took = released.elapsed();
     assert!(
-        took < Duration::from_secs(5),
+        took < WITHIN_ROUND,
         "the drops took {took:?}, waiting for a round of {ROUND:?}"
     );
 }
@@ -471,7 +479,7 @@ fn a_full_queues_drops_go_again_beside_a_steady_sender() {
         drop(stopping);
         let took = released.elapsed();
         assert!(
-            took < Duration::from_secs(5),
+            took < WITHIN_ROUND,
             "the drops took {took:?}, waiting for a round of {ROUND:?}"
         );
     });

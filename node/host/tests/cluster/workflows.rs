@@ -18,7 +18,7 @@ use vos_wire::records::{Workflow, WorkflowState};
 use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
 use vos_wire::{Decode, Encode, keys};
 
-use crate::common::{ALICE, Cluster, compacting, log_start, replaced, retired, wait_until};
+use crate::common::{ALICE, Cluster, compacting, log_start, retired, wait_until};
 
 const SHOP: InstanceId = InstanceId(4);
 
@@ -51,23 +51,24 @@ impl Shop {
         cluster.install_package(agent, SHOP, &package("lean"));
     }
 
-    /// Alice's request starting workflow `name`, at `sequence` of the
-    /// cluster's session.
+    /// Alice's request starting workflow `name` at `agent`, at `sequence`
+    /// of the cluster's session there.
     fn starting<A: Encode>(
         &self,
         cluster: &Cluster,
+        agent: AgentId,
         sequence: u64,
         name: &str,
         arguments: A,
     ) -> vos_wire::batch::Request {
         vos_wire::batch::Request {
             instance: SHOP,
-            ..cluster.request_of(sequence, self.method(name), arguments.encode())
+            ..cluster.request_of(agent, sequence, self.method(name), arguments.encode())
         }
     }
 
     /// Start workflow `name` by [`Shop::starting`]'s request at `agent`'s
-    /// leader: its id.
+    /// leader, followed as it moves: its id.
     fn start<A: Encode>(
         &self,
         cluster: &Cluster,
@@ -76,9 +77,8 @@ impl Shop {
         name: &str,
         arguments: A,
     ) -> WorkflowId {
-        let request = self.starting(cluster, sequence, name, arguments);
-        let leader = cluster.node(cluster.leader(agent));
-        match smol::block_on(leader.call(agent, request)) {
+        let request = self.starting(cluster, agent, sequence, name, arguments);
+        match cluster.call_at_leader(agent, request) {
             Ok(Reply::Ran(Outcome::Started(workflow))) => workflow,
             other => panic!("{other:?}"),
         }
@@ -90,10 +90,14 @@ fn record(node: &Node, agent: AgentId, workflow: WorkflowId) -> Option<Workflow>
     vos_checker::applied(node.store(), agent, &keys::workflow(workflow))
 }
 
+/// How long a workflow may take to end: its computations are long runs
+/// of a debug build's interpreter, which a loaded host slows several fold.
+const COMPUTING: Duration = Duration::from_secs(60);
+
 /// Wait until every replica holds `workflow` ended: its outcome.
 fn ended(cluster: &Cluster, agent: AgentId, workflow: WorkflowId) -> Outcome {
     let mut outcome = None;
-    wait_until("the workflow ends on every replica", || {
+    vos_checker::wait_until("the workflow ends on every replica", COMPUTING, || {
         let ends: Vec<Option<Outcome>> = cluster
             .running()
             .map(|(_, node)| match record(node, agent, workflow)?.state {
@@ -250,14 +254,14 @@ fn a_workflow_starts_in_the_batch_that_installs_its_program() {
     let leader = cluster.node(cluster.leader(agent));
     let before = leader.applied(agent).unwrap();
     let closed = hold.refines.close();
-    let held = leader.call(agent, cluster.request(1, 1));
+    let held = leader.call(agent, cluster.request(agent, 1, 1));
     wait_until("a batch's refine is held", || hold.refines.reached() > 0);
     let install = leader.install(agent, SHOP, &package("shop"), vec![]);
     let program = CodeHash::of(&shop.shop).0;
     wait_until("the package is stored", || leader.stores_blob(&program));
     // Its install is queued once its program is stored.
     std::thread::sleep(Duration::from_millis(200));
-    let started = leader.call(agent, shop.starting(&cluster, 2, "nap", 0u64));
+    let started = leader.call(agent, shop.starting(&cluster, agent, 2, "nap", 0u64));
     drop(closed);
     assert!(smol::block_on(held).ran());
     installed(smol::block_on(install));
@@ -303,7 +307,7 @@ fn a_snapshot_carries_a_living_workflows_pin() {
     shop.upgrade(&cluster, agent);
     let program = record(cluster.node(leader), agent, nap).unwrap().program.0;
     for sequence in 2..=40 {
-        let added = vos_checker::calls::done(cluster.increment(leader, agent, sequence, 1));
+        let added = vos_checker::calls::done(cluster.increment_at_leader(agent, sequence, 1));
         assert_eq!(added, sequence - 1);
     }
     cluster.compacted_past(leader, agent, 20);
@@ -333,11 +337,7 @@ fn a_retired_replica_releases_a_living_workflows_pin() {
             .iter()
             .all(|number| cluster.node(*number).pinned().contains(&program))
     });
-    let replicas = replaced(&[1, 2, 3], removed, 4);
-    assert_eq!(
-        cluster.node(leader).replace(agent, removed, 4).unwrap(),
-        replicas
-    );
+    cluster.replace(leader, agent, &[1, 2, 3], removed, 4);
     retired(cluster.node(removed), agent);
     assert!(cluster.node(removed).pinned().is_empty());
     cluster.converged(agent);

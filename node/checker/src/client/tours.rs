@@ -17,7 +17,7 @@ use crate::model::Nodes;
 use crate::rounds::{ROUNDS_A_TOUR, TourMethods, signed_read, tour};
 
 /// How long a tour may take to end once started, through every failure.
-const TOUR_ENDS: Duration = Duration::from_secs(120);
+pub(crate) const TOUR_ENDS: Duration = Duration::from_secs(120);
 /// How long a read of a tour waits for it to end, within an attempt.
 const READ_WAIT: Duration = Duration::from_millis(1000);
 

@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use vos_checker::rounds::ROUNDS;
-use vos_checker::{ANSWERED, ATTEMPT, Client, Random, Touring, wait_until};
+use vos_checker::{ANSWERED, ATTEMPT, Client, PAUSING, Random, Touring, wait_until};
 use vos_node::Node;
 use vos_wire::ids::{AgentId, Session, SessionId, WorkflowId};
 use vos_wire::keys::Due;
@@ -174,6 +174,12 @@ pub(crate) fn faults(cluster: &Cluster, clients: &[Client], random: &mut Random)
             cluster.offset.fetch_add(CLUSTER_JUMP, Ordering::SeqCst);
             std::thread::sleep(ATTEMPT + Duration::from_millis(500));
             drop(held);
+            // A loaded host may take long to reach a session timed before
+            // the jump, which the run checks one met: the next faults
+            // wait for it.
+            vos_checker::poll(PAUSING, || {
+                cluster.log.seen().contains_key("session timed again")
+            });
             continue;
         }
         if fault == FAULTS / 2 {
@@ -308,7 +314,7 @@ fn holds_sessions(node: &Node, agent: AgentId) -> bool {
 fn expire_every_session(cluster: &Cluster, clients: &[Client], random: &mut Random) {
     cluster.saw("fault: every session expires");
     cluster.paused.store(true, Ordering::SeqCst);
-    wait_until("the clients pause", ANSWERED, || {
+    wait_until("the clients pause", PAUSING, || {
         clients.iter().all(Client::idle)
     });
     let captured: Vec<Vec<Vec<u8>>> = clients
