@@ -45,6 +45,10 @@ pub trait VenueClient: Send + Sync {
     fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]>;
     /// Where `space` stands at the venue, as far as it can say.
     fn status(&self, space: &SpaceId) -> Status;
+    /// The venue's time, in milliseconds since the Unix epoch, as last
+    /// read: what every deadline between parties is timed by (pin D). None
+    /// before the client has read it.
+    fn time(&self) -> Option<u64>;
 }
 
 /// Where a space stands at a venue.
@@ -505,6 +509,10 @@ impl VenueClient for ModelVenue {
             Some(space) if space.suspended => Status::Suspended,
             Some(_) => Status::Active,
         }
+    }
+
+    fn time(&self) -> Option<u64> {
+        Some((self.now)())
     }
 }
 

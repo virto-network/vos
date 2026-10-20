@@ -867,4 +867,9 @@ impl VenueClient for KreivoVenue {
             Some(SpaceStatus::Blocked) => Status::Blocked,
         }
     }
+
+    /// `Timestamp.Now` as the reader thread last read it.
+    fn time(&self) -> Option<u64> {
+        self.shared.state().now
+    }
 }
