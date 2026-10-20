@@ -3273,13 +3273,17 @@ test's or its harness's, not a node's:
   read just before the stop; a loaded host's stop let it take entries
   past it, and it came back by the log ("no node caught up by a
   snapshot", with the compaction logged done). Its bound is the running
-  replicas' last entry, read once it is down.
-- **One replica's compaction read for all.** The snapshot tests waited
-  for the leader to compact past the stopped follower, then expected a
-  snapshot; a loaded host moved leadership to a replica whose durable
-  applies lagged and whose log still held the follower's entries, and it
-  caught up by the log ("switched once", 0). `compacted_past` waits for
-  every running replica.
+  replicas' last entry, read once it is down. (The counter race below
+  fails the same check; which of the two the run met is not known.)
+- **A switch counted after it shows.** A replica's snapshot switch
+  commits its state, then updates the group's, then counts the switch; a
+  loaded host let the test read the counter between ("switched once", 0,
+  the follower's log starting at the snapshot's index, eight copies at
+  once on the two cores failing 2 in 48). The test waits for the count;
+  the served runs' "no node caught up by a snapshot" sums the counts
+  within an attempt's 2 s. `compacted_past` also waits for every running
+  replica now, not the leader alone, so whichever leads must send a
+  snapshot.
 - **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
   counted any result past its start; an install applied late is one. A
   marker is an empty result, and only those count.

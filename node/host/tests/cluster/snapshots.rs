@@ -126,6 +126,11 @@ fn a_snapshot_stream_outlasting_the_leaders_deadline_goes_on() {
         "the stream outlasted the deadline: {:?}",
         started.elapsed()
     );
+    // Counted once the switch's state is in: a moment after a loaded host
+    // shows it.
+    wait_until("the switch is counted", || {
+        caught_up.snapshots_installed() > 0
+    });
     assert_eq!(caught_up.snapshots_installed(), 1, "switched once");
     let more = cluster.node(leader).snapshots_streamed() - streamed;
     assert!(more <= 1, "no other stream started: {more} did");

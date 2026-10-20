@@ -18,8 +18,8 @@ use vos_checker::calls::install_at_leader;
 use vos_checker::programs::{actor, package, schema};
 use vos_checker::rounds::{ASKED, ROUNDS, Rounds, TOLD};
 use vos_checker::{
-    ANSWERED, COUNTER, Client, INBOX, Methods, Mode, Random, SECOND, Touring, check_tallies,
-    wait_until,
+    ANSWERED, ATTEMPT, COUNTER, Client, INBOX, Methods, Mode, Random, SECOND, Touring,
+    check_tallies, wait_until,
 };
 use vos_node::Node;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
@@ -186,14 +186,18 @@ pub(crate) fn exactly_once(
         })
         .sum();
     println!("messages sent across nodes: {across}");
-    let installed: u64 = (1..=NODES)
-        .map(|number| {
-            cluster.slot(number).installed.load(Ordering::SeqCst)
-                + cluster.node(number).unwrap().snapshots_installed()
-        })
-        .sum();
-    println!("snapshots installed: {installed}");
-    assert!(installed > 0, "no node caught up by a snapshot");
+    let installed = || -> u64 {
+        (1..=NODES)
+            .map(|number| {
+                cluster.slot(number).installed.load(Ordering::SeqCst)
+                    + cluster.node(number).unwrap().snapshots_installed()
+            })
+            .sum()
+    };
+    // A switch is counted a moment after its state shows.
+    let switched = vos_checker::poll(ATTEMPT, || installed() > 0);
+    println!("snapshots installed: {}", installed());
+    assert!(switched, "no node caught up by a snapshot");
     assert!(across > 0, "no message crossed nodes");
     if let Some(alongside) = alongside {
         alongside.check(&cluster, &agents);
