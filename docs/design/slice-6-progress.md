@@ -2882,3 +2882,7 @@ On `vos-core` (from `4447127a`).
     pinned in `mutations.json`;
   - **9 (low):** §13 question 14 lists the mock's other choices and notes
     that G14's refusal 5 past `end_window` cannot be reached by calls.
+- **After the fold:** `just check` at `ef73f879` green, 98 suites, 1,292
+  passed, 0 failed, 14.5 min; G1–G18 now 153 steps, `spaces.json` 303 KB.
+
+**6.17 accepted.**
