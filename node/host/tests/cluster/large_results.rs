@@ -216,9 +216,7 @@ fn a_large_results_blob_goes_once_the_log_is_compacted_past_it() {
             sequence - 11
         );
     }
-    for number in 1..=3 {
-        cluster.compacted_past(number, agent, last);
-    }
+    cluster.compacted_past(agent, last);
     wait_until("every replica collects the blobs", || {
         cluster
             .running()

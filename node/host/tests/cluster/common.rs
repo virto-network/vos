@@ -551,11 +551,16 @@ impl Cluster {
         );
     }
 
-    /// Node `number` compacts `agent`'s log past `index`.
+    /// Every running replica of `agent` compacts its log past `index`, so
+    /// a replica behind it catches up by a snapshot whichever leads: one
+    /// whose durable applies a loaded host holds back compacts later than
+    /// the others, and leading it would send the log.
     #[track_caller]
-    pub fn compacted_past(&self, number: NodeNumber, agent: AgentId, index: u64) {
-        wait_until(&format!("node {number} compacts past {index}"), || {
-            log_start(self.node(number), agent) > index
+    pub fn compacted_past(&self, agent: AgentId, index: u64) {
+        wait_until(&format!("every replica compacts past {index}"), || {
+            self.running()
+                .filter(|(_, node)| node.applied(agent).is_some())
+                .all(|(_, node)| log_start(node, agent) > index)
         });
     }
 

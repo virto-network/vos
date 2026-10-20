@@ -424,7 +424,7 @@ fn a_replica_down_across_a_cut_holds_its_proofs_on_return() {
         });
         let root = roots::cut_root(&node.store().snapshot(), agent, 0).unwrap();
         if by_snapshot {
-            cluster.compacted_past(leading, agent, stopped_at);
+            cluster.compacted_past(agent, stopped_at);
         }
         cluster.start(follower);
         let back = cluster.node(follower);

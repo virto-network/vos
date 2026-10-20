@@ -311,7 +311,7 @@ fn a_snapshot_carries_a_living_workflows_pin() {
         let added = vos_checker::calls::done(cluster.increment_at_leader(agent, sequence, 1));
         assert_eq!(added, sequence - 1);
     }
-    cluster.compacted_past(leader, agent, 20);
+    cluster.compacted_past(agent, 20);
     cluster.start(follower);
     cluster.converged(agent);
     let caught_up = cluster.node(follower);

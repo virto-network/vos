@@ -175,12 +175,12 @@ fn every_replica_builds_the_same_root() {
 fn a_follower_caught_up_by_a_snapshot_builds_the_same_root() {
     let mut cluster = Cluster::tuned(3, compacting);
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    let (leader, follower) = cluster.leader_and_follower(agent);
+    let (_, follower) = cluster.leader_and_follower(agent);
     write(&cluster, agent, 1..=10);
     same_root(&cluster, agent, &[1, 2, 3]);
     cluster.stop(follower);
     write(&cluster, agent, 11..=40);
-    cluster.compacted_past(leader, agent, 30);
+    cluster.compacted_past(agent, 30);
     cluster.start(follower);
     std::thread::scope(|scope| {
         let cluster = &cluster;

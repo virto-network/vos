@@ -3274,6 +3274,12 @@ test's or its harness's, not a node's:
   past it, and it came back by the log ("no node caught up by a
   snapshot", with the compaction logged done). Its bound is the running
   replicas' last entry, read once it is down.
+- **One replica's compaction read for all.** The snapshot tests waited
+  for the leader to compact past the stopped follower, then expected a
+  snapshot; a loaded host moved leadership to a replica whose durable
+  applies lagged and whose log still held the follower's entries, and it
+  caught up by the log ("switched once", 0). `compacted_past` waits for
+  every running replica.
 - **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
   counted any result past its start; an install applied late is one. A
   marker is an empty result, and only those count.

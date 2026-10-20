@@ -64,7 +64,7 @@ fn a_follower_behind_the_log_catches_up_by_a_snapshot() {
     cluster.stop(follower);
     cluster.install(agent);
     cluster.increments(leader, agent, 1..=30);
-    cluster.compacted_past(leader, agent, 20);
+    cluster.compacted_past(agent, 20);
     cluster.start(follower);
     // Calls go on while it catches up.
     let total = std::thread::scope(|scope| {
@@ -110,7 +110,7 @@ fn a_snapshot_stream_outlasting_the_leaders_deadline_goes_on() {
     cluster.stop(follower);
     cluster.install(agent);
     let total = cluster.increments(leader, agent, 1..=30);
-    cluster.compacted_past(leader, agent, 20);
+    cluster.compacted_past(agent, 20);
     // The leader streams to the stopped follower once its log is compacted
     // past it. That stream may still run, and serve the restarted
     // follower, or have fallen silent and ended: the restart needs one
@@ -141,7 +141,7 @@ fn a_replica_caught_up_by_a_snapshot_answers_from_its_window_when_it_leads() {
     let (leader, follower) = cluster.leader_and_follower(agent);
     cluster.stop(follower);
     let total = cluster.increments(leader, agent, 1..=30);
-    cluster.compacted_past(leader, agent, 20);
+    cluster.compacted_past(agent, 20);
     cluster.start(follower);
     cluster.converged(agent);
     assert!(log_start(cluster.node(follower), agent) > 20);
@@ -176,7 +176,7 @@ fn a_snapshot_cut_short_is_sent_again() {
     cluster.stop(follower);
     // Enough rows for many chunks.
     let total = cluster.increments(leader, agent, 1..=60);
-    cluster.compacted_past(leader, agent, 40);
+    cluster.compacted_past(agent, 40);
     // Its follower stops while it stages.
     cluster.start(follower);
     std::thread::sleep(Duration::from_millis(15));
@@ -212,7 +212,7 @@ fn a_snapshot_waits_for_the_programs_it_names() {
     cluster.stop(follower);
     cluster.install(agent);
     cluster.increments(leader, agent, 1..=30);
-    cluster.compacted_past(leader, agent, 20);
+    cluster.compacted_past(agent, 20);
     withheld.withhold(true);
     cluster.start(follower);
     wait_until("the follower stages the snapshot", || {
