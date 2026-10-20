@@ -2791,3 +2791,73 @@ Commits: `7b2c5d0a` (6.14b's merge), `f73a4999` (the fold), `5de84ad7`,
 `7acc49e0` (the gates' recipes), this record.
 
 **M3a accepted.**
+
+## Step 6.19: the JAM statements service
+
+On `s6/jam` (from `4447127a`). The full record is the step's log.
+
+- **Built:** `vos-statement-service` (`pvm/proof/statement/service`), a
+  JAM service for riscv64em on the venue guests' runtime (shared from
+  `vos-statement`'s guest). Items `Register`, `Migrate` (on JAM the
+  controller is an ed25519 key, signing `BLAKE2b-256("vos/space/migrate"
+  ‖ migrate)`), `Anchor` and `Submit`, its statement in the payload (at
+  most 64 KiB, as Kreivo bounds it; past it code 1) and its proof the
+  item's first extrinsic (`fetch` kind 4). Refine verifies the
+  registration's (1 to 16 founders, a registrable clock, a founding
+  signer), the migration's and the anchor's ed25519 signatures and runs
+  pin F's checks but `anchored` and `seen`, then the proof; its `Verdict`
+  at most 36,891 B. Accumulate holds the spaces (clock, controller, keys,
+  range, `Last`, suspension), the anchors and their evidence, `Seen` and
+  each item's outcome keyed by its payload's hash; applies pin D's anchor
+  rule and the registration's start bound at the slot's time (`genesis_ms
+  + slot × 6 s`); records a statement only on a code of 0, its roots
+  anchored and its id unseen. Anchors, rooted `Seen` entries and outcomes
+  are queued by the hour they expire and dropped a few an accumulate; a
+  rootless entry is never queued. A deployment's genesis hash, genesis
+  time and pins are a block of the program's read-only data that
+  `config::configure` fills before deploy: constants, changed by
+  redeploy; the service has no test mode.
+- **The JAM-only host** prices `fetch` by Gray Paper 0.8.0's per-kind
+  table and serves extrinsics (kinds 3, 4); its harness runs a service's
+  refine and accumulate.
+- **The golden fixtures fail one check each:** unanchored root, a root's
+  window and a root now change the venue's anchors, not the statement's
+  roots, which moved the io-hash too: the JAM service, verifying before it
+  reads its state, refused them `0x108` where the other venues refuse
+  `0x5`. Only `statements.cases` changed; the proofs are byte for byte.
+- **The builder** fits a package within CE 133's bound (`MAX_PACKAGE`,
+  204,800 B: payload, imports' references and 4 KiB of framing) as well as
+  `W_B`; a 64-request batch of 256 KiB of arguments splits, 32 in the
+  first package.
+- **Tooling:** `vos-jam` builds a GP 0.8.0 work package by hand, byte for
+  byte `jamt`'s, and submits it with its extrinsics through
+  `submitWorkPackage`; `live::statements` is the service's client;
+  `vos-venue`'s `JamVenue` the service as a node's venue; `vos jam
+  statements` deploys and drives it; `testnet.sh [agent|statements|both]`
+  on PolkaJam v0.8.0, its files and chain under `TMPDIR`; `just
+  jam-statements-testnet`.
+- **Measured** [measured]:
+  - the program 595,247 B (ELF 938,456 B), under the 4,000,000 B bound;
+  - refine, JAM-only host: a masked statement accepted 84.11M gas (the
+    rooted fixture), 83.78M (the rootless one); refused by the proof's
+    words 12.05M; refused before the proof 0.11–0.13M; a 256 KiB extrinsic
+    read and refused by the verifier 0.21M; `Register` 3.17M, `Anchor`
+    3.10M, `Migrate` 3.07M (an ed25519 verify each);
+  - accumulate: 75k–115k gas a report on the JAM-only host (its host calls
+    at the base); 107,910 on PolkaJam for the accepted statement, by the
+    service's own count;
+  - **PolkaJam v0.8.0 testnet (interpreter)**, `just
+    jam-statements-testnet` and `testnet.sh both` (the agent's 8
+    packages, then the service): the 256 KiB extrinsic landed (`0x104`,
+    208,160 gas); a space registered, window 3 anchored, an unlisted key
+    refused `Key`; the rootless masked statement accepted, 83,778,546 gas
+    on PolkaJam and on the JAM-only host, equal to the unit; replayed
+    `0x6`; the rooted one, bound to the fixtures' venue, `0x7`; the space
+    migrated; a second root `Equivocation`, the space suspended; each item
+    about 18 s from submission to its outcome at the finalized block; the
+    testnet logging no error.
+
+**Open:** no key management or `resume` item on JAM yet: a suspended JAM
+space stays suspended (6.14b's rotation needs `add_authority`'s
+equivalent); `JamVenue`'s calls block until the item lands, so a node's
+leader awaits about 18 s an anchor (6.21).

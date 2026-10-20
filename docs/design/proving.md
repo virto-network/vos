@@ -735,8 +735,10 @@ last for decades.**
   anchors and repeats, and records, checking an anchor's signer against
   the space's registered keys and keeping a rootless statement's `Seen`
   entry forever, as Kreivo does; accepted program ids are constants
-  changed by redeploy; a proof rides in its work item's payload (or as a
-  preimage; 6.0b decides). An actor in the
+  changed by redeploy; a statement rides in its `Submit` item's payload
+  and its proof as the item's extrinsic, since JAM-NP's CE 133 bounds the
+  package at 204,802 bytes (built in 6.19: `vos-statement-service`). An
+  actor in the
   default agent cannot host it: `MAX_HANDLER_GAS` 100M, a 512 KiB program
   cap (538,683 B with both formats linked), 2 KiB messages, no preimage
   access.

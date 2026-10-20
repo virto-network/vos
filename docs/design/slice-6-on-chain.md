@@ -1698,6 +1698,13 @@ fees are the teammate's.
   guest is 523,362 B); a package within CE 133's 204,802 B; the guest's
   `.bss` (a 64 MiB arena and a 1 MiB stack) within JAM's refine memory;
   PolkaJam v0.8.0 pinned (sha256 `e90c8ccd…`).
+- **As built** (`slice-6-progress.md`, 6.19): on JAM the controller is an
+  ed25519 key, which signs a `Migrate` item; a deployment's genesis hash,
+  genesis time and pins are a block of the linked program's read-only
+  data, set before it is deployed; each item's outcome is kept under its
+  payload's hash; the golden fixtures each fail one check alone, so the
+  service, verifying the proof before it reads its state, reaches every
+  fixture's class.
 - **Dep:** 6.0b, 6.5, 6.10. **Estimate:** 2.5–3 weeks (the new deploy
   tooling takes the upper bound).
 
