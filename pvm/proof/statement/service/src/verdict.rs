@@ -13,7 +13,7 @@ use vos_statement::vos_anchor::codec::{self, Reader};
 use vos_statement::vos_anchor::{RootKind, SpaceId, WindowClock};
 use vos_statement::{DecodeError, MAX_ROOT_AGE_MS};
 
-use crate::item::Kind;
+use crate::item::{Kind, Op};
 
 /// What a registration refine admitted names.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -89,6 +89,14 @@ pub enum Verdict {
     },
     /// A statement judged.
     Submit(Judged),
+    /// A control signed by the key it names, which accumulate checks is the
+    /// space's controller.
+    Control {
+        space: SpaceId,
+        nonce: u64,
+        op: Op,
+        controller: [u8; 32],
+    },
     /// An item of `kind` (none: no item's) refused at refine by `code`, its
     /// kind's ([`RegisterCode`], [`MigrateCode`], [`AnchorCode`]).
     Refused { kind: Option<Kind>, code: u32 },
@@ -148,6 +156,18 @@ impl Verdict {
                     out.extend_from_slice(&root.window.to_le_bytes());
                     out.extend_from_slice(&root.root);
                 }
+            }
+            Self::Control {
+                space,
+                nonce,
+                op,
+                controller,
+            } => {
+                out.push(5);
+                out.extend_from_slice(&space.0);
+                out.extend_from_slice(&nonce.to_le_bytes());
+                op.encode_to(&mut out);
+                out.extend_from_slice(controller);
             }
             Self::Refused { kind, code } => {
                 out.push(4);
@@ -224,6 +244,12 @@ impl Verdict {
                     code: reader.u32()?,
                 }
             }
+            5 => Self::Control {
+                space: SpaceId(reader.array()?),
+                nonce: reader.u64()?,
+                op: Op::decode_from(&mut reader)?,
+                controller: reader.array()?,
+            },
             _ => return Err(DecodeError::Noncanonical),
         };
         Ok((verdict, reader.used()))
@@ -236,6 +262,7 @@ impl Verdict {
             Self::Migrate { .. } => Some(Kind::Migrate),
             Self::Anchor { .. } => Some(Kind::Anchor),
             Self::Submit(_) => Some(Kind::Submit),
+            Self::Control { .. } => Some(Kind::Control),
             Self::Refused { kind, .. } => *kind,
         }
     }
@@ -305,6 +332,25 @@ pub enum AnchorCode {
     Equivocation = 10,
 }
 
+/// A control's outcome.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u32)]
+pub enum ControlCode {
+    Done = 0,
+    Item = 1,
+    Signature = 2,
+    Unregistered = 3,
+    /// The signer is not the space's controller.
+    Controller = 4,
+    /// Not the space's next nonce: a replay, or one out of order.
+    Nonce = 5,
+    /// A key listed already, or `MAX_FOUNDING_KEYS` listed, to add; one not
+    /// listed to remove.
+    Key = 6,
+    /// A resume while a signer of one of its equivocations is listed.
+    Suspended = 7,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -344,6 +390,12 @@ mod tests {
                 }],
                 code: 0,
             }),
+            Verdict::Control {
+                space: SpaceId([1; 32]),
+                nonce: 9,
+                op: Op::SetController([3; 32]),
+                controller: [2; 32],
+            },
             Verdict::Refused {
                 kind: None,
                 code: 1,

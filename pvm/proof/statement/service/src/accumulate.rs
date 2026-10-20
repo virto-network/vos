@@ -13,14 +13,19 @@
 //!   same root at its window again taken as a repeat, another root kept as
 //!   evidence and the space suspended; `Last < w`, w within its range;
 //!   `w < now_w`; `now − B_w ≤ MaxRootAge`.
+//! - **A control:** the signer the space's controller, its nonce the
+//!   space's next; a key added (at most `MAX_FOUNDING_KEYS`) or removed, a
+//!   resume once neither signer of any equivocation is listed, or another
+//!   controller.
 //! - **A statement** refine accepted: every root anchored (its space
 //!   registered and unsuspended, the window within its range and no older
 //!   than `MaxRootAge`, the root the one held), then unseen, then recorded
 //!   under the `Seen` rule. A verdict refine refused is recorded as it is,
 //!   so only a code 0 is ever accepted.
 //!
-//! Each item's outcome is kept under its payload's hash for its submitter
-//! to read. Rows age out: an anchor, a rooted statement's `Seen` entry and
+//! Each item's outcome is kept under its package's and its payload's
+//! hashes for its submitter to read: a later package of the same payload,
+//! anyone's, keeps its own. Rows age out: an anchor, a rooted statement's `Seen` entry and
 //! an outcome are queued, by the hour they expire in, and dropped a few an
 //! accumulate once that hour is past; a rootless statement's `Seen` entry
 //! is never queued, since it has no anchor to fail (pin F). `MaxRootAge` is
@@ -33,12 +38,14 @@ use alloc::vec::Vec;
 
 use vos_statement::MAX_ROOT_AGE_MS;
 use vos_statement::model::Range;
-use vos_statement::vos_anchor::{SpaceId, WindowClock};
+use vos_statement::vos_anchor::{MAX_FOUNDING_KEYS, SpaceId, WindowClock};
 
 use crate::config::Config;
-use crate::item::Kind;
+use crate::item::{Kind, Op};
 use crate::state::{self, AnchorRecord, Evidence, Outcome, SpaceRecord, Storage, keys};
-use crate::verdict::{AnchorCode, Judged, MigrateCode, RegisterCode, Registered, Verdict};
+use crate::verdict::{
+    AnchorCode, ControlCode, Judged, MigrateCode, RegisterCode, Registered, Verdict,
+};
 use crate::{SLOT_MS, natural};
 
 /// The rows queued to drop, by the hour they expire in.
@@ -51,6 +58,7 @@ const PRUNE_BASE: u32 = 8;
 /// gas, 2 a panic, …).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Operand {
+    pub package_hash: [u8; 32],
     pub payload_hash: [u8; 32],
     pub result: Result<Vec<u8>, u8>,
 }
@@ -66,6 +74,7 @@ impl Operand {
         let (&0, rest) = bytes.split_first()? else {
             return None;
         };
+        let package_hash = rest.get(..32)?.try_into().ok()?;
         let payload_hash = rest.get(96..128)?.try_into().ok()?;
         let (_, at) = natural(rest, 128)?;
         let (&tag, rest) = rest.get(at..)?.split_first()?;
@@ -78,6 +87,7 @@ impl Operand {
             error => Err(error),
         };
         Some(Self {
+            package_hash,
             payload_hash,
             result,
         })
@@ -97,16 +107,12 @@ pub fn accumulate(config: &Config, slot: u64, operands: &[Operand], storage: &mu
     let now = time(config, slot);
     for operand in operands {
         let outcome = apply(storage, now, operand);
-        storage.write(
-            &keys::outcome(&operand.payload_hash),
-            Some(&outcome.encode()),
-        );
-        enqueue(
-            storage,
-            now,
-            now.saturating_add(MAX_ROOT_AGE_MS),
-            &keys::outcome(&operand.payload_hash),
-        );
+        let at = keys::outcome(&state::outcome_id(
+            &operand.package_hash,
+            &operand.payload_hash,
+        ));
+        storage.write(&at, Some(&outcome.encode()));
+        enqueue(storage, now, now.saturating_add(MAX_ROOT_AGE_MS), &at);
     }
     let budget = u32::try_from(operands.len())
         .unwrap_or(u32::MAX)
@@ -159,6 +165,12 @@ fn apply(storage: &mut impl Storage, now: u64, operand: &Operand) -> Outcome {
             (anchor(storage, now, &space, kind, window, held), space.0)
         }
         Verdict::Submit(judged) => (submit(storage, now, &judged), judged.id),
+        Verdict::Control {
+            space,
+            nonce,
+            op,
+            controller,
+        } => (control(storage, &space, nonce, op, &controller), space.0),
         Verdict::Refused { code, .. } => (code, [0; 32]),
     };
     Outcome {
@@ -195,6 +207,8 @@ fn register(storage: &mut impl Storage, now: u64, registered: &Registered) -> u3
         },
         last: None,
         suspended: false,
+        equivocators: Vec::new(),
+        nonce: 0,
     };
     storage.write(&keys::space(&registered.space), Some(&record.encode()));
     RegisterCode::Registered as u32
@@ -267,6 +281,11 @@ fn anchor(
             storage.write(&at, Some(&evidence.encode()));
         }
         record.suspended = true;
+        for signer in [held.signer, signed.signer] {
+            if !record.equivocators.contains(&signer) {
+                record.equivocators.push(signer);
+            }
+        }
         storage.write(&keys::space(space), Some(&record.encode()));
         return AnchorCode::Equivocation as u32;
     }
@@ -288,6 +307,57 @@ fn anchor(
     storage.write(&at, Some(&signed.encode()));
     enqueue(storage, now, boundary.saturating_add(MAX_ROOT_AGE_MS), &at);
     AnchorCode::New as u32
+}
+
+/// A control: the controller's, at the space's next nonce; then its op, as
+/// the model venue's `add_anchor_key`, `remove_anchor_key` and `resume`
+/// apply it, a resume only once no equivocator is listed, which clears
+/// them.
+fn control(
+    storage: &mut impl Storage,
+    space: &SpaceId,
+    nonce: u64,
+    op: Op,
+    controller: &[u8; 32],
+) -> u32 {
+    let Some(mut record) = state::space(storage, space) else {
+        return ControlCode::Unregistered as u32;
+    };
+    if record.controller != *controller {
+        return ControlCode::Controller as u32;
+    }
+    if nonce != record.nonce {
+        return ControlCode::Nonce as u32;
+    }
+    match op {
+        Op::AddKey(key) => {
+            if record.keys.contains(&key) || record.keys.len() >= MAX_FOUNDING_KEYS {
+                return ControlCode::Key as u32;
+            }
+            record.keys.push(key);
+        }
+        Op::RemoveKey(key) => {
+            if !record.keys.contains(&key) {
+                return ControlCode::Key as u32;
+            }
+            record.keys.retain(|held| *held != key);
+        }
+        Op::Resume => {
+            if record
+                .equivocators
+                .iter()
+                .any(|signer| record.keys.contains(signer))
+            {
+                return ControlCode::Suspended as u32;
+            }
+            record.suspended = false;
+            record.equivocators.clear();
+        }
+        Op::SetController(key) => record.controller = key,
+    }
+    record.nonce = nonce.saturating_add(1);
+    storage.write(&keys::space(space), Some(&record.encode()));
+    ControlCode::Done as u32
 }
 
 fn submit(storage: &mut impl Storage, now: u64, judged: &Judged) -> u32 {

@@ -252,6 +252,15 @@ mod tests {
             "no import, no extrinsic"
         );
 
+        // A payload past 16 KiB takes a 3-byte length: the builder's
+        // framing bound, its imports' count at 1 byte here, not 3.
+        let large = WorkItem {
+            payload: vec![0; 200_000],
+            ..item.clone()
+        };
+        let package = encode_package(&context, &[large]);
+        assert_eq!(package.len(), 200_000 + crate::builder::PACKAGE_FRAMING - 2);
+
         let with = WorkItem {
             extrinsics: vec![vec![1, 2, 3]],
             ..item

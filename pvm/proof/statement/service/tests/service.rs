@@ -25,10 +25,11 @@ use vos_statement::vos_pvm_final_verifier::{MAX_PROOF_BYTES, masked};
 use vos_statement::{Pin, Refusal, blake2b_256};
 use vos_statement_service::config::{self, Config, configure};
 use vos_statement_service::item::{
-    Item, MAX_STATEMENT_BYTES, Register, SignedMigrate, migrate_digest,
+    Control, Item, MAX_ROOTS, MAX_STATEMENT_BYTES, Op, Register, SignedControl, SignedMigrate,
+    control_digest, migrate_digest,
 };
 use vos_statement_service::state::{self, AnchorRecord, Outcome, SpaceRecord, Storage, keys};
-use vos_statement_service::verdict::{AnchorCode, MigrateCode, RegisterCode};
+use vos_statement_service::verdict::{AnchorCode, ControlCode, MigrateCode, RegisterCode};
 use vos_statement_service::{MAX_VERDICT_BYTES, SLOT_MS};
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
 
@@ -54,6 +55,8 @@ fn linked() -> &'static [u8] {
 #[derive(Debug)]
 struct Landed {
     outcome: Outcome,
+    /// Its outcome's id: its package's and its payload's hashes.
+    id: [u8; 32],
     refine: u64,
     accumulate: u64,
 }
@@ -66,6 +69,8 @@ struct Rig {
     service: u32,
     storage: BTreeMap<Vec<u8>, Vec<u8>>,
     slot: u64,
+    /// The packages refined: each package's hash differs by it.
+    packages: u64,
 }
 
 impl Rig {
@@ -80,6 +85,7 @@ impl Rig {
             service,
             storage: BTreeMap::new(),
             slot: 0,
+            packages: 0,
         }
     }
 
@@ -108,8 +114,8 @@ impl Rig {
                 ..JamItem::default()
             })
             .collect();
-        let package_hash =
-            blake2b_256(&[&items.iter().map(|(p, _)| p.len() as u8).collect::<Vec<_>>()]);
+        self.packages += 1;
+        let package_hash = blake2b_256(&[&self.packages.to_le_bytes()]);
         let mut inputs = Vec::new();
         let mut refines = Vec::new();
         for (index, (payload, _)) in items.iter().enumerate() {
@@ -153,11 +159,14 @@ impl Rig {
         items
             .iter()
             .zip(refines)
-            .map(|((payload, _), refine)| Landed {
-                outcome: state::outcome(&mut self.storage, &blake2b_256(&[payload]))
-                    .expect("an outcome"),
-                refine,
-                accumulate,
+            .map(|((payload, _), refine)| {
+                let id = state::outcome_id(&package_hash, &blake2b_256(&[payload]));
+                Landed {
+                    outcome: state::outcome(&mut self.storage, &id).expect("an outcome"),
+                    id,
+                    refine,
+                    accumulate,
+                }
             })
             .collect()
     }
@@ -190,6 +199,8 @@ impl Rig {
                 range: space.range,
                 last: None,
                 suspended: false,
+                equivocators: Vec::new(),
+                nonce: 0,
             };
             self.storage
                 .write(&keys::space(&space.id), Some(&record.encode()));
@@ -714,6 +725,209 @@ fn a_migration_ends_the_spaces_range_here() {
     );
 }
 
+/// A control of `space` at `nonce`, signed by `by`.
+fn control(rig: &Rig, space: &SpaceId, nonce: u64, op: Op, by: &SigningKey) -> Vec<u8> {
+    let control = Control {
+        space: *space,
+        nonce,
+        op,
+    };
+    Item::Control(SignedControl {
+        control,
+        controller: by.verifying_key().to_bytes(),
+        signature: by.sign(&control_digest(&rig.venue(), &control)).to_bytes(),
+    })
+    .encode()
+}
+
+/// The controller's controls, each at the space's next nonce: a key added
+/// anchors, a replay of its control refused, a key removed anchors no more;
+/// a resume refused while a signer of the equivocation is listed, taken
+/// once both are removed; another controller, the old one refused after.
+#[test]
+fn the_controller_adds_and_removes_keys_resumes_and_hands_over() {
+    let space = founded(2);
+    let mut rig = live_rig(1_000);
+    let code = |rig: &mut Rig, payload| rig.code(payload, Vec::new());
+    let (first, second) = (&space.founders[0], &space.founders[1]);
+    let controller = &space.controller;
+    let payload = control(&rig, &space.id, 0, Op::Resume, controller);
+    assert_eq!(code(&mut rig, payload), ControlCode::Unregistered as u32);
+    let payload = register(&rig, &space, first, 990);
+    assert_eq!(code(&mut rig, payload), 0);
+
+    let rotated = key(0x33);
+    let add = Op::AddKey(rotated.verifying_key().to_bytes());
+    let payload = control(&rig, &space.id, 0, add, first);
+    assert_eq!(code(&mut rig, payload), ControlCode::Controller as u32);
+    let mut forged = Item::decode(&control(&rig, &space.id, 0, add, controller)).unwrap();
+    if let Item::Control(signed) = &mut forged {
+        signed.control.nonce = 1;
+    }
+    assert_eq!(
+        code(&mut rig, forged.encode()),
+        ControlCode::Signature as u32
+    );
+    let payload = control(&rig, &space.id, 1, add, controller);
+    assert_eq!(code(&mut rig, payload), ControlCode::Nonce as u32, "ahead");
+    let added = control(&rig, &space.id, 0, add, controller);
+    let landed = rig.item(added.clone(), Vec::new());
+    assert_eq!(landed.outcome.code, ControlCode::Done as u32);
+    eprintln!(
+        "control: refine {:.2}M gas, accumulate {} gas",
+        landed.refine as f64 / 1e6,
+        landed.accumulate
+    );
+    let payload = anchor(&rig, &space.id, 997, 1, &rotated);
+    assert_eq!(code(&mut rig, payload), 0, "the added key anchors");
+    let remove = Op::RemoveKey(rotated.verifying_key().to_bytes());
+    let payload = control(&rig, &space.id, 1, remove, controller);
+    assert_eq!(code(&mut rig, payload), 0);
+    assert_eq!(
+        code(&mut rig, added),
+        ControlCode::Nonce as u32,
+        "a replayed add does not list the key again"
+    );
+    let payload = anchor(&rig, &space.id, 998, 1, &rotated);
+    assert_eq!(code(&mut rig, payload), AnchorCode::Key as u32);
+    let payload = control(&rig, &space.id, 2, remove, controller);
+    assert_eq!(
+        code(&mut rig, payload),
+        ControlCode::Key as u32,
+        "not listed"
+    );
+
+    // An equivocation by both founders, then a resume.
+    let payload = anchor(&rig, &space.id, 998, 1, first);
+    assert_eq!(code(&mut rig, payload), 0);
+    let payload = anchor(&rig, &space.id, 998, 2, second);
+    assert_eq!(code(&mut rig, payload), AnchorCode::Equivocation as u32);
+    let payload = control(&rig, &space.id, 2, Op::Resume, controller);
+    assert_eq!(code(&mut rig, payload), ControlCode::Suspended as u32);
+    for (nonce, signer) in [(2, first), (3, second)] {
+        let op = Op::RemoveKey(signer.verifying_key().to_bytes());
+        let payload = control(&rig, &space.id, nonce, op, controller);
+        assert_eq!(code(&mut rig, payload), 0);
+        if nonce == 2 {
+            let payload = control(&rig, &space.id, 3, Op::Resume, controller);
+            assert_eq!(code(&mut rig, payload), ControlCode::Suspended as u32);
+        }
+    }
+    let payload = control(&rig, &space.id, 4, add, controller);
+    assert_eq!(code(&mut rig, payload), 0);
+    let payload = control(&rig, &space.id, 5, Op::Resume, controller);
+    assert_eq!(code(&mut rig, payload), 0);
+    let record = rig.space(&space.id).unwrap();
+    assert!(!record.suspended && record.equivocators.is_empty());
+    let payload = anchor(&rig, &space.id, 999, 1, &rotated);
+    assert_eq!(code(&mut rig, payload), 0, "resumed, by the rotated key");
+
+    let successor = key(0xc1);
+    let op = Op::SetController(successor.verifying_key().to_bytes());
+    let payload = control(&rig, &space.id, 6, op, controller);
+    assert_eq!(code(&mut rig, payload), 0);
+    let payload = control(&rig, &space.id, 7, Op::Resume, controller);
+    assert_eq!(code(&mut rig, payload), ControlCode::Controller as u32);
+    let payload = control(&rig, &space.id, 7, Op::Resume, &successor);
+    assert_eq!(code(&mut rig, payload), 0);
+    // At most `MAX_FOUNDING_KEYS` listed.
+    for nonce in 8..8 + 15 {
+        let op = Op::AddKey(key(nonce as u8).verifying_key().to_bytes());
+        let payload = control(&rig, &space.id, nonce, op, &successor);
+        assert_eq!(code(&mut rig, payload), 0, "{nonce}");
+    }
+    let op = Op::AddKey(key(0xfe).verifying_key().to_bytes());
+    let payload = control(&rig, &space.id, 23, op, &successor);
+    assert_eq!(code(&mut rig, payload), ControlCode::Key as u32, "the 17th");
+}
+
+/// A statement reading more than `MAX_ROOTS` roots is refused at refine as
+/// undecodable, its proof unread.
+#[test]
+fn a_statement_of_too_many_roots_is_refused() {
+    let valid = fixture("valid");
+    let mut rig = fixture_rig(&valid);
+    let mut statement = valid.input.statement.clone();
+    let root = statement.roots[0];
+    statement.roots = vec![root; MAX_ROOTS + 1];
+    let landed = rig.item(submit(&statement.encode()), vec![valid.proof.clone()]);
+    assert_eq!(landed.outcome.code, 1);
+    assert!(landed.refine < 1_000_000, "{} gas", landed.refine);
+}
+
+/// Each package's outcome is its own: a package of the same payload with
+/// a junk proof does not overwrite the accepted one's.
+#[test]
+fn a_later_package_of_the_same_payload_keeps_its_own_outcome() {
+    let valid = fixture("valid");
+    let mut rig = fixture_rig(&valid);
+    let payload = submit(&valid.input.statement.encode());
+    let accepted = rig.item(payload.clone(), vec![valid.proof.clone()]);
+    let junk = rig.item(payload, vec![vec![0; 16]]);
+    assert_ne!(accepted.id, junk.id);
+    assert_eq!(junk.outcome.code >> 8, 1);
+    assert_eq!(
+        state::outcome(&mut rig.storage, &accepted.id).unwrap().code,
+        0
+    );
+}
+
+/// A storage past what the service's balance holds answers `write` `FULL`:
+/// the program traps, so a JAM node reverts the whole accumulate.
+#[test]
+fn a_full_storage_traps_the_accumulate() {
+    use vos_pvm::accumulate_host::ServiceStorage;
+    struct Full(BTreeMap<Vec<u8>, Vec<u8>>);
+    impl ServiceStorage for Full {
+        fn read(&self, key: &[u8]) -> Option<Vec<u8>> {
+            self.0.get(key).cloned()
+        }
+        fn write(&mut self, key: &[u8], value: Option<&[u8]>) -> Option<usize> {
+            let previous = match value {
+                Some(value) => self.0.insert(key.to_vec(), value.to_vec()),
+                None => self.0.remove(key),
+            };
+            previous.map(|value| value.len())
+        }
+        fn full(&self, key: &[u8], _: Option<&[u8]>) -> bool {
+            key[0] == keys::SEEN
+        }
+    }
+    let rootless = fixture("rootless");
+    let mut rig = fixture_rig(&rootless);
+    let payload = submit(&rootless.input.statement.encode());
+    let args = RefineArgs::new(u64::from(rig.service), payload.clone(), [1; 32]);
+    let jam = JamRefine {
+        service: u64::from(rig.service),
+        items: vec![JamItem {
+            payload: payload.clone(),
+            extrinsics: vec![rootless.proof.clone()],
+            ..JamItem::default()
+        }],
+        ..JamRefine::default()
+    };
+    let refined = jam::refine(&rig.program, &args.encode(), jam, REFINE_GAS);
+    let operand = Operand {
+        package_hash: [1; 32],
+        segment_root: [0; 32],
+        authorizer: [0; 32],
+        payload_hash: blake2b_256(&[&payload]),
+        gas_limit: ACCUMULATE_GAS,
+        result: Ok(refined.output),
+        auth_trace: Vec::new(),
+    };
+    let mut full = Full(std::mem::take(&mut rig.storage));
+    let (exit, _) = jam::accumulate(
+        &rig.prepared,
+        rig.slot,
+        u64::from(rig.service),
+        &[AccumulateInput::Operand(operand).encode()],
+        &mut full,
+        ACCUMULATE_GAS,
+    );
+    assert_eq!(exit, ExitReason::Panic);
+}
+
 // ── Aging out ─────────────────────────────────────────────────────────────
 
 /// Past `MaxRootAge`, an anchor, a rooted statement's `Seen` entry and an
@@ -746,7 +960,8 @@ fn rows_age_out_past_max_root_age_and_a_rootless_entry_never() {
     let payload = register(&rig, &space, &space.founders[0], 40);
     assert_eq!(rig.code(payload, Vec::new()), 0);
     let anchored = anchor(&rig, &space.id, 41, 9, &space.founders[0]);
-    assert_eq!(rig.code(anchored.clone(), Vec::new()), 0);
+    let anchored = rig.item(anchored, Vec::new());
+    assert_eq!(anchored.outcome.code, 0);
     assert!(state::anchor(&mut rig.storage, &space.id, RootKind::Space, 41).is_some());
 
     // Past every expiry's hour, packages of an item each until the queue
@@ -762,10 +977,7 @@ fn rows_age_out_past_max_root_age_and_a_rootless_entry_never() {
         "kept"
     );
     assert!(state::anchor(&mut rig.storage, &space.id, RootKind::Space, 41).is_none());
-    assert_eq!(
-        state::outcome(&mut rig.storage, &blake2b_256(&[&anchored])),
-        None
-    );
+    assert_eq!(state::outcome(&mut rig.storage, &anchored.id), None);
     let hour = rig.now() / 3_600_000;
     let queued = rig.storage.keys().filter(|key| key[0] == keys::QUEUED);
     assert!(

@@ -2806,7 +2806,7 @@ On `s6/jam` (from `4447127a`). The full record is the step's log.
   registration's (1 to 16 founders, a registrable clock, a founding
   signer), the migration's and the anchor's ed25519 signatures and runs
   pin F's checks but `anchored` and `seen`, then the proof; its `Verdict`
-  at most 36,891 B. Accumulate holds the spaces (clock, controller, keys,
+  at most 2,734 B (a statement of at most 64 roots). Accumulate holds the spaces (clock, controller, keys,
   range, `Last`, suspension), the anchors and their evidence, `Seen` and
   each item's outcome keyed by its payload's hash; applies pin D's anchor
   rule and the registration's start bound at the slot's time (`genesis_ms
@@ -2857,7 +2857,28 @@ On `s6/jam` (from `4447127a`). The full record is the step's log.
     about 18 s from submission to its outcome at the finalized block; the
     testnet logging no error.
 
-**Open:** no key management or `resume` item on JAM yet: a suspended JAM
-space stays suspended (6.14b's rotation needs `add_authority`'s
-equivalent); `JamVenue`'s calls block until the item lands, so a node's
-leader awaits about 18 s an anchor (6.21).
+**The review** (Opus, accept with fixes), folded:
+- **F1:** a `write` the host refuses (`FULL`) traps, so the whole
+  accumulate reverts; the JAM-only host answers `FULL` for a full storage
+  (`ServiceStorage::full`); pin F and an ops note: the balance above the
+  threshold, alerted on.
+- **F2:** outcomes keyed by `BLAKE2b-256(package hash ‖ payload hash)`, so
+  a later package of the same payload cannot overwrite one;
+  `submit_package` returns the package's hash.
+- **F3:** a `Control { space, nonce, AddKey | RemoveKey | Resume |
+  SetController }` item, the controller's, at the space's next nonce; the
+  equivocators kept in the space's record, a resume as the model venue's;
+  `JamVenue::control`, `status`.
+- **F5:** the service created with a least accumulate gas an item (2M);
+  at most 64 roots a statement (code 1 past it).
+- **F6:** `JamVenue::new` checks the code hash against the configured blob
+  and the configuration's genesis against the chain's, its time from the
+  configuration; pin D: (genesis, service) fixes the code.
+- **F7:** pin F: a statement failing several checks gets its venue's first.
+- **F8:** the CE 133 test isolates the bound; `PACKAGE_FRAMING` exact (269
+  B, jamt's encoding); a package to the service holds at most 17 items,
+  their verdicts within a report; the verdict bound recorded (36,891 B
+  before the roots' cap; commit `c8150c54` said 36,972).
+- **F4** (`JamVenue` blocks about 18 s a call) waits for the merge onto
+  6.17b's non-blocking queue.
+

@@ -9,8 +9,10 @@
 //! - the golden fixtures' masked statements: the rootless one accepted (its
 //!   program pinned, not venue-bound), then refused as a repeat; the rooted
 //!   one, venue-bound to the fixtures' venue, refused as another venue's;
-//! - the space migrated away, then a second root for its window, its
-//!   evidence kept and the space suspended.
+//! - a second root for its window, its evidence kept and the space
+//!   suspended; the controller's controls: the founder's key removed, a
+//!   rotated key added (its control replayed, refused), the space resumed,
+//!   the rotated key anchoring; then the space migrated away.
 //!
 //! Each statement's refine gas, by the service's own count, is compared
 //! with the JAM-only host's for the same item; the record lists every
@@ -21,7 +23,7 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use vos_jam::live::PolkaJam;
-use vos_jam::live::statements::Statements;
+use vos_jam::live::statements::{MIN_ITEM_GAS, Statements};
 use vos_pvm::refine_host::{JamItem, JamRefine, RefineContext};
 use vos_pvm_compiler::{ServiceMetadata, service_blob};
 use vos_statement::fixtures::{self, Fixture};
@@ -31,8 +33,9 @@ use vos_statement::vos_anchor::{
 use vos_statement::vos_pvm_final_verifier::MAX_PROOF_BYTES;
 use vos_statement::{Pin, blake2b_256};
 use vos_statement_service::config::{Config, configure};
-use vos_statement_service::item::Item;
+use vos_statement_service::item::{Control, Item, Op, SignedControl, control_digest};
 use vos_statement_service::state::Outcome;
+use vos_statement_service::verdict::ControlCode;
 use vos_venue::VenueClient;
 use vos_venue::jam::{JamVenue, register_code};
 use vos_wire::jam::RefineArgs;
@@ -188,7 +191,7 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
     let blob = service_blob(&program, &METADATA);
     let file = args.data.join("statements.jam");
     std::fs::write(&file, &blob).map_err(at(&file))?;
-    let service = node.create_service(&file, ENDOWMENT)?;
+    let service = node.create_service(&file, ENDOWMENT, Some(MIN_ITEM_GAS))?;
     record.note(format!(
         "service {service}: the statements service, program {} B, blob {} B, code hash {}",
         program.len(),
@@ -198,8 +201,9 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
     let since =
         node.await_preimage(service, &digest(&blob), blob.len() as u64, PREIMAGE_TIMEOUT)?;
     record.note(format!("its code available since slot {since}"));
-    let statements = Statements::new(node, service, parameters.max_refine_gas)?;
-    let venue = JamVenue::new(statements, genesis);
+    let statements = Statements::new(node, service, parameters.max_refine_gas, EPOCH_MS)?;
+    let venue = JamVenue::new(statements, config.clone(), &blob)
+        .map_err(|mismatch| format!("the service's code: {mismatch:?}"))?;
     record.note(format!("the venue {}", hex::encode(venue.id().0)));
 
     // A proof of `MAX_PROOF_BYTES` as an extrinsic: the package past CE
@@ -299,8 +303,65 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
         &other,
     );
 
+    // A second root for its anchored window: the space suspended. Its
+    // controller delists the founder, lists a rotated key (a replay of
+    // which is refused) and resumes it; the rotated key anchors.
+    record.note(format!(
+        "a second root for window {start}: {:?}; {:?}",
+        venue.anchor(&anchor(start, 2, &founder)),
+        venue.status(&space)?
+    ));
+    let rotated = SigningKey::from_bytes(&blake2b_256(&[b"vos/jam/statements/rotated"]));
+    let add = Op::AddKey(rotated.verifying_key().to_bytes());
+    let controls = [
+        (
+            "remove the founder's key",
+            Op::RemoveKey(founder.verifying_key().to_bytes()),
+        ),
+        ("add a rotated key", add),
+        ("resume", Op::Resume),
+    ];
+    let mut controlled = Vec::new();
+    for (what, op) in controls {
+        let code = venue.control(&space, op, &controller)?;
+        record.note(format!("control, {what}: {code}"));
+        controlled.push(code);
+    }
+    let replayed_add = {
+        let control = Control {
+            space,
+            nonce: 1,
+            op: add,
+        };
+        let item = Item::Control(SignedControl {
+            control,
+            controller: controller.verifying_key().to_bytes(),
+            signature: ed25519_dalek::Signer::sign(
+                &controller,
+                &control_digest(&venue.id(), &control),
+            )
+            .to_bytes(),
+        });
+        venue.land(item.encode(), Vec::new())?.code
+    };
+    record.note(format!(
+        "the add's control replayed: {replayed_add}; {:?}",
+        venue.status(&space)?
+    ));
+    let later = loop {
+        let open = clock.window(venue.statements.now()?).unwrap_or(0);
+        if open >= start + 2 {
+            break open - 1;
+        }
+        std::thread::sleep(Duration::from_secs(6));
+    };
+    let resumed = venue.anchor(&anchor(later, 3, &rotated));
+    record.note(format!(
+        "anchor window {later} by the rotated key: {resumed:?}"
+    ));
+
     // The space migrated away from a window past the venue's next by the
-    // time its item lands, then a second root for its anchored window.
+    // time its item lands.
     let next = venue
         .statements
         .now()
@@ -313,11 +374,6 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
     };
     let migrated = venue.migrate(&migrate, &controller);
     record.note(format!("migrate from window {next}: {migrated:?}"));
-    record.note(format!(
-        "a second root for window {start}: {:?}; the space suspended: {:?}",
-        venue.anchor(&anchor(start, 2, &founder)),
-        venue.space(&space)?.map(|space| space.suspended)
-    ));
 
     let expected = [
         (landed.code, 0, "the rootless statement accepted"),
@@ -328,6 +384,12 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
         if code != expected {
             return Err(format!("{what}: code {code:#x}").into());
         }
+    }
+    if controlled != [0, 0, 0] || replayed_add != ControlCode::Nonce as u32 {
+        return Err(format!("the controls: {controlled:?}, the replay {replayed_add}").into());
+    }
+    if resumed != Ok(vos_venue::Anchored::New) {
+        return Err(format!("the rotated key's anchor: {resumed:?}").into());
     }
     migrated.map_err(|refusal| format!("the migration refused: {refusal:?}"))?;
     record.note("every verdict as expected");

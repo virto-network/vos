@@ -52,16 +52,24 @@ impl PolkaJam {
         Ok((stdout, stderr))
     }
 
-    /// Create a service of `code`, a service blob, endowed with `amount`:
-    /// its id.
-    pub fn create_service(&self, code: &Path, amount: u64) -> Result<u64, Error> {
+    /// Create a service of `code`, a service blob, endowed with `amount`,
+    /// each work item to it declaring at least `min_item_gas` of
+    /// accumulate gas (`jamt`'s default, 10,000, when none): its id.
+    pub fn create_service(
+        &self,
+        code: &Path,
+        amount: u64,
+        min_item_gas: Option<u64>,
+    ) -> Result<u64, Error> {
         let amount = amount.to_string();
-        let (printed, _) = self.jamt([
-            OsStr::new("create-service"),
-            OsStr::new("--raw"),
-            code.as_os_str(),
-            OsStr::new(&amount),
-        ])?;
+        let mut args: Vec<OsString> = vec!["create-service".into(), "--raw".into()];
+        if let Some(gas) = min_item_gas {
+            args.push("--min-item-gas".into());
+            args.push(gas.to_string().into());
+        }
+        args.push(code.as_os_str().to_owned());
+        args.push(amount.into());
+        let (printed, _) = self.jamt(args)?;
         service_id(&printed)
     }
 

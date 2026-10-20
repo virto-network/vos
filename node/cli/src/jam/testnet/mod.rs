@@ -185,7 +185,7 @@ impl Testnet {
         }
         let code = self.args.data.join("agent.jam");
         let blob = write_service(&self.agent, &METADATA, &code)?;
-        let service = self.node.create_service(&code, ENDOWMENT)?;
+        let service = self.node.create_service(&code, ENDOWMENT, None)?;
         self.note(format!(
             "service {service}: the agent, {} bytes, code hash {}",
             blob.len(),

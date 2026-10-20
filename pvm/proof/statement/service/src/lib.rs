@@ -25,9 +25,16 @@
 //! time a package costs its submitter, not `seen` before the proof.
 //!
 //! **Sizes.** A statement is at most [`item::MAX_STATEMENT_BYTES`], as
-//! Kreivo bounds it, so a verdict is at most [`MAX_VERDICT_BYTES`] (a
-//! statement's roots, 41 bytes each), within a report's 48 KiB: a package
-//! of one `Submit` fits its report whatever the statement.
+//! Kreivo bounds it, and [`item::MAX_ROOTS`] roots, so a verdict is at most
+//! [`MAX_VERDICT_BYTES`]: a package of [`MAX_ITEMS`] items fits its
+//! report's 48 KiB whatever its statements.
+//!
+//! **The service's balance must stay above its threshold.** A `write` past
+//! it answers `FULL` and writes nothing: the program then traps, so the
+//! whole accumulate reverts rather than record an outcome without its
+//! `Seen` entry or a `Last` without its anchor. Junk items' outcomes and
+//! rootless `Seen` entries grow the threshold; an operator alerts on the
+//! balance less the threshold (`info`).
 //!
 //! The service carries no test mode: what an item reaches accumulate as is
 //! what refine judged, and accumulate accepts a statement only on a code
@@ -68,17 +75,18 @@ pub use vos_statement;
 /// A JAM slot's length.
 pub const SLOT_MS: u64 = 6_000;
 
-/// The longest verdict refine outputs: a statement's at its bound, every
-/// byte past its header a root's (73 bytes in the statement, 41 in the
-/// verdict), with its header (its tag, id, program, space, code and a
-/// count of five bytes at most), and the gas's 8 after it.
-pub const MAX_VERDICT_BYTES: usize = 1 + 32 * 3 + 4 + 5 + ROOTS * 41 + 8;
-/// The most roots a statement of [`item::MAX_STATEMENT_BYTES`] holds.
-const ROOTS: usize = item::MAX_STATEMENT_BYTES / vos_statement::RootRead::BYTES;
+/// The longest verdict refine outputs: a statement's of [`item::MAX_ROOTS`]
+/// roots (41 bytes each in the verdict), with its header (its tag, id,
+/// program, space, code and its roots' count), and the gas's 8 after it.
+pub const MAX_VERDICT_BYTES: usize = 1 + 32 * 3 + 4 + 1 + item::MAX_ROOTS * 41 + 8;
 /// A work report's elective data, `W_R`: its outputs' bound.
 pub const REPORT_BYTES: usize = 48 << 10;
 
-const _: () = assert!(MAX_VERDICT_BYTES <= REPORT_BYTES);
+/// The most items a package to the service holds: their verdicts within a
+/// report.
+pub const MAX_ITEMS: usize = REPORT_BYTES / MAX_VERDICT_BYTES;
+
+const _: () = assert!(MAX_ITEMS >= 1);
 
 /// A Gray Paper natural at `at` in `bytes`: its value and where it ends.
 pub fn natural(bytes: &[u8], at: usize) -> Option<(u64, usize)> {

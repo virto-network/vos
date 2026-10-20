@@ -13,7 +13,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use vos_pvm::ExitReason;
-use vos_pvm::accumulate_host::AccumulateContext;
+use vos_pvm::accumulate_host::{AccumulateContext, ServiceStorage};
 use vos_pvm::refine::PreparedProgram;
 use vos_pvm::refine_host::{JamItem, JamRefine, Preimages, RefineContext};
 use vos_statement::model::Input;
@@ -181,7 +181,7 @@ pub fn accumulate(
     slot: u64,
     service: u64,
     inputs: &[Vec<u8>],
-    storage: &mut BTreeMap<Vec<u8>, Vec<u8>>,
+    storage: &mut impl ServiceStorage,
     gas: u64,
 ) -> (ExitReason, u64) {
     let invocation = AccumulateContext::load(program, slot, service, inputs, gas, storage)

@@ -7,7 +7,10 @@
 //!   names, which accumulate checks is the space's controller.
 //! - **An anchor:** signed by the key it names over its digest at this
 //!   venue; accumulate checks the key is one of the space's.
-//! - **A statement:** at most [`MAX_STATEMENT_BYTES`], decoding; then pin
+//! - **A control:** signed by the key it names over its digest at this
+//!   venue; accumulate checks the key is the space's controller.
+//! - **A statement:** at most [`MAX_STATEMENT_BYTES`] and [`MAX_ROOTS`]
+//!   roots, decoding; then pin
 //!   F's checks in order, but `anchored` and `seen`, which accumulate makes:
 //!   the format, the program against this deployment's pins, the venue if
 //!   venue-bound, the space rule, the io-hash and the id; then its proof,
@@ -27,8 +30,10 @@ use vos_statement::{
 };
 
 use crate::config::Config;
-use crate::item::{Item, Kind, MAX_STATEMENT_BYTES, migrate_digest};
-use crate::verdict::{AnchorCode, Judged, MigrateCode, RegisterCode, Registered, Root, Verdict};
+use crate::item::{Item, Kind, MAX_ROOTS, MAX_STATEMENT_BYTES, control_digest, migrate_digest};
+use crate::verdict::{
+    AnchorCode, ControlCode, Judged, MigrateCode, RegisterCode, Registered, Root, Verdict,
+};
 
 /// The item's extrinsics, which a `Submit` reads its proof from.
 pub trait Extrinsics {
@@ -91,6 +96,7 @@ pub fn refine(
             let code = match kind {
                 Some(Kind::Anchor) => AnchorCode::Item as u32,
                 Some(Kind::Migrate) => MigrateCode::Item as u32,
+                Some(Kind::Control) => ControlCode::Item as u32,
                 _ => RegisterCode::Item as u32,
             };
             return Verdict::Refused { kind, code };
@@ -163,6 +169,26 @@ pub fn refine(
             }
         }
         Item::Submit(bytes) => Verdict::Submit(judge(config, venue, &bytes, extrinsics)),
+        Item::Control(signed_control) => {
+            let digest = control_digest(&venue, &signed_control.control);
+            if !signed(
+                &signed_control.controller,
+                &digest,
+                &signed_control.signature,
+            ) {
+                return Verdict::Refused {
+                    kind: Some(Kind::Control),
+                    code: ControlCode::Signature as u32,
+                };
+            }
+            let control = signed_control.control;
+            Verdict::Control {
+                space: control.space,
+                nonce: control.nonce,
+                op: control.op,
+                controller: signed_control.controller,
+            }
+        }
     }
 }
 
@@ -176,7 +202,12 @@ fn judge(
     let statement = if bytes.len() > MAX_STATEMENT_BYTES {
         Err(DecodeError::Trailing)
     } else {
-        Statement::decode(bytes)
+        Statement::decode(bytes).and_then(|statement| {
+            if statement.roots.len() > MAX_ROOTS {
+                return Err(DecodeError::Noncanonical);
+            }
+            Ok(statement)
+        })
     };
     let statement = match statement {
         Ok(statement) => statement,

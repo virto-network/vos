@@ -187,9 +187,13 @@ impl Storage for Service {
         Some(value)
     }
 
+    /// A write the host refuses (`FULL`: the service's balance below the
+    /// threshold the write would raise, or anything but a length or `NONE`)
+    /// traps, so the whole accumulate reverts: no outcome lands without
+    /// the rows it reports.
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) {
         let value = value.unwrap_or_default();
-        hostcall!(
+        let answer = hostcall!(
             WRITE,
             [
                 key.as_ptr() as u64,
@@ -200,7 +204,16 @@ impl Storage for Service {
                 0
             ]
         );
+        if answer != NONE && answer > u64::from(u32::MAX) {
+            trap();
+        }
     }
+}
+
+/// Stop the invocation with a panic: on accumulate, every write reverts.
+fn trap() -> ! {
+    // SAFETY: `unimp` lowers to a PVM trap.
+    unsafe { core::arch::asm!("unimp", options(noreturn)) }
 }
 
 // ── The entries ──────────────────────────────────────────────────────────

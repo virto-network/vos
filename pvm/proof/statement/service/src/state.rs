@@ -3,11 +3,11 @@
 //!
 //! | key | value |
 //! |---|---|
-//! | `0x01 ‖ space` | [`SpaceRecord`]: its clock, controller, anchor keys, range, last window anchored, suspension |
+//! | `0x01 ‖ space` | [`SpaceRecord`]: its clock, controller, anchor keys, range, last window anchored, suspension and its equivocators, its controls' nonce |
 //! | `0x02 ‖ space ‖ kind ‖ w (8, BE)` | [`AnchorRecord`]: the root anchored and its signer |
 //! | `0x03 ‖ statement id` | a `Seen` entry: the venue time it expires at (8, LE), `u64::MAX` never |
 //! | `0x04 ‖ space ‖ kind ‖ w (8, BE)` | [`Evidence`]: the root held and the other, each with its signer |
-//! | `0x05 ‖ payload hash` | [`Outcome`]: what became of the item whose payload hashes so |
+//! | `0x05 ‖ outcome id` | [`Outcome`]: what became of an item, by [`outcome_id`]: its package's and its payload's hashes |
 //! | `0x06 ‖ bucket (8, BE)` | the count of rows queued to drop in the hour `bucket` (4, LE) |
 //! | `0x07 ‖ bucket (8, BE) ‖ i (4, BE)` | the key of a row to drop once the hour `bucket` is past |
 //! | `0x08` | the pruning's cursor: the bucket (8) and the index (4) it is at |
@@ -88,8 +88,9 @@ pub mod keys {
         .concat()
     }
 
-    pub fn outcome(payload_hash: &[u8; 32]) -> Vec<u8> {
-        [&[OUTCOME][..], payload_hash].concat()
+    /// An item's outcome, by [`super::outcome_id`].
+    pub fn outcome(id: &[u8; 32]) -> Vec<u8> {
+        [&[OUTCOME][..], id].concat()
     }
 
     pub fn bucket(bucket: u64) -> Vec<u8> {
@@ -115,6 +116,11 @@ pub struct SpaceRecord {
     pub last: Option<u64>,
     /// It equivocated: its roots are not anchored, its anchors refused.
     pub suspended: bool,
+    /// The signers of its equivocations, both of each, which a resume
+    /// needs delisted.
+    pub equivocators: Vec<[u8; 32]>,
+    /// Its controls taken: the nonce its next one names.
+    pub nonce: u64,
 }
 
 fn put_option(out: &mut Vec<u8>, value: Option<u64>) {
@@ -144,9 +150,12 @@ impl SpaceRecord {
         put_option(&mut out, self.range.until);
         put_option(&mut out, self.last);
         out.push(u8::from(self.suspended));
-        codec::compact(&mut out, self.keys.len() as u64);
-        for key in &self.keys {
-            out.extend_from_slice(key);
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        for keys in [&self.keys, &self.equivocators] {
+            codec::compact(&mut out, keys.len() as u64);
+            for key in keys {
+                out.extend_from_slice(key);
+            }
         }
         out
     }
@@ -163,10 +172,12 @@ impl SpaceRecord {
             1 => true,
             _ => return Err(DecodeError::Noncanonical),
         };
-        let count = reader.count(32)?;
-        let keys = (0..count)
-            .map(|_| reader.array())
-            .collect::<Result<_, _>>()?;
+        let nonce = reader.u64()?;
+        let mut keys = || -> Result<Vec<[u8; 32]>, DecodeError> {
+            let count = reader.count(32)?;
+            (0..count).map(|_| reader.array()).collect()
+        };
+        let (keys, equivocators) = (keys()?, keys()?);
         reader.finish()?;
         Ok(Self {
             clock,
@@ -175,6 +186,8 @@ impl SpaceRecord {
             range: Range { from, until },
             last,
             suspended,
+            equivocators,
+            nonce,
         })
     }
 }
@@ -294,10 +307,16 @@ pub fn seen(storage: &mut impl Storage, id: &StatementId) -> Option<u64> {
     Some(u64::from_le_bytes(bytes.try_into().ok()?))
 }
 
-/// The outcome of the item whose payload hashes to `payload_hash`.
-pub fn outcome(storage: &mut impl Storage, payload_hash: &[u8; 32]) -> Option<Outcome> {
+/// An item's outcome id: `BLAKE2b-256(package hash ‖ payload hash)`, so
+/// its own package's outcome, not a later package's of the same payload.
+pub fn outcome_id(package_hash: &[u8; 32], payload_hash: &[u8; 32]) -> [u8; 32] {
+    vos_statement::blake2b_256(&[package_hash, payload_hash])
+}
+
+/// The outcome of the item of id `id` ([`outcome_id`]).
+pub fn outcome(storage: &mut impl Storage, id: &[u8; 32]) -> Option<Outcome> {
     storage
-        .read(&keys::outcome(payload_hash))
+        .read(&keys::outcome(id))
         .and_then(|bytes| Outcome::decode(&bytes).ok())
 }
 
@@ -318,6 +337,8 @@ mod tests {
             },
             last: Some(7),
             suspended: true,
+            equivocators: vec![[5; 32], [6; 32]],
+            nonce: 3,
         };
         assert_eq!(SpaceRecord::decode(&space.encode()), Ok(space.clone()));
         let open = SpaceRecord {
@@ -327,6 +348,7 @@ mod tests {
             },
             last: None,
             suspended: false,
+            equivocators: Vec::new(),
             ..space
         };
         assert_eq!(SpaceRecord::decode(&open.encode()), Ok(open));

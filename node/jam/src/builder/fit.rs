@@ -88,11 +88,13 @@ pub(crate) const MAX_INPUT: usize = 12 << 20;
 /// downloads no huge package before it checks its authorization. PolkaJam
 /// enforces it; extrinsics travel apart, under `W_B` alone.
 pub const MAX_PACKAGE: usize = 204_800;
-/// A package's bytes beyond its payload and its imports' references: its
-/// authorization, its context and its item's fixed fields, 269 bytes with
-/// PolkaJam's bootstrap authorizer [6.0b], with room for the refusals one
-/// testnet gave near 201.6 KB that the bound does not explain.
-pub const PACKAGE_FRAMING: usize = 4 << 10;
+/// A package's bytes beyond its payload and its imports' references, at
+/// most, as `jamt` encodes it (`live::package::encode_package`, the same
+/// bytes): its authorization by PolkaJam's bootstrap authorizer, its
+/// context and its item's fixed fields, 262 bytes, with its payload's
+/// length (3 bytes to 2 MiB), its imports' count (3 bytes to 2 MiB of them)
+/// and its extrinsics' (1).
+pub const PACKAGE_FRAMING: usize = 262 + 3 + 3 + 1;
 /// An import's reference in a work item: a segment root and its index.
 pub const IMPORT_REF: usize = 32 + 2;
 

@@ -10,6 +10,15 @@
 //! proof keeps its class and its final verifier's code, but for a STARK's
 //! refusal other than OODS or PoW, which reads as an invalid structure:
 //! [`JamVenue::submit_code`] gives the service's code itself.
+//!
+//! A `JamVenue` is made only for a service whose code is the one the node
+//! expects: its code hash the deployed blob's, that blob's configuration
+//! block the expected configuration, whose genesis hash is the chain's.
+//! The service never calls `upgrade`, so its id, the chain and the
+//! service's number, fixes its code and its pins for good.
+//!
+//! Its calls wait for their items to land, about three slots; a node's
+//! leader takes them through 6.17b's non-blocking queue (at the merge).
 
 use std::time::Duration;
 
@@ -19,11 +28,22 @@ use vos_jam::Error;
 use vos_jam::live::statements::{Item as Package, Statements};
 use vos_statement::vos_pvm_final_verifier::Error as ProofError;
 use vos_statement::{DecodeError, MAX_ROOT_AGE_MS, Refusal, Statement, StatementId};
-use vos_statement_service::item::{Item, Register, SignedMigrate, migrate_digest};
+use vos_statement_service::config::{Config, configure};
+use vos_statement_service::item::{
+    Control, Item, Op, Register, SignedControl, SignedMigrate, control_digest, migrate_digest,
+};
 use vos_statement_service::state::{AnchorRecord, Outcome, SpaceRecord, keys};
 use vos_statement_service::verdict::{AnchorCode, MigrateCode, RegisterCode};
 
 use crate::{AnchorRefusal, Anchored, MigrateRefusal, VenueClient};
+
+/// A space's standing at the service.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Unregistered,
+    Active,
+    Suspended,
+}
 
 /// How long an item's outcome may take to land.
 pub const LANDING: Duration = Duration::from_secs(120);
@@ -31,18 +51,68 @@ pub const LANDING: Duration = Duration::from_secs(120);
 /// A JAM statements service, as a node's venue.
 pub struct JamVenue {
     pub statements: Statements,
-    /// The JAM chain's genesis hash, which the venue's id hashes.
-    pub genesis: [u8; 32],
+    /// The deployment's constants, which its code holds.
+    pub config: Config,
+}
+
+/// What a service's code is checked for.
+#[derive(Debug)]
+pub enum Mismatch {
+    /// The chain holds another code for the service than `code`.
+    Code,
+    /// `code`'s configuration is not the expected one.
+    Config,
+    /// The configuration names another chain than the node's.
+    Genesis,
+    Node(Error),
 }
 
 impl JamVenue {
-    /// The service `statements` of the chain whose genesis hash is
-    /// `genesis`.
-    pub fn new(statements: Statements, genesis: [u8; 32]) -> Self {
-        Self {
-            statements,
-            genesis,
+    /// The service `statements`, checked to run `code`, the service blob
+    /// deployed, whose configuration block holds `config`, `config` naming
+    /// the chain the node is on; its time from `config`'s genesis time.
+    pub fn new(mut statements: Statements, config: Config, code: &[u8]) -> Result<Self, Mismatch> {
+        if vos_statement::blake2b_256(&[code]) != statements.code_hash {
+            return Err(Mismatch::Code);
         }
+        let mut configured = code.to_vec();
+        configure(&mut configured, &config).map_err(|_| Mismatch::Config)?;
+        if configured != code {
+            return Err(Mismatch::Config);
+        }
+        if statements.node.genesis().map_err(Mismatch::Node)? != config.genesis {
+            return Err(Mismatch::Genesis);
+        }
+        statements.genesis_ms = config.genesis_ms;
+        Ok(Self { statements, config })
+    }
+
+    /// A space's control by its controller, at its next nonce as the
+    /// finalized block holds it: the service's code (`ControlCode`).
+    pub fn control(&self, space: &SpaceId, op: Op, controller: &SigningKey) -> Result<u32, Error> {
+        let nonce = self.space(space)?.map_or(0, |record| record.nonce);
+        let control = Control {
+            space: *space,
+            nonce,
+            op,
+        };
+        let item = Item::Control(SignedControl {
+            control,
+            controller: controller.verifying_key().to_bytes(),
+            signature: controller
+                .sign(&control_digest(&self.id(), &control))
+                .to_bytes(),
+        });
+        Ok(self.land(item.encode(), Vec::new())?.code)
+    }
+
+    /// A space's standing here: unregistered, active or suspended.
+    pub fn status(&self, space: &SpaceId) -> Result<Status, Error> {
+        Ok(match self.space(space)? {
+            None => Status::Unregistered,
+            Some(record) if record.suspended => Status::Suspended,
+            Some(_) => Status::Active,
+        })
     }
 
     /// One item, landed: its outcome.
@@ -159,7 +229,7 @@ pub fn refusal(code: u32) -> Refusal {
 impl VenueClient for JamVenue {
     fn id(&self) -> VenueId {
         let service = u32::try_from(self.statements.service).unwrap_or(u32::MAX);
-        VenueId::jam(&self.genesis, service)
+        VenueId::jam(&self.config.genesis, service)
     }
 
     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {

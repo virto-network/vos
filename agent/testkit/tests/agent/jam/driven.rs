@@ -552,6 +552,13 @@ fn the_builder_fits_a_batch_to_ce_133s_package_bound() {
     );
     assert!(inputs < requests.len(), "{inputs} of the requests");
     assert!(prepared.package_bytes() <= builder::MAX_PACKAGE);
+    // The batch halved on CE 133's bound alone: twice this package passes
+    // it, while twice its own work and its exports fit the gas and the
+    // segments.
+    assert_eq!(inputs * 2, requests.len());
+    assert!(2 * prepared.package_bytes() > builder::MAX_PACKAGE);
+    assert!(2 * (prepared.gas - prepared.package.batch.budget) <= builder::OWN_BOUND);
+    assert!(2 * prepared.exports() as usize <= vos_wire::package::MAX_SEGMENTS);
     assert!(prepared.payload.len() > builder::MAX_PACKAGE / 4);
     let rest = requests[inputs..].to_vec();
     let later = driven
