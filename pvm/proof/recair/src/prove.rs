@@ -179,6 +179,36 @@ where
     Ok(scheme.roots()[0])
 }
 
+/// The preprocessed tree's root of a circuit whose wiring checks, as a
+/// masked `format` commits it on `MC`'s trees: each column extended one
+/// level, under the format's blowup, at the masked lifting height.
+pub fn masked_preprocessed_root_on<MC: MerkleChannel>(
+    format: &Format,
+    circuit: &Circuit,
+) -> Result<<MC::H as MerkleHasherLifted>::Hash, WiringError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    use vos_pvm_recair_air::masked::{MASKED_COLUMN_EXPANSION, MASKED_LOG_CONSTRAINT_EXPANSION};
+
+    circuit.check_wiring()?;
+    let log_sizes = circuit.log_sizes();
+    let tallest = log_sizes.iter().copied().max().unwrap_or(0);
+    let lifting = tallest + MASKED_LOG_CONSTRAINT_EXPANSION + format.params.log_blowup;
+    let twiddles =
+        SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
+    let columns: Vec<_> =
+        SimdBackend::interpolate_columns(preprocessed_evaluations(circuit), &twiddles)
+            .into_iter()
+            .map(|poly| poly.extend(poly.log_size() + MASKED_COLUMN_EXPANSION))
+            .collect();
+    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(format.pcs_config(), &twiddles);
+    let mut builder = scheme.tree_builder();
+    builder.extend_polys(columns);
+    builder.commit(&mut MC::C::default());
+    Ok(scheme.roots()[0])
+}
+
 fn preprocessed_evaluations(circuit: &Circuit) -> Evaluations {
     let log_sizes = circuit.log_sizes();
     trace::preprocessed_columns(circuit)

@@ -192,7 +192,7 @@ fn value(account: &Account<Value>) -> Vec<u8> {
 }
 
 /// The space the tests' agent belongs to: [`genesis`] 1's.
-fn space() -> SpaceId {
+pub(crate) fn space() -> SpaceId {
     space_id(&genesis(1))
 }
 
@@ -224,7 +224,7 @@ fn small() -> Cut {
 }
 
 /// A million rows under 1,024 agents' roots, as spike 6.0a's.
-fn large() -> Cut {
+pub(crate) fn large() -> Cut {
     let started = Instant::now();
     let cut = cut_of(ROWS, AGENTS, true);
     eprintln!(
@@ -275,7 +275,7 @@ fn settle(
 }
 
 /// The honest settlement from [`CARRIED`].
-fn honest(cut: &Cut) -> cut::Live {
+pub(crate) fn honest(cut: &Cut) -> cut::Live {
     settle(cut, CARRIED.commitment(&PEER, CURRENCY), &CARRIED, |_| {})
 }
 

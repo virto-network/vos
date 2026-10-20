@@ -162,6 +162,16 @@ impl WrapCircuit {
             .expect("the wrap's wiring checks")
     }
 
+    /// Its preprocessed tree's root as format 39 commits it, masked: what
+    /// `vos-pvm-final-verifier` pins as `PREPROCESSED_ROOT_39`.
+    pub fn masked_preprocessed_root(&self) -> Blake2bHash {
+        crate::prove::masked_preprocessed_root_on::<Blake2bMerkleChannel>(
+            &MASKED_WRAP,
+            &self.topology().circuit,
+        )
+        .expect("the wrap's wiring checks")
+    }
+
     /// The values of the wrap of `root`, a valid proof of the padded shape,
     /// under the program whose id's preimage is `program`; and the statement
     /// its output carries, its program id and io-hash.

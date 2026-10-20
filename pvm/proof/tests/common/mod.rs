@@ -562,7 +562,7 @@ pub fn wrap_root(
 
 /// The process's peak resident set (`VmHWM`) in MiB, reset to the present
 /// one first when `reset`.
-fn resident_peak_mib(reset: bool) -> u64 {
+pub fn resident_peak_mib(reset: bool) -> u64 {
     if reset {
         // Writing 5 resets this process's peak resident set.
         std::fs::write("/proc/self/clear_refs", "5").expect("the peak resets");

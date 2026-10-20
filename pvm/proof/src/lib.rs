@@ -148,6 +148,7 @@ pub mod trace;
 // Poseidon2-M31 primitives and the security counts. All are `no_std`-clean
 // (the verifier path uses them); their prover-only pieces are
 // `#[cfg(feature = "prover")]` within.
+pub mod constants;
 pub mod format;
 pub mod pcs;
 pub mod poseidon2;
