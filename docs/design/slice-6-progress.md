@@ -3194,7 +3194,7 @@ test's or its harness's, not a node's:
   `a_resend_of_a_queued_first_call…` `NotLeader`).
 - **Calls at a stale leader.** `Cluster::call_at_leader` sends a request
   again at the agent's leader on `NotLeader` or `TimedOut` (a resend at its
-  sequence runs once) until the in-process wait (20 s) runs out, where
+  sequence runs once) until the in-process wait runs out, where
   `increment_at_leader` gave up after ten tries (~2.6 s); `increments`,
   `roots`' writes, the shop's starts and the generic calls of
   `liveness`, `queries`, `membership`, `large_results`, `replication` and
@@ -3255,6 +3255,11 @@ test's or its harness's, not a node's:
   `NotLeader`, and the install went again at the next. The nodes the
   install went to are recorded, and those but the one that ran it are
   restarted, which empties their pools.
+- **A leader slow to take calls.** A node a loaded host's election made
+  leader answered an install `NotLeader` for 20 s, each try waiting out
+  its node's settling (`every_agent_reports_and_one_close_serves_their_reads`,
+  with another worktree building beside the run). The in-process wait,
+  every harness wait's bound, is 30 s.
 - **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
   counted any result past its start; an install applied late is one. A
   marker is an empty result, and only those count.

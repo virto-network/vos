@@ -15,8 +15,9 @@ use vos_wire::peer::NodeNumber;
 
 use crate::Random;
 
-/// How long a test of nodes in one process waits for them to settle.
-pub const IN_PROCESS_WAIT: Duration = Duration::from_secs(20);
+/// How long a test of nodes in one process waits for them to settle: a
+/// loaded host's leader may take most of 20 s to take calls.
+pub const IN_PROCESS_WAIT: Duration = Duration::from_secs(30);
 
 /// Wait until `done`, as long as a test of nodes in one process waits for
 /// them to settle.

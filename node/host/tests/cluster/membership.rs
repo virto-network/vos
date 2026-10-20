@@ -352,7 +352,7 @@ fn overlapping_replacements_by_a_silent_node_hold_nothing_else_up() {
             loop {
                 match cluster.node(at).replace(agent, removed, 4) {
                     Err(vos_node::ReplaceError::Call(vos_node::CallError::NotLeader(_)))
-                        if started.elapsed() < Duration::from_secs(20) =>
+                        if started.elapsed() < vos_checker::spaces::IN_PROCESS_WAIT =>
                     {
                         std::thread::sleep(Duration::from_millis(100));
                         at = cluster.leader(agent);

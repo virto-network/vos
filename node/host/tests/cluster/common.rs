@@ -226,7 +226,7 @@ impl Cluster {
     /// deadline, what each running replica says of itself.
     #[track_caller]
     pub fn leader(&self, agent: AgentId) -> NodeNumber {
-        let until = Instant::now() + Duration::from_secs(20);
+        let until = Instant::now() + IN_PROCESS_WAIT;
         loop {
             let leading: Vec<NodeNumber> = self
                 .running()
