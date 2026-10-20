@@ -174,7 +174,7 @@ impl Node {
             service: u64::from(AGENT.0),
             items: vec![JamItem {
                 payload,
-                imports: Vec::new(),
+                ..JamItem::default()
             }],
             preimages: Some(Arc::new(Scope {
                 programs: Arc::clone(&self.programs),

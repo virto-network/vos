@@ -71,7 +71,11 @@ impl Runner {
     pub(crate) fn jam(&self, payload: Vec<u8>, imports: Vec<Vec<u8>>) -> JamRefine {
         JamRefine {
             service: self.service,
-            items: vec![JamItem { payload, imports }],
+            items: vec![JamItem {
+                payload,
+                imports,
+                extrinsics: Vec::new(),
+            }],
             preimages: Some(Arc::clone(&self.preimages)),
             ..JamRefine::default()
         }
