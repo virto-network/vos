@@ -29,7 +29,8 @@ const ROW: u32 = 60_000;
 const CALLS: u64 = 10;
 
 /// Three nodes whose refines `hooks` can hold, each tuned further by
-/// `tuning`.
+/// `tuning`. A leader waits 50 ms past an input that wakes it before it
+/// takes a batch: calls made together on a loaded host share one.
 fn cluster(
     hooks: &Arc<Holds>,
     tuning: impl Fn(NodeNumber, &mut vos_node::Config) + Send + Sync + 'static,
@@ -37,6 +38,7 @@ fn cluster(
     let hooks = Arc::clone(hooks);
     Cluster::tuned(3, move |number, config| {
         config.hooks = hooks.clone();
+        config.linger = Duration::from_millis(50);
         tuning(number, config);
     })
 }
@@ -78,8 +80,12 @@ fn two_batches(
     wait_until("the first batch's refine is held", || {
         hooks.refines.reached() > held
     });
-    let together: Vec<_> = (first + 1..=first + CALLS)
-        .map(|sequence| node.call(agent, fill(cluster, agent, sequence)))
+    let requests: Vec<_> = (first + 1..=first + CALLS)
+        .map(|sequence| fill(cluster, agent, sequence))
+        .collect();
+    let together: Vec<_> = requests
+        .into_iter()
+        .map(|request| node.call(agent, request))
         .collect();
     drop(closed);
     filled(smol::block_on(alone));

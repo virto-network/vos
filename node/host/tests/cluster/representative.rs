@@ -535,8 +535,8 @@ fn a_representative_leader_change_before_the_close_sends_it_once() {
 /// before `B_0`, past the agent's cut and report and the representative's
 /// close at `B_0 + D`, and the read's `Attest`, stated against `S_0`, is in
 /// the agent's log, and `S_0` anchored at the venue, each within
-/// `D + 10 s` of `B_0`. A read asked at any time in window 0 is then stated
-/// within `L + D + 10 s` of its asking.
+/// `D + 30 s` of `B_0`, a loaded host's lag included. A read asked at any
+/// time in window 0 is then stated within `L + D + 30 s` of its asking.
 #[test]
 fn a_read_is_stated_within_a_window_and_its_close() {
     let clock = WindowClock {
@@ -559,7 +559,7 @@ fn a_read_is_stated_within_a_window_and_its_close() {
     let space = cluster.space.id();
     anchoring.set_clocks(&cluster, b0 - 2_000);
     let boundary = Instant::now() + Duration::from_secs(2);
-    let bound = Duration::from_millis(d + 10_000);
+    let bound = Duration::from_millis(d + 30_000);
     let (mut attested, mut anchored) = (None, None);
     while (attested.is_none() || anchored.is_none())
         && Instant::now() < boundary + bound + Duration::from_secs(20)

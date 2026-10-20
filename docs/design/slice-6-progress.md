@@ -3260,6 +3260,15 @@ test's or its harness's, not a node's:
   its node's settling (`every_agent_reports_and_one_close_serves_their_reads`,
   with another worktree building beside the run). The in-process wait,
   every harness wait's bound, is 30 s.
+- **A batch formed before its calls were queued.** The large-result
+  tests queue ten calls behind a held refine for one batch past 2 MiB; a
+  loaded host built them slower than the leader's 2 ms linger, and the
+  leader took the first alone. The requests are built before any is
+  queued, and those tests' leaders linger 50 ms.
+- **Leadership moved by chance, timed.** A test stops leaders until the
+  replica a snapshot caught up leads, within 20 s: within 16 moves now.
+- **The attest's and anchor's latency** from `B_0` bounded by `D + 10 s`
+  (34.4 s taken): `D + 30 s`, far within the 120 s window.
 - **A late result taken for a marker.** `an_agent_of_no_space_gets_no_marker`
   counted any result past its start; an install applied late is one. A
   marker is an empty result, and only those count.

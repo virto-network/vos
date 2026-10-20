@@ -145,10 +145,12 @@ fn a_replica_caught_up_by_a_snapshot_answers_from_its_window_when_it_leads() {
     cluster.start(follower);
     cluster.converged(agent);
     assert!(log_start(cluster.node(follower), agent) > 20);
-    // Leadership moves until it reaches the replica that caught up.
-    let until = Instant::now() + Duration::from_secs(20);
+    // Leadership moves until it reaches the replica that caught up: each
+    // move half a chance, however long a loaded host takes for one.
+    let mut moves = 0;
     while cluster.leader(agent) != follower {
-        assert!(Instant::now() < until, "it never led");
+        moves += 1;
+        assert!(moves <= 16, "it never led");
         let current = cluster.leader(agent);
         cluster.stop(current);
         wait_until("another leader", || {
