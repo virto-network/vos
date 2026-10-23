@@ -402,8 +402,8 @@ their bytes, hex, `Debug` lists and decimal digits.
 | an anchor: Kreivo's `Anchor` call, JAM's `Anchor` item | space, window, kind, `S_w`, signer, signature | leaves | the audit |
 | the JAM statements service's work report | its verdict, a function of its item (the statement's id, roots and code; an anchor's fields) | leaves | follows from the item |
 | a client's answer | the method's outcome: a read's output | leaves | the audit |
-| logs, at every level | ids, windows, codes, the prover's backlog counts, and each proof's time in seconds | leaves | the audit; the time is the side channel below |
-| standard error | nothing, in a production build | leaves | the audit |
+| logs, at every level | ids, windows, codes, the prover's backlog counts, and each proof's time in seconds; at debug level, an agent's guest log lines (`refine_host`'s `log`), text the agent's own code writes, which carries whatever that code puts in it | leaves | the audit, for the node's own lines; an agent's are its author's, audited with its code; the time is the side channel below |
+| standard error | the node's log: `vos` writes its tracing there, at `VOS_LOG`'s level (info by default); no debug output in a production build | leaves | the audit (the run captures both) |
 | the debug outputs: the PVM's instruction trace, `GREY_PVM_DEBUG`'s registers and native code, `CPU_DUMP`, `CPU_EXPR_DUMP`, `ZKPVM_PROFILE` | a run's steps, pcs, registers and trace rows | only a `debug-internals` build (`vos-pvm`'s, this crate's) | `just check-no-debug-internals`: no production edge enables it, and the node's binary names none of them |
 | the operator's `/stats` | stage histograms, `refine_gas` and `step_gas` among them: a kernel's gas, so its steps, within a quarter and in sums | the node's operator | not audited: the operator runs the replica |
 | the tests' `target/tmp/wrap/` | final wraps (28 of test circuits, 39), their formats, words and judgements' inputs | the test machine | `kernel`'s `wrap_files`: each verifies as a final wrap, and nothing else is there |

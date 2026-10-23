@@ -840,18 +840,18 @@ where
         total_interaction_columns,
     };
 
-    // Print on the explicit `profile` flag, or, in a build with
-    // `debug-internals`, whenever `ZKPVM_PROFILE` is set in the environment
+    // Printed only in a build with `debug-internals`, on the explicit
+    // `profile` flag or whenever `ZKPVM_PROFILE` is set in the environment
     // (so the phase breakdown is reachable through paths that hard-code
-    // `profile = false`, e.g. `prove_canonical`). A production build prints
-    // no segment's sizes, which are its step counts, from the environment.
+    // `profile = false`, e.g. `prove_canonical`): a segment's sizes are its
+    // step counts. A production build returns the profile to its caller
+    // and prints nothing.
     #[cfg(feature = "debug-internals")]
-    let from_environment = std::env::var_os("ZKPVM_PROFILE").is_some();
-    #[cfg(not(feature = "debug-internals"))]
-    let from_environment = false;
-    if profile || from_environment {
+    if profile || std::env::var_os("ZKPVM_PROFILE").is_some() {
         eprintln!("{prof}");
     }
+    #[cfg(not(feature = "debug-internals"))]
+    let _ = profile;
 
     // Caller supplies the bitmask (empty for chip-isolated harness).
     Ok((

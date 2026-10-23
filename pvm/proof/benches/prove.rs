@@ -107,7 +107,8 @@ mod imp {
     fn profile_at_log_size(log_size: u32) {
         let (mut side_note, n_steps) = add_side_note(log_size);
         eprintln!("=== LogSize={log_size} ({n_steps} steps) ===");
-        let (proof, _) = prove_profiled(&mut side_note).expect("proving failed");
+        let (proof, profile) = prove_profiled(&mut side_note).expect("proving failed");
+        eprintln!("{profile}");
         let proof_bytes = bincode::serialize(&proof).unwrap();
         eprintln!(
             "Proof size: {} bytes ({:.1} KB)",

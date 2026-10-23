@@ -156,7 +156,8 @@ fn a_snapshot_stream_outlasting_the_leaders_deadline_goes_on() {
     // While the follower was stopped, the leader's streams to it fell
     // silent and ended, as many as the stop lasted. Once the follower
     // answered one, by asking for a chunk past the first, that one ran to
-    // its end: past the deadline, and no stream started after it.
+    // its end, past the deadline from that answer on, and no stream
+    // started after it.
     let mut answered = false;
     for (number, hooks) in (1..=3).zip(&slow) {
         let sent = hooks.sent_to(follower);
@@ -164,10 +165,6 @@ fn a_snapshot_stream_outlasting_the_leaders_deadline_goes_on() {
             continue;
         };
         answered = true;
-        let start = sent[..=first]
-            .iter()
-            .rposition(|&(_, sequence, _)| sequence == 0)
-            .expect("a stream begins at its first chunk");
         let again = sent[first..]
             .iter()
             .filter(|&&(_, sequence, _)| sequence == 0)
@@ -176,11 +173,13 @@ fn a_snapshot_stream_outlasting_the_leaders_deadline_goes_on() {
             again, 0,
             "node {number} started {again} streams past the answered one"
         );
-        let (began, ended) = (sent[start].0, sent[sent.len() - 1].0);
+        // From the follower's first answer, so the time the stream waited
+        // for the stopped follower counts for nothing.
+        let (answered_at, ended) = (sent[first].0, sent[sent.len() - 1].0);
         assert!(
-            ended - began > DEADLINE,
-            "the stream outlasted the deadline: {:?}",
-            ended - began
+            ended - answered_at > DEADLINE,
+            "the stream outlasted the deadline once answered: {:?}",
+            ended - answered_at
         );
     }
     assert!(answered, "the follower answered a stream");
