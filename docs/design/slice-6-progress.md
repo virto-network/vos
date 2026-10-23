@@ -3924,9 +3924,16 @@ work reports, the run 1,213 s.
   `jam-statements-testnet` (38 entries, 14 packages, 14 outcomes) and in
   the end to end for both deployments.
 
+Its gates [measured, at `f0395555`, as the fold's]: `just check` green,
+108 suites, 1,380 passed, 0 failed; `jam-statements-testnet` green, the
+storage accounted for (38 entries, as many named); `just e2e-chain` green,
+every verdict as expected, the audit clean over 326 carriers and 22 JAM
+packages, the storage of JAM a (53 entries, 14 outcomes) and JAM b (11,
+3) each as many as named from the packages watched, the run 1,145 s.
+
 Commits: `dd06e6af` (the JAM client as dev tooling, decision 17),
-`e579a484` (the fold), `3ecea8b3` (its gates), the review's fold, this
-record.
+`e579a484` (the fold), `3ecea8b3` (its gates), `f0395555` (the review's
+fold), this record.
 
 ## The JAM client as development tooling (decision 17)
 
