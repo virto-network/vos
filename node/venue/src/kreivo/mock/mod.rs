@@ -177,6 +177,21 @@ pub struct Chain {
     storage: BTreeMap<Vec<u8>, Vec<u8>>,
     accounts: BTreeMap<AccountId, Account>,
     fees: bool,
+    /// A broken pallet, for the vectors' own tests.
+    #[cfg(test)]
+    broken: Option<Broken>,
+}
+
+/// How a pallet the vectors must fail is broken.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Broken {
+    /// Every stored format and program taken as active, whatever its
+    /// window.
+    Activation,
+    /// An accepted submit's released deposit not credited back to its
+    /// window's budget.
+    CreditBack,
 }
 
 type Dispatched = Result<(), DispatchError>;
@@ -190,7 +205,31 @@ impl Chain {
             storage: BTreeMap::new(),
             accounts: BTreeMap::new(),
             fees: false,
+            #[cfg(test)]
+            broken: None,
         }
+    }
+
+    /// The chain as a pallet broken by `broken` would be: one the vectors
+    /// must fail.
+    #[cfg(test)]
+    pub(crate) fn broken(mut self, broken: Broken) -> Self {
+        self.broken = Some(broken);
+        self
+    }
+
+    #[cfg(test)]
+    fn is_broken(&self, broken: Broken) -> bool {
+        self.broken == Some(broken)
+    }
+
+    /// Whether `active` holds now.
+    fn active(&self, active: &Active) -> bool {
+        #[cfg(test)]
+        if self.is_broken(Broken::Activation) {
+            return true;
+        }
+        active.at(self.now_ms)
     }
 
     /// The chain with Kreivo's fee pipeline, `ChargeSpaceFee`, or without.
@@ -381,6 +420,10 @@ impl Chain {
     /// `post_dispatch`: a deposit the dispatch did not forfeit credited
     /// back to the window's budget.
     fn credit_budget(&mut self, space: &Space, deposit: Balance) {
+        #[cfg(test)]
+        if self.is_broken(Broken::CreditBack) {
+            return;
+        }
         if let Some(mut spend) = self.get::<Spend>(&keys::budget(space)) {
             spend.spent = spend.spent.saturating_sub(deposit);
             self.put(keys::budget(space), &spend);
@@ -946,12 +989,12 @@ impl Chain {
         let statement =
             Statement::decode(bytes).map_err(|error| Refusal::Statement(error).code())?;
         let format: Option<Active> = self.get(&keys::formats(statement.format));
-        if !format.is_some_and(|active| active.at(self.now_ms)) {
+        if !format.is_some_and(|active| self.active(&active)) {
             return Err(Refusal::Format.code());
         }
         let program = self
             .get::<ProgramInfo>(&keys::programs(&statement.program.0))
-            .filter(|info| info.active.at(self.now_ms))
+            .filter(|info| self.active(&info.active))
             .ok_or(Refusal::Program.code())?;
         let pin = Pin {
             program: ProgramId(statement.program.0),
@@ -1104,7 +1147,7 @@ impl Venue for StorageVenue<'_> {
     fn accepts(&self, format: u32) -> bool {
         self.chain
             .get::<Active>(&keys::formats(format))
-            .is_some_and(|active| active.at(self.chain.now_ms))
+            .is_some_and(|active| self.chain.active(&active))
     }
 
     /// The root held at its space, kind and window; the space active (a

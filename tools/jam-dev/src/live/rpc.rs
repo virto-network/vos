@@ -189,6 +189,66 @@ mod tests {
         assert_eq!(calls[3]["params"][1], json!([0, 1]));
     }
 
+    /// A package whose submission's answer is lost is watched all the
+    /// same: the node may have taken it.
+    #[test]
+    fn a_package_is_watched_before_it_is_sent() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::live::Watch;
+        use crate::live::package::WorkItem;
+
+        let block = |slot: u32| {
+            let hash = STANDARD.encode([slot as u8; 32]);
+            sent(&format!(
+                r#"{{"jsonrpc":"2.0","id":1,"result":{{"header_hash":"{hash}","slot":{slot}}}}}"#
+            ))
+        };
+        let root = sent(&format!(
+            r#"{{"jsonrpc":"2.0","id":1,"result":"{}"}}"#,
+            STANDARD.encode([9; 32])
+        ));
+        let lost = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n".to_string();
+        let (mut node, served) = canned(vec![
+            block(8),
+            block(7),
+            root.clone(),
+            root.clone(),
+            root,
+            lost,
+        ]);
+        type Seen = (Vec<u8>, Vec<Vec<u8>>, Option<bool>);
+        let watched: Arc<Mutex<Vec<Seen>>> = Arc::default();
+        let seen = Arc::clone(&watched);
+        node.watch = Some(Watch(Arc::new(
+            move |package: &[u8], extrinsics: &[Vec<u8>], taken: Option<bool>| {
+                seen.lock()
+                    .unwrap()
+                    .push((package.to_vec(), extrinsics.to_vec(), taken));
+            },
+        )));
+        let item = WorkItem {
+            service: 3,
+            code_hash: [1; 32],
+            refine_gas: 10,
+            accumulate_gas: 10,
+            payload: vec![5; 40],
+            extrinsics: vec![vec![6; 20]],
+        };
+        assert!(node.submit_package(0, &[item]).is_err(), "its answer lost");
+        let calls = served.join().unwrap();
+        assert_eq!(calls[5]["method"], "submitWorkPackage");
+        let watched = watched.lock().unwrap();
+        assert_eq!(watched.len(), 2, "watched, then answered");
+        assert_eq!(
+            STANDARD.encode(&watched[0].0),
+            calls[5]["params"][1],
+            "the package sent"
+        );
+        assert_eq!(watched[0].1, [vec![6; 20]]);
+        assert_eq!((watched[0].2, watched[1].2), (None, Some(false)));
+    }
+
     #[test]
     fn segments_and_values_decode_from_base64() {
         assert_eq!(decoded(&json!("AQID")).unwrap(), Some(vec![1, 2, 3]));

@@ -279,7 +279,7 @@ impl Needles {
                 ));
             }
         }
-        for &steps in &internals.steps {
+        for &steps in internals.steps.iter().chain([&internals.run_steps]) {
             if !steps.is_power_of_two() && steps > 0xff {
                 self.0.push(Needle::number(
                     Kind::StepCount,
@@ -288,13 +288,11 @@ impl Needles {
                 ));
             }
         }
-        if let Some(&run) = internals.steps.first() {
-            self.0.push(Needle::number(
-                Kind::StepCount,
-                format!("{statement}: the gas its re-run left"),
-                RERUN_GAS - run,
-            ));
-        }
+        self.0.push(Needle::number(
+            Kind::StepCount,
+            format!("{statement}: the gas its re-run left"),
+            RERUN_GAS.saturating_sub(internals.run_steps),
+        ));
         for root in &internals.memory_roots {
             self.push(Needle::field(
                 Kind::MemoryRoot,

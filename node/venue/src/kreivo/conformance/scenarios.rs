@@ -836,12 +836,42 @@ fn g7(fx: &Fixtures) -> Vector {
     w.refused(changed(&|s| s.public_args[0] ^= 1), proof.clone(), 7);
     assert_eq!(fx.tampered_code >> 8, 1);
     w.refused(s.encode(), fx.tampered.clone(), fx.tampered_code);
+    // The activation windows: the fixture's own format and program stored,
+    // but not active now.
+    let format = vos_statement::vos_pvm_final_verifier::masked::FORMAT;
+    let set_format = |from_ms| Call::SetFormat {
+        format,
+        active: Active {
+            from_ms,
+            until_ms: None,
+        },
+    };
+    let set_program = |from_ms, until_ms| Call::SetProgram {
+        program: fx.valid.pin.program.0,
+        info: Some(ProgramInfo {
+            handler: Handler::Record,
+            venue_bound: fx.valid.pin.venue_bound,
+            active: Active { from_ms, until_ms },
+        }),
+    };
+    let (later, latest) = (NOW + 60_000, NOW + 120_000);
+    w.call(Origin::Root, set_format(later), Expect::Ok);
+    w.refused(s.encode(), proof.clone(), 2);
+    w.at(later);
+    w.call(Origin::Root, set_program(0, Some(later)), Expect::Ok);
+    w.refused(s.encode(), proof.clone(), 3);
+    w.call(Origin::Root, set_program(latest, None), Expect::Ok);
+    w.refused(s.encode(), proof.clone(), 3);
+    w.at(latest);
+    w.accept(AUTHORITY_F, F, false);
     w.finish(
         "G7",
         "one mutant per refusal class, each Refused { code } and DepositForfeited: 1 (the \
          statement cut short), 2 (format 30), 3 (a program not in Programs), 4 (a space not its \
          roots'), 5 (a root not anchored), 7 (another venue's statement), 0x1xx (the proof's \
-         byte flipped); 6 is G8's, its deposit released",
+         byte flipped); 6 is G8's, its deposit released. Then the statement itself against \
+         activation windows: 2 while Formats[39].from_ms is past now; 3 while its program's \
+         until_ms is now, and while its from_ms is past now; accepted once now reaches it",
     )
 }
 
@@ -1074,6 +1104,7 @@ fn g12(fx: &Fixtures) -> Vector {
 fn g13(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, true);
     w.with_b(AUTHORITY_1, KEY_3);
+    w.anchor_f();
     w.begin();
     let constants = w.constants().clone();
     let each = constants.submit_deposit + constants.fee_bound;
@@ -1098,12 +1129,26 @@ fn g13(fx: &Fixtures) -> Vector {
     w.controller(budget, Expect::Ok);
     w.submit(AUTHORITY_1, b(), vec![9], Vec::new(), Expect::Ok);
     w.submit(AUTHORITY_1, b(), vec![10], Vec::new(), Expect::Payment);
+    // An accepted submit's deposit, released, is credited back: at one
+    // submit and one fee a window, the accepted one leaves room for one
+    // forfeiting submit, which without the credit would not fit.
+    let budget = Call::SetBudget {
+        space: b(),
+        max_spend_per_window: each + constants.fee_bound,
+    };
+    w.controller(budget, Expect::Ok);
+    w.at(B_CLOCK.boundary(B_CLOCK.window(next).unwrap()).unwrap());
+    w.accept(AUTHORITY_1, b(), false);
+    w.submit(AUTHORITY_1, b(), vec![11], Vec::new(), Expect::Ok);
+    w.submit(AUTHORITY_1, b(), vec![12], Vec::new(), Expect::Payment);
     w.finish(
         "G13",
         "the budget, fees: at 8 × (SubmitDeposit + FeeBound) a window, eight forfeiting \
          submits taken and the ninth refused in validate (InvalidTransaction::Payment; \
          OverBudget in the fallback), the sovereign untouched; the next window resets it; \
-         set_budget to two submits' worth, the window's second taken and its third refused. \
+         set_budget to two submits' worth, the window's second taken and its third refused; \
+         set_budget to SubmitDeposit + 2 × FeeBound, the next window's accepted submit, its \
+         deposit credited back, leaving room for one forfeiting submit, and the next refused. \
          The model charges each fee at FeeBound, so eight fill the budget exactly",
     )
 }
@@ -1398,6 +1443,44 @@ fn g18(fx: &Fixtures) -> Vector {
     // `S`, of `F`, paid for by `B`'s authority.
     w.add_authority(AUTHORITY_1, None, Expect::Ok);
     w.accept(AUTHORITY_1, b(), false);
+    // Pin F's bounds: a genesis of 2 KiB, a statement of 64 KiB and a proof
+    // of 256 KiB decode; a byte more does not.
+    let bounds = w.constants().bounds;
+    let genesis_of_len = |len: usize| Call::Register {
+        genesis: vec![0; len],
+        controller: CONTROLLER,
+        start_window: B_START,
+        founder_key: public(KEY_1),
+        founder_sig: [0; 64],
+    };
+    let at_bound = genesis_of_len(bounds.genesis);
+    w.call(
+        Origin::Signed(OPERATOR),
+        at_bound,
+        Expect::Err(Error::BadGenesis),
+    );
+    let over = genesis_of_len(bounds.genesis + 1);
+    w.call(Origin::Signed(OPERATOR), over, Expect::Undecodable);
+    let s = fx.statement().encode();
+    let long = vec![0; bounds.statement];
+    w.refused(long.clone(), fx.proof.clone(), 1);
+    let longer = [long, vec![0]].concat();
+    w.submit(
+        AUTHORITY_F,
+        F,
+        longer,
+        fx.proof.clone(),
+        Expect::Undecodable,
+    );
+    let proof = vec![0; bounds.proof];
+    let outcome = w.submit(AUTHORITY_F, F, s.clone(), proof.clone(), Expect::Ok);
+    assert!(
+        matches!(outcome.events[..], [Event::Refused { .. }, ..]),
+        "judged: {:?}",
+        outcome.events
+    );
+    let proof = [proof, vec![0]].concat();
+    w.submit(AUTHORITY_F, F, s, proof, Expect::Undecodable);
     w.finish(
         "G18",
         "registration refusals: a window length below MinWindowMs or above MaxWindowMs \
@@ -1405,7 +1488,11 @@ fn g18(fx: &Fixtures) -> Vector {
          in the genesis or another founder's signature (BadFounder), a sovereign already listed \
          (SovereignInUse), an unfunded sovereign (InsufficientSovereignBalance), a second \
          registration (SpaceExists); a submit paid by a space other than the statement's: \
-         accepted",
+         accepted. The length bounds: a genesis of MaxGenesisLen (2,048) bytes decodes \
+         (BadGenesis) and one of a byte more does not (undecodable); a statement of \
+         MaxStatementLen (65,536) bytes decodes (refused 1) and a byte more does not; a proof \
+         of MaxProofLen (262,144) bytes decodes (judged: S, accepted before, a repeat) and a \
+         byte more does not",
     )
 }
 
@@ -1451,9 +1538,11 @@ pub fn file(fx: &Fixtures) -> File {
                 .map(|(name, seed)| (name.to_string(), hex(&public(seed)))),
         )
         .collect();
+    let prune_cursor = [keys::twox128(keys::PALLET), keys::twox128(b"PruneCursor")].concat();
     File {
         about: ABOUT.iter().map(|line| line.to_string()).collect(),
         constants: ConstantsJson::of(&constants),
+        unpinned: vec![hex(&prune_cursor)],
         names,
         vectors,
     }
@@ -1464,7 +1553,8 @@ const ABOUT: &[&str] = &[
     "A vector: the constants (above), a pre-state and steps. The pre-state: now_ms (Timestamp.Now), each account's free and held balances (HoldReason Registration and Submit) and its providers and consumers, and the pallet's raw storage (key → SCALE value, hex). The venue (frame_system::block_hash(0)) is constants.venue, the fixtures' venue: their statements are venue-bound.",
     "A step: now_ms, then a call (origin: {\"signed\": account} or root, programs (ProgramsOrigin), emergency (EmergencyOrigin), status (StatusOrigin); call: the RuntimeCall's bytes, [90, call_index] ++ SCALE(args), as parts: hex, or {fixture, from, to}, bytes from..to of the kit's fixtures/<fixture>) or on_idle with ample weight.",
     "Each step's expectation: result (ok; {\"module\": i}, DispatchError::Module { index: 90, error: [i, 0, 0, 0] }; bad_origin; funds_unavailable; invalid_payment, InvalidTransaction::Payment in validate, never included; undecodable, the call's bytes refused before dispatch); events, the pallet's Event in SCALE, without the runtime's index; storage, every raw key of the pallet's whose value changed (null: removed); balances, each account's deltas (free, held_registration, held_submit, providers).",
-    "fees: false vectors run in the pallet's own mock runtime, no fee pipeline: deposits pinned exactly. fees: true vectors run in Kreivo's runtime with ChargeSpaceFee: free deltas by sign only (+, -, 0; the signer always listed), payer who paid the fee (sovereign or signer), and Budget's writes left out (its spend sums fees, the teammate's weights). The mock charges every fee at fee_bound.",
+    "fees: false vectors run in the pallet's own mock runtime, no fee pipeline: deposits pinned exactly. fees: true vectors run in Kreivo's runtime with ChargeSpaceFee: free deltas by sign only (+, -, 0; the signer always listed), payer who paid the fee (sovereign or signer), and Budget's writes pinned by key and window, the value's spent masked (each ? a nibble not compared: it sums fees, the teammate's weights). The mock charges every fee at fee_bound.",
+    "A call's parts may also be {repeat, count}: the byte repeat (hex) count times. unpinned: raw keys a harness leaves out of every step's storage, items the design lets a pallet keep that the mock does not (PruneCursor, on_idle's cursor).",
     "Balances: in a pallet-level vector every account a step does not list is unchanged; in a fees vector the runtime's fee recipients (the block author, the treasury's share) are not pinned, and only the accounts listed are. A pre-state's consumers exclude the one FRAME's Balances takes for a hold (sovereign F's are 0 though it holds its registration deposit): the teammate's harness keeps its own; providers are pinned as deltas.",
     "Accounts: 'names' labels them. The fixture space F ([0xa1; 32], the fixtures' statements' space) is in every pre-state as storage, since no genesis hashes to its id; space B is registered by call from a genesis of two founders.",
 ];

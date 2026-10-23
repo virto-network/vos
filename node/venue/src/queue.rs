@@ -5,12 +5,22 @@
 //! [`AnchorSend`], until the venue holds one, refuses it for good, or it
 //! is too old. Each space waits apart: one space's wait holds back only
 //! its own later windows.
+//!
+//! An anchor the venue will not take as signed (its key no longer listed,
+//! its signature refused) is dropped and its window kept as unsettled
+//! ([`AnchorQueue::unsettled`]), which the representative's leader reads
+//! to sign it again; and an anchor queued again with another signer
+//! replaces the one queued, the newest signature winning.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use vos_anchor::{Anchor, SpaceId};
+
+/// How many windows the venue will never take a queue remembers, so an
+/// anchor of one handed over again is refused at once, unsent.
+const DEAD_KEPT: usize = 256;
 
 /// What became of an anchor sent, or offered to send.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -22,6 +32,10 @@ pub enum Fate {
     Dead,
     /// Not taken now: kept, and offered again no sooner than this.
     Again(Duration),
+    /// Not taken as signed (a key the venue does not list, a signature it
+    /// refuses): dropped, its window unsettled until an anchor of it is
+    /// queued again, signed anew, its client having alerted.
+    Resign,
 }
 
 /// How a client sends one anchor: it checks the venue would take it,
@@ -38,6 +52,10 @@ struct Entry {
 #[derive(Default)]
 struct State {
     entries: BTreeMap<(SpaceId, u64), Entry>,
+    /// The windows whose anchors were dropped to be signed again.
+    unsettled: BTreeSet<(SpaceId, u64)>,
+    /// The latest windows the venue will never take, at most [`DEAD_KEPT`].
+    dead: BTreeSet<(SpaceId, u64)>,
     stopping: bool,
 }
 
@@ -75,22 +93,48 @@ impl AnchorQueue {
         Self { shared }
     }
 
-    /// Queue `anchor`, unless one of its space and window is queued.
+    /// Queue `anchor`, unless one of its space and window by the same
+    /// signer is queued: one by another signer is replaced, and sent
+    /// next. Its window is no longer unsettled.
     pub fn push(&self, anchor: &Anchor) {
         let mut state = self.shared.state();
-        state
-            .entries
-            .entry((anchor.space, anchor.window))
-            .or_insert(Entry {
-                anchor: *anchor,
-                not_before: Instant::now(),
-            });
+        let key = (anchor.space, anchor.window);
+        state.unsettled.remove(&key);
+        let entry = Entry {
+            anchor: *anchor,
+            not_before: Instant::now(),
+        };
+        match state.entries.get_mut(&key) {
+            Some(queued) if queued.anchor.signer == anchor.signer => {}
+            Some(queued) => *queued = entry,
+            None => {
+                state.entries.insert(key, entry);
+            }
+        }
         self.shared.wake.notify_all();
+    }
+
+    /// The windows of `space` whose anchors were dropped, not taken as
+    /// signed ([`Fate::Resign`]), and not queued again since, in order.
+    pub fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+        self.shared
+            .state()
+            .unsettled
+            .range((*space, 0)..=(*space, u64::MAX))
+            .map(|(_, window)| *window)
+            .collect()
     }
 
     /// Whether an anchor of `space` at `window` is queued.
     pub fn holds(&self, space: &SpaceId, window: u64) -> bool {
         self.shared.state().entries.contains_key(&(*space, window))
+    }
+
+    /// Whether the venue refused an anchor of `space` at `window` for
+    /// good ([`Fate::Dead`]): a client answers one handed over again
+    /// refused, unsent.
+    pub fn dead(&self, space: &SpaceId, window: u64) -> bool {
+        self.shared.state().dead.contains(&(*space, window))
     }
 
     /// How many anchors are queued.
@@ -150,9 +194,27 @@ fn run(shared: &Shared, sender: &impl AnchorSend) {
         drop(state);
         let fate = sender.send(&anchor);
         state = shared.state();
+        // Replaced while it was sent: the new one goes next, whatever
+        // became of this one, unless the venue now holds the window.
+        let replaced = state
+            .entries
+            .get(&key)
+            .is_none_or(|entry| entry.anchor != anchor);
         match fate {
-            Fate::Done | Fate::Dead => {
+            Fate::Done => {
                 state.entries.remove(&key);
+            }
+            _ if replaced => {}
+            Fate::Dead => {
+                state.entries.remove(&key);
+                state.dead.insert(key);
+                if state.dead.len() > DEAD_KEPT {
+                    state.dead.pop_first();
+                }
+            }
+            Fate::Resign => {
+                state.entries.remove(&key);
+                state.unsettled.insert(key);
             }
             Fate::Again(after) => {
                 if let Some(entry) = state.entries.get_mut(&key) {
@@ -241,5 +303,72 @@ mod tests {
             4,
             "space 1's first once"
         );
+    }
+
+    /// Refuses every anchor signed by `refused` as signed, and takes the
+    /// rest, recording each signer it took.
+    struct Rotated {
+        refused: [u8; 32],
+        taken: Mutex<Vec<[u8; 32]>>,
+    }
+
+    impl AnchorSend for Arc<Rotated> {
+        fn send(&self, anchor: &Anchor) -> Fate {
+            if anchor.signer == self.refused {
+                return Fate::Resign;
+            }
+            self.taken.lock().unwrap().push(anchor.signer);
+            Fate::Done
+        }
+    }
+
+    /// An anchor queued again by another signer replaces the one queued;
+    /// one the venue refuses as signed is dropped and its window
+    /// unsettled, until it is queued again, signed anew, and taken.
+    #[test]
+    fn a_window_refused_as_signed_is_unsettled_until_signed_again() {
+        let sends = Arc::new(Rotated {
+            refused: [1; 32],
+            taken: Mutex::default(),
+        });
+        let queue = AnchorQueue::spawn("test-resign", Arc::clone(&sends));
+        let space = SpaceId([3; 32]);
+        let signed = |signer: u8| Anchor {
+            signer: [signer; 32],
+            ..anchor(3, 7)
+        };
+        queue.push(&signed(1));
+        let start = Instant::now();
+        while queue.unsettled(&space) != [7] {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(queue.is_empty(), "dropped");
+        queue.push(&signed(2));
+        assert!(queue.unsettled(&space).is_empty(), "queued again");
+        assert!(!queue.dead(&space, 7));
+        while !queue.is_empty() {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(*sends.taken.lock().unwrap(), [[2; 32]]);
+
+        // Replaced in place: one entry, the newest signer's.
+        let held = Arc::new(Sends {
+            sent: Mutex::default(),
+            tries: AtomicUsize::new(0),
+            held: AtomicBool::new(true),
+        });
+        let queue = AnchorQueue::spawn("test-replace", Arc::clone(&held));
+        let first = anchor(1, 3);
+        queue.push(&first);
+        queue.push(&Anchor {
+            signer: [9; 32],
+            ..first
+        });
+        assert_eq!(queue.len(), 1);
+        let entry = queue.shared.state().entries[&(first.space, 3)].anchor;
+        assert_eq!(entry.signer, [9; 32], "the newest signature wins");
+        held.held.store(false, Ordering::SeqCst);
     }
 }

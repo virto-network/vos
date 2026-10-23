@@ -209,26 +209,29 @@ impl PolkaJam {
 
     /// Submit a package of `items` to the guarantors of `core`, anchored at
     /// the finalized block, with every item's extrinsics: the package's
-    /// encoding.
+    /// encoding. The watch sees it before it is sent: a package the node
+    /// takes and whose answer is lost is on chain all the same.
     pub fn submit_package(&self, core: u16, items: &[WorkItem]) -> Result<Vec<u8>, Error> {
         let package = encode_package(&self.context()?, items);
-        let extrinsics: Vec<String> = items
+        let raw: Vec<Vec<u8>> = items
             .iter()
-            .flat_map(|item| &item.extrinsics)
+            .flat_map(|item| item.extrinsics.clone())
+            .collect();
+        if let Some(Watch(watch)) = &self.watch {
+            watch(&package, &raw, None);
+        }
+        let extrinsics: Vec<String> = raw
+            .iter()
             .map(|extrinsic| STANDARD.encode(extrinsic))
             .collect();
-        self.call(
+        let answer = self.call(
             "submitWorkPackage",
             json!([core, STANDARD.encode(&package), extrinsics]),
-        )?;
+        );
         if let Some(Watch(watch)) = &self.watch {
-            let extrinsics: Vec<Vec<u8>> = items
-                .iter()
-                .flat_map(|item| item.extrinsics.clone())
-                .collect();
-            watch(&package, &extrinsics);
+            watch(&package, &raw, Some(answer.is_ok()));
         }
-        Ok(package)
+        answer.map(|_| package)
     }
 }
 

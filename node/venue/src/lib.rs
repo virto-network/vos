@@ -55,6 +55,24 @@ pub trait VenueClient: Send + Sync {
     /// read: what every deadline between parties is timed by (pin D). None
     /// before the client has read it.
     fn time(&self) -> Option<u64>;
+    /// The windows of `space` whose anchors this client took
+    /// ([`Anchored::Queued`]) and then dropped, the venue refusing them as
+    /// signed: the representative's leader signs each again. None for a
+    /// client that queues nothing.
+    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+        let _ = space;
+        Vec::new()
+    }
+}
+
+/// Whether a submission refused with `code` may be accepted when sent
+/// again: 5, a root the venue does not hold anchored now (its anchor yet to
+/// land, its space suspended until resumed, a node's view behind the
+/// venue's), and a venue's failure to judge it, from `0x1000` (on JAM,
+/// refine out of gas, a panic, an undecodable verdict). The others are the
+/// statement's own, and final.
+pub fn transient(code: u32) -> bool {
+    code == Refusal::Unanchored.code() || code >= 0x1000
 }
 
 /// Where a space stands at a venue.

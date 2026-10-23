@@ -90,6 +90,10 @@ impl VenueClient for Tapped {
     fn time(&self) -> Option<u64> {
         self.inner.time()
     }
+
+    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+        self.inner.unsettled(space)
+    }
 }
 
 /// What a venue is sent for `anchor`, as each venue's client lays it out:

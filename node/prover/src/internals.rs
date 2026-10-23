@@ -21,8 +21,11 @@ pub struct NodeProof {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Internals {
     pub proofs: Vec<NodeProof>,
-    /// Each segment's steps, each boundary's step index and the run's.
+    /// Each boundary's step index, then each segment's steps.
     pub steps: Vec<u64>,
+    /// The run's steps, every segment's summed: what the gas its re-run
+    /// left shows.
+    pub run_steps: u64,
     /// Each boundary's memory root and the commitment of its image; never
     /// the kernel's image root, which its install's record publishes.
     pub memory_roots: Vec<[u8; 32]>,

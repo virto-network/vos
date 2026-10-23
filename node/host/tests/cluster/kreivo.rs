@@ -80,6 +80,10 @@ impl VenueClient for Watched {
     fn time(&self) -> Option<u64> {
         self.inner.time()
     }
+
+    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+        self.inner.unsettled(space)
+    }
 }
 
 /// A node's client: its number, its account, the client.

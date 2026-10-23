@@ -406,11 +406,11 @@ testnet's own logs and database.
 |---|---|---|---|
 | a submission: the venue's `submit`, Kreivo's `Submit` call, JAM's `Submit` item and its extrinsic | the statement (format, program id, space, public arguments, output, roots) and the format-39 proof | leaves | the audit |
 | an anchor: Kreivo's `Anchor` call, JAM's `Anchor` item | space, window, kind, `S_w`, signer, signature | leaves | the audit |
-| a JAM work package as it went, its extrinsics, and the work report a guarantor made of it | the items (registrations, anchors, statements) and their proofs; the verdicts, a function of the items | leaves | the audit, every form, on every package a node's or the run's client sent to a PolkaJam testnet, anchors and replays among them, and its report (`just e2e-chain`, `vos_jam::live::Watch`) |
+| a JAM work package as it went, its extrinsics, and the work report a guarantor made of it | the items (registrations, anchors, statements) and their proofs; the verdicts, a function of the items | leaves | the audit, every form, on every package a node's or the run's client sent to a PolkaJam testnet, anchors and replays among them, each watched before it went, whether the node's answer came or not, and its report (`just e2e-chain`, the dev tooling's `vos_jam_dev::live::Watch`) |
 | a signed Kreivo extrinsic: its envelope | the signer's nonce and the call | leaves | the audit, every form, on the mock's (`just e2e-chain`) |
 | a chain's own record of what it was sent: its nodes' logs and database | blocks, guarantees, the packages and their extrinsics, the services' code | leaves | the audit (`just e2e-chain`, `Reach::Recorded`): every needle's bytes, whole hex and `Debug` list, a register file's bytes; not a number's digits, hex or bytes, a hash's hex prefix or a debug output's text, which the chain's own counters, gas, hashes and program bytes hold by chance. What it was sent is searched in every form as the packages and reports above; a statement's encoding and a work report are shown to be in its database as bytes, a report's hash in its log |
 | a client's answer | the method's outcome: a read's output | leaves | the audit |
-| logs, at every level | ids, windows, codes, the prover's backlog counts, and each proof's time in seconds; at debug level, an agent's guest log lines (`refine_host`'s `log`), text the agent's own code writes, which carries whatever that code puts in it | leaves | the audit, for the node's own lines; an agent's are its author's, audited with its code; the time is the side channel below |
+| logs, at every level | ids, windows, codes, the prover's backlog counts, each proof's time in seconds, and Stwo's `info!` of a proof's size estimate; at debug level, an agent's guest log lines (`refine_host`'s `log`), text the agent's own code writes, which carries whatever that code puts in it | leaves | the audit, for the node's own lines; an agent's are its author's, audited with its code; the time and the size estimate are side channels as below |
 | standard error | the node's log: `vos` writes its tracing there, at `VOS_LOG`'s level (info by default); no debug output in a production build | leaves | the audit (the run captures both) |
 | the debug outputs: the PVM's instruction trace, `GREY_PVM_DEBUG`'s registers and native code, `CPU_DUMP`, `CPU_EXPR_DUMP`, `ZKPVM_PROFILE` | a run's steps, pcs, registers and trace rows | only a `debug-internals` build (`vos-pvm`'s, this crate's) | `just check-no-debug-internals`: no production edge enables it, and the node's binary names none of them |
 | the operator's `/stats` | stage histograms, `refine_gas` and `step_gas` among them: a kernel's gas, so its steps, within a quarter and in sums | the node's operator | not audited: the operator runs the replica |
@@ -422,9 +422,10 @@ testnet's own logs and database.
 | an agent on JAM: its work packages and results (`vos-jam`) | its batch, its rows' witness and its attests whole, served rows included | JAM's validators and DA | by design: an agent on JAM keeps no row from JAM, so a statement of one hides nothing from it |
 
 `RefinePayload`, which carried memory roots, went with the refine-bundle
-path (format 36). A proof's time in the logs and the operator's gas
-stages reveal the trace's size, as the prover's time does (the side
-channel below); a statement is published at the window's cadence for it.
+path (format 36). A proof's time and Stwo's size estimate in the logs,
+and the operator's gas stages, reveal the trace's size, as the prover's
+time does (the side channel below); a statement is published at the
+window's cadence for it.
 
 ## The external audit
 

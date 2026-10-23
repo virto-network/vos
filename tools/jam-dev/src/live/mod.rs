@@ -56,14 +56,16 @@ pub struct PolkaJam {
     pub watch: Option<Watch>,
 }
 
-/// What sees each work package a [`PolkaJam`] submitted, once the node
-/// took it: its encoding and its extrinsics, as they went. A run that
-/// audits what reached the chain keeps them.
+/// What sees each work package a [`PolkaJam`] submits, before it is sent:
+/// its encoding and its extrinsics, as they go, whether the node then
+/// answers or not; then whether the node answered that it took it. A run
+/// that audits what reached the chain keeps them.
 #[derive(Clone)]
 pub struct Watch(pub Arc<Watching>);
 
-/// A [`Watch`]'s function: a package's encoding and its extrinsics.
-pub type Watching = dyn Fn(&[u8], &[Vec<u8>]) + Send + Sync;
+/// A [`Watch`]'s function: a package's encoding, its extrinsics, and
+/// whether the node answered that it took it: none before it is sent.
+pub type Watching = dyn Fn(&[u8], &[Vec<u8>], Option<bool>) + Send + Sync;
 
 impl std::fmt::Debug for Watch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

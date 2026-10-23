@@ -79,6 +79,13 @@ impl Statements {
                 items.len()
             )));
         }
+        // An item's outcome is kept by its package and payload: two of one
+        // payload would share it.
+        let payloads: std::collections::BTreeSet<&Vec<u8>> =
+            items.iter().map(|(payload, _)| payload).collect();
+        if payloads.len() < items.len() {
+            return Err(failed("two items of one payload in a package"));
+        }
         let service = u32::try_from(self.service).map_err(failed)?;
         let refine_gas = self.refine_gas / items.len() as u64;
         let items: Vec<WorkItem> = items
@@ -121,20 +128,35 @@ impl Statements {
     /// Submit `items` as one package, and wait until each one's outcome
     /// lands: each outcome. The package goes to core 0, and again to core 1
     /// if nothing lands within half of `timeout`; the outcomes are the
-    /// package's that lands.
+    /// package's that lands, each item's taken from the other package
+    /// instead where that one landed too and applied it (code 0): a
+    /// control the first applied is the second's `Nonce`.
     pub fn land(&self, items: &[Item], timeout: Duration) -> Result<Vec<Outcome>, Error> {
         let until = Instant::now() + timeout;
         let mut packages = vec![self.submit(0, items)?];
         let resubmit = Instant::now() + timeout / 2;
         let mut errors = 0;
         loop {
+            let mut landed: Vec<Vec<Outcome>> = Vec::new();
             for package in &packages {
                 match self.landed(package, items) {
-                    Ok(Some(outcomes)) => return Ok(outcomes),
+                    Ok(Some(outcomes)) => landed.push(outcomes),
                     Ok(None) => errors = 0,
                     Err(error) if errors == TRANSIENT => return Err(error),
                     Err(_) => errors += 1,
                 }
+            }
+            if let Some(first) = landed.first() {
+                let applied = (0..first.len())
+                    .map(|at| {
+                        landed
+                            .iter()
+                            .map(|outcomes| outcomes[at])
+                            .find(|outcome| outcome.code == 0)
+                            .unwrap_or(first[at])
+                    })
+                    .collect();
+                return Ok(applied);
             }
             if packages.len() == 1 && Instant::now() > resubmit {
                 packages.push(self.submit(1, items)?);

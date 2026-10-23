@@ -8,15 +8,16 @@
 //! time, the accounts, the pallet's raw storage) and steps, each at a time:
 //! a call (its origin, its bytes as parts) or `on_idle`, and what it must
 //! do: its result, the pallet's events in SCALE, its raw storage writes
-//! (`null` a removal) and its balance deltas. A call's bytes are hex parts
-//! and ranges of the kit's fixture files (`fixtures/wrap.proof`), so a
-//! proof is not copied into the file once a submit.
+//! (`null` a removal) and its balance deltas. A call's bytes are hex parts,
+//! ranges of the kit's fixture files (`fixtures/wrap.proof`), so a proof is
+//! not copied into the file once a submit, and runs of one byte. The file's
+//! `unpinned` keys (`PruneCursor`'s) are left out of every step's storage.
 //!
 //! **Balances:** a pallet-level vector (`"fees": false`) pins every free
 //! and held delta exactly, and a provider count's; a `fees` vector, Kreivo's
 //! runtime with `ChargeSpaceFee`, pins free deltas by sign only, the
-//! signer's always listed, and who paid the fee; its `Budget` writes, whose
-//! spend sums the fees, are left out.
+//! signer's always listed, and who paid the fee; its `Budget` writes are
+//! pinned by key and `window`, their `spent`, which sums the fees, masked.
 
 mod client;
 mod mutations;
@@ -124,6 +125,10 @@ impl Fixtures {
 pub struct File {
     pub about: Vec<String>,
     pub constants: ConstantsJson,
+    /// Raw keys whose writes a harness leaves out of every step's storage:
+    /// items the design lets a pallet keep that the mock does not
+    /// (`PruneCursor`).
+    pub unpinned: Vec<String>,
     /// Labels of the accounts and anchor keys the vectors use.
     pub names: BTreeMap<String, String>,
     pub vectors: Vec<Vector>,
@@ -260,7 +265,8 @@ impl From<OriginJson> for Origin {
     }
 }
 
-/// A part of a call's bytes: hex, or a range of a kit fixture file.
+/// A part of a call's bytes: hex, a range of a kit fixture file, or one
+/// byte repeated.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Part {
@@ -270,6 +276,41 @@ pub enum Part {
         from: usize,
         to: usize,
     },
+    Repeat {
+        /// The byte, in hex.
+        repeat: String,
+        count: usize,
+    },
+}
+
+/// The shortest run of one byte a call's parts write as [`Part::Repeat`].
+const RUN: usize = 256;
+
+/// `bytes` as parts: hex, each run of [`RUN`] or more of one byte a repeat.
+fn hex_parts(bytes: &[u8]) -> Vec<Part> {
+    let mut out = Vec::new();
+    let (mut at, mut plain) = (0, 0);
+    while at < bytes.len() {
+        let run = bytes[at..]
+            .iter()
+            .take_while(|byte| **byte == bytes[at])
+            .count();
+        if run >= RUN {
+            if plain < at {
+                out.push(Part::Hex(hex(&bytes[plain..at])));
+            }
+            out.push(Part::Repeat {
+                repeat: hex(&[bytes[at]]),
+                count: run,
+            });
+            plain = at + run;
+        }
+        at += run;
+    }
+    if plain < bytes.len() || out.is_empty() {
+        out.push(Part::Hex(hex(&bytes[plain..])));
+    }
+    out
 }
 
 /// A call's result.
@@ -352,6 +393,17 @@ fn sign(before: u128, after: u128) -> String {
     .to_string()
 }
 
+/// A `Budget` value in a `fees` vector: its `window` in hex, its `spent`
+/// (which sums the fees, the teammate's weights) `?` for each nibble.
+fn masked_spend(value: &[u8]) -> String {
+    let window = &value[..value.len().min(8)];
+    format!(
+        "{}{}",
+        hex(window),
+        "?".repeat(2 * value.len().saturating_sub(8))
+    )
+}
+
 /// The pre-state of `chain`.
 fn pre(chain: &Chain) -> Pre {
     Pre {
@@ -421,12 +473,19 @@ fn step(
         .collect();
     let storage = keys
         .into_iter()
-        .filter(|key| !(fees && key.starts_with(&budget)))
         .filter_map(|key| {
             let (was, is) = (before.storage().get(key), after.storage().get(key));
-            (was != is).then(|| Entry {
+            let value = |value: &Vec<u8>| match fees && key.starts_with(&budget) {
+                true => masked_spend(value),
+                false => hex(value),
+            };
+            let changed = match fees && key.starts_with(&budget) {
+                true => was.map(value) != is.map(value),
+                false => was != is,
+            };
+            changed.then(|| Entry {
                 key: hex(key),
-                value: is.map(|value| hex(value)),
+                value: is.map(value),
             })
         })
         .collect();
@@ -511,17 +570,20 @@ fn parts(bytes: &[u8], files: &[(String, Vec<u8>)]) -> Vec<Part> {
                 to,
             })
         };
-        return [
-            Some(Part::Hex(hex(&bytes[..start]))),
-            range(0, offset),
-            (!patch.inserted.is_empty()).then(|| Part::Hex(hex(&patch.inserted))),
-            range(offset + removed, file.len()),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        return hex_parts(&bytes[..start])
+            .into_iter()
+            .chain(
+                [
+                    range(0, offset),
+                    (!patch.inserted.is_empty()).then(|| Part::Hex(hex(&patch.inserted))),
+                    range(offset + removed, file.len()),
+                ]
+                .into_iter()
+                .flatten(),
+            )
+            .collect();
     }
-    vec![Part::Hex(hex(bytes))]
+    hex_parts(bytes)
 }
 
 /// The bytes `parts` name.
@@ -537,6 +599,7 @@ fn assemble(parts: &[Part], files: &[(String, Vec<u8>)]) -> Vec<u8> {
                     .unwrap_or_else(|| panic!("the fixture file {fixture}"));
                 file[*from..*to].to_vec()
             }
+            Part::Repeat { repeat, count } => unhex(repeat).repeat(*count),
         })
         .collect()
 }
@@ -589,6 +652,12 @@ fn typed(entry: &Entry) {
         .find(|(item, ..)| key.starts_with(&item.prefix()))
         .unwrap_or_else(|| panic!("{}: no item's key", entry.key));
     assert_eq!(key.len(), 32 + parts, "{}: {item:?}'s key", entry.key);
+    if let Some(value) = entry.value.as_ref().filter(|value| value.contains('?')) {
+        assert_eq!(item, Item::Budget, "{}: masked", entry.key);
+        assert_eq!(value.len(), 2 * (8 + 16), "{}: a Spend", entry.key);
+        assert!(value[..16].bytes().all(|nibble| nibble.is_ascii_hexdigit()));
+        return;
+    }
     if let Some(value) = &entry.value {
         assert!(
             decode(&unhex(value)),
@@ -599,6 +668,11 @@ fn typed(entry: &Entry) {
 }
 
 fn replay(file: &File, fixtures: &Fixtures) {
+    replay_on(file, fixtures, |chain| chain);
+}
+
+/// [`replay`] on the chain `pallet` makes of each vector's pre-state.
+fn replay_on(file: &File, fixtures: &Fixtures, pallet: impl Fn(Chain) -> Chain) {
     let constants = Constants::kreivo(fixtures.venue);
     assert_eq!(file.constants, ConstantsJson::of(&constants));
     for vector in &file.vectors {
@@ -606,7 +680,7 @@ fn replay(file: &File, fixtures: &Fixtures) {
         for step in &vector.steps {
             step.storage.iter().for_each(typed);
         }
-        let mut chain = load(&constants, vector.fees, &vector.pre);
+        let mut chain = pallet(load(&constants, vector.fees, &vector.pre));
         for (n, expected) in vector.steps.iter().enumerate() {
             let before = chain.clone();
             chain.set_now(expected.now_ms);
@@ -652,6 +726,58 @@ fn the_mock_passes_every_vector() {
     let expected: Vec<String> = (1..=18).map(|n| format!("G{n}")).collect();
     assert_eq!(ids, expected);
     replay(&file, &fixtures);
+}
+
+/// The committed vectors, as a pallet's harness reads them.
+fn committed() -> File {
+    let text = std::fs::read_to_string(directory().join(SPACES)).expect("the vectors");
+    serde_json::from_str(&text).expect("the vectors parse")
+}
+
+/// Whether vector `id` replayed on the chain `pallet` makes passes.
+fn passes(id: &str, pallet: impl Fn(Chain) -> Chain) -> bool {
+    let fixtures = Fixtures::load();
+    let mut file = committed();
+    file.vectors.retain(|vector| vector.id == id);
+    assert_eq!(file.vectors.len(), 1, "{id}");
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        replay_on(&file, &fixtures, pallet)
+    }))
+    .is_ok()
+}
+
+/// Pallets the vectors must fail, each broken one way: one that takes
+/// every stored format and program as active, whatever its window (G7
+/// submits against a format not yet active, and a program past its
+/// `until_ms` and before its `from_ms`); one with other length bounds (G18
+/// submits at each bound and a byte past it); one that does not credit an
+/// accepted submit's deposit back to its window's budget (G13).
+#[test]
+fn a_broken_pallet_fails_the_vectors() {
+    use super::mock::Broken;
+    assert!(passes("G7", |chain| chain));
+    assert!(!passes("G7", |chain| chain.broken(Broken::Activation)));
+    assert!(passes("G18", |chain| chain));
+    for widen in [
+        |bounds: &mut super::mock::types::Bounds| bounds.genesis += 1,
+        |bounds: &mut super::mock::types::Bounds| bounds.statement += 1,
+        |bounds: &mut super::mock::types::Bounds| bounds.proof += 1,
+    ] {
+        assert!(!passes("G18", |mut chain| {
+            widen(&mut chain.constants.bounds);
+            chain
+        }));
+    }
+    assert!(passes("G13", |chain| chain));
+    assert!(!passes("G13", |chain| chain.broken(Broken::CreditBack)));
+}
+
+/// The file names `PruneCursor`'s key, which a pallet may keep for
+/// `on_idle` (`spaces-pallet.md` §5) and the mock does not, as unpinned.
+#[test]
+fn the_prune_cursor_is_unpinned() {
+    let cursor = [keys::twox128(keys::PALLET), keys::twox128(b"PruneCursor")].concat();
+    assert_eq!(committed().unpinned, [hex(&cursor)]);
 }
 
 /// The committed vectors and mutation lists are the generator's, byte for

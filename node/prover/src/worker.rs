@@ -101,7 +101,8 @@ pub struct Options {
     /// How long a proof another replica made is asked for before it is
     /// proved here.
     pub patience: Duration,
-    /// How long a submission whose answer was lost waits before it goes
+    /// How long a submission whose answer was lost, or that the venue
+    /// refused for now ([`vos_venue::transient`]), waits before it goes
     /// again, doubled each time.
     pub retry: Duration,
 }
@@ -387,6 +388,17 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             .collect()
     }
 
+    /// Submit `id` again no sooner than a wait from now, twice the last
+    /// one, [`Options::retry`] the first time: the wait.
+    fn retry_later(&mut self, id: StatementId) -> Duration {
+        let wait = self
+            .retries
+            .get(&id)
+            .map_or(self.options.retry, |(_, wait)| *wait * 2);
+        self.retries.insert(id, (Instant::now() + wait, wait));
+        wait
+    }
+
     /// Whether `statement`'s anchor passes `MaxRootAge` by the venue's time
     /// `ahead` from now; unknown, while the venue's time is, as not.
     fn dead(&self, statement: &Statement, ahead: Duration) -> bool {
@@ -507,8 +519,9 @@ impl<H: Host, J: Jobs> Worker<H, J> {
 
     /// Submit the led agents' proved statements that are recorded in their
     /// agents and whose roots the venue holds anchored: each handed over
-    /// once its job says so, a repeat counted as accepted. The number
-    /// handed over.
+    /// once its job says so, a repeat counted as accepted, a refusal that
+    /// may not hold later ([`vos_venue::transient`]) submitted again after
+    /// a backoff until its anchor ages. The number handed over.
     fn submit(&mut self, jobs: &[(StatementId, Job)]) -> Result<usize, String> {
         let mut handed = 0;
         let mut by_window: BTreeMap<(u64, AgentId, u64), (StatementId, Job)> = BTreeMap::new();
@@ -577,6 +590,16 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             let state = match self.venue.submit(&statement, &bytes) {
                 Ok(_) => State::Accepted,
                 Err(NotAccepted::Refused(code)) if code == repeated => State::Accepted,
+                Err(NotAccepted::Refused(code)) if vos_venue::transient(code) => {
+                    let wait = self.retry_later(id);
+                    tracing::warn!(
+                        agent = job.agent.0,
+                        code,
+                        seconds = wait.as_secs(),
+                        "a statement refused for now: submitted again later, until its anchor ages"
+                    );
+                    continue;
+                }
                 Err(NotAccepted::Refused(code)) => {
                     tracing::error!(
                         agent = job.agent.0,
@@ -586,11 +609,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                     State::Refused(code)
                 }
                 Err(NotAccepted::Unjudged(why)) => {
-                    let wait = self
-                        .retries
-                        .get(&id)
-                        .map_or(self.options.retry, |(_, wait)| *wait * 2);
-                    self.retries.insert(id, (Instant::now() + wait, wait));
+                    let wait = self.retry_later(id);
                     tracing::warn!(
                         agent = job.agent.0,
                         ?why,

@@ -525,10 +525,12 @@ fn a_pooled_anchor_lands_once() {
 }
 
 /// A key removed after its anchor was queued: the venue refuses it
-/// (`UnknownAnchorKey`), the client alerts and keeps it, and does not send
-/// it again within the window.
+/// (`UnknownAnchorKey`), or the client, once it reads the listing, sends it
+/// no more; it alerts, drops it and hands its window back to be signed
+/// again; an anchor of the window signed by a listed key
+/// is then sent and lands.
 #[test]
-fn a_refused_key_keeps_the_anchor_for_a_window() {
+fn a_refused_key_hands_the_window_back_to_be_signed_again() {
     let setup = Setup::new(true);
     let venue = setup.venue();
     setup
@@ -537,21 +539,30 @@ fn a_refused_key_keeps_the_anchor_for_a_window() {
     read_again(&venue);
     assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
     let key = keys::anchor_keys(&setup.space.0, &setup.key.verifying_key().to_bytes());
+    let value = setup.chain.with(|chain| chain.storage()[&key].clone());
     setup.chain.with(|chain| {
         chain.remove_storage(&key);
         chain.set_storage(keys::paused(), vec![0]);
     });
-    wait_until("the key refused", || setup.anchors_sent() == 1);
-    read_again(&venue);
-    std::thread::sleep(A_WHILE);
-    assert_eq!(setup.anchors_sent(), 1, "not again within the window");
-    assert_eq!(venue.queued(), 1, "kept");
+    wait_until("the window handed back", || {
+        venue.unsettled(&setup.space) == [5]
+    });
+    // Refused by the venue, or unsent once the client read the listing.
+    let refused = setup.anchors_sent();
+    assert!(refused <= 1);
+    assert_eq!(venue.queued(), 0, "dropped");
     assert!(
         venue
             .alerts()
             .iter()
             .any(|alert| matches!(alert, Alert::Configuration { .. }))
     );
+    setup.chain.with(|chain| chain.set_storage(key, value));
+    read_again(&venue);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    assert!(venue.unsettled(&setup.space).is_empty(), "queued again");
+    wait_until("the anchor lands", || setup.anchored_window(5));
+    assert_eq!(setup.anchors_sent(), refused + 1);
 }
 
 /// A venue whose chain cannot be reached at first: the client starts all
@@ -720,6 +731,7 @@ fn every_error_and_refusal_is_mapped() {
             WindowTooOld | OutOfRange => Answer::Dead(error),
             SpaceNotActive | Paused => Answer::Wait,
             InsufficientSovereignBalance | OverBudget => Answer::Funding(error),
+            UnknownAnchorKey | BadAnchorSignature => Answer::Resign(error),
             _ => Answer::Configuration,
         };
         assert_eq!(answer(Some(error)), expected, "{error:?}");

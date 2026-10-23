@@ -142,6 +142,10 @@ impl VenueClient for Recorded {
     fn time(&self) -> Option<u64> {
         self.inner.time()
     }
+
+    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+        self.inner.unsettled(space)
+    }
 }
 
 /// A work package sent to a JAM service, as it went: its encoding, its
@@ -151,6 +155,8 @@ pub struct Sent {
     pub package: Vec<u8>,
     pub extrinsics: Vec<Vec<u8>>,
     pub report: Arc<OnceLock<Vec<u8>>>,
+    /// Whether the node answered that it took it: none until it answered.
+    pub taken: Arc<OnceLock<bool>>,
 }
 
 impl Sent {
@@ -171,24 +177,39 @@ const REPORTED: Duration = Duration::from_secs(90);
 pub struct Wire(Mutex<Vec<Sent>>);
 
 impl Wire {
-    /// The watch to set on `node`, the client that sends.
+    /// The watch to set on `node`, the client that sends: each package
+    /// kept as it goes, its report read apart, whether the node answers it
+    /// took it or not (an answer lost, the package taken all the same).
     pub fn watch(self: &Arc<Self>, node: &PolkaJam) -> Watch {
         let (wire, node) = (Arc::clone(self), node.clone());
-        Watch(Arc::new(move |package: &[u8], extrinsics: &[Vec<u8>]| {
-            let report = Arc::new(OnceLock::new());
-            lock(&wire.0).push(Sent {
-                package: package.to_vec(),
-                extrinsics: extrinsics.to_vec(),
-                report: Arc::clone(&report),
-            });
-            let (node, package) = (node.clone(), package.to_vec());
-            std::thread::spawn(move || {
-                vos_checker::poll(REPORTED, || match node.work_report(&package) {
-                    Ok(Some(bytes)) => report.set(bytes).is_ok(),
-                    _ => false,
+        Watch(Arc::new(
+            move |package: &[u8], extrinsics: &[Vec<u8>], taken: Option<bool>| {
+                if let Some(taken) = taken {
+                    if let Some(sent) = lock(&wire.0)
+                        .iter()
+                        .rev()
+                        .find(|sent| sent.package == package)
+                    {
+                        let _ = sent.taken.set(taken);
+                    }
+                    return;
+                }
+                let report = Arc::new(OnceLock::new());
+                lock(&wire.0).push(Sent {
+                    package: package.to_vec(),
+                    extrinsics: extrinsics.to_vec(),
+                    report: Arc::clone(&report),
+                    taken: Arc::new(OnceLock::new()),
                 });
-            });
-        }))
+                let (node, package) = (node.clone(), package.to_vec());
+                std::thread::spawn(move || {
+                    vos_checker::poll(REPORTED, || match node.work_report(&package) {
+                        Ok(Some(bytes)) => report.set(bytes).is_ok(),
+                        _ => false,
+                    });
+                });
+            },
+        ))
     }
 
     /// The packages sent so far.
@@ -253,6 +274,10 @@ impl VenueClient for Migrating {
 
     fn time(&self) -> Option<u64> {
         self.current().time()
+    }
+
+    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+        self.current().unsettled(space)
     }
 }
 

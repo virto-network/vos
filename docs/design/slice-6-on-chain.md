@@ -409,10 +409,10 @@ pub struct Migrate { pub space: SpaceId, pub from: VenueId, pub to: VenueId, pub
 | anchor digest | `BLAKE2b-256("vos/anchor/v1" ‖ venue ‖ space ‖ w (8, LE) ‖ kind (1) ‖ root)`, ed25519 by a registered anchor key |
 | registration | a founding key's ed25519 signature over `BLAKE2b-256("vos/space/register" ‖ venue ‖ space ‖ controller (32) ‖ start_window (8, LE))`; the venue takes the genesis itself and computes the id, so it learns the clock and the founding keys from the hash. The first window the space anchors at the venue is signed, so nobody who sees a registration can resubmit it with a start that keeps the space from ever anchoring; the venue also bounds it, `now_w − MaxRootAge / length_ms ≤ start_window ≤ now_w + 1` by its own time |
 | controller | an `AccountId` (32 bytes) at each venue: a person, a multisig, a pass account or a community account; it rotates the authorities and anchor keys and migrates the space |
-| anchor keys | each node's, in its store, oldest first: its node key, which a founding node's genesis names, then each `vos node anchor-key rotate` makes (6.14b). The representative's leader signs with the newest of its own the venue lists (`VenueClient::anchor_keys`: Kreivo's `AnchorKeys`, the model's set), and signs nothing when it lists none, alerting "replace this replica, or list one of its keys": that window waits, and the later ones behind it, until one is listed, or the space resumes after a `Suspended`, and is settled unsent past `B_w + MaxRootAge`. A wait survives a leader change only within the windows whose representative cut roots the replicas keep (the last `CUT_KEEP`): a new leadership takes up every window up to the close mark whose cut root it keeps and whose root the venue does not hold; a window lost so is a gap, which the venue allows and the Clerk's carried state tolerates. An idle leader tries a waiting anchor again every 2 s. A rotation: the node makes the key and prints it; the controller registers it (`add_authority`); the node signs with it once listed; the controller removes the old one |
+| anchor keys | each node's, in its store, oldest first: its node key, which a founding node's genesis names, then each `vos node anchor-key rotate` makes (6.14b). The representative's leader signs with the newest of its own the venue lists (`VenueClient::anchor_keys`: Kreivo's `AnchorKeys`, the model's set), and signs nothing when it lists none, alerting "replace this replica, or list one of its keys": that window waits, and the later ones behind it, until one is listed, or the space resumes after a `Suspended`, and is settled unsent past `B_w + MaxRootAge`. A wait survives a leader change only within the windows whose representative cut roots the replicas keep (the last `CUT_KEEP`): a new leadership takes up every window up to the close mark whose cut root it keeps and whose root the venue does not hold; a window lost so is a gap, which the venue allows and the Clerk's carried state tolerates. An idle leader tries a waiting anchor again every 2 s, and an anchor refused `Unregistered` waits as one refused `Open` does (a client may answer so before it reads the registration). A leadership takes up the waiting windows again once a window length, and a recheck after a venue's client hands a window back: a client that queues anchors drops one the venue refuses as signed (its key no longer listed) and the leader signs it again with the newest key listed, and one queued again by another signer replaces it. A rotation: the node makes the key and prints it; the controller registers it (`add_authority`); the node signs with it once listed; the controller removes the old one |
 | sovereign account | on Kreivo, `PalletId(*b"kv/space").into_sub_account_truncating(space)` (`b"modl" ‖ b"kv/space" ‖ space[0..20]`): derivable from the genesis before registration, so the founder funds it first; it holds the registration deposit and pays every fee and `submit` deposit of the space's authorities, within a spend budget per window that the controller sets and the venue enforces before inclusion, so a compromised node key cannot drain it (`spaces-pallet.md` §7) |
 | authorities | on Kreivo, a map `(space, account) → anchor key`: each node's own sr25519 account, paired with its ed25519 anchor key, set by the controller; an authority signs `anchor` and `submit`, and the sovereign account pays (`spaces-pallet.md` §7). On JAM, the registered anchor keys alone |
-| migration | `Migrate`, by the controller at each venue; each venue refuses anchors outside its range |
+| migration | `Migrate`, by the controller at each venue; each venue refuses anchors outside its range. One way: a space that left a venue cannot register there again, so it returns only with a new genesis. And any single founding key registers the space at a venue it has not reached, under a controller of that key's choosing: one compromised founder squats the space there (the lever, carried: a registration co-signed by the controller, or by a founders' quorum) |
 | `MaxRootAge` | 24 h: an anchor older is refused and pruned; there is no separate grace |
 | JAM's code | the statements service never calls `upgrade`, so (JAM genesis, service id), its `VenueId`, fixes its code and its pins; a node checks the code hash against the configured program it expects before it anchors there (6.19) |
 
@@ -1880,6 +1880,52 @@ fees are the teammate's.
       the layout; a venue's allocator is the remaining lever.
 - **Then the slice's own cleanup:** the Opus code-quality review of slice
   6's code, folded the same way.
+- **Carried from the M3b/M3c Fable review** (`research/slice-6/M3bc-fable.md`;
+  H1, M1–M3, M5(a)(b) and M6(a)–(c) are folded, M4 resolved by decision 17,
+  L1, L2 and L6 fixed, M6(d) and (e) and L7's §9.1 references stated in
+  `spaces-pallet.md` §9.1, L7's logs row in `SECURITY.md`):
+  - **M5(c):** `Reach::Recorded` exempts the statements service's own
+    output in the testnet's log and database (its guest log lines and
+    accumulate writes): the service's storage dumped over RPC as a
+    `Leaves` carrier, the chain's layout constants excluded by value;
+  - **M5(d):** the masked wrap's own randomness and mask-column
+    commitments as needles (a `Built::Wrap` observation); an audited run
+    with an injected failing and a panicking proof, or a redacting panic
+    hook on the prover thread (`TreeError`'s `Debug` reaches
+    `ProveError::Failed`); and the binary scan on the release build, with
+    `vos-statement-service --features pvm-guest` in
+    `check-no-debug-internals`;
+  - **M6(d)'s runner:** a FRAME-agnostic reference runner in the kit, if
+    VOS's review of the teammate's harness is not enough;
+  - **M6(e)'s code, with the port:** `KreivoVenue` marks an anchor held
+    on its transport's `Anchored` event and its `last` only rises; the
+    port reports finalized inclusion, or the client reads the record at a
+    finalized block first; the pool's "already imported", "temporarily
+    banned" and "priority too low" mapped to `Lost`;
+  - **L3 (design):** migration one-way per venue, no re-registration; a
+    single founding key registers the space at a venue under a controller
+    of its choosing (the lever: a registration co-signed by the
+    controller, or a founders' quorum): recorded in pin D;
+  - **L4:** rootless `Kind::Stating` statements have no production prover
+    (the worker proves at-cut attests alone);
+  - **L5:** finished rootless jobs are never pruned: prune them once the
+    agent's watermark and compaction are past their record;
+  - **L7's rest:** `assert_searchable` plants only a needle's first
+    `Leaves` form; `carriers::directory` swallows read errors and skips
+    file names; the e2e reads node disks before `cluster.stop`; `resume`
+    leaves the disputed window's first root anchored, unpinned by a
+    vector; `Options::per_submit` defaults to one UNIT while a submit
+    holds 1.5; the mock's `migrate` omits `to != venue`;
+  - **L8 (ops notes):** decision 16's bound (3 s at the defaults) lets a
+    node proving on the leader's disk hand over every group it leads
+    under one slow fsync and win them back; the harnesses keep 5 s, their
+    nodes sharing a disk. A JAM registration's `genesis_ms` is `EPOCH_MS`
+    in the dev tooling and the harness, right for JAM's slot time;
+    `JamVenue::new` pins it through the configured block.
+  - The leader's recheck of anchors once a window length (M2's second
+    half) runs on the wall clock and is covered by the hand-back path's
+    test (a window refused as signed, signed again), not by a test of
+    its own: the shortest window is two minutes.
 - **Docs:** `proving.md` draft 6, `core-model.md`, `identity-and-authority.md`,
   `kreivo-pallet.md`'s superseded note, `clerk-across-spaces.md`, per
   `doc-fixes.md`; `slice-6-progress.md`, "Slice 6 accepted".

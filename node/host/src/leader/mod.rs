@@ -132,9 +132,14 @@ struct Leader {
     /// sign, or the venue would not take yet for want of a key or a
     /// resumption: alerted once a window.
     alerted: Option<u64>,
-    /// Whether this leadership has taken up the anchors an earlier one
-    /// left waiting.
-    seeded: bool,
+    /// The windows whose anchors the venue refused for good, or that aged
+    /// unsent, among those whose cut roots this replica keeps: not taken
+    /// up again.
+    refused: std::collections::BTreeSet<u64>,
+    /// When this leadership last took up the anchors left waiting: at its
+    /// first batch, then a window length later, or sooner once the venue's
+    /// client hands a window back to be signed again.
+    seeded: Option<Instant>,
     /// The venue's anchor key listing when it last refused this node's
     /// key, and the node's time then: the anchor goes again once the
     /// listing changes, or a window later.
@@ -205,7 +210,8 @@ impl Leader {
             unanchored: std::collections::BTreeMap::new(),
             anchor_tried: None,
             alerted: None,
-            seeded: false,
+            seeded: None,
+            refused: std::collections::BTreeSet::new(),
             key_refused: None,
         }
     }

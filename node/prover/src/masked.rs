@@ -192,7 +192,7 @@ impl MaskedProver {
         let (proof, _) = self.proved(kernel, attest, |program, entry, run| {
             vos_pvm_recair::tree::prove_final_watched(program, entry, run, &mut watch)
         })?;
-        internals.steps.push(lengths.iter().sum());
+        internals.run_steps = lengths.iter().sum();
         internals.steps.extend(lengths);
         Ok((proof, internals))
     }

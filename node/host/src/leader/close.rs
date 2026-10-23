@@ -58,13 +58,57 @@ impl Leader {
     }
 
     /// How long until an idle leader hands the venue a waiting anchor
-    /// again: a recheck after the last try; none while none waits.
+    /// again, a recheck after the last try, or takes up again the anchors
+    /// left waiting ([`Leader::reseed_wait`]); none while neither is due.
     pub(super) fn anchor_wait(&self) -> Option<Duration> {
-        if self.unanchored.is_empty() {
+        let waiting = (!self.unanchored.is_empty()).then(|| {
+            let since = self.anchor_tried.map_or(ANCHOR_RECHECK, |at| at.elapsed());
+            ANCHOR_RECHECK.saturating_sub(since)
+        });
+        waiting.into_iter().chain(self.reseed_wait()).min()
+    }
+
+    /// How long until the representative's leader takes up again the
+    /// anchors left waiting ([`Leader::seed_waiting`]): a window length
+    /// after it last did, or a recheck after it while the venue's client
+    /// holds windows handed back to be signed again
+    /// ([`vos_venue::VenueClient::unsettled`]). None before this
+    /// leadership's first batch, which takes them up, or with no venue.
+    fn reseed_wait(&self) -> Option<Duration> {
+        let venue = self.inner.venue.as_ref()?;
+        let seeded = self.seeded?;
+        if !self.represents() {
             return None;
         }
-        let since = self.anchor_tried.map_or(ANCHOR_RECHECK, |at| at.elapsed());
-        Some(ANCHOR_RECHECK.saturating_sub(since))
+        let (space, clock) = self.inner.space_and_clock();
+        let every = if venue.unsettled(&space).is_empty() {
+            Duration::from_millis(clock.length_ms)
+        } else {
+            ANCHOR_RECHECK
+        };
+        Some(every.saturating_sub(seeded.elapsed()))
+    }
+
+    /// Whether to take up the anchors left waiting now: at a leadership's
+    /// first batch, then when [`Leader::reseed_wait`] says. A window the
+    /// venue's client handed back is no longer settled, so a close not yet
+    /// sent hands it over again too.
+    fn reseed_due(&mut self) -> bool {
+        let Some(venue) = self.inner.venue.clone() else {
+            return false;
+        };
+        if !self.represents() {
+            return false;
+        }
+        let (space, _) = self.inner.space_and_clock();
+        for window in venue.unsettled(&space) {
+            self.anchored.remove(&window);
+        }
+        let due = self.reseed_wait().is_none_or(|wait| wait.is_zero());
+        if due {
+            self.seeded = Some(Instant::now());
+        }
+        due
     }
 
     /// Whether this agent is its space's representative.
@@ -119,8 +163,7 @@ impl Leader {
     /// in window order, each window's anchor handed to the venue first
     /// ([`Leader::anchor_due`]).
     pub(super) fn closes(&mut self, snapshot: &Snapshot) -> Result<Closes, Fault> {
-        if !self.seeded {
-            self.seeded = true;
+        if self.reseed_due() {
             self.seed_waiting(snapshot)?;
         }
         let unsent = unsent(snapshot, self.id, self.represents())?;
@@ -160,13 +203,15 @@ impl Leader {
         Ok(Closes::Due(due))
     }
 
-    /// Take up, at a leadership's start, the anchors an earlier one left
-    /// waiting: every window up to the close mark whose cut root this
+    /// Take up the anchors left waiting, by an earlier leadership or by
+    /// the venue: every window up to the close mark whose cut root this
     /// replica still keeps (the representative's last
-    /// [`defaults::CUT_KEEP`] windows) and
-    /// whose root the venue does not hold anchored. Its close was sent, so
-    /// no unsent close names it; the root is the representative's at its
-    /// cut, the one its close carried.
+    /// [`defaults::CUT_KEEP`] windows) and whose root the venue does not
+    /// hold anchored, whether never handed over, handed over and dropped
+    /// by the venue's client to be signed again, or refused while the
+    /// space was not registered there yet. Its close was sent, so no unsent
+    /// close names it; the root is the representative's at its cut, the
+    /// one its close carried.
     fn seed_waiting(&mut self, snapshot: &Snapshot) -> Result<(), Fault> {
         let Some(venue) = self.inner.venue.clone() else {
             return Ok(());
@@ -180,12 +225,17 @@ impl Leader {
             return Ok(());
         };
         let (space, _) = self.inner.space_and_clock();
+        let mut kept = std::collections::BTreeSet::new();
         for row in snapshot.scan(self.id, &keys::cut_roots(), None) {
             let (key, value) = row?;
             let Some(window) = keys::cut_root_entry(&key).filter(|window| *window <= through)
             else {
                 continue;
             };
+            kept.insert(window);
+            if self.refused.contains(&window) {
+                continue;
+            }
             let Some((root, _)) = <([u8; 32], u64)>::decode_exact(&value) else {
                 return Err(fault(roots::Error::Corrupt("a cut root")));
             };
@@ -205,6 +255,7 @@ impl Leader {
                 self.unanchored.entry(window).or_insert(root);
             }
         }
+        self.refused.retain(|window| kept.contains(window));
         Ok(())
     }
 
@@ -214,15 +265,23 @@ impl Leader {
     /// venue will not take until its controller acts (a key registered, the
     /// space resumed). The next batch tries again, or an idle leader a
     /// recheck later ([`Leader::anchor_wait`]), with the later ones behind
-    /// it, so none passes it. A window past `MaxRootAge` by this
-    /// node's clock is settled here, unsent: no venue takes it. One taken,
-    /// or refused for good, is
+    /// it, so none passes it. A window past `MaxRootAge` by the venue's
+    /// time (this node's while the venue's client cannot say) is settled
+    /// here, unsent: no venue takes it. One taken, or refused for good, is
     /// settled; the close goes on either way, and a statement over an
     /// unanchored root is refused at the venue.
     fn anchor_due(&mut self) {
         let (_, clock) = self.inner.space_and_clock();
+        if self.unanchored.is_empty() {
+            return;
+        }
+        let now = self
+            .inner
+            .venue
+            .as_ref()
+            .and_then(|venue| venue.time())
+            .unwrap_or_else(|| (self.inner.clock)());
         while let Some((&window, &root)) = self.unanchored.first_key_value() {
-            let now = (self.inner.clock)();
             let aged = clock
                 .boundary(window)
                 .is_some_and(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS);
@@ -231,6 +290,7 @@ impl Leader {
                     window,
                     "the space's root waited past `MaxRootAge`; no venue takes it now"
                 );
+                self.refused.insert(window);
             } else if !self.anchor(window, &root) {
                 self.anchor_tried = Some(Instant::now());
                 return;
@@ -317,8 +377,17 @@ impl Leader {
                 );
                 false
             }
+            Err(AnchorRefusal::Unregistered) => {
+                self.alert(
+                    window,
+                    "the space is not registered at the venue, or its client has not read the \
+                     registration yet; anchoring again",
+                );
+                false
+            }
             Err(refusal) => {
                 tracing::error!(window, ?refusal, "the venue refused the space's root");
+                self.refused.insert(window);
                 true
             }
         }

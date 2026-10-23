@@ -20,10 +20,13 @@
 //! `MaxRootAge` by the venue's clock); otherwise it is kept: 16
 //! `WindowInFuture` until `Timestamp.Now` passes `B_w` plus a block; 19 and
 //! 20 until the space is active and anchors are not paused; 21 and 27, and
-//! `InvalidTransaction::Payment`, a funding alert, until the next read; the
-//! others (7 `NotAuthority`, 11–13 the key or the signature) an alert, and
-//! again a window later; the pool's other refusals an alert, and again
-//! after a backoff.
+//! `InvalidTransaction::Payment`, a funding alert, until the next read; 11
+//! `UnknownAnchorKey` and 12 `BadAnchorSignature`, or a signer the space no
+//! longer lists by the client's last read (then unsent), an alert, and the
+//! anchor dropped, its window handed back to the representative's leader
+//! to sign again ([`VenueClient::unsettled`]); the others (7
+//! `NotAuthority`, 13 the kind) an alert, and again a window later; the
+//! pool's other refusals an alert, and again after a backoff.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -466,6 +469,13 @@ impl Shared {
             state.alert(Alert::Configuration { space, what });
             return wait;
         };
+        if !known.keys.contains(&anchor.signer) {
+            state.later.remove(&key);
+            state.landed.remove(&key);
+            let what = format!("window {window}'s anchor key is not listed: to be signed again");
+            state.alert(Alert::Configuration { space, what });
+            return Fate::Resign;
+        }
         let clock = info.clock();
         let boundary = clock.boundary(window).unwrap_or(u64::MAX);
         if now.saturating_sub(boundary) > MAX_ROOT_AGE_MS {
@@ -543,6 +553,13 @@ impl Shared {
                         let what = format!("an anchor refused: {error:?}");
                         state.alert(Alert::Funding { space, what });
                         wait
+                    }
+                    Answer::Resign(error) => {
+                        state.later.remove(&key);
+                        state.landed.remove(&key);
+                        let what = format!("an anchor refused: {error:?}; to be signed again");
+                        state.alert(Alert::Configuration { space, what });
+                        Fate::Resign
                     }
                     Answer::Configuration => {
                         let what = format!(
@@ -709,8 +726,11 @@ pub(super) enum Answer {
     /// 21 `InsufficientSovereignBalance`, 27 `OverBudget`: kept; a
     /// funding alert.
     Funding(Error),
-    /// 7 `NotAuthority`, 11–13 the key, the signature, the kind, any
-    /// other, or not the pallet's: kept, an alert, again a window later.
+    /// 11 `UnknownAnchorKey`, 12 `BadAnchorSignature`: dropped, an
+    /// alert, its window handed back to be signed again.
+    Resign(Error),
+    /// 7 `NotAuthority`, 13 the kind, any other, or not the pallet's:
+    /// kept, an alert, again a window later.
     Configuration,
 }
 
@@ -722,6 +742,9 @@ pub(super) fn answer(error: Option<Error>) -> Answer {
         Some(Error::SpaceNotActive | Error::Paused) => Answer::Wait,
         Some(error @ (Error::InsufficientSovereignBalance | Error::OverBudget)) => {
             Answer::Funding(error)
+        }
+        Some(error @ (Error::UnknownAnchorKey | Error::BadAnchorSignature)) => {
+            Answer::Resign(error)
         }
         _ => Answer::Configuration,
     }
@@ -786,6 +809,9 @@ impl VenueClient for KreivoVenue {
             };
         }
         if !info.holds(window) {
+            return Err(AnchorRefusal::Window);
+        }
+        if self.queue.dead(&anchor.space, window) {
             return Err(AnchorRefusal::Window);
         }
         if self.queue.holds(&anchor.space, window) {
@@ -873,5 +899,9 @@ impl VenueClient for KreivoVenue {
     /// `Timestamp.Now` as the reader thread last read it.
     fn time(&self) -> Option<u64> {
         self.shared.state().now
+    }
+
+    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+        self.queue.unsettled(space)
     }
 }

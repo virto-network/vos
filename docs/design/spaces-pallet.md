@@ -280,6 +280,7 @@ client and the mock read raw keys.
 | `Programs` | `ProgramId` (Blake2_128Concat) | `ProgramInfo { handler: Handler, venue_bound: bool, active: Active }` |
 | `Seen` | `StatementId` (Identity) | `u64` expires_ms; `u64::MAX` = never |
 | `Paused` | (value) | `u8` flags: bit 0 submit, bit 1 anchor, bit 2 register |
+| `PruneCursor` | (value, optional) | the pallet's own: where `on_idle` resumes (§6.5); its layout is the teammate's, and the vectors leave its writes out (§10's `unpinned`) |
 
 ```rust
 pub struct SpaceInfo {
@@ -462,7 +463,11 @@ The outcome:
   `expires_ms < now`.
 - Never prune `Seen` entries at `u64::MAX`.
 - Keep `Last`, and keep `Equivocations` until `resume`.
-- Bounded by the remaining weight, with a cursor.
+- Bounded by the remaining weight: it may stop part way and resume in a
+  later block, keeping where it stopped in `PruneCursor` (§5), the one
+  item whose layout this design leaves to the pallet. A pallet that prunes
+  all it can each block needs none. Either way the vectors pin every other
+  key's writes (§10); `PruneCursor`'s are the file's `unpinned`.
 - `MaxRootAge` is never raised in place; a raise is a VOS change of
   `MAX_ROOT_AGE_MS`, a new kit, and a migration that, before the new bound
   takes effect, prunes anchors older than the old bound and adds
@@ -705,8 +710,9 @@ port adds it):
   - The call goes as its pinned bytes, never as a `pallet/call` path and
     text fields. The client checks that the call bytes in the payload
     equal them.
-  - The metadata's extensions must be §7's ten, in order, or nothing is
-    signed.
+  - The metadata's signed extensions must be the list the port pins from
+    Kreivo's runtime (`KR/lib.rs`), in its order, with §7's
+    `ChargeSpaceFee` in `ChargeTransaction`'s place, or nothing is signed.
   - `PassAuthenticate` is pinned to `None` after its type is checked to
     be an `Option`.
 - **Nonce and pool.** The `Sender` takes a call as landed only once
@@ -728,7 +734,10 @@ port adds it):
   - `Call`;
   - `Other`;
   - `Lost` for a lost connection, or a watched extrinsic dropped,
-    invalidated or usurped.
+    invalidated or usurped; and for the pool's "already imported",
+    "temporarily banned" and "priority too low", whose extrinsic may still
+    land, so the `Sender` never signs again with a fresh nonce while it
+    may.
 
   part: the extension folds every invalid transaction into one `Chain`
   code.
@@ -746,6 +755,13 @@ port adds it):
   - The port adds reads by raw key, and best-block reads:
     `Transport::storage`, `keys`, `best` and `chain_nonce` read at the
     best block.
+  - What `VenueClient::anchored` answers from must be final: the anchors
+    `KreivoVenue` holds and the last window it read are taken from
+    finalized blocks, never from a best block's `Anchored` event, or a
+    reorg makes the worker submit against a retracted root and forfeit its
+    deposit. The client as built marks an anchor held on the event its
+    transport reports; the port reports finalized inclusion there, or the
+    client reads the record at a finalized block first.
 - **Reconnect.**
   - ext: the light client reconnects, and a session whose cleanup is
     uncertain is poisoned and dropped.
@@ -773,9 +789,14 @@ port adds it):
 **The contract** is the conformance vectors and the mock:
 - `node/venue/conformance/*.json` and the mock that writes them
   (`vos-venue`'s `mock` feature; `just conformance` regenerates them);
-- `KreivoVenue`'s tests over the mock (`node/venue/src/kreivo/tests.rs`,
-  `node/host/tests/cluster/kreivo.rs`), which the ported transport must
-  pass against a dev chain carrying the pallet (M3b's deferred gate 2).
+- the scenarios of `KreivoVenue`'s tests over the mock
+  (`node/venue/src/kreivo/tests.rs`, `node/host/tests/cluster/kreivo.rs`),
+  which set the mock's state directly: the port states them again over
+  its transport against a dev chain carrying the pallet, its state set by
+  the pallet's calls (M3b's deferred gate 2);
+- the vectors' replay is the mock's (`conformance/mod.rs`); the
+  teammate's harness that runs them against the pallet is reviewed by VOS
+  before the pallet is taken as passing G1–G18.
 
 ## 10. Conformance vectors
 
@@ -821,7 +842,11 @@ tag's, byte for byte.
     `validate`, `undecodable` before dispatch), the pallet's events in SCALE
     (without the runtime's index), every raw key whose value changed (`null`
     removed), and each account's deltas. A `fees` vector also names who paid
-    the fee, and leaves out `Budget`'s writes, whose spend sums fees;
+    the fee, and pins `Budget`'s writes by key and `window`, its `spent`
+    masked (`?` a nibble not compared), since that spend sums fees. A
+    call's parts may also be `{repeat, count}`, one byte repeated, which
+    the length bounds' steps use. `unpinned` lists the raw keys a harness
+    leaves out of every step's storage: `PruneCursor`'s (§5, §6.5);
   - `mutations.json`: spike 6c's proof mutants (120) and statement mutants
     (284), and format 39's masked fields tampered (12 the fixed layout
     holds), each a patch of the `valid` fixture's proof or statement and
@@ -835,7 +860,18 @@ tag's, byte for byte.
   (`frame_system::block_hash(0)` in the mock runtime) is the fixtures',
   which their venue-bound statements name.
 - **G7** covers codes 1–5, 7 and `0x1xx`: a repeat (6) releases its
-  deposit (§6.3), so it is G8's. G4 reaches `BadClock` by setting the time
+  deposit (§6.3), so it is G8's. It then submits the fixture itself while
+  its format is stored but not yet active (2), while its program's
+  `until_ms` is now and while its `from_ms` is later (3), and once it is
+  active (accepted): a pallet that checks a format's or program's presence
+  and not its window fails it.
+- **G18** pins the length bounds (§4): a genesis of `MaxGenesisLen`, a
+  statement of `MaxStatementLen` and a proof of `MaxProofLen` bytes decode
+  and are judged; a byte more of each is `undecodable`.
+- **G13** pins `Budget`'s key and its `window`, and an accepted submit's
+  deposit credited back to the window's budget: at `SubmitDeposit + 2 ×
+  FeeBound` a window, an accepted submit leaves room for one forfeiting
+  submit. G4 reaches `BadClock` by setting the time
   before the space's origin, the only way for a registered space.
 
 | Id | Scenario |
@@ -846,18 +882,18 @@ tag's, byte for byte.
 | G4 | anchor refusals: a stale w ≤ Last, the open window `now_w` (`WindowInFuture`; then `now_ms` advanced past `B_w` and the same anchor resubmitted → `Anchored`), a future w, older than `MaxRootAge`, out of range, bad signature, kind 1, a `now_ms` before the origin (`BadClock`) |
 | G5 | an equivocation by one key, then `Suspended`, `resume` refused until it is removed; and by two keys (the failover case): `Evidence` names both, `resume` refused until both are removed |
 | G6 | `submit` of the masked format-39 fixture: `Accepted { id }`; the deposit released |
-| G7 | one mutant per refusal class, 1–7 and `0x1xx`: `Refused { code }`, `DepositForfeited` |
+| G7 | one mutant per refusal class, 1–7 and `0x1xx`: `Refused { code }`, `DepositForfeited`; then the fixture against its format's and program's activation windows (2, 3, accepted once active) |
 | G8 | the same statement twice: `Refused { 6 }`, the deposit released |
 | G9 | a rootless statement resubmitted at `MaxRootAge + 1`: refusal 6. A rooted one: refusal 5 |
 | G10 | a non-authority submit → `NotAuthority`; pause flags |
 | G11 | `set_program` by `ProgramsOrigin` with `from < now + delay` → `TooEarly`; with Root, at once |
 | G12 (fees) | signs only: an authority's `anchor` and `submit` debit the sovereign account, not the node; a non-authority pays its own; a submit whose sovereign cannot cover fee and deposit refused in `validate` |
-| G13 | the budget: with `max_spend_per_window = 8 × (SubmitDeposit + FeeBound)`, the ninth submit in a window refused before dispatch (`InvalidTransaction::Payment`; `OverBudget` in the fallback), the sovereign's balance untouched; the next window resets it; `set_budget` |
+| G13 | the budget: with `max_spend_per_window = 8 × (SubmitDeposit + FeeBound)`, the ninth submit in a window refused before dispatch (`InvalidTransaction::Payment`; `OverBudget` in the fallback), the sovereign's balance untouched; the next window resets it; `set_budget`; an accepted submit's deposit credited back, leaving room for one more |
 | G14 | `migrate`: `end_window` set; an anchor at `w ≥ from_window` → `OutOfRange`; a rooted statement whose root's window is ≥ `end_window` → refusal 5; a second `migrate` → `AlreadyMigrated` |
 | G15 | the controller and keys: `set_controller` (the old controller refused after it); `add_authority` updating a paired key (the old key leaves `AnchorKeys`); a key paired elsewhere → `AnchorKeyInUse`; `remove_anchor_key` of a paired key → `AnchorKeyInUse`, of an unpaired founding key → removed; `remove_authority` with a consumer on the account (best effort) |
 | G16 | `dispatch_as_sovereign` (a transfer from the sovereign; `SovereignDispatched`); `set_status` block (submits and anchors refused) and unblock (back to `Active`, or `Suspended` with equivocations); `set_format` under the delay (`TooEarly`; Root at once) |
 | G17 | `on_idle`: an anchor and a rooted `Seen` entry pruned past `MaxRootAge`, the rootless entry kept, `Last` and `Equivocations` kept |
-| G18 | registration refusals: `BadClock` (a length outside the bounds), `BadFounder` (a key not in the genesis, or a bad signature), `SovereignInUse`, `SpaceExists`; and a submit paid by a space other than the statement's: accepted |
+| G18 | registration refusals: `BadClock` (a length outside the bounds), `BadFounder` (a key not in the genesis, or a bad signature), `SovereignInUse`, `SpaceExists`; and a submit paid by a space other than the statement's: accepted; the length bounds, at each bound and a byte past it |
 
 ## 11. Later stages: pass, and anonymous authentication
 

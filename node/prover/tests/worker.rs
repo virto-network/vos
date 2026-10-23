@@ -1,7 +1,8 @@
 //! The worker over a model of its node, its prover and its venue: a
 //! restart mid-proof leaves one proof, a submission made twice is accepted
 //! once, a leader change proves nothing twice, a dead statement is skipped,
-//! and a record whose re-run is not its statement is refused.
+//! a record whose re-run is not its statement is refused, and a refusal
+//! that may not hold later is submitted again.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -214,6 +215,8 @@ struct Venue {
     accepted: Mutex<BTreeSet<[u8; 32]>>,
     submissions: AtomicUsize,
     lose: AtomicBool,
+    /// The codes the next submissions are refused with, in order.
+    refuse: Mutex<Vec<u32>>,
 }
 
 impl Venue {
@@ -243,6 +246,11 @@ impl VenueClient for Venue {
 
     fn submit(&self, statement: &Statement, _: &[u8]) -> Result<StatementId, NotAccepted> {
         self.submissions.fetch_add(1, Ordering::SeqCst);
+        let mut refuse = self.refuse.lock().unwrap();
+        if !refuse.is_empty() {
+            return Err(NotAccepted::Refused(refuse.remove(0)));
+        }
+        drop(refuse);
         let id = statement.id();
         if !self.accepted.lock().unwrap().insert(id.0) {
             return Err(NotAccepted::Refused(6));
@@ -596,4 +604,53 @@ fn an_io_hash_mismatch_is_refused() {
     assert_eq!(venue.accepted(), 1);
     let backlog = worker.backlog().unwrap();
     assert_eq!((backlog.refused, backlog.accepted), (1, 1));
+}
+
+/// A statement refused for now, a root not anchored (5) and then a refine
+/// out of gas (`0x1001`), is submitted again after a backoff, doubled, and
+/// accepted; one refused for good (3, another program) stays refused.
+#[test]
+fn a_transient_refusal_is_submitted_again() {
+    let agent = Arc::new(Mutex::new(Agent::default()));
+    agent.lock().unwrap().log.push(vec![attest(3, 1)]);
+    let node = Node::new(&agent, true);
+    let (jobs, prover, venue) = (
+        MemoryJobs::default(),
+        Arc::new(Proofs::default()),
+        Venue::at(after(3)),
+    );
+    let retry = Duration::from_millis(200);
+    let options = Options { retry, ..options() };
+    let mut worker = worker_with(&node, &jobs, &prover, &venue, options);
+    // Proved and recorded, its root not anchored yet.
+    while agent.lock().unwrap().proven.is_empty() {
+        worker.step().unwrap();
+    }
+    venue.anchor(3);
+    let submitted = |states: Vec<State>| matches!(states[..], [State::Submitted { .. }]);
+    *venue.refuse.lock().unwrap() = vec![5, 0x1001];
+    worker.step().unwrap();
+    assert!(submitted(states(&jobs)), "5: kept");
+    std::thread::sleep(retry);
+    worker.step().unwrap();
+    assert!(submitted(states(&jobs)), "0x1001: kept");
+    worker.step().unwrap();
+    assert_eq!(
+        venue.submissions.load(Ordering::SeqCst),
+        2,
+        "not again before its doubled wait"
+    );
+    std::thread::sleep(retry * 2);
+    worker.step().unwrap();
+    assert_eq!(states(&jobs), [State::Accepted]);
+    assert_eq!(venue.accepted(), 1);
+
+    agent.lock().unwrap().log.push(vec![attest(3, 2)]);
+    *venue.refuse.lock().unwrap() = vec![3];
+    while venue.submissions.load(Ordering::SeqCst) < 4 {
+        worker.step().unwrap();
+    }
+    let finished = states(&jobs);
+    assert!(finished.contains(&State::Refused(3)), "3: final");
+    assert!(finished.contains(&State::Accepted));
 }

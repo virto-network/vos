@@ -1,3 +1,4 @@
+use vos_node_prover::Internals;
 use vos_wire::Encode;
 use vos_wire::ids::{AgentId, InstanceId, ProgramHash};
 use vos_wire::result::Attest;
@@ -215,4 +216,31 @@ fn a_rootless_records_private_arguments_are_needles() {
 fn a_record_whose_rows_are_not_after_its_arguments_fails() {
     let (attest, arguments) = attest(7);
     Needles::default().attest("read", &attest, arguments - 1);
+}
+
+/// A proof's internals give the needle of the gas its re-run left from the
+/// run's steps, whatever its boundaries' step indices: a log line printing
+/// that gas is found.
+#[test]
+fn the_gas_a_rerun_left_is_the_runs() {
+    let internals = Internals {
+        steps: vec![1, 600_001, 600_001, 1_234_568, 600_000, 634_567],
+        run_steps: 1_234_567,
+        ..Internals::default()
+    };
+    let mut needles = Needles::default();
+    needles.internals("s", &internals);
+    let left: Vec<&Needle> = needles.named(Kind::StepCount, "re-run left").collect();
+    assert_eq!(left.len(), 1);
+    let line = format!("re-run gas left: {}", (1u64 << 32) - 1_234_567);
+    assert_eq!(
+        audit(Reach::Leaves, line.as_bytes(), left[0].clone()).len(),
+        1
+    );
+    let run = format!("steps={}", 1_234_567);
+    assert!(
+        needles
+            .named(Kind::StepCount, "1234567 steps")
+            .any(|needle| !audit(Reach::Leaves, run.as_bytes(), needle.clone()).is_empty())
+    );
 }

@@ -108,13 +108,19 @@ const ITEMS: [Item; 12] = [
 /// the key its builder makes, the value its type.
 fn read_back(transport: &MockTransport, entry: &Entry, at: &str) {
     let key = unhex(&entry.key);
+    let stored = transport.storage(&key).unwrap();
+    if let Some(masked) = entry.value.as_ref().filter(|value| value.contains('?')) {
+        let read = hex(&stored.unwrap_or_default());
+        let held = read.len() == masked.len()
+            && read
+                .bytes()
+                .zip(masked.bytes())
+                .all(|(read, masked)| masked == b'?' || read == masked);
+        assert!(held, "{at}: {}: {read} is not {masked}", entry.key);
+        return;
+    }
     let value = entry.value.as_deref().map(unhex);
-    assert_eq!(
-        transport.storage(&key).unwrap(),
-        value,
-        "{at}: {}",
-        entry.key
-    );
+    assert_eq!(stored, value, "{at}: {}", entry.key);
     let (name, rebuild, decode) = ITEMS
         .iter()
         .find(|(name, ..)| key.starts_with(&keys::plain("Spaces", name)))
@@ -227,10 +233,12 @@ fn spends(transport: &dyn Transport, written: &[Entry], now_ms: u64, at: &str) {
             continue;
         };
         let space: [u8; 32] = array(&key, 32);
-        let spend: Spend = calls::read(&unhex(value)).expect("a spend");
+        // Its `window`, the value's first field: its `spent` may be masked.
+        let window: [u8; 8] = unhex(&value[..16]).try_into().expect("a window");
+        let window = u64::from_le_bytes(window);
         let info: SpaceInfo = read_as(transport, &keys::spaces(&space), at);
         assert_eq!(
-            Some(spend.window),
+            Some(window),
             info.clock().window(now_ms),
             "{at}: the spend's window"
         );

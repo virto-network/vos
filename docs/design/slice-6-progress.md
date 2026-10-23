@@ -3814,7 +3814,68 @@ only with 14 GB or more available]:
   its driver (cargo takes one test filter before `--`; the filters moved
   after it), before any test ran.
 
-**Milestone review: Fable —** _(verdict pending)_
+**Milestone review: Fable — accept after fixes, folded** (`M3bc-fable.md`,
+on `s6/m3bc-fix`): no path by which a wrong statement is accepted or a
+forged, replayed or cross-venue anchor lands at either venue; the defects
+are in the node's anchor and submission liveness, the audit's coverage
+and the vectors' completeness. Its findings:
+- **H1 (high):** a pallet ignoring a format's or program's activation
+  window passed every vector: G7 now submits the fixture while its format
+  is stored but not yet active (2), while its program's `until_ms` is now
+  and while its `from_ms` is later (3), then accepted once active. Test:
+  `a_broken_pallet_fails_the_vectors` (a mock taking every stored entry as
+  active fails G7).
+- **M1 (medium):** a queued anchor was never replaced, re-signed or
+  alerted on: `AnchorQueue::push` replaces an entry of another signer;
+  `Fate::Resign` (JAM's `Key` and `Signature`, Kreivo's 11 and 12, or a
+  signer the client's last read no longer lists) drops it and keeps its
+  window `unsettled`, which `VenueClient::unsettled` hands the leader,
+  who takes it up again and signs with the newest key listed; a window
+  the venue refused for good is remembered (`AnchorQueue::dead`) and
+  answered `Window`, unsent; `JamSend` alerts on every refusal but
+  `Open`. Tests: `a_queued_anchor_whose_key_is_removed_is_signed_again`
+  (cluster: queued under K1 in an open window, K1 removed for K2 before
+  it lands, landed under K2), the queue's
+  `a_window_refused_as_signed_is_unsettled_until_signed_again`, Kreivo's
+  `a_refused_key_hands_the_window_back_to_be_signed_again`, JAM's
+  `each_anchor_code_has_its_fate`.
+- **M2 (medium):** `Unregistered` waits as `Open` does, alerted once; the
+  leadership takes up waiting windows again once a window length (and a
+  recheck after a hand-back), skipping those refused for good. Test:
+  `windows_refused_unregistered_are_anchored_once_registered` (a client
+  answering `Unregistered` until it reads the registration; windows 0 and
+  1 anchored after, then 2).
+- **M3 (medium):** the worker submits again, with the doubling backoff,
+  a statement refused 5 or `≥ 0x1000` (`vos_venue::transient`) until its
+  anchor ages; 1–4, 7 and `0x1xx` stay final. Test:
+  `a_transient_refusal_is_submitted_again` (5, then `0x1001`, then
+  accepted; 3 final).
+- **M4 (medium):** resolved by decision 17: the JAM client is dev
+  tooling, venues attach through extensions, no `vos node run` venue
+  option in this slice.
+- **M5 (a):** the "gas a re-run left" needle read a boundary's timestamp:
+  `Internals::run_steps` holds the run's steps, the needle `2^32 −
+  run_steps`. Test: `the_gas_a_rerun_left_is_the_runs`. **(b):** the
+  watch saw a package only once the node answered: `submit_package`
+  watches before the call and reports the answer after; the end to end
+  audits every package watched, and requires a report of each the node
+  answered it took. Test: `a_package_is_watched_before_it_is_sent`.
+  (c) and (d) carried (the plan's 6.22).
+- **M6 (a):** G18 pins the length bounds, a genesis, a statement and a
+  proof at each bound and a byte past it (`undecodable`), the calls' long
+  runs as `{repeat, count}` parts; **(b):** `PruneCursor` named in
+  `spaces-pallet.md` §5 and §6.5, its key the file's `unpinned`;
+  **(c):** a `fees` vector pins `Budget`'s key and `window`, `spent`
+  masked, and G13 shows an accepted submit's deposit credited back. Tests:
+  `a_broken_pallet_fails_the_vectors` (other bounds fail G18, a pallet
+  that does not credit back fails G13), `the_prune_cursor_is_unpinned`.
+  (d): VOS reviews the teammate's harness (§9.1); (e) stated in §9.1, its
+  code carried with the port.
+- **Low:** L1 (an anchor's age by the venue's time), L2 (the tooling's
+  `land` prefers an applied outcome across its two packages and refuses
+  duplicate payloads) and L6 (part of M1) fixed; L7's §9.1 references and
+  `SECURITY.md`'s logs row (Stwo's size estimate) fixed; L3 recorded in
+  pin D; L3–L5, L7's rest and L8 carried in the plan's 6.22.
 
 Commits: this record.
 

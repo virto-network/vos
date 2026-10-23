@@ -92,26 +92,31 @@ pub fn nodes(run: &mut Run) -> Audit {
     audit
 }
 
-/// Every package `jam`'s client sent, its extrinsics and its work report:
-/// the reports, as the canaries take them.
+/// Every package `jam`'s client sent, its extrinsics and its work report,
+/// watched before it went: the reports, as the canaries take them. A
+/// package the node answered it took has a report; one whose answer was
+/// lost or refused is audited all the same, its report too if the chain
+/// holds one.
 fn wire(audit: &mut Audit, jam: &Jam) -> Vec<Vec<u8>> {
     let mut reports = Vec::new();
     for (n, sent) in jam.wire.sent().into_iter().enumerate() {
         let name = format!("JAM {}'s package {n}", jam.name);
-        let report = sent
-            .report(REPORTED)
-            .unwrap_or_else(|| panic!("{name}'s work report"));
         audit.carrier(name.clone(), Reach::Leaves, sent.package.clone());
         for (at, extrinsic) in sent.extrinsics.iter().enumerate() {
             let extrinsic = extrinsic.clone();
             audit.carrier(format!("{name}'s extrinsic {at}"), Reach::Leaves, extrinsic);
         }
-        audit.carrier(
-            format!("{name}'s work report"),
-            Reach::Leaves,
-            report.clone(),
-        );
-        reports.push(report);
+        let report = sent.report(REPORTED);
+        let taken = sent.taken.get().copied().unwrap_or(false);
+        assert!(report.is_some() || !taken, "{name}'s work report");
+        if let Some(report) = report {
+            audit.carrier(
+                format!("{name}'s work report"),
+                Reach::Leaves,
+                report.clone(),
+            );
+            reports.push(report);
+        }
     }
     reports
 }
