@@ -7,13 +7,20 @@
 # - `statements`: the JAM statements service deployed and driven through
 #   its items, each a package submitted by RPC with its extrinsics, its
 #   outcome read back (`vos jam statements`);
-# - `both`: the agent, then the statements service beside it.
+# - `both`: the agent, then the statements service beside it;
+# - `chain`: the end to end on chain, `vos-node`'s `chain` test, its
+#   testnet's clock the host's shifted by the eight bytes (milliseconds,
+#   little-endian) of a file the test writes (`clock-shift.c`, preloaded
+#   into the testnet's nodes): so the chain's time passes `MaxRootAge`
+#   within the run.
 #
 # It needs systemd's user manager (`systemd-run --user`, `systemctl
 # --user`), `setsid`, `curl`, and the programs built: the agent and the test
 # actors (`just build-agent build-test-actors`) for the agent, the service
 # (`just check-no-std`, or `just jam-statements-testnet`) for the
-# statements. POLKAJAM names the directory of PolkaJam's binaries, v0.8.0
+# statements, and for `chain` the host's C compiler (`cc`) and the test
+# actors, the default agent and the representative (`just
+# build-test-actors build-agent build-representative`). POLKAJAM names the directory of PolkaJam's binaries, v0.8.0
 # by default (sha256 e90c8ccd… of its release archive); the run's files go
 # to a new directory under TMPDIR (or /tmp), or JAM_RUN, and the testnet's
 # chain under TMPDIR too. The testnet runs PolkaJam's interpreter: its
@@ -23,7 +30,7 @@ set -euo pipefail
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 mode="${1:-agent}"
-case "$mode" in agent|statements|both) ;; *) echo "usage: $0 [agent|statements|both]" >&2; exit 2 ;; esac
+case "$mode" in agent|statements|both|chain) ;; *) echo "usage: $0 [agent|statements|both|chain]" >&2; exit 2 ;; esac
 POLKAJAM="${POLKAJAM:-$HOME/.cache/vos/polkajam/v0.8.0/polkajam-v0.8.0-linux-x86_64}"
 scratch="${TMPDIR:-/tmp}"
 run="${JAM_RUN:-$(mktemp -d "$scratch/vos-jam-testnet.XXXXXX")}"
@@ -38,7 +45,7 @@ service="${CARGO_TARGET_DIR:-$root/target}/riscv64em-vos/release/statement-servi
 for binary in polkajam-testnet polkajam jamt; do
     [ -x "$POLKAJAM/$binary" ] || { echo "no $binary in $POLKAJAM" >&2; exit 1; }
 done
-if [ "$mode" != statements ]; then
+if [ "$mode" = agent ] || [ "$mode" = both ]; then
     [ -f "$agent" ] && [ -f "$actors/lean.elf" ] || {
         echo "build the agent and the test actors first: just build-agent build-test-actors" >&2
         exit 1
@@ -55,7 +62,15 @@ if curl -s -m 2 -o /dev/null "http://$rpc"; then
     exit 1
 fi
 
-cargo build -q -p vos-cli --manifest-path "$root/Cargo.toml"
+# The testnet's clock: the host's, shifted by the file's milliseconds.
+clock=()
+if [ "$mode" = chain ]; then
+    cc -O2 -shared -fPIC -o "$run/clock-shift.so" "$root/node/jam/clock-shift.c" -ldl
+    head -c 8 /dev/zero >"$run/clock-shift"
+    clock=(LD_PRELOAD="$run/clock-shift.so" VOS_CLOCK_SHIFT="$run/clock-shift")
+else
+    cargo build -q -p vos-cli --manifest-path "$root/Cargo.toml"
+fi
 
 # The testnet runs in a scope of its own, which stopping stops every
 # process of; the process groups in it are recorded, and signalled too
@@ -80,7 +95,7 @@ stop() {
 trap stop EXIT
 
 setsid systemd-run --user --scope -q --unit="$unit" -p MemoryMax=12G -p MemorySwapMax=0 \
-    env TZ=UTC TMPDIR="$scratch" POLKAVM_BACKEND=interpreter "$POLKAJAM/polkajam-testnet" >"$run/testnet.log" 2>&1 &
+    env TZ=UTC TMPDIR="$scratch" POLKAVM_BACKEND=interpreter "${clock[@]}" "$POLKAJAM/polkajam-testnet" >"$run/testnet.log" 2>&1 &
 
 rpc_call() {
     curl -s -m 10 -H 'content-type: application/json' \
@@ -105,7 +120,15 @@ echo "testnet up: process groups $(tr '\n' ' ' <"$run/testnet.groups"); log $run
 } | tee "$run/build.txt"
 
 status=0
-if [ "$mode" != statements ]; then
+if [ "$mode" = chain ]; then
+    env VOS_E2E_RUN="$run" VOS_E2E_RPC="$rpc" POLKAJAM="$POLKAJAM" VOS_E2E_SERVICE="$service" \
+        VOS_CLOCK_SHIFT="$run/clock-shift" VOS_E2E_TESTNET_LOG="$run/testnet.log" \
+        cargo test -p vos-node --features chain --test chain --manifest-path "$root/Cargo.toml" \
+        run:: -- --nocapture --test-threads=1 2>&1 | tee "$run/chain.log" || status=$?
+    # The test captures its standard error: a failure's message is there.
+    [ "$status" = 0 ] || grep -A8 panicked "$run/stderr" || true
+fi
+if [ "$mode" = agent ] || [ "$mode" = both ]; then
     "$vos" jam testnet \
         --polkajam "$POLKAJAM" \
         --rpc "$rpc" \
@@ -113,7 +136,7 @@ if [ "$mode" != statements ]; then
         --actors "$actors" \
         --data "$run/builder" | tee "$run/vos.log" || status=$?
 fi
-if [ "$mode" != agent ] && [ "$status" = 0 ]; then
+if { [ "$mode" = statements ] || [ "$mode" = both ]; } && [ "$status" = 0 ]; then
     "$vos" jam statements \
         --polkajam "$POLKAJAM" \
         --rpc "$rpc" \
@@ -123,7 +146,7 @@ if [ "$mode" != agent ] && [ "$status" = 0 ]; then
 fi
 
 # What the testnet said of the packages it did not take.
-for record in "$run/builder/record.txt" "$run/statements/record.txt"; do
+for record in "$run/builder/record.txt" "$run/statements/record.txt" "$run/record.txt"; do
     [ -f "$record" ] || continue
     {
         echo "the testnet's errors:"

@@ -159,6 +159,7 @@ clippy:
 # clean.
 clippy-prover:
     cargo clippy -p vos-node -p vos-cli --features vos-node/prover,vos-cli/prover --all-targets --quiet -- -D warnings
+    cargo clippy -p vos-node --features chain --tests --quiet -- -D warnings
 
 # Fails on any JAR remnant in the PVM crates: its ISA and gas modes, opcodes,
 # exits, capability surface, linker entry points, invocation kernel, CSR
@@ -204,6 +205,22 @@ jam-testnet: build-test-actors build-agent
 jam-statements-testnet:
     cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
     bash node/jam/testnet.sh statements
+
+# The end to end on chain (`slice-6-on-chain.md` 6.21), on a local PolkaJam
+# testnet it starts and stops (`testnet.sh chain`): three nodes of a space
+# proving with the masked prover anchor and submit at the Kreivo mock, then
+# migrate to the JAM statements service, deployed twice; the rootless
+# statements' venue binding, and their replays once the testnet's clock is
+# moved past `MaxRootAge`; every carrier of the run audited; the latency,
+# gas, fees and the prover's throughput measured, written to the run's
+# `record.txt`. Outside `ci`, as `jam-testnet` is: it needs the PolkaJam
+# binaries and a C compiler. About 25 minutes, one masked proof at a time
+# (about 6 GiB): run it under a 12 GiB limit, e.g.
+# `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just e2e-chain`.
+e2e-chain: build-test-actors build-agent build-representative
+    cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+    cargo test -p vos-node --features chain --test chain --no-run
+    bash node/jam/testnet.sh chain
 
 # A plain build of `vos` carries no faults: building the fault suite's
 # `vos` with the feature must not leak into it, and no workspace member

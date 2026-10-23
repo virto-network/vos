@@ -16,6 +16,9 @@ prover = ["vos-node-prover/prove"]
 # (`vos_node_prover::masked::Disclosing`): its test alone (`just
 # test-carriers`). No production build enables it.
 disclosing = ["prover", "vos-node-prover/disclosing"]
+# The end to end on chain (`just e2e-chain`): its test alone, against the
+# PolkaJam testnet the recipe starts. No production build enables it.
+chain = ["disclosing"]
 
 [dependencies]
 fjall = { workspace = true }
@@ -66,6 +69,10 @@ parity-scale-codec = "3.7.5"
 rayon = "1"
 # The node's binary runs on mimalloc: its tests run on it too.
 mimalloc = "0.1.52"
+# The window actor's accounts, which the end to end on chain writes.
+cipher-clerk = { workspace = true, features = ["settlement"] }
+# The JAM statements service the end to end on chain deploys.
+vos-statement-service = { workspace = true }
 
 [[test]]
 name = "crash"
@@ -128,3 +135,10 @@ harness = false
 [[test]]
 name = "carriers"
 required-features = ["disclosing"]
+
+# The end to end on chain: three nodes anchoring at the Kreivo mock, then,
+# migrated, at the JAM statements service on a PolkaJam testnet (`just
+# e2e-chain`, which starts the testnet).
+[[test]]
+name = "chain"
+required-features = ["chain"]

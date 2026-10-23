@@ -58,7 +58,7 @@ impl Audit {
     /// of each, in one pass over each carrier.
     pub fn findings(&self) -> Vec<Finding> {
         let mut findings = Vec::new();
-        for reach in [Reach::Leaves, Reach::Role] {
+        for reach in [Reach::Leaves, Reach::Recorded, Reach::Role] {
             let mut patterns: Vec<&[u8]> = Vec::new();
             let mut of: Vec<(usize, usize)> = Vec::new();
             for (index, needle) in self.needles.0.iter().enumerate() {

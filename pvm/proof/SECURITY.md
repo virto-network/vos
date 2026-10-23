@@ -396,13 +396,18 @@ statement with the masked prover beside a fourth that replicates nothing
 of it, every debug output's environment set, and every carrier's bytes
 are searched for the run's own internals: in their bytes, hex, `Debug`
 lists, M31 limbs, decimal digits and either byte order, a store by its
-rows, each capture path shown to capture by a canary.
+rows, each capture path shown to capture by a canary. `just e2e-chain`
+runs it over a whole run on chain: the Kreivo mock's extrinsics, the JAM
+statements service's work reports on a PolkaJam testnet, both venues'
+anchor chains and the testnet's own logs and database.
 
 | carrier | what it carries | reach | checked by |
 |---|---|---|---|
 | a submission: the venue's `submit`, Kreivo's `Submit` call, JAM's `Submit` item and its extrinsic | the statement (format, program id, space, public arguments, output, roots) and the format-39 proof | leaves | the audit |
 | an anchor: Kreivo's `Anchor` call, JAM's `Anchor` item | space, window, kind, `S_w`, signer, signature | leaves | the audit |
-| the JAM statements service's work report | its verdict, a function of its item (the statement's id, roots and code; an anchor's fields) | leaves | follows from the item |
+| the JAM statements service's work report | its verdict, a function of its item (the statement's id, roots and code; an anchor's fields) | leaves | the audit, on the reports a PolkaJam testnet made (`just e2e-chain`) |
+| a signed Kreivo extrinsic: its envelope | the signer's nonce and the call | leaves | the audit, on the mock's (`just e2e-chain`) |
+| a chain's own record of what it was sent: its nodes' logs and database | blocks, guarantees, the items and their extrinsics, the services' code | leaves | the audit (`just e2e-chain`), in every needle's full forms: not a number's digits or bytes, nor a hash's hex prefix, which the chain's own counters, gas and hashes hold by chance (`Reach::Recorded`) |
 | a client's answer | the method's outcome: a read's output | leaves | the audit |
 | logs, at every level | ids, windows, codes, the prover's backlog counts, and each proof's time in seconds; at debug level, an agent's guest log lines (`refine_host`'s `log`), text the agent's own code writes, which carries whatever that code puts in it | leaves | the audit, for the node's own lines; an agent's are its author's, audited with its code; the time is the side channel below |
 | standard error | the node's log: `vos` writes its tracing there, at `VOS_LOG`'s level (info by default); no debug output in a production build | leaves | the audit (the run captures both) |

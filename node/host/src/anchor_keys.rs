@@ -63,6 +63,11 @@ impl AnchorKeys {
             .collect()
     }
 
+    /// The node key, which a founding node's genesis names.
+    pub(crate) fn node_key(&self) -> SigningKey {
+        lock(&self.held).keys[0].clone()
+    }
+
     /// The newest key among `listed`, the anchor keys a venue registered:
     /// none when it lists none of them.
     pub(crate) fn listed(&self, listed: &[[u8; 32]]) -> Option<SigningKey> {

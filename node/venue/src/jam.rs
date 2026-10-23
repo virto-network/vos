@@ -158,10 +158,23 @@ impl Jam {
 
     /// One item, landed: its outcome.
     pub fn land(&self, payload: Vec<u8>, extrinsics: Vec<Vec<u8>>) -> Result<Outcome, Error> {
-        let mut outcomes = self.statements.land(&[(payload, extrinsics)], LANDING)?;
-        outcomes
+        self.land_package(payload, extrinsics)
+            .map(|(_, outcome)| outcome)
+    }
+
+    /// One item, landed: the encoding of its package and its outcome.
+    pub fn land_package(
+        &self,
+        payload: Vec<u8>,
+        extrinsics: Vec<Vec<u8>>,
+    ) -> Result<(Vec<u8>, Outcome), Error> {
+        let (package, mut outcomes) = self
+            .statements
+            .land_package(&[(payload, extrinsics)], LANDING)?;
+        let outcome = outcomes
             .pop()
-            .ok_or_else(|| Error::Node("no outcome".into()))
+            .ok_or_else(|| Error::Node("no outcome".into()))?;
+        Ok((package, outcome))
     }
 
     /// Items landed together, in one package: each one's outcome.
@@ -182,12 +195,32 @@ impl Jam {
     ) -> Result<u32, Error> {
         let space = vos_anchor::space_id(genesis);
         let digest = register_digest(&self.id(), &space, &controller, start_window);
+        self.register_signed(
+            genesis,
+            controller,
+            start_window,
+            founder.verifying_key().to_bytes(),
+            founder.sign(&digest).to_bytes(),
+        )
+    }
+
+    /// Register the space `genesis` founds, as [`Jam::register`] does, by
+    /// the signature a founding key `founder_key` made over its digest
+    /// (a founding node's, `vos_node::Node::sign_registration`).
+    pub fn register_signed(
+        &self,
+        genesis: &SpaceGenesis,
+        controller: [u8; 32],
+        start_window: u64,
+        founder_key: [u8; 32],
+        signature: [u8; 64],
+    ) -> Result<u32, Error> {
         let item = Item::Register(Register {
             genesis: genesis.clone(),
             controller,
             start_window,
-            founder_key: founder.verifying_key().to_bytes(),
-            signature: founder.sign(&digest).to_bytes(),
+            founder_key,
+            signature,
         });
         Ok(self.land(item.encode(), Vec::new())?.code)
     }

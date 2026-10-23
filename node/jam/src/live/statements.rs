@@ -73,6 +73,12 @@ impl Statements {
     /// the package's hash. At most [`MAX_ITEMS`], so their verdicts fit the
     /// report.
     pub fn submit(&self, core: u16, items: &[Item]) -> Result<Hash, Error> {
+        self.submit_encoded(core, items)
+            .map(|package| digest(&package))
+    }
+
+    /// [`Statements::submit`]: the package's encoding.
+    fn submit_encoded(&self, core: u16, items: &[Item]) -> Result<Vec<u8>, Error> {
         if items.is_empty() || items.len() > MAX_ITEMS {
             return Err(failed(format!(
                 "{} items: a package holds 1 to {MAX_ITEMS}",
@@ -92,9 +98,7 @@ impl Statements {
                 extrinsics: extrinsics.clone(),
             })
             .collect();
-        self.node
-            .submit_package(core, &items)
-            .map(|package| digest(&package))
+        self.node.submit_package(core, &items)
     }
 
     /// A value of the service's storage at the finalized block.
@@ -123,21 +127,31 @@ impl Statements {
     /// if nothing lands within half of `timeout`; the outcomes are the
     /// package's that lands.
     pub fn land(&self, items: &[Item], timeout: Duration) -> Result<Vec<Outcome>, Error> {
+        self.land_package(items, timeout)
+            .map(|(_, outcomes)| outcomes)
+    }
+
+    /// [`Statements::land`], and the encoding of the package that landed.
+    pub fn land_package(
+        &self,
+        items: &[Item],
+        timeout: Duration,
+    ) -> Result<(Vec<u8>, Vec<Outcome>), Error> {
         let until = Instant::now() + timeout;
-        let mut packages = vec![self.submit(0, items)?];
+        let mut packages = vec![self.submit_encoded(0, items)?];
         let resubmit = Instant::now() + timeout / 2;
         let mut errors = 0;
         loop {
             for package in &packages {
-                match self.landed(package, items) {
-                    Ok(Some(outcomes)) => return Ok(outcomes),
+                match self.landed(&digest(package), items) {
+                    Ok(Some(outcomes)) => return Ok((package.clone(), outcomes)),
                     Ok(None) => errors = 0,
                     Err(error) if errors == TRANSIENT => return Err(error),
                     Err(_) => errors += 1,
                 }
             }
             if packages.len() == 1 && Instant::now() > resubmit {
-                packages.push(self.submit(1, items)?);
+                packages.push(self.submit_encoded(1, items)?);
             }
             if Instant::now() > until {
                 return Err(failed("the package's outcomes never landed"));

@@ -68,6 +68,24 @@ fn a_number_is_found_whole_in_the_carriers_that_leave() {
 }
 
 #[test]
+fn a_venues_record_is_searched_in_full_forms_alone() {
+    let secret: Vec<u8> = (1..=16).collect();
+    let needle = || Needle::bytes(Kind::ServedRow, "secret", &secret).unwrap();
+    assert_eq!(audit(Reach::Recorded, &secret, needle()).len(), 1);
+    let prefix = format!("hash={}…", &hex(&secret)[..16]).into_bytes();
+    assert!(audit(Reach::Recorded, &prefix, needle()).is_empty());
+    let steps = || Needle::number(Kind::StepCount, "steps", 123_457);
+    assert!(audit(Reach::Recorded, b"conn_id=123457", steps()).is_empty());
+    assert!(audit(Reach::Recorded, &123_457u64.to_le_bytes(), steps()).is_empty());
+    let root: Vec<u8> = (100..132).collect();
+    let proof = Needle::bytes(Kind::NodeProof, "root", &root).unwrap();
+    assert_eq!(
+        audit(Reach::Recorded, &hex(&root).into_bytes(), proof).len(),
+        1
+    );
+}
+
+#[test]
 fn proofs_and_registers_are_searched_within_the_role_too() {
     let root: Vec<u8> = (100..132).collect();
     let proof = Needle::bytes(Kind::NodeProof, "root", &root).unwrap();
@@ -166,6 +184,30 @@ fn a_records_rows_and_private_arguments_are_needles() {
         .len(),
         1
     );
+}
+
+#[test]
+fn a_rootless_records_private_arguments_are_needles() {
+    let public: Vec<u8> = (200..220).collect();
+    let secret: Vec<u8> = (10..30).collect();
+    let attest = Attest {
+        program: ProgramHash([0; 32]),
+        window: None,
+        witness_input: [public.clone(), secret.clone()].concat(),
+        output: Vec::new(),
+        public_args: public,
+        roots: Vec::new(),
+    };
+    let mut needles = Needles::default();
+    needles.attest("rootless", &attest, attest.witness_input.len());
+    assert_eq!(needles.named(Kind::ServedRow, "argument part").count(), 1);
+    assert_eq!(needles.named(Kind::ServedRow, "row").count(), 0);
+    let mut audit = Audit {
+        needles,
+        ..Audit::default()
+    };
+    audit.carrier("carrier", Reach::Leaves, secret);
+    assert_eq!(audit.findings().len(), 1);
 }
 
 #[test]

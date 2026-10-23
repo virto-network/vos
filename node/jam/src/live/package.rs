@@ -124,7 +124,38 @@ fn named(answer: &serde_json::Value) -> Result<(String, Hash, u32), Error> {
     Ok((text, hash, slot))
 }
 
+/// The anchor the context of `package`, as [`encode_package`] lays it out,
+/// names: the block's hash past the auth host and the auth code hash.
+pub fn anchor_of(package: &[u8]) -> Option<Hash> {
+    package.get(36..68)?.try_into().ok()
+}
+
 impl PolkaJam {
+    /// The work report a guarantor made of `package` (its encoding), once
+    /// the chain holds it reported: the report's hash from
+    /// `workPackageStatus` at the best block, its bytes from `workReport`.
+    /// None while it is not reported.
+    pub fn work_report(&self, package: &[u8]) -> Result<Option<Vec<u8>>, Error> {
+        let anchor = anchor_of(package).ok_or_else(|| failed("a package cut short"))?;
+        let (head, ..) = named(&self.call("bestBlock", json!([]))?)?;
+        let status = self.call(
+            "workPackageStatus",
+            json!([
+                head,
+                STANDARD.encode(digest(package)),
+                STANDARD.encode(anchor)
+            ]),
+        )?;
+        let report = status
+            .as_object()
+            .and_then(|status| status.values().next())
+            .and_then(|state| state.get("report_hash"));
+        match report {
+            Some(report) => decoded(&self.call("workReport", json!([report]))?),
+            None => Ok(None),
+        }
+    }
+
     /// The parent of block `head` (base64): its hash and slot.
     pub fn parent(&self, head: &str) -> Result<(String, Hash, u32), Error> {
         named(&self.call("parent", json!([head]))?)
@@ -231,6 +262,7 @@ mod tests {
         };
         let package = encode_package(&context, std::slice::from_ref(&item));
         assert_eq!(package.len(), 1266);
+        assert_eq!(anchor_of(&package), Some(context.anchor.hash));
         // The bytes before its payload, as jamt sent them.
         let head = concat!(
             "00000000f8d86b97d65319a078e5840f1614c296a5254217794dcc910e72ca174e3c2e86e68d25d2",

@@ -67,6 +67,12 @@ pub enum Reach {
     /// Out of the prover role: a venue, a log, a client, a node that does
     /// not replicate the agent.
     Leaves,
+    /// A venue's own record of what it was sent: a chain's logs and its
+    /// database. Every needle is searched there in its full forms, not a
+    /// number's digits and byte forms nor a hash's hex prefix, which the
+    /// chain's own counters, gas and hashes hold by chance; what the venue
+    /// was sent is searched whole as carriers that leave.
+    Recorded,
     /// Within the agent's replicas, which hold its rows and run its
     /// kernels.
     Role,

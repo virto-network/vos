@@ -211,7 +211,7 @@ impl Needle {
 
     /// Whether its kind is searched in a carrier of `reach`.
     pub(super) fn reaches(&self, reach: Reach) -> bool {
-        reach == Reach::Leaves || self.kind.nowhere() || self.kind == Kind::Register
+        reach != Reach::Role || self.kind.nowhere() || self.kind == Kind::Register
     }
 
     /// Its forms searched in a carrier of `reach`.
@@ -323,20 +323,27 @@ impl Needles {
     }
 
     /// What `attest`'s record holds privately, its witness its kernel's
-    /// `arguments` bytes and then the rows served: the rows, their salts
-    /// and the cut's roots and paths, each part of its arguments that is
-    /// not a public argument's encoding, and the plain and domain-prefixed
-    /// hashes of each. Fails if the rows do not decode where the arguments
-    /// end.
+    /// `arguments` bytes and then, for a statement at a window's cut, the
+    /// rows served: the rows, their salts and the cut's roots and paths, each
+    /// part of its arguments that is not a public argument's encoding, and
+    /// the plain and domain-prefixed hashes of each. A rootless statement's
+    /// witness is its arguments alone. Fails if the rows do not decode
+    /// where the arguments end, or a rootless witness runs past them.
     pub fn attest(&mut self, statement: &str, attest: &Attest, arguments: usize) {
         let witness = &attest.witness_input;
         let (arguments, rows) = witness.split_at(arguments);
-        let served = Served::decode_exact(rows)
-            .unwrap_or_else(|| panic!("{statement}: no rows served after its arguments"));
-        let mut private: Vec<(String, Vec<u8>)> = vec![
-            ("the witness".into(), witness.clone()),
-            ("the served rows".into(), rows.to_vec()),
-        ];
+        let mut private: Vec<(String, Vec<u8>)> = vec![("the witness".into(), witness.clone())];
+        if attest.window.is_none() {
+            assert!(
+                rows.is_empty(),
+                "{statement}: a rootless witness past its arguments"
+            );
+        } else {
+            let served = Served::decode_exact(rows)
+                .unwrap_or_else(|| panic!("{statement}: no rows served after its arguments"));
+            private.push(("the served rows".into(), rows.to_vec()));
+            self.served(statement, &served, &mut private);
+        }
         for (at, part) in unpublished(arguments, &attest.public_args).enumerate() {
             let name = format!("argument part {at}");
             self.push(Needle::bytes(
@@ -346,6 +353,12 @@ impl Needles {
             ));
             private.push((name, part.to_vec()));
         }
+        self.hashes(statement, private);
+    }
+
+    /// The needles of the rows `served` for `statement`, each row's value
+    /// pushed onto `private` to be hashed.
+    fn served(&mut self, statement: &str, served: &Served, private: &mut Vec<(String, Vec<u8>)>) {
         let cut = [
             ("the agent's root at the cut", served.agent_root.to_vec()),
             ("the representative's root", served.rep_root.to_vec()),
@@ -376,6 +389,10 @@ impl Needles {
             }
             private.push((format!("row {row}'s value"), value.clone()));
         }
+    }
+
+    /// The plain and domain-prefixed hashes of each of `private`.
+    fn hashes(&mut self, statement: &str, private: Vec<(String, Vec<u8>)>) {
         for (what, bytes) in private {
             let mut hashes = vec![
                 (

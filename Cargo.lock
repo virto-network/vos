@@ -2662,6 +2662,7 @@ dependencies = [
 name = "vos-node"
 version = "0.1.0"
 dependencies = [
+ "cipher-clerk",
  "ed25519-dalek",
  "event-listener",
  "fjall",
@@ -2689,6 +2690,7 @@ dependencies = [
  "vos-pvm-compiler",
  "vos-pvm-program",
  "vos-raft",
+ "vos-statement-service",
  "vos-testkit",
  "vos-tree",
  "vos-venue",
