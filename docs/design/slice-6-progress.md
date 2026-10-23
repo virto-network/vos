@@ -3301,5 +3301,12 @@ test's or its harness's, not a node's:
 - **Diagnosis.** The exactly-once run's convergence wait names what each
   replica holds against what it should.
 
-Gate: each of `cluster`, `served`, `cuts` 10/10 under that load; `just
-check` green.
+Gate, under that load: `served` 10/10 and `cuts` 10/10; `cluster` 9/10, its
+one failure `a_snapshot_stream_outlasting_the_leaders_deadline_goes_on`'s
+"no other stream started: 2 did", left open: on a loaded host the leader
+may start a second stream past its 300 ms deadline, which the test's bound
+of one does not allow. One test met only beside another worktree's builds
+(load average above 30) is open too:
+`a_stale_leader_left_out_of_the_configuration_retires` ("the stale one
+still leads"), its cut-off leader stepping down at check-quorum before the
+test looks. `just check` green.
