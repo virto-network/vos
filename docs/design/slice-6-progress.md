@@ -3471,3 +3471,75 @@ until then.
   - §9.1 notes that the extension reads at finalized blocks only.
   - The envelope is said to be the transport's.
   - `core-model.md` Q18 separates what is decided from what is open.
+
+## Step 6.20: the carrier audit (R7)
+
+On `s6/carrier` (from `bc175ed0`). The full record is the step's log.
+
+- **The harness** (`vos_checker::carriers`), reusable by 6.21's
+  `e2e-chain`:
+  - **Needles** are what a run knows it must not show, each in its bytes,
+    hex, `Debug` list and, for numbers, little-endian and decimal digits:
+    - the internals of each proof (`vos_node_prover::Internals`, from
+      `MaskedProver::prove_disclosing` over the tree's watch seam,
+      `vos_pvm_recair::tree::prove_final_watched`): every segment, leaf
+      and fold proof's trees' roots, three windows of its encoding, and
+      its output's boundary digests; each segment's step count and
+      boundary indices; each boundary's memory root and image commitment
+      (never the kernel's public image root); the registers φ0..φ8;
+    - from each record (`Attest`): the served rows' values and salts, the
+      cut's roots, salt and paths, the arguments not among the public ones,
+      and BLAKE2b-256 and BLAKE3 of each and of the witness;
+    - each debug output's own text.
+  - **Carriers** leave the role or stay within it: every needle is searched
+    in those that leave; node proofs, memory roots and register files in
+    every carrier. One Aho–Corasick pass a carrier.
+  - **Capture:** `Tapped` (any `VenueClient`: anchors and submissions, laid
+    out as the model venue, Kreivo's calls and the JAM service's items take
+    them), `Logs` (the process's tracing at every level), `Stderr`,
+    `Hub::tap` (every frame), `directory` (a node's disk), and
+    `assert_searchable` (each needle found when planted, every kind made).
+- **The run** (`just test-carriers`, in `test-proof`): three nodes prove a
+  read's statement at window 0's cut with the masked prover
+  (`masked::Disclosing`), recorded and accepted, every debug output's
+  environment set. Carriers: the anchor and the submission in each venue's
+  layout, the client's answer, the logs, standard error; every frame by
+  class, each node's log entries, work results, prover table and every
+  file it wrote. 91 node-proof, 17 row, 28 hash, 9 step, 15 memory-root,
+  23 register and 7 debug-output needles; about two minutes.
+  **6.21:** `e2e-chain` wraps its venue clients in `Tapped`, proves with
+  `Disclosing`, installs `Logs` and `Stderr` before its nodes start, and
+  feeds each node's disk, the JAM service's reports and the Kreivo mock's
+  extrinsics as carriers; then `assert_searchable` and `assert_clean`.
+- **Found and fixed:**
+  - **The PVM's instruction trace** (`vos_pvm::interpreter`, `trace!`
+    each step: pc, opcode, gas): the prover's re-run of a kernel logged
+    its control flow and, by its gas from 2^32, its step count (11.9 MB of
+    logs a run; the step and register needles hit). Now under `vos-pvm`'s
+    new `debug-internals`, with `GREY_PVM_DEBUG`'s registers at each
+    run's entry and exit and its native code dump.
+  - **`CPU_DUMP`** (rows 0 and 1 of the CPU trace on stderr) under
+    `vos-pvm-proof`'s `debug-internals`; `ZKPVM_PROFILE` compiled out
+    rather than `cfg!`-skipped; `CPU_EXPR_DUMP` was already inside a
+    `debug-internals` function.
+  - **Regression checks:** the run sets every debug environment and
+    searches the logs and stderr for each output's text (with
+    `vos-pvm/debug-internals` the audit fails on the trace, checked);
+    `just check-no-debug-internals` (in `check` and `ci`): no production
+    edge enables either feature, and the node's binary built with the
+    prover names none of the variables nor the trace's message (with the
+    feature it holds the message, checked).
+- **The tests' `target/tmp/wrap/`:** final wraps only, of formats 28 (test
+  circuits) and 39, their words, formats and judgements' inputs;
+  `kernel`'s `wrap_files` checks each proof verifies as a final wrap and
+  nothing else is there (checked on 59 files, and a junk proof refused).
+- **Not leaks, recorded** (`SECURITY.md`'s table): an agent on JAM ships its
+  attests whole, served rows included, in its packages (it keeps no row
+  from JAM by design); the operator's `/stats` `refine_gas` and
+  `step_gas`, and a proof's time in the logs, show a trace's size, as the
+  prover's time does. `RefinePayload` is gone (6.9).
+- **`SECURITY.md`** gains "What leaves the prover role", per carrier.
+- **Gates:** the audit clean on four runs after the fixes, `just
+  test-carriers` among them; `just check` green: 105 suites, 1,358
+  passed, 0 failed, `check-no-debug-internals` in it (12 GiB scope, `nice
+  -n 10`, 8 jobs).

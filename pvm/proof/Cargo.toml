@@ -42,6 +42,9 @@ wire = ["dep:vos-wire"]
 # "ConstraintsNotSatisfied" vs. "claimed logup sum is not zero" failure
 # modes when adding constraints; and `prove_chip_isolated_format`, a
 # chip's proof alone, which the recursion prover's tests measure a leaf on.
+# Also the environment's debug outputs, which show a trace's rows and sizes
+# (`CPU_DUMP`, `CPU_EXPR_DUMP`, `ZKPVM_PROFILE`): no production build
+# enables it (`just check-no-debug-internals`).
 debug-internals = ["prover"]
 
 [dependencies]

@@ -638,7 +638,9 @@ impl Interpreter {
         let category = opcode.category();
         let args = args::decode_args(&self.code, pc, skip, category);
 
-        // Per-instruction trace
+        // Each instruction traced: a run's steps and its control flow, so
+        // only under `debug-internals`.
+        #[cfg(feature = "debug-internals")]
         tracing::trace!(pc, ?opcode, gas = self.gas, "pvm-inst");
 
         // Execute instruction inline

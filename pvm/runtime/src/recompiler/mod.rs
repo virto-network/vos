@@ -677,19 +677,7 @@ impl RecompiledPvm {
         gas: Gas,
         data_layout: Option<DataLayout>,
     ) -> Result<Self, String> {
-        let debug = {
-            use std::sync::atomic::{AtomicU8, Ordering};
-            static CACHED: AtomicU8 = AtomicU8::new(0); // 0=unchecked, 1=false, 2=true
-            match CACHED.load(Ordering::Relaxed) {
-                2 => true,
-                1 => false,
-                _ => {
-                    let val = std::env::var("GREY_PVM_DEBUG").is_ok();
-                    CACHED.store(if val { 2 } else { 1 }, Ordering::Relaxed);
-                    val
-                }
-            }
-        };
+        let debug = debug_from_environment();
 
         // Gas blocks and validation are now computed inline during the compile loop.
         // No separate pre-passes needed.
@@ -1209,6 +1197,30 @@ impl RecompiledPvm {
         // SAFETY: ptr and len describe a valid mmap allocation from NativeCode::new().
         unsafe { std::slice::from_raw_parts(self.native_code.ptr, self.native_code.len) }
     }
+}
+
+/// Whether `GREY_PVM_DEBUG` is set, read once: the recompiler's debug
+/// outputs, which show a run's registers, exist only under
+/// `debug-internals`.
+#[cfg(feature = "debug-internals")]
+fn debug_from_environment() -> bool {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    // 0 unread, 1 unset, 2 set.
+    static CACHED: AtomicU8 = AtomicU8::new(0);
+    match CACHED.load(Ordering::Relaxed) {
+        2 => true,
+        1 => false,
+        _ => {
+            let set = std::env::var_os("GREY_PVM_DEBUG").is_some();
+            CACHED.store(if set { 2 } else { 1 }, Ordering::Relaxed);
+            set
+        }
+    }
+}
+
+#[cfg(not(feature = "debug-internals"))]
+fn debug_from_environment() -> bool {
+    false
 }
 
 #[cfg(test)]

@@ -385,6 +385,38 @@ a field leaking about 0.13 in total variation; at the real wrap's 32, by
 uniformity, a field leaking about 0.6, and between witnesses only a field
 fixed by the witness.
 
+## What leaves the prover role
+
+Only a statement and its masked final proof leave the space's prover role
+(`docs/design/proving.md` A.5): segment, leaf and fold proofs, the served
+rows, the witness, step counts, memory roots and registers past φ9..φ12
+stay with the agent's replicas. The carrier audit checks it on a run
+(`just test-carriers`, `vos_checker::carriers`): three nodes prove a read's
+statement with the masked prover, every debug output's environment set,
+and every carrier's bytes are searched for the run's own internals, in
+their bytes, hex, `Debug` lists and decimal digits.
+
+| carrier | what it carries | reach | checked by |
+|---|---|---|---|
+| a submission: the venue's `submit`, Kreivo's `Submit` call, JAM's `Submit` item and its extrinsic | the statement (format, program id, space, public arguments, output, roots) and the format-39 proof | leaves | the audit |
+| an anchor: Kreivo's `Anchor` call, JAM's `Anchor` item | space, window, kind, `S_w`, signer, signature | leaves | the audit |
+| the JAM statements service's work report | its verdict, a function of its item (the statement's id, roots and code; an anchor's fields) | leaves | follows from the item |
+| a client's answer | the method's outcome: a read's output | leaves | the audit |
+| logs, at every level | ids, windows, codes, the prover's backlog counts, and each proof's time in seconds | leaves | the audit; the time is the side channel below |
+| standard error | nothing, in a production build | leaves | the audit |
+| the debug outputs: the PVM's instruction trace, `GREY_PVM_DEBUG`'s registers and native code, `CPU_DUMP`, `CPU_EXPR_DUMP`, `ZKPVM_PROFILE` | a run's steps, pcs, registers and trace rows | only a `debug-internals` build (`vos-pvm`'s, this crate's) | `just check-no-debug-internals`: no production edge enables it, and the node's binary names none of them |
+| the operator's `/stats` | stage histograms, `refine_gas` and `step_gas` among them: a kernel's gas, so its steps, within a quarter and in sums | the node's operator | not audited: the operator runs the replica |
+| the tests' `target/tmp/wrap/` | final wraps (28 of test circuits, 39), their formats, words and judgements' inputs | the test machine | `kernel`'s `wrap_files`: each verifies as a final wrap, and nothing else is there |
+| the agent's log, snapshots and peer frames | `Resume` with the served rows; work results with each `Attest` (witness, output, public arguments, roots); `Proven` with the proof's hash | the agent's replicas | the audit: no node proof, memory root or register file |
+| the node's blobs and disk | final proofs, large work results, the store | the node | the audit: as above |
+| the prover's table | each job's record until it finishes, its statement, its proof's hash | the prover's node | the audit: as above |
+| an agent on JAM: its work packages and results (`vos-jam`) | its batch, its rows' witness and its attests whole, served rows included | JAM's validators and DA | by design: an agent on JAM keeps no row from JAM, so a statement of one hides nothing from it |
+
+`RefinePayload`, which carried memory roots, went with the refine-bundle
+path (format 36). A proof's time in the logs and the operator's gas
+stages reveal the trace's size, as the prover's time does (the side
+channel below); a statement is published at the window's cadence for it.
+
 ## The external audit
 
 Required before value rides on a proof. Its scope:

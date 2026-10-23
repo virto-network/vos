@@ -845,8 +845,10 @@ where
     // (so the phase breakdown is reachable through paths that hard-code
     // `profile = false`, e.g. `prove_canonical`). A production build prints
     // no segment's sizes, which are its step counts, from the environment.
-    let from_environment =
-        cfg!(feature = "debug-internals") && std::env::var_os("ZKPVM_PROFILE").is_some();
+    #[cfg(feature = "debug-internals")]
+    let from_environment = std::env::var_os("ZKPVM_PROFILE").is_some();
+    #[cfg(not(feature = "debug-internals"))]
+    let from_environment = false;
     if profile || from_environment {
         eprintln!("{prof}");
     }

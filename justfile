@@ -68,13 +68,26 @@ vectors:
 # rows, and the final
 # verifier's decode, verify and Wasm gates as the maximum over 12 seeds of
 # the masked wrap (on the JAM-only host's `final-verify.elf`, built by
-# `check-no-std`, and `judge-wasm`'s blob), one test at a time.
+# `check-no-std`, and `judge-wasm`'s blob), one test at a time. Last, the
+# wrap files the suites wrote checked to be final wraps alone, and the
+# carrier audit (`test-carriers`).
 test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
     for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip reads:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     cargo test -p vos-pvm-proof --features debug-internals --test kernel reads:: -- --test-threads=1
     cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
     cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion -- leakage heavy --test-threads=1
+    cargo test -p vos-pvm-proof --features debug-internals --test kernel wrap_files:: -- --test-threads=1
+    just test-carriers
+
+# The carrier audit (`slice-6-on-chain.md` 6.20, `vos_checker::carriers`):
+# three nodes proving a read's statement with the masked prover, every
+# debug output's environment set, and every carrier of the run searched for
+# the proof's internals, the served rows and their hashes; alone in its
+# process, which it captures whole (its logs at every level, its standard
+# error). About two minutes and 6 GiB.
+test-carriers: build-test-actors build-agent build-representative
+    cargo test -p vos-node --features prover --test carriers audit:: -- --nocapture --test-threads=1
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
 # verifier's blobs built as a runtime builds them, under the PVF's semantics
@@ -221,6 +234,22 @@ check-no-seeded-masks:
     if (open pvm/proof/Cargo.toml | get features.debug-internals | any {|feature| $feature | str contains 'seeded-masks' }) { error make { msg: "debug-internals implies seeded masks" } }
     print "no seeded masks in a production build"
 
+# The debug outputs (`vos-pvm`'s and `vos-pvm-proof`'s `debug-internals`:
+# the PVM's instruction trace, `GREY_PVM_DEBUG`'s registers and native code,
+# `CPU_DUMP`, `CPU_EXPR_DUMP`, `ZKPVM_PROFILE`), which show a run's steps,
+# registers and rows, reach no production build: no normal or build edge of
+# any workspace member, nor of the agent's or the final verifier's
+# workspaces, enables them; and the node's binary, built with the prover,
+# names none of their environment variables nor the instruction trace's
+# message, so none of them is compiled in.
+check-no-debug-internals:
+    just _no-feature debug-internals --workspace
+    just _no-feature debug-internals -p vos-cli --features prover
+    for manifest in [agent/default pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature debug-internals --manifest-path $"($manifest)/Cargo.toml" }
+    cargo build -p vos-cli --features prover
+    let binary = (open --raw target/debug/vos); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"the node's binary names ($name)" } } }
+    print "no debug outputs in a production build"
+
 # Format 28, the unmasked wrap (`vos-pvm-final-verifier`'s and
 # `vos-statement`'s `test-formats`), reaches no production build: no normal
 # or build edge of any workspace member, nor of the workspaces built apart
@@ -360,7 +389,7 @@ fuzz secs="60":
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-kit build-test-actors build-agent build-representative fuzz-replay
+check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-no-debug-internals check-kit build-test-actors build-agent build-representative fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     just clippy-prover
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures
@@ -377,7 +406,7 @@ test-reads:
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
-ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats check-kit fuzz-replay
+ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats check-no-debug-internals check-kit fuzz-replay
 
 # The gate at a milestone: `ci` plus the prover suites, the soundness gates
 # (the leakage tests at their medium N), the bench tests that prove and the

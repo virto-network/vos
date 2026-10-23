@@ -3,6 +3,15 @@
 version = 4
 
 [[package]]
+name = "aho-corasick"
+version = "1.1.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c982642fa9e8606056828ee9a8505737230110bb1099153c79efe865c59d12ba"
+dependencies = [
+ "memchr",
+]
+
+[[package]]
 name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2570,13 +2579,21 @@ dependencies = [
 name = "vos-checker"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
+ "blake3",
  "ed25519-dalek",
  "hex",
+ "libc",
  "smol",
  "socket2",
  "tempfile",
+ "tracing",
+ "tracing-subscriber",
  "vos-node",
+ "vos-node-prover",
+ "vos-statement-service",
  "vos-testkit",
+ "vos-venue",
  "vos-wire",
 ]
 

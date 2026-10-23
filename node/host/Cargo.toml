@@ -116,3 +116,9 @@ harness = false
 [[bench]]
 name = "cuts"
 harness = false
+
+# The carrier audit: three nodes proving with the masked prover, every
+# carrier of the run searched (`just test-carriers`, alone in its process).
+[[test]]
+name = "carriers"
+required-features = ["prover"]

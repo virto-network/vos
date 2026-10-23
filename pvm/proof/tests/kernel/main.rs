@@ -21,3 +21,4 @@ mod reads;
 mod recursion_seams;
 mod throughput;
 mod window_kernel;
+mod wrap_files;

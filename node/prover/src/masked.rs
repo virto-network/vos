@@ -14,13 +14,14 @@ use std::sync::{Arc, Mutex};
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
 use vos_pvm_proof::program_id::{KernelEntry, KernelProgram};
-use vos_pvm_recair::tree::Stats;
+use vos_pvm_recair::tree::{Built, Stats};
 use vos_venue::vos_statement::ProgramId;
 use vos_wire::Decode;
 use vos_wire::ids::{MethodId, ProgramHash};
 use vos_wire::records::Kernel;
 use vos_wire::result::{Attest, KernelReturn};
 
+use crate::internals::{Internals, NodeProof};
 use crate::worker::{ProveError, Prover};
 
 /// The gas a re-run is given: a kernel's own limit bounds the live run
@@ -130,22 +131,99 @@ impl MaskedProver {
         kernel: &[u8],
         attest: &Attest,
     ) -> Result<(Vec<u8>, Stats), ProveError> {
+        self.prove_watched(kernel, attest, &mut |_| {})
+    }
+
+    /// [`Prover::prove`], and the internals it built the proof from, which
+    /// never leave the prover role: what a carrier audit looks for.
+    pub fn prove_disclosing(
+        &self,
+        kernel: &[u8],
+        attest: &Attest,
+    ) -> Result<(Vec<u8>, Internals), ProveError> {
+        let public_root = kernel_record(kernel)
+            .map_err(ProveError::Kernel)?
+            .image_root;
+        let mut internals = Internals::default();
+        let (mut segments, mut leaves, mut folds) = (0, 0, 0);
+        let proof = self.prove_watched(kernel, attest, &mut |built| {
+            let name = match &built {
+                Built::Segment(segment) => {
+                    let (first, last) = segment.steps;
+                    internals.steps.push((last - first) as u64);
+                    for state in [&segment.proof.initial_state, &segment.proof.final_state] {
+                        internals.steps.push(state.timestamp);
+                        internals.registers.push(state.registers);
+                        for root in [state.memory_root, state.memory_commitment] {
+                            if root != public_root && root != [0; 32] {
+                                internals.memory_roots.push(root);
+                            }
+                        }
+                    }
+                    segments += 1;
+                    format!("segment {}", segments - 1)
+                }
+                Built::Leaf(_) => {
+                    leaves += 1;
+                    format!("leaf {}", leaves - 1)
+                }
+                Built::Fold(_) => {
+                    folds += 1;
+                    format!("fold {}", folds - 1)
+                }
+            };
+            let digests = match &built {
+                Built::Segment(_) => Vec::new(),
+                Built::Leaf(node) | Built::Fold(node) => vec![
+                    node.output.entry_digest.to_bytes(),
+                    node.output.exit_digest.to_bytes(),
+                ],
+            };
+            internals.proofs.push(NodeProof {
+                name,
+                roots: built.roots(),
+                encoding: built.encoding(),
+                digests,
+            });
+        })?;
+        if let Some(steps) = internals
+            .steps
+            .iter()
+            .step_by(3)
+            .copied()
+            .reduce(|a, b| a + b)
+        {
+            internals.steps.push(steps);
+        }
+        Ok((proof.0, internals))
+    }
+
+    /// [`Prover::prove`], each proof of the run's tree shown to `watch`, and
+    /// what its proofs took.
+    fn prove_watched(
+        &self,
+        kernel: &[u8],
+        attest: &Attest,
+        watch: &mut dyn FnMut(Built<'_>),
+    ) -> Result<(Vec<u8>, Stats), ProveError> {
         let program = self.kernel(kernel)?;
         let (program, entry) = &*program;
         let trace = self.rerun(kernel, attest)?;
-        vos_pvm_recair::tree::prove_final(program, entry, &trace.side_note).map_err(|error| {
-            use vos_pvm_proof::ProvingError;
-            use vos_pvm_recair::tree::TreeError;
-            match error {
-                // The run does not fit its kernel's shape: no proof of it
-                // can be made.
-                TreeError::Empty
-                | TreeError::Segment(ProvingError::Shape { .. } | ProvingError::MalformedShape) => {
-                    ProveError::Kernel(format!("{error:?}"))
+        vos_pvm_recair::tree::prove_final_watched(program, entry, &trace.side_note, watch).map_err(
+            |error| {
+                use vos_pvm_proof::ProvingError;
+                use vos_pvm_recair::tree::TreeError;
+                match error {
+                    // The run does not fit its kernel's shape: no proof of it
+                    // can be made.
+                    TreeError::Empty
+                    | TreeError::Segment(
+                        ProvingError::Shape { .. } | ProvingError::MalformedShape,
+                    ) => ProveError::Kernel(format!("{error:?}")),
+                    error => ProveError::Failed(format!("{error:?}")),
                 }
-                error => ProveError::Failed(format!("{error:?}")),
-            }
-        })
+            },
+        )
     }
 }
 
@@ -157,5 +235,39 @@ impl Prover for MaskedProver {
 
     fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
         self.prove_timed(kernel, attest).map(|(bytes, _)| bytes)
+    }
+}
+
+/// The masked prover, keeping each statement's record and the internals it
+/// built the proof from: a carrier audit's prover, which knows what no
+/// carrier may hold.
+#[derive(Default)]
+pub struct Disclosing {
+    masked: MaskedProver,
+    made: Mutex<Vec<(Attest, Internals)>>,
+}
+
+impl Disclosing {
+    /// Every statement proved so far: its record and its proof's internals.
+    pub fn made(&self) -> Vec<(Attest, Internals)> {
+        self.made
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+impl Prover for Disclosing {
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError> {
+        self.masked.program(kernel)
+    }
+
+    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+        let (proof, internals) = self.masked.prove_disclosing(kernel, attest)?;
+        self.made
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push((attest.clone(), internals));
+        Ok(proof)
     }
 }

@@ -8,10 +8,11 @@ use std::time::{Duration, Instant};
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
 use vos_pvm_proof::format::SEGMENT;
+use vos_pvm_proof::pcs::ProofHash;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{IdPreimage, KernelEntry, KernelProgram};
 use vos_pvm_proof::shape::KernelShape;
-use vos_pvm_proof::{Proof, ProvingError, SideNote};
+use vos_pvm_proof::{KernelSegment, Proof, ProvingError, SideNote};
 
 use crate::context::Finalized;
 use crate::fold::{FoldCircuit, Proved};
@@ -85,6 +86,49 @@ impl Stats {
     }
 }
 
+/// A proof of a run's tree as it is built, before the wrap: what never
+/// leaves the prover role. Seen by [`prove_run_watched`]'s watcher.
+pub enum Built<'a> {
+    /// A segment's proof, at its position.
+    Segment(&'a KernelSegment),
+    /// A segment's leaf.
+    Leaf(&'a Node),
+    /// The fold of two nodes.
+    Fold(&'a Node),
+}
+
+impl Built<'_> {
+    /// Its proof's trees' roots, in tree order.
+    pub fn roots(&self) -> Vec<[u8; 32]> {
+        match self {
+            Self::Segment(segment) => segment
+                .proof
+                .stark_proof
+                .commitments()
+                .iter()
+                .map(|root| root.to_bytes())
+                .collect(),
+            Self::Leaf(node) | Self::Fold(node) => node
+                .proof
+                .stark_proof
+                .0
+                .commitments
+                .iter()
+                .map(ProofHash::to_bytes)
+                .collect(),
+        }
+    }
+
+    /// Its proof's serde form, as postcard lays it out.
+    pub fn encoding(&self) -> Vec<u8> {
+        match self {
+            Self::Segment(segment) => postcard::to_allocvec(&segment.proof),
+            Self::Leaf(node) | Self::Fold(node) => postcard::to_allocvec(&node.proof),
+        }
+        .unwrap_or_default()
+    }
+}
+
 /// The class whose budgets a run of `shape` is cut by: the first of the
 /// most steps, so a run is cut in as few segments as its steps need (a
 /// window its pages overflow is cut again, by `prove_kernel`).
@@ -110,6 +154,17 @@ pub fn prove_run(
     entry: &KernelEntry,
     run: &SideNote,
 ) -> Result<(Node, Stats), TreeError> {
+    prove_run_watched(program, entry, run, &mut |_| {})
+}
+
+/// [`prove_run`], each segment, leaf and fold shown to `watch` as it is
+/// proved.
+pub fn prove_run_watched(
+    program: &KernelProgram,
+    entry: &KernelEntry,
+    run: &SideNote,
+    watch: &mut dyn FnMut(Built<'_>),
+) -> Result<(Node, Stats), TreeError> {
     let cut = cut_class(&program.shape);
     let started = Instant::now();
     let segments = vos_pvm_proof::prove_kernel(run, &program.shape, cut, &SEGMENT)
@@ -125,16 +180,13 @@ pub fn prove_run(
     let mut circuits = BTreeMap::new();
     let mut nodes = Vec::with_capacity(segments.len());
     for (position, segment) in segments.into_iter().enumerate() {
+        watch(Built::Segment(&segment));
         let circuit = circuits
             .entry(segment.class)
             .or_insert_with(|| LeafCircuit::of_class(program, entry, segment.class));
-        nodes.push(leaf(
-            circuit,
-            &segment.proof,
-            id,
-            fold_word,
-            position as u32,
-        )?);
+        let node = leaf(circuit, &segment.proof, id, fold_word, position as u32)?;
+        watch(Built::Leaf(&node));
+        nodes.push(node);
         stats.leaves += 1;
     }
     stats.leaves_took = started.elapsed();
@@ -147,7 +199,9 @@ pub fn prove_run(
         while let Some(left) = pending.next() {
             match pending.next() {
                 Some(right) => {
-                    level.push(fold(&circuit, &left, &right, &preimage, fold_word)?);
+                    let node = fold(&circuit, &left, &right, &preimage, fold_word)?;
+                    watch(Built::Fold(&node));
+                    level.push(node);
                     stats.folds += 1;
                 }
                 None => level.push(left),
@@ -170,7 +224,18 @@ pub fn prove_final(
     entry: &KernelEntry,
     run: &SideNote,
 ) -> Result<(Vec<u8>, Stats), TreeError> {
-    let (root, mut stats) = prove_run(program, entry, run)?;
+    prove_final_watched(program, entry, run, &mut |_| {})
+}
+
+/// [`prove_final`], each segment, leaf and fold shown to `watch` as it is
+/// proved ([`prove_run_watched`]).
+pub fn prove_final_watched(
+    program: &KernelProgram,
+    entry: &KernelEntry,
+    run: &SideNote,
+    watch: &mut dyn FnMut(Built<'_>),
+) -> Result<(Vec<u8>, Stats), TreeError> {
+    let (root, mut stats) = prove_run_watched(program, entry, run, watch)?;
     let started = Instant::now();
     let (proof, ..) = wrap(&root, &program.id_preimage())?;
     let bytes = crate::wrap::proof_bytes(&proof).ok_or(TreeError::Bytes)?;

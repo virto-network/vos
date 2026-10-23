@@ -9,6 +9,12 @@ description = "Gray Paper v0.8.0 PVM runtime used by VOS."
 [features]
 default = ["std"]
 std = ["dep:libc", "dep:memoffset"]
+# The run's debug outputs: each instruction traced (its pc, opcode and gas)
+# and, with `GREY_PVM_DEBUG` set, the recompiler's registers at each entry
+# and exit and its native code in `/tmp/pvm_native.bin`. They show a
+# kernel's steps and registers, which never leave the prover role: no
+# production build enables it (`just check-no-debug-internals`).
+debug-internals = []
 
 [dependencies]
 libc = { version = "0.2", optional = true }

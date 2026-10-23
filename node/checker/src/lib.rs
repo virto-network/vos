@@ -16,11 +16,13 @@
 //! [`programs`], the guest programs; [`calls`], the calls, installs and
 //! queries tests make, and what their answers carry; [`hooks`], what a
 //! test gives a node to hold or fail it;
-//! [`spaces`], nodes in one process and free ports; [`crash`], the crash
+//! [`spaces`], nodes in one process and free ports; [`carriers`], the
+//! carrier audit; [`crash`], the crash
 //! tests' rounds; [`processes`], node processes and the relay between
 //! them; [`rounds`], the workflows the checker starts and their reads.
 
 pub mod calls;
+pub mod carriers;
 mod client;
 pub mod crash;
 pub mod hooks;

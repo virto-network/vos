@@ -39,7 +39,12 @@ struct State {
     random: u64,
     delay: Duration,
     limits: Limits,
+    /// Sees every frame sent, lost or not.
+    tap: Option<Tap>,
 }
+
+/// What sees every frame a hub is sent: from, to, its class and its bytes.
+pub type Tap = Arc<dyn Fn(NodeNumber, NodeNumber, Class, &[u8]) + Send + Sync>;
 
 /// A joined endpoint: the generation it joined in, its arrivals and the
 /// peers it takes frames from.
@@ -74,6 +79,7 @@ impl Hub {
                 random: seed | 1,
                 delay: Duration::ZERO,
                 limits: Limits::default(),
+                tap: None,
             })),
         }
     }
@@ -156,6 +162,11 @@ impl Hub {
     /// Lose `per_million` of every million frames, at random.
     pub fn set_loss(&self, per_million: u32) {
         self.state().loss = per_million.min(1_000_000);
+    }
+
+    /// Show every frame sent from now on to `tap`, lost or not.
+    pub fn tap(&self, tap: Tap) {
+        self.state().tap = Some(tap);
     }
 
     /// Deliver every frame `delay` after it was sent.
@@ -270,6 +281,9 @@ impl Network for Endpoint {
             frame,
         };
         *state.sent.entry(class).or_insert(0) += 1;
+        if let Some(tap) = &state.tap {
+            tap(self.number, to, class, &incoming.frame);
+        }
         // A peer that is down, or cut off, loses what is sent to it.
         if !state.endpoints.contains_key(&to)
             || state.cut.contains(&(self.number, to))

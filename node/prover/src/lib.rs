@@ -41,6 +41,7 @@
 //! `program::program_id` a kernel's program id from its ELF, which `vos
 //! program-id` prints.
 
+mod internals;
 mod job;
 mod memory;
 mod worker;
@@ -50,6 +51,7 @@ pub mod masked;
 #[cfg(feature = "prove")]
 pub mod program;
 
+pub use internals::{Internals, NodeProof};
 pub use job::{Job, MAX_ATTEMPTS, REFUSED_KERNEL, REFUSED_RERUN, State, deadline};
 pub use memory::MemoryJobs;
 pub use worker::{Backlog, FORMAT, Host, Jobs, Options, ProveError, Prover, Stepped, Worker};

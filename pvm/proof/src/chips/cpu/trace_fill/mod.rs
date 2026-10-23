@@ -102,10 +102,12 @@ pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -
         side_note.add_bitwise_and(a, b);
     }
 
-    // Diagnostic scaffolding.  Set CPU_DUMP=1 in the env to dump
-    // row-0 + row-1 helper values to stderr; useful for spot-checking
-    // that witness fill matches expected algebraic values.
-    if std::env::var("CPU_DUMP").is_ok() {
+    // With `CPU_DUMP` set, rows 0 and 1's helper values on stderr, to
+    // spot-check the witness fill against the expected algebraic values.
+    // They are the trace's, which never leaves the prover role: only under
+    // `debug-internals`.
+    #[cfg(feature = "debug-internals")]
+    if std::env::var_os("CPU_DUMP").is_some() {
         use crate::air_column::AirColumn;
         let cols_to_dump: &[(&str, Column)] = &[
             ("IsReal", Column::IsPadding), // is_real = 1 - is_padding
