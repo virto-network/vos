@@ -339,8 +339,10 @@ mod tests {
     use super::*;
 
     /// An anchor is queued and answered at once, whatever the node: one
-    /// of a node that never answers returns within 10 ms; one not signed
-    /// over this venue's digest is refused.
+    /// of a node that never answers returns within 500 ms, a signature's
+    /// check in a debug build on a loaded host and no wait on the node,
+    /// whose calls time out in seconds; one not signed over this venue's
+    /// digest is refused.
     #[test]
     fn an_anchor_is_answered_at_once() {
         use std::net::TcpListener;
@@ -390,7 +392,7 @@ mod tests {
         let start = Instant::now();
         assert_eq!(venue.anchor(&anchor), Ok(Anchored::Queued));
         let took = start.elapsed();
-        assert!(took < Duration::from_millis(10), "{took:?}");
+        assert!(took < Duration::from_millis(500), "{took:?}");
         assert!(venue.queue.holds(&anchor.space, 5));
     }
 }
