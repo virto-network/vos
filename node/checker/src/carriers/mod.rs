@@ -8,10 +8,13 @@
 //! (`vos_node_prover::Internals`) and each statement's record; [`Audit`]
 //! holds the carriers, each as it [`Reach`]es: out of the role (a venue's
 //! call, a log line, a client's answer, a node that does not replicate the
-//! agent) or within the agent's replicas (its log, its blobs, the frames
-//! between them). Every needle is searched in every carrier that leaves;
-//! the proofs, memory roots and register files, which no carrier may hold,
-//! in those that stay too.
+//! agent), a venue's own record of what it was sent (a chain's logs and
+//! database), or within the agent's replicas (its log, its blobs, the
+//! frames between them). Every needle is searched in every form in each
+//! carrier that leaves; every needle in its full forms alone in a venue's
+//! record (see [`Reach::Recorded`]); the proofs, memory roots and register
+//! files, which no carrier may hold, in its full forms in those that stay
+//! too.
 //!
 //! - [`needles`]: the needles and the forms each is searched in;
 //! - [`audit`]: the carriers and the search;
@@ -68,10 +71,18 @@ pub enum Reach {
     /// not replicate the agent.
     Leaves,
     /// A venue's own record of what it was sent: a chain's logs and its
-    /// database. Every needle is searched there in its full forms, not a
-    /// number's digits and byte forms nor a hash's hex prefix, which the
-    /// chain's own counters, gas and hashes hold by chance; what the venue
-    /// was sent is searched whole as carriers that leave.
+    /// database. Every needle of every kind is searched there in its full
+    /// forms: a byte needle's bytes, its whole hex in either case and its
+    /// `Debug` list, and, for M31 limbs, their lists and varints; a
+    /// register file's bytes and `Debug` list. Not searched there: a byte
+    /// needle's 16-character hex prefix, a number's forms (a step count's,
+    /// the re-run's gas, a single register's: digits, `0x` hex, either
+    /// byte order) and a debug output's text, which the chain's own
+    /// counters, gas, hashes and program bytes hold by chance (a run found
+    /// connection ids equal to step counts in its log, and a register's
+    /// value in a service's code in its database). What the venue was sent
+    /// (each package, extrinsic and work report, each call) is searched in
+    /// every form as carriers that leave.
     Recorded,
     /// Within the agent's replicas, which hold its rows and run its
     /// kernels.

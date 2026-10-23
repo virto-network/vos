@@ -20,10 +20,11 @@
 //!   accepted rootless statement, replayed, is refused as a repeat (`0x6`),
 //!   a rooted one as unanchored (`0x5`).
 //! - **The carrier audit** (`vos_checker::carriers`) over the whole run:
-//!   what each venue was sent, the JAM service's work reports, the mock's
+//!   what each venue's client was asked to send, every work package the
+//!   JAM clients sent with its extrinsics and work report, the mock's
 //!   signed extrinsics, both venues' anchor chains, the testnet's log and
 //!   chain, every frame between the nodes, each node's store and disk, the
-//!   process's logs and standard error.
+//!   process's logs and standard error (`collect`).
 //! - **Measured:** each statement's latency from its window's boundary to
 //!   its acceptance, against pin D's `L/2 + D + t_prove + inclusion` and
 //!   the gate `L + D + t_prove + 30 s`; the refine gas of each statement at
@@ -47,8 +48,11 @@ mod cuts;
 mod representative;
 
 mod agents;
+mod collect;
 mod jam;
+mod kernels;
 mod kreivo;
+mod measure;
 mod record;
 mod run;
 mod venues;

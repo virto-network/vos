@@ -397,17 +397,18 @@ of it, every debug output's environment set, and every carrier's bytes
 are searched for the run's own internals: in their bytes, hex, `Debug`
 lists, M31 limbs, decimal digits and either byte order, a store by its
 rows, each capture path shown to capture by a canary. `just e2e-chain`
-runs it over a whole run on chain: the Kreivo mock's extrinsics, the JAM
-statements service's work reports on a PolkaJam testnet, both venues'
-anchor chains and the testnet's own logs and database.
+runs it over a whole run on chain: the Kreivo mock's extrinsics, every
+work package sent to the JAM statements service on a PolkaJam testnet
+with its extrinsics and work report, both venues' anchor chains and the
+testnet's own logs and database.
 
 | carrier | what it carries | reach | checked by |
 |---|---|---|---|
 | a submission: the venue's `submit`, Kreivo's `Submit` call, JAM's `Submit` item and its extrinsic | the statement (format, program id, space, public arguments, output, roots) and the format-39 proof | leaves | the audit |
 | an anchor: Kreivo's `Anchor` call, JAM's `Anchor` item | space, window, kind, `S_w`, signer, signature | leaves | the audit |
-| the JAM statements service's work report | its verdict, a function of its item (the statement's id, roots and code; an anchor's fields) | leaves | the audit, on the reports a PolkaJam testnet made (`just e2e-chain`) |
-| a signed Kreivo extrinsic: its envelope | the signer's nonce and the call | leaves | the audit, on the mock's (`just e2e-chain`) |
-| a chain's own record of what it was sent: its nodes' logs and database | blocks, guarantees, the items and their extrinsics, the services' code | leaves | the audit (`just e2e-chain`), in every needle's full forms: not a number's digits or bytes, nor a hash's hex prefix, which the chain's own counters, gas and hashes hold by chance (`Reach::Recorded`) |
+| a JAM work package as it went, its extrinsics, and the work report a guarantor made of it | the items (registrations, anchors, statements) and their proofs; the verdicts, a function of the items | leaves | the audit, every form, on every package a node's or the run's client sent to a PolkaJam testnet, anchors and replays among them, and its report (`just e2e-chain`, `vos_jam::live::Watch`) |
+| a signed Kreivo extrinsic: its envelope | the signer's nonce and the call | leaves | the audit, every form, on the mock's (`just e2e-chain`) |
+| a chain's own record of what it was sent: its nodes' logs and database | blocks, guarantees, the packages and their extrinsics, the services' code | leaves | the audit (`just e2e-chain`, `Reach::Recorded`): every needle's bytes, whole hex and `Debug` list, a register file's bytes; not a number's digits, hex or bytes, a hash's hex prefix or a debug output's text, which the chain's own counters, gas, hashes and program bytes hold by chance. What it was sent is searched in every form as the packages and reports above; a statement's encoding and a work report are shown to be in its database as bytes, a report's hash in its log |
 | a client's answer | the method's outcome: a read's output | leaves | the audit |
 | logs, at every level | ids, windows, codes, the prover's backlog counts, and each proof's time in seconds; at debug level, an agent's guest log lines (`refine_host`'s `log`), text the agent's own code writes, which carries whatever that code puts in it | leaves | the audit, for the node's own lines; an agent's are its author's, audited with its code; the time is the side channel below |
 | standard error | the node's log: `vos` writes its tracing there, at `VOS_LOG`'s level (info by default); no debug output in a production build | leaves | the audit (the run captures both) |

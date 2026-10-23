@@ -9,7 +9,12 @@
 //! - a number, in the carriers that leave: its decimal digits, its little-
 //!   and big-endian bytes, and its `0x` hex;
 //! - a register file: its values' little-endian bytes, their `Debug` list
-//!   and hex.
+//!   and hex;
+//! - a debug output's text, in the carriers that leave.
+//!
+//! "The carriers that leave" are `Reach::Leaves`'s: a venue's own record
+//! (`Reach::Recorded`) is searched in the other forms alone, the full ones
+//! (a needle's `forms`, not its `leaving`).
 
 use std::fmt;
 

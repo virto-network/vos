@@ -9,6 +9,7 @@
 
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use vos_jam::live::PolkaJam;
@@ -20,7 +21,7 @@ use vos_venue::vos_statement::Pin;
 use vos_wire::package::EPOCH_MS;
 use vos_wire::result::digest;
 
-use crate::venues::Jam;
+use crate::venues::Wire;
 
 /// A service's endowment: its storage deposits.
 const ENDOWMENT: u64 = 10_000_000_000;
@@ -63,6 +64,7 @@ impl Testnet {
                 rpc: var("VOS_E2E_RPC"),
                 jamt: PathBuf::from(var("POLKAJAM")).join("jamt"),
                 files: run.join("files"),
+                watch: None,
             },
             service: PathBuf::from(var("VOS_E2E_SERVICE")),
             shift: PathBuf::from(var("VOS_CLOCK_SHIFT")),
@@ -72,8 +74,9 @@ impl Testnet {
     }
 
     /// The statements service, deployed as `name` and pinning `pins`, as a
-    /// venue checked to run its code.
-    pub fn deploy(&self, name: &str, pins: Vec<Pin>) -> Jam {
+    /// venue checked to run its code, every package its client sends kept
+    /// by `wire`.
+    pub fn deploy(&self, name: &str, pins: Vec<Pin>, wire: &Arc<Wire>) -> JamVenue {
         let parameters = self.node.parameters().expect("the testnet's parameters");
         let config = Config {
             genesis: self.node.genesis().expect("the chain's genesis"),
@@ -93,16 +96,12 @@ impl Testnet {
         self.node
             .await_preimage(service, &digest(&blob), blob.len() as u64, PREIMAGE_TIMEOUT)
             .expect("the service's code available");
-        let statements = Statements::new(
-            self.node.clone(),
-            service,
-            parameters.max_refine_gas,
-            EPOCH_MS,
-        )
-        .expect("the service's code hash");
-        let venue = JamVenue::new(statements, config, &blob)
-            .unwrap_or_else(|mismatch| panic!("the service's code: {mismatch:?}"));
-        Jam::new(venue)
+        let mut node = self.node.clone();
+        node.watch = Some(wire.watch(&self.node));
+        let statements = Statements::new(node, service, parameters.max_refine_gas, EPOCH_MS)
+            .expect("the service's code hash");
+        JamVenue::new(statements, config, &blob)
+            .unwrap_or_else(|mismatch| panic!("the service's code: {mismatch:?}"))
     }
 
     /// The testnet's clock set `ms` ahead of the host's.
@@ -116,10 +115,11 @@ impl Testnet {
     }
 
     /// The testnet's chain directory, as its log names it.
-    pub fn chain(&self) -> Option<PathBuf> {
-        let log = std::fs::read_to_string(&self.log).ok()?;
+    pub fn chain(&self) -> PathBuf {
+        let log = std::fs::read_to_string(&self.log).expect("the testnet's log");
         log.lines()
             .find_map(|line| line.strip_prefix("testnet: Working directory: "))
             .map(PathBuf::from)
+            .expect("the testnet's log names its chain directory")
     }
 }

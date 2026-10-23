@@ -1,22 +1,22 @@
 //! The run's clients and prover, each wrapped to keep what the run
-//! measures and audits: every judgement and when it came, the JAM
-//! service's outcomes and the packages they landed in, the Kreivo mock's
-//! signed envelopes, and each proof's time.
+//! measures and audits: every judgement and when it came, every work
+//! package a JAM service's client sent and its work report, the Kreivo
+//! mock's signed envelopes, and each proof's time.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
+use vos_jam::live::{PolkaJam, Watch};
 use vos_node_prover::masked::Disclosing;
 use vos_node_prover::{Internals, ProveError, Prover};
-use vos_statement_service::item::Item;
-use vos_statement_service::state::{Outcome, keys};
+use vos_statement_service::state::Outcome;
 use vos_venue::jam::JamVenue;
 use vos_venue::kreivo::Transport;
 use vos_venue::kreivo::calls::AccountId;
 use vos_venue::kreivo::transport::{Included, Lost, SendError, Signed};
 use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
-use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
+use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, VenueClient};
 use vos_wire::result::Attest;
 use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
 
@@ -144,119 +144,67 @@ impl VenueClient for Recorded {
     }
 }
 
-/// An item the run landed at the JAM service: what it was, its outcome,
-/// and the work report a guarantor made of its package, once read.
+/// A work package sent to a JAM service, as it went: its encoding, its
+/// extrinsics, and the work report a guarantor made of it, once read.
 #[derive(Clone)]
-pub struct Landed {
-    pub what: String,
-    pub outcome: Outcome,
+pub struct Sent {
+    pub package: Vec<u8>,
+    pub extrinsics: Vec<Vec<u8>>,
     pub report: Arc<OnceLock<Vec<u8>>>,
 }
 
-impl Landed {
-    /// Its package's work report, once read: none past `within`.
+impl Sent {
+    /// Its work report, once read: none past `within`.
     pub fn report(&self, within: Duration) -> Option<Vec<u8>> {
         vos_checker::poll(within, || self.report.get().is_some());
         self.report.get().cloned()
     }
 }
 
-/// How long a landed package's report may take to show.
-const REPORTED: Duration = Duration::from_secs(60);
+/// How long a sent package's report may take to show.
+const REPORTED: Duration = Duration::from_secs(90);
 
-/// The JAM statements service as a venue, as `JamVenue` is, each
-/// submission landed by the run so its outcome, its refine gas and its
-/// package's work report are kept.
-pub struct Jam {
-    pub venue: JamVenue,
-    landed: Mutex<Vec<Landed>>,
-}
+/// Every work package a JAM service's client sent, anchors, registrations
+/// and statements alike (`vos_jam::live::Watch`), each one's work report
+/// read apart while the chain's status of the package names it.
+#[derive(Default)]
+pub struct Wire(Mutex<Vec<Sent>>);
 
-impl Jam {
-    pub fn new(venue: JamVenue) -> Self {
-        Self {
-            venue,
-            landed: Mutex::default(),
-        }
-    }
-
-    /// Land an item: its outcome, kept as `what`. Its package's work report
-    /// is read apart, while the chain's status of the package names it, so
-    /// the answer does not wait for it.
-    pub fn land(
-        &self,
-        what: impl Into<String>,
-        payload: Vec<u8>,
-        extrinsics: Vec<Vec<u8>>,
-    ) -> Result<Outcome, vos_jam::Error> {
-        let (package, outcome) = self.venue.land_package(payload, extrinsics)?;
-        let report = Arc::new(OnceLock::new());
-        let (node, read) = (self.venue.statements.node.clone(), Arc::clone(&report));
-        std::thread::spawn(move || {
-            vos_checker::poll(REPORTED, || match node.work_report(&package) {
-                Ok(Some(bytes)) => read.set(bytes).is_ok(),
-                _ => false,
+impl Wire {
+    /// The watch to set on `node`, the client that sends.
+    pub fn watch(self: &Arc<Self>, node: &PolkaJam) -> Watch {
+        let (wire, node) = (Arc::clone(self), node.clone());
+        Watch(Arc::new(move |package: &[u8], extrinsics: &[Vec<u8>]| {
+            let report = Arc::new(OnceLock::new());
+            lock(&wire.0).push(Sent {
+                package: package.to_vec(),
+                extrinsics: extrinsics.to_vec(),
+                report: Arc::clone(&report),
             });
-        });
-        lock(&self.landed).push(Landed {
-            what: what.into(),
-            outcome,
-            report,
-        });
-        Ok(outcome)
+            let (node, package) = (node.clone(), package.to_vec());
+            std::thread::spawn(move || {
+                vos_checker::poll(REPORTED, || match node.work_report(&package) {
+                    Ok(Some(bytes)) => report.set(bytes).is_ok(),
+                    _ => false,
+                });
+            });
+        }))
     }
 
-    /// Submit `statement` with its final proof as its item's extrinsic, a
-    /// repeat sent too: its outcome.
-    pub fn judge(&self, statement: &Statement, proof: &[u8]) -> Result<Outcome, vos_jam::Error> {
-        let what = format!("statement {}", hex(&statement.id().0[..8]));
-        let payload = Item::Submit(statement.encode()).encode();
-        self.land(what, payload, vec![proof.to_vec()])
+    /// The packages sent so far.
+    pub fn sent(&self) -> Vec<Sent> {
+        lock(&self.0).clone()
     }
 
-    /// Every item the run landed.
-    pub fn landed(&self) -> Vec<Landed> {
-        lock(&self.landed).clone()
-    }
-}
-
-/// The JAM venue's answers, as `JamVenue::submit` gives them: a statement
-/// the service holds seen accepted unsent, a code of 0 or 6 accepted.
-impl VenueClient for Jam {
-    fn id(&self) -> VenueId {
-        self.venue.id()
-    }
-
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        self.venue.anchor(anchor)
-    }
-
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
-        let id = statement.id();
-        if let Ok(Some(_)) = self.venue.statements.value(&keys::seen(&id)) {
-            return Ok(id);
-        }
-        match self.judge(statement, proof) {
-            Ok(outcome) if outcome.code == 0 || outcome.code == 6 => Ok(id),
-            Ok(outcome) => Err(NotAccepted::Refused(outcome.code)),
-            Err(_) => Err(NotAccepted::Unjudged(Unjudged::Unknown)),
-        }
-    }
-
-    fn anchored(&self, root: &RootRead) -> bool {
-        self.venue.anchored(root)
-    }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        self.venue.anchor_keys(space)
-    }
-
-    fn status(&self, space: &SpaceId) -> Status {
-        self.venue.status(space)
-    }
-
-    fn time(&self) -> Option<u64> {
-        self.venue.time()
+    /// The outcome the service keeps of the item `payload` in any package
+    /// sent, as its finalized block holds it.
+    pub fn outcome(&self, jam: &JamVenue, payload: &[u8]) -> Option<Outcome> {
+        self.sent().iter().find_map(|sent| {
+            jam.statements
+                .outcome(&vos_wire::result::digest(&sent.package), payload)
+                .ok()
+                .flatten()
+        })
     }
 }
 
