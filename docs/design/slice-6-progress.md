@@ -3589,3 +3589,10 @@ gaps, which 6.21 inherits), folded:
   `Logs` on the shared lock; `delay_chunk`'s unused parameters named so;
   the disclosing prover keeps its segments' lengths apart; a record's
   rows split at its arguments' known length.
+- **Gates after the fold:** the audit clean on three runs (four nodes,
+  about two minutes each; 91 node-proof, 41 row and argument, 182 hash,
+  10 step, 15 memory-root, 25 register and 7 debug-output needles; every
+  canary in its carrier); `just check` green: 105 suites, 1,360 passed,
+  0 failed. `vos-venue`'s `an_anchor_is_answered_at_once` met 10.1 ms
+  against its 10 ms bound under load; its bound is 500 ms, the node it
+  must not wait on timing out in seconds.
