@@ -168,6 +168,18 @@ pub enum Input {
         rep_root: [u8; 32],
         paths: Vec<(AgentId, [u8; 16], Vec<u8>)>,
     },
+    /// The statement `id` of one of the agent's attests at window
+    /// `window`'s cut proved, its final proof the blob `proof` (its
+    /// BLAKE2b-256) in the prover's blob store: refine records it
+    /// ([`crate::keys::proven`]), the first proof of an id alone. The
+    /// prover, the agent's leader, puts it in a batch once the proof is
+    /// stored.
+    #[codec(index = 9)]
+    Proven {
+        window: u64,
+        id: [u8; 32],
+        proof: [u8; 32],
+    },
 }
 
 /// A client request, in its session's sequence for this agent.

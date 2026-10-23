@@ -294,6 +294,9 @@ pub enum InputRef {
     /// ([`crate::batch::Input::Close`]).
     #[codec(index = 7)]
     Close { window: u64 },
+    /// A statement of the agent's proved ([`crate::batch::Input::Proven`]).
+    #[codec(index = 8)]
+    Proven { id: [u8; 32] },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

@@ -149,6 +149,7 @@ enum Row {
     Serving = 0x20,
     CloseMark = 0x21,
     Reports = 0x22,
+    Proven = 0x23,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -621,6 +622,18 @@ pub fn close_mark() -> Vec<u8> {
 /// one stores nothing.
 pub fn reports(agent: AgentId) -> Vec<u8> {
     key(&[&Row::Reports.prefix(), &agent.0.to_be_bytes()])
+}
+
+/// The final proof of the agent's statement `id` (a
+/// `vos_statement::StatementId`) of an attest at window `window`'s cut, as
+/// its prover recorded it ([`crate::batch::Input::Proven`]): the proof's
+/// BLAKE2b-256, a blob in the prover's store. Replicated, written by the
+/// step of the first `Proven` of the id; a later one is ignored. Every
+/// replica learns from it that the statement is proved, so a new leader
+/// proves it again only when no replica holds the proof. Keyed by window
+/// first, so the rows of windows no venue anchors any more go by prefix.
+pub fn proven(window: u64, id: &[u8; 32]) -> Vec<u8> {
+    key(&[&Row::Proven.prefix(), &window.to_be_bytes(), id])
 }
 
 /// The representative's close of the window `window`, node-local, written

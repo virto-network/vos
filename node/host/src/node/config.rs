@@ -71,6 +71,11 @@ pub struct Config {
     /// in its store beside its node key, never the same key, never logged.
     /// Taken when `venue` is unset.
     pub venue_with_account: Option<VenueWithAccount>,
+    /// What proves the statements of the agents this node leads, with a
+    /// venue to submit them to (`vos_node_prover`): none proves nothing.
+    pub prover: Option<Arc<dyn vos_node_prover::Prover>>,
+    /// The prover worker's settings.
+    pub prover_options: vos_node_prover::Options,
     /// How the node reaches the other nodes of its space.
     pub peers: Peers,
     /// Where the peer endpoint binds, when not the address its space
@@ -159,6 +164,8 @@ impl Config {
             space: None,
             venue: None,
             venue_with_account: None,
+            prover: None,
+            prover_options: vos_node_prover::Options::default(),
             peer_bind: None,
             quic_idle: vos_net::quic::IDLE,
             peers: Peers::Quic,

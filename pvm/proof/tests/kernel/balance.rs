@@ -17,12 +17,12 @@ use vos_wire::ids::MapId;
 use vos_wire::keys::{self, Transform};
 use vos_wire::vos_anchor::{VenueId, space_id};
 
-const ACCOUNT: [u8; 32] = [0xAC; 32];
+pub(crate) const ACCOUNT: [u8; 32] = [0xAC; 32];
 const BALANCE: u64 = 5_000;
-const SALT: [u8; 16] = [0x5A; 16];
+pub(crate) const SALT: [u8; 16] = [0x5A; 16];
 
 /// The actor's commitment to `account` under `salt` (`balance::commitment`).
-fn commitment(salt: &[u8; 16], account: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn commitment(salt: &[u8; 16], account: &[u8; 32]) -> [u8; 32] {
     Blake2b.hash(b"vos/test/balance/account", &[salt, account])
 }
 
@@ -37,7 +37,7 @@ fn row(account: &[u8; 32]) -> Vec<u8> {
 }
 
 /// The balances at the cut: [`ACCOUNT`]'s among 256 others.
-fn balances() -> Cut {
+pub(crate) fn balances() -> Cut {
     let mut rng = Rng(0xba1a_0000);
     let others = (0..256)
         .map(|_| {
@@ -52,7 +52,7 @@ fn balances() -> Cut {
 
 /// `at_least_at_cut` of `account` over `threshold`, its commitment `c`
 /// opened by `salt`.
-fn at_least(
+pub(crate) fn at_least(
     cut: &Cut,
     c: [u8; 32],
     threshold: u64,

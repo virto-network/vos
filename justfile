@@ -48,6 +48,9 @@ vectors:
 # 39, their statements judged at the model venue against the space's
 # anchors, and the fixtures checked against their generator and judged in
 # Wasm.
+# The repository's constants (`pvm/proof/src/constants.rs`) are recomputed
+# with and without `debug-internals`, and the prover worker's throughput at
+# the default window length is measured (`kernel`'s `throughput`).
 # Memory-heavy: the library, `gates` and `isa` run two tests at a time, and
 # `kernel`, whose proving runs each take several GiB, one at a time: each
 # of its tests (a window's up to about 9 GiB at its peak) in a process of
@@ -70,6 +73,7 @@ test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
     for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip reads:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
     cargo test -p vos-pvm-proof --features debug-internals --test kernel reads:: -- --test-threads=1
+    cargo test -p vos-pvm-proof --test kernel constants:: -- --test-threads=1
     cargo test -p vos-pvm-recair --features heavy-gates --test circuit --test recursion -- leakage heavy --test-threads=1
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
@@ -94,6 +98,18 @@ judge-wasm:
 # the generator no longer makes.
 fixtures:
     with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators }
+
+# The reproducibility gate on aarch64: `vos program-id`, built for aarch64
+# with the masked prover and run under qemu-user, recomputes each known
+# kernel's program id from its test actor's ELF and the circuits'
+# constants (`H_fold`, the wrap's roots), each the repository's
+# (`pvm/proof/src/constants.rs`). It needs `qemu-aarch64`, an aarch64 GNU
+# toolchain (`aarch64-linux-gnu-gcc`, its sysroot at
+# `/usr/aarch64-linux-gnu`) and the toolchain's `aarch64-unknown-linux-gnu`
+# target; on an ARM host, run `vos program-id` natively.
+repro-aarch64: build-test-actors
+    with-env { CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: "aarch64-linux-gnu-gcc", CC_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-gcc", AR_aarch64_unknown_linux_gnu: "aarch64-linux-gnu-ar" } { cargo build -p vos-cli --no-default-features --features prover --target aarch64-unknown-linux-gnu }
+    let source = (open --raw pvm/proof/src/constants.rs); let pinned = {|name| $source | parse --regex ("pub const " + $name + ": \\[u\\d+; \\d+\\] = \\[(?<values>[^\\]]*)\\]") | get values.0 | split row "," | each {|value| $value | str trim } | where {|value| $value != "" } | str join " " }; let vos = {|...args| ^qemu-aarch64 -L /usr/aarch64-linux-gnu target/aarch64-unknown-linux-gnu/debug/vos program-id ...$args | str trim }; for case in [[window settle WINDOW_PROGRAM] [balance at_least BALANCE_PROGRAM] [kernels areas PREDICATE_PROGRAM]] { let printed = (do $vos $"agent/test-actors/target/riscv64em-vos/release/($case.0).elf" $case.1); if $printed != (do $pinned $case.2) { error make { msg: $"($case.2) on aarch64: ($printed)" } } }; let circuits = (do $vos "--circuits" | lines); let names = ($circuits | each {|line| $line | split row " " | first }); if $names != [H_FOLD WRAP_ROOT_28 WRAP_ROOT_39] { error make { msg: $"the circuits printed on aarch64: ($names)" } }; for line in $circuits { let parts = ($line | split row " "); if ($parts | skip 1 | str join " ") != (do $pinned $parts.0) { error make { msg: $"($parts.0) on aarch64: ($line)" } } }; print "the program ids and the circuits' constants on aarch64 are the repository's"
 
 # The conformance vectors of Kreivo's spaces pallet and the mutation lists
 # (`node/venue/conformance`, `spaces-pallet.md` §10), written anew by the
@@ -124,7 +140,13 @@ clippy:
     cargo clippy -p vos-cli --features faults --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-proof --features debug-internals --all-targets --quiet -- -D warnings
+    just clippy-prover
     just clippy-kreivo
+
+# The node and `vos` with the masked prover (`prover`): they build and lint
+# clean.
+clippy-prover:
+    cargo clippy -p vos-node -p vos-cli --features vos-node/prover,vos-cli/prover --all-targets --quiet -- -D warnings
 
 # The Kreivo client's chain transport, behind the `kreivo` feature: it
 # builds, lints clean, and its envelope's checks pass.
@@ -155,7 +177,7 @@ build-representative:
 # default agent against it, the checker's own model, the node running the
 # agent, the network between nodes, and the `vos` command.
 test-agent: build-test-actors build-agent build-representative
-    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-venue -p vos-net -p vos-cli
+    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
     just test-reads
@@ -201,6 +223,7 @@ _no-feature feature +args:
 # `debug-internals` does not imply it.
 check-no-seeded-masks:
     just _no-feature seeded-masks --workspace
+    just _no-feature seeded-masks -p vos-cli --features prover
     for manifest in [agent/default pvm/proof/fuzz pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature seeded-masks --manifest-path $"($manifest)/Cargo.toml" }
     if (open pvm/proof/Cargo.toml | get features.debug-internals | any {|feature| $feature | str contains 'seeded-masks' }) { error make { msg: "debug-internals implies seeded masks" } }
     print "no seeded masks in a production build"
@@ -215,6 +238,7 @@ check-no-seeded-masks:
 # verifier too, and are no venue.
 check-no-test-formats:
     just _no-feature test-formats --workspace
+    just _no-feature test-formats -p vos-cli --features prover
     for manifest in [agent/default pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature test-formats --manifest-path $"($manifest)/Cargo.toml" }
     just _no-feature test-formats -p vos-statement --features fixtures,pvm-guest
     just _no-feature test-formats -p vos-statement-service --features pvm-guest
@@ -345,10 +369,11 @@ fuzz secs="60":
 # library tests, and the lints of other feature sets.
 check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-kit build-test-actors build-agent build-representative fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
+    just clippy-prover
     just clippy-kreivo
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures
     just test-recair
-    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-venue -p vos-net -p vos-cli
+    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli
     just test-reads
 
 # The live runs of reads at a cut on the agent's model, with no proving:

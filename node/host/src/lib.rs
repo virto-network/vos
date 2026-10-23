@@ -24,6 +24,7 @@ mod liveness;
 mod messages;
 mod node;
 pub mod peer;
+mod prover;
 mod pvm;
 mod queries;
 pub mod raft;

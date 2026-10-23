@@ -1,0 +1,33 @@
+[package]
+name = "vos-node-prover"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The node's prover worker: an agent's leader proves the statements its attests at a window's cut make, keeps each final proof, records it in the agent and submits it at the space's venue, once."
+
+[features]
+# The masked prover (`masked::MaskedProver`): a kernel's run re-traced on
+# its record's witness, proved segment by segment, its leaves folded and
+# the root wrapped masked under format 39; and a kernel's program id from
+# its ELF (`program::program_id`, `vos program-id`).
+prove = [
+    "dep:vos-pvm-proof",
+    "dep:vos-pvm-recair",
+    "dep:vos-pvm-compiler",
+    "dep:vos-pvm-program",
+]
+
+[dependencies]
+tracing = "0.1"
+# Every statement's venue: its anchors read, its statements submitted.
+vos-venue = { workspace = true }
+vos-wire = { workspace = true }
+vos-pvm-proof = { workspace = true, optional = true }
+vos-pvm-recair = { workspace = true, optional = true }
+vos-pvm-compiler = { workspace = true, optional = true }
+vos-pvm-program = { workspace = true, optional = true }
+
+[dev-dependencies]
+vos-node-prover = { path = ".", features = ["prove"] }
+# The test actors' kernels, run live as an agent runs them.
+vos-testkit = { path = "../../agent/testkit" }

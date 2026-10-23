@@ -156,12 +156,18 @@ impl Node {
             retiring: Mutex::new(HashSet::new()),
             halted: AtomicBool::new(false),
             liveness: crate::liveness::Liveness::new(incarnation),
+            unrecorded: crate::prover::Unrecorded::default(),
+            proving: AtomicBool::new(false),
+            backlog: Mutex::new(None),
         });
         inner.resume(records, placements);
         let liveness = arrivals.map(|arrivals| start_liveness(&inner, arrivals));
         inner.spawn(super::directory::resend_records(Arc::clone(&inner)));
         inner.spawn(crate::stats::probe(Arc::clone(&inner)));
         let collector = Some(start_collector(&inner));
+        let prover = config
+            .prover
+            .and_then(|prover| crate::prover::start(&inner, prover, config.prover_options));
         Ok(Self {
             inner,
             data,
@@ -172,6 +178,7 @@ impl Node {
             runtime: Some(thread),
             liveness,
             collector,
+            prover,
         })
     }
 
@@ -194,6 +201,12 @@ impl Node {
         }
         if let Some((stop, thread)) = self.liveness.take() {
             let _ = stop.try_send(());
+            let _ = thread.join();
+        }
+        // A proof under way ends first: the worker writes its table and
+        // the blob store.
+        if let Some((stop, thread)) = self.prover.take() {
+            let _ = stop.send(());
             let _ = thread.join();
         }
         // A collection under way ends first: it waits on the writers.

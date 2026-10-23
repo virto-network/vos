@@ -10,6 +10,7 @@ mod close;
 mod cut;
 mod execute;
 mod outbox;
+mod proven;
 mod serve;
 mod settle;
 mod sweep;
@@ -324,7 +325,11 @@ impl Leader {
             // A read proved at its cut, a report, a close, or a waiting
             // anchor to try again.
             let anchor = self.anchor_wait();
-            if self.serve_due() || self.duties_due() || anchor == Some(Duration::ZERO) {
+            if self.serve_due()
+                || self.duties_due()
+                || self.proofs_due()
+                || anchor == Some(Duration::ZERO)
+            {
                 smol::future::yield_now().await;
                 return Some(Taken::Serve);
             }

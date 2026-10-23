@@ -272,6 +272,28 @@ impl Batch {
         );
     }
 
+    /// Write the prover's job of `agent`'s statement `id`, its encoding,
+    /// or remove it (`None`).
+    pub fn prover_job(&mut self, agent: AgentId, id: &[u8; 32], job: Option<&[u8]>) {
+        let key = node_record(
+            NodeRow::ProverJob,
+            &[&agent.0.to_be_bytes()[..], id].concat(),
+        );
+        match job {
+            Some(job) => self.batch.insert(self.store.system(), key, job),
+            None => self.batch.remove(self.store.system(), key),
+        }
+    }
+
+    /// Write the last index of `agent`'s log the prover read into jobs.
+    pub fn prover_mark(&mut self, agent: AgentId, index: u64) {
+        self.batch.insert(
+            self.store.system(),
+            node_record(NodeRow::ProverMark, &agent.0.to_be_bytes()),
+            index.to_be_bytes(),
+        );
+    }
+
     /// Write the node's `row` for the agent.
     fn set(&mut self, agent: AgentId, row: NodeRow, value: impl Into<fjall::Slice>) {
         self.batch

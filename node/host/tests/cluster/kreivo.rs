@@ -76,6 +76,10 @@ impl VenueClient for Watched {
     fn status(&self, space: &SpaceId) -> Status {
         self.inner.status(space)
     }
+
+    fn time(&self) -> Option<u64> {
+        self.inner.time()
+    }
 }
 
 /// A node's client: its number, its account, the client.

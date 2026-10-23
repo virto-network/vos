@@ -199,6 +199,12 @@ impl Node {
             .is_some_and(|run| run.shared.state().role == Role::Leader)
     }
 
+    /// The prover worker's backlog as its last step left it: none while no
+    /// worker runs, or before its first step.
+    pub fn prover_backlog(&self) -> Option<vos_node_prover::Backlog> {
+        *crate::lock(&self.inner.backlog)
+    }
+
     /// The last index this node's replica of `agent` applied.
     pub fn applied(&self, agent: AgentId) -> Option<u64> {
         Some(self.inner.run(agent)?.shared.state().applied)

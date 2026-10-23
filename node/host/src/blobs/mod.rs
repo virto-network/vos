@@ -352,11 +352,17 @@ impl Blobs {
         }
     }
 
-    /// The pinned blobs, each once.
+    /// The programs agents pin, each once: not the blobs the node itself
+    /// holds pinned (its prover's proofs, under [`crate::store::NODE_AGENT`]).
     pub fn pinned(&self) -> store::Result<Vec<[u8; 32]>> {
         let mut out: Vec<[u8; 32]> = Vec::new();
+        let node = crate::store::NODE_AGENT.0.to_be_bytes();
         for row in self.index().prefix([IndexRow::Pin as u8]) {
-            let hash = pinned_hash(&row.key()?);
+            let key = row.key()?;
+            if key.ends_with(&node) {
+                continue;
+            }
+            let hash = pinned_hash(&key);
             if out.last() != Some(&hash) {
                 out.push(hash);
             }

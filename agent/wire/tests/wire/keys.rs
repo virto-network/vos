@@ -136,6 +136,10 @@ fn keys_keep_their_bytes() {
         keys::reports(AgentId(0x0102_0304)),
         [0x00, 0x22, 0x01, 0x02, 0x03, 0x04]
     );
+    assert_eq!(
+        keys::proven(sequence, &[0xab; 32]),
+        cat(&[&[0x00, 0x23], &at, &[0xab; 32]])
+    );
     assert_eq!(keys::closing(sequence), cat(&[&[0x02, 0x07], &at]));
     assert_eq!(keys::closings(), [0x02, 0x07]);
     assert_eq!(
@@ -149,6 +153,7 @@ fn keys_keep_their_bytes() {
         keys::moved(1),
         keys::serving(),
         keys::close_mark(),
+        keys::proven(1, &[1; 32]),
     ] {
         assert!(keys::is_replicated(&replicated));
     }

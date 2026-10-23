@@ -9,6 +9,9 @@ description = "The VOS node host: storage, the leader loops and ingress."
 # Faults a test injects into a running node (`vos_node::faults`): never
 # in a production build.
 faults = []
+# The masked prover (`vos_node_prover::masked`): a node built with it can
+# prove its agents' statements (`Config::prover`).
+prover = ["vos-node-prover/prove"]
 
 [dependencies]
 fjall = { workspace = true }
@@ -33,6 +36,9 @@ vos-raft = { workspace = true }
 vos-tree = { workspace = true }
 # Where the space's representative anchors its roots.
 vos-venue = { workspace = true }
+# The prover worker: the statements of the agents a node leads proved,
+# recorded and submitted.
+vos-node-prover = { workspace = true }
 vos-wire = { workspace = true }
 # The node's account key at its venue, zeroed when dropped.
 zeroize = "1.8"

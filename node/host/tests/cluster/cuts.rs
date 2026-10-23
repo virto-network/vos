@@ -25,7 +25,7 @@ use vos_node::{Node, Reply};
 use vos_tree::{Blake2b, Hash, NodeStore};
 use vos_venue::VenueClient;
 use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, InstanceId, MapId, MethodId, RequestId};
+use vos_wire::ids::{AgentId, InstanceId, MapId, MethodId, RequestId, Session};
 use vos_wire::keys::{self, Transform};
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::{PendingRead, unstored, unversioned};
@@ -337,6 +337,18 @@ pub(crate) fn ask_keys(
     agent: AgentId,
     sequence: u64,
 ) -> (RequestId, PendingRead, Vec<u64>) {
+    ask_in(cluster, agent, cluster.session(agent), sequence, 0)
+}
+
+/// [`ask_keys`] as request `sequence` of `session`, asked in window
+/// `window`.
+pub(crate) fn ask_in(
+    cluster: &Cluster,
+    agent: AgentId,
+    session: Session,
+    sequence: u64,
+    window: u64,
+) -> (RequestId, PendingRead, Vec<u64>) {
     let leader = cluster.node(cluster.leader(agent));
     let map = entries();
     let present: Vec<u64> = settled(leader, agent)
@@ -352,7 +364,7 @@ pub(crate) fn ask_keys(
     assert_eq!(present.len(), 12, "twelve rows written");
     let keys: Vec<u64> = present.iter().copied().chain(1_000..1_004).collect();
     let start = Request {
-        session: cluster.session(agent),
+        session,
         sequence,
         caller: ALICE,
         instance: READER,
@@ -382,7 +394,7 @@ pub(crate) fn ask_keys(
         wait_until("every replica holds the request", || {
             node.store()
                 .snapshot()
-                .get(agent, &keys::request(0, id))
+                .get(agent, &keys::request(window, id))
                 .unwrap()
                 .is_some()
         });

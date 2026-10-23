@@ -157,6 +157,13 @@ pub(crate) struct Inner {
     pub(crate) calls: crate::calls::Calls,
     /// The read indexes this replica asked its leaders for.
     pub(crate) reads: crate::asking::Waits<Option<u64>>,
+    /// The statements proved here that their agents have still to record.
+    pub(crate) unrecorded: crate::prover::Unrecorded,
+    /// Whether a prover worker runs here: compaction keeps the entries its
+    /// scan has not read.
+    pub(crate) proving: AtomicBool,
+    /// The prover worker's latest backlog.
+    pub(crate) backlog: Mutex<Option<vos_node_prover::Backlog>>,
 }
 
 /// What the node counts, as [`Node`]'s getters report it.
@@ -507,6 +514,8 @@ pub struct Node {
     liveness: Option<(smol::channel::Sender<()>, JoinHandle<()>)>,
     /// The blob collector's thread, and what stops it.
     collector: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
+    /// The prover worker's thread, and what stops it.
+    prover: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
 }
 
 #[cfg(test)]

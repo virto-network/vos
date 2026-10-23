@@ -194,6 +194,7 @@ impl Reads {
                         rep_root,
                         paths,
                     } => self.kit.close(*window, *rep_root, paths.clone()),
+                    Input::Proven { window, id, proof } => self.kit.proven(*window, *id, *proof),
                     other => panic!("not modelled: {other:?}"),
                 },
                 Step::Swept { .. } | Step::Refused { .. } => {
@@ -1327,6 +1328,31 @@ fn a_close_sends_each_path_once() {
     assert_eq!(
         row::<(u64, Option<AgentId>)>(&reads, &keys::close_mark()),
         Some((9, None))
+    );
+}
+
+/// A statement's proof is recorded once: the first `Proven` of an id
+/// writes its row, a second of the id, another proof, writes nothing, and
+/// another id its own.
+#[test]
+fn a_statement_is_recorded_proven_once() {
+    let mut reads = Reads::with(&[(1, 10)]);
+    let proven = |id: u8, proof: u8| Input::Proven {
+        window: 4,
+        id: [id; 32],
+        proof: [proof; 32],
+    };
+    let result = reads.batch(T0 + 1, vec![proven(1, 0xa1), proven(1, 0xa2)]);
+    assert_eq!(ran(&result.steps[0]).writes.len(), 1);
+    assert!(ran(&result.steps[1]).writes.is_empty());
+    reads.batch(T0 + 2, vec![proven(1, 0xa3), proven(2, 0xb1)]);
+    assert_eq!(
+        row::<[u8; 32]>(&reads, &keys::proven(4, &[1; 32])),
+        Some([0xa1; 32])
+    );
+    assert_eq!(
+        row::<[u8; 32]>(&reads, &keys::proven(4, &[2; 32])),
+        Some([0xb1; 32])
     );
 }
 

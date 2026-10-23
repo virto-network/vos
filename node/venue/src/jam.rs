@@ -256,7 +256,14 @@ impl VenueClient for JamVenue {
         Ok(Anchored::Queued)
     }
 
+    /// A statement the service holds seen is answered accepted unsent: a
+    /// package refined again only to be refused a repeat costs a whole
+    /// refine.
     fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
+        let id = statement.id();
+        if let Ok(Some(_)) = self.statements.value(&keys::seen(&id)) {
+            return Ok(id);
+        }
         match self.submit_code(statement, proof) {
             Ok(0 | 6) => Ok(statement.id()),
             Ok(code) => Err(NotAccepted::Refused(code)),
@@ -302,6 +309,11 @@ impl VenueClient for JamVenue {
             .flatten()
             .map(|space| space.keys)
             .unwrap_or_default()
+    }
+    /// The finalized block's slot time (slot × 6 s from JAM's genesis
+    /// time); none while the node cannot say.
+    fn time(&self) -> Option<u64> {
+        self.statements.now().ok()
     }
 }
 
