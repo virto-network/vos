@@ -165,7 +165,7 @@ fn run(shared: &Shared, sender: &impl AnchorSend) {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use vos_anchor::RootKind;
 
@@ -183,16 +183,22 @@ mod tests {
     }
 
     /// Space 1 waits; space 2's anchors are sent all the same, in window
-    /// order; a repeat is queued once.
+    /// order; a repeat is queued once. Space 1's send is held until
+    /// `held` is cleared, so the test queues space 2's anchors while the
+    /// worker is busy, and the worker finds them all at once.
     struct Sends {
         sent: Mutex<Vec<(u8, u64)>>,
         tries: AtomicUsize,
+        held: AtomicBool,
     }
 
     impl AnchorSend for Arc<Sends> {
         fn send(&self, anchor: &Anchor) -> Fate {
             self.tries.fetch_add(1, Ordering::SeqCst);
             if anchor.space.0[0] == 1 {
+                while self.held.load(Ordering::SeqCst) {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 return Fate::Again(Duration::from_secs(60));
             }
             self.sent
@@ -208,15 +214,21 @@ mod tests {
         let sends = Arc::new(Sends {
             sent: Mutex::default(),
             tries: AtomicUsize::new(0),
+            held: AtomicBool::new(true),
         });
         let queue = AnchorQueue::spawn("test-anchors", Arc::clone(&sends));
         queue.push(&anchor(1, 3));
         queue.push(&anchor(1, 3));
         queue.push(&anchor(1, 4));
+        let start = Instant::now();
+        while sends.tries.load(Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < Duration::from_secs(10));
+            std::thread::sleep(Duration::from_millis(1));
+        }
         for window in [6, 5, 7] {
             queue.push(&anchor(2, window));
         }
-        let start = Instant::now();
+        sends.held.store(false, Ordering::SeqCst);
         while sends.sent.lock().unwrap().len() < 3 {
             assert!(start.elapsed() < Duration::from_secs(10));
             std::thread::sleep(Duration::from_millis(5));
