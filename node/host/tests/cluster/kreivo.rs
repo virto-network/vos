@@ -1,12 +1,12 @@
 //! The representative's anchors through the Kreivo client
 //! (`vos_venue::kreivo::KreivoVenue`) over the mock of Kreivo's spaces
 //! pallet, with its fee pipeline, a second an extrinsic: each node's
-//! client made at its start from the account key it keeps in its store,
-//! the space registered with every node its authority, paired with its
-//! genesis key, the sovereign account paying. Anchors land once a window, in order, while the leader
-//! never waits on the chain inside its batch; a suspended space is sent
-//! nothing; a key the venue refuses is tried again once a window, or once
-//! the venue's listing changes.
+//! client signing as its own account, the space registered with every
+//! node its authority, paired with its genesis key, the sovereign account
+//! paying. Anchors land once a window, in order, while the leader never
+//! waits on the chain inside its batch; a suspended space is sent nothing;
+//! a key the venue refuses is tried again once a window, or once the
+//! venue's listing changes.
 //!
 //! The windows are an hour long (`cuts::clock`); the tests move the nodes'
 //! clocks and the mock chain's past each window's close, `B_w + D`.
@@ -19,7 +19,7 @@ use vos_node::Config;
 use vos_venue::kreivo::mock::transport::MockChain;
 use vos_venue::kreivo::mock::types::{AuthorityInfo, SpaceInfo, SpaceStatus};
 use vos_venue::kreivo::mock::{Account, Chain, Constants, Origin, keys};
-use vos_venue::kreivo::{AccountSeed, KreivoVenue, Options};
+use vos_venue::kreivo::{KreivoVenue, Options};
 use vos_venue::vos_statement::{Statement, StatementId};
 use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, VenueClient};
 use vos_wire::ids::AgentId;
@@ -85,9 +85,9 @@ impl VenueClient for Watched {
 /// A node's client: its number, its account, the client.
 type Client = (NodeNumber, [u8; 32], Arc<Watched>);
 
-/// The node's Kreivo account, from the key it keeps: the mock's signer.
-fn account_of(seed: &AccountSeed) -> [u8; 32] {
-    vos_wire::vos_anchor::blake2b_256(&[b"test account", seed.secret()])
+/// Node `number`'s Kreivo account: the mock's signer.
+fn account_of(number: NodeNumber) -> [u8; 32] {
+    vos_wire::vos_anchor::blake2b_256(&[b"test account", &[number]])
 }
 
 /// The mock Kreivo the space anchors at, timed by its own clock, which the
@@ -117,7 +117,8 @@ impl Kreivo {
         }
     }
 
-    /// Each node's config: its client made from its account key.
+    /// Each node's config: its client, signing as its account, made once
+    /// per node however many configs are made for it.
     fn tuning(&self) -> impl Fn(NodeNumber, &mut Config) + Send + Sync + 'static {
         let (chain, clients, extra) = (
             Arc::clone(&self.chain),
@@ -127,28 +128,29 @@ impl Kreivo {
         move |number, config| {
             let space =
                 vos_wire::vos_anchor::space_id(config.space.as_ref().unwrap().genesis().unwrap());
-            let (chain, clients, extra) = (chain.clone(), clients.clone(), extra.clone());
-            config.venue_with_account = Some(Box::new(move |seed| {
-                let account = account_of(&seed);
+            let mut clients = clients.lock().unwrap();
+            let made = clients
+                .iter()
+                .find(|(of, ..)| *of == number)
+                .map(|(.., client)| Arc::clone(client));
+            let client = made.unwrap_or_else(|| {
+                let account = account_of(number);
                 let options = Options {
                     refresh: Duration::from_millis(50),
                     backoff: Duration::from_millis(10),
                     ..Options::default()
                 };
                 let transport = chain.transport(Origin::Signed(account));
-                let inner = KreivoVenue::over(transport, &[space], space, options);
                 let watched = Arc::new(Watched {
-                    inner,
+                    inner: KreivoVenue::over(transport, &[space], space, options),
                     anchors: AtomicUsize::new(0),
                     slowest: AtomicU64::new(0),
-                    extra,
+                    extra: Arc::clone(&extra),
                 });
-                clients
-                    .lock()
-                    .unwrap()
-                    .push((number, account, Arc::clone(&watched)));
-                Ok(watched as Arc<dyn VenueClient>)
-            }));
+                clients.push((number, account, Arc::clone(&watched)));
+                watched
+            });
+            config.venue = Some(client as Arc<dyn VenueClient>);
         }
     }
 

@@ -2889,6 +2889,10 @@ On `vos-core` (from `4447127a`).
 
 ## Step 6.17b: the node's Kreivo client
 
+The chain transport, the account key and the tooling below were parked
+afterwards and removed (see "The Kreivo chain client parked"); the
+record stands as built.
+
 On `vos-core` (from `56ab4860`).
 
 - **Built, in `vos-venue`:** `kreivo::KreivoVenue: VenueClient`, in two
@@ -3374,3 +3378,81 @@ merge of `vos-core` (`331ab890`), the JAM venue's fold (`b8471312`), `6b7ec21b`,
 this record.
 
 **6.18 accepted.**
+
+## The Kreivo chain client parked
+
+On `s6/kreivo-park` (from `9e63e5a9`).
+
+**The owner's decision (2026-10-20, decision 12c).** Slice 6 agreed on
+design and kit only for Kreivo (12b): no pallet code from VOS, and a node
+client tested against a mock of the designed interface. Step 6.17b went
+further: a chain transport on subxt, a fee-paying node key and `vos`
+tooling. The owner already has an in-house Substrate client, `sube`
+(virto-sdk: metadata-driven, sr25519 through libwallet, a smol runtime).
+The chain client is parked, handoff only. Master's
+`extensions/substrate`, already on sube over smoldot, is the expected
+transport: it is ported onto vos-core's extension host once that host
+exists, and `KreivoVenue` reaches it by message through `Transport`. The
+owner also decided (12d) that the prover stays built into the node and
+the extension host waits until after the slices, so Kreivo is mock-only
+until then.
+
+- **Removed:**
+  - `node/venue/src/kreivo/chain.rs` (`ChainTransport`) and subxt,
+    subxt-signer, scale-info and tokio from `vos-venue`;
+  - the `kreivo` and `kreivo-unvetted` features (on `vos-venue` and
+    `vos-cli`) and `kreivo::selectable`;
+  - `AccountSeed` and `zeroize` in `vos-venue` and `vos-node`;
+  - `examples/kreivo_dev.rs`;
+  - the node's account key: `NodeRow::VenueAccount` (its tag `0x10` left
+    unused), its store reads and writes, `venue_account`,
+    `rotate_venue_account`, `Config::venue_with_account` and
+    `VenueWithAccount`;
+  - `sign_with_node_key`, which only registration used;
+  - in `vos`: `node run --venue/--venue-url`, `node venue-account
+    show|rotate`, and `space venue register|authority add|remove|budget`
+    (`node/cli/src/venue.rs`);
+  - the `clippy-kreivo` recipe; `doc-check` now documents `vos-venue`
+    with `mock` only.
+- **Kept:**
+  - `KreivoVenue`, and `Connect`, which the ported transport plugs into;
+  - `calls`, `Transport` and the `Sender`;
+  - the `AnchorQueue`;
+  - the mock and `node/venue/conformance/*.json`, with `just
+    conformance`;
+  - the kit (`pvm/proof/kit/`, `vendor-verifier`, `vos-sync`,
+    `check-kit`, `kit-lock`);
+  - every test of `KreivoVenue` over the mock. The cluster's clients now
+    sign as an account derived from each node's number.
+- **Counts:**
+  - code: 20 files, 1,446 lines removed, 20 added;
+  - `Cargo.lock`: 221 packages pruned (553 to 332), 2,578 lines removed.
+- **The handoff:** `spaces-pallet.md` §9.1 lists what the ported
+  transport must provide, from the parked code and its review, marking
+  what master's extension covers already:
+  - the key's custody and rotation;
+  - the envelope;
+  - pool-aware signing against a state-nonce landed check;
+  - the pool's refusals classified;
+  - the watch giving up past the era;
+  - reconnect, with the node starting while Kreivo is down;
+  - transport security;
+  - the last window never moving back;
+  - the release gate;
+  - the CLI.
+
+  The vectors and the mock are the contract. `slice-6-on-chain.md`'s
+  6.17b and 6.21 now say this: 6.21's Kreivo leg runs `KreivoVenue` over
+  the mock transport only.
+- **Gates:** `just check` at `bc218fcd` green: 101 suites, 1,338 passed,
+  0 failed (12 GiB scope, `nice -n 10`, 8 jobs). `just conformance`
+  rewrote the vectors byte for byte.
+- **The review** (Opus): ready to merge; its findings folded.
+  - The cluster test makes one client per node, however many configs a
+    node's open retries make.
+  - Tag `0x10`'s old layout is documented, and the tag reserved.
+  - Who owns the port is stated: VOS, after the slices; the pallet is the
+    teammate's; the live leg waits on both.
+  - §9.1 notes that the extension reads at finalized blocks only.
+  - The envelope is said to be the transport's.
+  - `core-model.md` Q18 separates what is decided from what is open.

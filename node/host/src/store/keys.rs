@@ -36,7 +36,10 @@ pub(super) enum NodeRow {
     Incarnation = 0x0d,
     VoteFloor = 0x0e,
     AnchorKey = 0x0f,
-    VenueAccount = 0x10,
+    // 0x10 is reserved: it held the node's venue-account seeds (a u64
+    // big-endian number to a 32-byte sr25519 mini secret), and stores from
+    // earlier builds may hold such rows. A reuse keeps that layout, or
+    // takes a new tag.
     ProverJob = 0x11,
     ProverMark = 0x12,
 }

@@ -49,8 +49,9 @@ Out of scope:
 - proving attestable methods, and `instantiate` under proof tracing
   (step 5);
 - the Merge lane and `#[msg(merge)]` (step 6);
-- SSH ingress, the prover extension and the Substrate light client, which
-  attach through the extension host after this slice;
+- SSH ingress and the Substrate light client, which attach through the
+  extension host after this slice (the prover is a built-in node
+  component, not an extension);
 - package signatures and licensing (section 6.4 [open]).
 
 ## Crates [proposed]
@@ -340,9 +341,9 @@ This answers open question 18 for one node.
   message: an extension has an agent id, receives `send`s in its pair
   sequences and answers with messages. That keeps one mechanism for
   everything that crosses an agent's boundary. The HTTP ingress is a
-  built-in node component in this slice. The extension host itself,
-  loading SSH, the prover and the Substrate light client, follows after
-  this slice.
+  built-in node component in this slice, and the prover is one for good.
+  The extension host itself, loading SSH and the Substrate light client,
+  follows after this slice.
 
 ## Sessions and ingress [proposed]
 

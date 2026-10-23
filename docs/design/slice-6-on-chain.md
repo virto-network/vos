@@ -68,10 +68,10 @@ here and in `spaces-pallet.md`:
    `set_status`'s unblock, `BadClock` before the origin and "no
    compile-time metadata" in the design; 6.17's stale line removed;
    decision 11's repeat exception; the two-sided rule in the design;
-   6.17b's `vosx space venue` tooling; 6.15 marked F.
+   6.17b's `vosx space venue` tooling (parked since, 12c); 6.15 marked F.
 8. **The deferred Kreivo gates** listed in M3b's acceptance, and the
    `kreivo` venue unselectable in production configuration until they
-   pass.
+   pass (parked since, 12c).
 
 ## Changes from draft 2
 
@@ -1485,64 +1485,60 @@ fees are the teammate's.
   it is suspended; a `Key` refusal is retried only once the `anchor_keys`
   listing changes, or once a window. A window past `B_w + MaxRootAge` by
   the leader's clock is settled locally, unsent (built in 6.14b).
-- **Files:** `node/venue/kreivo` (in `vos-venue`, behind a `kreivo`
-  feature); the operator and controller tooling over the same `calls`
-  layer: `vosx space venue register` (call 0, the founder's signature over
-  the registration digest with its `start_window`),
-  `vosx space venue authority add|remove` (calls 2–3) and
-  `vosx space venue budget` (call 10), which 6.21's mock leg uses to set
-  its space up; `KreivoVenue: VenueClient`, in two layers: `calls` (the
-  pinned call bytes, storage keys and event decoding of
-  `spaces-pallet.md` §9) and a `Transport` trait (submit signed call
-  bytes, follow to inclusion, read events and raw storage), with a subxt
-  transport (subxt and subxt-signer =0.51.1, sr25519; `RawCall` payloads;
-  tested on omni-node stable2606-2 and Kreivo 87f8728, spec 134) and a
-  mock transport over 6.17's model.
+- **Parked (owner, 2026-10-20, decision 12c):** the chain transport, the
+  node's Kreivo account key and the `vos` tooling. Slice 6's Kreivo scope
+  stays design and kit (12b). The transport is expected to be master's
+  `extensions/substrate` (sube over smoldot), ported onto vos-core's
+  extension host, with `KreivoVenue` reaching it by message through
+  `Transport`. The port is VOS's work after the slices, once the host
+  exists (decision 12d); the pallet is the teammate's; the live Kreivo
+  leg (M3b's deferred gate 2) waits on both, so until then Kreivo is
+  mock-only. `spaces-pallet.md` §9.1 lists what that
+  transport must provide, and which parts the extension already covers.
+- **Files:** `node/venue/src/kreivo` (in `vos-venue`): `KreivoVenue:
+  VenueClient`, in two layers. `calls` holds the pinned call bytes,
+  storage keys and event decoding of `spaces-pallet.md` §9. The
+  `Transport` trait signs and submits call bytes, follows them to
+  inclusion, and reads events and raw storage. The mock transport runs
+  over 6.17's model (feature `mock`). The `AnchorQueue`
+  (`node/venue/src/queue.rs`) is shared with JAM's client.
 - **Design:**
   - **the key (decision 12):** one sr25519 Kreivo account key per node,
-    generated and held in the node's key store beside its ed25519 node
-    key, never the same key, never logged; the controller registers it as
-    an authority paired with the node's anchor key; the node holds no
-    balance: the space's sovereign account pays;
-  - `anchor` and `submit` built from the pinned bytes, the envelope from
-    Kreivo's live metadata; `PassAuthenticate` pinned to None by a typed
-    extension, never by frame-decode's fallback, and the live extension
-    list checked against the expected ten in order, an unknown one
-    refused before signing; the verdict from `Accepted` or
-    `Refused { code }` mapped to `Refusal`'s codes, `Refused { 6 }` as
-    accepted, the errors mapped per the design's §9: before sending an
-    anchor, the client reads `Timestamp.Now` and waits until the venue's
-    clock has closed the window (`w < now_w` by the venue's time); 14
-    `AlreadyAnchored` and 15 `WindowNotAfterLast` done; 16
-    `WindowInFuture` waits until `Timestamp.Now` passes `B_w` plus one
-    block and resubmits, never skips (a skipped anchor leaves the window
-    unanchored for good); 17 `WindowTooOld` and 18 `OutOfRange` dead, with
-    an alert; 7, 19–21 and `InvalidTransaction::Payment` (the budget or
-    the sovereign's funds) a configuration or funding alert;
+    beside its ed25519 node key, never the same key, never logged; the
+    controller registers it as an authority paired with the node's anchor
+    key; the node holds no balance: the space's sovereign account pays.
+    The key and its store row come with the ported transport;
+  - the verdict from `Accepted` or `Refused { code }` mapped to
+    `Refusal`'s codes, `Refused { 6 }` as accepted, and the errors mapped
+    per the design's §9:
+    - before an anchor, the client reads `Timestamp.Now`. It sends only
+      once the venue's clock has closed the window (`w < now_w` by the
+      venue's time);
+    - 14 `AlreadyAnchored` and 15 `WindowNotAfterLast` are done;
+    - 16 `WindowInFuture` waits until `Timestamp.Now` passes `B_w` plus
+      one block, then resubmits. It never skips: a skipped anchor leaves
+      the window unanchored for good;
+    - 17 `WindowTooOld` and 18 `OutOfRange` are dead, with an alert;
+    - 7, 19–21 and `InvalidTransaction::Payment` (the budget or the
+      sovereign's funds) raise a configuration or funding alert;
   - `anchored(&RootRead)` reads `Anchors` at the best block; a funding
     alert when the sovereign account's balance falls below N submits'
     deposits and fees;
   - an extrinsic never re-signed with a new nonce while the first may
-    still land; retries with backoff;
+    still land; retries with backoff (the `Sender`);
   - the representative's anchor hook and the worker use it through
-    `VenueClient`, chosen by the space's venue in the node's
-    configuration;
-  - **the `kreivo` venue is not selectable in a production node's
-    configuration** (a refused configuration value outside test and dev
-    builds) until M3b's deferred Kreivo gates (1) and (2) pass, so no space
-    anchors on a chain whose pallet has not met the vectors.
-- **Tests:** through the mock transport, G1–G18 driven by the client's
-  own encode and decode; an anchor sent at `now_w` waits and lands once
-  the mock's `now_ms` passes `B_w`; the budget's refusal raises the alert;
-  a lost connection mid-submit (no double submission); key-store tests;
-  the production configuration refusing `kreivo`. Through the subxt transport on 6.0e's dev
-  chain: the envelope, the nonce, inclusion and event reading with a stock
-  call.
+    `VenueClient`.
+- **Tests:** through the mock transport:
+  - G1–G18 driven by the client's own encode and decode;
+  - an anchor sent at `now_w` waits, and lands once the mock's `now_ms`
+    passes `B_w`;
+  - the budget's refusal raises the alert;
+  - a lost connection mid-submit causes no double submission;
+  - the three-node cluster over the mock.
 - **Gates:** every vector passes through the client; every error and
   refusal code mapped; no double submission under a reconnect.
-- **Review:** Fable as well, for the key handling.
-- **Dep:** 6.0e, 6.17; decision 12. **Estimate:** 1.5 weeks (6.0e
-  needed no fallback); the workspace build behind `kreivo` first.
+- **Review:** Fable as well.
+- **Dep:** 6.0e, 6.17; decision 12. **Estimate:** 1.5 weeks.
 
 ### M3b acceptance
 
@@ -1553,11 +1549,13 @@ fees are the teammate's.
   committed; the kit follows at 6.16, the vectors and the mutation lists
   at 6.17.
 - **Deferred Kreivo gates,** for when the teammate's pallet lands, named
-  here so they are not lost; until (1) and (2) pass, the `kreivo` venue
-  stays unselectable in production configuration (6.17b):
+  here so they are not lost. Until (1) and (2) pass, no release build
+  reaches Kreivo: the ported transport (`spaces-pallet.md` §9.1)
+  stays behind a development-only feature.
   1. G1–G18 pass in the teammate's pallet mock runtime, and the `fees`
      vectors in Kreivo's runtime tests;
-  2. `just e2e-kreivo` on a Kreivo dev chain with the real client:
+  2. an end to end run on a Kreivo dev chain, `KreivoVenue` over the
+     ported substrate extension:
      register, add an authority, anchor near a window's boundary (the
      `WindowInFuture` wait), submit, a repeat, a refusal, an `anchored`
      read;
@@ -1749,15 +1747,16 @@ fees are the teammate's.
   - a venue-bound rootless statement accepted at its venue and refused at
     another (`0x7`); an unbound one accepted at both; each replayed past
     `MaxRootAge` refused (`0x6`).
-- **The Kreivo leg, against the mock:** the space registered and its
-  authorities added with 6.17b's `vosx space venue` tooling, then
-  anchoring and submitting through `KreivoVenue` over the mock transport,
+- **The Kreivo leg, against the mock only:** the space registered and its
+  authorities added in the mock's state, then anchoring and submitting
+  through `KreivoVenue` over the mock transport,
   its sovereign account paying within its budget; then the space migrates at window k from the
   mock to the JAM service: a statement at w ≥ k accepted at JAM and
   refused at the mock (`0x5`).
 - **The gate for Kreivo is the mock end to end.** The same leg on a
-  Kreivo dev chain (`just e2e-kreivo`, the subxt transport) runs when the
-  teammate's pallet exists; it is not a gate of this slice.
+  Kreivo dev chain, over the ported substrate extension, runs when the
+  pallet and that transport exist (M3b's deferred gate 2); it is not a
+  gate of this slice.
 - **Measured:** latency from `B_w` to acceptance at each venue, against
   pin D's `L/2 + D + t_prove + inclusion`; gas per statement on JAM; the
   deposits and fees the mock charged the sovereign account; the worker's
@@ -1910,12 +1909,12 @@ fees are the teammate's.
 | a rootless statement accepted again after its `Seen` entry is pruned | pin F's rule, tested at `MaxRootAge + 1` at every venue (G9) | 6.5, 6.17, 6.19 |
 | the teammate's pallet diverges from the design | the conformance vectors G1–G18 and the mutation lists; the Kreivo leg rerun on a dev chain when the pallet lands | 6.17, after the slice |
 | the design's §13 questions answered otherwise | the mock and the client follow the recommended defaults; another answer regenerates the vectors and touches only `calls` | 6.16–6.17b |
-| the node cannot reach Kreivo (no chain client in the workspace) | 6.0e's probe; 6.17b's subxt transport; fallback raw JSON-RPC | 6.0e, 6.17b |
-| key custody of the nodes' sr25519 keys | decision 12 (one per node, no balance); 6.17b's Fable review | 6.17b |
+| the node cannot reach Kreivo (no chain client in the workspace) | 6.0e's probe; master's `extensions/substrate` (sube), ported onto vos-core's extension host behind `Transport`: VOS's work after the slices (12c, 12d); the pallet the teammate's; the live leg (M3b's deferred gate 2) waits on both | 6.0e, 6.17b |
+| key custody of the nodes' sr25519 keys | decision 12 (one per node, no balance); the requirements in `spaces-pallet.md` §9.1, for VOS's port | 6.17b |
 | a compromised authority drains the sovereign account at block speed | the spend budget per window, refused before inclusion (design §7; G13) | 6.17 |
 | an anchor refused as `WindowInFuture` near a boundary and lost | the client reads the venue's time first, waits and resubmits (design §9; G4; 6.17b) | 6.17b |
 | a registration resubmitted with another `start_window` | the window in the registration digest, and bounded (pin D; G1) | 6.10, 6.17 |
-| the `kreivo` venue used before the pallet meets the vectors | unselectable in production configuration until the deferred Kreivo gates (1)–(2) pass | 6.17b |
+| Kreivo used before the pallet meets the vectors | no transport in VOS; the ported one behind a development-only feature until the deferred Kreivo gates (1)–(2) pass | 6.17b |
 | a JAM package over CE 133's 204,802 B is refused at submission (statements and the agent's builder) | the proof as an extrinsic, measured first; `fit.rs`'s payload bound; `fetch` per-kind prices | 6.19 |
 | the worker lags the window cadence | 6.18's throughput gate; L bounded below by it; the prover-time levers | 6.18 |
 | a masked format iteration re-pins every venue | 39 lands once at 6.4, before 6.17 and 6.19; any later change takes a new number | 6.4 |

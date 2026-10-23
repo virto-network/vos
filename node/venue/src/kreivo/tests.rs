@@ -22,7 +22,7 @@ use super::mock::transport::{Fault, MockChain};
 use super::mock::{Account, Chain, Constants, Origin};
 use super::transport::{Included, Lost, SendError, Sent, Signed, Transport};
 use super::venue::{Answer, answer, judged};
-use super::{Alert, KreivoVenue, Options, Sender, selectable};
+use super::{Alert, KreivoVenue, Options, Sender};
 use crate::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
 
 const UNITS: u128 = 1_000_000_000_000;
@@ -747,11 +747,4 @@ fn every_error_and_refusal_is_mapped() {
         );
     }
     assert_eq!(judged(&[], id), None);
-}
-
-/// A build reaches Kreivo only with the `kreivo-unvetted` feature, until
-/// its pallet meets the vectors.
-#[test]
-fn only_an_unvetted_build_reaches_kreivo() {
-    assert_eq!(selectable().is_ok(), cfg!(feature = "kreivo-unvetted"));
 }

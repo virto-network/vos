@@ -9,14 +9,6 @@ description = "A venue as a VOS node reaches it: anchoring a space's roots, subm
 # The reference mock of Kreivo's spaces pallet and a transport over it,
 # for the node's tests.
 mock = []
-# The Kreivo client's chain transport: subxt over a Kreivo node's RPC.
-kreivo = ["dep:scale-info", "dep:subxt", "dep:subxt-signer", "dep:tokio"]
-# Lets the Kreivo client reach a chain: until Kreivo's spaces pallet
-# passes the conformance vectors in its runtime and the end to end run on
-# a Kreivo dev chain (M3b's deferred gates 1 and 2), only development,
-# tests and those runs build with it, never a release. The feature goes
-# once they pass.
-kreivo-unvetted = ["kreivo"]
 
 [dependencies]
 blake2 = "0.10"
@@ -26,20 +18,12 @@ ed25519-dalek = "2"
 # `twox64`, `blake2_128`).
 parity-scale-codec = { version = "3.7.5", features = ["derive", "std"] }
 tracing = "0.1"
-# The node's Kreivo account key, zeroed when dropped.
-zeroize = "1.8"
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 vos-anchor = { workspace = true }
 # A JAM statements service, reached through its client.
 vos-jam = { workspace = true }
 vos-statement = { workspace = true }
 vos-statement-service = { workspace = true }
-# Kreivo's chain: the envelope from its live metadata, signed with the
-# node's sr25519 account key.
-scale-info = { version = "2.11.6", optional = true, default-features = false }
-subxt = { version = "=0.51.1", optional = true, features = ["reconnecting-rpc-client"] }
-subxt-signer = { version = "=0.51.1", optional = true, features = ["sr25519"] }
-tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "time"] }
 
 [dev-dependencies]
 # The conformance vectors, as JSON.
@@ -50,7 +34,3 @@ serde_json = "1"
 vos-statement = { workspace = true, features = ["fixtures"] }
 vos-pvm-final-verifier = { workspace = true }
 stwo = { workspace = true }
-
-[[example]]
-name = "kreivo_dev"
-required-features = ["kreivo-unvetted"]

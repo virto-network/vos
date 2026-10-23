@@ -132,7 +132,7 @@ fmt-check:
 # item.
 doc-check:
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc --workspace --no-deps --quiet }
-    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue --features kreivo-unvetted,mock --no-deps --quiet }
+    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue --features mock --no-deps --quiet }
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
@@ -141,18 +141,11 @@ clippy:
     cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-proof --features debug-internals --all-targets --quiet -- -D warnings
     just clippy-prover
-    just clippy-kreivo
 
 # The node and `vos` with the masked prover (`prover`): they build and lint
 # clean.
 clippy-prover:
     cargo clippy -p vos-node -p vos-cli --features vos-node/prover,vos-cli/prover --all-targets --quiet -- -D warnings
-
-# The Kreivo client's chain transport, behind the `kreivo` feature: it
-# builds, lints clean, and its envelope's checks pass.
-clippy-kreivo:
-    cargo clippy -p vos-venue -p vos-cli --features vos-venue/mock,vos-cli/kreivo-unvetted --all-targets --quiet -- -D warnings
-    cargo test -p vos-venue --features kreivo --lib kreivo::
 
 # Fails on any JAR remnant in the PVM crates: its ISA and gas modes, opcodes,
 # exits, capability surface, linker entry points, invocation kernel, CSR
@@ -370,7 +363,6 @@ fuzz secs="60":
 check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-kit build-test-actors build-agent build-representative fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     just clippy-prover
-    just clippy-kreivo
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures
     just test-recair
     cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli

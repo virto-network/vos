@@ -42,11 +42,10 @@ use crate::tls::IngressTls;
 use crate::{lock, timeout};
 
 pub(crate) use config::Settings;
-pub use config::{Config, Peers, VenueWithAccount};
+pub use config::{Config, Peers};
 pub(crate) use directory::Directory;
 pub use error::{CallError, Error, ReplaceError, Reply};
 pub use open::{ADMIN_TOKEN, NODE_KEY, STORE, wall_clock};
-pub(crate) use open::{new_venue_account, venue_account_secret};
 pub(crate) use queue::{Agent, Answered, Pending};
 
 /// An agent this node replicates: its queue, its group's shared state, the

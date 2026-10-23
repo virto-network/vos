@@ -17,7 +17,6 @@ use vos_wire::ids::AgentId;
 use vos_wire::ids::ProgramHash;
 use vos_wire::ingress::NodeId;
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
-use zeroize::Zeroizing;
 
 use super::{Config, Counters, Directory, Error, Inner, Node, Peers, Run, Settings, Tasks};
 use crate::anchor_keys::AnchorKeys;
@@ -40,7 +39,7 @@ pub const NODE_KEY: &str = "node.key";
 impl Node {
     /// Open the node's data directory `data` (its store and admin token),
     /// join its space and start every agent it replicates.
-    pub fn open(data: impl AsRef<Path>, mut config: Config) -> Result<Self, Error> {
+    pub fn open(data: impl AsRef<Path>, config: Config) -> Result<Self, Error> {
         if config.refine_gas < defaults::min_refine_gas(config.max_inputs.max(1)) {
             return Err(Error::Gas);
         }
@@ -49,14 +48,6 @@ impl Node {
         let store = Fjall::open(data.join(STORE))?;
         let secret = node_secret(&store)?;
         let anchor_keys = AnchorKeys::load(&secret, &store)?;
-        let venue = match (config.venue.take(), config.venue_with_account.take()) {
-            (Some(venue), _) => Some(venue),
-            (None, Some(make)) => {
-                let seed = venue_account_secret(&store)?;
-                Some(make(vos_venue::kreivo::AccountSeed::new(seed)).map_err(Error::Data)?)
-            }
-            (None, None) => None,
-        };
         // Each run's pair heartbeat outranks the last run's, whatever the
         // clock did between them.
         let incarnation = crate::liveness::next_incarnation(store.incarnation()?);
@@ -128,7 +119,7 @@ impl Node {
             clock: config.clock,
             node_id,
             anchor_keys,
-            venue,
+            venue: config.venue,
             number,
             numbers: config
                 .space
@@ -304,30 +295,6 @@ fn node_secret(store: &Fjall) -> Result<[u8; 32], Error> {
     let secret = random();
     let mut batch = store.batch();
     batch.node_secret(&secret);
-    batch.commit(PersistMode::SyncAll)?;
-    Ok(secret)
-}
-
-/// The seed of the node's newest account key at its space's venue: made,
-/// and kept durably, at its first start that asks for it.
-pub(crate) fn venue_account_secret(store: &Fjall) -> Result<Zeroizing<[u8; 32]>, Error> {
-    let seeds = store.venue_account_secrets()?;
-    if let Some(seed) = seeds.into_iter().rev().find_map(|(_, seed)| seed) {
-        return Ok(seed);
-    }
-    new_venue_account(store)
-}
-
-/// Make the node a new account key at its space's venue, numbered past
-/// every one stored, an unreadable one's too, kept durably: its seed.
-pub(crate) fn new_venue_account(store: &Fjall) -> Result<Zeroizing<[u8; 32]>, Error> {
-    let number = store
-        .venue_account_secrets()?
-        .last()
-        .map_or(1, |(number, _)| number + 1);
-    let secret = Zeroizing::new(random::<32>());
-    let mut batch = store.batch();
-    batch.venue_account_secret(number, &secret);
     batch.commit(PersistMode::SyncAll)?;
     Ok(secret)
 }

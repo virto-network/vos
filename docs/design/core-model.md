@@ -1464,11 +1464,15 @@ knowledge and aggregation are the longest work and gate goal 8.
     space's net positions settle, and what a mixer-like space reveals by
     its flows), and collectives that vote.
 18. **The node host and native extensions:** designed for one node in
-    `slice-2-one-node.md`; what remains open is the extension host itself
-    and its multi-node form:
-    - the node process and its scheduler across agents;
-    - storage and networking ownership;
-    - ingress;
-    - how native extensions attach: the HTTP and SSH transports, the
-      prover, the Substrate light client. On master they are small
-      capability adapters behind an extension host.
+    `slice-2-one-node.md`.
+    - **Decided:** the prover is a built-in node component for good, not
+      an extension, because proving is essential to VOS. The HTTP ingress
+      is built in for now.
+    - **Open:** the extension host itself and its multi-node form,
+      deferred until after the planned slices:
+      - the node process and its scheduler across agents;
+      - storage and networking ownership;
+      - ingress;
+      - how native extensions attach: the SSH transport and the Substrate
+        light client. On master they are small capability adapters
+        behind an extension host.
