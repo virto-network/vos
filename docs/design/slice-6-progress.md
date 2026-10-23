@@ -3877,7 +3877,16 @@ and the vectors' completeness. Its findings:
   `SECURITY.md`'s logs row (Stwo's size estimate) fixed; L3 recorded in
   pin D; L3–L5, L7's rest and L8 carried in the plan's 6.22.
 
-Commits: this record.
+**The fold's gates** [measured, at `e579a484`; each under a 12 GiB scope,
+`nice -n 10`, `CARGO_BUILD_JOBS=8`, one heavy run at a time]: `just check`
+green, 108 suites, 1,372 passed, 0 failed (its first run stopped on a
+clippy lint in the new worker test, fixed); `just e2e-chain` green through
+`vos-jam-dev` (`tools/jam-dev/testnet.sh chain`): every verdict as
+expected, the audit clean over 326 carriers and 22 JAM packages with their
+work reports, the run 1,213 s.
+
+Commits: `dd06e6af` (the JAM client as dev tooling, decision 17),
+`e579a484` (the fold), this record.
 
 ## The JAM client as development tooling (decision 17)
 
