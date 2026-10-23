@@ -3767,3 +3767,53 @@ debug-output; clean, every canary in its carrier. 1,150 s.
 - **Gates after the fold:** `just e2e-chain` passed (run 6, above); `just
   check` at `5859c409` green, 105 suites, 1,363 passed, 0 failed (12 GiB
   scope, `nice -n 10`, 8 jobs).
+
+## M3b and M3c accepted: Kreivo's design and kit, the prover worker, the JAM service, end to end
+
+M3b is 6.16, 6.17 and 6.17b: the verifier kit and the spaces pallet's
+design, the reference mock and the conformance vectors, the node's Kreivo
+client. M3c is 6.18–6.21: the prover worker and the reproducibility gate,
+the JAM statements service, the carrier audit, the end to end on chain.
+Their acceptance (the plan's "M3b acceptance", and 6.21's gate) at
+`vos-core` `68570481`.
+
+**Gates** [measured; each under a 12 GiB scope, `nice -n 10`,
+`CARGO_BUILD_JOBS=10`, `CARGO_INCREMENTAL=0`, one heavy run at a time;
+`ci-full`'s recipes run one by one in its order, each heavy part started
+only with 14 GB or more available]:
+- **`ci`** (at `68570481`): green, 120 suites, 1,465 passed, 0 failed,
+  2,093 s (34.9 min, a 30-min wait for memory before `test` not counted).
+  Among them M3b's gates: `vos-venue`'s `kreivo::conformance` (the mock
+  passing every vector, G1–G18; the client passing them through the mock;
+  the vectors their generators', 28 `kreivo` tests in all), and
+  `check-kit` (the kit's standalone `wasm32v1-none` build with no std
+  feature, its sync check refusing a one-byte change in each of 5
+  vendored files, a file added and one removed, a kit's own script, and
+  `VENDOR`'s untagged, malformed or moved names).
+- **`test-proof`:** green, 47 suites (each kernel test a process), 561
+  passed, 0 failed, 3,191 s; `judge-wasm` 31 of 31 fixtures as recorded,
+  under both semantics; the leakage tests at their medium N among them;
+  the carrier audit (`test-carriers`) clean, 41 carriers, every needle
+  kind searched, 87 s.
+- **`test-bench-proof`:** green, 2 passed, 19 s.
+- **`just fuzz 60`:** the seven targets a minute each, no crash, 826 s
+  (`prove_verify_roundtrip` 39 runs in 278 s, its proofs past the
+  minute; the others 1,819–14.9M runs).
+- **The checker loop with cuts and the representative:** seeds 6401–6412
+  × the three exactly-once tests and the cuts run with `CUTS_FULL` (the
+  representative on three nodes, anchoring at the served harness's
+  `ModelVenue`): 48 of 48 green, 1,490 s, load 4.4–7.3 at each seed's end.
+  Per run and agent: 134–371 reads, 110–342 served, 15–48 not served in
+  time, 0 unserved; 257–1,228 samples holding undo rows; 5 cut rows kept;
+  `S_w` the same on every replica at the representative's two latest
+  cuts, each seed; the venue 48–64 anchors a run, one a window, each
+  checked against the replicas' roots, no evidence.
+- **`just e2e-chain`:** passed at 6.21's fold (run 6, above); `68570481`
+  changes only this record, so not rerun.
+- **Failed first:** nothing in the code. The loop's first start failed in
+  its driver (cargo takes one test filter before `--`; the filters moved
+  after it), before any test ran.
+
+**Milestone review: Fable —** _(verdict pending)_
+
+Commits: this record.
