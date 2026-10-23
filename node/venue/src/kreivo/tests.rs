@@ -545,8 +545,13 @@ fn a_refused_key_hands_the_window_back_to_be_signed_again() {
         chain.set_storage(keys::paused(), vec![0]);
     });
     wait_until("the window handed back", || {
-        venue.unsettled(&setup.space) == [5]
+        venue.unsettled(&setup.space) == [setup.anchor(5, 1)]
     });
+    assert_eq!(
+        venue.anchor(&setup.anchor(5, 1)),
+        Err(AnchorRefusal::Key),
+        "its key not listed: not taken again"
+    );
     // Refused by the venue, or unsent once the client read the listing.
     let refused = setup.anchors_sent();
     assert!(refused <= 1);
@@ -731,7 +736,7 @@ fn every_error_and_refusal_is_mapped() {
             WindowTooOld | OutOfRange => Answer::Dead(error),
             SpaceNotActive | Paused => Answer::Wait,
             InsufficientSovereignBalance | OverBudget => Answer::Funding(error),
-            UnknownAnchorKey | BadAnchorSignature => Answer::Resign(error),
+            UnknownAnchorKey => Answer::Resign(error),
             _ => Answer::Configuration,
         };
         assert_eq!(answer(Some(error)), expected, "{error:?}");

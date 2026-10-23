@@ -19,11 +19,12 @@
 //! outcome and the gas, and is written whatever the outcome.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use vos_jam_dev::live::PolkaJam;
 use vos_jam_dev::live::statements::{MIN_ITEM_GAS, Statements};
+use vos_jam_dev::live::{PolkaJam, Watch};
 use vos_jam_dev::venue::{JamVenue, register_code};
 use vos_pvm::refine_host::{JamItem, JamRefine, RefineContext};
 use vos_pvm_compiler::{ServiceMetadata, service_blob};
@@ -159,11 +160,21 @@ fn jam_only_gas(
 
 fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
     std::fs::create_dir_all(&args.data).map_err(at(&args.data))?;
+    // Every package the run sends, as it goes: the service's storage is
+    // accounted for against them at the end.
+    let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+    let sending = Arc::clone(&sent);
     let node = PolkaJam {
         rpc: args.rpc.clone(),
         jamt: args.polkajam.join("jamt"),
         files: args.data.join("files"),
-        watch: None,
+        watch: Some(Watch(Arc::new(
+            move |package: &[u8], _: &[Vec<u8>], answered: Option<bool>| {
+                if answered.is_none() {
+                    lock(&sending).push(package.to_vec());
+                }
+            },
+        ))),
     };
     let parameters = node.parameters()?;
     record.note(format!("testnet: {parameters:?}"));
@@ -206,6 +217,7 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
     let venue = JamVenue::new(statements, config.clone(), &blob)
         .map_err(|mismatch| format!("the service's code: {mismatch:?}"))?;
     record.note(format!("the venue {}", hex::encode(venue.id().0)));
+    let baseline = venue.statements.entries(0)?;
 
     // A proof of `MAX_PROOF_BYTES` as an extrinsic: the package past CE
     // 133's bound but for it, read whole by refine.
@@ -394,7 +406,25 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
     }
     migrated.map_err(|refusal| format!("the migration refused: {refusal:?}"))?;
     record.note("every verdict as expected");
+    let accounting = venue.statements.account(baseline, || lock(&sent).clone())?;
+    record.note(format!(
+        "the service's storage: {} entries, {} named from the {} packages sent, {} outcomes \
+         among them",
+        accounting.held,
+        accounting.named,
+        lock(&sent).len(),
+        accounting.outcomes
+    ));
+    if accounting.held != accounting.named {
+        return Err("the service holds entries no package the run sent names".into());
+    }
     Ok(())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The outcome's refine gas against the JAM-only host's for the same item.

@@ -7,9 +7,10 @@
 //! codes), mapped onto the trait's. An anchor is queued and answered at
 //! once (`Anchored::Queued`): the [`AnchorQueue`]'s worker lands it, again
 //! while the venue is not ready for it, until the venue holds it or will
-//! never take it; one refused as signed (its key not listed, its
-//! signature) is dropped, its window handed back to the leader to sign
-//! again ([`VenueClient::unsettled`]). Every refusal but `Open` alerts. A statement's code is its refusal's class; a repeat (6)
+//! never take it; one whose key the service does not list is handed back
+//! to the leader to sign again with a key it lists
+//! ([`VenueClient::unsettled`]), and the same anchor offered again is
+//! refused for its key. Every refusal but `Open` alerts. A statement's code is its refusal's class; a repeat (6)
 //! is the venue holding it accepted; a transport failure, or a package that
 //! never lands, leaves it unjudged (`Unjudged::Unknown`).
 //!
@@ -126,6 +127,28 @@ impl AnchorSend for JamSend {
         }
         fate
     }
+
+    fn settled(&self, anchor: &Anchor) -> bool {
+        JamSend::settled(self, anchor)
+    }
+}
+
+impl JamSend {
+    /// Whether the service no longer needs `anchor`: its space's last
+    /// anchored window at or past it, or the window past `MaxRootAge` by
+    /// the finalized block's time. False while the node cannot say.
+    fn settled(&self, anchor: &Anchor) -> bool {
+        let (Ok(Some(space)), Ok(now)) = (self.0.space(&anchor.space), self.0.statements.now())
+        else {
+            return false;
+        };
+        let passed = space.last.is_some_and(|last| last >= anchor.window);
+        let aged = space
+            .clock
+            .boundary(anchor.window)
+            .is_some_and(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS);
+        passed || aged
+    }
 }
 
 /// What becomes of an anchor the service answered `code`.
@@ -139,9 +162,7 @@ fn fate(code: u32) -> Fate {
             Fate::Dead
         }
         code if code == AnchorCode::Open as u32 => Fate::Again(SLOT),
-        code if code == AnchorCode::Key as u32 || code == AnchorCode::Signature as u32 => {
-            Fate::Resign
-        }
+        code if code == AnchorCode::Key as u32 => Fate::Resign,
         _ => Fate::Again(AWHILE),
     }
 }
@@ -281,8 +302,9 @@ impl VenueClient for JamVenue {
     }
 
     /// Queued, answered at once: an anchor not signed by its signer over
-    /// its digest here is refused, and one of a window the service refused
-    /// for good; the rest the queue's worker lands.
+    /// its digest here is refused, one of a window the service refused for
+    /// good, and the one handed back for its key; the rest the queue's
+    /// worker lands.
     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
         let signed = VerifyingKey::from_bytes(&anchor.signer).is_ok_and(|key| {
             key.verify_strict(
@@ -297,7 +319,9 @@ impl VenueClient for JamVenue {
         if self.queue.dead(&anchor.space, anchor.window) {
             return Err(AnchorRefusal::Window);
         }
-        self.queue.push(anchor);
+        if !self.queue.push(anchor) {
+            return Err(AnchorRefusal::Key);
+        }
         Ok(Anchored::Queued)
     }
 
@@ -361,7 +385,7 @@ impl VenueClient for JamVenue {
         self.statements.now().ok()
     }
 
-    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
         self.queue.unsettled(space)
     }
 }
@@ -387,9 +411,10 @@ pub fn register_code(code: u32) -> &'static str {
 mod tests {
     use super::*;
 
-    /// A key or signature refused hands the window back to be signed
-    /// again; an unregistered or suspended space waits; a window the
-    /// service will never take is dead.
+    /// A key refused hands the anchor back to be signed again; a
+    /// signature refused waits, since signing again with the same key
+    /// makes the same signature; an unregistered or suspended space waits;
+    /// a window the service will never take is dead.
     #[test]
     fn each_anchor_code_has_its_fate() {
         use AnchorCode::*;
@@ -397,7 +422,7 @@ mod tests {
             (New, Fate::Done),
             (Again, Fate::Done),
             (Item, Fate::Again(AWHILE)),
-            (Signature, Fate::Resign),
+            (Signature, Fate::Again(AWHILE)),
             (Unregistered, Fate::Again(AWHILE)),
             (Suspended, Fate::Again(AWHILE)),
             (Key, Fate::Resign),

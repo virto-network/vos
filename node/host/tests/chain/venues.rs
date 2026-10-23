@@ -143,7 +143,7 @@ impl VenueClient for Recorded {
         self.inner.time()
     }
 
-    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
         self.inner.unsettled(space)
     }
 }
@@ -276,7 +276,7 @@ impl VenueClient for Migrating {
         self.current().time()
     }
 
-    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
         self.current().unsettled(space)
     }
 }

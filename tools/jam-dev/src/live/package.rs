@@ -102,6 +102,37 @@ pub fn encode_package(context: &Context, items: &[WorkItem]) -> Vec<u8> {
     out
 }
 
+/// The payloads of the items of `package`, as [`encode_package`] lays
+/// them out: none for bytes it does not make.
+pub fn payloads(package: &[u8]) -> Option<Vec<Vec<u8>>> {
+    let nat = |at: usize| vos_pvm_program::read_nat(package, at);
+    // Its authorization and context, then no prerequisites, token or
+    // configuration.
+    let mut at = 4 + 32 + (32 + 4 + 32 + 32) + (32 + 4 + 32);
+    if package.get(at..at + 3)? != [0, 0, 0] {
+        return None;
+    }
+    at += 3;
+    let (count, used) = nat(at)?;
+    at += used;
+    let mut payloads = Vec::new();
+    for _ in 0..count {
+        at += 4 + 32 + 8 + 8 + 2;
+        let (length, used) = nat(at)?;
+        at += used;
+        let end = at.checked_add(usize::try_from(length).ok()?)?;
+        payloads.push(package.get(at..end)?.to_vec());
+        at = end;
+        // No imports, then the extrinsics' hashes and lengths.
+        if *package.get(at)? != 0 {
+            return None;
+        }
+        let (extrinsics, used) = nat(at + 1)?;
+        at += 1 + used + usize::try_from(extrinsics).ok()? * (32 + 4);
+    }
+    (at == package.len()).then_some(payloads)
+}
+
 /// A header's hash as the RPC gives it, base64.
 fn header(value: &serde_json::Value) -> Result<(String, Hash), Error> {
     let text = value
@@ -196,6 +227,17 @@ impl PolkaJam {
         })
     }
 
+    /// The items `service`'s account counts at block `head` (`a_i`, the
+    /// account's encoding past its version byte, code hash and five 8-byte
+    /// fields): two a preimage lookup, one a storage entry.
+    pub fn service_items(&self, head: &str, service: u64) -> Result<u32, Error> {
+        let data = decoded(&self.call("serviceData", json!([head, service]))?)?
+            .ok_or_else(|| failed(format!("no service {service}")))?;
+        data.get(73..77)
+            .and_then(|items| Some(u32::from_le_bytes(items.try_into().ok()?)))
+            .ok_or_else(|| failed("a service account cut short"))
+    }
+
     /// The code hash of `service` at the finalized block: the first field
     /// of its account's encoding, past its version byte.
     pub fn code_hash(&self, service: u64) -> Result<Hash, Error> {
@@ -242,6 +284,41 @@ mod tests {
     /// The package `jamt` 0.1.29 submitted for a 1,000-byte payload to
     /// service 0, encoded again from its fields: byte for byte, 266 bytes
     /// past its payload; and the extrinsics named after the payload.
+    /// A package's payloads are read back from its encoding; bytes it does
+    /// not make are not.
+    #[test]
+    fn a_packages_payloads_are_read_back() {
+        let context = Context {
+            anchor: Block {
+                hash: [1; 32],
+                slot: 5,
+                state_root: [2; 32],
+            },
+            beefy_root: [3; 32],
+            lookup: Block {
+                hash: [4; 32],
+                slot: 4,
+                state_root: [5; 32],
+            },
+        };
+        let item = |payload: Vec<u8>, extrinsics: Vec<Vec<u8>>| WorkItem {
+            service: 3,
+            code_hash: [6; 32],
+            refine_gas: 7,
+            accumulate_gas: 8,
+            payload,
+            extrinsics,
+        };
+        let items = [
+            item(vec![9; 300], vec![vec![1; 10], vec![2; 20]]),
+            item(vec![7; 5], Vec::new()),
+        ];
+        let package = encode_package(&context, &items);
+        assert_eq!(payloads(&package), Some(vec![vec![9; 300], vec![7; 5]]));
+        assert_eq!(payloads(&package[..package.len() - 1]), None);
+        assert_eq!(payloads(&[package.clone(), vec![0]].concat()), None);
+    }
+
     #[test]
     fn a_package_encodes_as_jamts() {
         let hash = |text: &str| -> Hash { hex::decode(text).unwrap().try_into().unwrap() };

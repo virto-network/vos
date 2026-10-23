@@ -58,8 +58,8 @@ impl Leader {
     }
 
     /// How long until an idle leader hands the venue a waiting anchor
-    /// again, a recheck after the last try, or takes up again the anchors
-    /// left waiting ([`Leader::reseed_wait`]); none while neither is due.
+    /// again, a recheck after the last try, or takes up anchors left
+    /// waiting ([`Leader::reseed_wait`]); none while neither is due.
     pub(super) fn anchor_wait(&self) -> Option<Duration> {
         let waiting = (!self.unanchored.is_empty()).then(|| {
             let since = self.anchor_tried.map_or(ANCHOR_RECHECK, |at| at.elapsed());
@@ -68,43 +68,58 @@ impl Leader {
         waiting.into_iter().chain(self.reseed_wait()).min()
     }
 
-    /// How long until the representative's leader takes up again the
-    /// anchors left waiting ([`Leader::seed_waiting`]): a window length
-    /// after it last did, or a recheck after it while the venue's client
-    /// holds windows handed back to be signed again
-    /// ([`vos_venue::VenueClient::unsettled`]). None before this
-    /// leadership's first batch, which takes them up, or with no venue.
+    /// The anchors the venue's client handed back to be signed again
+    /// ([`vos_venue::VenueClient::unsettled`]) that this leadership has
+    /// not taken up, nor settled for good.
+    fn handed_back(&self) -> Vec<Anchor> {
+        let Some(venue) = self.inner.venue.as_ref() else {
+            return Vec::new();
+        };
+        let (space, _) = self.inner.space_and_clock();
+        venue
+            .unsettled(&space)
+            .into_iter()
+            .filter(|anchor| {
+                !self.unanchored.contains_key(&anchor.window)
+                    && !self.refused.contains(&anchor.window)
+            })
+            .collect()
+    }
+
+    /// How long until the representative's leader takes up anchors left
+    /// waiting: at once for one the venue's client handed back, and its
+    /// cut roots ([`Leader::seed_waiting`]) a window length after it last
+    /// did. None before this leadership's first batch, which takes them
+    /// up, or with no venue.
     fn reseed_wait(&self) -> Option<Duration> {
-        let venue = self.inner.venue.as_ref()?;
+        self.inner.venue.as_ref()?;
         let seeded = self.seeded?;
         if !self.represents() {
             return None;
         }
-        let (space, clock) = self.inner.space_and_clock();
-        let every = if venue.unsettled(&space).is_empty() {
-            Duration::from_millis(clock.length_ms)
-        } else {
-            ANCHOR_RECHECK
-        };
-        Some(every.saturating_sub(seeded.elapsed()))
+        if !self.handed_back().is_empty() {
+            return Some(Duration::ZERO);
+        }
+        let (_, clock) = self.inner.space_and_clock();
+        Some(Duration::from_millis(clock.length_ms).saturating_sub(seeded.elapsed()))
     }
 
-    /// Whether to take up the anchors left waiting now: at a leadership's
-    /// first batch, then when [`Leader::reseed_wait`] says. A window the
-    /// venue's client handed back is no longer settled, so a close not yet
-    /// sent hands it over again too.
-    fn reseed_due(&mut self) -> bool {
-        let Some(venue) = self.inner.venue.clone() else {
-            return false;
-        };
-        if !self.represents() {
+    /// Take up the anchors the venue's client handed back: each root
+    /// signed again, by the newest key the venue lists, whether or not
+    /// this replica still keeps its cut root. Whether to take up the cut
+    /// roots' too: at a leadership's first batch, then a window length
+    /// after it last did.
+    fn take_up(&mut self) -> bool {
+        if self.inner.venue.is_none() || !self.represents() {
             return false;
         }
-        let (space, _) = self.inner.space_and_clock();
-        for window in venue.unsettled(&space) {
-            self.anchored.remove(&window);
+        for anchor in self.handed_back() {
+            self.anchored.remove(&anchor.window);
+            self.unanchored.insert(anchor.window, anchor.root);
         }
-        let due = self.reseed_wait().is_none_or(|wait| wait.is_zero());
+        let (_, clock) = self.inner.space_and_clock();
+        let every = Duration::from_millis(clock.length_ms);
+        let due = self.seeded.is_none_or(|at| at.elapsed() >= every);
         if due {
             self.seeded = Some(Instant::now());
         }
@@ -163,16 +178,18 @@ impl Leader {
     /// in window order, each window's anchor handed to the venue first
     /// ([`Leader::anchor_due`]).
     pub(super) fn closes(&mut self, snapshot: &Snapshot) -> Result<Closes, Fault> {
-        if self.reseed_due() {
+        if self.take_up() {
             self.seed_waiting(snapshot)?;
         }
         let unsent = unsent(snapshot, self.id, self.represents())?;
         let first = unsent.first().map(|(window, _)| *window);
         self.anchored
             .retain(|window| first.is_some_and(|first| *window >= first));
+        let (space, _) = self.inner.space_and_clock();
         for (window, closing) in &unsent {
             if !self.anchored.contains(window) {
-                self.unanchored.entry(*window).or_insert(closing.root);
+                let root = space_root(&space, *window, &closing.root);
+                self.unanchored.entry(*window).or_insert(root);
             }
         }
         self.anchor_due();
@@ -252,10 +269,13 @@ impl Leader {
                 root: space_root(&space, window, &root),
             });
             if !held {
+                let root = space_root(&space, window, &root);
                 self.unanchored.entry(window).or_insert(root);
             }
         }
-        self.refused.retain(|window| kept.contains(window));
+        let back: Vec<u64> = venue.unsettled(&space).iter().map(|a| a.window).collect();
+        self.refused
+            .retain(|window| kept.contains(window) || back.contains(window));
         Ok(())
     }
 
@@ -300,13 +320,13 @@ impl Leader {
         }
     }
 
-    /// Sign the anchor of the space's root of window `window`, over the
-    /// representative's root at its cut `rep_root`, with the newest of this
+    /// Sign the anchor of the space's root `root` of window `window` (`S_w`,
+    /// over the representative's root at its cut), with the newest of this
     /// node's anchor keys the venue lists, and hand it to the venue:
     /// whether that settled it, taken or refused for good. With no key of
     /// this node's listed it signs nothing, and alerts. Synchronous, inside
     /// the batch: a venue's client queues and answers at once.
-    fn anchor(&mut self, window: u64, rep_root: &[u8; 32]) -> bool {
+    fn anchor(&mut self, window: u64, root: &[u8; 32]) -> bool {
         let Some(venue) = self.inner.venue.clone() else {
             return true;
         };
@@ -341,7 +361,7 @@ impl Leader {
             space,
             window,
             kind: RootKind::Space,
-            root: space_root(&space, window, rep_root),
+            root: *root,
             signer: key.verifying_key().to_bytes(),
             signature: [0; 64],
         };

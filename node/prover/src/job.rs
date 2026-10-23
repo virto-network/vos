@@ -21,6 +21,13 @@ pub const REFUSED_KERNEL: u32 = 0x1_0002;
 /// ([`REFUSED_KERNEL`]): a kernel whose proof panics or stops the node.
 pub const MAX_ATTEMPTS: u32 = 3;
 
+/// The times a statement goes again after a venue failed to judge it
+/// (from `0x1000`: on JAM, refine out of gas, a panic, an undecodable
+/// verdict, each likely the same the next time), or, for a rootless
+/// statement, whose anchor sets no deadline, after its answer was lost:
+/// then it is refused with that code, or dead.
+pub const MAX_RESUBMITS: u32 = 4;
+
 /// How far a statement's job has come.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum State {

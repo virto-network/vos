@@ -75,6 +75,10 @@ impl VenueClient for Judging {
     fn time(&self) -> Option<u64> {
         self.model.time()
     }
+
+    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
+        self.model.unsettled(space)
+    }
 }
 
 /// A prover whose proofs differ each time, as masked proofs do, each

@@ -7,9 +7,12 @@
 //! long wait taken up after a failover; a rotation whose process
 //! is killed before the venue lists the key, which the node keeps; windows
 //! refused while the venue's client answers the space unregistered,
-//! anchored once it reads the registration; and a
-//! queued anchor whose key the venue stops listing before it lands, signed
-//! again by the new key.
+//! anchored once it reads the registration; and, through a client that
+//! queues its anchors, one whose key the venue stops listing before it
+//! lands signed again by the new key, one refused for a key the client
+//! still lists not sent again until the listing changes, and windows
+//! handed back after their cut roots are dropped signed again from the
+//! anchors themselves, in order.
 //!
 //! The windows are an hour long (`cuts::clock`), and the tests move the
 //! nodes' clocks and the venue's past each window's close, `B_w + D`.
@@ -17,8 +20,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::{Signer, SigningKey};
@@ -30,7 +33,7 @@ use vos_wire::WindowClock;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::Unplaced;
 use vos_wire::keys;
-use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
+use vos_wire::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceId, VenueId};
 
 use crate::common::{Cluster, wait_until};
 use crate::cuts::{clock, set_clock};
@@ -494,6 +497,10 @@ impl VenueClient for Unread {
     fn time(&self) -> Option<u64> {
         self.venue.time()
     }
+
+    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
+        self.venue.unsettled(space)
+    }
 }
 
 /// Windows 0 and 1 close while the venue answers the space unregistered,
@@ -524,24 +531,70 @@ fn windows_refused_unregistered_are_anchored_once_registered() {
 
 /// The model venue reached through an [`AnchorQueue`], as a client of a
 /// chain reaches its venue: an anchor queued and answered at once, then
-/// sent until the venue takes it; one refused as signed handed back.
+/// sent until the venue takes it; one whose key the venue does not list
+/// handed back. Its listing of anchor keys may be held at an older read
+/// (`stale`), as a client's lags the chain.
 struct Queued {
     venue: Arc<ModelVenue>,
     queue: AnchorQueue,
+    sends: Arc<AtomicUsize>,
+    stale: Mutex<Option<Vec<[u8; 32]>>>,
 }
 
-struct Sending(Arc<ModelVenue>);
+impl Queued {
+    fn over(venue: &Arc<ModelVenue>) -> Arc<Self> {
+        let sends = Arc::new(AtomicUsize::new(0));
+        let sending = Sending(Arc::clone(venue), Arc::clone(&sends));
+        Arc::new(Self {
+            venue: Arc::clone(venue),
+            queue: AnchorQueue::spawn("test-queued-anchors", sending),
+            sends,
+            stale: Mutex::new(None),
+        })
+    }
+
+    /// A single node anchoring through `self`.
+    fn cluster(self: &Arc<Self>, clock: WindowClock) -> Cluster {
+        let client: Arc<dyn VenueClient> = self.clone();
+        Cluster::in_space(1, Some(clock), move |_, config: &mut Config| {
+            config.venue = Some(Arc::clone(&client));
+        })
+    }
+}
+
+/// How the queue sends to the model venue, counting each send.
+struct Sending(Arc<ModelVenue>, Arc<AtomicUsize>);
 
 impl AnchorSend for Sending {
     fn send(&self, anchor: &Anchor) -> Fate {
+        self.1.fetch_add(1, Ordering::SeqCst);
         match self.0.anchor(anchor) {
             Ok(_) => Fate::Done,
             Err(AnchorRefusal::Open | AnchorRefusal::Unregistered | AnchorRefusal::Suspended) => {
                 Fate::Again(Duration::from_millis(50))
             }
-            Err(AnchorRefusal::Key | AnchorRefusal::Signature) => Fate::Resign,
+            Err(AnchorRefusal::Key) => Fate::Resign,
             Err(_) => Fate::Dead,
         }
+    }
+
+    /// The venue's last anchored window at or past it, or aged.
+    fn settled(&self, anchor: &Anchor) -> bool {
+        let passed = self
+            .0
+            .anchors(&anchor.space)
+            .iter()
+            .any(|held| held.window >= anchor.window);
+        let aged = self
+            .0
+            .time()
+            .zip(self.0.clock(&anchor.space))
+            .is_some_and(|(now, clock)| {
+                clock
+                    .boundary(anchor.window)
+                    .is_some_and(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS)
+            });
+        passed || aged
     }
 }
 
@@ -551,7 +604,9 @@ impl VenueClient for Queued {
     }
 
     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        self.queue.push(anchor);
+        if !self.queue.push(anchor) {
+            return Err(AnchorRefusal::Key);
+        }
         Ok(Anchored::Queued)
     }
 
@@ -564,7 +619,8 @@ impl VenueClient for Queued {
     }
 
     fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        self.venue.anchor_keys(space)
+        let stale = self.stale.lock().unwrap().clone();
+        stale.unwrap_or_else(|| self.venue.anchor_keys(space))
     }
 
     fn status(&self, space: &SpaceId) -> Status {
@@ -575,45 +631,145 @@ impl VenueClient for Queued {
         self.venue.time()
     }
 
-    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
         self.queue.unsettled(space)
     }
+}
+
+/// Set node `number`'s clock past `window`'s close, leaving the venue's,
+/// and wait until its replica of the representative has closed it.
+fn node_closed(cluster: &Cluster, clock: &WindowClock, representative: AgentId, window: u64) {
+    set_clock(
+        cluster,
+        1,
+        clock.boundary(window).unwrap() + delay(clock) + 1_000,
+    );
+    wait_until(
+        &format!("the representative closes window {window}"),
+        || {
+            vos_checker::applied::<(u64, Option<AgentId>)>(
+                cluster.node(1).store(),
+                representative,
+                &keys::close_mark(),
+            )
+            .is_some_and(|(closed, _)| closed >= window)
+        },
+    );
 }
 
 /// The node's anchor of window 0 is queued while the venue's clock has not
 /// closed the window; before it lands, the node rotates its key and the
 /// controller lists the new one and removes the old. The venue refuses the
-/// queued anchor's key, the client hands the window back, and the same
-/// leader signs it again with the new key, which the venue takes.
+/// queued anchor's key, the client hands it back, and the same leader
+/// signs it again with the new key, which the venue takes.
 #[test]
 fn a_queued_anchor_whose_key_is_removed_is_signed_again() {
     let clock = clock();
     let anchoring = Anchoring::new();
-    let queued = Arc::new(Queued {
-        venue: Arc::clone(&anchoring.venue),
-        queue: AnchorQueue::spawn("test-queued-anchors", Sending(Arc::clone(&anchoring.venue))),
-    });
-    let client: Arc<dyn VenueClient> = queued.clone();
-    let cluster = Cluster::in_space(1, Some(clock), move |_, config: &mut Config| {
-        config.venue = Some(Arc::clone(&client));
-    });
+    let queued = Queued::over(&anchoring.venue);
+    let cluster = queued.cluster(clock);
     anchoring.register(&cluster);
-    cluster.representative(&[1]);
+    let representative = cluster.representative(&[1]);
     let space = cluster.space.id();
     let venue = &anchoring.venue;
     let old = cluster.node(1).anchor_keys()[0];
     // The venue's clock a minute into window 0, the node's past its close.
-    let close = clock.boundary(0).unwrap() + delay(&clock) + 1_000;
-    set_clock(&cluster, 1, close);
+    node_closed(&cluster, &clock, representative, 0);
     wait_until("window 0's anchor queued", || queued.queue.holds(&space, 0));
     assert!(windows(&anchoring, &cluster).is_empty(), "the window open");
     let new = cluster.node(1).rotate_anchor_key().unwrap();
     assert!(venue.add_anchor_key(&space, new));
     assert!(venue.remove_anchor_key(&space, &old));
-    anchoring.set_venue(close);
+    anchoring.set_venue(clock.boundary(0).unwrap() + delay(&clock) + 1_000);
     wait_until("window 0 anchored", || {
         !windows(&anchoring, &cluster).is_empty()
     });
     assert_eq!(venue.anchors(&space)[0].signer, new, "signed again");
+    assert!(venue.evidence().is_empty());
+}
+
+/// A key refused while the client's listing still names it: the window is
+/// handed back, the leader signs it again with that key, as the listing it
+/// reads says, and the client refuses that anchor for its key, sending
+/// nothing. No anchor goes again until the listing changes; then the new
+/// key's lands.
+#[test]
+fn a_key_refused_is_not_sent_again_until_the_listing_changes() {
+    let clock = clock();
+    let anchoring = Anchoring::new();
+    let queued = Queued::over(&anchoring.venue);
+    let cluster = queued.cluster(clock);
+    anchoring.register(&cluster);
+    let representative = cluster.representative(&[1]);
+    let space = cluster.space.id();
+    let venue = &anchoring.venue;
+    let old = cluster.node(1).anchor_keys()[0];
+    node_closed(&cluster, &clock, representative, 0);
+    wait_until("window 0's anchor queued", || queued.queue.holds(&space, 0));
+    let new = cluster.node(1).rotate_anchor_key().unwrap();
+    *queued.stale.lock().unwrap() = Some(vec![old]);
+    assert!(venue.add_anchor_key(&space, new));
+    assert!(venue.remove_anchor_key(&space, &old));
+    anchoring.set_venue(clock.boundary(0).unwrap() + delay(&clock) + 1_000);
+    wait_until("window 0 handed back", || {
+        queued.queue.unsettled(&space).len() == 1
+    });
+    let sent = queued.sends.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_secs(7));
+    assert_eq!(
+        queued.sends.load(Ordering::SeqCst),
+        sent,
+        "nothing sent while the listing is the same"
+    );
+    assert_eq!(queued.queue.unsettled(&space).len(), 1, "still handed back");
+    *queued.stale.lock().unwrap() = None;
+    wait_until("window 0 anchored", || {
+        !windows(&anchoring, &cluster).is_empty()
+    });
+    assert_eq!(venue.anchors(&space)[0].signer, new);
+}
+
+/// The node closes windows 0 to 5 while the venue's clock is still in
+/// window 0, so window 0's cut root is no longer kept; then its key is
+/// rotated out. Each window's anchor is handed back in turn, window 0's
+/// root signed again from the anchor itself, and every window lands under
+/// the new key, in order.
+#[test]
+fn a_window_handed_back_after_its_cut_root_is_pruned_is_signed_again() {
+    let clock = clock();
+    let anchoring = Anchoring::new();
+    let queued = Queued::over(&anchoring.venue);
+    let cluster = queued.cluster(clock);
+    anchoring.register(&cluster);
+    let representative = cluster.representative(&[1]);
+    let space = cluster.space.id();
+    let venue = &anchoring.venue;
+    let old = cluster.node(1).anchor_keys()[0];
+    for window in 0..=5 {
+        node_closed(&cluster, &clock, representative, window);
+    }
+    wait_until("window 0's cut root dropped", || {
+        roots::cut_root(&cluster.node(1).store().snapshot(), representative, 0)
+            .unwrap()
+            .is_none()
+    });
+    assert!(
+        windows(&anchoring, &cluster).is_empty(),
+        "every window open"
+    );
+    let new = cluster.node(1).rotate_anchor_key().unwrap();
+    assert!(venue.add_anchor_key(&space, new));
+    assert!(venue.remove_anchor_key(&space, &old));
+    anchoring.set_venue(clock.boundary(5).unwrap() + delay(&clock) + 1_000);
+    wait_until("windows 0 to 5 anchored", || {
+        windows(&anchoring, &cluster).len() == 6
+    });
+    assert_eq!(windows(&anchoring, &cluster), [0, 1, 2, 3, 4, 5]);
+    assert!(
+        venue
+            .anchors(&space)
+            .iter()
+            .all(|anchor| anchor.signer == new)
+    );
     assert!(venue.evidence().is_empty());
 }

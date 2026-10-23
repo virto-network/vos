@@ -861,7 +861,8 @@ tag's, byte for byte.
   which their venue-bound statements name.
 - **G7** covers codes 1–5, 7 and `0x1xx`: a repeat (6) releases its
   deposit (§6.3), so it is G8's. It then submits the fixture itself while
-  its format is stored but not yet active (2), while its program's
+  its format is retired (`until_ms` now) and while it is not yet active
+  (2), while its program's
   `until_ms` is now and while its `from_ms` is later (3), and once it is
   active (accepted): a pallet that checks a format's or program's presence
   and not its window fails it.

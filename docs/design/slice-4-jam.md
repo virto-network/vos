@@ -704,7 +704,9 @@ JAM, so a step's `gas_used` is the same on both hosts:
 - **The CI surface check pins PolkaJam's prices** for the calls 4.0
   measured, so a change in either host shows.
 
-**The builder** (`node/jam`, a library and `vos jam` commands):
+**The builder** (`node/jam`, a library and `vos jam` commands; the
+PolkaJam client and the commands are development tooling now,
+`tools/jam-dev`'s `vos-jam-dev`, slice 6's decision 17):
 - it holds the agent's full state in a node store, with one root over
   the whole keyspace;
 - it assembles a batch from its own queue;
@@ -865,7 +867,8 @@ on it.
 
 ### 4.9 The builder and the milestone
 
-- `node/jam` and `vos jam`: the store with one root over the whole
+- `node/jam` and `vos jam` (now `vos-jam-dev`, `tools/jam-dev`): the
+  store with one root over the whole
   keyspace, submission, waiting for code availability, the service's
   metadata in the compiler's linker.
 - **On a local PolkaJam testnet:**

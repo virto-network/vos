@@ -268,7 +268,7 @@ impl From<OriginJson> for Origin {
 /// A part of a call's bytes: hex, a range of a kit fixture file, or one
 /// byte repeated.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+#[serde(untagged, deny_unknown_fields)]
 pub enum Part {
     Hex(String),
     Fixture {
@@ -299,10 +299,9 @@ fn hex_parts(bytes: &[u8]) -> Vec<Part> {
             if plain < at {
                 out.push(Part::Hex(hex(&bytes[plain..at])));
             }
-            out.push(Part::Repeat {
-                repeat: hex(&[bytes[at]]),
-                count: run,
-            });
+            let repeat = hex(&[bytes[at]]);
+            assert_eq!(repeat.len(), 2, "a repeat of one byte");
+            out.push(Part::Repeat { repeat, count: run });
             plain = at + run;
         }
         at += run;
@@ -599,7 +598,11 @@ fn assemble(parts: &[Part], files: &[(String, Vec<u8>)]) -> Vec<u8> {
                     .unwrap_or_else(|| panic!("the fixture file {fixture}"));
                 file[*from..*to].to_vec()
             }
-            Part::Repeat { repeat, count } => unhex(repeat).repeat(*count),
+            Part::Repeat { repeat, count } => {
+                let byte = unhex(repeat);
+                assert_eq!(byte.len(), 1, "a repeat of one byte: {repeat}");
+                byte.repeat(*count)
+            }
         })
         .collect()
 }
@@ -770,6 +773,27 @@ fn a_broken_pallet_fails_the_vectors() {
     }
     assert!(passes("G13", |chain| chain));
     assert!(!passes("G13", |chain| chain.broken(Broken::CreditBack)));
+}
+
+/// A part names its form whole: a repeat of one byte, no field unknown.
+#[test]
+fn a_part_is_exactly_one_form() {
+    let part = |json: &str| serde_json::from_str::<Part>(json);
+    assert_eq!(
+        part(r#"{"repeat": "00", "count": 3}"#).unwrap(),
+        Part::Repeat {
+            repeat: "00".into(),
+            count: 3
+        }
+    );
+    assert!(part(r#"{"repeat": "00", "count": 3, "more": 1}"#).is_err());
+    assert!(part(r#"{"fixture": "f", "from": 0, "to": 1, "count": 3}"#).is_err());
+    let two = Part::Repeat {
+        repeat: "0000".into(),
+        count: 2,
+    };
+    let assembled = std::panic::catch_unwind(|| assemble(&[two], &[]));
+    assert!(assembled.is_err(), "a repeat of two bytes");
 }
 
 /// The file names `PruneCursor`'s key, which a pallet may keep for

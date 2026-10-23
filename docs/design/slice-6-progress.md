@@ -3885,8 +3885,48 @@ clippy lint in the new worker test, fixed); `just e2e-chain` green through
 expected, the audit clean over 326 carriers and 22 JAM packages with their
 work reports, the run 1,213 s.
 
+**The fold's own review (Opus): fix, then merge.** Folded:
+- **M-1:** a window handed back held no later window back, so the next
+  could land first and the re-signed one be refused `Window`: a window
+  handed back now holds back its space's later ones in the queue until it
+  is queued again or the venue no longer needs it. Test:
+  `a_window_handed_back_holds_back_its_spaces_later_ones`.
+- **M-2:** `Resign` had no backoff, and re-signing cannot fix a bad
+  signature: only a key refusal hands an anchor back (JAM `Key`, Kreivo 11,
+  or a signer the last read does not list); a signature refusal is
+  `Configuration` (Kreivo 12) or waits (JAM). The handed-back anchor itself,
+  by its signer, is refused `Key` when offered again, so the leader's
+  `key_refused` gate holds until the listing changes. Test:
+  `a_key_refused_is_not_sent_again_until_the_listing_changes` (a client
+  whose listing lags: 140 sends in 7 s without the refusal, none with it).
+- **M-3:** handed-back windows never expired, and one whose cut root was
+  dropped could not be signed again: `VenueClient::unsettled` (required of
+  every client) hands back the anchors, whose roots the leader signs again
+  itself, the leader's waiting anchors now held as `S_w`; the queue drops
+  one the venue holds, or a later window, or past `MaxRootAge` by the
+  venue's time (`AnchorSend::settled`, asked each recheck); the leader
+  takes them up at once and its cut roots once a window length. Tests:
+  `a_window_handed_back_after_its_cut_root_is_pruned_is_signed_again`
+  (windows 0–5 queued under the old key, window 0's cut root dropped, all
+  landing under the new key in order), `a_window_handed_back_is_dropped_once_settled`.
+- **Low:** the dead windows forgotten oldest first
+  (`the_oldest_dead_window_is_forgotten_first`); G7 also submits against a
+  retired format; a `{repeat, count}` part a single byte and no unknown
+  field (`a_part_is_exactly_one_form`); the worker refuses a statement the
+  venue failed to judge after `MAX_RESUBMITS` (4) more submissions, and a
+  rootless statement unjudged as often is dead (`resubmissions_are_bounded`),
+  code 5 still bounded by its anchor's age; the stale `vos jam` and
+  `live::package` references and the `vos-jam-dev` dev-dependency's note.
+- **M5(b)'s assertion:** the service's storage accounted for against the
+  packages watched (`Statements::account`: its account's item count
+  against every entry named from them: outcomes, spaces, statements,
+  anchors, evidence, the pruning's queue, cursor and gas): equal in
+  `jam-statements-testnet` (38 entries, 14 packages, 14 outcomes) and in
+  the end to end for both deployments.
+
 Commits: `dd06e6af` (the JAM client as dev tooling, decision 17),
-`e579a484` (the fold), this record.
+`e579a484` (the fold), `3ecea8b3` (its gates), the review's fold, this
+record.
 
 ## The JAM client as development tooling (decision 17)
 

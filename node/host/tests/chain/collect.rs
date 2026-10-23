@@ -5,8 +5,10 @@
 //! venue's layout (`Tapped`); every work package a JAM client sent, as it
 //! went, with its extrinsics and the work report a guarantor made of it
 //! (anchors, the registration, statements and replays alike: the
-//! deployment's `Wire`); the Kreivo mock's signed envelopes and storage;
-//! both venues' anchor chains; the process's logs and standard error.
+//! deployment's `Wire`), and the service's storage accounted for against
+//! them, so it holds no outcome of a package not watched; the Kreivo mock's
+//! signed envelopes and storage; both venues' anchor chains; the process's
+//! logs and standard error.
 //! The testnet's own log and database, the chain's record of what it was
 //! sent, are searched in every needle's full forms ([`Reach::Recorded`]).
 //! Each capture path is shown to capture: a canary through the logs and
@@ -149,6 +151,29 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
         }
     }
     let reports = [wire(audit, &run.jam_a), wire(audit, &run.jam_b)].concat();
+    for jam in [&run.jam_a, &run.jam_b] {
+        let accounting = jam
+            .venue
+            .statements
+            .account(jam.baseline, || {
+                jam.wire
+                    .sent()
+                    .into_iter()
+                    .map(|sent| sent.package)
+                    .collect()
+            })
+            .expect("the service's storage");
+        run.record.note(format!(
+            "JAM {}'s storage: {} entries, as many named from the packages watched, {} outcomes \
+             among them",
+            jam.name, accounting.held, accounting.outcomes
+        ));
+        assert_eq!(
+            accounting.held, accounting.named,
+            "JAM {}: every outcome the service holds is of a package watched",
+            jam.name
+        );
+    }
     for (n, envelope) in run.kreivo.envelopes().into_iter().enumerate() {
         audit.carrier(format!("Kreivo's extrinsic {n}"), Reach::Leaves, envelope);
     }

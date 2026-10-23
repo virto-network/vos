@@ -123,7 +123,7 @@ struct Leader {
     /// The windows still to close whose anchors this leadership settled.
     anchored: std::collections::BTreeSet<u64>,
     /// The anchors this leadership has still to hand the venue, by window:
-    /// the representative's root at the cut.
+    /// the space's root `S_w`.
     unanchored: std::collections::BTreeMap<u64, [u8; 32]>,
     /// When it last handed the venue an anchor that then waited: an idle
     /// leader tries again a recheck later.
@@ -136,9 +136,8 @@ struct Leader {
     /// unsent, among those whose cut roots this replica keeps: not taken
     /// up again.
     refused: std::collections::BTreeSet<u64>,
-    /// When this leadership last took up the anchors left waiting: at its
-    /// first batch, then a window length later, or sooner once the venue's
-    /// client hands a window back to be signed again.
+    /// When this leadership last took up the anchors left waiting by its
+    /// cut roots: at its first batch, then a window length later.
     seeded: Option<Instant>,
     /// The venue's anchor key listing when it last refused this node's
     /// key, and the node's time then: the anchor goes again once the

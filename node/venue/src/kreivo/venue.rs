@@ -21,12 +21,12 @@
 //! `WindowInFuture` until `Timestamp.Now` passes `B_w` plus a block; 19 and
 //! 20 until the space is active and anchors are not paused; 21 and 27, and
 //! `InvalidTransaction::Payment`, a funding alert, until the next read; 11
-//! `UnknownAnchorKey` and 12 `BadAnchorSignature`, or a signer the space no
-//! longer lists by the client's last read (then unsent), an alert, and the
-//! anchor dropped, its window handed back to the representative's leader
-//! to sign again ([`VenueClient::unsettled`]); the others (7
-//! `NotAuthority`, 13 the kind) an alert, and again a window later; the
-//! pool's other refusals an alert, and again after a backoff.
+//! `UnknownAnchorKey`, or a signer the space no longer lists by the
+//! client's last read (then unsent), an alert, and the anchor handed back
+//! to the representative's leader to sign again with a key it lists
+//! ([`VenueClient::unsettled`]); the others (7 `NotAuthority`, 12 the
+//! signature, 13 the kind) an alert, and again a window later; the pool's
+//! other refusals an alert, and again after a backoff.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -707,6 +707,22 @@ impl AnchorSend for KreivoSend {
     fn send(&self, anchor: &Anchor) -> Fate {
         self.0.send_anchor(anchor)
     }
+
+    /// By the client's last read: the space's last anchored window at or
+    /// past the anchor's, or the window past `MaxRootAge` by the venue's
+    /// time.
+    fn settled(&self, anchor: &Anchor) -> bool {
+        let mut state = self.0.state();
+        let now = state.now;
+        let known = state.watch(anchor.space).clone();
+        let passed = known.last.is_some_and(|last| last >= anchor.window);
+        let aged = known
+            .info
+            .and_then(|info| info.clock().boundary(anchor.window))
+            .zip(now)
+            .is_some_and(|(boundary, now)| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS);
+        passed || aged
+    }
 }
 
 /// What an anchor the chain refused waits for (`spaces-pallet.md` §9).
@@ -726,11 +742,12 @@ pub(super) enum Answer {
     /// 21 `InsufficientSovereignBalance`, 27 `OverBudget`: kept; a
     /// funding alert.
     Funding(Error),
-    /// 11 `UnknownAnchorKey`, 12 `BadAnchorSignature`: dropped, an
-    /// alert, its window handed back to be signed again.
+    /// 11 `UnknownAnchorKey`: dropped, an alert, handed back to be
+    /// signed again with a key the space lists.
     Resign(Error),
-    /// 7 `NotAuthority`, 13 the kind, any other, or not the pallet's:
-    /// kept, an alert, again a window later.
+    /// 7 `NotAuthority`, 12 `BadAnchorSignature` (signing again with the
+    /// same key makes the same signature), 13 the kind, any other, or not
+    /// the pallet's: kept, an alert, again a window later.
     Configuration,
 }
 
@@ -743,9 +760,7 @@ pub(super) fn answer(error: Option<Error>) -> Answer {
         Some(error @ (Error::InsufficientSovereignBalance | Error::OverBudget)) => {
             Answer::Funding(error)
         }
-        Some(error @ (Error::UnknownAnchorKey | Error::BadAnchorSignature)) => {
-            Answer::Resign(error)
-        }
+        Some(error @ Error::UnknownAnchorKey) => Answer::Resign(error),
         _ => Answer::Configuration,
     }
 }
@@ -814,7 +829,9 @@ impl VenueClient for KreivoVenue {
         if self.queue.dead(&anchor.space, window) {
             return Err(AnchorRefusal::Window);
         }
+        // Queued already: this one replaces it if signed by another key.
         if self.queue.holds(&anchor.space, window) {
+            self.queue.push_listed(anchor);
             return Ok(Anchored::Queued);
         }
         let clock = info.clock();
@@ -827,7 +844,9 @@ impl VenueClient for KreivoVenue {
             return Err(AnchorRefusal::Age);
         }
         drop(state);
-        self.queue.push(anchor);
+        // Its key listed by the last read: queued, even if an anchor of it
+        // by the same key was handed back before the listing changed.
+        self.queue.push_listed(anchor);
         Ok(Anchored::Queued)
     }
 
@@ -901,7 +920,7 @@ impl VenueClient for KreivoVenue {
         self.shared.state().now
     }
 
-    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
+    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
         self.queue.unsettled(space)
     }
 }

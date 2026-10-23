@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use vos_node_prover::{
-    Host, Jobs, MAX_ATTEMPTS, MemoryJobs, Options, ProveError, Prover, REFUSED_KERNEL,
-    REFUSED_RERUN, State, Worker,
+    Host, Jobs, MAX_ATTEMPTS, MAX_RESUBMITS, MemoryJobs, Options, ProveError, Prover,
+    REFUSED_KERNEL, REFUSED_RERUN, State, Worker,
 };
 use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
 use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
@@ -217,6 +217,8 @@ struct Venue {
     lose: AtomicBool,
     /// The codes the next submissions are refused with, in order.
     refuse: Mutex<Vec<u32>>,
+    /// Every answer lost while set.
+    lose_all: AtomicBool,
 }
 
 impl Venue {
@@ -255,6 +257,10 @@ impl VenueClient for Venue {
         if !self.accepted.lock().unwrap().insert(id.0) {
             return Err(NotAccepted::Refused(6));
         }
+        if self.lose_all.load(Ordering::SeqCst) {
+            self.accepted.lock().unwrap().remove(&id.0);
+            return Err(NotAccepted::Unjudged(Unjudged::Unknown));
+        }
         if self.lose.swap(false, Ordering::SeqCst) {
             return Err(NotAccepted::Unjudged(Unjudged::Unknown));
         }
@@ -275,6 +281,10 @@ impl VenueClient for Venue {
 
     fn time(&self) -> Option<u64> {
         Some(self.now.load(Ordering::SeqCst))
+    }
+
+    fn unsettled(&self, _: &SpaceId) -> Vec<Anchor> {
+        Vec::new()
     }
 }
 
@@ -653,4 +663,58 @@ fn a_transient_refusal_is_submitted_again() {
     let finished = states(&jobs);
     assert!(finished.contains(&State::Refused(3)), "3: final");
     assert!(finished.contains(&State::Accepted));
+}
+
+/// A venue that fails to judge a statement every time (`0x1001`) refuses
+/// it after [`MAX_RESUBMITS`] more submissions; a rootless statement whose
+/// answer is lost every time, which no anchor gives a deadline, is dead
+/// after as many.
+#[test]
+fn resubmissions_are_bounded() {
+    let agent = Arc::new(Mutex::new(Agent::default()));
+    let rootless = Attest {
+        roots: Vec::new(),
+        ..attest(3, 2)
+    };
+    agent.lock().unwrap().log.push(vec![attest(3, 1)]);
+    let node = Node::new(&agent, true);
+    let (jobs, prover, venue) = (
+        MemoryJobs::default(),
+        Arc::new(Proofs::default()),
+        Venue::at(after(3)),
+    );
+    venue.anchor(3);
+    let retry = Duration::from_millis(1);
+    let options = Options { retry, ..options() };
+    let mut worker = worker_with(&node, &jobs, &prover, &venue, options);
+    *venue.refuse.lock().unwrap() = vec![0x1001; 64];
+    let start = std::time::Instant::now();
+    while states(&jobs) != [State::Refused(0x1001)] {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            states(&jobs)
+        );
+        worker.step().unwrap();
+    }
+    assert_eq!(
+        venue.submissions.load(Ordering::SeqCst),
+        MAX_RESUBMITS as usize + 1
+    );
+
+    venue.refuse.lock().unwrap().clear();
+    venue.lose_all.store(true, Ordering::SeqCst);
+    agent.lock().unwrap().log.push(vec![rootless]);
+    while !states(&jobs).contains(&State::Dead) {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            states(&jobs)
+        );
+        worker.step().unwrap();
+    }
+    assert_eq!(
+        venue.submissions.load(Ordering::SeqCst),
+        2 * (MAX_RESUBMITS as usize + 1)
+    );
 }

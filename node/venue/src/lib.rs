@@ -55,14 +55,12 @@ pub trait VenueClient: Send + Sync {
     /// read: what every deadline between parties is timed by (pin D). None
     /// before the client has read it.
     fn time(&self) -> Option<u64>;
-    /// The windows of `space` whose anchors this client took
-    /// ([`Anchored::Queued`]) and then dropped, the venue refusing them as
-    /// signed: the representative's leader signs each again. None for a
-    /// client that queues nothing.
-    fn unsettled(&self, space: &SpaceId) -> Vec<u64> {
-        let _ = space;
-        Vec::new()
-    }
+    /// The anchors of `space` this client took ([`Anchored::Queued`]) and
+    /// then handed back, the venue not listing their keys, that the venue
+    /// still needs: the representative's leader signs each root again
+    /// with a key it lists. None for a client that queues nothing; a
+    /// client that wraps another hands back the other's.
+    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor>;
 }
 
 /// Whether a submission refused with `code` may be accepted when sent
@@ -418,6 +416,11 @@ impl ModelVenue {
         self.state().evidence.clone()
     }
 
+    /// `space`'s clock, once registered.
+    pub fn clock(&self, space: &SpaceId) -> Option<WindowClock> {
+        self.state().spaces.get(space).map(|space| space.clock)
+    }
+
     /// The anchors held of `space`, in window order.
     pub fn anchors(&self, space: &SpaceId) -> Vec<Anchor> {
         self.state()
@@ -537,6 +540,11 @@ impl VenueClient for ModelVenue {
 
     fn time(&self) -> Option<u64> {
         Some((self.now)())
+    }
+
+    /// None: it takes or refuses each anchor at once.
+    fn unsettled(&self, _: &SpaceId) -> Vec<Anchor> {
+        Vec::new()
     }
 }
 

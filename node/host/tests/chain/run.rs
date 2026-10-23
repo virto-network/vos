@@ -77,12 +77,15 @@ pub struct Jam {
     pub recorded: Arc<Recorded>,
     pub tapped: Arc<Tapped>,
     pub wire: Arc<Wire>,
+    /// The items its account counted at deployment, its storage empty.
+    pub baseline: u32,
 }
 
 impl Jam {
     fn deploy(testnet: &Testnet, name: &'static str, kernels: &Kernels) -> Self {
         let wire = Arc::new(Wire::default());
         let venue = Arc::new(testnet.deploy(name, kernels.pins(), &wire));
+        let baseline = venue.statements.entries(0).expect("the service's account");
         let recorded = Arc::new(Recorded::new(venue.clone()));
         let tapped = Arc::new(Tapped::new(recorded.clone()));
         Self {
@@ -91,6 +94,7 @@ impl Jam {
             recorded,
             tapped,
             wire,
+            baseline,
         }
     }
 

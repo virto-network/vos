@@ -89,8 +89,8 @@ pub const MAX_INPUT: usize = 12 << 20;
 /// enforces it; extrinsics travel apart, under `W_B` alone.
 pub const MAX_PACKAGE: usize = 204_800;
 /// A package's bytes beyond its payload and its imports' references, at
-/// most, as `jamt` encodes it (`live::package::encode_package`, the same
-/// bytes): its authorization by PolkaJam's bootstrap authorizer, its
+/// most, as `jamt` encodes it (the dev tooling's
+/// `vos_jam_dev::live::package::encode_package`, the same bytes): its authorization by PolkaJam's bootstrap authorizer, its
 /// context and its item's fixed fields, 262 bytes, with its payload's
 /// length (3 bytes to 2 MiB), its imports' count (3 bytes to 2 MiB of them)
 /// and its extrinsics' (1).

@@ -839,12 +839,9 @@ fn g7(fx: &Fixtures) -> Vector {
     // The activation windows: the fixture's own format and program stored,
     // but not active now.
     let format = vos_statement::vos_pvm_final_verifier::masked::FORMAT;
-    let set_format = |from_ms| Call::SetFormat {
+    let set_format = |from_ms, until_ms| Call::SetFormat {
         format,
-        active: Active {
-            from_ms,
-            until_ms: None,
-        },
+        active: Active { from_ms, until_ms },
     };
     let set_program = |from_ms, until_ms| Call::SetProgram {
         program: fx.valid.pin.program.0,
@@ -855,7 +852,9 @@ fn g7(fx: &Fixtures) -> Vector {
         }),
     };
     let (later, latest) = (NOW + 60_000, NOW + 120_000);
-    w.call(Origin::Root, set_format(later), Expect::Ok);
+    w.call(Origin::Root, set_format(0, Some(NOW)), Expect::Ok);
+    w.refused(s.encode(), proof.clone(), 2);
+    w.call(Origin::Root, set_format(later, None), Expect::Ok);
     w.refused(s.encode(), proof.clone(), 2);
     w.at(later);
     w.call(Origin::Root, set_program(0, Some(later)), Expect::Ok);
@@ -870,8 +869,9 @@ fn g7(fx: &Fixtures) -> Vector {
          statement cut short), 2 (format 30), 3 (a program not in Programs), 4 (a space not its \
          roots'), 5 (a root not anchored), 7 (another venue's statement), 0x1xx (the proof's \
          byte flipped); 6 is G8's, its deposit released. Then the statement itself against \
-         activation windows: 2 while Formats[39].from_ms is past now; 3 while its program's \
-         until_ms is now, and while its from_ms is past now; accepted once now reaches it",
+         activation windows: 2 while Formats[39].until_ms is now (retired), and while its \
+         from_ms is past now; 3 while its program's until_ms is now, and while its from_ms is \
+         past now; accepted once now reaches it",
     )
 }
 

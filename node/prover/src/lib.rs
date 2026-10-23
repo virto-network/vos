@@ -52,6 +52,6 @@ pub mod masked;
 pub mod program;
 
 pub use internals::{Internals, NodeProof};
-pub use job::{Job, MAX_ATTEMPTS, REFUSED_KERNEL, REFUSED_RERUN, State, deadline};
+pub use job::{Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, State, deadline};
 pub use memory::MemoryJobs;
 pub use worker::{Backlog, FORMAT, Host, Jobs, Options, ProveError, Prover, Stepped, Worker};

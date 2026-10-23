@@ -2030,7 +2030,7 @@
     },
     {
       "id": "G7",
-      "title": "one mutant per refusal class, each Refused { code } and DepositForfeited: 1 (the statement cut short), 2 (format 30), 3 (a program not in Programs), 4 (a space not its roots'), 5 (a root not anchored), 7 (another venue's statement), 0x1xx (the proof's byte flipped); 6 is G8's, its deposit released. Then the statement itself against activation windows: 2 while Formats[39].from_ms is past now; 3 while its program's until_ms is now, and while its from_ms is past now; accepted once now reaches it",
+      "title": "one mutant per refusal class, each Refused { code } and DepositForfeited: 1 (the statement cut short), 2 (format 30), 3 (a program not in Programs), 4 (a space not its roots'), 5 (a root not anchored), 7 (another venue's statement), 0x1xx (the proof's byte flipped); 6 is G8's, its deposit released. Then the statement itself against activation windows: 2 while Formats[39].until_ms is now (retired), and while its from_ms is past now; 3 while its program's until_ms is now, and while its from_ms is past now; accepted once now reaches it",
       "fees": false,
       "pre": {
         "now_ms": 25800000,
@@ -2354,6 +2354,54 @@
           "result": "ok",
           "events": [
             "0ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1d729a7f95fb3871bc594b1d01f7d11e61302ff3ff21f1677c4b4f18422c8544f12010000",
+            "0da1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a10088526a740000000000000000000000"
+          ],
+          "storage": [],
+          "balances": [
+            {
+              "account": "6d6f646c6b762f7370616365a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+              "free": "-500000000000"
+            },
+            {
+              "account": "6d6f646c70792f74727372790000000000000000000000000000000000000000",
+              "free": "+500000000000"
+            }
+          ]
+        },
+        {
+          "now_ms": 25800000,
+          "origin": "root",
+          "call": [
+            "5a102700000000000000000000000140ad890100000000"
+          ],
+          "result": "ok",
+          "events": [
+            "0e2700000000000000000000000140ad890100000000"
+          ],
+          "storage": [
+            {
+              "key": "dc90e6f82b1c3812e102a180b502f8a08975e14e9f8614e72a9fb0ff01cd72a15056c834eadafc6027000000",
+              "value": "00000000000000000140ad890100000000"
+            }
+          ],
+          "balances": []
+        },
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "afafafafafafafafafafafafafafafafafafafafafafafafafafafafafafafaf"
+          },
+          "call": [
+            "5a08a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a15904270000002bbb1e4c5810883ca959886418f5e01064d5977bee04b65f5397dd645c564e17a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a19c464b6c29a4bda3ce6aab4eb01d9abf25e6a90d1b4c8cb02273b630b00e58560b6e6f6e63652037587468652073746174656d656e742773206f75747075740800a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a12900000000000000414141414141414141414141414141414141414141414141414141414141414100a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a12a00000000000000424242424242424242424242424242424242424242424242424242424242424212f20800",
+            {
+              "fixture": "wrap.proof",
+              "from": 0,
+              "to": 146564
+            }
+          ],
+          "result": "ok",
+          "events": [
+            "0ca1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1d729a7f95fb3871bc594b1d01f7d11e61302ff3ff21f1677c4b4f18422c8544f02000000",
             "0da1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a10088526a740000000000000000000000"
           ],
           "storage": [],

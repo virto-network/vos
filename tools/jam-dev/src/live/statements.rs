@@ -5,13 +5,17 @@
 
 use std::time::{Duration, Instant};
 
+use std::collections::BTreeSet;
+
+use vos_statement::MAX_ROOT_AGE_MS;
+use vos_statement::vos_anchor::{RootKind, SpaceId};
 use vos_statement_service::MAX_ITEMS;
-use vos_statement_service::state::{Outcome, keys, outcome_id};
+use vos_statement_service::state::{Outcome, SpaceRecord, keys, outcome_id};
 use vos_tree::Hash;
 use vos_wire::package::SLOT_MS;
 use vos_wire::result::digest;
 
-use super::package::WorkItem;
+use super::package::{WorkItem, payloads};
 use super::{PolkaJam, failed};
 use vos_jam::Error;
 
@@ -38,6 +42,25 @@ pub struct Statements {
     /// The chain's genesis time, ms since the Unix epoch, the service's
     /// configured one: slot t starts at `genesis_ms + t × 6 s`.
     pub genesis_ms: u64,
+}
+
+/// The hour a queued row of the service's pruning is filed under.
+const BUCKET_MS: u64 = 3_600_000;
+
+/// The service's storage, accounted for at one block: the entries its
+/// account counts, and those named from the packages a client sent, the
+/// items' outcomes among them. Equal when every outcome it holds is of a
+/// package the client sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Accounting {
+    /// The storage entries the account counts.
+    pub held: u32,
+    /// The outcomes found of the packages' items.
+    pub outcomes: u32,
+    /// Every entry found: the outcomes, the spaces and statements they
+    /// are of, the spaces' anchors and evidence, the pruning's queue, its
+    /// cursor and the gas key.
+    pub named: u32,
 }
 
 /// An item to submit: its payload and its extrinsics.
@@ -116,6 +139,98 @@ impl Statements {
         self.value(&keys::outcome(&outcome_id(package, &digest(payload))))?
             .map(|bytes| Outcome::decode(&bytes).map_err(|error| failed(format!("{error:?}"))))
             .transpose()
+    }
+
+    /// The storage entries the service's account counts at the finalized
+    /// block, past the `baseline` it counted with none (its preimage
+    /// lookups, at its deployment).
+    pub fn entries(&self, baseline: u32) -> Result<u32, Error> {
+        let (head, _) = self.node.finalized()?;
+        Ok(self
+            .node
+            .service_items(&head, self.service)?
+            .saturating_sub(baseline))
+    }
+
+    /// The service's storage accounted for at the finalized block, against
+    /// `packages`, the packages a client sent, read once that block is
+    /// chosen (`sent`, called after it): every outcome found of their
+    /// items, every space and statement those are of, each space's anchors
+    /// and evidence over its windows anchored, the pruning's queue from its
+    /// cursor to the latest hour a row can expire in, the cursor, and the
+    /// gas key. `baseline` is the account's count with no storage.
+    pub fn account(
+        &self,
+        baseline: u32,
+        sent: impl FnOnce() -> Vec<Vec<u8>>,
+    ) -> Result<Accounting, Error> {
+        let (head, slot) = self.node.finalized()?;
+        let held = self
+            .node
+            .service_items(&head, self.service)?
+            .saturating_sub(baseline);
+        let packages = sent();
+        let value = |key: &[u8]| self.node.value(&head, self.service, key);
+        let mut named = 0u32;
+        let mut found = |key: &[u8]| -> Result<Option<Vec<u8>>, Error> {
+            let value = value(key)?;
+            named += u32::from(value.is_some());
+            Ok(value)
+        };
+        let mut outcomes = 0u32;
+        let mut subjects = BTreeSet::new();
+        for package in &packages {
+            let hash = digest(package);
+            for payload in payloads(package).ok_or_else(|| failed("a package not ours"))? {
+                let key = keys::outcome(&outcome_id(&hash, &digest(&payload)));
+                if let Some(bytes) = found(&key)? {
+                    outcomes += 1;
+                    let outcome = Outcome::decode(&bytes).map_err(|e| failed(format!("{e:?}")))?;
+                    subjects.insert(outcome.subject);
+                }
+            }
+        }
+        let mut spaces = Vec::new();
+        for subject in &subjects {
+            if let Some(bytes) = found(&keys::space(&SpaceId(*subject)))? {
+                let record = SpaceRecord::decode(&bytes).map_err(|e| failed(format!("{e:?}")))?;
+                spaces.push((SpaceId(*subject), record));
+            }
+            found(&keys::seen(&vos_statement::StatementId(*subject)))?;
+        }
+        for (space, record) in &spaces {
+            let Some(last) = record.last else { continue };
+            for window in record.range.from..=last {
+                found(&keys::anchor(space, RootKind::Space, window))?;
+                found(&keys::evidence(space, RootKind::Space, window))?;
+            }
+        }
+        if let Some(cursor) = found(keys::CURSOR)? {
+            let from = cursor
+                .get(..8)
+                .and_then(|bucket| Some(u64::from_le_bytes(bucket.try_into().ok()?)))
+                .ok_or_else(|| failed("a cursor cut short"))?;
+            let now = self.genesis_ms + slot * SLOT_MS;
+            let until = (now + MAX_ROOT_AGE_MS) / BUCKET_MS + 1;
+            for bucket in from..=until {
+                let Some(count) = found(&keys::bucket(bucket))? else {
+                    continue;
+                };
+                let count = count
+                    .try_into()
+                    .map(u32::from_le_bytes)
+                    .map_err(|_| failed("a bucket's count"))?;
+                for index in 0..count {
+                    found(&keys::queued(bucket, index))?;
+                }
+            }
+        }
+        found(keys::GAS)?;
+        Ok(Accounting {
+            held,
+            outcomes,
+            named,
+        })
     }
 
     /// The gas the service's last accumulate took, by its own count.

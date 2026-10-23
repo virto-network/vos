@@ -61,6 +61,10 @@ impl VenueClient for Venue {
     fn time(&self) -> Option<u64> {
         self.model.time()
     }
+
+    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
+        self.model.unsettled(space)
+    }
 }
 
 /// The replicas of the agents the run reads and represents: node 4, in the
