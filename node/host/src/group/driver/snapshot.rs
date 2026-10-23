@@ -606,7 +606,7 @@ async fn stream(
             })
             .encode();
             window.insert(read, frame.clone());
-            let delay = inner.hooks.delay_chunk();
+            let delay = inner.hooks.delay_chunk(to, read, wanted);
             if !delay.is_zero() {
                 smol::Timer::after(delay).await;
             }

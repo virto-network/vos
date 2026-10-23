@@ -2,11 +2,12 @@
 //! compaction catching up by a snapshot: under load, over a slow link,
 //! cut short, and once the programs it names are there.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vos_checker::calls::done;
 use vos_node::{Hooks, Node};
+use vos_wire::peer::NodeNumber;
 
 use crate::common::{
     Cluster, STAGED_IDLE, WithholdBlobs, compacting, log_start, old_epochs_dropped, wait_until,
@@ -85,12 +86,38 @@ fn a_follower_behind_the_log_catches_up_by_a_snapshot() {
     old_epochs_dropped(caught_up, agent);
 }
 
-/// Slows every snapshot chunk, as a slow link would.
-struct SlowChunks(Duration);
+/// Slows every snapshot chunk, as a slow link would, and records each
+/// chunk as it is first sent: when, to whom, its sequence, and the chunk
+/// its follower had asked for.
+struct SlowChunks {
+    delay: Duration,
+    sent: Mutex<Vec<(Instant, NodeNumber, u64, u64)>>,
+}
+
+impl SlowChunks {
+    fn new(delay: Duration) -> Self {
+        Self {
+            delay,
+            sent: Mutex::default(),
+        }
+    }
+
+    /// The chunks sent to `to`, in order: when, the sequence, and the chunk
+    /// its follower had asked for.
+    fn sent_to(&self, to: NodeNumber) -> Vec<(Instant, u64, u64)> {
+        let sent = self.sent.lock().unwrap();
+        sent.iter()
+            .filter(|chunk| chunk.1 == to)
+            .map(|&(at, _, sequence, wanted)| (at, sequence, wanted))
+            .collect()
+    }
+}
 
 impl Hooks for SlowChunks {
-    fn delay_chunk(&self) -> Duration {
-        self.0
+    fn delay_chunk(&self, to: NodeNumber, sequence: u64, wanted: u64) -> Duration {
+        let sent = (Instant::now(), to, sequence, wanted);
+        self.sent.lock().unwrap().push(sent);
+        self.delay
     }
 }
 
@@ -99,11 +126,15 @@ impl Hooks for SlowChunks {
 /// once, and catches up.
 #[test]
 fn a_snapshot_stream_outlasting_the_leaders_deadline_goes_on() {
-    let slow = Arc::new(SlowChunks(Duration::from_millis(40)));
+    const DEADLINE: Duration = Duration::from_millis(300);
+    let slow: Vec<Arc<SlowChunks>> = (1..=3)
+        .map(|_| Arc::new(SlowChunks::new(Duration::from_millis(40))))
+        .collect();
+    let hooks = slow.clone();
     let mut cluster = Cluster::tuned(3, move |number, config| {
         compacting(number, config);
-        config.snapshot_timeout_ms = 300;
-        config.hooks = slow.clone();
+        config.snapshot_timeout_ms = DEADLINE.as_millis() as u64;
+        config.hooks = hooks[usize::from(number) - 1].clone();
     });
     let agent = cluster.agent(&[1, 2, 3]);
     let (leader, follower) = cluster.leader_and_follower(agent);
@@ -111,30 +142,48 @@ fn a_snapshot_stream_outlasting_the_leaders_deadline_goes_on() {
     cluster.install(agent);
     let total = cluster.increments(leader, agent, 1..=30);
     cluster.compacted_past(agent, 20);
-    // The leader streams to the stopped follower once its log is compacted
-    // past it. That stream may still run, and serve the restarted
-    // follower, or have fallen silent and ended: the restart needs one
-    // more at most.
-    let streamed = cluster.node(leader).snapshots_streamed();
-    let started = Instant::now();
     cluster.start(follower);
     cluster.converged(agent);
     let caught_up = cluster.node(follower);
     assert!(log_start(caught_up, agent) > 20, "installed a snapshot");
-    assert!(
-        started.elapsed() > Duration::from_millis(300),
-        "the stream outlasted the deadline: {:?}",
-        started.elapsed()
-    );
     // Counted once the switch's state is in: a moment after a loaded host
     // shows it.
     wait_until("the switch is counted", || {
         caught_up.snapshots_installed() > 0
     });
     assert_eq!(caught_up.snapshots_installed(), 1, "switched once");
-    let more = cluster.node(leader).snapshots_streamed() - streamed;
-    assert!(more <= 1, "no other stream started: {more} did");
     assert_eq!(cluster.value(follower, agent), total);
+    // While the follower was stopped, the leader's streams to it fell
+    // silent and ended, as many as the stop lasted. Once the follower
+    // answered one, by asking for a chunk past the first, that one ran to
+    // its end: past the deadline, and no stream started after it.
+    let mut answered = false;
+    for (number, hooks) in (1..=3).zip(&slow) {
+        let sent = hooks.sent_to(follower);
+        let Some(first) = sent.iter().position(|&(_, _, wanted)| wanted > 0) else {
+            continue;
+        };
+        answered = true;
+        let start = sent[..=first]
+            .iter()
+            .rposition(|&(_, sequence, _)| sequence == 0)
+            .expect("a stream begins at its first chunk");
+        let again = sent[first..]
+            .iter()
+            .filter(|&&(_, sequence, _)| sequence == 0)
+            .count();
+        assert_eq!(
+            again, 0,
+            "node {number} started {again} streams past the answered one"
+        );
+        let (began, ended) = (sent[start].0, sent[sent.len() - 1].0);
+        assert!(
+            ended - began > DEADLINE,
+            "the stream outlasted the deadline: {:?}",
+            ended - began
+        );
+    }
+    assert!(answered, "the follower answered a stream");
 }
 
 /// A replica that caught up by a snapshot holds the sessions with it: once

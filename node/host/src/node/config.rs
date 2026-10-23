@@ -77,8 +77,10 @@ pub struct Config {
     /// How often a group's leader sends heartbeats, in milliseconds.
     pub heartbeat_ms: u64,
     /// How long the node's oldest pending commit may wait before its
-    /// writer counts as stalled, and the groups it leads hand over.
-    pub writer_stall: Duration,
+    /// writer counts as stalled, and the groups it leads hand over: by
+    /// default (`None`) the election timeout's upper end, so a slow sync
+    /// costs leadership no sooner than a crash would.
+    pub writer_stall: Option<Duration>,
     /// How long a call or an admin command, once queued at the leader,
     /// waits for its answer before it answers that it may have run.
     pub answered: Duration,
@@ -133,6 +135,13 @@ pub struct Config {
 }
 
 impl Config {
+    /// The writer's stall bound: [`Config::writer_stall`] if set, else the
+    /// election timeout's upper end.
+    pub fn stall_bound(&self) -> Duration {
+        self.writer_stall
+            .unwrap_or(Duration::from_millis(self.election_timeout_ms.1))
+    }
+
     pub fn new(agent: Vec<u8>) -> Self {
         Self {
             agent,
@@ -158,7 +167,7 @@ impl Config {
             peers: Peers::Quic,
             election_timeout_ms: (1500, 3000),
             heartbeat_ms: 500,
-            writer_stall: crate::storage::STALL_AFTER,
+            writer_stall: None,
             answered: Duration::from_secs(30),
             resend_round: Duration::from_secs(1),
             compact_every: 1024,
@@ -236,5 +245,25 @@ impl Settings {
             )),
             ingress_connections: config.ingress_connections,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::Config;
+
+    #[test]
+    fn the_writers_stall_bound_is_the_election_timeouts_upper_end_unless_set() {
+        let mut config = Config::new(Vec::new());
+        config.election_timeout_ms = (1_000, 4_500);
+        assert_eq!(config.stall_bound(), Duration::from_millis(4_500));
+        config.writer_stall = Some(Duration::from_secs(7));
+        assert_eq!(config.stall_bound(), Duration::from_secs(7));
+        assert_eq!(
+            Config::new(Vec::new()).stall_bound(),
+            crate::storage::STALL_AFTER
+        );
     }
 }

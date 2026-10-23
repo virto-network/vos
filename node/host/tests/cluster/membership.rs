@@ -400,32 +400,44 @@ fn overlapping_replacements_by_a_silent_node_hold_nothing_else_up() {
 /// followers are lost, while it still hears theirs.
 #[test]
 fn a_stale_leader_left_out_of_the_configuration_retires() {
-    let cluster = Cluster::new(4);
+    // A leader checks its quorum once per the election timeout's upper
+    // bound, and steps down at the first check that heard no follower
+    // since the last: at least 6 s after the cut, while its followers
+    // campaign from 1 s on.
+    let cluster = Cluster::tuned(4, |_, config| config.election_timeout_ms = (1_000, 6_000));
     let agent = cluster.counter_agent(&[1, 2, 3]);
-    let stale = cluster.leader(agent);
-    let followers: Vec<NodeNumber> = (1..=3).filter(|number| *number != stale).collect();
-    for &follower in &followers {
-        cut_both(&cluster.hub, stale, follower, Class::Consensus);
-        cluster.hub.cut_class(stale, follower, Class::Liveness);
-    }
-    let mut next = None;
-    wait_until("a follower leads", || {
-        let leading: Vec<NodeNumber> = followers
-            .iter()
-            .copied()
-            .filter(|number| cluster.node(*number).leads(agent))
-            .collect();
-        next = match leading[..] {
-            [next] => Some(next),
-            _ => None,
-        };
-        next.is_some()
-    });
-    let next = next.unwrap();
-    assert!(
-        cluster.node(stale).leads(agent),
-        "the stale one still leads"
-    );
+    // A loaded host may hold the followers' election past that check, or a
+    // draw may put both followers' timers late: the leader is no longer
+    // stale then, and the links heal for another try at the leader they
+    // settle on.
+    let (stale, next) = (0..5)
+        .find_map(|_| {
+            let stale = cluster.leader(agent);
+            let followers: Vec<NodeNumber> = (1..=3).filter(|number| *number != stale).collect();
+            for &follower in &followers {
+                cut_both(&cluster.hub, stale, follower, Class::Consensus);
+                cluster.hub.cut_class(stale, follower, Class::Liveness);
+            }
+            let mut next = None;
+            wait_until("a follower leads", || {
+                let leading: Vec<NodeNumber> = followers
+                    .iter()
+                    .copied()
+                    .filter(|number| cluster.node(*number).leads(agent))
+                    .collect();
+                next = match leading[..] {
+                    [next] => Some(next),
+                    _ => None,
+                };
+                next.is_some()
+            });
+            if cluster.node(stale).leads(agent) {
+                return Some((stale, next.unwrap()));
+            }
+            cluster.hub.heal();
+            None
+        })
+        .expect("the stale one still leads once another does");
     cluster.replace(next, agent, &[1, 2, 3], stale, 4);
     cluster.hub.heal();
     retired(cluster.node(stale), agent);

@@ -103,7 +103,7 @@ impl Node {
             storage: StorageThread::spawn_with(
                 store.clone(),
                 Arc::clone(&config.hooks),
-                config.writer_stall,
+                config.stall_bound(),
             ),
             store,
             machines: Machines {

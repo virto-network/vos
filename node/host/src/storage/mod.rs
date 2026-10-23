@@ -29,8 +29,9 @@ use crate::store::{Fjall, HardState, LogEntry, Membership, Row, Switch};
 use crate::{Hooks, lock, raise};
 
 /// How long the oldest pending commit may wait before the writer counts as
-/// stalled, unless the node's config says otherwise.
-pub(crate) const STALL_AFTER: Duration = Duration::from_secs(1);
+/// stalled, for a writer spawned without a node's config: the default
+/// election timeout's upper end, as a node's own bound defaults to its.
+pub(crate) const STALL_AFTER: Duration = Duration::from_secs(3);
 
 /// The most bytes of entries and writes one flush takes, once it has any:
 /// a guard, so one large commit cannot hold back every agent for long.

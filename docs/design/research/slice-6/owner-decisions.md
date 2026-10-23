@@ -21,3 +21,4 @@
 13. Code-quality rest from slice 5: ALL in slice 6 (6.22 cleanup), not split.
 14. External audit: scope frozen at M2 acceptance; engage after slice 6, before any value.
 15. Rename the Clerk's slice-6 draft → clerk-across-spaces.md (slice number set when scheduled), with a header noting what changed.
+16. (2026-10-23) Writer stall bound defaults to the election timeout's upper end (owner, 2026-10-23): `Config::writer_stall` an override, `None` deriving it from `election_timeout_ms.1` (3 s at the defaults), so a slow fsync never costs leadership sooner than a crash would.

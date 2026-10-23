@@ -200,9 +200,11 @@ pub trait Hooks: Send + Sync {
         false
     }
 
-    /// Before a leader sends a snapshot chunk: how long it waits first, as
-    /// on a slow link.
-    fn delay_chunk(&self) -> Duration {
+    /// Before a leader first sends chunk `sequence` of a snapshot stream to
+    /// `to`, whose follower has asked for the chunks from `wanted` on (0
+    /// before it answered): how long it waits first, as on a slow link.
+    fn delay_chunk(&self, to: NodeNumber, sequence: u64, wanted: u64) -> Duration {
+        let _ = (to, sequence, wanted);
         Duration::ZERO
     }
 

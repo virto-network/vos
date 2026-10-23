@@ -178,7 +178,7 @@ impl Cluster {
         };
         config.election_timeout_ms = (1_000, 2_000);
         config.heartbeat_ms = 10;
-        config.writer_stall = WRITER_STALL;
+        config.writer_stall = Some(WRITER_STALL);
         // Each node's own clock, a few milliseconds apart, and as far
         // ahead as the test sets it.
         let skew = u64::from(number) * 7;

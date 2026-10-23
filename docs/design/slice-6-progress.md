@@ -3188,10 +3188,12 @@ test's or its harness's, not a node's:
   elsewhere: leaders moved under calls aimed at them (`NotLeader` in
   `membership`, `roots`, `liveness`, `large_results`, `replication`,
   `workflows`; "node 1 leads some" timing out). The bound is now
-  `Config::writer_stall`, its default unchanged; both harnesses set 5 s.
-  Open for the owner: a default below the default election timeout
-  (1.5–3 s) hands over every group of a node whose disk is busy for a
-  second.
+  `Config::writer_stall`; both harnesses set 5 s. The owner's answer
+  (2026-10-23, `owner-decisions.md` 16): the bound defaults to the
+  election timeout's upper end (`Config::stall_bound`, 3 s at the
+  defaults; `writer_stall` an override), so a slow sync costs leadership
+  no sooner than a crash would. The harnesses keep 5 s, past their 2 s
+  elections: their nodes share one disk under the load above.
 - **Elections of 300–600 ms** (`cluster`) and **40–80 ms** (`served`)
   lapsed when a starved host held a heartbeat; both harnesses now elect in
   1–2 s (`forwarding::a_leader_whose_clock_trails…` "it goes on leading",
@@ -3307,13 +3309,26 @@ test's or its harness's, not a node's:
 
 Gate, under that load: `served` 10/10 and `cuts` 10/10; `cluster` 9/10, its
 one failure `a_snapshot_stream_outlasting_the_leaders_deadline_goes_on`'s
-"no other stream started: 2 did", left open: on a loaded host the leader
-may start a second stream past its 300 ms deadline, which the test's bound
-of one does not allow. One test met only beside another worktree's builds
-(load average above 30) is open too:
+"no other stream started: 2 did". One test met only beside another
+worktree's builds (load average above 30) was open too:
 `a_stale_leader_left_out_of_the_configuration_retires` ("the stale one
-still leads"), its cut-off leader stepping down at check-quorum before the
-test looks. `just check` green.
+still leads"). `just check` green. Both are closed on `s6/carrier`:
+
+- **The snapshot stream's bound.** While the follower is down, the
+  leader's streams to it fall silent and end (10 s each), as many as the
+  stop lasts; a loaded host's longer stop saw two. The property is of the
+  stream the follower answers: `Hooks::delay_chunk(to, sequence, wanted)`
+  now sees each chunk's place, and the test asserts that no stream starts
+  once the follower has asked for a chunk past the first (`wanted > 0`),
+  and that the answered stream ran past the 300 ms deadline. The silent
+  ones before it are allowed.
+- **The stale leader.** A leader checks its quorum once per the election
+  timeout's upper end; the test's elections are (1 s, 6 s), so the cut-off
+  leader steps down 6 s at the earliest, while its followers campaign from
+  1 s. A loaded host or a late draw may still beat it: the links heal and
+  the cut is made again at the leader they settle on, up to five times.
+- Under the load above (two cores, four spinners, sixteen threads): both
+  tests 8/8, `snapshots` and `membership` whole 3/3.
 
 ## Step 6.18: the prover worker and the reproducibility gate
 
