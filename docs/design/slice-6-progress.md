@@ -3596,3 +3596,114 @@ gaps, which 6.21 inherits), folded:
   0 failed. `vos-venue`'s `an_anchor_is_answered_at_once` met 10.1 ms
   against its 10 ms bound under load; its bound is 500 ms, the node it
   must not wait on timing out in seconds.
+
+## Step 6.21: the end to end on chain
+
+On `s6/e2e` (from `ede9f2af`). The full record is the step's log.
+
+- **`just e2e-chain`** (`node/host/tests/chain`, `vos-node`'s `chain`
+  feature, `testnet.sh chain`): a space of three nodes running `balance`,
+  the window actor, the reader and the representative, each node proving
+  with the disclosing masked prover (one proof at a time across the
+  process), windows of 120 s (`D` 24 s). Outside `check` and `ci-full`,
+  as `jam-testnet` is: it needs the PolkaJam binaries and a C compiler.
+  About 20 minutes.
+  - **Kreivo, the mock only:** the founder funds the sovereign account,
+    the controller registers the space from window 0 with a founder's
+    signature (`Node::sign_registration`, the node key over pin D's
+    registration digest) and adds each node's account as an authority,
+    paired with its anchor key, all by the pallet's calls; each node
+    anchors and submits through its `KreivoVenue` over the mock's
+    transport, a block's 6 s on every extrinsic. Windows 0–2 anchored, a
+    balance statement at window 1's cut accepted.
+  - **The migration at k = 3:** in window 2 the space is registered at the
+    JAM service from 3 and migrated away from the mock from 3; the nodes'
+    venue moves to the service once window 2 is anchored at the mock (114 s
+    before window 3 closes). Window 3's statement, accepted at JAM, is
+    refused at the mock **`0x5`**, its deposit forfeited.
+  - **JAM, on PolkaJam v0.8.0 (interpreter):** windows 3–5 anchored, a
+    balance and a window statement at each cut, all masked (format 39),
+    all accepted. The reader's rootless statements, proved by the run: the
+    venue-bound one accepted at its venue and refused at a second
+    deployment of the service **`0x7`**; the unbound one accepted at both.
+  - **Past `MaxRootAge`:** the testnet's clock is the host's shifted by a
+    file's milliseconds (`node/jam/clock-shift.c`, preloaded into its
+    nodes): moved 25 h ahead, the chain skips 15,000 slots (1,249 epochs,
+    Safrole falling back to its fallback keys) and goes on. Replayed, the
+    venue-bound statement at its venue, the unbound one at both venues
+    **`0x6`**; window 3's rooted statement **`0x5`**. The production
+    constant is untouched.
+  - **The carrier audit** (6.20's harness, as 6.20 asked): each venue
+    client in `Tapped`, `Disclosing` behind `disclosing`, `Logs` and
+    `Stderr` installed before the nodes start; carriers: what each venue
+    was sent (anchors, submissions, in each venue's layout), the JAM
+    service's work reports from PolkaJam (`workPackageStatus` and
+    `workReport`, 14), the mock's signed envelopes, both anchor chains
+    (the mock's storage, JAM's anchors for windows 3–5 and the space's
+    record), every frame between the nodes, each node's log entries, work
+    results, prover table, store rows and disk, the testnet's log and
+    chain database, the process's logs and standard error: 252 carriers.
+    Needles: 219 node-proof, 67 row and argument, 455 hash, 42 step, 39
+    memory-root, 89 register and 7 debug-output (nine statements proved).
+    `assert_searchable` and `assert_clean` pass.
+- **Found and fixed:**
+  - **A chain's own records match numbers by chance.** The testnet's log
+    held step counts as `conn_id=2148` and the like, and its database the
+    eight bytes of a register at a boundary inside the service's program
+    (the same four registers of two window statements, at two boundaries:
+    layout values). What the venue was sent is searched whole as carriers
+    that leave; a chain's logs and database are now `Reach::Recorded`:
+    every needle in its full forms, not a number's digits or bytes nor a
+    hash's hex prefix (tested). `SECURITY.md`'s table names the reports,
+    the envelopes and the chain's records.
+  - **A rootless record's needles:** `Needles::attest` takes a record of no
+    window, its witness its arguments alone (tested).
+  - **No founder could register at JAM from a node:** `sign_with_node_key`
+    went with the Kreivo tooling; `Node::sign_registration` signs pin D's
+    registration digest only, and `Jam::register_signed` takes it.
+  - **Guarantors take no package for a few slots after the jump:** the
+    replays wait five finalized slots and send again while refused.
+- **Added:** `vos_jam`'s `PolkaJam::work_report` and `anchor_of`,
+  `Statements::land_package`, `Jam::land_package` (a landed item's
+  package, for its report); `just clippy-prover` lints `vos-node`'s tests
+  with `chain` (the carrier audit's and this one).
+- **Measured** [measured, the run that passed; the machine shared]:
+  - **latency, `B_w` to acceptance** (L 120 s, D 24 s): Kreivo 48.8 s
+    (`t_prove` 17.0 s); JAM 60.6–103.5 s, a window's two statements proved
+    in turn (`t_prove` 15.6–39.8 s; after its proof 16–21 s: the anchor's
+    landing and the submission's, about three slots each). Pin D's
+    `L/2 + D + t_prove + inclusion` for a request at a random time is
+    108–140 s here (inclusion taken as the time after the proof); the gate
+    `L + D + t_prove + 30 s` is 189.6–213.8 s: **every statement within
+    it**, the slowest 103.5 s against its 213.8 s;
+  - **JAM gas:** refine 83.24M–84.13M a statement (a statement accepted,
+    repeated or refused alike: the proof is verified before the state is
+    read); the last accumulate 286,989 gas (6.19: 83.78M, 107,910);
+  - **Kreivo's sovereign account:** funded 100 UNITS, 0.5 held for the
+    registration; 3 anchors and 2 submits by the authorities, a fee of 1
+    UNIT each (`FeeBound`), the accepted submit's deposit refunded, the
+    refused one's 0.5 forfeited: 5.5 UNITS charged in all, asserted; no
+    alert; the budget 12 UNITS a window, never reached;
+  - **the prover:** 7 statements at cuts in 171.2 s, 24.5 s on average
+    (balance 15.6–22.8 s, window 28.9–39.8 s; the rootless 12.7–13.7 s):
+    about 25 a 10-minute window, 5 a 120-second one.
+- **Runs:** five; the first four failed on the test's own waits (a
+  follower's table counted as pending; the replays before the guarantors
+  took packages again) and on the chain's records (above); the fifth
+  passed whole. Every PolkaJam process stopped by its scope, each run's
+  chain directory removed.
+- **Gates:** `just e2e-chain` at `f2b69d46` passed (1,158 s; the code since
+  unchanged but a test of `vos-venue`'s queue). `just check`: its first
+  run 96 suites, 1,354 passed, 1 failed, `vos-venue`'s
+  `queue::tests::each_space_waits_apart_and_sends_in_window_order`, a race
+  of the test's own (the worker sent window 6, alone in the queue, before
+  window 5 was pushed): fixed (`9bf4ed57`), space 1's send held while space
+  2's anchors are queued, 30 of 30; then at `9bf4ed57` green, 105 suites,
+  1,362 passed, 0 failed, about 14 minutes (12 GiB scope, `nice -n 10`, 8
+  jobs).
+- **Left out:** the anchors' own work reports (their items land through
+  the node's anchor queue, not the run's; the anchors are carriers as sent
+  and as the service keeps them); the Kreivo leg on a dev chain (M3b's
+  deferred gate 2, the teammate's pallet and the ported transport); the
+  latency of a request at a random time in its window (pin D's `L/2`),
+  computed from the measured terms rather than sampled.
