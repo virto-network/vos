@@ -12,6 +12,10 @@ faults = []
 # The masked prover (`vos_node_prover::masked`): a node built with it can
 # prove its agents' statements (`Config::prover`).
 prover = ["vos-node-prover/prove"]
+# The carrier audit's prover, which discloses what it built each proof from
+# (`vos_node_prover::masked::Disclosing`): its test alone (`just
+# test-carriers`). No production build enables it.
+disclosing = ["prover", "vos-node-prover/disclosing"]
 
 [dependencies]
 fjall = { workspace = true }
@@ -121,4 +125,4 @@ harness = false
 # carrier of the run searched (`just test-carriers`, alone in its process).
 [[test]]
 name = "carriers"
-required-features = ["prover"]
+required-features = ["disclosing"]

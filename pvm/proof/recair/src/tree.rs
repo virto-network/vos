@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_final_verifier::{PUBLIC_WORDS, Statement, WrapProof};
 use vos_pvm_proof::format::SEGMENT;
+#[cfg(feature = "watch")]
 use vos_pvm_proof::pcs::ProofHash;
 use vos_pvm_proof::poseidon2::P2Hash;
 use vos_pvm_proof::program_id::{IdPreimage, KernelEntry, KernelProgram};
@@ -87,7 +88,8 @@ impl Stats {
 }
 
 /// A proof of a run's tree as it is built, before the wrap: what never
-/// leaves the prover role. Seen by [`prove_run_watched`]'s watcher.
+/// leaves the prover role. Shown to a watcher only under the `watch`
+/// feature, a carrier audit's (`prove_run_watched`).
 pub enum Built<'a> {
     /// A segment's proof, at its position.
     Segment(&'a KernelSegment),
@@ -97,6 +99,7 @@ pub enum Built<'a> {
     Fold(&'a Node),
 }
 
+#[cfg(feature = "watch")]
 impl Built<'_> {
     /// Its proof's trees' roots, in tree order.
     pub fn roots(&self) -> Vec<[u8; 32]> {
@@ -154,12 +157,22 @@ pub fn prove_run(
     entry: &KernelEntry,
     run: &SideNote,
 ) -> Result<(Node, Stats), TreeError> {
-    prove_run_watched(program, entry, run, &mut |_| {})
+    run_watched(program, entry, run, &mut |_| {})
 }
 
 /// [`prove_run`], each segment, leaf and fold shown to `watch` as it is
 /// proved.
+#[cfg(feature = "watch")]
 pub fn prove_run_watched(
+    program: &KernelProgram,
+    entry: &KernelEntry,
+    run: &SideNote,
+    watch: &mut dyn FnMut(Built<'_>),
+) -> Result<(Node, Stats), TreeError> {
+    run_watched(program, entry, run, watch)
+}
+
+fn run_watched(
     program: &KernelProgram,
     entry: &KernelEntry,
     run: &SideNote,
@@ -224,18 +237,28 @@ pub fn prove_final(
     entry: &KernelEntry,
     run: &SideNote,
 ) -> Result<(Vec<u8>, Stats), TreeError> {
-    prove_final_watched(program, entry, run, &mut |_| {})
+    final_watched(program, entry, run, &mut |_| {})
 }
 
 /// [`prove_final`], each segment, leaf and fold shown to `watch` as it is
 /// proved ([`prove_run_watched`]).
+#[cfg(feature = "watch")]
 pub fn prove_final_watched(
     program: &KernelProgram,
     entry: &KernelEntry,
     run: &SideNote,
     watch: &mut dyn FnMut(Built<'_>),
 ) -> Result<(Vec<u8>, Stats), TreeError> {
-    let (root, mut stats) = prove_run_watched(program, entry, run, watch)?;
+    final_watched(program, entry, run, watch)
+}
+
+fn final_watched(
+    program: &KernelProgram,
+    entry: &KernelEntry,
+    run: &SideNote,
+    watch: &mut dyn FnMut(Built<'_>),
+) -> Result<(Vec<u8>, Stats), TreeError> {
+    let (root, mut stats) = run_watched(program, entry, run, watch)?;
     let started = Instant::now();
     let (proof, ..) = wrap(&root, &program.id_preimage())?;
     let bytes = crate::wrap::proof_bytes(&proof).ok_or(TreeError::Bytes)?;

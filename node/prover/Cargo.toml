@@ -16,6 +16,11 @@ prove = [
     "dep:vos-pvm-compiler",
     "dep:vos-pvm-program",
 ]
+# The masked prover disclosing what it built each proof from
+# (`masked::MaskedProver::prove_disclosing`, `masked::Disclosing`): the
+# carrier audit's prover, for its tests. No production build enables it
+# (`just check-no-debug-internals`).
+disclosing = ["prove", "vos-pvm-recair/watch"]
 
 [dependencies]
 tracing = "0.1"

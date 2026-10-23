@@ -87,7 +87,7 @@ test-proof: build-test-actors judge-wasm
 # process, which it captures whole (its logs at every level, its standard
 # error). About two minutes and 6 GiB.
 test-carriers: build-test-actors build-agent build-representative
-    cargo test -p vos-node --features prover --test carriers audit:: -- --nocapture --test-threads=1
+    cargo test -p vos-node --features disclosing --test carriers audit:: -- --nocapture --test-threads=1
 
 # The golden fixtures (`pvm/proof/fixtures`) judged in Wasm, by the final
 # verifier's blobs built as a runtime builds them, under the PVF's semantics
@@ -237,14 +237,18 @@ check-no-seeded-masks:
 # The debug outputs (`vos-pvm`'s and `vos-pvm-proof`'s `debug-internals`:
 # the PVM's instruction trace, `GREY_PVM_DEBUG`'s registers and native code,
 # `CPU_DUMP`, `CPU_EXPR_DUMP`, `ZKPVM_PROFILE`), which show a run's steps,
-# registers and rows, reach no production build: no normal or build edge of
-# any workspace member, nor of the agent's or the final verifier's
-# workspaces, enables them; and the node's binary, built with the prover,
-# names none of their environment variables nor the instruction trace's
-# message, so none of them is compiled in.
+# registers and rows, and the carrier audit's seams (`vos-node`'s and
+# `vos-node-prover`'s `disclosing`, `vos-pvm-recair`'s `watch`), which hand
+# a proof's internals out, reach no production build: no normal or build
+# edge of any workspace member, nor of the agent's or the final verifier's
+# workspaces, enables the debug outputs, nor of any workspace member the
+# seams; and the node's binary, built with the prover, names none of the
+# debug outputs' environment variables nor the instruction trace's message,
+# so none of them is compiled in.
 check-no-debug-internals:
     just _no-feature debug-internals --workspace
     just _no-feature debug-internals -p vos-cli --features prover
+    for feature in [disclosing watch] { just _no-feature $feature --workspace; just _no-feature $feature -p vos-cli --features prover }
     for manifest in [agent/default pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature debug-internals --manifest-path $"($manifest)/Cargo.toml" }
     cargo build -p vos-cli --features prover
     let binary = (open --raw target/debug/vos); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"the node's binary names ($name)" } } }

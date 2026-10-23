@@ -43,6 +43,11 @@ seeded-masks = []
 # real wrap), the masked acceptance above 2^16 rows, and the final
 # verifier's gas and Wasm gates over seeds. No code of the crate's.
 heavy-gates = []
+# A run's tree shown proof by proof as it is built (`tree::prove_final_watched`,
+# `tree::Built`'s roots and encoding): the carrier audit's seam, for its
+# tests (a dev edge or a test's feature). No production build enables it
+# (`just check-no-debug-internals`).
+watch = []
 
 [dev-dependencies]
 # The masked prover's tests reproduce a proof byte for byte from a seed.
