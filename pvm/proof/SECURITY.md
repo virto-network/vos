@@ -392,9 +392,11 @@ Only a statement and its masked final proof leave the space's prover role
 rows, the witness, step counts, memory roots and registers past φ9..φ12
 stay with the agent's replicas. The carrier audit checks it on a run
 (`just test-carriers`, `vos_checker::carriers`): three nodes prove a read's
-statement with the masked prover, every debug output's environment set,
-and every carrier's bytes are searched for the run's own internals, in
-their bytes, hex, `Debug` lists and decimal digits.
+statement with the masked prover beside a fourth that replicates nothing
+of it, every debug output's environment set, and every carrier's bytes
+are searched for the run's own internals: in their bytes, hex, `Debug`
+lists, M31 limbs, decimal digits and either byte order, a store by its
+rows, each capture path shown to capture by a canary.
 
 | carrier | what it carries | reach | checked by |
 |---|---|---|---|
@@ -408,6 +410,7 @@ their bytes, hex, `Debug` lists and decimal digits.
 | the operator's `/stats` | stage histograms, `refine_gas` and `step_gas` among them: a kernel's gas, so its steps, within a quarter and in sums | the node's operator | not audited: the operator runs the replica |
 | the tests' `target/tmp/wrap/` | final wraps (28 of test circuits, 39), their formats, words and judgements' inputs | the test machine | `kernel`'s `wrap_files`: each verifies as a final wrap, and nothing else is there |
 | the agent's log, snapshots and peer frames | `Resume` with the served rows; work results with each `Attest` (witness, output, public arguments, roots); `Proven` with the proof's hash | the agent's replicas | the audit: no node proof, memory root or register file |
+| frames to a node of the space that does not replicate the agent, and that node's disk and store | heartbeats, placements, forwarded requests | leaves | the audit, every needle |
 | the node's blobs and disk | final proofs, large work results, the store | the node | the audit: as above |
 | the prover's table | each job's record until it finishes, its statement, its proof's hash | the prover's node | the audit: as above |
 | an agent on JAM: its work packages and results (`vos-jam`) | its batch, its rows' witness and its attests whole, served rows included | JAM's validators and DA | by design: an agent on JAM keeps no row from JAM, so a statement of one hides nothing from it |

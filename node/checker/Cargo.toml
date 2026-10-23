@@ -34,3 +34,7 @@ tempfile = "3"
 vos-node = { path = "../host" }
 vos-testkit = { path = "../../agent/testkit" }
 vos-wire = { workspace = true }
+
+[dev-dependencies]
+# The carrier audit's tests: a root laid out as postcard lays it out.
+postcard = { version = "1", features = ["alloc"] }

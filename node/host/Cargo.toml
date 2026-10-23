@@ -62,6 +62,8 @@ vos-pvm-program = { workspace = true }
 # tests anchor at, and its stored values' SCALE.
 vos-venue = { workspace = true, features = ["mock"] }
 parity-scale-codec = "3.7.5"
+# The carrier audit's canary on a pool thread, as the prover's run.
+rayon = "1"
 # The node's binary runs on mimalloc: its tests run on it too.
 mimalloc = "0.1.52"
 

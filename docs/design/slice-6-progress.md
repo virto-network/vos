@@ -3543,3 +3543,49 @@ On `s6/carrier` (from `bc175ed0`). The full record is the step's log.
   test-carriers` among them; `just check` green: 105 suites, 1,358
   passed, 0 failed, `check-no-debug-internals` in it (12 GiB scope, `nice
   -n 10`, 8 jobs).
+
+**The review** (Opus, fix then merge: no leak, the harness's coverage
+gaps, which 6.21 inherits), folded:
+- **M1:** the run writes rows of high-entropy values past 2^40; a row's
+  value that decodes as an integer is a number needle too; at least one
+  value needle a row is asserted (41 row and argument needles a run).
+- **M2:** a 32-byte needle of M31 limbs (the leaves' and folds' roots and
+  digests, memory roots that are) is searched as its decimal limb list
+  (`P2Hash([…])`, an array's `Debug`), its `M31(…)` list and its postcard
+  varints; every byte needle in upper-case hex too, and its first 16 hex
+  characters in carriers that leave; numbers as `0x` hex.
+- **M3:** a fourth node in the space replicates neither agent: the frames
+  to it and its disk and store leave the role, and are searched for every
+  needle.
+- **M4:** each node's store is a carrier by its rows (`Fjall::dump`), so
+  fjall's compressed blocks hide nothing; the raw scan stays for blobs and
+  the other files.
+- **L1:** the seams behind features no production edge enables (`vos-pvm-
+  recair`'s `watch`, `vos-node-prover`'s and `vos-node`'s `disclosing`),
+  checked by `check-no-debug-internals`.
+- **L2:** a canary through each capture path (a TRACE line from a node's
+  storage thread, a line on stderr from a pool thread, a file in a node's
+  directory, a hub frame, a submission through `Tapped`), each asserted in
+  its carrier.
+- **L3:** hashes under each of `vos-wire`'s and its venues' domains (11);
+  numbers big-endian too; the gas a re-run left (2^32 less its steps);
+  each part of a kernel's arguments no public argument covers. A number's
+  byte forms need four distinct bytes, and a register the run's entry
+  state holds (the halt address, the stack's top) is public: the first
+  run with the new forms found a heartbeat's counter equal to a step count
+  and the halt address in a node's store.
+- **L4:** `SECURITY.md`: the node's log is on stderr; an agent's guest log
+  lines are its author's text.
+- **L5:** `prove_profiled` prints nothing without `debug-internals`; it
+  returns the profile.
+- **L6:** `wrap_files` fails on an empty directory (it runs after the
+  suites, not among them), and a format-28 wrap must be of a test circuit:
+  the kernels' predicate, or a circuit wrapped under 39 beside it. It
+  caught a stale `window.*` in `vos-core`'s `target/tmp/wrap/`, a format-
+  28 wrap of an older window program no test writes any more.
+- **L7:** the snapshot stream's span measured from its follower's first
+  answer (1.4 s of 36 chunks, against the 300 ms deadline).
+- **Quality:** `carriers` split into `needles`, `audit` and `capture`;
+  `Logs` on the shared lock; `delay_chunk`'s unused parameters named so;
+  the disclosing prover keeps its segments' lengths apart; a record's
+  rows split at its arguments' known length.

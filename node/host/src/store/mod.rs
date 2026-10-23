@@ -122,6 +122,9 @@ struct Partitions {
     blobs: Keyspace,
 }
 
+/// A row of [`Fjall::dump`]: its partition's name, its key and its value.
+pub type DumpedRow = (&'static str, Vec<u8>, Vec<u8>);
+
 /// A prover's job as the store keeps it: its agent, its statement's id and
 /// its encoding.
 pub type ProverJob = (AgentId, [u8; 32], Vec<u8>);
@@ -304,6 +307,27 @@ impl Fjall {
 
     /// The prover's jobs, each its agent, its statement's id and its
     /// encoding, by agent and id.
+    /// Every key and value of every partition, by partition, in key order:
+    /// all the store holds, as a test reads it, however its blocks are
+    /// compressed on disk.
+    #[doc(hidden)]
+    pub fn dump(&self) -> Result<Vec<DumpedRow>> {
+        let partitions = [
+            ("state", &self.0.state),
+            ("system", &self.0.system),
+            ("log", &self.0.log),
+            ("blobs", &self.0.blobs),
+        ];
+        let mut rows = Vec::new();
+        for (name, partition) in partitions {
+            for row in partition.iter() {
+                let (key, value) = row.into_inner()?;
+                rows.push((name, key.to_vec(), value.to_vec()));
+            }
+        }
+        Ok(rows)
+    }
+
     pub fn prover_jobs(&self) -> Result<Vec<ProverJob>> {
         let prefix = node_record(NodeRow::ProverJob, &[]);
         let mut jobs = Vec::new();
