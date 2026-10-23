@@ -147,7 +147,13 @@ fn stated(cluster: &Cluster, anchoring: &Anchoring) -> (Agents, Attest) {
         reader: reader_agent(cluster, &[1, 2, 3]),
     };
     write(cluster, agents.reader, 1..=20);
-    let attest = read_at(cluster, anchoring, &agents, 0, (cluster.session(agents.reader), 21));
+    let attest = read_at(
+        cluster,
+        anchoring,
+        &agents,
+        0,
+        (cluster.session(agents.reader), 21),
+    );
     (agents, attest)
 }
 
