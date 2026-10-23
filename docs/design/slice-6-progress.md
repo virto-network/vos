@@ -3662,18 +3662,19 @@ On `s6/e2e` (from `ede9f2af`). The full record is the step's log.
     went with the Kreivo tooling; `Node::sign_registration` signs pin D's
     registration digest only, and `Jam::register_signed` takes it.
   - **Guarantors take no package for a few slots after the jump:** the
-    replays wait five finalized slots and send again while refused.
-- **Added:** `vos_jam`'s `PolkaJam::work_report` and `anchor_of`,
-  `Statements::land_package`, `Jam::land_package` (a landed item's
-  package, for its report); `just clippy-prover` lints `vos-node`'s tests
-  with `chain` (the carrier audit's and this one).
+    replays wait five finalized slots; a replay whose package was refused
+    or did not land in time is sent again, and one that landed late counts.
+- **Added:** `vos_jam`'s `PolkaJam::work_report`; `just clippy-prover`
+  lints `vos-node`'s tests with `chain` (the carrier audit's and this
+  one). (The review's fold below replaced the landing helpers with a
+  watch.)
 - **Measured** [measured, the run that passed; the machine shared]:
   - **latency, `B_w` to acceptance** (L 120 s, D 24 s): Kreivo 48.8 s
     (`t_prove` 17.0 s); JAM 60.6–103.5 s, a window's two statements proved
     in turn (`t_prove` 15.6–39.8 s; after its proof 16–21 s: the anchor's
     landing and the submission's, about three slots each). Pin D's
-    `L/2 + D + t_prove + inclusion` for a request at a random time is
-    108–140 s here (inclusion taken as the time after the proof); the gate
+    `L/2 + D + t_prove + inclusion`, for reference only (its `L/2`
+    computed, not measured), is 108–140 s with these terms; the gate
     `L + D + t_prove + 30 s` is 189.6–213.8 s: **every statement within
     it**, the slowest 103.5 s against its 213.8 s;
   - **JAM gas:** refine 83.24M–84.13M a statement (a statement accepted,
@@ -3701,9 +3702,68 @@ On `s6/e2e` (from `ede9f2af`). The full record is the step's log.
   2's anchors are queued, 30 of 30; then at `9bf4ed57` green, 105 suites,
   1,362 passed, 0 failed, about 14 minutes (12 GiB scope, `nice -n 10`, 8
   jobs).
-- **Left out:** the anchors' own work reports (their items land through
-  the node's anchor queue, not the run's; the anchors are carriers as sent
-  and as the service keeps them); the Kreivo leg on a dev chain (M3b's
+- **Left out:** the Kreivo leg on a dev chain (M3b's
   deferred gate 2, the teammate's pallet and the ported transport); the
   latency of a request at a random time in its window (pin D's `L/2`),
   computed from the measured terms rather than sampled.
+
+**The review** (Opus, fix then merge), folded (`d678d348`, `5859c409`):
+- **1 (medium), the real JAM wire:** `Tapped` re-encodes what a client is
+  asked to send, and the anchors the node's `AnchorQueue` landed, their
+  reports, the registration and the replays went around it. `PolkaJam`
+  has a `watch` (`vos_jam::live::Watch`, none in a node's client), shown
+  each package `submit_package` sent and its extrinsics once the node took
+  it; each deployment's watch in the run keeps every package (19: JAM `a`
+  16, the registration, the anchors, the statements and replays; `b` 3)
+  and reads each one's work report while its status names it. Every
+  package, extrinsic and report is a carrier that leaves, searched in
+  every form. **`Reach::Recorded` kept** for the testnet's log and
+  database: what reached the chain is now audited whole and at full
+  strength as it went, so the chain's own record of it adds only its own
+  numbers, hashes and code, where a number's forms match by chance (run 4:
+  connection ids, a register's value in the service's code), and blanking
+  the deployed blobs would not stop the log's counters. What `Recorded`
+  searches is stated exactly (`carriers/mod.rs`, `needles.rs`,
+  `SECURITY.md`): every needle's bytes, whole hex and `Debug` list (and
+  M31 limb forms), a register file's bytes; not a hex prefix, a number's
+  forms or a debug output's text.
+- **2 (medium), canaries:** a TRACE line from a node's thread and a line
+  on standard error are asserted in the logs and standard error; the
+  chain directory and the log are expected, not skipped; the chain's
+  database holds a submitted statement's encoding and its work report as
+  plain bytes (asserted: the database is searchable, not compressed or
+  erasure-coded where they lie), and its log a report's hash as it names
+  it (`0x` and 16 hex characters), asserted.
+- **3:** the run's own `Jam` venue is gone; the nodes and the run use the
+  production `JamVenue`, wrapped only in `Recorded` and `Tapped`; gas is
+  read from the outcome the service keeps of each submission's item in
+  any package the watch saw.
+- **4:** `Statements::land_package` and `Jam::land_package` removed,
+  `anchor_of` crate-private; `PolkaJam::work_report` and
+  `Jam::register_signed` kept.
+- **5:** `Node::sign_registration` returns none for a node of no space or
+  one the genesis does not name
+  (`anchor_keys::only_a_founding_node_signs_the_registration`).
+- **6:** a replay's package that lands after its wait timed out is kept by
+  the watch, its report collected, and its outcome counts; the record says
+  a replay is sent again only when its package did not land.
+- **7:** pin D's figure is a single reference line, not a column.
+- **8:** the test in phases (`Run::start`, `kreivo_leg`, `migrate`,
+  `jam_leg`, `rootless`, `judged`, `replays`) and modules (`kernels`,
+  `collect`, `measure`).
+
+**After the fold** [measured, run 6, at `5859c409`'s code]: every verdict as
+before (Kreivo window 1 accepted; windows 3–5 at JAM, six accepted;
+window 3's at Kreivo `0x5`; rootless bound `0`/`0x7`, unbound `0`/`0`;
+past `MaxRootAge` `0x6`, `0x6`, `0x6`, rooted `0x5`). Latency: Kreivo
+49.7 s; JAM 60.8–97.1 s; gates 191.9–210.3 s, all within; pin D's
+reference 108.9–138.4 s. Refine 82.04M–84.74M a statement accepted, the
+venue-bound one refused at `b` before its proof 0.11M; last accumulate
+286,989. Kreivo: 5.5 UNITS charged, asserted, no alert. Prover: 7
+statements at cuts in 170.5 s, 24.4 s on average. Audit: 290 carriers, 19
+packages with their extrinsics and reports; needles 219 node-proof, 67
+row and argument, 455 hash, 42 step, 39 memory-root, 89 register, 7
+debug-output; clean, every canary in its carrier. 1,150 s.
+- **Gates after the fold:** `just e2e-chain` passed (run 6, above); `just
+  check` at `5859c409` green, 105 suites, 1,363 passed, 0 failed (12 GiB
+  scope, `nice -n 10`, 8 jobs).
