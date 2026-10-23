@@ -163,7 +163,7 @@ pub fn store(store: &vos_node::store::Fjall) -> Vec<u8> {
 }
 
 /// The environment that turns every debug output on, in a build that has
-/// them: a run under it shows the outputs [`DEBUG_OUTPUTS`] names unless
+/// them: a run under it shows the outputs [`DEBUG_OUTPUTS`](super::DEBUG_OUTPUTS) names unless
 /// they are compiled out.
 pub const DEBUG_ENVIRONMENT: [&str; 4] = [
     "GREY_PVM_DEBUG",
