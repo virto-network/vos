@@ -1,4 +1,4 @@
-//! `vos jam statements`: the JAM statements service deployed on a running
+//! `vos-jam-dev statements`: the JAM statements service deployed on a running
 //! PolkaJam testnet and driven through its items, each a work package of
 //! its own submitted by RPC with its extrinsics, its outcome read back from
 //! the service's storage:
@@ -22,8 +22,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use vos_jam::live::PolkaJam;
-use vos_jam::live::statements::{MIN_ITEM_GAS, Statements};
+use vos_jam_dev::live::PolkaJam;
+use vos_jam_dev::live::statements::{MIN_ITEM_GAS, Statements};
+use vos_jam_dev::venue::{JamVenue, register_code};
 use vos_pvm::refine_host::{JamItem, JamRefine, RefineContext};
 use vos_pvm_compiler::{ServiceMetadata, service_blob};
 use vos_statement::fixtures::{self, Fixture};
@@ -37,7 +38,6 @@ use vos_statement_service::item::{Control, Item, Op, SignedControl, control_dige
 use vos_statement_service::state::Outcome;
 use vos_statement_service::verdict::{AnchorCode, ControlCode};
 use vos_venue::VenueClient;
-use vos_venue::jam::{JamVenue, register_code};
 use vos_wire::jam::RefineArgs;
 use vos_wire::package::EPOCH_MS;
 use vos_wire::result::digest;

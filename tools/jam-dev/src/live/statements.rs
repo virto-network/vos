@@ -13,7 +13,7 @@ use vos_wire::result::digest;
 
 use super::package::WorkItem;
 use super::{PolkaJam, failed};
-use crate::Error;
+use vos_jam::Error;
 
 /// A package's accumulate gas an item: the service's accumulate takes about
 /// 0.1M a statement on the JAM-only host and on PolkaJam, as measured at 6.19.

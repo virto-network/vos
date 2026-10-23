@@ -3817,3 +3817,39 @@ only with 14 GB or more available]:
 **Milestone review: Fable —** _(verdict pending)_
 
 Commits: this record.
+
+## The JAM client as development tooling (decision 17)
+
+The owner's decision of 2026-10-23: `vos` and the node know no JAM. A
+blob is deployed on JAM with JAM's tooling; a JAM extension running a
+light node lets agents call agents on JAM later, once extensions exist
+(12d). Until then the JAM client is development and test tooling.
+
+- **Moved** into `tools/jam-dev` (`vos-jam-dev`, `publish = false`): the
+  PolkaJam JSON-RPC and `jamt` driver, work packages with extrinsics and
+  the statements service's client (`vos_jam_dev::live`, from
+  `vos_jam::live`); `Jam` and `JamVenue` (`vos_jam_dev::venue`, from
+  `vos_venue::jam`); the `vos jam service | testnet | statements`
+  commands, now the `vos-jam-dev` binary's; `testnet.sh` and
+  `clock-shift.c`. `just jam-testnet`, `jam-statements-testnet` and
+  `e2e-chain` run through it; `vos-node`'s `chain` test takes it as a
+  dev-dependency.
+- **Kept, shipped:** the JAM statements service; `vos-jam`, the
+  agent-as-JAM-service build (the builder, `programs`, the simulation,
+  the emulated JAM), now without `base64`, `serde_json`, `hex` or the
+  service among its dependencies (`MAX_INPUT` and `MAX_REFINE_OUTPUT`
+  public for the dev crate's checks); `vos-venue` with the `VenueClient`
+  trait, `ModelVenue`, `AnchorQueue` and the Kreivo client against its
+  mock, no longer depending on `vos-jam` or the service.
+- **`vos-cli`** has no JAM dependency on a normal edge (its `cli` test
+  compares an install's derivation with `vos_jam::programs::derive`'s, a
+  dev-dependency); the `vos jam` command is gone.
+- **`just check-no-jam-dev`** (in `check` and `ci`): `cargo tree -e
+  no-dev --target all` of `vos-cli`, with and without the prover, and of
+  `vos-node`, with and without it, holds neither `vos-jam-dev` nor
+  `vos-jam`.
+- **Docs:** decision 17 in `owner-decisions.md`; 6.19 and 6.21 of the
+  plan say the JAM client is tooling, and that the M3b/M3c review's M4
+  (no operator path to a venue) is resolved by the decision: venues
+  attach through extensions, and no `vos node run` venue option comes in
+  this slice; `core-model.md` §18.

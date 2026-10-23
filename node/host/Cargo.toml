@@ -71,8 +71,11 @@ rayon = "1"
 mimalloc = "0.1.52"
 # The window actor's accounts, which the end to end on chain writes.
 cipher-clerk = { workspace = true, features = ["settlement"] }
-# The JAM statements service the end to end on chain deploys.
+# The JAM statements service the end to end on chain deploys, and the
+# development tooling that deploys it on a PolkaJam testnet and anchors and
+# submits there (`JamVenue`).
 vos-statement-service = { workspace = true }
+vos-jam-dev = { path = "../../tools/jam-dev" }
 
 [[test]]
 name = "crash"

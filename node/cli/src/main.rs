@@ -3,7 +3,6 @@
 
 mod args;
 mod call;
-mod jam;
 mod kept;
 mod operator;
 
@@ -80,7 +79,6 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Call(arguments) => call::call(&arguments),
         Command::Query { call, linearizable } => call::query(&call, linearizable),
         Command::Workflow(read) => read_workflow(&read),
-        Command::Jam { command } => command.run(),
         #[cfg(feature = "prover")]
         Command::ProgramId {
             elf,

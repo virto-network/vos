@@ -19,7 +19,7 @@ use vos_wire::result::digest;
 
 use super::rpc::decoded;
 use super::{PolkaJam, Watch, failed};
-use crate::Error;
+use vos_jam::Error;
 
 /// The code hash of PolkaJam's bootstrap authorizer, which service 0 hosts:
 /// what `jamt` 0.1.29 (PolkaJam v0.8.0) names in every package it builds,
@@ -298,7 +298,10 @@ mod tests {
             ..item.clone()
         };
         let package = encode_package(&context, &[large]);
-        assert_eq!(package.len(), 200_000 + crate::builder::PACKAGE_FRAMING - 2);
+        assert_eq!(
+            package.len(),
+            200_000 + vos_jam::builder::PACKAGE_FRAMING - 2
+        );
 
         let with = WorkItem {
             extrinsics: vec![vec![1, 2, 3]],

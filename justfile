@@ -184,7 +184,7 @@ build-representative:
 # default agent against it, the checker's own model, the node running the
 # agent, the network between nodes, and the `vos` command.
 test-agent: build-test-actors build-agent build-representative
-    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli
+    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
     just test-reads
@@ -194,17 +194,17 @@ test-agent: build-test-actors build-agent build-representative
 # later ones, every read witnessed. Outside `ci`: it needs the PolkaJam
 # binaries, in POLKAJAM or the directory `testnet.sh` names by default.
 jam-testnet: build-test-actors build-agent
-    bash node/jam/testnet.sh
+    bash tools/jam-dev/testnet.sh
 
 # The JAM statements service on a local PolkaJam testnet, which it starts
 # and stops: deployed, a space registered and a window anchored, the golden
 # fixtures' masked statements submitted with their proofs as extrinsics,
 # each outcome read back, every refine's gas against the JAM-only host's.
-# `bash node/jam/testnet.sh both` deploys it beside the default agent.
+# `bash tools/jam-dev/testnet.sh both` deploys it beside the default agent.
 # Outside `ci`, as `jam-testnet` is.
 jam-statements-testnet:
     cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
-    bash node/jam/testnet.sh statements
+    bash tools/jam-dev/testnet.sh statements
 
 # The end to end on chain (`slice-6-on-chain.md` 6.21), on a local PolkaJam
 # testnet it starts and stops (`testnet.sh chain`): three nodes of a space
@@ -220,7 +220,7 @@ jam-statements-testnet:
 e2e-chain: build-test-actors build-agent build-representative
     cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
     cargo test -p vos-node --features chain --test chain --no-run
-    bash node/jam/testnet.sh chain
+    bash tools/jam-dev/testnet.sh chain
 
 # A plain build of `vos` carries no faults: building the fault suite's
 # `vos` with the feature must not leak into it, and no workspace member
@@ -236,6 +236,20 @@ check-no-faults:
 # another is caught.
 _no-feature feature +args:
     if (cargo tree {{args}} -e no-dev --target all -f '{f}' --prefix none | lines | each {|line| $line | str replace ' (*)' '' | split row ',' } | flatten | any {|enabled| $enabled == '{{feature}}' }) { error make { msg: "cargo tree {{args}} enables {{feature}}" } }
+
+# Fails when the build `cargo tree <args>` resolves (its normal and build
+# edges, for every target) holds `package`.
+_no-dep package +args:
+    if (cargo tree {{args}} -e no-dev --target all -f '{p}' --prefix none | lines | any {|line| ($line | split row ' ' | first) == '{{package}}' }) { error make { msg: "cargo tree {{args}} holds {{package}}" } }
+
+# A node knows no JAM: the JAM client (a PolkaJam node's RPC and `jamt`,
+# the statements service's client and `JamVenue`) is development tooling,
+# `vos-jam-dev`, and neither the `vos` binary, with or without the prover,
+# nor `vos-node` depends on it, nor on the agent-as-JAM-service builder
+# (`vos-jam`), on a normal or build edge.
+check-no-jam-dev:
+    for package in [vos-jam-dev vos-jam] { just _no-dep $package -p vos-cli; just _no-dep $package -p vos-cli --features prover; just _no-dep $package -p vos-node; just _no-dep $package -p vos-node --features prover }
+    print "no JAM client in the node"
 
 # The masked prover's test seams (`vos-pvm-recair`'s `seeded-masks`: the
 # seeded randomness `MaskRng::Seeded` and the forced proof
@@ -410,12 +424,12 @@ fuzz secs="60":
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-no-debug-internals check-kit build-test-actors build-agent build-representative fuzz-replay
+check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-no-debug-internals check-no-jam-dev check-kit build-test-actors build-agent build-representative fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     just clippy-prover
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures
     just test-recair
-    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli
+    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev
     just test-reads
 
 # The live runs of reads at a cut on the agent's model, with no proving:
@@ -427,7 +441,7 @@ test-reads:
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
-ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats check-no-debug-internals check-kit fuzz-replay
+ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats check-no-debug-internals check-no-jam-dev check-kit fuzz-replay
 
 # The gate at a milestone: `ci` plus the prover suites, the soundness gates
 # (the leakage tests at their medium N), the bench tests that prove and the

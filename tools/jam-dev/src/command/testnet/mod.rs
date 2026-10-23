@@ -1,4 +1,4 @@
-//! `vos jam testnet`: the default agent deployed on a running PolkaJam
+//! `vos-jam-dev testnet`: the default agent deployed on a running PolkaJam
 //! testnet, with the counter's and the shop's programs, its workflows in
 //! it, as the service's preimages, and run, a package each: the programs
 //! solicited, the installs, a request that writes state, a workflow's
@@ -19,9 +19,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vos_jam::live::{Live, PolkaJam};
 use vos_jam::programs::Installable;
 use vos_jam::{Builder, Chain, Emulated, Error, Runner, Store, Taken};
+use vos_jam_dev::live::{Live, PolkaJam};
 use vos_pvm::refine::PreparedProgram;
 use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Admin, Input};

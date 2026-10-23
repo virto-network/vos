@@ -82,7 +82,7 @@ use crate::{Error, gas};
 
 /// The largest work package input the builder makes: PolkaJam's
 /// `max_input` (`W_B`) is 13,791,360 bytes, imports and all.
-pub(crate) const MAX_INPUT: usize = 12 << 20;
+pub const MAX_INPUT: usize = 12 << 20;
 /// JAM-NP's CE 133 bound on a work package: its first message, the core's
 /// index (2 bytes) and the package, at most 204,802 bytes, so a guarantor
 /// downloads no huge package before it checks its authorization. PolkaJam

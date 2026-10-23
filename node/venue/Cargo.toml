@@ -3,7 +3,7 @@ name = "vos-venue"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "A venue as a VOS node reaches it: anchoring a space's roots, submitting statements, and asking what is anchored; the model venue the node's tests anchor at; the client of Kreivo's spaces pallet; and a JAM statements service."
+description = "A venue as a VOS node reaches it: anchoring a space's roots, submitting statements, and asking what is anchored; the model venue the node's tests anchor at; the anchor queue of a client that reaches a chain; and the client of Kreivo's spaces pallet, against its mock."
 
 [features]
 # The reference mock of Kreivo's spaces pallet and a transport over it,
@@ -20,10 +20,7 @@ parity-scale-codec = { version = "3.7.5", features = ["derive", "std"] }
 tracing = "0.1"
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 vos-anchor = { workspace = true }
-# A JAM statements service, reached through its client.
-vos-jam = { workspace = true }
 vos-statement = { workspace = true }
-vos-statement-service = { workspace = true }
 
 [dev-dependencies]
 # The conformance vectors, as JSON.

@@ -12,14 +12,14 @@
 //! package's ELF as a VOS node derives them ([`programs`]).
 //!
 //! [`Emulated`] is a JAM node in process, DA included, so the whole
-//! loop runs without one; [`live`] reaches a PolkaJam node.
+//! loop runs without one. A real JAM node is reached by JAM's tooling and
+//! by VOS's development tooling (`vos-jam-dev`), never by a VOS node.
 
 mod admit;
 pub mod builder;
 mod chain;
 mod da;
 pub mod gas;
-pub mod live;
 pub mod programs;
 mod simulate;
 mod store;
@@ -31,7 +31,7 @@ use vos_wire::ids::WorkflowId;
 
 pub use admit::admit;
 pub use builder::{Attempt, Builder, Fate, Prepared, Taken};
-pub use chain::{Chain, Emulated, Fault, Landed, Refined};
+pub use chain::{Chain, Emulated, Fault, Landed, MAX_REFINE_OUTPUT, Refined};
 pub use da::{Da, Segments};
 pub use simulate::{Runner, Simulation};
 pub use store::{Exported, Pending, Store, View};

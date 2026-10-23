@@ -7,11 +7,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use vos_jam::live::{PolkaJam, Watch};
+use vos_jam_dev::JamVenue;
+use vos_jam_dev::live::{PolkaJam, Watch};
 use vos_node_prover::masked::Disclosing;
 use vos_node_prover::{Internals, ProveError, Prover};
 use vos_statement_service::state::Outcome;
-use vos_venue::jam::JamVenue;
 use vos_venue::kreivo::Transport;
 use vos_venue::kreivo::calls::AccountId;
 use vos_venue::kreivo::transport::{Included, Lost, SendError, Signed};
@@ -165,7 +165,7 @@ impl Sent {
 const REPORTED: Duration = Duration::from_secs(90);
 
 /// Every work package a JAM service's client sent, anchors, registrations
-/// and statements alike (`vos_jam::live::Watch`), each one's work report
+/// and statements alike (`vos_jam_dev::live::Watch`), each one's work report
 /// read apart while the chain's status of the package names it.
 #[derive(Default)]
 pub struct Wire(Mutex<Vec<Sent>>);

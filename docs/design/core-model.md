@@ -1468,11 +1468,19 @@ knowledge and aggregation are the longest work and gate goal 8.
     - **Decided:** the prover is a built-in node component for good, not
       an extension, because proving is essential to VOS. The HTTP ingress
       is built in for now.
+    - **Decided:** the node knows no JAM (slice 6's decision 17). A
+      program is deployed on JAM with JAM's tooling, and VOS ships the
+      JAM statements service and the agent-as-JAM-service build; the JAM
+      client VOS wrote (a PolkaJam node's RPC and `jamt`, the statements
+      service's client and venue) is development and test tooling
+      (`tools/jam-dev`), which no node links. Venues, JAM's among them,
+      attach to a node through extensions.
     - **Open:** the extension host itself and its multi-node form,
       deferred until after the planned slices:
       - the node process and its scheduler across agents;
       - storage and networking ownership;
       - ingress;
-      - how native extensions attach: the SSH transport and the Substrate
-        light client. On master they are small capability adapters
-        behind an extension host.
+      - how native extensions attach: the SSH transport, the Substrate
+        light client, and a JAM light node through which agents call
+        agents on JAM with work packages and their proofs. On master the
+        first two are small capability adapters behind an extension host.

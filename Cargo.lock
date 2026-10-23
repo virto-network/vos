@@ -2619,9 +2619,6 @@ dependencies = [
  "vos-node-prover",
  "vos-pvm",
  "vos-pvm-compiler",
- "vos-statement",
- "vos-statement-service",
- "vos-venue",
  "vos-wire",
 ]
 
@@ -2629,18 +2626,38 @@ dependencies = [
 name = "vos-jam"
 version = "0.1.0"
 dependencies = [
- "base64",
  "ed25519-dalek",
  "fjall",
- "hex",
  "lz4_flex 0.13.1",
- "serde_json",
  "thiserror",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-pvm-program",
+ "vos-tree",
+ "vos-wire",
+]
+
+[[package]]
+name = "vos-jam-dev"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "clap",
+ "ed25519-dalek",
+ "getrandom 0.2.17",
+ "hex",
+ "serde_json",
+ "tracing",
+ "vos-anchor",
+ "vos-jam",
+ "vos-node",
+ "vos-pvm",
+ "vos-pvm-compiler",
+ "vos-pvm-program",
+ "vos-statement",
  "vos-statement-service",
  "vos-tree",
+ "vos-venue",
  "vos-wire",
 ]
 
@@ -2684,6 +2701,7 @@ dependencies = [
  "tracing",
  "vos-checker",
  "vos-jam",
+ "vos-jam-dev",
  "vos-net",
  "vos-node-prover",
  "vos-pvm",
@@ -2985,10 +3003,8 @@ dependencies = [
  "tracing",
  "twox-hash",
  "vos-anchor",
- "vos-jam",
  "vos-pvm-final-verifier",
  "vos-statement",
- "vos-statement-service",
 ]
 
 [[package]]

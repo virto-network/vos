@@ -29,16 +29,10 @@ ed25519-dalek = "2"
 getrandom = "0.2"
 hex = "0.4"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
-vos-jam = { workspace = true }
 vos-node = { path = "../host" }
 vos-node-prover = { workspace = true, optional = true }
 vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
-# The golden fixtures' masked statements, which `vos jam statements` submits
-# to a JAM statements service.
-vos-statement = { workspace = true, features = ["fixtures"] }
-vos-statement-service = { workspace = true }
-vos-venue = { workspace = true }
 vos-wire = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -49,6 +43,9 @@ futures-rustls = { version = "0.26", default-features = false, features = ["ring
 httparse = "1"
 smol = "2"
 vos-checker = { path = "../checker" }
+# The agent-as-JAM-service builder's derivation, which an install's must
+# equal.
+vos-jam = { workspace = true }
 tempfile = "3"
 
 [[bench]]

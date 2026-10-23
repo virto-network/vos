@@ -1,4 +1,5 @@
-//! `vos jam`: an agent as a JAM service, built and driven by its builder.
+//! `vos-jam-dev`'s commands: an agent as a JAM service, built and driven by
+//! its builder, and the JAM statements service deployed and driven.
 
 mod reference;
 mod statements;

@@ -9,7 +9,7 @@ use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
 
 use super::{PolkaJam, failed};
-use crate::Error;
+use vos_jam::Error;
 
 impl PolkaJam {
     /// One JSON-RPC call: its result.

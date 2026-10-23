@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use vos_tree::Hash;
 
 use super::{PolkaJam, failed};
-use crate::Error;
+use vos_jam::Error;
 
 /// How long a `jamt` command may take.
 const JAMT_TIMEOUT: Duration = Duration::from_secs(300);

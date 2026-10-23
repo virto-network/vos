@@ -1,5 +1,5 @@
 //! A JAM statements service as a node's venue ([`JamVenue`]), through
-//! `vos_jam::live::statements`: each call an item in a work package of its
+//! [`crate::live::statements`]: each call an item in a work package of its
 //! own, waited for until its outcome lands in the service's storage, about
 //! two slots past the finalized block it was anchored at.
 //!
@@ -23,10 +23,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::live::statements::{Item as Package, Statements};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use vos_anchor::{Anchor, Migrate, RootRead, SpaceGenesis, SpaceId, VenueId, register_digest};
 use vos_jam::Error;
-use vos_jam::live::statements::{Item as Package, Statements};
 use vos_statement::{MAX_ROOT_AGE_MS, Statement, StatementId};
 use vos_statement_service::config::{Config, configure};
 use vos_statement_service::item::{
@@ -35,8 +35,10 @@ use vos_statement_service::item::{
 use vos_statement_service::state::{AnchorRecord, Outcome, SpaceRecord, keys};
 use vos_statement_service::verdict::{AnchorCode, MigrateCode, RegisterCode};
 
-use crate::queue::{AnchorQueue, AnchorSend, Fate};
-use crate::{AnchorRefusal, Anchored, MigrateRefusal, NotAccepted, Status, Unjudged, VenueClient};
+use vos_venue::queue::{AnchorQueue, AnchorSend, Fate};
+use vos_venue::{
+    AnchorRefusal, Anchored, MigrateRefusal, NotAccepted, Status, Unjudged, VenueClient,
+};
 
 /// How long an item's outcome may take to land.
 pub const LANDING: Duration = Duration::from_secs(120);
@@ -369,8 +371,8 @@ mod tests {
         use std::path::PathBuf;
         use std::time::Instant;
 
+        use crate::live::PolkaJam;
         use vos_anchor::RootKind;
-        use vos_jam::live::PolkaJam;
 
         // A node that takes connections and never answers.
         let stalled = TcpListener::bind("127.0.0.1:0").unwrap();

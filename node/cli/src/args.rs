@@ -7,7 +7,6 @@ use clap::{Parser, Subcommand};
 use vos_node::client::Target;
 use vos_node::tls::{IngressTls, Trust};
 
-use crate::jam::JamCommand;
 use crate::{at, failed, key_bytes};
 
 /// The version, saying so when the build injects faults.
@@ -71,11 +70,6 @@ pub enum Command {
     /// Read a workflow the client key started, by the id its start was
     /// answered with: where it stands, or its result once it ended.
     Workflow(WorkflowArgs),
-    /// An agent as a JAM service, which its builder drives.
-    Jam {
-        #[command(subcommand)]
-        command: JamCommand,
-    },
     /// The program id of an actor's attestable method's kernel, derived
     /// from its ELF as an install derives it: eight M31 words, in decimal.
     /// With `--circuits`, the circuits' constants instead, each a line of

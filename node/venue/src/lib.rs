@@ -14,10 +14,13 @@
 //! removed as `spaces-pallet.md`'s controller does, and `resume` lifts a
 //! suspension once neither equivocating key is registered.
 //!
-//! [`kreivo::KreivoVenue`] is Kreivo's: the client of its spaces pallet.
+//! [`kreivo::KreivoVenue`] is Kreivo's: the client of its spaces pallet,
+//! built only against its mock until the pallet is vetted. A client that
+//! reaches a chain queues its anchors in an [`queue::AnchorQueue`].
 //!
-//! [`jam::JamVenue`] is a JAM statements service (`vos-statement-service`)
-//! on a JAM node, through `vos-jam`'s client.
+//! A node reaches no JAM node: a JAM statements service is a venue only
+//! through VOS's development tooling (`vos-jam-dev`'s `JamVenue`), and
+//! venues attach to a node through extensions.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -519,7 +522,6 @@ impl VenueClient for ModelVenue {
     }
 }
 
-pub mod jam;
 pub mod kreivo;
 pub mod queue;
 

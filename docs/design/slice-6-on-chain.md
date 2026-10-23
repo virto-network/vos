@@ -1720,6 +1720,14 @@ fees are the teammate's.
   payload's hash; the golden fixtures each fail one check alone, so the
   service, verifying the proof before it reads its state, reaches every
   fixture's class.
+- **The JAM client is development tooling** (decision 17): the
+  PolkaJam RPC and `jamt` driver, the statements service's client,
+  `JamVenue` and the deploy-and-drive commands live in `tools/jam-dev`
+  (`vos-jam-dev`), which `jam-testnet`, `jam-statements-testnet` and
+  `e2e-chain` use and neither `vos` nor `vos-node` depends on (`just
+  check-no-jam-dev`). VOS ships the service and the agent-as-JAM-service
+  build (`vos-jam`); deploying either on JAM is JAM's tooling's, and a
+  node reaches JAM, later, through an extension running a light node.
 - **Dep:** 6.0b, 6.5, 6.10. **Estimate:** 2.5–3 weeks (the new deploy
   tooling takes the upper bound).
 
@@ -1762,6 +1770,14 @@ fees are the teammate's.
   deposits and fees the mock charged the sovereign account; the worker's
   throughput.
 - **Gate:** every verdict as expected; latency ≤ L + D + t_prove + 30 s.
+- **The JAM venue is the harness's** (decision 17): the end to end
+  reaches the JAM service through `vos-jam-dev`'s `JamVenue`, a dev
+  crate, and the node takes its venue from the harness's `Config`. The
+  M3b/M3c Fable review's M4 (no operator path to a venue) is resolved by
+  that decision: venues attach to a node through extensions, after the
+  slices (12d), and there is no `vos node run` venue option in this
+  slice; the production shape of the harness's `Migrating` client (a
+  venue by window range) comes with them.
 - **Dep:** 6.17b, 6.18, 6.19, 6.20. **Estimate:** 1–2 weeks.
 
 ### 6.22 Acceptance, and the code-quality rest from slice 5

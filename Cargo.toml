@@ -32,6 +32,7 @@ members = [
     "pvm/proof/derive",
     "pvm/proof/verifier",
     "pvm/bench",
+    "tools/jam-dev",
 ]
 exclude = [
     # Built with `cargo fuzz` (nightly flags, panic = abort).

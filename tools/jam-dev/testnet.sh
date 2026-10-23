@@ -3,10 +3,10 @@
 # - `agent` (the default): the default agent deployed with the counter and
 #   the shop, a workflow suspended in one work package and resumed in later
 #   ones, every state read witnessed against the root on chain, each batch
-#   checked against a VOS node in process (`vos jam testnet`);
+#   checked against a VOS node in process (`vos-jam-dev testnet`);
 # - `statements`: the JAM statements service deployed and driven through
 #   its items, each a package submitted by RPC with its extrinsics, its
-#   outcome read back (`vos jam statements`);
+#   outcome read back (`vos-jam-dev statements`);
 # - `both`: the agent, then the statements service beside it;
 # - `chain`: the end to end on chain, `vos-node`'s `chain` test, its
 #   testnet's clock the host's shifted by the eight bytes (milliseconds,
@@ -37,7 +37,7 @@ run="${JAM_RUN:-$(mktemp -d "$scratch/vos-jam-testnet.XXXXXX")}"
 mkdir -p "$run/builder"
 rpc="localhost:19800"
 unit="vos-jam-testnet-$$"
-vos="${CARGO_TARGET_DIR:-$root/target}/debug/vos"
+dev="${CARGO_TARGET_DIR:-$root/target}/debug/vos-jam-dev"
 agent="${CARGO_TARGET_DIR:-$root/agent/default/target}/riscv64em-vos/release/vos-agent.elf"
 actors="${CARGO_TARGET_DIR:-$root/agent/test-actors/target}/riscv64em-vos/release"
 service="${CARGO_TARGET_DIR:-$root/target}/riscv64em-vos/release/statement-service.elf"
@@ -65,11 +65,11 @@ fi
 # The testnet's clock: the host's, shifted by the file's milliseconds.
 clock=()
 if [ "$mode" = chain ]; then
-    cc -O2 -shared -fPIC -o "$run/clock-shift.so" "$root/node/jam/clock-shift.c" -ldl
+    cc -O2 -shared -fPIC -o "$run/clock-shift.so" "$root/tools/jam-dev/clock-shift.c" -ldl
     head -c 8 /dev/zero >"$run/clock-shift"
     clock=(LD_PRELOAD="$run/clock-shift.so" VOS_CLOCK_SHIFT="$run/clock-shift")
 else
-    cargo build -q -p vos-cli --manifest-path "$root/Cargo.toml"
+    cargo build -q -p vos-jam-dev --manifest-path "$root/Cargo.toml"
 fi
 
 # The testnet runs in a scope of its own, which stopping stops every
@@ -129,7 +129,7 @@ if [ "$mode" = chain ]; then
     [ "$status" = 0 ] || grep -A8 panicked "$run/stderr" || true
 fi
 if [ "$mode" = agent ] || [ "$mode" = both ]; then
-    "$vos" jam testnet \
+    "$dev" testnet \
         --polkajam "$POLKAJAM" \
         --rpc "$rpc" \
         --agent "$agent" \
@@ -137,7 +137,7 @@ if [ "$mode" = agent ] || [ "$mode" = both ]; then
         --data "$run/builder" | tee "$run/vos.log" || status=$?
 fi
 if { [ "$mode" = statements ] || [ "$mode" = both ]; } && [ "$status" = 0 ]; then
-    "$vos" jam statements \
+    "$dev" statements \
         --polkajam "$POLKAJAM" \
         --rpc "$rpc" \
         --service "$service" \

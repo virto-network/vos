@@ -4,7 +4,7 @@
 //! made available, then wrapped as a venue.
 //!
 //! The testnet's clock is the host's shifted by the milliseconds a file
-//! holds (`node/jam/clock-shift.c`, preloaded into its nodes): the run
+//! holds (`tools/jam-dev/clock-shift.c`, preloaded into its nodes): the run
 //! moves the chain's time, the venue's, past `MaxRootAge` by writing them.
 
 use std::os::unix::fs::FileExt;
@@ -12,11 +12,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
-use vos_jam::live::PolkaJam;
-use vos_jam::live::statements::{MIN_ITEM_GAS, Statements};
+use vos_jam_dev::JamVenue;
+use vos_jam_dev::live::PolkaJam;
+use vos_jam_dev::live::statements::{MIN_ITEM_GAS, Statements};
 use vos_pvm_compiler::{ServiceMetadata, service_blob};
 use vos_statement_service::config::{Config, configure};
-use vos_venue::jam::JamVenue;
 use vos_venue::vos_statement::Pin;
 use vos_wire::package::EPOCH_MS;
 use vos_wire::result::digest;

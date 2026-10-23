@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
 use vos_checker::carriers::{self, Logs, Tapped};
+use vos_jam_dev::JamVenue;
 use vos_node::{Config, Hooks};
 use vos_node_prover::Prover;
 use vos_statement_service::item::Item;
 use vos_statement_service::state::{Outcome as Judged, keys as jam_keys};
-use vos_venue::jam::JamVenue;
 use vos_venue::kreivo::KreivoVenue;
 use vos_venue::vos_statement::Statement;
 use vos_venue::{NotAccepted, VenueClient};
