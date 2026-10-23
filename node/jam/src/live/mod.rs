@@ -51,6 +51,24 @@ pub struct PolkaJam {
     pub jamt: PathBuf,
     /// Where payloads are written for `jamt` to read.
     pub files: PathBuf,
+    /// Shown each package [`PolkaJam::submit_package`] submitted: none in a
+    /// node's client.
+    pub watch: Option<Watch>,
+}
+
+/// What sees each work package a [`PolkaJam`] submitted, once the node
+/// took it: its encoding and its extrinsics, as they went. A run that
+/// audits what reached the chain keeps them.
+#[derive(Clone)]
+pub struct Watch(pub Arc<Watching>);
+
+/// A [`Watch`]'s function: a package's encoding and its extrinsics.
+pub type Watching = dyn Fn(&[u8], &[Vec<u8>]) + Send + Sync;
+
+impl std::fmt::Debug for Watch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Watch")
+    }
 }
 
 /// The protocol's parameters the builder reads.

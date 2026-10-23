@@ -410,3 +410,38 @@ fn a_rotation_survives_its_crash() {
     assert_eq!(anchored(&anchoring, &cluster, &clock, 3).signer, rotated);
     assert_eq!(windows(&anchoring, &cluster), [0, 1, 2, 3]);
 }
+
+/// A founding node signs the space's registration by its node key, over
+/// pin D's registration digest; a node the genesis does not name, or a
+/// node of no space, signs none.
+#[test]
+fn only_a_founding_node_signs_the_registration() {
+    let venue = vos_wire::vos_anchor::VenueId([0x5e; 32]);
+    let cluster = Cluster::founded_by(3, &[1, 2], clock(), |_, _| {});
+    let space = cluster.space.id();
+    let (key, signature) = cluster
+        .node(2)
+        .sign_registration(&venue, &[9; 32], 4)
+        .expect("a founder signs");
+    let digest = vos_wire::vos_anchor::register_digest(&venue, &space, &[9; 32], 4);
+    assert_eq!(key, cluster.node(2).id().0, "by its node key");
+    ed25519_dalek::VerifyingKey::from_bytes(&key)
+        .unwrap()
+        .verify_strict(&digest, &ed25519_dalek::Signature::from_bytes(&signature))
+        .expect("over the registration digest");
+    assert!(
+        cluster
+            .node(3)
+            .sign_registration(&venue, &[9; 32], 4)
+            .is_none(),
+        "not a founder"
+    );
+    let spaceless = Cluster::in_space(1, None, |_, _| {});
+    assert!(
+        spaceless
+            .node(1)
+            .sign_registration(&venue, &[9; 32], 4)
+            .is_none(),
+        "of no space"
+    );
+}

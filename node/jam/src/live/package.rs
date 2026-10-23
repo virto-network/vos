@@ -18,7 +18,7 @@ use vos_tree::Hash;
 use vos_wire::result::digest;
 
 use super::rpc::decoded;
-use super::{PolkaJam, failed};
+use super::{PolkaJam, Watch, failed};
 use crate::Error;
 
 /// The code hash of PolkaJam's bootstrap authorizer, which service 0 hosts:
@@ -126,7 +126,7 @@ fn named(answer: &serde_json::Value) -> Result<(String, Hash, u32), Error> {
 
 /// The anchor the context of `package`, as [`encode_package`] lays it out,
 /// names: the block's hash past the auth host and the auth code hash.
-pub fn anchor_of(package: &[u8]) -> Option<Hash> {
+pub(crate) fn anchor_of(package: &[u8]) -> Option<Hash> {
     package.get(36..68)?.try_into().ok()
 }
 
@@ -221,6 +221,13 @@ impl PolkaJam {
             "submitWorkPackage",
             json!([core, STANDARD.encode(&package), extrinsics]),
         )?;
+        if let Some(Watch(watch)) = &self.watch {
+            let extrinsics: Vec<Vec<u8>> = items
+                .iter()
+                .flat_map(|item| item.extrinsics.clone())
+                .collect();
+            watch(&package, &extrinsics);
+        }
         Ok(package)
     }
 }

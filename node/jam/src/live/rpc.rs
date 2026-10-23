@@ -126,6 +126,7 @@ mod tests {
             rpc,
             jamt: PathBuf::from("jamt"),
             files: std::env::temp_dir(),
+            watch: None,
         };
         (node, served)
     }

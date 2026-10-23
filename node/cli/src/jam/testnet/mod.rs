@@ -162,6 +162,7 @@ impl Testnet {
             rpc: args.rpc.clone(),
             jamt: args.polkajam.join("jamt"),
             files: args.data.join("files"),
+            watch: None,
         };
         Ok(Self {
             agent: link(&args.agent)?,

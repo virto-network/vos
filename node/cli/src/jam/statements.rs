@@ -163,6 +163,7 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
         rpc: args.rpc.clone(),
         jamt: args.polkajam.join("jamt"),
         files: args.data.join("files"),
+        watch: None,
     };
     let parameters = node.parameters()?;
     record.note(format!("testnet: {parameters:?}"));

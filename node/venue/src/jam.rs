@@ -158,23 +158,10 @@ impl Jam {
 
     /// One item, landed: its outcome.
     pub fn land(&self, payload: Vec<u8>, extrinsics: Vec<Vec<u8>>) -> Result<Outcome, Error> {
-        self.land_package(payload, extrinsics)
-            .map(|(_, outcome)| outcome)
-    }
-
-    /// One item, landed: the encoding of its package and its outcome.
-    pub fn land_package(
-        &self,
-        payload: Vec<u8>,
-        extrinsics: Vec<Vec<u8>>,
-    ) -> Result<(Vec<u8>, Outcome), Error> {
-        let (package, mut outcomes) = self
-            .statements
-            .land_package(&[(payload, extrinsics)], LANDING)?;
-        let outcome = outcomes
+        let mut outcomes = self.statements.land(&[(payload, extrinsics)], LANDING)?;
+        outcomes
             .pop()
-            .ok_or_else(|| Error::Node("no outcome".into()))?;
-        Ok((package, outcome))
+            .ok_or_else(|| Error::Node("no outcome".into()))
     }
 
     /// Items landed together, in one package: each one's outcome.
@@ -391,6 +378,7 @@ mod tests {
             rpc: stalled.local_addr().unwrap().to_string(),
             jamt: PathBuf::from("jamt"),
             files: std::env::temp_dir(),
+            watch: None,
         };
         let statements = Statements {
             node,
