@@ -244,3 +244,21 @@ fn the_gas_a_rerun_left_is_the_runs() {
             .any(|needle| !audit(Reach::Leaves, run.as_bytes(), needle.clone()).is_empty())
     );
 }
+
+/// The wrap's randomness is a needle in every carrier, the role's own
+/// included.
+#[test]
+fn the_wraps_randomness_is_searched_everywhere() {
+    let seed: Vec<u8> = (0..32).map(|byte| byte * 7 + 3).collect();
+    let internals = Internals {
+        wrap_randomness: vec![("an attempt's seed".into(), seed.clone())],
+        ..Internals::default()
+    };
+    let mut needles = Needles::default();
+    needles.internals("s", &internals);
+    let drawn: Vec<&Needle> = needles.named(Kind::WrapRandomness, "seed").collect();
+    assert_eq!(drawn.len(), 1);
+    for reach in [Reach::Leaves, Reach::Recorded, Reach::Role] {
+        assert_eq!(audit(reach, &seed, drawn[0].clone()).len(), 1, "{reach:?}");
+    }
+}

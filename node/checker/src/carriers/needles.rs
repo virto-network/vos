@@ -245,8 +245,8 @@ impl Needles {
     }
 
     /// What a statement's proof was built from ([`Internals`]): its node
-    /// proofs, step counts and the gas its re-run had left, memory roots
-    /// and registers. A step count of a power of two is a class's budget,
+    /// proofs, step counts and the gas its re-run had left, memory roots,
+    /// registers and the wrap's randomness. A step count of a power of two is a class's budget,
     /// the kernel's public shape, and is not searched; nor a register below
     /// 2^24, whose digits a log line holds by chance, nor one the run's
     /// entry state holds.
@@ -298,6 +298,13 @@ impl Needles {
                 Kind::MemoryRoot,
                 format!("{statement}: a memory root"),
                 root,
+            ));
+        }
+        for (at, (what, bytes)) in internals.wrap_randomness.iter().enumerate() {
+            self.push(Needle::bytes(
+                Kind::WrapRandomness,
+                format!("{statement}: the wrap's {what} ({at})"),
+                bytes,
             ));
         }
         let private = Internals::PRIVATE_REGISTERS;

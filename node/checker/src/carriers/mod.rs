@@ -3,8 +3,8 @@
 //!
 //! A run knows what it must not show: the segment, leaf and fold proofs it
 //! built, the rows it served, the plain hashes of its private arguments,
-//! its step counts, its memory roots and its registers past the io-hash's
-//! φ9..φ12. [`Needles`] holds them, from the prover's internals
+//! its step counts, its memory roots, its registers past the io-hash's
+//! φ9..φ12 and the masked wrap's randomness. [`Needles`] holds them, from the prover's internals
 //! (`vos_node_prover::Internals`) and each statement's record; [`Audit`]
 //! holds the carriers, each as it [`Reach`]es: out of the role (a venue's
 //! call, a log line, a client's answer, a node that does not replicate the
@@ -12,9 +12,9 @@
 //! database), or within the agent's replicas (its log, its blobs, the
 //! frames between them). Every needle is searched in every form in each
 //! carrier that leaves; every needle in its full forms alone in a venue's
-//! record (see [`Reach::Recorded`]); the proofs, memory roots and register
-//! files, which no carrier may hold, in its full forms in those that stay
-//! too.
+//! record (see [`Reach::Recorded`]); the proofs, memory roots, register
+//! files and the wrap's randomness, which no carrier may hold, in its full
+//! forms in those that stay too.
 //!
 //! - [`needles`]: the needles and the forms each is searched in;
 //! - [`audit`]: the carriers and the search;
@@ -51,6 +51,10 @@ pub enum Kind {
     MemoryRoot,
     /// A register past φ9..φ12, or the file φ0..φ8.
     Register,
+    /// The masked wrap's randomness: its attempts' entropy and seeds, the
+    /// witness digest it is hedged with, its blinding values and the seeds
+    /// of its mask, salt and `R` columns.
+    WrapRandomness,
     /// A debug output's own text, which only `debug-internals` builds
     /// print: each instruction a run steps through, the recompiler's
     /// registers, a trace's rows.
@@ -60,7 +64,10 @@ pub enum Kind {
 impl Kind {
     /// Whether no carrier at all may hold it, the role's own included.
     fn nowhere(self) -> bool {
-        matches!(self, Self::NodeProof | Self::MemoryRoot)
+        matches!(
+            self,
+            Self::NodeProof | Self::MemoryRoot | Self::WrapRandomness
+        )
     }
 }
 

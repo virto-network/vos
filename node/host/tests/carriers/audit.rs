@@ -203,6 +203,20 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
         audit.needles.named(Kind::ServedRow, "'s value").count() >= 12,
         "every row served a needle by its value"
     );
+    for drawn in [
+        "entropy",
+        "attempt's seed",
+        "witness digest",
+        "blinding value",
+        "mask column's seed",
+        "salt column's seed",
+        "R column's seed",
+    ] {
+        assert!(
+            audit.needles.named(Kind::WrapRandomness, drawn).count() > 0,
+            "the wrap's randomness has a needle of its {drawn}"
+        );
+    }
 
     // The canaries, one through each capture path.
     let (sent, pooled) = std::sync::mpsc::channel();
@@ -300,6 +314,7 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
         Kind::StepCount,
         Kind::MemoryRoot,
         Kind::Register,
+        Kind::WrapRandomness,
         Kind::DebugOutput,
     ]);
     for carrier in [

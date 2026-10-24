@@ -62,6 +62,8 @@ impl MaskRng {
             .chain_update(witness)
             .chain_update(attempt.to_le_bytes())
             .finalize();
+        super::drawn::note("an attempt's entropy", &entropy);
+        super::drawn::note("an attempt's seed", &seed);
         Ok(ChaCha20Rng::from_seed(seed.into()))
     }
 }

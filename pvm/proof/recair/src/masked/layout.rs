@@ -162,6 +162,9 @@ pub(crate) fn mask_columns(
     rng: &mut ChaCha20Rng,
 ) -> Result<Vec<CircleCoefficients<SimdBackend>>, ProveError> {
     let seeds: Vec<[u8; 32]> = polys.iter().map(|_| rng.r#gen()).collect();
+    for seed in &seeds {
+        super::drawn::note("a mask column's seed", seed);
+    }
     polys
         .par_iter()
         .zip(seeds)

@@ -34,6 +34,7 @@
 //! The format pins the masking ([`Masking`]); nothing here names the wrap,
 //! whose set is [`WrapComponents`].
 
+mod drawn;
 mod layout;
 mod rank;
 mod rng;
@@ -73,6 +74,7 @@ use vos_pvm_recair_air::masked::{
     MaskedComponent, MaskedComponents, WrapComponents,
 };
 
+pub use drawn::{Drawn, drawn_in};
 pub use layout::MaskLayout;
 pub use rank::rank_m31;
 pub use rng::MaskRng;
@@ -317,6 +319,7 @@ where
         },
         &trace.main,
     );
+    drawn::note("the witness digest", &witness);
     let layouts = layout::layouts(trace.log_sizes, masking.log_mask_rows)?;
     let preprocessed: Vec<CircleCoefficients<SimdBackend>> =
         SimdBackend::interpolate_columns(trace.preprocessed, &twiddles)
@@ -512,6 +515,9 @@ where
     }
     let mut polys = composition_poly.into_coordinate_polys().to_vec();
     let seeds: Vec<[u8; 32]> = (0..masking.fri_mask_columns).map(|_| rng.r#gen()).collect();
+    for seed in &seeds {
+        drawn::note("an R column's seed", seed);
+    }
     polys.extend(
         seeds
             .into_iter()
@@ -607,6 +613,14 @@ fn blinding(n_components: usize, rng: &mut ChaCha20Rng) -> Vec<SecureField> {
         .map(|_| SecureField::from_m31_array(core::array::from_fn(|_| rng.r#gen())))
         .collect();
     values.push(-values.iter().copied().sum::<SecureField>());
+    for value in &values {
+        let limbs: Vec<u8> = value
+            .to_m31_array()
+            .iter()
+            .flat_map(|limb| limb.0.to_le_bytes())
+            .collect();
+        drawn::note("a blinding value", &limbs);
+    }
     values
 }
 

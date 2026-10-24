@@ -18,6 +18,7 @@ use vos_pvm_proof::{KernelSegment, Proof, ProvingError, SideNote};
 use crate::context::Finalized;
 use crate::fold::{FoldCircuit, Proved};
 use crate::leaf::{LeafCircuit, NodeOutput};
+use crate::masked::{Drawn, drawn_in};
 use crate::prove::{ProveError, RecairProof};
 use crate::verifier::WitnessError;
 use crate::wrap::{self, WrapCircuit};
@@ -97,13 +98,17 @@ pub enum Built<'a> {
     Leaf(&'a Node),
     /// The fold of two nodes.
     Fold(&'a Node),
+    /// The masked wrap's randomness, as it was drawn
+    /// ([`crate::masked::drawn_in`]); its proof, the final one, is public.
+    Wrap(&'a [Drawn]),
 }
 
 #[cfg(feature = "watch")]
 impl Built<'_> {
-    /// Its proof's trees' roots, in tree order.
+    /// Its proof's trees' roots, in tree order: none for the wrap's.
     pub fn roots(&self) -> Vec<[u8; 32]> {
         match self {
+            Self::Wrap(_) => Vec::new(),
             Self::Segment(segment) => segment
                 .proof
                 .stark_proof
@@ -122,9 +127,11 @@ impl Built<'_> {
         }
     }
 
-    /// Its proof's serde form, as postcard lays it out.
+    /// Its proof's serde form, as postcard lays it out: none for the
+    /// wrap's.
     pub fn encoding(&self) -> Vec<u8> {
         match self {
+            Self::Wrap(_) => Ok(Vec::new()),
             Self::Segment(segment) => postcard::to_allocvec(&segment.proof),
             Self::Leaf(node) | Self::Fold(node) => postcard::to_allocvec(&node.proof),
         }
@@ -241,7 +248,7 @@ pub fn prove_final(
 }
 
 /// [`prove_final`], each segment, leaf and fold shown to `watch` as it is
-/// proved ([`prove_run_watched`]).
+/// proved ([`prove_run_watched`]), then the wrap's randomness.
 #[cfg(feature = "watch")]
 pub fn prove_final_watched(
     program: &KernelProgram,
@@ -260,7 +267,9 @@ fn final_watched(
 ) -> Result<(Vec<u8>, Stats), TreeError> {
     let (root, mut stats) = run_watched(program, entry, run, watch)?;
     let started = Instant::now();
-    let (proof, ..) = wrap(&root, &program.id_preimage())?;
+    let (wrapped, drawn) = drawn_in(|| wrap(&root, &program.id_preimage()));
+    let (proof, ..) = wrapped?;
+    watch(Built::Wrap(&drawn));
     let bytes = crate::wrap::proof_bytes(&proof).ok_or(TreeError::Bytes)?;
     stats.wrap_took = started.elapsed();
     Ok((bytes, stats))

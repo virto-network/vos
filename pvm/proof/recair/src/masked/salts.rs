@@ -71,6 +71,9 @@ pub(crate) fn commit_salted<MC: MerkleChannel>(
         &scheme.base_column_pool,
     );
     let seeds: Vec<[u8; 32]> = (0..salt_columns).map(|_| rng.r#gen()).collect();
+    for seed in &seeds {
+        super::drawn::note("a salt column's seed", seed);
+    }
     let domain = CanonicCoset::new(lifting_log_size).circle_domain();
     let salts: Vec<BaseColumn> = seeds
         .into_par_iter()

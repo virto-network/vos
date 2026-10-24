@@ -1,7 +1,8 @@
 //! What a statement's proof is built from that must never leave the prover
 //! role: the segment, leaf and fold proofs, the run's step counts, its
-//! memory roots and its registers past the io-hash's φ9..φ12. A carrier
-//! audit searches every carrier that leaves the role for them.
+//! memory roots, its registers past the io-hash's φ9..φ12 and the masked
+//! wrap's randomness. A carrier audit searches every carrier that leaves
+//! the role for them.
 
 /// A segment, leaf or fold proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -31,6 +32,11 @@ pub struct Internals {
     pub memory_roots: Vec<[u8; 32]>,
     /// Each boundary's registers, φ0..φ12 (φ9..φ12, the io-hash, public).
     pub registers: Vec<[u64; 13]>,
+    /// The masked wrap's randomness, each value named by what it is
+    /// (`vos_pvm_recair::masked::Drawn`): its attempts' entropy and seeds,
+    /// its witness digest, its blinding values and the seeds of its mask,
+    /// salt and `R` columns.
+    pub wrap_randomness: Vec<(String, Vec<u8>)>,
 }
 
 impl Internals {

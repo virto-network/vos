@@ -236,6 +236,7 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
         Kind::StepCount,
         Kind::MemoryRoot,
         Kind::Register,
+        Kind::WrapRandomness,
         Kind::DebugOutput,
     ]);
     audit.assert_clean();
