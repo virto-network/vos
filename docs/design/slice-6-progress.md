@@ -4083,9 +4083,9 @@ block reclaimed when it is the last and a realloc at the top in place:
 | heap peak live | 386,114 | 380,378 | 380,378 |
 | high-water | 980,032 | 1,433,872 | 1,302,136³ |
 
-³ The highest top reached, measured again at 6.22's close with the peak
-tracked (the column first gave the top at the end, 1,301,368, which falls
-as the last blocks are freed); the allocations are the same.
+³ The highest top reached, measured again at 6.22's close in a
+`heap-peak` build (the column first gave the top at the end, 1,301,368,
+which falls as the last blocks are freed); the allocations are the same.
 
 The statements service (`statement-service.elf`, the same runtime):
 `valid`'s refine 84.12M → 79.41M gas, accumulate 116,512 → 108,334;
@@ -4126,11 +4126,12 @@ own commit on `s6/close` from `s6/quality` (`40b6cca2`).
 | L7 | the mock's `migrate` refuses its own venue: `SameVenue`, error 28, in `spaces-pallet.md` §8 and G14; the vectors regenerated | `cbeb2e68` |
 | flake | `an_install_at_a_stalled_leader_times_out` follows the leader: an install refused `NotLeader` (not run) goes again at the leader with the commits open meanwhile; the install still answers `TimedOut` within the deadline at a leader whose commits stall | `1a12d6b9` |
 | review 1 | the guests' allocator in its own file (`guest/heap.rs`, generic over its arena); the high-water mark the highest top reached, kept as the top falls (a branch-free max), not the top at the end | `bca969b1` |
-| review 2 | a block shrunk below the top kept in place | `a9c105cd` |
-| review 3 | host tests of the allocator over a 4 KiB arena: alignment, the last block reclaimed in LIFO order, a realloc at the top, a shrink in place, the peak, null past the arena | `e31b4180` |
+| review 1 | the peak behind `heap-peak`, a measurement build's feature: without it the allocator keeps none and the report gives the top at the end, so the venues' guests pay nothing for it | `4333ff2d` |
+| review 2 | a block shrunk below the top kept in place (`a9c105cd`), reverted: its check cost verify gas on every realloc below the top and never fired on `valid`; the test expects a block below the top to move above it | `a035eb30` |
+| review 3 | host tests of the allocator over a 4 KiB arena: alignment, the last block reclaimed in LIFO order, a realloc at the top, a shrink at the top in place, the peak (under `heap-peak`), null past the arena | `e31b4180` |
 | review 4 | the classification test's table described by what it holds | `573fe86f` |
 | review 5 | 6.22a's two carried items of item 18 named in the plan's carried list: no slice-6 step re-pins program ids | this record |
-| docs | `kreivo-pallet.md`'s note; `clerk-across-spaces.md`; `core-model.md`; `identity-and-authority.md`; `proving.md` draft 6 and `recursion-air.md`'s masked verifier; the guests' program sizes | `dc551379`, `2bb3e97e`, `338e70df`, `66303ee5`, `cadd2b1e`, `724db80d` |
+| docs | `kreivo-pallet.md`'s note; `clerk-across-spaces.md`; `core-model.md`; `identity-and-authority.md`; `proving.md` draft 6 and `recursion-air.md`'s masked verifier; the guests' program sizes | `dc551379`, `2bb3e97e`, `338e70df`, `66303ee5`, `cadd2b1e`, `724db80d`, and the numbers again after the revert |
 
 `resume` leaving the disputed window's first root anchored stays as
 documented. Still carried, in the plan's §6.22: M5(d)'s binary scan of the
@@ -4139,21 +4140,23 @@ leader's anchor recheck's own test, and item 18's two pieces for the next
 re-pin.
 
 **The allocator, measured** [the `valid` fixture by a words request on the
-JAM-only host, `final-verify.elf`]: at `40b6cca2` 79,305,353 gas (decode
-1,500,249, verify 77,755,239), the top at the end 1,301,368; now
-79,563,385 (decode 1,499,821, verify 78,013,149), the highest top
-1,302,136, 380,378 bytes live at the peak and 7,426 allocations both. The
-peak's tracking costs about 173k of the verify, the shrink in place about
-85k (it never fires on `valid`; its check runs on every realloc below the
-top): +0.33% in all. The guests' programs: 397,976 bytes, the test
-guest's 462,242.
+JAM-only host, `final-verify.elf`]: the production build as at `40b6cca2`,
+79,305,353 gas (lookup 50,158, decode 1,500,249, verify 77,755,239), the
+top at the end 1,301,368, 380,378 bytes live at the peak, 7,426
+allocations. With the peak tracked at every fall of the top it cost
+173k of the verify, and the shrink in place 85k more (+0.33% in all), so
+the peak is a `heap-peak` build's alone and the shrink reverted. A
+`heap-peak` build: 79,459,988 gas, the highest top 1,302,136. The guests'
+programs: 391,784 bytes, the test guest's 454,662.
 
 **Bisecting `s6/quality`:** `854083f1`..`c77445d5` fail `check-no-std` and
 `a2c538fe`..`c2412e0d` fail `doc-check` on their own; the tips are green.
 A bisect over that range skips them.
 
-**Gates** [measured, at this code]: `just check` green, 1,398 passed in
+**Gates** [measured]: at `5a7f9af3`, `just check` green, 1,398 passed in
 109 suites; `just e2e-chain` green (1,399.8 s; the audit 332 carriers, 22
 JAM packages and their reports, 4,059 `WrapRandomness` needles among the
 rest, clean; the testnet's errors none); `just test-carriers` green (451
-`WrapRandomness` needles, clean, 122.7 s).
+`WrapRandomness` needles, clean, 122.7 s). After the allocator's revert
+and `heap-peak`, at `4b4ad712`, `just check` green again, 1,398 passed in
+109 suites.
