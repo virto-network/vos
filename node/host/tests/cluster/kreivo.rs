@@ -8,7 +8,7 @@
 //! a key the venue refuses is tried again once a window, or once the
 //! venue's listing changes.
 //!
-//! The windows are an hour long (`cuts::clock`); the tests move the nodes'
+//! The windows are an hour long (`support::clock`); the tests move the nodes'
 //! clocks and the mock chain's past each window's close, `B_w + D`.
 
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
@@ -28,8 +28,8 @@ use vos_wire::peer::NodeNumber;
 use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId, WindowClock};
 
 use crate::common::{Cluster, wait_until};
-use crate::cuts::{clock, set_clock};
-use crate::representative::delay;
+use crate::support::delay;
+use crate::support::{clock, set_clock};
 
 const UNITS: u128 = 1_000_000_000_000;
 const VENUE: VenueId = VenueId([0x6b; 32]);

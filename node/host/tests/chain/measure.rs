@@ -9,8 +9,8 @@ use vos_statement_service::state::Outcome as Judged;
 use vos_venue::kreivo::mock::Origin;
 
 use crate::kreivo::{self, UNITS};
-use crate::representative::delay;
 use crate::run::{Run, Stated, accepted};
+use crate::support::delay;
 
 /// The gate's margin past `L + D + t_prove`.
 const MARGIN_MS: u64 = 30_000;

@@ -27,8 +27,8 @@ use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
 use vos_wire::{Decode, keys};
 
 use crate::common::{Cluster, log_start, wait_until};
-use crate::cuts::{ask_in, call, clock, reader_agent, write, writes};
-use crate::representative::{Anchoring, attests, delay, ended, holds, replica};
+use crate::support::{Anchoring, attests, delay, ended, holds, replica};
+use crate::support::{ask_in, call, clock, reader_agent, write, writes};
 
 /// The model prover's program id for every kernel.
 const PROGRAM: ProgramId = ProgramId([7; 8]);

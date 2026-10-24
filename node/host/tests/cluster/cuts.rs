@@ -18,70 +18,19 @@ use std::collections::BTreeMap;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use vos_checker::programs::{actor, method, package, table_tag};
-use vos_node::roots::{self, AgentStore, CutProof, ReadRow};
-use vos_node::store::EntryKind;
-use vos_node::{Node, Reply};
-use vos_tree::{Blake2b, Hash, NodeStore};
+use vos_node::roots::{self, CutProof, ReadRow};
+use vos_tree::{Blake2b, Hash};
 use vos_venue::VenueClient;
-use vos_wire::batch::Request;
-use vos_wire::ids::{AgentId, InstanceId, MapId, MethodId, RequestId, Session};
-use vos_wire::keys::{self, Transform};
-use vos_wire::peer::NodeNumber;
-use vos_wire::records::{PendingRead, unstored, unversioned};
-use vos_wire::result::{Outcome, WorkResult};
+use vos_wire::keys::{self};
+use vos_wire::result::Outcome;
 use vos_wire::vos_anchor::MAX_LENGTH_MS;
 use vos_wire::{Decode, Encode, WindowClock};
 
-use crate::common::{ALICE, Cluster, Rows, compacting, log_start, wait_until};
-use crate::representative::{Anchoring, delay, rep_root};
-
-/// A space's clock of hour-long windows, now a minute into window 0.
-pub(crate) fn clock() -> WindowClock {
-    WindowClock {
-        origin_ms: vos_node::wall_clock() - 60_000,
-        length_ms: MAX_LENGTH_MS,
-    }
-}
-
-/// Set node `number`'s clock to read `at` about now.
-pub(crate) fn set_clock(cluster: &Cluster, number: NodeNumber, at: u64) {
-    let own = vos_node::wall_clock() + u64::from(number) * 7;
-    cluster.offsets[usize::from(number) - 1].store(at as i64 - own as i64, Ordering::SeqCst);
-}
-
-/// The cuts `node` holds of `agent`: each window's version.
-pub(crate) fn cuts(node: &Node, agent: AgentId) -> BTreeMap<u64, u64> {
-    vos_checker::cuts(&node.store().snapshot(), agent)
-}
-
-/// `agent`'s state version on `node`.
-pub(crate) fn version(node: &Node, agent: AgentId) -> u64 {
-    vos_checker::applied(node.store(), agent, &keys::version()).unwrap_or(0)
-}
-
-/// `agent`'s applied index as `node`'s store holds it: the index written
-/// in the commit of its apply. The node's own count of it moves once that
-/// commit returns, so a row an apply wrote can be read before it does.
-fn stored_applied(node: &Node, agent: AgentId) -> u64 {
-    node.store().snapshot().applied(agent).unwrap().unwrap_or(0)
-}
-
-/// The work results of `agent`'s log on `node` past index `after`, through
-/// its applied index in the store: each with its index.
-pub(crate) fn results(node: &Node, agent: AgentId, after: u64) -> Vec<(u64, WorkResult)> {
-    let through = stored_applied(node, agent);
-    (after + 1..=through)
-        .filter_map(|index| {
-            let entry = node.store().log_entry(agent, index).unwrap()?;
-            if entry.kind != EntryKind::Result {
-                return None;
-            }
-            let result = WorkResult::decode(&entry.body).ok()?.0;
-            Some((index, result))
-        })
-        .collect()
-}
+use crate::common::{Cluster, compacting, log_start, wait_until};
+use crate::support::{
+    Anchoring, READER, ask, clock, cuts, delay, reader_agent, rep_root, results, same_state,
+    set_clock, settled, stored_applied, version, write,
+};
 
 /// The leader's `Cut` marker for an idle agent. While the leader's clock
 /// trails `B_0` it appends none, though every follower's clock is past it,
@@ -218,180 +167,6 @@ fn a_leaders_clock_jumping_ahead_cuts_every_window_it_passes_at_one_version() {
             vos_checker::applied(cluster.node(number).store(), agent, &keys::batch_time()).unwrap();
         assert!(held >= mark, "batch time never goes back");
     }
-}
-
-/// The reader, installed beside the counter.
-pub(crate) const READER: InstanceId = InstanceId(2);
-
-/// An agent on `replicas` with the counter and the reader installed.
-pub(crate) fn reader_agent(cluster: &Cluster, replicas: &[NodeNumber]) -> AgentId {
-    let agent = cluster.counter_agent(replicas);
-    cluster.install_package(agent, READER, &package("reader"));
-    agent
-}
-
-/// The reader's method `name`.
-pub(crate) fn reader(name: &str) -> MethodId {
-    method(&actor("reader"), name)
-}
-
-/// The reader's committed map, `entries`.
-pub(crate) fn entries() -> MapId {
-    MapId {
-        instance: READER,
-        tag: table_tag("entries"),
-        transform: Transform::Hashed,
-    }
-}
-
-/// Request `sequence` of the cluster's session at `agent`: 25 puts and
-/// deletes in the reader's committed map, over 300 keys that come back.
-pub(crate) fn writes(cluster: &Cluster, agent: AgentId, sequence: u64) -> Request {
-    let writes: Vec<(u64, Option<u64>)> = (0..25u64)
-        .map(|index| {
-            let key = (sequence * 37 + index * 11) % 300;
-            (key, (key % 7 != sequence % 7).then_some(sequence))
-        })
-        .collect();
-    Request {
-        session: cluster.session(agent),
-        sequence,
-        caller: ALICE,
-        instance: READER,
-        method: reader("set_entries"),
-        arguments: writes.encode(),
-    }
-}
-
-/// `request` at `agent`'s leader, followed as it moves: its outcome.
-pub(crate) fn call(cluster: &Cluster, agent: AgentId, request: Request) -> Outcome {
-    let sequence = request.sequence;
-    match cluster.call_at_leader(agent, request) {
-        Ok(Reply::Ran(outcome)) => outcome,
-        other => panic!("sequence {sequence}: {other:?}"),
-    }
-}
-
-/// Each request of `sequences` at `agent`'s leader, followed as it moves.
-pub(crate) fn write(cluster: &Cluster, agent: AgentId, sequences: std::ops::RangeInclusive<u64>) {
-    for sequence in sequences {
-        let outcome = call(cluster, agent, writes(cluster, agent, sequence));
-        assert!(
-            matches!(outcome, Outcome::Done(_)),
-            "sequence {sequence}: {outcome:?}"
-        );
-    }
-}
-
-/// The agent's committed rows on `node` once its root is built at its
-/// version: the root, the version, and each row's salt and bare value.
-pub(crate) type Settled = (Hash, u64, BTreeMap<Vec<u8>, ([u8; 16], Vec<u8>)>);
-
-pub(crate) fn settled(node: &Node, agent: AgentId) -> Settled {
-    let mut settled = None;
-    wait_until("the root built at the agent's version", || {
-        let snapshot = node.store().snapshot();
-        let at = version(node, agent);
-        let Ok((root, built)) = roots::agent_root(&snapshot, agent) else {
-            return false;
-        };
-        if built != at {
-            return false;
-        }
-        let tree = AgentStore::open(&snapshot, agent).unwrap();
-        let rows = snapshot
-            .scan(agent, &keys::committed_all(), None)
-            .map(|row| {
-                let (key, stored) = row.unwrap();
-                let (_, value) = unversioned(unstored(&stored).unwrap()).unwrap();
-                let leaf = tree.leaf(&key).unwrap().expect("a leaf");
-                (key, (leaf.salt, value.to_vec()))
-            })
-            .collect();
-        settled = Some((root, built, rows));
-        true
-    });
-    settled.unwrap()
-}
-
-/// A read of the current window by the reader's workflow `sum_at_cut`,
-/// started by request `sequence`, once every running replica holds its
-/// request: sixteen rows of the reader's committed map, twelve the writes
-/// reach and four they never do.
-pub(crate) fn ask(cluster: &Cluster, agent: AgentId, sequence: u64) -> (RequestId, PendingRead) {
-    let (id, read, _) = ask_keys(cluster, agent, sequence);
-    (id, read)
-}
-
-/// [`ask`], and the keys the read names, its kernel's arguments.
-pub(crate) fn ask_keys(
-    cluster: &Cluster,
-    agent: AgentId,
-    sequence: u64,
-) -> (RequestId, PendingRead, Vec<u64>) {
-    ask_in(cluster, agent, cluster.session(agent), sequence, 0)
-}
-
-/// [`ask_keys`] as request `sequence` of `session`, asked in window
-/// `window`.
-pub(crate) fn ask_in(
-    cluster: &Cluster,
-    agent: AgentId,
-    session: Session,
-    sequence: u64,
-    window: u64,
-) -> (RequestId, PendingRead, Vec<u64>) {
-    let leader = cluster.node(cluster.leader(agent));
-    let map = entries();
-    let present: Vec<u64> = settled(leader, agent)
-        .2
-        .into_keys()
-        .filter_map(|row| {
-            let transformed = row.strip_prefix(&keys::committed_rows(&map)[..])?;
-            let raw = Transform::Hashed.raw(transformed)?;
-            Some(u64::from_be_bytes(raw.try_into().ok()?))
-        })
-        .take(12)
-        .collect();
-    assert_eq!(present.len(), 12, "twelve rows written");
-    let keys: Vec<u64> = present.iter().copied().chain(1_000..1_004).collect();
-    let start = Request {
-        session,
-        sequence,
-        caller: ALICE,
-        instance: READER,
-        method: reader("sum_at_cut"),
-        arguments: keys.encode(),
-    };
-    let Outcome::Started(workflow) = call(cluster, agent, start) else {
-        panic!("the read did not start");
-    };
-    let id = RequestId {
-        workflow,
-        awaits: 0,
-    };
-    let mut rows: Vec<Vec<u8>> = keys
-        .iter()
-        .map(|key| keys::committed(&map, &Transform::Hashed.apply(&key.to_be_bytes())))
-        .collect();
-    rows.sort();
-    let read = PendingRead {
-        instance: READER,
-        rows,
-    };
-    for (_, node) in cluster.running() {
-        if node.applied(agent).is_none() {
-            continue;
-        }
-        wait_until("every replica holds the request", || {
-            node.store()
-                .snapshot()
-                .get(agent, &keys::request(window, id))
-                .unwrap()
-                .is_some()
-        });
-    }
-    (id, read, keys)
 }
 
 /// A replica down across a cut builds it on its return, by the log or by
@@ -645,24 +420,4 @@ fn a_read_at_a_cut_is_served_by_its_leader() {
         });
     }
     same_state(&cluster, agent);
-}
-
-/// `agent`'s replicated rows on `node` ([`keys::is_replicated`]) and its
-/// applied index, from one store snapshot.
-pub(crate) fn replicated(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
-    let snapshot = node.store().snapshot();
-    let rows = vos_checker::replicated(&snapshot, agent);
-    (snapshot.applied(agent).unwrap(), rows)
-}
-
-/// Every running replica holds the same replicated rows at the same
-/// applied index.
-pub(crate) fn same_state(cluster: &Cluster, agent: AgentId) {
-    wait_until("every replica holds the same rows", || {
-        let views: Vec<_> = cluster
-            .running()
-            .map(|(_, node)| replicated(node, agent))
-            .collect();
-        views.len() > 1 && views.windows(2).all(|pair| pair[0] == pair[1])
-    });
 }

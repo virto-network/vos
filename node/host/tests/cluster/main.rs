@@ -21,4 +21,5 @@ mod replication;
 mod representative;
 mod roots;
 mod snapshots;
+mod support;
 mod workflows;

@@ -41,11 +41,8 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[path = "../cluster/common.rs"]
 mod common;
 #[allow(dead_code)]
-#[path = "../cluster/cuts.rs"]
-mod cuts;
-#[allow(dead_code)]
-#[path = "../cluster/representative.rs"]
-mod representative;
+#[path = "../cluster/support.rs"]
+mod support;
 
 mod agents;
 mod collect;

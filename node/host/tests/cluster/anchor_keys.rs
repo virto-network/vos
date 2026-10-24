@@ -14,7 +14,7 @@
 //! handed back after their cut roots are dropped signed again from the
 //! anchors themselves, in order.
 //!
-//! The windows are an hour long (`cuts::clock`), and the tests move the
+//! The windows are an hour long (`support::clock`), and the tests move the
 //! nodes' clocks and the venue's past each window's close, `B_w + D`.
 
 use std::io::{BufRead, BufReader, Write};
@@ -36,8 +36,8 @@ use vos_wire::keys;
 use vos_wire::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceId, VenueId};
 
 use crate::common::{Cluster, wait_until};
-use crate::cuts::{clock, set_clock};
-use crate::representative::{Anchoring, delay};
+use crate::support::{Anchoring, delay};
+use crate::support::{clock, set_clock};
 
 /// The anchor of `window` the venue holds, once the clocks have passed
 /// its close and the representative's leader has anchored it.

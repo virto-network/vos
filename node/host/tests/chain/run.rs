@@ -33,7 +33,7 @@ use crate::jam::Testnet;
 use crate::kernels::Kernels;
 use crate::kreivo::{self, Kreivo};
 use crate::record::Record;
-use crate::representative::{attests, delay, replica};
+use crate::support::{attests, delay, replica};
 use crate::venues::{Judgement, Migrating, Recorded, Serial, Wire, hex};
 use crate::{collect, measure};
 

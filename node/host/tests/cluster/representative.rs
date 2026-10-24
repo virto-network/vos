@@ -7,107 +7,30 @@
 //! the reports and the close, and its leader changing between its cut's
 //! build and the close.
 //!
-//! Each space has windows of an hour (`cuts::clock`), so `D` is two
+//! Each space has windows of an hour (`support::clock`), so `D` is two
 //! minutes; the tests move the nodes' clocks, and the venue's, across
 //! `B_0` and `B_0 + D`.
 
 use std::collections::BTreeSet;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vos_node::Hooks;
 use vos_node::roots::{self, CutProof};
-use vos_node::{Config, Hooks, Node};
-use vos_venue::{ModelVenue, VenueClient};
+use vos_venue::VenueClient;
 use vos_wire::ids::{AgentId, RequestId};
 use vos_wire::keys;
-use vos_wire::peer::NodeNumber;
-use vos_wire::records::{Workflow, WorkflowState};
-use vos_wire::result::{Attest, InputRef, Outcome, Step};
-use vos_wire::served::{ClosedRow, Served, representative_row};
-use vos_wire::vos_anchor::{MIN_LENGTH_MS, RootKind, RootRead, VenueId, space_root};
+use vos_wire::result::Outcome;
+use vos_wire::served::{ClosedRow, Served};
+use vos_wire::vos_anchor::{MIN_LENGTH_MS, RootKind, RootRead, space_root};
 use vos_wire::{Encode, WindowClock};
 
 use crate::common::{Cluster, wait_until};
-use crate::cuts::{READER, ask_keys, clock, reader_agent, results, set_clock, write};
-
-/// The venue the space anchors at, timed by its own clock, which the
-/// tests move with the nodes'.
-pub(crate) struct Anchoring {
-    pub(crate) venue: Arc<ModelVenue>,
-    offset: Arc<AtomicI64>,
-}
-
-impl Anchoring {
-    pub(crate) fn new() -> Self {
-        let offset = Arc::new(AtomicI64::new(0));
-        let read = Arc::clone(&offset);
-        let now = Arc::new(move || {
-            vos_node::wall_clock().saturating_add_signed(read.load(Ordering::SeqCst))
-        });
-        Self {
-            venue: Arc::new(ModelVenue::new(VenueId([0x7e; 32]), now)),
-            offset,
-        }
-    }
-
-    /// Each node's config: anchoring at the venue.
-    pub(crate) fn tuning(&self) -> impl Fn(NodeNumber, &mut Config) + Send + Sync + 'static {
-        let venue: Arc<dyn VenueClient> = self.venue.clone();
-        move |_, config| config.venue = Some(Arc::clone(&venue))
-    }
-
-    /// The cluster's space registered at the venue, from window 0.
-    pub(crate) fn register(&self, cluster: &Cluster) {
-        self.venue
-            .register(cluster.space.genesis().expect("a genesis"), 0);
-    }
-
-    /// Every node's clock and the venue's set to read `at` about now.
-    pub(crate) fn set_clocks(&self, cluster: &Cluster, at: u64) {
-        for number in 1..=cluster.offsets.len() as NodeNumber {
-            set_clock(cluster, number, at);
-        }
-        self.set_venue(at);
-    }
-
-    /// The venue's clock set to read `at` about now.
-    pub(crate) fn set_venue(&self, at: u64) {
-        self.offset
-            .store(at as i64 - vos_node::wall_clock() as i64, Ordering::SeqCst);
-    }
-}
-
-/// The representative's delay `D` on `clock`.
-pub(crate) fn delay(clock: &WindowClock) -> u64 {
-    clock.representative().unwrap().origin_ms - clock.origin_ms
-}
-
-/// The representative's root at its cut of `window`, once every running
-/// replica of it has built that cut: the same on each.
-pub(crate) fn rep_root(cluster: &Cluster, representative: AgentId, window: u64) -> [u8; 32] {
-    let mut root = None;
-    wait_until("every replica of the representative builds its cut", || {
-        let built: Vec<_> = cluster
-            .running()
-            .filter(|(_, node)| node.applied(representative).is_some())
-            .map(|(_, node)| {
-                roots::cut_root(&node.store().snapshot(), representative, window).unwrap()
-            })
-            .collect();
-        let all = built.iter().all(Option::is_some) && !built.is_empty();
-        if all {
-            assert!(
-                built.windows(2).all(|pair| pair[0] == pair[1]),
-                "the replicas' roots at the cut differ: {built:?}"
-            );
-            root = built[0].map(|(root, _)| root);
-        }
-        all
-    });
-    root.unwrap()
-}
-
+use crate::support::{
+    Anchoring, READER, ask_keys, attests, clock, delay, ended, holds, logged, reader_agent,
+    rep_root, replica, set_clock, write,
+};
 /// The space's root of `window` over the representative's `rep_root`.
 fn stated(cluster: &Cluster, window: u64, rep_root: &[u8; 32]) -> RootRead {
     let space = cluster.space.id();
@@ -117,73 +40,6 @@ fn stated(cluster: &Cluster, window: u64, rep_root: &[u8; 32]) -> RootRead {
         window,
         root: space_root(&space, window, rep_root),
     }
-}
-
-/// How workflow `id` of `agent` ended, once it has, on a replica of it.
-pub(crate) fn ended(cluster: &Cluster, agent: AgentId, id: RequestId) -> Outcome {
-    let mut ended = None;
-    wait_until("the read is served and its workflow ends", || {
-        ended = cluster
-            .running()
-            .filter(|(_, node)| node.applied(agent).is_some())
-            .find_map(|(_, node)| {
-                let record: Workflow =
-                    vos_checker::applied(node.store(), agent, &keys::workflow(id.workflow))?;
-                match record.state {
-                    WorkflowState::Ended(outcome) => Some(outcome),
-                    _ => None,
-                }
-            });
-        ended.is_some()
-    });
-    ended.unwrap()
-}
-
-/// The attests of the steps `request`'s `Resume`s made in `agent`'s log
-/// on `node`, once its log holds one: the workflow's end, the last.
-pub(crate) fn attests(node: &Node, agent: AgentId, request: RequestId) -> Vec<Attest> {
-    let mut attests = Vec::new();
-    wait_until("the replica applies the read's statement", || {
-        attests = logged(node, agent, request);
-        !attests.is_empty()
-    });
-    attests
-}
-
-/// The attests of the steps `request`'s `Resume`s made in `agent`'s log
-/// on `node` so far.
-fn logged(node: &Node, agent: AgentId, request: RequestId) -> Vec<Attest> {
-    results(node, agent, 0)
-        .into_iter()
-        .flat_map(|(_, result)| result.steps)
-        .filter_map(|step| match step {
-            Step::Ran(run) if run.input == (InputRef::Resume { request }) => Some(run.attests),
-            _ => None,
-        })
-        .flatten()
-        .collect()
-}
-
-/// A node running `agent`.
-pub(crate) fn replica(cluster: &Cluster, agent: AgentId) -> &Node {
-    cluster
-        .running()
-        .find(|(_, node)| node.applied(agent).is_some())
-        .map(|(_, node)| node)
-        .expect("a replica")
-}
-
-/// Whether `representative`'s replica on `node` holds `agent`'s root at
-/// `window`'s cut.
-pub(crate) fn holds(node: &Node, representative: AgentId, agent: AgentId, window: u64) -> bool {
-    node.store()
-        .snapshot()
-        .get(
-            representative,
-            &representative_row(agent, RootKind::Space, window),
-        )
-        .unwrap()
-        .is_some()
 }
 
 /// Every agent reports, and each read is served at one close. Three

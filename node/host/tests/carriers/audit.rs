@@ -19,8 +19,8 @@ use vos_wire::result::Outcome;
 use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
 
 use crate::common::{ALICE, Cluster, wait_until};
-use crate::cuts::{READER, ask_in, call, clock, reader, reader_agent};
-use crate::representative::{Anchoring, attests, delay, ended, holds, replica};
+use crate::support::{Anchoring, attests, delay, ended, holds, replica};
+use crate::support::{READER, ask_in, call, clock, reader, reader_agent};
 
 /// The model venue's anchors, a statement taken once by its id.
 struct Venue {

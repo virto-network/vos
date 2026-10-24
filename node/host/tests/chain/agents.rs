@@ -25,7 +25,7 @@ use vos_wire::result::{Attest, Outcome, Step};
 use vos_wire::vos_anchor::VenueId;
 
 use crate::common::{ALICE, Cluster};
-use crate::cuts::{READER, results};
+use crate::support::{READER, results};
 
 pub const BALANCE: InstanceId = InstanceId(3);
 pub const WINDOW: InstanceId = InstanceId(4);
