@@ -24,6 +24,16 @@ pub enum Place {
     LastLayer,
 }
 
+/// How a vector is resized.
+#[derive(Arbitrary, Debug, Clone, Copy)]
+pub enum Resize {
+    /// Grown by a copy of its last item.
+    Grow,
+    Shrink,
+    /// Emptied.
+    Clear,
+}
+
 #[derive(Arbitrary, Debug)]
 pub enum Mutation {
     /// The encoding's byte at `at` (modulo its length) xored with `with`.
@@ -43,21 +53,12 @@ pub enum Mutation {
         len: u32,
     },
     /// A vector at `place` (its `outer`th, then `inner`th, as it nests)
-    /// grown by a copy of its last item, shrunk, or emptied.
-    Grow {
+    /// resized.
+    Resize {
         place: Place,
         outer: u8,
         inner: u8,
-    },
-    Shrink {
-        place: Place,
-        outer: u8,
-        inner: u8,
-    },
-    Clear {
-        place: Place,
-        outer: u8,
-        inner: u8,
+        how: Resize,
     },
     /// A value at `place` set to `limbs` (unreduced: any `u32`).
     Value {
@@ -96,17 +97,17 @@ fn pick<T>(items: &mut [T], at: usize) -> Option<&mut T> {
     (len > 0).then(|| &mut items[at % len])
 }
 
-fn resize<T: Clone>(items: &mut Vec<T>, how: u8) {
+fn resize<T: Clone>(items: &mut Vec<T>, how: Resize) {
     match how {
-        0 => {
+        Resize::Grow => {
             if let Some(last) = items.last().cloned() {
                 items.push(last);
             }
         }
-        1 => {
+        Resize::Shrink => {
             items.pop();
         }
-        _ => items.clear(),
+        Resize::Clear => items.clear(),
     }
 }
 
@@ -114,8 +115,8 @@ fn secure(limbs: [u32; 4]) -> SecureField {
     SecureField::from_m31_array(limbs.map(BaseField::from_u32_unchecked))
 }
 
-/// A vector at `place` resized by `how` (0 grow, 1 shrink, 2 clear).
-fn reshape(proof: &mut WrapProof, place: Place, outer: usize, inner: usize, how: u8) {
+/// A vector at `place` resized by `how`.
+fn reshape(proof: &mut WrapProof, place: Place, outer: usize, inner: usize, how: Resize) {
     let stark = &mut proof.stark_proof.0;
     let fri = &mut stark.fri_proof;
     match place {
@@ -229,21 +230,12 @@ fn set_hash(proof: &mut WrapProof, place: Place, outer: usize, at: usize, hash: 
 
 pub fn apply(proof: &mut WrapProof, mutation: &Mutation) {
     match *mutation {
-        Mutation::Grow {
+        Mutation::Resize {
             place,
             outer,
             inner,
-        } => reshape(proof, place, outer.into(), inner.into(), 0),
-        Mutation::Shrink {
-            place,
-            outer,
-            inner,
-        } => reshape(proof, place, outer.into(), inner.into(), 1),
-        Mutation::Clear {
-            place,
-            outer,
-            inner,
-        } => reshape(proof, place, outer.into(), inner.into(), 2),
+            how,
+        } => reshape(proof, place, outer.into(), inner.into(), how),
         Mutation::Value {
             place,
             outer,
