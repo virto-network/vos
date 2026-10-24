@@ -563,15 +563,16 @@ impl BuiltInProverComponent for MemoryChip {
 
             // The page's permission, as MemoryPageChip proves it, held
             // along the address's group; on its start, also the tuple's.
+            use crate::memory_layout::Permission;
             let permission =
                 layout.permission(entry.address / crate::page_merkle::PAGE_SIZE as u32);
-            trace.fill_columns(row, permission >= 1, Column::Readable);
-            trace.fill_columns(row, permission == 2, Column::Writable);
+            trace.fill_columns(row, permission >= Permission::Readable, Column::Readable);
+            trace.fill_columns(row, permission == Permission::Writable, Column::Writable);
             let is_start = row == 0 || entries[row - 1].address != entry.address;
             trace.fill_columns(row, is_start, Column::IsStart);
             trace.fill_columns(
                 row,
-                if is_start { permission } else { 0 },
+                if is_start { permission as u8 } else { 0 },
                 Column::PermissionH,
             );
 

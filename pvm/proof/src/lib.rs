@@ -144,6 +144,7 @@ pub mod core;
 mod framework;
 pub mod framework_access;
 mod lookups;
+pub mod memory_layout;
 pub mod proof;
 pub mod segment;
 pub mod sparse_memory;

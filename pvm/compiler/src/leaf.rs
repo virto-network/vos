@@ -58,6 +58,33 @@ pub struct Chip {
 
 use Mask::{Current, Next, Previous};
 
+/// The statement header's words before its log sizes
+/// (`vos_pvm_proof::proof::statement_header_words`): the domain's two, the
+/// format, the PCS configuration's five, and no lifting height's one.
+const HEADER_WORDS: usize = 9;
+
+/// The transcript before the relations are drawn, past the header: the
+/// preprocessed and main trees' roots, then the boundary states' 296
+/// bytes, eight a word, 37 absorptions.
+const ROOTS_AND_BOUNDARY: usize = 2 + 37;
+
+/// The transcript between the claimed sums and the samples: the
+/// interaction root mixed, the composition coefficient drawn, the
+/// composition root mixed, the OODS point drawn.
+const COMPOSITION_STEPS: usize = 4;
+
+/// The DEEP coefficient's draw, after the samples.
+const DEEP_COEFFICIENT: usize = 1;
+
+/// FRI's last layer mixed, after its layers' roots and folding draws.
+const LAST_LAYER: usize = 1;
+
+/// The two proof-of-work checks: their rows, `[p2, qm31, h8]`.
+const POW: [usize; 3] = [6, 246, 0];
+
+/// The context's own constants' rows, `[p2, qm31, h8]`.
+const CONTEXT: [usize; 3] = [0, 2, 0];
+
 /// The segment AIR's relations, each its tuple's size.
 pub const RELATIONS: [(&str, u32); 20] = [
     ("Range256", 1),
@@ -674,21 +701,20 @@ pub fn leaf_terms(chips: u32, log_sizes: &[u8; SEGMENT_CHIPS]) -> Terms {
     let deep = deep(&trees, lifting);
     let lifting = lifting as usize;
     let q = QUERIES;
-    let header = 9 + n;
+    let header = HEADER_WORDS + n;
 
     let leaves: usize = trees.iter().map(|tree| (tree.len() + 1).div_ceil(8)).sum();
     let paths = preprocessed_height + 3 * lifting;
     let fri: usize = (0..fri_layers).map(|layer| 3 + lifting - 1 - layer).sum();
     let channel = header
-        + 2
-        + 37
+        + ROOTS_AND_BOUNDARY
         + relations.count_ones() as usize
         + n.div_ceil(2)
-        + 4
+        + COMPOSITION_STEPS
         + samples.div_ceil(2)
-        + 1
+        + DEEP_COEFFICIENT
         + 2 * fri_layers
-        + 1;
+        + LAST_LAYER;
     let sum = |field: fn(&Chip) -> u32| -> usize {
         active
             .iter()
@@ -703,7 +729,7 @@ pub fn leaf_terms(chips: u32, log_sizes: &[u8; SEGMENT_CHIPS]) -> Terms {
         .sum();
     Terms {
         channel: [channel, 0, 0],
-        pow: [6, 246, 0],
+        pow: POW,
         queries: [q.div_ceil(8), 64 * q, 0],
         circle: [0, (4 * lifting - 5) * q, 0],
         merkle: [(leaves + paths) * q, 0, 0],
@@ -719,7 +745,7 @@ pub fn leaf_terms(chips: u32, log_sizes: &[u8; SEGMENT_CHIPS]) -> Terms {
         ],
         logup: [0, linear_rows(n) + BOUNDARY_TERMS, 0],
         shape: [0, header + 2, 0],
-        context: [0, 2, 0],
+        context: CONTEXT,
         leaf: [LEAF_WORK[0], LEAF_WORK[1], 0],
         points: deep.points,
         blocks: deep.blocks,

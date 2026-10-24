@@ -50,11 +50,8 @@ pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), Ve
     Ok(())
 }
 
-/// Default per-component log_size cap used by `verify`.  See
-/// `vos_pvm_proof_verifier::DEFAULT_MAX_LOG_SIZE` for the rationale; same value
-/// kept in sync deliberately so prover-side and verifier-only paths
-/// reject at the same threshold.
-pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
+/// The per-component log size cap `verify` applies, the protocol's.
+pub use crate::proof::MAX_PROOF_LOG_SIZE as DEFAULT_MAX_LOG_SIZE;
 
 /// Verify a proof against a `side_note` describing the SAME program +
 /// segment the prover ran.

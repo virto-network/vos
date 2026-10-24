@@ -42,5 +42,5 @@ bench = false
 caller = { path = "../caller" }
 counter = { path = "../counter" }
 ledger = { path = "../ledger" }
-vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
+vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles" }
 vos-sdk = { workspace = true }

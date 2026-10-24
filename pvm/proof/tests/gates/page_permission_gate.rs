@@ -15,9 +15,10 @@ use vos_pvm::{ExitReason, PVM_REGISTER_COUNT, PVM_ZONE_SIZE};
 use vos_pvm_proof::AirColumn;
 use vos_pvm_proof::SideNote;
 use vos_pvm_proof::chips::MemoryPageChip;
-use vos_pvm_proof::chips::memory_page::{Column as Page, MemoryLayout, PageRange};
+use vos_pvm_proof::chips::memory_page::Column as Page;
 use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::harness::MachineProverComponent;
+use vos_pvm_proof::memory_layout::{MemoryLayout, PageRange};
 use vos_pvm_proof::trace::component::ComponentTrace;
 
 /// A byte in the middle of page 17, above the protected low zone.

@@ -10,16 +10,15 @@ use crate::core::step::WORD_SIZE;
 
 use super::utils_external::coset_order_to_circle_domain_order;
 
-/// Pick a `log_size` that covers `num_entries` real rows and is at least
-/// `LOG_N_LANES` (SIMD pack width).  Every chip with a dynamically sized
-/// trace uses this pattern; centralising here avoids the
-/// `((n as f64).log2().ceil() as u32).max(LOG_N_LANES)` incantation.
+/// The least `log_size` that covers `num_entries` real rows and is at least
+/// `LOG_N_LANES` (the SIMD pack width): every chip with a dynamically sized
+/// trace sizes it so.
 pub fn ceil_log2_at_least_lanes(num_entries: usize) -> u32 {
-    if num_entries == 0 {
-        LOG_N_LANES
-    } else {
-        ((num_entries as f64).log2().ceil() as u32).max(LOG_N_LANES)
-    }
+    num_entries
+        .max(1)
+        .next_power_of_two()
+        .ilog2()
+        .max(LOG_N_LANES)
 }
 
 /// Trait for BaseField representation.

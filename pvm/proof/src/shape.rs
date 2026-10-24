@@ -62,7 +62,7 @@ pub struct SegmentShape {
 }
 
 /// The most a pinned log size may be: a verifier's default cap.
-pub const MAX_LOG_SIZE: u8 = 24;
+pub const MAX_LOG_SIZE: u8 = crate::proof::MAX_PROOF_LOG_SIZE as u8;
 
 /// The most classes a shape has: a kernel's record's cap
 /// (`vos_wire::records::MAX_CLASSES`).

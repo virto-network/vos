@@ -12,8 +12,8 @@ use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;
 use vos_pvm::interpreter::{Interpreter, Memory};
 
-use vos_pvm_proof::chips::memory_page::MemoryLayout;
 use vos_pvm_proof::core::tracing::TracingPvm;
+use vos_pvm_proof::memory_layout::MemoryLayout;
 use vos_pvm_proof::segment::segment_bounds;
 use vos_pvm_proof::{SideNote, program_commitment_of_proof, prove_chain};
 use vos_pvm_proof_verifier::verify_chain_standalone;

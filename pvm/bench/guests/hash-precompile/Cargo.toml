@@ -20,4 +20,4 @@ codegen-units = 1
 
 
 [dependencies]
-vos-pvm-precompiles = { path = "../../../proof/precompiles", default-features = false, features = ["blake2b"] }
+vos-pvm-precompiles = { path = "../../../proof/precompiles" }

@@ -15,7 +15,7 @@ test = false
 bench = false
 
 [dependencies]
-vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
+vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles" }
 vos-sdk = { workspace = true }
 
 [[bin]]

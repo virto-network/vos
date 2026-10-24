@@ -73,7 +73,10 @@ pub const MAX_EXTENDED_LOG_SIZE: u32 = 30;
 /// SideNote. Larger blowups turn a small hostile proof into exponential local
 /// recommitment work; the segment format uses 2.
 pub const MAX_RECOMMIT_LOG_BLOWUP: u32 = 4;
-/// Protocol cap for a component's unextended trace.
+/// Protocol cap for a component's unextended trace, and every verifier's
+/// default cap. At 24 each chip's main trace has 2^24 ≈ 16M rows: well
+/// above the largest trace a kernel's run produces and well below the size
+/// where verification's CPU and memory become onerous.
 pub const MAX_PROOF_LOG_SIZE: u32 = 24;
 /// Bound proof-owned Merkle witnesses before hashing or allocation-heavy work.
 pub const MAX_MERKLE_WITNESS_HASHES: usize = MAX_FRI_QUERIES * MAX_EXTENDED_LOG_SIZE as usize;

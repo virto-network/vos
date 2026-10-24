@@ -1,3 +1,8 @@
+/// The least log size of the arithmetic chips' traces (multiplication,
+/// division, comparison and the bitwise operations).
+#[cfg(feature = "prover")]
+const MIN_ARITHMETIC_LOG_SIZE: u32 = 5;
+
 pub mod bitcount;
 pub mod bitwise;
 pub mod bitwise_and_byte;

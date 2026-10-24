@@ -10,7 +10,7 @@ description = "Portable codec and memory layout for standard PVM programs."
 default = []
 
 [dependencies]
-vos-pvm-precompiles = { path = "../proof/precompiles", default-features = false, features = ["blake2b"] }
+vos-pvm-precompiles = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"

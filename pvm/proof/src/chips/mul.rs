@@ -24,7 +24,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        backend::simd::SimdBackend,
         poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
@@ -504,19 +504,8 @@ impl BuiltInProverComponent for MulChip {
         min_log_size: u32,
     ) -> FinalizedTrace {
         let entries = &side_note.mul_entries;
-        const MIN_LOG_SIZE: u32 = 5;
-
-        if entries.is_empty() {
-            let log_size = LOG_N_LANES.max(MIN_LOG_SIZE).max(min_log_size);
-            let mut trace = TraceBuilder::<Column>::new(log_size);
-            for row in 0..trace.num_rows() {
-                trace.fill_columns(row, true, Column::IsPadding);
-            }
-            return trace.finalize_bit_reversed();
-        }
-
         let log_size = crate::trace::utils::ceil_log2_at_least_lanes(entries.len())
-            .max(MIN_LOG_SIZE)
+            .max(super::MIN_ARITHMETIC_LOG_SIZE)
             .max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();

@@ -63,7 +63,7 @@ num-traits = { version = "0.2", default-features = false }
 impl-trait-for-tuples = { workspace = true }
 # A kernel's entry, its registers as the loader lays it out, and its hash.
 vos-pvm-program = { workspace = true }
-vos-pvm-precompiles = { path = "precompiles", default-features = false, features = ["blake2b"] }
+vos-pvm-precompiles = { workspace = true }
 # The Poseidon2-M31 permutation and its modes, which the Poseidon2-M31
 # channel's hasher and transcript adapt.
 vos-pvm-poseidon2 = { workspace = true }

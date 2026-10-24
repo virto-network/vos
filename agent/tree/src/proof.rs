@@ -265,3 +265,36 @@ impl PartialTree {
         Ok(self.tree.rehash(hasher, None))
     }
 }
+
+impl Entry {
+    /// The tags of the entries' encodings, each its variant's
+    /// `codec(index)`, which the encoded proof's reader matches on.
+    pub(crate) const BRANCH: u8 = 0;
+    pub(crate) const HASH: u8 = 1;
+    pub(crate) const LEAF: u8 = 2;
+    pub(crate) const EMPTY: u8 = 3;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_tags_are_the_codec_indices() {
+        let entries = [
+            (Entry::Branch(7), Entry::BRANCH),
+            (Entry::Hash([1; 32]), Entry::HASH),
+            (
+                Entry::Leaf {
+                    key: vec![2],
+                    value_hash: [3; 32],
+                },
+                Entry::LEAF,
+            ),
+            (Entry::Empty, Entry::EMPTY),
+        ];
+        for (entry, tag) in entries {
+            assert_eq!(entry.encode()[0], tag, "{entry:?}");
+        }
+    }
+}

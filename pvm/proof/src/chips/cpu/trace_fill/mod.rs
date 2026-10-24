@@ -13,7 +13,6 @@
 //! the producer chips read them in `generate_main_trace`.
 
 use stwo::core::fields::m31::BaseField;
-use stwo::prover::backend::simd::m31::LOG_N_LANES;
 
 use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_WITNESS_INPUT};
 use crate::core::step::{PvmStep, WORD_SIZE};
@@ -74,8 +73,7 @@ fn fill_ts_carry(trace: &mut TraceBuilder<Column>, row: usize, ts: u64) {
 
 pub(super) fn generate_main_trace(side_note: &mut SideNote, min_log_size: u32) -> FinalizedTrace {
     let num_steps = side_note.num_steps();
-    let log_size = (num_steps as f64).log2().ceil().max(LOG_N_LANES as f64) as u32;
-    let log_size = log_size.max(LOG_N_LANES).max(min_log_size);
+    let log_size = crate::trace::utils::ceil_log2_at_least_lanes(num_steps).max(min_log_size);
 
     let mut trace = TraceBuilder::<Column>::new(log_size);
     let num_rows = trace.num_rows();

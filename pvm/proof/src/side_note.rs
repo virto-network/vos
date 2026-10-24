@@ -140,7 +140,7 @@ pub struct SideNote {
     /// preprocessed regions, so part of its proof's program identity. Read
     /// through [`Self::memory_layout`]; attached by
     /// [`Self::with_memory_layout`].
-    memory_layout: Option<crate::chips::memory_page::MemoryLayout>,
+    memory_layout: Option<crate::memory_layout::MemoryLayout>,
 }
 
 /// One listed page's entering and exit byte images (each `PAGE_SIZE` bytes).
@@ -406,7 +406,7 @@ impl SideNote {
 
     /// Attach the program's layout: the pages it may touch, and how. Its
     /// regions must be disjoint.
-    pub fn with_memory_layout(mut self, layout: crate::chips::memory_page::MemoryLayout) -> Self {
+    pub fn with_memory_layout(mut self, layout: crate::memory_layout::MemoryLayout) -> Self {
         assert!(
             layout.is_disjoint(),
             "a layout's regions overlap: {layout:?}"
@@ -419,17 +419,17 @@ impl SideNote {
     /// every page writable over a flat memory, a test machine's. `None` for
     /// a sparse image without one: a kernel's image comes with its layout,
     /// and proving and verifying refuse one without.
-    pub fn memory_layout(&self) -> Option<crate::chips::memory_page::MemoryLayout> {
+    pub fn memory_layout(&self) -> Option<crate::memory_layout::MemoryLayout> {
         self.memory_layout.or_else(|| {
             self.sparse_initial_memory
                 .is_none()
-                .then(crate::chips::memory_page::MemoryLayout::writable)
+                .then(crate::memory_layout::MemoryLayout::writable)
         })
     }
 
     /// [`Self::memory_layout`] where the prove and verify paths have
     /// already refused a side note without one.
-    pub(crate) fn layout(&self) -> crate::chips::memory_page::MemoryLayout {
+    pub(crate) fn layout(&self) -> crate::memory_layout::MemoryLayout {
         self.memory_layout()
             .expect("a sparse memory image without its layout")
     }

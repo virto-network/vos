@@ -36,7 +36,7 @@ struct Probe {
     program: [u8; 32],
     track: bool,
     gas: u64,
-    arguments: Option<Vec<u8>>,
+    input: Option<Vec<u8>>,
     writes: Vec<(u64, Vec<u8>)>,
     registers: Vec<(u8, u64)>,
     reads: Vec<(u64, u32)>,
@@ -72,7 +72,7 @@ unsafe extern "C" fn tracker_refine(arguments: *const u8, len: u64) -> Output {
 
 fn run(probe: Probe) -> Report {
     let mut machine = Machine::acquire(&probe.program).expect("a machine");
-    if probe.arguments.is_some() {
+    if probe.input.is_some() {
         // A kernel's registers, as the agent sets them: the loader's for no
         // arguments, which it reads through its witness input.
         machine.set_register(7, ARGUMENTS);
@@ -93,7 +93,7 @@ fn run(probe: Probe) -> Report {
     }
     machine.set_gas(probe.gas);
     let mut served = 0;
-    let input = probe.arguments.as_deref().unwrap_or_default();
+    let input = probe.input.as_deref().unwrap_or_default();
     let mut read = 0;
     let (status, detail) = loop {
         // Every page the machine first writes is paid.
@@ -116,7 +116,7 @@ fn run(probe: Probe) -> Report {
             Exit::OutOfGas => break (4, 0),
         }
     };
-    let output = match (status, &probe.arguments) {
+    let output = match (status, &probe.input) {
         (0, Some(_)) => machine
             .peek(machine.register(7), machine.register(8) as usize)
             .unwrap_or_default(),

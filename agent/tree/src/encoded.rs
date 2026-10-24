@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 use crate::hash::{Hasher, empty_root, leaf_hash};
 use crate::keys::{bit, first_difference};
-use crate::{Error, Hash, valid_key};
+use crate::{Error, Hash, proof::Entry, valid_key};
 
 /// A node's hash in aligned words, which a hasher inlined over it reads as
 /// words: the guest target has no misaligned access, so a byte array moves
@@ -92,7 +92,7 @@ pub fn verify_encoded<H: Hasher, K: AsRef<[u8]>>(
             return Err(Error::Malformed);
         }
         let (mut node, mut closed) = match reader.array::<1>()?[0] {
-            0 => {
+            Entry::BRANCH => {
                 let level = u16::from_le_bytes(reader.array()?);
                 if open.last().is_some_and(|parent| level <= parent.level) {
                     return Err(Error::Malformed);
@@ -112,7 +112,7 @@ pub fn verify_encoded<H: Hasher, K: AsRef<[u8]>>(
                 to = mid;
                 continue;
             }
-            1 => {
+            Entry::HASH => {
                 let hash = reader.array()?;
                 for &at in &order[from..to] {
                     let valid = valid_key(claims[at].0.as_ref());
@@ -120,7 +120,7 @@ pub fn verify_encoded<H: Hasher, K: AsRef<[u8]>>(
                 }
                 (Digest(hash), true)
             }
-            2 => {
+            Entry::LEAF => {
                 let len = reader.u32()? as usize;
                 let key = reader.take(len)?;
                 let value_hash: Hash = reader.array()?;
@@ -155,7 +155,7 @@ pub fn verify_encoded<H: Hasher, K: AsRef<[u8]>>(
                 }
                 (Digest(leaf_hash(hasher, key, &value_hash)), false)
             }
-            3 if count == 1 => {
+            Entry::EMPTY if count == 1 => {
                 for &at in &order[from..to] {
                     let (claimed, value) = &claims[at];
                     if !valid_key(claimed.as_ref()) {

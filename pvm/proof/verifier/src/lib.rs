@@ -48,18 +48,9 @@ use vos_pvm_proof::framework_access::{
 /// of the proof's format.
 pub use vos_pvm_proof::pcs::Commitment as CommitmentHash;
 
-/// Default per-component log_size cap used by `verify_standalone`.
-///
-/// At log_size = 24 each chip's main trace has 2^24 ≈ 16M rows; the
-/// FRI/Merkle phase commits those plus the preprocessed and
-/// interaction traces.  This is well above the largest trace the
-/// `prove_vos_actor` benchmark suite produces and well below the
-/// log_size where verification CPU/memory cost becomes onerous.
-///
-/// Callers who need to accept larger proofs (e.g. for batched
-/// proving over very long executions) should call
-/// `verify_standalone_with_max_log_size` with an explicit bound.
-pub const DEFAULT_MAX_LOG_SIZE: u32 = 24;
+/// The per-component log size cap `verify_standalone` applies, the
+/// protocol's.
+pub use vos_pvm_proof::proof::MAX_PROOF_LOG_SIZE as DEFAULT_MAX_LOG_SIZE;
 
 /// Verify a PVM execution proof.
 ///

@@ -10,7 +10,7 @@ vos-sdk-macros = { workspace = true }
 vos-wire = { workspace = true }
 # The proofs a read at a window's cut is served with, checked in the kernel.
 vos-tree = { workspace = true }
-vos-pvm-precompiles = { path = "../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
+vos-pvm-precompiles = { workspace = true }
 
 [dev-dependencies]
 trybuild = "1"

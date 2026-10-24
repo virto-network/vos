@@ -5,13 +5,5 @@ version.workspace = true
 license = "Apache-2.0"
 description = "Guest-side shims for vos-pvm-proof precompile ECALLs.  VOS actors link this to call into chip-accelerated host computations via the JAM ECALL ABI.  On host (non-riscv64) builds the shims fall through to a software reference so the same code path runs in tests."
 
-[features]
-default = ["blake2b"]
-
-# `blake2b_compress` (one-block primitive) + the streaming
-# `blake2b_hash::<N>(domain, parts)` helper.  No extra runtime deps
-# — the off-target software reference lives inside this crate.
-blake2b = []
-
 [dev-dependencies]
 blake2 = "0.10"

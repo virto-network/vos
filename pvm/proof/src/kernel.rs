@@ -67,7 +67,7 @@ fn load(
     (
         Interpreter,
         SparseMemoryImage,
-        crate::chips::memory_page::MemoryLayout,
+        crate::memory_layout::MemoryLayout,
     ),
     KernelTraceError,
 > {
@@ -101,7 +101,7 @@ fn load(
         }
     }
     let image: SparseMemoryImage = memory.nonzero_page_image().into();
-    let permissions = crate::chips::memory_page::MemoryLayout::standard(&layout);
+    let permissions = crate::memory_layout::MemoryLayout::standard(&layout);
     let registers = layout.registers;
     let code = program.code;
     let machine = Interpreter::with_memory(

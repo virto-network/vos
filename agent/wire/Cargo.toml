@@ -13,7 +13,7 @@ vos-pvm-program = { workspace = true }
 # The key transforms every table's rows are keyed by.
 vos-tree = { workspace = true }
 # BLAKE2b-256 of a whole buffer: pages' and, on JAM, work results' hashes.
-vos-pvm-precompiles = { path = "../../pvm/proof/precompiles", default-features = false, features = ["blake2b"] }
+vos-pvm-precompiles = { workspace = true }
 
 [dev-dependencies]
 proptest = "1"
