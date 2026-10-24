@@ -10,76 +10,26 @@
 //! `just test-proof`'s), so the venue judges anchors as the model venue
 //! does and takes a statement once by its id.
 
-use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use vos_node::{Config, Node};
 use vos_node_prover::{FORMAT, Job, Options, ProveError, Prover, State};
+use vos_venue::VenueClient;
 use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
-use vos_venue::{AnchorRefusal, Anchored, ModelVenue, NotAccepted, Status, VenueClient};
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, Session};
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::{Attest, Outcome};
-use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
 use vos_wire::{Decode, keys};
 
 use crate::common::{Cluster, log_start, wait_until};
-use crate::support::{Anchoring, attests, delay, ended, holds, replica};
+use crate::support::{Anchoring, Judging, attests, delay, ended, holds, replica};
 use crate::support::{ask_in, call, clock, reader_agent, write, writes};
 
 /// The model prover's program id for every kernel.
 const PROGRAM: ProgramId = ProgramId([7; 8]);
-
-/// The model venue's anchors, and statements taken once by id, every
-/// root held unanchored while `hold` is set.
-struct Judging {
-    model: Arc<ModelVenue>,
-    accepted: Mutex<BTreeSet<[u8; 32]>>,
-    submissions: AtomicUsize,
-    hold: AtomicBool,
-}
-
-impl VenueClient for Judging {
-    fn id(&self) -> VenueId {
-        self.model.id()
-    }
-
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        self.model.anchor(anchor)
-    }
-
-    fn submit(&self, statement: &Statement, _: &[u8]) -> Result<StatementId, NotAccepted> {
-        self.submissions.fetch_add(1, Ordering::SeqCst);
-        let id = statement.id();
-        if !self.accepted.lock().unwrap().insert(id.0) {
-            return Err(NotAccepted::Refused(6));
-        }
-        Ok(id)
-    }
-
-    fn anchored(&self, root: &RootRead) -> bool {
-        !self.hold.load(Ordering::SeqCst) && self.model.anchored(root)
-    }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        self.model.anchor_keys(space)
-    }
-
-    fn status(&self, space: &SpaceId) -> Status {
-        self.model.status(space)
-    }
-
-    fn time(&self) -> Option<u64> {
-        self.model.time()
-    }
-
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.model.unsettled(space)
-    }
-}
 
 /// A prover whose proofs differ each time, as masked proofs do, each
 /// held while `hold` is set.
@@ -247,12 +197,7 @@ fn recorded(cluster: &Cluster, agent: AgentId, id: &StatementId) -> bool {
 #[test]
 fn a_reads_statement_is_proved_recorded_and_accepted() {
     let anchoring = Anchoring::new();
-    let judging = Arc::new(Judging {
-        model: Arc::clone(&anchoring.venue),
-        accepted: Mutex::default(),
-        submissions: AtomicUsize::new(0),
-        hold: AtomicBool::new(false),
-    });
+    let judging = Arc::new(Judging::new(Arc::clone(&anchoring.venue), false));
     let proofs = Arc::new(Proofs::default());
     let cluster = cluster(&judging, &proofs);
     let (agents, attest) = stated(&cluster, &anchoring);
@@ -282,12 +227,7 @@ fn a_reads_statement_is_proved_recorded_and_accepted() {
 #[test]
 fn a_leader_change_submits_a_recorded_statement_once() {
     let anchoring = Anchoring::new();
-    let judging = Arc::new(Judging {
-        model: Arc::clone(&anchoring.venue),
-        accepted: Mutex::default(),
-        submissions: AtomicUsize::new(0),
-        hold: AtomicBool::new(true),
-    });
+    let judging = Arc::new(Judging::new(Arc::clone(&anchoring.venue), true));
     let proofs = Arc::new(Proofs::default());
     let mut cluster = cluster(&judging, &proofs);
     let (agents, attest) = stated(&cluster, &anchoring);
@@ -333,12 +273,7 @@ fn a_leader_change_submits_a_recorded_statement_once() {
 #[test]
 fn a_record_applied_during_a_proof_is_proved() {
     let anchoring = Anchoring::new();
-    let judging = Arc::new(Judging {
-        model: Arc::clone(&anchoring.venue),
-        accepted: Mutex::default(),
-        submissions: AtomicUsize::new(0),
-        hold: AtomicBool::new(false),
-    });
+    let judging = Arc::new(Judging::new(Arc::clone(&anchoring.venue), false));
     let proofs = Arc::new(Proofs::default());
     proofs.hold.store(true, Ordering::SeqCst);
     let cluster = cluster(&judging, &proofs);

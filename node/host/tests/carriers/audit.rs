@@ -1,7 +1,6 @@
 //! The audit's run and its carriers.
 
-use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use vos_checker::carriers::{self, Audit, Canary, Kind, Logs, Reach};
@@ -9,62 +8,17 @@ use vos_net::{Class, Network, Peer};
 use vos_node::{Config, Hooks};
 use vos_node_prover::Prover;
 use vos_node_prover::masked::Disclosing;
-use vos_venue::vos_statement::{Statement, StatementId};
-use vos_venue::{AnchorRefusal, Anchored, ModelVenue, NotAccepted, Status, VenueClient};
+use vos_venue::VenueClient;
+use vos_venue::vos_statement::Statement;
 use vos_wire::Encode;
 use vos_wire::batch::Request;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::Outcome;
-use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
 
 use crate::common::{ALICE, Cluster, wait_until};
-use crate::support::{Anchoring, attests, delay, ended, holds, replica};
+use crate::support::{Anchoring, Judging, attests, delay, ended, holds, replica};
 use crate::support::{READER, ask_in, call, clock, reader, reader_agent};
-
-/// The model venue's anchors, a statement taken once by its id.
-struct Venue {
-    model: Arc<ModelVenue>,
-    accepted: Mutex<BTreeSet<[u8; 32]>>,
-}
-
-impl VenueClient for Venue {
-    fn id(&self) -> VenueId {
-        self.model.id()
-    }
-
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        self.model.anchor(anchor)
-    }
-
-    fn submit(&self, statement: &Statement, _: &[u8]) -> Result<StatementId, NotAccepted> {
-        let id = statement.id();
-        if !self.accepted.lock().unwrap().insert(id.0) {
-            return Err(NotAccepted::Refused(6));
-        }
-        Ok(id)
-    }
-
-    fn anchored(&self, root: &RootRead) -> bool {
-        self.model.anchored(root)
-    }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        self.model.anchor_keys(space)
-    }
-
-    fn status(&self, space: &SpaceId) -> Status {
-        self.model.status(space)
-    }
-
-    fn time(&self) -> Option<u64> {
-        self.model.time()
-    }
-
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.model.unsettled(space)
-    }
-}
 
 /// The replicas of the agents the run reads and represents: node 4, in the
 /// space, replicates neither.
@@ -113,10 +67,7 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
     let stderr = carriers::Stderr::capture(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")));
     let logs = Logs::install();
     let anchoring = Anchoring::new();
-    let venue = Arc::new(Venue {
-        model: Arc::clone(&anchoring.venue),
-        accepted: Mutex::default(),
-    });
+    let venue = Arc::new(Judging::new(Arc::clone(&anchoring.venue), false));
     let tapped = Arc::new(carriers::Tapped::new(venue.clone()));
     let prover = Arc::new(Disclosing::default());
     let canary = Arc::new(Canary::new(CANARY));
