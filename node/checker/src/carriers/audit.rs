@@ -129,8 +129,9 @@ impl Audit {
     }
 
     /// Fails unless the run made needles of each of `kinds`, and each
-    /// needle, put in a carrier that leaves, is found there: a run whose
-    /// needles could not be found would pass the audit for nothing.
+    /// needle, put in a carrier that leaves in each of its forms, is found
+    /// there in each: a run whose needles could not be found would pass
+    /// the audit for nothing.
     pub fn assert_searchable(&self, kinds: &[Kind]) {
         for kind in kinds {
             assert!(
@@ -139,11 +140,20 @@ impl Audit {
             );
         }
         for needle in &self.needles.0 {
-            let form = needle.forms(Reach::Leaves).next().expect("a form");
-            let mut planted = Audit::default();
-            planted.carrier("planted", Reach::Leaves, [b" ", &form[..], b" "].concat());
-            planted.needles.0.push(needle.clone());
-            assert_eq!(planted.findings().len(), 1, "{} is not found", needle.name);
+            let mut forms = 0;
+            for (index, form) in needle.forms(Reach::Leaves).enumerate() {
+                let mut planted = Audit::default();
+                planted.carrier("planted", Reach::Leaves, [b" ", &form[..], b" "].concat());
+                planted.needles.0.push(needle.clone());
+                assert_eq!(
+                    planted.findings().len(),
+                    1,
+                    "{} is not found in its form {index}",
+                    needle.name
+                );
+                forms += 1;
+            }
+            assert!(forms > 0, "{} has no form", needle.name);
         }
     }
 
