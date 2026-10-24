@@ -90,7 +90,7 @@ here and in `spaces-pallet.md`:
   map, per `spaces-pallet.md`.
 - **Kreivo is design and kit only** (decision 12): 6.16 is the verifier
   kit and the design committed; 6.17 the reference mock and the
-  conformance vectors G1–G18; 6.17b the client against the mock; no pallet
+  conformance vectors G1–G19; 6.17b the client against the mock; no pallet
   code; the weights, benchmarks and fees are the teammate's; 6.21's
   on-chain leg runs on the JAM service, the Kreivo leg against the mock,
   and on a dev chain only when the teammate's pallet exists. The design's
@@ -164,7 +164,7 @@ Each of the review's findings, and where it landed:
      on-chain venue.
    - **Kreivo, design and kit:** the spaces pallet's design handed to the
      Kreivo teammate; the verifier crates packaged for vendoring with a
-     sync check; conformance vectors G1–G18 generated from our fixtures; a
+     sync check; conformance vectors G1–G19 generated from our fixtures; a
      reference mock of the designed interface that passes them; the node's
      Kreivo client passing them through the mock. The Kreivo leg on a
      chain runs when the teammate's pallet exists; it is not a gate of
@@ -421,7 +421,16 @@ key; the signature; `Last < w < now_w` (gaps allowed; the open window,
 `now_w` itself, cannot be anchored), `now − B_w ≤ MaxRootAge`, w within the
 venue's range. A second root for one `(space, kind, w)` is
 stored as evidence and suspends the space until the controller removes
-both signing keys (`resume`); anyone may submit the second signed anchor.
+both signing keys (`resume`); anyone may submit the second signed anchor,
+and an honest node does: its venue client, finding the venue holding
+another root at a window the node anchors, sends the node's anchor all
+the same as the evidence, and alerts (a stolen listed key that anchors
+first is otherwise never caught). The venue drops the window's anchor
+when it records the evidence, so a contested root is never trusted
+(decision 18): after `resume` the window stays unusable for good,
+statements rooted there are refused `0x5`, either root anchored there
+again is refused for its window, and the space continues from the window
+after its last (conformance vector G19).
 A suspended space's roots are not anchored, those anchored before
 included: its anchored windows go dark while it is suspended, and die if
 the suspension outlasts `MaxRootAge`.
@@ -433,6 +442,16 @@ registers the new keys, removes the old and resumes it (6.14b).
 space can anchor any root of its own making. So every value-moving handler
 is two-sided or spends the submitting space's own escrow; slice 6 admits
 `Record` alone.
+
+**Known limits:**
+- **One founder registers the space anywhere:** any single founding key
+  registers the space at a venue it has not reached, under a controller of
+  its choosing (the registration row above); carried.
+- **Equivocation is per venue:** a venue the space migrates to trusts the
+  founder-signed start, not the old venue's `Migrate`, so the windows
+  `[start, from_window)` may be anchored at both, and nobody detects an
+  equivocation across venues. By design (decision 8: an anchor gives no
+  integrity), carried.
 
 **Time between parties is the venue's** (decision 2's rule). Every time
 logic between parties, an expiry, a timeout, an exposure deadline, a
@@ -1446,7 +1465,7 @@ fees are the teammate's.
   the design's tables, so its bytes are FRAME's, not hand-rolled
   (`parity-scale-codec` as a std, test-only dependency, outside the
   vendored tree).
-- **The vectors:** `conformance/spaces.json`, G1–G18 (`spaces-pallet.md`
+- **The vectors:** `conformance/spaces.json`, G1–G19 (`spaces-pallet.md`
   §10), committed in VOS and named in `vos_kit.py`'s `CONFORMANCE`, so the
   kit carries them and the sync check holds them to the tag's; generated
   by running each scenario through the mock over our fixtures: the format-39 fixture (G6), one mutant per refusal class
@@ -1464,7 +1483,7 @@ fees are the teammate's.
   benchmark helper runs them.
 - **G4 covers the open window:** an anchor at `now_w` refused
   (`WindowInFuture`), then accepted once `now_ms` passes `B_w`.
-- **Tests:** the mock passes G1–G18; each vector's expectation checked by
+- **Tests:** the mock passes G1–G19; each vector's expectation checked by
   hand against the design's text in the review; the vectors regenerate
   byte for byte.
 - **Review:** Fable as well: the vectors are the contract a pallet we do
@@ -1529,7 +1548,7 @@ fees are the teammate's.
   - the representative's anchor hook and the worker use it through
     `VenueClient`.
 - **Tests:** through the mock transport:
-  - G1–G18 driven by the client's own encode and decode;
+  - G1–G19 driven by the client's own encode and decode;
   - an anchor sent at `now_w` waits, and lands once the mock's `now_ms`
     passes `B_w`;
   - the budget's refusal raises the alert;
@@ -1543,7 +1562,7 @@ fees are the teammate's.
 ### M3b acceptance
 
 - **Gates:** the kit's standalone `wasm32v1-none` build and its sync
-  check; the mock passing G1–G18; the client passing them through the
+  check; the mock passing G1–G19; the client passing them through the
   mock; `ci-full`.
 - **Handoff:** the design goes to the Kreivo teammate when this plan is
   committed; the kit follows at 6.16, the vectors and the mutation lists
@@ -1552,7 +1571,7 @@ fees are the teammate's.
   here so they are not lost. Until (1) and (2) pass, no release build
   reaches Kreivo: the ported transport (`spaces-pallet.md` §9.1)
   stays behind a development-only feature.
-  1. G1–G18 pass in the teammate's pallet mock runtime, and the `fees`
+  1. G1–G19 pass in the teammate's pallet mock runtime, and the `fees`
      vectors in Kreivo's runtime tests;
   2. an end to end run on a Kreivo dev chain, `KreivoVenue` over the
      ported substrate extension:
@@ -1581,7 +1600,10 @@ fees are the teammate's.
   a `program-id` tool (`vosx program-id <elf> <method>`).
 - **Design:**
   - the role is the leader of the agent whose record it is; a failover
-    re-proves at most the statement in flight;
+    re-proves at most the statement in flight, but for a replica that
+    installed a snapshot past records it had not read: it counts them
+    lost, so when it leads, the old leader's `Queued` statements are
+    never proved (the slice-end review's M3, carried);
   - a node-local job table, `id → queued | proving | proved(proof) |
     submitted | accepted | refused(code) | dead`, and a watermark per
     agent;
@@ -1906,8 +1928,9 @@ fees are the teammate's.
     read and searches the names; the audits read node disks once the nodes
     stop; `Options::per_submit` defaults to 1.5 UNIT; the mock's `migrate`
     refuses its own venue (`SameVenue`, error 28, in G14). `resume`
-    leaving the disputed window's first root anchored stays as documented
-    (mock and model alike), unpinned by a vector.
+    leaving the disputed window's first root anchored was the slice-end
+    review's M2: decided against (decision 18) and folded, every venue
+    dropping a disputed window's anchor, pinned by G19.
 
   Still carried:
   - **M5(d)'s binary scan on the release build:** `check-no-debug-internals`
@@ -1956,29 +1979,141 @@ fees are the teammate's.
     unmasked half (it moves the test-formats blobs), item 26's
     `SpaceGenesis::version` (the encoding is byte-identical, but dropping
     the field moves every blob that links vos-anchor), item 27 (the
-    `ANCHORS` golden-vector mode out of the production `final-verify`),
-    item 28 (**a strictness fix**: the service's `natural` and
-    `Operand::decode_input` accept non-canonical naturals that
-    `vos_pvm_program::read_nat` refuses; share `read_nat` and
-    `vos_wire::jam::Operand`), item 3's `TryFrom<u32>` for `AnchorCode`,
-    and item 33's `FetchKind` enum.
+    `ANCHORS` golden-vector mode out of `final-verify.elf`: a payload
+    starting `ANCHORS` decodes a vector and returns `ACCEPT` with no proof
+    read, `pvm/proof/statement/src/bin/guest/mod.rs:203-207`; no venue is
+    exposed, as the JAM venue is `statement-service.elf`, which has no
+    such mode, and nothing deploys `final-verify.elf` as a venue, but an
+    ELF that accepts without a proof must never become one; it waits for
+    the batch only because the move changes the blob), item 28 (**a
+    strictness fix**: the service's `natural` and `Operand::decode_input`
+    accept non-canonical naturals that `vos_pvm_program::read_nat`
+    refuses; share `read_nat` and `vos_wire::jam::Operand`; no submitter
+    reaches it, as `natural` parses the host's arguments and the
+    operands only, `statement-service.rs:229-232, 270-272`,
+    `accumulate.rs:81, 85`), item 3's `TryFrom<u32>` for `AnchorCode`,
+    and item 33's `FetchKind` enum. Item 68 hides an owner call:
+    `closes::stored(..).unwrap_or_default()`
+    (`agent/default/src/refine/inputs.rs:122`) drops a report on a
+    `Corrupt` row silently; it is deterministic across replicas, so a
+    liveness gap and not a forgery path, and failing the batch instead
+    is the owner's call.
   - **Owner's calls left carried:** item 34's `Mutation` split (it re-maps
     the replay corpus), item 58 (`State::Refused(u32)` as an enum changes
     the node's SCALE rows), item 54's `String` errors, item 46
     (`vos_jam::Error::Node` is how jam-dev's `Live` reports through the
     public `Chain` trait, which the builder takes as `&mut dyn Chain`;
     removing it needs a chain error threaded through the builder), item
-    1's generated `ABOUT` strings (the committed conformance JSON).
+    1's generated `ABOUT` strings (the committed conformance JSON), item
+    5's lock helper (one poison-tolerant `lock` for the many
+    `lock().unwrap_or_else(|poisoned| poisoned.into_inner())` sites).
   - **Larger or performance:** 13 (the witness digest from
     `statement_header_words`; it changes seeded bytes), 14's
     `masked_gates.rs` split, 30's `derive.rs` split, 31 (`prove_on`, the
-    prover's hot path), 35 (the kit script, part of the kit's hash), 50's
+    prover's hot path), 58's performance half (`work()` reads the job
+    table whole about four times a step, `node/prover/src/worker.rs`, and
+    `next()` decodes each statement inside its `min_by_key`), 35 (the kit script, part of the kit's hash), 50's
     `store/open.rs` split, 53 (one snapshot per idle wake), 70 (a
     `vos_testkit::served` module), 74's `forward_venue!` macro, 77 (long
     test functions, `stays(..)` for the fixed sleeps, the two Kreivo test
     mocks' registration), 29's control-test split.
+- **Carried from the slice-end Fable review** (`research/slice-6/slice-end-fable.md`;
+  M1, M2 (decision 18), M7, M8's label, L7, and the docs of M3–M6 folded,
+  `slice-6-progress.md`, "The slice-end review folded"):
+  - **M3, the code:** a replica that installed a snapshot and then leads
+    drops the old leader's `Queued` statements: a scan counts a record it
+    cannot read as lost and moves past it (`node/prover/src/worker.rs:341-344`),
+    `next()` and `submittable()` need `leads()` (`:445-455`), and `lost`
+    is in memory, logged only while jobs are pending
+    (`node/host/src/prover.rs:322-326`). The lever: the unproved set
+    recoverable from replicated state (an "attested, unproven" marker per
+    cut a new leader scans), or a new leader pulling peers' unfinished
+    jobs; at least a distinct alert when a scan crosses `log_start`;
+  - **M4:** (a) `prune` (`worker.rs:297-324`) never touches a `Queued` or
+    `Proving` job of an agent the node does not lead, and `follow`
+    (`:399-413`) moves one only on a `proven` row, so a refused, dead or
+    lost statement's job keeps its `Attest`, `witness_input` included,
+    for good (`SECURITY.md`'s prover-table row says so); (b) a job whose
+    kernel blob is absent is picked again every step until it is dead
+    (`:494-496`) and the scan stops at its record (`:347-350`), while
+    kernels are pinned only while an installed instance names them
+    (`node/host/src/group/apply.rs:294-340`), so an upgrade with
+    statements of the old kernel queued loses them. The fix: `prune` marks
+    any aged unfinished job dead and drops jobs of agents the node no
+    longer runs once read past; each unfinished job's kernel pinned under
+    `NODE_AGENT`; `next()` skips a job whose kernel is absent, refusing it
+    after a bound;
+  - **M5, the code:** a live run's fault text (`ExitReason`'s `Debug`,
+    `node/host/src/pvm.rs:177-180, 218`; an executor panic's message,
+    `node/host/src/executor.rs:67-68`, `node/host/src/fault.rs:58-61`)
+    reaches the warn log (`node/host/src/group/apply.rs:232-236`) and a
+    query's answer (`node/host/src/queries.rs:331`): log and answer the
+    variant alone and a static panic message with its place; one audited
+    run with a faulting kernel (`SECURITY.md` has the row);
+  - **M6, the needles:** the served rows' keys and every value a run wrote
+    as needles, and a run over small values
+    (`node/checker/src/carriers/needles.rs:44-45, 89, 174-178, 293, 321, 362, 370`;
+    `SECURITY.md` states the floor);
+  - **L1's `check` pin:** a cheap seeded-hash pin of the small masked
+    circuit in `check`, so the masked prover's byte-for-byte guard
+    (`pvm/proof/tests/kernel/fixtures.rs:192`, in `test-proof`) has a
+    per-step echo;
+  - **L2:** no test pins the guest blobs' hashes (`final-verify.elf`,
+    `final-verify-test.elf`, `statement-service.elf`, the Wasm blobs): a
+    `blobs.lock` checked by `check-no-std`, re-pinned with the re-pin
+    batch;
+  - **L3:** a root `cargo build` unifies `vos-node/dump`,
+    `vos-venue/kreivo` and `vos-statement/fixtures` into `vos` through
+    `node/checker/Cargo.toml`'s normal edges; the `_forbidden` rows cover
+    `-p vos-cli` and `-p vos-node` alone (`justfile:251-301`), and
+    `_debug-names-absent` reads a hard-coded `target/debug/vos`
+    (`justfile:241, 311`). The fix: `default-members` without
+    `node/checker` and `tools/jam-dev`, or a pinned `just release` with
+    gate rows for exactly that build;
+  - **L4:** the pallet's signature semantics: every VOS verifier is
+    `verify_strict` (`node/venue/src/lib.rs:69-77`,
+    `pvm/proof/statement/service/src/refine.rs:77-82`, the mock), while
+    `sp_io::crypto::ed25519_verify` is cofactored; `spaces-pallet.md` §6
+    to require strict verification, or refuse small-order keys at
+    `register` and `add_authority`, with a vector of a small-order key;
+  - **L5:** the JAM dev client queues with `push`
+    (`tools/jam-dev/src/venue.rs:426`), which refuses the same signer
+    while its window is handed back (`node/venue/src/queue.rs:157-160`):
+    `push_listed` once the finalized record lists the signer;
+  - **L6, the worker's edges:** (a) `inner.resume` starts the drivers
+    before `prover::start` sets `proving` (`node/host/src/node/open.rs:160-167`);
+    (b) `MAX_ATTEMPTS` counts an operator's kill mid-proof
+    (`worker.rs:497-499`, `node/host/src/prover.rs:308-336`); (c) a crash
+    between `hold(true)` and `put(Proved)` leaks the proof's pin
+    (`worker.rs:509-512`); (d) `retries` and the `MAX_RESUBMITS` counts
+    are in memory; (e) a finished proof on a deposed node is
+    `Unrecorded` (`node/host/src/prover.rs:211-216`) and the new leader
+    proves again, so leadership and proving can ping-pong under the
+    writer's stall; (f) `core-model.md`'s "a sync held past the stall
+    bound" is the oldest pending commit's age, queueing included
+    (`node/host/src/storage/mod.rs:329-334`);
+  - **L8's rest:** the generated `ABOUT` string
+    (`node/venue/src/kreivo/conformance/mutations.rs:323`, with item 1's);
+    `core-model.md`'s "Draft 5" heading after `338e70df`;
+  - **L9's rest:** `wrap::prove_masked`'s `tamper` parameter, public and
+    ungated (`pvm/proof/recair/src/wrap.rs:217-229`), to sit under
+    `seeded-masks` with pin C's other seams; `ProveError::Rerun` and
+    `Kernel` still format values (`node/prover/src/masked.rs:91, 106-121, 216`),
+    unlogged; Stwo's `info!(proof_size_estimate)` at the default level (a
+    `stwo=warn` default filter); `check-no-faults` in `ci` only, with `-e
+    features` and the host target (`justfile:239`);
+  - **the info items:** cross-venue window overlap undetectable (decision
+    8; pin D's known limits); duplicate keys in a genesis pass the decode
+    and should be `BadGenesis` (`pvm/proof/anchor`'s `SpaceGenesis::decode`);
+    the service's guest reads its storage leniently, an undecodable row
+    taken as absent (`pvm/proof/statement/service/src/state.rs:286-308`),
+    to trap instead; `migrate_digest` has no nonce
+    (`pvm/proof/statement/service/src/item.rs:93-95`), negligible; pin
+    C's hedge degrades to a function of the witness if OS randomness
+    fails, `getrandom`'s failure `ProveError::Entropy` with no fallback,
+    inherent and documented.
 - **Docs:** `proving.md` draft 6, `core-model.md`, `identity-and-authority.md`,
-  `kreivo-pallet.md`'s superseded note, `clerk-across-spaces.md`, per
+  `research/slice-5/kreivo-pallet.md`'s superseded note, `clerk-across-spaces.md`, per
   `doc-fixes.md`; `slice-6-progress.md`, "Slice 6 accepted".
 - **Estimate:** 3.5–5 weeks (the reviews 2–3, the slice-5 rest 1.5–2).
 
@@ -2002,7 +2137,7 @@ fees are the teammate's.
 | prover-time levers | conditional on 6.18's gate |
 | C-DJUMP, the ledgers' 2^27 gap, the BLAKE2b pointer near 2^32, refine slices' page permissions | stay recorded; the audit's scope |
 | the external audit | scope frozen at M2's acceptance (decision 14) |
-| the code-quality rest | 6.22, all of it (decision 13) |
+| the code-quality rest | 6.22 (decision 13), but for item 18's two re-pin pieces (`array::from_fn` in `agent/tree`'s hash, `leaf_terms`' offsets), carried to the next re-pin |
 
 ## Risks, and the gate that retires each
 
@@ -2020,7 +2155,7 @@ fees are the teammate's.
 | the representative's close and the paths' return under a failover or a skewed clock | rows keyed by w (pin D); `Closed` and the re-cut (pin E); 6.14's tests | 6.14 |
 | a deadline between parties read from a space's clock | pin D's rule: venue time only; reviewed in 6.14, 6.17 and 6.19 | M3 |
 | a rootless statement accepted again after its `Seen` entry is pruned | pin F's rule, tested at `MaxRootAge + 1` at every venue (G9) | 6.5, 6.17, 6.19 |
-| the teammate's pallet diverges from the design | the conformance vectors G1–G18 and the mutation lists; the Kreivo leg rerun on a dev chain when the pallet lands | 6.17, after the slice |
+| the teammate's pallet diverges from the design | the conformance vectors G1–G19 and the mutation lists; the Kreivo leg rerun on a dev chain when the pallet lands | 6.17, after the slice |
 | the design's §13 questions answered otherwise | the mock and the client follow the recommended defaults; another answer regenerates the vectors and touches only `calls` | 6.16–6.17b |
 | the node cannot reach Kreivo (no chain client in the workspace) | 6.0e's probe; master's `extensions/substrate` (sube), ported onto vos-core's extension host behind `Transport`: VOS's work after the slices (12c, 12d); the pallet the teammate's; the live leg (M3b's deferred gate 2) waits on both | 6.0e, 6.17b |
 | key custody of the nodes' sr25519 keys | decision 12 (one per node, no balance); the requirements in `spaces-pallet.md` §9.1, for VOS's port | 6.17b |

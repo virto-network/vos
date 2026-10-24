@@ -3,13 +3,11 @@
 Status: a design for the Kreivo teammate who implements it, handed over
 when VOS commits its slice-6 plan. VOS writes no pallet code in slice 6.
 VOS delivers three things:
-- this design, now;
-- the verifier crates, packaged for vendoring with a sync check, at VOS
-  step 6.16;
-- the conformance vectors in §10, at VOS step 6.17, and a node client
-  tested against a mock of the interface in §9 (6.17b); the transport
-  that takes that client to a live Kreivo node is a port of master's
-  substrate extension (§9.1).
+- this design;
+- the verifier crates, packaged for vendoring with a sync check (§3.1);
+- the conformance vectors in §10, and a node client tested against a mock
+  of the interface in §9; the transport that takes that client to a live
+  Kreivo node is a port of master's substrate extension (§9.1).
 
 The supporting research, with file:line citations, is
 `docs/design/research/slice-6/spaces-pallet-research.md`. `KR` below is Kreivo's `runtime/kreivo/src`
@@ -36,15 +34,15 @@ needs nothing from VOS. So:
    BLAKE2b over the documented preimages) stands in for the kit.
 2. **Then the kit replaces the stub,** and §10's vectors run.
 
-What each §3 API waits on, in VOS's plan:
+Each §3 API is in VOS's tagged crates:
 
-| API | VOS step |
+| API | in VOS |
 |---|---|
-| `vos_anchor` (`SpaceGenesis`, `space_id`, `WindowClock`, `anchor_digest`, `register_digest`, `RootKind`) | 6.10, landed |
-| `vos_statement::judge` over an accepted set, `Venue::id`, refusal code 7 | 6.5, landed |
-| format 39's verifier (the masked proofs) | 6.4, landed |
-| the vendored kit, `VENDOR`, the sync check (§3.1) | 6.16, landed |
-| the conformance vectors G1–G18 and the mutation lists | 6.17, landed |
+| `vos_anchor` (`SpaceGenesis`, `space_id`, `WindowClock`, `anchor_digest`, `register_digest`, `RootKind`) | landed |
+| `vos_statement::judge` over an accepted set, `Venue::id`, refusal code 7 | landed |
+| format 39's verifier (the masked proofs) | landed |
+| the vendored kit, `VENDOR`, the sync check (§3.1) | landed |
+| the conformance vectors G1–G19 and the mutation lists | landed |
 
 ---
 
@@ -142,7 +140,7 @@ them and never re-implements their encodings.
   | 7 | venue |
   | `0x100 \| e` | proof, where e is the final verifier's code |
 
-  - Code 7, `Venue::id` and `Pin` landed in VOS step 6.5; the pallet
+  - Code 7, `Venue::id` and `Pin` are in VOS's crates; the pallet
     compiles against the tag the `VENDOR` file names.
 
 ### 3.1 The kit, and keeping it VOS's
@@ -168,7 +166,7 @@ VOS writes the kit; Kreivo vendors it whole and edits none of it.
     the verdicts of a build linking 28 and 39; the kit links 39 alone, so
     a case of format 28 is refused as `Format` (2), as
     `Fixture::verdict_linking` gives it;
-  - `conformance/`: §10's vectors, from VOS step 6.17;
+  - `conformance/`: §10's vectors;
   - `vos_kit.py`, the vendoring and sync script;
   - `.gitattributes` (`* -text`), so a checkout converting line endings
     keeps the kit's bytes;
@@ -323,7 +321,7 @@ compact, and the vectors are `BoundedVec<u8, _>`.
 | 3 | `remove_authority(space: SpaceId, who: AccountId32)` | controller | removes it and its paired anchor key; `dec_providers(who)` best effort: a `ConsumerRemaining` error is ignored, the account merely stays alive |
 | 4 | `remove_anchor_key(space: SpaceId, key: [u8;32])` | controller | removes an unpaired key, such as a founding one |
 | 5 | `migrate(space: SpaceId, to: [u8;32], from_window: u64)` | controller | sets `end_window = from_window` (once, ≥ the next window, `to` another venue than this one); anchors at `w ≥ from_window` are refused here |
-| 6 | `resume(space: SpaceId)` | controller | `Suspended → Active` only when neither signer of any of the space's `Equivocations` (`first_signer`, `second_signer`) is still registered; it then clears them |
+| 6 | `resume(space: SpaceId)` | controller | `Suspended → Active` only when neither signer of any of the space's `Equivocations` (`first_signer`, `second_signer`) is still registered; it then clears them. It restores no anchor: each window with evidence stays unanchored for good (§6.1) |
 | 7 | `anchor(anchor: AnchorArg)` | any signed; the sovereign pays when the signer is an authority of `anchor.space` | §6.1 |
 | 8 | `submit(payer: SpaceId, statement: Vec<u8>, proof: Vec<u8>)` | an authority of `payer`; the sovereign pays | §6.3 |
 | 9 | `dispatch_as_sovereign(space: SpaceId, call: Box<RuntimeCall>)` | controller | dispatches as `Signed(sovereign)`, as communities' `dispatch_as_account` does |
@@ -363,10 +361,18 @@ Then:
 - **If `Anchors(space, kind, window)` exists:**
   - with the same root → `AlreadyAnchored`;
   - with a different root → store `Equivocations` with both roots and
-    both signers (the stored record's and this one's), set the status to
-    `Suspended`, emit `Equivocated` and `SpaceSuspended`, and return **Ok**
-    so the evidence persists. Anyone may submit that second signed anchor.
-    Which root was wrong is unknowable, so `resume` needs both keys gone.
+    both signers (the stored record's and this one's), **remove
+    `Anchors(space, kind, window)`**, set the status to `Suspended`, emit
+    `Equivocated` and `SpaceSuspended`, and return **Ok** so the evidence
+    persists. Anyone may submit that second signed anchor; a VOS node's
+    client does, sending its own anchor as the evidence when it finds the
+    pallet holding another root at its window. Which root was wrong is
+    unknowable, so `resume` needs both keys gone, and neither root is
+    trusted again (VOS's decision 18): with the anchor removed and `Last`
+    kept, a submit rooted at that window is refused `Unanchored` (5) after
+    `resume` as before it, either root anchored there again is refused
+    `WindowNotAfterLast`, and the space anchors on from the window after
+    `Last` (G19).
 - **Otherwise:**
   - `start_window ≤ w`;
   - `w < end_window` when it is set;
@@ -405,6 +411,12 @@ Then:
 
 The deposit is released only by a later deregistration, which is not in
 this version.
+
+**Known limit:** any single founding key registers the space here, before
+the space's controller does, under a controller of that key's choosing,
+and the space cannot register here again: one compromised founder squats
+the space at every venue it has not reached. The lever is carried: a
+registration co-signed by the controller, or by a founders' quorum.
 
 ### 6.3 `submit` (pin F's order)
 
@@ -675,7 +687,8 @@ host yet (`core-model.md` §18, open question 18).
   - the port is VOS's work, after the planned slices, once the extension
     host exists (owner decision 12d);
   - the pallet is the teammate's;
-  - M3b's deferred gate 2, the live Kreivo leg, waits on both.
+  - the live Kreivo leg (the client over the port, on a dev chain
+    carrying the pallet) waits on both.
 
   Until then `KreivoVenue` runs over the mock only, including the Kreivo
   leg of the end-to-end run.
@@ -684,7 +697,7 @@ host yet (`core-model.md` §18, open question 18).
   `Connect` the client's reader thread calls until Kreivo is reached.
 - An earlier subxt transport, parked unmerged, is
   `node/venue/src/kreivo/chain.rs` at VOS commit `9e63e5a9`. Its review
-  (`slice-6-progress.md`, step 6.17b) found the behaviours below.
+  (`slice-6-progress.md`) found the behaviours below.
 
 **What the transport must provide** ("ext": master's extension already
 covers it; "part": it covers part, and the port finishes it; unmarked: the
@@ -775,8 +788,11 @@ port adds it):
   - an anchor landed whose record is not yet read stays queued;
   - nothing is sent for a window the venue has not closed, nor while the
     space waits.
-- **The release gate.** No release build reaches Kreivo until M3b's
-  deferred gates 1 and 2 pass (`slice-6-on-chain.md`).
+- **The release gate.** No release build reaches Kreivo until the pallet
+  passes G1–G19 in its mock runtime (the `fees` vectors in Kreivo's
+  runtime tests) and the client passes an end to end run on a Kreivo dev
+  chain over the port (`slice-6-on-chain.md`, the deferred Kreivo
+  gates).
 - **The CLI,** over `calls::Call` and the `Sender`:
   - the node's Kreivo venue;
   - showing and rotating its account;
@@ -794,10 +810,10 @@ port adds it):
   (`node/venue/src/kreivo/tests.rs`, `node/host/tests/cluster/kreivo.rs`),
   which set the mock's state directly: the port states them again over
   its transport against a dev chain carrying the pallet, its state set by
-  the pallet's calls (M3b's deferred gate 2);
+  the pallet's calls (the live Kreivo leg);
 - the vectors' replay is the mock's (`conformance/mod.rs`); the
   teammate's harness that runs them against the pallet is reviewed by VOS
-  before the pallet is taken as passing G1–G18.
+  before the pallet is taken as passing G1–G19.
 
 ## 10. Conformance vectors
 
@@ -832,7 +848,7 @@ tag's, byte for byte.
   - `spaces.json`: the constants (§4's suggested values, `UNITS =
     10^12`, `FeeBound = UNITS`, the existential deposit `UNITS / 1000`,
     `ForfeitTo` the `py/trsry` pallet account), labels for the accounts and
-    anchor keys, and G1–G18. A pre-state is the time, each account's free
+    anchor keys, and G1–G19. A pre-state is the time, each account's free
     and held balances (`Registration`, `Submit`) and its providers and
     consumers, and the pallet's raw storage. A step is a time, then a call
     (its origin: a signed account, Root, `ProgramsOrigin`,
@@ -882,7 +898,7 @@ tag's, byte for byte.
 | G2 | `add_authority`, `remove_authority`, providers |
 | G3 | `anchor` at w, then w+2 (a gap); `Last` |
 | G4 | anchor refusals: a stale w ≤ Last, the open window `now_w` (`WindowInFuture`; then `now_ms` advanced past `B_w` and the same anchor resubmitted → `Anchored`), a future w, older than `MaxRootAge`, out of range, bad signature, kind 1, a `now_ms` before the origin (`BadClock`) |
-| G5 | an equivocation by one key, then `Suspended`, `resume` refused until it is removed; and by two keys (the failover case): `Evidence` names both, `resume` refused until both are removed |
+| G5 | an equivocation by one key, then `Suspended` (the window's `Anchors` removed), `resume` refused until it is removed; and by two keys (the failover case): `Evidence` names both, `resume` refused until both are removed |
 | G6 | `submit` of the masked format-39 fixture: `Accepted { id }`; the deposit released |
 | G7 | one mutant per refusal class, 1–7 and `0x1xx`: `Refused { code }`, `DepositForfeited`; then the fixture against its format's and program's activation windows (2, 3, accepted once active) |
 | G8 | the same statement twice: `Refused { 6 }`, the deposit released |
@@ -896,6 +912,7 @@ tag's, byte for byte.
 | G16 | `dispatch_as_sovereign` (a transfer from the sovereign; `SovereignDispatched`); `set_status` block (submits and anchors refused) and unblock (back to `Active`, or `Suspended` with equivocations); `set_format` under the delay (`TooEarly`; Root at once) |
 | G17 | `on_idle`: an anchor and a rooted `Seen` entry pruned past `MaxRootAge`, the rootless entry kept, `Last` and `Equivocations` kept |
 | G18 | registration refusals: `BadClock` (a length outside the bounds), `BadFounder` (a key not in the genesis, or a bad signature), `SovereignInUse`, `SpaceExists`; and a submit paid by a space other than the statement's: accepted; the length bounds, at each bound and a byte past it |
+| G19 | after `resume`, a disputed window stays unusable: a second root at a window of F's held (`Equivocated`, `SpaceSuspended`, the window's `Anchors` removed); both signers' authorities removed, a fresh key added, `resume`; the statement rooted at that window's first root → refusal 5; either root anchored there again → `WindowNotAfterLast`; the next window anchored |
 
 ## 11. Later stages: pass, and anonymous authentication
 
@@ -966,11 +983,9 @@ fold-in (S2).
      account or a community account; or an origin enum.
    - **Recommended: an `AccountId`.**
 7. **The name and index:** `Spaces` at 90 (recommended).
-8. **Slice 6's on-chain end to end (6.21).**
-   - The options: conditional on the teammate's delivery; or a mock end to
-     end only.
-   - **Recommended: conditional,** with the mock end to end as the
-     acceptance gate.
+8. **The on-chain end to end.** Settled: VOS's end to end runs the
+   Kreivo leg over the mock, its acceptance gate; the live leg runs once
+   the pallet and the port exist.
 9. **Communities fold-in (S2):** after slice 6 (recommended).
 10. **Anonymous authorities:** after slice 7's credential AIR (recommended).
 11. **A blocked space's roots.**
@@ -983,8 +998,7 @@ fold-in (S2).
     - **Recommended: unanchored,** the same rule for both: a space
       governance blocked is not one whose state a handler should act on.
 12. **Anchor keys beyond the founding ones.**
-    - **Anchor-key rotation is supported on VOS's side** (VOS step
-      6.14b). Each node keeps its ed25519 anchor keys in its store, the
+    - **Anchor-key rotation is supported on VOS's side.** Each node keeps its ed25519 anchor keys in its store, the
       first its node key, which a founding node's genesis names; `vos node
       anchor-key rotate` makes another and prints it. The representative's
       leader reads the space's `AnchorKeys` and signs with the newest of

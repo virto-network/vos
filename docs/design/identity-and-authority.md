@@ -412,7 +412,7 @@ an agent, but approving a payment is a member's grant like any other.
     window's boundary plus a close delay of `min(L/5, 2 min)`); the space
     root is `S_w = BLAKE2b-256("vos/space/v1" ‖ space ‖ w ‖ A_rep)`, over
     the representative's agent root at that cut (`slice-6-on-chain.md`,
-    pin D).
+    on spaces, windows, roots and anchors).
 - **Windows** run at a fixed cadence, minutes apart. A root that moved
   only on activity would leak activity. They are Unix time from the
   space's genesis, whose hash is the `SpaceId` and which freezes the

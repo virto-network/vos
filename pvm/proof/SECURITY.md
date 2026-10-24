@@ -225,7 +225,7 @@ computes from the format, never read from the proof.
 | 8 | `pcs/verifier.rs` `commit`: `log_size + log_blowup_factor`; `vcs_lifted` `MerkleVerifierLifted::new`'s `assert!` | ours: the trees' log sizes and the format's configuration, no lifting log size, so the height is the tallest column |
 | 9 | `verify_values`: `zip_cols` (`zip_eq` trees, `zip_eq` columns) of sample points × sampled values | shape: four trees, each tree's columns and each column's samples |
 | 10 | `verify_values`: `trees.last().unwrap()`, `trees[0].height`, `lifting_log_size − log_blowup_factor` | ours: four trees committed by the verifier, each at least the blowup tall |
-| 11 | `pcs/utils.rs` `prepare_preprocessed_query_positions`: the shifts | ours: the trees' heights (20, 22) |
+| 11 | `pcs/utils.rs` `prepare_preprocessed_query_positions`: the shifts | ours: the trees' heights (the preprocessed tree's 21, the tallest 22) |
 | 12 | `verify_values`: `zip_eq` trees × decommitments × queried values × query positions | shape: four decommitments and four queried trees |
 | 13 | `vcs_lifted/verifier.rs` `verify`: `col_vals[idx]` | the fork's `QueriedValuesShapeMismatch` (`ca20894`) first: one column a committed column, one value a query |
 | 14 | `verify`: `chunk[0]`, `chunk[1]`, `unreachable!` on `idx & 1` | `chunk_by` yields non-empty runs of at most a sibling pair |
@@ -256,7 +256,7 @@ The channel's draws and `verify_pow_nonce` index nothing from the proof.
 `cargo fuzz cmin` after a five-minute run and kept small; `just
 fuzz-replay` (in `just check`) runs every input once; `cargo run --example
 paths` lists what each input reaches. The paths it covers are recorded in
-`docs/design/slice-6-progress.md` (6.7).
+`docs/design/slice-6-progress.md`.
 
 ## The Stwo fork's open divergences
 
@@ -272,7 +272,7 @@ panic-freedom does:
   sample point whose `y` is its own conjugate; a conjugate line through a
   queried point), each with a unit test from a constructed point. The
   accepted set is unchanged. Branch `vos/verify-panics` (`c3ec9813`), on
-  `ab294189`, reviewed (Fable) and pushed; the pin.
+  `ab294189`: the pin.
 - **DIVERGENCE-011:** the first FRI round folds by `2^fold_step`, the
   circle fold in it. The security tool counts it so; a model counting the
   circle fold as its own round would differ by about 0.8 bits on the fold
@@ -394,13 +394,34 @@ stay with the agent's replicas. The carrier audit checks it on a run
 (`just test-carriers`, `vos_checker::carriers`): three nodes prove a read's
 statement with the masked prover beside a fourth that replicates nothing
 of it, every debug output's environment set, and every carrier's bytes
-are searched for the run's own internals: in their bytes, hex, `Debug`
-lists, M31 limbs, decimal digits and either byte order, a store by its
-rows, each capture path shown to capture by a canary. `just e2e-chain`
+are searched for the run's own internals, above the floor below: in their
+bytes, hex, `Debug` lists, M31 limbs, decimal digits and either byte
+order, a store by its rows, each capture path shown to capture by a
+canary. The internals are `proving.md` A.5's needles, the masked wrap's
+randomness among them (`Kind::WrapRandomness`: each attempt's entropy and
+seed, the witness digest, the blinding values, the seeds of the mask, salt
+and `R` columns, shown by the prover's watch seam, a dev edge only). `just e2e-chain`
 runs it over a whole run on chain: the Kreivo mock's extrinsics, every
 work package sent to the JAM statements service on a PolkaJam testnet
 with its extrinsics and work report, both venues' anchor chains and the
 testnet's own logs and database.
+
+**The search's floor.** A needle too small to tell from chance is not
+searched (`node/checker/src/carriers/needles.rs`):
+- a byte needle needs at least 8 bytes, 4 of them distinct;
+- a number's forms need 4 distinct bytes, so most values below about
+  2^16 are dropped;
+- a single register and a trace row's value below 2^24 are not needles,
+  nor a step count of at most 255 or a power of two;
+- the served rows' keys are not needles, and of the rows a run wrote,
+  only those served are.
+
+What compensates: each served value's salt and its plain and
+domain-prefixed hashes are needles; the served rows and the witness blobs
+are searched whole; the re-run's gas is a needle; and the audit's run
+writes high-entropy rows by design (`node/host/tests/carriers/audit.rs`),
+so its values clear the floor. The served keys and every written value as
+needles, and a run over small values, are carried.
 
 | carrier | what it carries | reach | checked by |
 |---|---|---|---|
@@ -410,6 +431,9 @@ testnet's own logs and database.
 | a signed Kreivo extrinsic: its envelope | the signer's nonce and the call | leaves | the audit, every form, on the mock's (`just e2e-chain`) |
 | a chain's own record of what it was sent: its nodes' logs and database | blocks, guarantees, the packages and their extrinsics, the services' code | leaves | the audit (`just e2e-chain`, `Reach::Recorded`): every needle's bytes, whole hex and `Debug` list, a register file's bytes; not a number's digits, hex or bytes, a hash's hex prefix or a debug output's text, which the chain's own counters, gas, hashes and program bytes hold by chance. What it was sent is searched in every form as the packages and reports above; a statement's encoding and a work report are shown to be in its database as bytes, a report's hash in its log |
 | a client's answer | the method's outcome: a read's output | leaves | the audit |
+| the JAM statements service's storage, read over RPC at the finalized block | the spaces, anchors, evidence, `Seen` entries and items' outcomes: what the items carried, and the verdicts | leaves | the audit, every form (`just e2e-chain`), but the venue's layout constants and the space's clock, public in this carrier alone (`Audit::carrier_except`) and needles in every other |
+| a live run's fault text: `ExitReason`'s `Debug` in `Fault::Agent` (a page fault's address among it; `node/host/src/pvm.rs:177-180, 218`), an executor panic's message (`node/host/src/executor.rs:67-68`, `node/host/src/fault.rs:58-61`) | text of the agent's own run, data-dependent | leaves: the applying node logs it at warn (`node/host/src/group/apply.rs:232-236`), and a query returns it to its caller as `CallError::Failed` (`node/host/src/queries.rs:331`) | not audited: the audit runs happy paths. The replica's logs and an authorized caller hold the agent's state already, so this is not the prover role leaking, but its content is not bounded; the fix (the variant alone, a static panic message with its place) and one audited run of a faulting kernel are carried |
+| a panic while a proof is made; a failed proof's error | the panic's place (file and line), not its message; `ProveError::Failed`, which names what failed and no value | leaves (standard error, the logs) | the redacting hook (`node/prover/src/redact.rs`) while a proof is in flight; the audit over the logs |
 | logs, at every level | ids, windows, codes, the prover's backlog counts, each proof's time in seconds, and Stwo's `info!` of a proof's size estimate; at debug level, an agent's guest log lines (`refine_host`'s `log`), text the agent's own code writes, which carries whatever that code puts in it | leaves | the audit, for the node's own lines; an agent's are its author's, audited with its code; the time and the size estimate are side channels as below |
 | standard error | the node's log: `vos` writes its tracing there, at `VOS_LOG`'s level (info by default); no debug output in a production build | leaves | the audit (the run captures both) |
 | the debug outputs: the PVM's instruction trace, `GREY_PVM_DEBUG`'s registers and native code, `CPU_DUMP`, `CPU_EXPR_DUMP`, `ZKPVM_PROFILE` | a run's steps, pcs, registers and trace rows | only a `debug-internals` build (`vos-pvm`'s, this crate's) | `just check-no-debug-internals`: no production edge enables it, and the node's binary names none of them |
@@ -418,7 +442,7 @@ testnet's own logs and database.
 | the agent's log, snapshots and peer frames | `Resume` with the served rows; work results with each `Attest` (witness, output, public arguments, roots); `Proven` with the proof's hash | the agent's replicas | the audit: no node proof, memory root or register file |
 | frames to a node of the space that does not replicate the agent, and that node's disk and store | heartbeats, placements, forwarded requests | leaves | the audit, every needle |
 | the node's blobs and disk | final proofs, large work results, the store | the node | the audit: as above |
-| the prover's table | each job's record until it finishes, its statement, its proof's hash | the prover's node | the audit: as above |
+| the prover's table | each job's record (`witness_input` among it) until it finishes, its statement, its proof's hash; a `Queued` or `Proving` job of an agent the node does not lead keeps its record, never pruned while no `proven` row reaches it (a refused, dead or lost statement's never does; `node/prover/src/worker.rs`'s `prune` and `follow`; the bound is carried) | the prover's node | the audit: as above |
 | an agent on JAM: its work packages and results (`vos-jam`) | its batch, its rows' witness and its attests whole, served rows included | JAM's validators and DA | by design: an agent on JAM keeps no row from JAM, so a statement of one hides nothing from it |
 
 `RefinePayload`, which carried memory roots, went with the refine-bundle

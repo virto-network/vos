@@ -676,10 +676,10 @@ and fold layout of §1.1 is unchanged.
 | rows p2 / qm31 / h8 | 15,311 / 20,766 / 1,794 → 2^14 / 2^15 / 2^11, tallest **2^15** (≤ 2^17) | model |
 | own parameters | blowup 64, 20 queries, PoW 26, interaction PoW 8, fold step 3, last layer 2^6, Blake2b-256 Merkle and channel, affine DEEP batching for 80 proven bits (`proving.md` §3.5) | decided (format 28) |
 | cells, extended cells | 7.5M, 481M | model |
-| memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked [projected]; masked (format 39): 3.45 GiB of heap (×1.41), 11.6–15 s (×2.6–2.9) [measured] | projected, measured |
+| memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked [projected]; masked (format 39) as built: a 3.6 GiB heap [measured]; spike 6a's masked toy, historical: 3.45 GiB (×1.41), 11.6–15 s (×2.6–2.9) | projected, measured |
 | JAM gas, unmasked | 81.1M with the model's Blake2s; **85.2M Blake2b-256 in software (×1.05); 64.1M through `0x400` (×0.79)** | model (`R/spike4a-final-gas.md` §5, §7) |
-| JAM gas, masked | 115.8–118.7M (×1.21–1.24); the toy's ×1.37–1.40 overestimated | measured (spike 6a) |
-| proof | about 122 KB unmasked [model], 160–163 KB masked [measured] | model, measured |
+| JAM gas, masked | **79.3M** as built, the decode 1.50M of it [measured]; spike 6a's figures, historical: 115.8–118.7M (×1.21–1.24), its toy's ×1.37–1.40 | measured |
+| proof | about 122 KB unmasked [model]; masked as built 146,564 B (`wrap.proof`) [measured]; spike 6a's 160–163 KB, historical | model, measured |
 
 - The gas uses spike 4a's fit within 5.8%
   (`gas ≈ −4.2M + 59.3k·C + 2,171·q·C + 17,183·P + 9,376·F`) at 458 columns,
@@ -717,8 +717,8 @@ build-std. It holds:
   (`ST/stwo/src/core/fri.rs:107-200`, admitted after review);
 - the Blake2b-256 Merkle hasher and channel, in software as built. The
   hook that would route it through a host (VOS `0x400`, Kreivo's
-  `blake2_256`) is deferred, a lever for when ref_time binds: nothing in
-  slice 6 verifies as a PVM guest on a VOS host, and Kreivo's binding
+  `blake2_256`) is deferred, a lever for when ref_time binds: no venue
+  verifies as a PVM guest on a VOS host, and Kreivo's binding
   limit is proof_size. JAM serves no hash (Gray Paper 0.8.0 has no hash
   host call), so a JAM verifier hashes in software;
 - the public logup sum from the program id, the io-hash, `u` and `one`;

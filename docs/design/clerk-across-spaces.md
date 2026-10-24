@@ -8,8 +8,9 @@ Slice 6 built:
 - **the statements:** a kernel's final proof, masked (format 39), over
   its program id, its space, its `#[public]` arguments, its output and
   the roots it read; the node's prover, built into the node, proves each
-  statement its leader's agents record and submits it to the space's
-  venue (`proving.md` §3.6);
+  statement at an anchored cut its leader's agents record and submits it
+  to the space's venue (`proving.md` §3.6); a rootless statement has no
+  production prover yet (`proving.md` §6);
 - **the space roots and anchors:** Unix-time windows from the space's
   genesis, a space root per window built by its representative, anchored
   by one registered node key at the space's one venue; a space moves to

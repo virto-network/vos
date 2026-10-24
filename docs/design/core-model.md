@@ -705,7 +705,7 @@ The Local (replica-only) lane is deferred until a use case needs it.
     held build.
   - **Cost:** a committed write takes about 4.3 µs on the apply path,
     and the builder keeps up at 20k committed writes a second (slice 4).
-  - **Window cuts** [decided; built at slice 6's 6.12]. In an agent of a
+  - **Window cuts** [decided; built]. In an agent of a
     space, apply records `cut(w)`, the version before the first result
     timed at or past a window's boundary, for each boundary a result
     crosses (at most the newest `MAX_CUTS`); the leader of an idle agent
@@ -720,17 +720,16 @@ The Local (replica-only) lane is deferred until a use case needs it.
   read, scan and write of a refine is witnessed against the root the
   chain stores (section 12).
 - Hashing inside the PVM uses the hash precompile (section 11.2).
-- [decided; built at slice 6's 6.11 (agent root) and 6.14 (space root)]
-  Every agent has a root on both hosts: committed rows sit under their own
-  owner byte, `0x03 ‖ instance ‖ tag ‖ transform ‖ key'`; VOS keeps one
-  tree per agent over them, each leaf the bare value salted from the
-  writing version's seed and the full key; JAM's whole-keyspace tree
-  hashes `0x03` leaves the same way (its witness still carries the stored
-  rows), so the agent's root is the node at `0x03` of JAM's tree, and a
-  map's the node at its prefix. Every key under `0x03` is a committed
-  value row; anything else stored there is corrupt, and both hosts fail on
-  it. A space has a root per window, built by its representative
-  (`proving.md` §7).
+- [decided; built] Every agent has a root on both hosts: committed rows
+  sit under their own owner byte, `0x03 ‖ instance ‖ tag ‖ transform ‖
+  key'`; VOS keeps one tree per agent over them, each leaf the bare value
+  salted from the writing version's seed and the full key; JAM's
+  whole-keyspace tree hashes `0x03` leaves the same way (its witness still
+  carries the stored rows), so the agent's root is the node at `0x03` of
+  JAM's tree, and a map's the node at its prefix. Every key under `0x03`
+  is a committed value row; anything else stored there is corrupt, and
+  both hosts fail on it. A space has a root per window, built by its
+  representative (`proving.md` §7).
 
 ### 9.4 Merge lane
 

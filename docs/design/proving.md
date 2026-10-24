@@ -551,7 +551,10 @@ pub struct Statement {
     other vos dependency than `vos-anchor`, which it re-exports, so Kreivo
     can depend on it; its `model` is a venue as plain data, which the
     fixtures are judged against, and its JAM refine program
-    (`final-verify.elf`) is the venue on the JAM-only host;
+    (`final-verify.elf`) the harness's on the JAM-only host: a test and
+    vector program, which judges the fixtures and computes the anchor
+    vectors (its `ANCHORS` mode accepts with no proof read), so it is
+    never deployed as a venue; the JAM venue is the statements service;
   - `statement/service` (`vos-statement-service`): the JAM statements
     service (§6), its refine and accumulate over `vos-statement`, built
     as a JAM program (`statement-service.elf`);
@@ -788,7 +791,9 @@ last for decades.**
   in the agent (`Input::Proven`) and submits it once its roots are
   anchored, a repeat counted as accepted. The prover is built into the
   node and stays there [decided]; the extension host that will carry the
-  venues' transports is deferred.
+  venues' transports is deferred. **Known limit:** the worker proves
+  statements at an anchored cut alone (an attest with a window); a
+  rootless statement (`Kind::Stating`) has no production prover yet.
 
 ## 7. Roots and anchors [proposed]
 
@@ -824,6 +829,21 @@ last for decades.**
   pin D).
 - **Anchors** [decided] are signed by one registered node key; the
   controller rotates the keys.
+- **Equivocation** [decided]: a second root at a window held is evidence
+  and suspends the space until the controller removes both signing keys
+  and resumes it. An honest node raises it: its venue client, finding
+  the venue holding another root at a window the node anchors, sends the
+  node's anchor all the same as the evidence, and alerts. A contested
+  root is never trusted: the venue drops the window's anchor with the
+  evidence, so after the resume statements rooted there are refused
+  (`0x5`) and the space anchors on from the window after its last
+  (`slice-6-on-chain.md`, pin D; `spaces-pallet.md` §6.1, vector G19).
+- **Known limits** (carried): any single founding key registers the
+  space at a venue it has not reached, under a controller of its choosing,
+  and so squats it there (`spaces-pallet.md` §6.2); and equivocation is
+  caught per venue only: a venue the space migrates to trusts the
+  founder-signed start, so the windows before the migration may be
+  anchored at both venues unseen (an anchor gives no integrity).
 - **Retention:** none past a cut. A request made in window w reads at
   `cut(w)` and is served at the next cut.
 - **Spans** [decided]: a statement over a span of windows takes a carried
@@ -1280,7 +1300,7 @@ the order drawn, never in `TypeId` order). `just judge-wasm` (in
 
 **At format 39** [measured]: the generator wraps `S`'s
 run under format 39, masked from the seeded test seam (`MaskRng::Seeded`,
-so the bytes are its own every run: `wrap.proof`, 145,796 bytes), and under
+so the bytes are its own every run: `wrap.proof`, 146,564 bytes), and under
 28 (`wrap-28.proof`, 123,797 bytes); the two cheating wraps under 39; and a
 second kernel's rootless statement `S0`, one segment wrapped under 39
 (`wrap-rootless.proof`). `S` is a venue-bound program's: its `public_args`
@@ -1294,13 +1314,13 @@ JAM-only host (`final-verify.elf`, 39 alone, and `final-verify-test.elf`).
 A build linking 39 alone refuses a statement of 28 as `0x2`, its first
 check:
 
-| case | verdict | JAM-only host, production |
+| case | verdict | JAM-only host, 39 alone [measured] |
 |---|---|---|
-| valid; rootless (`S0`) | accepted | 109.7M; 109.8M gas |
-| format 28 at the test venue | accepted (`0x2` where 28 is not linked) | test guest 96.5M |
-| tampered; tampered, format 28 at the test venue | `0x112` | 70.0M; test guest 67.2M |
-| wrong program; wrong io-hash; the nonce; the roots' order; a root dropped | `0x108` | 14.0M |
-| prefix; mid-way | `0x109` | 14.2M |
+| valid; rootless (`S0`) | accepted | 79.4M; 79.1M gas |
+| format 28 at the test venue | accepted (`0x2` where 28 is not linked) | test guest 76.2M |
+| tampered; tampered, format 28 at the test venue | `0x112` | 47.6M; test guest 52.8M |
+| wrong program; wrong io-hash; the nonce; the roots' order; a root dropped | `0x108` | 11.0M |
+| prefix; mid-way | `0x109` | 11.1M |
 | unaccepted format (30); format 28 at a production venue | `0x2` | 0.1M |
 | another program than the pin | `0x3` | 0.1M |
 | another space; the space; rootless, another space; rooted, of no space | `0x4` | 0.1M |

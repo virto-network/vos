@@ -396,7 +396,9 @@ check-no-heap-peak: (_forbidden "heap-peak")
 # with the standard library built from source, with the venue's JAM refine
 # program, which `vos-pvm-recair`'s wrap tests and the fixtures' and the
 # end-to-end tests run on the JAM-only host: `final-verify.elf`, the
-# production venue's, linking format 39 alone, and `final-verify-test.elf`,
+# harness's refine program, linking format 39 alone (a test and vector
+# program: its `ANCHORS` mode accepts with no proof, so it is no venue; the
+# JAM venue is `statement-service.elf`), and `final-verify-test.elf`,
 # linking 28 beside it for the test policy's fixtures; and the JAM statements
 # service's program, `statement-service.elf`, which its tests run on the
 # JAM-only host, refine and accumulate. The final verifier and
