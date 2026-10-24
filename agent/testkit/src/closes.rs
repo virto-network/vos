@@ -21,10 +21,16 @@ impl Testkit {
 
     /// A step that runs nothing and writes `writes`, applied.
     fn written(&mut self, writes: Vec<Write>, messages: Vec<Outgoing>) -> Step {
+        self.applied(Step {
+            writes,
+            messages,
+            ..Step::consumed(Outcome::Done(Vec::new()))
+        })
+    }
+
+    /// `step`, which runs nothing, counted and applied.
+    fn applied(&mut self, step: Step) -> Step {
         self.steps += 1;
-        let mut step = Step::consumed(Outcome::Done(Vec::new()));
-        step.writes = writes;
-        step.messages = messages;
         self.apply(&step, Vec::new());
         step
     }
@@ -189,11 +195,10 @@ impl Testkit {
         }
         overlay.insert(keys::reports(from), Some(window.encode()));
         let (writes, committed) = crate::split_writes(overlay);
-        self.steps += 1;
-        let mut step = Step::consumed(Outcome::Done(Vec::new()));
-        step.writes = writes;
-        step.committed = committed;
-        self.apply(&step, Vec::new());
-        step
+        self.applied(Step {
+            writes,
+            committed,
+            ..Step::consumed(Outcome::Done(Vec::new()))
+        })
     }
 }
