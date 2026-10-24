@@ -280,7 +280,7 @@ fn masked_field_mutants(judge: &Judge, proof: &[u8]) -> (Vec<Mutant>, Vec<String
         match masked::encode(&tampered) {
             Some(bytes) => {
                 let code = judge.code(&statement, &bytes);
-                assert_eq!(code >> 8, 1, "{name}: refused by its proof");
+                assert!(crate::proof_refused(code), "{name}: refused by its proof");
                 mutants.push(mutant(name.to_string(), proof, &bytes, code));
             }
             None => without.push(name.to_string()),

@@ -748,3 +748,14 @@ pub fn standard_program(instructions: &[Vec<u8>]) -> Vec<u8> {
     })
     .expect("a standard program")
 }
+
+/// Whether a venue's `code` refuses a proof against the words its
+/// statement makes: the interaction PoW, drawn from other words, falls
+/// short, or the claimed sums and the public terms do not add to zero.
+pub fn by_words(code: u32) -> bool {
+    use vos_pvm_final_verifier::Error;
+    use vos_statement::Refusal;
+    [Error::InteractionPow, Error::Logup]
+        .into_iter()
+        .any(|error| code == Refusal::Proof(error).code())
+}

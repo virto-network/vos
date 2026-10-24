@@ -9,7 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use vos_node_prover::{Host, Jobs, Options, ProveError, Prover, State, Worker};
-use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
+use vos_venue::vos_statement::{ProgramId, Refusal, Statement, StatementId};
 use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
 use vos_wire::ids::{AgentId, ProgramHash};
 use vos_wire::result::Attest;
@@ -260,7 +260,7 @@ impl VenueClient for Venue {
         drop(refuse);
         let id = statement.id();
         if !self.accepted.lock().unwrap().insert(id.0) {
-            return Err(NotAccepted::Refused(6));
+            return Err(Refusal::Repeated.into());
         }
         if self
             .unfunded

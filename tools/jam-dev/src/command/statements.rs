@@ -25,7 +25,7 @@ use std::time::Duration;
 use ed25519_dalek::SigningKey;
 use vos_jam_dev::live::statements::{MIN_ITEM_GAS, Statements};
 use vos_jam_dev::live::{PolkaJam, Watch};
-use vos_jam_dev::venue::{JamVenue, register_code};
+use vos_jam_dev::venue::{JamVenue, anchor_code, register_code};
 use vos_pvm::refine_host::{JamItem, JamRefine, RefineContext};
 use vos_pvm_compiler::{ServiceMetadata, service_blob};
 use vos_statement::fixtures::{self, Fixture};
@@ -33,7 +33,7 @@ use vos_statement::vos_anchor::{
     Anchor, Migrate, RootKind, SpaceGenesis, VenueId, WindowClock, space_id,
 };
 use vos_statement::vos_pvm_final_verifier::MAX_PROOF_BYTES;
-use vos_statement::{Pin, blake2b_256};
+use vos_statement::{Pin, Refusal, blake2b_256};
 use vos_statement_service::config::{Config, configure};
 use vos_statement_service::item::{Control, Item, Op, SignedControl, control_digest};
 use vos_statement_service::state::Outcome;
@@ -230,7 +230,7 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
         &outcome,
     );
     compare(record, &program, service, &lone, &[large], &outcome)?;
-    if outcome.code >> 8 != 1 {
+    if !vos_venue::proof_refused(outcome.code) {
         return Err("the 256 KiB proof was not refused by the verifier".into());
     }
 
@@ -390,8 +390,16 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
 
     let expected = [
         (landed.code, 0, "the rootless statement accepted"),
-        (replayed.code, 6, "its replay refused as repeated"),
-        (other.code, 7, "the rooted one refused as another venue's"),
+        (
+            replayed.code,
+            Refusal::Repeated.code(),
+            "its replay refused as repeated",
+        ),
+        (
+            other.code,
+            Refusal::Venue.code(),
+            "the rooted one refused as another venue's",
+        ),
     ];
     for (code, expected, what) in expected {
         if code != expected {
@@ -401,7 +409,7 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
     if controlled != [0, 0, 0] || replayed_add != ControlCode::Nonce as u32 {
         return Err(format!("the controls: {controlled:?}, the replay {replayed_add}").into());
     }
-    if resumed.as_ref().ok() != Some(&(AnchorCode::New as u32)) {
+    if resumed.as_ref().ok().copied().and_then(anchor_code) != Some(AnchorCode::New) {
         return Err(format!("the rotated key's anchor: {resumed:?}").into());
     }
     migrated.map_err(|refusal| format!("the migration refused: {refusal:?}"))?;

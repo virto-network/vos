@@ -13,7 +13,7 @@ use vos_node::roots::{self, AgentStore};
 use vos_node::store::EntryKind;
 use vos_node::{Config, Node, Reply};
 use vos_tree::{Hash, NodeStore};
-use vos_venue::vos_statement::{Statement, StatementId};
+use vos_venue::vos_statement::{Refusal, Statement, StatementId};
 use vos_venue::{AnchorRefusal, Anchored, ModelVenue, NotAccepted, Status, VenueClient};
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, InstanceId, MapId, MethodId, RequestId, Session};
@@ -480,7 +480,7 @@ impl VenueClient for Judging {
         self.submissions.fetch_add(1, Ordering::SeqCst);
         let id = statement.id();
         if !self.accepted.lock().unwrap().insert(id.0) {
-            return Err(NotAccepted::Refused(6));
+            return Err(Refusal::Repeated.into());
         }
         Ok(id)
     }

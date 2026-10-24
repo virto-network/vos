@@ -14,9 +14,9 @@ use vos_node::{Config, Hooks};
 use vos_node_prover::Prover;
 use vos_statement_service::item::Item;
 use vos_statement_service::state::{Outcome as Judged, keys as jam_keys};
+use vos_venue::VenueClient;
 use vos_venue::kreivo::KreivoVenue;
-use vos_venue::vos_statement::Statement;
-use vos_venue::{NotAccepted, VenueClient};
+use vos_venue::vos_statement::{Refusal, Statement};
 use vos_wire::SpaceGenesis;
 use vos_wire::keys;
 use vos_wire::package::SLOT_MS;
@@ -446,7 +446,7 @@ impl Run {
         ));
         assert_eq!(
             refused,
-            Err(NotAccepted::Refused(5)),
+            Err(Refusal::Unanchored.into()),
             "unanchored at Kreivo"
         );
         stated
@@ -498,7 +498,7 @@ impl Run {
             (
                 "venue-bound, at another venue",
                 b.submit(bound, bound_proof),
-                Err(NotAccepted::Refused(7)),
+                Err(Refusal::Venue.into()),
             ),
             (
                 "unbound, at JAM a",

@@ -35,7 +35,8 @@ use vos_pvm_proof::program_id::KernelEntry;
 use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
 use vos_pvm_proof::{Proof, program_commitment_of_proof, prove_kernel};
 use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment};
-use vos_statement::{ProgramId, Statement};
+use vos_statement::vos_pvm_final_verifier::Error as FinalError;
+use vos_statement::{ProgramId, Refusal, Statement};
 use vos_tree::{Blake2b, Hasher};
 use vos_venue::{AnchorRefusal, VenueClient};
 use vos_wire::abi::AttestError;
@@ -708,13 +709,21 @@ fn the_window_is_stated_at_the_model_venue() {
         vos_venue::code(&venue.venue.submit(statement, &proof))
     };
     // The proof refused against the words the statement makes.
-    const WORDS: u32 = 0x108;
+    let words = Refusal::Proof(FinalError::InteractionPow).code();
 
     let accepting = anchored();
     assert_eq!(code(&accepting, &statement), 0, "accepted");
-    assert_eq!(code(&accepting, &statement), 6, "a repeat");
+    assert_eq!(
+        code(&accepting, &statement),
+        Refusal::Repeated.code(),
+        "a repeat"
+    );
 
-    assert_eq!(code(&venue(VENUE), &statement), 5, "an unanchored root");
+    assert_eq!(
+        code(&venue(VENUE), &statement),
+        Refusal::Unanchored.code(),
+        "an unanchored root"
+    );
 
     let before = RootRead {
         window: WINDOW - 1,
@@ -724,13 +733,17 @@ fn the_window_is_stated_at_the_model_venue() {
         roots: vec![before],
         ..statement.clone()
     };
-    assert_eq!(code(&anchored(), &at_another_window), 5, "another window");
+    assert_eq!(
+        code(&anchored(), &at_another_window),
+        Refusal::Unanchored.code(),
+        "another window"
+    );
     let both = venue(VENUE);
     both.anchor(&before).expect("anchored at the window before");
     both.anchor(&root).expect("anchored");
     assert_eq!(
         code(&both, &at_another_window),
-        WORDS,
+        words,
         "another window, anchored"
     );
 
@@ -739,7 +752,11 @@ fn the_window_is_stated_at_the_model_venue() {
         space: second,
         ..statement.clone()
     };
-    assert_eq!(code(&anchored(), &claimed), 4, "another space");
+    assert_eq!(
+        code(&anchored(), &claimed),
+        Refusal::Space.code(),
+        "another space"
+    );
     let of_second = RootRead {
         space: second,
         ..root
@@ -753,7 +770,7 @@ fn the_window_is_stated_at_the_model_venue() {
     there
         .anchor(&of_second)
         .expect("anchored in the second space");
-    assert_eq!(code(&there, &moved), WORDS, "another space, anchored");
+    assert_eq!(code(&there, &moved), words, "another space, anchored");
 
     let without = venue(VENUE);
     without
@@ -764,7 +781,7 @@ fn the_window_is_stated_at_the_model_venue() {
         .expect("anchored without the agent's row");
     assert_eq!(
         code(&without, &statement),
-        5,
+        Refusal::Unanchored.code(),
         "a missing representative row"
     );
 
@@ -775,7 +792,7 @@ fn the_window_is_stated_at_the_model_venue() {
         output: (net + 1, seq, c_new).encode(),
         ..statement.clone()
     };
-    assert_eq!(code(&anchored(), &tampered), WORDS, "a tampered output");
+    assert_eq!(code(&anchored(), &tampered), words, "a tampered output");
 
     let elsewhere = venue(VenueId([0x7f; 32]));
     assert_eq!(
@@ -783,7 +800,11 @@ fn the_window_is_stated_at_the_model_venue() {
         Err(AnchorRefusal::Signature),
         "an anchor signed for another venue"
     );
-    assert_eq!(code(&elsewhere, &statement), 5, "a venue mismatch");
+    assert_eq!(
+        code(&elsewhere, &statement),
+        Refusal::Unanchored.code(),
+        "a venue mismatch"
+    );
 
     let migrated = venue(VENUE);
     migrated.set_now(cut::CLOCK.boundary(WINDOW - 2).unwrap() + 1);
@@ -804,7 +825,7 @@ fn the_window_is_stated_at_the_model_venue() {
     );
     assert_eq!(
         code(&migrated, &statement),
-        5,
+        Refusal::Unanchored.code(),
         "a window outside the migration range"
     );
 }

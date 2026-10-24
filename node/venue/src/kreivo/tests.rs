@@ -25,6 +25,7 @@ use super::send::{Answer, answer, judged};
 use super::transport::{Included, Lost, SendError, Sent, Signed, Transport};
 use super::{Alert, KreivoVenue, Options, Sender};
 use crate::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
+use vos_statement::Refusal;
 
 const UNITS: u128 = 1_000_000_000_000;
 const VENUE: VenueId = VenueId([0x7e; 32]);
@@ -678,7 +679,7 @@ fn statements_are_judged_through_the_client() {
     other.output.push(0);
     let refused = venue.submit(&other, &fx.proof);
     assert!(
-        matches!(refused, Err(NotAccepted::Refused(code)) if code >= 0x100),
+        matches!(refused, Err(NotAccepted::Refused(code)) if crate::proof_refused(code)),
         "the proof refused against another statement: {refused:?}"
     );
     assert_eq!(
@@ -691,7 +692,7 @@ fn statements_are_judged_through_the_client() {
     let sent = chain.sends().len();
     assert_eq!(
         venue.submit(&format, &fx.proof),
-        Err(NotAccepted::Refused(2))
+        Err(Refusal::Format.into())
     );
     assert_eq!(chain.sends().len(), sent, "refused before paying");
     assert!(
@@ -757,7 +758,10 @@ fn every_error_and_refusal_is_mapped() {
         output_hash: [0; 32],
     };
     assert_eq!(judged(&[accepted], id), Some(Ok(id)));
-    assert_eq!(judged(&[refused(6)], id), Some(Ok(id)));
+    assert_eq!(
+        judged(&[refused(Refusal::Repeated.code())], id),
+        Some(Ok(id))
+    );
     for code in [1, 2, 3, 4, 5, 7, 0x101, 0x108] {
         assert_eq!(
             judged(&[refused(code)], id),

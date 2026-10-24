@@ -148,13 +148,12 @@ fn a_balance_is_accepted_at_the_model_venue() {
             &proof,
         ))
     };
-    let by_words = |code: u32| code == 0x108 || code == 0x109;
     let mut changed = statement.clone();
     let threshold = changed.public_args.len() - 8;
     changed.public_args[threshold] ^= 1;
-    assert!(by_words(code(&changed)), "another threshold");
+    assert!(common::by_words(code(&changed)), "another threshold");
     let mut changed = statement.clone();
     changed.public_args[8] ^= 1;
-    assert!(by_words(code(&changed)), "another commitment");
+    assert!(common::by_words(code(&changed)), "another commitment");
     assert_eq!(code(&statement), 0, "accepted");
 }

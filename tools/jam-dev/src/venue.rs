@@ -10,9 +10,10 @@
 //! never take it; one whose key the service does not list is handed back
 //! to the leader to sign again with a key it lists
 //! ([`VenueClient::unsettled`]), and the same anchor offered again is
-//! refused for its key. Every refusal but `Open` alerts. A statement's code is its refusal's class; a repeat (6)
-//! is the venue holding it accepted; a transport failure, or a package that
-//! never lands, leaves it unjudged (`Unjudged::Unknown`).
+//! refused for its key. Every refusal but `Open` alerts. A statement's
+//! code is its refusal's class; a repeat (`Refusal::Repeated`) is the
+//! venue holding it accepted; a transport failure, or a package that never
+//! lands, leaves it unjudged (`Unjudged::Unknown`).
 //!
 //! A `JamVenue` is made only for a service whose code is the one the node
 //! expects: its code hash the deployed blob's, that blob's configuration
@@ -30,7 +31,7 @@ use crate::live::statements::{Item as Package, Statements};
 use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use vos_anchor::{Anchor, Migrate, RootRead, SpaceGenesis, SpaceId, VenueId, register_digest};
 use vos_jam::Error;
-use vos_statement::{MAX_ROOT_AGE_MS, Statement, StatementId};
+use vos_statement::{MAX_ROOT_AGE_MS, Refusal, Statement, StatementId};
 use vos_statement_service::config::{Config, configure};
 use vos_statement_service::item::{
     Control, Item, Op, Register, SignedControl, SignedMigrate, control_digest, migrate_digest,
@@ -130,7 +131,7 @@ impl AnchorSend for JamSend {
             }
         };
         let fate = fate(code);
-        if !matches!(fate, Fate::Done) && code != AnchorCode::Open as u32 {
+        if !matches!(fate, Fate::Done) && anchor_code(code) != Some(AnchorCode::Open) {
             tracing::error!(window, code, ?fate, "the JAM service refused an anchor");
         }
         fate
@@ -165,18 +166,50 @@ impl JamSend {
     }
 }
 
+/// The anchor outcome the service's `code` is; none for another code.
+pub fn anchor_code(code: u32) -> Option<AnchorCode> {
+    use AnchorCode::*;
+    [
+        New,
+        Again,
+        Item,
+        Signature,
+        Unregistered,
+        Suspended,
+        Key,
+        Window,
+        Open,
+        Age,
+        Equivocation,
+    ]
+    .into_iter()
+    .find(|known| *known as u32 == code)
+}
+
+/// The migration outcome the service's `code` is; none for another code.
+fn migrate_code(code: u32) -> Option<MigrateCode> {
+    use MigrateCode::*;
+    [
+        Migrated,
+        Item,
+        Venue,
+        Signature,
+        Unregistered,
+        Controller,
+        AlreadyMigrated,
+        Window,
+    ]
+    .into_iter()
+    .find(|known| *known as u32 == code)
+}
+
 /// What becomes of an anchor the service answered `code`.
 fn fate(code: u32) -> Fate {
-    match code {
-        code if code == AnchorCode::New as u32 || code == AnchorCode::Again as u32 => Fate::Done,
-        code if code == AnchorCode::Window as u32
-            || code == AnchorCode::Age as u32
-            || code == AnchorCode::Equivocation as u32 =>
-        {
-            Fate::Dead
-        }
-        code if code == AnchorCode::Open as u32 => Fate::Again(SLOT),
-        code if code == AnchorCode::Key as u32 => Fate::Resign,
+    match anchor_code(code) {
+        Some(AnchorCode::New | AnchorCode::Again) => Fate::Done,
+        Some(AnchorCode::Window | AnchorCode::Age | AnchorCode::Equivocation) => Fate::Dead,
+        Some(AnchorCode::Open) => Fate::Again(SLOT),
+        Some(AnchorCode::Key) => Fate::Resign,
         _ => Fate::Again(AWHILE),
     }
 }
@@ -283,13 +316,11 @@ impl Jam {
             .land(item.encode(), Vec::new())
             .map_err(|_| MigrateRefusal::Window)?
             .code;
-        match code {
-            code if code == MigrateCode::Migrated as u32 => Ok(()),
-            code if code == MigrateCode::Unregistered as u32 => Err(MigrateRefusal::Unregistered),
-            code if code == MigrateCode::Venue as u32 => Err(MigrateRefusal::Venue),
-            code if code == MigrateCode::AlreadyMigrated as u32 => {
-                Err(MigrateRefusal::AlreadyMigrated)
-            }
+        match migrate_code(code) {
+            Some(MigrateCode::Migrated) => Ok(()),
+            Some(MigrateCode::Unregistered) => Err(MigrateRefusal::Unregistered),
+            Some(MigrateCode::Venue) => Err(MigrateRefusal::Venue),
+            Some(MigrateCode::AlreadyMigrated) => Err(MigrateRefusal::AlreadyMigrated),
             _ => Err(MigrateRefusal::Window),
         }
     }
@@ -349,7 +380,8 @@ impl VenueClient for JamVenue {
             return Ok(id);
         }
         match self.submit_code(statement, proof) {
-            Ok(0 | 6) => Ok(statement.id()),
+            Ok(0) => Ok(id),
+            Ok(code) if code == Refusal::Repeated.code() => Ok(id),
             Ok(code) => Err(NotAccepted::Refused(code)),
             Err(_) => Err(NotAccepted::Unjudged(Unjudged::Unknown)),
         }

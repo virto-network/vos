@@ -50,14 +50,24 @@ pub trait VenueClient: Send + Sync {
     fn unsettled(&self, space: &SpaceId) -> Vec<Anchor>;
 }
 
+/// The first of the codes a venue reports for its failure to judge a
+/// statement (on JAM, refine out of gas, a panic, an undecodable verdict):
+/// above every [`Refusal::code`].
+pub const UNJUDGED_FROM: u32 = 0x1000;
+
 /// Whether a submission refused with `code` may be accepted when sent
-/// again: 5, a root the venue does not hold anchored now (its anchor yet to
-/// land, its space suspended until resumed, a node's view behind the
-/// venue's), and a venue's failure to judge it, from `0x1000` (on JAM,
-/// refine out of gas, a panic, an undecodable verdict). The others are the
-/// statement's own, and final.
+/// again: [`Refusal::Unanchored`], a root the venue does not hold anchored
+/// now (its anchor yet to land, its space suspended until resumed, a
+/// node's view behind the venue's), and a venue's failure to judge it, from
+/// [`UNJUDGED_FROM`]. The others are the statement's own, and final.
 pub fn transient(code: u32) -> bool {
-    code == Refusal::Unanchored.code() || code >= 0x1000
+    code == Refusal::Unanchored.code() || code >= UNJUDGED_FROM
+}
+
+/// Whether `code` is a refused proof's ([`Refusal::Proof`]'s class: `0x100`
+/// and the final verifier's code).
+pub fn proof_refused(code: u32) -> bool {
+    code >> 8 == 1
 }
 
 /// Where a space stands at a venue.

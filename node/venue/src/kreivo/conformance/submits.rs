@@ -64,7 +64,7 @@ pub(super) fn g7(fx: &Fixtures) -> Vector {
     };
     w.refused(changed(&|s| s.roots[0] = unanchored), proof.clone(), 5);
     w.refused(changed(&|s| s.public_args[0] ^= 1), proof.clone(), 7);
-    assert_eq!(fx.tampered_code >> 8, 1);
+    assert!(crate::proof_refused(fx.tampered_code));
     w.refused(s.encode(), fx.tampered.clone(), fx.tampered_code);
     // The activation windows: the fixture's own format and program stored,
     // but not active now.

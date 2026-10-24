@@ -620,10 +620,11 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 Ok(_) => State::Accepted,
                 Err(NotAccepted::Refused(code)) if code == repeated => State::Accepted,
                 Err(NotAccepted::Refused(code)) if vos_venue::transient(code) => {
-                    let (wait, count) = self.retry_later(id, code >= 0x1000);
-                    // 5 goes again until the anchor ages; a failure to judge
-                    // a bounded number of times.
-                    if code >= 0x1000 && count > MAX_RESUBMITS {
+                    let unjudged = code >= vos_venue::UNJUDGED_FROM;
+                    let (wait, count) = self.retry_later(id, unjudged);
+                    // `Unanchored` goes again until the anchor ages; a
+                    // failure to judge a bounded number of times.
+                    if unjudged && count > MAX_RESUBMITS {
                         tracing::error!(
                             agent = job.agent.0,
                             code,
@@ -651,9 +652,10 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 Err(NotAccepted::Unjudged(why)) => {
                     // A rootless statement has no deadline: its answers
                     // lost count, a bounded number of times, and then it
-                    // goes once more, a repeat (6) counted as accepted, an
-                    // acceptance whose answer was lost. Funding and the
-                    // configuration are the operator's, and do not count.
+                    // goes once more, a repeat (`Refusal::Repeated`)
+                    // counted as accepted, an acceptance whose answer was
+                    // lost. Funding and the configuration are the
+                    // operator's, and do not count.
                     let lost = why == Unjudged::Unknown;
                     let (wait, count) = self.retry_later(id, lost);
                     if statement.roots.is_empty() && count > MAX_RESUBMITS {

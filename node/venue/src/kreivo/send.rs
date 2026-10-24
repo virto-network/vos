@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vos_anchor::{Anchor, MAX_ROOT_AGE_MS};
-use vos_statement::{Statement, StatementId};
+use vos_statement::{Refusal, Statement, StatementId};
 
 use super::calls::{
     Active, AnchorRecord, Call, Error, Event, PAUSED_ANCHOR, PAUSED_SUBMIT, ProgramInfo, SpaceInfo,
@@ -277,13 +277,13 @@ impl Shared {
         let now = self.venue_now().ok()?;
         let format = self.read::<Active>(&keys::formats(statement.format)).ok()?;
         if !format.is_some_and(|active| active.at(now)) {
-            return Some(Err(NotAccepted::Refused(2)));
+            return Some(Err(Refusal::Format.into()));
         }
         let program = self
             .read::<ProgramInfo>(&keys::programs(&statement.program.0))
             .ok()?;
         if !program.is_some_and(|info| info.active.at(now)) {
-            return Some(Err(NotAccepted::Refused(3)));
+            return Some(Err(Refusal::Program.into()));
         }
         if self.read::<u64>(&keys::seen(&id.0)).ok()?.is_some() {
             return Some(Ok(*id));
@@ -377,15 +377,15 @@ pub(super) fn answer(error: Option<Error>) -> Answer {
 }
 
 /// A submit's verdict from its events: `Accepted { id }` accepted,
-/// `Refused { 6 }` accepted (a repeat, two nodes racing), `Refused { c }`
-/// refused; none when it was not judged.
+/// `Refused` with [`Refusal::Repeated`]'s code accepted (a repeat, two
+/// nodes racing), `Refused { c }` refused; none when it was not judged.
 pub(super) fn judged(
     events: &[Event],
     id: StatementId,
 ) -> Option<Result<StatementId, NotAccepted>> {
     events.iter().find_map(|event| match event {
         Event::Accepted { id: accepted, .. } if *accepted == id.0 => Some(Ok(id)),
-        Event::Refused { code: 6, .. } => Some(Ok(id)),
+        Event::Refused { code, .. } if *code == Refusal::Repeated.code() => Some(Ok(id)),
         Event::Refused { code, .. } => Some(Err(NotAccepted::Refused(*code))),
         _ => None,
     })

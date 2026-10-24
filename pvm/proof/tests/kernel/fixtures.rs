@@ -331,8 +331,8 @@ mod statements {
     use vos_statement::fixtures::{CASES, Case, Patch};
     use vos_statement::model::{Input, Policy, Range, Space};
     use vos_statement::{
-        MAX_ROOT_AGE_MS, Pin, ProgramId, RootKind, RootRead, SpaceId, Statement, StatementId,
-        VenueId, WindowClock,
+        MAX_ROOT_AGE_MS, Pin, ProgramId, Refusal, RootKind, RootRead, SpaceId, Statement,
+        StatementId, VenueId, WindowClock,
     };
 
     use super::common::{self, NodeRun};
@@ -592,8 +592,8 @@ mod statements {
         };
         type Class = fn(u32) -> bool;
         let accepted: Class = |code| code == 0;
-        let by_proof: Class = |code| code >> 8 == 1;
-        let by_words: Class = |code| code == 0x108 || code == 0x109;
+        let by_proof: Class = vos_venue::proof_refused;
+        let by_words: Class = common::by_words;
         let cases: Vec<(&str, &str, Option<Patch>, Input, Class)> = vec![
             ("valid", "wrap.proof", None, input(&|_| {}), accepted),
             (
@@ -627,7 +627,7 @@ mod statements {
                 input(&|i| {
                     i.policy.anchors.remove(0);
                 }),
-                |code| code == 5,
+                |code| code == Refusal::Unanchored.code(),
             ),
             (
                 "prefix",
@@ -648,21 +648,21 @@ mod statements {
                 "wrap.proof",
                 None,
                 input(&|i| i.policy.record(&i.statement)),
-                |code| code == 6,
+                |code| code == Refusal::Repeated.code(),
             ),
             (
                 "unaccepted format",
                 "wrap.proof",
                 None,
                 input(&|i| i.statement.format = 30),
-                |code| code == 2,
+                |code| code == Refusal::Format.code(),
             ),
             (
                 "format 28 at a production venue",
                 "wrap-28.proof",
                 None,
                 input(&under_28),
-                |code| code == 2,
+                |code| code == Refusal::Format.code(),
             ),
             (
                 "wrong io-hash",
@@ -676,28 +676,28 @@ mod statements {
                 "wrap.proof",
                 None,
                 input(&|i| i.statement.program = other),
-                |code| code == 3,
+                |code| code == Refusal::Program.code(),
             ),
             (
                 "another space",
                 "wrap.proof",
                 None,
                 input(&|i| i.statement.roots[1].space = OTHER_SPACE),
-                |code| code == 4,
+                |code| code == Refusal::Space.code(),
             ),
             (
                 "the space",
                 "wrap.proof",
                 None,
                 input(&|i| i.statement.space = OTHER_SPACE),
-                |code| code == 4,
+                |code| code == Refusal::Space.code(),
             ),
             (
                 "rootless, another space",
                 "wrap.proof",
                 None,
                 input(&|i| i.statement.roots.clear()),
-                |code| code == 4,
+                |code| code == Refusal::Space.code(),
             ),
             (
                 "rooted, of no space",
@@ -711,35 +711,35 @@ mod statements {
                     i.policy.spaces[0].id = SpaceId::NONE;
                     i.policy.anchors = i.statement.roots.clone();
                 }),
-                |code| code == 4,
+                |code| code == Refusal::Space.code(),
             ),
             (
                 "another venue's statement",
                 "wrap.proof",
                 None,
                 input(&|i| i.statement.public_args[31] ^= 1),
-                |code| code == 7,
+                |code| code == Refusal::Venue.code(),
             ),
             (
                 "replayed at another venue",
                 "wrap.proof",
                 None,
                 input(&|i| i.policy.venue = VenueId::jam(&[0x4A; 32], 8)),
-                |code| code == 7,
+                |code| code == Refusal::Venue.code(),
             ),
             (
                 "a root's window",
                 "wrap.proof",
                 None,
                 input(&|i| i.policy.anchors[1].window = 43),
-                |code| code == 5,
+                |code| code == Refusal::Unanchored.code(),
             ),
             (
                 "a root",
                 "wrap.proof",
                 None,
                 input(&|i| i.policy.anchors[1].root[31] ^= 1),
-                |code| code == 5,
+                |code| code == Refusal::Unanchored.code(),
             ),
             (
                 "the nonce",
@@ -774,7 +774,7 @@ mod statements {
                         until: Some(42),
                     }
                 }),
-                |code| code == 5,
+                |code| code == Refusal::Unanchored.code(),
             ),
             (
                 "registered after a root's window",
@@ -786,7 +786,7 @@ mod statements {
                         until: None,
                     }
                 }),
-                |code| code == 5,
+                |code| code == Refusal::Unanchored.code(),
             ),
             (
                 "rooted, replayed past MaxRootAge",
@@ -796,7 +796,7 @@ mod statements {
                     i.policy.record(&i.statement);
                     i.policy.advance(past);
                 }),
-                |code| code == 5,
+                |code| code == Refusal::Unanchored.code(),
             ),
             (
                 "rootless, replayed past MaxRootAge",
@@ -806,7 +806,7 @@ mod statements {
                     i.policy.record(&i.statement);
                     i.policy.advance(past);
                 }),
-                |code| code == 6,
+                |code| code == Refusal::Repeated.code(),
             ),
             (
                 "format 28 at the test venue",
@@ -830,14 +830,14 @@ mod statements {
                     i.policy = after_39.clone();
                     under_28(i);
                 }),
-                |code| code == 6,
+                |code| code == Refusal::Repeated.code(),
             ),
             (
                 "accepted under 28, replayed under 39",
                 "wrap.proof",
                 None,
                 input(&|i| i.policy = after_28.clone()),
-                |code| code == 6,
+                |code| code == Refusal::Repeated.code(),
             ),
         ];
         let proofs = [
