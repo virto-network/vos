@@ -113,10 +113,6 @@ impl MaskLayout {
         })
     }
 
-    pub fn log_size(&self) -> u32 {
-        self.log_size
-    }
-
     /// `poly + v_H·r` at `log_size + 1`, `r`'s `h` coefficients from `rng`.
     pub fn mask(
         &self,

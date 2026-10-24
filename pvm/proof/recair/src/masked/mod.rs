@@ -68,7 +68,7 @@ use stwo::prover::{
 };
 use stwo_constraint_framework::Relation;
 use vos_pvm_final_verifier::masked::{MaskedFormat, shape_of};
-use vos_pvm_proof::format::{Format, MASKED_WRAP, Masking};
+use vos_pvm_proof::format::{Format, Masking};
 use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair_air::masked::{
     self as air, BLIND_COLUMNS, MASKED_COLUMN_EXPANSION, MASKED_LOG_CONSTRAINT_EXPANSION, MaskPins,
@@ -94,13 +94,6 @@ pub const fn mask_pins(masking: &Masking) -> MaskPins {
         fri_mask_columns: masking.fri_mask_columns,
     }
 }
-
-/// `format::MASKED_WRAP`'s trees: its salt and `R` columns, read from the
-/// registry.
-pub const MASKED_WRAP_PINS: MaskPins = match &MASKED_WRAP.masking {
-    Some(masking) => mask_pins(masking),
-    None => panic!("format::MASKED_WRAP pins its masking"),
-};
 
 /// A masked registry entry as its verifier pins it
 /// (`vos_pvm_final_verifier::masked::MaskedFormat`): its number, its

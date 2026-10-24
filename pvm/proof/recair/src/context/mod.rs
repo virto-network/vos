@@ -557,10 +557,7 @@ impl<V: Value> Context<V> {
     /// The DEEP accumulator `acc·μ + Σ_j σ^j·v_j` over the eight limbs of the
     /// wires `v`, its output a new wire.
     pub fn h8(&mut self, acc: Var, step: Var, mu: Var, v: [Var; 2]) -> Var {
-        self.h8_gate([acc, step, mu, v[0], v[1]], None)
-    }
-
-    fn h8_gate(&mut self, inputs: [Var; 5], out: Option<Var>) -> Var {
+        let inputs = [acc, step, mu, v[0], v[1]];
         let [acc, step, mu, v0, v1] = inputs.map(|var| self.value(var));
         // Each input is a use, so none yields: a guess stays pending.
         for var in inputs {
@@ -572,7 +569,7 @@ impl<V: Value> Context<V> {
             horner = horner * step + samples[j / 4].limb(j % 4);
         }
         let computed = acc * mu + horner;
-        let (var, out_slot) = self.out_slot(out, computed);
+        let (var, out_slot) = self.out_slot(None, computed);
         self.count_row(2);
         self.h8.push(H8Gate {
             inputs: inputs.map(Var::address),

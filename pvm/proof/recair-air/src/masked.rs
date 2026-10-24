@@ -61,7 +61,7 @@ relation!(BlindRelation, 1);
 
 /// What a masked format commits beside the AIR's columns: the trees' layout
 /// its masking pins (`vos_pvm_proof::format::Masking`, whose entry for
-/// `format::MASKED_WRAP` `vos-pvm-recair` reads as `MASKED_WRAP_PINS`).
+/// `format::MASKED_WRAP` the final verifier pins as `masked::PINS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaskPins {
     /// The salt columns at the end of each salted tree (main, interaction,
