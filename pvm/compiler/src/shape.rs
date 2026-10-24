@@ -86,7 +86,7 @@ pub fn opcode_chips(op: Opcode) -> u32 {
 
 /// The chips host call `id` uses: a precompile's. The witness input
 /// compares each call's count with its capacity.
-pub fn host_call_chips(id: u64) -> u32 {
+pub(crate) fn host_call_chips(id: u64) -> u32 {
     match id {
         id if id == BLAKE2B_COMPRESS => 1 << chip::BLAKE2B,
         id if id == WITNESS_INPUT => 1 << chip::WITNESS_INPUT | 1 << chip::COMPARE,

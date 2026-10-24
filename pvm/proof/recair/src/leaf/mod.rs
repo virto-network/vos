@@ -55,10 +55,9 @@ use crate::verifier::bits::{guess_bits, m31_of, recompose};
 use crate::verifier::witness::{digest_wires, pack};
 use crate::verifier::{SegmentShape, SegmentValues, WitnessError, verify_segment};
 
-pub use output::{
-    NodeOutput, PREIMAGE_WORDS, STATE_WORDS, State, io_hash_limbs, io_hash_of, preimage,
-};
-pub use program::{LEAF_CIRCUITS_VERSION, kernel_program, leaf_circuit_hashes};
+use output::io_hash_limbs;
+pub use output::{NodeOutput, PREIMAGE_WORDS, STATE_WORDS, State, io_hash_of, preimage};
+pub use program::{LEAF_CIRCUITS_VERSION, kernel_program};
 
 /// The padded shape of every leaf and fold (`proving.md` §3.4, A.4's format
 /// 32, [`LEAF_FOLD_LOG_SIZES`]): `p2`, `qm31` and `h8` rows.

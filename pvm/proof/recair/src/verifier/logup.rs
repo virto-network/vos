@@ -126,7 +126,7 @@ fn register_file<V: Value>(
 }
 
 /// The components' `claimed_sums` add to zero.
-pub fn check_total<V: Value>(context: &mut Context<V>, claimed_sums: &[Var]) {
+pub(crate) fn check_total<V: Value>(context: &mut Context<V>, claimed_sums: &[Var]) {
     let zero = context.zero();
     let terms: Vec<(BaseField, Var)> = claimed_sums
         .iter()

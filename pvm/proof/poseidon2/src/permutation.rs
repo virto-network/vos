@@ -189,12 +189,12 @@ pub const INTERNAL_ROUND_CONSTS: [M31; N_PARTIAL_ROUNDS] = [
 /// The shifts of the internal diagonal past its first entry:
 /// `INTERNAL_DIAGONAL[i] = 2^INTERNAL_DIAG_SHIFTS[i - 1]` for `i ≥ 1`
 /// (Plonky3's `POSEIDON2_INTERNAL_MATRIX_DIAG_16_SHIFTS`).
-pub const INTERNAL_DIAG_SHIFTS: [u8; N_STATE - 1] =
+pub(crate) const INTERNAL_DIAG_SHIFTS: [u8; N_STATE - 1] =
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 14, 15, 16];
 
 /// The internal matrix is `1 + diag(INTERNAL_DIAGONAL)`, with `1` the all-ones
 /// matrix: `[-2, 2^0, 2^1, …, 2^8, 2^10, 2^12, 2^13, 2^14, 2^15, 2^16]`.
-pub const INTERNAL_DIAGONAL: [u32; N_STATE] = {
+pub(crate) const INTERNAL_DIAGONAL: [u32; N_STATE] = {
     let mut diagonal = [P - 2; N_STATE];
     let mut i = 1;
     while i < N_STATE {

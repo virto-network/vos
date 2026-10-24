@@ -739,17 +739,13 @@ pub fn leaf_rows(chips: u32, log_sizes: &[u8; SEGMENT_CHIPS]) -> [usize; 3] {
 
 /// Each class of `shape` whose leaf would not fit the padded shape, with
 /// its rows.
-pub fn oversized_leaves(shape: &Shape) -> Vec<(usize, [usize; 3])> {
-    oversized(shape, PADDED)
-}
-
-fn oversized(shape: &Shape, padded: [usize; 3]) -> Vec<(usize, [usize; 3])> {
+pub(crate) fn oversized_leaves(shape: &Shape) -> Vec<(usize, [usize; 3])> {
     shape
         .classes
         .iter()
         .enumerate()
         .map(|(class, sizes)| (class, leaf_rows(shape.chips, &sizes.log_sizes)))
-        .filter(|(_, rows)| rows.iter().zip(padded).any(|(&rows, padded)| rows > padded))
+        .filter(|(_, rows)| rows.iter().zip(PADDED).any(|(&rows, padded)| rows > padded))
         .collect()
 }
 

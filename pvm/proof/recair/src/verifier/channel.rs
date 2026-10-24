@@ -57,7 +57,7 @@ impl<V: Value> Channel<V> {
     }
 
     /// `mix_u64` of the value whose four limbs `wire` holds.
-    pub fn mix_wire(&mut self, context: &mut Context<V>, wire: Var) {
+    pub(crate) fn mix_wire(&mut self, context: &mut Context<V>, wire: Var) {
         self.transcript.absorb(context, &[wire], 4);
     }
 
@@ -77,12 +77,12 @@ impl<V: Value> Channel<V> {
     }
 
     /// `draw_secure_felt`.
-    pub fn draw_felt(&mut self, context: &mut Context<V>) -> Var {
+    pub(crate) fn draw_felt(&mut self, context: &mut Context<V>) -> Var {
         self.transcript.squeeze(context)[0]
     }
 
     /// `draw_secure_felts(2)`: one squeeze.
-    pub fn draw_felts(&mut self, context: &mut Context<V>) -> [Var; 2] {
+    pub(crate) fn draw_felts(&mut self, context: &mut Context<V>) -> [Var; 2] {
         self.transcript.squeeze(context)
     }
 

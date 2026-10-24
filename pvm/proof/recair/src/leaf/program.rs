@@ -24,7 +24,7 @@ pub const LEAF_CIRCUITS_VERSION: u32 = 1;
 
 /// Each class's leaf circuit's hash, in the classes' order: `program`'s
 /// kernel, whose run starts at `entry`.
-pub fn leaf_circuit_hashes(program: &KernelProgram, entry: &KernelEntry) -> Vec<P2Hash> {
+pub(crate) fn leaf_circuit_hashes(program: &KernelProgram, entry: &KernelEntry) -> Vec<P2Hash> {
     (0..program.shape.classes.len())
         .map(|class| LeafCircuit::of_class(program, entry, class).hash())
         .collect()

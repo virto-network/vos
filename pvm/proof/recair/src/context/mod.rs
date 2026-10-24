@@ -560,11 +560,6 @@ impl<V: Value> Context<V> {
         self.h8_gate([acc, step, mu, v[0], v[1]], None)
     }
 
-    /// The DEEP accumulator, its output the wire `out`.
-    pub fn h8_into(&mut self, acc: Var, step: Var, mu: Var, v: [Var; 2], out: Var) {
-        self.h8_gate([acc, step, mu, v[0], v[1]], Some(out));
-    }
-
     fn h8_gate(&mut self, inputs: [Var; 5], out: Option<Var>) -> Var {
         let [acc, step, mu, v0, v1] = inputs.map(|var| self.value(var));
         // Each input is a use, so none yields: a guess stays pending.

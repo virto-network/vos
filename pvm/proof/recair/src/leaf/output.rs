@@ -107,7 +107,7 @@ fn leaf_sponge(words: &[BaseField]) -> P2Hash {
 }
 
 /// The io-hash's 16 limbs: its bytes in pairs, `b0 + 256·b1`.
-pub fn io_hash_limbs(io_hash: &[u8; 32]) -> [BaseField; 16] {
+pub(crate) fn io_hash_limbs(io_hash: &[u8; 32]) -> [BaseField; 16] {
     core::array::from_fn(|i| {
         BaseField::from(u32::from(io_hash[2 * i]) | u32::from(io_hash[2 * i + 1]) << 8)
     })
@@ -157,7 +157,7 @@ impl NodeOutput {
     }
 
     /// Its preimage's wires.
-    pub fn preimage_wires(&self) -> [SecureField; preimage::WIRES] {
+    pub(crate) fn preimage_wires(&self) -> [SecureField; preimage::WIRES] {
         pack(&self.preimage())
             .try_into()
             .expect("the preimage's wires")

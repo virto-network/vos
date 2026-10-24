@@ -10,7 +10,8 @@
 //!   [`INTERNAL_ROUND_CONSTS`]);
 //! - the external matrix `circ(2·M4, M4, M4, M4)` ([`apply_m4`]), applied once
 //!   before the first round;
-//! - the internal matrix `1 + diag(V)` ([`INTERNAL_DIAGONAL`]).
+//! - the internal matrix `1 + diag(V)`, `V` the diagonal of
+//!   [`apply_internal_round_matrix`].
 //!
 //! The tests check it against Plonky3's vectors bit for bit. The linear layers
 //! are generic over the word, so a constraint body applies them to its
@@ -40,9 +41,9 @@ mod transcript;
 
 pub use field::{M31, P};
 pub use permutation::{
-    EXTERNAL_ROUND_CONSTS, FULL_ROUNDS, INTERNAL_DIAG_SHIFTS, INTERNAL_DIAGONAL,
-    INTERNAL_ROUND_CONSTS, N_HALF_FULL_ROUNDS, N_PARTIAL_ROUNDS, N_STATE,
-    apply_external_round_matrix, apply_internal_round_matrix, apply_m4, permute, permute_with,
+    EXTERNAL_ROUND_CONSTS, FULL_ROUNDS, INTERNAL_ROUND_CONSTS, N_HALF_FULL_ROUNDS,
+    N_PARTIAL_ROUNDS, N_STATE, apply_external_round_matrix, apply_internal_round_matrix, apply_m4,
+    permute, permute_with,
 };
 pub use sponge::{Digest, LeafSponge, RATE, compress, digest_of};
 pub use transcript::{

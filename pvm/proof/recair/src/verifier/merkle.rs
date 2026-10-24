@@ -25,7 +25,7 @@ use crate::value::Value;
 
 /// `leaf`'s path to `root`: a node a level, ordered by `bits` (least
 /// significant first, the leaf's level first), each over its sibling.
-pub fn verify_path<V: Value>(
+pub(crate) fn verify_path<V: Value>(
     context: &mut Context<V>,
     leaf: P2Handle<V>,
     bits: &[Bit],

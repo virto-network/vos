@@ -137,7 +137,7 @@ impl Value for SecureField {
 }
 
 /// The sixteen words of four wires.
-pub fn words_of(wires: [SecureField; 4]) -> [vos_pvm_poseidon2::M31; 16] {
+pub(crate) fn words_of(wires: [SecureField; 4]) -> [vos_pvm_poseidon2::M31; 16] {
     core::array::from_fn(|i| vos_pvm_poseidon2::M31::new(wires[i / 4].to_m31_array()[i % 4].0))
 }
 

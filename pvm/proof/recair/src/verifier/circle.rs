@@ -9,7 +9,7 @@ use stwo::core::poly::circle::CanonicCoset;
 
 use crate::circuit::Qm31Op;
 use crate::context::{Bit, Context, Var};
-use crate::value::{Value, embed};
+use crate::value::Value;
 
 /// A circle point's two coordinates as wires.
 #[derive(Clone, Copy, Debug)]
@@ -48,7 +48,7 @@ pub fn add_constant<V: Value>(
 }
 
 /// The `x` of a point doubled: `2x² − 1`, one row.
-pub fn double_x<V: Value>(context: &mut Context<V>, x: Var) -> Var {
+pub(crate) fn double_x<V: Value>(context: &mut Context<V>, x: Var) -> Var {
     let one = context.one();
     context.qm31(
         Qm31Op {
@@ -200,12 +200,4 @@ pub fn domain_point<V: Value>(context: &mut Context<V>, log_size: u32, bits: &[B
         None,
     );
     Point { x: p.x, y }
-}
-
-/// A constant point's coordinates as constant wires.
-pub fn constant_point<V: Value>(context: &mut Context<V>, p: CirclePoint<BaseField>) -> Point {
-    Point {
-        x: context.constant(embed(p.x)),
-        y: context.constant(embed(p.y)),
-    }
 }

@@ -11,7 +11,7 @@ use crate::context::{Bit, Context, Var};
 use crate::value::Value;
 
 /// The M31 a wire's first limb holds, when the context holds values.
-pub fn m31_of<V: Value>(value: V) -> Option<u32> {
+pub(crate) fn m31_of<V: Value>(value: V) -> Option<u32> {
     value.to_qm31().map(|value| value.to_m31_array()[0].0)
 }
 
@@ -105,7 +105,7 @@ pub fn recompose<V: Value>(
 /// The 31 bits of the M31 `word`, least significant first: they recompose
 /// it, and they are not all one, the other decomposition of zero
 /// (`2^31 − 1 = p`). 63 rows.
-pub fn decompose_word<V: Value>(context: &mut Context<V>, word: Var) -> Vec<Bit> {
+pub(crate) fn decompose_word<V: Value>(context: &mut Context<V>, word: Var) -> Vec<Bit> {
     let value = m31_of(context.value(word));
     let bits = guess_bits(context, value, 31);
     check_word_bits(context, word, &bits);

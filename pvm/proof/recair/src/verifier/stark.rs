@@ -383,7 +383,7 @@ pub fn interaction<V: Value>(
 /// each query's openings, DEEP quotient and FRI folds. `roots` are the
 /// preprocessed and main roots' wires; `relations` and `claimed_sums` what
 /// [`interaction`] returned. The draws and each query's first-layer value.
-pub fn verify_rest<V: Value>(
+pub(crate) fn verify_rest<V: Value>(
     context: &mut Context<V>,
     shape: &StarkShape,
     channel: &mut Channel<V>,
