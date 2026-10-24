@@ -9,7 +9,7 @@
 //!    unsalted;
 //! 3. the main tree: each component's columns, then its blinding columns
 //!    (one QM31 on its first row, the set's summing to zero: R2), every one
-//!    masked `f + v_H·r` ([`MaskLayout`]), then the salts;
+//!    masked `f + v_H·r` (`layout::MaskLayout`), then the salts;
 //! 4. the public values; the interaction PoW;
 //! 5. the set's relations, then the blinding relation
 //!    ([`MaskedComponents::draw`]);
@@ -24,7 +24,7 @@
 //!
 //! **The randomness** is hedged (R4, [`MaskRng`]). **R1** is checked on
 //! every transcript: the randomizer's revealed functionals of full rank
-//! over M31 ([`rank_m31`]); a deficient transcript is discarded and every
+//! over M31 (`rank::rank_m31`); a deficient transcript is discarded and every
 //! mask drawn again, at most [`MAX_ATTEMPTS`] times. Whether a transcript
 //! passes is a function of public coins and the format, so the retry
 //! conditions on a public event. **R3** holds by construction: `R`'s
@@ -76,7 +76,8 @@ use vos_pvm_recair_air::masked::{
 };
 
 pub use drawn::{Drawn, drawn_in};
-pub use layout::MaskLayout;
+use layout::MaskLayout;
+#[cfg(feature = "seeded-masks")]
 pub use rank::rank_m31;
 pub use rng::MaskRng;
 

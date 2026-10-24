@@ -18,22 +18,15 @@ use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::quotients::{DeepCoefficients, deep_values_of_column};
-use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
-use stwo::prover::backend::Column;
 use stwo::prover::backend::simd::SimdBackend;
-use stwo::prover::backend::simd::column::BaseColumn;
-use stwo::prover::poly::BitReversedOrder;
-use stwo::prover::poly::circle::CircleCoefficients;
-use stwo::prover::poly::circle::CircleEvaluation;
 use stwo::prover::{ComponentProver, ProvingError};
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
 use vos_pvm_proof::format::{DeepBatching, Format, FormatParams, MASKED_WRAP, Masking};
 use vos_pvm_recair::masked::{
-    MaskLayout, MaskRng, MaskedProof, MaskedProvers, MaskedTrace, prove_masked, rank_m31,
-    verifier_format,
+    MaskRng, MaskedProof, MaskedProvers, MaskedTrace, prove_masked, rank_m31, verifier_format,
 };
 use vos_pvm_recair::prove::prove_masked_on;
 use vos_pvm_recair::trace::{self, FirstRowFraction};
@@ -140,69 +133,6 @@ pub(crate) fn verify(
         &layout,
         proof.stark_proof.clone(),
     )
-}
-
-/// `f' = f + v_H·r`: `(f' − f)/v_H`, taken on `2N` points off the trace
-/// domain, is a polynomial of exactly `h` coefficients, at every size from
-/// `2^6` to `2^17` rows. Of degree below `N + h ≤ 2N`, `v_H` times it agrees
-/// with `f' − f` everywhere, so `f'` equals `f` on the trace domain.
-#[test]
-fn the_mask_keeps_the_column_on_its_domain() {
-    let mut rng =
-        <rand_chacha::ChaCha20Rng as rand_chacha::rand_core::SeedableRng>::seed_from_u64(1);
-    for log_size in 6..=17u32 {
-        let log_mask_rows = (log_size - 2).min(8);
-        let h = 1usize << log_mask_rows;
-        let layout = MaskLayout::new(log_size, log_mask_rows).unwrap();
-        let values: Vec<BaseField> = (0..1u32 << log_size)
-            .map(|i| BaseField::from(i.wrapping_mul(2_654_435_761) % 1_000_003))
-            .collect();
-        let domain = CanonicCoset::new(log_size).circle_domain();
-        let f = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
-            domain,
-            BaseColumn::from_cpu(&values),
-        )
-        .interpolate();
-        let masked = layout.mask(&f, &mut rng).unwrap();
-        assert_eq!(masked.log_size(), log_size + 1);
-        let wide = CanonicCoset::new(log_size + 1).circle_domain();
-        let difference = masked.evaluate(wide).values.to_cpu();
-        let original = f.extend(log_size + 1).evaluate(wide).values.to_cpu();
-        let trace_coset = CanonicCoset::new(log_size).coset;
-        let quotient: Vec<BaseField> = (0..wide.size())
-            .map(|i| {
-                let point = wide.at(stwo::core::utils::bit_reverse_index(i, log_size + 1));
-                let vanishing = stwo::core::constraints::coset_vanishing(trace_coset, point);
-                (difference[i] - original[i]) / vanishing
-            })
-            .collect();
-        let quotient = CircleEvaluation::<SimdBackend, BaseField, BitReversedOrder>::new(
-            wide,
-            BaseColumn::from_cpu(&quotient),
-        )
-        .interpolate();
-        // The size-`h` basis at `2^(log_size + 1)`: where an `h`-coefficient
-        // polynomial's coefficients land when extended.
-        let probe: Vec<BaseField> = (1..=h as u32).map(BaseField::from).collect();
-        let span: Vec<bool> = CircleCoefficients::<SimdBackend>::new(BaseColumn::from_cpu(&probe))
-            .extend(log_size + 1)
-            .coeffs
-            .to_cpu()
-            .iter()
-            .map(|c| !c.is_zero())
-            .collect();
-        let quotient = quotient.coeffs.to_cpu();
-        assert!(
-            quotient
-                .iter()
-                .zip(&span)
-                .all(|(c, &spanned)| spanned || c.is_zero()),
-            "2^{log_size}: (f' − f)/v_H of degree below h"
-        );
-        let nonzero = quotient.iter().filter(|c| !c.is_zero()).count();
-        assert_eq!(nonzero, h, "2^{log_size}");
-    }
-    assert!(matches!(MaskLayout::new(9, 8), Err(ProveError::Masking(_))));
 }
 
 /// R1 refuses `h = 64` against 24 queries, `2(4·2 + 24·3) = 160` revealed

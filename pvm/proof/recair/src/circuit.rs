@@ -242,7 +242,7 @@ impl Circuit {
     /// two of at least [`MIN_ROWS`] rows, no chained first row, every address
     /// below `p`, every used address yielded exactly once with the
     /// multiplicity of its uses, and the absolute multiplicities' sum below
-    /// `p`; and every read bound ([`Circuit::check_reads`]).
+    /// `p`; and every read bound (`check_reads`).
     pub fn check_wiring(&self) -> Result<WiringStats, WiringError> {
         let stats = self.check_relation()?;
         self.check_reads()?;
@@ -261,7 +261,7 @@ impl Circuit {
     ///
     /// A wire some gate yields with no use (multiplicity 0 at its own
     /// address) is a guess read once, and stays admitted.
-    pub fn check_reads(&self) -> Result<(), WiringError> {
+    fn check_reads(&self) -> Result<(), WiringError> {
         // A read with no multiplicity is a guess read once only at an
         // address no wire holds; at a wire's (the free slots' address 0
         // among them, the zero wire's), it is a value the relation does not

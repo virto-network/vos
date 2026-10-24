@@ -34,8 +34,9 @@ rayon = { workspace = true }
 
 [features]
 # The masked prover's test seams, for the prover's tests (a dev edge): its
-# seeded randomness (`MaskRng::Seeded`) and a proof forced past its own
-# check of the constraints (`prove_masked_unchecked`). No production build
+# seeded randomness (`MaskRng::Seeded`), a proof forced past its own
+# check of the constraints (`prove_masked_unchecked`) and the rank over M31
+# R1 takes (`masked::rank_m31`). No production build
 # enables it (`just check-no-seeded-masks`).
 seeded-masks = []
 # The masking's heavy gates, for `just test-proof`: the statistical leakage
