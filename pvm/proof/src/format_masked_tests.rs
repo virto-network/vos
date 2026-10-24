@@ -269,7 +269,7 @@ fn the_masked_wrap_needs_affine_batching() {
     );
 }
 
-/// Format 39's masking (pin A, R6): 8 salt columns a tree, an 8-column `R`,
+/// Format 39's masking (R6): 8 salt columns a tree, an 8-column `R`,
 /// and `h = 256` within its static bounds: at least `2(4|O| + q(|O| + 1))`,
 /// the randomizer's revealed functionals at `q` queries and `|O| = 2`
 /// offsets (160), and at most `N/4` and `2N/3` for every component, the

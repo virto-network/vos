@@ -5,7 +5,7 @@
 //! representative's tree of 1,024 agents, each with its roots of three
 //! windows; and re-traced by the prover from their attests.
 //!
-//! Measured against spike 6.0a's prototype: steps, compressions and
+//! Measured against the budgets (`proving.md` §7): steps, compressions and
 //! witness bytes, per row and for the space path; and the sixteen-row
 //! kernel's segments at the 32k class, with those its pages cut short.
 
@@ -32,16 +32,16 @@ const SPACE: SpaceId = SpaceId([0xA1; 32]);
 const PEER: [u8; 32] = [0xB2; 32];
 const OPERATOR: [u8; 32] = [0x0C; 32];
 const CURRENCY: u32 = 840;
-/// The 32k class's cut, as 6.0a cut its runs.
+/// The 32k class's cut, as the budgets were measured at.
 const LOG_STEPS: u32 = 15;
 const PAGES: usize = 8;
 
-/// Spike 6.0a's measured costs [measured, slice-6-progress.md].
-const SPIKE_ROW_COMPRESSIONS: f64 = 19.07 + 1.0;
-const SPIKE_ROW_BYTES: f64 = 842.0;
-const SPIKE_PATH_COMPRESSIONS: f64 = 15.0;
-const SPIKE_PATH_BYTES: f64 = 590.0;
-const SPIKE_SIXTEEN_STEPS: f64 = 205_841.0;
+/// The budgets: a prototype's costs of the reads (`proving.md` §7).
+const BUDGET_ROW_COMPRESSIONS: f64 = 19.07 + 1.0;
+const BUDGET_ROW_BYTES: f64 = 842.0;
+const BUDGET_PATH_COMPRESSIONS: f64 = 15.0;
+const BUDGET_PATH_BYTES: f64 = 590.0;
+const BUDGET_SIXTEEN_STEPS: f64 = 205_841.0;
 
 /// Sixteen pseudo-accounts, as the window kernel's: eight journals'
 /// outgoing and incoming accounts.
@@ -161,7 +161,7 @@ fn a_read_at_a_cut_re_runs_as_its_live_run() {
 /// over fifteen; the path's, its check's and `S_w`'s, and the bytes of the
 /// path, the leaf's salt and the two roots it joins; the sixteen-row
 /// prologue's steps, the kernel read through its view or not. Each within a
-/// tenth of spike 6.0a's, a row's compressions with the one its view's
+/// tenth of its budget, a row's compressions with the one its view's
 /// read hashes the key with; the sixteen-row kernel's segments at the 32k
 /// class, those its eight pages cut short, reported.
 #[test]
@@ -221,19 +221,19 @@ fn reads_at_a_cut_measure() {
         looked - bare,
         (looked - bare) as f64 / 16.0
     );
-    let within = |measured: f64, spike: f64| measured <= spike * 1.1;
+    let within = |measured: f64, budget: f64| measured <= budget * 1.1;
     assert!(
-        within(row_compressions, SPIKE_ROW_COMPRESSIONS),
+        within(row_compressions, BUDGET_ROW_COMPRESSIONS),
         "{row_compressions}"
     );
-    assert!(within(row_bytes, SPIKE_ROW_BYTES), "{row_bytes}");
+    assert!(within(row_bytes, BUDGET_ROW_BYTES), "{row_bytes}");
     assert!(
-        within(path_compressions, SPIKE_PATH_COMPRESSIONS),
+        within(path_compressions, BUDGET_PATH_COMPRESSIONS),
         "{path_compressions}"
     );
-    assert!(within(path_bytes, SPIKE_PATH_BYTES), "{path_bytes}");
-    // The spike's kernel read its rows by position; the view reads each by
-    // its key, hashing it under the map's transform: the prologue, the
-    // spike's cost, is the run with no read.
-    assert!(within(bare as f64, SPIKE_SIXTEEN_STEPS), "{bare}");
+    assert!(within(path_bytes, BUDGET_PATH_BYTES), "{path_bytes}");
+    // The prototype's kernel read its rows by position; the view reads each
+    // by its key, hashing it under the map's transform: the prologue, the
+    // prototype's cost, is the run with no read.
+    assert!(within(bare as f64, BUDGET_SIXTEEN_STEPS), "{bare}");
 }

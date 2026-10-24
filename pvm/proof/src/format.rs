@@ -61,18 +61,18 @@
 //!   ([`Format::verifier_config`]). 39 needs it too: batched by powers, it
 //!   caps at 76.98 at blowup 32 and 74.48 at blowup 64.
 //! - **The masked wrap** (39) is 28's AIR under masking variant (c)
-//!   (`research/slice-5/spike2-masking.md` §3b; [`crate::security`] counts
-//!   it): every main and interaction column masked to twice its rows'
-//!   degree, the preprocessed ones left as they are, the composition
-//!   committed whole at four times the tallest component's rows and sampled
-//!   at `π(z)`, R2's blinding, a FRI mask of eight columns and salted trees.
-//!   It takes a number of its own, as a bump of 28 would make one number
-//!   name two sets of parameters. Its FRI runs at blowup 32, where each
-//!   column's own extension is the size 28's is at 64, with 24 queries:
-//!   146 / 82 (82.70), the query term binding; 23 queries is the least that
-//!   clears 80 (80.84). Blowup 64 at 20 queries counts 81.74, its DEEP
-//!   batching term binding, at twice the prover's memory. Its proofs are a
-//!   fixed layout ([`ProofBytes::FixedLayout`]); 28's are postcard.
+//!   (`proving.md` §5; [`crate::security`] counts it): every main and
+//!   interaction column masked to twice its rows' degree, the preprocessed
+//!   ones left as they are, the composition committed whole at four times the
+//!   tallest component's rows and sampled at `π(z)`, R2's blinding, a FRI mask
+//!   of eight columns and salted trees. It takes a number of its own, as a
+//!   bump of 28 would make one number name two sets of parameters. Its FRI
+//!   runs at blowup 32, where each column's own extension is the size 28's is
+//!   at 64, with 24 queries: 146 / 82 (82.70), the query term binding; 23
+//!   queries is the least that clears 80 (80.84). Blowup 64 at 20 queries
+//!   counts 81.74, its DEEP batching term binding, at twice the prover's
+//!   memory. Its proofs are a fixed layout ([`ProofBytes::FixedLayout`]); 28's
+//!   are postcard.
 //! - **`masked`** says what a format's proofs are: masking a format's proofs
 //!   is a format change. A masked format whose masking is built pins it
 //!   ([`Format::masking`], [`Masking`]): its salt and FRI-mask columns and
@@ -179,8 +179,7 @@ impl FormatParams {
     }
 }
 
-/// A masked format's masking
-/// (`docs/design/research/slice-5/masking-review.md` R6): what its trees commit
+/// A masked format's masking (`proving.md` §5, R6): what its trees commit
 /// beside the AIR's columns, and the randomizer's size. A prover masks with
 /// it and a verifier lays the trees out by it; neither reads it from a
 /// proof.
@@ -454,7 +453,7 @@ pub const WRAP: Format = Format {
     },
 };
 
-/// Format 39's masking (pin A): 8 salt columns a tree (248 bits); an `R` of 8
+/// Format 39's masking: 8 salt columns a tree (248 bits); an `R` of 8
 /// columns, whose 8 independent DEEP coefficients span QM31 over M31 but
 /// with probability about `p^-5`, so R3 holds without a check; and `h = 256`,
 /// at least `2(4|O| + q(|O| + 1)) = 160` for `q = 24` queries and `|O| = 2`

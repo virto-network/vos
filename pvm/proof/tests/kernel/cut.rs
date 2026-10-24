@@ -41,7 +41,7 @@ pub const CLOCK: WindowClock = WindowClock {
     origin_ms: 0,
     length_ms: 600_000,
 };
-/// A window of today at 10-minute windows, as spike 6.0a's.
+/// A window of today at 10-minute windows.
 pub const WINDOW: u64 = 2_966_000;
 pub const AGENT: AgentId = AgentId(517);
 /// The space's representative, which the agent reports to and hears its
@@ -49,7 +49,7 @@ pub const AGENT: AgentId = AgentId(517);
 pub const REPRESENTATIVE: AgentId = AgentId(0x0900_0000);
 pub const INSTANCE: InstanceId = InstanceId(9);
 /// The rows of a map read at scale, and the agents whose roots the
-/// representative keeps, as spike 6.0a's.
+/// representative keeps, at the budgets' scale (`proving.md` §7).
 pub const ROWS: usize = 1_000_000;
 pub const AGENTS: u32 = 1_024;
 

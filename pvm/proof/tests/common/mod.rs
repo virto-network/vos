@@ -576,13 +576,14 @@ pub fn resident_peak_mib(reset: bool) -> u64 {
     kib >> 10
 }
 
-/// A finalized wrap circuit's witness proved masked under `format::MASKED_WRAP`
-/// (`vos_pvm_recair::wrap::prove`), within 4.5 GiB of heap and 8 GiB of
-/// resident memory, its revealed functionals within pin A's count, its
-/// bytes the fixed layout, and verified by the final verifier's masked
-/// verifier, its preprocessed root `format::MASKED_WRAP`'s (pin A): its proving time and
-/// R1's printed with the load average, and its bytes written for the Wasm
-/// harness as `wrap/<name>-39.{proof,format,words}`: the bytes.
+/// A finalized wrap circuit's witness proved masked under
+/// `format::MASKED_WRAP` (`vos_pvm_recair::wrap::prove`), within 4.5 GiB of
+/// heap and 8 GiB of resident memory, its revealed functionals within the
+/// format's count, its bytes the fixed layout, and verified by the final
+/// verifier's masked verifier at the preprocessed root the format pins: its
+/// proving time and R1's printed with the load average, and its bytes
+/// written for the Wasm harness as `wrap/<name>-39.{proof,format,words}`:
+/// the bytes.
 fn masked_wrap(
     name: &str,
     finalized: &vos_pvm_recair::Finalized<stwo::core::fields::qm31::SecureField>,

@@ -1,4 +1,4 @@
-//! The prover worker's throughput gate (6.18): at the default window length
+//! The prover worker's throughput gate: at the default window length
 //! (L = 10 min), one prover keeps up with three window statements a window
 //! and the `balance` statements.
 //!

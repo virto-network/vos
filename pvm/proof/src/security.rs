@@ -71,13 +71,13 @@
 //! `γ`'s limit, `1 - γ > √ρ` for every `m`, so it holds at whatever `m` the
 //! count is taken.
 //!
-//! **Masking variant (c)** ([`SecurityShape::variant_c`],
-//! `research/slice-5/spike2-masking.md` §3b) moves an AIR whose tallest
-//! component has `N = 2^m` rows to other levels; every formula stays.
-//! Every main and interaction column is committed as `f + v_H·r`, of degree
-//! bound `2N`, so `k = 2N` in the DEEP term. The constraint bound is `4N`
-//! and the composition is committed whole, never split, so FRI tests
-//! dimension `4N` at the format's rate (FRI's `log_blowup`), and `d = 3`.
+//! **Masking variant (c)** ([`SecurityShape::variant_c`], `proving.md` §5)
+//! moves an AIR whose tallest component has `N = 2^m` rows to other levels;
+//! every formula stays. Every main and interaction column is committed as
+//! `f + v_H·r`, of degree bound `2N`, so `k = 2N` in the DEEP term. The
+//! constraint bound is `4N` and the composition is committed whole, never
+//! split, so FRI tests dimension `4N` at the format's rate (FRI's
+//! `log_blowup`), and `d = 3`.
 //! The composition is sampled at `π(z)`, the doubling of the out-of-domain
 //! point, so `j = 1`. The masked columns, the FRI mask and the blinding
 //! columns are batched with the rest: an affine batch's error does not
@@ -184,8 +184,8 @@ pub fn proven_count(params: &FormatParams, shape: &SecurityShape) -> Option<f64>
 
 /// `log2` of each FRI round's folding factor the count is taken at, the
 /// first round's with the circle fold in it; `None` for a shape outside the
-/// analysis. A verifier's own rounds must be these (`format::MASKED_WRAP`'s: `[3, 3, 3,
-/// 2]`, `vos_pvm_final_verifier::masked::FRI_ROUNDS`).
+/// analysis. A verifier's own rounds must be these (`format::MASKED_WRAP`'s:
+/// `[3, 3, 3, 2]`, `vos_pvm_final_verifier::masked::FRI_ROUNDS`).
 pub fn fri_rounds(params: &FormatParams, shape: &SecurityShape) -> Option<alloc::vec::Vec<u32>> {
     Analysis::new(params, shape).map(|analysis| analysis.folds)
 }

@@ -57,11 +57,11 @@ const CUT: usize = 1;
 /// The venue the statements are judged at.
 const VENUE: VenueId = VenueId([0x7e; 32]);
 
-/// Spike 6.0a's measured costs of the space path [measured,
-/// slice-6-progress.md]: its compressions (with `S_w`'s) and bytes. A
-/// row's are `reads`' (`reads_at_a_cut_measure`), the window reading two.
-const SPIKE_PATH_COMPRESSIONS: f64 = 15.0;
-const SPIKE_PATH_BYTES: f64 = 590.0;
+/// The space path's budget (`proving.md` §7): its compressions (with
+/// `S_w`'s) and bytes. A row's are `reads`' (`reads_at_a_cut_measure`), the
+/// window reading two.
+const BUDGET_PATH_COMPRESSIONS: f64 = 15.0;
+const BUDGET_PATH_BYTES: f64 = 590.0;
 
 /// A pair's running totals (`window::Totals`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -223,7 +223,7 @@ fn small() -> Cut {
     cut_of(256, 8, true)
 }
 
-/// A million rows under 1,024 agents' roots, as spike 6.0a's.
+/// A million rows under 1,024 agents' roots, as the budgets' scale.
 pub(crate) fn large() -> Cut {
     let started = Instant::now();
     let cut = cut_of(ROWS, AGENTS, true);
@@ -647,13 +647,14 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
     assert_eq!(end.io_hash, trace.io_hash);
 }
 
-/// The window end to end on the million-row map: its run, at most 1M
-/// steps, its space path within a fifth of spike 6.0a's; proved whole,
-/// folded to one root and wrapped under `format::WRAP` and masked under 39; and
-/// its statement (the reader's agent and instance, the peer, the currency
-/// and `c_prev` public, `(net, seq, c_new)` its output, `S_w` its root)
-/// judged at the model venue, which pins the kernel's program and holds
-/// `S_w` anchored by the space's founding key.
+/// The window end to end on the million-row map: its run, at most 1M steps,
+/// its space path within a fifth of its budget; proved whole, folded to one
+/// root and wrapped under `format::WRAP` and masked under
+/// `format::MASKED_WRAP`; and its statement (the reader's agent and
+/// instance, the peer, the currency and `c_prev` public,
+/// `(net, seq, c_new)` its output, `S_w` its root) judged at the model
+/// venue, which pins the kernel's program and holds `S_w` anchored by the
+/// space's founding key.
 ///
 /// Accepted, and then refused as a repeat (6). Then each case, a venue or a
 /// statement that differs in one thing, and the check that refuses it:
@@ -704,10 +705,10 @@ fn the_window_is_stated_at_the_model_venue() {
     );
     assert!(steps <= 1_000_000, "{steps} steps");
     assert!(
-        path_compressions <= SPIKE_PATH_COMPRESSIONS * 1.2,
+        path_compressions <= BUDGET_PATH_COMPRESSIONS * 1.2,
         "{path_compressions}"
     );
-    assert!(path_bytes <= SPIKE_PATH_BYTES * 1.2, "{path_bytes}");
+    assert!(path_bytes <= BUDGET_PATH_BYTES * 1.2, "{path_bytes}");
 
     let started = Instant::now();
     let (program, root, segments, mut totals) =
