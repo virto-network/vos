@@ -231,25 +231,75 @@ check-no-faults:
     cargo build -p vos-cli
     if ((^target/debug/vos --version) | str contains "faults") { error make { msg: "a plain build of vos injects faults" } } else { print "no faults in a plain build of vos" }
 
-# Fails when the build `cargo tree <args>` resolves (its normal and build
-# edges, for every target) enables `feature` in any package: each package's
-# enabled features (`{f}`) compared whole, so one a feature enables through
-# another is caught.
-_no-feature feature +args:
-    if (cargo tree {{args}} -e no-dev --target all -f '{f}' --prefix none | lines | each {|line| $line | str replace ' (*)' '' | split row ',' } | flatten | any {|enabled| $enabled == '{{feature}}' }) { error make { msg: "cargo tree {{args}} enables {{feature}}" } }
+# The gates' table: by gate, each build `cargo tree <args>` resolves (its
+# normal and build edges, for every target), the features no package in it
+# may enable and the packages it may not hold. Each package's enabled
+# features (`{f}`) are compared whole, so one a feature enables through
+# another is caught. `_forbidden <gate>...` resolves each build the gates
+# name once, prints every feature enabled and package held, and fails on
+# any.
+_forbidden +gates:
+    let table = [ \
+        [gate args features packages]; \
+        [jam-dev "-p vos-cli" [] [vos-jam-dev vos-jam]] \
+        [jam-dev "-p vos-cli --features prover" [] [vos-jam-dev vos-jam]] \
+        [jam-dev "-p vos-node" [] [vos-jam-dev vos-jam]] \
+        [jam-dev "-p vos-node --features prover" [] [vos-jam-dev vos-jam]] \
+        [venue-clients "--workspace" [kreivo-mock model] []] \
+        [venue-clients "-p vos-cli" [kreivo-mock kreivo model] []] \
+        [venue-clients "-p vos-cli --features prover" [kreivo-mock kreivo model] []] \
+        [venue-clients "-p vos-node" [kreivo-mock kreivo model] []] \
+        [venue-clients "-p vos-node --features prover" [kreivo-mock kreivo model] []] \
+        [seeded-masks "--workspace" [seeded-masks] []] \
+        [seeded-masks "-p vos-cli --features prover" [seeded-masks] []] \
+        [seeded-masks "--manifest-path agent/default/Cargo.toml" [seeded-masks] []] \
+        [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml" [seeded-masks] []] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks] []] \
+        [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [seeded-masks] []] \
+        [debug-internals "--workspace" [debug-internals disclosing watch] []] \
+        [debug-internals "-p vos-cli --features prover" [debug-internals disclosing watch] []] \
+        [debug-internals "-p vos-statement-service --features pvm-guest" [debug-internals] []] \
+        [debug-internals "--manifest-path agent/default/Cargo.toml" [debug-internals] []] \
+        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [debug-internals] []] \
+        [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [debug-internals] []] \
+        [test-formats "--workspace" [test-formats] []] \
+        [test-formats "-p vos-cli --features prover" [test-formats] []] \
+        [test-formats "--manifest-path agent/default/Cargo.toml" [test-formats] []] \
+        [test-formats "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [test-formats] []] \
+        [test-formats "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [test-formats] []] \
+        [test-formats "-p vos-statement --features fixtures,pvm-guest" [test-formats] []] \
+        [test-formats "-p vos-statement-service --features pvm-guest" [test-formats] []] \
+    ]; \
+    let failures = ($table | where gate in [{{gates}}] | group-by args | items {|args, rows| \
+        let tree = (cargo tree ...($args | split row ' ') -e no-dev --target all -f '{p}|{f}' --prefix none | lines | each {|line| $line | str replace ' (*)' '' | split row '|' }); \
+        let held = ($tree | each {|parts| $parts.0 | split row ' ' | first }); \
+        let enabled = ($tree | each {|parts| $parts.1? | default '' | split row ',' } | flatten); \
+        ($rows.features | flatten | uniq | where {|feature| $feature in $enabled } | each {|feature| $"cargo tree ($args) enables ($feature)" }) \
+        ++ ($rows.packages | flatten | uniq | where {|package| $package in $held } | each {|package| $"cargo tree ($args) holds ($package)" }) \
+    } | flatten); \
+    for failure in $failures { print -e $failure }; \
+    if ($failures | is-not-empty) { error make { msg: "a production build enables a forbidden feature or holds a forbidden package" } }
 
-# Fails when the build `cargo tree <args>` resolves (its normal and build
-# edges, for every target) holds `package`.
-_no-dep package +args:
-    if (cargo tree {{args}} -e no-dev --target all -f '{p}' --prefix none | lines | any {|line| ($line | split row ' ' | first) == '{{package}}' }) { error make { msg: "cargo tree {{args}} holds {{package}}" } }
+# The proof crate's `debug-internals` does not imply `seeded-masks`.
+_seeded-masks-unimplied:
+    if (open pvm/proof/Cargo.toml | get features.debug-internals | any {|feature| $feature | str contains 'seeded-masks' }) { error make { msg: "debug-internals implies seeded masks" } }
+
+# The node's binary, built with the prover, names none of the debug
+# outputs' environment variables nor the instruction trace's message.
+_debug-names-absent:
+    cargo build -p vos-cli --features prover
+    let binary = (open --raw target/debug/vos); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"the node's binary names ($name)" } } }
+
+# Every `check-no-*` gate below, each build resolved once.
+check-no-leaks: (_forbidden "jam-dev" "venue-clients" "seeded-masks" "debug-internals" "test-formats") _seeded-masks-unimplied _debug-names-absent
+    print "no test seam, debug output, test format, JAM client or venue client in a production build"
 
 # A node knows no JAM: the JAM client (a PolkaJam node's RPC and `jamt`,
 # the statements service's client and `JamVenue`) is development tooling,
 # `vos-jam-dev`, and neither the `vos` binary, with or without the prover,
 # nor `vos-node` depends on it, nor on the agent-as-JAM-service builder
 # (`vos-jam`), on a normal or build edge.
-check-no-jam-dev:
-    for package in [vos-jam-dev vos-jam] { just _no-dep $package -p vos-cli; just _no-dep $package -p vos-cli --features prover; just _no-dep $package -p vos-node; just _no-dep $package -p vos-node --features prover }
+check-no-jam-dev: (_forbidden "jam-dev")
     print "no JAM client in the node"
 
 # A node carries no venue's client: `vos-venue`'s model venue (`model`),
@@ -258,9 +308,7 @@ check-no-jam-dev:
 # prover, nor `vos-node`, on a normal or build edge (the tests enable them
 # on dev edges, the carrier audit's checker `kreivo`), and no normal or
 # build edge of any workspace member enables the model or the mock.
-check-no-venue-clients:
-    for feature in [kreivo-mock model] { just _no-feature $feature --workspace }
-    for feature in [kreivo-mock kreivo model] { just _no-feature $feature -p vos-cli; just _no-feature $feature -p vos-cli --features prover; just _no-feature $feature -p vos-node; just _no-feature $feature -p vos-node --features prover }
+check-no-venue-clients: (_forbidden "venue-clients")
     print "no venue client in the node"
 
 # The masked prover's test seams (`vos-pvm-recair`'s `seeded-masks`: the
@@ -270,11 +318,7 @@ check-no-venue-clients:
 # the fuzz targets, the final verifier's Wasm blob and its runner), enables
 # it (the prover's tests enable it on a dev edge), and the proof crate's
 # `debug-internals` does not imply it.
-check-no-seeded-masks:
-    just _no-feature seeded-masks --workspace
-    just _no-feature seeded-masks -p vos-cli --features prover
-    for manifest in [agent/default pvm/proof/fuzz pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature seeded-masks --manifest-path $"($manifest)/Cargo.toml" }
-    if (open pvm/proof/Cargo.toml | get features.debug-internals | any {|feature| $feature | str contains 'seeded-masks' }) { error make { msg: "debug-internals implies seeded masks" } }
+check-no-seeded-masks: (_forbidden "seeded-masks") _seeded-masks-unimplied
     print "no seeded masks in a production build"
 
 # The debug outputs (`vos-pvm`'s and `vos-pvm-proof`'s `debug-internals`:
@@ -288,14 +332,7 @@ check-no-seeded-masks:
 # seams; and the node's binary, built with the prover, names none of the
 # debug outputs' environment variables nor the instruction trace's message,
 # so none of them is compiled in.
-check-no-debug-internals:
-    just _no-feature debug-internals --workspace
-    just _no-feature debug-internals -p vos-cli --features prover
-    just _no-feature debug-internals -p vos-statement-service --features pvm-guest
-    for feature in [disclosing watch] { just _no-feature $feature --workspace; just _no-feature $feature -p vos-cli --features prover }
-    for manifest in [agent/default pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature debug-internals --manifest-path $"($manifest)/Cargo.toml" }
-    cargo build -p vos-cli --features prover
-    let binary = (open --raw target/debug/vos); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"the node's binary names ($name)" } } }
+check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
     print "no debug outputs in a production build"
 
 # Format 28, the unmasked wrap (`vos-pvm-final-verifier`'s and
@@ -306,12 +343,7 @@ check-no-debug-internals:
 # builds by name); and `vos-statement`'s `fixtures` and `pvm-guest`, and the
 # JAM statements service's program, do not imply it. The fuzz targets, built apart, fuzz format 28's decode and
 # verifier too, and are no venue.
-check-no-test-formats:
-    just _no-feature test-formats --workspace
-    just _no-feature test-formats -p vos-cli --features prover
-    for manifest in [agent/default pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature test-formats --manifest-path $"($manifest)/Cargo.toml" }
-    just _no-feature test-formats -p vos-statement --features fixtures,pvm-guest
-    just _no-feature test-formats -p vos-statement-service --features pvm-guest
+check-no-test-formats: (_forbidden "test-formats")
     print "no test formats in a production build"
 
 # The builds without std. vos-raft for an embedded target, on core and alloc
@@ -437,7 +469,7 @@ fuzz secs="60":
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-no-debug-internals check-no-jam-dev check-no-venue-clients check-kit build-test-actors build-agent build-representative fuzz-replay
+check: fmt-check doc-check check-no-std check-no-leaks check-kit build-test-actors build-agent build-representative fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     just clippy-prover
@@ -460,7 +492,7 @@ test-reads:
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
-ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats check-no-debug-internals check-no-jam-dev check-no-venue-clients check-kit fuzz-replay
+ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-leaks check-kit fuzz-replay
 
 # The gate at a milestone: `ci` plus the prover suites, the soundness gates
 # (the leakage tests at their medium N), the bench tests that prove and the
