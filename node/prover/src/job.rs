@@ -121,6 +121,13 @@ impl Job {
         Statement::decode(&self.statement).ok()
     }
 
+    /// The earliest window its statement reads a root at; none for a
+    /// rootless statement, or one that does not decode.
+    pub(crate) fn earliest_window(&self) -> Option<u64> {
+        self.statement()
+            .and_then(|statement| statement.roots.iter().map(|root| root.window).min())
+    }
+
     /// Moved to `state`, its record dropped once it finishes.
     pub fn to(mut self, state: State) -> Self {
         self.state = state;
