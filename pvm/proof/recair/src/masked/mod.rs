@@ -96,6 +96,29 @@ pub const fn mask_pins(masking: &Masking) -> MaskPins {
     }
 }
 
+/// The masked lifting height of components of `log_sizes` under
+/// `format`'s blowup: the tallest, raised by the masked constraint
+/// expansion. `None` for no components, or a height that overflows.
+pub(crate) fn lifting_log_size(format: &Format, log_sizes: &[u32]) -> Option<u32> {
+    log_sizes
+        .iter()
+        .max()?
+        .checked_add(MASKED_LOG_CONSTRAINT_EXPANSION)?
+        .checked_add(format.params.log_blowup)
+}
+
+/// The preprocessed columns as a masked format commits them: interpolated
+/// on `twiddles` and each extended one level.
+pub(crate) fn extend_preprocessed(
+    preprocessed: Evaluations,
+    twiddles: &TwiddleTree<SimdBackend>,
+) -> Vec<CircleCoefficients<SimdBackend>> {
+    SimdBackend::interpolate_columns(preprocessed, twiddles)
+        .into_iter()
+        .map(|poly| poly.extend(poly.log_size() + MASKED_COLUMN_EXPANSION))
+        .collect()
+}
+
 /// A masked registry entry as its verifier pins it
 /// (`vos_pvm_final_verifier::masked::MaskedFormat`): its number, its
 /// configuration and interaction PoW, its masking, `log_sizes`, and the
@@ -297,13 +320,9 @@ where
             "one main trace per component expected",
         ));
     }
-    let composition = trace
-        .log_sizes
-        .iter()
-        .max()
-        .and_then(|log_size| log_size.checked_add(MASKED_LOG_CONSTRAINT_EXPANSION))
+    let lifting = lifting_log_size(format, trace.log_sizes)
         .ok_or(ProveError::TraceShape("a component's log size overflows"))?;
-    let lifting = composition + format.params.log_blowup;
+    let composition = lifting - format.params.log_blowup;
     let twiddles =
         SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
     let witness = rng::witness_digest(
@@ -317,11 +336,7 @@ where
     );
     drawn::note("the witness digest", &witness);
     let layouts = layout::layouts(trace.log_sizes, masking.log_mask_rows)?;
-    let preprocessed: Vec<CircleCoefficients<SimdBackend>> =
-        SimdBackend::interpolate_columns(trace.preprocessed, &twiddles)
-            .into_iter()
-            .map(|poly| poly.extend(poly.log_size() + MASKED_COLUMN_EXPANSION))
-            .collect();
+    let preprocessed = extend_preprocessed(trace.preprocessed, &twiddles);
     let mut main = Vec::with_capacity(trace.main.len());
     for (columns, &log_size) in trace.main.into_iter().zip(trace.log_sizes) {
         if columns

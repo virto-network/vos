@@ -185,19 +185,12 @@ pub fn masked_preprocessed_root_on<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    use vos_pvm_recair_air::masked::{MASKED_COLUMN_EXPANSION, MASKED_LOG_CONSTRAINT_EXPANSION};
-
     circuit.check_wiring()?;
-    let log_sizes = circuit.log_sizes();
-    let tallest = log_sizes.iter().copied().max().unwrap_or(0);
-    let lifting = tallest + MASKED_LOG_CONSTRAINT_EXPANSION + format.params.log_blowup;
+    let lifting = masked::lifting_log_size(format, &circuit.log_sizes())
+        .expect("a circuit's three log sizes lift");
     let twiddles =
         SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
-    let columns: Vec<_> =
-        SimdBackend::interpolate_columns(preprocessed_evaluations(circuit), &twiddles)
-            .into_iter()
-            .map(|poly| poly.extend(poly.log_size() + MASKED_COLUMN_EXPANSION))
-            .collect();
+    let columns = masked::extend_preprocessed(preprocessed_evaluations(circuit), &twiddles);
     let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(format.pcs_config(), &twiddles);
     let mut builder = scheme.tree_builder();
     builder.extend_polys(columns);
