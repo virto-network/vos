@@ -4,7 +4,8 @@
 //!   agent-relative key;
 //! - `system`: agents' system keys (sessions, reply windows, pair marks,
 //!   the outbox), keyed the same way, and the node's own rows for each
-//!   agent (its applied index, its Raft state), above every epoch;
+//!   agent (its applied index, its Raft state), above every epoch, with
+//!   the store's layout row, which [`Fjall::open`] checks;
 //! - `log`: each agent's log, by (agent, index);
 //! - `blobs`: the blob store's index and pins ([`crate::blobs`]).
 //!
@@ -44,7 +45,7 @@ use keys::{
 pub use batch::Batch;
 pub use entry::{BlobRef, EntryKind, LARGE_RESULT, LogEntry};
 pub use fjall::{Error, PersistMode};
-pub use keys::{NODE_AGENT, decode_configuration, encode_configuration, next_epoch};
+pub use keys::{LAYOUT, NODE_AGENT, decode_configuration, encode_configuration, next_epoch};
 pub use read::{Export, Snapshot};
 pub use tuning::Tuning;
 pub use vos_wire::peer::NodeNumber;
@@ -508,7 +509,7 @@ impl Fjall {
         let db = Database::builder(path.as_ref())
             .cache_size(tuning.cache_bytes)
             .open()?;
-        Ok(Self(Arc::new(Partitions {
+        let store = Self(Arc::new(Partitions {
             state: db.keyspace("state", || tuning.rows())?,
             // System keys are looked up for session indexes and replies
             // that are often absent: keep the filters that answer misses
@@ -517,6 +518,100 @@ impl Fjall {
             log: db.keyspace("log", KeyspaceCreateOptions::default)?,
             blobs: db.keyspace("blobs", KeyspaceCreateOptions::default)?,
             db,
-        })))
+        }));
+        store.check_layout()?;
+        Ok(store)
+    }
+
+    /// Check the store's layout row against [`LAYOUT`], writing it, synced,
+    /// to a store that holds no rows yet. A store whose rows were written
+    /// under another layout, or that holds rows and names no layout (it
+    /// was written before layouts were numbered), is refused with a
+    /// [`LayoutMismatch`] rather than read as if its rows were where this
+    /// build looks for them.
+    fn check_layout(&self) -> Result<()> {
+        let key = node_record(NodeRow::Layout, &[]);
+        let found = match self.system().get(&key)? {
+            Some(value) => Some(
+                <[u8; 4]>::try_from(&value[..])
+                    .map(u32::from_be_bytes)
+                    .map_err(|_| LayoutMismatch::refuse(Layout::Unreadable))?,
+            ),
+            None => None,
+        };
+        match found {
+            Some(LAYOUT) => Ok(()),
+            Some(layout) => Err(LayoutMismatch::refuse(Layout::Other(layout))),
+            None if self.holds_nothing()? => {
+                self.system().insert(key, LAYOUT.to_be_bytes())?;
+                self.database().persist(PersistMode::SyncAll)
+            }
+            None => Err(LayoutMismatch::refuse(Layout::Unnamed)),
+        }
+    }
+
+    fn holds_nothing(&self) -> Result<bool> {
+        for partition in [self.state(), self.system(), self.log(), self.blobs()] {
+            if !partition.is_empty()? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 }
+
+/// What a refused store's layout row says.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Layout {
+    /// A layout other than [`LAYOUT`].
+    Other(u32),
+    /// No layout row, in a store that holds rows.
+    Unnamed,
+    /// A layout row that is not a number.
+    Unreadable,
+}
+
+/// A store refused at open: its rows are laid out other than this build
+/// reads them. It reaches the caller as an [`Error::Io`] of kind
+/// `InvalidData` carrying this value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LayoutMismatch {
+    pub found: Layout,
+}
+
+impl LayoutMismatch {
+    fn refuse(found: Layout) -> Error {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            Self { found },
+        ))
+    }
+
+    /// The mismatch an open refused with, if that is why it failed.
+    pub fn of(error: &Error) -> Option<Self> {
+        match error {
+            Error::Io(inner) => inner.get_ref()?.downcast_ref::<Self>().copied(),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for LayoutMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.found {
+            Layout::Other(layout) => write!(
+                f,
+                "the store is laid out as layout {layout} and this build reads layout {LAYOUT}"
+            ),
+            Layout::Unnamed => write!(
+                f,
+                "the store holds rows and names no layout: it was written before \
+                 layouts were numbered, and this build reads layout {LAYOUT}"
+            ),
+            Layout::Unreadable => write!(f, "the store's layout row is unreadable"),
+        }?;
+        f.write_str("; move the store aside to start a new one")
+    }
+}
+
+impl std::error::Error for LayoutMismatch {}

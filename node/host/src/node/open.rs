@@ -45,7 +45,13 @@ impl Node {
         }
         let data = data.as_ref().to_path_buf();
         private_dir(&data).map_err(Error::Data)?;
-        let store = Fjall::open(data.join(STORE))?;
+        let store =
+            Fjall::open(data.join(STORE)).map_err(
+                |error| match crate::store::LayoutMismatch::of(&error) {
+                    Some(mismatch) => Error::Data(mismatch.to_string()),
+                    None => Error::Store(error),
+                },
+            )?;
         let secret = node_secret(&store)?;
         let anchor_keys = AnchorKeys::load(&secret, &store)?;
         // Each run's pair heartbeat outranks the last run's, whatever the

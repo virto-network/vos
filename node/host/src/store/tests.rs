@@ -532,3 +532,74 @@ fn a_store_whose_creation_was_cut_short_opens() {
         );
     }
 }
+
+fn layout_row(store: &Fjall) -> Option<Vec<u8>> {
+    store
+        .system()
+        .get(node_record(NodeRow::Layout, &[]))
+        .unwrap()
+        .map(|value| value.to_vec())
+}
+
+/// Set a store's layout row, or remove it, as an earlier build would have
+/// left it, beside a row of an agent's.
+fn written_as(path: &Path, layout: Option<&[u8]>) {
+    let store = Fjall::open(path).unwrap();
+    let mut batch = store.batch();
+    batch.apply(A, 0, 1, &[put(row(0, 1), b"one")]);
+    batch.commit(PersistMode::SyncAll).unwrap();
+    let key = node_record(NodeRow::Layout, &[]);
+    match layout {
+        Some(value) => store.system().insert(key, value).unwrap(),
+        None => store.system().remove(key).unwrap(),
+    }
+    store.database().persist(PersistMode::SyncAll).unwrap();
+}
+
+fn refused(path: &Path) -> Layout {
+    let error = Fjall::open(path).err().expect("the store is refused");
+    LayoutMismatch::of(&error).expect("a layout mismatch").found
+}
+
+#[test]
+fn a_new_store_names_the_layout_it_is_written_in() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Fjall::open(dir.path()).unwrap();
+    assert_eq!(layout_row(&store), Some(LAYOUT.to_be_bytes().to_vec()));
+}
+
+#[test]
+fn a_store_reopens_under_the_layout_it_names() {
+    let dir = tempfile::tempdir().unwrap();
+    written_as(dir.path(), Some(&LAYOUT.to_be_bytes()));
+    let store = Fjall::open(dir.path()).unwrap();
+    assert_eq!(layout_row(&store), Some(LAYOUT.to_be_bytes().to_vec()));
+    assert_eq!(
+        store.snapshot().get(A, &row(0, 1)).unwrap().as_deref(),
+        Some(&b"one"[..])
+    );
+}
+
+#[test]
+fn a_store_in_another_layout_is_refused() {
+    for layout in [LAYOUT - 1, LAYOUT + 1] {
+        let dir = tempfile::tempdir().unwrap();
+        written_as(dir.path(), Some(&layout.to_be_bytes()));
+        assert_eq!(refused(dir.path()), Layout::Other(layout));
+    }
+    let dir = tempfile::tempdir().unwrap();
+    written_as(dir.path(), Some(b"two"));
+    assert_eq!(refused(dir.path()), Layout::Unreadable);
+}
+
+/// A store with rows and no layout row was written before layouts were
+/// numbered, under layout 1 or 2: it is refused, not guessed at.
+#[test]
+fn a_store_with_rows_and_no_layout_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    written_as(dir.path(), None);
+    assert_eq!(refused(dir.path()), Layout::Unnamed);
+    let error = Fjall::open(dir.path()).err().unwrap();
+    let message = LayoutMismatch::of(&error).unwrap().to_string();
+    assert!(message.contains("names no layout"), "{message}");
+}

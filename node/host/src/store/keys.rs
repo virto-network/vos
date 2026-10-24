@@ -42,7 +42,15 @@ pub(super) enum NodeRow {
     // takes a new tag.
     ProverJob = 0x11,
     ProverMark = 0x12,
+    Layout = 0x13,
 }
+
+/// The keyspace layout this build reads and writes, as the store's layout
+/// row names it. Layout 1 kept an instance's committed maps under the
+/// instance's own owner byte; layout 2 keeps them under an owner byte of
+/// their own, `0x03` ([`vos_wire::keys`]). A change to where rows live
+/// takes the next number.
+pub const LAYOUT: u32 = 2;
 
 pub(super) fn agent_key(agent: AgentId, epoch: u8, key: &[u8]) -> Vec<u8> {
     [&agent.0.to_be_bytes()[..], &[epoch], key].concat()
