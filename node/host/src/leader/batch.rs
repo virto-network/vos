@@ -22,17 +22,28 @@ use crate::{Backoff, lock, raise, random};
 const CLOCK_BOUND: u64 = 10_000;
 
 impl Leader {
+    /// The duties due on `snapshot`, in a batch's order: the reads served,
+    /// the reports, the proofs to record and the closes; none when a test's
+    /// hook stopped the leader before a close.
+    fn duties(&mut self, snapshot: &Snapshot) -> Result<Option<Vec<Pending>>, Fault> {
+        let mut duties = self.resumes(snapshot)?;
+        duties.extend(self.reports(snapshot)?);
+        duties.extend(self.proofs(snapshot)?);
+        Ok(match self.closes(snapshot)? {
+            Closes::Due(closes) => {
+                duties.extend(closes);
+                Some(duties)
+            }
+            Closes::Stopped => None,
+        })
+    }
+
     /// Run one batch to its end. False when a hook stops the leader.
     pub(super) async fn run(&mut self, mut pending: Vec<Pending>) -> bool {
         let taken = Instant::now();
         // Whether to sweep, and what reads to serve, are decided below, on
         // the batch's state.
-        pending.retain(|item| {
-            !matches!(
-                item,
-                Pending::Sweep(_) | Pending::Resume { .. } | Pending::Duty(_)
-            )
-        });
+        pending.retain(|item| !matches!(item, Pending::Sweep(_) | Pending::Duty(_)));
         let snapshot = Arc::new(self.inner.store.snapshot());
         let before = Arc::clone(&snapshot);
         // The batch is refined on this state, at its version and no earlier
@@ -81,21 +92,9 @@ impl Leader {
                 }
             }
         }
-        let duties = self
-            .resumes(&snapshot)
-            .and_then(|resumes| Ok((resumes, self.reports(&snapshot)?)))
-            .and_then(|(resumes, reports)| Ok((resumes, reports, self.proofs(&snapshot)?)))
-            .and_then(|(resumes, reports, proofs)| {
-                Ok((resumes, reports, proofs, self.closes(&snapshot)?))
-            });
-        match duties {
-            Ok((resumes, reports, proofs, Closes::Due(closes))) => {
-                pending.extend(resumes);
-                pending.extend(reports);
-                pending.extend(proofs);
-                pending.extend(closes);
-            }
-            Ok((.., Closes::Stopped)) => {
+        match self.duties(&snapshot) {
+            Ok(Some(duties)) => pending.extend(duties),
+            Ok(None) => {
                 self.agent.requeue(pending);
                 return false;
             }

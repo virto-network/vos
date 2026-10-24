@@ -17,7 +17,6 @@ use vos_wire::served::Closing;
 use vos_wire::{Decode, defaults};
 
 use super::Leader;
-use super::serve::fault;
 use crate::fault::{Fault, read};
 use crate::node::Pending;
 use crate::roots;
@@ -68,16 +67,14 @@ impl Leader {
         let reported =
             read::<(u64, AgentId)>(snapshot, self.id, &keys::reported())?.map(|(window, _)| window);
         let mut due = Vec::new();
-        for (window, (root, _)) in roots::cut_roots(snapshot, self.id).map_err(fault)? {
+        for (window, (root, _)) in roots::cut_roots(snapshot, self.id)? {
             if reported.is_some_and(|reported| window <= reported) {
                 continue;
             }
             if !self.inner.hooks.report(self.id, window) {
                 break;
             }
-            let pending = !roots::served_at(snapshot, self.id, window)
-                .map_err(fault)?
-                .is_empty();
+            let pending = !roots::served_at(snapshot, self.id, window)?.is_empty();
             due.push(Pending::Duty(Input::Report {
                 to,
                 window,
@@ -139,8 +136,7 @@ fn unsent(snapshot: &Snapshot, agent: AgentId, represents: bool) -> Result<Vec<U
         let Some(window) = keys::closing_entry(&key) else {
             continue;
         };
-        let mut closing =
-            Closing::decode_exact(&value).ok_or_else(|| fault(roots::Error::Corrupt("a close")))?;
+        let mut closing = Closing::decode_exact(&value).ok_or(roots::Error::Corrupt("a close"))?;
         match mark {
             Some((closed, _)) if closed > window => continue,
             Some((closed, None)) if closed == window => continue,

@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 use vos_wire::batch::{Admin, Input, Message, Request};
-use vos_wire::ids::{AgentId, RequestId};
+use vos_wire::ids::AgentId;
 use vos_wire::keys::Due;
 
 use super::{CallError, Inner, Reply};
@@ -45,17 +45,11 @@ pub(crate) enum Pending {
     /// The leader's sweep of the rows of the due index due at its batch's
     /// time, which it lists: expired sessions, and workflows' steps.
     Sweep(Vec<(u64, Due)>),
-    /// A read at window `window`'s cut, `request`, served: the encoded rows
-    /// and proofs, or `None` unserved. The leader makes it from its
-    /// replica's state for each batch, so it is never queued.
-    Resume {
-        window: u64,
-        request: RequestId,
-        served: Option<Vec<u8>>,
-    },
     /// An input of the agent's own the leader makes from its replica's
     /// state for each batch, never queued: a report of its root at a cut,
-    /// or the representative's close of a window.
+    /// the representative's close of a window, or a read at a window's cut
+    /// served ([`Input::Resume`]: the encoded rows and proofs, or `None`
+    /// unserved).
     Duty(Input),
 }
 
@@ -75,15 +69,6 @@ impl Pending {
                 sequence: *sequence,
             },
             Pending::Sweep(due) => Input::Sweep { due: due.clone() },
-            Pending::Resume {
-                window,
-                request,
-                served,
-            } => Input::Resume {
-                window: *window,
-                request: *request,
-                served: served.clone(),
-            },
             Pending::Duty(input) => input.clone(),
         }
     }
@@ -92,7 +77,7 @@ impl Pending {
         match self {
             Pending::Request { request, .. } => request.arguments.len(),
             Pending::Message(message) => message.body.payload_len(),
-            Pending::Resume { served, .. } => served.as_ref().map_or(0, Vec::len),
+            Pending::Duty(Input::Resume { served, .. }) => served.as_ref().map_or(0, Vec::len),
             // Its batch carries no body.
             Pending::Failed(_)
             | Pending::Admin { .. }

@@ -8,6 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use vos_wire::batch::Batch;
+use vos_wire::ids::AgentId;
 use vos_wire::keys;
 use vos_wire::result::WorkResult;
 use vos_wire::{SpaceId, WindowClock};
@@ -22,10 +23,7 @@ use crate::store::Snapshot;
 const CUT_RECHECK: Duration = Duration::from_secs(2);
 
 /// The clock of `snapshot`'s agent's space, if it belongs to one.
-fn space_clock(
-    snapshot: &Snapshot,
-    agent: vos_wire::ids::AgentId,
-) -> Result<Option<WindowClock>, Fault> {
+fn space_clock(snapshot: &Snapshot, agent: AgentId) -> Result<Option<WindowClock>, Fault> {
     let space = read::<SpaceId>(snapshot, agent, &keys::space())?;
     if space.is_none_or(|space| space == SpaceId::NONE) {
         return Ok(None);
@@ -38,20 +36,36 @@ fn next_boundary(clock: &WindowClock, mark: u64) -> Option<u64> {
     clock.boundary(clock.window(mark).unwrap_or(0))
 }
 
+/// The first boundary past the agent's batch-time mark on its space's
+/// clock; none when it belongs to no space.
+fn cut_due(snapshot: &Snapshot, agent: AgentId) -> Result<Option<u64>, Fault> {
+    let Some(clock) = space_clock(snapshot, agent)? else {
+        return Ok(None);
+    };
+    let mark = read::<u64>(snapshot, agent, &keys::batch_time())?.unwrap_or(0);
+    Ok(next_boundary(&clock, mark))
+}
+
+/// What a marker is made of, as `snapshot` holds the agent: its space's
+/// clock, its version, its batch-time floor and its applied index.
+fn marker_state(
+    snapshot: &Snapshot,
+    agent: AgentId,
+) -> Result<(Option<WindowClock>, u64, u64, u64), Fault> {
+    let clock = space_clock(snapshot, agent)?;
+    let version = read::<u64>(snapshot, agent, &keys::version())?.unwrap_or(0);
+    let floor = read::<u64>(snapshot, agent, &keys::batch_time())?.unwrap_or(0);
+    let applied = snapshot.applied(agent)?.unwrap_or(0);
+    Ok((clock, version, floor, applied))
+}
+
 impl Leader {
     /// How long until an idle leader appends a marker: zero when one is
     /// due now, its clock at or past the first boundary after the agent's
     /// batch-time mark; none when the agent belongs to no space.
     pub(super) fn cut_wait(&self) -> Option<Duration> {
         let snapshot = self.inner.store.snapshot();
-        let due = (|| {
-            let Some(clock) = space_clock(&snapshot, self.id)? else {
-                return Ok(None);
-            };
-            let mark = read::<u64>(&snapshot, self.id, &keys::batch_time())?.unwrap_or(0);
-            Ok::<_, Fault>(next_boundary(&clock, mark))
-        })();
-        let boundary = match due {
+        let boundary = match cut_due(&snapshot, self.id) {
             Ok(Some(boundary)) => boundary,
             Ok(None) => return None,
             Err(_) => return Some(CUT_RECHECK),
@@ -70,15 +84,11 @@ impl Leader {
     /// refined. False when a hook stops the leader.
     pub(super) async fn marker(&mut self) -> bool {
         let snapshot = Arc::new(self.inner.store.snapshot());
-        let state = (|| {
-            let clock = space_clock(&snapshot, self.id)?;
-            let version = read::<u64>(&snapshot, self.id, &keys::version())?.unwrap_or(0);
-            let floor = read::<u64>(&snapshot, self.id, &keys::batch_time())?.unwrap_or(0);
-            self.applied = snapshot.applied(self.id)?.unwrap_or(0);
-            Ok::<_, Fault>((clock, version, floor))
-        })();
-        let (clock, version, floor) = match state {
-            Ok(state) => state,
+        let (clock, version, floor) = match marker_state(&snapshot, self.id) {
+            Ok((clock, version, floor, applied)) => {
+                self.applied = applied;
+                (clock, version, floor)
+            }
             Err(fault) => {
                 self.retry(Vec::new(), fault).await;
                 return true;

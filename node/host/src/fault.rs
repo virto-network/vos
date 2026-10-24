@@ -47,6 +47,13 @@ impl From<fjall::Error> for Fault {
     }
 }
 
+/// A root builder's error, as the leader's fault.
+impl From<crate::roots::Error> for Fault {
+    fn from(error: crate::roots::Error) -> Self {
+        Fault::Infrastructure(format!("a cut's proofs: {error}"))
+    }
+}
+
 /// A panic on an executor is the node's fault.
 impl From<Panicked> for Fault {
     fn from(panicked: Panicked) -> Self {

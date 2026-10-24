@@ -3,7 +3,7 @@
 //! in or one a re-cut moved it to, [`roots::serving_windows`]) and the
 //! agent holds the representative's close of that window
 //! ([`keys::closed`]), the request goes into a batch as a
-//! [`Pending::Resume`]: its rows and their proof as the cut's build
+//! [`Input::Resume`]: its rows and their proof as the cut's build
 //! persisted them ([`roots::cut_proof_at`]), with the close's root, salt
 //! and path of the agent's root at the cut to the space's root; the first
 //! such window. A request whose rows pass its target's [`Limits::served`]
@@ -11,6 +11,7 @@
 //! its window is re-cut, or its deadline ends it.
 
 use vos_wire::abi::cap::{Limits, Target};
+use vos_wire::batch::Input;
 use vos_wire::ids::{AgentId, RequestId};
 use vos_wire::keys;
 use vos_wire::records::{PendingRead, unstored};
@@ -55,11 +56,11 @@ impl Leader {
             .into_iter()
             .map(|ready| {
                 let served = served(snapshot, self.id, space, target.limits(), &ready)?;
-                Ok(Pending::Resume {
+                Ok(Pending::Duty(Input::Resume {
                     window: ready.asked,
                     request: ready.request,
                     served,
-                })
+                }))
             })
             .collect()
     }
@@ -69,7 +70,7 @@ impl Leader {
 /// agent holding its close, at most [`RESUMES`], in the order of the
 /// windows they were asked in, each at the first such cut.
 fn proved(snapshot: &Snapshot, agent: AgentId) -> Result<Vec<Ready>, Fault> {
-    let Some(latest) = roots::latest_built(snapshot, agent).map_err(fault)? else {
+    let Some(latest) = roots::latest_built(snapshot, agent)? else {
         return Ok(Vec::new());
     };
     let mut ready = Vec::new();
@@ -83,11 +84,11 @@ fn proved(snapshot: &Snapshot, agent: AgentId) -> Result<Vec<Ready>, Fault> {
         if asked > latest || ready.len() == RESUMES {
             break;
         }
-        if windows.as_ref().is_none_or(|(of, _)| *of != asked) {
-            let serving = roots::serving_windows(snapshot, agent, asked).map_err(fault)?;
-            windows = Some((asked, serving));
-        }
-        let (_, serving) = windows.as_ref().expect("the windows");
+        let serving = match windows.take() {
+            Some((of, serving)) if of == asked => serving,
+            _ => roots::serving_windows(snapshot, agent, asked)?,
+        };
+        let (_, serving) = windows.insert((asked, serving));
         for window in serving.iter().copied().filter(|window| *window <= latest) {
             let closed = snapshot.get(agent, &keys::closed(window))?.is_some();
             let proved = closed
@@ -117,8 +118,7 @@ fn served(
     limits: &Limits,
     ready: &Ready,
 ) -> Result<Option<Vec<u8>>, Fault> {
-    let proof =
-        roots::cut_proof_at(snapshot, agent, ready.request, ready.serving).map_err(fault)?;
+    let proof = roots::cut_proof_at(snapshot, agent, ready.request, ready.serving)?;
     let Some(CutProof {
         window,
         agent_root,
@@ -133,9 +133,9 @@ fn served(
         .get(agent, &keys::request(ready.asked, ready.request))?
         .as_deref()
         .and_then(unstored)
-        .and_then(|bytes| PendingRead::decode(bytes).ok());
+        .and_then(PendingRead::decode_exact);
     let closed = read::<ClosedRow>(snapshot, agent, &keys::closed(window))?;
-    let (Some((asked, _)), Some(closed)) = (asked, closed) else {
+    let (Some(asked), Some(closed)) = (asked, closed) else {
         return Ok(None);
     };
     let served = Served {
@@ -152,9 +152,4 @@ fn served(
     }
     .encode();
     Ok((served.len() <= limits.served).then_some(served))
-}
-
-/// A root builder's error, as the leader's fault.
-pub(super) fn fault(error: roots::Error) -> Fault {
-    Fault::Infrastructure(format!("a cut's proofs: {error}"))
 }

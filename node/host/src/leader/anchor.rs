@@ -15,7 +15,6 @@ use vos_wire::vos_anchor::{Anchor, RootKind, RootRead, space_root};
 
 use super::Leader;
 use super::close::Unsent;
-use super::serve::fault;
 use crate::fault::{Fault, read};
 use crate::roots;
 use crate::store::Snapshot;
@@ -149,7 +148,7 @@ impl Leader {
         let (space, clock) = self.inner.space_and_clock();
         for anchor in self.handed_back() {
             let window = anchor.window;
-            let cut = roots::cut_root(snapshot, self.id, window).map_err(fault)?;
+            let cut = roots::cut_root(snapshot, self.id, window)?;
             let computed = cut.map(|(root, _)| space_root(&space, window, &root));
             if computed.is_some_and(|root| root != anchor.root) {
                 self.anchoring.foreign.insert(anchor);
@@ -197,17 +196,15 @@ impl Leader {
         };
         let (space, _) = self.inner.space_and_clock();
         let mut kept = BTreeSet::new();
-        let cut_roots = roots::cut_roots(snapshot, self.id).map_err(fault)?;
+        let cut_roots = roots::cut_roots(snapshot, self.id)?;
         for (&window, &(root, _)) in cut_roots.range(..=through) {
             kept.insert(window);
             if self.anchoring.refused.contains(&window) {
                 continue;
             }
-            let closing = roots::closing_of(snapshot, self.id, window).map_err(fault)?;
+            let closing = roots::closing_of(snapshot, self.id, window)?;
             if closing.is_some_and(|closing| closing.root != root) {
-                return Err(fault(roots::Error::Corrupt(
-                    "a close whose root is not its cut's",
-                )));
+                return Err(roots::Error::Corrupt("a close whose root is not its cut's").into());
             }
             let root = space_root(&space, window, &root);
             let held = venue.anchored(&RootRead {
