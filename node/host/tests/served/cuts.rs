@@ -29,7 +29,7 @@ use std::time::Duration;
 
 use vos_checker::calls::install_at_leader;
 use vos_checker::programs::{actor, method, package, table_tag};
-use vos_checker::{ANSWERED, Mode, wait_until};
+use vos_checker::{ANSWERED, Mode, cuts, replicated, wait_until};
 use vos_node::roots;
 use vos_node::store::Snapshot;
 use vos_node::{Node, Reply};
@@ -338,27 +338,6 @@ impl Cuts {
         );
         assert!(checked > 0, "no anchor checked");
     }
-}
-
-/// The cuts `snapshot` holds of `agent`.
-fn cuts(snapshot: &Snapshot, agent: AgentId) -> BTreeMap<u64, u64> {
-    snapshot
-        .scan(agent, &keys::cuts(), None)
-        .map(|row| {
-            let (key, value) = row.unwrap();
-            let version = u64::decode(unstored(&value).unwrap()).unwrap().0;
-            (keys::cut_entry(&key).unwrap(), version)
-        })
-        .collect()
-}
-
-/// `agent`'s replicated rows in `snapshot` ([`keys::is_replicated`]).
-fn replicated(snapshot: &Snapshot, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
-    [[0x00u8], [0x01], [0x03]]
-        .iter()
-        .flat_map(|prefix| snapshot.scan(agent, prefix, None).map(Result::unwrap))
-        .filter(|(key, _)| keys::is_replicated(key))
-        .collect()
 }
 
 /// Once every replica applies as far as the others and has built every

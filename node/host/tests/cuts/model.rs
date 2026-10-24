@@ -312,14 +312,7 @@ pub fn scan(snapshot: &Snapshot, prefix: &[u8]) -> Vec<(Vec<u8>, Vec<u8>)> {
 
 /// The cuts the agent recorded: each window's cut version.
 pub fn cuts(snapshot: &Snapshot) -> BTreeMap<u64, u64> {
-    scan(snapshot, &keys::cuts())
-        .into_iter()
-        .map(|(key, bytes)| {
-            let window = keys::cut_entry(&key).expect("a cut row");
-            let version = u64::decode_exact(unstored(&bytes).unwrap()).unwrap();
-            (window, version)
-        })
-        .collect()
+    vos_checker::cuts(snapshot, AGENT)
 }
 
 /// The pending requests the agent holds: each request's window and read.
@@ -350,11 +343,7 @@ pub fn undos(snapshot: &Snapshot) -> BTreeMap<(u64, Vec<u8>), Vec<u8>> {
 
 /// The agent's replicated rows ([`keys::is_replicated`]).
 pub fn replicated(snapshot: &Snapshot) -> Vec<(Vec<u8>, Vec<u8>)> {
-    [[0x00u8], [0x01], [0x03]]
-        .iter()
-        .flat_map(|prefix| scan(snapshot, prefix))
-        .filter(|(key, _)| keys::is_replicated(key))
-        .collect()
+    vos_checker::replicated(snapshot, AGENT)
 }
 
 /// What the agent applied, in order: the model every check compares with.

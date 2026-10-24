@@ -37,12 +37,13 @@ pub use client::tours::{Touring, check_tallies};
 pub use client::{Client, PAUSING, clients};
 pub use model::{ANSWERED, ATTEMPT, COUNTER, INBOX, Log, Methods, Mode, Nodes, SECOND};
 
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use vos_node::store::Fjall;
-use vos_wire::Decode;
+use vos_node::store::{Fjall, Snapshot};
 use vos_wire::ids::AgentId;
 use vos_wire::records::unstored;
+use vos_wire::{Decode, keys};
 
 /// A small seeded generator, so a failing run can be run again.
 pub struct Random(pub u64);
@@ -100,6 +101,41 @@ pub fn applied<T: Decode>(store: &Fjall, agent: AgentId, key: &[u8]) -> Option<T
 /// 0 while it holds none.
 pub fn mark(store: &Fjall, agent: AgentId, key: &[u8]) -> u64 {
     applied(store, agent, key).unwrap_or(0)
+}
+
+/// The owner bytes of an agent's state rows: the agent's own, its
+/// instances' and their committed maps', all but the root builder's
+/// (`0x02`).
+pub const STATE_PREFIXES: [[u8; 1]; 3] = [[0x00], [0x01], [0x03]];
+
+/// Every row of `agent`'s applied state in `snapshot`, under each of
+/// [`STATE_PREFIXES`] in turn.
+pub fn state_rows(snapshot: &Snapshot, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
+    STATE_PREFIXES
+        .iter()
+        .flat_map(|prefix| snapshot.scan(agent, prefix, None).map(Result::unwrap))
+        .collect()
+}
+
+/// `agent`'s replicated rows in `snapshot` ([`keys::is_replicated`]).
+pub fn replicated(snapshot: &Snapshot, agent: AgentId) -> Vec<(Vec<u8>, Vec<u8>)> {
+    state_rows(snapshot, agent)
+        .into_iter()
+        .filter(|(key, _)| keys::is_replicated(key))
+        .collect()
+}
+
+/// The cuts `snapshot` holds of `agent`: each window's cut version.
+pub fn cuts(snapshot: &Snapshot, agent: AgentId) -> BTreeMap<u64, u64> {
+    snapshot
+        .scan(agent, &keys::cuts(), None)
+        .map(|row| {
+            let (key, value) = row.unwrap();
+            let window = keys::cut_entry(&key).expect("a cut row");
+            let version = u64::decode_exact(unstored(&value).unwrap()).unwrap();
+            (window, version)
+        })
+        .collect()
 }
 
 /// The median and the 99th percentile of `samples`, by nearest rank, in

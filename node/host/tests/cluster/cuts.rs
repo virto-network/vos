@@ -52,15 +52,7 @@ pub(crate) fn set_clock(cluster: &Cluster, number: NodeNumber, at: u64) {
 
 /// The cuts `node` holds of `agent`: each window's version.
 pub(crate) fn cuts(node: &Node, agent: AgentId) -> BTreeMap<u64, u64> {
-    node.store()
-        .snapshot()
-        .scan(agent, &keys::cuts(), None)
-        .map(|row| {
-            let (key, value) = row.unwrap();
-            let version = u64::decode(unstored(&value).unwrap()).unwrap().0;
-            (keys::cut_entry(&key).unwrap(), version)
-        })
-        .collect()
+    vos_checker::cuts(&node.store().snapshot(), agent)
 }
 
 /// `agent`'s state version on `node`.
@@ -659,11 +651,7 @@ fn a_read_at_a_cut_is_served_by_its_leader() {
 /// applied index, from one store snapshot.
 pub(crate) fn replicated(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
     let snapshot = node.store().snapshot();
-    let rows = [[0x00u8], [0x01], [0x03]]
-        .iter()
-        .flat_map(|prefix| snapshot.scan(agent, prefix, None).map(Result::unwrap))
-        .filter(|(key, _)| keys::is_replicated(key))
-        .collect();
+    let rows = vos_checker::replicated(&snapshot, agent);
     (snapshot.applied(agent).unwrap(), rows)
 }
 

@@ -666,16 +666,7 @@ pub fn rows(node: &Node, agent: AgentId) -> Rows {
 pub fn applied_rows(node: &Node, agent: AgentId) -> (Option<u64>, Rows) {
     let snapshot = node.store().snapshot();
     let applied = snapshot.applied(agent).unwrap();
-    let rows = [[0x00u8], [0x01], [0x03]]
-        .iter()
-        .flat_map(|prefix| {
-            snapshot
-                .scan(agent, prefix, None)
-                .map(Result::unwrap)
-                .collect::<Vec<_>>()
-        })
-        .collect();
-    (applied, rows)
+    (applied, vos_checker::state_rows(&snapshot, agent))
 }
 
 /// Where `agent`'s log on `node` starts: the index it was compacted
