@@ -28,10 +28,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::live::statements::{Item as Package, Statements};
-use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey};
 use vos_anchor::{Anchor, Migrate, RootRead, SpaceGenesis, SpaceId, VenueId, register_digest};
 use vos_jam::Error;
-use vos_statement::{MAX_ROOT_AGE_MS, Refusal, Statement, StatementId};
+use vos_statement::{Refusal, Statement, StatementId};
 use vos_statement_service::config::{Config, configure};
 use vos_statement_service::item::{
     Control, Item, Op, Register, SignedControl, SignedMigrate, control_digest, migrate_digest,
@@ -152,11 +152,7 @@ impl JamSend {
         else {
             return None;
         };
-        let aged = space
-            .clock
-            .boundary(anchor.window)
-            .is_some_and(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS);
-        if aged {
+        if vos_venue::aged(&space.clock, anchor.window, now) {
             return Some(Fate::Dead);
         }
         space
@@ -351,14 +347,7 @@ impl VenueClient for JamVenue {
     /// good, and the one handed back for its key; the rest the queue's
     /// worker lands.
     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        let signed = VerifyingKey::from_bytes(&anchor.signer).is_ok_and(|key| {
-            key.verify_strict(
-                &anchor.digest(&self.id()),
-                &Signature::from_bytes(&anchor.signature),
-            )
-            .is_ok()
-        });
-        if !signed {
+        if !vos_venue::signed(anchor, &self.id()) {
             return Err(AnchorRefusal::Signature);
         }
         if self.queue.dead(&anchor.space, anchor.window) {
@@ -404,11 +393,7 @@ impl VenueClient for JamVenue {
         let Ok(now) = self.statements.now() else {
             return false;
         };
-        let fresh = space
-            .clock
-            .boundary(root.window)
-            .and_then(|boundary| boundary.checked_add(MAX_ROOT_AGE_MS))
-            .is_some_and(|last| now <= last);
+        let fresh = vos_venue::fresh(&space.clock, root.window, now);
         let held = self
             .statements
             .value(&keys::anchor(&root.space, root.kind, root.window))

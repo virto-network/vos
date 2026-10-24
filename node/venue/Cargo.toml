@@ -8,16 +8,16 @@ description = "A venue as a VOS node reaches it: anchoring a space's roots, subm
 # No production build enables these: a node carries no venue's client.
 [features]
 # The model venue, for the node's tests.
-model = ["dep:ed25519-dalek"]
+model = []
 # The client of Kreivo's spaces pallet.
-kreivo = ["dep:blake2", "dep:ed25519-dalek", "dep:parity-scale-codec", "dep:twox-hash"]
+kreivo = ["dep:blake2", "dep:parity-scale-codec", "dep:twox-hash"]
 # The reference mock of Kreivo's spaces pallet and a transport over it,
 # for the node's tests.
 kreivo-mock = ["kreivo"]
 
 [dependencies]
 blake2 = { version = "0.10", optional = true }
-ed25519-dalek = { version = "2", optional = true }
+ed25519-dalek = "2"
 # The spaces pallet's calls, events and stored values in SCALE, FRAME's
 # bytes; its storage keys hashed as FRAME's hashers do (`twox128`,
 # `twox64`, `blake2_128`).
@@ -31,7 +31,6 @@ vos-statement = { workspace = true }
 # This crate's tests build the model venue, the Kreivo client and its
 # mock whatever the features.
 blake2 = "0.10"
-ed25519-dalek = "2"
 parity-scale-codec = { version = "3.7.5", features = ["derive", "std"] }
 twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 # The conformance vectors, as JSON.

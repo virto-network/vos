@@ -12,10 +12,8 @@
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use ed25519_dalek::{Signature, VerifyingKey};
 use vos_anchor::{
-    Anchor, MAX_FOUNDING_KEYS, MAX_ROOT_AGE_MS, Migrate, RootRead, SpaceGenesis, SpaceId, VenueId,
-    WindowClock,
+    Anchor, MAX_FOUNDING_KEYS, Migrate, RootRead, SpaceGenesis, SpaceId, VenueId, WindowClock,
 };
 use vos_statement::model::{Policy, Range, Space};
 use vos_statement::{Pin, ProgramId, Statement, StatementId, Venue};
@@ -82,10 +80,7 @@ fn held(state: &State, root: &RootRead, now: u64) -> bool {
     let Some(space) = state.spaces.get(&root.space) else {
         return false;
     };
-    let fresh = space
-        .clock
-        .boundary(root.window)
-        .is_some_and(|boundary| now.saturating_sub(boundary) <= MAX_ROOT_AGE_MS);
+    let fresh = crate::fresh(&space.clock, root.window, now);
     !space.suspended
         && space.range.contains(root.window)
         && fresh
@@ -286,14 +281,7 @@ impl VenueClient for ModelVenue {
         if !space.keys.contains(&anchor.signer) {
             return Err(AnchorRefusal::Key);
         }
-        let signed = VerifyingKey::from_bytes(&anchor.signer).is_ok_and(|key| {
-            key.verify_strict(
-                &anchor.digest(&self.id),
-                &Signature::from_bytes(&anchor.signature),
-            )
-            .is_ok()
-        });
-        if !signed {
+        if !crate::signed(anchor, &self.id) {
             return Err(AnchorRefusal::Signature);
         }
         let at = (anchor.space, anchor.kind as u8, anchor.window);
@@ -317,8 +305,7 @@ impl VenueClient for ModelVenue {
         {
             return Err(AnchorRefusal::Open);
         }
-        let boundary = space.clock.boundary(anchor.window);
-        if boundary.is_none_or(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS) {
+        if !crate::fresh(&space.clock, anchor.window, now) {
             return Err(AnchorRefusal::Age);
         }
         space.last = Some(anchor.window);

@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use vos_anchor::{Anchor, MAX_ROOT_AGE_MS};
+use vos_anchor::Anchor;
 use vos_statement::{Refusal, Statement, StatementId};
 
 use super::calls::{
@@ -79,8 +79,7 @@ impl Shared {
             return Err(Fate::Resign);
         }
         let clock = info.clock();
-        let boundary = clock.boundary(window).unwrap_or(u64::MAX);
-        if now.saturating_sub(boundary) > MAX_ROOT_AGE_MS {
+        if crate::aged(&clock, window, now) {
             state.forget(key);
             let error = Error::WindowTooOld;
             state.alert(Alert::Dead {
@@ -99,7 +98,7 @@ impl Shared {
         if paused || info.status != SpaceStatus::Active || !closed || later {
             return Err(wait);
         }
-        Ok((info, boundary))
+        Ok((info, clock.boundary(window).unwrap_or(u64::MAX)))
     }
 
     /// The fate of `anchor`, sent at the venue's time `now` as `sent`
@@ -329,9 +328,8 @@ impl AnchorSend for KreivoSend {
         let passed = known.last.is_some_and(|last| last >= anchor.window);
         let aged = known
             .info
-            .and_then(|info| info.clock().boundary(anchor.window))
             .zip(now)
-            .is_some_and(|(boundary, now)| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS);
+            .is_some_and(|(info, now)| crate::aged(&info.clock(), anchor.window, now));
         passed || aged
     }
 }

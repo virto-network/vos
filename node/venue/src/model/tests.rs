@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey};
-use vos_anchor::{MIN_LENGTH_MS, RootKind};
+use vos_anchor::{MAX_ROOT_AGE_MS, MIN_LENGTH_MS, RootKind};
 
 use super::*;
 

@@ -17,7 +17,8 @@
 //! A JAM statements service is a venue only through VOS's development
 //! tooling (`vos-jam-dev`'s `JamVenue`).
 
-use vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
+use ed25519_dalek::{Signature, VerifyingKey};
+use vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceId, VenueId, WindowClock};
 use vos_statement::{Refusal, Statement, StatementId};
 
 /// What a node asks of a venue.
@@ -62,6 +63,35 @@ pub const UNJUDGED_FROM: u32 = 0x1000;
 /// [`UNJUDGED_FROM`]. The others are the statement's own, and final.
 pub fn transient(code: u32) -> bool {
     code == Refusal::Unanchored.code() || code >= UNJUDGED_FROM
+}
+
+/// Whether `anchor` is signed by its signer over its digest at `venue`.
+pub fn signed(anchor: &Anchor, venue: &VenueId) -> bool {
+    VerifyingKey::from_bytes(&anchor.signer).is_ok_and(|key| {
+        key.verify_strict(
+            &anchor.digest(venue),
+            &Signature::from_bytes(&anchor.signature),
+        )
+        .is_ok()
+    })
+}
+
+/// Whether a root of window `w` by `clock` is fresh at `now`: its window's
+/// boundary at most `MaxRootAge` ago. A window whose boundary is past
+/// `u64`'s range is not.
+pub fn fresh(clock: &WindowClock, w: u64, now: u64) -> bool {
+    clock
+        .boundary(w)
+        .is_some_and(|boundary| now.saturating_sub(boundary) <= MAX_ROOT_AGE_MS)
+}
+
+/// Whether an anchor of window `w` by `clock` is past `MaxRootAge` at
+/// `now`: its window's boundary more than `MaxRootAge` ago. A window whose
+/// boundary is past `u64`'s range is not.
+pub fn aged(clock: &WindowClock, w: u64, now: u64) -> bool {
+    clock
+        .boundary(w)
+        .is_some_and(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS)
 }
 
 /// Whether `code` is a refused proof's ([`Refusal::Proof`]'s class: `0x100`

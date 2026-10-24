@@ -33,8 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signature, VerifyingKey};
-use vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceId, VenueId};
+use vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
 use vos_statement::{Statement, StatementId};
 
 use super::calls::{
@@ -448,14 +447,7 @@ impl VenueClient for KreivoVenue {
         let Some(id) = self.shared.id.get() else {
             return Err(AnchorRefusal::Open);
         };
-        let signed = VerifyingKey::from_bytes(&anchor.signer).is_ok_and(|key| {
-            key.verify_strict(
-                &anchor.digest(id),
-                &Signature::from_bytes(&anchor.signature),
-            )
-            .is_ok()
-        });
-        if !signed {
+        if !crate::signed(anchor, id) {
             return Err(AnchorRefusal::Open);
         }
         let mut state = self.shared.state();
@@ -498,8 +490,7 @@ impl VenueClient for KreivoVenue {
         if clock.window(now).is_none_or(|open| window >= open) {
             return Err(AnchorRefusal::Open);
         }
-        let boundary = clock.boundary(window).unwrap_or(u64::MAX);
-        if now.saturating_sub(boundary) > MAX_ROOT_AGE_MS {
+        if crate::aged(&clock, window, now) {
             return Err(AnchorRefusal::Age);
         }
         drop(state);
@@ -543,11 +534,7 @@ impl VenueClient for KreivoVenue {
         let Some(info) = known.info else {
             return false;
         };
-        let fresh = info
-            .clock()
-            .boundary(root.window)
-            .zip(now)
-            .is_some_and(|(boundary, now)| now.saturating_sub(boundary) <= MAX_ROOT_AGE_MS);
+        let fresh = now.is_some_and(|now| crate::fresh(&info.clock(), root.window, now));
         if info.status != SpaceStatus::Active || !info.holds(root.window) || !fresh {
             return false;
         }

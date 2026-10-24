@@ -7,12 +7,12 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::time::{Duration, Instant};
 
-use ed25519_dalek::{Signature, Signer, VerifyingKey};
+use ed25519_dalek::Signer;
 use vos_venue::AnchorRefusal;
 use vos_wire::Decode;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
-use vos_wire::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootKind, RootRead, space_root};
+use vos_wire::vos_anchor::{Anchor, RootKind, RootRead, space_root};
 
 use super::Leader;
 use super::close::Unsent;
@@ -97,13 +97,7 @@ impl Leader {
                 let signed = anchor.space == space
                     && anchor.kind == RootKind::Space
                     && ours.contains(&anchor.signer)
-                    && VerifyingKey::from_bytes(&anchor.signer).is_ok_and(|key| {
-                        key.verify_strict(
-                            &anchor.digest(&id),
-                            &Signature::from_bytes(&anchor.signature),
-                        )
-                        .is_ok()
-                    });
+                    && vos_venue::signed(anchor, &id);
                 let window = anchor.window;
                 let settled_since = self.anchoring.anchored.contains(&window)
                     && self
@@ -283,10 +277,7 @@ impl Leader {
             .and_then(|venue| venue.time())
             .unwrap_or_else(|| (self.inner.clock)());
         while let Some((&window, &root)) = self.anchoring.unanchored.first_key_value() {
-            let aged = clock
-                .boundary(window)
-                .is_some_and(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS);
-            if aged {
+            if vos_venue::aged(&clock, window, now) {
                 tracing::error!(
                     window,
                     "the space's root waited past `MaxRootAge`; no venue takes it now"
