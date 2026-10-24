@@ -232,8 +232,8 @@ pub fn prove_masked(
 }
 
 /// Proves a finalized wrap circuit unmasked under `format::WRAP`, on the
-/// Blake2b-256 channel: what the tests and the fixtures verify until the
-/// venues take `format::MASKED_WRAP`.
+/// Blake2b-256 channel: what the unmasked tests and fixtures verify; the
+/// venues take only `format::MASKED_WRAP`.
 pub fn prove_unmasked(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError> {
     prove_unmasked_with(finalized, |_| {})
 }

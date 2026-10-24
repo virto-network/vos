@@ -1,6 +1,6 @@
-//! The leakage gates' statistics (`docs/design/slice-6-on-chain.md`, "The
-//! masking's gates"): a masked proof's published values field by field, and the tests
-//! they are held to, each with its p-value:
+//! The leakage gates' statistics (`docs/design/proving.md` §5): a masked
+//! proof's published values field by field, and the tests they are held to,
+//! each with its p-value:
 //! - per field, a two-sample χ² on 16 buckets of a value's top bits (4 for
 //!   at most [`FEW`] values a side; two witnesses' proofs), or a one-sample
 //!   test against uniform M31 (exact for at most [`FEW`] values);

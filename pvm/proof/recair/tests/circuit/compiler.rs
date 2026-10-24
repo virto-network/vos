@@ -10,7 +10,7 @@
 //! 3. **tamper:** every sample a chip reads moves its combination, and so
 //!    the composition check (the samples no constraint reads are pinned);
 //! 4. **counts:** each chip's rows are pinned, within 1% of the re-baselined
-//!    count (`docs/design/research/slice-5/count-hardened.log`).
+//!    count (`BASELINE`).
 //!
 //! A mis-compiled gate, a coefficient flipped or a term dropped, fails
 //! tests 1 and 2 on every chip. A synthetic component covers what the chips
@@ -52,8 +52,7 @@ const LOG_SIZES: [u32; chip_idx::COUNT] = [
     15, 14, 16, 18, 9, 8, 4, 17, 4, 4, 4, 16, 8, 16, 8, 8, 6, 8, 8, 8, 15, 15, 15, 15, 16,
 ];
 
-/// Each chip's fused gate rows in the re-baselined count
-/// (`count-hardened.log`, the full shape).
+/// Each chip's fused gate rows in the re-baselined count, the full shape.
 const BASELINE: [usize; chip_idx::COUNT] = [
     2850, 12307, 5341, 202, 4876, 709, 76, 191, 19, 26, 37, 48, 19, 126, 10, 12, 18, 11, 12, 18,
     830, 353, 141, 1199, 12,

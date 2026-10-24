@@ -36,8 +36,8 @@ const LOG_SIZES: LogSizes = [14, 15, 11];
 
 /// Each constraint's degree is at most 3, so a constraint over columns
 /// masked to `2N` stays under the composition's `4N`:
-/// `3(N + h) − N ≤ 4N − 1` for `h ≤ 2N/3`, which pin A's `h = 256` meets on
-/// every component.
+/// `3(N + h) − N ≤ 4N − 1` for `h ≤ 2N/3`, which the format's `h = 256`
+/// meets on every component.
 fn audit(name: &str, recorded: &ExprEvaluator, preprocessed: &[&str]) -> Vec<usize> {
     let counted = degrees(recorded, preprocessed);
     assert!(
@@ -155,11 +155,11 @@ fn the_segment_chips_pass_the_degree_audit_under_c() {
 
 /// The masked wrap's shape, read from the built components' own layout:
 /// FRI's `k` the composition's whole bound (`4N`, never split), the masked
-/// columns' level, every value the DEEP quotient batches at pin B's sample
-/// points (a column sampled twice batches a third, its periodicity value)
-/// and the most of one column,
-/// the constraints and fractions the components declare, the widest
-/// relation, and the doublings from `z` to the composition's point.
+/// columns' level, every value the DEEP quotient batches at the
+/// transcript's sample points (a column sampled twice batches a third, its
+/// periodicity value) and the most of one column, the constraints and
+/// fractions the components declare, the widest relation, and the doublings
+/// from `z` to the composition's point.
 fn masked_wrap_shape() -> SecurityShape {
     let relation = GateRelation::dummy();
     let blind = BlindRelation::dummy();

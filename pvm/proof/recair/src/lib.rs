@@ -22,13 +22,13 @@
 //! - [`fold`] is a fold node: two children of the padded shape, leaves or
 //!   folds, verified, their circuits, program and run checked, and the node
 //!   output their run states.
-//! - [`wrap`] is the final wrap: a tree's root verified, its circuit,
-//!   program and run checked, the program id and io-hash its public words,
-//!   proved masked under `format::MASKED_WRAP` on the Blake2b-256 channel, or unmasked
-//!   under `format::WRAP`.
-//! - [`masked`] is the masked prover (masking variant (c)), over any
-//!   component set and Merkle channel: the masks, salts, blinding and FRI
-//!   mask in pin B's order, R1 checked on the transcript, the randomness
+//! - [`wrap`] is the final wrap: a tree's root verified, its circuit, program
+//!   and run checked, the program id and io-hash its public words, proved
+//!   masked under `format::MASKED_WRAP` on the Blake2b-256 channel, or
+//!   unmasked under `format::WRAP`.
+//! - [`masked`] is the masked prover (masking variant (c)), over any component
+//!   set and Merkle channel: the masks, salts, blinding and FRI mask in the
+//!   masked transcript's order, R1 checked on the transcript, the randomness
 //!   hedged.
 //! - [`tree`] proves a run's tree node by node: leaves, folds, the wrap.
 

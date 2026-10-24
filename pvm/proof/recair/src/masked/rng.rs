@@ -1,5 +1,6 @@
-//! The masking's randomness (pin C's R4): hedged, so neither a replayed
-//! operating-system state nor a known witness alone fixes the masks.
+//! The masking's randomness (`proving.md` §5, R4): hedged, so neither a
+//! replayed operating-system state nor a known witness alone fixes the
+//! masks.
 //!
 //! Each attempt's stream is ChaCha20 seeded with
 //! `BLAKE2b-256("vos/mask/seed/v1" ‖ 32 OS bytes ‖ witness digest ‖ attempt as u32 LE)`,

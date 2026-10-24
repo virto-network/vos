@@ -6,19 +6,19 @@
 //!   number, configuration, masking, log sizes, trees' widths and DEEP
 //!   values; its preprocessed root; its bytes; FRI's rounds as the security
 //!   count takes them and as `FriVerifier::commit` derives them.
-//! - **Every masked field tampered** (spike 6a's 14 cases) is refused with
+//! - **Every masked field tampered** (14 cases) is refused with
 //!   an error, never a panic, as a proof and through its bytes; and a
 //!   verifier pinning another salt count or `R` refuses the proof.
 //! - **Cross-format proofs, both ways,** are refused as another format.
 //! - **The bytes:** truncations and a trailing byte refused.
 //! - **On the JAM-only host** the venue's refine program accepts it within
 //!   `format::MASKED_WRAP`'s gas, and refuses a tampered byte and other words.
-//! - **No hidden state** of the run is in any carrier of the proof (leakage
-//!   4).
-//! - **Under `heavy-gates`** (`just test-proof`): leakage 2, 3 and 5 on the
-//!   real wrap at 16 proofs a witness (32 in `just slice-gate`,
-//!   `LEAKAGE_WRAP_N`), and the verify gates (decode, verify and the PVF's
-//!   Wasm instructions) as the maximum over 12 seeds.
+//! - **No hidden state** of the run is in any carrier of the proof.
+//! - **Under `heavy-gates`** (`just test-proof`): witness
+//!   indistinguishability, uniformity and fresh randomness on the real wrap
+//!   at 16 proofs a witness (32 in `just slice-gate`, `LEAKAGE_WRAP_N`),
+//!   and the verify gates (decode, verify and the PVF's Wasm instructions)
+//!   as the maximum over 12 seeds.
 //!
 //! The real wrap's leakage power [est; exact for uniformity, simulated for
 //! the two-sample test]: at N = 32 the two-sample test finds only a field
@@ -588,7 +588,7 @@ impl Needle {
     }
 }
 
-/// Leakage 4: no hidden state of the run is in any carrier of its masked
+/// No hidden state of the run is in any carrier of its masked
 /// wrap (its fixed-layout bytes, its postcard encoding, its public words):
 /// neither the segment's step count (its final timestamp), its pcs, its
 /// registers but φ9..12 (the io-hash's, public), its memory roots and
@@ -803,30 +803,31 @@ mod heavy {
         })
     }
 
-    /// Leakage 2 on the real wrap: each published field of the two
-    /// witnesses' masked wraps alike; the unmasked control fails.
+    /// Witness indistinguishability on the real wrap: each published field of
+    /// the two witnesses' masked wraps alike; the unmasked control fails.
     #[test]
     fn heavy_the_masked_wraps_openings_do_not_depend_on_the_witness() {
         let [a, b] = witnesses();
-        let mut verdicts = Verdicts::new("leakage 2, the real wrap");
+        let mut verdicts = Verdicts::new("indistinguishability, the real wrap");
         indistinguishable(&mut verdicts, "6000/6001", &a.fields, &b.fields, n());
         verdicts.report();
         let refused = verdicts.refused();
         assert!(refused.is_empty(), "{:?}", &refused[..refused.len().min(8)]);
-        let mut control = Verdicts::new("leakage 2's control on the real wrap, unmasked");
+        let mut control =
+            Verdicts::new("indistinguishability's control on the real wrap, unmasked");
         indistinguishable(&mut control, "6000/6001", &a.unmasked, &b.unmasked, n());
         control.report();
         assert!(!control.refused().is_empty(), "the unmasked wrap passes");
     }
 
-    /// Leakage 3 on the real wrap: each published field of either witness's
+    /// Uniformity on the real wrap: each published field of either witness's
     /// proofs uniform over M31 (exact at N ≤ 64). Against a leak the two
     /// witnesses share, this is the real wrap's sharper test: at N ≤ 64 the
     /// two-sample test finds only a field nearly fixed by the witness.
     #[test]
     fn heavy_the_masked_wraps_openings_are_uniform() {
         let [a, b] = witnesses();
-        let mut verdicts = Verdicts::new("leakage 3, the real wrap");
+        let mut verdicts = Verdicts::new("uniformity, the real wrap");
         uniform(&mut verdicts, &a.fields, n());
         uniform(&mut verdicts, &b.fields, n());
         verdicts.report();
@@ -834,7 +835,7 @@ mod heavy {
         assert!(refused.is_empty(), "{:?}", &refused[..refused.len().min(8)]);
     }
 
-    /// Leakage 5 on the real wrap: two proofs of one witness share no
+    /// Fresh randomness on the real wrap: two proofs of one witness share no
     /// opening, nor do two witnesses' proofs from one seed.
     #[test]
     fn heavy_every_opening_of_the_masked_wrap_is_fresh() {

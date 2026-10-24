@@ -1,16 +1,16 @@
 //! The masking's statistical leakage gates on a small circuit
-//! (`docs/design/slice-6-on-chain.md`, "The masking's gates"), at N proofs
-//! a witness: 64 in `just check`; under `heavy-gates`, 500 in `just
-//! test-proof` and 2,000 in `just slice-gate` (`LEAKAGE_N`).
+//! (`docs/design/proving.md` §5), at N proofs a witness: 64 in
+//! `just check`; under `heavy-gates`, 500 in `just test-proof` and 2,000 in
+//! `just slice-gate` (`LEAKAGE_N`).
 //!
-//! - **Witness indistinguishability (leakage 2):** the honest prover's
+//! - **Witness indistinguishability:** the honest prover's
 //!   published values do not depend on the witness. N proofs of one
 //!   witness against N of another under the same public inputs (a zero
 //!   witness and a random one; two amounts differing by 1): per field a
 //!   two-sample χ² on 16 buckets of the value's top bits (4 at N ≤ 64), and one pooled
 //!   two-sample KS over every value. The control: the unmasked prover fails
 //!   the same test.
-//! - **Uniformity (leakage 3):** each field of the zero witness's N proofs
+//! - **Uniformity:** each field of the zero witness's N proofs
 //!   against uniform M31, one-sample χ² (exact at N ≤ 64).
 //!
 //! Their power [est; simulated at N = 2,000, scaled to other N by √N]: at
@@ -222,20 +222,20 @@ fn the_statistics_are_calibrated() {
     assert!((tail[0] - 1.0).abs() < 1e-9, "{}", tail[0]);
 }
 
-/// Leakage 2: the masked prover's published values do not depend on the
-/// witness, for the zero witness against a random one and for two amounts
-/// differing by 1; the unmasked prover fails the same test.
+/// Witness indistinguishability: the masked prover's published values do
+/// not depend on the witness, for the zero witness against a random one and
+/// for two amounts differing by 1; the unmasked prover fails the same test.
 #[test]
 fn the_masked_openings_do_not_depend_on_the_witness() {
     let [zero, random, amount] = witnesses();
-    let mut verdicts = Verdicts::new("leakage 2, the small circuit");
+    let mut verdicts = Verdicts::new("indistinguishability, the small circuit");
     indistinguishable(&mut verdicts, "zero/random", zero, random, n());
     indistinguishable(&mut verdicts, "amount/amount+1", random, amount, n());
     verdicts.report();
     let refused = verdicts.refused();
     assert!(refused.is_empty(), "{:?}", &refused[..refused.len().min(8)]);
 
-    let mut control = Verdicts::new("leakage 2's control, unmasked");
+    let mut control = Verdicts::new("indistinguishability's control, unmasked");
     indistinguishable(
         &mut control,
         "zero/random",
@@ -247,12 +247,12 @@ fn the_masked_openings_do_not_depend_on_the_witness() {
     assert!(!control.refused().is_empty(), "the unmasked prover passes");
 }
 
-/// Leakage 3: each published field of the zero witness's masked proofs is
+/// Uniformity: each published field of the zero witness's masked proofs is
 /// uniform over M31.
 #[test]
 fn the_masked_openings_are_uniform() {
     let [zero, ..] = witnesses();
-    let mut verdicts = Verdicts::new("leakage 3, the small circuit");
+    let mut verdicts = Verdicts::new("uniformity, the small circuit");
     uniform(&mut verdicts, zero, n());
     verdicts.report();
     let refused = verdicts.refused();

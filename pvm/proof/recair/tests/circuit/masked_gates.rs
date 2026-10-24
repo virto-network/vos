@@ -1,11 +1,9 @@
-//! The masking's soundness and leakage gates (`docs/design/slice-6-on-chain.md`,
-//! "The masking's gates"; `research/slice-5/spike2-masking.md` §5, as `research/slice-5/masking-review.md`
-//! amends it) on small circuits of the recursion AIR, each proof verified
-//! by the final verifier's masked verifier over the set and channel it was
-//! proved on. The gates the earlier steps hold are theirs: the degree
-//! audit (`masked.rs`), the mask invariant and R1's refusal
-//! (`masked_prover.rs`), each masked field tampered and both bit counts
-//! (`format::MASKED_WRAP`'s own tests).
+//! The masking's soundness and leakage gates (`docs/design/proving.md` §5)
+//! on small circuits of the recursion AIR, each proof verified by the final
+//! verifier's masked verifier over the set and channel it was proved on.
+//! The gates other files hold are theirs: the degree audit (`masked.rs`),
+//! the mask invariant and R1's refusal (`masked_prover.rs`), each masked
+//! field tampered and both bit counts (`format::MASKED_WRAP`'s own tests).
 //!
 //! **Soundness:** masked proofs verify at every size, alone and mixed, on
 //! both channels (Blake2b-256 and Poseidon2-M31); a broken constraint on
@@ -15,11 +13,12 @@
 //! and the blinding cannot cancel it; a malformed proof is an error, never
 //! a panic.
 //!
-//! **Leakage:** R1 checks every column class on every proof (1); every
-//! opening is fresh, and a replayed seed draws other masks for another
-//! witness (5); a right guess reproduces an unblinded claimed sum, never a
-//! blinded one (6); a proof's shape is the format's and its coins' (7).
-//! Leakage 2 and 3 are `leakage.rs`'s; 4 the real wrap's.
+//! **Leakage:** R1 checks every column class on every proof; every opening
+//! is fresh, and a replayed seed draws other masks for another witness; a
+//! right guess reproduces an unblinded claimed sum, never a blinded one; a
+//! proof's shape is the format's and its coins'. Witness
+//! indistinguishability and uniformity are `leakage.rs`'s; no hidden state
+//! in a carrier, the real wrap's.
 
 use std::collections::BTreeSet;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -251,9 +250,9 @@ where
     assert_eq!(stats.attempts, 1, "{name}");
 }
 
-/// Soundness 2 and 6, leakage 1: a masked proof verifies at every size,
-/// each component alone at `2^8` to `2^12` rows and mixed in one proof, on
-/// both channels; R1 checks every column class of each.
+/// Masked acceptance, lifting and the rank: a masked proof verifies at
+/// every size, each component alone at `2^8` to `2^12` rows and mixed in
+/// one proof, on both channels; R1 checks every column class of each.
 #[test]
 fn masked_proofs_verify_at_every_size_on_both_channels() {
     for (seed, &log_sizes) in SIZES.iter().enumerate() {
@@ -263,7 +262,7 @@ fn masked_proofs_verify_at_every_size_on_both_channels() {
     }
 }
 
-/// Soundness 2 above the SIMD backend's `2^16`: `p2` at `2^17` rows, the
+/// Masked acceptance above the SIMD backend's `2^16`: `p2` at `2^17` rows, the
 /// others below, on both channels.
 #[cfg(feature = "heavy-gates")]
 #[test]
@@ -382,10 +381,10 @@ fn input_plus_one(main: &mut MainTrace, row: usize) {
     }
 }
 
-/// Soundness 3: one broken constraint on the first row, the last row and
-/// the wrap row of each component is refused by the prover's own check,
-/// and a proof forced past it by the verifier's out-of-domain check. A
-/// `qm31` row is broken on padding rows turned to both ends, so that no
+/// A constraint tampered: one broken constraint on the first row, the last
+/// row and the wrap row of each component is refused by the prover's own
+/// check, and a proof forced past it by the verifier's out-of-domain check.
+/// A `qm31` row is broken on padding rows turned to both ends, so that no
 /// relation entry moves. The wrap row: the `p2` rows turned so that row 0
 /// is chained and reads the last row across the domain's end, which an
 /// honest proof keeps; then row 0's permutation recomputed from another
@@ -489,7 +488,7 @@ impl MaskedComponents for Unlifted {
     }
 }
 
-/// Soundness 6: the preprocessed columns verify at `n + 1`, as the prover
+/// Lifting: the preprocessed columns verify at `n + 1`, as the prover
 /// commits them; a verifier laying them at `n` refuses the proof, with an
 /// error.
 #[test]
@@ -524,14 +523,13 @@ fn linear_row(circuit: &Circuit) -> (usize, BaseField) {
         .expect("a linear row")
 }
 
-/// Soundness 8 (R2): a witness whose every row holds but whose relation
-/// does not balance (one `qm31` row reads `a + 1` and yields its output
-/// accordingly) proves, and the verifier refuses its logup total. A prover
-/// that sets its blinding to cancel the imbalance at the drawn challenges
-/// is refused by its own check, and a proof forced past it by the
-/// verifier's out-of-domain check, its total balanced: the blinding
-/// columns are committed before the challenges, so they cannot follow
-/// them.
+/// The blinding's soundness (R2): a witness whose every row holds but whose
+/// relation does not balance (one `qm31` row reads `a + 1` and yields its
+/// output accordingly) proves, and the verifier refuses its logup total. A
+/// prover that sets its blinding to cancel the imbalance at the drawn
+/// challenges is refused by its own check, and a proof forced past it by
+/// the verifier's out-of-domain check, its total balanced: the blinding
+/// columns are committed before the challenges, so they cannot follow them.
 #[test]
 fn an_unbalanced_relation_cancelled_by_the_blinding_is_refused() {
     let finalized = circuit(13);
@@ -609,7 +607,7 @@ fn drawn_relation<MC: MerkleChannel>(format: &Format, proof: &Proof<MC>) -> Gate
     GateRelation::draw(&mut channel)
 }
 
-/// Soundness 9: a proof malformed in any field of its structure is refused
+/// The structure: a proof malformed in any field of its structure is refused
 /// with an error, never a panic: a tree, a column, a sample, a queried
 /// value, a witness hash or a FRI layer more or fewer, another last layer,
 /// claimed sums or log sizes of another count, another configuration.
@@ -859,7 +857,7 @@ fn a_malformed_proof_is_an_error_never_a_panic() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Leakage 5: two proofs of one witness differ in every opening; and a
+/// Fresh randomness: two proofs of one witness differ in every opening; and a
 /// replayed seed with two witnesses (amounts differing by 1) differs in
 /// every opening, its masks drawn from the witness's digest too.
 #[test]
@@ -890,7 +888,7 @@ fn every_opening_is_fresh() {
     eprintln!("{n} openings of one witness, {m} of two from one seed: none shared");
 }
 
-/// Leakage 6: the claimed sums' control. Unblinded (`format::WRAP`'s
+/// The claimed sums' control. Unblinded (`format::WRAP`'s
 /// parameters, unmasked), the sums a right guess of the witness computes
 /// at the proof's relation are the proof's; blinded, none is, though their
 /// total is (the blinding sums to zero).
@@ -1074,12 +1072,13 @@ where
     }
 }
 
-/// Leakage 7: a proof's shape is public, the format's and its Fiat–Shamir
-/// coins' alone: every length its layout varies by (each column's queried
-/// values, each tree's and FRI layer's witness hashes, FRI's witness
-/// values) is what its own query positions give, counted for an all-zero
-/// witness, for proofs of a zero witness and of a random one alike; every
-/// other count is the format's pin (`check_shape`, `format::MASKED_WRAP`'s own tests).
+/// The shape public: a proof's shape is public, the format's and its
+/// Fiat–Shamir coins' alone: every length its layout varies by (each
+/// column's queried values, each tree's and FRI layer's witness hashes,
+/// FRI's witness values) is what its own query positions give, counted for
+/// an all-zero witness, for proofs of a zero witness and of a random one
+/// alike; every other count is the format's pin (`check_shape`,
+/// `format::MASKED_WRAP`'s own tests).
 #[test]
 fn the_shape_is_the_format_and_the_coins() {
     let format = format();

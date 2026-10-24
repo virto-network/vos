@@ -1,5 +1,5 @@
-//! R1 (`docs/design/research/slice-5/masking-review.md` §1.1, pin C): the randomizer's revealed
-//! functionals have full row rank over M31, checked on the transcript.
+//! R1 (`docs/design/proving.md` §5): the randomizer's revealed functionals
+//! have full row rank over M31, checked on the transcript.
 //!
 //! A masked column `f + v_H·r` reveals linear functionals of `r`'s `h`
 //! coefficients: four M31 rows for each out-of-domain sample, one for each

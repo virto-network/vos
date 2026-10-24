@@ -1,7 +1,7 @@
 //! The masked prover: masking variant (c) (`docs/design/proving.md` §5,
-//! `research/slice-5/masking-review.md`), over any component set
-//! ([`MaskedComponents`]) and any Merkle channel, in pin B's order
-//! (`docs/design/slice-6-on-chain.md`):
+//! R1–R8), over any component set ([`MaskedComponents`]) and any Merkle
+//! channel, in the masked transcript's order
+//! (`vos_pvm_final_verifier::masked`):
 //!
 //! 1. the header, at the format's number and configuration, and the log
 //!    sizes;
