@@ -4000,3 +4000,104 @@ light node lets agents call agents on JAM later, once extensions exist
   (no operator path to a venue) is resolved by the decision: venues
   attach through extensions, and no `vos node run` venue option comes in
   this slice; `core-model.md` §18.
+
+## 6.22, the slice-5 rest
+
+The plan's 6.22 list, items 1–21 and 23 (item 22, the store layout
+version, is a later step's), each checked against the code at
+`e21e25b0` and folded as its own behaviour-preserving commit. After every
+commit that touches the AIR, the prover, the verifier or the recursion,
+the fixtures' stale test and the constants' (`kernel fixtures::`,
+`kernel constants::`: every fixture byte, `WINDOW_PROGRAM`,
+`BALANCE_PROGRAM`, `PREDICATE_PROGRAM`, `H_FOLD`, the wrap roots) ran
+green: proof bytes and program ids are unchanged throughout.
+
+| # | Item | Commit |
+|---|---|---|
+| 1 | the chip indices one table, `vos_wire::records::segment_chip`, that `chips!` is checked against and the compiler's `shape::chip` is | `b41e8c6e` |
+| 2 | R5's rest: `RowTrace`, the row view over a `ComponentTrace`, derived beside `Row`; the program-memory tuple and the flag bytes' bits as tables both sides read (`PROGRAM_MEMORY`, `FLAG_BYTES`), the constraints' expressions built in their old order | `81f8f575` |
+| 3 | `observed_step` | gone at 6.9 |
+| 4 | one `chips_of_mask` | `4c3deb15` |
+| 5 | `preprocessed_root` and `twiddles_for` shared by the program commitment, the prover and the verifier's preprocessed check; the prover mixes `mix_statement_header`; recair's twiddles once (`committed_log_sizes` was recair-air's since 5.16c) | `d22f44ff` |
+| 6 | the CPU's relations an owned `Lookups` implementing `ComponentLookupElements`, drawn in its field order | `4d9c2051` |
+| 7 | Blake2b's `Column` and `BoundaryColumn` and their `CompressionColumns` from one `compression_columns!` (the shared variants checked equal, size and mask, before) | `a7a8b2c3` |
+| 8 | `classify_opcode` as `flags!` literals, the category flags derived after the match; a test holds all 139 opcodes to the old table | `830ba93a` |
+| 9 | `CPU_DUMP` a generic `TraceBuilder::dump` over `ALL_VARIANTS` | `4e6a360e` |
+| 10 | one `check_continuity` (`proof::check_continuity`): the verifier crate's two loops and `verify_chain`'s; the third was `verify_chain_standalone_allowlist`'s, deleted at 5.16b | `7a2b423e` |
+| 11 | `pub(crate)` for recair's, poseidon2's and the compiler's items with no outside user (`h8_into` and `constant_point`, then dead, deleted; `oversized` inlined); kept `pub`: recair's `lane_sum` and `preprocessed_root_on` and poseidon2's `pow_passes`, which recair's tests call. `verify/recursion.rs` stays: the proof crate's own kernel tests use it, and it reads the crate's private transcript prefix | `a2c538fe`, `c2412e0d`¹ |
+| 12 | `ProveRequest` for the prove chain; `BuiltInProverComponent`'s main trace the `_min` pair alone; `statement_header_words` for recair's fake `Channel` | `62321376` |
+| 13 | `Blake2bRecord` as `Blake2bCall`; `P2Hash` ↔ `Digest` by `From`; `BLAKE2B_CALL_REGS`; one 28-bit ordering decomposition (`chips::ordering`); `refine_codec`'s copies gone at 6.9 | `e3243ba8` |
+| 14 | `Phi10/11/12/7` as `HPtr/MPtr/TLow/Flag`, their helpers with them | `61e74e7f` |
+| 15 | format numbers in comments named by their `format::` constants (162 lines; `format.rs`, which defines them, and string literals left) | `3b84548c` |
+| 16 | stale docs: the cited files moved or never landed (`masking-review.md`, `ledger-read-consistency.md`, the Stwo issue draft), the component mask's zero; the rest of review item 32 gone at 5.16b | `36022c31` |
+| 17 | the 63 banner lines; the chips' `alloc` imports through a crate prelude | `4584ae3c` |
+| 18 | the small idioms but one (below) | `a3381ff9` |
+| 19 | `Derived::derivation` for the five installs; `leaf::deep`, `derive::kernel`, `compile::program::lower`, `DeepPlan::new` and `verify_rest` split, each in its order (`verify_refine_bundle_authenticated` gone at 6.9) | `6734ee95`, `9fef7c7f` |
+| 20 | the relabel seam of formats 18 and 19 with its test; the fuzz mutations' `Resize`, `final_verifier_mutate`'s corpus regenerated | `854083f1`, `c77445d5`², `bace1660` |
+| 21 | the runtime's observed refine path (`run_observed`, its observation types, `invoke_observed`, `continue_observed`, the observer through `dispatch`; `resume_observed` and `Interpreter::run_observed` kept); `with_stack!`'s Blake2s arm to `$unbuilt`; `spikes/s5-attestable` and `spikes/s5-precompile/harness` deleted | `d3d852ac`, `8cbc0917`, `8eb3a2c9` |
+| 23 | the venue guests' allocator a bump (below) | `64b12b0d` |
+
+¹ `verify_rest`, now the crate's, named in the public docs, not linked.
+² The transcript's re-exports, which the seam's removal had left behind
+its `cfg(feature = "prover")`, ungated again for the verifier-only build.
+
+**Carried:**
+- **18's `array::from_fn` in `agent/tree/src/hash.rs`:** the guest's code
+  changes with it (the branch hash), and with it the window, balance,
+  reader and accounts kernels: `WINDOW_PROGRAM` and `BALANCE_PROGRAM`
+  move. It waits for a step that re-pins program ids. (The rest of the
+  item's guest edits were laid out so no line moves under a panic site:
+  a panic's location is part of the guest's bytes.)
+- **18's `leaf_terms` constants, in part:** the transcript's terms are
+  named (`HEADER_WORDS`, `ROOTS_AND_BOUNDARY`, `COMPOSITION_STEPS`,
+  `DEEP_COEFFICIENT`, `LAST_LAYER`), and the proof-of-work and context
+  rows; the per-query offsets (`4L − 5` circle rows, `6F − 2` FRI rows,
+  OODS's `+ 13`, the shape's `+ 2`) stay as written until each is traced
+  to its piece of recair's verifier.
+
+**Notes on the folds:** the precompiles crate's feature dropped changes
+the guests' ELF bytes (crate metadata) but not their derived programs; the
+constraint-side table for the flag bytes builds its sums in the order the
+hand-written tuples did, since the leaf circuits are compiled from the
+constraints' expressions in their creation order (the program ids are the
+guard); `final_verifier_mutate`'s corpus [measured]: 300 s without a
+sanitizer seeded from the old 200 inputs (45,895 runs, no crash), merged,
+then an edge set cover: 189 inputs of at most 803 B, 3,638 edges (the old
+200 reach 3,281 under the new type).
+
+**The decode's allocator (item 23)** [measured, the `valid` fixture, a
+146,564 B format-39 proof, by a words request on the JAM-only host,
+`final-verify.elf`]. At `e21e25b0` the decode is 1.81M gas, not 6.4's
+3.7M: later steps took the rest. The guests' allocator was power-of-two
+classes with free lists and page runs, its class a software
+count-leading-zeros on RV64EM; a bump over the same 64 MiB arena, a freed
+block reclaimed when it is the last and a realloc at the top in place:
+
+| | before | pure bump (trial) | bump, last block reclaimed |
+|---|---|---|---|
+| total | 83,970,562 | 79,509,867 | **79,305,353** (−5.6%) |
+| lookup | 84,230 | 50,210 | 50,158 |
+| decode | 1,810,081 | 1,537,149 | **1,499,751** (−17.1%) |
+| verify | 82,076,046 | 77,922,303 | **77,755,239** (−5.3%) |
+| allocations | 7,969 | 7,427 | 7,426 |
+| heap peak live | 386,114 | 380,378 | 380,378 |
+| high-water | 980,032 | 1,433,872 | 1,301,368 |
+
+The statements service (`statement-service.elf`, the same runtime):
+`valid`'s refine 84.12M → 79.41M gas, accumulate 116,512 → 108,334;
+`rootless` 83.78M → 79.09M; an anchor's refine 3.10M → 3.09M, accumulate
+123,692 → 110,919. An invocation verifies one proof or applies one
+block's operands, so a reclaim only at the top costs at most the 0.3 MiB
+of high-water above. The decode's remaining 1.5M is its copies and its
+reads, not the allocator.
+
+**Gates** [measured, at `c77445d5`]: `just check` green but for one
+test seen failing once under load,
+`cluster::liveness::an_install_at_a_stalled_leader_times_out`
+(`Err(NotLeader(None))`: the leader changed under the stalled commit),
+green on its rerun (`cluster` 111 of 111), then the check's node suites
+rerun whole with `--no-fail-fast`, 552 passed in 42 suites, and
+`test-reads` 7 of 7; the rest of the check 1,072 passed in 79 suites
+before that stage, the fuzz replay and every build and lint among it.
+`just test-proof` green: 562 passed in 47 suites, the heavy recair gates
+and the carriers among them.
