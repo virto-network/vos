@@ -321,23 +321,19 @@ impl PcsStack for P2MerkleChannel {
 }
 
 /// Run `$body` with `$stack` the [`PcsStack`] of channel `$channel`, or
-/// evaluate `$unbuilt` for a channel no stack implements yet.
+/// evaluate `$unbuilt` for a channel no segment format names.
 #[macro_export]
 #[doc(hidden)]
 macro_rules! with_stack {
     ($channel:expr, $stack:ident => $body:expr, unbuilt => $unbuilt:expr $(,)?) => {
         match $channel {
-            $crate::format::ChannelKind::Blake2s => {
-                type $stack = ::stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
-                $body
-            }
             $crate::format::ChannelKind::Poseidon2M31 => {
                 type $stack = $crate::poseidon2::P2MerkleChannel;
                 $body
             }
-            $crate::format::ChannelKind::Blake2sM31 | $crate::format::ChannelKind::Blake2b256 => {
-                $unbuilt
-            }
+            $crate::format::ChannelKind::Blake2s
+            | $crate::format::ChannelKind::Blake2sM31
+            | $crate::format::ChannelKind::Blake2b256 => $unbuilt,
         }
     };
 }
