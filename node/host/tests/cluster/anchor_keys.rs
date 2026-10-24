@@ -242,7 +242,7 @@ fn waiting_anchors_survive_a_failover_through_a_long_wait() {
 /// registers the new key, cannot resume while the equivocating key is
 /// registered, and removes it. The window that closes while the space is
 /// suspended waits, unanchored; once resumed, it is anchored by the new key,
-/// then the next.
+/// then the next, and the disputed window never again.
 #[test]
 fn a_single_founder_resumes_after_an_equivocation() {
     let (anchoring, mut cluster, clock, representative) = space(1);
@@ -276,15 +276,19 @@ fn a_single_founder_resumes_after_an_equivocation() {
     closed(&anchoring, &cluster, &clock, (1, representative), 1);
     assert_eq!(
         windows(&anchoring, &cluster),
-        [0],
-        "suspended: window 1 waits"
+        [] as [u64; 0],
+        "window 0 disputed; suspended: window 1 waits"
     );
     assert!(venue.resume(&space));
     assert_eq!(anchored(&anchoring, &cluster, &clock, 2).signer, rotated);
     assert!(!venue.suspended(&space));
     let anchors = venue.anchors(&space);
-    assert_eq!(windows(&anchoring, &cluster), [0, 1, 2]);
-    assert_eq!(anchors[1].signer, rotated);
+    assert_eq!(
+        windows(&anchoring, &cluster),
+        [1, 2],
+        "window 0 never counts again"
+    );
+    assert_eq!(anchors[0].signer, rotated);
 }
 
 /// A node that did not found the space replicates the representative once

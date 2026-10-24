@@ -1,4 +1,4 @@
-//! The anchors' vectors: G3–G5 and G17.
+//! The anchors' vectors: G3–G5, G17 and G19.
 
 use parity_scale_codec::Encode;
 
@@ -244,5 +244,65 @@ pub(super) fn g17(fx: &Fixtures) -> Vector {
         "on_idle: at B_w + MaxRootAge of F's newest root, only older anchors pruned; one ms \
          later its anchor and the rooted Seen entry pruned, the rootless entry kept, Last and \
          Equivocations kept",
+    )
+}
+
+pub(super) fn g19(fx: &Fixtures) -> Vector {
+    let mut w = World::new(fx, false);
+    w.anchor_f();
+    let add = |who, seed| Call::AddAuthority {
+        space: F,
+        who,
+        anchor_key: Some(public(seed)),
+    };
+    w.controller(add(AUTHORITY_1, KEY_1), Expect::Ok);
+    w.begin();
+    let disputed = fx.statement().roots[0];
+    let window = disputed.window;
+    // A second listed key signs another root of a window held.
+    let outcome = w.anchor(AUTHORITY_1, F, window, root(0x0b), KEY_1, Expect::Ok);
+    assert!(matches!(
+        outcome.events[..],
+        [Event::Equivocated { first, second, .. }, Event::SpaceSuspended { .. }]
+            if first == disputed.root && second == root(0x0b)
+    ));
+    assert!(!w.has(&keys::anchors(&F, 0, window)), "the disputed root");
+    // Both signers removed, a fresh key listed, the space resumed.
+    let remove = |who| Call::RemoveAuthority { space: F, who };
+    w.controller(remove(AUTHORITY_1), Expect::Ok);
+    w.controller(remove(AUTHORITY_F), Expect::Ok);
+    w.controller(add(AUTHORITY_2, KEY_5), Expect::Ok);
+    w.controller(Call::Resume { space: F }, Expect::Ok);
+    // The statement over the disputed window's first root: unanchored.
+    let statement = fx.statement().encode();
+    w.refused_by(
+        AUTHORITY_2,
+        statement,
+        fx.proof.clone(),
+        vos_statement::Refusal::Unanchored.code(),
+    );
+    // Neither root is anchored at the window again.
+    for again in [disputed.root, root(0x0b)] {
+        w.anchor(
+            AUTHORITY_2,
+            F,
+            window,
+            again,
+            KEY_5,
+            Expect::Err(Error::WindowNotAfterLast),
+        );
+    }
+    // The space anchors on from the window after its last.
+    let next = 43;
+    w.at(F_CLOCK.boundary(next).unwrap());
+    let outcome = w.anchor(AUTHORITY_2, F, next, root(0x43), KEY_5, Expect::Ok);
+    assert!(matches!(outcome.events[..], [Event::Anchored { .. }]));
+    w.finish(
+        "G19",
+        "after resume, a disputed window stays unusable: a second root of F's window held \
+         (Equivocated, SpaceSuspended) drops the window's anchor; both signers removed, a fresh \
+         key listed, resumed; the statement over the window's first root refused 5 \
+         (Unanchored), either root anchored again refused (WindowNotAfterLast); the next \
+         window anchored",
     )
 }

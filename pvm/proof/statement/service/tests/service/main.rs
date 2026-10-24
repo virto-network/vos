@@ -2,7 +2,8 @@
 //! `just check-no-std`) on the JAM-only host, refine and accumulate, each
 //! item a work package's: a proof read from a 256 KiB extrinsic; every
 //! golden fixture judged as every venue judges it; registrations, anchors
-//! (an unregistered key, an equivocation), migrations; and the rows aging
+//! (an unregistered key, an equivocation, a resume that never restores a
+//! disputed root), migrations; and the rows aging
 //! out past `MaxRootAge`, a rootless statement's `Seen` entry never.
 
 #[path = "../../../tests/support/jam.rs"]
@@ -117,6 +118,75 @@ fn a_suspended_spaces_roots_go_dark() {
         vec![valid.proof.clone()],
     );
     assert_eq!(code, Refusal::Unanchored.code());
+}
+
+/// A listed key stolen anchored the valid statement's first root, and the
+/// space's own key anchors another root there: the evidence suspends the
+/// space and drops the window's anchor. Once the controller removes both
+/// keys, lists a rotated one and resumes it, neither root counts again:
+/// the statement over the first is refused as unanchored, either root
+/// anchored again is refused for its window, and the space anchors from
+/// the window after its last.
+#[test]
+fn a_resumed_space_never_counts_a_disputed_root() {
+    let valid = fixture("valid");
+    let mut rig = fixture_rig(&valid);
+    let statement = &valid.input.statement;
+    let space = statement.space;
+    let (controller, honest, stolen, rotated) = (key(0xc0), key(1), key(2), key(3));
+    let public = |key: &SigningKey| key.verifying_key().to_bytes();
+    let disputed = statement.roots[0];
+    let mut record = rig.space(&space).unwrap();
+    record.controller = public(&controller);
+    record.keys = vec![public(&honest), public(&stolen)];
+    record.last = statement.roots.iter().map(|root| root.window).max();
+    rig.storage
+        .write(&keys::space(&space), Some(&record.encode()));
+    let at = keys::anchor(&space, disputed.kind, disputed.window);
+    let held = state::AnchorRecord {
+        root: disputed.root,
+        signer: public(&stolen),
+    };
+    rig.storage.write(&at, Some(&held.encode()));
+    let anchor_of = |rig: &Rig, window: u64, root: [u8; 32], signer: &SigningKey| {
+        let mut anchor = Anchor {
+            space,
+            window,
+            kind: RootKind::Space,
+            root,
+            signer: public(signer),
+            signature: [0; 64],
+        };
+        anchor.signature = signer.sign(&anchor.digest(&rig.venue())).to_bytes();
+        Item::Anchor(anchor).encode()
+    };
+    let code = |rig: &mut Rig, payload| rig.code(payload, Vec::new());
+
+    let other = anchor_of(&rig, disputed.window, [0xee; 32], &honest);
+    assert_eq!(code(&mut rig, other), AnchorCode::Equivocation as u32);
+    assert!(rig.storage.read(&at).is_none(), "the disputed root dropped");
+    let ops = [
+        Op::RemoveKey(public(&stolen)),
+        Op::RemoveKey(public(&honest)),
+        Op::AddKey(public(&rotated)),
+        Op::Resume,
+    ];
+    for (nonce, op) in ops.into_iter().enumerate() {
+        let payload = control(&rig, &space, nonce as u64, op, &controller);
+        assert_eq!(code(&mut rig, payload), ControlCode::Done as u32, "{op:?}");
+    }
+    assert!(!rig.space(&space).unwrap().suspended);
+
+    let refused = rig.code(submit(&statement.encode()), vec![valid.proof.clone()]);
+    assert_eq!(refused, Refusal::Unanchored.code());
+    for root in [disputed.root, [0xee; 32]] {
+        let payload = anchor_of(&rig, disputed.window, root, &rotated);
+        assert_eq!(code(&mut rig, payload), AnchorCode::Window as u32);
+    }
+    let next = record.last.unwrap() + 1;
+    rig.at(record.clock.boundary(next).unwrap());
+    let payload = anchor_of(&rig, next, [0x0f; 32], &rotated);
+    assert_eq!(code(&mut rig, payload), AnchorCode::New as u32);
 }
 
 /// An item that does not decode, a statement that does not, and one past

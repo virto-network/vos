@@ -154,7 +154,7 @@ fn an_equivocation_is_caught() {
         f.venue.anchor(&f.anchor(4, 1, 0)),
         Err(AnchorRefusal::Suspended)
     );
-    assert_eq!(f.venue.anchors(&f.space), [first]);
+    assert!(f.venue.anchors(&f.space).is_empty(), "the disputed root");
 }
 
 /// A statement is judged against the venue's anchors: a program it pinned
@@ -260,7 +260,8 @@ fn anchor_keys_are_added_and_removed() {
 }
 
 /// A suspended space resumes only once neither equivocating key is
-/// registered: its evidence cleared, it anchors again by another key.
+/// registered: its evidence cleared, it anchors again by another key from
+/// the next window, and the disputed window's roots never count again.
 #[test]
 fn a_suspended_space_resumes_without_its_equivocating_keys() {
     let f = fixture();
@@ -286,5 +287,10 @@ fn a_suspended_space_resumes_without_its_equivocating_keys() {
     anchor.signer = rotated.verifying_key().to_bytes();
     anchor.signature = rotated.sign(&anchor.digest(&VENUE)).to_bytes();
     assert_eq!(f.venue.anchor(&anchor), Ok(Anchored::New));
-    assert!(f.venue.anchored(&f.read(3, 1)), "the first root held");
+    assert!(!f.venue.anchored(&f.read(3, 1)), "the first root disputed");
+    assert!(!f.venue.anchored(&f.read(3, 2)), "the second root disputed");
+    let mut again = f.anchor(3, 1, 0);
+    again.signer = rotated.verifying_key().to_bytes();
+    again.signature = rotated.sign(&again.digest(&VENUE)).to_bytes();
+    assert_eq!(f.venue.anchor(&again), Err(AnchorRefusal::Window));
 }

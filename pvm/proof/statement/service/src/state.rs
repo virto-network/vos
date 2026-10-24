@@ -4,7 +4,7 @@
 //! | key | value |
 //! |---|---|
 //! | `0x01 ‖ space` | [`SpaceRecord`]: its clock, controller, anchor keys, range, last window anchored, suspension and its equivocators, its controls' nonce |
-//! | `0x02 ‖ space ‖ kind ‖ w (8, BE)` | [`AnchorRecord`]: the root anchored and its signer |
+//! | `0x02 ‖ space ‖ kind ‖ w (8, BE)` | [`AnchorRecord`]: the root anchored and its signer; dropped once another root's evidence disputes it |
 //! | `0x03 ‖ statement id` | a `Seen` entry: the venue time it expires at (8, LE), `u64::MAX` never |
 //! | `0x04 ‖ space ‖ kind ‖ w (8, BE)` | [`Evidence`]: the root held and the other, each with its signer |
 //! | `0x05 ‖ outcome id` | [`Outcome`]: what became of an item, by [`outcome_id`]: its package's and its payload's hashes |

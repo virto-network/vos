@@ -1,4 +1,4 @@
-//! G1–G18 through the node's client: each vector's calls decoded and
+//! G1–G19 through the node's client: each vector's calls decoded and
 //! encoded again by the client's own types ([`calls`]), sent by its
 //! [`Sender`] through the transport over the mock, and what came back read
 //! by the client: the result from its decode of the dispatch error, the

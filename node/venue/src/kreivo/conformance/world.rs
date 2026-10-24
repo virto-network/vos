@@ -354,7 +354,18 @@ impl<'f> World<'f> {
     /// `statement` submitted by `F`'s authority with `proof`: refused with
     /// `code`, and its deposit forfeited unless it is a repeat.
     pub(super) fn refused(&mut self, statement: Vec<u8>, proof: Vec<u8>, code: u32) {
-        let outcome = self.submit(AUTHORITY_F, F, statement, proof, Expect::Ok);
+        self.refused_by(AUTHORITY_F, statement, proof, code);
+    }
+
+    /// [`World::refused`], submitted by `by`, an authority of `F`.
+    pub(super) fn refused_by(
+        &mut self,
+        by: AccountId,
+        statement: Vec<u8>,
+        proof: Vec<u8>,
+        code: u32,
+    ) {
+        let outcome = self.submit(by, F, statement, proof, Expect::Ok);
         let forfeited = code != vos_statement::Refusal::Repeated.code();
         match &outcome.events[..] {
             [Event::Refused { code: got, .. }] => assert!(!forfeited && *got == code),

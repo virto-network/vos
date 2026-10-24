@@ -165,6 +165,9 @@ pub(crate) enum Broken {
     /// An accepted submit's released deposit not credited back to its
     /// window's budget.
     CreditBack,
+    /// An equivocation's window keeps its first root anchored, which a
+    /// resume reinstates.
+    DisputedRootKept,
 }
 
 pub(super) type Dispatched = Result<(), DispatchError>;
@@ -194,6 +197,16 @@ impl Chain {
     #[cfg(test)]
     fn is_broken(&self, broken: Broken) -> bool {
         self.broken == Some(broken)
+    }
+
+    /// Whether an equivocation's window keeps its first root anchored:
+    /// never, but in a pallet broken so.
+    pub(super) fn keeps_disputed_root(&self) -> bool {
+        #[cfg(test)]
+        if self.is_broken(Broken::DisputedRootKept) {
+            return true;
+        }
+        false
     }
 
     /// Whether `active` holds now.

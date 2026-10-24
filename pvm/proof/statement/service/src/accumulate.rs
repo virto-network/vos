@@ -11,12 +11,14 @@
 //! - **An anchor**, the anchor rule as the model venue applies it: a
 //!   registered, unsuspended space; a signer among its anchor keys; the
 //!   same root at its window again taken as a repeat, another root kept as
-//!   evidence and the space suspended; `Last < w`, w within its range;
-//!   `w < now_w`; `now − B_w ≤ MaxRootAge`.
+//!   evidence, the space suspended and the window's anchor dropped, so
+//!   neither root counts again, a resume restoring neither; `Last < w`, w
+//!   within its range; `w < now_w`; `now − B_w ≤ MaxRootAge`.
 //! - **A control:** the signer the space's controller, its nonce the
 //!   space's next; a key added (at most `MAX_FOUNDING_KEYS`) or removed, a
-//!   resume once neither signer of any equivocation is listed, or another
-//!   controller.
+//!   resume once neither signer of any equivocation is listed (the space
+//!   anchors again from the window after its last, every disputed window
+//!   unanchored for good), or another controller.
 //! - **A statement** refine accepted: every root anchored (its space
 //!   registered and unsuspended, the window within its range and no older
 //!   than `MaxRootAge`, the root the one held), then unseen, then recorded
@@ -280,6 +282,7 @@ fn anchor(
         if storage.read(&at).is_none() {
             storage.write(&at, Some(&evidence.encode()));
         }
+        storage.write(&keys::anchor(space, kind, window), None);
         record.suspended = true;
         for signer in [held.signer, signed.signer] {
             if !record.equivocators.contains(&signer) {

@@ -5,7 +5,8 @@
 //! `Last < w < now_w`; the root no older than `MaxRootAge`; the window
 //! within the space's range here, which a migration away ends) and `judge`.
 //! A second root for one `(space, kind, w)` is kept as evidence and
-//! suspends the space. Its anchor keys are kept by space, the founding ones
+//! suspends the space, and the window's anchor is dropped: neither root
+//! counts again, after a resume as before it. Its anchor keys are kept by space, the founding ones
 //! first, added and removed as `spaces-pallet.md`'s controller does, and
 //! `resume` lifts a suspension once neither equivocating key is registered.
 
@@ -290,6 +291,11 @@ impl VenueClient for ModelVenue {
                 return Ok(Anchored::Again);
             }
             state.evidence.push((*held, *anchor));
+            state.anchors.remove(&at);
+            state
+                .policy
+                .anchors
+                .retain(|root| (root.space, root.kind as u8, root.window) != at);
             space.suspended = true;
             return Err(AnchorRefusal::Equivocation);
         }

@@ -417,7 +417,10 @@ impl Chain {
         Ok(())
     }
 
-    /// `spaces-pallet.md` §6.1, the anchor rule.
+    /// `spaces-pallet.md` §6.1, the anchor rule. A second root at a window
+    /// held is the equivocation's evidence: the space suspended, and the
+    /// window's anchor dropped, so neither root counts again, after a
+    /// resume as before it.
     fn anchor(&mut self, anchor: &AnchorArg, events: &mut Vec<Event>) -> Dispatched {
         self.paused(PAUSE_ANCHOR)?;
         let space = anchor.space;
@@ -457,6 +460,9 @@ impl Chain {
                 keys::equivocations(&space, anchor.kind, anchor.window),
                 &evidence,
             );
+            if !self.keeps_disputed_root() {
+                self.storage.remove(&at);
+            }
             info.status = SpaceStatus::Suspended;
             self.put(keys::spaces(&space), &info);
             events.push(Event::Equivocated {
