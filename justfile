@@ -337,8 +337,9 @@ check-no-seeded-masks: (_forbidden "seeded-masks") _seeded-masks-unimplied
 check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
     print "no debug outputs in a production build"
 
-# Format 28, the unmasked wrap (`vos-pvm-final-verifier`'s and
-# `vos-statement`'s `test-formats`), reaches no production build: no normal
+# Format 28, the unmasked wrap (`vos-pvm-final-verifier`'s, its prover
+# `vos-pvm-recair`'s and `vos-statement`'s `test-formats`), reaches no
+# production build: no normal
 # or build edge of any workspace member, nor of the workspaces built apart
 # that venues or nodes run (the agent, the final verifier's Wasm blob, its
 # runner), enables it (the tests enable it on dev edges, the harnesses' test

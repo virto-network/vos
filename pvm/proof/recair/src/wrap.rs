@@ -1,8 +1,8 @@
 //! The final wrap (`proving.md` §3.5, A.3; `recursion-air.md` §7): a 1-to-1
 //! node over a tree's root, proved masked under `format::MASKED_WRAP` on
-//! the Blake2b-256 channel ([`prove`]), or unmasked under `format::WRAP`,
-//! which `vos-pvm-final-verifier` verifies against 24 public words
-//! ([`prove_unmasked`]).
+//! the Blake2b-256 channel ([`prove`]), or, under `test-formats`, unmasked
+//! under `format::WRAP`, which `vos-pvm-final-verifier` verifies against 24
+//! public words (`prove_unmasked`).
 //!
 //! **What it checks of the root,** a node of the padded shape
 //! (`format::LEAF_FOLD`), a fold's or, for a run of one segment, a leaf's:
@@ -48,7 +48,7 @@ use crate::fold::{
 use crate::gadgets::leaf_hash;
 use crate::leaf::preimage;
 use crate::masked::{MaskRng, MaskStats};
-use crate::prove::{ProveError, RecairProof, prove_masked_on, prove_on};
+use crate::prove::{ProveError, RecairProof, prove_masked_on};
 use crate::trace::MainTrace;
 use crate::value::{NoValue, Value};
 use crate::verifier::WitnessError;
@@ -234,18 +234,24 @@ pub fn prove_masked(
 /// Proves a finalized wrap circuit unmasked under `format::WRAP`, on the
 /// Blake2b-256 channel: what the unmasked tests and fixtures verify; the
 /// venues take only `format::MASKED_WRAP`.
+#[cfg(feature = "test-formats")]
 pub fn prove_unmasked(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError> {
     prove_unmasked_with(finalized, |_| {})
 }
 
 /// [`prove_unmasked`], with the main trace passed through `tamper` before it
 /// is committed: a seam for the refusal tests.
+#[cfg(feature = "test-formats")]
 pub fn prove_unmasked_with(
     finalized: &Finalized<SecureField>,
     tamper: impl FnOnce(&mut MainTrace),
 ) -> Result<WrapProof, ProveError> {
-    let proof =
-        prove_on::<Blake2bMerkleChannel>(&WRAP, &finalized.circuit, &finalized.witness, tamper)?;
+    let proof = crate::prove::prove_on::<Blake2bMerkleChannel>(
+        &WRAP,
+        &finalized.circuit,
+        &finalized.witness,
+        tamper,
+    )?;
     Ok(wrap_proof(proof))
 }
 
@@ -262,12 +268,15 @@ fn wrap_proof(proof: RecairProof<Blake2bMerkleHasher>) -> WrapProof {
 /// A wrap proof's bytes as its format lays them out
 /// (`vos_pvm_proof::format::Format::bytes`): `format::MASKED_WRAP`'s fixed
 /// layout (`vos_pvm_final_verifier::masked::encode`), the one encoding its
-/// verifier reads, or postcard's; `None` for a format the registry does not
-/// hold, or a proof its layout cannot hold.
+/// verifier reads, or postcard's (under `test-formats`); `None` for a format
+/// the registry does not hold, or a proof its layout cannot hold.
 pub fn proof_bytes(proof: &WrapProof) -> Option<Vec<u8>> {
     match lookup(proof.format_version)?.bytes {
         ProofBytes::FixedLayout => vos_pvm_final_verifier::masked::encode(proof),
+        #[cfg(feature = "test-formats")]
         ProofBytes::Postcard => postcard::to_allocvec(proof).ok(),
+        #[cfg(not(feature = "test-formats"))]
+        ProofBytes::Postcard => None,
     }
 }
 

@@ -10,8 +10,8 @@ vos-pvm-recair-air = { workspace = true }
 # The wrap's proof, its public words and its layout, which the prover
 # produces and the final verifier reads; format 39's fixed layout.
 vos-pvm-final-verifier = { workspace = true }
-# Format 28's bytes.
-postcard = { version = "1", features = ["alloc"] }
+# Format 28's bytes, and a watched tree's proofs' encoding.
+postcard = { version = "1", features = ["alloc"], optional = true }
 vos-pvm-poseidon2 = { workspace = true }
 # The Poseidon2-M31 channel and its SIMD backend, the format registry, the
 # transcript's header and the security accounting.
@@ -48,11 +48,15 @@ heavy-gates = []
 # `tree::Built`'s roots and encoding): the carrier audit's seam, for its
 # tests (a dev edge or a test's feature). No production build enables it
 # (`just check-no-debug-internals`).
-watch = []
+watch = ["dep:postcard"]
+# Format 28, the unmasked wrap, and its postcard bytes (`wrap::prove_unmasked`,
+# `prove_unmasked_with`): the tests' and the fixtures' format, for a dev edge.
+# No production build enables it (`just check-no-test-formats`).
+test-formats = ["dep:postcard", "vos-pvm-final-verifier/test-formats"]
 
 [dev-dependencies]
 # The masked prover's tests reproduce a proof byte for byte from a seed.
-vos-pvm-recair = { path = ".", features = ["seeded-masks"] }
+vos-pvm-recair = { path = ".", features = ["seeded-masks", "test-formats"] }
 bincode = "1"
 # Format 28's verifier, the unmasked wrap the recursion tests prove.
 vos-pvm-final-verifier = { workspace = true, features = ["test-formats"] }

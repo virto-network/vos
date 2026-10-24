@@ -91,7 +91,7 @@ vos-tree = { workspace = true }
 # verified on the recursion AIR; and the window's wrap, verified by the
 # final verifier; the fixtures' masked wraps, from the seeded seam
 # (`seeded-masks`, a dev edge: no production build has it).
-vos-pvm-recair = { workspace = true, features = ["seeded-masks"] }
+vos-pvm-recair = { workspace = true, features = ["seeded-masks", "test-formats"] }
 # Format 28's verifier beside format 39's: the test policy's fixtures and
 # the kernels' wraps are 28.
 vos-pvm-final-verifier = { workspace = true, features = ["test-formats"] }
