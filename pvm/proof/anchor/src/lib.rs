@@ -1,4 +1,4 @@
-//! A space as a venue knows it (`slice-6-on-chain.md`, pin D): its
+//! A space as a venue knows it (`spaces-pallet.md` §6.1): its
 //! identity, the clock that numbers its windows, the roots it states of a
 //! window and their anchors, with the digests a venue checks signatures
 //! over. The venue verifies the signatures (ed25519); this crate gives the

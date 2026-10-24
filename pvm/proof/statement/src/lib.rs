@@ -419,14 +419,14 @@ impl Admitted {
 /// `pin` is what the venue pinned for the kernel whose handler acts on the
 /// statement, never what the caller supplies (the crate's docs).
 ///
-/// In order (pin F): the format, accepted by the venue and linked in this
-/// build; the statement's program against the pin's; the venue, the first
-/// 32 bytes of `public_args` its id, if the program is venue-bound; the
-/// space, a rootless statement's [`SpaceId::NONE`] and a rooted statement's
-/// not, every root's equal to it; every root anchored; the io-hash
-/// recomputed from the fields and the id from it; a repeat. Each before the
-/// proof, which is the costly check: a venue that verified first would
-/// spend a verify on every replay.
+/// In order (`spaces-pallet.md` §6.3): the format, accepted by the venue
+/// and linked in this build; the statement's program against the pin's; the
+/// venue, the first 32 bytes of `public_args` its id, if the program is
+/// venue-bound; the space, a rootless statement's [`SpaceId::NONE`] and a
+/// rooted statement's not, every root's equal to it; every root anchored;
+/// the io-hash recomputed from the fields and the id from it; a repeat.
+/// Each before the proof, which is the costly check: a venue that verified
+/// first would spend a verify on every replay.
 pub fn admit(venue: &impl Venue, pin: &Pin, statement: &Statement) -> Result<Admitted, Refusal> {
     if !LINKED.contains(&statement.format) || !venue.accepts(statement.format) {
         return Err(Refusal::Format);

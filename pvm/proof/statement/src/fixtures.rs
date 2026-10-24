@@ -15,8 +15,8 @@
 //! after the input decodes, and reaches every other case's verdict
 //! ([`Fixture::verdict_linking`]).
 //!
-//! The generator (`pvm/proof/tests/kernel/fixtures.rs`) writes them, and refuses
-//! fixtures it no longer makes.
+//! The generator (`pvm/proof/tests/kernel/fixtures.rs`) writes them, and
+//! refuses fixtures it does not make.
 
 #![allow(
     clippy::panic,

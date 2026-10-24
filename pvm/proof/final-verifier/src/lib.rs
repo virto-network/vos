@@ -1,5 +1,5 @@
-//! The final wrap's verifier (`recursion-air.md` §8, `proving.md` §3.5–3.6,
-//! `slice-6-on-chain.md` pins A and B).
+//! The final wrap's verifier (`recursion-air.md` §8, `proving.md` §3.5–3.6
+//! and §5).
 //!
 //! A wrap proof states the recursion AIR's three components at the wrap
 //! circuit's log sizes ([`LOG_SIZES`]), proved on the Blake2b-256 channel
@@ -378,8 +378,8 @@ mod tests {
         ));
     }
 
-    /// `format::MASKED_WRAP`'s preprocessed root is `format::WRAP`'s (pin A): its columns at
-    /// `n + 1` under blowup 32 are `format::WRAP`'s at `n + 6`.
+    /// `format::MASKED_WRAP`'s preprocessed root is `format::WRAP`'s: its
+    /// columns at `n + 1` under blowup 32 are `format::WRAP`'s at `n + 6`.
     #[test]
     fn the_masked_preprocessed_root_is_format_28s() {
         assert_eq!(PREPROCESSED_ROOT_39, PREPROCESSED_ROOT);

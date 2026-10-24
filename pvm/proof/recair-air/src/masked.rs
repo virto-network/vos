@@ -1,5 +1,5 @@
 //! The recursion AIR as the masked wrap proves it: masking variant (c)
-//! (`docs/design/proving.md` §5; `research/slice-5/masking-review.md`), the
+//! (`docs/design/proving.md` §5, R1–R8), the
 //! AIR of `format::MASKED_WRAP` in `vos_pvm_proof::format`'s registry.
 //!
 //! - **Constraint bound `log_size + 2`**

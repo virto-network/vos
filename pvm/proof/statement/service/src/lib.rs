@@ -1,5 +1,5 @@
-//! The JAM statements service (`slice-6-on-chain.md`, step 6.19; pins D and
-//! F): a venue on JAM, as a dedicated service.
+//! The JAM statements service (`proving.md` §6, `spaces-pallet.md` §6.1 and
+//! §6.3): a venue on JAM, as a dedicated service.
 //!
 //! - **Its items** ([`item`]): `Register`, `Migrate`, `Anchor` and
 //!   `Submit { statement, proof }`, the statement in the item's payload and
@@ -7,13 +7,13 @@
 //!   at 204,802 bytes, below the 256 KiB a proof may take.
 //! - **Refine** ([`refine`]) reads no state: it verifies a registration's,
 //!   a migration's or an anchor's ed25519 signature against the key it
-//!   names, and runs pin F's checks of a statement but `anchored` and
+//!   names, and runs `judge`'s checks of a statement but `anchored` and
 //!   `seen`, then its proof; its output is a [`verdict::Verdict`].
 //! - **Accumulate** ([`accumulate`]) holds the spaces, their anchors and
 //!   the statements accepted ([`state`]): it checks an anchor's signer
-//!   against the space's keys and applies pin D's anchor rule at the
-//!   venue's time (the slot's), and checks a statement's roots anchored
-//!   and its id unseen before recording it under the `Seen` rule.
+//!   against the space's keys and applies the anchor rule at the venue's
+//!   time (the slot's), and checks a statement's roots anchored and its id
+//!   unseen before recording it under the `Seen` rule.
 //! - **A deployment's constants** ([`config`]): the JAM chain's genesis hash
 //!   (the venue's id is `VenueId::jam(genesis, service)`), its genesis time
 //!   and the programs it pins, venue-bound or not; set in the linked

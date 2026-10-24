@@ -217,8 +217,8 @@ fn an_unknown_root_kind_is_refused_at_decode() {
     assert_eq!(RootKind::try_from(0), Ok(RootKind::Space));
 }
 
-/// Each digest is BLAKE2b-256 over its domain and its fields, as pin D
-/// writes its preimage.
+/// Each digest is BLAKE2b-256 over its domain and its fields, as
+/// `spaces-pallet.md` §3 writes its preimage.
 #[test]
 fn every_digest_is_its_preimages() {
     let space = space_id(&genesis());

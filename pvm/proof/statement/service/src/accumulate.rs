@@ -1,6 +1,6 @@
 //! Accumulate: each item's verdict applied to the service's state, at the
-//! venue's time, `genesis_ms + slot × 6 s` (pin D: time between parties is
-//! the venue's).
+//! venue's time, `genesis_ms + slot × 6 s` (every deadline between parties
+//! is the venue's time, `proving.md` §7).
 //!
 //! - **A registration:** the space not registered yet, its start window
 //!   within `[now_w − MaxRootAge / length, now_w + 1]` by the venue's
@@ -8,7 +8,7 @@
 //! - **A migration:** the signer the space's controller; once, from a
 //!   window past every one anchored and not before the venue's next, nor
 //!   before the space's start here (`vos_venue::ModelVenue::migrate`'s).
-//! - **An anchor**, pin D's rule as the model venue applies it: a
+//! - **An anchor**, the anchor rule as the model venue applies it: a
 //!   registered, unsuspended space; a signer among its anchor keys; the
 //!   same root at its window again taken as a repeat, another root kept as
 //!   evidence and the space suspended; `Last < w`, w within its range;
@@ -25,14 +25,14 @@
 //!
 //! Each item's outcome is kept under its package's and its payload's
 //! hashes for its submitter to read: a later package of the same payload,
-//! anyone's, keeps its own. Rows age out: an anchor, a rooted statement's `Seen` entry and
-//! an outcome are queued, by the hour they expire in, and dropped a few an
-//! accumulate once that hour is past; a rootless statement's `Seen` entry
-//! is never queued, since it has no anchor to fail (pin F). `MaxRootAge` is
-//! a constant here: a raise is a redeploy that first prunes the anchors
-//! older than the old bound, or a `Seen` entry dropped by the old bound
-//! would let its statement's replay through anchors still fresh by the
-//! new one (pin F).
+//! anyone's, keeps its own. Rows age out: an anchor, a rooted statement's
+//! `Seen` entry and an outcome are queued, by the hour they expire in, and
+//! dropped a few an accumulate once that hour is past; a rootless
+//! statement's `Seen` entry is never queued, since it has no anchor to fail
+//! (`spaces-pallet.md` §6.3). `MaxRootAge` is a constant here: a raise is a
+//! redeploy that first prunes the anchors older than the old bound, or a
+//! `Seen` entry dropped by the old bound would let its statement's replay
+//! through anchors still fresh by the new one (`spaces-pallet.md` §6.5).
 
 use alloc::vec::Vec;
 

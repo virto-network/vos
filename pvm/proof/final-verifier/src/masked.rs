@@ -1,14 +1,14 @@
-//! The masked wrap's verifier: `format::MASKED_WRAP` (pin A), its transcript pin B's,
+//! The masked wrap's verifier: `format::MASKED_WRAP` and its transcript,
 //! over any masked component set and Merkle channel ([`verify_masked`]),
 //! the recursion AIR's wrap on the Blake2b-256 channel its production use
 //! ([`verify`]).
 //!
-//! **The transcript** (pin B): the header (the format's number and
-//! configuration, the log sizes); the preprocessed root (columns at
-//! `n + 1`, unsalted); the main root (masked columns, blinding columns,
-//! salts); the public values; the interaction PoW; the set's relations, then
-//! the blinding relation; the blinded claimed sums; the interaction root;
-//! the composition coefficient; the composition tree's root (the whole
+//! **The transcript:** the header (the format's number and configuration,
+//! the log sizes); the preprocessed root (columns at `n + 1`, unsalted);
+//! the main root (masked columns, blinding columns, salts); the public
+//! values; the interaction PoW; the set's relations, then the blinding
+//! relation; the blinded claimed sums; the interaction root; the
+//! composition coefficient; the composition tree's root (the whole
 //! composition, the FRI mask `R`, salts); the out-of-domain point `z`; then
 //! Stwo's PCS (`CommitmentSchemeVerifier::{commit, verify_values}`). Never
 //! `stwo::core::verifier::verify`, whose composition split is hardcoded
@@ -165,7 +165,7 @@ pub struct MaskedFormat<'a> {
     pub deep_values: usize,
 }
 
-/// `format::MASKED_WRAP`, the masked wrap (pin A).
+/// `format::MASKED_WRAP`, the masked wrap.
 pub const MASKED_WRAP: MaskedFormat<'static> = MaskedFormat {
     number: FORMAT,
     config: CONFIG,

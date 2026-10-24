@@ -38,7 +38,7 @@ impl Root {
     const BYTES: usize = 1 + 8 + 32;
 }
 
-/// A statement's judgement at refine: every check of pin F's but
+/// A statement's judgement at refine: every check of `judge`'s but
 /// `anchored` and `seen`, which accumulate makes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Judged {
