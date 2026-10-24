@@ -76,7 +76,7 @@ pub struct Needle {
     /// common to look for in a replica's own bytes.
     leaving: Vec<Vec<u8>>,
     /// The number it is, for a number's needle.
-    value: Option<u64>,
+    pub(super) value: Option<u64>,
 }
 
 /// How many distinct values `bytes` holds.
@@ -233,15 +233,6 @@ pub struct Needles(pub Vec<Needle>);
 impl Needles {
     pub fn push(&mut self, needle: Option<Needle>) {
         self.0.extend(needle);
-    }
-
-    /// Drop every number's needle whose value is one of `public`: a
-    /// venue's layout constants, which its storage holds and any run's
-    /// numbers may equal, as a register's needle drops what the run's
-    /// entry state holds.
-    pub fn except(&mut self, public: &[u64]) {
-        self.0
-            .retain(|needle| needle.value.is_none_or(|value| !public.contains(&value)));
     }
 
     /// The needles of `kind` whose name holds `naming`.

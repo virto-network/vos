@@ -145,21 +145,21 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
             .iter()
             .flat_map(|(key, value)| [key.as_slice(), value].concat())
             .collect();
-        audit.carrier(
+        // The service's storage holds the venue's layout constants and the
+        // space's clock: a number of the run's equal to one is no leak there.
+        audit.carrier_except(
             format!("JAM {}'s storage", jam.name),
             Reach::Leaves,
             storage,
+            &[
+                SLOT_MS,
+                BUCKET_MS,
+                MAX_ROOT_AGE_MS,
+                run.clock.origin_ms,
+                run.clock.length_ms,
+            ],
         );
     }
-    // The service's storage holds the venue's layout constants and the
-    // space's clock: a number of the run's equal to one is no leak.
-    audit.needles.except(&[
-        SLOT_MS,
-        BUCKET_MS,
-        MAX_ROOT_AGE_MS,
-        run.clock.origin_ms,
-        run.clock.length_ms,
-    ]);
     for (n, envelope) in run.kreivo.envelopes().into_iter().enumerate() {
         audit.carrier(format!("Kreivo's extrinsic {n}"), Reach::Leaves, envelope);
     }

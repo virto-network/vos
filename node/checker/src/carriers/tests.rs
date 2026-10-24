@@ -259,27 +259,39 @@ fn the_wraps_randomness_is_searched_everywhere() {
     }
 }
 
-/// A number's needle whose value is a venue's constant is dropped; other
-/// needles are kept.
+/// A number's needle whose value a carrier holds as public is not searched
+/// in that carrier, and is still found in every other; other needles are
+/// searched in both.
 #[test]
 fn a_public_constant_is_no_needle() {
-    let mut needles = Needles::default();
-    needles
+    let mut audit = Audit::default();
+    let bytes = b" 3600000 1234567 ".to_vec();
+    audit.carrier_except("storage", Reach::Leaves, bytes.clone(), &[3_600_000]);
+    audit.carrier("a log", Reach::Leaves, bytes);
+    audit
+        .needles
         .0
-        .push(Needle::number(Kind::StepCount, "steps", 3_600_000));
-    needles
+        .push(Needle::number(Kind::StepCount, "constant", 3_600_000));
+    audit
+        .needles
         .0
         .push(Needle::number(Kind::StepCount, "steps", 1_234_567));
-    needles.push(Needle::bytes(Kind::ServedRow, "row", b"a row's value"));
-    needles.except(&[3_600_000]);
-    let names: Vec<&str> = needles
-        .0
-        .iter()
-        .map(|needle| needle.name.as_str())
+    let mut found: Vec<(String, String)> = audit
+        .findings()
+        .into_iter()
+        .map(|finding| (finding.needle, finding.carrier))
         .collect();
-    assert_eq!(names, ["steps", "row"]);
+    found.sort();
+    let found: Vec<(&str, &str)> = found
+        .iter()
+        .map(|(needle, carrier)| (needle.as_str(), carrier.as_str()))
+        .collect();
     assert_eq!(
-        audit(Reach::Leaves, b" 1234567 ", needles.0[0].clone()).len(),
-        1
+        found,
+        [
+            ("constant", "a log"),
+            ("steps", "a log"),
+            ("steps", "storage")
+        ]
     );
 }

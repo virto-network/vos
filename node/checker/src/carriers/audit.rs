@@ -11,6 +11,9 @@ pub struct Carrier {
     pub name: String,
     pub reach: Reach,
     pub bytes: Vec<u8>,
+    /// The numbers it holds as public: a number's needle of one of these
+    /// values is not searched in it.
+    pub public: Vec<u64>,
 }
 
 /// A needle found in a carrier.
@@ -47,10 +50,25 @@ impl Audit {
     /// Add a carrier's bytes; an empty one is kept, so the report counts
     /// it.
     pub fn carrier(&mut self, name: impl Into<String>, reach: Reach, bytes: Vec<u8>) {
+        self.carrier_except(name, reach, bytes, &[]);
+    }
+
+    /// [`Audit::carrier`], whose bytes hold each of `public` as a public
+    /// number (a venue's layout constants, its clock): a number's needle of
+    /// one of those values is not searched in it, and still is in every
+    /// other carrier.
+    pub fn carrier_except(
+        &mut self,
+        name: impl Into<String>,
+        reach: Reach,
+        bytes: Vec<u8>,
+        public: &[u64],
+    ) {
         self.carriers.push(Carrier {
             name: name.into(),
             reach,
             bytes,
+            public: public.to_vec(),
         });
     }
 
@@ -82,11 +100,16 @@ impl Audit {
                 let mut found = vec![false; self.needles.0.len()];
                 for hit in automaton.find_overlapping_iter(&carrier.bytes) {
                     let (index, form) = of[hit.pattern().as_usize()];
-                    if found[index] || !whole(&carrier.bytes, hit.start(), hit.len()) {
+                    let needle = &self.needles.0[index];
+                    if found[index]
+                        || !whole(&carrier.bytes, hit.start(), hit.len())
+                        || needle
+                            .value
+                            .is_some_and(|value| carrier.public.contains(&value))
+                    {
                         continue;
                     }
                     found[index] = true;
-                    let needle = &self.needles.0[index];
                     findings.push(Finding {
                         kind: needle.kind,
                         needle: needle.name.clone(),
