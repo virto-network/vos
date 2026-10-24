@@ -226,7 +226,10 @@ fn row_impl(
         }
     }
     let doc = format!("The values of every `{enum_ident}` at a row, read once.");
+    let trace = trace_row_impl(parsed_variants, crate_ident, enum_ident, row);
     quote! {
+        #trace
+
         #[doc = #doc]
         pub struct #row_ident<F> {
             #(#fields,)*
@@ -246,6 +249,58 @@ fn row_impl(
 
             /// The values of `column`.
             pub fn column(&self, column: #enum_ident) -> &[F] {
+                match column {
+                    #(#arms,)*
+                }
+            }
+        }
+    }
+}
+
+/// The row view over a component's main trace, `NameTrace<'a>`: every
+/// column's finalized parts, a field per variant named as in the row view's
+/// (no `_next` twins), for the interaction trace's prover-side reads.
+fn trace_row_impl(
+    parsed_variants: &[ParsedVariant],
+    crate_ident: &TokenStream,
+    enum_ident: &syn::Ident,
+    row: &str,
+) -> TokenStream {
+    let trace_ident = format_ident!("{row}Trace");
+    let mut fields = Vec::new();
+    let mut reads = Vec::new();
+    let mut arms = Vec::new();
+    for v in parsed_variants {
+        let ident = &v.ident;
+        let field = format_ident!("{}", field_name(ident));
+        let size = v.size;
+        let doc = format!("`{enum_ident}::{ident}`'s parts.");
+        fields.push(quote! {
+            #[doc = #doc]
+            pub #field: [#crate_ident::trace::component::FinalizedColumn<'a>; #size]
+        });
+        reads.push(quote! { #field: trace.original_base_column(#enum_ident::#ident) });
+        arms.push(quote! { #enum_ident::#ident => &self.#field });
+    }
+    let doc = format!("Every `{enum_ident}`'s parts in a component's main trace, read once.");
+    quote! {
+        #[cfg(feature = "prover")]
+        #[doc = #doc]
+        pub struct #trace_ident<'a> {
+            #(#fields,)*
+        }
+
+        #[cfg(feature = "prover")]
+        impl<'a> #trace_ident<'a> {
+            /// The columns of `trace`'s main trace.
+            pub fn new(trace: &'a #crate_ident::trace::component::ComponentTrace) -> Self {
+                Self {
+                    #(#reads,)*
+                }
+            }
+
+            /// The parts of `column`.
+            pub fn column(&self, column: #enum_ident) -> &[#crate_ident::trace::component::FinalizedColumn<'a>] {
                 match column {
                     #(#arms,)*
                 }

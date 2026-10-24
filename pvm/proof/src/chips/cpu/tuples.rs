@@ -69,6 +69,117 @@ pub(super) const BITWISE: [Column; 9] = [
 /// The bitwise operations' flags; IsBitwise is their sum.
 pub(super) const BITWISE_FLAGS: [Column; 6] = [IsAnd, IsOr, IsXor, IsAndInv, IsOrInv, IsXnor];
 
+/// ProgramMemoryLookup's tuple, the instruction a step fetches: its pc,
+/// opcode, length and registers, its immediate, the ten flag bytes, the
+/// second immediate, the branch target and the host call's dispatch.
+pub(super) const PROGRAM_MEMORY: [Column; 20] = [
+    Pc,
+    Opcode,
+    SkipLen,
+    RegA,
+    RegB,
+    RegD,
+    ImmBytes,
+    FlagByte0,
+    FlagByte1,
+    FlagByte2,
+    FlagByte3,
+    FlagByte4,
+    FlagByte5,
+    FlagByte6,
+    FlagByte7,
+    FlagByte8,
+    FlagByte9,
+    ImmYBytes,
+    BranchTarget,
+    HostCallPrecompileDispatch,
+];
+
+/// ByteToBits' tuples for flag bytes 0 to 5: each byte, and its eight
+/// bits, low first, each a flag or a sum of flags (the categories IsBitwise,
+/// IsCompare, IsBranch and IsStore). The program memory packs the flags in
+/// this layout (`pack_flags`).
+pub(super) const FLAG_BYTES: [(Column, [&[Column]; 8]); 6] = [
+    (
+        FlagByte0,
+        [
+            &[IsAdd],
+            &[IsSub],
+            &[IsMul],
+            &[IsSharR],
+            &BITWISE_FLAGS,
+            &[IsShift],
+            &COMPARE_FLAGS,
+            &[IsMove],
+        ],
+    ),
+    (
+        FlagByte1,
+        [
+            &[Is32Bit],
+            &BRANCH_FLAGS,
+            &[IsJump],
+            &[IsDivRem],
+            &[IsLoad],
+            &STORE_FLAGS,
+            &[IsExit],
+            &[IsNegAdd],
+        ],
+    ),
+    (
+        FlagByte2,
+        [
+            &[IsReverseBytes],
+            &[IsZeroExt16],
+            &[IsSignExt8],
+            &[IsSignExt16],
+            &[IsTrap],
+            &[IsJumpInd],
+            &[IsLoadImmJumpInd],
+            &[IsMulUpperUU],
+        ],
+    ),
+    (
+        FlagByte3,
+        [
+            &[IsMulUpperSU],
+            &[IsMulUpperSS],
+            &[IsDivS],
+            &[IsLoadI8],
+            &[IsLoadI16],
+            &[IsLoadI32],
+            &[IsMemSize1],
+            &[IsMemSize2],
+        ],
+    ),
+    (
+        FlagByte4,
+        [
+            &[IsMemSize4],
+            &[IsMemSize8],
+            &[IsStoreDirect],
+            &[IsLoadDirect],
+            &[IsMemIndirect],
+            &[IsStoreImmAny],
+            &[IsStoreImmDirect],
+            &[IsStoreInd],
+        ],
+    ),
+    (
+        FlagByte5,
+        [
+            &[IsRotateL64],
+            &[IsCountSetBits],
+            &[IsLzb],
+            &[IsTzb],
+            &[IsRotateR64],
+            &[IsRotateL32],
+            &[IsRotateR32],
+            &[IsImmAlt],
+        ],
+    ),
+];
+
 /// The number of limbs `columns` hold.
 #[cfg(feature = "prover")]
 pub(super) fn width(columns: &[Column]) -> usize {

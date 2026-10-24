@@ -1,12 +1,13 @@
 //! The instruction's binding to program memory, and the flag bytes' bits.
-use alloc::{vec, vec::Vec};
+use alloc::vec::Vec;
 
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
-use super::{Lookups, Row, is_bitwise, is_branch, is_compare, is_store};
+use super::{Lookups, Row, sum, values};
 use crate::chips::cpu::columns::Column;
+use crate::chips::cpu::tuples::{FLAG_BYTES, PROGRAM_MEMORY};
 
 /// The program-memory consumer: the instruction tuple of each step.
 pub(in crate::chips::cpu) fn program_memory<E: EvalAtRow>(
@@ -34,38 +35,7 @@ pub(in crate::chips::cpu) fn program_memory<E: EvalAtRow>(
     // identical multiplicity and tuple.  ProgramMemoryChip doubles its
     // multiplicity column.
     {
-        let mut tuple: Vec<E::F> = row.pc.to_vec();
-        tuple.push(row.opcode[0].clone());
-        tuple.push(row.skip_len[0].clone());
-        tuple.push(row.reg_a[0].clone());
-        tuple.push(row.reg_b[0].clone());
-        tuple.push(row.reg_d[0].clone());
-        tuple.extend_from_slice(&row.imm_bytes);
-        tuple.push(row.flag_byte0[0].clone());
-        tuple.push(row.flag_byte1[0].clone());
-        tuple.push(row.flag_byte2[0].clone());
-        tuple.push(row.flag_byte3[0].clone());
-        tuple.push(row.flag_byte4[0].clone());
-        tuple.push(row.flag_byte5[0].clone());
-        for byte in [
-            Column::FlagByte6,
-            Column::FlagByte7,
-            Column::FlagByte8,
-            Column::FlagByte9,
-        ] {
-            tuple.push(row.column(byte)[0].clone());
-        }
-        // Bind ImmYBytes to canonical imm_y (low 4 bytes) for
-        // LoadImmJumpInd; 0 for ops without a second immediate.  Tracer
-        // writes 0 to imm_y for those, so balanced.
-        tuple.extend_from_slice(&row.imm_y_bytes);
-        // Bind BranchTarget to its canonical (pc + sign_extend(offset))
-        // for static jumps/branches.  For JumpInd/LoadImmJumpInd and
-        // non-branch ops, the canonical is 0; the tracer also writes 0
-        // to BranchTarget for those (see decode_branch_target's default
-        // arm), so the lookup balances without gating.
-        tuple.extend_from_slice(&row.branch_target);
-        tuple.push(row.host_call_precompile_dispatch[0].clone());
+        let tuple = values(row, &PROGRAM_MEMORY);
 
         // Paired emissions; ProgramMemoryChip's mult = 2·count_at_pc.
         eval.add_to_relation(RelationEntry::new(
@@ -108,99 +78,14 @@ pub(in crate::chips::cpu) fn flag_bits<E: EvalAtRow>(
     // chips/program_memory.rs and the canonical 48-flag layout in
     // `classify_opcode_for_program_memory`).
     {
-        // Read the individual-flag bit expressions for each byte.
-
-        // Sum expressions for the 4 folded category slots.
-        let bw_sum_e = is_bitwise(row);
-        let cmp_sum_e = is_compare(row);
-        let br_sum_e = is_branch(row);
-        let st_sum_e = is_store(row);
-
-        // byte 0: (FlagByte0, is_add, is_sub, is_mul, is_shar_r, BW_SUM,
-        //          is_shift, CMP_SUM, is_move)
-        let tuple0: Vec<E::F> = vec![
-            row.flag_byte0[0].clone(),
-            row.is_add[0].clone(),
-            row.is_sub[0].clone(),
-            row.is_mul[0].clone(),
-            row.is_shar_r[0].clone(),
-            bw_sum_e.clone(),
-            row.is_shift[0].clone(),
-            cmp_sum_e.clone(),
-            row.is_move[0].clone(),
-        ];
-        // byte 1: (FlagByte1, is_32bit, BR_SUM, is_jump, is_div_rem,
-        //          is_load, ST_SUM, is_exit, is_neg_add)
-        let tuple1: Vec<E::F> = vec![
-            row.flag_byte1[0].clone(),
-            row.is32_bit[0].clone(),
-            br_sum_e.clone(),
-            row.is_jump[0].clone(),
-            row.is_div_rem[0].clone(),
-            row.is_load[0].clone(),
-            st_sum_e.clone(),
-            row.is_exit[0].clone(),
-            row.is_neg_add[0].clone(),
-        ];
-        // byte 2: (FlagByte2, is_reverse_bytes, is_zero_ext_16,
-        //          is_sign_ext_8, is_sign_ext_16, is_trap, is_jump_ind,
-        //          is_load_imm_jump_ind, is_mul_upper_uu)
-        let tuple2: Vec<E::F> = vec![
-            row.flag_byte2[0].clone(),
-            row.is_reverse_bytes[0].clone(),
-            row.is_zero_ext16[0].clone(),
-            row.is_sign_ext8[0].clone(),
-            row.is_sign_ext16[0].clone(),
-            row.is_trap[0].clone(),
-            row.is_jump_ind[0].clone(),
-            row.is_load_imm_jump_ind[0].clone(),
-            row.is_mul_upper_uu[0].clone(),
-        ];
-        // byte 3: (FlagByte3, is_mul_upper_su, is_mul_upper_ss, is_div_s,
-        //          is_load_i8, is_load_i16, is_load_i32,
-        //          is_mem_size_1, is_mem_size_2)
-        let tuple3: Vec<E::F> = vec![
-            row.flag_byte3[0].clone(),
-            row.is_mul_upper_su[0].clone(),
-            row.is_mul_upper_ss[0].clone(),
-            row.is_div_s[0].clone(),
-            row.is_load_i8[0].clone(),
-            row.is_load_i16[0].clone(),
-            row.is_load_i32[0].clone(),
-            row.is_mem_size1[0].clone(),
-            row.is_mem_size2[0].clone(),
-        ];
-        // byte 4: (FlagByte4, is_mem_size_4, is_mem_size_8,
-        //          is_store_direct, is_load_direct, is_mem_indirect,
-        //          is_store_imm_any, is_store_imm_direct, is_store_ind)
-        let tuple4: Vec<E::F> = vec![
-            row.flag_byte4[0].clone(),
-            row.is_mem_size4[0].clone(),
-            row.is_mem_size8[0].clone(),
-            row.is_store_direct[0].clone(),
-            row.is_load_direct[0].clone(),
-            row.is_mem_indirect[0].clone(),
-            row.is_store_imm_any[0].clone(),
-            row.is_store_imm_direct[0].clone(),
-            row.is_store_ind[0].clone(),
-        ];
-        // byte 5: (FlagByte5, is_rotate_l64, is_count_set_bits,
-        //          is_lzb, is_tzb, is_rotate_r64, is_rotate_l32,
-        //          is_rotate_r32, is_imm_alt)
-        let tuple5: Vec<E::F> = vec![
-            row.flag_byte5[0].clone(),
-            row.is_rotate_l64[0].clone(),
-            row.is_count_set_bits[0].clone(),
-            row.is_lzb[0].clone(),
-            row.is_tzb[0].clone(),
-            row.is_rotate_r64[0].clone(),
-            row.is_rotate_l32[0].clone(),
-            row.is_rotate_r32[0].clone(),
-            row.is_imm_alt[0].clone(),
-        ];
-
-        for t in [&tuple0, &tuple1, &tuple2, &tuple3, &tuple4, &tuple5] {
-            eval.add_to_relation(RelationEntry::new(byte_to_bits_lookup, E::EF::one(), t));
+        let tuples = FLAG_BYTES.map(|(byte, bits)| {
+            let mut tuple = Vec::with_capacity(9);
+            tuple.push(row.column(byte)[0].clone());
+            tuple.extend(bits.map(|flags| sum(row, flags)));
+            tuple
+        });
+        for tuple in &tuples {
+            eval.add_to_relation(RelationEntry::new(byte_to_bits_lookup, E::EF::one(), tuple));
         }
 
         // Flag bytes 6..9, recomposed here from their bits, each bit a

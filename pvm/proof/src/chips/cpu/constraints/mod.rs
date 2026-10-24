@@ -63,7 +63,7 @@ pub(super) fn values<F: Clone>(row: &Row<F>, columns: &[Column]) -> Vec<F> {
 }
 
 /// The sum of the flags `columns`, left to right.
-fn sum<F: Clone + Add<Output = F>>(row: &Row<F>, columns: &[Column]) -> F {
+pub(super) fn sum<F: Clone + Add<Output = F>>(row: &Row<F>, columns: &[Column]) -> F {
     columns
         .iter()
         .map(|&column| row.column(column)[0].clone())

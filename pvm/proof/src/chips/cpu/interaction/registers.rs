@@ -6,10 +6,10 @@ use super::*;
 /// host calls' register reads and the BLAKE2b call.
 pub(super) fn registers(
     logup: &mut LogupTraceBuilder,
-    component_trace: &ComponentTrace,
+    row: &RowTrace<'_>,
     lookup_elements: &AllLookupElements,
 ) {
-    let timestamp = crate::trace::original_base_column!(component_trace, Column::Timestamp);
+    let timestamp = &row.timestamp;
     // ── Register-memory producer emissions ──
     // Three potential register accesses per step: ValB read, ValD read,
     // Result write.  Each is gated by its Is* flag and emits a tuple
@@ -17,13 +17,13 @@ pub(super) fn registers(
     // ledger consumers.  Flags are 0 when the corresponding slot isn't
     // a register access (immediate source, or no register write).
     let reg_lookup: &RegisterMemoryLookupElements = lookup_elements.as_ref();
-    let val_b_is_reg = crate::trace::original_base_column!(component_trace, Column::ValBIsReg);
-    let val_b_reg_idx = crate::trace::original_base_column!(component_trace, Column::ValBRegIdx);
-    let val_d_is_reg = crate::trace::original_base_column!(component_trace, Column::ValDIsReg);
-    let val_d_reg_idx = crate::trace::original_base_column!(component_trace, Column::ValDRegIdx);
-    let result_is_reg = crate::trace::original_base_column!(component_trace, Column::ResultIsReg);
-    let result_reg_idx = crate::trace::original_base_column!(component_trace, Column::ResultRegIdx);
-    let result_cols = crate::trace::original_base_column!(component_trace, Column::Result);
+    let val_b_is_reg = &row.val_b_is_reg;
+    let val_b_reg_idx = &row.val_b_reg_idx;
+    let val_d_is_reg = &row.val_d_is_reg;
+    let val_d_reg_idx = &row.val_d_reg_idx;
+    let result_is_reg = &row.result_is_reg;
+    let result_reg_idx = &row.result_reg_idx;
+    let result_cols = &row.result;
     // is_write is the last register-tuple limb (binds reads vs writes — see
     // RegisterMemoryChip).  Constant per emission: 0 for reads, 1 for the
     // result write.
@@ -32,10 +32,10 @@ pub(super) fn registers(
     {
         // Use RegValB (raw register value) rather than ValB so
         // 32-bit-truncated ops still emit the authentic register value.
-        let reg_val_b_cols = crate::trace::original_base_column!(component_trace, Column::RegValB);
+        let reg_val_b_cols = &row.reg_val_b;
         let mut tuple: Vec<_> = vec![val_b_reg_idx[0].clone()];
-        tuple.extend_from_slice(&reg_val_b_cols);
-        tuple.extend_from_slice(&timestamp);
+        tuple.extend_from_slice(reg_val_b_cols);
+        tuple.extend_from_slice(timestamp);
         tuple.push(is_write_read.clone());
         logup.add_to_relation_with(
             reg_lookup,
@@ -47,10 +47,10 @@ pub(super) fn registers(
     {
         // Use RegValD (raw register value) instead of ValD
         // (which gets rewritten to 2^shift_amount for shift ops).
-        let reg_val_d_cols = crate::trace::original_base_column!(component_trace, Column::RegValD);
+        let reg_val_d_cols = &row.reg_val_d;
         let mut tuple: Vec<_> = vec![val_d_reg_idx[0].clone()];
-        tuple.extend_from_slice(&reg_val_d_cols);
-        tuple.extend_from_slice(&timestamp);
+        tuple.extend_from_slice(reg_val_d_cols);
+        tuple.extend_from_slice(timestamp);
         tuple.push(is_write_read.clone());
         logup.add_to_relation_with(
             reg_lookup,
@@ -61,13 +61,12 @@ pub(super) fn registers(
     }
     // RegValA producer (paired emission for parity).
     {
-        let reg_val_a_cols = crate::trace::original_base_column!(component_trace, Column::RegValA);
-        let reg_a_cols = crate::trace::original_base_column!(component_trace, Column::RegA);
-        let is_store_ind_col =
-            crate::trace::original_base_column!(component_trace, Column::IsStoreInd);
+        let reg_val_a_cols = &row.reg_val_a;
+        let reg_a_cols = &row.reg_a;
+        let is_store_ind_col = &row.is_store_ind;
         let mut tuple: Vec<_> = vec![reg_a_cols[0].clone()];
-        tuple.extend_from_slice(&reg_val_a_cols);
-        tuple.extend_from_slice(&timestamp);
+        tuple.extend_from_slice(reg_val_a_cols);
+        tuple.extend_from_slice(timestamp);
         tuple.push(is_write_read.clone());
         for _ in 0..2 {
             logup.add_to_relation_with(
@@ -80,8 +79,8 @@ pub(super) fn registers(
     }
     {
         let mut tuple: Vec<_> = vec![result_reg_idx[0].clone()];
-        tuple.extend_from_slice(&result_cols);
-        tuple.extend_from_slice(&timestamp);
+        tuple.extend_from_slice(result_cols);
+        tuple.extend_from_slice(timestamp);
         tuple.push(is_write_write.clone());
         logup.add_to_relation_with(
             reg_lookup,
@@ -98,11 +97,11 @@ pub(super) fn registers(
     // mapping (h_ptr=Phi10, m_ptr=Phi11, t_low=Phi12, f_flag=Phi7) —
     // see `ECALL_REG_IDXS` below for the slot-to-register mapping that
     // aligns with `trace_fill.rs`'s sources.
-    let is_blake_ecall = crate::trace::original_base_column!(component_trace, Column::IsBlakeEcall);
-    let phi7 = crate::trace::original_base_column!(component_trace, Column::Phi7);
-    let phi10 = crate::trace::original_base_column!(component_trace, Column::Phi10);
-    let phi11 = crate::trace::original_base_column!(component_trace, Column::Phi11);
-    let phi12 = crate::trace::original_base_column!(component_trace, Column::Phi12);
+    let is_blake_ecall = &row.is_blake_ecall;
+    let phi7 = &row.phi7;
+    let phi10 = &row.phi10;
+    let phi11 = &row.phi11;
+    let phi12 = &row.phi12;
     const ECALL_REG_IDXS: [u32; 4] = [10, 7, 8, 9];
     let phi_cols: [_; 4] = [phi7.clone(), phi10.clone(), phi11.clone(), phi12.clone()];
     for (slot, &reg_idx) in ECALL_REG_IDXS.iter().enumerate() {
@@ -136,14 +135,14 @@ pub(super) fn registers(
     // Blake2bChip emits the matching consumer at IsFirstOfCompression so
     // the tuple values must agree.
     let blake2b_call: &Blake2bCallLookupElements = lookup_elements.as_ref();
-    let phi7_bool = crate::trace::original_base_column!(component_trace, Column::Phi7Bool);
+    let phi7_bool = &row.phi7_bool;
     {
         let mut tuple: Vec<_> = Vec::with_capacity(25);
         tuple.extend_from_slice(&phi10[0..4]);
         tuple.extend_from_slice(&phi11[0..4]);
-        tuple.extend_from_slice(&phi12);
+        tuple.extend_from_slice(phi12);
         tuple.push(phi7_bool[0].clone());
-        tuple.extend_from_slice(&timestamp);
+        tuple.extend_from_slice(timestamp);
         logup.add_to_relation_with(
             blake2b_call,
             [is_blake_ecall[0].clone()],
@@ -157,17 +156,16 @@ pub(super) fn registers(
     // and φ[8], the call's destination and capacity, from the Phi10/Phi11
     // slots.
     {
-        let is_witness =
-            crate::trace::original_base_column!(component_trace, Column::IsWitnessEcall);
+        let is_witness = &row.is_witness_ecall;
 
         // Register-read producers: (reg_idx, value[8], ts[8], is_write=0).
-        for (reg_idx, value) in [(7u32, &phi10), (8u32, &phi11)] {
+        for (reg_idx, value) in [(7u32, phi10), (8u32, phi11)] {
             let mut tuple: Vec<_> = Vec::with_capacity(18);
             tuple.push(crate::trace::component::FinalizedColumn::Constant(
                 BaseField::from(reg_idx),
             ));
             tuple.extend_from_slice(value);
-            tuple.extend_from_slice(&timestamp);
+            tuple.extend_from_slice(timestamp);
             tuple.push(is_write_read.clone());
             logup.add_to_relation_with(
                 reg_lookup,
@@ -182,12 +180,12 @@ pub(super) fn registers(
 /// The witness input: its count compared with its capacity, and its call.
 pub(super) fn witness_input(
     logup: &mut LogupTraceBuilder,
-    component_trace: &ComponentTrace,
+    row: &RowTrace<'_>,
     lookup_elements: &AllLookupElements,
 ) {
-    let timestamp = crate::trace::original_base_column!(component_trace, Column::Timestamp);
-    let phi10 = crate::trace::original_base_column!(component_trace, Column::Phi10);
-    let phi11 = crate::trace::original_base_column!(component_trace, Column::Phi11);
+    let timestamp = &row.timestamp;
+    let phi10 = &row.phi10;
+    let phi11 = &row.phi11;
     // ── Witness input (prover-side mirror) ──
     // Two CompareLookup tuples (φ8, count, 0), then two WitnessCall tuples
     // (ts, φ7's low four bytes, count), the count combined from Result's
@@ -195,13 +193,11 @@ pub(super) fn witness_input(
     {
         let compare: &CompareLookupElements = lookup_elements.as_ref();
         let witness_call: &WitnessCallLookupElements = lookup_elements.as_ref();
-        let is_witness =
-            crate::trace::original_base_column!(component_trace, Column::IsWitnessEcall);
-        let non_empty =
-            crate::trace::original_base_column!(component_trace, Column::WitnessNonEmpty);
-        let result = crate::trace::original_base_column!(component_trace, Column::Result);
+        let is_witness = &row.is_witness_ecall;
+        let non_empty = &row.witness_non_empty;
+        let result = &row.result;
         let mut compare_tuple: Vec<_> = phi11.to_vec();
-        compare_tuple.extend_from_slice(&result);
+        compare_tuple.extend_from_slice(result);
         compare_tuple.push(crate::trace::component::FinalizedColumn::Constant(
             BaseField::from(0u32),
         ));

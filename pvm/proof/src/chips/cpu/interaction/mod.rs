@@ -33,7 +33,7 @@ use crate::lookups::{
 };
 use crate::trace::component::ComponentTrace;
 
-use super::columns::Column;
+use super::columns::{Column, RowTrace};
 
 use stwo::prover::backend::simd::m31::PackedBaseField;
 
@@ -53,33 +53,34 @@ pub(super) fn generate_interaction_trace(
 ) {
     let log_size = component_trace.log_size();
     let mut logup = LogupTraceBuilder::new(log_size);
-    result_bytes(&mut logup, &component_trace, lookup_elements);
-    memory::memory_access(&mut logup, &component_trace, lookup_elements);
-    control::program_execution(&mut logup, &component_trace, lookup_elements);
-    lookups::table_lookups(&mut logup, &component_trace, lookup_elements);
-    registers::registers(&mut logup, &component_trace, lookup_elements);
-    signs::sign_extension(&mut logup, &component_trace, lookup_elements);
-    program::program_memory(&mut logup, &component_trace, lookup_elements);
-    program::flag_bits(&mut logup, &component_trace, lookup_elements);
-    control::jump_table(&mut logup, &component_trace, lookup_elements);
-    signs::sign_nibbles(&mut logup, &component_trace, lookup_elements);
-    lookups::arithmetic(&mut logup, &component_trace, lookup_elements);
-    registers::witness_input(&mut logup, &component_trace, lookup_elements);
-    next_timestamp(&mut logup, &component_trace, lookup_elements);
+    let row = RowTrace::new(&component_trace);
+    result_bytes(&mut logup, &row, lookup_elements);
+    memory::memory_access(&mut logup, &row, lookup_elements);
+    control::program_execution(&mut logup, &row, lookup_elements);
+    lookups::table_lookups(&mut logup, &row, lookup_elements);
+    registers::registers(&mut logup, &row, lookup_elements);
+    signs::sign_extension(&mut logup, &row, lookup_elements);
+    program::program_memory(&mut logup, &row, lookup_elements);
+    program::flag_bits(&mut logup, &row, lookup_elements);
+    control::jump_table(&mut logup, &row, lookup_elements);
+    signs::sign_nibbles(&mut logup, &row, lookup_elements);
+    lookups::arithmetic(&mut logup, &row, lookup_elements);
+    registers::witness_input(&mut logup, &row, lookup_elements);
+    next_timestamp(&mut logup, &row, lookup_elements);
     logup.finalize()
 }
 
 /// The result's bytes, range-checked on every real row.
 fn result_bytes(
     logup: &mut LogupTraceBuilder,
-    component_trace: &ComponentTrace,
+    row: &RowTrace<'_>,
     lookup_elements: &AllLookupElements,
 ) {
-    let is_pad = crate::trace::original_base_column!(component_trace, Column::IsPadding);
+    let is_pad = &row.is_padding;
     let range256: &Range256LookupElements = lookup_elements.as_ref();
     // Range256 lookups for result bytes
-    let result = crate::trace::original_base_column!(component_trace, Column::Result);
-    for col in &result {
+    let result = &row.result;
+    for col in result {
         logup.add_to_relation_with(
             range256,
             [is_pad[0].clone()],
@@ -92,15 +93,15 @@ fn result_bytes(
 /// The next timestamp's bytes, range-checked; kept last.
 fn next_timestamp(
     logup: &mut LogupTraceBuilder,
-    component_trace: &ComponentTrace,
+    row: &RowTrace<'_>,
     lookup_elements: &AllLookupElements,
 ) {
-    let is_pad = crate::trace::original_base_column!(component_trace, Column::IsPadding);
+    let is_pad = &row.is_padding;
     let range256: &Range256LookupElements = lookup_elements.as_ref();
     // ── NextTimestamp Range256 lookups (8, kept last) ──
     {
-        let next_ts = crate::trace::original_base_column!(component_trace, Column::NextTimestamp);
-        for col in &next_ts {
+        let next_ts = &row.next_timestamp;
+        for col in next_ts {
             logup.add_to_relation_with(
                 range256,
                 [is_pad[0].clone()],

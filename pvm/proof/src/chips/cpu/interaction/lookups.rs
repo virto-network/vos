@@ -12,7 +12,7 @@ use crate::trace::component::FinalizedColumn;
 /// The power-of-two, popcount and bitcount lookups.
 pub(super) fn table_lookups(
     logup: &mut LogupTraceBuilder,
-    component_trace: &ComponentTrace,
+    row: &RowTrace<'_>,
     lookup_elements: &AllLookupElements,
 ) {
     // Power-of-two lookup: (shift_amount, val_d[8]) when shift is constrained.
@@ -20,20 +20,15 @@ pub(super) fn table_lookups(
     // `is_shift_c · (1 − is_rotate_r64 − is_rotate_r32)`, and one keyed
     // on ShiftAmountCompl with multiplicity `is_rotate_r64 + is_rotate_r32`.
     let pow2_lookup: &PowerOfTwoLookupElements = lookup_elements.as_ref();
-    let shift_amount_col =
-        crate::trace::original_base_column!(component_trace, Column::ShiftAmount);
-    let is_shift_constrained =
-        crate::trace::original_base_column!(component_trace, Column::IsShiftConstrained);
-    let is_rotate_r64_col_pow2 =
-        crate::trace::original_base_column!(component_trace, Column::IsRotateR64);
-    let is_rotate_r32_col_pow2 =
-        crate::trace::original_base_column!(component_trace, Column::IsRotateR32);
-    let shift_amount_compl_col =
-        crate::trace::original_base_column!(component_trace, Column::ShiftAmountCompl);
-    let val_d_cols = crate::trace::original_base_column!(component_trace, Column::ValD);
+    let shift_amount_col = &row.shift_amount;
+    let is_shift_constrained = &row.is_shift_constrained;
+    let is_rotate_r64_col_pow2 = &row.is_rotate_r64;
+    let is_rotate_r32_col_pow2 = &row.is_rotate_r32;
+    let shift_amount_compl_col = &row.shift_amount_compl;
+    let val_d_cols = &row.val_d;
     {
         let mut tuple: Vec<_> = vec![shift_amount_col[0].clone()];
-        tuple.extend_from_slice(&val_d_cols);
+        tuple.extend_from_slice(val_d_cols);
         logup.add_to_relation_with(
             pow2_lookup,
             [
@@ -49,7 +44,7 @@ pub(super) fn table_lookups(
     // ShiftAmountCompl.
     {
         let mut tuple: Vec<_> = vec![shift_amount_compl_col[0].clone()];
-        tuple.extend_from_slice(&val_d_cols);
+        tuple.extend_from_slice(val_d_cols);
         logup.add_to_relation_with(
             pow2_lookup,
             [
@@ -65,10 +60,8 @@ pub(super) fn table_lookups(
     // CountSetBits rows.  Mirror of the verifier-side emission.
     {
         let popcount_lookup: &PopcountLookupElements = lookup_elements.as_ref();
-        let is_count_set_bits_col =
-            crate::trace::original_base_column!(component_trace, Column::IsCountSetBits);
-        let byte_popcount_col =
-            crate::trace::original_base_column!(component_trace, Column::BytePopcount);
+        let is_count_set_bits_col = &row.is_count_set_bits;
+        let byte_popcount_col = &row.byte_popcount;
         for i in 0..WORD_SIZE {
             logup.add_to_relation_with(
                 popcount_lookup,
@@ -83,10 +76,10 @@ pub(super) fn table_lookups(
     // BitOpTzByte[i]) on LZ/TZ rows.  Multiplicity = is_lzb + is_tzb.
     {
         let bitcount_lookup: &BitcountLookupElements = lookup_elements.as_ref();
-        let is_lzb_col = crate::trace::original_base_column!(component_trace, Column::IsLzb);
-        let is_tzb_col = crate::trace::original_base_column!(component_trace, Column::IsTzb);
-        let lz_col = crate::trace::original_base_column!(component_trace, Column::BitOpLzByte);
-        let tz_col = crate::trace::original_base_column!(component_trace, Column::BitOpTzByte);
+        let is_lzb_col = &row.is_lzb;
+        let is_tzb_col = &row.is_tzb;
+        let lz_col = &row.bit_op_lz_byte;
+        let tz_col = &row.bit_op_tz_byte;
         for i in 0..WORD_SIZE {
             logup.add_to_relation_with(
                 bitcount_lookup,
@@ -103,10 +96,10 @@ pub(super) fn table_lookups(
 /// are DivRemChip's own.
 pub(super) fn arithmetic(
     logup: &mut LogupTraceBuilder,
-    component_trace: &ComponentTrace,
+    row: &RowTrace<'_>,
     lookup_elements: &AllLookupElements,
 ) {
-    let flag = |column: Column| component_trace.original_base_column::<1, _>(column)[0].clone();
+    let flag = |column: Column| row.column(column)[0].clone();
 
     // ── MultiplicationLookup producer (prover-side mirror) ──
     // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +
@@ -115,9 +108,9 @@ pub(super) fn arithmetic(
     {
         let mul: &MultiplicationLookupElements = lookup_elements.as_ref();
         let is_mul_lo_slot = width(&MUL_HEAD);
-        let mut tuple = columns(component_trace, &MUL_HEAD);
+        let mut tuple = columns(row, &MUL_HEAD);
         tuple.push(FinalizedColumn::Constant(BaseField::from(0)));
-        tuple.extend(columns(component_trace, &MUL_TAIL));
+        tuple.extend(columns(row, &MUL_TAIL));
         let width = tuple.len();
         for _ in 0..2 {
             let is_mul = flag(Column::IsMul);
@@ -141,7 +134,7 @@ pub(super) fn arithmetic(
     // 41-limb tuple (4 sign bits, is_div_s, is_shar_r).
     {
         let divrem: &DivRemLookupElements = lookup_elements.as_ref();
-        let tuple = columns(component_trace, &DIVREM);
+        let tuple = columns(row, &DIVREM);
         for _ in 0..2 {
             logup.add_to_relation_with(divrem, [flag(Column::IsDivRem)], |[m]| m.into(), &tuple);
         }
@@ -152,7 +145,7 @@ pub(super) fn arithmetic(
     // Multiplicity = is_compare + is_branch (= sum of 18 sub-flags).
     {
         let compare: &CompareLookupElements = lookup_elements.as_ref();
-        let tuple = columns(component_trace, &COMPARE);
+        let tuple = columns(row, &COMPARE);
         let flags: [_; COMPARE_FLAGS.len() + BRANCH_FLAGS.len()] = core::array::from_fn(|i| {
             flag(
                 COMPARE_FLAGS
@@ -170,7 +163,7 @@ pub(super) fn arithmetic(
     // Tuple (30 limbs): val_b[8] + val_d[8] + result[8] + 6 sub-flags.
     {
         let bitwise: &BitwiseLookupElements = lookup_elements.as_ref();
-        let tuple = columns(component_trace, &BITWISE);
+        let tuple = columns(row, &BITWISE);
         for _ in 0..2 {
             logup.add_to_relation_with(bitwise, BITWISE_FLAGS.map(flag), |f| sum(f).into(), &tuple);
         }
@@ -179,13 +172,10 @@ pub(super) fn arithmetic(
 
 /// The finalized parts of `columns`, in order: a tuple of
 /// [`tuples`](crate::chips::cpu::tuples).
-fn columns<'a>(
-    component_trace: &'a ComponentTrace,
-    columns: &[Column],
-) -> Vec<FinalizedColumn<'a>> {
+pub(super) fn columns<'a>(row: &RowTrace<'a>, columns: &[Column]) -> Vec<FinalizedColumn<'a>> {
     columns
         .iter()
-        .flat_map(|&column| component_trace.original_columns(column))
+        .flat_map(|&column| row.column(column).iter().cloned())
         .collect()
 }
 

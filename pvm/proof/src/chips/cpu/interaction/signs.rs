@@ -5,20 +5,20 @@ use super::*;
 /// The sign extensions' nibble lookups.
 pub(super) fn sign_extension(
     logup: &mut LogupTraceBuilder,
-    component_trace: &ComponentTrace,
+    row: &RowTrace<'_>,
     lookup_elements: &AllLookupElements,
 ) {
     let bitwise_and: &BitwiseAndLookupElements = lookup_elements.as_ref();
     let sixteen = PackedBaseField::broadcast(BaseField::from(16));
-    let val_d_cols = crate::trace::original_base_column!(component_trace, Column::ValD);
+    let val_d_cols = &row.val_d;
     // ── BitManip SE nibble lookups ──
     // 4 emissions paired with verifier-side (2a, 2b, 3a, 3b).  Last block
     // before finalize() so they pair within themselves.
     {
-        let is_se8 = crate::trace::original_base_column!(component_trace, Column::IsSignExt8);
-        let is_se16 = crate::trace::original_base_column!(component_trace, Column::IsSignExt16);
-        let se_bit = crate::trace::original_base_column!(component_trace, Column::SignExtBit);
-        let se_hi = crate::trace::original_base_column!(component_trace, Column::SignExtSrcHiNib);
+        let is_se8 = &row.is_sign_ext8;
+        let is_se16 = &row.is_sign_ext16;
+        let se_bit = &row.sign_ext_bit;
+        let se_hi = &row.sign_ext_src_hi_nib;
         let eight_p = PackedBaseField::broadcast(BaseField::from(8));
         let fifteen_p = PackedBaseField::broadcast(BaseField::from(15));
         let val_d_0 = val_d_cols[0].clone();
@@ -70,7 +70,7 @@ pub(super) fn sign_extension(
 /// The sign bits' nibble lookups.
 pub(super) fn sign_nibbles(
     logup: &mut LogupTraceBuilder,
-    component_trace: &ComponentTrace,
+    row: &RowTrace<'_>,
     lookup_elements: &AllLookupElements,
 ) {
     let bitwise_and: &BitwiseAndLookupElements = lookup_elements.as_ref();
@@ -79,19 +79,19 @@ pub(super) fn sign_nibbles(
     // finalize_logup_in_pairs.  Same tuple shape, same multiplicity
     // (is_real per row), same emission order.
     {
-        let is_pad_col = crate::trace::original_base_column!(component_trace, Column::IsPadding);
-        let sign_src_b = crate::trace::original_base_column!(component_trace, Column::SignSrcB);
-        let sign_src_d = crate::trace::original_base_column!(component_trace, Column::SignSrcD);
-        let sign_src_q = crate::trace::original_base_column!(component_trace, Column::SignSrcQ);
-        let sign_src_r = crate::trace::original_base_column!(component_trace, Column::SignSrcR);
-        let sign_b_hi = crate::trace::original_base_column!(component_trace, Column::SignBHiNib);
-        let sign_d_hi = crate::trace::original_base_column!(component_trace, Column::SignDHiNib);
-        let sign_q_hi = crate::trace::original_base_column!(component_trace, Column::SignQHiNib);
-        let sign_r_hi = crate::trace::original_base_column!(component_trace, Column::SignRHiNib);
-        let sign_bit_b = crate::trace::original_base_column!(component_trace, Column::SignBitB);
-        let sign_bit_d = crate::trace::original_base_column!(component_trace, Column::SignBitD);
-        let sign_bit_q = crate::trace::original_base_column!(component_trace, Column::SignBitQ);
-        let sign_bit_r = crate::trace::original_base_column!(component_trace, Column::SignBitR);
+        let is_pad_col = &row.is_padding;
+        let sign_src_b = &row.sign_src_b;
+        let sign_src_d = &row.sign_src_d;
+        let sign_src_q = &row.sign_src_q;
+        let sign_src_r = &row.sign_src_r;
+        let sign_b_hi = &row.sign_b_hi_nib;
+        let sign_d_hi = &row.sign_d_hi_nib;
+        let sign_q_hi = &row.sign_q_hi_nib;
+        let sign_r_hi = &row.sign_r_hi_nib;
+        let sign_bit_b = &row.sign_bit_b;
+        let sign_bit_d = &row.sign_bit_d;
+        let sign_bit_q = &row.sign_bit_q;
+        let sign_bit_r = &row.sign_bit_r;
 
         let one_p = PackedBaseField::broadcast(BaseField::from(1));
         let eight_p = PackedBaseField::broadcast(BaseField::from(8));
@@ -198,11 +198,9 @@ pub(super) fn sign_nibbles(
         );
 
         // SignBitResult — pin to bit 7 of result[3].
-        let result_cols = crate::trace::original_base_column!(component_trace, Column::Result);
-        let sign_bit_result_col =
-            crate::trace::original_base_column!(component_trace, Column::SignBitResult);
-        let result_hi_col =
-            crate::trace::original_base_column!(component_trace, Column::ResultHiNib);
+        let result_cols = &row.result;
+        let sign_bit_result_col = &row.sign_bit_result;
+        let result_hi_col = &row.result_hi_nib;
         let hi_res = result_hi_col[0].clone();
         let bit_res = sign_bit_result_col[0].clone();
         let pad_res1 = is_pad_col[0].clone();
@@ -228,12 +226,9 @@ pub(super) fn sign_nibbles(
         );
 
         // LoadSignBit — pin to bit 7 of LoadSignSrc.
-        let load_sign_src =
-            crate::trace::original_base_column!(component_trace, Column::LoadSignSrc);
-        let load_sign_bit_col =
-            crate::trace::original_base_column!(component_trace, Column::LoadSignBit);
-        let load_sign_hi_col =
-            crate::trace::original_base_column!(component_trace, Column::LoadSignHiNib);
+        let load_sign_src = &row.load_sign_src;
+        let load_sign_bit_col = &row.load_sign_bit;
+        let load_sign_hi_col = &row.load_sign_hi_nib;
         let hi_load = load_sign_hi_col[0].clone();
         let bit_load = load_sign_bit_col[0].clone();
         let pad_load1 = is_pad_col[0].clone();

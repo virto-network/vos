@@ -5,29 +5,23 @@ use super::*;
 /// The memory access, a byte at a time.
 pub(super) fn memory_access(
     logup: &mut LogupTraceBuilder,
-    component_trace: &ComponentTrace,
+    row: &RowTrace<'_>,
     lookup_elements: &AllLookupElements,
 ) {
     // Memory access lookups — byte-level (up to 8 entries per memory op)
     // `is_write` is the sum of the 3 store-class sub-flags
     // (IsStoreDirect + IsStoreImmAny + IsStoreInd).
     let mem_lookup: &MemoryAccessLookupElements = lookup_elements.as_ref();
-    let is_store_direct_mem =
-        crate::trace::original_base_column!(component_trace, Column::IsStoreDirect);
-    let is_store_imm_any_mem =
-        crate::trace::original_base_column!(component_trace, Column::IsStoreImmAny);
-    let is_store_ind_mem = crate::trace::original_base_column!(component_trace, Column::IsStoreInd);
-    let mem_addr = crate::trace::original_base_column!(component_trace, Column::MemAddr);
-    let mem_value = crate::trace::original_base_column!(component_trace, Column::MemValue);
-    let timestamp = crate::trace::original_base_column!(component_trace, Column::Timestamp);
-    let mem_byte_active =
-        crate::trace::original_base_column!(component_trace, Column::MemByteActive);
-    let mem_byte_carry1 =
-        crate::trace::original_base_column!(component_trace, Column::MemByteAddrCarry1);
-    let mem_byte_carry2 =
-        crate::trace::original_base_column!(component_trace, Column::MemByteAddrCarry2);
-    let mem_byte_carry3 =
-        crate::trace::original_base_column!(component_trace, Column::MemByteAddrCarry3);
+    let is_store_direct_mem = &row.is_store_direct;
+    let is_store_imm_any_mem = &row.is_store_imm_any;
+    let is_store_ind_mem = &row.is_store_ind;
+    let mem_addr = &row.mem_addr;
+    let mem_value = &row.mem_value;
+    let timestamp = &row.timestamp;
+    let mem_byte_active = &row.mem_byte_active;
+    let mem_byte_carry1 = &row.mem_byte_addr_carry1;
+    let mem_byte_carry2 = &row.mem_byte_addr_carry2;
+    let mem_byte_carry3 = &row.mem_byte_addr_carry3;
 
     // For each byte offset 0..8, produce a byte-level lookup entry
     // Tuple: (addr+i [4], value_byte_i [1], timestamp[8], is_write[1])
