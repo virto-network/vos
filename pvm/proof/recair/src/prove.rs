@@ -22,6 +22,7 @@ use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::poly::circle::PolyOps;
+use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::{CommitmentSchemeProver, ComponentProver, ProvingError};
 use vos_pvm_poseidon2::{Digest, M31};
 use vos_pvm_proof::format::{ChannelKind, Format, LEAF_FOLD, ProofKind};
@@ -142,10 +143,13 @@ pub fn circuit_hash_of(log_sizes: &LogSizes, root: &P2Hash) -> Digest {
     )
 }
 
-fn twiddle_log_size(log_sizes: &LogSizes, config: &PcsConfig) -> u32 {
-    log_sizes.iter().max().copied().unwrap_or(0)
+/// The twiddles a commitment scheme over a circuit of `log_sizes` takes:
+/// to its tallest component's constraint-degree bound, blown up.
+fn twiddles(log_sizes: &LogSizes, config: &PcsConfig) -> TwiddleTree<SimdBackend> {
+    let log_size = log_sizes.iter().max().copied().unwrap_or(0)
         + LOG_CONSTRAINT_EXPANSION
-        + config.fri_config.log_blowup_factor
+        + config.fri_config.log_blowup_factor;
+    SimdBackend::precompute_twiddles(CanonicCoset::new(log_size).circle_domain().half_coset)
 }
 
 /// The preprocessed tree's root, and the circuit's hash, of a circuit whose
@@ -167,11 +171,7 @@ where
     circuit.check_wiring()?;
     let log_sizes = circuit.log_sizes();
     let config = format.pcs_config();
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(twiddle_log_size(&log_sizes, &config))
-            .circle_domain()
-            .half_coset,
-    );
+    let twiddles = twiddles(&log_sizes, &config);
     let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     let mut builder = scheme.tree_builder();
     builder.extend_evals(preprocessed_evaluations(circuit));
@@ -251,11 +251,7 @@ where
     circuit.check_wiring().map_err(ProveError::Wiring)?;
     let log_sizes = circuit.log_sizes();
     let config = format.pcs_config();
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(twiddle_log_size(&log_sizes, &config))
-            .circle_domain()
-            .half_coset,
-    );
+    let twiddles = twiddles(&log_sizes, &config);
     let channel = &mut MC::C::default();
     mix_statement_header(channel, format.number, &config, &log_sizes);
     let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);

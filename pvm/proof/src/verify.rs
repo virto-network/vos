@@ -1,13 +1,9 @@
 use num_traits::Zero;
-use stwo::{
-    core::{
-        air::Component,
-        fields::qm31::SecureField,
-        pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec},
-        poly::circle::CanonicCoset,
-        verifier::VerificationError,
-    },
-    prover::{CommitmentSchemeProver, poly::circle::PolyOps},
+use stwo::core::{
+    air::Component,
+    fields::qm31::SecureField,
+    pcs::{CommitmentSchemeVerifier, PcsConfig, TreeVec},
+    verifier::VerificationError,
 };
 use stwo_constraint_framework::TraceLocationAllocator;
 
@@ -373,34 +369,10 @@ where
             "a sparse memory image without its program's layout".to_string(),
         ));
     }
-    // The caller passes the same prover-trait component set the
-    // prover used (either `active_components(side_note)` for the default
-    // path, or an explicit slice for the chip-isolated harness).  This
-    // helper actually re-runs prover-side preprocessing-trace generation
-    // to re-commit, so it needs the prover trait, not the verifier-side
-    // MachineComponent.
-    let max_constraint_log_degree_bound = components
-        .iter()
-        .zip(log_sizes)
-        .map(|(c, &log_size)| c.max_constraint_log_degree_bound(log_size))
-        .max()
-        .unwrap_or(0);
-    // The root does not depend on the channel it is mixed into.
-    let verifier_channel = &mut MC::C::default();
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
-            .circle_domain()
-            .half_coset,
-    );
-    let commitment_scheme = &mut CommitmentSchemeProver::<SimdBackend, MC>::new(*config, &twiddles);
-
-    let mut tree_builder = commitment_scheme.tree_builder();
-    for (c, log_size) in components.iter().zip(log_sizes) {
-        tree_builder.extend_evals(c.generate_preprocessed_trace(*log_size, side_note));
-    }
-    tree_builder.commit(verifier_channel);
-
-    let preprocessed_expected = commitment_scheme.roots()[PREPROCESSED_TRACE_IDX];
+    // The prover-trait components the prover used, whose preprocessed
+    // traces are generated again and committed.
+    let preprocessed_expected =
+        crate::prove::preprocessed_root::<MC>(side_note, components, log_sizes, *config);
     let preprocessed = proof.commitments[PREPROCESSED_TRACE_IDX];
     if preprocessed_expected != preprocessed {
         Err(VerificationError::InvalidStructure(format!(

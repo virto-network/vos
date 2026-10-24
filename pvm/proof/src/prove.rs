@@ -3,15 +3,11 @@ use stwo::{
         ColumnVec,
         channel::Channel,
         fields::{m31::BaseField, qm31::SecureField},
-        poly::circle::CanonicCoset,
     },
     prover::{
         CommitmentSchemeProver, ComponentProver,
         backend::simd::SimdBackend,
-        poly::{
-            BitReversedOrder,
-            circle::{CircleEvaluation, PolyOps},
-        },
+        poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
 use stwo_constraint_framework::TraceLocationAllocator;
@@ -33,6 +29,7 @@ use crate::{lookups::AllLookupElements, side_note::SideNote};
 pub use crate::proof::{Proof, SegmentState};
 
 mod canonical;
+pub(crate) use canonical::preprocessed_root;
 #[cfg(feature = "debug-internals")]
 mod debug;
 mod profile;
@@ -651,21 +648,10 @@ where
     }
     let trace_gen = t.elapsed();
 
-    let max_constraint_log_degree_bound = components
-        .iter()
-        .zip(&log_sizes)
-        .map(|(c, &log_size)| c.max_constraint_log_degree_bound(log_size))
-        .max()
-        .unwrap_or(0);
-
-    let twiddles = SimdBackend::precompute_twiddles(
-        CanonicCoset::new(max_constraint_log_degree_bound + config.fri_config.log_blowup_factor)
-            .circle_domain()
-            .half_coset,
-    );
+    let twiddles = canonical::twiddles_for(components, &log_sizes, &config);
 
     let prover_channel = &mut MC::C::default();
-    crate::proof::mix_proof_fs_domain(prover_channel, format.number, &config);
+    crate::proof::mix_statement_header(prover_channel, format.number, &config, &log_sizes);
 
     let mut commitment_scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     // Stwo v2.x requires polynomial coefficients to be stored — without
@@ -673,9 +659,6 @@ where
     // polynomial's coefficients are not stored".  The toggle costs some
     // memory but is the only supported path for our chip shape.
     commitment_scheme.set_store_polynomials_coefficients();
-    log_sizes.iter().for_each(|log_size| {
-        prover_channel.mix_u64(*log_size as u64);
-    });
 
     // Preprocessed trace.
     let t = Instant::now();
