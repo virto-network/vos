@@ -39,7 +39,7 @@ use crate::blobs::{IndexRow, pinned_hash};
 use keys::{
     NODE, NodeRow, SYSTEM, agent_key, applied, be_u64, decode_entry, decode_hard,
     decode_membership, decode_position, entry_blobs, epoch, log_index, log_key, node_record,
-    node_row, registry_prefix,
+    node_row, prover_job, prover_job_of, registry_prefix,
 };
 
 pub use batch::Batch;
@@ -335,27 +335,21 @@ impl Fjall {
         let mut jobs = Vec::new();
         for row in self.system().prefix(&prefix) {
             let (key, job) = row.into_inner()?;
-            let rest = &key[prefix.len()..];
-            let (Some(agent), Some(id)) = (
-                rest.get(..4).and_then(|bytes| bytes.try_into().ok()),
-                rest.get(4..)
-                    .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok()),
-            ) else {
+            let Some((agent, id)) = prover_job_of(&key[prefix.len()..]) else {
                 tracing::error!("a prover's job is misnamed; it is not read");
                 continue;
             };
-            jobs.push((AgentId(u32::from_be_bytes(agent)), id, job.to_vec()));
+            jobs.push((agent, id, job.to_vec()));
         }
         Ok(jobs)
     }
 
     /// The prover's job of `agent`'s statement `id`, its encoding.
     pub fn prover_job(&self, agent: AgentId, id: &[u8; 32]) -> Result<Option<Vec<u8>>> {
-        let key = node_record(
-            NodeRow::ProverJob,
-            &[&agent.0.to_be_bytes()[..], id].concat(),
-        );
-        Ok(self.system().get(key)?.map(|job| job.to_vec()))
+        Ok(self
+            .system()
+            .get(prover_job(agent, id))?
+            .map(|job| job.to_vec()))
     }
 
     /// The last index of `agent`'s log the prover read into jobs: 0 for

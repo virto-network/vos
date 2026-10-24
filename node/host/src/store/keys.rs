@@ -72,6 +72,22 @@ pub(super) fn node_record(row: NodeRow, rest: &[u8]) -> Vec<u8> {
     [node_row(NODE_AGENT, row), rest.to_vec()].concat()
 }
 
+/// A prover's job's row: its agent, then its statement's id.
+pub(super) fn prover_job(agent: AgentId, id: &[u8; 32]) -> Vec<u8> {
+    node_record(
+        NodeRow::ProverJob,
+        &[&agent.0.to_be_bytes()[..], id].concat(),
+    )
+}
+
+/// The agent and statement id a prover's job's row names past its
+/// prefix: none for a misnamed row.
+pub(super) fn prover_job_of(rest: &[u8]) -> Option<(AgentId, [u8; 32])> {
+    let agent = rest.get(..4)?.try_into().ok()?;
+    let id = rest.get(4..)?.try_into().ok()?;
+    Some((AgentId(u32::from_be_bytes(agent)), id))
+}
+
 pub(super) fn be_u64(bytes: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(bytes.try_into().ok()?))
 }

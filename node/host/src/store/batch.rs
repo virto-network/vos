@@ -10,7 +10,7 @@ use vos_wire::result::Write;
 
 use super::keys::{
     NodeRow, agent_key, encode_entry, encode_hard, encode_last_result, encode_membership,
-    encode_position, log_key, node_record, node_row, registry_prefix,
+    encode_position, log_key, node_record, node_row, prover_job, registry_prefix,
 };
 use super::{Error, Fjall, HardState, LogEntry, Membership, Result, Row, Switch};
 
@@ -265,10 +265,7 @@ impl Batch {
     /// Write the prover's job of `agent`'s statement `id`, its encoding,
     /// or remove it (`None`).
     pub fn prover_job(&mut self, agent: AgentId, id: &[u8; 32], job: Option<&[u8]>) {
-        let key = node_record(
-            NodeRow::ProverJob,
-            &[&agent.0.to_be_bytes()[..], id].concat(),
-        );
+        let key = prover_job(agent, id);
         match job {
             Some(job) => self.batch.insert(self.store.system(), key, job),
             None => self.batch.remove(self.store.system(), key),
