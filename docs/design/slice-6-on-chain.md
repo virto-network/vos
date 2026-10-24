@@ -1873,7 +1873,9 @@ fees are the teammate's.
       store's system partition naming the keyspace layout, which
       `Fjall::open` refuses on a mismatch, so a store written before a
       layout change (6.11 moved committed rows under `0x03`) fails to open
-      instead of hiding its rows.
+      instead of hiding its rows. Built at 6.22's close: layout 2, a new
+      store writes it, and a store holding rows and naming no layout is
+      refused, as it may be either.
   23. **The decode's allocator** (6.4's review): format 39's decode costs
       about 3.7M gas on the JAM-only host, most of it the guest's
       allocator over the proof's 1,012 column vectors (Stwo's shape), not
@@ -1883,18 +1885,32 @@ fees are the teammate's.
 - **Carried from the M3b/M3c Fable review** (`research/slice-6/M3bc-fable.md`;
   H1, M1–M3, M5(a)(b) and M6(a)–(c) are folded, M4 resolved by decision 17,
   L1, L2 and L6 fixed, M6(d) and (e) and L7's §9.1 references stated in
-  `spaces-pallet.md` §9.1, L7's logs row in `SECURITY.md`):
-  - **M5(c):** `Reach::Recorded` exempts the statements service's own
-    output in the testnet's log and database (its guest log lines and
-    accumulate writes): the service's storage dumped over RPC as a
-    `Leaves` carrier, the chain's layout constants excluded by value;
-  - **M5(d):** the masked wrap's own randomness and mask-column
-    commitments as needles (a `Built::Wrap` observation); an audited run
-    with an injected failing and a panicking proof, or a redacting panic
-    hook on the prover thread (`TreeError`'s `Debug` reaches
-    `ProveError::Failed`); and the binary scan on the release build, with
-    `vos-statement-service --features pvm-guest` in
+  `spaces-pallet.md` §9.1, L7's logs row in `SECURITY.md`). Done at 6.22's
+  close (`slice-6-progress.md`, "6.22, the close"):
+  - **M5(c):** the statements service's storage, read over RPC at the
+    finalized block, is a carrier that leaves in the chain e2e; the
+    venue's layout constants and the space's clock are dropped from the
+    needles by value (`Needles::except`);
+  - **M5(d):** a `Built::Wrap` observation makes the masked wrap's
+    randomness needles (each attempt's entropy and seed, the witness
+    digest, the blinding values, the seeds of the mask, salt and `R`
+    columns: `Kind::WrapRandomness`); a panic while a proof is made prints
+    its place and not its message, and a failed proof's error names what
+    failed and no value; `vos-statement-service --features pvm-guest` is in
     `check-no-debug-internals`;
+  - **L5:** a finished rootless job is pruned once its record is behind
+    its agent's watermark and compacted out of its log;
+  - **L7's rest:** `assert_searchable` plants every form a carrier that
+    leaves is searched in; `carriers::directory` fails on what it cannot
+    read and searches the names; the audits read node disks once the nodes
+    stop; `Options::per_submit` defaults to 1.5 UNIT; the mock's `migrate`
+    refuses its own venue (`SameVenue`, error 28, in G14). `resume`
+    leaving the disputed window's first root anchored stays as documented
+    (mock and model alike), unpinned by a vector.
+
+  Still carried:
+  - **M5(d)'s binary scan on the release build:** `check-no-debug-internals`
+    scans the debug `vos` binary;
   - **M6(d)'s runner:** a FRAME-agnostic reference runner in the kit, if
     VOS's review of the teammate's harness is not enough;
   - **M6(e)'s code, with the port:** `KreivoVenue` marks an anchor held
@@ -1908,14 +1924,6 @@ fees are the teammate's.
     controller, or a founders' quorum): recorded in pin D;
   - **L4:** rootless `Kind::Stating` statements have no production prover
     (the worker proves at-cut attests alone);
-  - **L5:** finished rootless jobs are never pruned: prune them once the
-    agent's watermark and compaction are past their record;
-  - **L7's rest:** `assert_searchable` plants only a needle's first
-    `Leaves` form; `carriers::directory` swallows read errors and skips
-    file names; the e2e reads node disks before `cluster.stop`; `resume`
-    leaves the disputed window's first root anchored, unpinned by a
-    vector; `Options::per_submit` defaults to one UNIT while a submit
-    holds 1.5; the mock's `migrate` omits `to != venue`;
   - **L8 (ops notes):** decision 16's bound (3 s at the defaults) lets a
     node proving on the leader's disk hand over every group it leads
     under one slow fsync and win them back; the harnesses keep 5 s, their
@@ -1926,6 +1934,13 @@ fees are the teammate's.
     half) runs on the wall clock and is covered by the hand-back path's
     test (a window refused as signed, signed again), not by a test of
     its own: the shortest window is two minutes.
+- **Carried from the slice-5 rest (item 18), for the next step that
+  re-pins program ids** (none in slice 6): `array::from_fn` in
+  `agent/tree/src/hash.rs`, which moves the guest's code and with it
+  `WINDOW_PROGRAM` and `BALANCE_PROGRAM`; and `leaf_terms`' per-query
+  offsets (`4L − 5` circle rows, `6F − 2` FRI rows, OODS's `+ 13`, the
+  shape's `+ 2`), named once each is traced to its piece of recair's
+  verifier.
 - **Docs:** `proving.md` draft 6, `core-model.md`, `identity-and-authority.md`,
   `kreivo-pallet.md`'s superseded note, `clerk-across-spaces.md`, per
   `doc-fixes.md`; `slice-6-progress.md`, "Slice 6 accepted".

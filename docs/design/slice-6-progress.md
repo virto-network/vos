@@ -4081,7 +4081,11 @@ block reclaimed when it is the last and a realloc at the top in place:
 | verify | 82,076,046 | 77,922,303 | **77,755,239** (−5.3%) |
 | allocations | 7,969 | 7,427 | 7,426 |
 | heap peak live | 386,114 | 380,378 | 380,378 |
-| high-water | 980,032 | 1,433,872 | 1,301,368 |
+| high-water | 980,032 | 1,433,872 | 1,302,136³ |
+
+³ The highest top reached, measured again at 6.22's close with the peak
+tracked (the column first gave the top at the end, 1,301,368, which falls
+as the last blocks are freed); the allocations are the same.
 
 The statements service (`statement-service.elf`, the same runtime):
 `valid`'s refine 84.12M → 79.41M gas, accumulate 116,512 → 108,334;
@@ -4101,3 +4105,55 @@ rerun whole with `--no-fail-fast`, 552 passed in 42 suites, and
 before that stage, the fuzz replay and every build and lint among it.
 `just test-proof` green: 562 passed in 47 suites, the heavy recair gates
 and the carriers among them.
+
+## 6.22, the close
+
+The plan's item 22, the M3b/M3c review's carried items worth doing now, a
+load flake, the Opus review of 6.22a's small items, and the docs, each its
+own commit on `s6/close` from `s6/quality` (`40b6cca2`).
+
+| Item | What | Commit |
+|---|---|---|
+| 22 | the store names its keyspace layout: a row in the system partition (`NodeRow::Layout`, `0x13`), layout 2 (committed maps under `0x03`; layout 1 kept them under the instance's owner byte); a new store (all four partitions empty) writes it, synced; `Fjall::open` refuses a store in another layout, or with an unreadable row, and a store that holds rows and names no layout, as written before layouts were numbered it may be either; the node reports the refusal as a data error; tests: a new store's row, a reopen, another layout and no layout refused | `723e8421` |
+| M5(c) | the JAM statements service's storage, every entry `Statements::account` names, read over RPC at the finalized block, a carrier that leaves in the chain e2e (`JAM a`: 53 entries, `b`: 11); number needles equal to `SLOT_MS`, `BUCKET_MS`, `MAX_ROOT_AGE_MS` or the space's clock dropped by value (`Needles::except`) | `e978cc8a` |
+| M5(d) | `Built::Wrap`: the masked wrap's randomness as drawn, under `watch` (`vos_pvm_recair::masked::drawn_in`, a thread-local the draws note into): each attempt's entropy and seed, the witness digest, the blinding values, the seeds of every mask, salt and `R` column; `Kind::WrapRandomness`, searched in every carrier, the role's included | `c627c0a9` |
+| M5(d) | a panic while a proof is made prints its thread and place, its message withheld (a hook installed with the first proof, in force while any proof is in flight, as the prover's pool threads are not told apart); `ProveError::Failed` names what failed, no `Debug` of a value; tested by the test binary run again as a child, its standard error read | `e5182371` |
+| M5(d) | `vos-statement-service --features pvm-guest` in `check-no-debug-internals` | `2d1d68e6` |
+| L5 | a finished rootless job pruned once its record is behind its agent's watermark and compacted out of its log (`Host::attests` answers `None`); tested | `6db6b55e` |
+| L7 | `assert_searchable` plants each needle in every form a carrier that leaves is searched in | `77eba154` |
+| L7 | `carriers::directory` fails on a directory or file it cannot read (a file removed since it was listed is skipped) and adds every name under it as a carrier; the chain e2e and the carriers test read node disks once the nodes stop | `943831ba` |
+| L7 | `Options::per_submit` 1.5 UNIT, a submit's deposit and fee bound at the suggested values, pinned by a test against the mock's constants | `0fba9674` |
+| L7 | the mock's `migrate` refuses its own venue: `SameVenue`, error 28, in `spaces-pallet.md` §8 and G14; the vectors regenerated | `cbeb2e68` |
+| flake | `an_install_at_a_stalled_leader_times_out` follows the leader: an install refused `NotLeader` (not run) goes again at the leader with the commits open meanwhile; the install still answers `TimedOut` within the deadline at a leader whose commits stall | `1a12d6b9` |
+| review 1 | the guests' allocator in its own file (`guest/heap.rs`, generic over its arena); the high-water mark the highest top reached, kept as the top falls (a branch-free max), not the top at the end | `bca969b1` |
+| review 2 | a block shrunk below the top kept in place | `a9c105cd` |
+| review 3 | host tests of the allocator over a 4 KiB arena: alignment, the last block reclaimed in LIFO order, a realloc at the top, a shrink in place, the peak, null past the arena | `e31b4180` |
+| review 4 | the classification test's table described by what it holds | `573fe86f` |
+| review 5 | 6.22a's two carried items of item 18 named in the plan's carried list: no slice-6 step re-pins program ids | this record |
+| docs | `kreivo-pallet.md`'s note; `clerk-across-spaces.md`; `core-model.md`; `identity-and-authority.md`; `proving.md` draft 6 and `recursion-air.md`'s masked verifier; the guests' program sizes | `dc551379`, `2bb3e97e`, `338e70df`, `66303ee5`, `cadd2b1e`, `724db80d` |
+
+`resume` leaving the disputed window's first root anchored stays as
+documented. Still carried, in the plan's §6.22: M5(d)'s binary scan of the
+release build, M6(d)'s runner, M6(e) with the port, L3, L4, L8, the
+leader's anchor recheck's own test, and item 18's two pieces for the next
+re-pin.
+
+**The allocator, measured** [the `valid` fixture by a words request on the
+JAM-only host, `final-verify.elf`]: at `40b6cca2` 79,305,353 gas (decode
+1,500,249, verify 77,755,239), the top at the end 1,301,368; now
+79,563,385 (decode 1,499,821, verify 78,013,149), the highest top
+1,302,136, 380,378 bytes live at the peak and 7,426 allocations both. The
+peak's tracking costs about 173k of the verify, the shrink in place about
+85k (it never fires on `valid`; its check runs on every realloc below the
+top): +0.33% in all. The guests' programs: 397,976 bytes, the test
+guest's 462,242.
+
+**Bisecting `s6/quality`:** `854083f1`..`c77445d5` fail `check-no-std` and
+`a2c538fe`..`c2412e0d` fail `doc-check` on their own; the tips are green.
+A bisect over that range skips them.
+
+**Gates** [measured, at this code]: `just check` green, 1,398 passed in
+109 suites; `just e2e-chain` green (1,399.8 s; the audit 332 carriers, 22
+JAM packages and their reports, 4,059 `WrapRandomness` needles among the
+rest, clean; the testnet's errors none); `just test-carriers` green (451
+`WrapRandomness` needles, clean, 122.7 s).
