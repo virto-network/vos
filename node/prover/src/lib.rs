@@ -29,7 +29,8 @@
 //! [`VenueClient`](vos_venue::VenueClient); a venue's repeat counts as
 //! accepted, and a submission whose answer was lost goes again after 30 s,
 //! the wait doubled each time. A prover that panics on a statement, or
-//! stops the node, gives it up after three attempts.
+//! stops the node, gives it up after three attempts; a panic's message is
+//! withheld from standard error while a proof is made, its place printed.
 //!
 //! **Idempotent by statement id:** a restart finds a job it was proving
 //! queued again and proves it once more; a submission it made counts once
@@ -44,6 +45,7 @@
 mod internals;
 mod job;
 mod memory;
+mod redact;
 mod worker;
 
 #[cfg(feature = "prove")]

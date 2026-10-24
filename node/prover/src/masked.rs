@@ -153,6 +153,14 @@ impl MaskedProver {
         let (mut leaves, mut folds) = (0, 0);
         let mut watch = |built: Built<'_>| {
             let (name, digests) = match &built {
+                Built::Wrap(drawn) => {
+                    internals.wrap_randomness.extend(
+                        drawn
+                            .iter()
+                            .map(|drawn| (drawn.what.to_string(), drawn.bytes.clone())),
+                    );
+                    return;
+                }
                 Built::Segment(segment) => {
                     let (first, last) = segment.steps;
                     lengths.push((last - first) as u64);
@@ -220,9 +228,21 @@ impl MaskedProver {
                 | TreeError::Segment(ProvingError::Shape { .. } | ProvingError::MalformedShape) => {
                     ProveError::Kernel(format!("{error:?}"))
                 }
-                error => ProveError::Failed(format!("{error:?}")),
+                error => ProveError::Failed(failed(&error).into()),
             }
         })
+    }
+}
+
+/// What failed, and nothing of the values it failed on: an error's `Debug`
+/// may hold a run's.
+fn failed(error: &TreeError) -> &'static str {
+    match error {
+        TreeError::Witness(_) => "a node's values do not lay out",
+        TreeError::Prove(_) => "a node's circuit does not prove",
+        TreeError::Segment(_) => "a segment does not prove",
+        TreeError::Empty => "the run has no step",
+        TreeError::Bytes => "the wrap does not fit its format's layout",
     }
 }
 

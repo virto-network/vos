@@ -4,7 +4,6 @@
 //! submitted once its roots are anchored.
 
 use std::collections::{BTreeMap, HashMap};
-use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -477,7 +476,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         self.jobs.put(&id, &job)?;
         let started = Instant::now();
         let prover = Arc::clone(&self.prover);
-        let proved = std::panic::catch_unwind(AssertUnwindSafe(|| prover.prove(&kernel, &attest)))
+        let proved = crate::redact::proving(|| prover.prove(&kernel, &attest))
             .unwrap_or_else(|_| Err(ProveError::Failed("the prover panicked".into())));
         let took = started.elapsed();
         match proved {
