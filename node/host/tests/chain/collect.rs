@@ -17,8 +17,6 @@
 //! statement's encoding and a work report in its database, a report's
 //! hash in its log).
 
-use std::time::Duration;
-
 use vos_checker::carriers::{self, Audit, Kind, Reach};
 use vos_statement_service::accumulate::BUCKET_MS;
 use vos_statement_service::item::Item;
@@ -28,10 +26,7 @@ use vos_wire::result::digest;
 use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
 
 use crate::run::{CANARY, Jam, Run, Stated};
-use crate::venues::hex;
-
-/// How long a sent package's work report is waited for once the run ends.
-const REPORTED: Duration = Duration::from_secs(90);
+use crate::venues::{REPORTED, hex};
 
 /// What each node holds and sent, and both venues' anchor chains,
 /// collected before the nodes stop and the chain's clock moves; then the

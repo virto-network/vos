@@ -57,6 +57,12 @@ pub struct Cluster {
     pub offsets: Vec<Arc<AtomicI64>>,
 }
 
+/// Node `number`'s own clock's lead on the wall's: a few milliseconds,
+/// each node's its own.
+fn skew(number: NodeNumber) -> u64 {
+    u64::from(number) * 7
+}
+
 impl Cluster {
     /// Nodes 1..=count on the hub, as the harness configures them.
     pub fn new(count: u8) -> Self {
@@ -181,7 +187,7 @@ impl Cluster {
         config.writer_stall = Some(WRITER_STALL);
         // Each node's own clock, a few milliseconds apart, and as far
         // ahead as the test sets it.
-        let skew = u64::from(number) * 7;
+        let skew = skew(number);
         let offset = Arc::clone(&self.offsets[usize::from(number) - 1]);
         config.clock = Arc::new(move || {
             (vos_node::wall_clock() + skew).saturating_add_signed(offset.load(Ordering::SeqCst))
@@ -389,7 +395,20 @@ impl Cluster {
     /// milliseconds of skew, and its offset.
     pub fn clock(&self, number: NodeNumber) -> u64 {
         let offset = self.offsets[usize::from(number) - 1].load(Ordering::SeqCst);
-        (vos_node::wall_clock() + u64::from(number) * 7).saturating_add_signed(offset)
+        (vos_node::wall_clock() + skew(number)).saturating_add_signed(offset)
+    }
+
+    /// Node `number`'s clock set to read `at` about now.
+    pub fn set_clock(&self, number: NodeNumber, at: u64) {
+        let own = vos_node::wall_clock() + skew(number);
+        self.offsets[usize::from(number) - 1].store(at as i64 - own as i64, Ordering::SeqCst);
+    }
+
+    /// Every node's clock set to read `at` about now.
+    pub fn set_clocks(&self, at: u64) {
+        for number in 1..=self.offsets.len() as NodeNumber {
+            self.set_clock(number, at);
+        }
     }
 
     /// Alice's request adding `by` to `agent`'s counter, at `sequence` of

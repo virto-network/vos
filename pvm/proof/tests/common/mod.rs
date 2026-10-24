@@ -560,6 +560,15 @@ pub fn wrap_root(
     (bytes, words, masked)
 }
 
+/// The machine's load averages, as `/proc/loadavg` gives them: empty
+/// where it gives none.
+pub fn load() -> String {
+    std::fs::read_to_string("/proc/loadavg")
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
 /// The process's peak resident set (`VmHWM`) in MiB, reset to the present
 /// one first when `reset`.
 pub fn resident_peak_mib(reset: bool) -> u64 {
@@ -593,7 +602,7 @@ fn masked_wrap(
     use vos_pvm_final_verifier::masked;
     use vos_pvm_recair::masked::MaskRng;
 
-    let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
+    let load = load();
     resident_peak_mib(true);
     let ((proof, stats), proving, peak_mib) = measured(|| {
         vos_pvm_recair::wrap::prove_masked(finalized, MaskRng::default(), |_| {})
@@ -610,7 +619,7 @@ fn masked_wrap(
         stats.rank_check.as_secs_f64() * 1e3,
         stats.revealed_rows,
         stats.attempts,
-        load.trim(),
+        load,
     );
     assert!(peak_mib <= 4608, "{peak_mib} MiB of heap");
     assert!(resident_mib <= 8 << 10, "{resident_mib} MiB resident");

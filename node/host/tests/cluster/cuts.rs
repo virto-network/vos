@@ -27,9 +27,10 @@ use vos_wire::vos_anchor::MAX_LENGTH_MS;
 use vos_wire::{Decode, Encode, WindowClock};
 
 use crate::common::{Cluster, compacting, log_start, wait_until};
+use crate::support::past_close;
 use crate::support::{
-    Anchoring, READER, ask, clock, cuts, delay, reader_agent, rep_root, results, same_state,
-    set_clock, settled, stored_applied, version, write,
+    Anchoring, READER, ask, clock, cuts, reader_agent, rep_root, results, same_state, settled,
+    stored_applied, version, write,
 };
 
 /// The leader's `Cut` marker for an idle agent. While the leader's clock
@@ -50,7 +51,7 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     let node = cluster.node(leader);
     let applied = stored_applied(node, agent);
     for number in (1..=3).filter(|number| *number != leader) {
-        set_clock(&cluster, number, b0 + 2_000);
+        cluster.set_clock(number, b0 + 2_000);
     }
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(cluster.leader(agent), leader, "the leader stayed");
@@ -70,7 +71,7 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     let before = version(node, agent);
     let applied = stored_applied(node, agent);
 
-    set_clock(&cluster, leader, b0 + 500);
+    cluster.set_clock(leader, b0 + 500);
     let reading = cluster.clock(leader);
     // The cut row may show in the store before the node's applied index
     // passes the marker: wait for both.
@@ -118,7 +119,7 @@ fn an_agent_of_no_space_gets_no_marker() {
         .boundary(WindowClock::DEFAULT.window(cluster.clock(leader)).unwrap())
         .unwrap();
     for number in 1..=3 {
-        set_clock(&cluster, number, boundary + 1_000);
+        cluster.set_clock(number, boundary + 1_000);
     }
     std::thread::sleep(Duration::from_secs(2));
     // A marker is an empty result; the install's, should a loaded host
@@ -147,7 +148,7 @@ fn a_leaders_clock_jumping_ahead_cuts_every_window_it_passes_at_one_version() {
     let node = cluster.node(leader);
     let before = version(node, agent);
     let ahead = clock.boundary(2).unwrap() + MAX_LENGTH_MS / 2;
-    set_clock(&cluster, leader, ahead);
+    cluster.set_clock(leader, ahead);
     wait_until("the leader's replica records cut(2)", || {
         cuts(node, agent).contains_key(&2)
     });
@@ -191,7 +192,7 @@ fn a_replica_down_across_a_cut_holds_its_proofs_on_return() {
         let (id, _) = ask(&cluster, agent, 11);
         write(&cluster, agent, 12..=20);
         for number in 1..=3 {
-            set_clock(&cluster, number, b0 + 1_000);
+            cluster.set_clock(number, b0 + 1_000);
         }
         write(&cluster, agent, 21..=60);
         let leading = cluster.leader(agent);
@@ -245,7 +246,7 @@ fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {
     // The state at the cut: nothing applies between it and `B_0`.
     let (root, at_cut, values) = settled(cluster.node(cluster.leader(agent)), agent);
     for number in 1..=3 {
-        set_clock(&cluster, number, b0 + 1_000);
+        cluster.set_clock(number, b0 + 1_000);
     }
     write(&cluster, agent, 31..=31);
     let proofs: Vec<CutProof> = (1..=3)
@@ -368,7 +369,7 @@ fn a_read_at_a_cut_is_served_by_its_leader() {
     let applied = stored_applied(cluster.node(leader), agent);
     anchoring.set_clocks(&cluster, b0 + 1_000);
     write(&cluster, agent, 22..=30);
-    anchoring.set_clocks(&cluster, b0 + delay(&clock) + 1_000);
+    anchoring.set_clocks(&cluster, past_close(&clock, 0));
     let node = cluster.node(leader);
     let mut ended = None;
     wait_until("the read is served and its workflow ends", || {

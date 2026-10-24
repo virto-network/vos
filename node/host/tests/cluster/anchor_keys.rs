@@ -32,20 +32,17 @@ use vos_venue::{AnchorRefusal, Anchored, ModelVenue, NotAccepted, Status, VenueC
 use vos_wire::WindowClock;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::Unplaced;
-use vos_wire::keys;
 use vos_wire::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceId, VenueId};
 
 use crate::common::{Cluster, wait_until};
-use crate::support::{Anchoring, delay};
-use crate::support::{clock, set_clock};
+use crate::support::Anchoring;
+use crate::support::clock;
+use crate::support::{closed_on, past_close};
 
 /// The anchor of `window` the venue holds, once the clocks have passed
 /// its close and the representative's leader has anchored it.
 fn anchored(anchoring: &Anchoring, cluster: &Cluster, clock: &WindowClock, window: u64) -> Anchor {
-    anchoring.set_clocks(
-        cluster,
-        clock.boundary(window).unwrap() + delay(clock) + 1_000,
-    );
+    anchoring.set_clocks(cluster, past_close(clock, window));
     let space = cluster.space.id();
     let mut anchor = None;
     wait_until(&format!("the venue holds window {window}'s anchor"), || {
@@ -68,20 +65,10 @@ fn closed(
     (number, representative): (u8, AgentId),
     window: u64,
 ) {
-    anchoring.set_clocks(
-        cluster,
-        clock.boundary(window).unwrap() + delay(clock) + 1_000,
-    );
+    anchoring.set_clocks(cluster, past_close(clock, window));
     wait_until(
         &format!("the representative closes window {window}"),
-        || {
-            vos_checker::applied::<(u64, Option<AgentId>)>(
-                cluster.node(number).store(),
-                representative,
-                &keys::close_mark(),
-            )
-            .is_some_and(|(closed, _)| closed >= window)
-        },
+        || closed_on(cluster.node(number), representative, window),
     );
 }
 
@@ -643,21 +630,10 @@ impl VenueClient for Queued {
 /// Set node `number`'s clock past `window`'s close, leaving the venue's,
 /// and wait until its replica of the representative has closed it.
 fn node_closed(cluster: &Cluster, clock: &WindowClock, representative: AgentId, window: u64) {
-    set_clock(
-        cluster,
-        1,
-        clock.boundary(window).unwrap() + delay(clock) + 1_000,
-    );
+    cluster.set_clock(1, past_close(clock, window));
     wait_until(
         &format!("the representative closes window {window}"),
-        || {
-            vos_checker::applied::<(u64, Option<AgentId>)>(
-                cluster.node(1).store(),
-                representative,
-                &keys::close_mark(),
-            )
-            .is_some_and(|(closed, _)| closed >= window)
-        },
+        || closed_on(cluster.node(1), representative, window),
     );
 }
 
@@ -684,7 +660,7 @@ fn a_queued_anchor_whose_key_is_removed_is_signed_again() {
     let new = cluster.node(1).rotate_anchor_key().unwrap();
     assert!(venue.add_anchor_key(&space, new));
     assert!(venue.remove_anchor_key(&space, &old));
-    anchoring.set_venue(clock.boundary(0).unwrap() + delay(&clock) + 1_000);
+    anchoring.set_venue(past_close(&clock, 0));
     wait_until("window 0 anchored", || {
         !windows(&anchoring, &cluster).is_empty()
     });
@@ -714,7 +690,7 @@ fn a_key_refused_is_not_sent_again_until_the_listing_changes() {
     *queued.stale.lock().unwrap() = Some(vec![old]);
     assert!(venue.add_anchor_key(&space, new));
     assert!(venue.remove_anchor_key(&space, &old));
-    anchoring.set_venue(clock.boundary(0).unwrap() + delay(&clock) + 1_000);
+    anchoring.set_venue(past_close(&clock, 0));
     wait_until("window 0 handed back", || {
         queued.queue.unsettled(&space).len() == 1
     });
@@ -764,7 +740,7 @@ fn a_window_handed_back_after_its_cut_root_is_pruned_is_signed_again() {
     let new = cluster.node(1).rotate_anchor_key().unwrap();
     assert!(venue.add_anchor_key(&space, new));
     assert!(venue.remove_anchor_key(&space, &old));
-    anchoring.set_venue(clock.boundary(5).unwrap() + delay(&clock) + 1_000);
+    anchoring.set_venue(past_close(&clock, 5));
     wait_until("windows 0 to 5 anchored", || {
         windows(&anchoring, &cluster).len() == 6
     });
@@ -793,7 +769,7 @@ fn an_anchor_handed_back_that_this_node_did_not_make_is_not_signed() {
     let representative = cluster.representative(&[1]);
     let space = cluster.space.id();
     let venue = &anchoring.venue;
-    anchoring.set_venue(clock.boundary(0).unwrap() + delay(&clock) + 1_000);
+    anchoring.set_venue(past_close(&clock, 0));
     node_closed(&cluster, &clock, representative, 0);
     wait_until("window 0 anchored", || windows(&anchoring, &cluster) == [0]);
     let held = venue.anchors(&space)[0];

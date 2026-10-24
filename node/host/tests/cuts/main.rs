@@ -22,8 +22,8 @@ use vos_wire::records::{PendingRead, stored_versioned};
 use vos_wire::result::Write;
 
 use model::{
-    AGENT, CLOCK, Committed, Entry, History, MAPS, Replica, SPACE, check_proof, cuts, pending,
-    replicated, requests, row, undos,
+    AGENT, CLOCK, Committed, Entry, History, MAPS, Replica, SPACE, check_proof, committed, cuts,
+    replicated, requests, row, undos, workload,
 };
 
 /// Keys the results write, over both maps.
@@ -36,17 +36,7 @@ const BATCH: usize = 16;
 /// Version `version`'s committed writes: each key once, a value or, one in
 /// nine, a deletion.
 fn writes(version: u64) -> Vec<Committed> {
-    (0..WRITES)
-        .map(|index| {
-            let slot = (version * 7919 + index * 31) % KEYS;
-            let value = (!(version + index).is_multiple_of(9)).then(|| version.encode());
-            (
-                MAPS[(slot % 2) as usize],
-                slot.to_be_bytes().to_vec(),
-                value,
-            )
-        })
-        .collect()
+    committed(version, KEYS, WRITES)
 }
 
 /// Sixteen rows a request reads: twelve the results write, present or
@@ -69,13 +59,8 @@ fn read_rows(offset: u64) -> Vec<Vec<u8>> {
 /// 10·(w+1) − 1), a request in each window at its third version.
 fn history(through: u64) -> History {
     let mut history = History::default();
-    history.push(Entry::install(100, SPACE));
-    for version in 2..=through {
-        let mut entry = Entry::at(100 * version, writes(version));
-        if version % 10 == 3 {
-            entry.request = Some(pending(version, read_rows(version)));
-        }
-        history.push(entry);
+    for version in 1..=through {
+        history.push(workload(version, KEYS, WRITES, read_rows));
     }
     history
 }

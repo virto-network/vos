@@ -11,11 +11,13 @@
 //! The windows are an hour long (`support::clock`); the tests move the nodes'
 //! clocks and the mock chain's past each window's close, `B_w + D`.
 
-use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use parity_scale_codec::Decode;
 use vos_node::Config;
+use vos_venue::kreivo::calls::{Call, RuntimeCall};
 use vos_venue::kreivo::mock::transport::MockChain;
 use vos_venue::kreivo::mock::types::{AuthorityInfo, SpaceInfo, SpaceStatus};
 use vos_venue::kreivo::mock::{Account, Chain, Constants, Origin, keys};
@@ -23,13 +25,12 @@ use vos_venue::kreivo::{KreivoVenue, Options};
 use vos_venue::vos_statement::{Statement, StatementId};
 use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, VenueClient};
 use vos_wire::ids::AgentId;
-use vos_wire::keys as wire_keys;
 use vos_wire::peer::NodeNumber;
 use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId, WindowClock};
 
 use crate::common::{Cluster, wait_until};
-use crate::support::delay;
-use crate::support::{clock, set_clock};
+use crate::support::clock;
+use crate::support::{OffsetClock, closed_on, past_close};
 
 const UNITS: u128 = 1_000_000_000_000;
 const VENUE: VenueId = VenueId([0x6b; 32]);
@@ -98,24 +99,20 @@ fn account_of(number: NodeNumber) -> [u8; 32] {
 /// tests move with the nodes'; each node's client, by number.
 struct Kreivo {
     chain: Arc<MockChain>,
-    offset: Arc<AtomicI64>,
+    clock: OffsetClock,
     clients: Arc<Mutex<Vec<Client>>>,
     extra: Arc<Mutex<Vec<[u8; 32]>>>,
 }
 
 impl Kreivo {
     fn new() -> Self {
-        let offset = Arc::new(AtomicI64::new(0));
-        let read = Arc::clone(&offset);
-        let now = Arc::new(move || {
-            vos_node::wall_clock().saturating_add_signed(read.load(Ordering::SeqCst))
-        });
+        let clock = OffsetClock::default();
         let chain = Chain::new(Constants::kreivo(VENUE)).with_fees(true);
-        let chain = MockChain::with_clock(chain, Some(now));
+        let chain = MockChain::with_clock(chain, Some(clock.reader()));
         chain.set_latency(Duration::from_secs(1));
         Self {
             chain,
-            offset,
+            clock,
             clients: Arc::default(),
             extra: Arc::default(),
         }
@@ -231,11 +228,8 @@ impl Kreivo {
 
     /// Every node's clock and the chain's set to read `at` about now.
     fn set_clocks(&self, cluster: &Cluster, at: u64) {
-        for number in 1..=cluster.offsets.len() as NodeNumber {
-            set_clock(cluster, number, at);
-        }
-        self.offset
-            .store(at as i64 - vos_node::wall_clock() as i64, Ordering::SeqCst);
+        cluster.set_clocks(at);
+        self.clock.set(at);
     }
 
     /// The windows of the anchors the chain holds, from its storage.
@@ -287,8 +281,10 @@ fn unscale<T: parity_scale_codec::Decode>(bytes: &[u8]) -> T {
 fn windows(calls: &[(Origin, Vec<u8>)]) -> Vec<u64> {
     calls
         .iter()
-        .filter(|(_, call)| call[..2] == [90, 7])
-        .map(|(_, call)| u64::from_le_bytes(call[34..42].try_into().unwrap()))
+        .filter_map(|(_, call)| match RuntimeCall::decode(&mut &call[..]) {
+            Ok(RuntimeCall::Spaces(Call::Anchor { anchor })) => Some(anchor.window),
+            _ => None,
+        })
         .collect()
 }
 
@@ -305,23 +301,13 @@ fn space() -> (Kreivo, Cluster, WindowClock, AgentId) {
 
 /// Set the clocks past `window`'s close.
 fn close(kreivo: &Kreivo, cluster: &Cluster, clock: &WindowClock, window: u64) {
-    kreivo.set_clocks(
-        cluster,
-        clock.boundary(window).unwrap() + delay(clock) + 1_000,
-    );
+    kreivo.set_clocks(cluster, past_close(clock, window));
 }
 
 /// Wait until the representative's replicas have closed `window`.
 fn closed(cluster: &Cluster, representative: AgentId, window: u64) {
     wait_until(&format!("window {window} closes"), || {
-        (1..=3).all(|number| {
-            vos_checker::applied::<(u64, Option<AgentId>)>(
-                cluster.node(number).store(),
-                representative,
-                &wire_keys::close_mark(),
-            )
-            .is_some_and(|(closed, _)| closed >= window)
-        })
+        (1..=3).all(|number| closed_on(cluster.node(number), representative, window))
     });
 }
 

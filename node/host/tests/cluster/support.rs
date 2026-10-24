@@ -35,12 +35,6 @@ pub(crate) fn clock() -> WindowClock {
     }
 }
 
-/// Set node `number`'s clock to read `at` about now.
-pub(crate) fn set_clock(cluster: &Cluster, number: NodeNumber, at: u64) {
-    let own = vos_node::wall_clock() + u64::from(number) * 7;
-    cluster.offsets[usize::from(number) - 1].store(at as i64 - own as i64, Ordering::SeqCst);
-}
-
 /// The cuts `node` holds of `agent`: each window's version.
 pub(crate) fn cuts(node: &Node, agent: AgentId) -> BTreeMap<u64, u64> {
     vos_checker::cuts(&node.store().snapshot(), agent)
@@ -77,11 +71,22 @@ pub(crate) fn results(node: &Node, agent: AgentId, after: u64) -> Vec<(u64, Work
 /// The reader, installed beside the counter.
 pub(crate) const READER: InstanceId = InstanceId(2);
 
+/// An agent on `replicas` with the counter and `actor` installed as
+/// `instance`.
+pub(crate) fn agent_with(
+    cluster: &Cluster,
+    replicas: &[NodeNumber],
+    instance: InstanceId,
+    actor: &str,
+) -> AgentId {
+    let agent = cluster.counter_agent(replicas);
+    cluster.install_package(agent, instance, &package(actor));
+    agent
+}
+
 /// An agent on `replicas` with the counter and the reader installed.
 pub(crate) fn reader_agent(cluster: &Cluster, replicas: &[NodeNumber]) -> AgentId {
-    let agent = cluster.counter_agent(replicas);
-    cluster.install_package(agent, READER, &package("reader"));
-    agent
+    agent_with(cluster, replicas, READER, "reader")
 }
 
 /// The reader's method `name`.
@@ -272,19 +277,15 @@ pub(crate) fn same_state(cluster: &Cluster, agent: AgentId) {
 /// tests move with the nodes'.
 pub(crate) struct Anchoring {
     pub(crate) venue: Arc<ModelVenue>,
-    offset: Arc<AtomicI64>,
+    clock: OffsetClock,
 }
 
 impl Anchoring {
     pub(crate) fn new() -> Self {
-        let offset = Arc::new(AtomicI64::new(0));
-        let read = Arc::clone(&offset);
-        let now = Arc::new(move || {
-            vos_node::wall_clock().saturating_add_signed(read.load(Ordering::SeqCst))
-        });
+        let clock = OffsetClock::default();
         Self {
-            venue: Arc::new(ModelVenue::new(VenueId([0x7e; 32]), now)),
-            offset,
+            venue: Arc::new(ModelVenue::new(VenueId([0x7e; 32]), clock.reader())),
+            clock,
         }
     }
 
@@ -302,22 +303,54 @@ impl Anchoring {
 
     /// Every node's clock and the venue's set to read `at` about now.
     pub(crate) fn set_clocks(&self, cluster: &Cluster, at: u64) {
-        for number in 1..=cluster.offsets.len() as NodeNumber {
-            set_clock(cluster, number, at);
-        }
+        cluster.set_clocks(at);
         self.set_venue(at);
     }
 
     /// The venue's clock set to read `at` about now.
     pub(crate) fn set_venue(&self, at: u64) {
-        self.offset
+        self.clock.set(at);
+    }
+}
+
+/// A venue's clock: the wall's, moved by an offset the tests set.
+#[derive(Clone, Default)]
+pub(crate) struct OffsetClock(Arc<AtomicI64>);
+
+impl OffsetClock {
+    /// The clock set to read `at` about now.
+    pub(crate) fn set(&self, at: u64) {
+        self.0
             .store(at as i64 - vos_node::wall_clock() as i64, Ordering::SeqCst);
+    }
+
+    /// The clock, as a venue reads it.
+    pub(crate) fn reader(&self) -> Arc<dyn Fn() -> u64 + Send + Sync> {
+        let offset = Arc::clone(&self.0);
+        Arc::new(move || {
+            vos_node::wall_clock().saturating_add_signed(offset.load(Ordering::SeqCst))
+        })
     }
 }
 
 /// The representative's delay `D` on `clock`.
 pub(crate) fn delay(clock: &WindowClock) -> u64 {
     clock.representative().unwrap().origin_ms - clock.origin_ms
+}
+
+/// Whether `node`'s replica of the representative has closed `window`.
+pub(crate) fn closed_on(node: &Node, representative: AgentId, window: u64) -> bool {
+    vos_checker::applied::<(u64, Option<AgentId>)>(
+        node.store(),
+        representative,
+        &keys::close_mark(),
+    )
+    .is_some_and(|(closed, _)| closed >= window)
+}
+
+/// A second past window `window`'s close on `clock`, `B_w + D`.
+pub(crate) fn past_close(clock: &WindowClock, window: u64) -> u64 {
+    clock.boundary(window).unwrap() + delay(clock) + 1_000
 }
 
 /// The representative's root at its cut of `window`, once every running

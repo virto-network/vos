@@ -34,10 +34,9 @@ use std::time::Duration;
 
 use vos_checker::crash::{Round, Rounds, journal};
 use vos_node::roots;
-use vos_wire::Encode;
 use vos_wire::keys;
 
-use model::{AGENT, Entry, History, MAPS, Replica, SPACE, check_proof, cuts, pending, row, undos};
+use model::{AGENT, Entry, History, MAPS, Replica, check_proof, cuts, row, undos, workload};
 
 const KEYS: u64 = 2_000;
 const WRITES: u64 = 250;
@@ -59,31 +58,14 @@ const TEAR: u64 = 4096;
 /// `WRITES` committed writes, and a request of sixteen rows at the third
 /// version of each window.
 fn entry(version: u64) -> Entry {
-    if version == 1 {
-        return Entry::install(100, SPACE);
-    }
-    let committed = (0..WRITES)
-        .map(|index| {
-            let slot = (version * 7919 + index * 31) % KEYS;
-            let value = (!(version + index).is_multiple_of(9)).then(|| version.encode());
-            (
-                MAPS[(slot % 2) as usize],
-                slot.to_be_bytes().to_vec(),
-                value,
-            )
-        })
-        .collect();
-    let mut entry = Entry::at(100 * version, committed);
-    if version % 10 == 3 {
-        let rows = (0..16u64)
+    workload(version, KEYS, WRITES, |version| {
+        (0..16u64)
             .map(|index| {
                 let slot = (version * 13 + index * 97) % (KEYS + 100);
                 row(MAPS[(slot % 2) as usize], &slot.to_be_bytes())
             })
-            .collect();
-        entry.request = Some(pending(version, rows));
-    }
-    entry
+            .collect()
+    })
 }
 
 /// The model through `version`.
@@ -141,13 +123,9 @@ fn check(round: Round, last: &mut u64) -> bool {
     );
     let history = history(version);
     let before = replica.snapshot();
-    assert_eq!(
-        cuts(&before),
-        history.cuts(version),
-        "round {round}: the cuts"
-    );
-    let requests = history.requests(version);
     let recorded = cuts(&before);
+    assert_eq!(recorded, history.cuts(version), "round {round}: the cuts");
+    let requests = history.requests(version);
     let between = requests.iter().any(|(id, (window, _))| {
         recorded.contains_key(window)
             && roots::cut_proof_at(&before, AGENT, *id, *window)

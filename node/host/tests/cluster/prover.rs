@@ -25,7 +25,8 @@ use vos_wire::result::{Attest, Outcome};
 use vos_wire::{Decode, keys};
 
 use crate::common::{Cluster, log_start, wait_until};
-use crate::support::{Anchoring, Judging, attests, delay, ended, holds, replica};
+use crate::support::past_close;
+use crate::support::{Anchoring, Judging, attests, ended, holds, replica};
 use crate::support::{ask_in, call, clock, reader_agent, write, writes};
 
 /// The model prover's program id for every kernel.
@@ -134,7 +135,7 @@ fn read_at(
             window,
         )
     });
-    anchoring.set_clocks(cluster, boundary + delay(&clock) + 1_000);
+    anchoring.set_clocks(cluster, past_close(&clock, window));
     assert!(matches!(ended(cluster, agent, read), Outcome::Done(_)));
     let attests = attests(replica(cluster, agent), agent, read);
     assert_eq!(attests.len(), 1);

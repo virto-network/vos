@@ -121,9 +121,7 @@ fn prove(name: &str, actor: &str, attest: &Attest) -> Proved {
         proof.len(),
         proved.heap_mib,
         proved.resident_mib,
-        std::fs::read_to_string("/proc/loadavg")
-            .unwrap_or_default()
-            .trim(),
+        common::load(),
     );
     proved
 }

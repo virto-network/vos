@@ -17,7 +17,8 @@ use vos_wire::peer::NodeNumber;
 use vos_wire::result::Outcome;
 
 use crate::common::{ALICE, Cluster, wait_until};
-use crate::support::{Anchoring, Judging, attests, delay, ended, holds, replica};
+use crate::support::past_close;
+use crate::support::{Anchoring, Judging, attests, ended, holds, replica};
 use crate::support::{READER, ask_in, call, clock, reader, reader_agent};
 
 /// The replicas of the agents the run reads and represents: node 4, in the
@@ -99,7 +100,7 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
     wait_until("the representative holds the agent's root", || {
         holds(replica(&cluster, representative), representative, reader, 0)
     });
-    anchoring.set_clocks(&cluster, boundary + delay(&clock) + 1_000);
+    anchoring.set_clocks(&cluster, past_close(&clock, 0));
     let answer = ended(&cluster, reader, read);
     assert!(matches!(answer, Outcome::Done(_)), "{answer:?}");
     let attest = attests(replica(&cluster, reader), reader, read)[0].clone();

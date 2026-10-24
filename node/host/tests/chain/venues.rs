@@ -168,7 +168,7 @@ impl Sent {
 }
 
 /// How long a sent package's report may take to show.
-const REPORTED: Duration = Duration::from_secs(90);
+pub const REPORTED: Duration = Duration::from_secs(90);
 
 /// Every work package a JAM service's client sent, anchors, registrations
 /// and statements alike (`vos_jam_dev::live::Watch`), each one's work report

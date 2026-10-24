@@ -27,9 +27,10 @@ use vos_wire::vos_anchor::{MIN_LENGTH_MS, RootKind, RootRead, space_root};
 use vos_wire::{Encode, WindowClock};
 
 use crate::common::{Cluster, wait_until};
+use crate::support::past_close;
 use crate::support::{
     Anchoring, READER, ask_keys, attests, clock, delay, ended, holds, logged, reader_agent,
-    rep_root, replica, set_clock, write,
+    rep_root, replica, write,
 };
 /// The space's root of `window` over the representative's `rep_root`.
 fn stated(cluster: &Cluster, window: u64, rep_root: &[u8; 32]) -> RootRead {
@@ -70,7 +71,7 @@ fn every_agent_reports_and_one_close_serves_their_reads() {
             holds(replica(&cluster, representative), representative, *agent, 0)
         });
     }
-    anchoring.set_clocks(&cluster, b0 + delay(&clock) + 1_000);
+    anchoring.set_clocks(&cluster, past_close(&clock, 0));
     let rep_root = rep_root(&cluster, representative, 0);
     let root = stated(&cluster, 0, &rep_root);
     for (agent, read) in agents.iter().zip(&reads) {
@@ -114,7 +115,7 @@ fn a_leading_clock_reports_its_next_window_apart() {
     });
     // Node 3 leads by `L − D + 10 s`: past `B_1` while the others are before
     // `B_0 + D`.
-    set_clock(&cluster, 3, b0 + d - 2_000 + length - d + 10_000);
+    cluster.set_clock(3, b0 + d - 2_000 + length - d + 10_000);
     wait_until("the representative holds window 1's root", || {
         holds(rep(), representative, agent, 1)
     });
@@ -126,7 +127,7 @@ fn a_leading_clock_reports_its_next_window_apart() {
         "its window-0 row kept"
     );
     for number in [1, 2] {
-        set_clock(&cluster, number, b0 + d + 1_000);
+        cluster.set_clock(number, b0 + d + 1_000);
     }
     anchoring.set_venue(b0 + d + 1_000);
     let rep_root = rep_root(&cluster, representative, 0);
@@ -306,7 +307,7 @@ fn a_representative_failover_keeps_one_root() {
     cluster.stop(old);
     let new = cluster.leader(representative);
     assert_ne!(new, old);
-    anchoring.set_clocks(&cluster, b0 + delay(&clock) + 1_000);
+    anchoring.set_clocks(&cluster, past_close(&clock, 0));
     let rep_root = rep_root(&cluster, representative, 0);
     assert!(matches!(ended(&cluster, agent, read), Outcome::Done(_)));
     cluster.start(old);
@@ -361,7 +362,7 @@ fn a_representative_leader_change_before_the_close_sends_it_once() {
         holds(replica(&cluster, representative), representative, agent, 0)
     });
     let old = cluster.leader(representative);
-    anchoring.set_clocks(&cluster, b0 + delay(&clock) + 1_000);
+    anchoring.set_clocks(&cluster, past_close(&clock, 0));
     let rep_root = rep_root(&cluster, representative, 0);
     assert!(matches!(ended(&cluster, agent, read), Outcome::Done(_)));
     assert!(

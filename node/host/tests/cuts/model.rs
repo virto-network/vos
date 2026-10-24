@@ -346,6 +346,42 @@ pub fn replicated(snapshot: &Snapshot) -> Vec<(Vec<u8>, Vec<u8>)> {
     vos_checker::replicated(snapshot, AGENT)
 }
 
+/// Version `version`'s committed writes: `count` of them over `keys` keys
+/// of both maps, each key once, a value or, one in nine, a deletion.
+pub fn committed(version: u64, keys: u64, count: u64) -> Vec<Committed> {
+    (0..count)
+        .map(|index| {
+            let slot = (version * 7919 + index * 31) % keys;
+            let value = (!(version + index).is_multiple_of(9)).then(|| version.encode());
+            (
+                MAPS[(slot % 2) as usize],
+                slot.to_be_bytes().to_vec(),
+                value,
+            )
+        })
+        .collect()
+}
+
+/// Version `version` of the cut tests' workload: the install first, then a
+/// result every 100 ms, so a window of a second is cut at every tenth
+/// version, with `count` committed writes over `keys` keys, and a request
+/// reading `rows(version)` at the third version of each window.
+pub fn workload(
+    version: u64,
+    keys: u64,
+    count: u64,
+    rows: impl FnOnce(u64) -> Vec<Vec<u8>>,
+) -> Entry {
+    if version == 1 {
+        return Entry::install(100, SPACE);
+    }
+    let mut entry = Entry::at(100 * version, committed(version, keys, count));
+    if version % 10 == 3 {
+        entry.request = Some(pending(version, rows(version)));
+    }
+    entry
+}
+
 /// What the agent applied, in order: the model every check compares with.
 #[derive(Default)]
 pub struct History {

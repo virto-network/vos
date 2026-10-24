@@ -14,8 +14,7 @@ use cipher_clerk::conventions::PseudoAccount;
 use cipher_clerk::ids::JournalId;
 use cipher_clerk::kernel::Value;
 use cipher_clerk::types::{Account, Layer};
-use vos_checker::programs::{actor, method, package};
-use vos_node::Reply;
+use vos_checker::programs::{actor, method};
 use vos_tree::{Blake2b, Hasher};
 use vos_wire::Encode;
 use vos_wire::batch::Request;
@@ -25,7 +24,7 @@ use vos_wire::result::{Attest, Outcome, Step};
 use vos_wire::vos_anchor::VenueId;
 
 use crate::common::{ALICE, Cluster};
-use crate::support::{READER, results};
+use crate::support::{READER, agent_with, call, reader_agent, results};
 
 pub const BALANCE: InstanceId = InstanceId(3);
 pub const WINDOW: InstanceId = InstanceId(4);
@@ -75,15 +74,6 @@ pub struct Asked {
     pub arguments: usize,
 }
 
-/// `request` at `agent`'s leader, followed as it moves: its outcome.
-fn call(cluster: &Cluster, agent: AgentId, request: Request) -> Outcome {
-    let sequence = request.sequence;
-    match cluster.call_at_leader(agent, request) {
-        Ok(Reply::Ran(outcome)) => outcome,
-        other => panic!("sequence {sequence}: {other:?}"),
-    }
-}
-
 /// A session at `agent` opened now, by its leader's clock: one a window, so
 /// none is stale by the time it is first used.
 pub fn session(cluster: &Cluster, agent: AgentId, nonce: u64) -> Session {
@@ -110,14 +100,6 @@ fn request(
         method,
         arguments,
     }
-}
-
-/// An agent on the three nodes with the counter and `actor` installed as
-/// `instance`.
-fn agent(cluster: &Cluster, instance: InstanceId, actor: &str) -> AgentId {
-    let agent = cluster.counter_agent(&REPLICAS);
-    cluster.install_package(agent, instance, &package(actor));
-    agent
 }
 
 /// `balance`'s accounts: sixteen, each its balance.
@@ -222,9 +204,9 @@ impl Agents {
     pub fn install(cluster: &Cluster) -> Self {
         let agents = Self {
             representative: cluster.representative(&REPLICAS),
-            balance: agent(cluster, BALANCE, "balance"),
-            window: agent(cluster, WINDOW, "window"),
-            reader: agent(cluster, READER, "reader"),
+            balance: agent_with(cluster, &REPLICAS, BALANCE, "balance"),
+            window: agent_with(cluster, &REPLICAS, WINDOW, "window"),
+            reader: reader_agent(cluster, &REPLICAS),
         };
         let set = request(
             session(cluster, agents.balance, 1),

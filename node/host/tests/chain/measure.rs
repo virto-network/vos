@@ -5,7 +5,9 @@
 
 use std::time::Duration;
 
+use parity_scale_codec::Decode;
 use vos_statement_service::state::Outcome as Judged;
+use vos_venue::kreivo::calls::{Call, RuntimeCall};
 use vos_venue::kreivo::mock::Origin;
 
 use crate::kreivo::{self, UNITS};
@@ -117,9 +119,9 @@ fn fees(run: &mut Run) {
     let (mut anchors, mut submits) = (0u128, 0u128);
     for (origin, call) in kreivo.included() {
         let authority = (1..=3).any(|n| origin == Origin::Signed(kreivo::node_account(n)));
-        match &call[..2] {
-            [90, 7] if authority => anchors += 1,
-            [90, 8] if authority => submits += 1,
+        match RuntimeCall::decode(&mut &call[..]) {
+            Ok(RuntimeCall::Spaces(Call::Anchor { .. })) if authority => anchors += 1,
+            Ok(RuntimeCall::Spaces(Call::Submit { .. })) if authority => submits += 1,
             _ => {}
         }
     }
