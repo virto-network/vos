@@ -147,12 +147,12 @@ impl AirLayout {
 /// Back-compat: `mask == 0` (default for older proofs) falls back to
 /// "all chips active" — older proofs predate dynamic selection.
 fn active_indices_from_mask(mask: u32) -> alloc::vec::Vec<usize> {
-    let n = BASE_COMPONENTS.len();
-    if mask == 0 {
-        (0..n).collect()
+    let mask = if mask == 0 {
+        crate::chip_idx::ALL
     } else {
-        (0..n).filter(|&i| mask & (1 << i) != 0).collect()
-    }
+        mask
+    };
+    crate::chips_of_mask(mask).collect()
 }
 
 /// Draw all lookup elements from the channel (same order as prover).

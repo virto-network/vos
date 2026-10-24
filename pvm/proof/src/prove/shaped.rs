@@ -14,11 +14,8 @@ use crate::side_note::SideNote;
 
 /// The chips `components` selects, in chip order.
 fn selected(components: u32) -> Vec<&'static dyn MachineProverComponent> {
-    crate::all_components()
-        .iter()
-        .enumerate()
-        .filter(|(index, _)| components & 1 << index != 0)
-        .map(|(_, &component)| component)
+    crate::chips_of_mask(components)
+        .map(|chip| crate::all_components()[chip])
         .collect()
 }
 

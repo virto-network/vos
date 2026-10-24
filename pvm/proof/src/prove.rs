@@ -378,11 +378,10 @@ pub fn prove_chip_isolated_format(
     min_log_sizes: &[u32],
 ) -> Result<Proof, ProvingError> {
     install_thread_pool();
-    let chips = 0..crate::chip_idx::COUNT;
-    let components: Vec<&dyn crate::framework::MachineProverComponent> = chips
-        .filter(|&chip| component_mask & 1 << chip != 0)
-        .map(|chip| crate::BASE_COMPONENTS[chip])
-        .collect();
+    let components: Vec<&dyn crate::framework::MachineProverComponent> =
+        crate::chips_of_mask(component_mask)
+            .map(|chip| crate::BASE_COMPONENTS[chip])
+            .collect();
     let (proof, _) = prove_impl_with_components(
         side_note,
         Target::of(format)?,
@@ -677,8 +676,7 @@ where
             .enumerate()
             .find(|(_, (log_size, pinned))| log_size != pinned)
     {
-        let chip = (0..crate::chip_idx::COUNT)
-            .filter(|chip| component_mask & 1 << chip != 0)
+        let chip = crate::chips_of_mask(component_mask)
             .nth(position)
             .unwrap_or(position);
         return Err(ProvingError::Shape {

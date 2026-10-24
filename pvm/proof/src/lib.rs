@@ -351,12 +351,14 @@ chips! {
 pub fn active_components(
     side_note: &side_note::SideNote,
 ) -> alloc::vec::Vec<&'static dyn framework::MachineProverComponent> {
-    let a = activity_from_steps(side_note);
-    BASE_COMPONENTS
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &c)| if a.is_active(i) { Some(c) } else { None })
+    chips_of_mask(active_component_mask(side_note))
+        .map(|chip| BASE_COMPONENTS[chip])
         .collect()
+}
+
+/// The chips `mask` selects, by index, in chip order: bit i is chip i.
+pub(crate) fn chips_of_mask(mask: u32) -> impl Iterator<Item = usize> {
+    (0..chip_idx::COUNT).filter(move |chip| mask & 1 << chip != 0)
 }
 
 /// Per-chip activity flags inferred from `side_note.steps`
@@ -488,17 +490,8 @@ pub fn opcode_component_mask(op: core::opcode::Opcode) -> u32 {
 pub(crate) fn active_components_verifier(
     side_note: &side_note::SideNote,
 ) -> alloc::vec::Vec<&'static dyn framework::MachineComponent> {
-    let a = activity_from_steps(side_note);
-    BASE_COMPONENTS
-        .iter()
-        .enumerate()
-        .filter_map(|(i, &c)| {
-            if a.is_active(i) {
-                Some(c as &dyn framework::MachineComponent)
-            } else {
-                None
-            }
-        })
+    chips_of_mask(active_component_mask(side_note))
+        .map(|chip| BASE_COMPONENTS[chip] as &dyn framework::MachineComponent)
         .collect()
 }
 
