@@ -41,7 +41,7 @@ use vos_statement::model::Range;
 use vos_statement::vos_anchor::{MAX_FOUNDING_KEYS, SpaceId, WindowClock};
 
 use crate::config::Config;
-use crate::item::{Kind, Op};
+use crate::item::Op;
 use crate::state::{self, AnchorRecord, Evidence, Outcome, SpaceRecord, Storage, keys};
 use crate::verdict::{
     AnchorCode, ControlCode, Judged, MigrateCode, RegisterCode, Registered, Verdict,
@@ -466,9 +466,4 @@ fn prune(storage: &mut impl Storage, now: u64, budget: u32) {
     if (bucket, index) != moved {
         set_cursor(storage, bucket, index);
     }
-}
-
-/// The kind of item a verdict's outcome names, as its byte reads.
-pub fn kind(outcome: &Outcome) -> Option<Kind> {
-    Kind::from_u8(outcome.kind)
 }
