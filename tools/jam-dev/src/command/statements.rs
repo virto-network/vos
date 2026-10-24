@@ -23,18 +23,17 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use vos_jam_dev::live::statements::{MIN_ITEM_GAS, Statements};
+use vos_jam_dev::live::statements::{Deployed, deploy};
 use vos_jam_dev::live::{PolkaJam, Watch};
-use vos_jam_dev::venue::{JamVenue, anchor_code, register_code};
+use vos_jam_dev::venue::{anchor_code, register_code};
 use vos_pvm::refine_host::{JamItem, JamRefine, RefineContext};
-use vos_pvm_compiler::{ServiceMetadata, service_blob};
 use vos_statement::fixtures::{self, Fixture};
 use vos_statement::vos_anchor::{
     Anchor, Migrate, RootKind, SpaceGenesis, VenueId, WindowClock, space_id,
 };
 use vos_statement::vos_pvm_final_verifier::MAX_PROOF_BYTES;
 use vos_statement::{Pin, Refusal, blake2b_256};
-use vos_statement_service::config::{Config, configure};
+use vos_statement_service::config::Config;
 use vos_statement_service::item::{Control, Item, Op, SignedControl, control_digest};
 use vos_statement_service::state::Outcome;
 use vos_statement_service::verdict::{AnchorCode, ControlCode};
@@ -43,7 +42,7 @@ use vos_wire::jam::RefineArgs;
 use vos_wire::package::EPOCH_MS;
 use vos_wire::result::digest;
 
-use crate::{at, link};
+use crate::at;
 
 #[derive(clap::Args)]
 pub struct StatementsArgs {
@@ -66,19 +65,8 @@ pub struct StatementsArgs {
     pub data: PathBuf,
 }
 
-/// The service's endowment: its storage deposits.
-const ENDOWMENT: u64 = 10_000_000_000;
-/// How long the service's code may take to become available.
-const PREIMAGE_TIMEOUT: Duration = Duration::from_secs(180);
 /// The space's window length: the shortest a venue registers.
 const LENGTH_MS: u64 = 120_000;
-
-const METADATA: ServiceMetadata<'static> = ServiceMetadata {
-    name: "vos-statements",
-    version: env!("CARGO_PKG_VERSION"),
-    license: "Apache-2.0",
-    authors: &["VOS"],
-};
 
 type Failed = Box<dyn std::error::Error>;
 
@@ -198,24 +186,27 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
             },
         ],
     };
-    let mut program = link(&args.service)?;
-    configure(&mut program, &config).map_err(|error| format!("{error:?}"))?;
-    let blob = service_blob(&program, &METADATA);
     let file = args.data.join("statements.jam");
-    std::fs::write(&file, &blob).map_err(at(&file))?;
-    let service = node.create_service(&file, ENDOWMENT, Some(MIN_ITEM_GAS))?;
+    let Deployed {
+        program,
+        blob,
+        service,
+        since,
+        venue,
+    } = deploy(
+        node,
+        &args.service,
+        &config,
+        &file,
+        parameters.max_refine_gas,
+    )?;
     record.note(format!(
         "service {service}: the statements service, program {} B, blob {} B, code hash {}",
         program.len(),
         blob.len(),
         hex::encode(digest(&blob))
     ));
-    let since =
-        node.await_preimage(service, &digest(&blob), blob.len() as u64, PREIMAGE_TIMEOUT)?;
     record.note(format!("its code available since slot {since}"));
-    let statements = Statements::new(node, service, parameters.max_refine_gas, EPOCH_MS)?;
-    let venue = JamVenue::new(statements, config.clone(), &blob)
-        .map_err(|mismatch| format!("the service's code: {mismatch:?}"))?;
     record.note(format!("the venue {}", hex::encode(venue.id().0)));
     let baseline = venue.statements.entries(0)?;
 

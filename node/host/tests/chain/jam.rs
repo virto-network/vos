@@ -10,30 +10,15 @@
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
 
 use vos_jam_dev::JamVenue;
 use vos_jam_dev::live::PolkaJam;
-use vos_jam_dev::live::statements::{MIN_ITEM_GAS, Statements};
-use vos_pvm_compiler::{ServiceMetadata, service_blob};
-use vos_statement_service::config::{Config, configure};
+use vos_jam_dev::live::statements;
+use vos_statement_service::config::Config;
 use vos_venue::vos_statement::Pin;
 use vos_wire::package::EPOCH_MS;
-use vos_wire::result::digest;
 
 use crate::venues::Wire;
-
-/// A service's endowment: its storage deposits.
-const ENDOWMENT: u64 = 10_000_000_000;
-/// How long a service's code may take to become available.
-const PREIMAGE_TIMEOUT: Duration = Duration::from_secs(180);
-
-const METADATA: ServiceMetadata<'static> = ServiceMetadata {
-    name: "vos-statements",
-    version: env!("CARGO_PKG_VERSION"),
-    license: "Apache-2.0",
-    authors: &["VOS"],
-};
 
 /// The testnet and the run's files.
 pub struct Testnet {
@@ -83,25 +68,18 @@ impl Testnet {
             genesis_ms: EPOCH_MS,
             pins,
         };
-        let elf = std::fs::read(&self.service).expect("the service's program");
-        let mut program = vos_pvm_compiler::link_elf_spi(&elf).expect("the service links");
-        configure(&mut program, &config).expect("the service's configuration");
-        let blob = service_blob(&program, &METADATA);
-        let file = self.run.join(format!("statements-{name}.jam"));
-        std::fs::write(&file, &blob).expect("the service's blob written");
-        let service = self
-            .node
-            .create_service(&file, ENDOWMENT, Some(MIN_ITEM_GAS))
-            .expect("the service created");
-        self.node
-            .await_preimage(service, &digest(&blob), blob.len() as u64, PREIMAGE_TIMEOUT)
-            .expect("the service's code available");
         let mut node = self.node.clone();
         node.watch = Some(wire.watch(&self.node));
-        let statements = Statements::new(node, service, parameters.max_refine_gas, EPOCH_MS)
-            .expect("the service's code hash");
-        JamVenue::new(statements, config, &blob)
-            .unwrap_or_else(|mismatch| panic!("the service's code: {mismatch:?}"))
+        let file = self.run.join(format!("statements-{name}.jam"));
+        statements::deploy(
+            node,
+            &self.service,
+            &config,
+            &file,
+            parameters.max_refine_gas,
+        )
+        .unwrap_or_else(|error| panic!("the statements service deployed: {error}"))
+        .venue
     }
 
     /// The testnet's clock set `ms` ahead of the host's.

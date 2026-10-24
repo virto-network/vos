@@ -21,6 +21,7 @@ use std::time::Duration;
 
 use vos_jam::programs::Installable;
 use vos_jam::{Builder, Chain, Emulated, Error, Runner, Store, Taken};
+use vos_jam_dev::live::statements::{ENDOWMENT, PREIMAGE_TIMEOUT};
 use vos_jam_dev::live::{Live, PolkaJam};
 use vos_pvm::refine::PreparedProgram;
 use vos_wire::abi::cap::Target;
@@ -56,12 +57,8 @@ pub struct TestnetArgs {
     pub data: PathBuf,
 }
 
-/// The service's endowment: its storage deposits, preimages included.
-const ENDOWMENT: u64 = 10_000_000_000;
 const COUNTER: InstanceId = InstanceId(1);
 const SHOP: InstanceId = InstanceId(4);
-/// How long a preimage may take to become available.
-const PREIMAGE_TIMEOUT: Duration = Duration::from_secs(180);
 /// The sweeps the computation may take to end.
 const SWEEPS: u32 = 12;
 

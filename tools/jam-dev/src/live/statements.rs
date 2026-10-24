@@ -3,21 +3,26 @@
 //! outcome read back from the service's storage at the finalized block, by
 //! its package's and its payload's hashes.
 
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use std::collections::BTreeSet;
 
+use vos_pvm_compiler::{ServiceMetadata, service_blob};
 use vos_statement::MAX_ROOT_AGE_MS;
 use vos_statement::vos_anchor::{RootKind, SpaceId};
 use vos_statement_service::MAX_ITEMS;
 use vos_statement_service::accumulate::BUCKET_MS;
+use vos_statement_service::config::{Config, configure};
 use vos_statement_service::state::{Outcome, SpaceRecord, keys, outcome_id};
 use vos_tree::Hash;
+use vos_wire::package::EPOCH_MS;
 use vos_wire::package::SLOT_MS;
 use vos_wire::result::digest;
 
 use super::package::{WorkItem, payloads};
 use super::{PolkaJam, failed};
+use crate::venue::JamVenue;
 use vos_jam::Error;
 
 /// A package's accumulate gas an item: the service's accumulate takes about
@@ -66,6 +71,69 @@ pub struct Accounting {
 
 /// An item to submit: its payload and its extrinsics.
 pub type Item = (Vec<u8>, Vec<Vec<u8>>);
+
+/// A service's endowment: its storage deposits.
+pub const ENDOWMENT: u64 = 10_000_000_000;
+/// How long a service's code may take to become available.
+pub const PREIMAGE_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// The statements service's metadata, which its blob carries.
+const METADATA: ServiceMetadata<'static> = ServiceMetadata {
+    name: "vos-statements",
+    version: env!("CARGO_PKG_VERSION"),
+    license: "Apache-2.0",
+    authors: &["VOS"],
+};
+
+/// The statements service deployed ([`deploy`]).
+pub struct Deployed {
+    /// Its program, linked and configured.
+    pub program: Vec<u8>,
+    /// Its blob, as created.
+    pub blob: Vec<u8>,
+    /// The service's number.
+    pub service: u64,
+    /// The slot since which its code is available.
+    pub since: u64,
+    /// The service as a venue, checked to run its code.
+    pub venue: JamVenue,
+}
+
+/// The statements service's program at `elf`, configured by `config`, its
+/// blob written to `file` and created on `node` as a service, its code
+/// waited for until available, and wrapped as a venue whose packages have
+/// `refine_gas`.
+pub fn deploy(
+    node: PolkaJam,
+    elf: &Path,
+    config: &Config,
+    file: &Path,
+    refine_gas: u64,
+) -> Result<Deployed, String> {
+    let bytes = std::fs::read(elf).map_err(|error| format!("{}: {error}", elf.display()))?;
+    let mut program = vos_pvm_compiler::link_elf_spi(&bytes)
+        .map_err(|error| format!("{}: {error:?}", elf.display()))?;
+    configure(&mut program, config).map_err(|error| format!("{error:?}"))?;
+    let blob = service_blob(&program, &METADATA);
+    std::fs::write(file, &blob).map_err(|error| format!("{}: {error}", file.display()))?;
+    let service = node
+        .create_service(file, ENDOWMENT, Some(MIN_ITEM_GAS))
+        .map_err(|error| error.to_string())?;
+    let since = node
+        .await_preimage(service, &digest(&blob), blob.len() as u64, PREIMAGE_TIMEOUT)
+        .map_err(|error| error.to_string())?;
+    let statements =
+        Statements::new(node, service, refine_gas, EPOCH_MS).map_err(|error| error.to_string())?;
+    let venue = JamVenue::new(statements, config.clone(), &blob)
+        .map_err(|mismatch| format!("the service's code: {mismatch:?}"))?;
+    Ok(Deployed {
+        program,
+        blob,
+        service,
+        since,
+        venue,
+    })
+}
 
 impl Statements {
     /// Service `service` of `node`, its code hash read at the finalized
