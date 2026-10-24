@@ -21,7 +21,8 @@ use vos_anchor::vectors;
 use vos_anchor::{Anchor, Migrate, RootKind, VenueId};
 use vos_statement::fixtures;
 
-/// `format::MASKED_WRAP`'s header in its fixed layout: the format and ten words.
+/// `format::MASKED_WRAP`'s header in its fixed layout: the format and ten
+/// words.
 const MASKED_HEADER: usize = 4 * 11;
 
 fn main() {

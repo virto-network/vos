@@ -1,7 +1,8 @@
-//! The golden wraps, the fixtures' (`pvm/proof/fixtures`): `format::MASKED_WRAP`'s two
-//! accepted statements' and `format::WRAP`'s: each its proof's bytes, the 24
-//! public words it verifies against, and the oracle for a proof a target
-//! finds accepted. Each target uses what it reads of it.
+//! The golden wraps, the fixtures' (`pvm/proof/fixtures`):
+//! `format::MASKED_WRAP`'s two accepted statements' and `format::WRAP`'s:
+//! each its proof's bytes, the 24 public words it verifies against, and the
+//! oracle for a proof a target finds accepted. Each target uses what it
+//! reads of it.
 
 #![allow(dead_code)]
 
@@ -9,7 +10,8 @@ use std::sync::OnceLock;
 
 use vos_pvm_final_verifier::PUBLIC_WORDS;
 
-/// `format::MASKED_WRAP`'s header in its fixed layout: the format and ten words.
+/// `format::MASKED_WRAP`'s header in its fixed layout: the format and ten
+/// words.
 pub const MASKED_HEADER: usize = 4 * 11;
 
 pub struct Golden {
@@ -113,8 +115,9 @@ fn of_fixture(name: &str) -> Golden {
     golden
 }
 
-/// The goldens: `format::MASKED_WRAP`'s rooted statement (`valid`) and rootless one
-/// (`rootless`), and `format::WRAP`'s (`format 28 at the test venue`).
+/// The goldens: `format::MASKED_WRAP`'s rooted statement (`valid`) and
+/// rootless one (`rootless`), and `format::WRAP`'s
+/// (`format 28 at the test venue`).
 pub fn goldens() -> &'static [Golden; 3] {
     static GOLDENS: OnceLock<[Golden; 3]> = OnceLock::new();
     GOLDENS.get_or_init(|| {

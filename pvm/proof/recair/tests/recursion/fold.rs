@@ -1,7 +1,7 @@
 //! A fold (`proving.md` §3.4, `recursion-air.md` §6) over a small kernel's
 //! run, a standard program that sets its io-hash and halts, cut in four
-//! segments proved at their natural sizes under `format::SEGMENT`, each verified in
-//! its leaf and the leaves proved at the padded shape.
+//! segments proved at their natural sizes under `format::SEGMENT`, each
+//! verified in its leaf and the leaves proved at the padded shape.
 //!
 //! - **A fold of two leaves** verifies both children as natively (each
 //!   child's transcript the native recorder's, permutation for

@@ -3,13 +3,13 @@
 //! `just check`; under `heavy-gates`, 500 in `just test-proof` and 2,000 in
 //! `just slice-gate` (`LEAKAGE_N`).
 //!
-//! - **Witness indistinguishability:** the honest prover's
-//!   published values do not depend on the witness. N proofs of one
-//!   witness against N of another under the same public inputs (a zero
-//!   witness and a random one; two amounts differing by 1): per field a
-//!   two-sample χ² on 16 buckets of the value's top bits (4 at N ≤ 64), and one pooled
-//!   two-sample KS over every value. The control: the unmasked prover fails
-//!   the same test.
+//! - **Witness indistinguishability:** the honest prover's published values
+//!   do not depend on the witness. N proofs of one witness against N of
+//!   another under the same public inputs (a zero witness and a random one;
+//!   two amounts differing by 1): per field a two-sample χ² on 16 buckets
+//!   of the value's top bits (4 at N ≤ 64), and one pooled two-sample KS
+//!   over every value. The control: the unmasked prover fails the same
+//!   test.
 //! - **Uniformity:** each field of the zero witness's N proofs
 //!   against uniform M31, one-sample χ² (exact at N ≤ 64).
 //!

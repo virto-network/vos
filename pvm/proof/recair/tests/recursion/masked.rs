@@ -1,6 +1,7 @@
-//! The masked wrap (`format::MASKED_WRAP`) over the one-segment run's root, proved by
-//! `vos-pvm-recair`'s masked prover from a seed, its bytes the fixed layout,
-//! and verified by `vos-pvm-final-verifier`'s masked verifier.
+//! The masked wrap (`format::MASKED_WRAP`) over the one-segment run's root,
+//! proved by `vos-pvm-recair`'s masked prover from a seed, its bytes the
+//! fixed layout, and verified by `vos-pvm-final-verifier`'s masked
+//! verifier.
 //!
 //! - **The verifier's constants are the registry's** entry for 39: its
 //!   number, configuration, masking, log sizes, trees' widths and DEEP
@@ -56,8 +57,8 @@ use vos_pvm_recair::wrap::{self, WrapCircuit};
 use vos_pvm_recair_air::GateRelation;
 use vos_pvm_recair_air::masked::{BlindRelation, MaskPins, WrapComponents};
 
-/// The one-segment run's root wrapped under `format::MASKED_WRAP`: the proof, its
-/// bytes and its public words.
+/// The one-segment run's root wrapped under `format::MASKED_WRAP`: the
+/// proof, its bytes and its public words.
 struct Masked {
     proof: WrapProof,
     bytes: Vec<u8>,
@@ -95,7 +96,8 @@ fn masked_wrap() -> &'static Masked {
 
 /// A wrap's proof, format and public words, under the target's tmp
 /// directory as `wrap/<name>.{proof,format,words}`: the Wasm harness's
-/// input (`final-verifier/wasm/run`) and the fuzz targets' `format::MASKED_WRAP` golden.
+/// input (`final-verifier/wasm/run`) and the fuzz targets'
+/// `format::MASKED_WRAP` golden.
 fn write(name: &str, format: u32, proof: &[u8], words: &[u32; PUBLIC_WORDS]) {
     let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
     std::fs::create_dir_all(&directory).expect("the wrap's directory");
@@ -307,10 +309,10 @@ fn every_masked_field_tampered_is_refused() {
 }
 
 /// A verifier pinning another salt count or `R` refuses the proof: with
-/// `format::MASKED_WRAP`'s widths, its set's trees are not the format's; with the
-/// widths its pins lay out, the proof's trees are not its. And a proof with
-/// a salt column or an `R` column more is refused by its shape, as a proof
-/// and at its decode.
+/// `format::MASKED_WRAP`'s widths, its set's trees are not the format's;
+/// with the widths its pins lay out, the proof's trees are not its. And a
+/// proof with a salt column or an `R` column more is refused by its shape,
+/// as a proof and at its decode.
 #[test]
 fn another_salt_count_or_r_width_is_refused() {
     let masked = masked_wrap();
@@ -393,8 +395,9 @@ fn another_salt_count_or_r_width_is_refused() {
 }
 
 /// A `format::WRAP` proof under `format::MASKED_WRAP` and a
-/// `format::MASKED_WRAP` proof under `format::WRAP` are refused as another format (`0x4`): by their bytes, each format's
-/// decode reading its own header, and as proofs.
+/// `format::MASKED_WRAP` proof under `format::WRAP` are refused as another
+/// format (`0x4`): by their bytes, each format's decode reading its own
+/// header, and as proofs.
 #[test]
 fn cross_format_proofs_are_refused_both_ways() {
     let masked = masked_wrap();
@@ -898,13 +901,13 @@ mod heavy {
         mean_c + covariance / variance * (most - mean_h)
     }
 
-    /// The verify gates as the maximum over 12 seeds of the one-segment
-    /// run's masked wrap ([`gate_proofs`]): on the JAM-only host the decode at most 4M gas
-    /// and the verify at most 125M; in Wasm (the final verifier's blob,
-    /// `just judge-wasm`) at most 50M instructions under the PVF's
-    /// semantics. Each seed's witness hashes are held to the most 24
-    /// distinct queries can take, and each gate also to its cost there,
-    /// extrapolated along the seeds' fit.
+    /// The verify gates as the maximum over 12 seeds of the one-segment run's
+    /// masked wrap ([`gate_proofs`]): on the JAM-only host the decode at most
+    /// 4M gas and the verify at most 125M; in Wasm (the final verifier's blob,
+    /// `just judge-wasm`) at most 50M instructions under the PVF's semantics.
+    /// Each seed's witness hashes are held to the most 24 distinct queries can
+    /// take, and each gate also to its cost there, extrapolated along the
+    /// seeds' fit.
     #[test]
     fn heavy_the_verify_gates_hold_over_seeds() {
         let (program, _) = jam::program();

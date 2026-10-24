@@ -23,13 +23,14 @@
 //!     queries.
 //!
 //! **The randomness** is hedged (R4, [`MaskRng`]). **R1** is checked on
-//! every transcript: the randomizer's revealed functionals of full rank over
-//! M31 ([`rank_m31`]); a deficient transcript is discarded and every mask
-//! drawn again, at most [`MAX_ATTEMPTS`] times. Whether a transcript passes
-//! is a function of public coins and the format, so the retry conditions on
-//! a public event. **R3** holds by construction: `R`'s columns are the
-//! format's (8 for `format::MASKED_WRAP`), whose independent DEEP coefficients span
-//! QM31 over M31 but with probability about `p^-5`; no check.
+//! every transcript: the randomizer's revealed functionals of full rank
+//! over M31 ([`rank_m31`]); a deficient transcript is discarded and every
+//! mask drawn again, at most [`MAX_ATTEMPTS`] times. Whether a transcript
+//! passes is a function of public coins and the format, so the retry
+//! conditions on a public event. **R3** holds by construction: `R`'s
+//! columns are the format's (8 for `format::MASKED_WRAP`), whose
+//! independent DEEP coefficients span QM31 over M31 but with probability
+//! about `p^-5`; no check.
 //!
 //! The format pins the masking ([`Masking`]); nothing here names the wrap,
 //! whose set is [`WrapComponents`].
@@ -94,10 +95,11 @@ pub const fn mask_pins(masking: &Masking) -> MaskPins {
     }
 }
 
-/// `format::MASKED_WRAP`'s trees: its salt and `R` columns, read from the registry.
+/// `format::MASKED_WRAP`'s trees: its salt and `R` columns, read from the
+/// registry.
 pub const MASKED_WRAP_PINS: MaskPins = match &MASKED_WRAP.masking {
     Some(masking) => mask_pins(masking),
-    None => panic!("format 39 pins its masking"),
+    None => panic!("format::MASKED_WRAP pins its masking"),
 };
 
 /// A masked registry entry as its verifier pins it

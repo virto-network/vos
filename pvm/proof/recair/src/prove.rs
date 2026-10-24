@@ -1,15 +1,15 @@
 //! Native proving and verifying of a circuit on the Poseidon2-M31 channel,
-//! under `format::LEAF_FOLD` (`vos_pvm_proof::format::LEAF_FOLD`), the recursion AIR's
-//! format for leaves and folds, at its exact parameters; and proving under
-//! any format of the recursion AIR on its channel ([`prove_on`]), the wrap's
-//! (28) on Blake2b-256, which `vos-pvm-final-verifier` verifies.
+//! under `format::LEAF_FOLD`, the recursion AIR's format for leaves and
+//! folds, at its exact parameters; and proving under any format of the
+//! recursion AIR on its channel ([`prove_on`]), the wrap's (`format::WRAP`)
+//! on Blake2b-256, which `vos-pvm-final-verifier` verifies.
 //!
 //! **The transcript** is the recursion AIR's
 //! ([`vos_pvm_recair_air::transcript`]), its public values the outputs'.
 //!
 //! The verifier pins the circuit by its hash
-//! ([`vos_pvm_recair_air::circuit_hash`]), which binds the preprocessed root, the
-//! log sizes and the format's parameters.
+//! ([`vos_pvm_recair_air::circuit_hash`]), which binds the preprocessed
+//! root, the log sizes and the format's parameters.
 
 use num_traits::Zero;
 use serde::{Deserialize, Serialize};

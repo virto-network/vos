@@ -1,11 +1,11 @@
 //! The final wrap (`proving.md` §3.5, A.3; `recursion-air.md` §7): a 1-to-1
-//! node over a tree's root, proved masked under `format::MASKED_WRAP` on the Blake2b-256
-//! channel ([`prove`]), or unmasked under `format::WRAP`, which
-//! `vos-pvm-final-verifier` verifies against 24 public words
+//! node over a tree's root, proved masked under `format::MASKED_WRAP` on
+//! the Blake2b-256 channel ([`prove`]), or unmasked under `format::WRAP`,
+//! which `vos-pvm-final-verifier` verifies against 24 public words
 //! ([`prove_unmasked`]).
 //!
-//! **What it checks of the root,** a node of the padded shape (`format::LEAF_FOLD`), a
-//! fold's or, for a run of one segment, a leaf's:
+//! **What it checks of the root,** a node of the padded shape
+//! (`format::LEAF_FOLD`), a fold's or, for a run of one segment, a leaf's:
 //! - its proof, verified with its output digest's two wires as the proof's
 //!   outputs (the in-circuit verifier's pieces, as a fold verifies a
 //!   child);
@@ -162,8 +162,8 @@ impl WrapCircuit {
             .expect("the wrap's wiring checks")
     }
 
-    /// Its preprocessed tree's root as `format::MASKED_WRAP` commits it, masked: what
-    /// `vos-pvm-final-verifier` pins as `PREPROCESSED_ROOT_39`.
+    /// Its preprocessed tree's root as `format::MASKED_WRAP` commits it,
+    /// masked: what `vos-pvm-final-verifier` pins as `PREPROCESSED_ROOT_39`.
     pub fn masked_preprocessed_root(&self) -> Blake2bHash {
         crate::prove::masked_preprocessed_root_on::<Blake2bMerkleChannel>(
             &MASKED_WRAP,
@@ -208,8 +208,8 @@ impl<V: Value> WrapValues<V> {
     }
 }
 
-/// Proves a finalized wrap circuit masked under `format::MASKED_WRAP`, on the Blake2b-256
-/// channel, from the operating system's randomness.
+/// Proves a finalized wrap circuit masked under `format::MASKED_WRAP`, on
+/// the Blake2b-256 channel, from the operating system's randomness.
 pub fn prove(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError> {
     prove_masked(finalized, MaskRng::default(), |_| {}).map(|(proof, _)| proof)
 }
@@ -260,8 +260,8 @@ fn wrap_proof(proof: RecairProof<Blake2bMerkleHasher>) -> WrapProof {
 }
 
 /// A wrap proof's bytes as its format lays them out
-/// (`vos_pvm_proof::format::Format::bytes`): `format::MASKED_WRAP`'s fixed layout
-/// (`vos_pvm_final_verifier::masked::encode`), the one encoding its
+/// (`vos_pvm_proof::format::Format::bytes`): `format::MASKED_WRAP`'s fixed
+/// layout (`vos_pvm_final_verifier::masked::encode`), the one encoding its
 /// verifier reads, or postcard's; `None` for a format the registry does not
 /// hold, or a proof its layout cannot hold.
 pub fn proof_bytes(proof: &WrapProof) -> Option<Vec<u8>> {

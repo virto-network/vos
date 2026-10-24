@@ -1,7 +1,7 @@
-//! The masked wrap's AIR (`format::MASKED_WRAP`, masking variant (c)): its degree audit,
-//! the segment chips' under (c), its security shape from the built
-//! components against the registry's reference, and where the masking may
-//! be named.
+//! The masked wrap's AIR (`format::MASKED_WRAP`, masking variant (c)): its
+//! degree audit, the segment chips' under (c), its security shape from the
+//! built components against the registry's reference, and where the masking
+//! may be named.
 
 use std::path::{Path, PathBuf};
 
@@ -31,7 +31,7 @@ use vos_pvm_recair_air::{LogSizes, h8, p2, qm31};
 
 use crate::gates::{degrees, preprocessed_of};
 
-/// The wrap's log sizes, `format::WRAP`'s and 39's.
+/// The wrap's log sizes, `format::WRAP`'s and `format::MASKED_WRAP`'s.
 const LOG_SIZES: LogSizes = [14, 15, 11];
 
 /// Each constraint's degree is at most 3, so a constraint over columns
@@ -217,9 +217,9 @@ fn masked_wrap_shape() -> SecurityShape {
     }
 }
 
-/// The registry's reference for `format::MASKED_WRAP` is the built masked wrap's shape,
-/// field for field: 538 batched values, 3 at most a column; it counts
-/// 82.69 to 82.70 proven bits.
+/// The registry's reference for `format::MASKED_WRAP` is the built masked
+/// wrap's shape, field for field: 538 batched values, 3 at most a column;
+/// it counts 82.69 to 82.70 proven bits.
 #[test]
 fn the_masked_reference_shape_is_the_built_wraps() {
     let built = masked_wrap_shape();

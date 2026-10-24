@@ -1,7 +1,7 @@
 //! A kernel leaf (`proving.md` §3.3, A.3) on a small kernel's run: a
 //! standard program that sets its io-hash in φ9..12 and halts, traced from
-//! the loader's layout and proved at its natural sizes under `format::SEGMENT`, as
-//! one segment and as two.
+//! the loader's layout and proved at its natural sizes under
+//! `format::SEGMENT`, as one segment and as two.
 //!
 //! - **The leaf states its segment:** no mismatch; its transcript the native
 //!   recorder's permutation for permutation; its output digest the native

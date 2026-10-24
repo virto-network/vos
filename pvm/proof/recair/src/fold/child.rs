@@ -1,13 +1,14 @@
-//! A fold's child verified in a circuit (`recursion-air.md` §6): a leaf's or
-//! a fold's proof, `format::LEAF_FOLD` at the padded shape, the recursion AIR's own.
+//! A fold's child verified in a circuit (`recursion-air.md` §6): a leaf's
+//! or a fold's proof, `format::LEAF_FOLD` at the padded shape, the
+//! recursion AIR's own.
 //!
 //! **What a child's circuit is built for** ([`ChildShape`]): the recursion
 //! AIR's three components at the padded log sizes
-//! ([`LEAF_FOLD_LOG_SIZES`]), their constraints compiled by the gate compiler
-//! from the components' own `evaluate`, the `Gate` relation the one drawn,
-//! under `format::LEAF_FOLD`'s parameters. Every child has this shape, a leaf or a
-//! fold: what tells them apart is the preprocessed root, which a child's
-//! circuit is, and the fold takes it as a witness.
+//! ([`LEAF_FOLD_LOG_SIZES`]), their constraints compiled by the gate
+//! compiler from the components' own `evaluate`, the `Gate` relation the
+//! one drawn, under `format::LEAF_FOLD`'s parameters. Every child has this
+//! shape, a leaf or a fold: what tells them apart is the preprocessed root,
+//! which a child's circuit is, and the fold takes it as a witness.
 //!
 //! **The transcript,** as [`crate::verify`] runs it: the statement header
 //! (constants of the fold's circuit), the preprocessed root (a witness),
@@ -17,9 +18,10 @@
 //! the claimed sums, `u`'s use and each output's add to zero; then Stwo's
 //! protocol, as a segment's (`verify_rest`).
 //!
-//! **The circuit hash** ([`circuit_hash`]) is [`vos_pvm_recair_air::circuit_hash`]
-//! in rows: one transcript absorption, from the zero digest, of the format's
-//! constant words and the preprocessed root's wires.
+//! **The circuit hash** ([`circuit_hash`]) is
+//! [`vos_pvm_recair_air::circuit_hash`] in rows: one transcript absorption,
+//! from the zero digest, of the format's constant words and the
+//! preprocessed root's wires.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -87,7 +89,8 @@ fn sample_layout(log_sizes: &LogSizes, config: &PcsConfig) -> SampleLayout {
 }
 
 impl ChildShape {
-    /// The shape of a recursion AIR proof under `format::LEAF_FOLD` at `log_sizes`.
+    /// The shape of a recursion AIR proof under `format::LEAF_FOLD` at
+    /// `log_sizes`.
     ///
     /// # Panics
     /// When the format's floors refuse the shape.
@@ -355,8 +358,9 @@ pub fn verify_child<V: Value>(
 }
 
 /// The circuit hash of a `format::LEAF_FOLD` circuit at `log_sizes` whose
-/// preprocessed root is the wires `root`: [`vos_pvm_recair_air::circuit_hash`]'s
-/// one absorption, its constant words then the root's.
+/// preprocessed root is the wires `root`:
+/// [`vos_pvm_recair_air::circuit_hash`]'s one absorption, its constant
+/// words then the root's.
 pub fn circuit_hash<V: Value>(
     context: &mut Context<V>,
     log_sizes: &LogSizes,

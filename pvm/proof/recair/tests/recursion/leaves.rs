@@ -1,11 +1,11 @@
 //! The leaves' feasibility (`recursion-air.md` §10): COMPARE's leaf, and
 //! the window kernel leaf's rows.
 //!
-//! - **COMPARE's leaf:** a chip-isolated COMPARE proof of `format::SEGMENT`, verified
-//!   natively and in a circuit, the circuit proved and verified; its rows
-//!   against `count-35.log`'s "verify COMPARE alone"; a tampered OODS
-//!   sample, queried value, Merkle sibling, FRI value and nonce each refused
-//!   by its check.
+//! - **COMPARE's leaf:** a chip-isolated COMPARE proof of
+//!   `format::SEGMENT`, verified natively and in a circuit, the circuit
+//!   proved and verified; its rows against `count-35.log`'s "verify COMPARE
+//!   alone"; a tampered OODS sample, queried value, Merkle sibling, FRI
+//!   value and nonce each refused by its check.
 //! - **The window kernel's class-1 leaf topology,** built without values:
 //!   its rows pinned term by term, each beside `count-35.log`'s model.
 
@@ -49,9 +49,9 @@ struct Compare {
     data: RecursionData,
 }
 
-/// COMPARE proved alone under `format::SEGMENT`, over a trace of padding rows: with
-/// no CPU in the proof to produce its lookups, only an idle COMPARE's sums
-/// close. The circuit's rows do not depend on the values.
+/// COMPARE proved alone under `format::SEGMENT`, over a trace of padding
+/// rows: with no CPU in the proof to produce its lookups, only an idle
+/// COMPARE's sums close. The circuit's rows do not depend on the values.
 fn compare() -> &'static Compare {
     static COMPARE: OnceLock<Compare> = OnceLock::new();
     COMPARE.get_or_init(|| {

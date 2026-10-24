@@ -1,14 +1,14 @@
-//! Fuzz target: `format::MASKED_WRAP`'s goldens reshaped within the layout's bounds,
-//! where Stwo's PCS reads them. The parts the transcript binds before the
-//! queries (the header, the commitments, the claimed sums, the sampled
-//! values, the nonces, FRI's commitments and last layer) stay the golden's,
-//! so every proof this makes passes the replay and its proof of work and
-//! reaches `verify_values`' Merkle checks, the DEEP quotients' answers and
-//! FRI's decommitments. What the queries open is made anew, each part kept
-//! or rewritten by the input: each tree's queried values (one count a tree,
-//! up to a query each, any limbs, a noncanonical one among them) and its
-//! Merkle witness (up to a sibling a query a level), and each FRI layer's
-//! witness values and hashes, within their bounds.
+//! Fuzz target: `format::MASKED_WRAP`'s goldens reshaped within the
+//! layout's bounds, where Stwo's PCS reads them. The parts the transcript
+//! binds before the queries (the header, the commitments, the claimed sums,
+//! the sampled values, the nonces, FRI's commitments and last layer) stay
+//! the golden's, so every proof this makes passes the replay and its proof
+//! of work and reaches `verify_values`' Merkle checks, the DEEP quotients'
+//! answers and FRI's decommitments. What the queries open is made anew,
+//! each part kept or rewritten by the input: each tree's queried values
+//! (one count a tree, up to a query each, any limbs, a noncanonical one
+//! among them) and its Merkle witness (up to a sibling a query a level),
+//! and each FRI layer's witness values and hashes, within their bounds.
 //!
 //! Byte flips and the mutation target rarely get this far: a changed
 //! commitment or sampled value is refused by the transcript first.
