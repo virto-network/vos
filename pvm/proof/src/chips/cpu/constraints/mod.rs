@@ -25,33 +25,62 @@ use crate::chips::cpu::columns::Column;
 pub(super) use crate::chips::cpu::columns::Row;
 use crate::chips::cpu::tuples::{BITWISE_FLAGS, BRANCH_FLAGS, COMPARE_FLAGS, STORE_FLAGS};
 use crate::lookups::{
-    BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements,
+    AllLookupElements, BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements,
     Blake2bCallLookupElements, ByteToBitsLookupElements, CompareLookupElements,
-    DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements,
-    MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
-    ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
-    RegisterMemoryLookupElements, WitnessCallLookupElements,
+    ComponentLookupElements, DivRemLookupElements, JumpTableLookupElements,
+    MemoryAccessLookupElements, MultiplicationLookupElements, PopcountLookupElements,
+    PowerOfTwoLookupElements, ProgramExecutionLookupElements, ProgramMemoryLookupElements,
+    Range256LookupElements, RegisterMemoryLookupElements, WitnessCallLookupElements,
 };
 
-/// The relations the CPU chip's rows enter.
-pub(super) struct Lookups<'a> {
-    pub range256_lookup: &'a Range256LookupElements,
-    pub mem_lookup: &'a MemoryAccessLookupElements,
-    pub prog_exec_lookup: &'a ProgramExecutionLookupElements,
-    pub bitwise_and_lookup: &'a BitwiseAndLookupElements,
-    pub pow2_lookup: &'a PowerOfTwoLookupElements,
-    pub blake2b_call_lookup: &'a Blake2bCallLookupElements,
-    pub reg_lookup: &'a RegisterMemoryLookupElements,
-    pub prog_mem_lookup: &'a ProgramMemoryLookupElements,
-    pub jump_table_lookup: &'a JumpTableLookupElements,
-    pub popcount_lookup: &'a PopcountLookupElements,
-    pub bitcount_lookup: &'a BitcountLookupElements,
-    pub mul_lookup: &'a MultiplicationLookupElements,
-    pub bitwise_lookup: &'a BitwiseLookupElements,
-    pub compare_lookup: &'a CompareLookupElements,
-    pub divrem_lookup: &'a DivRemLookupElements,
-    pub byte_to_bits_lookup: &'a ByteToBitsLookupElements,
-    pub witness_call_lookup: &'a WitnessCallLookupElements,
+/// The relations the CPU chip's rows enter, drawn in field order: the
+/// order is the transcript's, so it is part of every program id.
+macro_rules! lookups {
+    ($($field:ident: $relation:ty,)*) => {
+        /// The relations the CPU chip's rows enter.
+        pub struct Lookups {
+            $(pub $field: $relation,)*
+        }
+
+        impl crate::lookups::private::Sealed for Lookups {}
+
+        impl ComponentLookupElements for Lookups {
+            fn dummy() -> Self {
+                Self { $($field: <$relation as ComponentLookupElements>::dummy(),)* }
+            }
+
+            fn get(lookup_elements: &AllLookupElements) -> Self {
+                Self { $($field: <$relation as ComponentLookupElements>::get(lookup_elements),)* }
+            }
+
+            fn draw(
+                lookup_elements: &mut AllLookupElements,
+                channel: &mut impl stwo::core::channel::Channel,
+            ) {
+                $(<$relation as ComponentLookupElements>::draw(lookup_elements, channel);)*
+            }
+        }
+    };
+}
+
+lookups! {
+    range256_lookup: Range256LookupElements,
+    mem_lookup: MemoryAccessLookupElements,
+    prog_exec_lookup: ProgramExecutionLookupElements,
+    bitwise_and_lookup: BitwiseAndLookupElements,
+    pow2_lookup: PowerOfTwoLookupElements,
+    blake2b_call_lookup: Blake2bCallLookupElements,
+    reg_lookup: RegisterMemoryLookupElements,
+    prog_mem_lookup: ProgramMemoryLookupElements,
+    jump_table_lookup: JumpTableLookupElements,
+    popcount_lookup: PopcountLookupElements,
+    bitcount_lookup: BitcountLookupElements,
+    mul_lookup: MultiplicationLookupElements,
+    bitwise_lookup: BitwiseLookupElements,
+    compare_lookup: CompareLookupElements,
+    divrem_lookup: DivRemLookupElements,
+    byte_to_bits_lookup: ByteToBitsLookupElements,
+    witness_call_lookup: WitnessCallLookupElements,
 }
 
 /// The values of `columns`, in order: a tuple of [`tuples`](super::tuples).

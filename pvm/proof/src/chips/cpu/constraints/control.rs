@@ -226,9 +226,9 @@ pub(in crate::chips::cpu) fn branch_conditions<E: EvalAtRow>(eval: &mut E, row: 
 pub(in crate::chips::cpu) fn program_execution<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let prog_exec_lookup = lookups.prog_exec_lookup;
+    let prog_exec_lookup = &lookups.prog_exec_lookup;
     let is_real = E::F::one() - row.is_padding[0].clone();
     // ════════════════════════════════════════════════════════════════════
     // Program execution lookup: step sequencing
@@ -288,9 +288,9 @@ pub(in crate::chips::cpu) fn trap_terminal<E: EvalAtRow>(eval: &mut E, row: &Row
 pub(in crate::chips::cpu) fn jump_ind<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let jump_table_lookup = lookups.jump_table_lookup;
+    let jump_table_lookup = &lookups.jump_table_lookup;
     let f256 = E::F::from(BaseField::from(256));
     // ════════════════════════════════════════════════════════════════════
     // JumpInd target binding via JumpTableChip
@@ -384,9 +384,9 @@ pub(in crate::chips::cpu) fn jump_ind<E: EvalAtRow>(
 pub(in crate::chips::cpu) fn load_imm_jump_ind<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let jump_table_lookup = lookups.jump_table_lookup;
+    let jump_table_lookup = &lookups.jump_table_lookup;
     let f256 = E::F::from(BaseField::from(256));
     // ════════════════════════════════════════════════════════════════════
     // LoadImmJumpInd target binding via JumpTable

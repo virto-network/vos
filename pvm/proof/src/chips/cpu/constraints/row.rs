@@ -146,9 +146,9 @@ pub(in crate::chips::cpu) fn shared_helpers<E: EvalAtRow>(eval: &mut E, row: &Ro
 pub(in crate::chips::cpu) fn next_timestamp_bytes<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let range256_lookup = lookups.range256_lookup;
+    let range256_lookup = &lookups.range256_lookup;
     let is_real = E::F::one() - row.is_padding[0].clone();
     // ── The next timestamp's limbs are bytes ──
     // The carry chain fixes the timestamp's field value, not its limbs:

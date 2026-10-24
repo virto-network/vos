@@ -63,9 +63,9 @@ pub(in crate::chips::cpu) fn address_validity<E: EvalAtRow>(eval: &mut E, row: &
 pub(in crate::chips::cpu) fn result_bytes<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let range256_lookup = lookups.range256_lookup;
+    let range256_lookup = &lookups.range256_lookup;
     let is_real = E::F::one() - row.is_padding[0].clone();
     // ════════════════════════════════════════════════════════════════════
     // Range256 checks for result byte limbs
@@ -83,9 +83,9 @@ pub(in crate::chips::cpu) fn result_bytes<E: EvalAtRow>(
 pub(in crate::chips::cpu) fn memory_access<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let mem_lookup = lookups.mem_lookup;
+    let mem_lookup = &lookups.mem_lookup;
     // ════════════════════════════════════════════════════════════════════
     // Memory access lookup (producer side)
     // ════════════════════════════════════════════════════════════════════

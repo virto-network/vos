@@ -302,9 +302,9 @@ pub(in crate::chips::cpu) fn leading_trailing_zeros<E: EvalAtRow>(eval: &mut E, 
 pub(in crate::chips::cpu) fn sign_extend_nibbles<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let bitwise_and_lookup = lookups.bitwise_and_lookup;
+    let bitwise_and_lookup = &lookups.bitwise_and_lookup;
     // ════════════════════════════════════════════════════════════════════
     // BITMANIP — SignExtend8/16 nibble lookups
     //

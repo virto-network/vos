@@ -13,23 +13,13 @@ use crate::trace::eval::TraceEval;
 #[cfg(feature = "prover")]
 use crate::trace::{builder::FinalizedTrace, component::ComponentTrace};
 
+use crate::framework::BuiltInComponent;
 #[cfg(feature = "prover")]
 use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::AllLookupElements;
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{
-    framework::BuiltInComponent,
-    lookups::{
-        BitcountLookupElements, BitwiseAndLookupElements, BitwiseLookupElements,
-        Blake2bCallLookupElements, ByteToBitsLookupElements, CompareLookupElements,
-        DivRemLookupElements, JumpTableLookupElements, MemoryAccessLookupElements,
-        MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
-        ProgramExecutionLookupElements, ProgramMemoryLookupElements, Range256LookupElements,
-        RegisterMemoryLookupElements, WitnessCallLookupElements,
-    },
-};
 
 // Opcode classification + register-access derivation consume `vos_pvm`
 // types (`Opcode`, `InstructionCategory`) and `PvmStep` witnesses, all of
@@ -71,94 +61,14 @@ impl BuiltInComponent for CpuChip {
 
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
-    type LookupElements = (
-        Range256LookupElements,
-        MemoryAccessLookupElements,
-        ProgramExecutionLookupElements,
-        BitwiseAndLookupElements,
-        PowerOfTwoLookupElements,
-        Blake2bCallLookupElements,
-        RegisterMemoryLookupElements,
-        ProgramMemoryLookupElements,
-        (
-            JumpTableLookupElements,
-            PopcountLookupElements,
-            BitcountLookupElements,
-            MultiplicationLookupElements,
-            BitwiseLookupElements,
-            CompareLookupElements,
-            DivRemLookupElements,
-            ByteToBitsLookupElements,
-            WitnessCallLookupElements,
-        ),
-    );
+    type LookupElements = constraints::Lookups;
 
     fn add_constraints<E: EvalAtRow>(
         &self,
         eval: &mut E,
         trace_eval: TraceEval<PreprocessedColumn, Column, E>,
-        lookup_elements: &(
-            Range256LookupElements,
-            MemoryAccessLookupElements,
-            ProgramExecutionLookupElements,
-            BitwiseAndLookupElements,
-            PowerOfTwoLookupElements,
-            Blake2bCallLookupElements,
-            RegisterMemoryLookupElements,
-            ProgramMemoryLookupElements,
-            (
-                JumpTableLookupElements,
-                PopcountLookupElements,
-                BitcountLookupElements,
-                MultiplicationLookupElements,
-                BitwiseLookupElements,
-                CompareLookupElements,
-                DivRemLookupElements,
-                ByteToBitsLookupElements,
-                WitnessCallLookupElements,
-            ),
-        ),
+        lookups: &constraints::Lookups,
     ) {
-        let (
-            range256_lookup,
-            mem_lookup,
-            prog_exec_lookup,
-            bitwise_and_lookup,
-            pow2_lookup,
-            blake2b_call_lookup,
-            reg_lookup,
-            prog_mem_lookup,
-            (
-                jump_table_lookup,
-                popcount_lookup,
-                bitcount_lookup,
-                mul_lookup,
-                bitwise_lookup,
-                compare_lookup,
-                divrem_lookup,
-                byte_to_bits_lookup,
-                witness_call_lookup,
-            ),
-        ) = lookup_elements;
-        let lookups = constraints::Lookups {
-            range256_lookup,
-            mem_lookup,
-            prog_exec_lookup,
-            bitwise_and_lookup,
-            pow2_lookup,
-            blake2b_call_lookup,
-            reg_lookup,
-            prog_mem_lookup,
-            jump_table_lookup,
-            popcount_lookup,
-            bitcount_lookup,
-            mul_lookup,
-            bitwise_lookup,
-            compare_lookup,
-            divrem_lookup,
-            byte_to_bits_lookup,
-            witness_call_lookup,
-        };
         let row = &columns::Row::new(&trace_eval);
         constraints::row::padding(eval, row);
         constraints::row::timestamp_chain(eval, row);
@@ -187,20 +97,20 @@ impl BuiltInComponent for CpuChip {
         constraints::control::next_pc(eval, row);
         constraints::control::branch_conditions(eval, row);
         constraints::host_call::host_call_continuation(eval, row);
-        constraints::memory::result_bytes(eval, row, &lookups);
-        constraints::memory::memory_access(eval, row, &lookups);
+        constraints::memory::result_bytes(eval, row, lookups);
+        constraints::memory::memory_access(eval, row, lookups);
         constraints::memory::active_bytes(eval, row);
-        constraints::control::program_execution(eval, row, &lookups);
-        constraints::lookups::table_lookups(eval, row, &lookups);
-        constraints::registers::register_accesses(eval, row, &lookups);
-        constraints::host_call::blake2b_call(eval, row, &lookups);
-        constraints::host_call::witness_input_reads(eval, row, &lookups);
-        constraints::bitmanip::sign_extend_nibbles(eval, row, &lookups);
-        constraints::program::program_memory(eval, row, &lookups);
-        constraints::program::flag_bits(eval, row, &lookups);
+        constraints::control::program_execution(eval, row, lookups);
+        constraints::lookups::table_lookups(eval, row, lookups);
+        constraints::registers::register_accesses(eval, row, lookups);
+        constraints::host_call::blake2b_call(eval, row, lookups);
+        constraints::host_call::witness_input_reads(eval, row, lookups);
+        constraints::bitmanip::sign_extend_nibbles(eval, row, lookups);
+        constraints::program::program_memory(eval, row, lookups);
+        constraints::program::flag_bits(eval, row, lookups);
         constraints::control::trap_terminal(eval, row);
-        constraints::control::jump_ind(eval, row, &lookups);
-        constraints::control::load_imm_jump_ind(eval, row, &lookups);
+        constraints::control::jump_ind(eval, row, lookups);
+        constraints::control::load_imm_jump_ind(eval, row, lookups);
         constraints::memory::load_result(eval, row);
         constraints::memory::direct_store_value(eval, row);
         constraints::memory::indirect_store_value(eval, row);
@@ -209,13 +119,13 @@ impl BuiltInComponent for CpuChip {
         constraints::memory::indirect_address(eval, row);
         constraints::memory::signed_load_extension(eval, row);
         constraints::signs::sign_sources(eval, row);
-        constraints::signs::sign_nibbles(eval, row, &lookups);
-        constraints::lookups::mul_lookup(eval, row, &lookups);
-        constraints::lookups::divrem_lookup(eval, row, &lookups);
-        constraints::lookups::compare_lookup(eval, row, &lookups);
-        constraints::lookups::bitwise_lookup(eval, row, &lookups);
-        constraints::host_call::witness_input(eval, row, &lookups);
-        constraints::row::next_timestamp_bytes(eval, row, &lookups);
+        constraints::signs::sign_nibbles(eval, row, lookups);
+        constraints::lookups::mul_lookup(eval, row, lookups);
+        constraints::lookups::divrem_lookup(eval, row, lookups);
+        constraints::lookups::compare_lookup(eval, row, lookups);
+        constraints::lookups::bitwise_lookup(eval, row, lookups);
+        constraints::host_call::witness_input(eval, row, lookups);
+        constraints::row::next_timestamp_bytes(eval, row, lookups);
 
         eval.finalize_logup_in_pairs();
     }

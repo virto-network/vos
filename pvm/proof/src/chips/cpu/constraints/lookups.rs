@@ -12,11 +12,11 @@ use crate::core::step::WORD_SIZE;
 pub(in crate::chips::cpu) fn table_lookups<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let pow2_lookup = lookups.pow2_lookup;
-    let popcount_lookup = lookups.popcount_lookup;
-    let bitcount_lookup = lookups.bitcount_lookup;
+    let pow2_lookup = &lookups.pow2_lookup;
+    let popcount_lookup = &lookups.popcount_lookup;
+    let bitcount_lookup = &lookups.bitcount_lookup;
     // BitwiseAndLookup nibble emissions live in BitwiseChip.  CpuChip
     // emits the BitwiseLookup producer (paired) just before
     // finalize_logup_in_pairs.
@@ -96,7 +96,7 @@ pub(in crate::chips::cpu) fn table_lookups<E: EvalAtRow>(
 pub(in crate::chips::cpu) fn mul_lookup<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
     // ── MultiplicationLookup producer ──
     // Tuple (35 limbs): val_b[8] + val_d[8] + result[8] +
@@ -116,7 +116,7 @@ pub(in crate::chips::cpu) fn mul_lookup<E: EvalAtRow>(
     tuple.extend(values(row, &MUL_TAIL));
     for _ in 0..2 {
         eval.add_to_relation(RelationEntry::new(
-            lookups.mul_lookup,
+            &lookups.mul_lookup,
             row.is_mul[0].clone().into(),
             &tuple,
         ));
@@ -127,7 +127,7 @@ pub(in crate::chips::cpu) fn mul_lookup<E: EvalAtRow>(
 pub(in crate::chips::cpu) fn divrem_lookup<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
     // ── DivRemLookup producer ──
     // Tuple (41 limbs): val_b[8] + val_d[8] + div_quotient[8] +
@@ -140,7 +140,7 @@ pub(in crate::chips::cpu) fn divrem_lookup<E: EvalAtRow>(
     let tuple = values(row, &DIVREM);
     for _ in 0..2 {
         eval.add_to_relation(RelationEntry::new(
-            lookups.divrem_lookup,
+            &lookups.divrem_lookup,
             row.is_div_rem[0].clone().into(),
             &tuple,
         ));
@@ -151,7 +151,7 @@ pub(in crate::chips::cpu) fn divrem_lookup<E: EvalAtRow>(
 pub(in crate::chips::cpu) fn compare_lookup<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
     // ── CompareLookup producer ──
     // Tuple (17 limbs): val_b[8] + val_d[8] + cmp_lt_flag.
@@ -160,7 +160,7 @@ pub(in crate::chips::cpu) fn compare_lookup<E: EvalAtRow>(
     let tuple = values(row, &COMPARE);
     for _ in 0..2 {
         eval.add_to_relation(RelationEntry::new(
-            lookups.compare_lookup,
+            &lookups.compare_lookup,
             is_cmp_or_branch.clone().into(),
             &tuple,
         ));
@@ -171,7 +171,7 @@ pub(in crate::chips::cpu) fn compare_lookup<E: EvalAtRow>(
 pub(in crate::chips::cpu) fn bitwise_lookup<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
     // ── BitwiseLookup producer ──
     // Tuple (30 limbs): val_b[8] + val_d[8] + result[8] + 6 sub-flags.
@@ -181,7 +181,7 @@ pub(in crate::chips::cpu) fn bitwise_lookup<E: EvalAtRow>(
     let tuple = values(row, &BITWISE);
     for _ in 0..2 {
         eval.add_to_relation(RelationEntry::new(
-            lookups.bitwise_lookup,
+            &lookups.bitwise_lookup,
             is_bitwise.clone().into(),
             &tuple,
         ));

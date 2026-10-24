@@ -13,9 +13,9 @@ use crate::chips::cpu::tuples::{FLAG_BYTES, PROGRAM_MEMORY};
 pub(in crate::chips::cpu) fn program_memory<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let prog_mem_lookup = lookups.prog_mem_lookup;
+    let prog_mem_lookup = &lookups.prog_mem_lookup;
     let is_real = E::F::one() - row.is_padding[0].clone();
     // ════════════════════════════════════════════════════════════════════
     // Program-memory consumer (pc + opcode + regs + imm
@@ -55,9 +55,9 @@ pub(in crate::chips::cpu) fn program_memory<E: EvalAtRow>(
 pub(in crate::chips::cpu) fn flag_bits<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let byte_to_bits_lookup = lookups.byte_to_bits_lookup;
+    let byte_to_bits_lookup = &lookups.byte_to_bits_lookup;
     // ════════════════════════════════════════════════════════════════════
     // Byte-to-bits decomposition lookups
     //

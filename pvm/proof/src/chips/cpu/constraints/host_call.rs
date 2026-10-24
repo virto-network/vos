@@ -85,10 +85,10 @@ pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(eval: &mut E, 
 pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let blake2b_call_lookup = lookups.blake2b_call_lookup;
-    let reg_lookup = lookups.reg_lookup;
+    let blake2b_call_lookup = &lookups.blake2b_call_lookup;
+    let reg_lookup = &lookups.reg_lookup;
     // ── blake2b ECALL register-read producers + Phi7Bool tie ──
     {
         // Slot → PVM register index for the ECALL register-read
@@ -173,9 +173,9 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
 pub(in crate::chips::cpu) fn witness_input_reads<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let reg_lookup = lookups.reg_lookup;
+    let reg_lookup = &lookups.reg_lookup;
     // ── Witness-input register reads ──
     // The call reads φ[7] and φ[8], its destination and capacity, from
     // the Phi10/Phi11 slots (= regs_before[7,8], filled every row); the
@@ -208,10 +208,10 @@ pub(in crate::chips::cpu) fn witness_input_reads<E: EvalAtRow>(
 pub(in crate::chips::cpu) fn witness_input<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let compare_lookup = lookups.compare_lookup;
-    let witness_call_lookup = lookups.witness_call_lookup;
+    let compare_lookup = &lookups.compare_lookup;
+    let witness_call_lookup = &lookups.witness_call_lookup;
     // ── Witness input ──
     // An acknowledged witness-input row reads φ7, the destination, and
     // φ8, the capacity (the register reads above); writes its count to

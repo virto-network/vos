@@ -123,7 +123,7 @@ impl AllLookupElements {
     }
 }
 
-mod private {
+pub(crate) mod private {
     pub trait Sealed {}
 }
 impl<T: RegisteredLookupBound> private::Sealed for T {}

@@ -92,9 +92,9 @@ pub(in crate::chips::cpu) fn register_helpers<E: EvalAtRow>(eval: &mut E, row: &
 pub(in crate::chips::cpu) fn register_accesses<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
-    lookups: &Lookups<'_>,
+    lookups: &Lookups,
 ) {
-    let reg_lookup = lookups.reg_lookup;
+    let reg_lookup = &lookups.reg_lookup;
     let is_real = E::F::one() - row.is_padding[0].clone();
     // Register-memory producers: mirror of the interaction trace
     // emissions in the same order (ValB read → ValD read → Result
