@@ -282,7 +282,9 @@ fn the_groups_of_a_node_whose_writer_stalls_elect_elsewhere() {
 
 /// An install at a leader whose commits stall answers that it may have
 /// run, within the node's deadline, rather than wait for the commit; sent
-/// again once commits go on, it installs, as an install overwrites.
+/// again once commits go on, it installs, as an install overwrites. An
+/// install a node no longer leading refuses (`NotLeader`, not run) is sent
+/// to the agent's leader again, its commits open meanwhile.
 #[test]
 fn an_install_at_a_stalled_leader_times_out() {
     let commits = Arc::new(Gate::default());
@@ -292,24 +294,30 @@ fn an_install_at_a_stalled_leader_times_out() {
         config.answered = Duration::from_millis(400);
     });
     let agent = cluster.node(1).create_replicated(vec![1, 2, 3]).unwrap();
-    let leader = cluster.node(cluster.leader(agent));
-    let closed = commits.close();
-    let started = Instant::now();
-    // Bounded here too, so that waiting for the commit fails, not hangs.
-    let install = leader.install(agent, COUNTER, &cluster.programs.counter_elf, vec![]);
-    let installed = smol::block_on(smol::future::or(async { Some(install.await) }, async {
-        smol::Timer::after(Duration::from_secs(10)).await;
-        None
-    }))
-    .expect("the install waited for its commit, past the deadline");
+    let until = Instant::now() + Duration::from_secs(60);
+    let (installed, took, closed) = loop {
+        let leader = cluster.node(cluster.leader(agent));
+        let closed = commits.close();
+        let started = Instant::now();
+        // Bounded here too, so that waiting for the commit fails, not hangs.
+        let install = leader.install(agent, COUNTER, &cluster.programs.counter_elf, vec![]);
+        let installed = smol::block_on(smol::future::or(async { Some(install.await) }, async {
+            smol::Timer::after(Duration::from_secs(10)).await;
+            None
+        }))
+        .expect("the install waited for its commit, past the deadline");
+        match installed {
+            Err(CallError::NotLeader(_)) if Instant::now() < until => drop(closed),
+            installed => break (installed, started.elapsed(), closed),
+        }
+    };
     assert!(
         matches!(installed, Err(CallError::TimedOut)),
         "{installed:?}"
     );
     assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "answered within the deadline, not the commit: {:?}",
-        started.elapsed()
+        took < Duration::from_secs(5),
+        "answered within the deadline, not the commit: {took:?}"
     );
     drop(closed);
     // Sent again, as its operator would after `TimedOut`, until it
