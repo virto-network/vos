@@ -3,7 +3,7 @@
 //! An invocation verifies one proof, or applies one block's operands, and
 //! ends: what it frees is reclaimed only when it is the arena's last block,
 //! so an allocation is a few instructions, which on the PVM's per-block gas
-//! is most of what a decode costs.
+//! is most of what a decode costs. A block shrunk stays where it is.
 
 use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
@@ -128,11 +128,15 @@ unsafe impl<const N: usize> GlobalAlloc for Heap<N> {
             self.account(new_size, layout.size());
             return ptr;
         }
+        if new_size <= layout.size() {
+            self.account(new_size, layout.size());
+            return ptr;
+        }
         // SAFETY: as GlobalAlloc::realloc's default.
         unsafe {
             let new = self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
             if !new.is_null() {
-                core::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size));
+                core::ptr::copy_nonoverlapping(ptr, new, layout.size());
                 self.dealloc(ptr, layout);
             }
             new
