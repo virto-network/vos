@@ -449,9 +449,14 @@ check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-form
 # The live runs of reads at a cut on the agent's model, with no proving:
 # the window's, the balance's and a small map's reads, re-traced, and the
 # kernels' refusals, so a change of the served contract fails `check`.
-# One at a time: four at once were killed past 12 GiB.
+# One at a time: four at once were killed past 12 GiB. Each is named
+# exactly, and the recipe fails unless every name is a test, so a renamed
+# test is not skipped unseen.
+reads_tests := "window_kernel::the_window_settles_at_a_cut window_kernel::a_carried_state_that_does_not_open_is_refused window_kernel::an_older_cut_is_refused window_kernel::rows_off_the_cut_are_refused balance::a_balance_is_stated_at_a_cut balance::a_commitment_that_does_not_open_is_refused reads::a_read_at_a_cut_re_runs_as_its_live_run"
+
 test-reads:
-    cargo test -p vos-pvm-proof --test kernel -- --test-threads=1 window_kernel::the_window_settles_at_a_cut window_kernel::a_carried_state_that_does_not_open_is_refused window_kernel::an_older_cut_is_refused window_kernel::rows_off_the_cut_are_refused balance::a_balance_is_stated_at_a_cut balance::a_commitment_that_does_not_open_is_refused reads::a_read_at_a_cut_re_runs_as_its_live_run
+    let named = ([{{reads_tests}}] | length); let listed = (cargo test -p vos-pvm-proof --test kernel -- --list --exact {{reads_tests}} | lines | where {|line| $line ends-with ': test' } | length); if $listed != $named { error make { msg: $"test-reads names ($named) tests, of which ($listed) exist" } }
+    cargo test -p vos-pvm-proof --test kernel -- --test-threads=1 --exact {{reads_tests}}
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
