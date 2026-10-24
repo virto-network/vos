@@ -19,7 +19,7 @@
 //! widths and the values the DEEP quotient batches. None is read from the
 //! proof, whose own header is checked against them.
 //!
-//! **Before any Stwo call** ([`check_shape`]): the proof's log sizes and
+//! **Before any Stwo call** (`check_shape`): the proof's log sizes and
 //! configuration the format's (before the component set is built at them);
 //! the set's trees the format's widths; four trees of commitments,
 //! decommitments, sampled and queried values, each tree of the format's
@@ -32,7 +32,7 @@
 //! pinned by the format and tested.
 //! - `verify_values` zips the sample points with the sampled values, and
 //!   its trees with the decommitments and queried values: the trees'
-//!   widths ([`crate::TREE_WIDTHS`]) and counts, which [`check_shape`]
+//!   widths ([`crate::TREE_WIDTHS`]) and counts, which `check_shape`
 //!   holds every proof to first;
 //! - `verify_values` takes FRI's degree bound as the last committed tree's
 //!   height less the blowup, so the composition tree must be the last
@@ -132,7 +132,7 @@ pub const FRI_ROUNDS: [u32; 4] = [3, 3, 3, 2];
 /// the interaction tree each component's running sum (4 columns) twice, the
 /// rest once, the salts never; in the composition tree its 4 coordinates and
 /// `R`'s 8 once, the salts never. The decode reads exactly these;
-/// [`check_shape`] holds every proof to the sample points themselves.
+/// `check_shape` holds every proof to the sample points themselves.
 pub const fn samples(tree: usize, column: usize) -> usize {
     match (tree, column) {
         (0, 0..57) => 1,
@@ -265,7 +265,7 @@ fn samples_fit<P, V>(
 /// points (`points`, at any point); FRI's inner layers the rounds its degree
 /// bound folds in after the first, its last layer the format's degree; every
 /// M31 limb canonical.
-pub fn check_shape<H: MerkleHasherLifted>(
+fn check_shape<H: MerkleHasherLifted>(
     format: &MaskedFormat<'_>,
     trees: &TreeVec<Vec<u32>>,
     points: &TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
@@ -326,7 +326,7 @@ pub struct Replayed<MC: MerkleChannel> {
 /// `claim`'s transcript under `format` replayed over `proof`, the component
 /// set `C` laid out as `layout` (at the format's log sizes, any relations),
 /// every check before Stwo's PCS done: the header, the shape
-/// ([`check_shape`]), the circuit, the interaction PoW, the logup sums, the
+/// (`check_shape`), the circuit, the interaction PoW, the logup sums, the
 /// sample points' DEEP values and the composition at the out-of-domain
 /// point. The set is laid out once: its sample points made at zero for the
 /// shape and moved to the out-of-domain point, its constraints evaluated
