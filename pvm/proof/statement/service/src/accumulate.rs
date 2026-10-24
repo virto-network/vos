@@ -49,7 +49,7 @@ use crate::verdict::{
 use crate::{SLOT_MS, natural};
 
 /// The rows queued to drop, by the hour they expire in.
-const BUCKET_MS: u64 = 3_600_000;
+pub const BUCKET_MS: u64 = 3_600_000;
 /// The queued rows an accumulate drops at most: this, and two an input.
 const PRUNE_BASE: u32 = 8;
 

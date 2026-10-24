@@ -262,3 +262,28 @@ fn the_wraps_randomness_is_searched_everywhere() {
         assert_eq!(audit(reach, &seed, drawn[0].clone()).len(), 1, "{reach:?}");
     }
 }
+
+/// A number's needle whose value is a venue's constant is dropped; other
+/// needles are kept.
+#[test]
+fn a_public_constant_is_no_needle() {
+    let mut needles = Needles::default();
+    needles
+        .0
+        .push(Needle::number(Kind::StepCount, "steps", 3_600_000));
+    needles
+        .0
+        .push(Needle::number(Kind::StepCount, "steps", 1_234_567));
+    needles.push(Needle::bytes(Kind::ServedRow, "row", b"a row's value"));
+    needles.except(&[3_600_000]);
+    let names: Vec<&str> = needles
+        .0
+        .iter()
+        .map(|needle| needle.name.as_str())
+        .collect();
+    assert_eq!(names, ["steps", "row"]);
+    assert_eq!(
+        audit(Reach::Leaves, b" 1234567 ", needles.0[0].clone()).len(),
+        1
+    );
+}

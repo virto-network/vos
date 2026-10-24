@@ -79,6 +79,8 @@ pub struct Needle {
     /// Searched in the carriers that leave only: forms too short or too
     /// common to look for in a replica's own bytes.
     leaving: Vec<Vec<u8>>,
+    /// The number it is, for a number's needle.
+    value: Option<u64>,
 }
 
 /// How many distinct values `bytes` holds.
@@ -135,6 +137,7 @@ impl Needle {
                 listed(bytes),
             ],
             leaving,
+            value: None,
         })
     }
 
@@ -186,6 +189,7 @@ impl Needle {
             name: name.into(),
             forms: Vec::new(),
             leaving,
+            value: Some(value),
         }
     }
 
@@ -201,6 +205,7 @@ impl Needle {
             name: name.into(),
             forms: vec![bytes.clone(), listed(values)],
             leaving: vec![hex(&bytes).into_bytes()],
+            value: None,
         }
     }
 
@@ -211,6 +216,7 @@ impl Needle {
             name: name.into(),
             forms: Vec::new(),
             leaving: vec![text.as_bytes().to_vec()],
+            value: None,
         }
     }
 
@@ -235,6 +241,15 @@ pub struct Needles(pub Vec<Needle>);
 impl Needles {
     pub fn push(&mut self, needle: Option<Needle>) {
         self.0.extend(needle);
+    }
+
+    /// Drop every number's needle whose value is one of `public`: a
+    /// venue's layout constants, which its storage holds and any run's
+    /// numbers may equal, as a register's needle drops what the run's
+    /// entry state holds.
+    pub fn except(&mut self, public: &[u64]) {
+        self.0
+            .retain(|needle| needle.value.is_none_or(|value| !public.contains(&value)));
     }
 
     /// The needles of `kind` whose name holds `naming`.

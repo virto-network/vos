@@ -10,6 +10,7 @@ use std::collections::BTreeSet;
 use vos_statement::MAX_ROOT_AGE_MS;
 use vos_statement::vos_anchor::{RootKind, SpaceId};
 use vos_statement_service::MAX_ITEMS;
+use vos_statement_service::accumulate::BUCKET_MS;
 use vos_statement_service::state::{Outcome, SpaceRecord, keys, outcome_id};
 use vos_tree::Hash;
 use vos_wire::package::SLOT_MS;
@@ -44,14 +45,11 @@ pub struct Statements {
     pub genesis_ms: u64,
 }
 
-/// The hour a queued row of the service's pruning is filed under.
-const BUCKET_MS: u64 = 3_600_000;
-
 /// The service's storage, accounted for at one block: the entries its
 /// account counts, and those named from the packages a client sent, the
 /// items' outcomes among them. Equal when every outcome it holds is of a
 /// package the client sent.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Accounting {
     /// The storage entries the account counts.
     pub held: u32,
@@ -61,6 +59,9 @@ pub struct Accounting {
     /// are of, the spaces' anchors and evidence, the pruning's queue, its
     /// cursor and the gas key.
     pub named: u32,
+    /// Every entry found, its key and its value, in the order read: the
+    /// service's storage as a carrier audit searches it.
+    pub rows: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
 /// An item to submit: its payload and its extrinsics.
@@ -171,10 +172,12 @@ impl Statements {
             .saturating_sub(baseline);
         let packages = sent();
         let value = |key: &[u8]| self.node.value(&head, self.service, key);
-        let mut named = 0u32;
+        let mut rows = Vec::new();
         let mut found = |key: &[u8]| -> Result<Option<Vec<u8>>, Error> {
             let value = value(key)?;
-            named += u32::from(value.is_some());
+            if let Some(value) = &value {
+                rows.push((key.to_vec(), value.clone()));
+            }
             Ok(value)
         };
         let mut outcomes = 0u32;
@@ -229,7 +232,8 @@ impl Statements {
         Ok(Accounting {
             held,
             outcomes,
-            named,
+            named: rows.len() as u32,
+            rows,
         })
     }
 

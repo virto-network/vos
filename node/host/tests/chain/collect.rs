@@ -5,8 +5,9 @@
 //! venue's layout (`Tapped`); every work package a JAM client sent, as it
 //! went, with its extrinsics and the work report a guarantor made of it
 //! (anchors, the registration, statements and replays alike: the
-//! deployment's `Wire`), and the service's storage accounted for against
-//! them, so it holds no outcome of a package not watched; the Kreivo mock's
+//! deployment's `Wire`), and the service's storage, accounted for against
+//! them, so it holds no outcome of a package not watched, and read whole
+//! over RPC, the venue's layout constants no needle; the Kreivo mock's
 //! signed envelopes and storage; both venues' anchor chains; the process's
 //! logs and standard error.
 //! The testnet's own log and database, the chain's record of what it was
@@ -20,11 +21,14 @@ use std::time::Duration;
 
 use vos_checker::carriers::{self, Audit, Kind, Reach};
 use vos_node::Node;
+use vos_statement_service::accumulate::BUCKET_MS;
 use vos_statement_service::item::Item;
 use vos_wire::Encode;
 use vos_wire::ids::AgentId;
+use vos_wire::package::SLOT_MS;
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::digest;
+use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
 
 use crate::cuts::results;
 use crate::run::{CANARY, Jam, Run, Stated};
@@ -174,7 +178,26 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
             "JAM {}: every outcome the service holds is of a package watched",
             jam.name
         );
+        let storage: Vec<u8> = accounting
+            .rows
+            .iter()
+            .flat_map(|(key, value)| [key.as_slice(), value].concat())
+            .collect();
+        audit.carrier(
+            format!("JAM {}'s storage", jam.name),
+            Reach::Leaves,
+            storage,
+        );
     }
+    // The service's storage holds the venue's layout constants and the
+    // space's clock: a number of the run's equal to one is no leak.
+    audit.needles.except(&[
+        SLOT_MS,
+        BUCKET_MS,
+        MAX_ROOT_AGE_MS,
+        run.clock.origin_ms,
+        run.clock.length_ms,
+    ]);
     for (n, envelope) in run.kreivo.envelopes().into_iter().enumerate() {
         audit.carrier(format!("Kreivo's extrinsic {n}"), Reach::Leaves, envelope);
     }
