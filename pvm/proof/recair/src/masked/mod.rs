@@ -71,8 +71,8 @@ use vos_pvm_final_verifier::masked::{MaskedFormat, shape_of};
 use vos_pvm_proof::format::{Format, Masking};
 use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair_air::masked::{
-    self as air, BLIND_COLUMNS, MASKED_COLUMN_EXPANSION, MASKED_LOG_CONSTRAINT_EXPANSION, MaskPins,
-    MaskedComponent, MaskedComponents, WrapComponents,
+    self as air, BLIND_COLUMNS, BlindRelation, MASKED_COLUMN_EXPANSION,
+    MASKED_LOG_CONSTRAINT_EXPANSION, MaskPins, MaskedComponent, MaskedComponents, WrapComponents,
 };
 
 pub use drawn::{Drawn, drawn_in};
@@ -363,10 +363,13 @@ where
     };
     for attempt in 0..MAX_ATTEMPTS {
         let mut stream = rng.attempt(&witness, attempt)?;
-        if let Some((proof, mut stats)) =
-            prove_once::<MC, C>(&setup, &preprocessed, &main, &mut stream)?
-        {
-            stats.attempts = attempt + 1;
+        if let Some((proof, r1)) = prove_once::<MC, C>(&setup, &preprocessed, &main, &mut stream)? {
+            let stats = MaskStats {
+                attempts: attempt + 1,
+                rank_check: r1.took,
+                classes: r1.classes,
+                revealed_rows: r1.rows,
+            };
             return Ok((proof, stats));
         }
     }
@@ -387,9 +390,22 @@ struct Setup<'a, R> {
     check_constraints: bool,
 }
 
-/// An attempt's proof and what it measured, `None` when R1 refuses its
+/// A commitment scheme on `MC`'s trees.
+type Scheme<'a, MC> = CommitmentSchemeProver<'a, SimdBackend, MC>;
+
+/// The sample points, one list a column, one tree a list.
+type Points = TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>;
+
+/// What R1 measured on a transcript it accepted.
+struct R1 {
+    took: Duration,
+    classes: usize,
+    rows: usize,
+}
+
+/// An attempt's proof and what R1 measured, `None` when R1 refuses its
 /// transcript.
-type Attempt<H> = Option<(MaskedProof<H>, MaskStats)>;
+type Attempt<H> = Option<(MaskedProof<H>, R1)>;
 
 /// One attempt from `rng`'s stream.
 fn prove_once<MC: MerkleChannel, C: MaskedProvers>(
@@ -401,52 +417,20 @@ fn prove_once<MC: MerkleChannel, C: MaskedProvers>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    let Setup {
-        format,
-        masking,
-        composition,
-        lifting,
-        twiddles,
-        layouts,
-        log_sizes,
-        public,
-        interaction,
-        check_constraints,
-    } = *setup;
-    let pins = mask_pins(&masking);
+    let format = setup.format;
     let config = format.pcs_config();
     let channel = &mut MC::C::default();
-    mix_statement_header(channel, format.number, &config, log_sizes);
-    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, twiddles);
+    mix_statement_header(channel, format.number, &config, setup.log_sizes);
+    let mut scheme = Scheme::<MC>::new(config, setup.twiddles);
     scheme.set_store_polynomials_coefficients();
 
     let mut builder = scheme.tree_builder();
     builder.extend_polys(preprocessed.to_vec());
     builder.commit(channel);
 
-    let blinding = blinding(log_sizes.len(), rng);
-    let blinding_columns: Vec<Vec<CircleCoefficients<SimdBackend>>> = blinding
-        .iter()
-        .zip(log_sizes)
-        .map(|(&value, &log_size)| blinding_polys(value, log_size, twiddles))
-        .collect();
-    let columns: Vec<&CircleCoefficients<SimdBackend>> = main
-        .iter()
-        .zip(&blinding_columns)
-        .flat_map(|(own, blinding)| own.iter().chain(blinding))
-        .collect();
-    let masked = layout::mask_columns(&columns, layouts, rng)?;
-    drop(blinding_columns);
-    salts::commit_salted(
-        &mut scheme,
-        masked,
-        lifting,
-        masking.salt_columns,
-        rng,
-        channel,
-    );
+    let blinding = commit_main(setup, &mut scheme, main, rng, channel)?;
 
-    channel.mix_felts(public);
+    channel.mix_felts(setup.public);
     let interaction_pow = <SimdBackend as stwo::core::proof_of_work::GrindOps<MC::C>>::grind(
         channel,
         format.interaction_pow_bits(),
@@ -454,51 +438,16 @@ where
     channel.mix_u64(interaction_pow);
     let (relations, blind) = C::draw(channel);
 
-    let denominator: SecureField =
-        Relation::<BaseField, SecureField>::combine(&blind, &[BaseField::one()]);
-    let fractions: Vec<FirstRowFraction> = blinding
-        .iter()
-        .map(|&numerator| FirstRowFraction {
-            numerator,
-            denominator,
-        })
-        .collect();
-    let interaction_columns = interaction(&relations, &fractions);
-    if interaction_columns.len() != log_sizes.len() {
-        return Err(ProveError::TraceShape(
-            "one interaction trace per component expected",
-        ));
-    }
-    let claimed_sums: Vec<SecureField> = interaction_columns.iter().map(|(_, sum)| *sum).collect();
-    let polys = SimdBackend::interpolate_columns(
-        interaction_columns
-            .into_iter()
-            .flat_map(|(columns, _)| columns)
-            .collect(),
-        twiddles,
-    );
-    let masked = layout::mask_columns(&polys.iter().collect::<Vec<_>>(), layouts, rng)?;
-    drop(polys);
-    channel.mix_felts(&claimed_sums);
-    salts::commit_salted(
+    let claimed_sums = commit_interaction(
+        setup,
         &mut scheme,
-        masked,
-        lifting,
-        masking.salt_columns,
+        (&relations, &blind),
+        &blinding,
         rng,
         channel,
-    );
-
-    let set = C::new(&relations, &blind, log_sizes, &claimed_sums).ok_or(
-        ProveError::TraceShape("the component set refuses its log sizes or claimed sums"),
     )?;
-    if air::composition_log_degree_bound(&set) != Some(composition) {
-        return Err(ProveError::Masking(
-            "the set's composition bound is not its tallest log size plus 2",
-        ));
-    }
-    let air_level =
-        air::air_log_size(&set).ok_or(ProveError::Masking("the set has no AIR level"))?;
+
+    let (set, air_level) = masked_set::<C>(setup, &relations, &blind, &claimed_sums)?;
     let lifted: Vec<Lifted<'_>> = set
         .provers()
         .into_iter()
@@ -512,57 +461,10 @@ where
         n_preprocessed_columns: scheme.trees[PREPROCESSED_TRACE_IDX].polynomials.len(),
     };
 
-    let random_coeff = channel.draw_secure_felt();
-    let composition_poly = provers.compute_composition_polynomial(
-        random_coeff,
-        &scheme.trace(),
-        twiddles,
-        format.params.log_blowup,
-    );
-    if composition_poly.log_size() != composition {
-        return Err(ProveError::Masking(
-            "the composition polynomial is not at its bound",
-        ));
-    }
-    let mut polys = composition_poly.into_coordinate_polys().to_vec();
-    let seeds: Vec<[u8; 32]> = (0..masking.fri_mask_columns).map(|_| rng.r#gen()).collect();
-    for seed in &seeds {
-        drawn::note("an R column's seed", seed);
-    }
-    polys.extend(
-        seeds
-            .into_iter()
-            .map(|seed| salts::uniform_poly(seed, composition)),
-    );
-    salts::commit_salted(
-        &mut scheme,
-        polys,
-        lifting,
-        masking.salt_columns,
-        rng,
-        channel,
-    );
+    let random_coeff = commit_composition(setup, &mut scheme, &provers, rng, channel)?;
 
     let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
-    let points = air::sample_points(&set, oods_point, &pins).ok_or(ProveError::Masking(
-        "the set's mask points do not fit its trees",
-    ))?;
-    let fits = points.len() == scheme.trees.len()
-        && points
-            .iter()
-            .zip(scheme.trees.iter())
-            .all(|(columns, tree)| columns.len() == tree.polynomials.len());
-    let salts_unsampled = points.iter().skip(1).all(|columns| {
-        columns
-            .len()
-            .checked_sub(masking.salt_columns)
-            .is_some_and(|start| columns[start..].iter().all(Vec::is_empty))
-    });
-    if !fits || !salts_unsampled {
-        return Err(ProveError::Masking(
-            "the sample points do not fit the trees, or a salt is sampled",
-        ));
-    }
+    let points = checked_points(setup, &set, &scheme, oods_point)?;
     let extended = scheme.prove_values(points.clone(), channel);
     let stark_proof = StarkProof(extended.proof);
 
@@ -573,7 +475,7 @@ where
     let composition_value = air::composition_oods_eval(&stark_proof.sampled_values).ok_or(
         ProveError::Masking("the composition's coordinates are not sampled once each"),
     )?;
-    if check_constraints
+    if setup.check_constraints
         && composition_value
             != components.eval_composition_polynomial_at_point(
                 oods_point,
@@ -585,35 +487,243 @@ where
         return Err(ProveError::Stwo(ProvingError::ConstraintsNotSatisfied));
     }
 
-    let started = Instant::now();
-    let revealed = rank::revealed_functionals(
+    let Some(r1) = rank_check(
+        setup,
         &components,
         &points,
         oods_point,
         &extended.aux.unsorted_query_locations,
-        lifting,
-        masking.log_mask_rows,
-    )
-    .ok_or(ProveError::Masking(
-        "R1's column classes do not fit the sample points",
-    ))?;
-    let stats = MaskStats {
-        attempts: 0,
-        rank_check: started.elapsed(),
-        classes: revealed.classes,
-        revealed_rows: revealed.rows,
-    };
-    if !revealed.independent {
+    )?
+    else {
         return Ok(None);
-    }
+    };
     Ok(Some((
         MaskedProof {
             interaction_pow,
             claimed_sums,
             stark_proof,
         },
-        stats,
+        r1,
     )))
+}
+
+/// The main tree: each component's columns, then its blinding columns, all
+/// masked, then the salts. Returns the blinding values.
+fn commit_main<MC: MerkleChannel, R>(
+    setup: &Setup<'_, R>,
+    scheme: &mut Scheme<'_, MC>,
+    main: &[Vec<CircleCoefficients<SimdBackend>>],
+    rng: &mut ChaCha20Rng,
+    channel: &mut MC::C,
+) -> Result<Vec<SecureField>, ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    let blinding = blinding(setup.log_sizes.len(), rng);
+    let blinding_columns: Vec<Vec<CircleCoefficients<SimdBackend>>> = blinding
+        .iter()
+        .zip(setup.log_sizes)
+        .map(|(&value, &log_size)| blinding_polys(value, log_size, setup.twiddles))
+        .collect();
+    let columns: Vec<&CircleCoefficients<SimdBackend>> = main
+        .iter()
+        .zip(&blinding_columns)
+        .flat_map(|(own, blinding)| own.iter().chain(blinding))
+        .collect();
+    let masked = layout::mask_columns(&columns, setup.layouts, rng)?;
+    drop(blinding_columns);
+    salts::commit_salted(
+        scheme,
+        masked,
+        setup.lifting,
+        setup.masking.salt_columns,
+        rng,
+        channel,
+    );
+    Ok(blinding)
+}
+
+/// The interaction tree under the drawn `(relations, blind)`: the blinded
+/// claimed sums mixed, then the columns masked and salted. Returns the
+/// blinded claimed sums.
+fn commit_interaction<MC: MerkleChannel, R>(
+    setup: &Setup<'_, R>,
+    scheme: &mut Scheme<'_, MC>,
+    (relations, blind): (&R, &BlindRelation),
+    blinding: &[SecureField],
+    rng: &mut ChaCha20Rng,
+    channel: &mut MC::C,
+) -> Result<Vec<SecureField>, ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    let denominator: SecureField =
+        Relation::<BaseField, SecureField>::combine(blind, &[BaseField::one()]);
+    let fractions: Vec<FirstRowFraction> = blinding
+        .iter()
+        .map(|&numerator| FirstRowFraction {
+            numerator,
+            denominator,
+        })
+        .collect();
+    let interaction_columns = (setup.interaction)(relations, &fractions);
+    if interaction_columns.len() != setup.log_sizes.len() {
+        return Err(ProveError::TraceShape(
+            "one interaction trace per component expected",
+        ));
+    }
+    let claimed_sums: Vec<SecureField> = interaction_columns.iter().map(|(_, sum)| *sum).collect();
+    let polys = SimdBackend::interpolate_columns(
+        interaction_columns
+            .into_iter()
+            .flat_map(|(columns, _)| columns)
+            .collect(),
+        setup.twiddles,
+    );
+    let masked = layout::mask_columns(&polys.iter().collect::<Vec<_>>(), setup.layouts, rng)?;
+    drop(polys);
+    channel.mix_felts(&claimed_sums);
+    salts::commit_salted(
+        scheme,
+        masked,
+        setup.lifting,
+        setup.masking.salt_columns,
+        rng,
+        channel,
+    );
+    Ok(claimed_sums)
+}
+
+/// The component set at the drawn relations and the blinded claimed sums,
+/// its composition at the setup's bound, and its AIR level.
+fn masked_set<C: MaskedProvers>(
+    setup: &Setup<'_, C::Relations>,
+    relations: &C::Relations,
+    blind: &BlindRelation,
+    claimed_sums: &[SecureField],
+) -> Result<(C, u32), ProveError> {
+    let set = C::new(relations, blind, setup.log_sizes, claimed_sums).ok_or(
+        ProveError::TraceShape("the component set refuses its log sizes or claimed sums"),
+    )?;
+    if air::composition_log_degree_bound(&set) != Some(setup.composition) {
+        return Err(ProveError::Masking(
+            "the set's composition bound is not its tallest log size plus 2",
+        ));
+    }
+    let air_level =
+        air::air_log_size(&set).ok_or(ProveError::Masking("the set has no AIR level"))?;
+    Ok((set, air_level))
+}
+
+/// The composition tree: the composition's 4 coordinates whole at its
+/// bound, the FRI mask `R`'s uniform columns, the salts. Returns the
+/// composition coefficient drawn before it.
+fn commit_composition<MC: MerkleChannel, R>(
+    setup: &Setup<'_, R>,
+    scheme: &mut Scheme<'_, MC>,
+    provers: &ComponentProvers<'_, SimdBackend>,
+    rng: &mut ChaCha20Rng,
+    channel: &mut MC::C,
+) -> Result<SecureField, ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    let random_coeff = channel.draw_secure_felt();
+    let composition_poly = provers.compute_composition_polynomial(
+        random_coeff,
+        &scheme.trace(),
+        setup.twiddles,
+        setup.format.params.log_blowup,
+    );
+    if composition_poly.log_size() != setup.composition {
+        return Err(ProveError::Masking(
+            "the composition polynomial is not at its bound",
+        ));
+    }
+    let mut polys = composition_poly.into_coordinate_polys().to_vec();
+    let seeds: Vec<[u8; 32]> = (0..setup.masking.fri_mask_columns)
+        .map(|_| rng.r#gen())
+        .collect();
+    for seed in &seeds {
+        drawn::note("an R column's seed", seed);
+    }
+    polys.extend(
+        seeds
+            .into_iter()
+            .map(|seed| salts::uniform_poly(seed, setup.composition)),
+    );
+    salts::commit_salted(
+        scheme,
+        polys,
+        setup.lifting,
+        setup.masking.salt_columns,
+        rng,
+        channel,
+    );
+    Ok(random_coeff)
+}
+
+/// `set`'s sample points around `oods_point`, checked to fit the committed
+/// trees with no salt sampled.
+fn checked_points<MC: MerkleChannel, R>(
+    setup: &Setup<'_, R>,
+    set: &impl MaskedComponents,
+    scheme: &Scheme<'_, MC>,
+    oods_point: CirclePoint<SecureField>,
+) -> Result<Points, ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    let points = air::sample_points(set, oods_point, &mask_pins(&setup.masking)).ok_or(
+        ProveError::Masking("the set's mask points do not fit its trees"),
+    )?;
+    let fits = points.len() == scheme.trees.len()
+        && points
+            .iter()
+            .zip(scheme.trees.iter())
+            .all(|(columns, tree)| columns.len() == tree.polynomials.len());
+    let salts_unsampled = points.iter().skip(1).all(|columns| {
+        columns
+            .len()
+            .checked_sub(setup.masking.salt_columns)
+            .is_some_and(|start| columns[start..].iter().all(Vec::is_empty))
+    });
+    if !fits || !salts_unsampled {
+        return Err(ProveError::Masking(
+            "the sample points do not fit the trees, or a salt is sampled",
+        ));
+    }
+    Ok(points)
+}
+
+/// R1 on the transcript: the randomizer's revealed functionals at `points`
+/// and the queried `query_positions`, timed. `None` when they are not of
+/// full rank.
+fn rank_check<R>(
+    setup: &Setup<'_, R>,
+    components: &Components<'_>,
+    points: &Points,
+    oods_point: CirclePoint<SecureField>,
+    query_positions: &[usize],
+) -> Result<Option<R1>, ProveError> {
+    let started = Instant::now();
+    let revealed = rank::revealed_functionals(
+        components,
+        points,
+        oods_point,
+        query_positions,
+        setup.lifting,
+        setup.masking.log_mask_rows,
+    )
+    .ok_or(ProveError::Masking(
+        "R1's column classes do not fit the sample points",
+    ))?;
+    let took = started.elapsed();
+    Ok(revealed.independent.then_some(R1 {
+        took,
+        classes: revealed.classes,
+        rows: revealed.rows,
+    }))
 }
 
 /// The blinding values (R2), one a component: uniform but the last, which
