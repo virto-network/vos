@@ -30,6 +30,8 @@ pub trait Host {
     fn agents(&self) -> Vec<AgentId>;
     /// The last index of `agent`'s log this replica applied.
     fn applied(&self, agent: AgentId) -> u64;
+    /// The last index compacted out of `agent`'s log: 0 for none.
+    fn log_start(&self, agent: AgentId) -> Result<u64, String>;
     /// The attests the work result at `index` of `agent`'s log recorded:
     /// none for another kind of entry; `None` when the log no longer holds
     /// the entry.
@@ -321,11 +323,11 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         Ok(removed)
     }
 
-    /// Whether `job`'s record is behind its agent's watermark and no longer
-    /// in its log.
+    /// Whether `job`'s record is behind its agent's watermark and compacted
+    /// out of its log.
     fn read_past(&self, job: &Job) -> Result<bool, String> {
         Ok(self.jobs.watermark(job.agent)? >= job.index
-            && self.host.attests(job.agent, job.index)?.is_none())
+            && self.host.log_start(job.agent)? >= job.index)
     }
 
     /// Read `agent`'s records past its watermark, through its applied

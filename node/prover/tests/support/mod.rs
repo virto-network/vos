@@ -111,6 +111,10 @@ impl Host for Node {
         self.agent.lock().unwrap().log.len() as u64
     }
 
+    fn log_start(&self, _: AgentId) -> Result<u64, String> {
+        Ok(self.agent.lock().unwrap().compacted)
+    }
+
     fn attests(&self, _: AgentId, index: u64) -> Result<Option<Vec<Attest>>, String> {
         let agent = self.agent.lock().unwrap();
         if index <= agent.compacted {

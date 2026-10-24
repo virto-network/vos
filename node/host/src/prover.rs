@@ -100,6 +100,14 @@ impl Host for NodeHost {
             .unwrap_or(0)
     }
 
+    fn log_start(&self, agent: AgentId) -> Result<u64, String> {
+        self.0
+            .store
+            .agent_rows(agent)
+            .map(|rows| rows.log_start)
+            .map_err(|error| format!("{error:?}"))
+    }
+
     fn attests(&self, agent: AgentId, index: u64) -> Result<Option<Vec<Attest>>, String> {
         let Some(entry) = self
             .0
