@@ -22,9 +22,6 @@ struct Handler {
     kind: Kind,
     options: Options,
     has_context: bool,
-    /// An attestable `&self` method: it reads its instance's committed rows
-    /// at a window's cut, through its actor's view.
-    reads: bool,
     arguments: Vec<(Ident, Type)>,
     /// Which arguments are `#[public]`, by their position.
     public: Vec<bool>,
@@ -36,12 +33,6 @@ impl Handler {
     /// Its arguments' names.
     fn names(&self) -> Vec<&Ident> {
         self.arguments.iter().map(|(name, _)| name).collect()
-    }
-
-    /// Whether its kernel states public arguments or a root: a venue, the
-    /// reader, or a `#[public]` argument.
-    fn states_parts(&self) -> bool {
-        self.options.venue_bound.is_some() || self.reads || self.public.iter().any(|public| *public)
     }
 }
 
@@ -188,6 +179,69 @@ fn handler(
             "only a query (`&self`) is `linearizable`: what runs through the log already is",
         ));
     }
+    let Arguments {
+        has_context,
+        arguments,
+        public,
+    } = arguments(inputs, kind, &options)?;
+    let (reply, error) = reply_and_error(&method.sig.output);
+    if kind == Kind::Attestable && error.is_some() {
+        return Err(Error::new(
+            method.sig.output.span(),
+            "an #[attestable] method cannot fail: return its output",
+        ));
+    }
+    // An attestable method's kind says what its kernel returns, and whether
+    // it reads at a window's cut.
+    let kind = match kind {
+        Kind::Attestable if reads => Kind::Reading,
+        Kind::Attestable if options.venue_bound.is_some() || public.contains(&true) => {
+            Kind::Stating
+        }
+        kind => kind,
+    };
+    let id = ids.take("vos/method/", &name, method.sig.ident.span())?;
+    method
+        .attrs
+        .retain(|attribute| !attribute.path().is_ident("msg") && mark(attribute).is_none());
+    for input in &mut method.sig.inputs {
+        if let FnArg::Typed(typed) = input {
+            typed
+                .attrs
+                .retain(|attribute| !attribute.path().is_ident("public"));
+        }
+    }
+    Ok(Handler {
+        method,
+        name,
+        id,
+        kind,
+        options,
+        has_context,
+        arguments,
+        public,
+        reply,
+        error,
+    })
+}
+
+/// A handler's arguments after its receiver, as [`handler`] reads them.
+struct Arguments {
+    /// Whether the first is its context.
+    has_context: bool,
+    arguments: Vec<(Ident, Type)>,
+    /// Which arguments are `#[public]`, by their position.
+    public: Vec<bool>,
+}
+
+/// The arguments `inputs` of a handler of `kind` (an attestable method's
+/// before its kind is refined) with `options`: its context, if it takes
+/// one, then its plain-named arguments.
+fn arguments<'a>(
+    inputs: impl Iterator<Item = &'a FnArg>,
+    kind: Kind,
+    options: &Options,
+) -> syn::Result<Arguments> {
     let mut has_context = false;
     let mut arguments = Vec::new();
     let mut public = Vec::new();
@@ -251,45 +305,10 @@ fn handler(
         arguments.push((pattern.ident.clone(), (*typed.ty).clone()));
         public.push(marked_public.is_some());
     }
-    let (reply, error) = reply_and_error(&method.sig.output);
-    if kind == Kind::Attestable && error.is_some() {
-        return Err(Error::new(
-            method.sig.output.span(),
-            "an #[attestable] method cannot fail: return its output",
-        ));
-    }
-    // An attestable method's kind says what its kernel returns, and whether
-    // it reads at a window's cut.
-    let kind = match kind {
-        Kind::Attestable if reads => Kind::Reading,
-        Kind::Attestable if options.venue_bound.is_some() || public.contains(&true) => {
-            Kind::Stating
-        }
-        kind => kind,
-    };
-    let id = ids.take("vos/method/", &name, method.sig.ident.span())?;
-    method
-        .attrs
-        .retain(|attribute| !attribute.path().is_ident("msg") && mark(attribute).is_none());
-    for input in &mut method.sig.inputs {
-        if let FnArg::Typed(typed) = input {
-            typed
-                .attrs
-                .retain(|attribute| !attribute.path().is_ident("public"));
-        }
-    }
-    Ok(Handler {
-        method,
-        name,
-        id,
-        kind,
-        options,
+    Ok(Arguments {
         has_context,
-        reads,
         arguments,
         public,
-        reply,
-        error,
     })
 }
 
@@ -329,7 +348,7 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
             Some(attribute) => {
                 let kind = mark(&attribute);
                 let handler = handler(method, &attribute, kind, &mut ids)?;
-                if handler.reads {
+                if handler.kind == Kind::Reading {
                     viewed.push(handler.method.clone());
                 } else {
                     items.push(ImplItem::Fn(handler.method.clone()));
@@ -347,93 +366,25 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
         ));
     }
 
-    let mut types = Vec::new();
-    let mut arms = Vec::new();
-    let mut entries = Vec::new();
-    let mut attestables = Vec::new();
-    let mut schema = Schema {
-        methods: Vec::new(),
+    let mut generated = Generated {
+        types: Vec::new(),
+        arms: Vec::new(),
+        entries: Vec::new(),
+        attestables: Vec::new(),
+        schema: Schema {
+            methods: Vec::new(),
+        },
     };
     for handler in &handlers {
-        let message = format_ident!("{}", upper_camel(&handler.name));
-        let id = handler.id;
-        let reply = &handler.reply;
-        let venue = handler
-            .options
-            .venue_bound
-            .map(|_| quote!(pub venue: ::vos_sdk::VenueId));
-        let fields = venue.into_iter().chain(
-            handler
-                .arguments
-                .iter()
-                .map(|(name, ty)| quote!(pub #name: #ty)),
-        );
-        schema.methods.push(MethodSchema {
-            id: MethodId(id),
-            name: handler.name.clone().into_bytes(),
-            kind: handler.kind,
-            role: handler.options.role.clone().map(String::into_bytes),
-            gas: handler.options.gas,
-            linearizable: handler.options.linearizable.is_some(),
-        });
-        types.push(quote! {
-            #[derive(::vos_sdk::Encode, ::vos_sdk::Decode)]
-            pub struct #message {
-                #(#fields,)*
-            }
-        });
-        let error = handler
-            .error
-            .clone()
-            .unwrap_or_else(|| syn::parse_quote!(::vos_sdk::context::Never));
-        match handler.kind {
-            Kind::Attestable | Kind::Stating | Kind::Reading => {
-                let method = if handler.reads {
-                    quote!(AtCutMethod)
-                } else {
-                    quote!(AttestableMethod)
-                };
-                types.push(quote! {
-                    impl ::vos_sdk::context::#method for #message {
-                        type Actor = super::#actor;
-                        const ID: u32 = #id;
-                        type Output = #reply;
-                    }
-                });
-                let (entry, attestable) =
-                    attestable_entry(handler, &actor, &view, &module, &message);
-                entries.push(entry);
-                attestables.push(attestable);
-            }
-            Kind::Workflow => {
-                types.push(quote! {
-                    impl ::vos_sdk::context::WorkflowMethod for #message {
-                        type Actor = super::#actor;
-                        const ID: u32 = #id;
-                        type Output = #reply;
-                        type Error = #error;
-                    }
-                });
-                arms.push(workflow_arm(handler, &actor, &message));
-            }
-            Kind::Command | Kind::Query => {
-                types.push(quote! {
-                    impl ::vos_sdk::context::Method for #message {
-                        type Actor = super::#actor;
-                        const ID: u32 = #id;
-                        type Reply = #reply;
-                        type Error = #error;
-                    }
-                });
-                if handler.kind == Kind::Query {
-                    types.push(quote! {
-                        impl ::vos_sdk::context::QueryMethod for #message {}
-                    });
-                }
-                arms.push(handler_arm(handler, &actor, &message));
-            }
-        }
+        generated.add(handler, &actor, &view, &module);
     }
+    let Generated {
+        types,
+        arms,
+        entries,
+        attestables,
+        schema,
+    } = generated;
 
     let schema = schema.section();
     let schema_len = schema.len();
@@ -489,6 +440,102 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
     })
 }
 
+/// The code `#[messages]` makes of its handlers, in their order.
+struct Generated {
+    /// The message types and their impls.
+    types: Vec<Tokens>,
+    /// The dispatcher's arms.
+    arms: Vec<Tokens>,
+    /// The attestable methods' entries, and their rows in the table.
+    entries: Vec<Tokens>,
+    attestables: Vec<Tokens>,
+    schema: Schema,
+}
+
+impl Generated {
+    /// `handler`'s message type, its schema entry, and its dispatcher arm
+    /// or its attestable entry.
+    fn add(&mut self, handler: &Handler, actor: &Ident, view: &Ident, module: &Ident) {
+        let message = format_ident!("{}", upper_camel(&handler.name));
+        let id = handler.id;
+        let reply = &handler.reply;
+        let venue = handler
+            .options
+            .venue_bound
+            .map(|_| quote!(pub venue: ::vos_sdk::VenueId));
+        let fields = venue.into_iter().chain(
+            handler
+                .arguments
+                .iter()
+                .map(|(name, ty)| quote!(pub #name: #ty)),
+        );
+        self.schema.methods.push(MethodSchema {
+            id: MethodId(id),
+            name: handler.name.clone().into_bytes(),
+            kind: handler.kind,
+            role: handler.options.role.clone().map(String::into_bytes),
+            gas: handler.options.gas,
+            linearizable: handler.options.linearizable.is_some(),
+        });
+        self.types.push(quote! {
+            #[derive(::vos_sdk::Encode, ::vos_sdk::Decode)]
+            pub struct #message {
+                #(#fields,)*
+            }
+        });
+        let error = handler
+            .error
+            .clone()
+            .unwrap_or_else(|| syn::parse_quote!(::vos_sdk::context::Never));
+        match handler.kind {
+            Kind::Attestable | Kind::Stating | Kind::Reading => {
+                let method = if handler.kind == Kind::Reading {
+                    quote!(AtCutMethod)
+                } else {
+                    quote!(AttestableMethod)
+                };
+                self.types.push(quote! {
+                    impl ::vos_sdk::context::#method for #message {
+                        type Actor = super::#actor;
+                        const ID: u32 = #id;
+                        type Output = #reply;
+                    }
+                });
+                let (entry, attestable) = attestable_entry(handler, actor, view, module, &message);
+                self.entries.push(entry);
+                self.attestables.push(attestable);
+            }
+            Kind::Workflow => {
+                self.types.push(quote! {
+                    impl ::vos_sdk::context::WorkflowMethod for #message {
+                        type Actor = super::#actor;
+                        const ID: u32 = #id;
+                        type Output = #reply;
+                        type Error = #error;
+                    }
+                });
+                self.arms.push(workflow_arm(handler, actor, &message));
+            }
+            Kind::Command | Kind::Query => {
+                self.types.push(quote! {
+                    impl ::vos_sdk::context::Method for #message {
+                        type Actor = super::#actor;
+                        const ID: u32 = #id;
+                        type Reply = #reply;
+                        type Error = #error;
+                    }
+                });
+                if handler.kind == Kind::Query {
+                    self.types.push(quote! {
+                        impl ::vos_sdk::context::QueryMethod for #message {}
+                    });
+                }
+                self.arms.push(handler_arm(handler, actor, &message));
+            }
+        }
+    }
+}
+
 /// An attestable method's entry, `__vos_attest_<name>`, the root its
 /// kernel is derived from, and the entry's row in the program's table.
 ///
@@ -511,52 +558,8 @@ fn attestable_entry(
     let id = handler.id;
     let names = handler.names();
     let entry = format_ident!("__vos_attest_{}", handler.name);
-    let body = if handler.states_parts() {
-        let venue = handler.options.venue_bound.map(|_| quote!(venue,));
-        let bound = handler
-            .options
-            .venue_bound
-            .map(|_| quote!(::vos_sdk::Encode::encode_to(&venue, &mut public_args);));
-        let publics = handler
-            .arguments
-            .iter()
-            .zip(&handler.public)
-            .filter(|(_, public)| **public)
-            .map(|((name, _), _)| quote!(::vos_sdk::Encode::encode_to(&#name, &mut public_args);));
-        let (served, reader, call, roots) = if handler.reads {
-            (
-                quote! {
-                    let served = ::vos_sdk::runtime::served(&input[used..]);
-                    let root = ::vos_sdk::runtime::verify_served(served);
-                    let view = <#view as ::vos_sdk::state::View>::served(served);
-                },
-                quote!(::vos_sdk::Encode::encode_to(&(served.agent, served.instance), &mut public_args);),
-                quote!(view.#method(#(#names),*)),
-                quote!(::vos_sdk::Vec::from([root])),
-            )
-        } else {
-            (
-                quote!(let _ = used;),
-                quote!(),
-                quote!(Self::#method(#(#names),*)),
-                quote!(::vos_sdk::Vec::new()),
-            )
-        };
-        quote! {
-            let ::core::result::Result::Ok((#module::#message { #venue #(#names),* }, used)) =
-                <#module::#message as ::vos_sdk::Decode>::decode(input)
-            else {
-                ::core::panic!("undecodable arguments")
-            };
-            #served
-            let mut public_args = ::vos_sdk::Vec::new();
-            #bound
-            #reader
-            #(#publics)*
-            let output = ::vos_sdk::Encode::encode(&#call);
-            // SAFETY: the caller's contract.
-            unsafe { ::vos_sdk::runtime::attested(public_args, output, #roots, io_hash) }
-        }
+    let body = if handler.kind != Kind::Attestable {
+        parts_body(handler, view, module, message)
     } else {
         quote! {
             let ::core::result::Result::Ok((#module::#message { #(#names),* }, _)) =
@@ -591,7 +594,7 @@ fn attestable_entry(
             #body
         }
     };
-    let word = if handler.reads {
+    let word = if handler.kind == Kind::Reading {
         quote!(#id as u64 | ::vos_sdk::runtime::READS_SERVED)
     } else {
         quote!(#id as u64)
@@ -603,6 +606,58 @@ fn attestable_entry(
         }
     };
     (function, row)
+}
+
+/// An attestable entry's body when its method states parts beside its
+/// output: a venue, the reader or a `#[public]` argument.
+fn parts_body(handler: &Handler, view: &Ident, module: &Ident, message: &Ident) -> Tokens {
+    let method = &handler.method.sig.ident;
+    let names = handler.names();
+    let venue = handler.options.venue_bound.map(|_| quote!(venue,));
+    let bound = handler
+        .options
+        .venue_bound
+        .map(|_| quote!(::vos_sdk::Encode::encode_to(&venue, &mut public_args);));
+    let publics = handler
+        .arguments
+        .iter()
+        .zip(&handler.public)
+        .filter(|(_, public)| **public)
+        .map(|((name, _), _)| quote!(::vos_sdk::Encode::encode_to(&#name, &mut public_args);));
+    let (served, reader, call, roots) = if handler.kind == Kind::Reading {
+        (
+            quote! {
+                let served = ::vos_sdk::runtime::served(&input[used..]);
+                let root = ::vos_sdk::runtime::verify_served(served);
+                let view = <#view as ::vos_sdk::state::View>::served(served);
+            },
+            quote!(::vos_sdk::Encode::encode_to(&(served.agent, served.instance), &mut public_args);),
+            quote!(view.#method(#(#names),*)),
+            quote!(::vos_sdk::Vec::from([root])),
+        )
+    } else {
+        (
+            quote!(let _ = used;),
+            quote!(),
+            quote!(Self::#method(#(#names),*)),
+            quote!(::vos_sdk::Vec::new()),
+        )
+    };
+    quote! {
+        let ::core::result::Result::Ok((#module::#message { #venue #(#names),* }, used)) =
+            <#module::#message as ::vos_sdk::Decode>::decode(input)
+        else {
+            ::core::panic!("undecodable arguments")
+        };
+        #served
+        let mut public_args = ::vos_sdk::Vec::new();
+        #bound
+        #reader
+        #(#publics)*
+        let output = ::vos_sdk::Encode::encode(&#call);
+        // SAFETY: the caller's contract.
+        unsafe { ::vos_sdk::runtime::attested(public_args, output, #roots, io_hash) }
+    }
 }
 
 /// A workflow's arm of the dispatcher: its arguments decoded, its context
