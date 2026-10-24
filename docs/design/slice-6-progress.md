@@ -4244,3 +4244,113 @@ one "authoring is lagging behind the best block slot" on node1, a load
 warning). After item 50's key helper (`3435ce3a`), `just check` green
 again (1,398 passed in 103 suites) and `just test-carriers` green (451
 `WrapRandomness` needles, clean, 146.0 s).
+
+## Slice 6's gates
+
+The plan's 6.22 gates (`slice-gate`, the checker loop, `just e2e-chain`,
+the kit's sync check) and its measured rows, at `vos-core` `bd3d975d`
+(`bf895d27` and the fix below).
+
+**Gates** [measured; each under a 12 GiB scope, `nice -n 10`,
+`CARGO_BUILD_JOBS=12`, `CARGO_INCREMENTAL=1` for the host's builds, one
+heavy run at a time, each started with 36 GB or more available;
+`slice-gate`'s recipes run one by one in its order, `test-proof` and
+`test-bench-proof` with `RUST_TEST_NOCAPTURE=1` so their rows print]:
+- **`ci`:** green, 125 suites, 1,507 passed, 0 failed, 1,316 s.
+- **`test-bench-proof`:** green, 2 passed, 17 s.
+- **`test-proof`** with `LEAKAGE_N=2000 LEAKAGE_WRAP_N=32`: green, 47
+  suites (each kernel test a process), 562 passed, 0 failed, 2,825 s.
+  `judge-wasm` 31 of 31 fixtures as recorded under both semantics, for
+  the production blob (39) and the test blob (28, 39), the 3 anchor
+  vectors as pinned; the constants and program ids the repository's, with
+  and without `debug-internals`. The leakage tests at their full N: on the
+  small circuit 2,000 masked proofs of each of 3 witnesses (59.1 s), 7,546
+  hypotheses, the smallest p-value 1.10e-5 against a threshold of
+  3.31e-8, none refused (the unmasked control: 3,159 of 3,441 refused); on
+  the real wrap 32 masked wraps of each of two kernels (356.0 s and
+  276.9 s, 15,160 fields each), 15,161 hypotheses, the smallest p-value
+  1.06e-4 against 1.65e-8, none refused (the control: 8,764 of 11,685
+  refused). The carrier audit (`test-carriers`) clean, 451
+  `WrapRandomness` needles among every kind, 228 s.
+- **`just fuzz 300`:** the seven targets five minutes each, no crash,
+  2,305 s: `final_verifier_bytes` 733,645 runs, `final_verifier_mutate`
+  8,354, `statement_decode` 615,104, `prove_verify_roundtrip` 39 (in
+  314 s), `masked_bytes` 282,911, `masked_shape` 20,470, `anchor_decode`
+  76,755,791.
+- `slice-gate` in all: 6,463 s (107.7 min).
+- **The checker loop with cuts and the representative:** seeds 6501–6512
+  × the three exactly-once tests and the cuts run with `CUTS_FULL` (the
+  representative on three nodes, anchoring at the served harness's
+  `ModelVenue`): 48 of 48 green, 1,370 s (95–139 s a seed), load 4.3–7.2
+  at each seed's end. Per run and agent: 144–291 reads, 84–265 served,
+  18–65 not served in time, 0 unserved; 350–693 samples holding undo
+  rows; 5 cut rows kept; `S_w` the same on every replica at the
+  representative's two latest cuts, each seed; the venue 49–63 anchors a
+  run, one a window, each checked against the replicas' roots, no
+  evidence.
+- **`just e2e-chain`:** green, 1,443 s (the test 1,431 s): every verdict
+  as expected; the audit clean over 332 carriers and 22 JAM packages with
+  their work reports (4,059 `WrapRandomness` needles among them); the
+  storage of JAM a (53 entries, 14 outcomes) and JAM b (11, 3) each as
+  many as named from the packages watched; the testnet's errors none.
+- **The kit's sync check** (`check-kit`, in `ci`): ran and passed: the
+  kit's `wasm32v1-none` build with no std feature, VOS `bd3d975d` vendored
+  (`blake2b-256:f0c73946…`), the sync check refusing a one-byte change in
+  each of 5 vendored files, a file added and one removed, a kit's own
+  script, and `VENDOR`'s untagged, malformed or moved names.
+
+**Rows** [measured, from the gates' own runs; load 5.6–9.3]:
+- **The masked wrap per statement** (format 39, `test-proof`): the
+  window 8.32 s, 147,076 B; `balance` 8.83 s, 146,052 B; the predicate
+  (`areas`) 8.46 s, 146,052 B; each its peak heap 3,627 MiB, the process's
+  peak resident 3,824–3,851 MiB, 80 rows revealed of h = 256, one attempt,
+  R1 5.9–7.9 ms. In the throughput test, beside the segments: the window's
+  12.3 s, `balance`'s 8.1 s.
+- **The statements' rows, steps and proving:** the window 67,147 steps,
+  56 compressions, witness 2,401 B, kernel 70,734 B, in 3 segments
+  (2 of class 1, 2^15 steps; 1 of class 0, 1,611 steps), each segment
+  9.6–11.1 s (5.1 s the short one) at 4,792 MiB peak heap; its leaves
+  [57,700, 102,173, 46,000] rows (the short one's [56,698, 102,091,
+  45,960]), 1.77 s each at 942 MiB; its two folds [32,167, 42,864, 4,048]
+  rows, 1.78 s each; the recursion 14.48 s, 58.7% of the segments'
+  24.64 s. `balance` 21,733 steps, 19 compressions, witness 856 B, one
+  segment 9.40 s, the recursion 10.18 s. The predicate 31,204 steps in
+  8 segments, its leaf [56,698, 101,456, 46,040] rows in 1.78 s, the
+  recursion 14.24 s of the segments' 16.02 s. A read at a cut: a row 20.07
+  compressions, 862 B, 14,230 steps; the path 14 (+1 `S_w`) compressions,
+  590 B; one row 35,465 steps, sixteen 248,914 in 11 segments.
+- **The JAM service's gas and size:** the deployed program 495,640 B (the
+  ELF `statement-service.elf` 844,208 B), under JAM's 4,000,000 B; in
+  `just e2e-chain` refine 78.43M–79.88M gas for each accepted masked
+  statement (8 at JAM a, 1 at JAM b), 98,704 gas for one refused `0x7`
+  before its proof, the last accumulate 269,813 gas; the final verifier
+  judging a masked statement on the JAM-only host 75,004,815 gas (lookup
+  94,826, the judgement 74,909,784), heap peak 459 KiB (`test-proof`).
+- **The worker's throughput** (`throughput::`, `test-proof`): the window
+  statement 46.5 s (48.7 s whole; 3 segments 23.4 s, 3 leaves 6.8 s,
+  2 folds 3.9 s, the masked wrap 12.3 s), 146,820 B, peak resident
+  5,942 MiB; `balance` 19.6 s (21.8 s whole), 144,516 B, 5,876 MiB: three
+  window statements take 140 s of a 600-s window, leaving room for 23.4
+  `balance` statements. Within the gate.
+- **The cut's cost** (`cargo bench -p vos-node --bench cuts`, 6.12's
+  bench, run once beside the gates, a million keys, load 2.1–3.0): a
+  committed write with a cut pending 5.06 µs (1.23 µs with none, 4.10×),
+  6.11 µs with accumulate's 1.05 µs against the gate of 8.6 µs; a cut's
+  build with 100 proofs of 16 rows after 10,000 writes 373 ms against
+  1 s, the proofs alone 79.4 ms.
+
+**Failed first, and fixed:**
+- **`ci`** (1,008 s, at `bf895d27`): 7 tests of `vos-cli` and the testkit
+  failed, the default agent's ELF refused as it loaded (`InvalidSection:
+  control-flow target splits a relocated HI20+LO12 pair`). The
+  environment's `CARGO_INCREMENTAL=1` overrides the release profile, so
+  the guest builds ran incrementally and linked other code (the agent's
+  ELF 771,720 B against 839,416 B). Fixed in `bd3d975d`: every guest and
+  blob recipe (`build-agent`, `build-test-actors`, `build-representative`,
+  `build-statement-service`, `build-bench-guests`, `judge-wasm`'s blobs,
+  `check-no-std`'s `final-verify` blobs) sets `CARGO_INCREMENTAL` to 0;
+  rebuilt under `CARGO_INCREMENTAL=1`, the agent's ELF hashed as a
+  non-incremental build's. `ci` then green (above), and every gate after
+  it ran at `bd3d975d`.
+
+Commits: `bd3d975d` (the guest builds never incremental), this record.
