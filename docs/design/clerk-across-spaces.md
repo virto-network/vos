@@ -3,13 +3,32 @@
 Plan, draft 2, written for slice 5 before the owner chose proving first.
 Its slice number is set when it is scheduled; it follows slice 6.
 
-**What changed since this draft:** proving came first (slices 5 and 6);
-slice 6 builds the statements, the space roots and anchors (Unix-time
-windows from the genesis, one venue per space), the carried commitment
-that replaces two-anchor reads, `&self` reads by a served witness, a JAM
-statements service and the design of Kreivo's spaces pallet. The steps
-below, renumbered C.0–C.8, are re-read against them where marked; the
-rest of the draft stands as written.
+**What changed since this draft:** proving came first (slices 5 and 6).
+Slice 6 built:
+- **the statements:** a kernel's final proof, masked (format 39), over
+  its program id, its space, its `#[public]` arguments, its output and
+  the roots it read; the node's prover, built into the node, proves each
+  statement its leader's agents record and submits it to the space's
+  venue (`proving.md` §3.6);
+- **the space roots and anchors:** Unix-time windows from the space's
+  genesis, a space root per window built by its representative, anchored
+  by one registered node key at the space's one venue; a space moves to
+  another venue by a one-way migration from a later window
+  (`proving.md` §7);
+- **the carried commitment,** which replaces two-anchor reads, and
+  `&self` reads by a served witness, inline in the read's `Resume` input
+  (C.4);
+- **the venues:** the JAM statements service, which VOS ships (the
+  client that drives a PolkaJam testnet is development tooling,
+  `tools/jam-dev`); and Kreivo's spaces pallet as a design
+  (`spaces-pallet.md`) with a mock and conformance vectors, the pallet
+  the Kreivo teammate's and the node's chain transport a port of
+  master's substrate extension onto the extension host, both after the
+  slices;
+- **time between parties is the venue's** (C.3).
+
+The steps below, renumbered C.0–C.8, are re-read against them where
+marked; the rest of the draft stands as written.
 - **Draft 1** followed the owner's choice of proving plus the Clerk.
 - **Draft 2** folds Fable's review of draft 1:
   - why settlement by statement is safe;
@@ -28,7 +47,7 @@ instructions unmasked); slice 6 masks it and builds roots, anchors,
 `&self` reads and the venues.
 - **The Clerk still needs** transport between spaces and its settlement
   handler at the venue; the space-level roots, the anchors and the reads
-  of committed rows inside kernels come with slice 6.
+  of committed rows inside kernels are built (slice 6).
 
 ## The split
 
@@ -57,13 +76,14 @@ adds a proof without changing it:
 
 **Clerk first** also settles what reshapes proving: how many rows a
 window reads, the witness channel (the argument cap stays; a statement's
-rows arrive as a served witness by hash, under `Limits::served` (proposed; set by 6.0a)), the
-public output and the anchor hierarchy.
+rows arrive as a served witness, inline in the read's `Resume` input,
+under `Limits::served`), the public output and the anchor hierarchy.
 
 ## Goals
 
 1. **The Clerk across spaces:** cipher-clerk v0.3.0 inside a VOS space;
-   payments between two spaces; windows that settle on JAM by statement.
+   payments between two spaces; windows that settle at the space's venue
+   by statement.
 2. **Proving's foundations:**
    - the costs that decide slice 6, measured;
    - one program identity, decided;
@@ -192,7 +212,9 @@ slice 5's 5.15).
   - Exactly-once ordering makes that well defined, and the anchor root
     proves the rows at that cut.
 - **Anchors:** a space-level root over its agents' roots per window, and
-  the path map root → agent root → space root, are slice 6's.
+  the path map root → agent root → space root (built in slice 6;
+  `proving.md` §7). The venue anchors a window only once its own clock
+  has closed it.
 - **The carried commitment:** the handler keeps per (A, B, currency) a
   commitment to the last settled cumulative state; the kernel takes it as
   a `#[public]` argument, the old values privately, and reads the current
@@ -229,13 +251,16 @@ slice 5's 5.15).
     rows and paths, and the roots go into the `Attest` record);
   - it runs `settlement::window` at one cut (above);
   - the argument cap stays; a statement's rows arrive as a served
-    witness by hash, under `Limits::served` (proposed; set by 6.0a).
+    witness, inline in the read's `Resume` input, under
+    `Limits::served`.
 
 ### C.5 The venues
 
-- **Settlement on Kreivo first,** a `ClerkSettle` handler in
-  `pallet-spaces` (the Kreivo teammate's); the JAM statements service
-  beside it.
+- **Settlement at the space's venue:** a `ClerkSettle` handler in
+  Kreivo's `pallet-spaces` (the Kreivo teammate's, from
+  `spaces-pallet.md`), and the JAM statements service beside it, which
+  records statements alone today and takes the handler as a service
+  change. Both counterparties anchor and settle at one venue.
 - **Spaces register at the venue from their genesis,** with a sovereign
   account.
 - **The settlement handler:**
@@ -300,14 +325,16 @@ measurements, Ristretto removed.
     and ids; the Clerk doesn't need them, and slice 7's generic bignum
     chip replaces them;
   - **the identity design's step 3** (credentials, anonymous origins):
-    slice 6 or later, with a holder-side prover.
+    later, with a holder-side prover (slice 7's credential AIR).
 
 ### C.8 Acceptance
 
 - **Gates:**
   - `ci-full`;
   - the checker loop with workflows and the Clerk;
-  - two spaces settling on a PolkaJam testnet.
+  - two spaces settling at a venue: the JAM statements service on a
+    PolkaJam testnet (`just e2e-chain`'s harness), and Kreivo's pallet
+    once it exists.
 - **Rows measured:**
   - a payment's gas on vos-core;
   - the window statement's steps and compressions per journal;
@@ -348,7 +375,8 @@ override** (superseded by C.4/C.5 where marked):
 ## Risks
 
 - ~~A real proof's verification may not fit JAM.~~ Retired: the final
-  proof fits (96.4M gas).
+  proof fits (96.4M gas unmasked; the masked format 39 about 79M on the
+  JAM-only host).
 - ~~Masking may need a Stwo move and a toolchain change.~~ Retired: it
   needed no Stwo move (spike 6a).
 - **Transport between spaces and the cut** are the largest new protocol
