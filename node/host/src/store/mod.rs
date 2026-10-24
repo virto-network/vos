@@ -306,8 +306,6 @@ impl Fjall {
         Ok(seeds)
     }
 
-    /// The prover's jobs, each its agent, its statement's id and its
-    /// encoding, by agent and id.
     /// Every key and value of every partition, by partition, in key order:
     /// all the store holds, as a test reads it, however its blocks are
     /// compressed on disk.
@@ -329,6 +327,8 @@ impl Fjall {
         Ok(rows)
     }
 
+    /// The prover's jobs, each its agent, its statement's id and its
+    /// encoding, by agent and id.
     pub fn prover_jobs(&self) -> Result<Vec<ProverJob>> {
         let prefix = node_record(NodeRow::ProverJob, &[]);
         let mut jobs = Vec::new();
