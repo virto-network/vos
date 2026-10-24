@@ -5,6 +5,7 @@
 //! batches, the outbox's windows go again: in rounds, or at once when a
 //! receiver finds this agent behind it.
 
+mod anchor;
 mod batch;
 mod close;
 mod cut;
@@ -31,6 +32,7 @@ use crate::group::{Local, Shared, State};
 use crate::node::{Agent, Inner, Pending};
 use crate::store::Snapshot;
 use crate::{Backoff, lock, timeout};
+use anchor::Anchoring;
 use sweep::Sweeps;
 use window::{BEHIND_EVERY, WINDOW, Window};
 
@@ -120,36 +122,8 @@ struct Leader {
     /// When it last told senders whose messages the queue dropped full
     /// that they are behind.
     told: Option<Instant>,
-    /// The windows still to close whose anchors this leadership settled.
-    anchored: std::collections::BTreeSet<u64>,
-    /// The anchors this leadership has still to hand the venue, by window:
-    /// the space's root `S_w`.
-    unanchored: std::collections::BTreeMap<u64, [u8; 32]>,
-    /// When it last handed the venue an anchor that then waited: an idle
-    /// leader tries again a recheck later.
-    anchor_tried: Option<Instant>,
-    /// The window whose anchor this leadership last alerted it could not
-    /// sign, or the venue would not take yet for want of a key or a
-    /// resumption: alerted once a window.
-    alerted: Option<u64>,
-    /// The windows whose anchors the venue refused for good, or that aged
-    /// unsent, among those whose cut roots this replica keeps: not taken
-    /// up again.
-    refused: std::collections::BTreeSet<u64>,
-    /// The last anchor this leadership signed of each window still
-    /// waiting, kept or handed back: an anchor handed back that it has
-    /// since replaced is not taken up.
-    signed: std::collections::BTreeMap<u64, vos_wire::vos_anchor::Anchor>,
-    /// Anchors handed back whose root is not the space's at their window,
-    /// by the cut root this replica keeps: never signed again.
-    foreign: std::collections::HashSet<vos_wire::vos_anchor::Anchor>,
-    /// When this leadership last took up the anchors left waiting by its
-    /// cut roots: at its first batch, then a window length later.
-    seeded: Option<Instant>,
-    /// The venue's anchor key listing when it last refused this node's
-    /// key, and the node's time then: the anchor goes again once the
-    /// listing changes, or a window later.
-    key_refused: Option<(Vec<[u8; 32]>, u64)>,
+    /// The representative's anchoring of the space's roots at the venue.
+    anchoring: Anchoring,
 }
 
 /// What an idle leader takes.
@@ -212,15 +186,7 @@ impl Leader {
             sweeps: Sweeps::default(),
             ended: None,
             told: None,
-            anchored: std::collections::BTreeSet::new(),
-            unanchored: std::collections::BTreeMap::new(),
-            anchor_tried: None,
-            alerted: None,
-            seeded: None,
-            signed: std::collections::BTreeMap::new(),
-            foreign: std::collections::HashSet::new(),
-            refused: std::collections::BTreeSet::new(),
-            key_refused: None,
+            anchoring: Anchoring::default(),
         }
     }
 
