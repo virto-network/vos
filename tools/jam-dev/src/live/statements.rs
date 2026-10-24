@@ -3,10 +3,9 @@
 //! outcome read back from the service's storage at the finalized block, by
 //! its package's and its payload's hashes.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::{Duration, Instant};
-
-use std::collections::BTreeSet;
 
 use vos_pvm_compiler::{ServiceMetadata, service_blob};
 use vos_statement::MAX_ROOT_AGE_MS;
@@ -155,10 +154,15 @@ impl Statements {
         })
     }
 
+    /// Slot `slot`'s start.
+    fn slot_time(&self, slot: u64) -> u64 {
+        self.genesis_ms + slot * SLOT_MS
+    }
+
     /// The venue's time at the finalized block: its slot's start.
     pub fn now(&self) -> Result<u64, Error> {
         let (_, slot) = self.node.finalized()?;
-        Ok(self.genesis_ms + slot * SLOT_MS)
+        Ok(self.slot_time(slot))
     }
 
     /// Submit `items` as one work package to `core`, sharing its refine gas:
@@ -173,8 +177,7 @@ impl Statements {
         }
         // An item's outcome is kept by its package and payload: two of one
         // payload would share it.
-        let payloads: std::collections::BTreeSet<&Vec<u8>> =
-            items.iter().map(|(payload, _)| payload).collect();
+        let payloads: BTreeSet<&Vec<u8>> = items.iter().map(|(payload, _)| payload).collect();
         if payloads.len() < items.len() {
             return Err(failed("two items of one payload in a package"));
         }
@@ -206,7 +209,7 @@ impl Statements {
     /// finalized block holds it.
     pub fn outcome(&self, package: &Hash, payload: &[u8]) -> Result<Option<Outcome>, Error> {
         self.value(&keys::outcome(&outcome_id(package, &digest(payload))))?
-            .map(|bytes| Outcome::decode(&bytes).map_err(|error| failed(format!("{error:?}"))))
+            .map(|bytes| Outcome::decode(&bytes).map_err(undecodable))
             .transpose()
     }
 
@@ -256,7 +259,7 @@ impl Statements {
                 let key = keys::outcome(&outcome_id(&hash, &digest(&payload)));
                 if let Some(bytes) = found(&key)? {
                     outcomes += 1;
-                    let outcome = Outcome::decode(&bytes).map_err(|e| failed(format!("{e:?}")))?;
+                    let outcome = Outcome::decode(&bytes).map_err(undecodable)?;
                     subjects.insert(outcome.subject);
                 }
             }
@@ -264,7 +267,7 @@ impl Statements {
         let mut spaces = Vec::new();
         for subject in &subjects {
             if let Some(bytes) = found(&keys::space(&SpaceId(*subject)))? {
-                let record = SpaceRecord::decode(&bytes).map_err(|e| failed(format!("{e:?}")))?;
+                let record = SpaceRecord::decode(&bytes).map_err(undecodable)?;
                 spaces.push((SpaceId(*subject), record));
             }
             found(&keys::seen(&vos_statement::StatementId(*subject)))?;
@@ -281,7 +284,7 @@ impl Statements {
                 .get(..8)
                 .and_then(|bucket| Some(u64::from_le_bytes(bucket.try_into().ok()?)))
                 .ok_or_else(|| failed("a cursor cut short"))?;
-            let now = self.genesis_ms + slot * SLOT_MS;
+            let now = self.slot_time(slot);
             let until = (now + MAX_ROOT_AGE_MS) / BUCKET_MS + 1;
             for bucket in from..=until {
                 let Some(count) = found(&keys::bucket(bucket))? else {
@@ -366,4 +369,9 @@ impl Statements {
         }
         Ok(Some(outcomes))
     }
+}
+
+/// Stored bytes that do not decode.
+fn undecodable(error: impl std::fmt::Debug) -> Error {
+    failed(format!("{error:?}"))
 }

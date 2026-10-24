@@ -114,15 +114,16 @@ impl Testnet {
             .filter(|(_, tries)| *tries > 1)
             .map(|(name, tries)| format!("{name} ({tries})"))
             .collect();
-        self.note(match retried.is_empty() {
-            true => format!(
+        self.note(if retried.is_empty() {
+            format!(
                 "every one of the {} packages landed at its first attempt",
                 self.attempts.len()
-            ),
-            false => format!(
+            )
+        } else {
+            format!(
                 "packages that took more than one attempt: {}",
                 retried.join(", ")
-            ),
+            )
         });
     }
 }

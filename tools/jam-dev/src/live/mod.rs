@@ -31,11 +31,8 @@ use vos_wire::defaults::SESSION_SKEW_MS;
 use vos_wire::package::{EPOCH_MS, EXPORTS, MAX_SEGMENTS, ROOT, SLOT_MS};
 
 use rpc::decoded;
-use vos_jam::Error;
-use vos_jam::Runner;
-use vos_jam::Segments;
 use vos_jam::builder::{MAX_INPUT, Prepared};
-use vos_jam::{Chain, Landed, MAX_REFINE_OUTPUT};
+use vos_jam::{Chain, Error, Landed, MAX_REFINE_OUTPUT, Runner, Segments};
 
 /// The slots past a preimage's arrival the finalized block must be before
 /// a package that needs it: it must be past that slot; one more is margin.

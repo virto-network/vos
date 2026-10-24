@@ -45,9 +45,10 @@ fn http_body(response: &[u8]) -> Result<Vec<u8>, Error> {
         .ok_or_else(|| failed("an HTTP response without a body"))?;
     let head = String::from_utf8_lossy(&response[..at]).to_ascii_lowercase();
     let body = &response[at + 4..];
-    match head.contains("transfer-encoding: chunked") {
-        true => unchunked(body),
-        false => Ok(body.to_vec()),
+    if head.contains("transfer-encoding: chunked") {
+        unchunked(body)
+    } else {
+        Ok(body.to_vec())
     }
 }
 

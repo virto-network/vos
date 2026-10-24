@@ -90,13 +90,14 @@ pub const MAX_INPUT: usize = 12 << 20;
 pub const MAX_PACKAGE: usize = 204_800;
 /// A package's bytes beyond its payload and its imports' references, at
 /// most, as `jamt` encodes it (the dev tooling's
-/// `vos_jam_dev::live::package::encode_package`, the same bytes): its authorization by PolkaJam's bootstrap authorizer, its
-/// context and its item's fixed fields, 262 bytes, with its payload's
-/// length (3 bytes to 2 MiB), its imports' count (3 bytes to 2 MiB of them)
-/// and its extrinsics' (1).
+/// `vos_jam_dev::live::package::encode_package`, the same bytes): its
+/// authorization by PolkaJam's bootstrap authorizer, its context and its
+/// item's fixed fields, 262 bytes, with its payload's length (3 bytes to
+/// 2 MiB), its imports' count (3 bytes to 2 MiB of them) and its
+/// extrinsics' (1).
 pub const PACKAGE_FRAMING: usize = 262 + 3 + 3 + 1;
 /// An import's reference in a work item: a segment root and its index.
-pub const IMPORT_REF: usize = 32 + 2;
+pub(crate) const IMPORT_REF: usize = 32 + 2;
 
 /// What a package's refine keeps past its estimate, in parts of a
 /// thousand of its gas.

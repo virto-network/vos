@@ -20,8 +20,9 @@
 # (`just check-no-std`, or `just jam-statements-testnet`) for the
 # statements, and for `chain` the host's C compiler (`cc`) and the test
 # actors, the default agent and the representative (`just
-# build-test-actors build-agent build-representative`). POLKAJAM names the directory of PolkaJam's binaries, v0.8.0
-# by default (sha256 e90c8ccd… of its release archive); the run's files go
+# build-test-actors build-agent build-representative`). POLKAJAM names
+# the directory of PolkaJam's binaries, v0.8.0 by default (sha256
+# e90c8ccd… of its release archive); the run's files go
 # to a new directory under TMPDIR (or /tmp), or JAM_RUN, and the testnet's
 # chain under TMPDIR too. The testnet runs PolkaJam's interpreter: its
 # recompiler needs vm.unprivileged_userfaultfd=1. It logs in UTC, as the
@@ -41,6 +42,7 @@ dev="${CARGO_TARGET_DIR:-$root/target}/debug/vos-jam-dev"
 agent="${CARGO_TARGET_DIR:-$root/agent/default/target}/riscv64em-vos/release/vos-agent.elf"
 actors="${CARGO_TARGET_DIR:-$root/agent/test-actors/target}/riscv64em-vos/release"
 service="${CARGO_TARGET_DIR:-$root/target}/riscv64em-vos/release/statement-service.elf"
+representative="${CARGO_TARGET_DIR:-$root/agent/representative/target}/riscv64em-vos/release/vos-representative.elf"
 
 for binary in polkajam-testnet polkajam jamt; do
     [ -x "$POLKAJAM/$binary" ] || { echo "no $binary in $POLKAJAM" >&2; exit 1; }
@@ -48,6 +50,13 @@ done
 if [ "$mode" = agent ] || [ "$mode" = both ]; then
     [ -f "$agent" ] && [ -f "$actors/lean.elf" ] || {
         echo "build the agent and the test actors first: just build-agent build-test-actors" >&2
+        exit 1
+    }
+fi
+if [ "$mode" = chain ]; then
+    [ -f "$agent" ] && [ -f "$representative" ] \
+        && [ -f "$actors/balance.elf" ] && [ -f "$actors/window.elf" ] && [ -f "$actors/reader.elf" ] || {
+        echo "build the test actors, the agent and the representative first: just build-test-actors build-agent build-representative" >&2
         exit 1
     }
 fi

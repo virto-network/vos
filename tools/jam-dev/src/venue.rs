@@ -27,7 +27,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::live::statements::{Item as Package, Statements};
+use crate::live::statements::Statements;
 use ed25519_dalek::{Signer, SigningKey};
 use vos_anchor::{Anchor, Migrate, RootRead, SpaceGenesis, SpaceId, VenueId, register_digest};
 use vos_jam::Error;
@@ -247,11 +247,6 @@ impl Jam {
         outcomes
             .pop()
             .ok_or_else(|| Error::Node("no outcome".into()))
-    }
-
-    /// Items landed together, in one package: each one's outcome.
-    pub fn land_all(&self, items: &[Package]) -> Result<Vec<Outcome>, Error> {
-        self.statements.land(items, LANDING)
     }
 
     /// Register the space `genesis` founds under `controller` (an ed25519

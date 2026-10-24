@@ -281,9 +281,6 @@ impl PolkaJam {
 mod tests {
     use super::*;
 
-    /// The package `jamt` 0.1.29 submitted for a 1,000-byte payload to
-    /// service 0, encoded again from its fields: byte for byte, 266 bytes
-    /// past its payload; and the extrinsics named after the payload.
     /// A package's payloads are read back from its encoding; bytes it does
     /// not make are not.
     #[test]
@@ -319,6 +316,9 @@ mod tests {
         assert_eq!(payloads(&[package.clone(), vec![0]].concat()), None);
     }
 
+    /// The package `jamt` 0.1.29 submitted for a 1,000-byte payload to
+    /// service 0, encoded again from its fields: byte for byte, 266 bytes
+    /// past its payload; and the extrinsics named after the payload.
     #[test]
     fn a_package_encodes_as_jamts() {
         let hash = |text: &str| -> Hash { hex::decode(text).unwrap().try_into().unwrap() };
