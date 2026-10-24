@@ -145,7 +145,7 @@ fmt-check:
 # item.
 doc-check:
     with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc --workspace --no-deps --quiet }
-    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue --features mock --no-deps --quiet }
+    with-env { RUSTDOCFLAGS: "-D rustdoc::broken_intra_doc_links -D rustdoc::private_intra_doc_links" } { cargo doc -p vos-venue --features kreivo-mock,model --no-deps --quiet }
 
 clippy:
     cargo clippy --workspace --all-targets --quiet -- -D warnings
@@ -153,6 +153,8 @@ clippy:
     cargo clippy -p vos-cli --features faults --all-targets --quiet -- -D warnings
     cargo clippy -p vos-cli --no-default-features --all-targets --quiet -- -D warnings
     cargo clippy -p vos-pvm-proof --features debug-internals --all-targets --quiet -- -D warnings
+    cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
+    for features in [model kreivo kreivo-mock] { cargo clippy -p vos-venue --features $features --quiet -- -D warnings }
     just clippy-prover
 
 # The node and `vos` with the masked prover (`prover`): they build and lint
@@ -249,6 +251,17 @@ _no-dep package +args:
 check-no-jam-dev:
     for package in [vos-jam-dev vos-jam] { just _no-dep $package -p vos-cli; just _no-dep $package -p vos-cli --features prover; just _no-dep $package -p vos-node; just _no-dep $package -p vos-node --features prover }
     print "no JAM client in the node"
+
+# A node carries no venue's client: `vos-venue`'s model venue (`model`),
+# its client of Kreivo's spaces pallet (`kreivo`) and that pallet's mock
+# (`kreivo-mock`) reach neither the `vos` binary, with or without the
+# prover, nor `vos-node`, on a normal or build edge (the tests enable them
+# on dev edges, the carrier audit's checker `kreivo`), and no normal or
+# build edge of any workspace member enables the model or the mock.
+check-no-venue-clients:
+    for feature in [kreivo-mock model] { just _no-feature $feature --workspace }
+    for feature in [kreivo-mock kreivo model] { just _no-feature $feature -p vos-cli; just _no-feature $feature -p vos-cli --features prover; just _no-feature $feature -p vos-node; just _no-feature $feature -p vos-node --features prover }
+    print "no venue client in the node"
 
 # The masked prover's test seams (`vos-pvm-recair`'s `seeded-masks`: the
 # seeded randomness `MaskRng::Seeded` and the forced proof
@@ -424,8 +437,9 @@ fuzz secs="60":
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-no-debug-internals check-no-jam-dev check-kit build-test-actors build-agent build-representative fuzz-replay
+check: fmt-check doc-check check-no-std check-no-seeded-masks check-no-test-formats check-no-debug-internals check-no-jam-dev check-no-venue-clients check-kit build-test-actors build-agent build-representative fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
+    cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     just clippy-prover
     cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures
     just test-recair
@@ -441,7 +455,7 @@ test-reads:
 
 # Everything but the prover suites: before a merge, and at the end of each
 # planned stage of work.
-ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats check-no-debug-internals check-no-jam-dev check-kit fuzz-replay
+ci: fmt-check doc-check check-no-std clippy jar-check test vectors test-bench test-agent check-no-faults check-no-seeded-masks check-no-test-formats check-no-debug-internals check-no-jam-dev check-no-venue-clients check-kit fuzz-replay
 
 # The gate at a milestone: `ci` plus the prover suites, the soundness gates
 # (the leakage tests at their medium N), the bench tests that prove and the

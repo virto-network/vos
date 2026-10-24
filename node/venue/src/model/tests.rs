@@ -172,7 +172,7 @@ fn a_statement_is_judged_against_the_anchors() {
         output: vec![2],
         roots: vec![f.read(3, 1)],
     };
-    let code = |verdict: Result<StatementId, NotAccepted>| super::code(&verdict);
+    let code = |verdict: Result<StatementId, NotAccepted>| crate::code(&verdict);
     assert_eq!(code(f.venue.submit(&statement, &[0])), 3, "not pinned");
     f.venue.pin(Pin {
         program,

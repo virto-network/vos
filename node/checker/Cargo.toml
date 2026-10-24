@@ -17,7 +17,7 @@ aho-corasick = "1"
 blake3 = "1"
 # The venues' encodings of what a node sends them: Kreivo's calls and the
 # JAM statements service's items.
-vos-venue = { workspace = true }
+vos-venue = { workspace = true, features = ["kreivo"] }
 vos-statement-service = { workspace = true }
 # The prover's internals, which the carrier audit searches for.
 vos-node-prover = { workspace = true }

@@ -61,9 +61,10 @@ tempfile = "3"
 # JAM's tree over the whole keyspace, which the agent's root is a node of.
 vos-jam = { workspace = true }
 vos-pvm-program = { workspace = true }
-# The mock of Kreivo's spaces pallet, which the Kreivo client's cluster
-# tests anchor at, and its stored values' SCALE.
-vos-venue = { workspace = true, features = ["mock"] }
+# The model venue the tests anchor at, and the mock of Kreivo's spaces
+# pallet, which the Kreivo client's cluster tests anchor at, and its stored
+# values' SCALE.
+vos-venue = { workspace = true, features = ["model", "kreivo-mock"] }
 parity-scale-codec = "3.7.5"
 # The carrier audit's canary on a pool thread, as the prover's run.
 rayon = "1"

@@ -789,7 +789,7 @@ port adds it):
 
 **The contract** is the conformance vectors and the mock:
 - `node/venue/conformance/*.json` and the mock that writes them
-  (`vos-venue`'s `mock` feature; `just conformance` regenerates them);
+  (`vos-venue`'s `kreivo-mock` feature; `just conformance` regenerates them);
 - the scenarios of `KreivoVenue`'s tests over the mock
   (`node/venue/src/kreivo/tests.rs`, `node/host/tests/cluster/kreivo.rs`),
   which set the mock's state directly: the port states them again over

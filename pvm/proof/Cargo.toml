@@ -100,7 +100,7 @@ vos-pvm-final-verifier = { workspace = true, features = ["test-formats"] }
 vos-statement = { workspace = true, features = ["fixtures"] }
 # Statements at a cut judged at the model venue: the space's anchors
 # signed by its founding key.
-vos-venue = { workspace = true }
+vos-venue = { workspace = true, features = ["model"] }
 ed25519-dalek = "2"
 
 # Both examples demonstrate the prover end-to-end; mark them
