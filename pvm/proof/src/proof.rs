@@ -118,9 +118,8 @@ pub struct Proof {
     /// Bit i set ⇔ chip i in BASE_COMPONENTS was active for
     /// this proof.  Allows the standalone verifier (no SideNote) to
     /// reconstruct the exact active-chip selection the prover used.
-    /// Defaults to `0` for back-compat with older proofs (the verifier
-    /// then falls back to count-based inference: full set if count =
-    /// BASE_COMPONENTS.len(), Blake2b-skipped if count = len-1).
+    /// `0` reads as every chip: a chip-isolated proof's, which only
+    /// `verify_with_explicit_components` takes.
     #[serde(default)]
     pub component_mask: u32,
     pub pcs_config: PcsConfig,

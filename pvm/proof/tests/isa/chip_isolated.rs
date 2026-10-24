@@ -89,11 +89,10 @@ fn harness_smoke_bound1_only() {
 /// - The full-system path (`prove_add64`) checks lookup correctness
 ///   end-to-end.
 ///
-/// An upstream Stwo bug — `MerkleProverLifted::decommit` index OOB on
-/// mixed-width column traces — is documented in
-/// `STWO_MERKLE_LIFTED_OOB_ISSUE_DRAFT.md` (not blocking: bound-1 chips
-/// and this harness shape don't trip it, and production paths never
-/// did).
+/// An upstream Stwo bug, `MerkleProverLifted::decommit` indexing out of
+/// bounds on mixed-width column traces, does not block it: bound-1 chips
+/// and this harness's shape do not trip it, and production paths never
+/// did.
 #[test]
 fn harness_blake2b_isolated() {
     use vos_pvm_proof::chips::Blake2bCall;

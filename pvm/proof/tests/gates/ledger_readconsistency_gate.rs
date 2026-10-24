@@ -92,7 +92,7 @@ fn register_side_note() -> SideNote {
 
 // Asserts a forged read is rejected: the cross-row prev_value binding +
 // (reg,ts) sortedness + is_write tuple-binding tie the read to the prior
-// ledger row's value.  See docs/plans/ledger-read-consistency.md.
+// ledger row's value.  See pvm/proof/docs/design/ledger-read-consistency.md.
 #[test]
 fn register_forged_read_value_is_rejected() {
     use vos_pvm_proof::chips::register_memory::Column;
@@ -191,7 +191,7 @@ fn memory_side_note() -> SideNote {
 
 // Asserts a forged read is rejected: the cross-row prev_value binding +
 // (addr,ts) sortedness tie the read to the prior ledger row's value.  See
-// docs/plans/ledger-read-consistency.md.
+// pvm/proof/docs/design/ledger-read-consistency.md.
 #[test]
 fn memory_forged_read_value_is_rejected() {
     use vos_pvm_proof::chips::memory::Column;

@@ -22,8 +22,6 @@ use crate::trace::{
     eval::{ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX},
 };
 
-// prove_impl uses super::active_components(side_note) instead
-// of the static BASE_COMPONENTS list to skip dormant chips.
 use crate::{lookups::AllLookupElements, side_note::SideNote};
 
 pub use crate::proof::{Proof, SegmentState};

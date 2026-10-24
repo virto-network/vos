@@ -1,5 +1,5 @@
 //! The masking's soundness and leakage gates (`docs/design/slice-6-on-chain.md`,
-//! "The masking's gates"; `research/slice-5/spike2-masking.md` §5, as `masking-review.md`
+//! "The masking's gates"; `research/slice-5/spike2-masking.md` §5, as `research/slice-5/masking-review.md`
 //! amends it) on small circuits of the recursion AIR, each proof verified
 //! by the final verifier's masked verifier over the set and channel it was
 //! proved on. The gates the earlier steps hold are theirs: the degree

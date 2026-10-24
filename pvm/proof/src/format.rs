@@ -179,7 +179,8 @@ impl FormatParams {
     }
 }
 
-/// A masked format's masking (`masking-review.md` R6): what its trees commit
+/// A masked format's masking
+/// (`docs/design/research/slice-5/masking-review.md` R6): what its trees commit
 /// beside the AIR's columns, and the randomizer's size. A prover masks with
 /// it and a verifier lays the trees out by it; neither reads it from a
 /// proof.
