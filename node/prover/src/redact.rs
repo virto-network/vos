@@ -5,6 +5,11 @@
 //! in the process, every thread's panic is printed so, as the prover's
 //! pool threads are not told apart from the node's; outside one, the hook
 //! installed before runs.
+//!
+//! The hook is installed once, at the first proof, over the one before it.
+//! A `std::panic::set_hook` after that replaces it and so ends the
+//! redaction for the process: nothing that links the prover may set a
+//! panic hook once a proof has been made.
 
 use std::panic::{AssertUnwindSafe, PanicHookInfo};
 use std::sync::Once;
