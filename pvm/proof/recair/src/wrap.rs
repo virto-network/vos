@@ -1,10 +1,10 @@
 //! The final wrap (`proving.md` §3.5, A.3; `recursion-air.md` §7): a 1-to-1
-//! node over a tree's root, proved masked under format 39 on the Blake2b-256
-//! channel ([`prove`]), or unmasked under format 28, which
+//! node over a tree's root, proved masked under `format::MASKED_WRAP` on the Blake2b-256
+//! channel ([`prove`]), or unmasked under `format::WRAP`, which
 //! `vos-pvm-final-verifier` verifies against 24 public words
 //! ([`prove_unmasked`]).
 //!
-//! **What it checks of the root,** a node of the padded shape (format 32), a
+//! **What it checks of the root,** a node of the padded shape (`format::LEAF_FOLD`), a
 //! fold's or, for a run of one segment, a leaf's:
 //! - its proof, verified with its output digest's two wires as the proof's
 //!   outputs (the in-circuit verifier's pieces, as a fold verifies a
@@ -155,14 +155,14 @@ impl WrapCircuit {
         self.finalize(&WrapValues::blank(self.root))
     }
 
-    /// Its preprocessed tree's root on format 28's Blake2b-256 trees: what
+    /// Its preprocessed tree's root on `format::WRAP`'s Blake2b-256 trees: what
     /// `vos-pvm-final-verifier` pins.
     pub fn preprocessed_root(&self) -> Blake2bHash {
         crate::prove::preprocessed_root_on::<Blake2bMerkleChannel>(&WRAP, &self.topology().circuit)
             .expect("the wrap's wiring checks")
     }
 
-    /// Its preprocessed tree's root as format 39 commits it, masked: what
+    /// Its preprocessed tree's root as `format::MASKED_WRAP` commits it, masked: what
     /// `vos-pvm-final-verifier` pins as `PREPROCESSED_ROOT_39`.
     pub fn masked_preprocessed_root(&self) -> Blake2bHash {
         crate::prove::masked_preprocessed_root_on::<Blake2bMerkleChannel>(
@@ -208,7 +208,7 @@ impl<V: Value> WrapValues<V> {
     }
 }
 
-/// Proves a finalized wrap circuit masked under format 39, on the Blake2b-256
+/// Proves a finalized wrap circuit masked under `format::MASKED_WRAP`, on the Blake2b-256
 /// channel, from the operating system's randomness.
 pub fn prove(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError> {
     prove_masked(finalized, MaskRng::default(), |_| {}).map(|(proof, _)| proof)
@@ -231,9 +231,9 @@ pub fn prove_masked(
     Ok((wrap_proof(proof), stats))
 }
 
-/// Proves a finalized wrap circuit unmasked under format 28, on the
+/// Proves a finalized wrap circuit unmasked under `format::WRAP`, on the
 /// Blake2b-256 channel: what the tests and the fixtures verify until the
-/// venues take format 39.
+/// venues take `format::MASKED_WRAP`.
 pub fn prove_unmasked(finalized: &Finalized<SecureField>) -> Result<WrapProof, ProveError> {
     prove_unmasked_with(finalized, |_| {})
 }
@@ -260,7 +260,7 @@ fn wrap_proof(proof: RecairProof<Blake2bMerkleHasher>) -> WrapProof {
 }
 
 /// A wrap proof's bytes as its format lays them out
-/// (`vos_pvm_proof::format::Format::bytes`): format 39's fixed layout
+/// (`vos_pvm_proof::format::Format::bytes`): `format::MASKED_WRAP`'s fixed layout
 /// (`vos_pvm_final_verifier::masked::encode`), the one encoding its
 /// verifier reads, or postcard's; `None` for a format the registry does not
 /// hold, or a proof its layout cannot hold.

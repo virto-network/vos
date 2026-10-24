@@ -11,7 +11,7 @@
 //! one-segment program — `prove_canonical_format` proves the whole trace as one
 //! segment).
 //!
-//! The segment proves under format 35, on `SimdBackend`.
+//! The segment proves under `format::SEGMENT`, on `SimdBackend`.
 //!
 //! Run (one measurement per process so `VmHWM` is clean):
 //!   STEPS=7    cargo test -p vos-pvm-proof-verifier --release --test segment_cost \

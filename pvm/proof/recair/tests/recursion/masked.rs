@@ -1,4 +1,4 @@
-//! The masked wrap (format 39) over the one-segment run's root, proved by
+//! The masked wrap (`format::MASKED_WRAP`) over the one-segment run's root, proved by
 //! `vos-pvm-recair`'s masked prover from a seed, its bytes the fixed layout,
 //! and verified by `vos-pvm-final-verifier`'s masked verifier.
 //!
@@ -12,7 +12,7 @@
 //! - **Cross-format proofs, both ways,** are refused as another format.
 //! - **The bytes:** truncations and a trailing byte refused.
 //! - **On the JAM-only host** the venue's refine program accepts it within
-//!   format 39's gas, and refuses a tampered byte and other words.
+//!   `format::MASKED_WRAP`'s gas, and refuses a tampered byte and other words.
 //! - **No hidden state** of the run is in any carrier of the proof (leakage
 //!   4).
 //! - **Under `heavy-gates`** (`just test-proof`): leakage 2, 3 and 5 on the
@@ -56,7 +56,7 @@ use vos_pvm_recair::wrap::{self, WrapCircuit};
 use vos_pvm_recair_air::GateRelation;
 use vos_pvm_recair_air::masked::{BlindRelation, MaskPins, WrapComponents};
 
-/// The one-segment run's root wrapped under format 39: the proof, its
+/// The one-segment run's root wrapped under `format::MASKED_WRAP`: the proof, its
 /// bytes and its public words.
 struct Masked {
     proof: WrapProof,
@@ -95,7 +95,7 @@ fn masked_wrap() -> &'static Masked {
 
 /// A wrap's proof, format and public words, under the target's tmp
 /// directory as `wrap/<name>.{proof,format,words}`: the Wasm harness's
-/// input (`final-verifier/wasm/run`) and the fuzz targets' format-39 golden.
+/// input (`final-verifier/wasm/run`) and the fuzz targets' `format::MASKED_WRAP` golden.
 fn write(name: &str, format: u32, proof: &[u8], words: &[u32; PUBLIC_WORDS]) {
     let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
     std::fs::create_dir_all(&directory).expect("the wrap's directory");
@@ -307,7 +307,7 @@ fn every_masked_field_tampered_is_refused() {
 }
 
 /// A verifier pinning another salt count or `R` refuses the proof: with
-/// format 39's widths, its set's trees are not the format's; with the
+/// `format::MASKED_WRAP`'s widths, its set's trees are not the format's; with the
 /// widths its pins lay out, the proof's trees are not its. And a proof with
 /// a salt column or an `R` column more is refused by its shape, as a proof
 /// and at its decode.
@@ -392,8 +392,8 @@ fn another_salt_count_or_r_width_is_refused() {
     }
 }
 
-/// A format-28 proof under format 39 and a format-39 proof under format 28
-/// are refused as another format (`0x4`): by their bytes, each format's
+/// A `format::WRAP` proof under `format::MASKED_WRAP` and a
+/// `format::MASKED_WRAP` proof under `format::WRAP` are refused as another format (`0x4`): by their bytes, each format's
 /// decode reading its own header, and as proofs.
 #[test]
 fn cross_format_proofs_are_refused_both_ways() {
@@ -457,7 +457,7 @@ fn the_layout_refuses_truncations_and_trailing_bytes() {
 
 /// The masked wrap on the JAM-only host, by the production guest (format
 /// 39 alone): accepted within 125M gas of verify and 4M of decode (format
-/// 28's postcard: 19.9M), its phases reported beside format 28's on the
+/// 28's postcard: 19.9M), its phases reported beside `format::WRAP`'s on the
 /// same witness, by the test guest (28 beside 39); a proof tampered at its
 /// middle byte, and other words, refused without a panic; 28 refused by the
 /// production guest as a format it does not link.

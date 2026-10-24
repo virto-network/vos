@@ -1,7 +1,7 @@
 //! The format registry at the verifier: every admitted format round-trips
 //! and verifies in one build, a proof is refused under another format than
 //! its own, the interaction PoW is checked, and a proof below a floor is
-//! refused. Format 35 proves on the Poseidon2-M31 channel, its PoW and
+//! refused. `format::SEGMENT` proves on the Poseidon2-M31 channel, its PoW and
 //! interaction PoW ground on `SimdBackend`.
 
 use std::sync::OnceLock;
@@ -138,7 +138,7 @@ fn a_proof_under_one_format_is_refused_under_another() {
     }
 }
 
-/// The interaction PoW is checked: a format-35 proof with a nonce its
+/// The interaction PoW is checked: a `format::SEGMENT` proof with a nonce its
 /// channel does not accept is refused.
 #[test]
 fn the_interaction_pow_is_checked() {
@@ -188,7 +188,7 @@ fn transcript_before_interaction_pow(proof: &Proof) -> Poseidon2M31Channel {
     channel
 }
 
-/// A proof below a floor is refused: less PoW than format 35's conjectured
+/// A proof below a floor is refused: less PoW than `format::SEGMENT`'s conjectured
 /// floor allows, or than its proven floor allows; and, at its floors,
 /// parameters other than the format's.
 #[test]
@@ -213,7 +213,7 @@ fn a_proof_below_a_floor_is_refused() {
     refused_both(with_pow(25), side_note, "differ from format 35");
 }
 
-/// The counts of a real proof, at its own shape, clear format 35's floors.
+/// The counts of a real proof, at its own shape, clear `format::SEGMENT`'s floors.
 #[test]
 fn the_bit_counts_are_counted_at_the_proofs_shape() {
     let segment = proof_security_bits(&proved(&format::SEGMENT).0).unwrap();
@@ -227,7 +227,7 @@ fn the_bit_counts_are_counted_at_the_proofs_shape() {
     assert!(segment.proven >= format::SEGMENT.floor.proven);
 }
 
-/// A full canonical segment proves under format 35 and verifies; a main
+/// A full canonical segment proves under `format::SEGMENT` and verifies; a main
 /// root with one limb changed is refused, and a non-canonical limb is
 /// refused without a panic.
 #[test]

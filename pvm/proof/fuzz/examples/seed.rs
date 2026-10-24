@@ -1,6 +1,6 @@
 //! Seeds the corpora of the targets that start from the golden fixtures
 //! (`pvm/proof/fixtures`) and vectors: `final_verifier_bytes` with every
-//! wrap there, `masked_bytes` with format 39's past their header,
+//! wrap there, `masked_bytes` with `format::MASKED_WRAP`'s past their header,
 //! `statement_decode` with every fixture's judgement (its input, then its
 //! proof) and its statement alone, and `anchor_decode` with `vos-anchor`'s
 //! golden vectors, their geneses, an anchor and a migration of each.
@@ -21,7 +21,7 @@ use vos_anchor::vectors;
 use vos_anchor::{Anchor, Migrate, RootKind, VenueId};
 use vos_statement::fixtures;
 
-/// Format 39's header in its fixed layout: the format and ten words.
+/// `format::MASKED_WRAP`'s header in its fixed layout: the format and ten words.
 const MASKED_HEADER: usize = 4 * 11;
 
 fn main() {

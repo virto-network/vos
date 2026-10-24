@@ -1,4 +1,4 @@
-//! The masked wrap's verifier: format 39 (pin A), its transcript pin B's,
+//! The masked wrap's verifier: `format::MASKED_WRAP` (pin A), its transcript pin B's,
 //! over any masked component set and Merkle channel ([`verify_masked`]),
 //! the recursion AIR's wrap on the Blake2b-256 channel its production use
 //! ([`verify`]).
@@ -82,7 +82,7 @@ pub const TREES: usize = 4;
 /// The masked wrap's format number (`vos_pvm_proof::format::MASKED_WRAP`).
 pub const FORMAT: u32 = 39;
 
-/// Format 39's PCS configuration: blowup 32, 24 queries, PoW 26, FRI fold
+/// `format::MASKED_WRAP`'s PCS configuration: blowup 32, 24 queries, PoW 26, FRI fold
 /// step 3, a 2^6 last layer, affine DEEP batching.
 pub const CONFIG: PcsConfig = PcsConfig {
     pow_bits: 26,
@@ -96,36 +96,36 @@ pub const CONFIG: PcsConfig = PcsConfig {
     deep_batching: DeepBatching::Affine,
 };
 
-/// Format 39's interaction PoW.
+/// `format::MASKED_WRAP`'s interaction PoW.
 pub const INTERACTION_POW_BITS: u32 = 8;
 
-/// Format 39's trees beside the AIR's columns: 8 salt columns a salted tree,
+/// `format::MASKED_WRAP`'s trees beside the AIR's columns: 8 salt columns a salted tree,
 /// an `R` of 8 columns.
 pub const PINS: MaskPins = MaskPins {
     salt_columns: 8,
     fri_mask_columns: 8,
 };
 
-/// Format 39's `log2 h`: the prover's randomizer, 256 coefficients a column.
+/// `format::MASKED_WRAP`'s `log2 h`: the prover's randomizer, 256 coefficients a column.
 /// The verifier reads no mask; pinned with the format, for its registry
 /// entry.
 pub const LOG_MASK_ROWS: u32 = 8;
 
-/// The values format 39's DEEP quotient batches: `(57 + 373 + 40 + 4 + 8) +
+/// The values `format::MASKED_WRAP`'s DEEP quotient batches: `(57 + 373 + 40 + 4 + 8) +
 /// 2·(16 + 3·4)`, a twice-sampled column batching a third, its periodicity
 /// value (`MASKED_WRAP_REFERENCE.sampled_values`).
 pub const DEEP_VALUES: usize = 538;
 
-/// FRI's degree bound under format 39: the composition's, committed whole
+/// FRI's degree bound under `format::MASKED_WRAP`: the composition's, committed whole
 /// at `m + 2` for the wrap's tallest component of `2^15` rows.
 pub const LOG_DEGREE_BOUND: u32 = 17;
 
-/// FRI's folding rounds at format 39's degree bound, 2^[`LOG_DEGREE_BOUND`],
+/// FRI's folding rounds at `format::MASKED_WRAP`'s degree bound, 2^[`LOG_DEGREE_BOUND`],
 /// to its 2^6 last layer: the first with the circle fold in it
 /// ([`fri_rounds`]).
 pub const FRI_ROUNDS: [u32; 4] = [3, 3, 3, 2];
 
-/// Format 39's samples of column `column` of tree `tree`, as its sample
+/// `format::MASKED_WRAP`'s samples of column `column` of tree `tree`, as its sample
 /// points lay them out: every preprocessed column once; in the main tree
 /// the 16 `p2` columns its last round also reads at the previous row (every
 /// other one from 269) twice, the rest once, the 8 salts never; in the
@@ -165,7 +165,7 @@ pub struct MaskedFormat<'a> {
     pub deep_values: usize,
 }
 
-/// Format 39, the masked wrap (pin A).
+/// `format::MASKED_WRAP`, the masked wrap (pin A).
 pub const MASKED_WRAP: MaskedFormat<'static> = MaskedFormat {
     number: FORMAT,
     config: CONFIG,
@@ -467,14 +467,14 @@ pub fn verify_masked<MC: MerkleChannel, C: MaskedComponents>(
         .map_err(Error::Stark)
 }
 
-/// The format-39 proof in `bytes`: at most [`crate::MAX_PROOF_BYTES`], its
-/// fixed layout read whole, its header format 39's, every count its pin or
+/// The `format::MASKED_WRAP` proof in `bytes`: at most [`crate::MAX_PROOF_BYTES`], its
+/// fixed layout read whole, its header `format::MASKED_WRAP`'s, every count its pin or
 /// within its bound, nothing after it.
 pub fn decode(bytes: &[u8]) -> Result<WrapProof, Error> {
     crate::layout::decode(bytes)
 }
 
-/// `proof`'s fixed layout: what the prover emits for format 39, and the one
+/// `proof`'s fixed layout: what the prover emits for `format::MASKED_WRAP`, and the one
 /// encoding [`decode`] reads; `None` for a proof the layout cannot hold (a
 /// column of other samples than [`samples`], a tree whose queried columns
 /// differ in length), which no verifier would accept.
@@ -482,13 +482,13 @@ pub fn encode(proof: &WrapProof) -> Option<Vec<u8>> {
     crate::layout::encode(proof)
 }
 
-/// Verifies the format-39 proof in `bytes` ([`decode`]) against the public
+/// Verifies the `format::MASKED_WRAP` proof in `bytes` ([`decode`]) against the public
 /// `words`.
 pub fn verify_bytes(bytes: &[u8], words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
     verify(decode(bytes)?, words)
 }
 
-/// Verifies a format-39 proof of the wrap circuit against the public
+/// Verifies a `format::MASKED_WRAP` proof of the wrap circuit against the public
 /// `words`, and returns the statement they make: the program id and the
 /// io-hash.
 pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
@@ -496,7 +496,7 @@ pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement
 }
 
 /// [`verify`] under `format`'s pins and the circuit `preprocessed_root`: a
-/// verifier pinning other salts, `R` or widths refuses format 39's proofs.
+/// verifier pinning other salts, `R` or widths refuses `format::MASKED_WRAP`'s proofs.
 pub fn verify_with(
     format: &MaskedFormat<'_>,
     preprocessed_root: &[u8; 32],
@@ -539,7 +539,7 @@ mod tests {
 
     use stwo::core::channel::Blake2bChannel;
 
-    /// The wrap's set at format 39's pins: the trees' widths 57 / 381 / 48 /
+    /// The wrap's set at `format::MASKED_WRAP`'s pins: the trees' widths 57 / 381 / 48 /
     /// 20 and 538 DEEP values, as pinned; the composition tree the last and
     /// at FRI's degree bound, the tallest; every column's samples
     /// [`samples`]'.
@@ -589,7 +589,7 @@ mod tests {
         assert_eq!(fri_rounds(4, &config(0, 0)), None);
     }
 
-    /// The header mixed for format 39 is the segment transcript's
+    /// The header mixed for `format::MASKED_WRAP` is the segment transcript's
     /// (`mix_statement_header`), at its configuration and the wrap's log
     /// sizes; the constants are its registry entry.
     #[test]

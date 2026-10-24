@@ -3,7 +3,7 @@
 //! the step's expected result asserted as the design's text gives it.
 //!
 //! **The world every vector starts from:** the fixtures' time (window 42's
-//! boundary of the fixture space's clock); format 39 and the fixtures' two
+//! boundary of the fixture space's clock); `format::MASKED_WRAP` and the fixtures' two
 //! programs (venue-bound, `Record`) active from 0; the fixture space `F`
 //! (the fixtures' statements' space, `[0xA1; 32]`, registered from window
 //! 40 under the default clock, its one authority paired with its anchor

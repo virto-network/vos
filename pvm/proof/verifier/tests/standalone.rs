@@ -9,7 +9,7 @@ use vos_pvm_proof::core::tracing::TracingPvm;
 use vos_pvm_proof::{Proof, SideNote, prove};
 use vos_pvm_proof_verifier::{CommitmentHash, verify_standalone};
 
-/// The Poseidon2-M31 Stark proof of a format-35 proof.
+/// The Poseidon2-M31 Stark proof of a `format::SEGMENT` proof.
 fn stark(proof: &mut Proof) -> &mut StarkProof<P2MerkleHasher> {
     P2MerkleChannel::stark_mut(&mut proof.stark_proof).expect("a Poseidon2-M31 proof")
 }

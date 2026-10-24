@@ -255,9 +255,9 @@ fn the_fixtures_are_judged() {
 /// io-hash, an output of its own, two roots of its space read and its
 /// `public_args` the venue's id and a nonce, as a venue-bound program's,
 /// then halts. Its run, cut in three segments, is proved at its class, its
-/// leaves folded to a root and the root wrapped under format 39, masked
+/// leaves folded to a root and the root wrapped under `format::MASKED_WRAP`, masked
 /// from the seeded test seam (`MaskRng::Seeded`, so the bytes are the
-/// generator's every run): `wrap.proof`; and under format 28:
+/// generator's every run): `wrap.proof`; and under `format::WRAP`:
 /// `wrap-28.proof`. Two roots that are not a whole run, wrapped under 39 as
 /// a cheating prover would (the wrap circuit's checks failing, proved
 /// anyway): `wrap-prefix.proof`, the first two segments, which set the
@@ -267,7 +267,7 @@ fn the_fixtures_are_judged() {
 /// under 39: `wrap-rootless.proof`.
 ///
 /// The production venue pins the kernel's program id, venue-bound, accepts
-/// format 39, registers `S`'s space from window 40, anchors `S`'s two roots
+/// `format::MASKED_WRAP`, registers `S`'s space from window 40, anchors `S`'s two roots
 /// (windows 41 and 42), judges at window 42's boundary and has accepted one
 /// other statement. The test venue is the same and accepts 28 beside 39.
 /// The cases (`statements.cases`), each a venue's state, a statement and a
@@ -284,8 +284,8 @@ fn the_fixtures_are_judged() {
 ///   root;
 /// - **prefix**, **mid-way:** `S` with the wraps of a part of the run;
 /// - **repeated:** `S` after the venue accepted it;
-/// - **unaccepted format:** `S` under format 30;
-/// - **format 28 at a production venue:** `S` under 28, with its wrap;
+/// - **unaccepted format:** `S` under `format::CREDENTIAL_PROOF`;
+/// - **`format::WRAP` at a production venue:** `S` under 28, with its wrap;
 /// - **wrong io-hash:** `S` with its output changed;
 /// - **another program than the pin:** the statement names another program
 ///   than the one the venue pinned;
@@ -453,7 +453,7 @@ mod statements {
         context.finalize().expect("the wrap's wiring checks")
     }
 
-    /// The wrap of `root` under format 39, masked from the seeded seam: its
+    /// The wrap of `root` under `format::MASKED_WRAP`, masked from the seeded seam: its
     /// fixed layout.
     fn masked_wrap(root: &NodeRun, program: &KernelProgram, lenient: bool) -> Vec<u8> {
         let (proof, _) = wrap::prove_masked(
@@ -466,7 +466,7 @@ mod statements {
         wrap::proof_bytes(&proof).expect("the fixed layout holds it")
     }
 
-    /// The wrap of `root` under format 28: postcard.
+    /// The wrap of `root` under `format::WRAP`: postcard.
     fn unmasked_wrap(root: &NodeRun, program: &KernelProgram) -> Vec<u8> {
         let proof: WrapProof =
             wrap::prove_unmasked(&finalized(root, program, false)).expect("the wrap proves");

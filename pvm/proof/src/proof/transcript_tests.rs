@@ -22,7 +22,7 @@ fn state(register: u64) -> SegmentState {
 }
 
 /// The boundary relations' challenges, drawn after `initial` and
-/// `final_state` are mixed as format 35 mixes them.
+/// `final_state` are mixed as `format::SEGMENT` mixes them.
 fn challenges(
     initial: &SegmentState,
     final_state: &SegmentState,

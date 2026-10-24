@@ -292,7 +292,7 @@ pub fn is_refused(finalized: &Finalized<SecureField>) -> bool {
     }
 }
 
-/// The format-35 segment fixture's proof.
+/// The `format::SEGMENT` segment fixture's proof.
 pub fn segment_fixture() -> vos_pvm_proof::Proof {
     let bytes = std::fs::read(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -302,7 +302,7 @@ pub fn segment_fixture() -> vos_pvm_proof::Proof {
     postcard::from_bytes(&bytes).expect("a proof")
 }
 
-/// A run of six Add64s proved under format 35 over all 25 chips, the ones
+/// A run of six Add64s proved under `format::SEGMENT` over all 25 chips, the ones
 /// it does not use padded; proved once a test binary.
 pub fn full_shape_proof() -> &'static vos_pvm_proof::Proof {
     use vos_pvm::instruction::Opcode;

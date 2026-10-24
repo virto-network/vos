@@ -108,7 +108,7 @@ fn partial_rows(circuit: &Circuit) -> usize {
 }
 
 /// The circuits of a tree absorb wires in part and read no unread lane:
-/// the window kernel's leaf (the format-35 fixture's shape), a small
+/// the window kernel's leaf (the `format::SEGMENT` fixture's shape), a small
 /// kernel's leaf, the fold and the wrap; each topology finalized, so
 /// checked.
 #[test]

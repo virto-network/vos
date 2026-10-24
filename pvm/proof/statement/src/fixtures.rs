@@ -3,15 +3,15 @@
 //! statement, a proof and the verdict every venue must reach.
 //!
 //! - `wrap.proof`, `wrap-rootless.proof`, `wrap-prefix.proof` and
-//!   `wrap-midway.proof`: final proofs of format 39, its fixed layout;
-//!   `wrap-28.proof`: format 28's, postcard, for the test policy's cases;
+//!   `wrap-midway.proof`: final proofs of `format::MASKED_WRAP`, its fixed layout;
+//!   `wrap-28.proof`: `format::WRAP`'s, postcard, for the test policy's cases;
 //! - [`CASES`]: the cases, each its name, its proof's file, a [`Patch`] of
 //!   that proof's bytes if any, its [`Input`] and its verdict's code
 //!   (`crate::code`), in this module's encoding ([`encode`]).
 //!
 //! A case's verdict is a build's linking both formats ([`RECORDED`]): the
 //! tests', and the harnesses' test builds. A production build, linking 39
-//! alone, refuses a statement of format 28 as `Format` (2), the first check
+//! alone, refuses a statement of `format::WRAP` as `Format` (2), the first check
 //! after the input decodes, and reaches every other case's verdict
 //! ([`Fixture::verdict_linking`]).
 //!

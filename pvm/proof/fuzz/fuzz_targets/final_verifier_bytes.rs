@@ -1,4 +1,4 @@
-//! Fuzz target: arbitrary bytes as a wrap proof of format 28 and of format
+//! Fuzz target: arbitrary bytes as a wrap proof of `format::WRAP` and of format
 //! 39, each against its golden wrap's public words, dispatched by the
 //! format as a venue dispatches (`vos_pvm_final_verifier::verify`).
 //!

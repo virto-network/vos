@@ -5,7 +5,7 @@
 //! proved on. The gates the earlier steps hold are theirs: the degree
 //! audit (`masked.rs`), the mask invariant and R1's refusal
 //! (`masked_prover.rs`), each masked field tampered and both bit counts
-//! (format 39's own tests).
+//! (`format::MASKED_WRAP`'s own tests).
 //!
 //! **Soundness:** masked proofs verify at every size, alone and mixed, on
 //! both channels (Blake2b-256 and Poseidon2-M31); a broken constraint on
@@ -890,7 +890,7 @@ fn every_opening_is_fresh() {
     eprintln!("{n} openings of one witness, {m} of two from one seed: none shared");
 }
 
-/// Leakage 6: the claimed sums' control. Unblinded (format 28's
+/// Leakage 6: the claimed sums' control. Unblinded (`format::WRAP`'s
 /// parameters, unmasked), the sums a right guess of the witness computes
 /// at the proof's relation are the proof's; blinded, none is, though their
 /// total is (the blinding sums to zero).
@@ -1079,7 +1079,7 @@ where
 /// values, each tree's and FRI layer's witness hashes, FRI's witness
 /// values) is what its own query positions give, counted for an all-zero
 /// witness, for proofs of a zero witness and of a random one alike; every
-/// other count is the format's pin (`check_shape`, format 39's own tests).
+/// other count is the format's pin (`check_shape`, `format::MASKED_WRAP`'s own tests).
 #[test]
 fn the_shape_is_the_format_and_the_coins() {
     let format = format();

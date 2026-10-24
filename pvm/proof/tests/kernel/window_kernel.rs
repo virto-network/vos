@@ -14,7 +14,7 @@
 //! the agent's reference model at the cut; its kernel re-runs from the
 //! attest to the same statement, proves over its shape and verifies as a
 //! chain against its program; its leaves and folds prove and verify; and
-//! its whole run, folded to one root, wraps under format 28 and masked
+//! its whole run, folded to one root, wraps under `format::WRAP` and masked
 //! under 39, whose statement the model venue judges against the space's
 //! anchors: accepted, and refused as each thing it binds is changed.
 
@@ -649,7 +649,7 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
 
 /// The window end to end on the million-row map: its run, at most 1M
 /// steps, its space path within a fifth of spike 6.0a's; proved whole,
-/// folded to one root and wrapped under format 28 and masked under 39; and
+/// folded to one root and wrapped under `format::WRAP` and masked under 39; and
 /// its statement (the reader's agent and instance, the peer, the currency
 /// and `c_prev` public, `(net, seq, c_new)` its output, `S_w` its root)
 /// judged at the model venue, which pins the kernel's program and holds

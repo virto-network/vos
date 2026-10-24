@@ -229,7 +229,7 @@ fn run_watched(
 
 /// `run`, a whole run of `program` from `entry` to its halt, proved to its
 /// final proof: [`prove_run`], then the root's [`wrap()`], masked under
-/// format 39, its bytes the format's fixed layout; and what each stage
+/// `format::MASKED_WRAP`, its bytes the format's fixed layout; and what each stage
 /// took. The statement it proves is the program's id and the run's
 /// io-hash.
 pub fn prove_final(
@@ -297,7 +297,7 @@ pub fn fold(
 }
 
 /// The wrap of `root` under the program whose id's preimage is `program`,
-/// proved masked under format 39 ([`wrap::prove`]): its proof, the statement
+/// proved masked under `format::MASKED_WRAP` ([`wrap::prove`]): its proof, the statement
 /// it carries and its public words.
 pub fn wrap(
     root: &Node,

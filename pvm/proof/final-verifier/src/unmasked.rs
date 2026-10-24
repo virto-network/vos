@@ -1,4 +1,4 @@
-//! Format 28, the unmasked wrap: the tests' and the fixtures' format, linked
+//! `format::WRAP`, the unmasked wrap: the tests' and the fixtures' format, linked
 //! only under the `test-formats` feature; no production venue accepts it.
 //!
 //! The recursion AIR's three components at the wrap circuit's log sizes,
@@ -44,7 +44,7 @@ use crate::{
 /// The format the unmasked wrap's proofs carry (`vos_pvm_proof::format::WRAP`).
 pub const FORMAT: u32 = 28;
 
-/// Format 28's PCS configuration, affine DEEP batching among it.
+/// `format::WRAP`'s PCS configuration, affine DEEP batching among it.
 pub const CONFIG: PcsConfig = PcsConfig {
     pow_bits: 26,
     fri_config: FriConfig {
@@ -57,10 +57,10 @@ pub const CONFIG: PcsConfig = PcsConfig {
     deep_batching: DeepBatching::Affine,
 };
 
-/// Format 28's interaction PoW.
+/// `format::WRAP`'s interaction PoW.
 pub const INTERACTION_POW_BITS: u32 = 8;
 
-/// The format-28 proof in `bytes`: at most [`MAX_PROOF_BYTES`], its format
+/// The `format::WRAP` proof in `bytes`: at most [`MAX_PROOF_BYTES`], its format
 /// word 28, one postcard encoding and nothing after it.
 pub fn decode(bytes: &[u8]) -> Result<WrapProof, Error> {
     if bytes.len() > MAX_PROOF_BYTES {
@@ -77,13 +77,13 @@ pub fn decode(bytes: &[u8]) -> Result<WrapProof, Error> {
     }
 }
 
-/// Verifies the format-28 proof in `bytes` ([`decode`]) against the public
+/// Verifies the `format::WRAP` proof in `bytes` ([`decode`]) against the public
 /// `words`.
 pub fn verify_bytes(bytes: &[u8], words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
     verify(decode(bytes)?, words)
 }
 
-/// Verifies a format-28 `proof` against the public `words`, and returns the
+/// Verifies a `format::WRAP` `proof` against the public `words`, and returns the
 /// statement they make: the program id and the io-hash.
 pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
     let statement = Statement::from_words(words)?;
@@ -137,7 +137,7 @@ pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement
     Ok(statement)
 }
 
-/// The format, the configuration and the log sizes: format 28's. A proof's
+/// The format, the configuration and the log sizes: `format::WRAP`'s. A proof's
 /// configuration does not carry its DEEP batching, so its batching is not
 /// compared.
 fn check_header(proof: &WrapProof) -> Result<(), Error> {
@@ -215,7 +215,7 @@ fn check_samples(
 mod tests {
     use super::*;
 
-    /// The header is the segment transcript's, on format 28's
+    /// The header is the segment transcript's, on `format::WRAP`'s
     /// configuration and the wrap's log sizes; the constants are format
     /// 28's registry entry.
     #[test]

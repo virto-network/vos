@@ -1,8 +1,8 @@
 //! The tests' wrap files (`target/tmp/wrap/`), a carrier of the prover's
-//! output: each a final wrap of format 28 or 39 that verifies against its
+//! output: each a final wrap of `format::WRAP` or 39 that verifies against its
 //! public words, its format, its words or its judgement's input, and
 //! nothing else, so no segment, leaf or fold proof is ever written there;
-//! and a production kernel's wrap is masked, format 28 the test circuits'
+//! and a production kernel's wrap is masked, `format::WRAP` the test circuits'
 //! alone. Run by `just test-proof` after the suites that write them, which
 //! leave some: an empty directory fails.
 
@@ -54,7 +54,7 @@ fn the_wrap_directory_holds_final_wraps_alone() {
         .unwrap_or_else(|error| panic!("{name}: not a final wrap: {error:?}"));
         statements.insert(name, (format, statement.program));
     }
-    // Format 28 wraps a test circuit alone: the kernels' predicate, or a
+    // `format::WRAP` wraps a test circuit alone: the kernels' predicate, or a
     // circuit wrapped under 39 beside it, as the recursion suite's
     // one-segment run is.
     let masked: Vec<[u32; 8]> = statements

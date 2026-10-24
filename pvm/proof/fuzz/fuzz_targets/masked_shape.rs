@@ -1,4 +1,4 @@
-//! Fuzz target: format 39's goldens reshaped within the layout's bounds,
+//! Fuzz target: `format::MASKED_WRAP`'s goldens reshaped within the layout's bounds,
 //! where Stwo's PCS reads them. The parts the transcript binds before the
 //! queries (the header, the commitments, the claimed sums, the sampled
 //! values, the nonces, FRI's commitments and last layer) stay the golden's,

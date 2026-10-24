@@ -9,7 +9,7 @@
 //! - [`trace`] lays out the three components' preprocessed, main and
 //!   interaction columns; a `p2` padding row holds the permutation of zero.
 //! - [`prove()`] and [`verify()`] run natively on the Poseidon2-M31 channel
-//!   under format 32; a circuit is pinned by its hash.
+//!   under `format::LEAF_FOLD`; a circuit is pinned by its hash.
 //! - [`gadgets`] are the Poseidon2 modes as the circuit uses them: the leaf
 //!   sponge, the Merkle node and the transcript.
 //! - [`compile`] turns a component's constraints into `qm31` rows that
@@ -24,8 +24,8 @@
 //!   output their run states.
 //! - [`wrap`] is the final wrap: a tree's root verified, its circuit,
 //!   program and run checked, the program id and io-hash its public words,
-//!   proved masked under format 39 on the Blake2b-256 channel, or unmasked
-//!   under format 28.
+//!   proved masked under `format::MASKED_WRAP` on the Blake2b-256 channel, or unmasked
+//!   under `format::WRAP`.
 //! - [`masked`] is the masked prover (masking variant (c)), over any
 //!   component set and Merkle channel: the masks, salts, blinding and FRI
 //!   mask in pin B's order, R1 checked on the transcript, the randomness

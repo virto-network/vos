@@ -74,7 +74,7 @@
 //! - **Trace** — [`TracingPvm::into_side_note`][into_side_note] (a
 //!   run's whole trace) or [`SideNote::new`] from a hand-built step
 //!   trace.
-//! - **Prove** — [`prove`], under the segment format 35;
+//! - **Prove** — [`prove`], under the segment `format::SEGMENT`;
 //!   [`prove_format`] under any admitted format of the
 //!   [`format`](mod@format) registry, at its parameters.
 //! - **Verify** — [`verify`] (prover-side, with the SideNote);

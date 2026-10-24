@@ -2,7 +2,7 @@
 //! [`Statement`], its canonical encoding, its io-hash and its id, and
 //! [`judge`], the venue's check of a final proof against it.
 //!
-//! **What binds what.** The final proof (`vos-pvm-final-verifier`, format 39;
+//! **What binds what.** The final proof (`vos-pvm-final-verifier`, `format::MASKED_WRAP`;
 //! 28 under `test-formats`) states two public inputs, the program id and the
 //! io-hash. The io-hash is BLAKE2b-256 of `vos/io/v1` and the statement's
 //! `public_args`, `output` and `roots` in their SCALE encoding, as the
@@ -49,14 +49,14 @@
 //!
 //! **Formats.** [`judge`] reads a statement's proof under the statement's
 //! format, through the final verifier's dispatch, when the venue accepts it
-//! and this build links it ([`LINKED`]): format 39 alone, and 28 beside it
+//! and this build links it ([`LINKED`]): `format::MASKED_WRAP` alone, and 28 beside it
 //! only under the `test-formats` feature, which no production build
 //! enables (`just check-no-test-formats`). So the accepted set is the one
-//! gate between format 28 and a production venue.
+//! gate between `format::WRAP` and a production venue.
 //!
 //! **Keys.** A venue remembers what it accepted by the statement's id
 //! ([`Statement::id`]), never by the proof's bytes or their hash: a proof has
-//! many encodings under format 28 (`vos_pvm_final_verifier::unmasked::decode`),
+//! many encodings under `format::WRAP` (`vos_pvm_final_verifier::unmasked::decode`),
 //! and many proofs state one statement.
 //!
 //! **`Seen` and time** ([`seen_expiry`]): a rooted statement's entry may be

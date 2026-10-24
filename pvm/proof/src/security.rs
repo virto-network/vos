@@ -184,7 +184,7 @@ pub fn proven_count(params: &FormatParams, shape: &SecurityShape) -> Option<f64>
 
 /// `log2` of each FRI round's folding factor the count is taken at, the
 /// first round's with the circle fold in it; `None` for a shape outside the
-/// analysis. A verifier's own rounds must be these (format 39's: `[3, 3, 3,
+/// analysis. A verifier's own rounds must be these (`format::MASKED_WRAP`'s: `[3, 3, 3,
 /// 2]`, `vos_pvm_final_verifier::masked::FRI_ROUNDS`).
 pub fn fri_rounds(params: &FormatParams, shape: &SecurityShape) -> Option<alloc::vec::Vec<u32>> {
     Analysis::new(params, shape).map(|analysis| analysis.folds)

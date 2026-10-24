@@ -50,7 +50,7 @@ pub struct Kreivo {
 }
 
 impl Kreivo {
-    /// The chain, accepting format 39 and `programs`, none venue-bound,
+    /// The chain, accepting `format::MASKED_WRAP` and `programs`, none venue-bound,
     /// from its genesis; the founder and the controller funded.
     pub fn new(programs: &[ProgramId]) -> Self {
         let mut chain = Chain::new(Constants::kreivo(VENUE)).with_fees(true);

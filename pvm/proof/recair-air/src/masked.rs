@@ -1,6 +1,6 @@
 //! The recursion AIR as the masked wrap proves it: masking variant (c)
 //! (`docs/design/proving.md` §5; `research/slice-5/masking-review.md`), the
-//! AIR of format 39 in `vos_pvm_proof::format`'s registry.
+//! AIR of `format::MASKED_WRAP` in `vos_pvm_proof::format`'s registry.
 //!
 //! - **Constraint bound `log_size + 2`**
 //!   ([`MASKED_LOG_CONSTRAINT_EXPANSION`]): every main and interaction
@@ -61,7 +61,7 @@ relation!(BlindRelation, 1);
 
 /// What a masked format commits beside the AIR's columns: the trees' layout
 /// its masking pins (`vos_pvm_proof::format::Masking`, whose entry for
-/// format 39 `vos-pvm-recair` reads as `MASKED_WRAP_PINS`).
+/// `format::MASKED_WRAP` `vos-pvm-recair` reads as `MASKED_WRAP_PINS`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct MaskPins {
     /// The salt columns at the end of each salted tree (main, interaction,
@@ -604,7 +604,7 @@ mod tests {
 
     use stwo::core::circle::SECURE_FIELD_CIRCLE_GEN;
 
-    /// Format 28's and 39's log sizes.
+    /// `format::WRAP`'s and 39's log sizes.
     const LOG_SIZES: LogSizes = [14, 15, 11];
 
     /// Pin A's: 8 salt columns a tree and an `R` of 8.

@@ -28,7 +28,7 @@
 //! drawn again, at most [`MAX_ATTEMPTS`] times. Whether a transcript passes
 //! is a function of public coins and the format, so the retry conditions on
 //! a public event. **R3** holds by construction: `R`'s columns are the
-//! format's (8 for format 39), whose independent DEEP coefficients span
+//! format's (8 for `format::MASKED_WRAP`), whose independent DEEP coefficients span
 //! QM31 over M31 but with probability about `p^-5`; no check.
 //!
 //! The format pins the masking ([`Masking`]); nothing here names the wrap,
@@ -92,7 +92,7 @@ pub const fn mask_pins(masking: &Masking) -> MaskPins {
     }
 }
 
-/// Format 39's trees: its salt and `R` columns, read from the registry.
+/// `format::MASKED_WRAP`'s trees: its salt and `R` columns, read from the registry.
 pub const MASKED_WRAP_PINS: MaskPins = match &MASKED_WRAP.masking {
     Some(masking) => mask_pins(masking),
     None => panic!("format 39 pins its masking"),

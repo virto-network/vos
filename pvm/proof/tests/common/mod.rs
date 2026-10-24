@@ -510,12 +510,12 @@ pub fn prove_fold(
     }
 }
 
-/// `root`, the root of a whole run of `program`, wrapped under format 28 on
+/// `root`, the root of a whole run of `program`, wrapped under `format::WRAP` on
 /// the Blake2b-256 channel within 2^17 rows and 8 GiB of heap, and verified
 /// by `vos-pvm-final-verifier`, its statement the program's id and the root's
 /// io-hash: the proof's bytes (postcard) and its public words; its proving
 /// time and peak heap added to `wrap`. The same witness is proved masked
-/// under format 39 as well ([`masked_wrap`]): its bytes, the fixed layout.
+/// under `format::MASKED_WRAP` as well ([`masked_wrap`]): its bytes, the fixed layout.
 pub fn wrap_root(
     name: &str,
     program: &vos_pvm_proof::program_id::KernelProgram,
@@ -576,11 +576,11 @@ pub fn resident_peak_mib(reset: bool) -> u64 {
     kib >> 10
 }
 
-/// A finalized wrap circuit's witness proved masked under format 39
+/// A finalized wrap circuit's witness proved masked under `format::MASKED_WRAP`
 /// (`vos_pvm_recair::wrap::prove`), within 4.5 GiB of heap and 8 GiB of
 /// resident memory, its revealed functionals within pin A's count, its
 /// bytes the fixed layout, and verified by the final verifier's masked
-/// verifier, its preprocessed root format 39's (pin A): its proving time and
+/// verifier, its preprocessed root `format::MASKED_WRAP`'s (pin A): its proving time and
 /// R1's printed with the load average, and its bytes written for the Wasm
 /// harness as `wrap/<name>-39.{proof,format,words}`: the bytes.
 fn masked_wrap(
@@ -695,7 +695,7 @@ pub fn judged_statement(
     input
 }
 
-/// A format-28 wrap's proof (postcard), its format, its public words and its
+/// A `format::WRAP` wrap's proof (postcard), its format, its public words and its
 /// judgement's input, under the target's tmp directory as
 /// `wrap/<name>.{proof,format,words,input}`, for the Wasm harness.
 pub fn write_wrap(

@@ -14,7 +14,7 @@
 //! so a record read twice makes one job.
 //!
 //! **For each attest at a window's cut** in an agent's log: the statement
-//! it makes ([`Statement`](vos_venue::vos_statement::Statement): format 39,
+//! it makes ([`Statement`](vos_venue::vos_statement::Statement): `format::MASKED_WRAP`,
 //! its kernel's program id recomputed from the kernel's blob, the space,
 //! the public arguments, the output and the roots) and its id. A statement
 //! whose anchor would pass `MaxRootAge` by the venue's time before its

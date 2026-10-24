@@ -1,7 +1,7 @@
 //! The production prover: a kernel's run re-traced on its record's
 //! witness and checked against the record, then proved segment by segment,
 //! each segment verified in its class's leaf, the leaves folded to one
-//! root, and the root wrapped masked under format 39 (pin A).
+//! root, and the root wrapped masked under `format::MASKED_WRAP` (pin A).
 //!
 //! The kernel's program id is recomputed from its blob alone: its shape
 //! from its code, its image root from its memory, each class's

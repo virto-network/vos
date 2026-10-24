@@ -6,7 +6,7 @@
 //! `prove_chain` derives ONE forcing profile over the window bounds and proves
 //! every window to it, so all segments share one program commitment. The
 //! resulting per-segment proofs then verify trustlessly via
-//! `verify_chain_standalone` against that single commitment, under format 35.
+//! `verify_chain_standalone` against that single commitment, under `format::SEGMENT`.
 
 use vos_pvm::PVM_REGISTER_COUNT;
 use vos_pvm::instruction::Opcode;

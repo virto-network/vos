@@ -1,6 +1,6 @@
 //! The golden fixtures (`proving.md` A.6, `pvm/proof/fixtures`) as the
 //! venues judge them: natively, and on the JAM-only host by the venue's
-//! refine programs (`final-verify.elf`, linking format 39 alone, and
+//! refine programs (`final-verify.elf`, linking `format::MASKED_WRAP` alone, and
 //! `final-verify-test.elf`, 28 beside it; built by `just check-no-std`); the
 //! Wasm harness judges them with `judge` (`final-verifier/wasm/run`), its
 //! production and test blobs alike. Each verdict is its fixture's under the
@@ -20,7 +20,7 @@ use vos_statement::model::judge_bytes;
 use vos_statement::vos_anchor::vectors;
 use vos_statement::vos_pvm_final_verifier::{self, MAX_PROOF_BYTES, masked};
 
-/// The cases a venue accepts: under format 39, the rooted statement and the
+/// The cases a venue accepts: under `format::MASKED_WRAP`, the rooted statement and the
 /// rootless one; under 28, at the test venue.
 const ACCEPTED: [&str; 3] = ["valid", "rootless", "format 28 at the test venue"];
 
@@ -86,7 +86,7 @@ fn every_fixture_is_judged_natively_as_recorded() {
 }
 
 /// On the JAM-only host: each fixture's verdict, by the production guest
-/// (format 39 alone: a statement of 28 refused as `Format`) and by the test
+/// (`format::MASKED_WRAP` alone: a statement of 28 refused as `Format`) and by the test
 /// guest (28 beside it: the recorded verdict); its gas.
 #[test]
 fn every_fixture_is_judged_on_the_jam_only_host_as_recorded() {
@@ -126,7 +126,7 @@ fn every_fixture_is_judged_on_the_jam_only_host_as_recorded() {
     }
 }
 
-/// The production guest's program, linking format 39 alone, within JAM's
+/// The production guest's program, linking `format::MASKED_WRAP` alone, within JAM's
 /// 4,000,000-byte bound on a service's code, its only size bound; and
 /// smaller than the test guest's, which links 28 beside it.
 #[test]

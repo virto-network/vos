@@ -1,5 +1,5 @@
 //! Native proving and verifying of a circuit on the Poseidon2-M31 channel,
-//! under format 32 (`vos_pvm_proof::format::LEAF_FOLD`), the recursion AIR's
+//! under `format::LEAF_FOLD` (`vos_pvm_proof::format::LEAF_FOLD`), the recursion AIR's
 //! format for leaves and folds, at its exact parameters; and proving under
 //! any format of the recursion AIR on its channel ([`prove_on`]), the wrap's
 //! (28) on Blake2b-256, which `vos-pvm-final-verifier` verifies.

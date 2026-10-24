@@ -1,4 +1,4 @@
-//! Proving the BLAKE2b precompile in a segment proof (format 35).
+//! Proving the BLAKE2b precompile in a segment proof (`format::SEGMENT`).
 //!
 //! `precompile prove <n>`: trace, prove, encode and verify n hashes. Run one
 //! size per process: peak RSS is per process, and proving needs 4–24 GiB.

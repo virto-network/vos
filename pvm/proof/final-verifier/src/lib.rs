@@ -378,8 +378,8 @@ mod tests {
         ));
     }
 
-    /// Format 39's preprocessed root is format 28's (pin A): its columns at
-    /// `n + 1` under blowup 32 are format 28's at `n + 6`.
+    /// `format::MASKED_WRAP`'s preprocessed root is `format::WRAP`'s (pin A): its columns at
+    /// `n + 1` under blowup 32 are `format::WRAP`'s at `n + 6`.
     #[test]
     fn the_masked_preprocessed_root_is_format_28s() {
         assert_eq!(PREPROCESSED_ROOT_39, PREPROCESSED_ROOT);

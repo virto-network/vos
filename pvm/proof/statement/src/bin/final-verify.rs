@@ -4,7 +4,7 @@
 //! and reports its gas by phase.
 //!
 //! Two builds of it (`src/bin/guest`): `final-verify.elf`, the production
-//! venue's, linking format 39 alone, which refuses to build under
+//! venue's, linking `format::MASKED_WRAP` alone, which refuses to build under
 //! `test-formats`; and `final-verify-test.elf` (`--features
 //! pvm-guest,test-formats`, `src/bin/final-verify-test.rs`), linking format
 //! 28 beside it, for the test policy's fixtures.

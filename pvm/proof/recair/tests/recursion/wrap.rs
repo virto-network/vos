@@ -1,7 +1,7 @@
 //! The final wrap (`proving.md` §3.5, `recursion-air.md` §7) over a small
 //! kernel's run, a standard program that sets its io-hash and halts: as one
 //! segment, whose leaf is the root, and cut in four segments, whose leaves
-//! fold to the root. Each root is wrapped, proved under format 28 on the
+//! fold to the root. Each root is wrapped, proved under `format::WRAP` on the
 //! Blake2b-256 channel and verified by `vos-pvm-final-verifier`.
 //!
 //! - **The circuit is pinned:** its log sizes and preprocessed root are the
@@ -219,7 +219,7 @@ pub(crate) fn values_of(root: &Node, program: &IdPreimage) -> WrapValues<SecureF
 }
 
 /// The circuit: its log sizes and preprocessed root the final verifier's,
-/// its rows by piece, the tallest component 2^15, within 2^17; format 28's
+/// its rows by piece, the tallest component 2^15, within 2^17; `format::WRAP`'s
 /// entry the final verifier's constants.
 #[test]
 fn the_wrap_circuit_is_pinned() {
@@ -758,7 +758,7 @@ fn the_final_verifier_reads_one_bounded_encoding() {
     );
 }
 
-/// The final verifier on the JAM-only host, by the test guest (format 28
+/// The final verifier on the JAM-only host, by the test guest (`format::WRAP`
 /// beside 39): the wrap accepted within 150M gas, its phases reported; a
 /// proof tampered at its middle byte, and other words, refused without a
 /// panic.

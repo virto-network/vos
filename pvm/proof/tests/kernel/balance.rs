@@ -1,7 +1,7 @@
 //! The `balance` test actor's read at a window's cut: whether an account
 //! held at least a threshold, the account public only as a salted
 //! commitment. Run live at the cut on the agent's reference model,
-//! re-traced, proved whole, wrapped under format 28 and masked under 39,
+//! re-traced, proved whole, wrapped under `format::WRAP` and masked under 39,
 //! and judged at the model venue against the space's anchor.
 
 use crate::common;
@@ -113,7 +113,7 @@ fn a_commitment_that_does_not_open_is_refused() {
     assert_eq!(live.output::<bool>(), Err(AttestError::Failed));
 }
 
-/// The balance's statement proved whole, wrapped masked under format 39 and
+/// The balance's statement proved whole, wrapped masked under `format::MASKED_WRAP` and
 /// accepted at the model venue holding the space's root anchored; another
 /// threshold or commitment in its public arguments refused by the proof's
 /// words.

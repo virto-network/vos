@@ -1,5 +1,5 @@
 //! The venue's JAM programs on the JAM-only host, at PolkaJam's prices:
-//! the refine program (`final-verify.elf`, linking format 39 alone, and
+//! the refine program (`final-verify.elf`, linking `format::MASKED_WRAP` alone, and
 //! `final-verify-test.elf`, linking 28 beside it), its request as work item
 //! 0's payload and the proof as a preimage of the running service; and any
 //! service's refine and accumulate (`statement-service.elf`'s), each built
@@ -45,13 +45,13 @@ pub struct GuestReport {
     pub digests: Vec<u8>,
 }
 
-/// The production guest, linking format 39 alone, linked: its program and
+/// The production guest, linking `format::MASKED_WRAP` alone, linked: its program and
 /// its ELF's length.
 pub fn program() -> (Vec<u8>, usize) {
     guest("final-verify")
 }
 
-/// The test guest, linking format 28 beside 39, linked: its program and its
+/// The test guest, linking `format::WRAP` beside 39, linked: its program and its
 /// ELF's length.
 pub fn test_program() -> (Vec<u8>, usize) {
     guest("final-verify-test")

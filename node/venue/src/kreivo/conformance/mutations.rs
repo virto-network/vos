@@ -1,6 +1,6 @@
 //! The mutation lists (`slice-6-on-chain.md` 6.17), as data for the
 //! teammate's benchmark helper: spike 6c's in-Wasm sweep (its proof and
-//! statement mutants) and format 39's masked fields tampered (spike 6a's
+//! statement mutants) and `format::MASKED_WRAP`'s masked fields tampered (spike 6a's
 //! cases, `vos-pvm-recair`'s `every_masked_field_tampered_is_refused`), each
 //! a patch of the `valid` fixture's proof or statement and the code its
 //! judgement reaches at the fixture's venue state: `judge`'s on the
@@ -197,7 +197,7 @@ fn bump(value: &mut BaseField) {
     *value = BaseField::from((value.0 + 1) % P);
 }
 
-/// Format 39's masked fields tampered, each re-encoded in the fixed
+/// `format::MASKED_WRAP`'s masked fields tampered, each re-encoded in the fixed
 /// layout: those it holds as mutants, the others by name.
 fn masked_field_mutants(judge: &Judge, proof: &[u8]) -> (Vec<Mutant>, Vec<String>) {
     let statement = judge.input.statement.encode();

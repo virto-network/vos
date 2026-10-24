@@ -1,4 +1,4 @@
-//! The in-AIR verifier's pieces (`recursion-air.md` §4) on real format-35
+//! The in-AIR verifier's pieces (`recursion-air.md` §4) on real `format::SEGMENT`
 //! proofs: the fixture (18 chips) and a run proved over all 25.
 //!
 //! - **Composed:** the fixture verified in a circuit, its transcript
@@ -452,7 +452,7 @@ fn a_shape_the_native_verifier_refuses_builds_no_circuit() {
     let mut oversize = WINDOW_LOG_SIZES;
     oversize[3] = vos_pvm_proof::DEFAULT_MAX_LOG_SIZE + 1;
     refused(&SEGMENT, &oversize, "log sizes the native verifier admits");
-    // Format 35 with a proven floor of 63 bits: the window kernel's shape
+    // `format::SEGMENT` with a proven floor of 63 bits: the window kernel's shape
     // counts 63, the same with its widest chip at 2^20 rows 62.
     let raised: &'static Format = Box::leak(Box::new(Format {
         floor: SecurityFloor {

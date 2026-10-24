@@ -1,4 +1,4 @@
-//! The recursion seams on a format-35 proof: the recorded transcript, the
+//! The recursion seams on a `format::SEGMENT` proof: the recorded transcript, the
 //! step-by-step extraction and the OODS reconstruction replay the same
 //! verifier transcript.
 

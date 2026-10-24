@@ -45,7 +45,7 @@ pub fn entry(blob: &[u8]) -> State {
     }
 }
 
-/// The kernel's whole run proved as one segment under format 35, once a
+/// The kernel's whole run proved as one segment under `format::SEGMENT`, once a
 /// test binary.
 pub fn whole_run() -> &'static vos_pvm_proof::Proof {
     static WHOLE: std::sync::OnceLock<vos_pvm_proof::Proof> = std::sync::OnceLock::new();
