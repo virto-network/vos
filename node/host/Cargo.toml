@@ -16,6 +16,10 @@ prover = ["vos-node-prover/prove"]
 # (`vos_node_prover::masked::Disclosing`): its test alone (`just
 # test-carriers`). No production build enables it.
 disclosing = ["prover", "vos-node-prover/disclosing"]
+# Every row of the store (`store::Fjall::dump`), for the carrier audit
+# (`vos-checker`, a dev edge) and the tests. No production build enables it
+# (`just check-no-store-dump`).
+dump = []
 # The end to end on chain (`just e2e-chain`): its test alone, against the
 # PolkaJam testnet the recipe starts. No production build enables it.
 chain = ["disclosing"]

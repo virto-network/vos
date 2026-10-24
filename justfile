@@ -269,6 +269,10 @@ _forbidden +gates:
         [test-formats "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [test-formats] []] \
         [test-formats "-p vos-statement --features fixtures,pvm-guest" [test-formats] []] \
         [test-formats "-p vos-statement-service --features pvm-guest" [test-formats] []] \
+        [store-dump "-p vos-cli" [dump] []] \
+        [store-dump "-p vos-cli --features prover" [dump] []] \
+        [store-dump "-p vos-node" [dump] []] \
+        [store-dump "-p vos-node --features prover" [dump] []] \
     ]; \
     let failures = ($table | where gate in [{{gates}}] | group-by args | items {|args, rows| \
         let resolved = (cargo tree ...($args | split row ' ') -e no-dev --target all -f '{p}|{f}' --prefix none | complete); \
@@ -293,8 +297,8 @@ _debug-names-absent:
     let binary = (open --raw target/debug/vos); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"the node's binary names ($name)" } } }
 
 # Every `check-no-*` gate below, each build resolved once.
-check-no-leaks: (_forbidden "jam-dev" "venue-clients" "seeded-masks" "debug-internals" "test-formats") _seeded-masks-unimplied _debug-names-absent
-    print "no test seam, debug output, test format, JAM client or venue client in a production build"
+check-no-leaks: (_forbidden "jam-dev" "venue-clients" "seeded-masks" "debug-internals" "test-formats" "store-dump") _seeded-masks-unimplied _debug-names-absent
+    print "no test seam, debug output, test format, store dump, JAM client or venue client in a production build"
 
 # A node knows no JAM: the JAM client (a PolkaJam node's RPC and `jamt`,
 # the statements service's client and `JamVenue`) is development tooling,
@@ -348,6 +352,13 @@ check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
 # verifier too, and are no venue.
 check-no-test-formats: (_forbidden "test-formats")
     print "no test formats in a production build"
+
+# The store's dump (`vos-node`'s `dump`: `store::Fjall::dump`, every row
+# the store holds) reaches neither the `vos` binary, with or without the
+# prover, nor `vos-node`, on a normal or build edge (the carrier audit's
+# checker enables it, a dev edge of both).
+check-no-store-dump: (_forbidden "store-dump")
+    print "no store dump in a production build"
 
 # The builds without std. vos-raft for an embedded target, on core and alloc
 # alone, built from the toolchain's source. The proof verifier, which reads

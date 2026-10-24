@@ -31,7 +31,8 @@ hex = "0.4"
 smol = "2"
 socket2 = "0.6"
 tempfile = "3"
-vos-node = { path = "../host" }
+# The store's every row, which the carrier audit searches.
+vos-node = { path = "../host", features = ["dump"] }
 vos-testkit = { path = "../../agent/testkit" }
 vos-wire = { workspace = true }
 

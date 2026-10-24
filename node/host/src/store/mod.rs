@@ -124,6 +124,7 @@ struct Partitions {
 }
 
 /// A row of [`Fjall::dump`]: its partition's name, its key and its value.
+#[cfg(feature = "dump")]
 pub type DumpedRow = (&'static str, Vec<u8>, Vec<u8>);
 
 /// A prover's job as the store keeps it: its agent, its statement's id and
@@ -309,7 +310,7 @@ impl Fjall {
     /// Every key and value of every partition, by partition, in key order:
     /// all the store holds, as a test reads it, however its blocks are
     /// compressed on disk.
-    #[doc(hidden)]
+    #[cfg(feature = "dump")]
     pub fn dump(&self) -> Result<Vec<DumpedRow>> {
         let partitions = [
             ("state", &self.0.state),
