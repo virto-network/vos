@@ -215,7 +215,7 @@ impl MaskedProver {
                 | TreeError::Segment(ProvingError::Shape { .. } | ProvingError::MalformedShape) => {
                     ProveError::Kernel(format!("{error:?}"))
                 }
-                error => ProveError::Failed(failed(&error).into()),
+                error => ProveError::Failed(failed(&error)),
             }
         })
     }

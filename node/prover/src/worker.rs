@@ -78,8 +78,9 @@ pub enum ProveError {
     Rerun(String),
     /// The record names no kernel this prover proves: refused for good.
     Kernel(String),
-    /// The prover failed: tried again.
-    Failed(String),
+    /// The prover failed: tried again. Its reason is static, so that it
+    /// holds nothing of the run's values and may be logged.
+    Failed(&'static str),
 }
 
 /// What proves a statement.
@@ -497,7 +498,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         let started = Instant::now();
         let prover = Arc::clone(&self.prover);
         let proved = crate::redact::proving(|| prover.prove(&kernel, &attest))
-            .unwrap_or_else(|_| Err(ProveError::Failed("the prover panicked".into())));
+            .unwrap_or(Err(ProveError::Failed("the prover panicked")));
         let took = started.elapsed();
         match proved {
             Ok(proof) => {
@@ -519,10 +520,11 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 self.jobs
                     .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
             }
-            Err(ProveError::Failed(_)) => {
+            Err(ProveError::Failed(reason)) => {
                 tracing::warn!(
                     agent,
                     attempts = job.attempts,
+                    reason,
                     "a proof failed: queued again"
                 );
                 self.jobs.put(&id, &job.to(State::Queued))?;
