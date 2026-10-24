@@ -6,18 +6,10 @@ use vos_pvm::interpreter::Interpreter;
 
 use vos_pvm::precompile::{WITNESS_INPUT, WitnessFault, WitnessInput, WitnessRead};
 
+use crate::chips::blake2b::Blake2bCall;
 use crate::core::step::{CompactStep, MemAccess, PvmStep, RegWrite, WitnessWrite, expand_steps};
 
 pub use crate::core::ecall::ECALL_BLAKE2B_COMPRESS;
-
-/// A recorded blake2b call for the precompile chip.
-#[derive(Clone, Debug)]
-pub struct Blake2bRecord {
-    pub h: [u64; 8],
-    pub m: [u64; 16],
-    pub t: u128,
-    pub f: bool,
-}
 
 /// Per-byte memory operations for a single blake2b_compress ECALL, so the
 /// MemoryChip ledger can account for the reads (h, m) and writes (output
@@ -58,7 +50,7 @@ pub struct TracingPvm {
     /// out-of-band register mutation between steps would otherwise be
     /// silently lost in expansion.
     last_regs: [u64; PVM_REGISTER_COUNT],
-    pub blake2b_records: Vec<Blake2bRecord>,
+    pub blake2b_records: Vec<Blake2bCall>,
     pub blake2b_mem_ops: Vec<Blake2bMemOp>,
     /// The input a kernel's witness-input calls read, when the run has one;
     /// without it a witness-input call is an unhandled host call.
@@ -380,7 +372,7 @@ impl TracingPvm {
             return false;
         };
         let ts = self.timestamp - 1;
-        self.blake2b_records.push(Blake2bRecord { h, m, t, f });
+        self.blake2b_records.push(Blake2bCall { h, m, t, f });
         self.blake2b_mem_ops.push(Blake2bMemOp {
             h_ptr,
             m_ptr,
@@ -434,22 +426,13 @@ impl TracingPvm {
         let jump_table = self.pvm.jump_table.to_vec();
         let steps = self.trace();
         let mut side_note = crate::SideNote::new(steps, code, bitmask).with_jump_table(jump_table);
-        side_note.blake2b_calls = self
-            .blake2b_records
-            .into_iter()
-            .map(|record| crate::chips::blake2b::Blake2bCall {
-                h: record.h,
-                m: record.m,
-                t: record.t,
-                f: record.f,
-            })
-            .collect();
+        side_note.blake2b_calls = self.blake2b_records;
         side_note.blake2b_mem_ops = self.blake2b_mem_ops;
         side_note
     }
 
     /// Return recorded blake2b calls for the precompile chip.
-    pub fn blake2b_calls(&self) -> &[Blake2bRecord] {
+    pub fn blake2b_calls(&self) -> &[Blake2bCall] {
         &self.blake2b_records
     }
 }

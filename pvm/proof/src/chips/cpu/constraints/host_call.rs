@@ -6,6 +6,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo_constraint_framework::{EvalAtRow, RelationEntry};
 
 use super::{Lookups, Row};
+use crate::chips::cpu::tuples::BLAKE2B_CALL_REGS;
 use crate::core::step::WORD_SIZE;
 
 /// Host-call continuation.
@@ -91,17 +92,9 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
     let reg_lookup = &lookups.reg_lookup;
     // ── blake2b ECALL register-read producers + Phi7Bool tie ──
     {
-        // Slot → PVM register index for the ECALL register-read
-        // producer.  The `Column::Phi*` names don't match their actual
-        // sources, which are:
-        //   Phi7  ← φ[10] (f_flag)
-        //   Phi10 ← φ[7]  (h_ptr)
-        //   Phi11 ← φ[8]  (m_ptr)
-        //   Phi12 ← φ[9]  (t_low)
-        // See `trace_fill.rs` for the full mapping.
-        const ECALL_REG_IDXS: [u32; 4] = [10, 7, 8, 9];
+        // Each slot's register read ([`BLAKE2B_CALL_REGS`]).
         let phi_cols: [&[E::F]; 4] = [&row.phi7, &row.phi10, &row.phi11, &row.phi12];
-        for (slot, &reg_idx) in ECALL_REG_IDXS.iter().enumerate() {
+        for (slot, &reg_idx) in BLAKE2B_CALL_REGS.iter().enumerate() {
             let mut tuple: Vec<E::F> = Vec::with_capacity(18);
             tuple.push(E::F::from(BaseField::from(reg_idx)));
             for c in phi_cols[slot] {

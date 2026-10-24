@@ -1,6 +1,7 @@
 //! The register accesses and the host calls.
 
 use super::*;
+use crate::chips::cpu::tuples::BLAKE2B_CALL_REGS;
 
 /// The register accesses: the operands' reads, the result's write, the
 /// host calls' register reads and the BLAKE2b call.
@@ -90,21 +91,15 @@ pub(super) fn registers(
         );
     }
 
-    // ── blake2b ECALL register reads (φ[7], [8], [9], [10]) ──
-    // 4 extra register-memory producers emitted only at blake2b ECALL
-    // steps.  The actor's a0/a1/a2/a3 map to PVM φ[7/8/9/10].  The
-    // `Column::Phi*` names are slot labels that do not match the register
-    // mapping (h_ptr=Phi10, m_ptr=Phi11, t_low=Phi12, f_flag=Phi7) —
-    // see `ECALL_REG_IDXS` below for the slot-to-register mapping that
-    // aligns with `trace_fill.rs`'s sources.
+    // The BLAKE2b call's register reads, a producer a slot
+    // ([`BLAKE2B_CALL_REGS`]), only at a served call's step.
     let is_blake_ecall = &row.is_blake_ecall;
     let phi7 = &row.phi7;
     let phi10 = &row.phi10;
     let phi11 = &row.phi11;
     let phi12 = &row.phi12;
-    const ECALL_REG_IDXS: [u32; 4] = [10, 7, 8, 9];
     let phi_cols: [_; 4] = [phi7.clone(), phi10.clone(), phi11.clone(), phi12.clone()];
-    for (slot, &reg_idx) in ECALL_REG_IDXS.iter().enumerate() {
+    for (slot, &reg_idx) in BLAKE2B_CALL_REGS.iter().enumerate() {
         let idx_const = PackedBaseField::broadcast(BaseField::from(reg_idx));
         let val_c = phi_cols[slot].clone();
         let ts_c = timestamp.clone();

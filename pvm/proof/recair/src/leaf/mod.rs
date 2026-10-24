@@ -363,7 +363,7 @@ impl LeafCircuit {
         let topology = self.topology();
         let (_, hash) =
             crate::circuit_commitment(&topology.circuit).expect("a leaf's wiring checks");
-        P2Hash(hash.map(|word| BaseField::from(word.value())))
+        P2Hash::from(hash)
     }
 
     /// The values of `proof`, a valid segment proof of its shape, as the

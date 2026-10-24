@@ -288,7 +288,7 @@ impl FoldCircuit {
         let topology = self.topology();
         let (_, hash) =
             crate::circuit_commitment(&topology.circuit).expect("a fold's wiring checks");
-        P2Hash(hash.map(|word| BaseField::from(word.value())))
+        P2Hash::from(hash)
     }
 
     /// [`FoldCircuit::hash`] of the fold circuit over the padded shape,
@@ -350,7 +350,7 @@ impl FoldChild<SecureField> {
         let proof = ChildValues::from_proof(shape, proved.proof)?;
         let root = proved.proof.stark_proof.commitments[0];
         let hash = circuit_hash_of(&proved.proof.log_sizes, &root);
-        let hash = P2Hash(hash.map(|word| BaseField::from(word.value())));
+        let hash = P2Hash::from(hash);
         let choice = program
             .leaf_circuits
             .hashes()

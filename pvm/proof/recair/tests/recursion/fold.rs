@@ -181,7 +181,7 @@ fn refusals(fold: &FoldCircuit, values: &FoldValues<SecureField>) -> Vec<&'stati
 }
 
 fn digest_of(hash: &P2Hash) -> vos_pvm_poseidon2::Digest {
-    hash.0.map(|word| vos_pvm_poseidon2::M31::new(word.0))
+    (*hash).into()
 }
 
 /// The fold of the first two leaves verifies each child as natively,

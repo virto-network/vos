@@ -24,7 +24,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::{CommitmentSchemeProver, ComponentProver, ProvingError};
-use vos_pvm_poseidon2::{Digest, M31};
+use vos_pvm_poseidon2::Digest;
 use vos_pvm_proof::format::{ChannelKind, Format, LEAF_FOLD, ProofKind};
 use vos_pvm_proof::pcs::ProofHash;
 use vos_pvm_proof::poseidon2::{P2Hash, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel};
@@ -129,17 +129,13 @@ pub(crate) fn hashed_params(format: &Format) -> [u32; 6] {
     ]
 }
 
-fn digest_of_root(root: &P2Hash) -> Digest {
-    root.0.map(|limb| M31::from(limb.0))
-}
-
 /// The hash of a circuit whose preprocessed tree has `root`, at `log_sizes`.
 pub fn circuit_hash_of(log_sizes: &LogSizes, root: &P2Hash) -> Digest {
     vos_pvm_recair_air::circuit_hash(
         FORMAT.number,
         hashed_params(FORMAT),
         log_sizes,
-        &digest_of_root(root),
+        &Digest::from(*root),
     )
 }
 

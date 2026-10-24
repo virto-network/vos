@@ -13,6 +13,7 @@ pub mod memory_merkle;
 pub mod memory_page;
 pub mod memory_root_boundary;
 pub mod mul;
+mod ordering;
 pub mod popcount;
 pub mod power_of_two;
 pub mod program_boundary;

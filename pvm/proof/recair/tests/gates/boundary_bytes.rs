@@ -288,7 +288,7 @@ fn finalized(values: &LeafValues<SecureField>) -> vos_pvm_recair::Finalized<Secu
 #[test]
 fn a_forged_boundary_byte_proved_is_refused() {
     let whole = whole();
-    let hash = whole.leaf.hash().0.map(|limb| M31::new(limb.0));
+    let hash = vos_pvm_poseidon2::Digest::from(whole.leaf.hash());
     let forgeries = forgeries();
     let alias = forgeries
         .iter()

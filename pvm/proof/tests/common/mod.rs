@@ -496,7 +496,7 @@ pub fn prove_fold(
         digest_wires(&output.digest()).to_vec(),
         "the fold states the native output"
     );
-    let hash = fold_word.0.map(|word| vos_pvm_poseidon2::M31::new(word.0));
+    let hash = vos_pvm_poseidon2::Digest::from(fold_word);
     vos_pvm_recair::verify(fold_proof.clone(), &hash).expect("the fold verifies");
     NodeRun {
         rows,

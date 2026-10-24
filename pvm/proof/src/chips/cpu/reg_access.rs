@@ -7,6 +7,7 @@
 //! derivation here keeps them in sync.
 
 use super::classify::{classify_opcode, uses_immediate};
+use super::tuples::BLAKE2B_CALL_REGS;
 use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_WITNESS_INPUT};
 #[allow(unused_imports)]
 use alloc::{boxed::Box, vec, vec::Vec};
@@ -149,17 +150,12 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
         None
     };
     let result_write = step.reg_write.map(|idx| (idx as u8, step.regs_after[idx]));
-    // blake2b ECALL reads φ[7], φ[8], φ[9], φ[10] at this step's
-    // ts.  The actor's a0/a1/a2/a3 (h_ptr/m_ptr/
-    // t_low/f_flag) map to PVM φ[7/8/9/10] via grey-transpiler's
-    // `map_register`.  CpuChip's `ECALL_REG_IDXS` (in
-    // `constraints/host_call.rs` and `interaction.rs`) emits register-file
-    // producers at [10, 7, 8, 9] — matching this ledger consumer per blake2b
-    // ECALL step.
+    // A BLAKE2b call reads its registers ([`BLAKE2B_CALL_REGS`]) at this
+    // step's ts, in ascending order here.
     // ECALL register-read ledger consumers.
     // These must match the producers CpuChip emits gated by the matching
     // Is*Ecall column, otherwise the register-memory logup balance breaks.
-    //   blake2b: φ[7,8,9,10] (h_ptr/m_ptr/t_low/f_flag).
+    //   blake2b: φ[7..=10] ([`BLAKE2B_CALL_REGS`]).
     //   witness input: φ[7,8] (destination/capacity), before the step's
     //   write of its count to φ[7].
     // Only a served call reads them (`PvmStep::served_ecall`): for any
@@ -168,12 +164,11 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     let is_blake_ecall = ecall == Some(ECALL_BLAKE2B_COMPRESS as u64);
     let is_witness_ecall = ecall == Some(ECALL_WITNESS_INPUT as u64);
     let ecall_reads = if is_blake_ecall {
-        vec![
-            (7u8, step.regs_before[7]),
-            (8u8, step.regs_before[8]),
-            (9u8, step.regs_before[9]),
-            (10u8, step.regs_before[10]),
-        ]
+        let mut regs = BLAKE2B_CALL_REGS.map(|reg| reg as u8);
+        regs.sort_unstable();
+        regs.iter()
+            .map(|&reg| (reg, step.regs_before[usize::from(reg)]))
+            .collect()
     } else if is_witness_ecall {
         vec![(7u8, step.regs_before[7]), (8u8, step.regs_before[8])]
     } else {

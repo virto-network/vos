@@ -72,6 +72,18 @@ impl core::fmt::Display for P2Hash {
 }
 impl Hash for P2Hash {}
 
+impl From<vos_pvm_poseidon2::Digest> for P2Hash {
+    fn from(digest: vos_pvm_poseidon2::Digest) -> Self {
+        Self(digest.map(base))
+    }
+}
+
+impl From<P2Hash> for vos_pvm_poseidon2::Digest {
+    fn from(hash: P2Hash) -> Self {
+        hash.0.map(word)
+    }
+}
+
 impl P2Hash {
     /// The canonical 32-byte serialization: the 8 M31 limbs as little-endian
     /// `u32`s. Inverse of [`P2Hash::from`] for canonical limbs (`< p`), which is
@@ -125,14 +137,14 @@ impl P2MerkleHasher {
 impl MerkleHasherLifted for P2MerkleHasher {
     type Hash = P2Hash;
     fn hash_children((left, right): (P2Hash, P2Hash)) -> P2Hash {
-        P2Hash(vos_pvm_poseidon2::compress(&left.0.map(word), &right.0.map(word)).map(base))
+        vos_pvm_poseidon2::compress(&left.into(), &right.into()).into()
     }
     fn update_leaf(&mut self, column_values: &[BaseField]) {
         self.sponge
             .absorb(column_values.iter().map(|&value| word(value)));
     }
     fn finalize(self) -> P2Hash {
-        P2Hash(self.sponge.finalize().map(base))
+        self.sponge.finalize().into()
     }
 }
 
@@ -307,7 +319,7 @@ impl MerkleChannel for P2MerkleChannel {
     type C = Poseidon2M31Channel;
     type H = P2MerkleHasher;
     fn mix_root(channel: &mut Self::C, root: <Self::H as MerkleHasherLifted>::Hash) {
-        channel.absorb(&root.0.map(word));
+        channel.absorb(&vos_pvm_poseidon2::Digest::from(root));
     }
 }
 

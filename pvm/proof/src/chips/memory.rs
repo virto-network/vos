@@ -36,11 +36,6 @@ use crate::{framework::BuiltInComponent, lookups::MemoryAccessLookupElements};
 /// must return the value from the last write.
 pub struct MemoryChip;
 
-/// Ordering deltas must fit below this bit width. Twenty-eight bits cover the
-/// canonical actor-proof budget (<100M steps) while staying far enough below
-/// the M31 modulus to reject a field-wrapped negative as an alleged positive.
-const ORDER_DELTA_BITS: usize = 28;
-
 /// Byte-level memory model: each row is a single byte access.
 /// Multi-byte accesses are decomposed into N byte entries.
 #[derive(Debug, Copy, Clone, AirColumn)]
@@ -300,13 +295,7 @@ impl BuiltInComponent for MemoryChip {
         let order_delta = is_same_addr[0].clone() * key_diff
             + adv_lo[0].clone() * (lo_diff - E::F::one())
             + adv_hi[0].clone() * (hi_diff - E::F::one());
-        let mut recomposed = E::F::zero();
-        let mut pow2 = E::F::one();
-        for bit in &order_bits {
-            eval.add_constraint(bit.clone() * (bit.clone() - E::F::one()));
-            recomposed += bit.clone() * pow2.clone();
-            pow2 *= two.clone();
-        }
+        let recomposed = super::ordering::recompose(eval, &order_bits, two.clone());
         eval.add_constraint(recomposed - order_delta);
 
         // Cross-row value binding: same-address ⇒ the next row's prev_value
@@ -627,12 +616,7 @@ impl BuiltInProverComponent for MemoryChip {
             } else {
                 0
             };
-            assert!(
-                order_delta < (1u64 << ORDER_DELTA_BITS),
-                "memory ordering delta {order_delta} exceeds the {ORDER_DELTA_BITS}-bit proof bound"
-            );
-            let bits: [BaseField; ORDER_DELTA_BITS] =
-                core::array::from_fn(|b| BaseField::from(((order_delta >> b) & 1) as u32));
+            let bits = super::ordering::bits("memory", order_delta);
             trace.fill_columns_base_field(row, &bits, Column::OrderBits);
         }
 
