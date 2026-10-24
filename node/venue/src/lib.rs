@@ -195,8 +195,11 @@ pub enum AnchorRefusal {
     Open,
     /// The window's boundary is older than `MaxRootAge`.
     Age,
-    /// Another root of the space's kind at the window is anchored: this
-    /// one is kept as evidence, and the space is suspended.
+    /// Another root of the space's kind at the window is anchored, signed
+    /// by a listed key: this one is the equivocation's evidence, which
+    /// suspends the space, and the window's root never counts again. A
+    /// client that finds the venue holding another root sends its node's
+    /// anchor all the same, as that evidence.
     Equivocation,
 }
 

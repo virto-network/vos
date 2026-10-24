@@ -22,12 +22,12 @@ use crate::{NotAccepted, Unjudged};
 const POOL_BACKOFF: Duration = Duration::from_secs(30);
 
 impl Shared {
-    /// Whether the venue holds `anchor`'s root at its window.
-    fn holds(&self, anchor: &Anchor) -> Result<bool, Lost> {
+    /// The root the venue holds anchored of `anchor`'s space and kind at
+    /// its window: none for a window it never anchored, or whose anchor it
+    /// dropped (aged, or disputed by an equivocation).
+    pub(super) fn venue_root(&self, anchor: &Anchor) -> Result<Option<[u8; 32]>, Lost> {
         let key = keys::anchors(&anchor.space.0, anchor.kind as u8, anchor.window);
-        Ok(self
-            .read::<AnchorRecord>(&key)?
-            .is_some_and(|record| record.root == anchor.root))
+        Ok(self.read::<AnchorRecord>(&key)?.map(|record| record.root))
     }
 
     /// Send `anchor`, when the venue would take it.
@@ -48,19 +48,38 @@ impl Shared {
     }
 
     /// Whether `anchor` goes now, by the client's last read at the venue's
-    /// time `now`: its space and its window's boundary, or its fate.
+    /// time `now`: its space and its window's boundary, or its fate. An
+    /// anchor that landed with its answer lost, or of a window at or before
+    /// the space's last anchored, is checked against the root the venue
+    /// holds there: the same is done, none behind the last is a window the
+    /// venue never takes, and another root is an equivocation by a listed
+    /// key, which this anchor goes as evidence of once the space is active
+    /// and anchors are not paused.
     fn ready(&self, anchor: &Anchor, now: u64) -> Result<(SpaceInfo, u64), Fate> {
         let wait = Fate::Again(self.options.refresh);
         let (space, window) = (anchor.space, anchor.window);
         let key = (space, window);
-        let landed = self.state().landed.contains(&key);
-        if landed {
-            match self.holds(anchor) {
-                Ok(true) => {
+        let (landed, behind) = {
+            let state = self.state();
+            let last = state.spaces.get(&space).and_then(|known| known.last);
+            (
+                state.landed.contains(&key),
+                last.is_some_and(|last| window <= last),
+            )
+        };
+        let mut evidence = false;
+        if landed || behind {
+            match self.venue_root(anchor) {
+                Ok(Some(root)) if root == anchor.root => {
                     self.state().held(anchor);
                     return Err(Fate::Done);
                 }
-                Ok(false) => {}
+                Ok(Some(_)) => evidence = true,
+                Ok(None) if behind => {
+                    self.state().forget(key);
+                    return Err(Fate::Done);
+                }
+                Ok(None) => {}
                 Err(_) => return Err(wait),
             }
         }
@@ -68,7 +87,6 @@ impl Shared {
         let paused = state.paused & PAUSED_ANCHOR != 0;
         let known = state.spaces.get(&space);
         let listed = known.is_some_and(|known| known.keys.contains(&anchor.signer));
-        let last = known.and_then(|known| known.last);
         let Some(info) = known.and_then(|known| known.info) else {
             let what = "the space is not registered".to_string();
             state.alert(Alert::Configuration { space, what });
@@ -91,9 +109,12 @@ impl Shared {
             });
             return Err(Fate::Dead);
         }
-        if last.is_some_and(|last| window < last) {
-            state.forget(key);
-            return Err(Fate::Done);
+        if evidence {
+            state.alert(Alert::Equivocation { space, window });
+            if paused || info.status != SpaceStatus::Active {
+                return Err(wait);
+            }
+            return Ok((info, clock.boundary(window).unwrap_or(u64::MAX)));
         }
         let closed = clock.window(now).is_some_and(|open| window < open);
         let later = state.later.get(&key).is_some_and(|at| now < *at);

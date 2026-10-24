@@ -11,6 +11,11 @@
 //! Every call is signed by the node's one account, one at a time
 //! ([`Sender`]).
 //!
+//! An anchor of a window at or before the space's last anchored is checked
+//! against the root the venue holds there: another root is an equivocation
+//! by a listed key, and this node's anchor is sent all the same, as its
+//! evidence, which suspends the space; an alert.
+//!
 //! An anchor is never sent for a window the venue's clock has not closed
 //! (`w < now_w` by `Timestamp.Now`), nor while the space is not active or
 //! anchors are paused: each failed `anchor` is a fee the space's sovereign
@@ -89,8 +94,11 @@ pub enum Alert {
         window: u64,
         error: Error,
     },
-    /// An anchor recorded an equivocation: the space is suspended until
-    /// its controller removes both keys and resumes it.
+    /// The venue holds another root of the space at a window than this
+    /// node's anchor: a listed anchor key signed it. This node's anchor
+    /// goes as the equivocation's evidence, which suspends the space until
+    /// its controller removes both keys and resumes it; the window's root
+    /// never counts again.
     Equivocation { space: SpaceId, window: u64 },
     /// The node's configuration at the venue: the space unknown or not
     /// active, this node not its authority, the pallet paused, a key or a
@@ -274,6 +282,38 @@ impl KreivoVenue {
     /// The anchors queued, not yet settled at the venue.
     pub fn queued(&self) -> usize {
         self.queue.len()
+    }
+
+    /// An anchor of a window at or before the space's last anchored, by
+    /// the root the venue holds there: the same `Again`; none, a window
+    /// the venue never anchored or no longer counts, `Window`; another, an
+    /// equivocation by a listed key: this node's anchor goes as its
+    /// evidence, which suspends the space, and an alert. Queued while the
+    /// venue cannot be read: the queue's worker reads it.
+    fn behind(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
+        let (space, window) = (anchor.space, anchor.window);
+        let settled = |answer| {
+            self.queue.settle(&space, window);
+            answer
+        };
+        match self.shared.venue_root(anchor) {
+            Ok(Some(root)) if root == anchor.root => {
+                self.shared.state().held(anchor);
+                settled(Ok(Anchored::Again))
+            }
+            Ok(Some(_)) => {
+                self.shared
+                    .state()
+                    .alert(Alert::Equivocation { space, window });
+                self.queue.push_listed(anchor);
+                Err(AnchorRefusal::Equivocation)
+            }
+            Ok(None) => settled(Err(AnchorRefusal::Window)),
+            Err(_) => {
+                self.queue.push_listed(anchor);
+                Ok(Anchored::Queued)
+            }
+        }
     }
 }
 
@@ -474,10 +514,11 @@ impl VenueClient for KreivoVenue {
             answer
         };
         if known.last.is_some_and(|last| window <= last) {
-            return settled(match known.held.get(&window) {
-                Some(root) if *root == anchor.root => Ok(Anchored::Again),
-                _ => Err(AnchorRefusal::Window),
-            });
+            if known.held.get(&window) == Some(&anchor.root) {
+                return settled(Ok(Anchored::Again));
+            }
+            drop(state);
+            return self.behind(anchor);
         }
         if !info.holds(window) || self.queue.dead(&anchor.space, window) {
             return settled(Err(AnchorRefusal::Window));

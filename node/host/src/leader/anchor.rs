@@ -362,6 +362,19 @@ impl Leader {
                 );
                 false
             }
+            Err(AnchorRefusal::Equivocation) => {
+                tracing::error!(
+                    window,
+                    "the venue holds another root of the space at this window, signed by a \
+                     listed anchor key: that key is compromised or its node faulty. This node's \
+                     anchor goes as the evidence, which suspends the space; its controller \
+                     removes both signing keys (this node's too: `vos node anchor-key rotate`, \
+                     then `add_authority`) and resumes it, and the window's root never counts \
+                     again"
+                );
+                self.anchoring.refused.insert(window);
+                true
+            }
             Err(refusal) => {
                 tracing::error!(window, ?refusal, "the venue refused the space's root");
                 self.anchoring.refused.insert(window);

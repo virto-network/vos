@@ -3,8 +3,8 @@
 //! item a work package's: a proof read from a 256 KiB extrinsic; every
 //! golden fixture judged as every venue judges it; registrations, anchors
 //! (an unregistered key, an equivocation, a resume that never restores a
-//! disputed root), migrations; and the rows aging
-//! out past `MaxRootAge`, a rootless statement's `Seen` entry never.
+//! disputed root), migrations; and the rows aging out past `MaxRootAge`, a
+//! rootless statement's `Seen` entry never.
 
 #[path = "../../../tests/support/jam.rs"]
 mod jam;

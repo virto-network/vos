@@ -226,12 +226,121 @@ fn an_anchor_is_taken_at_once_and_lands() {
     }));
     assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Again));
     assert_eq!(
-        venue.anchor(&setup.anchor(5, 2)),
-        Err(AnchorRefusal::Window)
+        venue.anchor(&setup.anchor(4, 1)),
+        Err(AnchorRefusal::Window),
+        "a window behind the last, never anchored"
     );
     assert_eq!(venue.anchor(&setup.anchor(6, 1)), Err(AnchorRefusal::Open));
     assert_eq!(setup.anchors_sent(), 1);
     assert!(venue.alerts().is_empty(), "{:?}", venue.alerts());
+}
+
+/// A second anchor key the space lists, stolen: the attacker's account,
+/// its authority, anchors window 5's root `[9; 32]` before the node.
+const ATTACKER: [u8; 32] = [0x66; 32];
+
+impl Setup {
+    fn stolen(&self) -> SigningKey {
+        let stolen = SigningKey::from_bytes(&[0x66; 32]);
+        self.call(
+            CONTROLLER,
+            Call::AddAuthority {
+                space: self.space.0,
+                who: ATTACKER,
+                anchor_key: Some(stolen.verifying_key().to_bytes()),
+            },
+        );
+        stolen
+    }
+
+    /// The attacker's anchor of window 5, dispatched on the chain.
+    fn attack(&self, chain: &mut Chain, stolen: &SigningKey) {
+        let mut anchor = Anchor {
+            signer: stolen.verifying_key().to_bytes(),
+            ..self.anchor(5, 9)
+        };
+        anchor.signature = stolen.sign(&anchor.digest(&VENUE)).to_bytes();
+        let outcome = chain.submit(Origin::Signed(ATTACKER), &Call::anchor(&anchor).bytes());
+        assert!(
+            outcome.events.iter().any(|event| matches!(
+                event,
+                super::mock::types::Event::Anchored { window: 5, .. }
+            )),
+            "{outcome:?}"
+        );
+    }
+
+    /// The node's anchor of window 5 made the equivocation's evidence: the
+    /// space suspended, the evidence naming the attacker's key first and
+    /// the node's second, the window's root no longer held, the client
+    /// alerting.
+    fn evidence_lands(&self, venue: &KreivoVenue, stolen: &SigningKey) {
+        wait_until("the evidence suspends the space", || {
+            venue.status(&self.space) == Status::Suspended
+        });
+        let evidence = self.chain.with(|chain| {
+            chain
+                .storage()
+                .get(&keys::equivocations(&self.space.0, 0, 5))
+                .cloned()
+        });
+        let evidence: super::mock::types::Evidence =
+            calls::read(&evidence.expect("the evidence")).unwrap();
+        assert_eq!(evidence.first_signer, stolen.verifying_key().to_bytes());
+        assert_eq!(evidence.second_signer, self.key.verifying_key().to_bytes());
+        assert_eq!((evidence.first, evidence.second), ([9; 32], [1; 32]));
+        assert!(!self.anchored_window(5), "the disputed root dropped");
+        assert_eq!(self.anchors_sent(), 1);
+        assert!(
+            venue.alerts().contains(&Alert::Equivocation {
+                space: self.space,
+                window: 5
+            }),
+            "{:?}",
+            venue.alerts()
+        );
+    }
+}
+
+/// A listed key stolen anchors another root first, and the client has
+/// read it: the node's anchor is answered `Equivocation` at once and sent
+/// as the evidence, which suspends the space.
+#[test]
+fn an_anchor_over_another_root_goes_as_evidence() {
+    let setup = Setup::new(false);
+    let stolen = setup.stolen();
+    setup.chain.with(|chain| setup.attack(chain, &stolen));
+    let venue = setup.venue();
+    assert_eq!(
+        venue.anchor(&setup.anchor(5, 1)),
+        Err(AnchorRefusal::Equivocation)
+    );
+    setup.evidence_lands(&venue, &stolen);
+    assert_eq!(
+        venue.anchor(&setup.anchor(5, 1)),
+        Err(AnchorRefusal::Suspended)
+    );
+}
+
+/// A listed key stolen anchors another root after the node's anchor was
+/// queued, before it went: the queue's worker finds the venue holding the
+/// other root and sends the node's as the evidence.
+#[test]
+fn a_queued_anchor_overtaken_goes_as_evidence() {
+    let setup = Setup::new(false);
+    let stolen = setup.stolen();
+    let venue = setup.venue();
+    setup
+        .chain
+        .with(|chain| chain.set_storage(keys::paused(), vec![2]));
+    read_again(&venue);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    setup.chain.with(|chain| {
+        chain.set_storage(keys::paused(), vec![0]);
+        setup.attack(chain, &stolen);
+    });
+    setup.evidence_lands(&venue, &stolen);
+    wait_until("the queue empties", || venue.queued() == 0);
 }
 
 /// An anchor for the venue's open window is not taken; once the venue's
