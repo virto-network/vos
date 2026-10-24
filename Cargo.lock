@@ -2947,6 +2947,7 @@ dependencies = [
 name = "vos-statement"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "vos-anchor",
  "vos-pvm",
  "vos-pvm-compiler",

@@ -242,10 +242,7 @@ fn an_anchor_key_is_rotated_on_a_stopped_node() {
         .iter()
         .map(|(_, seed)| {
             let key = ed25519_dalek::SigningKey::from_bytes(&seed.unwrap()).verifying_key();
-            key.to_bytes()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect()
+            hex::encode(key.to_bytes())
         })
         .collect();
     assert_eq!(made, [first, second]);

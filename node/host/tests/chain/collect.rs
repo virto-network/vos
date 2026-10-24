@@ -26,7 +26,7 @@ use vos_wire::result::digest;
 use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
 
 use crate::run::{CANARY, Jam, Run, Stated};
-use crate::venues::{REPORTED, hex};
+use crate::venues::REPORTED;
 
 /// What each node holds and sent, and both venues' anchor chains,
 /// collected before the nodes stop and the chain's clock moves; then the
@@ -210,7 +210,7 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
             .expect("the statement's work report");
     audit.assert_captured("the testnet's chain", &statement.encode());
     audit.assert_captured("the testnet's chain", report);
-    let named = format!("0x{}", &hex(&digest(report))[..16]);
+    let named = format!("0x{}", &hex::encode(digest(report))[..16]);
     audit.assert_captured("the testnet's log", named.as_bytes());
 
     audit.assert_searchable(&Kind::ALL);

@@ -61,7 +61,7 @@ impl Node {
         batch.incarnation(incarnation);
         batch.commit(PersistMode::SyncAll)?;
         let node_id = NodeId(SigningKey::from_bytes(&secret).verifying_key().to_bytes());
-        let hex = crate::hex(&node_id.0);
+        let hex = hex::encode(node_id.0);
         std::fs::write(data.join(NODE_KEY), &hex)
             .map_err(|error| Error::Data(error.to_string()))?;
         let number = match &config.space {
@@ -422,7 +422,7 @@ fn collect_blobs(inner: &Inner, stopped: &mpsc::Receiver<()>) {
 pub(super) fn write_token(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
-    let hex = crate::hex(token);
+    let hex = hex::encode(token);
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

@@ -13,19 +13,15 @@ fn audit(reach: Reach, bytes: &[u8], needle: Needle) -> Vec<Finding> {
     audit.findings()
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 #[test]
 fn a_needle_is_found_in_each_of_its_forms() {
     let secret: Vec<u8> = (1..=16).collect();
     let needle = || Needle::bytes(Kind::ServedRow, "secret", &secret).unwrap();
     for carrier in [
         [b"x".as_slice(), &secret, b"y"].concat(),
-        format!("value={}", hex(&secret)).into_bytes(),
-        format!("value={}", hex(&secret).to_uppercase()).into_bytes(),
-        format!("value={}…", &hex(&secret)[..16]).into_bytes(),
+        format!("value={}", hex::encode(&secret)).into_bytes(),
+        format!("value={}", hex::encode(&secret).to_uppercase()).into_bytes(),
+        format!("value={}…", &hex::encode(&secret)[..16]).into_bytes(),
         format!("value={secret:?}").into_bytes(),
     ] {
         assert_eq!(audit(Reach::Leaves, &carrier, needle()).len(), 1);
@@ -73,7 +69,7 @@ fn a_venues_record_is_searched_in_full_forms_alone() {
     let secret: Vec<u8> = (1..=16).collect();
     let needle = || Needle::bytes(Kind::ServedRow, "secret", &secret).unwrap();
     assert_eq!(audit(Reach::Recorded, &secret, needle()).len(), 1);
-    let prefix = format!("hash={}…", &hex(&secret)[..16]).into_bytes();
+    let prefix = format!("hash={}…", &hex::encode(&secret)[..16]).into_bytes();
     assert!(audit(Reach::Recorded, &prefix, needle()).is_empty());
     let steps = || Needle::number(Kind::StepCount, "steps", 123_457);
     assert!(audit(Reach::Recorded, b"conn_id=123457", steps()).is_empty());
@@ -81,7 +77,7 @@ fn a_venues_record_is_searched_in_full_forms_alone() {
     let root: Vec<u8> = (100..132).collect();
     let proof = Needle::bytes(Kind::NodeProof, "root", &root).unwrap();
     assert_eq!(
-        audit(Reach::Recorded, &hex(&root).into_bytes(), proof).len(),
+        audit(Reach::Recorded, &hex::encode(&root).into_bytes(), proof).len(),
         1
     );
 }

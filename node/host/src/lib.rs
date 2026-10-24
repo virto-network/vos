@@ -96,11 +96,6 @@ pub(crate) fn hex32(text: &str) -> Option<[u8; 32]> {
     Some(out)
 }
 
-/// `bytes` in lowercase hex.
-pub(crate) fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 /// Raise `key`'s value in `map` to `value`, if that is higher.
 pub(crate) fn raise<K: Eq + Hash>(map: &mut HashMap<K, u64>, key: K, value: u64) {
     let raised = map.entry(key).or_insert(value);

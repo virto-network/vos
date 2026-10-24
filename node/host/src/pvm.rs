@@ -103,7 +103,7 @@ impl AgentPrograms {
         if program.is_none() {
             tracing::warn!(
                 agent = self.agent.0,
-                program = %crate::hex(&hash[..4]),
+                program = %hex::encode(&hash[..4]),
                 "a program of the agent's is not stored"
             );
         }

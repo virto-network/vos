@@ -34,7 +34,7 @@ use crate::kernels::Kernels;
 use crate::kreivo::{self, Kreivo};
 use crate::record::Record;
 use crate::support::{attests, delay, replica};
-use crate::venues::{Judgement, Migrating, Recorded, Serial, Wire, hex};
+use crate::venues::{Judgement, Migrating, Recorded, Serial, Wire};
 use crate::{collect, measure};
 
 /// The space's windows: the shortest a venue registers.
@@ -180,7 +180,7 @@ impl Run {
                 "JAM service {}: id {}, venue {}",
                 jam.name,
                 jam.venue.statements.service,
-                hex(&jam.venue.id().0)
+                hex::encode(jam.venue.id().0)
             ));
         }
         let kreivo = Arc::new(Kreivo::new(&[
@@ -239,7 +239,7 @@ impl Run {
         let genesis = cluster.space.genesis().unwrap().clone();
         record.note(format!(
             "the space {}: windows of {} s from {}, D {} s, three nodes",
-            hex(&space.0[..8]),
+            hex::encode(&space.0[..8]),
             LENGTH_MS / 1_000,
             clock.origin_ms,
             delay(&clock) / 1_000
@@ -434,7 +434,7 @@ impl Run {
                 stated.asked.what,
                 stated.asked.window,
                 stated.statement.format,
-                hex(&stated.statement.id().0[..8])
+                hex::encode(&stated.statement.id().0[..8])
             ));
         }
 
@@ -542,7 +542,10 @@ impl Run {
                 };
                 let outcome = jam.judged(statement).expect("an outcome kept");
                 (
-                    format!("JAM {name}, statement {}", hex(&statement.id().0[..8])),
+                    format!(
+                        "JAM {name}, statement {}",
+                        hex::encode(&statement.id().0[..8])
+                    ),
                     outcome,
                 )
             })

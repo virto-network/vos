@@ -91,10 +91,6 @@ fn distinct(bytes: &[u8]) -> usize {
         .len()
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
-}
-
 /// `values` as `Debug` lists them, without the brackets.
 fn listed<T: fmt::Display>(values: &[T]) -> Vec<u8> {
     values
@@ -120,7 +116,7 @@ impl Needle {
         if bytes.len() < SHORTEST || distinct(bytes) < DISTINCT {
             return None;
         }
-        let lower = hex(bytes);
+        let lower = hex::encode(bytes);
         let upper = lower.to_uppercase();
         let mut leaving = Vec::new();
         if bytes.len() > 8 {
@@ -204,7 +200,7 @@ impl Needle {
             kind: Kind::Register,
             name: name.into(),
             forms: vec![bytes.clone(), listed(values)],
-            leaving: vec![hex(&bytes).into_bytes()],
+            leaving: vec![hex::encode(&bytes).into_bytes()],
             value: None,
         }
     }

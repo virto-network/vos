@@ -48,6 +48,8 @@ vos-pvm-final-verifier = { workspace = true }
 vos-anchor = { workspace = true }
 
 [dev-dependencies]
+# The anchor vectors' reports, in hex.
+hex = "0.4"
 # The tests judge format 28's fixtures beside 39's.
 vos-pvm-final-verifier = { workspace = true, features = ["test-formats"] }
 # The io-hash a kernel computes, which a statement's must equal.

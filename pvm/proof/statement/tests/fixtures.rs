@@ -181,7 +181,6 @@ fn a_proof_too_long_is_refused_before_its_lookup() {
 #[test]
 fn the_anchor_vectors_are_computed_on_the_jam_only_host_as_pinned() {
     let (program, _) = jam::program();
-    let hex = |bytes: &[u8]| -> String { bytes.iter().map(|byte| format!("{byte:02x}")).collect() };
     for golden in vectors::golden() {
         let vector = golden.vector.encode();
         let (gas, report) = jam::run_payload(&program, jam::anchors_request(&vector), None);
@@ -193,7 +192,12 @@ fn the_anchor_vectors_are_computed_on_the_jam_only_host_as_pinned() {
             golden.name,
             report.error
         );
-        assert_eq!(hex(&report.digests), golden.digests, "{}", golden.name);
+        assert_eq!(
+            hex::encode(&report.digests),
+            golden.digests,
+            "{}",
+            golden.name
+        );
         assert_eq!(report.digests, golden.vector.digests().to_bytes());
 
         let short = jam::anchors_request(&vector[..vector.len() - 1]);

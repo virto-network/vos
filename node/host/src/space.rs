@@ -382,11 +382,7 @@ mod tests {
         std::fs::write(&path, format!("1 {} 10.0.0.1:7800 x\n", "01".repeat(32))).unwrap();
         let space = Space::read(&path).unwrap();
         let genesis = space.found(WindowClock::DEFAULT, 0, [0; 16]).unwrap();
-        let hex: String = genesis
-            .encode()
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect();
+        let hex = hex::encode(genesis.encode());
         for bad in [
             "zz".to_string(),
             hex[..hex.len() - 2].to_string(),

@@ -382,7 +382,7 @@ fn rotate_and_kill(data: &Path) -> [u8; 32] {
 fn a_rotation_survives_its_crash() {
     if let Some(data) = std::env::var_os(ROTATING) {
         let key = vos_node::rotate_anchor_key(Path::new(&data)).unwrap();
-        let hex: String = key.iter().map(|byte| format!("{byte:02x}")).collect();
+        let hex = hex::encode(key);
         let mut out = std::io::stdout();
         writeln!(out, "{MADE}{hex}").unwrap();
         out.flush().unwrap();
