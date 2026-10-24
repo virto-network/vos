@@ -3955,9 +3955,15 @@ every verdict as expected, the audit clean over 326 carriers and 22 JAM
 packages, the storage of JAM a (53 entries, 14 outcomes) and JAM b (11,
 3) each as many as named from the packages watched, the run 1,145 s.
 
+The re-check's gates [measured, at `66fca808`]: `just check` green, 108
+suites, 1,383 passed, 0 failed; `just e2e-chain` green, every verdict as
+expected, the audit clean over 326 carriers and 22 JAM packages, the
+storage of JAM a (53 entries) and JAM b (11) as many as named, 1,145 s.
+
 Commits: `dd06e6af` (the JAM client as dev tooling, decision 17),
 `e579a484` (the fold), `3ecea8b3` (its gates), `f0395555` (the review's
-fold), this record.
+fold), `2ad9b9e6` (its gates), `66fca808` (the re-check's fold), this
+record.
 
 ## The JAM client as development tooling (decision 17)
 
