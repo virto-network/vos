@@ -47,9 +47,12 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use perf_event::Counter;
+use perf_event::events::Hardware;
 use sc_allocator::{FreeingBumpHeapAllocator, Memory as AllocatorMemory};
 use wasmtime::{
-    Config, Engine, Extern, Instance, Linker, Memory, MemoryType, Module, OptLevel, Store, Val,
+    AsContextMut, Config, Engine, Extern, Instance, Linker, Memory, MemoryType, Module, OptLevel,
+    Store, TypedFunc, Val,
 };
 
 const PAGE: u64 = 65536;
@@ -63,6 +66,27 @@ const CLIENT_EXTRA_PAGES: u32 = 2048;
 enum Semantics {
     Client,
     Pvf,
+}
+
+impl std::str::FromStr for Semantics {
+    type Err = anyhow::Error;
+
+    fn from_str(name: &str) -> Result<Self> {
+        match name {
+            "client" => Ok(Self::Client),
+            "pvf" => Ok(Self::Pvf),
+            other => bail!("unknown semantics {other}"),
+        }
+    }
+}
+
+impl Semantics {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Pvf => "pvf",
+        }
+    }
 }
 
 struct State {
@@ -218,8 +242,6 @@ fn linker(engine: &Engine) -> Result<Linker<State>> {
     Ok(linker)
 }
 
-use wasmtime::AsContextMut;
-
 /// A fresh instance with its imported memory and allocator.
 fn instantiate(
     engine: &Engine,
@@ -287,45 +309,114 @@ fn median(mut values: Vec<Duration>) -> Duration {
     values[values.len() / 2]
 }
 
-fn run(args: &[String]) -> Result<()> {
-    let [blob, semantics, runs, proofs @ ..] = args else {
-        bail!("usage: <verifier.wasm> <client|pvf> <runs|judge|anchors|statements> <file>...");
-    };
-    let semantics = match semantics.as_str() {
-        "client" => Semantics::Client,
-        "pvf" => Semantics::Pvf,
-        other => bail!("unknown semantics {other}"),
-    };
-    let blob = std::fs::read(blob)?;
-    let prepared = prepare(&blob, semantics)?;
-    let engine = engine(semantics)?;
-    let start = Instant::now();
-    let module = Module::new(&engine, &prepared)?;
-    println!(
-        "blob {} B (prepared {} B), compiled in {:.2?}",
-        blob.len(),
-        prepared.len(),
-        start.elapsed()
-    );
-    let linker = linker(&engine)?;
-    // A judgement's instructions, where the kernel lets this thread count
-    // its own (`perf_event_paranoid` at most 2); the verdicts without.
-    let judged = |name: &str, input: &[u8]| -> Result<(u32, Option<u64>, String)> {
-        let (mut store, instance, memory) = instantiate(&engine, &module, &linker, semantics)?;
-        let call = instance.get_typed_func::<(u32, u32), u32>(&mut store, "judge")?;
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// A counter of this thread's user-mode `event`s.
+fn counter(event: Hardware) -> std::io::Result<Counter> {
+    perf_event::Builder::new(event)
+        .observe_self()
+        .exclude_kernel(true)
+        .exclude_hv(true)
+        .build()
+}
+
+/// The blob compiled under its semantics, instantiated afresh per call.
+struct Runner {
+    engine: Engine,
+    module: Module,
+    linker: Linker<State>,
+    semantics: Semantics,
+}
+
+/// A fresh instance, its input written, before its call of an export.
+struct Call {
+    store: Store<State>,
+    instance: Instance,
+    memory: Memory,
+    export: TypedFunc<(u32, u32), u32>,
+    ptr: u32,
+    len: u32,
+}
+
+impl Call {
+    /// `instance`'s `export`, `input` written for it.
+    fn new(
+        (mut store, instance, memory): (Store<State>, Instance, Memory),
+        export: &str,
+        input: &[u8],
+    ) -> Result<Self> {
+        let export = instance.get_typed_func::<(u32, u32), u32>(&mut store, export)?;
         let ptr = write_input(&mut store, memory, input)?;
-        let mut instructions = perf_event::Builder::new(perf_event::events::Hardware::INSTRUCTIONS)
-            .observe_self()
-            .exclude_kernel(true)
-            .exclude_hv(true)
-            .build()
-            .ok();
+        Ok(Self {
+            store,
+            instance,
+            memory,
+            export,
+            ptr,
+            len: input.len() as u32,
+        })
+    }
+
+    fn run(&mut self) -> Result<u32> {
+        self.export.call(&mut self.store, (self.ptr, self.len))
+    }
+
+    /// The `len` bytes at the address `export` returns.
+    fn output(&mut self, export: &str, len: usize) -> Result<Vec<u8>> {
+        let at = self
+            .instance
+            .get_typed_func::<(), u32>(&mut self.store, export)?
+            .call(&mut self.store, ())?;
+        let mut bytes = vec![0u8; len];
+        self.memory.read(&self.store, at as usize, &mut bytes)?;
+        Ok(bytes)
+    }
+}
+
+impl Runner {
+    /// The blob at `path`, prepared and compiled under `semantics`.
+    fn new(path: &str, semantics: Semantics) -> Result<Self> {
+        let blob = std::fs::read(path)?;
+        let prepared = prepare(&blob, semantics)?;
+        let engine = engine(semantics)?;
+        let start = Instant::now();
+        let module = Module::new(&engine, &prepared)?;
+        println!(
+            "blob {} B (prepared {} B), compiled in {:.2?}",
+            blob.len(),
+            prepared.len(),
+            start.elapsed()
+        );
+        let linker = linker(&engine)?;
+        Ok(Self {
+            engine,
+            module,
+            linker,
+            semantics,
+        })
+    }
+
+    fn instantiate(&self) -> Result<(Store<State>, Instance, Memory)> {
+        instantiate(&self.engine, &self.module, &self.linker, self.semantics)
+    }
+
+    /// A fresh instance's `export`, `input` written for it.
+    fn call(&self, export: &str, input: &[u8]) -> Result<Call> {
+        Call::new(self.instantiate()?, export, input)
+    }
+
+    /// A judgement's code, its instructions where the kernel lets this
+    /// thread count its own (`perf_event_paranoid` at most 2), and the
+    /// statement id it accepted.
+    fn judged(&self, name: &str, input: &[u8]) -> Result<(u32, Option<u64>, String)> {
+        let mut call = self.call("judge", input)?;
+        let mut instructions = counter(Hardware::INSTRUCTIONS).ok();
         if let Some(counter) = &mut instructions {
             counter.enable()?;
         }
-        let code = call
-            .call(&mut store, (ptr, input.len() as u32))
-            .with_context(|| format!("{name}: the call"))?;
+        let code = call.run().with_context(|| format!("{name}: the call"))?;
         let instructions = match &mut instructions {
             Some(counter) => {
                 counter.disable()?;
@@ -335,200 +426,201 @@ fn run(args: &[String]) -> Result<()> {
         };
         let mut id = String::new();
         if code == 0 {
-            let at = instance
-                .get_typed_func::<(), u32>(&mut store, "statement_id")?
-                .call(&mut store, ())?;
-            let mut bytes = [0u8; 32];
-            memory.read(&store, at as usize, &mut bytes)?;
-            id = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+            id = hex(&call.output("statement_id", 32)?);
         }
         Ok((code, instructions, id))
+    }
+
+    /// Every golden fixture under `directory` judged, each verdict the one
+    /// a build linking `formats` reaches.
+    fn judge(&self, directory: &str, formats: &str) -> Result<()> {
+        let linked = formats
+            .split(',')
+            .map(str::parse)
+            .collect::<Result<Vec<u32>, _>>()
+            .context("the formats, comma-separated")?;
+        let fixtures = vos_statement::fixtures::load(std::path::Path::new(directory));
+        let mut differ = 0;
+        for fixture in &fixtures {
+            let expected = fixture.verdict_linking(&linked);
+            let (code, instructions, id) = self.judged(&fixture.name, &fixture.bytes())?;
+            println!(
+                "JUDGE fixture={:?} expected={expected:#x} code={code:#x} instructions={} id={id}",
+                fixture.name,
+                count(instructions),
+            );
+            differ += usize::from(code != expected);
+        }
+        if differ > 0 {
+            bail!("{differ} of {} fixtures judged otherwise", fixtures.len());
+        }
+        println!(
+            "{} fixtures judged as recorded, linking {linked:?}",
+            fixtures.len()
+        );
+        Ok(())
+    }
+
+    /// `input`'s anchor digests, `None` when the blob refuses it.
+    fn digests(&self, input: &[u8]) -> Result<Option<Vec<u8>>> {
+        let mut call = self.call("anchor_digests", input)?;
+        if call.run()? != 1 {
+            return Ok(None);
+        }
+        Ok(Some(call.output(
+            "digests",
+            vos_statement::vos_anchor::vectors::Digests::BYTES,
+        )?))
+    }
+
+    /// Every golden anchor vector's digests the pinned ones, and the vector
+    /// cut short refused.
+    fn anchors(&self) -> Result<()> {
+        let vectors = vos_statement::vos_anchor::vectors::golden();
+        for golden in &vectors {
+            let encoded = golden.vector.encode();
+            let digests = self
+                .digests(&encoded)?
+                .with_context(|| format!("{}: the vector refused", golden.name))?;
+            println!("ANCHORS vector={:?} digests={}", golden.name, hex(&digests));
+            if hex(&digests) != golden.digests {
+                bail!(
+                    "{}: digests {} not the pinned {}",
+                    golden.name,
+                    hex(&digests),
+                    golden.digests
+                );
+            }
+            if self.digests(&encoded[..encoded.len() - 1])?.is_some() {
+                bail!("{}: a vector cut short decoded", golden.name);
+            }
+        }
+        println!("{} vectors computed as pinned", vectors.len());
+        Ok(())
+    }
+
+    /// Each judgement's input at `paths`, beside its proof, accepted.
+    fn statements(&self, paths: &[String]) -> Result<()> {
+        for path in paths {
+            let input = std::fs::read(path)?;
+            let proof = std::fs::read(path.replace(".input", ".proof"))?;
+            let (code, instructions, id) = self.judged(path, &[input, proof].concat())?;
+            println!(
+                "STATEMENT file={path} code={code:#x} instructions={} id={id}",
+                count(instructions)
+            );
+            if code != 0 {
+                bail!("{path}: refused, {code:#x}");
+            }
+        }
+        Ok(())
+    }
+
+    /// Each proof at `paths` verified `runs` times, measured, and a tampered
+    /// copy refused.
+    fn bench(&self, runs: usize, paths: &[String]) -> Result<()> {
+        for path in paths {
+            let proof = std::fs::read(path)?;
+            let mut input = std::fs::read(path.replace(".proof", ".format"))?;
+            input.extend(std::fs::read(path.replace(".proof", ".words"))?);
+            input.extend_from_slice(&proof);
+            let (mut instantiation, mut verify, mut decode) = (Vec::new(), Vec::new(), Vec::new());
+            let mut allocations = 0;
+            // User-mode instructions and cycles of this thread over the call:
+            // retired instructions do not depend on the machine's load.
+            let mut instructions = counter(Hardware::INSTRUCTIONS)?;
+            let mut cycles = counter(Hardware::CPU_CYCLES)?;
+            let (mut instr_min, mut cycles_min) = (u64::MAX, u64::MAX);
+            let mut pages = 0;
+            for _ in 0..runs {
+                let start = Instant::now();
+                let instance = self.instantiate()?;
+                instantiation.push(start.elapsed());
+                let mut call = Call::new(instance, "verify", &input)?;
+                instructions.reset()?;
+                cycles.reset()?;
+                instructions.enable()?;
+                cycles.enable()?;
+                let start = Instant::now();
+                let verdict = call.run()?;
+                verify.push(start.elapsed());
+                cycles.disable()?;
+                instructions.disable()?;
+                instr_min = instr_min.min(instructions.read()?);
+                cycles_min = cycles_min.min(cycles.read()?);
+                if verdict != 1 {
+                    bail!("{path}: verdict {verdict}");
+                }
+                allocations = call.store.data().allocations;
+                pages = call.memory.data_size(&call.store) as u64 / PAGE;
+
+                let mut call = self.call("decode", &input)?;
+                let start = Instant::now();
+                assert_eq!(call.run()?, 1);
+                decode.push(start.elapsed());
+            }
+            let min = |v: &Vec<Duration>| *v.iter().min().unwrap();
+            println!(
+                "{path}: {} B; verify min {:.3?} median {:.3?} (decode min {:.3?}); instantiate min {:.3?}; \
+                 {allocations} host allocations; memory {pages} pages; \
+                 {instr_min} instructions, {cycles_min} cycles (min)",
+                proof.len(),
+                min(&verify),
+                median(verify.clone()),
+                min(&decode),
+                min(&instantiation),
+            );
+            println!(
+                "RESULT file={path} semantics={} isa={} bytes={} verify_us_min={} verify_us_median={} \
+                 decode_us_min={} instantiate_us_min={} allocations={allocations} pages={pages} \
+                 instructions={instr_min} cycles={cycles_min}",
+                self.semantics.as_str(),
+                isa(),
+                proof.len(),
+                min(&verify).as_micros(),
+                median(verify).as_micros(),
+                min(&decode).as_micros(),
+                min(&instantiation).as_micros(),
+            );
+            // A tampered copy: one byte flipped at the middle of the proof.
+            let mut tampered = input.clone();
+            let middle = tampered.len() - proof.len() / 2;
+            tampered[middle] ^= 1;
+            let verdict = self.call("verify", &tampered)?.run()?;
+            if verdict == 1 {
+                bail!("{path}: a tampered proof accepted");
+            }
+            println!("{path}: a tampered byte: verdict {verdict}");
+        }
+        Ok(())
+    }
+}
+
+fn count(instructions: Option<u64>) -> String {
+    instructions.map_or("-".into(), |n| n.to_string())
+}
+
+fn run(args: &[String]) -> Result<()> {
+    let [blob, semantics, mode, files @ ..] = args else {
+        bail!("usage: <verifier.wasm> <client|pvf> <runs|judge|anchors|statements> <file>...");
     };
-    let count = |instructions: Option<u64>| instructions.map_or("-".into(), |n| n.to_string());
-    match runs.as_str() {
+    let runner = Runner::new(blob, semantics.parse()?)?;
+    match mode.as_str() {
         "judge" => {
-            let [directory, formats] = proofs else {
+            let [directory, formats] = files else {
                 bail!("judge: one fixtures directory, then the formats the blob links");
             };
-            let linked = formats
-                .split(',')
-                .map(str::parse)
-                .collect::<Result<Vec<u32>, _>>()
-                .context("the formats, comma-separated")?;
-            let fixtures = vos_statement::fixtures::load(std::path::Path::new(directory));
-            let mut differ = 0;
-            for fixture in &fixtures {
-                let expected = fixture.verdict_linking(&linked);
-                let (code, instructions, id) = judged(&fixture.name, &fixture.bytes())?;
-                println!(
-                    "JUDGE fixture={:?} expected={expected:#x} code={code:#x} instructions={} id={id}",
-                    fixture.name,
-                    count(instructions),
-                );
-                differ += usize::from(code != expected);
-            }
-            if differ > 0 {
-                bail!("{differ} of {} fixtures judged otherwise", fixtures.len());
-            }
-            println!(
-                "{} fixtures judged as recorded, linking {linked:?}",
-                fixtures.len()
-            );
-            return Ok(());
+            runner.judge(directory, formats)
         }
         "anchors" => {
-            if !proofs.is_empty() {
+            if !files.is_empty() {
                 bail!("anchors: no files");
             }
-            let hex =
-                |bytes: &[u8]| -> String { bytes.iter().map(|b| format!("{b:02x}")).collect() };
-            let vectors = vos_statement::vos_anchor::vectors::golden();
-            for golden in &vectors {
-                let encoded = golden.vector.encode();
-                let computed = |input: &[u8]| -> Result<Option<Vec<u8>>> {
-                    let (mut store, instance, memory) =
-                        instantiate(&engine, &module, &linker, semantics)?;
-                    let call =
-                        instance.get_typed_func::<(u32, u32), u32>(&mut store, "anchor_digests")?;
-                    let ptr = write_input(&mut store, memory, input)?;
-                    if call.call(&mut store, (ptr, input.len() as u32))? != 1 {
-                        return Ok(None);
-                    }
-                    let at = instance
-                        .get_typed_func::<(), u32>(&mut store, "digests")?
-                        .call(&mut store, ())?;
-                    let mut bytes = vec![0u8; vos_statement::vos_anchor::vectors::Digests::BYTES];
-                    memory.read(&store, at as usize, &mut bytes)?;
-                    Ok(Some(bytes))
-                };
-                let digests = computed(&encoded)?
-                    .with_context(|| format!("{}: the vector refused", golden.name))?;
-                println!("ANCHORS vector={:?} digests={}", golden.name, hex(&digests));
-                if hex(&digests) != golden.digests {
-                    bail!(
-                        "{}: digests {} not the pinned {}",
-                        golden.name,
-                        hex(&digests),
-                        golden.digests
-                    );
-                }
-                if computed(&encoded[..encoded.len() - 1])?.is_some() {
-                    bail!("{}: a vector cut short decoded", golden.name);
-                }
-            }
-            println!("{} vectors computed as pinned", vectors.len());
-            return Ok(());
+            runner.anchors()
         }
-        "statements" => {
-            for path in proofs {
-                let input = std::fs::read(path)?;
-                let proof = std::fs::read(path.replace(".input", ".proof"))?;
-                let (code, instructions, id) = judged(path, &[input, proof].concat())?;
-                println!(
-                    "STATEMENT file={path} code={code:#x} instructions={} id={id}",
-                    count(instructions)
-                );
-                if code != 0 {
-                    bail!("{path}: refused, {code:#x}");
-                }
-            }
-            return Ok(());
-        }
-        _ => {}
+        "statements" => runner.statements(files),
+        runs => runner.bench(runs.parse()?, files),
     }
-
-    let runs: usize = runs.parse()?;
-    for path in proofs {
-        let proof = std::fs::read(path)?;
-        let mut input = std::fs::read(path.replace(".proof", ".format"))?;
-        input.extend(std::fs::read(path.replace(".proof", ".words"))?);
-        input.extend_from_slice(&proof);
-        let (mut instantiation, mut verify, mut decode) = (Vec::new(), Vec::new(), Vec::new());
-        let mut allocations = 0;
-        // User-mode instructions and cycles of this thread over the call:
-        // retired instructions do not depend on the machine's load.
-        let counter = |event| {
-            perf_event::Builder::new(event)
-                .observe_self()
-                .exclude_kernel(true)
-                .exclude_hv(true)
-                .build()
-        };
-        let mut instructions = counter(perf_event::events::Hardware::INSTRUCTIONS)?;
-        let mut cycles = counter(perf_event::events::Hardware::CPU_CYCLES)?;
-        let (mut instr_min, mut cycles_min) = (u64::MAX, u64::MAX);
-        let mut pages = 0;
-        for _ in 0..runs {
-            let start = Instant::now();
-            let (mut store, instance, memory) = instantiate(&engine, &module, &linker, semantics)?;
-            instantiation.push(start.elapsed());
-            let call = instance.get_typed_func::<(u32, u32), u32>(&mut store, "verify")?;
-            let ptr = write_input(&mut store, memory, &input)?;
-            instructions.reset()?;
-            cycles.reset()?;
-            instructions.enable()?;
-            cycles.enable()?;
-            let start = Instant::now();
-            let verdict = call.call(&mut store, (ptr, input.len() as u32))?;
-            verify.push(start.elapsed());
-            cycles.disable()?;
-            instructions.disable()?;
-            instr_min = instr_min.min(instructions.read()?);
-            cycles_min = cycles_min.min(cycles.read()?);
-            if verdict != 1 {
-                bail!("{path}: verdict {verdict}");
-            }
-            allocations = store.data().allocations;
-            pages = memory.data_size(&store) as u64 / PAGE;
-
-            let (mut store, instance, memory) = instantiate(&engine, &module, &linker, semantics)?;
-            let call = instance.get_typed_func::<(u32, u32), u32>(&mut store, "decode")?;
-            let ptr = write_input(&mut store, memory, &input)?;
-            let start = Instant::now();
-            assert_eq!(call.call(&mut store, (ptr, input.len() as u32))?, 1);
-            decode.push(start.elapsed());
-        }
-        let min = |v: &Vec<Duration>| *v.iter().min().unwrap();
-        println!(
-            "{path}: {} B; verify min {:.3?} median {:.3?} (decode min {:.3?}); instantiate min {:.3?}; \
-             {allocations} host allocations; memory {pages} pages; \
-             {instr_min} instructions, {cycles_min} cycles (min)",
-            proof.len(),
-            min(&verify),
-            median(verify.clone()),
-            min(&decode),
-            min(&instantiation),
-        );
-        println!(
-            "RESULT file={path} semantics={} isa={} bytes={} verify_us_min={} verify_us_median={} \
-             decode_us_min={} instantiate_us_min={} allocations={allocations} pages={pages} \
-             instructions={instr_min} cycles={cycles_min}",
-            if semantics == Semantics::Pvf {
-                "pvf"
-            } else {
-                "client"
-            },
-            isa(),
-            proof.len(),
-            min(&verify).as_micros(),
-            median(verify).as_micros(),
-            min(&decode).as_micros(),
-            min(&instantiation).as_micros(),
-        );
-        // A tampered copy: one byte flipped at the middle of the proof.
-        let mut tampered = input.clone();
-        let middle = tampered.len() - proof.len() / 2;
-        tampered[middle] ^= 1;
-        let (mut store, instance, memory) = instantiate(&engine, &module, &linker, semantics)?;
-        let call = instance.get_typed_func::<(u32, u32), u32>(&mut store, "verify")?;
-        let ptr = write_input(&mut store, memory, &tampered)?;
-        let verdict = call.call(&mut store, (ptr, tampered.len() as u32))?;
-        if verdict == 1 {
-            bail!("{path}: a tampered proof accepted");
-        }
-        println!("{path}: a tampered byte: verdict {verdict}");
-    }
-    Ok(())
 }
 
 /// The CPUs of the list `list` (`0-11`, `0,2,4-7`).
