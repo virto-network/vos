@@ -58,7 +58,8 @@ pub struct Options {
     /// time.
     pub block_ms: u64,
     /// The most one submit takes of the paying space's sovereign account:
-    /// `SubmitDeposit` and a fee's bound.
+    /// `SubmitDeposit` and a fee's bound, 1.5 UNIT at the design's
+    /// suggested values (`spaces-pallet.md` §4).
     pub per_submit: Balance,
     /// The funding alert: the sovereign account's free balance below this
     /// many submits.
@@ -72,7 +73,7 @@ impl Default for Options {
             refresh: Duration::from_secs(2),
             backoff: Duration::from_secs(1),
             block_ms: 12_000,
-            per_submit: UNITS,
+            per_submit: UNITS + UNITS / 2,
             funding_submits: 8,
         }
     }

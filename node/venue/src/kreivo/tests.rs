@@ -728,7 +728,7 @@ fn a_refused_proof_reports_its_class() {
 #[test]
 fn every_error_and_refusal_is_mapped() {
     use Error::*;
-    for index in 0..=27 {
+    for index in 0..=28 {
         let error = Error::from_index(index).unwrap();
         let expected = match error {
             AlreadyAnchored | WindowNotAfterLast => Answer::Done,
@@ -764,4 +764,15 @@ fn every_error_and_refusal_is_mapped() {
         );
     }
     assert_eq!(judged(&[], id), None);
+}
+
+/// The client's bound on one submit is what a submit holds at the design's
+/// suggested values: its deposit and a fee's bound.
+#[test]
+fn a_submits_bound_is_its_deposit_and_fee() {
+    let constants = Constants::kreivo(VENUE);
+    assert_eq!(
+        Options::default().per_submit,
+        constants.submit_deposit + constants.fee_bound
+    );
 }
