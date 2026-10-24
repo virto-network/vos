@@ -512,14 +512,14 @@ mod statements {
         assert!(lone_leaf.node.output.entry && lone_leaf.node.output.halt);
         let valid_rootless = masked_wrap(&lone_leaf, &lone_program, false);
 
-        let pinned = ProgramId(program.id().0.map(|word| word.0));
+        let pinned = ProgramId(program.id().words());
         let other = ProgramId(pinned.0.map(|word| (word + 1) % ((1 << 31) - 1)));
         let s = Statement {
             program: pinned,
             ..base
         };
         let s0 = Statement {
-            program: ProgramId(lone_program.id().0.map(|word| word.0)),
+            program: ProgramId(lone_program.id().words()),
             ..lone
         };
         let production = {

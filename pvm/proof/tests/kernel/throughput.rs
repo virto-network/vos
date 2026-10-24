@@ -13,9 +13,8 @@
 
 use std::time::{Duration, Instant};
 
-use vos_pvm_final_verifier::masked;
 use vos_pvm_proof::format::SEGMENT;
-use vos_statement::{Pin, ProgramId, Statement};
+use vos_statement::ProgramId;
 use vos_wire::result::Attest;
 use vos_wire::vos_anchor::{VenueId, WindowClock};
 
@@ -71,25 +70,14 @@ fn prove(name: &str, actor: &str, attest: &Attest) -> Proved {
         let took = started.elapsed();
         let (proof, stats) = vos_pvm_recair::tree::prove_final(&program, &entry, &trace.side_note)
             .expect("the statement proves");
-        let id = ProgramId(program.id().0.map(|word| word.0));
+        let id = ProgramId(program.id().words());
         (proof, rerun, took, stats, id)
     });
     let whole = started.elapsed();
     let resident_mib = common::resident_peak_mib(false);
 
-    let statement = Statement {
-        format: masked::FORMAT,
-        program: id,
-        space: attest.roots[0].space,
-        public_args: attest.public_args.clone(),
-        output: attest.output.clone(),
-        roots: attest.roots.clone(),
-    };
-    let venue = Venue::new(VenueId([0x7e; 32]), &[genesis(1)]);
-    venue.venue.pin(Pin {
-        program: id,
-        venue_bound: false,
-    });
+    let statement = cut::masked_statement(attest, id, attest.roots[0].space);
+    let venue = Venue::pinned(VenueId([0x7e; 32]), &[genesis(1)], id);
     venue.anchor(&attest.roots[0]).expect("anchored");
     let verdict = vos_venue::VenueClient::submit(&venue.venue, &statement, &proof);
     assert_eq!(vos_venue::code(&verdict), 0, "{name}: accepted");

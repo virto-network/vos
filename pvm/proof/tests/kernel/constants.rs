@@ -32,7 +32,7 @@ pub fn program_id(actor: &str, name: &str) -> [u32; 8] {
         &SEGMENT,
     )
     .expect("the kernel's program");
-    program.id().0.map(|word| word.0)
+    program.id().words()
 }
 
 /// Each constant is what its source computes, the wrap's roots the final

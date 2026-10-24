@@ -50,5 +50,5 @@ pub fn program_id(elf: &[u8], method: &str) -> Result<[u32; 8], String> {
         .ok_or_else(|| format!("{method} has no kernel"))?;
     let (program, _) =
         vos_pvm_recair::leaf::kernel_program(blob, record, derived.transpiler_version, &SEGMENT)?;
-    Ok(program.id().0.map(|word| word.0))
+    Ok(program.id().words())
 }

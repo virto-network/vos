@@ -7,8 +7,7 @@
 use crate::common;
 use crate::cut::{self, AGENT, Cut, INSTANCE, Rng, Venue, genesis, read_live, traced};
 
-use vos_pvm_final_verifier::masked;
-use vos_statement::{Pin, ProgramId, Statement};
+use vos_statement::{ProgramId, Statement};
 use vos_testkit::programs::table_tag;
 use vos_tree::{Blake2b, Hasher};
 use vos_wire::Encode;
@@ -138,20 +137,9 @@ fn a_balance_is_accepted_at_the_model_venue() {
     totals.report("balance");
     eprintln!("balance: {segments} segments");
 
-    let program = ProgramId(program.id().0.map(|word| word.0));
-    let statement = Statement {
-        format: masked::FORMAT,
-        program,
-        space: cut.space,
-        public_args: attest.public_args.clone(),
-        output: attest.output.clone(),
-        roots: attest.roots.clone(),
-    };
-    let venue = Venue::new(VenueId([0x7e; 32]), &[genesis(1)]);
-    venue.venue.pin(Pin {
-        program,
-        venue_bound: false,
-    });
+    let program = ProgramId(program.id().words());
+    let statement = cut::masked_statement(&attest, program, cut.space);
+    let venue = Venue::pinned(VenueId([0x7e; 32]), &[genesis(1)], program);
     venue.anchor(&root).expect("anchored");
     let code = |statement: &Statement| {
         vos_venue::code(&vos_venue::VenueClient::submit(

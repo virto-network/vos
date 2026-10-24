@@ -20,29 +20,25 @@
 
 use crate::common;
 use crate::cut::{
-    self, AGENT, AGENTS, Cut, INSTANCE, ROWS, Rng, Venue, WINDOW, genesis, read_live, traced,
+    self, AGENT, AGENTS, BUDGET_PATH_BYTES, BUDGET_PATH_COMPRESSIONS, Cut, INSTANCE, ROWS, Rng,
+    Venue, WINDOW, account_row, account_value, genesis, read_live, traced,
 };
 
 use std::time::Instant;
 
-use cipher_clerk::codec;
 use cipher_clerk::conventions::PseudoAccount;
 use cipher_clerk::ids::JournalId;
 use cipher_clerk::kernel::Value;
 use cipher_clerk::types::{Account, Layer};
-use vos_pvm_final_verifier::masked;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::program_id::KernelEntry;
 use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
 use vos_pvm_proof::{Proof, program_commitment_of_proof, prove_kernel};
 use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment};
-use vos_statement::{Pin, ProgramId, Statement};
-use vos_testkit::programs::table_tag;
+use vos_statement::{ProgramId, Statement};
 use vos_tree::{Blake2b, Hasher};
 use vos_venue::{AnchorRefusal, VenueClient};
 use vos_wire::abi::AttestError;
-use vos_wire::ids::MapId;
-use vos_wire::keys::{self, Transform};
 use vos_wire::served::Served;
 use vos_wire::vos_anchor::{Migrate, RootRead, VenueId, space_id, space_root};
 use vos_wire::{Encode, SpaceId};
@@ -56,12 +52,6 @@ const AGGREGATE: JournalId = JournalId([0; 16]);
 const CUT: usize = 1;
 /// The venue the statements are judged at.
 const VENUE: VenueId = VenueId([0x7e; 32]);
-
-/// The space path's budget (`proving.md` §7): its compressions (with
-/// `S_w`'s) and bytes. A row's are `reads`' (`reads_at_a_cut_measure`), the
-/// window reading two.
-const BUDGET_PATH_COMPRESSIONS: f64 = 15.0;
-const BUDGET_PATH_BYTES: f64 = 590.0;
 
 /// A pair's running totals (`window::Totals`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,26 +161,6 @@ fn accounts() -> [Account<Value>; 2] {
     ]
 }
 
-/// The window actor's committed map.
-fn map() -> MapId {
-    MapId {
-        instance: INSTANCE,
-        tag: table_tag("accounts"),
-        transform: Transform::Hashed,
-    }
-}
-
-/// An account's full row key in the map, by its id.
-fn row(id: &[u8]) -> Vec<u8> {
-    keys::committed(&map(), &Transform::Hashed.apply(id))
-}
-
-/// An account's value as the map stores it: its cipher-clerk encoding,
-/// encoded as the SDK encodes a byte vector.
-fn value(account: &Account<Value>) -> Vec<u8> {
-    codec::to_bytes(account).encode()
-}
-
 /// The space the tests' agent belongs to: [`genesis`] 1's.
 pub(crate) fn space() -> SpaceId {
     space_id(&genesis(1))
@@ -201,19 +171,19 @@ pub(crate) fn space() -> SpaceId {
 /// agent's held unless not `reported`.
 fn cut_of(rows: usize, agents: u32, reported: bool) -> Cut {
     let accounts = accounts();
-    let width = value(&accounts[0]).len();
+    let width = account_value(&accounts[0]).len();
     let mut rng = Rng(0x5eed_0000 + rows as u64);
     let others = (accounts.len()..rows)
         .map(|_| {
             let (mut id, mut bytes) = ([0u8; 16], vec![0u8; width]);
             rng.fill(&mut id);
             rng.fill(&mut bytes);
-            (row(&id), bytes)
+            (account_row(&id), bytes)
         })
         .collect();
     let known = accounts
         .iter()
-        .map(|account| (row(&account.id.0), value(account)))
+        .map(|account| (account_row(&account.id.0), account_value(account)))
         .collect();
     Cut::new(space(), known, others, agents, reported)
 }
@@ -721,28 +691,14 @@ fn the_window_is_stated_at_the_model_venue() {
         started.elapsed().as_secs_f64()
     );
 
-    let program = ProgramId(program.id().0.map(|word| word.0));
-    let statement = Statement {
-        format: masked::FORMAT,
-        program,
-        space: space(),
-        public_args: attest.public_args.clone(),
-        output: attest.output.clone(),
-        roots: attest.roots.clone(),
-    };
+    let program = ProgramId(program.id().words());
+    let statement = cut::masked_statement(&attest, program, space());
     let root = statement.roots[0];
     assert_eq!(
         root.root,
         space_root(&space(), WINDOW, &representative.root)
     );
-    let venue = |id: VenueId| {
-        let venue = Venue::new(id, &[genesis(1), genesis(2)]);
-        venue.venue.pin(Pin {
-            program,
-            venue_bound: false,
-        });
-        venue
-    };
+    let venue = |id: VenueId| Venue::pinned(id, &[genesis(1), genesis(2)], program);
     let anchored = || {
         let venue = venue(VENUE);
         venue.anchor(&root).expect("anchored");

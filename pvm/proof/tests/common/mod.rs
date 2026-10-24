@@ -554,7 +554,7 @@ pub fn wrap_root(
     let verified =
         vos_pvm_final_verifier::unmasked::verify_bytes(&bytes, &words).expect("the wrap verifies");
     assert_eq!(verified, statement);
-    assert_eq!(statement.program, program.id().0.map(|word| word.0));
+    assert_eq!(statement.program, program.id().words());
     assert_eq!(statement.io_hash, root.node.output.io_hash);
     let masked = masked_wrap(name, &finalized, &words);
     (bytes, words, masked)

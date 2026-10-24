@@ -71,6 +71,11 @@ pub const ID_WORDS: usize = 8 + 4 + 8 * MAX_LEAF_CIRCUITS;
 pub struct ProgramId(pub [BaseField; 8]);
 
 impl ProgramId {
+    /// Its words as integers: the form a statement names it in.
+    pub fn words(&self) -> [u32; 8] {
+        self.0.map(|word| word.0)
+    }
+
     /// The 32-byte form: each word as four little-endian bytes.
     pub fn to_bytes(&self) -> [u8; 32] {
         let mut bytes = [0u8; 32];
@@ -382,7 +387,7 @@ mod tests {
         assert_eq!(id[..8], program.kernel_digest().0);
         assert!(id[8..].iter().all(|&word| word == BaseField::from(0)));
         assert_eq!(
-            program.id().0.map(|word| word.0),
+            program.id().words(),
             [
                 2135066872, 100226137, 1685726148, 2064667428, 305260091, 2132776637, 2063760913,
                 1333887263

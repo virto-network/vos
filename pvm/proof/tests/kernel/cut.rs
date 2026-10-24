@@ -9,22 +9,26 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use cipher_clerk::kernel::Value;
+use cipher_clerk::types::Account;
 use ed25519_dalek::{Signer, SigningKey};
+use vos_pvm_final_verifier::masked;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
 use vos_pvm_proof::program_id::KernelProgram;
 use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
 use vos_pvm_proof::{Proof, ProvingError, prove_shaped};
+use vos_statement::{Pin, ProgramId, Statement};
 use vos_testkit::Step;
 use vos_testkit::Testkit;
-use vos_testkit::programs::{derivation, derived, method, package};
+use vos_testkit::programs::{derivation, derived, method, package, table_tag};
 use vos_tree::{BatchProof, Blake2b, Hash, Leaf, MemStore};
 use vos_venue::{AnchorRefusal, Anchored, ModelVenue, VenueClient};
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{AttestError, Failure};
 use vos_wire::batch::Body;
-use vos_wire::ids::{AgentId, InstanceId, Principal, ProgramHash, RequestId};
-use vos_wire::keys;
+use vos_wire::ids::{AgentId, InstanceId, MapId, Principal, ProgramHash, RequestId};
+use vos_wire::keys::{self, Transform};
 use vos_wire::records::{PendingRead, WorkflowState};
 use vos_wire::result::{Attest, KernelReturn, Outcome};
 use vos_wire::served::{Served, representative_row};
@@ -52,6 +56,49 @@ pub const INSTANCE: InstanceId = InstanceId(9);
 /// representative keeps, at the budgets' scale (`proving.md` §7).
 pub const ROWS: usize = 1_000_000;
 pub const AGENTS: u32 = 1_024;
+
+/// The budgets: a prototype's costs of the reads (`proving.md` §7): a
+/// row's compressions and witness bytes, the space path's (its
+/// compressions with `S_w`'s), and the sixteen-row kernel's steps.
+pub const BUDGET_ROW_COMPRESSIONS: f64 = 19.07 + 1.0;
+pub const BUDGET_ROW_BYTES: f64 = 842.0;
+pub const BUDGET_PATH_COMPRESSIONS: f64 = 15.0;
+pub const BUDGET_PATH_BYTES: f64 = 590.0;
+pub const BUDGET_SIXTEEN_STEPS: f64 = 205_841.0;
+
+/// The committed map of accounts the `accounts` and `window` test actors
+/// keep.
+fn accounts_map() -> MapId {
+    MapId {
+        instance: INSTANCE,
+        tag: table_tag("accounts"),
+        transform: Transform::Hashed,
+    }
+}
+
+/// An account's full row key in the accounts map, by its id.
+pub fn account_row(id: &[u8]) -> Vec<u8> {
+    keys::committed(&accounts_map(), &Transform::Hashed.apply(id))
+}
+
+/// An account's value as the map stores it: its cipher-clerk encoding,
+/// encoded as the SDK encodes a byte vector.
+pub fn account_value(account: &Account<Value>) -> Vec<u8> {
+    cipher_clerk::codec::to_bytes(account).encode()
+}
+
+/// The masked statement of `attest` in `space`, its kernel's program
+/// `program`.
+pub fn masked_statement(attest: &Attest, program: ProgramId, space: SpaceId) -> Statement {
+    Statement {
+        format: masked::FORMAT,
+        program,
+        space,
+        public_args: attest.public_args.clone(),
+        output: attest.output.clone(),
+        roots: attest.roots.clone(),
+    }
+}
 
 /// splitmix64: the other rows' bytes, reproducible.
 pub struct Rng(pub u64);
@@ -500,6 +547,16 @@ impl Venue {
             venue.register(genesis, WINDOW - 1);
         }
         Self { venue, now }
+    }
+
+    /// [`Venue::new`], pinning `program` venue-unbound.
+    pub fn pinned(id: VenueId, geneses: &[SpaceGenesis], program: ProgramId) -> Self {
+        let venue = Self::new(id, geneses);
+        venue.venue.pin(Pin {
+            program,
+            venue_bound: false,
+        });
+        venue
     }
 
     /// A second past [`WINDOW`]'s close, `B_w + D`.

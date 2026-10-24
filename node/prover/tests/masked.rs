@@ -66,10 +66,7 @@ fn a_kernel_is_read_from_its_blob_alone() {
             &vos_pvm_proof::format::SEGMENT,
         )
         .unwrap();
-        assert_eq!(
-            prover.program(blob).unwrap().0,
-            program.id().0.map(|word| word.0)
-        );
+        assert_eq!(prover.program(blob).unwrap().0, program.id().words());
     }
     assert!(matches!(
         prover.program(b"not a kernel"),

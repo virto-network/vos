@@ -19,14 +19,15 @@ use cipher_clerk::kernel::Value;
 use cipher_clerk::types::{Account, Layer};
 use vos_pvm_proof::kernel::KernelTrace;
 use vos_pvm_proof::segment::segment_bounds_budgeted;
-use vos_testkit::programs::table_tag;
-use vos_wire::ids::MapId;
-use vos_wire::keys::{self, Transform};
 use vos_wire::result::Attest;
 use vos_wire::served::Served;
 use vos_wire::{Encode, SpaceId};
 
-use crate::cut::{self, AGENT, AGENTS, Cut, INSTANCE, ROWS, Rng, WINDOW, read_live, traced};
+use crate::cut::{
+    self, AGENT, AGENTS, BUDGET_PATH_BYTES, BUDGET_PATH_COMPRESSIONS, BUDGET_ROW_BYTES,
+    BUDGET_ROW_COMPRESSIONS, BUDGET_SIXTEEN_STEPS, Cut, INSTANCE, ROWS, Rng, WINDOW, account_row,
+    account_value, read_live, traced,
+};
 
 const SPACE: SpaceId = SpaceId([0xA1; 32]);
 const PEER: [u8; 32] = [0xB2; 32];
@@ -35,13 +36,6 @@ const CURRENCY: u32 = 840;
 /// The 32k class's cut, as the budgets were measured at.
 const LOG_STEPS: u32 = 15;
 const PAGES: usize = 8;
-
-/// The budgets: a prototype's costs of the reads (`proving.md` §7).
-const BUDGET_ROW_COMPRESSIONS: f64 = 19.07 + 1.0;
-const BUDGET_ROW_BYTES: f64 = 842.0;
-const BUDGET_PATH_COMPRESSIONS: f64 = 15.0;
-const BUDGET_PATH_BYTES: f64 = 590.0;
-const BUDGET_SIXTEEN_STEPS: f64 = 205_841.0;
 
 /// Sixteen pseudo-accounts, as the window kernel's: eight journals'
 /// outgoing and incoming accounts.
@@ -77,26 +71,6 @@ fn accounts() -> Vec<Account<Value>> {
         .collect()
 }
 
-/// The accounts actor's committed map.
-fn map() -> MapId {
-    MapId {
-        instance: INSTANCE,
-        tag: table_tag("accounts"),
-        transform: Transform::Hashed,
-    }
-}
-
-/// An account's full row key in the map, by its id.
-fn row(id: &[u8]) -> Vec<u8> {
-    keys::committed(&map(), &Transform::Hashed.apply(id))
-}
-
-/// An account's value as the map stores it: its cipher-clerk encoding,
-/// encoded as the SDK encodes a byte vector.
-fn value(account: &Account<Value>) -> Vec<u8> {
-    codec::to_bytes(account).encode()
-}
-
 /// A map of `rows` accounts, the sixteen among them, under a
 /// representative's tree of `agents` agents' roots at three windows.
 fn cut_of(rows: usize, agents: u32) -> Cut {
@@ -108,12 +82,12 @@ fn cut_of(rows: usize, agents: u32) -> Cut {
             let (mut id, mut bytes) = ([0u8; 32], vec![0u8; width]);
             rng.fill(&mut id);
             rng.fill(&mut bytes);
-            (row(&id), bytes.encode())
+            (account_row(&id), bytes.encode())
         })
         .collect();
     let known = accounts
         .iter()
-        .map(|account| (row(&account.id.0), value(account)))
+        .map(|account| (account_row(&account.id.0), account_value(account)))
         .collect();
     Cut::new(SPACE, known, others, agents, true)
 }
