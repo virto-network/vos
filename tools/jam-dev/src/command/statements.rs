@@ -22,22 +22,22 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use vos_jam_dev::live::statements::{Deployed, deploy};
 use vos_jam_dev::live::{PolkaJam, Watch};
-use vos_jam_dev::venue::{anchor_code, register_code};
+use vos_jam_dev::venue::{JamVenue, anchor_code, register_code};
 use vos_pvm::refine_host::{JamItem, JamRefine, RefineContext};
 use vos_statement::fixtures::{self, Fixture};
 use vos_statement::vos_anchor::{
-    Anchor, Migrate, RootKind, SpaceGenesis, VenueId, WindowClock, space_id,
+    Anchor, Migrate, RootKind, SpaceGenesis, SpaceId, VenueId, WindowClock, space_id,
 };
 use vos_statement::vos_pvm_final_verifier::MAX_PROOF_BYTES;
 use vos_statement::{Pin, Refusal, blake2b_256};
 use vos_statement_service::config::Config;
-use vos_statement_service::item::{Control, Item, Op, SignedControl, control_digest};
+use vos_statement_service::item::{Item, Op};
 use vos_statement_service::state::Outcome;
 use vos_statement_service::verdict::{AnchorCode, ControlCode};
-use vos_venue::VenueClient;
+use vos_venue::{MigrateRefusal, VenueClient};
 use vos_wire::jam::RefineArgs;
 use vos_wire::package::EPOCH_MS;
 use vos_wire::result::digest;
@@ -151,7 +151,45 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
     // Every package the run sends, as it goes: the service's storage is
     // accounted for against them at the end.
     let sent: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
-    let sending = Arc::clone(&sent);
+    let (mut run, rooted, rootless) = deployed(args, record, &sent)?;
+    let baseline = run.venue.statements.entries(0)?;
+
+    let lone = submit(&rootless.input.statement);
+    run.large_proof(&lone)?;
+    let space = run.register()?;
+    let [landed, replayed, other] = run.fixture_statements(&lone, &rootless, &rooted)?;
+    let controlled = run.controls(&space)?;
+    let migrated = run.migrate(&space)?;
+
+    check(&[landed, replayed, other], &controlled, migrated)?;
+    run.record.note("every verdict as expected");
+    let accounting = run
+        .venue
+        .statements
+        .account(baseline, || lock(&sent).clone())?;
+    run.record.note(format!(
+        "the service's storage: {} entries, {} named from the {} packages sent, {} outcomes \
+         among them",
+        accounting.held,
+        accounting.named,
+        lock(&sent).len(),
+        accounting.outcomes
+    ));
+    if accounting.held != accounting.named {
+        return Err("the service holds entries no package the run sent names".into());
+    }
+    Ok(())
+}
+
+/// The service deployed on the node at `args`, configured for the golden
+/// fixtures' pins, every package sent noted in `sent`; with the fixtures'
+/// rooted and rootless statements.
+fn deployed<'a>(
+    args: &StatementsArgs,
+    record: &'a mut Record,
+    sent: &Arc<Mutex<Vec<Vec<u8>>>>,
+) -> Result<(Run<'a>, Fixture, Fixture), Failed> {
+    let sending = Arc::clone(sent);
     let node = PolkaJam {
         rpc: args.rpc.clone(),
         jamt: args.polkajam.join("jamt"),
@@ -208,186 +246,279 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
     ));
     record.note(format!("its code available since slot {since}"));
     record.note(format!("the venue {}", hex::encode(venue.id().0)));
-    let baseline = venue.statements.entries(0)?;
-
-    // A proof of `MAX_PROOF_BYTES` as an extrinsic: the package past CE
-    // 133's bound but for it, read whole by refine.
-    let submit = |statement: &vos_statement::Statement| Item::Submit(statement.encode()).encode();
-    let lone = submit(&rootless.input.statement);
-    let large = vec![0x5a; MAX_PROOF_BYTES];
-    let outcome = venue.land(lone.clone(), vec![large.clone()])?;
-    record.outcome(
-        &format!("a {MAX_PROOF_BYTES} B extrinsic as the proof"),
-        &outcome,
-    );
-    compare(record, &program, service, &lone, &[large], &outcome)?;
-    if !vos_venue::proof_refused(outcome.code) {
-        return Err("the 256 KiB proof was not refused by the verifier".into());
-    }
-
-    // A space of one founder, its windows the shortest, registered from
-    // the window before the venue's open one.
-    let now = venue.statements.now()?;
-    let founder = SigningKey::from_bytes(&blake2b_256(&[b"vos/jam/statements/founder"]));
-    let controller = SigningKey::from_bytes(&blake2b_256(&[b"vos/jam/statements/controller"]));
-    let clock = WindowClock {
-        origin_ms: now - now % LENGTH_MS - 4 * LENGTH_MS,
-        length_ms: LENGTH_MS,
+    let run = Run {
+        record,
+        program,
+        service,
+        venue,
     };
-    let genesis_space = SpaceGenesis {
-        version: 1,
-        nodes: vec![(0, founder.verifying_key().to_bytes())],
-        clock,
-        time: now,
-        nonce: blake2b_256(&[&now.to_le_bytes()])[..16].try_into()?,
-    };
-    let space = space_id(&genesis_space);
-    let open = clock
-        .window(now)
-        .ok_or("the venue's time before the clock")?;
-    let start = open - 1;
-    let code = venue.register(
-        &genesis_space,
-        controller.verifying_key().to_bytes(),
-        start,
-        &founder,
-    )?;
-    record.note(format!(
-        "register {} from window {start}: {code} ({})",
-        hex::encode(&space.0[..8]),
-        register_code(code)
-    ));
-    let anchor = |window: u64, root: u8, key: &SigningKey| {
+    Ok((run, rooted, rootless))
+}
+
+/// The item submitting `statement`.
+fn submit(statement: &vos_statement::Statement) -> Vec<u8> {
+    Item::Submit(statement.encode()).encode()
+}
+
+/// The deployed service the run drives, and its record.
+struct Run<'a> {
+    record: &'a mut Record,
+    program: Vec<u8>,
+    service: u64,
+    venue: JamVenue,
+}
+
+/// The run's space, registered.
+struct Space {
+    id: SpaceId,
+    clock: WindowClock,
+    /// The window it anchors from.
+    start: u64,
+    founder: SigningKey,
+    controller: SigningKey,
+}
+
+impl Space {
+    /// `key`'s anchor of `root` (each byte) for `window` at `venue`.
+    fn anchor(&self, venue: VenueId, window: u64, root: u8, key: &SigningKey) -> Anchor {
         let mut anchor = Anchor {
-            space,
+            space: self.id,
             window,
             kind: RootKind::Space,
             root: [root; 32],
             signer: key.verifying_key().to_bytes(),
             signature: [0; 64],
         };
-        anchor.signature = ed25519_dalek::Signer::sign(key, &anchor.digest(&venue.id())).to_bytes();
+        anchor.signature = key.sign(&anchor.digest(&venue)).to_bytes();
         anchor
-    };
-    let stranger = SigningKey::from_bytes(&[0x99; 32]);
-    record.note(format!(
-        "anchor window {start} by a key the space does not list: {:?}",
-        venue.anchor_now(&anchor(start, 1, &stranger))
-    ));
-    record.note(format!(
-        "anchor window {start}: {:?}",
-        venue.anchor_now(&anchor(start, 1, &founder))
-    ));
-    record.note(format!(
-        "its anchor keys at the venue: {}",
-        venue.anchor_keys(&space).len()
-    ));
-
-    // The fixtures' masked statements.
-    let landed = venue.land(lone.clone(), vec![rootless.proof.clone()])?;
-    record.outcome("the rootless masked statement", &landed);
-    compare(
-        record,
-        &program,
-        service,
-        &lone,
-        std::slice::from_ref(&rootless.proof),
-        &landed,
-    )?;
-    record.note(format!(
-        "accumulate: {:?} gas by its own count",
-        venue.statements.accumulate_gas()?
-    ));
-    let replayed = venue.land(lone, vec![rootless.proof.clone()])?;
-    record.outcome("the rootless masked statement again", &replayed);
-    let bound = submit(&rooted.input.statement);
-    let other = venue.land(bound, vec![rooted.proof.clone()])?;
-    record.outcome(
-        "the rooted masked statement, bound to the fixtures' venue",
-        &other,
-    );
-
-    // A second root for its anchored window: the space suspended. Its
-    // controller delists the founder, lists a rotated key (a replay of
-    // which is refused) and resumes it; the rotated key anchors.
-    record.note(format!(
-        "a second root for window {start}: {:?}; {:?}",
-        venue.anchor_now(&anchor(start, 2, &founder)),
-        venue.status(&space)
-    ));
-    let rotated = SigningKey::from_bytes(&blake2b_256(&[b"vos/jam/statements/rotated"]));
-    let add = Op::AddKey(rotated.verifying_key().to_bytes());
-    let controls = [
-        (
-            "remove the founder's key",
-            Op::RemoveKey(founder.verifying_key().to_bytes()),
-        ),
-        ("add a rotated key", add),
-        ("resume", Op::Resume),
-    ];
-    let mut controlled = Vec::new();
-    for (what, op) in controls {
-        let code = venue.control(&space, op, &controller)?;
-        record.note(format!("control, {what}: {code}"));
-        controlled.push(code);
     }
-    let replayed_add = {
-        let control = Control {
-            space,
-            nonce: 1,
-            op: add,
-        };
-        let item = Item::Control(SignedControl {
-            control,
-            controller: controller.verifying_key().to_bytes(),
-            signature: ed25519_dalek::Signer::sign(
-                &controller,
-                &control_digest(&venue.id(), &control),
-            )
-            .to_bytes(),
-        });
-        venue.land(item.encode(), Vec::new())?.code
-    };
-    record.note(format!(
-        "the add's control replayed: {replayed_add}; {:?}",
-        venue.status(&space)
-    ));
-    let later = loop {
-        let open = clock.window(venue.statements.now()?).unwrap_or(0);
-        if open >= start + 2 {
-            break open - 1;
+}
+
+/// The controller's controls: each one's code, the add's replay's code and
+/// the rotated key's anchor once the space is resumed.
+struct Controlled {
+    codes: Vec<u32>,
+    replayed_add: u32,
+    resumed: Result<u32, vos_jam::Error>,
+}
+
+impl Run<'_> {
+    /// A proof of `MAX_PROOF_BYTES` as an extrinsic: the package past CE
+    /// 133's bound but for it, read whole by refine, and refused by the
+    /// verifier.
+    fn large_proof(&mut self, lone: &[u8]) -> Result<(), Failed> {
+        let large = vec![0x5a; MAX_PROOF_BYTES];
+        let outcome = self.venue.land(lone.to_vec(), vec![large.clone()])?;
+        self.record.outcome(
+            &format!("a {MAX_PROOF_BYTES} B extrinsic as the proof"),
+            &outcome,
+        );
+        self.compare(lone, &[large], &outcome)?;
+        if !vos_venue::proof_refused(outcome.code) {
+            return Err("the 256 KiB proof was not refused by the verifier".into());
         }
-        std::thread::sleep(Duration::from_secs(6));
-    };
-    let resumed = venue.anchor_now(&anchor(later, 3, &rotated));
-    record.note(format!(
-        "anchor window {later} by the rotated key: {resumed:?}"
-    ));
+        Ok(())
+    }
 
-    // The space migrated away from a window past the venue's next by the
-    // time its item lands.
-    let next = venue
-        .statements
-        .now()
-        .map(|now| clock.window(now).unwrap_or(0) + 2)?;
-    let migrate = Migrate {
-        space,
-        from: venue.id(),
-        to: VenueId([0xee; 32]),
-        from_window: next,
-    };
-    let migrated = venue.migrate(&migrate, &controller);
-    record.note(format!("migrate from window {next}: {migrated:?}"));
+    /// A space of one founder, its windows the shortest, registered from
+    /// the window before the venue's open one; an anchor of that window by
+    /// a key the space does not list, then by the founder.
+    fn register(&mut self) -> Result<Space, Failed> {
+        let venue = &self.venue;
+        let now = venue.statements.now()?;
+        let founder = SigningKey::from_bytes(&blake2b_256(&[b"vos/jam/statements/founder"]));
+        let controller = SigningKey::from_bytes(&blake2b_256(&[b"vos/jam/statements/controller"]));
+        let clock = WindowClock {
+            origin_ms: now - now % LENGTH_MS - 4 * LENGTH_MS,
+            length_ms: LENGTH_MS,
+        };
+        let genesis = SpaceGenesis {
+            version: 1,
+            nodes: vec![(0, founder.verifying_key().to_bytes())],
+            clock,
+            time: now,
+            nonce: blake2b_256(&[&now.to_le_bytes()])[..16].try_into()?,
+        };
+        let id = space_id(&genesis);
+        let open = clock
+            .window(now)
+            .ok_or("the venue's time before the clock")?;
+        let start = open - 1;
+        let code = venue.register(
+            &genesis,
+            controller.verifying_key().to_bytes(),
+            start,
+            &founder,
+        )?;
+        self.record.note(format!(
+            "register {} from window {start}: {code} ({})",
+            hex::encode(&id.0[..8]),
+            register_code(code)
+        ));
+        let space = Space {
+            id,
+            clock,
+            start,
+            founder,
+            controller,
+        };
+        let stranger = SigningKey::from_bytes(&[0x99; 32]);
+        self.record.note(format!(
+            "anchor window {start} by a key the space does not list: {:?}",
+            venue.anchor_now(&space.anchor(venue.id(), start, 1, &stranger))
+        ));
+        self.record.note(format!(
+            "anchor window {start}: {:?}",
+            venue.anchor_now(&space.anchor(venue.id(), start, 1, &space.founder))
+        ));
+        self.record.note(format!(
+            "its anchor keys at the venue: {}",
+            venue.anchor_keys(&space.id).len()
+        ));
+        Ok(space)
+    }
 
+    /// The fixtures' masked statements: the rootless one (`lone`), again,
+    /// and the rooted one, bound to the fixtures' venue. Their codes.
+    fn fixture_statements(
+        &mut self,
+        lone: &[u8],
+        rootless: &Fixture,
+        rooted: &Fixture,
+    ) -> Result<[u32; 3], Failed> {
+        let landed = self
+            .venue
+            .land(lone.to_vec(), vec![rootless.proof.clone()])?;
+        self.record
+            .outcome("the rootless masked statement", &landed);
+        self.compare(lone, std::slice::from_ref(&rootless.proof), &landed)?;
+        self.record.note(format!(
+            "accumulate: {:?} gas by its own count",
+            self.venue.statements.accumulate_gas()?
+        ));
+        let replayed = self
+            .venue
+            .land(lone.to_vec(), vec![rootless.proof.clone()])?;
+        self.record
+            .outcome("the rootless masked statement again", &replayed);
+        let bound = submit(&rooted.input.statement);
+        let other = self.venue.land(bound, vec![rooted.proof.clone()])?;
+        self.record.outcome(
+            "the rooted masked statement, bound to the fixtures' venue",
+            &other,
+        );
+        Ok([landed.code, replayed.code, other.code])
+    }
+
+    /// A second root for the space's anchored window: the space suspended.
+    /// Its controller delists the founder, lists a rotated key (a replay of
+    /// which is refused) and resumes it; the rotated key anchors.
+    fn controls(&mut self, space: &Space) -> Result<Controlled, Failed> {
+        let venue = &self.venue;
+        let start = space.start;
+        self.record.note(format!(
+            "a second root for window {start}: {:?}; {:?}",
+            venue.anchor_now(&space.anchor(venue.id(), start, 2, &space.founder)),
+            venue.status(&space.id)
+        ));
+        let rotated = SigningKey::from_bytes(&blake2b_256(&[b"vos/jam/statements/rotated"]));
+        let add = Op::AddKey(rotated.verifying_key().to_bytes());
+        let controls = [
+            (
+                "remove the founder's key",
+                Op::RemoveKey(space.founder.verifying_key().to_bytes()),
+            ),
+            ("add a rotated key", add),
+            ("resume", Op::Resume),
+        ];
+        let mut codes = Vec::new();
+        for (what, op) in controls {
+            let code = venue.control(&space.id, op, &space.controller)?;
+            self.record.note(format!("control, {what}: {code}"));
+            codes.push(code);
+        }
+        let replayed_add = venue.control_at(&space.id, 1, add, &space.controller)?;
+        self.record.note(format!(
+            "the add's control replayed: {replayed_add}; {:?}",
+            venue.status(&space.id)
+        ));
+        let later = loop {
+            let open = space.clock.window(venue.statements.now()?).unwrap_or(0);
+            if open >= start + 2 {
+                break open - 1;
+            }
+            std::thread::sleep(Duration::from_secs(6));
+        };
+        let resumed = venue.anchor_now(&space.anchor(venue.id(), later, 3, &rotated));
+        self.record.note(format!(
+            "anchor window {later} by the rotated key: {resumed:?}"
+        ));
+        Ok(Controlled {
+            codes,
+            replayed_add,
+            resumed,
+        })
+    }
+
+    /// The space migrated away from a window past the venue's next by the
+    /// time its item lands.
+    fn migrate(&mut self, space: &Space) -> Result<Result<(), MigrateRefusal>, Failed> {
+        let next = self
+            .venue
+            .statements
+            .now()
+            .map(|now| space.clock.window(now).unwrap_or(0) + 2)?;
+        let migrate = Migrate {
+            space: space.id,
+            from: self.venue.id(),
+            to: VenueId([0xee; 32]),
+            from_window: next,
+        };
+        let migrated = self.venue.migrate(&migrate, &space.controller);
+        self.record
+            .note(format!("migrate from window {next}: {migrated:?}"));
+        Ok(migrated)
+    }
+
+    /// The outcome's refine gas against the JAM-only host's for the same
+    /// item.
+    fn compare(
+        &mut self,
+        payload: &[u8],
+        extrinsics: &[Vec<u8>],
+        outcome: &Outcome,
+    ) -> Result<(), Failed> {
+        let local = jam_only_gas(&self.program, self.service, payload, extrinsics)?;
+        self.record.note(format!(
+            "  its refine on the JAM-only host: {local} gas; PolkaJam's {}: {}",
+            outcome.refine_gas,
+            if local == outcome.refine_gas {
+                "equal".to_string()
+            } else {
+                format!("{} apart", outcome.refine_gas as i128 - local as i128)
+            }
+        ));
+        Ok(())
+    }
+}
+
+/// Every verdict the expected one: the fixtures' statements' codes (the
+/// rootless one, its replay, the rooted one), the controls', the rotated
+/// key's anchor and the migration.
+fn check(
+    [landed, replayed, other]: &[u32; 3],
+    controlled: &Controlled,
+    migrated: Result<(), MigrateRefusal>,
+) -> Result<(), Failed> {
     let expected = [
-        (landed.code, 0, "the rootless statement accepted"),
+        (*landed, 0, "the rootless statement accepted"),
         (
-            replayed.code,
+            *replayed,
             Refusal::Repeated.code(),
             "its replay refused as repeated",
         ),
         (
-            other.code,
+            *other,
             Refusal::Venue.code(),
             "the rooted one refused as another venue's",
         ),
@@ -397,26 +528,18 @@ fn drive(args: &StatementsArgs, record: &mut Record) -> Result<(), Failed> {
             return Err(format!("{what}: code {code:#x}").into());
         }
     }
-    if controlled != [0, 0, 0] || replayed_add != ControlCode::Nonce as u32 {
-        return Err(format!("the controls: {controlled:?}, the replay {replayed_add}").into());
+    let Controlled {
+        codes,
+        replayed_add,
+        resumed,
+    } = controlled;
+    if codes != &[0, 0, 0] || *replayed_add != ControlCode::Nonce as u32 {
+        return Err(format!("the controls: {codes:?}, the replay {replayed_add}").into());
     }
     if resumed.as_ref().ok().copied().and_then(anchor_code) != Some(AnchorCode::New) {
         return Err(format!("the rotated key's anchor: {resumed:?}").into());
     }
     migrated.map_err(|refusal| format!("the migration refused: {refusal:?}"))?;
-    record.note("every verdict as expected");
-    let accounting = venue.statements.account(baseline, || lock(&sent).clone())?;
-    record.note(format!(
-        "the service's storage: {} entries, {} named from the {} packages sent, {} outcomes \
-         among them",
-        accounting.held,
-        accounting.named,
-        lock(&sent).len(),
-        accounting.outcomes
-    ));
-    if accounting.held != accounting.named {
-        return Err("the service holds entries no package the run sent names".into());
-    }
     Ok(())
 }
 
@@ -424,26 +547,4 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-/// The outcome's refine gas against the JAM-only host's for the same item.
-fn compare(
-    record: &mut Record,
-    program: &[u8],
-    service: u64,
-    payload: &[u8],
-    extrinsics: &[Vec<u8>],
-    outcome: &Outcome,
-) -> Result<(), Failed> {
-    let local = jam_only_gas(program, service, payload, extrinsics)?;
-    record.note(format!(
-        "  its refine on the JAM-only host: {local} gas; PolkaJam's {}: {}",
-        outcome.refine_gas,
-        if local == outcome.refine_gas {
-            "equal".to_string()
-        } else {
-            format!("{} apart", outcome.refine_gas as i128 - local as i128)
-        }
-    ));
-    Ok(())
 }

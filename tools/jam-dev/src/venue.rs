@@ -226,6 +226,19 @@ impl Jam {
     /// finalized block holds it: the service's code (`ControlCode`).
     pub fn control(&self, space: &SpaceId, op: Op, controller: &SigningKey) -> Result<u32, Error> {
         let nonce = self.space(space)?.map_or(0, |record| record.nonce);
+        self.control_at(space, nonce, op, controller)
+    }
+
+    /// A space's control by its controller at `nonce`: the service's code
+    /// (`ControlCode`), `ControlCode::Nonce` for a nonce not the space's
+    /// next.
+    pub fn control_at(
+        &self,
+        space: &SpaceId,
+        nonce: u64,
+        op: Op,
+        controller: &SigningKey,
+    ) -> Result<u32, Error> {
         let control = Control {
             space: *space,
             nonce,
