@@ -162,7 +162,7 @@ impl Node {
         use ed25519_dalek::Signer;
         let key = self.inner.anchor_keys.node_key();
         let public = key.verifying_key().to_bytes();
-        let genesis = self.inner.space.as_ref()?.genesis()?;
+        let genesis = self.inner.genesis()?;
         if !genesis.nodes.iter().any(|(_, founder)| *founder == public) {
             return None;
         }

@@ -54,7 +54,7 @@ pub struct Space {
 
 /// The genesis file beside the space file at `space`: its name with
 /// `.genesis` after it.
-pub fn genesis_path(space: &Path) -> PathBuf {
+pub(crate) fn genesis_path(space: &Path) -> PathBuf {
     let mut name = space.as_os_str().to_owned();
     name.push(".genesis");
     PathBuf::from(name)
@@ -74,7 +74,7 @@ fn parse_genesis(text: &str) -> Result<SpaceGenesis, String> {
 
 /// The genesis beside the space file at `space`; none when there is no
 /// such file.
-pub fn read_genesis(space: &Path) -> Result<Option<SpaceGenesis>, String> {
+pub(crate) fn read_genesis(space: &Path) -> Result<Option<SpaceGenesis>, String> {
     let path = genesis_path(space);
     match std::fs::read_to_string(&path) {
         Ok(text) => parse_genesis(&text)

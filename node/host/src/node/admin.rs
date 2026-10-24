@@ -177,9 +177,7 @@ impl Inner {
     /// Whether node `number` founded the space: its key, in the genesis, a
     /// venue registers as an anchor key.
     fn founding(&self, number: NodeNumber) -> bool {
-        self.space
-            .as_ref()
-            .and_then(|space| space.genesis())
+        self.genesis()
             .is_some_and(|genesis| genesis.nodes.iter().any(|(node, _)| *node == number))
     }
 

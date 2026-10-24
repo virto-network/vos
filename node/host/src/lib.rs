@@ -42,7 +42,7 @@ pub use node::{
     ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, ReplaceError, Reply, STORE,
     wall_clock,
 };
-pub use space::{Space, SpaceNode, genesis_path, read_genesis, write_genesis};
+pub use space::{Space, SpaceNode, write_genesis};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -203,7 +203,8 @@ pub trait Hooks: Send + Sync {
     /// Before a leader first sends chunk `sequence` of a snapshot stream to
     /// `to`, whose follower has asked for the chunks from `wanted` on (0
     /// before it answered): how long it waits first, as on a slow link.
-    fn delay_chunk(&self, _to: NodeNumber, _sequence: u64, _wanted: u64) -> Duration {
+    fn delay_chunk(&self, to: NodeNumber, sequence: u64, wanted: u64) -> Duration {
+        let _ = (to, sequence, wanted);
         Duration::ZERO
     }
 

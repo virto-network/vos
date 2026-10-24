@@ -186,13 +186,15 @@ impl Inner {
         )
     }
 
+    /// The space's genesis, when the node has one.
+    pub(crate) fn genesis(&self) -> Option<&vos_wire::vos_anchor::SpaceGenesis> {
+        self.space.as_ref().and_then(|space| space.genesis())
+    }
+
     /// The space's representative ([`vos_wire::served::representative`]):
     /// none without a genesis.
     pub(crate) fn representative(&self) -> Option<AgentId> {
-        self.space
-            .as_ref()
-            .and_then(|space| space.genesis())
-            .and_then(vos_wire::served::representative)
+        self.genesis().and_then(vos_wire::served::representative)
     }
 
     /// The anchor keys the space has registered: the venue's listing, or,
@@ -203,9 +205,7 @@ impl Inner {
         match &self.venue {
             Some(venue) => venue.anchor_keys(&space),
             None => self
-                .space
-                .as_ref()
-                .and_then(|space| space.genesis())
+                .genesis()
                 .map(|genesis| genesis.nodes.iter().map(|(_, key)| *key).collect())
                 .unwrap_or_default(),
         }

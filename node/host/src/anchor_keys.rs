@@ -97,25 +97,24 @@ impl AnchorKeys {
     }
 }
 
-/// The store of the stopped node whose data directory is `data`, and its
-/// node key's seed: refused when the node has not run.
-fn stopped(data: &Path) -> Result<(Fjall, [u8; 32]), String> {
+/// The store of the stopped node whose data directory is `data`: refused
+/// when the node has not run.
+fn stopped(data: &Path) -> Result<Fjall, String> {
     let path = data.join(crate::STORE);
-    let failed = |error: fjall::Error| format!("{}: {error:?}", path.display());
     if !path.exists() {
         return Err(format!(
             "{}: no node's store; run the node once first",
             path.display()
         ));
     }
-    let store = Fjall::open(&path).map_err(failed)?;
-    let Some(secret) = store.node_secret().map_err(failed)? else {
+    let store = Fjall::open(&path).map_err(failed(data))?;
+    if store.node_secret().map_err(failed(data))?.is_none() {
         return Err(format!(
             "{}: the node has no key yet; run it once first",
             path.display()
         ));
-    };
-    Ok((store, secret))
+    }
+    Ok(store)
 }
 
 fn failed(data: &Path) -> impl Fn(fjall::Error) -> String {
@@ -129,7 +128,7 @@ fn failed(data: &Path) -> impl Fn(fjall::Error) -> String {
 /// it once a venue lists it.
 pub fn rotate_anchor_key(data: impl AsRef<Path>) -> Result<[u8; 32], String> {
     let data = data.as_ref();
-    let (store, _) = stopped(data)?;
+    let store = stopped(data)?;
     let number = next_number(&store.anchor_secrets().map_err(failed(data))?);
     let seed: [u8; 32] = random();
     let mut batch = store.batch();

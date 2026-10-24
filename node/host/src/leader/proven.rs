@@ -26,12 +26,19 @@ impl Leader {
     pub(super) fn proofs(&self, snapshot: &Snapshot) -> Result<Vec<Pending>, Fault> {
         let mut due = Vec::new();
         for (id, window, proof) in self.inner.unrecorded.of(self.id) {
-            if snapshot.get(self.id, &keys::proven(window, &id))?.is_some() {
+            if snapshot
+                .get(self.id, &keys::proven(window, &id.0))?
+                .is_some()
+            {
                 self.inner.unrecorded.recorded(self.id, &id);
                 continue;
             }
             if due.len() < PROVEN {
-                due.push(Pending::Duty(Input::Proven { window, id, proof }));
+                due.push(Pending::Duty(Input::Proven {
+                    window,
+                    id: id.0,
+                    proof,
+                }));
             }
         }
         Ok(due)

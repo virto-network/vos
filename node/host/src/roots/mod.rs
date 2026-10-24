@@ -52,9 +52,9 @@ use crate::store::{Fjall, Snapshot};
 mod cuts;
 
 pub use cuts::{
-    CutProof, ReadRow, answered, closing_of, cut_proof, cut_proof_at, cut_root, latest_built,
-    served_at, serving_windows, undo,
+    CutProof, ReadRow, cut_proof, cut_proof_at, cut_root, latest_built, served_at, undo,
 };
+pub(crate) use cuts::{answered, closing_of, serving_windows};
 
 /// The most distinct keys one batch rebuilds.
 pub(crate) const BATCH: usize = 10_000;
@@ -497,13 +497,13 @@ impl Build {
 
     /// Whether the build was of a window's cut, and its last batch is
     /// taken: its root and its proofs are in that batch's commit.
-    pub fn finished_cut(&self) -> bool {
+    pub(crate) fn finished_cut(&self) -> bool {
         self.done && self.cut.is_some()
     }
 
     /// Build as the space's representative's: the commit that finishes a
     /// cut keeps its close ([`keys::closing`]).
-    pub fn representing(mut self, representative: bool) -> Self {
+    pub(crate) fn representing(mut self, representative: bool) -> Self {
         self.representative = representative;
         self
     }

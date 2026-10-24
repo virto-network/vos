@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use vos_node_prover::{Backlog, Host, Job, Jobs, Options, Prover, Worker};
 use vos_raft::Role;
@@ -40,10 +40,10 @@ const REPORT_EVERY: Duration = Duration::from_secs(60);
 pub(crate) struct Unrecorded(Mutex<HashMap<AgentId, Proofs>>);
 
 /// Statements' windows and proofs, by statement id.
-type Proofs = BTreeMap<[u8; 32], (u64, [u8; 32])>;
+type Proofs = BTreeMap<StatementId, (u64, [u8; 32])>;
 
 impl Unrecorded {
-    fn add(&self, agent: AgentId, window: u64, id: [u8; 32], proof: [u8; 32]) {
+    fn add(&self, agent: AgentId, window: u64, id: StatementId, proof: [u8; 32]) {
         lock(&self.0)
             .entry(agent)
             .or_default()
@@ -51,7 +51,7 @@ impl Unrecorded {
     }
 
     /// `agent`'s, each its statement's id, its window and its proof.
-    pub(crate) fn of(&self, agent: AgentId) -> Vec<([u8; 32], u64, [u8; 32])> {
+    pub(crate) fn of(&self, agent: AgentId) -> Vec<(StatementId, u64, [u8; 32])> {
         lock(&self.0)
             .get(&agent)
             .map(|waiting| {
@@ -64,7 +64,7 @@ impl Unrecorded {
     }
 
     /// `agent`'s statement `id`, recorded.
-    pub(crate) fn recorded(&self, agent: AgentId, id: &[u8; 32]) {
+    pub(crate) fn recorded(&self, agent: AgentId, id: &StatementId) {
         let mut waiting = lock(&self.0);
         if let Some(of) = waiting.get_mut(&agent) {
             of.remove(id);
@@ -165,9 +165,10 @@ impl Host for NodeHost {
     /// pins.
     fn hold(&self, hash: &[u8; 32], held: bool) {
         let mut batch = self.0.store.batch();
-        match held {
-            true => batch.pin(hash, NODE_AGENT),
-            false => batch.unpin(hash, NODE_AGENT),
+        if held {
+            batch.pin(hash, NODE_AGENT);
+        } else {
+            batch.unpin(hash, NODE_AGENT);
         }
         if let Err(error) = batch.commit(PersistMode::SyncAll) {
             tracing::warn!("a proof's pin was not written: {error:?}");
@@ -200,7 +201,7 @@ impl Host for NodeHost {
     }
 
     fn record(&self, agent: AgentId, window: u64, id: StatementId, proof: [u8; 32]) {
-        self.0.unrecorded.add(agent, window, id.0, proof);
+        self.0.unrecorded.add(agent, window, id, proof);
         if let Some(run) = self.0.run(agent) {
             run.agent.wake();
         }
@@ -297,7 +298,7 @@ pub(crate) fn start(
 /// Step the worker until stopped, waiting [`IDLE`] whenever a step leaves
 /// nothing to prove, and its backlog kept for the node to report.
 fn work(mut worker: Worker<NodeHost, NodeJobs>, stopped: &mpsc::Receiver<()>) {
-    let mut reported = std::time::Instant::now();
+    let mut reported = Instant::now();
     loop {
         if worker.host().0.closing.load(Ordering::SeqCst) {
             return;
@@ -312,7 +313,7 @@ fn work(mut worker: Worker<NodeHost, NodeJobs>, stopped: &mpsc::Receiver<()>) {
         };
         if let Ok(backlog) = worker.backlog() {
             if backlog.pending() > 0 && reported.elapsed() >= REPORT_EVERY {
-                reported = std::time::Instant::now();
+                reported = Instant::now();
                 report(&backlog);
             }
             *lock(&worker.host().0.backlog) = Some(backlog);
