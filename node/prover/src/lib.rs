@@ -1,4 +1,4 @@
-//! The node's prover worker (`slice-6-on-chain.md`, 6.18).
+//! The node's prover worker (`proving.md` §6, "Venues in the node").
 //!
 //! **The role** is the leader of the agent whose record it is: a node
 //! proves and submits the statements of the agents it leads. Every replica
@@ -14,23 +14,24 @@
 //! so a record read twice makes one job.
 //!
 //! **For each attest at a window's cut** in an agent's log: the statement
-//! it makes ([`Statement`](vos_venue::vos_statement::Statement): `format::MASKED_WRAP`,
-//! its kernel's program id recomputed from the kernel's blob, the space,
-//! the public arguments, the output and the roots) and its id. A statement
-//! whose anchor would pass `MaxRootAge` by the venue's time before its
-//! proof ends is dead, never proved (pin D's rule: time between parties is
-//! the venue's). Otherwise the [`Prover`] re-runs the kernel on the
-//! record's witness, refuses a run whose output or io-hash is not the
-//! record's, and proves it: segments, leaves, folds and the masked wrap.
-//! The proof is kept in the node's blob store, held there until its job
-//! finishes, and the agent records it (`Input::Proven { window, id,
-//! proof }`, through its leader). Once recorded and once the venue holds
-//! its roots anchored, it is submitted through the space's
-//! [`VenueClient`](vos_venue::VenueClient); a venue's repeat counts as
-//! accepted, and a submission whose answer was lost goes again after 30 s,
-//! the wait doubled each time. A prover that panics on a statement, or
-//! stops the node, gives it up after three attempts; a panic's message is
-//! withheld from standard error while a proof is made, its place printed.
+//! it makes ([`Statement`](vos_venue::vos_statement::Statement):
+//! `format::MASKED_WRAP`, its kernel's program id recomputed from the
+//! kernel's blob, the space, the public arguments, the output and the
+//! roots) and its id. A statement whose anchor would pass `MaxRootAge` by
+//! the venue's time before its proof ends is dead, never proved (every
+//! deadline between parties is the venue's time, `proving.md` §7).
+//! Otherwise the [`Prover`] re-runs the kernel on the record's witness,
+//! refuses a run whose output or io-hash is not the record's, and proves
+//! it: segments, leaves, folds and the masked wrap. The proof is kept in
+//! the node's blob store, held there until its job finishes, and the agent
+//! records it (`Input::Proven { window, id, proof }`, through its leader).
+//! Once recorded and once the venue holds its roots anchored, it is
+//! submitted through the space's [`VenueClient`](vos_venue::VenueClient); a
+//! venue's repeat counts as accepted, and a submission whose answer was
+//! lost goes again after 30 s, the wait doubled each time. A prover that
+//! panics on a statement, or stops the node, gives it up after three
+//! attempts; a panic's message is withheld from standard error while a
+//! proof is made, its place printed.
 //!
 //! **Idempotent by statement id:** a restart finds a job it was proving
 //! queued again and proves it once more; a submission it made counts once

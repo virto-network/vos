@@ -1,8 +1,8 @@
-//! The end to end on chain (`slice-6-on-chain.md` 6.21): three nodes of a
-//! space running `balance`, the window actor, the reader and the
-//! representative, each proving with the masked prover, anchor first at
-//! Kreivo, as its spaces pallet's mock models it, then migrate to the JAM
-//! statements service on a PolkaJam testnet.
+//! The end to end on chain: three nodes of a space running `balance`, the
+//! window actor, the reader and the representative, each proving with the
+//! masked prover, anchor first at Kreivo, as its spaces pallet's mock
+//! models it, then migrate to the JAM statements service on a PolkaJam
+//! testnet.
 //!
 //! - **Kreivo:** the space registered and its authorities added by the
 //!   pallet's calls; each node anchors and submits through its
@@ -26,10 +26,10 @@
 //!   chain, every frame between the nodes, each node's store and disk, the
 //!   process's logs and standard error (`collect`).
 //! - **Measured:** each statement's latency from its window's boundary to
-//!   its acceptance, against pin D's `L/2 + D + t_prove + inclusion` and
-//!   the gate `L + D + t_prove + 30 s`; the refine gas of each statement at
-//!   the service; the deposits and fees the mock charged the sovereign
-//!   account; the prover's throughput.
+//!   its acceptance, against `proving.md` §7's
+//!   `L/2 + D + t_prove + inclusion` and the gate `L + D + t_prove + 30 s`;
+//!   the refine gas of each statement at the service; the deposits and fees
+//!   the mock charged the sovereign account; the prover's throughput.
 //!
 //! It runs against the testnet `just e2e-chain` starts, alone in its
 //! process, which it captures whole.

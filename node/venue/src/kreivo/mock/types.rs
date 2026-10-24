@@ -100,7 +100,7 @@ pub struct ProgramInfo {
     pub active: Active,
 }
 
-/// `anchor`'s argument: pin D's `Anchor`.
+/// `anchor`'s argument: `vos-anchor`'s `Anchor`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AnchorArg {
     pub space: Space,
@@ -445,7 +445,7 @@ mod tests {
     }
 
     /// A call's bytes are `[90, call_index] ++ SCALE(args)`; `anchor`'s
-    /// argument is pin D's `Anchor` in `vos-anchor`'s encoding.
+    /// argument is an `Anchor` in `vos-anchor`'s encoding.
     #[test]
     fn a_call_is_its_pinned_bytes() {
         let resume = RuntimeCall::Spaces(Call::Resume { space: [7; 32] }).encode();

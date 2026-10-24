@@ -645,11 +645,10 @@ impl Shared {
         }
     }
 
-    /// What the venue's state says of `statement` before paying for it,
-    /// in pin F's order as far as its storage tells (the pause, the
-    /// format, the program, a repeat), then the paying space and its
-    /// budget: a verdict, or none to send it. A read that fails says
-    /// nothing.
+    /// What the venue's state says of `statement` before paying for it, in
+    /// `spaces-pallet.md` §6.3's order as far as its storage tells (the pause,
+    /// the format, the program, a repeat), then the paying space and its
+    /// budget: a verdict, or none to send it. A read that fails says nothing.
     fn before_paying(
         &self,
         statement: &Statement,

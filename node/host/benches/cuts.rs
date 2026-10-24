@@ -1,10 +1,10 @@
-//! Window cuts' costs through the node's store and root builder, the
-//! plan's two gates for them:
+//! Window cuts' costs through the node's store and root builder, and
+//! their two gates:
 //!
 //! - **a committed write with a cut pending:** the node's apply of a
 //!   result's committed writes, its undo rows read and written beside
 //!   them ([`roots::undo`]), against the same writes with no cut pending.
-//!   Gate: accumulate's 1.05 µs on the JIT (slice 4) plus the store's
+//!   Gate: accumulate's 1.05 µs on the JIT plus the store's
 //!   path with a cut pending, at most twice the 4.3 µs a committed write
 //!   costs with none. The ratio to the bench's own cost with no cut
 //!   pending is printed beside it;
@@ -37,7 +37,7 @@ const PER_RESULT: u64 = 1_000;
 /// The pending requests a cut proves, and the rows each reads.
 const REQUESTS: u64 = 100;
 const ROWS: u64 = 16;
-/// The plan's gates.
+/// The gates.
 const WRITE_GATE_US: f64 = 2.0 * 4.3;
 const ACCUMULATE_US: f64 = 1.05;
 const CUT_GATE: Duration = Duration::from_secs(1);

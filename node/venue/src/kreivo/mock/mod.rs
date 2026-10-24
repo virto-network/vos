@@ -1,6 +1,6 @@
 //! A plain-Rust model of Kreivo's spaces pallet (`spaces-pallet.md` §4–§8),
 //! not a FRAME pallet: the reference the conformance vectors are generated
-//! from, and the chain 6.17b's client is tested against.
+//! from, and the chain the Kreivo client is tested against.
 //!
 //! - **Storage** is raw, a map from the pinned keys ([`keys`]) to SCALE
 //!   values ([`types`]), so what a call writes is FRAME's bytes.
@@ -661,7 +661,7 @@ impl Chain {
         Ok(info)
     }
 
-    /// §6.2.
+    /// `spaces-pallet.md` §6.2.
     fn register(
         &mut self,
         genesis: &[u8],
@@ -821,7 +821,7 @@ impl Chain {
         Ok(())
     }
 
-    /// §6.1, the anchor rule.
+    /// `spaces-pallet.md` §6.1, the anchor rule.
     fn anchor(&mut self, anchor: &AnchorArg, events: &mut Vec<Event>) -> Dispatched {
         self.paused(PAUSE_ANCHOR)?;
         let space = anchor.space;
@@ -910,7 +910,7 @@ impl Chain {
         Ok(())
     }
 
-    /// §6.3, pin F's order.
+    /// `spaces-pallet.md` §6.3, in its order.
     fn submit_statement(
         &mut self,
         who: &AccountId,
@@ -985,8 +985,8 @@ impl Chain {
         account.free += deposit;
     }
 
-    /// Steps 6–9 of §6.3: the statement decoded, its format and program
-    /// active now, then `judge`. The statement and its id, or the
+    /// Steps 6–9 of `spaces-pallet.md` §6.3: the statement decoded, its format
+    /// and program active now, then `judge`. The statement and its id, or the
     /// refusal's code.
     fn judge(&self, bytes: &[u8], proof: &[u8]) -> Result<(Statement, StatementId), u32> {
         let statement =
@@ -1051,12 +1051,11 @@ impl Chain {
         Ok(())
     }
 
-    /// §6.4: Root at any time; `ProgramsOrigin` only with a delay. A
-    /// change that only sets or shortens a stored entry's `until_ms`, the
-    /// rest of it unchanged (`rest_same`), needs that `until_ms` no
-    /// earlier than `now + ProgramChangeDelay`; any other, a new entry
-    /// among them, needs its `from_ms` (and any `until_ms`) no earlier
-    /// than that.
+    /// `spaces-pallet.md` §6.4: Root at any time; `ProgramsOrigin` only with a
+    /// delay. A change that only sets or shortens a stored entry's `until_ms`,
+    /// the rest of it unchanged (`rest_same`), needs that `until_ms` no earlier
+    /// than `now + ProgramChangeDelay`; any other, a new entry among them,
+    /// needs its `from_ms` (and any `until_ms`) no earlier than that.
     fn governed(
         &self,
         origin: Origin,
@@ -1090,8 +1089,8 @@ impl Chain {
         }
     }
 
-    /// §6.5, with weight enough for every entry: anchors past
-    /// `MaxRootAge` and `Seen` entries past their expiry pruned; `Last`,
+    /// `spaces-pallet.md` §6.5, with weight enough for every entry: anchors
+    /// past `MaxRootAge` and `Seen` entries past their expiry pruned; `Last`,
     /// `Equivocations` and a rootless statement's entry kept.
     pub fn on_idle(&mut self) {
         let now = self.now_ms;

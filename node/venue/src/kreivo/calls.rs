@@ -55,7 +55,7 @@ pub struct ProgramInfo {
     pub active: Active,
 }
 
-/// `anchor`'s argument: pin D's `Anchor`.
+/// `anchor`'s argument: `vos-anchor`'s `Anchor`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AnchorArg {
     pub space: [u8; 32],
@@ -683,8 +683,8 @@ mod tests {
         assert_eq!(Error::from_index(29), None);
     }
 
-    /// The anchor call is `[90, 7]` and pin D's `Anchor` in
-    /// `vos-anchor`'s encoding.
+    /// The anchor call is `[90, 7]` and an `Anchor` in `vos-anchor`'s
+    /// encoding.
     #[test]
     fn an_anchor_call_is_its_pinned_bytes() {
         let anchor = Anchor {

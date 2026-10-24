@@ -23,9 +23,9 @@ pub fn all(run: &mut Run, stated: &[Stated], judged: &[(String, Judged)]) {
 }
 
 /// Each statement's latency from `B_w` to its acceptance, within `L + D +
-/// t_prove + 30 s`; pin D's `L/2 + D + t_prove + inclusion`, the wait of a
-/// request asked at a random time in its window, noted as a reference, its
-/// `L/2` computed, not measured.
+/// t_prove + 30 s`; `proving.md` §7's `L/2 + D + t_prove + inclusion`, the
+/// wait of a request asked at a random time in its window, noted as a
+/// reference, its `L/2` computed, not measured.
 fn latency(run: &mut Run, stated: &[Stated]) {
     let (l, d) = (run.clock.length_ms, delay(&run.clock));
     let proved = run.prover.proved();
@@ -78,7 +78,7 @@ fn latency(run: &mut Run, stated: &[Stated]) {
         references.iter().max().unwrap(),
     );
     run.record.note(format!(
-        "  for reference, pin D's L/2 + D + t_prove + inclusion with these terms (L/2 \
+        "  for reference, L/2 + D + t_prove + inclusion with these terms (L/2 \
          computed): {:.1}–{:.1} s",
         *low as f64 / 1e3,
         *high as f64 / 1e3

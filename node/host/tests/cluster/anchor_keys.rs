@@ -424,8 +424,8 @@ fn a_rotation_survives_its_crash() {
 }
 
 /// A founding node signs the space's registration by its node key, over
-/// pin D's registration digest; a node the genesis does not name, or a
-/// node of no space, signs none.
+/// `vos-anchor`'s registration digest; a node the genesis does not name, or
+/// a node of no space, signs none.
 #[test]
 fn only_a_founding_node_signs_the_registration() {
     let venue = vos_wire::vos_anchor::VenueId([0x5e; 32]);

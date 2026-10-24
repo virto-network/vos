@@ -4,15 +4,15 @@
 //! venue in every anchor's digest.
 //!
 //! [`ModelVenue`] keeps a venue's state as `vos_statement::model` does, its
-//! anchors and the statements it accepted as lists, and checks what pin D
-//! and pin F say a venue checks: the anchor rule (a registered,
-//! unsuspended space; a registered key; the signature; `Last < w < now_w`;
-//! the root no older than `MaxRootAge`; the window within the space's
-//! range here, which a migration away ends) and `judge`. A second root for
-//! one `(space, kind, w)` is kept as evidence and suspends the space. Its
-//! anchor keys are kept by space, the founding ones first, added and
-//! removed as `spaces-pallet.md`'s controller does, and `resume` lifts a
-//! suspension once neither equivocating key is registered.
+//! anchors and the statements it accepted as lists, and checks what
+//! `spaces-pallet.md` §6.1 and §6.3 say a venue checks: the anchor rule (a
+//! registered, unsuspended space; a registered key; the signature;
+//! `Last < w < now_w`; the root no older than `MaxRootAge`; the window
+//! within the space's range here, which a migration away ends) and `judge`.
+//! A second root for one `(space, kind, w)` is kept as evidence and
+//! suspends the space. Its anchor keys are kept by space, the founding ones
+//! first, added and removed as `spaces-pallet.md`'s controller does, and
+//! `resume` lifts a suspension once neither equivocating key is registered.
 //!
 //! [`kreivo::KreivoVenue`] is Kreivo's: the client of its spaces pallet,
 //! built only against its mock until the pallet is vetted. A client that
@@ -51,8 +51,8 @@ pub trait VenueClient: Send + Sync {
     fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]>;
     /// Where `space` stands at the venue, as far as it can say.
     fn status(&self, space: &SpaceId) -> Status;
-    /// The venue's time, in milliseconds since the Unix epoch, as last
-    /// read: what every deadline between parties is timed by (pin D). None
+    /// The venue's time, in milliseconds since the Unix epoch, as last read:
+    /// what every deadline between parties is timed by (`proving.md` §7). None
     /// before the client has read it.
     fn time(&self) -> Option<u64>;
     /// The anchors of `space` this client took ([`Anchored::Queued`]) and

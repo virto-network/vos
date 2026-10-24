@@ -21,7 +21,7 @@ use super::{PolkaJam, failed};
 use vos_jam::Error;
 
 /// A package's accumulate gas an item: the service's accumulate takes about
-/// 0.1M a statement on the JAM-only host and on PolkaJam, as measured at 6.19.
+/// 0.1M a statement on the JAM-only host and on PolkaJam.
 pub const ACCUMULATE_GAS: u64 = 10_000_000;
 /// The least accumulate gas a work item to the service may declare, set at
 /// its creation: above its worst item's, a statement of `MAX_ROOTS` roots,

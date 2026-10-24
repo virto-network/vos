@@ -393,7 +393,7 @@ fn sign(before: u128, after: u128) -> String {
 }
 
 /// A `Budget` value in a `fees` vector: its `window` in hex, its `spent`
-/// (which sums the fees, the teammate's weights) `?` for each nibble.
+/// (which sums the fees, Kreivo's weights) `?` for each nibble.
 fn masked_spend(value: &[u8]) -> String {
     let window = &value[..value.len().min(8)];
     format!(
