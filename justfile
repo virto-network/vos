@@ -19,6 +19,7 @@ guest_flags := "--target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core
 # with it.
 test:
     cargo test {{core_crates}}
+    cargo test -p vos-statement --features heap-peak --test heap
     just test-recair
     cargo test -p vos-pvm-proof --lib
 
@@ -282,6 +283,10 @@ _forbidden +gates:
         [store-dump "-p vos-cli --features prover" [dump] []] \
         [store-dump "-p vos-node" [dump] []] \
         [store-dump "-p vos-node --features prover" [dump] []] \
+        [heap-peak "--workspace" [heap-peak] []] \
+        [heap-peak "-p vos-cli --features prover" [heap-peak] []] \
+        [heap-peak "-p vos-statement --features pvm-guest" [heap-peak] []] \
+        [heap-peak "-p vos-statement-service --features pvm-guest" [heap-peak] []] \
     ]; \
     let failures = ($table | where gate in [{{gates}}] | group-by args | items {|args, rows| \
         let resolved = (cargo tree ...($args | split row ' ') -e no-dev --target all -f '{p}|{f}' --prefix none | complete); \
@@ -306,8 +311,8 @@ _debug-names-absent:
     let binary = (open --raw target/debug/vos); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"the node's binary names ($name)" } } }
 
 # Every `check-no-*` gate below, each build resolved once.
-check-no-leaks: (_forbidden "jam-dev" "venue-clients" "seeded-masks" "debug-internals" "test-formats" "store-dump") _seeded-masks-unimplied _debug-names-absent
-    print "no test seam, debug output, test format, store dump, JAM client or venue client in a production build"
+check-no-leaks: (_forbidden "jam-dev" "venue-clients" "seeded-masks" "debug-internals" "test-formats" "store-dump" "heap-peak") _seeded-masks-unimplied _debug-names-absent
+    print "no test seam, debug output, test format, store dump, heap peak, JAM client or venue client in a production build"
 
 # A node knows no JAM: the JAM client (a PolkaJam node's RPC and `jamt`,
 # the statements service's client and `JamVenue`) is development tooling,
@@ -368,6 +373,14 @@ check-no-test-formats: (_forbidden "test-formats")
 # checker enables it, a dev edge of both).
 check-no-store-dump: (_forbidden "store-dump")
     print "no store dump in a production build"
+
+# The guests' heap peak (`vos-statement`'s and the JAM statements service's
+# `heap-peak`), a measurement build's, reaches no production build: no
+# normal or build edge of any workspace member, of the `vos` binary with
+# the prover, nor of the venues' guests (`final-verify` and the service's
+# program) enables it.
+check-no-heap-peak: (_forbidden "heap-peak")
+    print "no heap peak in a production build"
 
 # The builds without std. vos-raft for an embedded target, on core and alloc
 # alone, built from the toolchain's source. The proof verifier, which reads
