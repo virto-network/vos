@@ -15,7 +15,7 @@
 //! the fold re-hashes from the child's preimage), the interaction PoW, the
 //! relation, the claimed sums; then the logup sums with the public terms:
 //! the claimed sums, `u`'s use and each output's add to zero; then Stwo's
-//! protocol, as a segment's ([`verify_rest`]).
+//! protocol, as a segment's (`verify_rest`).
 //!
 //! **The circuit hash** ([`circuit_hash`]) is [`vos_pvm_recair_air::circuit_hash`]
 //! in rows: one transcript absorption, from the zero digest, of the format's

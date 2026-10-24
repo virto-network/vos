@@ -3,12 +3,12 @@
 //! the trees' orders and heights, the samples, DEEP's plan, FRI's layers and
 //! the compiled constraints), the values past the AIR's own prefix
 //! ([`StarkValues`]), and the transcript from the interaction PoW on
-//! ([`interaction`], [`verify_rest`]).
+//! ([`interaction`], `verify_rest`).
 //!
 //! An AIR's verifier runs its own prefix (a segment: its header, its
 //! preprocessed root against the shape's, its boundary states; a recursion
 //! AIR proof: its header, its preprocessed root, its outputs), then
-//! [`interaction`], its own logup check, then [`verify_rest`], each check
+//! [`interaction`], its own logup check, then `verify_rest`, each check
 //! where the native verifier makes it.
 
 use stwo::core::pcs::PcsConfig;
