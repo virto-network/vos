@@ -101,6 +101,22 @@ impl<C: AirColumn> TraceBuilder<C> {
     }
 }
 
+#[cfg(feature = "debug-internals")]
+impl<C: AirColumn + core::fmt::Debug> TraceBuilder<C> {
+    /// Every column's values at `rows` on stderr.
+    pub fn dump(&self, rows: core::ops::Range<usize>) {
+        for row in rows {
+            for &column in C::ALL_VARIANTS {
+                let offset = column.offset();
+                let values: Vec<BaseField> = (offset..offset + column.size())
+                    .map(|index| self.cols[index][row])
+                    .collect();
+                eprintln!("DUMP row {row} {column:?}: {values:?}");
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FinalizedTrace {
     pub cols: Vec<BaseColumn>,
