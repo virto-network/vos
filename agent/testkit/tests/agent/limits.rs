@@ -388,7 +388,7 @@ fn an_install_into_another_space_than_its_agents_is_refused() {
         let models: Vec<_> = installs
             .iter()
             .map(|&(instance, _, program, target, space, clock)| {
-                kit.install_in(space, clock, target, instance, program, &[], &[])
+                kit.install_in((space, clock), target, instance, program, &[], &[])
             })
             .collect();
         let result = node.batch(0, inputs);

@@ -8,6 +8,13 @@
 extern crate alloc;
 
 use vos_sdk::prelude::*;
+use vos_sdk::table::Read;
+
+/// The rows of `reader`'s entries under `keys`, as a read at the cut
+/// names them.
+fn entries(reader: &Reader, keys: &[u64]) -> Vec<Read> {
+    keys.iter().map(|key| reader.entries.read(key)).collect()
+}
 
 #[actor]
 pub struct Reader {
@@ -58,7 +65,7 @@ impl Reader {
     pub async fn sum_at_cut(ctx: &mut Workflow<Self>, keys: Vec<u64>) -> Result<u64, AttestError> {
         let reads = keys.clone();
         ctx.attest_at_cut(reader::SumEntries { keys })
-            .reads(|reader: &Reader| reads.iter().map(|key| reader.entries.read(key)).collect())
+            .reads(|reader: &Reader| entries(reader, &reads))
             .await
     }
 
@@ -71,7 +78,7 @@ impl Reader {
         reads: Vec<u64>,
     ) -> Result<u64, AttestError> {
         ctx.attest_at_cut(reader::SumEntries { keys })
-            .reads(|reader: &Reader| reads.iter().map(|key| reader.entries.read(key)).collect())
+            .reads(|reader: &Reader| entries(reader, &reads))
             .await
     }
 
@@ -93,7 +100,7 @@ impl Reader {
             keys,
         })
         .reads(|reader: &Reader| {
-            let mut rows: Vec<_> = reads.iter().map(|key| reader.entries.read(key)).collect();
+            let mut rows = entries(reader, &reads);
             rows.push(reader.names.read(&key));
             rows
         })
@@ -110,11 +117,11 @@ impl Reader {
         let reads = keys.clone();
         let first = ctx
             .attest_at_cut(reader::SumEntries { keys: keys.clone() })
-            .reads(|reader: &Reader| reads.iter().map(|key| reader.entries.read(key)).collect())
+            .reads(|reader: &Reader| entries(reader, &reads))
             .await?;
         let second = ctx
             .attest_at_cut(reader::SumEntries { keys })
-            .reads(|reader: &Reader| reads.iter().map(|key| reader.entries.read(key)).collect())
+            .reads(|reader: &Reader| entries(reader, &reads))
             .await?;
         Ok((first, second))
     }
@@ -131,7 +138,7 @@ impl Reader {
         let reads = keys.clone();
         let sum = ctx
             .attest_at_cut(reader::SumEntries { keys })
-            .reads(|reader: &Reader| reads.iter().map(|key| reader.entries.read(key)).collect())
+            .reads(|reader: &Reader| entries(reader, &reads))
             .await?;
         let (_, me) = ctx.me();
         let made = ctx
@@ -164,7 +171,7 @@ impl Reader {
         let reads = keys.clone();
         let read = ctx
             .attest_at_cut(reader::SumEntries { keys })
-            .reads(|reader: &Reader| reads.iter().map(|key| reader.entries.read(key)).collect())
+            .reads(|reader: &Reader| entries(reader, &reads))
             .await;
         let code = read.map_or_else(|error| error.code(), |_| 0);
         ctx.update(|reader: &mut Reader| reader.outcomes.insert(&tag, &code));

@@ -1,5 +1,5 @@
 //! The guest programs this repository builds (`just build-agent
-//! build-test-actors`), linked or derived as an install derives them, and
+//! build-representative build-test-actors`), linked or derived as an install derives them, and
 //! their methods by name: for the tests and benches of the testkit and of
 //! the node.
 
@@ -29,7 +29,7 @@ pub fn agent_elf() -> PathBuf {
 }
 
 /// The space's representative's ELF.
-pub fn representative_elf() -> PathBuf {
+fn representative_elf() -> PathBuf {
     guest("representative/target/riscv64em-vos/release/vos-representative.elf")
 }
 

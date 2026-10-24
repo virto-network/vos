@@ -138,7 +138,7 @@ pub struct Testkit {
 
 /// The space and clock of an agent whose node has no genesis, which the
 /// installs name unless a test names another ([`Testkit::install_in`]).
-pub const SPACELESS: (SpaceId, WindowClock) = (SpaceId::NONE, WindowClock::DEFAULT);
+const SPACELESS: (SpaceId, WindowClock) = (SpaceId::NONE, WindowClock::DEFAULT);
 
 impl Testkit {
     pub fn new(agent: AgentId) -> Self {
@@ -190,11 +190,9 @@ impl Testkit {
     /// [`Testkit::install_for`] into an agent of `space`, whose windows
     /// `clock` numbers: refused for another space or clock than the
     /// agent's, which its first install names, before anything else.
-    #[allow(clippy::too_many_arguments)]
     pub fn install_in(
         &mut self,
-        space: SpaceId,
-        clock: WindowClock,
+        (space, clock): (SpaceId, WindowClock),
         target: Target,
         instance: InstanceId,
         program: &[u8],
