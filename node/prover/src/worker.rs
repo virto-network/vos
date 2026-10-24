@@ -274,18 +274,27 @@ impl<H: Host, J: Jobs> Worker<H, J> {
 
     /// Remove the finished jobs whose roots no venue anchors any more:
     /// their records are read past, and their statements can be judged
-    /// nowhere. A rootless statement's job is kept.
+    /// nowhere. A rootless statement, judged at no deadline, has its
+    /// finished job removed once its record is read past and compacted out
+    /// of its agent's log: no read of the log can make the job again.
     pub fn prune(&mut self) -> Result<usize, String> {
-        let Some(now) = self.venue.time() else {
-            return Ok(0);
-        };
+        let now = self.venue.time();
         let clock = self.host.clock();
         let mut removed = 0;
         for (id, job) in self.jobs.all()? {
-            let aged = job
-                .statement()
-                .and_then(|statement| deadline(&statement, &clock))
-                .is_some_and(|deadline| now > deadline);
+            let Some(statement) = job.statement() else {
+                continue;
+            };
+            if statement.roots.is_empty() {
+                if job.state.finished() && self.read_past(&job)? {
+                    self.jobs.remove(job.agent, &id)?;
+                    removed += 1;
+                }
+                continue;
+            }
+            let aged = now
+                .zip(deadline(&statement, &clock))
+                .is_some_and(|(now, deadline)| now > deadline);
             if job.state.finished() && aged {
                 self.jobs.remove(job.agent, &id)?;
                 removed += 1;
@@ -295,6 +304,13 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             }
         }
         Ok(removed)
+    }
+
+    /// Whether `job`'s record is behind its agent's watermark and no longer
+    /// in its log.
+    fn read_past(&self, job: &Job) -> Result<bool, String> {
+        Ok(self.jobs.watermark(job.agent)? >= job.index
+            && self.host.attests(job.agent, job.index)?.is_none())
     }
 
     /// Read `agent`'s records past its watermark, through its applied

@@ -55,6 +55,8 @@ fn root(window: u64) -> RootRead {
 #[derive(Default)]
 struct Agent {
     log: Vec<Vec<Attest>>,
+    /// The log's entries through this index compacted away.
+    compacted: u64,
     proven: BTreeMap<[u8; 32], [u8; 32]>,
 }
 
@@ -115,6 +117,9 @@ impl Host for Node {
 
     fn attests(&self, _: AgentId, index: u64) -> Result<Option<Vec<Attest>>, String> {
         let agent = self.agent.lock().unwrap();
+        if index <= agent.compacted {
+            return Ok(None);
+        }
         Ok(agent.log.get(index as usize - 1).cloned())
     }
 
@@ -598,6 +603,37 @@ fn a_dead_statement_is_skipped() {
     let backlog = worker.backlog().unwrap();
     assert_eq!((backlog.dead, backlog.pending()), (2, 0));
     assert_eq!(worker.prune().unwrap(), 2, "pruned once aged");
+}
+
+/// A rootless statement's finished job is kept while its record is in its
+/// agent's log, whatever the venue's time, and removed once the log is
+/// compacted past it.
+#[test]
+fn a_rootless_job_is_pruned_once_its_record_is_compacted() {
+    let agent = Arc::new(Mutex::new(Agent::default()));
+    let rootless = Attest {
+        roots: Vec::new(),
+        ..attest(3, 1)
+    };
+    agent.lock().unwrap().log.push(vec![rootless]);
+    let node = Node::new(&agent, true);
+    let (jobs, prover, venue) = (
+        MemoryJobs::default(),
+        Arc::new(Proofs::default()),
+        Venue::at(after(3)),
+    );
+    let mut worker = worker(&node, &jobs, &prover, &venue);
+    for _ in 0..3 {
+        worker.step().unwrap();
+    }
+    assert_eq!(states(&jobs), [State::Accepted]);
+    venue.now.store(u64::MAX / 2, Ordering::SeqCst);
+    assert_eq!(worker.prune().unwrap(), 0, "kept while its record is held");
+    agent.lock().unwrap().compacted = 1;
+    assert_eq!(worker.prune().unwrap(), 1, "pruned once compacted");
+    assert!(states(&jobs).is_empty());
+    worker.step().unwrap();
+    assert!(states(&jobs).is_empty(), "never read again");
 }
 
 /// A record whose re-run is not its statement (its io-hash not the
