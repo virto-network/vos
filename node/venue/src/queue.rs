@@ -186,6 +186,13 @@ impl AnchorQueue {
             .collect()
     }
 
+    /// No longer hand back `space`'s anchor of `window`: its client found
+    /// it settled, taken or refused for good.
+    pub fn settle(&self, space: &SpaceId, window: u64) {
+        self.shared.state().unsettled.remove(&(*space, window));
+        self.shared.wake.notify_all();
+    }
+
     /// Whether an anchor of `space` at `window` is queued.
     pub fn holds(&self, space: &SpaceId, window: u64) -> bool {
         self.shared.state().entries.contains_key(&(*space, window))
@@ -306,6 +313,18 @@ fn run(shared: &Shared, sender: &impl AnchorSend, every: Duration) {
             Fate::Resign => {
                 state.entries.remove(&key);
                 state.unsettled.insert(key, anchor);
+                if state
+                    .entries
+                    .range(key..=(key.0, u64::MAX))
+                    .next()
+                    .is_some()
+                {
+                    tracing::warn!(
+                        window = key.1,
+                        "an anchor handed back to be signed again: its space's later windows wait \
+                         behind it"
+                    );
+                }
             }
             Fate::Again(after) => {
                 if let Some(entry) = state.entries.get_mut(&key) {
@@ -490,6 +509,24 @@ mod tests {
         assert!(!queue.unsettled(&space).is_empty(), "needed still");
         sends.settled.store(true, Ordering::SeqCst);
         until("window 7 dropped", || queue.unsettled(&space).is_empty());
+        until("window 8 lands", || queue.is_empty());
+        assert_eq!(*sends.taken.lock().unwrap(), [(8, [2; 32])]);
+    }
+
+    /// A window handed back that its client finds settled (the venue
+    /// answers it `Again` or `Window`) is handed back no more, and holds
+    /// back no later window.
+    #[test]
+    fn a_window_its_client_settles_is_handed_back_no_more() {
+        let (sends, queue) = rotated(Duration::from_secs(3_600));
+        let space = SpaceId([3; 32]);
+        queue.push(&signed(7, 1));
+        queue.push(&signed(8, 2));
+        until("window 7 handed back", || {
+            queue.unsettled(&space).len() == 1
+        });
+        queue.settle(&space, 7);
+        assert!(queue.unsettled(&space).is_empty());
         until("window 8 lands", || queue.is_empty());
         assert_eq!(*sends.taken.lock().unwrap(), [(8, [2; 32])]);
     }

@@ -219,6 +219,10 @@ struct Venue {
     refuse: Mutex<Vec<u32>>,
     /// Every answer lost while set.
     lose_all: AtomicBool,
+    /// Every answer lost while set, the statement accepted all the same.
+    lose_landed: AtomicBool,
+    /// The submissions answered unfunded still to come.
+    unfunded: AtomicUsize,
 }
 
 impl Venue {
@@ -256,6 +260,19 @@ impl VenueClient for Venue {
         let id = statement.id();
         if !self.accepted.lock().unwrap().insert(id.0) {
             return Err(NotAccepted::Refused(6));
+        }
+        if self
+            .unfunded
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
+        {
+            self.accepted.lock().unwrap().remove(&id.0);
+            return Err(NotAccepted::Unjudged(Unjudged::Funding));
+        }
+        if self.lose_landed.load(Ordering::SeqCst) {
+            return Err(NotAccepted::Unjudged(Unjudged::Unknown));
         }
         if self.lose_all.load(Ordering::SeqCst) {
             self.accepted.lock().unwrap().remove(&id.0);
@@ -668,7 +685,7 @@ fn a_transient_refusal_is_submitted_again() {
 /// A venue that fails to judge a statement every time (`0x1001`) refuses
 /// it after [`MAX_RESUBMITS`] more submissions; a rootless statement whose
 /// answer is lost every time, which no anchor gives a deadline, is dead
-/// after as many.
+/// after as many and one more.
 #[test]
 fn resubmissions_are_bounded() {
     let agent = Arc::new(Mutex::new(Agent::default()));
@@ -715,6 +732,54 @@ fn resubmissions_are_bounded() {
     }
     assert_eq!(
         venue.submissions.load(Ordering::SeqCst),
-        2 * (MAX_RESUBMITS as usize + 1)
+        2 * (MAX_RESUBMITS as usize + 1) + 1
     );
+}
+
+/// A rootless statement survives a venue unfunded for longer than
+/// [`MAX_RESUBMITS`] submissions, which the operator's to fix; and one
+/// whose acceptance's answer is lost every time is accepted, its last
+/// submission answered a repeat.
+#[test]
+fn a_rootless_statement_outlasts_a_pause_and_a_lost_answer() {
+    let agent = Arc::new(Mutex::new(Agent::default()));
+    let rootless = |n| Attest {
+        roots: Vec::new(),
+        ..attest(3, n)
+    };
+    agent.lock().unwrap().log.push(vec![rootless(1)]);
+    let node = Node::new(&agent, true);
+    let (jobs, prover, venue) = (
+        MemoryJobs::default(),
+        Arc::new(Proofs::default()),
+        Venue::at(after(3)),
+    );
+    let retry = Duration::from_millis(1);
+    let options = Options { retry, ..options() };
+    let mut worker = worker_with(&node, &jobs, &prover, &venue, options);
+    venue
+        .unfunded
+        .store(3 * MAX_RESUBMITS as usize, Ordering::SeqCst);
+    let start = std::time::Instant::now();
+    while states(&jobs) != [State::Accepted] {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            states(&jobs)
+        );
+        worker.step().unwrap();
+    }
+    assert!(venue.submissions.load(Ordering::SeqCst) > 3 * MAX_RESUBMITS as usize);
+
+    venue.lose_landed.store(true, Ordering::SeqCst);
+    agent.lock().unwrap().log.push(vec![rootless(2)]);
+    while states(&jobs) != [State::Accepted, State::Accepted] {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            states(&jobs)
+        );
+        worker.step().unwrap();
+    }
+    assert_eq!(venue.accepted(), 2);
 }

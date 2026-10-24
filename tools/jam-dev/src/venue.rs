@@ -114,6 +114,14 @@ struct JamSend(Arc<Jam>);
 impl AnchorSend for JamSend {
     fn send(&self, anchor: &Anchor) -> Fate {
         let window = anchor.window;
+        // Settled already, it is not sent: no answer the service gives an
+        // anchor it no longer takes holds back the space's later windows.
+        if let Some(fate) = self.standing(anchor) {
+            if fate == Fate::Dead {
+                tracing::error!(window, "an anchor past `MaxRootAge`: not sent");
+            }
+            return fate;
+        }
         let code = match self.0.anchor_now(anchor) {
             Ok(code) => code,
             Err(error) => {
@@ -129,25 +137,31 @@ impl AnchorSend for JamSend {
     }
 
     fn settled(&self, anchor: &Anchor) -> bool {
-        JamSend::settled(self, anchor)
+        self.standing(anchor).is_some()
     }
 }
 
 impl JamSend {
-    /// Whether the service no longer needs `anchor`: its space's last
-    /// anchored window at or past it, or the window past `MaxRootAge` by
-    /// the finalized block's time. False while the node cannot say.
-    fn settled(&self, anchor: &Anchor) -> bool {
+    /// What became of `anchor` without sending it, as the finalized block
+    /// holds its space: done once a window at or past it is anchored, dead
+    /// once it is past `MaxRootAge`; none while it may still be taken, or
+    /// the node cannot say.
+    fn standing(&self, anchor: &Anchor) -> Option<Fate> {
         let (Ok(Some(space)), Ok(now)) = (self.0.space(&anchor.space), self.0.statements.now())
         else {
-            return false;
+            return None;
         };
-        let passed = space.last.is_some_and(|last| last >= anchor.window);
         let aged = space
             .clock
             .boundary(anchor.window)
             .is_some_and(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS);
-        passed || aged
+        if aged {
+            return Some(Fate::Dead);
+        }
+        space
+            .last
+            .is_some_and(|last| last >= anchor.window)
+            .then_some(Fate::Done)
     }
 }
 
@@ -317,6 +331,7 @@ impl VenueClient for JamVenue {
             return Err(AnchorRefusal::Signature);
         }
         if self.queue.dead(&anchor.space, anchor.window) {
+            self.queue.settle(&anchor.space, anchor.window);
             return Err(AnchorRefusal::Window);
         }
         if !self.queue.push(anchor) {

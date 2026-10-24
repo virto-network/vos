@@ -3924,6 +3924,30 @@ work reports, the run 1,213 s.
   `jam-statements-testnet` (38 entries, 14 packages, 14 outcomes) and in
   the end to end for both deployments.
 
+**A re-check of `f0395555`** found four more, folded:
+- **F-1 (medium):** the leader took any root a client handed back. It
+  now takes one back only if it is an anchor of its space's root kind
+  that this node's key signed over this venue's digest, and, where the
+  replica keeps the window's cut root, of the space's root over it; it
+  never replaces a root it computed, and a mismatch alerts and is never
+  signed. An idle leader looks for hand-backs a recheck apart, and takes
+  them up at its leadership's start. Test:
+  `an_anchor_handed_back_that_this_node_did_not_make_is_not_signed` (another
+  root by the node's key, a root by a foreign key: nothing sent, no
+  evidence).
+- **F-2 (medium):** a rootless statement was dead after four of any
+  `Unjudged`: only a lost answer (`Unknown`) counts now, and at the bound
+  it goes once more, a repeat counted as accepted. Test:
+  `a_rootless_statement_outlasts_a_pause_and_a_lost_answer`.
+- **F-3 (low):** a handed-back window this leadership has since settled by
+  a later anchor is not taken up again, and a client answering one
+  `Again` or `Window` settles it in its queue
+  (`a_window_its_client_settles_is_handed_back_no_more`).
+- **F-4 (low, dev tooling):** `JamSend` sends nothing for an anchor the
+  service no longer takes (a window at or past it anchored: done; past
+  `MaxRootAge`: dead), so no refusal holds the space's later windows for
+  ever; the queue logs when a hand-back holds later windows back.
+
 Its gates [measured, at `f0395555`, as the fold's]: `just check` green,
 108 suites, 1,380 passed, 0 failed; `jam-statements-testnet` green, the
 storage accounted for (38 entries, as many named); `just e2e-chain` green,

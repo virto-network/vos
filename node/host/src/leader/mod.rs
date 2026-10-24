@@ -136,6 +136,13 @@ struct Leader {
     /// unsent, among those whose cut roots this replica keeps: not taken
     /// up again.
     refused: std::collections::BTreeSet<u64>,
+    /// The last anchor this leadership signed of each window still
+    /// waiting, kept or handed back: an anchor handed back that it has
+    /// since replaced is not taken up.
+    signed: std::collections::BTreeMap<u64, vos_wire::vos_anchor::Anchor>,
+    /// Anchors handed back whose root is not the space's at their window,
+    /// by the cut root this replica keeps: never signed again.
+    foreign: std::collections::HashSet<vos_wire::vos_anchor::Anchor>,
     /// When this leadership last took up the anchors left waiting by its
     /// cut roots: at its first batch, then a window length later.
     seeded: Option<Instant>,
@@ -210,6 +217,8 @@ impl Leader {
             anchor_tried: None,
             alerted: None,
             seeded: None,
+            signed: std::collections::BTreeMap::new(),
+            foreign: std::collections::HashSet::new(),
             refused: std::collections::BTreeSet::new(),
             key_refused: None,
         }

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vos_venue::vos_statement::{ProgramId, Refusal, Statement, StatementId};
-use vos_venue::{NotAccepted, VenueClient};
+use vos_venue::{NotAccepted, Unjudged, VenueClient};
 use vos_wire::ids::{AgentId, ProgramHash};
 use vos_wire::result::Attest;
 use vos_wire::{SpaceId, WindowClock};
@@ -392,14 +392,16 @@ impl<H: Host, J: Jobs> Worker<H, J> {
 
     /// Submit `id` again no sooner than a wait from now, twice the last
     /// one, [`Options::retry`] the first time: the wait, and how often it
-    /// has gone again, this time included.
-    fn retry_later(&mut self, id: StatementId) -> (Duration, u32) {
+    /// has gone again for an answer `counted` towards [`MAX_RESUBMITS`],
+    /// this time included if it is.
+    fn retry_later(&mut self, id: StatementId, counted: bool) -> (Duration, u32) {
         let (wait, count) = self
             .retries
             .get(&id)
-            .map_or((self.options.retry, 1), |(_, wait, count)| {
-                (*wait * 2, count + 1)
+            .map_or((self.options.retry, 0), |(_, wait, count)| {
+                (*wait * 2, *count)
             });
+        let count = count + u32::from(counted);
         self.retries
             .insert(id, (Instant::now() + wait, wait, count));
         (wait, count)
@@ -597,7 +599,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 Ok(_) => State::Accepted,
                 Err(NotAccepted::Refused(code)) if code == repeated => State::Accepted,
                 Err(NotAccepted::Refused(code)) if vos_venue::transient(code) => {
-                    let (wait, count) = self.retry_later(id);
+                    let (wait, count) = self.retry_later(id, code >= 0x1000);
                     // 5 goes again until the anchor ages; a failure to judge
                     // a bounded number of times.
                     if code >= 0x1000 && count > MAX_RESUBMITS {
@@ -626,16 +628,27 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                     State::Refused(code)
                 }
                 Err(NotAccepted::Unjudged(why)) => {
-                    let (wait, count) = self.retry_later(id);
-                    // A rootless statement has no deadline: it goes again a
-                    // bounded number of times.
+                    // A rootless statement has no deadline: its answers
+                    // lost count, a bounded number of times, and then it
+                    // goes once more, a repeat (6) counted as accepted, an
+                    // acceptance whose answer was lost. Funding and the
+                    // configuration are the operator's, and do not count.
+                    let lost = why == Unjudged::Unknown;
+                    let (wait, count) = self.retry_later(id, lost);
                     if statement.roots.is_empty() && count > MAX_RESUBMITS {
-                        tracing::error!(
-                            agent = job.agent.0,
-                            ?why,
-                            "a rootless statement never judged: dead"
-                        );
-                        State::Dead
+                        match self.venue.submit(&statement, &bytes) {
+                            Ok(_) => State::Accepted,
+                            Err(NotAccepted::Refused(code)) if code == repeated => State::Accepted,
+                            Err(NotAccepted::Refused(code)) => State::Refused(code),
+                            Err(NotAccepted::Unjudged(why)) => {
+                                tracing::error!(
+                                    agent = job.agent.0,
+                                    ?why,
+                                    "a rootless statement never judged: dead"
+                                );
+                                State::Dead
+                            }
+                        }
                     } else {
                         tracing::warn!(
                             agent = job.agent.0,

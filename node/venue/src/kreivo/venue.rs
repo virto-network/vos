@@ -817,17 +817,19 @@ impl VenueClient for KreivoVenue {
             return Err(AnchorRefusal::Key);
         }
         let window = anchor.window;
+        // Settled, taken or refused for good: no longer handed back.
+        let settled = |answer| {
+            self.queue.settle(&anchor.space, window);
+            answer
+        };
         if known.last.is_some_and(|last| window <= last) {
-            return match known.held.get(&window) {
+            return settled(match known.held.get(&window) {
                 Some(root) if *root == anchor.root => Ok(Anchored::Again),
                 _ => Err(AnchorRefusal::Window),
-            };
+            });
         }
-        if !info.holds(window) {
-            return Err(AnchorRefusal::Window);
-        }
-        if self.queue.dead(&anchor.space, window) {
-            return Err(AnchorRefusal::Window);
+        if !info.holds(window) || self.queue.dead(&anchor.space, window) {
+            return settled(Err(AnchorRefusal::Window));
         }
         // Queued already: this one replaces it if signed by another key.
         if self.queue.holds(&anchor.space, window) {

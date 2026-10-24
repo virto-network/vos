@@ -539,6 +539,8 @@ struct Queued {
     queue: AnchorQueue,
     sends: Arc<AtomicUsize>,
     stale: Mutex<Option<Vec<[u8; 32]>>>,
+    /// Anchors it hands back beside its queue's, as a faulty client would.
+    injected: Mutex<Vec<Anchor>>,
 }
 
 impl Queued {
@@ -550,6 +552,7 @@ impl Queued {
             queue: AnchorQueue::spawn("test-queued-anchors", sending),
             sends,
             stale: Mutex::new(None),
+            injected: Mutex::default(),
         })
     }
 
@@ -632,7 +635,8 @@ impl VenueClient for Queued {
     }
 
     fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.queue.unsettled(space)
+        let injected = self.injected.lock().unwrap().clone();
+        [self.queue.unsettled(space), injected].concat()
     }
 }
 
@@ -772,4 +776,52 @@ fn a_window_handed_back_after_its_cut_root_is_pruned_is_signed_again() {
             .all(|anchor| anchor.signer == new)
     );
     assert!(venue.evidence().is_empty());
+}
+
+/// A client hands back anchors this node never signed: window 0's, once
+/// it is anchored, of another root signed by the node's key, and of a root
+/// signed by a key not the node's. The leader signs neither again: the
+/// venue is sent nothing more, holds window 0's root as anchored, and keeps
+/// no evidence.
+#[test]
+fn an_anchor_handed_back_that_this_node_did_not_make_is_not_signed() {
+    let clock = clock();
+    let anchoring = Anchoring::new();
+    let queued = Queued::over(&anchoring.venue);
+    let mut cluster = queued.cluster(clock);
+    anchoring.register(&cluster);
+    let representative = cluster.representative(&[1]);
+    let space = cluster.space.id();
+    let venue = &anchoring.venue;
+    anchoring.set_venue(clock.boundary(0).unwrap() + delay(&clock) + 1_000);
+    node_closed(&cluster, &clock, representative, 0);
+    wait_until("window 0 anchored", || windows(&anchoring, &cluster) == [0]);
+    let held = venue.anchors(&space)[0];
+    cluster.stop(1);
+    let secret = vos_node::store::Fjall::open(cluster.dirs[0].path().join(vos_node::STORE))
+        .unwrap()
+        .node_secret()
+        .unwrap()
+        .unwrap();
+    cluster.start(1);
+    let sign = |key: &SigningKey, root: [u8; 32]| {
+        let mut anchor = Anchor {
+            root,
+            signer: key.verifying_key().to_bytes(),
+            ..held
+        };
+        anchor.signature = key.sign(&anchor.digest(&venue.id())).to_bytes();
+        anchor
+    };
+    let ours = sign(&SigningKey::from_bytes(&secret), [0xee; 32]);
+    assert_eq!(ours.signer, held.signer, "the node's key");
+    let foreign = sign(&SigningKey::from_bytes(&[9; 32]), [0xef; 32]);
+    *queued.injected.lock().unwrap() = vec![ours, foreign];
+    cluster.leader(representative);
+    let sent = queued.sends.load(Ordering::SeqCst);
+    std::thread::sleep(Duration::from_secs(6));
+    assert_eq!(queued.sends.load(Ordering::SeqCst), sent, "nothing sent");
+    assert_eq!(venue.anchors(&space), [held]);
+    assert!(venue.evidence().is_empty());
+    assert!(!venue.suspended(&space));
 }
