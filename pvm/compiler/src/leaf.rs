@@ -82,7 +82,7 @@ pub const RELATIONS: [(&str, u32); 20] = [
     ("MerkleNode", 66),
 ];
 
-/// The segment AIR's chips, in its order (`crate::shape::chip`).
+/// The segment AIR's chips, in its order (`vos_wire::records::segment_chip`).
 pub const CHIPS: [Chip; SEGMENT_CHIPS] = [
     // CPU
     Chip {

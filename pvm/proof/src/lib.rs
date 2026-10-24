@@ -239,6 +239,12 @@ macro_rules! chips {
             pub const FORCING: u32 = 1 << BLAKE2B | 1 << BLAKE2B_BOUNDARY | 1 << MEMORY_PAGE;
         }
 
+        #[cfg(feature = "wire")]
+        const _: () = assert!(
+            chip_idx::COUNT == vos_wire::records::SEGMENT_CHIPS
+                $(&& chip_idx::$index == vos_wire::records::segment_chip::$index)*
+        );
+
         #[cfg(feature = "prover")]
         const BASE_COMPONENTS: &[&dyn framework::MachineProverComponent] = &[$(&$chip),*];
 

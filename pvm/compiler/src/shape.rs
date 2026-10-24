@@ -21,38 +21,10 @@
 
 use vos_pvm::instruction::{Opcode, decode_opcode_fast};
 use vos_pvm::precompile::{BLAKE2B_COMPRESS, WITNESS_INPUT};
-use vos_wire::records::{SegmentClass, Shape};
+use vos_wire::records::{SEGMENT_CHIPS, SegmentClass, Shape};
 
 /// The segment AIR's chips, in its order.
-pub mod chip {
-    pub const CPU: usize = 0;
-    pub const BLAKE2B: usize = 1;
-    pub const BLAKE2B_BOUNDARY: usize = 2;
-    pub const MEMORY: usize = 3;
-    pub const MEMORY_PAGE: usize = 4;
-    pub const MEMORY_MERKLE: usize = 5;
-    pub const MEMORY_ROOT_BOUNDARY: usize = 6;
-    pub const REGISTER_MEMORY: usize = 7;
-    pub const REGISTER_MEMORY_BOUNDARY: usize = 8;
-    pub const REGISTER_MEMORY_CLOSING: usize = 9;
-    pub const PROGRAM_BOUNDARY: usize = 10;
-    pub const PROGRAM_MEMORY: usize = 11;
-    pub const JUMP_TABLE: usize = 12;
-    pub const WITNESS_INPUT: usize = 13;
-    pub const RANGE_MULTIPLICITY_256: usize = 14;
-    pub const BITWISE_LOOKUP: usize = 15;
-    pub const POWER_OF_TWO: usize = 16;
-    pub const POPCOUNT: usize = 17;
-    pub const BITCOUNT: usize = 18;
-    pub const BYTE_TO_BITS: usize = 19;
-    pub const MUL: usize = 20;
-    pub const BITWISE: usize = 21;
-    pub const COMPARE: usize = 22;
-    pub const DIVREM: usize = 23;
-    pub const BITWISE_AND_BYTE: usize = 24;
-    /// The chips of the segment AIR.
-    pub const COUNT: usize = vos_wire::records::SEGMENT_CHIPS;
-}
+pub use vos_wire::records::segment_chip as chip;
 
 /// The chips a code selects: the rest are in every shape.
 const SELECTED: u32 = 1 << chip::BLAKE2B
@@ -67,7 +39,7 @@ const SELECTED: u32 = 1 << chip::BLAKE2B
 
 /// The chips in every shape: the CPU, the ledgers, the boundaries, the
 /// program's memory, the page Merkle chips and the fixed tables.
-pub const ALWAYS: u32 = ((1 << chip::COUNT) - 1) & !SELECTED;
+pub const ALWAYS: u32 = ((1 << SEGMENT_CHIPS) - 1) & !SELECTED;
 
 /// The version of the policy below, the classes and each chip's capacity
 /// in them, that a shape's record names (`Shape::policy`): a change to
@@ -189,7 +161,7 @@ fn capacity(index: usize, log_steps: u8, pages: u16, code: usize, jump_table: us
         | chip::BITCOUNT
         | chip::BYTE_TO_BITS => 8,
         chip::BITWISE_AND_BYTE => 16,
-        _ => unreachable!("chip {index} of {}", chip::COUNT),
+        _ => unreachable!("chip {index} of {}", SEGMENT_CHIPS),
     }
 }
 

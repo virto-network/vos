@@ -16,7 +16,7 @@
 use crate::common;
 
 use vos_pvm::instruction::Opcode;
-use vos_pvm_compiler::shape::{self as derived_shape, chip};
+use vos_pvm_compiler::shape as derived_shape;
 use vos_pvm_proof::chip_idx;
 use vos_pvm_proof::format::SEGMENT;
 use vos_pvm_proof::kernel::{KernelTrace, kernel_side_note, trace_kernel};
@@ -137,50 +137,12 @@ fn kernel(name: &str, values: &[u64]) -> Kernel {
         .unwrap()
 }
 
-/// The derivation's chips are the AIR's: its order, the chips every proof
-/// holds, and, opcode by opcode, the chips a step of it activates.
+/// The derivation's chips are the AIR's (their order is one table,
+/// `vos_wire::records::segment_chip`): the chips every proof holds, and,
+/// opcode by opcode, the chips a step of it activates.
 #[test]
 fn derive_reads_the_airs_chips() {
-    assert_eq!(chip::COUNT, chip_idx::COUNT);
     assert_eq!(derived_shape::ALWAYS, chip_idx::ALWAYS);
-    for (derived, air) in [
-        (chip::CPU, chip_idx::CPU),
-        (chip::BLAKE2B, chip_idx::BLAKE2B),
-        (chip::BLAKE2B_BOUNDARY, chip_idx::BLAKE2B_BOUNDARY),
-        (chip::MEMORY, chip_idx::MEMORY),
-        (chip::MEMORY_PAGE, chip_idx::MEMORY_PAGE),
-        (chip::MEMORY_MERKLE, chip_idx::MEMORY_MERKLE),
-        (chip::MEMORY_ROOT_BOUNDARY, chip_idx::MEMORY_ROOT_BOUNDARY),
-        (chip::REGISTER_MEMORY, chip_idx::REGISTER_MEMORY),
-        (
-            chip::REGISTER_MEMORY_BOUNDARY,
-            chip_idx::REGISTER_MEMORY_BOUNDARY,
-        ),
-        (
-            chip::REGISTER_MEMORY_CLOSING,
-            chip_idx::REGISTER_MEMORY_CLOSING,
-        ),
-        (chip::PROGRAM_BOUNDARY, chip_idx::PROGRAM_BOUNDARY),
-        (chip::PROGRAM_MEMORY, chip_idx::PROGRAM_MEMORY),
-        (chip::JUMP_TABLE, chip_idx::JUMP_TABLE),
-        (chip::WITNESS_INPUT, chip_idx::WITNESS_INPUT),
-        (
-            chip::RANGE_MULTIPLICITY_256,
-            chip_idx::RANGE_MULTIPLICITY_256,
-        ),
-        (chip::BITWISE_LOOKUP, chip_idx::BITWISE_LOOKUP),
-        (chip::POWER_OF_TWO, chip_idx::POWER_OF_TWO),
-        (chip::POPCOUNT, chip_idx::POPCOUNT),
-        (chip::BITCOUNT, chip_idx::BITCOUNT),
-        (chip::BYTE_TO_BITS, chip_idx::BYTE_TO_BITS),
-        (chip::MUL, chip_idx::MUL),
-        (chip::BITWISE, chip_idx::BITWISE),
-        (chip::COMPARE, chip_idx::COMPARE),
-        (chip::DIVREM, chip_idx::DIVREM),
-        (chip::BITWISE_AND_BYTE, chip_idx::BITWISE_AND_BYTE),
-    ] {
-        assert_eq!(derived, air);
-    }
     let mut opcodes = 0;
     for byte in 0..=u8::MAX {
         let Some(op) = Opcode::from_byte(byte) else {

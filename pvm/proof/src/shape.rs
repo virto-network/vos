@@ -69,10 +69,7 @@ pub const MAX_LOG_SIZE: u8 = 24;
 pub const MAX_CLASSES: usize = 4;
 
 #[cfg(feature = "wire")]
-const _: () = assert!(
-    MAX_CLASSES == vos_wire::records::MAX_CLASSES
-        && chip_idx::COUNT == vos_wire::records::SEGMENT_CHIPS
-);
+const _: () = assert!(MAX_CLASSES == vos_wire::records::MAX_CLASSES);
 
 impl KernelShape {
     /// Whether it is a shape a verifier accepts: within the segment AIR,
