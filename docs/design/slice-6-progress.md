@@ -4389,3 +4389,54 @@ committed vectors unchanged; `just test-carriers` green (451
 `WrapRandomness` needles, clean, 182 s); `just e2e-chain` green (1,427 s;
 the audit 332 carriers, 22 JAM packages and their reports, clean, every
 verdict as expected).
+
+## Slice 6 accepted
+
+Accepted on `90fb9498` (vos-core), 2026-10-24: the slice's gates green at
+`bd3d975d` ([Slice 6's gates](#slice-6s-gates)), the slice-end review's
+fold green after them ([The slice-end review folded](#the-slice-end-review-folded)).
+
+### What slice 6 delivered
+
+- **M2, the final wrap masked** ([M2 accepted](#m2-accepted-the-final-wrap-masked)):
+  format 39 (146 / 82.70 bits, affine DEEP batching), the masked AIR,
+  prover and fixed-layout verifier, its leakage and forgery gates,
+  panic-freedom and fuzzing in CI; format 36 and the refine-bundle path
+  retired.
+- **M3a, roots, anchors and `&self` reads on the model venue**
+  ([M3a accepted](#m3a-accepted-roots-anchors-and-self-reads-on-the-model-venue)):
+  `vos-anchor` and the genesis, committed rows under `0x03`, window cuts,
+  attestables, the representative and its rotatable anchor key.
+- **M3b and M3c**
+  ([M3b and M3c accepted](#m3b-and-m3c-accepted-kreivos-design-and-kit-the-prover-worker-the-jam-service-end-to-end)):
+  the spaces pallet's design, kit, mock and conformance vectors as the
+  Kreivo handoff (its chain client parked, decision 12c); the prover
+  worker built into the node (12d); the JAM statements service, its
+  client as development tooling (17); the carrier audit; the end to end
+  on PolkaJam.
+- **6.22:** the slice-5 rest, the store layout version, the carried
+  review items, the code-quality review (52 items folded, program ids and
+  proof bytes unchanged), the slice-end review's fold: equivocation
+  evidence sent by the clients, disputed windows dead after a resume
+  (decision 18, vector G19).
+
+323 commits on `31b7938e..90fb9498`. The owner's decisions are 1–18 in
+`research/slice-6/owner-decisions.md`.
+
+### Reviews
+
+Fable at each milestone (M2, M3a, M3b/M3c: accept after fixes, folded)
+and at the slice's end (`research/slice-6/slice-end-fable.md`: accept
+after fixes, folded; its M1 and M2 re-checked by Opus, accepted, F1
+folded); one Opus review per step; the Opus code-quality review
+(`research/slice-6/quality-review.md`), folded.
+
+### Carried
+
+The slice-7 re-pin batch (the BP-pin quality items, item 18's rest,
+`SpaceGenesis::version`, item 28's strictness fix) and every other carried
+item, each with its file and line, under 6.22's carried lists in
+`slice-6-on-chain.md`. Waiting on others: 5.6's phone run (slice 7); the
+spaces pallet (the Kreivo teammate), then the substrate extension's port
+once the extension host exists; the audit engagement, scoped at M2, after
+this slice. Before anything reaches master: the heavy cleanup.
