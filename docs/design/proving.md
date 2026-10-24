@@ -710,9 +710,10 @@ last for decades.**
     reference mock of the designed pallet and the conformance vectors
     (`node/venue/conformance`), which the teammate's pallet must pass.
     The chain transport (on sube, signing with the node's sr25519
-    authority key) is the teammate's, a port of master's substrate
-    extension onto the node's extension host once that exists; until
-    both exist, no node reaches Kreivo (`spaces-pallet.md` §9.1).
+    authority key) is a port of master's substrate extension onto the
+    node's extension host: VOS's work, after the slices, once that host
+    exists. The pallet is the teammate's. Until both exist, no node
+    reaches Kreivo (`spaces-pallet.md` §9.1).
   - The weights and benchmarks are the teammate's.
   - **`submit(statement, proof)`, checked in this order:**
     1. the size cap;
@@ -1008,9 +1009,11 @@ that narrows the inner proof makes folds cheaper too.
     pallet-communities later; VOS delivers its design, the verifier kit
     vendored with a sync check, and the node's client against a mock
     (§6). This replaces 7's "in slice 6".
-12. **The Kreivo transport** (2026-10-20): the chain client is the
-    teammate's, on sube behind `Transport`; VOS keeps the design, the
-    kit, the calls, `KreivoVenue`, the mock and the conformance vectors.
+12. **The Kreivo transport** (2026-10-20): the chain client, on sube
+    behind `Transport`, is a port of master's substrate extension, VOS's
+    work after the slices, once the extension host exists; the pallet is
+    the teammate's. VOS also keeps the design, the kit, the calls,
+    `KreivoVenue`, the mock and the conformance vectors.
 13. **The prover stays in the node** (2026-10-20); the extension host is
     deferred, and a venue's transport becomes an extension once it
     exists.
