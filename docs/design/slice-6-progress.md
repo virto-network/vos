@@ -4354,3 +4354,37 @@ heavy run at a time, each started with 36 GB or more available;
   it ran at `bd3d975d`.
 
 Commits: `bd3d975d` (the guest builds never incremental), this record.
+
+## The slice-end review folded
+
+The slice-end Fable review (`research/slice-6/slice-end-fable.md`,
+`73bfaa86`): accept after fixes. Each finding, with its commit or carried
+(the plan's carried list, "Carried from the slice-end Fable review", names
+each carried item with its file:line):
+
+| Finding | What | Commit |
+|---|---|---|
+| M1 | an honest node sends the conflicting anchor: the Kreivo client reads the venue's root of a window at or before the space's last (at `anchor`, and in the send path for one overtaken while queued), and the JAM dev client before it settles one unsent; another root held sends the node's anchor as the equivocation's evidence, which suspends the space, with `Alert::Equivocation` (Kreivo) or an error (JAM); the leader takes `AnchorRefusal::Equivocation` as an alarm of its own. Tests: a stolen listed key anchors first, through the Kreivo client over the mock (read before `anchor`, and after the anchor was queued) and the JAM dev client over the service's refine and accumulate in memory; each asserts the evidence (the stolen key first, the node's second), the suspension and the dropped root | `5c09bd3a` |
+| M2 | decision 18: a window with evidence never counts again. The JAM statements service's accumulate, the Kreivo mock and `ModelVenue` drop the window's anchor when they record the evidence (`Last` kept), so after `resume` statements rooted there are refused `0x5`, either root anchored again is refused for its window, and the space anchors from the window after its last. Conformance vector G19 pins it (a pallet that keeps the disputed root fails it, `Broken::DisputedRootKept`); `just conformance` rewrote `spaces.json` (G19, and G5's and G17's anchor rows); the service test `a_resumed_space_never_counts_a_disputed_root`; the cluster test of a single founder's resume updated. The statements service's blob changes; no blob hash is pinned in the repo | `48ef4c6a`, `06d59325` (decision 18), `8e25c98c` (pin D, `spaces-pallet.md` §6.1, the `resume` row and G19's row, `proving.md` §7) |
+| M3 | 6.18's failover claim qualified in the plan and the prover's docs; the code carried | `8e25c98c`, `0cea6230`; carried |
+| M4 | `SECURITY.md`'s prover-table row: an unfinished job of an agent not led keeps its `witness_input`; the code carried | `8e25c98c`; carried |
+| M5 | `SECURITY.md` row for a live run's fault text; the code carried | `8e25c98c`; carried |
+| M6 | the audit's floor and its compensations in `SECURITY.md`; the needles carried | `8e25c98c`; carried |
+| M7 | `proving.md` A.6 re-measured (`wrap.proof` 146,564 B; on `final-verify.elf` valid 79.4M, rootless 79.1M, tampered 47.6M, `0x108` 11.0M, `0x109` 11.1M; the test guest's 28 76.2M and tampered 52.8M); `recursion-air.md`'s spike 6a rows labelled historical beside the built figures; `SECURITY.md`'s carriers to A.5 (the JAM storage carrier and `carrier_except`, the `WrapRandomness` needles, a prover's panic and `ProveError::Failed`); the known limits in the designs (one founder registers anywhere: pin D, `spaces-pallet.md` §6.2, `proving.md` §7; no production prover for rootless statements: `proving.md` §6, `clerk-across-spaces.md`) | `8e25c98c` |
+| M8 | `final-verify.elf` named the harness's refine program, a test and vector program (`justfile`, `proving.md`); item 27's hazard stated in the carried list | `8e25c98c` |
+| L1 | the slice-gate tier ran green at `bd3d975d` (the coordinator's record); the `check` pin carried | carried |
+| L2–L6 | | carried |
+| L7 | the carried list: item 5's lock helper, item 58's performance half, item 68's owner call named (`inputs.rs:122`), item 28 not reachable by a submitter, the landing row's item-18 exception, `research/slice-5/kreivo-pallet.md` | `8e25c98c` |
+| L8 | `core-model.md`'s step numbers, `spaces-pallet.md`'s step numbers and M3b gates (open question 8 settled), `identity-and-authority.md`'s pin letter, `SECURITY.md`'s two, `recursion-air.md`'s slice reference; the `ABOUT` string and `core-model.md`'s draft heading carried | `8e25c98c`; carried |
+| L9 | `MAX_VERDICT_BYTES` counts the compact count's two bytes (`MAX_ITEMS` stays 17); `SECURITY.md` row 11's heights; the rest carried | `2ca7a2fc`, `8e25c98c`; carried |
+| Info | cross-venue overlap in pin D's known limits; the rest carried | `8e25c98c`; carried |
+
+`vos-core` (`98ad66d4`, with `bd3d975d`'s non-incremental guest builds)
+merged in before the gates.
+
+**Gates** [measured], after the merge: `just check` green (1,402 passed in
+109 suites, `check-kit` among them); `just conformance` leaves the
+committed vectors unchanged; `just test-carriers` green (451
+`WrapRandomness` needles, clean, 182 s); `just e2e-chain` green (1,427 s;
+the audit 332 carriers, 22 JAM packages and their reports, clean, every
+verdict as expected).
