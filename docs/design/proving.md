@@ -1,12 +1,14 @@
 # Proving: layers, formats and verifiers
 
-Design, draft 5. It is the architecture behind slices 5, 6 and 7
-(`slice-5-proving.md`). The recursion AIR's own design is
-`recursion-air.md`.
+Design, draft 6. It is the architecture behind slices 5, 6 and 7
+(`slice-5-proving.md`, `slice-6-on-chain.md`). The recursion AIR's own
+design is `recursion-air.md`.
 - **Status:** [decided] marks the owner's decisions; [proposed] marks
   everything else, which is open to review.
-- **Evidence:** the research is in `research/slice-5/`. Every number below
-  carries its tag there: [measured], [model] or [projected].
+- **Evidence:** the research is in `research/slice-5/` and
+  `research/slice-6/`, the measurements in `slice-5-progress.md` and
+  `slice-6-progress.md`. Every number below carries its tag there:
+  [measured], [model] or [projected].
 - **History:**
   - draft 2 folded in Fable's review (`research/slice-5/proving-review.md`,
     R1–R13);
@@ -16,7 +18,11 @@ Design, draft 5. It is the architecture behind slices 5, 6 and 7
   - draft 5 folds in Fable's review of the planning set
     (`research/slice-5/plan7-review.md`, R1–R11): the fold's carry of
     the circuit hash, lossless encodings, the witness-input record, the
-    crates' homes, the budgets per node and the estimates.
+    crates' homes, the budgets per node and the estimates;
+  - draft 6 folds slice 6's spikes (6a–6c), its design round on roots and
+    anchors and Fable's review of it, the owner's decisions of 2026-10-19
+    to 2026-10-23, and what slice 6 built: the masked wrap (format 39),
+    statements at anchored cuts, the venues and the carrier audit.
 
 ## 1. What the owner requires [decided]
 
@@ -195,10 +201,10 @@ attribution). Its full design is `recursion-air.md`.
     like `0x400`'s; it writes only `[φ7, φ7 + count)`, with the count at
     most φ8, and has no other effect;
   - the caller's arguments are capped by `Limits::attest` (64 KiB on VOS,
-    2 KiB on JAM); a statement's served witness travels as a blob by
-    hash, under `Limits::served` (proposed; set by 6.0a) and the
-    kernel's declared gas (slice 6);
-    4 MiB stays the ceiling of the kernel's whole input;
+    2 KiB on JAM); a statement's served witness travels inline in the
+    `Resume` input that answers the read, under `Limits::served` (128 KiB
+    on VOS, 32 KiB on JAM) and the kernel's declared gas; 4 MiB stays the
+    ceiling of the kernel's whole input;
   - `derive` admits the new id, and a live≡traced test gates it in M0.
 - **Page permissions are preprocessed.** The program's layout is four
   regions of pages: two readable (the read-only data, the argument
@@ -376,10 +382,6 @@ attribution). Its full design is `recursion-air.md`.
 - **Cost:**
   - about 85M JAM gas unmasked with Blake2b in software, and 64M through
     VOS's `0x400` precompile [model];
-  - masked (spike 6a, shape A, postcard): 115.8–118.7M JAM gas (decode
-    19.9M, verify 95.8M), 45.2M Wasm instructions, 160–163 KB, 3.45 GiB
-    of heap and 11.6–15 s to prove [measured]; about 98M with format
-    39's fixed-layout decode [est];
   - about 122 KB unmasked [model].
 - **Built** (slice 5's 5.14) [measured], unmasked:
   - **96.4M JAM gas** on the JAM-only host, Blake2b-256 in software: the
@@ -389,10 +391,22 @@ attribution). Its full design is `recursion-air.md`.
     the client's), 2.1 ms, a 292 KB blob;
   - **122–125 KB** (the window kernel's 123,686 bytes);
   - **5.45 s and a 2.5 GiB heap** to prove the window kernel's wrap.
-- **Levers:** format 39 is to decode a fixed layout (6.4); the Blake2b
-  hook is deferred, a lever for when ref_time binds: nothing in slice 6
-  verifies as a PVM guest on a VOS host, and Kreivo's binding limit is
-  proof_size.
+- **Built masked, format 39** [measured, `slice-6-progress.md`, "M2
+  accepted" and "6.22, the slice-5 rest"], its proof decoded from a fixed
+  layout (`vos_pvm_final_verifier::masked`), never postcard:
+  - **the window kernel's wrap:** 148,868 bytes, proved in 7.44 s under
+    load at a 3,627 MiB heap peak (format 28's in the same run: 4.55 s,
+    2,498 MiB, 122,085 bytes);
+  - **on the JAM-only host** (`final-verify.elf`, Blake2b-256 in
+    software, the guests' allocator a bump over its arena): the `valid`
+    fixture's 146,564-byte proof in 79.6M gas, the decode 1.50M of it and
+    the verify 78.0M; the JAM statements service's refine of one
+    statement about 80M;
+  - **in Wasm** under the PVF's semantics: 44.9M instructions (the window
+    kernel's proof), 46.4M of the 50M budget at the worst shape.
+- **Levers:** the Blake2b hook is deferred, a lever for when ref_time
+  binds: no venue verifies as a PVM guest on a VOS host, and Kreivo's
+  binding limit is proof_size.
 - **Fold step above 1:** the pinned Stwo implements it; our fork's review
   and tamper tests admitted it for format 28 (slice 5's 5.14).
 - **Its public inputs** are the program id (8 M31) and the io-hash (its
@@ -465,8 +479,8 @@ pub struct Statement {
   A venue keys on the statement id, never on the proof's bytes or their
   hash: postcard's varints need not be minimal, so one proof has many
   encodings, and many proofs state one statement.
-- **The venue's check, built** (slice 5's 5.15, `vos_statement::judge`;
-  slice 6's 6.5, pin F), in order: the format (one the venue accepts and
+- **The venue's check** (`vos_statement::judge`; `slice-6-on-chain.md`,
+  pin F), in order: the format (one the venue accepts and
   the build links: 39, and 28 only under `test-formats`, which no
   production build enables); the statement's program against the venue's
   pin; the venue, when the pin says the program is venue-bound: the first
@@ -538,9 +552,12 @@ pub struct Statement {
     can depend on it; its `model` is a venue as plain data, which the
     fixtures are judged against, and its JAM refine program
     (`final-verify.elf`) is the venue on the JAM-only host;
+  - `statement/service` (`vos-statement-service`): the JAM statements
+    service (§6), its refine and accumulate over `vos-statement`, built
+    as a JAM program (`statement-service.elf`);
   - the golden fixtures, under `fixtures` (A.6).
 
-  Every venue uses the last four. The source uses no nightly feature:
+  Every venue uses `final-verifier`, `anchor` and `statement`. The source uses no nightly feature:
   it builds on stable for x86 and wasm32, and the JAM build runs on the
   pinned nightly with build-std.
 
@@ -599,8 +616,8 @@ last for decades.**
   rests on the conjectured count. All counts are the security tool's own
   [model], pinned by tests and not yet reviewed outside.
 - **Format 36,** the legacy Blake2s segment format, counted 96 / 57:
-  below the 60-bit proven floor. It is retired with the refine-bundle path
-  that used it (slice 6's 6.9); the default prover produces 35.
+  below the 60-bit proven floor. It is retired, and the refine-bundle path
+  that used it deleted; the default prover produces 35.
 - **Salts:** 8 M31 (248 bits).
 - **Interaction PoW** applies to every proof with logup, folds included.
 - **An external audit,** before value rides on a proof, of:
@@ -624,9 +641,9 @@ last for decades.**
   Its owner and timing are the owner's to set, and open
   (`slice-5-progress.md`, "Carried out of slice 5").
 
-## 5. Masking [proposed]
+## 5. Masking [built: format 39]
 
-- **Where:** the final wrap (slice 6). Device proofs (slice 7) reuse it:
+- **Where:** the final wrap. Device proofs (slice 7) reuse it:
   the masking is generic over the component set and the channel. Segment,
   leaf and fold proofs stay in the prover role, as the witness rows do.
 - **Device proofs at rate 1/2** serve authorizations a space re-checks at
@@ -643,12 +660,16 @@ last for decades.**
      attempt; R takes 8 columns, whose coefficients span M31^4 except
      with probability about 2^-155, with no prover check (the rank test
      runs on a small circuit only);
-  4. hedged randomness, H(OS ‖ witness);
+  4. hedged randomness: each attempt's stream seeded with
+     `BLAKE2b-256("vos/mask/seed/v1" ‖ 32 OS bytes ‖ witness digest ‖
+     attempt)`, the witness digest binding the statement and the main
+     columns (`MaskRng`; a seeded stream only on the tests' dev edge,
+     `seeded-masks`, which no production build enables);
   5. a degree audit (the recursion AIR's gates stay at degree ≤ 3 with
      paired logup, so (c) applies);
   6. parameters pinned in the format;
   7. every carrier audited (A.5);
-  8. the cost measured.
+  8. the cost measured (§3.5).
 - **The composition mode:** a test pins that (c) lifts no constraint past
   the blowup. If it did, the prover would re-LDE every column.
 - **On the wrap** (spike 6a): no re-LDE [measured]; the prover ×2.6–2.9
@@ -682,9 +703,16 @@ last for decades.**
     about 20 statements fit a block on one core.
   - **The repeat rule:** a rootless statement's `Seen` entry never
     expires, since it has no anchor whose age refuses a replay.
-  - **The node's Kreivo client:** the representative and the worker
-    anchor and submit through a `VenueClient` signing with the node's own
-    sr25519 key, which holds no balance.
+  - **The node's Kreivo client** (`vos_venue::kreivo::KreivoVenue`): the
+    representative and the worker anchor and submit through it, a
+    `VenueClient`, the space's sovereign account paying. It reaches the
+    chain by message through a `Transport`; VOS tests it against a
+    reference mock of the designed pallet and the conformance vectors
+    (`node/venue/conformance`), which the teammate's pallet must pass.
+    The chain transport (on sube, signing with the node's sr25519
+    authority key) is the teammate's, a port of master's substrate
+    extension onto the node's extension host once that exists; until
+    both exist, no node reaches Kreivo (`spaces-pallet.md` §9.1).
   - The weights and benchmarks are the teammate's.
   - **`submit(statement, proof)`, checked in this order:**
     1. the size cap;
@@ -708,10 +736,12 @@ last for decades.**
     verifier and the statement code must not panic on any input: the
     shape and sample checks (`check_shape`, `check_samples`) refuse
     before Stwo reaches its indexing and `unwrap`s, and the statement's
-    decode bounds every count by the bytes left. Fuzzing
-    (`pvm/proof/fuzz`) is the evidence so far; a CI fuzz job and an audit
-    of every index and `unwrap` on the verify path at the pin are carried
-    to slice 6.
+    decode bounds every count by the bytes left. The final verifier,
+    `vos-statement` and `vos-anchor` deny `unwrap`, `expect`, indexing,
+    `panic` and unchecked arithmetic outside their tests; every such site
+    on the fork's verify path at the pin is listed with its guard
+    (`SECURITY.md`, § Panic-freedom); the fuzz targets (`pvm/proof/fuzz`)
+    run in CI.
   - **Every re-pin is a governance event at every venue:** a segment
     format bump (any base-AIR hardening) changes every program id, and a
     change to `recair`'s compiler or gate set changes every leaf-circuit
@@ -728,27 +758,44 @@ last for decades.**
   - **Its home:** `pallet-spaces`, in Kreivo, built by the Kreivo teammate
     from `spaces-pallet.md`, to replace pallet-communities later; the
     verifier stack vendored into Kreivo with a sync check against a VOS
-    tag (VOS's kit, slice 6's 6.16); frame-contrib and crates.io later.
-- **The JAM statements service** (slice 6): a dedicated service; refine
-  verifies anchors' signatures and statements (about 100M gas a
-  statement; a report's accumulate has 10M); accumulate holds the spaces,
+    tag (VOS's kit, `pvm/proof/kit`); frame-contrib and crates.io later.
+- **The JAM statements service** (`vos-statement-service`): a dedicated
+  service; refine verifies anchors' signatures and statements (about 80M gas
+  a statement [measured]; a report's accumulate has 10M); accumulate
+  holds the spaces,
   anchors and repeats, and records, checking an anchor's signer against
   the space's registered keys and keeping a rootless statement's `Seen`
   entry forever, as Kreivo does; accepted program ids are constants
   changed by redeploy; a statement rides in its `Submit` item's payload
   and its proof as the item's extrinsic, since JAM-NP's CE 133 bounds the
-  package at 204,802 bytes (built in 6.19: `vos-statement-service`). An
-  actor in the
-  default agent cannot host it: `MAX_HANDLER_GAS` 100M, a 512 KiB program
-  cap (538,683 B with both formats linked), 2 KiB messages, no preimage
-  access.
+  package at 204,802 bytes. An actor in the default agent cannot host
+  it: `MAX_HANDLER_GAS` 100M, a 512 KiB program cap, 2 KiB messages, no
+  preimage access.
+- **The JAM client is development tooling** [decided]: VOS ships the
+  statements service and the agent-as-JAM-service build (`vos-jam`); it
+  deploys on JAM with JAM's own tooling. The PolkaJam JSON-RPC and `jamt`
+  driver, the service's client and `JamVenue` live in `tools/jam-dev`
+  (`vos-jam-dev`), which serves the end-to-end tests and the testnets;
+  neither `vos` nor `vos-node` depends on it (`just check-no-jam-dev`).
+  A node reaches JAM later through an extension running a light node.
+- **Venues in the node:** a space anchors and submits at one venue at a
+  time, through a `VenueClient` (`vos-venue`: the trait, `ModelVenue`,
+  the `AnchorQueue` that retries anchors, and `KreivoVenue`). The
+  representative's leader signs and anchors each window; the prover
+  worker (`vos-node-prover`), on the leader of the agent whose record it
+  is, proves each statement at an anchored cut, records the proof's hash
+  in the agent (`Input::Proven`) and submits it once its roots are
+  anchored, a repeat counted as accepted. The prover is built into the
+  node and stays there [decided]; the extension host that will carry the
+  venues' transports is deferred.
 
 ## 7. Roots and anchors [proposed]
 
 - **The kernel verifies its rows up to the space root.** Its witness
   carries the full path: row → map root → agent root → space root. So
   `RootRead.root` is the anchored space root, which the venue compares.
-  That costs a few dozen more compressions per statement.
+  The path costs 14 compressions (one more for `S_w`) and 590 B at 1,024
+  agents, a row 19.07 compressions and 842 B [measured].
 - **A chain-bound statement reads at the space's last anchored window
   cut.** A statement that stays inside the space keeps "as of the latest
   complete root W ≤ V".
@@ -784,9 +831,16 @@ last for decades.**
 - **An anchor gives ordering and non-equivocation, not integrity:** a
   space can anchor any root of its own making, so every value-moving
   handler is two-sided or spends the submitting space's own escrow.
-- **Venue migration:** a space anchors on one venue at a time. The signed
-  migration point is recorded on both venues, and each refuses windows
-  outside its range.
+- **Venue migration:** a space anchors on one venue at a time. The
+  controller's signed `migrate(to, from_window)` sets the old venue's
+  range to end before `from_window`, at or after the next window and
+  never to the venue itself; the space registers at the new venue from
+  that window. Each venue refuses anchors outside its range, and a
+  statement whose roots fall outside it (`0x5`). Migration is one-way per venue: a space that left a venue does
+  not register there again.
+- **Venue-bound programs:** a program the pin marks venue-bound states the
+  venue's id as the first 32 bytes of its `public_args`, so its statement
+  is accepted at that venue alone (`Refusal::Venue`, `0x7`).
 - **Root kinds:**
   - Committed rows sit first in the keyspace, under `0x03`, so an
     agent's root is the same on both hosts: VOS's tree per agent equals
@@ -894,12 +948,13 @@ that narrows the inner proof makes folds cheaper too.
 | the final wrap misses its gas or size | the real wrap verified on the JAM-only host (≤ 150M unmasked) and in the Wasm harness | slice 5, M1 |
 | the multi-step FRI path, or the new Blake2b channel, is unsound | a review plus tamper tests before the format admits them | slice 5, M1 |
 | the wrap misses its 80 proven bits | 74.7 at blowup 64 with powers-of-one DEEP batching [model]; **retired at 5.14:** affine batching in the fork for format 28, 82.6 proven bits [model] | slice 5, M1 |
-| masking the wrap costs more than (c)'s factor | one masked wrap: ≤ 24 GiB, ≤ 200M gas; leakage and soundness tests. Measured (spike 6a): 3.45 GiB of heap, 115.8–118.7M gas; the gate is 6.3–6.6 | slice 6 |
-| the cut and held build fail under failover | the cut and the held build across a leader change (6.12) | slice 6 |
-| the prover worker falls behind the window cadence | the worker measured against the cadence (6.18) | slice 6 |
-| the teammate's pallet diverges from the design | the pallet against the conformance vectors (6.17) | slice 6, then the teammate's |
-| a deadline between parties is read from a space's clock | a test that every deadline is the venue's time | slice 6 |
-| a forgery in the recursion AIR | the recursion AIR's forgery gates (6.8) | slice 6 |
+| masking the wrap costs more than (c)'s factor | one masked wrap: ≤ 24 GiB, ≤ 200M gas; leakage and soundness tests. **Retired:** format 39 at a 3.6 GiB heap, 79.6M gas [measured] | slice 6, M2 |
+| the cut and held build fail under failover | the cut and the held build across a leader change | slice 6, M3 |
+| the prover worker falls behind the window cadence | the worker measured against the cadence | slice 6, M3 |
+| the teammate's pallet diverges from the design | the pallet against the conformance vectors | the teammate's |
+| a deadline between parties is read from a space's clock | a test that every deadline is the venue's time | slice 6, M3 |
+| a forgery in the recursion AIR | the recursion AIR's forgery gates | slice 6, M2 |
+| a prover's internals leave the role | the carrier audit (A.5) on the model venue and on chain | slice 6, M3 |
 | the credential AIR misses sub-second | masked auth and payment proofs on a real flagship | slice 7 |
 | the signature chips' cost or soundness | a gate ladder per chip; a phone run | slice 7 |
 
@@ -950,9 +1005,21 @@ that narrows the inner proof makes folds cheaper too.
     every deadline between parties is the venue's time (§7).
 11. **The pallet's home** (2026-10-19): `pallet-spaces` in Kreivo, built
     by the Kreivo teammate from `spaces-pallet.md`, to replace
-    pallet-communities later; slice 6 delivers its design, the verifier
-    kit vendored with a sync check, and the node's client (§6). This
-    replaces 7's "in slice 6".
+    pallet-communities later; VOS delivers its design, the verifier kit
+    vendored with a sync check, and the node's client against a mock
+    (§6). This replaces 7's "in slice 6".
+12. **The Kreivo transport** (2026-10-20): the chain client is the
+    teammate's, on sube behind `Transport`; VOS keeps the design, the
+    kit, the calls, `KreivoVenue`, the mock and the conformance vectors.
+13. **The prover stays in the node** (2026-10-20); the extension host is
+    deferred, and a venue's transport becomes an extension once it
+    exists.
+14. **The writer's stall bound** (2026-10-23): a node whose store's
+    writer stalls past the election timeout's upper end stops leading
+    (`Config::writer_stall` an override), so a slow sync costs leadership
+    no sooner than a crash would.
+15. **The JAM client is development tooling** (2026-10-23): `vos` and the
+    node know no JAM (§6).
 
 **Decided on the evidence, and the owner's to override:**
 - reads at the last anchored cut, to the space root;
@@ -1064,7 +1131,7 @@ counts as conjectured / proven at the reference shape [model]:
 | 32 | leaf and fold (one padded shape) | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 | reserved |
 | 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 | 28 | the final wrap, unmasked (tests only) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
-| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | reserved; admitted at slice 6's 6.4 |
+| 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted; the one production venues accept |
 | 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 
 - **Each entry** holds its channel, its parameters, the DEEP batching its
@@ -1081,9 +1148,11 @@ counts as conjectured / proven at the reference shape [model]:
   refused until its AIR and channel exist. 32's exist from slice 5's 5.8:
   `vos-pvm-recair` proves and verifies its proofs natively, and the registry
   refuses it, as no verifier outside the recursion reads a leaf or a fold.
-  28 is admitted from slice 5's 5.14: `vos-pvm-recair` proves the wrap and
-  `vos-pvm-final-verifier` verifies it; a segment verifier takes only a
-  segment format.
+  28 and 39 are admitted: `vos-pvm-recair` proves the wrap and
+  `vos-pvm-final-verifier` verifies it, 39 by its fixed layout; 28 is
+  linked only under `test-formats`, which no production build enables
+  (`just check-no-test-formats`); a segment verifier takes only a segment
+  format.
 - **Masking takes a new number, 39:** a bump of 28 would break "a number
   names one AIR and one set of parameters". 40, spike 6a's blowup-64
   shape, is retired unregistered; 38 stays unassigned, the fixtures' "a
@@ -1091,29 +1160,61 @@ counts as conjectured / proven at the reference shape [model]:
 - **24 to 27, 29, 31, 33, 34, 36 and 40 are retired.** 24 to 27 and 29
   named the segment AIR before its hardening, and 31, 33 and 34 the
   hardened AIR with its unread columns (31 at 44 queries); 36 named the
-  legacy Blake2s segment format, the default prover's and the refine
-  bundles' until slice 6's 6.9: its parameters the proof's own under a
+  legacy Blake2s segment format, once the default prover's and the
+  refine bundles': its parameters the proof's own under a
   96-bit conjectured floor, no interaction PoW and the boundary states
   mixed a word at a time, 57 proven bits at its MOBILE shape, below the
   60-bit floor; 40 was never registered, but spike 6a's measured masked
   wrap at blowup 64 was made under it. They are refused and never
   registered again: a number names one AIR and one set of parameters.
 
-**A.5 What may leave the prover role (slice 6):**
+**A.5 What may leave the prover role:**
 - the `Statement`;
 - the final proof.
 
-`Attest` (`agent/wire/src/result.rs`) is `{ program, witness_input,
-output }`.
-- **`witness_input`** replaced `arguments` in M0: the exact byte stream
-  the kernel read, in call order, at most 4 MiB. Keeping both would have
-  held the same bytes twice. A large result travels as a blob (slice 4's
-  4.4a).
-- Slice 6 adds the window, then the final proof's hash.
+`Attest` (`agent/wire/src/result.rs`) is `{ program, window,
+witness_input, output, public_args, roots }`:
+- **`window`:** the window whose cut it read at, for a read at a cut;
+  none for a plain attest;
+- **`witness_input`:** the exact byte stream the kernel read, in call
+  order: its arguments, then, at a cut, the served rows' encoding, which
+  arrived inline in the `Resume` input; at most a work result's cap. A
+  prover's re-run is served the same bytes;
+- **`public_args`** and **`roots`:** the statement's, as §3.6 orders them.
 
-Segment, leaf and fold proofs appear in no log entry, blob or message
-that leaves the role. The carrier audit checks every one of those
-carriers.
+The final proof's hash reaches the agent as an `Input::Proven { window,
+id, proof }`, through its leader; the proof itself is a blob, held until
+its job finishes.
+
+**The carrier audit** (`vos_checker::carriers`, `just test-carriers` on
+the model venue and `just e2e-chain` on both venues) searches every byte
+a run produced for what never leaves the role, each needle in its bytes,
+its hex, its `Debug` list and, for a number, its digits and byte orders:
+- **the needles:** every segment, leaf and fold proof's roots, encoding
+  and output digests; each segment's steps and the gas its re-run left;
+  each boundary's memory roots and registers φ0..φ8; the served rows,
+  their salts, the cut's roots and paths, the private arguments and their
+  plain and domain-prefixed hashes; the masked wrap's randomness (each
+  attempt's entropy and seed, the witness digest, the blinding values,
+  the seeds of the mask, salt and `R` columns), shown by the prover's
+  watch seam (`vos-pvm-recair`'s `watch`, a dev edge only); each debug
+  output's text;
+- **the carriers, by reach:** what leaves the role (a venue's calls, every
+  JAM package, extrinsic and work report as sent, the statements
+  service's storage read over RPC, the logs at every level, standard
+  error, a client's answers, frames to and the disk of a node that does
+  not replicate the agent) is searched for every needle in every form; a
+  chain's own record (its log and database) for every needle in its full
+  forms, a number's being matched there by the chain's counters by
+  chance; what stays within the agent's replicas (their logs, blobs,
+  stores, disks once stopped, frames) for proofs, memory roots, register
+  files and the wrap's randomness, which no carrier may hold;
+- **the guards:** each capture path shown to capture by a canary; each
+  needle found when planted in each of its forms; the audit's seams and
+  the debug outputs reach no production build (`just
+  check-no-debug-internals`, `check-no-seeded-masks`); a panic while a
+  proof is made prints its place and not its message; a failed proof's
+  error names what failed, no value.
 
 **A.6 The golden fixtures (M1, extended in slice 6):**
 - a valid statement and proof;
@@ -1162,8 +1263,8 @@ class is the first check it fails. The last case is a transition's: the
 id leaves the format out, so the run the venue accepted under a successor
 format is the same statement under 28. No format holds 38 and this
 verifier reads 28 alone, so the case records the successor's acceptance
-as the id the venue keeps, all its repeat check reads; slice 6's masked
-format adds the case the other way round. The words are mixed before the
+as the id the venue keeps, all its repeat check reads; at format 39 the
+transition runs both ways (below). The words are mixed before the
 interaction PoW (8 bits), so a proof of other words fails there (`0x108`)
 with probability 255/256, or otherwise at the logup sums (`0x109`); a wrap
 proved over a refused root does not balance its logup sums. A judgement
@@ -1174,7 +1275,7 @@ depend on the features a build turns on (the drawn relations are kept in
 the order drawn, never in `TypeId` order). `just judge-wasm` (in
 `test-proof`) judges the fixtures in Wasm.
 
-**At format 39** (slice 6's 6.5) [measured]: the generator wraps `S`'s
+**At format 39** [measured]: the generator wraps `S`'s
 run under format 39, masked from the seeded test seam (`MaskRng::Seeded`,
 so the bytes are its own every run: `wrap.proof`, 145,796 bytes), and under
 28 (`wrap-28.proof`, 123,797 bytes); the two cheating wraps under 39; and a
@@ -1219,7 +1320,7 @@ under `systemd-run` with these caps as `MemoryMax`.
 | segment (the window kernel's) | its class | ≤ 24 GiB | ≤ 8 s, once the SIMD hasher lands |
 | leaf | ≤ the padded shape | ≤ 4 GiB | 1.2–2.6 s [projected]; ≤ 1× the segment's proving (target 0.13–0.5×) |
 | fold | the padded shape | ≤ 4 GiB; 942 MiB of heap [measured] | 1.2–2.6 s [projected]; ≤ the leaf's; 1.5 s [measured] |
-| wrap | ≤ 2^17; 2^14 / 2^15 / 2^11 [measured] | ≤ 8 GiB unmasked; a 2.5 GiB heap [measured]. 39: ≤ 8 GiB; 3.45 GiB of heap [measured] | 4.4–9.5 s [projected]; 5.45 s [measured]. 39: ≤ 15 s; 11.6 s [measured] |
+| wrap | ≤ 2^17; 2^14 / 2^15 / 2^11 [measured] | ≤ 8 GiB unmasked; a 2.5 GiB heap [measured]. 39: ≤ 8 GiB; a 3,627 MiB heap [measured] | 4.4–9.5 s [projected]; 5.45 s [measured]. 39: ≤ 15 s; 7.44–8.40 s under load [measured] |
 
 A window of 16 segments proves end to end in about 3–5 minutes
 [projected].

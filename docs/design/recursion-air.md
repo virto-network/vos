@@ -724,9 +724,9 @@ build-std. It holds:
 - the public logup sum from the program id, the io-hash, `u` and `one`;
 - the components built once, as spike 4a's; unlike spike 4a's, a shape
   check before any Stwo call (`check_shape`, `check_samples`: the
-  verifier must be panic-free, `proving.md` §6); and postcard's decode,
-  16.0M of its 96.4M gas, until a fixed-layout decode (slice 6,
-  `R/spike4a-final-gas.md` §4).
+  verifier must be panic-free, `proving.md` §6); format 28 keeps
+  postcard's decode (16.0M of its 96.4M gas); format 39 decodes a fixed
+  layout (`R/spike4a-final-gas.md` §4).
 
 **Expected size:** spike 4a's proxy verifier is 344–370 KB as a PVM program
 and 208 KB as a Wasm blob [measured]; the recursion AIR's constraints (313,
@@ -742,6 +742,16 @@ components' masks; every limb canonical), the preprocessed root against
 its constant, the header and the interaction PoW, then the logup sums with
 the 24 words' and `u`'s public terms, then Stwo's verifier, the components
 built once. **469 KB** as a PVM program, **292 KB** as a Wasm blob.
+
+**The masked verifier, format 39** [measured]: it reads the proof's fixed
+layout and runs over Stwo's PCS (`CommitmentSchemeVerifier::{commit,
+verify_values}`), never `core::verifier::verify`, whose composition split
+is hardcoded (DIVERGENCE-004); the two facts it leaves to Stwo are pinned
+by the format: the trees' widths (57 / 381 / 48 / 20) and the FRI round
+list (`[3, 3, 3, 2]`). `R` has 8 columns, so it needs no rank check. A
+production venue links 39 alone (523,607 bytes as a PVM program); the
+`valid` fixture verifies in 79.6M gas on the JAM-only host, its decode
+1.50M (`proving.md` §3.5).
 
 **The statement over it** (slice 5's 5.15): `vos-statement`
 (`pvm/proof/statement`) depends on it, not it on the statement: the
