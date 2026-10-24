@@ -441,14 +441,7 @@ pub fn verify_chain_standalone(
     // Boundary continuity: each segment's final state must equal the next
     // segment's initial state.  Bound for registers/pc/timestamp (and the
     // memory root) by each segment's in-circuit boundary binding.
-    for window in proofs.windows(2) {
-        if window[0].final_state != window[1].initial_state {
-            return Err(VerificationError::InvalidStructure(format!(
-                "segment chain broken: final state at ts={} does not match next initial at ts={}",
-                window[0].final_state.timestamp, window[1].initial_state.timestamp,
-            )));
-        }
-    }
+    vos_pvm_proof::proof::check_continuity(proofs)?;
     // Each segment verifies standalone against the SAME program commitment:
     // no side note, and program identity is pinned across the whole chain.
     for proof in proofs {
@@ -536,14 +529,7 @@ pub fn verify_kernel_chain(
     if last.final_state.pc != HALT_PC {
         return refuse("the last segment does not end at the halt");
     }
-    for window in proofs.windows(2) {
-        if window[0].final_state != window[1].initial_state {
-            return Err(VerificationError::InvalidStructure(format!(
-                "segment chain broken: final state at ts={} does not match next initial at ts={}",
-                window[0].final_state.timestamp, window[1].initial_state.timestamp,
-            )));
-        }
-    }
+    vos_pvm_proof::proof::check_continuity(&proofs)?;
     let classes = proofs
         .iter()
         .map(|proof| kernel_segment_class(proof, program))

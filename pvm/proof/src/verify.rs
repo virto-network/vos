@@ -42,15 +42,7 @@ pub fn verify_chain(proofs: &[Proof], side_notes: &[&SideNote]) -> Result<(), Ve
             "proofs and side_notes length mismatch".to_string(),
         ));
     }
-    // Check segment continuity
-    for window in proofs.windows(2) {
-        if window[0].final_state != window[1].initial_state {
-            return Err(VerificationError::InvalidStructure(format!(
-                "segment chain broken: final state at ts={} doesn't match next initial at ts={}",
-                window[0].final_state.timestamp, window[1].initial_state.timestamp
-            )));
-        }
-    }
+    crate::proof::check_continuity(proofs)?;
     // Verify each segment independently
     for (proof, side_note) in proofs.iter().zip(side_notes) {
         verify(proof.clone(), side_note)?;

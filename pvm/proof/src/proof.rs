@@ -31,6 +31,24 @@ pub use preflight::{
 /// history".
 pub const PROOF_FORMAT_VERSION: u32 = crate::format::SEGMENT.number;
 
+/// Whether consecutive segments chain: each one's final state is the next
+/// one's initial state.
+pub fn check_continuity(proofs: &[Proof]) -> Result<(), stwo::core::verifier::VerificationError> {
+    match proofs
+        .windows(2)
+        .find(|pair| pair[0].final_state != pair[1].initial_state)
+    {
+        Some(pair) => Err(stwo::core::verifier::VerificationError::InvalidStructure(
+            alloc::format!(
+                "segment chain broken: final state at ts={} does not match next initial at ts={}",
+                pair[0].final_state.timestamp,
+                pair[1].initial_state.timestamp,
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Exact number of commitment trees in this generation of the Stwo proof:
 /// preprocessed, main, interaction, and split composition.
 pub const PROOF_COMMITMENT_TREE_COUNT: usize = 4;
