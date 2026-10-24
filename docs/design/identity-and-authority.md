@@ -340,8 +340,8 @@ primitives built first don't preclude them. A space opts in.
 - **One pool shared by many spaces,** not one per space. The anonymity
   set is everyone who uses it.
 - **Its costs on JAM:**
-  - a final proof costs about 100M gas of refine, so about 50 fit a
-    work package's 5e9;
+  - a final proof costs about 80M gas of refine (the JAM statements
+    service's, measured), so about 60 fit a work package's 5e9;
   - scanning notes held on JAM needs the JAM light client in the
     personal space.
 - **An anonymous input** travels the client path without a session:
@@ -424,7 +424,22 @@ an agent, but approving a payment is a member's grant like any other.
     through the node's own sr25519 authority account, the space's
     sovereign account paying (`spaces-pallet.md`; a budget per window
     bounds what a compromised node key can spend); or the JAM statements
-    service. The anchor gives outsiders ordering;
+    service. A node reaches its venue through a `VenueClient`, which an
+    extension will provide: the Kreivo client is built against a mock of
+    the designed pallet, its chain transport a port of the Substrate
+    extension once the pallet and the extension host exist; the JAM
+    client is development tooling (`tools/jam-dev`), the node knowing no
+    JAM. The anchor's signer is checked against the space's anchor keys
+    listed at the venue, which its controller adds and removes (a
+    removed key's anchors are refused, and an anchor refused for its key
+    is signed again with a listed one). The anchor gives outsiders
+    ordering;
+  - two anchors of one window under different roots are an
+    equivocation: the venue suspends the space until the controller has
+    delisted both keys;
+  - **a space moves venues** by a migration its controller signs at the
+    old venue: windows from the migration's on anchor at the new one
+    only, and the old venue keeps judging statements rooted before it.
   - integrity comes only from a proof that names the anchor.
 - **A venue anchors only a window its own clock has closed;** every
   deadline between parties is the venue's time.
@@ -432,7 +447,7 @@ an agent, but approving a payment is a member's grant like any other.
   - on Kreivo an anchor is a ~170-byte extrinsic, a statement about 4 ms
     of ref_time unmasked [measured] and about 0.43 UNITS of length fee,
     plus a refundable deposit, all paid by the space's sovereign account;
-    on JAM a statement is about 100M gas of refine;
+    on JAM a statement is about 80M gas of refine;
   - "this root is in the sequence" is a witnessed read in the
     representative agent's state, which slice 4 made cheap: on JAM,
     later; on Kreivo the pallet stores the anchors.
@@ -444,8 +459,8 @@ an agent, but approving a payment is a member's grant like any other.
   private one.**
   - An unmasked STARK opens parts of its trace, so a settlement proof
     sent to JAM would leak the space's ledger to the world.
-  - The final proof is masked from slice 6 (format 39); aggregation (the
-    recursion) and fixed shapes came first, in slice 5.
+  - The final proof is masked (format 39), over the recursion's one
+    proof a run and a fixed shape per kernel.
 
 ## 12. The root space and the registry of spaces
 
