@@ -730,41 +730,11 @@ fn kernel(graph: &Graph, method: u32, entry: u64, input: Input) -> Result<Vec<u8
     let head = Prologue::new(arguments, input);
     code_sections.push((0, prologue, head.code.clone()));
 
-    // The data reached, the rest zeros: the read-only data as long as its
-    // last object, in as many zones as the actor's, so the read-write data
-    // stays where it was linked; the read-write data's initialized part as
-    // far as its last object reaches.
     let objects = merge_ranges(reached.objects.iter().copied().collect());
     let kept = |address: u64, len: u64| {
         range_at(&objects, address).is_some_and(|(_, end)| address.saturating_add(len) <= end)
     };
-    let masked = |base: u64, original: &[u8], least: u64| {
-        let last = objects
-            .iter()
-            .filter(|&&(start, _)| start >= base && start < base + original.len() as u64)
-            .map(|&(_, end)| end - base)
-            .max()
-            .unwrap_or(0);
-        let len = last.max(least).min(original.len() as u64) as usize;
-        let mut bytes = vec![0; len];
-        for &(start, end) in &objects {
-            let from = start.saturating_sub(base).min(len as u64) as usize;
-            let to = end.saturating_sub(base).min(len as u64) as usize;
-            bytes[from..to].copy_from_slice(&original[from..to]);
-        }
-        bytes
-    };
-    let least = match elf.ro_data.len() as u64 {
-        0 => 0,
-        len => {
-            let padding = elf.ro_base.saturating_sub(Z_Z);
-            (zone_round(padding + len) - Z_Z + 1)
-                .saturating_sub(padding)
-                .max(1)
-        }
-    };
-    let ro_data = masked(elf.ro_base, &elf.ro_data, least);
-    let rw_data = masked(elf.rw_base, &elf.rw_data, 0);
+    let (ro_data, rw_data) = reached_data(elf, &objects);
 
     // What the kernel's linking needs of the ELF's relocations, its own.
     let pairs = |map: &BTreeMap<u64, u64>| -> BTreeMap<u64, u64> {
@@ -821,6 +791,57 @@ fn kernel(graph: &Graph, method: u32, entry: u64, input: Input) -> Result<Vec<u8
     };
 
     let transpiled = transpile_with(&kernel, Link::Kernel)?;
+    checked_blob(graph, &reached, method, transpiled, arguments, input)
+}
+
+/// The data a kernel keeps of `elf`, `objects` the ranges it reaches, the
+/// rest zeros: the read-only data as long as its last object, in as many
+/// zones as the actor's, so the read-write data stays where it was
+/// linked; the read-write data's initialized part as far as its last
+/// object reaches.
+fn reached_data(elf: &LinkedElf, objects: &[(u64, u64)]) -> (Vec<u8>, Vec<u8>) {
+    let masked = |base: u64, original: &[u8], least: u64| {
+        let last = objects
+            .iter()
+            .filter(|&&(start, _)| start >= base && start < base + original.len() as u64)
+            .map(|&(_, end)| end - base)
+            .max()
+            .unwrap_or(0);
+        let len = last.max(least).min(original.len() as u64) as usize;
+        let mut bytes = vec![0; len];
+        for &(start, end) in objects {
+            let from = start.saturating_sub(base).min(len as u64) as usize;
+            let to = end.saturating_sub(base).min(len as u64) as usize;
+            bytes[from..to].copy_from_slice(&original[from..to]);
+        }
+        bytes
+    };
+    let least = match elf.ro_data.len() as u64 {
+        0 => 0,
+        len => {
+            let padding = elf.ro_base.saturating_sub(Z_Z);
+            (zone_round(padding + len) - Z_Z + 1)
+                .saturating_sub(padding)
+                .max(1)
+        }
+    };
+    (
+        masked(elf.ro_base, &elf.ro_data, least),
+        masked(elf.rw_base, &elf.rw_data, 0),
+    )
+}
+
+/// The kernel of `method` as its blob, `transpiled` from its linked ELF:
+/// refused if it makes a host call no kernel may, jumps to the halt
+/// statically, or its argument pages are not its read-write data's last.
+fn checked_blob(
+    graph: &Graph,
+    reached: &Reached,
+    method: u32,
+    transpiled: crate::linker::TranspiledElf,
+    arguments: u64,
+    input: Input,
+) -> Result<Vec<u8>, DeriveError> {
     if let Some(&(address, id)) = transpiled
         .host_calls
         .iter()
@@ -841,7 +862,7 @@ fn kernel(graph: &Graph, method: u32, entry: u64, input: Input) -> Result<Vec<u8
     let [_, rw, _] = vos_pvm_program::StandardHeader::read(&blob)
         .and_then(|header| header.regions())
         .ok_or_else(|| TranspileError::InvalidSection("a kernel's layout".into()))?;
-    let pages = u64::from(elf.heap_pages) + input.pages();
+    let pages = u64::from(graph.elf.heap_pages) + input.pages();
     if rw.base + rw.size != arguments + pages * PAGE {
         return Err(TranspileError::InvalidSection(format!(
             "a kernel's argument pages at {arguments:#x} are not its read-write data's last"

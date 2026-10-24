@@ -394,6 +394,67 @@ pub(crate) fn verify_rest<V: Value>(
 ) -> (Draws, Vec<Var>) {
     let config = shape.config();
     let lifting = shape.layout.lifting_log_size;
+    let composition = composition(context, shape, channel, &relations, claimed_sums, values);
+    let (deep_coeff, commitment) = fri_commitment(context, shape, channel, &composition, values);
+    context.piece("pow");
+    let nonce = context.guess(values.nonce);
+    channel.check_pow(context, config.pow_bits, nonce);
+    context.piece("queries");
+    let queries = channel.draw_queries(context, config.fri_config.n_queries, lifting);
+
+    context.piece("deep once");
+    let constants = deep::prepare(
+        context,
+        &shape.deep,
+        composition.oods_point,
+        deep_coeff,
+        &composition.sampled,
+    );
+    let [preprocessed_root, main_root] = roots;
+    let roots = [
+        preprocessed_root,
+        main_root,
+        composition.interaction_root,
+        composition.composition_root,
+    ];
+    let answers = queries
+        .iter()
+        .zip(&values.queries)
+        .map(|(bits, query)| {
+            verify_query_openings(context, shape, &constants, &commitment, roots, bits, query)
+        })
+        .collect();
+    context.piece("end");
+    let draws = Draws {
+        relations,
+        composition_coeff: composition.composition_coeff,
+        oods: composition.oods_point,
+        deep_coeff,
+        fri_alphas: commitment.alphas,
+        queries,
+    };
+    (draws, answers)
+}
+
+/// What the composition's check leaves the rest of the proof.
+struct Composition {
+    interaction_root: [Var; 2],
+    composition_coeff: Var,
+    composition_root: [Var; 2],
+    oods_point: Point,
+    sampled: Vec<Var>,
+}
+
+/// The interaction and composition roots mixed and their draws, then the
+/// sampled values guessed and the composition checked at the OODS point.
+fn composition<V: Value>(
+    context: &mut Context<V>,
+    shape: &StarkShape,
+    channel: &mut Channel<V>,
+    relations: &[[Var; 2]],
+    claimed_sums: &[Var],
+    values: &StarkValues<V>,
+) -> Composition {
     context.piece("channel");
     let interaction_root = context.guess_pair(values.roots[1]);
     channel.mix_root(context, interaction_root);
@@ -424,93 +485,92 @@ pub(crate) fn verify_rest<V: Value>(
         shape.layout.max_log_degree_bound,
         composition,
     );
+    Composition {
+        interaction_root,
+        composition_coeff,
+        composition_root,
+        oods_point,
+        sampled,
+    }
+}
 
+/// The sampled values mixed and DEEP's coefficient drawn, then FRI's layers'
+/// roots mixed, each layer's folding drawn, and its last layer mixed.
+fn fri_commitment<V: Value>(
+    context: &mut Context<V>,
+    shape: &StarkShape,
+    channel: &mut Channel<V>,
+    composition: &Composition,
+    values: &StarkValues<V>,
+) -> (Var, FriCommitment) {
     context.piece("channel");
-    channel.mix_felts(context, &sampled);
+    channel.mix_felts(context, &composition.sampled);
     let deep_coeff = channel.draw_felt(context);
-    let mut fri_roots = Vec::with_capacity(shape.n_fri_layers);
-    let mut fri_alphas = Vec::with_capacity(shape.n_fri_layers);
+    let mut roots = Vec::with_capacity(shape.n_fri_layers);
+    let mut alphas = Vec::with_capacity(shape.n_fri_layers);
     for &root in &values.fri_roots {
         let root = context.guess_pair(root);
         channel.mix_root(context, root);
-        fri_roots.push(root);
-        fri_alphas.push(channel.draw_felt(context));
+        roots.push(root);
+        alphas.push(channel.draw_felt(context));
     }
     let last_layer = context.guess(values.last_layer);
     channel.mix_felts(context, &[last_layer]);
-    context.piece("pow");
-    let nonce = context.guess(values.nonce);
-    channel.check_pow(context, config.pow_bits, nonce);
-    context.piece("queries");
-    let queries = channel.draw_queries(context, config.fri_config.n_queries, lifting);
-
-    context.piece("deep once");
-    let constants = deep::prepare(context, &shape.deep, oods_point, deep_coeff, &sampled);
     let commitment = FriCommitment {
-        roots: fri_roots,
-        alphas: fri_alphas.clone(),
+        roots,
+        alphas,
         last_layer,
     };
-    let [preprocessed_root, main_root] = roots;
-    let roots = [
-        preprocessed_root,
-        main_root,
-        interaction_root,
-        composition_root,
-    ];
-    let mut answers = Vec::with_capacity(queries.len());
-    for (bits, query) in queries.iter().zip(&values.queries) {
-        context.piece("circle");
-        let point = domain_point(context, lifting, bits);
-        context.piece("merkle");
-        let leaves: Vec<Vec<Var>> = query
-            .trees
-            .iter()
-            .map(|tree| tree.leaf.iter().map(|&v| context.guess(v)).collect())
-            .collect();
-        for (tree, opening) in query.trees.iter().enumerate() {
-            let tree_bits = if tree == 0 {
-                preprocessed_bits(bits, shape.heights[0])
-            } else {
-                bits.clone()
-            };
-            verify_opening(
-                context,
-                &leaves[tree],
-                shape.leaf_order[tree].len(),
-                &tree_bits,
-                &opening.path,
-                roots[tree],
-            );
-        }
-        context.piece("deep");
-        let answer = deep::answer(
+    (deep_coeff, commitment)
+}
+
+/// One query: its domain point, its four trees' openings against `roots`,
+/// its DEEP quotient and its FRI folds. The quotient, the first layer's
+/// value.
+fn verify_query_openings<V: Value>(
+    context: &mut Context<V>,
+    shape: &StarkShape,
+    constants: &deep::DeepConstants,
+    commitment: &FriCommitment,
+    roots: [[Var; 2]; 4],
+    bits: &[Bit],
+    query: &QueryValues<V>,
+) -> Var {
+    let lifting = shape.layout.lifting_log_size;
+    context.piece("circle");
+    let point = domain_point(context, lifting, bits);
+    context.piece("merkle");
+    let leaves: Vec<Vec<Var>> = query
+        .trees
+        .iter()
+        .map(|tree| tree.leaf.iter().map(|&v| context.guess(v)).collect())
+        .collect();
+    for (tree, opening) in query.trees.iter().enumerate() {
+        let tree_bits = if tree == 0 {
+            preprocessed_bits(bits, shape.heights[0])
+        } else {
+            bits.to_vec()
+        };
+        verify_opening(
             context,
-            &shape.deep,
-            &constants,
-            point,
-            [&leaves[0], &leaves[1], &leaves[2], &leaves[3]],
+            &leaves[tree],
+            shape.leaf_order[tree].len(),
+            &tree_bits,
+            &opening.path,
+            roots[tree],
         );
-        context.piece("fri");
-        verify_query(
-            context,
-            lifting,
-            &commitment,
-            bits,
-            point,
-            answer,
-            &query.fri,
-        );
-        answers.push(answer);
     }
-    context.piece("end");
-    let draws = Draws {
-        relations,
-        composition_coeff,
-        oods: oods_point,
-        deep_coeff,
-        fri_alphas,
-        queries,
-    };
-    (draws, answers)
+    context.piece("deep");
+    let answer = deep::answer(
+        context,
+        &shape.deep,
+        constants,
+        point,
+        [&leaves[0], &leaves[1], &leaves[2], &leaves[3]],
+    );
+    context.piece("fri");
+    verify_query(
+        context, lifting, commitment, bits, point, answer, &query.fri,
+    );
+    answer
 }

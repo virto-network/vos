@@ -98,6 +98,62 @@ impl DeepPlan {
     /// The plan over `layout`, the trees' leaf rows sorted by `leaf_order`
     /// (each tree's columns, in the order its leaf hashes them).
     pub fn new(layout: &SampleLayout, leaf_order: &[Vec<usize>]) -> Self {
+        let (offsets, columns) = Self::column_samples(layout);
+        let mut points: Vec<DeepPoint> = offsets
+            .iter()
+            .map(|&offset| DeepPoint {
+                offset,
+                samples: Vec::new(),
+                items: Vec::new(),
+            })
+            .collect();
+        for sample in columns.iter().flatten().flatten() {
+            points[sample.point]
+                .samples
+                .push((sample.exponent, sample.value));
+        }
+        for point in &mut points {
+            point
+                .samples
+                .sort_unstable_by_key(|sample| core::cmp::Reverse(sample.0));
+        }
+
+        // Clean blocks, then every other sample a single.
+        let taken = Self::clean_blocks(&mut points, &columns, leaf_order);
+        for (tree, order) in leaf_order.iter().enumerate() {
+            for (lane, &column) in order.iter().enumerate() {
+                for sample in &columns[tree][column] {
+                    if !taken.contains(&(tree, column, sample.point)) {
+                        points[sample.point].items.push(Item::Single {
+                            tree,
+                            lane,
+                            exponent: sample.exponent,
+                        });
+                    }
+                }
+            }
+        }
+        for point in &mut points {
+            point
+                .items
+                .sort_unstable_by_key(|item| core::cmp::Reverse(item.high()));
+            debug_assert!(
+                point
+                    .items
+                    .windows(2)
+                    .all(|pair| pair[0].low() > pair[1].high())
+            );
+        }
+        Self { points }
+    }
+
+    /// Each tree's columns' samples, as the native verifier numbers them,
+    /// and the distinct points they are at: a column of two samples first
+    /// gets the periodicity sample, at its second point plus its log
+    /// size's period, with the second value.
+    fn column_samples(
+        layout: &SampleLayout,
+    ) -> (Vec<CirclePoint<BaseField>>, Vec<Vec<Vec<ColumnSample>>>) {
         let lifting_step = CanonicCoset::new(layout.lifting_log_size).step();
         let mut offsets: Vec<CirclePoint<BaseField>> = Vec::new();
         let mut point_of = |offset: CirclePoint<BaseField>| match offsets
@@ -110,9 +166,6 @@ impl DeepPlan {
                 offsets.len() - 1
             }
         };
-        // Each tree's columns' samples, as the native verifier numbers them:
-        // a column of two samples first gets the periodicity sample, at its
-        // second point plus its log size's period, with the second value.
         let (mut exponent, mut value) = (0, 0);
         let mut columns: Vec<Vec<Vec<ColumnSample>>> = Vec::new();
         for (tree, tree_offsets) in layout.sample_offsets.iter().enumerate() {
@@ -142,26 +195,18 @@ impl DeepPlan {
             }
             columns.push(tree_samples);
         }
-        let mut points: Vec<DeepPoint> = offsets
-            .iter()
-            .map(|&offset| DeepPoint {
-                offset,
-                samples: Vec::new(),
-                items: Vec::new(),
-            })
-            .collect();
-        for sample in columns.iter().flatten().flatten() {
-            points[sample.point]
-                .samples
-                .push((sample.exponent, sample.value));
-        }
-        for point in &mut points {
-            point
-                .samples
-                .sort_unstable_by_key(|sample| core::cmp::Reverse(sample.0));
-        }
+        (offsets, columns)
+    }
 
-        // Clean blocks, then every other sample a single.
+    /// The clean blocks of eight leaf lanes, each pushed to its point's
+    /// items: at a point, each lane's one sample there, their exponents a
+    /// step apart and no other sample of the point between them. The
+    /// `(tree, column, point)`s they take.
+    fn clean_blocks(
+        points: &mut [DeepPoint],
+        columns: &[Vec<Vec<ColumnSample>>],
+        leaf_order: &[Vec<usize>],
+    ) -> BTreeSet<(usize, usize, usize)> {
         let mut taken: BTreeSet<(usize, usize, usize)> = BTreeSet::new();
         for (tree, order) in leaf_order.iter().enumerate() {
             for block in 0..order.len() / 8 {
@@ -210,31 +255,7 @@ impl DeepPlan {
                 }
             }
         }
-        for (tree, order) in leaf_order.iter().enumerate() {
-            for (lane, &column) in order.iter().enumerate() {
-                for sample in &columns[tree][column] {
-                    if !taken.contains(&(tree, column, sample.point)) {
-                        points[sample.point].items.push(Item::Single {
-                            tree,
-                            lane,
-                            exponent: sample.exponent,
-                        });
-                    }
-                }
-            }
-        }
-        for point in &mut points {
-            point
-                .items
-                .sort_unstable_by_key(|item| core::cmp::Reverse(item.high()));
-            debug_assert!(
-                point
-                    .items
-                    .windows(2)
-                    .all(|pair| pair[0].low() > pair[1].high())
-            );
-        }
-        Self { points }
+        taken
     }
 
     /// Each point's lowest exponent.

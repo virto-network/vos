@@ -104,83 +104,11 @@ pub(crate) fn lower(
     alpha: &dyn Fn(usize) -> Operand,
 ) -> Lowered {
     let n = dag.nodes.len();
-    let mut reached = vec![false; n];
-    let mut stack = roots.to_vec();
-    while let Some(node) = stack.pop() {
-        if !std::mem::replace(&mut reached[node], true) {
-            stack.extend(dag.operands(node));
-        }
-    }
-    let mut uses = vec![0usize; n];
-    let mut is_root = vec![false; n];
-    for &root in roots {
-        uses[root] += 1;
-        is_root[root] = true;
-    }
-    for node in (0..n).filter(|&node| reached[node]) {
-        for operand in dag.operands(node) {
-            uses[operand] += 1;
-        }
-    }
-
+    let (reached, uses, is_root) = reach(dag, roots);
     let mut rows = Vec::new();
-
-    // A relation's powers: `α^i = α^(i−1)·α`, one row each, up to the
-    // highest power reached.
-    let mut powers: Vec<(usize, usize)> = (0..n)
-        .filter(|&node| reached[node])
-        .filter_map(|node| match dag.nodes[node] {
-            Op::Power { relation, power } => Some((relation, power)),
-            _ => None,
-        })
-        .collect();
-    powers.sort();
-    let mut power_row = std::collections::BTreeMap::new();
-    for relation in powers.iter().map(|&(relation, _)| relation) {
-        if power_row.contains_key(&(relation, 2)) {
-            continue;
-        }
-        let highest = powers
-            .iter()
-            .filter(|&&(r, _)| r == relation)
-            .map(|&(_, power)| power)
-            .max()
-            .unwrap();
-        let mut previous = alpha(relation);
-        for power in 2..=highest {
-            rows.push(
-                Form {
-                    product: Some((BaseField::one(), previous, alpha(relation))),
-                    terms: vec![],
-                }
-                .row(),
-            );
-            previous = Operand::Row(rows.len() - 1);
-            power_row.insert((relation, power), previous);
-        }
-    }
+    let power_row = power_rows(dag, &reached, alpha, &mut rows);
     let power_rows = rows.len();
-
-    // Whether `node` is taken in by its consumer.
-    let single = |node: Node| uses[node] == 1 && !is_root[node];
-    let mut absorbed = vec![false; n];
-    for node in (0..n).filter(|&node| reached[node]) {
-        if let Op::Add(a, b) | Op::Sub(a, b) = dag.nodes[node] {
-            let mut product = false;
-            for child in [a, b] {
-                match dag.nodes[child] {
-                    Op::Mul(x, y) if single(child) && !product => {
-                        absorbed[child] = true;
-                        if dag.m31(x).is_none() && dag.m31(y).is_none() {
-                            product = true;
-                        }
-                    }
-                    Op::Neg(_) if single(child) => absorbed[child] = true,
-                    _ => {}
-                }
-            }
-        }
-    }
+    let absorbed = absorbed(dag, &reached, &uses, &is_root);
 
     let mut operands = Operands {
         dag,
@@ -256,6 +184,101 @@ pub(crate) fn lower(
         roots,
         power_rows,
     }
+}
+
+/// The nodes reaching `roots`, each node's uses by the reached nodes and
+/// the roots, and whether it is a root.
+fn reach(dag: &Dag, roots: &[Node]) -> (Vec<bool>, Vec<usize>, Vec<bool>) {
+    let n = dag.nodes.len();
+    let mut reached = vec![false; n];
+    let mut stack = roots.to_vec();
+    while let Some(node) = stack.pop() {
+        if !std::mem::replace(&mut reached[node], true) {
+            stack.extend(dag.operands(node));
+        }
+    }
+    let mut uses = vec![0usize; n];
+    let mut is_root = vec![false; n];
+    for &root in roots {
+        uses[root] += 1;
+        is_root[root] = true;
+    }
+    for node in (0..n).filter(|&node| reached[node]) {
+        for operand in dag.operands(node) {
+            uses[operand] += 1;
+        }
+    }
+    (reached, uses, is_root)
+}
+
+/// A relation's powers: `α^i = α^(i−1)·α`, one row each pushed to `rows`,
+/// up to the highest power reached; the row of each.
+fn power_rows(
+    dag: &Dag,
+    reached: &[bool],
+    alpha: &dyn Fn(usize) -> Operand,
+    rows: &mut Vec<Row>,
+) -> std::collections::BTreeMap<(usize, usize), Operand> {
+    let mut powers: Vec<(usize, usize)> = (0..dag.nodes.len())
+        .filter(|&node| reached[node])
+        .filter_map(|node| match dag.nodes[node] {
+            Op::Power { relation, power } => Some((relation, power)),
+            _ => None,
+        })
+        .collect();
+    powers.sort();
+    let mut power_row = std::collections::BTreeMap::new();
+    for relation in powers.iter().map(|&(relation, _)| relation) {
+        if power_row.contains_key(&(relation, 2)) {
+            continue;
+        }
+        let highest = powers
+            .iter()
+            .filter(|&&(r, _)| r == relation)
+            .map(|&(_, power)| power)
+            .max()
+            .unwrap();
+        let mut previous = alpha(relation);
+        for power in 2..=highest {
+            rows.push(
+                Form {
+                    product: Some((BaseField::one(), previous, alpha(relation))),
+                    terms: vec![],
+                }
+                .row(),
+            );
+            previous = Operand::Row(rows.len() - 1);
+            power_row.insert((relation, power), previous);
+        }
+    }
+    power_row
+}
+
+/// The nodes their consumer takes in: a sum's or a difference's operands
+/// that only it uses, each a negation or a product, at most one of them a
+/// product of two wires.
+fn absorbed(dag: &Dag, reached: &[bool], uses: &[usize], is_root: &[bool]) -> Vec<bool> {
+    let n = dag.nodes.len();
+    let single = |node: Node| uses[node] == 1 && !is_root[node];
+    let mut absorbed = vec![false; n];
+    for node in (0..n).filter(|&node| reached[node]) {
+        if let Op::Add(a, b) | Op::Sub(a, b) = dag.nodes[node] {
+            let mut product = false;
+            for child in [a, b] {
+                match dag.nodes[child] {
+                    Op::Mul(x, y) if single(child) && !product => {
+                        absorbed[child] = true;
+                        if dag.m31(x).is_none() && dag.m31(y).is_none() {
+                            product = true;
+                        }
+                    }
+                    Op::Neg(_) if single(child) => absorbed[child] = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+    absorbed
 }
 
 /// The operand each lowered node is.

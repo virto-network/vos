@@ -458,10 +458,45 @@ struct Deep {
 /// A sample: its point and its exponent.
 type Sample = (u64, usize);
 
+/// Each column's samples, numbered across the trees.
+type Samples = Vec<Vec<Vec<Sample>>>;
+
+/// A point's items, `(low, high, step)`: clean blocks, then singles.
+type Items = BTreeMap<u64, Vec<(usize, usize, usize)>>;
+
 fn deep(trees: &[Vec<Column>; 4], lifting: u32) -> Deep {
-    // Each column's samples, numbered across the trees.
+    let samples = numbered_samples(trees, lifting);
+    let mut by_point: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+    for &(point, exponent) in samples.iter().flatten().flatten() {
+        by_point.entry(point).or_default().push(exponent);
+    }
+    let (mut items, taken, blocks) = clean_blocks(trees, &samples, &by_point);
+    let mut singles = 0;
+    for (tree, columns) in samples.iter().enumerate() {
+        for (column, column_samples) in columns.iter().enumerate() {
+            for &(point, exponent) in column_samples {
+                if !taken.contains(&(tree, column, point)) {
+                    singles += 1;
+                    items
+                        .entry(point)
+                        .or_default()
+                        .push((exponent, exponent, 0));
+                }
+            }
+        }
+    }
+    Deep {
+        points: by_point.len(),
+        blocks,
+        singles,
+        once: once_rows(&by_point, &mut items),
+    }
+}
+
+/// Each column's samples, numbered across the trees in their order.
+fn numbered_samples(trees: &[Vec<Column>; 4], lifting: u32) -> Samples {
     let mut exponent = 0;
-    let samples: Vec<Vec<Vec<Sample>>> = trees
+    trees
         .iter()
         .map(|tree| {
             tree.iter()
@@ -476,14 +511,19 @@ fn deep(trees: &[Vec<Column>; 4], lifting: u32) -> Deep {
                 })
                 .collect()
         })
-        .collect();
-    let mut by_point: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
-    for &(point, exponent) in samples.iter().flatten().flatten() {
-        by_point.entry(point).or_default().push(exponent);
-    }
+        .collect()
+}
 
-    // Each point's items, `(low, high, step)`: clean blocks, then singles.
-    let mut items: BTreeMap<u64, Vec<(usize, usize, usize)>> = BTreeMap::new();
+/// The clean blocks of eight lanes, a tree's columns in log-size order:
+/// at a point, each lane's one sample there, their exponents a step apart
+/// and no other sample of the point between them. Their items, the
+/// `(tree, column, point)`s they take, and their count.
+fn clean_blocks(
+    trees: &[Vec<Column>; 4],
+    samples: &Samples,
+    by_point: &BTreeMap<u64, Vec<usize>>,
+) -> (Items, BTreeSet<(usize, usize, u64)>, usize) {
+    let mut items: Items = BTreeMap::new();
     let mut taken: BTreeSet<(usize, usize, u64)> = BTreeSet::new();
     let orders: Vec<Vec<usize>> = trees
         .iter()
@@ -496,7 +536,7 @@ fn deep(trees: &[Vec<Column>; 4], lifting: u32) -> Deep {
     let mut blocks = 0;
     for (tree, order) in orders.iter().enumerate() {
         for lanes in order.chunks_exact(8) {
-            for (&point, exponents) in &by_point {
+            for (&point, exponents) in by_point {
                 let at: Option<Vec<usize>> = lanes
                     .iter()
                     .map(|&column| {
@@ -533,26 +573,16 @@ fn deep(trees: &[Vec<Column>; 4], lifting: u32) -> Deep {
             }
         }
     }
-    let mut singles = 0;
-    for (tree, columns) in samples.iter().enumerate() {
-        for (column, column_samples) in columns.iter().enumerate() {
-            for &(point, exponent) in column_samples {
-                if !taken.contains(&(tree, column, point)) {
-                    singles += 1;
-                    items
-                        .entry(point)
-                        .or_default()
-                        .push((exponent, exponent, 0));
-                }
-            }
-        }
-    }
+    (items, taken, blocks)
+}
 
-    // The powers of `α` the chains and the constants read, as
-    // `vos_pvm_recair::verifier::deep::prepare` takes them.
+/// DEEP's once rows: the powers of `α` the chains and the constants read,
+/// as `vos_pvm_recair::verifier::deep::prepare` takes them, and each
+/// point's own.
+fn once_rows(by_point: &BTreeMap<u64, Vec<usize>>, items: &mut Items) -> usize {
     let (mut powers, mut conjugates) = (BTreeSet::new(), BTreeSet::new());
     let mut point_rows = 0;
-    for (point, exponents) in &by_point {
+    for (point, exponents) in by_point {
         let mut exponents = exponents.clone();
         exponents.sort_unstable_by(|a, b| b.cmp(a));
         for pair in exponents.windows(2) {
@@ -583,12 +613,7 @@ fn deep(trees: &[Vec<Column>; 4], lifting: u32) -> Deep {
         .iter()
         .map(|&power: &usize| power.count_ones() as usize - 1)
         .sum();
-    Deep {
-        points: by_point.len(),
-        blocks,
-        singles,
-        once: squarings + products + conjugates.len() + point_rows,
-    }
+    squarings + products + conjugates.len() + point_rows
 }
 
 /// A leaf's rows by the verifier's pieces, as `vos_pvm_recair`'s context counts
