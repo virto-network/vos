@@ -92,8 +92,8 @@ fn forge_bytes(test_name: &str, edit: impl FnOnce(&mut ComponentTrace)) {
 }
 
 #[test]
-fn the_count_goes_to_phi7_alone() {
-    forge_cpu("the_count_goes_to_phi7_alone", |trace, row| {
+fn the_count_goes_to_flag_alone() {
+    forge_cpu("the_count_goes_to_flag_alone", |trace, row| {
         set(trace, Cpu::ResultRegIdx.offset(), row, 8);
     });
 }
@@ -115,7 +115,7 @@ fn the_count_is_below_2_24() {
 #[test]
 fn the_destination_is_below_2_32() {
     forge_cpu("the_destination_is_below_2_32", |trace, row| {
-        set(trace, Cpu::Phi10.offset() + 4, row, 1);
+        set(trace, Cpu::HPtr.offset() + 4, row, 1);
     });
 }
 

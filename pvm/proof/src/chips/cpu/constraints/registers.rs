@@ -12,7 +12,7 @@ use crate::core::step::WORD_SIZE;
 pub(in crate::chips::cpu) fn register_helpers<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let is_real = E::F::one() - row.is_padding[0].clone();
     // ── Register-memory binding helpers ──
-    // The IsTruncated/ValBIsReg/ValDIsReg/ResultIsReg/Phi7Bool/
+    // The IsTruncated/ValBIsReg/ValDIsReg/ResultIsReg/FlagBool/
     // IsBlakeEcall boolean properties are enforced unconditionally
     // below.
     {
@@ -23,7 +23,7 @@ pub(in crate::chips::cpu) fn register_helpers<E: EvalAtRow>(eval: &mut E, row: &
             &row.val_b_is_reg,
             &row.val_d_is_reg,
             &row.result_is_reg,
-            &row.phi7_bool,
+            &row.flag_bool,
             &row.is_blake_ecall,
             &row.is_witness_ecall,
         ] {
@@ -68,23 +68,23 @@ pub(in crate::chips::cpu) fn register_helpers<E: EvalAtRow>(eval: &mut E, row: &
                 - is_real.clone() * (row.is_rotate_r64[0].clone() + row.is_rotate_r32[0].clone()),
         );
     }
-    // Phi7-related helpers.
+    // Flag-related helpers.
     {
         eval.add_constraint(
-            row.real_not_phi7_bool_h[0].clone()
-                - is_real.clone() * (E::F::one() - row.phi7_bool[0].clone()),
+            row.real_not_flag_bool_h[0].clone()
+                - is_real.clone() * (E::F::one() - row.flag_bool[0].clone()),
         );
         eval.add_constraint(
-            row.real_phi7_bool_h[0].clone() - is_real.clone() * row.phi7_bool[0].clone(),
+            row.real_flag_bool_h[0].clone() - is_real.clone() * row.flag_bool[0].clone(),
         );
         // Its bytes' sum, at most 2040, is zero exactly when the
         // register is: φ10 non-zero but ≡ 0 mod p, as a base-256
         // combination would see it, is non-zero here.
-        let phi7_sum = row
-            .phi7
+        let flag_sum = row
+            .flag
             .iter()
             .fold(E::F::zero(), |sum, byte| sum + byte.clone());
-        eval.add_constraint(row.phi7_times_inv_h[0].clone() - phi7_sum * row.phi7_inv[0].clone());
+        eval.add_constraint(row.flag_times_inv_h[0].clone() - flag_sum * row.flag_inv[0].clone());
     }
 }
 

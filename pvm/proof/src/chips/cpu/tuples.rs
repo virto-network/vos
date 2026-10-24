@@ -180,9 +180,9 @@ pub(super) const FLAG_BYTES: [(Column, [&[Column]; 8]); 6] = [
     ),
 ];
 
-/// The registers a BLAKE2b call reads, in its slots' order (`Phi7`,
-/// `Phi10`, `Phi11`, `Phi12`): φ[10] the flag, φ[7] the state's pointer,
-/// φ[8] the message's, φ[9] the counter's low word. The precompile shim's
+/// The registers a BLAKE2b call reads, in its slots' order (`Flag`,
+/// `HPtr`, `MPtr`, `TLow`): φ[10] the final-block flag, φ[7] the state's
+/// pointer, φ[8] the message's, φ[9] the counter's low word. The precompile shim's
 /// a0..a3 are φ[7..=10] after the transpiler's register map.
 pub(super) const BLAKE2B_CALL_REGS: [u32; 4] = [10, 7, 8, 9];
 

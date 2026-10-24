@@ -204,8 +204,8 @@ fn padding_is_a_bit() {
             Cpu::NonShiftGateTruncH,
             Cpu::RealShiftCH,
             Cpu::IsRotateRGateH,
-            Cpu::RealNotPhi7BoolH,
-            Cpu::RealPhi7BoolH,
+            Cpu::RealNotFlagBoolH,
+            Cpu::RealFlagBoolH,
             Cpu::IsRealTrapH,
         ] {
             let value = get(trace, column.offset(), row);
@@ -245,7 +245,7 @@ fn padding_is_a_bit_on_a_padding_row() {
             Cpu::ValDIsImmH,
             Cpu::NonShiftGateH,
             Cpu::NonShiftGateNotTruncH,
-            Cpu::RealNotPhi7BoolH,
+            Cpu::RealNotFlagBoolH,
         ] {
             set_field(trace, column.offset(), row, minus_one);
         }
@@ -390,7 +390,7 @@ fn a_compression_s_pointers_are_32_bit() {
                 get(trace, Cpu::IsBlakeEcall.offset(), row),
                 BaseField::from(1u32)
             );
-            set(trace, Cpu::Phi10.offset() + 4, row, 1);
+            set(trace, Cpu::HPtr.offset() + 4, row, 1);
         },
     );
 }

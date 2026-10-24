@@ -133,7 +133,7 @@ impl BuiltInComponent for Blake2bChip {
         m_addr.constrain(eval, &is_real[0]);
 
         // T[8..16] = 0 — the ECALL handler only uses the low 8 bytes of t,
-        // so the upper half must be zero for the binding to CpuChip Phi12
+        // so the upper half must be zero for the binding to CpuChip TLow
         // to be unambiguous.  Gated by is_real so padding rows are inert.
         let t_e = crate::trace::trace_eval!(trace_eval, Column::T);
         for i in 8..16 {

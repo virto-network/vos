@@ -82,7 +82,7 @@ pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(eval: &mut E, 
     }
 }
 
-/// The BLAKE2b call: its register reads, the Phi7Bool tie and the call binding.
+/// The BLAKE2b call: its register reads, the FlagBool tie and the call binding.
 pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
     eval: &mut E,
     row: &Row<E::F>,
@@ -90,10 +90,10 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
 ) {
     let blake2b_call_lookup = &lookups.blake2b_call_lookup;
     let reg_lookup = &lookups.reg_lookup;
-    // ── blake2b ECALL register-read producers + Phi7Bool tie ──
+    // ── blake2b ECALL register-read producers + FlagBool tie ──
     {
         // Each slot's register read ([`BLAKE2B_CALL_REGS`]).
-        let phi_cols: [&[E::F]; 4] = [&row.phi7, &row.phi10, &row.phi11, &row.phi12];
+        let phi_cols: [&[E::F]; 4] = [&row.flag, &row.h_ptr, &row.m_ptr, &row.t_low];
         for (slot, &reg_idx) in BLAKE2B_CALL_REGS.iter().enumerate() {
             let mut tuple: Vec<E::F> = Vec::with_capacity(18);
             tuple.push(E::F::from(BaseField::from(reg_idx)));
@@ -111,19 +111,19 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
             ));
         }
 
-        // Phi7Bool ↔ Phi7 (its bytes' sum, zero exactly when the
+        // FlagBool ↔ Flag (its bytes' sum, zero exactly when the
         // register is) tie, gated only by is_real.
-        // Phi7Bool is boolean on every row (`registers::register_helpers`).
-        // If Phi7Bool = 0, then Phi7's bytes are 0.
-        let phi7_sum = row
-            .phi7
+        // FlagBool is boolean on every row (`registers::register_helpers`).
+        // If FlagBool = 0, then Flag's bytes are 0.
+        let flag_sum = row
+            .flag
             .iter()
             .fold(E::F::zero(), |sum, byte| sum + byte.clone());
-        eval.add_constraint(row.real_not_phi7_bool_h[0].clone() * phi7_sum);
-        // If Phi7Bool = 1, then Phi7 · Phi7Inv = 1 — body lifted into
-        // Phi7TimesInvH so the gate × body is deg 2.
+        eval.add_constraint(row.real_not_flag_bool_h[0].clone() * flag_sum);
+        // If FlagBool = 1, then Flag · FlagInv = 1 — body lifted into
+        // FlagTimesInvH so the gate × body is deg 2.
         eval.add_constraint(
-            row.real_phi7_bool_h[0].clone() * (row.phi7_times_inv_h[0].clone() - E::F::one()),
+            row.real_flag_bool_h[0].clone() * (row.flag_times_inv_h[0].clone() - E::F::one()),
         );
     }
 
@@ -131,15 +131,15 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
     {
         let mut tuple: Vec<E::F> = Vec::with_capacity(25);
         for i in 0..4 {
-            tuple.push(row.phi10[i].clone());
+            tuple.push(row.h_ptr[i].clone());
         }
         for i in 0..4 {
-            tuple.push(row.phi11[i].clone());
+            tuple.push(row.m_ptr[i].clone());
         }
         for i in 0..WORD_SIZE {
-            tuple.push(row.phi12[i].clone());
+            tuple.push(row.t_low[i].clone());
         }
-        tuple.push(row.phi7_bool[0].clone());
+        tuple.push(row.flag_bool[0].clone());
         for i in 0..WORD_SIZE {
             tuple.push(row.timestamp[i].clone());
         }
@@ -153,11 +153,11 @@ pub(in crate::chips::cpu) fn blake2b_call<E: EvalAtRow>(
         // φ7 or φ8 is past 2^32, and the call tuple carries their low
         // four bytes only.
         for i in 4..WORD_SIZE {
-            eval.add_constraint(row.is_blake_ecall[0].clone() * row.phi10[i].clone());
-            eval.add_constraint(row.is_blake_ecall[0].clone() * row.phi11[i].clone());
+            eval.add_constraint(row.is_blake_ecall[0].clone() * row.h_ptr[i].clone());
+            eval.add_constraint(row.is_blake_ecall[0].clone() * row.m_ptr[i].clone());
         }
 
-        // Phi7Bool and IsBlakeEcall are boolean on every row
+        // FlagBool and IsBlakeEcall are boolean on every row
         // (`registers::register_helpers`).
     }
 }
@@ -171,14 +171,14 @@ pub(in crate::chips::cpu) fn witness_input_reads<E: EvalAtRow>(
     let reg_lookup = &lookups.reg_lookup;
     // ── Witness-input register reads ──
     // The call reads φ[7] and φ[8], its destination and capacity, from
-    // the Phi10/Phi11 slots (= regs_before[7,8], filled every row); the
+    // the HPtr/MPtr slots (= regs_before[7,8], filled every row); the
     // register-read producers bind those snapshots to the register file
     // at the step ts. Two emissions keep finalize_logup_in_pairs
     // balanced.
     {
         // Register-read producers (reg_idx, value[8], ts[8], is_write=0):
-        // φ[7] in Phi10, φ[8] in Phi11.
-        for (reg_idx, value) in [(7u32, &row.phi10), (8u32, &row.phi11)] {
+        // φ[7] in HPtr, φ[8] in MPtr.
+        for (reg_idx, value) in [(7u32, &row.h_ptr), (8u32, &row.m_ptr)] {
             let mut tuple: Vec<E::F> = Vec::with_capacity(18);
             tuple.push(E::F::from(BaseField::from(reg_idx)));
             for c in value.iter() {
@@ -236,7 +236,7 @@ pub(in crate::chips::cpu) fn witness_input<E: EvalAtRow>(
         }
         // A call that writes bytes writes them below 2^32; one that
         // writes none may name any destination, as the live call does.
-        for byte in &row.phi10[4..WORD_SIZE] {
+        for byte in &row.h_ptr[4..WORD_SIZE] {
             eval.add_constraint(row.witness_non_empty[0].clone() * byte.clone());
         }
         // WitnessNonEmpty: a witness row's count is non-zero exactly
@@ -261,7 +261,7 @@ pub(in crate::chips::cpu) fn witness_input<E: EvalAtRow>(
 
         // count ≤ capacity: CompareChip proves capacity < count false.
         let mut compare: Vec<E::F> = Vec::with_capacity(17);
-        compare.extend_from_slice(&row.phi11);
+        compare.extend_from_slice(&row.m_ptr);
         compare.extend_from_slice(&row.result);
         compare.push(E::F::zero());
         for _ in 0..2 {
@@ -274,7 +274,7 @@ pub(in crate::chips::cpu) fn witness_input<E: EvalAtRow>(
         // The call WitnessInputChip writes: (ts, destination, count).
         let mut call: Vec<E::F> = Vec::with_capacity(13);
         call.extend_from_slice(&row.timestamp);
-        call.extend_from_slice(&row.phi10[..4]);
+        call.extend_from_slice(&row.h_ptr[..4]);
         call.push(count);
         for _ in 0..2 {
             eval.add_to_relation(RelationEntry::new(

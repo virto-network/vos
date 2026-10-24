@@ -6,9 +6,9 @@ use super::*;
 /// bytes and the sum's inverse.
 #[derive(Clone, Copy)]
 pub(super) struct HostCall {
-    pub phi7_bool: u8,
-    pub phi7_sum: BaseField,
-    pub phi7_inv: BaseField,
+    pub flag_bool: u8,
+    pub flag_sum: BaseField,
+    pub flag_inv: BaseField,
 }
 
 /// The host calls: the BLAKE2b call's registers and the witness input's count.
@@ -24,19 +24,7 @@ pub(super) fn host_call(out: &mut Sinks, s: Step, ops: &Operands) -> HostCall {
     // ── Blake2b ECALL binding ──
     // Detect Ecalli with imm == ECALL_BLAKE2B_COMPRESS and snapshot the
     // regs_before values that the precompile reads.
-    //
-    // Register convention: the vos-pvm-precompiles shim puts
-    // a0/a1/a2/a3 → h_ptr/m_ptr/t_low/f_flag, which grey-transpiler
-    // maps to PVM φ[7/8/9/10].  The `Column::Phi*` names below are
-    // semantic slot labels for the Blake2bCall lookup tuple — Phi10
-    // holds h_ptr (sourced from φ[7]), Phi11 holds m_ptr (φ[8]),
-    // Phi12 holds t_low (φ[9]), and Phi7 holds the full u64 of
-    // f_flag (φ[10]).  The slot-to-register-index re-routing happens
-    // in the ECALL_REG_IDXS array on the producer side; the Phi*
-    // column names are kept as-is (they don't match the slot
-    // semantics) to avoid renaming across files, at the cost of a
-    // little local confusion (the column comments below carry the
-    // slot's actual semantic meaning).
+    // The slots' registers: `tuples::BLAKE2B_CALL_REGS`.
     // Only a served call selects a relation (`PvmStep::served_ecall`).
     let ecall = step.served_ecall();
     let is_blake_ecall = ecall == Some(ECALL_BLAKE2B_COMPRESS as u64);
@@ -81,36 +69,36 @@ pub(super) fn host_call(out: &mut Sinks, s: Step, ops: &Operands) -> HostCall {
                 cmp_carry,
             });
     }
-    // Phi10 slot ← h_ptr (a0 = x10 = PVM φ[7]).
-    trace.fill_columns(row, step.regs_before[7], Column::Phi10);
-    // Phi11 slot ← m_ptr (a1 = x11 = PVM φ[8]).
-    trace.fill_columns(row, step.regs_before[8], Column::Phi11);
-    // Phi12 slot ← t_low (a2 = x12 = PVM φ[9]).
-    trace.fill_columns(row, step.regs_before[9], Column::Phi12);
-    // Phi7 slot ← f_flag (a3 = x13 = PVM φ[10]).
-    let phi7_u64 = step.regs_before[10];
-    trace.fill_columns(row, phi7_u64, Column::Phi7);
-    // Phi7 is non-zero exactly when its bytes' sum is: at most 2040,
+    // HPtr slot ← h_ptr (a0 = x10 = PVM φ[7]).
+    trace.fill_columns(row, step.regs_before[7], Column::HPtr);
+    // MPtr slot ← m_ptr (a1 = x11 = PVM φ[8]).
+    trace.fill_columns(row, step.regs_before[8], Column::MPtr);
+    // TLow slot ← t_low (a2 = x12 = PVM φ[9]).
+    trace.fill_columns(row, step.regs_before[9], Column::TLow);
+    // Flag slot ← f_flag (a3 = x13 = PVM φ[10]).
+    let flag_u64 = step.regs_before[10];
+    trace.fill_columns(row, flag_u64, Column::Flag);
+    // Flag is non-zero exactly when its bytes' sum is: at most 2040,
     // it is its own field value, so its inverse witnesses it.
-    let phi7_sum = BaseField::from(
-        phi7_u64
+    let flag_sum = BaseField::from(
+        flag_u64
             .to_le_bytes()
             .iter()
             .map(|&b| u32::from(b))
             .sum::<u32>(),
     );
-    let phi7_bool: u8 = (phi7_u64 != 0).into();
-    trace.fill_columns(row, phi7_bool, Column::Phi7Bool);
-    let phi7_inv = if phi7_u64 != 0 {
-        phi7_sum.inverse()
+    let flag_bool: u8 = (flag_u64 != 0).into();
+    trace.fill_columns(row, flag_bool, Column::FlagBool);
+    let flag_inv = if flag_u64 != 0 {
+        flag_sum.inverse()
     } else {
         BaseField::from(0u32)
     };
-    trace.fill_columns_base_field(row, &[phi7_inv], Column::Phi7Inv);
+    trace.fill_columns_base_field(row, &[flag_inv], Column::FlagInv);
     HostCall {
-        phi7_bool,
-        phi7_sum,
-        phi7_inv,
+        flag_bool,
+        flag_sum,
+        flag_inv,
     }
 }
 

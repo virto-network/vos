@@ -305,25 +305,25 @@ pub(super) fn selectors(
         ..
     } = *shift;
     let HostCall {
-        phi7_bool,
-        phi7_sum,
-        phi7_inv,
+        flag_bool,
+        flag_sum,
+        flag_inv,
     } = *host;
     // ── Boolean / selector helper fills ──
     // is_truncated, val_b_is_reg / val_d_is_reg / result_is_reg,
-    // phi7_bool, is_blake_ecall_b, is_shift_constrained are all
+    // flag_bool, is_blake_ecall_b, is_shift_constrained are all
     // booleans (or u8 ∈ {0,1}) in valid traces.  All Bool-helpers
     // are 0 in valid traces (boolean identity always holds).
     // Selector helpers are simple bool products of known flags.
     let is_truncated_b = is_truncated != 0;
     let val_b_is_reg_b = accesses.val_b_read.is_some();
     let val_d_is_reg_b = accesses.val_d_read.is_some();
-    let phi7_bool_b = phi7_bool != 0;
+    let flag_bool_b = flag_bool != 0;
     let real_b = true; // not padding
     let is_32bit_b = flags.is_32bit;
     let is_shift_c_b = is_shift_constrained;
     let is_rot_r_either_b = flags.is_rotate_r64 || flags.is_rotate_r32;
-    // IsTruncated / ValBIsReg / ValDIsReg / ResultIsReg / Phi7Bool /
+    // IsTruncated / ValBIsReg / ValDIsReg / ResultIsReg / FlagBool /
     // IsBlakeEcall are enforced as unconditional `X·(1-X)=0`, so they
     // need no boolean-helper columns.
     // Selector helpers.
@@ -353,11 +353,11 @@ pub(super) fn selectors(
     );
     trace.fill_columns(row, is_shift_c_b, Column::RealShiftCH);
     trace.fill_columns(row, real_b && is_rot_r_either_b, Column::IsRotateRGateH);
-    // Phi7 helpers.
-    trace.fill_columns(row, real_b && !phi7_bool_b, Column::RealNotPhi7BoolH);
-    trace.fill_columns(row, real_b && phi7_bool_b, Column::RealPhi7BoolH);
-    // Phi7TimesInvH = (Σ Phi7 bytes) · Phi7Inv: 0 or 1.
-    trace.fill_columns_base_field(row, &[phi7_sum * phi7_inv], Column::Phi7TimesInvH);
+    // Flag helpers.
+    trace.fill_columns(row, real_b && !flag_bool_b, Column::RealNotFlagBoolH);
+    trace.fill_columns(row, real_b && flag_bool_b, Column::RealFlagBoolH);
+    // FlagTimesInvH = (Σ Flag bytes) · FlagInv: 0 or 1.
+    trace.fill_columns_base_field(row, &[flag_sum * flag_inv], Column::FlagTimesInvH);
 
     // Additional degree-3 selector patterns in CpuChip.
     trace.fill_columns(

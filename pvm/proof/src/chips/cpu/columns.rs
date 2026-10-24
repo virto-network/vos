@@ -5,7 +5,7 @@
 //! the auxiliary witnesses (carry chains, AND nibbles, sign bits, equality
 //! witnesses), the register-memory binding witnesses (ValB/ValD/Result reg
 //! sources + indices), and the Blake2b ECALL-binding columns (φ[10/11/12/7]
-//! + Phi7Bool inversion witness).
+//! + FlagBool inversion witness).
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
 
@@ -299,46 +299,38 @@ pub enum Column {
     /// Blake2bChip forces this to be set correctly for every blake2b call.
     #[size = 1]
     IsBlakeEcall,
-    // ── Blake2b ECALL slot columns ──
-    //
-    // Naming note: these column names ("Phi10", "Phi11", "Phi12", "Phi7")
-    // do NOT match the PVM register each slot holds — each slot's SOURCE
-    // is a different register than its name implies.  See
-    // `chips/cpu/trace_fill.rs`'s Blake2b block and
-    // `ECALL_REG_IDXS` in `chips/cpu/constraints/host_call.rs` and
-    // `chips/cpu/interaction.rs` for the canonical
-    // slot ↔ register mapping.
-    //
+    // ── The BLAKE2b call's slots, each the register it reads
+    // (`tuples::BLAKE2B_CALL_REGS`) ──
     /// h_ptr slot (sourced from φ\[7\]; low 4 bytes flow into the
     /// Blake2bCall tuple as h_ptr).  Full u64 witnessed so the upper
     /// 32 bits can hold whatever regs_before\[7\] held.
     #[size = 8]
-    Phi10,
+    HPtr,
     /// m_ptr slot (sourced from φ\[8\]).  Low 4 bytes flow into the
     /// Blake2bCall tuple as m_ptr.
     #[size = 8]
-    Phi11,
+    MPtr,
     /// t_low slot (sourced from φ\[9\]).  Full 8 bytes flow into the
     /// Blake2bCall tuple as T.
     #[size = 8]
-    Phi12,
+    TLow,
     /// f_flag slot (sourced from φ\[10\] = a3).  Full u64 of regs_before\[10\].
-    /// Phi7Bool below is the boolean form `(regs_before[10] != 0)`,
+    /// FlagBool below is the boolean form `(regs_before[10] != 0)`,
     /// which is what flows into the Blake2bCall tuple as F.
     #[size = 8]
-    Phi7,
+    Flag,
     /// Inversion witness for the f_flag slot: the inverse of the sum of
-    /// Phi7's bytes, or 0 when it is 0. The sum, at most 2040, is zero
-    /// exactly when the register is, so it constrains Phi7Bool =
-    /// (Phi7 != 0) in-circuit as the register's value, not its field
+    /// Flag's bytes, or 0 when it is 0. The sum, at most 2040, is zero
+    /// exactly when the register is, so it constrains FlagBool =
+    /// (Flag != 0) in-circuit as the register's value, not its field
     /// reduction.
     #[size = 1]
-    Phi7Inv,
+    FlagInv,
     /// Boolean form of the f_flag slot: 1 if regs_before\[10\] != 0.
     /// The prover fills this and the lookup balance keeps it tied to
     /// the Blake2bChip.F column at the matching compression.
     #[size = 1]
-    Phi7Bool,
+    FlagBool,
     // ── Register-memory binding ──
     /// 1 iff ValB was sourced from a register read at this step.  See
     /// `val_b_read_reg` for the per-category mapping.  Gates the ValB
@@ -1020,7 +1012,7 @@ pub enum Column {
 
     // Register-memory binding selector helpers.  Many cross-constraints
     // chain 3-4 selector flags before a linear body.  (The IsTruncated /
-    // ValBIsReg / ValDIsReg / ResultIsReg / Phi7Bool / IsBlakeEcall
+    // ValBIsReg / ValDIsReg / ResultIsReg / FlagBool / IsBlakeEcall
     // booleans are enforced unconditionally as `X·(1-X)=0`, so no separate
     // helpers are needed.)
     /// `(1 - IsPadding) · Is32Bit` — used in the IsTruncated identity binding.
@@ -1055,15 +1047,15 @@ pub enum Column {
     /// `(1 - IsPadding) · (IsRotateR64 + IsRotateR32)` — rotate-R identity gate.
     #[size = 1]
     IsRotateRGateH,
-    /// `(1 - IsPadding) · (1 - Phi7Bool)` — gate for `Phi7=0` constraint.
+    /// `(1 - IsPadding) · (1 - FlagBool)` — gate for `Flag=0` constraint.
     #[size = 1]
-    RealNotPhi7BoolH,
-    /// `(1 - IsPadding) · Phi7Bool` — gate for `Phi7·Phi7Inv=1` constraint.
+    RealNotFlagBoolH,
+    /// `(1 - IsPadding) · FlagBool` — gate for `Flag·FlagInv=1` constraint.
     #[size = 1]
-    RealPhi7BoolH,
-    /// `(Σ Phi7 bytes) · Phi7Inv` — body helper for the Phi7-nonzero proof.
+    RealFlagBoolH,
+    /// `(Σ Flag bytes) · FlagInv` — body helper for the Flag-nonzero proof.
     #[size = 1]
-    Phi7TimesInvH,
+    FlagTimesInvH,
 
     // Deg-3 selector helpers for RotR ImmAlt val_b pinning and 32-bit
     // shift val_d-high-bytes-zero.
@@ -1147,8 +1139,8 @@ pub enum Column {
 
     // ── Witness-input binding ──
     /// 1 iff an acknowledged `Ecalli` of the witness input (dispatch 101).
-    /// Its row reads φ7, the destination (`Phi10`), and φ8, the capacity
-    /// (`Phi11`); writes the count to φ7 (`Result`, `ResultRegIdx` 7), a
+    /// Its row reads φ7, the destination (`HPtr`), and φ8, the capacity
+    /// (`MPtr`); writes the count to φ7 (`Result`, `ResultRegIdx` 7), a
     /// value below 2^24 at most φ8 (a CompareLookup tuple); and, when the
     /// count is not zero, hands `(ts, destination, count)` to
     /// `WitnessInputChip`, which writes exactly that range.
