@@ -58,3 +58,8 @@ pub use job::{Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, S
 pub use worker::{
     Backlog, FORMAT, Host, Jobs, Options, ProveError, Prover, Stepped, Worker, statement,
 };
+
+/// The gas a prover's re-run of a kernel starts with: a kernel's own limit
+/// bounds the live run whose record it repeats, so this bounds nothing an
+/// honest record needs. What a re-run has left shows its steps.
+pub const RERUN_GAS: u64 = 1 << 32;

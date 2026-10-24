@@ -22,13 +22,10 @@ use vos_wire::ids::{MethodId, ProgramHash};
 use vos_wire::records::Kernel;
 use vos_wire::result::{Attest, KernelReturn};
 
+use crate::RERUN_GAS;
 #[cfg(feature = "disclosing")]
 use crate::internals::{Internals, NodeProof};
 use crate::worker::{ProveError, Prover};
-
-/// The gas a re-run is given: a kernel's own limit bounds the live run
-/// whose record it repeats, so this bounds nothing an honest record needs.
-const RERUN_GAS: u64 = 1 << 32;
 
 /// A kernel's program and its run's entry, recomputed from its blob.
 type Program = Arc<(KernelProgram, KernelEntry)>;

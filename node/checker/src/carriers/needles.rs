@@ -61,10 +61,6 @@ const DOMAINS: [&[u8]; 11] = [
     b"vos/space/migrate",
 ];
 
-/// The gas a prover's re-run of a kernel starts with
-/// (`vos_node_prover::masked`): what it has left shows its steps.
-const RERUN_GAS: u64 = 1 << 32;
-
 /// M31's modulus: 32 bytes whose eight little-endian words are all below it
 /// may be a Poseidon2-M31 hash.
 const M31: u32 = (1 << 31) - 1;
@@ -302,7 +298,7 @@ impl Needles {
         self.0.push(Needle::number(
             Kind::StepCount,
             format!("{statement}: the gas its re-run left"),
-            RERUN_GAS.saturating_sub(internals.run_steps),
+            vos_node_prover::RERUN_GAS.saturating_sub(internals.run_steps),
         ));
         for root in &internals.memory_roots {
             self.push(Needle::field(
