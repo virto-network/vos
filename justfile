@@ -279,6 +279,7 @@ check-no-seeded-masks:
 check-no-debug-internals:
     just _no-feature debug-internals --workspace
     just _no-feature debug-internals -p vos-cli --features prover
+    just _no-feature debug-internals -p vos-statement-service --features pvm-guest
     for feature in [disclosing watch] { just _no-feature $feature --workspace; just _no-feature $feature -p vos-cli --features prover }
     for manifest in [agent/default pvm/proof/final-verifier/wasm/run pvm/proof/final-verifier/wasm/blob] { just _no-feature debug-internals --manifest-path $"($manifest)/Cargo.toml" }
     cargo build -p vos-cli --features prover
