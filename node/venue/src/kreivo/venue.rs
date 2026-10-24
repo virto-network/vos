@@ -41,7 +41,7 @@ use super::calls::{
     SpaceInfo, SpaceStatus, keys,
 };
 use super::send::KreivoSend;
-use super::transport::{Lost, Sender, Transport};
+use super::transport::{Backoff, Lost, Sender, Transport};
 use crate::queue::AnchorQueue;
 use crate::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
 
@@ -304,11 +304,16 @@ impl Shared {
         let _ = self.wake.wait_timeout(state, wait);
     }
 
+    /// Kreivo's genesis read through `transport`: the venue's id.
+    fn read_id(&self, transport: &dyn Transport) -> Result<(), Lost> {
+        let genesis = transport.genesis()?;
+        let _ = self.id.set(VenueId(genesis));
+        Ok(())
+    }
+
     /// Kreivo reached through `transport`: its genesis read, if it can be.
     fn reached(&self, transport: Arc<dyn Transport>) {
-        if let Ok(genesis) = transport.genesis() {
-            let _ = self.id.set(VenueId(genesis));
-        }
+        let _ = self.read_id(&*transport);
         let _ = self
             .sender
             .set(Sender::new(transport, self.options.backoff));
@@ -342,7 +347,7 @@ impl Shared {
     /// Connect, read Kreivo's genesis, then read the watched spaces every
     /// refresh, until stopped.
     fn read_on(&self, mut connect: Option<Connect>) {
-        let mut wait = self.options.backoff;
+        let mut backoff = Backoff::new(self.options.backoff);
         loop {
             if self.stopped() {
                 return;
@@ -354,17 +359,14 @@ impl Shared {
             };
             let genesis = reached.and_then(|()| match self.id.get() {
                 Some(_) => Ok(()),
-                None => self.transport()?.genesis().map(|genesis| {
-                    let _ = self.id.set(VenueId(genesis));
-                }),
+                None => self.read_id(&**self.transport()?),
             });
             if let Err(Lost(why)) = genesis {
                 tracing::warn!(%why, "Kreivo is not reachable; trying again");
-                self.pause(wait);
-                wait = (wait * 2).min(self.options.backoff * 32);
+                self.pause(backoff.next());
                 continue;
             }
-            wait = self.options.backoff;
+            backoff.reset();
             let due = self
                 .state()
                 .refreshed
@@ -379,7 +381,7 @@ impl Shared {
     /// Read the venue's time, the pause, and every watched space; alert
     /// when the paying space's sovereign account runs short.
     fn refresh(&self) -> Result<(), Lost> {
-        let now = self.venue_now()?;
+        self.venue_now()?;
         let paused = self.read::<u8>(&keys::paused())?.unwrap_or(0);
         let watched: Vec<SpaceId> = self.state().spaces.keys().copied().collect();
         let mut read = Vec::new();
@@ -398,7 +400,7 @@ impl Shared {
         let payer = read
             .iter()
             .find(|(space, ..)| *space == self.payer)
-            .and_then(|(_, info, ..)| info.clone());
+            .and_then(|(_, info, ..)| *info);
         let free = match &payer {
             Some(info) => self
                 .read::<AccountInfo>(&keys::account(&info.sovereign))?
@@ -408,7 +410,6 @@ impl Shared {
             None => None,
         };
         let mut state = self.state();
-        state.now = Some(now);
         state.paused = paused;
         for (space, info, keys, last) in read {
             let known = state.spaces.entry(space).or_default();
@@ -451,7 +452,8 @@ impl VenueClient for KreivoVenue {
             return Err(AnchorRefusal::Open);
         }
         let mut state = self.shared.state();
-        let known = state.watch(anchor.space).clone();
+        let now = state.now.unwrap_or(0);
+        let known = state.watch(anchor.space);
         if !known.read {
             self.shared.wake.notify_all();
             return Err(AnchorRefusal::Open);
@@ -486,7 +488,6 @@ impl VenueClient for KreivoVenue {
             return Ok(Anchored::Queued);
         }
         let clock = info.clock();
-        let now = state.now.unwrap_or(0);
         if clock.window(now).is_none_or(|open| window >= open) {
             return Err(AnchorRefusal::Open);
         }
@@ -527,19 +528,20 @@ impl VenueClient for KreivoVenue {
     }
 
     fn anchored(&self, root: &RootRead) -> bool {
-        let (known, now) = {
+        {
             let mut state = self.shared.state();
-            (state.watch(root.space).clone(), state.now)
-        };
-        let Some(info) = known.info else {
-            return false;
-        };
-        let fresh = now.is_some_and(|now| crate::fresh(&info.clock(), root.window, now));
-        if info.status != SpaceStatus::Active || !info.holds(root.window) || !fresh {
-            return false;
-        }
-        if known.held.get(&root.window) == Some(&root.root) {
-            return true;
+            let now = state.now;
+            let known = state.watch(root.space);
+            let Some(info) = known.info else {
+                return false;
+            };
+            let fresh = now.is_some_and(|now| crate::fresh(&info.clock(), root.window, now));
+            if info.status != SpaceStatus::Active || !info.holds(root.window) || !fresh {
+                return false;
+            }
+            if known.held.get(&root.window) == Some(&root.root) {
+                return true;
+            }
         }
         let key = keys::anchors(&root.space.0, root.kind as u8, root.window);
         self.shared

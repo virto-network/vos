@@ -161,6 +161,30 @@ pub enum Unsent {
     Stopped,
 }
 
+/// A wait doubled after each failure, up to 32 times the first.
+pub(crate) struct Backoff {
+    first: Duration,
+    wait: Duration,
+}
+
+impl Backoff {
+    pub(crate) fn new(first: Duration) -> Self {
+        Self { first, wait: first }
+    }
+
+    /// The wait now; the next one doubled.
+    pub(crate) fn next(&mut self) -> Duration {
+        let wait = self.wait;
+        self.wait = (wait * 2).min(self.first * 32);
+        wait
+    }
+
+    /// Back to the first wait.
+    pub(crate) fn reset(&mut self) {
+        self.wait = self.first;
+    }
+}
+
 /// Sends calls for one signer, one at a time.
 pub struct Sender {
     transport: Arc<dyn Transport>,
@@ -196,7 +220,7 @@ impl Sender {
 
     /// `read` until the chain answers, waiting longer after each loss.
     fn retry<R>(&self, mut read: impl FnMut() -> Result<R, Lost>) -> Result<R, Unsent> {
-        let mut wait = self.backoff;
+        let mut backoff = Backoff::new(self.backoff);
         loop {
             if self.stopped() {
                 return Err(Unsent::Stopped);
@@ -205,15 +229,14 @@ impl Sender {
                 Ok(value) => return Ok(value),
                 Err(Lost(why)) => {
                     tracing::warn!(%why, "Kreivo is not reachable; trying again");
-                    std::thread::sleep(wait);
-                    wait = (wait * 2).min(self.backoff * 32);
+                    std::thread::sleep(backoff.next());
                 }
             }
         }
     }
 
     fn sign(&self, call: &[u8], nonce: u64) -> Result<Signed, Unsent> {
-        let mut wait = self.backoff;
+        let mut backoff = Backoff::new(self.backoff);
         loop {
             if self.stopped() {
                 return Err(Unsent::Stopped);
@@ -223,8 +246,7 @@ impl Sender {
                 Err(SendError::Invalid(invalid)) => return Err(Unsent::Invalid(invalid)),
                 Err(SendError::Lost(Lost(why))) => {
                     tracing::warn!(%why, "Kreivo is not reachable to sign; trying again");
-                    std::thread::sleep(wait);
-                    wait = (wait * 2).min(self.backoff * 32);
+                    std::thread::sleep(backoff.next());
                 }
             }
         }
@@ -243,7 +265,7 @@ impl Sender {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let nonce = self.retry(|| self.transport.nonce())?;
         let mut signed = self.sign(call, nonce)?;
-        let mut wait = self.backoff;
+        let mut backoff = Backoff::new(self.backoff);
         loop {
             match self.transport.send(&signed) {
                 Ok(included) => return Ok(Sent::Included(Outcome::of(included))),
@@ -255,8 +277,7 @@ impl Sender {
                     tracing::warn!(%why, nonce, "a call's answer was lost; reading whether it landed");
                 }
             }
-            std::thread::sleep(wait);
-            wait = (wait * 2).min(self.backoff * 32);
+            std::thread::sleep(backoff.next());
             if self.retry(|| self.transport.chain_nonce())? > nonce {
                 return Ok(Sent::Landed);
             }

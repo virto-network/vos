@@ -249,14 +249,16 @@ fn an_open_window_is_anchored_once_the_venue_closes_it() {
     assert_eq!(setup.anchors_sent(), 1);
 }
 
-/// A transport whose chain's clock lags: the first anchor it sends is
-/// refused `WindowInFuture` without reaching the chain.
-struct Lagging {
+/// A transport that forwards to `inner`: `on_sign` sees each nonce signed
+/// first, and `on_send` answers a send in `inner`'s place when it
+/// returns an answer.
+struct Hooked {
     inner: Arc<dyn Transport>,
-    refused: AtomicUsize,
+    on_sign: Box<dyn Fn(u64) + Send + Sync>,
+    on_send: Box<dyn Fn() -> Option<Result<Included, SendError>> + Send + Sync>,
 }
 
-impl Transport for Lagging {
+impl Transport for Hooked {
     fn account(&self) -> [u8; 32] {
         self.inner.account()
     }
@@ -273,24 +275,11 @@ impl Transport for Lagging {
         self.inner.chain_nonce()
     }
     fn sign(&self, call: &[u8], nonce: u64) -> Result<Signed, SendError> {
+        (self.on_sign)(nonce);
         self.inner.sign(call, nonce)
     }
     fn send(&self, signed: &Signed) -> Result<Included, SendError> {
-        if self.refused.fetch_add(1, Ordering::SeqCst) == 0 {
-            let error = Error::WindowInFuture as u8;
-            return Ok(Included {
-                block: 0,
-                events: Vec::new(),
-                failure: Some(
-                    Failure::Module {
-                        pallet: PALLET,
-                        error,
-                    }
-                    .encode(),
-                ),
-            });
-        }
-        self.inner.send(signed)
+        (self.on_send)().unwrap_or_else(|| self.inner.send(signed))
     }
     fn storage(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Lost> {
         self.inner.storage(key)
@@ -306,21 +295,40 @@ impl Transport for Lagging {
 #[test]
 fn window_in_future_waits_a_block_and_sends_again() {
     let setup = Setup::new(true);
-    let lagging = Arc::new(Lagging {
+    // The chain's clock lags: the first anchor sent is refused
+    // `WindowInFuture` without reaching the chain.
+    let refused = Arc::new(AtomicUsize::new(0));
+    let sends = Arc::clone(&refused);
+    let lagging = Arc::new(Hooked {
         inner: setup.chain.transport(Origin::Signed(NODE)),
-        refused: AtomicUsize::new(0),
+        on_sign: Box::new(|_| {}),
+        on_send: Box::new(move || {
+            (sends.fetch_add(1, Ordering::SeqCst) == 0).then(|| {
+                Ok(Included {
+                    block: 0,
+                    events: Vec::new(),
+                    failure: Some(
+                        Failure::Module {
+                            pallet: PALLET,
+                            error: Error::WindowInFuture as u8,
+                        }
+                        .encode(),
+                    ),
+                })
+            })
+        }),
     });
-    let venue = setup.venue_over(lagging.clone());
+    let venue = setup.venue_over(lagging);
     assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
     wait_until("the venue refuses it once", || {
-        lagging.refused.load(Ordering::SeqCst) == 1
+        refused.load(Ordering::SeqCst) == 1
     });
     read_again(&venue);
-    assert_eq!(lagging.refused.load(Ordering::SeqCst), 1, "it waits");
+    assert_eq!(refused.load(Ordering::SeqCst), 1, "it waits");
     assert_eq!(venue.queued(), 1, "it is kept");
     setup.set_now(CLOCK.boundary(5).unwrap() + 1_001);
     wait_until("window 5 lands", || setup.anchored_window(5));
-    assert_eq!(lagging.refused.load(Ordering::SeqCst), 2);
+    assert_eq!(refused.load(Ordering::SeqCst), 2);
     assert!(venue.alerts().is_empty(), "{:?}", venue.alerts());
 }
 
@@ -604,49 +612,18 @@ fn an_expired_send_is_signed_again_with_its_nonce() {
     let setup = Setup::new(true);
     let transport = setup.chain.transport(Origin::Signed(NODE));
     let signs = Arc::new(Mutex::new(Vec::new()));
-    struct Counting {
-        inner: Arc<dyn Transport>,
-        signs: Arc<Mutex<Vec<u64>>>,
-        chain: Arc<MockChain>,
-    }
-    impl Transport for Counting {
-        fn account(&self) -> [u8; 32] {
-            self.inner.account()
-        }
-        fn genesis(&self) -> Result<[u8; 32], Lost> {
-            self.inner.genesis()
-        }
-        fn best(&self) -> Result<u64, Lost> {
-            self.inner.best()
-        }
-        fn nonce(&self) -> Result<u64, Lost> {
-            self.inner.nonce()
-        }
-        fn chain_nonce(&self) -> Result<u64, Lost> {
-            self.inner.chain_nonce()
-        }
-        fn sign(&self, call: &[u8], nonce: u64) -> Result<Signed, SendError> {
-            self.signs.lock().unwrap().push(nonce);
-            self.inner.sign(call, nonce)
-        }
-        fn send(&self, signed: &Signed) -> Result<Included, SendError> {
-            if self.signs.lock().unwrap().len() == 1 {
-                self.chain.advance(100);
-                return Err(SendError::Lost(Lost("lost".into())));
-            }
-            self.inner.send(signed)
-        }
-        fn storage(&self, key: &[u8]) -> Result<Option<Vec<u8>>, Lost> {
-            self.inner.storage(key)
-        }
-        fn keys(&self, prefix: &[u8]) -> Result<Vec<Vec<u8>>, Lost> {
-            self.inner.keys(prefix)
-        }
-    }
-    let counting = Arc::new(Counting {
+    let signed = Arc::clone(&signs);
+    let sent = Arc::clone(&signs);
+    let chain = Arc::clone(&setup.chain);
+    let counting = Arc::new(Hooked {
         inner: transport,
-        signs: Arc::clone(&signs),
-        chain: Arc::clone(&setup.chain),
+        on_sign: Box::new(move |nonce| signed.lock().unwrap().push(nonce)),
+        on_send: Box::new(move || {
+            (sent.lock().unwrap().len() == 1).then(|| {
+                chain.advance(100);
+                Err(SendError::Lost(Lost("lost".into())))
+            })
+        }),
     });
     let sender = Sender::new(counting, Duration::from_millis(1));
     let sent = sender.call(&Call::anchor(&setup.anchor(5, 1)).bytes());

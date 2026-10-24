@@ -223,7 +223,7 @@ impl From<SpaceStatus> for crate::Status {
 }
 
 /// `Spaces[space]`.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct SpaceInfo {
     pub sovereign: AccountId,
     pub controller: AccountId,
@@ -554,11 +554,13 @@ pub mod keys {
         Blake2b::<U16>::digest(data).into()
     }
 
-    fn twox64_concat(data: &[u8]) -> Vec<u8> {
+    /// FRAME's `Twox64Concat`: `twox64(data) ++ data`.
+    pub(crate) fn twox64_concat(data: &[u8]) -> Vec<u8> {
         [&twox64(data)[..], data].concat()
     }
 
-    fn blake2_128_concat(data: &[u8]) -> Vec<u8> {
+    /// FRAME's `Blake2_128Concat`: `blake2_128(data) ++ data`.
+    pub(crate) fn blake2_128_concat(data: &[u8]) -> Vec<u8> {
         [&blake2_128(data)[..], data].concat()
     }
 
@@ -596,16 +598,21 @@ pub mod keys {
         [anchor_keys_of(space), key.to_vec()].concat()
     }
 
-    /// `Anchors[space][kind][window]`: Identity, Twox64Concat,
-    /// Twox64Concat.
-    pub fn anchors(space: &[u8; 32], kind: u8, window: u64) -> Vec<u8> {
+    /// `item[space][kind][window]`: Identity, Twox64Concat, Twox64Concat.
+    fn windowed(name: &str, space: &[u8; 32], kind: u8, window: u64) -> Vec<u8> {
         [
-            item("Anchors"),
+            item(name),
             space.to_vec(),
             twox64_concat(&[kind]),
             twox64_concat(&window.to_le_bytes()),
         ]
         .concat()
+    }
+
+    /// `Anchors[space][kind][window]`: Identity, Twox64Concat,
+    /// Twox64Concat.
+    pub fn anchors(space: &[u8; 32], kind: u8, window: u64) -> Vec<u8> {
+        windowed("Anchors", space, kind, window)
     }
 
     /// `Last[space][kind]`: Identity, Twox64Concat.
@@ -615,13 +622,7 @@ pub mod keys {
 
     /// `Equivocations[space][kind][window]`, as `Anchors`.
     pub fn equivocations(space: &[u8; 32], kind: u8, window: u64) -> Vec<u8> {
-        [
-            item("Equivocations"),
-            space.to_vec(),
-            twox64_concat(&[kind]),
-            twox64_concat(&window.to_le_bytes()),
-        ]
-        .concat()
+        windowed("Equivocations", space, kind, window)
     }
 
     /// `Budget[space]`, Identity.

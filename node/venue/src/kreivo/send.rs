@@ -66,13 +66,15 @@ impl Shared {
         }
         let mut state = self.state();
         let paused = state.paused & PAUSED_ANCHOR != 0;
-        let known = state.spaces.get(&space).cloned().unwrap_or_default();
-        let Some(info) = known.info else {
+        let known = state.spaces.get(&space);
+        let listed = known.is_some_and(|known| known.keys.contains(&anchor.signer));
+        let last = known.and_then(|known| known.last);
+        let Some(info) = known.and_then(|known| known.info) else {
             let what = "the space is not registered".to_string();
             state.alert(Alert::Configuration { space, what });
             return Err(wait);
         };
-        if !known.keys.contains(&anchor.signer) {
+        if !listed {
             state.forget(key);
             let what = format!("window {window}'s anchor key is not listed: to be signed again");
             state.alert(Alert::Configuration { space, what });
@@ -89,7 +91,7 @@ impl Shared {
             });
             return Err(Fate::Dead);
         }
-        if known.last.is_some_and(|last| window < last) {
+        if last.is_some_and(|last| window < last) {
             state.forget(key);
             return Err(Fate::Done);
         }
@@ -324,7 +326,7 @@ impl AnchorSend for KreivoSend {
     fn settled(&self, anchor: &Anchor) -> bool {
         let mut state = self.0.state();
         let now = state.now;
-        let known = state.watch(anchor.space).clone();
+        let known = state.watch(anchor.space);
         let passed = known.last.is_some_and(|last| last >= anchor.window);
         let aged = known
             .info

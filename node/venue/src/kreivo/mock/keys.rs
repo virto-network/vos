@@ -2,32 +2,12 @@
 //! `twox128("Spaces") ++ twox128(item) ++` each key part under its pinned
 //! hasher, the part SCALE-encoded.
 
-use blake2::digest::consts::U16;
-use blake2::{Blake2b, Digest};
-use twox_hash::XxHash64;
-
 use super::types::{AccountId, Space};
+pub use crate::kreivo::calls::keys::{blake2_128, twox64, twox128};
+use crate::kreivo::calls::keys::{blake2_128_concat, twox64_concat};
 
 /// The pallet's storage prefix.
 pub const PALLET: &[u8] = b"Spaces";
-
-/// FRAME's `twox_64`: xxHash64 with seed 0, little-endian.
-pub fn twox64(data: &[u8]) -> [u8; 8] {
-    XxHash64::oneshot(0, data).to_le_bytes()
-}
-
-/// FRAME's `twox_128`: xxHash64 with seeds 0 and 1, each little-endian.
-pub fn twox128(data: &[u8]) -> [u8; 16] {
-    let mut out = [0; 16];
-    out[..8].copy_from_slice(&XxHash64::oneshot(0, data).to_le_bytes());
-    out[8..].copy_from_slice(&XxHash64::oneshot(1, data).to_le_bytes());
-    out
-}
-
-/// FRAME's `blake2_128`: unkeyed BLAKE2b with a 16-byte output.
-pub fn blake2_128(data: &[u8]) -> [u8; 16] {
-    Blake2b::<U16>::digest(data).into()
-}
 
 /// The storage items, by their names in the design.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,14 +48,6 @@ impl Item {
     pub fn prefix(self) -> Vec<u8> {
         [twox128(PALLET), twox128(self.name().as_bytes())].concat()
     }
-}
-
-fn blake2_128_concat(part: &[u8]) -> Vec<u8> {
-    [&blake2_128(part)[..], part].concat()
-}
-
-fn twox64_concat(part: &[u8]) -> Vec<u8> {
-    [&twox64(part)[..], part].concat()
 }
 
 fn key(item: Item, parts: &[&[u8]]) -> Vec<u8> {
