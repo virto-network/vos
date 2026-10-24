@@ -3,6 +3,11 @@
 //! its pinned indices, so its bytes are FRAME's.
 
 use parity_scale_codec::{Decode, Encode};
+use vos_anchor::{RootRead, VenueId};
+use vos_statement::{StatementId, Venue};
+
+use super::Chain;
+use super::keys;
 
 /// An `AccountId32`.
 pub type AccountId = [u8; 32];
@@ -393,6 +398,51 @@ pub enum Event {
         space: Space,
         max_spend_per_window: Balance,
     },
+}
+
+/// `Paused`'s flags.
+pub const PAUSE_SUBMIT: u8 = 1;
+pub const PAUSE_ANCHOR: u8 = 2;
+pub const PAUSE_REGISTER: u8 = 4;
+
+/// The `Venue` the pallet implements over its storage (§3).
+pub(crate) struct StorageVenue<'a> {
+    pub(super) chain: &'a Chain,
+}
+
+impl Venue for StorageVenue<'_> {
+    fn id(&self) -> VenueId {
+        self.chain.constants.venue
+    }
+
+    fn accepts(&self, format: u32) -> bool {
+        self.chain
+            .get::<Active>(&keys::formats(format))
+            .is_some_and(|active| self.chain.active(&active))
+    }
+
+    /// The root held at its space, kind and window; the space active (a
+    /// suspended or blocked space's roots are not anchored), the window in
+    /// its range and the root no older than `MaxRootAge`.
+    fn anchored(&self, root: &RootRead) -> bool {
+        let chain = self.chain;
+        let Some(info) = chain.space(&root.space.0) else {
+            return false;
+        };
+        let w = root.window;
+        let in_range = info.start_window <= w && info.end_window.is_none_or(|end| w < end);
+        let fresh = Chain::clock(&info).boundary(w).is_some_and(|boundary| {
+            chain.now_ms.saturating_sub(boundary) <= chain.constants.max_root_age_ms
+        });
+        let held = chain
+            .get::<AnchorRecord>(&keys::anchors(&root.space.0, root.kind as u8, w))
+            .is_some_and(|held| held.root == root.root);
+        info.status == SpaceStatus::Active && in_range && fresh && held
+    }
+
+    fn seen(&self, id: &StatementId) -> bool {
+        self.chain.storage.contains_key(&keys::seen(&id.0))
+    }
 }
 
 #[cfg(test)]

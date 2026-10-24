@@ -22,12 +22,10 @@ use super::{ConstantsJson, File, Fixtures, Pre, Step, Vector, hex, parts, pre, s
 use crate::kreivo::mock::keys;
 use crate::kreivo::mock::types::{
     AccountId, Active, AnchorArg, AuthorityInfo, BALANCES_INDEX, BalancesCall, Call, DispatchError,
-    Error, Event, Handler, MultiAddress, ProgramInfo, RuntimeCall, Space, SpaceInfo, SpaceStatus,
+    Error, Event, Handler, MultiAddress, PAUSE_ANCHOR, PAUSE_REGISTER, PAUSE_SUBMIT, ProgramInfo,
+    RuntimeCall, Space, SpaceInfo, SpaceStatus,
 };
-use crate::kreivo::mock::{
-    Account, Chain, Constants, Origin, Outcome, PAUSE_ANCHOR, PAUSE_REGISTER, PAUSE_SUBMIT, Payer,
-    Verdict,
-};
+use crate::kreivo::mock::{Account, Chain, Constants, Origin, Outcome, Payer, Verdict};
 
 const UNITS: u128 = 1_000_000_000_000;
 /// The fixtures' time: window 42's boundary of `F`'s clock.
