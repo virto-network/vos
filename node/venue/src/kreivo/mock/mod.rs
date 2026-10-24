@@ -635,7 +635,7 @@ impl Chain {
                 self.put(keys::spaces(&space), &info);
                 events.push(Event::SpaceStatusSet {
                     space,
-                    status: info.status as u8,
+                    status: info.status,
                 });
                 Ok(())
             }

@@ -1324,7 +1324,10 @@ fn g16(fx: &Fixtures) -> Vector {
     let outcome = w.call(Origin::Status, status(b(), false), Expect::Ok);
     assert!(matches!(
         outcome.events[..],
-        [Event::SpaceStatusSet { status, .. }] if status == SpaceStatus::Suspended as u8
+        [Event::SpaceStatusSet {
+            status: SpaceStatus::Suspended,
+            ..
+        }]
     ));
     // `set_format` under the delay.
     let delay = w.constants().program_change_delay_ms;

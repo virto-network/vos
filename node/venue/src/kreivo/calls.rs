@@ -351,7 +351,10 @@ pub enum Event {
     #[codec(index = 9)]
     SpaceResumed { space: [u8; 32] },
     #[codec(index = 10)]
-    SpaceStatusSet { space: [u8; 32], status: u8 },
+    SpaceStatusSet {
+        space: [u8; 32],
+        status: SpaceStatus,
+    },
     #[codec(index = 11)]
     Accepted {
         id: [u8; 32],
