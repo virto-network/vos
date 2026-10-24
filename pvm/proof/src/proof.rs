@@ -11,7 +11,6 @@ use crate::format::Format;
 use crate::pcs::StarkProofAny;
 
 mod transcript;
-#[cfg(feature = "prover")]
 pub use transcript::{
     check_format_security, check_interaction_pow, format_security_bits, mix_boundary_states,
     mix_statement_header, replay_prefix, statement_header_words,
