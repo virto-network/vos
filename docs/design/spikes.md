@@ -610,7 +610,8 @@ Two replicas are compared:
 
 ## S5 — Attestable
 
-**Setup.** `spikes/s5-attestable`, on the saga's Gray Paper 0.8.0 prover
+**Setup.** `spikes/s5-attestable` (deleted with the refine API it called;
+in history before 6.22), on the saga's Gray Paper 0.8.0 prover
 (`trace_refine`, `prove_refine`, `verify_refine_bundle_replayed`, production
 PCS configuration). The proved program is S4's guest, which runs BLAKE2b
 inside the PVM. Hashing is the work an attestable root update does without
@@ -724,7 +725,8 @@ for the root after, with hash counts from S4 at 10M keys:
 guests use only JAM refine host calls?
 
 **Prototype.** Branch `exp/gp-precompiles` (`6659ddea`, from the saga
-commit), with the spike in `spikes/s5-precompile`. 11 files changed,
+commit), with the spike in `spikes/s5-precompile` (its harness deleted with
+the refine API it called). 11 files changed,
 +359/−40:
 
 - **Id:** BLAKE2b compression is `ecalli 0x400`. VOS precompiles take
