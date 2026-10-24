@@ -272,38 +272,21 @@ fn invoke_resumes_after_host_call_then_panics_on_trap() {
 }
 
 #[test]
-fn observed_identity_does_not_alias_a_reused_slot() {
+fn a_reused_slot_has_a_new_identity() {
     let mut machines = InnerMachines::new();
-    let state = InvokeState {
-        gas: 100_000,
-        registers: [0; PVM_REGISTER_COUNT],
-    };
+    let identity = |machines: &InnerMachines| machines.views().next().unwrap().identity;
     let first_slot = machines.create(&host_then_trap(), 0).unwrap();
-    let mut first_identity = None;
-    machines
-        .invoke_observed(first_slot, state.clone(), |event| {
-            if let InnerMachineObservation::Enter { identity, .. } = event {
-                first_identity = Some(identity);
-            }
-        })
-        .unwrap();
+    let first_identity = identity(&machines);
     machines.expunge(first_slot).unwrap();
 
     let second_slot = machines.create(&host_then_trap(), 0).unwrap();
-    let mut second_identity = None;
-    machines
-        .invoke_observed(second_slot, state, |event| {
-            if let InnerMachineObservation::Enter { identity, .. } = event {
-                second_identity = Some(identity);
-            }
-        })
-        .unwrap();
+    let second_identity = identity(&machines);
 
     assert_eq!(first_slot, second_slot);
-    assert_eq!(first_identity.unwrap().slot, second_identity.unwrap().slot);
+    assert_eq!(first_identity.slot, second_identity.slot);
     assert_ne!(first_identity, second_identity);
-    assert_eq!(first_identity.unwrap().generation, 0);
-    assert_eq!(second_identity.unwrap().generation, 1);
+    assert_eq!(first_identity.generation, 0);
+    assert_eq!(second_identity.generation, 1);
 }
 
 #[test]

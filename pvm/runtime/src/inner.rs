@@ -205,23 +205,6 @@ pub struct InnerMachineView<'a> {
     pub machine: Option<&'a Interpreter>,
 }
 
-/// Read-only events emitted while an inner machine is invoked.
-pub enum InnerMachineObservation<'a> {
-    Enter {
-        identity: InnerMachineIdentity,
-        machine: &'a Interpreter,
-    },
-    Instruction {
-        identity: InnerMachineIdentity,
-        instruction: crate::interpreter::InstructionObservation<'a>,
-    },
-    Exit {
-        identity: InnerMachineIdentity,
-        exit: InnerExit,
-        machine: &'a Interpreter,
-    },
-}
-
 struct InnerMachine {
     generation: u64,
     program_blob: Arc<[u8]>,
@@ -513,36 +496,7 @@ impl InnerMachines {
 
     /// Resume a machine with the supplied gas counter and register file.
     pub fn invoke(&mut self, id: u32, state: InvokeState) -> Result<InvokeOutcome, InnerError> {
-        self.invoke_with_observer(id, state, None)
-    }
-
-    /// Resume a machine while exposing immutable entry, instruction, and
-    /// exit observations. This follows [`Self::invoke`] exactly while keeping
-    /// the observed path explicitly on the reference interpreter. Ordinary
-    /// invocation uses the selected backend without per-instruction callbacks.
-    /// A dictionary selected for native execution still retains native memory;
-    /// proof/snapshot callers should construct it with `ForceInterpreter`,
-    /// which uses sparse inner memory.
-    pub fn invoke_observed(
-        &mut self,
-        id: u32,
-        state: InvokeState,
-        mut observer: impl for<'a> FnMut(InnerMachineObservation<'a>),
-    ) -> Result<InvokeOutcome, InnerError> {
-        self.invoke_with_observer(id, state, Some(&mut observer))
-    }
-
-    fn invoke_with_observer(
-        &mut self,
-        id: u32,
-        state: InvokeState,
-        mut observer: Option<&mut dyn for<'a> FnMut(InnerMachineObservation<'a>)>,
-    ) -> Result<InvokeOutcome, InnerError> {
         let machine = self.machines.get_mut(&id).ok_or(InnerError::Unknown)?;
-        let identity = InnerMachineIdentity {
-            slot: id,
-            generation: machine.generation,
-        };
         // Lay the machine out on first use, then borrow its preparation and
         // its state apart: cloning the preparation would cost two atomic
         // reference counts per exit.
@@ -558,27 +512,12 @@ impl InnerMachines {
         vm.registers = state.registers;
         // Every exit returns to the outer machine, a precompile call's too:
         // the agent serves an inner machine's precompiles, on every host.
-        let exit = match observer.as_deref_mut() {
-            Some(observer) => {
-                observer(InnerMachineObservation::Enter {
-                    identity,
-                    machine: vm,
-                });
-                vm.run_observed(|instruction| {
-                    observer(InnerMachineObservation::Instruction {
-                        identity,
-                        instruction,
-                    });
-                })
-                .0
+        let exit = match execution.run(vm) {
+            Ok(exit) => exit,
+            Err(_) => {
+                *failed = true;
+                return Err(InnerError::Backend);
             }
-            None => match execution.run(vm) {
-                Ok(exit) => exit,
-                Err(_) => {
-                    *failed = true;
-                    return Err(InnerError::Backend);
-                }
-            },
         };
         let exit = match exit {
             ExitReason::Halt => {
@@ -598,13 +537,6 @@ impl InnerMachines {
                 InnerExit::Host(id)
             }
         };
-        if let Some(observer) = observer {
-            observer(InnerMachineObservation::Exit {
-                identity,
-                exit,
-                machine: vm,
-            });
-        }
         Ok(InvokeOutcome {
             exit,
             state: InvokeState {

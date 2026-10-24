@@ -36,16 +36,8 @@ fn inner_program() -> Vec<u8> {
     vec![0, 1, 3, 10, 42, 0, 0b0000_0101]
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ObservedEvent {
-    Enter(RefineMachineIdentity, u32),
-    Instruction(RefineMachineIdentity, u32),
-    Exit(RefineMachineIdentity, ExitReason),
-    Host(RefineHostPhase, u64),
-}
-
 #[test]
-fn observed_nested_run_preserves_semantics_and_machine_identity() {
+fn a_nested_run_is_the_same_reused_and_recompiled() {
     const RW_BASE: u32 = 2 * crate::PVM_ZONE_SIZE;
     let mut frame = [0u8; 112];
     frame[..8].copy_from_slice(&100_000u64.to_le_bytes());
@@ -96,74 +88,6 @@ fn observed_nested_run_preserves_semantics_and_machine_identity() {
             assert_eq!(actual_frame, expected_frame);
         }
     }
-
-    let mut events = Vec::new();
-    let observed = RefineContext::load_with(&outer, &args, 1_000_000, MemoryModel::Sparse)
-        .unwrap()
-        .run_observed(|event| match event {
-            RefineObservation::MachineEnter { identity, machine } => {
-                assert!(
-                    machine.memory().allocated_bytes() < 16 << 20,
-                    "observation must retain the sparse 4 GiB image"
-                );
-                events.push(ObservedEvent::Enter(identity, machine.pc));
-            }
-            RefineObservation::Instruction {
-                identity,
-                instruction,
-            } => events.push(ObservedEvent::Instruction(identity, instruction.pc_before)),
-            RefineObservation::MachineExit { identity, exit, .. } => {
-                events.push(ObservedEvent::Exit(identity, exit));
-            }
-            RefineObservation::HostCall { phase, id, .. } => {
-                events.push(ObservedEvent::Host(phase, id));
-            }
-            RefineObservation::Precompile { .. } => {
-                panic!("this program calls no precompile")
-            }
-        });
-
-    assert_eq!(observed.exit, expected.exit);
-    assert_eq!(observed.pc, expected.pc);
-    assert_eq!(observed.registers, expected.registers);
-    assert_eq!(observed.gas_used, expected.gas_used);
-    assert_eq!(
-        observed.output_bounded(crate::PVM_PAGE_SIZE as usize),
-        expected.output_bounded(crate::PVM_PAGE_SIZE as usize)
-    );
-    let inner = RefineMachineIdentity::Inner(InnerMachineIdentity {
-        slot: 0,
-        generation: 0,
-    });
-    assert!(events.contains(&ObservedEvent::Enter(inner, 0)));
-    assert!(events.contains(&ObservedEvent::Instruction(inner, 0)));
-    assert!(events.contains(&ObservedEvent::Exit(inner, ExitReason::HostCall(42))));
-    assert_eq!(
-        events
-            .iter()
-            .filter_map(|event| match event {
-                ObservedEvent::Enter(RefineMachineIdentity::Outer, pc) => Some(*pc),
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        [0, 2, 9],
-        "each outer trace slice starts after the prior handled call"
-    );
-    assert_eq!(
-        events
-            .iter()
-            .filter_map(|event| match event {
-                ObservedEvent::Host(phase, id) => Some((*phase, *id)),
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        [
-            (RefineHostPhase::Before, 9),
-            (RefineHostPhase::After, 9),
-            (RefineHostPhase::Before, 13),
-            (RefineHostPhase::After, 13),
-        ]
-    );
 }
 
 #[test]
@@ -241,16 +165,6 @@ fn precompile_price_is_charged_identically_on_every_path() {
     .unwrap()
     .run();
     let gas = check(&interpreted, "interpreter");
-    let observed = RefineContext::load_with_backend(
-        &program,
-        &[],
-        1_000_000,
-        crate::refine::MemoryModel::Sparse,
-        PvmBackend::ForceInterpreter,
-    )
-    .unwrap()
-    .run_observed(|_| {});
-    assert_eq!(check(&observed, "observed"), gas);
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
     {
         let native = RefineContext::load_with_backend(
@@ -295,27 +209,20 @@ fn precompile_output_is_a_dirty_page_on_every_path() {
             "{path}: precompile output"
         );
     };
-    for (model, observed) in [
-        (crate::refine::MemoryModel::Auto, false),
-        (crate::refine::MemoryModel::Sparse, true),
+    for model in [
+        crate::refine::MemoryModel::Auto,
+        crate::refine::MemoryModel::Sparse,
     ] {
-        let context = RefineContext::load_with_backend(
+        let invocation = RefineContext::load_with_backend(
             &program,
             &[],
             1_000_000,
             model,
             PvmBackend::ForceInterpreter,
         )
-        .unwrap();
-        let invocation = if observed {
-            context.run_observed(|_| {})
-        } else {
-            context.run()
-        };
-        check(
-            invocation,
-            if observed { "observed" } else { "interpreter" },
-        );
+        .unwrap()
+        .run();
+        check(invocation, "interpreter");
     }
     #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
     check(
@@ -673,17 +580,6 @@ fn gas_reports_what_is_left() {
     assert!(left < 1_000_000 - 10 && left > 1_000_000 - 1_000, "{left}");
 }
 
-#[cfg(feature = "std")]
-#[test]
-#[should_panic(expected = "does not serve `instantiate` from a pool")]
-fn observed_runs_refuse_a_pool() {
-    let program = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
-    RefineContext::load(&program, &[], 1_000_000)
-        .unwrap()
-        .with_pool(alloc::sync::Arc::new(crate::pool::MachinePool::new()))
-        .run_observed(|_| {});
-}
-
 #[test]
 fn unpayable_precompile_stops_out_of_gas_unserved() {
     let program = compression_program(crate::precompile::BLAKE2B_COMPRESS as u16);
@@ -691,27 +587,21 @@ fn unpayable_precompile_stops_out_of_gas_unserved() {
     assert_eq!(full.exit, ExitReason::Halt);
     // Funds every block but not the price.
     let budget = full.gas_used - crate::precompile::BLAKE2B_COMPRESS_GAS;
-    for observed in [false, true] {
-        let context = RefineContext::load_with_backend(
-            &program,
-            &[],
-            budget,
-            crate::refine::MemoryModel::Sparse,
-            PvmBackend::ForceInterpreter,
-        )
-        .unwrap();
-        let invocation = if observed {
-            context.run_observed(|_| {})
-        } else {
-            context.run()
-        };
-        assert_eq!(invocation.exit, ExitReason::OutOfGas, "observed={observed}");
-        assert_eq!(invocation.pc, 10, "stops on the call's own counter");
-        assert_eq!(invocation.gas_used, budget);
-        let mut h = [0u8; 64];
-        invocation.memory().read_bytes(0x2_0000, &mut h);
-        assert_eq!(h, [0x5a; 64], "the call was not served");
-    }
+    let invocation = RefineContext::load_with_backend(
+        &program,
+        &[],
+        budget,
+        crate::refine::MemoryModel::Sparse,
+        PvmBackend::ForceInterpreter,
+    )
+    .unwrap()
+    .run();
+    assert_eq!(invocation.exit, ExitReason::OutOfGas);
+    assert_eq!(invocation.pc, 10, "stops on the call's own counter");
+    assert_eq!(invocation.gas_used, budget);
+    let mut h = [0u8; 64];
+    invocation.memory().read_bytes(0x2_0000, &mut h);
+    assert_eq!(h, [0x5a; 64], "the call was not served");
 }
 
 /// Run an inner machine whose program is `ecalli id; trap` with `gas` in

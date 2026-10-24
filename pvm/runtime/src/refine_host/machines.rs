@@ -3,14 +3,10 @@
 
 use alloc::vec::Vec;
 
-use crate::inner::{
-    InnerError, InnerExit, InnerMachineObservation, InvokeState, MAX_INNER_MACHINES, PageMode, gas,
-};
-use crate::{ExitReason, PVM_REGISTER_COUNT};
+use crate::PVM_REGISTER_COUNT;
+use crate::inner::{InnerError, InnerExit, InvokeState, MAX_INNER_MACHINES, PageMode, gas};
 
-use super::{
-    Observer, PANIC, RefineContext, RefineMachineIdentity, RefineObservation, Stop, result,
-};
+use super::{PANIC, RefineContext, Stop, result};
 
 /// The programs the running agent may load, and where `instantiate` finds
 /// one its node's pool lacks.
@@ -197,7 +193,7 @@ impl RefineContext {
         self.answer(status)
     }
 
-    pub(super) fn invoke(&mut self, observer: Option<Observer<'_>>) -> Result<(), Stop> {
+    pub(super) fn invoke(&mut self) -> Result<(), Stop> {
         let registers = *self.outer.registers();
         let (id, frame_address) = (registers[7], registers[8]);
         let Ok((frame_address, _)) = self.outer_range(frame_address, 112) else {
@@ -230,37 +226,7 @@ impl RefineContext {
             gas: requested_gas,
             registers: inner_registers,
         };
-        let outcome = match observer {
-            Some(observer) => self.inner.invoke_observed(id, state, |event| match event {
-                InnerMachineObservation::Enter { identity, machine } => {
-                    observer(RefineObservation::MachineEnter {
-                        identity: RefineMachineIdentity::Inner(identity),
-                        machine,
-                    });
-                }
-                InnerMachineObservation::Instruction {
-                    identity,
-                    instruction,
-                } => {
-                    observer(RefineObservation::Instruction {
-                        identity: RefineMachineIdentity::Inner(identity),
-                        instruction,
-                    });
-                }
-                InnerMachineObservation::Exit {
-                    identity,
-                    exit,
-                    machine,
-                } => {
-                    observer(RefineObservation::MachineExit {
-                        identity: RefineMachineIdentity::Inner(identity),
-                        exit: inner_exit_reason(exit),
-                        machine,
-                    });
-                }
-            }),
-            None => self.inner.invoke(id, state),
-        };
+        let outcome = self.inner.invoke(id, state);
         let outcome = match outcome {
             Ok(outcome) => outcome,
             Err(InnerError::Unknown) => return self.answer(result::WHO),
@@ -303,15 +269,5 @@ impl RefineContext {
             .and_then(|id| self.inner.expunge(id).ok())
             .map_or(result::WHO, u64::from);
         self.answer(result)
-    }
-}
-
-fn inner_exit_reason(exit: InnerExit) -> ExitReason {
-    match exit {
-        InnerExit::Halt => ExitReason::Halt,
-        InnerExit::Panic => ExitReason::Panic,
-        InnerExit::Fault(address) => ExitReason::PageFault(address),
-        InnerExit::Host(id) => ExitReason::HostCall(id),
-        InnerExit::OutOfGas => ExitReason::OutOfGas,
     }
 }

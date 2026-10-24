@@ -423,19 +423,6 @@ impl Machine {
             .0
     }
 
-    /// Continue after a host call the embedder served in place, observing
-    /// instructions without starting a new slice.
-    pub fn continue_observed(
-        &mut self,
-        observer: impl for<'a> FnMut(crate::interpreter::InstructionObservation<'a>),
-    ) -> ExitReason {
-        self.interp.resume_after_host_call();
-        if let Some(exit) = &self.terminal_exit {
-            return exit.clone();
-        }
-        self.interp.run_observed(observer).0
-    }
-
     /// Exact interpreter image owned by this standard machine.
     ///
     /// The returned reference is read-only so trace assemblers can capture

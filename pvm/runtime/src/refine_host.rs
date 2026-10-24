@@ -13,8 +13,8 @@ pub use state::StateReader;
 
 use alloc::vec::Vec;
 
-use crate::inner::{InnerMachineIdentity, InnerMachines, gp_call, host_call};
-use crate::refine::{Invocation, Machine, MachineObservation, MemoryModel, RefineError};
+use crate::inner::{InnerMachines, gp_call, host_call};
+use crate::refine::{Invocation, Machine, MemoryModel, RefineError};
 use crate::{ExitReason, Gas, PvmBackend};
 
 /// Standard host result constants used by the inner-machine calls.
@@ -39,57 +39,6 @@ enum Stop {
 
 /// A host call stopping the machine on a panic.
 const PANIC: Stop = Stop::Exit(ExitReason::Panic);
-
-/// Stable identity of a machine participating in one nested Refine run.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub enum RefineMachineIdentity {
-    Outer,
-    Inner(InnerMachineIdentity),
-}
-
-/// Phase of an outer-runtime host-call dispatch.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RefineHostPhase {
-    Before,
-    After,
-}
-
-/// Read-only nested execution events used by proof and diagnostic tracers.
-///
-/// `MachineEnter` exposes the exact code and sparse memory image before the
-/// first instruction of that slice. `Instruction` is emitted by the sole
-/// interpreter execution path. Host boundaries surround all state changes
-/// made by calls 9 through 14, including an intervening inner invocation.
-pub enum RefineObservation<'a> {
-    MachineEnter {
-        identity: RefineMachineIdentity,
-        machine: &'a crate::interpreter::Interpreter,
-    },
-    Instruction {
-        identity: RefineMachineIdentity,
-        instruction: crate::interpreter::InstructionObservation<'a>,
-    },
-    MachineExit {
-        identity: RefineMachineIdentity,
-        exit: ExitReason,
-        machine: &'a crate::interpreter::Interpreter,
-    },
-    /// An outer precompile served in place inside the current slice. An
-    /// inner machine's precompile call exits to the outer machine instead.
-    Precompile {
-        identity: RefineMachineIdentity,
-        call: &'a crate::precompile::PrecompileCall,
-    },
-    HostCall {
-        phase: RefineHostPhase,
-        id: u64,
-        outer: &'a Machine,
-        inner: &'a InnerMachines,
-    },
-}
-
-/// What observes an observed run.
-type Observer<'o> = &'o mut dyn for<'a> FnMut(RefineObservation<'a>);
 
 /// Gas for a host call the Gray Paper prices at its base cost.
 const BASE_CALL_GAS: Gas = 10;
@@ -227,8 +176,7 @@ impl RefineContext {
     ///
     /// The embedder must admit the call, validate memory ranges and charge gas
     /// and its own I/O budgets before doing work. This is not a storage ABI or
-    /// an authorization grant. The observed/proof runner does not yet support
-    /// external handlers and must not silently substitute for this path.
+    /// an authorization grant.
     pub fn run_with_host(
         self,
         host: impl FnMut(u64, &mut Machine) -> Result<(), ExitReason>,
@@ -247,7 +195,7 @@ impl RefineContext {
             let ExitReason::HostCall(id) = exit else {
                 return Ok(self.outer.finish(exit));
             };
-            match self.dispatch(id, None) {
+            match self.dispatch(id) {
                 Ok(()) => {}
                 Err(Stop::Exit(ExitReason::HostCall(call))) => {
                     if let Err(exit) = host(call, &mut self.outer) {
@@ -256,106 +204,6 @@ impl RefineContext {
                 }
                 Err(Stop::Exit(exit)) => return Ok(self.outer.finish(exit)),
                 Err(Stop::Backend) => return Err(RefineError::Backend),
-            }
-        }
-    }
-
-    /// Run the same nested Refine state machine as [`Self::run`] while
-    /// reporting immutable machine and host-dispatch boundaries.
-    ///
-    /// This selects reference interpreter instructions, not new memory or
-    /// preparation. A context loaded for the recompiler retains native backing
-    /// and prepares its inner programs for that backend. Proof/snapshot callers
-    /// must explicitly load `ForceInterpreter` with [`MemoryModel::Sparse`] to
-    /// keep value-image inspection proportional to touched pages.
-    pub fn run_observed(
-        self,
-        mut observer: impl for<'a> FnMut(RefineObservation<'a>),
-    ) -> Invocation {
-        self.run_with_observer(&mut observer)
-    }
-
-    fn run_with_observer(mut self, observer: Observer<'_>) -> Invocation {
-        // A traced run must execute exactly like a live one, and tracing
-        // cannot follow a pooled machine or the node's state yet.
-        #[cfg(feature = "std")]
-        assert!(
-            self.inner.pool().is_none(),
-            "observed Refine execution does not serve `instantiate` from a pool"
-        );
-        assert!(
-            self.state.is_none(),
-            "observed Refine execution does not serve `state_read`"
-        );
-        loop {
-            let mut exit = self.outer.resume_observed(|event| match event {
-                MachineObservation::Enter(machine) => {
-                    observer(RefineObservation::MachineEnter {
-                        identity: RefineMachineIdentity::Outer,
-                        machine,
-                    });
-                }
-                MachineObservation::Instruction(instruction) => {
-                    observer(RefineObservation::Instruction {
-                        identity: RefineMachineIdentity::Outer,
-                        instruction,
-                    });
-                }
-            });
-            // Precompiles are served in place; the slice continues.
-            while let ExitReason::HostCall(id) = exit {
-                if !self.computes_precompiles() || !crate::precompile::is_precompile(id) {
-                    break;
-                }
-                if !self.outer.charge(crate::precompile::price(id).unwrap_or(0)) {
-                    exit = ExitReason::OutOfGas;
-                    break;
-                }
-                let registers = *self.outer.registers();
-                let Some(call) =
-                    crate::precompile::execute(id, &registers, self.outer.memory_mut())
-                else {
-                    exit = ExitReason::Panic;
-                    break;
-                };
-                observer(RefineObservation::Precompile {
-                    identity: RefineMachineIdentity::Outer,
-                    call: &call,
-                });
-                exit = self.outer.continue_observed(|instruction| {
-                    observer(RefineObservation::Instruction {
-                        identity: RefineMachineIdentity::Outer,
-                        instruction,
-                    });
-                });
-            }
-            observer(RefineObservation::MachineExit {
-                identity: RefineMachineIdentity::Outer,
-                exit: exit.clone(),
-                machine: self.outer.interpreter(),
-            });
-            let ExitReason::HostCall(id) = exit else {
-                return self.outer.finish(exit);
-            };
-            observer(RefineObservation::HostCall {
-                phase: RefineHostPhase::Before,
-                id,
-                outer: &self.outer,
-                inner: &self.inner,
-            });
-            let dispatch = self.dispatch(id, Some(&mut *observer));
-            observer(RefineObservation::HostCall {
-                phase: RefineHostPhase::After,
-                id,
-                outer: &self.outer,
-                inner: &self.inner,
-            });
-            match dispatch {
-                Ok(()) => {}
-                Err(Stop::Exit(exit)) => return self.outer.finish(exit),
-                Err(Stop::Backend) => {
-                    panic!("observed Refine execution requires the reference backend")
-                }
             }
         }
     }
@@ -369,10 +217,8 @@ impl RefineContext {
         self.host == (Host::Node { precompiles: true })
     }
 
-    /// Serve host call `id`, or stop the machine. An observed run serves
-    /// its precompiles before dispatching, and has no pool or state, so
-    /// only the arms it reaches see `observer`.
-    fn dispatch(&mut self, id: u64, observer: Option<Observer<'_>>) -> Result<(), Stop> {
+    /// Serve host call `id`, or stop the machine.
+    fn dispatch(&mut self, id: u64) -> Result<(), Stop> {
         match u32::try_from(id) {
             _ if self.computes_precompiles() && crate::precompile::is_precompile(id) => {
                 self.precompile(id)
@@ -381,7 +227,7 @@ impl RefineContext {
             Ok(host_call::PEEK) => self.peek(),
             Ok(host_call::POKE) => self.poke(),
             Ok(host_call::PAGES) => self.pages(),
-            Ok(host_call::INVOKE) => self.invoke(observer),
+            Ok(host_call::INVOKE) => self.invoke(),
             Ok(host_call::EXPUNGE) => self.expunge(),
             #[cfg(feature = "std")]
             Ok(host_call::INSTANTIATE) if self.inner.pool().is_some() => self.instantiate(),
