@@ -3,7 +3,10 @@
 Research for slice 7's "simplify and scale" milestone (`slice-7-mobile.md`,
 M3.9; owner decision S1(a)). It inventories slice 6's pin D as built, at
 `f83f744b`, and lists the candidates for the owner to choose among. Nothing
-here is decided. Tags: [measured] counted in the code; [est] estimated from
+here is decided. Draft 2 folds the plan review (`plan1-review.md`'s H2,
+M3–M5, L3): each candidate names the standing decisions it reverses, C4
+is a question of its own, C11 is added, and §7 asks one question per
+candidate. Tags: [measured] counted in the code; [est] estimated from
 the counts; [proposed] a recommendation.
 
 ## 1. Why
@@ -70,8 +73,11 @@ inventories].
   rise, Kreivo to JAM) re-founds under a new genesis, so a new `SpaceId`:
   its counterparties re-link, and the Clerk's carried pair commitments
   restart. Today's rule already makes a departed space re-found to return.
-  The Clerk has both counterparties at one venue anyway
-  (`clerk-across-spaces.md` C.5).
+  **It restricts the Clerk:** counterparties settle at one venue
+  (`clerk-across-spaces.md` C.5), so with no migration a space on JAM and a
+  space on Kreivo never settle with each other unless one re-founds.
+- **Reverses:** decision 8's migration ranges; `proving.md` §7's venue
+  migration; `spaces-pallet.md` call 5, errors 24 and 28, vector G14.
 - **Safety:** better: the one cross-venue overlap pin D could not detect
   disappears.
 - **Recommendation [proposed]: take it.** A space that moves venues
@@ -92,8 +98,12 @@ inventories].
   replicate the representative (the replica rule stays, simpler).
 - **Costs:** a compromised or lost node key is answered by replacing the
   node (a new node with a new key, the controller listing it and delisting
-  the old), not by rotating in place. A single-founder space that
-  equivocates cannot rotate and resume (moot under C4).
+  the old), not by rotating in place; a replacement moves every replica
+  the node held, not only the representative's. A single-founder space
+  that equivocates cannot rotate and resume (moot under C4).
+- **Reverses:** decision 7's rotation ("the node signs with its newest key
+  the venue lists") and step 6.14b; `spaces-pallet.md` §13 questions 2 and
+  12 (the paired key and the rotation calls' semantics), part of G15.
 - **Safety:** neutral: the response to a key compromise is the same
   (delist the key), with one fewer key per node to guard.
 - **Recommendation [proposed]: take it.**
@@ -129,7 +139,7 @@ windows past `CUT_KEEP`.
 - **Recommendation [proposed]: take it** (with C2; without C2 it still
   works, re-signing with the newest listed key from the replicated row).
 
-### C4. Equivocation is terminal
+### C4. Equivocation is terminal (its own question: §7, Q4)
 
 Today evidence suspends the space; the controller delists both signing
 keys and calls `resume`; the disputed window stays dead (decision 18); a
@@ -140,20 +150,39 @@ single founder rotates first (6.14b).
 - **Removes:** `resume` at the three venues (and its three "no
   equivocator listed" checks), JAM's `equivocators` and `Op::Resume`,
   Kreivo call 6, error 23, event 9, `set_status`'s re-suspend branch, the
-  evidence rows' lifecycle (finding F3 disappears: nothing reads them
-  after), decision 18's disputed-window rule and G19, G5's resume half,
-  the node's `Suspended` waits and alerts, the Kreivo client's F1
+  evidence rows' lifecycle (finding F3), decision 18's disputed-window
+  rule, the node's `Suspended` waits and alerts, the Kreivo client's F1
   cache-forgetting, the single-founder recovery. About 200 venue lines and
   150 node lines, and 300–400 test lines [est].
-- **Costs:** an honest space whose key was stolen loses its `SpaceId` at
-  that venue: statements in flight fail, counterparties re-link, the
-  Clerk's pair commitments restart. An equivocation already means a
-  stolen key or a byzantine node, which the trust model (crash faults
-  only, core model §5) does not survive gracefully anyway.
-- **Safety:** better: no path re-admits a space after a dispute, so no
-  rule about which of its roots count is needed.
-- **Recommendation [proposed]: take it.** Option kept for the owner: a
-  governance-only revive at Kreivo (`StatusOrigin`), outside VOS's nodes.
+- **Costs, in full** (the review's M3): a re-founding is a new `SpaceId`,
+  and everything keyed by it is stranded or reset:
+  - **the sovereign account,** derived from the `SpaceId`
+    (`spaces-pallet.md` §13 question 3), with its funds and deposits: they
+    leave only by `dispatch_as_sovereign`, a controller call on an ended
+    space, which must stay callable, or by governance;
+  - **the Clerk's pair commitments** with every counterparty;
+  - **every member's device secret,** since pin K puts the space in the
+    PRF input: every member re-enrolls (unless the PRF input is a stable
+    handle, the plan's question on it);
+  - **issued credentials and their nullifiers.**
+  And two more:
+  - **one stolen listed key ends the space:** the honest node's evidence
+    (slice-end M1) is what ends it, so a key theft becomes a forced
+    re-founding, where today it is a suspension the controller lifts;
+  - **a tombstone:** an ended space stays recorded at the venue and is
+    never pruned, or C8's founder signature, which has no nonce, could
+    register it again from a replay.
+- **Reverses:** decision 7's "equivocation suspends, then resume" and
+  decision 18; `proving.md` §7's [decided] equivocation text;
+  `spaces-pallet.md` call 6, error 23, vectors G5 (its resume half) and
+  G19.
+- **Safety:** better against a dispute's aftermath (no path re-admits a
+  space), worse for availability (a single stolen key is fatal).
+- **Recommendation [proposed]: the owner's call** (§7, Q4): terminal as
+  above; terminal at the nodes with a governance-only revive at Kreivo
+  (`StatusOrigin`); or today's resume and decision 18. Leaning to the
+  governance revive: the nodes lose the resume path, and a space whose key
+  was stolen keeps a way back that does not run through VOS's code.
 
 ### C5. Collapse the refusal and fate taxonomy
 
@@ -163,8 +192,10 @@ single founder rotates first (6.14b).
   - `NotYet` (the window still open by the venue's clock, the space not
     yet registered, the venue paused): the leader waits and retries;
   - `Never` (the window at or behind `Last`, aged past `MaxRootAge`, a bad
-    signature, an unlisted key): settled, with an alert carrying the raw
-    code;
+    signature): settled, with an alert carrying the raw code;
+  - `Unlisted` (the signer not listed): the leader hands off its
+    leadership, so a replica whose key is listed anchors the window (C3
+    keeps it in the replicated row), and alerts (the review's L3);
   - `Stopped` (the space suspended, blocked or ended by evidence): no more
     anchors until an operator acts; alert.
   The venue's own codes stay where they are pinned (`Refusal` 1–7 and the
@@ -172,7 +203,7 @@ single founder rotates first (6.14b).
   pallet's errors, which are the teammate's), each mapped in one table per
   client. The worker's submit outcomes collapse the same way: `Accepted`
   (a repeat included, at one site), `Refused(code)`, `Retry`.
-- **Removes:** `AnchorRefusal` (8) and `Anchored` (3) → 4; `Fate` (4) →
+- **Removes:** `AnchorRefusal` (8) and `Anchored` (3) → 5; `Fate` (4) →
   3; Kreivo's `Answer` (7) and its second mapping in `place`; the
   overloaded `Again`/`Window`/`Key`; the five "repeat means accepted"
   sites → 1; `Status` (4) → 3 [est: about 40 variants and 150–200 lines].
@@ -200,6 +231,8 @@ single founder rotates first (6.14b).
 - **Costs:** the pallet's design (`spaces-pallet.md` §6.1) is stated as
   "call the core", a change to the handed-over design; FRAME's storage
   stays the pallet's.
+- **Reverses:** nothing decided; it changes how `spaces-pallet.md` §6.1 is
+  written.
 - **Safety:** better: one implementation for the reviewers, and every
   venue judges alike by construction, not only by vectors.
 - **Recommendation [proposed]: take it.**
@@ -223,6 +256,10 @@ single founder rotates first (6.14b).
   space's ingress, not at a venue (`proving.md` §3), so nothing in this
   slice needs one. Every golden fixture is venue-bound today: they and the
   vectors regenerate (once, folded into the re-pin batch).
+- **Reverses:** decision 8's per-program `venue_bound` flag and decision
+  10's "a rootless statement's `Seen` entry never expires" (both return
+  with rootless statements). The pallet's anonymous authorities (§11) are
+  not `judge` statements, so they do not conflict.
 - **Safety:** neutral today (no production rootless prover); F2's venue
   binding for rootless statements returns with them.
 - **Recommendation [proposed]: take it, if the owner agrees no rootless
@@ -239,7 +276,11 @@ single founder rotates first (6.14b).
   construction [est: 40–60 lines; G1 and G18 shrink].
 - **Costs:** a space cannot back-date its first anchored window; the
   windows before registration are unanchored, which gaps already allow.
-- **Safety:** better: no field left to replay.
+- **Safety:** better: no field left to replay, as long as the venue never
+  forgets a space it registered (the tombstone C4 needs; without C4 a
+  registered space is never pruned anyway).
+- **Reverses:** plan 3's fix (the signed `start_window`), G1 and G18 in
+  part.
 - **Recommendation [proposed]: take it.** The known limit "one founding
   key registers the space anywhere under a controller of its choosing"
   stays carried (its lever, a controller co-signature or a founders'
@@ -261,6 +302,8 @@ next window, up to `RECUTS` = 2, so `READ_WINDOWS` = 3 and `CUT_KEEP` = 4.
   (8 minutes at L = 10): both faults an operator must fix anyway. A
   representative outage across a close fails that window's reads.
 - **Safety:** neutral (liveness only; the served path's checks stay).
+- **Reverses:** nothing decided (6.14's re-cut rule was the plan's); it
+  changes the agent image, before the re-pin.
 - **Recommendation [proposed]: take it**, measured in the scale test with
   real clocks: the fail rate of reads at the real skew of the owner's LAN.
 
@@ -277,11 +320,32 @@ w)` has no consumer but a read's path.
 - **Removes:** the `asked` table and its pruning, the `pending` flag, the
   idle agents' markers, builds and reports; `S_w` covers the agents that
   read in w.
-- **Costs:** `S_w` no longer commits to every agent's root at w; no
-  consumer reads those rows.
+- **Costs:** `S_w` no longer commits to every agent's root at w. One
+  consumer is coming (the review's M5): a cross-space credential, whose
+  verifier demands the issuer's root within N windows
+  (`identity-and-authority.md` §7). So an agent may **opt in to report
+  every window** (`#[agent(report_every_window)]`, for issuers); the rest
+  report only when read.
+- **Reverses:** `proving.md` §7's "`S_w` over every agent's root".
 - **Safety:** neutral.
-- **Recommendation [proposed]: take it**; it is the representative's
-  scale lever, built in 7.3 and measured by the scale test (7.6).
+- **Recommendation [proposed]: take it, with the opt-in**; it is the
+  representative's scale lever, built in 7.3 and measured by the scale
+  test (7.6).
+
+### C11. A window with no reports anchors nothing
+
+- **Proposal:** the representative closes a window as today, but when no
+  agent reported for it (no read waits, no issuer opted in) it writes no
+  anchor row and its leader sends nothing. Gaps are already legal at every
+  venue.
+- **Removes:** the anchors no one reads: today 144 a day a space at
+  L = 10 min, each a fee on Kreivo and a work item on JAM.
+- **Costs:** a window's absence at the venue no longer tells an outsider
+  the space was alive then; nothing relies on that.
+- **Reverses:** nothing decided.
+- **Safety:** neutral: a statement needs its own window anchored, and its
+  read's report makes it so.
+- **Recommendation [proposed]: take it** (with C10).
 
 ### Considered and not recommended
 
@@ -297,20 +361,20 @@ w)` has no consumer but a read's path.
   dispatch, fees): the teammate's pallet; it stays out of the node's
   state machine under C5.
 
-## 4. What the protocol looks like with C1–C10
+## 4. What the protocol looks like with C1–C11
 
 - **Registration:** a founding key signs `(venue, space, controller)`;
   the space anchors from the venue's next window; its founding keys are
   its anchor keys; the controller adds and removes keys.
-- **Anchoring:** the representative's close records `S_w`; its leader
-  signs pending rows in window order with its node key and sends; the
-  venue answers `Taken`, `NotYet`, `Never` or `Stopped`; the rule is one
-  function every venue calls.
+- **Anchoring:** the representative's close records `S_w` for a window
+  some agent reported; its leader signs pending rows in window order with
+  its node key and sends; the venue answers `Taken`, `NotYet`, `Never`,
+  `Unlisted` or `Stopped`; the rule is one function every venue calls.
 - **Equivocation:** evidence ends the space at the venue; an honest node
   sends its own anchor as evidence; the space re-founds.
 - **Statements:** rooted, at an anchored window, at the one venue.
 - **Reads:** served at their own window, or `NotClosed`; only reading
-  agents report.
+  agents (and opted-in issuers) report.
 
 **What goes, in all** [est]: on the node about 1,000–1,400 of 4,750
 lines, the leader's anchoring state from nine fields to two, the anchor's
@@ -321,23 +385,72 @@ variants.
 
 ## 5. What each choice touches outside VOS
 
-- **The Kreivo teammate:** C1, C4, C6, C7 and C8 change
-  `spaces-pallet.md` (calls 5 and 6, `start_window`, the anchor rule as
-  the core's call, `venue_bound`, the rootless `Seen` rule) and regenerate
-  the conformance vectors. If the teammate has started, each is a change
-  to work in progress: the owner asks first (open question 2 in the plan).
+- **The Kreivo teammate:** C1, C2, C4, C6, C7 and C8 change
+  `spaces-pallet.md` (calls 5 and 6, the key pairing, `start_window`, the
+  anchor rule as the core's call, `venue_bound`, the rootless `Seen`
+  rule) and regenerate the conformance vectors. If the teammate has
+  started, each is a change to work in progress: the owner asks first
+  (the plan's question on the teammate). The teammate gets two drops: the
+  design and vectors at 7.1, the kit's re-pinned blobs at 7.8.
 - **The JAM statements service:** its blob changes (no blob hash is
   pinned yet; slice 6's L2 pins them with the re-pin batch, after this
   milestone).
 - **The fixtures:** C7 regenerates them (every fixture is venue-bound
   today), folded into M4's re-pin batch.
-- **The Clerk** (`clerk-across-spaces.md`): no conflict. It needs rooted
-  statements at one venue for both counterparties, and tolerates gaps;
-  C4 makes a counterparty's re-founding the response to its equivocation.
+- **The Clerk** (`clerk-across-spaces.md`): rooted statements at one venue
+  for both counterparties, gaps tolerated, so C7 and C9–C11 do not touch
+  it. C1 restricts it (counterparties share a venue for good) and C4
+  resets its pair commitments when a counterparty re-founds.
 
 ## 6. Order, if all are taken
 
 C6 first (the core every later change edits once), then C1, C4, C8 and
 C7 (removals at the venues, the vectors regenerated once), then C2, C3
-and C5 (the node's anchoring), then C9 and C10 (the agent's reads and
-reports). The plan's 7.1–7.3 follow this order.
+and C5 (the node's anchoring), then C9, C10 and C11 (the agent's reads
+and reports). The plan's 7.1–7.3 follow this order.
+
+**Simplifications outside pin D,** in the plan's draft 2: the Poseidon2
+tree in the credential actor's own rows, not a builder's second index
+(pin G); the Poseidon2 chip in the device format only (pin H); payment as
+a proof of the owner digest's preimage (pin I); the scale harness without
+its own venue, certificates or ARM deploys (7.4).
+
+## 7. Questions for the owner, one per candidate
+
+Asked one at a time, in this order (C6 first: the others are written into
+it). Each answer is recorded in `owner-decisions.md`.
+
+1. **C6, one anchor rule written once?** (a) Yes; (b) no, keep three.
+   **Recommended: (a).** Reverses nothing.
+2. **C1, no migration?** (a) Yes: a space that changes venue re-founds,
+   and Clerk counterparties share a venue for good; (b) keep migration.
+   **Recommended: (a).** Reverses decision 8's ranges, `proving.md` §7's
+   migration, pallet call 5 and G14.
+3. **C8, registration from the venue's next window?** (a) Yes; (b) keep
+   the signed `start_window`. **Recommended: (a).** Reverses plan 3's fix
+   in G1 and G18.
+4. **C4, equivocation?** (a) Terminal: the space re-founds, its sovereign
+   funds leave by a controller or governance call, members re-enroll,
+   counterparties re-link, the venue keeps a tombstone; (b) terminal at
+   the nodes, with a governance-only revive at Kreivo; (c) keep resume and
+   decision 18. **Recommended: (b).** (a) and (b) reverse decisions 7 (its
+   resume) and 18, `proving.md` §7 and pallet call 6, G5 and G19.
+5. **C7, rooted statements only at the venues this slice?** (a) Yes, and
+   `venue_bound` goes; (b) keep rootless statements and `venue_bound`.
+   **Recommended: (a).** Reverses decisions 8 (`venue_bound`) and 10 (the
+   rootless `Seen` rule) until rootless statements return.
+6. **C2, the node key as the only anchor key?** (a) Yes: a compromised
+   key means replacing the node; (b) keep rotation. **Recommended: (a).**
+   Reverses decision 7's rotation, 6.14b and pallet questions 2 and 12.
+7. **C3, re-sign from replicated state, no hand-back?** (a) Yes; (b) no.
+   **Recommended: (a).** Reverses nothing.
+8. **C5, five outcomes on the node** (`Taken`, `NotYet`, `Never`,
+   `Unlisted`, `Stopped`)? (a) Yes; (b) keep today's enums.
+   **Recommended: (a).** Reverses nothing.
+9. **C9, no re-cuts?** (a) Yes: a read not closed in time fails and the
+   caller asks again; (b) keep two re-cuts. **Recommended: (a).**
+10. **C10, report only when read, issuers opting in to every window?**
+    (a) Yes; (b) every agent reports every window. **Recommended: (a).**
+    Reverses `proving.md` §7's "`S_w` over every agent's root".
+11. **C11, no anchor for a window no one reported?** (a) Yes; (b) anchor
+    every window. **Recommended: (a).** Reverses nothing.

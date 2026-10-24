@@ -52,3 +52,23 @@ The three shapes agree within one query; the query term binds everywhere
 4. **PoW 24 instead of 20** halves the floor at blowup 2 and saves 8
    queries, for about 16× the grinding: on the phone about 2^24 Blake2s
    hashes, a few hundred milliseconds [est], too dear for a 1 s gate.
+5. **PoW is a phone lever the other way too** (draft 1's review, M9): PoW
+   20 is 0.028 s on 8 x86 threads (`proving.md` §4), so about 0.1 s on the
+   phone on average and about 0.3 s at the 95th percentile [est, ARM
+   factor 3.5]. Fewer bits cost a few queries, and the floor stays:
+
+   | shape | blowup | PoW | queries | proven | conjectured | rows at least |
+   |---|---|---|---|---|---|---|
+   | device, m = 16 | 4 | 16 | 47 | 62.09 | 110 | 2^11 |
+   | device, m = 14 | 4 | 16 | 47 | 62.30 | 110 | 2^11 |
+   | credential | 4 | 16 | 47 | 62.66 | 110 | 2^11 |
+   | device, m = 16 | 2 | 16 | 95 | 62.19 | 111 | 2^12 |
+   | device, m = 16 | 8 | 16 | 32 | 63.01 | 112 | 2^10 |
+
+   PoW 14 at blowup 4 needs 49 queries (62.05). The phone gates record the
+   95th percentile, where the grind's tail shows.
+6. **Bytes at blowup 2** (the review's H1): the kit's floor proof was 1.02
+   MB at 38 queries, unmasked, over 4,655 columns; masking added ×1.31 in
+   bytes on the wrap. At 86–87 queries that is about 3 MB on the floor's
+   columns and about 1.3 MB on a shape of about 2,000 columns (BLAKE2b
+   gone) [est], against pin J's 1.5 MiB. 7.0a measures it.
