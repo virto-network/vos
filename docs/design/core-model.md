@@ -639,7 +639,7 @@ The Local (replica-only) lane is deferred until a use case needs it.
 | `#[msg] fn f(&self)` (query) | any replica (`linearizable`: after a read index) | nothing | applied Linear and Merge state |
 | `#[msg(merge)]` | any replica or device, no log | Merge | Merge |
 | `#[workflow]` | leader, through the log | nothing directly (calls and messages) | its own memory |
-| `#[attestable]` | inside a command or workflow step | committed fields only, returned privately and applied by the caller | its arguments and committed fields, through witnesses |
+| `#[attestable]` | inside a command or workflow step | nothing (writes, "the root after", are not built) | its arguments, and, as `&self`, committed fields through a served witness at an anchored window cut, its read set declared |
 
 - The macros generate a view per mode, so misuse fails to compile.
 - The agent also enforces the modes at run time (section 6.5).
@@ -829,6 +829,14 @@ prefixes; a tree per agent would multiply memtables and background work. A
 Raft snapshot exports an agent's prefix as a range and installs by range
 delete and ingestion.
 
+**The store names its layout** [decided]. A row in the system partition
+holds the number of the keyspace layout the store was written in (layout
+2: an instance's committed maps under their own owner byte, `0x03`). A
+new store writes it; opening checks it, and refuses a store in another
+layout, or one that holds rows and names none, rather than read its rows
+where they no longer are. A change to where rows live takes the next
+number.
+
 **One log writer per node** [proposed]. Every agent's Raft log goes to one
 node-level log, keyed by (agent, index):
 
@@ -837,7 +845,12 @@ node-level log, keyed by (agent, index):
 - a flush is capped in bytes, so one large entry cannot hold back every
   agent (open question 3);
 - storage I/O never runs on executor threads;
-- writes that only move the commit index are not fsynced.
+- writes that only move the commit index are not fsynced;
+- **a stalled writer hands over leadership** [decided]: a sync held past
+  the stall bound (`Config::writer_stall`, by default the election
+  timeout's upper end, 3 s at the defaults) marks the writer stalled, and
+  the node stops leading the groups it leads, which elect elsewhere. A
+  slow sync so costs leadership no sooner than a crash would be detected.
 
 **Applied state without fsync** [proposed]. Accumulate writes each entry as
 one atomic batch without fsync. This is safe under seven invariants:
@@ -908,30 +921,41 @@ outbox sequence numbers, which receivers deduplicate.
   uses no context and makes no calls, sends, `now` or `random`; only
   precompiles run inside it. The macro enforces this, and the derivation
   refuses a kernel whose reachable code makes any other host call.
-- **Inputs** (private): its arguments, plus the committed fields it reads,
-  delivered as witnesses (rows plus a `BatchProof` against `CommittedMap`
-  roots). Plain fields and tables have no root, so the macro rejects any
-  use of them.
+- **Inputs** (private): its arguments, and, for a `&self` method, a
+  served witness: the rows it reads and one multiproof against the agent
+  root at the window's cut, the representative's root and salt, and the
+  path to the space root. The witness travels inline in the `Resume`
+  input, under `Limits::served`. Plain fields and tables have no root, so
+  the macro rejects any use of them.
 - **Outputs:** public: the statement, its program id, space, `#[public]`
   arguments, output and the roots it read (`proving.md` §3.6); writes are
   not built.
 - A live call runs that same kernel as an inner machine, so what runs is
-  what gets proven. The agent records the program hash, the witness and the
-  output with the agent's replicated state. The record is internal to the
-  space, so losing the producing node cannot make a settlement window
-  unprovable.
-- Proving is asynchronous, by a prover inside the space's trust domain
-  (section 11.4). Proofs are content-addressed and attached to messages
-  for other spaces or JAM.
+  what gets proven. The agent records each run in its replicated state as
+  an `Attest { program, window, witness_input, output, public_args, roots }`
+  (`proving.md` A.5): `witness_input` is the arguments followed, for a
+  statement at a window's cut, by the served witness. The record is
+  internal to the space, so losing the producing node cannot make a
+  settlement window unprovable.
+- Proving is asynchronous, by the prover built into each node of the
+  space (section 11.4). Every replica reads its agents' logs into a
+  node-local job table; the leader of the agent proves each statement at a
+  window's cut (re-running the kernel on the record's witness, then the
+  segments, leaves, folds and the masked wrap), keeps the proof by hash,
+  has the agent record it (`Input::Proven { window, id, proof }`), and,
+  once the venue holds its roots anchored, submits it to the space's
+  venue. A statement whose anchor would pass `MaxRootAge` by the venue's
+  time before its proof ends is dead, never proved.
 - **Verification** [proposed]:
   - On VOS, the receiving node verifies a proof at ingress, where trust
     changes, before the message enters the log. Refine sees only verified
     claims, and a batch never stalls on a verification that takes seconds.
-  - On JAM, an on-chain agent's refine runs the verifier program itself,
-    and its accumulate applies the public output. A window's segments
-    fold into one final proof (slice 5): 96.4M JAM gas unmasked, about
-    116–119M masked with postcard [measured], to be verified in a JAM
-    statements service's refine (slice 6).
+  - At a venue, the space's one chain: a run's segments fold into one
+    final proof, masked under format 39, which the venue verifies against
+    the program it pins and the roots the space anchored there (the JAM
+    statements service's refine, about 79M gas a statement; Kreivo's
+    spaces pallet). A node reaches its venue through a `VenueClient`
+    (`proving.md` §6).
 
 ### 11.2 Precompiles [decided direction; prototyped in S5b]
 
@@ -1005,9 +1029,13 @@ return value is the public output that on-chain agents act on.
 
 Status today (checked in the code, not only by the review):
 
-- **Not hiding.** The pinned Stwo revision has no zero-knowledge masking
-  (no randomized trace or blinding). STARK openings can leak information
-  about the trace, and so about private inputs.
+- **Hiding where a proof leaves.** The final proof is masked (format 39,
+  variant (c), `proving.md` §5); segment, leaf and fold proofs are not,
+  and never leave the prover role. A carrier audit (`proving.md` A.5)
+  searches every carrier a run produces (venue calls, logs, standard
+  error, client answers, frames and disks) for the proofs, served rows,
+  private hashes, step counts, memory roots, registers and the masking's
+  randomness.
 - **Witness-free verification:** a statement's final proof binds the
   whole run (its entry, its halt and its io-hash). The refine-bundle path
   (format 36) is retired, and deleted.
@@ -1016,20 +1044,18 @@ Status today (checked in the code, not only by the review):
 
 Requirements before any proof leaves a space:
 
-1. **Zero-knowledge proving:** hiding trace commitments and openings in the
-   prover and its chips.
-2. **Witness-free verification of attestable programs:** everything an
-   attestable run depends on is proven in the AIR. Attestable methods are
-   pure (section 11.1), so their only host calls are precompiles, which
-   are already in-AIR (S5b).
-3. **No plain hash of private inputs** in anything published.
-4. **A minimal published format** (met by the statement (slice 5);
-   format 39 at 6.6). A published proof carries only:
+1. **Zero-knowledge proving** (met by format 39's masking of the final
+   proof, the one proof that leaves): hiding commitments and openings.
+2. **Witness-free verification of attestable programs** (met by the final
+   proof, which binds the whole run): everything an attestable run
+   depends on is proven in the AIR. Attestable methods are pure (section
+   11.1), so their only host calls are precompiles, which are in-AIR.
+3. **No plain hash of private inputs** in anything published (met: the
+   io-hash covers public values only).
+4. **A minimal published format** (met by the statement and format 39). A
+   published proof carries only:
    - the public output: the return value, the roots and the program hash;
    - a fixed shape class.
-
-   Today's bundle also carries the gas limit, host boundaries and
-   per-slice machine states, which must stay out.
 5. **Fixed shape classes** (met by the shape per kernel and the padded
    fold shape, slice 5): segment counts and trace sizes are padded to a
    few canonical shapes (the existing canonical-shape work), so a proof
@@ -1046,7 +1072,8 @@ Around the proof:
 - **Leaves are salted** (section 9.3), so published roots do not let anyone
   guess low-entropy values.
 - **Agents on JAM are public by design** (section 12). Private data stays in
-  VOS spaces; only proofs and their public outputs reach JAM.
+  VOS spaces; only final proofs, their statements and the space's anchors
+  reach a venue (the JAM statements service, Kreivo's spaces pallet).
 
 These form a prover track that runs alongside the core slices (section 16).
 
@@ -1343,9 +1370,9 @@ prototypes exist where noted.
 
 7. Chained segments on the refine path, sized by prover memory (S5, S5b).
 8. Reduce the BLAKE2b chip's memory per compression (S5b).
-9. Zero-knowledge proving (section 11.4, requirement 1): slice 6
-   (format 39, `proving.md` §5), on the pinned Stwo fork with no Stwo
-   move.
+9. ~~Zero-knowledge proving (section 11.4, requirement 1).~~ Done by
+   format 39's masking of the final proof (`proving.md` §5), on the
+   pinned Stwo fork with no Stwo move.
 10. ~~Witness-free verification of attestable programs, with no plain hash
     of private inputs (requirements 2 and 3).~~ Done by the statement
     (slice 5).
@@ -1468,7 +1495,7 @@ knowledge and aggregation are the longest work and gate goal 8.
     - **Decided:** the prover is a built-in node component for good, not
       an extension, because proving is essential to VOS. The HTTP ingress
       is built in for now.
-    - **Decided:** the node knows no JAM (slice 6's decision 17). A
+    - **Decided:** the node knows no JAM. A
       program is deployed on JAM with JAM's tooling, and VOS ships the
       JAM statements service and the agent-as-JAM-service build; the JAM
       client VOS wrote (a PolkaJam node's RPC and `jamt`, the statements
