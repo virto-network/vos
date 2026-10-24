@@ -56,12 +56,10 @@ pub(in crate::chips::cpu) fn zero_divisor_helpers<E: EvalAtRow>(eval: &mut E, ro
 /// DivRem: the result is the quotient or the remainder, sign-extended on 32-bit rows.
 pub(in crate::chips::cpu) fn divrem<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let ff: E::F = E::F::from(BaseField::from(255));
-    // ════════════════════════════════════════════════════════════════════
     // DIVREM: quotient * divisor + remainder = dividend
     // dividend = val_b, divisor = val_d
     // For div (op 0,1): result = quotient. For rem (op 2,3): result = remainder.
     // When divisor == 0 (div_by_zero=1): constraint bypassed (special result).
-    // ════════════════════════════════════════════════════════════════════
     // The divrem chains live in DivRemChip: the schoolbook q·d+r=b
     // chain, the r<d uniqueness chain, and the DivS sign-correction
     // chain.  CpuChip flows val_b/val_d/q/r + 4 sign bits + flags via
@@ -95,7 +93,6 @@ pub(in crate::chips::cpu) fn divrem<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>)
         );
     }
 
-    // ════════════════════════════════════════════════════════════════════
     // The DivU r<d uniqueness chain lives in DivRemChip.  The
     // DivRemLookup tuple flows is_div_s alongside
     // is_div_rem/div_by_zero/is_32bit; DivRemChip witnesses
@@ -106,7 +103,6 @@ pub(in crate::chips::cpu) fn divrem<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>)
 /// The byte-wise zero check of `val_d` and the division-by-zero result.
 pub(in crate::chips::cpu) fn zero_divisor<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let is_real = E::F::one() - row.is_padding[0].clone();
-    // ════════════════════════════════════════════════════════════════════
     // Byte-wise val_d zero-check + DivByZero result binding
     //
     // Binds two related values with shared infrastructure:
@@ -191,14 +187,12 @@ pub(in crate::chips::cpu) fn zero_divisor<E: EvalAtRow>(eval: &mut E, row: &Row<
 /// DivS: the remainder takes the dividend's sign when non-zero.
 pub(in crate::chips::cpu) fn remainder_sign<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let is_real = E::F::one() - row.is_padding[0].clone();
-    // ════════════════════════════════════════════════════════════════════
     // The full DivS |r|<|d| chain lives in DivRemChip.
     // AbsD/AbsDCarry/AbsR/AbsRCarry + AbsCmpDiff/AbsCmpCarry are
     // DivRemChip-internal columns; the chains run on the narrower
     // trace using sign_bit_d / sign_bit_r flowed via the DivRemLookup
     // tuple.
 
-    // ════════════════════════════════════════════════════════════════════
     // DivS sign-of-r uniqueness (`sign(r) = sign(b)` when r ≠ 0)
     //
     // Mirrors the byte-wise zero-check pattern but on `div_remainder`.

@@ -9,8 +9,7 @@
 use super::classify::{classify_opcode, uses_immediate};
 use super::tuples::BLAKE2B_CALL_REGS;
 use crate::core::ecall::{ECALL_BLAKE2B_COMPRESS, ECALL_WITNESS_INPUT};
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use vos_pvm::instruction::Opcode;
 
 /// Register-access descriptor for a single PVM step.  Used by both

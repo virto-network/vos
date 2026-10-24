@@ -37,9 +37,6 @@ pub(in crate::chips::cpu) fn msb_helpers<E: EvalAtRow>(eval: &mut E, row: &Row<E
 
 /// ReverseBytes, ZeroExtend16, SignExtend8 and SignExtend16.
 pub(in crate::chips::cpu) fn byte_ops<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
-    // BITMANIP — REVERSE_BYTES: result[i] = val_d[7-i]
-    // ════════════════════════════════════════════════════════════════════
     for i in 0..WORD_SIZE {
         eval.add_constraint(
             row.is_reverse_bytes[0].clone()
@@ -47,9 +44,6 @@ pub(in crate::chips::cpu) fn byte_ops<E: EvalAtRow>(eval: &mut E, row: &Row<E::F
         );
     }
 
-    // ════════════════════════════════════════════════════════════════════
-    // BITMANIP — ZERO_EXTEND_16: result[0..2] = val_d[0..2]; result[2..8] = 0
-    // ════════════════════════════════════════════════════════════════════
     eval.add_constraint(
         row.is_zero_ext16[0].clone() * (row.result[0].clone() - row.val_d[0].clone()),
     );
@@ -60,11 +54,9 @@ pub(in crate::chips::cpu) fn byte_ops<E: EvalAtRow>(eval: &mut E, row: &Row<E::F
         eval.add_constraint(row.is_zero_ext16[0].clone() * row.result[i].clone());
     }
 
-    // ════════════════════════════════════════════════════════════════════
     // BITMANIP — SIGN_EXTEND_8 / SIGN_EXTEND_16  (ground constraints only;
     // the sign-bit-pinning AND lookups are `sign_extend_nibbles`, emitted
     // last, before finalize_logup).
-    // ════════════════════════════════════════════════════════════════════
     let is_sign_ext = row.is_sign_ext8[0].clone() + row.is_sign_ext16[0].clone();
     let ff_se: E::F = E::F::from(BaseField::from(255));
 
@@ -96,13 +88,11 @@ pub(in crate::chips::cpu) fn byte_ops<E: EvalAtRow>(eval: &mut E, row: &Row<E::F
 
 /// CountSetBits: the result is the sum of the bytes' popcounts.
 pub(in crate::chips::cpu) fn count_set_bits<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
     // BITMANIP CountSetBits (CSB64 / CSB32):
     //   result[0] = sum(BytePopcount[0..N])  (N = 4 if Is32Bit else 8)
     //   result[1..8] = 0
     //   per-byte popcount lookup `(val_d[i], BytePopcount[i]) ∈ popcount`
     //     emitted in `lookups::table_lookups`.
-    // ════════════════════════════════════════════════════════════════════
     // 64-bit case: result[0] = sum of all 8 byte-popcount witnesses.
     // 32-bit case: result[0] = sum of low 4 byte-popcount witnesses.
     // is_64bit = 1 - is_32bit.
@@ -134,7 +124,6 @@ pub(in crate::chips::cpu) fn leading_trailing_zeros_helpers<E: EvalAtRow>(
 ) {
     let is_real = E::F::one() - row.is_padding[0].clone();
     let is_64bit = E::F::one() - row.is32_bit[0].clone();
-    // ════════════════════════════════════════════════════════════════════
     // BITMANIP LeadingZeroBits / TrailingZeroBits 32 / 64.
     //
     // Per-byte LZ/TZ are bound via a separate (byte, lz, tz) lookup
@@ -164,7 +153,6 @@ pub(in crate::chips::cpu) fn leading_trailing_zeros_helpers<E: EvalAtRow>(
     //   LZ32: result[0] = sum_{i=0..3} is_first_nz_msb_lo[i] · (8·(3−i)
     //                       + LzByte[i])
     //                     + (1 − partial_msb_lo[0]) · 32
-    // ════════════════════════════════════════════════════════════════════
 
     // ── ValDPartialNZMsb[8] recurrence ──
     // PartialNZMsb[7] = ByteIndicator[7]; for i < 7, OR-recurrence
@@ -305,7 +293,6 @@ pub(in crate::chips::cpu) fn sign_extend_nibbles<E: EvalAtRow>(
     lookups: &Lookups,
 ) {
     let bitwise_and_lookup = &lookups.bitwise_and_lookup;
-    // ════════════════════════════════════════════════════════════════════
     // BITMANIP — SignExtend8/16 nibble lookups
     //
     // Placed immediately before finalize_logup_in_pairs so the 4 emissions
@@ -318,7 +305,6 @@ pub(in crate::chips::cpu) fn sign_extend_nibbles<E: EvalAtRow>(
     //   (2b) gated on IsSE16: same tuple
     //   (3a) gated on IsSE8: (val_d[0] - 16·SignExtSrcHiNib, 0xF, same)
     //   (3b) gated on IsSE16: (val_d[1] - 16·SignExtSrcHiNib, 0xF, same)
-    // ════════════════════════════════════════════════════════════════════
     {
         let sixteen_se: E::F = E::F::from(BaseField::from(16));
         let eight_se: E::F = E::F::from(BaseField::from(8));

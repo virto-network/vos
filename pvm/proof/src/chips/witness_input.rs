@@ -26,8 +26,7 @@
 //! row produces its byte's memory write and range-checks the byte and its
 //! address; the memory ledger orders it with the run's other accesses.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]

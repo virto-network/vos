@@ -14,8 +14,7 @@
 //! range that wraps as well). The limb relations hold on every row, so the
 //! writing row's addresses are pinned on that row, not only on the first.
 
-#[allow(unused_imports)]
-use alloc::{vec, vec::Vec};
+use crate::prelude::*;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::prover::backend::simd::{m31::PackedBaseField, qm31::PackedSecureField};

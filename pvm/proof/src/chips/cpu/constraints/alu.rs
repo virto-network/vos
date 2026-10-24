@@ -41,9 +41,6 @@ pub(in crate::chips::cpu) fn selector_helpers<E: EvalAtRow>(eval: &mut E, row: &
 pub(in crate::chips::cpu) fn add<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let ff: E::F = E::F::from(BaseField::from(255));
     let f256 = E::F::from(BaseField::from(256u32));
-    // ════════════════════════════════════════════════════════════════════
-    // ADD: result[i] + carry[i]*256 = val_b[i] + val_d[i] + carry[i-1]
-    // ════════════════════════════════════════════════════════════════════
     // The carries are bits on every row: a field-valued carry solves any
     // byte equation, for any result.
     for c in row.carry.iter() {
@@ -79,9 +76,6 @@ pub(in crate::chips::cpu) fn sub<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let ff: E::F = E::F::from(BaseField::from(255));
     let f256 = E::F::from(BaseField::from(256u32));
     let f255 = E::F::from(BaseField::from(255u32));
-    // ════════════════════════════════════════════════════════════════════
-    // SUB: two's complement addition a + ~b + 1
-    // ════════════════════════════════════════════════════════════════════
     for i in 0..WORD_SIZE {
         let carry_in = if i == 0 {
             E::F::one()
@@ -117,11 +111,9 @@ pub(in crate::chips::cpu) fn sub<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
 /// 32-bit Mul: the result sign-extended; the product itself is bound through MulChip.
 pub(in crate::chips::cpu) fn mul<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let ff: E::F = E::F::from(BaseField::from(255));
-    // ════════════════════════════════════════════════════════════════════
     // MUL: CpuChip witnesses UnsignedProductLow/Hi/MulHigh (used by the
     // result-variant binding below); their values are pinned by lookup
     // balance to MulChip's carry-chain-pinned witnesses.
-    // ════════════════════════════════════════════════════════════════════
     // The result-variant binding lives in MulChip.  CpuChip keeps the
     // 32-bit sign-extension on result high bytes since it reads only
     // result + sign_bit_result (both CpuChip columns).
@@ -199,9 +191,6 @@ pub(in crate::chips::cpu) fn imm_alt_operands<E: EvalAtRow>(eval: &mut E, row: &
 
 /// Move: the result is `val_d`.
 pub(in crate::chips::cpu) fn move_reg<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
-    // MOVE: result = val_d
-    // ════════════════════════════════════════════════════════════════════
     for i in 0..WORD_SIZE {
         eval.add_constraint(
             row.is_move[0].clone() * (row.result[i].clone() - row.val_d[i].clone()),

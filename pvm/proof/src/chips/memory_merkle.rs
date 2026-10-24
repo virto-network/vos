@@ -20,8 +20,7 @@
 //!   NOT range-checked (a wrapped/huge index is unreachable from the pinned
 //!   root `(0, 0)` and is orphaned by logup balance — design §1).
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]

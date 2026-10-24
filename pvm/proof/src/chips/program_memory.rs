@@ -33,8 +33,7 @@
 //!     its bit slot in FlagByte_i.  Composed, every individual flag column
 //!     is pinned to its canonical value for every real step.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{

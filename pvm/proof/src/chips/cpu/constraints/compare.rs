@@ -78,31 +78,25 @@ pub(in crate::chips::cpu) fn compare_and_divrem_helpers<E: EvalAtRow>(
 
 /// Compare: the signed less-than flag and the result of each compare op.
 pub(in crate::chips::cpu) fn compare<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
     // MulUpper SS/SU sign-correction lives in MulChip.  CpuChip's
     // mu_uu/mu_su/mu_ss flags + sign_bit_b/d values are sent through the
     // MultiplicationLookup tuple so MulChip's constraint binds against
     // them.  CpuChip's result on `is_mul_upper` rows is consumed by
     // MulChip's sign-correction chain (which proves it equals
     // unsigned_product_hi − sa·val_d − sb·val_b mod 2^64).
-    // ════════════════════════════════════════════════════════════════════
 
-    // ════════════════════════════════════════════════════════════════════
     // BITWISE result-binding lives in BitwiseChip.  CpuChip's `result`
     // on bitwise rows is bound via the BitwiseLookup tuple (val_b,
     // val_d, result + 6 sub-flags) to BitwiseChip's `result`, which is
     // pinned by BitwiseChip's per-op identity + the 16 nibble-AND
     // lookups.
-    // ════════════════════════════════════════════════════════════════════
 
-    // ════════════════════════════════════════════════════════════════════
     // COMPARE: SetLtU via subtraction carry analysis
     // cmp_carry chain: val_b + ~val_d + 1 (same as sub)
     // cmp_lt_flag = 1 - cmp_carry[7] (unsigned: a < b iff no final carry)
     // SetLtU: result = cmp_lt_flag, zero-extended.
     // SetLtS: result = cmp_lt_s_flag, bound below by the sign bits.
     // CmovIz/Nz and Min/Max: result bound below to the selected operand.
-    // ════════════════════════════════════════════════════════════════════
     let is_cmp_or_branch = is_compare(row) + is_branch(row);
     // The cmp_carry chain + cmp_lt_flag derivation live in CompareChip.
     // CpuChip's cmp_lt_flag is bound via the CompareLookup tuple to

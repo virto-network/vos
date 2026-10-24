@@ -3,8 +3,7 @@
 //! This module re-exports the types and functions needed by `vos-pvm-proof-verifier`
 //! without requiring the full `SideNote` / trace generation infrastructure.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use stwo::core::{
     air::{Component, Components},
     circle::CirclePoint,

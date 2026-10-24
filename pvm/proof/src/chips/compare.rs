@@ -8,8 +8,7 @@
 //!
 //! Lookup tuple (17 limbs): val_b\[8\] + val_d\[8\] + cmp_lt_flag.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]

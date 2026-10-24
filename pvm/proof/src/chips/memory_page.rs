@@ -28,8 +28,7 @@
 //! producer's tuples carry 0 there, the closing reads 1), and `MemoryChip`
 //! holds every access of the address to it.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]

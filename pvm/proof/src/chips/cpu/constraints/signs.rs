@@ -8,7 +8,6 @@ use super::{Lookups, Row};
 /// The sign bits' source bytes.
 pub(in crate::chips::cpu) fn sign_sources<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let is_real = E::F::one() - row.is_padding[0].clone();
-    // ════════════════════════════════════════════════════════════════════
     // Pin SignBitB / SignBitD / SignBitQ / SignBitR to bit 7
     // of their respective source bytes via nibble-AND lookups.
     // Without this tie those four sign bits would be prover-witnessed

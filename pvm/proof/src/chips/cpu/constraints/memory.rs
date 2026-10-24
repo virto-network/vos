@@ -67,9 +67,6 @@ pub(in crate::chips::cpu) fn result_bytes<E: EvalAtRow>(
 ) {
     let range256_lookup = &lookups.range256_lookup;
     let is_real = E::F::one() - row.is_padding[0].clone();
-    // ════════════════════════════════════════════════════════════════════
-    // Range256 checks for result byte limbs
-    // ════════════════════════════════════════════════════════════════════
     for i in 0..WORD_SIZE {
         eval.add_to_relation(RelationEntry::new(
             range256_lookup,
@@ -86,9 +83,6 @@ pub(in crate::chips::cpu) fn memory_access<E: EvalAtRow>(
     lookups: &Lookups,
 ) {
     let mem_lookup = &lookups.mem_lookup;
-    // ════════════════════════════════════════════════════════════════════
-    // Memory access lookup (producer side)
-    // ════════════════════════════════════════════════════════════════════
     // IsStore folded — `is_store(row)` is the sum.
     let f256 = E::F::from(BaseField::from(256));
 
@@ -144,7 +138,6 @@ pub(in crate::chips::cpu) fn memory_access<E: EvalAtRow>(
 
 /// `MemByteActive` pinned to a prefix of ones of length `MemSize`.
 pub(in crate::chips::cpu) fn active_bytes<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
     // Pin MemByteActive to a prefix-1 pattern of length MemSize
     //
     // MemByteActive is the lookup multiplicity for byte-level memory
@@ -189,7 +182,6 @@ pub(in crate::chips::cpu) fn active_bytes<E: EvalAtRow>(eval: &mut E, row: &Row<
 
 /// Loads: the result is the memory value on active bytes.
 pub(in crate::chips::cpu) fn load_result<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
     // Bind Result to MemValue on Load steps
     //
     // For each byte i, on a load step (is_load=1), if byte i is within
@@ -215,7 +207,6 @@ pub(in crate::chips::cpu) fn load_result<E: EvalAtRow>(eval: &mut E, row: &Row<E
 
 /// Direct stores: the memory value is `val_b`.
 pub(in crate::chips::cpu) fn direct_store_value<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
     // Bind MemValue ↔ val_b on Direct stores
     //
     // For StoreU8 / StoreU16 / StoreU32 / StoreU64 (the OneRegOneImm
@@ -244,7 +235,6 @@ pub(in crate::chips::cpu) fn direct_store_value<E: EvalAtRow>(eval: &mut E, row:
 
 /// Indirect register-source stores: the memory value is `RegValA`.
 pub(in crate::chips::cpu) fn indirect_store_value<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
     // Bind MemValue ↔ RegValA on indirect register-source stores
     //
     // For StoreInd[U][8/16/32/64] (TwoRegOneImm), val_b holds
@@ -270,7 +260,6 @@ pub(in crate::chips::cpu) fn indirect_store_value<E: EvalAtRow>(eval: &mut E, ro
 
 /// Direct loads and stores: the address is the immediate.
 pub(in crate::chips::cpu) fn direct_address<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
     // Bind MemAddr ↔ ImmBytes[0..4] on direct loads/stores
     //
     // For LoadU8/I8/U16/I16/U32/I32/U64 and StoreU8/16/32/64
@@ -306,7 +295,6 @@ pub(in crate::chips::cpu) fn direct_address<E: EvalAtRow>(eval: &mut E, row: &Ro
 
 /// StoreImm and StoreImmInd: the memory value is `imm_y`.
 pub(in crate::chips::cpu) fn immediate_store_value<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
     // Bind MemValue ↔ ImmYBytes on StoreImm / StoreImmInd
     //
     // For all 8 immediate-source store opcodes (StoreImm[U] and
@@ -336,7 +324,6 @@ pub(in crate::chips::cpu) fn immediate_store_value<E: EvalAtRow>(eval: &mut E, r
 /// Indirect loads and stores: the address is `val_b` plus the immediate, mod 2^32.
 pub(in crate::chips::cpu) fn indirect_address<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
     let f256 = E::F::from(BaseField::from(256));
-    // ════════════════════════════════════════════════════════════════════
     // Bind MemAddr ↔ (val_b + ImmBytes) mod 2^32 on indirect ops
     //
     // For LoadInd[U/I][8/16/32/64], StoreInd[U][8/16/32/64], and
@@ -379,7 +366,6 @@ pub(in crate::chips::cpu) fn indirect_address<E: EvalAtRow>(eval: &mut E, row: &
 
 /// Signed loads: inactive bytes extend the sign.
 pub(in crate::chips::cpu) fn signed_load_extension<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
     // Signed-load inactive-byte sign-extension
     //
     // For load rows, every inactive byte (mem_byte_active[i] = 0)

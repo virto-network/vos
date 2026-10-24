@@ -27,8 +27,7 @@
 //!                   - val_b[i] - imm_bytes[i] - carry[i-1]) = 0`
 //! that pins JumpIndAddr to the runtime-computed virtual address.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]

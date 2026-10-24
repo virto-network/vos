@@ -15,8 +15,7 @@
 //! preprocessed table plus a Multiplicity column counted from
 //! CpuChip's per-row charges).
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]
 use stwo::{

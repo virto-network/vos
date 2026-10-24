@@ -19,8 +19,7 @@
 //!   compression at row 95, which `MemoryPageChip` / `MemoryMerkleChip`
 //!   consume.
 
-#[allow(unused_imports)]
-use alloc::{vec, vec::Vec};
+use crate::prelude::*;
 use num_traits::One;
 #[cfg(feature = "prover")]
 use stwo::{

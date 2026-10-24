@@ -17,7 +17,6 @@ pub(in crate::chips::cpu) fn program_memory<E: EvalAtRow>(
 ) {
     let prog_mem_lookup = &lookups.prog_mem_lookup;
     let is_real = E::F::one() - row.is_padding[0].clone();
-    // ════════════════════════════════════════════════════════════════════
     // Program-memory consumer (pc + opcode + regs + imm
     //                          + 10 packed flag bytes
     //                          + imm_y + branch_target)
@@ -58,7 +57,6 @@ pub(in crate::chips::cpu) fn flag_bits<E: EvalAtRow>(
     lookups: &Lookups,
 ) {
     let byte_to_bits_lookup = &lookups.byte_to_bits_lookup;
-    // ════════════════════════════════════════════════════════════════════
     // Byte-to-bits decomposition lookups
     //
     // Per real CpuChip step, emit 6 lookups against ByteToBitsChip's

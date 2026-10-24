@@ -10,8 +10,7 @@
 //! Lookup tuple (30 limbs): val_b\[8\] + val_d\[8\] + result\[8\] +
 //! is_and + is_or + is_xor + is_and_inv + is_or_inv + is_xnor.
 
-#[allow(unused_imports)]
-use alloc::{boxed::Box, vec, vec::Vec};
+use crate::prelude::*;
 use num_traits::One;
 use stwo::core::fields::m31::BaseField;
 #[cfg(feature = "prover")]

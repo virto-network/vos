@@ -79,10 +79,6 @@ pub(in crate::chips::cpu) fn control_flow_helpers<E: EvalAtRow>(eval: &mut E, ro
 
 /// Control flow: the next PC of jumps and branches.
 pub(in crate::chips::cpu) fn next_pc<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
-    // CONTROL FLOW: constrain next_pc based on branch/jump
-    // ════════════════════════════════════════════════════════════════════
-
     // A jump or a taken branch continues at branch_target; every other
     // real row at pc + 1 + skip_len, all four bytes with their carries
     // (`branch_conditions`).
@@ -230,9 +226,6 @@ pub(in crate::chips::cpu) fn program_execution<E: EvalAtRow>(
 ) {
     let prog_exec_lookup = &lookups.prog_exec_lookup;
     let is_real = E::F::one() - row.is_padding[0].clone();
-    // ════════════════════════════════════════════════════════════════════
-    // Program execution lookup: step sequencing
-    // ════════════════════════════════════════════════════════════════════
     {
         // Consume (timestamp, pc)
         let mut consume_tuple: Vec<E::F> = row.timestamp.to_vec();
@@ -256,7 +249,6 @@ pub(in crate::chips::cpu) fn program_execution<E: EvalAtRow>(
 
 /// No real row follows a Trap.
 pub(in crate::chips::cpu) fn trap_terminal<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
-    // ════════════════════════════════════════════════════════════════════
     // Terminal-row constraint gated on per-opcode IsTrap
     //
     // Forbids a real successor row after Trap.  Gating on IsExit would
@@ -292,7 +284,6 @@ pub(in crate::chips::cpu) fn jump_ind<E: EvalAtRow>(
 ) {
     let jump_table_lookup = &lookups.jump_table_lookup;
     let f256 = E::F::from(BaseField::from(256));
-    // ════════════════════════════════════════════════════════════════════
     // JumpInd target binding via JumpTableChip
     //
     // (1) Carry-chain constraint: pin JumpIndAddr to (val_b + imm) low 32 bits.
@@ -388,7 +379,6 @@ pub(in crate::chips::cpu) fn load_imm_jump_ind<E: EvalAtRow>(
 ) {
     let jump_table_lookup = &lookups.jump_table_lookup;
     let f256 = E::F::from(BaseField::from(256));
-    // ════════════════════════════════════════════════════════════════════
     // LoadImmJumpInd target binding via JumpTable
     //
     // Same chip lookup as JumpInd, but with a different addr formula.

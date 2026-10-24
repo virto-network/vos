@@ -132,6 +132,11 @@
 
 extern crate alloc;
 
+/// The `alloc` items the chips use, in scope with `std` or without.
+mod prelude {
+    pub(crate) use alloc::{boxed::Box, vec, vec::Vec};
+}
+
 pub mod air_column;
 pub mod boundary_binding;
 pub mod chips;
