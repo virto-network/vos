@@ -10,6 +10,7 @@ use crate::{ExitReason, Gas};
 /// What the JAM-only host charges where PolkaJam's prices differ from the
 /// Gray Paper's base, measured on PolkaJam 0.1.29 (Gray Paper 0.8.0).
 pub mod jam_gas {
+    use super::fetch_kind;
     use crate::Gas;
 
     /// `gas`.
@@ -25,18 +26,18 @@ pub mod jam_gas {
     /// unit: a segment's import 171, a payload's 95 and 96 a KiB.
     pub const fn fetch(kind: u64, len: u64) -> Gas {
         let (base, per_kib): (Gas, Gas) = match kind {
-            0 => (390, 0),
+            fetch_kind::PARAMETERS => (390, 0),
             1 => (103, 0),
             2 => (80, 96),
-            3 | 4 => (85, 96),
-            5 | 6 => (171, 0),
+            fetch_kind::ANY_EXTRINSIC | fetch_kind::OUR_EXTRINSIC => (85, 96),
+            fetch_kind::ANY_IMPORT | fetch_kind::OUR_IMPORT => (171, 0),
             7 => (85, 96),
             8 => (84, 0),
             9 => (88, 0),
             10 => (111, 0),
             11 => (317, 0),
             12 => (250, 0),
-            13 => (95, 96),
+            fetch_kind::PAYLOAD => (95, 96),
             14 => (287, 400),
             15 => (355, 344),
             _ => (80, 0),
