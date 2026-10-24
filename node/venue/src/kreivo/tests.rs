@@ -1,6 +1,8 @@
 //! [`KreivoVenue`] over the mock: an anchor taken at once and sent in the
-//! background; an open window, `WindowInFuture`, a suspension and a pause
-//! sending nothing until they pass; the budget's refusal and a short
+//! background; an anchor over another root, read before it is taken or
+//! after, sent as the equivocation's evidence; an open window,
+//! `WindowInFuture`, a suspension and a pause sending nothing until they
+//! pass; the budget's refusal and a short
 //! sovereign account alerting; a lost answer and a dropped send never
 //! sending a call twice; statements judged through the client; every
 //! pallet error mapped; and the production build refusing Kreivo.

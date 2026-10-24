@@ -4,8 +4,11 @@
 //! proves and submits the statements of the agents it leads. Every replica
 //! running a prover reads its own log into jobs, through its applied
 //! index, and its log is compacted no further than that read (at most
-//! the node's `PROVER_HOLD` entries behind), so a new leader holds every record already and a
-//! failover proves again at most the statement in flight.
+//! the node's `PROVER_HOLD` entries behind), so a new leader holds every
+//! record already and a failover proves again at most the statement in
+//! flight. A replica that installed a snapshot past records it had not
+//! read holds no job of them: it counts them lost, and when it leads, the
+//! statements the old leader had queued are not proved.
 //!
 //! **Its table** is node-local ([`Jobs`]): each statement's job by id,
 //! `queued | proving | proved(proof) | submitted | accepted |
