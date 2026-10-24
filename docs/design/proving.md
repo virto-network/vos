@@ -399,9 +399,9 @@ attribution). Its full design is `recursion-air.md`.
     2,498 MiB, 122,085 bytes);
   - **on the JAM-only host** (`final-verify.elf`, Blake2b-256 in
     software, the guests' allocator a bump over its arena): the `valid`
-    fixture's 146,564-byte proof in 79.6M gas, the decode 1.50M of it and
-    the verify 78.0M; the JAM statements service's refine of one
-    statement about 80M;
+    fixture's 146,564-byte proof in 79.3M gas, the decode 1.50M of it and
+    the verify 77.8M; the JAM statements service's refine of one
+    statement 79.4M;
   - **in Wasm** under the PVF's semantics: 44.9M instructions (the window
     kernel's proof), 46.4M of the 50M budget at the worst shape.
 - **Levers:** the Blake2b hook is deferred, a lever for when ref_time
@@ -760,7 +760,7 @@ last for decades.**
     verifier stack vendored into Kreivo with a sync check against a VOS
     tag (VOS's kit, `pvm/proof/kit`); frame-contrib and crates.io later.
 - **The JAM statements service** (`vos-statement-service`): a dedicated
-  service; refine verifies anchors' signatures and statements (about 80M gas
+  service; refine verifies anchors' signatures and statements (79.4M gas
   a statement [measured]; a report's accumulate has 10M); accumulate
   holds the spaces,
   anchors and repeats, and records, checking an anchor's signer against
@@ -948,7 +948,7 @@ that narrows the inner proof makes folds cheaper too.
 | the final wrap misses its gas or size | the real wrap verified on the JAM-only host (≤ 150M unmasked) and in the Wasm harness | slice 5, M1 |
 | the multi-step FRI path, or the new Blake2b channel, is unsound | a review plus tamper tests before the format admits them | slice 5, M1 |
 | the wrap misses its 80 proven bits | 74.7 at blowup 64 with powers-of-one DEEP batching [model]; **retired at 5.14:** affine batching in the fork for format 28, 82.6 proven bits [model] | slice 5, M1 |
-| masking the wrap costs more than (c)'s factor | one masked wrap: ≤ 24 GiB, ≤ 200M gas; leakage and soundness tests. **Retired:** format 39 at a 3.6 GiB heap, 79.6M gas [measured] | slice 6, M2 |
+| masking the wrap costs more than (c)'s factor | one masked wrap: ≤ 24 GiB, ≤ 200M gas; leakage and soundness tests. **Retired:** format 39 at a 3.6 GiB heap, 79.3M gas [measured] | slice 6, M2 |
 | the cut and held build fail under failover | the cut and the held build across a leader change | slice 6, M3 |
 | the prover worker falls behind the window cadence | the worker measured against the cadence | slice 6, M3 |
 | the teammate's pallet diverges from the design | the pallet against the conformance vectors | the teammate's |
@@ -1308,8 +1308,8 @@ check:
 The transition holds both ways: `S` accepted under one format is the same
 statement under the other, refused as a repeat. Past `MaxRootAge` a rooted
 replay is unanchored (its `Seen` entry and anchors dropped) and a rootless
-one is repeated (its entry kept). The production guest's program is 397,976
-bytes (the test guest's 462,242), within JAM's 4,000,000-byte bound on a
+one is repeated (its entry kept). The production guest's program is 391,784
+bytes (the test guest's 454,662), within JAM's 4,000,000-byte bound on a
 service's code, its only size bound.
 
 **A.7 Budgets per node (M1: measured, then pinned).** Heavy tests run
