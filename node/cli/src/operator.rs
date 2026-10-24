@@ -66,14 +66,7 @@ impl InstallArgs {
         let derived = vos_pvm_compiler::derive(&elf).map_err(at(&self.elf))?;
         let schema = Schema::read(&derived.schema)
             .map_err(|error| format!("{}: its schema: {error:?}", self.elf.display()))?;
-        let local = Derivation::new(
-            &elf,
-            &derived.actor,
-            &derived.kernels,
-            &derived.shapes,
-            derived.transpiler_version,
-            derived.heap,
-        );
+        let local = derived.derivation(&elf);
         let install = Install {
             instance: InstanceId(self.instance),
             elf,

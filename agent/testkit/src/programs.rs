@@ -73,14 +73,7 @@ pub fn derived(name: &str) -> Derived {
 
 /// The derivation an install of package `elf`, derived as `derived`, names.
 pub fn derivation(elf: &[u8], derived: &Derived) -> Derivation {
-    Derivation::new(
-        elf,
-        &derived.actor,
-        &derived.kernels,
-        &derived.shapes,
-        derived.transpiler_version,
-        derived.heap,
-    )
+    derived.derivation(elf)
 }
 
 /// The derivation of an actor program a test holds alone, linked or built:

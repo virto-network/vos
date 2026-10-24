@@ -49,14 +49,7 @@ pub fn derive(elf: &[u8]) -> Result<Installable, Error> {
             method.gas.unwrap_or_default(),
         )));
     }
-    let derivation = Derivation::new(
-        elf,
-        &derived.actor,
-        &derived.kernels,
-        &derived.shapes,
-        derived.transpiler_version,
-        derived.heap,
-    );
+    let derivation = derived.derivation(elf);
     let programs = core::iter::once(derived.actor)
         .chain(derived.kernels.into_iter().map(|(_, kernel)| kernel))
         .collect();

@@ -121,6 +121,21 @@ pub struct Derived {
     pub transpiler_version: u32,
 }
 
+impl Derived {
+    /// The derivation an install of the package `elf`, derived as this,
+    /// names.
+    pub fn derivation(&self, elf: &[u8]) -> vos_wire::records::Derivation {
+        vos_wire::records::Derivation::new(
+            elf,
+            &self.actor,
+            &self.kernels,
+            &self.shapes,
+            self.transpiler_version,
+            self.heap,
+        )
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DeriveError {
     #[error("the ELF holds {0} bytes, past {MAX_ELF}")]

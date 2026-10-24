@@ -10,7 +10,6 @@ use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, ProgramHash};
 use vos_wire::ingress::Unplaced;
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
-use vos_wire::records::Derivation;
 
 use super::{Answered, CallError, Inner, Pending, ReplaceError};
 use crate::blobs::Keep;
@@ -277,14 +276,7 @@ impl Inner {
                     stored.push((reference, Arc::new(blob)));
                     Ok(ProgramHash(hash.0))
                 };
-                let derivation = Derivation::new(
-                    &elf,
-                    &derived.actor,
-                    &derived.kernels,
-                    &derived.shapes,
-                    derived.transpiler_version,
-                    derived.heap,
-                );
+                let derivation = derived.derivation(&elf);
                 pooled(derived.actor)?;
                 for (_, kernel) in derived.kernels {
                     pooled(kernel)?;

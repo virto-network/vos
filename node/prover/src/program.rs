@@ -3,7 +3,6 @@
 //! reproducibility gate recomputes on another architecture.
 
 use vos_pvm_proof::format::SEGMENT;
-use vos_wire::records::Derivation;
 use vos_wire::schema::Schema;
 
 /// The circuits' constants every statement's proof rests on, as the
@@ -38,14 +37,7 @@ pub fn program_id(elf: &[u8], method: &str) -> Result<[u32; 8], String> {
     let id = schema
         .method_id(method)
         .ok_or_else(|| format!("no method {method}"))?;
-    let install = Derivation::new(
-        elf,
-        &derived.actor,
-        &derived.kernels,
-        &derived.shapes,
-        derived.transpiler_version,
-        derived.heap,
-    );
+    let install = derived.derivation(elf);
     let record = install
         .kernels
         .iter()
