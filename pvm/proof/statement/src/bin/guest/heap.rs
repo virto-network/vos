@@ -15,8 +15,8 @@ struct Arena<const N: usize>([u8; N]);
 pub struct State {
     /// The bump offset into the arena: where the next block starts.
     pub top: usize,
-    /// The highest `top` held before it last fell: kept as it falls, which
-    /// is rarer than it rises.
+    /// The highest `top` held before it last fell, under `heap-peak`.
+    #[cfg(feature = "heap-peak")]
     fallen_from: usize,
     live: usize,
     /// The most bytes live at once.
@@ -43,6 +43,7 @@ impl<const N: usize> Heap<N> {
             arena: UnsafeCell::new(Arena([0; N])),
             state: UnsafeCell::new(State {
                 top: 0,
+                #[cfg(feature = "heap-peak")]
                 fallen_from: 0,
                 live: 0,
                 peak_live: 0,
@@ -66,25 +67,32 @@ impl<const N: usize> Heap<N> {
         ptr as usize + bytes == self.base() + self.state().top
     }
 
-    /// Move the top to `top`, the height it leaves kept should it fall: a
-    /// max without a branch, as a branch ends a block of the PVM's gas.
+    /// Move the top to `top`; under `heap-peak`, the height it leaves kept
+    /// should it fall, by a max without a branch, as a branch ends a block
+    /// of the PVM's gas. Without it the peak costs nothing.
     fn move_top(&self, top: usize) {
         let state = self.state();
-        let (kept, from) = (state.fallen_from, state.top);
-        let higher = usize::from(kept < from).wrapping_neg();
-        state.fallen_from = kept ^ ((kept ^ from) & higher);
+        #[cfg(feature = "heap-peak")]
+        {
+            let (kept, from) = (state.fallen_from, state.top);
+            let higher = usize::from(kept < from).wrapping_neg();
+            state.fallen_from = kept ^ ((kept ^ from) & higher);
+        }
         state.top = top;
     }
 
-    /// The highest top reached: how much of the arena an invocation
-    /// touched.
+    /// How much of the arena an invocation touched: the highest top
+    /// reached under `heap-peak`, the top now without it.
     #[allow(
         dead_code,
         reason = "the statements service reports no high-water mark"
     )]
     pub fn peak_top(&self) -> usize {
         let state = self.state();
-        state.fallen_from.max(state.top)
+        #[cfg(feature = "heap-peak")]
+        return state.fallen_from.max(state.top);
+        #[cfg(not(feature = "heap-peak"))]
+        state.top
     }
 
     fn account(&self, grow: usize, shrink: usize) {

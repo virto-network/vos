@@ -16,6 +16,11 @@ fixtures = ["vos-anchor/vectors"]
 # The venue as a JAM refine program (`src/bin/final-verify.rs`), for the
 # PVM target only: no_main, its own allocator and panic handler.
 pvm-guest = ["vos-anchor/vectors"]
+# The guests' heap peak (`guest/heap.rs`): the highest top the allocator
+# reached, which a guest reports as its high-water mark, for measurement
+# builds of `final-verify` only. Without it the report gives the top at the
+# end, and the allocator pays nothing for the peak.
+heap-peak = []
 
 [[bin]]
 name = "final-verify"

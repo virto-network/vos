@@ -9,6 +9,10 @@ description = "The JAM statements service: a venue on JAM, as a service whose re
 # The service as a JAM program (`src/bin/statement-service.rs`), for the
 # PVM target only: no_main, the venue guests' runtime.
 pvm-guest = []
+# The guests' heap peak, which the runtime this program shares names
+# (`vos-statement`'s `heap-peak`); the service reports no high-water mark
+# and never enables it.
+heap-peak = []
 
 [[bin]]
 name = "statement-service"
