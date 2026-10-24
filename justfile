@@ -227,7 +227,7 @@ e2e-chain: build-test-actors build-agent build-representative
 # `vos` with the feature must not leak into it, and no workspace member
 # turns the feature on for vos-node.
 check-no-faults:
-    if (cargo tree --workspace -e features -i vos-node | str contains 'feature "faults"') { error make { msg: "a workspace member enables vos-node's faults" } }
+    let resolved = (cargo tree --workspace -e features -i vos-node | complete); if $resolved.exit_code != 0 { print -e $resolved.stderr; error make { msg: "cargo tree failed" } }; if ($resolved.stdout | str contains 'feature "faults"') { error make { msg: "a workspace member enables vos-node's faults" } }
     cargo build -p vos-cli
     if ((^target/debug/vos --version) | str contains "faults") { error make { msg: "a plain build of vos injects faults" } } else { print "no faults in a plain build of vos" }
 
@@ -237,7 +237,7 @@ check-no-faults:
 # features (`{f}`) are compared whole, so one a feature enables through
 # another is caught. `_forbidden <gate>...` resolves each build the gates
 # name once, prints every feature enabled and package held, and fails on
-# any.
+# any, or when a build does not resolve.
 _forbidden +gates:
     let table = [ \
         [gate args features packages]; \
@@ -271,7 +271,9 @@ _forbidden +gates:
         [test-formats "-p vos-statement-service --features pvm-guest" [test-formats] []] \
     ]; \
     let failures = ($table | where gate in [{{gates}}] | group-by args | items {|args, rows| \
-        let tree = (cargo tree ...($args | split row ' ') -e no-dev --target all -f '{p}|{f}' --prefix none | lines | each {|line| $line | str replace ' (*)' '' | split row '|' }); \
+        let resolved = (cargo tree ...($args | split row ' ') -e no-dev --target all -f '{p}|{f}' --prefix none | complete); \
+        if $resolved.exit_code != 0 { print -e $resolved.stderr; error make { msg: $"cargo tree ($args) failed" } }; \
+        let tree = ($resolved.stdout | lines | each {|line| $line | str replace ' (*)' '' | split row '|' }); \
         let held = ($tree | each {|parts| $parts.0 | split row ' ' | first }); \
         let enabled = ($tree | each {|parts| $parts.1? | default '' | split row ',' } | flatten); \
         ($rows.features | flatten | uniq | where {|feature| $feature in $enabled } | each {|feature| $"cargo tree ($args) enables ($feature)" }) \
