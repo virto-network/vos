@@ -100,11 +100,7 @@ fn paths(target: &str, bytes: &[u8]) -> Vec<String> {
                     for mutation in &mutations {
                         mutation::apply(&mut proof, mutation);
                     }
-                    let result = match golden.format {
-                        masked::FORMAT => masked::verify(proof, &golden.words),
-                        _ => vos_pvm_final_verifier::unmasked::verify(proof, &golden.words),
-                    };
-                    format!("{}: {}", golden.format, verdict(result))
+                    format!("{}: {}", golden.format, verdict(golden.verify(proof)))
                 })
                 .collect()
         }

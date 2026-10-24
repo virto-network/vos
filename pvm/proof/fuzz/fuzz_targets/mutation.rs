@@ -115,34 +115,32 @@ fn secure(limbs: [u32; 4]) -> SecureField {
     SecureField::from_m31_array(limbs.map(BaseField::from_u32_unchecked))
 }
 
+/// Trees of columns resized by `how`: tree `outer`'s, its column `inner`
+/// when `inner` is not 0, or the trees when there are none.
+fn reshape_nested<T: Clone>(trees: &mut Vec<Vec<Vec<T>>>, outer: usize, inner: usize, how: Resize) {
+    match pick(trees, outer) {
+        Some(tree) if inner == 0 => resize(tree, how),
+        Some(tree) => {
+            if let Some(column) = pick(tree, inner) {
+                resize(column, how);
+            }
+        }
+        None => resize(trees, how),
+    }
+}
+
 /// A vector at `place` resized by `how`.
 fn reshape(proof: &mut WrapProof, place: Place, outer: usize, inner: usize, how: Resize) {
     let stark = &mut proof.stark_proof.0;
     let fri = &mut stark.fri_proof;
     match place {
         Place::Commitments => resize(&mut stark.commitments.0, how),
-        Place::Sampled => match pick(&mut stark.sampled_values.0, outer) {
-            Some(tree) if inner == 0 => resize(tree, how),
-            Some(tree) => {
-                if let Some(column) = pick(tree, inner) {
-                    resize(column, how);
-                }
-            }
-            None => resize(&mut stark.sampled_values.0, how),
-        },
+        Place::Sampled => reshape_nested(&mut stark.sampled_values.0, outer, inner, how),
         Place::Decommitments => match pick(&mut stark.decommitments.0, outer) {
             Some(tree) => resize(&mut tree.hash_witness, how),
             None => resize(&mut stark.decommitments.0, how),
         },
-        Place::Queried => match pick(&mut stark.queried_values.0, outer) {
-            Some(tree) if inner == 0 => resize(tree, how),
-            Some(tree) => {
-                if let Some(column) = pick(tree, inner) {
-                    resize(column, how);
-                }
-            }
-            None => resize(&mut stark.queried_values.0, how),
-        },
+        Place::Queried => reshape_nested(&mut stark.queried_values.0, outer, inner, how),
         Place::FirstLayer => resize(&mut fri.first_layer.fri_witness, how),
         Place::InnerLayers => resize(&mut fri.inner_layers, how),
         Place::InnerWitness => {

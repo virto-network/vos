@@ -49,7 +49,7 @@ fuzz_target!(|data: &[u8]| {
             .iter()
             .filter(|golden| golden.format == masked::FORMAT)
         {
-            if golden.verify(proof.clone()) {
+            if golden.verify(proof.clone()).is_ok() {
                 golden.assert_is_golden(&proof);
             }
         }

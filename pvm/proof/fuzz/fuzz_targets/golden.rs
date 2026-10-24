@@ -60,12 +60,15 @@ impl Golden {
     }
 
     /// Verifies `proof` under the golden's format against its words.
-    pub fn verify(&self, proof: vos_pvm_final_verifier::WrapProof) -> bool {
+    pub fn verify(
+        &self,
+        proof: vos_pvm_final_verifier::WrapProof,
+    ) -> Result<vos_pvm_final_verifier::Statement, vos_pvm_final_verifier::Error> {
         match self.format {
             vos_pvm_final_verifier::masked::FORMAT => {
-                vos_pvm_final_verifier::masked::verify(proof, &self.words).is_ok()
+                vos_pvm_final_verifier::masked::verify(proof, &self.words)
             }
-            _ => vos_pvm_final_verifier::unmasked::verify(proof, &self.words).is_ok(),
+            _ => vos_pvm_final_verifier::unmasked::verify(proof, &self.words),
         }
     }
 

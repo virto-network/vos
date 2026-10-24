@@ -45,7 +45,7 @@ fuzz_target!(|data: &[u8]| {
     if shape::reshape(&mut u, &mut proof).is_err() {
         return;
     }
-    let accepted = golden.verify(proof.clone());
+    let accepted = golden.verify(proof.clone()).is_ok();
     if accepted {
         golden.assert_is_golden(&proof);
     }

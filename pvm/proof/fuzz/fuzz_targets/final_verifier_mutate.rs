@@ -36,7 +36,7 @@ fuzz_target!(|mutations: Vec<Mutation>| {
         for mutation in &mutations {
             apply(&mut proof, mutation);
         }
-        if golden.verify(proof.clone()) {
+        if golden.verify(proof.clone()).is_ok() {
             golden.assert_is_golden(&proof);
         }
         let mut bytes = golden
