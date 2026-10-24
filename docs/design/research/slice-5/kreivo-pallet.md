@@ -3,7 +3,17 @@
 **Superseded in parts.** The built venue, slice 6's plan
 (`../../slice-6-on-chain.md`) and `../../spaces-pallet.md` (the pallet's
 handoff design, which replaces this note's pallet) supersede parts of this
-note:
+note. **Who builds what:** the pallet, `pallet-spaces`, is the Kreivo
+teammate's, built from `spaces-pallet.md`; VOS ships the design, the
+verifier kit with its sync check (`pvm/proof/kit`, `just check-kit`), the
+calls, the `Transport` trait, `KreivoVenue`, a mock of the pallet and the
+conformance vectors G1–G18 (`node/venue/conformance/spaces.json`, written
+by the mock through `just conformance`). The node's chain client is not
+VOS's to build now: the transport is a port of master's substrate
+extension (sube over smoldot) onto vos-core's extension host once that
+host exists, after the slices (`spaces-pallet.md` §9.1); `KreivoVenue`
+runs against the mock until then, and the live Kreivo leg waits on both
+the pallet and the port. Where this note and the design differ:
 1. **§1, Kreivo's facts** (e4b2af3, stable2603, velocity 12, 500 ms
    blocks): Kreivo master `87f8728` runs stable2606-2 from crates.io,
    velocity 3 (2 s blocks) with block bundling; one core gives about
@@ -36,7 +46,7 @@ note:
 9. **§7, `PROOF_FORMAT_VERSION` 24/25 as a cargo feature:** formats are
    chosen at run time from the registry.
 10. **§8, the toolchain and pin ("vos-core pins stwo e1286720"):** the pin
-    is olanod/stwo `ab294189`; the stack builds on Kreivo's stable 1.94.1
+    is olanod/stwo `c3ec9813` (the kit carries VOS's); the stack builds on Kreivo's stable 1.94.1
     for `wasm32v1-none` with no change and adds 75.7 KiB compressed
     [measured, `../slice-6/spike6c-kreivo.md`].
 11. **§9's table, "Blake2s: software in Wasm":** Blake2b-256; JAM serves no
@@ -49,8 +59,12 @@ note:
     controller, anchor_keys)`, anchor keys signing directly) and §6's
     fees:** a space registered from its genesis with a sovereign account
     that pays; an authorities map of the nodes' sr25519 accounts paired
-    with ed25519 anchor keys; a refundable deposit on `submit`
-    (decisions 11, 12; `spaces-pallet.md`).
+    with ed25519 anchor keys; a refundable deposit on `submit`, released on
+    acceptance or a repeat and forfeited on any other refusal, beside the
+    normal length and weight fees, within a spend budget per window (a
+    submit holds at most the deposit and a fee's bound, 1.5 UNIT at the
+    design's suggested values); a migration to another venue, one-way,
+    set by the controller (decisions 11, 12; `spaces-pallet.md` §§5–8).
 15. **§5's `Verified` expiry for every statement:** a rootless statement's
     `Seen` entry never expires.
 
