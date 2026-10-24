@@ -60,6 +60,8 @@ use crate::framework::BuiltInProverComponent;
 #[cfg(feature = "prover")]
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
+use crate::memory_layout::Permission;
+#[cfg(feature = "prover")]
 use crate::side_note::SideNote;
 
 pub struct MemoryPageChip;
@@ -653,8 +655,12 @@ impl BuiltInProverComponent for MemoryPageChip {
                     t.push(PackedBaseField::one());
                     let mut permission = PackedBaseField::zero();
                     for (k, column) in select.iter().enumerate() {
-                        let code = if k < FIRST_WRITABLE { 1 } else { 2 };
-                        permission += column.at(v) * bc(code);
+                        let code = if k < FIRST_WRITABLE {
+                            Permission::Readable
+                        } else {
+                            Permission::Writable
+                        };
+                        permission += column.at(v) * bc(code as u8);
                     }
                     t.push(permission * two);
                     t

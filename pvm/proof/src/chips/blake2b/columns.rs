@@ -1,10 +1,16 @@
 //! Blake2b AIR column layouts.
 //!
-//! `Column` carries the per-row main-trace witness for a single G-function
-//! invocation (96 rows per compression), including nibble AND witnesses, the
-//! v[0..16] state snapshot, compression-level inputs (h, t, f, m), ECALL
-//! memory-binding pointers and address limbs, and the final-row Output
-//! witnesses.
+//! `compression_columns!` lays out the compression core's main-trace
+//! witness for a single G-function invocation a row (96 rows per
+//! compression): the input state and message words, each step's sum,
+//! carries and byte-wide AND results (each a lookup into
+//! `BitwiseAndByteChip`), the v[0..16] state snapshot, compression-level
+//! inputs (h, t, f, m) and the final-row Output witnesses, around a chip's
+//! own columns. `Column` is the ECALL chip's: the core's, with the
+//! memory-binding pointers, timestamp and address limbs; the boundary
+//! chip's `BoundaryColumn` (`boundary.rs`) is the core's, with its
+//! production multiplicity in place of those.
+//! [`CompressionColumns`] is the handles the shared core reads them by.
 //!
 //! `PreprocessedColumn` carries the row-index-derived selectors: 8 G-index
 //! selectors (one per column/diagonal slot), the first/last-of-compression
