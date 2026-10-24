@@ -4378,6 +4378,7 @@ each carried item with its file:line):
 | L8 | `core-model.md`'s step numbers, `spaces-pallet.md`'s step numbers and M3b gates (open question 8 settled), `identity-and-authority.md`'s pin letter, `SECURITY.md`'s two, `recursion-air.md`'s slice reference; the `ABOUT` string and `core-model.md`'s draft heading carried | `8e25c98c`; carried |
 | L9 | `MAX_VERDICT_BYTES` counts the compact count's two bytes (`MAX_ITEMS` stays 17); `SECURITY.md` row 11's heights; the rest carried | `2ca7a2fc`, `8e25c98c`; carried |
 | Info | cross-venue overlap in pin D's known limits; the rest carried | `8e25c98c`; carried |
+| F1 (the Opus re-check of M1 and M2) | the Kreivo client forgets the roots it saw held when it reads the space not active, sees an `Equivocated` event for its anchor, or reads a window behind its last with no root, so `anchored()` no longer answers a disputed window from its cache; tested (`a_disputed_root_seen_held_is_not_anchored_after_resume`, which fails without the fix). F2 and F3 carried | this commit; `just check` green (1,403 passed in 109 suites) |
 
 `vos-core` (`98ad66d4`, with `bd3d975d`'s non-incremental guest builds)
 merged in before the gates.

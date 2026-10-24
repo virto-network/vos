@@ -2111,7 +2111,14 @@ fees are the teammate's.
     (`pvm/proof/statement/service/src/item.rs:93-95`), negligible; pin
     C's hedge degrades to a function of the witness if OS randomness
     fails, `getrandom`'s failure `ProveError::Entropy` with no fallback,
-    inherent and documented.
+    inherent and documented;
+  - **F2 (the M1/M2 re-check):** `KreivoVenue::behind()`
+    (`node/venue/src/kreivo/venue.rs`) reads the venue's storage
+    synchronously on the leader's batch thread, so the live transport must
+    bound how long a read takes;
+  - **F3 (the same):** on `resume` the JAM service keeps its evidence rows
+    (`0x04`) while the mock removes `Equivocations`; no rule reads them
+    after, so the venues judge alike.
 - **Docs:** `proving.md` draft 6, `core-model.md`, `identity-and-authority.md`,
   `research/slice-5/kreivo-pallet.md`'s superseded note, `clerk-across-spaces.md`, per
   `doc-fixes.md`; `slice-6-progress.md`, "Slice 6 accepted".

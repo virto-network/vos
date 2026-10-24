@@ -124,6 +124,8 @@ pub(super) struct Known {
     /// Its last anchored window (`Last[space][0]`).
     pub(super) last: Option<u64>,
     /// The roots the client saw anchored, by window: the newest [`HELD`].
+    /// Forgotten when the space is read not active, or an equivocation
+    /// is seen: the venue drops a disputed window's root for good.
     held: BTreeMap<u64, [u8; 32]>,
 }
 
@@ -177,6 +179,14 @@ impl State {
     pub(super) fn forget(&mut self, key: (SpaceId, u64)) {
         self.later.remove(&key);
         self.landed.remove(&key);
+    }
+
+    /// `space`'s root of `window` disputed by an equivocation: no longer
+    /// taken as anchored.
+    pub(super) fn disputed(&mut self, space: SpaceId, window: u64) {
+        if let Some(known) = self.spaces.get_mut(&space) {
+            known.held.remove(&window);
+        }
     }
 
     /// `anchor` seen anchored.
@@ -308,7 +318,10 @@ impl KreivoVenue {
                 self.queue.push_listed(anchor);
                 Err(AnchorRefusal::Equivocation)
             }
-            Ok(None) => settled(Err(AnchorRefusal::Window)),
+            Ok(None) => {
+                self.shared.state().disputed(space, window);
+                settled(Err(AnchorRefusal::Window))
+            }
             Err(_) => {
                 self.queue.push_listed(anchor);
                 Ok(Anchored::Queued)
@@ -456,6 +469,12 @@ impl Shared {
             known.read = true;
             known.info = info;
             known.keys = keys;
+            // A suspended or blocked space's roots are not anchored, and
+            // a disputed window's never again: what was seen held is
+            // read from the venue anew.
+            if info.is_none_or(|info| info.status != SpaceStatus::Active) {
+                known.held.clear();
+            }
             // A venue's last window never goes back: a read begun before
             // an anchor landed does not undo the anchor seen held.
             known.last = known.last.max(last);

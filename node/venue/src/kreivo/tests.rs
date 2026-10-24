@@ -345,6 +345,48 @@ fn a_queued_anchor_overtaken_goes_as_evidence() {
     wait_until("the queue empties", || venue.queued() == 0);
 }
 
+/// The node's anchor lands first and a stolen key equivocates: once the
+/// controller removes both keys and resumes the space, the disputed
+/// window is not anchored, though the client saw its root held.
+#[test]
+fn a_disputed_root_seen_held_is_not_anchored_after_resume() {
+    let setup = Setup::new(false);
+    let stolen = setup.stolen();
+    let venue = setup.venue();
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    wait_until("window 5 lands", || setup.anchored_window(5));
+    let read = RootRead {
+        kind: RootKind::Space,
+        space: setup.space,
+        window: 5,
+        root: [1; 32],
+    };
+    wait_until("the root seen held", || venue.anchored(&read));
+    let mut other = Anchor {
+        signer: stolen.verifying_key().to_bytes(),
+        ..setup.anchor(5, 9)
+    };
+    other.signature = stolen.sign(&other.digest(&VENUE)).to_bytes();
+    setup.call(ATTACKER, Call::anchor(&other));
+    wait_until("the suspension is read", || {
+        venue.status(&setup.space) == Status::Suspended
+    });
+    for who in [ATTACKER, NODE] {
+        let space = setup.space.0;
+        setup.call(CONTROLLER, Call::RemoveAuthority { space, who });
+    }
+    setup.call(
+        CONTROLLER,
+        Call::Resume {
+            space: setup.space.0,
+        },
+    );
+    wait_until("the resumption is read", || {
+        venue.status(&setup.space) == Status::Active
+    });
+    assert!(!venue.anchored(&read), "the disputed root");
+}
+
 /// An anchor for the venue's open window is not taken; once the venue's
 /// time passes the window's boundary, it is, and lands.
 #[test]

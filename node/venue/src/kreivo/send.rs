@@ -154,6 +154,7 @@ impl Shared {
                     return Fate::Done;
                 }
                 if equivocated {
+                    state.disputed(space, window);
                     state.alert(Alert::Equivocation { space, window });
                     return Fate::Done;
                 }
