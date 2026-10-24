@@ -1,11 +1,10 @@
 //! The kernels the run's statements are of, each by its blob and the
 //! program id recomputed from it, and the statement a record makes.
 
-use vos_node_prover::{FORMAT, Prover};
+use vos_node_prover::Prover;
 use vos_venue::vos_statement::{Pin, ProgramId, Statement};
 use vos_wire::ids::ProgramHash;
 use vos_wire::result::Attest;
-use vos_wire::vos_anchor::SpaceId;
 
 use crate::venues::Serial;
 
@@ -30,17 +29,7 @@ impl Kernel {
 
     /// The statement `attest` makes, as the worker makes it.
     pub fn statement(&self, attest: &Attest) -> Statement {
-        Statement {
-            format: FORMAT,
-            program: self.program,
-            space: attest
-                .roots
-                .first()
-                .map_or(SpaceId::NONE, |root| root.space),
-            public_args: attest.public_args.clone(),
-            output: attest.output.clone(),
-            roots: attest.roots.clone(),
-        }
+        vos_node_prover::statement(attest, self.program)
     }
 }
 

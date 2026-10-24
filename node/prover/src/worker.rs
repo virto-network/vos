@@ -154,6 +154,22 @@ pub struct Stepped {
     pub more: bool,
 }
 
+/// The statement `attest` makes, its kernel's program id `program`: of
+/// the space its first root names, or of none.
+pub fn statement(attest: &Attest, program: ProgramId) -> Statement {
+    Statement {
+        format: FORMAT,
+        program,
+        space: attest
+            .roots
+            .first()
+            .map_or(SpaceId::NONE, |root| root.space),
+        public_args: attest.public_args.clone(),
+        output: attest.output.clone(),
+        roots: attest.roots.clone(),
+    }
+}
+
 /// The prover worker of one node.
 pub struct Worker<H, J> {
     host: H,
@@ -373,17 +389,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 program
             }
         };
-        Ok(Some(Statement {
-            format: FORMAT,
-            program,
-            space: attest
-                .roots
-                .first()
-                .map_or(SpaceId::NONE, |root| root.space),
-            public_args: attest.public_args.clone(),
-            output: attest.output.clone(),
-            roots: attest.roots.clone(),
-        }))
+        Ok(Some(statement(attest, program)))
     }
 
     /// `jobs`, each queued job of an agent this node follows that its agent

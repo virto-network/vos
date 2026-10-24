@@ -55,4 +55,6 @@ pub mod program;
 
 pub use internals::{Internals, NodeProof};
 pub use job::{Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, State, deadline};
-pub use worker::{Backlog, FORMAT, Host, Jobs, Options, ProveError, Prover, Stepped, Worker};
+pub use worker::{
+    Backlog, FORMAT, Host, Jobs, Options, ProveError, Prover, Stepped, Worker, statement,
+};
