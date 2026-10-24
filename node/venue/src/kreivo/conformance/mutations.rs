@@ -17,7 +17,8 @@ use vos_statement::{Statement, code};
 
 use parity_scale_codec::Encode;
 
-use super::scenarios::{self, AUTHORITY_F, F};
+use super::submits::g7_chain;
+use super::world::{AUTHORITY_F, F};
 use super::{Fixtures, hex};
 use crate::kreivo::mock::types::{Call, Event, RuntimeCall};
 use crate::kreivo::mock::{Chain, Origin, Verdict};
@@ -293,7 +294,7 @@ pub fn lists(fx: &Fixtures) -> Lists {
     let proof = &fx.proof;
     let judge = Judge {
         input,
-        chain: scenarios::g7_chain(fx),
+        chain: g7_chain(fx),
     };
     assert_eq!(
         judge.code(&input.statement.encode(), proof),

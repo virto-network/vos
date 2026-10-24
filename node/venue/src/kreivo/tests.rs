@@ -17,7 +17,8 @@ use vos_anchor::{
 
 use super::calls::{self, Call, Error, Event, Failure, PALLET, SpaceInfo, SpaceStatus, keys};
 use super::conformance::Fixtures;
-use super::conformance::scenarios::{AUTHORITY_F, F, g7_chain};
+use super::conformance::submits::g7_chain;
+use super::conformance::world::{AUTHORITY_F, F};
 use super::mock::transport::{Fault, MockChain};
 use super::mock::{Account, Chain, Constants, Origin};
 use super::send::{Answer, answer, judged};
