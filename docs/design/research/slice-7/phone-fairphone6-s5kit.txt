@@ -1,0 +1,137 @@
+Fairphone 6
+SM7635
+Fairphone/FP6/FP6:16/FP6.QREL.16.111.0/WS1Q:user/release-keys
+Current Battery Service state:
+  AC powered: false
+  USB powered: true
+  Wireless powered: false
+  Dock powered: false
+  Max charging current: 900000
+ Time when the latest updated value of the Max charging current was sent via battery changed broadcast: +6d2h52m3s837ms
+  Max charging voltage: 5000000
+  Charge counter: 2157204
+  status: 2
+  health: 2
+  present: true
+  level: 51
+  scale: 100
+  voltage: 3978
+ Time when the latest updated value of the voltage was sent via battery changed broadcast: +6d2h52m57s967ms
+ The last voltage value sent via the battery changed broadcast: 3978
+  temperature: 320
+  technology: Li-ion
+  Charging state: 0
+  Charging policy: 0
+  Capacity level: -1
+/sys/devices/system/cpu/cpu0 1804800
+/sys/devices/system/cpu/cpu1 1804800
+/sys/devices/system/cpu/cpu2 1804800
+/sys/devices/system/cpu/cpu3 1804800
+/sys/devices/system/cpu/cpu4 2400000
+/sys/devices/system/cpu/cpu5 2400000
+/sys/devices/system/cpu/cpu6 2400000
+/sys/devices/system/cpu/cpu7 2496000
+== round 1
+{"kind":"device","arch":"aarch64","hardware":"","soc":"VOLCANO","cpus":8,"cpu_parts":["0xd80","0xd80","0xd80","0xd80","0xd81","0xd81","0xd81","0xd81"],"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"mem_total_kib":"7579252","battery_temp_decic":"","battery_capacity":"","battery_status":"","kernel":""}
+{"kind":"build","version":"s5-phone/1","channel":"blake2s","format":24,"reference_built":"0fb8b627d92ea5ced418c461cc95e85aa7bf7369a60b39eb651e003b7426730c","reference_floor":"d428b49dfafd4de8851416e48156c1e4708ccef3058ad1b20d335f8edc6cf6a9"}
+shape built: 4 threads, 5 reps
+  built rep 1/5: 6.596 s
+  built rep 2/5: 6.601 s
+  built rep 3/5: 6.210 s
+  built rep 4/5: 6.098 s
+  built rep 5/5: 6.492 s
+{"kind":"shape","shape":"built","statement":"auth","steps":12951,"threads":"4","config":"2:38:20","mask":"0x807cffff","chips":22,"reps":5,"prove_s_best":6.0985,"prove_s_median":6.4922,"prove_s_runs":[6.5958,6.6012,6.2100,6.0985,6.4922],"cpu_s_best":18.840,"peak_rss_mib":1988,"peak_rss_reset":true,"trace_s":0.009,"proof_bytes":1625467,"proof_sha256":"0fb8b627d92ea5ced418c461cc95e85aa7bf7369a60b39eb651e003b7426730c","verified":true,"verify_ms":71.7,"matches_x86":true}
+shape floor: 4 threads, 5 reps
+  floor rep 1/5: 3.032 s
+  floor rep 2/5: 2.857 s
+  floor rep 3/5: 2.761 s
+  floor rep 4/5: 2.827 s
+  floor rep 5/5: 2.903 s
+{"kind":"shape","shape":"floor","statement":"auth","steps":12951,"threads":"4","config":"2:38:20","mask":"0x807cff8b","chips":18,"reps":5,"prove_s_best":2.7611,"prove_s_median":2.8571,"prove_s_runs":[3.0325,2.8571,2.7611,2.8273,2.9032],"cpu_s_best":8.510,"peak_rss_mib":925,"peak_rss_reset":true,"trace_s":0.010,"proof_bytes":1021298,"proof_sha256":"d428b49dfafd4de8851416e48156c1e4708ccef3058ad1b20d335f8edc6cf6a9","verified":null,"verify_ms":0.0,"matches_x86":true}
+{"kind":"done","ok":true,"wall_s":54.3}
+  level: 51
+  temperature: 310
+  Capacity level: -1
+== round 2
+{"kind":"device","arch":"aarch64","hardware":"","soc":"VOLCANO","cpus":8,"cpu_parts":["0xd80","0xd80","0xd80","0xd80","0xd81","0xd81","0xd81","0xd81"],"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"mem_total_kib":"7579252","battery_temp_decic":"","battery_capacity":"","battery_status":"","kernel":""}
+{"kind":"build","version":"s5-phone/1","channel":"blake2s","format":24,"reference_built":"0fb8b627d92ea5ced418c461cc95e85aa7bf7369a60b39eb651e003b7426730c","reference_floor":"d428b49dfafd4de8851416e48156c1e4708ccef3058ad1b20d335f8edc6cf6a9"}
+shape built: 4 threads, 5 reps
+  built rep 1/5: 6.536 s
+  built rep 2/5: 6.351 s
+  built rep 3/5: 6.394 s
+  built rep 4/5: 6.481 s
+  built rep 5/5: 6.246 s
+{"kind":"shape","shape":"built","statement":"auth","steps":12951,"threads":"4","config":"2:38:20","mask":"0x807cffff","chips":22,"reps":5,"prove_s_best":6.2462,"prove_s_median":6.3940,"prove_s_runs":[6.5356,6.3513,6.3940,6.4812,6.2462],"cpu_s_best":19.860,"peak_rss_mib":1995,"peak_rss_reset":true,"trace_s":0.008,"proof_bytes":1625467,"proof_sha256":"0fb8b627d92ea5ced418c461cc95e85aa7bf7369a60b39eb651e003b7426730c","verified":true,"verify_ms":69.4,"matches_x86":true}
+shape floor: 4 threads, 5 reps
+  floor rep 1/5: 2.821 s
+  floor rep 2/5: 2.791 s
+  floor rep 3/5: 2.838 s
+  floor rep 4/5: 2.780 s
+  floor rep 5/5: 2.781 s
+{"kind":"shape","shape":"floor","statement":"auth","steps":12951,"threads":"4","config":"2:38:20","mask":"0x807cff8b","chips":18,"reps":5,"prove_s_best":2.7803,"prove_s_median":2.7908,"prove_s_runs":[2.8207,2.7908,2.8380,2.7803,2.7809],"cpu_s_best":8.510,"peak_rss_mib":928,"peak_rss_reset":true,"trace_s":0.010,"proof_bytes":1021298,"proof_sha256":"d428b49dfafd4de8851416e48156c1e4708ccef3058ad1b20d335f8edc6cf6a9","verified":null,"verify_ms":0.0,"matches_x86":true}
+{"kind":"done","ok":true,"wall_s":54.0}
+  level: 51
+  temperature: 310
+  Capacity level: -1
+== round 3
+{"kind":"device","arch":"aarch64","hardware":"","soc":"VOLCANO","cpus":8,"cpu_parts":["0xd80","0xd80","0xd80","0xd80","0xd81","0xd81","0xd81","0xd81"],"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"mem_total_kib":"7579252","battery_temp_decic":"","battery_capacity":"","battery_status":"","kernel":""}
+{"kind":"build","version":"s5-phone/1","channel":"blake2s","format":24,"reference_built":"0fb8b627d92ea5ced418c461cc95e85aa7bf7369a60b39eb651e003b7426730c","reference_floor":"d428b49dfafd4de8851416e48156c1e4708ccef3058ad1b20d335f8edc6cf6a9"}
+shape built: 4 threads, 5 reps
+  built rep 1/5: 6.133 s
+  built rep 2/5: 6.265 s
+  built rep 3/5: 6.224 s
+  built rep 4/5: 6.206 s
+  built rep 5/5: 6.540 s
+{"kind":"shape","shape":"built","statement":"auth","steps":12951,"threads":"4","config":"2:38:20","mask":"0x807cffff","chips":22,"reps":5,"prove_s_best":6.1334,"prove_s_median":6.2245,"prove_s_runs":[6.1334,6.2651,6.2245,6.2055,6.5403],"cpu_s_best":19.240,"peak_rss_mib":2014,"peak_rss_reset":true,"trace_s":0.010,"proof_bytes":1625467,"proof_sha256":"0fb8b627d92ea5ced418c461cc95e85aa7bf7369a60b39eb651e003b7426730c","verified":true,"verify_ms":32.1,"matches_x86":true}
+shape floor: 4 threads, 5 reps
+  floor rep 1/5: 2.993 s
+  floor rep 2/5: 2.988 s
+  floor rep 3/5: 3.003 s
+  floor rep 4/5: 2.923 s
+  floor rep 5/5: 3.060 s
+{"kind":"shape","shape":"floor","statement":"auth","steps":12951,"threads":"4","config":"2:38:20","mask":"0x807cff8b","chips":18,"reps":5,"prove_s_best":2.9228,"prove_s_median":2.9928,"prove_s_runs":[2.9928,2.9883,3.0030,2.9228,3.0604],"cpu_s_best":9.000,"peak_rss_mib":884,"peak_rss_reset":true,"trace_s":0.010,"proof_bytes":1021298,"proof_sha256":"d428b49dfafd4de8851416e48156c1e4708ccef3058ad1b20d335f8edc6cf6a9","verified":null,"verify_ms":0.0,"matches_x86":true}
+{"kind":"done","ok":true,"wall_s":54.4}
+  level: 51
+  temperature: 310
+  Capacity level: -1
+exit=0
+== pinned f0 t4
+{"kind":"device","arch":"aarch64","hardware":"","soc":"VOLCANO","cpus":4,"cpu_parts":["0xd80","0xd80","0xd80","0xd80","0xd81","0xd81","0xd81","0xd81"],"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"mem_total_kib":"7579252","battery_temp_decic":"","battery_capacity":"","battery_status":"","kernel":""}
+{"kind":"build","version":"s5-phone/1","channel":"blake2s","format":24,"reference_built":"0fb8b627d92ea5ced418c461cc95e85aa7bf7369a60b39eb651e003b7426730c","reference_floor":"d428b49dfafd4de8851416e48156c1e4708ccef3058ad1b20d335f8edc6cf6a9"}
+shape built: 4 threads, 5 reps
+  built rep 1/5: 6.437 s
+  built rep 2/5: 6.464 s
+  built rep 3/5: 6.370 s
+  built rep 4/5: 6.413 s
+  built rep 5/5: 6.312 s
+{"kind":"shape","shape":"built","statement":"auth","steps":12951,"threads":"4","config":"2:38:20","mask":"0x807cffff","chips":22,"reps":5,"prove_s_best":6.3118,"prove_s_median":6.4126,"prove_s_runs":[6.4368,6.4640,6.3697,6.4126,6.3118],"cpu_s_best":16.090,"peak_rss_mib":2044,"peak_rss_reset":true,"trace_s":0.010,"proof_bytes":1625467,"proof_sha256":"0fb8b627d92ea5ced418c461cc95e85aa7bf7369a60b39eb651e003b7426730c","verified":true,"verify_ms":31.2,"matches_x86":true}
+shape floor: 4 threads, 5 reps
+  floor rep 1/5: 2.677 s
+  floor rep 2/5: 2.554 s
+  floor rep 3/5: 2.476 s
+  floor rep 4/5: 2.683 s
+  floor rep 5/5: 2.587 s
+{"kind":"shape","shape":"floor","statement":"auth","steps":12951,"threads":"4","config":"2:38:20","mask":"0x807cff8b","chips":18,"reps":5,"prove_s_best":2.4764,"prove_s_median":2.5866,"prove_s_runs":[2.6768,2.5538,2.4764,2.6827,2.5866],"cpu_s_best":6.590,"peak_rss_mib":934,"peak_rss_reset":true,"trace_s":0.009,"proof_bytes":1021298,"proof_sha256":"d428b49dfafd4de8851416e48156c1e4708ccef3058ad1b20d335f8edc6cf6a9","verified":null,"verify_ms":0.0,"matches_x86":true}
+{"kind":"done","ok":true,"wall_s":52.6}
+== t8
+{"kind":"device","arch":"aarch64","hardware":"","soc":"VOLCANO","cpus":8,"cpu_parts":["0xd80","0xd80","0xd80","0xd80","0xd81","0xd81","0xd81","0xd81"],"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"mem_total_kib":"7579252","battery_temp_decic":"","battery_capacity":"","battery_status":"","kernel":""}
+{"kind":"build","version":"s5-phone/1","channel":"blake2s","format":24,"reference_built":"0fb8b627d92ea5ced418c461cc95e85aa7bf7369a60b39eb651e003b7426730c","reference_floor":"d428b49dfafd4de8851416e48156c1e4708ccef3058ad1b20d335f8edc6cf6a9"}
+shape built: 8 threads, 5 reps
+  built rep 1/5: 5.284 s
+  built rep 2/5: 5.276 s
+  built rep 3/5: 5.139 s
+  built rep 4/5: 5.052 s
+  built rep 5/5: 5.114 s
+{"kind":"shape","shape":"built","statement":"auth","steps":12951,"threads":"8","config":"2:38:20","mask":"0x807cffff","chips":22,"reps":5,"prove_s_best":5.0517,"prove_s_median":5.1386,"prove_s_runs":[5.2842,5.2760,5.1386,5.0517,5.1140],"cpu_s_best":26.500,"peak_rss_mib":2022,"peak_rss_reset":true,"trace_s":0.010,"proof_bytes":1625467,"proof_sha256":"0fb8b627d92ea5ced418c461cc95e85aa7bf7369a60b39eb651e003b7426730c","verified":true,"verify_ms":35.9,"matches_x86":true}
+shape floor: 8 threads, 5 reps
+  floor rep 1/5: 2.313 s
+  floor rep 2/5: 2.160 s
+  floor rep 3/5: 2.159 s
+  floor rep 4/5: 2.213 s
+  floor rep 5/5: 2.282 s
+{"kind":"shape","shape":"floor","statement":"auth","steps":12951,"threads":"8","config":"2:38:20","mask":"0x807cff8b","chips":18,"reps":5,"prove_s_best":2.1589,"prove_s_median":2.2134,"prove_s_runs":[2.3128,2.1598,2.1589,2.2134,2.2822],"cpu_s_best":11.050,"peak_rss_mib":1025,"peak_rss_reset":true,"trace_s":0.010,"proof_bytes":1021298,"proof_sha256":"d428b49dfafd4de8851416e48156c1e4708ccef3058ad1b20d335f8edc6cf6a9","verified":null,"verify_ms":0.0,"matches_x86":true}
+{"kind":"done","ok":true,"wall_s":45.0}
+  level: 51
+  temperature: 310
+  Capacity level: -1
+exit2=0
