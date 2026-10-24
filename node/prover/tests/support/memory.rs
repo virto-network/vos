@@ -1,5 +1,4 @@
-//! A job table in memory: a host's that keeps none across restarts, and
-//! the tests'.
+//! A job table in memory, kept across no restart of the test's process.
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -7,13 +6,12 @@ use std::sync::{Arc, Mutex};
 use vos_venue::vos_statement::StatementId;
 use vos_wire::ids::AgentId;
 
-use crate::job::Job;
-use crate::worker::Jobs;
+use vos_node_prover::{Job, Jobs};
 
 /// Jobs and watermarks in memory, shared by its clones: a clone outlives a
 /// worker dropped as a stopped node's, for the next to open.
 #[derive(Clone, Default)]
-pub struct MemoryJobs {
+pub(crate) struct MemoryJobs {
     held: Arc<Mutex<Held>>,
 }
 

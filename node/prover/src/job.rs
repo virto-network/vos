@@ -1,7 +1,7 @@
 //! A statement's job in the prover's table: where its record is, the
 //! statement, and how far it has come.
 
-use vos_venue::vos_statement::{Statement, StatementId};
+use vos_venue::vos_statement::Statement;
 use vos_wire::ids::AgentId;
 use vos_wire::result::Attest;
 use vos_wire::vos_anchor::{MAX_ROOT_AGE_MS, WindowClock};
@@ -119,11 +119,6 @@ impl Job {
     /// Its statement; `None` if its bytes do not decode.
     pub fn statement(&self) -> Option<Statement> {
         Statement::decode(&self.statement).ok()
-    }
-
-    /// Its statement's id; `None` if its bytes do not decode.
-    pub fn id(&self) -> Option<StatementId> {
-        self.statement().map(|statement| statement.id())
     }
 
     /// Moved to `state`, its record dropped once it finishes.

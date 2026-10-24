@@ -4,7 +4,7 @@
 //! proves and submits the statements of the agents it leads. Every replica
 //! running a prover reads its own log into jobs, through its applied
 //! index, and its log is compacted no further than that read (at most
-//! 64k entries behind), so a new leader holds every record already and a
+//! the node's `PROVER_HOLD` entries behind), so a new leader holds every record already and a
 //! failover proves again at most the statement in flight.
 //!
 //! **Its table** is node-local ([`Jobs`]): each statement's job by id,
@@ -28,9 +28,9 @@
 //! Once recorded and once the venue holds its roots anchored, it is
 //! submitted through the space's [`VenueClient`](vos_venue::VenueClient); a
 //! venue's repeat counts as accepted, and a submission whose answer was
-//! lost goes again after 30 s, the wait doubled each time. A prover that
-//! panics on a statement, or stops the node, gives it up after three
-//! attempts; a panic's message is withheld from standard error while a
+//! lost goes again after [`Options::retry`], the wait doubled each time. A
+//! prover that panics on a statement, or stops the node, gives it up after
+//! [`MAX_ATTEMPTS`] attempts; a panic's message is withheld from standard error while a
 //! proof is made, its place printed.
 //!
 //! **Idempotent by statement id:** a restart finds a job it was proving
@@ -45,7 +45,6 @@
 
 mod internals;
 mod job;
-mod memory;
 mod redact;
 mod worker;
 
@@ -56,5 +55,4 @@ pub mod program;
 
 pub use internals::{Internals, NodeProof};
 pub use job::{Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, State, deadline};
-pub use memory::MemoryJobs;
 pub use worker::{Backlog, FORMAT, Host, Jobs, Options, ProveError, Prover, Stepped, Worker};

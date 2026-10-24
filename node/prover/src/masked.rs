@@ -61,7 +61,7 @@ impl MaskedProver {
     }
 
     /// `kernel`'s program and entry, from its blob.
-    pub fn kernel(&self, kernel: &[u8]) -> Result<Program, ProveError> {
+    fn kernel(&self, kernel: &[u8]) -> Result<Program, ProveError> {
         let hash = ProgramHash::of(kernel);
         if let Some(program) = self.lock().get(&hash) {
             return Ok(Arc::clone(program));
@@ -124,16 +124,6 @@ impl MaskedProver {
             )));
         }
         Ok(trace)
-    }
-
-    /// [`Prover::prove`], and what its run's proofs took
-    /// ([`vos_pvm_recair::tree::prove_final`]).
-    pub fn prove_timed(
-        &self,
-        kernel: &[u8],
-        attest: &Attest,
-    ) -> Result<(Vec<u8>, Stats), ProveError> {
-        self.proved(kernel, attest, vos_pvm_recair::tree::prove_final)
     }
 
     /// [`Prover::prove`], and the internals it built the proof from, which
@@ -253,7 +243,8 @@ impl Prover for MaskedProver {
     }
 
     fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
-        self.prove_timed(kernel, attest).map(|(bytes, _)| bytes)
+        self.proved(kernel, attest, vos_pvm_recair::tree::prove_final)
+            .map(|(bytes, _)| bytes)
     }
 }
 
