@@ -7,6 +7,7 @@ mod alu;
 mod control;
 mod decode;
 mod memory;
+pub(crate) mod rv;
 
 use std::collections::{BTreeSet, HashMap};
 

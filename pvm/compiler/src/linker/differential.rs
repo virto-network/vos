@@ -11,6 +11,7 @@ use proptest::prelude::*;
 use vos_pvm::{ExitReason, refine};
 
 use super::{Link, LinkedElf, spi_blob, transpile_with};
+use crate::riscv::rv::{b_type, i_type, jal, r_type, s_type};
 
 const TEXT: u64 = 0x40_0000;
 /// The registers a program may read and write besides x0: t0..a5. ra holds
@@ -182,46 +183,6 @@ fn flatten(items: &[Item]) -> Vec<Inst> {
     flat
 }
 
-fn r_type(opcode: u32, f3: u32, f7: u32, rd: u32, rs1: u32, rs2: u32) -> u32 {
-    (f7 << 25) | (rs2 << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | opcode
-}
-
-fn i_type(opcode: u32, f3: u32, rd: u32, rs1: u32, imm: i32) -> u32 {
-    (((imm as u32) & 0xfff) << 20) | (rs1 << 15) | (f3 << 12) | (rd << 7) | opcode
-}
-
-fn s_type(f3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
-    let imm = imm as u32;
-    (((imm >> 5) & 0x7f) << 25)
-        | (rs2 << 20)
-        | (rs1 << 15)
-        | (f3 << 12)
-        | ((imm & 0x1f) << 7)
-        | 0x23
-}
-
-fn b_type(f3: u32, rs1: u32, rs2: u32, offset: i32) -> u32 {
-    let o = offset as u32;
-    (((o >> 12) & 1) << 31)
-        | (((o >> 5) & 0x3f) << 25)
-        | (rs2 << 20)
-        | (rs1 << 15)
-        | (f3 << 12)
-        | (((o >> 1) & 0xf) << 8)
-        | (((o >> 11) & 1) << 7)
-        | 0x63
-}
-
-fn j_type(rd: u32, offset: i32) -> u32 {
-    let o = offset as u32;
-    (((o >> 20) & 1) << 31)
-        | (((o >> 1) & 0x3ff) << 21)
-        | (((o >> 11) & 1) << 20)
-        | (((o >> 12) & 0xff) << 12)
-        | (rd << 7)
-        | 0x6f
-}
-
 fn encode(index: usize, inst: &Inst) -> u32 {
     let reg = u32::from;
     match *inst {
@@ -247,7 +208,7 @@ fn encode(index: usize, inst: &Inst) -> u32 {
         Inst::Branch { f3, rs1, rs2, to } => {
             b_type(f3, reg(rs1), reg(rs2), (to as i32 - index as i32) * 4)
         }
-        Inst::Jump { to } => j_type(0, (to as i32 - index as i32) * 4),
+        Inst::Jump { to } => jal(0, (to as i32 - index as i32) * 4),
     }
 }
 

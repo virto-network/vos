@@ -1,5 +1,6 @@
 use super::relocs::overlaps_data_relocation;
 use super::*;
+use crate::riscv::rv::{addi, auipc, jal, jalr, ld, lui, sd};
 use vos_pvm::{ExitReason, refine};
 
 #[test]
@@ -27,43 +28,8 @@ const A0: u32 = 10;
 const A1: u32 = 11;
 const A2: u32 = 12;
 
-fn lui(rd: u32, imm20: u32) -> u32 {
-    (imm20 << 12) | (rd << 7) | 0x37
-}
-
-fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
-    ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
-}
-
-fn auipc(rd: u32) -> u32 {
-    (rd << 7) | 0x17
-}
-
-fn jalr(rd: u32, rs1: u32) -> u32 {
-    (rs1 << 15) | (rd << 7) | 0x67
-}
-
-fn sd(rs2: u32, rs1: u32, imm: i32) -> u32 {
-    let imm = imm as u32 & 0xfff;
-    ((imm >> 5) << 25) | (rs2 << 20) | (rs1 << 15) | (3 << 12) | ((imm & 0x1f) << 7) | 0x23
-}
-
 fn assemble(insts: &[u32]) -> Vec<u8> {
     insts.iter().flat_map(|inst| inst.to_le_bytes()).collect()
-}
-
-fn ld(rd: u32, rs1: u32, imm: i32) -> u32 {
-    ((imm as u32 & 0xfff) << 20) | (rs1 << 15) | (3 << 12) | (rd << 7) | 0x03
-}
-
-fn jal(rd: u32, offset: i32) -> u32 {
-    let i = offset as u32;
-    (((i >> 20) & 1) << 31)
-        | (((i >> 1) & 0x3ff) << 21)
-        | (((i >> 11) & 1) << 20)
-        | (((i >> 12) & 0xff) << 12)
-        | (rd << 7)
-        | 0x6f
 }
 
 /// A linked ELF of `text` at `TEXT_VADDR`, whose code reaches twice as
@@ -138,7 +104,7 @@ fn relocated_call_flushes_pending_lui_before_transfer() {
     let text = assemble(&[
         addi(T2, RA, 0),  // preserve the host return address
         lui(A2, 2),       // buffered A2 = 8192
-        auipc(T0),        // R_RISCV_CALL_PLT relocation lives here
+        auipc(T0, 0),     // R_RISCV_CALL_PLT relocation lives here
         jalr(RA, T0),     // relocation override consumes this instruction
         addi(RA, T2, 0),  // restore the host return address
         addi(A0, SP, -8), // designate the callee's snapshot as output

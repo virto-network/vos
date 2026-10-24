@@ -61,6 +61,7 @@ use crate::linker::{
     Link, LinkedElf, STT_FUNC, Z_Z, direct_targets, in_ranges, merge_ranges, name_at, name_is,
     parse_linked_elf, range_at, raw_code_pointers, spi_blob, transpile_with, zone_round,
 };
+use crate::riscv::rv::{add, addi, auipc, b_type, jal, jalr, ld, lui, sub};
 use crate::riscv::{self, decode_b_imm, decode_j_imm, op};
 
 /// The derivation's version: it changes whenever the bytes it derives from
@@ -927,42 +928,11 @@ impl Prologue {
         const BEQ: u32 = 0;
         const BLTU: u32 = 6;
         const BGEU: u32 = 7;
-        let i_type = |opcode: u32, funct3: u32, rd: u32, rs1: u32, imm: i32| {
-            ((imm as u32) << 20) | (rs1 << 15) | (funct3 << 12) | (rd << 7) | opcode
-        };
-        let addi = |rd, rs1, imm| i_type(op::OP_IMM, 0, rd, rs1, imm);
-        let ld = |rd, rs1, imm| i_type(op::LOAD, 3, rd, rs1, imm);
-        let jalr = |rd, rs1| i_type(op::JALR, 0, rd, rs1, 0);
-        let r_type = |funct7: u32, rd: u32, rs1: u32, rs2: u32| {
-            (funct7 << 25) | (rs2 << 20) | (rs1 << 15) | (rd << 7) | op::OP
-        };
-        let add = |rd, rs1, rs2| r_type(0, rd, rs1, rs2);
-        let sub = |rd, rs1, rs2| r_type(0x20, rd, rs1, rs2);
-        let branch = |funct3: u32, rs1: u32, rs2: u32, offset: i32| {
-            let imm = offset as u32;
-            ((imm >> 12 & 1) << 31)
-                | ((imm >> 5 & 0x3f) << 25)
-                | (rs2 << 20)
-                | (rs1 << 15)
-                | (funct3 << 12)
-                | ((imm >> 1 & 0xf) << 8)
-                | ((imm >> 11 & 1) << 7)
-                | op::BRANCH
-        };
-        let jal = |rd: u32, offset: i32| {
-            let imm = offset as u32;
-            ((imm >> 20 & 1) << 31)
-                | ((imm >> 1 & 0x3ff) << 21)
-                | ((imm >> 11 & 1) << 20)
-                | ((imm >> 12 & 0xff) << 12)
-                | (rd << 7)
-                | op::JAL
-        };
         // `lui` and `addi`: a value below 2^31, its low twelve bits signed.
         let load = |rd: u32, value: u64| {
             let upper = ((value + 0x800) >> 12) as u32;
             let lower = (value as i32) - ((upper << 12) as i32);
-            [(upper << 12) | (rd << 7) | op::LUI, addi(rd, rd, lower)]
+            [lui(rd, upper), addi(rd, rd, lower)]
         };
         // The offset in bytes from instruction `from` to instruction `to`.
         let offset = |from: usize, to: usize| 4 * (to as i32 - from as i32);
@@ -984,7 +954,7 @@ impl Prologue {
         code.push(add(A0, S1, T1));
         code.push(sub(A1, T2, T1));
         if input.chunk().is_some() {
-            code.push(branch(BLTU, A1, A3, 8));
+            code.push(b_type(BLTU, A1, A3, 8));
             code.push(addi(A1, A3, 0));
         }
         code.push(addi(T0, 0, vos_pvm::precompile::WITNESS_INPUT as i32));
@@ -996,7 +966,7 @@ impl Prologue {
         code.push(add(T1, T1, A0));
         let back = code.len();
         code.push(jal(0, offset(back, next)));
-        code[ended] = branch(BEQ, A0, 0, offset(ended, code.len()));
+        code[ended] = b_type(BEQ, A0, 0, offset(ended, code.len()));
         // Room filled: too long, to the trap.
         let filled = code.len();
         code.push(0);
@@ -1005,7 +975,7 @@ impl Prologue {
         code.push(addi(SP, SP, -32)); // the io-hash's place
         code.push(addi(A2, SP, 0));
         let call_at = code.len();
-        code.push((RA << 7) | op::AUIPC); // auipc ra, 0: the call to the entry
+        code.push(auipc(RA, 0)); // the call to the entry
         code.push(jalr(RA, RA));
         let return_at = code.len();
         code.push(ld(A2, SP, 0)); // the io-hash, φ9 to φ12
@@ -1015,7 +985,7 @@ impl Prologue {
         code.push(addi(SP, SP, 32));
         code.push(addi(RA, S0, 0));
         code.push(jalr(0, RA)); // to the halt address
-        code[filled] = branch(BGEU, T1, T2, offset(filled, code.len()));
+        code[filled] = b_type(BGEU, T1, T2, offset(filled, code.len()));
         code.push(UNIMP);
         Self {
             code: code.into_iter().flat_map(u32::to_le_bytes).collect(),
