@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use vos_checker::carriers::{self, Logs, Tapped};
+use vos_checker::carriers::{self, Canary, Frames, Logs, Tapped};
 use vos_jam_dev::JamVenue;
 use vos_node::{Config, Hooks};
 use vos_node_prover::Prover;
@@ -48,21 +48,6 @@ const ACCEPTED_WITHIN: Duration = Duration::from_secs(1_200);
 /// What each capture path of the process is sent once, to show it
 /// captures: a log line from a node's thread, a line on standard error.
 pub const CANARY: &str = "e2e-chain-canary";
-
-/// Logs [`CANARY`] once, at TRACE, from the first node thread that commits.
-#[derive(Default)]
-struct Canary(AtomicBool);
-
-impl Hooks for Canary {
-    fn before_commit(&self) {
-        if !self.0.swap(true, Ordering::SeqCst) {
-            tracing::trace!(canary = CANARY, "a node's thread");
-        }
-    }
-}
-
-/// Every frame between the nodes, by its destination and class.
-pub type Frames = Arc<Mutex<BTreeMap<(NodeNumber, String), Vec<u8>>>>;
 
 /// Each node's Kreivo client, by number: itself, as recorded, and as
 /// tapped.
@@ -178,13 +163,9 @@ impl Run {
     fn start() -> Self {
         let testnet = Testnet::from_env();
         let mut record = Record::new(&testnet.run);
-        // Every debug output on, as an operator could set it: none prints
-        // in a build without `debug-internals`.
-        for name in carriers::DEBUG_ENVIRONMENT {
-            // SAFETY: before the run starts any thread that reads the
-            // environment.
-            unsafe { std::env::set_var(name, "1") };
-        }
+        // SAFETY: before the run starts any thread that reads the
+        // environment.
+        unsafe { carriers::debug_environment_on() };
         let stderr = carriers::Stderr::capture(&testnet.run);
         let logs = Logs::install();
         let prover = Arc::new(Serial::default());
@@ -215,7 +196,7 @@ impl Run {
         };
         let moved = Arc::new(AtomicBool::new(false));
         let kreivo_clients = KreivoClients::default();
-        let canary = Arc::new(Canary::default());
+        let canary = Arc::new(Canary::new(CANARY));
         let cluster = {
             let (kreivo, clients, jam, moved) = (
                 Arc::clone(&kreivo),
@@ -253,16 +234,7 @@ impl Run {
                 },
             )
         };
-        let frames = Frames::default();
-        let framed = Arc::clone(&frames);
-        cluster.hub.tap(Arc::new(move |_, to, class, frame| {
-            framed
-                .lock()
-                .unwrap()
-                .entry((to, format!("{class:?}")))
-                .or_default()
-                .extend_from_slice(frame);
-        }));
+        let frames = carriers::tap_frames(&cluster.hub);
         let space = cluster.space.id();
         let genesis = cluster.space.genesis().unwrap().clone();
         record.note(format!(

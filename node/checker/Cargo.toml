@@ -33,6 +33,8 @@ socket2 = "0.6"
 tempfile = "3"
 # The store's every row, which the carrier audit searches.
 vos-node = { path = "../host", features = ["dump"] }
+# The carrier audit's tap on the frames between the nodes.
+vos-net = { workspace = true }
 vos-testkit = { path = "../../agent/testkit" }
 vos-wire = { workspace = true }
 

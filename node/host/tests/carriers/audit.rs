@@ -1,13 +1,12 @@
 //! The audit's run and its carriers.
 
-use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vos_checker::carriers::{self, Audit, Kind, Logs, Reach};
+use vos_checker::carriers::{self, Audit, Canary, Kind, Logs, Reach};
 use vos_net::{Class, Network, Peer};
-use vos_node::{Config, Hooks, Node};
+use vos_node::{Config, Hooks};
 use vos_node_prover::Prover;
 use vos_node_prover::masked::Disclosing;
 use vos_venue::vos_statement::{Statement, StatementId};
@@ -20,7 +19,7 @@ use vos_wire::result::Outcome;
 use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
 
 use crate::common::{ALICE, Cluster, wait_until};
-use crate::cuts::{READER, ask_in, call, clock, reader, reader_agent, results};
+use crate::cuts::{READER, ask_in, call, clock, reader, reader_agent};
 use crate::representative::{Anchoring, attests, delay, ended, holds, replica};
 
 /// The model venue's anchors, a statement taken once by its id.
@@ -77,21 +76,6 @@ const REPLICAS: [NodeNumber; 3] = [1, 2, 3];
 /// submission through the venue's client.
 const CANARY: &str = "carrier-audit-canary";
 
-/// Logs [`CANARY`] once, at TRACE, from the first node thread that commits.
-#[derive(Default)]
-struct Canary(AtomicBool);
-
-impl Hooks for Canary {
-    fn before_commit(&self) {
-        if !self.0.swap(true, Ordering::SeqCst) {
-            tracing::trace!(canary = CANARY, "a node's thread");
-        }
-    }
-}
-
-/// Every frame between the nodes, by its destination and class.
-type Frames = Arc<Mutex<BTreeMap<(NodeNumber, String), Vec<u8>>>>;
-
 /// A value of a row the run writes: high in entropy, so a carrier holding
 /// it is found, and past 2^40.
 fn entry(key: u64, sequence: u64) -> u64 {
@@ -124,13 +108,8 @@ fn write_entries(cluster: &Cluster, agent: AgentId, sequences: std::ops::RangeIn
 
 #[test]
 fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
-    // Every debug output on, as an operator could set it: none prints in a
-    // build without `debug-internals`.
-    for name in carriers::DEBUG_ENVIRONMENT {
-        // SAFETY: before the run starts any thread that reads the
-        // environment.
-        unsafe { std::env::set_var(name, "1") };
-    }
+    // SAFETY: before the run starts any thread that reads the environment.
+    unsafe { carriers::debug_environment_on() };
     let stderr = carriers::Stderr::capture(std::path::Path::new(env!("CARGO_TARGET_TMPDIR")));
     let logs = Logs::install();
     let anchoring = Anchoring::new();
@@ -140,7 +119,7 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
     });
     let tapped = Arc::new(carriers::Tapped::new(venue.clone()));
     let prover = Arc::new(Disclosing::default());
-    let canary = Arc::new(Canary::default());
+    let canary = Arc::new(Canary::new(CANARY));
     let mut cluster = {
         let venue: Arc<dyn VenueClient> = tapped.clone();
         let prover: Arc<dyn Prover> = prover.clone();
@@ -155,15 +134,7 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
             },
         )
     };
-    let frames = Frames::default();
-    let framed = Arc::clone(&frames);
-    cluster.hub.tap(Arc::new(move |_, to, class, frame| {
-        let mut frames = framed.lock().unwrap();
-        frames
-            .entry((to, format!("{class:?}")))
-            .or_default()
-            .extend_from_slice(frame);
-    }));
+    let frames = carriers::tap_frames(&cluster.hub);
 
     // A read at window 0's cut, served, stated and proved.
     anchoring.register(&cluster);
@@ -261,39 +232,8 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
         );
     }
     for (number, node) in cluster.running() {
-        for agent in [representative, reader] {
-            audit.carrier(
-                format!("node {number}: agent {}'s log", agent.0),
-                reach(number),
-                log_entries(node, agent),
-            );
-            let results: Vec<u8> = results(node, agent, 0)
-                .iter()
-                .flat_map(|(_, result)| result.encode())
-                .collect();
-            audit.carrier(
-                format!("node {number}: agent {}'s work results", agent.0),
-                reach(number),
-                results,
-            );
-        }
-        let jobs: Vec<u8> = node
-            .store()
-            .prover_jobs()
-            .unwrap()
-            .into_iter()
-            .flat_map(|(_, id, job)| [id.to_vec(), job].concat())
-            .collect();
-        audit.carrier(
-            format!("node {number}: the prover's table"),
-            reach(number),
-            jobs,
-        );
-        audit.carrier(
-            format!("node {number}: the store's rows"),
-            reach(number),
-            carriers::store(node.store()),
-        );
+        let agents = [representative, reader];
+        carriers::node_carriers(&mut audit, number, node, &agents, reach(number));
     }
     // The disks once the nodes stop, every file closed.
     let numbers: Vec<NodeNumber> = cluster.running().map(|(number, _)| number).collect();
@@ -307,21 +247,10 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
         }
     }
     // The logs last, everything the run wrote in them.
-    std::thread::sleep(Duration::from_secs(1));
-    audit.carrier("the logs, every level", Reach::Leaves, logs.bytes());
-    audit.carrier("standard error", Reach::Leaves, stderr.finish());
+    carriers::finish_logs(&mut audit, &logs, stderr);
 
     eprintln!("{}", audit.summary());
-    audit.assert_searchable(&[
-        Kind::NodeProof,
-        Kind::ServedRow,
-        Kind::PrivateHash,
-        Kind::StepCount,
-        Kind::MemoryRoot,
-        Kind::Register,
-        Kind::WrapRandomness,
-        Kind::DebugOutput,
-    ]);
+    audit.assert_searchable(&Kind::ALL);
     for carrier in [
         "the logs",
         "standard error",
@@ -332,13 +261,4 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
         audit.assert_captured(carrier, CANARY.as_bytes());
     }
     audit.assert_clean();
-}
-
-/// Every entry `agent`'s log holds on `node`, its body as the log keeps it.
-fn log_entries(node: &Node, agent: AgentId) -> Vec<u8> {
-    let through = node.applied(agent).unwrap_or(0);
-    (1..=through)
-        .filter_map(|index| node.store().log_entry(agent, index).ok().flatten())
-        .flat_map(|entry| entry.body)
-        .collect()
 }

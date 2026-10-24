@@ -20,31 +20,18 @@
 use std::time::Duration;
 
 use vos_checker::carriers::{self, Audit, Kind, Reach};
-use vos_node::Node;
 use vos_statement_service::accumulate::BUCKET_MS;
 use vos_statement_service::item::Item;
-use vos_wire::Encode;
-use vos_wire::ids::AgentId;
 use vos_wire::package::SLOT_MS;
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::digest;
 use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
 
-use crate::cuts::results;
 use crate::run::{CANARY, Jam, Run, Stated};
 use crate::venues::hex;
 
 /// How long a sent package's work report is waited for once the run ends.
 const REPORTED: Duration = Duration::from_secs(90);
-
-/// Every entry `agent`'s log holds on `node`, its body as the log keeps it.
-fn log_entries(node: &Node, agent: AgentId) -> Vec<u8> {
-    let through = node.applied(agent).unwrap_or(0);
-    (1..=through)
-        .filter_map(|index| node.store().log_entry(agent, index).ok().flatten())
-        .flat_map(|entry| entry.body)
-        .collect()
-}
 
 /// What each node holds and sent, and both venues' anchor chains,
 /// collected before the nodes stop and the chain's clock moves; then the
@@ -65,27 +52,7 @@ pub fn nodes(run: &mut Run) -> Audit {
         agents.reader,
     ];
     for (number, node) in run.cluster.running() {
-        for agent in all {
-            let name = format!("node {number}: agent {}'s log", agent.0);
-            audit.carrier(name, Reach::Role, log_entries(node, agent));
-            let results: Vec<u8> = results(node, agent, 0)
-                .iter()
-                .flat_map(|(_, result)| result.encode())
-                .collect();
-            let name = format!("node {number}: agent {}'s work results", agent.0);
-            audit.carrier(name, Reach::Role, results);
-        }
-        let jobs: Vec<u8> = node
-            .store()
-            .prover_jobs()
-            .unwrap()
-            .into_iter()
-            .flat_map(|(_, id, job)| [id.to_vec(), job].concat())
-            .collect();
-        let name = format!("node {number}: the prover's table");
-        audit.carrier(name, Reach::Role, jobs);
-        let name = format!("node {number}: the store's rows");
-        audit.carrier(name, Reach::Role, carriers::store(node.store()));
+        carriers::node_carriers(&mut audit, number, node, &all, Reach::Role);
     }
     for number in 1..=3 {
         run.cluster.stop(number);
@@ -213,10 +180,8 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
     std::thread::spawn(|| eprintln!("{CANARY}: a thread of the process"))
         .join()
         .unwrap();
-    std::thread::sleep(Duration::from_secs(1));
-    audit.carrier("the logs, every level", Reach::Leaves, run.logs.bytes());
     let stderr = run.stderr.take().expect("standard error captured");
-    audit.carrier("standard error", Reach::Leaves, stderr.finish());
+    carriers::finish_logs(audit, &run.logs, stderr);
 
     let summary = audit.summary();
     let kinds: Vec<&str> = summary
@@ -253,16 +218,7 @@ pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
     let named = format!("0x{}", &hex(&digest(report))[..16]);
     audit.assert_captured("the testnet's log", named.as_bytes());
 
-    audit.assert_searchable(&[
-        Kind::NodeProof,
-        Kind::ServedRow,
-        Kind::PrivateHash,
-        Kind::StepCount,
-        Kind::MemoryRoot,
-        Kind::Register,
-        Kind::WrapRandomness,
-        Kind::DebugOutput,
-    ]);
+    audit.assert_searchable(&Kind::ALL);
     audit.assert_clean();
     run.record
         .note("the audit clean, every capture path shown; every verdict as expected");

@@ -2590,6 +2590,7 @@ dependencies = [
  "tempfile",
  "tracing",
  "tracing-subscriber",
+ "vos-net",
  "vos-node",
  "vos-node-prover",
  "vos-statement-service",

@@ -28,7 +28,8 @@ pub mod needles;
 
 pub use audit::{Audit, Carrier, Finding};
 pub use capture::{
-    DEBUG_ENVIRONMENT, Logs, Stderr, Tapped, anchor_carriers, directory, store, submission_carriers,
+    Canary, DEBUG_ENVIRONMENT, Frames, Logs, Stderr, Tapped, anchor_carriers, debug_environment_on,
+    directory, finish_logs, node_carriers, store, submission_carriers, tap_frames,
 };
 pub use needles::{DEBUG_OUTPUTS, DISTINCT, Needle, Needles, SHORTEST};
 
@@ -62,6 +63,18 @@ pub enum Kind {
 }
 
 impl Kind {
+    /// Every kind, each a run's audit must hold needles of.
+    pub const ALL: [Kind; 8] = [
+        Self::NodeProof,
+        Self::ServedRow,
+        Self::PrivateHash,
+        Self::StepCount,
+        Self::MemoryRoot,
+        Self::Register,
+        Self::WrapRandomness,
+        Self::DebugOutput,
+    ];
+
     /// Whether no carrier at all may hold it, the role's own included.
     fn nowhere(self) -> bool {
         matches!(

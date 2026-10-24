@@ -1,15 +1,27 @@
 //! What takes a run's carriers: a venue's client ([`Tapped`]) and each
 //! venue's layout of what it is sent, the process's logs ([`Logs`]) and
-//! standard error ([`Stderr`]), a node's files ([`directory`]) and its
-//! store's rows ([`store`]).
+//! standard error ([`Stderr`]), the frames between the nodes
+//! ([`tap_frames`]), a node's files ([`directory`]), its store's rows
+//! ([`store`]) and what else it holds ([`node_carriers`]); and the run's
+//! [`Canary`] in its nodes' threads.
 
+use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
+use vos_net::memory::Hub;
+use vos_node::store::EntryKind;
+use vos_node::{Hooks, Node};
 use vos_statement_service::item::Item;
 use vos_venue::kreivo;
 use vos_venue::vos_statement::{Statement, StatementId};
 use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, VenueClient};
+use vos_wire::ids::AgentId;
+use vos_wire::peer::NodeNumber;
+use vos_wire::result::WorkResult;
 use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
+use vos_wire::{Decode, Encode};
 
 use super::{Audit, Reach, lock};
 
@@ -195,6 +207,21 @@ pub const DEBUG_ENVIRONMENT: [&str; 4] = [
     "ZKPVM_PROFILE",
 ];
 
+/// Turns every debug output on, as an operator could: none prints in a
+/// build without `debug-internals`.
+///
+/// # Safety
+///
+/// It sets the process's environment: no other thread may read or write
+/// it meanwhile, so it is called before the run starts any.
+pub unsafe fn debug_environment_on() {
+    for name in DEBUG_ENVIRONMENT {
+        // SAFETY: no other thread reads the environment, as the caller
+        // ensures.
+        unsafe { std::env::set_var(name, "1") };
+    }
+}
+
 /// The process's standard error, written to a file from [`Stderr::capture`]
 /// until [`Stderr::finish`]: what a debug output prints there. The test
 /// harness keeps its own capture of a test's prints unless run with
@@ -279,4 +306,117 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Logs {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+/// The logs and standard error, taken last, once the run has written
+/// everything it will in them.
+pub fn finish_logs(audit: &mut Audit, logs: &Logs, stderr: Stderr) {
+    std::thread::sleep(Duration::from_secs(1));
+    audit.carrier("the logs, every level", Reach::Leaves, logs.bytes());
+    audit.carrier("standard error", Reach::Leaves, stderr.finish());
+}
+
+/// Logs its canary once, at TRACE, from the first node thread that
+/// commits.
+pub struct Canary {
+    canary: &'static str,
+    logged: AtomicBool,
+}
+
+impl Canary {
+    pub fn new(canary: &'static str) -> Self {
+        Self {
+            canary,
+            logged: AtomicBool::new(false),
+        }
+    }
+}
+
+impl Hooks for Canary {
+    fn before_commit(&self) {
+        if !self.logged.swap(true, Ordering::SeqCst) {
+            tracing::trace!(canary = self.canary, "a node's thread");
+        }
+    }
+}
+
+/// Every frame between the nodes, by its destination and class.
+pub type Frames = Arc<Mutex<BTreeMap<(NodeNumber, String), Vec<u8>>>>;
+
+/// Every frame sent through `hub` from now on, kept by its destination and
+/// class.
+pub fn tap_frames(hub: &Hub) -> Frames {
+    let frames = Frames::default();
+    let framed = Arc::clone(&frames);
+    hub.tap(Arc::new(move |_, to, class, frame| {
+        framed
+            .lock()
+            .unwrap()
+            .entry((to, format!("{class:?}")))
+            .or_default()
+            .extend_from_slice(frame);
+    }));
+    frames
+}
+
+/// What node `number` holds, each a carrier that `reach`es: each of
+/// `agents`' log entries and work results, the prover's table, and the
+/// store's rows.
+pub fn node_carriers(
+    audit: &mut Audit,
+    number: NodeNumber,
+    node: &Node,
+    agents: &[AgentId],
+    reach: Reach,
+) {
+    for &agent in agents {
+        audit.carrier(
+            format!("node {number}: agent {}'s log", agent.0),
+            reach,
+            log_entries(node, agent),
+        );
+        audit.carrier(
+            format!("node {number}: agent {}'s work results", agent.0),
+            reach,
+            work_results(node, agent),
+        );
+    }
+    let jobs: Vec<u8> = node
+        .store()
+        .prover_jobs()
+        .unwrap()
+        .into_iter()
+        .flat_map(|(_, id, job)| [id.to_vec(), job].concat())
+        .collect();
+    audit.carrier(format!("node {number}: the prover's table"), reach, jobs);
+    audit.carrier(
+        format!("node {number}: the store's rows"),
+        reach,
+        store(node.store()),
+    );
+}
+
+/// Every entry `agent`'s log holds on `node`, its body as the log keeps it.
+fn log_entries(node: &Node, agent: AgentId) -> Vec<u8> {
+    let through = node.applied(agent).unwrap_or(0);
+    (1..=through)
+        .filter_map(|index| node.store().log_entry(agent, index).ok().flatten())
+        .flat_map(|entry| entry.body)
+        .collect()
+}
+
+/// The work results of `agent`'s log on `node`, through its applied index
+/// in the store, each encoded.
+fn work_results(node: &Node, agent: AgentId) -> Vec<u8> {
+    let through = node.store().snapshot().applied(agent).unwrap().unwrap_or(0);
+    (1..=through)
+        .filter_map(|index| {
+            let entry = node.store().log_entry(agent, index).unwrap()?;
+            if entry.kind != EntryKind::Result {
+                return None;
+            }
+            Some(WorkResult::decode(&entry.body).ok()?.0)
+        })
+        .flat_map(|result| result.encode())
+        .collect()
 }
