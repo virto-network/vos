@@ -1,7 +1,7 @@
 //! The guests' allocator (`src/bin/guest/heap.rs`), on the host over a
 //! small arena: blocks aligned, the last block reclaimed, in LIFO order, a
-//! block at the top grown and a block shrunk in place, the peak kept, and
-//! no block past the arena.
+//! block at the top grown or shrunk in place, one below it moved above it,
+//! the peak kept, and no block past the arena.
 
 use std::alloc::{GlobalAlloc, Layout};
 
@@ -65,17 +65,18 @@ fn a_block_at_the_top_grows_in_place() {
 }
 
 #[test]
-fn a_block_below_the_top_shrinks_in_place_and_grows_by_a_copy() {
+fn a_block_below_the_top_moves_above_it_to_shrink_or_grow() {
     let heap = Box::new(Heap::<N>::new());
     unsafe {
         let block = heap.alloc(layout(64, 8));
         block.write_bytes(9, 64);
         let above = heap.alloc(layout(8, 8));
         let shrunk = heap.realloc(block, layout(64, 8), 16);
-        assert_eq!(shrunk, block, "kept where it is");
-        assert_eq!(heap.state().top, 72);
+        assert!(shrunk > above, "copied above the top");
+        assert_eq!(*shrunk.add(15), 9);
+        assert_eq!(heap.state().top, 72 + 16);
         let grown = heap.realloc(shrunk, layout(16, 8), 128);
-        assert!(grown > above, "copied above the top");
+        assert_eq!(grown, shrunk, "now the last block, grown in place");
         assert_eq!(*grown.add(15), 9);
         assert_eq!(heap.state().top, 72 + 128);
     }
