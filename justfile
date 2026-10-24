@@ -80,7 +80,7 @@ test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --test kernel wrap_files:: -- --test-threads=1
     just test-carriers
 
-# The carrier audit (`slice-6-on-chain.md` 6.20, `vos_checker::carriers`):
+# The carrier audit (`proving.md` §5's R7, `vos_checker::carriers`):
 # three nodes proving a read's statement with the masked prover, every
 # debug output's environment set, and every carrier of the run searched for
 # the proof's internals, the served rows and their hashes; alone in its
@@ -108,7 +108,7 @@ judge-wasm:
 # The proof fixtures under `pvm/proof/fixtures` (`proving.md` A.6), written
 # anew by their generator, `pvm/proof/tests/kernel/fixtures.rs`: at a format bump,
 # or a change of the AIR or a kernel's shape. `test-proof` refuses fixtures
-# the generator no longer makes.
+# the generator does not make.
 fixtures:
     with-env { VOS_FIXTURES: "write" } { cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators }
 
@@ -128,7 +128,7 @@ repro-aarch64: build-test-actors
 # (`node/venue/conformance`, `spaces-pallet.md` §10), written anew by the
 # reference mock (`node/venue/src/kreivo`) over the golden fixtures: after a
 # change of the design, the mock or the fixtures. `check` refuses vectors
-# the mock no longer writes.
+# the mock does not write.
 conformance:
     with-env { VOS_CONFORMANCE: "write" } { cargo test -p vos-venue kreivo::conformance::the_vectors_are_the_generators }
 
@@ -206,16 +206,15 @@ jam-statements-testnet:
     cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
     bash tools/jam-dev/testnet.sh statements
 
-# The end to end on chain (`slice-6-on-chain.md` 6.21), on a local PolkaJam
-# testnet it starts and stops (`testnet.sh chain`): three nodes of a space
-# proving with the masked prover anchor and submit at the Kreivo mock, then
-# migrate to the JAM statements service, deployed twice; the rootless
-# statements' venue binding, and their replays once the testnet's clock is
-# moved past `MaxRootAge`; every carrier of the run audited; the latency,
-# gas, fees and the prover's throughput measured, written to the run's
-# `record.txt`. Outside `ci`, as `jam-testnet` is: it needs the PolkaJam
-# binaries and a C compiler. About 25 minutes, one masked proof at a time
-# (about 6 GiB): run it under a 12 GiB limit, e.g.
+# The end to end on chain, on a local PolkaJam testnet it starts and stops
+# (`testnet.sh chain`): three nodes of a space proving with the masked prover
+# anchor and submit at the Kreivo mock, then migrate to the JAM statements
+# service, deployed twice; the rootless statements' venue binding, and their
+# replays once the testnet's clock is moved past `MaxRootAge`; every carrier
+# of the run audited; the latency, gas, fees and the prover's throughput
+# measured, written to the run's `record.txt`. Outside `ci`, as `jam-testnet`
+# is: it needs the PolkaJam binaries and a C compiler. About 25 minutes, one
+# masked proof at a time (about 6 GiB): run it under a 12 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just e2e-chain`.
 e2e-chain: build-test-actors build-agent build-representative
     cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
