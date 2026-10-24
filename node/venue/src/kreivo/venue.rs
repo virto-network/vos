@@ -909,12 +909,11 @@ impl VenueClient for KreivoVenue {
 
     fn status(&self, space: &SpaceId) -> Status {
         let mut state = self.shared.state();
-        match state.watch(*space).info.as_ref().map(|info| info.status) {
-            None => Status::Unregistered,
-            Some(SpaceStatus::Active) => Status::Active,
-            Some(SpaceStatus::Suspended) => Status::Suspended,
-            Some(SpaceStatus::Blocked) => Status::Blocked,
-        }
+        state
+            .watch(*space)
+            .info
+            .as_ref()
+            .map_or(Status::Unregistered, |info| info.status.into())
     }
 
     /// `Timestamp.Now` as the reader thread last read it.

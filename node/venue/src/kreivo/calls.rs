@@ -26,7 +26,6 @@ pub const MAX_PROOF_LEN: usize = 262_144;
 /// `Paused`'s bits.
 pub const PAUSED_SUBMIT: u8 = 1;
 pub const PAUSED_ANCHOR: u8 = 2;
-pub const PAUSED_REGISTER: u8 = 4;
 
 /// When a format or a program is accepted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -211,6 +210,16 @@ pub enum SpaceStatus {
     Suspended = 1,
     /// Governance blocked it.
     Blocked = 2,
+}
+
+impl From<SpaceStatus> for crate::Status {
+    fn from(status: SpaceStatus) -> Self {
+        match status {
+            SpaceStatus::Active => Self::Active,
+            SpaceStatus::Suspended => Self::Suspended,
+            SpaceStatus::Blocked => Self::Blocked,
+        }
+    }
 }
 
 /// `Spaces[space]`.

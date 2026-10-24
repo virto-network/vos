@@ -168,7 +168,7 @@ pub struct Sender {
     calling: std::sync::Mutex<()>,
     /// The first wait after a lost connection, doubled up to 32 times it.
     backoff: Duration,
-    stopping: Arc<AtomicBool>,
+    stopping: AtomicBool,
 }
 
 impl Sender {
@@ -177,7 +177,7 @@ impl Sender {
             transport,
             calling: std::sync::Mutex::new(()),
             backoff,
-            stopping: Arc::new(AtomicBool::new(false)),
+            stopping: AtomicBool::new(false),
         }
     }
 
@@ -190,7 +190,7 @@ impl Sender {
         self.stopping.store(true, Ordering::SeqCst);
     }
 
-    pub fn stopped(&self) -> bool {
+    fn stopped(&self) -> bool {
         self.stopping.load(Ordering::SeqCst)
     }
 

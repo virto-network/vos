@@ -123,7 +123,7 @@ impl AnchorQueue {
 
     /// [`AnchorQueue::spawn`], asking whether each window handed back is
     /// still needed every `recheck`.
-    pub fn spawn_rechecking(name: &str, sender: impl AnchorSend, recheck: Duration) -> Self {
+    pub(crate) fn spawn_rechecking(name: &str, sender: impl AnchorSend, recheck: Duration) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::default(),
             wake: Condvar::new(),
@@ -280,9 +280,10 @@ fn run(shared: &Shared, sender: &impl AnchorSend, every: Duration) {
             Ok(due) => due,
             Err(earliest) => {
                 let due = earliest.map_or(Duration::from_secs(3_600), |at| at - now);
-                let wait = match state.unsettled.is_empty() {
-                    true => due,
-                    false => due.min(every.saturating_sub(rechecked.elapsed())),
+                let wait = if state.unsettled.is_empty() {
+                    due
+                } else {
+                    due.min(every.saturating_sub(rechecked.elapsed()))
                 };
                 state = shared
                     .wake
