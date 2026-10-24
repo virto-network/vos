@@ -1889,8 +1889,9 @@ fees are the teammate's.
   close (`slice-6-progress.md`, "6.22, the close"):
   - **M5(c):** the statements service's storage, read over RPC at the
     finalized block, is a carrier that leaves in the chain e2e; the
-    venue's layout constants and the space's clock are dropped from the
-    needles by value (`Needles::except`);
+    venue's layout constants and the space's clock are public in that
+    carrier alone (`Audit::carrier_except`, 6.22c), and still needles in
+    every other;
   - **M5(d):** a `Built::Wrap` observation makes the masked wrap's
     randomness needles (each attempt's entropy and seed, the witness
     digest, the blinding values, the seeds of the mask, salt and `R`
@@ -1941,6 +1942,41 @@ fees are the teammate's.
   offsets (`4L − 5` circle rows, `6F − 2` FRI rows, OODS's `+ 13`, the
   shape's `+ 2`), named once each is traced to its piece of recair's
   verifier.
+- **Carried from the code-quality review** (`research/slice-6/quality-review.md`;
+  folded at 6.22c, `slice-6-progress.md`, "6.22, the reviews folded"):
+  - **The slice-7 re-pin batch**, one commit with one re-pin of the agent
+    image, the kernels, `final-verify.elf`, `final-verify-test.elf`, the
+    final verifier's Wasm blobs and the statement-service blob: item 4's
+    guest half
+    (`WindowClock::root_expiry`, `seen_expiry_of`), items 17–25 (the
+    verdict, prefix, mode and `Op` tags as `#[repr(u8)]` enums first; the
+    codecs, the outcome codes, the guests' shared runtime, the long guest
+    functions, vos-anchor's codec pieces), 64–66, 67 (`AgentRoot.kind`,
+    `AgentPath`, `EntryTag`, `Attesting`'s `From`), 68, 69, item 16's
+    unmasked half (it moves the test-formats blobs), item 26's
+    `SpaceGenesis::version` (the encoding is byte-identical, but dropping
+    the field moves every blob that links vos-anchor), item 27 (the
+    `ANCHORS` golden-vector mode out of the production `final-verify`),
+    item 28 (**a strictness fix**: the service's `natural` and
+    `Operand::decode_input` accept non-canonical naturals that
+    `vos_pvm_program::read_nat` refuses; share `read_nat` and
+    `vos_wire::jam::Operand`), item 3's `TryFrom<u32>` for `AnchorCode`,
+    and item 33's `FetchKind` enum.
+  - **Owner's calls left carried:** item 34's `Mutation` split (it re-maps
+    the replay corpus), item 58 (`State::Refused(u32)` as an enum changes
+    the node's SCALE rows), item 54's `String` errors, item 46
+    (`vos_jam::Error::Node` is how jam-dev's `Live` reports through the
+    public `Chain` trait, which the builder takes as `&mut dyn Chain`;
+    removing it needs a chain error threaded through the builder), item
+    1's generated `ABOUT` strings (the committed conformance JSON).
+  - **Larger or performance:** 13 (the witness digest from
+    `statement_header_words`; it changes seeded bytes), 14's
+    `masked_gates.rs` split, 30's `derive.rs` split, 31 (`prove_on`, the
+    prover's hot path), 35 (the kit script, part of the kit's hash), 50's
+    `store/open.rs` split, 53 (one snapshot per idle wake), 70 (a
+    `vos_testkit::served` module), 74's `forward_venue!` macro, 77 (long
+    test functions, `stays(..)` for the fixed sleeps, the two Kreivo test
+    mocks' registration), 29's control-test split.
 - **Docs:** `proving.md` draft 6, `core-model.md`, `identity-and-authority.md`,
   `kreivo-pallet.md`'s superseded note, `clerk-across-spaces.md`, per
   `doc-fixes.md`; `slice-6-progress.md`, "Slice 6 accepted".

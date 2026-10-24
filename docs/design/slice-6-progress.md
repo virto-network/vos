@@ -4160,3 +4160,87 @@ rest, clean; the testnet's errors none); `just test-carriers` green (451
 `WrapRandomness` needles, clean, 122.7 s). After the allocator's revert
 and `heap-peak`, at `4b4ad712`, `just check` green again, 1,398 passed in
 109 suites.
+
+## 6.22, the reviews folded
+
+The slice's code-quality review (`research/slice-6/quality-review.md`, 80
+items, `2ca22340`) and the Opus review of 6.22b, folded on `s6/close` from
+`24bf0b5e`, each item or tight group its own behaviour-preserving commit,
+in the review's order: comments, the gates alone, dead code, tests, moves,
+de-duplication, long functions. No program id, proof byte, fixture,
+conformance vector or guest blob moved: every guest blob (`final-verify`,
+`final-verify-test`, `statement-service`, the agent, the representative,
+the 24 test actors, both Wasm blobs) hashed the same as at `24bf0b5e`
+after each guest-crate commit and at the end; `just fixtures` left
+`pvm/proof/fixtures` unchanged after items 9 and 30, and the kernel
+program-id tests (`constants::`, `program_identity::`, the lib's
+`program_id`) passed after 9, 30 and 62; `just conformance` left the
+vectors unchanged after 38, 39, 40 and 42.
+
+**Item 59 found no divergence:** with the committed writes compared, the
+node and the model agree on every reads and representative step.
+
+| Item | What | Commit |
+|---|---|---|
+| 1 | no step numbers, pin letters, spike labels, slice-doc paths or people in code comments; specs cited instead; `SPIKE_*` → `BUDGET_*`; the guest crates' comments refilled within their own lines (no blob moved) | `25d50653`, `b9816e11`, `3ec81049`, `7156b71a`, `d7075548`; the generated `ABOUT` strings carried |
+| 2 | the format rename's leftovers refilled, formats named by their constants in prose | `e5db102b`, `c72bcaac` |
+| 3 | refusal and verdict codes by name; `UNJUDGED_FROM`, `proof_refused`; one `by_words`; jam-dev's `anchor_code` | `e95ebceb`; `AnchorCode`'s `TryFrom` carried (service) |
+| 4 | `vos_venue::{signed, fresh, aged}` on the host | `96f01a33`; guest half carried |
+| 5 | hex by the `hex` crate | `20e09a0f`; the lock helper carried |
+| 6 | `prove_once` split, the rng and transcript order kept (seeded proofs' hashes compared before and after), `MaskStats` built in the attempt loop | `6a25314e` |
+| 7, 8 | recair's dead code and test-only `pub` items | `4dec052a`, `dfe89009` |
+| 9 | `lifting_log_size`, `extend_preprocessed` | `eb617248` |
+| 10, 11 | `lane_census`, `P2Wiring::absorbed`; recair's idioms | `b643dcc0`, `f88326aa` |
+| 12 | recair's unmasked wrap prover, Postcard arm and `postcard` behind recair's `test-formats`, forwarding to the final verifier's; `check-no-test-formats` covers it | `95809774` |
+| 13 | | carried |
+| 14 | recair tests' harness shared, `mod heavy` its own file | `a6065f55`; `prove_set` kept (not `prove_masked_on`'s equal: its blind hook, unchecked mode, no wiring check); the `masked_gates.rs` split carried |
+| 15 | the Wasm runner's `Runner` | `a3b813a4` |
+| 16 | `masked::check_shape` private | `05b841bc`; the unmasked half carried: it moves the test-formats blobs |
+| 17–25 | | carried (re-pin batch) |
+| 26 | `accumulate::kind` deleted, the service blob unmoved | `2b7f651e`; `SpaceGenesis::version` carried: byte-identical encoding, but dropping the field moves every blob linking vos-anchor |
+| 27, 28 | | carried (re-pin batch; 28 a strictness fix) |
+| 29 | the service tests' `Rig` in `tests/service/rig.rs` | `6414fa74`; the control test's split carried |
+| 30 | `riscv::rv` encoders | `fe8ef0d7`; the file split carried |
+| 31 | | carried |
+| 32, 33 | `Permission` discriminants, blake2b columns doc; `fetch_kind` names | `603485b9`, `d8b5387d` |
+| 34 | `reshape_nested`, `Golden::verify` a `Result` | `065eaa89`; the `Mutation` split carried |
+| 35 | | carried |
+| 36, 38, 39 | Kreivo's send path, the mock's split, the conformance split | `7b3b313d`, `a3ecc1ef`, `0aa62e91` |
+| 37 | `ModelVenue` behind `model`, the Kreivo client behind `kreivo`, the mock `kreivo-mock`: none in `vos` (decision 17); `check-no-venue-clients`; vos-venue linted without features | `0c8d191e` |
+| 40, 41, 42 | the venue's duplication; its dead code; `SpaceStatus` in `SpaceStatusSet`, client and mock | `d873394f`, `f3532d81`, `66c6ec81` |
+| 43, 44, 45 | jam-dev's `drive` split; `live::statements::deploy`; jam-dev's small items | `05ad3032`, `8183eb60`, `89c8b68f` |
+| 46 | | carried: `Error::Node` is how jam-dev's `Live` reports through `Chain`, which the builder takes as `&mut dyn Chain` |
+| 47, 48, 49 | the leader's `Anchoring`; roots' `decoded`, `value_row`, `root_of`, `cut_roots`; the leader's error plumbing | `55247d0c`, `ac877c16`, `09c16188` |
+| 50 | the misplaced doc; `keys::prover_job` and `prover_job_of` | `efb05e6c`, `3435ce3a`; `store/open.rs` carried |
+| 51, 52 | the host's visibility and idioms; `roots/build.rs` | `809446a9`, `60540a73` |
+| 53 | | carried |
+| 54 | `Fjall::dump` behind vos-node's `dump`, which only the checker enables; `check-no-store-dump` | `de202bb3`; the `String` errors carried |
+| 55, 56, 57 | `RERUN_GAS` once; `submit`'s seams; the prover's test-only code in `tests/support` | `7fc46004`, `4fadd38b`, `185f6b6e` |
+| 58 | | carried |
+| 59 | one `agrees`, the reads harness checking committed writes | `5fa99170` |
+| 60, 61, 62, 63 | the reads tests split; the testkit's `operation` split; `#[messages]` from `kind` (the ELFs unmoved); the testkit's API and the reader | `eac1ac08`, `c1994bc8`, `7c8dfe35`, `6983197d` |
+| 64–70 | | carried (64–69 the re-pin batch) |
+| 71–76 | the state prefixes and cut scan once in `vos_checker`; the carrier audits' shared setup; the test-free cluster support; `Judging`; the cluster helpers; `vos_node_prover::statement` and the kernel tests' fixtures | `08a450d9`, `a54db85d`, `7e721e23`, `6f770184`, `79ea38a7`, `a97e1499`, `c4cf0a26`; the `forward_venue!` macro carried |
+| 77 | | carried |
+| 78 | the `check-no-*` gates from one table, each build resolved once (the 45 pairs before and after the same); `check-no-leaks`; a gate whose `cargo tree` fails now fails (it passed before) | `8e1a6685`, `27e831f0` |
+| 79, 80 | the justfile's variables and `build-statement-service`; `test-reads` names its tests exactly | `3570e38e`, `d31493fd` |
+| M-1 | the public numbers excepted in the JAM storage carrier alone (`Audit::carrier_except`), still needles in every other | `1df7f12e` |
+| M-2 | `proving.md`: the chain transport VOS's port of master's substrate extension, after the slices; the pallet the teammate's | `1a38a967` |
+| L-1 | a layout refusal shown readably, saying that moving a layout-1 store aside discards the node secret and its registered anchor keys | `0982d60b` |
+| L-2 | the redacting hook's doc: a later `set_hook` replaces it and ends the redaction (it prints no backtrace) | `2b323d6f` |
+| L-3 | `ProveError::Failed(&'static str)`, its reason logged; `Kernel`'s shape never | `971bfedd` |
+| L-4 | `check-no-heap-peak`; `vos-statement --features heap-peak --test heap` in `check` | `a8d12968` |
+| L-5 | `read_past` checks the log's start directly (`Host::log_start`): `attests() == None` also held for a large result whose blob is missing | `18d4069f` |
+| L-6 | the mask columns' commitments are not needles, on purpose: they are public, and their seeds are needles (`Kind::WrapRandomness`) | this record |
+
+The carried items are listed in the plan's carried list, the slice-7
+re-pin batch first.
+
+**Gates** [measured]: at `18d4069f`, `just check` green (1,398 passed in
+103 suites), `just test-carriers` green (451 `WrapRandomness` needles,
+clean, 129.7 s), `just e2e-chain` green (1,398.1 s; the audit 332
+carriers, 22 JAM packages and their reports, clean; the testnet's errors
+one "authoring is lagging behind the best block slot" on node1, a load
+warning). After item 50's key helper (`3435ce3a`), `just check` green
+again (1,398 passed in 103 suites) and `just test-carriers` green (451
+`WrapRandomness` needles, clean, 146.0 s).
