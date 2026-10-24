@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use vos_testkit::programs::{actor, method};
-use vos_testkit::{Step as KitStep, Testkit, decode};
+use vos_testkit::{Testkit, decode};
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Op, cap, price};
 use vos_wire::batch::{Admin, Answer, Await, Body, Input, Message};
@@ -17,7 +17,7 @@ use vos_wire::records::{Workflow, WorkflowState, stored};
 use vos_wire::result::{InputRef, Outcome, Outgoing, Run, Step, WorkResult, split_output};
 use vos_wire::{Encode, defaults};
 
-use crate::common::{ALICE, Actors, COUNTER, LEDGER, Node, SHOP, Sessions, ran};
+use crate::common::{ALICE, Actors, COUNTER, LEDGER, Node, SHOP, Sessions, agrees, ran};
 
 mod budget;
 mod hosts;
@@ -360,18 +360,6 @@ impl Flows {
         }
         self.kit.version = self.node.version;
     }
-}
-
-/// A step of the node's and the model's agree, field by field.
-fn agrees(index: usize, run: &Run, expected: &KitStep) {
-    assert_eq!(run.outcome, expected.outcome, "step {index}'s outcome");
-    assert_eq!(run.writes, expected.writes, "step {index}'s writes");
-    assert_eq!(run.committed, expected.committed, "step {index}'s commits");
-    assert_eq!(run.messages, expected.messages, "step {index}'s messages");
-    assert_eq!(run.attests, expected.attests, "step {index}'s attests");
-    assert_eq!(run.pages, expected.pages, "step {index}'s pages");
-    assert_eq!(run.instances, expected.instances, "step {index}'s gas");
-    assert_eq!(run.gas_used, expected.gas_used, "step {index}'s gas");
 }
 
 /// The run of the step a workflow's due step made.

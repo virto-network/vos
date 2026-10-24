@@ -12,7 +12,7 @@ use vos_pvm::refine_host::{JamItem, JamRefine, Preimages, ProgramSource, RefineC
 use vos_pvm::{ExitReason, PvmBackend};
 use vos_testkit::node::serve;
 use vos_testkit::programs::{actor, agent, bare, derivation, derived, kernel, method, package};
-use vos_testkit::{Testkit, decode};
+use vos_testkit::{Step as KitStep, Testkit, decode};
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Refusal, cap};
 use vos_wire::batch::{Admin, Batch, Input, Query, Request, Work};
@@ -655,6 +655,18 @@ pub fn counter_only(mut node: Node) -> (Actors, Node) {
     let result = node.batch(0, vec![install(COUNTER, program)]);
     ran(&result.steps[0]);
     (actors, node)
+}
+
+/// A step of the node's and the model's agree, field by field.
+pub fn agrees(index: usize, run: &Run, expected: &KitStep) {
+    assert_eq!(run.outcome, expected.outcome, "step {index}'s outcome");
+    assert_eq!(run.writes, expected.writes, "step {index}'s writes");
+    assert_eq!(run.committed, expected.committed, "step {index}'s commits");
+    assert_eq!(run.messages, expected.messages, "step {index}'s messages");
+    assert_eq!(run.attests, expected.attests, "step {index}'s attests");
+    assert_eq!(run.pages, expected.pages, "step {index}'s pages");
+    assert_eq!(run.instances, expected.instances, "step {index}'s gas");
+    assert_eq!(run.gas_used, expected.gas_used, "step {index}'s gas");
 }
 
 pub fn ran(step: &Step) -> &Run {

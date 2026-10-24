@@ -28,7 +28,7 @@ use vos_wire::served::{Served, representative_row, space_root};
 use vos_wire::vos_anchor::{MIN_LENGTH_MS, RootKind, RootRead, VenueId};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults};
 
-use crate::common::{AGENT, ALICE, Node, ran};
+use crate::common::{AGENT, ALICE, Node, agrees, ran};
 
 const READER: InstanceId = InstanceId(5);
 const SPACE: SpaceId = SpaceId([0x5a; 32]);
@@ -203,14 +203,7 @@ impl Reads {
                     continue;
                 }
             };
-            let run = ran(step);
-            assert_eq!(run.outcome, expected.outcome, "step {index}'s outcome");
-            assert_eq!(run.writes, expected.writes, "step {index}'s writes");
-            assert_eq!(run.messages, expected.messages, "step {index}'s messages");
-            assert_eq!(run.attests, expected.attests, "step {index}'s attests");
-            assert_eq!(run.pages, expected.pages, "step {index}'s pages");
-            assert_eq!(run.gas_used, expected.gas_used, "step {index}'s gas");
-            assert_eq!(run.instances, expected.instances, "step {index}'s gas");
+            agrees(index, ran(step), &expected);
         }
         self.sync_cuts();
         result

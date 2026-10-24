@@ -30,7 +30,7 @@ fn at(window: u64) -> u64 {
     CLOCK.boundary(window).unwrap() - 1
 }
 
-use crate::common::{AGENT, Node, ran};
+use crate::common::{AGENT, Node, agrees, ran};
 
 const SPACE: SpaceId = SpaceId([0x5a; 32]);
 
@@ -124,16 +124,14 @@ fn a_report_is_stored_as_a_read_proves_it() {
     ];
     let result = node.batch(at(5), inputs.clone());
     kit.batch(at(5), [0; 32]);
-    for (step, input) in result.steps.iter().zip(&inputs) {
+    for (index, (step, input)) in result.steps.iter().zip(&inputs).enumerate() {
         let Input::Message(message) = input else {
             unreachable!()
         };
         let expected = kit.message(message.from, &message.body);
         let run = ran(step);
         assert_eq!(run.outcome, vos_wire::result::Outcome::Done(Vec::new()));
-        assert_eq!(run.outcome, expected.outcome);
-        assert_eq!(run.writes, expected.writes);
-        assert_eq!(run.committed, expected.committed);
+        agrees(index, run, &expected);
     }
     let value = |node: &Node, key: &[u8]| {
         let stored = node.get(key)?;
