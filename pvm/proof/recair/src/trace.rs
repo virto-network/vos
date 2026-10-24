@@ -333,10 +333,10 @@ impl MainTrace {
             let mut generator = LogupTraceGenerator::new(log_size);
             for pair in (0..n_fractions).step_by(2) {
                 let mut stored = vec![(SecureField::zero(), SecureField::one()); rows.len()];
-                for row in 0..rows.len() {
+                for (row, &position) in positions.iter().enumerate() {
                     let (n0, d0) =
                         fraction(row, pair).unwrap_or((SecureField::zero(), SecureField::one()));
-                    stored[positions[row]] = match fraction(row, pair + 1) {
+                    stored[position] = match fraction(row, pair + 1) {
                         Some((n1, d1)) => (n0 * d1 + n1 * d0, d0 * d1),
                         None => (n0, d0),
                     };

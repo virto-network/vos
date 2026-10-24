@@ -7,6 +7,8 @@
 //! other constant is a wire the `Context` fixes. A constraint's value is a
 //! row, an input or a constant, never taken in.
 
+use std::collections::BTreeMap;
+
 use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
@@ -104,7 +106,11 @@ pub(crate) fn lower(
     alpha: &dyn Fn(usize) -> Operand,
 ) -> Lowered {
     let n = dag.nodes.len();
-    let (reached, uses, is_root) = reach(dag, roots);
+    let Reach {
+        reached,
+        uses,
+        is_root,
+    } = reach(dag, roots);
     let mut rows = Vec::new();
     let power_row = power_rows(dag, &reached, alpha, &mut rows);
     let power_rows = rows.len();
@@ -186,9 +192,17 @@ pub(crate) fn lower(
     }
 }
 
+/// What [`reach`] finds of some roots, by node.
+struct Reach {
+    reached: Vec<bool>,
+    /// The uses by the reached nodes and the roots.
+    uses: Vec<usize>,
+    is_root: Vec<bool>,
+}
+
 /// The nodes reaching `roots`, each node's uses by the reached nodes and
 /// the roots, and whether it is a root.
-fn reach(dag: &Dag, roots: &[Node]) -> (Vec<bool>, Vec<usize>, Vec<bool>) {
+fn reach(dag: &Dag, roots: &[Node]) -> Reach {
     let n = dag.nodes.len();
     let mut reached = vec![false; n];
     let mut stack = roots.to_vec();
@@ -208,7 +222,11 @@ fn reach(dag: &Dag, roots: &[Node]) -> (Vec<bool>, Vec<usize>, Vec<bool>) {
             uses[operand] += 1;
         }
     }
-    (reached, uses, is_root)
+    Reach {
+        reached,
+        uses,
+        is_root,
+    }
 }
 
 /// A relation's powers: `α^i = α^(i−1)·α`, one row each pushed to `rows`,
@@ -218,7 +236,7 @@ fn power_rows(
     reached: &[bool],
     alpha: &dyn Fn(usize) -> Operand,
     rows: &mut Vec<Row>,
-) -> std::collections::BTreeMap<(usize, usize), Operand> {
+) -> BTreeMap<(usize, usize), Operand> {
     let mut powers: Vec<(usize, usize)> = (0..dag.nodes.len())
         .filter(|&node| reached[node])
         .filter_map(|node| match dag.nodes[node] {
@@ -227,17 +245,9 @@ fn power_rows(
         })
         .collect();
     powers.sort();
-    let mut power_row = std::collections::BTreeMap::new();
-    for relation in powers.iter().map(|&(relation, _)| relation) {
-        if power_row.contains_key(&(relation, 2)) {
-            continue;
-        }
-        let highest = powers
-            .iter()
-            .filter(|&&(r, _)| r == relation)
-            .map(|&(_, power)| power)
-            .max()
-            .unwrap();
+    let mut power_row = BTreeMap::new();
+    for relation_powers in powers.chunk_by(|a, b| a.0 == b.0) {
+        let (relation, highest) = relation_powers[relation_powers.len() - 1];
         let mut previous = alpha(relation);
         for power in 2..=highest {
             rows.push(

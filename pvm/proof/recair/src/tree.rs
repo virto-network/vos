@@ -135,7 +135,7 @@ impl Built<'_> {
             Self::Segment(segment) => postcard::to_allocvec(&segment.proof),
             Self::Leaf(node) | Self::Fold(node) => postcard::to_allocvec(&node.proof),
         }
-        .unwrap_or_default()
+        .expect("a proof encodes")
     }
 }
 
