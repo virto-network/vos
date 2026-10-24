@@ -82,8 +82,8 @@ pub const TREES: usize = 4;
 /// The masked wrap's format number (`vos_pvm_proof::format::MASKED_WRAP`).
 pub const FORMAT: u32 = 39;
 
-/// `format::MASKED_WRAP`'s PCS configuration: blowup 32, 24 queries, PoW 26, FRI fold
-/// step 3, a 2^6 last layer, affine DEEP batching.
+/// `format::MASKED_WRAP`'s PCS configuration: blowup 32, 24 queries, PoW
+/// 26, FRI fold step 3, a 2^6 last layer, affine DEEP batching.
 pub const CONFIG: PcsConfig = PcsConfig {
     pow_bits: 26,
     fri_config: FriConfig {
@@ -99,39 +99,39 @@ pub const CONFIG: PcsConfig = PcsConfig {
 /// `format::MASKED_WRAP`'s interaction PoW.
 pub const INTERACTION_POW_BITS: u32 = 8;
 
-/// `format::MASKED_WRAP`'s trees beside the AIR's columns: 8 salt columns a salted tree,
-/// an `R` of 8 columns.
+/// `format::MASKED_WRAP`'s trees beside the AIR's columns: 8 salt columns a
+/// salted tree, an `R` of 8 columns.
 pub const PINS: MaskPins = MaskPins {
     salt_columns: 8,
     fri_mask_columns: 8,
 };
 
-/// `format::MASKED_WRAP`'s `log2 h`: the prover's randomizer, 256 coefficients a column.
-/// The verifier reads no mask; pinned with the format, for its registry
-/// entry.
+/// `format::MASKED_WRAP`'s `log2 h`: the prover's randomizer, 256
+/// coefficients a column. The verifier reads no mask; pinned with the
+/// format, for its registry entry.
 pub const LOG_MASK_ROWS: u32 = 8;
 
-/// The values `format::MASKED_WRAP`'s DEEP quotient batches: `(57 + 373 + 40 + 4 + 8) +
-/// 2·(16 + 3·4)`, a twice-sampled column batching a third, its periodicity
-/// value (`MASKED_WRAP_REFERENCE.sampled_values`).
+/// The values `format::MASKED_WRAP`'s DEEP quotient batches:
+/// `(57 + 373 + 40 + 4 + 8) + 2·(16 + 3·4)`, a twice-sampled column batching
+/// a third, its periodicity value (`MASKED_WRAP_REFERENCE.sampled_values`).
 pub const DEEP_VALUES: usize = 538;
 
-/// FRI's degree bound under `format::MASKED_WRAP`: the composition's, committed whole
-/// at `m + 2` for the wrap's tallest component of `2^15` rows.
+/// FRI's degree bound under `format::MASKED_WRAP`: the composition's,
+/// committed whole at `m + 2` for the wrap's tallest component of `2^15` rows.
 pub const LOG_DEGREE_BOUND: u32 = 17;
 
-/// FRI's folding rounds at `format::MASKED_WRAP`'s degree bound, 2^[`LOG_DEGREE_BOUND`],
-/// to its 2^6 last layer: the first with the circle fold in it
-/// ([`fri_rounds`]).
+/// FRI's folding rounds at `format::MASKED_WRAP`'s degree bound,
+/// 2^[`LOG_DEGREE_BOUND`], to its 2^6 last layer: the first with the circle
+/// fold in it ([`fri_rounds`]).
 pub const FRI_ROUNDS: [u32; 4] = [3, 3, 3, 2];
 
-/// `format::MASKED_WRAP`'s samples of column `column` of tree `tree`, as its sample
-/// points lay them out: every preprocessed column once; in the main tree
-/// the 16 `p2` columns its last round also reads at the previous row (every
-/// other one from 269) twice, the rest once, the 8 salts never; in the
-/// interaction tree each component's running sum (4 columns) twice, the
-/// rest once, the salts never; in the composition tree its 4 coordinates
-/// and `R`'s 8 once, the salts never. The decode reads exactly these;
+/// `format::MASKED_WRAP`'s samples of column `column` of tree `tree`, as its
+/// sample points lay them out: every preprocessed column once; in the main
+/// tree the 16 `p2` columns its last round also reads at the previous row
+/// (every other one from 269) twice, the rest once, the 8 salts never; in
+/// the interaction tree each component's running sum (4 columns) twice, the
+/// rest once, the salts never; in the composition tree its 4 coordinates and
+/// `R`'s 8 once, the salts never. The decode reads exactly these;
 /// [`check_shape`] holds every proof to the sample points themselves.
 pub const fn samples(tree: usize, column: usize) -> usize {
     match (tree, column) {
@@ -467,36 +467,36 @@ pub fn verify_masked<MC: MerkleChannel, C: MaskedComponents>(
         .map_err(Error::Stark)
 }
 
-/// The `format::MASKED_WRAP` proof in `bytes`: at most [`crate::MAX_PROOF_BYTES`], its
-/// fixed layout read whole, its header `format::MASKED_WRAP`'s, every count its pin or
-/// within its bound, nothing after it.
+/// The `format::MASKED_WRAP` proof in `bytes`: at most
+/// [`crate::MAX_PROOF_BYTES`], its fixed layout read whole, its header the
+/// format's, every count its pin or within its bound, nothing after it.
 pub fn decode(bytes: &[u8]) -> Result<WrapProof, Error> {
     crate::layout::decode(bytes)
 }
 
-/// `proof`'s fixed layout: what the prover emits for `format::MASKED_WRAP`, and the one
-/// encoding [`decode`] reads; `None` for a proof the layout cannot hold (a
-/// column of other samples than [`samples`], a tree whose queried columns
-/// differ in length), which no verifier would accept.
+/// `proof`'s fixed layout: what the prover emits for `format::MASKED_WRAP`,
+/// and the one encoding [`decode`] reads; `None` for a proof the layout
+/// cannot hold (a column of other samples than [`samples`], a tree whose
+/// queried columns differ in length), which no verifier would accept.
 pub fn encode(proof: &WrapProof) -> Option<Vec<u8>> {
     crate::layout::encode(proof)
 }
 
-/// Verifies the `format::MASKED_WRAP` proof in `bytes` ([`decode`]) against the public
-/// `words`.
+/// Verifies the `format::MASKED_WRAP` proof in `bytes` ([`decode`]) against
+/// the public `words`.
 pub fn verify_bytes(bytes: &[u8], words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
     verify(decode(bytes)?, words)
 }
 
-/// Verifies a `format::MASKED_WRAP` proof of the wrap circuit against the public
-/// `words`, and returns the statement they make: the program id and the
-/// io-hash.
+/// Verifies a `format::MASKED_WRAP` proof of the wrap circuit against the
+/// public `words`, and returns the statement they make: the program id and
+/// the io-hash.
 pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
     verify_with(&MASKED_WRAP, &PREPROCESSED_ROOT_39, proof, words)
 }
 
 /// [`verify`] under `format`'s pins and the circuit `preprocessed_root`: a
-/// verifier pinning other salts, `R` or widths refuses `format::MASKED_WRAP`'s proofs.
+/// verifier pinning other salts, `R` or widths refuses `MASKED_WRAP`'s proofs.
 pub fn verify_with(
     format: &MaskedFormat<'_>,
     preprocessed_root: &[u8; 32],
@@ -539,10 +539,10 @@ mod tests {
 
     use stwo::core::channel::Blake2bChannel;
 
-    /// The wrap's set at `format::MASKED_WRAP`'s pins: the trees' widths 57 / 381 / 48 /
-    /// 20 and 538 DEEP values, as pinned; the composition tree the last and
-    /// at FRI's degree bound, the tallest; every column's samples
-    /// [`samples`]'.
+    /// The wrap's set at `format::MASKED_WRAP`'s pins: the trees' widths
+    /// 57, 381, 48 and 20 and 538 DEEP values, as pinned; the composition
+    /// tree the last and at FRI's degree bound, the tallest; every column's
+    /// samples [`samples`]'.
     #[test]
     fn the_pinned_shape_is_the_wrap_components() {
         let layout = WrapComponents::build(

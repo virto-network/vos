@@ -295,9 +295,9 @@ mod tests {
     const NOW: u64 = 43 * 600_000;
 
     /// A venue that pins the statement's program, venue-bound, accepts
-    /// `format::MASKED_WRAP`, registers its space from window 40 and anchors its roots,
-    /// at window 42's boundary; and the statement, its `public_args` the
-    /// venue's id and a nonce.
+    /// `format::MASKED_WRAP`, registers its space from window 40 and anchors
+    /// its roots, at window 42's boundary; and the statement, its `public_args`
+    /// the venue's id and a nonce.
     fn input() -> Input {
         let mut statement = crate::tests::statement();
         statement.public_args = [&VENUE.0[..], b"nonce 7"].concat();

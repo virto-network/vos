@@ -604,7 +604,7 @@ mod tests {
 
     use stwo::core::circle::SECURE_FIELD_CIRCLE_GEN;
 
-    /// `format::WRAP`'s and 39's log sizes.
+    /// `format::WRAP`'s and `format::MASKED_WRAP`'s log sizes.
     const LOG_SIZES: LogSizes = [14, 15, 11];
 
     /// Pin A's: 8 salt columns a tree and an `R` of 8.

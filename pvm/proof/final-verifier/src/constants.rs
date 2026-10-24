@@ -13,17 +13,17 @@ pub const PREPROCESSED_ROOT: [u8; 32] = [
     79, 80, 233, 170, 53, 248, 208, 10, 0, 176, 135,
 ];
 
-/// `format::MASKED_WRAP`'s: its columns one level up (`n + 1`), under blowup 32. Their
-/// evaluations are `format::WRAP`'s at `n + 6`, so the root is `format::WRAP`'s;
-/// pinned on its own, and its equality a test.
+/// `format::MASKED_WRAP`'s: its columns one level up (`n + 1`), under
+/// blowup 32. Their evaluations are `format::WRAP`'s at `n + 6`, so the
+/// root is `format::WRAP`'s; pinned on its own, and its equality a test.
 pub const PREPROCESSED_ROOT_39: [u8; 32] = [
     242, 222, 64, 119, 8, 117, 210, 231, 91, 134, 186, 46, 66, 17, 191, 228, 202, 180, 196, 8, 255,
     79, 80, 233, 170, 53, 248, 208, 10, 0, 176, 135,
 ];
 
-/// `format::MASKED_WRAP`'s trees' widths: preprocessed 57; main 381 (373 and 8 salts);
-/// interaction 48 (40 and 8 salts); composition 20 (its 4 coordinates,
-/// `R`'s 8 and 8 salts).
+/// `format::MASKED_WRAP`'s trees' widths: preprocessed 57; main 381 (373
+/// and 8 salts); interaction 48 (40 and 8 salts); composition 20 (its 4
+/// coordinates, `R`'s 8 and 8 salts).
 pub const TREE_WIDTHS: [usize; 4] = [57, 381, 48, 20];
 
 /// The longest wrap proof a decode reads, in bytes: a bound on a venue's

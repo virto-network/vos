@@ -1,5 +1,5 @@
-//! `format::WRAP`, the unmasked wrap: the tests' and the fixtures' format, linked
-//! only under the `test-formats` feature; no production venue accepts it.
+//! `format::WRAP`, the unmasked wrap: the tests' and the fixtures' format,
+//! linked only under `test-formats`; no production venue accepts it.
 //!
 //! The recursion AIR's three components at the wrap circuit's log sizes,
 //! proved on the Blake2b-256 channel and Merkle trees with blowup 64, 20
@@ -83,8 +83,8 @@ pub fn verify_bytes(bytes: &[u8], words: &[u32; PUBLIC_WORDS]) -> Result<Stateme
     verify(decode(bytes)?, words)
 }
 
-/// Verifies a `format::WRAP` `proof` against the public `words`, and returns the
-/// statement they make: the program id and the io-hash.
+/// Verifies a `format::WRAP` `proof` against the public `words`, and
+/// returns the statement they make: the program id and the io-hash.
 pub fn verify(proof: WrapProof, words: &[u32; PUBLIC_WORDS]) -> Result<Statement, Error> {
     let statement = Statement::from_words(words)?;
     check_header(&proof)?;

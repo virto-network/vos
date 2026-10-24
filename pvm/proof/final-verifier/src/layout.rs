@@ -1,5 +1,5 @@
-//! `format::MASKED_WRAP`'s bytes: a fixed layout (`vos_pvm_proof::format::ProofBytes::
-//! FixedLayout`).
+//! `format::MASKED_WRAP`'s bytes: a fixed layout
+//! (`vos_pvm_proof::format::ProofBytes::FixedLayout`).
 //!
 //! The fields in a fixed order, every integer little-endian at its width,
 //! no varints; a vector whose length the proof chooses a `u32` count, then
@@ -72,8 +72,8 @@ const INNER_LAYERS: usize = FRI_ROUNDS.len() - 1;
 /// The last layer's coefficients.
 const LAST_LAYER: usize = 1 << CONFIG.fri_config.log_last_layer_degree_bound;
 
-/// The header after the format: the log sizes, then the configuration in
-/// the layout's order, no lifting log size. `format::MASKED_WRAP`'s, word for word.
+/// The header after the format: the log sizes, then the configuration in the
+/// layout's order, no lifting log size. `format::MASKED_WRAP`'s, word for word.
 const HEADER: [u32; 10] = [
     LOG_SIZES[0],
     LOG_SIZES[1],
@@ -376,7 +376,7 @@ impl Writer {
     }
 }
 
-/// The bytes reserved for an encoding: a `format::MASKED_WRAP` proof is about 150 KB.
+/// The bytes reserved for an encoding: a masked wrap's proof is about 150 KB.
 const CAPACITY: usize = 160 << 10;
 
 /// `proof` in the module's layout; `None` for a proof it cannot hold: a
@@ -470,8 +470,8 @@ mod tests {
     /// A change setting a limb.
     type SetLimb = fn(&mut WrapProof, BaseField);
 
-    /// A proof of `format::MASKED_WRAP`'s header and shape, its every vector the least
-    /// its pins allow: each column one sample and one queried value, each
+    /// A proof of the masked wrap's header and shape, its every vector the
+    /// least its pins allow: each column one sample and one queried value, each
     /// witness empty or of one item. Small, so every byte of it can be cut.
     fn smallest() -> WrapProof {
         let value = |i: u32| SecureField::from_u32_unchecked(i, i + 1, i + 2, i + 3);

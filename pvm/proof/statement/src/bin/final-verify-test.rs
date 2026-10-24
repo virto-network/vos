@@ -1,4 +1,4 @@
-//! The venue as a JAM refine program, linking `format::WRAP` beside 39
+//! The venue as a JAM refine program, linking `format::WRAP` as well
 //! (`--features pvm-guest,test-formats`): `final-verify`'s program
 //! (`src/bin/final-verify.rs`) for the test policy's fixtures.
 
