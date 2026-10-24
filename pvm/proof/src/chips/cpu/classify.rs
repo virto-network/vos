@@ -718,8 +718,8 @@ mod tests {
         }
     }
 
-    /// Every opcode's flags, packed, as the arm-by-arm classification
-    /// set them before the category flags were derived.
+    /// The flags each opcode classifies to, packed: the program ids rest
+    /// on them.
     const FLAGS: [(u8, u128); 139] = [
         (0, 0x10800000000000),
         (1, 0x0),
@@ -863,7 +863,7 @@ mod tests {
     ];
 
     #[test]
-    fn every_opcode_classifies_as_before() {
+    fn every_opcode_classifies_to_its_flags() {
         let opcodes: Vec<u8> = (0..=u8::MAX)
             .filter(|&byte| Opcode::from_byte(byte).is_some())
             .collect();
