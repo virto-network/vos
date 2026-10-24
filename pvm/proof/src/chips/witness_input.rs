@@ -261,10 +261,6 @@ fn byte_rows(side_note: &SideNote) -> Vec<ByteRow> {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for WitnessInputChip {
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
-        self.generate_main_trace_min(side_note, 0)
-    }
-
     fn generate_main_trace_min(
         &self,
         side_note: &mut SideNote,

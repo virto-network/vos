@@ -133,10 +133,6 @@ impl BuiltInComponent for CpuChip {
 
 #[cfg(feature = "prover")]
 impl BuiltInProverComponent for CpuChip {
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
-        trace_fill::generate_main_trace(side_note, 0)
-    }
-
     fn generate_main_trace_min(
         &self,
         side_note: &mut SideNote,

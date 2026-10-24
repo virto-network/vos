@@ -23,37 +23,44 @@ use crate::trace::eval::{INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED
 const PROOF_FS_DOMAIN_WORD_0: u64 = u64::from_le_bytes(*b"VOS/PVM/");
 const PROOF_FS_DOMAIN_WORD_1: u64 = u64::from_le_bytes(*b"STARK/FS");
 
-/// Bind the proof protocol domain and exact format generation into a Fiat–
-/// Shamir channel. This prefix authenticates the STARK statement transcript.
-pub fn mix_proof_fs_domain(channel: &mut impl Channel, format_version: u32, config: &PcsConfig) {
-    channel.mix_u64(PROOF_FS_DOMAIN_WORD_0);
-    channel.mix_u64(PROOF_FS_DOMAIN_WORD_1);
-    channel.mix_u64(u64::from(format_version));
-    channel.mix_u64(u64::from(config.pow_bits));
-    channel.mix_u64(config.fri_config.n_queries as u64);
-    channel.mix_u64(u64::from(config.fri_config.log_blowup_factor));
-    channel.mix_u64(u64::from(config.fri_config.log_last_layer_degree_bound));
-    channel.mix_u64(u64::from(config.fri_config.fold_step));
-    match config.lifting_log_size {
-        None => channel.mix_u64(0),
-        Some(lifting) => {
-            channel.mix_u64(1);
-            channel.mix_u64(u64::from(lifting));
-        }
-    }
+/// A.1's first item, as the words `mix_u64` takes: the protocol domain,
+/// the exact format generation and the PCS configuration, then each
+/// component's log size. This prefix authenticates the STARK statement
+/// transcript.
+pub fn statement_header_words(
+    format_version: u32,
+    config: &PcsConfig,
+    log_sizes: &[u32],
+) -> alloc::vec::Vec<u64> {
+    let lifting = match config.lifting_log_size {
+        None => alloc::vec![0],
+        Some(lifting) => alloc::vec![1, u64::from(lifting)],
+    };
+    [
+        PROOF_FS_DOMAIN_WORD_0,
+        PROOF_FS_DOMAIN_WORD_1,
+        u64::from(format_version),
+        u64::from(config.pow_bits),
+        config.fri_config.n_queries as u64,
+        u64::from(config.fri_config.log_blowup_factor),
+        u64::from(config.fri_config.log_last_layer_degree_bound),
+        u64::from(config.fri_config.fold_step),
+    ]
+    .into_iter()
+    .chain(lifting)
+    .chain(log_sizes.iter().map(|&log_size| u64::from(log_size)))
+    .collect()
 }
 
-/// A.1's first item: the domain, the format and the PCS configuration, then
-/// each component's log size.
+/// Mixes the statement's header ([`statement_header_words`]) into `channel`.
 pub fn mix_statement_header(
     channel: &mut impl Channel,
     format_version: u32,
     config: &PcsConfig,
     log_sizes: &[u32],
 ) {
-    mix_proof_fs_domain(channel, format_version, config);
-    for &log_size in log_sizes {
-        channel.mix_u64(u64::from(log_size));
+    for word in statement_header_words(format_version, config, log_sizes) {
+        channel.mix_u64(word);
     }
 }
 

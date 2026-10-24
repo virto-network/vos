@@ -2,8 +2,8 @@
 //! at exactly a class's log size.
 
 use super::{
-    ProvingError, Sizes, Target, install_thread_pool, prepare_side_note_for_verification,
-    prove_impl_with_components_overridden,
+    ProveRequest, ProvingError, Sizes, Target, install_thread_pool,
+    prepare_side_note_for_verification, prove_with,
 };
 use crate::format::Format;
 use crate::framework::MachineProverComponent;
@@ -43,15 +43,13 @@ pub fn prove_shaped(
     install_thread_pool();
     prepare_side_note_for_verification(side_note);
     let components = selected(shape.components);
-    let (proof, _) = prove_impl_with_components_overridden(
-        side_note,
+    let request = ProveRequest::new(
         Target::of(format)?,
-        false,
         &components,
         shape.components,
-        None,
         Sizes::Pinned(&shape.log_sizes),
-    )?;
+    );
+    let (proof, _) = prove_with(side_note, request)?;
     Ok(proof)
 }
 

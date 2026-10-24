@@ -10,8 +10,8 @@ use stwo::prover::poly::twiddles::TwiddleTree;
 use stwo::prover::{CommitmentSchemeProver, poly::circle::PolyOps};
 
 use super::{
-    ProvingError, Sizes, Target, install_thread_pool, prepare_side_note_for_verification,
-    prove_impl_with_components_overridden,
+    ProveRequest, ProvingError, Sizes, Target, install_thread_pool,
+    prepare_side_note_for_verification, prove_with,
 };
 use crate::format::Format;
 use crate::pcs::PcsStack;
@@ -68,15 +68,13 @@ pub fn prove_canonical_format(
             }
         })
         .collect();
-    let (proof, _) = prove_impl_with_components_overridden(
-        side_note,
+    let request = ProveRequest::new(
         Target::of(format)?,
-        false,
         components,
         component_mask,
-        None,
         Sizes::Floors(&floors),
-    )?;
+    );
+    let (proof, _) = prove_with(side_note, request)?;
     Ok(proof)
 }
 

@@ -34,7 +34,7 @@ use stwo::{
 ///
 /// `Sync` is required so `&dyn MachineComponent` / `&dyn
 /// MachineProverComponent` can be sent into rayon parallel iterators
-/// (used by `prove_impl_with_components` to parallelize per-chip
+/// (used by `prove_on` to parallelize per-chip
 /// interaction-trace generation).  Every concrete impl in
 /// `crate::chips` is already `Sync` — adding the supertrait just makes
 /// it expressible at the trait-object level.
@@ -72,15 +72,15 @@ pub trait MachineProverComponent: MachineComponent {
     ) -> ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>;
 
     /// Whether this chip mutates `side_note` during trace generation.
-    /// Drives the producer/consumer split in `prove_impl_with_components`.
+    /// Drives the producer/consumer split in `prove_on`.
     fn is_producer(&self) -> bool;
 
     fn generate_component_trace(&self, side_note: &mut SideNote) -> ComponentTrace;
 
     /// Trace-gen path that doesn't mutate `side_note`.  Only valid for
     /// `is_producer() == false` chips; producers panic via the default in
-    /// `BuiltInProverComponent::generate_main_trace_immut`.  Used by the
-    /// parallel consumer pass in `prove_impl_with_components`.
+    /// `BuiltInProverComponent::generate_main_trace_immut_min`.  Used by the
+    /// parallel consumer pass in `prove_on`.
     fn generate_component_trace_immut(&self, side_note: &SideNote) -> ComponentTrace;
 
     /// Canonical-shape variant of `generate_component_trace` threading a
@@ -218,30 +218,11 @@ where
     }
 
     fn generate_component_trace(&self, side_note: &mut SideNote) -> ComponentTrace {
-        let original_trace = <C as BuiltInProverComponent>::generate_main_trace(self, side_note);
-
-        let log_size = original_trace.log_size;
-        let preprocessed_trace =
-            <C as BuiltInProverComponent>::generate_preprocessed_trace(self, log_size, side_note);
-
-        ComponentTrace {
-            log_size,
-            preprocessed_trace: preprocessed_trace.cols,
-            original_trace: original_trace.cols,
-        }
+        self.generate_component_trace_min(side_note, 0)
     }
 
     fn generate_component_trace_immut(&self, side_note: &SideNote) -> ComponentTrace {
-        let original_trace =
-            <C as BuiltInProverComponent>::generate_main_trace_immut(self, side_note);
-        let log_size = original_trace.log_size;
-        let preprocessed_trace =
-            <C as BuiltInProverComponent>::generate_preprocessed_trace(self, log_size, side_note);
-        ComponentTrace {
-            log_size,
-            preprocessed_trace: preprocessed_trace.cols,
-            original_trace: original_trace.cols,
-        }
+        self.generate_component_trace_immut_min(side_note, 0)
     }
 
     fn generate_component_trace_min(

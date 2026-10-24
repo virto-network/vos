@@ -104,7 +104,11 @@ impl BuiltInComponent for MemoryRootBoundaryChip {
 impl BuiltInProverComponent for MemoryRootBoundaryChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        _min_log_size: u32,
+    ) -> FinalizedTrace {
         let log_size = stwo::prover::backend::simd::m31::LOG_N_LANES;
         let mut trace = TraceBuilder::<Column>::new(log_size);
 

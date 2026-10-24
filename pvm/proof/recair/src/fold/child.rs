@@ -47,10 +47,10 @@ use crate::prove::{FORMAT, RecairProof, circuit_hash_of, hashed_params, prefix};
 use crate::value::Value;
 use crate::verifier::bits::linear;
 use crate::verifier::channel::Channel;
-use crate::verifier::shape::header_words;
 use crate::verifier::stark::{Draws, StarkShape, StarkValues, interaction, verify_rest};
 use crate::verifier::witness::{digest_wires, drawn_positions, pack};
 use crate::verifier::{ShapeMismatch, WitnessError};
+use vos_pvm_proof::proof::statement_header_words;
 
 /// The relation a recursion AIR proof draws, by the name its components'
 /// recordings give it.
@@ -125,7 +125,7 @@ impl ChildShape {
         Self {
             stark: StarkShape::new(FORMAT, layout, vec![GATE.into()], compiled),
             log_sizes,
-            header: header_words(FORMAT.number, &config, &log_sizes),
+            header: statement_header_words(FORMAT.number, &config, &log_sizes),
         }
     }
 

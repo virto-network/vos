@@ -62,58 +62,44 @@ pub trait BuiltInProverComponent: BuiltInComponent {
     }
 
     /// Whether this chip writes to `SideNote` during trace generation.
-    /// Default `true` for safety.  Pure consumers override to `false` and
-    /// implement `generate_main_trace_immut` instead of (or in addition
-    /// to) `generate_main_trace` — `prove_impl_with_components` runs
-    /// producers sequentially and consumers in parallel.
+    /// Default `true` for safety. Pure consumers override to `false` and
+    /// implement `generate_main_trace_immut_min`: `prove_on` runs producers
+    /// sequentially and consumers in parallel.
     const IS_PRODUCER: bool = true;
 
-    /// Producers (default `IS_PRODUCER = true`) override this.  Consumers
-    /// can either override this directly or override
-    /// `generate_main_trace_immut` and let the default forward.
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
-        // Default: forward to immut path.  Producers MUST override.
-        self.generate_main_trace_immut(side_note)
-    }
-
-    /// Pure consumers (`IS_PRODUCER = false`) override this; the default
-    /// `generate_main_trace` forwards here.  Producers leave the default
-    /// panic — `prove_impl_with_components` never invokes this on
-    /// producer chips.
-    fn generate_main_trace_immut(&self, _side_note: &SideNote) -> FinalizedTrace {
-        unimplemented!("non-producer chip must override generate_main_trace_immut")
-    }
-
-    /// Like `generate_main_trace`, but pads the main trace to at least
-    /// `min_log_size` rows (`TraceBuilder::new(natural.max(min_log_size))`).
-    /// The default ignores the floor (natural size): it is the size of a
-    /// fixed table, or of the program's code. Every chip whose rows a run
-    /// fills overrides it, so a kernel's shape pins every log size; among
-    /// them the canonical *forcing set*
+    /// The main trace, padded to at least `min_log_size` rows
+    /// (`TraceBuilder::new(natural.max(min_log_size))`); 0 gives its natural
+    /// size. A chip of a fixed table, or of the program's code, ignores the
+    /// floor. Every chip whose rows a run fills honours it, so a kernel's
+    /// shape pins every log size; among them the canonical *forcing set*
     /// ([`chip_idx::FORCING`](crate::chip_idx::FORCING)), the variable
     /// preprocessed-bearing chips whose `log_size` the program commitment
-    /// depends on.  Padding rows are `is_real = 0` and inert, so a forced
+    /// depends on. Padding rows are `is_real = 0` and inert, so a forced
     /// larger trace proves the identical statement; a forcing-set chip whose
     /// `generate_preprocessed_trace` re-derives its own `log_size` from
     /// `side_note` must switch to the passed (forced) `log_size` param so
-    /// its preprocessed trace tracks the forced main height.  Producers
-    /// override this; consumers override `generate_main_trace_immut_min`.
+    /// its preprocessed trace tracks the forced main height. Producers
+    /// override this; the default forwards to the consumers'
+    /// `generate_main_trace_immut_min`.
     fn generate_main_trace_min(
         &self,
         side_note: &mut SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        self.generate_main_trace(side_note)
+        self.generate_main_trace_immut_min(side_note, min_log_size)
     }
 
-    /// Consumer counterpart of [`generate_main_trace_min`] (see
-    /// `generate_main_trace_immut`).
+    /// The main trace of a pure consumer (`IS_PRODUCER = false`), which reads
+    /// `side_note` only; as [`generate_main_trace_min`]. Producers leave the
+    /// default panic: `prove_on` never invokes this on them.
+    ///
+    /// [`generate_main_trace_min`]: Self::generate_main_trace_min
     fn generate_main_trace_immut_min(
         &self,
-        side_note: &SideNote,
+        _side_note: &SideNote,
         _min_log_size: u32,
     ) -> FinalizedTrace {
-        self.generate_main_trace_immut(side_note)
+        unimplemented!("non-producer chip must override generate_main_trace_immut_min")
     }
 
     fn generate_interaction_trace(

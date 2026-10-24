@@ -14,7 +14,7 @@ mod transcript;
 #[cfg(feature = "prover")]
 pub use transcript::{
     check_format_security, check_interaction_pow, format_security_bits, mix_boundary_states,
-    mix_proof_fs_domain, mix_statement_header, replay_prefix,
+    mix_statement_header, replay_prefix, statement_header_words,
 };
 mod preflight;
 pub use preflight::{

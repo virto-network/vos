@@ -301,10 +301,6 @@ impl BuiltInComponent for RegisterMemoryChip {
 impl BuiltInProverComponent for RegisterMemoryChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
-        self.generate_main_trace_immut_min(side_note, 0)
-    }
-
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
@@ -465,7 +461,7 @@ impl BuiltInProverComponent for RegisterMemoryChip {
 const _: [(); (NUM_REGS <= u8::MAX as usize) as usize - 1] = [];
 
 /// Build the (reg, ts)-sorted list of register-memory ledger entries that
-/// `generate_main_trace_immut` fills, one per row; the gates build it too.
+/// `generate_main_trace_immut_min` fills, one per row; the gates build it too.
 #[cfg(feature = "prover")]
 pub fn build_entries_from_side_note(side_note: &crate::side_note::SideNote) -> Vec<RegEntry> {
     let mut entries: Vec<RegEntry> = Vec::new();

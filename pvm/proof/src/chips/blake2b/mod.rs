@@ -280,10 +280,6 @@ impl BuiltInProverComponent for Blake2bChip {
         trace.finalize_bit_reversed()
     }
 
-    fn generate_main_trace(&self, side_note: &mut SideNote) -> FinalizedTrace {
-        self.generate_main_trace_min(side_note, 0)
-    }
-
     fn generate_main_trace_min(
         &self,
         side_note: &mut SideNote,

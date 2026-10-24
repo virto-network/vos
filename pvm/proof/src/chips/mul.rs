@@ -499,10 +499,6 @@ pub fn range_checked_bytes(e: &MulEntry) -> impl Iterator<Item = u8> + '_ {
 impl BuiltInProverComponent for MulChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
-        self.generate_main_trace_immut_min(side_note, 0)
-    }
-
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,

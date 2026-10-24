@@ -564,10 +564,6 @@ impl BuiltInProverComponent for MemoryPageChip {
         trace.finalize_bit_reversed()
     }
 
-    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
-        self.generate_main_trace_immut_min(side_note, 0)
-    }
-
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,

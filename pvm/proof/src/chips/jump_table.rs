@@ -145,7 +145,11 @@ impl BuiltInProverComponent for JumpTableChip {
         trace.finalize_bit_reversed()
     }
 
-    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
+    fn generate_main_trace_immut_min(
+        &self,
+        side_note: &SideNote,
+        _min_log_size: u32,
+    ) -> FinalizedTrace {
         let log_size = chip_log_size(side_note.jump_table.len());
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();

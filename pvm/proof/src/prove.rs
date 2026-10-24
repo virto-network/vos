@@ -342,7 +342,13 @@ fn prove_impl(
     let components_owned = super::active_components(side_note);
     let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
     let component_mask = super::active_component_mask(side_note);
-    prove_impl_with_components(side_note, target, profile, components, component_mask, &[])
+    prove_with(
+        side_note,
+        ProveRequest {
+            profile,
+            ..ProveRequest::new(target, components, component_mask, Sizes::NATURAL)
+        },
+    )
 }
 
 /// Chip-isolated prove path.  Bypasses `active_components` so
@@ -356,8 +362,8 @@ pub fn prove_with_explicit_components(
     components: &[&'static dyn crate::framework::MachineProverComponent],
 ) -> Result<Proof, ProvingError> {
     install_thread_pool();
-    let (proof, _) =
-        prove_impl_with_components(side_note, Target::SEGMENT, false, components, 0, &[])?;
+    let request = ProveRequest::new(Target::SEGMENT, components, 0, Sizes::NATURAL);
+    let (proof, _) = prove_with(side_note, request)?;
     Ok(proof)
 }
 
@@ -379,34 +385,46 @@ pub fn prove_chip_isolated_format(
         crate::chips_of_mask(component_mask)
             .map(|chip| crate::BASE_COMPONENTS[chip])
             .collect();
-    let (proof, _) = prove_impl_with_components(
-        side_note,
+    let request = ProveRequest::new(
         Target::of(format)?,
-        false,
         &components,
         component_mask,
-        min_log_sizes,
-    )?;
+        Sizes::Floors(min_log_sizes),
+    );
+    let (proof, _) = prove_with(side_note, request)?;
     Ok(proof)
 }
 
-fn prove_impl_with_components(
-    side_note: &mut SideNote,
-    target: Target,
-    profile: bool,
-    components: &[&dyn crate::framework::MachineProverComponent],
-    component_mask: u32,
-    min_log_sizes: &[u32],
-) -> Result<(Proof, ProveProfile), ProvingError> {
-    prove_impl_with_components_overridden(
-        side_note,
-        target,
-        profile,
-        components,
-        component_mask,
-        None,
-        Sizes::Floors(min_log_sizes),
-    )
+/// A proof to make: its target, its chips (`component_mask` names them, 0
+/// for an explicit set), their sizes, whether to profile the run, and the
+/// boundary states the forgery seam ships instead of the trace's.
+pub(crate) struct ProveRequest<'a> {
+    pub target: Target,
+    pub components: &'a [&'a dyn crate::framework::MachineProverComponent],
+    pub component_mask: u32,
+    pub sizes: Sizes<'a>,
+    pub profile: bool,
+    pub boundary_override: Option<(SegmentState, SegmentState)>,
+}
+
+impl<'a> ProveRequest<'a> {
+    /// A proof under `target` of `components` at `sizes`, unprofiled, with
+    /// the trace's boundary states.
+    pub(crate) fn new(
+        target: Target,
+        components: &'a [&'a dyn crate::framework::MachineProverComponent],
+        component_mask: u32,
+        sizes: Sizes<'a>,
+    ) -> Self {
+        Self {
+            target,
+            components,
+            component_mask,
+            sizes,
+            profile: false,
+            boundary_override: None,
+        }
+    }
 }
 
 /// The log sizes a proof's chips take: at least floors (none: natural
@@ -539,52 +557,39 @@ pub fn prove_with_boundary_override(
     let components_owned = super::active_components(side_note);
     let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
     let component_mask = super::active_component_mask(side_note);
-    let (proof, _) = prove_impl_with_components_overridden(
-        side_note,
-        Target::SEGMENT,
-        false,
-        components,
-        component_mask,
-        Some((initial_state, final_state)),
-        Sizes::NATURAL,
-    )?;
+    let request = ProveRequest {
+        boundary_override: Some((initial_state, final_state)),
+        ..ProveRequest::new(Target::SEGMENT, components, component_mask, Sizes::NATURAL)
+    };
+    let (proof, _) = prove_with(side_note, request)?;
     Ok(proof)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn prove_impl_with_components_overridden(
+/// Makes `request`'s proof on its format's channel.
+pub(crate) fn prove_with(
     side_note: &mut SideNote,
-    target: Target,
-    profile: bool,
-    components: &[&dyn crate::framework::MachineProverComponent],
-    component_mask: u32,
-    boundary_override: Option<(SegmentState, SegmentState)>,
-    sizes: Sizes<'_>,
+    request: ProveRequest<'_>,
 ) -> Result<(Proof, ProveProfile), ProvingError> {
-    crate::with_stack!(target.format.channel, Stack => prove_on::<Stack>(
-        side_note,
-        target,
-        profile,
-        components,
-        component_mask,
-        boundary_override,
-        sizes,
-    ), unbuilt => Err(ProvingError::FormatNotAdmitted(target.format.number)))
+    let format = request.target.format;
+    crate::with_stack!(format.channel, Stack => prove_on::<Stack>(side_note, request),
+        unbuilt => Err(ProvingError::FormatNotAdmitted(format.number)))
 }
 
-#[allow(clippy::too_many_arguments)]
 fn prove_on<MC: PcsStack>(
     side_note: &mut SideNote,
-    target: Target,
-    profile: bool,
-    components: &[&dyn crate::framework::MachineProverComponent],
-    component_mask: u32,
-    boundary_override: Option<(SegmentState, SegmentState)>,
-    sizes: Sizes<'_>,
+    request: ProveRequest<'_>,
 ) -> Result<(Proof, ProveProfile), ProvingError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
+    let ProveRequest {
+        target,
+        components,
+        component_mask,
+        sizes,
+        profile,
+        boundary_override,
+    } = request;
     use std::time::Instant;
     use stwo::core::proof_of_work::GrindOps;
 

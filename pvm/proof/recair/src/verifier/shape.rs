@@ -56,44 +56,6 @@ pub enum ShapeMismatch {
     Structure(&'static str),
 }
 
-/// The words `mix_statement_header` mixes, as `mix_u64` takes them.
-#[derive(Clone, Debug, Default)]
-struct HeaderWords(Vec<u64>);
-
-impl stwo::core::channel::Channel for HeaderWords {
-    const BYTES_PER_HASH: usize = 32;
-
-    fn verify_pow_nonce(&self, _: u32, _: u64) -> bool {
-        unreachable!("the header mixes words only")
-    }
-    fn mix_u32s(&mut self, _: &[u32]) {
-        unreachable!("the header mixes words only")
-    }
-    fn mix_felts(&mut self, _: &[SecureField]) {
-        unreachable!("the header mixes words only")
-    }
-    fn mix_u64(&mut self, value: u64) {
-        self.0.push(value);
-    }
-    fn draw_secure_felt(&mut self) -> SecureField {
-        unreachable!("the header draws nothing")
-    }
-    fn draw_secure_felts(&mut self, _: usize) -> Vec<SecureField> {
-        unreachable!("the header draws nothing")
-    }
-    fn draw_u32s(&mut self) -> Vec<u32> {
-        unreachable!("the header draws nothing")
-    }
-}
-
-/// The words `mix_statement_header` mixes for a proof under the format
-/// `number` at `config` and `log_sizes`, as `mix_u64` takes them.
-pub(crate) fn header_words(number: u32, config: &PcsConfig, log_sizes: &[u32]) -> Vec<u64> {
-    let mut header = HeaderWords::default();
-    vos_pvm_proof::proof::mix_statement_header(&mut header, number, config, log_sizes);
-    header.0
-}
-
 /// The chips whose claimed sums the boundary states bind.
 const BOUNDARY_CHIPS: u32 = 1 << chip_idx::REGISTER_MEMORY_BOUNDARY
     | 1 << chip_idx::REGISTER_MEMORY_CLOSING
@@ -202,7 +164,8 @@ impl SegmentShape {
             "log sizes the native verifier admits"
         );
 
-        let header = header_words(format.number, &config, log_sizes);
+        let header =
+            vos_pvm_proof::proof::statement_header_words(format.number, &config, log_sizes);
 
         let layout = sample_layout(component_mask, log_sizes, &config);
         if let Err(refusal) = check_format_security(format, &config, &layout.security_shape) {

@@ -222,10 +222,6 @@ impl BuiltInComponent for BitwiseChip {
 impl BuiltInProverComponent for BitwiseChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
-        self.generate_main_trace_immut_min(side_note, 0)
-    }
-
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,

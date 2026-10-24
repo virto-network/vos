@@ -278,10 +278,6 @@ impl BuiltInComponent for MemoryMerkleChip {
 impl BuiltInProverComponent for MemoryMerkleChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_main_trace_immut(&self, side_note: &SideNote) -> FinalizedTrace {
-        self.generate_main_trace_immut_min(side_note, 0)
-    }
-
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
