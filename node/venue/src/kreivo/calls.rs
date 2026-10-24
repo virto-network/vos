@@ -412,10 +412,11 @@ pub enum Error {
     BadHandler = 25,
     BadStartWindow = 26,
     OverBudget = 27,
+    SameVenue = 28,
 }
 
 impl Error {
-    const ALL: [Self; 28] = [
+    const ALL: [Self; 29] = [
         Self::SpaceExists,
         Self::UnknownSpace,
         Self::BadGenesis,
@@ -444,6 +445,7 @@ impl Error {
         Self::BadHandler,
         Self::BadStartWindow,
         Self::OverBudget,
+        Self::SameVenue,
     ];
 
     /// The error at pinned index `index`.
@@ -678,7 +680,7 @@ mod tests {
             assert_eq!(read::<Failure>(&failure.encode()), Some(failure));
             assert_eq!(failure.pallet(), Some(error));
         }
-        assert_eq!(Error::from_index(28), None);
+        assert_eq!(Error::from_index(29), None);
     }
 
     /// The anchor call is `[90, 7]` and pin D's `Anchor` in

@@ -1164,6 +1164,12 @@ fn g14(fx: &Fixtures) -> Vector {
         to: [0x77; 32],
         from_window,
     };
+    let here = Call::Migrate {
+        space: b(),
+        to: w.constants().venue.0,
+        from_window: now_w + 1,
+    };
+    w.controller(here, Expect::Err(Error::SameVenue));
     w.controller(migrate(now_w), Expect::Err(Error::OutOfRange));
     w.controller(migrate(now_w + 1), Expect::Ok);
     w.controller(migrate(now_w + 2), Expect::Err(Error::AlreadyMigrated));
@@ -1188,7 +1194,8 @@ fn g14(fx: &Fixtures) -> Vector {
     ));
     w.finish(
         "G14",
-        "migrate: from a window before the next refused (OutOfRange), from the next taken \
+        "migrate: to this venue refused (SameVenue); from a window before the next refused \
+         (OutOfRange), from the next taken \
          (end_window set), a second refused (AlreadyMigrated); an anchor at w ≥ from_window \
          refused (OutOfRange), the window before it anchored; a statement whose root's window \
          is ≥ end_window refused 5",

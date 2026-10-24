@@ -523,6 +523,9 @@ impl Chain {
                 from_window,
             } => {
                 let mut info = self.controlled(origin, &space)?;
+                if to == self.constants.venue.0 {
+                    return Err(Error::SameVenue.into());
+                }
                 if info.end_window.is_some() {
                     return Err(Error::AlreadyMigrated.into());
                 }

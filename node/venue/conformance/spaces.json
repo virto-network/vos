@@ -4650,7 +4650,7 @@
     },
     {
       "id": "G14",
-      "title": "migrate: from a window before the next refused (OutOfRange), from the next taken (end_window set), a second refused (AlreadyMigrated); an anchor at w ≥ from_window refused (OutOfRange), the window before it anchored; a statement whose root's window is ≥ end_window refused 5",
+      "title": "migrate: to this venue refused (SameVenue); from a window before the next refused (OutOfRange), from the next taken (end_window set), a second refused (AlreadyMigrated); an anchor at w ≥ from_window refused (OutOfRange), the window before it anchored; a statement whose root's window is ≥ end_window refused 5",
       "fees": false,
       "pre": {
         "now_ms": 25800000,
@@ -4800,6 +4800,21 @@
         ]
       },
       "steps": [
+        {
+          "now_ms": 25800000,
+          "origin": {
+            "signed": "c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0"
+          },
+          "call": [
+            "5a05cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e464b6c29a4bda3ce6aab4eb01d9abf25e6a90d1b4c8cb02273b630b00e58560b2a00000000000000"
+          ],
+          "result": {
+            "module": 28
+          },
+          "events": [],
+          "storage": [],
+          "balances": []
+        },
         {
           "now_ms": 25800000,
           "origin": {

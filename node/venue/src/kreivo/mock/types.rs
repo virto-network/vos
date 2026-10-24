@@ -293,6 +293,7 @@ pub enum Error {
     BadHandler = 25,
     BadStartWindow = 26,
     OverBudget = 27,
+    SameVenue = 28,
 }
 
 impl From<Error> for DispatchError {
@@ -432,6 +433,7 @@ mod tests {
             BadHandler,
             BadStartWindow,
             OverBudget,
+            SameVenue,
         ];
         for (index, error) in all.into_iter().enumerate() {
             assert_eq!(error as usize, index);

@@ -322,7 +322,7 @@ compact, and the vectors are `BoundedVec<u8, _>`.
 | 2 | `add_authority(space: SpaceId, who: AccountId32, anchor_key: Option<[u8;32]>)` | controller | adds an authority, or updates one: an update replaces its paired key (the old key leaves `AnchorKeys`); a key paired with another authority is refused (`AnchorKeyInUse`); `inc_providers(who)` on an add |
 | 3 | `remove_authority(space: SpaceId, who: AccountId32)` | controller | removes it and its paired anchor key; `dec_providers(who)` best effort: a `ConsumerRemaining` error is ignored, the account merely stays alive |
 | 4 | `remove_anchor_key(space: SpaceId, key: [u8;32])` | controller | removes an unpaired key, such as a founding one |
-| 5 | `migrate(space: SpaceId, to: [u8;32], from_window: u64)` | controller | sets `end_window = from_window` (once, ≥ the next window); anchors at `w ≥ from_window` are refused here |
+| 5 | `migrate(space: SpaceId, to: [u8;32], from_window: u64)` | controller | sets `end_window = from_window` (once, ≥ the next window, `to` another venue than this one); anchors at `w ≥ from_window` are refused here |
 | 6 | `resume(space: SpaceId)` | controller | `Suspended → Active` only when neither signer of any of the space's `Equivocations` (`first_signer`, `second_signer`) is still registered; it then clears them |
 | 7 | `anchor(anchor: AnchorArg)` | any signed; the sovereign pays when the signer is an authority of `anchor.space` | §6.1 |
 | 8 | `submit(payer: SpaceId, statement: Vec<u8>, proof: Vec<u8>)` | an authority of `payer`; the sovereign pays | §6.3 |
@@ -598,6 +598,7 @@ The variant indices are pinned.
 | 25 | `BadHandler` |
 | 26 | `BadStartWindow` |
 | 27 | `OverBudget` (the pallet-only fallback; the extension refuses in `validate`) |
+| 28 | `SameVenue` (a `migrate` to this venue) |
 
 As `DispatchError::Module { index: 90, error: [i, 0, 0, 0] }`.
 
@@ -890,7 +891,7 @@ tag's, byte for byte.
 | G11 | `set_program` by `ProgramsOrigin` with `from < now + delay` → `TooEarly`; with Root, at once |
 | G12 (fees) | signs only: an authority's `anchor` and `submit` debit the sovereign account, not the node; a non-authority pays its own; a submit whose sovereign cannot cover fee and deposit refused in `validate` |
 | G13 | the budget: with `max_spend_per_window = 8 × (SubmitDeposit + FeeBound)`, the ninth submit in a window refused before dispatch (`InvalidTransaction::Payment`; `OverBudget` in the fallback), the sovereign's balance untouched; the next window resets it; `set_budget`; an accepted submit's deposit credited back, leaving room for one more |
-| G14 | `migrate`: `end_window` set; an anchor at `w ≥ from_window` → `OutOfRange`; a rooted statement whose root's window is ≥ `end_window` → refusal 5; a second `migrate` → `AlreadyMigrated` |
+| G14 | `migrate`: to this venue → `SameVenue`; `end_window` set; an anchor at `w ≥ from_window` → `OutOfRange`; a rooted statement whose root's window is ≥ `end_window` → refusal 5; a second `migrate` → `AlreadyMigrated` |
 | G15 | the controller and keys: `set_controller` (the old controller refused after it); `add_authority` updating a paired key (the old key leaves `AnchorKeys`); a key paired elsewhere → `AnchorKeyInUse`; `remove_anchor_key` of a paired key → `AnchorKeyInUse`, of an unpaired founding key → removed; `remove_authority` with a consumer on the account (best effort) |
 | G16 | `dispatch_as_sovereign` (a transfer from the sovereign; `SovereignDispatched`); `set_status` block (submits and anchors refused) and unblock (back to `Active`, or `Suspended` with equivocations); `set_format` under the delay (`TooEarly`; Root at once) |
 | G17 | `on_idle`: an anchor and a rooted `Seen` entry pruned past `MaxRootAge`, the rootless entry kept, `Last` and `Equivocations` kept |
