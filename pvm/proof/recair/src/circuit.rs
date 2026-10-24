@@ -4,6 +4,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
+use num_traits::Zero;
 use stwo::core::fields::m31::{BaseField, P};
 use vos_pvm_recair_air::gate::Layout;
 use vos_pvm_recair_air::p2::P2Mode;
@@ -41,6 +42,13 @@ pub struct P2Wiring {
     pub bit_address: u32,
 }
 
+impl P2Wiring {
+    /// The lanes of message slot `w` its `act` absorbs.
+    pub fn absorbed(&self, w: usize) -> [bool; 4] {
+        core::array::from_fn(|j| !self.act[4 * w + j].is_zero())
+    }
+}
+
 /// The QM31 gate's coefficients:
 /// `out = k_m·a·b + k_p·(a⊙b) + k_a·a + k_b·b + k_c·c + Σ_j λ_j·c_j`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
@@ -69,13 +77,12 @@ impl Qm31Op {
     /// under a product or the operand's own coefficient, lane `j` of `c`
     /// under `λ_j`.
     pub fn reads(&self, i: usize) -> [bool; 4] {
-        let zero = BaseField::from(0);
-        let product = i < 2 && (self.k_m != zero || self.k_p != zero);
-        let own = [self.k_a, self.k_b, self.k_c][i] != zero;
+        let product = i < 2 && !(self.k_m.is_zero() && self.k_p.is_zero());
+        let own = ![self.k_a, self.k_b, self.k_c][i].is_zero();
         if product || own {
             [true; 4]
         } else if i == 2 {
-            self.lanes.map(|lane| lane != zero)
+            self.lanes.map(|lane| !lane.is_zero())
         } else {
             [false; 4]
         }
@@ -192,6 +199,13 @@ pub struct WiringStats {
 /// The least rows a component has: one SIMD vector.
 pub const MIN_ROWS: usize = 16;
 
+/// What [`Circuit::lane_census`] counts.
+struct LaneCensus {
+    absorbed: HashMap<u32, [bool; 4]>,
+    partial: HashSet<u32>,
+    computed: HashSet<u32>,
+}
+
 impl Circuit {
     /// The components' log sizes.
     pub fn log_sizes(&self) -> [u32; 3] {
@@ -284,9 +298,8 @@ impl Circuit {
         }
         for (row, wiring) in self.p2.iter().enumerate() {
             let node = wiring.mode == Some(P2Mode::Node);
-            let absorbs_free = (0..2).any(|w| {
-                free(&wiring.m[w]) && (0..4).any(|j| wiring.act[4 * w + j] != BaseField::from(0))
-            });
+            let absorbs_free =
+                (0..2).any(|w| free(&wiring.m[w]) && wiring.absorbed(w).contains(&true));
             if wiring.mode.is_some() && !node && absorbs_free {
                 return Err(WiringError::FreeMessageAbsorbed { row });
             }
@@ -309,40 +322,11 @@ impl Circuit {
     /// operand ([`Qm31Op::reads`]); an `h8` input, whole; a node's bit, its
     /// lane 0; a public use, whole.
     pub fn unread_lane_reads(&self) -> Vec<(u32, usize)> {
-        let mut absorbed: HashMap<u32, [bool; 4]> = HashMap::new();
-        let mut partial: HashSet<u32> = HashSet::new();
-        let mut computed: HashSet<u32> = HashSet::new();
-        for wiring in &self.p2 {
-            for w in 0..2 {
-                let entry = wiring.m[w];
-                if entry.multiplicity == 0 {
-                    continue;
-                }
-                let lanes: [bool; 4] = core::array::from_fn(|j| {
-                    wiring.mode == Some(P2Mode::Node) || wiring.act[4 * w + j] != BaseField::from(0)
-                });
-                let all = absorbed.entry(entry.address).or_default();
-                for (all, lane) in all.iter_mut().zip(lanes) {
-                    *all |= lane;
-                }
-                if lanes.contains(&false) {
-                    partial.insert(entry.address);
-                }
-            }
-            for w in 0..2 {
-                if wiring.out_multiplicity[w] != 0 {
-                    computed.insert(wiring.out_address.wrapping_add(w as u32));
-                }
-            }
-        }
-        computed.extend(
-            self.qm31
-                .iter()
-                .map(|wiring| wiring.operands[3])
-                .chain(self.h8.iter().map(|wiring| wiring.out))
-                .filter(|entry| entry.multiplicity != 0)
-                .map(|entry| entry.address),
-        );
+        let LaneCensus {
+            absorbed,
+            partial,
+            computed,
+        } = self.lane_census();
         if partial.iter().all(|address| computed.contains(address)) {
             return Vec::new();
         }
@@ -399,6 +383,52 @@ impl Circuit {
             read(public, [true; 4]);
         }
         reads
+    }
+
+    /// The lanes the `p2` rows absorb of each wire, the wires some row
+    /// absorbs only in part, and the wires a gate computes.
+    fn lane_census(&self) -> LaneCensus {
+        let mut absorbed: HashMap<u32, [bool; 4]> = HashMap::new();
+        let mut partial: HashSet<u32> = HashSet::new();
+        let mut computed: HashSet<u32> = HashSet::new();
+        for wiring in &self.p2 {
+            for w in 0..2 {
+                let entry = wiring.m[w];
+                if entry.multiplicity == 0 {
+                    continue;
+                }
+                let lanes = if wiring.mode == Some(P2Mode::Node) {
+                    [true; 4]
+                } else {
+                    wiring.absorbed(w)
+                };
+                let all = absorbed.entry(entry.address).or_default();
+                for (all, lane) in all.iter_mut().zip(lanes) {
+                    *all |= lane;
+                }
+                if lanes.contains(&false) {
+                    partial.insert(entry.address);
+                }
+            }
+            for w in 0..2 {
+                if wiring.out_multiplicity[w] != 0 {
+                    computed.insert(wiring.out_address.wrapping_add(w as u32));
+                }
+            }
+        }
+        computed.extend(
+            self.qm31
+                .iter()
+                .map(|wiring| wiring.operands[3])
+                .chain(self.h8.iter().map(|wiring| wiring.out))
+                .filter(|entry| entry.multiplicity != 0)
+                .map(|entry| entry.address),
+        );
+        LaneCensus {
+            absorbed,
+            partial,
+            computed,
+        }
     }
 
     /// The relation's part of [`Circuit::check_wiring`].
