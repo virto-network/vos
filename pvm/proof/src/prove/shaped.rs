@@ -2,8 +2,8 @@
 //! at exactly a class's log size.
 
 use super::{
-    ProofTranscriptGeneration, ProvingError, Sizes, Target, install_thread_pool,
-    prepare_side_note_for_verification, prove_impl_with_components_overridden,
+    ProvingError, Sizes, Target, install_thread_pool, prepare_side_note_for_verification,
+    prove_impl_with_components_overridden,
 };
 use crate::format::Format;
 use crate::framework::MachineProverComponent;
@@ -51,7 +51,6 @@ pub fn prove_shaped(
         shape.components,
         None,
         Sizes::Pinned(&shape.log_sizes),
-        ProofTranscriptGeneration::Current,
     )?;
     Ok(proof)
 }

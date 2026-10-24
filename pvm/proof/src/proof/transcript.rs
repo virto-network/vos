@@ -23,9 +23,6 @@ use crate::trace::eval::{INTERACTION_TRACE_IDX, ORIGINAL_TRACE_IDX, PREPROCESSED
 const PROOF_FS_DOMAIN_WORD_0: u64 = u64::from_le_bytes(*b"VOS/PVM/");
 const PROOF_FS_DOMAIN_WORD_1: u64 = u64::from_le_bytes(*b"STARK/FS");
 
-#[cfg(feature = "prover")]
-const PRE_CONFIG_FS_FORMAT_VERSION: u32 = 18;
-
 /// Bind the proof protocol domain and exact format generation into a Fiat–
 /// Shamir channel. This prefix authenticates the STARK statement transcript.
 pub fn mix_proof_fs_domain(channel: &mut impl Channel, format_version: u32, config: &PcsConfig) {
@@ -127,16 +124,6 @@ pub fn replay_prefix<MC: PcsStack>(
         channel,
     );
     Ok(lookup_elements)
-}
-
-/// Adversarial-test seam for constructing a proof under the immediately
-/// preceding transcript, which bound the format but omitted `PcsConfig`.
-/// The returned proof is deliberately invalid under the current generation.
-#[cfg(feature = "prover")]
-pub(crate) fn mix_pre_config_proof_fs_domain(channel: &mut impl Channel) {
-    channel.mix_u64(PROOF_FS_DOMAIN_WORD_0);
-    channel.mix_u64(PROOF_FS_DOMAIN_WORD_1);
-    channel.mix_u64(u64::from(PRE_CONFIG_FS_FORMAT_VERSION));
 }
 
 /// A proof's two counts ([`crate::security`]) at its own parameters and

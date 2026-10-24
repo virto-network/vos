@@ -500,7 +500,7 @@ pub use pcs::{Commitment, StarkProofAny};
 pub use proof::{PROOF_FORMAT_VERSION, Proof, SegmentState};
 #[doc(hidden)]
 #[cfg(feature = "prover")]
-pub use prove::{prove_pre_config_relabel_for_test, prove_with_boundary_override};
+pub use prove::prove_with_boundary_override;
 pub use sparse_memory::{SPARSE_MEMORY_PAGE_SIZE, SparseMemoryImage, SparseMemoryPage};
 // ── Prove: the stable surface ────────────────────────────────────────
 // Single proof: `prove` / `prove_format`.

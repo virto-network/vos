@@ -7,8 +7,8 @@ use stwo::prover::backend::{BackendForChannel, simd::SimdBackend};
 use stwo::prover::{CommitmentSchemeProver, poly::circle::PolyOps};
 
 use super::{
-    ProofTranscriptGeneration, ProvingError, Sizes, Target, install_thread_pool,
-    prepare_side_note_for_verification, prove_impl_with_components_overridden,
+    ProvingError, Sizes, Target, install_thread_pool, prepare_side_note_for_verification,
+    prove_impl_with_components_overridden,
 };
 use crate::format::Format;
 use crate::pcs::PcsStack;
@@ -73,7 +73,6 @@ pub fn prove_canonical_format(
         component_mask,
         None,
         Sizes::Floors(&floors),
-        ProofTranscriptGeneration::Current,
     )?;
     Ok(proof)
 }

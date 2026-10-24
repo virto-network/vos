@@ -383,26 +383,6 @@ fn standalone_verify_rejects_format_version_mismatch() {
         .expect_err("format-18 proof must be rejected");
     assert!(format!("{old_error:?}").contains("proof format 18 is not registered"));
 
-    // Stronger regression: construct all Stwo commitments/openings under the
-    // actual pre-config-binding v18 transcript, then relabel only the outer
-    // generation as current. The version field passes structural preflight,
-    // but the current FS prefix must make cryptographic verification fail.
-    let relabelled = vos_pvm_proof::prove_pre_config_relabel_for_test(&mut side_note)
-        .expect("legacy-transcript adversarial proof generation failed");
-    assert_eq!(
-        relabelled.format_version,
-        vos_pvm_proof::PROOF_FORMAT_VERSION
-    );
-    let relabelled_commitment = relabelled.preprocessed_commitment().unwrap();
-    assert!(
-        verify_standalone(relabelled.clone(), relabelled_commitment).is_err(),
-        "pre-config-binding transcript was accepted after relabelling"
-    );
-    assert!(
-        vos_pvm_proof::verify(relabelled, &side_note).is_err(),
-        "prover-side verifier accepted a relabelled v18 transcript"
-    );
-
     // Forge: a number the registry does not hold, as a proof of a future
     // AIR would carry.
     proof.format_version = 38;

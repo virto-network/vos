@@ -12,7 +12,6 @@ use crate::pcs::StarkProofAny;
 
 mod transcript;
 #[cfg(feature = "prover")]
-pub(crate) use transcript::mix_pre_config_proof_fs_domain;
 pub use transcript::{
     check_format_security, check_interaction_pow, format_security_bits, mix_boundary_states,
     mix_proof_fs_domain, mix_statement_header, replay_prefix,

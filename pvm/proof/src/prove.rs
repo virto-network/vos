@@ -409,7 +409,6 @@ fn prove_impl_with_components(
         component_mask,
         None,
         Sizes::Floors(min_log_sizes),
-        ProofTranscriptGeneration::Current,
     )
 }
 
@@ -429,12 +428,6 @@ impl<'a> Sizes<'a> {
             Self::Floors(sizes) | Self::Pinned(sizes) => sizes,
         }
     }
-}
-
-#[derive(Clone, Copy)]
-enum ProofTranscriptGeneration {
-    Current,
-    PreConfigRelabel,
 }
 
 /// The components' main traces: the producers in order, filling the side
@@ -557,32 +550,6 @@ pub fn prove_with_boundary_override(
         component_mask,
         Some((initial_state, final_state)),
         Sizes::NATURAL,
-        ProofTranscriptGeneration::Current,
-    )?;
-    Ok(proof)
-}
-
-/// Construct an otherwise honest proof using the immediately preceding
-/// format-18/19 Fiat–Shamir prefix and then label the outer envelope as the
-/// current generation. This exists solely for the adversarial verifier gate
-/// proving that an old proof cannot be relabelled after the PCS-config binding
-/// change; its output is intentionally unverifiable.
-#[doc(hidden)]
-pub fn prove_pre_config_relabel_for_test(side_note: &mut SideNote) -> Result<Proof, ProvingError> {
-    install_thread_pool();
-    prepare_side_note_for_verification(side_note);
-    let components_owned = super::active_components(side_note);
-    let components: &[&dyn crate::framework::MachineProverComponent] = &components_owned;
-    let component_mask = super::active_component_mask(side_note);
-    let (proof, _) = prove_impl_with_components_overridden(
-        side_note,
-        Target::SEGMENT,
-        false,
-        components,
-        component_mask,
-        None,
-        Sizes::NATURAL,
-        ProofTranscriptGeneration::PreConfigRelabel,
     )?;
     Ok(proof)
 }
@@ -596,7 +563,6 @@ fn prove_impl_with_components_overridden(
     component_mask: u32,
     boundary_override: Option<(SegmentState, SegmentState)>,
     sizes: Sizes<'_>,
-    transcript_generation: ProofTranscriptGeneration,
 ) -> Result<(Proof, ProveProfile), ProvingError> {
     crate::with_stack!(target.format.channel, Stack => prove_on::<Stack>(
         side_note,
@@ -606,7 +572,6 @@ fn prove_impl_with_components_overridden(
         component_mask,
         boundary_override,
         sizes,
-        transcript_generation,
     ), unbuilt => Err(ProvingError::FormatNotAdmitted(target.format.number)))
 }
 
@@ -619,7 +584,6 @@ fn prove_on<MC: PcsStack>(
     component_mask: u32,
     boundary_override: Option<(SegmentState, SegmentState)>,
     sizes: Sizes<'_>,
-    transcript_generation: ProofTranscriptGeneration,
 ) -> Result<(Proof, ProveProfile), ProvingError>
 where
     SimdBackend: BackendForChannel<MC>,
@@ -701,14 +665,7 @@ where
     );
 
     let prover_channel = &mut MC::C::default();
-    match transcript_generation {
-        ProofTranscriptGeneration::Current => {
-            crate::proof::mix_proof_fs_domain(prover_channel, format.number, &config);
-        }
-        ProofTranscriptGeneration::PreConfigRelabel => {
-            crate::proof::mix_pre_config_proof_fs_domain(prover_channel);
-        }
-    }
+    crate::proof::mix_proof_fs_domain(prover_channel, format.number, &config);
 
     let mut commitment_scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(config, &twiddles);
     // Stwo v2.x requires polynomial coefficients to be stored — without
