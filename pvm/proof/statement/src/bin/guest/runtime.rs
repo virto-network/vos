@@ -12,8 +12,8 @@ use core::fmt::Write;
 /// the verify needs.
 pub const STACK_BYTES: usize = 1 << 20;
 /// The heap arena, in `.bss` (a standard program's zero pages are at most
-/// 2^16, 256 MiB). Only the pages the allocator reaches are
-/// touched; the high-water mark says how much of it the verify needs.
+/// 2^16, 256 MiB). Only the pages the allocator reaches are touched; the
+/// high-water mark says how much of it an invocation needs.
 const ARENA_BYTES: usize = 64 << 20;
 
 #[repr(C, align(4096))]
@@ -24,13 +24,12 @@ unsafe impl Sync for Stack {}
 #[unsafe(no_mangle)]
 pub static VERIFY_STACK: Stack = Stack(UnsafeCell::new([0; STACK_BYTES]));
 
-// ── The allocator: power-of-two classes to 64 KiB, page runs above ──────
-
-const MIN_SHIFT: u32 = 4;
-const MAX_SMALL_SHIFT: u32 = 16;
-const CLASSES: usize = (MAX_SMALL_SHIFT - MIN_SHIFT + 1) as usize;
-const LARGE_SLOTS: usize = 512;
-const PAGE: usize = 4096;
+// ── The allocator: a bump over the arena ─────────────────────────────────
+//
+// An invocation verifies one proof, or applies one block's operands, and
+// ends: what it frees is reclaimed only when it is the arena's last block,
+// so an allocation is a few instructions, which on the PVM's per-block gas
+// is most of what a decode costs.
 
 #[repr(C, align(4096))]
 struct Arena([u8; ARENA_BYTES]);
@@ -38,14 +37,8 @@ struct Arena([u8; ARENA_BYTES]);
 pub struct State {
     /// Bump offset into the arena: the high-water mark.
     pub top: usize,
-    /// Free-list heads per class (0: empty); a free block's first word
-    /// links the next.
-    free: [usize; CLASSES],
-    /// Free page runs (address, bytes; address 0: an empty slot).
-    large: [(usize, usize); LARGE_SLOTS],
     live: usize,
     pub peak_live: usize,
-    total: usize,
     pub allocs: usize,
 }
 
@@ -62,46 +55,16 @@ pub static HEAP: Heap = Heap {
     arena: UnsafeCell::new(Arena([0; ARENA_BYTES])),
     state: UnsafeCell::new(State {
         top: 0,
-        free: [0; CLASSES],
-        large: [(0, 0); LARGE_SLOTS],
         live: 0,
         peak_live: 0,
-        total: 0,
         allocs: 0,
     }),
 };
 
-/// A request's class (`Some`, its block 2^class bytes) or a page run.
 #[allow(
     clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`, a page \
-              run's within it) and arena offsets below `ARENA_BYTES`, its index a class \
-              `class_of` bounds by `MAX_SMALL_SHIFT`, and a free never exceeds what is live"
-)]
-fn class_of(layout: &Layout) -> Option<u32> {
-    let need = layout.size().max(layout.align()).max(1 << MIN_SHIFT);
-    let shift = usize::BITS - (need - 1).leading_zeros();
-    (shift <= MAX_SMALL_SHIFT && layout.align() <= PAGE).then_some(shift)
-}
-
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`, a page \
-              run's within it) and arena offsets below `ARENA_BYTES`, its index a class \
-              `class_of` bounds by `MAX_SMALL_SHIFT`, and a free never exceeds what is live"
-)]
-fn round_page(n: usize) -> usize {
-    n.div_ceil(PAGE) * PAGE
-}
-
-#[allow(
-    clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`, a page \
-              run's within it) and arena offsets below `ARENA_BYTES`, its index a class \
-              `class_of` bounds by `MAX_SMALL_SHIFT`, and a free never exceeds what is live"
+    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`) and \
+              arena offsets below `ARENA_BYTES`, and a free never exceeds what is live"
 )]
 impl Heap {
     fn base(&self) -> usize {
@@ -114,134 +77,55 @@ impl Heap {
         unsafe { &mut *self.state.get() }
     }
 
-    fn bump(&self, bytes: usize, align: usize) -> *mut u8 {
-        let state = self.state();
-        let start = (self.base() + state.top).next_multiple_of(align) - self.base();
-        let end = start + bytes;
-        if end > ARENA_BYTES {
-            return core::ptr::null_mut();
-        }
-        state.top = end;
-        (self.base() + start) as *mut u8
-    }
-
-    fn free_run(&self, address: usize, bytes: usize) {
-        let state = self.state();
-        if address + bytes == self.base() + state.top {
-            state.top -= bytes;
-            return;
-        }
-        if let Some(slot) = state.large.iter_mut().find(|slot| slot.0 == 0) {
-            *slot = (address, bytes);
-        }
+    /// Whether the block of `bytes` at `ptr` is the arena's last.
+    fn is_last(&self, ptr: *mut u8, bytes: usize) -> bool {
+        ptr as usize + bytes == self.base() + self.state().top
     }
 
     fn account(&self, grow: usize, shrink: usize) {
         let state = self.state();
         state.live = state.live + grow - shrink;
         state.peak_live = state.peak_live.max(state.live);
-        state.total += grow;
     }
 }
 
 #[allow(
     clippy::arithmetic_side_effects,
-    clippy::indexing_slicing,
-    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`, a page \
-              run's within it) and arena offsets below `ARENA_BYTES`, its index a class \
-              `class_of` bounds by `MAX_SMALL_SHIFT`, and a free never exceeds what is live"
+    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`) and \
+              arena offsets below `ARENA_BYTES`, and a free never exceeds what is live"
 )]
 unsafe impl GlobalAlloc for Heap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let state = self.state();
         state.allocs += 1;
-        let ptr = match class_of(&layout) {
-            Some(shift) => {
-                let slot = &mut state.free[(shift - MIN_SHIFT) as usize];
-                if *slot != 0 {
-                    let block = *slot;
-                    // SAFETY: a free block's first word is the next link.
-                    *slot = unsafe { *(block as *const usize) };
-                    block as *mut u8
-                } else {
-                    let bytes = 1usize << shift;
-                    self.bump(bytes, bytes.min(PAGE))
-                }
-            }
-            None => {
-                let bytes = round_page(layout.size());
-                let align = layout.align().max(PAGE);
-                let fit = state
-                    .large
-                    .iter_mut()
-                    .filter(|slot| slot.0 != 0 && slot.1 >= bytes && slot.0.is_multiple_of(align))
-                    .min_by_key(|slot| slot.1);
-                match fit {
-                    Some(slot) => {
-                        let (address, run) = *slot;
-                        *slot = if run > bytes {
-                            (address + bytes, run - bytes)
-                        } else {
-                            (0, 0)
-                        };
-                        address as *mut u8
-                    }
-                    None => self.bump(bytes, align),
-                }
-            }
-        };
-        if !ptr.is_null() {
-            self.account(layout.size(), 0);
+        let base = self.base();
+        let start = (base + state.top).next_multiple_of(layout.align()) - base;
+        let end = start + layout.size();
+        if end > ARENA_BYTES {
+            return core::ptr::null_mut();
         }
-        ptr
+        state.top = end;
+        self.account(layout.size(), 0);
+        (base + start) as *mut u8
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         self.account(0, layout.size());
-        match class_of(&layout) {
-            Some(shift) => {
-                let slot = &mut self.state().free[(shift - MIN_SHIFT) as usize];
-                // SAFETY: the block is at least 16 bytes and 8-aligned.
-                unsafe { *(ptr as *mut usize) = *slot };
-                *slot = ptr as usize;
-            }
-            None => self.free_run(ptr as usize, round_page(layout.size())),
+        if self.is_last(ptr, layout.size()) {
+            self.state().top -= layout.size();
         }
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: GlobalAlloc's contract: `layout.align()` is a power of two.
-        let new_layout = unsafe { Layout::from_size_align_unchecked(new_size, layout.align()) };
-        match (class_of(&layout), class_of(&new_layout)) {
-            (Some(old), Some(new)) if old == new => {
-                self.account(new_size, layout.size());
-                return ptr;
-            }
-            (None, None) => {
-                let old_run = round_page(layout.size());
-                let new_run = round_page(new_size);
-                let address = ptr as usize;
-                let state = self.state();
-                if new_run <= old_run {
-                    if new_run < old_run {
-                        self.free_run(address + new_run, old_run - new_run);
-                    }
-                    self.account(new_size, layout.size());
-                    return ptr;
-                }
-                if address + old_run == self.base() + state.top
-                    && state.top + (new_run - old_run) <= ARENA_BYTES
-                {
-                    state.top += new_run - old_run;
-                    self.account(new_size, layout.size());
-                    return ptr;
-                }
-            }
-            _ => {}
+        let state = self.state();
+        if self.is_last(ptr, layout.size()) && state.top - layout.size() + new_size <= ARENA_BYTES {
+            state.top = state.top - layout.size() + new_size;
+            self.account(new_size, layout.size());
+            return ptr;
         }
         // SAFETY: as GlobalAlloc::realloc's default.
         unsafe {
-            let new = self.alloc(new_layout);
+            let new = self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
             if !new.is_null() {
                 core::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size));
                 self.dealloc(ptr, layout);
