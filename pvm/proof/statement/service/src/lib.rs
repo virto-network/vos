@@ -77,8 +77,9 @@ pub const SLOT_MS: u64 = 6_000;
 
 /// The longest verdict refine outputs: a statement's of [`item::MAX_ROOTS`]
 /// roots (41 bytes each in the verdict), with its header (its tag, id,
-/// program, space, code and its roots' count), and the gas's 8 after it.
-pub const MAX_VERDICT_BYTES: usize = 1 + 32 * 3 + 4 + 1 + item::MAX_ROOTS * 41 + 8;
+/// program, space, code and its roots' compact count, two bytes at 64),
+/// and the gas's 8 after it.
+pub const MAX_VERDICT_BYTES: usize = 1 + 32 * 3 + 4 + 2 + item::MAX_ROOTS * 41 + 8;
 /// A work report's elective data, `W_R`: its outputs' bound.
 pub const REPORT_BYTES: usize = 48 << 10;
 
