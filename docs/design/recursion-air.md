@@ -749,7 +749,7 @@ verify_values}`), never `core::verifier::verify`, whose composition split
 is hardcoded (DIVERGENCE-004); the two facts it leaves to Stwo are pinned
 by the format: the trees' widths (57 / 381 / 48 / 20) and the FRI round
 list (`[3, 3, 3, 2]`). `R` has 8 columns, so it needs no rank check. A
-production venue links 39 alone (523,607 bytes as a PVM program); the
+production venue links 39 alone (397,976 bytes as a PVM program); the
 `valid` fixture verifies in 79.6M gas on the JAM-only host, its decode
 1.50M (`proving.md` §3.5).
 

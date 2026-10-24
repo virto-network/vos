@@ -1308,8 +1308,8 @@ check:
 The transition holds both ways: `S` accepted under one format is the same
 statement under the other, refused as a repeat. Past `MaxRootAge` a rooted
 replay is unanchored (its `Seen` entry and anchors dropped) and a rootless
-one is repeated (its entry kept). The production guest's program is 523,607
-bytes (the test guest's 611,088), within JAM's 4,000,000-byte bound on a
+one is repeated (its entry kept). The production guest's program is 397,976
+bytes (the test guest's 462,242), within JAM's 4,000,000-byte bound on a
 service's code, its only size bound.
 
 **A.7 Budgets per node (M1: measured, then pinned).** Heavy tests run
