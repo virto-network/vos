@@ -3,12 +3,22 @@ set shell := ["nu", "-c"]
 default:
     @just --list
 
+# The fast suites' crates, which `test` and `check` run.
+core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
+
+# The agent's suites' crates, which `test-agent` and `check` run.
+agent_crates := "-p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev"
+
+# A guest build for the PVM: the statement's target, its standard library
+# built from source.
+guest_flags := "--target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem"
+
 # Fast suites: runtime, compiler, program format, codec, support crates,
 # precompile shim, Poseidon2, verifier, the recursion AIR and its gate VM,
-# prover library, wire types. The node runs the
-# agent, so it is tested with it.
+# prover library, wire types. The node runs the agent, so it is tested
+# with it.
 test:
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures
+    cargo test {{core_crates}}
     just test-recair
     cargo test -p vos-pvm-proof --lib
 
@@ -65,12 +75,11 @@ vectors:
 # leakage tests at a medium N (500 proofs a witness on the small circuit, 16
 # on the real wrap; `LEAKAGE_N` and `LEAKAGE_WRAP_N` set others, and
 # `slice-gate` the full 2,000 and 32), the masked acceptance above 2^16
-# rows, and the final
-# verifier's decode, verify and Wasm gates as the maximum over 12 seeds of
-# the masked wrap (on the JAM-only host's `final-verify.elf`, built by
-# `check-no-std`, and `judge-wasm`'s blob), one test at a time. Last, the
-# wrap files the suites wrote checked to be final wraps alone, and the
-# carrier audit (`test-carriers`).
+# rows, and the final verifier's decode, verify and Wasm gates as the
+# maximum over 12 seeds of the masked wrap (on the JAM-only host's
+# `final-verify.elf`, built by `check-no-std`, and `judge-wasm`'s blob),
+# one test at a time. Last, the wrap files the suites wrote checked to be
+# final wraps alone, and the carrier audit (`test-carriers`).
 test-proof: build-test-actors judge-wasm
     cargo test -p vos-pvm-proof --features debug-internals --lib --bins --test gates --test isa -- --test-threads=2
     for test in (cargo test -p vos-pvm-proof --features debug-internals --test kernel -- --list --format terse --skip reads:: --skip wrap_files:: | lines | where {|line| $line ends-with ': test' } | each {|line| $line | str replace ': test' '' }) { cargo test -p vos-pvm-proof --features debug-internals --test kernel $test -- --exact --test-threads=1 }
@@ -101,9 +110,7 @@ judge-wasm:
     cd pvm/proof/final-verifier/wasm/blob; cargo build --release
     cd pvm/proof/final-verifier/wasm/blob; cargo build --release --features test-formats --target-dir target/test-formats
     cd pvm/proof/final-verifier/wasm/run; cargo build --release
-    for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm $semantics judge pvm/proof/fixtures 39 }
-    for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm $semantics judge pvm/proof/fixtures 28,39 }
-    for semantics in [pvf client] { ^pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm $semantics anchors }
+    let run = "pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run"; for case in [[blob task]; ["wasm32-unknown-unknown" ["judge" "pvm/proof/fixtures" "39"]] ["test-formats/wasm32-unknown-unknown" ["judge" "pvm/proof/fixtures" "28,39"]] ["wasm32-unknown-unknown" ["anchors"]]] { for semantics in [pvf client] { ^$run $"pvm/proof/final-verifier/wasm/blob/target/($case.blob)/release/vos_pvm_final_verifier_wasm.wasm" $semantics ...$case.task } }
 
 # The proof fixtures under `pvm/proof/fixtures` (`proving.md` A.6), written
 # anew by their generator, `pvm/proof/tests/kernel/fixtures.rs`: at a format bump,
@@ -182,11 +189,15 @@ build-agent:
 build-representative:
     cd agent/representative; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
 
+# The JAM statements service's program, `statement-service.elf`.
+build-statement-service:
+    cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service {{guest_flags}}
+
 # The SDK, its macros' restrictions, the test actors on the testkit, the
 # default agent against it, the checker's own model, the node running the
 # agent, the network between nodes, and the `vos` command.
 test-agent: build-test-actors build-agent build-representative
-    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev
+    cargo test {{agent_crates}}
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
     just test-reads
@@ -204,8 +215,7 @@ jam-testnet: build-test-actors build-agent
 # each outcome read back, every refine's gas against the JAM-only host's.
 # `bash tools/jam-dev/testnet.sh both` deploys it beside the default agent.
 # Outside `ci`, as `jam-testnet` is.
-jam-statements-testnet:
-    cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+jam-statements-testnet: build-statement-service
     bash tools/jam-dev/testnet.sh statements
 
 # The end to end on chain, on a local PolkaJam testnet it starts and stops
@@ -218,8 +228,7 @@ jam-statements-testnet:
 # is: it needs the PolkaJam binaries and a C compiler. About 25 minutes, one
 # masked proof at a time (about 6 GiB): run it under a 12 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just e2e-chain`.
-e2e-chain: build-test-actors build-agent build-representative
-    cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
+e2e-chain: build-test-actors build-agent build-representative build-statement-service
     cargo test -p vos-node --features chain --test chain --no-run
     bash tools/jam-dev/testnet.sh chain
 
@@ -348,8 +357,8 @@ check-no-debug-internals: (_forbidden "debug-internals") _debug-names-absent
 # that venues or nodes run (the agent, the final verifier's Wasm blob, its
 # runner), enables it (the tests enable it on dev edges, the harnesses' test
 # builds by name); and `vos-statement`'s `fixtures` and `pvm-guest`, and the
-# JAM statements service's program, do not imply it. The fuzz targets, built apart, fuzz format 28's decode and
-# verifier too, and are no venue.
+# JAM statements service's program, do not imply it. The fuzz targets,
+# built apart, fuzz format 28's decode and verifier too, and are no venue.
 check-no-test-formats: (_forbidden "test-formats")
     print "no test formats in a production build"
 
@@ -391,12 +400,12 @@ check-no-std:
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-anchor --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
     cargo build -p vos-statement --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-statement --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
-    cargo build -p vos-statement --release --features pvm-guest --bin final-verify --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
-    cargo build -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
-    cargo clippy -p vos-statement --release --features pvm-guest --bin final-verify --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --quiet -- -D warnings
-    cargo clippy -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --quiet -- -D warnings
-    cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem
-    cargo clippy -p vos-statement-service --release --features pvm-guest --bin statement-service --target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem --quiet -- -D warnings
+    cargo build -p vos-statement --release --features pvm-guest --bin final-verify {{guest_flags}}
+    cargo build -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test {{guest_flags}}
+    cargo clippy -p vos-statement --release --features pvm-guest --bin final-verify {{guest_flags}} --quiet -- -D warnings
+    cargo clippy -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test {{guest_flags}} --quiet -- -D warnings
+    just build-statement-service
+    cargo clippy -p vos-statement-service --release --features pvm-guest --bin statement-service {{guest_flags}} --quiet -- -D warnings
     cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --quiet -- -D warnings
     cd pvm/proof/final-verifier/wasm/blob; cargo clippy --release --features test-formats --target-dir target/test-formats --quiet -- -D warnings
 
@@ -479,7 +488,8 @@ fuzz secs="60":
 
 # Checks before pushing: everything except proving.
 # The quick gate, after each change: formatting, the docs' links, the
-# builds without std, the verifier kit, the workspace's lints, and the suites of the node, the agent, vos-raft and the crates under them.
+# builds without std, the verifier kit, the workspace's lints, and the
+# suites of the node, the agent, vos-raft and the crates under them.
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
@@ -487,9 +497,9 @@ check: fmt-check doc-check check-no-std check-no-leaks check-kit build-test-acto
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     just clippy-prover
-    cargo test -p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures
+    cargo test {{core_crates}}
     just test-recair
-    cargo test -p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev
+    cargo test {{agent_crates}}
     just test-reads
 
 # The live runs of reads at a cut on the agent's model, with no proving:
