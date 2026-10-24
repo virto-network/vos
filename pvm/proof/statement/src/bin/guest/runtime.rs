@@ -3,7 +3,6 @@
 //! `vos-statement-service`'s): a stack of its own, the heap, the host-call
 //! convention, the panic handler and the single-core atomic libcalls.
 
-use core::alloc::{GlobalAlloc, Layout};
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 
@@ -24,116 +23,15 @@ unsafe impl Sync for Stack {}
 #[unsafe(no_mangle)]
 pub static VERIFY_STACK: Stack = Stack(UnsafeCell::new([0; STACK_BYTES]));
 
-// ── The allocator: a bump over the arena ─────────────────────────────────
-//
-// An invocation verifies one proof, or applies one block's operands, and
-// ends: what it frees is reclaimed only when it is the arena's last block,
-// so an allocation is a few instructions, which on the PVM's per-block gas
-// is most of what a decode costs.
+// ── The allocator ────────────────────────────────────────────────────────
 
-#[repr(C, align(4096))]
-struct Arena([u8; ARENA_BYTES]);
+#[path = "heap.rs"]
+mod heap;
 
-pub struct State {
-    /// Bump offset into the arena: the high-water mark.
-    pub top: usize,
-    live: usize,
-    pub peak_live: usize,
-    pub allocs: usize,
-}
-
-pub struct Heap {
-    arena: UnsafeCell<Arena>,
-    state: UnsafeCell<State>,
-}
-
-// SAFETY: a PVM invocation is single-threaded.
-unsafe impl Sync for Heap {}
+pub use heap::Heap;
 
 #[global_allocator]
-pub static HEAP: Heap = Heap {
-    arena: UnsafeCell::new(Arena([0; ARENA_BYTES])),
-    state: UnsafeCell::new(State {
-        top: 0,
-        live: 0,
-        peak_live: 0,
-        allocs: 0,
-    }),
-};
-
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`) and \
-              arena offsets below `ARENA_BYTES`, and a free never exceeds what is live"
-)]
-impl Heap {
-    fn base(&self) -> usize {
-        self.arena.get() as usize
-    }
-
-    #[allow(clippy::mut_from_ref)]
-    pub fn state(&self) -> &mut State {
-        // SAFETY: single-threaded, and no borrow outlives a call.
-        unsafe { &mut *self.state.get() }
-    }
-
-    /// Whether the block of `bytes` at `ptr` is the arena's last.
-    fn is_last(&self, ptr: *mut u8, bytes: usize) -> bool {
-        ptr as usize + bytes == self.base() + self.state().top
-    }
-
-    fn account(&self, grow: usize, shrink: usize) {
-        let state = self.state();
-        state.live = state.live + grow - shrink;
-        state.peak_live = state.peak_live.max(state.live);
-    }
-}
-
-#[allow(
-    clippy::arithmetic_side_effects,
-    reason = "the allocator's: its sums are of `Layout` sizes (at most `isize::MAX`) and \
-              arena offsets below `ARENA_BYTES`, and a free never exceeds what is live"
-)]
-unsafe impl GlobalAlloc for Heap {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let state = self.state();
-        state.allocs += 1;
-        let base = self.base();
-        let start = (base + state.top).next_multiple_of(layout.align()) - base;
-        let end = start + layout.size();
-        if end > ARENA_BYTES {
-            return core::ptr::null_mut();
-        }
-        state.top = end;
-        self.account(layout.size(), 0);
-        (base + start) as *mut u8
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        self.account(0, layout.size());
-        if self.is_last(ptr, layout.size()) {
-            self.state().top -= layout.size();
-        }
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let state = self.state();
-        if self.is_last(ptr, layout.size()) && state.top - layout.size() + new_size <= ARENA_BYTES {
-            state.top = state.top - layout.size() + new_size;
-            self.account(new_size, layout.size());
-            return ptr;
-        }
-        // SAFETY: as GlobalAlloc::realloc's default.
-        unsafe {
-            let new = self.alloc(Layout::from_size_align_unchecked(new_size, layout.align()));
-            if !new.is_null() {
-                core::ptr::copy_nonoverlapping(ptr, new, layout.size().min(new_size));
-                self.dealloc(ptr, layout);
-            }
-            new
-        }
-    }
-}
+pub static HEAP: Heap<ARENA_BYTES> = Heap::new();
 
 // ── Host calls ───────────────────────────────────────────────────────────
 

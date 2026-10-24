@@ -136,7 +136,7 @@ extern "C" fn verify_main() -> Output {
     report.gas_end = gas_left();
     let state = HEAP.state();
     report.peak_live = state.peak_live as u64;
-    report.high_water = state.top as u64;
+    report.high_water = HEAP.peak_top() as u64;
     report.allocs = state.allocs as u64;
     Output {
         address: report as *mut Report as u64,
