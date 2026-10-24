@@ -9,7 +9,6 @@ use std::time::{Duration, Instant};
 
 use ed25519_dalek::Signer;
 use vos_venue::AnchorRefusal;
-use vos_wire::Decode;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
 use vos_wire::vos_anchor::{Anchor, RootKind, RootRead, space_root};
@@ -198,37 +197,31 @@ impl Leader {
         };
         let (space, _) = self.inner.space_and_clock();
         let mut kept = BTreeSet::new();
-        for row in snapshot.scan(self.id, &keys::cut_roots(), None) {
-            let (key, value) = row?;
-            let Some(window) = keys::cut_root_entry(&key).filter(|window| *window <= through)
-            else {
-                continue;
-            };
+        let cut_roots = roots::cut_roots(snapshot, self.id).map_err(fault)?;
+        for (&window, &(root, _)) in cut_roots.range(..=through) {
             kept.insert(window);
             if self.anchoring.refused.contains(&window) {
                 continue;
             }
-            let Some((root, _)) = <([u8; 32], u64)>::decode_exact(&value) else {
-                return Err(fault(roots::Error::Corrupt("a cut root")));
-            };
             let closing = roots::closing_of(snapshot, self.id, window).map_err(fault)?;
             if closing.is_some_and(|closing| closing.root != root) {
                 return Err(fault(roots::Error::Corrupt(
                     "a close whose root is not its cut's",
                 )));
             }
+            let root = space_root(&space, window, &root);
             let held = venue.anchored(&RootRead {
                 kind: RootKind::Space,
                 space,
                 window,
-                root: space_root(&space, window, &root),
+                root,
             });
             if !held {
-                let root = space_root(&space, window, &root);
                 self.anchoring.unanchored.entry(window).or_insert(root);
             }
         }
-        let back: Vec<u64> = venue.unsettled(&space).iter().map(|a| a.window).collect();
+        let handed: Vec<Anchor> = venue.unsettled(&space);
+        let back: Vec<u64> = handed.iter().map(|anchor| anchor.window).collect();
         self.anchoring
             .refused
             .retain(|window| kept.contains(window) || back.contains(window));
@@ -237,20 +230,10 @@ impl Leader {
                 || back.contains(window)
                 || self.anchoring.unanchored.contains_key(window)
         };
-        let handed: Vec<Anchor> = venue.unsettled(&space);
         self.anchoring
             .foreign
             .retain(|anchor| handed.contains(anchor));
-        let signed: Vec<u64> = self
-            .anchoring
-            .signed
-            .keys()
-            .copied()
-            .filter(|w| !waiting(w))
-            .collect();
-        for window in signed {
-            self.anchoring.signed.remove(&window);
-        }
+        self.anchoring.signed.retain(|window, _| waiting(window));
         Ok(())
     }
 

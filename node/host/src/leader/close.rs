@@ -68,20 +68,13 @@ impl Leader {
         let reported =
             read::<(u64, AgentId)>(snapshot, self.id, &keys::reported())?.map(|(window, _)| window);
         let mut due = Vec::new();
-        for row in snapshot.scan(self.id, &keys::cut_roots(), None) {
-            let (key, value) = row?;
-            let Some(window) = keys::cut_root_entry(&key) else {
-                continue;
-            };
+        for (window, (root, _)) in roots::cut_roots(snapshot, self.id).map_err(fault)? {
             if reported.is_some_and(|reported| window <= reported) {
                 continue;
             }
             if !self.inner.hooks.report(self.id, window) {
                 break;
             }
-            let Some((root, _)) = <([u8; 32], u64)>::decode_exact(&value) else {
-                return Err(fault(roots::Error::Corrupt("a cut root")));
-            };
             let pending = !roots::served_at(snapshot, self.id, window)
                 .map_err(fault)?
                 .is_empty();
@@ -142,13 +135,12 @@ fn unsent(snapshot: &Snapshot, agent: AgentId, represents: bool) -> Result<Vec<U
     let mark = read::<(u64, Option<AgentId>)>(snapshot, agent, &keys::close_mark())?;
     let mut unsent = Vec::new();
     for row in snapshot.scan(agent, &keys::closings(), None) {
-        let (key, _) = row?;
+        let (key, value) = row?;
         let Some(window) = keys::closing_entry(&key) else {
             continue;
         };
-        let Some(mut closing) = roots::closing_of(snapshot, agent, window).map_err(fault)? else {
-            continue;
-        };
+        let mut closing =
+            Closing::decode_exact(&value).ok_or_else(|| fault(roots::Error::Corrupt("a close")))?;
         match mark {
             Some((closed, _)) if closed > window => continue,
             Some((closed, None)) if closed == window => continue,

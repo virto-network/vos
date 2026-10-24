@@ -38,7 +38,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use vos_tree::{BatchProof, Blake2b, Child, Hash, Leaf, Node, NodeStore, empty_root, node_at};
 use vos_wire::ids::{AgentId, MapId};
 use vos_wire::keys;
-use vos_wire::records::unstored;
+use vos_wire::records::{unstored, unversioned};
 use vos_wire::{Decode, Encode, scale};
 
 use crate::store::Snapshot;
@@ -52,7 +52,7 @@ pub(crate) use build::build;
 pub use cuts::{
     CutProof, ReadRow, cut_proof, cut_proof_at, cut_root, latest_built, served_at, undo,
 };
-pub(crate) use cuts::{answered, closing_of, serving_windows};
+pub(crate) use cuts::{answered, closing_of, cut_roots, serving_windows};
 
 /// The most distinct keys one batch rebuilds.
 pub(crate) const BATCH: usize = 10_000;
@@ -118,9 +118,7 @@ pub(crate) struct RootRow {
 impl RootRow {
     /// The row a complete build leaves: its root the top's.
     fn complete(top: Option<Child>) -> Self {
-        let root = top
-            .as_ref()
-            .map_or_else(|| empty_root(&Blake2b), |top| *top.hash());
+        let root = root_of(top.as_ref());
         Self { top, root }
     }
 
@@ -130,14 +128,29 @@ impl RootRow {
     }
 }
 
+/// `bytes`, when there are any, as exactly one `T`; `what` corrupt
+/// otherwise.
+fn decoded<T: Decode>(bytes: Option<Vec<u8>>, what: &'static str) -> Result<Option<T>, Error> {
+    bytes
+        .map(|bytes| T::decode_exact(&bytes).ok_or(Error::Corrupt(what)))
+        .transpose()
+}
+
+/// A stored value row's version and value.
+fn value_row(stored: &[u8]) -> Result<(u64, &[u8]), Error> {
+    unstored(stored)
+        .and_then(unversioned)
+        .ok_or(Error::Corrupt("a value row"))
+}
+
+/// The root of the tree whose top is `top`: the empty tree's when none.
+fn root_of(top: Option<&Child>) -> Hash {
+    top.map_or_else(|| empty_root(&Blake2b), |top| *top.hash())
+}
+
 /// The agent's root row, as `snapshot` holds it.
 pub(crate) fn root_row(snapshot: &Snapshot, agent: AgentId) -> Result<Option<RootRow>, Error> {
-    let Some(bytes) = snapshot.get(agent, &keys::tree_root())? else {
-        return Ok(None);
-    };
-    RootRow::decode_exact(&bytes)
-        .map(Some)
-        .ok_or(Error::Corrupt("a root row"))
+    decoded(snapshot.get(agent, &keys::tree_root())?, "a root row")
 }
 
 /// The agent's root, over its committed rows, and the state version it
@@ -162,8 +175,7 @@ pub fn agent_root(snapshot: &Snapshot, agent: AgentId) -> Result<(Hash, u64), Er
 /// prefix, and the state version it holds, as `snapshot` has them.
 pub fn root(snapshot: &Snapshot, agent: AgentId, map: &MapId) -> Result<(Hash, u64), Error> {
     let (top, version) = map_top(snapshot, agent, map)?;
-    let root = top.map_or_else(|| empty_root(&Blake2b), |top| *top.hash());
-    Ok((root, version))
+    Ok((root_of(top.as_ref()), version))
 }
 
 /// The node at `map`'s prefix, `None` while the map is empty, and the
@@ -285,9 +297,7 @@ pub(crate) fn prove<K: AsRef<[u8]>>(
     keys: &[K],
 ) -> Result<Proven, Error> {
     let (top, version) = map_top(snapshot, agent, &map)?;
-    let root = top
-        .as_ref()
-        .map_or_else(|| empty_root(&Blake2b), |top| *top.hash());
+    let root = root_of(top.as_ref());
     let store = AgentStore::new(snapshot, agent, top);
     let rows: Vec<Vec<u8>> = keys
         .iter()
@@ -344,12 +354,7 @@ impl<'a> AgentStore<'a> {
             Some(written) => written.clone(),
             None => self.snapshot.get(self.agent, key)?,
         };
-        let Some(bytes) = bytes else {
-            return Ok(None);
-        };
-        T::decode_exact(&bytes)
-            .map(Some)
-            .ok_or(Error::Corrupt(what))
+        decoded(bytes, what)
     }
 }
 

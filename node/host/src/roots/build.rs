@@ -8,7 +8,7 @@ use vos_tree::{Blake2b, Child, Leaf, empty_root};
 use vos_wire::Encode;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
-use vos_wire::records::{unstored, unversioned};
+use vos_wire::records::unstored;
 use vos_wire::result::Write;
 
 use super::{
@@ -237,10 +237,7 @@ impl Build {
         }
         writes.insert(keys::built(), Some(self.version.encode()));
         if let Some(cut) = self.cut {
-            let root = tree
-                .top
-                .as_ref()
-                .map_or_else(|| empty_root(&Blake2b), |top| *top.hash());
+            let root = super::root_of(tree.top.as_ref());
             let finish = cuts::Finish {
                 agent: self.agent,
                 cut,
@@ -299,9 +296,7 @@ impl Build {
         let Some(bytes) = bytes else {
             return Ok(None);
         };
-        let (version, value) = unstored(&bytes)
-            .and_then(unversioned)
-            .ok_or(Error::Corrupt("a value row"))?;
+        let (version, value) = super::value_row(&bytes)?;
         let seed = match seeds.get(&version) {
             Some(seed) => *seed,
             None => {

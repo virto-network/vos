@@ -36,13 +36,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use vos_tree::{BatchProof, Hash, NodeStore};
 use vos_wire::ids::{AgentId, RequestId};
 use vos_wire::keys::{self, Transform};
-use vos_wire::records::{PendingRead, unstored, unversioned};
+use vos_wire::records::{PendingRead, unstored};
 use vos_wire::result::Write;
 use vos_wire::served::{ASKED_TAG, Closing, REPRESENTATIVE, representative_row};
 use vos_wire::vos_anchor::RootKind;
 use vos_wire::{Decode, Encode, defaults, scale};
 
-use super::{AgentStore, Error};
+use super::{AgentStore, Error, decoded, value_row};
 use crate::store::Snapshot;
 
 pub use vos_wire::served::ReadRow;
@@ -63,7 +63,7 @@ pub struct CutProof {
 }
 
 /// The root at the cut of a window: the root, and the cut's version.
-type CutRoot = (Hash, u64);
+pub(crate) type CutRoot = (Hash, u64);
 
 /// A window's cut: the window, and the cut's version.
 #[derive(Clone, Copy, Debug)]
@@ -73,7 +73,10 @@ pub(super) struct Cut {
 }
 
 /// The cuts whose roots this replica keeps, by window.
-fn cut_roots(snapshot: &Snapshot, agent: AgentId) -> Result<BTreeMap<u64, CutRoot>, Error> {
+pub(crate) fn cut_roots(
+    snapshot: &Snapshot,
+    agent: AgentId,
+) -> Result<BTreeMap<u64, CutRoot>, Error> {
     snapshot
         .scan(agent, &keys::cut_roots(), None)
         .map(|row| {
@@ -209,9 +212,7 @@ pub fn undo(snapshot: &Snapshot, agent: AgentId, writes: &[Write]) -> Result<Vec
         let Some(stored) = snapshot.get(agent, row)? else {
             continue;
         };
-        let (version, _) = unstored(&stored)
-            .and_then(unversioned)
-            .ok_or(Error::Corrupt("a value row"))?;
+        let (version, _) = value_row(&stored)?;
         for cut in &cuts {
             if version <= cut.version {
                 undo.push(Write {
@@ -230,13 +231,8 @@ pub fn cut_root(
     snapshot: &Snapshot,
     agent: AgentId,
     window: u64,
-) -> Result<Option<(Hash, u64)>, Error> {
-    let Some(bytes) = snapshot.get(agent, &keys::cut_root(window))? else {
-        return Ok(None);
-    };
-    CutRoot::decode_exact(&bytes)
-        .map(Some)
-        .ok_or(Error::Corrupt("a cut root"))
+) -> Result<Option<CutRoot>, Error> {
+    decoded(snapshot.get(agent, &keys::cut_root(window))?, "a cut root")
 }
 
 /// The rows and proof this replica persisted for `request` at the latest
@@ -250,12 +246,7 @@ pub fn cut_proof(
         .scan(agent, &keys::cut_proofs_of(request), None)
         .last()
         .transpose()?;
-    let Some((_, bytes)) = latest else {
-        return Ok(None);
-    };
-    CutProof::decode_exact(&bytes)
-        .map(Some)
-        .ok_or(Error::Corrupt("a cut proof"))
+    decoded(latest.map(|(_, bytes)| bytes), "a cut proof")
 }
 
 /// The rows and proof this replica persisted for `request` at window
@@ -266,12 +257,10 @@ pub fn cut_proof_at(
     request: RequestId,
     window: u64,
 ) -> Result<Option<CutProof>, Error> {
-    let Some(bytes) = snapshot.get(agent, &keys::cut_proof(request, window))? else {
-        return Ok(None);
-    };
-    CutProof::decode_exact(&bytes)
-        .map(Some)
-        .ok_or(Error::Corrupt("a cut proof"))
+    decoded(
+        snapshot.get(agent, &keys::cut_proof(request, window))?,
+        "a cut proof",
+    )
 }
 
 /// The stored bytes of the committed row `row` at `cut`, as `at` holds the
@@ -289,9 +278,7 @@ pub(super) fn at_cut(
     let Some(stored) = at.get(agent, row)? else {
         return Ok(None);
     };
-    let (written, _) = unstored(&stored)
-        .and_then(unversioned)
-        .ok_or(Error::Corrupt("a value row"))?;
+    let (written, _) = value_row(&stored)?;
     Ok((written <= cut.version).then_some(stored))
 }
 
@@ -488,12 +475,7 @@ pub fn closing_of(
     agent: AgentId,
     window: u64,
 ) -> Result<Option<Closing>, Error> {
-    let Some(bytes) = snapshot.get(agent, &keys::closing(window))? else {
-        return Ok(None);
-    };
-    Closing::decode_exact(&bytes)
-        .map(Some)
-        .ok_or(Error::Corrupt("a close"))
+    decoded(snapshot.get(agent, &keys::closing(window))?, "a close")
 }
 
 /// The proof of `read` at `cut`: each row's leaf off `tree`, its value off
@@ -512,9 +494,7 @@ fn prove(
         let value = at_cut(at, agent, cut, row)?;
         let held = match (leaf, value) {
             (Some(leaf), Some(stored)) => {
-                let (_, value) = unstored(&stored)
-                    .and_then(unversioned)
-                    .ok_or(Error::Corrupt("a value row"))?;
+                let (_, value) = value_row(&stored)?;
                 Some((leaf.salt, value.to_vec()))
             }
             (None, None) => None,
