@@ -44,7 +44,8 @@ fn log_entries(node: &Node, agent: AgentId) -> Vec<u8> {
 
 /// What each node holds and sent, and both venues' anchor chains,
 /// collected before the nodes stop and the chain's clock moves; then the
-/// nodes stopped.
+/// nodes stopped and their disks read, every file closed and none
+/// changing under the read.
 pub fn nodes(run: &mut Run) -> Audit {
     let mut audit = Audit::default();
     audit.carrier("the anchor chains", Reach::Leaves, run.anchor_chains());
@@ -82,14 +83,14 @@ pub fn nodes(run: &mut Run) -> Audit {
         let name = format!("node {number}: the store's rows");
         audit.carrier(name, Reach::Role, carriers::store(node.store()));
     }
+    for number in 1..=3 {
+        run.cluster.stop(number);
+    }
     for (at, dir) in run.cluster.dirs.iter().enumerate() {
         let number = at as NodeNumber + 1;
         for (path, bytes) in carriers::directory(dir.path()) {
             audit.carrier(format!("node {number}: {path}"), Reach::Role, bytes);
         }
-    }
-    for number in 1..=3 {
-        run.cluster.stop(number);
     }
     audit
 }

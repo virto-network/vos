@@ -130,25 +130,44 @@ pub fn submission_carriers(statement: &Statement, proof: &[u8]) -> Vec<(String, 
     ]
 }
 
-/// Every file under `dir`, read whole, in path order: what a node wrote
-/// to its disk.
+/// Every file under `dir`, read whole, in path order, and then the names of
+/// every file and directory under it, one a line, as `<dir>: names`: what a
+/// node wrote to its disk. Fails on a directory or file that cannot be
+/// read, rather than leave its bytes unsearched; a file removed since it
+/// was listed is named and not read.
 pub fn directory(dir: &std::path::Path) -> Vec<(String, Vec<u8>)> {
     let mut files = Vec::new();
+    let mut names = Vec::new();
     let mut pending = vec![dir.to_path_buf()];
     while let Some(dir) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        let entries = std::fs::read_dir(&dir)
+            .unwrap_or_else(|error| panic!("{} is not read: {error}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|error| {
+                    panic!("an entry of {} is not read: {error}", dir.display())
+                })
+                .path();
+            names.push(path.display().to_string());
             if path.is_dir() {
                 pending.push(path);
-            } else if let Ok(bytes) = std::fs::read(&path) {
-                files.push((path.display().to_string(), bytes));
+            } else {
+                match std::fs::read(&path) {
+                    Ok(bytes) => files.push((path.display().to_string(), bytes)),
+                    // Removed since it was listed, by a process still
+                    // running: its name stays in the names.
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => panic!("{} is not read: {error}", path.display()),
+                }
             }
         }
     }
     files.sort();
+    names.sort();
+    files.push((
+        format!("{}: names", dir.display()),
+        names.join("\n").into_bytes(),
+    ));
     files
 }
 

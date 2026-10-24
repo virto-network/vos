@@ -141,7 +141,7 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
     let tapped = Arc::new(carriers::Tapped::new(venue.clone()));
     let prover = Arc::new(Disclosing::default());
     let canary = Arc::new(Canary::default());
-    let cluster = {
+    let mut cluster = {
         let venue: Arc<dyn VenueClient> = tapped.clone();
         let prover: Arc<dyn Prover> = prover.clone();
         let hooks: Arc<dyn Hooks> = canary.clone();
@@ -294,6 +294,11 @@ fn no_carrier_that_leaves_the_prover_role_holds_its_internals() {
             reach(number),
             carriers::store(node.store()),
         );
+    }
+    // The disks once the nodes stop, every file closed.
+    let numbers: Vec<NodeNumber> = cluster.running().map(|(number, _)| number).collect();
+    for number in numbers {
+        cluster.stop(number);
     }
     for (at, dir) in cluster.dirs.iter().enumerate() {
         let number = at as NodeNumber + 1;
