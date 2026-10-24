@@ -10,7 +10,10 @@ core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-cod
 agent_crates := "-p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev"
 
 # A guest build for the PVM: the statement's target, its standard library
-# built from source.
+# built from source. Every guest and blob build sets `CARGO_INCREMENTAL` to
+# 0: an incremental build, which the environment's `CARGO_INCREMENTAL=1`
+# forces over the release profile, links other code, which the program ids
+# and blob hashes pin and the transpiler may refuse.
 guest_flags := "--target pvm/proof/statement/riscv64em-vos.json -Zbuild-std=core,alloc,compiler_builtins -Zbuild-std-features=compiler-builtins-mem"
 
 # Fast suites: runtime, compiler, program format, codec, support crates,
@@ -30,7 +33,7 @@ test-recair:
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
-    for guest in [workflows actor agent hash-software hash-precompile diverse] { do { cd $"pvm/bench/guests/($guest)"; cargo build --release --target ../../../guest/riscv64em-vos.json } }
+    with-env { CARGO_INCREMENTAL: "0" } { for guest in [workflows actor agent hash-software hash-precompile diverse] { do { cd $"pvm/bench/guests/($guest)"; cargo build --release --target ../../../guest/riscv64em-vos.json } } }
 
 # Cross-host checks that need the bench guests. The bench tests that prove
 # run in `test-bench-proof`.
@@ -108,8 +111,8 @@ test-carriers: build-test-actors build-agent build-representative
 # golden vectors computed by the production blob, every digest the pinned
 # bytes.
 judge-wasm:
-    cd pvm/proof/final-verifier/wasm/blob; cargo build --release
-    cd pvm/proof/final-verifier/wasm/blob; cargo build --release --features test-formats --target-dir target/test-formats
+    with-env { CARGO_INCREMENTAL: "0" } { cd pvm/proof/final-verifier/wasm/blob; cargo build --release }
+    with-env { CARGO_INCREMENTAL: "0" } { cd pvm/proof/final-verifier/wasm/blob; cargo build --release --features test-formats --target-dir target/test-formats }
     cd pvm/proof/final-verifier/wasm/run; cargo build --release
     let run = "pvm/proof/final-verifier/wasm/run/target/release/vos-pvm-final-verifier-wasm-run"; for case in [[blob task]; ["wasm32-unknown-unknown" ["judge" "pvm/proof/fixtures" "39"]] ["test-formats/wasm32-unknown-unknown" ["judge" "pvm/proof/fixtures" "28,39"]] ["wasm32-unknown-unknown" ["anchors"]]] { for semantics in [pvf client] { ^$run $"pvm/proof/final-verifier/wasm/blob/target/($case.blob)/release/vos_pvm_final_verifier_wasm.wasm" $semantics ...$case.task } }
 
@@ -180,19 +183,19 @@ jar-check:
 
 # The SDK's test actors, built with the guest toolchain in `pvm/guest`.
 build-test-actors:
-    cd agent/test-actors; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
+    with-env { CARGO_INCREMENTAL: "0" } { cd agent/test-actors; cargo build --release --target ../../pvm/guest/riscv64em-vos.json }
 
 # The default agent program, built with the guest toolchain in `pvm/guest`.
 build-agent:
-    cd agent/default; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
+    with-env { CARGO_INCREMENTAL: "0" } { cd agent/default; cargo build --release --target ../../pvm/guest/riscv64em-vos.json }
 
 # The space's representative, built with the guest toolchain in `pvm/guest`.
 build-representative:
-    cd agent/representative; cargo build --release --target ../../pvm/guest/riscv64em-vos.json
+    with-env { CARGO_INCREMENTAL: "0" } { cd agent/representative; cargo build --release --target ../../pvm/guest/riscv64em-vos.json }
 
 # The JAM statements service's program, `statement-service.elf`.
 build-statement-service:
-    cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service {{guest_flags}}
+    with-env { CARGO_INCREMENTAL: "0" } { cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service {{guest_flags}} }
 
 # The SDK, its macros' restrictions, the test actors on the testkit, the
 # default agent against it, the checker's own model, the node running the
@@ -413,8 +416,8 @@ check-no-std:
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-anchor --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
     cargo build -p vos-statement --target thumbv7em-none-eabihf -Zbuild-std=core,alloc
     with-env { RUSTFLAGS: "-Zallow-features=" } { cargo build -p vos-statement --target wasm32-unknown-unknown --target-dir target/no-nightly-features }
-    cargo build -p vos-statement --release --features pvm-guest --bin final-verify {{guest_flags}}
-    cargo build -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test {{guest_flags}}
+    with-env { CARGO_INCREMENTAL: "0" } { cargo build -p vos-statement --release --features pvm-guest --bin final-verify {{guest_flags}} }
+    with-env { CARGO_INCREMENTAL: "0" } { cargo build -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test {{guest_flags}} }
     cargo clippy -p vos-statement --release --features pvm-guest --bin final-verify {{guest_flags}} --quiet -- -D warnings
     cargo clippy -p vos-statement --release --features pvm-guest,test-formats --bin final-verify-test {{guest_flags}} --quiet -- -D warnings
     just build-statement-service
