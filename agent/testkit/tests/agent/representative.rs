@@ -7,9 +7,9 @@
 //! rows of old windows gone; and no program's call writes any of it.
 
 use vos_testkit::Testkit;
-use vos_testkit::programs::{derivation, representative_package, table_tag};
+use vos_testkit::programs::{representative_package, table_tag};
 use vos_wire::abi::cap::Target;
-use vos_wire::batch::{Admin, Body, Input, Message};
+use vos_wire::batch::{Body, Input, Message};
 use vos_wire::ids::{AgentId, MethodId, Principal, derive_id};
 use vos_wire::keys::{self, Transform};
 use vos_wire::records::unversioned;
@@ -19,6 +19,8 @@ use vos_wire::served::{
 };
 use vos_wire::vos_anchor::{MIN_LENGTH_MS, RootKind};
 use vos_wire::{Encode, SpaceId, WindowClock};
+
+use crate::common::{Node, agrees, install_in, ran};
 
 const CLOCK: WindowClock = WindowClock {
     origin_ms: MIN_LENGTH_MS / 5,
@@ -30,8 +32,6 @@ fn at(window: u64) -> u64 {
     CLOCK.boundary(window).unwrap() - 1
 }
 
-use crate::common::{AGENT, Node, agrees, ran};
-
 const SPACE: SpaceId = SpaceId([0x5a; 32]);
 
 /// The representative installed as `AGENT`'s instance 0, in a node and the
@@ -40,17 +40,14 @@ fn representative() -> (Node, Testkit) {
     let package = representative_package();
     let derived = vos_pvm_compiler::derive(&package).unwrap();
     let mut node = Node::new();
-    node.add(&derived.actor);
-    let clock = CLOCK;
-    let install = Input::Admin(Admin::Install {
-        instance: REPRESENTATIVE,
-        derivation: derivation(&package, &derived),
-        roles: vec![],
-        target: Target::Vos,
-        space: SPACE,
-        clock,
-    });
-    let installed = node.batch(0, vec![install]);
+    let (kit, installed) = install_in(
+        &mut node,
+        (SPACE, CLOCK),
+        Target::Vos,
+        REPRESENTATIVE,
+        &package,
+        &derived,
+    );
     assert!(
         matches!(
             ran(&installed.steps[0]).outcome,
@@ -59,10 +56,6 @@ fn representative() -> (Node, Testkit) {
         "{:?}",
         ran(&installed.steps[0]).outcome
     );
-    let mut kit = Testkit::new(AGENT);
-    kit.install_derived_in((SPACE, clock), Target::Vos, REPRESENTATIVE, &derived, &[])
-        .unwrap();
-    kit.version = node.version;
     (node, kit)
 }
 
@@ -101,13 +94,8 @@ fn committed(node: &Node) -> Vec<Vec<u8>> {
 }
 
 /// The representative's names are the constants the agents and the node
-/// use; a report stores the reporting agent's root under
-/// `representative_row(agent, Space, w)`, its value the bare root, and an
-/// ask under `w ‖ agent`; a later report of the agent drops its rows of
-/// windows before `w − 2` and its asks with them, never another agent's.
-/// A report of a window at or before the sender's last, or two past the
-/// representative's open window, stores nothing. The model agrees on each
-/// step.
+/// use, and a report is stored as a read proves it ([`reports_are_stored`],
+/// [`old_windows_go`]); no call stores one ([`no_call_writes_a_report`]).
 #[test]
 fn a_report_is_stored_as_a_read_proves_it() {
     let (mut node, mut kit) = representative();
@@ -115,6 +103,24 @@ fn a_report_is_stored_as_a_read_proves_it() {
     assert_eq!(table_tag(REPRESENTATIVE_ASKED), ASKED_TAG);
 
     let (a, b) = (AgentId(0x0100_0007), AgentId(0x0200_0003));
+    reports_are_stored(&mut node, &mut kit, a, b);
+    old_windows_go(&mut node, a, b);
+    no_call_writes_a_report(&mut node, a);
+}
+
+/// The stored value under `key`, unversioned.
+fn value(node: &Node, key: &[u8]) -> Option<Vec<u8>> {
+    let stored = node.get(key)?;
+    let (_, value) = unversioned(&stored)?;
+    Some(value.to_vec())
+}
+
+/// A report stores the reporting agent's root under
+/// `representative_row(agent, Space, w)`, its value the bare root, and an
+/// ask under `w ‖ agent`. A report of a window at or before the sender's
+/// last, or two past the representative's open window, stores nothing. The
+/// model agrees on each step.
+fn reports_are_stored(node: &mut Node, kit: &mut Testkit, a: AgentId, b: AgentId) {
     let inputs = vec![
         report(a, 1, 5, [5; 32], true),
         report(b, 1, 5, [6; 32], true),
@@ -133,21 +139,16 @@ fn a_report_is_stored_as_a_read_proves_it() {
         assert_eq!(run.outcome, vos_wire::result::Outcome::Done(Vec::new()));
         agrees(index, run, &expected);
     }
-    let value = |node: &Node, key: &[u8]| {
-        let stored = node.get(key)?;
-        let (_, value) = unversioned(&stored)?;
-        Some(value.to_vec())
-    };
     assert_eq!(
-        value(&node, &representative_row(a, RootKind::Space, 5)),
+        value(node, &representative_row(a, RootKind::Space, 5)),
         Some(vec![5; 32])
     );
     assert_eq!(
-        value(&node, &representative_row(b, RootKind::Space, 5)),
+        value(node, &representative_row(b, RootKind::Space, 5)),
         Some(vec![6; 32])
     );
     assert_eq!(
-        value(&node, &representative_row(a, RootKind::Space, 6)),
+        value(node, &representative_row(a, RootKind::Space, 6)),
         Some(vec![7; 32])
     );
     assert!(node.get(&asked(5, a)).is_some());
@@ -155,31 +156,35 @@ fn a_report_is_stored_as_a_read_proves_it() {
     assert!(node.get(&asked(6, a)).is_none(), "not pending");
     assert_eq!(asked(5, a), representative_ask(5, a));
     assert_eq!(
-        value(&node, &representative_row(b, RootKind::Space, 7)),
+        value(node, &representative_row(b, RootKind::Space, 7)),
         None,
         "two past the open window"
     );
     assert_eq!(
-        value(&node, &representative_row(b, RootKind::Space, 5)),
+        value(node, &representative_row(b, RootKind::Space, 5)),
         Some(vec![6; 32]),
         "a window reported already"
     );
+}
 
-    // Window 8: `a`'s rows before window 6 go, and every ask of them.
+/// Window 8: a later report of `a` drops its rows of windows before
+/// `w − 2` and its asks with them, never another agent's.
+fn old_windows_go(node: &mut Node, a: AgentId, b: AgentId) {
     node.batch(at(7), vec![report(a, 3, 8, [8; 32], true)]);
     assert_eq!(
-        value(&node, &representative_row(a, RootKind::Space, 5)),
+        value(node, &representative_row(a, RootKind::Space, 5)),
         None
     );
-    assert!(value(&node, &representative_row(a, RootKind::Space, 6)).is_some());
-    assert!(value(&node, &representative_row(b, RootKind::Space, 5)).is_some());
+    assert!(value(node, &representative_row(a, RootKind::Space, 6)).is_some());
+    assert!(value(node, &representative_row(b, RootKind::Space, 5)).is_some());
     assert!(node.get(&asked(5, a)).is_none());
     assert!(node.get(&asked(8, a)).is_some());
+}
 
-    // A client's call, and a program's call as any agent's message carries
-    // it, of a method named `report` store nothing: the representative has
-    // none.
-    let before = committed(&node);
+/// A client's call, and a program's call as any agent's message carries it,
+/// of a method named `report` store nothing: the representative has none.
+fn no_call_writes_a_report(node: &mut Node, a: AgentId) {
+    let before = committed(node);
     let method = MethodId(derive_id("vos/method/", "report"));
     let arguments = AgentRoot {
         kind: 0,
@@ -220,6 +225,6 @@ fn a_report_is_stored_as_a_read_proves_it() {
         node.get(&representative_row(a, RootKind::Space, 9))
             .is_none()
     );
-    assert_eq!(committed(&node), before);
+    assert_eq!(committed(node), before);
     assert!(node.get(&asked(9, a)).is_none());
 }

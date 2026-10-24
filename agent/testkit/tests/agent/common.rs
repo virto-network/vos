@@ -10,6 +10,7 @@ use vos_pvm::pool::{CodeHash, MachinePool};
 use vos_pvm::refine::{Invocation, MemoryModel, PreparedProgram};
 use vos_pvm::refine_host::{JamItem, JamRefine, Preimages, ProgramSource, RefineContext};
 use vos_pvm::{ExitReason, PvmBackend};
+use vos_pvm_compiler::Derived;
 use vos_testkit::node::serve;
 use vos_testkit::programs::{actor, agent, bare, derivation, derived, kernel, method, package};
 use vos_testkit::{Step as KitStep, Testkit, decode};
@@ -23,7 +24,7 @@ use vos_wire::ingress::Grant;
 use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
 use vos_wire::records::{Installed, SessionMark, unstored};
 use vos_wire::result::{InputRef, Outcome, Run, Step, WorkResult, Write};
-use vos_wire::{Decode, Encode, keys};
+use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
 
 pub const AGENT: AgentId = AgentId(7);
 pub const COUNTER: InstanceId = InstanceId(1);
@@ -434,6 +435,37 @@ impl Node {
         let id: SessionId = self.value(&keys::session_index(session))?;
         Some((id, self.value(&keys::session(id)).expect("a mark")))
     }
+}
+
+/// `derived`, derived from `package`, installed as `AGENT`'s `instance`
+/// for `target` in `space` under `clock`, on `node` and in a model at the
+/// node's version: the model, and the install's result.
+pub fn install_in(
+    node: &mut Node,
+    (space, clock): (SpaceId, WindowClock),
+    target: Target,
+    instance: InstanceId,
+    package: &[u8],
+    derived: &Derived,
+) -> (Testkit, WorkResult) {
+    node.add(&derived.actor);
+    for (_, kernel) in &derived.kernels {
+        node.add(kernel);
+    }
+    let install = Input::Admin(Admin::Install {
+        instance,
+        derivation: derivation(package, derived),
+        roles: vec![],
+        target,
+        space,
+        clock,
+    });
+    let installed = node.batch(0, vec![install]);
+    let mut kit = Testkit::new(AGENT);
+    kit.install_derived_in((space, clock), target, instance, derived, &[])
+        .unwrap();
+    kit.version = node.version;
+    (kit, installed)
 }
 
 /// The test actors, installed in a node and a testkit alike, and the
