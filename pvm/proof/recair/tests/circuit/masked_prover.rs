@@ -20,13 +20,15 @@ use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::quotients::{DeepCoefficients, deep_values_of_column};
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::vcs_lifted::blake2b_merkle::Blake2bMerkleChannel;
+use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::{ComponentProver, ProvingError};
 use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
 use vos_pvm_proof::format::{DeepBatching, Format, FormatParams, MASKED_WRAP, Masking};
 use vos_pvm_recair::masked::{
-    MaskRng, MaskedProof, MaskedProvers, MaskedTrace, prove_masked, rank_m31, verifier_format,
+    MaskRng, MaskStats, MaskedProof, MaskedProvers, MaskedTrace, prove_masked, rank_m31,
+    verifier_format,
 };
 use vos_pvm_recair::prove::prove_masked_on;
 use vos_pvm_recair::trace::{self, FirstRowFraction};
@@ -81,21 +83,6 @@ pub(crate) fn circuit(seed: u64) -> Finalized<SecureField> {
         .expect("the wiring checks")
 }
 
-pub(crate) fn prove(
-    format: &Format,
-    finalized: &Finalized<SecureField>,
-    rng: MaskRng,
-) -> Result<RecairProof<<Blake2bMerkleChannel as MerkleChannel>::H>, ProveError> {
-    prove_masked_on::<Blake2bMerkleChannel>(
-        format,
-        &finalized.circuit,
-        &finalized.witness,
-        rng,
-        |_| {},
-    )
-    .map(|(proof, _)| proof)
-}
-
 /// The recursion AIR's set at the proof's sizes, under any relations: its
 /// trees' layout.
 pub(crate) fn wrap_layout(log_sizes: &[u32; 3]) -> WrapComponents {
@@ -107,21 +94,40 @@ pub(crate) fn wrap_layout(log_sizes: &[u32; 3]) -> WrapComponents {
     )
 }
 
-/// Verifies a masked proof of a small circuit, its outputs at a node's
-/// layout.
-pub(crate) fn verify(
+/// A small circuit's proof on `MC`.
+pub(crate) type Proof<MC> = RecairProof<<MC as MerkleChannel>::H>;
+
+/// A small circuit proved masked on `MC`, as the wrap is proved.
+pub(crate) fn prove<MC: MerkleChannel>(
     format: &Format,
-    proof: &RecairProof<<Blake2bMerkleChannel as MerkleChannel>::H>,
+    finalized: &Finalized<SecureField>,
+    rng: MaskRng,
+) -> Result<(Proof<MC>, MaskStats), ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    prove_masked_on::<MC>(format, &finalized.circuit, &finalized.witness, rng, |_| {})
+}
+
+/// The public terms' logup sum of a small circuit's outputs, at a node's
+/// layout.
+pub(crate) fn public_sum(outputs: &[SecureField], relation: &GateRelation) -> SecureField {
+    public_logup_sum(
+        relation,
+        Layout::node(outputs.len() as u32).public_terms(outputs.iter().copied()),
+    )
+}
+
+/// Verifies a masked proof of a small circuit on `MC`, over the set laid
+/// out as `layout`.
+pub(crate) fn verify_as<MC: MerkleChannel, C: MaskedComponents<Relations = GateRelation>>(
+    format: &Format,
+    proof: &Proof<MC>,
+    layout: &C,
 ) -> Result<(), Error> {
-    let public_sum = |relation: &GateRelation| {
-        public_logup_sum(
-            relation,
-            Layout::node(proof.outputs.len() as u32).public_terms(proof.outputs.iter().copied()),
-        )
-    };
-    let layout = wrap_layout(&proof.log_sizes);
-    verify_masked::<Blake2bMerkleChannel, WrapComponents>(
-        &verifier_format(format, &proof.log_sizes, &layout).expect("a masked format"),
+    let public_sum = |relation: &GateRelation| public_sum(&proof.outputs, relation);
+    verify_masked::<MC, C>(
+        &verifier_format(format, &proof.log_sizes, layout).expect("a masked format"),
         &Claim {
             log_sizes: &proof.log_sizes,
             circuit: None,
@@ -130,9 +136,15 @@ pub(crate) fn verify(
             interaction_pow: proof.interaction_pow,
             claimed_sums: &proof.claimed_sums,
         },
-        &layout,
+        layout,
         proof.stark_proof.clone(),
     )
+}
+
+/// Verifies a masked proof of a small circuit on `MC`, over the recursion
+/// AIR's set.
+pub(crate) fn verify<MC: MerkleChannel>(format: &Format, proof: &Proof<MC>) -> Result<(), Error> {
+    verify_as::<MC, _>(format, proof, &wrap_layout(&proof.log_sizes))
 }
 
 /// R1 refuses `h = 64` against 24 queries, `2(4·2 + 24·3) = 160` revealed
@@ -141,7 +153,7 @@ pub(crate) fn verify(
 fn r1_refuses_too_small_a_randomizer() {
     let finalized = circuit(1);
     assert!(matches!(
-        prove(&small_format(6, 8, 24), &finalized, MaskRng::default()),
+        prove::<Blake2bMerkleChannel>(&small_format(6, 8, 24), &finalized, MaskRng::default()),
         Err(ProveError::MaskRank)
     ));
     let (_, stats) = prove_masked_on::<Blake2bMerkleChannel>(
@@ -170,10 +182,7 @@ fn spans_qm31(coefficients: &[SecureField]) -> bool {
 /// The coefficients `prove_values` draws for `R`'s columns, replayed: the
 /// samples mixed, one coefficient a DEEP value, `R`'s after every earlier
 /// tree's values and the composition's 4.
-fn fri_mask_coefficients(
-    format: &Format,
-    proof: &RecairProof<<Blake2bMerkleChannel as MerkleChannel>::H>,
-) -> Vec<SecureField> {
+fn fri_mask_coefficients(format: &Format, proof: &Proof<Blake2bMerkleChannel>) -> Vec<SecureField> {
     let public_sum = |relation: &GateRelation| {
         public_logup_sum(
             relation,
@@ -221,15 +230,16 @@ fn fri_mask_coefficients_independent() {
     let finalized = circuit(2);
     let eight = format();
     for _ in 0..4 {
-        let proof = prove(&eight, &finalized, MaskRng::default()).unwrap();
-        verify(&eight, &proof).unwrap();
+        let (proof, _) =
+            prove::<Blake2bMerkleChannel>(&eight, &finalized, MaskRng::default()).unwrap();
+        verify::<Blake2bMerkleChannel>(&eight, &proof).unwrap();
         let coefficients = fri_mask_coefficients(&eight, &proof);
         assert_eq!(coefficients.len(), 8);
         assert!(spans_qm31(&coefficients));
     }
     let four = small_format(6, 4, 4);
-    let proof = prove(&four, &finalized, MaskRng::default()).unwrap();
-    verify(&four, &proof).unwrap();
+    let (proof, _) = prove::<Blake2bMerkleChannel>(&four, &finalized, MaskRng::default()).unwrap();
+    verify::<Blake2bMerkleChannel>(&four, &proof).unwrap();
     let mut coefficients = fri_mask_coefficients(&four, &proof);
     assert_eq!(coefficients.len(), 4);
     assert!(spans_qm31(&coefficients));
@@ -261,7 +271,7 @@ fn an_invalid_witness_is_refused() {
         );
     }
     assert!(matches!(
-        prove(&vos_pvm_proof::format::WRAP, &finalized, MaskRng::default()),
+        prove::<Blake2bMerkleChannel>(&vos_pvm_proof::format::WRAP, &finalized, MaskRng::default()),
         Err(ProveError::UnmaskedFormat)
     ));
 }
@@ -436,9 +446,13 @@ fn the_masked_prover_is_generic() {
 fn every_masked_value_is_fresh_and_the_seam_reproduces_bytes() {
     let finalized = circuit(5);
     let format = format();
-    let [first, second] = [(); 2].map(|_| prove(&format, &finalized, MaskRng::default()).unwrap());
+    let [first, second] = [(); 2].map(|_| {
+        prove::<Blake2bMerkleChannel>(&format, &finalized, MaskRng::default())
+            .unwrap()
+            .0
+    });
     for proof in [&first, &second] {
-        verify(&format, proof).unwrap();
+        verify::<Blake2bMerkleChannel>(&format, proof).unwrap();
     }
     let (a, b) = (
         &first.stark_proof.commitments,
@@ -452,8 +466,14 @@ fn every_masked_value_is_fresh_and_the_seam_reproduces_bytes() {
         assert_ne!(x, y);
     }
 
-    let bytes =
-        |rng: MaskRng| postcard::to_allocvec(&prove(&format, &finalized, rng).unwrap()).unwrap();
+    let bytes = |rng: MaskRng| {
+        postcard::to_allocvec(
+            &prove::<Blake2bMerkleChannel>(&format, &finalized, rng)
+                .unwrap()
+                .0,
+        )
+        .unwrap()
+    };
     let seeded = bytes(MaskRng::Seeded(7));
     assert_eq!(seeded, bytes(MaskRng::Seeded(7)));
     assert_ne!(seeded, bytes(MaskRng::Seeded(8)));

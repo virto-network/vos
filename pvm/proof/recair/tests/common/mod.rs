@@ -6,6 +6,7 @@
 pub mod kernel;
 pub mod leakage;
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use num_traits::One;
@@ -249,6 +250,36 @@ pub fn position_of(context: &Context<SecureField>, bits: &[Bit]) -> usize {
 /// `value` moved by one.
 pub fn bump(value: &mut SecureField) {
     *value += SecureField::one();
+}
+
+/// `value` moved by one, in M31.
+pub fn bump_m31(value: &mut BaseField) {
+    *value += BaseField::from(1);
+}
+
+/// The `.rs` files under `dir`, every level, past `target`, `.git`, the
+/// spikes and the worktrees.
+pub fn sources(dir: &Path) -> Vec<PathBuf> {
+    fn walk(dir: &Path, found: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                if !matches!(name.as_ref(), "target" | ".git" | "spikes" | ".worktrees") {
+                    walk(&path, found);
+                }
+            } else if name.ends_with(".rs") {
+                found.push(path);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    walk(dir, &mut found);
+    found
 }
 
 /// The circuit's transcript is `transcript`, the native verifier's recorded

@@ -7,26 +7,9 @@
 //! gates' forger. A second yield, which the relation alone balances
 //! (`multiplicities`), is refused because of it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// The `.rs` files under `dir`, past `target`, `.git` and the spikes.
-fn sources(dir: &Path, found: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if path.is_dir() {
-            if !matches!(name.as_ref(), "target" | ".git" | "spikes" | ".worktrees") {
-                sources(&path, found);
-            }
-        } else if name.ends_with(".rs") {
-            found.push(path);
-        }
-    }
-}
+use crate::common::sources;
 
 /// Whether `source` names `needle` as a whole identifier: Stwo's
 /// `new_with_preprocessed_columns(` is another function.
@@ -43,8 +26,7 @@ fn calls(source: &str, needle: &str) -> bool {
 fn only_checked_wirings_are_committed() {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace = manifest.join("../../..");
-    let mut found = Vec::new();
-    sources(&workspace, &mut found);
+    let found = sources(&workspace);
     assert!(found.len() > 100, "the workspace's sources");
     let allowed = [
         "pvm/proof/recair/src/prove.rs",

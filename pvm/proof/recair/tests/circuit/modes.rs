@@ -1,7 +1,7 @@
 //! `p2` against `vos_pvm_poseidon2` in every mode, and a tamper refused per
 //! component and per mode.
 
-use crate::common::{self, prove_and_verify};
+use crate::common::{self, bump_m31, prove_and_verify};
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
@@ -206,10 +206,6 @@ fn rewrite_input(trace: &mut MainTrace, row: usize, change: impl FnOnce(&mut [M3
     }
 }
 
-fn bump(value: &mut BaseField) {
-    *value += BaseField::from(1);
-}
-
 /// A tamper per component and per mode is refused:
 /// - in each mode, an S-box column changed (the round constraints), and the
 ///   input changed with the permutation recomputed (the mode's input
@@ -233,7 +229,7 @@ fn a_tamper_per_component_and_mode_is_refused() {
             .position(|wiring| wiring.mode == Some(mode))
             .unwrap();
         assert!(
-            refused(&finalized, |trace| bump(
+            refused(&finalized, |trace| bump_m31(
                 &mut trace.columns[0][p2::main::SBOXES + 20][row]
             )),
             "{mode:?}: an S-box"
@@ -276,7 +272,7 @@ fn a_tamper_per_component_and_mode_is_refused() {
         })
         .expect("a partial block of a wire");
     assert!(
-        unwired(&finalized, |trace| bump(
+        unwired(&finalized, |trace| bump_m31(
             &mut trace.columns[0][p2::main::M + lane][row]
         )),
         "an unread message lane"
@@ -297,13 +293,13 @@ fn a_tamper_per_component_and_mode_is_refused() {
         .expect("an addition");
     assert!(
         unwired(&finalized, |trace| {
-            bump(&mut trace.columns[1][0][row]);
-            bump(&mut trace.columns[1][12][row]);
+            bump_m31(&mut trace.columns[1][0][row]);
+            bump_m31(&mut trace.columns[1][12][row]);
         }),
         "qm31: an operand and its output"
     );
     assert!(
-        refused(&finalized, |trace| bump(&mut trace.columns[1][13][row])),
+        refused(&finalized, |trace| bump_m31(&mut trace.columns[1][13][row])),
         "qm31: an output"
     );
 }
@@ -347,7 +343,7 @@ fn an_h8_tamper_is_refused() {
         "h8: the accumulator and the output"
     );
     assert!(
-        refused(&finalized, |trace| bump(
+        refused(&finalized, |trace| bump_m31(
             &mut trace.columns[2][main::V + 5][row]
         )),
         "h8: a sample"

@@ -29,6 +29,7 @@ use vos_pvm_recair_air::p2::P2Eval;
 use vos_pvm_recair_air::qm31::Qm31Eval;
 use vos_pvm_recair_air::{LogSizes, h8, p2, qm31};
 
+use crate::common::sources;
 use crate::gates::{degrees, preprocessed_of};
 
 /// The wrap's log sizes, `format::WRAP`'s and `format::MASKED_WRAP`'s.
@@ -230,20 +231,6 @@ fn the_masked_reference_shape_is_the_built_wraps() {
     );
     let count = proven_count(&MASKED_WRAP.params, &built).unwrap();
     assert!((82.69..82.70).contains(&count), "{count}");
-}
-
-/// The Rust sources under `dir`, every level.
-fn sources(dir: &Path) -> Vec<PathBuf> {
-    let mut found = Vec::new();
-    for entry in std::fs::read_dir(dir).unwrap() {
-        let path = entry.unwrap().path();
-        if path.is_dir() {
-            found.extend(sources(&path));
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            found.push(path);
-        }
-    }
-    found
 }
 
 /// The paths among `paths` whose source names any of `needles`.

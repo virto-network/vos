@@ -26,7 +26,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use crate::common::leakage::published;
 use crate::common::random_circuit;
 use crate::leakage::{Witness as PrivateWitness, private_circuit};
-use crate::masked_prover::{LOG_SIZE, circuit, format, wrap_layout};
+use crate::masked_prover::{
+    LOG_SIZE, Proof, circuit, format, prove, public_sum, verify, verify_as, wrap_layout,
+};
 
 use num_traits::{One, Zero};
 use stwo::core::air::Component;
@@ -55,73 +57,23 @@ use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair::circuit::Qm31Wiring;
 use vos_pvm_recair::masked::{
-    MaskRng, MaskStats, MaskedTrace, prove_masked, prove_masked_unchecked, verifier_format,
+    MaskRng, MaskedTrace, prove_masked, prove_masked_unchecked, verifier_format,
 };
-use vos_pvm_recair::prove::{prove_masked_on, prove_on};
+use vos_pvm_recair::prove::prove_on;
 use vos_pvm_recair::trace::{self, FirstRowFraction, MainTrace};
 use vos_pvm_recair::{Circuit, Finalized, ProveError, RecairProof, Witness};
-use vos_pvm_recair_air::gate::{GateRelation, Layout, public_logup_sum};
+use vos_pvm_recair_air::gate::GateRelation;
 use vos_pvm_recair_air::masked::{
     BlindRelation, MaskedComponent, MaskedComponents, WrapComponents, composition_log_degree_bound,
     sample_points,
 };
 use vos_pvm_recair_air::{h8, p2, qm31};
 
-type Proof<MC> = RecairProof<<MC as MerkleChannel>::H>;
-
 /// A random circuit of every gate, each component at `2^log_sizes` rows.
 fn sized(seed: u64, log_sizes: [u32; 3]) -> Finalized<SecureField> {
     random_circuit::<SecureField>(seed, 200)
         .finalize_to(Some(log_sizes.map(|log_size| 1 << log_size)))
         .expect("the wiring checks")
-}
-
-/// The public terms' logup sum of a small circuit's outputs, at a node's
-/// layout.
-fn public_sum(outputs: &[SecureField], relation: &GateRelation) -> SecureField {
-    public_logup_sum(
-        relation,
-        Layout::node(outputs.len() as u32).public_terms(outputs.iter().copied()),
-    )
-}
-
-/// Verifies a masked proof of a small circuit on `MC`, over the set laid
-/// out as `layout`.
-fn verify_as<MC: MerkleChannel, C: MaskedComponents<Relations = GateRelation>>(
-    format: &Format,
-    proof: &Proof<MC>,
-    layout: &C,
-) -> Result<(), Error> {
-    let public_sum = |relation: &GateRelation| public_sum(&proof.outputs, relation);
-    verify_masked::<MC, C>(
-        &verifier_format(format, &proof.log_sizes, layout).expect("a masked format"),
-        &Claim {
-            log_sizes: &proof.log_sizes,
-            circuit: None,
-            public: &proof.outputs,
-            public_sum: Some(&public_sum),
-            interaction_pow: proof.interaction_pow,
-            claimed_sums: &proof.claimed_sums,
-        },
-        layout,
-        proof.stark_proof.clone(),
-    )
-}
-
-fn verify<MC: MerkleChannel>(format: &Format, proof: &Proof<MC>) -> Result<(), Error> {
-    verify_as::<MC, _>(format, proof, &wrap_layout(&proof.log_sizes))
-}
-
-fn prove<MC: MerkleChannel>(
-    format: &Format,
-    finalized: &Finalized<SecureField>,
-    rng: MaskRng,
-) -> (Proof<MC>, MaskStats)
-where
-    SimdBackend: BackendForChannel<MC>,
-{
-    prove_masked_on::<MC>(format, &finalized.circuit, &finalized.witness, rng, |_| {})
-        .expect("proves")
 }
 
 /// The recursion AIR's set proved masked over `circuit` and `witness`, as
@@ -238,7 +190,7 @@ where
     SimdBackend: BackendForChannel<MC>,
 {
     let format = format();
-    let (proof, stats) = prove::<MC>(&format, finalized, MaskRng::Seeded(1));
+    let (proof, stats) = prove::<MC>(&format, finalized, MaskRng::Seeded(1)).expect("proves");
     verify::<MC>(&format, &proof).unwrap_or_else(|error| panic!("{name}: {error}"));
     let classes = column_classes(&wrap_layout(&proof.log_sizes), &format);
     eprintln!(
@@ -495,7 +447,8 @@ impl MaskedComponents for Unlifted {
 fn the_preprocessed_columns_verify_only_lifted() {
     let format = format();
     let (proof, _) =
-        prove::<Blake2bMerkleChannel>(&format, &sized(12, [10, 8, 9]), MaskRng::Seeded(12));
+        prove::<Blake2bMerkleChannel>(&format, &sized(12, [10, 8, 9]), MaskRng::Seeded(12))
+            .expect("proves");
     verify::<Blake2bMerkleChannel>(&format, &proof).expect("verifies lifted");
     let layout = Unlifted(wrap_layout(&proof.log_sizes));
     let error = catch_unwind(AssertUnwindSafe(|| {
@@ -615,7 +568,8 @@ fn drawn_relation<MC: MerkleChannel>(format: &Format, proof: &Proof<MC>) -> Gate
 fn a_malformed_proof_is_an_error_never_a_panic() {
     let format = format();
     let finalized = circuit(14);
-    let (proof, _) = prove::<Blake2bMerkleChannel>(&format, &finalized, MaskRng::Seeded(14));
+    let (proof, _) =
+        prove::<Blake2bMerkleChannel>(&format, &finalized, MaskRng::Seeded(14)).expect("proves");
     verify::<Blake2bMerkleChannel>(&format, &proof).expect("verifies");
     type P = Proof<Blake2bMerkleChannel>;
     type Mutation = Box<dyn Fn(&mut P)>;
@@ -877,13 +831,19 @@ fn every_opening_is_fresh() {
         a.len()
     };
     let finalized = circuit(15);
-    let [first, second] =
-        [(); 2].map(|_| prove::<Blake2bMerkleChannel>(&format, &finalized, MaskRng::default()).0);
+    let [first, second] = [(); 2].map(|_| {
+        prove::<Blake2bMerkleChannel>(&format, &finalized, MaskRng::default())
+            .expect("proves")
+            .0
+    });
     let n = differing(&first, &second);
     let amount = private_circuit(&PrivateWitness::random(15));
     let other = private_circuit(&PrivateWitness::random(15).plus_one());
-    let [a, b] = [&amount, &other]
-        .map(|finalized| prove::<Blake2bMerkleChannel>(&format, finalized, MaskRng::Seeded(15)).0);
+    let [a, b] = [&amount, &other].map(|finalized| {
+        prove::<Blake2bMerkleChannel>(&format, finalized, MaskRng::Seeded(15))
+            .expect("proves")
+            .0
+    });
     let m = differing(&a, &b);
     eprintln!("{n} openings of one witness, {m} of two from one seed: none shared");
 }
@@ -911,7 +871,8 @@ fn a_right_guess_reproduces_an_unblinded_sum_only() {
     assert_eq!(guess(&relation), proof.claimed_sums, "unblinded: the guess");
 
     let masked = format();
-    let (proof, _) = prove::<Blake2bMerkleChannel>(&masked, &finalized, MaskRng::default());
+    let (proof, _) =
+        prove::<Blake2bMerkleChannel>(&masked, &finalized, MaskRng::default()).expect("proves");
     verify::<Blake2bMerkleChannel>(&masked, &proof).unwrap();
     let relation = drawn_relation::<Blake2bMerkleChannel>(&masked, &proof);
     let guessed = guess(&relation);
@@ -1087,7 +1048,8 @@ fn the_shape_is_the_format_and_the_coins() {
         let finalized = private_circuit(&witness);
         for seed in 0..6 {
             let (proof, _) =
-                prove::<Blake2bMerkleChannel>(&format, &finalized, MaskRng::Seeded(seed));
+                prove::<Blake2bMerkleChannel>(&format, &finalized, MaskRng::Seeded(seed))
+                    .expect("proves");
             let lengths = lengths_of::<Blake2bMerkleChannel>(&proof.stark_proof);
             assert_eq!(
                 lengths,
