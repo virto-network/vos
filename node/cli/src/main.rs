@@ -206,7 +206,10 @@ fn found(space: &Path, data: &Path, window_ms: u64, origin_ms: Option<u64>) -> R
     if store.exists() {
         let agents = vos_node::store::Fjall::open(&store)
             .and_then(|store| store.agents())
-            .map_err(|error| format!("{}: {error:?}", store.display()))?;
+            .map_err(|error| {
+                let shown = vos_node::store::LayoutMismatch::shown(&error);
+                format!("{}: {shown}", store.display())
+            })?;
         if !agents.is_empty() {
             return Err(format!(
                 "{}: the node holds {} agents, which belong to no space for good: \

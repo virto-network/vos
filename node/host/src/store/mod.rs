@@ -595,6 +595,12 @@ impl LayoutMismatch {
             _ => None,
         }
     }
+
+    /// `error` as an operator reads it: the mismatch's account when an
+    /// open refused the store's layout, its `Debug` otherwise.
+    pub fn shown(error: &Error) -> String {
+        Self::of(error).map_or_else(|| format!("{error:?}"), |mismatch| mismatch.to_string())
+    }
 }
 
 impl std::fmt::Display for LayoutMismatch {
@@ -611,7 +617,10 @@ impl std::fmt::Display for LayoutMismatch {
             ),
             Layout::Unreadable => write!(f, "the store's layout row is unreadable"),
         }?;
-        f.write_str("; move the store aside to start a new one")
+        f.write_str(
+            "; move the store aside to start a new one, which discards the node's secret \
+             and the anchor keys it registered at its venue",
+        )
     }
 }
 

@@ -13,7 +13,7 @@ use std::sync::Mutex;
 use ed25519_dalek::SigningKey;
 
 use crate::storage::{Change, StorageThread};
-use crate::store::{Fjall, PersistMode};
+use crate::store::{Fjall, LayoutMismatch, PersistMode};
 use crate::{lock, random};
 
 /// A node's anchor keys, oldest first: the node key, then each rotation's.
@@ -119,7 +119,7 @@ fn stopped(data: &Path) -> Result<Fjall, String> {
 
 fn failed(data: &Path) -> impl Fn(fjall::Error) -> String {
     let path = data.join(crate::STORE);
-    move |error| format!("{}: {error:?}", path.display())
+    move |error| format!("{}: {}", path.display(), LayoutMismatch::shown(&error))
 }
 
 /// Make an anchor key for the node whose data directory is `data`, its

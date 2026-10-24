@@ -600,6 +600,7 @@ fn a_store_with_rows_and_no_layout_is_refused() {
     written_as(dir.path(), None);
     assert_eq!(refused(dir.path()), Layout::Unnamed);
     let error = Fjall::open(dir.path()).err().unwrap();
-    let message = LayoutMismatch::of(&error).unwrap().to_string();
+    let message = LayoutMismatch::shown(&error);
     assert!(message.contains("names no layout"), "{message}");
+    assert!(message.contains("discards the node's secret"), "{message}");
 }
