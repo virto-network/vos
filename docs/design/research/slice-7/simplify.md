@@ -9,6 +9,11 @@ is a question of its own, C11 is added, and §7 asks one question per
 candidate. Tags: [measured] counted in the code; [est] estimated from
 the counts; [proposed] a recommendation.
 
+**Answered (2026-10-25):** all eleven taken, C4 fully terminal (§7's
+option (a): no resume, no governance revive), C1's limit on the Clerk
+accepted (`owner-decisions.md` S8–S18). The analysis below stays as
+written.
+
 ## 1. Why
 
 Pin D grew in every review: the registration's signed start (plan 3's

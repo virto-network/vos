@@ -61,3 +61,111 @@ unthrottled, battery 51%:
 
 The ARM factor is about 3.5× the x86 reference (3.3–3.6). A flagship should
 run about 2× faster than this phone.
+
+## The owner's answers to the plan's questions (2026-10-25)
+
+On draft 2's open questions and `simplify.md` §7. Each [decided]; the
+slice-6 decisions each reverses are named.
+
+S6. **The demo's relying party:** a subdomain the owner controls, serving
+  only `assetlinks.json` for the demo's package and its committed demo
+  keystore.
+
+S7. **The groundwork in parallel:** 7.0a at once; M5's masking of the
+  segment chips (7.14) and M4's 7.7, 7.9 and 7.10 beside M3.9.
+
+S8. **C6, one anchor rule:** a `no_std` venue core in `vos-anchor` that
+  every venue calls and the kit vendors. Reverses nothing.
+
+S9. **C1, no migration:** a space that changes venue re-founds. The
+  Clerk's limit is accepted: counterparties share a venue for good.
+  Reverses decision 8's migration ranges, `proving.md` §7's venue
+  migration, `spaces-pallet.md` call 5 (errors 24 and 28, event 5) and
+  vector G14.
+
+S10. **C8, registration from the venue's next window:** the founder signs
+  `(venue, space, controller)`; no `start_window`. Reverses slice 6's
+  plan-3 fix (the signed start; vectors G1 and G18 in part).
+
+S11. **C4, equivocation is fully terminal:** evidence ends the space at
+  every venue for good, with no resume anywhere, the pallet's design
+  included, and no governance revive. The space re-founds under a new
+  `SpaceId`; its sovereign funds leave by a controller or governance call
+  (`dispatch_as_sovereign` stays callable on an ended space); its members
+  register their credential leaves again (their secrets survive: S25's
+  stable handle); the Clerk's pairs reset; the venue keeps the ended
+  space's record as a tombstone it never prunes. Reverses decision 7
+  ("equivocation suspends, then resume") and decision 18 (resume with the
+  disputed window dead); `proving.md` §7's equivocation text;
+  `spaces-pallet.md` call 6, error 23, event 9, `set_status`'s
+  re-suspension, vectors G5 (its resume half) and G19.
+
+S12. **C7, rooted statements only at the venues** in this slice;
+  `venue_bound` goes. Reverses decision 8's per-program `venue_bound` and
+  decision 10's "a rootless statement's `Seen` entry never expires", until
+  rootless statements return.
+
+S13. **C2, the node key is a node's only anchor key:** a compromised key
+  means replacing the node. Reverses decision 7's rotation ("the node
+  signs with its newest key the venue lists"), step 6.14b and
+  `spaces-pallet.md` §13 questions 2 and 12, vector G15 in part.
+
+S14. **C3, no hand-back:** the close writes `S_w` in a replicated row;
+  the leader signs from it alone. Reverses nothing.
+
+S15. **C5, five outcomes on the node:** `Taken`, `NotYet`, `Never`,
+  `Unlisted` (the leader hands off its leadership), `Stopped`. Reverses
+  nothing.
+
+S16. **C9, no re-cuts:** a read not closed in time fails `NotClosed`, the
+  caller asks again. Reverses slice 6's 6.14 re-cut rule (the plan's, not
+  a numbered decision).
+
+S17. **C10, agents report only for windows a read waits on**, an issuer
+  opting in to every window. Reverses `proving.md` §7's "`S_w` over every
+  agent's root".
+
+S18. **C11, a window no one reported is not anchored.** Reverses nothing.
+
+S19. **The Kreivo teammate:** `spaces-pallet.md` v2 and the vectors are
+  regenerated in 7.1, and the teammate is told now
+  (`teammate-note.md`, for the owner to send).
+
+S20. **S3's gate is decided after 7.0a** (its masked-cost proxy on today's
+  AIR); the plan aims at 1 s until then. Open until 7.0a.
+
+S21. **The gate's statement:** the auth statement over the credential
+  actor's Poseidon2 tree through the chip; the BLAKE2b one measured beside
+  it.
+
+S22. **A public payer:** pay is a proof of knowing `s` behind the row's
+  owner digest, bound to the call and checked against the live row.
+
+S23. **The Poseidon2 chip and M5's levers go into the device format and
+  the node's segment format:** a second re-pin at the slice's end, once
+  M5's levers settle (the agent image, the kernels, the verifier blobs).
+  Reverses draft 2's "device format only" (the review's M1).
+
+S24. **A device proof at ingress authorizes what an auth credential
+  does.**
+
+S25. **A stable PRF handle:** 32 bytes the founder draws once, kept
+  across re-foundings, so members' device secrets survive one.
+
+S26. **The scale targets T1–T6 as proposed**, adjusted after run 2.
+
+S27. **The phone's memory:** at most 1 GiB peak resident, a target of
+  768 MiB.
+
+S28. **Threads:** the library's automatic choice; the four big cores
+  recorded beside it.
+
+S29. **The credential format's parameters by 7.12's grind:** blowup 4,
+  47 queries, PoW 16 if the grind's 95th percentile on the phone passes
+  50 ms; else blowup 4, 43 queries, PoW 20. Open until 7.12.
+
+S30. **Item 68:** a `closes` row that does not decode is quarantined
+  (moved aside, with an alert), the batch going on.
+
+S31. **Slice 6's six owner's-call quality items** (1, 5, 34, 46, 54, 58)
+  are folded in 7.23.
