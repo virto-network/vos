@@ -51,7 +51,7 @@ use alloc::vec::Vec;
 
 use num_traits::Zero;
 use stwo::core::ColumnVec;
-use stwo::core::air::{Component, Components};
+use stwo::core::air::Component;
 use stwo::core::channel::{Channel, MerkleChannel};
 use stwo::core::circle::CirclePoint;
 use stwo::core::fields::qm31::SecureField;
@@ -66,8 +66,8 @@ use stwo::core::verifier::VerificationError;
 use vos_pvm_recair_air::GateRelation;
 use vos_pvm_recair_air::gate::public_logup_sum;
 use vos_pvm_recair_air::masked::{
-    MaskPins, MaskedComponent, MaskedComponents, WrapComponents, air_log_size, committed_log_sizes,
-    composition_oods_eval, sample_points, sample_points_from_zero,
+    MaskPins, MaskedComponents, WrapComponents, air_log_size, committed_log_sizes,
+    composition_oods_eval, eval_lifted_composition, sample_points, sample_points_from_zero,
 };
 
 use crate::{
@@ -320,8 +320,11 @@ fn check_shape<H: MerkleHasherLifted>(
 pub struct Replayed<MC: MerkleChannel> {
     pub channel: MC::C,
     pub scheme: CommitmentSchemeVerifier<MC>,
-    pub points: TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
+    pub points: Points,
 }
+
+/// The sample points, tree by tree.
+type Points = TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>;
 
 /// `claim`'s transcript under `format` replayed over `proof`, the component
 /// set `C` laid out as `layout` (at the format's log sizes, any relations),
@@ -338,21 +341,7 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     layout: &C,
     proof: &StarkProof<MC::H>,
 ) -> Result<Replayed<MC>, Error> {
-    let config = PcsConfig {
-        deep_batching: format.config.deep_batching,
-        ..proof.config
-    };
-    if claim.log_sizes != format.log_sizes
-        || layout.log_sizes() != format.log_sizes
-        || config != format.config
-    {
-        return Err(Error::Format);
-    }
-    let trees = committed_log_sizes(layout, &format.pins)
-        .ok_or(Error::Shape("the component set's trees"))?;
-    let mut points = sample_points(layout, CirclePoint::zero(), &format.pins)
-        .ok_or(Error::Shape("the component set's sample points"))?;
-    check_shape(format, &trees, &points, proof)?;
+    let (trees, mut points) = admitted(format, claim, layout, proof)?;
     let [
         preprocessed_tree,
         main_tree,
@@ -371,12 +360,6 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     else {
         return Err(Error::Shape("four commitments"));
     };
-    if !claim.claimed_sums.iter().all(secure_is_canonical) {
-        return Err(Error::Noncanonical);
-    }
-    if claim.circuit.is_some_and(|root| preprocessed_root != root) {
-        return Err(Error::Circuit);
-    }
 
     let mut channel = MC::C::default();
     mix_header(
@@ -421,32 +404,86 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
             "the sample points' DEEP values are not the format's",
         ));
     }
-    let lifted: Vec<MaskedComponent<'_, dyn Component>> = set
-        .iter()
-        .map(|inner| MaskedComponent { inner: &**inner })
-        .collect();
-    let components = Components {
-        components: lifted.iter().map(|c| c as &dyn Component).collect(),
-        n_preprocessed_columns: preprocessed_tree.len(),
+    let set: Vec<&dyn Component> = set.iter().map(|component| &**component).collect();
+    check_composition(
+        &set,
+        layout,
+        preprocessed_tree.len(),
+        oods_point,
+        random_coeff,
+        &proof.sampled_values,
+    )?;
+    Ok(Replayed {
+        channel,
+        scheme,
+        points,
+    })
+}
+
+/// The checks on `proof` and `claim` before the transcript: the header (the
+/// log sizes and the configuration the format's), the shape at `layout`'s
+/// trees and sample points (`check_shape`), the claimed sums canonical and
+/// the preprocessed root the circuit's. Returns the trees' column log sizes
+/// and the sample points at zero.
+fn admitted<H: MerkleHasherLifted, C: MaskedComponents>(
+    format: &MaskedFormat<'_>,
+    claim: &Claim<'_, C::Relations, H::Hash>,
+    layout: &C,
+    proof: &StarkProof<H>,
+) -> Result<(TreeVec<Vec<u32>>, Points), Error> {
+    let config = PcsConfig {
+        deep_batching: format.config.deep_batching,
+        ..proof.config
     };
-    let composition = composition_oods_eval(&proof.sampled_values)
-        .ok_or(Error::Shape("the composition's samples"))?;
+    if claim.log_sizes != format.log_sizes
+        || layout.log_sizes() != format.log_sizes
+        || config != format.config
+    {
+        return Err(Error::Format);
+    }
+    let trees = committed_log_sizes(layout, &format.pins)
+        .ok_or(Error::Shape("the component set's trees"))?;
+    let points = sample_points(layout, CirclePoint::zero(), &format.pins)
+        .ok_or(Error::Shape("the component set's sample points"))?;
+    check_shape(format, &trees, &points, proof)?;
+    if !claim.claimed_sums.iter().all(secure_is_canonical) {
+        return Err(Error::Noncanonical);
+    }
+    if claim
+        .circuit
+        .is_some_and(|root| proof.commitments.first() != Some(&root))
+    {
+        return Err(Error::Circuit);
+    }
+    Ok((trees, points))
+}
+
+/// The composition's coordinates, sampled at their point, against the
+/// bound `set` lifted and evaluated at `oods_point` under `random_coeff`.
+fn check_composition(
+    set: &[&dyn Component],
+    layout: &impl MaskedComponents,
+    n_preprocessed_columns: usize,
+    oods_point: CirclePoint<SecureField>,
+    random_coeff: SecureField,
+    sampled_values: &TreeVec<ColumnVec<Vec<SecureField>>>,
+) -> Result<(), Error> {
+    let composition =
+        composition_oods_eval(sampled_values).ok_or(Error::Shape("the composition's samples"))?;
     let air_level = air_log_size(layout).ok_or(Error::Shape("the AIR's level"))?;
     if composition
-        != components.eval_composition_polynomial_at_point(
+        != eval_lifted_composition(
+            set,
+            n_preprocessed_columns,
             oods_point,
-            &proof.sampled_values,
+            sampled_values,
             random_coeff,
             air_level,
         )
     {
         return Err(Error::Stark(VerificationError::OodsNotMatching));
     }
-    Ok(Replayed {
-        channel,
-        scheme,
-        points,
-    })
+    Ok(())
 }
 
 /// Verifies `proof` of `claim` under `format` ([`replay`], then Stwo's

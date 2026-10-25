@@ -458,6 +458,29 @@ pub fn composition_oods_eval(
     Some(SecureField::from_partial_evals(coordinates))
 }
 
+/// The composition at `oods_point` of `components`, each lifted
+/// ([`MaskedComponent`]), from `samples` under `random_coeff`, the AIR at
+/// `air_level`: what the composition's coordinates, sampled at
+/// [`composition_point`], must give.
+pub fn eval_lifted_composition(
+    components: &[&dyn Component],
+    n_preprocessed_columns: usize,
+    oods_point: CirclePoint<SecureField>,
+    samples: &TreeVec<ColumnVec<Vec<SecureField>>>,
+    random_coeff: SecureField,
+    air_level: u32,
+) -> SecureField {
+    let lifted: Vec<MaskedComponent<'_, dyn Component>> = components
+        .iter()
+        .map(|&inner| MaskedComponent { inner })
+        .collect();
+    Components {
+        components: lifted.iter().map(|c| c as &dyn Component).collect(),
+        n_preprocessed_columns,
+    }
+    .eval_composition_polynomial_at_point(oods_point, samples, random_coeff, air_level)
+}
+
 /// The recursion AIR masked: [`p2`], [`qm31`] and [`h8`], each a
 /// [`MaskedEval`], their columns allocated in the trees' order.
 pub struct WrapComponents {
@@ -761,15 +784,14 @@ mod tests {
         let coefficient = channel.draw_secure_felt();
         let air_level = air_log_size(&layout).unwrap();
         let evaluate = |components: Vec<&dyn Component>| {
-            let lifted: Vec<MaskedComponent<'_, dyn Component>> = components
-                .into_iter()
-                .map(|inner| MaskedComponent { inner })
-                .collect();
-            Components {
-                components: lifted.iter().map(|c| c as &dyn Component).collect(),
-                n_preprocessed_columns: points[0].len(),
-            }
-            .eval_composition_polynomial_at_point(z, &samples, coefficient, air_level)
+            eval_lifted_composition(
+                &components,
+                points[0].len(),
+                z,
+                &samples,
+                coefficient,
+                air_level,
+            )
         };
         let rebound = evaluate(bound.iter().map(|c| &**c).collect());
         assert_eq!(rebound, evaluate(built.components()));
