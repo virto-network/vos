@@ -48,15 +48,11 @@ impl Hasher for Blake2b {
     fn branch(&self, level: u16, left: &Hash, right: &Hash) -> Hash {
         const VOS_TREE: u64 = u64::from_le_bytes(*b"vos/tree");
         const SLASH_BRANCH: u64 = u64::from_le_bytes(*b"/branch\0");
-        let word =
-            |hash: &Hash, k: usize| u64::from_le_bytes(hash[k * 8..k * 8 + 8].try_into().unwrap());
-        let left = [word(left, 0), word(left, 1), word(left, 2), word(left, 3)];
-        let right = [
-            word(right, 0),
-            word(right, 1),
-            word(right, 2),
-            word(right, 3),
-        ];
+        let words = |hash: &Hash| -> [u64; 4] {
+            let (chunks, _) = hash.as_chunks::<8>();
+            core::array::from_fn(|k| u64::from_le_bytes(chunks[k]))
+        };
+        let (left, right) = (words(left), words(right));
         let [high, low] = level.to_be_bytes();
         let block: [u64; 16] = [
             VOS_TREE,
