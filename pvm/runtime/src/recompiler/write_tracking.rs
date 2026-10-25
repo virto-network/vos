@@ -17,12 +17,14 @@ const UFFD_USER_MODE_ONLY: libc::c_int = 1;
 const UFFD_API: u64 = 0xaa;
 const UFFD_FEATURE_WP_HUGETLBFS_SHMEM: u64 = 1 << 12;
 const UFFD_FEATURE_WP_ASYNC: u64 = 1 << 15;
-const UFFDIO_API: libc::c_ulong = 0xc018_aa3f;
-const UFFDIO_REGISTER: libc::c_ulong = 0xc020_aa00;
+// An ioctl's request is a C `unsigned long` under glibc and an `int` under
+// musl: each request's 32 bits, as the target's libc takes them.
+const UFFDIO_API: libc::Ioctl = 0xc018_aa3f_u32 as libc::Ioctl;
+const UFFDIO_REGISTER: libc::Ioctl = 0xc020_aa00_u32 as libc::Ioctl;
 const UFFDIO_REGISTER_MODE_WP: u64 = 1 << 1;
-const UFFDIO_WRITEPROTECT: libc::c_ulong = 0xc018_aa06;
+const UFFDIO_WRITEPROTECT: libc::Ioctl = 0xc018_aa06_u32 as libc::Ioctl;
 const UFFDIO_WRITEPROTECT_MODE_WP: u64 = 1;
-const PAGEMAP_SCAN: libc::c_ulong = 0xc060_6610;
+const PAGEMAP_SCAN: libc::Ioctl = 0xc060_6610_u32 as libc::Ioctl;
 const PM_SCAN_WP_MATCHING: u64 = 1;
 const PM_SCAN_CHECK_WPASYNC: u64 = 1 << 1;
 const PAGE_IS_WRITTEN: u64 = 1 << 1;
