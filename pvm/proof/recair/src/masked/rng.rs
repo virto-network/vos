@@ -151,9 +151,9 @@ mod tests {
     }
 
     /// R4 against a replayed state: one OS state hedged with two witnesses
-    /// differing in one value, or with one witness under two channels or
-    /// public values, seeds two other streams; the same witness and state
-    /// seed one.
+    /// differing in one value, or with one witness under two channels,
+    /// public values, log sizes, format numbers or masks' heights, seeds
+    /// two other streams; the same witness and state seed one.
     #[test]
     fn a_replayed_state_draws_other_masks_for_another_witness() {
         use rand::RngCore;
@@ -162,6 +162,14 @@ mod tests {
         let poseidon = Format {
             channel: ChannelKind::Poseidon2M31,
             ..MASKED_WRAP
+        };
+        let renumbered = Format {
+            number: MASKED_WRAP.number + 1,
+            ..MASKED_WRAP
+        };
+        let taller = Masking {
+            log_mask_rows: masking.log_mask_rows + 1,
+            ..masking
         };
         let statement = |format, public| Statement {
             format,
@@ -177,6 +185,21 @@ mod tests {
             witness_digest(&statement(&MASKED_WRAP, &public), &[column(&amount)]),
             witness_digest(&statement(&poseidon, &public), &[column(&values)]),
             witness_digest(&statement(&MASKED_WRAP, &[]), &[column(&values)]),
+            witness_digest(
+                &Statement {
+                    log_sizes: &[5],
+                    ..statement(&MASKED_WRAP, &public)
+                },
+                &[column(&values)],
+            ),
+            witness_digest(&statement(&renumbered, &public), &[column(&values)]),
+            witness_digest(
+                &Statement {
+                    masking: &taller,
+                    ..statement(&MASKED_WRAP, &public)
+                },
+                &[column(&values)],
+            ),
         ];
         let first_word = |digest: &[u8; 32], attempt| {
             MaskRng::Seeded(5)
