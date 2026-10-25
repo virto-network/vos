@@ -13,10 +13,13 @@ are the parts that change, so you can hold them until v2 lands:
 2. **No resume: equivocation ends a space for good.** Call 6 (`resume`),
    error 23, event 9 and the unblock-to-`Suspended` branch of
    `set_status` go. A second root for a window still stores the evidence,
-   but the space's status becomes `Ended`, its roots are refused from then
-   on, and its record is never pruned (a tombstone). The controller's
-   `dispatch_as_sovereign` stays callable on an ended space, so its funds
-   can leave. G5 and G19 change.
+   but the space's status becomes `Ended` (`SpaceStatus` index 3; index 1,
+   `Suspended`, retired and never reused), its roots are refused from then
+   on, and its record is never pruned (a tombstone). The registration
+   deposit is released to the sovereign account on `Ended`, and the
+   controller's `dispatch_as_sovereign` stays callable on an ended space,
+   so its funds can leave (the existential deposit stays). G5 and G19
+   change.
 3. **Registration starts at the next window.** `register` no longer takes
    `start_window`: the founder signs `(venue, space, controller)` and the
    space anchors from the venue's next window. `BadStartWindow` goes; G1
@@ -41,7 +44,9 @@ Unchanged: the sovereign account and its budget, deposits and fees,
 `submit`'s check order, `Record`, formats and programs with their delay,
 the pause, `on_idle`, the storage keys of the items that stay.
 
-**Drops to expect:** v2 and the vectors at VOS's 7.1; the kit's blobs
-re-pinned at 7.8; the kit re-pinned once more at the slice's end, when
-VOS's node segment format changes (no change to the pallet's code, only
-the vendored tree and the pinned program ids).
+**Drops to expect:** v2 and the vectors at VOS's 7.1; the kit's fixtures
+and pinned program ids re-pinned at 7.8a; the kit's `vos-anchor` and
+statement pieces and the blob hashes at 7.8b; the fixtures and program ids
+once more at the slice's end (7.21), if VOS's node segment format changes
+(no change to the pallet's code, only the vendored tree and the pinned
+ids).

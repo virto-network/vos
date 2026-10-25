@@ -169,3 +169,42 @@ S30. **Item 68:** a `closes` row that does not decode is quarantined
 
 S31. **Slice 6's six owner's-call quality items** (1, 5, 34, 46, 54, 58)
   are folded in 7.23.
+
+## On Fable's review of draft 3 (2026-10-25)
+
+`plan3-fable.md`, "ready after fixes". Two new decisions, and three
+amendments the owner took as the review proposed.
+
+S32. **S23's leaf count, with its exit:** on 7.18's first day the node's
+  kernel leaves are counted over the CPU split's proposed layout and the
+  Poseidon2 chip. If any leaf would pass its `p2` budget (2^16 rows at 40
+  queries) with the split, the split stays device-only and the node's
+  format 41 takes the Poseidon2 chip alone, or nothing if that too
+  overflows, at 7.21. **No fold-shape change in this slice** (no `p2` at
+  2^17, no successor to format 32, `H_FOLD` unchanged). Narrows S23.
+
+S33. **The phone:** the Fairphone 6 is the only device. Its sessions are
+  batched, their number and timing planned (nine, P1–P9 in the plan's
+  "How every step runs"), each asked for a week in advance with its list.
+  Between sessions, iteration uses x86 timings scaled by the ARM factor
+  and qemu-aarch64 for byte-identity and verification; neither proxy is
+  a gate.
+
+Amendments:
+- **S7:** slice 6's re-pin batch is split: 7.8a (the pvm-internal items,
+  right after 7.0, before 7.14 touches a chip) and 7.8b (the agent-side
+  items and `blobs.lock`, after 7.3 and 7.11).
+- **S11:** the divergence guard is part of it: the leader signs only an
+  applied `anchor(w)`; before sending an anchor that would be evidence it
+  asks its followers for theirs and sends nothing if any differs (an
+  apply bug or a clone, alerted); a restored backup or a cloned store
+  counts as a compromised node key in `docs/operations.md`. Also: the
+  registration deposit is released on `Ended`.
+- **S25:** pin I's scope carries the `SpaceId`
+  (`scope = P2(TAG_SCOPE ‖ H(space ‖ agent ‖ instance ‖ name))`), so a
+  shared handle never shares nullifiers; `SECURITY.md` states that two
+  spaces sharing a handle can link their members' `member` and `owner`
+  digests, and the app shows and pins the handle at first enrollment; the
+  re-founding runbook re-seeds the new credential actor's tree from the
+  ended space's `member` digests, with no member action. Also: `member`
+  carries no epoch (`member = P2(TAG_MEMBER ‖ s)`).

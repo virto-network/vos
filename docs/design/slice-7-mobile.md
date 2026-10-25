@@ -1,7 +1,7 @@
 # Slice 7: simplify and scale, then proofs on the phone
 
-Plan, draft 3, with the owner's answers (2026-10-25). It takes the
-owner's slice-7 decisions S1–S31 (`research/slice-7/owner-decisions.md`)
+Plan, draft 4, with the owner's answers and Fable's review of draft 3
+folded (2026-10-25). It takes the owner's slice-7 decisions S1–S33 (`research/slice-7/owner-decisions.md`)
 and the first real phone run (`research/slice-7/phone-fairphone6-s5kit.txt`).
 Slice 6's decisions 1–18 stand, except those S9–S17 reverse ("Decisions"
 lists each). Two questions stay open: S3's gate after 7.0a (S20) and the
@@ -32,24 +32,20 @@ Tags as in slice 6: [measured] by a spike or a step; [model] by the
 security tool or a fit; [est] arithmetic on measured numbers, not run;
 [decided] the owner's; [proposed] open to review.
 
-## Changes from draft 2
+## Changes from draft 3
 
-The owner's answers (S6–S31): C1–C11 taken, C4 fully terminal with no
-resume anywhere (pin D′, 7.1); a stable PRF handle (pin K); the chip and
-M5's levers in the node's segment format too, so a second re-pin, 7.21,
-after the levers settle (pin H, M5); the teammate told now
-(`teammate-note.md`); the open questions answered, two left open until
-their measurements.
+Fable's review of draft 3 (`plan3-fable.md`, "ready after fixes"), every
+finding folded, and the owner's S32–S33: the scope carries the `SpaceId`
+and the runbook re-seeds the tree (H1); older roots expire (H2); the leaf
+count on 7.18's first day, no fold-shape change (H3, S32); the divergence
+guard (M1); `Unlisted`'s target and damper (M2); the PoW first and fuzzing
+at ingress (M3); 7.8 split (M4); per-format size caps (M5); the scale
+harness's host facts (M6); no epoch (M7); a witness-independent device
+trace (M8); 41 recounted (M9); nine planned phone sessions (M10, S33); and
+the eleven lows.
 
-## Changes from draft 1
-
-The Opus review of draft 1 (`plan1-review.md`), every finding folded:
-H1 (M5's outlook costed with the wrap's masking time; the CPU split
-expected), H2 (every reversed decision listed), H3 (pay as an owner
-proof), H4 (the tree in a credential actor's rows), M2–M11 (the critical
-path, C4's costs, C1's Clerk limit, C10's opt-in, C11, the device proof at
-ingress, the scale test, the credential request, PoW, 7.14's size, item
-68) and the lows. Its M1 ("device format only") is reversed by S23.
+**Earlier drafts:** draft 2 folded the Opus review of draft 1
+(`plan1-review.md`); draft 3 took the owner's answers S6–S31.
 
 ## Goals
 
@@ -64,9 +60,10 @@ ingress, the scale test, the credential request, PoW, 7.14's size, item
 4. **The general zkVM on the phone:** the auth statement under the device
    profile, masked, in at most 1 s and 1 GiB on the Fairphone 6 [decided,
    S3], or the gap measured lever by lever for the owner to judge.
-5. **Two re-pins, each one commit:** slice 6's batch early (7.8), the
-   segment format unchanged; the node's segment format 41, with the
-   Poseidon2 chip and M5's levers, late (7.21).
+5. **Two program-id re-pins and one blob lock, each one commit:** slice
+   6's pvm-internal items early (7.8a), its agent-side items with
+   `blobs.lock` after 7.3 and 7.11 (7.8b); the node's segment format 41
+   late (7.21), with what S32's count lets in.
 6. **Every item slice 6 carried** placed in a step or carried by name.
 
 **No value rides on a proof in this slice:** the external audit comes
@@ -78,12 +75,9 @@ device shape, the Poseidon2 chip and the CPU split to its scope.
 - **vos-core** at `f83f744b` (slice 6 accepted); the Stwo pin olanod/stwo
   `c3ec981`.
 - **Slice 5's mobile spike** (`spike/s5-mobile`, `ea539e9e`): the auth and
-  pay statements as kernels, a floor seam (the shape without the page
-  boundary, a cost proxy that does not verify), and the phone kit (a
-  static aarch64-musl binary with mimalloc, its runbook). It sits on
-  `3713cb42`, **503 commits behind**: the pre-hardening AIR (31 chips,
-  the Ristretto chips, no witness-input chip), format 24's Blake2s
-  channel.
+  pay kernels, a floor seam (no page boundary; a cost proxy that does not
+  verify) and the phone kit; **503 commits behind**, on the pre-hardening
+  AIR and format 24's Blake2s channel.
 - **Measured on the gate device** (2026-10-25, the kit's configuration
   `2:38:20`: log blowup 2, so blowup 4, 38 queries, PoW 20; unmasked):
   as built 6.2–6.5 s at 4 threads (2.0 GiB), 5.1 s at 8; the floor
@@ -99,15 +93,13 @@ device shape, the Poseidon2 chip and the CPU split to its scope.
 
 ## How every step runs
 
-- **A brief per step,** written from this plan and the design docs when
-  the step starts; an implementing agent works from it alone, at medium
-  effort.
-- **Reviews:** one Opus review of every step's diff, its findings folded
-  before the next step builds on it; Fable at each milestone's end and at
-  the slice's end, never per step. Steps marked **(S)** change soundness,
-  the protocol or a state layout: each milestone's Fable review names them
-  and checks them first. Review latency is outside the estimates. The
-  owner is not paused for between steps.
+- **A brief per step,** from this plan and the design docs; an
+  implementing agent works from it alone, at medium effort.
+- **Reviews:** one Opus review of every step's diff, folded before the
+  next step builds on it; Fable at each milestone's end and the slice's
+  end. Steps marked **(S)** change soundness, the protocol or a state
+  layout: Fable checks them first. Review latency is outside the
+  estimates; the owner is not paused for between steps.
 - **Gates:** `just check` per step; at each milestone's end `just ci-full`
   (fuzz a minute a target, leakage at medium N) and the checker loop; at
   the slice's end `just slice-gate` (leakage at full N, fuzz five minutes
@@ -115,20 +107,32 @@ device shape, the Poseidon2 chip and the CPU split to its scope.
   scale test's final run and the phone gates. Heavy runs one at a time
   under `systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=0 nice -n 10`,
   `TMPDIR` on disk, builds at `-j8`–`12`.
-- **Phone gates** (the s5 kit's approach), **two builds:** the timing
-  build with production features (masks from the OS), and a
-  `seeded-masks` build whose proofs are checked byte for byte against
-  x86's; neither ships. Each a static `aarch64-unknown-linux-musl` binary
-  with mimalloc and its fixtures embedded, its SHA-256 recorded; `adb
-  push` to `/data/local/tmp`; the device's model, SoC, build, per-CPU
-  maximum frequency and battery recorded; battery at least 50%, `dumpsys
-  battery` temperature below 35.0 °C at each round's start, battery saver
-  off, `svc power stayon usb`, out of its case; 3 rounds of 5 repetitions,
-  60 s apart; the gate is the median of the rounds' medians, the 95th
-  percentile recorded beside it; each proof verified on the phone and on
-  x86. The coordinator runs it over adb when the owner has the phone
-  attached and agrees; otherwise the owner runs the kit. Results land as
-  JSON lines in `research/slice-7/`.
+- **Phone gates** (the s5 kit's runbook): two static aarch64-musl bench
+  builds, neither shipped: a timing build (masks from the OS) and a
+  `seeded-masks` build checked byte for byte against x86; battery at least
+  50%, below 35.0 °C at each round's start, saver off, stay-on, out of its
+  case; 3 rounds of 5, 60 s apart; the gate the median of the rounds'
+  medians, the 95th percentile beside it; each proof verified on the phone
+  and on x86; JSON lines in `research/slice-7/`. The coordinator runs it
+  over adb when the owner attaches the phone and agrees.
+- **Phone sessions** [decided, S33]: the Fairphone 6 is the only device;
+  its sessions are batched and asked for a week ahead, each with its date
+  window and list. Between them, x86 timings scaled by the ARM factor
+  (re-measured each session) and qemu-aarch64 (byte-identity,
+  verification) serve iteration; neither is a gate.
+
+  | session | when | what |
+  |---|---|---|
+  | P1 | 7.0a's end | the baseline and masked proxy; 7.0b's PRF, across a reboot and a Google Password Manager re-sync |
+  | P2 | 7.12 | PG1 and the grind's 95th percentile (S29); the demo's first run |
+  | P3 | 7.13's end | PG3 recorded |
+  | P4 | 7.16 | the device parameters' candidates |
+  | P5 | 7.17's end | levers 1–4 together |
+  | P6 | 7.18, mid-way | the CPU split's first phone numbers |
+  | P7, P8 | 7.18's (or 7.19's) exit, a day apart | PG2, twice |
+  | P9 | 7.23 | PG1–PG3 on the final build |
+
+  The critical path assumes each session within a week of its ask.
 - **Rules:** slice 6's (`slice-6-on-chain.md`, "How every step runs"):
   commit on `vos-core`, push after reviewed milestones, the fork's pushes
   after Fable, no Kreivo code, timeless comments, no `#[ignore]`, no
@@ -156,22 +160,39 @@ G–L are M4's and M5's.
   says the pallet calls it.
 - **The node's outcome enum** (C5):
   `enum AnchorOutcome { Taken, NotYet, Never(u32), Unlisted(u32), Stopped(u32) }`,
-  the raw venue code carried for the log; `Unlisted` makes the leader hand
-  off its leadership so a listed replica anchors; one mapping table per
-  client, tested against every venue code. Submits:
-  `enum SubmitOutcome { Accepted, Refused(u32), Retry }`, a repeat
-  `Accepted` at one site.
+  the raw venue code carried for the log (`Stopped`: the space ended or
+  blocked); one mapping table per client, tested against every venue
+  code. Submits: `enum SubmitOutcome { Accepted, Refused(u32), Retry }`, a
+  repeat `Accepted` at one site.
+- **`Unlisted`'s handoff:** the leader transfers its leadership
+  (`vos-raft`'s `transfer_leadership`) to a replica whose node key the
+  client's last listing holds; at most one handoff a window a leadership;
+  with no replica listed, it alerts and waits, no handoff.
+- **What a client still reads:** the space's status, `AnchorKeys` (the
+  handoff's target; on Kreivo it tells a delisted authority's `Payment`
+  refusal from an exhausted budget) and `Last`/`Anchors[w]`; on its own
+  thread, cached for the batch thread (slice 6's F2).
 - **The replicated anchor row** (C3, C11): the representative's close
-  writes `anchor(w) = S_w` for a window some agent reported, kept for
-  `MaxRootAge`; its leader signs and sends pending rows in window order
-  with its node key (C2); nothing is handed back.
+  writes `anchor(w) = S_w` by apply for a window some agent reported, kept
+  for `MaxRootAge`; its leader signs only an applied row, never a root
+  from the batch under proposal, in window order, with its node key (C2);
+  nothing is handed back.
+- **The divergence guard** (S11): before sending an anchor the venue
+  would store as evidence, the leader asks its followers for their
+  applied `anchor(w)`; if any differs it sends nothing and alerts
+  "divergent replicas" (an apply bug or a clone, not a theft). A restored
+  backup or a cloned store counts as a compromised node key
+  (`docs/operations.md`): the node is replaced before the space re-founds.
 - **Equivocation ends the space** (C4, S11): the evidence is stored, the
   status becomes `Ended`, its roots are refused from then on, at every
   venue, with no resume and no revive; the record is a tombstone the venue
-  never prunes, so a replayed registration is refused; the controller's
-  `dispatch_as_sovereign` stays callable, so the sovereign's funds leave.
-  The space re-founds under a new `SpaceId`, its members register their
-  leaves again under the same handle (pin K), its Clerk pairs reset.
+  never prunes, so a replayed registration is refused; the registration
+  deposit is released to the sovereign on `Ended`, and the controller's
+  `dispatch_as_sovereign` stays callable, so the funds leave (the
+  existential deposit stays). The space re-founds under a new `SpaceId`;
+  the re-founding runbook installs the new credential actor with the same
+  handle (pin K) and re-seeds its tree from the ended space's `member`
+  digests, with no member action; its Clerk pairs reset.
 - **No migration** (C1): the Clerk's counterparties share a venue for good
   [decided, S9].
 
@@ -180,8 +201,8 @@ G–L are M4's and M5's.
 - **What it is:** `vos-credentials`, an actor installed in the agent whose
   methods it guards (the demo's: the ledger's agent). Its tree is a
   **positional sparse Merkle tree** of Poseidon2-M31, depth 32, kept in
-  its own committed rows: `slot(key) → u32` (the next free slot, freed
-  slots reused lowest first), `leaf(slot) → Digest`, the non-empty
+  its own committed rows: `slot(member) → u32`, keyed by the `member`
+  digest (the next free slot, freed slots reused lowest first), `leaf(slot) → Digest`, the non-empty
   `node(level, index) → Digest`, the empty subtrees' digests as constants.
 - **The hashes:** through the `0x402` host call (pin H): the VOS host
   serves it natively, a JAM-deployed agent pays the shim's software
@@ -192,12 +213,18 @@ G–L are M4's and M5's.
   M31 constants from `BLAKE2b("vos/p2/<name>")`.
 - **Roots:** a replicated ring `roots[i] = (root, batch_time)` of the last
   64 roots, one written per batch that changed the tree. Enrollment is
-  rare: 32 calls of `0x402` a write.
+  rare: 32 calls of `0x402` a write. **Freshness** (the Fable review's
+  H2): ingress accepts the current root at any age, and an older one only
+  if its `batch_time` is within `ROOT_MAX_AGE` (10 minutes) of the
+  replica's latest applied batch time, so a removal (revocation) takes
+  effect within it; the ring's count only bounds storage.
 - **The handle** (pin K, S25): a 32-byte value the founder draws once, set
   at the actor's install and served with `path`; a re-founded space's
   actor is installed with the same handle.
-- **Paths:** a query method `path(key) → (root, slot, siblings[32])`, served
-  by any replica. **What it reveals:** asking for a path by key tells the
+- **Paths:** a public query method `path(member) → (root, slot,
+  siblings[32])` and `handle()`, served by any replica, rate-limited per
+  connection (a `member` digest is a pseudonym, and the tree's shape is
+  not secret from its readers). **What it reveals:** asking for a path by key tells the
   operators which member is about to prove and when; `Anonymous` hides the
   member from the log's readers and from other agents, not from operators
   (`identity-and-authority.md` §3 and §8: hiding from operators is full
@@ -219,18 +246,20 @@ G–L are M4's and M5's.
   output of `compress`; no other effect. Served natively by the VOS host
   at a price measured in 7.9; on JAM the guest shim computes it in
   software on `WHAT`.
-- **The chip** (7.15), in the device format and the node's segment
-  format [decided, S23]: one permutation a row, `p2`'s arithmetic (`permutation_columns`, the S-box pair) as a
+- **The chip** (7.15), in the device format, and in the node's segment
+  format as S32 allows [decided, S23, S32]: one permutation a row, `p2`'s
+  arithmetic (`permutation_columns`, the S-box pair) as a
   `BuiltInComponent`, about 300 main columns at degree ≤ 3; memory-access
   lookups for the 64 bytes read and 32 written; each input word
   range-checked below p, so a word the live call refuses has no proof; a
   `Poseidon2Call` relation from the CPU's `IsP2Ecall` selector.
-- **Format 41, the node's segments** (admitted at 7.21): format 35's AIR
-  with the chip and M5's settled levers (the CPU split; word-level memory
-  if built), the page boundary kept, 35's parameters; 35 retired then.
-  `SEGMENT_CHIPS` and the install record's `Shape` change with it. Until
-  7.21 the nodes prove under 35, byte for byte, and `derive` admits `0x402`
-  in device kernels and handlers alone.
+- **Format 41, the node's segments** (7.21): format 35's AIR, the page
+  boundary kept, with what S32's count allows (the chip and M5's levers if
+  every kernel leaf stays within 2^16 `p2` rows at 40 queries; else the
+  chip alone; else no 41 this slice; **no fold-shape change**); its
+  parameters recounted on its own shape; 35 retired then. Until 7.21 the
+  nodes prove under 35, byte for byte, and `derive` admits `0x402` in
+  device kernels and handlers alone.
 
 ### Pin I: the credential statements and their verifier at ingress
 
@@ -246,19 +275,20 @@ G–L are M4's and M5's.
   least 62 proven and 100 conjectured bits on its masked shape (62.69 and
   106 [model]); `h = 512`, every component at least 2^11 rows. 30,
   reserved at an unmasked count, is retired unregistered.
-- **The scope,** namespaced by the verifier:
-  `scope = P2(TAG_SCOPE ‖ BLAKE2b-256(agent ‖ instance ‖ the guard's scope name))`,
-  computed by ingress from the method's guard; two agents' "login" never
-  share a pseudonym.
+- **The scope,** namespaced by the verifier and its space (the Fable
+  review's H1):
+  `scope = P2(TAG_SCOPE ‖ BLAKE2b-256(space ‖ agent ‖ instance ‖ the guard's scope name))`,
+  computed by ingress from the method's guard; no two agents' "login",
+  in one space or two, share a pseudonym, even for a member whose secret
+  two spaces share (pin K).
 - **The binding:** `binding = P2(BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖
   agent ‖ instance ‖ method ‖ program ‖ kind ‖ SCALE(arguments) ‖ nonce ‖
   expires_ms))`: a proof authorizes one call, in one space, under one
   statement.
 - **Auth** (`CredentialKind::Auth = 0`), public
   `(kind, map_root, scope, nullifier, binding)`, each 8 M31; private `s`,
-  the epoch, the slot and its path. Proves
-  `leaf(slot, member(s, epoch))` under `map_root` and
-  `nullifier = P2(TAG_NF ‖ s ‖ scope)`.
+  the slot and its path. Proves `leaf(slot, member(s))` under `map_root`
+  and `nullifier = P2(TAG_NF ‖ s ‖ scope)`.
 - **Pay** (`CredentialKind::Owner = 1`), public `(kind, owner, binding)`;
   private `s`. Proves `owner = P2(TAG_OWNER ‖ s)`: a post-quantum
   authorization by the owner of a row, about two permutations. No path,
@@ -269,16 +299,17 @@ G–L are M4's and M5's.
 - **The request:** `POST /agents/{id}/calls` with
   `Credentialed { call, kind, proof, public }`, no session (the reserved
   session-less input kind, `identity-and-authority.md` §15 step 0).
-- **Ingress checks, in order:** the size (≤ 512 KiB); the format (42, or
-  43 for a device proof, pin J); the program id the agent's schema pins
-  for the method; the scope recomputed; for auth, `map_root` in the
-  credential actor's ring as this replica has applied it (a root it has
-  not applied yet is a retryable refusal, the identity replica's lag
-  rule); the binding recomputed; `expires_ms` within 120 s of the node's
-  clock; then the proof, on an executor. Each refusal a `403` with its
-  code. **Load:** a bound per connection and an executor budget for
-  verification (past it, `503` and retry), no bucket per scope or method
-  that an attacker could drain for everyone.
+- **Ingress checks, in order:** the size per format (42: 512 KiB; 43:
+  1.5 MiB; the HTTP limit raised on this route alone; the log carries the
+  call and origin, never the proof, so `cap::REQUEST` is unchanged); the
+  format (42, or 43, pin J); the program id the schema pins for the
+  method; the scope; for auth, `map_root` the current root or a ring root
+  within `ROOT_MAX_AGE`, as applied here (one not yet applied: retryable,
+  the identity replica's lag rule); the binding; `expires_ms` within 120 s of the node's
+  clock (a client reads it from `GET /`); then the proof, on an
+  executor, **its PoW checked before any decommitment**. Each refusal a
+  `403` with its code. **Load:** a bound per connection and an executor
+  budget (past it, `503`), no bucket per scope or method to drain.
 - **At apply:** the binding refused if `expires_ms` is before the batch
   time, or if its digest is already recorded; the digest recorded until
   `expires_ms` plus the clock skew allowed (60 s) by batch time. So a
@@ -288,14 +319,16 @@ G–L are M4's and M5's.
   `Owner { digest }` for pay; never the proof (`identity-and-authority.md`
   §5). Guards: `#[msg(credential = Auth("login"))]`,
   `#[msg(credential = Owner)]`.
-- **Gate:** the native verify of a credential proof at most 10 ms on one
-  x86 core.
+- **Gates:** the native verify of a credential proof at most 10 ms on one
+  x86 core; a proof with a wrong PoW refused in under 1 ms; fuzz targets
+  for the `Credentialed` decode and the format 42 and 43 verifiers in
+  `just fuzz`.
 
 ### Pin J: the device profile, and format 43
 
-- **The shape:** one segment, at most 2^16 steps; format 41's chips (the
-  Poseidon2 chip and the levers among them) without the page-Merkle
-  boundary (BLAKE2B_BOUNDARY, MEMORY_PAGE, MEMORY_MERKLE,
+- **The shape:** one segment, at most 2^16 steps; the shared chip set (the
+  Poseidon2 chip and M5's levers, whether or not S32 lets them into 41)
+  without the page-Merkle boundary (BLAKE2B_BOUNDARY, MEMORY_PAGE, MEMORY_MERKLE,
   MEMORY_ROOT_BOUNDARY); the run bound by
   - code: PROGRAM_MEMORY, preprocessed;
   - first touches (`ts = 0` ledger entries): the data region from a
@@ -315,6 +348,10 @@ G–L are M4's and M5's.
 - **The device program id:** the format, the chip mask, the log sizes and
   the preprocessed roots (program memory, data table, permissions), as a
   segment program's; computed at install, never taken as submitted.
+- **A witness-independent trace** (the Fable review's M8): the prover pads
+  every chip to the program id's log sizes and fails on a run that
+  exceeds them; a device kernel is written branch-free (the path walked
+  with selects), so its proof's shape never depends on the witness.
 - **What a device proof authorizes at ingress:** exactly what an auth
   credential proof does. A device kernel is an `#[attestable]` method whose
   `public_args` are pin I's auth words `(kind, map_root, scope, nullifier,
@@ -324,11 +361,10 @@ G–L are M4's and M5's.
   auth checks and logs the same `Anonymous` origin. Payment stays a
   credential proof. Nothing else a device proof states is admitted in this
   slice.
-- **Budgets on the Fairphone 6** [decided S3 for time; proposed for the
-  rest]: the auth statement at most **1.0 s** (median, the library's
-  automatic threads), peak resident at most **1 GiB** (target 768 MiB),
-  the proof at most 1.5 MiB; verify at ingress at most 40 ms on one x86
-  core.
+- **Budgets on the Fairphone 6** [decided, S3, S20, S27, S28]: the auth
+  statement at most **1.0 s** (median, automatic threads), peak resident
+  at most **1 GiB** (target 768 MiB), the proof at most 1.5 MiB; verify at
+  ingress at most 40 ms on one x86 core.
 
 ### Pin K: the device secret from a passkey's PRF
 
@@ -336,22 +372,28 @@ G–L are M4's and M5's.
   PRF extension's `eval.first`; the client (the platform's WebAuthn
   client, not the authenticator) applies the `"WebAuthn PRF\0"` prefix.
   `handle` is the space's stable handle (pin G), not its `SpaceId`, so a
-  member's secret survives a re-founding [decided, S25].
+  member's secret survives a re-founding [decided, S25]. The app shows
+  the handle and pins it at the first enrollment.
 - **The derivation:** `o` the 32-byte PRF output;
   `w = BLAKE2b-512("vos/device/secret/v1" ‖ handle ‖ o)`;
   `s_i = u64_le(w[8i..8i+8]) mod p` for `i < 8` (bias below 2^-33 an
   element); derived again at each use from a fresh assertion with user
   verification.
-- **What a space stores:** `member(s, epoch) = P2(TAG_MEMBER ‖ s ‖ epoch)`
-  in the credential actor, `owner = P2(TAG_OWNER ‖ s)` in a ledger row; a
-  new passkey or a revocation bumps the epoch and re-enrolls. The handle
-  is in the derivation, so one passkey gives unlinkable secrets in two
-  spaces.
-- **Containment, stated honestly** (in `SECURITY.md`): the library zeroizes
-  `s` and its working copies, but the PRF output, equivalent to `s`,
-  reaches the app as base64 in a Java string through Credential Manager
-  and cannot be zeroized; a Google Password Manager passkey syncs, so `s`
-  is bound to the Google account, not to the phone.
+- **What a space stores:** `member(s) = P2(TAG_MEMBER ‖ s)` in the
+  credential actor, `owner(s) = P2(TAG_OWNER ‖ s)` in a ledger row; no
+  epoch, which the device could not keep nor the actor check (the Fable
+  review's M7): a revocation removes the leaf (pin G's freshness makes it
+  take effect), a new passkey is a new `s` and a new leaf. The handle is in
+  the derivation, so one passkey gives unlinkable secrets in two spaces
+  with different handles.
+- **The handle-copy linkage** (in `SECURITY.md`): a founder who copies
+  another space's public handle makes a member of both hold one `s`, so
+  the two spaces' operators can link that member's `member` and `owner`
+  digests; the scopes carry the `SpaceId`, so nullifiers stay distinct.
+- **Containment** (in `SECURITY.md`): the library zeroizes `s`, but the
+  PRF output, equivalent to `s`, reaches the app as a Java string and
+  cannot be zeroized; a synced passkey binds `s` to the Google account,
+  not to the phone.
 
 ### Pin L: the device library
 
@@ -364,7 +406,7 @@ G–L are M4's and M5's.
   ```rust
   pub struct DeviceSecret(/* [M31; 8], zeroized on drop */);
   pub fn derive_secret(prf_output: &[u8; 32], handle: &[u8; 32]) -> DeviceSecret;
-  pub fn member(secret: &DeviceSecret, epoch: u32) -> Digest;
+  pub fn member(secret: &DeviceSecret) -> Digest;
   pub fn owner(secret: &DeviceSecret) -> Digest;
   pub struct ProverConfig { pub threads: Threads, pub max_memory: u64 }
   pub enum Threads { Auto, Count(usize), Cores(Vec<usize>) }
@@ -387,7 +429,8 @@ G–L are M4's and M5's.
 
 Two tracks from the first day: the simplification (7.1–7.3) and the scale
 harness (7.4–7.5) meet in the scale runs (7.6). The probes (7.0a, 7.0b),
-M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
+M4's 7.7, 7.8a, 7.9 and 7.10 and M5's 7.14 run beside them [decided,
+S7].
 
 ### 7.0 The docs, the picks and two probes
 
@@ -395,30 +438,28 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
   "Decisions"; `slice-7-progress.md` opened; `proving.md` §8's floor and
   §11's rows corrected; `core-model.md`'s "Draft 5" heading (slice 6's L8).
 - **7.0a The device baseline on today's AIR** (a spike, throwaway code):
-  slice 5's floor seam and statements rebased onto `f83f744b` (format 35's
-  chips, Blake2s-M31 through the fork's channel); on x86 the as-built and
-  floor shapes at log blowup 1 and 2, 4 and 8 threads; **a masked-cost
-  proxy:** the floor shape with every column committed at its log size
-  + 1 and the composition at + 2 (what masking (c) commits), unmasked
-  values, timed and sized; the same kit on the Fairphone 6 by the
-  phone-gate protocol. **Output:** today's starting point, the masking
-  factor on this shape, and the proof's bytes at blowup 2 with 86–87
-  queries against pin J's 1.5 MiB; M5's outlook redone with them, for the
-  owner's call on S3's gate (S20). **Estimate:** 1–1.5 weeks.
-- **7.0b The passkey PRF on the gate device** (a probe): a throwaway app
-  creating a passkey with the PRF extension through Credential Manager
-  (`androidx.credentials`) under the demo's relying party, then an
-  assertion returning `prf.results.first`, twice, equal. PRF for a native
-  app through Google Password Manager is not documented: this probe is
-  the evidence. **The relying party** [decided, S6]: a subdomain that
-  serves `/.well-known/assetlinks.json` and nothing else (any page there
-  could ask for the same PRF input and derive `s`); a demo keystore
-  committed, its certificate's SHA-256 in `assetlinks.json`.
-  **Fallback:** a FIDO2 security key's `hmac-secret` through a CTAP
-  library over USB or NFC (Credential Manager may not pass PRF to a
-  security key), applying `SHA-256("WebAuthn PRF\0" ‖ input)` itself so
-  its secret equals the PRF path's; else a stored key stands in for the
-  PRF in the demo. **Estimate:** 2–3 days.
+  slice 5's floor seam and statements rebased onto `f83f744b`; on x86 the
+  as-built and floor shapes at log blowup 1 and 2, 4 and 8 threads, and
+  **a masked-cost proxy** (every column committed at its log size + 1, the
+  composition at + 2, as masking (c) commits); the kit on the phone
+  (session P1). **Output:** today's starting point, the masking factor on
+  this shape, the proof's bytes at blowup 2 with 86–87 queries against
+  pin J's 1.5 MiB; M5's outlook redone, for the owner's call on S3's gate
+  (S20). The proxy hashes the undoubled tree shape, omitting the doubled
+  leaf layer's hashing that dominated the wrap's factor: it is a floor on
+  the masking factor, not an estimate. **Estimate:** 1–1.5 weeks.
+- **7.0b The passkey PRF on the gate device** (a probe, session P1): a
+  throwaway app creating a passkey with PRF through Credential Manager
+  under the demo's relying party; `prf.results.first` equal twice, after a
+  reboot and after a Google Password Manager re-sync (a changed output
+  loses `s`). PRF for a native app through GPM is undocumented: this is
+  the evidence. **The relying party** [decided, S6]: a subdomain serving
+  `/.well-known/assetlinks.json` and nothing else (any page there could
+  ask for the same PRF input); a demo keystore committed, its SHA-256 in
+  `assetlinks.json`. **Fallback:** a FIDO2 key's `hmac-secret` through a
+  CTAP library (Credential Manager may not pass PRF to a security key),
+  applying `SHA-256("WebAuthn PRF\0" ‖ input)` itself; else a stored key
+  stands in for the PRF in the demo. **Estimate:** 2–3 days.
 
 ### 7.1 The venue side simplified (S)
 
@@ -428,7 +469,7 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
   `ModelVenue`, the JAM statements service, the Kreivo mock and client,
   and jam-dev's client; `spaces-pallet.md` v2 and the conformance vectors
   regenerated once (S19; `teammate-note.md` sent now): the teammate's
-  first drop (then 7.8's and 7.21's kit blobs).
+  first drop (then 7.8a's, 7.8b's and 7.21's).
 - **Folded:** slice 6's F2 (`behind()`'s read on the batch thread goes with
   the client's pre-checks), F3 (gone with resume), L4 (strict ed25519,
   and a small-order key refused at registration and when added, with a
@@ -438,11 +479,13 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
 - **Tests:** the core's own suite (every rule, every refusal) run against
   each venue's state; G1–G19 renumbered as the picks leave them; the
   fixtures judged alike at every venue; an equivocation ending the space
-  at each venue; the tombstone (an ended space's registration replayed,
-  refused); `dispatch_as_sovereign` on an ended space.
+  at each venue (status `Ended`, the Kreivo index 3, 1 retired); the
+  tombstone (an ended space's registration replayed, refused); the
+  registration deposit released on `Ended`; `dispatch_as_sovereign` on an
+  ended space.
 - **Gate:** every venue calls the core; no anchor-rule logic outside it
   (a grep check in `just check`); the vectors regenerate byte for byte.
-- **Dep:** 7.0. **Estimate:** 2–3 weeks.
+- **Dep:** 7.0. **Estimate:** 3–4 weeks.
 
 ### 7.2 The node's anchoring simplified (S)
 
@@ -453,11 +496,14 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
   CLI (`vos node anchor-key` removed).
 - **Folded:** slice 6's L5 (jam-dev's `push` wedge) and the untested
   once-a-window recheck, both gone with the hand-back.
-- **Tests:** anchors in order across a leader change; an unlisted leader
-  handing off to a listed replica, which anchors; a delisted node's
-  replica refused and replaced; an equivocation stopping the space; an
-  aged window settled unsent; every venue code through each client's
-  table.
+- **Tests:** anchors in order across a leader change; a deposed leader
+  with an uncommitted close and a successor whose clock lags, both
+  anchoring the same root; the divergence guard (a follower with another
+  `anchor(w)`: no evidence sent, the alert); an unlisted leader handing
+  off to a listed replica, which anchors; one handoff a window; no replica
+  listed: an alert and a wait; a delisted node's replica refused and
+  replaced; an equivocation ending the space; an aged window settled
+  unsent; every venue code through each client's table.
 - **Gate:** the checker loop with cuts and the representative; the
   leader's anchoring state and wait paths counted against `simplify.md`
   §4.
@@ -480,7 +526,7 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
   and a snapshot install with statements queued, each proved once.
 - **Gate:** the checker loop; the cut's bench (a write with a cut pending,
   a cut's build with 100 proofs) within 10% of slice 6's.
-- **Dep:** 7.2. **Estimate:** 1.5–2.5 weeks.
+- **Dep:** 7.2. **Estimate:** 2–3 weeks.
 
 ### 7.4 The scale harness
 
@@ -489,7 +535,8 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
   address, role, a placement weight, the data disk, the cores to use):
   - `check`: ssh reach, the kernel (the JIT needs Linux ≥ 6.7; an older
     host is excluded or weighted down), clock offsets (refused above
-    100 ms), free memory and disk, the CPU;
+    100 ms), free memory and disk, the disk's type, the CPU and its
+    `scaling_governor`, the link's speed; a Wi-Fi host refused;
   - `deploy`: a static musl build of `vos` from a pinned `just release`,
     the guest ELFs, the space file and genesis, by `rsync`;
   - `up`, `down`: nodes under `systemd-run --user` with a memory cap;
@@ -499,7 +546,9 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
     drivers (7.5);
   - `collect`: `/stats`, `/agents/*/status`, per-thread `/proc`, disk and
     network counters every 10 s as JSON lines; `report`: one directory a
-    run, with its inventory, versions, host facts and summary.
+    run, with its inventory, versions, host facts, summary, and the
+    binding resource of each host at the knee (CPU, iowait, the NIC
+    against its link speed).
 - **Node changes it needs:** a `--config node.toml` exposing `Config`
   (executors, queue, linger, `max_inputs`, `ingress_connections`,
   elections, heartbeat); an admin route and `vos space representative` to
@@ -522,21 +571,19 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
   offered load is `U·a·r` (at `a` = 5%, `r` = 0.1, 5,000 calls a second
   at a million users).
 - **Agents:** `K` ledger shards (a test actor with a `CommittedMap` of
-  accounts), `I` idle agents (installed, never called), and **a stand-in
-  identity agent:** `U` identity rows replicated on every node host, its
-  writes at 10 a second (enrollments, revocations) and its snapshots and
-  catch-up measured; the per-call ingress read of it is not modeled (no
-  such path exists yet).
+  accounts), `I` idle agents, and **a stand-in identity agent:** `U` rows
+  replicated on every node host, written 10 times a second, its snapshots
+  and catch-up measured.
 - **Operations,** open loop (Poisson, latency timed from the scheduled
   send), users drawn Zipf(1.0): transfers (a **cross-shard share** `x`, a
   parameter: random payees give `x = 1 − 1/K`, about 98% at `K = 64`),
   queries on followers, workflows, and reads at a cut (`attest_at_cut`,
   the window pipeline without proving). Each kind reported apart.
 - **Drivers:** each signs ahead, multiplexes users over at most 512 kept
-  connections a node, and reports per-operation histograms (p50, p99,
-  p99.9), the achieved rate and errors by kind every 10 s.
-- **Not modeled,** stated in every report: credentialed calls (M4's,
-  measured apart in 7.11), cross-space traffic, proving.
+  connections a node, and reports histograms, the rate and errors by kind
+  every 10 s.
+- **Not modeled,** stated in every report: the per-call identity read,
+  credentialed calls (measured in 7.11), cross-space traffic, proving.
 - **Gate:** one driver sustains 20k calls a second on one core-pair of a
   driver host; the operation mix within 1% of its target.
 - **Dep:** 7.4. **Estimate:** 1–1.5 weeks.
@@ -550,7 +597,9 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
      allocated whole at creation, and idle Raft timers, are the suspects;
      quiescing idle groups is the lever), fixed first if it binds;
   2. **the baseline:** `K = 64`, `U = 10^5`, `x` = 98% and again at 30%,
-     the rate stepped to the knee;
+     the rate stepped to the knee; then once more with the slowest host
+     excluded, the difference reported (a group commits at its median
+     replica's fsync, so a slow host gates every group it follows);
   3. **users:** `U = 10^6`, `K = 64`, at the T1 rate, then at 80% of the
      knee;
   4. **agents:** `I` stepped 10^4 → 10^5 at the baseline's load;
@@ -563,8 +612,11 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
   key cache), each a commit with its before and after; the ops notes
   (slice 6's L8, the clock-jump outage, catch-up by log) in
   `docs/operations.md`.
+- **During timed runs,** drivers and the coordinator never share a node
+  host.
 - **Gate:** "The scale test" targets met, or each miss recorded with its
-  measured cause and its lever (a step, or carried by name).
+  measured cause and its lever (a step, or carried by name); C9's read
+  fail rate at the LAN's real skew reported as a metric.
 - **Dep:** 7.3, 7.5. **Estimate:** 2–4 weeks.
 
 ### M3.9 acceptance
@@ -576,22 +628,19 @@ M4's 7.7, 7.9 and 7.10 and M5's 7.14 run beside them [decided, S7].
 ## The scale test
 
 **Hardware** [decided, S2]: the owner's desktop and other LAN machines,
-uneven, on a real network. The topology is the inventory's: 3 to 5 node
-hosts, one `vos` process each (the desktop may run two), every agent's 3
-replicas on three hosts by weight; 1 or 2 driver hosts; the desktop as
-coordinator running `vos-scale`.
+uneven, on a real network: 3 to 5 node hosts (one `vos` process each, the
+desktop perhaps two), every agent's 3 replicas on three hosts by weight;
+1 or 2 driver hosts; the desktop as coordinator.
 
-**What "users" means:** a user is a key and an account row, not an agent:
-an agent holds at most 65,536 live sessions (slice 3's cap), so a million
-users active within an hour need at least 16 shard agents; the agent is
-the unit of scaling, the row the unit of users.
+**Users** are keys and account rows, not agents: an agent holds at most
+65,536 live sessions (slice 3's cap), so a million users active within an
+hour need at least 16 shard agents.
 
 **Metrics:** per operation p50, p99 and p99.9 at the client and the
-achieved rate; per node CPU by thread (the `vos-node` runtime thread
-above all), RSS, idle wakes, fsync latency, disk and network bytes; per
-agent leader changes; the window pipeline (boundary to cut built, to
-report, to close); clock offsets between hosts; cost per user (bytes on
-disk, CPU per call) and per idle agent (RSS, CPU, wakes).
+achieved rate; per node CPU by thread (the runtime thread above all),
+RSS, idle wakes, fsync latency, disk and network bytes; leader changes;
+the window pipeline (boundary to cut, report, close); clock offsets; cost
+per user and per idle agent.
 
 **Targets** [decided, S26], from the one rate (`a` = 5%
 active at once, `r` = 0.1 calls a second each), checked after run 2 and
@@ -600,7 +649,7 @@ adjusted only by the owner:
 | | target |
 |---|---|
 | T1 users | 10^6 users in one space at `U·a·r` = 5,000 calls a second, cross-shard share 98%, client p99 at most 50 ms, no session refused |
-| T2 headroom | the knee at least 8× T1's rate (40,000 calls a second) on 4 node hosts or more, client p99 at most 50 ms below it, no leader lost: room for 8 million users at this rate |
+| T2 headroom | the knee at least 8× T1's rate (40,000 calls a second) on 4 node hosts or more, client p99 at most 50 ms below it, no leader lost: room for 8 million users at this rate, with `K` scaled to them (65,536 sessions an agent: `K ≥ 128`) |
 | T3 agents | 10^4 agents a space: idle cost at most 5% of a core and 64 MiB of RSS per 1,000 replicas (10^5 measured, a stretch) |
 | T4 windows | at L = 2 min, 15 windows, with 1% of agents reading each window: every read served by `B_w + D + 10 s`, none `NotClosed` without a fault; the representative's work a window proportional to readers (C10) |
 | T5 faults | a node host killed under load: every agent led again within 5 s, throughput back to 80% within 30 s, the host rejoined within 60 s of its restart |
@@ -608,8 +657,12 @@ adjusted only by the owner:
 
 ## M4: the credential AIR
 
-7.7, 7.9 and 7.10 start beside M3.9 (S7); 7.8, the re-pin, waits for 7.3,
-which changes the agent image last.
+7.7, 7.8a, 7.9 and 7.10 start beside M3.9 (S7); 7.8b waits for 7.3 and
+7.11, the last steps that change the agent image and its ABI (the Fable
+review's M4). 7.10's component set and 7.14's `MaskedComponents`
+extensions touch `recair-air/src/masked.rs` apart: 7.10 needs none of
+7.14's extensions (two recair components already mask, as `P2Only` does)
+and adds its set in a file of its own.
 
 ### 7.7 The design round
 
@@ -620,22 +673,33 @@ which changes the agent image last.
   and `identity-and-authority.md` §5–§7.
 - **Dep:** 7.0. **Estimate:** 1 week.
 
-### 7.8 The re-pin batch (S)
+### 7.8a The pvm-internal re-pin (S)
 
-- **What, one commit** (slice 6's carried list): items 4's guest half,
-  17–25 (the `#[repr(u8)]` enums first), 64–66, 67, 69, 16's unmasked
-  half, 26 (`SpaceGenesis::version`), 27 (the `ANCHORS` mode out of
-  `final-verify.elf`), 28 (the strictness fix, `read_nat` shared), 3's
-  `TryFrom<u32>` for `AnchorCode`, 33's `FetchKind`; item 13 (the witness
-  digest from `statement_header_words`); item 18's rest (`array::from_fn`
-  in `agent/tree`'s hash, `leaf_terms`' named offsets); slice 6's L2
-  (`blobs.lock`, checked by `check-no-std`); the fixtures and vectors as
-  7.1 left them. 7.1–7.3 change the agent image and the service's blob
-  before this, but no hash pins a blob until `blobs.lock`: this is the
-  slice's one re-pin, the teammate's second drop (the kit's blobs).
-- **Gate:** the stale-fixture test re-pinned once; format 35, `H_FOLD` and
-  the wraps' roots byte for byte; `repro-aarch64` equal.
-- **Dep:** 7.3. **Estimate:** 1.5–2.5 weeks.
+- **What, one commit, right after 7.0 and before 7.14 touches a chip:**
+  slice 6's carried items inside `pvm/proof` and the kernels' code, which
+  move program ids and fixtures: item 13 (the witness digest from
+  `statement_header_words`), item 16's unmasked half, the final
+  verifier's and recair's pieces of items 17–25, item 18's rest
+  (`array::from_fn` in `agent/tree`'s hash, `leaf_terms`' named offsets);
+  the fixtures regenerated. The teammate's second drop (the kit's
+  fixtures and pinned ids).
+- **Gate:** the stale-fixture test re-pinned once; format 35's AIR,
+  `H_FOLD` and the wraps' roots byte for byte; `repro-aarch64` equal.
+- **Dep:** 7.0. **Estimate:** 1–1.5 weeks.
+
+### 7.8b The agent-side items and `blobs.lock`
+
+- **What, one commit:** the rest of the batch: `vos-anchor`'s and the
+  statement service's pieces of items 17–25, items 3 (`TryFrom<u32>` for
+  `AnchorCode`), 4's guest half, 26 (`SpaceGenesis::version`), 27 (the
+  `ANCHORS` mode out of `final-verify.elf`), 28 (the strictness fix,
+  `read_nat` shared), 33 (`FetchKind`), 64–67 and 69; slice 6's L2
+  (`blobs.lock` over every guest blob, checked by `check-no-std`). 7.1–7.3
+  and 7.11 change the agent image and the service's blob before it; no
+  hash pins a blob until `blobs.lock`. The teammate's third drop.
+- **Gate:** `blobs.lock` reproduced from a clean build; the vectors and
+  fixtures unchanged by it.
+- **Dep:** 7.3, 7.11. **Estimate:** 1–1.5 weeks.
 
 ### 7.9 The Poseidon2 host call and the credential actor (S)
 
@@ -672,15 +736,21 @@ which changes the agent image last.
   `node/host/src/ingress.rs` and `calls.rs`; the origin ABI's `Anonymous`
   and `Owner` kinds and the session-less input kind
   (`identity-and-authority.md` §15 step 0); the guards; the replicated
-  binding set; a challenge route for clients that want a server nonce.
+  binding set; the route's per-format size caps; the fuzz targets. Its
+  ABI change lands before 7.8b, so no pinned blob moves twice.
 - **Tests:** each check's refusal in order; a proof replayed at another
   node, refused at apply; an expired binding at apply by batch time; a
-  root the replica has not applied (retryable); a proof of one call sent
-  with another; two agents' scopes distinct; the origin logged, the proof
-  not; a pay proof refused once the row's owner changed.
-- **Gate:** pin I's verify time; 1,000 credentialed calls a second on one
-  node at p99 within 50 ms of a signed call's.
-- **Dep:** 7.10. **Estimate:** 1.5–2.5 weeks.
+  root the replica has not applied (retryable); a revoked member's proof
+  against the pre-revocation root refused once `ROOT_MAX_AGE` has passed
+  by batch time; a proof of one call sent with another; two agents'
+  scopes distinct; two spaces sharing a handle: one secret, one guard
+  name, distinct nullifiers; a 1.4 MiB device proof taken, a 600 KiB
+  credential proof refused; a wrong-PoW proof refused in under 1 ms; the
+  origin logged, the proof not; a pay proof refused once the row's owner
+  changed.
+- **Gate:** pin I's gates; 1,000 credentialed calls a second on one node
+  at p99 within 50 ms of a signed call's.
+- **Dep:** 7.10. **Estimate:** 2–3 weeks.
 
 ### 7.12 The device library and the credential phone gate
 
@@ -691,7 +761,7 @@ which changes the agent image last.
   150 ms) and owner at most 150 ms, each within 256 MiB, the 95th
   percentile recorded; verified on the phone and on x86; the seeded
   build's bytes equal to x86's.
-- **Dep:** 7.10. **Estimate:** 1.5–2.5 weeks.
+- **Phone session:** P2. **Dep:** 7.10. **Estimate:** 1.5–2.5 weeks.
 
 ### 7.13 The Android demo
 
@@ -701,16 +771,19 @@ which changes the agent image last.
   `adb reverse tcp:7700 tcp:7700`, with a `network_security_config`
   allowing cleartext to `localhost`, so the ingress's plain HTTP on
   loopback serves it.
-- **Three buttons:** *Enroll* (create a passkey with PRF, derive `s`, send
-  `member(s, 0)` and `owner(s)` to the space's credential and ledger
-  actors under an operator-granted invitation); *Sign in* (a PRF
+- **Three buttons:** *Enroll* (show and pin the space's handle, create a
+  passkey with PRF, derive `s`, send `member(s)` and `owner(s)` to the
+  space's credential and ledger actors under an operator-granted
+  invitation that names those two digests, so an interceptor cannot
+  enroll its own); *Sign in* (a PRF
   assertion, the path fetched, auth proved, the call sent, its answer and
   the proving time shown); *Pay* (an amount and a payee, the owner proof,
   the transfer sent, the balance shown).
 - **Not in scope:** recovery, several devices, iOS, the Play Store, UI
   beyond the three buttons, storing anything but the credential id.
 - **Gate PG3:** the three flows end to end on the Fairphone 6 against a
-  local space, recorded (a screen capture and the node's log).
+  local space, recorded (a screen capture and the node's log); phone
+  session P3.
 - **Dep:** 7.0b, 7.11, 7.12. **Estimate:** 1.5–2.5 weeks.
 
 ### M4 acceptance
@@ -718,8 +791,8 @@ which changes the agent image last.
 - **Gates:** `ci-full`, the checker loop, PG1, PG3.
 - **Recorded:** the credential AIR's rows, proof bytes, proving on x86 and
   the phone, verify at ingress; `0x402`'s price; the re-pinned constants.
-- **Reviews:** Fable on 7.8–7.11 (the re-pin, the actor and its host call,
-  the AIR and its masking, the ingress); then a push.
+- **Reviews:** Fable on 7.8a–7.11 (the re-pins, the actor and its host
+  call, the AIR and its masking, the ingress); then a push.
 
 ## M5: the device profile
 
@@ -739,18 +812,25 @@ corrects it]:
 | lever 3: a lean kernel (the path walked in place, no copy; CPU, registers and memory are 88% of what remains) | ×0.55–0.7 | 1.1–2.1 s | [model, slice 5; the masked floor bounds it] |
 | lever 6: the CPU split by opcode family (the CPU about half of what remains) | ×0.65–0.75 | 0.72–1.55 s | [model] |
 | lever 5: word-level memory | ×0.88–0.92 | 0.65–1.4 s | [model] |
+| the PoW 20 grind, which the factors above do not shrink (the floor's 2.2 s holds about 0.1 s of it) | +0.1 s, +0.3 s at the 95th percentile | **0.7–1.5 s** | [est, `device-params.md` finding 5]; PoW 16 with 47 queries (S29's lever, for 43 too) makes it about 6 ms |
 
 So 1 s is reached only at the favourable end, after levers 1–3 and the
-CPU split; the unfavourable end stays near 1.4–1.5 s with every lever.
+CPU split; the unfavourable end stays near 1.5 s with every lever.
 The plan therefore **expects the CPU split** (7.18) and keeps word-level
 memory next (7.19); the owner decides whether the gate stands after 7.0a's
 masked proxy [decided, S20], and the plan aims at 1 s until then.
 
-**One chip set, two formats** [decided, S23]: the Poseidon2 chip, the CPU
-split and word-level memory are built once, as chips the device format 43
-and the node's segment format 41 share; the device shape drops the page
-boundary, the node's keeps it. The nodes prove under 35 until 7.21 admits
-41, re-pins and retires 35.
+**One chip set, two formats** [decided, S23, S32]: the Poseidon2 chip,
+the CPU split and word-level memory are built once, as chips the device
+format 43 and the node's segment format 41 share; the device shape drops
+the page boundary, the node's keeps it. A kernel leaf's `p2` rows grow
+with the segment's width times its queries (59,300 of 2^16 at 40 queries
+over 8,009 columns: about 760 columns to spare), and the split widens the
+shape while it shrinks the cells; so **7.18's first day counts the
+node's kernel leaves** over the proposed family layout. If any leaf would
+pass 2^16 with the split, the split stays device-only and format 41 takes
+the Poseidon2 chip alone, or nothing if that too overflows; no fold-shape
+change in this slice. The nodes prove under 35 until 7.21.
 
 ### 7.14 Masking the segment chips (S)
 
@@ -763,7 +843,7 @@ boundary, the node's keeps it. The nodes prove under 35 until 7.21 admits
   segment of a small kernel; R1 on every column class; **format 35's
   proofs byte for byte** (the shared segment prover unchanged for nodes
   until 7.21).
-- **Dep:** 7.0a. **Estimate:** 4–6 weeks.
+- **Dep:** 7.0a, 7.8a. **Estimate:** 4–6 weeks.
 
 ### 7.15 The device shape and its Poseidon2 chip (S)
 
@@ -786,12 +866,13 @@ boundary, the node's keeps it. The nodes prove under 35 until 7.21 admits
   at PoW 20 or 47 at PoW 16, blowup 8 with 29; the Blake2s-M31 channel,
   Blake2b-256 for comparison) on x86, then on the phone; format 43 pinned
   at the fastest candidate within pin J's memory and size budgets, by its
-  median and its 95th percentile.
+  median and its 95th percentile. Phone session P4.
 - **Dep:** 7.15. **Estimate:** 1–1.5 weeks.
 
 ### 7.17 Levers 1–4
 
-Each measured on the phone before the next.
+Each measured on x86 as it lands (scaled by the ARM factor), all four
+together on the phone in session P5.
 1. **The statement over the credential actor's Poseidon2 tree** through
    the chip (S21): BLAKE2b and the AND table leave the shape.
 2. **Threads by core class** (`Threads::Auto`: the A720s and A520s given
@@ -804,20 +885,27 @@ Each measured on the phone before the next.
 
 ### 7.18 The CPU split by opcode family (expected)
 
+- **First day, the count** [decided, S32]: the node's kernel leaves
+  counted over the proposed family layout and the chip (`count-35.log`'s
+  method), before the design is fixed. Any leaf past 2^16 `p2` rows at 40
+  queries: the split is device-only, and 7.21 takes the chip alone, or
+  nothing; no fold-shape change.
 - **What:** the shared chip set's CPU split into components per opcode
   family (ALU, memory, control, host calls), each with only its columns,
   so a row pays for its family alone (−50–70% of the CPU's cells [model,
-  `proving.md` §9]); for formats 43 and 41 (S23); its forgery gates per
-  family, on a device shape and on a node segment with the boundary.
-- **Exit:** PG2 passes twice, a day apart, or the owner decides between
-  7.19 and the measured time (S20).
-- **Dep:** 7.17. **Estimate:** 6–10 weeks.
+  `proving.md` §9]); for format 43, and for 41 if the count allows; its
+  forgery gates per family, on a device shape and, if for 41, on a node
+  segment with the boundary.
+- **Exit:** PG2 passes twice, a day apart (sessions P7 and P8; P6 mid-way),
+  or the owner decides between 7.19 and the measured time (S20).
+- **Dep:** 7.17. **Estimate:** 8–12 weeks for both shapes, 6–10 for the
+  device alone.
 
 ### 7.19 Word-level memory (if PG2 still misses)
 
 - **What:** the shared chip set's memory argument at word granularity:
-  4–8× fewer MEMORY rows [model]; forgery gates for sub-word access; the
-  page boundary's binding re-derived for format 41.
+  4–8× fewer MEMORY rows [model]; forgery gates for sub-word access; for
+  41 only under S32's count, the page boundary's binding re-derived then.
 - **Dep:** 7.18 and the owner's call. **Estimate:** 4–6 weeks.
 
 ### 7.20 The device kernel at ingress, and PG2
@@ -829,27 +917,27 @@ Each measured on the phone before the next.
   profile, masked, **at most 1.0 s** (the median of three rounds' medians,
   the 95th percentile recorded), peak resident at most 1 GiB, proof at
   most 1.5 MiB; verified on the phone and accepted at a space's ingress.
+- **Tests:** two witnesses of different path shapes proved under one
+  device program id (pin J's witness-independent trace); a run past the
+  program id's log sizes refused by the prover.
 - **Dep:** 7.11, 7.18 (or 7.19). **Estimate:** 1–2 weeks.
 
 ### 7.21 The second re-pin: the node's segment format 41 (S)
 
-- **What, one commit** [decided, S23]: format 41 admitted (pin H: format
-  35's AIR with the Poseidon2 chip and M5's settled levers, the page
-  boundary kept); the node's default prover on 41; 35 retired;
+- **What, one commit** [decided, S23, S32]: format 41 admitted with what
+  7.18's count let in (the chip and the levers, or the chip alone; if
+  nothing fits, no format 41, and the step records the counts); the page
+  boundary kept; the node's default prover on 41; 35 retired;
   `SEGMENT_CHIPS` and the install record's `Shape` re-encoded; `derive`
   admitting `0x402` in node kernels. It re-pins every program id and leaf
   circuit, the agent image, the kernels, `final-verify.elf`,
   `final-verify-test.elf`, the Wasm blobs, the statement service's blob,
-  `blobs.lock` and the reproducibility constants; the kit's blobs are the
-  teammate's third drop.
-- **The recursion rechecked first:** a kernel leaf's `p2` rows grow with
-  the segment's width times its queries (59,300 of 2^16 at 40 queries
-  over the window kernel's 8,009 columns, `count-35.log`); 41's widths
-  (the chip, the split CPU) counted by that method before any code. If a
-  leaf overflows 2^16: a shape per kernel drops unused chips already;
-  then fewer queries with more PoW; last, `p2` at 2^17, a new fold shape,
-  a successor to format 32 and a new `H_FOLD`. Otherwise `H_FOLD` and the
-  wraps' roots byte for byte.
+  `blobs.lock` and the reproducibility constants; the teammate's fourth
+  drop (fixtures and pinned ids, no code).
+- **Recounted** (the Fable review's M9): 41's parameters on its own
+  reference shape, moved if 40 queries and PoW 24 count under 62 proven
+  bits; the kernel leaves counted again as built, within 2^16 `p2` rows;
+  `H_FOLD` and the wraps' roots byte for byte.
 - **Gates:** the fixtures regenerated through the seeded seam; `test-proof`
   (segments, leaves, folds, the masked wrap per statement); the leakage
   gates at medium N; the shared chips' forgery gates on node shapes; the
@@ -857,7 +945,7 @@ Each measured on the phone before the next.
   throughput test's window statement against slice 6's 46.5 s (a
   regression past 10% is fixed or recorded with its cause).
 - **Dep:** 7.18 (and 7.19, if built). Beside 7.20. **Estimate:** 2.5–4
-  weeks.
+  weeks (1 if nothing enters 41).
 
 ### M5 acceptance
 
@@ -900,7 +988,8 @@ Each measured on the phone before the next.
 
 | carried from slice 6 | where |
 |---|---|
-| the slice-7 re-pin batch (quality items 3, 4, 13, 16–28, 33, 64–67, 69), item 18's rest, L2's `blobs.lock` | 7.8 |
+| the slice-7 re-pin batch: its pvm-internal items (13, 16's unmasked half, the final verifier's and recair's pieces of 17–25, item 18's rest) | 7.8a |
+| the rest of the batch (`vos-anchor`'s and the service's pieces of 17–25, items 3, 4, 26–28, 33, 64–67, 69) and L2's `blobs.lock` | 7.8b |
 | F2, F3, L4, item 74, item 29, the info items (duplicate founding keys, the service's lenient read) | 7.1 |
 | `migrate_digest`'s nonce; L3's one-way migration | 7.1 (gone with C1) |
 | L5 (jam-dev's `push`), the untested once-a-window recheck | 7.2 (gone with C3) |
@@ -918,6 +1007,7 @@ Each measured on the phone before the next.
 | M6(d)'s FRAME-agnostic runner; M6(e)'s code with the port; M3b's deferred Kreivo gates 1–5 | carried: the teammate's pallet and the port, after the slices |
 | the prover-time levers (ALU padding, WITNESS_INPUT in the entry class, a leaf over small segments) | carried: node proving is not this slice's |
 | the Blake2b hook (decision 4); `getrandom`'s failure (inherent, documented) | carried |
+| the per-call identity read at ingress (the scale test's unmodeled hot path, the Fable review's L9) | carried to the identity agent's slice, for its scale run |
 | C-DJUMP, the ledgers' 2^27 gap, the BLAKE2b pointer near 2^32, refine slices' page permissions | the audit's scope |
 | the external audit | after slice 6, before value; its scope gains the credential AIR, the device shape, its Poseidon2 chip and their masking |
 | the heavy cleanup before master | carried |
@@ -926,23 +1016,30 @@ Each measured on the phone before the next.
 
 | risk | gate | when |
 |---|---|---|
-| **likely:** the device profile misses 1 s on the Fairphone 6 (M5's outlook: 0.65–1.4 s with every lever) | 7.0a's masked proxy on today's AIR first; the owner's call on the gate then (S20); 7.17–7.19 in order, each measured on the phone | 7.0a, 7.17–7.19 |
+| **likely:** the device profile misses 1 s on the Fairphone 6 (M5's outlook: 0.7–1.5 s with every lever) | 7.0a's masked proxy on today's AIR first; the owner's call on the gate then (S20); 7.17–7.19 in order, on x86 between phone sessions | 7.0a, 7.17–7.19 |
+| the owner's one phone delays the critical path (about nine sessions) | sessions batched and asked a week ahead (S33); x86 and qemu-aarch64 proxies between them | every PG |
 | masking the segment chips costs more than the wrap's factor (the 2^12 floor, padded tables, 14 unpaired chips), or its proofs are too big to send | 7.0a's proxy and bytes; 7.14's gates; per-component `h`; blowup 4 halves the floor and the bytes; pin J's 1.5 MiB | 7.0a, 7.14, 7.16 |
 | a device format under its margin (37 counts 61.86 under (c)) | formats 42 and 43 counted on their masked shapes, pinned by tests | 7.10, 7.16 |
 | 7.14 breaks the nodes' segment proofs (it edits the shared prover) | format 35's proofs byte for byte | 7.14 |
 | Credential Manager returns no PRF to a native app on Android 16 (undocumented) | 7.0b's probe; a security key's `hmac-secret` through a CTAP library; a stored key as the last fallback | 7.0b |
 | a page at the relying party derives members' secrets | the subdomain serves `assetlinks.json` only | 7.0b |
 | a single-component masked set leaks its claimed sum | two components at least (pin I), a test that a one-component set is refused | 7.10 |
-| a credential proof replayed at another node, or across agents or spaces | the binding names the space, agent, method and program; recorded at apply; scopes namespaced | 7.11 |
-| ingress becomes a verification DoS target | the size cap first, the cheap checks before the proof, a bound per connection and an executor budget, no shared bucket | 7.11 |
+| a credential proof replayed at another node, or across agents or spaces | the binding names the space, agent, method and program; recorded at apply; scopes namespaced by space and agent | 7.11 |
+| two spaces sharing a handle link their members | the scope carries the `SpaceId`; the app shows and pins the handle; stated in `SECURITY.md` | 7.11 |
+| a revoked member proves against an old root | ring roots older than `ROOT_MAX_AGE` refused | 7.11 |
+| ingress becomes a verification DoS target | per-format size caps first, the PoW before any decommitment, a bound per connection and an executor budget, no shared bucket; fuzzing at ingress | 7.11 |
+| a device proof's shape leaks its witness | the trace padded to the program id's log sizes; branch-free kernels; a test with two path shapes | 7.20 |
 | path fetches reveal which member proves | stated in pin G and `SECURITY.md`; syncing the tree is the later fix | 7.9 |
-| a re-pin breaks the kit, the vectors or the teammate's vendored tree | two re-pins, each one commit (7.8, 7.21); `blobs.lock`; the vectors regenerated once in 7.1; three drops announced in `teammate-note.md` | 7.1, 7.8, 7.21 |
+| a re-pin breaks the kit, the vectors or the teammate's vendored tree, or parallel steps collide in `pvm/proof` | the batch split (7.8a before 7.14, 7.8b after 7.3 and 7.11); `blobs.lock`; the vectors regenerated once in 7.1; four drops announced in `teammate-note.md` | 7.1, 7.8a, 7.8b, 7.21 |
 | simplifying pin D changes a design the teammate is building | the teammate told now (S19); one regeneration of `spaces-pallet.md` and the vectors | 7.0, 7.1 |
-| a stolen key ends a space for good (accepted, S11) | the tombstone; `dispatch_as_sovereign` callable on an ended space; the stable handle keeps members' secrets; a re-founding runbook in `docs/operations.md` | 7.1 |
-| format 41's wider segment AIR overflows a kernel leaf's 2^16 `p2` rows, or changes the fold's shape and `H_FOLD` | 41's leaves counted before any code; a shape per kernel, then queries and PoW, then `p2` at 2^17 with a format-32 successor | 7.21 |
+| a stolen key ends a space for good (accepted, S11) | the tombstone; the deposit released and `dispatch_as_sovereign` callable on an ended space; the runbook re-seeds the tree from the old `member` digests | 7.1 |
+| an apply bug or a cloned store ends a space through the honest node's evidence | the divergence guard; signing only applied rows; a restored backup treated as a compromised key | 7.2 |
+| `Unlisted` handoffs loop | one handoff a window a leadership; no handoff when no replica is listed | 7.2 |
+| format 41's wider segment AIR overflows a kernel leaf's 2^16 `p2` rows | 7.18's first-day count; the split device-only, the chip alone or nothing in 41; no fold-shape change (S32) | 7.18, 7.21 |
 | the CPU split or word-level memory, shared with the node, slows node proving or opens a forgery on node shapes | the forgery gates on node segments with the boundary; the throughput test against slice 6's 46.5 s | 7.18, 7.21 |
 | per-replica memory, idle timers or the single runtime thread cap agents per node | 7.6's run 1 first; quiescing idle groups the named lever | 7.6 |
 | LAN clock skew fails reads or moves windows | `vos-scale check` refuses offsets above 100 ms; C9's fail rate measured | 7.4, 7.6 |
+| the knee is a slow host's, a NIC's or a governor's, not the node's | `check` records disks, links and governors, refuses Wi-Fi; `report` names each host's binding resource; run 2 without the slowest host | 7.4, 7.6 |
 | thermal throttling skews the phone numbers | the runbook's temperature and battery checks, rounds 60 s apart, the 95th percentile recorded | every PG |
 
 ## Estimates
@@ -950,48 +1047,45 @@ Each measured on the phone before the next.
 | | weeks |
 |---|---|
 | 7.0, the docs and the probes | 1.5–2 |
-| M3.9 simplification (7.1–7.3) | 5–8 |
+| M3.9 simplification (7.1–7.3) | 6.5–9.5 |
 | M3.9 scale (7.4–7.6) | 4.5–8 |
 | M3.9 acceptance | 0.5 |
-| M4 (7.7–7.13 and acceptance) | 11.5–17 |
-| M5 (7.14–7.18, 7.20, 7.21 and acceptance) | 20–31.5 |
+| M4 (7.7–7.13 with 7.8a and 7.8b, and acceptance) | 12.5–18 |
+| M5 (7.14–7.18, 7.20, 7.21 and acceptance) | 22–33.5 |
 | M5's word-level memory, if needed (7.19) | 4–6 |
 | the slice's end (7.22–7.23) | 4–5 |
-| **slice 7, engineer-weeks** | **about 47–72, up to 78** |
+| **slice 7, engineer-weeks** | **about 52–77, up to 83** |
 
-- **The critical path is M5's chain:** 7.0a → 7.14 → 7.15 → 7.16 → 7.17 →
-  7.18 → 7.21 → M5's acceptance → 7.22 → 7.23, about **24–36 weeks** of
-  calendar with the groundwork beside M3.9 (S7), up to 42 with 7.19; 7.20
-  runs beside 7.21.
-- **The second re-pin costs 2.5–4 weeks** on that path (S23); M5 would
-  otherwise end at its levers.
+- **The critical path is M5's chain:** 7.0 → 7.8a (beside 7.0a) → 7.14 →
+  7.15 → 7.16 → 7.17 → 7.18 → 7.21 → M5's acceptance → 7.22 → 7.23, about
+  **27–39 weeks** of calendar with the groundwork beside M3.9 (S7), up to
+  45 with 7.19, about 2–4 fewer if S32 keeps the split device-only; each
+  phone session within a week of its ask (S33). 7.20 runs beside 7.21.
+- **The second re-pin costs 1–4 weeks** on that path (S23, S32).
 - **Beside it:** M3.9's two tracks (7.1 → 7.2 → 7.3 → 7.6, and 7.4 → 7.5
-  → 7.6); M4's chain (7.7 → 7.9 → 7.10 → 7.11 → 7.13, with 7.8 after 7.3
-  and 7.12 after 7.10), about 9–12 weeks, done within M5's.
+  → 7.6); M4's chain (7.7 → 7.9 → 7.10 → 7.11 → 7.13, with 7.8b after 7.3
+  and 7.11, and 7.12 after 7.10), about 10–13 weeks, done within M5's.
 - **Against `proving.md` §11's 12–20 weeks for M4 and M5:** that row left
   out M3.9, the re-pin, the ingress verifier, the demo, masking the
   segment chips (7.14) and the CPU split.
 
 ## Decisions
 
-**Taken by the owner:** S1–S5 before the plan; S6–S31 on draft 2
-(`research/slice-7/owner-decisions.md`), among them C1–C11 all taken and
-C4 fully terminal (S8–S18), the teammate told now (S19), the chip and the
-levers in the node's format too (S23), a stable PRF handle (S25).
+**Taken by the owner:** S1–S5 before the plan; S6–S31 on draft 2; S32
+and S33 on draft 3 (`research/slice-7/owner-decisions.md`), among them
+C1–C11 all taken and C4 fully terminal (S8–S18), the teammate told now
+(S19), the chip and the levers in the node's format too as the leaf count
+allows (S23, S32), a stable PRF handle (S25), the phone sessions (S33).
+S7, S11 and S25 carry the review's amendments (7.8's split, the
+divergence guard, the scope's `SpaceId` and the re-seeding runbook).
 
-**Slice-6 decisions they reverse:**
-- **decision 7** (the controller rotates keys; equivocation suspends, then
-  resume): its rotation by S13 (C2), its resume by S11 (C4);
-- **decision 8** (migration ranges and the per-program `venue_bound`): by
-  S9 (C1) and S12 (C7);
-- **decision 10** (a rootless `Seen` entry never expires): by S12 (C7);
-- **decision 18** (resume, with the disputed window dead): by S11 (C4);
-- **`proving.md` §7:** its equivocation text (S11), its venue migration
-  (S9), and "`S_w` over every agent's root" (S17);
-- **`spaces-pallet.md`:** §13 questions 2 and 12 (S13), §6's calls 5 and 6
-  (S9, S11), vectors G5, G14, G15 and G19 (`teammate-note.md`);
-- **slice 6's own plan:** the signed `start_window` (S10) and 6.14's
-  re-cuts (S16).
+**Slice-6 decisions they reverse** (each named in `owner-decisions.md`):
+decision 7 (rotation by S13, resume by S11), decision 8 (S9, S12),
+decision 10 (S12), decision 18 (S11); `proving.md` §7's equivocation,
+migration and "`S_w` over every agent's root" (S11, S9, S17);
+`spaces-pallet.md` §13 questions 2 and 12, calls 5 and 6, vectors G5,
+G14, G15 and G19 (`teammate-note.md`); slice 6's signed `start_window`
+(S10) and re-cuts (S16).
 
 **Settled by the evidence, the owner's to override:** device formats
 counted on their masked shapes (30 and 37 retired unregistered, 42 and 43

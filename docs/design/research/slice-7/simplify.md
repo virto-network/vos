@@ -395,8 +395,8 @@ variants.
   anchor rule as the core's call, `venue_bound`, the rootless `Seen`
   rule) and regenerate the conformance vectors. If the teammate has
   started, each is a change to work in progress: the owner asks first
-  (the plan's question on the teammate). The teammate gets two drops: the
-  design and vectors at 7.1, the kit's re-pinned blobs at 7.8.
+  (the plan's question on the teammate). The teammate gets the design and
+  vectors at 7.1, then the kit's re-pins at 7.8a, 7.8b and 7.21.
 - **The JAM statements service:** its blob changes (no blob hash is
   pinned yet; slice 6's L2 pins them with the re-pin batch, after this
   milestone).
