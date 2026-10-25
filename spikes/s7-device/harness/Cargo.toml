@@ -1,0 +1,40 @@
+# The device baseline's harness: built in the patched copy of the tree that
+# `../scripts/tree.sh` makes (the spike's seams, `../pvm-proof.patch`), never
+# in the repository itself.
+[workspace]
+
+[package]
+name = "s7-device"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[features]
+# The phone run: the actor's ELF and the statement's input embedded (build
+# the guest and run `gen` first); with no known subcommand the binary runs
+# session P1's cells.
+phone = []
+# The x86 proofs' SHA-256 per cell compiled in (`S7_REFERENCES`), each phone
+# proof checked against it byte for byte. Nothing in 7.0a is masked, so the
+# timing build's proofs are deterministic too; it carries no reference.
+seeded-masks = []
+# mimalloc as the global allocator: musl's allocator makes the prover about
+# 3x slower than glibc's.
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+vos-pvm = { path = "../../../pvm/runtime" }
+vos-pvm-proof = { path = "../../../pvm/proof" }
+vos-pvm-proof-verifier = { path = "../../../pvm/proof/verifier" }
+vos-pvm-compiler = { path = "../../../pvm/compiler" }
+vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles" }
+vos-tree = { path = "../../../agent/tree" }
+stwo = { git = "https://github.com/olanod/stwo", rev = "c3ec981357a0053e373e00f1057ec5a62675f7eb", default-features = false, features = ["std", "prover", "parallel"] }
+postcard = { version = "1", features = ["alloc"] }
+sha2 = "0.10"
+mimalloc = { version = "0.1", optional = true, default-features = false }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = 1

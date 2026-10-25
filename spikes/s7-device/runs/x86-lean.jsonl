@@ -1,0 +1,65 @@
+# 2026-10-25T05:21:42+01:00  05:21:42 up 19 days, 13:56,  1 user,  load average: 1.76, 3.29, 2.84
+{"kind":"device","arch":"x86_64","cpus":4,"cpu_parts":[],"cpu_max_khz":[4500000,4800000,4800000,4800000,4800000,4500000,4500000,4500000,4500000,4500000,4500000,4500000,3800000,3800000,3800000,3800000,3800000,3800000,3800000,3800000,2500000,2500000],"mem_total_kib":"65375248","battery_temp_decic":"","battery_capacity":"","kernel":"7.1.13-2-MANJARO"}
+{"kind":"build","version":"s7-device/1","channel":"blake2s","format":37,"seeded_masks":false,"cells":"lean/1:86:20/plain,lean/1:86:20/masked12,lean/2:43:20/plain,lean/2:43:20/masked11"}
+cell lean/1:86:20/plain: threads 4, 5 reps
+  lean/1:86:20/plain rep 1/5: 0.523 s
+  lean/1:86:20/plain rep 2/5: 0.474 s
+  lean/1:86:20/plain rep 3/5: 0.483 s
+  lean/1:86:20/plain rep 4/5: 0.480 s
+  lean/1:86:20/plain rep 5/5: 0.489 s
+{"kind":"cell","cell":"lean/1:86:20/plain","steps":19192,"threads":"4","pool":4,"mask":"0x00f9ff89","chips":17,"log_sizes":[15, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10],"fixed":[],"columns":1882,"cells":34880208,"model_cells":34880208,"reps":5,"prove_s_best":0.4740,"prove_s_median":0.4831,"prove_s_runs":[0.5229,0.4740,0.4831,0.4799,0.4886],"cpu_s_median":1.450,"peak_rss_mib":642,"peak_rss_reset":true,"trace_s":0.016,"proof_bytes":948004,"proof_sha256":"16b0dbeddbba87b51b7010211dfdb586f3305df21cf1faea23043ebe727b0254","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell lean/1:86:20/masked12: threads 4, 5 reps
+  lean/1:86:20/masked12 rep 1/5: 0.892 s
+  lean/1:86:20/masked12 rep 2/5: 0.892 s
+  lean/1:86:20/masked12 rep 3/5: 0.893 s
+  lean/1:86:20/masked12 rep 4/5: 0.909 s
+  lean/1:86:20/masked12 rep 5/5: 0.906 s
+{"kind":"cell","cell":"lean/1:86:20/masked12","steps":19192,"threads":"4","pool":4,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":73946832,"model_cells":74842112,"reps":5,"prove_s_best":0.8921,"prove_s_median":0.8934,"prove_s_runs":[0.8923,0.8921,0.8934,0.9090,0.9064],"cpu_s_median":2.930,"peak_rss_mib":1245,"peak_rss_reset":true,"trace_s":0.020,"proof_bytes":988651,"proof_sha256":"5bbe0d854e6801e9e3a4b6110d2281e1d0cd29254518e0964b6c6aa8400fd170","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell lean/2:43:20/plain: threads 4, 5 reps
+  lean/2:43:20/plain rep 1/5: 0.695 s
+  lean/2:43:20/plain rep 2/5: 0.619 s
+  lean/2:43:20/plain rep 3/5: 0.627 s
+  lean/2:43:20/plain rep 4/5: 0.651 s
+  lean/2:43:20/plain rep 5/5: 0.613 s
+{"kind":"cell","cell":"lean/2:43:20/plain","steps":19192,"threads":"4","pool":4,"mask":"0x00f9ff89","chips":17,"log_sizes":[15, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10],"fixed":[],"columns":1882,"cells":34880208,"model_cells":34880208,"reps":5,"prove_s_best":0.6130,"prove_s_median":0.6269,"prove_s_runs":[0.6953,0.6189,0.6269,0.6508,0.6130],"cpu_s_median":2.010,"peak_rss_mib":970,"peak_rss_reset":true,"trace_s":0.017,"proof_bytes":536273,"proof_sha256":"9b5e5d2894a391cb7952d8d4962a00bb665a3021d2eae79248e7dac61f2f305b","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell lean/2:43:20/masked11: threads 4, 5 reps
+  lean/2:43:20/masked11 rep 1/5: 1.124 s
+  lean/2:43:20/masked11 rep 2/5: 1.184 s
+  lean/2:43:20/masked11 rep 3/5: 1.153 s
+  lean/2:43:20/masked11 rep 4/5: 1.194 s
+  lean/2:43:20/masked11 rep 5/5: 1.221 s
+{"kind":"cell","cell":"lean/2:43:20/masked11","steps":19192,"threads":"4","pool":4,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":70506192,"model_cells":71032832,"reps":5,"prove_s_best":1.1245,"prove_s_median":1.1844,"prove_s_runs":[1.1245,1.1844,1.1531,1.1936,1.2206],"cpu_s_median":3.940,"peak_rss_mib":1881,"peak_rss_reset":true,"trace_s":0.018,"proof_bytes":561297,"proof_sha256":"b757e5ad1e14968347c887af3e00bc9e4e65b635f0cee0a5e40bccc6740da3f1","verified":null,"verify_ms":0.0,"matches_x86":null}
+{"kind":"done","ok":true,"wall_s":28.3}
+# 2026-10-25T05:22:10+01:00  05:22:10 up 19 days, 13:56,  1 user,  load average: 2.10, 3.21, 2.83
+{"kind":"device","arch":"x86_64","cpus":12,"cpu_parts":[],"cpu_max_khz":[4500000,4800000,4800000,4800000,4800000,4500000,4500000,4500000,4500000,4500000,4500000,4500000,3800000,3800000,3800000,3800000,3800000,3800000,3800000,3800000,2500000,2500000],"mem_total_kib":"65375248","battery_temp_decic":"","battery_capacity":"","kernel":"7.1.13-2-MANJARO"}
+{"kind":"build","version":"s7-device/1","channel":"blake2s","format":37,"seeded_masks":false,"cells":"lean/1:86:20/plain,lean/1:86:20/masked12,lean/2:43:20/plain,lean/2:43:20/masked11"}
+cell lean/1:86:20/plain: threads 8, 5 reps
+  lean/1:86:20/plain rep 1/5: 0.545 s
+  lean/1:86:20/plain rep 2/5: 0.553 s
+  lean/1:86:20/plain rep 3/5: 0.539 s
+  lean/1:86:20/plain rep 4/5: 0.538 s
+  lean/1:86:20/plain rep 5/5: 0.539 s
+{"kind":"cell","cell":"lean/1:86:20/plain","steps":19192,"threads":"8","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[15, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10],"fixed":[],"columns":1882,"cells":34880208,"model_cells":34880208,"reps":5,"prove_s_best":0.5381,"prove_s_median":0.5395,"prove_s_runs":[0.5455,0.5526,0.5392,0.5381,0.5395],"cpu_s_median":2.820,"peak_rss_mib":683,"peak_rss_reset":true,"trace_s":0.024,"proof_bytes":948004,"proof_sha256":"16b0dbeddbba87b51b7010211dfdb586f3305df21cf1faea23043ebe727b0254","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell lean/1:86:20/masked12: threads 8, 5 reps
+  lean/1:86:20/masked12 rep 1/5: 0.787 s
+  lean/1:86:20/masked12 rep 2/5: 0.788 s
+  lean/1:86:20/masked12 rep 3/5: 0.820 s
+  lean/1:86:20/masked12 rep 4/5: 0.920 s
+  lean/1:86:20/masked12 rep 5/5: 0.920 s
+{"kind":"cell","cell":"lean/1:86:20/masked12","steps":19192,"threads":"8","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":73946832,"model_cells":74842112,"reps":5,"prove_s_best":0.7866,"prove_s_median":0.8196,"prove_s_runs":[0.7866,0.7883,0.8196,0.9202,0.9198],"cpu_s_median":4.790,"peak_rss_mib":1320,"peak_rss_reset":true,"trace_s":0.019,"proof_bytes":988651,"proof_sha256":"5bbe0d854e6801e9e3a4b6110d2281e1d0cd29254518e0964b6c6aa8400fd170","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell lean/2:43:20/plain: threads 8, 5 reps
+  lean/2:43:20/plain rep 1/5: 0.631 s
+  lean/2:43:20/plain rep 2/5: 0.580 s
+  lean/2:43:20/plain rep 3/5: 0.578 s
+  lean/2:43:20/plain rep 4/5: 0.572 s
+  lean/2:43:20/plain rep 5/5: 0.570 s
+{"kind":"cell","cell":"lean/2:43:20/plain","steps":19192,"threads":"8","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[15, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10],"fixed":[],"columns":1882,"cells":34880208,"model_cells":34880208,"reps":5,"prove_s_best":0.5696,"prove_s_median":0.5781,"prove_s_runs":[0.6305,0.5804,0.5781,0.5716,0.5696],"cpu_s_median":3.280,"peak_rss_mib":1027,"peak_rss_reset":true,"trace_s":0.018,"proof_bytes":536273,"proof_sha256":"9b5e5d2894a391cb7952d8d4962a00bb665a3021d2eae79248e7dac61f2f305b","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell lean/2:43:20/masked11: threads 8, 5 reps
+  lean/2:43:20/masked11 rep 1/5: 0.986 s
+  lean/2:43:20/masked11 rep 2/5: 0.963 s
+  lean/2:43:20/masked11 rep 3/5: 1.003 s
+  lean/2:43:20/masked11 rep 4/5: 1.157 s
+  lean/2:43:20/masked11 rep 5/5: 1.176 s
+{"kind":"cell","cell":"lean/2:43:20/masked11","steps":19192,"threads":"8","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":70506192,"model_cells":71032832,"reps":5,"prove_s_best":0.9631,"prove_s_median":1.0027,"prove_s_runs":[0.9856,0.9631,1.0027,1.1568,1.1763],"cpu_s_median":6.170,"peak_rss_mib":2048,"peak_rss_reset":true,"trace_s":0.018,"proof_bytes":561297,"proof_sha256":"b757e5ad1e14968347c887af3e00bc9e4e65b635f0cee0a5e40bccc6740da3f1","verified":null,"verify_ms":0.0,"matches_x86":null}
+{"kind":"done","ok":true,"wall_s":27.2}
+# 2026-10-25T05:22:38+01:00  05:22:38 up 19 days, 13:56,  1 user,  load average: 2.59, 3.23, 2.84

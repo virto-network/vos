@@ -1,0 +1,11 @@
+{"kind":"device","arch":"aarch64","cpus":22,"cpu_parts":["0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051","0x051"],"cpu_max_khz":[4500000,4800000,4800000,4800000,4800000,4500000,4500000,4500000,4500000,4500000,4500000,4500000,3800000,3800000,3800000,3800000,3800000,3800000,3800000,3800000,2500000,2500000],"mem_total_kib":"65375248","battery_temp_decic":"","battery_capacity":"","kernel":"7.1.13-2-MANJARO"}
+{"kind":"build","version":"s7-device/1","channel":"blake2s","format":37,"seeded_masks":true,"cells":"built/1:86:20/plain,lean/2:43:20/masked11"}
+cell built/1:86:20/plain: threads 8, 1 reps
+  built/1:86:20/plain rep 1/1: 45.305 s
+{"kind":"cell","cell":"built/1:86:20/plain","steps":19192,"threads":"8","pool":8,"mask":"0x01f9ffff","chips":23,"log_sizes":[15, 12, 16, 17, 8, 6, 4, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":7821,"cells":142859040,"model_cells":142859040,"reps":1,"prove_s_best":45.3053,"prove_s_median":45.3053,"prove_s_runs":[45.3053],"cpu_s_median":0.000,"peak_rss_mib":2092,"peak_rss_reset":true,"trace_s":0.258,"proof_bytes":3538744,"proof_sha256":"aef9b3c2b35ff1d866121bce2c61d258d8b585b70ea26663607096c3609f2581","verified":true,"verify_ms":287.3,"matches_x86":true}
+cell lean/2:43:20/masked11: threads 8, 1 reps
+  lean/2:43:20/masked11 rep 1/1: 36.914 s
+{"kind":"cell","cell":"lean/2:43:20/masked11","steps":19192,"threads":"8","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":70506192,"model_cells":71032832,"reps":1,"prove_s_best":36.9135,"prove_s_median":36.9135,"prove_s_runs":[36.9135],"cpu_s_median":0.000,"peak_rss_mib":1883,"peak_rss_reset":true,"trace_s":0.461,"proof_bytes":561297,"proof_sha256":"b757e5ad1e14968347c887af3e00bc9e4e65b635f0cee0a5e40bccc6740da3f1","verified":null,"verify_ms":0.0,"matches_x86":true}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":4,"pool":8,"mean_ms":1699.88,"median_ms":1697.96,"p95_ms":2789.76,"max_ms":2789.76}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":4,"pool":8,"mean_ms":154.36,"median_ms":193.54,"p95_ms":208.53,"max_ms":208.53}
+{"kind":"done","ok":true,"wall_s":159.8}

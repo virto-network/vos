@@ -1,0 +1,32 @@
+# The device statement as an attestable method of a test actor, built for the
+# PVM with the guest toolchain (`../scripts/build.sh` runs it):
+#
+#     cargo build --release --target ../../../pvm/guest/riscv64em-vos.json
+[workspace]
+
+[package]
+name = "device-statements"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "device-statements"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vos-sdk = { path = "../../../agent/sdk" }
+vos-tree = { path = "../../../agent/tree" }
+vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles" }
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "abort"
+codegen-units = 1

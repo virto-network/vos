@@ -1,0 +1,81 @@
+diff --git a/pvm/proof/src/chips/memory.rs b/pvm/proof/src/chips/memory.rs
+index ffaef5d..7d6e9d8 100644
+--- a/pvm/proof/src/chips/memory.rs
++++ b/pvm/proof/src/chips/memory.rs
+@@ -485,11 +485,20 @@ impl BuiltInProverComponent for MemoryChip {
+         // listed page.  Subsumes the old read-before-write ts=0 injection
+         // (MemoryBoundaryChip is deleted); the producers are MemoryPageChip.
+         let closing_ts = crate::chips::register_memory_closing::closing_ts_for(side_note);
++        // The spike's floor seam (`S7_TOUCHED_BYTES`): the boundary pair
++        // only for the bytes the trace accesses, the ledger a one-segment
++        // shape without the page-Merkle boundary carries. The page chips'
++        // relation no longer balances: a cost proxy only.
++        let accessed: Option<std::collections::HashSet<u32>> = std::env::var_os("S7_TOUCHED_BYTES")
++            .map(|_| entries.iter().map(|entry| entry.address).collect());
+         if let Some(payload) = &side_note.memory_pages {
+             for page in &payload.pages {
+                 let base = page.page_idx as u64 * crate::page_merkle::PAGE_SIZE as u64;
+                 for i in 0..crate::page_merkle::PAGE_SIZE {
+                     let addr = (base + i as u64) as u32;
++                    if accessed.as_ref().is_some_and(|set| !set.contains(&addr)) {
++                        continue;
++                    }
+                     entries.push(MemEntry {
+                         address: addr,
+                         value: page.before[i],
+diff --git a/pvm/proof/src/format.rs b/pvm/proof/src/format.rs
+index 018e3b1..546ec81 100644
+--- a/pvm/proof/src/format.rs
++++ b/pvm/proof/src/format.rs
+@@ -549,9 +549,23 @@ pub const RETIRED: [u32; 10] = [24, 25, 26, 27, 29, 31, 33, 34, 36, 40];
+ 
+ /// The entry for `number`, admitted or not.
+ pub fn lookup(number: u32) -> Option<&'static Format> {
++    let spike = SPIKE_FORMAT.load(core::sync::atomic::Ordering::Acquire);
++    if !spike.is_null() {
++        // SAFETY: set once from a leaked `&'static Format`.
++        let spike: &'static Format = unsafe { &*spike };
++        if spike.number == number {
++            return Some(spike);
++        }
++    }
+     REGISTRY.iter().find(|format| format.number == number)
+ }
+ 
++/// The measurement spike's format: a leaked entry that takes the place of
++/// the registry's under its number, for a channel and parameters no admitted
++/// format has.
++pub static SPIKE_FORMAT: core::sync::atomic::AtomicPtr<Format> =
++    core::sync::atomic::AtomicPtr::new(core::ptr::null_mut());
++
+ /// The entry for `number`, if a verifier accepts proofs under it.
+ pub fn admitted(number: u32) -> Result<&'static Format, alloc::string::String> {
+     match lookup(number) {
+diff --git a/pvm/proof/src/pcs.rs b/pvm/proof/src/pcs.rs
+index 2ebbea7..e35ad00 100644
+--- a/pvm/proof/src/pcs.rs
++++ b/pvm/proof/src/pcs.rs
+@@ -21,6 +21,9 @@ use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleH
+ use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+ 
+ use crate::format::ChannelKind;
++
++/// The Blake2s stack, for the measurement spike's format.
++pub type SpikeBlake2s = Blake2sMerkleChannel;
+ use crate::poseidon2::{P2Hash, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Channel};
+ 
+ /// A channel, named, for the lookup draws of the object-safe component
+@@ -331,8 +334,11 @@ macro_rules! with_stack {
+                 type $stack = $crate::poseidon2::P2MerkleChannel;
+                 $body
+             }
+-            $crate::format::ChannelKind::Blake2s
+-            | $crate::format::ChannelKind::Blake2sM31
++            $crate::format::ChannelKind::Blake2s => {
++                type $stack = $crate::pcs::SpikeBlake2s;
++                $body
++            }
++            $crate::format::ChannelKind::Blake2sM31
+             | $crate::format::ChannelKind::Blake2b256 => $unbuilt,
+         }
+     };

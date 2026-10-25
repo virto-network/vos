@@ -1,0 +1,222 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling typenum v1.20.1
+   Compiling version_check v0.9.5
+   Compiling subtle v2.6.1
+   Compiling crossbeam-utils v0.8.23
+   Compiling thiserror v2.0.21
+   Compiling autocfg v1.5.1
+   Compiling serde_core v1.0.229
+   Compiling cfg-if v1.0.5
+   Compiling libc v0.2.191
+   Compiling generic-array v0.14.7
+   Compiling crossbeam-epoch v0.9.21
+   Compiling once_cell v1.21.4
+   Compiling scopeguard v1.2.0
+   Compiling crossbeam-deque v0.8.8
+   Compiling lock_api v0.4.14
+   Compiling tracing-core v0.1.36
+   Compiling find-msvc-tools v0.1.15
+   Compiling shlex v2.0.1
+   Compiling syn v3.0.9
+   Compiling syn v2.0.119
+   Compiling rayon-core v1.13.0
+   Compiling serde v1.0.229
+   Compiling cc v1.10.0
+   Compiling hybrid-array v0.4.15
+   Compiling either v1.19.0
+   Compiling parking_lot_core v0.9.12
+   Compiling vos-pvm-precompiles v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof/precompiles)
+   Compiling pin-project-lite v0.2.17
+   Compiling memoffset v0.9.1
+   Compiling block-buffer v0.12.1
+   Compiling crypto-common v0.2.2
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling digest v0.10.7
+   Compiling num-traits v0.2.19
+   Compiling foldhash v0.2.0
+   Compiling blake2 v0.10.6
+   Compiling winnow v1.0.4
+   Compiling vos-anchor v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof/anchor)
+   Compiling equivalent v1.0.3
+   Compiling smallvec v1.16.4
+   Compiling allocator-api2 v0.2.21
+   Compiling hashbrown v0.17.1
+   Compiling blake3 v1.8.7
+   Compiling digest v0.11.3
+   Compiling rayon v1.12.0
+   Compiling toml_parser v1.1.5+spec-1.1.0
+   Compiling indexmap v2.14.2
+   Compiling vos-pvm-program v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/program)
+   Compiling keccak v0.2.2
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+   Compiling enum-ordinalize-derive v4.4.2
+   Compiling bytemuck_derive v1.12.1
+   Compiling hashbrown v0.14.5
+   Compiling enum-ordinalize v4.4.2
+   Compiling cpufeatures v0.3.1
+   Compiling arrayvec v0.7.8
+   Compiling constant_time_eq v0.4.2
+   Compiling syn v1.0.109
+   Compiling semver v1.0.28
+   Compiling toml_datetime v1.1.2+spec-1.1.0
+   Compiling rand_core v0.6.4
+   Compiling dashmap v6.2.1
+   Compiling rustc_version v0.4.1
+   Compiling rand v0.8.8
+   Compiling toml_edit v0.25.17+spec-1.1.0
+   Compiling sha3 v0.11.0
+   Compiling bytemuck v1.25.2
+   Compiling itertools v0.12.1
+   Compiling tracing-subscriber v0.3.23
+   Compiling hex v0.4.3
+   Compiling tracing-attributes v0.1.31
+   Compiling vos-pvm-codec-derive v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/codec-derive)
+   Compiling educe v0.5.11
+   Compiling unicode-segmentation v1.13.3
+   Compiling fnv v1.0.7
+   Compiling stwo-std-shims v1.0.0
+   Compiling proc-macro-crate v3.5.0
+   Compiling vos-pvm-codec v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/codec)
+   Compiling convert_case v0.7.1
+   Compiling vos-tree v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/agent/tree)
+   Compiling heapless v0.7.17
+   Compiling tracing v0.1.44
+   Compiling byteorder v1.5.0
+   Compiling impl-trait-for-tuples v0.2.3
+   Compiling vos-pvm v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/runtime)
+   Compiling hash32 v0.2.1
+   Compiling spin v0.9.9
+   Compiling stable_deref_trait v1.2.1
+   Compiling vos-pvm-poseidon2 v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof/poseidon2)
+   Compiling cobs v0.3.0
+   Compiling cpufeatures v0.2.17
+   Compiling rustc-demangle v0.1.28
+   Compiling vos-wire v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/agent/wire)
+   Compiling postcard v1.1.3
+   Compiling sha2 v0.10.9
+   Compiling stwo v2.2.0 (https://github.com/olanod/stwo?rev=c3ec981357a0053e373e00f1057ec5a62675f7eb#c3ec9813)
+   Compiling vos-pvm-compiler v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/compiler)
+   Compiling vos-pvm-proof-derive v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof/derive)
+   Compiling stwo-constraint-framework v2.2.0 (https://github.com/olanod/stwo?rev=c3ec981357a0053e373e00f1057ec5a62675f7eb#c3ec9813)
+   Compiling vos-pvm-proof v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof)
+   Compiling vos-pvm-proof-verifier v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof/verifier)
+   Compiling s7-device v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/spikes/s7-device/harness)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 20s
+references: built/1:86:20/plain=aef9b3c2b35ff1d866121bce2c61d258d8b585b70ea26663607096c3609f2581,floor/1:86:20/plain=3d3fcbe10daf1d05b4e4fe1f0a88f77a0b96bb7556ce3a9aee75393280b12aec,floor/1:86:20/masked12=d48da47ec2d258d359c8404fd3f9fad363da470b36469e2bd722f187bfc4aeba,lean/1:86:20/plain=16b0dbeddbba87b51b7010211dfdb586f3305df21cf1faea23043ebe727b0254,lean/1:86:20/masked12=5bbe0d854e6801e9e3a4b6110d2281e1d0cd29254518e0964b6c6aa8400fd170,floor/2:43:20/plain=0069404f5554e75c73a042720f6eaa0583e830d291d4c038ecbd7622dfaa6ca8,floor/2:43:20/masked11=dfadede348551febde4d8ff69e879ea61ad5386f7c6cb4da0349501911c27e41,lean/2:43:20/masked11=b757e5ad1e14968347c887af3e00bc9e4e65b635f0cee0a5e40bccc6740da3f1
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling typenum v1.20.1
+   Compiling version_check v0.9.5
+   Compiling libc v0.2.191
+   Compiling shlex v2.0.1
+   Compiling thiserror v2.0.21
+   Compiling crossbeam-utils v0.8.23
+   Compiling find-msvc-tools v0.1.15
+   Compiling subtle v2.6.1
+   Compiling autocfg v1.5.1
+   Compiling cc v1.10.0
+   Compiling generic-array v0.14.7
+   Compiling serde_core v1.0.229
+   Compiling crossbeam-epoch v0.9.21
+   Compiling once_cell v1.21.4
+   Compiling cfg-if v1.0.5
+   Compiling crossbeam-deque v0.8.8
+   Compiling tracing-core v0.1.36
+   Compiling syn v3.0.9
+   Compiling syn v2.0.119
+   Compiling hybrid-array v0.4.15
+   Compiling serde v1.0.229
+   Compiling rayon-core v1.13.0
+   Compiling pin-project-lite v0.2.17
+   Compiling vos-pvm-precompiles v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof/precompiles)
+   Compiling crypto-common v0.1.7
+   Compiling block-buffer v0.10.4
+   Compiling either v1.19.0
+   Compiling parking_lot_core v0.9.12
+   Compiling digest v0.10.7
+   Compiling block-buffer v0.12.1
+   Compiling crypto-common v0.2.2
+   Compiling cpufeatures v0.3.1
+   Compiling blake2 v0.10.6
+   Compiling memoffset v0.9.1
+   Compiling num-traits v0.2.19
+   Compiling winnow v1.0.4
+   Compiling blake3 v1.8.7
+   Compiling vos-anchor v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof/anchor)
+   Compiling foldhash v0.2.0
+   Compiling smallvec v1.16.4
+   Compiling allocator-api2 v0.2.21
+   Compiling hashbrown v0.17.1
+   Compiling equivalent v1.0.3
+   Compiling scopeguard v1.2.0
+   Compiling lock_api v0.4.14
+   Compiling toml_parser v1.1.5+spec-1.1.0
+   Compiling digest v0.11.3
+   Compiling rayon v1.12.0
+   Compiling thiserror-impl v2.0.21
+   Compiling serde_derive v1.0.229
+   Compiling enum-ordinalize-derive v4.4.2
+   Compiling indexmap v2.14.2
+   Compiling enum-ordinalize v4.4.2
+   Compiling bytemuck_derive v1.12.1
+   Compiling keccak v0.2.2
+   Compiling vos-pvm-program v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/program)
+   Compiling constant_time_eq v0.4.2
+   Compiling semver v1.0.28
+   Compiling syn v1.0.109
+   Compiling toml_datetime v1.1.2+spec-1.1.0
+   Compiling arrayvec v0.7.8
+   Compiling rand_core v0.6.4
+   Compiling hashbrown v0.14.5
+   Compiling rand v0.8.8
+   Compiling toml_edit v0.25.17+spec-1.1.0
+   Compiling bytemuck v1.25.2
+   Compiling rustc_version v0.4.1
+   Compiling dashmap v6.2.1
+   Compiling sha3 v0.11.0
+   Compiling itertools v0.12.1
+   Compiling tracing-subscriber v0.3.23
+   Compiling tracing-attributes v0.1.31
+   Compiling vos-pvm-codec-derive v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/codec-derive)
+   Compiling educe v0.5.11
+   Compiling hex v0.4.3
+   Compiling stwo-std-shims v1.0.0
+   Compiling fnv v1.0.7
+   Compiling unicode-segmentation v1.13.3
+   Compiling heapless v0.7.17
+   Compiling vos-pvm-codec v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/codec)
+   Compiling proc-macro-crate v3.5.0
+   Compiling libmimalloc-sys v0.1.49
+   Compiling vos-tree v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/agent/tree)
+   Compiling convert_case v0.7.1
+   Compiling byteorder v1.5.0
+   Compiling hash32 v0.2.1
+   Compiling impl-trait-for-tuples v0.2.3
+   Compiling stable_deref_trait v1.2.1
+   Compiling vos-pvm-poseidon2 v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof/poseidon2)
+   Compiling tracing v0.1.44
+   Compiling vos-pvm v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/runtime)
+   Compiling vos-wire v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/agent/wire)
+   Compiling cobs v0.3.0
+   Compiling cpufeatures v0.2.17
+   Compiling rustc-demangle v0.1.28
+   Compiling sha2 v0.10.9
+   Compiling stwo v2.2.0 (https://github.com/olanod/stwo?rev=c3ec981357a0053e373e00f1057ec5a62675f7eb#c3ec9813)
+   Compiling postcard v1.1.3
+   Compiling vos-pvm-compiler v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/compiler)
+   Compiling vos-pvm-proof-derive v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof/derive)
+   Compiling stwo-constraint-framework v2.2.0 (https://github.com/olanod/stwo?rev=c3ec981357a0053e373e00f1057ec5a62675f7eb#c3ec9813)
+   Compiling mimalloc v0.1.52
+   Compiling vos-pvm-proof v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof)
+   Compiling vos-pvm-proof-verifier v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/pvm/proof/verifier)
+   Compiling s7-device v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/spikes/s7-device/harness)
+    Finished `release` profile [optimized + debuginfo] target(s) in 2m 41s
+   Compiling s7-device v0.1.0 (/home/daniel/.claude/jobs/8e1fc21e/tmp/scratch/s7-device-tree/spikes/s7-device/harness)
+    Finished `release` profile [optimized + debuginfo] target(s) in 1m 20s
+3709b3c4e1b676db3af965d3f49c60a0fd027c92931c7d0f64f68cce739a14dc  s7-phone-timing
+a512b6b7b7b72e9cc8017121ee43f700bd81859112a9f533d0a3b8eafa698006  s7-phone-seeded
