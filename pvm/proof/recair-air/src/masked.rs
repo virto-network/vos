@@ -42,7 +42,7 @@ use stwo_constraint_framework::{
     RelationEntry, TraceLocationAllocator, relation,
 };
 
-use crate::{Body, GateRelation, LogSizes, h8, p2, preprocessed_ids, qm31};
+use crate::{Body, GateRelation, LogSizes, evals, h8, p2, preprocessed_ids, qm31};
 
 /// The constraint bound over the log size: `4N`, the composition whole.
 pub const MASKED_LOG_CONSTRAINT_EXPANSION: u32 = 2;
@@ -474,47 +474,28 @@ impl WrapComponents {
         log_sizes: &LogSizes,
         claimed_sums: &[SecureField; 3],
     ) -> Self {
+        let (p2, qm31, h8) = evals(relation, log_sizes);
+        let [p2_sum, qm31_sum, h8_sum] = *claimed_sums;
         let allocator =
             &mut TraceLocationAllocator::new_with_preprocessed_columns(&preprocessed_ids());
-        let p2 = FrameworkComponent::new(
-            allocator,
-            MaskedEval::new(
-                p2::P2Eval {
-                    log_size: log_sizes[0],
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            claimed_sums[0],
-        );
-        let qm31 = FrameworkComponent::new(
-            allocator,
-            MaskedEval::new(
-                qm31::Qm31Eval {
-                    log_size: log_sizes[1],
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            claimed_sums[1],
-        );
-        let h8 = FrameworkComponent::new(
-            allocator,
-            MaskedEval::new(
-                h8::H8Eval {
-                    log_size: log_sizes[2],
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            claimed_sums[2],
-        );
         Self {
-            p2,
-            qm31,
-            h8,
+            p2: FrameworkComponent::new(allocator, MaskedEval::new(p2, blind), p2_sum),
+            qm31: FrameworkComponent::new(allocator, MaskedEval::new(qm31, blind), qm31_sum),
+            h8: FrameworkComponent::new(allocator, MaskedEval::new(h8, blind), h8_sum),
             log_sizes: *log_sizes,
         }
+    }
+
+    /// The set at `log_sizes` under dummy relations and zero sums: its trees'
+    /// layout, which neither changes. [`MaskedComponents::bind`] evaluates
+    /// it under the drawn ones.
+    pub fn layout(log_sizes: &LogSizes) -> Self {
+        Self::build(
+            &GateRelation::dummy(),
+            &BlindRelation::dummy(),
+            log_sizes,
+            &[SecureField::default(); 3],
+        )
     }
 }
 
@@ -560,40 +541,10 @@ impl MaskedComponents for WrapComponents {
         let &[p2_sum, qm31_sum, h8_sum] = claimed_sums else {
             return None;
         };
-        let [p2_size, qm31_size, h8_size] = self.log_sizes;
-        let p2 = Rebound::new(
-            &self.p2,
-            MaskedEval::new(
-                p2::P2Eval {
-                    log_size: p2_size,
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            p2_sum,
-        )?;
-        let qm31 = Rebound::new(
-            &self.qm31,
-            MaskedEval::new(
-                qm31::Qm31Eval {
-                    log_size: qm31_size,
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            qm31_sum,
-        )?;
-        let h8 = Rebound::new(
-            &self.h8,
-            MaskedEval::new(
-                h8::H8Eval {
-                    log_size: h8_size,
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            h8_sum,
-        )?;
+        let (p2, qm31, h8) = evals(relation, &self.log_sizes);
+        let p2 = Rebound::new(&self.p2, MaskedEval::new(p2, blind), p2_sum)?;
+        let qm31 = Rebound::new(&self.qm31, MaskedEval::new(qm31, blind), qm31_sum)?;
+        let h8 = Rebound::new(&self.h8, MaskedEval::new(h8, blind), h8_sum)?;
         Some(alloc::vec![Box::new(p2), Box::new(qm31), Box::new(h8)])
     }
 }
@@ -614,12 +565,7 @@ mod tests {
     };
 
     fn wrap() -> WrapComponents {
-        WrapComponents::build(
-            &GateRelation::dummy(),
-            &BlindRelation::dummy(),
-            &LOG_SIZES,
-            &[SecureField::default(); 3],
-        )
+        WrapComponents::layout(&LOG_SIZES)
     }
 
     /// Pin A's trees: 57 preprocessed columns at `n + 1`, unsalted; 373

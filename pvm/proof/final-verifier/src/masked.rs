@@ -66,8 +66,8 @@ use stwo::core::verifier::VerificationError;
 use vos_pvm_recair_air::GateRelation;
 use vos_pvm_recair_air::gate::public_logup_sum;
 use vos_pvm_recair_air::masked::{
-    BlindRelation, MaskPins, MaskedComponent, MaskedComponents, WrapComponents, air_log_size,
-    committed_log_sizes, composition_oods_eval, sample_points, sample_points_from_zero,
+    MaskPins, MaskedComponent, MaskedComponents, WrapComponents, air_log_size, committed_log_sizes,
+    composition_oods_eval, sample_points, sample_points_from_zero,
 };
 
 use crate::{
@@ -511,12 +511,7 @@ pub fn verify_with(
     let public_sum = |relation: &GateRelation| {
         public_logup_sum(relation, LAYOUT.public_terms(public.iter().copied()))
     };
-    let layout = WrapComponents::build(
-        &GateRelation::dummy(),
-        &BlindRelation::dummy(),
-        &proof.log_sizes,
-        &[SecureField::zero(); 3],
-    );
+    let layout = WrapComponents::layout(&proof.log_sizes);
     verify_masked::<Blake2bMerkleChannel, WrapComponents>(
         format,
         &Claim {
@@ -545,12 +540,7 @@ mod tests {
     /// samples [`samples`]'.
     #[test]
     fn the_pinned_shape_is_the_wrap_components() {
-        let layout = WrapComponents::build(
-            &GateRelation::dummy(),
-            &BlindRelation::dummy(),
-            &LOG_SIZES,
-            &[SecureField::zero(); 3],
-        );
+        let layout = WrapComponents::layout(&LOG_SIZES);
         assert_eq!(shape_of(&layout, &PINS), Some((TREE_WIDTHS, DEEP_VALUES)));
         let trees = committed_log_sizes(&layout, &PINS).unwrap();
         assert_eq!(trees.iter().flatten().max(), Some(&LOG_DEGREE_BOUND));
