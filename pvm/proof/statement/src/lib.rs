@@ -24,7 +24,14 @@
 //! ([`Refusal::Space`]): no space has the id `NONE`, so a root of `NONE` is
 //! never one a venue anchored, and it is refused as a claim before any
 //! anchor is looked up. A rooted statement is accepted only where its
-//! space's roots are anchored: at its space's one venue.
+//! space's roots are anchored: at the venues its space registered at.
+//! Registering at one is the space's discipline, not a venue's rule: a
+//! founder may register the same genesis at two venues, and nothing at
+//! either sees the other. With the same roots at both, a statement is
+//! accepted, and handled, at both; with different roots, the space forks
+//! unseen. An anchor gives no integrity (`proving.md` §7), so a
+//! value-moving handler is two-sided or spends the submitting space's own
+//! escrow.
 //!
 //! **The program id is the venue's, never the caller's.** [`judge`] takes
 //! the id the venue pinned for the kernel whose handler will act on the

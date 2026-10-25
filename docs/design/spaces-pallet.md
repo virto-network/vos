@@ -60,13 +60,18 @@ at master 87f8728.
 - **Rooted statements only.** `ProgramInfo.venue_bound`, `Pin` and
   refusal 7 (`Venue`) are gone; `judge` takes the program; a statement of
   no root, or of the space `SpaceId::NONE`, is refused 4. `Seen` entries
-  all expire.
+  all expire. A statement is accepted where its space's roots are
+  anchored, which is where the space registered: one venue by the space's
+  discipline, not by any venue's rule (§6.2's known limit).
 - **The anchor rule as one function.** `vos_anchor::venue` holds the
-  registration, the anchor rule, `anchored`, the freshness and `Seen`
-  expiry as pure functions over two traits; the pallet implements them
+  registration, the anchor rule, `anchored`, the key-listing rule
+  (`add_key`), the freshness and `Seen` expiry as pure functions over two
+  traits; the pallet implements them
   over its storage and calls them (§6.1–§6.3). `MaxRootAge`,
   `MinWindowMs` and `MaxWindowMs` leave `Config`: they are the kit's
   constants.
+- **A second root at an aged window** is `WindowTooOld`, never evidence,
+  whether or not the first is still stored.
 - **`anchor` before the space's origin** is `WindowInFuture` (no window
   is closed yet), and an anchor before the space's first window is
   `WindowNotAfterLast`; `BadClock` is a registration's alone.
@@ -301,7 +306,7 @@ pub trait Config: frame_system::Config<AccountId = AccountId32> + pallet_timesta
     #[pallet::constant] type SubmitDeposit: Get<BalanceOf<Self>>;
     #[pallet::constant] type ProgramChangeDelay: Get<u64>;  // 604_800_000 ms (7 days)
     #[pallet::constant] type MaxAuthorities: Get<u32>;      // 16
-    #[pallet::constant] type MaxAnchorKeys: Get<u32>;       // 16, ≥ vos_anchor::MAX_FOUNDING_KEYS
+    #[pallet::constant] type MaxAnchorKeys: Get<u32>;       // 16 = vos_anchor::MAX_FOUNDING_KEYS, which add_key reads
     #[pallet::constant] type MaxGenesisLen: Get<u32>;       // 2_048
     #[pallet::constant] type MaxStatementLen: Get<u32>;     // 65_536
     #[pallet::constant] type MaxProofLen: Get<u32>;         // 262_144
@@ -385,7 +390,7 @@ compact, and the vectors are `BoundedVec<u8, _>`.
 |---|---|---|---|
 | 0 | `register(genesis: Vec<u8>, controller: AccountId32, founder_key: [u8;32], founder_sig: [u8;64])` | any signed (pays its own fee) | §6.2 |
 | 1 | `set_controller(space: SpaceId, controller: AccountId32)` | controller | replaces the controller |
-| 2 | `add_authority(space: SpaceId, who: AccountId32, anchor_key: Option<[u8;32]>)` | controller | adds an authority, paired with `anchor_key` when given: an account that is an authority already is refused (`AuthorityExists`), a key of small order (`BadAnchorKey`), a key paired with another authority (`AnchorKeyInUse`); an unpaired listed key, such as a founding one, becomes paired; `inc_providers(who)` |
+| 2 | `add_authority(space: SpaceId, who: AccountId32, anchor_key: Option<[u8;32]>)` | controller | adds an authority, paired with `anchor_key` when given: an account that is an authority already is refused (`AuthorityExists`), a key paired with another authority (`AnchorKeyInUse`); an unpaired listed key, such as a founding one, becomes paired; a key not listed is listed through `vos_anchor::venue::add_key` (small order → `BadAnchorKey`, `MAX_FOUNDING_KEYS` listed → `TooManyAnchorKeys`); `inc_providers(who)` |
 | 3 | `remove_authority(space: SpaceId, who: AccountId32)` | controller | removes it and its paired anchor key; `dec_providers(who)` best effort: a `ConsumerRemaining` error is ignored, the account merely stays alive |
 | 4 | `remove_anchor_key(space: SpaceId, key: [u8;32])` | controller | removes an unpaired key, such as a founding one |
 | 5, 6 | retired (v1's `migrate` and `resume`), never reused | | |
@@ -421,16 +426,21 @@ which decides in this order:
 2. `signer ∈ AnchorKeys(space)` (`Key` → `UnknownAnchorKey`);
 3. the ed25519 signature over `anchor_digest(venue, space, window, kind,
    root)`, strictly (`Signature` → `BadAnchorSignature`);
-4. **if `Anchors(space, kind, window)` exists:** the same root → `Again`
+4. `now_ms − B_w ≤ MaxRootAge` (`Age` → `WindowTooOld`): before the held
+   root, so a second root at an aged window is refused alike whether or
+   not `on_idle` has pruned the first;
+5. **if `Anchors(space, kind, window)` exists:** the same root → `Again`
    (`AlreadyAnchored`); another root → `Evidence(held)`;
-5. otherwise `start_window ≤ w` and `Last(space, kind) < w` when present,
+6. otherwise `start_window ≤ w` and `Last(space, kind) < w` when present,
    gaps allowed (`Window` → `WindowNotAfterLast`);
-6. `w < now_w`, `now_w` the window of `Timestamp.Now` through the space's
+7. `w < now_w`, `now_w` the window of `Timestamp.Now` through the space's
    clock, none before its origin: the open window, a later one, or any
    before the origin cannot be anchored (`Open` → `WindowInFuture`);
-7. `now_ms − B_w ≤ MaxRootAge` (`Age` → `WindowTooOld`);
 
-and answers `New`. The pallet then writes what it decided:
+and answers `New`. A venue that cannot read state where it checks the
+signature (JAM's refine) judges the signature first: an anchor failing
+both a state check and its signature is `Signature` there and the state's
+refusal here. The codes differ only when two faults coincide. The pallet then writes what it decided:
 - **`New`:** store `Anchors` (`at_ms = now`, `signer`) and `Last = w`;
   emit `Anchored`.
 - **`Evidence(held)`:** store `Equivocations` with both roots and both
@@ -477,7 +487,13 @@ live space is not in this version.
 the space's controller does, under a controller of that key's choosing,
 and the space cannot register here again: one compromised founder squats
 the space at every venue it has not reached. The lever is carried: a
-registration co-signed by the controller, or by a founders' quorum.
+registration co-signed by the controller, or by a founders' quorum. Nor
+does any venue see another's registrations: a founder may register the
+same genesis here and at another venue. With the same roots anchored at
+both, a statement is accepted, and handled, at both; with different roots,
+the space forks unseen. One venue a space is the space's discipline, and
+an anchor gives no integrity: a value-moving handler is two-sided or spends
+the submitting space's own escrow (§1).
 
 ### 6.3 `submit` (pin F's order)
 
@@ -504,7 +520,9 @@ and it reports through events:
    io-hash, unseen, and the proof.
 
 `payer` may differ from `statement.space`: any space's authority may pay
-for any statement; the proof is what is judged.
+for any statement; the proof is what is judged. A statement is accepted
+wherever its roots are anchored, here or at another venue the same space
+registered at (§6.2's known limit).
 
 The outcome:
 
@@ -962,7 +980,7 @@ tag's, byte for byte.
 | G1 | register: the fixture genesis's space registered, anchoring from the venue's next window (start_window now_w + 1), its sovereign address `modl ‖ kv/space ‖ space[..20]`, the deposit held; refused: the founder's signature under another controller (BadFounder), a second registration (SpaceExists); a space whose clock has not started registered from window 0 |
 | G2 | add_authority (with a paired anchor key, and without), remove_authority (its key leaves AnchorKeys), each account's providers; refused: a non-controller (NotController), an unknown space (UnknownSpace), a second removal (NotAuthority) |
 | G3 | anchor at w, then w + 2 (a gap), by an authority and by any signed account; Last follows |
-| G4 | anchor refusals: before the space's first window (WindowNotAfterLast), older than MaxRootAge (WindowTooOld), exactly MaxRootAge old taken, the same root again (AlreadyAnchored), a stale w ≤ Last (WindowNotAfterLast), the open window now_w and a later one (WindowInFuture), then now_ms at B_w and the same anchor resubmitted (Anchored); a bad signature (BadAnchorSignature), kind 1 (BadKind), an unlisted key (UnknownAnchorKey), an unknown space (UnknownSpace), now_ms before the origin (WindowInFuture) |
+| G4 | anchor refusals: before the space's first window (WindowNotAfterLast), older than MaxRootAge (WindowTooOld), exactly MaxRootAge old taken, the same root again (AlreadyAnchored), the open window now_w and a later one (WindowInFuture), then now_ms at B_w and the same anchor resubmitted (Anchored); a stale w ≤ Last (WindowNotAfterLast); a second root at a held window past MaxRootAge (WindowTooOld: no evidence, the space active); a bad signature (BadAnchorSignature), kind 1 (BadKind), an unlisted key (UnknownAnchorKey), an unknown space (UnknownSpace), now_ms before the origin (WindowInFuture) |
 | G5 | an equivocation ends a space: a second root of a window held, signed by another listed key (the failover case: the honest node's anchor as the evidence), Equivocated naming both signers and SpaceEnded, the status Ended (index 3), the registration deposit released to the sovereign; then its anchors refused (SpaceNotActive), the evidence's too, and its roots unanchored (a statement over a window held refused 5); the registration replayed refused (SpaceExists: the space is never pruned); dispatch_as_sovereign still the controller's, the sovereign's funds leaving, the existential deposit kept |
 | G6 | submit of the masked format-39 fixture: its two roots anchored, then Accepted { id }, Seen[id] its newest root's B_w + MaxRootAge, the deposit held and released |
 | G7 | one mutant per refusal class, each Refused { code } and DepositForfeited: 1 (the statement cut short), 2 (format 30), 3 (a program not in Programs), 4 (a space not its roots'), 5 (a root not anchored), 0x1xx (the proof's byte flipped); 6 is G8's, its deposit released. Then the statement itself against activation windows: 2 while Formats[39].until_ms is now (retired), and while its from_ms is past now; 3 while its program's until_ms is now, and while its from_ms is past now; accepted once now reaches it |

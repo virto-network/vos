@@ -420,7 +420,7 @@ pub struct Statement {
     pub format: FormatVersion,       // the final format; the venue checks it is accepted
     pub program: ProgramId,          // a public input of the proof
     pub space: SpaceId,              // checked by the venue against every RootRead
-    pub public_args: Vec<u8>,        // in order: the venue (venue-bound), the reader
+    pub public_args: Vec<u8>,        // in order: the kernel's own leading fields, the reader
                                      // (AgentId, InstanceId) (`&self`), each #[public] argument
     pub output: Vec<u8>,             // opaque; the handler for `program` decodes it
     pub roots: Vec<RootRead>,        // { kind, space, window, root }
@@ -452,7 +452,7 @@ pub struct Statement {
     `public_args`, `output` and `roots`;
   - the venue authenticates `format` (accepted), the roots (equal to
     anchored space roots, §7) and `space` (equal to every
-    `RootRead.space`, or the zero id for a rootless statement);
+    `RootRead.space`, at least one of them, never the zero id);
   - **only the kernel's code binds a `RootRead` to what the kernel
     verified against.** No layer checks that a stated root is the one
     the kernel's multiproof was checked against: the kernel writes its
@@ -461,13 +461,14 @@ pub struct Statement {
     states the roots it verified, carries a nonce where its statements
     can repeat, and keeps its low-entropy fields salted, as SECURITY.md's
     "program intent" says of the base layer.
-- **A rootless statement belongs to no space; a statement claiming a space
+- **A venue judges rooted statements alone; a statement claiming a space
   must read a root of it.** Only a root binds the space: the proof states
-  none, and the id hashes it. Were a rootless statement's space free, one
-  accepted proof would make a new id under each space and pass the repeat
-  check again: a settlement applied twice. The venue refuses a rootless
-  statement whose space is not the zero id (`SpaceId::NONE`), as
-  `Refusal::Space` (`0x4`).
+  none, and the id hashes it. Were a statement's space free of its roots,
+  one accepted proof would make a new id under each space and pass the
+  repeat check again: a settlement applied twice. The venue refuses a
+  statement of no root, or of the zero id (`SpaceId::NONE`), and one whose
+  roots are not all its space's, as `Refusal::Space` (`0x4`)
+  (`slice-7-mobile.md`, pin D′, C7).
 - **A kernel that does not state its roots** carries what it read in its
   output, which no venue checks: its handler must. A `&self` kernel states
   its root: the window kernel reads its rows at one cut and states `S_w`,
@@ -483,11 +484,9 @@ pub struct Statement {
   pin F), in order: the format (one the venue accepts and
   the build links: 39, and 28 only under `test-formats`, which no
   production build enables); the statement's program against the venue's
-  pin; the venue, when the pin says the program is venue-bound: the first
-  32 bytes of `public_args` the venue's id (`Refusal::Venue`, `0x7`); the
-  space, every root's the statement's and a rootless statement's none; every
-  root anchored, within the space's range at the venue (from its
-  registration to its migration away) and not past `MaxRootAge`; the
+  pins; the space, at least one root and every root the statement's; every
+  root anchored (`vos_anchor::venue::anchored`: the space active at the
+  venue, the root held at its window, not past `MaxRootAge`); the
   io-hash recomputed from the fields and the id from it; a repeat; then the
   final proof (at most 256 KiB, the format's own decode and nothing after
   it) against the pinned program id and the recomputed io-hash. **The
@@ -495,10 +494,9 @@ pub struct Statement {
   verified against the statement's or the proof's id would accept any
   kernel's proof. Each refusal has a class every venue reports alike
   (`Refusal::code`, the final verifier's `Error::code` under it).
-- **`Seen` and time** (`vos_statement::seen_expiry`): a rooted statement's
-  entry may be dropped once its newest root is past `MaxRootAge`
-  (`B_w + MaxRootAge`), since a replay then fails `0x5`; a rootless
-  statement's never expires, since it has no anchor to fail.
+- **`Seen` and time** (`vos_statement::seen_expiry`): a statement's entry
+  may be dropped once its newest root is past `MaxRootAge`
+  (`B_w + MaxRootAge`), since a replay then fails `0x5`.
 - **Low-entropy fields:** anything in `output` or `public_args` derived
   from private data is a nullifier or a salted commitment, never a plain
   hash of a guessable value.
@@ -694,8 +692,9 @@ last for decades.**
       account** that holds the registration deposit and pays its
       authorities' fees and deposits; an **authorities map** of the
       nodes' own sr25519 accounts, each paired with its ed25519 anchor
-      key, set by the controller (an `AccountId`); a registration signs
-      its first window; the venue-bound flag; the migration range;
+      key, set by the controller (an `AccountId`); a space anchors from
+      the venue's next window at its registration, and an equivocation
+      ends it for good, its record kept as a tombstone;
     - anchors keyed by `(space, kind, window)`; `MaxRootAge` (24 h) is
       the only age;
     - formats and programs: governance, with a delay.
@@ -704,8 +703,6 @@ last for decades.**
     fees, paid by the sovereign account through `ChargeSpaceFee` within a
     spend budget per window. A proof's length counts as proof_size, so
     about 20 statements fit a block on one core.
-  - **The repeat rule:** a rootless statement's `Seen` entry never
-    expires, since it has no anchor whose age refuses a replay.
   - **The node's Kreivo client** (`vos_venue::kreivo::KreivoVenue`): the
     representative and the worker anchor and submit through it, a
     `VenueClient`, the space's sovereign account paying. It reaches the
@@ -768,8 +765,8 @@ last for decades.**
   a statement [measured]; a report's accumulate has 10M); accumulate
   holds the spaces,
   anchors and repeats, and records, checking an anchor's signer against
-  the space's registered keys and keeping a rootless statement's `Seen`
-  entry forever, as Kreivo does; accepted program ids are constants
+  the space's registered keys, through the venue rules
+  (`vos_anchor::venue`) as Kreivo's pallet does; accepted program ids are constants
   changed by redeploy; a statement rides in its `Submit` item's payload
   and its proof as the item's extrinsic, since JAM-NP's CE 133 bounds the
   package at 204,802 bytes. An actor in the default agent cannot host
@@ -782,8 +779,7 @@ last for decades.**
   (`vos-jam-dev`), which serves the end-to-end tests and the testnets;
   neither `vos` nor `vos-node` depends on it (`just check-no-jam-dev`).
   A node reaches JAM later through an extension running a light node.
-- **Venues in the node:** a space anchors and submits at one venue at a
-  time, through a `VenueClient` (`vos-venue`: the trait, `ModelVenue`,
+- **Venues in the node:** a space anchors and submits at one venue, through a `VenueClient` (`vos-venue`: the trait, `ModelVenue`,
   the `AnchorQueue` that retries anchors, and `KreivoVenue`). The
   representative's leader signs and anchors each window; the prover
   worker (`vos-node-prover`), on the leader of the agent whose record it
@@ -791,9 +787,9 @@ last for decades.**
   in the agent (`Input::Proven`) and submits it once its roots are
   anchored, a repeat counted as accepted. The prover is built into the
   node and stays there [decided]; the extension host that will carry the
-  venues' transports is deferred. **Known limit:** the worker proves
-  statements at an anchored cut alone (an attest with a window); a
-  rootless statement (`Kind::Stating`) has no production prover yet.
+  venues' transports is deferred. The worker proves statements at an
+  anchored cut alone (an attest with a window), the only statements a
+  venue judges.
 
 ## 7. Roots and anchors [proposed]
 
@@ -827,23 +823,31 @@ last for decades.**
   the representative's agent root at its own cut of w, over its rows
   `(agent, kind, w) → the agent's root at cut(w)` (`slice-6-on-chain.md`,
   pin D).
-- **Anchors** [decided] are signed by one registered node key; the
-  controller rotates the keys.
-- **Equivocation** [decided]: a second root at a window held is evidence
-  and suspends the space until the controller removes both signing keys
-  and resumes it. An honest node raises it: its venue client, finding
-  the venue holding another root at a window the node anchors, sends the
-  node's anchor all the same as the evidence, and alerts. A contested
-  root is never trusted: the venue drops the window's anchor with the
-  evidence, so after the resume statements rooted there are refused
-  (`0x5`) and the space anchors on from the window after its last
-  (`slice-6-on-chain.md`, pin D; `spaces-pallet.md` §6.1, vector G19).
+- **Anchors** [decided] are signed by one registered node key, a node's
+  key set once when the controller lists it (`slice-7-mobile.md`,
+  pin D′).
+- **The venue rules** [decided] are written once, in `vos_anchor::venue`,
+  and every venue calls them: the registration, the anchor rule,
+  `anchored` and a root's freshness (`spaces-pallet.md` §6.1–§6.3).
+- **Equivocation** [decided]: a second root at a fresh window held is
+  evidence and ends the space for good (S11): its status `Ended`, its
+  roots refused from then on (`0x5`), no resume; the record is a
+  tombstone the venue never prunes, so its registration replayed is
+  refused; the registration deposit is released and the controller can
+  still move the sovereign's funds. The space founds again under a new
+  genesis. An honest node raises it: its venue client, finding the venue
+  holding another root at a window the node anchors, sends the node's
+  anchor all the same as the evidence, and alerts. A second root at a
+  window past `MaxRootAge` is refused as aged, never evidence
+  (`slice-7-mobile.md`, pin D′; `spaces-pallet.md` §6.1, vector G5).
 - **Known limits** (carried): any single founding key registers the
   space at a venue it has not reached, under a controller of its choosing,
-  and so squats it there (`spaces-pallet.md` §6.2); and equivocation is
-  caught per venue only: a venue the space migrates to trusts the
-  founder-signed start, so the windows before the migration may be
-  anchored at both venues unseen (an anchor gives no integrity).
+  and so squats it there (`spaces-pallet.md` §6.2); and nothing ties a
+  space to one venue but its own discipline: a founder may register the
+  same genesis at two venues. Anchoring the same roots at both, a
+  statement is accepted, and handled, at both; anchoring different roots,
+  the space forks unseen, since equivocation is caught per venue (an
+  anchor gives no integrity).
 - **Retention:** none past a cut. A request made in window w reads at
   `cut(w)` and is served at the next cut.
 - **Spans** [decided]: a statement over a span of windows takes a carried
@@ -852,16 +856,12 @@ last for decades.**
 - **An anchor gives ordering and non-equivocation, not integrity:** a
   space can anchor any root of its own making, so every value-moving
   handler is two-sided or spends the submitting space's own escrow.
-- **Venue migration:** a space anchors on one venue at a time. The
-  controller's signed `migrate(to, from_window)` sets the old venue's
-  range to end before `from_window`, at or after the next window and
-  never to the venue itself; the space registers at the new venue from
-  that window. Each venue refuses anchors outside its range, and a
-  statement whose roots fall outside it (`0x5`). Migration is one-way per venue: a space that left a venue does
-  not register there again.
-- **Venue-bound programs:** a program the pin marks venue-bound states the
-  venue's id as the first 32 bytes of its `public_args`, so its statement
-  is accepted at that venue alone (`Refusal::Venue`, `0x7`).
+- **One venue, no migration** [decided] (S9): a space anchors at one
+  venue for good, from the venue's next window at its registration; a
+  space that changes venue founds again under a new genesis. With every
+  statement rooted, a statement is accepted only where its space's roots
+  are anchored, which is where the space registered (the known limit
+  above).
 - **Root kinds:**
   - Committed rows sit first in the keyspace, under `0x03`, so an
     agent's root is the same on both hosts: VOS's tree per agent equals
@@ -1278,7 +1278,7 @@ a patch of one, and its verdict:
 | wrong io-hash (the output changed) | `0x108` interaction PoW | `0x108` | `0x108` | `0x108`, 17.5M |
 | another program than the pin | `0x3` | `0x3` | `0x3` | `0x3`, < 0.1M |
 | another space | `0x4` | `0x4` | `0x4` | `0x4`, 0.1M |
-| rootless, another space (`S` without its roots, its space still claimed) | `0x4` | `0x4` | `0x4` | `0x4`, < 0.1M |
+| rootless (`S` without its roots, its space still claimed) | `0x4` | `0x4` | `0x4` | `0x4`, < 0.1M |
 | the same run, another accepted format (the venue accepts 28 and 38, and accepted `S` under 38) | `0x6` | `0x6` | `0x6` | `0x6`, 0.1M |
 
 The accepted statement's id is the same at every venue. A refused proof's
@@ -1301,13 +1301,12 @@ the order drawn, never in `TypeId` order). `just judge-wasm` (in
 **At format 39** [measured]: the generator wraps `S`'s
 run under format 39, masked from the seeded test seam (`MaskRng::Seeded`,
 so the bytes are its own every run: `wrap.proof`, 146,564 bytes), and under
-28 (`wrap-28.proof`, 123,797 bytes); the two cheating wraps under 39; and a
-second kernel's rootless statement `S0`, one segment wrapped under 39
-(`wrap-rootless.proof`). `S` is a venue-bound program's: its `public_args`
-are the venue's id and a nonce. The production venue accepts {39}, the
-test venue {28, 39}; each registers `S`'s space from window 40 and judges
-at window 42's boundary. 31 cases (`statements.cases`, 19 KB), each but the
-three accepted a replay of an accepted statement with one thing changed;
+28 (`wrap-28.proof`, 123,797 bytes); and the two cheating wraps under 39.
+`S`'s `public_args` are a venue's id and a nonce, which the io-hash binds
+and no venue reads apart. The production venue accepts {39}, the test
+venue {28, 39}; each registers `S`'s space from window 40 and judges at
+window 42's boundary. 25 cases (`statements.cases`, 15 KB), each but the
+two accepted a replay of an accepted statement with one thing changed;
 every verdict the same natively (both formats linked), in Wasm (the
 production blob, 39 alone, and the test blob; PVF and client) and on the
 JAM-only host (`final-verify.elf`, 39 alone, and `final-verify-test.elf`).
@@ -1316,22 +1315,20 @@ check:
 
 | case | verdict | JAM-only host, 39 alone [measured] |
 |---|---|---|
-| valid; rootless (`S0`) | accepted | 79.4M; 79.1M gas |
+| valid | accepted | 79.4M gas |
 | format 28 at the test venue | accepted (`0x2` where 28 is not linked) | test guest 76.2M |
 | tampered; tampered, format 28 at the test venue | `0x112` | 47.6M; test guest 52.8M |
 | wrong program; wrong io-hash; the nonce; the roots' order; a root dropped | `0x108` | 11.0M |
 | prefix; mid-way | `0x109` | 11.1M |
 | unaccepted format (30); format 28 at a production venue | `0x2` | 0.1M |
 | another program than the pin | `0x3` | 0.1M |
-| another space; the space; rootless, another space; rooted, of no space | `0x4` | 0.1M |
-| unanchored root; a root's window; a root; migrated before a root's window; registered after a root's window; rooted, replayed past MaxRootAge | `0x5` | 0.1M |
-| repeated; rootless, replayed past MaxRootAge; accepted under 39, replayed under 28; accepted under 28, replayed under 39 | `0x6` | 0.1M |
-| another venue's statement; replayed at another venue | `0x7` | 0.1M |
+| another space; the space; rootless; rooted, of no space | `0x4` | 0.1M |
+| unanchored root; a root's window; a root; replayed past MaxRootAge | `0x5` | 0.1M |
+| repeated; accepted under 39, replayed under 28; accepted under 28, replayed under 39 | `0x6` | 0.1M |
 
 The transition holds both ways: `S` accepted under one format is the same
-statement under the other, refused as a repeat. Past `MaxRootAge` a rooted
-replay is unanchored (its `Seen` entry and anchors dropped) and a rootless
-one is repeated (its entry kept). The production guest's program is 391,784
+statement under the other, refused as a repeat. Past `MaxRootAge` a
+replay is unanchored (its `Seen` entry and anchors dropped). The production guest's program is 391,784
 bytes (the test guest's 454,662), within JAM's 4,000,000-byte bound on a
 service's code, its only size bound.
 
