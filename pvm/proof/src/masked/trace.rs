@@ -11,6 +11,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
 use stwo::prover::backend::simd::SimdBackend;
+use stwo::prover::backend::simd::column::BaseColumn;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo_constraint_framework::{ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX};
@@ -86,6 +87,14 @@ impl MaskedSegmentTrace {
             .iter()
             .map(|trace| trace.to_circle_evaluation(ORIGINAL_TRACE_IDX))
             .collect()
+    }
+
+    /// Each chip's main columns, in bit-reversed order, to change: what a
+    /// forged trace starts from.
+    pub fn main_columns_mut(&mut self) -> impl Iterator<Item = &mut Vec<BaseColumn>> {
+        self.traces
+            .iter_mut()
+            .map(|trace| &mut trace.original_trace)
     }
 
     /// The values mixed after the main tree's root: the boundary states

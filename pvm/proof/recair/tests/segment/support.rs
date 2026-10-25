@@ -20,7 +20,7 @@ pub const IO: [u32; 4] = [0x4433_2211, 0x0807_0605, 0x7f00_00ff, 0x9abc_def0];
 pub const IO_OTHER: [u32; 4] = [0x4433_2212, 0x0807_0605, 0x7f00_00ff, 0x9abc_def0];
 
 /// A standard program that sets φ8 (the output's length) to 0 and φ9..12 to
-/// `io`, sums φ9 and φ10 into φ7 and clears φ7 again (a value no boundary
+/// `io`, sums φ9 and φ12 into φ7 and clears φ7 again (a value no boundary
 /// state holds), then returns to φ0, the halt address.
 pub fn blob(io: [u32; 4]) -> Vec<u8> {
     let mut code = Vec::new();
@@ -33,8 +33,8 @@ pub fn blob(io: [u32; 4]) -> Vec<u8> {
     for (register, value) in [(8u8, 0u32)].into_iter().chain((9..13).zip(io)) {
         load(register, value, &mut code, &mut bitmask);
     }
-    // add_64 φ7 = φ9 + φ10, then φ7 = 0.
-    code.extend_from_slice(&[200, 9 | 10 << 4, 7]);
+    // add_64 φ7 = φ9 + φ12, then φ7 = 0.
+    code.extend_from_slice(&[200, 9 | 12 << 4, 7]);
     bitmask.extend_from_slice(&[1, 0, 0]);
     load(7, 0, &mut code, &mut bitmask);
     code.extend_from_slice(&[50, 0]);
@@ -57,7 +57,7 @@ pub fn blob(io: [u32; 4]) -> Vec<u8> {
 /// state's.
 pub fn secret(io: [u32; 4]) -> u64 {
     let extend = |word: u32| word as i32 as i64 as u64;
-    extend(io[0]).wrapping_add(extend(io[1]))
+    extend(io[0]).wrapping_add(extend(io[3]))
 }
 
 /// The kernel of `io`'s whole run, one segment.

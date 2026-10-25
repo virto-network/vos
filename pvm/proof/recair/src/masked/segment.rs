@@ -22,7 +22,9 @@ use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, verify_masked};
 use vos_pvm_proof::SegmentState;
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::framework_access::AllLookupElements;
-use vos_pvm_proof::masked::{SegmentComponents, bound_sums, masked_segment_trace, public_values};
+use vos_pvm_proof::masked::{
+    MaskedSegmentTrace, SegmentComponents, bound_sums, masked_segment_trace, public_values,
+};
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair_air::masked::MaskedComponents;
 
@@ -71,26 +73,28 @@ pub fn prove_segment<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    prove_segment_with::<MC>(format, side_note, active, rng, |_, _| {}, true)
+    prove_segment_with::<MC>(format, side_note, active, rng, |_| {}, |_, _| {}, true)
 }
 
-/// [`prove_segment`], each chip's blinding fraction through `blind` once the
-/// relations are drawn, and the prover's own check of the constraints made
-/// only when `checked`: the soundness gates' forced proofs. Only the tests'
-/// dev edge has it (`seeded-masks`); no production build does.
+/// [`prove_segment`], each chip's main columns through `tamper` before they
+/// are committed, its blinding fraction through `blind` once the relations
+/// are drawn, and the prover's own check of the constraints made only when
+/// `checked`: the soundness gates' forced proofs. Only the tests' dev edge
+/// has it (`seeded-masks`); no production build does.
 #[cfg(feature = "seeded-masks")]
 pub fn prove_segment_forced<MC: MerkleChannel>(
     format: &Format,
     side_note: &mut SideNote,
     active: u32,
     rng: MaskRng,
+    tamper: impl FnOnce(&mut MaskedSegmentTrace),
     blind: impl Fn(&AllLookupElements, &mut [FirstRowFraction]),
     checked: bool,
 ) -> Result<(SegmentProof<MC::H>, MaskStats), ProveError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    prove_segment_with::<MC>(format, side_note, active, rng, blind, checked)
+    prove_segment_with::<MC>(format, side_note, active, rng, tamper, blind, checked)
 }
 
 fn prove_segment_with<MC: MerkleChannel>(
@@ -98,6 +102,7 @@ fn prove_segment_with<MC: MerkleChannel>(
     side_note: &mut SideNote,
     active: u32,
     rng: MaskRng,
+    tamper: impl FnOnce(&mut MaskedSegmentTrace),
     blind: impl Fn(&AllLookupElements, &mut [FirstRowFraction]),
     checked: bool,
 ) -> Result<(SegmentProof<MC::H>, MaskStats), ProveError>
@@ -107,9 +112,10 @@ where
     let floors = floors(format, active).ok_or(ProveError::TraceShape(
         "the format's masking does not fit the chips",
     ))?;
-    let trace = masked_segment_trace(side_note, active, &floors)
+    let mut trace = masked_segment_trace(side_note, active, &floors)
         .map_err(|error| ProveError::Segment(error.to_string()))?;
     let side_note: &SideNote = side_note;
+    tamper(&mut trace);
     let public = trace.public();
     let interaction = |relations: &AllLookupElements, blinding: &[FirstRowFraction]| {
         let mut fractions = blinding.to_vec();
