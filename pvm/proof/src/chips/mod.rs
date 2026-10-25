@@ -53,3 +53,13 @@ pub use register_memory::RegisterMemoryChip;
 pub use register_memory_boundary::RegisterMemoryBoundaryChip;
 pub use register_memory_closing::RegisterMemoryClosingChip;
 pub use witness_input::WitnessInputChip;
+
+/// A fixed table's log size: its entries' `natural`, or `floor` when that
+/// is larger, its rows past the entries repeating them with no
+/// multiplicity, so a padded table holds the same entries.
+#[cfg(feature = "prover")]
+pub(crate) fn table_log_size(natural: u32, floor: u32) -> u32 {
+    natural
+        .max(stwo::prover::backend::simd::m31::LOG_N_LANES)
+        .max(floor)
+}

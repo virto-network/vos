@@ -3,7 +3,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        backend::simd::SimdBackend,
         poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
@@ -23,7 +23,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::BitwiseAndByteLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::BitwiseAndByteLookupElements,
+};
 
 /// Byte-wide bitwise-AND table: 2^16 rows of `(a, b, a & b)` for every byte
 /// pair, with a free multiplicity column.  The blake2b chips consume this
@@ -59,6 +62,7 @@ pub enum PreprocessedColumn {
 }
 
 impl BuiltInComponent for BitwiseAndByteChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = BitwiseAndByteLookupElements;
@@ -81,8 +85,6 @@ impl BuiltInComponent for BitwiseAndByteChip {
             (-mult[0].clone()).into(),
             &[a[0].clone(), b[0].clone(), and_result[0].clone()],
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -90,14 +92,14 @@ impl BuiltInComponent for BitwiseAndByteChip {
 impl BuiltInProverComponent for BitwiseAndByteChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
-        let log_size = BITWISE_BYTE_LOG_SIZE.max(LOG_N_LANES);
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        let log_size = super::table_log_size(BITWISE_BYTE_LOG_SIZE, log_size);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
 
         for row in 0..num_rows {
             let a = (row >> 8) as u8;
-            let b = (row & 0xFF) as u8;
+            let b = row as u8;
             trace.fill_columns(row, a, PreprocessedColumn::A);
             trace.fill_columns(row, b, PreprocessedColumn::B);
             trace.fill_columns(row, a & b, PreprocessedColumn::AndResult);
@@ -109,9 +111,9 @@ impl BuiltInProverComponent for BitwiseAndByteChip {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = BITWISE_BYTE_LOG_SIZE.max(LOG_N_LANES);
+        let log_size = super::table_log_size(BITWISE_BYTE_LOG_SIZE, min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 

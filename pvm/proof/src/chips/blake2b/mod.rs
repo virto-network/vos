@@ -233,8 +233,6 @@ impl BuiltInComponent for Blake2bChip {
             (-init_gate).into(),
             &tuple,
         ));
-
-        eval.finalize_logup_in_pairs();
     }
 }
 

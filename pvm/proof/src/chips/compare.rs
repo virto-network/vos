@@ -148,8 +148,6 @@ impl BuiltInComponent for CompareChip {
                 &tuple,
             ));
         }
-
-        eval.finalize_logup_in_pairs();
     }
 }
 

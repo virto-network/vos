@@ -212,8 +212,6 @@ impl BuiltInComponent for BitwiseChip {
                 &tuple,
             ));
         }
-
-        eval.finalize_logup_in_pairs();
     }
 }
 

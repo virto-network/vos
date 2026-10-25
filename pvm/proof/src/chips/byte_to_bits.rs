@@ -28,7 +28,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        backend::simd::SimdBackend,
         poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
@@ -48,7 +48,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::ByteToBitsLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::ByteToBitsLookupElements,
+};
 
 pub struct ByteToBitsChip;
 
@@ -88,6 +91,7 @@ pub enum PreprocessedColumn {
 }
 
 impl BuiltInComponent for ByteToBitsChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = ByteToBitsLookupElements;
@@ -125,8 +129,6 @@ impl BuiltInComponent for ByteToBitsChip {
             (-mult[0].clone()).into(),
             &tuple,
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -134,11 +136,11 @@ impl BuiltInComponent for ByteToBitsChip {
 impl BuiltInProverComponent for ByteToBitsChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
-        let log_size = BYTE_TO_BITS_LOG_SIZE.max(LOG_N_LANES);
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        let log_size = super::table_log_size(BYTE_TO_BITS_LOG_SIZE, log_size);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
 
-        for row in 0..256usize {
+        for row in 0..trace.num_rows() {
             let byte = row as u8;
             trace.fill_columns(row, byte, PreprocessedColumn::Byte);
             trace.fill_columns(row, (byte >> 0) & 1, PreprocessedColumn::Bit0);
@@ -157,9 +159,9 @@ impl BuiltInProverComponent for ByteToBitsChip {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = BYTE_TO_BITS_LOG_SIZE.max(LOG_N_LANES);
+        let log_size = super::table_log_size(BYTE_TO_BITS_LOG_SIZE, min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         for row in 0..256usize {

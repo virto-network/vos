@@ -1,7 +1,7 @@
 pub(crate) mod eval;
 mod traits;
 
-pub(crate) use traits::builtin::BuiltInComponent;
+pub(crate) use traits::builtin::{BuiltInComponent, Logup};
 // `MachineComponent` is re-exported through `crate::harness` for the
 // chip-isolated prove API.
 pub use traits::erased::MachineComponent;

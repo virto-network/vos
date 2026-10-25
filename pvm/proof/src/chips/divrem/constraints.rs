@@ -422,7 +422,5 @@ impl BuiltInComponent for DivRemChip {
                 &tuple,
             ));
         }
-
-        eval.finalize_logup_in_pairs();
     }
 }

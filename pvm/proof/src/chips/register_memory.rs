@@ -26,7 +26,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::RegisterMemoryLookupElements,
+};
 
 /// RegisterMemoryChip: PVM register-file ledger, analogous to MemoryChip but
 /// indexed by register number (0..NUM_REGS-1) and valued as full u64s.
@@ -132,6 +135,7 @@ pub struct RegEntry {
 }
 
 impl BuiltInComponent for RegisterMemoryChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = RegisterMemoryLookupElements;
@@ -278,8 +282,6 @@ impl BuiltInComponent for RegisterMemoryChip {
             (-is_real.clone()).into(),
             &tuple,
         ));
-
-        eval.finalize_logup();
     }
 }
 

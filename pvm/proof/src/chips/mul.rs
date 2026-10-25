@@ -476,8 +476,6 @@ impl BuiltInComponent for MulChip {
                 &tuple,
             ));
         }
-
-        eval.finalize_logup_in_pairs();
     }
 }
 

@@ -221,8 +221,6 @@ impl BuiltInComponent for WitnessInputChip {
                 core::slice::from_ref(byte),
             ));
         }
-
-        eval.finalize_logup_in_pairs();
     }
 }
 

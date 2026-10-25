@@ -21,7 +21,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        backend::simd::SimdBackend,
         poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
@@ -41,7 +41,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::BitcountLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::BitcountLookupElements,
+};
 
 pub struct BitcountChip;
 
@@ -69,6 +72,7 @@ pub enum PreprocessedColumn {
 }
 
 impl BuiltInComponent for BitcountChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = BitcountLookupElements;
@@ -90,8 +94,6 @@ impl BuiltInComponent for BitcountChip {
             (-mult[0].clone()).into(),
             &tuple,
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -99,11 +101,11 @@ impl BuiltInComponent for BitcountChip {
 impl BuiltInProverComponent for BitcountChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
-        let log_size = BITCOUNT_LOG_SIZE.max(LOG_N_LANES);
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        let log_size = super::table_log_size(BITCOUNT_LOG_SIZE, log_size);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
 
-        for row in 0..256usize {
+        for row in 0..trace.num_rows() {
             let byte = row as u8;
             let lz: u8 = if byte == 0 {
                 8
@@ -126,9 +128,9 @@ impl BuiltInProverComponent for BitcountChip {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = BITCOUNT_LOG_SIZE.max(LOG_N_LANES);
+        let log_size = super::table_log_size(BITCOUNT_LOG_SIZE, min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         for row in 0..256usize {

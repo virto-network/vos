@@ -268,8 +268,6 @@ impl BuiltInComponent for MemoryMerkleChip {
             (-comp_r[0].clone()).into(),
             &child_right,
         ));
-
-        eval.finalize_logup_in_pairs();
     }
 }
 

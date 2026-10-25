@@ -15,7 +15,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        backend::simd::SimdBackend,
         poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
@@ -35,7 +35,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::PopcountLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::PopcountLookupElements,
+};
 
 pub struct PopcountChip;
 
@@ -60,6 +63,7 @@ pub enum PreprocessedColumn {
 }
 
 impl BuiltInComponent for PopcountChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = PopcountLookupElements;
@@ -82,8 +86,6 @@ impl BuiltInComponent for PopcountChip {
             (-mult[0].clone()).into(),
             &tuple,
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -91,17 +93,14 @@ impl BuiltInComponent for PopcountChip {
 impl BuiltInProverComponent for PopcountChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
-        let log_size = POPCOUNT_LOG_SIZE.max(LOG_N_LANES);
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        let log_size = super::table_log_size(POPCOUNT_LOG_SIZE, log_size);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
 
-        for row in 0..256usize {
-            trace.fill_columns(row, row as u8, PreprocessedColumn::Byte);
-            trace.fill_columns(
-                row,
-                (row as u8).count_ones() as u8,
-                PreprocessedColumn::Popcount,
-            );
+        for row in 0..trace.num_rows() {
+            let byte = row as u8;
+            trace.fill_columns(row, byte, PreprocessedColumn::Byte);
+            trace.fill_columns(row, byte.count_ones() as u8, PreprocessedColumn::Popcount);
         }
 
         trace.finalize_bit_reversed()
@@ -110,9 +109,9 @@ impl BuiltInProverComponent for PopcountChip {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = POPCOUNT_LOG_SIZE.max(LOG_N_LANES);
+        let log_size = super::table_log_size(POPCOUNT_LOG_SIZE, min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         for row in 0..256usize {

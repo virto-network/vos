@@ -92,8 +92,6 @@ impl BuiltInComponent for ProgramBoundaryChip {
             (-is_real[0].clone()).into(),
             &consume_tuple,
         ));
-
-        eval.finalize_logup_in_pairs();
     }
 }
 
@@ -104,9 +102,9 @@ impl BuiltInProverComponent for ProgramBoundaryChip {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = LOG_N_LANES; // minimum size, only 1 real row
+        let log_size = LOG_N_LANES.max(min_log_size); // one real row
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         if !side_note.steps.is_empty() {

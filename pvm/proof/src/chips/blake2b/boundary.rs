@@ -356,8 +356,6 @@ impl BuiltInComponent for Blake2bBoundaryChip {
             emit_mult[0].clone().into(),
             &tuple,
         ));
-
-        eval.finalize_logup_in_pairs();
     }
 }
 
