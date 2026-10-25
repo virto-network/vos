@@ -2,7 +2,7 @@
   "about": [
     "VOS's mutation lists for Kreivo's spaces pallet (docs/design/spaces-pallet.md §10, the in-Wasm sweep of spike 6c), generated in VOS (`just conformance`); the teammate's `#[benchmark(extra)]` runs them through submit inside the runtime, every one refused, none trapping.",
     "Each mutant patches the `valid` case of the kit's fixtures/statements.cases: proof_mutants and masked_field_mutants its proof (fixtures/wrap.proof), statement_mutants its statement (`statement`, hex), against the valid proof. A patch replaces `removed` bytes at `offset` with `inserted` (hex).",
-    "code is the verdict at that case's venue state (its accepted formats, pinned program, registered space and anchored roots: in the pallet, Formats, Programs, Spaces and Anchors as G7's pre-state holds them), checked in VOS both by judge on that case and by the mock's submit at G7's pre-state: 1 a statement that does not decode, 2–7 the venue's checks, 0x100 | e the final verifier's error e."
+    "code is the verdict at that case's venue state (its accepted formats, pinned program, registered space and anchored roots: in the pallet, Formats, Programs, Spaces and Anchors as G7's pre-state holds them), checked in VOS both by judge on that case and by the mock's submit at G7's pre-state: 1 a statement that does not decode, 2–6 the venue's checks, 0x100 | e the final verifier's error e."
   ],
   "base": "valid",
   "proof": "wrap.proof",
@@ -1340,224 +1340,224 @@
       "offset": 69,
       "removed": 1,
       "inserted": "1c",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 70 XOR 0x5a",
       "offset": 70,
       "removed": 1,
       "inserted": "11",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 71 XOR 0x5a",
       "offset": 71,
       "removed": 1,
       "inserted": "36",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 72 XOR 0x5a",
       "offset": 72,
       "removed": 1,
       "inserted": "73",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 73 XOR 0x5a",
       "offset": 73,
       "removed": 1,
       "inserted": "fe",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 74 XOR 0x5a",
       "offset": 74,
       "removed": 1,
       "inserted": "e7",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 75 XOR 0x5a",
       "offset": 75,
       "removed": 1,
       "inserted": "f9",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 76 XOR 0x5a",
       "offset": 76,
       "removed": 1,
       "inserted": "94",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 77 XOR 0x5a",
       "offset": 77,
       "removed": 1,
       "inserted": "30",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 78 XOR 0x5a",
       "offset": 78,
       "removed": 1,
       "inserted": "f1",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 79 XOR 0x5a",
       "offset": 79,
       "removed": 1,
       "inserted": "14",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 80 XOR 0x5a",
       "offset": 80,
       "removed": 1,
       "inserted": "ea",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 81 XOR 0x5a",
       "offset": 81,
       "removed": 1,
       "inserted": "47",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 82 XOR 0x5a",
       "offset": 82,
       "removed": 1,
       "inserted": "c0",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 83 XOR 0x5a",
       "offset": 83,
       "removed": 1,
       "inserted": "e5",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 84 XOR 0x5a",
       "offset": 84,
       "removed": 1,
       "inserted": "7f",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 85 XOR 0x5a",
       "offset": 85,
       "removed": 1,
       "inserted": "bc",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 86 XOR 0x5a",
       "offset": 86,
       "removed": 1,
       "inserted": "f3",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 87 XOR 0x5a",
       "offset": 87,
       "removed": 1,
       "inserted": "57",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 88 XOR 0x5a",
       "offset": 88,
       "removed": 1,
       "inserted": "41",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 89 XOR 0x5a",
       "offset": 89,
       "removed": 1,
       "inserted": "16",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 90 XOR 0x5a",
       "offset": 90,
       "removed": 1,
       "inserted": "d6",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 91 XOR 0x5a",
       "offset": 91,
       "removed": 1,
       "inserted": "ea",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 92 XOR 0x5a",
       "offset": 92,
       "removed": 1,
       "inserted": "78",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 93 XOR 0x5a",
       "offset": 93,
       "removed": 1,
       "inserted": "29",
-      "code": 7
+      "code": 265
     },
     {
       "name": "byte 94 XOR 0x5a",
       "offset": 94,
       "removed": 1,
       "inserted": "ec",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 95 XOR 0x5a",
       "offset": 95,
       "removed": 1,
       "inserted": "6a",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 96 XOR 0x5a",
       "offset": 96,
       "removed": 1,
       "inserted": "ea",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 97 XOR 0x5a",
       "offset": 97,
       "removed": 1,
       "inserted": "54",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 98 XOR 0x5a",
       "offset": 98,
       "removed": 1,
       "inserted": "02",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 99 XOR 0x5a",
       "offset": 99,
       "removed": 1,
       "inserted": "0c",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 100 XOR 0x5a",
       "offset": 100,
       "removed": 1,
       "inserted": "51",
-      "code": 7
+      "code": 264
     },
     {
       "name": "byte 101 XOR 0x5a",

@@ -1,4 +1,4 @@
-//! The anchors' vectors: G3–G5, G17 and G19.
+//! The anchors' vectors: G3–G5 and G16.
 
 use parity_scale_codec::Encode;
 
@@ -6,7 +6,9 @@ use super::world::*;
 use super::{Fixtures, Vector};
 use crate::kreivo::mock::Origin;
 use crate::kreivo::mock::keys;
-use crate::kreivo::mock::types::{Call, Error, Event};
+use crate::kreivo::mock::types::{
+    BalancesCall, Call, Error, Event, MultiAddress, RuntimeCall, SpaceStatus,
+};
 
 pub(super) fn g3(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);
@@ -27,9 +29,8 @@ pub(super) fn g3(fx: &Fixtures) -> Vector {
 pub(super) fn g4(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);
     w.with_b(AUTHORITY_1, KEY_3);
-    // Window 30's root just past MaxRootAge.
-    let now = B_CLOCK.boundary(B_START).unwrap() + w.constants().max_root_age_ms + 1;
-    w.at(now);
+    // Window 29 closed and fresh, before the space's first window.
+    w.at(B_CLOCK.boundary(B_START).unwrap() + 1);
     w.begin();
     let by = AUTHORITY_1;
     w.anchor(
@@ -38,8 +39,11 @@ pub(super) fn g4(fx: &Fixtures) -> Vector {
         B_START - 1,
         root(1),
         KEY_3,
-        Expect::Err(Error::OutOfRange),
+        Expect::Err(Error::WindowNotAfterLast),
     );
+    // Window 30's root just past MaxRootAge.
+    let now = B_CLOCK.boundary(B_START).unwrap() + vos_anchor::MAX_ROOT_AGE_MS + 1;
+    w.at(now);
     w.anchor(
         by,
         b(),
@@ -49,7 +53,7 @@ pub(super) fn g4(fx: &Fixtures) -> Vector {
         Expect::Err(Error::WindowTooOld),
     );
     // Window 31's root exactly MaxRootAge old: taken.
-    let now = B_CLOCK.boundary(B_START + 1).unwrap() + w.constants().max_root_age_ms;
+    let now = B_CLOCK.boundary(B_START + 1).unwrap() + vos_anchor::MAX_ROOT_AGE_MS;
     w.at(now);
     let now_w = B_CLOCK.window(now).unwrap();
     assert_eq!(now_w, 176);
@@ -61,14 +65,6 @@ pub(super) fn g4(fx: &Fixtures) -> Vector {
         root(3),
         KEY_3,
         Expect::Err(Error::AlreadyAnchored),
-    );
-    w.anchor(
-        by,
-        b(),
-        B_START,
-        root(2),
-        KEY_3,
-        Expect::Err(Error::WindowNotAfterLast),
     );
     // The open window, then a later one.
     w.anchor(
@@ -92,6 +88,25 @@ pub(super) fn g4(fx: &Fixtures) -> Vector {
     w.at(B_CLOCK.boundary(now_w).unwrap());
     let outcome = w.anchor(by, b(), now_w, root(4), KEY_3, Expect::Ok);
     assert!(matches!(outcome.events[..], [Event::Anchored { window, .. }] if window == now_w));
+    // A stale window, closed and fresh but not past Last.
+    w.anchor(
+        by,
+        b(),
+        now_w - 1,
+        root(2),
+        KEY_3,
+        Expect::Err(Error::WindowNotAfterLast),
+    );
+    // Window 31 now past MaxRootAge: a second root there is aged, no
+    // evidence, though its first is still held.
+    w.anchor(
+        by,
+        b(),
+        B_START + 1,
+        root(7),
+        KEY_3,
+        Expect::Err(Error::WindowTooOld),
+    );
     let mut bad = w.anchor_arg(b(), now_w + 1, root(6), KEY_3);
     bad.signature[0] ^= 1;
     w.call(
@@ -122,7 +137,7 @@ pub(super) fn g4(fx: &Fixtures) -> Vector {
         KEY_3,
         Expect::Err(Error::UnknownSpace),
     );
-    // The venue's time before the space's origin.
+    // The venue's time before the space's origin: no window is closed.
     w.at(B_CLOCK.origin_ms - 1);
     w.anchor(
         by,
@@ -130,100 +145,109 @@ pub(super) fn g4(fx: &Fixtures) -> Vector {
         now_w + 1,
         root(6),
         KEY_3,
-        Expect::Err(Error::BadClock),
+        Expect::Err(Error::WindowInFuture),
     );
     w.finish(
         "G4",
-        "anchor refusals: before the space's start (OutOfRange), older than MaxRootAge \
-         (WindowTooOld), exactly MaxRootAge old taken, the same root again (AlreadyAnchored), a stale w ≤ Last \
-         (WindowNotAfterLast), the open window now_w and a later one (WindowInFuture), then \
-         now_ms at B_w and the same anchor resubmitted (Anchored); a bad signature \
-         (BadAnchorSignature), kind 1 (BadKind), an unlisted key (UnknownAnchorKey), an unknown \
-         space (UnknownSpace), now_ms before the origin (BadClock)",
+        "anchor refusals: before the space's first window (WindowNotAfterLast), older than \
+         MaxRootAge (WindowTooOld), exactly MaxRootAge old taken, the same root again \
+         (AlreadyAnchored), the open window now_w and a later one (WindowInFuture), then now_ms \
+         at B_w and the same anchor resubmitted (Anchored); a stale w ≤ Last (WindowNotAfterLast); \
+         a second root at a held window past MaxRootAge (WindowTooOld: no evidence, the space \
+         active); a bad signature (BadAnchorSignature), kind 1 (BadKind), an unlisted key \
+         (UnknownAnchorKey), an unknown space (UnknownSpace), now_ms before the origin \
+         (WindowInFuture)",
     )
 }
 
 pub(super) fn g5(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);
     w.with_b(AUTHORITY_1, KEY_3);
+    w.anchor(AUTHORITY_1, b(), 34, root(0x34), KEY_3, Expect::Ok);
     w.begin();
-    let resume = Call::Resume { space: b() };
-    // One key signs two roots of window 35.
-    w.anchor(AUTHORITY_1, b(), 35, root(0x0a), KEY_1, Expect::Ok);
-    let outcome = w.anchor(STRANGER, b(), 35, root(0x0b), KEY_1, Expect::Ok);
+    let sovereign = w.constants().sovereign(&b());
+    let deposit = w.constants().registration_deposit;
+    assert_eq!(w.chain.account(&sovereign).held_registration, deposit);
+    // A founding key anchors window 35; the authority's key signs another
+    // root of it, its node's anchor sent as the evidence: the failover
+    // case, two keys.
+    w.anchor(STRANGER, b(), 35, root(0x0a), KEY_2, Expect::Ok);
+    let outcome = w.anchor(AUTHORITY_1, b(), 35, root(0x0b), KEY_3, Expect::Ok);
     assert!(matches!(
         outcome.events[..],
-        [Event::Equivocated { first_signer, second_signer, .. }, Event::SpaceSuspended { .. }]
-            if first_signer == public(KEY_1) && second_signer == public(KEY_1)
+        [Event::Equivocated { first_signer, second_signer, .. }, Event::SpaceEnded { .. }]
+            if first_signer == public(KEY_2) && second_signer == public(KEY_3)
     ));
+    let info = w.chain.space(&b()).unwrap();
+    assert_eq!(info.status, SpaceStatus::Ended);
+    let account = w.chain.account(&sovereign);
+    assert_eq!(account.held_registration, 0, "the deposit released");
+    // No anchor taken, the evidence's included, and no root counted: a
+    // statement over the window before, held, refused 5.
     w.anchor(
         AUTHORITY_1,
         b(),
         36,
         root(0x0c),
-        KEY_2,
+        KEY_3,
         Expect::Err(Error::SpaceNotActive),
     );
-    w.controller(resume.clone(), Expect::Err(Error::StillEquivocating));
-    let remove_1 = Call::RemoveAnchorKey {
+    w.anchor(
+        STRANGER,
+        b(),
+        35,
+        root(0x0b),
+        KEY_3,
+        Expect::Err(Error::SpaceNotActive),
+    );
+    assert!(w.has(&keys::anchors(&b(), 0, 34)));
+    let over_34 = statement_of(fx, b(), 34, root(0x34));
+    w.refused(
+        over_34,
+        Vec::new(),
+        vos_statement::Refusal::Unanchored.code(),
+    );
+    // The tombstone: the registration replayed.
+    w.register(&b_genesis(), Expect::Err(Error::SpaceExists));
+    // The controller's `dispatch_as_sovereign`: the funds leave, the
+    // existential deposit kept.
+    let ed = w.constants().existential_deposit;
+    let transfer = RuntimeCall::Balances(BalancesCall::TransferKeepAlive {
+        dest: MultiAddress::Id(RECIPIENT),
+        value: account.free - ed,
+    });
+    let dispatch = Call::DispatchAsSovereign {
         space: b(),
-        key: public(KEY_1),
+        call: Box::new(transfer),
     };
-    w.controller(remove_1, Expect::Ok);
-    w.controller(resume.clone(), Expect::Ok);
-    assert!(!w.has(&keys::equivocations(&b(), 0, 35)));
-    // Two keys, the failover case.
-    w.anchor(AUTHORITY_1, b(), 37, root(0x0d), KEY_2, Expect::Ok);
-    let outcome = w.anchor(AUTHORITY_1, b(), 37, root(0x0e), KEY_3, Expect::Ok);
+    let outcome = w.controller(dispatch, Expect::Ok);
     assert!(matches!(
         outcome.events[..],
-        [Event::Equivocated { first_signer, second_signer, .. }, Event::SpaceSuspended { .. }]
-            if first_signer == public(KEY_2) && second_signer == public(KEY_3)
+        [Event::SovereignDispatched { result: Ok(()), .. }]
     ));
-    w.controller(resume.clone(), Expect::Err(Error::StillEquivocating));
-    let remove_2 = Call::RemoveAnchorKey {
-        space: b(),
-        key: public(KEY_2),
-    };
-    w.controller(remove_2, Expect::Ok);
-    w.controller(resume.clone(), Expect::Err(Error::StillEquivocating));
-    let remove_authority = Call::RemoveAuthority {
-        space: b(),
-        who: AUTHORITY_1,
-    };
-    w.controller(remove_authority, Expect::Ok);
-    w.controller(resume.clone(), Expect::Ok);
-    // Two fresh keys, the second signer's removed first: the first's still
-    // listed holds the suspension.
-    w.add_authority(AUTHORITY_2, Some(public(KEY_5)), Expect::Ok);
-    w.add_authority(AUTHORITY_3, Some(public(KEY_6)), Expect::Ok);
-    w.anchor(AUTHORITY_2, b(), 39, root(0x1a), KEY_5, Expect::Ok);
-    w.anchor(AUTHORITY_3, b(), 39, root(0x1b), KEY_6, Expect::Ok);
-    let remove = |who| Call::RemoveAuthority { space: b(), who };
-    w.controller(remove(AUTHORITY_3), Expect::Ok);
-    w.controller(resume.clone(), Expect::Err(Error::StillEquivocating));
-    w.controller(remove(AUTHORITY_2), Expect::Ok);
-    w.controller(resume, Expect::Ok);
+    assert_eq!(w.chain.account(&sovereign).free, ed);
     w.finish(
         "G5",
-        "equivocation by one key: Equivocated and SpaceSuspended, the space's anchors refused \
-         (SpaceNotActive), resume refused (StillEquivocating) until the key is removed; by two \
-         keys (the failover case): Evidence names both, resume refused until both are removed \
-         (the second with its authority); again with two fresh keys, the second signer's \
-         removed first, resume refused until the first's is too",
+        "an equivocation ends a space: a second root of a window held, signed by another listed \
+         key (the failover case: the honest node's anchor as the evidence), Equivocated naming \
+         both signers and SpaceEnded, the status Ended (index 3), the registration deposit \
+         released to the sovereign; then its anchors refused (SpaceNotActive), the evidence's \
+         too, and its roots unanchored (a statement over a window held refused 5); the \
+         registration replayed refused (SpaceExists: the space is never pruned); \
+         dispatch_as_sovereign still the controller's, the sovereign's funds leaving, the \
+         existential deposit kept",
     )
 }
 
-pub(super) fn g17(fx: &Fixtures) -> Vector {
+pub(super) fn g16(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);
     w.with_b(AUTHORITY_1, KEY_3);
     w.anchor_f();
-    w.accept(AUTHORITY_F, F, true);
-    w.accept(AUTHORITY_F, F, false);
+    w.accept(AUTHORITY_F, F);
     w.anchor(AUTHORITY_1, b(), 35, root(0x0a), KEY_3, Expect::Ok);
     w.anchor(AUTHORITY_1, b(), 35, root(0x0b), KEY_3, Expect::Ok);
     w.begin();
-    let newest = F_CLOCK.boundary(42).unwrap() + w.constants().max_root_age_ms;
+    let newest = F_CLOCK.boundary(42).unwrap() + vos_anchor::MAX_ROOT_AGE_MS;
     w.at(newest);
     w.on_idle();
     assert!(!w.has(&keys::anchors(&F, 0, 41)));
@@ -236,73 +260,13 @@ pub(super) fn g17(fx: &Fixtures) -> Vector {
     w.on_idle();
     assert!(!w.has(&keys::anchors(&F, 0, 42)));
     assert!(!w.has(&keys::seen(&fx.statement().id().0)));
-    assert!(w.has(&keys::seen(&fx.rootless.statement.id().0)));
     assert!(w.has(&keys::last(&F, 0)));
     assert!(w.has(&keys::equivocations(&b(), 0, 35)));
+    assert!(w.has(&keys::spaces(&b())), "an ended space's record");
     w.finish(
-        "G17",
+        "G16",
         "on_idle: at B_w + MaxRootAge of F's newest root, only older anchors pruned; one ms \
-         later its anchor and the rooted Seen entry pruned, the rootless entry kept, Last and \
-         Equivocations kept",
-    )
-}
-
-pub(super) fn g19(fx: &Fixtures) -> Vector {
-    let mut w = World::new(fx, false);
-    w.anchor_f();
-    let add = |who, seed| Call::AddAuthority {
-        space: F,
-        who,
-        anchor_key: Some(public(seed)),
-    };
-    w.controller(add(AUTHORITY_1, KEY_1), Expect::Ok);
-    w.begin();
-    let disputed = fx.statement().roots[0];
-    let window = disputed.window;
-    // A second listed key signs another root of a window held.
-    let outcome = w.anchor(AUTHORITY_1, F, window, root(0x0b), KEY_1, Expect::Ok);
-    assert!(matches!(
-        outcome.events[..],
-        [Event::Equivocated { first, second, .. }, Event::SpaceSuspended { .. }]
-            if first == disputed.root && second == root(0x0b)
-    ));
-    assert!(!w.has(&keys::anchors(&F, 0, window)), "the disputed root");
-    // Both signers removed, a fresh key listed, the space resumed.
-    let remove = |who| Call::RemoveAuthority { space: F, who };
-    w.controller(remove(AUTHORITY_1), Expect::Ok);
-    w.controller(remove(AUTHORITY_F), Expect::Ok);
-    w.controller(add(AUTHORITY_2, KEY_5), Expect::Ok);
-    w.controller(Call::Resume { space: F }, Expect::Ok);
-    // The statement over the disputed window's first root: unanchored.
-    let statement = fx.statement().encode();
-    w.refused_by(
-        AUTHORITY_2,
-        statement,
-        fx.proof.clone(),
-        vos_statement::Refusal::Unanchored.code(),
-    );
-    // Neither root is anchored at the window again.
-    for again in [disputed.root, root(0x0b)] {
-        w.anchor(
-            AUTHORITY_2,
-            F,
-            window,
-            again,
-            KEY_5,
-            Expect::Err(Error::WindowNotAfterLast),
-        );
-    }
-    // The space anchors on from the window after its last.
-    let next = 43;
-    w.at(F_CLOCK.boundary(next).unwrap());
-    let outcome = w.anchor(AUTHORITY_2, F, next, root(0x43), KEY_5, Expect::Ok);
-    assert!(matches!(outcome.events[..], [Event::Anchored { .. }]));
-    w.finish(
-        "G19",
-        "after resume, a disputed window stays unusable: a second root of F's window held \
-         (Equivocated, SpaceSuspended) drops the window's anchor; both signers removed, a fresh \
-         key listed, resumed; the statement over the window's first root refused 5 \
-         (Unanchored), either root anchored again refused (WindowNotAfterLast); the next \
-         window anchored",
+         later its anchor and the Seen entry pruned; Last, Equivocations and an ended space's \
+         record kept",
     )
 }

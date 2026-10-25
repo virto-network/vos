@@ -18,7 +18,7 @@
 use std::path::Path;
 
 use vos_anchor::vectors;
-use vos_anchor::{Anchor, Migrate, RootKind, VenueId};
+use vos_anchor::{Anchor, RootKind};
 use vos_statement::fixtures;
 
 /// `format::MASKED_WRAP`'s header in its fixed layout: the format and ten
@@ -95,13 +95,6 @@ fn main() {
             signature: [0x5a; 64],
         };
         write("anchor_decode", &format!("anchor-{at}"), &anchor.encode());
-        let migrate = Migrate {
-            space: digests.space,
-            from: vector.venue,
-            to: VenueId::jam(&vector.jam_genesis, vector.service),
-            from_window: vector.window,
-        };
-        write("anchor_decode", &format!("migrate-{at}"), &migrate.encode());
     }
     println!("{} fixtures seeded under {}", all.len(), corpus.display());
 }

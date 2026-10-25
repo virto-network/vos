@@ -2573,6 +2573,8 @@ name = "vos-anchor"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "curve25519-dalek",
+ "ed25519-dalek",
 ]
 
 [[package]]
@@ -2960,6 +2962,7 @@ name = "vos-statement-service"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "vos-anchor",
  "vos-pvm",
  "vos-pvm-compiler",
  "vos-statement",

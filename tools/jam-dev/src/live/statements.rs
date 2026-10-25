@@ -8,10 +8,9 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use vos_pvm_compiler::{ServiceMetadata, service_blob};
-use vos_statement::MAX_ROOT_AGE_MS;
 use vos_statement::vos_anchor::{RootKind, SpaceId};
 use vos_statement_service::MAX_ITEMS;
-use vos_statement_service::accumulate::BUCKET_MS;
+use vos_statement_service::accumulate::{BUCKET_MS, OUTCOME_KEEP_MS};
 use vos_statement_service::config::{Config, configure};
 use vos_statement_service::state::{Outcome, SpaceRecord, keys, outcome_id};
 use vos_tree::Hash;
@@ -274,7 +273,7 @@ impl Statements {
         }
         for (space, record) in &spaces {
             let Some(last) = record.last else { continue };
-            for window in record.range.from..=last {
+            for window in record.start..=last {
                 found(&keys::anchor(space, RootKind::Space, window))?;
                 found(&keys::evidence(space, RootKind::Space, window))?;
             }
@@ -285,7 +284,8 @@ impl Statements {
                 .and_then(|bucket| Some(u64::from_le_bytes(bucket.try_into().ok()?)))
                 .ok_or_else(|| failed("a cursor cut short"))?;
             let now = self.slot_time(slot);
-            let until = (now + MAX_ROOT_AGE_MS) / BUCKET_MS + 1;
+            // Every row is queued to drop within a day of its queueing.
+            let until = (now + OUTCOME_KEEP_MS) / BUCKET_MS + 1;
             for bucket in from..=until {
                 let Some(count) = found(&keys::bucket(bucket))? else {
                     continue;

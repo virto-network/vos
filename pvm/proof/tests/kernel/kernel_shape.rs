@@ -503,18 +503,5 @@ fn the_predicate_wraps() {
 
     let (bytes, words, _) = common::wrap_root("areas", &program, &root, &mut totals.wrap);
     totals.report("areas");
-    let input = common::judged_statement(
-        vos_statement::Statement {
-            format: vos_pvm_final_verifier::unmasked::FORMAT,
-            program: vos_statement::ProgramId(program.id().words()),
-            // Rootless: of no space.
-            space: vos_statement::SpaceId::NONE,
-            public_args: Vec::new(),
-            output: kernel.trace.output.clone(),
-            roots: Vec::new(),
-        },
-        &kernel.trace.io_hash,
-        &bytes,
-    );
-    common::write_wrap("predicate", &bytes, &words, &input);
+    common::verified_wrap("predicate", &bytes, &words);
 }

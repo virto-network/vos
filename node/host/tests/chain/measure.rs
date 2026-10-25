@@ -11,7 +11,7 @@ use vos_venue::kreivo::calls::{Call, RuntimeCall};
 use vos_venue::kreivo::mock::Origin;
 
 use crate::kreivo::{self, UNITS};
-use crate::run::{Run, Stated, accepted};
+use crate::run::{Run, Stated, Venue, accepted};
 use crate::support::delay;
 
 /// The gate's margin past `L + D + t_prove`.
@@ -31,7 +31,6 @@ pub fn all(run: &mut Run, stated: &[Stated], judged: &[(String, Judged)]) {
 fn latency(run: &mut Run, stated: &[Stated]) {
     let (l, d) = (run.clock.length_ms, delay(&run.clock));
     let proved = run.prover.proved();
-    let (kreivo, jam) = (run.kreivo_judged(), run.jam_a.recorded.judged());
     run.record.note(format!(
         "latency from B_w to acceptance (L {} s, D {} s), against the gate L + D + t_prove + \
          30 s:",
@@ -39,14 +38,17 @@ fn latency(run: &mut Run, stated: &[Stated]) {
         d / 1_000
     ));
     let mut references = Vec::new();
+    let (kreivo, jam) = (run.judged_at(Venue::Kreivo), run.judged_at(Venue::Jam));
     for Stated {
-        asked, statement, ..
+        venue,
+        asked,
+        statement,
+        ..
     } in stated
     {
-        let (venue, judged) = if asked.window < run.k {
-            ("Kreivo", &kreivo)
-        } else {
-            ("JAM", &jam)
+        let judged = match venue {
+            Venue::Kreivo => &kreivo,
+            Venue::Jam => &jam,
         };
         let judgement = accepted(judged, statement).expect("accepted");
         let proof = proved
@@ -59,7 +61,7 @@ fn latency(run: &mut Run, stated: &[Stated]) {
         let gate = l + d + t_prove + MARGIN_MS;
         references.push(l / 2 + d + t_prove + inclusion);
         run.record.note(format!(
-            "  {venue}, window {}, {}: {:.1} s (t_prove {:.1} s, after its proof {:.1} s); \
+            "  {venue:?}, window {}, {}: {:.1} s (t_prove {:.1} s, after its proof {:.1} s); \
              gate {:.1} s",
             asked.window,
             asked.what,
@@ -70,7 +72,7 @@ fn latency(run: &mut Run, stated: &[Stated]) {
         ));
         assert!(
             latency <= gate,
-            "{venue}'s {} statement of window {}: {latency} ms past B_w, over {gate} ms",
+            "{venue:?}'s {} statement of window {}: {latency} ms past B_w, over {gate} ms",
             asked.what,
             asked.window
         );
@@ -107,7 +109,7 @@ fn gas(run: &mut Run, judged: &[(String, Judged)]) {
 /// fee, and the refused statement's deposit, asserted.
 fn fees(run: &mut Run) {
     let kreivo = &run.kreivo;
-    let account = kreivo.account(&kreivo.sovereign_of(&run.space));
+    let account = kreivo.account(&kreivo.sovereign_of(&run.at_kreivo.id));
     let (fee, deposit, budget) = kreivo.chain.with(|chain| {
         let constants = &chain.constants;
         (
@@ -138,7 +140,7 @@ fn fees(run: &mut Run) {
     run.record.note(format!(
         "Kreivo's sovereign account, funded {} UNITS: {anchors} anchors and {submits} submits by \
          the authorities, each a fee of {} UNITS; one deposit of {} UNITS forfeited (the \
-         statement refused); {} UNITS held for the registration, none for submits; charged {} \
+         JAM space's statement refused); {} UNITS held for the registration, none for submits; charged {} \
          UNITS in all; the budget {} UNITS a window; the clients' alerts {alerts:?}",
         units(kreivo::FUNDING),
         units(fee),

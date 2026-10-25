@@ -10,7 +10,7 @@ use vos_pvm::refine_host::{JamItem, JamRefine};
 use vos_statement::fixtures::{self, Fixture};
 use vos_statement::model::Policy;
 use vos_statement::vos_anchor::{SpaceId, VenueId};
-use vos_statement::{Pin, blake2b_256};
+use vos_statement::{ProgramId, blake2b_256};
 use vos_statement_service::config::{Config, configure};
 use vos_statement_service::item::Item;
 use vos_statement_service::state::{self, AnchorRecord, Outcome, SpaceRecord, Storage, keys};
@@ -19,10 +19,11 @@ use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
 
 use crate::jam;
 
-/// The JAM chain the fixtures' venues are services of
-/// (`VenueId::jam(&[0x4A; 32], 7)`, and 8 for another venue), timed from
-/// the Unix epoch as the fixtures' venues are.
+/// The JAM chain the fixtures' venues are services of, timed from the Unix
+/// epoch as the fixtures' venues are.
 pub(crate) const GENESIS: [u8; 32] = [0x4A; 32];
+/// The fixtures' venues' service.
+const FIXTURE_SERVICE: u32 = 7;
 /// Gray Paper 0.8.0's common era: a live chain's genesis time.
 pub(crate) const EPOCH_MS: u64 = 1_735_732_800_000;
 /// A package's refine gas: PolkaJam's testnet's.
@@ -87,6 +88,37 @@ impl Rig {
     /// The slot holding `time`, or the first after it.
     pub(crate) fn at(&mut self, time: u64) {
         self.slot = (time - self.config.genesis_ms).div_ceil(SLOT_MS);
+    }
+
+    /// The accumulate input of the item `payload`, with `extrinsics`, as
+    /// refine outputs it in a package of `package_hash`.
+    pub(crate) fn operand(
+        &self,
+        payload: &[u8],
+        extrinsics: Vec<Vec<u8>>,
+        package_hash: [u8; 32],
+    ) -> Vec<u8> {
+        let args = RefineArgs::new(u64::from(self.service), payload.to_vec(), package_hash);
+        let jam = JamRefine {
+            service: u64::from(self.service),
+            items: vec![JamItem {
+                payload: payload.to_vec(),
+                extrinsics,
+                ..JamItem::default()
+            }],
+            ..JamRefine::default()
+        };
+        let refined = jam::refine(&self.program, &args.encode(), jam, REFINE_GAS);
+        let operand = Operand {
+            package_hash,
+            segment_root: [0; 32],
+            authorizer: [0; 32],
+            payload_hash: blake2b_256(&[payload]),
+            gas_limit: ACCUMULATE_GAS,
+            result: Ok(refined.output),
+            auth_trace: Vec::new(),
+        };
+        AccumulateInput::Operand(operand).encode()
     }
 
     /// A work package of `items`, each a payload and its extrinsics, refined
@@ -182,10 +214,9 @@ impl Rig {
                 clock: space.clock,
                 controller: [0; 32],
                 keys: Vec::new(),
-                range: space.range,
+                start: 0,
                 last: None,
-                suspended: false,
-                equivocators: Vec::new(),
+                ended: false,
                 nonce: 0,
             };
             self.storage
@@ -207,7 +238,7 @@ impl Rig {
 }
 
 /// The fixtures' configuration, pinning `pins`.
-fn fixture_config(pins: Vec<Pin>) -> Config {
+fn fixture_config(pins: Vec<ProgramId>) -> Config {
     Config {
         genesis: GENESIS,
         genesis_ms: 0,
@@ -226,19 +257,10 @@ pub(crate) fn fixture(name: &str) -> Fixture {
         .unwrap_or_else(|| panic!("the fixture {name:?}"))
 }
 
-/// A rig of `fixture`'s venue: its pin, its state, its time, the service
-/// whose venue it names.
+/// A rig of `fixture`'s venue: its pinned program, its state, its time.
 pub(crate) fn fixture_rig(fixture: &Fixture) -> Rig {
-    fixture_rig_pinning(fixture, vec![fixture.input.pin])
-}
-
-/// A rig of `fixture`'s venue pinning `pins`.
-pub(crate) fn fixture_rig_pinning(fixture: &Fixture, pins: Vec<Pin>) -> Rig {
     let policy = &fixture.input.policy;
-    let service = (0..=u16::MAX as u32)
-        .find(|&service| VenueId::jam(&GENESIS, service) == policy.venue)
-        .expect("a JAM venue's id");
-    let mut rig = Rig::new(fixture_config(pins), service);
+    let mut rig = Rig::new(fixture_config(vec![fixture.input.program]), FIXTURE_SERVICE);
     rig.hold(policy);
     rig.at(policy.now_ms);
     rig

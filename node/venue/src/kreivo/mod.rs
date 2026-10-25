@@ -4,7 +4,7 @@
 //! send a call, follow it to inclusion, read events and raw storage); and
 //! `mock`, a plain-Rust model of the pallet (feature `kreivo-mock`, and this
 //! crate's tests), the chain the client's tests run against, and the
-//! conformance vectors G1–G19 it generates, which Kreivo's pallet must
+//! conformance vectors G1–G17 it generates, which Kreivo's pallet must
 //! pass. The transport over a live Kreivo node is not here: it implements
 //! [`Transport`] (`spaces-pallet.md`, the node-side client).
 

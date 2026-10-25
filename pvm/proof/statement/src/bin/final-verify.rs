@@ -15,12 +15,12 @@
 //!   - 0: the proof's format (a little-endian `u32`, one this build links:
 //!     `vos_pvm_final_verifier::LINKED`) and the 24 public words (each a
 //!     little-endian `u32`), which the proof is verified against;
-//!   - 1: a judgement's input (`vos_statement::model::Input`): what the
-//!     venue pinned (the program id, venue-bound or not), its state (its
-//!     id, its time, its formats, spaces, anchors and `Seen` entries) and
-//!     the statement. The pin and the state come in the payload only for
-//!     the test harness; a real service reads them from its own state,
-//!     never from what a work item carries;
+//!   - 1: a judgement's input (`vos_statement::model::Input`): the program
+//!     id the venue pinned, its state (its time, its formats, spaces,
+//!     anchors and `Seen` entries) and the statement. The program id and
+//!     the state come in the payload only for the test harness; a real
+//!     service reads them from its own state, never from what a work item
+//!     carries;
 //!
 //!   then the proof's Blake2b-256 hash and its length (`u32`,
 //!   little-endian);

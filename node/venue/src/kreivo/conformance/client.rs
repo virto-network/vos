@@ -1,4 +1,4 @@
-//! G1–G19 through the node's client: each vector's calls decoded and
+//! G1–G17 through the node's client: each vector's calls decoded and
 //! encoded again by the client's own types ([`calls`]), sent by its
 //! [`Sender`] through the transport over the mock, and what came back read
 //! by the client: the result from its decode of the dispatch error, the
@@ -145,7 +145,6 @@ fn means(transport: &dyn Transport, call: &Call, events: &[Event], now_ms: u64, 
         Call::Register {
             genesis,
             controller,
-            start_window,
             ..
         } => {
             let genesis = SpaceGenesis::decode(genesis).expect("a registered genesis");
@@ -156,9 +155,9 @@ fn means(transport: &dyn Transport, call: &Call, events: &[Event], now_ms: u64, 
             assert_eq!(info.controller, *controller, "{at}: the controller");
             assert_eq!(info.origin_ms, genesis.clock.origin_ms, "{at}: the origin");
             assert_eq!(info.length_ms, genesis.clock.length_ms, "{at}: the length");
-            assert_eq!(info.start_window, *start_window, "{at}: the start");
+            let start = genesis.clock.window(now_ms).map_or(0, |open| open + 1);
+            assert_eq!(info.start_window, start, "{at}: the venue's next window");
             assert_eq!(info.registered_ms, now_ms, "{at}: registered at");
-            assert_eq!(info.end_window, None, "{at}");
             assert!(
                 events.contains(&Event::SpaceRegistered {
                     space: space.0,
@@ -166,7 +165,7 @@ fn means(transport: &dyn Transport, call: &Call, events: &[Event], now_ms: u64, 
                     controller: *controller,
                     origin_ms: genesis.clock.origin_ms,
                     length_ms: genesis.clock.length_ms,
-                    start_window: *start_window,
+                    start_window: start,
                 }),
                 "{at}: SpaceRegistered"
             );

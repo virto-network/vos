@@ -208,6 +208,10 @@ impl Storage for Service {
             trap();
         }
     }
+
+    fn corrupt(&mut self, _: &[u8]) -> ! {
+        trap()
+    }
 }
 
 /// Stop the invocation with a panic: on accumulate, every write reverts.
@@ -268,16 +272,18 @@ unsafe extern "C" fn accumulate_main(args: *const u8, len: u64) -> Output {
     // SAFETY: see the function's contract.
     let args = unsafe { core::slice::from_raw_parts(args, len as usize) };
     let parsed = natural(args, 0).and_then(|(slot, at)| {
-        let (_, at) = natural(args, at)?;
+        let (service, at) = natural(args, at)?;
         let (count, _) = natural(args, at)?;
-        Some((slot, count))
+        Some((slot, u32::try_from(service).ok()?, count))
     });
-    if let Some((slot, count)) = parsed {
+    if let Some((slot, service, count)) = parsed {
         let operands: Vec<Operand> = (0..count)
             .filter_map(|index| fetch(INPUT, index))
             .filter_map(|input| Operand::decode_input(&input))
             .collect();
-        accumulate(&config(), slot, &operands, &mut Service);
+        let config = config();
+        let venue = venue(&config, service);
+        accumulate(&config, venue, slot, &operands, &mut Service);
     }
     let gas = start.saturating_sub(gas_left());
     Service.write(keys::GAS, Some(&gas.to_le_bytes()));

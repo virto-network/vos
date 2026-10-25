@@ -20,7 +20,7 @@ use std::path::Path;
 
 use arbitrary::{Arbitrary, Unstructured};
 use vos_anchor::vectors::Vector;
-use vos_anchor::{Anchor, Migrate, SpaceGenesis};
+use vos_anchor::{Anchor, SpaceGenesis};
 use vos_pvm_final_verifier::{masked, Error, LINKED};
 use vos_statement::model::judge_bytes;
 
@@ -111,7 +111,6 @@ fn paths(target: &str, bytes: &[u8]) -> Vec<String> {
         "anchor_decode" => vec![
             decoded("genesis", SpaceGenesis::decode(bytes)),
             decoded("anchor", Anchor::decode(bytes)),
-            decoded("migrate", Migrate::decode(bytes)),
             decoded("vector", Vector::decode(bytes)),
         ],
         _ => vec!["a program".into()],

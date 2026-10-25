@@ -1,160 +1,156 @@
-//! The model venue's anchor rule and its judgement before the proof.
+//! The model venue under the venue rules' suite, and its judgement of a
+//! statement against its anchors.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use ed25519_dalek::{Signer, SigningKey};
-use vos_anchor::{MAX_ROOT_AGE_MS, MIN_LENGTH_MS, RootKind};
+use vos_anchor::suite::{self, Answer, Harness};
+use vos_anchor::venue::{RegisterRefusal, Status as Standing};
+use vos_anchor::{MIN_LENGTH_MS, RootKind};
 
 use super::*;
 
 const VENUE: VenueId = VenueId([0x7e; 32]);
 
-/// A venue at a time a test moves, a space of two founding keys
-/// registered from window 2, and the keys.
-struct Fixture {
-    venue: ModelVenue,
+/// The model venue at a time a test moves.
+pub(crate) struct Model {
+    pub(crate) venue: ModelVenue,
     now: Arc<AtomicU64>,
-    space: SpaceId,
-    clock: WindowClock,
-    keys: [SigningKey; 2],
 }
 
-fn fixture() -> Fixture {
-    let keys = [
-        SigningKey::from_bytes(&[1; 32]),
-        SigningKey::from_bytes(&[2; 32]),
-    ];
+impl Model {
+    pub(crate) fn new() -> Self {
+        let now = Arc::new(AtomicU64::new(0));
+        let read = Arc::clone(&now);
+        let venue = ModelVenue::new(VENUE, Arc::new(move || read.load(Ordering::SeqCst)));
+        Self { venue, now }
+    }
+}
+
+/// Test key `seed`.
+pub(crate) fn key(seed: u8) -> SigningKey {
+    SigningKey::from_bytes(&[seed; 32])
+}
+
+impl Harness for Model {
+    fn venue(&self) -> VenueId {
+        VENUE
+    }
+
+    fn set_now(&mut self, now: u64) {
+        self.now.store(now, Ordering::SeqCst);
+    }
+
+    fn key(&self, seed: u8) -> [u8; 32] {
+        key(seed).verifying_key().to_bytes()
+    }
+
+    fn sign(&self, seed: u8, digest: &[u8; 32]) -> [u8; 64] {
+        key(seed).sign(digest).to_bytes()
+    }
+
+    fn controller(&self) -> [u8; 32] {
+        [0xc0; 32]
+    }
+
+    fn register(
+        &mut self,
+        genesis: &SpaceGenesis,
+        controller: &[u8; 32],
+        founder_key: [u8; 32],
+        signature: [u8; 64],
+    ) -> Result<(), RegisterRefusal> {
+        self.venue
+            .register(genesis, controller, &founder_key, &signature)
+            .map(|_| ())
+    }
+
+    fn start(&self, space: &SpaceId) -> Option<u64> {
+        self.venue.start(space)
+    }
+
+    fn anchor(&mut self, anchor: &Anchor) -> Answer {
+        use vos_anchor::venue::AnchorRefusal as Rule;
+        match self.venue.anchor(anchor) {
+            Ok(Anchored::New) => Answer::New,
+            Ok(Anchored::Again) => Answer::Again,
+            Err(AnchorRefusal::Equivocation) => Answer::Evidence,
+            Err(refusal) => Answer::Refused(match refusal {
+                AnchorRefusal::Unregistered => Rule::Unregistered,
+                AnchorRefusal::Stopped => Rule::Stopped,
+                AnchorRefusal::Key => Rule::Key,
+                AnchorRefusal::Signature => Rule::Signature,
+                AnchorRefusal::Window => Rule::Window,
+                AnchorRefusal::Open => Rule::Open,
+                AnchorRefusal::Age => Rule::Age,
+                other => panic!("{other:?}"),
+            }),
+            Ok(other) => panic!("{other:?}"),
+        }
+    }
+
+    fn add_key(&mut self, space: &SpaceId, key: [u8; 32]) -> bool {
+        self.venue.add_anchor_key(space, key)
+    }
+
+    fn remove_key(&mut self, space: &SpaceId, key: [u8; 32]) -> bool {
+        self.venue.remove_anchor_key(space, &key)
+    }
+
+    fn status(&self, space: &SpaceId) -> Option<Standing> {
+        match self.venue.status(space) {
+            Status::Unregistered => None,
+            Status::Active => Some(Standing::Active),
+            Status::Blocked => Some(Standing::Blocked),
+            Status::Ended => Some(Standing::Ended),
+        }
+    }
+
+    fn anchored(&self, root: &RootRead) -> bool {
+        self.venue.anchored(root)
+    }
+}
+
+/// The model venue judges as the venue rules do.
+#[test]
+fn the_model_passes_the_venue_rules_suite() {
+    suite::run(Model::new);
+}
+
+/// The evidence an equivocation leaves: the anchor held and the other.
+#[test]
+fn an_equivocation_keeps_both_anchors() {
+    let mut model = Model::new();
     let clock = WindowClock {
         origin_ms: 1_000_000,
         length_ms: MIN_LENGTH_MS,
     };
     let genesis = SpaceGenesis {
         version: vos_anchor::GENESIS_VERSION,
-        nodes: vec![
-            (1, keys[0].verifying_key().to_bytes()),
-            (2, keys[1].verifying_key().to_bytes()),
-        ],
+        nodes: vec![(1, model.key(1)), (2, model.key(2))],
         clock,
         time: 7,
         nonce: [3; 16],
     };
-    let now = Arc::new(AtomicU64::new(clock.boundary(5).unwrap() + 10));
-    let read = Arc::clone(&now);
-    let venue = ModelVenue::new(VENUE, Arc::new(move || read.load(Ordering::SeqCst)));
-    let space = venue.register(&genesis, 2);
-    Fixture {
-        venue,
-        now,
-        space,
-        clock,
-        keys,
-    }
-}
-
-impl Fixture {
-    /// `root` as the space's at `window`, signed by key `by`.
-    fn anchor(&self, window: u64, root: u8, by: usize) -> Anchor {
+    let space = model.venue.seed(&genesis, 0);
+    model.set_now(clock.boundary(5).unwrap());
+    let signed = |seed: u8, root: u8| {
         let mut anchor = Anchor {
-            space: self.space,
-            window,
+            space,
+            window: 3,
             kind: RootKind::Space,
             root: [root; 32],
-            signer: self.keys[by].verifying_key().to_bytes(),
+            signer: model.key(seed),
             signature: [0; 64],
         };
-        anchor.signature = self.keys[by].sign(&anchor.digest(&VENUE)).to_bytes();
+        anchor.signature = model.sign(seed, &anchor.digest(&VENUE));
         anchor
-    }
-
-    fn read(&self, window: u64, root: u8) -> RootRead {
-        RootRead {
-            kind: RootKind::Space,
-            space: self.space,
-            window,
-            root: [root; 32],
-        }
-    }
-}
-
-/// An anchor past the last and before the open window is taken, by either
-/// founding key, and again as `Again`; the windows it may not take: one at
-/// or before the last, one before the start, and, until its boundary
-/// passes, the open one; another
-/// signer, a signature over another venue's digest, an unregistered space.
-#[test]
-fn the_anchor_rule() {
-    let f = fixture();
-    assert_eq!(f.venue.anchor(&f.anchor(3, 1, 0)), Ok(Anchored::New));
-    assert!(f.venue.anchored(&f.read(3, 1)));
-    assert_eq!(f.venue.anchor(&f.anchor(3, 1, 1)), Ok(Anchored::Again));
-    assert_eq!(f.venue.anchor(&f.anchor(5, 1, 1)), Ok(Anchored::New));
-    for window in [4, 1] {
-        assert_eq!(
-            f.venue.anchor(&f.anchor(window, 1, 0)),
-            Err(AnchorRefusal::Window),
-            "window {window}"
-        );
-    }
-    assert_eq!(f.venue.anchor(&f.anchor(6, 1, 0)), Err(AnchorRefusal::Open));
-    f.now
-        .store(f.clock.boundary(6).unwrap() + 1, Ordering::SeqCst);
-    assert_eq!(
-        f.venue.anchor(&f.anchor(6, 1, 0)),
-        Ok(Anchored::New),
-        "once past"
-    );
-    let mut stranger = f.anchor(5, 2, 0);
-    let other = SigningKey::from_bytes(&[9; 32]);
-    stranger.signer = other.verifying_key().to_bytes();
-    stranger.signature = other.sign(&stranger.digest(&VENUE)).to_bytes();
-    assert_eq!(f.venue.anchor(&stranger), Err(AnchorRefusal::Key));
-    let mut elsewhere = f.anchor(5, 2, 0);
-    elsewhere.signature = f.keys[0]
-        .sign(&elsewhere.digest(&VenueId([1; 32])))
-        .to_bytes();
-    assert_eq!(f.venue.anchor(&elsewhere), Err(AnchorRefusal::Signature));
-    let mut unknown = f.anchor(5, 2, 0);
-    unknown.space = SpaceId([8; 32]);
-    assert_eq!(f.venue.anchor(&unknown), Err(AnchorRefusal::Unregistered));
-}
-
-/// A root older than `MaxRootAge` is not anchored, and an anchored one
-/// stops being so once it is.
-#[test]
-fn a_root_past_its_age_is_refused() {
-    let f = fixture();
-    assert_eq!(f.venue.anchor(&f.anchor(4, 1, 0)), Ok(Anchored::New));
-    let past = f.clock.boundary(4).unwrap() + MAX_ROOT_AGE_MS + 3 * MIN_LENGTH_MS;
-    f.now.store(past, Ordering::SeqCst);
-    assert!(!f.venue.anchored(&f.read(4, 1)));
-    let late = f.clock.window(past).unwrap() - 1;
-    assert!(f.clock.boundary(late).unwrap() + MAX_ROOT_AGE_MS >= past);
-    let old = f.clock.window(past - MAX_ROOT_AGE_MS).unwrap() - 2;
-    assert_eq!(
-        f.venue.anchor(&f.anchor(old, 1, 0)),
-        Err(AnchorRefusal::Age)
-    );
-    assert_eq!(f.venue.anchor(&f.anchor(late, 1, 0)), Ok(Anchored::New));
-}
-
-/// A second root for an anchored window, signed by a founding key, is an
-/// equivocation: kept as evidence beside the first, the space suspended,
-/// its roots no longer anchored and its next anchors refused.
-#[test]
-fn an_equivocation_is_caught() {
-    let f = fixture();
-    let first = f.anchor(3, 1, 0);
-    assert_eq!(f.venue.anchor(&first), Ok(Anchored::New));
-    let second = f.anchor(3, 2, 1);
-    assert_eq!(f.venue.anchor(&second), Err(AnchorRefusal::Equivocation));
-    assert_eq!(f.venue.evidence(), [(first, second)]);
-    assert!(f.venue.suspended(&f.space));
-    assert!(!f.venue.anchored(&f.read(3, 1)));
-    assert_eq!(
-        f.venue.anchor(&f.anchor(4, 1, 0)),
-        Err(AnchorRefusal::Suspended)
-    );
-    assert!(f.venue.anchors(&f.space).is_empty(), "the disputed root");
+    };
+    let (held, other) = (signed(1, 1), signed(2, 2));
+    assert_eq!(model.venue.anchor(&held), Ok(Anchored::New));
+    assert_eq!(model.venue.anchor(&other), Err(AnchorRefusal::Equivocation));
+    assert_eq!(model.venue.evidence(), vec![(held, other)]);
+    assert_eq!(model.venue.status(&space), Status::Ended);
 }
 
 /// A statement is judged against the venue's anchors: a program it pinned
@@ -162,135 +158,55 @@ fn an_equivocation_is_caught() {
 /// passes every check before the proof, whose bytes are then judged.
 #[test]
 fn a_statement_is_judged_against_the_anchors() {
-    let f = fixture();
+    let mut model = Model::new();
+    let clock = WindowClock {
+        origin_ms: 1_000_000,
+        length_ms: MIN_LENGTH_MS,
+    };
+    let genesis = SpaceGenesis {
+        version: vos_anchor::GENESIS_VERSION,
+        nodes: vec![(1, model.key(1))],
+        clock,
+        time: 7,
+        nonce: [3; 16],
+    };
+    let space = model.venue.seed(&genesis, 0);
+    model.set_now(clock.boundary(5).unwrap());
     let program = ProgramId([5; 8]);
+    let root = RootRead {
+        kind: RootKind::Space,
+        space,
+        window: 3,
+        root: [1; 32],
+    };
     let statement = Statement {
         format: vos_statement::LINKED[0],
         program,
-        space: f.space,
+        space,
         public_args: vec![1],
         output: vec![2],
-        roots: vec![f.read(3, 1)],
+        roots: vec![root],
     };
     let code = |verdict: Result<StatementId, NotAccepted>| crate::code(&verdict);
-    assert_eq!(code(f.venue.submit(&statement, &[0])), 3, "not pinned");
-    f.venue.pin(Pin {
-        program,
-        venue_bound: false,
-    });
-    assert_eq!(code(f.venue.submit(&statement, &[0])), 5, "not anchored");
-    f.venue.anchor(&f.anchor(3, 1, 0)).unwrap();
+    assert_eq!(code(model.venue.submit(&statement, &[0])), 3, "not pinned");
+    model.venue.pin(program);
+    assert_eq!(
+        code(model.venue.submit(&statement, &[0])),
+        5,
+        "not anchored"
+    );
+    let mut anchor = Anchor {
+        space,
+        window: 3,
+        kind: RootKind::Space,
+        root: [1; 32],
+        signer: model.key(1),
+        signature: [0; 64],
+    };
+    anchor.signature = model.sign(1, &anchor.digest(&VENUE));
+    model.venue.anchor(&anchor).unwrap();
     assert!(
-        code(f.venue.submit(&statement, &[0])) >= 0x100,
+        code(model.venue.submit(&statement, &[0])) >= 0x100,
         "judged to the proof"
     );
-}
-
-/// A migration away ends the space's range: its anchors at or past the
-/// migration's window are refused, and its roots there are not anchored,
-/// those before still are. Refused: a migration from another venue, to
-/// this one, of a space not registered, from a window anchored here or
-/// before the venue's next, and a second one.
-#[test]
-fn a_migration_ends_the_range() {
-    let f = fixture();
-    assert_eq!(f.venue.anchor(&f.anchor(3, 1, 0)), Ok(Anchored::New));
-    assert_eq!(f.venue.anchor(&f.anchor(4, 1, 0)), Ok(Anchored::New));
-    // The venue's clock is in window 5: its next is 6.
-    let away = |from: VenueId, to: VenueId, space: SpaceId, from_window: u64| Migrate {
-        space,
-        from,
-        to,
-        from_window,
-    };
-    let there = VenueId([0x55; 32]);
-    for (migrate, refusal) in [
-        (
-            away(VenueId([1; 32]), there, f.space, 7),
-            MigrateRefusal::Venue,
-        ),
-        (away(VENUE, VENUE, f.space, 7), MigrateRefusal::Venue),
-        (
-            away(VENUE, there, SpaceId([8; 32]), 7),
-            MigrateRefusal::Unregistered,
-        ),
-        (away(VENUE, there, f.space, 4), MigrateRefusal::Window),
-        (away(VENUE, there, f.space, 5), MigrateRefusal::Window),
-    ] {
-        assert_eq!(f.venue.migrate(&migrate), Err(refusal), "{migrate:?}");
-    }
-    assert_eq!(f.venue.migrate(&away(VENUE, there, f.space, 7)), Ok(()));
-    assert_eq!(
-        f.venue.migrate(&away(VENUE, there, f.space, 8)),
-        Err(MigrateRefusal::AlreadyMigrated)
-    );
-    assert!(f.venue.anchored(&f.read(4, 1)));
-    f.now
-        .store(f.clock.boundary(7).unwrap() + 1, Ordering::SeqCst);
-    assert_eq!(f.venue.anchor(&f.anchor(6, 1, 0)), Ok(Anchored::New));
-    assert_eq!(
-        f.venue.anchor(&f.anchor(7, 1, 0)),
-        Err(AnchorRefusal::Window)
-    );
-    assert!(!f.venue.anchored(&f.read(7, 1)));
-}
-
-/// A space's anchor keys, added and removed: a key added anchors, a key
-/// removed no longer does, and the listing follows both.
-#[test]
-fn anchor_keys_are_added_and_removed() {
-    let f = fixture();
-    let founding = |by: usize| f.keys[by].verifying_key().to_bytes();
-    assert_eq!(f.venue.anchor_keys(&f.space), [founding(0), founding(1)]);
-    let added = SigningKey::from_bytes(&[9; 32]);
-    let key = added.verifying_key().to_bytes();
-    let mut anchor = f.anchor(3, 1, 0);
-    anchor.signer = key;
-    anchor.signature = added.sign(&anchor.digest(&VENUE)).to_bytes();
-    assert_eq!(f.venue.anchor(&anchor), Err(AnchorRefusal::Key));
-    assert!(f.venue.add_anchor_key(&f.space, key));
-    assert!(!f.venue.add_anchor_key(&f.space, key), "registered already");
-    assert_eq!(f.venue.anchor(&anchor), Ok(Anchored::New));
-    assert!(f.venue.remove_anchor_key(&f.space, &founding(0)));
-    assert!(!f.venue.remove_anchor_key(&f.space, &founding(0)));
-    assert_eq!(f.venue.anchor_keys(&f.space), [founding(1), key]);
-    assert_eq!(f.venue.anchor(&f.anchor(4, 1, 0)), Err(AnchorRefusal::Key));
-    assert!(f.venue.anchor_keys(&SpaceId([8; 32])).is_empty());
-    assert!(!f.venue.add_anchor_key(&SpaceId([8; 32]), key));
-}
-
-/// A suspended space resumes only once neither equivocating key is
-/// registered: its evidence cleared, it anchors again by another key from
-/// the next window, and the disputed window's roots never count again.
-#[test]
-fn a_suspended_space_resumes_without_its_equivocating_keys() {
-    let f = fixture();
-    let founding = |by: usize| f.keys[by].verifying_key().to_bytes();
-    f.venue.anchor(&f.anchor(3, 1, 0)).unwrap();
-    assert_eq!(
-        f.venue.anchor(&f.anchor(3, 2, 1)),
-        Err(AnchorRefusal::Equivocation)
-    );
-    assert!(f.venue.remove_anchor_key(&f.space, &founding(0)));
-    assert!(!f.venue.resume(&f.space), "the second signer is registered");
-    assert!(f.venue.suspended(&f.space));
-    let rotated = SigningKey::from_bytes(&[9; 32]);
-    assert!(
-        f.venue
-            .add_anchor_key(&f.space, rotated.verifying_key().to_bytes())
-    );
-    assert!(f.venue.remove_anchor_key(&f.space, &founding(1)));
-    assert!(f.venue.resume(&f.space));
-    assert!(!f.venue.suspended(&f.space));
-    assert!(f.venue.evidence().is_empty());
-    let mut anchor = f.anchor(4, 1, 0);
-    anchor.signer = rotated.verifying_key().to_bytes();
-    anchor.signature = rotated.sign(&anchor.digest(&VENUE)).to_bytes();
-    assert_eq!(f.venue.anchor(&anchor), Ok(Anchored::New));
-    assert!(!f.venue.anchored(&f.read(3, 1)), "the first root disputed");
-    assert!(!f.venue.anchored(&f.read(3, 2)), "the second root disputed");
-    let mut again = f.anchor(3, 1, 0);
-    again.signer = rotated.verifying_key().to_bytes();
-    again.signature = rotated.sign(&again.digest(&VENUE)).to_bytes();
-    assert_eq!(f.venue.anchor(&again), Err(AnchorRefusal::Window));
 }

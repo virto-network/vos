@@ -85,6 +85,12 @@ inventories].
   migration; `spaces-pallet.md` call 5, errors 24 and 28, vector G14.
 - **Safety:** better: the one cross-venue overlap pin D could not detect
   disappears.
+  *Erratum (the 7.1 review, `7.1-fable.md` M3):* only the migration's
+  overlap goes. A founder may still register the same genesis at two
+  venues, which neither sees: with the same roots a statement is accepted
+  and handled at both, with different roots the space forks unseen.
+  Registering at one venue is the space's discipline, as it was under
+  pin D.
 - **Recommendation [proposed]: take it.** A space that moves venues
   re-founds; a later slice adds migration back if a real space needs it,
   with the overlap problem solved then.

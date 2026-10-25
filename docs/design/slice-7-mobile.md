@@ -194,7 +194,10 @@ G–L are M4's and M5's.
   handle (pin K) and re-seeds its tree from the ended space's `member`
   digests, with no member action; its Clerk pairs reset.
 - **No migration** (C1): the Clerk's counterparties share a venue for good
-  [decided, S9].
+  [decided, S9]. Registering at one venue is the space's discipline, which
+  no venue enforces: a founder may register the same genesis at two, and
+  neither sees the other (with the same roots a statement is handled at
+  both; with different roots the space forks unseen).
 
 ### Pin G: the credential actor and its Poseidon2 tree
 

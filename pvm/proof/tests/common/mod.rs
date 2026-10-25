@@ -658,65 +658,29 @@ fn write_wrap_files(
     }
 }
 
-/// `statement`, the run's: its io-hash the run's `io_hash`, judged against
-/// the wrap `proof` by a test venue that pins its program, accepts format
-/// 28 and anchors its roots, natively and on the JAM-only host by the
-/// venue's test refine program (`final-verify-test.elf`, which links 28);
-/// the judgement's input.
-pub fn judged_statement(
-    statement: vos_statement::Statement,
-    io_hash: &[u8],
-    proof: &[u8],
-) -> vos_statement::model::Input {
-    assert_eq!(statement.io_hash()[..], io_hash[..]);
-    assert!(statement.roots.is_empty(), "a rootless statement");
-    let input = vos_statement::model::Input {
-        pin: vos_statement::Pin {
-            program: statement.program,
-            venue_bound: false,
-        },
-        policy: vos_statement::model::Policy::new(
-            vos_statement::VenueId([0; 32]),
-            0,
-            &[vos_pvm_final_verifier::unmasked::FORMAT],
-        ),
-        statement,
-    };
-    let id = input.judge(proof).expect("the venue accepts the statement");
-    assert_eq!(id, input.statement.id());
-    let (program, _) = jam::test_program();
-    let (gas, report) = jam::run(&program, &jam::judge_request(&input), proof);
-    let [start, lookup, _, end] = report.gas;
-    eprintln!(
-        "judged on the JAM-only host: {gas} gas ({:.1}M), lookup {}, the judgement {}; heap \
-         peak {} KiB; id {}",
-        gas as f64 / 1e6,
-        start - lookup,
-        lookup - end,
-        report.peak_live >> 10,
-        id.0.iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>(),
-    );
-    assert_eq!(report.verdict, jam::ACCEPT, "{}", report.error);
-    assert_eq!(report.code, 0);
-    assert_eq!(report.id, id.0);
-    assert!(gas <= 150_000_000, "{gas} gas");
-    input
-}
-
-/// A `format::WRAP` wrap's proof (postcard), its format, its public words and its
-/// judgement's input, under the target's tmp directory as
-/// `wrap/<name>.{proof,format,words,input}`, for the Wasm harness.
-pub fn write_wrap(
+/// A `format::WRAP` wrap's `proof`, verified against its public `words`
+/// natively and on the JAM-only host by the venue's test refine program
+/// (`final-verify-test.elf`, which links 28), and written under the
+/// target's tmp directory as `wrap/<name>.{proof,format,words}` for the
+/// Wasm harness.
+pub fn verified_wrap(
     name: &str,
     proof: &[u8],
     words: &[u32; vos_pvm_final_verifier::PUBLIC_WORDS],
-    input: &vos_statement::model::Input,
 ) {
-    write_wrap_files(name, vos_pvm_final_verifier::unmasked::FORMAT, proof, words);
-    let directory = std::path::Path::new(env!("CARGO_TARGET_TMPDIR")).join("wrap");
-    std::fs::write(directory.join(format!("{name}.input")), input.encode()).expect("writes");
+    let format = vos_pvm_final_verifier::unmasked::FORMAT;
+    vos_pvm_final_verifier::verify(format, &[format], proof, words)
+        .expect("the wrap verifies natively");
+    let (program, _) = jam::test_program();
+    let (gas, report) = jam::run(&program, &jam::words_request(format, words), proof);
+    eprintln!(
+        "verified on the JAM-only host: {gas} gas ({:.1}M); heap peak {} KiB",
+        gas as f64 / 1e6,
+        report.peak_live >> 10,
+    );
+    assert_eq!(report.verdict, jam::ACCEPT, "{}", report.error);
+    assert!(gas <= 150_000_000, "{gas} gas");
+    write_wrap_files(name, format, proof, words);
 }
 
 /// `instructions` as code, each one's start marked in the bitmask, with no

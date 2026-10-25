@@ -16,11 +16,11 @@ use vos_node::{Hooks, Node};
 use vos_statement_service::item::Item;
 use vos_venue::kreivo;
 use vos_venue::vos_statement::{Statement, StatementId};
-use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, VenueClient};
+use vos_venue::{AnchorRefusal, Anchored, NotAccepted, VenueClient};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::WorkResult;
-use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
+use vos_wire::vos_anchor::Anchor;
 use vos_wire::{Decode, Encode};
 
 use super::{Audit, Reach, lock};
@@ -72,11 +72,7 @@ impl Tapped {
     }
 }
 
-impl VenueClient for Tapped {
-    fn id(&self) -> VenueId {
-        self.inner.id()
-    }
-
+vos_venue::forward_venue!(Tapped => inner; forward [id, anchored, anchor_keys, status, time, unsettled] {
     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
         lock(&self.anchors).push(*anchor);
         self.inner.anchor(anchor)
@@ -86,27 +82,7 @@ impl VenueClient for Tapped {
         lock(&self.submitted).push((statement.clone(), proof.to_vec()));
         self.inner.submit(statement, proof)
     }
-
-    fn anchored(&self, root: &RootRead) -> bool {
-        self.inner.anchored(root)
-    }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        self.inner.anchor_keys(space)
-    }
-
-    fn status(&self, space: &SpaceId) -> Status {
-        self.inner.status(space)
-    }
-
-    fn time(&self) -> Option<u64> {
-        self.inner.time()
-    }
-
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.inner.unsettled(space)
-    }
-}
+});
 
 /// What a venue is sent for `anchor`, as each venue's client lays it out:
 /// Kreivo's call and the JAM statements service's work item.

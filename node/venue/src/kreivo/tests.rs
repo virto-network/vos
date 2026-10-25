@@ -1,11 +1,12 @@
-//! [`KreivoVenue`] over the mock: an anchor taken at once and sent in the
-//! background; an anchor over another root, read before it is taken or
-//! after, sent as the equivocation's evidence; an open window,
-//! `WindowInFuture`, a suspension and a pause sending nothing until they
-//! pass; the budget's refusal and a short
-//! sovereign account alerting; a lost answer and a dropped send never
-//! sending a call twice; statements judged through the client; every
-//! pallet error mapped; and the production build refusing Kreivo.
+//! The mock under the venue rules' suite, and an ended space's deposit and
+//! sovereign account; [`KreivoVenue`] over the mock: an anchor taken at
+//! once and sent in the background, the pallet judging it; an anchor over
+//! another root, sent before or after it is held, the equivocation's
+//! evidence, which ends the space; an open window sent again a block
+//! later; a block and a pause sending nothing until they pass; the
+//! budget's refusal and a short sovereign account alerting; a lost answer
+//! and a dropped send never sending a call twice; statements judged through
+//! the client; every pallet error mapped.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,12 +18,12 @@ use vos_anchor::{
     Anchor, MIN_LENGTH_MS, RootKind, RootRead, SpaceGenesis, SpaceId, VenueId, WindowClock,
 };
 
-use super::calls::{self, Call, Error, Event, Failure, PALLET, SpaceInfo, SpaceStatus, keys};
+use super::calls::{self, Call, Error, Event, PALLET, SpaceInfo, SpaceStatus, keys};
 use super::conformance::Fixtures;
 use super::conformance::submits::g7_chain;
 use super::conformance::world::{AUTHORITY_F, F};
 use super::mock::transport::{Fault, MockChain};
-use super::mock::{Account, Chain, Constants, Origin};
+use super::mock::{Account, Chain, Constants, Origin, Verdict};
 use super::send::{Answer, answer, judged};
 use super::transport::{Included, Lost, SendError, Sent, Signed, Transport};
 use super::{Alert, KreivoVenue, Options, Sender};
@@ -70,9 +71,9 @@ fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// A space of one founding key registered at the mock from window 2, the
-/// node its authority paired with that key, the chain's time at the
-/// boundary of window 5 (window 6 open).
+/// A space of one founding key registered at the mock at its clock's
+/// origin, so from window 1, the node its authority paired with that key,
+/// the chain's time then at the boundary of window 5 (window 6 open).
 struct Setup {
     chain: Arc<MockChain>,
     now: Arc<AtomicU64>,
@@ -100,7 +101,7 @@ impl Setup {
         for who in [OPERATOR, CONTROLLER, calls::sovereign(&space)] {
             chain.set_account(who, funded);
         }
-        let now = Arc::new(AtomicU64::new(CLOCK.boundary(5).unwrap() + 10));
+        let now = Arc::new(AtomicU64::new(CLOCK.origin_ms));
         let read = Arc::clone(&now);
         let clock = Arc::new(move || read.load(Ordering::SeqCst));
         let setup = Self {
@@ -109,13 +110,12 @@ impl Setup {
             space,
             key,
         };
-        let digest = vos_anchor::register_digest(&VENUE, &space, &CONTROLLER, 2);
+        let digest = vos_anchor::register_digest(&VENUE, &space, &CONTROLLER);
         setup.call(
             OPERATOR,
             Call::Register {
                 genesis: genesis.encode(),
                 controller: CONTROLLER,
-                start_window: 2,
                 founder_key: setup.key.verifying_key().to_bytes(),
                 founder_sig: setup.key.sign(&digest).to_bytes(),
             },
@@ -128,6 +128,7 @@ impl Setup {
                 anchor_key: Some(setup.key.verifying_key().to_bytes()),
             },
         );
+        setup.set_now(CLOCK.boundary(5).unwrap() + 10);
         setup
     }
 
@@ -183,8 +184,8 @@ impl Setup {
         })
     }
 
-    /// Set the space's status in the chain's storage, as an equivocation or
-    /// a resumption leaves it.
+    /// Set the space's status in the chain's storage, as governance or an
+    /// equivocation leaves it.
     fn set_status(&self, status: SpaceStatus) {
         self.chain.with(|chain| {
             let key = keys::spaces(&self.space.0);
@@ -196,8 +197,10 @@ impl Setup {
 }
 
 /// An anchor is taken at once while the chain takes its time, lands in
-/// the background, and is then held; its window again is `Again`, the
-/// open window `Open`.
+/// the background, and is then held. The client does not judge anchors:
+/// the same anchor again, and one of a window behind the last, are sent,
+/// and settled by the pallet's answers, `AlreadyAnchored` and
+/// `WindowNotAfterLast`, without an alert.
 #[test]
 fn an_anchor_is_taken_at_once_and_lands() {
     let setup = Setup::new(true);
@@ -226,14 +229,13 @@ fn an_anchor_is_taken_at_once_and_lands() {
         root: [2; 32],
         ..read
     }));
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Again));
-    assert_eq!(
-        venue.anchor(&setup.anchor(4, 1)),
-        Err(AnchorRefusal::Window),
-        "a window behind the last, never anchored"
-    );
-    assert_eq!(venue.anchor(&setup.anchor(6, 1)), Err(AnchorRefusal::Open));
-    assert_eq!(setup.anchors_sent(), 1);
+    setup.chain.set_latency(Duration::ZERO);
+    for window in [5, 4] {
+        assert_eq!(venue.anchor(&setup.anchor(window, 1)), Ok(Anchored::Queued));
+        wait_until("the queue empties", || venue.queued() == 0);
+    }
+    assert_eq!(setup.anchors_sent(), 3);
+    assert!(!setup.anchored_window(4), "a window behind the last");
     assert!(venue.alerts().is_empty(), "{:?}", venue.alerts());
 }
 
@@ -273,12 +275,11 @@ impl Setup {
     }
 
     /// The node's anchor of window 5 made the equivocation's evidence: the
-    /// space suspended, the evidence naming the attacker's key first and
-    /// the node's second, the window's root no longer held, the client
-    /// alerting.
+    /// space ended, the evidence naming the attacker's key first and the
+    /// node's second, neither root anchored, the client alerting.
     fn evidence_lands(&self, venue: &KreivoVenue, stolen: &SigningKey) {
-        wait_until("the evidence suspends the space", || {
-            venue.status(&self.space) == Status::Suspended
+        wait_until("the evidence ends the space", || {
+            venue.status(&self.space) == Status::Ended
         });
         let evidence = self.chain.with(|chain| {
             chain
@@ -291,7 +292,15 @@ impl Setup {
         assert_eq!(evidence.first_signer, stolen.verifying_key().to_bytes());
         assert_eq!(evidence.second_signer, self.key.verifying_key().to_bytes());
         assert_eq!((evidence.first, evidence.second), ([9; 32], [1; 32]));
-        assert!(!self.anchored_window(5), "the disputed root dropped");
+        for root in [[9; 32], [1; 32]] {
+            let read = RootRead {
+                kind: RootKind::Space,
+                space: self.space,
+                window: 5,
+                root,
+            };
+            assert!(!venue.anchored(&read), "an ended space's root");
+        }
         assert_eq!(self.anchors_sent(), 1);
         assert!(
             venue.alerts().contains(&Alert::Equivocation {
@@ -304,29 +313,25 @@ impl Setup {
     }
 }
 
-/// A listed key stolen anchors another root first, and the client has
-/// read it: the node's anchor is answered `Equivocation` at once and sent
-/// as the evidence, which suspends the space.
+/// A listed key stolen anchors another root first: the node's anchor is
+/// sent all the same, and the pallet keeps it as the evidence, which ends
+/// the space; its anchors are then refused.
 #[test]
 fn an_anchor_over_another_root_goes_as_evidence() {
     let setup = Setup::new(false);
     let stolen = setup.stolen();
     setup.chain.with(|chain| setup.attack(chain, &stolen));
     let venue = setup.venue();
-    assert_eq!(
-        venue.anchor(&setup.anchor(5, 1)),
-        Err(AnchorRefusal::Equivocation)
-    );
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
     setup.evidence_lands(&venue, &stolen);
     assert_eq!(
-        venue.anchor(&setup.anchor(5, 1)),
-        Err(AnchorRefusal::Suspended)
+        venue.anchor(&setup.anchor(6, 1)),
+        Err(AnchorRefusal::Stopped)
     );
 }
 
 /// A listed key stolen anchors another root after the node's anchor was
-/// queued, before it went: the queue's worker finds the venue holding the
-/// other root and sends the node's as the evidence.
+/// queued, before it went: the node's goes as the evidence.
 #[test]
 fn a_queued_anchor_overtaken_goes_as_evidence() {
     let setup = Setup::new(false);
@@ -346,10 +351,9 @@ fn a_queued_anchor_overtaken_goes_as_evidence() {
 }
 
 /// The node's anchor lands first and a stolen key equivocates: once the
-/// controller removes both keys and resumes the space, the disputed
-/// window is not anchored, though the client saw its root held.
+/// client reads the space ended, the root it saw held is not anchored.
 #[test]
-fn a_disputed_root_seen_held_is_not_anchored_after_resume() {
+fn a_root_seen_held_is_not_anchored_once_its_space_ends() {
     let setup = Setup::new(false);
     let stolen = setup.stolen();
     let venue = setup.venue();
@@ -368,38 +372,28 @@ fn a_disputed_root_seen_held_is_not_anchored_after_resume() {
     };
     other.signature = stolen.sign(&other.digest(&VENUE)).to_bytes();
     setup.call(ATTACKER, Call::anchor(&other));
-    wait_until("the suspension is read", || {
-        venue.status(&setup.space) == Status::Suspended
+    wait_until("the end is read", || {
+        venue.status(&setup.space) == Status::Ended
     });
-    for who in [ATTACKER, NODE] {
-        let space = setup.space.0;
-        setup.call(CONTROLLER, Call::RemoveAuthority { space, who });
-    }
-    setup.call(
-        CONTROLLER,
-        Call::Resume {
-            space: setup.space.0,
-        },
-    );
-    wait_until("the resumption is read", || {
-        venue.status(&setup.space) == Status::Active
-    });
-    assert!(!venue.anchored(&read), "the disputed root");
+    assert!(!venue.anchored(&read), "an ended space's root");
 }
 
-/// An anchor for the venue's open window is not taken; once the venue's
-/// time passes the window's boundary, it is, and lands.
+/// An anchor of the venue's open window is sent, refused
+/// `WindowInFuture`, kept, and sent again a block of the venue's time
+/// later: once the venue has closed the window, it lands.
 #[test]
-fn an_open_window_is_anchored_once_the_venue_closes_it() {
+fn an_open_window_is_sent_again_a_block_later() {
     let setup = Setup::new(true);
     let venue = setup.venue();
-    assert_eq!(venue.anchor(&setup.anchor(6, 1)), Err(AnchorRefusal::Open));
+    assert_eq!(venue.anchor(&setup.anchor(6, 1)), Ok(Anchored::Queued));
+    wait_until("refused once", || setup.anchors_sent() == 1);
+    read_again(&venue);
+    assert_eq!(setup.anchors_sent(), 1, "it waits a block");
+    assert_eq!(venue.queued(), 1, "it is kept");
     setup.set_now(CLOCK.boundary(6).unwrap() + 1);
-    wait_until("the venue's time is read again", || {
-        venue.anchor(&setup.anchor(6, 1)) == Ok(Anchored::Queued)
-    });
     wait_until("window 6 lands", || setup.anchored_window(6));
-    assert_eq!(setup.anchors_sent(), 1);
+    assert_eq!(setup.anchors_sent(), 2);
+    assert!(venue.alerts().is_empty(), "{:?}", venue.alerts());
 }
 
 /// A transport that forwards to `inner`: `on_sign` sees each nonce signed
@@ -442,66 +436,26 @@ impl Transport for Hooked {
     }
 }
 
-/// `WindowInFuture`: the anchor waits until the venue's time passes the
-/// window's boundary by a block, then goes again and lands; never
-/// skipped.
+/// A blocked or ended space is sent nothing: its anchors are refused at
+/// once, and an anchor queued before a block waits until it is active
+/// again.
 #[test]
-fn window_in_future_waits_a_block_and_sends_again() {
-    let setup = Setup::new(true);
-    // The chain's clock lags: the first anchor sent is refused
-    // `WindowInFuture` without reaching the chain.
-    let refused = Arc::new(AtomicUsize::new(0));
-    let sends = Arc::clone(&refused);
-    let lagging = Arc::new(Hooked {
-        inner: setup.chain.transport(Origin::Signed(NODE)),
-        on_sign: Box::new(|_| {}),
-        on_send: Box::new(move || {
-            (sends.fetch_add(1, Ordering::SeqCst) == 0).then(|| {
-                Ok(Included {
-                    block: 0,
-                    events: Vec::new(),
-                    failure: Some(
-                        Failure::Module {
-                            pallet: PALLET,
-                            error: Error::WindowInFuture as u8,
-                        }
-                        .encode(),
-                    ),
-                })
-            })
-        }),
-    });
-    let venue = setup.venue_over(lagging);
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
-    wait_until("the venue refuses it once", || {
-        refused.load(Ordering::SeqCst) == 1
-    });
-    read_again(&venue);
-    assert_eq!(refused.load(Ordering::SeqCst), 1, "it waits");
-    assert_eq!(venue.queued(), 1, "it is kept");
-    setup.set_now(CLOCK.boundary(5).unwrap() + 1_001);
-    wait_until("window 5 lands", || setup.anchored_window(5));
-    assert_eq!(refused.load(Ordering::SeqCst), 2);
-    assert!(venue.alerts().is_empty(), "{:?}", venue.alerts());
-}
-
-/// A suspended space is sent nothing: its anchors are refused at once,
-/// and an anchor queued before a block waits until it is active again.
-#[test]
-fn a_suspended_space_is_sent_nothing() {
+fn a_stopped_space_is_sent_nothing() {
     let setup = Setup::new(true);
     let venue = setup.venue();
-    setup.set_status(SpaceStatus::Suspended);
-    wait_until("the suspension is read", || {
-        venue.status(&setup.space) == Status::Suspended
-    });
-    assert!(venue.status(&setup.space).waits());
-    assert_eq!(
-        venue.anchor(&setup.anchor(5, 1)),
-        Err(AnchorRefusal::Suspended)
-    );
+    for status in [SpaceStatus::Ended, SpaceStatus::Blocked] {
+        setup.set_status(status);
+        wait_until("the status is read", || {
+            venue.status(&setup.space) == calls_status(status)
+        });
+        assert!(venue.status(&setup.space).waits());
+        assert_eq!(
+            venue.anchor(&setup.anchor(5, 1)),
+            Err(AnchorRefusal::Stopped)
+        );
+    }
     setup.set_status(SpaceStatus::Active);
-    wait_until("the resumption is read", || {
+    wait_until("the unblock is read", || {
         venue.status(&setup.space) == Status::Active
     });
     setup
@@ -585,7 +539,6 @@ fn the_budgets_refusal_raises_a_funding_alert() {
         chain.set_storage(keys::formats(39), active.encode());
         let info = calls::ProgramInfo {
             handler: calls::Handler::Record,
-            venue_bound: false,
             active,
         };
         chain.set_storage(keys::programs(&[5; 8]), info.encode());
@@ -860,12 +813,11 @@ fn a_refused_proof_reports_its_class() {
 #[test]
 fn every_error_and_refusal_is_mapped() {
     use Error::*;
-    for index in 0..=28 {
-        let error = Error::from_index(index).unwrap();
+    for error in (0..=u8::MAX).filter_map(Error::from_index) {
         let expected = match error {
             AlreadyAnchored | WindowNotAfterLast => Answer::Done,
             WindowInFuture => Answer::Later,
-            WindowTooOld | OutOfRange => Answer::Dead(error),
+            WindowTooOld => Answer::Dead(error),
             SpaceNotActive | Paused => Answer::Wait,
             InsufficientSovereignBalance | OverBudget => Answer::Funding(error),
             UnknownAnchorKey => Answer::Resign(error),
@@ -892,7 +844,7 @@ fn every_error_and_refusal_is_mapped() {
         judged(&[refused(Refusal::Repeated.code())], id),
         Some(Ok(id))
     );
-    for code in [1, 2, 3, 4, 5, 7, 0x101, 0x108] {
+    for code in [1, 2, 3, 4, 5, 0x101, 0x108] {
         assert_eq!(
             judged(&[refused(code)], id),
             Some(Err(NotAccepted::Refused(code)))
@@ -910,4 +862,196 @@ fn a_submits_bound_is_its_deposit_and_fee() {
         Options::default().per_submit,
         constants.submit_deposit + constants.fee_bound
     );
+}
+
+/// The client's status of the pallet's `status`.
+fn calls_status(status: SpaceStatus) -> Status {
+    status.into()
+}
+
+/// The mock driven by the venue rules' suite, through its calls: each
+/// error mapped back to the rules' refusal.
+struct Pallet {
+    chain: Chain,
+}
+
+impl Pallet {
+    fn new() -> Self {
+        let mut chain = Chain::new(Constants::kreivo(VENUE));
+        let funded = Account {
+            free: 100 * UNITS,
+            providers: 1,
+            ..Account::default()
+        };
+        chain.set_account(OPERATOR, funded);
+        chain.set_account(CONTROLLER, funded);
+        Self { chain }
+    }
+
+    /// `call` by `who`: Ok, its events; or its pallet error.
+    fn call(&mut self, who: [u8; 32], call: Call) -> Result<Vec<super::mock::types::Event>, Error> {
+        let outcome = self.chain.submit(Origin::Signed(who), &call.bytes());
+        match outcome.verdict {
+            Verdict::Ok => Ok(outcome.events),
+            Verdict::Err(super::mock::types::DispatchError::Module(module)) => {
+                Err(Error::from_index(module.error[0]).expect("a pallet error"))
+            }
+            other => panic!("{call:?}: {other:?}"),
+        }
+    }
+}
+
+impl vos_anchor::suite::Harness for Pallet {
+    fn venue(&self) -> VenueId {
+        VENUE
+    }
+
+    fn set_now(&mut self, now: u64) {
+        self.chain.set_now(now);
+    }
+
+    fn key(&self, seed: u8) -> [u8; 32] {
+        SigningKey::from_bytes(&[seed; 32])
+            .verifying_key()
+            .to_bytes()
+    }
+
+    fn sign(&self, seed: u8, digest: &[u8; 32]) -> [u8; 64] {
+        SigningKey::from_bytes(&[seed; 32]).sign(digest).to_bytes()
+    }
+
+    fn controller(&self) -> [u8; 32] {
+        CONTROLLER
+    }
+
+    fn register(
+        &mut self,
+        genesis: &SpaceGenesis,
+        controller: &[u8; 32],
+        founder_key: [u8; 32],
+        signature: [u8; 64],
+    ) -> Result<(), vos_anchor::venue::RegisterRefusal> {
+        use vos_anchor::venue::RegisterRefusal as Rule;
+        let sovereign = calls::sovereign(&vos_anchor::space_id(genesis));
+        if self.chain.account(&sovereign).free == 0 {
+            let funded = Account {
+                free: 10 * UNITS,
+                ..Account::default()
+            };
+            self.chain.set_account(sovereign, funded);
+        }
+        let register = Call::Register {
+            genesis: genesis.encode(),
+            controller: *controller,
+            founder_key,
+            founder_sig: signature,
+        };
+        self.call(OPERATOR, register)
+            .map(|_| ())
+            .map_err(|error| match error {
+                Error::BadGenesis => Rule::Genesis,
+                Error::BadClock => Rule::Clock,
+                Error::BadFounder => Rule::Founder,
+                Error::SpaceExists => Rule::Exists,
+                other => panic!("{other:?}"),
+            })
+    }
+
+    fn start(&self, space: &SpaceId) -> Option<u64> {
+        self.chain.space(&space.0).map(|info| info.start_window)
+    }
+
+    fn anchor(&mut self, anchor: &Anchor) -> vos_anchor::suite::Answer {
+        use vos_anchor::suite::Answer;
+        use vos_anchor::venue::AnchorRefusal as Rule;
+        match self.call(OPERATOR, Call::anchor(anchor)) {
+            Ok(events) => {
+                let ended = events
+                    .iter()
+                    .any(|event| matches!(event, super::mock::types::Event::SpaceEnded { .. }));
+                if ended { Answer::Evidence } else { Answer::New }
+            }
+            Err(Error::AlreadyAnchored) => Answer::Again,
+            Err(error) => Answer::Refused(match error {
+                Error::UnknownSpace => Rule::Unregistered,
+                Error::SpaceNotActive => Rule::Stopped,
+                Error::UnknownAnchorKey => Rule::Key,
+                Error::BadAnchorSignature => Rule::Signature,
+                Error::WindowNotAfterLast => Rule::Window,
+                Error::WindowInFuture => Rule::Open,
+                Error::WindowTooOld => Rule::Age,
+                other => panic!("{other:?}"),
+            }),
+        }
+    }
+
+    fn add_key(&mut self, space: &SpaceId, key: [u8; 32]) -> bool {
+        let add = Call::AddAuthority {
+            space: space.0,
+            who: key,
+            anchor_key: Some(key),
+        };
+        self.call(CONTROLLER, add).is_ok()
+    }
+
+    fn remove_key(&mut self, space: &SpaceId, key: [u8; 32]) -> bool {
+        let remove = Call::RemoveAuthority {
+            space: space.0,
+            who: key,
+        };
+        self.call(CONTROLLER, remove).is_ok()
+    }
+
+    fn status(&self, space: &SpaceId) -> Option<vos_anchor::venue::Status> {
+        self.chain.space(&space.0).map(|info| info.status.into())
+    }
+
+    fn anchored(&self, root: &RootRead) -> bool {
+        self.chain.anchored(root)
+    }
+}
+
+/// The mock judges as the venue rules do.
+#[test]
+fn the_mock_passes_the_venue_rules_suite() {
+    vos_anchor::suite::run(Pallet::new);
+}
+
+/// An equivocation ends a space at the mock: its status stored as
+/// `Ended`, index 3; its registration deposit released to its sovereign
+/// account, its existential deposit kept; its controller's
+/// `dispatch_as_sovereign` still callable, so the funds leave.
+#[test]
+fn an_ended_spaces_deposit_is_released_and_its_funds_leave() {
+    let setup = Setup::new(false);
+    let stolen = setup.stolen();
+    let sovereign = calls::sovereign(&setup.space);
+    let before = setup.chain.with(|chain| chain.account(&sovereign));
+    let deposit = Constants::kreivo(VENUE).registration_deposit;
+    assert_eq!(before.held_registration, deposit);
+    setup.chain.with(|chain| setup.attack(chain, &stolen));
+    setup.call(NODE, Call::anchor(&setup.anchor(5, 1)));
+    let (stored, after) = setup.chain.with(|chain| {
+        let info = chain.storage()[&keys::spaces(&setup.space.0)].clone();
+        (info, chain.account(&sovereign))
+    });
+    let info: SpaceInfo = calls::read(&stored).unwrap();
+    assert_eq!(info.status, SpaceStatus::Ended);
+    assert_eq!(SpaceStatus::Ended.encode(), [3]);
+    assert_eq!(after.held_registration, 0);
+    assert_eq!(after.free, before.free + deposit);
+
+    let ed = Constants::kreivo(VENUE).existential_deposit;
+    let transfer = calls::RuntimeCall::Balances(calls::BalancesCall::TransferKeepAlive {
+        dest: calls::MultiAddress::Id(OPERATOR),
+        value: after.free - ed,
+    });
+    setup.call(
+        CONTROLLER,
+        Call::DispatchAsSovereign {
+            space: setup.space.0,
+            call: Box::new(transfer),
+        },
+    );
+    assert_eq!(setup.chain.with(|chain| chain.account(&sovereign)).free, ed);
 }

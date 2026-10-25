@@ -1,7 +1,7 @@
 //! The space's agents and what the run asks of them: `balance`'s balances
 //! and `window`'s pair rows written, each read at a window's cut
 //! (`at_least_at_cut`, `settle_at_cut`), and the reader's two rootless
-//! statements (`attest_plain`: `stamped`, venue-bound, and `ordered`).
+//! statements (`attest_plain`: `stamped`, naming a venue, and `ordered`).
 //!
 //! Every value the run writes is high in entropy, so a carrier holding one
 //! is found: the accounts and their balances past 2^40, the pairs' peers
@@ -317,8 +317,8 @@ impl Agents {
         }
     }
 
-    /// The reader's two rootless statements, `stamped` bound to `venue`
-    /// and `ordered` of no venue: their records, as its log holds them.
+    /// The reader's two rootless statements, `stamped` naming `venue` and
+    /// `ordered`: their records, as its log holds them.
     pub fn plain(&self, cluster: &Cluster, venue: VenueId) -> (Attest, Attest) {
         let secret = mixed(0x5ec7) | 1 << 48;
         let arguments = [

@@ -1,12 +1,10 @@
 //! The service's work items, each a payload: a tag byte, then the item.
 //!
 //! - **`Register`** (0): the space's genesis (its canonical encoding), the
-//!   controller (32), the start window (8), a founding key (32) and its
-//!   signature over `vos_anchor::register_digest` (64), as Kreivo's
-//!   `register` takes them;
-//! - **`Migrate`** (1): a `vos_anchor::Migrate`, the controller's key (32)
-//!   and its signature over [`migrate_digest`] (64). On JAM the controller
-//!   is an ed25519 key: the service holds no accounts;
+//!   controller (32), a founding key (32) and its signature over
+//!   `vos_anchor::register_digest` (64), as Kreivo's `register` takes them.
+//!   On JAM the controller is an ed25519 key: the service holds no
+//!   accounts;
 //! - **`Anchor`** (2): a `vos_anchor::Anchor`, its signature over its
 //!   digest at this venue;
 //! - **`Submit`** (3): a statement's canonical encoding, at most
@@ -14,10 +12,12 @@
 //!   the item's first extrinsic (`fetch` kind 4), at most
 //!   `MAX_PROOF_BYTES`;
 //! - **`Control`** (4): the controller's management of its space, the
-//!   space's spaces-pallet calls 2–4, 6 and 1 on JAM: add or remove an
-//!   anchor key, resume after an equivocation, set another controller;
-//!   each with the space's next nonce, so none is replayed, and the
-//!   controller's signature over [`control_digest`].
+//!   space's spaces-pallet calls 2–4 and 1 on JAM: add or remove an anchor
+//!   key, set another controller; each with the space's next nonce, so
+//!   none is replayed, and the controller's signature over
+//!   [`control_digest`].
+//!
+//! Tag 1 and op 2 are retired, never reused.
 //!
 //! JAM-NP's CE 133 bounds a work package, payloads among it, at 204,802
 //! bytes, below the 256 KiB a proof may take: the proof goes as an
@@ -27,7 +27,7 @@
 use alloc::vec::Vec;
 
 use vos_statement::vos_anchor::codec::Reader;
-use vos_statement::vos_anchor::{Anchor, Migrate, SpaceGenesis, SpaceId, VenueId};
+use vos_statement::vos_anchor::{Anchor, SpaceGenesis, SpaceId, VenueId};
 use vos_statement::{DecodeError, blake2b_256};
 
 /// The longest statement the service takes, as Kreivo's `submit` bounds it:
@@ -39,8 +39,6 @@ pub const MAX_STATEMENT_BYTES: usize = 64 << 10;
 /// 64, a statement's accumulate stays within its item's gas.
 pub const MAX_ROOTS: usize = 64;
 
-/// The migration digest's domain.
-pub const MIGRATE_DOMAIN: &[u8] = b"vos/space/migrate";
 /// The control digest's domain.
 pub const CONTROL_DOMAIN: &[u8] = b"vos/space/control";
 
@@ -49,7 +47,6 @@ pub const CONTROL_DOMAIN: &[u8] = b"vos/space/control";
 #[repr(u8)]
 pub enum Kind {
     Register = 0,
-    Migrate = 1,
     Anchor = 2,
     Submit = 3,
     Control = 4,
@@ -60,7 +57,6 @@ impl Kind {
     pub const fn from_u8(byte: u8) -> Option<Self> {
         Some(match byte {
             0 => Self::Register,
-            1 => Self::Migrate,
             2 => Self::Anchor,
             3 => Self::Submit,
             4 => Self::Control,
@@ -74,36 +70,18 @@ impl Kind {
 pub struct Register {
     pub genesis: SpaceGenesis,
     pub controller: [u8; 32],
-    pub start_window: u64,
     pub founder_key: [u8; 32],
     pub signature: [u8; 64],
-}
-
-/// A space's migration away, signed by its controller.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SignedMigrate {
-    pub migrate: Migrate,
-    pub controller: [u8; 32],
-    pub signature: [u8; 64],
-}
-
-/// What the controller signs to migrate a space:
-/// `BLAKE2b-256("vos/space/migrate" ‖ migrate)`, the migration in its
-/// encoding, which names both venues.
-pub fn migrate_digest(migrate: &Migrate) -> [u8; 32] {
-    blake2b_256(&[MIGRATE_DOMAIN, &migrate.encode()])
 }
 
 /// What the controller does to its space.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Op {
-    /// List another anchor key (at most `MAX_FOUNDING_KEYS`).
+    /// List another anchor key (at most `MAX_FOUNDING_KEYS`, none of small
+    /// order).
     AddKey([u8; 32]),
     /// Delist an anchor key.
     RemoveKey([u8; 32]),
-    /// Lift a suspension, once neither signer of any of its equivocations
-    /// is listed.
-    Resume,
     /// Hand the space to another controller key.
     SetController([u8; 32]),
 }
@@ -119,7 +97,6 @@ impl Op {
                 out.push(1);
                 out.extend_from_slice(key);
             }
-            Self::Resume => out.push(2),
             Self::SetController(key) => {
                 out.push(3);
                 out.extend_from_slice(key);
@@ -131,7 +108,6 @@ impl Op {
         Ok(match reader.u8()? {
             0 => Self::AddKey(reader.array()?),
             1 => Self::RemoveKey(reader.array()?),
-            2 => Self::Resume,
             3 => Self::SetController(reader.array()?),
             _ => return Err(DecodeError::Noncanonical),
         })
@@ -184,7 +160,6 @@ pub struct SignedControl {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Item {
     Register(Register),
-    Migrate(SignedMigrate),
     Anchor(Anchor),
     /// A statement's encoding, decoded by refine: an undecodable one is a
     /// verdict, code 1.
@@ -196,7 +171,6 @@ impl Item {
     pub fn kind(&self) -> Kind {
         match self {
             Self::Register(_) => Kind::Register,
-            Self::Migrate(_) => Kind::Migrate,
             Self::Anchor(_) => Kind::Anchor,
             Self::Submit(_) => Kind::Submit,
             Self::Control(_) => Kind::Control,
@@ -210,14 +184,8 @@ impl Item {
             Self::Register(register) => {
                 register.genesis.encode_to(&mut out);
                 out.extend_from_slice(&register.controller);
-                out.extend_from_slice(&register.start_window.to_le_bytes());
                 out.extend_from_slice(&register.founder_key);
                 out.extend_from_slice(&register.signature);
-            }
-            Self::Migrate(signed) => {
-                out.extend_from_slice(&signed.migrate.encode());
-                out.extend_from_slice(&signed.controller);
-                out.extend_from_slice(&signed.signature);
             }
             Self::Anchor(anchor) => out.extend_from_slice(&anchor.encode()),
             Self::Submit(statement) => out.extend_from_slice(statement),
@@ -243,13 +211,7 @@ impl Item {
             Kind::Register => Self::Register(Register {
                 genesis: SpaceGenesis::decode_from(&mut reader)?,
                 controller: reader.array()?,
-                start_window: reader.u64()?,
                 founder_key: reader.array()?,
-                signature: reader.array()?,
-            }),
-            Kind::Migrate => Self::Migrate(SignedMigrate {
-                migrate: Migrate::decode(reader.take(MIGRATE_BYTES)?)?,
-                controller: reader.array()?,
                 signature: reader.array()?,
             }),
             Kind::Anchor => Self::Anchor(Anchor::decode(reader.take(Anchor::BYTES)?)?),
@@ -264,9 +226,6 @@ impl Item {
         Ok(item)
     }
 }
-
-/// A migration's bytes: the space, the venues and the window.
-const MIGRATE_BYTES: usize = 32 * 3 + 8;
 
 #[cfg(test)]
 mod tests {
@@ -292,19 +251,8 @@ mod tests {
             Item::Register(Register {
                 genesis: genesis(),
                 controller: [3; 32],
-                start_window: 9,
                 founder_key: [1; 32],
                 signature: [4; 64],
-            }),
-            Item::Migrate(SignedMigrate {
-                migrate: Migrate {
-                    space: SpaceId([5; 32]),
-                    from: VenueId([6; 32]),
-                    to: VenueId([7; 32]),
-                    from_window: 11,
-                },
-                controller: [8; 32],
-                signature: [9; 64],
             }),
             Item::Anchor(Anchor {
                 space: SpaceId([5; 32]),
@@ -327,7 +275,7 @@ mod tests {
                 control: Control {
                     space: SpaceId([5; 32]),
                     nonce: 4,
-                    op: Op::Resume,
+                    op: Op::SetController([16; 32]),
                 },
                 controller: [14; 32],
                 signature: [15; 64],
@@ -342,7 +290,9 @@ mod tests {
             assert_eq!(Item::decode(&more), Err(DecodeError::Trailing));
         }
         assert_eq!(Item::decode(&[3, 1, 2]), Ok(Item::Submit(vec![1, 2])));
-        assert_eq!(Item::decode(&[5]), Err(DecodeError::Noncanonical));
+        for retired in [1, 5] {
+            assert_eq!(Item::decode(&[retired]), Err(DecodeError::Noncanonical));
+        }
         assert_eq!(Item::decode(&[]), Err(DecodeError::Short));
     }
 }

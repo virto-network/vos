@@ -1,8 +1,8 @@
 //! Fuzz target: arbitrary bytes through `vos-anchor`'s decoders, each a
 //! venue's reading of what a space hands it: `SpaceGenesis::decode` (a
-//! registration's genesis), `Anchor::decode`, `Migrate::decode` and the
-//! golden vectors' `Vector::decode`; then the clock, the digests and the
-//! id over what decoded.
+//! registration's genesis), `Anchor::decode` and the golden vectors'
+//! `Vector::decode`; then the clock, the digests and the id over what
+//! decoded.
 //!
 //! Properties: **no panic, no abort**, and **one encoding:** a value that
 //! decodes re-encodes to the bytes. The clock's arithmetic is checked
@@ -21,7 +21,7 @@
 
 use libfuzzer_sys::fuzz_target;
 use vos_anchor::vectors::Vector;
-use vos_anchor::{space_id, Anchor, Migrate, SpaceGenesis, VenueId, WindowClock};
+use vos_anchor::{space_id, Anchor, SpaceGenesis, VenueId, WindowClock};
 
 /// A venue's id from the bytes' first 32, or zeros.
 fn venue(data: &[u8]) -> VenueId {
@@ -63,9 +63,6 @@ fuzz_target!(|data: &[u8]| {
     if let Ok(anchor) = Anchor::decode(data) {
         assert_eq!(anchor.encode(), data, "one encoding");
         let _ = anchor.digest(&venue(data));
-    }
-    if let Ok(migrate) = Migrate::decode(data) {
-        assert_eq!(migrate.encode(), data, "one encoding");
     }
     if let Ok(vector) = Vector::decode(data) {
         assert_eq!(vector.encode(), data, "one encoding");

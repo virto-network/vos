@@ -2,8 +2,7 @@
 //! them, from `pvm/proof/fixtures`: each a case, a venue's state, a
 //! statement, a proof and the verdict every venue must reach.
 //!
-//! - `wrap.proof`, `wrap-rootless.proof`, `wrap-prefix.proof` and
-//!   `wrap-midway.proof`: final proofs of `format::MASKED_WRAP`, fixed layout;
+//! - `wrap.proof`, `wrap-prefix.proof` and `wrap-midway.proof`: final proofs of `format::MASKED_WRAP`, fixed layout;
 //!   `wrap-28.proof`: `format::WRAP`'s, postcard, for the test policy's cases;
 //! - [`CASES`]: the cases, each its name, its proof's file, a [`Patch`] of
 //!   that proof's bytes if any, its [`Input`] and its verdict's code

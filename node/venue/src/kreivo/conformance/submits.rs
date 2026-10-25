@@ -15,7 +15,7 @@ pub(super) fn g6(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);
     w.begin();
     w.anchor_f();
-    w.accept(AUTHORITY_F, F, false);
+    w.accept(AUTHORITY_F, F);
     let id = fx.statement().id().0;
     let expiry = vos_statement::seen_expiry(fx.statement(), &F_CLOCK);
     assert_eq!(
@@ -63,7 +63,6 @@ pub(super) fn g7(fx: &Fixtures) -> Vector {
         ..s.roots[0]
     };
     w.refused(changed(&|s| s.roots[0] = unanchored), proof.clone(), 5);
-    w.refused(changed(&|s| s.public_args[0] ^= 1), proof.clone(), 7);
     assert!(crate::proof_refused(fx.tampered_code));
     w.refused(s.encode(), fx.tampered.clone(), fx.tampered_code);
     // The activation windows: the fixture's own format and program stored,
@@ -74,10 +73,9 @@ pub(super) fn g7(fx: &Fixtures) -> Vector {
         active: Active { from_ms, until_ms },
     };
     let set_program = |from_ms, until_ms| Call::SetProgram {
-        program: fx.valid.pin.program.0,
+        program: fx.valid.program.0,
         info: Some(ProgramInfo {
             handler: Handler::Record,
-            venue_bound: fx.valid.pin.venue_bound,
             active: Active { from_ms, until_ms },
         }),
     };
@@ -92,13 +90,13 @@ pub(super) fn g7(fx: &Fixtures) -> Vector {
     w.call(Origin::Root, set_program(latest, None), Expect::Ok);
     w.refused(s.encode(), proof.clone(), 3);
     w.at(latest);
-    w.accept(AUTHORITY_F, F, false);
+    w.accept(AUTHORITY_F, F);
     w.finish(
         "G7",
         "one mutant per refusal class, each Refused { code } and DepositForfeited: 1 (the \
          statement cut short), 2 (format 30), 3 (a program not in Programs), 4 (a space not its \
-         roots'), 5 (a root not anchored), 7 (another venue's statement), 0x1xx (the proof's \
-         byte flipped); 6 is G8's, its deposit released. Then the statement itself against \
+         roots'), 5 (a root not anchored), 0x1xx (the proof's byte flipped); 6 is G8's, its \
+         deposit released. Then the statement itself against \
          activation windows: 2 while Formats[39].until_ms is now (retired), and while its \
          from_ms is past now; 3 while its program's until_ms is now, and while its from_ms is \
          past now; accepted once now reaches it",
@@ -109,7 +107,7 @@ pub(super) fn g8(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);
     w.anchor_f();
     w.begin();
-    w.accept(AUTHORITY_F, F, false);
+    w.accept(AUTHORITY_F, F);
     w.refused(fx.statement().encode(), fx.proof.clone(), 6);
     w.finish(
         "G8",
@@ -121,23 +119,28 @@ pub(super) fn g9(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);
     w.anchor_f();
     w.begin();
-    w.accept(AUTHORITY_F, F, true);
-    w.accept(AUTHORITY_F, F, false);
-    let past = F_CLOCK.boundary(42).unwrap() + w.constants().max_root_age_ms + 1;
+    // A statement of no root, of no space: venues judge rooted statements
+    // alone.
+    let rootless = Statement {
+        space: SpaceId::NONE,
+        roots: Vec::new(),
+        ..fx.statement().clone()
+    };
+    w.refused(rootless.encode(), fx.proof.clone(), 4);
+    w.accept(AUTHORITY_F, F);
+    let past = F_CLOCK.boundary(42).unwrap() + vos_anchor::MAX_ROOT_AGE_MS + 1;
     w.at(past);
     // Before the cursor prunes them: the anchors are held but stale.
     w.refused(fx.statement().encode(), fx.proof.clone(), 5);
     w.on_idle();
     assert!(!w.has(&keys::seen(&fx.statement().id().0)));
-    assert!(w.has(&keys::seen(&fx.rootless.statement.id().0)));
-    w.refused(fx.rootless.statement.encode(), fx.rootless_proof.clone(), 6);
     w.refused(fx.statement().encode(), fx.proof.clone(), 5);
     w.finish(
         "G9",
-        "a rootless and a rooted statement accepted; at MaxRootAge + 1 past the newest root's \
-         B_w, the rooted one resubmitted before on_idle refused 5 (its anchors held but past \
-         MaxRootAge); on_idle prunes the rooted Seen entry and keeps the rootless one; resubmitted, the \
-         rootless is refused 6 (released) and the rooted 5 (forfeited)",
+        "a statement of no root refused 4: venues judge rooted statements alone. A rooted one \
+         accepted; at MaxRootAge + 1 past its newest root's B_w, resubmitted before on_idle \
+         refused 5 (its anchors held but past MaxRootAge); on_idle prunes its Seen entry; \
+         resubmitted, refused 5",
     )
 }
 
@@ -151,7 +154,7 @@ pub(super) fn g10(fx: &Fixtures) -> Vector {
         + constants.submit_deposit / 2;
     w.chain
         .set_account(constants.sovereign(&space_of(&poor)), funded(free));
-    w.register(&poor, B_START, Expect::Ok);
+    w.register(&poor, Expect::Ok);
     let add = Call::AddAuthority {
         space: space_of(&poor),
         who: AUTHORITY_2,
@@ -207,7 +210,7 @@ pub(super) fn g10(fx: &Fixtures) -> Vector {
         Expect::Err(Error::Paused),
     );
     w.call(Origin::Emergency, pause(PAUSE_REGISTER), Expect::Ok);
-    w.register(&b_genesis(), B_START, Expect::Err(Error::Paused));
+    w.register(&b_genesis(), Expect::Err(Error::Paused));
     w.call(Origin::Root, pause(0), Expect::Ok);
     w.anchor(
         AUTHORITY_F,
@@ -217,7 +220,7 @@ pub(super) fn g10(fx: &Fixtures) -> Vector {
         KEY_F,
         Expect::Ok,
     );
-    w.register(&b_genesis(), B_START, Expect::Ok);
+    w.register(&b_genesis(), Expect::Ok);
     w.finish(
         "G10",
         "a submit whose sovereign cannot hold the deposit (InsufficientSovereignBalance, nothing \
@@ -305,7 +308,7 @@ pub(super) fn g13(fx: &Fixtures) -> Vector {
     };
     w.controller(budget, Expect::Ok);
     w.at(B_CLOCK.boundary(B_CLOCK.window(next).unwrap()).unwrap());
-    w.accept(AUTHORITY_1, b(), false);
+    w.accept(AUTHORITY_1, b());
     w.submit(AUTHORITY_1, b(), vec![11], Vec::new(), Expect::Ok);
     w.submit(AUTHORITY_1, b(), vec![12], Vec::new(), Expect::Payment);
     w.finish(

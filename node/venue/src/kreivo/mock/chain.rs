@@ -26,14 +26,16 @@ pub struct Constants {
     pub default_spend_per_window: Balance,
     /// `ForfeitTo`: Kreivo's treasury.
     pub forfeit_to: AccountId,
-    pub max_root_age_ms: u64,
     pub program_change_delay_ms: u64,
-    pub min_window_ms: u64,
-    pub max_window_ms: u64,
     pub max_authorities: u8,
+    /// `MaxAnchorKeys`: the kit's `MAX_FOUNDING_KEYS`, which the venue
+    /// rules' `add_key` reads.
     pub max_anchor_keys: u8,
     pub bounds: Bounds,
 }
+
+const MAX_ANCHOR_KEYS: u8 = 16;
+const _: () = assert!(MAX_ANCHOR_KEYS as usize == vos_anchor::MAX_FOUNDING_KEYS);
 
 impl Constants {
     /// The design's suggested values (§4, `UNITS = 10^12`), at `venue`.
@@ -50,12 +52,9 @@ impl Constants {
             fee_bound,
             default_spend_per_window: 8 * (deposit + fee_bound),
             forfeit_to: account_of(b"py/trsry", &[]),
-            max_root_age_ms: vos_anchor::MAX_ROOT_AGE_MS,
             program_change_delay_ms: 604_800_000,
-            min_window_ms: vos_anchor::MIN_LENGTH_MS,
-            max_window_ms: vos_anchor::MAX_LENGTH_MS,
             max_authorities: 16,
-            max_anchor_keys: 16,
+            max_anchor_keys: MAX_ANCHOR_KEYS,
             bounds: Bounds {
                 genesis: 2_048,
                 statement: 65_536,
@@ -165,9 +164,9 @@ pub(crate) enum Broken {
     /// An accepted submit's released deposit not credited back to its
     /// window's budget.
     CreditBack,
-    /// An equivocation's window keeps its first root anchored, which a
-    /// resume reinstates.
-    DisputedRootKept,
+    /// An equivocation's evidence stored and the space ended, but its
+    /// registration deposit kept held.
+    DepositKept,
 }
 
 pub(super) type Dispatched = Result<(), DispatchError>;
@@ -199,11 +198,11 @@ impl Chain {
         self.broken == Some(broken)
     }
 
-    /// Whether an equivocation's window keeps its first root anchored:
-    /// never, but in a pallet broken so.
-    pub(super) fn keeps_disputed_root(&self) -> bool {
+    /// Whether an ended space keeps its registration deposit held: never,
+    /// but in a pallet broken so.
+    pub(super) fn keeps_deposit(&self) -> bool {
         #[cfg(test)]
-        if self.is_broken(Broken::DisputedRootKept) {
+        if self.is_broken(Broken::DepositKept) {
             return true;
         }
         false

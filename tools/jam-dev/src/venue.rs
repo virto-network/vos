@@ -4,19 +4,18 @@
 //! two slots past the finalized block it was anchored at.
 //!
 //! Its answers are the service's (`vos_statement_service::verdict`'s
-//! codes), mapped onto the trait's. An anchor is queued and answered at
-//! once (`Anchored::Queued`): the [`AnchorQueue`]'s worker lands it, again
-//! while the venue is not ready for it, until the venue holds it or will
-//! never take it; one whose key the service does not list is handed back
-//! to the leader to sign again with a key it lists
-//! ([`VenueClient::unsettled`]), and the same anchor offered again is
-//! refused for its key. One of a window at or before the space's last
-//! anchored is settled unsent if the service holds its root there, or
-//! none; if it holds another, a listed key equivocated, and the anchor is
-//! sent all the same, as the evidence that suspends the space. Every
-//! refusal but `Open` alerts. A statement's code is its refusal's class; a
-//! repeat (`Refusal::Repeated`) is the venue holding it accepted; a
-//! transport failure, or a package that never lands, leaves it unjudged
+//! codes), mapped onto the trait's; the client judges no anchor itself,
+//! the service does by the venue rules (`vos_anchor::venue`). An anchor is
+//! queued and answered at once (`Anchored::Queued`): the [`AnchorQueue`]'s
+//! worker lands it, again while the venue is not ready for it, until the
+//! venue holds it, holds another root there (this node's anchor is then
+//! the equivocation's evidence, which ends the space), or will never take
+//! it; one whose key the service does not list is handed back to the
+//! leader to sign again with a key it lists ([`VenueClient::unsettled`]),
+//! and the same anchor offered again is refused for its key. Every refusal
+//! but `Open` alerts. A statement's code is its refusal's class; a repeat
+//! (`Refusal::Repeated`) is the venue holding it accepted; a transport
+//! failure, or a package that never lands, leaves it unjudged
 //! (`Unjudged::Unknown`).
 //!
 //! A `JamVenue` is made only for a service whose code is the one the node
@@ -33,20 +32,17 @@ use std::time::Duration;
 
 use crate::live::statements::Statements;
 use ed25519_dalek::{Signer, SigningKey};
-use vos_anchor::{Anchor, Migrate, RootRead, SpaceGenesis, SpaceId, VenueId, register_digest};
+use vos_anchor::venue::{self as rules, Held, Roots};
+use vos_anchor::{Anchor, RootKind, RootRead, SpaceGenesis, SpaceId, VenueId, register_digest};
 use vos_jam::Error;
 use vos_statement::{Refusal, Statement, StatementId};
 use vos_statement_service::config::{Config, configure};
-use vos_statement_service::item::{
-    Control, Item, Op, Register, SignedControl, SignedMigrate, control_digest, migrate_digest,
-};
+use vos_statement_service::item::{Control, Item, Op, Register, SignedControl, control_digest};
 use vos_statement_service::state::{AnchorRecord, Outcome, SpaceRecord, keys};
-use vos_statement_service::verdict::{AnchorCode, MigrateCode, RegisterCode};
+use vos_statement_service::verdict::{AnchorCode, RegisterCode};
 
 use vos_venue::queue::{AnchorQueue, AnchorSend, Fate};
-use vos_venue::{
-    AnchorRefusal, Anchored, MigrateRefusal, NotAccepted, Status, Unjudged, VenueClient,
-};
+use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
 
 /// How long an item's outcome may take to land.
 pub const LANDING: Duration = Duration::from_secs(120);
@@ -117,8 +113,6 @@ impl JamVenue {
 /// finalized block holds it, and lands on it.
 trait Service: Send + Sync + 'static {
     fn space(&self, space: &SpaceId) -> Result<Option<SpaceRecord>, Error>;
-    /// The anchor held of `anchor`'s space and kind at its window.
-    fn held(&self, anchor: &Anchor) -> Result<Option<AnchorRecord>, Error>;
     /// The venue's time.
     fn now(&self) -> Result<u64, Error>;
     /// Land `anchor`: the service's code (`AnchorCode`).
@@ -128,13 +122,6 @@ trait Service: Send + Sync + 'static {
 impl Service for Jam {
     fn space(&self, space: &SpaceId) -> Result<Option<SpaceRecord>, Error> {
         Jam::space(self, space)
-    }
-
-    fn held(&self, anchor: &Anchor) -> Result<Option<AnchorRecord>, Error> {
-        Ok(self
-            .statements
-            .value(&keys::anchor(&anchor.space, anchor.kind, anchor.window))?
-            .and_then(|bytes| AnchorRecord::decode(&bytes).ok()))
     }
 
     fn now(&self) -> Result<u64, Error> {
@@ -152,14 +139,6 @@ struct JamSend<S = Jam>(Arc<S>);
 impl<S: Service> AnchorSend for JamSend<S> {
     fn send(&self, anchor: &Anchor) -> Fate {
         let window = anchor.window;
-        // Settled already, it is not sent: no answer the service gives an
-        // anchor it no longer takes holds back the space's later windows.
-        if let Some(fate) = self.standing(anchor) {
-            if fate == Fate::Dead {
-                tracing::error!(window, "an anchor past `MaxRootAge`: not sent");
-            }
-            return fate;
-        }
         let code = match self.0.land_anchor(anchor) {
             Ok(code) => code,
             Err(error) => {
@@ -172,9 +151,8 @@ impl<S: Service> AnchorSend for JamSend<S> {
             Some(AnchorCode::Equivocation) => tracing::error!(
                 window,
                 "an equivocation: the JAM service holds another root of the space at this \
-                 window, signed by a listed anchor key, and this node's anchor is its evidence; \
-                 the space is suspended until its controller removes both signing keys and \
-                 resumes it, and the window's root never counts again"
+                 window, signed by a listed anchor key, and this node's anchor is its evidence, \
+                 which ends the space for good; it re-founds under a new genesis"
             ),
             Some(AnchorCode::Open) => {}
             _ if fate != Fate::Done => {
@@ -185,41 +163,13 @@ impl<S: Service> AnchorSend for JamSend<S> {
         fate
     }
 
+    /// As the finalized block holds the space: a window at or past the
+    /// anchor's anchored, or the window past `MaxRootAge`.
     fn settled(&self, anchor: &Anchor) -> bool {
-        self.standing(anchor).is_some()
-    }
-}
-
-impl<S: Service> JamSend<S> {
-    /// What became of `anchor` without sending it, as the finalized block
-    /// holds its space: dead once it is past `MaxRootAge`; once a window at
-    /// or past it is anchored, done if the service holds its root there or
-    /// none (a window never anchored, or disputed); none while it may still
-    /// be taken, or the node cannot say. Another root held there is an
-    /// equivocation by a listed key: none, so the anchor is sent, as its
-    /// evidence.
-    fn standing(&self, anchor: &Anchor) -> Option<Fate> {
         let (Ok(Some(space)), Ok(now)) = (self.0.space(&anchor.space), self.0.now()) else {
-            return None;
+            return false;
         };
-        if vos_venue::aged(&space.clock, anchor.window, now) {
-            return Some(Fate::Dead);
-        }
-        if space.last.is_none_or(|last| last < anchor.window) {
-            return None;
-        }
-        match self.0.held(anchor) {
-            Ok(Some(held)) if held.root != anchor.root => {
-                tracing::error!(
-                    window = anchor.window,
-                    "the JAM service holds another root of the space at this window, signed by \
-                     a listed anchor key: this node's anchor goes as the equivocation's evidence"
-                );
-                None
-            }
-            Ok(_) => Some(Fate::Done),
-            Err(_) => None,
-        }
+        rules::passed(space.last, anchor.window) || rules::aged(&space.clock, anchor.window, now)
     }
 }
 
@@ -232,7 +182,7 @@ pub fn anchor_code(code: u32) -> Option<AnchorCode> {
         Item,
         Signature,
         Unregistered,
-        Suspended,
+        Ended,
         Key,
         Window,
         Open,
@@ -243,28 +193,13 @@ pub fn anchor_code(code: u32) -> Option<AnchorCode> {
     .find(|known| *known as u32 == code)
 }
 
-/// The migration outcome the service's `code` is; none for another code.
-fn migrate_code(code: u32) -> Option<MigrateCode> {
-    use MigrateCode::*;
-    [
-        Migrated,
-        Item,
-        Venue,
-        Signature,
-        Unregistered,
-        Controller,
-        AlreadyMigrated,
-        Window,
-    ]
-    .into_iter()
-    .find(|known| *known as u32 == code)
-}
-
 /// What becomes of an anchor the service answered `code`.
 fn fate(code: u32) -> Fate {
     match anchor_code(code) {
         Some(AnchorCode::New | AnchorCode::Again) => Fate::Done,
-        Some(AnchorCode::Window | AnchorCode::Age | AnchorCode::Equivocation) => Fate::Dead,
+        Some(
+            AnchorCode::Window | AnchorCode::Age | AnchorCode::Equivocation | AnchorCode::Ended,
+        ) => Fate::Dead,
         Some(AnchorCode::Open) => Fate::Again(SLOT),
         Some(AnchorCode::Key) => Fate::Resign,
         _ => Fate::Again(AWHILE),
@@ -324,22 +259,20 @@ impl Jam {
     }
 
     /// Register the space `genesis` founds under `controller` (an ed25519
-    /// key's 32 bytes), anchoring from `start_window`, signed by `founder`,
-    /// one of its founding keys: the service's code
-    /// (`RegisterCode`).
+    /// key's 32 bytes), signed by `founder`, one of its founding keys: the
+    /// service's code (`RegisterCode`). It anchors from the venue's next
+    /// window.
     pub fn register(
         &self,
         genesis: &SpaceGenesis,
         controller: [u8; 32],
-        start_window: u64,
         founder: &SigningKey,
     ) -> Result<u32, Error> {
         let space = vos_anchor::space_id(genesis);
-        let digest = register_digest(&self.id(), &space, &controller, start_window);
+        let digest = register_digest(&self.id(), &space, &controller);
         self.register_signed(
             genesis,
             controller,
-            start_window,
             founder.verifying_key().to_bytes(),
             founder.sign(&digest).to_bytes(),
         )
@@ -352,42 +285,16 @@ impl Jam {
         &self,
         genesis: &SpaceGenesis,
         controller: [u8; 32],
-        start_window: u64,
         founder_key: [u8; 32],
         signature: [u8; 64],
     ) -> Result<u32, Error> {
         let item = Item::Register(Register {
             genesis: genesis.clone(),
             controller,
-            start_window,
             founder_key,
             signature,
         });
         Ok(self.land(item.encode(), Vec::new())?.code)
-    }
-
-    /// A space's migration away from this venue, signed by its controller.
-    pub fn migrate(
-        &self,
-        migrate: &Migrate,
-        controller: &SigningKey,
-    ) -> Result<(), MigrateRefusal> {
-        let item = Item::Migrate(SignedMigrate {
-            migrate: *migrate,
-            controller: controller.verifying_key().to_bytes(),
-            signature: controller.sign(&migrate_digest(migrate)).to_bytes(),
-        });
-        let code = self
-            .land(item.encode(), Vec::new())
-            .map_err(|_| MigrateRefusal::Window)?
-            .code;
-        match migrate_code(code) {
-            Some(MigrateCode::Migrated) => Ok(()),
-            Some(MigrateCode::Unregistered) => Err(MigrateRefusal::Unregistered),
-            Some(MigrateCode::Venue) => Err(MigrateRefusal::Venue),
-            Some(MigrateCode::AlreadyMigrated) => Err(MigrateRefusal::AlreadyMigrated),
-            _ => Err(MigrateRefusal::Window),
-        }
     }
 
     /// Submit `statement` with its final proof as the item's extrinsic: the
@@ -449,28 +356,25 @@ impl VenueClient for JamVenue {
     /// node cannot say.
     fn status(&self, space: &SpaceId) -> Status {
         match self.space(space) {
-            Ok(Some(record)) if record.suspended => Status::Suspended,
+            Ok(Some(record)) if record.ended => Status::Ended,
             Ok(Some(_)) => Status::Active,
             _ => Status::Unregistered,
         }
     }
 
+    /// The venue rules' `anchored` over the finalized block's record of the
+    /// space and root at the window, and its slot's time.
     fn anchored(&self, root: &RootRead) -> bool {
-        let Ok(Some(space)) = self.space(&root.space) else {
+        let (Ok(Some(space)), Ok(now)) = (self.space(&root.space), self.statements.now()) else {
             return false;
         };
-        let Ok(now) = self.statements.now() else {
-            return false;
-        };
-        let fresh = vos_venue::fresh(&space.clock, root.window, now);
         let held = self
             .statements
             .value(&keys::anchor(&root.space, root.kind, root.window))
             .ok()
             .flatten()
-            .and_then(|bytes| AnchorRecord::decode(&bytes).ok())
-            .is_some_and(|held| held.root == root.root);
-        !space.suspended && space.range.contains(root.window) && fresh && held
+            .and_then(|bytes| AnchorRecord::decode(&bytes).ok());
+        rules::anchored(&Read { space, now, held }, root)
     }
 
     fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
@@ -491,17 +395,47 @@ impl VenueClient for JamVenue {
     }
 }
 
+/// One window of a space as the finalized block holds it, for the venue
+/// rules.
+struct Read {
+    space: SpaceRecord,
+    now: u64,
+    held: Option<AnchorRecord>,
+}
+
+impl Roots for Read {
+    fn now(&self) -> u64 {
+        self.now
+    }
+
+    fn space(&self, _: &SpaceId) -> Option<rules::Space> {
+        Some(rules::Space {
+            clock: self.space.clock,
+            start: self.space.start,
+            status: if self.space.ended {
+                rules::Status::Ended
+            } else {
+                rules::Status::Active
+            },
+        })
+    }
+
+    fn held(&self, _: &SpaceId, _: RootKind, _: u64) -> Option<Held> {
+        self.held.map(|held| Held {
+            root: held.root,
+            signer: held.signer,
+        })
+    }
+}
+
 /// A registration's code read as its name, for a record.
 pub fn register_code(code: u32) -> &'static str {
     [
         (RegisterCode::Registered, "registered"),
         (RegisterCode::Item, "undecodable"),
         (RegisterCode::Genesis, "genesis"),
-        (RegisterCode::Founder, "not a founder"),
-        (RegisterCode::Signature, "signature"),
+        (RegisterCode::Founder, "not a founder, or its signature"),
         (RegisterCode::Again, "registered already"),
-        (RegisterCode::Start, "start window"),
-        (RegisterCode::Clock, "before the clock's origin"),
     ]
     .into_iter()
     .find(|(named, _)| *named as u32 == code)
@@ -514,8 +448,8 @@ mod tests {
 
     /// A key refused hands the anchor back to be signed again; a
     /// signature refused waits, since signing again with the same key
-    /// makes the same signature; an unregistered or suspended space waits;
-    /// a window the service will never take is dead.
+    /// makes the same signature; an unregistered space waits; a window the
+    /// service will never take, or an ended space's, is dead.
     #[test]
     fn each_anchor_code_has_its_fate() {
         use AnchorCode::*;
@@ -525,7 +459,7 @@ mod tests {
             (Item, Fate::Again(AWHILE)),
             (Signature, Fate::Again(AWHILE)),
             (Unregistered, Fate::Again(AWHILE)),
-            (Suspended, Fate::Again(AWHILE)),
+            (Ended, Fate::Dead),
             (Key, Fate::Resign),
             (Window, Fate::Dead),
             (Open, Fate::Again(SLOT)),
@@ -586,7 +520,7 @@ mod tests {
                 payload_hash,
                 result: Ok(output),
             };
-            accumulate(&self.config, *slot, &[operand], storage);
+            accumulate(&self.config, self.venue(), *slot, &[operand], storage);
             let id = state::outcome_id(&package_hash, &payload_hash);
             state::outcome(storage, &id).expect("an outcome").code
         }
@@ -603,12 +537,6 @@ mod tests {
                 .and_then(|bytes| SpaceRecord::decode(&bytes).ok()))
         }
 
-        fn held(&self, anchor: &Anchor) -> Result<Option<AnchorRecord>, Error> {
-            Ok(self
-                .read(&keys::anchor(&anchor.space, anchor.kind, anchor.window))
-                .and_then(|bytes| AnchorRecord::decode(&bytes).ok()))
-        }
-
         fn now(&self) -> Result<u64, Error> {
             let slot = self.state.lock().unwrap().1;
             Ok(vos_statement_service::accumulate::time(&self.config, slot))
@@ -620,9 +548,9 @@ mod tests {
     }
 
     /// A listed key stolen anchors another root of a window first: the
-    /// node's anchor of it, not settled by the window anchored, is sent as
-    /// the equivocation's evidence, which suspends the space and drops the
-    /// window's anchor; offered again, it is settled unsent.
+    /// node's anchor of it is sent all the same, the equivocation's
+    /// evidence, which ends the space; offered again, the ended space
+    /// refuses it for good.
     #[test]
     fn an_anchor_over_another_root_goes_as_evidence() {
         use vos_anchor::{RootKind, WindowClock};
@@ -655,13 +583,11 @@ mod tests {
         };
         let space = vos_anchor::space_id(&genesis);
         let window = 10;
-        local.at(clock.boundary(window).unwrap());
         let controller_key = controller.verifying_key().to_bytes();
-        let digest = register_digest(&local.venue(), &space, &controller_key, window);
+        let digest = register_digest(&local.venue(), &space, &controller_key);
         let register = Item::Register(Register {
             genesis,
             controller: controller_key,
-            start_window: window,
             founder_key: honest.verifying_key().to_bytes(),
             signature: honest.sign(&digest).to_bytes(),
         });
@@ -669,6 +595,7 @@ mod tests {
             local.land(&register.encode()),
             RegisterCode::Registered as u32
         );
+        local.at(clock.boundary(window).unwrap());
         let anchor = |root: u8, key: &SigningKey| {
             let mut anchor = Anchor {
                 space,
@@ -688,22 +615,17 @@ mod tests {
 
         let send = JamSend(Arc::clone(&local));
         let ours = anchor(1, &honest);
-        assert!(!send.settled(&ours), "another root held: not settled");
         assert_eq!(send.send(&ours), Fate::Dead, "sent, the evidence");
         let record = local.space(&space).unwrap().unwrap();
-        assert!(record.suspended);
+        assert!(record.ended);
         let evidence = local
             .read(&keys::evidence(&space, RootKind::Space, window))
             .expect("the evidence");
         let evidence = Evidence::decode(&evidence).unwrap();
         assert_eq!(evidence.held.signer, stolen.verifying_key().to_bytes());
         assert_eq!(evidence.other.signer, honest.verifying_key().to_bytes());
-        assert_eq!(
-            local.held(&ours).unwrap(),
-            None,
-            "the disputed root dropped"
-        );
-        assert_eq!(send.send(&ours), Fate::Done, "settled unsent");
+        assert_eq!(send.send(&ours), Fate::Dead, "the space ended");
+        assert!(send.settled(&ours), "its window anchored");
     }
 
     /// An anchor is queued and answered at once, whatever the node: one

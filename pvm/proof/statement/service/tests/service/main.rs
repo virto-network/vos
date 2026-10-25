@@ -2,39 +2,34 @@
 //! `just check-no-std`) on the JAM-only host, refine and accumulate, each
 //! item a work package's: a proof read from a 256 KiB extrinsic; every
 //! golden fixture judged as every venue judges it; registrations, anchors
-//! (an unregistered key, an equivocation, a resume that never restores a
-//! disputed root), migrations; and the rows aging out past `MaxRootAge`, a
-//! rootless statement's `Seen` entry never.
+//! and an equivocation, which ends the space; the controller's controls;
+//! a row that does not decode, or a write past the balance, trapping the
+//! accumulate; and the rows aging out past `MaxRootAge`. The venue rules'
+//! suite runs over the service's own refine and accumulate (`rules`).
 
 #[path = "../../../tests/support/jam.rs"]
 mod jam;
 mod rig;
+mod rules;
 
 use std::collections::BTreeMap;
 
 use ed25519_dalek::{Signer, SigningKey};
 use vos_pvm::ExitReason;
-use vos_pvm::refine_host::{JamItem, JamRefine};
-use vos_statement::model::Range;
+use vos_statement::Refusal;
 use vos_statement::vos_anchor::{
-    Anchor, MAX_ROOT_AGE_MS, Migrate, RootKind, SpaceGenesis, SpaceId, VenueId, WindowClock,
-    register_digest, space_id,
+    Anchor, MAX_ROOT_AGE_MS, RootKind, SpaceGenesis, SpaceId, WindowClock, register_digest,
+    space_id,
 };
 use vos_statement::vos_pvm_final_verifier::{MAX_PROOF_BYTES, masked};
-use vos_statement::{Refusal, blake2b_256};
 use vos_statement_service::config::{self, Config};
 use vos_statement_service::item::{
-    Control, Item, MAX_ROOTS, MAX_STATEMENT_BYTES, Op, Register, SignedControl, SignedMigrate,
-    control_digest, migrate_digest,
+    Control, Item, MAX_ROOTS, MAX_STATEMENT_BYTES, Op, Register, SignedControl, control_digest,
 };
 use vos_statement_service::state::{self, Storage, keys};
-use vos_statement_service::verdict::{AnchorCode, ControlCode, MigrateCode, RegisterCode};
-use vos_wire::jam::{AccumulateInput, Operand, RefineArgs};
+use vos_statement_service::verdict::{AnchorCode, ControlCode, RegisterCode};
 
-use rig::{
-    ACCUMULATE_GAS, EPOCH_MS, REFINE_GAS, Rig, fixture, fixture_rig, fixture_rig_pinning, load,
-    submit,
-};
+use rig::{ACCUMULATE_GAS, EPOCH_MS, Rig, fixture, fixture_rig, load, submit};
 
 /// The proof is the `Submit` item's first extrinsic, read whole: the valid
 /// fixture's accepted; 256 KiB, `MAX_PROOF_BYTES`, read and refused by the
@@ -101,16 +96,16 @@ fn every_fixture_is_judged_by_the_service_as_recorded() {
     }
 }
 
-/// A suspended space's roots are not anchored, those anchored before
-/// included: the valid statement at a venue that holds its roots and
-/// suspended its space is refused as unanchored.
+/// An ended space's roots are not anchored, those anchored before
+/// included: the valid statement at a venue that holds its roots and ended
+/// its space is refused as unanchored.
 #[test]
-fn a_suspended_spaces_roots_go_dark() {
+fn an_ended_spaces_roots_go_dark() {
     let valid = fixture("valid");
     let mut rig = fixture_rig(&valid);
     let space = valid.input.statement.space;
     let mut record = rig.space(&space).unwrap();
-    record.suspended = true;
+    record.ended = true;
     rig.storage
         .write(&keys::space(&space), Some(&record.encode()));
     let code = rig.code(
@@ -118,75 +113,6 @@ fn a_suspended_spaces_roots_go_dark() {
         vec![valid.proof.clone()],
     );
     assert_eq!(code, Refusal::Unanchored.code());
-}
-
-/// A listed key stolen anchored the valid statement's first root, and the
-/// space's own key anchors another root there: the evidence suspends the
-/// space and drops the window's anchor. Once the controller removes both
-/// keys, lists a rotated one and resumes it, neither root counts again:
-/// the statement over the first is refused as unanchored, either root
-/// anchored again is refused for its window, and the space anchors from
-/// the window after its last.
-#[test]
-fn a_resumed_space_never_counts_a_disputed_root() {
-    let valid = fixture("valid");
-    let mut rig = fixture_rig(&valid);
-    let statement = &valid.input.statement;
-    let space = statement.space;
-    let (controller, honest, stolen, rotated) = (key(0xc0), key(1), key(2), key(3));
-    let public = |key: &SigningKey| key.verifying_key().to_bytes();
-    let disputed = statement.roots[0];
-    let mut record = rig.space(&space).unwrap();
-    record.controller = public(&controller);
-    record.keys = vec![public(&honest), public(&stolen)];
-    record.last = statement.roots.iter().map(|root| root.window).max();
-    rig.storage
-        .write(&keys::space(&space), Some(&record.encode()));
-    let at = keys::anchor(&space, disputed.kind, disputed.window);
-    let held = state::AnchorRecord {
-        root: disputed.root,
-        signer: public(&stolen),
-    };
-    rig.storage.write(&at, Some(&held.encode()));
-    let anchor_of = |rig: &Rig, window: u64, root: [u8; 32], signer: &SigningKey| {
-        let mut anchor = Anchor {
-            space,
-            window,
-            kind: RootKind::Space,
-            root,
-            signer: public(signer),
-            signature: [0; 64],
-        };
-        anchor.signature = signer.sign(&anchor.digest(&rig.venue())).to_bytes();
-        Item::Anchor(anchor).encode()
-    };
-    let code = |rig: &mut Rig, payload| rig.code(payload, Vec::new());
-
-    let other = anchor_of(&rig, disputed.window, [0xee; 32], &honest);
-    assert_eq!(code(&mut rig, other), AnchorCode::Equivocation as u32);
-    assert!(rig.storage.read(&at).is_none(), "the disputed root dropped");
-    let ops = [
-        Op::RemoveKey(public(&stolen)),
-        Op::RemoveKey(public(&honest)),
-        Op::AddKey(public(&rotated)),
-        Op::Resume,
-    ];
-    for (nonce, op) in ops.into_iter().enumerate() {
-        let payload = control(&rig, &space, nonce as u64, op, &controller);
-        assert_eq!(code(&mut rig, payload), ControlCode::Done as u32, "{op:?}");
-    }
-    assert!(!rig.space(&space).unwrap().suspended);
-
-    let refused = rig.code(submit(&statement.encode()), vec![valid.proof.clone()]);
-    assert_eq!(refused, Refusal::Unanchored.code());
-    for root in [disputed.root, [0xee; 32]] {
-        let payload = anchor_of(&rig, disputed.window, root, &rotated);
-        assert_eq!(code(&mut rig, payload), AnchorCode::Window as u32);
-    }
-    let next = record.last.unwrap() + 1;
-    rig.at(record.clock.boundary(next).unwrap());
-    let payload = anchor_of(&rig, next, [0x0f; 32], &rotated);
-    assert_eq!(code(&mut rig, payload), AnchorCode::New as u32);
 }
 
 /// An item that does not decode, a statement that does not, and one past
@@ -270,17 +196,42 @@ fn live_rig(window: u64) -> Rig {
     rig
 }
 
-fn register(rig: &Rig, space: &Space, founder: &SigningKey, start: u64) -> Vec<u8> {
-    let controller = space.controller.verifying_key().to_bytes();
-    let digest = register_digest(&rig.venue(), &space.id, &controller, start);
+/// `space`'s registration under its controller, signed by `founder`.
+fn register(rig: &Rig, space: &Space, founder: &SigningKey) -> Vec<u8> {
+    register_under(
+        rig,
+        space,
+        founder,
+        space.controller.verifying_key().to_bytes(),
+    )
+}
+
+/// `space`'s registration under its controller, `founder` signing it
+/// under `signed_for`.
+fn register_under(rig: &Rig, space: &Space, founder: &SigningKey, signed_for: [u8; 32]) -> Vec<u8> {
+    let digest = register_digest(&rig.venue(), &space.id, &signed_for);
     Item::Register(Register {
         genesis: space.genesis.clone(),
-        controller,
-        start_window: start,
+        controller: space.controller.verifying_key().to_bytes(),
         founder_key: founder.verifying_key().to_bytes(),
         signature: founder.sign(&digest).to_bytes(),
     })
     .encode()
+}
+
+/// `space` registered while window `start − 1` of its clock is open, so it
+/// anchors from `start`, the rig's time then put back.
+fn registered_from(rig: &mut Rig, space: &Space, start: u64) {
+    let slot = rig.slot;
+    let clock = space.genesis.clock;
+    rig.at(clock.boundary(start - 1).unwrap() - clock.length_ms);
+    let payload = register(rig, space, &space.founders[0]);
+    assert_eq!(
+        rig.code(payload, Vec::new()),
+        RegisterCode::Registered as u32
+    );
+    assert_eq!(rig.space(&space.id).unwrap().start, start);
+    rig.slot = slot;
 }
 
 fn anchor(rig: &Rig, space: &SpaceId, window: u64, root: u8, signer: &SigningKey) -> Vec<u8> {
@@ -296,67 +247,55 @@ fn anchor(rig: &Rig, space: &SpaceId, window: u64, root: u8, signer: &SigningKey
     Item::Anchor(anchor).encode()
 }
 
-fn migrate(rig: &Rig, space: &SpaceId, to: VenueId, from_window: u64, by: &SigningKey) -> Vec<u8> {
-    let migrate = Migrate {
-        space: *space,
-        from: rig.venue(),
-        to,
-        from_window,
-    };
-    Item::Migrate(SignedMigrate {
-        migrate,
-        controller: by.verifying_key().to_bytes(),
-        signature: by.sign(&migrate_digest(&migrate)).to_bytes(),
-    })
-    .encode()
-}
-
 /// A registration: a founding key's signature over its digest at this
-/// venue, its start window within `[now_w − MaxRootAge / length, now_w +
-/// 1]`, its genesis of 1 to 16 founders and a length the venue registers;
-/// once.
+/// venue under the controller it names; its genesis of 1 to 16 distinct
+/// founders, none of small order, and a length the venue registers; once.
+/// It anchors from the venue's next window, from window 0 before its
+/// clock's origin.
 #[test]
-fn a_space_registers_once_signed_by_a_founder_from_a_bounded_start() {
+fn a_space_registers_once_from_the_venues_next_window() {
     let space = founded(3);
     let mut rig = live_rig(1_000);
-    let back = MAX_ROOT_AGE_MS / CLOCK.length_ms;
     let code = |rig: &mut Rig, payload| rig.code(payload, Vec::new());
 
     let stranger = key(0x99);
-    let payload = register(&rig, &space, &stranger, 1_000);
+    let payload = register(&rig, &space, &stranger);
     assert_eq!(code(&mut rig, payload), RegisterCode::Founder as u32);
-    let mut forged = Item::decode(&register(&rig, &space, &space.founders[1], 1_000)).unwrap();
-    if let Item::Register(register) = &mut forged {
-        register.start_window = 999;
-    }
+    let payload = register_under(&rig, &space, &space.founders[1], [0xc1; 32]);
     assert_eq!(
-        code(&mut rig, forged.encode()),
-        RegisterCode::Signature as u32
+        code(&mut rig, payload),
+        RegisterCode::Founder as u32,
+        "signed under another controller"
     );
-    for start in [1_000 - back - 1, 1_002] {
-        let payload = register(&rig, &space, &space.founders[1], start);
-        assert_eq!(
-            code(&mut rig, payload),
-            RegisterCode::Start as u32,
-            "{start}"
-        );
-    }
     let mut wide = founded(17);
-    wide.genesis.clock.length_ms = 600_000;
-    let payload = register(&rig, &wide, &wide.founders[0], 1_000);
+    wide.id = space_id(&wide.genesis);
+    let payload = register(&rig, &wide, &wide.founders[0]);
     assert_eq!(code(&mut rig, payload), RegisterCode::Genesis as u32);
     let mut short = founded(1);
     short.genesis.clock.length_ms = 60_000;
     short.id = space_id(&short.genesis);
-    let payload = register(&rig, &short, &short.founders[0], 1_000);
+    let payload = register(&rig, &short, &short.founders[0]);
     assert_eq!(code(&mut rig, payload), RegisterCode::Genesis as u32);
-    let mut early = founded(1);
-    early.genesis.clock.origin_ms = rig.now() + 1;
-    early.id = space_id(&early.genesis);
-    let payload = register(&rig, &early, &early.founders[0], 0);
-    assert_eq!(code(&mut rig, payload), RegisterCode::Clock as u32);
+    for (name, second) in [
+        ("twice", space.genesis.nodes[0].1),
+        ("small order", {
+            let mut identity = [0; 32];
+            identity[0] = 1;
+            identity
+        }),
+    ] {
+        let mut odd = founded(2);
+        odd.genesis.nodes[1].1 = second;
+        odd.id = space_id(&odd.genesis);
+        let payload = register(&rig, &odd, &odd.founders[0]);
+        assert_eq!(
+            code(&mut rig, payload),
+            RegisterCode::Genesis as u32,
+            "{name}"
+        );
+    }
 
-    let payload = register(&rig, &space, &space.founders[1], 1_000 - back);
+    let payload = register(&rig, &space, &space.founders[1]);
     let landed = rig.item(payload, Vec::new());
     assert_eq!(landed.outcome.code, RegisterCode::Registered as u32);
     assert_eq!(landed.outcome.subject, space.id.0);
@@ -366,27 +305,29 @@ fn a_space_registers_once_signed_by_a_founder_from_a_bounded_start() {
         landed.accumulate
     );
     let record = rig.space(&space.id).unwrap();
-    assert_eq!(
-        record.range,
-        Range {
-            from: 1_000 - back,
-            until: None
-        }
-    );
+    assert_eq!(record.start, 1_001, "the venue's next window");
     assert_eq!(record.keys.len(), 3);
     assert_eq!(
         record.controller,
         space.controller.verifying_key().to_bytes()
     );
-    let again = register(&rig, &space, &space.founders[0], 1_001);
+    let again = register(&rig, &space, &space.founders[0]);
     assert_eq!(code(&mut rig, again), RegisterCode::Again as u32);
+
+    let mut early = founded(1);
+    early.genesis.clock.origin_ms = rig.now() + 1;
+    early.id = space_id(&early.genesis);
+    let payload = register(&rig, &early, &early.founders[0]);
+    assert_eq!(code(&mut rig, payload), RegisterCode::Registered as u32);
+    assert_eq!(rig.space(&early.id).unwrap().start, 0);
 }
 
 /// Pin D's anchor rule at the venue's time: a registered space; a key of
-/// its; the signature over its digest at this venue; `Last < w < now_w`;
-/// no older than `MaxRootAge`; the same root again a repeat.
+/// its; the signature over its digest at this venue; the window at or past
+/// the space's first, past `Last` and before `now_w`; no older than
+/// `MaxRootAge`; the same root again a repeat.
 #[test]
-fn anchors_follow_pin_ds_rule() {
+fn anchors_follow_the_venue_rules() {
     let space = founded(2);
     let mut rig = live_rig(1_000);
     let founder = &space.founders[0];
@@ -394,8 +335,7 @@ fn anchors_follow_pin_ds_rule() {
 
     let payload = anchor(&rig, &space.id, 998, 1, founder);
     assert_eq!(code(&mut rig, payload), AnchorCode::Unregistered as u32);
-    let payload = register(&rig, &space, founder, 990);
-    assert_eq!(code(&mut rig, payload), 0);
+    registered_from(&mut rig, &space, 990);
 
     let stranger = key(0x99);
     let payload = anchor(&rig, &space.id, 998, 1, &stranger);
@@ -427,7 +367,7 @@ fn anchors_follow_pin_ds_rule() {
     assert_eq!(
         code(&mut rig, payload),
         AnchorCode::Window as u32,
-        "before its start"
+        "before its first window"
     );
 
     let payload = anchor(&rig, &space.id, 998, 1, founder);
@@ -455,8 +395,7 @@ fn anchors_follow_pin_ds_rule() {
 
     // A window whose boundary is past `MaxRootAge` by the venue's clock.
     let mut late = live_rig(1_000);
-    let payload = register(&late, &space, founder, 990);
-    assert_eq!(code(&mut late, payload), 0);
+    registered_from(&mut late, &space, 990);
     late.at(CLOCK.boundary(995).unwrap() + MAX_ROOT_AGE_MS + 1);
     let payload = anchor(&late, &space.id, 995, 1, founder);
     assert_eq!(code(&mut late, payload), AnchorCode::Age as u32);
@@ -466,14 +405,14 @@ fn anchors_follow_pin_ds_rule() {
 }
 
 /// A second root for a window held is kept as evidence, with both signers,
-/// whoever submits it, and suspends the space: its anchors refused after.
+/// whoever submits it, and ends the space for good: its anchors refused
+/// after, its registration refused again, its controls still taken.
 #[test]
-fn a_second_root_is_evidence_and_suspends_the_space() {
+fn a_second_root_is_evidence_and_ends_the_space() {
     let space = founded(2);
     let mut rig = live_rig(1_000);
     let code = |rig: &mut Rig, payload| rig.code(payload, Vec::new());
-    let payload = register(&rig, &space, &space.founders[0], 990);
-    assert_eq!(code(&mut rig, payload), 0);
+    registered_from(&mut rig, &space, 990);
     let payload = anchor(&rig, &space.id, 998, 1, &space.founders[0]);
     assert_eq!(code(&mut rig, payload), 0);
     let other = anchor(&rig, &space.id, 998, 2, &space.founders[1]);
@@ -481,7 +420,7 @@ fn a_second_root_is_evidence_and_suspends_the_space() {
         code(&mut rig, other.clone()),
         AnchorCode::Equivocation as u32
     );
-    assert!(rig.space(&space.id).unwrap().suspended);
+    assert!(rig.space(&space.id).unwrap().ended);
     let evidence = rig
         .storage
         .read(&keys::evidence(&space.id, RootKind::Space, 998))
@@ -497,75 +436,13 @@ fn a_second_root_is_evidence_and_suspends_the_space() {
     );
     assert_eq!(evidence.other.root, [2; 32]);
     let payload = anchor(&rig, &space.id, 999, 3, &space.founders[0]);
-    assert_eq!(code(&mut rig, payload), AnchorCode::Suspended as u32);
-    assert_eq!(code(&mut rig, other), AnchorCode::Suspended as u32);
-}
-
-/// A migration away: the controller's, once, to another venue, from a
-/// window past every one anchored and not before the venue's next; the
-/// space's anchors at or past it refused after.
-#[test]
-fn a_migration_ends_the_spaces_range_here() {
-    let space = founded(1);
-    let mut rig = live_rig(1_000);
-    let founder = &space.founders[0];
-    let code = |rig: &mut Rig, payload| rig.code(payload, Vec::new());
-    let elsewhere = VenueId([0xee; 32]);
-    let payload = migrate(&rig, &space.id, elsewhere, 1_005, &space.controller);
-    assert_eq!(code(&mut rig, payload), MigrateCode::Unregistered as u32);
-    let payload = register(&rig, &space, founder, 990);
-    assert_eq!(code(&mut rig, payload), 0);
-    let payload = anchor(&rig, &space.id, 998, 1, founder);
-    assert_eq!(code(&mut rig, payload), 0);
-
-    let payload = migrate(&rig, &space.id, elsewhere, 1_005, founder);
-    assert_eq!(code(&mut rig, payload), MigrateCode::Controller as u32);
-    let payload = migrate(&rig, &space.id, rig.venue(), 1_005, &space.controller);
-    assert_eq!(code(&mut rig, payload), MigrateCode::Venue as u32);
-    let mut forged = Item::decode(&migrate(
-        &rig,
-        &space.id,
-        elsewhere,
-        1_005,
-        &space.controller,
-    ))
-    .unwrap();
-    if let Item::Migrate(signed) = &mut forged {
-        signed.migrate.from_window = 1_006;
-    }
-    assert_eq!(
-        code(&mut rig, forged.encode()),
-        MigrateCode::Signature as u32
-    );
-    for window in [998, 1_000] {
-        let payload = migrate(&rig, &space.id, elsewhere, window, &space.controller);
-        assert_eq!(
-            code(&mut rig, payload),
-            MigrateCode::Window as u32,
-            "{window}"
-        );
-    }
-    let payload = migrate(&rig, &space.id, elsewhere, 1_001, &space.controller);
-    let landed = rig.item(payload, Vec::new());
-    assert_eq!(landed.outcome.code, MigrateCode::Migrated as u32);
-    eprintln!(
-        "migrate: refine {:.2}M gas, accumulate {} gas",
-        landed.refine as f64 / 1e6,
-        landed.accumulate
-    );
-    assert_eq!(rig.space(&space.id).unwrap().range.until, Some(1_001));
-    let payload = migrate(&rig, &space.id, elsewhere, 1_002, &space.controller);
-    assert_eq!(code(&mut rig, payload), MigrateCode::AlreadyMigrated as u32);
-
-    rig.at(CLOCK.boundary(1_002).unwrap());
-    let payload = anchor(&rig, &space.id, 1_000, 1, founder);
-    assert_eq!(code(&mut rig, payload), 0, "within its range");
-    let payload = anchor(&rig, &space.id, 1_001, 1, founder);
-    assert_eq!(
-        code(&mut rig, payload),
-        AnchorCode::Window as u32,
-        "migrated"
-    );
+    assert_eq!(code(&mut rig, payload), AnchorCode::Ended as u32);
+    assert_eq!(code(&mut rig, other), AnchorCode::Ended as u32);
+    let again = register(&rig, &space, &space.founders[0]);
+    assert_eq!(code(&mut rig, again), RegisterCode::Again as u32);
+    let op = Op::SetController(key(0xc1).verifying_key().to_bytes());
+    let payload = control(&rig, &space.id, 0, op, &space.controller);
+    assert_eq!(code(&mut rig, payload), ControlCode::Done as u32);
 }
 
 /// A control of `space` at `nonce`, signed by `by`.
@@ -583,24 +460,22 @@ fn control(rig: &Rig, space: &SpaceId, nonce: u64, op: Op, by: &SigningKey) -> V
     .encode()
 }
 
-/// The controller's controls, each at the space's next nonce: a key added
-/// anchors, a replay of its control refused, a key removed anchors no more;
-/// a resume refused while a signer of the equivocation is listed, taken
-/// once both are removed; another controller, the old one refused after.
+/// The controller's key controls, each at the space's next nonce: a key
+/// added anchors, a replay of its control refused, a key removed anchors
+/// no more; one of small order never listed; at most `MAX_FOUNDING_KEYS`.
 #[test]
-fn the_controller_adds_and_removes_keys_resumes_and_hands_over() {
+fn the_controller_adds_and_removes_keys() {
     let space = founded(2);
     let mut rig = live_rig(1_000);
     let code = |rig: &mut Rig, payload| rig.code(payload, Vec::new());
-    let (first, second) = (&space.founders[0], &space.founders[1]);
+    let first = &space.founders[0];
     let controller = &space.controller;
-    let payload = control(&rig, &space.id, 0, Op::Resume, controller);
-    assert_eq!(code(&mut rig, payload), ControlCode::Unregistered as u32);
-    let payload = register(&rig, &space, first, 990);
-    assert_eq!(code(&mut rig, payload), 0);
-
     let rotated = key(0x33);
     let add = Op::AddKey(rotated.verifying_key().to_bytes());
+    let payload = control(&rig, &space.id, 0, add, controller);
+    assert_eq!(code(&mut rig, payload), ControlCode::Unregistered as u32);
+    registered_from(&mut rig, &space, 990);
+
     let payload = control(&rig, &space.id, 0, add, first);
     assert_eq!(code(&mut rig, payload), ControlCode::Controller as u32);
     let mut forged = Item::decode(&control(&rig, &space.id, 0, add, controller)).unwrap();
@@ -639,49 +514,42 @@ fn the_controller_adds_and_removes_keys_resumes_and_hands_over() {
         ControlCode::Key as u32,
         "not listed"
     );
-
-    // An equivocation by both founders, then a resume.
-    let payload = anchor(&rig, &space.id, 998, 1, first);
-    assert_eq!(code(&mut rig, payload), 0);
-    let payload = anchor(&rig, &space.id, 998, 2, second);
-    assert_eq!(code(&mut rig, payload), AnchorCode::Equivocation as u32);
-    let payload = control(&rig, &space.id, 2, Op::Resume, controller);
-    assert_eq!(code(&mut rig, payload), ControlCode::Suspended as u32);
-    for (nonce, signer) in [(2, first), (3, second)] {
-        let op = Op::RemoveKey(signer.verifying_key().to_bytes());
-        let payload = control(&rig, &space.id, nonce, op, controller);
-        assert_eq!(code(&mut rig, payload), 0);
-        if nonce == 2 {
-            let payload = control(&rig, &space.id, 3, Op::Resume, controller);
-            assert_eq!(code(&mut rig, payload), ControlCode::Suspended as u32);
-        }
-    }
-    let payload = control(&rig, &space.id, 4, add, controller);
-    assert_eq!(code(&mut rig, payload), 0);
-    let payload = control(&rig, &space.id, 5, Op::Resume, controller);
-    assert_eq!(code(&mut rig, payload), 0);
-    let record = rig.space(&space.id).unwrap();
-    assert!(!record.suspended && record.equivocators.is_empty());
-    let payload = anchor(&rig, &space.id, 999, 1, &rotated);
-    assert_eq!(code(&mut rig, payload), 0, "resumed, by the rotated key");
-
-    let successor = key(0xc1);
-    let op = Op::SetController(successor.verifying_key().to_bytes());
-    let payload = control(&rig, &space.id, 6, op, controller);
-    assert_eq!(code(&mut rig, payload), 0);
-    let payload = control(&rig, &space.id, 7, Op::Resume, controller);
-    assert_eq!(code(&mut rig, payload), ControlCode::Controller as u32);
-    let payload = control(&rig, &space.id, 7, Op::Resume, &successor);
-    assert_eq!(code(&mut rig, payload), 0);
+    let mut identity = [0; 32];
+    identity[0] = 1;
+    let payload = control(&rig, &space.id, 2, Op::AddKey(identity), controller);
+    assert_eq!(
+        code(&mut rig, payload),
+        ControlCode::Key as u32,
+        "small order"
+    );
     // At most `MAX_FOUNDING_KEYS` listed.
-    for nonce in 8..8 + 15 {
-        let op = Op::AddKey(key(nonce as u8).verifying_key().to_bytes());
-        let payload = control(&rig, &space.id, nonce, op, &successor);
+    for nonce in 2..2 + 14 {
+        let op = Op::AddKey(key(nonce as u8 + 0x40).verifying_key().to_bytes());
+        let payload = control(&rig, &space.id, nonce, op, controller);
         assert_eq!(code(&mut rig, payload), 0, "{nonce}");
     }
     let op = Op::AddKey(key(0xfe).verifying_key().to_bytes());
-    let payload = control(&rig, &space.id, 23, op, &successor);
+    let payload = control(&rig, &space.id, 16, op, controller);
     assert_eq!(code(&mut rig, payload), ControlCode::Key as u32, "the 17th");
+}
+
+/// The controller hands the space to another key: the old one refused
+/// after, the new one taken.
+#[test]
+fn the_controller_hands_the_space_over() {
+    let space = founded(1);
+    let mut rig = live_rig(1_000);
+    let code = |rig: &mut Rig, payload| rig.code(payload, Vec::new());
+    registered_from(&mut rig, &space, 990);
+    let (controller, successor) = (&space.controller, key(0xc1));
+    let op = Op::SetController(successor.verifying_key().to_bytes());
+    let payload = control(&rig, &space.id, 0, op, controller);
+    assert_eq!(code(&mut rig, payload), 0);
+    let remove = Op::RemoveKey(space.founders[0].verifying_key().to_bytes());
+    let payload = control(&rig, &space.id, 1, remove, controller);
+    assert_eq!(code(&mut rig, payload), ControlCode::Controller as u32);
+    let payload = control(&rig, &space.id, 1, remove, &successor);
+    assert_eq!(code(&mut rig, payload), 0);
 }
 
 /// A statement reading more than `MAX_ROOTS` roots is refused at refine as
@@ -736,36 +604,38 @@ fn a_full_storage_traps_the_accumulate() {
             key[0] == keys::SEEN
         }
     }
-    let rootless = fixture("rootless");
-    let mut rig = fixture_rig(&rootless);
-    let payload = submit(&rootless.input.statement.encode());
-    let args = RefineArgs::new(u64::from(rig.service), payload.clone(), [1; 32]);
-    let jam = JamRefine {
-        service: u64::from(rig.service),
-        items: vec![JamItem {
-            payload: payload.clone(),
-            extrinsics: vec![rootless.proof.clone()],
-            ..JamItem::default()
-        }],
-        ..JamRefine::default()
-    };
-    let refined = jam::refine(&rig.program, &args.encode(), jam, REFINE_GAS);
-    let operand = Operand {
-        package_hash: [1; 32],
-        segment_root: [0; 32],
-        authorizer: [0; 32],
-        payload_hash: blake2b_256(&[&payload]),
-        gas_limit: ACCUMULATE_GAS,
-        result: Ok(refined.output),
-        auth_trace: Vec::new(),
-    };
+    let valid = fixture("valid");
+    let mut rig = fixture_rig(&valid);
+    let payload = submit(&valid.input.statement.encode());
+    let input = rig.operand(&payload, vec![valid.proof.clone()], [1; 32]);
     let mut full = Full(std::mem::take(&mut rig.storage));
     let (exit, _) = jam::accumulate(
         &rig.prepared,
         rig.slot,
         u64::from(rig.service),
-        &[AccumulateInput::Operand(operand).encode()],
+        &[input],
         &mut full,
+        ACCUMULATE_GAS,
+    );
+    assert_eq!(exit, ExitReason::Panic);
+}
+
+/// A row of the service's own that does not decode is a fault: reading it,
+/// the program traps, so the accumulate reverts rather than take it as
+/// absent.
+#[test]
+fn an_undecodable_row_traps_the_accumulate() {
+    let space = founded(1);
+    let mut rig = live_rig(1_000);
+    rig.storage.write(&keys::space(&space.id), Some(&[1, 2, 3]));
+    let payload = anchor(&rig, &space.id, 998, 1, &space.founders[0]);
+    let input = rig.operand(&payload, Vec::new(), [2; 32]);
+    let (exit, _) = jam::accumulate(
+        &rig.prepared,
+        rig.slot,
+        u64::from(rig.service),
+        &[input],
+        &mut rig.storage,
         ACCUMULATE_GAS,
     );
     assert_eq!(exit, ExitReason::Panic);
@@ -773,35 +643,27 @@ fn a_full_storage_traps_the_accumulate() {
 
 // ── Aging out ─────────────────────────────────────────────────────────────
 
-/// Past `MaxRootAge`, an anchor, a rooted statement's `Seen` entry and an
-/// item's outcome are dropped, a few each accumulate once their hour is
-/// over; a rootless statement's `Seen` entry is kept: replayed, the rooted
-/// statement is refused as unanchored and the rootless one as repeated.
+/// Past `MaxRootAge`, an anchor, a statement's `Seen` entry and an item's
+/// outcome are dropped, a few each accumulate once their hour is over:
+/// replayed, the statement is refused as unanchored.
 #[test]
-fn rows_age_out_past_max_root_age_and_a_rootless_entry_never() {
+fn rows_age_out_past_max_root_age() {
     let valid = fixture("valid");
-    let rootless = fixture("rootless");
-    let mut rig = fixture_rig_pinning(&valid, vec![valid.input.pin, rootless.input.pin]);
+    let mut rig = fixture_rig(&valid);
 
     let rooted = submit(&valid.input.statement.encode());
-    let lone = submit(&rootless.input.statement.encode());
-    let landed = rig.package(&[
-        (rooted.clone(), vec![valid.proof.clone()]),
-        (lone.clone(), vec![rootless.proof.clone()]),
-    ]);
-    assert_eq!([landed[0].outcome.code, landed[1].outcome.code], [0, 0]);
-    let (rooted_id, lone_id) = (valid.input.statement.id(), rootless.input.statement.id());
-    let expiry = state::seen(&mut rig.storage, &rooted_id).unwrap();
+    let landed = rig.item(rooted.clone(), vec![valid.proof.clone()]);
+    assert_eq!(landed.outcome.code, 0);
+    let id = valid.input.statement.id();
+    let expiry = state::seen(&mut rig.storage, &id).unwrap();
     assert_eq!(
         expiry,
         CLOCK_FIXTURE.boundary(42).unwrap() + MAX_ROOT_AGE_MS
     );
-    assert_eq!(state::seen(&mut rig.storage, &lone_id), Some(u64::MAX));
 
     // An anchor of a space on the fixtures' clock, queued too.
     let space = founded_on(1, CLOCK_FIXTURE);
-    let payload = register(&rig, &space, &space.founders[0], 40);
-    assert_eq!(rig.code(payload, Vec::new()), 0);
+    registered_from(&mut rig, &space, 40);
     let anchored = anchor(&rig, &space.id, 41, 9, &space.founders[0]);
     let anchored = rig.item(anchored, Vec::new());
     assert_eq!(anchored.outcome.code, 0);
@@ -813,14 +675,10 @@ fn rows_age_out_past_max_root_age_and_a_rootless_entry_never() {
     for _ in 0..16 {
         rig.item(vec![9], Vec::new());
     }
-    assert_eq!(state::seen(&mut rig.storage, &rooted_id), None, "dropped");
-    assert_eq!(
-        state::seen(&mut rig.storage, &lone_id),
-        Some(u64::MAX),
-        "kept"
-    );
+    assert_eq!(state::seen(&mut rig.storage, &id), None, "dropped");
     assert!(state::anchor(&mut rig.storage, &space.id, RootKind::Space, 41).is_none());
     assert_eq!(state::outcome(&mut rig.storage, &anchored.id), None);
+    assert!(rig.space(&space.id).is_some(), "a space is never dropped");
     let hour = rig.now() / 3_600_000;
     let queued = rig.storage.keys().filter(|key| key[0] == keys::QUEUED);
     assert!(
@@ -830,13 +688,13 @@ fn rows_age_out_past_max_root_age_and_a_rootless_entry_never() {
         "the queue drained to the hour"
     );
 
-    let replays = rig.package(&[
-        (rooted, vec![valid.proof.clone()]),
-        (lone, vec![rootless.proof.clone()]),
-    ]);
-    assert_eq!(replays[0].outcome.code, Refusal::Unanchored.code());
-    assert_eq!(replays[1].outcome.code, Refusal::Repeated.code());
+    let replay = rig.item(rooted, vec![valid.proof.clone()]);
+    assert_eq!(replay.outcome.code, Refusal::Unanchored.code());
 }
+
+// Every row queued expires within a day of its queueing, the horizon a
+// client reading the queue scans.
+const _: () = assert!(vos_statement_service::accumulate::OUTCOME_KEEP_MS >= MAX_ROOT_AGE_MS);
 
 /// The fixtures' venue clock (`WindowClock::DEFAULT`).
 const CLOCK_FIXTURE: WindowClock = WindowClock::DEFAULT;

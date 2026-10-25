@@ -50,7 +50,6 @@ pub enum Handler {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct ProgramInfo {
     pub handler: Handler,
-    pub venue_bound: bool,
     pub active: Active,
 }
 
@@ -78,14 +77,13 @@ impl From<&Anchor> for AnchorArg {
     }
 }
 
-/// The pallet's calls at their pinned indices (§6).
+/// The pallet's calls at their pinned indices (§6); 5 and 6 are retired.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Call {
     #[codec(index = 0)]
     Register {
         genesis: Vec<u8>,
         controller: AccountId,
-        start_window: u64,
         founder_key: [u8; 32],
         founder_sig: [u8; 64],
     },
@@ -104,14 +102,6 @@ pub enum Call {
     RemoveAuthority { space: [u8; 32], who: AccountId },
     #[codec(index = 4)]
     RemoveAnchorKey { space: [u8; 32], key: [u8; 32] },
-    #[codec(index = 5)]
-    Migrate {
-        space: [u8; 32],
-        to: [u8; 32],
-        from_window: u64,
-    },
-    #[codec(index = 6)]
-    Resume { space: [u8; 32] },
     #[codec(index = 7)]
     Anchor { anchor: AnchorArg },
     #[codec(index = 8)]
@@ -203,21 +193,32 @@ pub enum RuntimeCall {
     Spaces(Call),
 }
 
+/// A space's status; index 1 is retired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum SpaceStatus {
     Active = 0,
-    /// An equivocation suspended it.
-    Suspended = 1,
     /// Governance blocked it.
     Blocked = 2,
+    /// An equivocation ended it, for good.
+    Ended = 3,
+}
+
+impl From<SpaceStatus> for vos_anchor::venue::Status {
+    fn from(status: SpaceStatus) -> Self {
+        match status {
+            SpaceStatus::Active => Self::Active,
+            SpaceStatus::Blocked => Self::Blocked,
+            SpaceStatus::Ended => Self::Ended,
+        }
+    }
 }
 
 impl From<SpaceStatus> for crate::Status {
     fn from(status: SpaceStatus) -> Self {
         match status {
             SpaceStatus::Active => Self::Active,
-            SpaceStatus::Suspended => Self::Suspended,
             SpaceStatus::Blocked => Self::Blocked,
+            SpaceStatus::Ended => Self::Ended,
         }
     }
 }
@@ -230,8 +231,6 @@ pub struct SpaceInfo {
     pub origin_ms: u64,
     pub length_ms: u64,
     pub start_window: u64,
-    /// Exclusive; set by `migrate`.
-    pub end_window: Option<u64>,
     pub status: SpaceStatus,
     pub authorities: u8,
     pub anchor_keys: u8,
@@ -245,11 +244,6 @@ impl SpaceInfo {
             origin_ms: self.origin_ms,
             length_ms: self.length_ms,
         }
-    }
-
-    /// Whether window `w` is within the space's range here.
-    pub fn holds(&self, w: u64) -> bool {
-        self.start_window <= w && self.end_window.is_none_or(|end| w < end)
     }
 }
 
@@ -296,7 +290,7 @@ pub struct AccountInfo {
     pub flags: u128,
 }
 
-/// The pallet's events at their pinned indices (§8).
+/// The pallet's events at their pinned indices (§8); 5 and 9 are retired.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Event {
     #[codec(index = 0)]
@@ -323,12 +317,6 @@ pub enum Event {
     AuthorityRemoved { space: [u8; 32], who: AccountId },
     #[codec(index = 4)]
     AnchorKeyRemoved { space: [u8; 32], key: [u8; 32] },
-    #[codec(index = 5)]
-    Migrated {
-        space: [u8; 32],
-        to: [u8; 32],
-        from_window: u64,
-    },
     #[codec(index = 6)]
     Anchored {
         space: [u8; 32],
@@ -347,9 +335,7 @@ pub enum Event {
         second_signer: [u8; 32],
     },
     #[codec(index = 8)]
-    SpaceSuspended { space: [u8; 32] },
-    #[codec(index = 9)]
-    SpaceResumed { space: [u8; 32] },
+    SpaceEnded { space: [u8; 32] },
     #[codec(index = 10)]
     SpaceStatusSet {
         space: [u8; 32],
@@ -392,7 +378,8 @@ pub enum Event {
     },
 }
 
-/// The pallet's errors at their pinned indices (§8).
+/// The pallet's errors at their pinned indices (§8); 18, 23, 24, 26 and 28
+/// are retired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Error {
@@ -414,21 +401,18 @@ pub enum Error {
     WindowNotAfterLast = 15,
     WindowInFuture = 16,
     WindowTooOld = 17,
-    OutOfRange = 18,
     SpaceNotActive = 19,
     Paused = 20,
     InsufficientSovereignBalance = 21,
     TooEarly = 22,
-    StillEquivocating = 23,
-    AlreadyMigrated = 24,
     BadHandler = 25,
-    BadStartWindow = 26,
     OverBudget = 27,
-    SameVenue = 28,
+    AuthorityExists = 29,
+    BadAnchorKey = 30,
 }
 
 impl Error {
-    const ALL: [Self; 29] = [
+    const ALL: [Self; 26] = [
         Self::SpaceExists,
         Self::UnknownSpace,
         Self::BadGenesis,
@@ -447,22 +431,20 @@ impl Error {
         Self::WindowNotAfterLast,
         Self::WindowInFuture,
         Self::WindowTooOld,
-        Self::OutOfRange,
         Self::SpaceNotActive,
         Self::Paused,
         Self::InsufficientSovereignBalance,
         Self::TooEarly,
-        Self::StillEquivocating,
-        Self::AlreadyMigrated,
         Self::BadHandler,
-        Self::BadStartWindow,
         Self::OverBudget,
-        Self::SameVenue,
+        Self::AuthorityExists,
+        Self::BadAnchorKey,
     ];
 
-    /// The error at pinned index `index`.
+    /// The error at pinned index `index`; none for a retired or unknown
+    /// one.
     pub fn from_index(index: u8) -> Option<Self> {
-        Self::ALL.get(usize::from(index)).copied()
+        Self::ALL.into_iter().find(|error| *error as u8 == index)
     }
 }
 
@@ -682,18 +664,20 @@ mod tests {
     /// FRAME's `DispatchError` encodes them.
     #[test]
     fn the_errors_are_at_their_pinned_indices() {
-        for (index, error) in Error::ALL.into_iter().enumerate() {
-            assert_eq!(error as usize, index);
-            assert_eq!(Error::from_index(index as u8), Some(error));
+        for error in Error::ALL {
+            let index = error as u8;
+            assert_eq!(Error::from_index(index), Some(error));
             let failure = Failure::Module {
                 pallet: PALLET,
-                error: index as u8,
+                error: index,
             };
-            assert_eq!(failure.encode(), [3, PALLET, index as u8, 0, 0, 0]);
+            assert_eq!(failure.encode(), [3, PALLET, index, 0, 0, 0]);
             assert_eq!(read::<Failure>(&failure.encode()), Some(failure));
             assert_eq!(failure.pallet(), Some(error));
         }
-        assert_eq!(Error::from_index(29), None);
+        for retired in [18, 23, 24, 26, 28, 31] {
+            assert_eq!(Error::from_index(retired), None);
+        }
     }
 
     /// The anchor call is `[90, 7]` and an `Anchor` in `vos-anchor`'s

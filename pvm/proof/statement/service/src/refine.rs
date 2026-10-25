@@ -1,39 +1,43 @@
 //! Refine: an item's checks that read no state.
 //!
-//! - **A registration:** its genesis decodes, of 1 to `MAX_FOUNDING_KEYS`
-//!   founding keys and a window length the venue registers; the signing
-//!   key one of them, its signature over `register_digest` at this venue.
-//! - **A migration:** away from this venue to another, signed by the key it
-//!   names, which accumulate checks is the space's controller.
+//! - **A registration:** `vos_anchor::venue::registration`, the checks that
+//!   read no state: its genesis of 1 to `MAX_FOUNDING_KEYS` distinct keys,
+//!   none of small order, and a window length the venue registers; the
+//!   signing key one of them, its signature over `register_digest` at this
+//!   venue.
 //! - **An anchor:** signed by the key it names over its digest at this
-//!   venue; accumulate checks the key is one of the space's.
+//!   venue; accumulate applies the anchor rule, the signature taken as
+//!   verified here.
 //! - **A control:** signed by the key it names over its digest at this
 //!   venue; accumulate checks the key is the space's controller.
 //! - **A statement:** at most [`MAX_STATEMENT_BYTES`] and [`MAX_ROOTS`]
 //!   roots, decoding; then pin
 //!   F's checks in order, but `anchored` and `seen`, which accumulate makes:
-//!   the format, the program against this deployment's pins, the venue if
-//!   venue-bound, the space rule, the io-hash and the id; then its proof,
+//!   the format, the program against this deployment's pins, the space
+//!   rule, the io-hash and the id; then its proof,
 //!   the item's first extrinsic, at most `MAX_PROOF_BYTES`, read only once
 //!   the checks before it pass.
 //!
-//! A signature is verified with `verify_strict`, as the model venue does.
+//! A signature is verified with `verify_strict`, as the venue rules ask.
+//! Refine reads no state, so it judges an anchor's signature before the
+//! venue rules' space, status and key checks, which accumulate makes: an
+//! anchor failing both a state check and its signature is refused
+//! `Signature` here where another venue says the state's refusal. The
+//! codes differ only when two faults coincide.
 
 use alloc::vec::Vec;
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use vos_statement::vos_anchor::{MAX_FOUNDING_KEYS, RootRead, register_digest, space_id};
+use vos_statement::vos_anchor::RootRead;
+use vos_statement::vos_anchor::venue::{self as rules, RegisterRefusal};
 use vos_statement::vos_pvm_final_verifier::{self, MAX_PROOF_BYTES};
 use vos_statement::{
-    DecodeError, LINKED, Pin, ProgramId, Refusal, SpaceId, Statement, StatementId, Venue, VenueId,
-    admit,
+    DecodeError, LINKED, ProgramId, Refusal, SpaceId, Statement, StatementId, Venue, VenueId, admit,
 };
 
 use crate::config::Config;
-use crate::item::{Item, Kind, MAX_ROOTS, MAX_STATEMENT_BYTES, control_digest, migrate_digest};
-use crate::verdict::{
-    AnchorCode, ControlCode, Judged, MigrateCode, RegisterCode, Registered, Root, Verdict,
-};
+use crate::item::{Item, Kind, MAX_ROOTS, MAX_STATEMENT_BYTES, control_digest};
+use crate::verdict::{AnchorCode, ControlCode, Judged, RegisterCode, Registered, Root, Verdict};
 
 /// The item's extrinsics, which a `Submit` reads its proof from.
 pub trait Extrinsics {
@@ -43,17 +47,11 @@ pub trait Extrinsics {
     fn proof(&mut self, len: usize) -> Vec<u8>;
 }
 
-/// The venue as refine sees it: its id and the formats this build links;
-/// every root anchored and no statement seen, which accumulate checks.
-struct Stateless {
-    venue: VenueId,
-}
+/// The venue as refine sees it: the formats this build links; every root
+/// anchored and no statement seen, which accumulate checks.
+struct Stateless;
 
 impl Venue for Stateless {
-    fn id(&self) -> VenueId {
-        self.venue
-    }
-
     fn accepts(&self, format: u32) -> bool {
         LINKED.contains(&format)
     }
@@ -95,7 +93,6 @@ pub fn refine(
             let kind = payload.first().copied().and_then(Kind::from_u8);
             let code = match kind {
                 Some(Kind::Anchor) => AnchorCode::Item as u32,
-                Some(Kind::Migrate) => MigrateCode::Item as u32,
                 Some(Kind::Control) => ControlCode::Item as u32,
                 _ => RegisterCode::Item as u32,
             };
@@ -103,56 +100,25 @@ pub fn refine(
         }
     };
     match item {
-        Item::Register(register) => {
-            let refused = |code: RegisterCode| Verdict::Refused {
-                kind: Some(Kind::Register),
-                code: code as u32,
-            };
-            let genesis = &register.genesis;
-            if genesis.nodes.len() > MAX_FOUNDING_KEYS || !genesis.clock.registrable() {
-                return refused(RegisterCode::Genesis);
-            }
-            let keys: Vec<[u8; 32]> = genesis.nodes.iter().map(|(_, key)| *key).collect();
-            if !keys.contains(&register.founder_key) {
-                return refused(RegisterCode::Founder);
-            }
-            let space = space_id(genesis);
-            let digest =
-                register_digest(&venue, &space, &register.controller, register.start_window);
-            if !signed(&register.founder_key, &digest, &register.signature) {
-                return refused(RegisterCode::Signature);
-            }
-            Verdict::Register(Registered {
-                space,
-                clock: genesis.clock,
+        Item::Register(register) => match rules::registration(
+            &venue,
+            &register.genesis,
+            &register.controller,
+            &register.founder_key,
+            &register.signature,
+            signed,
+        ) {
+            Ok(registration) => Verdict::Register(Registered {
+                space: registration.space,
+                clock: registration.clock,
                 controller: register.controller,
-                start_window: register.start_window,
-                keys,
-            })
-        }
-        Item::Migrate(signed_migrate) => {
-            let refused = |code: MigrateCode| Verdict::Refused {
-                kind: Some(Kind::Migrate),
-                code: code as u32,
-            };
-            let migrate = &signed_migrate.migrate;
-            if migrate.from != venue || migrate.to == venue {
-                return refused(MigrateCode::Venue);
-            }
-            let digest = migrate_digest(migrate);
-            if !signed(
-                &signed_migrate.controller,
-                &digest,
-                &signed_migrate.signature,
-            ) {
-                return refused(MigrateCode::Signature);
-            }
-            Verdict::Migrate {
-                space: migrate.space,
-                from_window: migrate.from_window,
-                controller: signed_migrate.controller,
-            }
-        }
+                keys: registration.keys,
+            }),
+            Err(refusal) => Verdict::Refused {
+                kind: Some(Kind::Register),
+                code: register_code(refusal) as u32,
+            },
+        },
         Item::Anchor(anchor) => {
             if !signed(&anchor.signer, &anchor.digest(&venue), &anchor.signature) {
                 return Verdict::Refused {
@@ -168,7 +134,7 @@ pub fn refine(
                 signer: anchor.signer,
             }
         }
-        Item::Submit(bytes) => Verdict::Submit(judge(config, venue, &bytes, extrinsics)),
+        Item::Submit(bytes) => Verdict::Submit(judge(config, &bytes, extrinsics)),
         Item::Control(signed_control) => {
             let digest = control_digest(&venue, &signed_control.control);
             if !signed(
@@ -192,13 +158,17 @@ pub fn refine(
     }
 }
 
+/// The service's code of a registration's refusal.
+pub fn register_code(refusal: RegisterRefusal) -> RegisterCode {
+    match refusal {
+        RegisterRefusal::Genesis | RegisterRefusal::Clock => RegisterCode::Genesis,
+        RegisterRefusal::Founder => RegisterCode::Founder,
+        RegisterRefusal::Exists => RegisterCode::Again,
+    }
+}
+
 /// A statement's judgement at refine.
-fn judge(
-    config: &Config,
-    venue: VenueId,
-    bytes: &[u8],
-    extrinsics: &mut impl Extrinsics,
-) -> Judged {
+fn judge(config: &Config, bytes: &[u8], extrinsics: &mut impl Extrinsics) -> Judged {
     let statement = if bytes.len() > MAX_STATEMENT_BYTES {
         Err(DecodeError::Trailing)
     } else {
@@ -224,11 +194,12 @@ fn judge(
     // A program it pins none for is refused as `admit` refuses another
     // program than the pinned one, after the format: no program id has a
     // word at `u32::MAX`.
-    let pin = config.pin(&statement.program).unwrap_or(Pin {
-        program: ProgramId([u32::MAX; 8]),
-        venue_bound: false,
-    });
-    let verdict = admit(&Stateless { venue }, &pin, &statement).and_then(|admitted| {
+    let program = if config.pins.contains(&statement.program) {
+        statement.program
+    } else {
+        ProgramId([u32::MAX; 8])
+    };
+    let verdict = admit(&Stateless, &program, &statement).and_then(|admitted| {
         let proof = match extrinsics.proof_len() {
             Some(len) if len > MAX_PROOF_BYTES => {
                 return Err(Refusal::Proof(vos_pvm_final_verifier::Error::Length));

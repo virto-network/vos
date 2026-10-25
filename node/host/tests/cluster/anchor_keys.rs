@@ -1,7 +1,6 @@
 //! The nodes' anchor keys at the model venue: a rotation, the new key
-//! signing once the venue lists it and no window missed; a single-founder
-//! space resumed after an equivocation by rotating its only key; a leader
-//! whose keys the venue does not list signing nothing; a node that did not
+//! signing once the venue lists it and no window missed; a leader whose
+//! keys the venue does not list signing nothing; a node that did not
 //! found the space replicating the representative once its key is
 //! registered, and anchoring after a failover; anchors waiting through a
 //! long wait taken up after a failover; a rotation whose process
@@ -27,12 +26,11 @@ use std::time::Duration;
 use ed25519_dalek::{Signer, SigningKey};
 use vos_node::{Config, ReplaceError, roots};
 use vos_venue::queue::{AnchorQueue, AnchorSend, Fate};
-use vos_venue::vos_statement::{Statement, StatementId};
-use vos_venue::{AnchorRefusal, Anchored, ModelVenue, NotAccepted, Status, VenueClient};
+use vos_venue::{AnchorRefusal, Anchored, ModelVenue, Status, VenueClient};
 use vos_wire::WindowClock;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::Unplaced;
-use vos_wire::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootRead, SpaceId, VenueId};
+use vos_wire::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, SpaceId};
 
 use crate::common::{Cluster, wait_until};
 use crate::support::Anchoring;
@@ -236,61 +234,6 @@ fn waiting_anchors_survive_a_failover_through_a_long_wait() {
     assert!(venue.evidence().is_empty());
 }
 
-/// An equivocation in a space of one founder: a second root of window 0,
-/// signed by its only anchor key, suspends the space. The node, stopped,
-/// rotates its key as `vos node anchor-key rotate` does; the controller
-/// registers the new key, cannot resume while the equivocating key is
-/// registered, and removes it. The window that closes while the space is
-/// suspended waits, unanchored; once resumed, it is anchored by the new key,
-/// then the next, and the disputed window never again.
-#[test]
-fn a_single_founder_resumes_after_an_equivocation() {
-    let (anchoring, mut cluster, clock, representative) = space(1);
-    let space = cluster.space.id();
-    let venue = &anchoring.venue;
-    let founding = cluster.node(1).anchor_keys()[0];
-    let first = anchored(&anchoring, &cluster, &clock, 0);
-    assert_eq!(first.signer, founding);
-    cluster.stop(1);
-    let data = cluster.dirs[0].path().to_path_buf();
-    let secret = vos_node::store::Fjall::open(data.join(vos_node::STORE))
-        .unwrap()
-        .node_secret()
-        .unwrap()
-        .unwrap();
-    let key = SigningKey::from_bytes(&secret);
-    assert_eq!(key.verifying_key().to_bytes(), founding);
-    let mut second = Anchor {
-        root: [0xee; 32],
-        ..first
-    };
-    second.signature = key.sign(&second.digest(&venue.id())).to_bytes();
-    assert_eq!(venue.anchor(&second), Err(AnchorRefusal::Equivocation));
-    assert!(venue.suspended(&space));
-    let rotated = vos_node::rotate_anchor_key(&data).unwrap();
-    cluster.start(1);
-    assert_eq!(cluster.node(1).anchor_keys(), [founding, rotated]);
-    assert!(venue.add_anchor_key(&space, rotated));
-    assert!(!venue.resume(&space), "the equivocating key is registered");
-    assert!(venue.remove_anchor_key(&space, &founding));
-    closed(&anchoring, &cluster, &clock, (1, representative), 1);
-    assert_eq!(
-        windows(&anchoring, &cluster),
-        [] as [u64; 0],
-        "window 0 disputed; suspended: window 1 waits"
-    );
-    assert!(venue.resume(&space));
-    assert_eq!(anchored(&anchoring, &cluster, &clock, 2).signer, rotated);
-    assert!(!venue.suspended(&space));
-    let anchors = venue.anchors(&space);
-    assert_eq!(
-        windows(&anchoring, &cluster),
-        [1, 2],
-        "window 0 never counts again"
-    );
-    assert_eq!(anchors[0].signer, rotated);
-}
-
 /// A node that did not found the space replicates the representative once
 /// it holds a registered anchor key: refused before, as it holds none;
 /// it rotates to one, the controller registers it, it replaces a founding
@@ -424,9 +367,9 @@ fn only_a_founding_node_signs_the_registration() {
     let space = cluster.space.id();
     let (key, signature) = cluster
         .node(2)
-        .sign_registration(&venue, &[9; 32], 4)
+        .sign_registration(&venue, &[9; 32])
         .expect("a founder signs");
-    let digest = vos_wire::vos_anchor::register_digest(&venue, &space, &[9; 32], 4);
+    let digest = vos_wire::vos_anchor::register_digest(&venue, &space, &[9; 32]);
     assert_eq!(key, cluster.node(2).id().0, "by its node key");
     ed25519_dalek::VerifyingKey::from_bytes(&key)
         .unwrap()
@@ -435,7 +378,7 @@ fn only_a_founding_node_signs_the_registration() {
     assert!(
         cluster
             .node(3)
-            .sign_registration(&venue, &[9; 32], 4)
+            .sign_registration(&venue, &[9; 32])
             .is_none(),
         "not a founder"
     );
@@ -443,7 +386,7 @@ fn only_a_founding_node_signs_the_registration() {
     assert!(
         spaceless
             .node(1)
-            .sign_registration(&venue, &[9; 32], 4)
+            .sign_registration(&venue, &[9; 32])
             .is_none(),
         "of no space"
     );
@@ -457,42 +400,14 @@ struct Unread {
     read: AtomicBool,
 }
 
-impl VenueClient for Unread {
-    fn id(&self) -> VenueId {
-        self.venue.id()
-    }
-
+vos_venue::forward_venue!(Unread => venue; forward [id, submit, anchored, anchor_keys, status, time, unsettled] {
     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
         if !self.read.load(Ordering::SeqCst) {
             return Err(AnchorRefusal::Unregistered);
         }
         self.venue.anchor(anchor)
     }
-
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
-        self.venue.submit(statement, proof)
-    }
-
-    fn anchored(&self, root: &RootRead) -> bool {
-        self.venue.anchored(root)
-    }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        self.venue.anchor_keys(space)
-    }
-
-    fn status(&self, space: &SpaceId) -> Status {
-        self.venue.status(space)
-    }
-
-    fn time(&self) -> Option<u64> {
-        self.venue.time()
-    }
-
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.venue.unsettled(space)
-    }
-}
+});
 
 /// Windows 0 and 1 close while the venue answers the space unregistered,
 /// its client not having read the registration: each anchor waits. Once
@@ -564,7 +479,7 @@ impl AnchorSend for Sending {
         self.1.fetch_add(1, Ordering::SeqCst);
         match self.0.anchor(anchor) {
             Ok(_) => Fate::Done,
-            Err(AnchorRefusal::Open | AnchorRefusal::Unregistered | AnchorRefusal::Suspended) => {
+            Err(AnchorRefusal::Open | AnchorRefusal::Unregistered | AnchorRefusal::Stopped) => {
                 Fate::Again(Duration::from_millis(50))
             }
             Err(AnchorRefusal::Key) => Fate::Resign,
@@ -592,11 +507,7 @@ impl AnchorSend for Sending {
     }
 }
 
-impl VenueClient for Queued {
-    fn id(&self) -> VenueId {
-        self.venue.id()
-    }
-
+vos_venue::forward_venue!(Queued => venue; forward [id, submit, anchored, status, time] {
     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
         if !self.queue.push(anchor) {
             return Err(AnchorRefusal::Key);
@@ -604,32 +515,16 @@ impl VenueClient for Queued {
         Ok(Anchored::Queued)
     }
 
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
-        self.venue.submit(statement, proof)
-    }
-
-    fn anchored(&self, root: &RootRead) -> bool {
-        self.venue.anchored(root)
-    }
-
     fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
         let stale = self.stale.lock().unwrap().clone();
         stale.unwrap_or_else(|| self.venue.anchor_keys(space))
-    }
-
-    fn status(&self, space: &SpaceId) -> Status {
-        self.venue.status(space)
-    }
-
-    fn time(&self) -> Option<u64> {
-        self.venue.time()
     }
 
     fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
         let injected = self.injected.lock().unwrap().clone();
         [self.queue.unsettled(space), injected].concat()
     }
-}
+});
 
 /// Set node `number`'s clock past `window`'s close, leaving the venue's,
 /// and wait until its replica of the representative has closed it.
@@ -803,5 +698,5 @@ fn an_anchor_handed_back_that_this_node_did_not_make_is_not_signed() {
     assert_eq!(queued.sends.load(Ordering::SeqCst), sent, "nothing sent");
     assert_eq!(venue.anchors(&space), [held]);
     assert!(venue.evidence().is_empty());
-    assert!(!venue.suspended(&space));
+    assert_eq!(venue.status(&space), Status::Active);
 }

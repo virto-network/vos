@@ -253,8 +253,7 @@ fn the_fixtures_are_judged() {
 ///
 /// The kernel states a fixed statement `S`: it sets φ9..12 to `S`'s
 /// io-hash, an output of its own, two roots of its space read and its
-/// `public_args` the venue's id and a nonce, as a venue-bound program's,
-/// then halts. Its run, cut in three segments, is proved at its class, its
+/// `public_args` 32 bytes and a nonce, then halts. Its run, cut in three segments, is proved at its class, its
 /// leaves folded to a root and the root wrapped under `format::MASKED_WRAP`, masked
 /// from the seeded test seam (`MaskRng::Seeded`, so the bytes are the
 /// generator's every run): `wrap.proof`; and under `format::WRAP`:
@@ -262,12 +261,10 @@ fn the_fixtures_are_judged() {
 /// a cheating prover would (the wrap circuit's checks failing, proved
 /// anyway): `wrap-prefix.proof`, the first two segments, which set the
 /// io-hash but never halt; `wrap-midway.proof`, the last two, labelled from
-/// position 0, which never start at the entry. A second kernel states a
-/// rootless statement `S0`, of no space, in one segment, its leaf wrapped
-/// under 39: `wrap-rootless.proof`.
+/// position 0, which never start at the entry.
 ///
-/// The production venue pins the kernel's program id, venue-bound, accepts
-/// `format::MASKED_WRAP`, registers `S`'s space from window 40, anchors `S`'s two roots
+/// The production venue pins the kernel's program id, accepts
+/// `format::MASKED_WRAP`, registers `S`'s space, anchors `S`'s two roots
 /// (windows 41 and 42), judges at window 42's boundary and has accepted one
 /// other statement. The test venue is the same and accepts 28 beside 39.
 /// The cases (`statements.cases`), each a venue's state, a statement and a
@@ -275,8 +272,7 @@ fn the_fixtures_are_judged() {
 /// thing changed, so each fails one check alone: a venue that verifies the
 /// proof before it reads its state (the JAM service's refine) reaches the
 /// same class as one that reads its state first:
-/// - **valid:** `S` and its wrap, accepted; **rootless:** `S0` and its
-///   wrap, accepted (its own program pinned);
+/// - **valid:** `S` and its wrap, accepted;
 /// - **tampered:** a byte of the wrap flipped;
 /// - **wrong program:** the venue pins another program, which the statement
 ///   names, and the wrap is this kernel's;
@@ -291,26 +287,18 @@ fn the_fixtures_are_judged() {
 ///   than the one the venue pinned;
 /// - **another space:** a root of another space than `S`'s;
 /// - **the space:** `S` claiming another space than its roots';
-/// - **rootless, another space:** `S` without its roots, its space still
-///   claimed: a rootless statement belongs to no space, since nothing
-///   binds it there and each space would give one proof another id;
+/// - **rootless:** `S` without its roots: a venue judges rooted statements
+///   alone, since nothing binds a rootless one to a space or a venue;
 /// - **rooted, of no space:** `S` claiming `SpaceId::NONE`, its roots of
 ///   none too and anchored: no space has the id `NONE`;
-/// - **another venue's statement:** `S` with `public_args` naming another
-///   venue; **replayed at another venue:** `S` at a venue of another id;
 /// - **a root's window**, **a root:** `S` at a venue that holds its second
 ///   root at another window, or another root at its window;
 /// - **the nonce:** `S` with its nonce changed; **the roots' order:** its
 ///   two roots swapped; **a root dropped:** its second root left out; each
 ///   bound by the proof's words through the io-hash;
-/// - **migrated before a root's window:** the venue's range for `S`'s
-///   space ends at window 42; **registered after a root's window:** it
-///   starts at 42;
-/// - **rooted, replayed past MaxRootAge:** `S` accepted, then the venue's
-///   time past its newest root's `MaxRootAge`: its `Seen` entry and its
-///   anchors dropped, it is unanchored;
-/// - **rootless, replayed past MaxRootAge:** `S0` accepted, then the same
-///   time passed: its `Seen` entry kept, it is repeated;
+/// - **replayed past MaxRootAge:** `S` accepted, then the venue's time past
+///   its newest root's `MaxRootAge`: its `Seen` entry and its anchors
+///   dropped, it is unanchored;
 /// - **the test policy:** `S` under 28 at the test venue, accepted; its
 ///   wrap's byte flipped; and the transition both ways, `S` accepted under
 ///   39 and replayed under 28, and accepted under 28 and replayed under 39,
@@ -329,10 +317,10 @@ mod statements {
     use vos_pvm_recair::masked::MaskRng;
     use vos_pvm_recair::wrap::{self, WrapCircuit};
     use vos_statement::fixtures::{CASES, Case, Patch};
-    use vos_statement::model::{Input, Policy, Range, Space};
+    use vos_statement::model::{Input, Policy, Space};
     use vos_statement::{
-        MAX_ROOT_AGE_MS, Pin, ProgramId, Refusal, RootKind, RootRead, SpaceId, Statement,
-        StatementId, VenueId, WindowClock,
+        MAX_ROOT_AGE_MS, ProgramId, Refusal, RootKind, RootRead, SpaceId, Statement, StatementId,
+        VenueId, WindowClock,
     };
 
     use super::common::{self, NodeRun};
@@ -351,7 +339,7 @@ mod statements {
     /// closed and anchored.
     const NOW: u64 = 43 * 600_000;
 
-    /// The venue: a JAM service's.
+    /// The 32 bytes `S`'s `public_args` lead with: a JAM venue's id.
     fn venue() -> VenueId {
         VenueId::jam(&[0x4A; 32], 7)
     }
@@ -365,8 +353,8 @@ mod statements {
         }
     }
 
-    /// `S`, its program left to fill: venue-bound, its `public_args` the
-    /// venue's id and a nonce.
+    /// `S`, its program left to fill: its `public_args` a venue's id and a
+    /// nonce.
     fn statement() -> Statement {
         Statement {
             format: masked::FORMAT,
@@ -375,18 +363,6 @@ mod statements {
             public_args: [&venue().0[..], b"nonce 7"].concat(),
             output: b"the statement's output".to_vec(),
             roots: vec![root(41, 0x41), root(42, 0x42)],
-        }
-    }
-
-    /// `S0`, its program left to fill: rootless, of no space.
-    fn rootless() -> Statement {
-        Statement {
-            format: masked::FORMAT,
-            program: ProgramId([0; 8]),
-            space: SpaceId::NONE,
-            public_args: [&venue().0[..], b"nonce 8"].concat(),
-            output: b"the rootless statement's output".to_vec(),
-            roots: Vec::new(),
         }
     }
 
@@ -505,32 +481,17 @@ mod statements {
         let midway = masked_wrap(&tail, &program, true);
         let valid_28 = unmasked_wrap(&whole, &program);
 
-        let lone = rootless();
-        let (lone_program, lone_entry, lone_segments) = proved(&lone, &[(0, 6)]);
-        let lone_leaf =
-            common::prove_leaf(&lone_program, &lone_entry, 0, &lone_segments[0], 0, word);
-        assert!(lone_leaf.node.output.entry && lone_leaf.node.output.halt);
-        let valid_rootless = masked_wrap(&lone_leaf, &lone_program, false);
-
         let pinned = ProgramId(program.id().words());
         let other = ProgramId(pinned.0.map(|word| (word + 1) % ((1 << 31) - 1)));
         let s = Statement {
             program: pinned,
             ..base
         };
-        let s0 = Statement {
-            program: ProgramId(lone_program.id().words()),
-            ..lone
-        };
         let production = {
-            let mut policy = Policy::new(venue(), NOW, &[masked::FORMAT]);
+            let mut policy = Policy::new(NOW, &[masked::FORMAT]);
             policy.spaces.push(Space {
                 id: SPACE,
                 clock: CLOCK,
-                range: Range {
-                    from: 40,
-                    until: None,
-                },
             });
             policy.anchors = s.roots.clone();
             policy.seen.push((
@@ -545,22 +506,12 @@ mod statements {
         };
         let input = |change: &dyn Fn(&mut Input)| {
             let mut input = Input {
-                pin: Pin {
-                    program: pinned,
-                    venue_bound: true,
-                },
+                program: pinned,
                 policy: production.clone(),
                 statement: s.clone(),
             };
             change(&mut input);
             input
-        };
-        let rootless_input = |change: &dyn Fn(&mut Input)| {
-            input(&|i| {
-                i.pin.program = s0.program;
-                i.statement = s0.clone();
-                change(i);
-            })
         };
         // The venue's time past the newest root's `MaxRootAge`.
         let past = CLOCK.boundary(42).unwrap() + MAX_ROOT_AGE_MS + 1;
@@ -597,13 +548,6 @@ mod statements {
         let cases: Vec<(&str, &str, Option<Patch>, Input, Class)> = vec![
             ("valid", "wrap.proof", None, input(&|_| {}), accepted),
             (
-                "rootless",
-                "wrap-rootless.proof",
-                None,
-                rootless_input(&|_| {}),
-                accepted,
-            ),
-            (
                 "tampered",
                 "wrap.proof",
                 Some(flip(&valid)),
@@ -615,7 +559,7 @@ mod statements {
                 "wrap.proof",
                 None,
                 input(&|i| {
-                    i.pin.program = other;
+                    i.program = other;
                     i.statement.program = other;
                 }),
                 by_words,
@@ -693,7 +637,7 @@ mod statements {
                 |code| code == Refusal::Space.code(),
             ),
             (
-                "rootless, another space",
+                "rootless",
                 "wrap.proof",
                 None,
                 input(&|i| i.statement.roots.clear()),
@@ -712,20 +656,6 @@ mod statements {
                     i.policy.anchors = i.statement.roots.clone();
                 }),
                 |code| code == Refusal::Space.code(),
-            ),
-            (
-                "another venue's statement",
-                "wrap.proof",
-                None,
-                input(&|i| i.statement.public_args[31] ^= 1),
-                |code| code == Refusal::Venue.code(),
-            ),
-            (
-                "replayed at another venue",
-                "wrap.proof",
-                None,
-                input(&|i| i.policy.venue = VenueId::jam(&[0x4A; 32], 8)),
-                |code| code == Refusal::Venue.code(),
             ),
             (
                 "a root's window",
@@ -765,31 +695,7 @@ mod statements {
                 by_words,
             ),
             (
-                "migrated before a root's window",
-                "wrap.proof",
-                None,
-                input(&|i| {
-                    i.policy.spaces[0].range = Range {
-                        from: 40,
-                        until: Some(42),
-                    }
-                }),
-                |code| code == Refusal::Unanchored.code(),
-            ),
-            (
-                "registered after a root's window",
-                "wrap.proof",
-                None,
-                input(&|i| {
-                    i.policy.spaces[0].range = Range {
-                        from: 42,
-                        until: None,
-                    }
-                }),
-                |code| code == Refusal::Unanchored.code(),
-            ),
-            (
-                "rooted, replayed past MaxRootAge",
+                "replayed past MaxRootAge",
                 "wrap.proof",
                 None,
                 input(&|i| {
@@ -797,16 +703,6 @@ mod statements {
                     i.policy.advance(past);
                 }),
                 |code| code == Refusal::Unanchored.code(),
-            ),
-            (
-                "rootless, replayed past MaxRootAge",
-                "wrap-rootless.proof",
-                None,
-                rootless_input(&|i| {
-                    i.policy.record(&i.statement);
-                    i.policy.advance(past);
-                }),
-                |code| code == Refusal::Repeated.code(),
             ),
             (
                 "format 28 at the test venue",
@@ -842,7 +738,6 @@ mod statements {
         ];
         let proofs = [
             ("wrap.proof", &valid),
-            ("wrap-rootless.proof", &valid_rootless),
             ("wrap-prefix.proof", &prefix),
             ("wrap-midway.proof", &midway),
             ("wrap-28.proof", &valid_28),

@@ -9,13 +9,13 @@ Slice 6 built:
   its program id, its space, its `#[public]` arguments, its output and
   the roots it read; the node's prover, built into the node, proves each
   statement at an anchored cut its leader's agents record and submits it
-  to the space's venue (`proving.md` §3.6); a rootless statement has no
-  production prover yet (`proving.md` §6);
+  to the space's venue (`proving.md` §3.6); a venue judges rooted
+  statements alone (`proving.md` §3.6);
 - **the space roots and anchors:** Unix-time windows from the space's
   genesis, a space root per window built by its representative, anchored
-  by one registered node key at the space's one venue; a space moves to
-  another venue by a one-way migration from a later window
-  (`proving.md` §7);
+  by one registered node key at the space's one venue, for good: a space
+  that changes venue founds again under a new genesis, and an
+  equivocation ends it (`proving.md` §7);
 - **the carried commitment,** which replaces two-anchor reads, and
   `&self` reads by a served witness, inline in the read's `Resume` input
   (C.4);
@@ -172,8 +172,9 @@ slice 5's 5.15).
 
 - **`SpaceId`** = the hash of the space's genesis (`vos-anchor`); a
   founding node key binds a controller at each venue.
-- **Counterparties anchor at the same venue;** a pair on two venues
-  settles once one migrates.
+- **Counterparties anchor at the same venue,** for good: a space anchors
+  at one venue, so a pair on two venues settles only once one of them
+  founds again at the other's (`slice-7-mobile.md`, pin D′).
 - **Pair keys qualified by space:** `(sender space, agent)` and
   `(receiver space, agent)`. `Message.from`, `Deliver`, `Acknowledge`
   and `Behind` carry `SpaceId`. That changes the wire, once.

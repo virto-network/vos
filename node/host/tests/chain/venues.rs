@@ -3,7 +3,6 @@
 //! package a JAM service's client sent and its work report, the Kreivo
 //! mock's signed envelopes, and each proof's time.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -16,9 +15,8 @@ use vos_venue::kreivo::Transport;
 use vos_venue::kreivo::calls::AccountId;
 use vos_venue::kreivo::transport::{Included, Lost, SendError, Signed};
 use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
-use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, VenueClient};
+use vos_venue::{NotAccepted, VenueClient};
 use vos_wire::result::Attest;
-use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
@@ -108,15 +106,7 @@ impl Recorded {
     }
 }
 
-impl VenueClient for Recorded {
-    fn id(&self) -> VenueId {
-        self.inner.id()
-    }
-
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        self.inner.anchor(anchor)
-    }
-
+vos_venue::forward_venue!(Recorded => inner; forward [id, anchor, anchored, anchor_keys, status, time, unsettled] {
     fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
         let answer = self.inner.submit(statement, proof);
         lock(&self.judged).push(Judgement {
@@ -126,27 +116,7 @@ impl VenueClient for Recorded {
         });
         answer
     }
-
-    fn anchored(&self, root: &RootRead) -> bool {
-        self.inner.anchored(root)
-    }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        self.inner.anchor_keys(space)
-    }
-
-    fn status(&self, space: &SpaceId) -> Status {
-        self.inner.status(space)
-    }
-
-    fn time(&self) -> Option<u64> {
-        self.inner.time()
-    }
-
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.inner.unsettled(space)
-    }
-}
+});
 
 /// A work package sent to a JAM service, as it went: its encoding, its
 /// extrinsics, and the work report a guarantor made of it, once read.
@@ -226,58 +196,6 @@ impl Wire {
                 .ok()
                 .flatten()
         })
-    }
-}
-
-/// A node's venue as its operator reconfigures it when the space migrates:
-/// the old venue's client until `moved`, the new one's after.
-pub struct Migrating {
-    pub before: Arc<dyn VenueClient>,
-    pub after: Arc<dyn VenueClient>,
-    pub moved: Arc<AtomicBool>,
-}
-
-impl Migrating {
-    fn current(&self) -> &Arc<dyn VenueClient> {
-        if self.moved.load(Ordering::SeqCst) {
-            &self.after
-        } else {
-            &self.before
-        }
-    }
-}
-
-impl VenueClient for Migrating {
-    fn id(&self) -> VenueId {
-        self.current().id()
-    }
-
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        self.current().anchor(anchor)
-    }
-
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
-        self.current().submit(statement, proof)
-    }
-
-    fn anchored(&self, root: &RootRead) -> bool {
-        self.current().anchored(root)
-    }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        self.current().anchor_keys(space)
-    }
-
-    fn status(&self, space: &SpaceId) -> Status {
-        self.current().status(space)
-    }
-
-    fn time(&self) -> Option<u64> {
-        self.current().time()
-    }
-
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.current().unsettled(space)
     }
 }
 

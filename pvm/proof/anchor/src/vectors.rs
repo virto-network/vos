@@ -2,8 +2,8 @@
 //! them, byte for byte, natively, in Wasm and in the PVM.
 //!
 //! A [`Vector`] is a genesis and what a venue signs over with it: a venue,
-//! a controller, a first window, a window and its representative's root,
-//! and a JAM chain's genesis and service. Its [`Digests`] are the space's
+//! a controller, a window and its representative's root, and a JAM chain's
+//! genesis and service. Its [`Digests`] are the space's
 //! id, the space root `S_w` of the window, the anchor digest of `S_w` at the
 //! venue, the registration digest and the JAM venue's id. A venue's harness
 //! decodes a vector's encoding ([`Vector::encode`]), computes its digests,
@@ -24,7 +24,6 @@ pub struct Vector {
     pub genesis: SpaceGenesis,
     pub venue: VenueId,
     pub controller: [u8; 32],
-    pub start_window: u64,
     pub window: u64,
     /// The representative's agent root at its cut of `window`.
     pub rep_root: [u8; 32],
@@ -68,14 +67,12 @@ impl Digests {
 
 impl Vector {
     /// Its encoding: the genesis's, then the venue, the controller, the
-    /// first window, the window, the representative's root, the JAM genesis
-    /// and the service.
+    /// window, the representative's root, the JAM genesis and the service.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.genesis.encode_to(&mut out);
         out.extend_from_slice(&self.venue.0);
         out.extend_from_slice(&self.controller);
-        out.extend_from_slice(&self.start_window.to_le_bytes());
         out.extend_from_slice(&self.window.to_le_bytes());
         out.extend_from_slice(&self.rep_root);
         out.extend_from_slice(&self.jam_genesis);
@@ -90,7 +87,6 @@ impl Vector {
             genesis: SpaceGenesis::decode_from(&mut reader)?,
             venue: VenueId(reader.array()?),
             controller: reader.array()?,
-            start_window: reader.u64()?,
             window: reader.u64()?,
             rep_root: reader.array()?,
             jam_genesis: reader.array()?,
@@ -114,7 +110,7 @@ impl Vector {
                 RootKind::Space,
                 &space_root,
             ),
-            register: register_digest(&self.venue, &space, &self.controller, self.start_window),
+            register: register_digest(&self.venue, &space, &self.controller),
             jam_venue: VenueId::jam(&self.jam_genesis, self.service),
         }
     }
@@ -133,7 +129,7 @@ fn counting<const N: usize>(from: u8) -> [u8; N] {
 }
 
 /// The golden vectors: one founder at window 0; three founders at window
-/// 2,966,001 of a two-minute clock, its first window the one before; and
+/// 2,966,001 of a two-minute clock; and
 /// every integer at its top, 64 founders (a two-byte count, more than a
 /// venue registers: the encoding's vector, not a registrable genesis).
 pub fn golden() -> Vec<Golden> {
@@ -153,7 +149,6 @@ pub fn golden() -> Vec<Golden> {
                 },
                 venue: VenueId([0x4b; 32]),
                 controller: [0xc0; 32],
-                start_window: 0,
                 window: 0,
                 rep_root: [0x22; 32],
                 jam_genesis: [0x7a; 32],
@@ -163,7 +158,7 @@ pub fn golden() -> Vec<Golden> {
                 "67a526a077f2fb557e36a7b90d631e34a63ae33a7d4904820a6229c6d6064385",
                 "59bca6cffe6878f3f5233bcb12f4ed7ae403c665814c70b12504cdcd796f06cc",
                 "4a3a40450c3d61d91e3b0a5224b686bd285a0ac9e65ed1013026934600d77fae",
-                "caf4bf0e15a1246da881e68a7031e2016b8ef583c63209c02e3e2ed3445b1f7b",
+                "57832e0395a16310fcd11123f63aa095690452bbbc48874a06e32b8ff7beea25",
                 "8a2bc027b19306035c5113f838d08e0781a3225ccf8348bde7a5a00060babff0"
             ),
         },
@@ -186,7 +181,6 @@ pub fn golden() -> Vec<Golden> {
                 },
                 venue: VenueId(counting(0x00)),
                 controller: counting(0x80),
-                start_window: 2_966_000,
                 window: 2_966_001,
                 rep_root: counting(0xd0),
                 jam_genesis: counting(0x40),
@@ -196,7 +190,7 @@ pub fn golden() -> Vec<Golden> {
                 "5a47da04f4b9ed4554145148fa20f6c3d52d882aff6559d4df13245f5704ef72",
                 "4055c65efa0159a24210735dd73e970c466a00b93cfc2b293512b880db51efdf",
                 "69b5f3b3503d6d4e9035408924d7aedc7c3ca43528f60a47a915a64716a79303",
-                "07d90a142325c10da81c8335a51b06296224cf1f6583d675e19904d16b0556a6",
+                "79d2303febeb13b866e9291d5bb9112b2cb969d9b9d9d469b5f186309b370d6d",
                 "50ac7e1c9f56e745963a6ad591313eb08fabf20f2e7d2e90eed5406f0f10ca69"
             ),
         },
@@ -215,7 +209,6 @@ pub fn golden() -> Vec<Golden> {
                 },
                 venue: VenueId([0xff; 32]),
                 controller: [0xff; 32],
-                start_window: u64::MAX,
                 window: u64::MAX,
                 rep_root: [0xff; 32],
                 jam_genesis: [0xff; 32],
@@ -225,7 +218,7 @@ pub fn golden() -> Vec<Golden> {
                 "680c554472cc2141f0e35a70b7340c5bc3b594bc639c34827d874cd90821a0a6",
                 "8f26b88d10b59d4efd8acd101ab48b15df6a5a3ce1d696b9f51155c24810425e",
                 "fa4dd591cd3f48b27447b0146233786c5ad100b9195a26f3e5eb65dbd1d27e03",
-                "1ccbba8406950f15ad4c1f43ac39e06e78be800ac6f64daf91b102800b1ae931",
+                "80d6f57b1cdfc362b78e8405b06b199585fa0c0c101fc56199a7f9cb08c96110",
                 "799bf7fd73ab486ca1254788dc6d6cf91ac23d0db52c96cef0bc4f084b8795a7"
             ),
         },

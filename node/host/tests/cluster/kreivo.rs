@@ -4,7 +4,7 @@
 //! client signing as its own account, the space registered with every
 //! node its authority, paired with its genesis key, the sovereign account
 //! paying. Anchors land once a window, in order, while the leader never
-//! waits on the chain inside its batch; a suspended space is sent nothing;
+//! waits on the chain inside its batch; a blocked space is sent nothing;
 //! a key the venue refuses is tried again once a window, or once the
 //! venue's listing changes.
 //!
@@ -22,11 +22,10 @@ use vos_venue::kreivo::mock::transport::MockChain;
 use vos_venue::kreivo::mock::types::{AuthorityInfo, SpaceInfo, SpaceStatus};
 use vos_venue::kreivo::mock::{Account, Chain, Constants, Origin, keys};
 use vos_venue::kreivo::{KreivoVenue, Options};
-use vos_venue::vos_statement::{Statement, StatementId};
-use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, VenueClient};
+use vos_venue::{AnchorRefusal, Anchored, Status, VenueClient};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
-use vos_wire::vos_anchor::{Anchor, RootRead, SpaceId, VenueId, WindowClock};
+use vos_wire::vos_anchor::{Anchor, SpaceId, VenueId, WindowClock};
 
 use crate::common::{Cluster, wait_until};
 use crate::support::clock;
@@ -46,11 +45,7 @@ struct Watched {
     extra: Arc<Mutex<Vec<[u8; 32]>>>,
 }
 
-impl VenueClient for Watched {
-    fn id(&self) -> VenueId {
-        self.inner.id()
-    }
-
+vos_venue::forward_venue!(Watched => inner; forward [id, submit, anchored, status, time, unsettled] {
     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
         let start = Instant::now();
         let answer = self.inner.anchor(anchor);
@@ -60,32 +55,12 @@ impl VenueClient for Watched {
         answer
     }
 
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
-        self.inner.submit(statement, proof)
-    }
-
-    fn anchored(&self, root: &RootRead) -> bool {
-        self.inner.anchored(root)
-    }
-
     fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
         let mut keys = self.extra.lock().unwrap().clone();
         keys.extend(self.inner.anchor_keys(space));
         keys
     }
-
-    fn status(&self, space: &SpaceId) -> Status {
-        self.inner.status(space)
-    }
-
-    fn time(&self) -> Option<u64> {
-        self.inner.time()
-    }
-
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.inner.unsettled(space)
-    }
-}
+});
 
 /// A node's client: its number, its account, the client.
 type Client = (NodeNumber, [u8; 32], Arc<Watched>);
@@ -171,7 +146,6 @@ impl Kreivo {
                 origin_ms: genesis.clock.origin_ms,
                 length_ms: genesis.clock.length_ms,
                 start_window: 0,
-                end_window: None,
                 status: SpaceStatus::Active,
                 authorities: clients.len() as u8,
                 anchor_keys: genesis.nodes.len() as u8,
@@ -332,28 +306,30 @@ fn anchors_land_once_a_window_and_never_hold_the_batch() {
     );
 }
 
-/// A suspended space is sent no anchor: its windows close, their anchors
+/// A blocked space is sent no anchor: its windows close, their anchors
 /// wait unsent, and land once the space is active again.
 #[test]
-fn a_suspended_space_is_sent_no_anchor() {
+fn a_blocked_space_is_sent_no_anchor() {
     let (kreivo, cluster, clock, representative) = space();
     close(&kreivo, &cluster, &clock, 0);
     wait_until("window 0 lands", || kreivo.holds(&cluster, 0));
-    kreivo.set_status(&cluster, SpaceStatus::Suspended);
+    kreivo.set_status(&cluster, SpaceStatus::Blocked);
     let clients = kreivo.clients.lock().unwrap().clone();
-    wait_until("every client reads the suspension", || {
+    wait_until("every client reads the block", || {
         clients
             .iter()
-            .all(|(_, _, client)| client.status(&cluster.space.id()) == Status::Suspended)
+            .all(|(_, _, client)| client.status(&cluster.space.id()) == Status::Blocked)
     });
     let calls = kreivo.anchor_calls();
     close(&kreivo, &cluster, &clock, 1);
     closed(&cluster, representative, 1);
     std::thread::sleep(Duration::from_secs(5));
-    assert_eq!(kreivo.sent(), [0], "nothing sent while suspended");
+    assert_eq!(kreivo.sent(), [0], "nothing sent while blocked");
     assert_eq!(kreivo.anchor_calls(), calls, "nothing handed over");
     kreivo.set_status(&cluster, SpaceStatus::Active);
-    wait_until("window 1 lands once resumed", || kreivo.holds(&cluster, 1));
+    wait_until("window 1 lands once unblocked", || {
+        kreivo.holds(&cluster, 1)
+    });
     assert_eq!(kreivo.included(), [0, 1]);
 }
 

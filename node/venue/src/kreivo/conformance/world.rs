@@ -1,13 +1,14 @@
 //! The world every vector starts from: the fixtures' time (window 42's
-//! boundary of the fixture space's clock); `format::MASKED_WRAP` and the fixtures' two
-//! programs (venue-bound, `Record`) active from 0; the fixture space `F`
-//! (the fixtures' statements' space, `[0xA1; 32]`, registered from window
-//! 40 under the default clock, its one authority paired with its anchor
-//! key) in the pre-state as storage, since no genesis hashes to the
-//! fixtures' space id; the venue the fixtures' (their statements bind it).
-//! A second space `B`, registered by call from a two-founder genesis, on a
-//! clock of its own (origin 1,000,000 ms, ten-minute windows: window 41 at
-//! the fixtures' time).
+//! boundary of the fixture space's clock); `format::MASKED_WRAP` and the
+//! fixtures' program (`Record`) active from 0; the fixture space `F` (the
+//! fixtures' statements' space, `[0xA1; 32]`, registered from window 40
+//! under the default clock, its one authority paired with its anchor key)
+//! in the pre-state as storage, since no genesis hashes to the fixtures'
+//! space id. A second space `B`, registered by call from a two-founder
+//! genesis, on a clock of its own (origin 1,000,000 ms, ten-minute windows:
+//! window 41 at the fixtures' time); a vector that anchors its early
+//! windows registers it while its window 29 is open, so it anchors from
+//! window 30.
 
 use ed25519_dalek::{Signer, SigningKey};
 use parity_scale_codec::Encode;
@@ -55,6 +56,13 @@ pub(super) const KEY_4: u8 = 4;
 pub(super) const KEY_5: u8 = 5;
 pub(super) const KEY_6: u8 = 6;
 pub(super) const KEY_9: u8 = 9;
+
+/// A key of small order (the identity's encoding), which no venue lists.
+pub(super) const SMALL_ORDER_KEY: [u8; 32] = {
+    let mut key = [0; 32];
+    key[0] = 1;
+    key
+};
 
 pub(super) fn signing(seed: u8) -> SigningKey {
     SigningKey::from_bytes(&[seed; 32])
@@ -152,7 +160,6 @@ impl<'f> World<'f> {
             origin_ms: F_CLOCK.origin_ms,
             length_ms: F_CLOCK.length_ms,
             start_window: 40,
-            end_window: None,
             status: SpaceStatus::Active,
             authorities: 1,
             anchor_keys: 1,
@@ -207,21 +214,18 @@ impl<'f> World<'f> {
             },
             Expect::Ok,
         );
-        for input in [&fx.valid, &fx.rootless] {
-            let info = ProgramInfo {
-                handler: Handler::Record,
-                venue_bound: input.pin.venue_bound,
-                active: always,
-            };
-            world.call(
-                Origin::Root,
-                Call::SetProgram {
-                    program: input.pin.program.0,
-                    info: Some(info),
-                },
-                Expect::Ok,
-            );
-        }
+        let info = ProgramInfo {
+            handler: Handler::Record,
+            active: always,
+        };
+        world.call(
+            Origin::Root,
+            Call::SetProgram {
+                program: fx.valid.program.0,
+                info: Some(info),
+            },
+            Expect::Ok,
+        );
         world
     }
 
@@ -383,13 +387,9 @@ impl<'f> World<'f> {
     }
 
     /// The fixtures' statement `S`, accepted.
-    pub(super) fn accept(&mut self, by: AccountId, payer: Space, rootless: bool) {
-        let (input, proof) = if rootless {
-            (&self.fx.rootless, self.fx.rootless_proof.clone())
-        } else {
-            (&self.fx.valid, self.fx.proof.clone())
-        };
-        let statement = input.statement.clone();
+    pub(super) fn accept(&mut self, by: AccountId, payer: Space) {
+        let statement = self.fx.statement().clone();
+        let proof = self.fx.proof.clone();
         let outcome = self.submit(by, payer, statement.encode(), proof, Expect::Ok);
         match &outcome.events[..] {
             [
@@ -407,47 +407,43 @@ impl<'f> World<'f> {
         }
     }
 
-    /// `genesis` registered by the operator under `CONTROLLER` from `start`,
-    /// founder 1 signing.
-    pub(super) fn register(
-        &mut self,
-        genesis: &SpaceGenesis,
-        start: u64,
-        expect: Expect,
-    ) -> Outcome {
-        let call = self.registration(genesis, start, start, KEY_1, KEY_1);
+    /// `genesis` registered by the operator under `CONTROLLER`, founder 1
+    /// signing: it anchors from the venue's next window.
+    pub(super) fn register(&mut self, genesis: &SpaceGenesis, expect: Expect) -> Outcome {
+        let call = self.registration(genesis, CONTROLLER, KEY_1, KEY_1);
         self.call(Origin::Signed(OPERATOR), call, expect)
     }
 
-    /// A registration of `genesis` claiming `founder`'s key, signed by
-    /// `signer` over `signed` as its first window, submitted with `start`.
+    /// A registration of `genesis` under `CONTROLLER` claiming `founder`'s
+    /// key, signed by `signer` over its digest under `signed_for`.
     pub(super) fn registration(
         &self,
         genesis: &SpaceGenesis,
-        start: u64,
-        signed: u64,
+        signed_for: AccountId,
         founder: u8,
         signer: u8,
     ) -> Call {
         let digest = vos_anchor::register_digest(
             &self.constants().venue,
             &vos_anchor::space_id(genesis),
-            &CONTROLLER,
-            signed,
+            &signed_for,
         );
         Call::Register {
             genesis: genesis.encode(),
             controller: CONTROLLER,
-            start_window: start,
             founder_key: public(founder),
             founder_sig: signing(signer).sign(&digest).to_bytes(),
         }
     }
 
-    /// `B` registered from `B_START`, `who` its authority paired with the
-    /// key of `seed`.
+    /// `B` registered while its window `B_START − 1` is open, so it anchors
+    /// from `B_START`, then the venue's time back at the fixtures'; `who`
+    /// its authority paired with the key of `seed`.
     pub(super) fn with_b(&mut self, who: AccountId, seed: u8) {
-        self.register(&b_genesis(), B_START, Expect::Ok);
+        let now = self.chain.now();
+        self.at(B_CLOCK.boundary(B_START - 2).unwrap());
+        self.register(&b_genesis(), Expect::Ok);
+        self.at(now);
         self.add_authority(who, Some(public(seed)), Expect::Ok);
     }
 
@@ -475,7 +471,7 @@ impl<'f> World<'f> {
 }
 
 /// A statement of `space` reading its root `root` at `window`, of the
-/// fixtures' program and venue: refused before its proof.
+/// fixtures' program: refused before its proof.
 pub(super) fn statement_of(fx: &Fixtures, space: Space, window: u64, root: [u8; 32]) -> Vec<u8> {
     Statement {
         space: SpaceId(space),
