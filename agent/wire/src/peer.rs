@@ -1,8 +1,9 @@
 //! What one node sends another: messages for an agent's replica group,
 //! snapshot chunks, blobs, liveness, the directory of agents, clients'
-//! calls and read indexes, which a replica asks of its leader, and agents'
+//! calls and read indexes, which a replica asks of its leader, agents'
 //! messages to each other, their acknowledgements and their receivers'
-//! calls to send again. The node checks each against the space's
+//! calls to send again, and the representative's anchor rows, which its
+//! leader asks of its replicas. The node checks each against the space's
 //! configuration before it reaches a group.
 //!
 //! The Raft types mirror the consensus core's, so the wire format is this
@@ -130,6 +131,24 @@ pub enum PeerMessage {
         sender: AgentId,
         receiver: AgentId,
         relayed: bool,
+    },
+    /// The leader of `agent`, the space's representative, asks a replica
+    /// for the space's root its close of `window` made (its anchor row),
+    /// before it sends an anchor the venue would keep as an equivocation's
+    /// evidence.
+    #[codec(index = 16)]
+    AnchorRow {
+        agent: AgentId,
+        token: u64,
+        window: u64,
+    },
+    /// A replica's answer: the root its anchor row holds, none while it
+    /// has none.
+    #[codec(index = 17)]
+    AnchorRowAnswer {
+        agent: AgentId,
+        token: u64,
+        root: Option<[u8; 32]>,
     },
 }
 

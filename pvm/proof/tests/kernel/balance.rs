@@ -142,11 +142,7 @@ fn a_balance_is_accepted_at_the_model_venue() {
     let venue = Venue::pinned(VenueId([0x7e; 32]), &[genesis(1)], program);
     venue.anchor(&root).expect("anchored");
     let code = |statement: &Statement| {
-        vos_venue::code(&vos_venue::VenueClient::submit(
-            &venue.venue,
-            statement,
-            &proof,
-        ))
+        vos_venue::VenueClient::submit(&venue.venue, statement, &proof).code()
     };
     let mut changed = statement.clone();
     let threshold = changed.public_args.len() - 8;

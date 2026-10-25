@@ -50,9 +50,10 @@ pub use build::Build;
 pub(crate) use build::build;
 
 pub use cuts::{
-    CutProof, ReadRow, cut_proof, cut_proof_at, cut_root, latest_built, served_at, undo,
+    CutProof, ReadRow, anchor_of, anchors, cut_proof, cut_proof_at, cut_root, latest_built,
+    served_at, undo,
 };
-pub(crate) use cuts::{answered, closing_of, cut_roots, serving_windows};
+pub(crate) use cuts::{answered, cut_roots, serving_windows};
 
 /// The most distinct keys one batch rebuilds.
 pub(crate) const BATCH: usize = 10_000;

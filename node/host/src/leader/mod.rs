@@ -32,6 +32,7 @@ use crate::group::{Local, Shared, State};
 use crate::node::{Agent, Inner, Pending};
 use crate::store::Snapshot;
 use crate::{Backoff, lock, timeout};
+pub use anchor::AnchorAlert;
 use anchor::Anchoring;
 use sweep::Sweeps;
 use window::{BEHIND_EVERY, WINDOW, Window};
@@ -139,6 +140,9 @@ enum Taken {
     Serve,
     /// No input: the windows due go again.
     Rounds,
+    /// The representative's waiting anchors are due again: offered, with
+    /// no batch.
+    Anchor,
 }
 
 /// What woke an idle leader.
@@ -196,9 +200,15 @@ impl Leader {
             return true;
         }
         while let Some(taken) = self.take().await {
+            // The rows applied so far, before the batch: never a root of a
+            // batch under proposal; once a cut is built, or the recheck due.
+            if self.anchor_due() {
+                self.anchor().await;
+            }
             let pending = match taken {
                 Taken::Inputs(pending) => Some(pending),
                 Taken::Sweep | Taken::Serve => Some(Vec::new()),
+                Taken::Anchor => None,
                 Taken::Marker => {
                     if !self.marker().await {
                         return false;
@@ -302,16 +312,16 @@ impl Leader {
                 smol::future::yield_now().await;
                 return Some(Taken::Marker);
             }
-            // A read proved at its cut, a report, a close, or a waiting
-            // anchor to try again.
-            let anchor = self.anchor_wait();
-            if self.serve_due()
-                || self.duties_due()
-                || self.proofs_due()
-                || anchor == Some(Duration::ZERO)
-            {
+            // A read proved at its cut, a report or a close.
+            if self.serve_due() || self.duties_due() || self.proofs_due() {
                 smol::future::yield_now().await;
                 return Some(Taken::Serve);
+            }
+            // A waiting anchor to offer again.
+            let anchor = self.anchor_wait();
+            if anchor == Some(Duration::ZERO) {
+                smol::future::yield_now().await;
+                return Some(Taken::Anchor);
             }
             // A receiver found this agent behind it: windows go again.
             if behind {

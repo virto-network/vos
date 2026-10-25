@@ -377,16 +377,10 @@ fn a_transient_refusal_is_submitted_again() {
 }
 
 /// A venue that fails to judge a statement every time (`0x1001`) refuses
-/// it after [`MAX_RESUBMITS`] more submissions; a rootless statement whose
-/// answer is lost every time, which no anchor gives a deadline, is dead
-/// after as many and one more.
+/// it after [`MAX_RESUBMITS`] more submissions.
 #[test]
 fn resubmissions_are_bounded() {
     let agent = Arc::new(Mutex::new(Agent::default()));
-    let rootless = Attest {
-        roots: Vec::new(),
-        ..attest(3, 2)
-    };
     agent.lock().unwrap().log.push(vec![attest(3, 1)]);
     let node = Node::new(&agent, true);
     let (jobs, prover, venue) = (
@@ -411,22 +405,6 @@ fn resubmissions_are_bounded() {
     assert_eq!(
         venue.submissions.load(Ordering::SeqCst),
         MAX_RESUBMITS as usize + 1
-    );
-
-    venue.refuse.lock().unwrap().clear();
-    venue.lose_all.store(true, Ordering::SeqCst);
-    agent.lock().unwrap().log.push(vec![rootless]);
-    while !states(&jobs).contains(&State::Dead) {
-        assert!(
-            start.elapsed() < Duration::from_secs(30),
-            "{:?}",
-            states(&jobs)
-        );
-        worker.step().unwrap();
-    }
-    assert_eq!(
-        venue.submissions.load(Ordering::SeqCst),
-        2 * (MAX_RESUBMITS as usize + 1) + 1
     );
 }
 

@@ -38,9 +38,10 @@ use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment};
 use vos_statement::vos_pvm_final_verifier::Error as FinalError;
 use vos_statement::{ProgramId, Refusal, Statement};
 use vos_tree::{Blake2b, Hasher};
-use vos_venue::{AnchorRefusal, VenueClient};
+use vos_venue::VenueClient;
 use vos_wire::abi::AttestError;
 use vos_wire::served::Served;
+use vos_wire::vos_anchor::venue::AnchorRefusal;
 use vos_wire::vos_anchor::{RootRead, VenueId, space_id, space_root};
 use vos_wire::{Encode, SpaceId};
 
@@ -701,9 +702,7 @@ fn the_window_is_stated_at_the_model_venue() {
         venue.anchor(&root).expect("anchored");
         venue
     };
-    let code = |venue: &Venue, statement: &Statement| {
-        vos_venue::code(&venue.venue.submit(statement, &proof))
-    };
+    let code = |venue: &Venue, statement: &Statement| venue.venue.submit(statement, &proof).code();
     // The proof refused against the words the statement makes.
     let words = Refusal::Proof(FinalError::InteractionPow).code();
 

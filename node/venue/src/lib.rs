@@ -20,18 +20,22 @@
 use ed25519_dalek::{Signature, VerifyingKey};
 pub use vos_anchor::venue::{aged, fresh};
 use vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
-use vos_statement::{Refusal, Statement, StatementId};
+use vos_statement::{Refusal, Statement};
 
-/// What a node asks of a venue.
+/// What a node asks of a venue. Its reads (the space's status, its
+/// anchor keys, the root held at a window, the venue's time) answer from
+/// what the client last read on its own thread, so the representative's
+/// leader asks them, and anchors, inside its batch without waiting on the
+/// venue.
 pub trait VenueClient: Send + Sync {
     /// The venue's id, which an anchor's signature binds.
     fn id(&self) -> VenueId;
-    /// Anchor a space's root of a window. It answers at once: the
-    /// representative's leader hands it over inside its batch.
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal>;
-    /// Submit a statement and its final proof: its id once accepted, or
-    /// once the venue holds it accepted already.
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted>;
+    /// Anchor a space's root of a window, answered at once: a client that
+    /// reaches a chain queues what it takes and sends it, in window order,
+    /// until the venue answers.
+    fn anchor(&self, anchor: &Anchor) -> AnchorOutcome;
+    /// Submit a statement and its final proof.
+    fn submit(&self, statement: &Statement, proof: &[u8]) -> SubmitOutcome;
     /// Whether `root` is anchored, its space's root of its kind at its
     /// window.
     fn anchored(&self, root: &RootRead) -> bool;
@@ -40,16 +44,13 @@ pub trait VenueClient: Send + Sync {
     fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]>;
     /// Where `space` stands at the venue, as far as it can say.
     fn status(&self, space: &SpaceId) -> Status;
+    /// The space's root the venue holds at `window` (`Anchors[w]`, past
+    /// `Last` none), as last read.
+    fn held(&self, space: &SpaceId, window: u64) -> Held;
     /// The venue's time, in milliseconds since the Unix epoch, as last read:
     /// what every deadline between parties is timed by (`proving.md` §7). None
     /// before the client has read it.
     fn time(&self) -> Option<u64>;
-    /// The anchors of `space` this client took ([`Anchored::Queued`]) and
-    /// then handed back, the venue not listing their keys, that the venue
-    /// still needs: the representative's leader signs each root again
-    /// with a key it lists. None for a client that queues nothing; a
-    /// client that wraps another hands back the other's.
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor>;
 }
 
 /// Implements [`VenueClient`] for a wrapper: each method in `forward [..]`
@@ -57,8 +58,8 @@ pub trait VenueClient: Send + Sync {
 /// written out in the braces.
 ///
 /// ```text
-/// forward_venue!(Timed => inner; forward [id, submit, anchored, anchor_keys, status, time, unsettled] {
-///     fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> { .. }
+/// forward_venue!(Timed => inner; forward [id, submit, anchored, anchor_keys, status, held, time] {
+///     fn anchor(&self, anchor: &Anchor) -> AnchorOutcome { .. }
 /// });
 /// ```
 #[macro_export]
@@ -76,10 +77,7 @@ macro_rules! forward_venue {
         }
     };
     (@ anchor $inner:ident) => {
-        fn anchor(
-            &self,
-            anchor: &$crate::forward::Anchor,
-        ) -> ::core::result::Result<$crate::Anchored, $crate::AnchorRefusal> {
+        fn anchor(&self, anchor: &$crate::forward::Anchor) -> $crate::AnchorOutcome {
             use $crate::VenueClient as _;
             self.$inner.anchor(anchor)
         }
@@ -89,7 +87,7 @@ macro_rules! forward_venue {
             &self,
             statement: &$crate::forward::Statement,
             proof: &[u8],
-        ) -> ::core::result::Result<$crate::forward::StatementId, $crate::NotAccepted> {
+        ) -> $crate::SubmitOutcome {
             use $crate::VenueClient as _;
             self.$inner.submit(statement, proof)
         }
@@ -112,19 +110,16 @@ macro_rules! forward_venue {
             self.$inner.status(space)
         }
     };
+    (@ held $inner:ident) => {
+        fn held(&self, space: &$crate::forward::SpaceId, window: u64) -> $crate::Held {
+            use $crate::VenueClient as _;
+            self.$inner.held(space, window)
+        }
+    };
     (@ time $inner:ident) => {
         fn time(&self) -> ::core::option::Option<u64> {
             use $crate::VenueClient as _;
             self.$inner.time()
-        }
-    };
-    (@ unsettled $inner:ident) => {
-        fn unsettled(
-            &self,
-            space: &$crate::forward::SpaceId,
-        ) -> ::std::vec::Vec<$crate::forward::Anchor> {
-            use $crate::VenueClient as _;
-            self.$inner.unsettled(space)
         }
     };
 }
@@ -133,22 +128,13 @@ macro_rules! forward_venue {
 #[doc(hidden)]
 pub mod forward {
     pub use vos_anchor::{Anchor, RootRead, SpaceId, VenueId};
-    pub use vos_statement::{Statement, StatementId};
+    pub use vos_statement::Statement;
 }
 
 /// The first of the codes a venue reports for its failure to judge a
 /// statement (on JAM, refine out of gas, a panic, an undecodable verdict):
 /// above every [`Refusal::code`].
 pub const UNJUDGED_FROM: u32 = 0x1000;
-
-/// Whether a submission refused with `code` may be accepted when sent
-/// again: [`Refusal::Unanchored`], a root the venue does not hold anchored
-/// now (its anchor yet to land, its space blocked until unblocked, a
-/// node's view behind the venue's), and a venue's failure to judge it, from
-/// [`UNJUDGED_FROM`]. The others are the statement's own, and final.
-pub fn transient(code: u32) -> bool {
-    code == Refusal::Unanchored.code() || code >= UNJUDGED_FROM
-}
 
 /// Whether `signature` is `key`'s over `digest`, strictly
 /// (`verify_strict`: `vos_anchor::venue::VenueState::verify`'s contract).
@@ -202,100 +188,85 @@ impl From<vos_anchor::venue::Status> for Status {
     }
 }
 
-/// Why a venue did not accept a statement.
+/// The code [`SubmitOutcome::Retry`] carries for a statement the venue
+/// did not judge: its client could not send it (the paying space's
+/// configuration or funds at the venue, alerted), or sent it and lost the
+/// answer.
+pub const UNJUDGED: u32 = u32::MAX;
+
+/// What became of a statement submitted, for its prover.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NotAccepted {
-    /// Judged and refused: [`Refusal::code`]'s class.
+pub enum SubmitOutcome {
+    /// Accepted, now or before: a repeat ([`Refusal::Repeated`]) is the
+    /// venue holding it accepted.
+    Accepted,
+    /// Refused for good: [`Refusal::code`]'s class.
     Refused(u32),
-    /// Not judged.
-    Unjudged(Unjudged),
+    /// Not accepted now, and sent again later: [`Refusal::Unanchored`] (its
+    /// anchor yet to land, its space blocked until unblocked, a node's view
+    /// behind the venue's), a venue's failure to judge it (from
+    /// [`UNJUDGED_FROM`]), or not judged at all ([`UNJUDGED`]).
+    Retry(u32),
 }
 
-/// Why a venue did not judge a statement.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Unjudged {
-    /// The node's configuration at the venue: the paying space unknown or
-    /// not active, the node not its authority, submits paused, or a
-    /// statement or proof past the venue's bounds.
-    Configuration,
-    /// The paying space's funds: its sovereign account's balance, or its
-    /// spend budget for the window.
-    Funding,
-    /// Sent, and what became of it unknown: the venue holds no acceptance
-    /// of it.
-    Unknown,
-}
-
-impl From<Refusal> for NotAccepted {
-    fn from(refusal: Refusal) -> Self {
-        Self::Refused(refusal.code())
-    }
-}
-
-/// A submission's verdict as every venue reports it
-/// ([`vos_statement::code`]): 0 accepted, a refusal's class, and
-/// `u32::MAX` unjudged.
-pub fn code(verdict: &Result<StatementId, NotAccepted>) -> u32 {
-    match verdict {
-        Ok(_) => 0,
-        Err(NotAccepted::Refused(code)) => *code,
-        Err(NotAccepted::Unjudged(_)) => u32::MAX,
-    }
-}
-
-/// An anchor the venue took.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Anchored {
-    /// Its root is now the space's at its window.
-    New,
-    /// The venue held that root already: a second leader's anchor, or the
-    /// same leader's again.
-    Again,
-    /// The venue's client took it to send, and sends it, in window order,
-    /// until the venue holds it or refuses it for good.
-    Queued,
-}
-
-/// Why a venue refuses an anchor.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AnchorRefusal {
-    /// The space is not registered.
-    Unregistered,
-    /// The space is not active: it equivocated and ended, or the venue's
-    /// governance blocked it.
-    Stopped,
-    /// The signer is not one of the space's anchor keys.
-    Key,
-    /// The signature is not the signer's over the anchor's digest.
-    Signature,
-    /// The window is before the space's first at the venue, or not past
-    /// its last anchored: refused for good.
-    Window,
-    /// The window is the space's open one, or later, by the venue's clock:
-    /// refused until the venue's time passes its boundary.
-    Open,
-    /// The window's boundary is older than `MaxRootAge`.
-    Age,
-    /// Another root of the space's kind at the window is anchored, signed
-    /// by a listed key: this one is the equivocation's evidence, which
-    /// ends the space for good. A client that finds the venue holding
-    /// another root sends its node's anchor all the same, as that evidence.
-    Equivocation,
-}
-
-impl From<vos_anchor::venue::AnchorRefusal> for AnchorRefusal {
-    fn from(refusal: vos_anchor::venue::AnchorRefusal) -> Self {
-        use vos_anchor::venue::AnchorRefusal as Rule;
-        match refusal {
-            Rule::Unregistered => Self::Unregistered,
-            Rule::Stopped => Self::Stopped,
-            Rule::Key => Self::Key,
-            Rule::Signature => Self::Signature,
-            Rule::Window => Self::Window,
-            Rule::Open => Self::Open,
-            Rule::Age => Self::Age,
+impl SubmitOutcome {
+    /// The outcome of a statement the venue judged `code`: 0 accepted, a
+    /// repeat accepted, the transient ones again, the rest refused. The one
+    /// place a repeat counts as accepted.
+    pub fn judged(code: u32) -> Self {
+        if code == 0 || code == Refusal::Repeated.code() {
+            Self::Accepted
+        } else if code == Refusal::Unanchored.code() || code >= UNJUDGED_FROM {
+            Self::Retry(code)
+        } else {
+            Self::Refused(code)
         }
     }
+
+    /// Its verdict as every venue reports it ([`vos_statement::code`]): 0
+    /// accepted, else the code it carries.
+    pub fn code(self) -> u32 {
+        match self {
+            Self::Accepted => 0,
+            Self::Refused(code) | Self::Retry(code) => code,
+        }
+    }
+}
+
+/// What a venue client answers an anchor: the leader's one outcome, every
+/// venue's codes mapped onto it by one table per client, the raw code kept
+/// for the log.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AnchorOutcome {
+    /// The venue holds it (new, or the same root again), or its client
+    /// queued it to send.
+    Taken,
+    /// Not now: the window still open by the venue's clock, the space not
+    /// registered there yet, anchors paused, the venue unreached or its
+    /// funds short. The leader offers it again.
+    NotYet,
+    /// Never to be taken: the window at or behind the space's last
+    /// anchored, past `MaxRootAge`, or a signature the venue refuses.
+    /// Settled, alerted.
+    Never(u32),
+    /// The venue does not list the signer: the leader hands its leadership
+    /// to a replica whose key it lists.
+    Unlisted(u32),
+    /// The space is ended (an equivocation's evidence stored, this node's
+    /// own anchor among it) or blocked: no more anchors until an operator
+    /// acts.
+    Stopped(u32),
+}
+
+/// What a client last read of a space's root at a window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Held {
+    /// Not read yet: the client reads it on its own thread.
+    Unread,
+    /// The venue holds no root there.
+    Nothing,
+    /// The venue holds this root there.
+    Root([u8; 32]),
 }
 
 #[cfg(any(test, feature = "kreivo"))]

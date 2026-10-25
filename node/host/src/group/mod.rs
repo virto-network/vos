@@ -83,6 +83,9 @@ pub(crate) enum Local {
     /// Something changed that the group's next round should see, such as
     /// the writer's health.
     Wake,
+    /// Hand this replica's leadership to the member `to`, which campaigns
+    /// once it has caught up ([`vos_raft::core::Core::transfer_leadership`]).
+    Transfer(NodeNumber),
     /// The snapshot stream to `to`, named by `term` and `index`, ended:
     /// `done` once its follower staged every chunk.
     StreamEnded {
@@ -106,7 +109,11 @@ impl Local {
             Local::ChangeMembership { answer, .. } => {
                 let _ = answer.try_send(Err(ChangeMembershipError::Stopped));
             }
-            Local::Retire | Local::StreamEnded { .. } | Local::Probe(_) | Local::Wake => {}
+            Local::Retire
+            | Local::StreamEnded { .. }
+            | Local::Probe(_)
+            | Local::Wake
+            | Local::Transfer(_) => {}
         }
     }
 }

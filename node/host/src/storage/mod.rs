@@ -137,12 +137,6 @@ pub enum Change {
         epoch: u8,
         writes: Vec<Write>,
     },
-    /// The seed of the node's anchor key `number`: see
-    /// [`crate::store::Batch::anchor_secret`].
-    AnchorKey {
-        number: u64,
-        seed: [u8; 32],
-    },
 }
 
 impl Change {
@@ -165,8 +159,7 @@ impl Change {
             | Self::Barrier
             | Self::Agent(_)
             | Self::Placement { .. }
-            | Self::Retire { .. }
-            | Self::AnchorKey { .. } => true,
+            | Self::Retire { .. } => true,
         }
     }
 

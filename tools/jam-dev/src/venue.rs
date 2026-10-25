@@ -4,19 +4,21 @@
 //! two slots past the finalized block it was anchored at.
 //!
 //! Its answers are the service's (`vos_statement_service::verdict`'s
-//! codes), mapped onto the trait's; the client judges no anchor itself,
-//! the service does by the venue rules (`vos_anchor::venue`). An anchor is
-//! queued and answered at once (`Anchored::Queued`): the [`AnchorQueue`]'s
-//! worker lands it, again while the venue is not ready for it, until the
-//! venue holds it, holds another root there (this node's anchor is then
-//! the equivocation's evidence, which ends the space), or will never take
-//! it; one whose key the service does not list is handed back to the
-//! leader to sign again with a key it lists ([`VenueClient::unsettled`]),
-//! and the same anchor offered again is refused for its key. Every refusal
-//! but `Open` alerts. A statement's code is its refusal's class; a repeat
-//! (`Refusal::Repeated`) is the venue holding it accepted; a transport
-//! failure, or a package that never lands, leaves it unjudged
-//! (`Unjudged::Unknown`).
+//! codes), mapped onto the leader's outcome by one table ([`outcome`]);
+//! the client judges no anchor itself, the service does by the venue rules
+//! (`vos_anchor::venue`). A reader thread reads each space the node asks
+//! of (its record: status, anchor keys, last window; and the roots at the
+//! windows the leader asks of) every slot, and the client answers from
+//! that read: not yet while unread or unregistered, stopped once ended,
+//! unlisted while the record does not list the signer, never for a window
+//! refused for good, else taken and queued. The [`AnchorQueue`]'s worker
+//! lands it, again while the venue is not ready for it, unless the
+//! service already holds a root there: the same root settles it, another
+//! is sent only once the leader, having read it, offered the anchor again
+//! (its divergence guard passed), as the equivocation's evidence, which
+//! ends the space. Every refusal but `Open` alerts. A statement's outcome
+//! is its code's ([`SubmitOutcome::judged`]); a transport failure, or a
+//! package that never lands, leaves it unjudged.
 //!
 //! A `JamVenue` is made only for a service whose code is the one the node
 //! expects: its code hash the deployed blob's, that blob's configuration
@@ -27,7 +29,9 @@
 //! [`Jam`]'s own calls, which a run's tooling makes, wait for their items
 //! to land, about three slots.
 
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use crate::live::statements::Statements;
@@ -35,14 +39,14 @@ use ed25519_dalek::{Signer, SigningKey};
 use vos_anchor::venue::{self as rules, Held, Roots};
 use vos_anchor::{Anchor, RootKind, RootRead, SpaceGenesis, SpaceId, VenueId, register_digest};
 use vos_jam::Error;
-use vos_statement::{Refusal, Statement, StatementId};
+use vos_statement::Statement;
 use vos_statement_service::config::{Config, configure};
 use vos_statement_service::item::{Control, Item, Op, Register, SignedControl, control_digest};
 use vos_statement_service::state::{AnchorRecord, Outcome, SpaceRecord, keys};
 use vos_statement_service::verdict::{AnchorCode, RegisterCode};
 
 use vos_venue::queue::{AnchorQueue, AnchorSend, Fate};
-use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
+use vos_venue::{AnchorOutcome, Held as Holding, Status, SubmitOutcome, UNJUDGED, VenueClient};
 
 /// How long an item's outcome may take to land.
 pub const LANDING: Duration = Duration::from_secs(120);
@@ -55,9 +59,9 @@ pub struct Jam {
 }
 
 /// A JAM statements service, as a node's venue: [`Jam`]'s calls, its
-/// anchors through an [`AnchorQueue`].
+/// reads on a thread of their own, its anchors through an [`AnchorQueue`].
 pub struct JamVenue {
-    jam: Arc<Jam>,
+    shared: Arc<Shared>,
     queue: AnchorQueue,
 }
 
@@ -65,8 +69,47 @@ impl std::ops::Deref for JamVenue {
     type Target = Jam;
 
     fn deref(&self) -> &Jam {
-        &self.jam
+        &self.shared.service
     }
+}
+
+impl Drop for JamVenue {
+    fn drop(&mut self) {
+        self.shared.stopping.store(true, Ordering::SeqCst);
+        self.shared.wake.notify_all();
+    }
+}
+
+/// What the client last read of a space.
+#[derive(Default)]
+struct Known {
+    /// Whether it has been read since the node asked of it.
+    read: bool,
+    record: Option<SpaceRecord>,
+    /// The roots held at the windows read, or none.
+    held: BTreeMap<u64, Option<[u8; 32]>>,
+    /// The windows at or behind its last the leader asked of, to read.
+    wanted: BTreeSet<u64>,
+    /// The windows the service refused for good, each with its code.
+    never: BTreeMap<u64, u32>,
+    /// The windows at which the leader offered an anchor while the client
+    /// held another root read there: sent as the equivocation's evidence.
+    evidence: BTreeSet<u64>,
+}
+
+#[derive(Default)]
+struct Reads {
+    now: Option<u64>,
+    spaces: BTreeMap<SpaceId, Known>,
+}
+
+/// The client's reads, shared by its reader, its queue's worker and the
+/// node's calls.
+struct Shared<S = Jam> {
+    service: Arc<S>,
+    read: Mutex<Reads>,
+    wake: Condvar,
+    stopping: AtomicBool,
 }
 
 /// How long the queue waits to offer an anchor again: a slot, or a window's
@@ -103,9 +146,19 @@ impl JamVenue {
             return Err(Mismatch::Genesis);
         }
         statements.genesis_ms = config.genesis_ms;
-        let jam = Arc::new(Jam { statements, config });
-        let queue = AnchorQueue::spawn("jam-anchors", JamSend(Arc::clone(&jam)));
-        Ok(Self { jam, queue })
+        Ok(Self::over(Arc::new(Jam { statements, config })))
+    }
+
+    /// The client of `jam`, its reader and its queue started.
+    fn over(jam: Arc<Jam>) -> Self {
+        let shared = Arc::new(Shared::new(jam));
+        let reader = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("jam-reads".into())
+            .spawn(move || reader.read_on())
+            .expect("the JAM reader starts");
+        let queue = AnchorQueue::spawn("jam-anchors", JamSend(Arc::clone(&shared)));
+        Self { shared, queue }
     }
 }
 
@@ -113,6 +166,8 @@ impl JamVenue {
 /// finalized block holds it, and lands on it.
 trait Service: Send + Sync + 'static {
     fn space(&self, space: &SpaceId) -> Result<Option<SpaceRecord>, Error>;
+    /// The space's root it holds at `window`.
+    fn root(&self, space: &SpaceId, window: u64) -> Result<Option<[u8; 32]>, Error>;
     /// The venue's time.
     fn now(&self) -> Result<u64, Error>;
     /// Land `anchor`: the service's code (`AnchorCode`).
@@ -124,6 +179,14 @@ impl Service for Jam {
         Jam::space(self, space)
     }
 
+    fn root(&self, space: &SpaceId, window: u64) -> Result<Option<[u8; 32]>, Error> {
+        Ok(self
+            .statements
+            .value(&keys::anchor(space, RootKind::Space, window))?
+            .and_then(|bytes| AnchorRecord::decode(&bytes).ok())
+            .map(|record| record.root))
+    }
+
     fn now(&self) -> Result<u64, Error> {
         self.statements.now()
     }
@@ -133,43 +196,189 @@ impl Service for Jam {
     }
 }
 
-/// The anchors' sending, as the queue's worker drives it.
-struct JamSend<S = Jam>(Arc<S>);
+impl<S: Service> Shared<S> {
+    fn new(service: Arc<S>) -> Self {
+        Self {
+            service,
+            read: Mutex::default(),
+            wake: Condvar::new(),
+            stopping: AtomicBool::new(false),
+        }
+    }
 
-impl<S: Service> AnchorSend for JamSend<S> {
+    fn read(&self) -> MutexGuard<'_, Reads> {
+        self.read
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// `space`, asked of: read at the reader's next turn.
+    fn watch(&self, read: &mut Reads, space: SpaceId) {
+        if let std::collections::btree_map::Entry::Vacant(entry) = read.spaces.entry(space) {
+            entry.insert(Known::default());
+            self.wake.notify_all();
+        }
+    }
+
+    /// Read every slot, or when woken, until stopped.
+    fn read_on(&self) {
+        while !self.stopping.load(Ordering::SeqCst) {
+            if let Err(error) = self.refresh() {
+                tracing::warn!(%error, "the JAM service is not readable; reading again");
+            }
+            let read = self.read();
+            let _ = self.wake.wait_timeout(read, SLOT);
+        }
+    }
+
+    /// Read the venue's time, and each space asked of: its record and the
+    /// roots at the windows wanted. What has aged is forgotten.
+    fn refresh(&self) -> Result<(), Error> {
+        let now = self.service.now()?;
+        let asked: Vec<(SpaceId, Vec<u64>)> = self
+            .read()
+            .spaces
+            .iter()
+            .map(|(space, known)| (*space, known.wanted.iter().copied().collect()))
+            .collect();
+        let mut records = Vec::new();
+        for (space, wanted) in asked {
+            let record = self.service.space(&space)?;
+            let mut held = Vec::new();
+            for window in wanted {
+                held.push((window, self.service.root(&space, window)?));
+            }
+            records.push((space, record, held));
+        }
+        let mut read = self.read();
+        read.now = Some(now);
+        for (space, record, held) in records {
+            let known = read.spaces.entry(space).or_default();
+            for (window, root) in held {
+                known.wanted.remove(&window);
+                known.held.entry(window).or_insert(root);
+            }
+            if let Some(record) = &record {
+                let fresh = |window: &u64| !rules::aged(&record.clock, *window, now);
+                known.held.retain(|window, _| fresh(window));
+                known.never.retain(|window, _| fresh(window));
+                known.evidence.retain(fresh);
+                known.wanted.retain(fresh);
+                if record.ended {
+                    known.held.clear();
+                }
+            }
+            known.record = record;
+            known.read = true;
+        }
+        Ok(())
+    }
+
+    /// Send `anchor`, unless the last read, or the service's root at its
+    /// window read now, says not to; the service's answer kept.
     fn send(&self, anchor: &Anchor) -> Fate {
-        let window = anchor.window;
-        let code = match self.0.land_anchor(anchor) {
+        let (space, window) = (anchor.space, anchor.window);
+        let Ok(now) = self.service.now() else {
+            return Fate::Again(SLOT);
+        };
+        {
+            let mut read = self.read();
+            let Some(known) = read.spaces.get_mut(&space) else {
+                return Fate::Again(SLOT);
+            };
+            let Some(record) = &known.record else {
+                return Fate::Again(SLOT);
+            };
+            if record.ended || !record.keys.contains(&anchor.signer) {
+                return Fate::Done;
+            }
+            if rules::aged(&record.clock, window, now) {
+                known.never.insert(window, AnchorCode::Age as u32);
+                return Fate::Done;
+            }
+        }
+        let Ok(held) = self.service.root(&space, window) else {
+            return Fate::Again(SLOT);
+        };
+        {
+            let mut read = self.read();
+            let Some(known) = read.spaces.get_mut(&space) else {
+                return Fate::Again(SLOT);
+            };
+            let last = known.record.as_ref().and_then(|record| record.last);
+            match held {
+                Some(root) if root == anchor.root => {
+                    known.held.insert(window, Some(root));
+                    return Fate::Done;
+                }
+                Some(root) => {
+                    known.held.insert(window, Some(root));
+                    if !known.evidence.contains(&window) {
+                        return Fate::Done;
+                    }
+                }
+                None if rules::passed(last, window) => {
+                    known.held.insert(window, None);
+                    known.never.insert(window, AnchorCode::Window as u32);
+                    return Fate::Done;
+                }
+                None => {}
+            }
+        }
+        let code = match self.service.land_anchor(anchor) {
             Ok(code) => code,
             Err(error) => {
                 tracing::warn!(window, %error, "an anchor not landed: again a slot later");
                 return Fate::Again(SLOT);
             }
         };
-        let fate = fate(code);
-        match anchor_code(code) {
-            Some(AnchorCode::Equivocation) => tracing::error!(
+        let outcome = outcome(code);
+        let mut read = self.read();
+        let known = read.spaces.entry(space).or_default();
+        match outcome {
+            AnchorOutcome::Taken => {
+                known.held.insert(window, Some(anchor.root));
+                return Fate::Done;
+            }
+            AnchorOutcome::NotYet if code == AnchorCode::Open as u32 => return Fate::Again(SLOT),
+            AnchorOutcome::NotYet => {}
+            AnchorOutcome::Never(code) => {
+                known.never.insert(window, code);
+            }
+            AnchorOutcome::Unlisted(_) => {
+                if let Some(record) = &mut known.record {
+                    record.keys.retain(|key| *key != anchor.signer);
+                }
+            }
+            AnchorOutcome::Stopped(_) => {
+                if let Some(record) = &mut known.record {
+                    record.ended = true;
+                }
+            }
+        }
+        if code == AnchorCode::Equivocation as u32 {
+            tracing::error!(
                 window,
                 "an equivocation: the JAM service holds another root of the space at this \
                  window, signed by a listed anchor key, and this node's anchor is its evidence, \
                  which ends the space for good; it re-founds under a new genesis"
-            ),
-            Some(AnchorCode::Open) => {}
-            _ if fate != Fate::Done => {
-                tracing::error!(window, code, ?fate, "the JAM service refused an anchor");
-            }
-            _ => {}
+            );
+        } else {
+            tracing::error!(window, code, ?outcome, "the JAM service refused an anchor");
         }
-        fate
+        match outcome {
+            AnchorOutcome::NotYet => Fate::Again(AWHILE),
+            _ => Fate::Done,
+        }
     }
+}
 
-    /// As the finalized block holds the space: a window at or past the
-    /// anchor's anchored, or the window past `MaxRootAge`.
-    fn settled(&self, anchor: &Anchor) -> bool {
-        let (Ok(Some(space)), Ok(now)) = (self.0.space(&anchor.space), self.0.now()) else {
-            return false;
-        };
-        rules::passed(space.last, anchor.window) || rules::aged(&space.clock, anchor.window, now)
+/// The anchors' sending, as the queue's worker drives it.
+struct JamSend<S = Jam>(Arc<Shared<S>>);
+
+impl<S: Service> AnchorSend for JamSend<S> {
+    fn send(&self, anchor: &Anchor) -> Fate {
+        self.0.send(anchor)
     }
 }
 
@@ -193,16 +402,19 @@ pub fn anchor_code(code: u32) -> Option<AnchorCode> {
     .find(|known| *known as u32 == code)
 }
 
-/// What becomes of an anchor the service answered `code`.
-fn fate(code: u32) -> Fate {
+/// The leader's outcome of an anchor the service answered `code`, the code
+/// kept: `New` and `Again` taken; `Signature`, `Window` and `Age` never;
+/// `Key` unlisted; `Ended` and `Equivocation` (this anchor the evidence)
+/// stopped; `Open`, `Unregistered`, `Item` and any other (refine failed)
+/// not yet.
+pub fn outcome(code: u32) -> AnchorOutcome {
+    use AnchorCode::*;
     match anchor_code(code) {
-        Some(AnchorCode::New | AnchorCode::Again) => Fate::Done,
-        Some(
-            AnchorCode::Window | AnchorCode::Age | AnchorCode::Equivocation | AnchorCode::Ended,
-        ) => Fate::Dead,
-        Some(AnchorCode::Open) => Fate::Again(SLOT),
-        Some(AnchorCode::Key) => Fate::Resign,
-        _ => Fate::Again(AWHILE),
+        Some(New | Again) => AnchorOutcome::Taken,
+        Some(Signature | Window | Age) => AnchorOutcome::Never(code),
+        Some(Key) => AnchorOutcome::Unlisted(code),
+        Some(Ended | Equivocation) => AnchorOutcome::Stopped(code),
+        _ => AnchorOutcome::NotYet,
     }
 }
 
@@ -315,50 +527,75 @@ impl Jam {
 
 impl VenueClient for JamVenue {
     fn id(&self) -> VenueId {
-        self.jam.id()
+        self.shared.service.id()
     }
 
-    /// Queued, answered at once: an anchor not signed by its signer over
-    /// its digest here is refused, one of a window the service refused for
-    /// good, and the one handed back for its key; the rest the queue's
-    /// worker lands.
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
+    /// Answered at once from the last read; what is taken is queued, and
+    /// the queue's worker lands it.
+    fn anchor(&self, anchor: &Anchor) -> AnchorOutcome {
         if !vos_venue::signed(anchor, &self.id()) {
-            return Err(AnchorRefusal::Signature);
+            return AnchorOutcome::Never(AnchorCode::Signature as u32);
         }
-        if self.queue.dead(&anchor.space, anchor.window) {
-            self.queue.settle(&anchor.space, anchor.window);
-            return Err(AnchorRefusal::Window);
+        let window = anchor.window;
+        {
+            let mut read = self.shared.read();
+            self.shared.watch(&mut read, anchor.space);
+            let Some(known) = read.spaces.get_mut(&anchor.space) else {
+                return AnchorOutcome::NotYet;
+            };
+            let Some(record) = known.record.as_ref().filter(|_| known.read) else {
+                return AnchorOutcome::NotYet;
+            };
+            if record.ended {
+                return AnchorOutcome::Stopped(AnchorCode::Ended as u32);
+            }
+            if !record.keys.contains(&anchor.signer) {
+                return AnchorOutcome::Unlisted(AnchorCode::Key as u32);
+            }
+            let last = record.last;
+            if let Some(code) = known.never.get(&window) {
+                return AnchorOutcome::Never(*code);
+            }
+            match known.held.get(&window) {
+                Some(Some(root)) if *root == anchor.root => return AnchorOutcome::Taken,
+                Some(Some(_)) => {
+                    known.evidence.insert(window);
+                }
+                Some(None) if rules::passed(last, window) => {
+                    return AnchorOutcome::Never(AnchorCode::Window as u32);
+                }
+                _ => {}
+            }
         }
-        if !self.queue.push(anchor) {
-            return Err(AnchorRefusal::Key);
-        }
-        Ok(Anchored::Queued)
+        self.queue.push(anchor);
+        AnchorOutcome::Taken
     }
 
-    /// A statement the service holds seen is answered accepted unsent: a
-    /// package refined again only to be refused a repeat costs a whole
-    /// refine.
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
+    /// A statement the service holds seen is accepted unsent: a package
+    /// refined again only to be refused a repeat costs a whole refine.
+    fn submit(&self, statement: &Statement, proof: &[u8]) -> SubmitOutcome {
         let id = statement.id();
         if let Ok(Some(_)) = self.statements.value(&keys::seen(&id)) {
-            return Ok(id);
+            return SubmitOutcome::Accepted;
         }
         match self.submit_code(statement, proof) {
-            Ok(0) => Ok(id),
-            Ok(code) if code == Refusal::Repeated.code() => Ok(id),
-            Ok(code) => Err(NotAccepted::Refused(code)),
-            Err(_) => Err(NotAccepted::Unjudged(Unjudged::Unknown)),
+            Ok(code) => SubmitOutcome::judged(code),
+            Err(_) => SubmitOutcome::Retry(UNJUDGED),
         }
     }
 
-    /// The space's standing at the finalized block; unregistered while the
-    /// node cannot say.
+    /// The space's standing as last read; unregistered while unread.
     fn status(&self, space: &SpaceId) -> Status {
-        match self.space(space) {
-            Ok(Some(record)) if record.ended => Status::Ended,
-            Ok(Some(_)) => Status::Active,
-            _ => Status::Unregistered,
+        let mut read = self.shared.read();
+        self.shared.watch(&mut read, *space);
+        match read
+            .spaces
+            .get(space)
+            .and_then(|known| known.record.as_ref())
+        {
+            Some(record) if record.ended => Status::Ended,
+            Some(_) => Status::Active,
+            None => Status::Unregistered,
         }
     }
 
@@ -378,20 +615,41 @@ impl VenueClient for JamVenue {
     }
 
     fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        self.space(space)
-            .ok()
-            .flatten()
-            .map(|space| space.keys)
+        let mut read = self.shared.read();
+        self.shared.watch(&mut read, *space);
+        read.spaces
+            .get(space)
+            .and_then(|known| known.record.as_ref())
+            .map(|record| record.keys.clone())
             .unwrap_or_default()
     }
-    /// The finalized block's slot time (slot × 6 s from JAM's genesis
-    /// time); none while the node cannot say.
-    fn time(&self) -> Option<u64> {
-        self.statements.now().ok()
+
+    /// The root read at `window`: none past the space's last anchored;
+    /// unread at or behind it until the reader reads it.
+    fn held(&self, space: &SpaceId, window: u64) -> Holding {
+        let mut read = self.shared.read();
+        self.shared.watch(&mut read, *space);
+        let Some(known) = read.spaces.get_mut(space).filter(|known| known.read) else {
+            return Holding::Unread;
+        };
+        let last = known.record.as_ref().and_then(|record| record.last);
+        match known.held.get(&window) {
+            Some(Some(root)) => Holding::Root(*root),
+            Some(None) => Holding::Nothing,
+            None if !rules::passed(last, window) => Holding::Nothing,
+            None => {
+                if known.wanted.insert(window) {
+                    self.shared.wake.notify_all();
+                }
+                Holding::Unread
+            }
+        }
     }
 
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.queue.unsettled(space)
+    /// The finalized block's slot time (slot × 6 s from JAM's genesis
+    /// time) as last read; none before.
+    fn time(&self) -> Option<u64> {
+        self.shared.read().now
     }
 }
 
@@ -446,29 +704,30 @@ pub fn register_code(code: u32) -> &'static str {
 mod tests {
     use super::*;
 
-    /// A key refused hands the anchor back to be signed again; a
-    /// signature refused waits, since signing again with the same key
-    /// makes the same signature; an unregistered space waits; a window the
-    /// service will never take, or an ended space's, is dead.
+    /// Every anchor code has its outcome, the code kept: a key refused
+    /// unlisted; a signature refused never, since signing again with the
+    /// same key makes the same signature; an unregistered space not yet; a
+    /// window the service will never take never; an ended space, or this
+    /// anchor the evidence that ends it, stopped.
     #[test]
-    fn each_anchor_code_has_its_fate() {
+    fn each_anchor_code_has_its_outcome() {
         use AnchorCode::*;
         for (code, expected) in [
-            (New, Fate::Done),
-            (Again, Fate::Done),
-            (Item, Fate::Again(AWHILE)),
-            (Signature, Fate::Again(AWHILE)),
-            (Unregistered, Fate::Again(AWHILE)),
-            (Ended, Fate::Dead),
-            (Key, Fate::Resign),
-            (Window, Fate::Dead),
-            (Open, Fate::Again(SLOT)),
-            (Age, Fate::Dead),
-            (Equivocation, Fate::Dead),
+            (New, AnchorOutcome::Taken),
+            (Again, AnchorOutcome::Taken),
+            (Item, AnchorOutcome::NotYet),
+            (Signature, AnchorOutcome::Never(Signature as u32)),
+            (Unregistered, AnchorOutcome::NotYet),
+            (Ended, AnchorOutcome::Stopped(Ended as u32)),
+            (Key, AnchorOutcome::Unlisted(Key as u32)),
+            (Window, AnchorOutcome::Never(Window as u32)),
+            (Open, AnchorOutcome::NotYet),
+            (Age, AnchorOutcome::Never(Age as u32)),
+            (Equivocation, AnchorOutcome::Stopped(Equivocation as u32)),
         ] {
-            assert_eq!(fate(code as u32), expected, "{code:?}");
+            assert_eq!(outcome(code as u32), expected, "{code:?}");
         }
-        assert_eq!(fate(0x1001), Fate::Again(AWHILE), "refine failed");
+        assert_eq!(outcome(0x1001), AnchorOutcome::NotYet, "refine failed");
     }
 
     /// The statements service's refine and accumulate in memory, at a
@@ -537,6 +796,13 @@ mod tests {
                 .and_then(|bytes| SpaceRecord::decode(&bytes).ok()))
         }
 
+        fn root(&self, space: &SpaceId, window: u64) -> Result<Option<[u8; 32]>, Error> {
+            Ok(self
+                .read(&keys::anchor(space, RootKind::Space, window))
+                .and_then(|bytes| AnchorRecord::decode(&bytes).ok())
+                .map(|record| record.root))
+        }
+
         fn now(&self) -> Result<u64, Error> {
             let slot = self.state.lock().unwrap().1;
             Ok(vos_statement_service::accumulate::time(&self.config, slot))
@@ -548,9 +814,10 @@ mod tests {
     }
 
     /// A listed key stolen anchors another root of a window first: the
-    /// node's anchor of it is sent all the same, the equivocation's
-    /// evidence, which ends the space; offered again, the ended space
-    /// refuses it for good.
+    /// node's anchor of it is not sent over it, the root read; offered
+    /// again once read, as the leader does once its divergence guard
+    /// passed, it is sent, the equivocation's evidence, which ends the
+    /// space.
     #[test]
     fn an_anchor_over_another_root_goes_as_evidence() {
         use vos_anchor::{RootKind, WindowClock};
@@ -613,9 +880,25 @@ mod tests {
             AnchorCode::New as u32
         );
 
-        let send = JamSend(Arc::clone(&local));
+        let shared = Shared::new(Arc::clone(&local));
         let ours = anchor(1, &honest);
-        assert_eq!(send.send(&ours), Fate::Dead, "sent, the evidence");
+        shared.watch(&mut shared.read(), space);
+        shared.refresh().unwrap();
+        assert_eq!(shared.send(&ours), Fate::Done, "not sent over another root");
+        assert!(!local.space(&space).unwrap().unwrap().ended);
+        assert_eq!(
+            shared.read().spaces[&space].held.get(&window),
+            Some(&Some([9; 32])),
+            "the root read"
+        );
+        shared
+            .read()
+            .spaces
+            .get_mut(&space)
+            .unwrap()
+            .evidence
+            .insert(window);
+        assert_eq!(shared.send(&ours), Fate::Done, "sent, the evidence");
         let record = local.space(&space).unwrap().unwrap();
         assert!(record.ended);
         let evidence = local
@@ -624,15 +907,14 @@ mod tests {
         let evidence = Evidence::decode(&evidence).unwrap();
         assert_eq!(evidence.held.signer, stolen.verifying_key().to_bytes());
         assert_eq!(evidence.other.signer, honest.verifying_key().to_bytes());
-        assert_eq!(send.send(&ours), Fate::Dead, "the space ended");
-        assert!(send.settled(&ours), "its window anchored");
+        assert!(shared.read().spaces[&space].record.as_ref().unwrap().ended);
     }
 
-    /// An anchor is queued and answered at once, whatever the node: one
-    /// of a node that never answers returns within 500 ms, a signature's
-    /// check in a debug build on a loaded host and no wait on the node,
-    /// whose calls time out in seconds; one not signed over this venue's
-    /// digest is refused.
+    /// An anchor is answered at once, whatever the node: one of a node
+    /// that never answers returns within 500 ms, a signature's check in a
+    /// debug build on a loaded host and no wait on the node, whose calls
+    /// time out in seconds; one not signed over this venue's digest is
+    /// never taken.
     #[test]
     fn an_anchor_is_answered_at_once() {
         use std::net::TcpListener;
@@ -665,10 +947,7 @@ mod tests {
                 pins: Vec::new(),
             },
         });
-        let venue = JamVenue {
-            queue: AnchorQueue::spawn("jam-anchors-test", JamSend(Arc::clone(&jam))),
-            jam,
-        };
+        let venue = JamVenue::over(jam);
         let key = SigningKey::from_bytes(&[7; 32]);
         let mut anchor = Anchor {
             space: SpaceId([1; 32]),
@@ -678,12 +957,16 @@ mod tests {
             signer: key.verifying_key().to_bytes(),
             signature: [0; 64],
         };
-        assert_eq!(venue.anchor(&anchor), Err(AnchorRefusal::Signature));
+        assert_eq!(
+            venue.anchor(&anchor),
+            AnchorOutcome::Never(AnchorCode::Signature as u32)
+        );
         anchor.signature = key.sign(&anchor.digest(&venue.id())).to_bytes();
         let start = Instant::now();
-        assert_eq!(venue.anchor(&anchor), Ok(Anchored::Queued));
+        assert_eq!(venue.anchor(&anchor), AnchorOutcome::NotYet, "unread");
+        assert_eq!(venue.held(&anchor.space, 5), Holding::Unread);
+        assert_eq!(venue.status(&anchor.space), Status::Unregistered);
         let took = start.elapsed();
         assert!(took < Duration::from_millis(500), "{took:?}");
-        assert!(venue.queue.holds(&anchor.space, 5));
     }
 }

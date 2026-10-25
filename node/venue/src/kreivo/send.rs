@@ -1,13 +1,15 @@
 //! [`KreivoVenue`](super::KreivoVenue)'s calls to the chain: an anchor sent
-//! while the client's last read has its space active and anchors not
-//! paused, the pallet's answer placed as the queue's [`Fate`]
-//! (`spaces-pallet.md` §9), and a submit checked against the venue's state
-//! before it is paid for.
+//! while the client's last read has its space active, its signer listed
+//! and anchors not paused, unless the venue already holds a root at its
+//! window; the pallet's answer placed by one table ([`outcome`],
+//! `spaces-pallet.md` §9) and kept; and a submit checked against the
+//! venue's state before it is paid for.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use vos_anchor::Anchor;
+use vos_anchor::venue as rules;
+use vos_anchor::{Anchor, RootKind};
 use vos_statement::{Refusal, Statement, StatementId};
 
 use super::calls::{
@@ -17,14 +19,14 @@ use super::calls::{
 use super::transport::{Invalid, Sender, Sent, Unsent};
 use super::venue::{Alert, Shared};
 use crate::queue::{AnchorSend, Fate};
-use crate::{NotAccepted, Unjudged};
+use crate::{AnchorOutcome, SubmitOutcome, UNJUDGED};
 
 /// How long an anchor the pool refused waits before it goes again.
 const POOL_BACKOFF: Duration = Duration::from_secs(30);
 
 impl Shared {
-    /// Send `anchor`, unless the client's last read says the venue would
-    /// not take it now.
+    /// Send `anchor`, unless the client's last read, or the venue's record
+    /// of its window read now, says not to.
     fn send_anchor(&self, anchor: &Anchor) -> Fate {
         let wait = Fate::Again(self.options.refresh);
         let Some(sender) = self.sender.get() else {
@@ -37,39 +39,76 @@ impl Shared {
             Ok(info) => info,
             Err(fate) => return fate,
         };
+        let record = keys::anchors(&anchor.space.0, RootKind::Space as u8, anchor.window);
+        let Ok(held) = self.read::<AnchorRecord>(&record) else {
+            return wait;
+        };
+        if let Some(fate) = self.held_before(anchor, held.map(|record| record.root)) {
+            return fate;
+        }
         let sent = sender.call(&Call::anchor(anchor).bytes());
         self.place(anchor, sent, &info, now)
     }
 
     /// Whether `anchor` goes now, by the client's last read at the venue's
-    /// time `now`: its space, or its fate. It waits while the space is not
-    /// registered or not active, anchors are paused, or the venue's time
-    /// has not passed the wait a refusal set; its key no longer listed, it
-    /// is handed back to be signed again.
+    /// time `now`: its space, or its fate. One whose space is not active,
+    /// whose signer is not listed, or whose window has aged is dropped:
+    /// the client answers the leader from what it read. It waits while the
+    /// space is not registered, anchors are paused, or the venue's time
+    /// has not passed the wait a refusal set.
     fn ready(&self, anchor: &Anchor, now: u64) -> Result<SpaceInfo, Fate> {
         let wait = Fate::Again(self.options.refresh);
-        let (space, window) = (anchor.space, anchor.window);
-        let key = (space, window);
+        let key = (anchor.space, anchor.window);
         let mut state = self.state();
         let paused = state.paused & PAUSED_ANCHOR != 0;
-        let known = state.spaces.get(&space);
-        let listed = known.is_some_and(|known| known.keys.contains(&anchor.signer));
-        let Some(info) = known.and_then(|known| known.info) else {
-            let what = "the space is not registered".to_string();
-            state.alert(Alert::Configuration { space, what });
+        let later = state.later.get(&key).is_some_and(|at| now < *at);
+        let Some(known) = state.spaces.get_mut(&anchor.space) else {
             return Err(wait);
         };
-        if !listed {
-            state.forget(key);
-            let what = format!("window {window}'s anchor key is not listed: to be signed again");
-            state.alert(Alert::Configuration { space, what });
-            return Err(Fate::Resign);
+        let Some(info) = known.info else {
+            return Err(wait);
+        };
+        let unlisted =
+            !known.keys.contains(&anchor.signer) || known.refused.contains_key(&anchor.signer);
+        if info.status != SpaceStatus::Active || unlisted {
+            return Err(Fate::Done);
         }
-        let later = state.later.get(&key).is_some_and(|at| now < *at);
-        if paused || info.status != SpaceStatus::Active || later {
+        if rules::aged(&info.clock(), anchor.window, now) {
+            known
+                .never
+                .insert(anchor.window, Error::WindowTooOld as u32);
+            return Err(Fate::Done);
+        }
+        if paused || later {
             return Err(wait);
         }
         Ok(info)
+    }
+
+    /// What the venue's record `held` of `anchor`'s window, read before
+    /// sending, settles: the same root is held; another is kept for the
+    /// leader to read, and sent only as the evidence it offered; none at
+    /// or behind the space's last is never taken. None to send it.
+    fn held_before(&self, anchor: &Anchor, held: Option<[u8; 32]>) -> Option<Fate> {
+        let mut state = self.state();
+        let known = state.spaces.get_mut(&anchor.space)?;
+        let window = anchor.window;
+        match held {
+            Some(root) if root == anchor.root => {
+                state.held(anchor);
+                Some(Fate::Done)
+            }
+            Some(root) => {
+                known.held.insert(window, Some(root));
+                (!known.evidence.contains(&window)).then_some(Fate::Done)
+            }
+            None if rules::passed(known.last, window) => {
+                known.held.insert(window, None);
+                known.never.insert(window, Error::WindowNotAfterLast as u32);
+                Some(Fate::Done)
+            }
+            None => None,
+        }
     }
 
     /// The fate of `anchor`, sent at the venue's time `now` as `sent`
@@ -100,7 +139,6 @@ impl Shared {
             return wait;
         }
         let mut state = self.state();
-        let window_length = Duration::from_millis(info.length_ms);
         match sent {
             Ok(Sent::Included(outcome)) => {
                 let anchored = outcome.events.iter().any(|event| {
@@ -121,51 +159,74 @@ impl Shared {
                     return Fate::Done;
                 }
                 let error = outcome.failure.and_then(|failure| failure.pallet());
-                match answer(error) {
-                    Answer::Done => {
-                        state.forget(key);
+                state.forget(key);
+                match outcome_of(error) {
+                    AnchorOutcome::Taken => {
+                        state.held(anchor);
                         Fate::Done
                     }
-                    Answer::Later => {
-                        state
-                            .later
-                            .insert(key, now.saturating_add(self.options.block_ms));
-                        wait
-                    }
-                    Answer::Dead(error) => {
-                        state.alert(Alert::Dead {
-                            space,
-                            window,
-                            error,
-                        });
-                        Fate::Dead
-                    }
-                    Answer::Wait => {
-                        if error == Some(Error::Paused) {
-                            state.paused |= PAUSED_ANCHOR;
+                    AnchorOutcome::Never(code) => {
+                        if let Some(known) = state.spaces.get_mut(&space) {
+                            known.never.insert(window, code);
                         }
+                        // A window behind the space's first or last is
+                        // routine (one before its registration); an aged
+                        // one is lost, and a signature or kind refused a
+                        // node's fault.
+                        match error {
+                            Some(Error::WindowNotAfterLast) => {}
+                            Some(error @ Error::WindowTooOld) => state.alert(Alert::Dead {
+                                space,
+                                window,
+                                error,
+                            }),
+                            _ => {
+                                let what = format!("an anchor refused: {error:?}");
+                                state.alert(Alert::Configuration { space, what });
+                            }
+                        }
+                        Fate::Done
+                    }
+                    AnchorOutcome::Unlisted(code) => {
+                        if let Some(known) = state.spaces.get_mut(&space) {
+                            let listing = known.keys.clone();
+                            known.refused.insert(anchor.signer, (code, listing));
+                        }
+                        let what = format!("an anchor refused: {error:?}");
+                        state.alert(Alert::Configuration { space, what });
+                        Fate::Done
+                    }
+                    AnchorOutcome::Stopped(_) => {
                         state.refreshed = None;
                         wait
                     }
-                    Answer::Funding(error) => {
-                        let what = format!("an anchor refused: {error:?}");
-                        state.alert(Alert::Funding { space, what });
-                        wait
-                    }
-                    Answer::Resign(error) => {
-                        state.forget(key);
-                        let what = format!("an anchor refused: {error:?}; to be signed again");
-                        state.alert(Alert::Configuration { space, what });
-                        Fate::Resign
-                    }
-                    Answer::Configuration => {
-                        let what = format!(
-                            "an anchor refused: {:?}; again a window later",
-                            outcome.failure
-                        );
-                        state.alert(Alert::Configuration { space, what });
-                        Fate::Again(window_length)
-                    }
+                    AnchorOutcome::NotYet => match error {
+                        Some(Error::WindowInFuture) => {
+                            state
+                                .later
+                                .insert(key, now.saturating_add(self.options.block_ms));
+                            wait
+                        }
+                        Some(Error::Paused) => {
+                            state.paused |= PAUSED_ANCHOR;
+                            state.refreshed = None;
+                            wait
+                        }
+                        Some(error @ (Error::InsufficientSovereignBalance | Error::OverBudget)) => {
+                            let what = format!("an anchor refused: {error:?}");
+                            state.alert(Alert::Funding { space, what });
+                            wait
+                        }
+                        _ => {
+                            let what = format!(
+                                "an anchor refused: {:?}; again a window later",
+                                outcome.failure
+                            );
+                            state.alert(Alert::Configuration { space, what });
+                            state.refreshed = None;
+                            Fate::Again(Duration::from_millis(info.length_ms))
+                        }
+                    },
                 }
             }
             Ok(Sent::Landed) => wait,
@@ -183,17 +244,17 @@ impl Shared {
         }
     }
 
-    /// Send a submit: its verdict.
+    /// Send a submit: its outcome.
     pub(super) fn send_submit(
         &self,
         sender: &Sender,
         call: &[u8],
         id: StatementId,
-    ) -> Result<StatementId, NotAccepted> {
+    ) -> SubmitOutcome {
         let space = self.payer;
-        let unjudged = |alert: Alert, why: Unjudged| {
+        let unjudged = |alert: Alert| {
             self.state().alert(alert);
-            Err(NotAccepted::Unjudged(why))
+            SubmitOutcome::Retry(UNJUDGED)
         };
         match sender.call(call) {
             Ok(Sent::Included(outcome)) => {
@@ -204,34 +265,28 @@ impl Shared {
                 let what = format!("a submit refused: {error:?}");
                 match error {
                     Some(Error::InsufficientSovereignBalance | Error::OverBudget) => {
-                        unjudged(Alert::Funding { space, what }, Unjudged::Funding)
+                        unjudged(Alert::Funding { space, what })
                     }
-                    Some(_) => unjudged(
-                        Alert::Configuration { space, what },
-                        Unjudged::Configuration,
-                    ),
+                    Some(_) => unjudged(Alert::Configuration { space, what }),
                     None => {
                         let what = format!("a submit's outcome unread: {outcome:?}");
-                        unjudged(Alert::Unexpected(what), Unjudged::Unknown)
+                        unjudged(Alert::Unexpected(what))
                     }
                 }
             }
             Ok(Sent::Landed) => match self.read::<u64>(&keys::seen(&id.0)) {
-                Ok(Some(_)) => Ok(id),
-                _ => Err(NotAccepted::Unjudged(Unjudged::Unknown)),
+                Ok(Some(_)) => SubmitOutcome::Accepted,
+                _ => SubmitOutcome::Retry(UNJUDGED),
             },
             Err(Unsent::Invalid(Invalid::Payment)) => {
                 let what = "the venue refused a submit's fee".to_string();
-                unjudged(Alert::Funding { space, what }, Unjudged::Funding)
+                unjudged(Alert::Funding { space, what })
             }
             Err(Unsent::Invalid(invalid)) => {
                 let what = format!("a submit refused: {invalid:?}");
-                unjudged(
-                    Alert::Configuration { space, what },
-                    Unjudged::Configuration,
-                )
+                unjudged(Alert::Configuration { space, what })
             }
-            Err(Unsent::Stopped) => Err(NotAccepted::Unjudged(Unjudged::Unknown)),
+            Err(Unsent::Stopped) => SubmitOutcome::Retry(UNJUDGED),
         }
     }
 
@@ -243,12 +298,12 @@ impl Shared {
         &self,
         statement: &Statement,
         id: &StatementId,
-    ) -> Option<Result<StatementId, NotAccepted>> {
+    ) -> Option<SubmitOutcome> {
         let space = self.payer;
         let configuration = |what: &str| {
             let what = what.to_string();
             self.state().alert(Alert::Configuration { space, what });
-            Some(Err(NotAccepted::Unjudged(Unjudged::Configuration)))
+            Some(SubmitOutcome::Retry(UNJUDGED))
         };
         if self.read::<u8>(&keys::paused()).ok()?.unwrap_or(0) & PAUSED_SUBMIT != 0 {
             return configuration("submits are paused");
@@ -256,16 +311,16 @@ impl Shared {
         let now = self.venue_now().ok()?;
         let format = self.read::<Active>(&keys::formats(statement.format)).ok()?;
         if !format.is_some_and(|active| active.at(now)) {
-            return Some(Err(Refusal::Format.into()));
+            return Some(SubmitOutcome::judged(Refusal::Format.code()));
         }
         let program = self
             .read::<ProgramInfo>(&keys::programs(&statement.program.0))
             .ok()?;
         if !program.is_some_and(|info| info.active.at(now)) {
-            return Some(Err(Refusal::Program.into()));
+            return Some(SubmitOutcome::judged(Refusal::Program.code()));
         }
         if self.read::<u64>(&keys::seen(&id.0)).ok()?.is_some() {
-            return Some(Ok(*id));
+            return Some(SubmitOutcome::Accepted);
         }
         let Some(info) = self.read::<SpaceInfo>(&keys::spaces(&space.0)).ok()? else {
             return configuration("the paying space is not registered");
@@ -284,7 +339,7 @@ impl Shared {
                 info.max_spend_per_window
             );
             self.state().alert(Alert::Funding { space, what });
-            return Some(Err(NotAccepted::Unjudged(Unjudged::Funding)));
+            return Some(SubmitOutcome::Retry(UNJUDGED));
         }
         None
     }
@@ -297,73 +352,43 @@ impl AnchorSend for KreivoSend {
     fn send(&self, anchor: &Anchor) -> Fate {
         self.0.send_anchor(anchor)
     }
-
-    /// By the client's last read: the space's last anchored window at or
-    /// past the anchor's, or the window past `MaxRootAge` by the venue's
-    /// time (`vos_anchor::venue::{passed, aged}`).
-    fn settled(&self, anchor: &Anchor) -> bool {
-        let mut state = self.0.state();
-        let now = state.now;
-        let known = state.watch(anchor.space);
-        let aged = known
-            .info
-            .zip(now)
-            .is_some_and(|(info, now)| vos_anchor::venue::aged(&info.clock(), anchor.window, now));
-        vos_anchor::venue::passed(known.last, anchor.window) || aged
-    }
 }
 
-/// What an anchor the chain refused waits for (`spaces-pallet.md` §9).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Answer {
-    /// 14 `AlreadyAnchored`, 15 `WindowNotAfterLast`: the venue holds it,
-    /// or a later window.
-    Done,
-    /// 16 `WindowInFuture`: sent again a block of the venue's time later;
-    /// never skipped.
-    Later,
-    /// 17 `WindowTooOld`: never taken; an alert.
-    Dead(Error),
-    /// 19 `SpaceNotActive`, 20 `Paused`: kept until the space is active
-    /// and anchors are not paused.
-    Wait,
-    /// 21 `InsufficientSovereignBalance`, 27 `OverBudget`: kept; a
-    /// funding alert.
-    Funding(Error),
-    /// 11 `UnknownAnchorKey`: dropped, an alert, handed back to be
-    /// signed again with a key the space lists.
-    Resign(Error),
-    /// 7 `NotAuthority`, 12 `BadAnchorSignature` (signing again with the
-    /// same key makes the same signature), 13 the kind, any other, or not
-    /// the pallet's: kept, an alert, again a window later.
-    Configuration,
-}
-
-pub(super) fn answer(error: Option<Error>) -> Answer {
+/// The leader's outcome of an anchor the pallet refused with `error`
+/// (`spaces-pallet.md` §9), its code kept:
+/// - 14 `AlreadyAnchored`: taken, the venue holding that root;
+/// - 15 `WindowNotAfterLast`, 17 `WindowTooOld`, 12 `BadAnchorSignature`
+///   (signing again with the same key makes the same signature), 13 the
+///   kind: never;
+/// - 7 `NotAuthority`, 11 `UnknownAnchorKey`: unlisted;
+/// - 19 `SpaceNotActive`: stopped;
+/// - 16 `WindowInFuture`, 20 `Paused`, 21 `InsufficientSovereignBalance`,
+///   27 `OverBudget`, 1 `UnknownSpace` (its registration not read yet),
+///   any other, or not the pallet's: not yet.
+pub(super) fn outcome_of(error: Option<Error>) -> AnchorOutcome {
     match error {
-        Some(Error::AlreadyAnchored | Error::WindowNotAfterLast) => Answer::Done,
-        Some(Error::WindowInFuture) => Answer::Later,
-        Some(error @ Error::WindowTooOld) => Answer::Dead(error),
-        Some(Error::SpaceNotActive | Error::Paused) => Answer::Wait,
-        Some(error @ (Error::InsufficientSovereignBalance | Error::OverBudget)) => {
-            Answer::Funding(error)
+        Some(Error::AlreadyAnchored) => AnchorOutcome::Taken,
+        Some(
+            error @ (Error::WindowNotAfterLast
+            | Error::WindowTooOld
+            | Error::BadAnchorSignature
+            | Error::BadKind),
+        ) => AnchorOutcome::Never(error as u32),
+        Some(error @ (Error::NotAuthority | Error::UnknownAnchorKey)) => {
+            AnchorOutcome::Unlisted(error as u32)
         }
-        Some(error @ Error::UnknownAnchorKey) => Answer::Resign(error),
-        _ => Answer::Configuration,
+        Some(error @ Error::SpaceNotActive) => AnchorOutcome::Stopped(error as u32),
+        _ => AnchorOutcome::NotYet,
     }
 }
 
-/// A submit's verdict from its events: `Accepted { id }` accepted,
-/// `Refused` with [`Refusal::Repeated`]'s code accepted (a repeat, two
-/// nodes racing), `Refused { c }` refused; none when it was not judged.
-pub(super) fn judged(
-    events: &[Event],
-    id: StatementId,
-) -> Option<Result<StatementId, NotAccepted>> {
+/// A submit's outcome from its events: `Accepted { id }` accepted,
+/// `Refused { c }` as [`SubmitOutcome::judged`] takes `c` (a repeat,
+/// two nodes racing, accepted); none when it was not judged.
+pub(super) fn judged(events: &[Event], id: StatementId) -> Option<SubmitOutcome> {
     events.iter().find_map(|event| match event {
-        Event::Accepted { id: accepted, .. } if *accepted == id.0 => Some(Ok(id)),
-        Event::Refused { code, .. } if *code == Refusal::Repeated.code() => Some(Ok(id)),
-        Event::Refused { code, .. } => Some(Err(NotAccepted::Refused(*code))),
+        Event::Accepted { id: accepted, .. } if *accepted == id.0 => Some(SubmitOutcome::Accepted),
+        Event::Refused { code, .. } => Some(SubmitOutcome::judged(*code)),
         _ => None,
     })
 }

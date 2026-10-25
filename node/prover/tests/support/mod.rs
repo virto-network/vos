@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use vos_node_prover::{Host, Jobs, Options, ProveError, Prover, State, Worker};
 use vos_venue::vos_statement::{ProgramId, Refusal, Statement, StatementId};
-use vos_venue::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
+use vos_venue::{AnchorOutcome, Held, Status, SubmitOutcome, UNJUDGED, VenueClient};
 use vos_wire::ids::{AgentId, ProgramHash};
 use vos_wire::result::Attest;
 use vos_wire::vos_anchor::{Anchor, RootKind, RootRead, SpaceId, VenueId, WindowClock};
@@ -222,8 +222,6 @@ pub(crate) struct Venue {
     pub(crate) lose: AtomicBool,
     /// The codes the next submissions are refused with, in order.
     pub(crate) refuse: Mutex<Vec<u32>>,
-    /// Every answer lost while set.
-    pub(crate) lose_all: AtomicBool,
     /// Every answer lost while set, the statement accepted all the same.
     pub(crate) lose_landed: AtomicBool,
     /// The submissions answered unfunded still to come.
@@ -251,20 +249,20 @@ impl VenueClient for Venue {
         VenueId([0x7e; 32])
     }
 
-    fn anchor(&self, _: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        Ok(Anchored::New)
+    fn anchor(&self, _: &Anchor) -> AnchorOutcome {
+        AnchorOutcome::Taken
     }
 
-    fn submit(&self, statement: &Statement, _: &[u8]) -> Result<StatementId, NotAccepted> {
+    fn submit(&self, statement: &Statement, _: &[u8]) -> SubmitOutcome {
         self.submissions.fetch_add(1, Ordering::SeqCst);
         let mut refuse = self.refuse.lock().unwrap();
         if !refuse.is_empty() {
-            return Err(NotAccepted::Refused(refuse.remove(0)));
+            return SubmitOutcome::judged(refuse.remove(0));
         }
         drop(refuse);
         let id = statement.id();
         if !self.accepted.lock().unwrap().insert(id.0) {
-            return Err(Refusal::Repeated.into());
+            return SubmitOutcome::judged(Refusal::Repeated.code());
         }
         if self
             .unfunded
@@ -274,19 +272,15 @@ impl VenueClient for Venue {
             .is_ok()
         {
             self.accepted.lock().unwrap().remove(&id.0);
-            return Err(NotAccepted::Unjudged(Unjudged::Funding));
+            return SubmitOutcome::Retry(UNJUDGED);
         }
         if self.lose_landed.load(Ordering::SeqCst) {
-            return Err(NotAccepted::Unjudged(Unjudged::Unknown));
-        }
-        if self.lose_all.load(Ordering::SeqCst) {
-            self.accepted.lock().unwrap().remove(&id.0);
-            return Err(NotAccepted::Unjudged(Unjudged::Unknown));
+            return SubmitOutcome::Retry(UNJUDGED);
         }
         if self.lose.swap(false, Ordering::SeqCst) {
-            return Err(NotAccepted::Unjudged(Unjudged::Unknown));
+            return SubmitOutcome::Retry(UNJUDGED);
         }
-        Ok(id)
+        SubmitOutcome::Accepted
     }
 
     fn anchored(&self, root: &RootRead) -> bool {
@@ -305,8 +299,8 @@ impl VenueClient for Venue {
         Some(self.now.load(Ordering::SeqCst))
     }
 
-    fn unsettled(&self, _: &SpaceId) -> Vec<Anchor> {
-        Vec::new()
+    fn held(&self, _: &SpaceId, _: u64) -> Held {
+        Held::Nothing
     }
 }
 

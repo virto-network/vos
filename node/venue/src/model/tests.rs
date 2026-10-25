@@ -70,22 +70,11 @@ impl Harness for Model {
     }
 
     fn anchor(&mut self, anchor: &Anchor) -> Answer {
-        use vos_anchor::venue::AnchorRefusal as Rule;
-        match self.venue.anchor(anchor) {
-            Ok(Anchored::New) => Answer::New,
-            Ok(Anchored::Again) => Answer::Again,
-            Err(AnchorRefusal::Equivocation) => Answer::Evidence,
-            Err(refusal) => Answer::Refused(match refusal {
-                AnchorRefusal::Unregistered => Rule::Unregistered,
-                AnchorRefusal::Stopped => Rule::Stopped,
-                AnchorRefusal::Key => Rule::Key,
-                AnchorRefusal::Signature => Rule::Signature,
-                AnchorRefusal::Window => Rule::Window,
-                AnchorRefusal::Open => Rule::Open,
-                AnchorRefusal::Age => Rule::Age,
-                other => panic!("{other:?}"),
-            }),
-            Ok(other) => panic!("{other:?}"),
+        match self.venue.answer(anchor) {
+            Ok(Anchoring::New) => Answer::New,
+            Ok(Anchoring::Again) => Answer::Again,
+            Ok(Anchoring::Evidence(_)) => Answer::Evidence,
+            Err(refusal) => Answer::Refused(refusal),
         }
     }
 
@@ -147,8 +136,8 @@ fn an_equivocation_keeps_both_anchors() {
         anchor
     };
     let (held, other) = (signed(1, 1), signed(2, 2));
-    assert_eq!(model.venue.anchor(&held), Ok(Anchored::New));
-    assert_eq!(model.venue.anchor(&other), Err(AnchorRefusal::Equivocation));
+    assert_eq!(model.venue.anchor(&held), AnchorOutcome::Taken);
+    assert_eq!(model.venue.anchor(&other), AnchorOutcome::Stopped(8));
     assert_eq!(model.venue.evidence(), vec![(held, other)]);
     assert_eq!(model.venue.status(&space), Status::Ended);
 }
@@ -187,7 +176,7 @@ fn a_statement_is_judged_against_the_anchors() {
         output: vec![2],
         roots: vec![root],
     };
-    let code = |verdict: Result<StatementId, NotAccepted>| crate::code(&verdict);
+    let code = |outcome: SubmitOutcome| outcome.code();
     assert_eq!(code(model.venue.submit(&statement, &[0])), 3, "not pinned");
     model.venue.pin(program);
     assert_eq!(
@@ -204,9 +193,34 @@ fn a_statement_is_judged_against_the_anchors() {
         signature: [0; 64],
     };
     anchor.signature = model.sign(1, &anchor.digest(&VENUE));
-    model.venue.anchor(&anchor).unwrap();
+    assert_eq!(model.venue.anchor(&anchor), AnchorOutcome::Taken);
     assert!(
         code(model.venue.submit(&statement, &[0])) >= 0x100,
         "judged to the proof"
     );
+}
+
+/// Every answer of the venue rules has its outcome: taken, not yet, never,
+/// unlisted or stopped, each refusal's code kept.
+#[test]
+fn every_rule_answer_has_its_outcome() {
+    use vos_anchor::venue::Held as Holding;
+    let evidence = Anchoring::Evidence(Holding {
+        root: [1; 32],
+        signer: [2; 32],
+    });
+    for (answer, expected) in [
+        (Ok(Anchoring::New), AnchorOutcome::Taken),
+        (Ok(Anchoring::Again), AnchorOutcome::Taken),
+        (Ok(evidence), AnchorOutcome::Stopped(8)),
+        (Err(AnchorRefusal::Unregistered), AnchorOutcome::NotYet),
+        (Err(AnchorRefusal::Stopped), AnchorOutcome::Stopped(2)),
+        (Err(AnchorRefusal::Key), AnchorOutcome::Unlisted(3)),
+        (Err(AnchorRefusal::Signature), AnchorOutcome::Never(4)),
+        (Err(AnchorRefusal::Window), AnchorOutcome::Never(5)),
+        (Err(AnchorRefusal::Open), AnchorOutcome::NotYet),
+        (Err(AnchorRefusal::Age), AnchorOutcome::Never(7)),
+    ] {
+        assert_eq!(outcome(answer), expected, "{answer:?}");
+    }
 }

@@ -14,9 +14,9 @@ use vos_node::{Config, Hooks};
 use vos_node_prover::Prover;
 use vos_statement_service::item::Item;
 use vos_statement_service::state::{Outcome as Judged, keys as jam_keys};
-use vos_venue::VenueClient;
 use vos_venue::kreivo::KreivoVenue;
 use vos_venue::vos_statement::{Refusal, Statement};
+use vos_venue::{Status, SubmitOutcome, VenueClient};
 use vos_wire::keys;
 use vos_wire::package::SLOT_MS;
 use vos_wire::peer::NodeNumber;
@@ -145,9 +145,9 @@ fn until(at: u64) {
 /// The judgement a venue gave `statement` that accepted it, if one did.
 pub fn accepted<'a>(judged: &'a [Judgement], statement: &Statement) -> Option<&'a Judgement> {
     let id = statement.id();
-    judged
-        .iter()
-        .find(|judgement| judgement.statement.id() == id && judgement.answer == Ok(id))
+    judged.iter().find(|judgement| {
+        judgement.statement.id() == id && judgement.answer == SubmitOutcome::Accepted
+    })
 }
 
 #[test]
@@ -278,6 +278,13 @@ impl Run {
         assert_eq!(code, 0, "registered at the JAM service");
         let id = at_jam.space.id();
         let start = jam.space(&id).unwrap().expect("registered").start;
+        // The client reads the space on its own thread, as Kreivo's does:
+        // its nodes replicate the representative once it lists their keys.
+        vos_checker::wait_until(
+            "JAM a's client reads the registration",
+            Duration::from_secs(60),
+            || jam.status(&id) == Status::Active,
+        );
         record.note(format!(
             "the space {} at JAM a: the same clock, three nodes; registered from window {start}",
             hex::encode(&id.0[..8]),
@@ -465,7 +472,11 @@ impl Run {
                 "the JAM space's statement {what}, where its roots are not anchored: \
                  {verdict:?}"
             ));
-            assert_eq!(verdict, Err(Refusal::Unanchored.into()), "{what}");
+            assert_eq!(
+                verdict,
+                SubmitOutcome::Retry(Refusal::Unanchored.code()),
+                "{what}"
+            );
         }
     }
 
@@ -486,7 +497,7 @@ impl Run {
             .note(format!("a rootless statement at JAM a: {verdict:?}"));
         assert_eq!(
             verdict,
-            Err(Refusal::Space.into()),
+            SubmitOutcome::Refused(Refusal::Space.code()),
             "rooted statements only"
         );
         (statement, proof)

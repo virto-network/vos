@@ -784,6 +784,16 @@ fn peer_messages_keep_their_bytes() {
             receiver: AgentId(4),
             relayed: true,
         },
+        PeerMessage::AnchorRow {
+            agent,
+            token: 0,
+            window: 0,
+        },
+        PeerMessage::AnchorRowAnswer {
+            agent,
+            token: 0,
+            root: None,
+        },
     ];
     for (index, frame) in frames.iter().enumerate() {
         assert_eq!(usize::from(frame.encode()[0]), index, "{frame:?}");

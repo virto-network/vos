@@ -257,39 +257,6 @@ fn the_founding_node_creates_the_representative_once() {
     assert_ne!(created.parse::<u32>().unwrap(), id);
 }
 
-/// `vos node anchor-key rotate` makes a key in a stopped node's store and
-/// prints it: each rotation another, kept in order, apart from the node
-/// key. A directory with no node's store is refused.
-#[test]
-fn an_anchor_key_is_rotated_on_a_stopped_node() {
-    let dir = tempfile::tempdir().unwrap();
-    let refused = vos_fails([
-        "node",
-        "anchor-key",
-        "rotate",
-        "--data",
-        dir.path().to_str().unwrap(),
-    ]);
-    assert!(refused.contains("run the node once first"), "{refused}");
-    let (mut node, data, _) = single_node(dir.path());
-    node.running.kill();
-    let rotate = || vos(["node", "anchor-key", "rotate", "--data", &data]);
-    let (first, second) = (rotate(), rotate());
-    assert_ne!(first, second);
-    let store = vos_node::store::Fjall::open(Path::new(&data).join(vos_node::STORE)).unwrap();
-    let made: Vec<String> = store
-        .anchor_secrets()
-        .unwrap()
-        .iter()
-        .map(|(_, seed)| {
-            let key = ed25519_dalek::SigningKey::from_bytes(&seed.unwrap()).verifying_key();
-            hex::encode(key.to_bytes())
-        })
-        .collect();
-    assert_eq!(made, [first, second]);
-    assert_ne!(node.key, made[0], "apart from the node key");
-}
-
 #[test]
 fn a_client_calls_an_agent_the_operator_installed() {
     let dir = tempfile::tempdir().unwrap();

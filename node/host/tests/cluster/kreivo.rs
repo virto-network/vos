@@ -4,9 +4,7 @@
 //! client signing as its own account, the space registered with every
 //! node its authority, paired with its genesis key, the sovereign account
 //! paying. Anchors land once a window, in order, while the leader never
-//! waits on the chain inside its batch; a blocked space is sent nothing;
-//! a key the venue refuses is tried again once a window, or once the
-//! venue's listing changes.
+//! waits on the chain inside its batch; a blocked space is sent nothing.
 //!
 //! The windows are an hour long (`support::clock`); the tests move the nodes'
 //! clocks and the mock chain's past each window's close, `B_w + D`.
@@ -22,10 +20,10 @@ use vos_venue::kreivo::mock::transport::MockChain;
 use vos_venue::kreivo::mock::types::{AuthorityInfo, SpaceInfo, SpaceStatus};
 use vos_venue::kreivo::mock::{Account, Chain, Constants, Origin, keys};
 use vos_venue::kreivo::{KreivoVenue, Options};
-use vos_venue::{AnchorRefusal, Anchored, Status, VenueClient};
+use vos_venue::{AnchorOutcome, Status, VenueClient};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
-use vos_wire::vos_anchor::{Anchor, SpaceId, VenueId, WindowClock};
+use vos_wire::vos_anchor::{Anchor, VenueId, WindowClock};
 
 use crate::common::{Cluster, wait_until};
 use crate::support::clock;
@@ -35,30 +33,22 @@ const UNITS: u128 = 1_000_000_000_000;
 const VENUE: VenueId = VenueId([0x6b; 32]);
 const CONTROLLER: [u8; 32] = [0xc0; 32];
 
-/// A node's client, as the leader reaches it: every anchor timed, and a
-/// listing of anchor keys the test may lead with.
+/// A node's client, as the leader reaches it: every anchor timed.
 struct Watched {
     inner: KreivoVenue,
     anchors: AtomicUsize,
     /// The slowest anchor's answer, in microseconds.
     slowest: AtomicU64,
-    extra: Arc<Mutex<Vec<[u8; 32]>>>,
 }
 
-vos_venue::forward_venue!(Watched => inner; forward [id, submit, anchored, status, time, unsettled] {
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
+vos_venue::forward_venue!(Watched => inner; forward [id, submit, anchored, anchor_keys, status, held, time] {
+    fn anchor(&self, anchor: &Anchor) -> AnchorOutcome {
         let start = Instant::now();
         let answer = self.inner.anchor(anchor);
         let took = start.elapsed().as_micros() as u64;
         self.slowest.fetch_max(took, Ordering::SeqCst);
         self.anchors.fetch_add(1, Ordering::SeqCst);
         answer
-    }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        let mut keys = self.extra.lock().unwrap().clone();
-        keys.extend(self.inner.anchor_keys(space));
-        keys
     }
 });
 
@@ -76,7 +66,6 @@ struct Kreivo {
     chain: Arc<MockChain>,
     clock: OffsetClock,
     clients: Arc<Mutex<Vec<Client>>>,
-    extra: Arc<Mutex<Vec<[u8; 32]>>>,
 }
 
 impl Kreivo {
@@ -89,18 +78,13 @@ impl Kreivo {
             chain,
             clock,
             clients: Arc::default(),
-            extra: Arc::default(),
         }
     }
 
     /// Each node's config: its client, signing as its account, made once
     /// per node however many configs are made for it.
     fn tuning(&self) -> impl Fn(NodeNumber, &mut Config) + Send + Sync + 'static {
-        let (chain, clients, extra) = (
-            Arc::clone(&self.chain),
-            Arc::clone(&self.clients),
-            Arc::clone(&self.extra),
-        );
+        let (chain, clients) = (Arc::clone(&self.chain), Arc::clone(&self.clients));
         move |number, config| {
             let space =
                 vos_wire::vos_anchor::space_id(config.space.as_ref().unwrap().genesis().unwrap());
@@ -121,7 +105,6 @@ impl Kreivo {
                     inner: KreivoVenue::over(transport, &[space], space, options),
                     anchors: AtomicUsize::new(0),
                     slowest: AtomicU64::new(0),
-                    extra: Arc::clone(&extra),
                 });
                 clients.push((number, account, Arc::clone(&watched)));
                 watched
@@ -329,67 +312,6 @@ fn a_blocked_space_is_sent_no_anchor() {
     kreivo.set_status(&cluster, SpaceStatus::Active);
     wait_until("window 1 lands once unblocked", || {
         kreivo.holds(&cluster, 1)
-    });
-    assert_eq!(kreivo.included(), [0, 1]);
-}
-
-/// A key the venue refuses is tried again once a window, or once the
-/// venue's listing changes: the leader's view of the listing leads with
-/// the genesis keys, which the venue does not list. Its first anchor is
-/// refused for the key, and not handed over again through the idle
-/// leader's rechecks; a window later it is, once; and once the venue lists
-/// the key, the listing changes and the window lands.
-#[test]
-fn a_refused_key_is_tried_once_a_window() {
-    let (kreivo, cluster, clock, representative) = space();
-    let space = cluster.space.id().0;
-    let genesis: Vec<[u8; 32]> = cluster
-        .space
-        .genesis()
-        .unwrap()
-        .nodes
-        .iter()
-        .map(|(_, key)| *key)
-        .collect();
-    let removed: Vec<(Vec<u8>, Vec<u8>)> = kreivo.chain.with(|chain| {
-        genesis
-            .iter()
-            .map(|key| {
-                let at = keys::anchor_keys(&space, key);
-                let value = chain.storage()[&at].clone();
-                (at, value)
-            })
-            .collect()
-    });
-    kreivo.chain.with(|chain| {
-        for (at, _) in &removed {
-            chain.remove_storage(at);
-        }
-    });
-    *kreivo.extra.lock().unwrap() = genesis.clone();
-    let clients = kreivo.clients.lock().unwrap().clone();
-    wait_until("every client reads the keys gone", || {
-        clients
-            .iter()
-            .all(|(_, _, client)| client.inner.anchor_keys(&cluster.space.id()).is_empty())
-    });
-    close(&kreivo, &cluster, &clock, 0);
-    closed(&cluster, representative, 0);
-    wait_until("the key refused", || kreivo.anchor_calls() == 1);
-    std::thread::sleep(Duration::from_secs(5));
-    assert_eq!(kreivo.anchor_calls(), 1, "not again within the window");
-    close(&kreivo, &cluster, &clock, 1);
-    wait_until("tried again a window later", || kreivo.anchor_calls() == 2);
-    std::thread::sleep(Duration::from_secs(3));
-    assert_eq!(kreivo.anchor_calls(), 2, "once a window");
-    assert!(kreivo.sent().is_empty(), "nothing sent for a refused key");
-    kreivo.chain.with(|chain| {
-        for (at, value) in removed {
-            chain.set_storage(at, value);
-        }
-    });
-    wait_until("windows 0 and 1 land once the key is listed", || {
-        kreivo.holds(&cluster, 0) && kreivo.holds(&cluster, 1)
     });
     assert_eq!(kreivo.included(), [0, 1]);
 }

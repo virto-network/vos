@@ -317,7 +317,9 @@ pub fn class(message: &PeerMessage) -> Class {
         | PeerMessage::ReadIndexAnswer { .. }
         | PeerMessage::Deliver { .. }
         | PeerMessage::Acknowledge { .. }
-        | PeerMessage::Behind { .. } => Class::Requests,
+        | PeerMessage::Behind { .. }
+        | PeerMessage::AnchorRow { .. }
+        | PeerMessage::AnchorRowAnswer { .. } => Class::Requests,
         PeerMessage::Liveness { .. } => Class::Liveness,
     }
 }
@@ -339,7 +341,9 @@ pub fn stream(message: &PeerMessage) -> u64 {
         | PeerMessage::ReadIndexAnswer { agent, .. }
         | PeerMessage::Deliver { to: agent, .. }
         | PeerMessage::Acknowledge { sender: agent, .. }
-        | PeerMessage::Behind { sender: agent, .. } => u64::from(agent.0),
+        | PeerMessage::Behind { sender: agent, .. }
+        | PeerMessage::AnchorRow { agent, .. }
+        | PeerMessage::AnchorRowAnswer { agent, .. } => u64::from(agent.0),
         PeerMessage::Blob { .. } | PeerMessage::Liveness { .. } => 0,
     }
 }
@@ -405,7 +409,9 @@ pub fn check(
         | PeerMessage::ReadIndexAnswer { .. }
         | PeerMessage::Deliver { .. }
         | PeerMessage::Acknowledge { .. }
-        | PeerMessage::Behind { .. } => Ok(()),
+        | PeerMessage::Behind { .. }
+        | PeerMessage::AnchorRow { .. }
+        | PeerMessage::AnchorRowAnswer { .. } => Ok(()),
     }
 }
 

@@ -15,8 +15,8 @@ use vos_node::store::EntryKind;
 use vos_node::{Hooks, Node};
 use vos_statement_service::item::Item;
 use vos_venue::kreivo;
-use vos_venue::vos_statement::{Statement, StatementId};
-use vos_venue::{AnchorRefusal, Anchored, NotAccepted, VenueClient};
+use vos_venue::vos_statement::Statement;
+use vos_venue::{AnchorOutcome, SubmitOutcome, VenueClient};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
 use vos_wire::result::WorkResult;
@@ -72,13 +72,13 @@ impl Tapped {
     }
 }
 
-vos_venue::forward_venue!(Tapped => inner; forward [id, anchored, anchor_keys, status, time, unsettled] {
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
+vos_venue::forward_venue!(Tapped => inner; forward [id, anchored, anchor_keys, status, held, time] {
+    fn anchor(&self, anchor: &Anchor) -> AnchorOutcome {
         lock(&self.anchors).push(*anchor);
         self.inner.anchor(anchor)
     }
 
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
+    fn submit(&self, statement: &Statement, proof: &[u8]) -> SubmitOutcome {
         lock(&self.submitted).push((statement.clone(), proof.to_vec()));
         self.inner.submit(statement, proof)
     }

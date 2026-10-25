@@ -2,10 +2,9 @@
 //! replica has built a window's cut, reports its root there to the space's
 //! representative ([`Input::Report`]), saying whether reads wait on the
 //! close. The representative's leader, once its replica has built its own
-//! cut of the window, which closes it, signs the anchor of the space's
-//! root `S_w` with the newest of this node's anchor keys the venue lists
-//! and hands it to the venue, then sends
-//! each agent that asked its path ([`Input::Close`]). Both are proposed
+//! cut of the window, which closes it (and writes the space's root `S_w`,
+//! which its anchoring signs), sends each agent that asked its path
+//! ([`Input::Close`]). Both are proposed
 //! from the replica's state, never queued, and sent once: refine sends
 //! nothing for a window its mark has passed ([`keys::reported`],
 //! [`keys::close_mark`]).
@@ -32,10 +31,6 @@ pub(super) enum Closes {
     /// A test's hook stopped the leader before a close.
     Stopped,
 }
-
-/// A window's close to propose: the window, the representative's root at
-/// its cut, and the paths not yet sent.
-pub(super) type Unsent = (u64, Closing);
 
 impl Leader {
     /// Whether a report or a close waits on this replica's state.
@@ -86,14 +81,9 @@ impl Leader {
     }
 
     /// The representative's closes due on `snapshot`, at most [`CLOSES`]
-    /// in window order, each window's anchor handed to the venue first
-    /// ([`Leader::anchor_due`]).
-    pub(super) fn closes(&mut self, snapshot: &Snapshot) -> Result<Closes, Fault> {
-        if self.take_up(snapshot)? {
-            self.seed_waiting(snapshot)?;
-        }
+    /// in window order.
+    pub(super) fn closes(&self, snapshot: &Snapshot) -> Result<Closes, Fault> {
         let unsent = unsent(snapshot, self.id, self.represents())?;
-        self.anchor_closes(&unsent);
         let mut due = Vec::new();
         for (window, closing) in unsent {
             if !self.inner.hooks.close(self.id, window) {
@@ -125,7 +115,11 @@ impl Leader {
 /// The closes `snapshot` holds whose paths are not all sent, in window
 /// order, each with the paths past the close mark: none but the
 /// representative's.
-fn unsent(snapshot: &Snapshot, agent: AgentId, represents: bool) -> Result<Vec<Unsent>, Fault> {
+fn unsent(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    represents: bool,
+) -> Result<Vec<(u64, Closing)>, Fault> {
     if !represents {
         return Ok(Vec::new());
     }

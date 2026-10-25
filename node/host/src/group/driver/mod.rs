@@ -409,6 +409,7 @@ impl Driver {
             Local::Retire => self.retired = true,
             Local::Probe(node) => self.core.probe(node),
             Local::Wake => {}
+            Local::Transfer(to) => self.core.transfer_leadership(Some(to)),
             Local::ReadIndex { answer } => {
                 let token = self.answers.token();
                 self.answers.reads.insert(token, answer);

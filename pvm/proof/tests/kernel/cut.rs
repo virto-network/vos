@@ -22,7 +22,7 @@ use vos_testkit::Step;
 use vos_testkit::Testkit;
 use vos_testkit::programs::{derivation, derived, method, package, table_tag};
 use vos_tree::{BatchProof, Blake2b, Hash, Leaf, MemStore};
-use vos_venue::{AnchorRefusal, Anchored, ModelVenue, VenueClient};
+use vos_venue::{ModelVenue, VenueClient};
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{AttestError, Failure};
 use vos_wire::batch::Body;
@@ -31,6 +31,7 @@ use vos_wire::keys::{self, Transform};
 use vos_wire::records::{PendingRead, WorkflowState};
 use vos_wire::result::{Attest, KernelReturn, Outcome};
 use vos_wire::served::{Served, representative_row};
+use vos_wire::vos_anchor::venue::{AnchorRefusal, Anchoring};
 use vos_wire::vos_anchor::{
     Anchor, GENESIS_VERSION, RootKind, RootRead, SpaceGenesis, VenueId, space_root,
 };
@@ -563,7 +564,7 @@ impl Venue {
         &self,
         root: &RootRead,
         signed_for: VenueId,
-    ) -> Result<Anchored, AnchorRefusal> {
+    ) -> Result<Anchoring, AnchorRefusal> {
         let key = founder();
         let mut anchor = Anchor {
             space: root.space,
@@ -574,11 +575,11 @@ impl Venue {
             signature: [0; 64],
         };
         anchor.signature = key.sign(&anchor.digest(&signed_for)).to_bytes();
-        self.venue.anchor(&anchor)
+        self.venue.answer(&anchor)
     }
 
     /// `root` anchored, signed by the founder for this venue.
-    pub fn anchor(&self, root: &RootRead) -> Result<Anchored, AnchorRefusal> {
+    pub fn anchor(&self, root: &RootRead) -> Result<Anchoring, AnchorRefusal> {
         self.anchor_for(root, self.venue.id())
     }
 }

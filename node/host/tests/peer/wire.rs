@@ -175,6 +175,16 @@ fn every_other_message_survives_the_wire() {
             relayed: true,
         },
         PeerMessage::DirectoryRequest { agent: AGENT },
+        PeerMessage::AnchorRow {
+            agent: AGENT,
+            token: 79,
+            window: 5,
+        },
+        PeerMessage::AnchorRowAnswer {
+            agent: AGENT,
+            token: 79,
+            root: Some([7; 32]),
+        },
         PeerMessage::ReadIndexAnswer {
             agent: AGENT,
             token: 78,

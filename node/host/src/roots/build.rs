@@ -5,11 +5,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
 use vos_tree::{Blake2b, Child, Leaf, empty_root};
-use vos_wire::Encode;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
 use vos_wire::records::unstored;
 use vos_wire::result::Write;
+use vos_wire::{Encode, SpaceId, WindowClock};
 
 use super::{
     AgentStore, BATCH, Error, ROWS_PER_KEY, RootRow, built, cuts, root_row, state_version,
@@ -48,8 +48,8 @@ pub struct Build {
     top: Option<Option<Child>>,
     /// Undo rows of cuts already built, deleted by the first batch.
     orphans: Vec<Vec<u8>>,
-    /// The agent is the space's representative.
-    representative: bool,
+    /// The space and its clock, when the agent is its representative.
+    representative: Option<(SpaceId, WindowClock)>,
     done: bool,
 }
 
@@ -99,7 +99,7 @@ impl Build {
             read: 0,
             top: None,
             orphans,
-            representative: false,
+            representative: None,
             done: false,
         }))
     }
@@ -123,10 +123,11 @@ impl Build {
         self.done && self.cut.is_some()
     }
 
-    /// Build as the space's representative's: the commit that finishes a
-    /// cut keeps its close ([`keys::closing`]).
-    pub(crate) fn representing(mut self, representative: bool) -> Self {
-        self.representative = representative;
+    /// Build as the representative's of `space`, timed by `clock`: the
+    /// commit that finishes a cut keeps its close ([`keys::closing`]) and
+    /// the space's root of the window ([`keys::anchor`]).
+    pub(crate) fn representing(mut self, space: SpaceId, clock: WindowClock) -> Self {
+        self.representative = Some((space, clock));
         self
     }
 
@@ -360,10 +361,13 @@ pub(crate) async fn build(inner: Arc<Inner>, shared: Arc<Shared>) {
 async fn run(inner: &Inner, shared: &Shared) -> Result<(), Error> {
     let agent = shared.agent;
     while !shared.state().stopped {
-        let Some(build) = Build::start(&inner.store, agent)? else {
+        let Some(mut build) = Build::start(&inner.store, agent)? else {
             return Ok(());
         };
-        let mut build = build.representing(inner.representative() == Some(agent));
+        if inner.representative() == Some(agent) {
+            let (space, clock) = inner.space_and_clock();
+            build = build.representing(space, clock);
+        }
         while !shared.state().stopped {
             let (returned, change) = inner
                 .offload(move || {

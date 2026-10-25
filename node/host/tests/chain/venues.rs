@@ -14,8 +14,8 @@ use vos_statement_service::state::Outcome;
 use vos_venue::kreivo::Transport;
 use vos_venue::kreivo::calls::AccountId;
 use vos_venue::kreivo::transport::{Included, Lost, SendError, Signed};
-use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
-use vos_venue::{NotAccepted, VenueClient};
+use vos_venue::vos_statement::{ProgramId, Statement};
+use vos_venue::{SubmitOutcome, VenueClient};
 use vos_wire::result::Attest;
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -83,7 +83,7 @@ impl Prover for Serial {
 #[derive(Clone, Debug)]
 pub struct Judgement {
     pub statement: Statement,
-    pub answer: Result<StatementId, NotAccepted>,
+    pub answer: SubmitOutcome,
     pub at_ms: u64,
 }
 
@@ -106,8 +106,8 @@ impl Recorded {
     }
 }
 
-vos_venue::forward_venue!(Recorded => inner; forward [id, anchor, anchored, anchor_keys, status, time, unsettled] {
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
+vos_venue::forward_venue!(Recorded => inner; forward [id, anchor, anchored, anchor_keys, status, held, time] {
+    fn submit(&self, statement: &Statement, proof: &[u8]) -> SubmitOutcome {
         let answer = self.inner.submit(statement, proof);
         lock(&self.judged).push(Judgement {
             statement: statement.clone(),

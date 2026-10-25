@@ -147,6 +147,10 @@ fn keys_keep_their_bytes() {
         Some(sequence)
     );
     assert_eq!(keys::closing_entry(&keys::cut_root(sequence)), None);
+    assert_eq!(keys::anchor(sequence), cat(&[&[0x02, 0x08], &at]));
+    assert_eq!(keys::anchors(), [0x02, 0x08]);
+    assert_eq!(keys::anchor_entry(&keys::anchor(sequence)), Some(sequence));
+    assert_eq!(keys::anchor_entry(&keys::closing(sequence)), None);
     for replicated in [
         keys::reported(),
         keys::closed(1),
@@ -158,6 +162,7 @@ fn keys_keep_their_bytes() {
         assert!(keys::is_replicated(&replicated));
     }
     assert!(!keys::is_replicated(&keys::closing(1)));
+    assert!(!keys::is_replicated(&keys::anchor(1)));
 }
 
 /// A sweep's rows: those due by its time, earliest first, as many as it

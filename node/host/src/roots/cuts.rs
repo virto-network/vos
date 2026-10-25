@@ -27,7 +27,9 @@
 //! ([`keys::closing`]); the same bytes on every replica that builds the cut
 //! within a few windows, since the asks are a plain table read where the
 //! build starts, and pruned: a replica far behind omits paths only dead
-//! reads need. An undo row an apply wrote racing that commit, of a
+//! reads need. Its close writes the space's root of the window too
+//! ([`keys::anchor`]), the only root its leader signs, kept for
+//! `MaxRootAge`. An undo row an apply wrote racing that commit, of a
 //! window built, is garbage the next build deletes, as are a request's
 //! proof once it is answered and a close once sent.
 
@@ -39,8 +41,8 @@ use vos_wire::keys::{self, Transform};
 use vos_wire::records::{PendingRead, unstored};
 use vos_wire::result::Write;
 use vos_wire::served::{ASKED_TAG, Closing, REPRESENTATIVE, representative_row};
-use vos_wire::vos_anchor::RootKind;
-use vos_wire::{Decode, Encode, defaults, scale};
+use vos_wire::vos_anchor::{MAX_ROOT_AGE_MS, RootKind, space_root};
+use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, scale};
 
 use super::{AgentStore, Error, decoded, value_row};
 use crate::store::Snapshot;
@@ -282,24 +284,23 @@ pub(super) fn at_cut(
     Ok((written <= cut.version).then_some(stored))
 }
 
-/// What finishes the build of a cut: the agent, the cut, its root, and
-/// whether the agent is the space's representative.
+/// What finishes the build of a cut: the agent, the cut, its root, and,
+/// when the agent is the space's representative, its space and clock.
 pub(super) struct Finish {
     pub(super) agent: AgentId,
     pub(super) cut: Cut,
     pub(super) root: Hash,
-    pub(super) representative: bool,
+    pub(super) representative: Option<(SpaceId, WindowClock)>,
 }
 
 impl Finish {
     /// The writes that finish the build: the root at the cut, the cut
-    /// roots kept (this one and the latest before it; the representative's
-    /// latest [`defaults::CUT_KEEP`], so a new leadership takes up every
-    /// anchor still waiting through a long wait), the window's undo
+    /// roots kept (this one and the latest before it), the window's undo
     /// rows dropped, as `fresh` holds them, and the proof of each pending
     /// request the cut serves ([`served_at`]), read off `tree`, the agent's
     /// tree at the cut, its values off `at`; the representative's, its
-    /// close of the window too.
+    /// close of the window too, and the space's root of the window, those
+    /// of windows past `MaxRootAge` dropped.
     pub(super) fn write(
         &self,
         [at, fresh]: [&Snapshot; 2],
@@ -318,12 +319,7 @@ impl Finish {
         );
         let kept = cut_roots(fresh, agent)?;
         let older = kept.keys().filter(|kept| **kept < cut.window).copied();
-        let older_kept = if representative {
-            defaults::CUT_KEEP - 1
-        } else {
-            1
-        };
-        for stale in older.rev().skip(older_kept as usize) {
+        for stale in older.rev().skip(1) {
             writes.insert(keys::cut_root(stale), None);
         }
         for row in fresh.scan(agent, &keys::undos(cut.window), None) {
@@ -358,9 +354,20 @@ impl Finish {
                 Err(error) => return Err(error),
             }
         }
-        if representative {
+        if let Some((space, clock)) = representative {
             let closing = closing(at, agent, cut.window, tree, root)?;
             writes.insert(keys::closing(cut.window), Some(closing.encode()));
+            let space_root = space_root(&space, cut.window, &root);
+            writes.insert(keys::anchor(cut.window), Some(space_root.to_vec()));
+            let kept = MAX_ROOT_AGE_MS.div_ceil(clock.length_ms.max(1));
+            let first = keys::anchor(cut.window.saturating_sub(kept));
+            for row in fresh.scan(agent, &keys::anchors(), None) {
+                let (key, _) = row?;
+                if key >= first {
+                    break;
+                }
+                writes.insert(key, None);
+            }
         }
         Ok(())
     }
@@ -469,13 +476,41 @@ fn asked_entry(raw: &[u8]) -> Option<(u64, AgentId)> {
     ))
 }
 
-/// The representative's close of window `window`, once its cut is built.
-pub fn closing_of(
+/// The space's roots the representative's closes made ([`keys::anchor`]),
+/// by window, past `after` when given.
+pub fn anchors(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    after: Option<u64>,
+) -> Result<BTreeMap<u64, [u8; 32]>, Error> {
+    let after = after.map(keys::anchor);
+    snapshot
+        .scan(agent, &keys::anchors(), after.as_deref())
+        .map(|row| {
+            let (key, value) = row?;
+            let window = keys::anchor_entry(&key).ok_or(Error::Corrupt("an anchor row's key"))?;
+            let root = value[..]
+                .try_into()
+                .map_err(|_| Error::Corrupt("an anchor row"))?;
+            Ok((window, root))
+        })
+        .collect()
+}
+
+/// The space's root of window `window` the representative's close made.
+pub fn anchor_of(
     snapshot: &Snapshot,
     agent: AgentId,
     window: u64,
-) -> Result<Option<Closing>, Error> {
-    decoded(snapshot.get(agent, &keys::closing(window))?, "a close")
+) -> Result<Option<[u8; 32]>, Error> {
+    snapshot
+        .get(agent, &keys::anchor(window))?
+        .map(|value| {
+            value[..]
+                .try_into()
+                .map_err(|_| Error::Corrupt("an anchor row"))
+        })
+        .transpose()
 }
 
 /// The proof of `read` at `cut`: each row's leaf off `tree`, its value off
