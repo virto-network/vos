@@ -1,3 +1,5 @@
+use alloc::vec::Vec;
+
 use stwo_constraint_framework::EvalAtRow;
 
 use crate::air_column::{AirColumn, PreprocessedAirColumn};
@@ -21,6 +23,43 @@ use stwo::{
     },
 };
 
+/// How a chip's fractions are finalized: in pairs, each pair one
+/// interaction column (the default), or each fraction its own column.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Logup {
+    Pairs,
+    Single,
+}
+
+impl Logup {
+    /// The batch of each of `n` fractions, then of `extra` more joined to the
+    /// last batch: what `finalize_logup_batched` takes. The extra fractions
+    /// add no column, and their denominators being constant, no degree. A
+    /// chip has at least one fraction (`n > 0`): with none, the extra ones
+    /// would make a batch of their own, a column the chip's interaction trace
+    /// does not have.
+    pub fn batches(self, n: usize, extra: usize) -> Vec<usize> {
+        debug_assert!(n > 0, "a chip with no fraction");
+        let batch = |i: usize| match self {
+            Self::Pairs => i / 2,
+            Self::Single => i,
+        };
+        let last = n.checked_sub(1).map_or(0, batch);
+        (0..n)
+            .map(batch)
+            .chain(core::iter::repeat_n(last, extra))
+            .collect()
+    }
+
+    /// Finalizes `eval`'s fractions in this batching.
+    pub fn finalize<E: EvalAtRow>(self, eval: &mut E) {
+        match self {
+            Self::Pairs => eval.finalize_logup_in_pairs(),
+            Self::Single => eval.finalize_logup(),
+        }
+    }
+}
+
 /// Verifier-side surface of a chip: column types, constraint-degree bound,
 /// lookup-element bag, and the constraint emitter.  Compiled both prover-
 /// and verifier-side; in a no_std verifier build this is the only chip
@@ -32,6 +71,10 @@ pub trait BuiltInComponent {
     /// it. Bound 1 admits degree ≤ 3.
     const LOG_CONSTRAINT_DEGREE_BOUND: u32 = 1;
 
+    /// How [`add_constraints`](Self::add_constraints)' fractions are
+    /// finalized, which the evaluation does after it.
+    const LOGUP: Logup = Logup::Pairs;
+
     type PreprocessedColumn: PreprocessedAirColumn;
     type MainColumn: AirColumn;
     // `ComponentLookupElements` is `pub(crate)` (sealed); harmless when
@@ -42,6 +85,8 @@ pub trait BuiltInComponent {
     #[allow(private_bounds)]
     type LookupElements: ComponentLookupElements;
 
+    /// The chip's constraints and fractions, the fractions left unfinalized
+    /// ([`LOGUP`](Self::LOGUP)).
     fn add_constraints<E: EvalAtRow>(
         &self,
         eval: &mut E,
@@ -69,9 +114,10 @@ pub trait BuiltInProverComponent: BuiltInComponent {
 
     /// The main trace, padded to at least `min_log_size` rows
     /// (`TraceBuilder::new(natural.max(min_log_size))`); 0 gives its natural
-    /// size. A chip of a fixed table, or of the program's code, ignores the
-    /// floor. Every chip whose rows a run fills honours it, so a kernel's
-    /// shape pins every log size; among them the canonical *forcing set*
+    /// size. Every chip honours it: a fixed table repeats its entries with no
+    /// multiplicity, a boundary or the program's code adds rows that make no
+    /// claim (the masked segment pads every chip to its masking's floor), so
+    /// a kernel's shape pins every log size; among them the canonical *forcing set*
     /// ([`chip_idx::FORCING`](crate::chip_idx::FORCING)), the variable
     /// preprocessed-bearing chips whose `log_size` the program commitment
     /// depends on. Padding rows are `is_real = 0` and inert, so a forced
@@ -104,7 +150,7 @@ pub trait BuiltInProverComponent: BuiltInComponent {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

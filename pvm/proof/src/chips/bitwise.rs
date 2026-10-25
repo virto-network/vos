@@ -212,8 +212,6 @@ impl BuiltInComponent for BitwiseChip {
                 &tuple,
             ));
         }
-
-        eval.finalize_logup_in_pairs();
     }
 }
 
@@ -259,7 +257,7 @@ impl BuiltInProverComponent for BitwiseChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

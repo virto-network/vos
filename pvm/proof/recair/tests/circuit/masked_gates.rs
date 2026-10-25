@@ -100,7 +100,7 @@ where
         .zip(log_sizes)
         .flat_map(|(columns, log_size)| trace::evaluations(columns, log_size))
         .collect();
-    let main_columns = main
+    let main_columns: Vec<trace::Evaluations> = main
         .columns
         .iter()
         .zip(log_sizes)
@@ -113,9 +113,15 @@ where
         Vec::from(main.interaction_with(circuit, relation, extra))
     };
     let trace = MaskedTrace {
+        active: (),
         log_sizes: &log_sizes,
         preprocessed,
-        main: main_columns,
+        main: &|component: usize| {
+            main_columns[component]
+                .iter()
+                .map(|column| &column.values)
+                .collect()
+        },
         public: &witness.outputs,
         interaction: &interaction,
     };
@@ -400,19 +406,27 @@ struct Unlifted(WrapComponents);
 
 impl MaskedComponents for Unlifted {
     type Relations = GateRelation;
+    type Active = ();
 
-    fn draw_relations(channel: &mut impl Channel) -> GateRelation {
-        WrapComponents::draw_relations(channel)
+    fn draw_relations((): (), channel: &mut impl Channel) -> GateRelation {
+        WrapComponents::draw_relations((), channel)
     }
 
     fn new(
+        (): (),
         relation: &GateRelation,
         blind: &BlindRelation,
         log_sizes: &[u32],
         claimed_sums: &[SecureField],
     ) -> Option<Self> {
-        WrapComponents::new(relation, blind, log_sizes, claimed_sums).map(Self)
+        WrapComponents::new((), relation, blind, log_sizes, claimed_sums).map(Self)
     }
+
+    fn layout((): (), log_sizes: &[u32]) -> Option<Self> {
+        <WrapComponents as MaskedComponents>::layout((), log_sizes).map(Self)
+    }
+
+    fn active(&self) {}
 
     fn log_sizes(&self) -> &[u32] {
         self.0.log_sizes()
@@ -775,6 +789,7 @@ fn a_malformed_proof_is_an_error_never_a_panic() {
                 circuit: None,
                 public: &proof.outputs,
                 public_sum: Some(&public_sum),
+                bound_sums: None,
                 interaction_pow: proof.interaction_pow,
                 claimed_sums,
             },
@@ -958,6 +973,7 @@ where
         circuit: None,
         public: &proof.outputs,
         public_sum: Some(&public_sum),
+        bound_sums: None,
         interaction_pow: proof.interaction_pow,
         claimed_sums: &proof.claimed_sums,
     };

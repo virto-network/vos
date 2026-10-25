@@ -145,7 +145,7 @@ impl MachineProverComponent for Forged {
     }
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

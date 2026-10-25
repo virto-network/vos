@@ -144,6 +144,7 @@ pub mod core;
 mod framework;
 pub mod framework_access;
 mod lookups;
+pub mod masked;
 pub mod memory_layout;
 pub mod proof;
 pub mod segment;
@@ -279,7 +280,10 @@ macro_rules! chips {
 /// What [`visit_chip`] does with a chip, generic over its type.
 pub(crate) trait ChipVisitor {
     type Output;
-    fn visit<C: framework::BuiltInComponent>(self, chip: &C) -> Self::Output;
+    fn visit<C>(self, chip: &'static C) -> Self::Output
+    where
+        C: framework::BuiltInComponent + Sync + 'static,
+        C::LookupElements: Sync + 'static;
 }
 
 // Ordering rule: all consumers of a lookup table must be listed BEFORE the

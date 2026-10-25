@@ -82,7 +82,7 @@ fn assert_cpu(chip: &CpuChip, trace: &ComponentTrace, side_note: &SideNote) -> R
     let channel = &mut Blake2sChannel::default();
     chip.draw_lookup_elements(&mut lookup_elements, channel.into());
     let (interaction_trace, claimed_sum) =
-        chip.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
+        chip.generate_interaction_trace(trace, side_note, &lookup_elements);
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         chip.debug_assert_constraints(trace, &interaction_trace, &lookup_elements, claimed_sum);
     }))

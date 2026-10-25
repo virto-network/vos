@@ -3,7 +3,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        backend::simd::SimdBackend,
         poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
@@ -23,7 +23,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::Range256LookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::Range256LookupElements,
+};
 
 /// Range multiplicity chip: proves that all byte values (0-255) are valid.
 /// This is the "receiver" side of the range check lookup.
@@ -49,6 +52,7 @@ pub enum PreprocessedColumn {
 }
 
 impl BuiltInComponent for RangeMultiplicity256 {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = Range256LookupElements;
@@ -68,8 +72,6 @@ impl BuiltInComponent for RangeMultiplicity256 {
             (-mult[0].clone()).into(),
             &[value[0].clone()],
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -77,14 +79,13 @@ impl BuiltInComponent for RangeMultiplicity256 {
 impl BuiltInProverComponent for RangeMultiplicity256 {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
-        let log_size = RANGE_LOG_SIZE.max(LOG_N_LANES);
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        let log_size = super::table_log_size(RANGE_LOG_SIZE, log_size);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
 
         for row in 0..num_rows {
-            let value = if row < 256 { row as u8 } else { 0 };
-            trace.fill_columns(row, value, PreprocessedColumn::Value);
+            trace.fill_columns(row, (row % 256) as u8, PreprocessedColumn::Value);
         }
 
         trace.finalize_bit_reversed()
@@ -93,9 +94,9 @@ impl BuiltInProverComponent for RangeMultiplicity256 {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = RANGE_LOG_SIZE.max(LOG_N_LANES);
+        let log_size = super::table_log_size(RANGE_LOG_SIZE, min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 
@@ -113,7 +114,7 @@ impl BuiltInProverComponent for RangeMultiplicity256 {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

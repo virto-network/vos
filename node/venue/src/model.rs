@@ -255,6 +255,12 @@ impl ModelVenue {
         self.state().evidence.clone()
     }
 
+    /// The statements held accepted, a repeat's once: what refuses a
+    /// statement as [`vos_statement::Refusal::Repeated`].
+    pub fn statements_held(&self) -> usize {
+        self.state().seen.len()
+    }
+
     /// `space`'s clock, once registered.
     pub fn clock(&self, space: &SpaceId) -> Option<WindowClock> {
         self.state().spaces.get(space).map(|space| space.clock)

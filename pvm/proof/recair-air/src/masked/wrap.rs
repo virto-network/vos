@@ -54,12 +54,14 @@ impl WrapComponents {
 
 impl MaskedComponents for WrapComponents {
     type Relations = GateRelation;
+    type Active = ();
 
-    fn draw_relations(channel: &mut impl Channel) -> GateRelation {
+    fn draw_relations((): (), channel: &mut impl Channel) -> GateRelation {
         GateRelation::draw(channel)
     }
 
     fn new(
+        (): (),
         relation: &GateRelation,
         blind: &BlindRelation,
         log_sizes: &[u32],
@@ -72,6 +74,12 @@ impl MaskedComponents for WrapComponents {
             claimed_sums.try_into().ok()?,
         ))
     }
+
+    fn layout((): (), log_sizes: &[u32]) -> Option<Self> {
+        Some(Self::layout(log_sizes.try_into().ok()?))
+    }
+
+    fn active(&self) {}
 
     fn log_sizes(&self) -> &[u32] {
         &self.log_sizes

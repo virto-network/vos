@@ -57,7 +57,7 @@ pub fn assert_chip<C: MachineProverComponent + ?Sized>(
     let channel = &mut Blake2sChannel::default();
     chip.draw_lookup_elements(&mut lookup_elements, channel.into());
     let (interaction_trace, claimed_sum) =
-        chip.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
+        chip.generate_interaction_trace(trace, side_note, &lookup_elements);
     chip.debug_assert_constraints(trace, &interaction_trace, &lookup_elements, claimed_sum);
 }
 

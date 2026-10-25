@@ -128,6 +128,7 @@ pub(crate) fn verify_as<MC: MerkleChannel, C: MaskedComponents<Relations = GateR
             circuit: None,
             public: &proof.outputs,
             public_sum: Some(&public_sum),
+            bound_sums: None,
             interaction_pow: proof.interaction_pow,
             claimed_sums: &proof.claimed_sums,
         },
@@ -189,6 +190,7 @@ fn fri_mask_coefficients(format: &Format, proof: &Proof<Blake2bMerkleChannel>) -
         circuit: None,
         public: &proof.outputs,
         public_sum: Some(&public_sum),
+        bound_sums: None,
         interaction_pow: proof.interaction_pow,
         claimed_sums: &proof.claimed_sums,
     };
@@ -283,12 +285,14 @@ struct P2Only {
 
 impl MaskedComponents for P2Only {
     type Relations = GateRelation;
+    type Active = ();
 
-    fn draw_relations(channel: &mut impl Channel) -> GateRelation {
+    fn draw_relations((): (), channel: &mut impl Channel) -> GateRelation {
         GateRelation::draw(channel)
     }
 
     fn new(
+        (): (),
         relation: &GateRelation,
         blind: &BlindRelation,
         log_sizes: &[u32],
@@ -317,6 +321,18 @@ impl MaskedComponents for P2Only {
             log_sizes: [log_size],
         })
     }
+
+    fn layout((): (), log_sizes: &[u32]) -> Option<Self> {
+        Self::new(
+            (),
+            &GateRelation::dummy(),
+            &BlindRelation::dummy(),
+            log_sizes,
+            &[SecureField::default()],
+        )
+    }
+
+    fn active(&self) {}
 
     fn log_sizes(&self) -> &[u32] {
         &self.log_sizes
@@ -370,6 +386,8 @@ fn the_masked_prover_is_generic() {
     let log_sizes = [LOG_SIZE];
     let preprocessed = trace::evaluations(&trace::preprocessed_columns(circuit)[0], LOG_SIZE);
     let main = trace::main_trace(circuit, &finalized.witness);
+    let main_columns = trace::evaluations(&main.columns[0], LOG_SIZE);
+    let main_of = |_: usize| main_columns.iter().map(|column| &column.values).collect();
     let interaction = |relation: &GateRelation, blinding: &[FirstRowFraction]| {
         let [p2, _, _] =
             main.interaction_with(circuit, relation, [blinding.first().copied(), None, None]);
@@ -380,9 +398,10 @@ fn the_masked_prover_is_generic() {
         prove_masked::<Blake2sMerkleChannel, P2Only>(
             &format,
             MaskedTrace {
+                active: (),
                 log_sizes: &log_sizes,
                 preprocessed: preprocessed.clone(),
-                main: vec![trace::evaluations(&main.columns[0], LOG_SIZE)],
+                main: &main_of,
                 public: &finalized.witness.outputs,
                 interaction: &interaction,
             },
@@ -393,6 +412,7 @@ fn the_masked_prover_is_generic() {
     };
     let proof: MaskedProof<_> = prove();
     let layout = P2Only::new(
+        (),
         &GateRelation::dummy(),
         &BlindRelation::dummy(),
         &log_sizes,
@@ -408,6 +428,7 @@ fn the_masked_prover_is_generic() {
                 circuit: None,
                 public: &finalized.witness.outputs,
                 public_sum: None,
+                bound_sums: None,
                 interaction_pow: proof.interaction_pow,
                 claimed_sums: &proof.claimed_sums,
             },

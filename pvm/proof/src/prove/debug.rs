@@ -67,7 +67,7 @@ pub fn debug_claimed_sums(side_note: &mut SideNote) -> bool {
 
     let mut total = SecureField::zero();
     for (i, (c, trace)) in components.iter().zip(traces).enumerate() {
-        let (_, claimed_sum) = c.generate_interaction_trace(trace, side_note, &lookup_elements);
+        let (_, claimed_sum) = c.generate_interaction_trace(&trace, side_note, &lookup_elements);
         let name = component_names.get(i).unwrap_or(&"?");
         eprintln!("  {name:>15}: {claimed_sum:?}");
         total += claimed_sum;
@@ -104,7 +104,7 @@ pub fn debug_assert_constraints_explicit(
 
     for (i, (c, trace)) in components.iter().zip(traces.iter()).enumerate() {
         let (interaction_trace, claimed_sum) =
-            c.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
+            c.generate_interaction_trace(trace, side_note, &lookup_elements);
         eprintln!("  [{i}] asserting constraints (claimed_sum={claimed_sum:?})…");
         c.debug_assert_constraints(trace, &interaction_trace, &lookup_elements, claimed_sum);
         eprintln!("  [{i}] all constraints OK");

@@ -25,7 +25,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::MemoryAccessLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::MemoryAccessLookupElements,
+};
 
 /// MemoryChip: proves read/write consistency of RAM accesses.
 ///
@@ -194,6 +197,7 @@ fn witness_entries(
 }
 
 impl BuiltInComponent for MemoryChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = MemoryAccessLookupElements;
@@ -395,8 +399,6 @@ impl BuiltInComponent for MemoryChip {
             (-is_real.clone()).into(),
             &tuple,
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -625,7 +627,7 @@ impl BuiltInProverComponent for MemoryChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

@@ -20,7 +20,10 @@
 //!   - `plain`, or `masked<P>`: every chip padded to 2^P rows at least, then
 //!     committed one log size up (the composition so two up), as masking
 //!     (c) commits a component of at least 4h rows. A chip whose size its
-//!     content fixes (the tables, the program) stays at it.
+//!     content fixes (the tables, the program) stays at it;
+//!   - `real`: masked for real, by the masked segment prover (7.14), each
+//!     chip padded to four times its `h` (`2·(8 + 3q)` rounded up), the
+//!     masks from the OS; verified for the built shape.
 //! - `grind [--bits B] [--n N] [--threads N]`: N grinds of the Blake2s-M31
 //!   channel's PoW, each from its own transcript: mean, median, 95th
 //!   percentile.
@@ -35,7 +38,7 @@ use std::time::Instant;
 use sha2::{Digest, Sha256};
 use vos_pvm_proof::chip_idx;
 use vos_pvm_proof::format::{
-    ChannelKind, DEVICE_PROOF, Format, FormatParams, ProofKind, SPIKE_FORMAT, Status,
+    ChannelKind, DEVICE_PROOF, Format, FormatParams, Masking, ProofKind, SPIKE_FORMAT, Status,
 };
 use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::segment::SegmentCursor;
@@ -291,6 +294,9 @@ struct Cell {
     queries: usize,
     pow: u32,
     masked: Option<u32>,
+    /// Masked for real: the segment's chips proved by the masked prover
+    /// (slice 7's 7.14), each padded to four times its `h`.
+    real: bool,
 }
 
 impl Cell {
@@ -308,8 +314,9 @@ impl Cell {
             other => panic!("unknown shape {other}"),
         };
         let config: Vec<&str> = parts[1].split(':').collect();
+        let real = parts[2] == "real";
         let masked = match parts[2] {
-            "plain" => None,
+            "plain" | "real" => None,
             proxy => Some(
                 proxy
                     .strip_prefix("masked")
@@ -324,6 +331,7 @@ impl Cell {
             queries: config[1].parse().unwrap(),
             pow: config[2].parse().unwrap(),
             masked,
+            real,
         }
     }
 
@@ -338,8 +346,12 @@ impl Cell {
             self.log_blowup,
             self.queries,
             self.pow,
-            self.masked
-                .map_or("plain".into(), |log| format!("masked{log}"))
+            if self.real {
+                "real".into()
+            } else {
+                self.masked
+                    .map_or("plain".into(), |log| format!("masked{log}"))
+            }
         )
     }
 
@@ -378,6 +390,9 @@ fn cell(cell: &Cell, elf: &[u8], input: &[u8], expected: &[u8], reps: usize, out
     let format = cell.install_format();
     let started = Instant::now();
     let run = Run::of(elf, input, expected);
+    if cell.real {
+        return real(cell, &run, started.elapsed().as_secs_f64(), reps);
+    }
     let trace_seconds = started.elapsed().as_secs_f64();
     let steps = run.steps();
     let natural = canonical_profile_for_bounds(&run.side_note, &[(0, steps)]).expect("a profile");
@@ -519,6 +534,136 @@ fn cell(cell: &Cell, elf: &[u8], input: &[u8], expected: &[u8], reps: usize, out
         list(&times, 4),
         median(&cpu),
         bytes.len(),
+    );
+}
+
+/// The masked format at `cell`'s parameters: the device number on the
+/// Blake2s channel, 8 salts a tree, an `R` of 8, `h` twice the rows a
+/// column reading two rows reveals (`4·2 + 3q`), rounded up.
+fn masked_format(cell: &Cell) -> Format {
+    let h = (2 * (8 + 3 * cell.queries)).next_power_of_two();
+    Format {
+        kind: ProofKind::Segment,
+        channel: ChannelKind::Blake2s,
+        params: FormatParams {
+            log_blowup: cell.log_blowup,
+            n_queries: cell.queries,
+            pow_bits: cell.pow,
+            ..DEVICE_PROOF.params
+        },
+        masked: true,
+        masking: Some(Masking {
+            salt_columns: 8,
+            fri_mask_columns: 8,
+            log_mask_rows: h.ilog2(),
+        }),
+        status: Status::Admitted,
+        ..DEVICE_PROOF
+    }
+}
+
+/// A cell masked for real: the shape's chips proved by the masked segment
+/// prover from the OS's randomness `reps` times, verified when the shape
+/// balances (not the floor's).
+fn real(cell: &Cell, run: &Run, trace_seconds: f64, reps: usize) {
+    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+    use vos_pvm_recair::masked::MaskRng;
+    use vos_pvm_recair::masked::segment::{circuit_root, prove_segment, verify_segment};
+    let format = masked_format(cell);
+    let steps = run.steps();
+    let mut mask = run.chips;
+    if cell.floor {
+        mask &= !BOUNDARY;
+    }
+    if cell.lean {
+        mask &= !(1 << chip_idx::BLAKE2B | 1 << chip_idx::BITWISE_AND_BYTE);
+    }
+    let (mut times, mut cpu) = (Vec::new(), Vec::new());
+    let mut made = None;
+    let mut rss_reset = true;
+    for rep in 0..reps {
+        let mut segment = run.whole();
+        rss_reset &= std::fs::write("/proc/self/clear_refs", "5").is_ok();
+        let cpu_started = cpu_seconds();
+        let started = Instant::now();
+        let proof =
+            prove_segment::<Blake2sMerkleChannel>(&format, &mut segment, mask, MaskRng::default())
+                .expect("the masked segment proves");
+        times.push(started.elapsed().as_secs_f64());
+        cpu.push(cpu_seconds() - cpu_started);
+        eprintln!(
+            "  {} rep {}/{reps}: {:.3} s",
+            cell.name(),
+            rep + 1,
+            times[rep]
+        );
+        made = Some(proof);
+    }
+    let rss = peak_rss_mib();
+    let (proof, stats) = made.unwrap();
+    let bytes = postcard::to_allocvec(&(
+        &proof.proof.stark_proof,
+        &proof.proof.claimed_sums,
+        proof.proof.interaction_pow,
+    ))
+    .unwrap();
+    let (verified, verify_ms) = if cell.floor {
+        ("null".to_string(), 0.0)
+    } else {
+        let root = circuit_root::<Blake2sMerkleChannel>(&format, &mut run.whole(), mask)
+            .expect("the circuit's root");
+        let mut best = f64::INFINITY;
+        let mut ok = true;
+        for _ in 0..3 {
+            let started = Instant::now();
+            ok &= verify_segment::<Blake2sMerkleChannel>(&format, &proof, root).is_ok();
+            best = best.min(started.elapsed().as_secs_f64());
+        }
+        (ok.to_string(), best * 1e3)
+    };
+    let mut cells = 0u64;
+    let mut columns = 0usize;
+    let chips: Vec<usize> = (0..chip_idx::COUNT)
+        .filter(|chip| mask & (1 << chip) != 0)
+        .collect();
+    for (&log, &chip) in proof.log_sizes.iter().zip(&chips) {
+        let component = vos_pvm_proof::all_components()[chip];
+        for (index, tree) in component.trace_sizes(log).iter().enumerate() {
+            let blinding = if index == 1 { 4 } else { 0 };
+            columns += tree.len() + blinding;
+            cells += (tree.len() + blinding) as u64 * (2u64 << log);
+        }
+    }
+    let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "auto".into());
+    let list = |values: &[f64]| {
+        values
+            .iter()
+            .map(|v| format!("{v:.4}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    println!(
+        "{{\"kind\":\"cell\",\"cell\":\"{}\",\"steps\":{steps},\"threads\":{},\"pool\":{},\"mask\":\"{mask:#010x}\",\
+         \"chips\":{},\"log_sizes\":{:?},\"log_mask_rows\":{},\"columns\":{columns},\"cells\":{cells},\"reps\":{reps},\
+         \"prove_s_best\":{:.4},\"prove_s_median\":{:.4},\"prove_s_runs\":[{}],\"cpu_s_median\":{:.3},\
+         \"peak_rss_mib\":{rss:.0},\"peak_rss_reset\":{rss_reset},\"trace_s\":{trace_seconds:.3},\
+         \"proof_bytes\":{},\"verified\":{verified},\"verify_ms\":{verify_ms:.1},\
+         \"r1_attempts\":{},\"r1_classes\":{},\"r1_rows\":{},\"r1_ms\":{:.1}}}",
+        cell.name(),
+        json_str(&threads),
+        rayon_threads(),
+        chips.len(),
+        proof.log_sizes,
+        format.masking.unwrap().log_mask_rows,
+        times.iter().copied().fold(f64::INFINITY, f64::min),
+        median(&times),
+        list(&times),
+        median(&cpu),
+        bytes.len(),
+        stats.attempts,
+        stats.classes,
+        stats.revealed_rows,
+        stats.rank_check.as_secs_f64() * 1e3,
     );
 }
 

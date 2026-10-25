@@ -38,7 +38,7 @@ rayon = { workspace = true }
 # check of the constraints (`prove_masked_unchecked`) and the rank over M31
 # R1 takes (`masked::rank_m31`). No production build
 # enables it (`just check-no-seeded-masks`).
-seeded-masks = []
+seeded-masks = ["vos-pvm-proof/seeded-masks"]
 # The masking's heavy gates, for `just test-proof`: the statistical leakage
 # tests at full N (2,000 proofs a witness on the small circuit, 32 on the
 # real wrap), the masked acceptance above 2^16 rows, and the final

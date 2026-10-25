@@ -25,7 +25,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::RegisterMemoryLookupElements,
+};
 
 /// RegisterMemoryClosingChip: produces 13 register-memory logup entries
 /// for the **final** register state at `ts = closing_ts_for(side_note)`
@@ -88,6 +91,7 @@ pub enum Column {
 pub enum PreprocessedColumn {}
 
 impl BuiltInComponent for RegisterMemoryClosingChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = RegisterMemoryLookupElements;
@@ -129,8 +133,6 @@ impl BuiltInComponent for RegisterMemoryClosingChip {
             is_real[0].clone().into(),
             &tuple,
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -141,9 +143,9 @@ impl BuiltInProverComponent for RegisterMemoryClosingChip {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(NUM_REGS);
+        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(NUM_REGS).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         // Gate emissions on the same condition the ledger augmentation
@@ -171,7 +173,7 @@ impl BuiltInProverComponent for RegisterMemoryClosingChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

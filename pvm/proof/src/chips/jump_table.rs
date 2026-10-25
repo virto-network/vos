@@ -54,7 +54,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::JumpTableLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::JumpTableLookupElements,
+};
 
 pub struct JumpTableChip;
 
@@ -86,6 +89,7 @@ pub enum PreprocessedColumn {
 }
 
 impl BuiltInComponent for JumpTableChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = JumpTableLookupElements;
@@ -113,8 +117,6 @@ impl BuiltInComponent for JumpTableChip {
             (-mult[0].clone()).into(),
             &tuple,
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -122,8 +124,8 @@ impl BuiltInComponent for JumpTableChip {
 impl BuiltInProverComponent for JumpTableChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, side_note: &SideNote) -> FinalizedTrace {
-        let log_size = chip_log_size(side_note.jump_table.len());
+    fn generate_preprocessed_trace(&self, log_size: u32, side_note: &SideNote) -> FinalizedTrace {
+        let log_size = chip_log_size(side_note.jump_table.len()).max(log_size);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
 
@@ -147,9 +149,9 @@ impl BuiltInProverComponent for JumpTableChip {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = chip_log_size(side_note.jump_table.len());
+        let log_size = chip_log_size(side_note.jump_table.len()).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 
@@ -166,7 +168,7 @@ impl BuiltInProverComponent for JumpTableChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

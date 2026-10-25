@@ -2849,6 +2849,7 @@ dependencies = [
  "vos-pvm-proof-derive",
  "vos-pvm-proof-verifier",
  "vos-pvm-recair",
+ "vos-pvm-recair-air",
  "vos-statement",
  "vos-testkit",
  "vos-tree",

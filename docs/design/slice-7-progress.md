@@ -961,3 +961,276 @@ anchors, every one the replicas' row, no evidence); `just e2e-chain`
 green first time, 1,670 s at a loaded host: the same verdicts, latency
 125.7 s at Kreivo and 79.4–169.7 s at JAM, each under its gate; 5 Kreivo
 anchors; the audit clean over 574 carriers.
+
+## Step 7.14: masking the segment chips
+
+Branch `s7/7.14`, from vos-core `61c0950e` (7.8a merged).
+
+**Built:**
+- **The finalize hook** (`003ae19a`): `BuiltInComponent::LOGUP`
+  (`Logup::{Pairs, Single}`), the 14 chips that finalize unpaired declaring
+  `Single`; `add_constraints` leaves its fractions unfinalized and the
+  evaluation finalizes them as before, so format 35's constraints and
+  proofs are unchanged. `Logup::batches(n, extra)` is the batching the
+  masked evaluation takes: the chip's own, the blinding fraction joined to
+  its last batch, so masking adds **no interaction column and no degree**
+  to any chip (the blinding's denominator `combine_B(1)` is a constant).
+- **The fixed chips padded** (same commit): the tables repeat their
+  entries past them with no multiplicity, the boundaries, the program's
+  code and the jump table add rows that claim nothing, when a floor asks
+  for more rows; their preprocessed columns follow the given size. No
+  production path passes a fixed chip a floor above its natural size.
+- **`MaskedComponents` extended** (`cd532763`): `Active` (the active-chip
+  mask, which `draw_relations` draws by; `()` for the wrap), `layout`
+  (the set under any relations), `active`, `public_sums` (the components
+  whose claimed sums the public values fix, which the prover leaves
+  unblinded). The final verifier's `Claim` gains `bound_sums`, checked
+  after the logup total. **A per-component `h`** (`masked::mask_rows`):
+  twice the rows a column of the component reveals, `4|O| + q(|O| + 1)`
+  for its widest offsets, rounded up, at most the format's; the mask
+  layouts are keyed by size and `h`, R1 checks each class at its `h`. The
+  wrap's draws, masks and bytes are unchanged (its `h` is the format's).
+- **The masked segment** (same commit): `vos_pvm_proof::masked`
+  (`SegmentComponents`, `MaskedChipEval`, `bound_sums`, `public_values`,
+  `drive_masked_chip`; prover side `masked_segment_trace`), and
+  `vos_pvm_recair::masked::segment` (`prove_segment`, `verify_segment`,
+  `floors`; `prove_segment_forced` under `seeded-masks`). The public values
+  after the main root are the boundary states, one M31 a byte; the four
+  boundary chips' sums stay unblinded and are checked against them; the
+  interaction trace takes a chip's blinding fraction on its running sum
+  alone (`β·(1 − (r + 1)/N)` at coset row `r`). No format is admitted:
+  the tests and the measurement name masked formats of their own.
+
+**Gates** [measured]:
+- **Degree audit** (`circuit`'s
+  `the_masked_segment_chips_pass_the_degree_audit`): every chip's masked
+  evaluation, 5,177 constraints, by degree `[0, 23, 4395, 759]`, R5's
+  histogram exactly; the built set at its layout declares them, each
+  bounded at `log_size + 2`.
+- **Soundness** (`recair/tests/segment`, the small kernel: φ8..12 set, φ7
+  summed and cleared, 17 chips): acceptance with every chip at `2^8`,
+  `2^9` and `2^10` at least on Poseidon2-M31 and Blake2s, and (heavy) at
+  the device floors, blowup 4 with 43 queries (`2^11`, 137 rows revealed
+  of `h = 512`) and blowup 2 with 86 (`2^12`, 266 of 1,024); R1 over every
+  column class (11) in one attempt; a broken constraint (the register
+  ledger's `BothRealH`) at row 0, the last row (across the wrap) and mid-way
+  refused by the prover and, forced, by `OodsNotMatching`; an unbalanced
+  range table refused by the logup total, and with the CPU's blinding
+  fraction moved to cancel it, refused by the prover and, forced, by
+  `OodsNotMatching`; 34 tampers (each tree's samples and queried values,
+  a salt, a blinded and a public claimed sum, the interaction PoW, the
+  boundary states, the structure, the log sizes, the mask, the
+  configuration, another circuit's root) refused, none a panic. The mask
+  invariant and R1's refusal are the generic prover's tests, the lifting
+  the wrap's (generic). Soundness 10 (both bit counts pinned) is a
+  registered format's: 7.16 pins format 43's.
+- **Leakage**: R1 on every class (above); witness indistinguishability and
+  uniformity at 16 proofs a kernel in `check` (34,157 hypotheses, smallest
+  p 2.3e-4 and 2.6e-6, none refused) and 64 under `heavy-gates`; the
+  unmasked control (format 35) refused by the pooled KS; no hidden state
+  (φ7's sum and its low half, both `memory_commitment`s) in a proof's
+  bytes; no opening shared by two proofs of one run (34,156) nor two
+  kernels' from one seed; a right guess reproduces every unmasked sum and
+  only the boundary chips' masked ones, the totals equal; one shape for
+  two kernels, by the kernels' construction (the same code length and
+  steps), not a property of the prover (below). **A deviation** from slice
+  6's pairs: a segment of the node's shape publishes its whole boundary, so
+  under equal public values a run has no other witness; the two kernels
+  differ in φ9 (as 6.6's real wrap differed in the program id). The gates
+  of two witnesses under equal public values belong to the device shape
+  (arguments through the witness input, the io-hash only): 7.15's.
+- **What 7.14 does not hide or pin** (the review's M2, M3): the shape, the
+  chips (`active`) and their log sizes (the run's, above the floors), is
+  public and witness-dependent until pin J's device program id pins it and
+  the prover pads to it (7.15; `prove_segment` takes no pinned shape
+  today); the transcript does not mix `active` (as format 35's does not),
+  which 7.15 closes by mixing the program id into the header and verifying
+  against it; `bound_sums` and the public sums assume the four boundary
+  chips, which the device shape (no memory roots, the io-hash in φ9..12)
+  generalizes.
+- **Format 35 byte for byte:** `fixtures::the_fixtures_are_the_generators`
+  and `the_fixtures_are_judged` pass (`segment-35.*`, the wraps, `H_FOLD`
+  and the program ids unchanged).
+- **`just check`:** green at `9b5ff346` (each under a 12 GiB scope,
+  `nice -n 10`, `CARGO_BUILD_JOBS=8`, another agent's runs on the machine,
+  load 12–46). Its first full run failed `vos-node`'s `tree_crash` ("no
+  round was killed between a build's batches", a kill-timing test under
+  load); its rest (the agent's crates and `test-reads`) rerun green, the
+  crash test cutting 4 of 12 rounds mid-build.
+- **`just test-proof`** (the leakage gates at their medium N, 64 proofs a
+  kernel on the masked segment): green, 568 passed in 48 suites, about 45
+  minutes; the segment's six heavy and leakage tests 401 s; `constants::`
+  with every pinned value unchanged; the carrier audit clean (451
+  `WrapRandomness` needles). Its first run failed
+  `window_kernel::the_window_is_stated_at_the_model_venue` from before this
+  step: since 7.2 (`4f9babad`) a venue answers a repeat as accepted
+  (`SubmitOutcome::judged`), and the test still expected code 6; it now
+  expects `SubmitOutcome::Accepted` (`6d0b50c9`).
+
+**Commits:** `003ae19a` the finalize hook and the floors; `cd532763` the
+trait's extensions, the per-component `h` and the masked segment;
+`8eb0da9e` the gates; `3d1c08a0`, `bd7edfad` the spike's `real` cells and
+their runs (the latter also carries `proving.md` §5 and §8); `2a378382`,
+`9b5ff346` a doc link and clippy; `6d0b50c9` the window kernel's repeat;
+this record.
+
+**Masked against unmasked, x86** [measured, `spikes/s7-device/runs/x86-real.jsonl`;
+the auth statement, 19,192 steps; the Blake2s channel; 4 threads pinned to
+four P-cores, median of 5; load 8.5 falling to 5.2, another agent's runs
+on the machine; `real` is the masked segment prover, each chip padded to
+four times its `h`, the OS's masks]:
+
+| cell | plain | masked | ×time | plain peak | masked peak | ×mem | plain bytes | masked bytes | ×bytes |
+|---|---|---|---|---|---|---|---|---|---|
+| built, 2:43:20 (h 512) | 3.28 s | 6.72 s | ×2.05 | 3,486 MiB | 7,949 MiB | ×2.28 | 1,893,890 | 2,123,121 | ×1.12 |
+| floor, 2:43:20 (h 512) | 0.85 s | 2.23 s | ×2.62 | 1,251 MiB | 2,958 MiB | ×2.36 | 1,217,153 | 1,419,714 | ×1.17 |
+| lean, 2:43:20 (h 512) | 0.68 s | 1.78 s | ×2.63 | 968 MiB | 2,279 MiB | ×2.35 | 536,273 | 679,897 | ×1.27 |
+| floor, 1:86:20 (h 1,024) | 0.70 s | 1.78 s | ×2.53 | 812 MiB | 2,002 MiB | ×2.47 | 2,245,957 | 2,620,870 | ×1.17 |
+| lean, 1:86:20 (h 1,024) | 0.50 s | 1.34 s | ×2.66 | 652 MiB | 1,565 MiB | ×2.40 | 948,004 | 1,228,742 | ×1.30 |
+
+- The built masked proof verifies in 29.8 ms (plain 26.5); R1 one
+  attempt, 18–24 ms at 43 queries (137 rows), 71–73 ms at 86 (266).
+- **Against 7.0a's proxy** (same cells, 4 threads): the real masking
+  costs ×1.34–1.51 the proxy on floor and lean (1:86 floor 1.33 → 1.78,
+  lean 0.89 → 1.34; 2:43 lean 1.18 → 1.78), ×1.25 on built; so the
+  masking factor on the segment chips is **×2.5–2.7** (×2.05 built), at
+  the wrap's ×2.6–2.9, and the outlook's "masking beyond the proxy ×1.0–1.4"
+  is at or past its top.
+- **Memory ×2.3–2.5**, above the proxy's ×1.9–2.0: the masked prover keeps
+  each chip's trace for the interaction (a chip's interaction generator
+  consumes its trace, and R1 may retry) beside the interpolated main
+  columns. A lever for 7.17: the interaction from the trace once, or a
+  borrowed trace.
+- **Bytes:** the masked lean shape fits pin J's 1.5 MiB at blowup 2 with
+  86 queries (1.23 MB, the Poseidon2 chip not counted) and at blowup 4
+  (0.68 MB); the masked floor fits only at blowup 4 (1.42 MB).
+
+**Where the plan was off:**
+- **No chip is at half the floor:** every segment chip's running sum reads
+  its previous row, so each has a two-offset column and takes the full
+  `h`. The per-component `h` is built (and generic), but on the segment AIR
+  it is uniform; pin J's "`|O| = 1` components at half the floor" and
+  `proving.md` §8's sentence (amended) hold for no segment chip.
+- **The 14 unpaired chips need no special treatment** beyond the
+  finalize hook: joined to the last batch, the blinding adds no column to
+  any chip, paired or not, and no degree.
+- **The fixed tables pad without an AIR change**, by repeating their
+  entries (every padded row a valid entry, so a multiplicity there claims
+  nothing false).
+- **Witness indistinguishability on a segment** needs a deviation (above);
+  the device shape (no memory root out, arguments through the witness
+  input) is where equal public values admit two witnesses: 7.15's gates.
+- **The masking factor** is ×2.5–2.7 under load, not the ×1.8–2.1 proxy
+  floor, and peak memory ×2.3–2.5; re-measured quiet after the review's
+  fold, ×2.14–2.19 and ×2.1–2.2 (below): M5's outlook's masked rows sit
+  past its ×1.0–1.4 "beyond the proxy" only by load.
+
+### The review's fixes
+
+Fable's review (`research/slice-7/7.14-fable.md`: fix-then-merge, no
+soundness or zero-knowledge defect), folded:
+- **M1** (`a14152f3`): `verify_segment` takes the preprocessed root,
+  mandatory; `circuit_root` computes it from the program and the shape.
+  Gates (`the_circuit_root_pins_the_tables_and_the_code`): the honest root
+  every proof's (two seeds), each verified against it; another program's
+  root refuses them as `Circuit`; a prover-chosen table (the power-of-two
+  table's entry on a padding row of no multiplicity made `(70, ·)`, every
+  constraint held, the logup balanced) verifies against the root it
+  commits and is refused against the program's.
+- **M2, M3:** the module docs (`vos_pvm_proof::masked`,
+  `vos_pvm_recair::masked::segment`) and the qualifications above.
+- **L1:** the window kernel's doc; the repeat is shown held once
+  (`ModelVenue::statements_held` 1 after it).
+- **L2:** the forging seam (`MaskedSegmentTrace::{main,preprocessed}_columns_mut`)
+  under `vos-pvm-proof`'s `seeded-masks`, which `vos-pvm-recair`'s
+  enables; `check-no-leaks` forbids the feature by name.
+- **L3:** a forced proof blinding the boundary chips' sums too (the
+  blinding summing to zero, every constraint held) refused by the boundary
+  binding (`Logup`); a log size smaller refused.
+- **L4:** `Logup::batches` asserts a chip has a fraction; `blinded` refuses
+  a chip with no running sum (every segment chip has one, the census
+  below).
+
+**The overhead (the review's option 1)** (`a14152f3`, `9db9f0b3`),
+behaviour-preserving: the seeded wraps and the fixtures byte for byte
+(`fixtures::`, `constants::`), the seeded masked segment's draws in the same
+order. Profiled first (perf and stage timings, the floor at 2:43:20 on a
+quiet machine, 1.73 s): the Merkle trees' Blake2s 30% (every column lifted
+to the composition's height, `+2` levels over the trace, against `+1`
+unmasked), the composition 23–27%, `prove_values` 13–15%, the interaction
+17%; the masking's own steps small (layouts 40 ms, the digest about 20 ms,
+the masks' scatter 16 + 8 ms, R1 13–20 ms, the set's three builds 4 ms each).
+- each chip's interaction trace generated from a borrowed trace (the
+  unmasked prover's too, its traces still dropped as each is consumed);
+- the masked prover's main columns borrowed (`MainColumns`): each component
+  interpolated, masked and its coefficients dropped in turn, no copy of the
+  trace and no unmasked coefficients kept across attempts (a retry, rare,
+  interpolates again);
+- the mask layouts cached by `(size, h)` for the process (the class's lift
+  and offsets do not enter a layout);
+- a masked chip's batching computed once, not every evaluation;
+- R1's elimination sixteen columns a SIMD word (`rank_m31`).
+Not taken: the set built once per prove (3 builds, 4 ms each); the
+masks' scatter (16 ms over every main column); **the witness digest in
+BLAKE3** (about 20 ms, 1%): it seeds the masks, so it moves every seeded
+masked wrap (`wrap*.proof`, `statements.cases`, the conformance vectors),
+a re-pin this step must not make; it fits 7.21's re-pin, `proving.md`'s R4
+note unchanged until then.
+
+**Masked against unmasked, x86, re-measured** [measured; quiet, load 1–2.5;
+4 threads pinned to four P-cores, median of 5; `runs/x86-real-folded.jsonl`
+after, `runs/x86-real-quiet.jsonl` the masked prover before the fold on the
+same quiet machine]:
+
+| cell | plain | masked before | masked after | ×time | plain peak | masked before | masked after | ×mem | masked bytes |
+|---|---|---|---|---|---|---|---|---|---|
+| built, 2:43:20 | 2.24 s | 5.48 s | 5.49 s | ×2.45 | 3,567 MiB | 8,066 MiB | 7,513 MiB | ×2.11 | 2,123,906 |
+| floor, 2:43:20 | 0.80 s | 1.86 s | 1.71 s | ×2.15 | 1,249 MiB | 2,919 MiB | 2,749 MiB | ×2.20 | 1,416,741 |
+| lean, 2:43:20 | 0.60 s | 1.43 s | 1.29 s | ×2.14 | 976 MiB | 2,352 MiB | 2,153 MiB | ×2.21 | 687,456 |
+| floor, 1:86:20 | 0.62 s | 1.46 s | 1.36 s | ×2.19 | 817 MiB | 1,978 MiB | 1,759 MiB | ×2.15 | 2,610,521 |
+| lean, 1:86:20 | 0.48 s | 1.07 s | 1.02 s | ×2.14 | 641 MiB | 1,516 MiB | 1,402 MiB | ×2.19 | 1,219,144 |
+
+- The fold took 5–10% of the masked time on floor and lean (none on built,
+  within noise) and 6–11% of peak memory; R1 16, 14, 12, 49 and 35 ms
+  (from 20, 17, 18, 67 and 58).
+- **The masking factor, quiet, is ×2.14–2.19 on floor and lean** (×2.45
+  built); the first table's ×2.5–2.7 was the load's (load 5–8 then). Memory
+  ×2.1–2.2: the masked columns' coefficients at `2N` and their extension,
+  not a copy the prover keeps.
+- What remains is the masking's arithmetic as built: every column at `2N`,
+  the composition at `4N` and every tree lifted one level more than
+  unmasked.
+
+**The cubic census (the review's option 4)** [measured,
+`circuit`'s `the_masked_segments_cubic_census`, `9db9f0b3`]: of the masked
+segment's 759 cubic constraints, **723 are the paired logup's batches** and
+**36 are gates** (the CPU's 34, the memory ledger's 2); the 4,377 quadratic
+gates and 18 quadratic batches the rest. Every fraction batched alone
+(`Logup::Single`, the blinding still joined to the last) is quadratic, at
+**1,464 interaction QM31 columns against 741** (×1.98, 2,892 base columns
+more). So **a masked-only `Single` batching does not make the masked AIR
+quadratic**: the 36 cubic gates keep the composition at `4N`
+(`MASKED_LOG_CONSTRAINT_EXPANSION` 2) unless they are rewritten, an AIR
+change for the segment's chips (the CPU's degree-3 gates, the memory
+ledger's two). With them rewritten [est]: the composition and every tree's
+lifted height one level down, about the 30% Merkle and 25% composition
+shares halved, against the interaction columns doubled (the interaction
+17% of the time, the CPU's columns most): net about −20–30% of the masked
+time, toward ×1.6–1.8; not measured.
+
+**Gates after the fold** [measured]: `just check` green at `b5252bf9`
+(1,441 passed in 111 suites, the segment's 13 tests among them);
+`just test-proof` green, 568 passed in 48 suites, 37 minutes, the segment's
+heavy and leakage tests 251 s (64 proofs a kernel), `constants::` and the
+carrier audit (451 `WrapRandomness` needles) clean; `fixtures::` byte for
+byte (format 35, the seeded masked wraps, `H_FOLD`, the program ids).
+
+**Options 2 and 3, recorded for 7.16** (security parameters, not applied):
+a tighter `h` (`2·revealed` rounded up, without the second ×2: `h` 512 → 256
+at 43 queries, 1,024 → 512 at 86, floors `2^10` and `2^11`), its retry rate
+measured; the floor at `2h` rows, not `4h` (a cubic constraint over columns
+of degree below `N + h` has a quotient of degree `2N + 3h ≤ 3.5N < 4N` for
+`h ≤ N/2`), with the degree audit and the lifting test re-run. On this
+statement the pads are about 4% of the cells, so each yields a few percent
+here, more on lean kernels; R1 halves with `h`.
+

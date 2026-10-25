@@ -26,7 +26,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::RegisterMemoryLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::RegisterMemoryLookupElements,
+};
 
 /// RegisterMemoryBoundaryChip: produces 13 register-memory logup entries for
 /// the initial register state at ts=0.  Mirrors MemoryBoundaryChip but for
@@ -53,6 +56,7 @@ pub enum Column {
 pub enum PreprocessedColumn {}
 
 impl BuiltInComponent for RegisterMemoryBoundaryChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = RegisterMemoryLookupElements;
@@ -83,8 +87,6 @@ impl BuiltInComponent for RegisterMemoryBoundaryChip {
             is_real[0].clone().into(),
             &tuple,
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -95,9 +97,9 @@ impl BuiltInProverComponent for RegisterMemoryBoundaryChip {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(NUM_REGS);
+        let log_size = crate::trace::utils::ceil_log2_at_least_lanes(NUM_REGS).max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         for (row, &val) in side_note.initial_regs.iter().enumerate() {
@@ -112,7 +114,7 @@ impl BuiltInProverComponent for RegisterMemoryBoundaryChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

@@ -38,7 +38,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::MerkleNodeLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::MerkleNodeLookupElements,
+};
 
 pub struct MemoryRootBoundaryChip;
 
@@ -60,6 +63,7 @@ pub enum Column {
 pub enum PreprocessedColumn {}
 
 impl BuiltInComponent for MemoryRootBoundaryChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = MerkleNodeLookupElements;
@@ -94,8 +98,6 @@ impl BuiltInComponent for MemoryRootBoundaryChip {
             (-is_real[0].clone()).into(),
             &tuple,
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -106,9 +108,9 @@ impl BuiltInProverComponent for MemoryRootBoundaryChip {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = stwo::prover::backend::simd::m31::LOG_N_LANES;
+        let log_size = stwo::prover::backend::simd::m31::LOG_N_LANES.max(min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
 
         let (root_before, root_after) = match &side_note.memory_pages {
@@ -125,7 +127,7 @@ impl BuiltInProverComponent for MemoryRootBoundaryChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

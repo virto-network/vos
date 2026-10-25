@@ -28,6 +28,7 @@ impl<C: BuiltInComponent> FrameworkEval for BuiltInComponentEval<'_, C> {
     fn evaluate<E: EvalAtRow>(&self, mut eval: E) -> E {
         let trace_eval = TraceEval::new(&mut eval);
         C::add_constraints(self.component, &mut eval, trace_eval, &self.lookup_elements);
+        C::LOGUP.finalize(&mut eval);
         eval
     }
 }

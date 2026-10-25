@@ -3,7 +3,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::{
     core::{ColumnVec, fields::qm31::SecureField},
     prover::{
-        backend::simd::{SimdBackend, m31::LOG_N_LANES},
+        backend::simd::SimdBackend,
         poly::{BitReversedOrder, circle::CircleEvaluation},
     },
 };
@@ -23,7 +23,10 @@ use crate::framework::BuiltInProverComponent;
 use crate::lookups::{AllLookupElements, LogupTraceBuilder};
 #[cfg(feature = "prover")]
 use crate::side_note::SideNote;
-use crate::{framework::BuiltInComponent, lookups::BitwiseAndLookupElements};
+use crate::{
+    framework::{BuiltInComponent, Logup},
+    lookups::BitwiseAndLookupElements,
+};
 
 /// BitwiseLookupChip: 16×16 table for nibble-level AND.
 ///
@@ -58,6 +61,7 @@ pub enum PreprocessedColumn {
 }
 
 impl BuiltInComponent for BitwiseLookupChip {
+    const LOGUP: Logup = Logup::Single;
     type PreprocessedColumn = PreprocessedColumn;
     type MainColumn = Column;
     type LookupElements = BitwiseAndLookupElements;
@@ -80,8 +84,6 @@ impl BuiltInComponent for BitwiseLookupChip {
             (-mult[0].clone()).into(),
             &[a[0].clone(), b[0].clone(), and_result[0].clone()],
         ));
-
-        eval.finalize_logup();
     }
 }
 
@@ -89,19 +91,18 @@ impl BuiltInComponent for BitwiseLookupChip {
 impl BuiltInProverComponent for BitwiseLookupChip {
     const IS_PRODUCER: bool = false;
 
-    fn generate_preprocessed_trace(&self, _log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
-        let log_size = BITWISE_LOG_SIZE.max(LOG_N_LANES);
+    fn generate_preprocessed_trace(&self, log_size: u32, _side_note: &SideNote) -> FinalizedTrace {
+        let log_size = super::table_log_size(BITWISE_LOG_SIZE, log_size);
         let mut trace = TraceBuilder::<PreprocessedColumn>::new(log_size);
         let num_rows = trace.num_rows();
 
         for row in 0..num_rows {
-            if row < 256 {
-                let a = (row / 16) as u8;
-                let b = (row % 16) as u8;
-                trace.fill_columns(row, a, PreprocessedColumn::A);
-                trace.fill_columns(row, b, PreprocessedColumn::B);
-                trace.fill_columns(row, a & b, PreprocessedColumn::AndResult);
-            }
+            let entry = row % 256;
+            let a = (entry / 16) as u8;
+            let b = (entry % 16) as u8;
+            trace.fill_columns(row, a, PreprocessedColumn::A);
+            trace.fill_columns(row, b, PreprocessedColumn::B);
+            trace.fill_columns(row, a & b, PreprocessedColumn::AndResult);
         }
 
         trace.finalize_bit_reversed()
@@ -110,9 +111,9 @@ impl BuiltInProverComponent for BitwiseLookupChip {
     fn generate_main_trace_immut_min(
         &self,
         side_note: &SideNote,
-        _min_log_size: u32,
+        min_log_size: u32,
     ) -> FinalizedTrace {
-        let log_size = BITWISE_LOG_SIZE.max(LOG_N_LANES);
+        let log_size = super::table_log_size(BITWISE_LOG_SIZE, min_log_size);
         let mut trace = TraceBuilder::<Column>::new(log_size);
         let num_rows = trace.num_rows();
 
@@ -134,7 +135,7 @@ impl BuiltInProverComponent for BitwiseLookupChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

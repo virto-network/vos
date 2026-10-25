@@ -126,8 +126,6 @@ impl BuiltInComponent for CpuChip {
         constraints::lookups::bitwise_lookup(eval, row, lookups);
         constraints::host_call::witness_input(eval, row, lookups);
         constraints::row::next_timestamp_bytes(eval, row, lookups);
-
-        eval.finalize_logup_in_pairs();
     }
 }
 
@@ -143,7 +141,7 @@ impl BuiltInProverComponent for CpuChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

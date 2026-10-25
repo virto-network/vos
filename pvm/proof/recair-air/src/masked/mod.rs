@@ -118,18 +118,23 @@ impl<B: Body> FrameworkEval for MaskedEval<B> {
     }
 }
 
-/// A component set the masked wrap proves: its components, each a
-/// [`MaskedEval`], at their log sizes.
+/// A component set a masked format proves: its components, each a body
+/// masked as [`MaskedEval`] masks one, at their log sizes.
 pub trait MaskedComponents: Sized {
     /// The relations the bodies read, drawn right before [`BlindRelation`].
     type Relations;
 
-    fn draw_relations(channel: &mut impl Channel) -> Self::Relations;
+    /// Which of the set's components a proof holds (the segment AIR's
+    /// active-chip mask; `()` for a set that always holds all of them),
+    /// which the relations drawn follow.
+    type Active: Copy;
+
+    fn draw_relations(active: Self::Active, channel: &mut impl Channel) -> Self::Relations;
 
     /// Pin B's fifth step, the masked transcript's challenges: the set's
     /// relations, then [`BlindRelation`].
-    fn draw(channel: &mut impl Channel) -> (Self::Relations, BlindRelation) {
-        let relations = Self::draw_relations(channel);
+    fn draw(active: Self::Active, channel: &mut impl Channel) -> (Self::Relations, BlindRelation) {
+        let relations = Self::draw_relations(active, channel);
         let blind = BlindRelation::draw(channel);
         (relations, blind)
     }
@@ -137,14 +142,29 @@ pub trait MaskedComponents: Sized {
     /// The set at `log_sizes` with its claimed sums, `None` when either
     /// count is not the set's.
     fn new(
+        active: Self::Active,
         relations: &Self::Relations,
         blind: &BlindRelation,
         log_sizes: &[u32],
         claimed_sums: &[SecureField],
     ) -> Option<Self>;
 
+    /// The set at `log_sizes` under any relations and claimed sums: its
+    /// trees' layout and its masks, which neither changes. `None` where
+    /// [`new`](Self::new) is.
+    fn layout(active: Self::Active, log_sizes: &[u32]) -> Option<Self>;
+
+    /// The components the set holds.
+    fn active(&self) -> Self::Active;
+
     /// Each component's log size, in commitment order.
     fn log_sizes(&self) -> &[u32];
+
+    /// The components whose claimed sums the verifier recomputes from the
+    /// public values: the prover leaves them unblinded, as they are public.
+    fn public_sums(&self) -> Vec<usize> {
+        Vec::new()
+    }
 
     /// The preprocessed tree's column log sizes, in commitment order, at the
     /// rows' level (unextended).
@@ -529,7 +549,7 @@ mod tests {
     #[test]
     fn a_bound_layout_evaluates_as_the_set_built_anew() {
         let mut channel = stwo::core::channel::Blake2bChannel::default();
-        let (relation, blind) = WrapComponents::draw(&mut channel);
+        let (relation, blind) = WrapComponents::draw((), &mut channel);
         let claimed_sums = [
             channel.draw_secure_felt(),
             channel.draw_secure_felt(),
@@ -547,6 +567,7 @@ mod tests {
         );
         assert!(Rebound::new(&layout.p2, other_size, claimed_sums[0]).is_none());
         let built = WrapComponents::build(&relation, &blind, &LOG_SIZES, &claimed_sums);
+        assert!(<WrapComponents as MaskedComponents>::layout((), &LOG_SIZES[..2]).is_none());
         let z = SECURE_FIELD_CIRCLE_GEN.mul(11);
         let points = sample_points(&layout, z, &MASKED_WRAP_PINS).unwrap();
         let samples = TreeVec(

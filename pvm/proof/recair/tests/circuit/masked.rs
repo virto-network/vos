@@ -18,6 +18,7 @@ use vos_pvm_proof::format::{MASKED_WRAP, MASKED_WRAP_REFERENCE, SEGMENT_REFERENC
 use vos_pvm_proof::framework_access::{
     AllLookupElements, draw_all_lookup_elements, drive_chip_oods,
 };
+use vos_pvm_proof::masked::{SegmentComponents, drive_masked_chip};
 use vos_pvm_proof::security::{SecurityShape, proven_count};
 use vos_pvm_recair_air::gate::{GATE_WIDTH, GateRelation};
 use vos_pvm_recair_air::h8::H8Eval;
@@ -30,7 +31,7 @@ use vos_pvm_recair_air::qm31::Qm31Eval;
 use vos_pvm_recair_air::{LogSizes, h8, p2, qm31};
 
 use crate::common::sources;
-use crate::gates::{degrees, preprocessed_of};
+use crate::gates::{degrees, fraction_degrees, preprocessed_of};
 
 /// The wrap's log sizes, `format::WRAP`'s and `format::MASKED_WRAP`'s.
 const LOG_SIZES: LogSizes = [14, 15, 11];
@@ -152,6 +153,119 @@ fn the_segment_chips_pass_the_degree_audit_under_c() {
     }
     assert_eq!(degrees.len(), SEGMENT_REFERENCE.constraints as usize);
     assert_eq!(histogram(&degrees), [0, 23, 4395, 759]);
+}
+
+/// R5 on the masked segment: each chip's masked evaluation (its constraints,
+/// its blinding fraction joined to its last batch) keeps every constraint of
+/// the chip at its degree, so the masked set holds the segment AIR's 5,177
+/// constraints, none above 3; and the set built at its layout declares them.
+#[test]
+fn the_masked_segment_chips_pass_the_degree_audit() {
+    let count = vos_pvm_proof::chip_idx::COUNT;
+    let mask = vos_pvm_proof::chip_idx::ALL;
+    let channel = &mut Blake2sChannel::default();
+    let lookups = SegmentComponents::draw_relations(mask, channel);
+    let blind = BlindRelation::draw(channel);
+    let mut degrees = Vec::new();
+    for chip in 0..count {
+        let name = vos_pvm_proof::chip_idx::NAMES[chip];
+        let info = drive_masked_chip(chip, 10, &lookups, &blind, InfoEvaluator::empty());
+        let preprocessed = preprocessed_of(&info);
+        let preprocessed: Vec<&str> = preprocessed.iter().map(String::as_str).collect();
+        let recorded = drive_masked_chip(chip, 10, &lookups, &blind, ExprEvaluator::new());
+        let counted = audit(name, &recorded, &preprocessed);
+        assert_eq!(counted.len(), info.n_constraints, "{name}");
+        let plain = drive_chip_oods(chip, 10, &lookups, InfoEvaluator::empty());
+        assert_eq!(counted.len(), plain.n_constraints, "{name}");
+        degrees.extend(counted);
+    }
+    assert_eq!(degrees.len(), SEGMENT_REFERENCE.constraints as usize);
+    assert_eq!(histogram(&degrees), [0, 23, 4395, 759]);
+    let built = SegmentComponents::layout(mask, &[10; 25]).unwrap();
+    assert_eq!(
+        built
+            .components()
+            .iter()
+            .map(|component| component.n_constraints())
+            .sum::<usize>(),
+        degrees.len()
+    );
+    assert!(
+        built
+            .components()
+            .iter()
+            .all(|component| component.max_constraint_log_degree_bound() == 12)
+    );
+}
+
+/// The cubic census (the review's option 4), a measurement: which of the
+/// masked segment's 759 cubic constraints are logup batches (the pairs'
+/// `Δ·d_1·d_2 − (n_1·d_2 + n_2·d_1)`, the blinding's constant denominator
+/// adding no degree) and which are gates; and the degree the masked AIR
+/// would have with every chip's fractions batched alone (`Logup::Single`,
+/// `Δ·d − n`), with the interaction columns that costs. Measured: 723
+/// batches and 36 gates (the CPU's 34, the memory ledger's 2); so batching
+/// alone leaves the AIR cubic.
+#[test]
+fn the_masked_segments_cubic_census() {
+    let mask = vos_pvm_proof::chip_idx::ALL;
+    let channel = &mut Blake2sChannel::default();
+    let lookups = SegmentComponents::draw_relations(mask, channel);
+    let blind = BlindRelation::draw(channel);
+    let (mut gates, mut batches) = ([0usize; 4], [0usize; 4]);
+    let (mut single_max, mut paired_columns, mut single_columns) = (0, 0, 0);
+    for chip in 0..vos_pvm_proof::chip_idx::COUNT {
+        let name = vos_pvm_proof::chip_idx::NAMES[chip];
+        let info = drive_masked_chip(chip, 10, &lookups, &blind, InfoEvaluator::empty());
+        let preprocessed = preprocessed_of(&info);
+        let preprocessed: Vec<&str> = preprocessed.iter().map(String::as_str).collect();
+        let recorded = drive_masked_chip(chip, 10, &lookups, &blind, ExprEvaluator::new());
+        let counted = audit(name, &recorded, &preprocessed);
+        let fractions = fraction_degrees(&recorded, &preprocessed);
+        // The chip's batches: its interaction columns a QM31 each, the
+        // running sum's among them; the last constraints are theirs.
+        let columns = info.mask_offsets[2].len() / 4;
+        let (gate, batch) = counted.split_at(counted.len() - columns);
+        for &degree in gate {
+            gates[degree] += 1;
+        }
+        for &degree in batch {
+            batches[degree] += 1;
+        }
+        // Alone, a fraction's constraint is `Δ·d − n`; the blinding joins
+        // the last, its denominator constant.
+        let alone = fractions
+            .iter()
+            .map(|&(numerator, denominator)| (1 + denominator).max(numerator))
+            .max()
+            .unwrap_or(0);
+        single_max = single_max.max(alone);
+        paired_columns += columns;
+        single_columns += fractions.len() - 1;
+        eprintln!(
+            "{name}: {} gates {:?}, {columns} batches {:?}; {} fractions alone at degree {alone}",
+            gate.len(),
+            histogram(gate),
+            histogram(batch),
+            fractions.len() - 1
+        );
+    }
+    eprintln!(
+        "gates {gates:?}, batches {batches:?}; batched alone: degree {single_max} at most, \
+         {single_columns} interaction QM31 columns against {paired_columns}"
+    );
+    assert_eq!(
+        gates.iter().sum::<usize>() + batches.iter().sum::<usize>(),
+        SEGMENT_REFERENCE.constraints as usize
+    );
+    // 723 of the 759 cubic constraints are the pairs' batches; 36 are gates
+    // (the CPU's 34, the memory ledger's 2), which batching alone leaves
+    // cubic. Alone, every fraction is quadratic, at 1,464 interaction QM31
+    // columns against 741.
+    assert_eq!(gates, [0, 23, 4377, 36]);
+    assert_eq!(batches, [0, 0, 18, 723]);
+    assert_eq!(single_max, 2);
+    assert_eq!((single_columns, paired_columns), (1464, 741));
 }
 
 /// The masked wrap's shape, read from the built components' own layout:

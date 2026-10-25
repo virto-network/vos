@@ -110,6 +110,31 @@ fn degrees_with(
         .collect()
 }
 
+/// Each recorded fraction's numerator's and denominator's degrees, the
+/// preprocessed columns at degree 1.
+pub(crate) fn fraction_degrees(
+    recorded: &ExprEvaluator,
+    preprocessed: &[&str],
+) -> Vec<(usize, usize)> {
+    let mut degrees = Degrees {
+        recorded,
+        preprocessed,
+        preprocessed_degree: 1,
+        memo: HashMap::new(),
+    };
+    recorded
+        .logup
+        .fracs
+        .iter()
+        .map(|fraction| {
+            (
+                degrees.ext(&fraction.numerator),
+                degrees.ext(&fraction.denominator),
+            )
+        })
+        .collect()
+}
+
 /// Each constraint's degree, the preprocessed columns at degree 1.
 pub(crate) fn degrees(recorded: &ExprEvaluator, preprocessed: &[&str]) -> Vec<usize> {
     degrees_with(recorded, preprocessed, 1)

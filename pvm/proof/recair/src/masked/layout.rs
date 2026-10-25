@@ -6,6 +6,8 @@
 //! elements `v_H·r` spans there; masking a column then writes `f`'s
 //! coefficients and `h` random ones into one vector, with no product taken.
 
+use std::sync::{Arc, Mutex};
+
 use num_traits::Zero;
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
@@ -28,6 +30,7 @@ use crate::prove::ProveError;
 #[derive(Clone, Debug)]
 pub(crate) struct MaskLayout {
     log_size: u32,
+    log_mask_rows: u32,
     /// `f`'s `i`-th coefficient's position at `log_size + 1`.
     lower: Vec<usize>,
     /// The `h` positions `v_H·r` spans at `log_size + 1`, none of `lower`'s.
@@ -108,6 +111,7 @@ impl MaskLayout {
         }
         Ok(Self {
             log_size,
+            log_mask_rows,
             lower,
             upper,
         })
@@ -136,42 +140,90 @@ impl MaskLayout {
     }
 }
 
-/// The layouts for every size among `log_sizes`, built in parallel.
-pub(crate) fn layouts(
-    log_sizes: &[u32],
-    log_mask_rows: u32,
-) -> Result<Vec<MaskLayout>, ProveError> {
-    let mut sizes = log_sizes.to_vec();
-    sizes.sort_unstable();
-    sizes.dedup();
-    sizes
+/// The layouts built so far, by `(log_size, log_mask_rows)`: a layout is a
+/// function of its size and `h` alone, so a process builds each once.
+static LAYOUTS: Mutex<Vec<Arc<MaskLayout>>> = Mutex::new(Vec::new());
+
+/// The layouts for every component's size and `h` among `classes`, each a
+/// `(log_size, log_mask_rows)`: those built before taken from the process's
+/// cache, the others built in parallel and kept.
+pub(crate) fn layouts(classes: &[(u32, u32)]) -> Result<Vec<Arc<MaskLayout>>, ProveError> {
+    let mut classes = classes.to_vec();
+    classes.sort_unstable();
+    classes.dedup();
+    let cached = |cache: &[Arc<MaskLayout>], (log_size, log_mask_rows): (u32, u32)| {
+        cache
+            .iter()
+            .find(|layout| layout.log_size == log_size && layout.log_mask_rows == log_mask_rows)
+            .cloned()
+    };
+    let missing: Vec<(u32, u32)> = {
+        let cache = LAYOUTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        classes
+            .iter()
+            .copied()
+            .filter(|&class| cached(&cache, class).is_none())
+            .collect()
+    };
+    let built: Vec<MaskLayout> = missing
         .into_par_iter()
-        .map(|log_size| MaskLayout::new(log_size, log_mask_rows))
-        .collect()
+        .map(|(log_size, log_mask_rows)| MaskLayout::new(log_size, log_mask_rows))
+        .collect::<Result<_, _>>()?;
+    let mut cache = LAYOUTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.extend(built.into_iter().map(Arc::new));
+    Ok(classes
+        .into_iter()
+        .filter_map(|class| cached(&cache, class))
+        .collect())
 }
 
-/// Each of `polys` masked by its size's layout, in parallel, one 32-byte
-/// seed a column drawn from `rng` in order.
-pub(crate) fn mask_columns(
-    polys: &[&CircleCoefficients<SimdBackend>],
-    layouts: &[MaskLayout],
-    rng: &mut ChaCha20Rng,
-) -> Result<Vec<CircleCoefficients<SimdBackend>>, ProveError> {
-    let seeds: Vec<[u8; 32]> = polys.iter().map(|_| rng.r#gen()).collect();
+/// `n` masks' 32-byte seeds drawn from `rng` in order, one a column.
+pub(crate) fn seeds(n: usize, rng: &mut ChaCha20Rng) -> Vec<[u8; 32]> {
+    let seeds: Vec<[u8; 32]> = (0..n).map(|_| rng.r#gen()).collect();
     for seed in &seeds {
         super::drawn::note("a mask column's seed", seed);
+    }
+    seeds
+}
+
+/// Each of `polys`, with its `log2 h`, masked by its size's layout at that
+/// `h` from its seed in `seeds`, in parallel.
+pub(crate) fn mask_with(
+    polys: &[(&CircleCoefficients<SimdBackend>, u32)],
+    seeds: Vec<[u8; 32]>,
+    layouts: &[Arc<MaskLayout>],
+) -> Result<Vec<CircleCoefficients<SimdBackend>>, ProveError> {
+    if seeds.len() != polys.len() {
+        return Err(ProveError::Masking("a seed for each column"));
     }
     polys
         .par_iter()
         .zip(seeds)
-        .map(|(poly, seed)| {
+        .map(|(&(poly, log_mask_rows), seed)| {
             let layout = layouts
                 .iter()
-                .find(|layout| layout.log_size == poly.log_size())
+                .find(|layout| {
+                    layout.log_size == poly.log_size() && layout.log_mask_rows == log_mask_rows
+                })
                 .ok_or(ProveError::Masking("a column of a size with no layout"))?;
             layout.mask(poly, &mut ChaCha20Rng::from_seed(seed))
         })
         .collect()
+}
+
+/// Each of `polys`, with its `log2 h`, masked by its size's layout at that
+/// `h`, in parallel, one 32-byte seed a column drawn from `rng` in order.
+pub(crate) fn mask_columns(
+    polys: &[(&CircleCoefficients<SimdBackend>, u32)],
+    layouts: &[Arc<MaskLayout>],
+    rng: &mut ChaCha20Rng,
+) -> Result<Vec<CircleCoefficients<SimdBackend>>, ProveError> {
+    let seeds = seeds(polys.len(), rng);
+    mask_with(polys, seeds, layouts)
 }
 
 #[cfg(test)]
