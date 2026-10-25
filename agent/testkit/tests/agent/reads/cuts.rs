@@ -118,6 +118,23 @@ fn only_a_window_a_read_waits_on_is_cut() {
     );
 }
 
+/// A read asked after a report of a later window, as the representative
+/// stores one from an agent whose clock leads, keeps the later window as
+/// the latest a read waits on, and its own window is cut all the same.
+#[test]
+fn a_read_never_moves_the_reading_window_back() {
+    let mut reads = Reads::with(&[(1, 10)]);
+    let later = vos_wire::records::stored(&(WINDOW + 1).encode());
+    reads.node.state.insert(keys::reading(), later);
+    reads.kit.set_row(keys::reading(), (WINDOW + 1).encode());
+    reads.start(T0 + 10, "sum_at_cut", vec![1u64]);
+    assert_eq!(row::<u64>(&reads, &keys::reading()), Some(WINDOW + 1));
+    tick(&mut reads, start_of(11) + 5);
+    assert_eq!(cut(&reads), [WINDOW], "the read's window cut");
+    tick(&mut reads, start_of(12) + 5);
+    assert_eq!(cut(&reads), [WINDOW, 11], "and the reported one's");
+}
+
 /// A clock's jump past `MAX_CUTS` windows leaves the window a read was
 /// asked in uncut, and its deadline is past, so the next sweep ends it
 /// `NotClosed`, its request gone.

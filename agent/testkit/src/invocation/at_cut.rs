@@ -74,7 +74,8 @@ impl Invocation<'_> {
             PendingRead { instance, rows }.encode(),
         )];
         let reading = self.read_state(&keys::reading())?;
-        if reading.and_then(|bytes| u64::decode_exact(&bytes)) != Some(window) {
+        let reading = reading.and_then(|bytes| u64::decode_exact(&bytes));
+        if reading.is_none_or(|reading| reading < window) {
             writes.push((keys::reading(), window.encode()));
         }
         for (key, value) in writes {
