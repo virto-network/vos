@@ -309,7 +309,8 @@ fn a_tampered_or_malformed_proof_is_refused_never_a_panic() {
     verify::<P2MerkleChannel>(&format, &honest).expect("verifies");
     let one = SecureField::one();
     let salts = format.masking.expect("masked").salt_columns;
-    let cases: Vec<(&str, Box<dyn Fn(&mut P)>)> = vec![
+    type Mutation<'a> = Box<dyn Fn(&mut P) + 'a>;
+    let cases: Vec<(&str, Mutation)> = vec![
         (
             "a main sample",
             Box::new(|p| p.proof.stark_proof.0.sampled_values[1][3][0] += one),

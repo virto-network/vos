@@ -225,6 +225,10 @@ pub fn fri_rounds(log_degree_bound: u32, config: &FriConfig) -> Option<Vec<u32>>
     Some(rounds)
 }
 
+/// Whether the claimed sums the public values fix are theirs under the
+/// relations.
+pub type BoundSums<'a, R> = dyn Fn(&R, &[SecureField]) -> bool + 'a;
+
 /// What a masked proof claims beside its STARK proof.
 pub struct Claim<'a, R, Hash> {
     /// Each component's log size, the proof's: the format's or refused.
@@ -240,7 +244,7 @@ pub struct Claim<'a, R, Hash> {
     /// Whether the claimed sums the public values fix
     /// ([`MaskedComponents::public_sums`]) are theirs under the relations;
     /// `None` for a set with none.
-    pub bound_sums: Option<&'a dyn Fn(&R, &[SecureField]) -> bool>,
+    pub bound_sums: Option<&'a BoundSums<'a, R>>,
     pub interaction_pow: u64,
     pub claimed_sums: &'a [SecureField],
 }
