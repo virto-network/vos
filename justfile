@@ -223,13 +223,14 @@ jam-statements-testnet: build-statement-service
     bash tools/jam-dev/testnet.sh statements
 
 # The end to end on chain, on a local PolkaJam testnet it starts and stops
-# (`testnet.sh chain`): three nodes of a space proving with the masked prover
-# anchor and submit at the Kreivo mock, then migrate to the JAM statements
-# service, deployed twice; the rootless statements' venue binding, and their
-# replays once the testnet's clock is moved past `MaxRootAge`; every carrier
-# of the run audited; the latency, gas, fees and the prover's throughput
-# measured, written to the run's `record.txt`. Outside `ci`, as `jam-testnet`
-# is: it needs the PolkaJam binaries and a C compiler. About 25 minutes, one
+# (`testnet.sh chain`): two spaces of three nodes proving with the masked
+# prover, one anchoring and submitting at the Kreivo mock, the other at the JAM
+# statements service, deployed twice; statements refused where their roots are
+# not anchored, a rootless one refused, and a replay once the testnet's clock
+# is moved past `MaxRootAge`; every carrier of the run audited; the latency,
+# gas, fees and the prover's throughput measured, written to the run's
+# `record.txt`. Outside `ci`, as `jam-testnet` is: it needs the PolkaJam
+# binaries and a C compiler. About 25 minutes, one
 # masked proof at a time (about 6 GiB): run it under a 12 GiB limit, e.g.
 # `systemd-run --user --scope -p MemoryMax=12G -p MemorySwapMax=0 just e2e-chain`.
 e2e-chain: build-test-actors build-agent build-representative build-statement-service
@@ -312,6 +313,23 @@ _seeded-masks-unimplied:
 _debug-names-absent:
     cargo build -p vos-cli --features prover
     let binary = (open --raw target/debug/vos); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"the node's binary names ($name)" } } }
+
+# The venue rules are written once, in `vos_anchor::venue`: no venue's
+# source outside its tests holds an anchor rule's arithmetic (the root age,
+# a window's boundary, the strict signature check past the one verifier
+# each venue hands the core, the small-order keys), and each venue calls the
+# core's rules.
+check-venue-rules:
+    let roots = [pvm/proof/statement/src pvm/proof/statement/service/src node/venue/src tools/jam-dev/src]; \
+    let markers = [MAX_ROOT_AGE_MS '.boundary(' verify_strict SMALL_ORDER]; \
+    let allowed = [[file marker]; [node/venue/src/lib.rs verify_strict] [pvm/proof/statement/service/src/refine.rs verify_strict]]; \
+    let sources = ($roots | each {|root| glob $"($root)/**/*.rs" } | flatten | each {|path| $path | path relative-to $env.PWD } | where {|path| not ($path =~ '(^|/)(tests?|conformance|command)(/|\.rs$)') }); \
+    let found = ($sources | each {|file| let code = (open --raw $file | lines | take until {|line| $line =~ '^#\[cfg\(test\)\]' } | each {|line| $line | str replace -r '//.*$' '' } | str join "\n" | str replace -a -r '(?m)^\s*(pub )?use [^;]*;' ''); $markers | where {|marker| ($code | str contains $marker) and not ($allowed | any {|a| $a.file == $file and $a.marker == $marker }) } | each {|marker| $"($file) holds ($marker)" } } | flatten); \
+    let calls = [[file call]; [pvm/proof/statement/src/model.rs 'rules::anchored('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchor('] [pvm/proof/statement/service/src/accumulate.rs 'rules::register('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchored('] [pvm/proof/statement/service/src/refine.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchor('] [node/venue/src/model.rs 'rules::register('] [node/venue/src/model.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchored('] [node/venue/src/kreivo/mock/pallet.rs 'rules::anchor('] [node/venue/src/kreivo/mock/pallet.rs 'rules::register('] [node/venue/src/kreivo/mock/pallet.rs 'rules::registration('] [node/venue/src/kreivo/mock/pallet.rs 'rules::anchored('] [node/venue/src/kreivo/venue.rs 'rules::anchored('] [tools/jam-dev/src/venue.rs 'rules::anchored(']]; \
+    let missing = ($calls | where {|row| not (open --raw $row.file | str contains $row.call) } | each {|row| $"($row.file) calls no ($row.call)" }); \
+    for failure in ($found ++ $missing) { print -e $failure }; \
+    if ($found ++ $missing | is-not-empty) { error make { msg: "an anchor rule lives outside vos_anchor::venue, or a venue does not call it" } }; \
+    print $"the venue rules live in vos_anchor::venue alone: ($sources | length) files searched, ($calls | length) calls found"
 
 # Every `check-no-*` gate below, each build resolved once.
 check-no-leaks: (_forbidden "jam-dev" "venue-clients" "seeded-masks" "debug-internals" "test-formats" "store-dump" "heap-peak") _seeded-masks-unimplied _debug-names-absent
@@ -511,7 +529,7 @@ fuzz secs="60":
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-no-std check-no-leaks check-kit build-test-actors build-agent build-representative fuzz-replay
+check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-kit build-test-actors build-agent build-representative fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     just clippy-prover

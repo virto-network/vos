@@ -11,7 +11,7 @@ The kit holds:
   dev-dependencies, tests or bins, which stay in VOS);
 - `fixtures/`: the golden fixtures `vos-statement`'s `fixtures` feature
   reads (`../fixtures` from its manifest);
-- `conformance/`: the conformance vectors G1–G18 (`spaces.json`) and the
+- `conformance/`: the conformance vectors G1–G17 (`spaces.json`) and the
   mutation lists (`mutations.json`), which VOS's reference mock generates;
 - this script, `vos_kit.py`;
 - `VENDOR`: the repository (for information), the commit, the tag, the
