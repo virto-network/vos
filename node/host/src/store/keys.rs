@@ -44,8 +44,12 @@ pub(super) enum NodeRow {
     // earlier builds may hold such rows. A reuse keeps that layout, or
     // takes a new tag.
     ProverJob = 0x11,
-    ProverMark = 0x12,
+    // 0x12 is reserved: it held, by agent, the last index of its log the
+    // prover read into jobs (a u64 big-endian), and stores from earlier
+    // builds may hold such rows. A reuse keeps that layout, or takes a new
+    // tag.
     Layout = 0x13,
+    ProverStopping = 0x14,
 }
 
 /// The keyspace layout this build reads and writes, as the store's layout

@@ -173,7 +173,9 @@ impl Reads {
                         rep_root,
                         paths,
                     } => self.kit.close(*window, *rep_root, paths.clone()),
-                    Input::Proven { window, id, proof } => self.kit.proven(*window, *id, *proof),
+                    Input::Proven {
+                        window, id, proof, ..
+                    } => self.kit.proven(*window, *id, *proof),
                     other => panic!("not modelled: {other:?}"),
                 },
                 Step::Swept { .. } | Step::Refused { .. } => {

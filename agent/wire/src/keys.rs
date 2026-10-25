@@ -169,6 +169,7 @@ enum TreeRow {
     CutProof = 0x06,
     Closing = 0x07,
     Anchor = 0x08,
+    Attested = 0x09,
 }
 
 impl TreeRow {
@@ -698,6 +699,36 @@ pub fn anchors() -> Vec<u8> {
 pub fn anchor_entry(key: &[u8]) -> Option<u64> {
     let rest = key.strip_prefix(&TreeRow::Anchor.prefix())?;
     Some(u64::from_be_bytes(rest.try_into().ok()?))
+}
+
+/// The record of an attest at window `window`'s cut
+/// ([`crate::result::Attest`]), by its digest
+/// ([`crate::result::Attest::digest`]): node-local, written by the node's
+/// apply of the work result that made it, kept without its witness once
+/// the statement's `Proven` applies, and dropped once the window's roots
+/// age past `MaxRootAge`; the same rows on every replica, so a replica that
+/// installs a snapshot holds them. The prover reads its jobs from these.
+pub fn attested(window: u64, digest: &[u8; 32]) -> Vec<u8> {
+    TreeRow::Attested.key(&[&window.to_be_bytes()[..], digest].concat())
+}
+
+/// The key the [`attested`] rows of window `window` and later follow, in
+/// window order.
+pub fn attested_from(window: u64) -> Vec<u8> {
+    TreeRow::Attested.key(&window.to_be_bytes())
+}
+
+/// The prefix of every [`attested`] row.
+pub fn attested_prefix() -> Vec<u8> {
+    TreeRow::Attested.prefix().to_vec()
+}
+
+/// The window and digest an [`attested`] key names; `None` for any other
+/// key.
+pub fn attested_entry(key: &[u8]) -> Option<(u64, [u8; 32])> {
+    let rest = key.strip_prefix(&TreeRow::Attested.prefix())?;
+    let (window, digest) = rest.split_first_chunk::<8>()?;
+    Some((u64::from_be_bytes(*window), digest.try_into().ok()?))
 }
 
 /// The window a [`closed`] key names; `None` for any other key.

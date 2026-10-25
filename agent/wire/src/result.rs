@@ -294,9 +294,15 @@ pub enum InputRef {
     /// ([`crate::batch::Input::Close`]).
     #[codec(index = 7)]
     Close { window: u64 },
-    /// A statement of the agent's proved ([`crate::batch::Input::Proven`]).
+    /// A statement of the agent's at window `window`'s cut proved, of the
+    /// attest whose record's digest is `attested`
+    /// ([`crate::batch::Input::Proven`]).
     #[codec(index = 8)]
-    Proven { id: [u8; 32] },
+    Proven {
+        window: u64,
+        id: [u8; 32],
+        attested: [u8; 32],
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -389,6 +395,18 @@ pub struct Attest {
     /// rootless method.
     pub roots: Vec<RootRead>,
 }
+
+impl Attest {
+    /// The digest that names this attest's record while its statement
+    /// waits to be proved ([`crate::keys::attested`]): the BLAKE2b-256 of
+    /// its encoding.
+    pub fn digest(&self) -> [u8; 32] {
+        vos_pvm_precompiles::blake2b_hash::<32>(ATTEST_DOMAIN, &[&self.encode()])
+    }
+}
+
+/// The domain of an attest's digest ([`Attest::digest`]).
+const ATTEST_DOMAIN: &[u8] = b"vos/attest";
 
 /// What a workflow's read at a window's cut ([`crate::abi::Op::AttestAt`])
 /// resumes it with: the kernel's output, or why there is none.

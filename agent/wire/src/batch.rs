@@ -170,15 +170,19 @@ pub enum Input {
     },
     /// The statement `id` of one of the agent's attests at window
     /// `window`'s cut proved, its final proof the blob `proof` (its
-    /// BLAKE2b-256) in the prover's blob store: refine records it
-    /// ([`crate::keys::proven`]), the first proof of an id alone. The
-    /// prover, the agent's leader, puts it in a batch once the proof is
+    /// BLAKE2b-256) in the prover's blob store, the attest's record the one
+    /// whose digest is `attested` ([`crate::result::Attest::digest`]):
+    /// refine records it ([`crate::keys::proven`]), the first proof of an id
+    /// alone, and the node keeps that record without its witness
+    /// ([`crate::keys::attested`]).
+    /// The prover, the agent's leader, puts it in a batch once the proof is
     /// stored.
     #[codec(index = 9)]
     Proven {
         window: u64,
         id: [u8; 32],
         proof: [u8; 32],
+        attested: [u8; 32],
     },
 }
 

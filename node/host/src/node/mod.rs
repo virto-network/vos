@@ -166,9 +166,6 @@ pub(crate) struct Inner {
     pub(crate) anchor_handed: Mutex<Option<u64>>,
     /// The statements proved here that their agents have still to record.
     pub(crate) unrecorded: crate::prover::Unrecorded,
-    /// Whether a prover worker runs here: compaction keeps the entries its
-    /// scan has not read.
-    pub(crate) proving: AtomicBool,
     /// The prover worker's latest backlog.
     pub(crate) backlog: Mutex<Option<vos_node_prover::Backlog>>,
 }

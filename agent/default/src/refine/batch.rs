@@ -317,7 +317,12 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
                 rep_root,
                 paths,
             } => Stepped::ran(closes::close(base, window, rep_root, paths)),
-            Input::Proven { window, id, proof } => Stepped::ran(proven(base, window, id, proof)),
+            Input::Proven {
+                window,
+                id,
+                proof,
+                attested,
+            } => Stepped::ran(proven(base, window, id, (proof, attested))),
         };
         let Some(due) = batched.take(base, stepped, plan.reserve, plan.runs) else {
             break;

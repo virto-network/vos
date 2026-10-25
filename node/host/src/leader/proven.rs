@@ -25,7 +25,7 @@ impl Leader {
     /// recorded, at most [`PROVEN`]; those it holds are forgotten.
     pub(super) fn proofs(&self, snapshot: &Snapshot) -> Result<Vec<Pending>, Fault> {
         let mut due = Vec::new();
-        for (id, window, proof) in self.inner.unrecorded.of(self.id) {
+        for (id, (window, proof, attested)) in self.inner.unrecorded.of(self.id) {
             if snapshot
                 .get(self.id, &keys::proven(window, &id.0))?
                 .is_some()
@@ -38,6 +38,7 @@ impl Leader {
                     window,
                     id: id.0,
                     proof,
+                    attested,
                 }));
             }
         }

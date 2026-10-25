@@ -291,6 +291,7 @@ fn a_statement_is_recorded_proven_once() {
         window: 4,
         id: [id; 32],
         proof: [proof; 32],
+        attested: [id ^ proof; 32],
     };
     let result = reads.batch(T0 + 1, vec![proven(1, 0xa1), proven(1, 0xa2)]);
     assert_eq!(ran(&result.steps[0]).writes.len(), 1);

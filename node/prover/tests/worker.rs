@@ -1,8 +1,11 @@
 //! The worker over a model of its node, its prover and its venue: a
-//! restart mid-proof leaves one proof, a submission made twice is accepted
-//! once, a leader change proves nothing twice, a dead statement is skipped,
-//! a record whose re-run is not its statement is refused, and a refusal
-//! that may not hold later is submitted again.
+//! restart mid-proof leaves one proof, a stop's not counted when the node
+//! was stopping, a submission made twice is accepted once, a leader change
+//! proves nothing twice, a dead statement is skipped, jobs age out and go
+//! with their agent, an unfinished job's kernel is held and one never
+//! fetched refused, a record whose re-run is not its statement is refused,
+//! and a refusal that may not hold later is submitted again, a venue's
+//! failures to judge it counted across restarts.
 
 mod support;
 
@@ -24,7 +27,7 @@ use support::*;
 #[test]
 fn a_restart_mid_proof_leaves_one_proof() {
     let agent = Arc::new(Mutex::new(Agent::default()));
-    agent.lock().unwrap().log.push(vec![attest(3, 1)]);
+    agent.lock().unwrap().attests(vec![attest(3, 1)]);
     let node = Node::new(&agent, true);
     let (jobs, prover, venue) = (
         MemoryJobs::default(),
@@ -49,10 +52,7 @@ fn a_restart_mid_proof_leaves_one_proof() {
     assert_eq!(states(&jobs), [State::Accepted]);
     assert_eq!(prover.made.load(Ordering::SeqCst), 1, "proved once");
     assert_eq!(node.blobs(), 1, "one proof kept");
-    assert!(
-        node.pins.lock().unwrap().is_empty(),
-        "its pin gone once accepted"
-    );
+    assert_eq!(proofs_held(&node), 0, "its pin gone once accepted");
     assert_eq!(agent.lock().unwrap().proven.len(), 1, "one proof recorded");
     assert_eq!(venue.accepted(), 1);
     // Read once: the record makes no second job.
@@ -67,7 +67,7 @@ fn a_restart_mid_proof_leaves_one_proof() {
 #[test]
 fn a_duplicate_submission_is_accepted_once() {
     let agent = Arc::new(Mutex::new(Agent::default()));
-    agent.lock().unwrap().log.push(vec![attest(3, 1)]);
+    agent.lock().unwrap().attests(vec![attest(3, 1)]);
     let node = Node::new(&agent, true);
     let (jobs, prover, venue) = (
         MemoryJobs::default(),
@@ -110,10 +110,7 @@ fn a_duplicate_submission_is_accepted_once() {
     assert_eq!(venue.submissions.load(Ordering::SeqCst), 2);
     assert_eq!(venue.accepted(), 1, "accepted once");
     assert_eq!(prover.made.load(Ordering::SeqCst), 1);
-    assert!(
-        node.pins.lock().unwrap().is_empty(),
-        "its pin gone once accepted"
-    );
+    assert_eq!(proofs_held(&node), 0, "its pin gone once accepted");
 }
 
 /// A prover that panics on a statement is caught: the job is queued again,
@@ -121,7 +118,7 @@ fn a_duplicate_submission_is_accepted_once() {
 #[test]
 fn a_prover_that_panics_gives_up_after_three_attempts() {
     let agent = Arc::new(Mutex::new(Agent::default()));
-    agent.lock().unwrap().log.push(vec![attest(3, 1)]);
+    agent.lock().unwrap().attests(vec![attest(3, 1)]);
     let node = Node::new(&agent, true);
     let (jobs, prover, venue) = (
         MemoryJobs::default(),
@@ -150,7 +147,7 @@ fn a_prover_that_panics_gives_up_after_three_attempts() {
 #[test]
 fn a_leader_change_proves_nothing_twice() {
     let agent = Arc::new(Mutex::new(Agent::default()));
-    agent.lock().unwrap().log.push(vec![attest(3, 1)]);
+    agent.lock().unwrap().attests(vec![attest(3, 1)]);
     let (a, b) = (Node::new(&agent, true), Node::new(&agent, false));
     b.peer(&a);
     let (prover, venue) = (Arc::new(Proofs::default()), Venue::at(after(3)));
@@ -168,7 +165,7 @@ fn a_leader_change_proves_nothing_twice() {
     a.leads.store(false, Ordering::SeqCst);
     b.leads.store(true, Ordering::SeqCst);
     venue.anchor(3);
-    agent.lock().unwrap().log.push(vec![attest(4, 2)]);
+    agent.lock().unwrap().attests(vec![attest(4, 2)]);
     venue.now.store(after(4), Ordering::SeqCst);
     venue.anchor(4);
     for _ in 0..4 {
@@ -193,7 +190,7 @@ fn a_leader_change_proves_nothing_twice() {
 
     // A third statement proved by a leader whose proof then is lost: the
     // next proves it again.
-    agent.lock().unwrap().log.push(vec![attest(5, 3)]);
+    agent.lock().unwrap().attests(vec![attest(5, 3)]);
     venue.now.store(after(5), Ordering::SeqCst);
     on_b.step().unwrap();
     b.blobs.lock().unwrap().clear();
@@ -228,7 +225,7 @@ fn a_leader_change_proves_nothing_twice() {
 #[test]
 fn a_dead_statement_is_skipped() {
     let agent = Arc::new(Mutex::new(Agent::default()));
-    agent.lock().unwrap().log.push(vec![attest(3, 1)]);
+    agent.lock().unwrap().attests(vec![attest(3, 1)]);
     let node = Node::new(&agent, true);
     let deadline = CLOCK.boundary(3).unwrap() + MAX_ROOT_AGE_MS;
     let expected = options().expected.as_millis() as u64;
@@ -243,7 +240,7 @@ fn a_dead_statement_is_skipped() {
     assert_eq!(states(&jobs), [State::Dead]);
     assert_eq!(prover.made.load(Ordering::SeqCst), 0, "never proved");
 
-    agent.lock().unwrap().log.push(vec![attest(4, 2)]);
+    agent.lock().unwrap().attests(vec![attest(4, 2)]);
     let deadline = CLOCK.boundary(4).unwrap() + MAX_ROOT_AGE_MS;
     venue.now.store(deadline - expected, Ordering::SeqCst);
     worker.step().unwrap();
@@ -263,35 +260,123 @@ fn a_dead_statement_is_skipped() {
     assert_eq!(worker.prune().unwrap(), 2, "pruned once aged");
 }
 
-/// A rootless statement's finished job is kept while its record is in its
-/// agent's log, whatever the venue's time, and removed once the log is
-/// compacted past it.
+/// Jobs age out: an unfinished job whose roots aged past `MaxRootAge` by
+/// the venue's time is dead, a finished one removed, and the jobs of an
+/// agent the node no longer replicates removed whatever their state, their
+/// proofs held no longer; a record stating no root makes no job.
 #[test]
-fn a_rootless_job_is_pruned_once_its_record_is_compacted() {
+fn jobs_age_out_and_go_with_their_agent() {
     let agent = Arc::new(Mutex::new(Agent::default()));
     let rootless = Attest {
         roots: Vec::new(),
-        ..attest(3, 1)
+        ..attest(3, 9)
     };
-    agent.lock().unwrap().log.push(vec![rootless]);
+    agent
+        .lock()
+        .unwrap()
+        .attests(vec![attest(3, 1), attest(4, 2), rootless]);
+    let node = Node::new(&agent, false);
+    let (jobs, prover, venue) = (
+        MemoryJobs::default(),
+        Arc::new(Proofs::default()),
+        Venue::at(after(4)),
+    );
+    let mut worker = worker(&node, &jobs, &prover, &venue);
+    worker.step().unwrap();
+    assert_eq!(
+        states(&jobs),
+        [State::Queued, State::Queued],
+        "no rootless job"
+    );
+    let aged = CLOCK.boundary(3).unwrap() + MAX_ROOT_AGE_MS + 1;
+    venue.now.store(aged, Ordering::SeqCst);
+    assert_eq!(worker.prune().unwrap(), 0);
+    let mut held = states(&jobs);
+    held.sort_by_key(|state| *state != State::Dead);
+    assert_eq!(
+        held,
+        [State::Dead, State::Queued],
+        "window 3's aged, 4's not"
+    );
+    assert_eq!(worker.prune().unwrap(), 1, "the dead job removed once aged");
+
+    node.replicates.store(false, Ordering::SeqCst);
+    assert_eq!(worker.prune().unwrap(), 1, "the agent no longer replicated");
+    assert!(states(&jobs).is_empty());
+}
+
+/// An unfinished job's kernel is held while the job waits, and no longer
+/// once it finishes; a kernel this node lacks is asked for, the job
+/// waiting, and refused once [`Options::patience`] passes without it.
+#[test]
+fn a_kernel_is_held_and_one_never_fetched_refused() {
+    let agent = Arc::new(Mutex::new(Agent::default()));
+    agent.lock().unwrap().attests(vec![attest(3, 1)]);
     let node = Node::new(&agent, true);
     let (jobs, prover, venue) = (
         MemoryJobs::default(),
         Arc::new(Proofs::default()),
         Venue::at(after(3)),
     );
+    venue.anchor(3);
+    let kernel = hash(KERNEL);
     let mut worker = worker(&node, &jobs, &prover, &venue);
-    for _ in 0..3 {
-        worker.step().unwrap();
-    }
-    assert_eq!(states(&jobs), [State::Accepted]);
-    venue.now.store(u64::MAX / 2, Ordering::SeqCst);
-    assert_eq!(worker.prune().unwrap(), 0, "kept while its record is held");
-    agent.lock().unwrap().compacted = 1;
-    assert_eq!(worker.prune().unwrap(), 1, "pruned once compacted");
-    assert!(states(&jobs).is_empty());
     worker.step().unwrap();
-    assert!(states(&jobs).is_empty(), "never read again");
+    assert!(
+        node.pins.lock().unwrap().contains(&kernel),
+        "held while proved"
+    );
+    worker.step().unwrap();
+    assert_eq!(states(&jobs), [State::Accepted]);
+    worker.step().unwrap();
+    assert!(!node.pins.lock().unwrap().contains(&kernel), "no longer");
+
+    node.no_kernel.store(true, Ordering::SeqCst);
+    agent.lock().unwrap().attests(vec![attest(3, 2)]);
+    let impatient = Options {
+        patience: Duration::from_millis(100),
+        ..options()
+    };
+    let mut worker = worker_with(&node, &jobs, &prover, &venue, impatient);
+    worker.step().unwrap();
+    assert_eq!(
+        states(&jobs),
+        [State::Accepted],
+        "its record waits for the kernel"
+    );
+    std::thread::sleep(Duration::from_millis(150));
+    worker.step().unwrap();
+    assert!(states(&jobs).contains(&State::Refused(REFUSED_KERNEL)));
+    assert_eq!(prover.made.load(Ordering::SeqCst), 1);
+}
+
+/// A proof under way when the node stops is not counted against its
+/// statement when the node was stopping then, as its operator stops it;
+/// it is when the node was not, as a kernel that kills it would.
+#[test]
+fn a_stop_mid_proof_counts_only_when_the_node_was_not_stopping() {
+    for stopping in [true, false] {
+        let agent = Arc::new(Mutex::new(Agent::default()));
+        agent.lock().unwrap().attests(vec![attest(3, 1)]);
+        let node = Node::new(&agent, true);
+        let (jobs, prover, venue) = (
+            MemoryJobs::default(),
+            Arc::new(Proofs::default()),
+            Venue::at(after(3)),
+        );
+        prover.stop.store(true, Ordering::SeqCst);
+        let mut first = worker(&node, &jobs, &prover, &venue);
+        std::thread::spawn(move || first.step());
+        while states(&jobs) != [State::Proving] {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        jobs.set_stopping(stopping).unwrap();
+        worker(&node, &jobs, &prover, &venue);
+        let (_, job) = jobs.all().unwrap().pop().unwrap();
+        assert_eq!(job.state, State::Queued);
+        assert_eq!(job.attempts, u32::from(!stopping), "stopping: {stopping}");
+        assert!(!jobs.stopping().unwrap(), "running again");
+    }
 }
 
 /// A record whose re-run is not its statement (its io-hash not the
@@ -303,8 +388,7 @@ fn an_io_hash_mismatch_is_refused() {
     agent
         .lock()
         .unwrap()
-        .log
-        .push(vec![attest(3, 1), attest(3, 2)]);
+        .attests(vec![attest(3, 1), attest(3, 2)]);
     let node = Node::new(&agent, true);
     let (jobs, prover, venue) = (
         MemoryJobs::default(),
@@ -333,7 +417,7 @@ fn an_io_hash_mismatch_is_refused() {
 #[test]
 fn a_transient_refusal_is_submitted_again() {
     let agent = Arc::new(Mutex::new(Agent::default()));
-    agent.lock().unwrap().log.push(vec![attest(3, 1)]);
+    agent.lock().unwrap().attests(vec![attest(3, 1)]);
     let node = Node::new(&agent, true);
     let (jobs, prover, venue) = (
         MemoryJobs::default(),
@@ -366,7 +450,7 @@ fn a_transient_refusal_is_submitted_again() {
     assert_eq!(states(&jobs), [State::Accepted]);
     assert_eq!(venue.accepted(), 1);
 
-    agent.lock().unwrap().log.push(vec![attest(3, 2)]);
+    agent.lock().unwrap().attests(vec![attest(3, 2)]);
     *venue.refuse.lock().unwrap() = vec![3];
     while venue.submissions.load(Ordering::SeqCst) < 4 {
         worker.step().unwrap();
@@ -381,7 +465,7 @@ fn a_transient_refusal_is_submitted_again() {
 #[test]
 fn resubmissions_are_bounded() {
     let agent = Arc::new(Mutex::new(Agent::default()));
-    agent.lock().unwrap().log.push(vec![attest(3, 1)]);
+    agent.lock().unwrap().attests(vec![attest(3, 1)]);
     let node = Node::new(&agent, true);
     let (jobs, prover, venue) = (
         MemoryJobs::default(),
@@ -408,24 +492,21 @@ fn resubmissions_are_bounded() {
     );
 }
 
-/// A rootless statement survives a venue unfunded for longer than
+/// A statement survives a venue unfunded for longer than
 /// [`MAX_RESUBMITS`] submissions, which the operator's to fix; and one
 /// whose acceptance's answer is lost every time is accepted, its last
 /// submission answered a repeat.
 #[test]
-fn a_rootless_statement_outlasts_a_pause_and_a_lost_answer() {
+fn a_statement_outlasts_a_pause_and_a_lost_answer() {
     let agent = Arc::new(Mutex::new(Agent::default()));
-    let rootless = |n| Attest {
-        roots: Vec::new(),
-        ..attest(3, n)
-    };
-    agent.lock().unwrap().log.push(vec![rootless(1)]);
+    agent.lock().unwrap().attests(vec![attest(3, 1)]);
     let node = Node::new(&agent, true);
     let (jobs, prover, venue) = (
         MemoryJobs::default(),
         Arc::new(Proofs::default()),
         Venue::at(after(3)),
     );
+    venue.anchor(3);
     let retry = Duration::from_millis(1);
     let options = Options { retry, ..options() };
     let mut worker = worker_with(&node, &jobs, &prover, &venue, options);
@@ -444,7 +525,7 @@ fn a_rootless_statement_outlasts_a_pause_and_a_lost_answer() {
     assert!(venue.submissions.load(Ordering::SeqCst) > 3 * MAX_RESUBMITS as usize);
 
     venue.lose_landed.store(true, Ordering::SeqCst);
-    agent.lock().unwrap().log.push(vec![rootless(2)]);
+    agent.lock().unwrap().attests(vec![attest(3, 2)]);
     while states(&jobs) != [State::Accepted, State::Accepted] {
         assert!(
             start.elapsed() < Duration::from_secs(30),
@@ -454,4 +535,39 @@ fn a_rootless_statement_outlasts_a_pause_and_a_lost_answer() {
         worker.step().unwrap();
     }
     assert_eq!(venue.accepted(), 2);
+}
+
+/// The count of a venue's failures to judge a statement is the job's: a
+/// restart between submissions does not reset it, and the statement is
+/// refused after [`MAX_RESUBMITS`] more all the same.
+#[test]
+fn resubmissions_are_counted_across_restarts() {
+    let agent = Arc::new(Mutex::new(Agent::default()));
+    agent.lock().unwrap().attests(vec![attest(3, 1)]);
+    let node = Node::new(&agent, true);
+    let (jobs, prover, venue) = (
+        MemoryJobs::default(),
+        Arc::new(Proofs::default()),
+        Venue::at(after(3)),
+    );
+    venue.anchor(3);
+    let retry = Duration::from_millis(1);
+    let options = Options { retry, ..options() };
+    *venue.refuse.lock().unwrap() = vec![0x1001; 64];
+    let start = std::time::Instant::now();
+    while states(&jobs) != [State::Refused(0x1001)] {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "{:?}",
+            states(&jobs)
+        );
+        // A fresh worker each step: a restart.
+        let mut worker = worker_with(&node, &jobs, &prover, &venue, options);
+        worker.step().unwrap();
+        std::thread::sleep(retry);
+    }
+    assert_eq!(
+        venue.submissions.load(Ordering::SeqCst),
+        MAX_RESUBMITS as usize + 1
+    );
 }

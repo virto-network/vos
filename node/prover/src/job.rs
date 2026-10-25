@@ -72,19 +72,24 @@ impl State {
     }
 }
 
-/// A statement's job: the agent whose record made it, the record's place
-/// in the agent's log, the record while it may be proved again, the
-/// statement, and its state.
+/// A statement's job: the agent whose record made it, the record's
+/// digest, the record while it may be proved again, the statement, and its
+/// state.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Job {
     pub agent: AgentId,
-    /// The log index of the work result that recorded it.
-    pub index: u64,
+    /// The digest of the attest's record ([`Attest::digest`]), which names
+    /// it in its agent's state (`vos_wire::keys::attested`).
+    pub attested: [u8; 32],
     /// The window whose cut the attest read at.
     pub window: u64,
-    /// How many times proving it began: a prover that panics or stops the
-    /// node on it gives up after [`MAX_ATTEMPTS`].
+    /// How many times proving it began, a stop of the node's own apart: a
+    /// prover that panics or stops the node on it gives up after
+    /// [`MAX_ATTEMPTS`].
     pub attempts: u32,
+    /// How many times it went again after a venue failed to judge it,
+    /// bounded by [`MAX_RESUBMITS`].
+    pub resubmits: u32,
     /// The record, kept until the job finishes: a proof another replica
     /// made may never arrive, and the statement is then proved here.
     pub attest: Option<Attest>,
@@ -94,20 +99,21 @@ pub struct Job {
 }
 
 impl Job {
-    /// A job of `attest`, recorded at `index` of `agent`'s log, stating
-    /// `statement`, in `state`.
+    /// A job of `agent`'s record `attest`, whose digest is `attested`,
+    /// stating `statement`, in `state`.
     pub fn new(
         agent: AgentId,
-        index: u64,
+        attested: [u8; 32],
         attest: Attest,
         statement: &Statement,
         state: State,
     ) -> Self {
         Self {
             agent,
-            index,
+            attested,
             window: attest.window.unwrap_or(0),
             attempts: 0,
+            resubmits: 0,
             attest: Some(attest),
             statement: statement.encode(),
             state,
@@ -119,8 +125,8 @@ impl Job {
         Statement::decode(&self.statement).ok()
     }
 
-    /// The earliest window its statement reads a root at; none for a
-    /// rootless statement, or one that does not decode.
+    /// The earliest window its statement reads a root at; none for one that
+    /// does not decode.
     pub(crate) fn earliest_window(&self) -> Option<u64> {
         self.statement()
             .and_then(|statement| statement.roots.iter().map(|root| root.window).min())
@@ -138,7 +144,7 @@ impl Job {
 
 /// The venue time by which every root `statement` reads stops being
 /// anchored, each `MaxRootAge` past its window's boundary on `clock`, the
-/// space's: `None` for a rootless statement, which no age ends.
+/// space's: `None` for a rootless statement, which no venue takes.
 pub fn deadline(statement: &Statement, clock: &WindowClock) -> Option<u64> {
     statement
         .roots
