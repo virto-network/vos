@@ -237,6 +237,10 @@ pub struct Claim<'a, R, Hash> {
     /// The public terms' logup sum under the relations, which the claimed
     /// sums must cancel; `None` for a set whose sums are not checked.
     pub public_sum: Option<&'a dyn Fn(&R) -> SecureField>,
+    /// Whether the claimed sums the public values fix
+    /// ([`MaskedComponents::public_sums`]) are theirs under the relations;
+    /// `None` for a set with none.
+    pub bound_sums: Option<&'a dyn Fn(&R, &[SecureField]) -> bool>,
     pub interaction_pow: u64,
     pub claimed_sums: &'a [SecureField],
 }
@@ -374,7 +378,7 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
         return Err(Error::InteractionPow);
     }
     channel.mix_u64(claim.interaction_pow);
-    let (relations, blind) = C::draw(&mut channel);
+    let (relations, blind) = C::draw(layout.active(), &mut channel);
     channel.mix_felts(claim.claimed_sums);
     scheme.commit(interaction_root, interaction_tree, &mut channel);
     if let Some(public_sum) = claim.public_sum {
@@ -387,6 +391,12 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
         if !total.is_zero() {
             return Err(Error::Logup);
         }
+    }
+    if claim
+        .bound_sums
+        .is_some_and(|bound| !bound(&relations, claim.claimed_sums))
+    {
+        return Err(Error::Logup);
     }
 
     let set = layout
@@ -554,6 +564,7 @@ pub fn verify_with(
             circuit: Some(Blake2bHash(*preprocessed_root)),
             public: &public,
             public_sum: Some(&public_sum),
+            bound_sums: None,
             interaction_pow: proof.interaction_pow,
             claimed_sums: &proof.claimed_sums,
         },

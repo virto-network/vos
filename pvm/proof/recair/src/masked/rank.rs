@@ -37,21 +37,27 @@ pub(crate) struct Revealed {
 struct Class {
     /// The class's columns' rows' level.
     log_size: u32,
+    /// `log2 h` of its columns' masks.
+    log_mask_rows: u32,
     secure: Vec<CirclePoint<SecureField>>,
     base: Vec<CirclePoint<BaseField>>,
 }
 
-/// R1 over `components` (their bounds the committed ones), sampled at
-/// `points` around `oods_point`, queried at `query_positions` of the
-/// lifting domain. `None` when the points do not fit the components.
+/// R1 over `components` (their bounds the committed ones), each masked by
+/// `2^mask_rows[c]` coefficients a column, sampled at `points` around
+/// `oods_point`, queried at `query_positions` of the lifting domain. `None`
+/// when the points do not fit the components.
 pub(crate) fn revealed_functionals(
     components: &Components<'_>,
     points: &TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>>,
     oods_point: CirclePoint<SecureField>,
     query_positions: &[usize],
     lifting_log_size: u32,
-    log_mask_rows: u32,
+    mask_rows: &[u32],
 ) -> Option<Revealed> {
+    if mask_rows.len() != components.components.len() {
+        return None;
+    }
     let composition = components
         .components
         .iter()
@@ -78,12 +84,12 @@ pub(crate) fn revealed_functionals(
         y: point.y.to_m31_array()[0],
     };
 
-    // A class: its level, its quotient's lift and its offsets.
-    type Key = (u32, u32, Vec<(u32, u32)>);
+    // A class: its level, its quotient's lift, its offsets and its `h`.
+    type Key = (u32, u32, Vec<(u32, u32)>, u32);
     let mut seen: Vec<Key> = Vec::new();
     let mut tree_offsets = vec![0usize; points.len()];
     let mut classes: Vec<Class> = Vec::new();
-    for component in &components.components {
+    for (component, &log_mask_rows) in components.components.iter().zip(mask_rows) {
         let bounds = component.trace_log_degree_bounds();
         let quotient_lift = composition.checked_sub(component.max_constraint_log_degree_bound())?;
         for (tree, tree_bounds) in bounds.iter().enumerate() {
@@ -105,7 +111,7 @@ pub(crate) fn revealed_functionals(
                 let mut offsets: Vec<(u32, u32)> =
                     shifts.iter().map(|shift| (shift.x.0, shift.y.0)).collect();
                 offsets.sort_unstable();
-                let class = (level, quotient_lift, offsets);
+                let class = (level, quotient_lift, offsets, log_mask_rows);
                 if seen.contains(&class) {
                     continue;
                 }
@@ -135,6 +141,7 @@ pub(crate) fn revealed_functionals(
                 }
                 classes.push(Class {
                     log_size,
+                    log_mask_rows,
                     secure,
                     base,
                 });
@@ -146,9 +153,14 @@ pub(crate) fn revealed_functionals(
         .map(|class| SECURE_EXTENSION_DEGREE * class.secure.len() + class.base.len())
         .max()
         .unwrap_or(0);
-    let independent = classes
-        .par_iter()
-        .all(|class| full_rank(class.log_size, log_mask_rows, &class.secure, &class.base));
+    let independent = classes.par_iter().all(|class| {
+        full_rank(
+            class.log_size,
+            class.log_mask_rows,
+            &class.secure,
+            &class.base,
+        )
+    });
     Some(Revealed {
         classes: classes.len(),
         rows,

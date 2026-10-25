@@ -40,6 +40,7 @@ mod layout;
 mod rank;
 mod rng;
 mod salts;
+pub mod segment;
 
 use std::time::{Duration, Instant};
 
@@ -105,6 +106,40 @@ pub(crate) fn lifting_log_size(format: &Format, log_sizes: &[u32]) -> Option<u32
         .max()?
         .checked_add(MASKED_LOG_CONSTRAINT_EXPANSION)?
         .checked_add(format.params.log_blowup)
+}
+
+/// Each component's `log2 h`: twice the rows a column of it reveals,
+/// `4|O| + q(|O| + 1)` for its widest set of offsets `O` and the format's `q`
+/// queries (`docs/design/proving.md` §8), rounded up to a power of two, at
+/// most the format's `h`. A component none of whose masked columns reads a
+/// second row takes about half the `h` of one that does; R1 checks each on
+/// every transcript. `None` for an unmasked format, or a set whose masks do
+/// not fit its trees.
+pub fn mask_rows(format: &Format, set: &impl MaskedComponents) -> Option<Vec<u32>> {
+    let format_rows = format.masking?.log_mask_rows;
+    let queries = format.params.n_queries;
+    let air_level = air::air_log_size(set)?;
+    set.components()
+        .into_iter()
+        .map(|component| {
+            let offsets = component
+                .mask_points(CirclePoint::zero(), air_level)
+                .iter()
+                .skip(1)
+                .flatten()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(0);
+            if offsets == 0 {
+                return Some(format_rows);
+            }
+            let revealed = offsets
+                .checked_mul(4)?
+                .checked_add(queries.checked_mul(offsets.checked_add(1)?)?)?;
+            let rows = revealed.checked_mul(2)?.checked_next_power_of_two()?;
+            Some(rows.ilog2().min(format_rows))
+        })
+        .collect()
 }
 
 /// The preprocessed columns as a masked format commits them: interpolated
@@ -225,7 +260,9 @@ pub type Interaction<'a, R> =
 
 /// What the masked prover proves: a component set's columns, unmasked, at
 /// their rows' level.
-pub struct MaskedTrace<'a, R> {
+pub struct MaskedTrace<'a, R, A = ()> {
+    /// The components the set holds ([`MaskedComponents::Active`]).
+    pub active: A,
     /// Each component's log size, in commitment order.
     pub log_sizes: &'a [u32],
     /// The preprocessed columns, in commitment order.
@@ -267,14 +304,17 @@ pub struct MaskStats {
 /// digest.
 ///
 /// The claimed sums are blinded (R2) by values summing to zero, so their
-/// total is the unblinded one. A set of one component is therefore left
-/// unblinded: its claimed sum is in the clear, and its verifier must check
-/// it against a public total (`claimed + public = 0`), which makes it
-/// public; a verifier that checks no total would leave a witness-dependent
-/// value in the clear.
+/// total is the unblinded one; the sums the public values fix
+/// ([`MaskedComponents::public_sums`]) are left unblinded. A set of one
+/// blinded component is therefore left unblinded: its claimed sum is in the
+/// clear, and its verifier must check it against a public total
+/// (`claimed + public = 0`), which makes it public; a verifier that checks no
+/// total would leave a witness-dependent value in the clear.
+///
+/// Each component's mask takes its own `h` ([`mask_rows`]).
 pub fn prove_masked<MC: MerkleChannel, C: MaskedProvers>(
     format: &Format,
-    trace: MaskedTrace<'_, C::Relations>,
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
     rng: MaskRng,
 ) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
 where
@@ -291,7 +331,7 @@ where
 #[cfg(feature = "seeded-masks")]
 pub fn prove_masked_unchecked<MC: MerkleChannel, C: MaskedProvers>(
     format: &Format,
-    trace: MaskedTrace<'_, C::Relations>,
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
     rng: MaskRng,
 ) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
 where
@@ -302,9 +342,9 @@ where
 
 /// [`prove_masked`], the out-of-domain check of the constraints made when
 /// `check_constraints`.
-fn prove_masked_checked<MC: MerkleChannel, C: MaskedProvers>(
+pub(crate) fn prove_masked_checked<MC: MerkleChannel, C: MaskedProvers>(
     format: &Format,
-    trace: MaskedTrace<'_, C::Relations>,
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
     rng: MaskRng,
     check_constraints: bool,
 ) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
@@ -335,7 +375,20 @@ where
         &trace.main,
     );
     drawn::note("the witness digest", &witness);
-    let layouts = layout::layouts(trace.log_sizes, masking.log_mask_rows)?;
+    let set_layout = C::layout(trace.active, trace.log_sizes).ok_or(ProveError::TraceShape(
+        "the component set refuses its log sizes",
+    ))?;
+    let mask_rows = mask_rows(format, &set_layout)
+        .ok_or(ProveError::Masking("the set's masks do not fit its trees"))?;
+    let public_sums = set_layout.public_sums();
+    drop(set_layout);
+    let classes: Vec<(u32, u32)> = trace
+        .log_sizes
+        .iter()
+        .copied()
+        .zip(mask_rows.iter().copied())
+        .collect();
+    let layouts = layout::layouts(&classes)?;
     let preprocessed = extend_preprocessed(trace.preprocessed, &twiddles);
     let mut main = Vec::with_capacity(trace.main.len());
     for (columns, &log_size) in trace.main.into_iter().zip(trace.log_sizes) {
@@ -352,6 +405,9 @@ where
     let setup = Setup {
         format,
         masking,
+        active: trace.active,
+        mask_rows: &mask_rows,
+        public_sums: &public_sums,
         composition,
         lifting,
         twiddles: &twiddles,
@@ -377,9 +433,14 @@ where
 }
 
 /// What every attempt shares.
-struct Setup<'a, R> {
+struct Setup<'a, R, A> {
     format: &'a Format,
     masking: Masking,
+    active: A,
+    /// Each component's `log2 h`.
+    mask_rows: &'a [u32],
+    /// The components left unblinded.
+    public_sums: &'a [usize],
     composition: u32,
     lifting: u32,
     twiddles: &'a TwiddleTree<SimdBackend>,
@@ -409,7 +470,7 @@ type Attempt<H> = Option<(MaskedProof<H>, R1)>;
 
 /// One attempt from `rng`'s stream.
 fn prove_once<MC: MerkleChannel, C: MaskedProvers>(
-    setup: &Setup<'_, C::Relations>,
+    setup: &Setup<'_, C::Relations, C::Active>,
     preprocessed: &[CircleCoefficients<SimdBackend>],
     main: &[Vec<CircleCoefficients<SimdBackend>>],
     rng: &mut ChaCha20Rng,
@@ -436,7 +497,7 @@ where
         format.interaction_pow_bits(),
     );
     channel.mix_u64(interaction_pow);
-    let (relations, blind) = C::draw(channel);
+    let (relations, blind) = C::draw(setup.active, channel);
 
     let claimed_sums = commit_interaction(
         setup,
@@ -509,8 +570,8 @@ where
 
 /// The main tree: each component's columns, then its blinding columns, all
 /// masked, then the salts. Returns the blinding values.
-fn commit_main<MC: MerkleChannel, R>(
-    setup: &Setup<'_, R>,
+fn commit_main<MC: MerkleChannel, R, A>(
+    setup: &Setup<'_, R, A>,
     scheme: &mut Scheme<'_, MC>,
     main: &[Vec<CircleCoefficients<SimdBackend>>],
     rng: &mut ChaCha20Rng,
@@ -519,16 +580,21 @@ fn commit_main<MC: MerkleChannel, R>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    let blinding = blinding(setup.log_sizes.len(), rng);
+    let blinding = blinding(setup.log_sizes.len(), setup.public_sums, rng);
     let blinding_columns: Vec<Vec<CircleCoefficients<SimdBackend>>> = blinding
         .iter()
         .zip(setup.log_sizes)
         .map(|(&value, &log_size)| blinding_polys(value, log_size, setup.twiddles))
         .collect();
-    let columns: Vec<&CircleCoefficients<SimdBackend>> = main
+    let columns: Vec<(&CircleCoefficients<SimdBackend>, u32)> = main
         .iter()
         .zip(&blinding_columns)
-        .flat_map(|(own, blinding)| own.iter().chain(blinding))
+        .zip(setup.mask_rows)
+        .flat_map(|((own, blinding), &log_mask_rows)| {
+            own.iter()
+                .chain(blinding)
+                .map(move |column| (column, log_mask_rows))
+        })
         .collect();
     let masked = layout::mask_columns(&columns, setup.layouts, rng)?;
     drop(blinding_columns);
@@ -546,8 +612,8 @@ where
 /// The interaction tree under the drawn `(relations, blind)`: the blinded
 /// claimed sums mixed, then the columns masked and salted. Returns the
 /// blinded claimed sums.
-fn commit_interaction<MC: MerkleChannel, R>(
-    setup: &Setup<'_, R>,
+fn commit_interaction<MC: MerkleChannel, R, A>(
+    setup: &Setup<'_, R, A>,
     scheme: &mut Scheme<'_, MC>,
     (relations, blind): (&R, &BlindRelation),
     blinding: &[SecureField],
@@ -573,6 +639,13 @@ where
         ));
     }
     let claimed_sums: Vec<SecureField> = interaction_columns.iter().map(|(_, sum)| *sum).collect();
+    let column_rows: Vec<u32> = interaction_columns
+        .iter()
+        .zip(setup.mask_rows)
+        .flat_map(|((columns, _), &log_mask_rows)| {
+            core::iter::repeat_n(log_mask_rows, columns.len())
+        })
+        .collect();
     let polys = SimdBackend::interpolate_columns(
         interaction_columns
             .into_iter()
@@ -580,7 +653,9 @@ where
             .collect(),
         setup.twiddles,
     );
-    let masked = layout::mask_columns(&polys.iter().collect::<Vec<_>>(), setup.layouts, rng)?;
+    let columns: Vec<(&CircleCoefficients<SimdBackend>, u32)> =
+        polys.iter().zip(column_rows).collect();
+    let masked = layout::mask_columns(&columns, setup.layouts, rng)?;
     drop(polys);
     channel.mix_felts(&claimed_sums);
     salts::commit_salted(
@@ -597,14 +672,21 @@ where
 /// The component set at the drawn relations and the blinded claimed sums,
 /// its composition at the setup's bound, and its AIR level.
 fn masked_set<C: MaskedProvers>(
-    setup: &Setup<'_, C::Relations>,
+    setup: &Setup<'_, C::Relations, C::Active>,
     relations: &C::Relations,
     blind: &BlindRelation,
     claimed_sums: &[SecureField],
 ) -> Result<(C, u32), ProveError> {
-    let set = C::new(relations, blind, setup.log_sizes, claimed_sums).ok_or(
-        ProveError::TraceShape("the component set refuses its log sizes or claimed sums"),
-    )?;
+    let set = C::new(
+        setup.active,
+        relations,
+        blind,
+        setup.log_sizes,
+        claimed_sums,
+    )
+    .ok_or(ProveError::TraceShape(
+        "the component set refuses its log sizes or claimed sums",
+    ))?;
     if air::composition_log_degree_bound(&set) != Some(setup.composition) {
         return Err(ProveError::Masking(
             "the set's composition bound is not its tallest log size plus 2",
@@ -618,8 +700,8 @@ fn masked_set<C: MaskedProvers>(
 /// The composition tree: the composition's 4 coordinates whole at its
 /// bound, the FRI mask `R`'s uniform columns, the salts. Returns the
 /// composition coefficient drawn before it.
-fn commit_composition<MC: MerkleChannel, R>(
-    setup: &Setup<'_, R>,
+fn commit_composition<MC: MerkleChannel, R, A>(
+    setup: &Setup<'_, R, A>,
     scheme: &mut Scheme<'_, MC>,
     provers: &ComponentProvers<'_, SimdBackend>,
     rng: &mut ChaCha20Rng,
@@ -665,8 +747,8 @@ where
 
 /// `set`'s sample points around `oods_point`, checked to fit the committed
 /// trees with no salt sampled.
-fn checked_points<MC: MerkleChannel, R>(
-    setup: &Setup<'_, R>,
+fn checked_points<MC: MerkleChannel, R, A>(
+    setup: &Setup<'_, R, A>,
     set: &impl MaskedComponents,
     scheme: &Scheme<'_, MC>,
     oods_point: CirclePoint<SecureField>,
@@ -699,8 +781,8 @@ where
 /// R1 on the transcript: the randomizer's revealed functionals at `points`
 /// and the queried `query_positions`, timed. `None` when they are not of
 /// full rank.
-fn rank_check<R>(
-    setup: &Setup<'_, R>,
+fn rank_check<R, A>(
+    setup: &Setup<'_, R, A>,
     components: &Components<'_>,
     points: &Points,
     oods_point: CirclePoint<SecureField>,
@@ -713,7 +795,7 @@ fn rank_check<R>(
         oods_point,
         query_positions,
         setup.lifting,
-        setup.masking.log_mask_rows,
+        setup.mask_rows,
     )
     .ok_or(ProveError::Masking(
         "R1's column classes do not fit the sample points",
@@ -726,14 +808,24 @@ fn rank_check<R>(
     }))
 }
 
-/// The blinding values (R2), one a component: uniform but the last, which
-/// makes them sum to zero, so the claimed sums' total is the unblinded one.
-/// A set of one component is left unblinded.
-fn blinding(n_components: usize, rng: &mut ChaCha20Rng) -> Vec<SecureField> {
-    let mut values: Vec<SecureField> = (1..n_components)
+/// The blinding values (R2), one a component: zero for the components
+/// `public` names, uniform for the others but the last, which makes them sum
+/// to zero, so the claimed sums' total is the unblinded one. A set of one
+/// blinded component is left unblinded.
+fn blinding(n_components: usize, public: &[usize], rng: &mut ChaCha20Rng) -> Vec<SecureField> {
+    let blinded: Vec<usize> = (0..n_components)
+        .filter(|component| !public.contains(component))
+        .collect();
+    let drawn: Vec<SecureField> = (1..blinded.len())
         .map(|_| SecureField::from_m31_array(core::array::from_fn(|_| rng.r#gen())))
         .collect();
-    values.push(-values.iter().copied().sum::<SecureField>());
+    let mut values = vec![SecureField::zero(); n_components];
+    for (&component, &value) in blinded.iter().zip(&drawn) {
+        values[component] = value;
+    }
+    if let Some(&last) = blinded.last() {
+        values[last] = -drawn.iter().copied().sum::<SecureField>();
+    }
     for value in &values {
         let limbs: Vec<u8> = value
             .to_m31_array()

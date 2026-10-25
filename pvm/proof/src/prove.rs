@@ -254,7 +254,7 @@ pub fn prepare_side_note_for_verification(side_note: &mut SideNote) {
 /// Backfill `initial_regs` from the first step's `regs_before` if the
 /// caller left it at the default all-zero but the tracer recorded
 /// non-zero initial state (segment slicers set it explicitly).
-fn backfill_initial_regs(side_note: &mut SideNote) {
+pub(crate) fn backfill_initial_regs(side_note: &mut SideNote) {
     if !side_note.steps.is_empty() && side_note.initial_regs.iter().all(|&r| r == 0) {
         let first = &side_note.steps[0];
         let n = crate::core::step::NUM_REGS.min(first.regs_before.len());
@@ -265,7 +265,7 @@ fn backfill_initial_regs(side_note: &mut SideNote) {
 /// Backfill `final_regs` from the last step's `regs_after`. Always
 /// overwrites (not gated on all-zero like `initial_regs`) so a stale
 /// value can never ship as the claimed final state.
-fn backfill_final_regs(side_note: &mut SideNote) {
+pub(crate) fn backfill_final_regs(side_note: &mut SideNote) {
     if !side_note.steps.is_empty() {
         let last = &side_note.steps[side_note.steps.len() - 1];
         let n = crate::core::step::NUM_REGS.min(last.regs_after.len());
@@ -290,7 +290,7 @@ fn backfill_final_regs(side_note: &mut SideNote) {
 /// handling, while CpuChip's four-limb lookup has no fifth carry. Reject such
 /// hand-built witnesses canonically instead of admitting backend-dependent
 /// overflow or an unbalanced lookup.
-fn validate_memory_witnesses(side_note: &SideNote) -> Result<(), ProvingError> {
+pub(crate) fn validate_memory_witnesses(side_note: &SideNote) -> Result<(), ProvingError> {
     const ADDRESS_SPACE_SIZE: u64 = 1u64 << 32;
 
     if side_note.memory_layout().is_none() {
@@ -445,7 +445,7 @@ impl<'a> Sizes<'a> {
 
 /// The components' main traces: the producers in order, filling the side
 /// note's multiplicities, then the consumers in parallel.
-fn generate_component_traces(
+pub(crate) fn generate_component_traces(
     side_note: &mut SideNote,
     components: &[&dyn crate::framework::MachineProverComponent],
     min_log_sizes: &[u32],
@@ -488,7 +488,7 @@ fn generate_component_traces(
 
 /// The boundary states a proof ships: the sparse-image hashes and the
 /// page-Merkle roots the boundary chips bind.
-fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
+pub(crate) fn derive_segment_states(side_note: &SideNote) -> (SegmentState, SegmentState) {
     let (root_before, root_after) = segment_memory_roots(side_note);
     let initial_state = if side_note.steps.is_empty() {
         SegmentState {

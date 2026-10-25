@@ -28,6 +28,7 @@ use crate::prove::ProveError;
 #[derive(Clone, Debug)]
 pub(crate) struct MaskLayout {
     log_size: u32,
+    log_mask_rows: u32,
     /// `f`'s `i`-th coefficient's position at `log_size + 1`.
     lower: Vec<usize>,
     /// The `h` positions `v_H·r` spans at `log_size + 1`, none of `lower`'s.
@@ -108,6 +109,7 @@ impl MaskLayout {
         }
         Ok(Self {
             log_size,
+            log_mask_rows,
             lower,
             upper,
         })
@@ -136,24 +138,22 @@ impl MaskLayout {
     }
 }
 
-/// The layouts for every size among `log_sizes`, built in parallel.
-pub(crate) fn layouts(
-    log_sizes: &[u32],
-    log_mask_rows: u32,
-) -> Result<Vec<MaskLayout>, ProveError> {
-    let mut sizes = log_sizes.to_vec();
-    sizes.sort_unstable();
-    sizes.dedup();
-    sizes
+/// The layouts for every component's size and `h` among `classes`, each a
+/// `(log_size, log_mask_rows)`, built in parallel.
+pub(crate) fn layouts(classes: &[(u32, u32)]) -> Result<Vec<MaskLayout>, ProveError> {
+    let mut classes = classes.to_vec();
+    classes.sort_unstable();
+    classes.dedup();
+    classes
         .into_par_iter()
-        .map(|log_size| MaskLayout::new(log_size, log_mask_rows))
+        .map(|(log_size, log_mask_rows)| MaskLayout::new(log_size, log_mask_rows))
         .collect()
 }
 
-/// Each of `polys` masked by its size's layout, in parallel, one 32-byte
-/// seed a column drawn from `rng` in order.
+/// Each of `polys`, with its `log2 h`, masked by its size's layout at that
+/// `h`, in parallel, one 32-byte seed a column drawn from `rng` in order.
 pub(crate) fn mask_columns(
-    polys: &[&CircleCoefficients<SimdBackend>],
+    polys: &[(&CircleCoefficients<SimdBackend>, u32)],
     layouts: &[MaskLayout],
     rng: &mut ChaCha20Rng,
 ) -> Result<Vec<CircleCoefficients<SimdBackend>>, ProveError> {
@@ -164,10 +164,12 @@ pub(crate) fn mask_columns(
     polys
         .par_iter()
         .zip(seeds)
-        .map(|(poly, seed)| {
+        .map(|(&(poly, log_mask_rows), seed)| {
             let layout = layouts
                 .iter()
-                .find(|layout| layout.log_size == poly.log_size())
+                .find(|layout| {
+                    layout.log_size == poly.log_size() && layout.log_mask_rows == log_mask_rows
+                })
                 .ok_or(ProveError::Masking("a column of a size with no layout"))?;
             layout.mask(poly, &mut ChaCha20Rng::from_seed(seed))
         })

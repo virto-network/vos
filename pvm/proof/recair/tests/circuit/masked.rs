@@ -18,6 +18,7 @@ use vos_pvm_proof::format::{MASKED_WRAP, MASKED_WRAP_REFERENCE, SEGMENT_REFERENC
 use vos_pvm_proof::framework_access::{
     AllLookupElements, draw_all_lookup_elements, drive_chip_oods,
 };
+use vos_pvm_proof::masked::{SegmentComponents, drive_masked_chip};
 use vos_pvm_proof::security::{SecurityShape, proven_count};
 use vos_pvm_recair_air::gate::{GATE_WIDTH, GateRelation};
 use vos_pvm_recair_air::h8::H8Eval;
@@ -152,6 +153,49 @@ fn the_segment_chips_pass_the_degree_audit_under_c() {
     }
     assert_eq!(degrees.len(), SEGMENT_REFERENCE.constraints as usize);
     assert_eq!(histogram(&degrees), [0, 23, 4395, 759]);
+}
+
+/// R5 on the masked segment: each chip's masked evaluation (its constraints,
+/// its blinding fraction joined to its last batch) keeps every constraint of
+/// the chip at its degree, so the masked set holds the segment AIR's 5,177
+/// constraints, none above 3; and the set built at its layout declares them.
+#[test]
+fn the_masked_segment_chips_pass_the_degree_audit() {
+    let count = vos_pvm_proof::chip_idx::COUNT;
+    let mask = vos_pvm_proof::chip_idx::ALL;
+    let channel = &mut Blake2sChannel::default();
+    let lookups = SegmentComponents::draw_relations(mask, channel);
+    let blind = BlindRelation::draw(channel);
+    let mut degrees = Vec::new();
+    for chip in 0..count {
+        let name = vos_pvm_proof::chip_idx::NAMES[chip];
+        let info = drive_masked_chip(chip, 10, &lookups, &blind, InfoEvaluator::empty());
+        let preprocessed = preprocessed_of(&info);
+        let preprocessed: Vec<&str> = preprocessed.iter().map(String::as_str).collect();
+        let recorded = drive_masked_chip(chip, 10, &lookups, &blind, ExprEvaluator::new());
+        let counted = audit(name, &recorded, &preprocessed);
+        assert_eq!(counted.len(), info.n_constraints, "{name}");
+        let plain = drive_chip_oods(chip, 10, &lookups, InfoEvaluator::empty());
+        assert_eq!(counted.len(), plain.n_constraints, "{name}");
+        degrees.extend(counted);
+    }
+    assert_eq!(degrees.len(), SEGMENT_REFERENCE.constraints as usize);
+    assert_eq!(histogram(&degrees), [0, 23, 4395, 759]);
+    let built = SegmentComponents::layout(mask, &[10; 25]).unwrap();
+    assert_eq!(
+        built
+            .components()
+            .iter()
+            .map(|component| component.n_constraints())
+            .sum::<usize>(),
+        degrees.len()
+    );
+    assert!(
+        built
+            .components()
+            .iter()
+            .all(|component| component.max_constraint_log_degree_bound() == 12)
+    );
 }
 
 /// The masked wrap's shape, read from the built components' own layout:

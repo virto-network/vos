@@ -97,6 +97,8 @@ pub enum ProveError {
     Masking(&'static str),
     /// The operating system's randomness is unavailable.
     Entropy,
+    /// The segment's run cannot be traced over its chips.
+    Segment(String),
 }
 
 impl core::fmt::Display for ProveError {
@@ -110,6 +112,7 @@ impl core::fmt::Display for ProveError {
             Self::TraceShape(what) => write!(f, "the trace: {what}"),
             Self::Masking(what) => write!(f, "the masking: {what}"),
             Self::Entropy => f.write_str("no randomness from the operating system"),
+            Self::Segment(error) => write!(f, "the segment: {error}"),
         }
     }
 }
@@ -322,6 +325,7 @@ where
     let (proof, stats) = masked::prove_masked::<MC, WrapComponents>(
         format,
         MaskedTrace {
+            active: (),
             log_sizes: &log_sizes,
             preprocessed: preprocessed_evaluations(circuit),
             main: main_columns,
