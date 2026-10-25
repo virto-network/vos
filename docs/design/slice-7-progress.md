@@ -387,3 +387,171 @@ again [measured]: 1,036 s, the same verdicts, latency 47.5 s at Kreivo and
 60.8–109.0 s at JAM, each under its gate; the audit clean over 398
 carriers.
 
+
+## Step 7.2: the node's anchoring simplified
+
+C2, C3 and C5 (pin D′) on the node, from vos-core `62981f95`, in three
+commits and a doc pass.
+
+**The node key alone (C2):** a node signs its space's anchors with its
+node key, and replicates the representative while the venue lists that
+key. The rotatable anchor keys of 6.14b go: `anchor_keys.rs`, their store
+rows (`NodeRow` tag `0x0f`, reserved), the storage change that wrote them,
+the rotation API and `vos node anchor-key rotate`, and the leader's
+`key_refused` memo.
+
+**One outcome (C5):** every venue client answers an anchor with
+`AnchorOutcome { Taken, NotYet, Never(u32), Unlisted(u32), Stopped(u32) }`,
+the raw code kept for the log, each client mapping its venue's codes by
+one table tested against every code: the model venue's rule refusals
+(`model::outcome`), Kreivo's pallet errors (`send::outcome_of`) and the JAM
+service's anchor codes (`venue::outcome`). A submit's outcome is
+`SubmitOutcome { Accepted, Refused(u32), Retry(u32) }`, a repeat accepted at
+one site (`SubmitOutcome::judged`); the prover worker maps it, a venue's
+failure to judge still bounded by `MAX_RESUBMITS`, the rest retried until
+the anchor ages (C7 left no rootless branch). `AnchorRefusal` (8),
+`Anchored` (3), `NotAccepted` (2), `Unjudged` (3), the queue's `Fate` (4 → 2),
+Kreivo's `Answer` (7) and `transient` go.
+
+**No hand-back, a replicated row (C3):**
+- The representative's close of each window, the commit that finishes its
+  cut's build, writes `anchor(w) = S_w` (`keys::anchor`, node-local, the
+  same bytes on every replica, kept for `MaxRootAge`). The representative
+  keeps two cut roots, as every agent does.
+- Its leader signs only those rows, never a root of a batch under
+  proposal, in window order, with the node key, before each batch and
+  every 2 s while a row waits. A window settles once the client reads the
+  venue holding its root, or the venue never takes it; one past
+  `MaxRootAge` by the venue's time settles unsent.
+- The divergence guard: where the venue holds another root, the leader
+  asks the replicas for their rows (`PeerMessage::AnchorRow`), and sends
+  its anchor, the evidence that ends the space, only once a quorum of the
+  group holds its root and no replica another. A replica holding another
+  is an alert ("divergent replicas"), nothing sent.
+- `Unlisted`: the leader hands its leadership to a replica whose node key
+  the client's listing holds (`Local::Transfer`, Raft's
+  `transfer_leadership`), at most once a window of the space's clock; with
+  none listed it alerts and waits.
+- The queue only resends the same bytes until the venue answers
+  (`Fate::{Done, Again}`); the client keeps the answer and answers the
+  leader's next offer from its reads. `VenueClient::unsettled`, the
+  queue's held-back windows, `recheck`, `push_listed`, the leader's
+  `signed`/`foreign`/`seeded`/`refused` bookkeeping, `take_up` and
+  `seed_waiting` go.
+- The three reads pin D′ keeps (status, `AnchorKeys`, `Last`/`Anchors[w]`
+  through the new `VenueClient::held`) answer from a cache the client
+  fills on its own thread: Kreivo's reader reads the windows the leader
+  asks of; jam-dev's client gained a reader thread (it read on the batch
+  thread before). A client sends nothing over another root unless the
+  leader offered it after reading that root.
+- The leader's alerts are kept for operators and tests
+  (`Node::anchor_alerts`).
+
+**Folded:** slice 6's L5 (jam-dev's `push` wedge: no push refuses a signer
+now) and the untested once-a-window recheck, both gone with the hand-back.
+
+**The doc pass:** `spaces-pallet.md` §9 (the 7.1 review's L6: the five
+outcomes and the client's table, no hand-back, the reads), §1's
+authorities; `proving.md` §7; `docs/operations.md` (new: the node key as
+the anchor key, replacing a node, a restored backup or a cloned store as a
+compromised key, the alerts, an ended space's re-founding).
+
+**Tests:** the cluster's `anchoring` suite (13): anchors in order across a
+leader change; a deposed leader stopped before its close and a successor
+whose clock lags both offering window 0, one root, no evidence; the
+divergence guard (a replica's row forged: no evidence, the alert); an
+equivocation ending the space (the replicas agreeing: the evidence goes,
+`Ended`); an unlisted leader handing off to a listed replica, which
+anchors; one handoff a window (the listed replica down: one handoff, then
+a wait; back, the next window hands off again); no replica listed (alert,
+wait, anchored once listed); a delisted node refused the representative
+and replaced; a non-founding node representing once registered; a long
+wait across a failover; an aged window settled unsent; windows refused
+unregistered. Every venue code through each client's table (the model's,
+Kreivo's, JAM's). The cuts checker also checks the replicas' anchor rows
+agree and every anchor is its row.
+
+**The leader's anchoring, against `simplify.md` §4:** its state is four
+fields (the last window settled, the last pass, the last alert, the last
+handoff's window), from nine; its waits are one recheck (2 s), which a
+pass reaches five ways (an unread root, not yet, unlisted, stopped, an
+unsure guard), from sixteen wait, retry or settle paths. The plan's
+"about two" fields was low (below).
+
+**Lines** (`git diff --numstat 62981f95`):
+
+| crate | added | removed |
+|---|---|---|
+| vos-node (src) | +451 | −680 |
+| vos-node (tests) | +805 | −814 |
+| vos-venue (src) | +505 | −694 |
+| vos-venue (tests) | +173 | −133 |
+| vos-jam-dev | +412 | −129 |
+| vos-node-prover (src) | +32 | −71 |
+| vos-node-prover (tests) | +13 | −41 |
+| vos-cli (src) | +1 | −30 |
+| vos-cli (tests) | +0 | −33 |
+| vos-wire (src) | +42 | −2 |
+| vos-wire (tests) | +15 | −0 |
+| vos-checker | +5 | −5 |
+| vos-pvm-proof (tests) | +10 | −14 |
+| docs | +138 | −32 |
+
+The leader's anchoring is 355 lines (the guard, the handoff and the
+alerts among them), from 409 plus `anchor_keys.rs`'s 176; the queue's code
+181 lines, from 338.
+
+**Unchanged:** the node's kernel program ids
+(`the_program_ids_are_the_repositorys` passes). The agent image's bytes
+change: any change to `vos-wire` changes its symbols' crate hash, and the
+guard's two messages are `vos-wire`'s; nothing pins the image before 7.8b's
+`blobs.lock`.
+
+**Gates** [measured]:
+- `just check` green.
+- The checker loop, `EXACTLY_ONCE_SEED` 7201–7204 with `CUTS_FULL`, the
+  three exactly-once tests and `cuts`: green, 137–201 s a seed at load
+  21–25; 58–71 anchors a seed, one a window, every one the replicas' row,
+  no evidence.
+- `just e2e-chain` green on its fourth run, 1,059 s: the same verdicts as
+  7.1's; latency 49.5 s at Kreivo and 72.3–120.2 s at JAM, each under its
+  gate; Kreivo's sovereign charged 7.5 UNITS (5 anchors, 2 submits, one
+  deposit forfeited; 7.1: 9 anchors, 11.5 UNITS: window 0, before the
+  registration, is no longer sent again after its refusal); the audit
+  clean over 565 carriers. The three runs before it failed:
+  - the Kreivo client alerted window 0's `WindowNotAfterLast`, a window
+    before the registration: fixed, that refusal is routine and quiet;
+  - the representative's creation `Unconfirmed` at JAM: its client had not
+    yet read the space on its own thread, so listed no key; the run now
+    waits for the read, as it waits for Kreivo's;
+  - a JAM package the node took without a work report within 90 s, at the
+    audit, under a host load of about 24; not seen again.
+
+**Where the plan was off:**
+- **"The representative's close writes `anchor(w)` by apply":** the row is
+  written by the commit that finishes the representative's cut build
+  (where its close is made, `closing(w)`), not by the agent's apply of
+  `Input::Close`: that input carries the root only when a path is sent,
+  and writing it there changes the agent image. The cut is fixed by the
+  committed log, so the row is the same bytes on every replica, which is
+  what the guard compares (`plan3-fable.md` verified the closing row's
+  determinism).
+- **The divergence guard needs a quorum, not only "none differs":** a
+  replica that has not built the cut answers no row, so "none differs"
+  alone would send evidence on the leader's row unchecked.
+- **"One handoff a window"** is per window of the space's clock, not per
+  window anchored: keyed on the window anchored, a failed handoff (the
+  target down) would never be retried.
+- **`SubmitOutcome::Retry` carries its code:** the log, the e2e's checks
+  (`Retry(5)`) and the worker's bound on a venue's failures to judge need
+  it.
+- **The leader's state is four fields, not about two;** the wait paths
+  one, reached five ways.
+- **Node-side lines:** vos-node's source fell by 229, not the 1,000–1,400
+  `simplify.md` §4 counts for C1–C11 on the node: most of that is C9–C11's
+  (7.3). jam-dev grew by 283 for its reader thread, which pin D′'s
+  off-the-batch-thread reads ask of every client.
+- **`docs/operations.md` did not exist** on vos-core; 7.2 starts it.
+- **The venue `Status` keeps its four variants:** the leader no longer
+  reads it but for the guard's skip of an ended space; the pin keeps the
+  status read.
