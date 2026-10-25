@@ -35,7 +35,7 @@ use vos_pvm_recair_air::gate::public_logup_sum;
 use vos_pvm_recair_air::transcript::{Prefix, replay_prefix};
 use vos_pvm_recair_air::{Components, LOG_CONSTRAINT_EXPANSION};
 
-use crate::masked::TREES;
+use crate::masked::{TREES, samples_fit};
 use crate::{
     Error, LAYOUT, LOG_SIZES, MAX_PROOF_BYTES, PREPROCESSED_ROOT, PUBLIC_WORDS, Statement,
     WrapProof, embed, mix_header, secure_is_canonical, stark_is_canonical,
@@ -156,17 +156,14 @@ fn check_header(proof: &WrapProof) -> Result<(), Error> {
 /// and every M31 limb canonical. The sampled values' columns are checked
 /// against the components' masks by `check_samples`.
 fn check_shape(stark: &StarkProof<Blake2bMerkleHasher>) -> Result<(), Error> {
-    if stark.commitments.len() != TREES {
-        return Err(Error::Shape("four commitments"));
-    }
-    if stark.sampled_values.len() != TREES {
-        return Err(Error::Shape("four trees of sampled values"));
-    }
-    if stark.decommitments.len() != TREES {
-        return Err(Error::Shape("four decommitments"));
-    }
-    if stark.queried_values.len() != TREES {
-        return Err(Error::Shape("four trees of queried values"));
+    if [
+        stark.commitments.len(),
+        stark.sampled_values.len(),
+        stark.decommitments.len(),
+        stark.queried_values.len(),
+    ] != [TREES; 4]
+    {
+        return Err(Error::Shape("four trees"));
     }
     if !stark_is_canonical(stark) {
         return Err(Error::Noncanonical);
@@ -194,18 +191,7 @@ fn check_samples(
         .ok_or(Error::Shape("the composition's degree bound"))?;
     let mut masks = air.mask_points(CirclePoint::zero(), max_log_degree_bound, false);
     masks.push(alloc::vec![alloc::vec![CirclePoint::zero()]; 2 * SECURE_EXTENSION_DEGREE]);
-    let matches = masks.len() == stark.sampled_values.len()
-        && masks
-            .iter()
-            .zip(stark.sampled_values.iter())
-            .all(|(tree, values)| {
-                tree.len() == values.len()
-                    && tree
-                        .iter()
-                        .zip(values)
-                        .all(|(points, values)| points.len() == values.len())
-            });
-    if !matches {
+    if !samples_fit(&masks, &stark.sampled_values) {
         return Err(Error::Shape("a column's samples are not its mask's"));
     }
     Ok(())

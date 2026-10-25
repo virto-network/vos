@@ -244,7 +244,7 @@ pub struct Claim<'a, R, Hash> {
 }
 
 /// Each column of `values` holds one value for each of its sample points.
-fn samples_fit<P, V>(
+pub(crate) fn samples_fit<P, V>(
     points: &TreeVec<ColumnVec<Vec<P>>>,
     values: &TreeVec<ColumnVec<Vec<V>>>,
 ) -> bool {
