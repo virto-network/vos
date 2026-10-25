@@ -844,10 +844,9 @@ last for decades.**
   still move the sovereign's funds. The space founds again under a new
   genesis. An honest node raises it: the representative's leader, finding
   the venue holding another root at a window whose row it holds, sends
-  its anchor as the evidence once its divergence guard passes (a quorum
-  of the replicas holds the same row, none another; a replica holding
-  another is an apply bug or a cloned store, and nothing is sent), and
-  alerts. A second root at a
+  its anchor as the evidence once its divergence guard passes: a quorum
+  of the replicas holds the same row (S34), any dissenting replica alerted
+  by name with its root; without a quorum nothing is sent. A second root at a
   window past `MaxRootAge` is refused as aged, never evidence
   (`slice-7-mobile.md`, pin D′; `spaces-pallet.md` §6.1, vector G5).
 - **Known limits** (carried): any single founding key registers the
