@@ -1218,6 +1218,13 @@ shares halved, against the interaction columns doubled (the interaction
 17% of the time, the CPU's columns most): net about −20–30% of the masked
 time, toward ×1.6–1.8; not measured.
 
+**Gates after the fold** [measured]: `just check` green at `b5252bf9`
+(1,441 passed in 111 suites, the segment's 13 tests among them);
+`just test-proof` green, 568 passed in 48 suites, 37 minutes, the segment's
+heavy and leakage tests 251 s (64 proofs a kernel), `constants::` and the
+carrier audit (451 `WrapRandomness` needles) clean; `fixtures::` byte for
+byte (format 35, the seeded masked wraps, `H_FOLD`, the program ids).
+
 **Options 2 and 3, recorded for 7.16** (security parameters, not applied):
 a tighter `h` (`2·revealed` rounded up, without the second ×2: `h` 512 → 256
 at 43 queries, 1,024 → 512 at 86, floors `2^10` and `2^11`), its retry rate
