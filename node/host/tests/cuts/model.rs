@@ -37,8 +37,8 @@ use vos_node::storage::{Change, StorageThread};
 use vos_node::store::{Fjall, Snapshot};
 use vos_tree::{Blake2b, Hash, Hasher, Leaf, value_hash};
 use vos_wire::abi::cap::Target;
-use vos_wire::apply::{Host, State, apply};
-use vos_wire::defaults::{CUT_KEEP, MAX_CUTS};
+use vos_wire::apply::{Host, State, Waits, apply};
+use vos_wire::defaults::CUT_KEEP;
 use vos_wire::ids::{AgentId, InstanceId, MapId, RequestId, WorkflowId};
 use vos_wire::keys::{self, Transform};
 use vos_wire::records::{PendingRead, unstored};
@@ -453,39 +453,25 @@ impl History {
     /// before the first a later result cut.
     pub fn cuts(&self, version: u64) -> BTreeMap<u64, u64> {
         let mut cuts = BTreeMap::new();
-        let (mut spaced, mut every) = (false, false);
+        let mut spaced = false;
+        let mut waits = Waits::default();
         let mut mark = 0;
-        let mut reading = None;
         for (at, entry) in (1..=version).zip(&self.entries) {
-            let window = CLOCK.window(mark).unwrap_or(0);
-            let crossed: Vec<u64> = (window..)
-                .take_while(|window| {
-                    CLOCK
-                        .boundary(*window)
-                        .is_some_and(|boundary| boundary <= entry.time)
-                })
-                .collect();
-            let skipped = crossed.len().saturating_sub(MAX_CUTS as usize);
-            let cut = match (spaced, every) {
-                (false, _) => &[][..],
-                (true, true) => &crossed[skipped..],
-                (true, false) if skipped == 0 && reading == Some(window) => {
-                    crossed.get(..1).unwrap_or(&[])
+            let cut = waits
+                .cuts(&CLOCK, mark, entry.time)
+                .filter(|_| spaced && entry.time > mark);
+            if let Some((first, last)) = cut {
+                for window in first..=last {
+                    cuts.insert(window, at - 1);
                 }
-                (true, false) => &[][..],
-            };
-            for window in cut {
-                cuts.insert(*window, at - 1);
-            }
-            if let Some(first) = cut.first() {
-                cuts.retain(|window, _| window + CUT_KEEP >= *first);
+                cuts.retain(|window, _| window + CUT_KEEP >= first);
             }
             for write in &entry.writes {
                 spaced |= write.key == keys::space() && write.value != Some(SpaceId::NONE.encode());
-                every |= write.key == keys::every_window() && write.value.is_some();
+                waits.every |= write.key == keys::every_window() && write.value.is_some();
             }
             if entry.request.is_some() {
-                reading = CLOCK.window(entry.time);
+                waits.reading = CLOCK.window(entry.time);
             }
             mark = mark.max(entry.time);
         }

@@ -97,7 +97,7 @@ impl Apply<'_> {
         let Some(clock) = self.record() else {
             return false;
         };
-        let reads = Reads {
+        let waits = Waits {
             every: self.state.read(&keys::every_window()).is_some(),
             reading: self.get::<u64>(&keys::reading()),
         };
@@ -125,7 +125,7 @@ impl Apply<'_> {
             self.put(&keys::seed(next), &result.seed);
         }
         if let Some(clock) = clock
-            && let Some((first, last)) = reads.cuts(&clock, latest, result.time)
+            && let Some((first, last)) = waits.cuts(&clock, latest, result.time)
         {
             for window in first..=last {
                 self.put(&keys::cut(window), &version.encode());
@@ -374,21 +374,23 @@ impl Apply<'_> {
     }
 }
 
-/// What the agent's cuts wait on, as a result finds it: whether it reports
-/// every window ([`keys::every_window`]), and the latest window a read
-/// waits on ([`keys::reading`]).
-struct Reads {
-    every: bool,
-    reading: Option<u64>,
+/// What an agent's cuts wait on, as a result finds it before its steps:
+/// whether it reports every window ([`keys::every_window`]), and the latest
+/// window a read waits on ([`keys::reading`]). The cut rule, which apply,
+/// the leader's marker and the models all follow.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Waits {
+    pub every: bool,
+    pub reading: Option<u64>,
 }
 
-impl Reads {
+impl Waits {
     /// The windows a result timed `time` cuts, after the agent's batch-time
     /// mark `mark`, the first and the last: every window it crosses
     /// ([`cut_windows`]) when the agent reports every one; else the window
     /// of the mark alone, when a read waits on it and the result crosses its
     /// boundary.
-    fn cuts(&self, clock: &WindowClock, mark: u64, time: u64) -> Option<(u64, u64)> {
+    pub fn cuts(&self, clock: &WindowClock, mark: u64, time: u64) -> Option<(u64, u64)> {
         let (first, last) = cut_windows(clock, mark, time)?;
         if self.every {
             return Some((first, last));

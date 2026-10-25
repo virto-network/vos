@@ -8,6 +8,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_wire::apply::Waits;
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
@@ -41,11 +42,12 @@ fn cut_due(snapshot: &Snapshot, agent: AgentId) -> Result<Option<u64>, Fault> {
         return Ok(None);
     };
     let mark = read::<u64>(snapshot, agent, &keys::batch_time())?.unwrap_or(0);
-    let window = clock.window(mark).unwrap_or(0);
-    let every = snapshot.get(agent, &keys::every_window())?.is_some();
-    let reading = read::<u64>(snapshot, agent, &keys::reading())?;
-    let waits = every || reading.is_some_and(|reading| reading >= window);
-    Ok(waits.then(|| clock.boundary(window)).flatten())
+    let waits = Waits {
+        every: snapshot.get(agent, &keys::every_window())?.is_some(),
+        reading: read::<u64>(snapshot, agent, &keys::reading())?,
+    };
+    let boundary = clock.boundary(clock.window(mark).unwrap_or(0));
+    Ok(boundary.filter(|boundary| waits.cuts(&clock, mark, *boundary).is_some()))
 }
 
 /// What a marker is made of, as `snapshot` holds the agent: the first
