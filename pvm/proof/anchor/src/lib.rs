@@ -18,10 +18,13 @@
 //! - **An anchor** ([`Anchor`]) is a registered anchor key's signature over
 //!   [`anchor_digest`]: one root of a kind per space and window, at a venue.
 //! - **Registration** is a founding key's signature over
-//!   [`register_digest`], which names the controller and the first window
-//!   the space anchors at the venue.
+//!   [`register_digest`], which names the venue, the space and its
+//!   controller; the space anchors from the venue's next window.
 //! - **A venue's id** ([`VenueId`]) separates its anchors and registrations
 //!   from another venue's.
+//! - **A venue's rules** ([`venue`]): the registration, the anchor rule,
+//!   what is anchored and a root's freshness, written once for every
+//!   venue.
 //!
 //! **Encodings.** Every type encodes as SCALE, by hand ([`codec`]): integers
 //! fixed-width little-endian, arrays as their bytes, a sequence a compact
@@ -57,8 +60,11 @@
 extern crate alloc;
 
 pub mod codec;
+#[cfg(feature = "suite")]
+pub mod suite;
 #[cfg(feature = "vectors")]
 pub mod vectors;
+pub mod venue;
 
 use alloc::vec::Vec;
 
@@ -383,24 +389,13 @@ pub fn anchor_digest(
 }
 
 /// What a founding key signs to register its space at `venue` under
-/// `controller` (a venue account's 32 bytes), anchoring from
-/// `start_window`:
-/// `BLAKE2b-256("vos/space/register" ‖ venue ‖ space ‖ controller ‖ start_window (8, LE))`.
-/// The first window is signed, so nobody who sees a registration can
-/// resubmit it with a start that keeps the space from ever anchoring.
-pub fn register_digest(
-    venue: &VenueId,
-    space: &SpaceId,
-    controller: &[u8; 32],
-    start_window: u64,
-) -> [u8; 32] {
-    blake2b_256(&[
-        REGISTER_DOMAIN,
-        &venue.0,
-        &space.0,
-        controller,
-        &start_window.to_le_bytes(),
-    ])
+/// `controller` (a venue account's 32 bytes):
+/// `BLAKE2b-256("vos/space/register" ‖ venue ‖ space ‖ controller)`. The
+/// space anchors from the venue's next window, which nobody signs, so a
+/// replayed registration has no field to change; a venue never forgets a
+/// space it registered, so it is refused.
+pub fn register_digest(venue: &VenueId, space: &SpaceId, controller: &[u8; 32]) -> [u8; 32] {
+    blake2b_256(&[REGISTER_DOMAIN, &venue.0, &space.0, controller])
 }
 
 /// A space's root of a kind at a window, signed by one of its anchor keys.
@@ -451,41 +446,6 @@ impl Anchor {
         };
         reader.finish()?;
         Ok(anchor)
-    }
-}
-
-/// A space's move from one venue to another, from a window on: each venue
-/// refuses its anchors outside its range.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct Migrate {
-    pub space: SpaceId,
-    pub from: VenueId,
-    pub to: VenueId,
-    pub from_window: u64,
-}
-
-impl Migrate {
-    /// Its encoding: the space, the venues, the window.
-    pub fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(32 * 3 + 8);
-        out.extend_from_slice(&self.space.0);
-        out.extend_from_slice(&self.from.0);
-        out.extend_from_slice(&self.to.0);
-        out.extend_from_slice(&self.from_window.to_le_bytes());
-        out
-    }
-
-    /// The migration `bytes` encode, all of them.
-    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let mut reader = Reader::new(bytes);
-        let migrate = Self {
-            space: SpaceId(reader.array()?),
-            from: VenueId(reader.array()?),
-            to: VenueId(reader.array()?),
-            from_window: reader.u64()?,
-        };
-        reader.finish()?;
-        Ok(migrate)
     }
 }
 

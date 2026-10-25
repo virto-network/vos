@@ -251,13 +251,12 @@ fn every_digest_is_its_preimages() {
         .concat()])
     );
     assert_eq!(
-        register_digest(&venue, &space, &[0xc0; 32], 0x0102_0304_0506_0708),
+        register_digest(&venue, &space, &[0xc0; 32]),
         blake2b_256(&[&[
             b"vos/space/register".as_slice(),
             &venue.0,
             &space.0,
-            &[0xc0; 32],
-            &w
+            &[0xc0; 32]
         ]
         .concat()])
     );
@@ -316,15 +315,10 @@ fn every_field_is_bound() {
         anchor,
         anchor_digest(&venue, &space, 9, RootKind::Space, &[0; 32])
     );
-    let register = register_digest(&venue, &space, &[6; 32], 9);
-    assert_ne!(register, register_digest(&other_venue, &space, &[6; 32], 9));
-    assert_ne!(register, register_digest(&venue, &other_space, &[6; 32], 9));
-    assert_ne!(register, register_digest(&venue, &space, &[7; 32], 9));
-    assert_ne!(
-        register,
-        register_digest(&venue, &space, &[6; 32], 10),
-        "the start window"
-    );
+    let register = register_digest(&venue, &space, &[6; 32]);
+    assert_ne!(register, register_digest(&other_venue, &space, &[6; 32]));
+    assert_ne!(register, register_digest(&venue, &other_space, &[6; 32]));
+    assert_ne!(register, register_digest(&venue, &space, &[7; 32]));
     assert_ne!(VenueId::jam(&[1; 32], 1), VenueId::jam(&[1; 32], 2));
     assert_ne!(VenueId::jam(&[1; 32], 1), VenueId::jam(&[2; 32], 1));
 }
@@ -349,25 +343,6 @@ fn no_domain_is_a_prefix_of_another() {
     }
 }
 
-/// A migration and an anchor round-trip, all their bytes or none.
-#[test]
-fn a_migration_round_trips() {
-    let migrate = Migrate {
-        space: SpaceId([1; 32]),
-        from: VenueId([2; 32]),
-        to: VenueId([3; 32]),
-        from_window: 99,
-    };
-    let bytes = migrate.encode();
-    assert_eq!(bytes.len(), 104);
-    assert_eq!(Migrate::decode(&bytes), Ok(migrate));
-    assert_eq!(Migrate::decode(&bytes[..103]), Err(DecodeError::Short));
-    assert_eq!(
-        Migrate::decode(&[bytes.as_slice(), &[0]].concat()),
-        Err(DecodeError::Trailing)
-    );
-}
-
 /// The golden vectors' digests, each its pinned bytes; each vector's
 /// encoding round-trips.
 #[cfg(feature = "vectors")]
@@ -384,4 +359,56 @@ fn the_golden_vectors() {
         assert_eq!(hex(&digests.to_bytes()), golden.digests, "{}", golden.name);
         assert!(golden.vector.genesis.clock.registrable(), "{}", golden.name);
     }
+}
+
+/// The small-order keys are the eight-torsion subgroup's points, every one
+/// of them under either sign bit and the non-canonical encodings of 0 and
+/// 1: each refused, as `verify_strict` refuses each key it decodes; and no
+/// key of a signing key is.
+#[test]
+fn the_small_order_keys_are_the_torsion_points() {
+    use curve25519_dalek::edwards::{CompressedEdwardsY, EdwardsPoint};
+    use curve25519_dalek::traits::Identity;
+
+    let order_8 = CompressedEdwardsY(venue::SMALL_ORDER[2])
+        .decompress()
+        .expect("a point");
+    let mut point = EdwardsPoint::identity();
+    for _ in 0..8 {
+        assert!(point.is_small_order());
+        assert!(venue::small_order(&point.compress().to_bytes()));
+        point += order_8;
+    }
+    assert_eq!(point, EdwardsPoint::identity(), "a point of order 8");
+    for encoding in venue::SMALL_ORDER {
+        for sign in [0, 0x80] {
+            let mut key = encoding;
+            key[31] |= sign;
+            assert!(venue::small_order(&key));
+            if let Ok(key) = ed25519_dalek::VerifyingKey::from_bytes(&key) {
+                assert!(key.is_weak(), "{key:?}");
+            }
+        }
+    }
+    for seed in 0..=u8::MAX {
+        let key = ed25519_dalek::SigningKey::from_bytes(&[seed; 32]).verifying_key();
+        assert!(!venue::small_order(key.as_bytes()), "{seed}");
+    }
+}
+
+/// Freshness at its edges: a root fresh through `B_w + MaxRootAge`, aged a
+/// millisecond after; a window whose expiry overflows neither; a `Seen`
+/// entry's expiry its newest root's, never for none.
+#[test]
+fn freshness_at_its_edges() {
+    let clock = genesis().clock;
+    let last = clock.boundary(7).unwrap() + MAX_ROOT_AGE_MS;
+    assert_eq!(venue::expiry(&clock, 7), Some(last));
+    assert!(venue::fresh(&clock, 7, 0));
+    assert!(venue::fresh(&clock, 7, last) && !venue::aged(&clock, 7, last));
+    assert!(!venue::fresh(&clock, 7, last + 1) && venue::aged(&clock, 7, last + 1));
+    assert!(!venue::fresh(&clock, u64::MAX, 0) && !venue::aged(&clock, u64::MAX, u64::MAX));
+    assert_eq!(venue::seen_expiry(&clock, [7, 3]), last);
+    assert_eq!(venue::seen_expiry(&clock, []), u64::MAX);
+    assert_eq!(venue::seen_expiry(&clock, [u64::MAX]), u64::MAX);
 }
