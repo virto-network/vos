@@ -1,24 +1,15 @@
-//! The nodes' anchor keys at the model venue: a rotation, the new key
-//! signing once the venue lists it and no window missed; a leader whose
-//! keys the venue does not list signing nothing; a node that did not
-//! found the space replicating the representative once its key is
-//! registered, and anchoring after a failover; anchors waiting through a
-//! long wait taken up after a failover; a rotation whose process
-//! is killed before the venue lists the key, which the node keeps; windows
-//! refused while the venue's client answers the space unregistered,
-//! anchored once it reads the registration; and, through a client that
-//! queues its anchors, one whose key the venue stops listing before it
-//! lands signed again by the new key, one refused for a key the client
-//! still lists not sent again until the listing changes, and windows
-//! handed back after their cut roots are dropped signed again from the
-//! anchors themselves, in order.
+//! The representative's anchoring at the model venue, each node signing
+//! with its node key: a leader whose key the venue does not list signing
+//! nothing; a node that did not found the space replicating the
+//! representative once its key is registered, and anchoring after a
+//! failover; anchors waiting through a long wait taken up after a
+//! failover; windows refused while the venue's client answers the space
+//! unregistered, anchored once it reads the registration; and anchors a
+//! client hands back that the node never signed, not signed again.
 //!
 //! The windows are an hour long (`support::clock`), and the tests move the
 //! nodes' clocks and the venue's past each window's close, `B_w + D`.
 
-use std::io::{BufRead, BufReader, Write};
-use std::path::Path;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -92,71 +83,21 @@ fn space(count: u8) -> (Anchoring, Cluster, WindowClock, AgentId) {
     (anchoring, cluster, clock, representative)
 }
 
-/// A rotation end to end: each node's first anchor key is the one the
-/// genesis names; each makes a new one, and signs with its old key while
-/// the venue does not list the new, with the new once it does, and with
-/// the new alone once the old is removed. Every window is anchored, in
-/// order, and none twice.
-#[test]
-fn a_rotation_anchors_every_window() {
-    let (anchoring, cluster, clock, _) = space(3);
-    let space = cluster.space.id();
-    let venue = &anchoring.venue;
-    let genesis: Vec<[u8; 32]> = cluster
-        .space
-        .genesis()
-        .unwrap()
-        .nodes
-        .iter()
-        .map(|(_, key)| *key)
-        .collect();
-    let old: Vec<[u8; 32]> = (1..=3)
-        .map(|number| cluster.node(number).anchor_keys()[0])
-        .collect();
-    assert_eq!(old, genesis, "the first anchor keys the genesis's");
-    let signer = |window| anchored(&anchoring, &cluster, &clock, window).signer;
-    assert!(old.contains(&signer(0)), "before");
-    let new: Vec<[u8; 32]> = (1..=3)
-        .map(|number| cluster.node(number).rotate_anchor_key().unwrap())
-        .collect();
-    for (number, key) in (1..=3).zip(&new) {
-        assert_eq!(
-            cluster.node(number).anchor_keys(),
-            [old[number as usize - 1], *key]
-        );
-    }
-    assert!(
-        old.contains(&signer(1)),
-        "made, not yet listed: the old key"
-    );
-    for key in &new {
-        assert!(venue.add_anchor_key(&space, *key));
-    }
-    assert!(new.contains(&signer(2)), "listed: the new key");
-    for key in &old {
-        assert!(venue.remove_anchor_key(&space, key));
-    }
-    assert!(new.contains(&signer(3)), "the old removed");
-    assert_eq!(windows(&anchoring, &cluster), [0, 1, 2, 3], "none missed");
-    assert!(venue.evidence().is_empty());
-}
-
-/// A leader whose keys the venue does not list signs nothing: it closes
-/// the window all the same, and the venue holds no anchor of it. Once a
-/// key it rotates to is listed, the window it held back is anchored, then
-/// the next, both by that key.
+/// A leader whose key the venue does not list signs nothing: it closes
+/// the window all the same, and the venue holds no anchor of it. Once its
+/// key is listed again, the window it held back is anchored, then the
+/// next, both by that key.
 #[test]
 fn an_unlisted_leader_signs_nothing() {
     let (anchoring, cluster, clock, representative) = space(1);
     let space = cluster.space.id();
     let venue = &anchoring.venue;
-    let founding = cluster.node(1).anchor_keys()[0];
+    let key = cluster.node(1).id().0;
     let stranger = SigningKey::from_bytes(&[9; 32]).verifying_key().to_bytes();
     assert!(venue.add_anchor_key(&space, stranger));
-    assert!(venue.remove_anchor_key(&space, &founding));
+    assert!(venue.remove_anchor_key(&space, &key));
     closed(&anchoring, &cluster, &clock, (1, representative), 0);
     assert!(windows(&anchoring, &cluster).is_empty(), "nothing signed");
-    let key = cluster.node(1).rotate_anchor_key().unwrap();
     assert!(venue.add_anchor_key(&space, key));
     assert_eq!(anchored(&anchoring, &cluster, &clock, 1).signer, key);
     let anchors = venue.anchors(&space);
@@ -168,7 +109,7 @@ fn an_unlisted_leader_signs_nothing() {
     assert!(anchors.iter().all(|anchor| anchor.signer == key));
 }
 
-/// An anchor left waiting survives a leader change: the leader's keys are
+/// An anchor left waiting survives a leader change: the leader's key is
 /// not listed, the other replicas' are; it closes window 0, signing
 /// nothing, and stops. The new leader takes up window 0 from its replica's
 /// cut, and anchors it, then window 1, with its own key.
@@ -177,13 +118,13 @@ fn a_waiting_anchor_survives_a_leader_change() {
     let (anchoring, mut cluster, clock, representative) = space(3);
     let space = cluster.space.id();
     let leader = cluster.leader(representative);
-    let unlisted = cluster.node(leader).anchor_keys()[0];
+    let unlisted = cluster.node(leader).id().0;
     assert!(anchoring.venue.remove_anchor_key(&space, &unlisted));
     closed(&anchoring, &cluster, &clock, (leader, representative), 0);
     assert!(windows(&anchoring, &cluster).is_empty(), "nothing signed");
     cluster.stop(leader);
     let next = cluster.leader(representative);
-    let key = cluster.node(next).anchor_keys()[0];
+    let key = cluster.node(next).id().0;
     assert_eq!(anchored(&anchoring, &cluster, &clock, 1).signer, key);
     let anchors = anchoring.venue.anchors(&space);
     assert_eq!(windows(&anchoring, &cluster), [0, 1], "window 0 taken up");
@@ -201,7 +142,7 @@ fn waiting_anchors_survive_a_failover_through_a_long_wait() {
     let space = cluster.space.id();
     let venue = &anchoring.venue;
     for number in 1..=3 {
-        assert!(venue.remove_anchor_key(&space, &cluster.node(number).anchor_keys()[0]));
+        assert!(venue.remove_anchor_key(&space, &cluster.node(number).id().0));
     }
     let leader = cluster.leader(representative);
     for window in 0..3 {
@@ -223,7 +164,7 @@ fn waiting_anchors_survive_a_failover_through_a_long_wait() {
     });
     cluster.stop(leader);
     let next = cluster.leader(representative);
-    let key = cluster.node(next).anchor_keys()[0];
+    let key = cluster.node(next).id().0;
     assert!(venue.add_anchor_key(&space, key));
     assert_eq!(anchored(&anchoring, &cluster, &clock, 3).signer, key);
     assert_eq!(
@@ -235,10 +176,9 @@ fn waiting_anchors_survive_a_failover_through_a_long_wait() {
 }
 
 /// A node that did not found the space replicates the representative once
-/// it holds a registered anchor key: refused before, as it holds none;
-/// it rotates to one, the controller registers it, it replaces a founding
-/// replica, and, its founding replicas failing over until it leads,
-/// anchors the next window with that key.
+/// the controller registers its node key: refused before; then it
+/// replaces a founding replica, and, its founding replicas failing over
+/// until it leads, anchors the next window with its key.
 #[test]
 fn a_registered_node_that_did_not_found_the_space_represents_it() {
     let clock = clock();
@@ -257,9 +197,9 @@ fn a_registered_node_that_did_not_found_the_space_represents_it() {
             cluster.node(leader).replace(representative, out, 4),
             Err(ReplaceError::Unplaced(Unplaced::CannotRun))
         ),
-        "node 4 holds no registered key"
+        "node 4's key is not registered"
     );
-    let key = cluster.node(4).rotate_anchor_key().unwrap();
+    let key = cluster.node(4).id().0;
     assert!(anchoring.venue.add_anchor_key(&space, key));
     let replicas = cluster.replace(leader, representative, &[1, 2, 3], out, 4);
     wait_until("node 4 runs the representative", || {
@@ -283,78 +223,6 @@ fn a_registered_node_that_did_not_found_the_space_represents_it() {
     }
     assert_eq!(cluster.leader(representative), 4, "replicas {replicas:?}");
     assert_eq!(anchored(&anchoring, &cluster, &clock, 0).signer, key);
-}
-
-/// The variable that makes the test binary the rotation killed: the data
-/// directory it rotates.
-const ROTATING: &str = "VOS_ANCHOR_KEY_ROTATING";
-/// What the rotation prints before the key it made.
-const MADE: &str = "anchor key ";
-
-/// Rotate the stopped node's anchor key at `data` in a child, as
-/// `vos node anchor-key rotate` does, and kill it once it prints the key:
-/// that key.
-fn rotate_and_kill(data: &Path) -> [u8; 32] {
-    let mut child = Command::new(std::env::current_exe().unwrap())
-        .args([
-            "anchor_keys::a_rotation_survives_its_crash",
-            "--exact",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(ROTATING, data)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let mut key = None;
-    for line in BufReader::new(child.stdout.take().unwrap()).lines() {
-        // The harness may print the test's name before it, on its line.
-        if let Some((_, hex)) = line.unwrap().split_once(MADE) {
-            key = Some(std::array::from_fn(|at| {
-                u8::from_str_radix(&hex[2 * at..2 * at + 2], 16).unwrap()
-            }));
-            break;
-        }
-    }
-    child.kill().unwrap();
-    child.wait().unwrap();
-    key.expect("the child printed its key")
-}
-
-/// A rotation whose process is killed once it shows the key, before any
-/// venue lists it: the node keeps the key, signs with its old one until
-/// the venue lists the new, then with the new; no window missed.
-#[test]
-fn a_rotation_survives_its_crash() {
-    if let Some(data) = std::env::var_os(ROTATING) {
-        let key = vos_node::rotate_anchor_key(Path::new(&data)).unwrap();
-        let hex = hex::encode(key);
-        let mut out = std::io::stdout();
-        writeln!(out, "{MADE}{hex}").unwrap();
-        out.flush().unwrap();
-        loop {
-            std::thread::park();
-        }
-    }
-    let (anchoring, mut cluster, clock, _) = space(1);
-    let space = cluster.space.id();
-    let founding = cluster.node(1).anchor_keys()[0];
-    assert_eq!(anchored(&anchoring, &cluster, &clock, 0).signer, founding);
-    cluster.stop(1);
-    let rotated = rotate_and_kill(cluster.dirs[0].path());
-    cluster.start(1);
-    assert_eq!(cluster.node(1).anchor_keys(), [founding, rotated], "kept");
-    assert_eq!(
-        anchored(&anchoring, &cluster, &clock, 1).signer,
-        founding,
-        "not yet listed"
-    );
-    assert!(anchoring.venue.add_anchor_key(&space, rotated));
-    assert_eq!(anchored(&anchoring, &cluster, &clock, 2).signer, rotated);
-    assert!(anchoring.venue.remove_anchor_key(&space, &founding));
-    assert_eq!(anchored(&anchoring, &cluster, &clock, 3).signer, rotated);
-    assert_eq!(windows(&anchoring, &cluster), [0, 1, 2, 3]);
 }
 
 /// A founding node signs the space's registration by its node key, over
@@ -534,123 +402,6 @@ fn node_closed(cluster: &Cluster, clock: &WindowClock, representative: AgentId, 
         &format!("the representative closes window {window}"),
         || closed_on(cluster.node(1), representative, window),
     );
-}
-
-/// The node's anchor of window 0 is queued while the venue's clock has not
-/// closed the window; before it lands, the node rotates its key and the
-/// controller lists the new one and removes the old. The venue refuses the
-/// queued anchor's key, the client hands it back, and the same leader
-/// signs it again with the new key, which the venue takes.
-#[test]
-fn a_queued_anchor_whose_key_is_removed_is_signed_again() {
-    let clock = clock();
-    let anchoring = Anchoring::new();
-    let queued = Queued::over(&anchoring.venue);
-    let cluster = queued.cluster(clock);
-    anchoring.register(&cluster);
-    let representative = cluster.representative(&[1]);
-    let space = cluster.space.id();
-    let venue = &anchoring.venue;
-    let old = cluster.node(1).anchor_keys()[0];
-    // The venue's clock a minute into window 0, the node's past its close.
-    node_closed(&cluster, &clock, representative, 0);
-    wait_until("window 0's anchor queued", || queued.queue.holds(&space, 0));
-    assert!(windows(&anchoring, &cluster).is_empty(), "the window open");
-    let new = cluster.node(1).rotate_anchor_key().unwrap();
-    assert!(venue.add_anchor_key(&space, new));
-    assert!(venue.remove_anchor_key(&space, &old));
-    anchoring.set_venue(past_close(&clock, 0));
-    wait_until("window 0 anchored", || {
-        !windows(&anchoring, &cluster).is_empty()
-    });
-    assert_eq!(venue.anchors(&space)[0].signer, new, "signed again");
-    assert!(venue.evidence().is_empty());
-}
-
-/// A key refused while the client's listing still names it: the window is
-/// handed back, the leader signs it again with that key, as the listing it
-/// reads says, and the client refuses that anchor for its key, sending
-/// nothing. No anchor goes again until the listing changes; then the new
-/// key's lands.
-#[test]
-fn a_key_refused_is_not_sent_again_until_the_listing_changes() {
-    let clock = clock();
-    let anchoring = Anchoring::new();
-    let queued = Queued::over(&anchoring.venue);
-    let cluster = queued.cluster(clock);
-    anchoring.register(&cluster);
-    let representative = cluster.representative(&[1]);
-    let space = cluster.space.id();
-    let venue = &anchoring.venue;
-    let old = cluster.node(1).anchor_keys()[0];
-    node_closed(&cluster, &clock, representative, 0);
-    wait_until("window 0's anchor queued", || queued.queue.holds(&space, 0));
-    let new = cluster.node(1).rotate_anchor_key().unwrap();
-    *queued.stale.lock().unwrap() = Some(vec![old]);
-    assert!(venue.add_anchor_key(&space, new));
-    assert!(venue.remove_anchor_key(&space, &old));
-    anchoring.set_venue(past_close(&clock, 0));
-    wait_until("window 0 handed back", || {
-        queued.queue.unsettled(&space).len() == 1
-    });
-    let sent = queued.sends.load(Ordering::SeqCst);
-    std::thread::sleep(Duration::from_secs(7));
-    assert_eq!(
-        queued.sends.load(Ordering::SeqCst),
-        sent,
-        "nothing sent while the listing is the same"
-    );
-    assert_eq!(queued.queue.unsettled(&space).len(), 1, "still handed back");
-    *queued.stale.lock().unwrap() = None;
-    wait_until("window 0 anchored", || {
-        !windows(&anchoring, &cluster).is_empty()
-    });
-    assert_eq!(venue.anchors(&space)[0].signer, new);
-}
-
-/// The node closes windows 0 to 5 while the venue's clock is still in
-/// window 0, so window 0's cut root is no longer kept; then its key is
-/// rotated out. Each window's anchor is handed back in turn, window 0's
-/// root signed again from the anchor itself, and every window lands under
-/// the new key, in order.
-#[test]
-fn a_window_handed_back_after_its_cut_root_is_pruned_is_signed_again() {
-    let clock = clock();
-    let anchoring = Anchoring::new();
-    let queued = Queued::over(&anchoring.venue);
-    let cluster = queued.cluster(clock);
-    anchoring.register(&cluster);
-    let representative = cluster.representative(&[1]);
-    let space = cluster.space.id();
-    let venue = &anchoring.venue;
-    let old = cluster.node(1).anchor_keys()[0];
-    for window in 0..=5 {
-        node_closed(&cluster, &clock, representative, window);
-    }
-    wait_until("window 0's cut root dropped", || {
-        roots::cut_root(&cluster.node(1).store().snapshot(), representative, 0)
-            .unwrap()
-            .is_none()
-    });
-    assert!(
-        windows(&anchoring, &cluster).is_empty(),
-        "every window open"
-    );
-    let new = cluster.node(1).rotate_anchor_key().unwrap();
-    assert!(venue.add_anchor_key(&space, new));
-    assert!(venue.remove_anchor_key(&space, &old));
-    anchoring.set_venue(past_close(&clock, 5));
-    wait_until("windows 0 to 5 anchored", || {
-        windows(&anchoring, &cluster).len() == 6
-    });
-    assert_eq!(windows(&anchoring, &cluster), [0, 1, 2, 3, 4, 5]);
-    assert!(
-        venue
-            .anchors(&space)
-            .iter()
-            .all(|anchor| anchor.signer == new)
-    );
-    assert!(venue.evidence().is_empty());
 }
 
 /// A client hands back anchors this node never signed: window 0's, once

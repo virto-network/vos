@@ -19,7 +19,6 @@ use vos_wire::ingress::NodeId;
 use vos_wire::peer::{CreationRecord, NodeNumber, Placement};
 
 use super::{Config, Counters, Directory, Error, Inner, Node, Peers, Run, Settings, Tasks};
-use crate::anchor_keys::AnchorKeys;
 use crate::blobs::Blobs;
 use crate::executor::Executors;
 use crate::pvm::Machines;
@@ -53,7 +52,6 @@ impl Node {
                 },
             )?;
         let secret = node_secret(&store)?;
-        let anchor_keys = AnchorKeys::load(&secret, &store)?;
         // Each run's pair heartbeat outranks the last run's, whatever the
         // clock did between them.
         let incarnation = crate::liveness::next_incarnation(store.incarnation()?);
@@ -124,7 +122,7 @@ impl Node {
             hooks: config.hooks,
             clock: config.clock,
             node_id,
-            anchor_keys,
+            node_key: SigningKey::from_bytes(&secret),
             venue: config.venue,
             number,
             numbers: config

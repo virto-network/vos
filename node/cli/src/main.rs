@@ -17,7 +17,7 @@ use vos_node::{Config, Node, Space};
 use vos_wire::ids::MethodId;
 use vos_wire::schema::Schema;
 
-use args::{AnchorKeyCommand, Cli, Command, KeyCommand, NodeCommand, RunArgs, SpaceCommand};
+use args::{Cli, Command, KeyCommand, NodeCommand, RunArgs, SpaceCommand};
 use call::read_workflow;
 
 /// mimalloc, unless built without it: a thread frees memory another thread
@@ -125,17 +125,6 @@ impl NodeCommand {
             NodeCommand::Info { node } => {
                 let id = vos_node::client::node_id(&node.target()?).map_err(failed)?;
                 println!("{}", hex::encode(id.0));
-                Ok(())
-            }
-            NodeCommand::AnchorKey {
-                command: AnchorKeyCommand::Rotate { data },
-            } => {
-                let key = vos_node::rotate_anchor_key(&data)?;
-                eprintln!(
-                    "vos: the node signs with this key once a venue lists it: have the space's \
-                     controller register it (`add_authority`), then remove the old one"
-                );
-                println!("{}", hex::encode(key));
                 Ok(())
             }
         }

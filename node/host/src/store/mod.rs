@@ -285,28 +285,6 @@ impl Fjall {
             .and_then(|seed| seed[..].try_into().ok()))
     }
 
-    /// The anchor keys the node made past its first, its node key's, by
-    /// number, oldest first: each seed, secret and never served, or `None`
-    /// where its row is unreadable. A number is never reused, so the next
-    /// key takes the last number plus one, past an unreadable row too.
-    pub fn anchor_secrets(&self) -> Result<Vec<(u64, Option<[u8; 32]>)>> {
-        let prefix = node_record(NodeRow::AnchorKey, &[]);
-        let mut seeds = Vec::new();
-        for row in self.system().prefix(&prefix) {
-            let (key, seed) = row.into_inner()?;
-            let Some(number) = key.get(prefix.len()..).and_then(be_u64) else {
-                tracing::error!("an anchor key's row is misnamed; it is not used");
-                continue;
-            };
-            let seed = seed[..].try_into().ok();
-            if seed.is_none() {
-                tracing::error!(number, "an unreadable anchor key; it is not used");
-            }
-            seeds.push((number, seed));
-        }
-        Ok(seeds)
-    }
-
     /// Every key and value of every partition, by partition, in key order:
     /// all the store holds, as a test reads it, however its blocks are
     /// compressed on disk.
@@ -361,17 +339,6 @@ impl Fjall {
             .get(key)?
             .and_then(|bytes| be_u64(&bytes))
             .unwrap_or(0))
-    }
-
-    /// Make anchor key `number`'s row unreadable, as a torn write might.
-    #[cfg(test)]
-    pub(crate) fn corrupt_anchor_secret(&self, number: u64) {
-        self.system()
-            .insert(
-                node_record(NodeRow::AnchorKey, &number.to_be_bytes()),
-                [0u8; 5],
-            )
-            .unwrap();
     }
 
     /// The node's last run, as its pair heartbeat numbered it.
@@ -612,8 +579,8 @@ impl std::fmt::Display for LayoutMismatch {
             Layout::Unreadable => write!(f, "the store's layout row is unreadable"),
         }?;
         f.write_str(
-            "; move the store aside to start a new one, which discards the node's secret \
-             and the anchor keys it registered at its venue",
+            "; move the store aside to start a new one, which discards the node's secret, \
+             the key its venue lists",
         )
     }
 }

@@ -62,7 +62,7 @@ impl Inner {
             return unplaced(Unplaced::NotInTheSpace);
         }
         // The representative's: `add` says it could run it only while it
-        // holds an anchor key the space registered (`on_directory`).
+        // holds a node key the space registered (`on_directory`).
         if !self.could_run(agent, add, CAPABLE).await {
             return unplaced(Unplaced::CannotRun);
         }
@@ -142,7 +142,7 @@ impl Inner {
     /// when empty): only on the space's first founding node, whose agent 0
     /// it is, and once, on founding nodes, whose genesis keys a venue
     /// registers with the space; a replacement may add any node holding a
-    /// registered anchor key. Answered as [`Inner::create_agent`] is.
+    /// node key the space registered. Answered as [`Inner::create_agent`] is.
     pub(crate) async fn create_representative(
         self: &Arc<Self>,
         replicas: Vec<NodeNumber>,

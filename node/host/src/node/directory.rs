@@ -475,7 +475,7 @@ impl Inner {
         if self.representative() == Some(record.agent) && !self.may_represent() {
             tracing::info!(
                 agent = record.agent.0,
-                "this node holds no anchor key the space registered: it cannot replicate the representative"
+                "the space did not register this node's key: it cannot replicate the representative"
             );
             return false;
         }

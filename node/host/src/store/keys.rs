@@ -35,7 +35,10 @@ pub(super) enum NodeRow {
     Placement = 0x0c,
     Incarnation = 0x0d,
     VoteFloor = 0x0e,
-    AnchorKey = 0x0f,
+    // 0x0f is reserved: it held the node's rotated anchor keys (a u64
+    // big-endian number to a 32-byte ed25519 seed), and stores from earlier
+    // builds may hold such rows. A reuse keeps that layout, or takes a new
+    // tag.
     // 0x10 is reserved: it held the node's venue-account seeds (a u64
     // big-endian number to a 32-byte sr25519 mini secret), and stores from
     // earlier builds may hold such rows. A reuse keeps that layout, or

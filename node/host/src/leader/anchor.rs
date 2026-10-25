@@ -1,6 +1,6 @@
 //! The representative's leader's anchoring: the anchor of each closed
-//! window's space root `S_w`, signed with the newest of this node's anchor
-//! keys the venue lists and handed to the venue inside the batch that
+//! window's space root `S_w`, signed with this node's key once the venue
+//! lists it and handed to the venue inside the batch that
 //! closes it; those the venue's client hands back, or that an earlier
 //! leadership left waiting, taken up and signed again.
 
@@ -53,10 +53,6 @@ pub(super) struct Anchoring {
     /// When this leadership last took up the anchors left waiting by its
     /// cut roots: at its first batch, then a window length later.
     seeded: Option<Instant>,
-    /// The venue's anchor key listing when it last refused this node's
-    /// key, and the node's time then: the anchor goes again once the
-    /// listing changes, or a window later.
-    key_refused: Option<(Vec<[u8; 32]>, u64)>,
 }
 
 impl Leader {
@@ -86,7 +82,7 @@ impl Leader {
             return Vec::new();
         };
         let (space, _) = self.inner.space_and_clock();
-        let ours = self.inner.anchor_keys.public();
+        let ours = self.inner.node_id.0;
         let id = venue.id();
         venue
             .unsettled(&space)
@@ -94,7 +90,7 @@ impl Leader {
             .filter(|anchor| {
                 let signed = anchor.space == space
                     && anchor.kind == RootKind::Space
-                    && ours.contains(&anchor.signer)
+                    && anchor.signer == ours
                     && vos_venue::signed(anchor, &id);
                 let window = anchor.window;
                 let settled_since = self.anchoring.anchored.contains(&window)
@@ -135,8 +131,7 @@ impl Leader {
     }
 
     /// Take up the anchors the venue's client handed back
-    /// ([`Leader::handed_back`]): each root signed again, by the newest key
-    /// the venue lists, whether or not this replica still keeps its cut
+    /// ([`Leader::handed_back`]): each root signed again, by this node's key, whether or not this replica still keeps its cut
     /// root; where it keeps it, only a root that is the space's root over
     /// it, `S_w`, which an anchor still waiting holds already. Whether to
     /// take up the cut roots' too: at a leadership's first batch, then a
@@ -273,16 +268,15 @@ impl Leader {
     }
 
     /// Sign the anchor of the space's root `root` of window `window` (`S_w`,
-    /// over the representative's root at its cut), with the newest of this
-    /// node's anchor keys the venue lists, and hand it to the venue:
-    /// whether that settled it, taken or refused for good. With no key of
-    /// this node's listed it signs nothing, and alerts. Synchronous, inside
+    /// over the representative's root at its cut), with this node's key,
+    /// and hand it to the venue: whether that settled it, taken or refused
+    /// for good. With its key not listed it signs nothing, and alerts. Synchronous, inside
     /// the batch: a venue's client queues and answers at once.
     fn anchor(&mut self, window: u64, root: &[u8; 32]) -> bool {
         let Some(venue) = self.inner.venue.clone() else {
             return true;
         };
-        let (space, clock) = self.inner.space_and_clock();
+        let (space, _) = self.inner.space_and_clock();
         if venue.status(&space).waits() {
             self.alert(
                 window,
@@ -292,27 +286,15 @@ impl Leader {
             );
             return false;
         }
-        let listing = venue.anchor_keys(&space);
-        let now = (self.inner.clock)();
-        let refused_again = self
-            .anchoring
-            .key_refused
-            .as_ref()
-            .is_some_and(|(listed, at)| {
-                *listed == listing && now.saturating_sub(*at) < clock.length_ms
-            });
-        if refused_again {
-            return false;
-        }
-        let Some(key) = self.inner.anchor_keys.listed(&listing) else {
+        let key = &self.inner.node_key;
+        if !venue.anchor_keys(&space).contains(&self.inner.node_id.0) {
             self.alert(
                 window,
-                "the venue lists none of this node's anchor keys; the space's root is not signed \
-                 until it lists one: replace this replica of the representative, or list one of \
-                 its keys (`vos node anchor-key rotate`, then the controller's `add_authority`)",
+                "the venue does not list this node's key; the space's root is not signed until \
+                 it does: replace this replica of the representative by a listed node's",
             );
             return false;
-        };
+        }
         let mut anchor = Anchor {
             space,
             window,
@@ -324,7 +306,6 @@ impl Leader {
         anchor.signature = key.sign(&anchor.digest(&venue.id())).to_bytes();
         self.anchoring.signed.insert(window, anchor);
         let answer = venue.anchor(&anchor);
-        self.anchoring.key_refused = None;
         match answer {
             Ok(anchored) => {
                 tracing::debug!(window, ?anchored, "anchored the space's root");
@@ -338,11 +319,9 @@ impl Leader {
                 false
             }
             Err(AnchorRefusal::Key) => {
-                self.anchoring.key_refused = Some((listing, now));
                 self.alert(
                     window,
-                    "the venue no longer lists the anchor key signed with; anchoring again once \
-                     its listing changes, or a window later",
+                    "the venue no longer lists this node's key; anchoring again once it does",
                 );
                 false
             }

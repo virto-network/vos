@@ -3,8 +3,7 @@
 //! representative ([`Input::Report`]), saying whether reads wait on the
 //! close. The representative's leader, once its replica has built its own
 //! cut of the window, which closes it, signs the anchor of the space's
-//! root `S_w` with the newest of this node's anchor keys the venue lists
-//! and hands it to the venue, then sends
+//! root `S_w` with this node's key and hands it to the venue, then sends
 //! each agent that asked its path ([`Input::Close`]). Both are proposed
 //! from the replica's state, never queued, and sent once: refine sends
 //! nothing for a window its mark has passed ([`keys::reported`],
