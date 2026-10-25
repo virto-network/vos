@@ -1,24 +1,22 @@
-//! The end to end on chain: three nodes of a space running `balance`, the
-//! window actor, the reader and the representative, each proving with the
-//! masked prover, anchor first at Kreivo, as its spaces pallet's mock
-//! models it, then migrate to the JAM statements service on a PolkaJam
-//! testnet.
+//! The end to end on chain: two spaces of three nodes each running
+//! `balance`, the window actor, the reader and the representative, each
+//! proving with the masked prover; one anchoring at Kreivo, as its spaces
+//! pallet's mock models it, the other at the JAM statements service on a
+//! PolkaJam testnet.
 //!
-//! - **Kreivo:** the space registered and its authorities added by the
-//!   pallet's calls; each node anchors and submits through its
-//!   `KreivoVenue`, the space's sovereign account paying within its
-//!   budget; a balance statement at a window's cut accepted.
-//! - **The migration** at window k: the space registered at the JAM
-//!   service from k and migrated away from the mock from k; the nodes'
-//!   venue moved to the service once window k − 1 is anchored at the mock.
-//! - **JAM:** windows k to k + 2 anchored, a balance and a window
-//!   statement read at each cut, proved masked and accepted; the first of
-//!   them refused at the mock (`0x5`). The reader's rootless statements: a
-//!   venue-bound one accepted at the service and refused at a second
-//!   deployment of it, another venue (`0x7`), an unbound one accepted at
-//!   both. Then the chain's clock moves past `MaxRootAge` and each
-//!   accepted rootless statement, replayed, is refused as a repeat (`0x6`),
-//!   a rooted one as unanchored (`0x5`).
+//! - **Kreivo:** the space registered from the chain's next window and its
+//!   authorities added by the pallet's calls; each node anchors and submits
+//!   through its `KreivoVenue`, the space's sovereign account paying within
+//!   its budget; a balance statement at a window's cut accepted.
+//! - **JAM:** the other space registered at the service by a founder's
+//!   signature, from its next window; three windows anchored, a balance and
+//!   a window statement read at each cut, proved masked and accepted. The
+//!   first of them refused where its space's roots are not anchored: at
+//!   Kreivo and at a second deployment of the service (`0x5`). The
+//!   reader's rootless `ordered`, its program pinned, refused at the
+//!   service (`0x4`): a venue judges rooted statements alone. Then the
+//!   chain's clock moves past `MaxRootAge` and the first statement,
+//!   replayed, is refused as unanchored (`0x5`).
 //! - **The carrier audit** (`vos_checker::carriers`) over the whole run:
 //!   what each venue's client was asked to send, every work package the
 //!   JAM clients sent with its extrinsics and work report, the mock's

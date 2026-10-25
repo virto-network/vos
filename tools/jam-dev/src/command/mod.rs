@@ -29,8 +29,8 @@ pub enum JamCommand {
     Testnet(testnet::TestnetArgs),
     /// Deploy the JAM statements service on a running PolkaJam testnet and
     /// drive it: a 256 KiB extrinsic, a space registered and anchored, the
-    /// golden fixtures' masked statements, a migration and an
-    /// equivocation, each outcome read back and recorded.
+    /// golden fixtures' masked statements and an equivocation
+    /// ending the space, each outcome read back and recorded.
     Statements(statements::StatementsArgs),
 }
 

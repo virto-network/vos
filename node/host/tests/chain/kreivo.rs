@@ -1,8 +1,8 @@
 //! Kreivo, as its spaces pallet's mock models it: a chain at the host's
 //! time, its fee pipeline on, a block's wait on every extrinsic, its
 //! genesis the pallet's formats and programs and the accounts it funds. The
-//! space is registered, its authorities added and it migrates away by the
-//! pallet's calls, signed by its controller; its nodes anchor and submit
+//! space is registered and its authorities added by the pallet's calls,
+//! signed by its controller; its nodes anchor and submit
 //! through their `KreivoVenue` clients, each signing as its own account.
 
 use std::sync::{Arc, Mutex};
@@ -50,8 +50,8 @@ pub struct Kreivo {
 }
 
 impl Kreivo {
-    /// The chain, accepting `format::MASKED_WRAP` and `programs`, none venue-bound,
-    /// from its genesis; the founder and the controller funded.
+    /// The chain, accepting `format::MASKED_WRAP` and `programs` from its
+    /// genesis; the founder and the controller funded.
     pub fn new(programs: &[ProgramId]) -> Self {
         let mut chain = Chain::new(Constants::kreivo(VENUE)).with_fees(true);
         let always = Active {
@@ -62,7 +62,6 @@ impl Kreivo {
         for program in programs {
             let info = ProgramInfo {
                 handler: Handler::Record,
-                venue_bound: false,
                 active: always,
             };
             chain.set_storage(keys::programs(&program.0), info.encode());
@@ -122,14 +121,13 @@ impl Kreivo {
         }
     }
 
-    /// The space `genesis` founds, registered from `start_window` by the
-    /// controller with a founder's signature, its sovereign account funded
+    /// The space `genesis` founds, registered from the chain's next window
+    /// by the controller with a founder's signature, its sovereign account funded
     /// by the founder first; each of `nodes` (number, anchor key) then an
     /// authority, paired with its anchor key.
     pub fn register(
         &self,
         genesis: &SpaceGenesis,
-        start_window: u64,
         (founder_key, founder_sig): ([u8; 32], [u8; 64]),
         nodes: &[(NodeNumber, [u8; 32])],
     ) {
@@ -143,7 +141,6 @@ impl Kreivo {
         let register = Call::Register {
             genesis: genesis.encode(),
             controller: controller(),
-            start_window,
             founder_key,
             founder_sig,
         };
@@ -158,15 +155,12 @@ impl Kreivo {
         }
     }
 
-    /// The space's migration to `to` from window `from_window`, by its
-    /// controller.
-    pub fn migrate(&self, space: &SpaceId, to: VenueId, from_window: u64) -> Outcome {
-        let migrate = Call::Migrate {
-            space: space.0,
-            to: to.0,
-            from_window,
-        };
-        self.call(controller(), migrate.bytes())
+    /// The first window the chain anchors of `space`.
+    pub fn start(&self, space: &SpaceId) -> u64 {
+        self.chain
+            .with(|chain| chain.space(&space.0))
+            .expect("the space registered")
+            .start_window
     }
 
     /// The space's sovereign account.

@@ -145,7 +145,7 @@ impl Cluster {
             }),
         ));
         if let Some(genesis) = space.genesis() {
-            venue.register(genesis, 0);
+            venue.seed(genesis, 0);
         }
         let cluster = Self {
             hub: Hub::new(seed),

@@ -237,8 +237,8 @@ impl Leader {
     /// Hand the venue the anchors this leadership has not settled, in
     /// window order, until one waits: a window the venue's clock has not
     /// yet closed, an anchor no key of this node's can sign, or one the
-    /// venue will not take until its controller acts (a key registered, the
-    /// space resumed). The next batch tries again, or an idle leader a
+    /// venue will not take until its controller or governance acts (a key
+    /// registered, the space unblocked). The next batch tries again, or an idle leader a
     /// recheck later ([`Leader::anchor_wait`]), with the later ones behind
     /// it, so none passes it. A window past `MaxRootAge` by the venue's
     /// time (this node's while the venue's client cannot say) is settled
@@ -286,9 +286,9 @@ impl Leader {
         if venue.status(&space).waits() {
             self.alert(
                 window,
-                "the space is suspended or blocked at the venue; its anchors wait, unsent, until \
-                 its controller resumes it (after removing both equivocating keys) or the venue \
-                 unblocks it",
+                "the space is ended or blocked at the venue; its anchors wait, unsent: an ended \
+                 space re-founds under a new genesis, a blocked one waits for the venue to \
+                 unblock it",
             );
             return false;
         }
@@ -346,11 +346,11 @@ impl Leader {
                 );
                 false
             }
-            Err(AnchorRefusal::Suspended) => {
+            Err(AnchorRefusal::Stopped) => {
                 self.alert(
                     window,
-                    "the space is suspended at the venue, for an equivocation, until its \
-                     controller removes both keys and resumes it; anchoring again",
+                    "the space is ended at the venue, for an equivocation, or blocked; anchoring \
+                     again",
                 );
                 false
             }
@@ -367,10 +367,8 @@ impl Leader {
                     window,
                     "the venue holds another root of the space at this window, signed by a \
                      listed anchor key: that key is compromised or its node faulty. This node's \
-                     anchor goes as the evidence, which suspends the space; its controller \
-                     removes both signing keys (this node's too: `vos node anchor-key rotate`, \
-                     then `add_authority`) and resumes it, and the window's root never counts \
-                     again"
+                     anchor goes as the evidence, which ends the space for good; it re-founds \
+                     under a new genesis"
                 );
                 self.anchoring.refused.insert(window);
                 true

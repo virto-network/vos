@@ -14,7 +14,7 @@ use vos_node::store::EntryKind;
 use vos_node::{Config, Node, Reply};
 use vos_tree::{Hash, NodeStore};
 use vos_venue::vos_statement::{Refusal, Statement, StatementId};
-use vos_venue::{AnchorRefusal, Anchored, ModelVenue, NotAccepted, Status, VenueClient};
+use vos_venue::{ModelVenue, NotAccepted, VenueClient};
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, InstanceId, MapId, MethodId, RequestId, Session};
 use vos_wire::keys::{self, Transform};
@@ -22,7 +22,7 @@ use vos_wire::peer::NodeNumber;
 use vos_wire::records::{PendingRead, Workflow, WorkflowState, unstored, unversioned};
 use vos_wire::result::{Attest, InputRef, Outcome, Step, WorkResult};
 use vos_wire::served::representative_row;
-use vos_wire::vos_anchor::{Anchor, MAX_LENGTH_MS, RootKind, RootRead, SpaceId, VenueId};
+use vos_wire::vos_anchor::{MAX_LENGTH_MS, RootKind, RootRead, VenueId};
 use vos_wire::{Decode, Encode, WindowClock};
 
 use crate::common::{ALICE, Cluster, Rows, wait_until};
@@ -295,10 +295,10 @@ impl Anchoring {
         move |_, config| config.venue = Some(Arc::clone(&venue))
     }
 
-    /// The cluster's space registered at the venue, from window 0.
+    /// The cluster's space set registered at the venue, from window 0.
     pub(crate) fn register(&self, cluster: &Cluster) {
         self.venue
-            .register(cluster.space.genesis().expect("a genesis"), 0);
+            .seed(cluster.space.genesis().expect("a genesis"), 0);
     }
 
     /// Every node's clock and the venue's set to read `at` about now.
@@ -467,15 +467,7 @@ impl Judging {
     }
 }
 
-impl VenueClient for Judging {
-    fn id(&self) -> VenueId {
-        self.model.id()
-    }
-
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        self.model.anchor(anchor)
-    }
-
+vos_venue::forward_venue!(Judging => model; forward [id, anchor, anchor_keys, status, time, unsettled] {
     fn submit(&self, statement: &Statement, _: &[u8]) -> Result<StatementId, NotAccepted> {
         self.submissions.fetch_add(1, Ordering::SeqCst);
         let id = statement.id();
@@ -488,20 +480,4 @@ impl VenueClient for Judging {
     fn anchored(&self, root: &RootRead) -> bool {
         !self.hold.load(Ordering::SeqCst) && self.model.anchored(root)
     }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        self.model.anchor_keys(space)
-    }
-
-    fn status(&self, space: &SpaceId) -> Status {
-        self.model.status(space)
-    }
-
-    fn time(&self) -> Option<u64> {
-        self.model.time()
-    }
-
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.model.unsettled(space)
-    }
-}
+});

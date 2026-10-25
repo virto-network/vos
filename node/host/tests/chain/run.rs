@@ -1,9 +1,9 @@
-//! The run, phase by phase: the space at Kreivo, its migration, the JAM
-//! leg, the rootless statements and their replays past `MaxRootAge`; then
-//! its measurements and its audit.
+//! The run, phase by phase: a space at Kreivo and a space at JAM, each at
+//! its one venue; their statements refused where their roots are not
+//! anchored, and a rootless one refused at JAM; the replays past
+//! `MaxRootAge`; then its measurements and its audit.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -17,7 +17,6 @@ use vos_statement_service::state::{Outcome as Judged, keys as jam_keys};
 use vos_venue::VenueClient;
 use vos_venue::kreivo::KreivoVenue;
 use vos_venue::vos_statement::{Refusal, Statement};
-use vos_wire::SpaceGenesis;
 use vos_wire::keys;
 use vos_wire::package::SLOT_MS;
 use vos_wire::peer::NodeNumber;
@@ -34,10 +33,10 @@ use crate::kernels::Kernels;
 use crate::kreivo::{self, Kreivo};
 use crate::record::Record;
 use crate::support::{attests, delay, replica};
-use crate::venues::{Judgement, Migrating, Recorded, Serial, Wire};
+use crate::venues::{Judgement, Recorded, Serial, Wire};
 use crate::{collect, measure};
 
-/// The space's windows: the shortest a venue registers.
+/// The spaces' windows: the shortest a venue registers.
 const LENGTH_MS: u64 = MIN_LENGTH_MS;
 /// How far the chain's clock moves at the end: past `MaxRootAge` by an
 /// hour, so every row the service queued to drop by its hour may go.
@@ -49,7 +48,7 @@ const ACCEPTED_WITHIN: Duration = Duration::from_secs(1_200);
 /// captures: a log line from a node's thread, a line on standard error.
 pub const CANARY: &str = "e2e-chain-canary";
 
-/// Each node's Kreivo client, by number: itself, as recorded, and as
+/// Each Kreivo node's client, by number: itself, as recorded, and as
 /// tapped.
 pub type KreivoClients =
     Arc<Mutex<BTreeMap<NodeNumber, (Arc<KreivoVenue>, Arc<Recorded>, Arc<Tapped>)>>>;
@@ -90,17 +89,29 @@ impl Jam {
     }
 }
 
+/// Where a space anchors: Kreivo's mock, or the JAM service `a`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Venue {
+    Kreivo,
+    Jam,
+}
+
+/// A space of three nodes at its one venue: its nodes, the frames between
+/// them, its agents.
+pub struct Space {
+    pub venue: Venue,
+    pub cluster: Cluster,
+    pub frames: Frames,
+    pub id: SpaceId,
+    pub agents: Agents,
+}
+
 /// A statement at a cut, as the run asked for it and its record made it.
 pub struct Stated {
+    pub venue: Venue,
     pub asked: Asked,
     pub attest: Attest,
     pub statement: Statement,
-}
-
-/// The reader's rootless statements, each with its proof.
-pub struct Rootless {
-    pub bound: (Statement, Vec<u8>),
-    pub free: (Statement, Vec<u8>),
 }
 
 /// The run's parts, phase to phase.
@@ -115,15 +126,12 @@ pub struct Run {
     pub jam_b: Jam,
     pub kreivo: Arc<Kreivo>,
     pub kreivo_clients: KreivoClients,
-    moved: Arc<AtomicBool>,
-    pub cluster: Cluster,
-    pub frames: Frames,
     pub clock: WindowClock,
-    pub space: SpaceId,
-    genesis: SpaceGenesis,
-    pub agents: Agents,
-    /// The window the space migrates at.
-    pub k: u64,
+    /// The space at Kreivo, and the space at JAM `a`.
+    pub at_kreivo: Space,
+    pub at_jam: Space,
+    /// The first window the run reads.
+    pub first: u64,
 }
 
 /// Sleep until the host's clock reads `at`.
@@ -143,23 +151,24 @@ pub fn accepted<'a>(judged: &'a [Judgement], statement: &Statement) -> Option<&'
 }
 
 #[test]
-fn a_space_moves_from_kreivo_to_jam_and_no_carrier_holds_its_internals() {
+fn each_space_anchors_at_its_one_venue_and_no_carrier_holds_its_internals() {
     let mut run = Run::start();
-    let first = run.kreivo_leg();
-    run.migrate(&first);
-    let stated = run.jam_leg(first);
+    let stated = run.reads();
+    run.elsewhere(&stated);
     let rootless = run.rootless();
     let judged = run.judged(&stated, &rootless);
     let mut audit = collect::nodes(&mut run);
-    run.replays(&stated, &rootless);
+    run.replays(&stated);
     measure::all(&mut run, &stated, &judged);
     collect::rest(&mut run, &mut audit, &stated);
 }
 
 impl Run {
-    /// The testnet's two deployments of the JAM service, the Kreivo mock
-    /// and the space's three nodes, its agents installed; the space
-    /// registered at Kreivo from window 0, each node its authority.
+    /// The testnet's two deployments of the JAM service, the Kreivo mock,
+    /// and two spaces of three nodes, their agents installed: one at
+    /// Kreivo, each node its authority, and one at JAM `a`; each
+    /// registered by a founder's signature, anchoring from its venue's next
+    /// window.
     fn start() -> Self {
         let testnet = Testnet::from_env();
         let mut record = Record::new(&testnet.run);
@@ -171,8 +180,7 @@ impl Run {
         let prover = Arc::new(Serial::default());
         let kernels = Kernels::load(&prover);
 
-        // `a`, where the space anchors once it migrates, and `b`, another
-        // venue.
+        // `a`, where a space anchors, and `b`, another venue.
         let jam_a = Jam::deploy(&testnet, "a", &kernels);
         let jam_b = Jam::deploy(&testnet, "b", &kernels);
         for jam in [&jam_a, &jam_b] {
@@ -188,77 +196,105 @@ impl Run {
             kernels.window.program,
         ]));
 
-        // Windows two minutes long from now; each node's venue its Kreivo
-        // client until the space moves, then the JAM service.
+        // Windows two minutes long from now.
         let clock = WindowClock {
             origin_ms: vos_node::wall_clock() - 1_000,
             length_ms: LENGTH_MS,
         };
-        let moved = Arc::new(AtomicBool::new(false));
         let kreivo_clients = KreivoClients::default();
-        let canary = Arc::new(Canary::new(CANARY));
-        let cluster = {
-            let (kreivo, clients, jam, moved) = (
-                Arc::clone(&kreivo),
-                Arc::clone(&kreivo_clients),
-                Arc::clone(&jam_a.tapped),
-                Arc::clone(&moved),
-            );
-            let prover: Arc<dyn Prover> = prover.clone();
-            let hooks: Arc<dyn Hooks> = canary;
-            Cluster::in_space(
-                3,
-                Some(clock),
+        let canary: Arc<dyn Hooks> = Arc::new(Canary::new(CANARY));
+        let tune =
+            |venue: Arc<dyn Fn(NodeNumber, SpaceId) -> Arc<dyn VenueClient> + Send + Sync>| {
+                let (prover, hooks): (Arc<dyn Prover>, _) = (prover.clone(), Arc::clone(&canary));
                 move |number: NodeNumber, config: &mut Config| {
                     let space = vos_wire::vos_anchor::space_id(
                         config.space.as_ref().unwrap().genesis().unwrap(),
                     );
-                    let (.., before) = clients
-                        .lock()
-                        .unwrap()
-                        .entry(number)
-                        .or_insert_with(|| {
-                            let client = Arc::new(kreivo.client(number, space));
-                            let recorded = Arc::new(Recorded::new(client.clone()));
-                            (client, recorded.clone(), Arc::new(Tapped::new(recorded)))
-                        })
-                        .clone();
-                    let after: Arc<dyn VenueClient> = jam.clone();
-                    config.venue = Some(Arc::new(Migrating {
-                        before,
-                        after,
-                        moved: Arc::clone(&moved),
-                    }));
+                    config.venue = Some(venue(number, space));
                     config.prover = Some(Arc::clone(&prover));
                     config.hooks = Arc::clone(&hooks);
-                },
-            )
+                }
+            };
+        let at_kreivo = {
+            let (kreivo, clients) = (Arc::clone(&kreivo), Arc::clone(&kreivo_clients));
+            let venue = move |number: NodeNumber, space: SpaceId| -> Arc<dyn VenueClient> {
+                let (.., tapped) = clients
+                    .lock()
+                    .unwrap()
+                    .entry(number)
+                    .or_insert_with(|| {
+                        let client = Arc::new(kreivo.client(number, space));
+                        let recorded = Arc::new(Recorded::new(client.clone()));
+                        (client, recorded.clone(), Arc::new(Tapped::new(recorded)))
+                    })
+                    .clone();
+                tapped
+            };
+            Cluster::in_space(3, Some(clock), tune(Arc::new(venue)))
         };
-        let frames = carriers::tap_frames(&cluster.hub);
-        let space = cluster.space.id();
-        let genesis = cluster.space.genesis().unwrap().clone();
+        let at_jam = {
+            let tapped = Arc::clone(&jam_a.tapped);
+            let venue = move |_: NodeNumber, _: SpaceId| -> Arc<dyn VenueClient> { tapped.clone() };
+            Cluster::in_space(3, Some(clock), tune(Arc::new(venue)))
+        };
+
+        // At Kreivo: registered with a founder's signature, each node an
+        // authority paired with its anchor key.
+        let genesis = at_kreivo.space.genesis().unwrap().clone();
+        let founder = at_kreivo
+            .node(1)
+            .sign_registration(&kreivo::VENUE, &kreivo::controller())
+            .expect("node 1 founded the space");
+        kreivo.register(&genesis, founder, &genesis.nodes);
+        let id = at_kreivo.space.id();
+        let registered = kreivo.account(&kreivo.sovereign_of(&id));
         record.note(format!(
-            "the space {}: windows of {} s from {}, D {} s, three nodes",
-            hex::encode(&space.0[..8]),
+            "the space {} at Kreivo: windows of {} s from {}, D {} s, three nodes; registered \
+             from window {}, 3 authorities; the sovereign account free {}, held for the \
+             registration {}",
+            hex::encode(&id.0[..8]),
             LENGTH_MS / 1_000,
             clock.origin_ms,
-            delay(&clock) / 1_000
+            delay(&clock) / 1_000,
+            kreivo.start(&id),
+            registered.free,
+            registered.held_registration
         ));
 
-        // Registered from window 0 with a founder's signature, each node an
-        // authority paired with its anchor key.
-        let founder = cluster
+        // At JAM `a`: registered with a founder's signature under an
+        // ed25519 controller.
+        let genesis = at_jam.space.genesis().unwrap().clone();
+        let controller = SigningKey::from_bytes(&blake2b_256(&[b"vos/e2e-chain/jam/controller"]))
+            .verifying_key()
+            .to_bytes();
+        let jam = &jam_a.venue;
+        let (key, signature) = at_jam
             .node(1)
-            .sign_registration(&kreivo::VENUE, &kreivo::controller(), 0)
+            .sign_registration(&jam.id(), &controller)
             .expect("node 1 founded the space");
-        kreivo.register(&genesis, 0, founder, &genesis.nodes);
-        let registered = kreivo.account(&kreivo.sovereign_of(&space));
+        let code = jam
+            .register_signed(&genesis, controller, key, signature)
+            .expect("the registration lands");
+        assert_eq!(code, 0, "registered at the JAM service");
+        let id = at_jam.space.id();
+        let start = jam.space(&id).unwrap().expect("registered").start;
         record.note(format!(
-            "Kreivo: registered from window 0, 3 authorities; the sovereign account free {}, \
-             held for the registration {}",
-            registered.free, registered.held_registration
+            "the space {} at JAM a: the same clock, three nodes; registered from window {start}",
+            hex::encode(&id.0[..8]),
         ));
-        let agents = Agents::install(&cluster);
+
+        let space = |venue, cluster: Cluster| {
+            let frames = carriers::tap_frames(&cluster.hub);
+            let id = cluster.space.id();
+            let agents = Agents::install(&cluster);
+            Space {
+                venue,
+                cluster,
+                frames,
+                id,
+                agents,
+            }
+        };
         Self {
             testnet,
             record,
@@ -270,14 +306,10 @@ impl Run {
             jam_b,
             kreivo,
             kreivo_clients,
-            moved,
-            cluster,
-            frames,
             clock,
-            space,
-            genesis,
-            agents,
-            k: 0,
+            at_kreivo: space(Venue::Kreivo, at_kreivo),
+            at_jam: space(Venue::Jam, at_jam),
+            first: 0,
         }
     }
 
@@ -285,7 +317,7 @@ impl Run {
         self.clock.boundary(window).unwrap()
     }
 
-    /// Every judgement the nodes' Kreivo clients were given.
+    /// Every judgement the Kreivo space's clients were given.
     pub fn kreivo_judged(&self) -> Vec<Judgement> {
         self.kreivo_clients
             .lock()
@@ -295,79 +327,81 @@ impl Run {
             .collect()
     }
 
-    /// A balance read at Kreivo, in the next window, `first`: the space
-    /// migrates two windows later.
-    fn kreivo_leg(&mut self) -> Asked {
+    /// The judgements given at `venue`.
+    pub fn judged_at(&self, venue: Venue) -> Vec<Judgement> {
+        match venue {
+            Venue::Kreivo => self.kreivo_judged(),
+            Venue::Jam => self.jam_a.recorded.judged(),
+        }
+    }
+
+    /// The space at `venue`.
+    pub fn space(&self, venue: Venue) -> &Space {
+        match venue {
+            Venue::Kreivo => &self.at_kreivo,
+            Venue::Jam => &self.at_jam,
+        }
+    }
+
+    /// From the next window on: a balance read at Kreivo in the first; a
+    /// balance and a window read at JAM in each of three; every statement
+    /// accepted at its space's venue.
+    fn reads(&mut self) -> Vec<Stated> {
         let first = self.clock.window(vos_node::wall_clock()).unwrap() + 1;
-        self.k = first + 2;
-        until(self.boundary(first - 1) + 2_000);
-        let asked = self.agents.ask_balance(&self.cluster, first);
-        self.record
-            .note(format!("window {first}: a balance read asked, at Kreivo"));
-        asked
+        self.first = first;
+        let mut asked = Vec::new();
+        for w in first..first + 3 {
+            until(self.boundary(w - 1) + 2_000);
+            if w == first {
+                let space = &self.at_kreivo;
+                asked.push((Venue::Kreivo, space.agents.ask_balance(&space.cluster, w)));
+                self.record
+                    .note(format!("window {w}: a balance read asked, at Kreivo"));
+            }
+            let space = &self.at_jam;
+            asked.push((Venue::Jam, space.agents.ask_balance(&space.cluster, w)));
+            asked.push((Venue::Jam, space.agents.ask_window(&space.cluster, w)));
+            self.record.note(format!(
+                "window {w}: a balance and a window read asked, at JAM"
+            ));
+        }
+        let stated: Vec<Stated> = asked
+            .iter()
+            .map(|(venue, asked)| self.stated(*venue, asked))
+            .collect();
+        vos_checker::wait_until("every statement accepted", ACCEPTED_WITHIN, || {
+            let (kreivo, jam) = (self.kreivo_judged(), self.jam_a.recorded.judged());
+            stated.iter().all(|stated| {
+                let judged = match stated.venue {
+                    Venue::Kreivo => &kreivo,
+                    Venue::Jam => &jam,
+                };
+                accepted(judged, &stated.statement).is_some()
+            })
+        });
+        for stated in &stated {
+            self.record.note(format!(
+                "accepted at {:?}: {}'s statement at window {}'s cut, format {}, {}",
+                stated.venue,
+                stated.asked.what,
+                stated.asked.window,
+                stated.statement.format,
+                hex::encode(&stated.statement.id().0[..8])
+            ));
+        }
+        stated
     }
 
-    /// In window k − 1: registered at JAM `a` from k by a founder's
-    /// signature, under an ed25519 controller, and migrated away from
-    /// Kreivo from k. The nodes move to the service once window k − 1 is
-    /// anchored at Kreivo and `first`'s balance statement accepted there,
-    /// before window k closes, so its anchor goes to the service.
-    fn migrate(&mut self, first: &Asked) {
-        let k = self.k;
-        until(self.boundary(k - 2) + 30_000);
-        let controller = SigningKey::from_bytes(&blake2b_256(&[b"vos/e2e-chain/jam/controller"]))
-            .verifying_key()
-            .to_bytes();
-        let jam = &self.jam_a.venue;
-        let (key, signature) = self
-            .cluster
-            .node(1)
-            .sign_registration(&jam.id(), &controller, k)
-            .expect("node 1 founded the space");
-        let code = jam
-            .register_signed(&self.genesis, controller, k, key, signature)
-            .expect("the registration lands");
-        assert_eq!(code, 0, "registered at the JAM service from window {k}");
-        let migrated = self.kreivo.migrate(&self.space, jam.id(), k);
-        self.record.note(format!(
-            "window {}: registered at JAM from window {k} (code {code}); migrated away from \
-             Kreivo from window {k}: {} event",
-            k - 1,
-            migrated.events.len()
-        ));
-
-        let statement = self.stated(first).statement;
-        let d = delay(&self.clock);
-        let within = (self.boundary(k) + d - 10_000).saturating_sub(vos_node::wall_clock());
-        vos_checker::wait_until(
-            "window k − 1 anchored at Kreivo and the balance statement accepted there",
-            Duration::from_millis(within),
-            || {
-                self.kreivo.holds(&self.space, k - 1)
-                    && accepted(&self.kreivo_judged(), &statement).is_some()
-            },
-        );
-        self.moved.store(true, Ordering::SeqCst);
-        let moved_at = vos_node::wall_clock();
-        assert!(
-            moved_at + 5_000 < self.boundary(k) + d,
-            "the nodes moved before window {k} closes"
-        );
-        self.record.note(format!(
-            "the nodes' venue moved to JAM {} s before window {k} closes",
-            (self.boundary(k) + d - moved_at) / 1_000
-        ));
-    }
-
-    /// `asked`'s read once it ended, and the statement its record makes.
-    fn stated(&self, asked: &Asked) -> Stated {
+    /// `asked`'s read in the space at `venue` once it ended, and the
+    /// statement its record makes.
+    fn stated(&self, venue: Venue, asked: &Asked) -> Stated {
+        let cluster = &self.space(venue).cluster;
         let mut ended = None;
         vos_checker::wait_until(
             &format!("{}'s read in window {} ends", asked.what, asked.window),
             READ_ENDS,
             || {
-                ended = self
-                    .cluster
+                ended = cluster
                     .running()
                     .filter(|(_, node)| node.applied(asked.agent).is_some())
                     .find_map(|(_, node)| {
@@ -386,78 +420,24 @@ impl Run {
         );
         let outcome = ended.unwrap();
         assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
-        let node = replica(&self.cluster, asked.agent);
+        let node = replica(cluster, asked.agent);
         let attest = attests(node, asked.agent, asked.read)[0].clone();
         assert_eq!(attest.window, Some(asked.window));
         let statement = self.kernels.of(&attest).statement(&attest);
         Stated {
+            venue,
             asked: *asked,
             attest,
             statement,
         }
     }
 
-    /// At JAM: a balance and a window read in each of windows k to k + 2,
-    /// every statement, `first`'s at Kreivo among them, accepted; then
-    /// window k's statement refused at Kreivo, past its range there.
-    fn jam_leg(&mut self, first: Asked) -> Vec<Stated> {
-        let k = self.k;
-        let mut asked = vec![first];
-        for w in k..k + 3 {
-            until(self.boundary(w - 1) + 2_000);
-            asked.push(self.agents.ask_balance(&self.cluster, w));
-            asked.push(self.agents.ask_window(&self.cluster, w));
-            self.record.note(format!(
-                "window {w}: a balance and a window read asked, at JAM"
-            ));
-        }
-        let stated: Vec<Stated> = asked.iter().map(|asked| self.stated(asked)).collect();
-        vos_checker::wait_until("every statement accepted", ACCEPTED_WITHIN, || {
-            let (kreivo, jam) = (self.kreivo_judged(), self.jam_a.recorded.judged());
-            stated.iter().all(|stated| {
-                let judged = if stated.asked.window < k {
-                    &kreivo
-                } else {
-                    &jam
-                };
-                accepted(judged, &stated.statement).is_some()
-            })
-        });
-        for stated in &stated {
-            let venue = if stated.asked.window < k {
-                "Kreivo"
-            } else {
-                "JAM"
-            };
-            self.record.note(format!(
-                "accepted at {venue}: {}'s statement at window {}'s cut, format {}, {}",
-                stated.asked.what,
-                stated.asked.window,
-                stated.statement.format,
-                hex::encode(&stated.statement.id().0[..8])
-            ));
-        }
-
-        let (statement, proof) = self.submitted(&self.at_k(&stated).statement);
-        let node_1 = self.kreivo_clients.lock().unwrap()[&1].2.clone();
-        let refused = node_1.submit(&statement, &proof);
-        self.record.note(format!(
-            "window {k}'s statement at Kreivo, past its migration: {refused:?}"
-        ));
-        assert_eq!(
-            refused,
-            Err(Refusal::Unanchored.into()),
-            "unanchored at Kreivo"
-        );
-        stated
-    }
-
-    /// The first statement of window k, the first of JAM's.
-    fn at_k<'a>(&self, stated: &'a [Stated]) -> &'a Stated {
+    /// The first statement of the JAM space's.
+    fn first_at_jam<'a>(&self, stated: &'a [Stated]) -> &'a Stated {
         stated
             .iter()
-            .find(|stated| stated.asked.window == self.k)
-            .expect("a statement of window k")
+            .find(|stated| stated.venue == Venue::Jam)
+            .expect("a statement at JAM")
     }
 
     /// `statement` and the proof the nodes submitted it with at JAM `a`.
@@ -470,80 +450,67 @@ impl Run {
             .expect("submitted at JAM")
     }
 
-    /// The reader's rootless statements, proved by the run: `stamped`,
-    /// bound to JAM `a`, accepted there and refused at `b`; `ordered`, of
-    /// no venue, accepted at both.
-    fn rootless(&mut self) -> Rootless {
-        let (stamped, ordered) = self.agents.plain(&self.cluster, self.jam_a.venue.id());
-        let prove = |attest: &Attest| {
-            let kernel = self.kernels.of(attest);
-            let proof = self
-                .prover
-                .prove(&kernel.blob, attest)
-                .expect("a rootless proof");
-            (kernel.statement(attest), proof)
-        };
-        let rootless = Rootless {
-            bound: prove(&stamped),
-            free: prove(&ordered),
-        };
-        let ((bound, bound_proof), (free, free_proof)) = (&rootless.bound, &rootless.free);
-        let (a, b) = (&self.jam_a.tapped, &self.jam_b.tapped);
+    /// The JAM space's first statement, accepted at JAM `a`, is refused
+    /// where its space's roots are not anchored: at Kreivo, by the Kreivo
+    /// space's client, and at JAM `b`.
+    fn elsewhere(&mut self, stated: &[Stated]) {
+        let (statement, proof) = self.submitted(&self.first_at_jam(stated).statement);
+        let node_1 = self.kreivo_clients.lock().unwrap()[&1].2.clone();
         let verdicts = [
-            (
-                "venue-bound, at its venue",
-                a.submit(bound, bound_proof),
-                Ok(bound.id()),
-            ),
-            (
-                "venue-bound, at another venue",
-                b.submit(bound, bound_proof),
-                Err(Refusal::Venue.into()),
-            ),
-            (
-                "unbound, at JAM a",
-                a.submit(free, free_proof),
-                Ok(free.id()),
-            ),
-            (
-                "unbound, at JAM b",
-                b.submit(free, free_proof),
-                Ok(free.id()),
-            ),
+            ("at Kreivo", node_1.submit(&statement, &proof)),
+            ("at JAM b", self.jam_b.tapped.submit(&statement, &proof)),
         ];
-        for (what, verdict, expected) in verdicts {
-            self.record
-                .note(format!("a rootless statement, {what}: {verdict:?}"));
-            assert_eq!(verdict, expected, "{what}");
+        for (what, verdict) in verdicts {
+            self.record.note(format!(
+                "the JAM space's statement {what}, where its roots are not anchored: \
+                 {verdict:?}"
+            ));
+            assert_eq!(verdict, Err(Refusal::Unanchored.into()), "{what}");
         }
-        rootless
+    }
+
+    /// The JAM space reader's rootless `ordered`, proved by the run and
+    /// refused at JAM `a`, its program pinned there: a venue judges rooted
+    /// statements alone.
+    fn rootless(&mut self) -> (Statement, Vec<u8>) {
+        let space = &self.at_jam;
+        let (_, ordered) = space.agents.plain(&space.cluster, self.jam_a.venue.id());
+        let kernel = self.kernels.of(&ordered);
+        let proof = self
+            .prover
+            .prove(&kernel.blob, &ordered)
+            .expect("a rootless proof");
+        let statement = kernel.statement(&ordered);
+        let verdict = self.jam_a.tapped.submit(&statement, &proof);
+        self.record
+            .note(format!("a rootless statement at JAM a: {verdict:?}"));
+        assert_eq!(
+            verdict,
+            Err(Refusal::Space.into()),
+            "rooted statements only"
+        );
+        (statement, proof)
     }
 
     /// What each JAM deployment keeps of each statement submitted there,
     /// read before the chain's clock moves and its outcomes age out: by
     /// deployment and statement, the outcome.
-    fn judged(&self, stated: &[Stated], rootless: &Rootless) -> Vec<(String, Judged)> {
-        let mut judged = Vec::new();
-        let at_jam = stated.iter().filter(|stated| stated.asked.window >= self.k);
-        for statement in at_jam.map(|stated| &stated.statement) {
-            judged.push((self.jam_a.name, statement));
-        }
-        for jam in [&self.jam_a, &self.jam_b] {
-            judged.push((jam.name, &rootless.bound.0));
-            judged.push((jam.name, &rootless.free.0));
-        }
+    fn judged(&self, stated: &[Stated], rootless: &(Statement, Vec<u8>)) -> Vec<(String, Judged)> {
+        let mut judged: Vec<(&Jam, &Statement)> = stated
+            .iter()
+            .filter(|stated| stated.venue == Venue::Jam)
+            .map(|stated| (&self.jam_a, &stated.statement))
+            .collect();
+        judged.push((&self.jam_b, &self.first_at_jam(stated).statement));
+        judged.push((&self.jam_a, &rootless.0));
         judged
             .into_iter()
-            .map(|(name, statement)| {
-                let jam = if name == "a" {
-                    &self.jam_a
-                } else {
-                    &self.jam_b
-                };
+            .map(|(jam, statement)| {
                 let outcome = jam.judged(statement).expect("an outcome kept");
                 (
                     format!(
-                        "JAM {name}, statement {}",
+                        "JAM {}, statement {}",
+                        jam.name,
                         hex::encode(&statement.id().0[..8])
                     ),
                     outcome,
@@ -552,22 +519,20 @@ impl Run {
             .collect()
     }
 
-    /// The anchor records JAM `a` holds of windows k to k + 2, and the
-    /// space's record there; every window before k anchored at Kreivo, k
-    /// not.
+    /// The Kreivo space's anchors at Kreivo, from its first window through
+    /// the run's first; the JAM space's at JAM `a`, of the run's three
+    /// windows, and its record there.
     pub fn anchor_chains(&self) -> Vec<u8> {
-        let k = self.k;
-        for w in 0..k {
-            assert!(self.kreivo.holds(&self.space, w), "window {w} at Kreivo");
+        let first = self.first;
+        let kreivo = &self.at_kreivo.id;
+        for w in self.kreivo.start(kreivo)..=first {
+            assert!(self.kreivo.holds(kreivo, w), "window {w} at Kreivo");
         }
-        assert!(
-            !self.kreivo.holds(&self.space, k),
-            "window {k} not at Kreivo"
-        );
+        let jam = &self.at_jam.id;
         let statements = &self.jam_a.venue.statements;
-        (k..k + 3)
-            .map(|w| jam_keys::anchor(&self.space, RootKind::Space, w))
-            .chain([jam_keys::space(&self.space)])
+        (first..first + 3)
+            .map(|w| jam_keys::anchor(jam, RootKind::Space, w))
+            .chain([jam_keys::space(jam)])
             .flat_map(|key| {
                 statements
                     .value(&key)
@@ -577,9 +542,9 @@ impl Run {
             .collect()
     }
 
-    /// Past `MaxRootAge` by the chain's clock, each accepted rootless
-    /// statement replayed is a repeat, window k's rooted one unanchored.
-    fn replays(&mut self, stated: &[Stated], rootless: &Rootless) {
+    /// Past `MaxRootAge` by the chain's clock, the JAM space's first
+    /// statement, replayed, is unanchored.
+    fn replays(&mut self, stated: &[Stated]) {
         let statements = &self.jam_a.venue.statements;
         let latest = statements.now().unwrap();
         self.testnet.shift(PAST_MAX_ROOT_AGE);
@@ -608,24 +573,11 @@ impl Run {
             "the chain's clock moved {} h ahead: JAM's time {jumped}",
             PAST_MAX_ROOT_AGE / 3_600_000
         ));
-        let rooted = self.submitted(&self.at_k(stated).statement);
-        let ((bound, bound_proof), (free, free_proof)) = (&rootless.bound, &rootless.free);
-        let replays = [
-            ("venue-bound, at JAM a", &self.jam_a, bound, bound_proof, 6),
-            ("unbound, at JAM a", &self.jam_a, free, free_proof, 6),
-            ("unbound, at JAM b", &self.jam_b, free, free_proof, 6),
-            ("rooted, at JAM a", &self.jam_a, &rooted.0, &rooted.1, 5),
-        ];
-        let mut codes = Vec::new();
-        for (what, jam, statement, proof, expected) in replays {
-            let code = replay(jam, statement, proof);
-            codes.push((what, code, expected));
-        }
-        for (what, code, expected) in codes {
-            self.record
-                .note(format!("replayed past MaxRootAge, {what}: code {code:#x}"));
-            assert_eq!(code, expected, "{what}, replayed past MaxRootAge");
-        }
+        let (statement, proof) = self.submitted(&self.first_at_jam(stated).statement);
+        let code = replay(&self.jam_a, &statement, &proof);
+        self.record
+            .note(format!("replayed past MaxRootAge at JAM a: code {code:#x}"));
+        assert_eq!(code, Refusal::Unanchored.code(), "replayed past MaxRootAge");
     }
 }
 

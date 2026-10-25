@@ -28,34 +28,46 @@ use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
 use crate::run::{CANARY, Jam, Run, Stated};
 use crate::venues::REPORTED;
 
-/// What each node holds and sent, and both venues' anchor chains,
+/// What each node of both spaces holds and sent, and both venues' anchor chains,
 /// collected before the nodes stop and the chain's clock moves; then the
 /// nodes stopped and their disks read, every file closed and none
 /// changing under the read.
 pub fn nodes(run: &mut Run) -> Audit {
     let mut audit = Audit::default();
     audit.carrier("the anchor chains", Reach::Leaves, run.anchor_chains());
-    for ((to, class), bytes) in run.frames.lock().unwrap().iter() {
-        let name = format!("frames to node {to}: {class}");
-        audit.carrier(name, Reach::Role, bytes.clone());
-    }
-    let agents = &run.agents;
-    let all = [
-        agents.representative,
-        agents.balance,
-        agents.window,
-        agents.reader,
-    ];
-    for (number, node) in run.cluster.running() {
-        carriers::node_carriers(&mut audit, number, node, &all, Reach::Role);
-    }
-    for number in 1..=3 {
-        run.cluster.stop(number);
-    }
-    for (at, dir) in run.cluster.dirs.iter().enumerate() {
-        let number = at as NodeNumber + 1;
-        for (path, bytes) in carriers::directory(dir.path()) {
-            audit.carrier(format!("node {number}: {path}"), Reach::Role, bytes);
+    for space in [&mut run.at_kreivo, &mut run.at_jam] {
+        let at = format!("{:?}", space.venue);
+        for ((to, class), bytes) in space.frames.lock().unwrap().iter() {
+            let name = format!("{at}'s space, frames to node {to}: {class}");
+            audit.carrier(name, Reach::Role, bytes.clone());
+        }
+        let agents = &space.agents;
+        let all = [
+            agents.representative,
+            agents.balance,
+            agents.window,
+            agents.reader,
+        ];
+        for (number, node) in space.cluster.running() {
+            let mut held = Audit::default();
+            carriers::node_carriers(&mut held, number, node, &all, Reach::Role);
+            for carrier in held.carriers {
+                let name = format!("{at}'s space, {}", carrier.name);
+                audit.carrier(name, carrier.reach, carrier.bytes);
+            }
+        }
+        for number in 1..=3 {
+            space.cluster.stop(number);
+        }
+        for (n, dir) in space.cluster.dirs.iter().enumerate() {
+            let number = n as NodeNumber + 1;
+            for (path, bytes) in carriers::directory(dir.path()) {
+                audit.carrier(
+                    format!("{at}'s space, node {number}: {path}"),
+                    Reach::Role,
+                    bytes,
+                );
+            }
         }
     }
     audit
@@ -95,7 +107,7 @@ fn wire(audit: &mut Audit, jam: &Jam) -> Vec<Vec<u8>> {
 pub fn rest(run: &mut Run, audit: &mut Audit, stated: &[Stated]) {
     audit.needles.debug_outputs();
     let made = run.prover.made();
-    assert!(made.len() >= stated.len() + 2, "each statement proved");
+    assert!(made.len() > stated.len(), "each statement proved");
     for (n, (attest, internals)) in made.iter().enumerate() {
         assert!(!internals.proofs.is_empty() && !internals.memory_roots.is_empty());
         let name = format!("statement {n}");

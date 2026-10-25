@@ -15,7 +15,7 @@ use vos_jam_dev::JamVenue;
 use vos_jam_dev::live::PolkaJam;
 use vos_jam_dev::live::statements;
 use vos_statement_service::config::Config;
-use vos_venue::vos_statement::Pin;
+use vos_venue::vos_statement::ProgramId;
 use vos_wire::package::EPOCH_MS;
 
 use crate::venues::Wire;
@@ -61,7 +61,7 @@ impl Testnet {
     /// The statements service, deployed as `name` and pinning `pins`, as a
     /// venue checked to run its code, every package its client sends kept
     /// by `wire`.
-    pub fn deploy(&self, name: &str, pins: Vec<Pin>, wire: &Arc<Wire>) -> JamVenue {
+    pub fn deploy(&self, name: &str, pins: Vec<ProgramId>, wire: &Arc<Wire>) -> JamVenue {
         let parameters = self.node.parameters().expect("the testnet's parameters");
         let config = Config {
             genesis: self.node.genesis().expect("the chain's genesis"),

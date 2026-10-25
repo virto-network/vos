@@ -149,15 +149,13 @@ impl Node {
 
     /// The space's registration at `venue`, signed as a founder: this
     /// node's key and its signature over the registration digest of the
-    /// space, `controller` and `start_window`
-    /// (`vos_anchor::register_digest`). None when the node is of no space,
-    /// or its genesis does not name this node's key: only a founding node
-    /// signs one.
+    /// space and `controller` (`vos_anchor::register_digest`). None when
+    /// the node is of no space, or its genesis does not name this node's
+    /// key: only a founding node signs one.
     pub fn sign_registration(
         &self,
         venue: &vos_wire::vos_anchor::VenueId,
         controller: &[u8; 32],
-        start_window: u64,
     ) -> Option<([u8; 32], [u8; 64])> {
         use ed25519_dalek::Signer;
         let key = self.inner.anchor_keys.node_key();
@@ -167,7 +165,7 @@ impl Node {
             return None;
         }
         let space = vos_wire::vos_anchor::space_id(genesis);
-        let digest = vos_wire::vos_anchor::register_digest(venue, &space, controller, start_window);
+        let digest = vos_wire::vos_anchor::register_digest(venue, &space, controller);
         Some((public, key.sign(&digest).to_bytes()))
     }
 
