@@ -373,6 +373,19 @@ impl<'a> Plan<'a> {
         }
     }
 
+    /// Fill every slot at the start: the users active then.
+    pub fn fill(&mut self) -> Vec<u64> {
+        for at in 0..self.slots.len() {
+            if self.slots[at].is_none() {
+                let user = self.draw_inactive();
+                let until = self.exponential(self.model.active_s);
+                self.active.insert(user);
+                self.slots[at] = Some(Slot { user, until });
+            }
+        }
+        self.slots.iter().flatten().map(|slot| slot.user).collect()
+    }
+
     /// The users active at once in this driver's share.
     pub fn slots(&self) -> usize {
         self.slots.len()

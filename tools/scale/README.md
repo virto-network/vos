@@ -59,6 +59,12 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
   A user's calls go one at a time, in order: a call scheduled while the
   user's last is unanswered waits for it (`queued`). The total adds the
   mix as sent against its target and the CPU the driver used.
+- **The capacity probe:** a plan with `"probe": true`, given to
+  `vos-scale drive-local --plan` by hand, sends every request to a node
+  that does not replicate its agent, which answers `Elsewhere` at once.
+  The driver does all its own work and the nodes almost none: its cost at
+  a rate the nodes could not commit. Its total line's `load_cores` and
+  `threads_cpu_s` give the CPU it took.
 - **Not modeled**, as every report says: the per-call identity read,
   credentialed calls, cross-space traffic and proving.
 

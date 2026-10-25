@@ -45,8 +45,19 @@ use crate::nodes::target;
 pub const MAX_CONNECTIONS: usize = 512;
 /// How far ahead of its schedule an operation is signed.
 const LOOKAHEAD: Duration = Duration::from_millis(500);
-/// How long one request may take before the driver counts it failed.
+/// How early an operation may go rather than wait for a timer: it is then
+/// timed from its send, not its schedule.
+const EARLY: Duration = Duration::from_micros(200);
+/// The least the planning thread sleeps once far enough ahead.
+const PLAN_NAP: Duration = Duration::from_millis(50);
+/// How long one request may take before the driver counts it failed:
+/// past it, a reaper that wakes every [`REAP`] closes its connection. A
+/// timer a request would cost as much as the request, at the driver's
+/// rates.
 const ANSWER: Duration = Duration::from_secs(30);
+const REAP: Duration = Duration::from_secs(1);
+/// How long a connection may take to open.
+const CONNECT: Duration = Duration::from_secs(10);
 /// A kept connection is used again only if idle less than this long, well
 /// within the node's idle limit.
 const REUSE: Duration = Duration::from_secs(20);
@@ -147,6 +158,33 @@ impl Shared {
             .expect("16 bytes")
     }
 
+    /// `user`'s session, opened if it has none: its key derived outside
+    /// the lock.
+    fn open(&self, user: u64) {
+        if self.sessions.lock().expect("sessions").contains_key(&user) {
+            return;
+        }
+        let key = self.key(user);
+        let generation = 0;
+        let session = UserSession {
+            key,
+            name: self.session_name(user, generation),
+            t0: self.agent_now(),
+            generation,
+            planned_next: 1,
+            sent_next: 1,
+            unsent: 0,
+            floor: 0,
+            busy: false,
+            queue: VecDeque::new(),
+        };
+        self.sessions
+            .lock()
+            .expect("sessions")
+            .entry(user)
+            .or_insert(session);
+    }
+
     /// A new session for `session`'s user, its calls not yet sent to be
     /// signed again in it.
     fn renew(&self, user: u64, session: &mut UserSession) {
@@ -218,26 +256,9 @@ impl Shared {
             planned.user
         };
         let cross = planned.payee.is_some_and(|(_, cross)| cross);
-        let fresh = {
-            let known = self.sessions.lock().expect("sessions").contains_key(&user);
-            (!known).then(|| self.key(user))
-        };
+        self.open(user);
         let mut sessions = self.sessions.lock().expect("sessions");
-        let session = sessions.entry(user).or_insert_with(|| {
-            let generation = 0;
-            UserSession {
-                key: fresh.unwrap_or_else(|| self.key(user)),
-                name: self.session_name(user, generation),
-                t0: self.agent_now(),
-                generation,
-                planned_next: 1,
-                sent_next: 1,
-                unsent: 0,
-                floor: 0,
-                busy: false,
-                queue: VecDeque::new(),
-            }
-        });
+        let session = sessions.get_mut(&user).expect("an open session");
         if planned.kind == Kind::Query {
             let key = session.key.clone();
             let floor = session.floor;
@@ -260,6 +281,11 @@ impl Shared {
                 cross,
                 body: Body::Query(body),
             };
+        }
+        // A session's time is its first call's: one opened before the load,
+        // or long before its user acted, would be refused as stale.
+        if session.planned_next == 1 && session.unsent == 0 {
+            session.t0 = self.agent_now();
         }
         let sequence = session.planned_next;
         session.planned_next += 1;
@@ -356,15 +382,19 @@ fn fate(answer: &Result<Response, String>) -> Fate {
 /// A refusal's name: its variant, and for `Rejected`, `Refused` and a
 /// failed outcome, the inner one.
 pub fn refusal(answer: &Result<Response, String>) -> String {
-    let text = match answer {
-        Ok(Response::Ran {
+    let response = match answer {
+        Ok(response) => response,
+        Err(error) => return format!("client: {error}"),
+    };
+    let name = match response {
+        Response::Ran {
             outcome: Outcome::Failed { code, detail },
             ..
-        })
-        | Ok(Response::Workflow {
+        }
+        | Response::Workflow {
             status: WorkflowStatus::Ended(Outcome::Failed { code, detail }),
             ..
-        }) => {
+        } => {
             return match AttestError::decode(detail) {
                 Ok((error, _)) if *code == vos_wire::abi::Failure::Handler => {
                     format!("Failed({code:?}: {error:?})")
@@ -372,19 +402,35 @@ pub fn refusal(answer: &Result<Response, String>) -> String {
                 _ => format!("Failed({code:?})"),
             };
         }
-        Ok(response) => format!("{response:?}"),
-        Err(error) => return format!("client: {error}"),
+        Response::Rejected(rejection) => return format!("Rejected({})", variant(rejection)),
+        Response::Refused(refused) => return format!("Refused({})", variant(refused)),
+        Response::Workflow { status, .. } => return format!("Workflow({})", variant(status)),
+        Response::Ran { .. } => "Ran",
+        Response::NotConsumed => "NotConsumed",
+        Response::Busy => "Busy",
+        Response::NoAgent => "NoAgent",
+        Response::Stopped => "Stopped",
+        Response::Created(_) => "Created",
+        Response::Unavailable => "Unavailable",
+        Response::NotLeader { .. } => "NotLeader",
+        Response::Elsewhere { .. } => "Elsewhere",
+        Response::Unconfirmed(_) => "Unconfirmed",
+        Response::TimedOut => "TimedOut",
+        Response::Placed(_) => "Placed",
+        Response::Unplaced(_) => "Unplaced",
+        Response::Status(_) => "Status",
+        Response::Stats(_) => "Stats",
     };
-    let mut words = text
-        .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-        .filter(|word| !word.is_empty());
-    let first = words.next().unwrap_or("?");
-    match first {
-        "Rejected" | "Refused" => format!("{first}({})", words.next().unwrap_or("?")),
-        // `Workflow { status: Running, .. }`: the status.
-        "Workflow" => format!("{first}({})", words.nth(1).unwrap_or("?")),
-        _ => first.to_string(),
-    }
+    name.to_string()
+}
+
+/// A small enum's variant, by the first word its `Debug` writes.
+fn variant(value: &impl std::fmt::Debug) -> String {
+    let text = format!("{value:?}");
+    text.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+        .find(|word| !word.is_empty())
+        .unwrap_or("?")
+        .to_string()
 }
 
 /// One kind's counts over an interval, or the whole load.
@@ -394,6 +440,8 @@ struct KindStats {
     ok: u64,
     latency: Histogram,
     errors: BTreeMap<String, u64>,
+    /// How long the refused took to be answered.
+    refused: Histogram,
     /// Sends more than [`LATE_US`] behind their schedule, and the latest.
     late_sends: u64,
     late_us: u64,
@@ -408,6 +456,7 @@ impl KindStats {
         self.sent += other.sent;
         self.ok += other.ok;
         self.latency.add(&other.latency);
+        self.refused.add(&other.refused);
         for (kind, count) in &other.errors {
             *self.errors.entry(kind.clone()).or_default() += count;
         }
@@ -433,6 +482,8 @@ impl KindStats {
             "p50_us": self.latency.quantile(0.5),
             "p99_us": self.latency.quantile(0.99),
             "p999_us": self.latency.quantile(0.999),
+            "refused_p50_us": self.refused.quantile(0.5),
+            "refused_p99_us": self.refused.quantile(0.99),
             "late_us": self.late_us,
             "late_sends": self.late_sends,
             "queued": self.queued,
@@ -477,6 +528,8 @@ enum Stream {
 
 struct Conn {
     stream: Stream,
+    /// Its socket, which the reaper shuts when a request on it is late.
+    socket: TcpStream,
     /// Bytes read past the last answer.
     buffer: Vec<u8>,
     /// When its last answer came: one idle past [`REUSE`] is closed, not
@@ -565,9 +618,15 @@ struct Pool {
     addresses: Vec<SocketAddr>,
     tls: Option<(TlsConnector, ServerName<'static>)>,
     authority: String,
+    /// Kept connections, the last used on top: a few stay busy, and the
+    /// rest age out unused.
     idle: RefCell<Vec<Conn>>,
     open: Cell<usize>,
     waiting: RefCell<VecDeque<Sender<Option<Conn>>>>,
+    /// Requests on their connections, by number: each one's deadline, and
+    /// its socket, which the reaper shuts past it.
+    asked: RefCell<HashMap<u64, (Instant, TcpStream)>>,
+    next: Cell<u64>,
 }
 
 impl Pool {
@@ -586,6 +645,8 @@ impl Pool {
             idle: RefCell::new(Vec::new()),
             open: Cell::new(0),
             waiting: RefCell::new(VecDeque::new()),
+            asked: RefCell::new(HashMap::new()),
+            next: Cell::new(0),
         })
     }
 
@@ -595,14 +656,25 @@ impl Pool {
             match TcpStream::connect(*address).await {
                 Ok(tcp) => {
                     tcp.set_nodelay(true)?;
+                    let socket = tcp.clone();
                     let stream = match &self.tls {
                         Some((connector, name)) => {
-                            Stream::Tls(Box::new(connector.connect(name.clone(), tcp).await?))
+                            let handshake =
+                                async { connector.connect(name.clone(), tcp).await.map(Some) };
+                            let late = async {
+                                Timer::after(CONNECT).await;
+                                Ok(None)
+                            };
+                            match smol::future::or(handshake, late).await? {
+                                Some(tls) => Stream::Tls(Box::new(tls)),
+                                None => return Err(std::io::ErrorKind::TimedOut.into()),
+                            }
                         }
                         None => Stream::Plain(tcp),
                     };
                     return Ok(Conn {
                         stream,
+                        socket,
                         buffer: Vec::new(),
                         used: Instant::now(),
                     });
@@ -659,6 +731,17 @@ impl Pool {
         match conn {
             Some(mut conn) => {
                 conn.used = Instant::now();
+                // The longest idle, at the bottom, are closed before the node
+                // closes them, not found stale when a burst needs them.
+                let stale = {
+                    let mut idle = self.idle.borrow_mut();
+                    let stale = idle
+                        .iter()
+                        .take_while(|kept| kept.used.elapsed() >= REUSE)
+                        .count();
+                    idle.drain(..stale).count()
+                };
+                self.open.set(self.open.get() - stale);
                 loop {
                     let Some(waiter) = self.waiting.borrow_mut().pop_front() else {
                         break;
@@ -709,10 +792,16 @@ impl Pool {
             )
             .into_bytes();
             request.extend_from_slice(body);
+            let id = self.next.get();
+            self.next.set(id + 1);
+            self.asked
+                .borrow_mut()
+                .insert(id, (Instant::now() + within, conn.socket.clone()));
             let answered = match conn.write_all(&request).await {
                 Ok(()) => conn.answer().await,
                 Err(error) => Err(error),
             };
+            let reaped = self.asked.borrow_mut().remove(&id).is_none();
             held.0.set(false);
             match answered {
                 Ok((status, answer, close)) => {
@@ -721,22 +810,35 @@ impl Pool {
                         .map(|(response, _)| response)
                         .map_err(|_| format!("an answer it cannot read (status {status})"))
                 }
+                Err(_) if reaped => {
+                    self.give(None);
+                    Err("timed out".into())
+                }
                 Err(error) => {
                     self.give(None);
                     Err(error.kind().to_string())
                 }
             }
         };
-        let timed = async {
-            Timer::after(within).await;
-            Err("timed out".to_string())
-        };
-        smol::future::or(exchange, timed).await
+        exchange.await
+    }
+
+    /// Shut the connections whose requests are past their deadlines: each
+    /// request then fails, timed out.
+    fn reap(&self) {
+        let now = Instant::now();
+        self.asked.borrow_mut().retain(|_, (deadline, socket)| {
+            let late = *deadline <= now;
+            if late {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+            !late
+        });
     }
 }
 
 /// A request's place among a pool's connections: given back as closed if
-/// the request ends holding it, past its time.
+/// the request is dropped holding it.
 struct Held<'a>(Cell<bool>, &'a Pool);
 
 impl Drop for Held<'_> {
@@ -774,9 +876,20 @@ struct Engine {
     /// The space's window clock: its origin and length, in ms; and `D`,
     /// how long after a window's boundary its close comes.
     window: (u64, u64, u64),
+    /// Every request to a node that does not replicate its agent:
+    /// [`Plan::probe`].
+    probe: bool,
 }
 
 impl Engine {
+    /// A node that does not replicate `agent`: a probe's target.
+    fn elsewhere(&self, agent: usize) -> usize {
+        let replicas = &self.shared.agents[agent].replicas;
+        (0..self.pools.len())
+            .find(|node| !replicas.contains(node))
+            .unwrap_or(replicas[0])
+    }
+
     fn record(&self, kind: &'static str, update: impl FnOnce(&mut KindStats)) {
         update(self.stats.borrow_mut().kind(kind));
     }
@@ -792,22 +905,25 @@ impl Engine {
                 ..
             })
         );
+        let took = Instant::now().saturating_duration_since(due).as_micros() as u64;
         self.record(kind, |stats| {
             if ok {
                 stats.ok += 1;
-                stats
-                    .latency
-                    .record(Instant::now().saturating_duration_since(due).as_micros() as u64);
+                stats.latency.record(took);
             } else {
                 *stats.errors.entry(refusal(answer)).or_default() += 1;
+                stats.refused.record(took);
             }
         });
     }
 
     /// Take `op` at its time: send it, or queue it behind its user's
     /// unanswered call.
-    fn dispatch(self: &Rc<Self>, op: Op) {
-        let late = Instant::now().saturating_duration_since(op.due).as_micros() as u64;
+    fn dispatch(self: &Rc<Self>, mut op: Op) {
+        let now = Instant::now();
+        let late = now.saturating_duration_since(op.due).as_micros() as u64;
+        // Sent a little early, to spare a timer: timed from its send.
+        op.due = op.due.max(now);
         self.record(op.kind.name(), |stats| {
             stats.sent += 1;
             stats.cross += u64::from(op.cross);
@@ -882,6 +998,7 @@ impl Engine {
             .filter(|node| *node != leader)
             .collect();
         let node = match followers.len() {
+            _ if self.probe => self.elsewhere(op.agent),
             0 => leader,
             n => followers[(op.user % n as u64) as usize],
         };
@@ -898,9 +1015,17 @@ impl Engine {
             unreachable!("a call")
         };
         let agent = &self.shared.agents[op.agent];
-        let node = self.leaders.borrow()[op.agent];
+        let node = match self.probe {
+            true => self.elsewhere(op.agent),
+            false => self.leaders.borrow()[op.agent],
+        };
         let answer = self.pools[node].post(&agent.paths[0], signed, ANSWER).await;
-        let fate = fate(&answer);
+        // A probe's calls are refused before they reach a session: its
+        // sequences go on as if each ran, as they would at the leader.
+        let fate = match self.probe {
+            true => Fate::Ran(0),
+            false => fate(&answer),
+        };
         if let Ok(Response::NotLeader {
             leader: Some(contact),
         }) = &answer
@@ -1067,6 +1192,38 @@ impl Engine {
     }
 }
 
+/// This process's threads' CPU time so far, in seconds, by name.
+fn thread_seconds() -> BTreeMap<String, f64> {
+    // SAFETY: `sysconf` reads a constant.
+    let ticks = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    let mut threads = BTreeMap::new();
+    let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+        return threads;
+    };
+    for task in tasks.flatten() {
+        let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+            continue;
+        };
+        // `pid (comm) state ...`: utime and stime the 14th and 15th fields.
+        let (Some(open), Some(close)) = (stat.find('('), stat.rfind(')')) else {
+            continue;
+        };
+        let name = stat[open + 1..close].to_string();
+        let fields: Vec<&str> = stat[close + 2..].split(' ').collect();
+        let used: f64 = fields
+            .get(11..13)
+            .map(|times| {
+                times
+                    .iter()
+                    .filter_map(|time| time.parse::<f64>().ok())
+                    .sum()
+            })
+            .unwrap_or(0.0);
+        *threads.entry(name).or_default() += used / ticks;
+    }
+    threads
+}
+
 /// This process's CPU time so far, user and system, in seconds.
 fn cpu_seconds() -> f64 {
     // SAFETY: `getrusage` writes the struct it is given.
@@ -1202,6 +1359,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
     let (sender, receiver) = smol::channel::unbounded::<Op>();
     // The load starts once the sending thread opened its first connections.
     let (started, starting) = std::sync::mpsc::channel::<Instant>();
+    let (ready, planned_ready) = std::sync::mpsc::channel::<()>();
     std::thread::scope(|scope| {
         let planner = {
             let shared = Arc::clone(&shared);
@@ -1210,15 +1368,22 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
             std::thread::Builder::new()
                 .name("plan".into())
                 .spawn_scoped(scope, move || {
+                    // The users active at the start, their keys derived
+                    // before it.
+                    let mut planned = load::Plan::new(model, users, driver, drivers);
+                    for user in planned.fill() {
+                        shared.open(user);
+                    }
+                    let _ = ready.send(());
                     let Ok(start) = starting.recv() else { return };
-                    let planned = load::Plan::new(model, users, driver, drivers);
                     for planned in planned {
                         if planned.t >= secs {
                             break;
                         }
                         let due = start + Duration::from_secs_f64(planned.t);
                         let ahead = due.saturating_duration_since(Instant::now());
-                        if ahead > LOOKAHEAD {
+                        // Asleep in stretches, not before every operation.
+                        if ahead > LOOKAHEAD + PLAN_NAP {
                             std::thread::sleep(ahead - LOOKAHEAD);
                         }
                         let op = shared.operation(&planned, users, due);
@@ -1239,6 +1404,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
             inflight: Cell::new(0),
             ex,
             window: plan.window,
+            probe: plan.probe,
         });
         let every = Duration::from_secs(plan.every_s.max(1));
         let drain = Duration::from_millis(plan.drain_ms());
@@ -1255,6 +1421,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
             for warm in warming {
                 warm.await;
             }
+            let _ = planned_ready.recv();
             // Signed ahead from now: the first operations a little later.
             let _ = started.send(Instant::now() + LOOKAHEAD);
             cpu_before = cpu_seconds();
@@ -1270,9 +1437,21 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
                     }
                 }
             };
+            let reaper = {
+                let engine = Rc::clone(&engine);
+                async move {
+                    loop {
+                        Timer::after(REAP).await;
+                        for pool in &engine.pools {
+                            pool.reap();
+                        }
+                    }
+                }
+            };
+            let reporter = smol::future::or(reporter, reaper);
             let load = async {
                 while let Ok(op) = receiver.recv().await {
-                    if op.due > Instant::now() + Duration::from_micros(200) {
+                    if op.due > Instant::now() + EARLY {
                         Timer::at(op.due).await;
                     }
                     engine.dispatch(op);
@@ -1301,6 +1480,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
         // The CPU of the load's span, in cores: the driver's cost at its
         // rate.
         total["load_cores"] = (load_cpu / secs.max(1.0)).into();
+        total["threads_cpu_s"] = serde_json::json!(thread_seconds());
         total["unanswered"] = engine.inflight.get().into();
         total["active_users"] = load::Plan::new(&model, &users, plan.driver, plan.drivers)
             .slots()

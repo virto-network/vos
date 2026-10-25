@@ -35,6 +35,16 @@ pub struct Plan {
     /// The space's window clock, origin and length in ms (no origin known:
     /// both 0), and `D`, how long past a window's boundary it closes.
     pub window: (u64, u64, u64),
+    /// The driver's capacity probe, set by hand in a plan given to
+    /// `drive-local`: every request goes to a node that does not
+    /// replicate its agent, which answers `Elsewhere` at once, before any
+    /// signature check. The driver does all its work (the plan, the
+    /// signatures, the connections, the answers), the nodes almost none:
+    /// its own cost at its rate, apart from theirs. It needs more nodes
+    /// than an agent's replicas; an agent on every node (the identity
+    /// agent) is called as usual.
+    #[serde(default)]
+    pub probe: bool,
 }
 
 impl Plan {
@@ -120,6 +130,7 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
             driver: index as u64,
             drivers: drivers.len() as u64,
             window,
+            probe: false,
         };
         drain_s = plan.drain_ms().div_ceil(1_000);
         let local = run.file(&format!("drive-{}.json", host.name));
