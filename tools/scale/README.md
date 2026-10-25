@@ -75,6 +75,15 @@ The coordinator also needs the repository, built from its root:
 `target/x86_64-unknown-linux-musl/release/`. `deploy` takes them from
 there unless `--bins` says otherwise.
 
+## Hardware-key ssh
+
+Every remote command goes over one shared ssh connection a host
+(`ControlMaster`, kept for 8 hours): a key that asks for a touch, such as
+a YubiKey, asks once a host when the first command connects, not on every
+command. Open the connections before a run, touching once each, with
+`ssh -o ControlMaster=auto -o ControlPath=~/.ssh/vos-scale-%C -o ControlPersist=8h HOST true`;
+close them after with `ssh -o ControlPath=~/.ssh/vos-scale-%C -O exit HOST`.
+
 ## The inventory
 
 Copy `inventory.example.toml` to `inventory.toml` and give one

@@ -11,14 +11,23 @@ use std::time::{Duration, Instant};
 
 use crate::inventory::Host;
 
-/// ssh's options: no prompt, a bounded connect, keep-alives.
-const SSH: [&str; 6] = [
+/// ssh's options: no prompt, a bounded connect, keep-alives, and one
+/// shared connection a host: the first command authenticates (a hardware
+/// key's single touch) and every later one, rsync's too, rides it for as
+/// long as it persists.
+const SSH: [&str; 12] = [
     "-o",
     "BatchMode=yes",
     "-o",
     "ConnectTimeout=10",
     "-o",
     "ServerAliveInterval=15",
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPath=~/.ssh/vos-scale-%C",
+    "-o",
+    "ControlPersist=8h",
 ];
 
 /// The prelude of every script: strict, and the user's systemd manager
