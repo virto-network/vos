@@ -60,17 +60,22 @@ fn representative() -> (Node, Testkit) {
     (node, kit)
 }
 
+/// A report of `root` at `window`, as an agent's report step sends it.
+fn report_body(window: u64, root: [u8; 32]) -> Body {
+    Body::Report(AgentRoot {
+        kind: RootKind::Space as u8,
+        window,
+        root,
+    })
+}
+
 /// Agent `from`'s report of `root` at `window`, as its report step sends
 /// it.
 fn report(from: AgentId, sequence: u64, window: u64, root: [u8; 32]) -> Input {
     Input::Message(Message {
         from,
         sequence,
-        body: Body::Report(AgentRoot {
-            kind: RootKind::Space as u8,
-            window,
-            root,
-        }),
+        body: report_body(window, root),
     })
 }
 
@@ -232,4 +237,49 @@ fn no_call_writes_a_report(node: &mut Node, a: AgentId) {
     );
     assert_eq!(committed(node), before);
     assert!(node.get(&asked(9, a)).is_none());
+}
+
+/// A row of a window's close that does not decode is quarantined, the
+/// step going on (S30): the representative holding a sender's last report
+/// that does not decode moves it aside under `keys::quarantined`, its
+/// bytes kept, and stores the report as the sender's first. An agent
+/// whose mark of its last report does not decode moves it aside too, and
+/// reports. The model agrees on each step.
+#[test]
+fn a_row_that_does_not_decode_is_quarantined() {
+    let (mut node, mut kit) = representative();
+    let a = AgentId(0x0100_0007);
+    let corrupt = vec![1, 2, 3];
+    for key in [keys::reports(a), keys::reported()] {
+        node.state
+            .insert(key.clone(), vos_wire::records::stored(&corrupt));
+        kit.set_row(key, corrupt.clone());
+    }
+    let inputs = vec![
+        report(a, 1, 5, [5; 32]),
+        Input::Report {
+            to: AgentId(0x0900_0000),
+            window: 4,
+            root: [4; 32],
+        },
+    ];
+    let result = node.batch(at(5), inputs);
+    kit.batch(at(5), [0; 32]);
+    let stored = kit.message(a, &report_body(5, [5; 32]));
+    agrees(0, ran(&result.steps[0]), &stored);
+    let reported = kit.report(AgentId(0x0900_0000), 4, [4; 32]);
+    agrees(1, ran(&result.steps[1]), &reported);
+    for key in [keys::reports(a), keys::reported()] {
+        assert_eq!(node.get(&keys::quarantined(&key)), Some(corrupt.clone()));
+    }
+    assert_eq!(node.value::<u64>(&keys::reports(a)), Some(5));
+    assert_eq!(
+        value(&node, &representative_row(a, RootKind::Space, 5)),
+        Some(vec![5; 32])
+    );
+    assert_eq!(
+        node.value::<(u64, AgentId)>(&keys::reported()),
+        Some((4, AgentId(0x0900_0000)))
+    );
+    assert_eq!(ran(&result.steps[1]).messages.len(), 1, "reported");
 }

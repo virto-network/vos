@@ -119,7 +119,7 @@ pub(crate) fn message(
         }
         Body::Report(report) => {
             let mut run = consumed(input, Outcome::Done(Vec::new()));
-            (run.writes, run.committed) = closes::stored(base, from, report).unwrap_or_default();
+            (run.writes, run.committed) = closes::stored(base, from, report);
             Stepped::ran(run)
         }
     };

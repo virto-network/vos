@@ -152,6 +152,7 @@ enum Row {
     Proven = 0x23,
     Reading = 0x24,
     EveryWindow = 0x25,
+    Quarantined = 0x26,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -611,6 +612,19 @@ pub fn cut_mark() -> Vec<u8> {
 /// is this one or an earlier ([`crate::apply`]).
 pub fn reading() -> Vec<u8> {
     Row::Reading.prefix().to_vec()
+}
+
+/// A row of a window's close that did not decode, moved aside by the step
+/// that read it, under its own key: its bytes, the decoded value's when it
+/// was stored whole, else as stored. Replicated; the step goes on as if the
+/// row were absent, and the node alerts.
+pub fn quarantined(row: &[u8]) -> Vec<u8> {
+    key(&[&Row::Quarantined.prefix(), row])
+}
+
+/// The prefix of every [`quarantined`] row.
+pub fn quarantined_prefix() -> Vec<u8> {
+    Row::Quarantined.prefix().to_vec()
 }
 
 /// Present when the agent records its cut, and reports its root there, at

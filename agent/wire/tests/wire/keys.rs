@@ -132,6 +132,8 @@ fn keys_keep_their_bytes() {
     assert_eq!(keys::cut_mark(), [0x00, 0x20]);
     assert_eq!(keys::reading(), [0x00, 0x24]);
     assert_eq!(keys::every_window(), [0x00, 0x25]);
+    assert_eq!(keys::quarantined(&[7, 8]), [0x00, 0x26, 7, 8]);
+    assert_eq!(keys::quarantined_prefix(), [0x00, 0x26]);
     assert_eq!(keys::close_mark(), [0x00, 0x21]);
     assert_eq!(
         keys::reports(AgentId(0x0102_0304)),
@@ -158,6 +160,7 @@ fn keys_keep_their_bytes() {
         keys::cut_mark(),
         keys::reading(),
         keys::every_window(),
+        keys::quarantined(&keys::reported()),
         keys::close_mark(),
         keys::proven(1, &[1; 32]),
     ] {

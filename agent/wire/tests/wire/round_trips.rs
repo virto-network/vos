@@ -146,6 +146,7 @@ proptest! {
             keys::cut_mark(),
             keys::reading(),
             keys::every_window(),
+            keys::quarantined(&keys::reports(AgentId(agent))),
             keys::close_mark(),
             keys::closing(sequence),
             keys::proven(sequence, &[agent as u8; 32]),

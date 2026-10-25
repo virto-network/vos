@@ -147,6 +147,7 @@ async fn apply_one(inner: &Inner, shared: &Shared, index: u64) -> Result<(), Fau
             };
             let took = writes.iter().any(|write| write.key == keys::version());
             shared.record_outcome(index, took);
+            quarantined(agent, index, &writes);
             // The values a pending cut's build still needs, kept beside the
             // writes that overwrite them, and the proofs of the requests
             // they answer, gone: this replica's own rows, decided on the
@@ -183,6 +184,23 @@ async fn apply_one(inner: &Inner, shared: &Shared, index: u64) -> Result<(), Fau
         .commit_unpinning(changes)
         .await
         .map_err(Fault::Storage)
+}
+
+/// Alert each row `writes` quarantine: a row of a window's close that did
+/// not decode, which the step that read it moved aside and went on
+/// without.
+fn quarantined(agent: AgentId, index: u64, writes: &[StateWrite]) {
+    let prefix = keys::quarantined_prefix();
+    for write in writes {
+        if write.value.is_some() && write.key.starts_with(&prefix) {
+            tracing::error!(
+                agent = agent.0,
+                index,
+                "a row of a window's close does not decode: moved aside, the batch going on \
+                 without it"
+            );
+        }
+    }
 }
 
 /// A result entry's body: inline, or the blob a large one names, read off
