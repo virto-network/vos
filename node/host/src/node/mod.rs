@@ -160,6 +160,10 @@ pub(crate) struct Inner {
     pub(crate) anchor_rows: crate::asking::Waits<(NodeNumber, Option<[u8; 32]>)>,
     /// The representative's leaders' alerts here, the latest few.
     pub(crate) anchor_alerts: Mutex<std::collections::VecDeque<crate::AnchorAlert>>,
+    /// The window of the space's clock in which a representative's leader
+    /// here last handed its leadership on, unlisted: once a window, across
+    /// leaderships.
+    pub(crate) anchor_handed: Mutex<Option<u64>>,
     /// The statements proved here that their agents have still to record.
     pub(crate) unrecorded: crate::prover::Unrecorded,
     /// Whether a prover worker runs here: compaction keeps the entries its
@@ -216,7 +220,10 @@ impl Inner {
     }
 
     /// Whether this node may replicate the space's representative: the
-    /// space registered its node key as an anchor key.
+    /// space registered its node key as an anchor key, as the venue's
+    /// client last read it. Before the client's first read of the space it
+    /// lists none, so the representative is refused here (`CannotRun`)
+    /// until then (`docs/operations.md`).
     pub(crate) fn may_represent(&self) -> bool {
         self.registered_anchor_keys().contains(&self.node_id.0)
     }

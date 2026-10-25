@@ -1,9 +1,9 @@
 //! The representative's anchoring at the model venue, each node signing
 //! with its node key the space's root its close wrote: anchors in order
 //! across a leader change; a deposed leader and a successor whose clock
-//! lags anchoring one root; the divergence guard, a replica holding
-//! another root sending nothing, and an equivocation, the replicas
-//! agreeing, ending the space; an unlisted leader handing off to a listed
+//! lags anchoring one root; the divergence guard, a quorum's majority
+//! sending the evidence over a dissenting replica and no quorum sending
+//! nothing, and an equivocation, the replicas agreeing, ending the space; an unlisted leader handing off to a listed
 //! replica, once a window, and with none listed alerting and waiting; a
 //! delisted node refused the representative and replaced; a node that did
 //! not found the space representing it once its key is registered;
@@ -316,36 +316,83 @@ fn overtaken() -> (Anchoring, Cluster, AgentId, NodeNumber, [u8; 32], Offers) {
     (anchoring, cluster, representative, leader, root, offers)
 }
 
-/// The divergence guard: the venue holds another root at window 0, and a
-/// replica holds another row of it than the leader's (an apply bug or a
-/// cloned store). The leader sends nothing, the venue keeps no evidence,
-/// the space stays active, and the leader alerts that its replicas
-/// diverge.
-#[test]
-fn a_divergent_replica_stops_the_evidence() {
-    let (anchoring, cluster, representative, leader, _, offers) = overtaken();
-    let follower = (1..=3).find(|number| *number != leader).unwrap();
-    let store = cluster.node(follower).store();
+/// Write `root` as `representative`'s row of window 0 on node `number`, as
+/// an apply bug, a cloned store or a compromise would leave it.
+fn forge_row(cluster: &Cluster, number: NodeNumber, representative: AgentId, root: [u8; 32]) {
+    let store = cluster.node(number).store();
     let epoch = store.snapshot().epoch(representative).unwrap();
     let mut batch = store.batch();
     let forged = Write {
         key: keys::anchor(0),
-        value: Some(vec![0xd1; 32]),
+        value: Some(root.to_vec()),
     };
     batch.rows(representative, epoch, [&forged]);
     batch.commit(PersistMode::SyncAll).unwrap();
+}
+
+/// The majority decides (S34): a compromised replica anchored a forged
+/// root at window 0 with its listed key and answers the guard with it as
+/// its row. A quorum, the leader and the other replica, holds the leader's
+/// row, so the evidence goes all the same and the space ends; the
+/// dissenter is alerted by name, its root the venue's held one, which
+/// names it the equivocator.
+#[test]
+fn a_dissenting_replica_does_not_block_the_evidence() {
+    let (anchoring, cluster, representative, leader, root, offers) = overtaken();
+    let compromised = (1..=3).find(|number| *number != leader).unwrap();
+    forge_row(&cluster, compromised, representative, [9; 32]);
     offers.read.store(true, Ordering::SeqCst);
-    let divergent = AnchorAlert::Divergent {
-        window: 0,
-        replica: follower,
-    };
-    wait_until("the leader alerts the divergence", || {
-        alerts(&cluster, leader).contains(&divergent)
+    let space = cluster.space.id();
+    wait_until("the evidence ends the space", || {
+        anchoring.venue.status(&space) == Status::Ended
+    });
+    let evidence = anchoring.venue.evidence();
+    assert_eq!(evidence.len(), 1);
+    assert_eq!(evidence[0].1.root, root);
+    let alerts = alerts(&cluster, leader);
+    assert!(
+        alerts.contains(&AnchorAlert::Divergent {
+            window: 0,
+            replica: compromised,
+            root: [9; 32],
+        }),
+        "{alerts:?}"
+    );
+    assert!(alerts.contains(&AnchorAlert::Evidence { window: 0 }));
+}
+
+/// Without a quorum nothing is sent and nothing settled: both other
+/// replicas hold another row of window 0 than the leader's, so the leader
+/// sends no evidence, alerts each by name, and asks again; once their rows
+/// hold the leader's again, the evidence goes.
+#[test]
+fn without_a_quorum_the_guard_waits() {
+    let (anchoring, cluster, representative, leader, root, offers) = overtaken();
+    let others: Vec<NodeNumber> = (1..=3).filter(|number| *number != leader).collect();
+    for number in &others {
+        forge_row(&cluster, *number, representative, [0xd1; 32]);
+    }
+    offers.read.store(true, Ordering::SeqCst);
+    wait_until("the leader alerts both", || {
+        let alerts = alerts(&cluster, leader);
+        others.iter().all(|replica| {
+            alerts.contains(&AnchorAlert::Divergent {
+                window: 0,
+                replica: *replica,
+                root: [0xd1; 32],
+            })
+        })
     });
     std::thread::sleep(Duration::from_secs(3));
     assert!(offers.of(0).is_empty(), "nothing sent");
     assert!(anchoring.venue.evidence().is_empty());
     assert_eq!(anchoring.venue.status(&cluster.space.id()), Status::Active);
+    for number in &others {
+        forge_row(&cluster, *number, representative, root);
+    }
+    wait_until("the evidence goes once a quorum holds the row", || {
+        anchoring.venue.status(&cluster.space.id()) == Status::Ended
+    });
 }
 
 /// An equivocation ends the space: the venue holds a stolen key's root at
@@ -408,8 +455,8 @@ fn an_unlisted_leader_hands_off_to_a_listed_replica() {
 /// One handoff a window: the leader and a second replica are unlisted, and
 /// the one listed replica is down, so the handoff fails; the leader hands
 /// off no more within the window, and waits. Once the listed replica is
-/// back and the next window has opened, it hands off again, and that
-/// replica anchors windows 0 and 1.
+/// back and the next window has opened, it hands off again (its alert
+/// raised once a leadership), and that replica anchors windows 0 and 1.
 #[test]
 fn one_handoff_a_window() {
     let (anchoring, mut cluster, clock, representative) = space(3);
@@ -449,7 +496,7 @@ fn one_handoff_a_window() {
     let held = anchored(&anchoring, &cluster, &clock, 1);
     assert_eq!(held.signer, cluster.node(listed).id().0);
     assert_eq!(windows(&anchoring, &cluster), [0, 1]);
-    assert_eq!(handed(&cluster), 2, "again in the next window");
+    assert_eq!(cluster.leader(representative), listed, "handed off again");
 }
 
 /// With no replica listed, an unlisted leader signs nothing: it closes the

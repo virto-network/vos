@@ -146,6 +146,7 @@ impl Node {
             reads: crate::asking::Waits::default(),
             anchor_rows: crate::asking::Waits::default(),
             anchor_alerts: Mutex::default(),
+            anchor_handed: Mutex::default(),
             turn: AtomicU64::new(0),
             counters: Counters::default(),
             stats: Arc::default(),

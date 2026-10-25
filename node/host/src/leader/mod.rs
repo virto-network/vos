@@ -201,8 +201,10 @@ impl Leader {
         }
         while let Some(taken) = self.take().await {
             // The rows applied so far, before the batch: never a root of a
-            // batch under proposal.
-            self.anchor().await;
+            // batch under proposal; once a cut is built, or the recheck due.
+            if self.anchor_due() {
+                self.anchor().await;
+            }
             let pending = match taken {
                 Taken::Inputs(pending) => Some(pending),
                 Taken::Sweep | Taken::Serve => Some(Vec::new()),
