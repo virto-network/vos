@@ -42,16 +42,32 @@ const NONE: u64 = u64::MAX;
 const PAYLOAD_MAX: usize = 16 << 10;
 
 /// The payload's modes, its first byte.
-const WORDS: u8 = 0;
-const JUDGE: u8 = 1;
-const ANCHORS: u8 = 2;
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum Mode {
+    Words = 0,
+    Judge = 1,
+    Anchors = 2,
+}
 
-/// Verdicts.
-const ACCEPT: u64 = 1;
-const REJECT: u64 = 0;
-const BAD_PAYLOAD: u64 = 2;
-const NO_PREIMAGE: u64 = 3;
-const UNDECODABLE: u64 = 4;
+impl Mode {
+    const ALL: [Self; 3] = [Self::Words, Self::Judge, Self::Anchors];
+
+    fn of(byte: u8) -> Option<Self> {
+        Self::ALL.into_iter().find(|&mode| mode as u8 == byte)
+    }
+}
+
+/// The program's verdicts, `Report::verdict`.
+#[derive(Clone, Copy)]
+#[repr(u64)]
+enum Verdict {
+    Reject = 0,
+    Accept = 1,
+    BadPayload = 2,
+    NoPreimage = 3,
+    Undecodable = 4,
+}
 
 static PAYLOAD: Static<[u8; PAYLOAD_MAX]> = Static(UnsafeCell::new([0; PAYLOAD_MAX]));
 static REPORT: Static<Report> = Static(UnsafeCell::new(Report::new()));
@@ -99,25 +115,26 @@ impl Report {
     }
 
     /// A judgement's verdict: its code, an accepted statement's id.
-    fn judged(&mut self, verdict: Result<StatementId, Refusal>) -> u64 {
+    fn judged(&mut self, verdict: Result<StatementId, Refusal>) -> Verdict {
         self.code = u64::from(vos_statement::code(&verdict));
         match verdict {
             Ok(id) => {
                 self.id = id.0;
-                ACCEPT
+                Verdict::Accept
             }
             Err(refusal) => self.refuse(&refusal),
         }
     }
 
-    fn refuse(&mut self, error: &dyn core::fmt::Display) -> u64 {
+    /// `error`'s text, and the verdict [`Verdict::Reject`].
+    fn refuse(&mut self, error: &dyn core::fmt::Display) -> Verdict {
         let mut cursor = Cursor {
             buf: &mut self.error,
             len: 0,
         };
         let _ = write!(cursor, "{error}");
         self.error_len = cursor.len as u64;
-        REJECT
+        Verdict::Reject
     }
 }
 
@@ -132,7 +149,7 @@ extern "C" fn verify_main() -> Output {
     // SAFETY: single-threaded; the host reads the report after halt.
     let report = unsafe { &mut *REPORT.0.get() };
     report.gas_start = gas_left();
-    report.verdict = verify(report);
+    report.verdict = verify(report) as u64;
     report.gas_end = gas_left();
     let state = HEAP.state();
     report.peak_live = state.peak_live as u64;
@@ -159,10 +176,9 @@ enum Check {
 }
 
 /// The payload: its request, the proof's hash and its length.
-fn request(payload: &[u8]) -> Option<(Request, [u8; 32], usize)> {
-    let (&mode, body) = payload.split_first()?;
+fn request(mode: Mode, body: &[u8]) -> Option<(Request, [u8; 32], usize)> {
     let (request, rest) = match mode {
-        WORDS => {
+        Mode::Words => {
             let (format, body) = body.split_first_chunk::<4>()?;
             let (words, rest) = body.split_at_checked(4 * PUBLIC_WORDS)?;
             let (words, _) = words.as_chunks::<4>();
@@ -173,17 +189,17 @@ fn request(payload: &[u8]) -> Option<(Request, [u8; 32], usize)> {
             let words = out;
             (Request::Words(u32::from_le_bytes(*format), words), rest)
         }
-        JUDGE => {
+        Mode::Judge => {
             let (input, used) = Input::decode_prefix(body).ok()?;
             (Request::Judge(input), body.get(used..)?)
         }
-        _ => return None,
+        Mode::Anchors => return None,
     };
     let [hash @ .., l0, l1, l2, l3] = <[u8; 36]>::try_from(rest).ok()?;
     Some((request, hash, u32::from_le_bytes([l0, l1, l2, l3]) as usize))
 }
 
-fn verify(report: &mut Report) -> u64 {
+fn verify(report: &mut Report) -> Verdict {
     // SAFETY: single-threaded; nothing else borrows the payload buffer.
     let payload = unsafe { &mut *PAYLOAD.0.get() };
     let len = hostcall!(
@@ -198,22 +214,28 @@ fn verify(report: &mut Report) -> u64 {
         ]
     );
     let Some(payload) = usize::try_from(len).ok().and_then(|len| payload.get(..len)) else {
-        return BAD_PAYLOAD;
+        return Verdict::BadPayload;
     };
-    if let [ANCHORS, vector @ ..] = payload {
-        return match Vector::decode(vector) {
+    let Some((mode, body)) = payload
+        .split_first()
+        .and_then(|(&mode, body)| Some((Mode::of(mode)?, body)))
+    else {
+        return Verdict::BadPayload;
+    };
+    if let Mode::Anchors = mode {
+        return match Vector::decode(body) {
             Ok(vector) => {
                 report.digests = vector.digests().to_bytes();
-                ACCEPT
+                Verdict::Accept
             }
             Err(error) => {
                 report.refuse(&error);
-                BAD_PAYLOAD
+                Verdict::BadPayload
             }
         };
     }
-    let Some((request, hash, proof_len)) = request(payload) else {
-        return BAD_PAYLOAD;
+    let Some((request, hash, proof_len)) = request(mode, body) else {
+        return Verdict::BadPayload;
     };
     report.proof_len = proof_len as u64;
     let check = match request {
@@ -228,7 +250,7 @@ fn verify(report: &mut Report) -> u64 {
         return match check {
             Check::Words(..) => {
                 report.refuse(&error);
-                UNDECODABLE
+                Verdict::Undecodable
             }
             Check::Judge(_) => report.judged(Err(Refusal::Proof(error))),
         };
@@ -247,7 +269,7 @@ fn verify(report: &mut Report) -> u64 {
         ]
     );
     if found != proof_len as u64 {
-        return NO_PREIMAGE;
+        return Verdict::NoPreimage;
     }
     // SAFETY: the host wrote all `proof_len` bytes.
     unsafe { bytes.set_len(proof_len) };
@@ -264,13 +286,13 @@ fn verify(report: &mut Report) -> u64 {
                 Err(error) => {
                     report.gas_after_decode = gas_left();
                     report.refuse(&error);
-                    return UNDECODABLE;
+                    return Verdict::Undecodable;
                 }
             };
             drop(bytes);
             report.gas_after_decode = gas_left();
             match decoded.verify(&words) {
-                Ok(_) => ACCEPT,
+                Ok(_) => Verdict::Accept,
                 Err(error) => report.refuse(&error),
             }
         }
