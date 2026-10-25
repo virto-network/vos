@@ -20,9 +20,9 @@ use vos_statement::model::judge_bytes;
 use vos_statement::vos_anchor::vectors;
 use vos_statement::vos_pvm_final_verifier::{self, MAX_PROOF_BYTES, masked};
 
-/// The cases a venue accepts: under `format::MASKED_WRAP`, the rooted statement and the
-/// rootless one; under 28, at the test venue.
-const ACCEPTED: [&str; 3] = ["valid", "rootless", "format 28 at the test venue"];
+/// The cases a venue accepts: under `format::MASKED_WRAP`, the statement;
+/// under 28, at the test venue.
+const ACCEPTED: [&str; 2] = ["valid", "format 28 at the test venue"];
 
 fn load() -> Vec<Fixture> {
     let fixtures = fixtures::load(&fixtures::directory());
@@ -40,19 +40,14 @@ fn load() -> Vec<Fixture> {
         "another program than the pin",
         "another space",
         "the space",
-        "rootless, another space",
+        "rootless",
         "rooted, of no space",
-        "another venue's statement",
-        "replayed at another venue",
         "a root's window",
         "a root",
         "the nonce",
         "the roots' order",
         "a root dropped",
-        "migrated before a root's window",
-        "registered after a root's window",
-        "rooted, replayed past MaxRootAge",
-        "rootless, replayed past MaxRootAge",
+        "replayed past MaxRootAge",
         "tampered, format 28 at the test venue",
         "accepted under 39, replayed under 28",
         "accepted under 28, replayed under 39",
@@ -166,7 +161,7 @@ fn a_proof_too_long_is_refused_before_its_lookup() {
     assert_eq!(report.gas[1], 0, "no lookup");
 
     let words = vos_pvm_final_verifier::Statement {
-        program: valid.input.pin.program.0,
+        program: valid.input.program.0,
         io_hash: valid.input.statement.io_hash(),
     }
     .words();

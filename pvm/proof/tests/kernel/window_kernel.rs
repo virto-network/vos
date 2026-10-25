@@ -41,7 +41,7 @@ use vos_tree::{Blake2b, Hasher};
 use vos_venue::{AnchorRefusal, VenueClient};
 use vos_wire::abi::AttestError;
 use vos_wire::served::Served;
-use vos_wire::vos_anchor::{Migrate, RootRead, VenueId, space_id, space_root};
+use vos_wire::vos_anchor::{RootRead, VenueId, space_id, space_root};
 use vos_wire::{Encode, SpaceId};
 
 const PEER: [u8; 32] = [0xB2; 32];
@@ -646,11 +646,7 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
 ///   proof's words (0x108); the tampered row itself traps the prologue;
 /// - **a venue mismatch:** the anchor digest binds the venue, so an anchor
 ///   signed for this venue is refused at another (`Signature`) and the root
-///   is unanchored there (5). The kernel is not venue-bound: code 7 is the
-///   golden fixtures';
-/// - **a window outside the migration range:** the space migrated away from
-///   the statement's window before it was anchored, so the anchor is
-///   refused (`Window`) and the root unanchored (5).
+///   is unanchored there (5).
 ///
 /// A key outside the read set traps the view, so no statement is made of
 /// it ([`rows_off_the_cut_are_refused`]).
@@ -804,28 +800,5 @@ fn the_window_is_stated_at_the_model_venue() {
         code(&elsewhere, &statement),
         Refusal::Unanchored.code(),
         "a venue mismatch"
-    );
-
-    let migrated = venue(VENUE);
-    migrated.set_now(cut::CLOCK.boundary(WINDOW - 2).unwrap() + 1);
-    assert_eq!(
-        migrated.venue.migrate(&Migrate {
-            space: space(),
-            from: VENUE,
-            to: VenueId([0x7f; 32]),
-            from_window: WINDOW,
-        }),
-        Ok(())
-    );
-    migrated.set_now(Venue::closed());
-    assert_eq!(
-        migrated.anchor(&root),
-        Err(AnchorRefusal::Window),
-        "an anchor past the migration"
-    );
-    assert_eq!(
-        code(&migrated, &statement),
-        Refusal::Unanchored.code(),
-        "a window outside the migration range"
     );
 }

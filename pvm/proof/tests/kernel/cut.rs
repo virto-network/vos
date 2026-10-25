@@ -7,7 +7,6 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use cipher_clerk::kernel::Value;
 use cipher_clerk::types::Account;
@@ -18,7 +17,7 @@ use vos_pvm_proof::kernel::{KernelTrace, trace_kernel};
 use vos_pvm_proof::program_id::KernelProgram;
 use vos_pvm_proof::segment::{SegmentCursor, segment_bounds_budgeted};
 use vos_pvm_proof::{Proof, ProvingError, prove_shaped};
-use vos_statement::{Pin, ProgramId, Statement};
+use vos_statement::{ProgramId, Statement};
 use vos_testkit::Step;
 use vos_testkit::Testkit;
 use vos_testkit::programs::{derivation, derived, method, package, table_tag};
@@ -533,29 +532,23 @@ pub fn genesis(nonce: u8) -> SpaceGenesis {
 /// The model venue, its time fixed a second past [`WINDOW`]'s close.
 pub struct Venue {
     pub venue: ModelVenue,
-    now: Arc<AtomicU64>,
 }
 
 impl Venue {
     /// A venue of id `id`, its time [`Venue::closed`], with the spaces
     /// `geneses` found registered from the window before [`WINDOW`].
     pub fn new(id: VenueId, geneses: &[SpaceGenesis]) -> Self {
-        let now = Arc::new(AtomicU64::new(Self::closed()));
-        let read = Arc::clone(&now);
-        let venue = ModelVenue::new(id, Arc::new(move || read.load(Ordering::SeqCst)));
+        let venue = ModelVenue::new(id, Arc::new(Self::closed));
         for genesis in geneses {
-            venue.register(genesis, WINDOW - 1);
+            venue.seed(genesis, WINDOW - 1);
         }
-        Self { venue, now }
+        Self { venue }
     }
 
-    /// [`Venue::new`], pinning `program` venue-unbound.
+    /// [`Venue::new`], pinning `program`.
     pub fn pinned(id: VenueId, geneses: &[SpaceGenesis], program: ProgramId) -> Self {
         let venue = Self::new(id, geneses);
-        venue.venue.pin(Pin {
-            program,
-            venue_bound: false,
-        });
+        venue.venue.pin(program);
         venue
     }
 
@@ -563,11 +556,6 @@ impl Venue {
     pub fn closed() -> u64 {
         let representative = CLOCK.representative().unwrap();
         CLOCK.boundary(WINDOW).unwrap() + representative.origin_ms - CLOCK.origin_ms + 1_000
-    }
-
-    /// The venue's time set to `now`.
-    pub fn set_now(&self, now: u64) {
-        self.now.store(now, Ordering::SeqCst);
     }
 
     /// `root` anchored, signed by the founder for the venue `signed_for`.

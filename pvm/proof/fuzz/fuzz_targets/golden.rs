@@ -96,7 +96,7 @@ fn of_fixture(name: &str) -> Golden {
         .unwrap_or_else(|| panic!("the fixture {name:?}"));
     let format = fixture.input.statement.format;
     let words = vos_pvm_final_verifier::Statement {
-        program: fixture.input.pin.program.0,
+        program: fixture.input.program.0,
         io_hash: fixture.input.statement.io_hash(),
     }
     .words();
@@ -118,15 +118,13 @@ fn of_fixture(name: &str) -> Golden {
     golden
 }
 
-/// The goldens: `format::MASKED_WRAP`'s rooted statement (`valid`) and
-/// rootless one (`rootless`), and `format::WRAP`'s
-/// (`format 28 at the test venue`).
-pub fn goldens() -> &'static [Golden; 3] {
-    static GOLDENS: OnceLock<[Golden; 3]> = OnceLock::new();
+/// The goldens: `format::MASKED_WRAP`'s statement (`valid`) and
+/// `format::WRAP`'s (`format 28 at the test venue`).
+pub fn goldens() -> &'static [Golden; 2] {
+    static GOLDENS: OnceLock<[Golden; 2]> = OnceLock::new();
     GOLDENS.get_or_init(|| {
         [
             of_fixture("valid"),
-            of_fixture("rootless"),
             of_fixture("format 28 at the test venue"),
         ]
     })

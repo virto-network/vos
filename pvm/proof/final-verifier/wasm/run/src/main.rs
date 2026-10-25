@@ -31,7 +31,6 @@
 //! ```text
 //! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> judge <fixtures> <formats>
 //! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> anchors
-//! vos-pvm-final-verifier-wasm-run <blob.wasm> <client|pvf> statements <name.input>...
 //! ```
 //!
 //! `judge`: every golden fixture under `<fixtures>` judged by the blob's
@@ -41,8 +40,6 @@
 //! judge-wasm`). `anchors`: every golden vector of `vos-anchor` computed by
 //! the blob's `anchor_digests`, failing when its digests are not the pinned
 //! bytes, or when a vector cut short is not refused (`just judge-wasm`).
-//! `statements`: each judgement's input beside its proof, `<name>.proof`,
-//! as the end-to-end tests write them, failing when one is refused.
 
 use std::time::{Duration, Instant};
 
@@ -499,23 +496,6 @@ impl Runner {
         Ok(())
     }
 
-    /// Each judgement's input at `paths`, beside its proof, accepted.
-    fn statements(&self, paths: &[String]) -> Result<()> {
-        for path in paths {
-            let input = std::fs::read(path)?;
-            let proof = std::fs::read(path.replace(".input", ".proof"))?;
-            let (code, instructions, id) = self.judged(path, &[input, proof].concat())?;
-            println!(
-                "STATEMENT file={path} code={code:#x} instructions={} id={id}",
-                count(instructions)
-            );
-            if code != 0 {
-                bail!("{path}: refused, {code:#x}");
-            }
-        }
-        Ok(())
-    }
-
     /// Each proof at `paths` verified `runs` times, measured, and a tampered
     /// copy refused.
     fn bench(&self, runs: usize, paths: &[String]) -> Result<()> {
@@ -602,7 +582,7 @@ fn count(instructions: Option<u64>) -> String {
 
 fn run(args: &[String]) -> Result<()> {
     let [blob, semantics, mode, files @ ..] = args else {
-        bail!("usage: <verifier.wasm> <client|pvf> <runs|judge|anchors|statements> <file>...");
+        bail!("usage: <verifier.wasm> <client|pvf> <runs|judge|anchors> <file>...");
     };
     let runner = Runner::new(blob, semantics.parse()?)?;
     match mode.as_str() {
@@ -618,7 +598,6 @@ fn run(args: &[String]) -> Result<()> {
             }
             runner.anchors()
         }
-        "statements" => runner.statements(files),
         runs => runner.bench(runs.parse()?, files),
     }
 }
