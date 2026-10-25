@@ -15,11 +15,11 @@
 //!   refused), and it anchors from the venue's next window: no start is
 //!   signed, so none can be replayed.
 //! - **An anchor** ([`anchor`]): of a registered, active space; signed by a
-//!   key it lists, strictly; a second root at a window held is the
-//!   evidence of an equivocation, which ends the space for good; otherwise
-//!   the window is at or after the space's first, past its last anchored
-//!   (gaps allowed), closed by the venue's clock (`w < now_w`) and no older
-//!   than [`MAX_ROOT_AGE_MS`].
+//!   key it lists, strictly; at a window no older than [`MAX_ROOT_AGE_MS`];
+//!   a second root at a window held is the evidence of an equivocation,
+//!   which ends the space for good; otherwise the window is at or after the
+//!   space's first, past its last anchored (gaps allowed) and closed by the
+//!   venue's clock (`w < now_w`).
 //! - **Anchored** ([`anchored`]): a root is its space's at its window while
 //!   the space is active, the venue holds it, and it is fresh.
 //! - **Time** ([`expiry`], [`fresh`], [`aged`], [`seen_expiry`]): a root of
@@ -212,10 +212,14 @@ pub enum AnchorRefusal {
 }
 
 /// The anchor rule, in its order: the space registered and active; the
-/// signer listed; the signature; a root held at the window (the same:
-/// [`Anchoring::Again`]; another: [`Anchoring::Evidence`]); the window at
-/// or after the space's first and past its last; closed by the venue's
-/// clock; fresh.
+/// signer listed; the signature; the window not past `MaxRootAge`; a root
+/// held at the window (the same: [`Anchoring::Again`]; another:
+/// [`Anchoring::Evidence`]); the window at or after the space's first and
+/// past its last; closed by the venue's clock.
+///
+/// Age comes before the held root, so an aged second root is refused alike
+/// whether or not the venue has pruned the first: only a fresh window's
+/// second root is evidence.
 pub fn anchor(state: &impl VenueState, anchor: &Anchor) -> Result<Anchoring, AnchorRefusal> {
     let space = state
         .space(&anchor.space)
@@ -231,6 +235,9 @@ pub fn anchor(state: &impl VenueState, anchor: &Anchor) -> Result<Anchoring, Anc
         return Err(AnchorRefusal::Signature);
     }
     let w = anchor.window;
+    if aged(&space.clock, w, state.now()) {
+        return Err(AnchorRefusal::Age);
+    }
     if let Some(held) = state.held(&anchor.space, anchor.kind, w) {
         return Ok(if held.root == anchor.root {
             Anchoring::Again
@@ -246,9 +253,6 @@ pub fn anchor(state: &impl VenueState, anchor: &Anchor) -> Result<Anchoring, Anc
     }
     if space.clock.window(state.now()).is_none_or(|open| w >= open) {
         return Err(AnchorRefusal::Open);
-    }
-    if !fresh(&space.clock, w, state.now()) {
-        return Err(AnchorRefusal::Age);
     }
     Ok(Anchoring::New)
 }

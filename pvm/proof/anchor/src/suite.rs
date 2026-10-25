@@ -138,6 +138,7 @@ pub fn run<H: Harness>(venue: impl Fn() -> H) {
     registration(&mut venue());
     anchoring(&mut venue());
     equivocation(&mut venue());
+    aged_evidence(&mut venue());
 }
 
 /// A registration's refusals, each alone; one taken, anchoring from the
@@ -312,4 +313,26 @@ fn equivocation(h: &mut impl Harness) {
         "the tombstone"
     );
     assert_eq!(h.status(&space), Some(Status::Ended));
+}
+
+/// A second root at a window held but past `MaxRootAge` is refused as aged,
+/// whether or not the venue still holds the first: no evidence, the space
+/// still active.
+fn aged_evidence(h: &mut impl Harness) {
+    h.set_now(into(20, 0));
+    let genesis = genesis(h, &[1, 2], 5);
+    let space = space_id(&genesis);
+    register(h, &genesis, 1).expect("registered");
+    h.set_now(into(25, 0));
+    let held = signed(h, space, 22, 0x22, 1);
+    assert_eq!(h.anchor(&held), Answer::New);
+    h.set_now(CLOCK.boundary(22).expect("a boundary") + MAX_ROOT_AGE_MS + 1);
+    let other = signed(h, space, 22, 0xee, 2);
+    assert_eq!(h.anchor(&other), Answer::Refused(AnchorRefusal::Age));
+    assert_eq!(
+        h.anchor(&held),
+        Answer::Refused(AnchorRefusal::Age),
+        "the root again"
+    );
+    assert_eq!(h.status(&space), Some(Status::Active));
 }

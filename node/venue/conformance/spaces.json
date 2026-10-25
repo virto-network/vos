@@ -740,10 +740,10 @@
     },
     {
       "id": "G4",
-      "title": "anchor refusals: before the space's first window (WindowNotAfterLast), older than MaxRootAge (WindowTooOld), exactly MaxRootAge old taken, the same root again (AlreadyAnchored), a stale w ≤ Last (WindowNotAfterLast), the open window now_w and a later one (WindowInFuture), then now_ms at B_w and the same anchor resubmitted (Anchored); a bad signature (BadAnchorSignature), kind 1 (BadKind), an unlisted key (UnknownAnchorKey), an unknown space (UnknownSpace), now_ms before the origin (WindowInFuture)",
+      "title": "anchor refusals: before the space's first window (WindowNotAfterLast), older than MaxRootAge (WindowTooOld), exactly MaxRootAge old taken, the same root again (AlreadyAnchored), the open window now_w and a later one (WindowInFuture), then now_ms at B_w and the same anchor resubmitted (Anchored); a stale w ≤ Last (WindowNotAfterLast); a second root at a held window past MaxRootAge (WindowTooOld: no evidence, the space active); a bad signature (BadAnchorSignature), kind 1 (BadKind), an unlisted key (UnknownAnchorKey), an unknown space (UnknownSpace), now_ms before the origin (WindowInFuture)",
       "fees": false,
       "pre": {
-        "now_ms": 106000001,
+        "now_ms": 19600001,
         "accounts": [
           {
             "account": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
@@ -879,7 +879,7 @@
       },
       "steps": [
         {
-          "now_ms": 106000001,
+          "now_ms": 19600001,
           "origin": {
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
@@ -953,21 +953,6 @@
             "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
           },
           "call": [
-            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e1e00000000000000000202020202020202020202020202020202020202020202020202020202020202ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d14c4ff8fcf9347c19c4a049a45038c9fa61a77f035b311ae000cebdae0f8985e7dfec987216c2583b2e41be723a9dfa0dbaaf271ca250ada4c026fa523106220c"
-          ],
-          "result": {
-            "module": 15
-          },
-          "events": [],
-          "storage": [],
-          "balances": []
-        },
-        {
-          "now_ms": 106600000,
-          "origin": {
-            "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
-          },
-          "call": [
             "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eb000000000000000000404040404040404040404040404040404040404040404040404040404040404ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1e6da34d8d6a84f86973382dda267fa771fb181958b26e2338b08277439e3d73b04dbefb713cc91a963f55a548eaf8fa19e8273e51bd544150cc9504222b2a305"
           ],
           "result": {
@@ -1014,6 +999,36 @@
               "value": "b000000000000000"
             }
           ],
+          "balances": []
+        },
+        {
+          "now_ms": 107200000,
+          "origin": {
+            "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
+          },
+          "call": [
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5eaf00000000000000000202020202020202020202020202020202020202020202020202020202020202ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d1ef8ab058df711324290ff50ec96636810bbbc2defb549247e2ceeac5b82be582e1164b4f68f5fe73f45230974f0ea73792dd4ff0f123f6ef32995c6516ecb10e"
+          ],
+          "result": {
+            "module": 15
+          },
+          "events": [],
+          "storage": [],
+          "balances": []
+        },
+        {
+          "now_ms": 107200000,
+          "origin": {
+            "signed": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3"
+          },
+          "call": [
+            "5a07cc65ab40d4da9c093bf33d1246f1a9a970698603ec0dc1c6f6816f4357b72c5e1f00000000000000000707070707070707070707070707070707070707070707070707070707070707ed4928c628d1c2c6eae90338905995612959273a5c63f93636c14614ac8737d194ed99eeb2af55f0fbc903a6a67d139c340624f34a7fa0a3b7894633d85580b2c10e5b22e0e4d2b2cc6aaa2413e6a7401e472040d0ea80e344cb536ea0ec390e"
+          ],
+          "result": {
+            "module": 17
+          },
+          "events": [],
+          "storage": [],
           "balances": []
         },
         {

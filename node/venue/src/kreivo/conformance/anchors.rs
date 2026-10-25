@@ -29,9 +29,8 @@ pub(super) fn g3(fx: &Fixtures) -> Vector {
 pub(super) fn g4(fx: &Fixtures) -> Vector {
     let mut w = World::new(fx, false);
     w.with_b(AUTHORITY_1, KEY_3);
-    // Window 30's root just past MaxRootAge.
-    let now = B_CLOCK.boundary(B_START).unwrap() + vos_anchor::MAX_ROOT_AGE_MS + 1;
-    w.at(now);
+    // Window 29 closed and fresh, before the space's first window.
+    w.at(B_CLOCK.boundary(B_START).unwrap() + 1);
     w.begin();
     let by = AUTHORITY_1;
     w.anchor(
@@ -42,6 +41,9 @@ pub(super) fn g4(fx: &Fixtures) -> Vector {
         KEY_3,
         Expect::Err(Error::WindowNotAfterLast),
     );
+    // Window 30's root just past MaxRootAge.
+    let now = B_CLOCK.boundary(B_START).unwrap() + vos_anchor::MAX_ROOT_AGE_MS + 1;
+    w.at(now);
     w.anchor(
         by,
         b(),
@@ -63,14 +65,6 @@ pub(super) fn g4(fx: &Fixtures) -> Vector {
         root(3),
         KEY_3,
         Expect::Err(Error::AlreadyAnchored),
-    );
-    w.anchor(
-        by,
-        b(),
-        B_START,
-        root(2),
-        KEY_3,
-        Expect::Err(Error::WindowNotAfterLast),
     );
     // The open window, then a later one.
     w.anchor(
@@ -94,6 +88,25 @@ pub(super) fn g4(fx: &Fixtures) -> Vector {
     w.at(B_CLOCK.boundary(now_w).unwrap());
     let outcome = w.anchor(by, b(), now_w, root(4), KEY_3, Expect::Ok);
     assert!(matches!(outcome.events[..], [Event::Anchored { window, .. }] if window == now_w));
+    // A stale window, closed and fresh but not past Last.
+    w.anchor(
+        by,
+        b(),
+        now_w - 1,
+        root(2),
+        KEY_3,
+        Expect::Err(Error::WindowNotAfterLast),
+    );
+    // Window 31 now past MaxRootAge: a second root there is aged, no
+    // evidence, though its first is still held.
+    w.anchor(
+        by,
+        b(),
+        B_START + 1,
+        root(7),
+        KEY_3,
+        Expect::Err(Error::WindowTooOld),
+    );
     let mut bad = w.anchor_arg(b(), now_w + 1, root(6), KEY_3);
     bad.signature[0] ^= 1;
     w.call(
@@ -138,9 +151,10 @@ pub(super) fn g4(fx: &Fixtures) -> Vector {
         "G4",
         "anchor refusals: before the space's first window (WindowNotAfterLast), older than \
          MaxRootAge (WindowTooOld), exactly MaxRootAge old taken, the same root again \
-         (AlreadyAnchored), a stale w ≤ Last (WindowNotAfterLast), the open window now_w and a \
-         later one (WindowInFuture), then now_ms at B_w and the same anchor resubmitted \
-         (Anchored); a bad signature (BadAnchorSignature), kind 1 (BadKind), an unlisted key \
+         (AlreadyAnchored), the open window now_w and a later one (WindowInFuture), then now_ms \
+         at B_w and the same anchor resubmitted (Anchored); a stale w ≤ Last (WindowNotAfterLast); \
+         a second root at a held window past MaxRootAge (WindowTooOld: no evidence, the space \
+         active); a bad signature (BadAnchorSignature), kind 1 (BadKind), an unlisted key \
          (UnknownAnchorKey), an unknown space (UnknownSpace), now_ms before the origin \
          (WindowInFuture)",
     )
