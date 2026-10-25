@@ -166,21 +166,28 @@ G–L are M4's and M5's.
   repeat `Accepted` at one site.
 - **`Unlisted`'s handoff:** the leader transfers its leadership
   (`vos-raft`'s `transfer_leadership`) to a replica whose node key the
-  client's last listing holds; at most one handoff a window a leadership;
-  with no replica listed, it alerts and waits, no handoff.
+  client's last listing holds; at most one handoff a window of the
+  space's clock, per node, across its leaderships; with no replica
+  listed, it alerts and waits, no handoff.
 - **What a client still reads:** the space's status, `AnchorKeys` (the
   handoff's target; on Kreivo it tells a delisted authority's `Payment`
   refusal from an exhausted budget) and `Last`/`Anchors[w]`; on its own
   thread, cached for the batch thread (slice 6's F2).
 - **The replicated anchor row** (C3, C11): the representative's close
-  writes `anchor(w) = S_w` by apply for a window some agent reported, kept
-  for `MaxRootAge`; its leader signs only an applied row, never a root
-  from the batch under proposal, in window order, with its node key (C2);
-  nothing is handed back.
-- **The divergence guard** (S11): before sending an anchor the venue
+  writes `anchor(w) = S_w` in the commit that finishes its cut's build
+  (the cut fixed by the committed log, so the same bytes on every
+  replica; not the agent's apply of `Input::Close`, which would change
+  the agent image; `slice-7-progress.md`, 7.2) for a window some agent
+  reported, kept for `MaxRootAge`; its leader signs only those rows,
+  never a root from the batch under proposal, in window order, with its
+  node key (C2); nothing is handed back.
+- **The divergence guard** (S11, S34): before sending an anchor the venue
   would store as evidence, the leader asks its followers for their
-  applied `anchor(w)`; if any differs it sends nothing and alerts
-  "divergent replicas" (an apply bug or a clone, not a theft). A restored
+  `anchor(w)`. A quorum of the group holding its row decides: the
+  evidence goes, each dissenting replica alerted by name with its root
+  (one equal to the venue's held root names the equivocator). Without a
+  quorum it sends nothing, settles nothing, and asks again every 2 s,
+  alerted once. A dissent alone never settles the window. A restored
   backup or a cloned store counts as a compromised node key
   (`docs/operations.md`): the node is replaced before the space re-founds.
 - **Equivocation ends the space** (C4, S11): the evidence is stored, the

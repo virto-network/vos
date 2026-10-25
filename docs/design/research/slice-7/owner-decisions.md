@@ -208,3 +208,21 @@ Amendments:
   re-founding runbook re-seeds the new credential actor's tree from the
   ended space's `member` digests, with no member action. Also: `member`
   carries no epoch (`member = P2(TAG_MEMBER ‖ s)`).
+
+## On Fable's review of 7.2 (2026-10-25)
+
+`7.2-fable.md`, "fix, then merge"; its M1 asked the owner whether a
+quorum overrides a dissenting minority in the divergence guard.
+
+S34. **The divergence guard: the majority decides.** When a quorum of the
+  representative's replicas (this one among them) holds the leader's row
+  of a window at which the venue holds another root, the leader sends its
+  anchor as the evidence even when a minority answers another row; each
+  dissenting replica is alerted by name with the root it holds. A
+  dissenter whose root equals the venue's held root names the
+  equivocator (a fork of this representative); one equal to neither is a
+  bug or a compromise. Without a quorum (too few answers, or a split with
+  no majority) the leader sends nothing and settles nothing: it asks
+  again every 2 s, its alert raised once. A dissent never settles the
+  window for the leadership. Narrows S11's amendment ("sends nothing if
+  any differs").
