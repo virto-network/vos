@@ -679,7 +679,7 @@ and fold layout of §1.1 is unchanged.
 | memory, time | 2.2–4.9 GiB, 4.4–9.5 s unmasked [projected]; masked (format 39) as built: a 3.6 GiB heap [measured]; spike 6a's masked toy, historical: 3.45 GiB (×1.41), 11.6–15 s (×2.6–2.9) | projected, measured |
 | JAM gas, unmasked | 81.1M with the model's Blake2s; **85.2M Blake2b-256 in software (×1.05); 64.1M through `0x400` (×0.79)** | model (`R/spike4a-final-gas.md` §5, §7) |
 | JAM gas, masked | **79.3M** as built, the decode 1.50M of it [measured]; spike 6a's figures, historical: 115.8–118.7M (×1.21–1.24), its toy's ×1.37–1.40 | measured |
-| proof | about 122 KB unmasked [model]; masked as built 146,564 B (`wrap.proof`) [measured]; spike 6a's 160–163 KB, historical | model, measured |
+| proof | about 122 KB unmasked [model]; masked as built 148,612 B (`wrap.proof`) [measured]; spike 6a's 160–163 KB, historical | model, measured |
 
 - The gas uses spike 4a's fit within 5.8%
   (`gas ≈ −4.2M + 59.3k·C + 2,171·q·C + 17,183·P + 9,376·F`) at 458 columns,

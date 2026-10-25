@@ -399,7 +399,7 @@ attribution). Its full design is `recursion-air.md`.
     2,498 MiB, 122,085 bytes);
   - **on the JAM-only host** (`final-verify.elf`, Blake2b-256 in
     software, the guests' allocator a bump over its arena): the `valid`
-    fixture's 146,564-byte proof in 79.3M gas, the decode 1.50M of it and
+    fixture as pinned at 6.22 (146,564 bytes), historical, in 79.3M gas, the decode 1.50M of it and
     the verify 77.8M; the JAM statements service's refine of one
     statement 79.4M;
   - **in Wasm** under the PVF's semantics: 44.9M instructions (the window
@@ -1314,7 +1314,7 @@ the order drawn, never in `TypeId` order). `just judge-wasm` (in
 
 **At format 39** [measured]: the generator wraps `S`'s
 run under format 39, masked from the seeded test seam (`MaskRng::Seeded`,
-so the bytes are its own every run: `wrap.proof`, 146,564 bytes), and under
+so the bytes are its own every run: `wrap.proof`, 148,612 bytes), and under
 28 (`wrap-28.proof`, 123,797 bytes); and the two cheating wraps under 39.
 `S`'s `public_args` are a venue's id and a nonce, which the io-hash binds
 and no venue reads apart. The production venue accepts {39}, the test

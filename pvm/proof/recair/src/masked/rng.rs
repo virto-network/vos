@@ -20,6 +20,7 @@ use rayon::prelude::*;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::pcs::DeepBatching;
 use vos_pvm_proof::format::{Format, Masking};
+use vos_pvm_proof::proof::statement_header_words;
 
 use crate::prove::ProveError;
 use crate::trace::Evaluations;
@@ -78,13 +79,15 @@ pub(crate) struct Statement<'a> {
 }
 
 /// The witness digest R4 hedges with: `BLAKE2b-256` of the domain, the
-/// statement's words (the format's number, its configuration, its masking
-/// and interaction PoW, its channel's tag, each log size, as u64
-/// little-endian; each public value's 4 limbs, as u32
-/// little-endian), then each main column's digest in commitment order, a
-/// column's the `BLAKE2b-256` of its values, 4 bytes little-endian each in
-/// Stwo's storage order. Every private value of the witness is in the main
-/// columns.
+/// statement's words as u64 little-endian (the count of its header's words,
+/// then the header the transcript mixes,
+/// `vos_pvm_proof::proof::statement_header_words`: the format's number, its
+/// configuration and each log size; then its DEEP batching, its interaction
+/// PoW, its channel's tag and its masking), the public values' count and
+/// each value's 4 limbs, as u32 little-endian, then each main column's digest
+/// in commitment order, a column's the `BLAKE2b-256` of its values, 4 bytes
+/// little-endian each in Stwo's storage order. Every private value of the
+/// witness is in the main columns.
 pub(crate) fn witness_digest(statement: &Statement<'_>, main: &[Evaluations]) -> [u8; 32] {
     let columns: Vec<[u8; 32]> = main
         .iter()
@@ -97,39 +100,21 @@ pub(crate) fn witness_digest(statement: &Statement<'_>, main: &[Evaluations]) ->
         })
         .collect();
     let config = statement.format.pcs_config();
-    let fri = config.fri_config;
-    let lifting = config
-        .lifting_log_size
-        .map_or(0, |log_size| 1 + u64::from(log_size));
+    let header = statement_header_words(statement.format.number, &config, statement.log_sizes);
     let batching = match config.deep_batching {
         DeepBatching::Powers => 0,
         DeepBatching::Affine => 1,
     };
     let masking = statement.masking;
     let mut hasher = Blake2b256::new().chain_update(WITNESS_DOMAIN);
-    for word in [
-        u64::from(statement.format.number),
-        u64::from(config.pow_bits),
-        fri.n_queries as u64,
-        u64::from(fri.log_blowup_factor),
-        u64::from(fri.log_last_layer_degree_bound),
-        u64::from(fri.fold_step),
-        lifting,
+    for word in core::iter::once(header.len() as u64).chain(header).chain([
         batching,
         u64::from(statement.format.interaction_pow_bits()),
         statement.format.channel as u64,
         masking.salt_columns as u64,
         masking.fri_mask_columns as u64,
         u64::from(masking.log_mask_rows),
-        statement.log_sizes.len() as u64,
-    ]
-    .into_iter()
-    .chain(
-        statement
-            .log_sizes
-            .iter()
-            .map(|&log_size| u64::from(log_size)),
-    ) {
+    ]) {
         hasher.update(word.to_le_bytes());
     }
     hasher.update((statement.public.len() as u64).to_le_bytes());
@@ -166,9 +151,9 @@ mod tests {
     }
 
     /// R4 against a replayed state: one OS state hedged with two witnesses
-    /// differing in one value, or with one witness under two channels or
-    /// public values, seeds two other streams; the same witness and state
-    /// seed one.
+    /// differing in one value, or with one witness under two channels,
+    /// public values, log sizes, format numbers or masks' heights, seeds
+    /// two other streams; the same witness and state seed one.
     #[test]
     fn a_replayed_state_draws_other_masks_for_another_witness() {
         use rand::RngCore;
@@ -177,6 +162,14 @@ mod tests {
         let poseidon = Format {
             channel: ChannelKind::Poseidon2M31,
             ..MASKED_WRAP
+        };
+        let renumbered = Format {
+            number: MASKED_WRAP.number + 1,
+            ..MASKED_WRAP
+        };
+        let taller = Masking {
+            log_mask_rows: masking.log_mask_rows + 1,
+            ..masking
         };
         let statement = |format, public| Statement {
             format,
@@ -192,6 +185,21 @@ mod tests {
             witness_digest(&statement(&MASKED_WRAP, &public), &[column(&amount)]),
             witness_digest(&statement(&poseidon, &public), &[column(&values)]),
             witness_digest(&statement(&MASKED_WRAP, &[]), &[column(&values)]),
+            witness_digest(
+                &Statement {
+                    log_sizes: &[5],
+                    ..statement(&MASKED_WRAP, &public)
+                },
+                &[column(&values)],
+            ),
+            witness_digest(&statement(&renumbered, &public), &[column(&values)]),
+            witness_digest(
+                &Statement {
+                    masking: &taller,
+                    ..statement(&MASKED_WRAP, &public)
+                },
+                &[column(&values)],
+            ),
         ];
         let first_word = |digest: &[u8; 32], attempt| {
             MaskRng::Seeded(5)

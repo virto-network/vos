@@ -39,7 +39,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use num_traits::{One, Zero};
+use num_traits::One;
 use stwo::core::channel::Blake2bChannel;
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
@@ -55,8 +55,7 @@ use vos_pvm_final_verifier::{
 use vos_pvm_proof::format::{self, ProofBytes, Status};
 use vos_pvm_recair::masked::{MaskRng, verifier_format};
 use vos_pvm_recair::wrap::{self, WrapCircuit};
-use vos_pvm_recair_air::GateRelation;
-use vos_pvm_recair_air::masked::{BlindRelation, MaskPins, WrapComponents};
+use vos_pvm_recair_air::masked::{MaskPins, WrapComponents};
 
 /// The one-segment run's root wrapped under `format::MASKED_WRAP`: the
 /// proof, its bytes and its public words.
@@ -114,12 +113,7 @@ fn write(name: &str, format: u32, proof: &[u8], words: &[u32; PUBLIC_WORDS]) {
 
 /// The wrap's set under any relations: its trees' layout.
 fn layout() -> WrapComponents {
-    WrapComponents::build(
-        &GateRelation::dummy(),
-        &BlindRelation::dummy(),
-        &vos_pvm_final_verifier::LOG_SIZES,
-        &[SecureField::zero(); 3],
-    )
+    WrapComponents::layout(&vos_pvm_final_verifier::LOG_SIZES)
 }
 
 /// `verify` run, a panic caught and reported as one.

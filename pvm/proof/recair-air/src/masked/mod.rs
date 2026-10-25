@@ -28,21 +28,14 @@ use core::array::from_fn;
 
 use num_traits::One;
 use stwo::core::ColumnVec;
-use stwo::core::air::accumulation::PointEvaluationAccumulator;
 use stwo::core::air::{Component, Components};
 use stwo::core::channel::Channel;
 use stwo::core::circle::CirclePoint;
-use stwo::core::constraints::coset_vanishing;
-use stwo::core::fields::FieldExpOps;
 use stwo::core::fields::qm31::{SECURE_EXTENSION_DEGREE, SecureField};
 use stwo::core::pcs::TreeVec;
-use stwo::core::poly::circle::CanonicCoset;
-use stwo_constraint_framework::{
-    EvalAtRow, FrameworkComponent, FrameworkEval, PREPROCESSED_TRACE_IDX, PointEvaluator,
-    RelationEntry, TraceLocationAllocator, relation,
-};
+use stwo_constraint_framework::{EvalAtRow, FrameworkEval, RelationEntry, relation};
 
-use crate::{Body, GateRelation, LogSizes, h8, p2, preprocessed_ids, qm31};
+use crate::Body;
 
 /// The constraint bound over the log size: `4N`, the composition whole.
 pub const MASKED_LOG_CONSTRAINT_EXPANSION: u32 = 2;
@@ -56,6 +49,19 @@ pub const BLIND_COLUMNS: usize = SECURE_EXTENSION_DEGREE;
 
 /// The composition's coordinate columns, committed whole.
 pub const COMPOSITION_COLUMNS: usize = SECURE_EXTENSION_DEGREE;
+
+/// The trees a masked proof commits: preprocessed, main, interaction, and
+/// the composition's last.
+pub const TREES: usize = 4;
+
+/// The trees the components' columns fill, before the composition's.
+const AIR_TREES: usize = TREES - 1;
+
+mod component;
+mod wrap;
+
+pub use component::{MaskedComponent, Rebound};
+pub use wrap::WrapComponents;
 
 relation!(BlindRelation, 1);
 
@@ -161,139 +167,6 @@ pub trait MaskedComponents: Sized {
     ) -> Option<Vec<Box<dyn Component + 'a>>>;
 }
 
-/// A component laid out once, its constraints evaluated by another
-/// evaluation of the same layout: the verifier lays its set out before the
-/// relations are drawn, and evaluates it under the drawn relations and the
-/// proof's claimed sums. A layout (the columns, masks and preprocessed
-/// columns `FrameworkComponent::new` reads off an evaluation) depends on
-/// neither, so `eval`, differing from `layout`'s only in them, reads the
-/// columns `layout` lays out. Its evaluation at a point is
-/// `FrameworkComponent`'s, everything else `layout`'s.
-pub struct Rebound<'a, E: FrameworkEval> {
-    layout: &'a FrameworkComponent<E>,
-    eval: E,
-    claimed_sum: SecureField,
-}
-
-impl<'a, E: FrameworkEval> Rebound<'a, E> {
-    /// `layout` evaluated by `eval` with `claimed_sum`; `None` unless `eval`
-    /// is at `layout`'s log size and constraint bound.
-    pub fn new(
-        layout: &'a FrameworkComponent<E>,
-        eval: E,
-        claimed_sum: SecureField,
-    ) -> Option<Self> {
-        (eval.log_size() == layout.log_size()
-            && eval.max_constraint_log_degree_bound()
-                == Component::max_constraint_log_degree_bound(layout))
-        .then_some(Self {
-            layout,
-            eval,
-            claimed_sum,
-        })
-    }
-}
-
-impl<E: FrameworkEval> Component for Rebound<'_, E> {
-    fn n_constraints(&self) -> usize {
-        self.layout.n_constraints()
-    }
-
-    fn max_constraint_log_degree_bound(&self) -> u32 {
-        self.layout.max_constraint_log_degree_bound()
-    }
-
-    fn trace_log_degree_bounds(&self) -> TreeVec<ColumnVec<u32>> {
-        self.layout.trace_log_degree_bounds()
-    }
-
-    fn mask_points(
-        &self,
-        point: CirclePoint<SecureField>,
-        max_log_degree_bound: u32,
-    ) -> TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>> {
-        self.layout.mask_points(point, max_log_degree_bound)
-    }
-
-    fn preprocessed_column_indices(&self) -> ColumnVec<usize> {
-        Component::preprocessed_column_indices(self.layout)
-    }
-
-    fn evaluate_constraint_quotients_at_point(
-        &self,
-        point: CirclePoint<SecureField>,
-        mask: &TreeVec<ColumnVec<Vec<SecureField>>>,
-        evaluation_accumulator: &mut PointEvaluationAccumulator,
-        max_log_degree_bound: u32,
-    ) {
-        let preprocessed = self
-            .layout
-            .preprocessed_column_indices()
-            .iter()
-            .map(|&index| &mask[PREPROCESSED_TRACE_IDX][index])
-            .collect();
-        let mut columns = mask.sub_tree(self.layout.trace_locations());
-        columns[PREPROCESSED_TRACE_IDX] = preprocessed;
-        self.eval.evaluate(PointEvaluator::new(
-            columns,
-            evaluation_accumulator,
-            coset_vanishing(CanonicCoset::new(max_log_degree_bound).coset, point).inverse(),
-            self.eval.log_size(),
-            self.claimed_sum,
-        ));
-    }
-}
-
-/// A component whose main and interaction columns, and the preprocessed
-/// columns it reads, are committed at `log_size + 1`; everything else is the
-/// inner component's.
-pub struct MaskedComponent<'a, C: ?Sized> {
-    pub inner: &'a C,
-}
-
-impl<C: Component + ?Sized> Component for MaskedComponent<'_, C> {
-    fn n_constraints(&self) -> usize {
-        self.inner.n_constraints()
-    }
-
-    fn max_constraint_log_degree_bound(&self) -> u32 {
-        self.inner.max_constraint_log_degree_bound()
-    }
-
-    fn trace_log_degree_bounds(&self) -> TreeVec<ColumnVec<u32>> {
-        self.inner
-            .trace_log_degree_bounds()
-            .map_cols(|log_size| log_size + MASKED_COLUMN_EXPANSION)
-    }
-
-    fn mask_points(
-        &self,
-        point: CirclePoint<SecureField>,
-        max_log_degree_bound: u32,
-    ) -> TreeVec<ColumnVec<Vec<CirclePoint<SecureField>>>> {
-        self.inner.mask_points(point, max_log_degree_bound)
-    }
-
-    fn preprocessed_column_indices(&self) -> ColumnVec<usize> {
-        self.inner.preprocessed_column_indices()
-    }
-
-    fn evaluate_constraint_quotients_at_point(
-        &self,
-        point: CirclePoint<SecureField>,
-        mask: &TreeVec<ColumnVec<Vec<SecureField>>>,
-        evaluation_accumulator: &mut PointEvaluationAccumulator,
-        max_log_degree_bound: u32,
-    ) {
-        self.inner.evaluate_constraint_quotients_at_point(
-            point,
-            mask,
-            evaluation_accumulator,
-            max_log_degree_bound,
-        )
-    }
-}
-
 /// The level the AIR is evaluated at, its tallest masked column's: `m + 1`.
 pub fn air_log_size(set: &impl MaskedComponents) -> Option<u32> {
     set.components()
@@ -394,10 +267,10 @@ pub fn sample_points(
         n_preprocessed_columns: n_preprocessed,
     }
     .mask_points(oods_point, air_level, false);
-    if points.len() > 3 {
+    if points.len() > AIR_TREES {
         return None;
     }
-    points.resize(3, Vec::new());
+    points.resize(AIR_TREES, Vec::new());
     for (tree, width) in points.iter_mut().zip(committed.iter().map(Vec::len)) {
         if tree.len() > width {
             return None;
@@ -458,144 +331,27 @@ pub fn composition_oods_eval(
     Some(SecureField::from_partial_evals(coordinates))
 }
 
-/// The recursion AIR masked: [`p2`], [`qm31`] and [`h8`], each a
-/// [`MaskedEval`], their columns allocated in the trees' order.
-pub struct WrapComponents {
-    pub p2: FrameworkComponent<MaskedEval<p2::P2Eval>>,
-    pub qm31: FrameworkComponent<MaskedEval<qm31::Qm31Eval>>,
-    pub h8: FrameworkComponent<MaskedEval<h8::H8Eval>>,
-    log_sizes: LogSizes,
-}
-
-impl WrapComponents {
-    pub fn build(
-        relation: &GateRelation,
-        blind: &BlindRelation,
-        log_sizes: &LogSizes,
-        claimed_sums: &[SecureField; 3],
-    ) -> Self {
-        let allocator =
-            &mut TraceLocationAllocator::new_with_preprocessed_columns(&preprocessed_ids());
-        let p2 = FrameworkComponent::new(
-            allocator,
-            MaskedEval::new(
-                p2::P2Eval {
-                    log_size: log_sizes[0],
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            claimed_sums[0],
-        );
-        let qm31 = FrameworkComponent::new(
-            allocator,
-            MaskedEval::new(
-                qm31::Qm31Eval {
-                    log_size: log_sizes[1],
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            claimed_sums[1],
-        );
-        let h8 = FrameworkComponent::new(
-            allocator,
-            MaskedEval::new(
-                h8::H8Eval {
-                    log_size: log_sizes[2],
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            claimed_sums[2],
-        );
-        Self {
-            p2,
-            qm31,
-            h8,
-            log_sizes: *log_sizes,
-        }
+/// The composition at `oods_point` of `components`, each lifted
+/// ([`MaskedComponent`]), from `samples` under `random_coeff`, the AIR at
+/// `air_level`: what the composition's coordinates, sampled at
+/// [`composition_point`], must give.
+pub fn eval_lifted_composition(
+    components: &[&dyn Component],
+    n_preprocessed_columns: usize,
+    oods_point: CirclePoint<SecureField>,
+    samples: &TreeVec<ColumnVec<Vec<SecureField>>>,
+    random_coeff: SecureField,
+    air_level: u32,
+) -> SecureField {
+    let lifted: Vec<MaskedComponent<'_, dyn Component>> = components
+        .iter()
+        .map(|&inner| MaskedComponent { inner })
+        .collect();
+    Components {
+        components: lifted.iter().map(|c| c as &dyn Component).collect(),
+        n_preprocessed_columns,
     }
-}
-
-impl MaskedComponents for WrapComponents {
-    type Relations = GateRelation;
-
-    fn draw_relations(channel: &mut impl Channel) -> GateRelation {
-        GateRelation::draw(channel)
-    }
-
-    fn new(
-        relation: &GateRelation,
-        blind: &BlindRelation,
-        log_sizes: &[u32],
-        claimed_sums: &[SecureField],
-    ) -> Option<Self> {
-        Some(Self::build(
-            relation,
-            blind,
-            log_sizes.try_into().ok()?,
-            claimed_sums.try_into().ok()?,
-        ))
-    }
-
-    fn log_sizes(&self) -> &[u32] {
-        &self.log_sizes
-    }
-
-    fn preprocessed_log_sizes(&self) -> Vec<u32> {
-        crate::preprocessed_log_sizes(&self.log_sizes)
-    }
-
-    fn components(&self) -> Vec<&dyn Component> {
-        alloc::vec![&self.p2, &self.qm31, &self.h8]
-    }
-
-    fn bind<'a>(
-        &'a self,
-        relation: &GateRelation,
-        blind: &BlindRelation,
-        claimed_sums: &[SecureField],
-    ) -> Option<Vec<Box<dyn Component + 'a>>> {
-        let &[p2_sum, qm31_sum, h8_sum] = claimed_sums else {
-            return None;
-        };
-        let [p2_size, qm31_size, h8_size] = self.log_sizes;
-        let p2 = Rebound::new(
-            &self.p2,
-            MaskedEval::new(
-                p2::P2Eval {
-                    log_size: p2_size,
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            p2_sum,
-        )?;
-        let qm31 = Rebound::new(
-            &self.qm31,
-            MaskedEval::new(
-                qm31::Qm31Eval {
-                    log_size: qm31_size,
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            qm31_sum,
-        )?;
-        let h8 = Rebound::new(
-            &self.h8,
-            MaskedEval::new(
-                h8::H8Eval {
-                    log_size: h8_size,
-                    relation: relation.clone(),
-                },
-                blind,
-            ),
-            h8_sum,
-        )?;
-        Some(alloc::vec![Box::new(p2), Box::new(qm31), Box::new(h8)])
-    }
+    .eval_composition_polynomial_at_point(oods_point, samples, random_coeff, air_level)
 }
 
 #[cfg(test)]
@@ -603,6 +359,8 @@ mod tests {
     use super::*;
 
     use stwo::core::circle::SECURE_FIELD_CIRCLE_GEN;
+
+    use crate::{GateRelation, LogSizes, h8, p2, qm31};
 
     /// `format::WRAP`'s and `format::MASKED_WRAP`'s log sizes.
     const LOG_SIZES: LogSizes = [14, 15, 11];
@@ -614,12 +372,7 @@ mod tests {
     };
 
     fn wrap() -> WrapComponents {
-        WrapComponents::build(
-            &GateRelation::dummy(),
-            &BlindRelation::dummy(),
-            &LOG_SIZES,
-            &[SecureField::default(); 3],
-        )
+        WrapComponents::layout(&LOG_SIZES)
     }
 
     /// Pin A's trees: 57 preprocessed columns at `n + 1`, unsalted; 373
@@ -815,15 +568,14 @@ mod tests {
         let coefficient = channel.draw_secure_felt();
         let air_level = air_log_size(&layout).unwrap();
         let evaluate = |components: Vec<&dyn Component>| {
-            let lifted: Vec<MaskedComponent<'_, dyn Component>> = components
-                .into_iter()
-                .map(|inner| MaskedComponent { inner })
-                .collect();
-            Components {
-                components: lifted.iter().map(|c| c as &dyn Component).collect(),
-                n_preprocessed_columns: points[0].len(),
-            }
-            .eval_composition_polynomial_at_point(z, &samples, coefficient, air_level)
+            eval_lifted_composition(
+                &components,
+                points[0].len(),
+                z,
+                &samples,
+                coefficient,
+                air_level,
+            )
         };
         let rebound = evaluate(bound.iter().map(|c| &**c).collect());
         assert_eq!(rebound, evaluate(built.components()));

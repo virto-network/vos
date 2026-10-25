@@ -409,6 +409,37 @@ const LEAF_WORK: [usize; 2] = [2 * 19 + 7, 85 + 448 + 2];
 /// The boundary chips' public logup terms over the boundary states.
 const BOUNDARY_TERMS: usize = 644;
 
+/// The `qm31` rows of a query's domain point (recair's
+/// `verifier::circle::domain_point`) at `log_size`: two for the bit above
+/// the first, four for each bit after it, one to conjugate on the first.
+/// A circle domain has at least four points: `log_size` is at least 2.
+const fn domain_point_rows(log_size: usize) -> usize {
+    debug_assert!(log_size >= 2, "a circle domain of at least four points");
+    2 + 4 * (log_size - 2) + 1
+}
+
+/// The `qm31` rows of a query's FRI folds (recair's
+/// `verifier::fri::verify_query`) over `layers`: in each layer the
+/// twiddle's inverse, the pair's difference, its scaling, their sum and the
+/// fold; and the query point's `x` doubled in each layer past the second.
+/// A segment's FRI has at least two layers: `layers` is at least 2.
+const fn fri_fold_rows(layers: usize) -> usize {
+    debug_assert!(layers >= 2, "at least two FRI layers");
+    5 * layers + (layers - 2)
+}
+
+/// The `qm31` rows of the OODS piece beside the compiled constraints and
+/// the two doubling chains (recair's `verifier::circle::random_point` and
+/// `verifier::oods::check`): the OODS point from its draw (4), the shift
+/// onto the canonic coset (2), the vanishing inverse (1), the sampled
+/// composition's two halves (3 each), their sum (1) and the product checked
+/// against it (1).
+const OODS_ROWS: usize = 4 + 2 + 1 + 2 * 3 + 1 + 1;
+
+/// The `qm31` rows the shape piece checks beside the header's words, one a
+/// word (recair's `verifier::segment`): the preprocessed root's two.
+const PREPROCESSED_ROOT_WORDS: usize = 2;
+
 /// The rows of a sum of `n` wires: three terms a first row, two each next.
 fn linear_rows(n: usize) -> usize {
     1 + n.saturating_sub(3).div_ceil(2)
@@ -756,20 +787,20 @@ pub fn leaf_terms(chips: u32, log_sizes: &[u8; SEGMENT_CHIPS]) -> Terms {
         channel: [channel, 0, 0],
         pow: POW,
         queries: [q.div_ceil(8), 64 * q, 0],
-        circle: [0, (4 * lifting - 5) * q, 0],
+        circle: [0, domain_point_rows(lifting) * q, 0],
         merkle: [(leaves + paths) * q, 0, 0],
-        fri: [fri * q, (6 * fri_layers - 2) * q, 0],
+        fri: [fri * q, fri_fold_rows(fri_layers) * q, 0],
         deep: [0, (deep.singles + 6 * deep.points) * q, deep.blocks * q],
         deep_once: [0, deep.once, 0],
         oods: [
             0,
             sum(|chip| chip.gates) + powers + sum(|chip| chip.constraints) - 1
-                + 2 * max_log as usize
-                + 13,
+                + 2 * (max_log as usize - 1)
+                + OODS_ROWS,
             0,
         ],
         logup: [0, linear_rows(n) + BOUNDARY_TERMS, 0],
-        shape: [0, header + 2, 0],
+        shape: [0, header + PREPROCESSED_ROOT_WORDS, 0],
         context: CONTEXT,
         leaf: [LEAF_WORK[0], LEAF_WORK[1], 0],
         points: deep.points,

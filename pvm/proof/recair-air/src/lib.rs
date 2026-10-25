@@ -143,6 +143,29 @@ pub fn committed_log_sizes(log_sizes: &LogSizes) -> [Vec<u32>; 3] {
     ]
 }
 
+/// The three components' evaluations at `log_sizes` under `relation`, in
+/// commitment order: [`p2`], [`qm31`], [`h8`].
+pub fn evals(
+    relation: &GateRelation,
+    log_sizes: &LogSizes,
+) -> (p2::P2Eval, qm31::Qm31Eval, h8::H8Eval) {
+    let [p2, qm31, h8] = *log_sizes;
+    (
+        p2::P2Eval {
+            log_size: p2,
+            relation: relation.clone(),
+        },
+        qm31::Qm31Eval {
+            log_size: qm31,
+            relation: relation.clone(),
+        },
+        h8::H8Eval {
+            log_size: h8,
+            relation: relation.clone(),
+        },
+    )
+}
+
 /// The three components at `log_sizes` and their claimed sums, their
 /// columns allocated in the trees' order.
 pub struct Components {
@@ -157,33 +180,15 @@ impl Components {
         log_sizes: &LogSizes,
         claimed_sums: &[SecureField; 3],
     ) -> Self {
+        let (p2, qm31, h8) = evals(relation, log_sizes);
+        let [p2_sum, qm31_sum, h8_sum] = *claimed_sums;
         let allocator =
             &mut TraceLocationAllocator::new_with_preprocessed_columns(&preprocessed_ids());
-        let p2 = FrameworkComponent::new(
-            allocator,
-            p2::P2Eval {
-                log_size: log_sizes[0],
-                relation: relation.clone(),
-            },
-            claimed_sums[0],
-        );
-        let qm31 = FrameworkComponent::new(
-            allocator,
-            qm31::Qm31Eval {
-                log_size: log_sizes[1],
-                relation: relation.clone(),
-            },
-            claimed_sums[1],
-        );
-        let h8 = FrameworkComponent::new(
-            allocator,
-            h8::H8Eval {
-                log_size: log_sizes[2],
-                relation: relation.clone(),
-            },
-            claimed_sums[2],
-        );
-        Self { p2, qm31, h8 }
+        Self {
+            p2: FrameworkComponent::new(allocator, p2, p2_sum),
+            qm31: FrameworkComponent::new(allocator, qm31, qm31_sum),
+            h8: FrameworkComponent::new(allocator, h8, h8_sum),
+        }
     }
 
     /// The components as Stwo's verifier takes them.

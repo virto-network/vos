@@ -86,12 +86,7 @@ pub(crate) fn circuit(seed: u64) -> Finalized<SecureField> {
 /// The recursion AIR's set at the proof's sizes, under any relations: its
 /// trees' layout.
 pub(crate) fn wrap_layout(log_sizes: &[u32; 3]) -> WrapComponents {
-    WrapComponents::build(
-        &GateRelation::dummy(),
-        &BlindRelation::dummy(),
-        log_sizes,
-        &[SecureField::zero(); 3],
-    )
+    WrapComponents::layout(log_sizes)
 }
 
 /// A small circuit's proof on `MC`.
