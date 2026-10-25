@@ -112,8 +112,10 @@ Each §3 API is in VOS's tagged crates:
    pays its deposits and fees.
 2. **A map of the space's current authorities:**
    - each authority is a node's own sr25519 Kreivo account;
-   - each is paired with the node's ed25519 anchor key;
-   - the space's controller rotates them;
+   - each is paired with the node's ed25519 node key, its only anchor
+     key;
+   - the space's controller adds and removes them: a node's key changes
+     only by replacing the node;
    - an authority's anchor and submit transactions are paid by the
      sovereign account, with no balance on the node.
 3. **Anchors:** one root per space, per window, under the anchor rule
@@ -711,34 +713,50 @@ The node's client (`vos-venue`'s `kreivo` module, over a `Transport`, §9.1):
 | anchor `S_w` (the representative's leader) | 7 | the node's sr25519 authority account | `Anchored` | see below |
 | submit a statement (the worker) | 8 | the node's sr25519 authority account | `Accepted { id }` → accepted; `Refused { 6 }` → accepted; `Refused { c }` → `Refusal(c)` | 7, 19–21 → a configuration or funding alert; `InvalidTransaction::Payment` → the budget or the sovereign's funds, an alert |
 
-**The anchor's errors, and what the client does.** The client pre-checks
-nothing of the anchor rule: it takes an anchor of a registered, active
-space signed by a key the space lists, and sends it; the pallet's answer
-decides.
-- an `Anchored` event of its root → done; an `Equivocated` event → the
-  space ended: an alert, and nothing more is sent for it;
-- 14 `AlreadyAnchored` → done;
-- 15 `WindowNotAfterLast` → done: a later anchor exists (a failover
-  anchored past it);
-- 16 `WindowInFuture` → sent again a block later. Kreivo's timestamp lags
-  real time by up to a block and the collator's drift, so near a
-  boundary, above all at L = 2 min (D = 24 s), this is a live case;
-  skipping it would leave the window unanchored for good;
-- 17 `WindowTooOld` → dead: an alert;
-- 19 `SpaceNotActive`, 20 `Paused` → wait for the space's status or the
-  pause to change;
-- 11 `UnknownAnchorKey` → handed back to be signed with a key the space
-  lists; 12, 13 → a bug: an alert.
+**The anchor's outcomes, and what the client does.** The node's leader
+knows five outcomes of an anchor (pin D′): taken, not yet, never,
+unlisted and stopped, each with the venue's raw code for its log. The
+client pre-checks nothing of the anchor rule. It answers from its last
+read of the space (not yet while unregistered, unread or paused; stopped
+while not active; unlisted while `AnchorKeys` does not list the signer),
+and otherwise queues the anchor and sends it. Before sending, it reads
+`Anchors[space][0][w]`: the same root held settles it; another root is
+sent only when the leader offered the anchor after reading that root (its
+divergence guard passed), as the equivocation's evidence. The pallet's
+answer, by one table:
+- an `Anchored` event of its root, or 14 `AlreadyAnchored` → taken;
+- an `Equivocated` event → the space ended: an alert, and nothing more is
+  sent for it;
+- 15 `WindowNotAfterLast`, 17 `WindowTooOld`, 12 `BadAnchorSignature`,
+  13 `BadKind` → never: an alert; signing again with the same key makes
+  the same signature;
+- 7 `NotAuthority`, 11 `UnknownAnchorKey` → unlisted: the leader hands its
+  leadership to a replica whose node key `AnchorKeys` lists;
+- 19 `SpaceNotActive` → stopped: no anchor until the space is active;
+- 16 `WindowInFuture` → not yet: sent again a block later. Kreivo's
+  timestamp lags real time by up to a block and the collator's drift, so
+  near a boundary, above all at L = 2 min (D = 24 s), this is a live
+  case; skipping it would leave the window unanchored for good;
+- 20 `Paused`, 21 and 27, `InvalidTransaction::Payment` (a funding alert:
+  a delisted authority pays its own fee, so the client reads the listing
+  first) and any other → not yet.
+
+Nothing is handed back to be signed again: a node signs only with its
+node key, and the leader offers each window's root again from its
+replicated row until the venue holds it, never takes it, or a replica
+whose key is listed leads.
 
 **Storage the node reads** (raw keys):
 `twox128("Spaces") ++ twox128(item) ++ hashed key`:
 - `Spaces[space]`: status, clock, sovereign;
 - `Authorities[space][self]`;
-- `AnchorKeys[space]`: `VenueClient::anchor_keys`, the keys the
-  representative's leader may sign with (the newest of its own listed) and
-  that let a node replicate the representative;
-- `Anchors[space][0][w]`: `VenueClient::anchored`;
-- `Last[space][0]`;
+- `AnchorKeys[space]`: `VenueClient::anchor_keys`, whether the
+  representative's leader may sign with its node key, the replica it
+  hands its leadership to when it may not, and whether a node may
+  replicate the representative;
+- `Anchors[space][0][w]`: `VenueClient::held`, the root at a window the
+  leader asks of, and `VenueClient::anchored`;
+- `Last[space][0]`: past it, the venue holds no root;
 - `Seen[id]`;
 - `Formats` and `Programs`: a pre-check before paying;
 - `Paused`;
@@ -789,8 +807,8 @@ port adds it):
   - ext: signing is external, so no key enters the extension. It
     prepares the exact V4 signing payload and checks the signature.
   - The node's side adds the key: one 32-byte mini secret per node, kept
-    in the node's store beside its ed25519 node key and anchor keys. It is
-    never one of them, never logged, and zeroed when dropped.
+    in the node's store beside its ed25519 node key. It is never the node
+    key, never logged, and zeroed when dropped.
   - The node store's `NodeRow` tag `0x10` is reserved: it held these
     seeds, a u64 big-endian number mapped to a 32-byte mini secret, and
     stores from earlier builds may hold such rows. A reuse keeps that

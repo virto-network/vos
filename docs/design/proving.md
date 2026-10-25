@@ -780,7 +780,8 @@ last for decades.**
   neither `vos` nor `vos-node` depends on it (`just check-no-jam-dev`).
   A node reaches JAM later through an extension running a light node.
 - **Venues in the node:** a space anchors and submits at one venue, through a `VenueClient` (`vos-venue`: the trait, `ModelVenue`,
-  the `AnchorQueue` that retries anchors, and `KreivoVenue`). The
+  the `AnchorQueue` that sends anchors until the venue answers, and
+  `KreivoVenue`). The
   representative's leader signs and anchors each window; the prover
   worker (`vos-node-prover`), on the leader of the agent whose record it
   is, proves each statement at an anchored cut, records the proof's hash
@@ -825,7 +826,13 @@ last for decades.**
   pin D).
 - **Anchors** [decided] are signed by one registered node key, a node's
   key set once when the controller lists it (`slice-7-mobile.md`,
-  pin D′).
+  pin D′). The representative's close of each window writes `S_w` in a
+  row, the same bytes on every replica; its leader signs only those rows,
+  never a root of a batch under proposal, in window order, and offers
+  each again until the venue holds it or never takes it. The venue's
+  client answers one of five outcomes (taken, not yet, never, unlisted,
+  stopped); unlisted, the leader hands its leadership to a replica whose
+  key the venue lists, at most once a window. Nothing is handed back.
 - **The venue rules** [decided] are written once, in `vos_anchor::venue`,
   and every venue calls them: the registration, the anchor rule,
   `anchored` and a root's freshness (`spaces-pallet.md` §6.1–§6.3).
@@ -835,9 +842,12 @@ last for decades.**
   tombstone the venue never prunes, so its registration replayed is
   refused; the registration deposit is released and the controller can
   still move the sovereign's funds. The space founds again under a new
-  genesis. An honest node raises it: its venue client, finding the venue
-  holding another root at a window the node anchors, sends the node's
-  anchor all the same as the evidence, and alerts. A second root at a
+  genesis. An honest node raises it: the representative's leader, finding
+  the venue holding another root at a window whose row it holds, sends
+  its anchor as the evidence once its divergence guard passes (a quorum
+  of the replicas holds the same row, none another; a replica holding
+  another is an apply bug or a cloned store, and nothing is sent), and
+  alerts. A second root at a
   window past `MaxRootAge` is refused as aged, never evidence
   (`slice-7-mobile.md`, pin D′; `spaces-pallet.md` §6.1, vector G5).
 - **Known limits** (carried): any single founding key registers the
