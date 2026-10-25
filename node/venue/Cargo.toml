@@ -36,6 +36,8 @@ twox-hash = { version = "2", default-features = false, features = ["xxhash64"] }
 # The conformance vectors, as JSON.
 serde = { workspace = true }
 serde_json = "1"
+# The venue rules' suite, run over the model venue and the Kreivo mock.
+vos-anchor = { workspace = true, features = ["suite"] }
 # The golden fixtures the vectors submit, and their format-39 proofs'
 # fields, which the mutation lists tamper.
 vos-statement = { workspace = true, features = ["fixtures"] }

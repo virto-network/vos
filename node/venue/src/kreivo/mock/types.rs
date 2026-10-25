@@ -3,7 +3,8 @@
 //! its pinned indices, so its bytes are FRAME's.
 
 use parity_scale_codec::{Decode, Encode};
-use vos_anchor::{RootRead, VenueId};
+use vos_anchor::venue::{self as rules, Held, Roots, VenueState};
+use vos_anchor::{RootKind, RootRead, SpaceId, VenueId};
 use vos_statement::{StatementId, Venue};
 
 use super::Chain;
@@ -22,13 +23,24 @@ pub const PALLET_INDEX: u8 = 90;
 /// space's sovereign account (`dispatch_as_sovereign`).
 pub const BALANCES_INDEX: u8 = 10;
 
+/// A space's status. Index 1 is retired, never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum SpaceStatus {
     Active = 0,
-    /// An equivocation suspended it.
-    Suspended = 1,
     /// Governance blocked it.
     Blocked = 2,
+    /// An equivocation ended it, for good.
+    Ended = 3,
+}
+
+impl From<SpaceStatus> for rules::Status {
+    fn from(status: SpaceStatus) -> Self {
+        match status {
+            SpaceStatus::Active => Self::Active,
+            SpaceStatus::Blocked => Self::Blocked,
+            SpaceStatus::Ended => Self::Ended,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -43,9 +55,8 @@ pub struct SpaceInfo {
     pub controller: AccountId,
     pub origin_ms: u64,
     pub length_ms: u64,
+    /// The first window anchored here: the venue's next at registration.
     pub start_window: u64,
-    /// Exclusive; set by `migrate`.
-    pub end_window: Option<u64>,
     pub status: SpaceStatus,
     pub authorities: u8,
     pub anchor_keys: u8,
@@ -101,7 +112,6 @@ impl Active {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct ProgramInfo {
     pub handler: Handler,
-    pub venue_bound: bool,
     pub active: Active,
 }
 
@@ -117,16 +127,16 @@ pub struct AnchorArg {
     pub signature: [u8; 64],
 }
 
-/// The pallet's calls at their pinned indices (§6). The vectors are
-/// `BoundedVec<u8, _>`, whose encoding is a `Vec<u8>`'s: the bounds are
-/// checked after the decode ([`Call::within`]).
+/// The pallet's calls at their pinned indices (§6); 5 and 6 are retired,
+/// never reused. The vectors are `BoundedVec<u8, _>`, whose encoding is a
+/// `Vec<u8>`'s: the bounds are checked after the decode
+/// ([`Call::within`]).
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Call {
     #[codec(index = 0)]
     Register {
         genesis: Vec<u8>,
         controller: AccountId,
-        start_window: u64,
         founder_key: [u8; 32],
         founder_sig: [u8; 64],
     },
@@ -142,14 +152,6 @@ pub enum Call {
     RemoveAuthority { space: Space, who: AccountId },
     #[codec(index = 4)]
     RemoveAnchorKey { space: Space, key: [u8; 32] },
-    #[codec(index = 5)]
-    Migrate {
-        space: Space,
-        to: [u8; 32],
-        from_window: u64,
-    },
-    #[codec(index = 6)]
-    Resume { space: Space },
     #[codec(index = 7)]
     Anchor { anchor: AnchorArg },
     #[codec(index = 8)]
@@ -266,7 +268,8 @@ pub enum TokenError {
     FundsUnavailable,
 }
 
-/// The pallet's errors at their pinned indices (§8).
+/// The pallet's errors at their pinned indices (§8); 18, 23, 24, 26 and 28
+/// are retired, never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Error {
@@ -288,17 +291,16 @@ pub enum Error {
     WindowNotAfterLast = 15,
     WindowInFuture = 16,
     WindowTooOld = 17,
-    OutOfRange = 18,
     SpaceNotActive = 19,
     Paused = 20,
     InsufficientSovereignBalance = 21,
     TooEarly = 22,
-    StillEquivocating = 23,
-    AlreadyMigrated = 24,
     BadHandler = 25,
-    BadStartWindow = 26,
     OverBudget = 27,
-    SameVenue = 28,
+    /// `add_authority` of an account that is one already.
+    AuthorityExists = 29,
+    /// An anchor key of small order (`vos_anchor::venue::small_order`).
+    BadAnchorKey = 30,
 }
 
 impl From<Error> for DispatchError {
@@ -310,7 +312,8 @@ impl From<Error> for DispatchError {
     }
 }
 
-/// The pallet's events at their pinned indices (§8).
+/// The pallet's events at their pinned indices (§8); 5 and 9 are retired,
+/// never reused.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum Event {
     #[codec(index = 0)]
@@ -334,12 +337,6 @@ pub enum Event {
     AuthorityRemoved { space: Space, who: AccountId },
     #[codec(index = 4)]
     AnchorKeyRemoved { space: Space, key: [u8; 32] },
-    #[codec(index = 5)]
-    Migrated {
-        space: Space,
-        to: [u8; 32],
-        from_window: u64,
-    },
     #[codec(index = 6)]
     Anchored {
         space: Space,
@@ -358,9 +355,7 @@ pub enum Event {
         second_signer: [u8; 32],
     },
     #[codec(index = 8)]
-    SpaceSuspended { space: Space },
-    #[codec(index = 9)]
-    SpaceResumed { space: Space },
+    SpaceEnded { space: Space },
     #[codec(index = 10)]
     SpaceStatusSet { space: Space, status: SpaceStatus },
     #[codec(index = 11)]
@@ -405,39 +400,64 @@ pub const PAUSE_SUBMIT: u8 = 1;
 pub const PAUSE_ANCHOR: u8 = 2;
 pub const PAUSE_REGISTER: u8 = 4;
 
-/// The `Venue` the pallet implements over its storage (§3).
+/// The pallet's storage as the venue rules (`vos_anchor::venue`) and
+/// `judge` read it (§3, §6.1).
 pub(crate) struct StorageVenue<'a> {
     pub(super) chain: &'a Chain,
 }
 
-impl Venue for StorageVenue<'_> {
-    fn id(&self) -> VenueId {
+impl Roots for StorageVenue<'_> {
+    fn now(&self) -> u64 {
+        self.chain.now_ms
+    }
+
+    fn space(&self, space: &SpaceId) -> Option<rules::Space> {
+        self.chain.space(&space.0).map(|info| rules::Space {
+            clock: Chain::clock(&info),
+            start: info.start_window,
+            status: info.status.into(),
+        })
+    }
+
+    fn held(&self, space: &SpaceId, kind: RootKind, window: u64) -> Option<Held> {
+        self.chain
+            .get::<AnchorRecord>(&keys::anchors(&space.0, kind as u8, window))
+            .map(|record| Held {
+                root: record.root,
+                signer: record.signer,
+            })
+    }
+}
+
+impl VenueState for StorageVenue<'_> {
+    fn venue(&self) -> VenueId {
         self.chain.constants.venue
     }
 
+    fn listed(&self, space: &SpaceId, key: &[u8; 32]) -> bool {
+        self.chain
+            .storage
+            .contains_key(&keys::anchor_keys(&space.0, key))
+    }
+
+    fn last(&self, space: &SpaceId, kind: RootKind) -> Option<u64> {
+        self.chain.get(&keys::last(&space.0, kind as u8))
+    }
+
+    fn verify(&self, key: &[u8; 32], digest: &[u8; 32], signature: &[u8; 64]) -> bool {
+        crate::verify(key, digest, signature)
+    }
+}
+
+impl Venue for StorageVenue<'_> {
     fn accepts(&self, format: u32) -> bool {
         self.chain
             .get::<Active>(&keys::formats(format))
             .is_some_and(|active| self.chain.active(&active))
     }
 
-    /// The root held at its space, kind and window; the space active (a
-    /// suspended or blocked space's roots are not anchored), the window in
-    /// its range and the root no older than `MaxRootAge`.
     fn anchored(&self, root: &RootRead) -> bool {
-        let chain = self.chain;
-        let Some(info) = chain.space(&root.space.0) else {
-            return false;
-        };
-        let w = root.window;
-        let in_range = info.start_window <= w && info.end_window.is_none_or(|end| w < end);
-        let fresh = Chain::clock(&info).boundary(w).is_some_and(|boundary| {
-            chain.now_ms.saturating_sub(boundary) <= chain.constants.max_root_age_ms
-        });
-        let held = chain
-            .get::<AnchorRecord>(&keys::anchors(&root.space.0, root.kind as u8, w))
-            .is_some_and(|held| held.root == root.root);
-        info.status == SpaceStatus::Active && in_range && fresh && held
+        rules::anchored(self, root)
     }
 
     fn seen(&self, id: &StatementId) -> bool {
@@ -455,37 +475,34 @@ mod tests {
     fn the_errors_are_at_their_pinned_indices() {
         use Error::*;
         let all = [
-            SpaceExists,
-            UnknownSpace,
-            BadGenesis,
-            BadClock,
-            BadFounder,
-            SovereignInUse,
-            NotController,
-            NotAuthority,
-            TooManyAuthorities,
-            TooManyAnchorKeys,
-            AnchorKeyInUse,
-            UnknownAnchorKey,
-            BadAnchorSignature,
-            BadKind,
-            AlreadyAnchored,
-            WindowNotAfterLast,
-            WindowInFuture,
-            WindowTooOld,
-            OutOfRange,
-            SpaceNotActive,
-            Paused,
-            InsufficientSovereignBalance,
-            TooEarly,
-            StillEquivocating,
-            AlreadyMigrated,
-            BadHandler,
-            BadStartWindow,
-            OverBudget,
-            SameVenue,
+            (0, SpaceExists),
+            (1, UnknownSpace),
+            (2, BadGenesis),
+            (3, BadClock),
+            (4, BadFounder),
+            (5, SovereignInUse),
+            (6, NotController),
+            (7, NotAuthority),
+            (8, TooManyAuthorities),
+            (9, TooManyAnchorKeys),
+            (10, AnchorKeyInUse),
+            (11, UnknownAnchorKey),
+            (12, BadAnchorSignature),
+            (13, BadKind),
+            (14, AlreadyAnchored),
+            (15, WindowNotAfterLast),
+            (16, WindowInFuture),
+            (17, WindowTooOld),
+            (19, SpaceNotActive),
+            (20, Paused),
+            (21, InsufficientSovereignBalance),
+            (22, TooEarly),
+            (25, BadHandler),
+            (27, OverBudget),
+            (29, AuthorityExists),
+            (30, BadAnchorKey),
         ];
-        for (index, error) in all.into_iter().enumerate() {
+        for (index, error) in all {
             assert_eq!(error as usize, index);
             assert_eq!(
                 DispatchError::from(error).encode(),
@@ -498,8 +515,12 @@ mod tests {
     /// argument is an `Anchor` in `vos-anchor`'s encoding.
     #[test]
     fn a_call_is_its_pinned_bytes() {
-        let resume = RuntimeCall::Spaces(Call::Resume { space: [7; 32] }).encode();
-        assert_eq!(resume, [&[90, 6][..], &[7; 32]].concat());
+        let budget = RuntimeCall::Spaces(Call::SetBudget {
+            space: [7; 32],
+            max_spend_per_window: 1,
+        })
+        .encode();
+        assert_eq!(budget[..34], [&[90, 10][..], &[7; 32]].concat());
         let paused = RuntimeCall::Spaces(Call::SetPaused { flags: 5 }).encode();
         assert_eq!(paused, [90, 18, 5]);
         let anchor = vos_anchor::Anchor {

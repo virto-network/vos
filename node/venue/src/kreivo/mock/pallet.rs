@@ -1,9 +1,9 @@
 //! The spaces pallet's calls (`spaces-pallet.md` §6), each dispatched
 //! on the chain transactionally.
 
-use ed25519_dalek::{Signature, VerifyingKey};
-use vos_anchor::{RootKind, SpaceGenesis};
-use vos_statement::{Pin, ProgramId, Refusal, Statement, StatementId};
+use vos_anchor::venue::{self as rules, AnchorRefusal, Anchoring, RegisterRefusal};
+use vos_anchor::{Anchor, RootKind, SpaceGenesis, SpaceId};
+use vos_statement::{Refusal, Statement, StatementId};
 
 use super::chain::{Chain, Dispatched, Origin};
 use super::keys;
@@ -24,19 +24,11 @@ impl Chain {
             Call::Register {
                 genesis,
                 controller,
-                start_window,
                 founder_key,
                 founder_sig,
             } => {
                 signed(origin)?;
-                self.register(
-                    &genesis,
-                    controller,
-                    start_window,
-                    &founder_key,
-                    &founder_sig,
-                    events,
-                )
+                self.register(&genesis, controller, &founder_key, &founder_sig, events)
             }
             Call::SetController { space, controller } => {
                 let mut info = self.controlled(origin, &space)?;
@@ -56,12 +48,6 @@ impl Chain {
             Call::RemoveAnchorKey { space, key } => {
                 self.remove_anchor_key(origin, space, key, events)
             }
-            Call::Migrate {
-                space,
-                to,
-                from_window,
-            } => self.migrate(origin, space, to, from_window, events),
-            Call::Resume { space } => self.resume(origin, space, events),
             Call::Anchor { anchor } => {
                 signed(origin)?;
                 self.anchor(&anchor, events)
@@ -121,61 +107,6 @@ impl Chain {
         Ok(())
     }
 
-    fn migrate(
-        &mut self,
-        origin: Origin,
-        space: Space,
-        to: [u8; 32],
-        from_window: u64,
-        events: &mut Vec<Event>,
-    ) -> Dispatched {
-        let mut info = self.controlled(origin, &space)?;
-        if to == self.constants.venue.0 {
-            return Err(Error::SameVenue.into());
-        }
-        if info.end_window.is_some() {
-            return Err(Error::AlreadyMigrated.into());
-        }
-        let now_w = Self::clock(&info)
-            .window(self.now_ms)
-            .ok_or(Error::BadClock)?;
-        if from_window < now_w.saturating_add(1) {
-            return Err(Error::OutOfRange.into());
-        }
-        info.end_window = Some(from_window);
-        self.put(keys::spaces(&space), &info);
-        events.push(Event::Migrated {
-            space,
-            to,
-            from_window,
-        });
-        Ok(())
-    }
-
-    fn resume(&mut self, origin: Origin, space: Space, events: &mut Vec<Event>) -> Dispatched {
-        let mut info = self.controlled(origin, &space)?;
-        if info.status != SpaceStatus::Suspended {
-            return Err(Error::SpaceNotActive.into());
-        }
-        let evidence = self.keys_under(&keys::equivocations_of(&space));
-        let listed = |chain: &Self, key: &[u8; 32]| {
-            chain.storage.contains_key(&keys::anchor_keys(&space, key))
-        };
-        for key in &evidence {
-            let held: Evidence = self.get(key).expect("listed");
-            if listed(self, &held.first_signer) || listed(self, &held.second_signer) {
-                return Err(Error::StillEquivocating.into());
-            }
-        }
-        for key in evidence {
-            self.storage.remove(&key);
-        }
-        info.status = SpaceStatus::Active;
-        self.put(keys::spaces(&space), &info);
-        events.push(Event::SpaceResumed { space });
-        Ok(())
-    }
-
     fn dispatch_as_sovereign(
         &mut self,
         origin: Origin,
@@ -223,12 +154,13 @@ impl Chain {
             return Err(DispatchError::BadOrigin);
         }
         let mut info = self.space(&space).ok_or(Error::UnknownSpace)?;
+        if info.status == SpaceStatus::Ended {
+            return Err(Error::SpaceNotActive.into());
+        }
         info.status = if blocked {
             SpaceStatus::Blocked
-        } else if self.keys_under(&keys::equivocations_of(&space)).is_empty() {
-            SpaceStatus::Active
         } else {
-            SpaceStatus::Suspended
+            SpaceStatus::Active
         };
         self.put(keys::spaces(&space), &info);
         events.push(Event::SpaceStatusSet {
@@ -257,48 +189,36 @@ impl Chain {
         Ok(info)
     }
 
-    /// `spaces-pallet.md` §6.2.
+    /// `spaces-pallet.md` §6.2: the venue rules' registration, then the
+    /// sovereign account's.
     fn register(
         &mut self,
         genesis: &[u8],
         controller: AccountId,
-        start_window: u64,
         founder_key: &[u8; 32],
         founder_sig: &[u8; 64],
         events: &mut Vec<Event>,
     ) -> Dispatched {
         self.paused(PAUSE_REGISTER)?;
         let genesis = SpaceGenesis::decode(genesis).map_err(|_| Error::BadGenesis)?;
-        let founders = genesis.nodes.len();
-        if founders > vos_anchor::MAX_FOUNDING_KEYS
-            || founders > self.constants.max_anchor_keys.into()
-        {
-            return Err(Error::BadGenesis.into());
-        }
-        let clock = genesis.clock;
-        if !(self.constants.min_window_ms..=self.constants.max_window_ms).contains(&clock.length_ms)
-        {
-            return Err(Error::BadClock.into());
-        }
-        let space = vos_anchor::space_id(&genesis).0;
-        if self.storage.contains_key(&keys::spaces(&space)) {
-            return Err(Error::SpaceExists.into());
-        }
-        let digest = vos_anchor::register_digest(
+        let refused = |refusal| match refusal {
+            RegisterRefusal::Genesis => Error::BadGenesis,
+            RegisterRefusal::Clock => Error::BadClock,
+            RegisterRefusal::Founder => Error::BadFounder,
+            RegisterRefusal::Exists => Error::SpaceExists,
+        };
+        let registration = rules::registration(
             &self.constants.venue,
-            &vos_anchor::SpaceId(space),
+            &genesis,
             &controller,
-            start_window,
-        );
-        let founding = genesis.nodes.iter().any(|(_, key)| key == founder_key);
-        if !founding || !verifies(founder_key, &digest, founder_sig) {
-            return Err(Error::BadFounder.into());
-        }
-        let now_w = clock.window(self.now_ms).ok_or(Error::BadClock)?;
-        let earliest = now_w.saturating_sub(self.constants.max_root_age_ms / clock.length_ms);
-        if start_window < earliest || start_window > now_w.saturating_add(1) {
-            return Err(Error::BadStartWindow.into());
-        }
+            founder_key,
+            founder_sig,
+            crate::verify,
+        )
+        .map_err(refused)?;
+        let start_window =
+            rules::register(&StorageVenue { chain: self }, &registration).map_err(refused)?;
+        let space = registration.space.0;
         let sovereign = self.constants.sovereign(&space);
         if self.storage.contains_key(&keys::sovereign_of(&sovereign)) {
             return Err(Error::SovereignInUse.into());
@@ -311,22 +231,22 @@ impl Chain {
         account.free -= deposit;
         account.held_registration += deposit;
         account.providers += 1;
+        let clock = registration.clock;
         let info = SpaceInfo {
             sovereign,
             controller,
             origin_ms: clock.origin_ms,
             length_ms: clock.length_ms,
             start_window,
-            end_window: None,
             status: SpaceStatus::Active,
             authorities: 0,
-            anchor_keys: founders as u8,
+            anchor_keys: registration.keys.len() as u8,
             registered_ms: self.now_ms,
             max_spend_per_window: self.constants.default_spend_per_window,
         };
         self.put(keys::spaces(&space), &info);
         self.put(keys::sovereign_of(&sovereign), &space);
-        for (_, key) in &genesis.nodes {
+        for key in &registration.keys {
             self.put(keys::anchor_keys(&space, key), &None::<AccountId>);
         }
         events.push(Event::SpaceRegistered {
@@ -349,34 +269,30 @@ impl Chain {
         events: &mut Vec<Event>,
     ) -> Dispatched {
         let mut info = self.controlled(origin, &space)?;
-        let existing: Option<AuthorityInfo> = self.get(&keys::authorities(&space, &who));
-        if existing.is_none() && info.authorities >= self.constants.max_authorities {
+        if self.storage.contains_key(&keys::authorities(&space, &who)) {
+            return Err(Error::AuthorityExists.into());
+        }
+        if info.authorities >= self.constants.max_authorities {
             return Err(Error::TooManyAuthorities.into());
         }
-        let old = existing.and_then(|existing| existing.anchor_key);
-        let mut count = info.anchor_keys;
-        if let Some(old) = old.filter(|old| Some(*old) != anchor_key) {
-            self.storage.remove(&keys::anchor_keys(&space, &old));
-            count -= 1;
-        }
         if let Some(key) = anchor_key {
+            if rules::small_order(&key) {
+                return Err(Error::BadAnchorKey.into());
+            }
             match self.get::<Option<AccountId>>(&keys::anchor_keys(&space, &key)) {
-                Some(Some(paired)) if paired != who => return Err(Error::AnchorKeyInUse.into()),
-                Some(_) => {}
+                Some(Some(_)) => return Err(Error::AnchorKeyInUse.into()),
+                Some(None) => {}
                 None => {
-                    if count >= self.constants.max_anchor_keys {
+                    if info.anchor_keys >= self.constants.max_anchor_keys {
                         return Err(Error::TooManyAnchorKeys.into());
                     }
-                    count += 1;
+                    info.anchor_keys += 1;
                 }
             }
             self.put(keys::anchor_keys(&space, &key), &Some(who));
         }
-        info.anchor_keys = count;
-        if existing.is_none() {
-            info.authorities += 1;
-            self.account_mut(&who).providers += 1;
-        }
+        info.authorities += 1;
+        self.account_mut(&who).providers += 1;
         self.put(keys::spaces(&space), &info);
         self.put(
             keys::authorities(&space, &who),
@@ -417,99 +333,80 @@ impl Chain {
         Ok(())
     }
 
-    /// `spaces-pallet.md` §6.1, the anchor rule. A second root at a window
-    /// held is the equivocation's evidence: the space suspended, and the
-    /// window's anchor dropped, so neither root counts again, after a
-    /// resume as before it.
-    fn anchor(&mut self, anchor: &AnchorArg, events: &mut Vec<Event>) -> Dispatched {
+    /// `spaces-pallet.md` §6.1: the venue rules' anchor rule. A second
+    /// root at a window held is the equivocation's evidence: kept, the
+    /// space ended for good and its registration deposit released.
+    fn anchor(&mut self, arg: &AnchorArg, events: &mut Vec<Event>) -> Dispatched {
         self.paused(PAUSE_ANCHOR)?;
-        let space = anchor.space;
-        let mut info = self.space(&space).ok_or(Error::UnknownSpace)?;
-        if info.status != SpaceStatus::Active {
-            return Err(Error::SpaceNotActive.into());
-        }
-        let kind = RootKind::from_u8(anchor.kind).ok_or(Error::BadKind)?;
-        if !self
-            .storage
-            .contains_key(&keys::anchor_keys(&space, &anchor.signer))
-        {
-            return Err(Error::UnknownAnchorKey.into());
-        }
-        let digest = vos_anchor::anchor_digest(
-            &self.constants.venue,
-            &vos_anchor::SpaceId(space),
-            anchor.window,
+        let kind = RootKind::from_u8(arg.kind).ok_or(Error::BadKind)?;
+        let anchor = Anchor {
+            space: SpaceId(arg.space),
+            window: arg.window,
             kind,
-            &anchor.root,
-        );
-        if !verifies(&anchor.signer, &digest, &anchor.signature) {
-            return Err(Error::BadAnchorSignature.into());
-        }
-        let at = keys::anchors(&space, anchor.kind, anchor.window);
-        if let Some(held) = self.get::<AnchorRecord>(&at) {
-            if held.root == anchor.root {
-                return Err(Error::AlreadyAnchored.into());
-            }
-            let evidence = Evidence {
-                first: held.root,
-                second: anchor.root,
-                first_signer: held.signer,
-                second_signer: anchor.signer,
-            };
-            self.put(
-                keys::equivocations(&space, anchor.kind, anchor.window),
-                &evidence,
-            );
-            if !self.keeps_disputed_root() {
-                self.storage.remove(&at);
-            }
-            info.status = SpaceStatus::Suspended;
-            self.put(keys::spaces(&space), &info);
-            events.push(Event::Equivocated {
-                space,
-                kind: anchor.kind,
-                window: anchor.window,
-                first: evidence.first,
-                second: evidence.second,
-                first_signer: evidence.first_signer,
-                second_signer: evidence.second_signer,
-            });
-            events.push(Event::SpaceSuspended { space });
-            return Ok(());
-        }
-        let w = anchor.window;
-        if w < info.start_window || info.end_window.is_some_and(|end| w >= end) {
-            return Err(Error::OutOfRange.into());
-        }
-        let last: Option<u64> = self.get(&keys::last(&space, anchor.kind));
-        if last.is_some_and(|last| w <= last) {
-            return Err(Error::WindowNotAfterLast.into());
-        }
-        let clock = Self::clock(&info);
-        let now_w = clock.window(self.now_ms).ok_or(Error::BadClock)?;
-        if w >= now_w {
-            return Err(Error::WindowInFuture.into());
-        }
-        let fresh = clock.boundary(w).is_some_and(|boundary| {
-            self.now_ms.saturating_sub(boundary) <= self.constants.max_root_age_ms
-        });
-        if !fresh {
-            return Err(Error::WindowTooOld.into());
-        }
-        let record = AnchorRecord {
-            root: anchor.root,
-            at_ms: self.now_ms,
-            signer: anchor.signer,
+            root: arg.root,
+            signer: arg.signer,
+            signature: arg.signature,
         };
-        self.put(at, &record);
-        self.put(keys::last(&space, anchor.kind), &w);
-        events.push(Event::Anchored {
-            space,
-            kind: anchor.kind,
-            window: w,
-            root: anchor.root,
-        });
-        Ok(())
+        let anchoring = rules::anchor(&StorageVenue { chain: self }, &anchor).map_err(
+            |refusal| match refusal {
+                AnchorRefusal::Unregistered => Error::UnknownSpace,
+                AnchorRefusal::Stopped => Error::SpaceNotActive,
+                AnchorRefusal::Key => Error::UnknownAnchorKey,
+                AnchorRefusal::Signature => Error::BadAnchorSignature,
+                AnchorRefusal::Window => Error::WindowNotAfterLast,
+                AnchorRefusal::Open => Error::WindowInFuture,
+                AnchorRefusal::Age => Error::WindowTooOld,
+            },
+        )?;
+        let (space, w) = (arg.space, arg.window);
+        match anchoring {
+            Anchoring::Again => Err(Error::AlreadyAnchored.into()),
+            Anchoring::New => {
+                let record = AnchorRecord {
+                    root: arg.root,
+                    at_ms: self.now_ms,
+                    signer: arg.signer,
+                };
+                self.put(keys::anchors(&space, arg.kind, w), &record);
+                self.put(keys::last(&space, arg.kind), &w);
+                events.push(Event::Anchored {
+                    space,
+                    kind: arg.kind,
+                    window: w,
+                    root: arg.root,
+                });
+                Ok(())
+            }
+            Anchoring::Evidence(held) => {
+                let evidence = Evidence {
+                    first: held.root,
+                    second: arg.root,
+                    first_signer: held.signer,
+                    second_signer: arg.signer,
+                };
+                self.put(keys::equivocations(&space, arg.kind, w), &evidence);
+                let mut info = self.space(&space).ok_or(Error::UnknownSpace)?;
+                info.status = SpaceStatus::Ended;
+                self.put(keys::spaces(&space), &info);
+                if !self.keeps_deposit() {
+                    let account = self.account_mut(&info.sovereign);
+                    let held = account.held_registration;
+                    account.held_registration = 0;
+                    account.free += held;
+                }
+                events.push(Event::Equivocated {
+                    space,
+                    kind: arg.kind,
+                    window: w,
+                    first: evidence.first,
+                    second: evidence.second,
+                    first_signer: evidence.first_signer,
+                    second_signer: evidence.second_signer,
+                });
+                events.push(Event::SpaceEnded { space });
+                Ok(())
+            }
+        }
     }
 
     /// `spaces-pallet.md` §6.3, in its order.
@@ -597,15 +494,11 @@ impl Chain {
         if !format.is_some_and(|active| self.active(&active)) {
             return Err(Refusal::Format.code());
         }
-        let program = self
-            .get::<ProgramInfo>(&keys::programs(&statement.program.0))
+        self.get::<ProgramInfo>(&keys::programs(&statement.program.0))
             .filter(|info| self.active(&info.active))
             .ok_or(Refusal::Program.code())?;
-        let pin = Pin {
-            program: ProgramId(statement.program.0),
-            venue_bound: program.venue_bound,
-        };
-        let id = vos_statement::judge(&StorageVenue { chain: self }, &pin, &statement, proof)
+        let program = statement.program;
+        let id = vos_statement::judge(&StorageVenue { chain: self }, &program, &statement, proof)
             .map_err(|refusal| refusal.code())?;
         Ok((statement, id))
     }
@@ -621,9 +514,7 @@ impl Chain {
         let stored: Option<ProgramInfo> = self.get(&key);
         match info {
             Some(info) => {
-                let rest_same = stored.is_some_and(|stored| {
-                    stored.handler == info.handler && stored.venue_bound == info.venue_bound
-                });
+                let rest_same = stored.is_some_and(|stored| stored.handler == info.handler);
                 self.governed(
                     origin,
                     &info.active,
@@ -691,27 +582,31 @@ impl Chain {
         }
     }
 
+    /// Whether `root` is anchored here, by the venue rules over the
+    /// pallet's storage (§3's `Venue::anchored`).
+    pub fn anchored(&self, root: &vos_anchor::RootRead) -> bool {
+        rules::anchored(&StorageVenue { chain: self }, root)
+    }
+
     /// `spaces-pallet.md` §6.5, with weight enough for every entry: anchors
-    /// past `MaxRootAge` and `Seen` entries past their expiry pruned; `Last`,
-    /// `Equivocations` and a rootless statement's entry kept.
+    /// past `MaxRootAge` (`vos_anchor::venue::aged`) and `Seen` entries past
+    /// their expiry pruned; `Spaces`, `Last` and `Equivocations` kept.
     pub fn on_idle(&mut self) {
         let now = self.now_ms;
         for key in self.keys_under(&keys::Item::Anchors.prefix()) {
             let Some((space, window)) = keys::anchors_parts(&key) else {
                 continue;
             };
-            let expired = self
+            let aged = self
                 .space(&space)
-                .and_then(|info| Self::clock(&info).boundary(window))
-                .and_then(|boundary| boundary.checked_add(self.constants.max_root_age_ms))
-                .is_some_and(|last| last < now);
-            if expired {
+                .is_some_and(|info| rules::aged(&Self::clock(&info), window, now));
+            if aged {
                 self.storage.remove(&key);
             }
         }
         for key in self.keys_under(&keys::Item::Seen.prefix()) {
             let expiry: u64 = self.get(&key).expect("a Seen entry");
-            if expiry != u64::MAX && expiry < now {
+            if expiry < now {
                 self.storage.remove(&key);
             }
         }
@@ -723,12 +618,4 @@ fn signed(origin: Origin) -> Result<AccountId, DispatchError> {
         Origin::Signed(who) => Ok(who),
         _ => Err(DispatchError::BadOrigin),
     }
-}
-
-/// Whether `signature` is `key`'s over `digest`, strictly.
-fn verifies(key: &[u8; 32], digest: &[u8; 32], signature: &[u8; 64]) -> bool {
-    VerifyingKey::from_bytes(key).is_ok_and(|key| {
-        key.verify_strict(digest, &Signature::from_bytes(signature))
-            .is_ok()
-    })
 }

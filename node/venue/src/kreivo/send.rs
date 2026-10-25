@@ -1,7 +1,8 @@
 //! [`KreivoVenue`](super::KreivoVenue)'s calls to the chain: an anchor sent
-//! once the client's last read says the venue would take it, its outcome
-//! placed as the queue's [`Fate`] (`spaces-pallet.md` §9), and a submit
-//! checked against the venue's state before it is paid for.
+//! while the client's last read has its space active and anchors not
+//! paused, the pallet's answer placed as the queue's [`Fate`]
+//! (`spaces-pallet.md` §9), and a submit checked against the venue's state
+//! before it is paid for.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use super::calls::{
     Active, AnchorRecord, Call, Error, Event, PAUSED_ANCHOR, PAUSED_SUBMIT, ProgramInfo, SpaceInfo,
     SpaceStatus, Spend, keys,
 };
-use super::transport::{Invalid, Lost, Sender, Sent, Unsent};
+use super::transport::{Invalid, Sender, Sent, Unsent};
 use super::venue::{Alert, Shared};
 use crate::queue::{AnchorSend, Fate};
 use crate::{NotAccepted, Unjudged};
@@ -22,15 +23,8 @@ use crate::{NotAccepted, Unjudged};
 const POOL_BACKOFF: Duration = Duration::from_secs(30);
 
 impl Shared {
-    /// The root the venue holds anchored of `anchor`'s space and kind at
-    /// its window: none for a window it never anchored, or whose anchor it
-    /// dropped (aged, or disputed by an equivocation).
-    pub(super) fn venue_root(&self, anchor: &Anchor) -> Result<Option<[u8; 32]>, Lost> {
-        let key = keys::anchors(&anchor.space.0, anchor.kind as u8, anchor.window);
-        Ok(self.read::<AnchorRecord>(&key)?.map(|record| record.root))
-    }
-
-    /// Send `anchor`, when the venue would take it.
+    /// Send `anchor`, unless the client's last read says the venue would
+    /// not take it now.
     fn send_anchor(&self, anchor: &Anchor) -> Fate {
         let wait = Fate::Again(self.options.refresh);
         let Some(sender) = self.sender.get() else {
@@ -39,50 +33,23 @@ impl Shared {
         let Ok(now) = self.venue_now() else {
             return wait;
         };
-        let (info, boundary) = match self.ready(anchor, now) {
-            Ok(ready) => ready,
+        let info = match self.ready(anchor, now) {
+            Ok(info) => info,
             Err(fate) => return fate,
         };
         let sent = sender.call(&Call::anchor(anchor).bytes());
-        self.place(anchor, sent, &info, boundary, now)
+        self.place(anchor, sent, &info, now)
     }
 
     /// Whether `anchor` goes now, by the client's last read at the venue's
-    /// time `now`: its space and its window's boundary, or its fate. An
-    /// anchor that landed with its answer lost, or of a window at or before
-    /// the space's last anchored, is checked against the root the venue
-    /// holds there: the same is done, none behind the last is a window the
-    /// venue never takes, and another root is an equivocation by a listed
-    /// key, which this anchor goes as evidence of once the space is active
-    /// and anchors are not paused.
-    fn ready(&self, anchor: &Anchor, now: u64) -> Result<(SpaceInfo, u64), Fate> {
+    /// time `now`: its space, or its fate. It waits while the space is not
+    /// registered or not active, anchors are paused, or the venue's time
+    /// has not passed the wait a refusal set; its key no longer listed, it
+    /// is handed back to be signed again.
+    fn ready(&self, anchor: &Anchor, now: u64) -> Result<SpaceInfo, Fate> {
         let wait = Fate::Again(self.options.refresh);
         let (space, window) = (anchor.space, anchor.window);
         let key = (space, window);
-        let (landed, behind) = {
-            let state = self.state();
-            let last = state.spaces.get(&space).and_then(|known| known.last);
-            (
-                state.landed.contains(&key),
-                last.is_some_and(|last| window <= last),
-            )
-        };
-        let mut evidence = false;
-        if landed || behind {
-            match self.venue_root(anchor) {
-                Ok(Some(root)) if root == anchor.root => {
-                    self.state().held(anchor);
-                    return Err(Fate::Done);
-                }
-                Ok(Some(_)) => evidence = true,
-                Ok(None) if behind => {
-                    self.state().forget(key);
-                    return Err(Fate::Done);
-                }
-                Ok(None) => {}
-                Err(_) => return Err(wait),
-            }
-        }
         let mut state = self.state();
         let paused = state.paused & PAUSED_ANCHOR != 0;
         let known = state.spaces.get(&space);
@@ -98,45 +65,40 @@ impl Shared {
             state.alert(Alert::Configuration { space, what });
             return Err(Fate::Resign);
         }
-        let clock = info.clock();
-        if crate::aged(&clock, window, now) {
-            state.forget(key);
-            let error = Error::WindowTooOld;
-            state.alert(Alert::Dead {
-                space,
-                window,
-                error,
-            });
-            return Err(Fate::Dead);
-        }
-        if evidence {
-            state.alert(Alert::Equivocation { space, window });
-            if paused || info.status != SpaceStatus::Active {
-                return Err(wait);
-            }
-            return Ok((info, clock.boundary(window).unwrap_or(u64::MAX)));
-        }
-        let closed = clock.window(now).is_some_and(|open| window < open);
         let later = state.later.get(&key).is_some_and(|at| now < *at);
-        if paused || info.status != SpaceStatus::Active || !closed || later {
+        if paused || info.status != SpaceStatus::Active || later {
             return Err(wait);
         }
-        Ok((info, clock.boundary(window).unwrap_or(u64::MAX)))
+        Ok(info)
     }
 
     /// The fate of `anchor`, sent at the venue's time `now` as `sent`
-    /// answers: `info` its space, `boundary` its window's.
+    /// answers: `info` its space. One that landed with its answer lost is
+    /// done once the venue holds its root at its window, else it goes again
+    /// a block later.
     fn place(
         &self,
         anchor: &Anchor,
         sent: Result<Sent, Unsent>,
         info: &SpaceInfo,
-        boundary: u64,
         now: u64,
     ) -> Fate {
         let wait = Fate::Again(self.options.refresh);
         let (space, window) = (anchor.space, anchor.window);
         let key = (space, window);
+        if let Ok(Sent::Landed) = sent {
+            let record = keys::anchors(&space.0, anchor.kind as u8, window);
+            let held = self.read::<AnchorRecord>(&record);
+            let mut state = self.state();
+            if held.is_ok_and(|held| held.is_some_and(|held| held.root == anchor.root)) {
+                state.held(anchor);
+                return Fate::Done;
+            }
+            state
+                .later
+                .insert(key, now.saturating_add(self.options.block_ms));
+            return wait;
+        }
         let mut state = self.state();
         let window_length = Duration::from_millis(info.length_ms);
         match sent {
@@ -154,7 +116,7 @@ impl Shared {
                     return Fate::Done;
                 }
                 if equivocated {
-                    state.disputed(space, window);
+                    state.ended(space);
                     state.alert(Alert::Equivocation { space, window });
                     return Fate::Done;
                 }
@@ -167,7 +129,7 @@ impl Shared {
                     Answer::Later => {
                         state
                             .later
-                            .insert(key, boundary.saturating_add(self.options.block_ms));
+                            .insert(key, now.saturating_add(self.options.block_ms));
                         wait
                     }
                     Answer::Dead(error) => {
@@ -206,13 +168,7 @@ impl Shared {
                     }
                 }
             }
-            Ok(Sent::Landed) => {
-                state.landed.insert(key);
-                state
-                    .later
-                    .insert(key, now.saturating_add(self.options.block_ms));
-                wait
-            }
+            Ok(Sent::Landed) => wait,
             Err(Unsent::Invalid(Invalid::Payment)) => {
                 let what = "the venue refused an anchor's fee".to_string();
                 state.alert(Alert::Funding { space, what });
@@ -344,7 +300,7 @@ impl AnchorSend for KreivoSend {
 
     /// By the client's last read: the space's last anchored window at or
     /// past the anchor's, or the window past `MaxRootAge` by the venue's
-    /// time.
+    /// time (`vos_anchor::venue::aged`).
     fn settled(&self, anchor: &Anchor) -> bool {
         let mut state = self.0.state();
         let now = state.now;
@@ -353,7 +309,7 @@ impl AnchorSend for KreivoSend {
         let aged = known
             .info
             .zip(now)
-            .is_some_and(|(info, now)| crate::aged(&info.clock(), anchor.window, now));
+            .is_some_and(|(info, now)| vos_anchor::venue::aged(&info.clock(), anchor.window, now));
         passed || aged
     }
 }
@@ -364,10 +320,10 @@ pub(super) enum Answer {
     /// 14 `AlreadyAnchored`, 15 `WindowNotAfterLast`: the venue holds it,
     /// or a later window.
     Done,
-    /// 16 `WindowInFuture`: sent again once the venue's time passes the
-    /// window's boundary by a block; never skipped.
+    /// 16 `WindowInFuture`: sent again a block of the venue's time later;
+    /// never skipped.
     Later,
-    /// 17 `WindowTooOld`, 18 `OutOfRange`: never taken; an alert.
+    /// 17 `WindowTooOld`: never taken; an alert.
     Dead(Error),
     /// 19 `SpaceNotActive`, 20 `Paused`: kept until the space is active
     /// and anchors are not paused.
@@ -388,7 +344,7 @@ pub(super) fn answer(error: Option<Error>) -> Answer {
     match error {
         Some(Error::AlreadyAnchored | Error::WindowNotAfterLast) => Answer::Done,
         Some(Error::WindowInFuture) => Answer::Later,
-        Some(error @ (Error::WindowTooOld | Error::OutOfRange)) => Answer::Dead(error),
+        Some(error @ Error::WindowTooOld) => Answer::Dead(error),
         Some(Error::SpaceNotActive | Error::Paused) => Answer::Wait,
         Some(error @ (Error::InsufficientSovereignBalance | Error::OverBudget)) => {
             Answer::Funding(error)
