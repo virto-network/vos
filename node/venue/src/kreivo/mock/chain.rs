@@ -28,9 +28,14 @@ pub struct Constants {
     pub forfeit_to: AccountId,
     pub program_change_delay_ms: u64,
     pub max_authorities: u8,
+    /// `MaxAnchorKeys`: the kit's `MAX_FOUNDING_KEYS`, which the venue
+    /// rules' `add_key` reads.
     pub max_anchor_keys: u8,
     pub bounds: Bounds,
 }
+
+const MAX_ANCHOR_KEYS: u8 = 16;
+const _: () = assert!(MAX_ANCHOR_KEYS as usize == vos_anchor::MAX_FOUNDING_KEYS);
 
 impl Constants {
     /// The design's suggested values (§4, `UNITS = 10^12`), at `venue`.
@@ -49,7 +54,7 @@ impl Constants {
             forfeit_to: account_of(b"py/trsry", &[]),
             program_change_delay_ms: 604_800_000,
             max_authorities: 16,
-            max_anchor_keys: 16,
+            max_anchor_keys: MAX_ANCHOR_KEYS,
             bounds: Bounds {
                 genesis: 2_048,
                 statement: 65_536,

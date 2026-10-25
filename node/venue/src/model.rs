@@ -12,9 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use vos_anchor::venue::{
     self as rules, Anchoring, Held, RegisterRefusal, Roots, Status as Standing, VenueState,
 };
-use vos_anchor::{
-    Anchor, MAX_FOUNDING_KEYS, RootKind, RootRead, SpaceGenesis, SpaceId, VenueId, WindowClock,
-};
+use vos_anchor::{Anchor, RootKind, RootRead, SpaceGenesis, SpaceId, VenueId, WindowClock};
 use vos_statement::{ProgramId, Statement, StatementId, Venue};
 
 use crate::{AnchorRefusal, Anchored, NotAccepted, Status, VenueClient};
@@ -200,16 +198,14 @@ impl ModelVenue {
     /// Add `key` to `space`'s anchor keys, as the controller's
     /// `add_authority` pairs one: false when the space is not registered,
     /// the key is registered already or of small order, or it holds
-    /// [`MAX_FOUNDING_KEYS`] (Kreivo's `MaxAnchorKeys`).
+    /// `vos_anchor::MAX_FOUNDING_KEYS` (Kreivo's `MaxAnchorKeys`): the venue
+    /// rules' `add_key`.
     pub fn add_anchor_key(&self, space: &SpaceId, key: [u8; 32]) -> bool {
         let mut state = self.state();
         let Some(space) = state.spaces.get_mut(space) else {
             return false;
         };
-        if space.keys.contains(&key)
-            || space.keys.len() >= MAX_FOUNDING_KEYS
-            || rules::small_order(&key)
-        {
+        if rules::add_key(space.keys.len(), space.keys.contains(&key), &key).is_err() {
             return false;
         }
         space.keys.push(key);

@@ -1,7 +1,7 @@
 //! The spaces pallet's calls (`spaces-pallet.md` §6), each dispatched
 //! on the chain transactionally.
 
-use vos_anchor::venue::{self as rules, AnchorRefusal, Anchoring, RegisterRefusal};
+use vos_anchor::venue::{self as rules, AnchorRefusal, Anchoring, KeyRefusal, RegisterRefusal};
 use vos_anchor::{Anchor, RootKind, SpaceGenesis, SpaceId};
 use vos_statement::{Refusal, Statement, StatementId};
 
@@ -276,16 +276,19 @@ impl Chain {
             return Err(Error::TooManyAuthorities.into());
         }
         if let Some(key) = anchor_key {
-            if rules::small_order(&key) {
-                return Err(Error::BadAnchorKey.into());
-            }
-            match self.get::<Option<AccountId>>(&keys::anchor_keys(&space, &key)) {
+            let listed = self.get::<Option<AccountId>>(&keys::anchor_keys(&space, &key));
+            match listed {
                 Some(Some(_)) => return Err(Error::AnchorKeyInUse.into()),
+                // A listed key unpaired, a founding one: paired.
                 Some(None) => {}
                 None => {
-                    if info.anchor_keys >= self.constants.max_anchor_keys {
-                        return Err(Error::TooManyAnchorKeys.into());
-                    }
+                    rules::add_key(usize::from(info.anchor_keys), false, &key).map_err(
+                        |refusal| match refusal {
+                            KeyRefusal::SmallOrder => Error::BadAnchorKey,
+                            KeyRefusal::Listed => Error::AnchorKeyInUse,
+                            KeyRefusal::Full => Error::TooManyAnchorKeys,
+                        },
+                    )?;
                     info.anchor_keys += 1;
                 }
             }

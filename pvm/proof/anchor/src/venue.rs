@@ -25,8 +25,9 @@
 //! - **Time** ([`expiry`], [`fresh`], [`aged`], [`seen_expiry`]): a root of
 //!   window w is fresh until `B_w + MaxRootAge` by the venue's clock; a
 //!   statement's `Seen` entry may be dropped once its newest root is not.
-//! - **Keys** ([`small_order`]): a key of small order is never listed, at
-//!   registration or later, so a venue whose ed25519 verification is
+//! - **Keys** ([`add_key`], [`small_order`]): at most
+//!   [`MAX_FOUNDING_KEYS`] listed, none twice; a key of small order is never
+//!   listed, at registration or later, so a venue whose ed25519 verification is
 //!   cofactored still takes no signature such a key "makes" over any
 //!   message.
 //!
@@ -172,6 +173,35 @@ pub fn register(state: &impl Roots, registration: &Registration) -> Result<u64, 
         .clock
         .window(state.now())
         .map_or(0, |open| open.saturating_add(1)))
+}
+
+/// Why a venue refuses to list another anchor key for a space.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum KeyRefusal {
+    /// The key is of small order ([`small_order`]).
+    SmallOrder,
+    /// The space lists it already.
+    Listed,
+    /// The space lists [`MAX_FOUNDING_KEYS`] keys already.
+    Full,
+}
+
+/// Whether a space listing `count` keys, `listed` among them or not, may
+/// list `key` too: never one of small order, never twice, at most
+/// [`MAX_FOUNDING_KEYS`] in all. A venue that pairs a listed key with an
+/// authority rather than listing it again (Kreivo's `add_authority` of a
+/// founding key) asks only of a key it does not list.
+pub fn add_key(count: usize, listed: bool, key: &[u8; 32]) -> Result<(), KeyRefusal> {
+    if small_order(key) {
+        return Err(KeyRefusal::SmallOrder);
+    }
+    if listed {
+        return Err(KeyRefusal::Listed);
+    }
+    if count >= MAX_FOUNDING_KEYS {
+        return Err(KeyRefusal::Full);
+    }
+    Ok(())
 }
 
 /// What an anchor a venue takes does.

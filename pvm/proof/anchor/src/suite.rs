@@ -277,6 +277,14 @@ fn anchoring(h: &mut impl Harness) {
     let mut torsion = [0; 32];
     torsion[0] = 1;
     assert!(!h.add_key(&space, torsion), "small order");
+
+    // Listed up to MAX_FOUNDING_KEYS (seeds 1 and 2 the genesis's), and
+    // no more.
+    let last = u8::try_from(MAX_FOUNDING_KEYS).expect("a seed");
+    for seed in 3..=last {
+        assert!(h.add_key(&space, h.key(seed)), "key {seed}");
+    }
+    assert!(!h.add_key(&space, h.key(last + 1)), "full");
 }
 
 /// A second root at a window held, by another listed key: the evidence,

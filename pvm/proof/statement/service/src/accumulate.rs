@@ -33,7 +33,7 @@ use alloc::vec::Vec;
 use vos_statement::vos_anchor::venue::{
     self as rules, AnchorRefusal, Anchoring, Held, Roots, Status, VenueState,
 };
-use vos_statement::vos_anchor::{Anchor, MAX_FOUNDING_KEYS, RootKind, RootRead, SpaceId, VenueId};
+use vos_statement::vos_anchor::{Anchor, RootKind, RootRead, SpaceId, VenueId};
 
 use crate::config::Config;
 use crate::item::Op;
@@ -364,10 +364,7 @@ fn control(
     }
     match op {
         Op::AddKey(key) => {
-            if record.keys.contains(&key)
-                || record.keys.len() >= MAX_FOUNDING_KEYS
-                || rules::small_order(&key)
-            {
+            if rules::add_key(record.keys.len(), record.keys.contains(&key), &key).is_err() {
                 return ControlCode::Key as u32;
             }
             record.keys.push(key);
