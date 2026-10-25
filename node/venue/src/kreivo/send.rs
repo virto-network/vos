@@ -68,7 +68,9 @@ impl Shared {
         let Some(info) = known.info else {
             return Err(wait);
         };
-        if info.status != SpaceStatus::Active || !known.keys.contains(&anchor.signer) {
+        let unlisted =
+            !known.keys.contains(&anchor.signer) || known.refused.contains_key(&anchor.signer);
+        if info.status != SpaceStatus::Active || unlisted {
             return Err(Fate::Done);
         }
         if rules::aged(&info.clock(), anchor.window, now) {
@@ -160,7 +162,7 @@ impl Shared {
                 state.forget(key);
                 match outcome_of(error) {
                     AnchorOutcome::Taken => {
-                        state.refreshed = None;
+                        state.held(anchor);
                         Fate::Done
                     }
                     AnchorOutcome::Never(code) => {
@@ -185,11 +187,11 @@ impl Shared {
                         }
                         Fate::Done
                     }
-                    AnchorOutcome::Unlisted(_) => {
+                    AnchorOutcome::Unlisted(code) => {
                         if let Some(known) = state.spaces.get_mut(&space) {
-                            known.keys.retain(|key| *key != anchor.signer);
+                            let listing = known.keys.clone();
+                            known.refused.insert(anchor.signer, (code, listing));
                         }
-                        state.refreshed = None;
                         let what = format!("an anchor refused: {error:?}");
                         state.alert(Alert::Configuration { space, what });
                         Fate::Done

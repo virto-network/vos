@@ -129,6 +129,12 @@ pub(super) struct Known {
     /// The windows at which the leader offered an anchor while the client
     /// held another root read there: sent as the equivocation's evidence.
     pub(super) evidence: BTreeSet<u64>,
+    /// The signers the venue refused as unlisted (7 `NotAuthority`, 11
+    /// `UnknownAnchorKey`), each with the code and the listing read then:
+    /// answered unlisted, unsent, until a read finds another listing. A
+    /// key `AnchorKeys` still lists while its account is no authority
+    /// would otherwise be sent, and refused for a fee, every block.
+    pub(super) refused: BTreeMap<[u8; 32], (u32, Vec<[u8; 32]>)>,
 }
 
 #[derive(Default)]
@@ -440,6 +446,7 @@ impl Shared {
             let known = state.spaces.entry(space).or_default();
             known.read = true;
             known.info = info;
+            known.refused.retain(|_, (_, listing)| *listing == keys);
             known.keys = keys;
             for (window, root) in held {
                 known.wanted.remove(&window);
@@ -513,6 +520,9 @@ impl VenueClient for KreivoVenue {
         }
         if !known.keys.contains(&anchor.signer) {
             return AnchorOutcome::Unlisted(Error::UnknownAnchorKey as u32);
+        }
+        if let Some((code, _)) = known.refused.get(&anchor.signer) {
+            return AnchorOutcome::Unlisted(*code);
         }
         let window = anchor.window;
         if let Some(code) = known.never.get(&window) {

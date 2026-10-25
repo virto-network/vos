@@ -703,6 +703,63 @@ fn a_refused_key_is_answered_unlisted() {
     assert_eq!(setup.anchors_sent(), refused + 1);
 }
 
+/// A key `AnchorKeys` still lists while its account is no authority: the
+/// venue refuses the anchor `NotAuthority`, a fee each time. The client
+/// answers the signer unlisted, unsent, while it reads the same listing;
+/// once the listing changes it sends again, and the anchor lands.
+#[test]
+fn a_refused_signer_is_not_sent_again_under_the_same_listing() {
+    let setup = Setup::new(true);
+    let refusing = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let refused = Arc::new(AtomicUsize::new(0));
+    let (refuse, count) = (Arc::clone(&refusing), Arc::clone(&refused));
+    let hooked = Arc::new(Hooked {
+        inner: setup.chain.transport(Origin::Signed(NODE)),
+        on_sign: Box::new(|_| {}),
+        on_send: Box::new(move || {
+            refuse.load(Ordering::SeqCst).then(|| {
+                count.fetch_add(1, Ordering::SeqCst);
+                let failure = calls::Failure::Module {
+                    pallet: PALLET,
+                    error: Error::NotAuthority as u8,
+                };
+                Ok(Included {
+                    block: 0,
+                    events: Vec::new(),
+                    failure: Some(failure.encode()),
+                })
+            })
+        }),
+    });
+    let venue = setup.venue_over(hooked);
+    let unlisted = AnchorOutcome::Unlisted(Error::NotAuthority as u32);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
+    wait_until("answered unlisted", || {
+        venue.anchor(&setup.anchor(5, 1)) == unlisted
+    });
+    read_again(&venue);
+    assert_eq!(
+        venue.anchor(&setup.anchor(5, 1)),
+        unlisted,
+        "the same listing"
+    );
+    std::thread::sleep(A_WHILE);
+    assert_eq!(refused.load(Ordering::SeqCst), 1, "not sent again");
+    refusing.store(false, Ordering::SeqCst);
+    let other = SigningKey::from_bytes(&[0x42; 32])
+        .verifying_key()
+        .to_bytes();
+    setup.chain.with(|chain| {
+        chain.set_storage(
+            keys::anchor_keys(&setup.space.0, &other),
+            None::<[u8; 32]>.encode(),
+        )
+    });
+    read_again(&venue);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
+    wait_until("the anchor lands", || setup.anchored_window(5));
+}
+
 /// A venue whose chain cannot be reached at first: the client starts all
 /// the same, every anchor `Open`; once reached, the anchor lands.
 #[test]
