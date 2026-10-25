@@ -155,6 +155,11 @@ pub(crate) struct Inner {
     pub(crate) calls: crate::calls::Calls,
     /// The read indexes this replica asked its leaders for.
     pub(crate) reads: crate::asking::Waits<Option<u64>>,
+    /// The anchor rows the representative's leader here asked its
+    /// replicas for: each answer's node and root.
+    pub(crate) anchor_rows: crate::asking::Waits<(NodeNumber, Option<[u8; 32]>)>,
+    /// The representative's leaders' alerts here, the latest few.
+    pub(crate) anchor_alerts: Mutex<std::collections::VecDeque<crate::AnchorAlert>>,
     /// The statements proved here that their agents have still to record.
     pub(crate) unrecorded: crate::prover::Unrecorded,
     /// Whether a prover worker runs here: compaction keeps the entries its

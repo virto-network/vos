@@ -144,6 +144,8 @@ impl Node {
             recording: smol::lock::Mutex::new(()),
             calls: crate::calls::Calls::default(),
             reads: crate::asking::Waits::default(),
+            anchor_rows: crate::asking::Waits::default(),
+            anchor_alerts: Mutex::default(),
             turn: AtomicU64::new(0),
             counters: Counters::default(),
             stats: Arc::default(),

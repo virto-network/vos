@@ -92,8 +92,14 @@ struct Cuts {
 }
 
 /// The representative's roots at its cuts by window, and the windows two
-/// replicas held two roots of.
-type RepRoots = (BTreeMap<u64, [u8; 32]>, Vec<u64>);
+/// replicas held two roots of; its anchor rows (`S_w`) by window, and the
+/// windows two replicas held two rows of.
+type RepRoots = (
+    BTreeMap<u64, [u8; 32]>,
+    Vec<u64>,
+    BTreeMap<u64, [u8; 32]>,
+    Vec<u64>,
+);
 
 impl Cuts {
     /// Rewrite rows of `agent`'s reader's committed map until `done`, in a
@@ -218,9 +224,17 @@ impl Cuts {
                         continue;
                     };
                     let mut held = self.rep_roots.lock().unwrap();
-                    let (roots, differ) = &mut *held;
+                    let (roots, differ, ..) = &mut *held;
                     if *roots.entry(window).or_insert(root) != root {
                         differ.push(window);
+                    }
+                }
+                let rows = roots::anchors(&snapshot, representative, None).unwrap_or_default();
+                let mut held = self.rep_roots.lock().unwrap();
+                let (.., anchor_rows, rows_differ) = &mut *held;
+                for (window, row) in rows {
+                    if *anchor_rows.entry(window).or_insert(row) != row {
+                        rows_differ.push(window);
                     }
                 }
             }
@@ -304,8 +318,9 @@ impl Alongside for Cuts {
 impl Cuts {
     /// The venue holds no second root of any window, and, once the
     /// representative's latest cut is anchored, every anchor of a window
-    /// whose root at the cut the run saw is `S_w` over that root; no two
-    /// replicas held two roots of one window.
+    /// whose root at the cut the run saw is `S_w` over that root, and the
+    /// replicas' anchor row of it; no two replicas held two roots, or two
+    /// rows, of one window.
     fn check_anchors(&self, cluster: &Cluster, representative: AgentId) {
         let space = cluster.space.id();
         let node = cluster.node(1).unwrap();
@@ -320,8 +335,12 @@ impl Cuts {
                 .any(|anchor| anchor.window >= latest)
         });
         assert!(cluster.venue.evidence().is_empty(), "no equivocation");
-        let (roots, differ) = &*self.rep_roots.lock().unwrap();
+        let (roots, differ, rows, rows_differ) = &*self.rep_roots.lock().unwrap();
         assert!(differ.is_empty(), "replicas' roots differ at {differ:?}");
+        assert!(
+            rows_differ.is_empty(),
+            "replicas' anchor rows differ at {rows_differ:?}"
+        );
         let anchors = cluster.venue.anchors(&space);
         let mut checked = 0;
         for anchor in &anchors {
@@ -329,6 +348,9 @@ impl Cuts {
                 let expected = vos_wire::vos_anchor::space_root(&space, anchor.window, root);
                 assert_eq!(anchor.root, expected, "S_{} anchored", anchor.window);
                 checked += 1;
+            }
+            if let Some(row) = rows.get(&anchor.window) {
+                assert_eq!(anchor.root, *row, "S_{} is its row", anchor.window);
             }
         }
         println!(
@@ -509,7 +531,7 @@ fn cuts_apply_once_and_replicas_agree_through_failures() {
         undo_held: Mutex::new(0),
         started: Mutex::new(Vec::new()),
         representative: Mutex::new(None),
-        rep_roots: Mutex::new((BTreeMap::new(), Vec::new())),
+        rep_roots: Mutex::new((BTreeMap::new(), Vec::new(), BTreeMap::new(), Vec::new())),
     };
     let rounds = std::env::var_os("CUTS_FULL").map(|_| Rounds::load());
     exactly_once(Mode::OneAtATime, 0x5eed_0612, rounds, Some(&cuts));

@@ -140,6 +140,12 @@ impl Node {
         self.inner.representative()
     }
 
+    /// The alerts the representative's leaders here raised about its
+    /// anchors, oldest first, the latest few.
+    pub fn anchor_alerts(&self) -> Vec<crate::AnchorAlert> {
+        self.inner.anchor_alerts()
+    }
+
     /// The space's registration at `venue`, signed as a founder: this
     /// node's key and its signature over the registration digest of the
     /// space and `controller` (`vos_anchor::register_digest`). None when

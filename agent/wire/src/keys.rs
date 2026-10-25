@@ -165,6 +165,7 @@ enum TreeRow {
     CutRoot = 0x05,
     CutProof = 0x06,
     Closing = 0x07,
+    Anchor = 0x08,
 }
 
 impl TreeRow {
@@ -651,6 +652,26 @@ pub fn closings() -> Vec<u8> {
 /// The window a [`closing`] key names; `None` for any other key.
 pub fn closing_entry(key: &[u8]) -> Option<u64> {
     let rest = key.strip_prefix(&TreeRow::Closing.prefix())?;
+    Some(u64::from_be_bytes(rest.try_into().ok()?))
+}
+
+/// The space's root `S_w` of the window `window`, as the representative's
+/// close of it makes it: node-local, written by the commit that finishes
+/// the representative's cut build of the window, the same bytes on every
+/// replica, the cut fixed by the committed log. Kept for `MaxRootAge`; its
+/// leader signs only these.
+pub fn anchor(window: u64) -> Vec<u8> {
+    TreeRow::Anchor.key(&window.to_be_bytes())
+}
+
+/// The prefix of every [`anchor`] row, in window order.
+pub fn anchors() -> Vec<u8> {
+    TreeRow::Anchor.prefix().to_vec()
+}
+
+/// The window an [`anchor`] key names; `None` for any other key.
+pub fn anchor_entry(key: &[u8]) -> Option<u64> {
+    let rest = key.strip_prefix(&TreeRow::Anchor.prefix())?;
     Some(u64::from_be_bytes(rest.try_into().ok()?))
 }
 

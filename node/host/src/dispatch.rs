@@ -209,6 +209,14 @@ impl Inner {
                 receiver,
                 relayed,
             } => self.on_behind(from, sender, receiver, relayed),
+            PeerMessage::AnchorRow {
+                agent,
+                token,
+                window,
+            } => self.on_anchor_row(from, agent, token, window),
+            PeerMessage::AnchorRowAnswer { agent, token, root } => {
+                self.on_answer(&self.anchor_rows, from, agent, token, (from, root))
+            }
             PeerMessage::Blob { .. } | PeerMessage::Directory { .. } => {
                 unreachable!("blobs and records are handled in tasks")
             }

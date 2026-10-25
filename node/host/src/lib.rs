@@ -36,6 +36,7 @@ pub mod store;
 pub mod tls;
 mod workflows;
 
+pub use leader::AnchorAlert;
 pub use node::{
     ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, ReplaceError, Reply, STORE,
     wall_clock,
@@ -209,9 +210,9 @@ pub trait Hooks: Send + Sync {
         true
     }
 
-    /// Before the representative's leader, its cut of `window` built and
-    /// its anchor handed to the venue, proposes the window's close: false
-    /// stops the leader there, as a crash would.
+    /// Before the representative's leader, its cut of `window` built,
+    /// proposes the window's close: false stops the leader there, as a
+    /// crash would.
     fn close(&self, agent: AgentId, window: u64) -> bool {
         let _ = (agent, window);
         true
