@@ -21,6 +21,7 @@ use stwo::core::pcs::TreeVec;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::utils::bit_reverse_index;
 use stwo::core::verifier::PREPROCESSED_TRACE_IDX;
+use stwo::prover::backend::simd::m31::{N_LANES, PackedM31};
 use vos_pvm_recair_air::masked::MASKED_COLUMN_EXPANSION;
 
 /// What R1 found: the column classes it checked, the most functionals one
@@ -222,26 +223,46 @@ fn basis_at(point: CirclePoint<SecureField>, log_size: u32) -> Vec<SecureField> 
     values
 }
 
-/// The rank of a matrix over M31, by forward elimination.
-pub fn rank_m31(mut rows: Vec<Vec<BaseField>>) -> usize {
+/// The rank of a matrix over M31, by forward elimination, its rows packed
+/// sixteen columns a SIMD word: a row's update from the pivot's is one
+/// vector multiply-subtract a word. Every row from the rank on is zero left
+/// of the column eliminated, so the word holding that column is updated
+/// whole.
+pub fn rank_m31(rows: Vec<Vec<BaseField>>) -> usize {
     let n_columns = rows.first().map_or(0, Vec::len);
+    let words = n_columns.div_ceil(N_LANES);
+    let mut rows: Vec<Vec<PackedM31>> = rows
+        .iter()
+        .map(|row| {
+            (0..words)
+                .map(|word| {
+                    PackedM31::from_array(core::array::from_fn(|lane| {
+                        row.get(word * N_LANES + lane).copied().unwrap_or_default()
+                    }))
+                })
+                .collect()
+        })
+        .collect();
+    let at = |row: &[PackedM31], column: usize| row[column / N_LANES].to_array()[column % N_LANES];
     let mut rank = 0;
     for column in 0..n_columns {
         if rank == rows.len() {
             break;
         }
-        let Some(pivot) = (rank..rows.len()).find(|&row| !rows[row][column].is_zero()) else {
+        let Some(pivot) = (rank..rows.len()).find(|&row| !at(&rows[row], column).is_zero()) else {
             continue;
         };
         rows.swap(rank, pivot);
         let (done, below) = rows.split_at_mut(rank + 1);
         let pivot_row = &done[rank];
-        let inverse = pivot_row[column].inverse();
+        let inverse = at(pivot_row, column).inverse();
+        let first = column / N_LANES;
         for row in below {
-            if !row[column].is_zero() {
-                let factor = row[column] * inverse;
-                for (value, &p) in row[column..].iter_mut().zip(&pivot_row[column..]) {
-                    *value -= factor * p;
+            let value = at(row, column);
+            if !value.is_zero() {
+                let factor = PackedM31::broadcast(value * inverse);
+                for (word, &p) in row[first..].iter_mut().zip(&pivot_row[first..]) {
+                    *word -= factor * p;
                 }
             }
         }

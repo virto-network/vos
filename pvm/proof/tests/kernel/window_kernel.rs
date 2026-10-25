@@ -715,7 +715,11 @@ fn the_window_is_stated_at_the_model_venue() {
         SubmitOutcome::Accepted,
         "a repeat, the venue holding it accepted"
     );
-    assert_eq!(accepting.venue.statements_held(), 1, "the repeat judged as one");
+    assert_eq!(
+        accepting.venue.statements_held(),
+        1,
+        "the repeat judged as one"
+    );
 
     assert_eq!(
         code(&venue(VENUE), &statement),
