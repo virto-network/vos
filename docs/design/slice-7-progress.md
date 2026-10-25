@@ -488,9 +488,10 @@ carriers.
 - **The numbers mean nothing for scale.** The four nodes share one NVMe
   (95% full) with other agents' builds, and the governor is
   `powersave`, which `check` warned about. The driver's p99 went from
-  1.05 s with all four nodes to 20 ms without n3. The cause was disk
-  stalls (38.8 ms per I/O in the first run, commit p99.9 about 1 s),
-  not n3.
+  1.05 s with all four nodes to 20 ms without n3. The first run saw the
+  shared disk at 38.8 ms per I/O and a commit p99.9 near 1 s, and n3 was
+  no slower than the others. So the difference is not shown to be n3's;
+  the shared disk is the likely cause, but this run cannot establish it.
 - **The first smokes** (three nodes, then four) ran the same way.
 
 **Gates:**
@@ -503,7 +504,107 @@ carriers.
 - **7.4's gate** (three hosts, 100 agents, 10,000 users, on two of the
   owner's machines at least) needs the owner's inventory. For that many
   users at once, `[node] ingress_connections` must go up, because the
-  smoke driver holds a connection per active user. 7.5's drivers
-  multiplex.
+  smoke driver gives each active user its own client and connection. The
+  connection model (users multiplexed over a few connections, calls
+  signed ahead) belongs to 7.5's drivers.
 - **The representative in a run** creates and installs; anchoring
   stays 7.2's.
+
+### The review's fixes
+
+The Opus review said fix, then merge, and that the harness must not run
+on the owner's machines until the fixes land. They are folded here as
+further commits.
+
+**High:**
+- **H1, the wipe:** `dir` is now an absolute path of plain characters,
+  with no empty, `.` or `..` part. It must be at least two levels deep and
+  not a home directory, and no entry's dir may sit inside another entry's
+  on the same machine. On the host, a deploy refuses `/` and `$HOME` (after
+  following links). It makes `dir` only when it is absent or empty, and
+  marks it `.vos-scale`. It wipes nothing in a dir that holds other files
+  and no marker. Tests cover each refusal; the guard script is run on temp
+  dirs, links included. The smoke showed it working: my earlier unmarked
+  dirs were refused and left untouched.
+- **H2, the clock:**
+  - The offset is now measured as a ping-pong over one ssh session
+    (`while read; do date +%s%N; done`), keeping the read with the
+    shortest round trip of eight. Localhost reads 0.4–0.5 ms, against
+    0.9–2.0 ms before.
+  - `check` records NTP sync (`timedatectl`) and chrony's offset, and
+    warns when sync is unknown or off.
+- **H3, a saturated thread:** the busiest single thread (by tid, as a
+  share of one core) is now a candidate for the binding resource. A test
+  shows a thread at 95% binding on an otherwise idle host.
+
+**Medium:**
+- **M1, the driver as bottleneck:** each driver now counts its sends and
+  how many went more than 10 ms behind schedule. The report gives each
+  driver's worst lateness and late share, and warns above 1% that the
+  driver, not the nodes, may have bound the run.
+- **M2, the slowest node host:** it is now the host whose node has the
+  highest `commit` p99, with the host's disk ms/io breaking ties. Nodes
+  are mapped to host names, and the binding resource stays as a per-host
+  label.
+- **M3, memory and placement:** `check` groups entries by machine (its
+  machine id, else its ssh host). It refuses a machine whose entries' caps
+  plus a 2 GiB reserve exceed its free memory. It also refuses a node's
+  machine that holds a driver or the coordinator, unless
+  `harness.smoke = true`, in which case it only warns. The localhost
+  inventory sets `smoke = true`.
+- **M4, leftovers:**
+  - The first run is wrapped in `timeout 60`.
+  - Every unit has `RuntimeMaxSec`: `harness.max_run_s` (6 h by default)
+    for nodes and samplers, and the load plus 5 minutes for drivers.
+  - `down`, and `deploy` before it ships, stop units on every listed
+    entry, excluded ones too. An unreachable excluded host is only warned
+    about.
+  - `run` stops every unit when deploy fails, when it fails partway, and
+    on SIGINT or SIGTERM: the handler sets a flag, and every wait and
+    poll ends on it. Tested: an interrupted run went from 10 units to 0.
+- **M5:** every remote script runs under `timeout 300 bash -s`, and each
+  clock session under `timeout 60`.
+- **M6:** the runbook and the report now say that a rerun without the
+  slowest host needs four node hosts or more. The report warns when it has
+  fewer.
+
+**Low:**
+- **L1:** `ssh` must be `localhost` or `[user@]host` of plain characters,
+  with no leading `-`. `address` must be an IP address.
+- **L2:** `--config` refuses a zero for `queue`, `max_inputs`,
+  `max_bytes` and `ingress_connections`, as it already did for
+  `executors`.
+- **L3:** the justfile's comments are back in place: `install-hooks`
+  keeps its own, and `check-no-scale` sits with the other `check-no-*`
+  gates.
+- **L4:** the report's default window is the drivers' span, measured with
+  the run's `every_s`, minus a ramp of one interval at the start
+  (`--ramp-s` sets the ramp).
+- **L5:** `/stats` now carries `groups` (replicas, leading, the sum of
+  terms), with a host test. The poller records it, and the report gives
+  each node's leaders and elections in the window.
+- **L6:** `check` warns about a USB or unknown data disk, and labels an
+  unknown transport `?` instead of `ssd`. Hosts sample their cores' clock
+  against its maximum, and the report gives it as `clock%`, warning when a
+  node ran below 70%.
+- **L7:** a process's CPU now comes from the totals in `/proc/<pid>/stat`.
+- `vos-scale` now uses mimalloc, as `vos` does.
+
+**The smoke again** [measured, `/var/tmp/vos-scale/runs/20261025T112914Z-smoke`
+and `20261025T113050Z-without-n3`]: one `run` with 4 agents, the
+representative, 40 users and 20 calls a second for 40 s, on four nodes and
+a driver.
+- **First run:** 797 calls answered, 0 errors, 0 elections.
+- **The new warnings fired as they should:**
+  - The driver was flagged, with 13.6% of its sends more than 10 ms late
+    and 11.5 s at worst, because the shared disk stalled commits for
+    seconds (disk 44–46% busy, 41–47 ms per I/O).
+  - The nodes' cores ran at 25–29% of their top clock under `powersave`.
+  - Every entry was flagged as sharing one machine, a smoke only.
+- **Rerun without n3:** 797 calls, 0 errors, p99 57 ms, 0.38% of sends
+  late. `report --compare` set the two runs side by side.
+- **What the numbers mean:** on this shared machine they are a
+  smoke's, not a measurement.
+
+**Gates after the fixes:** `just check` green, 104 suites, the new stats
+test among them; the localhost smoke, the interrupt and the rerun, above.
