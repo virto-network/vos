@@ -15,7 +15,13 @@ statements service's controls.
   `add_authority`, paired with the node's account; the JAM service's
   `AddKey` control).
 - Only a node whose key the venue lists replicates the space's
-  representative: adding another is refused (`CannotRun`).
+  representative: adding another is refused (`CannotRun`). A node knows
+  the listing from its venue client's reads, made on the client's own
+  thread a few seconds apart: until the client has read the space after
+  a start, it lists no key, and creating or adding the representative
+  there is refused the same way. Create it once the client has read the
+  space, a few seconds after the node starts, and add again after a
+  refusal.
 
 ## Replacing a node
 
@@ -26,8 +32,12 @@ by changing its key:
 3. replace the old node by the new one among each agent's replicas, the
    representative's first (`vos agent replace --agent A --remove OLD
    --add NEW`, at each agent's leader);
-4. have the controller remove the old node's key (and, on Kreivo, its
-   authority).
+4. have the controller remove the old node, in one sitting: on Kreivo,
+   its authority (`remove_authority`, which removes the key paired with
+   it), then any key left listed (`remove_anchor_key`); on JAM, its key
+   (`RemoveKey`). Between the two Kreivo calls the old node's key is
+   listed while its account is no authority: the venue refuses its
+   anchors, and its client sends no more until the listing changes.
 
 The replacement moves every replica the node held, not only the
 representative's.
@@ -41,25 +51,35 @@ that ended for it, or the new space inherits the fault).
 
 ## The representative's alerts
 
-The representative's leader logs each as an error, once, and keeps the
-latest (`Node::anchor_alerts`):
+The representative's leader logs each, once a leadership (a window's
+stop once), and keeps the latest (`Node::anchor_alerts`):
 - **unlisted, handed off:** the venue does not list this node's key; the
   leadership moved to a replica whose key it lists, which anchors. List
   this node's key again, or replace it.
 - **unlisted, waiting:** no replica's key is listed: nothing is anchored
-  until the controller lists one. The leader tries to hand off again
-  once a window.
+  until the controller lists one. The leader checks every 2 s and hands
+  off as soon as a replica is listed; a node hands off at most once a
+  window of the space's clock, so a handoff that failed (its target down)
+  is tried again in the next window.
+- **evidence:** the venue held another root at a window, a quorum of the
+  replicas held this node's row, and its anchor went as the
+  equivocation's evidence, which ends the space (below).
 - **stopped:** the space is blocked by the venue's governance, or ended
-  by an equivocation. A blocked space anchors again once unblocked; an
-  ended one never does (below).
+  by an equivocation (after an evidence alert when this node sent it). A
+  blocked space anchors again once unblocked; an ended one never does.
 - **never:** the venue will never take a window's anchor (too old, behind
   the space's last window, a signature it refuses), or the window aged
-  unsent. Statements over that window's root are refused.
+  unsent (an error). A window before the space's registration is routine,
+  logged as a warning. Statements over that window's root are refused.
 - **divergent replicas:** the venue holds another root at a window, and a
-  replica of the representative holds another root of it than the
-  leader's. This is an apply bug or a cloned store, not a theft: the
-  leader sends nothing, so the space is not ended for it. Stop the
-  replica that differs and replace it.
+  replica of the representative, named with the root it holds, holds
+  another row of it than the leader's. The majority decides (S34): with a
+  quorum holding the leader's row the evidence goes all the same; without
+  one, nothing is sent and the leader asks again every 2 s. The named
+  root tells which side is wrong: equal to the venue's held root, that
+  replica (or a fork of it) is the equivocator, its key compromised;
+  equal to neither, it is an apply bug, a cloned store or a compromise.
+  Either way, replace that replica.
 
 ## An ended space
 
