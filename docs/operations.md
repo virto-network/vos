@@ -81,6 +81,25 @@ stop once), and keeps the latest (`Node::anchor_alerts`):
   equal to neither, it is an apply bug, a cloned store or a compromise.
   Either way, replace that replica.
 
+## Which windows are anchored
+
+An agent cuts its state, and reports its root to the representative,
+only at a window a read of it waits on; the representative anchors only
+the windows some agent reported, so a quiet space anchors nothing and
+pays no fee. An issuer whose verifiers demand a recent root has its agent
+report every window (`Node::report_every_window`, an admin command), and
+every window it reports is anchored. A read whose window's close does
+not come by `B_{w+2}` fails `NotClosed`; its caller asks again.
+
+## A row that does not decode
+
+A row of a window's close that does not decode (an agent's report mark,
+the representative's close mark or its last report of an agent, a held
+close) is moved aside under the agent's quarantine rows with its bytes,
+and the batch goes on as if it were absent; every replica's apply logs it
+at error level. The rows are kept for the operator to read; the next
+report or close writes the row afresh.
+
 ## An ended space
 
 An equivocation's evidence ends a space at its venue for good: its roots
