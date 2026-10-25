@@ -961,3 +961,141 @@ anchors, every one the replicas' row, no evidence); `just e2e-chain`
 green first time, 1,670 s at a loaded host: the same verdicts, latency
 125.7 s at Kreivo and 79.4–169.7 s at JAM, each under its gate; 5 Kreivo
 anchors; the audit clean over 574 carriers.
+
+## Step 7.5: the load model and its drivers
+
+From vos-core `e5389045`, in two commits and this entry.
+
+**S35, recorded** (`owner-decisions.md`): one machine besides the
+desktop, `compumax`, holds the runs' three nodes, each its own unit, cap,
+cores and data directory; the drivers and the coordinator run on the
+desktop. §7.6 and the targets now say so: run 2's knee is one host's, not
+T2's; T2 and the rerun without the slowest host are recorded as not
+measurable until more machines exist. S35 does not name T5: run 5 kills
+one of compumax's nodes, not a host, and whether that stands for T5 is
+left to the owner (§7.6, the T5 row). `check` already admitted this
+layout; a test now pins it (three nodes on one machine with their caps
+summed against its memory; the drivers and the coordinator on a machine
+with no node), and nodes sharing a data disk need its free space each.
+`inventory.example.toml` is that layout.
+
+**Built:**
+- **The shard actor** (`agent/test-actors/shard`): accounts in a
+  `CommittedMap` (an absent one holds `2^40`), `transfer` here or by a
+  `credit` message to the payee's shard, `balance`, the workflow `tally`,
+  `holds_at_cut` (`attest_at_cut` over the payer's row), and the identity
+  rows (`fill_identities`, a thousand a call; `set_identity`). A testkit
+  test covers it.
+- **`agents`:** `K` shards and `I` idle agents by weight, the shard actor
+  in each; `--identity-rows U` creates the stand-in identity agent on every
+  node and writes its rows from eight clients. `deploy` founds the space at
+  an origin it records, so drivers know each window's close `B_w + D`.
+- **The model** (`tools/scale/src/load.rs`): users are keys from the seed
+  and index, accounts by hash onto the shards; offered load `U·a·r`
+  (`--users`, `--active`, `--per-user` or `--rate`); Poisson arrivals; the
+  mix (`--mix`, default 80% transfers, 15% queries, 4.5% workflows, 0.5%
+  reads at a cut); the cross-shard share `x` (`--cross`, random payees'
+  `1 − 1/K` by default); Zipf(1.0) by rejection-inversion, ranks spread over
+  the users by a stride coprime to `U`. Drivers split the users by index
+  and the rate evenly; the first writes the identity agent 10 times a
+  second, from 16 writer keys in turn.
+- **The drivers** (`engine.rs`, `drive-local`): a planning thread draws and
+  signs each operation up to 500 ms ahead; one sending thread (a smol
+  executor) sends it at its time, single attempts (`call_at`'s semantics:
+  no retry, no redirect followed; a `NotLeader` updates the leader hint),
+  over at most 512 kept connections a node (64 opened before the load),
+  calls to the shard's leader (read from the nodes before the load) and
+  queries to a follower. A user's calls go one at a time in its session,
+  in order; one refused before it ran gives its sequence to the next, one
+  of unknown fate starts a new session. Workflows are read until they end;
+  a read at a cut is read once for its window, then again from its close
+  and timed from it (`cut_read`, against T4's 10 s). Every 10 s a line a
+  kind (sent, answered, refusals by name, rate, p50/p99/p99.9, the late
+  sends, the calls queued behind their user's), a total a kind at the end,
+  and the mix as sent against its target, the driver's CPU over the load
+  (`load_cores`) and by thread. The report sets each kind apart, the model
+  beside it, and "not modeled" as before.
+- **The capacity probe** (`"probe": true` in a plan given to `drive-local`
+  by hand): every request to a node that does not replicate its agent,
+  answered `Elsewhere` at once, before any signature check. The driver does
+  all its work and the nodes almost none.
+
+**What the driver needed to reach the rate** [measured, this desktop]:
+signing is the planning thread's whole cost (curve25519 about 55% of the
+driver's samples), and three costs of the sending thread went:
+- a timer a request (600,000 pending at 20,000 a second for a 30 s
+  bound): now a reaper every second shuts a late request's socket. The
+  sending thread's CPU fell by about a third and its periodic stalls went;
+- naming a refusal by formatting the whole answer (`Elsewhere` prints its
+  contacts): 21% of the samples in `memcpy` under `Debug`; now by variant;
+- a 16 KiB read buffer on each request's future, copied at each spawn.
+Sessions are now timed from their first call: users keyed before the load
+and first called a minute later were refused `StaleSession`.
+
+**The gate** [measured, this desktop: Core Ultra 7 155H, governor
+`powersave` (EPP `balance_performance`), load average 5–12 from other
+agents' builds through every run; the driver pinned to cpus 1–2, one
+P-core's two threads; four nodes on the other cores]:
+- **The nodes cannot commit 20,000 calls a second here.** At 5,000 a
+  second (K = 64, `x` = 98%) they fell behind (p50 12 s; refine and dry
+  runs queued ~100 ms for executors that were 28% busy, the shared NVMe
+  23% busy at 9 ms an I/O); at 20,000 offered they answered about 10,000
+  and lost leaders (92 elections), and the driver, its users' calls
+  queueing behind unanswered ones, fell 60 s behind
+  (`20261025T172227Z-s75-20k-a`, `…182820Z-s75-20k-b`).
+- **The driver at 20,000 a second, by the probe** (60 s, `U = 4·10^5`,
+  `a` = 5%, `r` = 1, K = 64, the default mix; three runs of the final
+  binary, their records kept out of the repository): 1,199,155 sent and
+  answered, 20,009 a second offered; **the mix within 0.06 points** of its
+  target (worst: queries, 14.94% against 15%; transfers 80.04%, workflows
+  4.51%, reads at a cut 0.50%, the cross share 98.44% against 98.44%); **0.62 and 0.77
+  cores** of the pair over the load, the sending thread 0.22–0.26 and
+  the planner the rest; 1.0% and 0.9% of sends more than 10 ms late, at
+  worst 47–60 ms, all in the one or two intervals where the answers
+  stalled about a second (answer p99 1 s, from 64 µs otherwise), none in
+  the others. A third run, during another agent's burst (load 10, the
+  cores at 0.4 GHz), went 1.32 cores and 16% late. Earlier runs before the
+  last fixes: 0.80–1.21 cores, 0.7–1.8% late.
+- **The full stack at a rate the nodes keep** (3,000 a second, 120 s,
+  the same model, `20261025T192411Z-s75-full-3k-b`): 359,964 answered, no
+  error, p50 164 ms, p99 655 ms; 0.01% of sends late; 0.27 cores; the
+  mix within 0.05 points; every read at a cut served, 1.8 s past its
+  window's close at most; the identity agent written 10 a second.
+- **Verdict:** the driver sustains 20,000 calls a second on one core
+  pair, its mix within 0.06 points, at about two thirds of the pair's
+  CPU, against the nodes' cheapest answer; its schedule held within the
+  M1 bound (1% of sends more than 10 ms late) in two runs of three, at it
+  in one, the misses at node-side stalls. What the probe leaves out: the
+  nodes' commits, and the reads of workflows and cuts (5% of operations,
+  a signature and a request each more). It was not shown end to end:
+  the localhost nodes commit about 5,000 a second here.
+
+**Gates:** `just check` green (110 suites), on the first commit and again
+on the last.
+
+**Left for 7.6:**
+- compumax reachable by ssh with the owner's key touched once
+  (`ControlMaster`, README), lingering on, three directories of the
+  harness's own on its data disk, its LAN address and its cores split in
+  three; the desktop's wired address for the driver's entry
+  (`inventory.example.toml`).
+- Both machines on the `performance` governor, and the desktop quiet: at
+  `powersave` under other agents' load the driver's cores ran at 0.4–2 GHz,
+  and its cost per call varied threefold with them.
+- The node's throughput is the first thing the runs will meet: at 5,000
+  a second (T1's rate) four nodes on this desktop fell behind, executors
+  queued while mostly idle. Raise `executors` (the localhost smoke runs
+  2–3) and look at the refine and dry-run queues first.
+
+**What the plan left open, and how it was read:**
+- "A share `a` active, each at `r`" and "users drawn Zipf(1.0)" cannot
+  both hold per call: Zipf per call gives the hottest of 10^5 users 8% of
+  all calls, a rate no session serves one call at a time. The model draws
+  *who becomes active* Zipf and keeps `r` per active user, with a mean
+  active span (`--active-s`, 300 s) the plan does not give.
+- The mix's shares are not in the plan; the defaults above are the
+  harness's, every report states them.
+- "Within 1% of its target" is read as each share within one percentage
+  point; every run's worst was 0.06.
+- One core pair is read as two logical CPUs, here one physical core's two
+  threads: the strictest reading on this desktop.
