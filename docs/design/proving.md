@@ -1314,7 +1314,7 @@ the order drawn, never in `TypeId` order). `just judge-wasm` (in
 
 **At format 39** [measured]: the generator wraps `S`'s
 run under format 39, masked from the seeded test seam (`MaskRng::Seeded`,
-so the bytes are its own every run: `wrap.proof`, 146,564 bytes), and under
+so the bytes are its own every run: `wrap.proof`, 148,612 bytes), and under
 28 (`wrap-28.proof`, 123,797 bytes); and the two cheating wraps under 39.
 `S`'s `public_args` are a venue's id and a nonce, which the io-hash binds
 and no venue reads apart. The production venue accepts {39}, the test
