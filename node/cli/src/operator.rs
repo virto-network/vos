@@ -41,6 +41,15 @@ impl AgentCommand {
             AgentCommand::Create { operator, replicas } => {
                 created(operator_of(&operator)?.create_agent(replicas))
             }
+            AgentCommand::Reports {
+                operator,
+                agent,
+                every,
+            } => print_admin_answer(
+                &operator_of(&operator)?
+                    .report_every_window(AgentId(agent), every)
+                    .map_err(failed)?,
+            ),
             AgentCommand::Replace {
                 operator,
                 agent,

@@ -346,7 +346,9 @@ pub enum Admin {
     /// Record the agent's cut, and report its root there, at every window
     /// (`true`), as an issuer whose verifiers demand a recent root does, or
     /// only at the windows a read waits on (`false`, the default)
-    /// ([`crate::keys::every_window`]).
+    /// ([`crate::keys::every_window`]). Set on the representative, it
+    /// anchors nothing of its own: a window is anchored for the reports of
+    /// other agents its cut holds.
     #[codec(index = 2)]
     ReportEveryWindow(bool),
 }

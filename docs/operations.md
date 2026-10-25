@@ -87,8 +87,13 @@ An agent cuts its state, and reports its root to the representative,
 only at a window a read of it waits on; the representative anchors only
 the windows some agent reported, so a quiet space anchors nothing and
 pays no fee. An issuer whose verifiers demand a recent root has its agent
-report every window (`Node::report_every_window`, an admin command), and
-every window it reports is anchored. A read whose window's close does
+report every window, and every window it reports is anchored:
+
+    vos agent reports --data DIR --agent A --every true
+
+(`--every false` goes back to the windows its reads wait on.) The issuer
+must be an agent other than the representative: the representative's own
+cuts carry no report of it, so a window only it saw is not anchored. A read whose window's close does
 not come by `B_{w+2}` fails `NotClosed`; its caller asks again.
 
 ## A row that does not decode
