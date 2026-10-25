@@ -412,7 +412,9 @@ const BOUNDARY_TERMS: usize = 644;
 /// The `qm31` rows of a query's domain point (recair's
 /// `verifier::circle::domain_point`) at `log_size`: two for the bit above
 /// the first, four for each bit after it, one to conjugate on the first.
+/// A circle domain has at least four points: `log_size` is at least 2.
 const fn domain_point_rows(log_size: usize) -> usize {
+    debug_assert!(log_size >= 2, "a circle domain of at least four points");
     2 + 4 * (log_size - 2) + 1
 }
 
@@ -420,7 +422,9 @@ const fn domain_point_rows(log_size: usize) -> usize {
 /// `verifier::fri::verify_query`) over `layers`: in each layer the
 /// twiddle's inverse, the pair's difference, its scaling, their sum and the
 /// fold; and the query point's `x` doubled in each layer past the second.
+/// A segment's FRI has at least two layers: `layers` is at least 2.
 const fn fri_fold_rows(layers: usize) -> usize {
+    debug_assert!(layers >= 2, "at least two FRI layers");
     5 * layers + (layers - 2)
 }
 
