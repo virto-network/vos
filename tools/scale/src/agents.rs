@@ -72,6 +72,7 @@ impl Agents {
 
 /// A small deterministic generator (SplitMix64): placements are a
 /// function of the seed.
+#[derive(Clone, Copy)]
 pub struct Mix(pub u64);
 
 impl Mix {

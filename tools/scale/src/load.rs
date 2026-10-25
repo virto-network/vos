@@ -8,9 +8,12 @@
 //! call is one kind of the mix: a transfer (to a payee in another shard
 //! with probability `x`), a query on a follower, a workflow, or a read at
 //! a window's cut. Driver `d` of `D` runs the model on its users (those
-//! whose index is `d` modulo `D`) at its share of the rate.
+//! whose index is `d` modulo `D`) at its share of the rate. Beside the mix,
+//! a share of all the agents (the shards and the idle ones) read once at a
+//! cut each window, at a uniform time within it; the first driver writes
+//! the stand-in identity agent at a steady rate.
 
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +30,9 @@ pub enum Kind {
     /// A write to the stand-in identity agent: a steady stream beside the
     /// mix, outside its shares.
     Identity,
+    /// An agent's read at its window's cut, by the readers' share: beside
+    /// the mix, outside its shares.
+    Reader,
 }
 
 impl Kind {
@@ -40,6 +46,7 @@ impl Kind {
             Kind::Workflow => "workflow",
             Kind::Cut => "cut",
             Kind::Identity => "identity",
+            Kind::Reader => "reader",
         }
     }
 }
@@ -71,7 +78,7 @@ impl Shares {
             Kind::Query => self.query,
             Kind::Workflow => self.workflow,
             Kind::Cut => self.cut,
-            Kind::Identity => 0.0,
+            Kind::Identity | Kind::Reader => 0.0,
         }
     }
 
@@ -142,6 +149,10 @@ pub struct Model {
     pub zipf: f64,
     /// Writes a second to the stand-in identity agent, by the first driver.
     pub identity_hz: f64,
+    /// The share of all agents, shards and idle, that read at a cut once
+    /// each window.
+    #[serde(default)]
+    pub readers: f64,
     pub seed: u64,
 }
 
@@ -168,6 +179,9 @@ impl Model {
         }
         if !(0.0..=1.0).contains(&self.cross) || (shards < 2 && self.cross > 0.0) {
             return Err("the cross-shard share: in [0, 1], and 0 with one shard".into());
+        }
+        if !(0.0..=1.0).contains(&self.readers) {
+            return Err("the readers' share: in [0, 1]".into());
         }
         if shards == 0 {
             return Err("no ledger shards".into());
@@ -323,6 +337,21 @@ pub struct Planned {
     pub user: u64,
     /// A transfer's payee, and whether its shard is another.
     pub payee: Option<(u64, bool)>,
+    /// A reader's agent, among the shards then the idle agents.
+    pub agent: Option<usize>,
+}
+
+/// The agents that may read, and the space's windows: each window a share
+/// of them reads at a cut, at a uniform time within it.
+#[derive(Clone, Copy, Debug)]
+pub struct Readers {
+    /// The shards and the idle agents.
+    pub agents: usize,
+    /// Window 0's start and each window's length, in ms since the epoch.
+    pub origin_ms: u64,
+    pub length_ms: u64,
+    /// The load's start, in ms since the epoch.
+    pub start_ms: u64,
 }
 
 /// An active user's slot: who holds it, and until when.
@@ -348,6 +377,11 @@ pub struct Plan<'a> {
     /// The next identity write's time, for the first driver.
     identity_t: Option<f64>,
     identity_writes: u64,
+    readers: Option<Readers>,
+    /// The next window whose readers are drawn, and the reads drawn, in
+    /// time order.
+    reader_window: u64,
+    reads: VecDeque<(f64, usize)>,
 }
 
 impl<'a> Plan<'a> {
@@ -370,7 +404,59 @@ impl<'a> Plan<'a> {
             t: 0.0,
             identity_t: (driver == 0 && model.identity_hz > 0.0).then_some(0.0),
             identity_writes: 0,
+            readers: None,
+            reader_window: 0,
+            reads: VecDeque::new(),
         }
+    }
+
+    /// Read at a cut, by the readers' share of `readers.agents`, from the
+    /// window the load starts in.
+    pub fn with_readers(mut self, readers: Readers) -> Self {
+        if self.model.readers > 0.0 && readers.length_ms > 0 && readers.agents > 0 {
+            self.reader_window =
+                readers.start_ms.saturating_sub(readers.origin_ms) / readers.length_ms;
+            self.readers = Some(readers);
+        }
+        self
+    }
+
+    /// The window `w`'s reads in this driver's share: its agents drawn
+    /// without replacement, each at a uniform time within the window, in
+    /// seconds from the load's start.
+    fn draw_reads(&mut self, readers: Readers, window: u64) {
+        let count = (self.model.readers * readers.agents as f64).round() as usize;
+        let mut mix = Mix(self.model.seed ^ window.rotate_left(17) ^ 0x7ead);
+        let mut agents: Vec<usize> = (0..readers.agents).collect();
+        let mut reads = Vec::new();
+        for at in 0..count.min(readers.agents) {
+            let pick = at + (mix.next() % (readers.agents - at) as u64) as usize;
+            agents.swap(at, pick);
+            let agent = agents[at];
+            let start = readers.origin_ms + window * readers.length_ms;
+            let when = start as f64 + mix.unit() * readers.length_ms as f64;
+            let t = (when - readers.start_ms as f64) / 1e3;
+            if agent as u64 % self.drivers == self.driver && t >= self.t {
+                reads.push((t, agent));
+            }
+        }
+        reads.sort_by(|a, b| a.0.total_cmp(&b.0));
+        self.reads.extend(reads);
+    }
+
+    /// The next read's time, its window drawn once the plan reaches it.
+    fn next_read(&mut self, before: f64) -> Option<(f64, usize)> {
+        let readers = self.readers?;
+        while self.reads.is_empty() {
+            let start = readers.origin_ms + self.reader_window * readers.length_ms;
+            if (start as f64 - readers.start_ms as f64) / 1e3 > before {
+                return None;
+            }
+            let window = self.reader_window;
+            self.reader_window += 1;
+            self.draw_reads(readers, window);
+        }
+        self.reads.front().copied().filter(|(t, _)| *t <= before)
     }
 
     /// Fill every slot at the start: the users active then.
@@ -465,6 +551,19 @@ impl Iterator for Plan<'_> {
     fn next(&mut self) -> Option<Planned> {
         let gap = self.exponential(1.0 / self.rate);
         let next = self.t + gap;
+        let identity = self.identity_t.unwrap_or(f64::INFINITY);
+        if let Some((at, agent)) = self.next_read(next.min(identity)) {
+            self.reads.pop_front();
+            // The draw just made is spent: arrivals are memoryless.
+            self.t = self.t.max(at);
+            return Some(Planned {
+                t: at,
+                kind: Kind::Reader,
+                user: agent as u64 % self.users.count,
+                payee: None,
+                agent: Some(agent),
+            });
+        }
         if let Some(at) = self.identity_t
             && at <= next
         {
@@ -477,6 +576,7 @@ impl Iterator for Plan<'_> {
                 kind: Kind::Identity,
                 user: self.identity_writes % self.users.count,
                 payee: None,
+                agent: None,
             });
         }
         self.t = next;
@@ -488,13 +588,14 @@ impl Iterator for Plan<'_> {
             kind,
             user,
             payee,
+            agent: None,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, Model, Plan, Shares, Users, Zipf, stride};
+    use super::{Kind, Model, Plan, Readers, Shares, Users, Zipf, stride};
     use crate::agents::Mix;
     use std::collections::{BTreeMap, HashMap};
 
@@ -508,6 +609,7 @@ mod tests {
             cross: Model::random_cross(16),
             zipf: 1.0,
             identity_hz: 10.0,
+            readers: 0.0,
             seed: 3,
         }
     }
@@ -620,6 +722,54 @@ mod tests {
         // no user goes past a few times `r` while active.
         let most = by_user.values().max().copied().unwrap_or(0) as f64;
         assert!(most / secs < 10.0 * model.per_user, "{most}");
+    }
+
+    /// A tenth of 100 agents read each two-minute window, each once, at
+    /// times within it; the reads go beside the mix, which keeps its rate.
+    #[test]
+    fn a_share_of_the_agents_reads_once_a_window() {
+        let model = Model {
+            readers: 0.1,
+            identity_hz: 0.0,
+            ..model(10_000, 100.0)
+        };
+        let users = Users::new(model.seed, model.users, 4);
+        let start_ms = 1_000_000;
+        let readers = Readers {
+            agents: 100,
+            origin_ms: start_ms - 30_000,
+            length_ms: 120_000,
+            start_ms,
+        };
+        let plan = Plan::new(&model, &users, 0, 1).with_readers(readers);
+        let mut by_window: BTreeMap<u64, Vec<usize>> = BTreeMap::new();
+        let mut calls = 0u64;
+        let mut last = 0.0;
+        for planned in plan.take_while(|planned| planned.t < 330.0) {
+            assert!(planned.t >= last, "{planned:?}");
+            last = planned.t;
+            match planned.kind {
+                Kind::Reader => {
+                    let at = start_ms as f64 + planned.t * 1e3;
+                    let window = ((at - readers.origin_ms as f64) / 120_000.0) as u64;
+                    by_window
+                        .entry(window)
+                        .or_default()
+                        .push(planned.agent.unwrap());
+                }
+                _ => calls += 1,
+            }
+        }
+        // Windows 1 and 2 whole; window 0 began before the load.
+        for window in [1, 2] {
+            let mut agents = by_window[&window].clone();
+            assert_eq!(agents.len(), 10, "window {window}");
+            agents.sort_unstable();
+            agents.dedup();
+            assert_eq!(agents.len(), 10);
+        }
+        assert!(by_window[&0].len() < 10);
+        assert!((calls as f64 / 330.0 / 100.0 - 1.0).abs() < 0.05, "{calls}");
     }
 
     #[test]

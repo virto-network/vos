@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::Instant;
 
 use vos_tree::{Blake2b, Child, Leaf, empty_root};
 use vos_wire::ids::AgentId;
@@ -369,13 +370,21 @@ async fn run(inner: &Inner, shared: &Shared) -> Result<(), Error> {
             build = build.representing(space, clock);
         }
         while !shared.state().stopped {
-            let (returned, change) = inner
+            let asked = Instant::now();
+            let stats = Arc::clone(&inner.stats);
+            let (returned, change, started) = inner
                 .offload(move || {
+                    let started = Instant::now();
                     let change = build.next_batch();
-                    (build, change)
+                    stats.root_build.took(started.elapsed());
+                    (build, change, started)
                 })
                 .await
                 .ok_or_else(|| Error::Halted("the executors stopped".into()))?;
+            inner
+                .stats
+                .root_build_queue
+                .took(started.saturating_duration_since(asked));
             build = returned;
             let Some(change) = change? else {
                 break;

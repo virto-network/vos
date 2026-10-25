@@ -24,6 +24,9 @@ pub struct Plan {
     pub nodes: Vec<DeployedNode>,
     /// The `K` ledger shards, each with its leader as last read.
     pub shards: Vec<Placed>,
+    /// The idle agents: called only by the readers' share.
+    #[serde(default)]
+    pub idle: Vec<Placed>,
     /// The stand-in identity agent, if the run has one.
     pub identity: Option<Placed>,
     pub model: Model,
@@ -40,18 +43,26 @@ pub struct Plan {
     /// replicate its agent, which answers `Elsewhere` at once, before any
     /// signature check. The driver does all its work (the plan, the
     /// signatures, the connections, the answers), the nodes almost none:
-    /// its own cost at its rate, apart from theirs. It needs more nodes
-    /// than an agent's replicas; an agent on every node (the identity
-    /// agent) is called as usual.
+    /// its own cost at its rate, apart from theirs. It needs a node
+    /// outside every called agent's replicas, and writes no identity rows
+    /// (that agent is on every node).
     #[serde(default)]
     pub probe: bool,
+    /// The most connections the driver keeps to each node: within the
+    /// node's `ingress_connections`, its drivers' together.
+    #[serde(default = "connections")]
+    pub connections: usize,
+}
+
+fn connections() -> usize {
+    crate::engine::MAX_CONNECTIONS
 }
 
 impl Plan {
     /// How long past the load a driver waits for its last answers: past a
     /// window and its close when reads at a cut wait for one.
     pub fn drain_ms(&self) -> u64 {
-        if self.model.shares.cut > 0.0 {
+        if self.model.shares.cut > 0.0 || self.model.readers > 0.0 {
             self.window.1 + self.window.2 + 90_000
         } else {
             30_000
@@ -108,7 +119,22 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
         return Err("no driver host in the inventory".into());
     }
     load.model.validate(agents.agents.len())?;
+    let connections = inventory.harness.driver_connections;
+    let ingress = inventory
+        .node
+        .get("ingress_connections")
+        .and_then(toml::Value::as_integer)
+        .map_or(1_024, |value| value.max(0) as usize);
+    if connections * drivers.len() > ingress {
+        return Err(format!(
+            "{} drivers keep {connections} connections a node each, past the nodes' ingress_connections ({ingress}): raise [node] ingress_connections, or lower [harness] driver_connections",
+            drivers.len()
+        ));
+    }
     leaders(inventory, &deployed, &mut agents.agents);
+    if load.model.readers > 0.0 {
+        leaders(inventory, &deployed, &mut agents.idle);
+    }
     if let Some(identity) = &mut agents.identity {
         leaders(inventory, &deployed, std::slice::from_mut(identity));
     }
@@ -123,6 +149,11 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
         let plan = Plan {
             nodes: deployed.nodes.clone(),
             shards: agents.agents.clone(),
+            idle: if load.model.readers > 0.0 {
+                agents.idle.clone()
+            } else {
+                Vec::new()
+            },
             identity: agents.identity.clone(),
             model: load.model.clone(),
             secs: load.secs,
@@ -131,6 +162,7 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
             drivers: drivers.len() as u64,
             window,
             probe: false,
+            connections,
         };
         drain_s = plan.drain_ms().div_ceil(1_000);
         let local = run.file(&format!("drive-{}.json", host.name));

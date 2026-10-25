@@ -146,6 +146,10 @@ struct LoadArgs {
     /// one.
     #[arg(long, default_value_t = 10.0)]
     identity_hz: f64,
+    /// The share of all agents, shards and idle, each reading once at a
+    /// cut every window (T4's is 1%).
+    #[arg(long, default_value_t = 0.0)]
+    readers: f64,
     /// How long the load runs.
     #[arg(long)]
     secs: u64,
@@ -171,6 +175,7 @@ impl LoadArgs {
                 .unwrap_or_else(|| load::Model::random_cross(shards)),
             zipf: self.zipf,
             identity_hz: self.identity_hz,
+            readers: self.readers,
             seed: self.seed,
         };
         model.validate(shards)?;

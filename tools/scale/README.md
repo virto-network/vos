@@ -44,7 +44,7 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
 - **Calls** arrive open loop, as a Poisson process, and each one's latency
   is timed from its scheduled send.
 - **The mix** (`--mix`, `transfer=0.8,query=0.15,workflow=0.045,cut=0.005`
-  by default): transfers, a share `x` of them to a payee in another shard
+  by default, the harness's own shares pending the owner's): transfers, a share `x` of them to a payee in another shard
   (`--cross`; random payees' `1 − 1/K` by default), sent to the shard's
   leader; queries on a follower; workflows, read until they end; and reads
   at a cut, read again once their window closes (`B_w + D`) and timed from
@@ -52,19 +52,39 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
 - **The identity agent** (`run --identity`, or `agents --identity-rows`)
   holds a row a user, replicated on every node; the first driver writes
   it `--identity-hz` times a second (10).
+- **The readers** (`--readers`, 0 by default; T4's is 1%): a share of all
+  the agents, the shards and the idle ones, each read once at a cut every
+  window, at a uniform time within it (`reader`, and `reader_read` timed
+  from the close).
 - **The drivers** split the users and the rate. Each signs its calls ahead
-  of their schedule, keeps at most 512 connections a node, sends each call
-  once (no retry, no redirect followed), and writes a line a kind every
-  interval: sent, answered, refusals by name, rate and p50, p99, p99.9.
-  A user's calls go one at a time, in order: a call scheduled while the
-  user's last is unanswered waits for it (`queued`). The total adds the
-  mix as sent against its target and the CPU the driver used.
+  of their schedule, keeps at most `[harness] driver_connections` (512)
+  connections a node, and sends each call once (no retry, no redirect
+  followed). All the drivers' connections together must fit in the nodes'
+  `[node] ingress_connections` (1,024 by default), or `drive` refuses. A
+  call goes to its agent's leader as last learned, a query to a follower;
+  a node that does not answer, or answers `Unavailable` or names no
+  leader, is left out for 2 s and the leader's place moves to the next
+  replica. Each operation is timed from its schedule (or from its send,
+  if that came first: never from a later instant). A user's calls go one
+  at a time, in order: a call scheduled while the user's last is
+  unanswered waits for it (`queued`). A read at a cut is read again from
+  its window's close, after a jitter of up to 0.5 s, every 0.5 s.
+- **The record**, every interval: a line a kind (sent, answered, refusals
+  by name, rate, p50, p99, p99.9, sends late, signatures the sending thread
+  made), and a line for the mix with the driver's CPU in the interval, the
+  requests that waited for a connection and the most in use. The totals
+  add the load's span (its first and last sends, the report's window), the
+  mix as sent against its target, the CPU over the load, and each shard's
+  distinct users and sessions opened. The report warns when the
+  connections bound or the driver fell behind. A machine may run several
+  drivers, each its own entry, directory and cores.
 - **The capacity probe:** a plan with `"probe": true`, given to
   `vos-scale drive-local --plan` by hand, sends every request to a node
   that does not replicate its agent, which answers `Elsewhere` at once.
   The driver does all its own work and the nodes almost none: its cost at
-  a rate the nodes could not commit. Its total line's `load_cores` and
-  `threads_cpu_s` give the CPU it took.
+  a rate the nodes could not commit. It refuses to run when an agent is on
+  every node, and writes no identity rows. Its total line's `load_cores`
+  and `threads_cpu_s` give the CPU it took.
 - **Not modeled**, as every report says: the per-call identity read,
   credentialed calls, cross-space traffic and proving.
 

@@ -18,6 +18,9 @@ use crate::histogram::quantile;
 use crate::runs::Run;
 use crate::sample::Sample;
 
+/// Where the mix's defaults come from, stated in every report.
+pub const MIX_DEFAULTS: &str = "the mix's defaults (transfers 80%, queries 15%, workflows 4.5%, reads at a cut 0.5%) are the harness's own, pending the owner's";
+
 /// What the runs do not model, stated in every report.
 pub const NOT_MODELED: &str = "not modeled: the per-call identity read, credentialed calls (measured at 7.11), cross-space traffic, proving";
 
@@ -46,6 +49,10 @@ pub struct HostSummary {
     pub rss_mib: f64,
     pub rss_max_mib: f64,
     pub wakes_per_s: f64,
+    /// Its threads' preemptions a second: the host's other work taking
+    /// their cores.
+    #[serde(default)]
+    pub preempted_per_s: f64,
     /// The busiest threads, those of one name together: name and share
     /// of one core.
     pub threads: Vec<(String, f64)>,
@@ -68,7 +75,8 @@ pub struct NodeSummary {
     pub leading: u64,
     pub elections: u64,
     /// Stage quantiles over the window, in microseconds: `commit`, `late`,
-    /// `batch`, `queued`.
+    /// `batch`, `queued`, and the waits for an executor (`refine_queue`,
+    /// `dry_run_queue`, `root_build_queue`) with the root builds' runs.
     pub stages: BTreeMap<String, (u64, u64, u64)>,
     pub halted: bool,
     pub poll_errors: u64,
@@ -97,6 +105,14 @@ pub struct DriverSummary {
     /// The mix as sent against its target: the worst share's distance.
     pub mix_error: f64,
     pub mix: serde_json::Value,
+    /// Requests that waited for a connection, the most in use at once on
+    /// one node, and the cap a node.
+    pub conn_waits: u64,
+    pub in_use_max: u64,
+    pub connections: u64,
+    /// Each shard's distinct users and the sessions opened at it.
+    pub shard_users: Vec<u64>,
+    pub shard_sessions: Vec<u64>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -203,7 +219,12 @@ pub fn host_summary(facts: &Facts, samples: &[&Sample]) -> HostSummary {
         let mut threads: Vec<(String, f64)> = Vec::new();
         let mut busiest: Option<(String, f64)> = None;
         let mut wakes = 0.0;
+        let mut preempted = 0.0;
         for thread in &end.threads {
+            preempted += match before.get(&thread.tid) {
+                Some(old) => delta(old.involuntary, thread.involuntary),
+                None => thread.involuntary as f64,
+            };
             let (ticks, voluntary) = match before.get(&thread.tid) {
                 Some(old) => (
                     delta(old.utime + old.stime, thread.utime + thread.stime),
@@ -226,6 +247,7 @@ pub fn host_summary(facts: &Facts, samples: &[&Sample]) -> HostSummary {
             delta(begin.utime + begin.stime, end.utime + end.stime) / tck / seconds;
         summary.process_cpu_pct = 100.0 * summary.process_cores / facts.cores_used().max(1) as f64;
         summary.wakes_per_s = wakes / seconds;
+        summary.preempted_per_s = preempted / seconds;
         let mut named: BTreeMap<String, f64> = BTreeMap::new();
         for (name, pct) in threads {
             *named.entry(name).or_default() += pct;
@@ -377,12 +399,37 @@ pub fn report(
         .flat_map(|(_, lines)| lines)
         .filter(|line| line["total"] == false)
         .collect();
-    // By default the drivers' span past its ramp: an interval's line is
-    // written at its end, so the span starts an interval before the first;
-    // the ramp is an interval unless said otherwise, dropped if it would
-    // leave no window.
+    // By default the drivers' load, from the first send to the last, past
+    // its ramp: the drain after it, waiting for the last answers, is left
+    // out. A record without the load's span gives its intervals' span: an
+    // interval's line is written at its end, so the span starts an interval
+    // before the first. The ramp is an interval unless said otherwise,
+    // dropped if it would leave no window.
     let every_ms = every_s(run) * 1_000;
-    let window = window.unwrap_or_else(|| {
+    let ramp_ms = ramp_s.map_or(every_ms, |ramp| ramp * 1_000);
+    let loads: Vec<(u64, u64)> = records
+        .iter()
+        .filter_map(|(_, lines)| {
+            let total = lines
+                .iter()
+                .rfind(|line| line["total"] == true && line["kind"] == "all")?;
+            Some((
+                total["load_from_ms"].as_u64()?,
+                total["load_to_ms"].as_u64()?,
+            ))
+        })
+        .collect();
+    let loaded = match (
+        loads.iter().map(|load| load.0).min(),
+        loads.iter().map(|load| load.1).max(),
+    ) {
+        (Some(from), Some(to)) => {
+            let ramped = from + ramp_ms;
+            Some((if ramped < to { ramped } else { from }, to))
+        }
+        _ => None,
+    };
+    let window = window.or(loaded).unwrap_or_else(|| {
         let times: Vec<u64> = intervals
             .iter()
             .filter_map(|line| line["t_ms"].as_u64())
@@ -390,7 +437,7 @@ pub fn report(
         match (times.iter().min(), times.iter().max()) {
             (Some(first), Some(last)) => {
                 let start = first.saturating_sub(every_ms);
-                let ramped = start + ramp_s.map_or(every_ms, |ramp| ramp * 1_000);
+                let ramped = start + ramp_ms;
                 (if ramped < *last { ramped } else { start }, *last)
             }
             _ => (0, u64::MAX),
@@ -478,7 +525,16 @@ pub fn report(
             ) {
                 node.elections = after.saturating_sub(before);
             }
-            for stage in ["commit", "late", "batch", "queued"] {
+            for stage in [
+                "commit",
+                "late",
+                "batch",
+                "queued",
+                "refine_queue",
+                "dry_run_queue",
+                "root_build_queue",
+                "root_build",
+            ] {
                 if let Some(quantiles) = stage_quantiles(first, last, stage) {
                     node.stages.insert(stage.into(), quantiles);
                 }
@@ -533,6 +589,13 @@ pub fn report(
             driver.mix = total["mix"].clone();
             driver.mix_error = total["mix"]["worst_error"].as_f64().unwrap_or(0.0);
             driver.cores = total["load_cores"].as_f64().unwrap_or(0.0);
+            driver.conn_waits = total["conn_waits"].as_u64().unwrap_or(0);
+            driver.in_use_max = total["in_use_max"].as_u64().unwrap_or(0);
+            driver.connections = total["connections"].as_u64().unwrap_or(0);
+            driver.shard_users =
+                serde_json::from_value(total["shard_users"].clone()).unwrap_or_default();
+            driver.shard_sessions =
+                serde_json::from_value(total["shard_sessions"].clone()).unwrap_or_default();
             driver.ok = total["ok"].as_u64().unwrap_or(0);
             driver.errors = total["errors"].as_u64().unwrap_or(0);
             driver.rate = total["rate"].as_f64().unwrap_or(0.0);
@@ -542,6 +605,12 @@ pub fn report(
             driver.by_error = serde_json::from_value(total["by_error"].clone()).unwrap_or_default();
             driver.late_us = total["late_us"].as_u64().unwrap_or(0);
             let sent = total["sent"].as_u64().unwrap_or(0);
+            if driver.conn_waits as f64 > LATE_SHARE * sent as f64 {
+                summary.warnings.push(format!(
+                    "driver {name}: {} of its {sent} requests waited for a connection, {} at once in use at most of {} a node: the pool bound; raise [harness] driver_connections with [node] ingress_connections",
+                    driver.conn_waits, driver.in_use_max, driver.connections
+                ));
+            }
             driver.late_share =
                 total["late_sends"].as_u64().unwrap_or(0) as f64 / sent.max(1) as f64;
             if driver.late_share > LATE_SHARE {
@@ -651,6 +720,10 @@ pub fn text(summary: &Summary) -> String {
             host.binding_pct,
         );
     }
+    text += "\npreemptions a second (the host's other work taking a thread's core)\n";
+    for host in &summary.hosts {
+        text += &format!("  {}: {:.0}\n", host.name, host.preempted_per_s);
+    }
     text += "\nbusiest threads (% of a core)\n";
     for host in summary.hosts.iter().filter(|host| !host.threads.is_empty()) {
         let threads: Vec<String> = host
@@ -737,6 +810,25 @@ pub fn text(summary: &Summary) -> String {
             model["shares"],
             model["cross"],
             model["zipf"]
+        );
+        text += &format!("  {MIX_DEFAULTS}\n");
+    }
+    for driver in &summary.drivers {
+        if driver.shard_sessions.is_empty() {
+            continue;
+        }
+        let most = |counts: &[u64]| counts.iter().max().copied().unwrap_or(0);
+        text += &format!(
+            "  {}: {} users and {} sessions over {} shards, {} users and {} sessions at the busiest; {} requests waited for a connection, {} in use at most of {} a node\n",
+            driver.name,
+            driver.shard_users.iter().sum::<u64>(),
+            driver.shard_sessions.iter().sum::<u64>(),
+            driver.shard_sessions.len(),
+            most(&driver.shard_users),
+            most(&driver.shard_sessions),
+            driver.conn_waits,
+            driver.in_use_max,
+            driver.connections
         );
     }
     text += "\n";
@@ -890,6 +982,46 @@ mod tests {
         assert!((summary.binding_pct - 90.0).abs() < 1e-6);
         assert_eq!(summary.threads[0].0, "vos runtime");
         assert_eq!(summary.rss_mib, 1024.0);
+    }
+
+    /// The window is the drivers' load past its ramp: the drain's lines,
+    /// written while the last answers come, are left out; a pool that made
+    /// requests wait is warned of.
+    #[test]
+    fn the_window_is_the_load_not_the_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let run = crate::runs::Run {
+            id: "r".into(),
+            dir: dir.path().to_path_buf(),
+        };
+        let driver = Facts {
+            name: "d".into(),
+            role: "driver".into(),
+            ..Facts::default()
+        };
+        std::fs::write(
+            run.file("hosts.json"),
+            serde_json::to_string(&vec![driver]).unwrap(),
+        )
+        .unwrap();
+        let mut lines = String::new();
+        for t in (110_000..=400_000).step_by(10_000) {
+            lines += &format!("{{\"t_ms\":{t},\"total\":false,\"kind\":\"all\",\"sent\":1}}\n");
+        }
+        lines += "{\"t_ms\":400000,\"total\":true,\"kind\":\"all\",\"sent\":1000,\"conn_waits\":50,\"load_from_ms\":100000,\"load_to_ms\":160000}\n";
+        let hosts = run.dir.join("hosts").join("d");
+        std::fs::create_dir_all(&hosts).unwrap();
+        std::fs::write(hosts.join("r.drive.jsonl"), lines).unwrap();
+        let summary = super::report(&run, None, Some(10)).unwrap();
+        assert_eq!(summary.window_ms, (110_000, 160_000));
+        assert!(
+            summary
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("the pool bound")),
+            "{:?}",
+            summary.warnings
+        );
     }
 
     #[test]

@@ -113,6 +113,10 @@ pub struct Harness {
     /// the coordinator, which `check` otherwise refuses.
     #[serde(default)]
     pub smoke: bool,
+    /// The most connections each driver keeps to each node: the drivers'
+    /// together within the nodes' `ingress_connections`.
+    #[serde(default = "driver_connections")]
+    pub driver_connections: usize,
 }
 
 fn runs() -> PathBuf {
@@ -129,6 +133,9 @@ fn max_clock_offset_ms() -> u64 {
 }
 fn every_s() -> u64 {
     10
+}
+fn driver_connections() -> usize {
+    512
 }
 fn max_run_s() -> u64 {
     6 * 3_600
@@ -429,6 +436,21 @@ mod tests {
         );
         let unknown = THREE.replace("weight = 2", "wieght = 2");
         assert!(Inventory::parse(&unknown).is_err());
+    }
+
+    /// Several drivers on one machine: each its own entry, directory and
+    /// units.
+    #[test]
+    fn a_machine_may_run_several_drivers() {
+        let two = format!(
+            "{THREE}\n[[host]]\nname = \"e\"\nssh = \"localhost\"\naddress = \"127.0.0.1\"\nrole = \"driver\"\ndir = \"/tmp/e\"\ncores = \"6-7\"\n"
+        );
+        let inventory = Inventory::parse(&two).unwrap();
+        let drivers = inventory.drivers();
+        assert_eq!(drivers.len(), 2);
+        assert_ne!(drivers[0].unit("drive"), drivers[1].unit("drive"));
+        assert_eq!(drivers[0].machine(), drivers[1].machine());
+        assert_eq!(inventory.harness.driver_connections, 512);
     }
 
     #[test]
