@@ -1,5 +1,5 @@
 //! The masked segment: a run's chips proved masked
-//! (`vos_pvm_proof::masked`, variant (c)) by [`prove_masked`], and verified
+//! (`vos_pvm_proof::masked`, variant (c)) by [`super::prove_masked`], and verified
 //! by the final verifier's `verify_masked` over the chips laid out from the
 //! proof's active-chip mask and log sizes.
 //!
