@@ -40,7 +40,9 @@ use vos_pvm_proof::format::{
 use vos_pvm_proof::kernel::trace_kernel;
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::shape::SegmentShape;
-use vos_pvm_proof::{ProvingError, canonical_profile_for_bounds, program_commitment_of_proof, prove_shaped};
+use vos_pvm_proof::{
+    ProvingError, canonical_profile_for_bounds, program_commitment_of_proof, prove_shaped,
+};
 use vos_tree::{BatchProof, Blake2b, Encode, Leaf, MemStore, keys};
 
 #[cfg(feature = "mimalloc")]
@@ -80,7 +82,9 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 fn read(path: &str) -> Option<String> {
-    std::fs::read_to_string(path).ok().map(|s| s.trim().to_string())
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
 }
 
 fn json_str(value: &str) -> String {
@@ -112,8 +116,15 @@ fn peak_rss_mib() -> f64 {
 /// The process's CPU time so far (user + system, every thread), seconds.
 fn cpu_seconds() -> f64 {
     let stat = read("/proc/self/stat").unwrap_or_default();
-    let fields: Vec<&str> = stat[stat.rfind(')').map_or(0, |at| at + 2)..].split(' ').collect();
-    let ticks = |index: usize| fields.get(index).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
+    let fields: Vec<&str> = stat[stat.rfind(')').map_or(0, |at| at + 2)..]
+        .split(' ')
+        .collect();
+    let ticks = |index: usize| {
+        fields
+            .get(index)
+            .and_then(|v| v.parse::<f64>().ok())
+            .unwrap_or(0.0)
+    };
     (ticks(11) + ticks(12)) / 100.0
 }
 
@@ -174,11 +185,19 @@ fn generate(elf: &Path, dir: &Path) {
         let mut value = [0u8; 32];
         rng.fill(&mut value);
         let key = keys::hashed(&Blake2b, &id);
-        writes.push((key.clone(), Some(Leaf::salted(&Blake2b, &seed, &key, &value))));
+        writes.push((
+            key.clone(),
+            Some(Leaf::salted(&Blake2b, &seed, &key, &value)),
+        ));
     }
     writes.push((
         member.clone(),
-        Some(Leaf::salted(&Blake2b, &seed, &member, &member_value(&secret))),
+        Some(Leaf::salted(
+            &Blake2b,
+            &seed,
+            &member,
+            &member_value(&secret),
+        )),
     ));
     writes.sort_by(|a, b| a.0.cmp(&b.0));
     writes.dedup_by(|a, b| a.0 == b.0);
@@ -237,9 +256,13 @@ impl Run {
             .iter()
             .position(|(method, _)| *method == id)
             .expect("the auth kernel");
-        let trace = trace_kernel(&derived.kernels[position].1, input, GAS).expect("the kernel runs");
+        let trace =
+            trace_kernel(&derived.kernels[position].1, input, GAS).expect("the kernel runs");
         assert!(
-            trace.output.windows(expected.len()).any(|window| window == expected),
+            trace
+                .output
+                .windows(expected.len())
+                .any(|window| window == expected),
             "the kernel's output holds the nullifier"
         );
         Self {
@@ -273,7 +296,11 @@ struct Cell {
 impl Cell {
     fn parse(text: &str) -> Self {
         let parts: Vec<&str> = text.split('/').collect();
-        assert_eq!(parts.len(), 3, "a cell is shape/blowup:queries:pow/proxy: {text}");
+        assert_eq!(
+            parts.len(),
+            3,
+            "a cell is shape/blowup:queries:pow/proxy: {text}"
+        );
         let (floor, lean) = match parts[0] {
             "built" => (false, false),
             "floor" => (true, false),
@@ -311,7 +338,8 @@ impl Cell {
             self.log_blowup,
             self.queries,
             self.pow,
-            self.masked.map_or("plain".into(), |log| format!("masked{log}"))
+            self.masked
+                .map_or("plain".into(), |log| format!("masked{log}"))
         )
     }
 
@@ -360,7 +388,9 @@ fn cell(cell: &Cell, elf: &[u8], input: &[u8], expected: &[u8], reps: usize, out
     if cell.lean {
         mask &= !(1 << chip_idx::BLAKE2B | 1 << chip_idx::BITWISE_AND_BYTE);
     }
-    let chips: Vec<usize> = (0..chip_idx::COUNT).filter(|chip| mask & (1 << chip) != 0).collect();
+    let chips: Vec<usize> = (0..chip_idx::COUNT)
+        .filter(|chip| mask & (1 << chip) != 0)
+        .collect();
     let mut fixed: Vec<usize> = Vec::new();
     let sizes = |fixed: &[usize]| -> Vec<u32> {
         chips
@@ -382,9 +412,11 @@ fn cell(cell: &Cell, elf: &[u8], input: &[u8], expected: &[u8], reps: usize, out
             };
             match prove_shaped(&mut run.whole(), &shape, format) {
                 Ok(_) => break,
-                Err(ProvingError::Shape { chip, log_size, pinned }) if log_size < pinned => {
-                    fixed.push(chip)
-                }
+                Err(ProvingError::Shape {
+                    chip,
+                    log_size,
+                    pinned,
+                }) if log_size < pinned => fixed.push(chip),
                 Err(error) => panic!("the proxy's shape: {error:?}"),
             }
         }
@@ -405,7 +437,12 @@ fn cell(cell: &Cell, elf: &[u8], input: &[u8], expected: &[u8], reps: usize, out
         let made = prove_shaped(&mut segment, &shape, format).expect("the segment proves");
         times.push(started.elapsed().as_secs_f64());
         cpu.push(cpu_seconds() - cpu_started);
-        eprintln!("  {} rep {}/{reps}: {:.3} s", cell.name(), rep + 1, times[rep]);
+        eprintln!(
+            "  {} rep {}/{reps}: {:.3} s",
+            cell.name(),
+            rep + 1,
+            times[rep]
+        );
         proof = Some(made);
     }
     let rss = peak_rss_mib();
@@ -434,7 +471,9 @@ fn cell(cell: &Cell, elf: &[u8], input: &[u8], expected: &[u8], reps: usize, out
     let matches = REFERENCES
         .split(',')
         .find_map(|entry| entry.strip_prefix(&format!("{}=", cell.name())))
-        .map_or("null".to_string(), |expected| (expected == digest).to_string());
+        .map_or("null".to_string(), |expected| {
+            (expected == digest).to_string()
+        });
     #[cfg(not(feature = "seeded-masks"))]
     let matches = "null".to_string();
     // Every committed column (preprocessed, main, interaction) and its rows;
@@ -456,7 +495,11 @@ fn cell(cell: &Cell, elf: &[u8], input: &[u8], expected: &[u8], reps: usize, out
     }
     let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "auto".into());
     let list = |values: &[f64], digits: usize| {
-        values.iter().map(|v| format!("{v:.digits$}")).collect::<Vec<_>>().join(",")
+        values
+            .iter()
+            .map(|v| format!("{v:.digits$}"))
+            .collect::<Vec<_>>()
+            .join(",")
     };
     println!(
         "{{\"kind\":\"cell\",\"cell\":\"{}\",\"steps\":{steps},\"threads\":{},\"pool\":{},\"mask\":\"{mask:#010x}\",\
@@ -519,12 +562,21 @@ fn device() -> String {
         .filter_map(|line| line.split(':').nth(1).map(|v| json_str(v.trim())))
         .collect();
     let freqs: Vec<String> = (0..64)
-        .filter_map(|cpu| read(&format!("/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq")))
+        .filter_map(|cpu| {
+            read(&format!(
+                "/sys/devices/system/cpu/cpu{cpu}/cpufreq/cpuinfo_max_freq"
+            ))
+        })
         .collect();
     let mem_total = read("/proc/meminfo")
-        .and_then(|m| m.lines().next().and_then(|l| l.split_whitespace().nth(1).map(str::to_string)))
+        .and_then(|m| {
+            m.lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1).map(str::to_string))
+        })
         .unwrap_or_default();
-    let battery = |name: &str| read(&format!("/sys/class/power_supply/battery/{name}")).unwrap_or_default();
+    let battery =
+        |name: &str| read(&format!("/sys/class/power_supply/battery/{name}")).unwrap_or_default();
     format!(
         "{{\"kind\":\"device\",\"arch\":{},\"cpus\":{},\"cpu_parts\":[{}],\"cpu_max_khz\":[{}],\
          \"mem_total_kib\":{},\"battery_temp_decic\":{},\"battery_capacity\":{},\"kernel\":{}}}",
@@ -633,10 +685,20 @@ fn run(args: &[String]) {
             std::thread::sleep(std::time::Duration::from_secs(options.pause));
         }
         let parsed = Cell::parse(name);
-        eprintln!("cell {name}: threads {}, {} reps", options.threads, options.reps);
+        eprintln!(
+            "cell {name}: threads {}, {} reps",
+            options.threads, options.reps
+        );
         if options.inline {
             let (elf, input, expected) = statement(&options);
-            cell(&parsed, &elf, &input, &expected, options.reps, options.out.as_deref().map(Path::new));
+            cell(
+                &parsed,
+                &elf,
+                &input,
+                &expected,
+                options.reps,
+                options.out.as_deref().map(Path::new),
+            );
             continue;
         }
         let mut command = match &launcher {
@@ -648,7 +710,11 @@ fn run(args: &[String]) {
             None => Command::new(&exe),
         };
         command.args(["--child", name, &options.reps.to_string()]);
-        for (flag, value) in [("--elf", &options.elf), ("--input", &options.input), ("--out", &options.out)] {
+        for (flag, value) in [
+            ("--elf", &options.elf),
+            ("--input", &options.input),
+            ("--out", &options.out),
+        ] {
             if let Some(value) = value {
                 command.args([flag, value]);
             }
@@ -679,10 +745,20 @@ fn run(args: &[String]) {
 
 fn child(args: &[String]) {
     let name = args.first().unwrap_or_else(|| usage());
-    let reps = args.get(1).and_then(|n| n.parse().ok()).unwrap_or_else(|| usage());
+    let reps = args
+        .get(1)
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| usage());
     let options = options(&args[2..]);
     let (elf, input, expected) = statement(&options);
-    cell(&Cell::parse(name), &elf, &input, &expected, reps, options.out.as_deref().map(Path::new));
+    cell(
+        &Cell::parse(name),
+        &elf,
+        &input,
+        &expected,
+        reps,
+        options.out.as_deref().map(Path::new),
+    );
 }
 
 fn main() {
