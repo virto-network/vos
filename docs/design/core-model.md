@@ -1,7 +1,8 @@
 # VOS core model
 
-Draft 5 (2026-10-08). Drafts 3 and 4 were each reviewed by a second-opinion
-architecture review, and the owner decided the questions they raised.
+Draft 6 (2026-10-24): draft 5 (2026-10-08) in line with what slice 6
+built. Drafts 3 and 4 were each reviewed by a second-opinion architecture
+review, and the owner decided the questions they raised.
 Measurements come from the run 3 spikes in `spikes.md`, cited by name:
 S1–S6, S5b and SJ. Tags:
 
@@ -13,6 +14,23 @@ S1–S6, S5b and SJ. Tags:
 This is the model for a new core built on branch `vos-core` (from master
 `d2378274`). The v2 service layer on master, the saga's agent layer and
 everything specific to JAR are not ported; section 17 lists what is reused.
+
+## Changes from draft 5
+
+What slice 6 built (`slice-6-progress.md`), stated where each part lives:
+- **Attestable methods** read committed fields as `&self`, through a
+  served witness at an anchored window's cut, their read set declared; a
+  run is recorded as an `Attest`, whose witness input is the arguments
+  and the served witness (sections 8, 11).
+- **The store names its layout:** the keyspace layout's number in the
+  system partition, checked at open (section 9).
+- **A stalled writer hands over leadership** past the stall bound
+  (section 9).
+- **The prover is built into each node:** the leader of an agent proves
+  its statements at a window's cut, records the proof, and submits it to
+  the space's venue once the roots are anchored there; the final proof is
+  masked (format 39), and the carrier audit checks what leaves the
+  prover role (section 11).
 
 ## Changes from draft 4
 

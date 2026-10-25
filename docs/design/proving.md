@@ -916,7 +916,13 @@ boundary, binding the run like this:
 - **read-only pages:** a preprocessed permission table per region refuses
   writes;
 - **output:** the io-hash only;
-- **masking:** a floor of 2^11 rows per component.
+- **masking:** a floor of rows per masked component, set by the queries:
+  the randomizer covers twice the rows a column reveals, `4|O| + q(|O| + 1)`
+  for `|O|` offsets a column, rounded to a power of two `h`, and a component
+  has at least `4h` rows. At blowup 2 with 86–87 queries that is 2^12 rows
+  (`h` = 1,024), at blowup 4 with 43 queries 2^11, at blowup 8 with 29
+  2^10 [model, `research/slice-7/device-params.md`]; a component with no
+  next-row read (`|O| = 1`) needs half, so `h` is set per component.
 
 Its levers:
 1. no boundary, −58% [measured proxy];
@@ -936,10 +942,12 @@ signature [decided, after PRF]:
 Each signature statement is then about 8–10M cells [model]. They are not
 post-quantum.
 
-**A real phone, early:** a one-day run of the auth statement, as built
-and without the boundary, on a real flagship, to replace the projected
-ARM factor with a measurement. Planned in slice 5's foundation (5.6) and
-not done there: it waits on the owner's team, carried to slice 7.
+**A real phone:** the auth statement, as built and without the boundary,
+ran on the owner's Fairphone 6 (2026-10-25, slice 5's kit, unmasked): as
+built 6.2–6.5 s on 4 threads, the floor 2.6–3.0 s, 2.2 s on 8; every proof
+byte-identical to x86's; the ARM factor about 3.5× [measured,
+`research/slice-7/phone-fairphone6-s5kit.txt`]. The device profile's
+budgets and its gate are slice 7's (`slice-7-mobile.md`, pin J).
 
 ## 9. Node proving levers, named with their numbers
 
@@ -959,7 +967,7 @@ that narrows the inner proof makes folds cheaper too.
 
 | risk | gate | when |
 |---|---|---|
-| the ARM factor is wrong | the auth statement, as built and without the boundary, on a real flagship | planned in slice 5's M0, not run; pending the owner's team (slice 7) |
+| the ARM factor is wrong | **retired:** the auth statement, as built and without the boundary, on the Fairphone 6, about 3.5× x86 [measured] | slice 7, 7.0 |
 | the Poseidon2 segment channel is too slow to prove | retired: a segment's proving plus its leaf beats the Blake2s route's projection (§3.2) [measured, projected]; Poseidon2-M31 kept by the owner | slice 5, M0 |
 | our permutation is not the reference Poseidon2 | the reference arrangement and Plonky3's parameters adopted, checked on their vectors | slice 5, M0 |
 | the recursion AIR does not converge | sized in `recursion-air.md` (it converges at once [model]); then measured: a fold verifies two folds within the constant shape | slice 5, M1 |
@@ -977,7 +985,7 @@ that narrows the inner proof makes folds cheaper too.
 | a forgery in the recursion AIR | the recursion AIR's forgery gates | slice 6, M2 |
 | a prover's internals leave the role | the carrier audit (A.5) on the model venue and on chain | slice 6, M3 |
 | the credential AIR misses sub-second | masked auth and payment proofs on a real flagship | slice 7 |
-| the signature chips' cost or soundness | a gate ladder per chip; a phone run | slice 7 |
+| the signature chips' cost or soundness | a gate ladder per chip; a phone run | after slice 7 (S1) |
 
 ## 11. Slices and milestones [decided: three slices]
 
@@ -987,9 +995,10 @@ that narrows the inner proof makes folds cheaper too.
 | **5** | **M1 The recursion, unmasked, in tests** | a preparation step (slice 5's 5.8.0: the window kernel on the line, the fixture generator, shared code, the inner parameters recounted); then `recursion-air.md` §10's eight steps: the gate VM; the gate compiler; the in-AIR verifier's pieces; COMPARE's leaf; the window kernel's and the solvency predicate's leaves; the fold and the fixed point; the final wrap with the Blake2b channel and `vos-pvm-final-verifier`; end to end with `vos-statement` and the golden fixtures | 18–26 weeks, plus reviews |
 | **6** | **M2 Masking** | R1–R8 on the final wrap, generic over components and channel for slice 7; format 39; 248-bit salts; leakage and soundness gates; the items carried from slice 5 | 8.5–13 weeks |
 | **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo spaces pallet's design, the verifier kit and the node's client (the pallet is the Kreivo teammate's); the JAM statements service | 18.5–29 weeks |
-| **7** | **M4 Credential AIR** | the Poseidon2 root kind; the zkPVM Poseidon2 chip; the credential AIR with PRF passkeys; a phone gate | 6–10 weeks |
-| **7** | **M5 Device profile** | the device shape; lean kernels; narrow BLAKE2b | 6–10 weeks |
-| **7** | **M6 Signature chips** | SHA-256, SHA-512, the bignum chip, the P-256 and Edwards drivers | 8–14 weeks |
+| **7** | **M3.9 Simplify and scale** | the anchoring protocol simplified (pin D′: one venue core, five outcomes on the node, no migration, no rotation, equivocation terminal); a scale test across the owner's LAN | 11.5–18 weeks |
+| **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call and chip; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 42); its verifier at ingress; PRF passkeys, the device library and an Android demo; phone gates | 12.5–18 weeks |
+| **7** | **M5 Device profile** | the segment chips masked; the boundary-free device shape (format 43); levers 1–4; the CPU split by opcode family, word-level memory if needed; the Poseidon2 chip and the levers in the node's segment format (41), as its leaves allow; the ≤ 1 s phone gate | 22–33.5 weeks, 26–39.5 with word-level memory |
+| **later** | **M6 Signature chips** | SHA-256, SHA-512, the bignum chip, the P-256 and Edwards drivers; moved past slice 7 by the owner (S1) | 8–14 weeks |
 
 - M0 runs on two tracks. Its critical path is 5.1 → 5.2 → 5.4, and
   5.5 → 5.12 (`slice-5-proving.md`); 5.7 runs beside it.
@@ -1001,7 +1010,11 @@ that narrows the inner proof makes folds cheaper too.
   and M3: slice 6 is 32–49 engineer-weeks (`slice-6-on-chain.md`,
   "Estimates").
 - The Clerk across spaces follows slice 6.
-- The total is about 76–118 engineer-weeks.
+- Slice 7 is about 52–77 engineer-weeks, up to 83 with word-level memory,
+  with its acceptance and the slice-6 items it carries
+  (`slice-7-mobile.md`, "Estimates"). Its 12–20 weeks for M4 and M5 here
+  before left out M3.9, the re-pins, the ingress verifier, the demo,
+  masking the segment chips and the CPU split.
 
 ## 12. Decisions
 
@@ -1018,7 +1031,8 @@ that narrows the inner proof makes folds cheaper too.
 6. **Arguments** go through a witness-input precompile.
 7. **The Kreivo pallet** comes after the recursion, with P0 and P1
    together in slice 6.
-8. **Slicing:** three slices, as in §11.
+8. **Slicing:** three slices, as in §11; the signature chips (M6) moved
+   past slice 7 (2026-10-25, slice 7's S1).
 9. **The segment channel:** Poseidon2-M31, on a segment's total cost
    (§3.2).
 10. **The window length** (2026-10-19): windows of Unix time from the

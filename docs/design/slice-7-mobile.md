@@ -1076,16 +1076,17 @@ and S33 on draft 3 (`research/slice-7/owner-decisions.md`), among them
 C1–C11 all taken and C4 fully terminal (S8–S18), the teammate told now
 (S19), the chip and the levers in the node's format too as the leaf count
 allows (S23, S32), a stable PRF handle (S25), the phone sessions (S33).
-S7, S11 and S25 carry the review's amendments (7.8's split, the
-divergence guard, the scope's `SpaceId` and the re-seeding runbook).
+S7, S11 and S25 carry the review's amendments (7.8's split; the
+divergence guard and the deposit released on `Ended`; the scope's
+`SpaceId`, the re-seeding runbook and `member` without an epoch).
 
 **Slice-6 decisions they reverse** (each named in `owner-decisions.md`):
 decision 7 (rotation by S13, resume by S11), decision 8 (S9, S12),
 decision 10 (S12), decision 18 (S11); `proving.md` §7's equivocation,
 migration and "`S_w` over every agent's root" (S11, S9, S17);
 `spaces-pallet.md` §13 questions 2 and 12, calls 5 and 6, vectors G5,
-G14, G15 and G19 (`teammate-note.md`); slice 6's signed `start_window`
-(S10) and re-cuts (S16).
+G14, G15 and G19, and G1 and G18 in part (`teammate-note.md`); slice 6's
+signed `start_window` (S10) and re-cuts (S16).
 
 **Settled by the evidence, the owner's to override:** device formats
 counted on their masked shapes (30 and 37 retired unregistered, 42 and 43
