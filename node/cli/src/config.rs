@@ -37,8 +37,10 @@ impl Settings {
         toml::from_str(&text).map_err(at(path))
     }
 
-    /// Set what the file gives on `config`; an election timeout whose ends
-    /// are out of order, or that a heartbeat does not fit in, is refused.
+    /// Set what the file gives on `config`. Refused: an election timeout
+    /// whose ends are out of order or that a heartbeat does not fit in, and
+    /// a zero for a count of executors, queued requests, batch inputs or
+    /// bytes, or connections.
     pub fn apply(self, config: &mut Config) -> Result<(), String> {
         let set = |value: Option<usize>, field: &mut usize| *field = value.unwrap_or(*field);
         set(self.executors, &mut config.executors);
@@ -65,8 +67,16 @@ impl Settings {
                 config.heartbeat_ms
             ));
         }
-        if config.executors == 0 {
-            return Err("no executors".into());
+        for (name, value) in [
+            ("executors", config.executors),
+            ("queue", config.queue),
+            ("max_inputs", config.max_inputs),
+            ("max_bytes", config.max_bytes),
+            ("ingress_connections", config.ingress_connections),
+        ] {
+            if value == 0 {
+                return Err(format!("{name} of 0: a node takes no work"));
+            }
         }
         Ok(())
     }
@@ -106,6 +116,15 @@ mod tests {
         assert!(applied("executor = 3\n").is_err());
         assert!(applied("election_timeout_ms = [3000, 1000]\n").is_err());
         assert!(applied("heartbeat_ms = 1500\n").is_err());
-        assert!(applied("executors = 0\n").is_err());
+        for zero in [
+            "executors",
+            "queue",
+            "max_inputs",
+            "max_bytes",
+            "ingress_connections",
+        ] {
+            let refused = applied(&format!("{zero} = 0\n")).err();
+            assert!(refused.is_some_and(|error| error.contains(zero)), "{zero}");
+        }
     }
 }

@@ -143,6 +143,9 @@ impl Stats {
             stage("late", &self.late),
         ];
         stages.extend(more);
-        Wire { stages }
+        Wire {
+            stages,
+            groups: Default::default(),
+        }
     }
 }

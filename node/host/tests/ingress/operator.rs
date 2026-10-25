@@ -48,6 +48,20 @@ fn a_token_that_is_not_hex_is_refused_and_frees_its_connection() {
     assert!(matches!(operator.stats(), Ok(Response::Stats(_))));
 }
 
+/// A node's stats count its replica groups: a node of one holds and leads
+/// each of its agents, at a term of one at least.
+#[test]
+fn the_stats_count_the_groups_a_node_holds_and_leads() {
+    let served = Served::plain();
+    let operator = Operator::new(&served.target, &served.token);
+    let Ok(Response::Stats(stats)) = operator.stats() else {
+        panic!("the stats")
+    };
+    assert!(stats.groups.replicas >= 1, "{:?}", stats.groups);
+    assert_eq!(stats.groups.leading, stats.groups.replicas);
+    assert!(stats.groups.terms >= stats.groups.replicas);
+}
+
 /// The operator reads a replica's status, and a stranger cannot. A node
 /// of a space of one whose flush fails outside any log write halts, and
 /// its status says so.

@@ -381,10 +381,18 @@ impl Inner {
         }
     }
 
-    /// How long its stages took since it started: its leaders' batches'
-    /// and its writer's.
+    /// How long its stages took since it started, its leaders' batches'
+    /// and its writer's; and its replica groups now.
     pub(crate) fn stats(&self) -> vos_wire::ingress::Stats {
-        self.stats.wire(self.storage.stages())
+        let mut stats = self.stats.wire(self.storage.stages());
+        let runs: Vec<Arc<Run>> = lock(&self.runs).values().cloned().collect();
+        for run in runs {
+            let state = run.shared.state();
+            stats.groups.replicas += 1;
+            stats.groups.leading += u64::from(state.role == vos_raft::Role::Leader);
+            stats.groups.terms += state.term;
+        }
+        stats
     }
 
     /// Hand `local` to agent `id`'s group, never dropped. False when it has
