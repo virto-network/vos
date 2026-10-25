@@ -11,7 +11,7 @@ use vos_testkit::Testkit;
 use vos_testkit::programs::{representative_package, table_tag};
 use vos_wire::abi::cap::Target;
 use vos_wire::batch::{Body, Input, Message};
-use vos_wire::ids::{AgentId, MethodId, Principal, derive_id};
+use vos_wire::ids::{AgentId, MapId, MethodId, Principal, derive_id};
 use vos_wire::keys::{self, Transform};
 use vos_wire::records::unversioned;
 use vos_wire::served::{
@@ -79,14 +79,16 @@ fn report(from: AgentId, sequence: u64, window: u64, root: [u8; 32]) -> Input {
     })
 }
 
-/// The ask of `agent` at `window`, as the representative's node reads it.
+/// The ask of `agent` at `window`, as the representative's node reads it:
+/// a row of its committed map `asked`.
 fn asked(window: u64, agent: AgentId) -> Vec<u8> {
     let raw = [&window.to_be_bytes()[..], &agent.0.to_be_bytes()].concat();
-    [
-        keys::table_rows(REPRESENTATIVE, ASKED_TAG, Transform::Ordered),
-        Transform::Ordered.apply(&raw),
-    ]
-    .concat()
+    let map = MapId {
+        instance: REPRESENTATIVE,
+        tag: ASKED_TAG,
+        transform: Transform::Ordered,
+    };
+    keys::committed(&map, &Transform::Ordered.apply(&raw))
 }
 
 /// The committed rows of `node`'s state.

@@ -60,8 +60,8 @@ pub const REPRESENTATIVE_ROOTS: &str = "roots";
 /// kernel's prologue hashes nothing for it.
 pub const REPRESENTATIVE_TAG: u32 = 0x4b14_a09e;
 
-/// The name of the representative's table of the agents that reported each
-/// window, so asked for their paths at its close, keyed
+/// The name of the representative's committed map of the agents that
+/// reported each window, so asked for their paths at its close, keyed
 /// `w (8, BE) ‖ agent (4, BE)`, ordered: an agent reports a window a read
 /// waits on, or every window when it reports every one.
 pub const REPRESENTATIVE_ASKED: &str = "asked";
@@ -135,16 +135,46 @@ pub fn representative_row(agent: AgentId, kind: RootKind, window: u64) -> Vec<u8
     keys::committed(&representative_map(), &Transform::Ordered.apply(&raw))
 }
 
+/// The representative's committed map of the agents that reported each
+/// window ([`REPRESENTATIVE_ASKED`]): committed, so its rows at a window's
+/// cut are fixed however late a replica builds the cut.
+pub const fn representative_asks() -> MapId {
+    MapId {
+        instance: REPRESENTATIVE,
+        tag: ASKED_TAG,
+        transform: Transform::Ordered,
+    }
+}
+
 /// The full key of the representative's ask of `agent` at window `window`:
-/// a row of its table [`REPRESENTATIVE_ASKED`], keyed `w (8, BE) ‖ agent
-/// (4, BE)`, ordered, its value empty.
+/// a row of [`representative_asks`], keyed `w (8, BE) ‖ agent (4, BE)`,
+/// ordered, its value empty.
 pub fn representative_ask(window: u64, agent: AgentId) -> Vec<u8> {
     let mut raw = [0u8; 12];
     raw[..8].copy_from_slice(&window.to_be_bytes());
     raw[8..].copy_from_slice(&agent.0.to_be_bytes());
-    let mut key = keys::table_rows(REPRESENTATIVE, ASKED_TAG, Transform::Ordered);
-    key.extend_from_slice(&Transform::Ordered.apply(&raw));
-    key
+    keys::committed(&representative_asks(), &Transform::Ordered.apply(&raw))
+}
+
+/// The prefix of the representative's asks of window `window`: the
+/// window's key escaped, without the terminator the whole key's escape
+/// ends with.
+pub fn representative_asks_of(window: u64) -> Vec<u8> {
+    let mut escaped = Transform::Ordered.apply(&window.to_be_bytes());
+    escaped.truncate(escaped.len() - 2);
+    [keys::committed_rows(&representative_asks()), escaped].concat()
+}
+
+/// The window and agent an ask's full key names; `None` for any other key.
+pub fn representative_ask_entry(key: &[u8]) -> Option<(u64, AgentId)> {
+    let raw = Transform::Ordered
+        .raw(key.strip_prefix(&keys::committed_rows(&representative_asks())[..])?)?;
+    let (window, agent) = raw.split_first_chunk::<8>()?;
+    let agent: [u8; 4] = agent.try_into().ok()?;
+    Some((
+        u64::from_be_bytes(*window),
+        AgentId(u32::from_be_bytes(agent)),
+    ))
 }
 
 /// The space root of window `window` over the representative's root

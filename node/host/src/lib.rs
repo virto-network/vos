@@ -210,6 +210,13 @@ pub trait Hooks: Send + Sync {
         true
     }
 
+    /// Before a replica builds `agent`'s root: false holds every build of
+    /// it, as a builder slow to run would, until the hook says otherwise.
+    fn build(&self, agent: AgentId) -> bool {
+        let _ = agent;
+        true
+    }
+
     /// Before the representative's leader, its cut of `window` built,
     /// proposes the window's close: false stops the leader there, as a
     /// crash would.

@@ -21,7 +21,7 @@ use vos_wire::keys::{self, Transform};
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::{PendingRead, Workflow, WorkflowState, unstored, unversioned};
 use vos_wire::result::{Attest, InputRef, Outcome, Step, WorkResult};
-use vos_wire::served::{ASKED_TAG, REPRESENTATIVE, representative_row};
+use vos_wire::served::{representative_asks_of, representative_row};
 use vos_wire::vos_anchor::{MAX_LENGTH_MS, RootKind, RootRead, VenueId};
 use vos_wire::{Decode, Encode, WindowClock};
 
@@ -362,14 +362,9 @@ pub(crate) fn closed_on(node: &Node, representative: AgentId, window: u64) -> bo
 /// Whether `representative`'s replica on `node` holds some agent's report
 /// of `window`.
 pub(crate) fn reported_on(node: &Node, representative: AgentId, window: u64) -> bool {
-    let table = keys::table_rows(REPRESENTATIVE, ASKED_TAG, Transform::Ordered);
-    // The window's reports: its key escaped, without the terminator the
-    // whole key's escape ends with, is a prefix of each.
-    let mut escaped = Transform::Ordered.apply(&window.to_be_bytes());
-    escaped.truncate(escaped.len() - 2);
     node.store()
         .snapshot()
-        .scan(representative, &[&table[..], &escaped].concat(), None)
+        .scan(representative, &representative_asks_of(window), None)
         .next()
         .is_some()
 }

@@ -29,7 +29,7 @@ use vos_wire::{Encode, WindowClock};
 use crate::common::{Cluster, wait_until};
 use crate::support::{
     Anchoring, READER, ask_in, ask_keys, attests, clock, delay, ended, holds, later, logged,
-    reader_agent, rep_root, replica, write,
+    reader_agent, rep_root, replica, reported_on, write,
 };
 use crate::support::{close_with, past_close};
 /// The space's root of `window` over the representative's `rep_root`.
@@ -503,4 +503,87 @@ fn only_a_reported_window_is_anchored() {
         .map(|anchor| anchor.window)
         .collect();
     assert_eq!(windows, [2, 3]);
+}
+
+/// Holds every build of the agent a test names, on every node.
+#[derive(Default)]
+struct HeldBuilds(Mutex<Option<AgentId>>);
+
+impl Hooks for HeldBuilds {
+    fn build(&self, agent: AgentId) -> bool {
+        *self.0.lock().unwrap() != Some(agent)
+    }
+}
+
+/// A representative's cut built late closes the window it holds. Its
+/// builds held on every replica past its cut of window 0, the agent that
+/// reported window 0 reports window 3, which drops its ask of window 0 from
+/// the representative's state. Built then, the cut still finds the ask, as
+/// it stood at the cut: every replica writes the same anchor row of window
+/// 0, over the agent's row, and `S_0` is anchored.
+#[test]
+fn a_late_build_closes_the_asks_its_cut_holds() {
+    let clock = clock();
+    let anchoring = Anchoring::new();
+    let held = Arc::new(HeldBuilds::default());
+    let hooks: Arc<dyn Hooks> = held.clone();
+    let tuning = anchoring.tuning();
+    let cluster = Cluster::in_space(3, Some(clock), move |number, config| {
+        tuning(number, config);
+        config.hooks = Arc::clone(&hooks);
+    });
+    anchoring.register(&cluster);
+    let representative = cluster.representative(&[1, 2, 3]);
+    let agent = reader_agent(&cluster, &[1, 2, 3]);
+    write(&cluster, agent, 1..=20);
+    ask_keys(&cluster, agent, 21);
+    anchoring.set_clocks(&cluster, clock.boundary(0).unwrap() + 1_000);
+    let replicas = || {
+        cluster
+            .running()
+            .filter(|(_, node)| node.applied(representative).is_some())
+    };
+    wait_until("every replica holds the agent's root at window 0", || {
+        replicas().all(|(_, node)| holds(node, representative, agent, 0))
+    });
+    *held.0.lock().unwrap() = Some(representative);
+    anchoring.set_clocks(&cluster, past_close(&clock, 0));
+    wait_until("every replica records the cut of window 0", || {
+        replicas().all(|(_, node)| {
+            node.store()
+                .snapshot()
+                .get(representative, &keys::cut(0))
+                .unwrap()
+                .is_some()
+        })
+    });
+
+    anchoring.set_clocks(&cluster, clock.boundary(2).unwrap() + 1_000);
+    ask_in(&cluster, agent, later(&cluster, agent), 1, 3);
+    anchoring.set_clocks(&cluster, clock.boundary(3).unwrap() + 1_000);
+    wait_until(
+        "the agent's report of window 3 drops its ask of window 0",
+        || {
+            replicas().all(|(_, node)| {
+                holds(node, representative, agent, 3) && !reported_on(node, representative, 0)
+            })
+        },
+    );
+    for (_, node) in replicas() {
+        let snapshot = node.store().snapshot();
+        assert_eq!(roots::cut_root(&snapshot, representative, 0).unwrap(), None);
+    }
+
+    *held.0.lock().unwrap() = None;
+    let rep_root = rep_root(&cluster, representative, 0);
+    let root = stated(&cluster, 0, &rep_root);
+    for (_, node) in replicas() {
+        let anchors = roots::anchors(&node.store().snapshot(), representative, None).unwrap();
+        assert_eq!(
+            anchors.get(&0),
+            Some(&root.root),
+            "the anchor row of window 0"
+        );
+    }
+    wait_until("S_0 anchored", || anchoring.venue.anchored(&root));
 }

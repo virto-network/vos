@@ -38,10 +38,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use vos_tree::{BatchProof, Hash, NodeStore};
 use vos_wire::ids::{AgentId, RequestId};
-use vos_wire::keys::{self, Transform};
+use vos_wire::keys;
 use vos_wire::records::{PendingRead, unstored};
 use vos_wire::result::Write;
-use vos_wire::served::{ASKED_TAG, Closing, REPRESENTATIVE, representative_row};
+use vos_wire::served::{
+    Closing, representative_ask_entry, representative_asks_of, representative_row,
+};
 use vos_wire::vos_anchor::{MAX_ROOT_AGE_MS, RootKind, space_root};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, scale};
 
@@ -333,7 +335,7 @@ impl Finish {
             }
         }
         if let Some((space, clock)) = representative {
-            let closing = closing(at, agent, cut.window, tree, root)?;
+            let closing = closing(at, agent, cut, tree, root)?;
             // A window no agent's row reaches closes nothing, and is not
             // anchored.
             if !closing.paths.is_empty() {
@@ -378,31 +380,38 @@ pub fn requests_at(
     Ok(requests)
 }
 
-/// The representative's close of window `window`: its root at its cut,
-/// `root`, and the path of each agent that reported the window whose row
-/// its tree at the cut holds, in agent order. A report whose row the cut
-/// lacks, applied after the close, gets none: the agent's reads end
-/// `NotClosed`.
+/// The representative's close of `cut`: its root there, `root`, and the
+/// path of each agent that reported the window whose row its tree at the
+/// cut holds, in agent order. The reports are those the cut holds: the
+/// asks of the window whose rows stood at the cut, read off `at` and its
+/// undo rows, so a replica that builds the cut late finds the same. A
+/// report whose row the cut lacks, applied after the close, gets none: the
+/// agent's reads end `NotClosed`.
 fn closing(
     at: &Snapshot,
     agent: AgentId,
-    window: u64,
+    cut: Cut,
     tree: &AgentStore<'_>,
     root: Hash,
 ) -> Result<Closing, Error> {
-    let prefix = keys::table_rows(REPRESENTATIVE, ASKED_TAG, Transform::Ordered);
-    // The window's asks: its key escaped, without the terminator the whole
-    // key's escape ends with, is a prefix of each.
-    let mut escaped = Transform::Ordered.apply(&window.to_be_bytes());
-    escaped.truncate(escaped.len() - 2);
-    let mut paths = Vec::new();
-    for row in at.scan(agent, &[&prefix[..], &escaped].concat(), None) {
+    let prefix = representative_asks_of(cut.window);
+    let mut asks = BTreeSet::new();
+    for row in at.scan(agent, &prefix, None) {
+        asks.insert(row?.0);
+    }
+    let undone = keys::undo(cut.window, &prefix);
+    for row in at.scan(agent, &undone, None) {
         let (key, _) = row?;
-        let raw = Transform::Ordered.raw(&key[prefix.len()..]);
-        let Some((asked, of)) = raw.as_deref().and_then(asked_entry) else {
+        if let Some((_, row)) = keys::undo_entry(&key) {
+            asks.insert(row.to_vec());
+        }
+    }
+    let mut paths = Vec::new();
+    for ask in asks {
+        let Some((window, of)) = representative_ask_entry(&ask) else {
             continue;
         };
-        if asked != window {
+        if window != cut.window || at_cut(at, agent, cut, &ask)?.is_none() {
             continue;
         }
         let row = representative_row(of, RootKind::Space, window);
@@ -413,16 +422,6 @@ fn closing(
         paths.push((of, leaf.salt, path));
     }
     Ok(Closing { root, paths })
-}
-
-/// The window and agent an ask's raw key names: `w (8, BE) ‖ agent (4, BE)`.
-fn asked_entry(raw: &[u8]) -> Option<(u64, AgentId)> {
-    let (window, agent) = raw.split_first_chunk::<8>()?;
-    let agent: [u8; 4] = agent.try_into().ok()?;
-    Some((
-        u64::from_be_bytes(*window),
-        AgentId(u32::from_be_bytes(agent)),
-    ))
 }
 
 /// The space's roots the representative's closes made ([`keys::anchor`]),
