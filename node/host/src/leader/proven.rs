@@ -1,7 +1,9 @@
 //! Statements this node's prover proved, recorded in their agent: the
 //! leader proposes `Input::Proven` for each the worker handed over that
-//! the agent does not hold recorded, from its replica's state, never
-//! queued. Refine keeps the first proof of an id alone.
+//! the agent does not hold recorded, once this node holds its proof (one a
+//! replica sent is fetched from it), from its replica's state, never
+//! queued.
+//! Refine keeps the first proof of an id alone.
 
 use vos_wire::batch::Input;
 use vos_wire::keys;
@@ -31,6 +33,12 @@ impl Leader {
                 .is_some()
             {
                 self.inner.unrecorded.recorded(self.id, &id);
+                continue;
+            }
+            // Recorded only once this node holds the proof too: the record
+            // then keeps no witness, so a proof held by its prover alone
+            // could be lost for good.
+            if !self.inner.blobs.contains(&proof).unwrap_or(false) {
                 continue;
             }
             if due.len() < PROVEN {

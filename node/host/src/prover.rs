@@ -77,8 +77,8 @@ impl Unrecorded {
 
 impl Inner {
     /// A replica of `agent` on node `from` proved its statement `id`, no
-    /// longer leading it: recorded through this replica's leader, if it
-    /// leads.
+    /// longer leading it: its proof fetched, and recorded through this
+    /// replica's leader once here, if it leads.
     pub(crate) fn on_proved(
         &self,
         from: NodeNumber,
@@ -93,6 +93,9 @@ impl Inner {
         if let Some(run) = self.run(agent) {
             self.unrecorded
                 .add(agent, StatementId(id), (window, proof, attested));
+            if !self.blobs.contains(&proof).unwrap_or(false) {
+                self.fetch(agent, &proof);
+            }
             run.agent.wake();
         }
     }
@@ -255,6 +258,13 @@ impl Host for NodeHost {
         if let Err(error) = batch.commit(PersistMode::SyncAll) {
             tracing::warn!("a proof's pin was not written: {error:?}");
         }
+    }
+
+    fn held(&self) -> Vec<[u8; 32]> {
+        self.0.blobs.held_by_node().unwrap_or_else(|error| {
+            tracing::warn!("the node's pins were not read: {error:?}");
+            Vec::new()
+        })
     }
 
     fn proof(&self, agent: AgentId, hash: &[u8; 32]) -> Option<Vec<u8>> {

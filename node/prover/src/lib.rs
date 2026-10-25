@@ -16,9 +16,10 @@
 //! `queued | proving | proved(proof) | submitted | accepted |
 //! refused(code) | dead` ([`State`]). A job is keyed by its statement's
 //! id, so a record read twice makes one job. Each unfinished job's kernel
-//! is held in the node's blob store; one never fetched is refused after
-//! [`Options::patience`]. An unfinished job whose roots aged is dead, and
-//! the jobs of an agent the node no longer replicates go.
+//! is held in the node's blob store; a record whose kernel is not here
+//! waits for it, asked of the replicas and alerted, or ages out. An
+//! unfinished job whose roots aged is dead, and the finished jobs of an
+//! agent the node does not replicate go.
 
 //! **For each attest at a window's cut** its agent records: the statement
 //! it makes ([`Statement`](vos_venue::vos_statement::Statement):
@@ -63,7 +64,10 @@ pub mod masked;
 pub mod program;
 
 pub use internals::{Internals, NodeProof};
-pub use job::{Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, State, deadline};
+pub use job::{
+    Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, REFUSED_ROOTLESS,
+    REFUSED_UNWITNESSED, State, deadline,
+};
 pub use worker::{
     Backlog, FORMAT, Host, Jobs, Options, ProveError, Prover, Record, Stepped, Worker, statement,
 };

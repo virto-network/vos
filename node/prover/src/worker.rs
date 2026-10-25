@@ -18,7 +18,8 @@ use vos_wire::{SpaceId, WindowClock};
 use vos_wire::defaults::READ_WINDOWS;
 
 use crate::job::{
-    Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, State, deadline,
+    Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, REFUSED_ROOTLESS,
+    REFUSED_UNWITNESSED, State, deadline,
 };
 
 /// The longest wait before a statement not accepted goes again: the
@@ -53,6 +54,9 @@ pub trait Host {
     /// statement's proof from its proof until its job finishes, and each
     /// unfinished job's kernel.
     fn hold(&self, hash: &[u8; 32], held: bool);
+    /// The blobs this node holds whatever their age, as [`Host::hold`]
+    /// holds them.
+    fn held(&self) -> Vec<[u8; 32]>;
     /// The proof `hash`, if this node holds it; when not, `agent`'s other
     /// replicas are asked for it.
     fn proof(&self, agent: AgentId, hash: &[u8; 32]) -> Option<Vec<u8>>;
@@ -198,23 +202,19 @@ pub struct Worker<H, J> {
     prover: Arc<dyn Prover>,
     venue: Arc<dyn VenueClient>,
     options: Options,
-    /// Each kernel's program id, by its blob's hash.
+    /// Each kernel's program id, by its blob's hash, once computed.
     programs: HashMap<ProgramHash, ProgramId>,
-    /// When each kernel this node lacked was first asked for.
-    missing: HashMap<ProgramHash, Instant>,
+    /// The kernels asked of the replicas, not here when a record named
+    /// them: alerted once each.
+    fetching: HashSet<ProgramHash>,
     /// The kernels held for the unfinished jobs.
     kernels: BTreeSet<ProgramHash>,
-    /// Each agent's records read into jobs, by window and digest, from the
-    /// earliest window a new record may still come of.
-    read: HashMap<AgentId, BTreeSet<(u64, [u8; 32])>>,
-    /// Each agent's earliest window of a record whose kernel was not here
-    /// when last read.
-    unread: HashMap<AgentId, u64>,
-    /// When each proof another replica made was first asked for.
-    asked: HashMap<StatementId, Instant>,
-    /// The statements whose proof another replica made never arrived:
-    /// proved here.
-    unfetched: HashSet<StatementId>,
+    /// Each agent's earliest window a record not yet read into a job may
+    /// be of: the window of the reads still served, or of a record whose
+    /// kernel was not here.
+    from: HashMap<AgentId, u64>,
+    /// The proofs another replica made, asked for or never arrived.
+    fetches: HashMap<StatementId, Fetch>,
     /// When each submission whose answer was lost, or that was refused for
     /// now, goes again, and the wait after that.
     retries: HashMap<StatementId, (Instant, Duration)>,
@@ -222,10 +222,21 @@ pub struct Worker<H, J> {
     longest: Duration,
 }
 
+/// A proof another replica made, as this node fetches it.
+#[derive(Clone, Copy)]
+enum Fetch {
+    /// Asked for since then.
+    Asked(Instant),
+    /// Never arrived: proved here.
+    Lost,
+}
+
 impl<H: Host, J: Jobs> Worker<H, J> {
     /// A worker over `jobs`: a job a stopped worker was proving goes back
     /// to the queue, to be proved again, the attempt not counted when the
-    /// node was stopping then.
+    /// node was stopping then. Of the blobs the node holds, those no job
+    /// wants any more (a crash between a job's end and the next step) are
+    /// held no longer.
     pub fn open(
         host: H,
         jobs: J,
@@ -234,7 +245,14 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         options: Options,
     ) -> Result<Self, String> {
         let stopping = jobs.stopping()?;
+        let mut wanted = HashSet::new();
         for (id, job) in jobs.all()? {
+            if let Some(proof) = job.state.proof() {
+                wanted.insert(proof);
+            }
+            if let Some(attest) = job.attest.as_ref().filter(|_| !job.state.finished()) {
+                wanted.insert(attest.program.0);
+            }
             match job.state {
                 State::Proving => {
                     let attempts = job.attempts.saturating_sub(u32::from(stopping));
@@ -253,6 +271,11 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 _ => {}
             }
         }
+        for held in host.held() {
+            if !wanted.contains(&held) {
+                host.hold(&held, false);
+            }
+        }
         jobs.set_stopping(false)?;
         Ok(Self {
             host,
@@ -261,12 +284,10 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             venue,
             options,
             programs: HashMap::new(),
-            missing: HashMap::new(),
+            fetching: HashSet::new(),
             kernels: BTreeSet::new(),
-            read: HashMap::new(),
-            unread: HashMap::new(),
-            asked: HashMap::new(),
-            unfetched: HashSet::new(),
+            from: HashMap::new(),
+            fetches: HashMap::new(),
             retries: HashMap::new(),
             longest: Duration::ZERO,
         })
@@ -332,7 +353,8 @@ impl<H: Host, J: Jobs> Worker<H, J> {
 
     /// Age out the jobs whose roots no venue anchors any more: a finished
     /// one removed, an unfinished one dead, its proof held no longer; and
-    /// remove the jobs of agents this node no longer replicates.
+    /// remove the finished jobs of agents this node does not replicate now
+    /// (an unfinished one, of an agent absent for a while only, ages out).
     pub fn prune(&mut self) -> Result<usize, String> {
         let now = self.venue.time();
         let clock = self.host.clock();
@@ -344,7 +366,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 .and_then(|statement| deadline(&statement, &clock))
                 .zip(now)
                 .is_some_and(|(deadline, now)| now > deadline);
-            if (aged && job.state.finished()) || !agents.contains(&job.agent) {
+            if job.state.finished() && (aged || !agents.contains(&job.agent)) {
                 if let Some(proof) = job.state.proof() {
                     self.host.hold(&proof, false);
                 }
@@ -357,88 +379,82 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 self.jobs.put(&id, &job.to(State::Dead))?;
             }
         }
-        self.read.retain(|agent, _| agents.contains(agent));
-        self.unread.retain(|agent, _| agents.contains(agent));
+        self.from.retain(|agent, _| agents.contains(agent));
         Ok(removed)
     }
 
-    /// Read `agent`'s records not yet read into jobs: the new jobs. A
-    /// record whose kernel is not here yet is read again later; a rootless
-    /// one, which no venue takes, makes none. A new record is of a window
-    /// at most [`READ_WINDOWS`] before the latest read, the windows of the
-    /// reads still served, so the records before it, and before any waiting
-    /// for its kernel, are not read again.
+    /// Read `agent`'s records into jobs, from the earliest window one not
+    /// yet read may be of: the new jobs. A record already a job (by its
+    /// statement's id) makes none; one whose kernel is not here is read
+    /// again later; a rootless one, which no venue takes, makes a refused
+    /// job. A new record is of a window at most [`READ_WINDOWS`] before the
+    /// latest, the windows of the reads still served.
     fn scan(&mut self, agent: AgentId) -> Result<usize, String> {
-        let mut read = self.read.remove(&agent).unwrap_or_default();
-        let from = read
-            .last()
-            .map_or(0, |(window, _)| window.saturating_sub(READ_WINDOWS));
-        let from = self
-            .unread
-            .remove(&agent)
-            .map_or(from, |unread| unread.min(from));
-        read.retain(|(window, _)| *window >= from);
+        let from = self.from.get(&agent).copied().unwrap_or(0);
+        let mut latest = None;
+        let mut waiting: Option<u64> = None;
         let mut made = 0;
         for (window, digest, attest) in self.host.attested(agent, from)? {
-            if read.contains(&(window, digest)) {
-                continue;
-            }
-            if attest.roots.is_empty() {
-                tracing::warn!(agent = agent.0, "a record at a cut states no root: no job");
-                read.insert((window, digest));
-                continue;
-            }
+            latest = Some(window);
             let Some(statement) = self.statement(agent, &attest)? else {
-                let unread = self.unread.entry(agent).or_insert(window);
-                *unread = (*unread).min(window);
+                waiting = Some(waiting.map_or(window, |earliest| earliest.min(window)));
                 continue;
             };
-            read.insert((window, digest));
             let id = statement.id();
             if self.jobs.get(agent, &id)?.is_some() {
                 continue;
             }
-            let state = match self.host.proven(agent, window, &id) {
-                Some(proof) => State::Proved { proof },
-                None => State::Queued,
+            let state = match (
+                attest.roots.is_empty(),
+                self.host.proven(agent, window, &id),
+            ) {
+                (true, _) => {
+                    tracing::warn!(agent = agent.0, "a record at a cut states no root: refused");
+                    State::Refused(REFUSED_ROOTLESS)
+                }
+                (false, Some(proof)) => State::Proved { proof },
+                (false, None) => State::Queued,
             };
             let job = Job::new(agent, digest, attest, &statement, state);
             self.jobs.put(&id, &job)?;
             made += 1;
         }
-        self.read.insert(agent, read);
+        if let Some(latest) = latest {
+            let next = latest.saturating_sub(READ_WINDOWS);
+            let next = waiting.map_or(next, |waiting| waiting.min(next));
+            self.from.insert(agent, next.max(from));
+        }
         Ok(made)
     }
 
     /// The statement `attest` makes: `None` while its kernel's blob is not
-    /// here, or its program could not be computed for now; a kernel the
-    /// prover cannot read, or one asked for past [`Options::patience`],
-    /// makes a statement of no program, which the prover then refuses.
+    /// here (asked of the replicas, alerted once), or its program could not
+    /// be computed for now; a kernel the prover cannot read makes a
+    /// statement of no program, which the prover then refuses.
     fn statement(&mut self, agent: AgentId, attest: &Attest) -> Result<Option<Statement>, String> {
         let program = match self.programs.get(&attest.program) {
             Some(program) => *program,
             None => {
-                let program = match self.host.program(agent, &attest.program) {
-                    Some(blob) => match self.prover.program(&blob) {
-                        Ok(program) => program,
-                        Err(ProveError::Kernel(_)) => NO_PROGRAM,
-                        Err(_) => return Ok(None),
-                    },
-                    None if self.kernel_lost(attest.program) => NO_PROGRAM,
-                    None => return Ok(None),
+                let Some(blob) = self.host.program(agent, &attest.program) else {
+                    if self.fetching.insert(attest.program) {
+                        tracing::warn!(
+                            agent = agent.0,
+                            "a record's kernel is not here: asked of the replicas, its record waiting"
+                        );
+                    }
+                    return Ok(None);
+                };
+                self.fetching.remove(&attest.program);
+                let program = match self.prover.program(&blob) {
+                    Ok(program) => program,
+                    Err(ProveError::Kernel(_)) => ProgramId([u32::MAX; 8]),
+                    Err(_) => return Ok(None),
                 };
                 self.programs.insert(attest.program, program);
                 program
             }
         };
         Ok(Some(statement(attest, program)))
-    }
-
-    /// Whether the kernel `hash`, not here, has been asked for past
-    /// [`Options::patience`]: it is taken as lost.
-    fn kernel_lost(&mut self, hash: ProgramHash) -> bool {
-        let asked = *self.missing.entry(hash).or_insert_with(Instant::now);
-        asked.elapsed() >= self.options.patience
     }
 
     /// Hold the kernel of each unfinished job, and no longer those of none.
@@ -524,14 +540,15 @@ impl<H: Host, J: Jobs> Worker<H, J> {
     /// Prove `job`: taken as proved when its agent records it proved by
     /// another replica; dead when its anchor would age past `MaxRootAge`
     /// before its proof ends; refused once [`MAX_ATTEMPTS`] proofs of it
-    /// began, or once its kernel, not here, has been asked for past
-    /// [`Options::patience`]; else proved, its proof kept, held and
-    /// recorded, or refused. False when its kernel's blob is not here yet,
-    /// or the prover failed: it waits, queued.
+    /// began, or when its record kept no witness (recorded proved, its proof
+    /// never fetched); else proved, its proof kept, held and recorded, or
+    /// refused. False when its kernel's blob is not here, or the prover
+    /// failed: it waits, queued.
     fn prove(&mut self, id: StatementId, job: Job) -> Result<bool, String> {
         let agent = job.agent.0;
+        let lost = matches!(self.fetches.get(&id), Some(Fetch::Lost));
         if let Some(proof) = self.host.proven(job.agent, job.window, &id)
-            && !self.unfetched.contains(&id)
+            && !lost
         {
             self.jobs.put(&id, &job.to(State::Proved { proof }))?;
             return Ok(true);
@@ -559,16 +576,18 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
             return Ok(true);
         }
+        if attest.witness_input.is_empty() {
+            tracing::error!(
+                agent,
+                "a statement recorded proved whose proof never arrived, its record without its witness: refused"
+            );
+            self.jobs
+                .put(&id, &job.to(State::Refused(REFUSED_UNWITNESSED)))?;
+            return Ok(true);
+        }
         let Some(kernel) = self.host.program(job.agent, &attest.program) else {
-            if self.kernel_lost(attest.program) {
-                tracing::error!(agent, "a statement's kernel never arrived: refused");
-                self.jobs
-                    .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
-                return Ok(true);
-            }
             return Ok(false);
         };
-        self.missing.remove(&attest.program);
         let mut job = job.to(State::Proving);
         job.attempts += 1;
         self.jobs.put(&id, &job)?;
@@ -580,7 +599,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         match proved {
             Ok(proof) => {
                 self.longest = self.longest.max(took);
-                self.unfetched.remove(&id);
+                self.fetches.remove(&id);
                 let proof = self.host.keep(&proof)?;
                 let (recorder, window, attested) = (job.agent, job.window, job.attested);
                 // Proved before held: a crash between the two leaves a job
@@ -679,11 +698,15 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 continue;
             }
             let Some(bytes) = self.host.proof(job.agent, &proof) else {
-                let asked = *self.asked.entry(id).or_insert_with(Instant::now);
-                if asked.elapsed() >= self.options.patience {
+                let fetch = *self
+                    .fetches
+                    .entry(id)
+                    .or_insert_with(|| Fetch::Asked(Instant::now()));
+                if let Fetch::Asked(asked) = fetch
+                    && asked.elapsed() >= self.options.patience
+                {
                     tracing::warn!(agent = job.agent.0, "a proof never arrived: proved here");
-                    self.asked.remove(&id);
-                    self.unfetched.insert(id);
+                    self.fetches.insert(id, Fetch::Lost);
                     let state = if job.attest.is_some() {
                         State::Queued
                     } else {
@@ -693,7 +716,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 }
                 continue;
             };
-            self.asked.remove(&id);
+            self.fetches.remove(&id);
             self.host.hold(&proof, true);
             let mut job = job.to(State::Submitted { proof });
             self.jobs.put(&id, &job)?;
@@ -753,7 +776,3 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         None
     }
 }
-
-/// The program id of a statement whose kernel the prover cannot read, or
-/// that never arrived: the prover refuses it.
-const NO_PROGRAM: ProgramId = ProgramId([u32::MAX; 8]);

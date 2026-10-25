@@ -14,8 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use vos_node_prover::{
-    Jobs, MAX_ATTEMPTS, MAX_RESUBMITS, Options, REFUSED_KERNEL, REFUSED_RERUN, State,
+    Jobs, MAX_ATTEMPTS, MAX_RESUBMITS, Options, REFUSED_KERNEL, REFUSED_RERUN, REFUSED_ROOTLESS,
+    REFUSED_UNWITNESSED, State,
 };
+use vos_venue::vos_statement::ProgramId;
 use vos_wire::result::Attest;
 use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
 
@@ -142,8 +144,8 @@ fn a_prover_that_panics_gives_up_after_three_attempts() {
 /// before its roots were anchored: the new leader proves nothing again,
 /// fetches the proof from the first and submits it; the first, no longer
 /// leading, submits nothing. A statement recorded after the change is
-/// proved by the new leader. Without the first's proof, the new leader
-/// proves the recorded statement itself once its patience ends.
+/// proved by the new leader. Without the proofs, a leader whose records
+/// kept no witness once recorded proved refuses each for that.
 #[test]
 fn a_leader_change_proves_nothing_twice() {
     let agent = Arc::new(Mutex::new(Agent::default()));
@@ -188,8 +190,9 @@ fn a_leader_change_proves_nothing_twice() {
     assert_eq!(venue.accepted(), 2);
     assert_eq!(b.blobs(), 2, "the first's proof fetched, the second's made");
 
-    // A third statement proved by a leader whose proof then is lost: the
-    // next proves it again.
+    // A third statement proved by a leader whose proof then is lost: its
+    // record kept no witness once recorded proved, so a new leader that
+    // never fetches the proofs refuses each for that, proving none again.
     agent.lock().unwrap().attests(vec![attest(5, 3)]);
     venue.now.store(after(5), Ordering::SeqCst);
     on_b.step().unwrap();
@@ -206,17 +209,13 @@ fn a_leader_change_proves_nothing_twice() {
     for _ in 0..6 {
         on_c.step().unwrap();
     }
-    let accepted = states(&c_jobs)
-        .into_iter()
-        .filter(|state| *state == State::Accepted)
-        .count();
-    assert_eq!(accepted, 3, "{:?}", states(&c_jobs));
     assert_eq!(
-        prover.made.load(Ordering::SeqCst),
-        6,
-        "the lost proofs proved again"
+        states(&c_jobs),
+        [State::Refused(REFUSED_UNWITNESSED); 3],
+        "{:?}",
+        states(&c_jobs)
     );
-    assert_eq!(venue.accepted(), 3);
+    assert_eq!(prover.made.load(Ordering::SeqCst), 3, "none proved again");
 }
 
 /// A statement whose anchor would pass `MaxRootAge` by the venue's time
@@ -283,33 +282,39 @@ fn jobs_age_out_and_go_with_their_agent() {
     );
     let mut worker = worker(&node, &jobs, &prover, &venue);
     worker.step().unwrap();
-    assert_eq!(
-        states(&jobs),
-        [State::Queued, State::Queued],
-        "no rootless job"
-    );
+    let count = |jobs: &MemoryJobs, wanted: State| {
+        states(jobs)
+            .into_iter()
+            .filter(|state| *state == wanted)
+            .count()
+    };
+    assert_eq!(count(&jobs, State::Queued), 2);
+    assert_eq!(count(&jobs, State::Refused(REFUSED_ROOTLESS)), 1);
     let aged = CLOCK.boundary(3).unwrap() + MAX_ROOT_AGE_MS + 1;
     venue.now.store(aged, Ordering::SeqCst);
     assert_eq!(worker.prune().unwrap(), 0);
-    let mut held = states(&jobs);
-    held.sort_by_key(|state| *state != State::Dead);
-    assert_eq!(
-        held,
-        [State::Dead, State::Queued],
-        "window 3's aged, 4's not"
-    );
+    assert_eq!(count(&jobs, State::Dead), 1, "window 3's aged, 4's not");
     assert_eq!(worker.prune().unwrap(), 1, "the dead job removed once aged");
 
     node.replicates.store(false, Ordering::SeqCst);
-    assert_eq!(worker.prune().unwrap(), 1, "the agent no longer replicated");
-    assert!(states(&jobs).is_empty());
+    assert_eq!(
+        worker.prune().unwrap(),
+        1,
+        "the finished one, its agent absent"
+    );
+    assert_eq!(
+        states(&jobs),
+        [State::Queued],
+        "an unfinished one kept, its agent perhaps back soon"
+    );
 }
 
 /// An unfinished job's kernel is held while the job waits, and no longer
-/// once it finishes; a kernel this node lacks is asked for, the job
-/// waiting, and refused once [`Options::patience`] passes without it.
+/// once it finishes; a record whose kernel this node lacks waits for it,
+/// however long, and once it arrives its statement is proved under its own
+/// program's id.
 #[test]
-fn a_kernel_is_held_and_one_never_fetched_refused() {
+fn a_kernel_is_held_and_one_fetched_late_proves() {
     let agent = Arc::new(Mutex::new(Agent::default()));
     agent.lock().unwrap().attests(vec![attest(3, 1)]);
     let node = Node::new(&agent, true);
@@ -346,8 +351,55 @@ fn a_kernel_is_held_and_one_never_fetched_refused() {
     );
     std::thread::sleep(Duration::from_millis(150));
     worker.step().unwrap();
-    assert!(states(&jobs).contains(&State::Refused(REFUSED_KERNEL)));
-    assert_eq!(prover.made.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        states(&jobs),
+        [State::Accepted],
+        "past its patience, waiting"
+    );
+    node.no_kernel.store(false, Ordering::SeqCst);
+    for _ in 0..3 {
+        worker.step().unwrap();
+    }
+    assert_eq!(states(&jobs), [State::Accepted, State::Accepted]);
+    assert_eq!(prover.made.load(Ordering::SeqCst), 2);
+    let program = ProgramId([KERNEL.len() as u32; 8]);
+    let id = vos_node_prover::statement(&attest(3, 2), program).id();
+    assert!(venue.accepted.lock().unwrap().contains(&id.0), "its own id");
+}
+
+/// A statement recorded proved whose proof never arrives, its record
+/// without its witness, is refused for that reason, its kernel never run.
+#[test]
+fn a_witnessless_record_is_refused_for_it() {
+    let agent = Arc::new(Mutex::new(Agent::default()));
+    let proved = Attest {
+        witness_input: Vec::new(),
+        ..attest(3, 1)
+    };
+    let program = ProgramId([KERNEL.len() as u32; 8]);
+    let id = vos_node_prover::statement(&proved, program).id();
+    {
+        let mut agent = agent.lock().unwrap();
+        agent.attests(vec![proved]);
+        agent.proven.insert(id.0, [0xee; 32]);
+    }
+    let node = Node::new(&agent, true);
+    let (jobs, prover, venue) = (
+        MemoryJobs::default(),
+        Arc::new(Proofs::default()),
+        Venue::at(after(3)),
+    );
+    venue.anchor(3);
+    let impatient = Options {
+        patience: Duration::ZERO,
+        ..options()
+    };
+    let mut worker = worker_with(&node, &jobs, &prover, &venue, impatient);
+    for _ in 0..4 {
+        worker.step().unwrap();
+    }
+    assert_eq!(states(&jobs), [State::Refused(REFUSED_UNWITNESSED)]);
+    assert_eq!(prover.made.load(Ordering::SeqCst), 0);
 }
 
 /// A proof under way when the node stops is not counted against its

@@ -168,6 +168,10 @@ impl Host for Node {
         };
     }
 
+    fn held(&self) -> Vec<[u8; 32]> {
+        self.pins.lock().unwrap().iter().copied().collect()
+    }
+
     fn proof(&self, _: AgentId, key: &[u8; 32]) -> Option<Vec<u8>> {
         if let Some(bytes) = self.blobs.lock().unwrap().get(key) {
             return Some(bytes.clone());

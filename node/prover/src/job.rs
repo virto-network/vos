@@ -17,6 +17,14 @@ pub const REFUSED_RERUN: u32 = 0x1_0001;
 /// program's blob does not derive a kernel, or the kernel does not run.
 pub const REFUSED_KERNEL: u32 = 0x1_0002;
 
+/// A job's code when its record at a cut states no root: no venue takes
+/// it.
+pub const REFUSED_ROOTLESS: u32 = 0x1_0003;
+
+/// A job's code when its record kept no witness, its statement recorded
+/// proved by a proof this node never fetched: no re-run proves it.
+pub const REFUSED_UNWITNESSED: u32 = 0x1_0004;
+
 /// The times proving a statement may begin before it is refused
 /// ([`REFUSED_KERNEL`]): a kernel whose proof panics or stops the node.
 pub const MAX_ATTEMPTS: u32 = 3;
