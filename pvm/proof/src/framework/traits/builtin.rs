@@ -34,8 +34,12 @@ pub enum Logup {
 impl Logup {
     /// The batch of each of `n` fractions, then of `extra` more joined to the
     /// last batch: what `finalize_logup_batched` takes. The extra fractions
-    /// add no column, and their denominators being constant, no degree.
+    /// add no column, and their denominators being constant, no degree. A
+    /// chip has at least one fraction (`n > 0`): with none, the extra ones
+    /// would make a batch of their own, a column the chip's interaction trace
+    /// does not have.
     pub fn batches(self, n: usize, extra: usize) -> Vec<usize> {
+        debug_assert!(n > 0, "a chip with no fraction");
         let batch = |i: usize| match self {
             Self::Pairs => i / 2,
             Self::Single => i,
@@ -146,7 +150,7 @@ pub trait BuiltInProverComponent: BuiltInComponent {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

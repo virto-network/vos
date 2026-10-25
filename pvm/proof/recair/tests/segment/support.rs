@@ -3,6 +3,7 @@
 
 use stwo::core::channel::MerkleChannel;
 use stwo::core::pcs::DeepBatching;
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_final_verifier::Error;
@@ -10,7 +11,7 @@ use vos_pvm_proof::format::{ChannelKind, Format, FormatParams, Masking, SEGMENT}
 use vos_pvm_proof::segment::SegmentCursor;
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair::ProveError;
-use vos_pvm_recair::masked::segment::{SegmentProof, prove_segment, verify_segment};
+use vos_pvm_recair::masked::segment::{SegmentProof, circuit_root, prove_segment, verify_segment};
 use vos_pvm_recair::masked::{MaskRng, MaskStats};
 
 /// The small kernel's io-hash words, φ9..12.
@@ -121,7 +122,25 @@ where
     prove_segment::<MC>(format, &mut side_note, active, rng)
 }
 
-/// Verifies a masked segment proof on `MC`.
-pub fn verify<MC: MerkleChannel>(format: &Format, proof: &Proof<MC>) -> Result<(), Error> {
-    verify_segment::<MC>(format, proof, None)
+/// The preprocessed root the kernel of `io`'s masked segment commits under
+/// `format` on `MC`: its program's and its shape's, which a verifier pins.
+pub fn circuit<MC: MerkleChannel>(
+    format: &Format,
+    io: [u32; 4],
+) -> <MC::H as MerkleHasherLifted>::Hash
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    let mut side_note = run(io);
+    let active = active(&side_note);
+    circuit_root::<MC>(format, &mut side_note, active).expect("the circuit's root")
+}
+
+/// Verifies a masked segment proof of the small kernel ([`IO`]) on `MC`,
+/// against its program's root.
+pub fn verify<MC: MerkleChannel>(format: &Format, proof: &Proof<MC>) -> Result<(), Error>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    verify_segment::<MC>(format, proof, circuit::<MC>(format, IO))
 }

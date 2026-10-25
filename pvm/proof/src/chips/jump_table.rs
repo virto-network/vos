@@ -168,7 +168,7 @@ impl BuiltInProverComponent for JumpTableChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (

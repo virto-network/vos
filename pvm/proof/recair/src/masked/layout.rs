@@ -6,6 +6,8 @@
 //! elements `v_H·r` spans there; masking a column then writes `f`'s
 //! coefficients and `h` random ones into one vector, with no product taken.
 
+use std::sync::{Arc, Mutex};
+
 use num_traits::Zero;
 use rand::Rng;
 use rand_chacha::ChaCha20Rng;
@@ -138,28 +140,65 @@ impl MaskLayout {
     }
 }
 
+/// The layouts built so far, by `(log_size, log_mask_rows)`: a layout is a
+/// function of its size and `h` alone, so a process builds each once.
+static LAYOUTS: Mutex<Vec<Arc<MaskLayout>>> = Mutex::new(Vec::new());
+
 /// The layouts for every component's size and `h` among `classes`, each a
-/// `(log_size, log_mask_rows)`, built in parallel.
-pub(crate) fn layouts(classes: &[(u32, u32)]) -> Result<Vec<MaskLayout>, ProveError> {
+/// `(log_size, log_mask_rows)`: those built before taken from the process's
+/// cache, the others built in parallel and kept.
+pub(crate) fn layouts(classes: &[(u32, u32)]) -> Result<Vec<Arc<MaskLayout>>, ProveError> {
     let mut classes = classes.to_vec();
     classes.sort_unstable();
     classes.dedup();
-    classes
+    let cached = |cache: &[Arc<MaskLayout>], (log_size, log_mask_rows): (u32, u32)| {
+        cache
+            .iter()
+            .find(|layout| layout.log_size == log_size && layout.log_mask_rows == log_mask_rows)
+            .cloned()
+    };
+    let missing: Vec<(u32, u32)> = {
+        let cache = LAYOUTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        classes
+            .iter()
+            .copied()
+            .filter(|&class| cached(&cache, class).is_none())
+            .collect()
+    };
+    let built: Vec<MaskLayout> = missing
         .into_par_iter()
         .map(|(log_size, log_mask_rows)| MaskLayout::new(log_size, log_mask_rows))
-        .collect()
+        .collect::<Result<_, _>>()?;
+    let mut cache = LAYOUTS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.extend(built.into_iter().map(Arc::new));
+    Ok(classes
+        .into_iter()
+        .filter_map(|class| cached(&cache, class))
+        .collect())
+}
+
+/// `n` masks' 32-byte seeds drawn from `rng` in order, one a column.
+pub(crate) fn seeds(n: usize, rng: &mut ChaCha20Rng) -> Vec<[u8; 32]> {
+    let seeds: Vec<[u8; 32]> = (0..n).map(|_| rng.r#gen()).collect();
+    for seed in &seeds {
+        super::drawn::note("a mask column's seed", seed);
+    }
+    seeds
 }
 
 /// Each of `polys`, with its `log2 h`, masked by its size's layout at that
-/// `h`, in parallel, one 32-byte seed a column drawn from `rng` in order.
-pub(crate) fn mask_columns(
+/// `h` from its seed in `seeds`, in parallel.
+pub(crate) fn mask_with(
     polys: &[(&CircleCoefficients<SimdBackend>, u32)],
-    layouts: &[MaskLayout],
-    rng: &mut ChaCha20Rng,
+    seeds: Vec<[u8; 32]>,
+    layouts: &[Arc<MaskLayout>],
 ) -> Result<Vec<CircleCoefficients<SimdBackend>>, ProveError> {
-    let seeds: Vec<[u8; 32]> = polys.iter().map(|_| rng.r#gen()).collect();
-    for seed in &seeds {
-        super::drawn::note("a mask column's seed", seed);
+    if seeds.len() != polys.len() {
+        return Err(ProveError::Masking("a seed for each column"));
     }
     polys
         .par_iter()
@@ -174,6 +213,17 @@ pub(crate) fn mask_columns(
             layout.mask(poly, &mut ChaCha20Rng::from_seed(seed))
         })
         .collect()
+}
+
+/// Each of `polys`, with its `log2 h`, masked by its size's layout at that
+/// `h`, in parallel, one 32-byte seed a column drawn from `rng` in order.
+pub(crate) fn mask_columns(
+    polys: &[(&CircleCoefficients<SimdBackend>, u32)],
+    layouts: &[Arc<MaskLayout>],
+    rng: &mut ChaCha20Rng,
+) -> Result<Vec<CircleCoefficients<SimdBackend>>, ProveError> {
+    let seeds = seeds(polys.len(), rng);
+    mask_with(polys, seeds, layouts)
 }
 
 #[cfg(test)]

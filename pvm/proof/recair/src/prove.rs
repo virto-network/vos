@@ -312,7 +312,7 @@ where
     let log_sizes = circuit.log_sizes();
     let mut main = trace::main_trace(circuit, witness);
     tamper(&mut main);
-    let main_columns = main
+    let main_columns: Vec<trace::Evaluations> = main
         .columns
         .iter()
         .zip(log_sizes)
@@ -328,7 +328,12 @@ where
             active: (),
             log_sizes: &log_sizes,
             preprocessed: preprocessed_evaluations(circuit),
-            main: main_columns,
+            main: &|component: usize| {
+                main_columns[component]
+                    .iter()
+                    .map(|column| &column.values)
+                    .collect()
+            },
             public: &witness.outputs,
             interaction: &interaction,
         },

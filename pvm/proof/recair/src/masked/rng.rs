@@ -22,8 +22,8 @@ use stwo::core::pcs::DeepBatching;
 use vos_pvm_proof::format::{Format, Masking};
 use vos_pvm_proof::proof::statement_header_words;
 
+use super::MainColumns;
 use crate::prove::ProveError;
-use crate::trace::Evaluations;
 
 type Blake2b256 = Blake2b<U32>;
 
@@ -88,14 +88,13 @@ pub(crate) struct Statement<'a> {
 /// in commitment order, a column's the `BLAKE2b-256` of its values, 4 bytes
 /// little-endian each in Stwo's storage order. Every private value of the
 /// witness is in the main columns.
-pub(crate) fn witness_digest(statement: &Statement<'_>, main: &[Evaluations]) -> [u8; 32] {
-    let columns: Vec<[u8; 32]> = main
-        .iter()
-        .flatten()
+pub(crate) fn witness_digest(statement: &Statement<'_>, main: &MainColumns<'_>) -> [u8; 32] {
+    let columns: Vec<[u8; 32]> = (0..statement.log_sizes.len())
+        .flat_map(main)
         .collect::<Vec<_>>()
         .par_iter()
         .map(|column| {
-            let bytes: &[u8] = bytemuck::cast_slice(column.values.as_slice());
+            let bytes: &[u8] = bytemuck::cast_slice(column.as_slice());
             Blake2b256::digest(bytes).into()
         })
         .collect();
@@ -132,22 +131,21 @@ pub(crate) fn witness_digest(statement: &Statement<'_>, main: &[Evaluations]) ->
 #[cfg(test)]
 mod tests {
     use stwo::core::fields::m31::BaseField;
-    use stwo::core::poly::circle::CanonicCoset;
     use stwo::prover::backend::simd::column::BaseColumn;
-    use stwo::prover::poly::circle::CircleEvaluation;
     use vos_pvm_proof::format::{ChannelKind, Format, MASKED_WRAP};
 
     use super::*;
 
-    fn column(values: &[u32]) -> Evaluations {
-        let domain = CanonicCoset::new(4).circle_domain();
-        vec![CircleEvaluation::new(
-            domain,
-            values
-                .iter()
-                .map(|&value| BaseField::from(value))
-                .collect::<BaseColumn>(),
-        )]
+    fn column(values: &[u32]) -> BaseColumn {
+        values
+            .iter()
+            .map(|&value| BaseField::from(value))
+            .collect::<BaseColumn>()
+    }
+
+    /// The digest of a one-column witness.
+    fn digest(statement: &Statement<'_>, column: &BaseColumn) -> [u8; 32] {
+        witness_digest(statement, &|_| vec![column])
     }
 
     /// R4 against a replayed state: one OS state hedged with two witnesses
@@ -181,24 +179,24 @@ mod tests {
         let mut amount = values.clone();
         amount[3] += 1;
         let digests = [
-            witness_digest(&statement(&MASKED_WRAP, &public), &[column(&values)]),
-            witness_digest(&statement(&MASKED_WRAP, &public), &[column(&amount)]),
-            witness_digest(&statement(&poseidon, &public), &[column(&values)]),
-            witness_digest(&statement(&MASKED_WRAP, &[]), &[column(&values)]),
-            witness_digest(
+            digest(&statement(&MASKED_WRAP, &public), &column(&values)),
+            digest(&statement(&MASKED_WRAP, &public), &column(&amount)),
+            digest(&statement(&poseidon, &public), &column(&values)),
+            digest(&statement(&MASKED_WRAP, &[]), &column(&values)),
+            digest(
                 &Statement {
                     log_sizes: &[5],
                     ..statement(&MASKED_WRAP, &public)
                 },
-                &[column(&values)],
+                &column(&values),
             ),
-            witness_digest(&statement(&renumbered, &public), &[column(&values)]),
-            witness_digest(
+            digest(&statement(&renumbered, &public), &column(&values)),
+            digest(
                 &Statement {
                     masking: &taller,
                     ..statement(&MASKED_WRAP, &public)
                 },
-                &[column(&values)],
+                &column(&values),
             ),
         ];
         let first_word = |digest: &[u8; 32], attempt| {

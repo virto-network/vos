@@ -299,7 +299,7 @@ impl BuiltInProverComponent for Blake2bChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (
@@ -315,15 +315,15 @@ impl BuiltInProverComponent for Blake2bChip {
         // output-AND lookups) — shared with Blake2bBoundaryChip.
         add_compression_interaction_core::<PreprocessedColumn, Column>(
             &mut logup,
-            &component_trace,
+            component_trace,
             range256,
             bitwise,
         );
 
         let init_gate = crate::trace::original_base_column!(component_trace, Column::InitGateH);
         let output_gate = crate::trace::original_base_column!(component_trace, Column::OutputGateH);
-        let h_addr = address::AddressTrace::<64>::read(&component_trace, address::H);
-        let m_addr = address::AddressTrace::<128>::read(&component_trace, address::M);
+        let h_addr = address::AddressTrace::<64>::read(component_trace, address::H);
+        let m_addr = address::AddressTrace::<128>::read(component_trace, address::M);
         h_addr.add_range_lookups(
             &mut logup,
             range256,

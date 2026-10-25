@@ -727,7 +727,7 @@ where
             .par_iter()
             .zip(traces.into_par_iter())
             .map(|(c, component_trace)| {
-                c.generate_interaction_trace(component_trace, side_note, &lookup_elements)
+                c.generate_interaction_trace(&component_trace, side_note, &lookup_elements)
             })
             .collect()
     };

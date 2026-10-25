@@ -628,7 +628,8 @@ fn the_windows_leaves_and_folds_prove_and_verify() {
 /// venue, which pins the kernel's program and holds `S_w` anchored by the
 /// space's founding key.
 ///
-/// Accepted, and then refused as a repeat (6). Then each case, a venue or a
+/// Accepted, and then judged a repeat (6), which the venue answers as
+/// accepted, holding the statement once. Then each case, a venue or a
 /// statement that differs in one thing, and the check that refuses it:
 /// - **an unanchored root** (5): a venue that holds no anchor of the space;
 /// - **another window:** the root claimed at the window before, which the
@@ -708,11 +709,13 @@ fn the_window_is_stated_at_the_model_venue() {
 
     let accepting = anchored();
     assert_eq!(code(&accepting, &statement), 0, "accepted");
+    assert_eq!(accepting.venue.statements_held(), 1);
     assert_eq!(
         accepting.venue.submit(&statement, &proof),
         SubmitOutcome::Accepted,
         "a repeat, the venue holding it accepted"
     );
+    assert_eq!(accepting.venue.statements_held(), 1, "the repeat judged as one");
 
     assert_eq!(
         code(&venue(VENUE), &statement),

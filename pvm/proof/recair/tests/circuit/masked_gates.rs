@@ -100,7 +100,7 @@ where
         .zip(log_sizes)
         .flat_map(|(columns, log_size)| trace::evaluations(columns, log_size))
         .collect();
-    let main_columns = main
+    let main_columns: Vec<trace::Evaluations> = main
         .columns
         .iter()
         .zip(log_sizes)
@@ -116,7 +116,12 @@ where
         active: (),
         log_sizes: &log_sizes,
         preprocessed,
-        main: main_columns,
+        main: &|component: usize| {
+            main_columns[component]
+                .iter()
+                .map(|column| &column.values)
+                .collect()
+        },
         public: &witness.outputs,
         interaction: &interaction,
     };

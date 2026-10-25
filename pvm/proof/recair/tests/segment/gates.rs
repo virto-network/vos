@@ -19,6 +19,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 use stwo::core::verifier::VerificationError;
 use stwo::prover::ProvingError;
 use stwo::prover::backend::BackendForChannel;
@@ -32,14 +33,16 @@ use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{MaskedSegmentTrace, SegmentComponents};
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_recair::ProveError;
-use vos_pvm_recair::masked::segment::prove_segment_forced;
-use vos_pvm_recair::masked::{MaskRng, mask_pins, mask_rows};
+use vos_pvm_recair::masked::segment::{prove_segment_forced, verify_segment};
+use vos_pvm_recair::masked::{Checks, MaskRng, mask_pins, mask_rows};
 use vos_pvm_recair::trace::FirstRowFraction;
 use vos_pvm_recair_air::masked::{
     MaskedComponent, MaskedComponents, composition_log_degree_bound, sample_points,
 };
 
-use crate::support::{IO, Proof, active, format, prove, run, small_format, verify};
+use crate::support::{
+    IO, IO_OTHER, Proof, active, circuit, format, prove, run, small_format, verify,
+};
 
 /// The column classes R1 must check on the segment's set: each masked
 /// column with samples, by its level, its quotient's lift, its offsets from
@@ -89,6 +92,24 @@ pub fn forced<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
+    let checks = Checks {
+        constraints: checked,
+        ..Checks::ALL
+    };
+    forced_with::<MC>(format, seed, tamper, blind, checks)
+}
+
+/// [`forced`], the prover held to `checks` alone.
+pub fn forced_with<MC: MerkleChannel>(
+    format: &Format,
+    seed: u64,
+    tamper: impl FnOnce(&mut MaskedSegmentTrace),
+    blind: impl Fn(&AllLookupElements, &mut [FirstRowFraction]),
+    checks: Checks,
+) -> Result<Proof<MC>, ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
     let mut side_note = run(IO);
     let active = active(&side_note);
     prove_segment_forced::<MC>(
@@ -98,7 +119,7 @@ where
         MaskRng::Seeded(seed),
         tamper,
         blind,
-        checked,
+        checks,
     )
     .map(|(proof, _)| proof)
 }
@@ -286,9 +307,15 @@ fn an_unbalanced_relation_cancelled_by_the_blinding_is_refused() {
     ));
 }
 
-/// `proof` verified under `format`, a panic caught as one.
-fn outcome<MC: MerkleChannel>(format: &Format, proof: &Proof<MC>) -> Result<(), String> {
-    match catch_unwind(AssertUnwindSafe(|| verify::<MC>(format, proof))) {
+/// `proof` verified under `format` against `root`, a panic caught as one.
+fn outcome(
+    format: &Format,
+    proof: &Proof<P2MerkleChannel>,
+    root: <<P2MerkleChannel as MerkleChannel>::H as MerkleHasherLifted>::Hash,
+) -> Result<(), String> {
+    match catch_unwind(AssertUnwindSafe(|| {
+        verify_segment::<P2MerkleChannel>(format, proof, root)
+    })) {
         Ok(Ok(())) => Ok(()),
         Ok(Err(error)) => Err(format!("{error:?}")),
         Err(_) => Err("panicked".into()),
@@ -306,7 +333,8 @@ fn a_tampered_or_malformed_proof_is_refused_never_a_panic() {
     type P = Proof<P2MerkleChannel>;
     let format = format();
     let (honest, _) = prove::<P2MerkleChannel>(&format, IO, MaskRng::Seeded(6)).unwrap();
-    verify::<P2MerkleChannel>(&format, &honest).expect("verifies");
+    let root = circuit::<P2MerkleChannel>(&format, IO);
+    verify_segment::<P2MerkleChannel>(&format, &honest, root).expect("verifies");
     let one = SecureField::one();
     let salts = format.masking.expect("masked").salt_columns;
     type Mutation<'a> = Box<dyn Fn(&mut P) + 'a>;
@@ -438,6 +466,7 @@ fn a_tampered_or_malformed_proof_is_refused_never_a_panic() {
         ("a log size more", Box::new(|p| p.log_sizes.push(8))),
         ("a log size larger", Box::new(|p| p.log_sizes[0] += 1)),
         ("a log size zero", Box::new(|p| p.log_sizes[2] = 0)),
+        ("a log size smaller", Box::new(|p| p.log_sizes[0] -= 1)),
         (
             "a chip more",
             Box::new(|p| {
@@ -470,21 +499,80 @@ fn a_tampered_or_malformed_proof_is_refused_never_a_panic() {
     for (name, tamper) in &cases {
         let mut proof = honest.clone();
         tamper(&mut proof);
-        match outcome::<P2MerkleChannel>(&format, &proof) {
+        match outcome(&format, &proof, root) {
             Ok(()) => failures.push(format!("{name}: accepted")),
             Err(error) if error == "panicked" => failures.push(format!("{name}: panicked")),
             Err(error) => eprintln!("{name}: {error}"),
         }
     }
-    let other_circuit = honest.proof.stark_proof.commitments[1];
-    if !vos_pvm_recair::masked::segment::verify_segment::<P2MerkleChannel>(
-        &format,
-        &honest,
-        Some(other_circuit),
-    )
-    .is_err_and(|error| matches!(error, Error::Circuit))
-    {
-        failures.push("another circuit's root: not refused as such".into());
-    }
     assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// The circuit pinned: the root the program and the shape commit
+/// (`circuit_root`) is every honest proof's, of two runs from two seeds, and
+/// they verify against it; another program's root (φ9 one more) refuses
+/// them as `Circuit`. A prover-chosen table, the power-of-two table's entry
+/// at a padding row of no multiplicity made one no honest table holds (the
+/// logup still balanced, every constraint held), verifies against the root
+/// it commits, and is refused against the program's.
+#[test]
+fn the_circuit_root_pins_the_tables_and_the_code() {
+    let format = format();
+    let root = circuit::<P2MerkleChannel>(&format, IO);
+    for seed in [7, 8] {
+        let (proof, _) = prove::<P2MerkleChannel>(&format, IO, MaskRng::Seeded(seed)).unwrap();
+        assert_eq!(proof.proof.stark_proof.commitments[0], root);
+        verify_segment::<P2MerkleChannel>(&format, &proof, root).expect("verifies");
+        let other = circuit::<P2MerkleChannel>(&format, IO_OTHER);
+        assert_ne!(other, root);
+        assert!(matches!(
+            verify_segment::<P2MerkleChannel>(&format, &proof, other),
+            Err(Error::Circuit)
+        ));
+    }
+    let at = position(chip_idx::POWER_OF_TWO);
+    let choose = |trace: &mut MaskedSegmentTrace| {
+        let log_size = trace.log_sizes[at];
+        // Row 100 is past the table's 64 entries, a repeat of no multiplicity:
+        // its shift amount made 70, an entry no honest table holds.
+        let table = trace.preprocessed_columns_mut().nth(at).unwrap();
+        table[0].as_mut_slice()[stored(100, log_size)] = BaseField::from(70);
+    };
+    let chosen = forced::<P2MerkleChannel>(&format, 9, choose, |_, _| {}, true)
+        .expect("a chosen table proves");
+    let its_own = chosen.proof.stark_proof.commitments[0];
+    assert_ne!(its_own, root);
+    verify_segment::<P2MerkleChannel>(&format, &chosen, its_own)
+        .expect("verifies against the root it commits");
+    assert!(matches!(
+        verify_segment::<P2MerkleChannel>(&format, &chosen, root),
+        Err(Error::Circuit)
+    ));
+}
+
+/// The public sums bound: a forced prover that blinds the boundary chips'
+/// claimed sums too (the blinding still summing to zero, every constraint
+/// held) is refused by the boundary binding.
+#[test]
+fn a_blinded_public_sum_is_refused() {
+    let format = format();
+    let checks = Checks {
+        public_unblinded: false,
+        ..Checks::ALL
+    };
+    let proof = forced_with::<P2MerkleChannel>(&format, 10, |_| {}, |_, _| {}, checks)
+        .expect("a forced proof");
+    assert!(
+        proof
+            .proof
+            .claimed_sums
+            .iter()
+            .copied()
+            .sum::<SecureField>()
+            .is_zero()
+    );
+    assert!(matches!(
+        verify::<P2MerkleChannel>(&format, &proof),
+        Err(Error::Logup)
+    ));
 }

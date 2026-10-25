@@ -510,7 +510,7 @@ fn accepts(
     let mut total = stwo::core::fields::qm31::SecureField::zero();
     for (component, trace) in components.iter().zip(traces) {
         let (interaction_trace, claimed_sum) =
-            component.generate_interaction_trace(trace.clone(), side_note, &lookup_elements);
+            component.generate_interaction_trace(trace, side_note, &lookup_elements);
         component.debug_assert_constraints(
             trace,
             &interaction_trace,

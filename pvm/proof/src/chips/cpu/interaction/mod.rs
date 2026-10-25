@@ -45,7 +45,7 @@ mod registers;
 mod signs;
 
 pub(super) fn generate_interaction_trace(
-    component_trace: ComponentTrace,
+    component_trace: &ComponentTrace,
     lookup_elements: &AllLookupElements,
 ) -> (
     ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>,
@@ -53,7 +53,7 @@ pub(super) fn generate_interaction_trace(
 ) {
     let log_size = component_trace.log_size();
     let mut logup = LogupTraceBuilder::new(log_size);
-    let row = RowTrace::new(&component_trace);
+    let row = RowTrace::new(component_trace);
     result_bytes(&mut logup, &row, lookup_elements);
     memory::memory_access(&mut logup, &row, lookup_elements);
     control::program_execution(&mut logup, &row, lookup_elements);

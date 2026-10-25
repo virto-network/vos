@@ -18,6 +18,15 @@
 //! Every chip pads to its masking's floor (four times its `h`): the fixed
 //! tables repeat their entries with no multiplicity, the boundaries add rows
 //! that claim nothing. The unmasked segment formats never read this module.
+//!
+//! **The node's shape, assumed:** [`bound_sums`] and the public sums take the
+//! four boundary chips (the registers in and out, the program's boundary,
+//! the memory roots), and a mask without one is refused. Pin J's device
+//! shape drops the memory roots and outputs the io-hash in φ9..12, so both
+//! are generalized there (`slice-7-mobile.md`, 7.15). Nor is the shape
+//! pinned yet: the chips (`active`) and their sizes are the run's, above the
+//! floors, so they depend on the witness until the device program id pins
+//! them and the prover pads to them (7.15).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -59,11 +68,31 @@ pub struct MaskedChipEval<C: BuiltInComponent + 'static> {
     log_size: u32,
     lookup_elements: C::LookupElements,
     blind: BlindRelation,
-    /// The chip's own fractions a row.
-    n_fractions: usize,
+    /// The batch of each of the chip's fractions a row, then of the
+    /// blinding's, joined to the last.
+    batching: Vec<usize>,
 }
 
-/// The fractions `chip` adds a row.
+impl<C: BuiltInComponent + 'static> MaskedChipEval<C> {
+    fn new(
+        chip: &'static C,
+        log_size: u32,
+        lookup_elements: C::LookupElements,
+        blind: &BlindRelation,
+    ) -> Self {
+        Self {
+            chip,
+            log_size,
+            lookup_elements,
+            blind: blind.clone(),
+            batching: C::LOGUP.batches(fractions(chip), 1),
+        }
+    }
+}
+
+/// The fractions `chip` adds a row: at least one for every segment chip,
+/// each reading a relation (`Logup::batches` and the interaction's blinding
+/// both take the last batch to exist).
 fn fractions<C: BuiltInComponent>(chip: &C) -> usize {
     let mut info = InfoEvaluator::empty();
     let trace_eval = TraceEval::new(&mut info);
@@ -92,7 +121,7 @@ impl<C: BuiltInComponent + 'static> FrameworkEval for MaskedChipEval<C> {
             E::combine_ef(b),
             &[E::F::one()],
         ));
-        eval.finalize_logup_batched(&C::LOGUP.batches(self.n_fractions, 1));
+        eval.finalize_logup_batched(&self.batching);
         eval
     }
 }
@@ -129,13 +158,12 @@ impl ChipVisitor for Build<'_> {
     {
         Box::new(FrameworkComponent::new(
             self.allocator,
-            MaskedChipEval {
+            MaskedChipEval::new(
                 chip,
-                log_size: self.log_size,
-                lookup_elements: C::LookupElements::get(self.relations),
-                blind: self.blind.clone(),
-                n_fractions: fractions(chip),
-            },
+                self.log_size,
+                C::LookupElements::get(self.relations),
+                self.blind,
+            ),
             self.claimed_sum,
         ))
     }
@@ -363,13 +391,12 @@ pub fn drive_masked_chip<E: EvalAtRow>(
             C: BuiltInComponent + Sync + 'static,
             C::LookupElements: Sync + 'static,
         {
-            MaskedChipEval {
+            MaskedChipEval::new(
                 chip,
-                log_size: self.log_size,
-                lookup_elements: C::LookupElements::get(self.relations),
-                blind: self.blind.clone(),
-                n_fractions: fractions(chip),
-            }
+                self.log_size,
+                C::LookupElements::get(self.relations),
+                self.blind,
+            )
             .evaluate(self.eval)
         }
     }

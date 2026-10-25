@@ -404,7 +404,7 @@ impl BuiltInProverComponent for Blake2bBoundaryChip {
 
     fn generate_interaction_trace(
         &self,
-        component_trace: ComponentTrace,
+        component_trace: &ComponentTrace,
         _side_note: &SideNote,
         lookup_elements: &AllLookupElements,
     ) -> (
@@ -418,7 +418,7 @@ impl BuiltInProverComponent for Blake2bBoundaryChip {
         let bitwise: &BitwiseAndByteLookupElements = lookup_elements.as_ref();
         add_compression_interaction_core::<PreprocessedColumn, BoundaryColumn>(
             &mut logup,
-            &component_trace,
+            component_trace,
             range256,
             bitwise,
         );

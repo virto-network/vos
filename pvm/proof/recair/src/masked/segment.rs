@@ -9,14 +9,22 @@
 //! sums, left unblinded, are those the states fix. Every chip pads to four
 //! times its `h` ([`floors`]). No production format proves it: a test or
 //! measurement names a masked format of its own.
+//!
+//! The verifier pins the preprocessed root ([`circuit_root`]): the tables'
+//! and the code's content has no other pin. It takes the chips and their
+//! sizes from the proof, and the transcript does not mix the chips (as
+//! format 35's does not): the device program id, which 7.15 mixes into the
+//! header and verifies against, pins both.
 
 use num_traits::Zero;
 use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::qm31::SecureField;
+use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
-use stwo::prover::ComponentProver;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
+use stwo::prover::poly::circle::PolyOps;
+use stwo::prover::{CommitmentSchemeProver, ComponentProver};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, verify_masked};
 use vos_pvm_proof::SegmentState;
@@ -29,7 +37,7 @@ use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair_air::masked::MaskedComponents;
 
 use super::{
-    MaskRng, MaskStats, MaskedProof, MaskedProvers, MaskedTrace, mask_rows, verifier_format,
+    Checks, MaskRng, MaskStats, MaskedProof, MaskedProvers, MaskedTrace, mask_rows, verifier_format,
 };
 use crate::prove::ProveError;
 use crate::trace::FirstRowFraction;
@@ -73,14 +81,22 @@ pub fn prove_segment<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    prove_segment_with::<MC>(format, side_note, active, rng, |_| {}, |_, _| {}, true)
+    prove_segment_with::<MC>(
+        format,
+        side_note,
+        active,
+        rng,
+        |_| {},
+        |_, _| {},
+        Checks::ALL,
+    )
 }
 
-/// [`prove_segment`], each chip's main columns through `tamper` before they
-/// are committed, its blinding fraction through `blind` once the relations
-/// are drawn, and the prover's own check of the constraints made only when
-/// `checked`: the soundness gates' forced proofs. Only the tests' dev edge
-/// has it (`seeded-masks`); no production build does.
+/// [`prove_segment`], the trace (its main and preprocessed columns) through
+/// `tamper` before it is committed, each chip's blinding fraction through
+/// `blind` once the relations are drawn, the prover held to `checks` alone:
+/// the soundness gates' forced proofs. Only the tests' dev edge has it
+/// (`seeded-masks`); no production build does.
 #[cfg(feature = "seeded-masks")]
 pub fn prove_segment_forced<MC: MerkleChannel>(
     format: &Format,
@@ -89,12 +105,12 @@ pub fn prove_segment_forced<MC: MerkleChannel>(
     rng: MaskRng,
     tamper: impl FnOnce(&mut MaskedSegmentTrace),
     blind: impl Fn(&AllLookupElements, &mut [FirstRowFraction]),
-    checked: bool,
+    checks: Checks,
 ) -> Result<(SegmentProof<MC::H>, MaskStats), ProveError>
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    prove_segment_with::<MC>(format, side_note, active, rng, tamper, blind, checked)
+    prove_segment_with::<MC>(format, side_note, active, rng, tamper, blind, checks)
 }
 
 fn prove_segment_with<MC: MerkleChannel>(
@@ -104,7 +120,7 @@ fn prove_segment_with<MC: MerkleChannel>(
     rng: MaskRng,
     tamper: impl FnOnce(&mut MaskedSegmentTrace),
     blind: impl Fn(&AllLookupElements, &mut [FirstRowFraction]),
-    checked: bool,
+    checks: Checks,
 ) -> Result<(SegmentProof<MC::H>, MaskStats), ProveError>
 where
     SimdBackend: BackendForChannel<MC>,
@@ -130,12 +146,12 @@ where
         active,
         log_sizes: &trace.log_sizes,
         preprocessed: trace.preprocessed(),
-        main: trace.main(),
+        main: &|chip: usize| trace.main(chip),
         public: &public,
         interaction: &interaction,
     };
     let (proof, stats) =
-        super::prove_masked_checked::<MC, SegmentComponents>(format, masked, rng, checked)?;
+        super::prove_masked_checked::<MC, SegmentComponents>(format, masked, rng, checks)?;
     Ok((
         SegmentProof {
             active,
@@ -159,14 +175,45 @@ pub fn segment_format<'a>(
     Some((verifier_format(format, log_sizes, &layout)?, layout))
 }
 
-/// Verifies `proof` under `format`, its chips laid out from its active-chip
-/// mask and log sizes, its preprocessed root `circuit`'s when given: the
-/// masked transcript, the claimed sums' total zero and the boundary chips'
-/// sums the boundary states'.
+/// The preprocessed root a masked segment of `side_note`'s run over the
+/// chips `active` names commits under `format` on `MC`'s trees: each chip's
+/// preprocessed columns (the program's code, the jump table, the fixed
+/// tables) at its floor ([`floors`]), extended one level, as the prover
+/// commits them. What a verifier pins: a function of the program and the
+/// shape, never of a proof.
+pub fn circuit_root<MC: MerkleChannel>(
+    format: &Format,
+    side_note: &mut SideNote,
+    active: u32,
+) -> Result<<MC::H as MerkleHasherLifted>::Hash, ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
+    let floors = floors(format, active).ok_or(ProveError::TraceShape(
+        "the format's masking does not fit the chips",
+    ))?;
+    let trace = masked_segment_trace(side_note, active, &floors)
+        .map_err(|error| ProveError::Segment(error.to_string()))?;
+    let lifting = super::lifting_log_size(format, &trace.log_sizes)
+        .ok_or(ProveError::TraceShape("a component's log size overflows"))?;
+    let twiddles =
+        SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
+    let mut scheme = CommitmentSchemeProver::<SimdBackend, MC>::new(format.pcs_config(), &twiddles);
+    let mut builder = scheme.tree_builder();
+    builder.extend_polys(super::extend_preprocessed(trace.preprocessed(), &twiddles));
+    builder.commit(&mut MC::C::default());
+    Ok(scheme.roots()[0])
+}
+
+/// Verifies `proof` under `format` against `circuit`, the preprocessed root
+/// its program and shape commit ([`circuit_root`]), its chips laid out from
+/// its active-chip mask and log sizes: the masked transcript, the claimed
+/// sums' total zero and the boundary chips' sums the boundary states'.
+/// The root is the only pin of the tables' and the code's content.
 pub fn verify_segment<MC: MerkleChannel>(
     format: &Format,
     proof: &SegmentProof<MC::H>,
-    circuit: Option<<MC::H as MerkleHasherLifted>::Hash>,
+    circuit: <MC::H as MerkleHasherLifted>::Hash,
 ) -> Result<(), Error> {
     let (masked, layout) =
         segment_format(format, proof.active, &proof.log_sizes).ok_or(Error::Format)?;
@@ -183,7 +230,7 @@ pub fn verify_segment<MC: MerkleChannel>(
     };
     let claim = Claim {
         log_sizes: &proof.log_sizes,
-        circuit,
+        circuit: Some(circuit),
         public: &public,
         public_sum: Some(&zero),
         bound_sums: Some(&bound),

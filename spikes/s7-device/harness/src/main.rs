@@ -568,7 +568,7 @@ fn masked_format(cell: &Cell) -> Format {
 fn real(cell: &Cell, run: &Run, trace_seconds: f64, reps: usize) {
     use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
     use vos_pvm_recair::masked::MaskRng;
-    use vos_pvm_recair::masked::segment::{prove_segment, verify_segment};
+    use vos_pvm_recair::masked::segment::{circuit_root, prove_segment, verify_segment};
     let format = masked_format(cell);
     let steps = run.steps();
     let mut mask = run.chips;
@@ -610,11 +610,13 @@ fn real(cell: &Cell, run: &Run, trace_seconds: f64, reps: usize) {
     let (verified, verify_ms) = if cell.floor {
         ("null".to_string(), 0.0)
     } else {
+        let root = circuit_root::<Blake2sMerkleChannel>(&format, &mut run.whole(), mask)
+            .expect("the circuit's root");
         let mut best = f64::INFINITY;
         let mut ok = true;
         for _ in 0..3 {
             let started = Instant::now();
-            ok &= verify_segment::<Blake2sMerkleChannel>(&format, &proof, None).is_ok();
+            ok &= verify_segment::<Blake2sMerkleChannel>(&format, &proof, root).is_ok();
             best = best.min(started.elapsed().as_secs_f64());
         }
         (ok.to_string(), best * 1e3)

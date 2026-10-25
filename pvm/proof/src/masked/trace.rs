@@ -14,7 +14,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::simd::column::BaseColumn;
 use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::CircleEvaluation;
-use stwo_constraint_framework::{ORIGINAL_TRACE_IDX, PREPROCESSED_TRACE_IDX};
+use stwo_constraint_framework::PREPROCESSED_TRACE_IDX;
 
 use crate::lookups::AllLookupElements;
 use crate::proof::SegmentState;
@@ -81,20 +81,31 @@ impl MaskedSegmentTrace {
             .collect()
     }
 
-    /// Each chip's main columns.
-    pub fn main(&self) -> Vec<Evaluations> {
+    /// Chip `chip`'s main columns (its position among the trace's chips),
+    /// in bit-reversed order, borrowed: the masked prover interpolates them
+    /// a column at a time, with no copy of the trace.
+    pub fn main(&self, chip: usize) -> Vec<&BaseColumn> {
         self.traces
-            .iter()
-            .map(|trace| trace.to_circle_evaluation(ORIGINAL_TRACE_IDX))
-            .collect()
+            .get(chip)
+            .map_or_else(Vec::new, |trace| trace.original_trace.iter().collect())
     }
 
     /// Each chip's main columns, in bit-reversed order, to change: what a
-    /// forged trace starts from.
+    /// forged trace starts from. The soundness gates' seam alone.
+    #[cfg(feature = "seeded-masks")]
     pub fn main_columns_mut(&mut self) -> impl Iterator<Item = &mut Vec<BaseColumn>> {
         self.traces
             .iter_mut()
             .map(|trace| &mut trace.original_trace)
+    }
+
+    /// Each chip's preprocessed columns, in bit-reversed order, to change: a
+    /// table or code the prover chooses. The soundness gates' seam alone.
+    #[cfg(feature = "seeded-masks")]
+    pub fn preprocessed_columns_mut(&mut self) -> impl Iterator<Item = &mut Vec<BaseColumn>> {
+        self.traces
+            .iter_mut()
+            .map(|trace| &mut trace.preprocessed_trace)
     }
 
     /// The values mixed after the main tree's root: the boundary states
@@ -123,7 +134,7 @@ impl MaskedSegmentTrace {
             .enumerate()
             .map(|(index, (component, trace))| {
                 let (columns, claimed_sum) =
-                    component.generate_interaction_trace(trace.clone(), side_note, relations);
+                    component.generate_interaction_trace(trace, side_note, relations);
                 let blind = blinding
                     .get(index)
                     .map_or(SecureField::zero(), |&(numerator, denominator)| {
@@ -145,9 +156,13 @@ fn blinded(
     log_size: u32,
     blind: SecureField,
 ) -> (Evaluations, SecureField) {
-    if blind.is_zero() || columns.len() < 4 {
+    if blind.is_zero() {
         return (columns, claimed_sum);
     }
+    assert!(
+        columns.len() >= 4,
+        "a chip with no fraction has no running sum to blind"
+    );
     let rows = 1usize << log_size;
     let step = blind * BaseField::from(rows as u32).inverse();
     let first = columns.len() - 4;

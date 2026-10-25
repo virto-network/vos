@@ -386,6 +386,8 @@ fn the_masked_prover_is_generic() {
     let log_sizes = [LOG_SIZE];
     let preprocessed = trace::evaluations(&trace::preprocessed_columns(circuit)[0], LOG_SIZE);
     let main = trace::main_trace(circuit, &finalized.witness);
+    let main_columns = trace::evaluations(&main.columns[0], LOG_SIZE);
+    let main_of = |_: usize| main_columns.iter().map(|column| &column.values).collect();
     let interaction = |relation: &GateRelation, blinding: &[FirstRowFraction]| {
         let [p2, _, _] =
             main.interaction_with(circuit, relation, [blinding.first().copied(), None, None]);
@@ -399,7 +401,7 @@ fn the_masked_prover_is_generic() {
                 active: (),
                 log_sizes: &log_sizes,
                 preprocessed: preprocessed.clone(),
-                main: vec![trace::evaluations(&main.columns[0], LOG_SIZE)],
+                main: &main_of,
                 public: &finalized.witness.outputs,
                 interaction: &interaction,
             },
