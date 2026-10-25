@@ -13,7 +13,7 @@ use runtime::{Cursor, HEAP, STACK_BYTES, Static, gas_left};
 use vos_pvm_final_verifier::PUBLIC_WORDS;
 use vos_statement::model::Input;
 use vos_statement::vos_anchor::vectors::{Digests, Vector};
-use vos_statement::{Admitted, Refusal, StatementId};
+use vos_statement::{Refusal, StatementId};
 
 global_asm!(
     ".global _start",
@@ -161,33 +161,26 @@ extern "C" fn verify_main() -> Output {
     }
 }
 
-/// What the payload asks.
+/// What the payload asks: a proof checked against the words alone under a
+/// format, or a judgement's statement (`J`, its input, then the checks
+/// before the proof admitted).
 #[allow(clippy::large_enum_variant, reason = "one a run, never moved")]
-enum Request {
+enum Request<J> {
     Words(u32, [u32; PUBLIC_WORDS]),
-    Judge(Input),
-}
-
-/// What the proof is checked against: the words alone under a format, or a
-/// judgement's statement its checks before the proof admitted.
-enum Check {
-    Words(u32, [u32; PUBLIC_WORDS]),
-    Judge(Admitted),
+    Judge(J),
 }
 
 /// The payload: its request, the proof's hash and its length.
-fn request(mode: Mode, body: &[u8]) -> Option<(Request, [u8; 32], usize)> {
+fn request(mode: Mode, body: &[u8]) -> Option<(Request<Input>, [u8; 32], usize)> {
     let (request, rest) = match mode {
         Mode::Words => {
             let (format, body) = body.split_first_chunk::<4>()?;
             let (words, rest) = body.split_at_checked(4 * PUBLIC_WORDS)?;
-            let (words, _) = words.as_chunks::<4>();
             let mut out = [0; PUBLIC_WORDS];
-            for (word, bytes) in out.iter_mut().zip(words) {
+            for (word, bytes) in out.iter_mut().zip(words.as_chunks::<4>().0) {
                 *word = u32::from_le_bytes(*bytes);
             }
-            let words = out;
-            (Request::Words(u32::from_le_bytes(*format), words), rest)
+            (Request::Words(u32::from_le_bytes(*format), out), rest)
         }
         Mode::Judge => {
             let (input, used) = Input::decode_prefix(body).ok()?;
@@ -197,6 +190,43 @@ fn request(mode: Mode, body: &[u8]) -> Option<(Request, [u8; 32], usize)> {
     };
     let [hash @ .., l0, l1, l2, l3] = <[u8; 36]>::try_from(rest).ok()?;
     Some((request, hash, u32::from_le_bytes([l0, l1, l2, l3]) as usize))
+}
+
+/// A golden vector's digests, computed: no proof is read.
+fn vectors(report: &mut Report, vector: &[u8]) -> Verdict {
+    match Vector::decode(vector) {
+        Ok(vector) => {
+            report.digests = vector.digests().to_bytes();
+            Verdict::Accept
+        }
+        Err(error) => {
+            report.refuse(&error);
+            Verdict::BadPayload
+        }
+    }
+}
+
+/// The proof of `proof_len` bytes whose hash is `hash`, a preimage the
+/// host's `historical_lookup` reads; `None` when the host has not all of it.
+fn lookup_proof(hash: &[u8; 32], proof_len: usize) -> Option<Vec<u8>> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(proof_len);
+    let found = hostcall!(
+        HISTORICAL_LOOKUP,
+        [
+            NONE,
+            hash.as_ptr() as u64,
+            bytes.as_mut_ptr() as u64,
+            0,
+            proof_len as u64,
+            0
+        ]
+    );
+    if found != proof_len as u64 {
+        return None;
+    }
+    // SAFETY: the host wrote all `proof_len` bytes.
+    unsafe { bytes.set_len(proof_len) };
+    Some(bytes)
 }
 
 fn verify(report: &mut Report) -> Verdict {
@@ -223,60 +253,37 @@ fn verify(report: &mut Report) -> Verdict {
         return Verdict::BadPayload;
     };
     if let Mode::Anchors = mode {
-        return match Vector::decode(body) {
-            Ok(vector) => {
-                report.digests = vector.digests().to_bytes();
-                Verdict::Accept
-            }
-            Err(error) => {
-                report.refuse(&error);
-                Verdict::BadPayload
-            }
-        };
+        return vectors(report, body);
     }
     let Some((request, hash, proof_len)) = request(mode, body) else {
         return Verdict::BadPayload;
     };
     report.proof_len = proof_len as u64;
     let check = match request {
-        Request::Words(format, words) => Check::Words(format, words),
+        Request::Words(format, words) => Request::Words(format, words),
         Request::Judge(input) => match input.admit() {
-            Ok(admitted) => Check::Judge(admitted),
+            Ok(admitted) => Request::Judge(admitted),
             Err(refusal) => return report.judged(Err(refusal)),
         },
     };
     if proof_len > vos_pvm_final_verifier::MAX_PROOF_BYTES {
         let error = vos_pvm_final_verifier::Error::Length;
         return match check {
-            Check::Words(..) => {
+            Request::Words(..) => {
                 report.refuse(&error);
                 Verdict::Undecodable
             }
-            Check::Judge(_) => report.judged(Err(Refusal::Proof(error))),
+            Request::Judge(_) => report.judged(Err(Refusal::Proof(error))),
         };
     }
 
-    let mut bytes: Vec<u8> = Vec::with_capacity(proof_len);
-    let found = hostcall!(
-        HISTORICAL_LOOKUP,
-        [
-            NONE,
-            hash.as_ptr() as u64,
-            bytes.as_mut_ptr() as u64,
-            0,
-            proof_len as u64,
-            0
-        ]
-    );
-    if found != proof_len as u64 {
+    let Some(bytes) = lookup_proof(&hash, proof_len) else {
         return Verdict::NoPreimage;
-    }
-    // SAFETY: the host wrote all `proof_len` bytes.
-    unsafe { bytes.set_len(proof_len) };
+    };
     report.gas_after_lookup = gas_left();
 
     match check {
-        Check::Words(format, words) => {
+        Request::Words(format, words) => {
             let decoded = match vos_pvm_final_verifier::decode(
                 format,
                 vos_pvm_final_verifier::LINKED,
@@ -296,6 +303,6 @@ fn verify(report: &mut Report) -> Verdict {
                 Err(error) => report.refuse(&error),
             }
         }
-        Check::Judge(admitted) => report.judged(admitted.verify(&bytes)),
+        Request::Judge(admitted) => report.judged(admitted.verify(&bytes)),
     }
 }
