@@ -387,3 +387,119 @@ again [measured]: 1,036 s, the same verdicts, latency 47.5 s at Kreivo and
 60.8–109.0 s at JAM, each under its gate; the audit clean over 398
 carriers.
 
+## Step 7.8a: the pvm-internal re-pin
+
+Slice 6's carried items inside `pvm/proof`, the final verifier, recair and
+the kernels' code, from vos-core `62981f95`, each its own commit, and one
+re-pin at the end.
+
+| item | what | commit |
+|---|---|---|
+| 13 | the masking's witness digest hashes `statement_header_words` (its count first), then the words the header leaves out: the DEEP batching, the interaction PoW, the channel, the masking | `40614908` |
+| 16, unmasked half | `unmasked::check_samples` by `masked::samples_fit`; `check_shape`'s four tree counts one array | `d4ea3be8` |
+| 17 | `vos_pvm_recair_air::evals`, shared by `Components::new`, `WrapComponents::build` and `bind`, the allocation order kept; `WrapComponents::layout`, the dummy layout the final verifier and three tests laid out by hand | `f6653134` |
+| 18 | `replay`'s seams `admitted` and `check_composition`, the check order kept; `masked::eval_lifted_composition`, for the final verifier and recair-air's tests | `6d979de2` |
+| 19 | `recair-air/src/masked.rs` split into `masked/{mod,component,wrap}.rs`; `masked::TREES` once, the final verifier re-exporting it, `sample_points` reading `TREES − 1` for the literal 3 | `b74d2124` |
+| 20, `final-verify.elf`'s piece | the guest's mode bytes a `#[repr(u8)] Mode`, its verdicts a `#[repr(u64)] Verdict`; the wire and the report unchanged | `ccb8ca81` |
+| 24, `final-verify.elf`'s piece | the guest's `verify` split: `vectors`, `lookup_proof`; one `Request<J>` for `Request` and `Check`; the words decoded without the copy | `41b97e0d` |
+| slice 5's 18, `array::from_fn` | `agent/tree`'s branch hash builds its child words by `array::from_fn` over `as_chunks`; every guest ELF byte-identical | `a2e4648c` |
+| slice 5's 18, `leaf_terms` | the per-query and OODS offsets named after the pieces of recair's verifier they count: `domain_point_rows` (`4L − 5`: 2 for the bit above the first, 4 a bit after, 1 to conjugate; `verifier::circle::domain_point`), `fri_fold_rows` (`6F − 2`: 5 a layer, the twiddle's inverse, the difference, its scaling, the sum and the fold, and `x` doubled past the second; `verifier::fri::verify_query`), `OODS_ROWS` (15: the point from its draw 4, the shift 2, the vanishing inverse 1, the composition's halves 3 each, their sum 1, the product 1; with the two doubling chains `2(m − 1)`, the old `2m + 13`), `PREPROCESSED_ROOT_WORDS` (the shape's `+ 2`); every count unchanged | `9c0037a9` |
+| the re-pin | `just fixtures`, `just conformance`; `proving.md` and `recursion-air.md`'s `wrap.proof` size | `0de5ebcb` |
+
+**Left to 7.8b, as the plan splits them:** items 3, 4's guest half, 21,
+22, 23 (the guests' shared runtime: `statement-service.elf` includes it),
+25 and the service's and `vos-anchor`'s pieces of 17–24, 26
+(`SpaceGenesis::version`), 27 (`ANCHORS` out of `final-verify.elf`), 28
+(`read_nat`), 33, 64–67, 69 and `blobs.lock`. Item 18's fourth copy, in
+recair's `prove_once`, stays: the prover keeps the lifted set for R1's
+rank check, so the shared evaluation would lift it twice.
+
+**The pinned values:** none of `pvm/proof/src/constants.rs` moved.
+`WINDOW_PROGRAM`, `BALANCE_PROGRAM`, `PREDICATE_PROGRAM`, `H_FOLD`,
+`WRAP_ROOT_28` and `WRAP_ROOT_39` are as at `62981f95`:
+- the program ids: every guest ELF (the 22 test actors, the agent image,
+  the representative) is byte-identical to `62981f95`'s, so no kernel's
+  program id moves (below, on `array::from_fn`);
+- `H_FOLD` and the wraps' roots: the fold and wrap circuits are recair's
+  compilation of the segment verifier, which no item changed, and items
+  17–19 keep the wrap AIR's allocation order, so its preprocessed tree is
+  the same.
+
+**What moved:**
+- The fixtures (sha256 prefix, bytes): `wrap.proof` `0b8e3cea…` 146,564 →
+  `57f72bf7…` 148,612; `wrap-midway.proof` `d8ffe921…` 145,028 →
+  `dda5bf84…` 147,588; `wrap-prefix.proof` `15e5dfbc…` 144,292 →
+  `1e2b8860…` 142,724; `statements.cases` `b95ffc54…` → `30649910…`
+  (14,591 B, the cases unchanged, the wraps in them the new ones). The
+  masked wraps move with item 13: the seeded masks hash the new statement
+  words, so other masks, other roots, other query positions and another
+  count of decommitted nodes. `segment-35.*` and `wrap-28.proof`
+  (unmasked) are byte-identical.
+- The conformance vectors: `spaces.json` and `mutations.json`, the wraps'
+  hashes and lengths in the submit steps alone; the scenarios unchanged.
+- The blobs that link the final verifier change with its code (not
+  hashed here; no test pins them, 7.8b's `blobs.lock` will):
+  `final-verify.elf`, `final-verify-test.elf`, both Wasm blobs and
+  `statement-service.elf`, which links it through `vos-statement`.
+
+**The teammate's second drop:** the kit's fixtures (the three masked
+wraps and `statements.cases`), the conformance vectors (the wraps'
+hashes and lengths) and the vendored
+`vos-pvm-recair-air` (the masked module split into three files, `evals`,
+`WrapComponents::layout`, `eval_lifted_composition`, `TREES`) and
+`vos-pvm-final-verifier` (`replay`'s seams, `masked::TREES` a re-export).
+No pallet code changes: a verifier accepts the old wraps as before, and
+the new ones are the vectors'. The pinned program ids are unchanged, so
+the drop carries none; 7.21 is the one left that may move them.
+
+**`array::from_fn` and the kernels' steps** [measured]: written as
+`from_fn(|k| word(hash, k))` over the old slice-and-`try_into` closure,
+the branch hash moved the window, balance, reader and accounts kernels
+and cost the sixteen-row read's prologue 16,753 steps (210,019 →
+226,772, +8.0%; one row 35,465 → 37,495), past `BUDGET_SIXTEEN_STEPS`'
+10% margin (`reads::reads_at_a_cut_measure` failed in `test-proof`):
+the per-`k` slice was no longer folded into word loads. Read through
+`as_chunks::<8>()`, the same `from_fn` compiles to the old code byte for
+byte, so the item lands without moving `WINDOW_PROGRAM` or
+`BALANCE_PROGRAM`.
+
+
+**Where the plan was off:**
+- The Fable review's M4 lists 7.8's items as "13, 14, 18, 19, 21–26, 34
+  and 35" with `shape::chip`, `chips_of_mask`, the CPU `Lookups`, the
+  Blake2b column macro, `MIN_LOG_SIZE` and the `derive::kernel` and
+  `DeepPlan::new` splits: that is slice 5's review's numbering, and 6.22
+  landed all of it but item 18's two pieces, folded here. The plan's own
+  7.8a list (slice 6's numbering) is the one this step followed.
+- The plan expected the re-pin to move program ids (`array::from_fn`
+  moving `WINDOW_PROGRAM` and `BALANCE_PROGRAM`, slice 6's carried note).
+  Written so the guest's code is the same, it moves none: 7.8a's drop is
+  fixtures and vectors, no ids.
+- `final-verify.elf`'s pieces of items 20 and 24 land here (the plan's
+  "final verifier's pieces of 17–25"); 7.8b's item 27 then removes the
+  `Anchors` mode and `vectors` from the same file.
+
+**Gates** [measured; each under a 12 GiB scope, `nice -n 10`,
+`CARGO_BUILD_JOBS=8`, one heavy run at a time, other agents' runs on the
+machine]:
+- **`just check`:** green at `0de5ebcb`, 1,400 passed in 109 suites
+  (`check-kit` and `fuzz-replay` in it). The first run caught recair's
+  `only_the_masked_module_names_the_blinding_relation`, which named the
+  file `masked.rs`: it now exempts the `masked/` module (folded into
+  item 19's commit).
+- **`just test-proof`** (`ci-full`'s: the leakage gates at their medium
+  N): green, 562 passed in 47 suites, 3,223 s; `constants::` with every
+  pinned value as at `62981f95`; the carrier audit clean (451
+  `WrapRandomness` needles). Its first run, with `from_fn` written the
+  first way, failed `reads::reads_at_a_cut_measure` (above).
+- **`just repro-aarch64`:** the program ids and the circuits' constants
+  on aarch64 are the repository's.
+- **`just e2e-chain`:** green, 1,071 s: seven statements accepted at
+  their venues, the JAM space's first statement refused 5 at Kreivo and
+  at JAM `b`, the rootless one 4, the replay past `MaxRootAge` 5; latency
+  50.4 s at Kreivo and 72.9–127.0 s at JAM, each under its gate
+  (193.1–216.6 s); refine 78.3–80.0 M gas a statement; the audit clean
+  over 398 carriers. A first run, under the machine's load at the time
+  (load average about 11), failed one latency gate by 2.2 s (JAM's
+  window-2 window statement, 228.8 s against 226.6 s) after every verdict
+  had come out as expected; rerun at a load of about 4, green.
