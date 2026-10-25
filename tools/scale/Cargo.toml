@@ -1,0 +1,27 @@
+[package]
+name = "vos-scale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The scale test's harness, which no VOS node links: an inventory of LAN hosts checked, a space deployed on them over ssh, its nodes started and stopped as user units, agents placed by weight, a load driven, and each run's samples collected and reported."
+publish = false
+
+[[bin]]
+name = "vos-scale"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2"
+hex = "0.4"
+serde = { workspace = true }
+serde_json = "1"
+toml = "1"
+# The harness's clients: the operator's admin commands and signed calls,
+# each node pinned by its key over TLS.
+vos-node = { path = "../../node/host" }
+vos-pvm = { workspace = true }
+vos-wire = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

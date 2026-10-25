@@ -134,6 +134,12 @@ pub struct RunArgs {
     /// ingress address. Without it, the node is a space of one.
     #[arg(long)]
     pub space: Option<PathBuf>,
+    /// The node's settings, a TOML file: `executors`, `queue`,
+    /// `max_inputs`, `max_bytes`, `linger_ms`, `ingress_connections`,
+    /// `election_timeout_ms` (its two ends) and `heartbeat_ms`, each
+    /// optional. Without it, the defaults.
+    #[arg(long)]
+    pub config: Option<PathBuf>,
     /// Bind the peer endpoint here rather than at the address the
     /// space lists for this node, as behind port forwarding.
     #[arg(long)]
@@ -167,6 +173,17 @@ pub enum SpaceCommand {
         /// founding time by default.
         #[arg(long)]
         origin_ms: Option<u64>,
+    },
+    /// Create the space's representative, with the admin token of the
+    /// space's first founding node, which creates it once: its id is
+    /// printed. Then install the representative's package as its instance.
+    Representative {
+        #[command(flatten)]
+        operator: OperatorArgs,
+        /// The founding nodes to replicate it on, by number: `1,2,3`. The
+        /// node alone by default.
+        #[arg(long, value_delimiter = ',')]
+        replicas: Vec<u8>,
     },
 }
 

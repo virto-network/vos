@@ -216,6 +216,47 @@ fn a_node_holding_agents_founds_no_space() {
     assert!(!dir.path().join("space.genesis").exists());
 }
 
+/// A node runs with the settings its `--config` file gives, and refuses a
+/// file naming a setting it does not know; the space's first founding node
+/// creates the representative once, by `vos space representative`.
+#[test]
+fn the_founding_node_creates_the_representative_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut first, data, _) = single_node(dir.path());
+    first.running.kill();
+    let ingress = vos_checker::spaces::free_tcp_port();
+    let peer = vos_checker::spaces::free_udp_port();
+    let url = format!("http://127.0.0.1:{ingress}");
+    let space = dir.path().join("space");
+    let space = space.to_str().unwrap();
+    std::fs::write(space, format!("1 {} 127.0.0.1:{peer} {url}\n", first.key)).unwrap();
+    vos(["space", "up", "--space", space, "--data", &data]);
+    let config = dir.path().join("node.toml");
+    let config = config.to_str().unwrap();
+    std::fs::write(config, "executor = 2\n").unwrap();
+    let listen = format!("127.0.0.1:{ingress}");
+    let agent = agent_elf();
+    let run = [
+        "node", "run", "--data", &data, "--listen", &listen, "--space", space, "--config", config,
+    ];
+    let refused = vos_fails(
+        run.iter()
+            .copied()
+            .chain(["--agent", agent.to_str().unwrap()]),
+    );
+    assert!(refused.contains("executor"), "{refused}");
+    std::fs::write(config, "executors = 2\nlinger_ms = 3\nheartbeat_ms = 400\n").unwrap();
+    let _node = node_run(dir.path(), &run[2..]);
+    let representative = ["space", "representative", "--node", &url, "--data", &data];
+    let id: u32 = vos(representative)
+        .parse()
+        .expect("the representative's id");
+    let refused = vos_fails(representative);
+    assert!(refused.contains("representative exists"), "{refused}");
+    let created = vos(["agent", "create", "--node", &url, "--data", &data]);
+    assert_ne!(created.parse::<u32>().unwrap(), id);
+}
+
 /// `vos node anchor-key rotate` makes a key in a stopped node's store and
 /// prints it: each rotation another, kept in order, apart from the node
 /// key. A directory with no node's store is refused.

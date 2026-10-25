@@ -2613,8 +2613,10 @@ dependencies = [
  "httparse",
  "libc",
  "mimalloc",
+ "serde",
  "smol",
  "tempfile",
+ "toml",
  "tracing-subscriber",
  "vos-checker",
  "vos-jam",
@@ -2922,6 +2924,22 @@ name = "vos-raft"
 version = "0.1.0"
 dependencies = [
  "proptest",
+]
+
+[[package]]
+name = "vos-scale"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "toml",
+ "vos-node",
+ "vos-pvm",
+ "vos-wire",
 ]
 
 [[package]]

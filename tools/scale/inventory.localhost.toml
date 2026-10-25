@@ -1,0 +1,71 @@
+# The harness's smoke: four nodes and a driver on this machine, each a
+# `localhost` entry with its own ports, directory and cores. Run from the
+# repository's root after `just release build-agent build-representative
+# build-test-actors`:
+#
+#   target/x86_64-unknown-linux-musl/release/vos-scale \
+#     -i tools/scale/inventory.localhost.toml run \
+#     --agents 4 --representative --users 40 --rate 20 --secs 30
+#
+# and again without a node, compared with the first:
+#
+#   ... --exclude n4 run --agents 4 --users 40 --rate 20 --secs 30
+#   ... report --compare <the first run>
+
+[harness]
+runs = "/var/tmp/vos-scale/runs"
+memory_max = "2G"
+# The shortest window a space may have.
+window_ms = 120000
+
+[node]
+executors = 2
+
+[[host]]
+name = "n1"
+ssh = "localhost"
+address = "127.0.0.1"
+role = "node"
+dir = "/var/tmp/vos-scale/n1"
+cores = "0-3"
+ingress = 7911
+peer = 7921
+
+[[host]]
+name = "n2"
+ssh = "localhost"
+address = "127.0.0.1"
+role = "node"
+dir = "/var/tmp/vos-scale/n2"
+cores = "4-7"
+ingress = 7912
+peer = 7922
+
+[[host]]
+name = "n3"
+ssh = "localhost"
+address = "127.0.0.1"
+role = "node"
+weight = 2
+dir = "/var/tmp/vos-scale/n3"
+cores = "8-11"
+ingress = 7913
+peer = 7923
+
+[[host]]
+name = "n4"
+ssh = "localhost"
+address = "127.0.0.1"
+role = "node"
+dir = "/var/tmp/vos-scale/n4"
+cores = "16-19"
+ingress = 7914
+peer = 7924
+
+[[host]]
+name = "d1"
+ssh = "localhost"
+address = "127.0.0.1"
+role = "driver"
+dir = "/var/tmp/vos-scale/d1"
+cores = "20-21"

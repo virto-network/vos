@@ -14,27 +14,33 @@ use crate::args::{AgentCommand, InstallArgs, OperatorArgs, RoleArgs};
 use crate::call::{print_admin_answer, said};
 use crate::{at, failed, key_bytes};
 
+/// A created agent's id printed, or why there is none.
+pub(crate) fn created(
+    answer: Result<Response, vos_node::client::ClientError>,
+) -> Result<(), String> {
+    match answer.map_err(failed)? {
+        Response::Created(agent) => {
+            println!("{}", agent.0);
+            Ok(())
+        }
+        Response::Unconfirmed(agent) => {
+            println!("{}", agent.0);
+            eprintln!("vos: a majority of its replicas does not hold it yet");
+            Ok(())
+        }
+        other => {
+            let (Ok(text) | Err(text)) = said(&other);
+            Err(text)
+        }
+    }
+}
+
 impl AgentCommand {
     pub fn run(self) -> Result<(), String> {
         match self {
-            AgentCommand::Create { operator, replicas } => match operator_of(&operator)?
-                .create_agent(replicas)
-                .map_err(failed)?
-            {
-                Response::Created(agent) => {
-                    println!("{}", agent.0);
-                    Ok(())
-                }
-                Response::Unconfirmed(agent) => {
-                    println!("{}", agent.0);
-                    eprintln!("vos: a majority of its replicas does not hold it yet");
-                    Ok(())
-                }
-                other => {
-                    let (Ok(text) | Err(text)) = said(&other);
-                    Err(text)
-                }
-            },
+            AgentCommand::Create { operator, replicas } => {
+                created(operator_of(&operator)?.create_agent(replicas))
+            }
             AgentCommand::Replace {
                 operator,
                 agent,
@@ -127,7 +133,7 @@ impl RoleArgs {
     }
 }
 
-fn operator_of(args: &OperatorArgs) -> Result<Operator, String> {
+pub(crate) fn operator_of(args: &OperatorArgs) -> Result<Operator, String> {
     let path = args.data.join(ADMIN_TOKEN);
     let token = std::fs::read_to_string(&path).map_err(at(&path))?;
     // On the node's host, its data directory holds its key.

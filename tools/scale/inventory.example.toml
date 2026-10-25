@@ -1,0 +1,68 @@
+# The scale test's inventory: copy it to `inventory.toml`, one `[[host]]`
+# a node or a driver, and run `vos-scale check` until every host passes.
+# Every host is x86-64 Linux 6.7 or later on a wired link, reached by
+# key-based ssh as a user with lingering on (`loginctl enable-linger`).
+# The coordinator, which runs `vos-scale`, needs no entry; during a timed
+# run it shares no host with a node.
+
+[harness]
+# Where runs are kept on the coordinator, relative to this file.
+runs = "runs"
+# Each node's and driver's memory cap (systemd's MemoryMax).
+memory_max = "16G"
+# The space's window length: 2 minutes, as the runs measure windows.
+window_ms = 120000
+# check refuses a host whose clock is further off than this.
+max_clock_offset_ms = 100
+# How often hosts are sampled and nodes polled.
+every_s = 10
+
+# The nodes' settings (`vos node run --config`), the same on every node:
+# executors, queue, max_inputs, max_bytes, linger_ms, ingress_connections,
+# election_timeout_ms = [low, high], heartbeat_ms. Unset, the defaults.
+[node]
+
+[[host]]
+name = "desktop"
+# user@address for ssh; `localhost` runs on the coordinator itself.
+ssh = "owner@192.168.1.10"
+# The address on the wired LAN the other hosts reach it at.
+address = "192.168.1.10"
+role = "node"
+# Its share of agents' replicas against the other nodes': a slower host
+# weighs less. It still gates every group it follows (a group commits at
+# its median replica's fsync): exclude it to measure without it.
+weight = 2
+# A directory on the disk the node's data goes on: binaries, data, logs.
+dir = "/srv/vos-scale"
+# The cores it may use (taskset -c); all when unset.
+cores = "0-11"
+ingress = 7700
+peer = 7701
+
+[[host]]
+name = "laptop"
+ssh = "owner@192.168.1.11"
+address = "192.168.1.11"
+role = "node"
+weight = 1
+dir = "/home/owner/vos-scale"
+ingress = 7700
+peer = 7701
+
+[[host]]
+name = "nuc"
+ssh = "owner@192.168.1.12"
+address = "192.168.1.12"
+role = "node"
+weight = 1
+dir = "/home/owner/vos-scale"
+ingress = 7700
+peer = 7701
+
+[[host]]
+name = "driver"
+ssh = "owner@192.168.1.13"
+address = "192.168.1.13"
+role = "driver"
+dir = "/home/owner/vos-scale"

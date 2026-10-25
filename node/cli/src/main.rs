@@ -3,6 +3,7 @@
 
 mod args;
 mod call;
+mod config;
 mod kept;
 mod operator;
 
@@ -159,6 +160,9 @@ impl RunArgs {
         config.ingress_tls = self.tls.ingress();
         config.space = self.space.as_deref().map(Space::read).transpose()?;
         config.peer_bind = self.peer_bind;
+        if let Some(path) = &self.config {
+            config::Settings::read(path)?.apply(&mut config)?;
+        }
         #[cfg(feature = "prover")]
         {
             config.prover = Some(std::sync::Arc::new(
@@ -194,6 +198,16 @@ impl SpaceCommand {
                 window_ms,
                 origin_ms,
             } => found(&space, &data, window_ms, origin_ms),
+            SpaceCommand::Representative { operator, replicas } => {
+                match operator::operator_of(&operator)?.create_representative(replicas) {
+                    Ok(vos_wire::ingress::Response::Unavailable) => Err(
+                        "the node refused: the representative exists, the node is not the space's \
+                         first founding node, or a replica did not found the space"
+                            .into(),
+                    ),
+                    answer => operator::created(answer),
+                }
+            }
         }
     }
 }

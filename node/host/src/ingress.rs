@@ -192,7 +192,10 @@ impl Ingress {
                     _ => http::Response::not_found(),
                 }
             }
-            ("POST", ["agents"] | ["agents", _, "install" | "roles" | "replicas"])
+            (
+                "POST",
+                ["agents"] | ["representative"] | ["agents", _, "install" | "roles" | "replicas"],
+            )
             | ("GET", ["agents", _, "status"] | ["stats"])
                 if !self.admitted(&request) =>
             {
@@ -214,6 +217,22 @@ impl Ingress {
                         Ok(agent) => Response::Created(agent),
                         Err(error) => error.into(),
                     }),
+                    Err(answer) => respond(answer),
+                }
+            }
+            ("POST", ["representative"]) => {
+                let create = if request.body.is_empty() {
+                    Ok(Create::default())
+                } else {
+                    decode::<Create>(&request.body)
+                };
+                match create {
+                    Ok(create) => respond(
+                        match self.inner.create_representative(create.replicas).await {
+                            Ok(agent) => Response::Created(agent),
+                            Err(error) => error.into(),
+                        },
+                    ),
                     Err(answer) => respond(answer),
                 }
             }

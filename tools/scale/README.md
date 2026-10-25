@@ -1,0 +1,118 @@
+# vos-scale: the scale test's harness
+
+`vos-scale` runs the scale test (`docs/design/slice-7-mobile.md`, "The
+scale test") on the owner's LAN machines. It runs on one machine, the
+coordinator, and reaches every other host over ssh. An `inventory.toml`
+drives it, with one `[[host]]` entry for each node or driver.
+
+| command | what it does |
+|---|---|
+| `check` | Reads every host: architecture, kernel, clock offset, free memory and disk, the data disk's type, CPU and governor, the link's speed, the tools, the user manager, and whether the ports are free. It refuses a host that would make the numbers mislead, and exits 1 if it refuses any host. |
+| `deploy` | Ships the static `vos` and `vos-scale` and the agent's ELF to every host with `rsync`, wipes the nodes' data, makes each node's key, and founds a new space. |
+| `up` | Starts a run: each node and each host's sampler in a `systemd-run --user` unit under a memory cap. Ingress uses each node's own TLS, pinned by its key, so the harness makes no certificates. |
+| `agents` | Creates agents on three nodes each, picked by weight, and installs an actor in each (`--representative` creates the space's representative first). |
+| `drive` | Drives a load from every driver host while it polls each node's `/stats` and `/agents/*/status`. |
+| `collect` | Copies each host's samples, node log and driver record into the run's directory. |
+| `down` | Stops every unit on every host, by unit name. |
+| `report` | Summarises a run: each host's binding resource, the nodes' stages, leader changes, the drivers' rates and latencies, and the slowest node host. `--compare RUN` sets two runs side by side. |
+| `run` | Does all of these with one command: deploy, up, agents, drive, collect, down, report. |
+
+`--exclude NAME`, given before the command, leaves a host out as if the
+inventory did not list it. Use it for a second run without the slowest host.
+Each run gets its own directory under `runs/` (set by `harness.runs`). The
+directory holds the inventory, the hosts' facts (`hosts.json`), the versions
+and space (`deployed.json`), the agents, the polls (`nodes.jsonl`), each
+host's samples and logs (`hosts/<name>/`), `summary.json` and `report.txt`.
+
+The load `drive` offers is the harness's smoke load: one method, users
+picked uniformly, open loop, and one client and connection per active
+user. The load model and its drivers are step 7.5's work.
+
+## On each machine
+
+Every host, nodes and drivers alike, needs:
+
+- **x86-64 Linux 6.7 or later.** The PVM's JIT needs 6.7. A host on an
+  older kernel can stay only with `old_kernel = true` and a lower
+  `weight`. aarch64 hosts are not deployed to.
+- **A wired link.** `check` refuses Wi-Fi. A link under 1 GbE, or of
+  unknown speed, gets a warning: at the knee the NIC may be what binds.
+- **Packages:** `rsync`, `openssh-server`, `systemd` (with a user manager),
+  `util-linux` (`taskset`, `lsblk`) and `iproute2` (`ip`, `ss`). Nothing
+  else: `deploy` ships static binaries.
+- **ssh by key** from the coordinator, as the user that runs the units.
+  The harness uses batch mode, so log in once from the coordinator first
+  (`ssh user@host true`) to accept the host key.
+- **Lingering** for that user, so units outlive the ssh session:
+  `sudo loginctl enable-linger USER`.
+- **A synchronised clock** (chrony or systemd-timesyncd). `check`
+  refuses an offset above 100 ms from the coordinator.
+- **A directory on the data disk** for `dir`, with at least 10 GiB free.
+  Prefer an SSD or NVMe: a group commits at its median replica's fsync, so
+  a slow disk holds back every group the host follows.
+- **The `performance` CPU governor** for timed runs
+  (`sudo cpupower frequency-set -g performance`). Laptops run on AC
+  power with their lid open. `check` warns about any other governor.
+- **Open ports** between the hosts: each node's `ingress` (TCP) and
+  `peer` (UDP).
+
+The coordinator also needs the repository, built from its root:
+
+    just release build-agent build-representative build-test-actors
+
+`just release` builds the static `vos` and `vos-scale` under
+`target/x86_64-unknown-linux-musl/release/`. `deploy` takes them from
+there unless `--bins` says otherwise.
+
+## The inventory
+
+Copy `inventory.example.toml` to `inventory.toml` and give one
+`[[host]]` entry for each node and each driver:
+
+- `name`: unique, made of letters, digits, `-`, `_` and `.`. The
+  host's units and run files are named after it.
+- `ssh`: `user@address`, or `localhost` to run on the coordinator
+  without ssh.
+- `address`: the host's address on the wired LAN. Peers and clients
+  reach it there, and `check` finds the interface that holds it.
+- `role`: `node` or `driver`. A run needs three node hosts or more.
+  Keep the coordinator off every node host during timed runs.
+- `weight`: the host's share of agents' replicas against the other
+  nodes'. A slower host gets a lower weight.
+- `dir`: an absolute path on the data disk.
+- `cores`: optional, as `taskset -c` takes them, e.g. `0-11`. Use it
+  when the desktop runs two nodes, giving each its own cores, ports and
+  `dir`.
+- `ingress` and `peer`: the node's TCP and UDP ports.
+- `memory_max`: optional; it overrides `harness.memory_max` for this host.
+
+`[harness]` sets where runs are kept, the units' memory cap, the window
+length, the clock bound and the sampling interval. `[node]` holds the
+nodes' settings (`vos node run --config`): `executors`, `queue`,
+`max_inputs`, `max_bytes`, `linger_ms`, `ingress_connections`,
+`election_timeout_ms = [low, high]` and `heartbeat_ms`.
+
+## Running `check`
+
+From the repository's root:
+
+    target/x86_64-unknown-linux-musl/release/vos-scale -i inventory.toml check --json check.json
+
+`check` prints a row for each host, then each refusal and warning. Fix
+every refusal, or leave that host out with `--exclude NAME`. Warnings,
+such as the governor, a rotating disk or a slow link, are recorded with
+every run, and they name what may bind. Once every host passes, the
+step's gate is one command (raise `ingress_connections` in `[node]`
+when many users call at once):
+
+    target/x86_64-unknown-linux-musl/release/vos-scale -i inventory.toml run \
+        --agents 100 --users 10000 --rate 200 --secs 300 --label gate
+
+Then rerun with the slowest host left out, as the report names it, and
+compare the two runs:
+
+    vos-scale -i inventory.toml --exclude SLOWEST run --agents 100 --users 10000 --rate 200 --secs 300 --label without-SLOWEST
+    vos-scale -i inventory.toml report --compare <the first run's id>
+
+`tools/scale/inventory.localhost.toml` runs the same thing on one machine.
+It lists four nodes and a driver as `localhost` entries.

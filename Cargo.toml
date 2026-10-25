@@ -33,6 +33,42 @@ members = [
     "pvm/proof/verifier",
     "pvm/bench",
     "tools/jam-dev",
+    "tools/scale",
+]
+# A plain `cargo build` builds what ships: the development crates (the
+# checker, the JAM tooling, the scale harness) enable test features of the
+# node's crates, which a root build would unify into `vos`.
+default-members = [
+    "agent/wire",
+    "agent/sdk",
+    "agent/sdk-macros",
+    "agent/testkit",
+    "agent/tree",
+    "node/host",
+    "node/net",
+    "node/cli",
+    "node/jam",
+    "node/venue",
+    "node/prover",
+    "support/vos-raft",
+    "support/merkle-crdt",
+    "pvm/runtime",
+    "pvm/compiler",
+    "pvm/program",
+    "pvm/codec",
+    "pvm/codec-derive",
+    "pvm/proof",
+    "pvm/proof/precompiles",
+    "pvm/proof/poseidon2",
+    "pvm/proof/recair-air",
+    "pvm/proof/recair",
+    "pvm/proof/final-verifier",
+    "pvm/proof/statement",
+    "pvm/proof/statement/service",
+    "pvm/proof/anchor",
+    "pvm/proof/derive",
+    "pvm/proof/verifier",
+    "pvm/bench",
 ]
 exclude = [
     # Built with `cargo fuzz` (nightly flags, panic = abort).

@@ -52,6 +52,15 @@ impl Operator {
         self.post("/agents", &Create { replicas }.encode())
     }
 
+    /// Create the space's representative replicated on `replicas` (the
+    /// node alone when empty): at the space's first founding node, once.
+    pub fn create_representative(&self, replicas: Vec<u8>) -> Result<Response, ClientError> {
+        if replicas.is_empty() {
+            return self.post("/representative", &[]);
+        }
+        self.post("/representative", &Create { replicas }.encode())
+    }
+
     pub fn install(&self, agent: AgentId, install: &Install) -> Result<Response, ClientError> {
         self.post(&format!("/agents/{}/install", agent.0), &install.encode())
     }

@@ -7,7 +7,7 @@ default:
 core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
 # The agent's suites' crates, which `test-agent` and `check` run.
-agent_crates := "-p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev"
+agent_crates := "-p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale"
 
 # A guest build for the PVM: the statement's target, its standard library
 # built from source. Every guest and blob build sets `CARGO_INCREMENTAL` to
@@ -291,6 +291,10 @@ _forbidden +gates:
         [heap-peak "-p vos-cli --features prover" [heap-peak] []] \
         [heap-peak "-p vos-statement --features pvm-guest" [heap-peak] []] \
         [heap-peak "-p vos-statement-service --features pvm-guest" [heap-peak] []] \
+        [scale "-p vos-cli" [] [vos-scale]] \
+        [scale "-p vos-cli --features prover" [] [vos-scale]] \
+        [scale "-p vos-node" [] [vos-scale]] \
+        [scale "-p vos-node --features prover" [] [vos-scale]] \
     ]; \
     let failures = ($table | where gate in [{{gates}}] | group-by args | items {|args, rows| \
         let resolved = (cargo tree ...($args | split row ' ') -e no-dev --target all -f '{p}|{f}' --prefix none | complete); \
@@ -336,8 +340,12 @@ check-venue-rules:
     print $"the venue rules live in vos_anchor::venue alone: ($sources | length) files searched, ($calls | length) calls found"
 
 # Every `check-no-*` gate below, each build resolved once.
-check-no-leaks: (_forbidden "jam-dev" "venue-clients" "seeded-masks" "debug-internals" "test-formats" "store-dump" "heap-peak") _seeded-masks-unimplied _debug-names-absent
-    print "no test seam, debug output, test format, store dump, heap peak, JAM client or venue client in a production build"
+check-no-leaks: (_forbidden "jam-dev" "venue-clients" "seeded-masks" "debug-internals" "test-formats" "store-dump" "heap-peak" "scale") _seeded-masks-unimplied _debug-names-absent
+    print "no test seam, debug output, test format, store dump, heap peak, JAM client, venue client or scale harness in a production build"
+
+# The scale harness (`tools/scale`, `vos-scale`) is development tooling:
+# neither `vos`, with or without the prover, nor `vos-node` depends on it.
+check-no-scale: (_forbidden "scale")
 
 # A node knows no JAM: the JAM client (a PolkaJam node's RPC and `jamt`,
 # the statements service's client and `JamVenue`) is development tooling,
@@ -576,5 +584,13 @@ slice-gate: ci test-bench-proof
 
 # Use the repository's hooks: fmt and clippy before commits, `just ci`
 # before pushes.
+# The static x86-64 builds the scale test deploys (`tools/scale`): `vos`
+# and `vos-scale` for musl, from the lock file, each built alone so the
+# harness's dependencies never unify into the node's. Not incremental: the
+# release profile's code, as shipped.
+release:
+    with-env { CARGO_INCREMENTAL: "0" } { cargo build --release --locked --target x86_64-unknown-linux-musl -p vos-cli }
+    with-env { CARGO_INCREMENTAL: "0" } { cargo build --release --locked --target x86_64-unknown-linux-musl -p vos-scale }
+
 install-hooks:
     git config core.hooksPath .githooks
