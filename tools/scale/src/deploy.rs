@@ -38,6 +38,10 @@ pub struct DeployedNode {
 pub struct Deployed {
     pub space_id: String,
     pub window_ms: u64,
+    /// Where window 0 starts, in ms since the Unix epoch: by the
+    /// coordinator's clock, given at the founding.
+    #[serde(default)]
+    pub origin_ms: u64,
     pub nodes: Vec<DeployedNode>,
     /// `vos --version`, the repository's revision, and each artifact's
     /// SHA-256.
@@ -261,10 +265,12 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
     }
     let founder = node_hosts[0];
     let dir = quote(&founder.dir);
+    // A second back, so no founder's clock within the bound sees it ahead.
+    let origin_ms = crate::now_ms() - 1_000;
     let space_id = hosts::run(
         founder,
         &format!(
-            "{dir}/bin/vos space up --space {dir}/space --data {dir}/data --window-ms {}\n",
+            "{dir}/bin/vos space up --space {dir}/space --data {dir}/data --window-ms {} --origin-ms {origin_ms}\n",
             inventory.harness.window_ms
         ),
     )?
@@ -296,6 +302,7 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
     let deployed = Deployed {
         space_id,
         window_ms: inventory.harness.window_ms,
+        origin_ms,
         nodes,
         versions,
         at_ms: crate::now_ms(),

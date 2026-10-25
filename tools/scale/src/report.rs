@@ -88,7 +88,33 @@ pub struct DriverSummary {
     /// later than the driver's bound: a driver behind is what bound.
     pub late_us: u64,
     pub late_share: f64,
+    /// Calls a second it sent, of the mix; the CPU it used, in cores.
+    pub offered: f64,
+    pub cores: f64,
+    /// Each kind apart: the mix's, the reads waiting for a cut's close
+    /// (`cut_read`, timed from the close) and the identity writes.
+    pub kinds: BTreeMap<String, KindSummary>,
+    /// The mix as sent against its target: the worst share's distance.
+    pub mix_error: f64,
+    pub mix: serde_json::Value,
 }
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct KindSummary {
+    pub sent: u64,
+    pub ok: u64,
+    pub errors: u64,
+    pub by_error: BTreeMap<String, u64>,
+    pub rate: f64,
+    pub p50_us: u64,
+    pub p99_us: u64,
+    pub p999_us: u64,
+}
+
+/// The kinds a report lists, in its order.
+const KINDS: [&str; 6] = [
+    "transfer", "query", "workflow", "cut", "cut_read", "identity",
+];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Summary {
@@ -105,6 +131,8 @@ pub struct Summary {
     pub warnings: Vec<String>,
     pub not_modeled: String,
     pub t2: String,
+    /// The load model the drivers ran: `U`, `a`, `r`, the mix, `x`.
+    pub model: serde_json::Value,
 }
 
 fn jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
@@ -375,6 +403,16 @@ pub fn report(
         window_ms: window,
         not_modeled: NOT_MODELED.into(),
         t2: T2.into(),
+        model: facts
+            .iter()
+            .find(|host| host.role == "driver")
+            .and_then(|host| {
+                let text =
+                    std::fs::read_to_string(run.file(&format!("drive-{}.json", host.name))).ok()?;
+                serde_json::from_str::<serde_json::Value>(&text).ok()
+            })
+            .map(|plan| plan["model"].clone())
+            .unwrap_or_default(),
         ..Summary::default()
     };
     for host in &facts {
@@ -469,7 +507,32 @@ pub fn report(
             name: name.clone(),
             ..DriverSummary::default()
         };
-        if let Some(total) = lines.iter().rev().find(|line| line["total"] == true) {
+        let totals: Vec<&serde_json::Value> =
+            lines.iter().filter(|line| line["total"] == true).collect();
+        for line in &totals {
+            let kind = line["kind"].as_str().unwrap_or("all");
+            if kind == "all" {
+                continue;
+            }
+            driver.kinds.insert(
+                kind.to_string(),
+                KindSummary {
+                    sent: line["sent"].as_u64().unwrap_or(0),
+                    ok: line["ok"].as_u64().unwrap_or(0),
+                    errors: line["errors"].as_u64().unwrap_or(0),
+                    by_error: serde_json::from_value(line["by_error"].clone()).unwrap_or_default(),
+                    rate: line["rate"].as_f64().unwrap_or(0.0),
+                    p50_us: line["p50_us"].as_u64().unwrap_or(0),
+                    p99_us: line["p99_us"].as_u64().unwrap_or(0),
+                    p999_us: line["p999_us"].as_u64().unwrap_or(0),
+                },
+            );
+        }
+        if let Some(total) = totals.last() {
+            driver.offered = total["offered"].as_f64().unwrap_or(0.0);
+            driver.mix = total["mix"].clone();
+            driver.mix_error = total["mix"]["worst_error"].as_f64().unwrap_or(0.0);
+            driver.cores = total["load_cores"].as_f64().unwrap_or(0.0);
             driver.ok = total["ok"].as_u64().unwrap_or(0);
             driver.errors = total["errors"].as_u64().unwrap_or(0);
             driver.rate = total["rate"].as_f64().unwrap_or(0.0);
@@ -636,7 +699,47 @@ pub fn text(summary: &Summary) -> String {
             crate::drive::LATE_US
         );
     }
-    text += &format!("  all: {:.1} calls/s\n\n", summary.rate);
+    text += &format!("  all: {:.1} calls/s\n", summary.rate);
+    for driver in &summary.drivers {
+        text += &format!(
+            "  {}: offered {:.1} calls/s on {:.2} cores; the mix within {:.2} points of its target\n",
+            driver.name,
+            driver.offered,
+            driver.cores,
+            100.0 * driver.mix_error
+        );
+        for kind in KINDS {
+            if let Some(stats) = driver.kinds.get(kind) {
+                text += &format!(
+                    "    {kind:<9} {:>9} sent {:>9} ok {:>7} errors {:?}, {:.1}/s, p50 {} us, p99 {} us, p99.9 {} us\n",
+                    stats.sent,
+                    stats.ok,
+                    stats.errors,
+                    stats.by_error,
+                    stats.rate,
+                    stats.p50_us,
+                    stats.p99_us,
+                    stats.p999_us
+                );
+            }
+        }
+    }
+    let model = &summary.model;
+    if !model.is_null() {
+        text += &format!(
+            "  the model: U = {}, a = {}, r = {}, U·a·r = {:.0} calls/s; mix {}; x = {}; Zipf({})\n",
+            model["users"],
+            model["active"],
+            model["per_user"],
+            model["users"].as_f64().unwrap_or(0.0)
+                * model["active"].as_f64().unwrap_or(0.0)
+                * model["per_user"].as_f64().unwrap_or(0.0),
+            model["shares"],
+            model["cross"],
+            model["zipf"]
+        );
+    }
+    text += "\n";
     if let Some(slowest) = &summary.slowest {
         text += &format!(
             "slowest node host: {slowest} (its node's commits' p99 the highest): with four node hosts or more, rerun with --exclude {slowest} and compare\n"

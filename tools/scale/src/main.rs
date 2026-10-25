@@ -11,9 +11,11 @@ mod check;
 mod collect;
 mod deploy;
 mod drive;
+mod engine;
 mod histogram;
 mod hosts;
 mod inventory;
+mod load;
 mod nodes;
 mod report;
 mod runs;
@@ -84,11 +86,18 @@ struct DeployArgs {
 
 #[derive(clap::Args)]
 struct AgentsArgs {
-    /// Agents to create, each on three nodes drawn by weight.
+    /// Ledger shards to create, `K`, each on three nodes drawn by weight.
     #[arg(long)]
     count: u32,
-    /// The actor installed in each (`just build-test-actors`): the
-    /// counter by default.
+    /// Idle agents to create beside them, `I`: installed, never called.
+    #[arg(long, default_value_t = 0)]
+    idle: u32,
+    /// The stand-in identity agent's rows, `U`: created on every node with
+    /// them when not 0.
+    #[arg(long, default_value_t = 0)]
+    identity_rows: u64,
+    /// The actor installed in each (`just build-test-actors`): the shard
+    /// actor by default.
     #[arg(long)]
     actor: Option<PathBuf>,
     #[arg(long, default_value_t = 1)]
@@ -103,23 +112,70 @@ struct AgentsArgs {
 
 #[derive(clap::Args)]
 struct LoadArgs {
-    /// Simulated users, each a key derived from the seed and its index.
+    /// `U`: simulated users, each a key derived from the seed and its
+    /// index.
     #[arg(long)]
     users: u64,
-    /// Calls a second, offered by all drivers together.
+    /// `a`: the share of users active at once.
+    #[arg(long, default_value_t = 0.05)]
+    active: f64,
+    /// `r`: calls a second an active user makes. The offered load is
+    /// `U·a·r`.
+    #[arg(long, default_value_t = 0.1, conflicts_with = "rate")]
+    per_user: f64,
+    /// The offered load `U·a·r` in calls a second, setting `r` to it.
     #[arg(long)]
-    rate: f64,
+    rate: Option<f64>,
+    /// How long, on average, a user stays active, in seconds.
+    #[arg(long, default_value_t = 300.0)]
+    active_s: f64,
+    /// The mix: each kind's share, summing to 1.
+    #[arg(
+        long,
+        default_value = "transfer=0.8,query=0.15,workflow=0.045,cut=0.005"
+    )]
+    mix: String,
+    /// `x`: the share of transfers to a payee in another shard; random
+    /// payees' `1 − 1/K` by default.
+    #[arg(long)]
+    cross: Option<f64>,
+    /// The users' Zipf exponent.
+    #[arg(long, default_value_t = 1.0)]
+    zipf: f64,
+    /// Writes a second to the stand-in identity agent, when the run has
+    /// one.
+    #[arg(long, default_value_t = 10.0)]
+    identity_hz: f64,
     /// How long the load runs.
     #[arg(long)]
     secs: u64,
-    /// The method each call invokes.
-    #[arg(long, default_value = "increment")]
-    method: String,
-    /// Its arguments, SCALE-encoded, in hex: `increment(1)` by default.
-    #[arg(long, default_value = "0100000000000000")]
-    args: String,
     #[arg(long, default_value_t = 1)]
     seed: u64,
+}
+
+impl LoadArgs {
+    /// The model these arguments give, for `shards` ledger shards.
+    fn model(&self, shards: usize) -> Result<load::Model, String> {
+        let per_user = match self.rate {
+            Some(rate) => rate / (self.users as f64 * self.active),
+            None => self.per_user,
+        };
+        let model = load::Model {
+            users: self.users,
+            active: self.active,
+            per_user,
+            active_s: self.active_s,
+            shares: load::Shares::parse(&self.mix)?,
+            cross: self
+                .cross
+                .unwrap_or_else(|| load::Model::random_cross(shards)),
+            zipf: self.zipf,
+            identity_hz: self.identity_hz,
+            seed: self.seed,
+        };
+        model.validate(shards)?;
+        Ok(model)
+    }
 }
 
 #[derive(Subcommand)]
@@ -178,9 +234,15 @@ enum Command {
         deploy: DeployArgs,
         #[command(flatten)]
         load: LoadArgs,
-        /// Agents to create.
+        /// Ledger shards to create, `K`.
+        #[arg(long, alias = "agents")]
+        shards: u32,
+        /// Idle agents beside them, `I`.
+        #[arg(long, default_value_t = 0)]
+        idle: u32,
+        /// Create the stand-in identity agent, with a row a user.
         #[arg(long)]
-        agents: u32,
+        identity: bool,
         #[arg(long)]
         actor: Option<PathBuf>,
         #[arg(long)]
@@ -233,7 +295,7 @@ fn agents_request(args: &AgentsArgs) -> (PathBuf, Option<PathBuf>) {
     let actor = args
         .actor
         .clone()
-        .unwrap_or_else(|| guest("agent/test-actors/target/riscv64em-vos/release/counter.elf"));
+        .unwrap_or_else(|| guest("agent/test-actors/target/riscv64em-vos/release/shard.elf"));
     let representative = args
         .representative
         .then(|| guest("agent/representative/target/riscv64em-vos/release/vos-representative.elf"));
@@ -246,6 +308,8 @@ fn make_agents(inventory: &Inventory, args: &AgentsArgs, run: Option<&Run>) -> R
         inventory,
         &agents::Request {
             count: args.count,
+            idle: args.idle,
+            identity_rows: args.identity_rows,
             actor: &actor,
             instance: args.instance,
             representative: representative.as_deref(),
@@ -270,6 +334,8 @@ fn keep_agents(inventory: &Inventory, run: &Run) -> Result<(), String> {
 /// Drive `load` while polling every node; then collect.
 fn drive_and_poll(inventory: &Inventory, run: &Run, load: &LoadArgs) -> Result<(), String> {
     keep_agents(inventory, run)?;
+    let shards = agents::Agents::read(inventory)?.agents.len();
+    let model = load.model(shards)?;
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let poller = scope.spawn(|| collect::poll(inventory, run, &stop));
@@ -277,12 +343,8 @@ fn drive_and_poll(inventory: &Inventory, run: &Run, load: &LoadArgs) -> Result<(
             inventory,
             run,
             &drive::Load {
-                users: load.users,
-                rate: load.rate,
+                model,
                 secs: load.secs,
-                method: &load.method,
-                args: &load.args,
-                seed: load.seed,
             },
         );
         // One more interval of polls past the load's end.
@@ -369,7 +431,9 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Run {
             deploy,
             load,
-            agents,
+            shards,
+            idle,
+            identity,
             actor,
             representative,
             label,
@@ -395,7 +459,9 @@ fn run(cli: Cli) -> Result<(), String> {
             let ran = nodes::up(&inventory, &run, force)
                 .and_then(|()| {
                     let args = AgentsArgs {
-                        count: agents,
+                        count: shards,
+                        idle,
+                        identity_rows: if identity { load.users } else { 0 },
                         actor,
                         instance: 1,
                         representative,

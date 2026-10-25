@@ -38,10 +38,6 @@ impl Histogram {
         }
     }
 
-    pub fn count(&self) -> u64 {
-        self.counts.iter().sum()
-    }
-
     /// The `q` quantile's bucket floor; 0 when empty.
     pub fn quantile(&self, q: f64) -> u64 {
         quantile(&self.counts, q)

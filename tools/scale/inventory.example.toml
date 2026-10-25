@@ -1,5 +1,8 @@
 # The scale test's inventory: copy it to `inventory.toml`, one `[[host]]`
 # a node or a driver, and run `vos-scale check` until every host passes.
+# This is the runs' layout (S35): three nodes on `compumax`, each with its
+# own ports, cores and directory; the driver on the desktop, which is
+# also the coordinator.
 # Every host is x86-64 Linux 6.7 or later on a wired link, reached by
 # key-based ssh as a user with lingering on (`loginctl enable-linger`).
 # The coordinator, which runs `vos-scale`, needs no entry; during a timed
@@ -8,8 +11,10 @@
 [harness]
 # Where runs are kept on the coordinator, relative to this file.
 runs = "runs"
-# Each node's and driver's memory cap (systemd's MemoryMax).
-memory_max = "16G"
+# Each node's and driver's memory cap (systemd's MemoryMax). A machine's
+# entries' caps together, and a 2 GiB reserve, must fit in its free
+# memory.
+memory_max = "8G"
 # The space's window length: 2 minutes, as the runs measure windows.
 window_ms = 120000
 # check refuses a host whose clock is further off than this.
@@ -28,49 +33,52 @@ smoke = false
 [node]
 
 [[host]]
-name = "desktop"
+name = "c1"
 # user@address for ssh; `localhost` runs on the coordinator itself.
-ssh = "owner@192.168.1.10"
+ssh = "owner@192.168.1.20"
 # The address on the wired LAN the other hosts reach it at.
-address = "192.168.1.10"
+address = "192.168.1.20"
 role = "node"
-# Its share of agents' replicas against the other nodes': a slower host
-# weighs less. It still gates every group it follows (a group commits at
-# its median replica's fsync): exclude it to measure without it.
-weight = 2
+# Its share of agents' replicas against the other nodes'. With three
+# nodes, every agent has a replica on each.
+weight = 1
 # A directory of the harness's own on the disk the node's data goes on:
 # absent or empty at the first deploy, which marks it `.vos-scale`; a
 # deploy wipes the node's data inside it, and refuses a dir that holds
-# other files.
-dir = "/srv/vos-scale"
+# other files. Nodes sharing a machine each have their own.
+dir = "/srv/vos-scale/c1"
 # The cores it may use (taskset -c); all when unset.
-cores = "0-11"
-ingress = 7700
-peer = 7701
+cores = "0-3"
+ingress = 7701
+peer = 7801
 
 [[host]]
-name = "laptop"
-ssh = "owner@192.168.1.11"
-address = "192.168.1.11"
+name = "c2"
+ssh = "owner@192.168.1.20"
+address = "192.168.1.20"
 role = "node"
-weight = 1
-dir = "/home/owner/vos-scale"
-ingress = 7700
-peer = 7701
+dir = "/srv/vos-scale/c2"
+cores = "4-7"
+ingress = 7702
+peer = 7802
 
 [[host]]
-name = "nuc"
-ssh = "owner@192.168.1.12"
-address = "192.168.1.12"
+name = "c3"
+ssh = "owner@192.168.1.20"
+address = "192.168.1.20"
 role = "node"
-weight = 1
-dir = "/home/owner/vos-scale"
-ingress = 7700
-peer = 7701
+dir = "/srv/vos-scale/c3"
+cores = "8-11"
+ingress = 7703
+peer = 7803
 
 [[host]]
-name = "driver"
-ssh = "owner@192.168.1.13"
-address = "192.168.1.13"
+name = "desktop"
+ssh = "localhost"
+# Its wired LAN address: `check` reads that interface's link.
+address = "192.168.1.10"
 role = "driver"
-dir = "/home/owner/vos-scale"
+dir = "/var/tmp/vos-scale/desktop"
+# One core pair: a driver sustains 20,000 calls a second on it.
+cores = "1-2"
+memory_max = "4G"
