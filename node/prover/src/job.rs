@@ -133,6 +133,17 @@ impl Job {
         Statement::decode(&self.statement).ok()
     }
 
+    /// When no venue takes it any more: its statement's [`deadline`], or,
+    /// for one that states no root, `MaxRootAge` past its window's cut.
+    pub fn deadline(&self, clock: &WindowClock) -> Option<u64> {
+        self.statement()
+            .and_then(|statement| deadline(&statement, clock))
+            .or_else(|| {
+                let boundary = clock.boundary(self.window)?;
+                Some(boundary.saturating_add(MAX_ROOT_AGE_MS))
+            })
+    }
+
     /// The earliest window its statement reads a root at; none for one that
     /// does not decode.
     pub(crate) fn earliest_window(&self) -> Option<u64> {

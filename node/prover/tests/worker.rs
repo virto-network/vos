@@ -260,11 +260,12 @@ fn a_dead_statement_is_skipped() {
 }
 
 /// Jobs age out: an unfinished job whose roots aged past `MaxRootAge` by
-/// the venue's time is dead, a finished one removed, and the jobs of an
-/// agent the node no longer replicates removed whatever their state, their
-/// proofs held no longer; a record stating no root makes no job.
+/// the venue's time is dead, a finished one removed, their proofs held no
+/// longer, and a refused record stating no root ages by its window. The
+/// jobs of an agent the node does not replicate now are kept as they are,
+/// the agent perhaps back soon, until they age.
 #[test]
-fn jobs_age_out_and_go_with_their_agent() {
+fn jobs_age_out_and_outlast_their_agents_absence() {
     let agent = Arc::new(Mutex::new(Agent::default()));
     let rootless = Attest {
         roots: Vec::new(),
@@ -292,21 +293,13 @@ fn jobs_age_out_and_go_with_their_agent() {
     assert_eq!(count(&jobs, State::Refused(REFUSED_ROOTLESS)), 1);
     let aged = CLOCK.boundary(3).unwrap() + MAX_ROOT_AGE_MS + 1;
     venue.now.store(aged, Ordering::SeqCst);
-    assert_eq!(worker.prune().unwrap(), 0);
+    assert_eq!(worker.prune().unwrap(), 1, "the rootless one, of window 3");
     assert_eq!(count(&jobs, State::Dead), 1, "window 3's aged, 4's not");
     assert_eq!(worker.prune().unwrap(), 1, "the dead job removed once aged");
 
     node.replicates.store(false, Ordering::SeqCst);
-    assert_eq!(
-        worker.prune().unwrap(),
-        1,
-        "the finished one, its agent absent"
-    );
-    assert_eq!(
-        states(&jobs),
-        [State::Queued],
-        "an unfinished one kept, its agent perhaps back soon"
-    );
+    assert_eq!(worker.prune().unwrap(), 0);
+    assert_eq!(states(&jobs), [State::Queued], "kept, its agent absent");
 }
 
 /// An unfinished job's kernel is held while the job waits, and no longer

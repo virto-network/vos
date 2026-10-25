@@ -352,9 +352,10 @@ impl<H: Host, J: Jobs> Worker<H, J> {
     }
 
     /// Age out the jobs whose roots no venue anchors any more: a finished
-    /// one removed, an unfinished one dead, its proof held no longer; and
-    /// remove the finished jobs of agents this node does not replicate now
-    /// (an unfinished one, of an agent absent for a while only, ages out).
+    /// one removed, an unfinished one dead, its proof held no longer. The
+    /// jobs of an agent this node does not replicate now age out alike: an
+    /// agent absent for a while only, as across a placement change, finds
+    /// its jobs as it left them, none proved twice.
     pub fn prune(&mut self) -> Result<usize, String> {
         let now = self.venue.time();
         let clock = self.host.clock();
@@ -362,11 +363,10 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         let mut removed = 0;
         for (id, job) in self.jobs.all()? {
             let aged = job
-                .statement()
-                .and_then(|statement| deadline(&statement, &clock))
+                .deadline(&clock)
                 .zip(now)
                 .is_some_and(|(deadline, now)| now > deadline);
-            if job.state.finished() && (aged || !agents.contains(&job.agent)) {
+            if aged && job.state.finished() {
                 if let Some(proof) = job.state.proof() {
                     self.host.hold(&proof, false);
                 }
