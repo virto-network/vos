@@ -17,6 +17,10 @@ use crate::job::{
     Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, State, deadline,
 };
 
+/// The longest wait before a statement not accepted goes again: the
+/// longest window a space's clock registers.
+const RETRY_MAX: Duration = Duration::from_millis(vos_wire::vos_anchor::MAX_LENGTH_MS);
+
 /// The final proofs' format: the masked wrap's.
 pub const FORMAT: u32 = vos_venue::vos_statement::vos_pvm_final_verifier::masked::FORMAT;
 
@@ -413,15 +417,15 @@ impl<H: Host, J: Jobs> Worker<H, J> {
     }
 
     /// Submit `id` again no sooner than a wait from now, twice the last
-    /// one, [`Options::retry`] the first time: the wait, and how often it
-    /// has gone again for an answer `counted` towards [`MAX_RESUBMITS`],
-    /// this time included if it is.
+    /// one, [`Options::retry`] the first time, at most [`RETRY_MAX`]: the
+    /// wait, and how often it has gone again for an answer `counted`
+    /// towards [`MAX_RESUBMITS`], this time included if it is.
     fn retry_later(&mut self, id: StatementId, counted: bool) -> (Duration, u32) {
         let (wait, count) = self
             .retries
             .get(&id)
             .map_or((self.options.retry, 0), |(_, wait, count)| {
-                (*wait * 2, *count)
+                (wait.saturating_mul(2).min(RETRY_MAX), *count)
             });
         let count = count + u32::from(counted);
         self.retries
