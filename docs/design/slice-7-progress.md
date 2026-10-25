@@ -387,3 +387,123 @@ again [measured]: 1,036 s, the same verdicts, latency 47.5 s at Kreivo and
 60.8–109.0 s at JAM, each under its gate; the audit clean over 398
 carriers.
 
+
+## Step 7.4: the scale harness
+
+**Built:**
+- **`tools/scale` (`vos-scale`):** a development crate that no shipped
+  crate depends on. The `check-no-scale` row, part of `check-no-leaks`,
+  refuses it in `vos` (with and without the prover) and in `vos-node`.
+  An `inventory.toml` drives it, with one `[[host]]` for each node or
+  driver: ssh target (or `localhost`), LAN address, role, weight, data
+  directory, cores, and the ingress and peer ports. Commands:
+  - `check`: reads every host with one script, and its clock with five
+    `date` reads (the shortest round trip wins). It refuses another
+    architecture, a kernel before 6.7 (unless `old_kernel` is set, the
+    host weighted down), a clock more than 100 ms off, Wi-Fi, missing
+    tools, a taken port, no user manager, and, over ssh, no lingering.
+    It warns about a governor other than `performance`, a rotating data
+    disk, and a link under 1 GbE or of unknown speed. It records link
+    speed, governors, disk, transport and model with every run.
+  - `deploy`: refuses a binary that is not a static x86-64 one, then
+    ships `vos`, `vos-scale` and the agent by `rsync`. Each node's first
+    run makes its key, and the shell that started the node stops it by
+    its PID. The tool writes the space file, the first node founds the
+    space, and the genesis goes to every node. Versions are kept:
+    `vos --version`, the revision and each artifact's SHA-256.
+  - `up` and `down`: each node and each host's sampler run in a
+    `systemd-run --user` unit with `MemoryMax`, no swap,
+    `LimitNOFILE=65536`, and optional `taskset`. They are stopped by unit
+    name only, never by process name. Ingress uses `--tls` with the node
+    key pinned, so the harness makes no certificates.
+  - `agents`: places three replicas per agent by weight (seeded, no
+    replacement), creates each agent, and installs it at whichever
+    replica leads. `--representative` creates the representative first.
+  - `drive`: one `vos-scale drive-local` unit on each driver host, each
+    taking its share of the users and of the rate. Meanwhile the
+    coordinator polls `/stats` and every replica's status.
+  - `collect`: copies each host's samples, node log and driver record
+    into the run's directory.
+  - `report`: one directory per run, holding the inventory, host facts,
+    versions, agents, polls, samples, `summary.json` and `report.txt`.
+    For each host it gives the binding resource (the node's CPU against
+    its cores, iowait, disk busy time, the NIC against its link speed),
+    the busiest threads, RSS and idle wakes. It also gives the nodes'
+    stage quantiles, leader changes and the drivers' p50, p99 and p99.9,
+    and names the slowest node host. Every report states what it does
+    not model and T2's assumption (K ≥ 128 for 8 million users).
+    `--compare` sets two runs side by side.
+  - `run`: deploy, up, agents, drive, collect, down and report, all from
+    one command. `--exclude NAME` reruns without a host.
+  - `sample`, run on each host, writes a JSON line every 10 s: the
+    host's CPU by kind, the node's threads (ticks, voluntary switches),
+    RSS, I/O, the data disk's counters and the link's bytes. It finds the
+    node by its unit's main PID.
+- **The smoke load** is `drive`'s: one method, users drawn uniformly,
+  open loop with Poisson arrivals, latency timed from the scheduled send,
+  and one client per active user. 7.5 replaces it.
+- **Node changes:**
+  - `vos node run --config node.toml` sets `executors`, `queue`,
+    `max_inputs`, `max_bytes`, `linger_ms`, `ingress_connections`,
+    `election_timeout_ms` and `heartbeat_ms`. Unknown names are refused,
+    and so are unsound timings.
+  - The admin route `POST /representative`, with
+    `Operator::create_representative` and `vos space representative`.
+  - Slice 6's L3: `default-members` leaves out the checker, jam-dev and
+    the harness, so a plain `cargo build` resolves `vos` without `dump`,
+    `kreivo` or `fixtures`.
+  - `just release`: the static musl builds of `vos` and `vos-scale`,
+    `--locked`, not incremental, each built on its own.
+- **A fix the static build needed:** the PVM's write tracker typed its
+  `ioctl` requests as `c_ulong`, which musl refuses. They are now
+  `libc::Ioctl`, with the same 32 bits.
+- **The owner's runbook:** `tools/scale/README.md`, with
+  `inventory.example.toml` beside it.
+
+**Tests:**
+- The inventory: shipped files read; clashes refused.
+- `check`'s verdicts: Wi-Fi, old kernel, skew, arch, linger, tools,
+  ports refused; slow link, HDD, governor warned.
+- Unit scripts: cap, stop by name, no process matching.
+- Placement by weight; the ELF check; the sampler's parsers on this host.
+- Histograms; the binding resource; the report's two statements.
+- The node's settings file.
+- A CLI test: `--config` refused and accepted, the representative
+  created once.
+
+**The localhost smoke** [measured,
+`/var/tmp/vos-scale/runs/20261025T110039Z-smoke`,
+`20261025T110145Z-without-n3`]:
+- **The setup:** `tools/scale/inventory.localhost.toml`, with four nodes
+  and a driver on this machine, each on its own cores, ports and
+  directory.
+- **The command:** one `vos-scale run --agents 4 --representative
+  --users 40 --rate 20 --secs 30`.
+- **The run:** a space founded, four nodes up behind pinned TLS, the
+  representative and four counter agents placed, 587 calls answered and
+  no errors (19.6 a second), no leader change.
+- **Every unit stopped,** and the report written.
+- **The rerun:** `--exclude n3`, then `report --compare`, ran end to
+  end.
+- **The numbers mean nothing for scale.** The four nodes share one NVMe
+  (95% full) with other agents' builds, and the governor is
+  `powersave`, which `check` warned about. The driver's p99 went from
+  1.05 s with all four nodes to 20 ms without n3. The cause was disk
+  stalls (38.8 ms per I/O in the first run, commit p99.9 about 1 s),
+  not n3.
+- **The first smokes** (three nodes, then four) ran the same way.
+
+**Gates:**
+- `just check` green: `check-no-leaks` with the `scale` row, 104
+  suites.
+- The localhost smoke, above.
+
+**Left for the owner and later steps:**
+- **Not run:** no remote host was contacted, and none was given.
+- **7.4's gate** (three hosts, 100 agents, 10,000 users, on two of the
+  owner's machines at least) needs the owner's inventory. For that many
+  users at once, `[node] ingress_connections` must go up, because the
+  smoke driver holds a connection per active user. 7.5's drivers
+  multiplex.
+- **The representative in a run** creates and installs; anchoring
+  stays 7.2's.
