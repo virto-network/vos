@@ -128,8 +128,15 @@ pub struct KindSummary {
 }
 
 /// The kinds a report lists, in its order.
-const KINDS: [&str; 6] = [
-    "transfer", "query", "workflow", "cut", "cut_read", "identity",
+const KINDS: [&str; 8] = [
+    "transfer",
+    "query",
+    "workflow",
+    "cut",
+    "cut_read",
+    "identity",
+    "reader",
+    "reader_read",
 ];
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]

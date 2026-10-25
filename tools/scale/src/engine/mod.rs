@@ -342,18 +342,16 @@ impl Engine {
         };
         match (op.kind, started) {
             (Kind::Workflow, Some(workflow)) => {
-                let read = self
-                    .read_workflow(&op, node, workflow, WORKFLOW_WAIT_MS)
-                    .await;
+                let read = self.read_workflow(&op, workflow, WORKFLOW_WAIT_MS).await;
                 self.done("workflow", op.due, &read);
             }
             (Kind::Cut, Some(workflow)) => {
                 self.done("cut", op.due, &answer);
-                self.read_at_cut(&op, node, workflow, "cut_read").await;
+                self.read_at_cut(&op, workflow, "cut_read").await;
             }
             (Kind::Reader, Some(workflow)) => {
                 self.done("reader", op.due, &answer);
-                self.read_at_cut(&op, node, workflow, "reader_read").await;
+                self.read_at_cut(&op, workflow, "reader_read").await;
             }
             (kind, _) => self.done(kind.name(), op.due, &answer),
         }
@@ -392,12 +390,12 @@ impl Engine {
         }
     }
 
-    /// A signed read of `workflow`, waiting up to `wait_ms` for it to end:
-    /// signed here, on the sending thread, and counted so.
+    /// A signed read of `workflow`, waiting up to `wait_ms` for it to end,
+    /// at its agent's leader as last learned: signed here, on the sending
+    /// thread, and counted so.
     async fn read_workflow(
         &self,
         op: &Op,
-        node: usize,
         workflow: WorkflowId,
         wait_ms: u64,
     ) -> Result<Response, String> {
@@ -417,21 +415,31 @@ impl Engine {
         )
         .encode();
         self.record(op.kind.name(), |stats| stats.signed += 1);
-        self.pools[node]
+        let node = match self.probe {
+            true => self.elsewhere(op.agent),
+            false => self.routes.borrow().call(op.agent),
+        };
+        let answer = self.pools[node]
             .post(
                 &agent.paths[2],
                 &read,
                 ANSWER + Duration::from_millis(wait_ms),
             )
-            .await
+            .await;
+        if !self.probe && unserved(&answer) {
+            self.routes
+                .borrow_mut()
+                .failed(op.agent, &agent.replicas, node, Instant::now());
+        }
+        answer
     }
 
     /// A read at a cut, once started: read once to learn its window, then
     /// again from its close, `B_w + D`, until it ends, as `kind`. Its
     /// latency is from the close: whether every read is served within 10 s
     /// of it.
-    async fn read_at_cut(&self, op: &Op, node: usize, workflow: WorkflowId, kind: &'static str) {
-        let first = self.read_workflow(op, node, workflow, 0).await;
+    async fn read_at_cut(&self, op: &Op, workflow: WorkflowId, kind: &'static str) {
+        let first = self.read_workflow(op, workflow, 0).await;
         let (origin, length, delay) = self.window;
         let close = match &first {
             Ok(Response::Workflow {
@@ -457,7 +465,7 @@ impl Engine {
         Timer::at(closed + Duration::from_millis(jitter)).await;
         let last = loop {
             let asked = Instant::now();
-            let read = self.read_workflow(op, node, workflow, CUT_WAIT_MS).await;
+            let read = self.read_workflow(op, workflow, CUT_WAIT_MS).await;
             let ended = matches!(
                 read,
                 Ok(Response::Workflow {
