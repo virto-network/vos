@@ -75,9 +75,7 @@ use crate::{
     WrapProof, embed, mix_header, secure_is_canonical, stark_is_canonical,
 };
 
-/// The trees a masked proof commits: preprocessed, main, interaction,
-/// composition.
-pub const TREES: usize = 4;
+pub use vos_pvm_recair_air::masked::TREES;
 
 /// The masked wrap's format number (`vos_pvm_proof::format::MASKED_WRAP`).
 pub const FORMAT: u32 = 39;

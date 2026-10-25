@@ -266,15 +266,16 @@ fn leaves_and_folds_never_reference_the_masking() {
 }
 
 /// The blinding relation is the masked evaluation's alone: no module of the
-/// recursion AIR but `masked.rs` names it.
+/// recursion AIR but `masked`'s (`masked/`) names it.
 #[test]
 fn only_the_masked_module_names_the_blinding_relation() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../recair-air/src");
+    let masked = root.join("masked");
     let found = sources(&root);
-    assert!(found.iter().any(|path| path.ends_with("masked.rs")));
+    assert!(found.iter().any(|path| path.ends_with("masked/mod.rs")));
     let others: Vec<PathBuf> = found
         .into_iter()
-        .filter(|path| !path.ends_with("masked.rs"))
+        .filter(|path| !path.starts_with(&masked))
         .collect();
     assert!(others.len() >= 5);
     assert_eq!(naming(others, &[blinding()]), Vec::<PathBuf>::new());
