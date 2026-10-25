@@ -11,10 +11,11 @@
 //! - **the cut** of window w, `cut(w)`: the state version before the first
 //!   result applied with a time at or past `B_w`, the window's boundary.
 //!   A result timed t, applied after one timed p (the agent's batch-time
-//!   mark), records `cut(w)` = its version − 1 for every w with
-//!   p < `B_w` ≤ t, once the agent's record names a space, at most the
-//!   newest `MAX_CUTS` of them; a recording whose first window is w
-//!   deletes those of every window before `w − CUT_KEEP`;
+//!   mark), records `cut(w)` = its version − 1 for the window w holding p
+//!   when p < `B_w` ≤ t, once the agent's record names a space, when a
+//!   read waits on w and t crosses at most `MAX_CUTS` boundaries; a
+//!   recording of window w deletes those of every window before
+//!   `w − CUT_KEEP`;
 //! - **the cut's build**: the build whose target is `cut(w)`; it is done
 //!   once the replica holds the agent's root at `cut(w)`
 //!   ([`roots::cut_root`]), the root over the committed values the agent
@@ -146,6 +147,10 @@ impl Entry {
             writes.push(Write {
                 key: keys::request(window, *id),
                 value: Some(read.encode()),
+            });
+            writes.push(Write {
+                key: keys::reading(),
+                value: Some(window.encode()),
             });
         }
         let committed = self
@@ -438,39 +443,50 @@ impl History {
         vos_tree::root(&Blake2b, &leaves)
     }
 
-    /// The cuts the agent must have recorded through `version`: each window
-    /// whose boundary a result crossed, after the agent's record named a
-    /// space, at the version before that result; of a result crossing more
-    /// than `MAX_CUTS` boundaries, the newest `MAX_CUTS` alone; none of a
-    /// window more than `CUT_KEEP` before the first a later result cut.
+    /// The cuts the agent must have recorded through `version`, each at the
+    /// version before the first result past its boundary, after the
+    /// agent's record named a space: when the agent reports every window,
+    /// each window a result crosses, of more than `MAX_CUTS` the newest
+    /// alone; else the window of the agent's batch-time mark, when a request
+    /// was recorded in it before the result and the result crosses no more
+    /// than `MAX_CUTS` boundaries. None of a window more than `CUT_KEEP`
+    /// before the first a later result cut.
     pub fn cuts(&self, version: u64) -> BTreeMap<u64, u64> {
         let mut cuts = BTreeMap::new();
-        let mut spaced = false;
+        let (mut spaced, mut every) = (false, false);
         let mut mark = 0;
+        let mut reading = None;
         for (at, entry) in (1..=version).zip(&self.entries) {
-            if spaced {
-                let mut crossed = Vec::new();
-                let mut window = CLOCK.window(mark).map_or(0, |window| window);
-                while let Some(boundary) = CLOCK.boundary(window) {
-                    if boundary > entry.time {
-                        break;
-                    }
-                    if boundary > mark {
-                        crossed.push(window);
-                    }
-                    window += 1;
+            let window = CLOCK.window(mark).unwrap_or(0);
+            let crossed: Vec<u64> = (window..)
+                .take_while(|window| {
+                    CLOCK
+                        .boundary(*window)
+                        .is_some_and(|boundary| boundary <= entry.time)
+                })
+                .collect();
+            let skipped = crossed.len().saturating_sub(MAX_CUTS as usize);
+            let cut = match (spaced, every) {
+                (false, _) => &[][..],
+                (true, true) => &crossed[skipped..],
+                (true, false) if skipped == 0 && reading == Some(window) => {
+                    crossed.get(..1).unwrap_or(&[])
                 }
-                let skipped = crossed.len().saturating_sub(MAX_CUTS as usize);
-                for window in &crossed[skipped..] {
-                    cuts.insert(*window, at - 1);
-                }
-                if let Some(first) = crossed.get(skipped) {
-                    cuts.retain(|window, _| window + CUT_KEEP >= *first);
-                }
+                (true, false) => &[][..],
+            };
+            for window in cut {
+                cuts.insert(*window, at - 1);
             }
-            spaced |= entry.writes.iter().any(|write| {
-                write.key == keys::space() && write.value != Some(SpaceId::NONE.encode())
-            });
+            if let Some(first) = cut.first() {
+                cuts.retain(|window, _| window + CUT_KEEP >= *first);
+            }
+            for write in &entry.writes {
+                spaced |= write.key == keys::space() && write.value != Some(SpaceId::NONE.encode());
+                every |= write.key == keys::every_window() && write.value.is_some();
+            }
+            if entry.request.is_some() {
+                reading = CLOCK.window(entry.time);
+            }
             mark = mark.max(entry.time);
         }
         cuts

@@ -254,6 +254,23 @@ impl Node {
         })
     }
 
+    /// Have `agent` record its cut, and report its root there, at every
+    /// window (`true`), as an issuer does, or only at the windows a read
+    /// waits on (`false`).
+    pub fn report_every_window(
+        &self,
+        agent: AgentId,
+        every: bool,
+    ) -> impl Future<Output = Result<Reply, CallError>> + use<> {
+        let inner = Arc::clone(&self.inner);
+        self.inner.runtime.spawn(async move {
+            inner
+                .admin(agent, Admin::ReportEveryWindow(every))
+                .await
+                .map(|answered| answered.reply)
+        })
+    }
+
     /// A client request to `agent`, answered once its step is applied here.
     pub fn call(
         &self,

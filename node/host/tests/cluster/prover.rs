@@ -27,7 +27,7 @@ use vos_wire::{Decode, keys};
 use crate::common::{Cluster, log_start, wait_until};
 use crate::support::past_close;
 use crate::support::{Anchoring, Judging, attests, ended, holds, replica};
-use crate::support::{ask_in, call, clock, reader_agent, write, writes};
+use crate::support::{ask_in, call, clock, later, reader_agent, write, writes};
 
 /// The model prover's program id for every kernel.
 const PROGRAM: ProgramId = ProgramId([7; 8]);
@@ -140,17 +140,6 @@ fn read_at(
     let attests = attests(replica(cluster, agent), agent, read);
     assert_eq!(attests.len(), 1);
     attests[0].clone()
-}
-
-/// A session opened at `agent`'s leader's time now: the clocks have moved
-/// past the cluster's session's expiry.
-fn later(cluster: &Cluster, agent: AgentId) -> Session {
-    let t0 = cluster.clock(cluster.leader(agent));
-    Session {
-        key: [1; 32],
-        name: t0.to_le_bytes().repeat(2).try_into().unwrap(),
-        t0,
-    }
 }
 
 /// Requests `sequences` of `session`, writing `agent`'s rows.

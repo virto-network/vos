@@ -379,6 +379,24 @@ impl Cluster {
         agent
     }
 
+    /// An agent on `replicas`, as [`Cluster::counter_agent`] makes it, that
+    /// reports its root every window, as an issuer does: what keeps a
+    /// space's every window anchored where no read waits.
+    pub fn issuer(&self, replicas: &[NodeNumber]) -> AgentId {
+        let agent = self.counter_agent(replicas);
+        let until = Instant::now() + IN_PROCESS_WAIT;
+        loop {
+            let leader = self.node(self.leader(agent));
+            match smol::block_on(leader.report_every_window(agent, true)) {
+                Ok(_) => return agent,
+                Err(_) if Instant::now() < until => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("the agent does not report every window: {error:?}"),
+            }
+        }
+    }
+
     /// Alice's session at `agent`, timed when the test first asks for it,
     /// by the clock of the node leading `agent` then, as the test sets it:
     /// the clock a new session's time must be near.

@@ -290,8 +290,8 @@ impl Live {
 
 /// A live read at [`WINDOW`]'s cut through `actor`'s workflow `workflow`
 /// on `arguments`, installed at [`INSTANCE`] of [`AGENT`] in `cut`'s space:
-/// the agent's root reported to the representative, its `Closed` of the
-/// window from `cut` applied, and the read's rows served from `cut` and
+/// the window cut, the agent's root reported to the representative, its
+/// `Closed` of the window from `cut` applied, and the read's rows served from `cut` and
 /// changed by `serve`.
 pub fn read_live(
     cut: &Cut,
@@ -326,7 +326,10 @@ pub fn read_live(
     let mut served = cut.served(&read);
     serve(&mut served);
     kit.batch(time + 1, [0; 32]);
-    kit.report(REPRESENTATIVE, WINDOW, cut.agent_root, true);
+    // The window's cut, which the node's apply records once a result
+    // crosses its boundary.
+    kit.set_row(keys::cut(WINDOW), 0u64.encode());
+    kit.report(REPRESENTATIVE, WINDOW, cut.agent_root);
     let representative = &cut.representative;
     kit.message(
         REPRESENTATIVE,

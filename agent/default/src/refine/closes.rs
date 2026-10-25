@@ -1,7 +1,7 @@
 //! A window's close: an agent's report of its root at the window's cut to
 //! its space's representative, the representative storing it, the
-//! representative's close sending each agent that asked its path, and an
-//! agent taking its `Closed`.
+//! representative's close sending each agent that reported the window its
+//! path, and an agent taking its `Closed`.
 
 use alloc::vec::Vec;
 
@@ -30,7 +30,7 @@ fn read<T: Decode>(base: &Base, key: &[u8]) -> Result<Option<T>, Corrupt> {
 /// cut, to its space's representative `to`: a [`Body::Report`], and the
 /// report's mark ([`keys::reported`]). A window at or before the mark, an agent of
 /// no space, or one reporting to itself sends nothing.
-pub(crate) fn report(base: &Base, to: AgentId, window: u64, root: [u8; 32], pending: bool) -> Run {
+pub(crate) fn report(base: &Base, to: AgentId, window: u64, root: [u8; 32]) -> Run {
     let input = InputRef::Report { window };
     let mut run = consumed(input, Outcome::Done(Vec::new()));
     let reported = read::<(u64, AgentId)>(base, &keys::reported());
@@ -50,7 +50,6 @@ pub(crate) fn report(base: &Base, to: AgentId, window: u64, root: [u8; 32], pend
             kind: RootKind::Space as u8,
             window,
             root,
-            pending,
         }),
     });
     run.writes.push(Write {
@@ -114,17 +113,15 @@ pub(crate) fn close(
 
 /// What a `Closed` from agent `from` of window `window` writes: its row
 /// ([`keys::closed`]), when `from` is the representative the agent
-/// reported to, the window is not one it holds a close of, and it is not
-/// past the rows the agent keeps.
+/// reported to, the agent holds the window's cut ([`keys::cut`]), and no
+/// close of it.
 pub(crate) fn closed(base: &Base, from: AgentId, window: u64, row: ClosedRow) -> Vec<Write> {
     let reported = read::<(u64, AgentId)>(base, &keys::reported());
-    let serving = read::<u64>(base, &keys::serving());
     let held = base.read(&keys::closed(window));
-    let (Ok(Some((_, to))), Ok(serving), Ok(None)) = (reported, serving, held) else {
+    let (Ok(Some((_, to))), Ok(None)) = (reported, held) else {
         return Vec::new();
     };
-    let kept = serving.is_none_or(|serving| window + defaults::CUT_KEEP >= serving);
-    if to != from || !kept {
+    if to != from || !base.holds(&keys::cut(window)) {
         return Vec::new();
     }
     alloc::vec![Write {
@@ -135,10 +132,11 @@ pub(crate) fn closed(base: &Base, from: AgentId, window: u64, row: ClosedRow) ->
 
 /// What agent `from`'s report writes in this agent, its space's
 /// representative: the root at `representative_row(from, Space, w)`, as a
-/// bare 32-byte value, and with `pending` an ask
-/// ([`representative_ask`]); the sender's rows of windows before
-/// `w −` [`REPORTS_KEPT`] go, and its asks of them, no other agent's; and
-/// the sender's last report ([`keys::reports`]). Nothing for a report of
+/// bare 32-byte value, and its ask for its path ([`representative_ask`]);
+/// the sender's rows of windows before `w −` [`REPORTS_KEPT`] go, and its
+/// asks of them, no other agent's; the sender's last report
+/// ([`keys::reports`]); and the window, as one a read waits on
+/// ([`keys::reading`]), when past the latest. Nothing for a report of
 /// another kind than the space's, from itself, of a window at or before
 /// the sender's last, or past the one after this agent's open window; nor
 /// in an agent of no space or without the representative installed, nor
@@ -186,9 +184,10 @@ pub(crate) fn stored(
         representative_row(from, RootKind::Space, window),
         Some(report.root.to_vec()),
     );
-    if report.pending {
-        overlay.insert(representative_ask(window, from), Some(Vec::new()));
-    }
+    overlay.insert(representative_ask(window, from), Some(Vec::new()));
     overlay.insert(keys::reports(from), Some(window.encode()));
+    if read::<u64>(base, &keys::reading())?.is_none_or(|reading| reading < window) {
+        overlay.insert(keys::reading(), Some(window.encode()));
+    }
     Ok(split_writes(overlay))
 }

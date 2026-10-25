@@ -391,10 +391,10 @@ fn check_agent(cluster: &Cluster, agent: AgentId) {
     });
     let recorded = cuts(&snapshots[0], agent);
     let serving = snapshots[0]
-        .get(agent, &keys::serving())
+        .get(agent, &keys::cut_mark())
         .unwrap()
-        .and_then(|bytes| u64::decode(unstored(&bytes)?).ok())
-        .map_or(0, |(window, _)| window);
+        .and_then(|bytes| <(u64, u64)>::decode(unstored(&bytes)?).ok())
+        .map_or(0, |((first, _), _)| first);
     println!(
         "agent {}: cuts through window {serving}, {} kept",
         agent.0,

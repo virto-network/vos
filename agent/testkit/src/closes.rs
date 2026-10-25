@@ -54,7 +54,7 @@ impl Testkit {
     /// `window`'s cut, to its space's representative `to`: a call of its
     /// `report` and the report's mark, unless the agent belongs to no
     /// space, reports to itself, or has reported the window or a later one.
-    pub fn report(&mut self, to: AgentId, window: u64, root: [u8; 32], pending: bool) -> Step {
+    pub fn report(&mut self, to: AgentId, window: u64, root: [u8; 32]) -> Step {
         let reported = self.held::<(u64, AgentId)>(&keys::reported());
         let spaced = self.space.is_some_and(|(space, _)| space != SpaceId::NONE);
         if !spaced || to == self.agent || reported.is_some_and(|(last, _)| last >= window) {
@@ -66,7 +66,6 @@ impl Testkit {
                 kind: RootKind::Space as u8,
                 window,
                 root,
-                pending,
             }),
         };
         let mark = Write {
@@ -127,16 +126,14 @@ impl Testkit {
 
     /// The step of a `Closed` from agent `from` of window `window`: its row,
     /// when `from` is the representative the agent reported to and the
-    /// agent holds no close of the window and keeps its rows.
+    /// agent holds the window's cut and no close of it.
     pub(crate) fn closed(&mut self, from: AgentId, window: u64, row: ClosedRow) -> Step {
         let to = self
             .held::<(u64, AgentId)>(&keys::reported())
             .map(|(_, to)| to);
-        let kept = self
-            .held::<u64>(&keys::serving())
-            .is_none_or(|serving| window + defaults::CUT_KEEP >= serving);
+        let cut = self.state.contains_key(&keys::cut(window));
         let held = self.state.contains_key(&keys::closed(window));
-        let writes = if to == Some(from) && kept && !held {
+        let writes = if to == Some(from) && cut && !held {
             vec![Write {
                 key: keys::closed(window),
                 value: Some(row.encode()),
@@ -149,8 +146,9 @@ impl Testkit {
 
     /// The step of agent `from`'s report in this agent, its space's
     /// representative: the root under `representative_row(from, Space, w)`
-    /// and, with `pending`, an ask; the sender's rows and asks of windows
-    /// before `w −` [`REPORTS_KEPT`] gone; its last report's mark. Nothing
+    /// and its ask; the sender's rows and asks of windows before
+    /// `w −` [`REPORTS_KEPT`] gone; its last report's mark; the window as
+    /// the latest a read waits on, when past it. Nothing
     /// for a report of another kind, from itself, of a window at or before
     /// its last, or past the one after the open window; nor in an agent of
     /// no space or without the representative installed.
@@ -190,10 +188,14 @@ impl Testkit {
             representative_row(from, RootKind::Space, window),
             Some(report.root.to_vec()),
         );
-        if report.pending {
-            overlay.insert(representative_ask(window, from), Some(Vec::new()));
-        }
+        overlay.insert(representative_ask(window, from), Some(Vec::new()));
         overlay.insert(keys::reports(from), Some(window.encode()));
+        if self
+            .held::<u64>(&keys::reading())
+            .is_none_or(|reading| reading < window)
+        {
+            overlay.insert(keys::reading(), Some(window.encode()));
+        }
         let (writes, committed) = crate::split_writes(overlay);
         self.applied(Step {
             writes,

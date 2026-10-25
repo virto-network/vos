@@ -1,10 +1,11 @@
 //! A window's close, as the leaders drive it. An agent's leader, once its
-//! replica has built a window's cut, reports its root there to the space's
-//! representative ([`Input::Report`]), saying whether reads wait on the
-//! close. The representative's leader, once its replica has built its own
-//! cut of the window, which closes it (and writes the space's root `S_w`,
-//! which its anchoring signs), sends each agent that asked its path
-//! ([`Input::Close`]). Both are proposed
+//! replica has built a window's cut, which it records only for a window a
+//! read waits on or for every window when it reports every one, reports
+//! its root there to the space's representative ([`Input::Report`]). The
+//! representative's leader, once its replica has built its own cut of the
+//! window, which closes it (and, when some agent reported the window,
+//! writes the space's root `S_w`, which its anchoring signs), sends each
+//! agent that reported its path ([`Input::Close`]). Both are proposed
 //! from the replica's state, never queued, and sent once: refine sends
 //! nothing for a window its mark has passed ([`keys::reported`],
 //! [`keys::close_mark`]).
@@ -47,10 +48,9 @@ impl Leader {
     }
 
     /// The reports `snapshot` holds due: the root at each cut this replica
-    /// keeps past the agent's last report, in window order, and whether
-    /// requests wait on its close; none for the representative, or while
-    /// the space has none, which this node knows of. A window a test's hook
-    /// holds, and those after it, wait.
+    /// keeps past the agent's last report, in window order; none for the
+    /// representative, or while the space has none, which this node knows
+    /// of. A window a test's hook holds, and those after it, wait.
     pub(super) fn reports(&self, snapshot: &Snapshot) -> Result<Vec<Pending>, Fault> {
         let representative = self
             .inner
@@ -69,13 +69,7 @@ impl Leader {
             if !self.inner.hooks.report(self.id, window) {
                 break;
             }
-            let pending = !roots::requests_at(snapshot, self.id, window)?.is_empty();
-            due.push(Pending::Duty(Input::Report {
-                to,
-                window,
-                root,
-                pending,
-            }));
+            due.push(Pending::Duty(Input::Report { to, window, root }));
         }
         Ok(due)
     }

@@ -60,9 +60,10 @@ pub const REPRESENTATIVE_ROOTS: &str = "roots";
 /// kernel's prologue hashes nothing for it.
 pub const REPRESENTATIVE_TAG: u32 = 0x4b14_a09e;
 
-/// The name of the representative's table of the agents that asked for
-/// their paths at a window's close, keyed `w (8, BE) ‖ agent (4, BE)`,
-/// ordered.
+/// The name of the representative's table of the agents that reported each
+/// window, so asked for their paths at its close, keyed
+/// `w (8, BE) ‖ agent (4, BE)`, ordered: an agent reports a window a read
+/// waits on, or every window when it reports every one.
 pub const REPRESENTATIVE_ASKED: &str = "asked";
 
 /// The tag [`REPRESENTATIVE_ASKED`] derives.
@@ -75,14 +76,14 @@ pub const ASKED_TAG: u32 = 0xf5ab_2cca;
 pub const REPORTS_KEPT: u64 = 2;
 
 /// An agent's report of its root at a window's cut, a [`crate::batch::Body::Report`]:
-/// the root's kind, the window, the root, and whether reads wait on the
-/// window's close. The reporting agent is the message's sender.
+/// the root's kind, the window and the root. The reporting agent is the
+/// message's sender, and its report asks for its path at the window's
+/// close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRoot {
     pub kind: u8,
     pub window: u64,
     pub root: [u8; 32],
-    pub pending: bool,
 }
 
 /// The representative's close of a window as an agent holds it
@@ -98,9 +99,10 @@ pub struct ClosedRow {
 
 /// The representative's close of a window as its node keeps it
 /// ([`keys::closing`]), once its cut's build is done: its root at the
-/// cut, and for each agent that asked and whose row the cut holds, in
-/// agent order, the row's salt and a `vos_tree::BatchProof`'s encoding of
-/// it against the root.
+/// cut, and for each agent that reported the window and whose row the cut
+/// holds, in agent order, the row's salt and a `vos_tree::BatchProof`'s
+/// encoding of it against the root. A window no agent's row reaches has
+/// none: nothing is anchored of it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Closing {
     pub root: [u8; 32],

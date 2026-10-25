@@ -144,17 +144,17 @@ pub enum Input {
         served: Option<Vec<u8>>,
     },
     /// The agent's root at window `window`'s cut, `root`, for its space's
-    /// representative `to`, and whether reads wait on its close
-    /// (`pending`): refine sends it to the representative as a
+    /// representative `to`: refine sends it to the representative as a
     /// [`Body::Report`], once a window, after the latest window it reported
-    /// ([`crate::keys::reported`]).
-    /// The node puts it in a batch once its replica has built the cut.
+    /// ([`crate::keys::reported`]). The node puts it in a batch once its
+    /// replica has built the cut, which it records only for a window a
+    /// read waits on, or every window when the agent reports every one
+    /// ([`Admin::ReportEveryWindow`]).
     #[codec(index = 7)]
     Report {
         to: AgentId,
         window: u64,
         root: [u8; 32],
-        pending: bool,
     },
     /// The representative's close of window `window`: its root at its cut
     /// of the window, `rep_root`, and for each agent that asked, its row's
@@ -339,4 +339,10 @@ pub enum Admin {
     /// its roles, and `#[msg(role)]` refers to one by name.
     #[codec(index = 1)]
     SetRole(Grant),
+    /// Record the agent's cut, and report its root there, at every window
+    /// (`true`), as an issuer whose verifiers demand a recent root does, or
+    /// only at the windows a read waits on (`false`, the default)
+    /// ([`crate::keys::every_window`]).
+    #[codec(index = 2)]
+    ReportEveryWindow(bool),
 }

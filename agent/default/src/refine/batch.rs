@@ -309,12 +309,9 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
                     None => Stepped::ran(consumed(input, Outcome::Done(Vec::new()))),
                 }
             }
-            Input::Report {
-                to,
-                window,
-                root,
-                pending,
-            } => Stepped::ran(closes::report(base, to, window, root, pending)),
+            Input::Report { to, window, root } => {
+                Stepped::ran(closes::report(base, to, window, root))
+            }
             Input::Close {
                 window,
                 rep_root,

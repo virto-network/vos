@@ -50,9 +50,9 @@ fn record_rows(witness: &[(Vec<u8>, Opened)]) -> usize {
         .count()
 }
 
-/// Batches of an agent in a space, each run on a VOS node and as a JAM
-/// package, which agree on every row (cuts among them): the install
-/// records no cut; a batch exactly at `B_0` cuts window 0 at the version
+/// Batches of an agent in a space that reports every window, each run on a
+/// VOS node and as a JAM package, which agree on every row (cuts among
+/// them): the install records no cut; a batch exactly at `B_0` cuts window 0 at the version
 /// before it; one whose time jumps three windows ahead cuts windows 1 to 3
 /// at one version; one at the same time cuts nothing. Every package's
 /// witness opens the agent's record whole or not at all, and a package
@@ -64,7 +64,13 @@ fn vos_and_jam_cut_the_same_windows_and_witness_the_record_whole() {
     let mut paired = Paired::new(PvmBackend::Default, &programs(&actors), POLKAJAM_REFINE_GAS);
     let counter = ProgramHash::of(&actors.counter);
     let increment = actors.method(COUNTER, "increment");
-    let installed = paired.batch(T0, vec![in_space(Target::Jam, COUNTER, counter)]);
+    let installed = paired.batch(
+        T0,
+        vec![
+            in_space(Target::Jam, COUNTER, counter),
+            Input::Admin(Admin::ReportEveryWindow(true)),
+        ],
+    );
     ran_or_refused(&installed.result);
     assert_eq!(record_rows(&installed.witness), 3, "the install's");
     assert!(cuts(&paired.vos).is_empty(), "the install cuts nothing");

@@ -27,11 +27,11 @@ use vos_wire::vos_anchor::{MIN_LENGTH_MS, RootKind, RootRead, space_root};
 use vos_wire::{Encode, WindowClock};
 
 use crate::common::{Cluster, wait_until};
-use crate::support::past_close;
 use crate::support::{
-    Anchoring, READER, ask_keys, attests, clock, delay, ended, holds, logged, reader_agent,
-    rep_root, replica, write,
+    Anchoring, READER, ask_in, ask_keys, attests, clock, delay, ended, holds, later, logged,
+    reader_agent, rep_root, replica, write,
 };
+use crate::support::{close_with, past_close};
 /// The space's root of `window` over the representative's `rep_root`.
 fn stated(cluster: &Cluster, window: u64, rep_root: &[u8; 32]) -> RootRead {
     let space = cluster.space.id();
@@ -89,11 +89,11 @@ fn every_agent_reports_and_one_close_serves_their_reads() {
 }
 
 /// An agent whose clock leads the representative's by more than `L − D`
-/// cuts window 1 and reports it before the representative closes window
-/// 0: its window-1 root is a row of its own, so its window-0 row stays in
-/// `A_rep(0)` and `S_0` holds it as it was. Its read of window 0 is served
-/// at window 0 once the close comes, stated against `S_0`, which the venue
-/// holds anchored.
+/// cuts window 1, where a second read waits, and reports it before the
+/// representative closes window 0: its window-1 root is a row of its own,
+/// so its window-0 row stays in `A_rep(0)` and `S_0` holds it as it was.
+/// Its read of window 0 is served at window 0 once the close comes, stated
+/// against `S_0`, which the venue holds anchored.
 #[test]
 fn a_leading_clock_reports_its_next_window_apart() {
     let clock = clock();
@@ -112,6 +112,7 @@ fn a_leading_clock_reports_its_next_window_apart() {
     wait_until("the representative holds window 0's root", || {
         holds(rep(), representative, agent, 0)
     });
+    ask_in(&cluster, agent, later(&cluster, agent), 1, 1);
     // Node 3 leads by `L − D + 10 s`: past `B_1` while the others are before
     // `B_0 + D`.
     cluster.set_clock(3, b0 + d - 2_000 + length - d + 10_000);
@@ -435,4 +436,71 @@ fn a_read_is_stated_within_a_window_and_its_close() {
         [root]
     );
     assert!(anchoring.venue.anchored(&root));
+}
+
+/// A window no agent reported is not anchored, and an agent reporting
+/// every window has each anchored: with only an idle reader, windows 0 and
+/// 1 close with no row and no anchor; once an agent reports every window,
+/// window 2 is anchored, its root over that agent's row alone, and the
+/// idle reader's read of window 3 is anchored with it at window 3.
+#[test]
+fn only_a_reported_window_is_anchored() {
+    let clock = clock();
+    let anchoring = Anchoring::new();
+    let cluster = Cluster::in_space(3, Some(clock), anchoring.tuning());
+    anchoring.register(&cluster);
+    let representative = cluster.representative(&[1, 2, 3]);
+    let reader = reader_agent(&cluster, &[1, 2, 3]);
+    write(&cluster, reader, 1..=20);
+    for window in 0..2 {
+        anchoring.set_clocks(&cluster, past_close(&clock, window));
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    for (_, node) in cluster.running() {
+        let snapshot = node.store().snapshot();
+        assert!(
+            roots::anchors(&snapshot, representative, None)
+                .unwrap()
+                .is_empty(),
+            "no window reported: no anchor row"
+        );
+        assert_eq!(
+            roots::latest_built(&snapshot, representative).unwrap(),
+            None
+        );
+    }
+    assert!(anchoring.venue.anchors(&cluster.space.id()).is_empty());
+
+    let issuer = cluster.issuer(&[1, 2, 3]);
+    let set = |at| anchoring.set_clocks(&cluster, at);
+    close_with(&cluster, &clock, 2, set);
+    wait_until("window 2 anchored", || {
+        anchoring
+            .venue
+            .anchors(&cluster.space.id())
+            .iter()
+            .any(|anchor| anchor.window == 2)
+    });
+    let rep = replica(&cluster, representative);
+    assert!(holds(rep, representative, issuer, 2));
+    assert!(!holds(rep, representative, reader, 2), "the reader idle");
+
+    let (read, ..) = ask_in(&cluster, reader, later(&cluster, reader), 1, 3);
+    set(clock.boundary(3).unwrap() + 1_000);
+    wait_until("the representative holds the reader's root", || {
+        holds(replica(&cluster, representative), representative, reader, 3)
+    });
+    set(past_close(&clock, 3));
+    assert!(matches!(ended(&cluster, reader, read), Outcome::Done(_)));
+    let attests = attests(replica(&cluster, reader), reader, read);
+    assert_eq!(attests[0].window, Some(3));
+    let rep_root = rep_root(&cluster, representative, 3);
+    assert!(anchoring.venue.anchored(&stated(&cluster, 3, &rep_root)));
+    let windows: Vec<u64> = anchoring
+        .venue
+        .anchors(&cluster.space.id())
+        .iter()
+        .map(|anchor| anchor.window)
+        .collect();
+    assert_eq!(windows, [2, 3]);
 }

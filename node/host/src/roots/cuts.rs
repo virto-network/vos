@@ -23,13 +23,14 @@
 //! window), its rows as they stood at the cut with their salts, under one
 //! proof against that root ([`CutProof`]):
 //! the same bytes on every replica. The space's representative's also keeps
-//! its close of the window: its root, and the path of each agent that asked
-//! ([`keys::closing`]); the same bytes on every replica that builds the cut
-//! within a few windows, since the asks are a plain table read where the
-//! build starts, and pruned: a replica far behind omits paths only dead
-//! reads need. Its close writes the space's root of the window too
-//! ([`keys::anchor`]), the only root its leader signs, kept for
-//! `MaxRootAge`. An undo row an apply wrote racing that commit, of a
+//! its close of the window, once some agent reported it: its root, and the
+//! path of each agent that reported ([`keys::closing`]); the same bytes on
+//! every replica that builds the cut within a few windows, since the
+//! reports are a plain table read where the build starts, and pruned: a
+//! replica far behind omits paths only dead reads need. Its close writes
+//! the space's root of the window too ([`keys::anchor`]), the only root its
+//! leader signs, kept for `MaxRootAge`: a window no one reported is not
+//! anchored. An undo row an apply wrote racing that commit, of a
 //! window built, is garbage the next build deletes, as are a request's
 //! proof once it is answered and a close once sent.
 
@@ -333,9 +334,13 @@ impl Finish {
         }
         if let Some((space, clock)) = representative {
             let closing = closing(at, agent, cut.window, tree, root)?;
-            writes.insert(keys::closing(cut.window), Some(closing.encode()));
-            let space_root = space_root(&space, cut.window, &root);
-            writes.insert(keys::anchor(cut.window), Some(space_root.to_vec()));
+            // A window no agent's row reaches closes nothing, and is not
+            // anchored.
+            if !closing.paths.is_empty() {
+                writes.insert(keys::closing(cut.window), Some(closing.encode()));
+                let space_root = space_root(&space, cut.window, &root);
+                writes.insert(keys::anchor(cut.window), Some(space_root.to_vec()));
+            }
             let kept = MAX_ROOT_AGE_MS.div_ceil(clock.length_ms.max(1));
             let first = keys::anchor(cut.window.saturating_sub(kept));
             for row in fresh.scan(agent, &keys::anchors(), None) {
@@ -374,9 +379,10 @@ pub fn requests_at(
 }
 
 /// The representative's close of window `window`: its root at its cut,
-/// `root`, and the path of each agent that asked whose row its tree at the
-/// cut holds, in agent order. An ask whose row the cut lacks, its report
-/// applied after the close, gets none: the agent's reads end `NotClosed`.
+/// `root`, and the path of each agent that reported the window whose row
+/// its tree at the cut holds, in agent order. A report whose row the cut
+/// lacks, applied after the close, gets none: the agent's reads end
+/// `NotClosed`.
 fn closing(
     at: &Snapshot,
     agent: AgentId,

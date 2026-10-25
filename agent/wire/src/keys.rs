@@ -146,10 +146,12 @@ enum Row {
     Reported = 0x1d,
     Closed = 0x1e,
     // 0x1f: reserved.
-    Serving = 0x20,
+    CutMark = 0x20,
     CloseMark = 0x21,
     Reports = 0x22,
     Proven = 0x23,
+    Reading = 0x24,
+    EveryWindow = 0x25,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -435,9 +437,10 @@ pub fn built() -> Vec<u8> {
 
 /// The state version of the window `window`'s cut: the version before the
 /// first work result applied with a time at or past the window's boundary
-/// ([`crate::WindowClock::boundary`]). Apply writes it, for every window
-/// that result's time crosses, in an agent of a space; it is replicated,
-/// and never rewritten.
+/// ([`crate::WindowClock::boundary`]). Apply writes it, in an agent of a
+/// space, for the window a read waits on, or for every window that
+/// result's time crosses when the agent reports every one; it is
+/// replicated, and never rewritten.
 pub fn cut(window: u64) -> Vec<u8> {
     key(&[&Row::Cut.prefix(), &window.to_be_bytes()])
 }
@@ -594,10 +597,26 @@ pub fn closed_prefix() -> Vec<u8> {
     Row::Closed.prefix().to_vec()
 }
 
-/// The first of the windows the latest recording cut. Replicated, written
-/// by apply with the cuts.
-pub fn serving() -> Vec<u8> {
-    Row::Serving.prefix().to_vec()
+/// The first and last of the windows the latest recording cut. Replicated,
+/// written by apply with the cuts: the rows of earlier windows lie no
+/// further back than `CUT_KEEP` before its first.
+pub fn cut_mark() -> Vec<u8> {
+    Row::CutMark.prefix().to_vec()
+}
+
+/// The latest window a read waits on: one asked in it at a cut
+/// ([`crate::abi::Op::AttestAt`]), or, at the space's representative, an
+/// agent's report of it. Replicated, written by those steps; apply records
+/// the cut of the window the agent's batch-time mark lies in only when it
+/// is this one or an earlier ([`crate::apply`]).
+pub fn reading() -> Vec<u8> {
+    Row::Reading.prefix().to_vec()
+}
+
+/// Present when the agent records its cut, and reports its root there, at
+/// every window ([`crate::batch::Admin::ReportEveryWindow`]). Replicated.
+pub fn every_window() -> Vec<u8> {
+    Row::EveryWindow.prefix().to_vec()
 }
 
 /// The representative's mark of the closes it has sent
@@ -628,8 +647,9 @@ pub fn proven(window: u64, id: &[u8; 32]) -> Vec<u8> {
 }
 
 /// The representative's close of the window `window`, node-local, written
-/// by the commit that finishes its cut's build: its root there, and the
-/// path of each agent that asked for one ([`crate::served::Closing`]).
+/// by the commit that finishes its cut's build when some agent's row
+/// reaches it: its root there, and the path of each agent that reported
+/// the window ([`crate::served::Closing`]).
 pub fn closing(window: u64) -> Vec<u8> {
     TreeRow::Closing.key(&window.to_be_bytes())
 }
@@ -647,9 +667,10 @@ pub fn closing_entry(key: &[u8]) -> Option<u64> {
 
 /// The space's root `S_w` of the window `window`, as the representative's
 /// close of it makes it: node-local, written by the commit that finishes
-/// the representative's cut build of the window, the same bytes on every
-/// replica, the cut fixed by the committed log. Kept for `MaxRootAge`; its
-/// leader signs only these.
+/// the representative's cut build of the window when some agent reported
+/// it, the same bytes on every replica, the cut fixed by the committed
+/// log. Kept for `MaxRootAge`; its leader signs only these, so a window no
+/// one reported is not anchored.
 pub fn anchor(window: u64) -> Vec<u8> {
     TreeRow::Anchor.key(&window.to_be_bytes())
 }

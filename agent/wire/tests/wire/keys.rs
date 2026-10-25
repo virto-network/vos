@@ -129,7 +129,9 @@ fn keys_keep_their_bytes() {
     assert_eq!(keys::closed_prefix(), [0x00, 0x1e]);
     assert_eq!(keys::closed_entry(&keys::closed(sequence)), Some(sequence));
     assert_eq!(keys::closed_entry(&keys::cut(sequence)), None);
-    assert_eq!(keys::serving(), [0x00, 0x20]);
+    assert_eq!(keys::cut_mark(), [0x00, 0x20]);
+    assert_eq!(keys::reading(), [0x00, 0x24]);
+    assert_eq!(keys::every_window(), [0x00, 0x25]);
     assert_eq!(keys::close_mark(), [0x00, 0x21]);
     assert_eq!(
         keys::reports(AgentId(0x0102_0304)),
@@ -153,7 +155,9 @@ fn keys_keep_their_bytes() {
     for replicated in [
         keys::reported(),
         keys::closed(1),
-        keys::serving(),
+        keys::cut_mark(),
+        keys::reading(),
+        keys::every_window(),
         keys::close_mark(),
         keys::proven(1, &[1; 32]),
     ] {

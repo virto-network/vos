@@ -33,12 +33,20 @@ use vos_wire::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, RootKind, SpaceId};
 use crate::common::{Cluster, wait_until};
 use crate::support::Anchoring;
 use crate::support::clock;
-use crate::support::{closed_on, delay, past_close};
+use crate::support::{close_with, closed_on, delay};
+
+/// Window `window` closed: the clocks past its boundary until the
+/// representative holds a report of it, then past its close.
+fn close(anchoring: &Anchoring, cluster: &Cluster, clock: &WindowClock, window: u64) {
+    close_with(cluster, clock, window, |at| {
+        anchoring.set_clocks(cluster, at)
+    });
+}
 
 /// The anchor of `window` the venue holds, once the clocks have passed
 /// its close and the representative's leader has anchored it.
 fn anchored(anchoring: &Anchoring, cluster: &Cluster, clock: &WindowClock, window: u64) -> Anchor {
-    anchoring.set_clocks(cluster, past_close(clock, window));
+    close(anchoring, cluster, clock, window);
     let space = cluster.space.id();
     let mut anchor = None;
     wait_until(&format!("the venue holds window {window}'s anchor"), || {
@@ -61,7 +69,7 @@ fn closed(
     (number, representative): (u8, AgentId),
     window: u64,
 ) {
-    anchoring.set_clocks(cluster, past_close(clock, window));
+    close(anchoring, cluster, clock, window);
     wait_until(
         &format!("the representative closes window {window}"),
         || closed_on(cluster.node(number), representative, window),
@@ -79,7 +87,8 @@ fn windows(anchoring: &Anchoring, cluster: &Cluster) -> Vec<u64> {
 }
 
 /// A space of `count` nodes, each anchoring at the venue, its space
-/// registered there, and its representative on every node.
+/// registered there, its representative on every node, and an agent on
+/// every node reporting every window, so each is anchored.
 fn space(count: u8) -> (Anchoring, Cluster, WindowClock, AgentId) {
     let clock = clock();
     let anchoring = Anchoring::new();
@@ -87,6 +96,7 @@ fn space(count: u8) -> (Anchoring, Cluster, WindowClock, AgentId) {
     anchoring.register(&cluster);
     let replicas: Vec<u8> = (1..=count).collect();
     let representative = cluster.representative(&replicas);
+    cluster.issuer(&replicas);
     (anchoring, cluster, clock, representative)
 }
 
@@ -256,9 +266,10 @@ fn a_deposed_leader_and_a_lagging_successor_anchor_one_root() {
         Cluster::in_space(3, Some(clock), offers.tuning(&anchoring, true, Some(hooks)));
     anchoring.register(&cluster);
     let representative = cluster.representative(&[1, 2, 3]);
+    cluster.issuer(&[1, 2, 3]);
     *hook.representative.lock().unwrap() = Some(representative);
     let deposed = cluster.leader(representative);
-    anchoring.set_clocks(&cluster, past_close(&clock, 0));
+    close(&anchoring, &cluster, &clock, 0);
     wait_until("the hook stops the leader before its close", || {
         hook.stopped.load(Ordering::SeqCst)
     });
@@ -302,6 +313,7 @@ fn overtaken() -> (Anchoring, Cluster, AgentId, NodeNumber, [u8; 32], Offers) {
     anchoring.register(&cluster);
     let space = cluster.space.id();
     let representative = cluster.representative(&[1, 2, 3]);
+    cluster.issuer(&[1, 2, 3]);
     let stolen = SigningKey::from_bytes(&[0x66; 32]);
     assert!(
         anchoring
@@ -310,7 +322,7 @@ fn overtaken() -> (Anchoring, Cluster, AgentId, NodeNumber, [u8; 32], Offers) {
     );
     anchoring.set_venue(clock.boundary(0).unwrap() + 1_000);
     anchor_by(&anchoring.venue, space, 0, [9; 32], &stolen);
-    anchoring.set_clocks(&cluster, past_close(&clock, 0));
+    close(&anchoring, &cluster, &clock, 0);
     let root = rows(&cluster, representative, 0);
     let leader = cluster.leader(representative);
     (anchoring, cluster, representative, leader, root, offers)
@@ -349,6 +361,10 @@ fn a_dissenting_replica_does_not_block_the_evidence() {
     let evidence = anchoring.venue.evidence();
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0].1.root, root);
+    // The alert is raised once the venue has answered the evidence.
+    wait_until("the leader alerts the evidence", || {
+        alerts(&cluster, leader).contains(&AnchorAlert::Evidence { window: 0 })
+    });
     let alerts = alerts(&cluster, leader);
     assert!(
         alerts.contains(&AnchorAlert::Divergent {
@@ -358,7 +374,6 @@ fn a_dissenting_replica_does_not_block_the_evidence() {
         }),
         "{alerts:?}"
     );
-    assert!(alerts.contains(&AnchorAlert::Evidence { window: 0 }));
 }
 
 /// Without a quorum nothing is sent and nothing settled: both other
@@ -472,7 +487,7 @@ fn one_handoff_a_window() {
         );
     }
     cluster.stop(listed);
-    anchoring.set_clocks(&cluster, past_close(&clock, 0));
+    close(&anchoring, &cluster, &clock, 0);
     let handed = |cluster: &Cluster| {
         alerts(cluster, leader)
             .iter()
@@ -542,6 +557,7 @@ fn a_delisted_nodes_replica_is_refused_and_replaced() {
     anchoring.register(&cluster);
     let space = cluster.space.id();
     let representative = cluster.representative(&[1, 2, 3]);
+    cluster.issuer(&[1, 2]);
     assert!(
         anchoring
             .venue
@@ -631,6 +647,7 @@ fn a_registered_node_that_did_not_found_the_space_represents_it() {
     anchoring.register(&cluster);
     let space = cluster.space.id();
     let representative = cluster.representative(&[1, 2, 3]);
+    cluster.issuer(&[1, 2, 3]);
     let leader = cluster.leader(representative);
     let out = [1, 2, 3]
         .into_iter()
@@ -681,6 +698,7 @@ fn an_aged_window_is_settled_unsent() {
     let cluster = Cluster::in_space(1, Some(clock), offers.tuning(&anchoring, false, None));
     anchoring.register(&cluster);
     let representative = cluster.representative(&[1]);
+    cluster.issuer(&[1]);
     for window in 0..2 {
         closed(&anchoring, &cluster, &clock, (1, representative), window);
     }
@@ -765,6 +783,7 @@ fn windows_refused_unregistered_are_anchored_once_registered() {
     });
     anchoring.register(&cluster);
     let representative = cluster.representative(&[1]);
+    cluster.issuer(&[1]);
     for window in 0..2 {
         closed(&anchoring, &cluster, &clock, (1, representative), window);
     }

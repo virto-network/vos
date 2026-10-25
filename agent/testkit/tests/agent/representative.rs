@@ -3,8 +3,9 @@
 //! report step sends it, stores the agent's root in the representative's
 //! committed map under exactly the key a read's path names
 //! ([`vos_wire::served::representative_row`]) as a bare 32-byte value, as
-//! a kernel's prologue checks it; an ask under the key its node reads; the
-//! rows of old windows gone; and no program's call writes any of it.
+//! a kernel's prologue checks it; an ask under the key its node reads, and
+//! the window as one a read waits on; the rows of old windows gone; and no
+//! program's call writes any of it.
 
 use vos_testkit::Testkit;
 use vos_testkit::programs::{representative_package, table_tag};
@@ -59,9 +60,9 @@ fn representative() -> (Node, Testkit) {
     (node, kit)
 }
 
-/// Agent `from`'s report of `root` at `window`, `pending` or not, as its
-/// report step sends it.
-fn report(from: AgentId, sequence: u64, window: u64, root: [u8; 32], pending: bool) -> Input {
+/// Agent `from`'s report of `root` at `window`, as its report step sends
+/// it.
+fn report(from: AgentId, sequence: u64, window: u64, root: [u8; 32]) -> Input {
     Input::Message(Message {
         from,
         sequence,
@@ -69,7 +70,6 @@ fn report(from: AgentId, sequence: u64, window: u64, root: [u8; 32], pending: bo
             kind: RootKind::Space as u8,
             window,
             root,
-            pending,
         }),
     })
 }
@@ -116,17 +116,18 @@ fn value(node: &Node, key: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// A report stores the reporting agent's root under
-/// `representative_row(agent, Space, w)`, its value the bare root, and an
-/// ask under `w ‖ agent`. A report of a window at or before the sender's
-/// last, or two past the representative's open window, stores nothing. The
-/// model agrees on each step.
+/// `representative_row(agent, Space, w)`, its value the bare root, an ask
+/// under `w ‖ agent`, and the latest window reported as the one a read
+/// waits on, which the representative's apply cuts. A report of a window
+/// at or before the sender's last, or two past the representative's open
+/// window, stores nothing. The model agrees on each step.
 fn reports_are_stored(node: &mut Node, kit: &mut Testkit, a: AgentId, b: AgentId) {
     let inputs = vec![
-        report(a, 1, 5, [5; 32], true),
-        report(b, 1, 5, [6; 32], true),
-        report(a, 2, 6, [7; 32], false),
-        report(b, 2, 5, [9; 32], false),
-        report(b, 3, 7, [9; 32], false),
+        report(a, 1, 5, [5; 32]),
+        report(b, 1, 5, [6; 32]),
+        report(a, 2, 6, [7; 32]),
+        report(b, 2, 5, [9; 32]),
+        report(b, 3, 7, [9; 32]),
     ];
     let result = node.batch(at(5), inputs.clone());
     kit.batch(at(5), [0; 32]);
@@ -153,8 +154,13 @@ fn reports_are_stored(node: &mut Node, kit: &mut Testkit, a: AgentId, b: AgentId
     );
     assert!(node.get(&asked(5, a)).is_some());
     assert!(node.get(&asked(5, b)).is_some());
-    assert!(node.get(&asked(6, a)).is_none(), "not pending");
+    assert!(node.get(&asked(6, a)).is_some());
     assert_eq!(asked(5, a), representative_ask(5, a));
+    assert_eq!(
+        node.value::<u64>(&keys::reading()),
+        Some(6),
+        "the latest window reported"
+    );
     assert_eq!(
         value(node, &representative_row(b, RootKind::Space, 7)),
         None,
@@ -170,7 +176,7 @@ fn reports_are_stored(node: &mut Node, kit: &mut Testkit, a: AgentId, b: AgentId
 /// Window 8: a later report of `a` drops its rows of windows before
 /// `w − 2` and its asks with them, never another agent's.
 fn old_windows_go(node: &mut Node, a: AgentId, b: AgentId) {
-    node.batch(at(7), vec![report(a, 3, 8, [8; 32], true)]);
+    node.batch(at(7), vec![report(a, 3, 8, [8; 32])]);
     assert_eq!(
         value(node, &representative_row(a, RootKind::Space, 5)),
         None
@@ -190,7 +196,6 @@ fn no_call_writes_a_report(node: &mut Node, a: AgentId) {
         kind: 0,
         window: 9,
         root: [9; 32],
-        pending: true,
     }
     .encode();
     let client = Input::Request(vos_wire::batch::Request {

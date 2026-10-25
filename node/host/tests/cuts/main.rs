@@ -217,8 +217,9 @@ fn a_builder_lagging_across_two_boundaries_builds_each_cut_as_a_rebuild_would() 
     }
 }
 
-/// A batch time that jumps Δ, as after a leader's clock ran fast, cuts
-/// every window up to `w(t + Δ)` at one version: each window whose
+/// A batch time that jumps Δ, as after a leader's clock ran fast, cuts an
+/// agent reporting every window at every window up to `w(t + Δ)` at one
+/// version: each window whose
 /// boundary the jump crossed gets `cut(w)` = the version before the jumping
 /// result. A result exactly at a boundary crosses it; one a millisecond
 /// before does not. A later result at the mark, as a trailing leader times
@@ -234,7 +235,12 @@ fn a_clock_jump_cuts_every_window_it_crosses_at_one_version() {
         index: 0,
         recorded: BTreeMap::new(),
     };
-    jumps.history.push(Entry::install(500, SPACE));
+    let mut install = Entry::install(500, SPACE);
+    install.writes.push(Write {
+        key: keys::every_window(),
+        value: Some(Vec::new()),
+    });
+    jumps.history.push(install);
     jumps.index = 1;
     assert!(jumps.replica.apply(1, &jumps.history.entries[0].result(0)));
     jumps.step(900, true);

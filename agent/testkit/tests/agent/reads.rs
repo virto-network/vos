@@ -166,12 +166,7 @@ impl Reads {
                         request,
                         served,
                     } => self.kit.resume_read(*window, *request, served.clone()),
-                    Input::Report {
-                        to,
-                        window,
-                        root,
-                        pending,
-                    } => self.kit.report(*to, *window, *root, *pending),
+                    Input::Report { to, window, root } => self.kit.report(*to, *window, *root),
                     Input::Message(message) => self.kit.message(message.from, &message.body),
                     Input::Close {
                         window,
@@ -194,11 +189,14 @@ impl Reads {
     }
 
     /// The rows the node's apply writes and deletes with a cut, which the
-    /// model leaves to it: the latest recording's first window and the
+    /// model leaves to it: the cuts, the latest recording's windows and the
     /// closes it keeps, as the node holds them after a batch.
     fn sync_cuts(&mut self) {
-        let ours =
-            |key: &Vec<u8>| key.starts_with(&keys::closed_prefix()) || *key == keys::serving();
+        let ours = |key: &Vec<u8>| {
+            key.starts_with(&keys::closed_prefix())
+                || key.starts_with(&keys::cuts())
+                || *key == keys::cut_mark()
+        };
         let held: Vec<Vec<u8>> = self
             .kit
             .rows()
@@ -267,8 +265,9 @@ impl Reads {
     /// The rows `read` names served at window `window` from the agent's
     /// committed rows now, under the tree of them, with the path of the
     /// tree's root in a representative's tree of that root alone; the
-    /// agent's report of the root and the representative's `Closed` of the
-    /// window applied first, unless the agent holds one.
+    /// window's cut, the agent's report of the root and the
+    /// representative's `Closed` of the window applied first, unless the
+    /// agent holds one.
     fn served(&mut self, window: u64, read: &PendingRead) -> Served {
         let rows = self.committed();
         let (store, agent_root) = tree(
@@ -280,6 +279,14 @@ impl Reads {
         let (rep_root, rep_salt, space_path) =
             representative(&[(AGENT, window, agent_root)], (AGENT, window));
         if self.node.get(&keys::closed(window)).is_none() {
+            // The window's cut, as apply records it once a result crosses
+            // its boundary: a test serving within the window stands for it.
+            if self.node.get(&keys::cut(window)).is_none() {
+                let version = self.node.value::<u64>(&keys::version()).unwrap_or(0);
+                let cut = vos_wire::records::stored(&version.encode());
+                self.node.state.insert(keys::cut(window), cut);
+                self.kit.set_row(keys::cut(window), version.encode());
+            }
             self.close(window, agent_root, (rep_root, rep_salt, space_path.clone()));
         }
         Served {
@@ -315,7 +322,6 @@ impl Reads {
             to: REPRESENTATIVE,
             window,
             root: agent_root,
-            pending: true,
         };
         let closed = Input::Message(Message {
             from: REPRESENTATIVE,

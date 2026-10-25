@@ -20,9 +20,10 @@
 //! agent whose record (its target, space and clock, which its first
 //! install writes together) is stored in part: the state is corrupt.
 //!
-//! In an agent of a space, a result records the cut of each window whose
-//! boundary its time crosses ([`cut_windows`]): `cut(w)`, the state version
-//! before it ([`keys::cut`]).
+//! In an agent of a space, a result records the cut of the window a read
+//! waits on when its time crosses the window's boundary, or of each window
+//! it crosses ([`cut_windows`]) when the agent reports every one:
+//! `cut(w)`, the state version before it ([`keys::cut`]).
 
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::vec::Vec;
@@ -90,9 +91,15 @@ impl Apply<'_> {
         if result.time < latest || stale(result) || !self.within_caps(result) {
             return false;
         }
-        // Read before the steps: the install that writes it cuts nothing.
+        // Read before the steps: the install that writes it cuts nothing,
+        // and a read or a report the result makes waits on no window it
+        // crosses.
         let Some(clock) = self.record() else {
             return false;
+        };
+        let reads = Reads {
+            every: self.state.read(&keys::every_window()).is_some(),
+            reading: self.get::<u64>(&keys::reading()),
         };
         if result.time > latest {
             self.put(&keys::batch_time(), &result.time.encode());
@@ -118,30 +125,29 @@ impl Apply<'_> {
             self.put(&keys::seed(next), &result.seed);
         }
         if let Some(clock) = clock
-            && let Some((first, last)) = cut_windows(&clock, latest, result.time)
+            && let Some((first, last)) = reads.cuts(&clock, latest, result.time)
         {
             for window in first..=last {
                 self.put(&keys::cut(window), &version.encode());
             }
-            self.prune(clock.window(latest), first);
+            self.prune(first, last);
         }
         self.put(&keys::version(), &next.encode());
         true
     }
 
-    /// With the cuts a result records, the first `first`: the cut and close
-    /// rows of windows before `first − CUT_KEEP` go, those from `CUT_KEEP`
-    /// before the latest earlier recording's first window through `asked`,
-    /// the window of the agent's batch-time mark, past which the earlier
-    /// recordings cut nothing, since none lie below.
-    fn prune(&mut self, asked: Option<u64>, first: u64) {
-        let serving = self.get::<u64>(&keys::serving());
-        self.put(&keys::serving(), &first.encode());
-        let (Some(serving), Some(asked)) = (serving, asked) else {
+    /// The cuts `first` through `last` recorded: the agent's cut and close
+    /// rows of windows before `first − CUT_KEEP` go. They lie no further
+    /// back than `CUT_KEEP` before the latest earlier recording's first
+    /// window, and no further on than its last.
+    fn prune(&mut self, first: u64, last: u64) {
+        let earlier = self.get::<(u64, u64)>(&keys::cut_mark());
+        self.put(&keys::cut_mark(), &(first, last).encode());
+        let Some((from, to)) = earlier else {
             return;
         };
-        let below = first.saturating_sub(defaults::CUT_KEEP).min(asked + 1);
-        for window in serving.saturating_sub(defaults::CUT_KEEP)..below {
+        let below = first.saturating_sub(defaults::CUT_KEEP).min(to + 1);
+        for window in from.saturating_sub(defaults::CUT_KEEP)..below {
             for row in [keys::cut(window), keys::closed(window)] {
                 if self.state.read(&row).is_some() {
                     self.delete(&row);
@@ -365,6 +371,30 @@ impl Apply<'_> {
             }
             (Some(hash), Host::Jam) => self.put(&row, &hash),
         }
+    }
+}
+
+/// What the agent's cuts wait on, as a result finds it: whether it reports
+/// every window ([`keys::every_window`]), and the latest window a read
+/// waits on ([`keys::reading`]).
+struct Reads {
+    every: bool,
+    reading: Option<u64>,
+}
+
+impl Reads {
+    /// The windows a result timed `time` cuts, after the agent's batch-time
+    /// mark `mark`, the first and the last: every window it crosses
+    /// ([`cut_windows`]) when the agent reports every one; else the window
+    /// of the mark alone, when a read waits on it and the result crosses its
+    /// boundary.
+    fn cuts(&self, clock: &WindowClock, mark: u64, time: u64) -> Option<(u64, u64)> {
+        let (first, last) = cut_windows(clock, mark, time)?;
+        if self.every {
+            return Some((first, last));
+        }
+        let waits = self.reading.is_some_and(|reading| reading >= first);
+        (waits && clock.window(mark) == Some(first)).then_some((first, first))
     }
 }
 

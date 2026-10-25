@@ -639,17 +639,28 @@ impl<'a> Invocation<'a> {
             workflow: awaiting.workflow,
             awaits: awaiting.counter,
         };
-        let key = keys::request(window, request);
-        let value = PendingRead { instance, rows }.encode();
-        self.write_bytes += key.len() + value.len();
-        self.rows_written += 1;
-        if self.write_bytes > self.limits.step_writes || self.rows_written > self.limits.step_rows {
-            return Err(Failure::Cap);
+        let mut writes = alloc::vec![(
+            keys::request(window, request),
+            PendingRead { instance, rows }.encode(),
+        )];
+        // The window a read waits on, which apply cuts.
+        let reading = self.read_state(&keys::reading())?;
+        if reading.and_then(|bytes| u64::decode_exact(&bytes)) != Some(window) {
+            writes.push((keys::reading(), window.encode()));
         }
-        self.frames
-            .last_mut()
-            .expect("a frame")
-            .insert(key, Some(value));
+        for (key, value) in writes {
+            self.write_bytes += key.len() + value.len();
+            self.rows_written += 1;
+            if self.write_bytes > self.limits.step_writes
+                || self.rows_written > self.limits.step_rows
+            {
+                return Err(Failure::Cap);
+            }
+            self.frames
+                .last_mut()
+                .expect("a frame")
+                .insert(key, Some(value));
+        }
         let deadline = clock
             .boundary(window.saturating_add(defaults::READ_WINDOWS))
             .unwrap_or(u64::MAX);
