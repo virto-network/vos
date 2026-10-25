@@ -343,10 +343,6 @@ check-venue-rules:
 check-no-leaks: (_forbidden "jam-dev" "venue-clients" "seeded-masks" "debug-internals" "test-formats" "store-dump" "heap-peak" "scale") _seeded-masks-unimplied _debug-names-absent
     print "no test seam, debug output, test format, store dump, heap peak, JAM client, venue client or scale harness in a production build"
 
-# The scale harness (`tools/scale`, `vos-scale`) is development tooling:
-# neither `vos`, with or without the prover, nor `vos-node` depends on it.
-check-no-scale: (_forbidden "scale")
-
 # A node knows no JAM: the JAM client (a PolkaJam node's RPC and `jamt`,
 # the statements service's client and `JamVenue`) is development tooling,
 # `vos-jam-dev`, and neither the `vos` binary, with or without the prover,
@@ -363,6 +359,12 @@ check-no-jam-dev: (_forbidden "jam-dev")
 # build edge of any workspace member enables the model or the mock.
 check-no-venue-clients: (_forbidden "venue-clients")
     print "no venue client in the node"
+
+# The scale harness (`tools/scale`, `vos-scale`) is development tooling:
+# neither the `vos` binary, with or without the prover, nor `vos-node`
+# depends on it, on a normal or build edge.
+check-no-scale: (_forbidden "scale")
+    print "no scale harness in the node"
 
 # The masked prover's test seams (`vos-pvm-recair`'s `seeded-masks`: the
 # seeded randomness `MaskRng::Seeded` and the forced proof
@@ -582,8 +584,6 @@ slice-gate: ci test-bench-proof
     with-env { LEAKAGE_N: "2000", LEAKAGE_WRAP_N: "32" } { just test-proof }
     just fuzz 300
 
-# Use the repository's hooks: fmt and clippy before commits, `just ci`
-# before pushes.
 # The static x86-64 builds the scale test deploys (`tools/scale`): `vos`
 # and `vos-scale` for musl, from the lock file, each built alone so the
 # harness's dependencies never unify into the node's. Not incremental: the
@@ -592,5 +592,7 @@ release:
     with-env { CARGO_INCREMENTAL: "0" } { cargo build --release --locked --target x86_64-unknown-linux-musl -p vos-cli }
     with-env { CARGO_INCREMENTAL: "0" } { cargo build --release --locked --target x86_64-unknown-linux-musl -p vos-scale }
 
+# Use the repository's hooks: fmt and clippy before commits, `just ci`
+# before pushes.
 install-hooks:
     git config core.hooksPath .githooks

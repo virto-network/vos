@@ -2933,6 +2933,8 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hex",
+ "libc",
+ "mimalloc",
  "serde",
  "serde_json",
  "tempfile",

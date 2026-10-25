@@ -17,6 +17,8 @@ runs = "/var/tmp/vos-scale/runs"
 memory_max = "2G"
 # The shortest window a space may have.
 window_ms = 120000
+# Nodes, the driver and the coordinator share this machine: a smoke.
+smoke = true
 
 [node]
 executors = 2

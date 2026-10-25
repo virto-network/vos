@@ -55,16 +55,33 @@ fn user(seed: u64, index: u64) -> ([u8; 32], u64) {
     (digest, pick)
 }
 
+/// A send this far behind its schedule is late: the driver, not the
+/// nodes, set its latency's floor.
+pub const LATE_US: u64 = 10_000;
+
 /// What an interval saw.
 #[derive(Default)]
 struct Interval {
     latency: Histogram,
     errors: BTreeMap<String, u64>,
+    /// Sends, and those later than [`LATE_US`] behind their schedule.
+    sent: u64,
+    late_sends: u64,
     /// How far behind its schedule the latest send went.
     late_us: u64,
 }
 
 impl Interval {
+    fn absorb(&mut self, other: Interval) {
+        self.latency.add(&other.latency);
+        for (kind, count) in other.errors {
+            *self.errors.entry(kind).or_default() += count;
+        }
+        self.sent += other.sent;
+        self.late_sends += other.late_sends;
+        self.late_us = self.late_us.max(other.late_us);
+    }
+
     fn line(&self, t_ms: u64, seconds: f64, method: &str, total: bool) -> serde_json::Value {
         let ok = self.latency.count();
         let errors: u64 = self.errors.values().sum();
@@ -80,6 +97,8 @@ impl Interval {
             "p99_us": self.latency.quantile(0.99),
             "p999_us": self.latency.quantile(0.999),
             "late_us": self.late_us,
+            "sent": self.sent,
+            "late_sends": self.late_sends,
         })
     }
 }
@@ -170,7 +189,10 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
                     );
                     let took = Instant::now().saturating_duration_since(next);
                     let mut interval = interval.lock().expect("the interval");
-                    interval.late_us = interval.late_us.max(late.as_micros() as u64);
+                    let late = late.as_micros() as u64;
+                    interval.late_us = interval.late_us.max(late);
+                    interval.sent += 1;
+                    interval.late_sends += u64::from(late > LATE_US);
                     match answer {
                         Ok(Response::Ran { .. }) => {
                             interval.latency.record(took.as_micros() as u64)
@@ -197,12 +219,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
                     false,
                 );
                 let _ = writeln!(file, "{line}");
-                let mut whole = whole.lock().expect("the whole");
-                whole.latency.add(&taken.latency);
-                for (kind, count) in taken.errors {
-                    *whole.errors.entry(kind).or_default() += count;
-                }
-                whole.late_us = whole.late_us.max(taken.late_us);
+                whole.lock().expect("the whole").absorb(taken);
                 last = now;
                 if now >= end + Duration::from_secs(1) {
                     break;
@@ -212,10 +229,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
     });
     let leftover = std::mem::take(&mut *interval.lock().expect("the interval"));
     let mut whole = whole.into_inner().expect("the whole");
-    whole.latency.add(&leftover.latency);
-    for (kind, count) in leftover.errors {
-        *whole.errors.entry(kind).or_default() += count;
-    }
+    whole.absorb(leftover);
     let line = whole.line(crate::now_ms(), plan.secs as f64, &plan.method, true);
     writeln!(file, "{line}").map_err(|error| error.to_string())?;
     Ok(())
@@ -275,6 +289,8 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
                 "--out".into(),
                 format!("{}/drive/{}.drive.jsonl", host.dir, run.id),
             ],
+            // Its load, then a margin to finish its calls and write.
+            runtime_max_s: load.secs + 300,
         };
         hosts::run(host, &unit.start_script())?;
     }

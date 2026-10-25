@@ -62,6 +62,16 @@ impl Host {
         self.ssh == "localhost"
     }
 
+    /// The machine it names: entries of one machine share it. A
+    /// `localhost` entry is the coordinator's machine.
+    pub fn machine(&self) -> &str {
+        if self.is_local() {
+            "localhost"
+        } else {
+            self.ssh.rsplit('@').next().unwrap_or(&self.ssh)
+        }
+    }
+
     /// Its node's unit, and its sampler's and driver's.
     pub fn unit(&self, part: &str) -> String {
         format!("vos-scale-{part}-{}", self.name)
@@ -95,6 +105,14 @@ pub struct Harness {
     /// How often the samplers and the coordinator's poller sample.
     #[serde(default = "every_s")]
     pub every_s: u64,
+    /// The longest a node or a sampler unit runs before systemd stops
+    /// it: a run left up is not left up for good.
+    #[serde(default = "max_run_s")]
+    pub max_run_s: u64,
+    /// A smoke on shared hardware: a node host may also hold drivers or
+    /// the coordinator, which `check` otherwise refuses.
+    #[serde(default)]
+    pub smoke: bool,
 }
 
 fn runs() -> PathBuf {
@@ -111,6 +129,9 @@ fn max_clock_offset_ms() -> u64 {
 }
 fn every_s() -> u64 {
     10
+}
+fn max_run_s() -> u64 {
+    6 * 3_600
 }
 
 impl Default for Harness {
@@ -129,8 +150,13 @@ pub struct Inventory {
     /// `vos node run --config` names them.
     #[serde(default)]
     pub node: toml::Table,
+    /// The hosts a command uses: the inventory's less those excluded.
     #[serde(rename = "host")]
     pub hosts: Vec<Host>,
+    /// Every host the file lists, excluded or not: `down` and `deploy`
+    /// stop the harness's units on each.
+    #[serde(skip)]
+    pub listed: Vec<Host>,
     /// The directory the file was read from: relative paths are relative
     /// to it.
     #[serde(skip)]
@@ -138,6 +164,48 @@ pub struct Inventory {
     /// The file, which each run keeps a copy of.
     #[serde(skip)]
     pub path: PathBuf,
+}
+
+/// An ssh target: `localhost`, or `[user@]host` of plain characters, never
+/// read as an option.
+fn check_ssh(ssh: &str) -> Result<(), String> {
+    let plain = ssh
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "@._-".contains(c));
+    if ssh.is_empty() || ssh.starts_with('-') || !plain || ssh.matches('@').count() > 1 {
+        return Err(format!("ssh {ssh:?}: `localhost` or user@host"));
+    }
+    Ok(())
+}
+
+/// The harness wipes inside `dir`: an absolute path of plain characters,
+/// no `.` or `..` part, two parts deep at least, and not a home directory
+/// itself (`deploy` refuses `$HOME` again on the host).
+fn check_dir(dir: &str) -> Result<(), String> {
+    let plain = dir
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "/_.-".contains(c));
+    let parts: Vec<&str> = dir.split('/').skip(1).collect();
+    if !plain || !dir.starts_with('/') || parts.iter().any(|part| matches!(*part, "" | "." | ".."))
+    {
+        return Err(format!(
+            "dir {dir:?}: an absolute path of letters, digits, '/', '_', '.' and '-', with no empty, '.' or '..' part"
+        ));
+    }
+    let home = matches!(parts.as_slice(), ["root"] | ["home", _] | ["Users", _]);
+    if parts.len() < 2 || home {
+        return Err(format!(
+            "dir {dir}: a directory of its own, deeper than {dir}, which the harness wipes inside"
+        ));
+    }
+    Ok(())
+}
+
+/// Whether one of `a` and `b` is the other or inside it.
+fn nested(a: &str, b: &str) -> bool {
+    let inside =
+        |outer: &str, inner: &str| inner == outer || inner.starts_with(&format!("{outer}/"));
+    inside(a, b) || inside(b, a)
 }
 
 impl Inventory {
@@ -151,6 +219,7 @@ impl Inventory {
             .map(Path::to_path_buf)
             .unwrap_or_else(|| PathBuf::from("."));
         inventory.path = path.to_path_buf();
+        inventory.listed = inventory.hosts.clone();
         for name in excluded {
             if !inventory.hosts.iter().any(|host| &host.name == name) {
                 return Err(format!("--exclude {name}: no such host"));
@@ -165,7 +234,8 @@ impl Inventory {
 
     #[cfg(test)]
     pub fn parse(text: &str) -> Result<Self, String> {
-        let inventory: Inventory = toml::from_str(text).map_err(|error| error.to_string())?;
+        let mut inventory: Inventory = toml::from_str(text).map_err(|error| error.to_string())?;
+        inventory.listed = inventory.hosts.clone();
         inventory.validate()?;
         Ok(inventory)
     }
@@ -191,7 +261,7 @@ impl Inventory {
 
     fn validate(&self) -> Result<(), String> {
         let mut names = BTreeSet::new();
-        let mut dirs = BTreeSet::new();
+        let mut dirs: Vec<(&str, &str, &str)> = Vec::new();
         let mut ports = BTreeSet::new();
         for host in &self.hosts {
             let simple = |text: &str| {
@@ -209,12 +279,23 @@ impl Inventory {
             if !names.insert(&host.name) {
                 return Err(format!("host {}: named twice", host.name));
             }
-            if !host.dir.starts_with('/') {
-                return Err(format!("host {}: dir must be absolute", host.name));
+            check_ssh(&host.ssh).map_err(|error| format!("host {}: {error}", host.name))?;
+            if host.address.parse::<std::net::IpAddr>().is_err() {
+                return Err(format!(
+                    "host {}: address {:?} is not an IP address",
+                    host.name, host.address
+                ));
             }
-            if !dirs.insert((&host.ssh, &host.dir)) {
-                return Err(format!("host {}: its dir is another entry's", host.name));
+            check_dir(&host.dir).map_err(|error| format!("host {}: {error}", host.name))?;
+            for (machine, dir, other) in &dirs {
+                if *machine == host.machine() && nested(dir, &host.dir) {
+                    return Err(format!(
+                        "host {}: its dir {} and {other}'s {dir} are one inside the other",
+                        host.name, host.dir
+                    ));
+                }
             }
+            dirs.push((host.machine(), host.dir.as_str(), host.name.as_str()));
             if host.role == Role::Node {
                 if host.ingress == 0 || host.peer == 0 {
                     return Err(format!(
@@ -348,5 +429,49 @@ mod tests {
         );
         let unknown = THREE.replace("weight = 2", "wieght = 2");
         assert!(Inventory::parse(&unknown).is_err());
+    }
+
+    #[test]
+    fn a_dir_the_harness_could_wipe_wrongly_is_refused() {
+        let with_dir =
+            |dir: &str| Inventory::parse(&THREE.replace("\"/tmp/b\"", &format!("{dir:?}")));
+        for dir in [
+            "/",
+            "/tmp",
+            "/home/me",
+            "/root",
+            "tmp/b",
+            "/tmp/../etc",
+            "/tmp/./b",
+            "/tmp//b",
+            "/tmp/b/",
+            "/tmp/b c",
+            "/tmp/$HOME",
+        ] {
+            assert!(with_dir(dir).unwrap_err().contains("dir"), "{dir}");
+        }
+        // One entry's dir inside another's, on the same machine.
+        assert!(
+            with_dir("/tmp/a/b")
+                .unwrap_err()
+                .contains("one inside the other")
+        );
+        assert!(with_dir("/home/me/vos").is_ok());
+        // The same path on another machine is another dir.
+        let elsewhere = THREE.replace("\"/data/vos\"", "\"/tmp/a\"");
+        assert!(Inventory::parse(&elsewhere).is_ok());
+    }
+
+    #[test]
+    fn an_ssh_target_or_address_that_is_not_plain_is_refused() {
+        for ssh in ["-oProxyCommand=x", "me@host;rm", "a@b@c", "", "me@ho st"] {
+            let text = THREE.replace("\"me@10.0.0.3\"", &format!("{ssh:?}"));
+            assert!(
+                Inventory::parse(&text).unwrap_err().contains("ssh"),
+                "{ssh}"
+            );
+        }
+        let named = THREE.replace("address = \"10.0.0.3\"", "address = \"box.lan\"");
+        assert!(Inventory::parse(&named).unwrap_err().contains("IP address"));
     }
 }

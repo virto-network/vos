@@ -12,7 +12,6 @@ use serde::{Deserialize, Serialize};
 
 use crate::hosts::{self, quote};
 use crate::inventory::{Host, Inventory};
-use crate::nodes::units_of;
 
 /// The artifacts a deploy ships, on the coordinator.
 pub struct Artifacts {
@@ -135,7 +134,7 @@ fn output_of(command: &mut Command) -> String {
 /// node is stopped by the PID its shell started it under.
 const FIRST_RUN: &str = r#"
 cd "$DIR"
-"$DIR/bin/vos" node run --data "$DIR/data" --listen 127.0.0.1:0 --agent "$DIR/guests/vos-agent.elf" > logs/first.out 2> logs/first.log &
+timeout 60 "$DIR/bin/vos" node run --data "$DIR/data" --listen 127.0.0.1:0 --agent "$DIR/guests/vos-agent.elf" > logs/first.out 2> logs/first.log &
 pid=$!
 for _ in $(seq 600); do
   grep -q '^node ' logs/first.out && break
@@ -149,15 +148,27 @@ if [ -z "$key" ]; then cat logs/first.log >&2; exit 1; fi
 echo "$key"
 "#;
 
-fn prepare(host: &Host, artifacts: &Artifacts, units: &[String]) -> Result<(), String> {
-    let dir = quote(&host.dir);
-    hosts::run(
-        host,
-        &format!(
-            "{}rm -rf {dir}/data {dir}/space {dir}/space.genesis\nmkdir -p {dir}/bin {dir}/guests {dir}/logs {dir}/samples {dir}/drive\n",
-            hosts::stop_script(units)
-        ),
-    )?;
+/// Take `$DIR` for the harness, its `.vos-scale` marker saying the harness
+/// made it and may wipe inside it: made if absent, adopted if empty, kept if
+/// it holds the marker; refused if it is `/` or `$HOME` (after links), or
+/// holds anything else. Only then is the node's data wiped.
+const OWN: &str = r#"
+real=$(realpath -m -- "$DIR")
+home=$(realpath -m -- "${HOME:-/}")
+if [ "$real" = / ] || [ "$real" = "$home" ]; then
+  echo "$DIR is / or the home directory: the harness wipes inside its dir" >&2; exit 1
+fi
+if [ -e "$DIR" ] && [ ! -f "$DIR/.vos-scale" ] && [ -n "$(ls -A -- "$DIR")" ]; then
+  echo "$DIR holds files and no .vos-scale marker: give the harness a dir of its own" >&2; exit 1
+fi
+mkdir -p -- "$DIR"
+touch -- "$DIR/.vos-scale"
+rm -rf -- "$DIR/data" "$DIR/space" "$DIR/space.genesis"
+mkdir -p -- "$DIR/bin" "$DIR/guests" "$DIR/logs" "$DIR/samples" "$DIR/drive"
+"#;
+
+fn prepare(host: &Host, artifacts: &Artifacts) -> Result<(), String> {
+    hosts::run(host, &format!("DIR={}\n{OWN}", quote(&host.dir)))?;
     for name in ["vos", "vos-scale"] {
         hosts::push(
             host,
@@ -188,13 +199,15 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
     for stale in ["deployed.json", "space", "space.genesis", "agents.json"] {
         let _ = std::fs::remove_file(local.join(stale));
     }
+    // Every entry's units stop, an excluded one's too: none runs on.
+    crate::nodes::down(inventory)?;
     let keys: Vec<Option<String>> = std::thread::scope(|scope| {
         let shipped: Vec<_> = inventory
             .hosts
             .iter()
             .map(|host| {
                 scope.spawn(move || {
-                    prepare(host, artifacts, &units_of(host))?;
+                    prepare(host, artifacts)?;
                     eprintln!("{}: shipped", host.name);
                     match host.role {
                         crate::inventory::Role::Node => {
@@ -296,7 +309,56 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
 
 #[cfg(test)]
 mod tests {
-    use super::static_x86_64;
+    use super::{OWN, static_x86_64};
+    use std::path::Path;
+
+    /// `OWN` run here on `dir`, with `home` as `$HOME`.
+    fn own(dir: &Path, home: &Path) -> Result<(), String> {
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!(
+                "set -euo pipefail\nDIR={}\n{OWN}",
+                crate::hosts::quote(&dir.to_string_lossy())
+            ))
+            .env("HOME", home)
+            .output()
+            .unwrap();
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).into_owned())
+        }
+    }
+
+    #[test]
+    fn the_harness_wipes_only_a_dir_it_owns() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        // Absent: made and marked; the node's data wiped on the next deploy.
+        let fresh = root.path().join("fresh");
+        own(&fresh, &home).unwrap();
+        assert!(fresh.join(".vos-scale").exists() && fresh.join("bin").is_dir());
+        std::fs::create_dir_all(fresh.join("data/store")).unwrap();
+        own(&fresh, &home).unwrap();
+        assert!(!fresh.join("data").exists());
+        // Empty: adopted.
+        let empty = root.path().join("empty");
+        std::fs::create_dir(&empty).unwrap();
+        own(&empty, &home).unwrap();
+        // Holding files without the marker: refused, nothing touched.
+        let taken = root.path().join("taken");
+        std::fs::create_dir_all(taken.join("data")).unwrap();
+        std::fs::write(taken.join("data/precious"), b"x").unwrap();
+        assert!(own(&taken, &home).unwrap_err().contains("marker"));
+        assert!(taken.join("data/precious").exists());
+        // `$HOME`, through a link too, and `/`: refused.
+        assert!(own(&home, &home).unwrap_err().contains("home"));
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        assert!(own(&link, &home).unwrap_err().contains("home"));
+        assert!(own(Path::new("/"), &home).unwrap_err().contains("home"));
+    }
 
     #[test]
     fn a_dynamic_or_foreign_binary_is_refused() {

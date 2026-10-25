@@ -16,6 +16,11 @@ window_ms = 120000
 max_clock_offset_ms = 100
 # How often hosts are sampled and nodes polled.
 every_s = 10
+# The longest a node or sampler unit runs before systemd stops it.
+max_run_s = 21600
+# Left false for timed runs: check refuses a node host that also holds a
+# driver or the coordinator.
+smoke = false
 
 # The nodes' settings (`vos node run --config`), the same on every node:
 # executors, queue, max_inputs, max_bytes, linger_ms, ingress_connections,
@@ -33,7 +38,10 @@ role = "node"
 # weighs less. It still gates every group it follows (a group commits at
 # its median replica's fsync): exclude it to measure without it.
 weight = 2
-# A directory on the disk the node's data goes on: binaries, data, logs.
+# A directory of the harness's own on the disk the node's data goes on:
+# absent or empty at the first deploy, which marks it `.vos-scale`; a
+# deploy wipes the node's data inside it, and refuses a dir that holds
+# other files.
 dir = "/srv/vos-scale"
 # The cores it may use (taskset -c); all when unset.
 cores = "0-11"

@@ -19,6 +19,11 @@ drives it, with one `[[host]]` entry for each node or driver.
 
 `--exclude NAME`, given before the command, leaves a host out as if the
 inventory did not list it. Use it for a second run without the slowest host.
+That needs four node hosts or more: every agent has three replicas, so a
+space needs three nodes after one is left out. `down` and `deploy` still
+stop the harness's units on an excluded host. `run` stops every unit when it
+fails partway or is interrupted (Ctrl-C). Every unit also has a runtime cap
+(`harness.max_run_s`, and a driver's load plus five minutes).
 Each run gets its own directory under `runs/` (set by `harness.runs`). The
 directory holds the inventory, the hosts' facts (`hosts.json`), the versions
 and space (`deployed.json`), the agents, the polls (`nodes.jsonl`), each
@@ -46,8 +51,14 @@ Every host, nodes and drivers alike, needs:
 - **Lingering** for that user, so units outlive the ssh session:
   `sudo loginctl enable-linger USER`.
 - **A synchronised clock** (chrony or systemd-timesyncd). `check`
-  refuses an offset above 100 ms from the coordinator.
-- **A directory on the data disk** for `dir`, with at least 10 GiB free.
+  measures the offset over one ssh session, keeps the read with the
+  shortest round trip, and refuses an offset above 100 ms. It warns when
+  the host does not report NTP sync.
+- **A directory of the harness's own on the data disk** for `dir`, with
+  at least 10 GiB free. It must be absent or empty at the first deploy.
+  The deploy marks it with a `.vos-scale` file, and later deploys wipe the
+  node's data inside it. A deploy refuses a dir that holds other files, and
+  it refuses `/` and `$HOME`.
   Prefer an SSD or NVMe: a group commits at its median replica's fsync, so
   a slow disk holds back every group the host follows.
 - **The `performance` CPU governor** for timed runs
@@ -75,8 +86,10 @@ Copy `inventory.example.toml` to `inventory.toml` and give one
   without ssh.
 - `address`: the host's address on the wired LAN. Peers and clients
   reach it there, and `check` finds the interface that holds it.
-- `role`: `node` or `driver`. A run needs three node hosts or more.
-  Keep the coordinator off every node host during timed runs.
+- `role`: `node` or `driver`. A run needs three node hosts or more, and a
+  run without the slowest needs four. `check` refuses a node's machine
+  that also holds a driver or the coordinator, unless `harness.smoke` is
+  set, as it is on one machine.
 - `weight`: the host's share of agents' replicas against the other
   nodes'. A slower host gets a lower weight.
 - `dir`: an absolute path on the data disk.
@@ -85,6 +98,8 @@ Copy `inventory.example.toml` to `inventory.toml` and give one
   `dir`.
 - `ingress` and `peer`: the node's TCP and UDP ports.
 - `memory_max`: optional; it overrides `harness.memory_max` for this host.
+  On each machine, the caps of all its entries plus a 2 GiB reserve must
+  fit in its free memory, or `check` refuses it.
 
 `[harness]` sets where runs are kept, the units' memory cap, the window
 length, the clock bound and the sampling interval. `[node]` holds the
@@ -108,11 +123,19 @@ when many users call at once):
     target/x86_64-unknown-linux-musl/release/vos-scale -i inventory.toml run \
         --agents 100 --users 10000 --rate 200 --secs 300 --label gate
 
-Then rerun with the slowest host left out, as the report names it, and
-compare the two runs:
+The report names the slowest node host: the one whose node has the highest
+commit p99, with disk time per I/O breaking ties. With four node hosts or
+more, rerun without it and compare the two runs:
 
     vos-scale -i inventory.toml --exclude SLOWEST run --agents 100 --users 10000 --rate 200 --secs 300 --label without-SLOWEST
     vos-scale -i inventory.toml report --compare <the first run's id>
 
 `tools/scale/inventory.localhost.toml` runs the same thing on one machine.
-It lists four nodes and a driver as `localhost` entries.
+It lists four nodes and a driver as `localhost` entries, and is marked
+`smoke = true`.
+
+The report's window is the drivers' span, minus a ramp at the start (one
+sampling interval by default; `--ramp-s` sets it, `--from-ms` and
+`--to-ms` give the window outright). The report warns when a driver fell
+behind its schedule, because then the driver may be what bound, not the
+nodes.

@@ -8,7 +8,6 @@
 //! is warned of, and recorded with the run.
 
 use std::collections::BTreeMap;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
@@ -50,12 +49,22 @@ if systemctl --user show-environment >/dev/null 2>&1; then echo "user_manager=1"
 echo "linger=$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || echo unknown)"
 if [ -n "$INGRESS" ] && [ -n "$(ss -Hltn "sport = :$INGRESS" 2>/dev/null)" ]; then echo "taken=tcp/$INGRESS"; fi
 if [ -n "$PEER" ] && [ -n "$(ss -Hlun "sport = :$PEER" 2>/dev/null)" ]; then echo "taken=udp/$PEER"; fi
+echo "machine_id=$(cat /etc/machine-id 2>/dev/null)"
+echo "ntp_synchronized=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
+if command -v chronyc >/dev/null; then
+  echo "chrony_offset_s=$(chronyc tracking 2>/dev/null | awk '/^System time/{print ($6=="slow" ? "-" : "") $4}')"
+fi
+echo "freq_cur_khz=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null | awk '{s+=$1} END {if (NR) printf "%d", s/NR}')"
+echo "freq_max_khz=$(cat /sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq 2>/dev/null)"
 "#;
 
 /// The kernel the PVM's JIT needs.
 const MIN_KERNEL: (u32, u32) = (6, 7);
 /// The least free space a node host's data disk must have.
 const MIN_FREE_DISK_KB: u64 = 10 << 20;
+/// What a machine keeps free beyond its units' memory caps: its kernel,
+/// page cache and whatever else it runs.
+const MEMORY_RESERVE_KB: u64 = 2 << 20;
 
 /// A host's facts, as the probe read them, and the verdict on it.
 #[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
@@ -107,34 +116,16 @@ impl Facts {
     }
 }
 
-fn now_ms() -> f64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("after the epoch")
-        .as_secs_f64()
-        * 1e3
-}
-
-/// The host's clock against the coordinator's: the offset at the
-/// midpoint of the read with the shortest round trip of five.
+/// The host's clock against the coordinator's: of eight reads over one
+/// session, the offset at the midpoint of the one with the shortest round
+/// trip, and that round trip, the offset's bound being half of it.
 fn clock(host: &Host) -> Result<(f64, f64), String> {
-    let mut best: Option<(f64, f64)> = None;
-    for _ in 0..5 {
-        let sent = now_ms();
-        let start = Instant::now();
-        let text = hosts::run(host, "date +%s%N\n")?;
-        let rtt = start.elapsed().as_secs_f64() * 1e3;
-        let theirs: f64 =
-            text.trim()
-                .parse::<u128>()
-                .map_err(|_| format!("{}: a clock of {text:?}", host.name))? as f64
-                / 1e6;
-        let offset = theirs - (sent + rtt / 2.0);
-        if best.is_none_or(|(_, kept)| rtt < kept) {
-            best = Some((offset, rtt));
-        }
-    }
-    Ok(best.expect("five reads"))
+    let reads = hosts::clock_reads(host, 8)?;
+    let (sent, rtt, theirs) = reads
+        .into_iter()
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .ok_or_else(|| format!("{}: no clock read", host.name))?;
+    Ok((theirs - (sent + rtt / 2.0), rtt))
 }
 
 /// Probe `host`: its facts, without a verdict.
@@ -242,6 +233,11 @@ pub fn judge(facts: &mut Facts, host: &Host, harness: &Harness) {
             Some(_) => {}
         },
     }
+    match facts.get("ntp_synchronized") {
+        Some("yes") => {}
+        Some("no") => warnings.push("its clock is not NTP-synchronised".into()),
+        _ => warnings.push("whether its clock is NTP-synchronised is unknown".into()),
+    }
     let governors = facts.get("governors").unwrap_or("unknown").to_string();
     if governors != "performance" {
         warnings.push(format!(
@@ -264,20 +260,15 @@ pub fn judge(facts: &mut Facts, host: &Host, harness: &Harness) {
         refused.push(format!("ports in use: {taken}"));
     }
     if host.role == Role::Node {
-        if facts.get("disk_rotational") == Some("1") {
-            warnings.push(
+        match (facts.get("disk_rotational"), facts.get("disk_transport")) {
+            (Some("1"), _) => warnings.push(
                 "a rotating data disk: a group commits at its median replica's fsync, so it gates every group it follows".into(),
-            );
+            ),
+            (_, Some("usb")) => warnings.push("a USB data disk: its fsyncs may gate every group it follows".into()),
+            (Some("0"), _) => {}
+            _ => warnings.push("its data disk's type is unknown".into()),
         }
         let available = facts.number("mem_available_kb").unwrap_or(0);
-        let cap = size_kb(host.memory_max(harness)).unwrap_or(0);
-        if available < cap {
-            warnings.push(format!(
-                "{} MiB free, under its cap of {}",
-                available >> 10,
-                host.memory_max(harness)
-            ));
-        }
         if available < 2 << 20 {
             refused.push(format!("{} MiB of memory free", available >> 10));
         }
@@ -290,9 +281,85 @@ pub fn judge(facts: &mut Facts, host: &Host, harness: &Harness) {
     facts.warnings = warnings;
 }
 
+/// The verdicts on the hosts together, by machine (its machine id, else
+/// its ssh host): the memory caps of a machine's entries must fit in what
+/// it has free less a reserve, and a node's machine holds no driver and
+/// is not the coordinator's, unless the inventory is a smoke's.
+pub fn judge_machines(facts: &mut [Facts], hosts: &[Host], harness: &Harness, coordinator: &str) {
+    let machine = |facts: &Facts, host: &Host| {
+        facts
+            .get("machine_id")
+            .map(str::to_string)
+            .unwrap_or_else(|| host.machine().to_string())
+    };
+    let machines: Vec<String> = facts
+        .iter()
+        .zip(hosts)
+        .map(|(facts, host)| machine(facts, host))
+        .collect();
+    for at in 0..facts.len() {
+        let mine: Vec<usize> = (0..facts.len())
+            .filter(|other| machines[*other] == machines[at])
+            .collect();
+        let caps: u64 = mine
+            .iter()
+            .map(|other| size_kb(hosts[*other].memory_max(harness)).unwrap_or(0))
+            .sum();
+        let available = facts[at].number("mem_available_kb").unwrap_or(0);
+        let names: Vec<&str> = mine
+            .iter()
+            .map(|other| hosts[*other].name.as_str())
+            .collect();
+        if caps + MEMORY_RESERVE_KB > available {
+            facts[at].refused.push(format!(
+                "the memory caps of {} on its machine ({} MiB) and a {} MiB reserve exceed its {} MiB free",
+                names.join(", "),
+                caps >> 10,
+                MEMORY_RESERVE_KB >> 10,
+                available >> 10
+            ));
+        }
+        let node = mine.iter().any(|other| hosts[*other].role == Role::Node);
+        let driver = mine.iter().any(|other| hosts[*other].role == Role::Driver);
+        let coordinating = hosts[at].is_local() || machines[at] == coordinator;
+        let shared = match (node, driver, coordinating) {
+            (true, true, true) => Some("a node, a driver and the coordinator share its machine"),
+            (true, true, false) => Some("a node and a driver share its machine"),
+            (true, false, true) => Some("a node and the coordinator share its machine"),
+            _ => None,
+        };
+        if let Some(shared) = shared {
+            if harness.smoke {
+                facts[at]
+                    .warnings
+                    .push(format!("{shared}: a smoke's numbers only"));
+            } else {
+                facts[at].refused.push(format!(
+                    "{shared}: drivers and the coordinator take a node's CPU and link during a timed run"
+                ));
+            }
+        }
+    }
+}
+
 /// Probe and judge every host of `inventory`, in parallel: the facts in
 /// inventory order. A host that cannot be reached is refused.
 pub fn check(inventory: &Inventory) -> Vec<Facts> {
+    let coordinator = std::fs::read_to_string("/etc/machine-id")
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let mut facts = probe_all(inventory);
+    judge_machines(
+        &mut facts,
+        &inventory.hosts,
+        &inventory.harness,
+        &coordinator,
+    );
+    facts
+}
+
+fn probe_all(inventory: &Inventory) -> Vec<Facts> {
     std::thread::scope(|scope| {
         let probes: Vec<_> = inventory
             .hosts
@@ -340,7 +407,11 @@ pub fn table(facts: &[Facts]) -> String {
     for host in facts {
         let disk = match (host.get("disk"), host.get("disk_rotational")) {
             (Some(disk), Some("1")) => format!("{disk} (hdd)"),
-            (Some(disk), _) => format!("{disk} ({})", host.get("disk_transport").unwrap_or("ssd")),
+            (Some(disk), Some("0")) => format!(
+                "{disk} ({})",
+                host.get("disk_transport").unwrap_or("ssd, bus ?")
+            ),
+            (Some(disk), _) => format!("{disk} (?)"),
             (None, _) => "?".into(),
         };
         let link = match (host.get("iface"), host.get("link_mbps")) {
@@ -388,7 +459,7 @@ pub fn table(facts: &[Facts]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Facts, judge, kernel_at_least, size_kb};
+    use super::{Facts, judge, judge_machines, kernel_at_least, size_kb};
     use crate::inventory::Inventory;
 
     fn inventory() -> Inventory {
@@ -399,7 +470,7 @@ mod tests {
             ssh = "me@10.0.0.1"
             address = "10.0.0.1"
             role = "node"
-            dir = "/data"
+            dir = "/data/a"
             ingress = 7001
             peer = 7101
             [[host]]
@@ -407,7 +478,7 @@ mod tests {
             ssh = "localhost"
             address = "127.0.0.1"
             role = "node"
-            dir = "/b"
+            dir = "/srv/b"
             ingress = 7002
             peer = 7102
             [[host]]
@@ -415,7 +486,7 @@ mod tests {
             ssh = "localhost"
             address = "127.0.0.1"
             role = "node"
-            dir = "/c"
+            dir = "/srv/c"
             ingress = 7003
             peer = 7103
             "#,
@@ -439,6 +510,7 @@ mod tests {
             ("link_mbps", "2500"),
             ("user_manager", "1"),
             ("linger", "yes"),
+            ("ntp_synchronized", "yes"),
         ] {
             facts.probe.insert(key.into(), value.into());
         }
@@ -518,6 +590,126 @@ mod tests {
         });
         assert!(facts.refused.is_empty(), "{:?}", facts.refused);
         assert_eq!(facts.warnings.len(), 3, "{:?}", facts.warnings);
+    }
+
+    #[test]
+    fn a_usb_or_unknown_disk_or_an_unsynchronised_clock_is_warned_of() {
+        for (change, word) in [
+            (("disk_transport", "usb"), "USB"),
+            (("disk_rotational", ""), "unknown"),
+            (("ntp_synchronized", "no"), "NTP"),
+        ] {
+            let facts = judged(|facts| {
+                facts.probe.insert(change.0.into(), change.1.into());
+            });
+            assert!(facts.refused.is_empty(), "{:?}", facts.refused);
+            assert!(
+                facts.warnings.iter().any(|warning| warning.contains(word)),
+                "{word}: {:?}",
+                facts.warnings
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_whose_caps_do_not_fit_or_that_mixes_roles_is_refused() {
+        let text = r#"
+            [harness]
+            memory_max = "8G"
+            [[host]]
+            name = "a"
+            ssh = "me@10.0.0.1"
+            address = "10.0.0.1"
+            role = "node"
+            dir = "/data/a"
+            ingress = 7001
+            peer = 7101
+            [[host]]
+            name = "b"
+            ssh = "me@10.0.0.1"
+            address = "10.0.0.1"
+            role = "node"
+            dir = "/data/b"
+            ingress = 7002
+            peer = 7102
+            [[host]]
+            name = "c"
+            ssh = "me@10.0.0.3"
+            address = "10.0.0.3"
+            role = "node"
+            dir = "/data/c"
+            ingress = 7001
+            peer = 7101
+            [[host]]
+            name = "d"
+            ssh = "me@10.0.0.3"
+            address = "10.0.0.3"
+            role = "driver"
+            dir = "/data/d"
+        "#;
+        let mut inventory = Inventory::parse(text).unwrap();
+        let machines = ["m1", "m1", "m3", "m3"];
+        let judged = |inventory: &Inventory, free_gib: u64, coordinator: &str| {
+            let mut facts: Vec<Facts> = machines
+                .iter()
+                .map(|machine| {
+                    let mut facts = good();
+                    facts.probe.insert("machine_id".into(), machine.to_string());
+                    facts
+                        .probe
+                        .insert("mem_available_kb".into(), (free_gib << 20).to_string());
+                    facts
+                })
+                .collect();
+            judge_machines(
+                &mut facts,
+                &inventory.hosts,
+                &inventory.harness,
+                coordinator,
+            );
+            facts
+        };
+        // Two 8 GiB caps and the reserve need 18 GiB on m1.
+        let facts = judged(&inventory, 17, "none");
+        assert!(
+            facts[0]
+                .refused
+                .iter()
+                .any(|refusal| refusal.contains("memory caps")),
+            "{:?}",
+            facts[0].refused
+        );
+        assert!(judged(&inventory, 64, "none")[0].refused.is_empty());
+        // A driver beside a node, and the coordinator on a node's machine.
+        let facts = judged(&inventory, 64, "m1");
+        assert!(
+            facts[2]
+                .refused
+                .iter()
+                .any(|refusal| refusal.contains("a node and a driver"))
+        );
+        assert!(
+            facts[0]
+                .refused
+                .iter()
+                .any(|refusal| refusal.contains("the coordinator"))
+        );
+        inventory.harness.smoke = true;
+        let facts = judged(&inventory, 64, "m1");
+        assert!(facts.iter().all(|facts| facts.refused.is_empty()));
+        assert!(
+            facts[2]
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("smoke"))
+        );
+    }
+
+    #[test]
+    fn this_machines_clock_reads_over_one_session() {
+        let inventory = inventory();
+        let (offset, rtt) = super::clock(&inventory.hosts[1]).unwrap();
+        assert!(offset.abs() < 50.0 && rtt < 50.0, "{offset} {rtt}");
     }
 
     #[test]

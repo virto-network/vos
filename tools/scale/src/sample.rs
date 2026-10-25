@@ -27,6 +27,10 @@ pub struct Thread {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Process {
     pub pid: u32,
+    /// The process's user and system time, in clock ticks: its threads'
+    /// that ended too.
+    pub utime: u64,
+    pub stime: u64,
     pub rss_kb: u64,
     pub hwm_kb: u64,
     pub read_bytes: u64,
@@ -54,6 +58,10 @@ pub struct Sample {
     pub cpu: BTreeMap<String, u64>,
     pub process: Option<Process>,
     pub disk: Option<Disk>,
+    /// The cores' mean clock, and their top: below it under load, the
+    /// host is throttled or saving power.
+    pub freq_khz: Option<u64>,
+    pub freq_max_khz: Option<u64>,
     /// The link's received and sent bytes.
     pub rx_bytes: Option<u64>,
     pub tx_bytes: Option<u64>,
@@ -106,6 +114,7 @@ fn thread_stat(stat: &str) -> Option<(String, u64, u64)> {
 fn process(pid: u32) -> Option<Process> {
     let root = format!("/proc/{pid}");
     let status = read(format!("{root}/status"))?;
+    let (_, utime, stime) = thread_stat(&read(format!("{root}/stat"))?)?;
     let io = read(format!("{root}/io")).unwrap_or_default();
     let mut threads = Vec::new();
     for task in std::fs::read_dir(format!("{root}/task")).ok()?.flatten() {
@@ -132,6 +141,8 @@ fn process(pid: u32) -> Option<Process> {
     }
     Some(Process {
         pid,
+        utime,
+        stime,
         rss_kb: status_field(&status, "VmRSS"),
         hwm_kb: status_field(&status, "VmHWM"),
         read_bytes: status_field(&io, "read_bytes"),
@@ -172,6 +183,27 @@ fn link(iface: &str) -> Option<(u64, u64)> {
     Some((*fields.first()?, *fields.get(8)?))
 }
 
+/// The cores' mean current clock and the first core's top, in kHz.
+fn frequency() -> (Option<u64>, Option<u64>) {
+    let mut total = 0;
+    let mut cores = 0;
+    for core in std::fs::read_dir("/sys/devices/system/cpu")
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if let Some(khz) = read(core.path().join("cpufreq/scaling_cur_freq"))
+            .and_then(|text| text.trim().parse::<u64>().ok())
+        {
+            total += khz;
+            cores += 1;
+        }
+    }
+    let top = read("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
+        .and_then(|text| text.trim().parse().ok());
+    ((cores > 0).then(|| total / cores), top)
+}
+
 /// The main PID of the user unit `unit`, if it runs.
 fn main_pid(unit: &str) -> Option<u32> {
     let output = Command::new("systemctl")
@@ -188,7 +220,10 @@ fn main_pid(unit: &str) -> Option<u32> {
 /// One sample now.
 pub fn sample(unit: Option<&str>, iface: Option<&str>, disk_name: Option<&str>) -> Sample {
     let (rx_bytes, tx_bytes) = iface.and_then(link).unzip();
+    let (freq_khz, freq_max_khz) = frequency();
     Sample {
+        freq_khz,
+        freq_max_khz,
         t_ms: crate::now_ms(),
         cpu: host_cpu(),
         process: unit.and_then(main_pid).and_then(process),

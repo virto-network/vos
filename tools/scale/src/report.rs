@@ -2,10 +2,11 @@
 //! and its drivers' records, over a window of the run (the drivers' span
 //! by default; at the knee, the step the knee was found at). Each host's
 //! binding resource is the most used of its CPU (its node's, against the
-//! cores it may use), iowait, its data disk's busy time and its link
-//! against its speed; the slowest node host is the one whose binding
-//! resource is the most used. `--compare` sets two runs side by side, as
-//! a run again without the slowest host needs.
+//! cores it may use), its busiest thread against one core, iowait, its
+//! data disk's busy time and its link against its speed. The slowest node
+//! host is the one whose node's commits' p99 is the highest. `--compare`
+//! sets two runs side by side, as a run again without the slowest host
+//! (four node hosts at least) needs.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
@@ -48,6 +49,11 @@ pub struct HostSummary {
     /// The busiest threads, those of one name together: name and share
     /// of one core.
     pub threads: Vec<(String, f64)>,
+    /// The busiest single thread, as a share of one core: a thread at
+    /// 100% binds however idle the host's other cores are.
+    pub busiest_thread: Option<(String, f64)>,
+    /// The cores' mean clock against their top, over the window.
+    pub clock_pct: Option<f64>,
     pub binding: String,
     pub binding_pct: f64,
 }
@@ -55,6 +61,12 @@ pub struct HostSummary {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct NodeSummary {
     pub node: u64,
+    /// The host it ran on.
+    pub host: String,
+    /// The groups it led at the window's end, and the elections its
+    /// groups held within it (their terms' sum's growth).
+    pub leading: u64,
+    pub elections: u64,
     /// Stage quantiles over the window, in microseconds: `commit`, `late`,
     /// `batch`, `queued`.
     pub stages: BTreeMap<String, (u64, u64, u64)>,
@@ -72,6 +84,10 @@ pub struct DriverSummary {
     pub p50_us: u64,
     pub p99_us: u64,
     pub p999_us: u64,
+    /// The latest a send went behind its schedule, and the share of sends
+    /// later than the driver's bound: a driver behind is what bound.
+    pub late_us: u64,
+    pub late_share: f64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -129,8 +145,8 @@ pub fn host_summary(facts: &Facts, samples: &[&Sample]) -> HostSummary {
     summary.host_busy_pct = 100.0 * (total - idle - iowait) / total;
     summary.iowait_pct = 100.0 * iowait / total;
     let mut candidates = vec![
-        ("CPU (host)", summary.host_busy_pct),
-        ("iowait", summary.iowait_pct),
+        ("CPU (host)".to_string(), summary.host_busy_pct),
+        ("iowait".to_string(), summary.iowait_pct),
     ];
     // The process over the samples that saw it: a driver starts after its
     // sampler, and a restarted node is followed from its restart.
@@ -157,6 +173,7 @@ pub fn host_summary(facts: &Facts, samples: &[&Sample]) -> HostSummary {
             .map(|thread| (thread.tid, thread))
             .collect();
         let mut threads: Vec<(String, f64)> = Vec::new();
+        let mut busiest: Option<(String, f64)> = None;
         let mut wakes = 0.0;
         for thread in &end.threads {
             let (ticks, voluntary) = match before.get(&thread.tid) {
@@ -169,10 +186,16 @@ pub fn host_summary(facts: &Facts, samples: &[&Sample]) -> HostSummary {
                     thread.voluntary as f64,
                 ),
             };
-            threads.push((thread.comm.clone(), 100.0 * ticks / tck / seconds));
+            let pct = 100.0 * ticks / tck / seconds;
+            if busiest.as_ref().is_none_or(|(_, most)| pct > *most) {
+                busiest = Some((format!("{} ({})", thread.comm, thread.tid), pct));
+            }
+            threads.push((thread.comm.clone(), pct));
             wakes += voluntary;
         }
-        summary.process_cores = threads.iter().map(|(_, pct)| pct).sum::<f64>() / 100.0;
+        // The process's own totals hold its ended threads too.
+        summary.process_cores =
+            delta(begin.utime + begin.stime, end.utime + end.stime) / tck / seconds;
         summary.process_cpu_pct = 100.0 * summary.process_cores / facts.cores_used().max(1) as f64;
         summary.wakes_per_s = wakes / seconds;
         let mut named: BTreeMap<String, f64> = BTreeMap::new();
@@ -184,8 +207,23 @@ pub fn host_summary(facts: &Facts, samples: &[&Sample]) -> HostSummary {
         threads.truncate(5);
         summary.threads = threads;
         summary.rss_mib = end.rss_kb as f64 / 1024.0;
-        candidates[0] = ("CPU", summary.process_cpu_pct);
+        candidates[0] = ("CPU".to_string(), summary.process_cpu_pct);
+        if let Some((name, pct)) = &busiest {
+            candidates.push((format!("thread {name}"), *pct));
+        }
+        summary.busiest_thread = busiest;
     }
+    let clocks: Vec<f64> = samples
+        .iter()
+        .filter_map(|sample| {
+            Some(
+                100.0 * sample.freq_khz? as f64
+                    / sample.freq_max_khz.filter(|top| *top > 0)? as f64,
+            )
+        })
+        .collect();
+    summary.clock_pct =
+        (!clocks.is_empty()).then(|| clocks.iter().sum::<f64>() / clocks.len() as f64);
     summary.rss_max_mib = samples
         .iter()
         .filter_map(|sample| sample.process.as_ref())
@@ -199,7 +237,7 @@ pub fn host_summary(facts: &Facts, samples: &[&Sample]) -> HostSummary {
         let ios = delta(begin.reads + begin.writes, end.reads + end.writes);
         summary.disk_ms_per_io =
             (ios > 0.0).then(|| delta(begin.weighted_ms, end.weighted_ms) / ios);
-        candidates.push(("disk", util));
+        candidates.push(("disk".to_string(), util));
     }
     if let (Some(rx0), Some(rx1), Some(tx0), Some(tx1)) =
         (first.rx_bytes, last.rx_bytes, first.tx_bytes, last.tx_bytes)
@@ -217,14 +255,14 @@ pub fn host_summary(facts: &Facts, samples: &[&Sample]) -> HostSummary {
             summary.link_mbps = Some(speed as f64);
             let util = 100.0 * rx.max(tx) * 8.0 / speed as f64;
             summary.link_util_pct = Some(util);
-            candidates.push(("NIC", util));
+            candidates.push(("NIC".to_string(), util));
         }
     }
     let (binding, pct) = candidates
         .into_iter()
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .expect("CPU at least");
-    summary.binding = binding.to_string();
+    summary.binding = binding;
     summary.binding_pct = pct;
     summary
 }
@@ -266,7 +304,24 @@ fn stage_quantiles(
 /// Summarise `run` over `window` (milliseconds since the epoch), the
 /// drivers' span when `None`; written to the run's `summary.json` and
 /// `report.txt`.
-pub fn report(run: &Run, window: Option<(u64, u64)>) -> Result<Summary, String> {
+/// A share of late sends above which the driver, not the nodes, may have
+/// bound the run.
+const LATE_SHARE: f64 = 0.01;
+
+/// The sampling interval the run's inventory names.
+fn every_s(run: &Run) -> u64 {
+    std::fs::read_to_string(run.file("inventory.toml"))
+        .ok()
+        .and_then(|text| text.parse::<toml::Table>().ok())
+        .and_then(|table| table.get("harness")?.get("every_s")?.as_integer())
+        .map_or(10, |every| every.max(1) as u64)
+}
+
+pub fn report(
+    run: &Run,
+    window: Option<(u64, u64)>,
+    ramp_s: Option<u64>,
+) -> Result<Summary, String> {
     let facts: Vec<Facts> = serde_json::from_str(
         &std::fs::read_to_string(run.file("hosts.json"))
             .map_err(|error| format!("{}: {error}", run.file("hosts.json").display()))?,
@@ -294,14 +349,22 @@ pub fn report(run: &Run, window: Option<(u64, u64)>) -> Result<Summary, String> 
         .flat_map(|(_, lines)| lines)
         .filter(|line| line["total"] == false)
         .collect();
+    // By default the drivers' span past its ramp: an interval's line is
+    // written at its end, so the span starts an interval before the first;
+    // the ramp is an interval unless said otherwise, dropped if it would
+    // leave no window.
+    let every_ms = every_s(run) * 1_000;
     let window = window.unwrap_or_else(|| {
         let times: Vec<u64> = intervals
             .iter()
             .filter_map(|line| line["t_ms"].as_u64())
             .collect();
         match (times.iter().min(), times.iter().max()) {
-            // An interval's line is written at its end.
-            (Some(first), Some(last)) => (first.saturating_sub(10_000), *last),
+            (Some(first), Some(last)) => {
+                let start = first.saturating_sub(every_ms);
+                let ramped = start + ramp_s.map_or(every_ms, |ramp| ramp * 1_000);
+                (if ramped < *last { ramped } else { start }, *last)
+            }
             _ => (0, u64::MAX),
         }
     });
@@ -336,6 +399,12 @@ pub fn report(run: &Run, window: Option<(u64, u64)>) -> Result<Summary, String> 
             summary.warnings.push(format!("{}: {warning}", host.name));
         }
     }
+    let hosts_of: BTreeMap<u64, String> = deployed["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|node| Some((node["number"].as_u64()?, node["name"].as_str()?.to_string())))
+        .collect();
     let polls: Vec<serde_json::Value> = jsonl(&run.file("nodes.jsonl"));
     let numbers: BTreeSet<u64> = polls
         .iter()
@@ -360,9 +429,17 @@ pub fn report(run: &Run, window: Option<(u64, u64)>) -> Result<Summary, String> 
         let last = mine.iter().rfind(&inside).or(mine.last());
         let mut node = NodeSummary {
             node: number,
+            host: hosts_of.get(&number).cloned().unwrap_or_default(),
             ..NodeSummary::default()
         };
         if let (Some(first), Some(last)) = (first, last) {
+            node.leading = last["groups"]["leading"].as_u64().unwrap_or(0);
+            if let (Some(before), Some(after)) = (
+                first["groups"]["terms"].as_u64(),
+                last["groups"]["terms"].as_u64(),
+            ) {
+                node.elections = after.saturating_sub(before);
+            }
             for stage in ["commit", "late", "batch", "queued"] {
                 if let Some(quantiles) = stage_quantiles(first, last, stage) {
                     node.stages.insert(stage.into(), quantiles);
@@ -400,16 +477,38 @@ pub fn report(run: &Run, window: Option<(u64, u64)>) -> Result<Summary, String> 
             driver.p99_us = total["p99_us"].as_u64().unwrap_or(0);
             driver.p999_us = total["p999_us"].as_u64().unwrap_or(0);
             driver.by_error = serde_json::from_value(total["by_error"].clone()).unwrap_or_default();
+            driver.late_us = total["late_us"].as_u64().unwrap_or(0);
+            let sent = total["sent"].as_u64().unwrap_or(0);
+            driver.late_share =
+                total["late_sends"].as_u64().unwrap_or(0) as f64 / sent.max(1) as f64;
+            if driver.late_share > LATE_SHARE {
+                summary.warnings.push(format!(
+                    "driver {name}: {:.1}% of its sends went more than {} ms behind their schedule (at worst {} ms): the driver may be what bound, not the nodes",
+                    100.0 * driver.late_share,
+                    crate::drive::LATE_US / 1_000,
+                    driver.late_us / 1_000
+                ));
+            }
         }
         summary.rate += driver.rate;
         summary.drivers.push(driver);
     }
-    summary.slowest = summary
-        .hosts
-        .iter()
-        .filter(|host| host.role == "node")
-        .max_by(|a, b| a.binding_pct.total_cmp(&b.binding_pct))
-        .map(|host| host.name.clone());
+    summary.slowest = slowest(&summary);
+    let node_hosts = facts.iter().filter(|host| host.role == "node").count();
+    if node_hosts < 4 {
+        summary.warnings.push(format!(
+            "{node_hosts} node hosts: a run without the slowest needs four at least, three replicas an agent"
+        ));
+    }
+    for host in &summary.hosts {
+        if host.role == "node" && host.clock_pct.is_some_and(|clock| clock < 70.0) {
+            summary.warnings.push(format!(
+                "{}: its cores ran at {:.0}% of their top clock: throttled or saving power",
+                host.name,
+                host.clock_pct.unwrap_or(0.0)
+            ));
+        }
+    }
     std::fs::write(
         run.file("summary.json"),
         serde_json::to_string_pretty(&summary).expect("json"),
@@ -417,6 +516,31 @@ pub fn report(run: &Run, window: Option<(u64, u64)>) -> Result<Summary, String> 
     .map_err(|error| error.to_string())?;
     std::fs::write(run.file("report.txt"), text(&summary)).map_err(|error| error.to_string())?;
     Ok(summary)
+}
+
+/// The slowest node host: the node whose commits' p99 is the highest, its
+/// host's disk time per I/O breaking ties; a group commits at its median
+/// replica's fsync, so this host gates the groups it follows.
+fn slowest(summary: &Summary) -> Option<String> {
+    let disk = |host: &str| {
+        summary
+            .hosts
+            .iter()
+            .find(|summary| summary.name == host)
+            .and_then(|summary| summary.disk_ms_per_io)
+            .unwrap_or(0.0)
+    };
+    summary
+        .nodes
+        .iter()
+        .filter(|node| !node.host.is_empty())
+        .max_by(|a, b| {
+            let commit = |node: &NodeSummary| node.stages.get("commit").map_or(0, |stage| stage.1);
+            commit(a)
+                .cmp(&commit(b))
+                .then(disk(&a.host).total_cmp(&disk(&b.host)))
+        })
+        .map(|node| node.host.clone())
 }
 
 fn optional(value: Option<f64>) -> String {
@@ -430,11 +554,12 @@ pub fn text(summary: &Summary) -> String {
         summary.run, summary.versions, summary.agents, summary.window_ms.0, summary.window_ms.1
     );
     text += &format!(
-        "{:<14} {:<6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>8} {:>8}  {}\n",
+        "{:<14} {:<6} {:>6} {:>6} {:>6} {:>6} {:>7} {:>7} {:>7} {:>7} {:>8} {:>8}  {}\n",
         "host",
         "role",
         "cores",
         "cpu%",
+        "clock%",
         "iow%",
         "disk%",
         "ms/io",
@@ -446,11 +571,12 @@ pub fn text(summary: &Summary) -> String {
     );
     for host in &summary.hosts {
         text += &format!(
-            "{:<14} {:<6} {:>6.2} {:>6.1} {:>6.1} {:>7} {:>7} {:>7} {:>7.0} {:>8.0} {:>8}  {} {:.1}%\n",
+            "{:<14} {:<6} {:>6.2} {:>6.1} {:>6} {:>6.1} {:>7} {:>7} {:>7} {:>7.0} {:>8.0} {:>8}  {} {:.1}%\n",
             host.name,
             host.role,
             host.process_cores,
             host.process_cpu_pct,
+            optional(host.clock_pct),
             host.iowait_pct,
             optional(host.disk_util_pct),
             optional(host.disk_ms_per_io),
@@ -479,8 +605,11 @@ pub fn text(summary: &Summary) -> String {
             .map(|(name, (p50, p99, p999))| format!("{name} {p50}/{p99}/{p999}"))
             .collect();
         text += &format!(
-            "  node {}: {}{}{}\n",
+            "  node {} ({}): leads {}, {} elections; {}{}{}\n",
             node.node,
+            node.host,
+            node.leading,
+            node.elections,
             stages.join(", "),
             if node.halted { ", HALTED" } else { "" },
             if node.poll_errors > 0 {
@@ -493,7 +622,7 @@ pub fn text(summary: &Summary) -> String {
     text += &format!("\nleader changes {}\n\ndrivers\n", summary.leader_changes);
     for driver in &summary.drivers {
         text += &format!(
-            "  {}: {:.1} calls/s, {} ok, {} errors {:?}, p50 {} us, p99 {} us, p99.9 {} us\n",
+            "  {}: {:.1} calls/s, {} ok, {} errors {:?}, p50 {} us, p99 {} us, p99.9 {} us; late at worst {} us, {:.2}% of sends past {} us\n",
             driver.name,
             driver.rate,
             driver.ok,
@@ -501,13 +630,16 @@ pub fn text(summary: &Summary) -> String {
             driver.by_error,
             driver.p50_us,
             driver.p99_us,
-            driver.p999_us
+            driver.p999_us,
+            driver.late_us,
+            100.0 * driver.late_share,
+            crate::drive::LATE_US
         );
     }
     text += &format!("  all: {:.1} calls/s\n\n", summary.rate);
     if let Some(slowest) = &summary.slowest {
         text += &format!(
-            "slowest node host: {slowest} (its binding resource the most used): rerun with --exclude {slowest} and compare\n"
+            "slowest node host: {slowest} (its node's commits' p99 the highest): with four node hosts or more, rerun with --exclude {slowest} and compare\n"
         );
     }
     for warning in &summary.warnings {
@@ -595,6 +727,7 @@ mod tests {
                 .collect(),
             process: Some(Process {
                 pid: 7,
+                utime: ticks,
                 rss_kb: 1 << 20,
                 threads: vec![Thread {
                     tid: 8,
@@ -610,7 +743,26 @@ mod tests {
             }),
             rx_bytes: Some(0),
             tx_bytes: Some(tx),
+            freq_khz: Some(2_000_000),
+            freq_max_khz: Some(4_000_000),
         }
+    }
+
+    #[test]
+    fn a_saturated_thread_binds_on_an_idle_host() {
+        // Over 10 s one thread used 950 ticks: 95% of a core, a quarter of
+        // the four the node may use, the disk idle.
+        let first = sample(0, 0, 0, 0, 0);
+        let last = sample(10_000, 950, 950, 0, 0);
+        let summary = host_summary(&facts(), &[&first, &last]);
+        assert!(
+            (summary.process_cpu_pct - 23.75).abs() < 1e-6,
+            "{}",
+            summary.process_cpu_pct
+        );
+        assert_eq!(summary.binding, "thread vos runtime (8)");
+        assert!((summary.binding_pct - 95.0).abs() < 1e-6);
+        assert_eq!(summary.clock_pct, Some(50.0));
     }
 
     #[test]

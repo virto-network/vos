@@ -29,6 +29,18 @@ use clap::{Parser, Subcommand};
 use inventory::Inventory;
 use runs::Run;
 
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+/// Milliseconds since the epoch, to the microsecond.
+pub fn precise_now_ms() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("after the epoch")
+        .as_secs_f64()
+        * 1e3
+}
+
 pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -154,6 +166,10 @@ enum Command {
         /// Another run to set beside it.
         #[arg(long)]
         compare: Option<String>,
+        /// Seconds of the drivers' span left out at its start: one
+        /// sampling interval by default.
+        #[arg(long, conflicts_with = "from_ms")]
+        ramp_s: Option<u64>,
     },
     /// The whole run from one command: deploy, up, agents, drive while
     /// polling, collect, down and report.
@@ -270,7 +286,12 @@ fn drive_and_poll(inventory: &Inventory, run: &Run, load: &LoadArgs) -> Result<(
             },
         );
         // One more interval of polls past the load's end.
-        std::thread::sleep(Duration::from_secs(inventory.harness.every_s.min(10)));
+        let _ = hosts::wait_for(
+            "the last poll",
+            Duration::from_secs(inventory.harness.every_s.min(10)),
+            Duration::from_millis(200),
+            || Ok(false),
+        );
         stop.store(true, Ordering::Relaxed);
         let polled = poller.join().expect("the poller");
         driven.and(polled)
@@ -332,14 +353,15 @@ fn run(cli: Cli) -> Result<(), String> {
             from_ms,
             to_ms,
             compare,
+            ramp_s,
         } => {
             let inventory = inventory()?;
             let opened = Run::open(&inventory, run.as_deref())?;
-            let summary = report::report(&opened, from_ms.zip(to_ms))?;
+            let summary = report::report(&opened, from_ms.zip(to_ms), ramp_s)?;
             print!("{}", report::text(&summary));
             if let Some(other) = compare {
                 let other = Run::open(&inventory, Some(&other))?;
-                let other = report::report(&other, None)?;
+                let other = report::report(&other, None, ramp_s)?;
                 print!("\n{}", report::compare(&summary, &other));
             }
             Ok(())
@@ -355,13 +377,19 @@ fn run(cli: Cli) -> Result<(), String> {
             force,
         } => {
             let inventory = inventory()?;
+            // Interrupted, the run's waits end and its units stop.
+            hosts::stop_on_interrupt();
             if !no_deploy {
-                let deployed = deploy::deploy(&inventory, &artifacts(deploy))?;
-                eprintln!(
-                    "space {} on {} nodes",
-                    deployed.space_id,
-                    deployed.nodes.len()
-                );
+                match deploy::deploy(&inventory, &artifacts(deploy)) {
+                    Ok(deployed) => {
+                        eprintln!(
+                            "space {} on {} nodes",
+                            deployed.space_id,
+                            deployed.nodes.len()
+                        )
+                    }
+                    Err(error) => return nodes::down(&inventory).and(Err(error)),
+                }
             }
             let run = Run::new(&inventory, label.as_deref())?;
             let ran = nodes::up(&inventory, &run, force)
@@ -380,7 +408,7 @@ fn run(cli: Cli) -> Result<(), String> {
             // A failed run is collected too, for its logs.
             let gathered = collect::gather(&inventory, &run);
             ran.and(stopped).and(gathered)?;
-            let summary = report::report(&run, None)?;
+            let summary = report::report(&run, None, None)?;
             print!("{}", report::text(&summary));
             println!("run {} in {}", run.id, run.dir.display());
             Ok(())

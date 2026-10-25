@@ -72,6 +72,7 @@ fn node_unit<'a>(host: &'a Host, run: &Run, inventory: &'a Inventory) -> Unit<'a
         cores: host.cores.as_deref(),
         env: vec![("VOS_LOG", "info".into())],
         command,
+        runtime_max_s: inventory.harness.max_run_s,
     }
 }
 
@@ -110,6 +111,7 @@ fn sampler_unit<'a>(
         cores: None,
         env: Vec::new(),
         command,
+        runtime_max_s: inventory.harness.max_run_s,
     }
 }
 
@@ -175,16 +177,28 @@ pub fn up(inventory: &Inventory, run: &Run, force: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Stop every unit the harness runs on every host.
+/// Stop every unit the harness runs on every host the inventory lists,
+/// excluded or not.
 pub fn down(inventory: &Inventory) -> Result<(), String> {
     std::thread::scope(|scope| {
         let stopped: Vec<_> = inventory
-            .hosts
+            .listed
             .iter()
-            .map(|host| scope.spawn(move || hosts::run(host, &hosts::stop_script(&units_of(host)))))
+            .map(|host| {
+                scope.spawn(move || (host, hosts::run(host, &hosts::stop_script(&units_of(host)))))
+            })
             .collect();
-        stopped
-            .into_iter()
-            .try_for_each(|thread| thread.join().expect("a stop thread").map(drop))
+        stopped.into_iter().try_for_each(|thread| {
+            let (host, stopped) = thread.join().expect("a stop thread");
+            match stopped {
+                Ok(_) => Ok(()),
+                // An excluded host may be the one that is down.
+                Err(error) if !inventory.hosts.iter().any(|kept| kept.name == host.name) => {
+                    eprintln!("{}: excluded, and not stopped: {error}", host.name);
+                    Ok(())
+                }
+                Err(error) => Err(error),
+            }
+        })
     })
 }

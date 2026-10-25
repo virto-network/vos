@@ -45,28 +45,36 @@ pub fn poll(inventory: &Inventory, run: &Run, stop: &AtomicBool) -> Result<(), S
         .map_err(|error| format!("{}: {error}", path.display()))?;
     let placed: Vec<_> = agents.representative.iter().chain(&agents.agents).collect();
     let mut next = Instant::now();
-    while !stop.load(Ordering::Relaxed) {
+    while !stop.load(Ordering::Relaxed) && !hosts::interrupted() {
         for (number, operator) in &operators {
+            let mut groups = serde_json::Value::Null;
             let stats = match operator.stats() {
-                Ok(Response::Stats(stats)) => serde_json::Value::Object(
-                    stats
-                        .stages
-                        .iter()
-                        .map(|stage| {
-                            let buckets: BTreeMap<String, u64> = stage
-                                .counts
-                                .iter()
-                                .enumerate()
-                                .filter(|(_, count)| **count > 0)
-                                .map(|(index, count)| (index.to_string(), *count))
-                                .collect();
-                            (
-                                stage.name.clone(),
-                                serde_json::json!({ "total": stage.total, "buckets": buckets }),
-                            )
-                        })
-                        .collect(),
-                ),
+                Ok(Response::Stats(stats)) => {
+                    groups = serde_json::json!({
+                        "replicas": stats.groups.replicas,
+                        "leading": stats.groups.leading,
+                        "terms": stats.groups.terms,
+                    });
+                    serde_json::Value::Object(
+                        stats
+                            .stages
+                            .iter()
+                            .map(|stage| {
+                                let buckets: BTreeMap<String, u64> = stage
+                                    .counts
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, count)| **count > 0)
+                                    .map(|(index, count)| (index.to_string(), *count))
+                                    .collect();
+                                (
+                                    stage.name.clone(),
+                                    serde_json::json!({ "total": stage.total, "buckets": buckets }),
+                                )
+                            })
+                            .collect(),
+                    )
+                }
                 Ok(other) => serde_json::json!({ "error": format!("{other:?}") }),
                 Err(error) => serde_json::json!({ "error": error.to_string() }),
             };
@@ -95,12 +103,13 @@ pub fn poll(inventory: &Inventory, run: &Run, stop: &AtomicBool) -> Result<(), S
                 "t_ms": crate::now_ms(),
                 "node": number,
                 "stats": stats,
+                "groups": groups,
                 "statuses": statuses,
             });
             writeln!(file, "{line}").map_err(|error| error.to_string())?;
         }
         next += every;
-        while Instant::now() < next && !stop.load(Ordering::Relaxed) {
+        while Instant::now() < next && !stop.load(Ordering::Relaxed) && !hosts::interrupted() {
             std::thread::sleep(Duration::from_millis(100));
         }
     }
