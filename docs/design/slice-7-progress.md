@@ -1038,8 +1038,11 @@ agents' builds through every run; the driver pinned to cpus 1–2, one
 P-core's two threads; four nodes on the other cores]:
 - **The nodes cannot commit 20,000 calls a second here.** At 5,000 a
   second (K = 64, `x` = 98%) they fell behind (p50 12 s; refine and dry
-  runs queued ~100 ms for executors that were 28% busy, the shared NVMe
-  23% busy at 9 ms an I/O); at 20,000 offered they answered about 10,000
+  runs queued ~100 ms for executors each busy about 0.79 of a core, on a
+  starved host: 92% busy, a third of it other agents' niced builds, its
+  cores at 17% of their top clock, 0.6–0.9 GHz; the figures over the load
+  alone, per the review's H1, where the first report's window took in the
+  drain and showed the executors 28% busy); at 20,000 offered they answered about 10,000
   and lost leaders (92 elections), and the driver, its users' calls
   queueing behind unanswered ones, fell 60 s behind
   (`20261025T172227Z-s75-20k-a`, `…182820Z-s75-20k-b`).
@@ -1083,9 +1086,10 @@ on the last.
   `powersave` under other agents' load the driver's cores ran at 0.4–2 GHz,
   and its cost per call varied threefold with them.
 - The node's throughput is the first thing the runs will meet: at 5,000
-  a second (T1's rate) four nodes on this desktop fell behind, executors
-  queued while mostly idle. Raise `executors` (the localhost smoke runs
-  2–3) and look at the refine and dry-run queues first.
+  a second (T1's rate) four nodes on this starved desktop fell behind,
+  their executors saturated. The review's node findings (below) name why
+  T1's p99 is out of reach as built; the levers are scheduled after 7.6's
+  first real run.
 
 **What the plan left open, and how it was read:**
 - "A share `a` active, each at `r`" and "users drawn Zipf(1.0)" cannot
@@ -1099,3 +1103,101 @@ on the last.
   point; every run's worst was 0.06.
 - One core pair is read as two logical CPUs, here one physical core's two
   threads: the strictest reading on this desktop.
+
+### The review's fixes
+
+The Opus review said fix, then merge. Folded as further commits; the
+owner's S36 recorded.
+
+**S36:** with all three nodes on compumax, T5 kills one node's unit under
+load: T5-partial, the host kill re-run when more machines exist
+(`owner-decisions.md`, §7.6's run 5, the T5 row).
+
+**High:**
+- **H1, the report's window:** each driver's total now carries its load's
+  span, first send to last (`load_from_ms`, `load_to_ms`), and the report's
+  window is that span past the ramp: the drain, when the last answers and
+  the reads at a cut come in, is left out. A test pins it. The 5,000-a-
+  second run re-reported over its load alone changed the account above:
+  the executors were saturated on a starved host, not 28% busy.
+- **H2, routes:** a call goes to its agent's leader as last learned and a
+  query to a follower up; a node that gives no answer, `Unavailable` or a
+  `NotLeader` naming no leader is left out for 2 s and the leader's place
+  moves to the next replica up; workflow and cut reads follow the same
+  routes. Tests: the routes (a dead leader, a dead follower, the backoff's
+  end) and the pool against a closed port (fails at once, holds no place).
+- **H3, timing:** an operation is timed from its schedule, or from its
+  send when it went early (`min`, not `max`, which had timed a late send
+  from its send and hidden the lateness).
+
+**Medium:**
+- **M1:** every interval and total line counts the requests that waited
+  for a connection (with the wait's p99) and the most in use at once; the
+  report warns when the pool bound. The cap is `[harness]
+  driver_connections` (512), and `drive` refuses when the drivers' caps
+  together pass the nodes' `ingress_connections`. Several drivers on one
+  machine (each its own entry, directory and cores) work, with a test.
+- **M2:** the probe refuses to run when an agent is on every node, and
+  writes no identity rows. The signatures the sending thread makes (calls
+  signed again for their turn, the reads of workflows and cuts) are
+  counted by kind (`signed_sending`): in the verification run, one per
+  workflow, about six per read at a cut, one transfer in 2,000.
+- **M3:** `--readers`, a share of all the agents (the shards and the idle
+  ones) each reading once at a cut a window at a uniform time within it
+  (`reader`, `reader_read`), the idle agents' identities read at the start
+  sixteen at a time; a test of the windows. Reads at a cut wait a jitter of
+  up to 0.5 s after the close, then read every 0.5 s: their latency is
+  resolved to about a second, not two.
+- **M4:** each driver counts each shard's distinct users and the sessions
+  opened at it, and the report gives the totals and the busiest shard's.
+  The report, the README and this entry state the mix's defaults as the
+  harness's own, pending the owner.
+
+**Low:** L1, the last interval's rate over its real seconds; L2, `cpu_s` a
+delta each interval and `load_cores` over the send span; L3, sessions
+unused for 55 minutes dropped; L4, the sampler reads involuntary switches
+and the report gives preemptions a second; L5, tests of the pool's
+accounting (a cap of two, six requests: two opened, four waited) and of a
+session's turns (`NeverRan`, `Renew`); L6, T6 judges RSS once the
+accounts stop growing (§7.6, the T6 row); L7, timeouts on the wait for a
+connection and on `connect`. The engine is now four modules (`engine/`:
+the sending thread, the pool, the sessions, the counts).
+
+**The node findings (Q3)**, recorded here and as a T1 risk in the plan:
+- one FIFO executor queue takes all work: signature checks, refine and
+  the dry run as two hops, accumulates, queries and root builds;
+- the single `vos-node` runtime thread also reads the store synchronously
+  each batch (81–85% of a core in the verification run below);
+- a group has one batch in flight (commit p50 41–49 ms plus apply
+  25–29 ms in these runs), so T1's 50 ms p99 is out of reach without
+  pipelining.
+The review's levers, in order, scheduled after 7.6's first real run: refine
+and dry run in one executor job; a priority lane for the batch path; batch
+signature verification; the per-batch reads off the runtime thread;
+runtime threads sharded by group; batch pipelining. Added now: the node's
+`root_build_queue` and `root_build` stages (a root build's batch waiting
+for an executor, and its run), and the report gives them with the refine
+and dry-run queues.
+
+**The verification run** [measured, `20261025T231824Z-s75-verify`, this
+desktop, load average 9–13]: four nodes (executors 3), K = 64, 100 idle
+agents, the identity agent, `U = 4·10^5` at 2,000 calls a second, readers
+5%, 180 s; node n4's unit stopped 30 s into the load.
+- **H1:** the window is the load past its 10 s ramp (170 s), the drain's
+  lines out.
+- **H2:** n4's loss cost 67 queries refused at its port, 397 calls
+  answered `NotLeader` while its groups re-elected, and 41 broken
+  connections; the interval it fell in had p99 1.3 s, and the next ones
+  were back to 0.26 s. Reads followed the routes after this run only
+  (50 reads at a cut had gone to n4 and been refused).
+- **H3:** 0.01% of sends past 10 ms, at worst 12.6 ms.
+- 358,692 answered of 359,197; the mix within 0.09 points; 12 reads by the
+  readers' share, all served, 3.1 s past their window's close at the
+  median; 29,558 users and 29,590 sessions over the 64 shards, 515 at the
+  busiest.
+- From about 100 s the three nodes left fell behind (their runtime
+  threads 81–85% of a core, preemptions 1,700–2,600 a second from the
+  host's other work), the pool bound (512 in use) and p99 rose to 16 s:
+  the warning fired as it should.
+
+**Gates after the fixes:** `just check` green; `vos-scale`'s 42 tests.

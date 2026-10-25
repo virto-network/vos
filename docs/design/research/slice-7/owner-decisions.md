@@ -237,3 +237,7 @@ S35. **One machine besides the desktop.** The owner has one other machine,
   four node hosts or more, and run 2's rerun without the slowest host,
   are recorded as not measurable on this hardware, to be run when more
   machines exist. Narrows S2.
+
+S36. **T5-partial.** With all three nodes on compumax, T5 kills one
+  node's unit under load, and is recorded as T5-partial; the full host
+  kill re-runs when more machines exist. (2026-10-26)
