@@ -169,8 +169,7 @@ impl<S: Service> AnchorSend for JamSend<S> {
         let (Ok(Some(space)), Ok(now)) = (self.0.space(&anchor.space), self.0.now()) else {
             return false;
         };
-        let passed = space.last.is_some_and(|last| last >= anchor.window);
-        passed || rules::aged(&space.clock, anchor.window, now)
+        rules::passed(space.last, anchor.window) || rules::aged(&space.clock, anchor.window, now)
     }
 }
 

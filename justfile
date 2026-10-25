@@ -315,17 +315,21 @@ _debug-names-absent:
     let binary = (open --raw target/debug/vos); for name in [GREY_PVM_DEBUG CPU_DUMP CPU_EXPR_DUMP ZKPVM_PROFILE pvm-inst] { if ($binary | bytes index-of ($name | into binary)) >= 0 { error make { msg: $"the node's binary names ($name)" } } }
 
 # The venue rules are written once, in `vos_anchor::venue`: no venue's
-# source outside its tests holds an anchor rule's arithmetic (the root age,
-# a window's boundary, the strict signature check past the one verifier
-# each venue hands the core, the small-order keys), and each venue calls the
-# core's rules.
+# source outside its tests (the clients, jam-dev's commands among them)
+# holds the arithmetic of an anchor or registration rule: the root age, a
+# window's boundary, a comparison with the last window anchored, the window
+# lengths a venue registers, the key bounds and the small-order keys, or the
+# strict signature check past the one verifier each venue hands the core;
+# and each venue calls the core's rules. A tripwire on the rules'
+# arithmetic, not a proof that no rule is restated: the clients' reads of a
+# space's status and listed keys, which pin D′ keeps, are not flagged.
 check-venue-rules:
     let roots = [pvm/proof/statement/src pvm/proof/statement/service/src node/venue/src tools/jam-dev/src]; \
-    let markers = [MAX_ROOT_AGE_MS '.boundary(' verify_strict SMALL_ORDER]; \
-    let allowed = [[file marker]; [node/venue/src/lib.rs verify_strict] [pvm/proof/statement/service/src/refine.rs verify_strict]]; \
-    let sources = ($roots | each {|root| glob $"($root)/**/*.rs" } | flatten | each {|path| $path | path relative-to $env.PWD } | where {|path| not ($path =~ '(^|/)(tests?|conformance|command)(/|\.rs$)') }); \
-    let found = ($sources | each {|file| let code = (open --raw $file | lines | take until {|line| $line =~ '^#\[cfg\(test\)\]' } | each {|line| $line | str replace -r '//.*$' '' } | str join "\n" | str replace -a -r '(?m)^\s*(pub )?use [^;]*;' ''); $markers | where {|marker| ($code | str contains $marker) and not ($allowed | any {|a| $a.file == $file and $a.marker == $marker }) } | each {|marker| $"($file) holds ($marker)" } } | flatten); \
-    let calls = [[file call]; [pvm/proof/statement/src/model.rs 'rules::anchored('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchor('] [pvm/proof/statement/service/src/accumulate.rs 'rules::register('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchored('] [pvm/proof/statement/service/src/refine.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchor('] [node/venue/src/model.rs 'rules::register('] [node/venue/src/model.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchored('] [node/venue/src/kreivo/mock/pallet.rs 'rules::anchor('] [node/venue/src/kreivo/mock/pallet.rs 'rules::register('] [node/venue/src/kreivo/mock/pallet.rs 'rules::registration('] [node/venue/src/kreivo/mock/pallet.rs 'rules::anchored('] [node/venue/src/kreivo/venue.rs 'rules::anchored('] [tools/jam-dev/src/venue.rs 'rules::anchored(']]; \
+    let markers = ['MAX_ROOT_AGE_MS' '\.boundary\(' 'verify_strict' 'SMALL_ORDER' 'small_order\(' 'registrable' 'MIN_LENGTH_MS' 'MAX_LENGTH_MS' 'MAX_FOUNDING_KEYS' '[<>]=?\s*last\b' '\blast\s*[<>]']; \
+    let allowed = [[file marker]; [node/venue/src/lib.rs verify_strict] [pvm/proof/statement/service/src/refine.rs verify_strict] [node/venue/src/kreivo/mock/chain.rs MAX_FOUNDING_KEYS]]; \
+    let sources = ($roots | each {|root| glob $"($root)/**/*.rs" } | flatten | each {|path| $path | path relative-to $env.PWD } | where {|path| not ($path =~ '(^|/)(tests?|conformance)(/|\.rs$)') }); \
+    let found = ($sources | each {|file| let code = (open --raw $file | lines | take until {|line| $line =~ '^#\[cfg\(test\)\]' } | each {|line| $line | str replace -r '//.*$' '' } | str join "\n" | str replace -a -r '(?m)^\s*(pub )?use [^;]*;' ''); $markers | where {|marker| ($code =~ $marker) and not ($allowed | any {|a| $a.file == $file and $a.marker == $marker }) } | each {|marker| $"($file) holds ($marker)" } } | flatten); \
+    let calls = [[file call]; [pvm/proof/statement/src/model.rs 'rules::anchored('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchor('] [pvm/proof/statement/service/src/accumulate.rs 'rules::register('] [pvm/proof/statement/service/src/accumulate.rs 'rules::anchored('] [pvm/proof/statement/service/src/refine.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchor('] [node/venue/src/model.rs 'rules::register('] [node/venue/src/model.rs 'rules::registration('] [node/venue/src/model.rs 'rules::anchored('] [node/venue/src/kreivo/mock/pallet.rs 'rules::anchor('] [node/venue/src/kreivo/mock/pallet.rs 'rules::register('] [node/venue/src/kreivo/mock/pallet.rs 'rules::registration('] [node/venue/src/kreivo/mock/pallet.rs 'rules::anchored('] [node/venue/src/kreivo/venue.rs 'rules::anchored('] [tools/jam-dev/src/venue.rs 'rules::anchored('] [node/venue/src/model.rs 'rules::add_key('] [pvm/proof/statement/service/src/accumulate.rs 'rules::add_key('] [node/venue/src/kreivo/mock/pallet.rs 'rules::add_key(']]; \
     let missing = ($calls | where {|row| not (open --raw $row.file | str contains $row.call) } | each {|row| $"($row.file) calls no ($row.call)" }); \
     for failure in ($found ++ $missing) { print -e $failure }; \
     if ($found ++ $missing | is-not-empty) { error make { msg: "an anchor rule lives outside vos_anchor::venue, or a venue does not call it" } }; \

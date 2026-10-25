@@ -321,6 +321,13 @@ pub fn aged(clock: &WindowClock, window: u64, now: u64) -> bool {
     expiry(clock, window).is_some_and(|last| now > last)
 }
 
+/// Whether a space whose last anchored window is `last` has passed
+/// `window`: an anchor of it is refused for good ([`AnchorRefusal::Window`]),
+/// so a client stops sending it, as it does one [`aged`].
+pub fn passed(last: Option<u64>, window: u64) -> bool {
+    last.is_some_and(|last| last >= window)
+}
+
 /// When a venue may drop the `Seen` entry of a statement accepted reading
 /// roots of `windows`, its space's clock `clock`: its newest root's
 /// [`expiry`], past which a replay is refused unanchored. `u64::MAX`, never,

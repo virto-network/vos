@@ -300,17 +300,16 @@ impl AnchorSend for KreivoSend {
 
     /// By the client's last read: the space's last anchored window at or
     /// past the anchor's, or the window past `MaxRootAge` by the venue's
-    /// time (`vos_anchor::venue::aged`).
+    /// time (`vos_anchor::venue::{passed, aged}`).
     fn settled(&self, anchor: &Anchor) -> bool {
         let mut state = self.0.state();
         let now = state.now;
         let known = state.watch(anchor.space);
-        let passed = known.last.is_some_and(|last| last >= anchor.window);
         let aged = known
             .info
             .zip(now)
             .is_some_and(|(info, now)| vos_anchor::venue::aged(&info.clock(), anchor.window, now));
-        passed || aged
+        vos_anchor::venue::passed(known.last, anchor.window) || aged
     }
 }
 
