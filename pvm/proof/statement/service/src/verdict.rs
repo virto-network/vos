@@ -9,9 +9,9 @@
 
 use alloc::vec::Vec;
 
+use vos_statement::DecodeError;
 use vos_statement::vos_anchor::codec::{self, Reader};
 use vos_statement::vos_anchor::{RootKind, SpaceId, WindowClock};
-use vos_statement::{DecodeError, MAX_ROOT_AGE_MS};
 
 use crate::item::{Kind, Op};
 
@@ -21,7 +21,6 @@ pub struct Registered {
     pub space: SpaceId,
     pub clock: WindowClock,
     pub controller: [u8; 32],
-    pub start_window: u64,
     /// The founding keys, its first anchor keys.
     pub keys: Vec<[u8; 32]>,
 }
@@ -55,30 +54,20 @@ pub struct Judged {
 
 impl Judged {
     /// When its `Seen` entry may be dropped, by `clock`, its space's:
-    /// `vos_statement::seen_expiry`'s rule over its roots, `u64::MAX` for a
-    /// rootless statement or a boundary past `u64`.
+    /// `vos_anchor::venue::seen_expiry` over its roots' windows.
     pub fn seen_expiry(&self, clock: &WindowClock) -> u64 {
-        self.roots
-            .iter()
-            .map(|root| root.window)
-            .max()
-            .and_then(|window| clock.boundary(window))
-            .and_then(|boundary| boundary.checked_add(MAX_ROOT_AGE_MS))
-            .unwrap_or(u64::MAX)
+        vos_statement::vos_anchor::venue::seen_expiry(
+            clock,
+            self.roots.iter().map(|root| root.window),
+        )
     }
 }
 
-/// Refine's output for an item.
+/// Refine's output for an item; tag 1 is retired, never reused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Verdict {
     /// A registration whose genesis and signature passed.
     Register(Registered),
-    /// A migration signed by the key it names, away from this venue.
-    Migrate {
-        space: SpaceId,
-        from_window: u64,
-        controller: [u8; 32],
-    },
     /// An anchor signed by the key it names.
     Anchor {
         space: SpaceId,
@@ -98,7 +87,7 @@ pub enum Verdict {
         controller: [u8; 32],
     },
     /// An item of `kind` (none: no item's) refused at refine by `code`, its
-    /// kind's ([`RegisterCode`], [`MigrateCode`], [`AnchorCode`]).
+    /// kind's ([`RegisterCode`], [`AnchorCode`], [`ControlCode`]).
     Refused { kind: Option<Kind>, code: u32 },
 }
 
@@ -114,21 +103,10 @@ impl Verdict {
                 out.extend_from_slice(&registered.space.0);
                 registered.clock.encode_to(&mut out);
                 out.extend_from_slice(&registered.controller);
-                out.extend_from_slice(&registered.start_window.to_le_bytes());
                 codec::compact(&mut out, registered.keys.len() as u64);
                 for key in &registered.keys {
                     out.extend_from_slice(key);
                 }
-            }
-            Self::Migrate {
-                space,
-                from_window,
-                controller,
-            } => {
-                out.push(1);
-                out.extend_from_slice(&space.0);
-                out.extend_from_slice(&from_window.to_le_bytes());
-                out.extend_from_slice(controller);
             }
             Self::Anchor {
                 space,
@@ -186,7 +164,6 @@ impl Verdict {
                 let space = SpaceId(reader.array()?);
                 let clock = WindowClock::decode_from(&mut reader)?;
                 let controller = reader.array()?;
-                let start_window = reader.u64()?;
                 let count = reader.count(32)?;
                 let keys = (0..count)
                     .map(|_| reader.array())
@@ -195,15 +172,9 @@ impl Verdict {
                     space,
                     clock,
                     controller,
-                    start_window,
                     keys,
                 })
             }
-            1 => Self::Migrate {
-                space: SpaceId(reader.array()?),
-                from_window: reader.u64()?,
-                controller: reader.array()?,
-            },
             2 => Self::Anchor {
                 space: SpaceId(reader.array()?),
                 window: reader.u64()?,
@@ -259,7 +230,6 @@ impl Verdict {
     pub fn kind(&self) -> Option<Kind> {
         match self {
             Self::Register(_) => Some(Kind::Register),
-            Self::Migrate { .. } => Some(Kind::Migrate),
             Self::Anchor { .. } => Some(Kind::Anchor),
             Self::Submit(_) => Some(Kind::Submit),
             Self::Control { .. } => Some(Kind::Control),
@@ -268,47 +238,26 @@ impl Verdict {
     }
 }
 
-/// A registration's outcome.
+/// A registration's outcome (`vos_anchor::venue::RegisterRefusal`'s); 4, 6
+/// and 7 are retired, never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum RegisterCode {
     Registered = 0,
     /// The item does not decode.
     Item = 1,
-    /// A genesis of no founding key or more than `MAX_FOUNDING_KEYS`, or a
-    /// window length the venue does not register.
+    /// A genesis of no founding key or more than `MAX_FOUNDING_KEYS`, a key
+    /// twice or of small order, or a window length the venue does not
+    /// register.
     Genesis = 2,
-    /// The signing key is not one of the genesis's founding keys.
+    /// The signing key is not one of the genesis's founding keys, or its
+    /// signature does not verify.
     Founder = 3,
-    Signature = 4,
-    /// The space is registered already.
+    /// The space is registered already, ended or not.
     Again = 5,
-    /// The start window is outside `[now_w − MaxRootAge / length, now_w + 1]`.
-    Start = 6,
-    /// The venue's time is before the clock's origin.
-    Clock = 7,
 }
 
-/// A migration's outcome: `vos_venue::MigrateRefusal`'s, and refine's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
-pub enum MigrateCode {
-    Migrated = 0,
-    Item = 1,
-    /// It names another venue to leave, or this one to go to.
-    Venue = 2,
-    Signature = 3,
-    Unregistered = 4,
-    /// The signer is not the space's controller.
-    Controller = 5,
-    AlreadyMigrated = 6,
-    /// Its window is at or before one anchored, before the venue's next
-    /// window, or before the space's start here.
-    Window = 7,
-}
-
-/// An anchor's outcome: `vos_venue::Anchored`'s and `AnchorRefusal`'s,
-/// and refine's.
+/// An anchor's outcome: `vos_anchor::venue::anchor`'s, and refine's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum AnchorCode {
@@ -318,21 +267,22 @@ pub enum AnchorCode {
     Item = 2,
     Signature = 3,
     Unregistered = 4,
-    Suspended = 5,
+    /// The space ended: it equivocated.
+    Ended = 5,
     /// The signer is not one of the space's anchor keys.
     Key = 6,
-    /// At or before the last window anchored, or outside the space's range.
+    /// At or before the last window anchored, or before the space's first.
     Window = 7,
     /// The space's open window or later, by the venue's clock.
     Open = 8,
     /// Past `MaxRootAge`.
     Age = 9,
     /// Another root of the space's kind at the window is held: kept as
-    /// evidence, the space suspended.
+    /// evidence, the space ended for good.
     Equivocation = 10,
 }
 
-/// A control's outcome.
+/// A control's outcome; 7 is retired, never reused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u32)]
 pub enum ControlCode {
@@ -344,11 +294,9 @@ pub enum ControlCode {
     Controller = 4,
     /// Not the space's next nonce: a replay, or one out of order.
     Nonce = 5,
-    /// A key listed already, or `MAX_FOUNDING_KEYS` listed, to add; one not
-    /// listed to remove.
+    /// A key listed already, `MAX_FOUNDING_KEYS` listed, or a key of small
+    /// order, to add; one not listed to remove.
     Key = 6,
-    /// A resume while a signer of one of its equivocations is listed.
-    Suspended = 7,
 }
 
 #[cfg(test)]
@@ -364,14 +312,8 @@ mod tests {
                 space: SpaceId([1; 32]),
                 clock: WindowClock::DEFAULT,
                 controller: [2; 32],
-                start_window: 3,
                 keys: vec![[4; 32], [5; 32]],
             }),
-            Verdict::Migrate {
-                space: SpaceId([1; 32]),
-                from_window: 7,
-                controller: [2; 32],
-            },
             Verdict::Anchor {
                 space: SpaceId([1; 32]),
                 window: 8,
@@ -409,6 +351,6 @@ mod tests {
             let bytes = verdict.encode();
             assert_eq!(Verdict::decode_prefix(&bytes), Ok((verdict, bytes.len())));
         }
-        assert!(Verdict::decode_prefix(&[5]).is_err());
+        assert!(Verdict::decode_prefix(&[1]).is_err());
     }
 }

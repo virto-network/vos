@@ -3,19 +3,22 @@
 //!
 //! | key | value |
 //! |---|---|
-//! | `0x01 ‖ space` | [`SpaceRecord`]: its clock, controller, anchor keys, range, last window anchored, suspension and its equivocators, its controls' nonce |
-//! | `0x02 ‖ space ‖ kind ‖ w (8, BE)` | [`AnchorRecord`]: the root anchored and its signer; dropped once another root's evidence disputes it |
-//! | `0x03 ‖ statement id` | a `Seen` entry: the venue time it expires at (8, LE), `u64::MAX` never |
-//! | `0x04 ‖ space ‖ kind ‖ w (8, BE)` | [`Evidence`]: the root held and the other, each with its signer |
+//! | `0x01 ‖ space` | [`SpaceRecord`]: its clock, controller, anchor keys, first window, last window anchored, whether it ended, its controls' nonce; never dropped |
+//! | `0x02 ‖ space ‖ kind ‖ w (8, BE)` | [`AnchorRecord`]: the root anchored and its signer |
+//! | `0x03 ‖ statement id` | a `Seen` entry: the venue time it expires at (8, LE) |
+//! | `0x04 ‖ space ‖ kind ‖ w (8, BE)` | [`Evidence`]: the root held and the other, each with its signer; never dropped |
 //! | `0x05 ‖ outcome id` | [`Outcome`]: what became of an item, by [`outcome_id`]: its package's and its payload's hashes |
 //! | `0x06 ‖ bucket (8, BE)` | the count of rows queued to drop in the hour `bucket` (4, LE) |
 //! | `0x07 ‖ bucket (8, BE) ‖ i (4, BE)` | the key of a row to drop once the hour `bucket` is past |
 //! | `0x08` | the pruning's cursor: the bucket (8) and the index (4) it is at |
 //! | `0x09` | the gas the last accumulate took, by its own count (8, LE) |
+//!
+//! A row is the service's own: one that does not decode is a fault, and
+//! the invocation traps ([`Storage::corrupt`]), so accumulate reverts
+//! rather than read it as absent.
 
 use alloc::vec::Vec;
 
-use vos_statement::model::Range;
 use vos_statement::vos_anchor::codec::{self, Reader};
 use vos_statement::vos_anchor::{RootKind, SpaceId, WindowClock};
 use vos_statement::{DecodeError, StatementId};
@@ -25,6 +28,9 @@ pub trait Storage {
     fn read(&mut self, key: &[u8]) -> Option<Vec<u8>>;
     /// Set the value of `key`, or delete it (`None`).
     fn write(&mut self, key: &[u8], value: Option<&[u8]>);
+    /// A row at `key` that does not decode: the invocation stops, every
+    /// write of it reverted.
+    fn corrupt(&mut self, key: &[u8]) -> !;
 }
 
 /// Storage held in memory, by key: a client's copy, a test's.
@@ -38,6 +44,30 @@ impl Storage for alloc::collections::BTreeMap<Vec<u8>, Vec<u8>> {
             Some(value) => self.insert(key.to_vec(), value.to_vec()),
             None => self.remove(key),
         };
+    }
+
+    #[allow(
+        clippy::panic,
+        reason = "a copy of the service's storage holds the rows it wrote: one that does not \
+                  decode is the copy's fault, and the caller's invocation stops as the \
+                  service's does"
+    )]
+    fn corrupt(&mut self, key: &[u8]) -> ! {
+        panic!("a row that does not decode at {key:02x?}")
+    }
+}
+
+/// The row at `key`, decoded by `decode`; the invocation stopped when it
+/// does not decode.
+fn row<T>(
+    storage: &mut impl Storage,
+    key: &[u8],
+    decode: impl FnOnce(&[u8]) -> Result<T, DecodeError>,
+) -> Option<T> {
+    let bytes = storage.read(key)?;
+    match decode(&bytes) {
+        Ok(value) => Some(value),
+        Err(_) => storage.corrupt(key),
     }
 }
 
@@ -102,23 +132,24 @@ pub mod keys {
     }
 }
 
-/// A space the service registered.
+/// A space the service registered: never dropped, so an ended one stays
+/// recorded and its registration is never taken again.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SpaceRecord {
     pub clock: WindowClock,
-    /// The ed25519 key that migrates it.
+    /// The ed25519 key that controls it.
     pub controller: [u8; 32],
-    /// Its anchor keys: its founding keys.
+    /// Its anchor keys: its founding keys, then those its controller
+    /// added.
     pub keys: Vec<[u8; 32]>,
-    /// The windows the service anchors for it.
-    pub range: Range,
+    /// The first window it anchors here: the service's next at its
+    /// registration.
+    pub start: u64,
     /// The last window anchored, which a later anchor must pass.
     pub last: Option<u64>,
-    /// It equivocated: its roots are not anchored, its anchors refused.
-    pub suspended: bool,
-    /// The signers of its equivocations, both of each, which a resume
-    /// needs delisted.
-    pub equivocators: Vec<[u8; 32]>,
+    /// It equivocated: its roots are not anchored, its anchors refused, for
+    /// good.
+    pub ended: bool,
     /// Its controls taken: the nonce its next one names.
     pub nonce: u64,
 }
@@ -146,16 +177,13 @@ impl SpaceRecord {
         let mut out = Vec::new();
         self.clock.encode_to(&mut out);
         out.extend_from_slice(&self.controller);
-        out.extend_from_slice(&self.range.from.to_le_bytes());
-        put_option(&mut out, self.range.until);
+        out.extend_from_slice(&self.start.to_le_bytes());
         put_option(&mut out, self.last);
-        out.push(u8::from(self.suspended));
+        out.push(u8::from(self.ended));
         out.extend_from_slice(&self.nonce.to_le_bytes());
-        for keys in [&self.keys, &self.equivocators] {
-            codec::compact(&mut out, keys.len() as u64);
-            for key in keys {
-                out.extend_from_slice(key);
-            }
+        codec::compact(&mut out, self.keys.len() as u64);
+        for key in &self.keys {
+            out.extend_from_slice(key);
         }
         out
     }
@@ -164,29 +192,26 @@ impl SpaceRecord {
         let mut reader = Reader::new(bytes);
         let clock = WindowClock::decode_from(&mut reader)?;
         let controller = reader.array()?;
-        let from = reader.u64()?;
-        let until = option(&mut reader)?;
+        let start = reader.u64()?;
         let last = option(&mut reader)?;
-        let suspended = match reader.u8()? {
+        let ended = match reader.u8()? {
             0 => false,
             1 => true,
             _ => return Err(DecodeError::Noncanonical),
         };
         let nonce = reader.u64()?;
-        let mut keys = || -> Result<Vec<[u8; 32]>, DecodeError> {
-            let count = reader.count(32)?;
-            (0..count).map(|_| reader.array()).collect()
-        };
-        let (keys, equivocators) = (keys()?, keys()?);
+        let count = reader.count(32)?;
+        let keys = (0..count)
+            .map(|_| reader.array())
+            .collect::<Result<_, _>>()?;
         reader.finish()?;
         Ok(Self {
             clock,
             controller,
             keys,
-            range: Range { from, until },
+            start,
             last,
-            suspended,
-            equivocators,
+            ended,
             nonce,
         })
     }
@@ -284,9 +309,7 @@ impl Outcome {
 
 /// A registered space.
 pub fn space(storage: &mut impl Storage, space: &SpaceId) -> Option<SpaceRecord> {
-    storage
-        .read(&keys::space(space))
-        .and_then(|bytes| SpaceRecord::decode(&bytes).ok())
+    row(storage, &keys::space(space), SpaceRecord::decode)
 }
 
 /// The root anchored for `space` of `kind` at `window`.
@@ -296,15 +319,21 @@ pub fn anchor(
     kind: RootKind,
     window: u64,
 ) -> Option<AnchorRecord> {
-    storage
-        .read(&keys::anchor(space, kind, window))
-        .and_then(|bytes| AnchorRecord::decode(&bytes).ok())
+    row(
+        storage,
+        &keys::anchor(space, kind, window),
+        AnchorRecord::decode,
+    )
 }
 
 /// The expiry of statement `id`'s `Seen` entry, if it has one.
 pub fn seen(storage: &mut impl Storage, id: &StatementId) -> Option<u64> {
-    let bytes = storage.read(&keys::seen(id))?;
-    Some(u64::from_le_bytes(bytes.try_into().ok()?))
+    row(storage, &keys::seen(id), |bytes| {
+        let mut reader = Reader::new(bytes);
+        let expiry = reader.u64()?;
+        reader.finish()?;
+        Ok(expiry)
+    })
 }
 
 /// An item's outcome id: `BLAKE2b-256(package hash ‖ payload hash)`, so
@@ -315,9 +344,7 @@ pub fn outcome_id(package_hash: &[u8; 32], payload_hash: &[u8; 32]) -> [u8; 32] 
 
 /// The outcome of the item of id `id` ([`outcome_id`]).
 pub fn outcome(storage: &mut impl Storage, id: &[u8; 32]) -> Option<Outcome> {
-    storage
-        .read(&keys::outcome(id))
-        .and_then(|bytes| Outcome::decode(&bytes).ok())
+    row(storage, &keys::outcome(id), Outcome::decode)
 }
 
 #[cfg(test)]
@@ -331,24 +358,16 @@ mod tests {
             clock: WindowClock::DEFAULT,
             controller: [1; 32],
             keys: vec![[2; 32], [3; 32]],
-            range: Range {
-                from: 4,
-                until: Some(9),
-            },
+            start: 4,
             last: Some(7),
-            suspended: true,
-            equivocators: vec![[5; 32], [6; 32]],
+            ended: true,
             nonce: 3,
         };
         assert_eq!(SpaceRecord::decode(&space.encode()), Ok(space.clone()));
         let open = SpaceRecord {
-            range: Range {
-                from: 4,
-                until: None,
-            },
             last: None,
-            suspended: false,
-            equivocators: Vec::new(),
+            ended: false,
+            keys: Vec::new(),
             ..space
         };
         assert_eq!(SpaceRecord::decode(&open.encode()), Ok(open));

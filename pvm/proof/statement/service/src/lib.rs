@@ -1,23 +1,24 @@
 //! The JAM statements service (`proving.md` §6, `spaces-pallet.md` §6.1 and
 //! §6.3): a venue on JAM, as a dedicated service.
 //!
-//! - **Its items** ([`item`]): `Register`, `Migrate`, `Anchor` and
-//!   `Submit { statement, proof }`, the statement in the item's payload and
-//!   the proof its first extrinsic. JAM-NP's CE 133 bounds a work package
-//!   at 204,802 bytes, below the 256 KiB a proof may take.
-//! - **Refine** ([`refine`]) reads no state: it verifies a registration's,
-//!   a migration's or an anchor's ed25519 signature against the key it
-//!   names, and runs `judge`'s checks of a statement but `anchored` and
-//!   `seen`, then its proof; its output is a [`verdict::Verdict`].
+//! - **Its items** ([`item`]): `Register`, `Anchor`, `Submit { statement,
+//!   proof }` and `Control`, a statement in the item's payload and its
+//!   proof its first extrinsic. JAM-NP's CE 133 bounds a work package at
+//!   204,802 bytes, below the 256 KiB a proof may take.
+//! - **Refine** ([`refine`]) reads no state: it applies the registration's
+//!   checks that read none (`vos_anchor::venue::registration`), verifies an
+//!   anchor's or a control's ed25519 signature against the key it names,
+//!   and runs `judge`'s checks of a statement but `anchored` and `seen`,
+//!   then its proof; its output is a [`verdict::Verdict`].
 //! - **Accumulate** ([`accumulate`]) holds the spaces, their anchors and
-//!   the statements accepted ([`state`]): it checks an anchor's signer
-//!   against the space's keys and applies the anchor rule at the venue's
-//!   time (the slot's), and checks a statement's roots anchored and its id
-//!   unseen before recording it under the `Seen` rule.
+//!   the statements accepted ([`state`]): it applies the venue rules
+//!   (`vos_anchor::venue`) at the venue's time (the slot's) to a
+//!   registration and an anchor, and checks a statement's roots anchored
+//!   and its id unseen before recording it under the `Seen` rule.
 //! - **A deployment's constants** ([`config`]): the JAM chain's genesis hash
 //!   (the venue's id is `VenueId::jam(genesis, service)`), its genesis time
-//!   and the programs it pins, venue-bound or not; set in the linked
-//!   program before it is deployed, changed by redeploy.
+//!   and the programs it pins; set in the linked program before it is
+//!   deployed, changed by redeploy.
 //!
 //! **What refine cannot do.** It reads no state, so it cannot check `seen`:
 //! a replayed statement costs a whole refine, about 120M gas, before
@@ -33,8 +34,8 @@
 //! it answers `FULL` and writes nothing: the program then traps, so the
 //! whole accumulate reverts rather than record an outcome without its
 //! `Seen` entry or a `Last` without its anchor. Junk items' outcomes and
-//! rootless `Seen` entries grow the threshold; an operator alerts on the
-//! balance less the threshold (`info`).
+//! spaces' records grow the threshold; an operator alerts on the balance
+//! less the threshold (`info`).
 //!
 //! The service carries no test mode: what an item reaches accumulate as is
 //! what refine judged, and accumulate accepts a statement only on a code

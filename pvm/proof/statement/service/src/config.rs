@@ -5,22 +5,22 @@
 //! before it is deployed, so the service's code hash commits to them.
 //!
 //! The block is [`MARKER`], then the genesis hash (32), the genesis time
-//! (8, little-endian), the pins' count (1) and [`MAX_PINS`] pins, each the
-//! program id's 32 bytes and 1 if it is venue-bound, else 0; past the
-//! count, zeros. An unconfigured program pins nothing, so it refuses
-//! every statement as of another program than its pins (code 3).
+//! (8, little-endian), the pins' count (1) and [`MAX_PINS`] pins, each a
+//! program id's 32 bytes; past the count, zeros. An unconfigured program
+//! pins nothing, so it refuses every statement as of another program than
+//! its pins (code 3).
 
 use alloc::vec::Vec;
 
 use vos_statement::vos_anchor::codec::Reader;
-use vos_statement::{DecodeError, Pin, ProgramId};
+use vos_statement::{DecodeError, ProgramId};
 
 /// The block's first bytes, found once in a linked program.
-pub const MARKER: [u8; 32] = *b"vos/statement-service/config/v1\0";
+pub const MARKER: [u8; 32] = *b"vos/statement-service/config/v2\0";
 /// The most programs a deployment pins.
 pub const MAX_PINS: usize = 16;
-/// A pin's bytes: the program id, then the venue-bound flag.
-const PIN_BYTES: usize = 33;
+/// A pin's bytes: the program id.
+const PIN_BYTES: usize = 32;
 /// The block's bytes, the marker among them.
 pub const BYTES: usize = 32 + 32 + 8 + 1 + MAX_PINS * PIN_BYTES;
 
@@ -49,8 +49,8 @@ pub struct Config {
     /// The JAM chain's genesis time, ms since the Unix epoch: slot t
     /// starts at `genesis_ms + t × 6 s`, the venue's time.
     pub genesis_ms: u64,
-    /// The programs whose statements it judges, each venue-bound or not.
-    pub pins: Vec<Pin>,
+    /// The programs whose statements it judges.
+    pub pins: Vec<ProgramId>,
 }
 
 /// Why a configuration is refused.
@@ -70,7 +70,7 @@ impl Config {
             self.pins
                 .iter()
                 .skip(at.saturating_add(1))
-                .any(|other| other.program == pin.program)
+                .any(|other| other == pin)
         });
         if usize::from(pins) > MAX_PINS || twice {
             return Err(ConfigError::Pins);
@@ -81,16 +81,14 @@ impl Config {
         body.extend_from_slice(&self.genesis_ms.to_le_bytes());
         body.push(pins);
         for pin in &self.pins {
-            body.extend_from_slice(&pin.program.to_bytes());
-            body.push(u8::from(pin.venue_bound));
+            body.extend_from_slice(&pin.to_bytes());
         }
         body.resize(BYTES, 0);
         body.try_into().map_err(|_| ConfigError::Pins)
     }
 
     /// The configuration a block holds: its marker, at most
-    /// [`MAX_PINS`] pins, each flag 0 or 1, each program id canonical, and
-    /// zeros past them.
+    /// [`MAX_PINS`] pins, each program id canonical, and zeros past them.
     pub fn decode(block: &[u8; BYTES]) -> Result<Self, DecodeError> {
         let mut reader = Reader::new(block);
         if reader.array::<32>()? != MARKER {
@@ -111,15 +109,7 @@ impl Config {
                     return Err(DecodeError::Noncanonical);
                 }
             }
-            let venue_bound = match reader.u8()? {
-                0 => false,
-                1 => true,
-                _ => return Err(DecodeError::Noncanonical),
-            };
-            pins.push(Pin {
-                program: ProgramId(words),
-                venue_bound,
-            });
+            pins.push(ProgramId(words));
         }
         let rest = reader.take(BYTES.saturating_sub(reader.used()))?;
         if rest.iter().any(|&byte| byte != 0) {
@@ -130,14 +120,6 @@ impl Config {
             genesis_ms,
             pins,
         })
-    }
-
-    /// The pin of `program`, if it is pinned.
-    pub fn pin(&self, program: &ProgramId) -> Option<Pin> {
-        self.pins
-            .iter()
-            .find(|pin| pin.program == *program)
-            .copied()
     }
 }
 
@@ -170,22 +152,13 @@ mod tests {
         Config {
             genesis: [0x4a; 32],
             genesis_ms: 1_735_732_800_000,
-            pins: vec![
-                Pin {
-                    program: ProgramId([1, 2, 3, 4, 5, 6, 7, 8]),
-                    venue_bound: true,
-                },
-                Pin {
-                    program: ProgramId([9; 8]),
-                    venue_bound: false,
-                },
-            ],
+            pins: vec![ProgramId([1, 2, 3, 4, 5, 6, 7, 8]), ProgramId([9; 8])],
         }
     }
 
     /// A configuration's block decodes to it; the unset block to one of no
-    /// pin; a block of a pin's flag 2, of a word at `p`, of a byte past the
-    /// pins, or of another marker is refused.
+    /// pin; a block of a word at `p`, of a byte past the pins, or of
+    /// another marker is refused.
     #[test]
     fn a_block_decodes_to_its_configuration() {
         let block = config().encode().unwrap();
@@ -198,10 +171,13 @@ mod tests {
                 pins: Vec::new()
             })
         );
-        let first_flag = 32 + 32 + 8 + 1 + 32;
-        for at in [first_flag, 32 + 32 + 8, BYTES - 1, 0] {
+        let first_word = 32 + 32 + 8 + 1;
+        let mut high = block;
+        high[first_word..first_word + 4].copy_from_slice(&((1u32 << 31) - 1).to_le_bytes());
+        assert!(Config::decode(&high).is_err(), "a word at p");
+        for at in [32 + 32 + 8, BYTES - 1, 0] {
             let mut bad = block;
-            bad[at] = if at == first_flag { 2 } else { 0xff };
+            bad[at] = 0xff;
             assert!(Config::decode(&bad).is_err(), "{at}");
         }
     }
@@ -232,12 +208,7 @@ mod tests {
         doubled.pins.push(doubled.pins[0]);
         assert_eq!(doubled.encode(), Err(ConfigError::Pins));
         let many = Config {
-            pins: (0..=MAX_PINS as u32)
-                .map(|i| Pin {
-                    program: ProgramId([i; 8]),
-                    venue_bound: false,
-                })
-                .collect(),
+            pins: (0..=MAX_PINS as u32).map(|i| ProgramId([i; 8])).collect(),
             ..config()
         };
         assert_eq!(many.encode(), Err(ConfigError::Pins));

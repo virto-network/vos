@@ -31,6 +31,8 @@ ed25519-dalek = { version = "2", default-features = false }
 [dev-dependencies]
 # The golden fixtures, judged by the service as by every venue.
 vos-statement = { workspace = true, features = ["fixtures"] }
+# The venue rules' suite, run over the service's refine and accumulate.
+vos-anchor = { workspace = true, features = ["suite"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 # The JAM-only host the service runs on, refine and accumulate, and its
 # linker.
