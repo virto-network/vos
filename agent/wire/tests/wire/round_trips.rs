@@ -143,7 +143,6 @@ proptest! {
             keys::cut_proof(request, sequence),
             keys::reported(),
             keys::closed(sequence),
-            keys::moved(sequence),
             keys::serving(),
             keys::close_mark(),
             keys::closing(sequence),
@@ -217,7 +216,6 @@ proptest! {
                 keys::cut_root(number),
                 keys::cut_proof(RequestId { workflow: WorkflowId(number), awaits: u64::from(a) }, u64::from(b)),
                 keys::closed(number),
-                keys::moved(number),
                 keys::closing(number),
                 keys::proven(number, &triple.key),
             ]);

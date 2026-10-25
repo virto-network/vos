@@ -123,35 +123,26 @@ impl Apply<'_> {
             for window in first..=last {
                 self.put(&keys::cut(window), &version.encode());
             }
-            self.recut(clock.window(latest), first);
+            self.prune(clock.window(latest), first);
         }
         self.put(&keys::version(), &next.encode());
         true
     }
 
-    /// With the cuts a result records, the first `first`: the pending reads
-    /// the latest earlier cut serves are re-cut at `first` unless the
-    /// representative's close of its window has applied ([`keys::moved`]),
-    /// and `first` serves. Reads asked in a window a jump past
-    /// [`defaults::MAX_CUTS`] left uncut are past their deadline already.
-    /// The cut, re-cut and close rows of windows before `first − CUT_KEEP`
-    /// go: those from `CUT_KEEP` before the latest earlier cut through
-    /// `asked`, the window of the agent's batch-time mark, past which the
-    /// earlier recordings cut nothing, since none lie below.
-    fn recut(&mut self, asked: Option<u64>, first: u64) {
+    /// With the cuts a result records, the first `first`: the cut and close
+    /// rows of windows before `first − CUT_KEEP` go, those from `CUT_KEEP`
+    /// before the latest earlier recording's first window through `asked`,
+    /// the window of the agent's batch-time mark, past which the earlier
+    /// recordings cut nothing, since none lie below.
+    fn prune(&mut self, asked: Option<u64>, first: u64) {
         let serving = self.get::<u64>(&keys::serving());
-        if let Some(serving) = serving.filter(|serving| *serving < first)
-            && self.state.read(&keys::closed(serving)).is_none()
-        {
-            self.put(&keys::moved(serving), &first.encode());
-        }
         self.put(&keys::serving(), &first.encode());
         let (Some(serving), Some(asked)) = (serving, asked) else {
             return;
         };
         let below = first.saturating_sub(defaults::CUT_KEEP).min(asked + 1);
         for window in serving.saturating_sub(defaults::CUT_KEEP)..below {
-            for row in [keys::cut(window), keys::moved(window), keys::closed(window)] {
+            for row in [keys::cut(window), keys::closed(window)] {
                 if self.state.read(&row).is_some() {
                     self.delete(&row);
                 }

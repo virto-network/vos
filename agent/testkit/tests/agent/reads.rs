@@ -194,13 +194,11 @@ impl Reads {
     }
 
     /// The rows the node's apply writes and deletes with a cut, which the
-    /// model leaves to it: the serving window, each window's re-cut, and
-    /// the closes it keeps, as the node holds them after a batch.
+    /// model leaves to it: the latest recording's first window and the
+    /// closes it keeps, as the node holds them after a batch.
     fn sync_cuts(&mut self) {
-        let prefixes = [keys::moved(0)[..2].to_vec(), keys::closed_prefix()];
-        let ours = |key: &Vec<u8>| {
-            prefixes.iter().any(|prefix| key.starts_with(prefix)) || *key == keys::serving()
-        };
+        let ours =
+            |key: &Vec<u8>| key.starts_with(&keys::closed_prefix()) || *key == keys::serving();
         let held: Vec<Vec<u8>> = self
             .kit
             .rows()

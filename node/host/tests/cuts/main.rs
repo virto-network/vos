@@ -150,7 +150,7 @@ fn a_builder_lagging_across_two_boundaries_builds_each_cut_as_a_rebuild_would() 
             "window {window}'s undo rows dropped by its build, the later ones kept: {left:?}"
         );
         for (id, (asked, read)) in &requests {
-            let proof = roots::cut_proof_at(&snapshot, AGENT, *id, *asked).unwrap();
+            let proof = roots::cut_proof(&snapshot, AGENT, *id).unwrap();
             if *asked <= window {
                 let proof = proof.expect("a proof once its cut is built");
                 check_proof(&history, &proof, *asked, history.cuts(31)[asked], read);
@@ -194,9 +194,7 @@ fn a_builder_lagging_across_two_boundaries_builds_each_cut_as_a_rebuild_would() 
         let (root, version) = roots::agent_root(&at_cut, AGENT).unwrap();
         assert_eq!(version, cut);
         let proof_of = |id: &RequestId, read: &PendingRead| {
-            let proof = roots::cut_proof_at(&snapshot, AGENT, *id, window)
-                .unwrap()
-                .unwrap();
+            let proof = roots::cut_proof(&snapshot, AGENT, *id).unwrap().unwrap();
             let tree = AgentStore::open(&at_cut, AGENT).unwrap();
             let fresh = BatchProof::generate(&tree, &read.rows).unwrap();
             (proof, fresh.encode())
@@ -397,17 +395,13 @@ fn replicas_agree_whatever_undo_rows_each_holds() {
     }
     let latest: Vec<u64> = kept.keys().rev().take(2).copied().collect();
     for (id, (window, read)) in history.requests(47) {
-        let proof = roots::cut_proof_at(&a, AGENT, id, window).unwrap();
-        assert_eq!(
-            proof,
-            roots::cut_proof_at(&b, AGENT, id, window).unwrap(),
-            "{id:?}"
-        );
+        let proof = roots::cut_proof(&a, AGENT, id).unwrap();
+        assert_eq!(proof, roots::cut_proof(&b, AGENT, id).unwrap(), "{id:?}");
         if latest.contains(&window) {
             let proof = proof.clone().expect("a proof at a kept cut");
             check_proof(&history, &proof, window, kept[&window], &read);
         }
-        if !kept.contains_key(&window) {
+        if kept.keys().next_back().is_none_or(|last| window > *last) {
             assert!(proof.is_none(), "no proof before the cut");
         }
     }
@@ -477,7 +471,7 @@ fn a_cut_built_already_is_finished_alone() {
         Some((history.root(9), 9))
     );
     for (id, (window, read)) in history.requests(10) {
-        let proof = roots::cut_proof_at(&snapshot, AGENT, id, window)
+        let proof = roots::cut_proof(&snapshot, AGENT, id)
             .unwrap()
             .expect("a proof");
         check_proof(&history, &proof, window, 9, &read);
@@ -578,7 +572,7 @@ fn a_request_that_does_not_read_is_left_unproved() {
     let snapshot = replica.snapshot();
     assert!(roots::cut_root(&snapshot, AGENT, 0).unwrap().is_some());
     for (id, (window, read)) in history.requests(12) {
-        let proof = roots::cut_proof_at(&snapshot, AGENT, id, window)
+        let proof = roots::cut_proof(&snapshot, AGENT, id)
             .unwrap()
             .expect("a proof");
         check_proof(&history, &proof, window, 9, &read);

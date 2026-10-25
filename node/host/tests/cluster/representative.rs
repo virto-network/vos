@@ -91,9 +91,8 @@ fn every_agent_reports_and_one_close_serves_their_reads() {
 /// An agent whose clock leads the representative's by more than `L − D`
 /// cuts window 1 and reports it before the representative closes window
 /// 0: its window-1 root is a row of its own, so its window-0 row stays in
-/// `A_rep(0)` and `S_0` holds it as it was. Its read of window 0, re-cut at
-/// window 1 by that cut before the close came, is served at window 0 all
-/// the same once the close comes, stated against `S_0`, which the venue
+/// `A_rep(0)` and `S_0` holds it as it was. Its read of window 0 is served
+/// at window 0 once the close comes, stated against `S_0`, which the venue
 /// holds anchored.
 #[test]
 fn a_leading_clock_reports_its_next_window_apart() {
@@ -119,9 +118,6 @@ fn a_leading_clock_reports_its_next_window_apart() {
     wait_until("the representative holds window 1's root", || {
         holds(rep(), representative, agent, 1)
     });
-    let moved: Option<u64> =
-        vos_checker::applied(replica(&cluster, agent).store(), agent, &keys::moved(0));
-    assert_eq!(moved, Some(1), "re-cut before the close");
     assert!(
         holds(rep(), representative, agent, 0),
         "its window-0 row kept"
@@ -168,10 +164,9 @@ impl Hooks for Holds {
 /// `B_0 + D`, the representative's cut of window 0 holds no row of it, so
 /// no path from `S_0` reaches its root there and the kernel's prologue
 /// refuses its statement at window 0, served the path of another agent's
-/// row. Its read, re-cut at window 1, is served at window 1's close and
-/// stated against `S_1`, which the venue holds anchored.
+/// row. Its read ends `NotClosed` at its deadline, `B_2`, with no statement.
 #[test]
-fn an_agent_that_misses_the_close_is_served_at_the_next() {
+fn an_agent_that_misses_the_close_ends_not_closed() {
     let clock = clock();
     let b0 = clock.boundary(0).unwrap();
     let length = clock.length_ms;
@@ -257,24 +252,14 @@ fn an_agent_that_misses_the_close_is_served_at_the_next() {
         "the prologue refuses it at window 0"
     );
 
-    anchoring.set_clocks(&cluster, b0 + length + 1_000);
-    wait_until("the late read re-cut at window 1", || {
-        vos_checker::applied::<u64>(replica(&cluster, late).store(), late, &keys::moved(0))
-            == Some(1)
-    });
-    wait_until(
-        "the representative holds the late agent's window-1 root",
-        || holds(replica(&cluster, representative), representative, late, 1),
+    anchoring.set_clocks(&cluster, b0 + 2 * length + 1_000);
+    let ended = ended(&cluster, late, missed);
+    assert!(
+        matches!(&ended, Outcome::Failed { detail, .. }
+            if *detail == vos_wire::abi::AttestError::NotClosed.encode()),
+        "{ended:?}"
     );
-    anchoring.set_clocks(&cluster, b0 + length + d + 1_000);
-    let rep_root_1 = rep_root(&cluster, representative, 1);
-    assert!(matches!(ended(&cluster, late, missed), Outcome::Done(_)));
-    let attests = attests(replica(&cluster, late), late, missed);
-    assert_eq!(attests.len(), 1);
-    assert_eq!(attests[0].window, Some(1));
-    let root = stated(&cluster, 1, &rep_root_1);
-    assert_eq!(attests[0].roots, [root]);
-    assert!(anchoring.venue.anchored(&root));
+    assert!(logged(replica(&cluster, late), late, missed).is_empty());
     assert!(anchoring.venue.evidence().is_empty());
 }
 

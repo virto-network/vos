@@ -1,14 +1,13 @@
 //! The checker's exactly-once run with window cuts: windows of eight
 //! seconds, so a run crosses boundary after boundary through its
 //! failures (leaders stopped, nodes cut off, clocks jumping, snapshots
-//! installed), and a read's three windows to be served outlast what a
+//! installed), and a read's two windows to be served outlast what a
 //! loaded host adds to a window's close; with a writer at each agent
 //! rewriting rows of the reader's committed map, and a reader starting
 //! workflows that read sixteen of them at their window's cut
 //! ([`vos_wire::abi::Op::AttestAt`]). The space's representative,
 //! replicated on the three nodes, closes each window at `B_w + D`, 400 ms
-//! here: each read is served by its leader once its window is closed, or
-//! at the next window its read was re-cut to.
+//! here: each read is served by its leader once its window is closed.
 //!
 //! Beside the run's own checks: undo rows were held during it, by some
 //! replica, and none is left once every replica has built; every replica

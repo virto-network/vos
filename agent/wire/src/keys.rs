@@ -145,7 +145,7 @@ enum Row {
     Request = 0x1c,
     Reported = 0x1d,
     Closed = 0x1e,
-    Moved = 0x1f,
+    // 0x1f: reserved.
     Serving = 0x20,
     CloseMark = 0x21,
     Reports = 0x22,
@@ -532,9 +532,9 @@ pub fn cut_root_entry(key: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(rest.try_into().ok()?))
 }
 
-/// A pending request's rows and their proof at window `window`'s cut,
-/// node-local, written in the commit that marks the cut built: one for the
-/// window it was asked in, and one for each window a re-cut moved it to.
+/// A pending request's rows and their proof at the cut of window `window`,
+/// the one it was asked in: node-local, written in the commit that marks
+/// the cut built.
 pub fn cut_proof(id: RequestId, window: u64) -> Vec<u8> {
     TreeRow::CutProof.key(
         &[
@@ -546,7 +546,7 @@ pub fn cut_proof(id: RequestId, window: u64) -> Vec<u8> {
     )
 }
 
-/// The prefix of the [`cut_proof`] rows of request `id`, in window order.
+/// The prefix of the [`cut_proof`] row of request `id`.
 pub fn cut_proofs_of(id: RequestId) -> Vec<u8> {
     TreeRow::CutProof.key(&[&id.workflow.0.to_be_bytes()[..], &id.awaits.to_be_bytes()].concat())
 }
@@ -594,18 +594,8 @@ pub fn closed_prefix() -> Vec<u8> {
     Row::Closed.prefix().to_vec()
 }
 
-/// The window whose cut serves the pending requests the window `window`'s
-/// cut served, once that window went unclosed: its requests' re-cut. Apply
-/// writes it with the next cut recorded after `window`'s, when the
-/// representative's `Closed` of `window` has not been applied by then
-/// ([`crate::apply`]). Replicated.
-pub fn moved(window: u64) -> Vec<u8> {
-    key(&[&Row::Moved.prefix(), &window.to_be_bytes()])
-}
-
-/// The window of the latest cut recorded whose requests it serves: the
-/// first of the windows the latest recording cut. Replicated, written by
-/// apply with the cuts.
+/// The first of the windows the latest recording cut. Replicated, written
+/// by apply with the cuts.
 pub fn serving() -> Vec<u8> {
     Row::Serving.prefix().to_vec()
 }

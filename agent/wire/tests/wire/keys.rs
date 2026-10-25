@@ -128,8 +128,7 @@ fn keys_keep_their_bytes() {
     assert_eq!(keys::closed(sequence), cat(&[&[0x00, 0x1e], &at]));
     assert_eq!(keys::closed_prefix(), [0x00, 0x1e]);
     assert_eq!(keys::closed_entry(&keys::closed(sequence)), Some(sequence));
-    assert_eq!(keys::closed_entry(&keys::moved(sequence)), None);
-    assert_eq!(keys::moved(sequence), cat(&[&[0x00, 0x1f], &at]));
+    assert_eq!(keys::closed_entry(&keys::cut(sequence)), None);
     assert_eq!(keys::serving(), [0x00, 0x20]);
     assert_eq!(keys::close_mark(), [0x00, 0x21]);
     assert_eq!(
@@ -154,7 +153,6 @@ fn keys_keep_their_bytes() {
     for replicated in [
         keys::reported(),
         keys::closed(1),
-        keys::moved(1),
         keys::serving(),
         keys::close_mark(),
         keys::proven(1, &[1; 32]),

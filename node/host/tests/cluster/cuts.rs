@@ -231,7 +231,7 @@ fn a_replica_down_across_a_cut_holds_its_proofs_on_return() {
 /// they stood at the cut, with their salts, under one proof against the
 /// root at the cut, the same bytes on every replica. Later writes rewrite
 /// those rows. Then the leader stops: the new leader's replica, and the
-/// third, still hold the proof unchanged, of window 0 (no re-cut), and the
+/// third, still hold the proof unchanged, of window 0, and the
 /// old leader's, restarted, holds it too.
 #[test]
 fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {

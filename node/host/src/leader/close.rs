@@ -69,7 +69,7 @@ impl Leader {
             if !self.inner.hooks.report(self.id, window) {
                 break;
             }
-            let pending = !roots::served_at(snapshot, self.id, window)?.is_empty();
+            let pending = !roots::requests_at(snapshot, self.id, window)?.is_empty();
             due.push(Pending::Duty(Input::Report {
                 to,
                 window,

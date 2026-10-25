@@ -114,24 +114,6 @@ pub fn representative(genesis: &crate::SpaceGenesis) -> Option<AgentId> {
     Some(crate::peer::CreationRecord::agent_id(*founder, 0))
 }
 
-/// The windows whose cuts may serve a read asked in window `window`, in
-/// order: its own, then each its re-cuts moved it to ([`keys::moved`]), as
-/// `moved` reads them. The last is the cut its pending read waits on; any
-/// whose close the agent holds serves it. At most
-/// [`crate::defaults::RECUTS`] moves are followed: a third is recorded only
-/// at or past the read's deadline.
-pub fn serving_windows(window: u64, mut moved: impl FnMut(u64) -> Option<u64>) -> Vec<u64> {
-    let mut windows = alloc::vec![window];
-    for _ in 0..crate::defaults::RECUTS {
-        let at = *windows.last().expect("one window");
-        match moved(at) {
-            Some(next) if next > at => windows.push(next),
-            _ => break,
-        }
-    }
-    windows
-}
-
 /// The representative's committed map of agents' roots at their cuts.
 pub const fn representative_map() -> MapId {
     MapId {

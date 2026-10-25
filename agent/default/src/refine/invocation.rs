@@ -706,9 +706,9 @@ impl<'a> Invocation<'a> {
         {
             return (Attested::Failed(AttestError::Failed), 0);
         }
-        let Some(at) = self.serves(instance, window, request, &served) else {
+        if self.serves(instance, window, request, &served).is_none() {
             return (Attested::Failed(AttestError::Unserved), 0);
-        };
+        }
         let Ok(installed) = self.installed(instance) else {
             return (Attested::Failed(AttestError::Unknown), 0);
         };
@@ -740,7 +740,7 @@ impl<'a> Invocation<'a> {
         self.attests_counted += cap::AT_CUT;
         self.attests.push(Attest {
             program,
-            window: Some(at),
+            window: Some(window),
             witness_input: run.witness_input,
             output: parts.output.clone(),
             public_args: parts.public_args,
@@ -749,39 +749,30 @@ impl<'a> Invocation<'a> {
         (Attested::Done(parts.output), spent)
     }
 
-    /// The window whose cut serves the request asked in window `window` by
-    /// `request` when `served` is what it asked for: within the target's
-    /// cap, of this agent and its space, of the window it was asked in or
-    /// one its re-cuts moved it to ([`keys::moved`]), of the request's
-    /// instance and its rows, in order, and with the representative's
-    /// root, salt and path the agent holds of that window's close
-    /// ([`keys::closed`]).
+    /// Some when `bytes` serve the request asked in window `window` by
+    /// `request`: within the target's cap, of this agent and its space, of
+    /// that window, of the request's instance and its rows, in order, and
+    /// with the representative's root, salt and path the agent holds of
+    /// the window's close ([`keys::closed`]).
     fn serves(
         &self,
         instance: InstanceId,
         window: u64,
         request: RequestId,
         bytes: &[u8],
-    ) -> Option<u64> {
+    ) -> Option<()> {
         if bytes.len() > self.limits.served {
             return None;
         }
         let asked = self.read_state(&keys::request(window, request)).ok()??;
         let (asked, _) = PendingRead::decode(&asked).ok()?;
         let (served, used) = Served::decode(bytes).ok()?;
-        let at = served.window;
-        let windows = vos_wire::served::serving_windows(window, |window| {
-            let moved = self.read_state(&keys::moved(window)).ok()??;
-            u64::decode_exact(&moved)
-        });
-        if !windows.contains(&at) {
-            return None;
-        }
-        let closed = self.read_state(&keys::closed(at)).ok()??;
+        let closed = self.read_state(&keys::closed(window)).ok()??;
         let closed = ClosedRow::decode_exact(&closed)?;
         let space = matches!(self.space(), Ok(Some((space, _))) if space == served.space);
         let holds = used == bytes.len()
             && space
+            && served.window == window
             && served.agent == self.base.agent
             && served.instance == instance
             && asked.instance == instance
@@ -794,7 +785,7 @@ impl<'a> Invocation<'a> {
                 .iter()
                 .zip(&asked.rows)
                 .all(|((row, _), asked)| row == asked);
-        holds.then_some(at)
+        holds.then_some(())
     }
 
     /// A workflow's pause: a sleep until a time, or a request of another

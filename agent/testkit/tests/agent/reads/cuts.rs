@@ -1,4 +1,4 @@
-//! The window cuts reads wait on: re-cuts, deadlines and pruning, the
+//! The window cuts reads wait on: their windows, deadlines and pruning, the
 //! agent's report of its root, the representative's closes, and a
 //! statement's proof recorded.
 
@@ -27,86 +27,59 @@ fn stated(result: &WorkResult, request: RequestId) -> (Option<u64>, Vec<RootRead
     (attest.window, attest.roots.clone())
 }
 
-/// A window whose close has not applied by the next cut is re-cut there:
-/// a read asked in window 10, its window cut and unclosed when window 11's
-/// cut is recorded, moves to window 11 ([`keys::moved`]), and is served
-/// and stated at window 11's cut, with window 11's close. A window closed
-/// in time is not re-cut, its read served at its own cut. A close that
-/// comes after the re-cut serves the read at its own window still; a
-/// window it never moved through serves it none.
+/// A read is served at its own window's cut alone: asked in window 10 and
+/// closed only after window 11's cut is recorded, it is served and stated
+/// at window 10. Rows served at another window's cut, though that window
+/// is closed, serve it none.
 #[test]
-fn an_unclosed_window_is_re_cut_at_the_next() {
+fn a_read_is_served_at_its_own_window_alone() {
     let mut reads = Reads::with(&[(1, 10), (2, 20)]);
     let id = reads.start(T0 + 10, "sum_at_cut", vec![1u64, 2]);
     let (request, read) = reads.asked(WINDOW, id, 0);
     tick(&mut reads, start_of(11) + 5);
     assert_eq!(row::<u64>(&reads, &keys::serving()), Some(WINDOW));
-    assert_eq!(row::<u64>(&reads, &keys::moved(WINDOW)), None);
     tick(&mut reads, start_of(12) + 5);
-    assert_eq!(row::<u64>(&reads, &keys::serving()), Some(11));
-    assert_eq!(row::<u64>(&reads, &keys::moved(WINDOW)), Some(11));
-    let served = reads.served(11, &read);
+    let served = reads.served(WINDOW, &read);
     let resume = reads.resume(WINDOW, request, Some(&served));
     let result = reads.batch(start_of(12) + 10, vec![resume]);
     let (window, roots) = stated(&result, request);
-    assert_eq!(window, Some(11));
-    assert_eq!(roots[0].window, 11);
-    assert_eq!(roots[0].root, space_root(&SPACE, 11, &served.rep_root));
+    assert_eq!(window, Some(WINDOW));
+    assert_eq!(roots[0].window, WINDOW);
+    assert_eq!(roots[0].root, space_root(&SPACE, WINDOW, &served.rep_root));
     assert_eq!(ended(&reads.record(id)), &Outcome::Done(30u64.encode()));
 
-    // Closed in time: no re-cut.
     let id = reads.start(start_of(12) + 20, "sum_at_cut", vec![1u64, 2]);
     let (request, read) = reads.asked(12, id, 0);
-    let served = reads.served(12, &read);
     tick(&mut reads, start_of(13) + 5);
-    tick(&mut reads, start_of(14) + 5);
-    assert_eq!(row::<u64>(&reads, &keys::moved(12)), None);
-    let resume = reads.resume(12, request, Some(&served));
-    let result = reads.batch(start_of(14) + 10, vec![resume]);
-    assert_eq!(stated(&result, request).0, Some(12));
-
-    // Closed after the re-cut: still served at its own window, as at any
-    // window it was moved through; at none past them.
-    let id = reads.start(start_of(14) + 20, "sum_at_cut", vec![1u64, 2]);
-    let (request, read) = reads.asked(14, id, 0);
-    tick(&mut reads, start_of(15) + 5);
-    tick(&mut reads, start_of(16) + 5);
-    assert_eq!(row::<u64>(&reads, &keys::moved(14)), Some(15));
-    let before = reads.served(13, &read);
-    let resume = reads.resume(14, request, Some(&before));
-    let result = reads.batch(start_of(16) + 10, vec![resume]);
+    let other = reads.served(11, &read);
+    let resume = reads.resume(12, request, Some(&other));
+    let result = reads.batch(start_of(13) + 10, vec![resume]);
     assert!(
         resumed(&result, request).attests.is_empty(),
-        "not of its windows"
+        "not its window"
     );
-    let id = reads.start(start_of(16) + 20, "sum_at_cut", vec![1u64, 2]);
-    let (request, read) = reads.asked(16, id, 0);
-    tick(&mut reads, start_of(17) + 5);
-    tick(&mut reads, start_of(18) + 5);
-    assert_eq!(row::<u64>(&reads, &keys::moved(16)), Some(17));
-    let late = reads.served(16, &read);
-    let resume = reads.resume(16, request, Some(&late));
-    let result = reads.batch(start_of(18) + 10, vec![resume]);
-    assert_eq!(stated(&result, request).0, Some(16));
+    assert_eq!(
+        ended(&reads.record(id)),
+        &failed_with(AttestError::Unserved)
+    );
 }
 
-/// A read re-cut twice and closed at neither ends `NotClosed` at its
-/// deadline, `B_{w+3}`, when its third re-cut would come.
+/// A read whose window's close never comes ends `NotClosed` at its
+/// deadline, `B_{w+2}`, though the next window is closed.
 #[test]
-fn a_read_re_cut_twice_ends_not_closed() {
+fn a_read_the_close_misses_ends_not_closed() {
     let mut reads = Reads::with(&[(1, 10)]);
     let id = reads.start(T0 + 10, "sum_at_cut", vec![1u64]);
-    for window in 11..=13 {
-        tick(&mut reads, start_of(window) + 5);
-    }
-    tick(&mut reads, start_of(14) - 1);
-    assert_eq!(row::<u64>(&reads, &keys::moved(WINDOW)), Some(11));
-    assert_eq!(row::<u64>(&reads, &keys::moved(11)), Some(12));
+    let (_, read) = reads.asked(WINDOW, id, 0);
+    tick(&mut reads, start_of(11) + 5);
+    tick(&mut reads, start_of(12) + 5);
+    reads.served(11, &read);
+    tick(&mut reads, start_of(13) - 1);
     assert!(matches!(
         reads.record(id).state,
         WorkflowState::Attesting { .. }
     ));
-    tick(&mut reads, start_of(14));
+    tick(&mut reads, start_of(13));
     assert_eq!(
         ended(&reads.record(id)),
         &failed_with(AttestError::NotClosed)
@@ -139,8 +112,8 @@ fn a_read_a_jump_leaves_uncut_ends_not_closed() {
     assert!(reads.node.get(&keys::request(WINDOW, request)).is_none());
 }
 
-/// A cut recording window `w` deletes the cut, re-cut and close rows of
-/// every window before `w − CUT_KEEP`, and no later one.
+/// A cut recording window `w` deletes the cut and close rows of every
+/// window before `w − CUT_KEEP`, and no later one.
 #[test]
 fn old_cut_rows_are_pruned() {
     let mut reads = Reads::with(&[(1, 10)]);
@@ -158,13 +131,6 @@ fn old_cut_rows_are_pruned() {
             kept,
             "cut({window})"
         );
-        if window > WINDOW && window < 19 {
-            assert_eq!(
-                reads.node.get(&keys::moved(window)).is_some(),
-                kept,
-                "moved({window})"
-            );
-        }
     }
     assert!(
         reads.node.get(&keys::closed(WINDOW)).is_none(),
