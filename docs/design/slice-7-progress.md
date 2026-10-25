@@ -555,3 +555,48 @@ guard's two messages are `vos-wire`'s; nothing pins the image before 7.8b's
 - **The venue `Status` keeps its four variants:** the leader no longer
   reads it but for the guard's skip of an ended space; the pin keeps the
   status read.
+
+### The review's fixes
+
+Fable's review (`research/slice-7/7.2-fable.md`: fix, then merge) and the
+owner's answer to its M1 (S34, `owner-decisions.md`), folded as further
+commits:
+- **M1, S34: the majority decides.** A quorum of the replicas holding the
+  leader's row sends the evidence over a dissenting minority; each
+  dissenter is alerted by name with its root (`AnchorAlert::Divergent`;
+  equal to the venue's held root it names the equivocator). Without a
+  quorum nothing is sent and nothing settled, the guard asking again a
+  recheck later; a dissent never settles a window. Tests: a compromised
+  replica that anchored a forged root and answers it as its row does not
+  block the evidence; with no quorum the guard waits, then sends once a
+  quorum holds the row. Pin D′ amended.
+- **M2:** the Kreivo client keeps, by signer, the code and the listing
+  read when the venue refused it unlisted (7 `NotAuthority`, 11), answers
+  it unlisted and sends nothing under that listing, and forgets it when a
+  read finds another; a test through a transport refusing `NotAuthority`.
+  `operations.md`: a Kreivo removal in one sitting, authority then key.
+- **L1:** the pass runs once a cut is built or the recheck is due, not
+  before every batch; the guard stops at a quorum, with a 200 ms grace to
+  name the rest. **L2:** no later window is offered after the evidence.
+  **L3:** `AnchorAlert::Evidence`; a stop alerted once a window. **L4:**
+  with the venue's time unread nothing is judged aged. **L5:** the handoff
+  damper is the node's, across leaderships; no handoff before the space's
+  origin. **L6:** `may_represent` and `operations.md` say the
+  representative is refused until the venue client has read the space.
+  **L7:** pin D′'s "by apply" and "if any differs", and the runbook's
+  bullets.
+- **Info:** `AlreadyAnchored` caches the root held; the prover's retry
+  wait stops doubling at the longest window; a `Never` by the venue's own
+  refusal (the window before the registration) logs as a warning. The
+  leader's alerts are raised once a leadership each; with that, its
+  state is three fields (the last window settled, the last pass and the
+  cuts built then, the alerts raised), the handoff damper now the node's.
+- Not taken: a distinct `Unplaced::VenueUnread` (L6's alternative); the
+  documentation covers it.
+
+**Gates after the fixes** [measured]: `just check` green; the checker
+loop, seeds 7205–7206 with `CUTS_FULL`, green (174 s and 121 s; 51 and 54
+anchors, every one the replicas' row, no evidence); `just e2e-chain`
+green first time, 1,670 s at a loaded host: the same verdicts, latency
+125.7 s at Kreivo and 79.4–169.7 s at JAM, each under its gate; 5 Kreivo
+anchors; the audit clean over 574 carriers.
