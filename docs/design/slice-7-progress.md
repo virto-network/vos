@@ -1039,7 +1039,28 @@ Branch `s7/7.14`, from vos-core `61c0950e` (7.8a merged).
 - **Format 35 byte for byte:** `fixtures::the_fixtures_are_the_generators`
   and `the_fixtures_are_judged` pass (`segment-35.*`, the wraps, `H_FOLD`
   and the program ids unchanged).
-- `just check`: see below; `just test-proof`: see below.
+- **`just check`:** green at `9b5ff346` (each under a 12 GiB scope,
+  `nice -n 10`, `CARGO_BUILD_JOBS=8`, another agent's runs on the machine,
+  load 12–46). Its first full run failed `vos-node`'s `tree_crash` ("no
+  round was killed between a build's batches", a kill-timing test under
+  load); its rest (the agent's crates and `test-reads`) rerun green, the
+  crash test cutting 4 of 12 rounds mid-build.
+- **`just test-proof`** (the leakage gates at their medium N, 64 proofs a
+  kernel on the masked segment): green, 568 passed in 48 suites, about 45
+  minutes; the segment's six heavy and leakage tests 401 s; `constants::`
+  with every pinned value unchanged; the carrier audit clean (451
+  `WrapRandomness` needles). Its first run failed
+  `window_kernel::the_window_is_stated_at_the_model_venue` from before this
+  step: since 7.2 (`4f9babad`) a venue answers a repeat as accepted
+  (`SubmitOutcome::judged`), and the test still expected code 6; it now
+  expects `SubmitOutcome::Accepted` (`6d0b50c9`).
+
+**Commits:** `003ae19a` the finalize hook and the floors; `cd532763` the
+trait's extensions, the per-component `h` and the masked segment;
+`8eb0da9e` the gates; `3d1c08a0`, `bd7edfad` the spike's `real` cells and
+their runs (the latter also carries `proving.md` §5 and §8); `2a378382`,
+`9b5ff346` a doc link and clippy; `6d0b50c9` the window kernel's repeat;
+this record.
 
 **Masked against unmasked, x86** [measured, `spikes/s7-device/runs/x86-real.jsonl`;
 the auth statement, 19,192 steps; the Blake2s channel; 4 threads pinned to
