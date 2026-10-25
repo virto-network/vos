@@ -10,12 +10,13 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use vos_anchor::venue::{
-    self as rules, Anchoring, Held, RegisterRefusal, Roots, Status as Standing, VenueState,
+    self as rules, AnchorRefusal, Anchoring, Held as Holding, RegisterRefusal, Roots,
+    Status as Standing, VenueState,
 };
 use vos_anchor::{Anchor, RootKind, RootRead, SpaceGenesis, SpaceId, VenueId, WindowClock};
 use vos_statement::{ProgramId, Statement, StatementId, Venue};
 
-use crate::{AnchorRefusal, Anchored, NotAccepted, Status, VenueClient};
+use crate::{AnchorOutcome, Held, Status, SubmitOutcome, VenueClient};
 
 /// A space a venue registered.
 struct Registered {
@@ -67,11 +68,11 @@ impl Roots for View<'_> {
         })
     }
 
-    fn held(&self, space: &SpaceId, kind: RootKind, window: u64) -> Option<Held> {
+    fn held(&self, space: &SpaceId, kind: RootKind, window: u64) -> Option<Holding> {
         self.state
             .anchors
             .get(&(*space, kind, window))
-            .map(|anchor| Held {
+            .map(|anchor| Holding {
                 root: anchor.root,
                 signer: anchor.signer,
             })
@@ -224,6 +225,31 @@ impl ModelVenue {
         space.keys.len() < before
     }
 
+    /// The venue's own answer to `anchor`, by the venue rules: what it did
+    /// with it, or why it refused it. A second root at a window held is
+    /// stored as the evidence it is, and ends the space.
+    pub fn answer(&self, anchor: &Anchor) -> Result<Anchoring, AnchorRefusal> {
+        let mut state = self.state();
+        let anchoring = rules::anchor(&self.view(&state), anchor)?;
+        let at = (anchor.space, anchor.kind, anchor.window);
+        let Some(space) = state.spaces.get_mut(&anchor.space) else {
+            return Err(AnchorRefusal::Unregistered);
+        };
+        match anchoring {
+            Anchoring::Again => {}
+            Anchoring::New => {
+                space.last = Some(anchor.window);
+                state.anchors.insert(at, *anchor);
+            }
+            Anchoring::Evidence(_) => {
+                space.standing = Standing::Ended;
+                let held = state.anchors.get(&at).copied();
+                state.evidence.extend(held.map(|held| (held, *anchor)));
+            }
+        }
+        Ok(anchoring)
+    }
+
     /// The equivocations kept: each the anchor held and the other.
     pub fn evidence(&self) -> Vec<(Anchor, Anchor)> {
         self.state().evidence.clone()
@@ -255,29 +281,19 @@ impl VenueClient for ModelVenue {
         self.id
     }
 
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        let mut state = self.state();
-        let anchoring = rules::anchor(&self.view(&state), anchor)?;
-        let at = (anchor.space, anchor.kind, anchor.window);
-        let space = state.spaces.get_mut(&anchor.space);
-        match (anchoring, space) {
-            (Anchoring::Again, _) => Ok(Anchored::Again),
-            (Anchoring::New, Some(space)) => {
-                space.last = Some(anchor.window);
-                state.anchors.insert(at, *anchor);
-                Ok(Anchored::New)
-            }
-            (Anchoring::Evidence(_), Some(space)) => {
-                space.standing = Standing::Ended;
-                let held = state.anchors.get(&at).copied();
-                state.evidence.extend(held.map(|held| (held, *anchor)));
-                Err(AnchorRefusal::Equivocation)
-            }
-            (_, None) => Err(AnchorRefusal::Unregistered),
+    fn anchor(&self, anchor: &Anchor) -> AnchorOutcome {
+        let answer = self.answer(anchor);
+        if let Ok(Anchoring::Evidence(_)) = answer {
+            tracing::error!(
+                window = anchor.window,
+                "the venue held another root of the space at this window: this anchor is the \
+                 equivocation's evidence, and the space has ended"
+            );
         }
+        outcome(answer)
     }
 
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
+    fn submit(&self, statement: &Statement, proof: &[u8]) -> SubmitOutcome {
         let mut state = self.state();
         // A program it pinned none for is refused as `judge` refuses another
         // program than the pinned one, after the format: no program id has a
@@ -289,8 +305,10 @@ impl VenueClient for ModelVenue {
             .copied()
             .unwrap_or(ProgramId([u32::MAX; 8]));
         let view = self.view(&state);
-        let id =
-            vos_statement::judge(&view, &program, statement, proof).map_err(NotAccepted::from)?;
+        let id = match vos_statement::judge(&view, &program, statement, proof) {
+            Ok(id) => id,
+            Err(refusal) => return SubmitOutcome::judged(refusal.code()),
+        };
         let expiry = state
             .spaces
             .get(&statement.space)
@@ -298,7 +316,7 @@ impl VenueClient for ModelVenue {
                 vos_statement::seen_expiry(statement, &space.clock)
             });
         state.seen.push((id, expiry));
-        Ok(id)
+        SubmitOutcome::Accepted
     }
 
     fn anchored(&self, root: &RootRead) -> bool {
@@ -324,9 +342,29 @@ impl VenueClient for ModelVenue {
         Some((self.now)())
     }
 
-    /// None: it takes or refuses each anchor at once.
-    fn unsettled(&self, _: &SpaceId) -> Vec<Anchor> {
-        Vec::new()
+    fn held(&self, space: &SpaceId, window: u64) -> Held {
+        let state = self.state();
+        match state.anchors.get(&(*space, RootKind::Space, window)) {
+            Some(anchor) => Held::Root(anchor.root),
+            None => Held::Nothing,
+        }
+    }
+}
+
+/// The model venue's answer as the leader's outcome, the venue rules'
+/// refusal its code (`Unregistered` 1 to `Age` 7, 8 an equivocation's
+/// evidence).
+pub(crate) fn outcome(answer: Result<Anchoring, AnchorRefusal>) -> AnchorOutcome {
+    match answer {
+        Ok(Anchoring::New | Anchoring::Again) => AnchorOutcome::Taken,
+        Ok(Anchoring::Evidence(_)) => AnchorOutcome::Stopped(8),
+        Err(AnchorRefusal::Unregistered) => AnchorOutcome::NotYet,
+        Err(AnchorRefusal::Stopped) => AnchorOutcome::Stopped(2),
+        Err(AnchorRefusal::Key) => AnchorOutcome::Unlisted(3),
+        Err(AnchorRefusal::Signature) => AnchorOutcome::Never(4),
+        Err(AnchorRefusal::Window) => AnchorOutcome::Never(5),
+        Err(AnchorRefusal::Open) => AnchorOutcome::NotYet,
+        Err(AnchorRefusal::Age) => AnchorOutcome::Never(7),
     }
 }
 

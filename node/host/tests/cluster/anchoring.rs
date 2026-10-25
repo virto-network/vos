@@ -4,24 +4,21 @@
 //! representative once its key is registered, and anchoring after a
 //! failover; anchors waiting through a long wait taken up after a
 //! failover; windows refused while the venue's client answers the space
-//! unregistered, anchored once it reads the registration; and anchors a
-//! client hands back that the node never signed, not signed again.
+//! unregistered, anchored once it reads the registration.
 //!
 //! The windows are an hour long (`support::clock`), and the tests move the
 //! nodes' clocks and the venue's past each window's close, `B_w + D`.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::SigningKey;
 use vos_node::{Config, ReplaceError, roots};
-use vos_venue::queue::{AnchorQueue, AnchorSend, Fate};
-use vos_venue::{AnchorRefusal, Anchored, ModelVenue, Status, VenueClient};
+use vos_venue::{AnchorOutcome, ModelVenue, VenueClient};
 use vos_wire::WindowClock;
 use vos_wire::ids::AgentId;
 use vos_wire::ingress::Unplaced;
-use vos_wire::vos_anchor::{Anchor, MAX_ROOT_AGE_MS, SpaceId};
+use vos_wire::vos_anchor::Anchor;
 
 use crate::common::{Cluster, wait_until};
 use crate::support::Anchoring;
@@ -261,17 +258,17 @@ fn only_a_founding_node_signs_the_registration() {
 }
 
 /// The model venue as a client that has not read the space's registration
-/// yet answers it: each anchor refused `Unregistered` until `read`, as
+/// yet answers it: each anchor not yet taken until `read`, as
 /// Kreivo's client answers from what it last read.
 struct Unread {
     venue: Arc<ModelVenue>,
     read: AtomicBool,
 }
 
-vos_venue::forward_venue!(Unread => venue; forward [id, submit, anchored, anchor_keys, status, time, unsettled] {
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
+vos_venue::forward_venue!(Unread => venue; forward [id, submit, anchored, anchor_keys, status, held, time] {
+    fn anchor(&self, anchor: &Anchor) -> AnchorOutcome {
         if !self.read.load(Ordering::SeqCst) {
-            return Err(AnchorRefusal::Unregistered);
+            return AnchorOutcome::NotYet;
         }
         self.venue.anchor(anchor)
     }
@@ -301,153 +298,4 @@ fn windows_refused_unregistered_are_anchored_once_registered() {
     unread.read.store(true, Ordering::SeqCst);
     anchored(&anchoring, &cluster, &clock, 2);
     assert_eq!(windows(&anchoring, &cluster), [0, 1, 2]);
-}
-
-/// The model venue reached through an [`AnchorQueue`], as a client of a
-/// chain reaches its venue: an anchor queued and answered at once, then
-/// sent until the venue takes it; one whose key the venue does not list
-/// handed back. Its listing of anchor keys may be held at an older read
-/// (`stale`), as a client's lags the chain.
-struct Queued {
-    venue: Arc<ModelVenue>,
-    queue: AnchorQueue,
-    sends: Arc<AtomicUsize>,
-    stale: Mutex<Option<Vec<[u8; 32]>>>,
-    /// Anchors it hands back beside its queue's, as a faulty client would.
-    injected: Mutex<Vec<Anchor>>,
-}
-
-impl Queued {
-    fn over(venue: &Arc<ModelVenue>) -> Arc<Self> {
-        let sends = Arc::new(AtomicUsize::new(0));
-        let sending = Sending(Arc::clone(venue), Arc::clone(&sends));
-        Arc::new(Self {
-            venue: Arc::clone(venue),
-            queue: AnchorQueue::spawn("test-queued-anchors", sending),
-            sends,
-            stale: Mutex::new(None),
-            injected: Mutex::default(),
-        })
-    }
-
-    /// A single node anchoring through `self`.
-    fn cluster(self: &Arc<Self>, clock: WindowClock) -> Cluster {
-        let client: Arc<dyn VenueClient> = self.clone();
-        Cluster::in_space(1, Some(clock), move |_, config: &mut Config| {
-            config.venue = Some(Arc::clone(&client));
-        })
-    }
-}
-
-/// How the queue sends to the model venue, counting each send.
-struct Sending(Arc<ModelVenue>, Arc<AtomicUsize>);
-
-impl AnchorSend for Sending {
-    fn send(&self, anchor: &Anchor) -> Fate {
-        self.1.fetch_add(1, Ordering::SeqCst);
-        match self.0.anchor(anchor) {
-            Ok(_) => Fate::Done,
-            Err(AnchorRefusal::Open | AnchorRefusal::Unregistered | AnchorRefusal::Stopped) => {
-                Fate::Again(Duration::from_millis(50))
-            }
-            Err(AnchorRefusal::Key) => Fate::Resign,
-            Err(_) => Fate::Dead,
-        }
-    }
-
-    /// The venue's last anchored window at or past it, or aged.
-    fn settled(&self, anchor: &Anchor) -> bool {
-        let passed = self
-            .0
-            .anchors(&anchor.space)
-            .iter()
-            .any(|held| held.window >= anchor.window);
-        let aged = self
-            .0
-            .time()
-            .zip(self.0.clock(&anchor.space))
-            .is_some_and(|(now, clock)| {
-                clock
-                    .boundary(anchor.window)
-                    .is_some_and(|boundary| now.saturating_sub(boundary) > MAX_ROOT_AGE_MS)
-            });
-        passed || aged
-    }
-}
-
-vos_venue::forward_venue!(Queued => venue; forward [id, submit, anchored, status, time] {
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
-        if !self.queue.push(anchor) {
-            return Err(AnchorRefusal::Key);
-        }
-        Ok(Anchored::Queued)
-    }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        let stale = self.stale.lock().unwrap().clone();
-        stale.unwrap_or_else(|| self.venue.anchor_keys(space))
-    }
-
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        let injected = self.injected.lock().unwrap().clone();
-        [self.queue.unsettled(space), injected].concat()
-    }
-});
-
-/// Set node `number`'s clock past `window`'s close, leaving the venue's,
-/// and wait until its replica of the representative has closed it.
-fn node_closed(cluster: &Cluster, clock: &WindowClock, representative: AgentId, window: u64) {
-    cluster.set_clock(1, past_close(clock, window));
-    wait_until(
-        &format!("the representative closes window {window}"),
-        || closed_on(cluster.node(1), representative, window),
-    );
-}
-
-/// A client hands back anchors this node never signed: window 0's, once
-/// it is anchored, of another root signed by the node's key, and of a root
-/// signed by a key not the node's. The leader signs neither again: the
-/// venue is sent nothing more, holds window 0's root as anchored, and keeps
-/// no evidence.
-#[test]
-fn an_anchor_handed_back_that_this_node_did_not_make_is_not_signed() {
-    let clock = clock();
-    let anchoring = Anchoring::new();
-    let queued = Queued::over(&anchoring.venue);
-    let mut cluster = queued.cluster(clock);
-    anchoring.register(&cluster);
-    let representative = cluster.representative(&[1]);
-    let space = cluster.space.id();
-    let venue = &anchoring.venue;
-    anchoring.set_venue(past_close(&clock, 0));
-    node_closed(&cluster, &clock, representative, 0);
-    wait_until("window 0 anchored", || windows(&anchoring, &cluster) == [0]);
-    let held = venue.anchors(&space)[0];
-    cluster.stop(1);
-    let secret = vos_node::store::Fjall::open(cluster.dirs[0].path().join(vos_node::STORE))
-        .unwrap()
-        .node_secret()
-        .unwrap()
-        .unwrap();
-    cluster.start(1);
-    let sign = |key: &SigningKey, root: [u8; 32]| {
-        let mut anchor = Anchor {
-            root,
-            signer: key.verifying_key().to_bytes(),
-            ..held
-        };
-        anchor.signature = key.sign(&anchor.digest(&venue.id())).to_bytes();
-        anchor
-    };
-    let ours = sign(&SigningKey::from_bytes(&secret), [0xee; 32]);
-    assert_eq!(ours.signer, held.signer, "the node's key");
-    let foreign = sign(&SigningKey::from_bytes(&[9; 32]), [0xef; 32]);
-    *queued.injected.lock().unwrap() = vec![ours, foreign];
-    cluster.leader(representative);
-    let sent = queued.sends.load(Ordering::SeqCst);
-    std::thread::sleep(Duration::from_secs(6));
-    assert_eq!(queued.sends.load(Ordering::SeqCst), sent, "nothing sent");
-    assert_eq!(venue.anchors(&space), [held]);
-    assert!(venue.evidence().is_empty());
-    assert_eq!(venue.status(&space), Status::Active);
 }

@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use vos_venue::vos_statement::{ProgramId, Refusal, Statement, StatementId};
-use vos_venue::{NotAccepted, Unjudged, VenueClient};
+use vos_venue::vos_statement::{ProgramId, Statement, StatementId};
+use vos_venue::{SubmitOutcome, VenueClient};
 use vos_wire::ids::{AgentId, ProgramHash};
 use vos_wire::result::Attest;
 use vos_wire::{SpaceId, WindowClock};
@@ -106,7 +106,7 @@ pub struct Options {
     /// proved here.
     pub patience: Duration,
     /// How long a submission whose answer was lost, or that the venue
-    /// refused for now ([`vos_venue::transient`]), waits before it goes
+    /// refused for now ([`SubmitOutcome::Retry`]), waits before it goes
     /// again, doubled each time.
     pub retry: Duration,
 }
@@ -564,7 +564,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
     /// Submit the led agents' proved statements that are recorded in their
     /// agents and whose roots the venue holds anchored: each handed over
     /// once its job says so, a repeat counted as accepted, a refusal that
-    /// may not hold later ([`vos_venue::transient`]) submitted again after
+    /// may not hold later ([`SubmitOutcome::Retry`]) submitted again after
     /// a backoff until its anchor ages. The number handed over.
     fn submit(&mut self, jobs: &[(StatementId, Job)]) -> Result<usize, String> {
         let mut handed = 0;
@@ -629,8 +629,11 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         Ok(handed)
     }
 
-    /// The venue's verdict on `statement` with its proof's `bytes`, as
-    /// `job`'s next state: none while it goes again later.
+    /// The venue's outcome of `statement` with its proof's `bytes`, as
+    /// `job`'s next state: none while it goes again later. A venue's
+    /// failure to judge it counts towards [`MAX_RESUBMITS`]; the rest that
+    /// go again (its anchor yet to land, the paying space's configuration
+    /// or funds, an answer lost) go until its anchor ages.
     fn judged(
         &mut self,
         id: StatementId,
@@ -638,74 +641,34 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         statement: &Statement,
         bytes: &[u8],
     ) -> Option<State> {
-        let repeated = Refusal::Repeated.code();
-        let state = match self.venue.submit(statement, bytes) {
-            Ok(_) => State::Accepted,
-            Err(NotAccepted::Refused(code)) if code == repeated => State::Accepted,
-            Err(NotAccepted::Refused(code)) if vos_venue::transient(code) => {
-                let unjudged = code >= vos_venue::UNJUDGED_FROM;
-                let (wait, count) = self.retry_later(id, unjudged);
-                // `Unanchored` goes again until the anchor ages; a
-                // failure to judge a bounded number of times.
-                if unjudged && count > MAX_RESUBMITS {
-                    tracing::error!(
-                        agent = job.agent.0,
-                        code,
-                        "a statement the venue failed to judge, every time: refused"
-                    );
-                    State::Refused(code)
-                } else {
-                    tracing::warn!(
-                        agent = job.agent.0,
-                        code,
-                        seconds = wait.as_secs(),
-                        "a statement refused for now: submitted again later"
-                    );
-                    return None;
-                }
-            }
-            Err(NotAccepted::Refused(code)) => {
+        let code = match self.venue.submit(statement, bytes) {
+            SubmitOutcome::Accepted => return Some(State::Accepted),
+            SubmitOutcome::Refused(code) => {
                 tracing::error!(
                     agent = job.agent.0,
                     code,
                     "a statement refused by the venue"
                 );
-                State::Refused(code)
+                return Some(State::Refused(code));
             }
-            Err(NotAccepted::Unjudged(why)) => {
-                // A rootless statement has no deadline: its answers
-                // lost count, a bounded number of times, and then it
-                // goes once more, a repeat (`Refusal::Repeated`)
-                // counted as accepted, an acceptance whose answer was
-                // lost. Funding and the configuration are the
-                // operator's, and do not count.
-                let lost = why == Unjudged::Unknown;
-                let (wait, count) = self.retry_later(id, lost);
-                if statement.roots.is_empty() && count > MAX_RESUBMITS {
-                    match self.venue.submit(statement, bytes) {
-                        Ok(_) => State::Accepted,
-                        Err(NotAccepted::Refused(code)) if code == repeated => State::Accepted,
-                        Err(NotAccepted::Refused(code)) => State::Refused(code),
-                        Err(NotAccepted::Unjudged(why)) => {
-                            tracing::error!(
-                                agent = job.agent.0,
-                                ?why,
-                                "a rootless statement never judged: dead"
-                            );
-                            State::Dead
-                        }
-                    }
-                } else {
-                    tracing::warn!(
-                        agent = job.agent.0,
-                        ?why,
-                        seconds = wait.as_secs(),
-                        "a statement not judged: submitted again later"
-                    );
-                    return None;
-                }
-            }
+            SubmitOutcome::Retry(code) => code,
         };
-        Some(state)
+        let unjudged = (vos_venue::UNJUDGED_FROM..vos_venue::UNJUDGED).contains(&code);
+        let (wait, count) = self.retry_later(id, unjudged);
+        if unjudged && count > MAX_RESUBMITS {
+            tracing::error!(
+                agent = job.agent.0,
+                code,
+                "a statement the venue failed to judge, every time: refused"
+            );
+            return Some(State::Refused(code));
+        }
+        tracing::warn!(
+            agent = job.agent.0,
+            code,
+            seconds = wait.as_secs(),
+            "a statement not accepted for now: submitted again later"
+        );
+        None
     }
 }

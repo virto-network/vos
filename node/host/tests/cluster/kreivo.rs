@@ -20,10 +20,10 @@ use vos_venue::kreivo::mock::transport::MockChain;
 use vos_venue::kreivo::mock::types::{AuthorityInfo, SpaceInfo, SpaceStatus};
 use vos_venue::kreivo::mock::{Account, Chain, Constants, Origin, keys};
 use vos_venue::kreivo::{KreivoVenue, Options};
-use vos_venue::{AnchorRefusal, Anchored, Status, VenueClient};
+use vos_venue::{AnchorOutcome, Status, VenueClient};
 use vos_wire::ids::AgentId;
 use vos_wire::peer::NodeNumber;
-use vos_wire::vos_anchor::{Anchor, SpaceId, VenueId, WindowClock};
+use vos_wire::vos_anchor::{Anchor, VenueId, WindowClock};
 
 use crate::common::{Cluster, wait_until};
 use crate::support::clock;
@@ -33,30 +33,22 @@ const UNITS: u128 = 1_000_000_000_000;
 const VENUE: VenueId = VenueId([0x6b; 32]);
 const CONTROLLER: [u8; 32] = [0xc0; 32];
 
-/// A node's client, as the leader reaches it: every anchor timed, and a
-/// listing of anchor keys the test may lead with.
+/// A node's client, as the leader reaches it: every anchor timed.
 struct Watched {
     inner: KreivoVenue,
     anchors: AtomicUsize,
     /// The slowest anchor's answer, in microseconds.
     slowest: AtomicU64,
-    extra: Arc<Mutex<Vec<[u8; 32]>>>,
 }
 
-vos_venue::forward_venue!(Watched => inner; forward [id, submit, anchored, status, time, unsettled] {
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
+vos_venue::forward_venue!(Watched => inner; forward [id, submit, anchored, anchor_keys, status, held, time] {
+    fn anchor(&self, anchor: &Anchor) -> AnchorOutcome {
         let start = Instant::now();
         let answer = self.inner.anchor(anchor);
         let took = start.elapsed().as_micros() as u64;
         self.slowest.fetch_max(took, Ordering::SeqCst);
         self.anchors.fetch_add(1, Ordering::SeqCst);
         answer
-    }
-
-    fn anchor_keys(&self, space: &SpaceId) -> Vec<[u8; 32]> {
-        let mut keys = self.extra.lock().unwrap().clone();
-        keys.extend(self.inner.anchor_keys(space));
-        keys
     }
 });
 
@@ -74,7 +66,6 @@ struct Kreivo {
     chain: Arc<MockChain>,
     clock: OffsetClock,
     clients: Arc<Mutex<Vec<Client>>>,
-    extra: Arc<Mutex<Vec<[u8; 32]>>>,
 }
 
 impl Kreivo {
@@ -87,18 +78,13 @@ impl Kreivo {
             chain,
             clock,
             clients: Arc::default(),
-            extra: Arc::default(),
         }
     }
 
     /// Each node's config: its client, signing as its account, made once
     /// per node however many configs are made for it.
     fn tuning(&self) -> impl Fn(NodeNumber, &mut Config) + Send + Sync + 'static {
-        let (chain, clients, extra) = (
-            Arc::clone(&self.chain),
-            Arc::clone(&self.clients),
-            Arc::clone(&self.extra),
-        );
+        let (chain, clients) = (Arc::clone(&self.chain), Arc::clone(&self.clients));
         move |number, config| {
             let space =
                 vos_wire::vos_anchor::space_id(config.space.as_ref().unwrap().genesis().unwrap());
@@ -119,7 +105,6 @@ impl Kreivo {
                     inner: KreivoVenue::over(transport, &[space], space, options),
                     anchors: AtomicUsize::new(0),
                     slowest: AtomicU64::new(0),
-                    extra: Arc::clone(&extra),
                 });
                 clients.push((number, account, Arc::clone(&watched)));
                 watched

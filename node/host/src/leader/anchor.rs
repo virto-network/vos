@@ -1,14 +1,14 @@
 //! The representative's leader's anchoring: the anchor of each closed
 //! window's space root `S_w`, signed with this node's key once the venue
 //! lists it and handed to the venue inside the batch that
-//! closes it; those the venue's client hands back, or that an earlier
-//! leadership left waiting, taken up and signed again.
+//! closes it; those an earlier leadership left waiting taken up and
+//! signed again.
 
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 
 use ed25519_dalek::Signer;
-use vos_venue::AnchorRefusal;
+use vos_venue::AnchorOutcome;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
 use vos_wire::vos_anchor::{Anchor, RootKind, RootRead, space_root};
@@ -43,13 +43,6 @@ pub(super) struct Anchoring {
     /// unsent, among those whose cut roots this replica keeps: not taken
     /// up again.
     refused: BTreeSet<u64>,
-    /// The last anchor this leadership signed of each window still
-    /// waiting, kept or handed back: an anchor handed back that it has
-    /// since replaced is not taken up.
-    signed: BTreeMap<u64, Anchor>,
-    /// Anchors handed back whose root is not the space's at their window,
-    /// by the cut root this replica keeps: never signed again.
-    foreign: HashSet<Anchor>,
     /// When this leadership last took up the anchors left waiting by its
     /// cut roots: at its first batch, then a window length later.
     seeded: Option<Instant>,
@@ -70,50 +63,10 @@ impl Leader {
         waiting.into_iter().chain(self.reseed_wait()).min()
     }
 
-    /// The anchors the venue's client handed back to be signed again
-    /// ([`vos_venue::VenueClient::unsettled`]) that this node signed, of
-    /// its space's root, over this venue's digest, and that this
-    /// leadership has neither taken up, nor settled since (a later anchor of
-    /// the window it signed settled), nor settled for good. An anchor
-    /// another key signed, of another kind or space, or over another
-    /// digest, is no anchor of this node's: it is never signed again.
-    fn handed_back(&self) -> Vec<Anchor> {
-        let Some(venue) = self.inner.venue.as_ref() else {
-            return Vec::new();
-        };
-        let (space, _) = self.inner.space_and_clock();
-        let ours = self.inner.node_id.0;
-        let id = venue.id();
-        venue
-            .unsettled(&space)
-            .into_iter()
-            .filter(|anchor| {
-                let signed = anchor.space == space
-                    && anchor.kind == RootKind::Space
-                    && anchor.signer == ours
-                    && vos_venue::signed(anchor, &id);
-                let window = anchor.window;
-                let settled_since = self.anchoring.anchored.contains(&window)
-                    && self
-                        .anchoring
-                        .signed
-                        .get(&window)
-                        .is_some_and(|last| last != anchor);
-                signed
-                    && !settled_since
-                    && !self.anchoring.foreign.contains(anchor)
-                    && !self.anchoring.unanchored.contains_key(&window)
-                    && !self.anchoring.refused.contains(&window)
-            })
-            .collect()
-    }
-
     /// How long until the representative's leader takes up anchors left
-    /// waiting: at once for one the venue's client handed back, and its
-    /// cut roots ([`Leader::seed_waiting`]) a window length after it last
-    /// did; an idle leader looks for anchors handed back a recheck apart,
-    /// as a client hands them back on its own thread; at once before this
-    /// leadership has. None with no venue.
+    /// waiting by its cut roots ([`Leader::seed_waiting`]): a window length
+    /// after it last did, at once before this leadership has. None with no
+    /// venue.
     fn reseed_wait(&self) -> Option<Duration> {
         self.inner.venue.as_ref()?;
         if !self.represents() {
@@ -122,50 +75,25 @@ impl Leader {
         let Some(seeded) = self.anchoring.seeded else {
             return Some(Duration::ZERO);
         };
-        if !self.handed_back().is_empty() {
-            return Some(Duration::ZERO);
-        }
         let (_, clock) = self.inner.space_and_clock();
         let reseed = Duration::from_millis(clock.length_ms).saturating_sub(seeded.elapsed());
         Some(reseed.min(ANCHOR_RECHECK))
     }
 
-    /// Take up the anchors the venue's client handed back
-    /// ([`Leader::handed_back`]): each root signed again, by this node's key, whether or not this replica still keeps its cut
-    /// root; where it keeps it, only a root that is the space's root over
-    /// it, `S_w`, which an anchor still waiting holds already. Whether to
-    /// take up the cut roots' too: at a leadership's first batch, then a
+    /// Whether to take up the anchors left waiting by the cut roots
+    /// ([`Leader::seed_waiting`]): at a leadership's first batch, then a
     /// window length after it last did.
-    pub(super) fn take_up(&mut self, snapshot: &Snapshot) -> Result<bool, Fault> {
+    pub(super) fn take_up(&mut self) -> bool {
         if self.inner.venue.is_none() || !self.represents() {
-            return Ok(false);
+            return false;
         }
-        let (space, clock) = self.inner.space_and_clock();
-        for anchor in self.handed_back() {
-            let window = anchor.window;
-            let cut = roots::cut_root(snapshot, self.id, window)?;
-            let computed = cut.map(|(root, _)| space_root(&space, window, &root));
-            if computed.is_some_and(|root| root != anchor.root) {
-                self.anchoring.foreign.insert(anchor);
-                self.alert(
-                    window,
-                    "the venue's client handed back an anchor whose root is not the space's at \
-                     its window; it is not signed again",
-                );
-                continue;
-            }
-            self.anchoring.anchored.remove(&window);
-            self.anchoring
-                .unanchored
-                .entry(window)
-                .or_insert(anchor.root);
-        }
+        let (_, clock) = self.inner.space_and_clock();
         let every = Duration::from_millis(clock.length_ms);
         let due = self.anchoring.seeded.is_none_or(|at| at.elapsed() >= every);
         if due {
             self.anchoring.seeded = Some(Instant::now());
         }
-        Ok(due)
+        due
     }
 
     /// Take up the anchors left waiting, by an earlier leadership or by
@@ -173,8 +101,8 @@ impl Leader {
     /// replica still keeps (the representative's last
     /// [`defaults::CUT_KEEP`] windows) and whose root the venue does not
     /// hold anchored, whether never handed over, handed over and dropped
-    /// by the venue's client to be signed again, or refused while the
-    /// space was not registered there yet. Its close was sent, so no unsent
+    /// by the venue's client, or refused while the space was not
+    /// registered there yet. Its close was sent, so no unsent
     /// close names it; the root is the representative's at its cut, the
     /// one its close carried.
     pub(super) fn seed_waiting(&mut self, snapshot: &Snapshot) -> Result<(), Fault> {
@@ -212,20 +140,9 @@ impl Leader {
                 self.anchoring.unanchored.entry(window).or_insert(root);
             }
         }
-        let handed: Vec<Anchor> = venue.unsettled(&space);
-        let back: Vec<u64> = handed.iter().map(|anchor| anchor.window).collect();
         self.anchoring
             .refused
-            .retain(|window| kept.contains(window) || back.contains(window));
-        let waiting = |window: &u64| {
-            kept.contains(window)
-                || back.contains(window)
-                || self.anchoring.unanchored.contains_key(window)
-        };
-        self.anchoring
-            .foreign
-            .retain(|anchor| handed.contains(anchor));
-        self.anchoring.signed.retain(|window, _| waiting(window));
+            .retain(|window| kept.contains(window));
         Ok(())
     }
 
@@ -304,56 +221,39 @@ impl Leader {
             signature: [0; 64],
         };
         anchor.signature = key.sign(&anchor.digest(&venue.id())).to_bytes();
-        self.anchoring.signed.insert(window, anchor);
-        let answer = venue.anchor(&anchor);
-        match answer {
-            Ok(anchored) => {
-                tracing::debug!(window, ?anchored, "anchored the space's root");
+        match venue.anchor(&anchor) {
+            AnchorOutcome::Taken => {
+                tracing::debug!(window, "anchored the space's root");
                 true
             }
-            Err(AnchorRefusal::Open) => {
+            AnchorOutcome::NotYet => {
                 tracing::info!(
                     window,
-                    "the venue has not closed the window yet; anchoring again"
+                    "the venue does not take the anchor yet; anchoring again"
                 );
                 false
             }
-            Err(AnchorRefusal::Key) => {
+            AnchorOutcome::Unlisted(code) => {
                 self.alert(
                     window,
-                    "the venue no longer lists this node's key; anchoring again once it does",
+                    &format!(
+                        "the venue does not list this node's key ({code}); anchoring again once \
+                         it does"
+                    ),
                 );
                 false
             }
-            Err(AnchorRefusal::Stopped) => {
+            AnchorOutcome::Stopped(code) => {
                 self.alert(
                     window,
-                    "the space is ended at the venue, for an equivocation, or blocked; anchoring \
-                     again",
+                    &format!(
+                        "the space is ended or blocked at the venue ({code}); anchoring again"
+                    ),
                 );
                 false
             }
-            Err(AnchorRefusal::Unregistered) => {
-                self.alert(
-                    window,
-                    "the space is not registered at the venue, or its client has not read the \
-                     registration yet; anchoring again",
-                );
-                false
-            }
-            Err(AnchorRefusal::Equivocation) => {
-                tracing::error!(
-                    window,
-                    "the venue holds another root of the space at this window, signed by a \
-                     listed anchor key: that key is compromised or its node faulty. This node's \
-                     anchor goes as the evidence, which ends the space for good; it re-founds \
-                     under a new genesis"
-                );
-                self.anchoring.refused.insert(window);
-                true
-            }
-            Err(refusal) => {
-                tracing::error!(window, ?refusal, "the venue refused the space's root");
+            AnchorOutcome::Never(code) => {
+                tracing::error!(window, code, "the venue refused the space's root for good");
                 self.anchoring.refused.insert(window);
                 true
             }

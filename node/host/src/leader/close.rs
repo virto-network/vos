@@ -88,7 +88,7 @@ impl Leader {
     /// in window order, each window's anchor handed to the venue first
     /// ([`Leader::anchor_due`]).
     pub(super) fn closes(&mut self, snapshot: &Snapshot) -> Result<Closes, Fault> {
-        if self.take_up(snapshot)? {
+        if self.take_up() {
             self.seed_waiting(snapshot)?;
         }
         let unsent = unsent(snapshot, self.id, self.represents())?;

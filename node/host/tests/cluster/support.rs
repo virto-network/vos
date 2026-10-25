@@ -13,8 +13,8 @@ use vos_node::roots::{self, AgentStore};
 use vos_node::store::EntryKind;
 use vos_node::{Config, Node, Reply};
 use vos_tree::{Hash, NodeStore};
-use vos_venue::vos_statement::{Refusal, Statement, StatementId};
-use vos_venue::{ModelVenue, NotAccepted, VenueClient};
+use vos_venue::vos_statement::{Refusal, Statement};
+use vos_venue::{ModelVenue, SubmitOutcome, VenueClient};
 use vos_wire::batch::Request;
 use vos_wire::ids::{AgentId, InstanceId, MapId, MethodId, RequestId, Session};
 use vos_wire::keys::{self, Transform};
@@ -467,14 +467,14 @@ impl Judging {
     }
 }
 
-vos_venue::forward_venue!(Judging => model; forward [id, anchor, anchor_keys, status, time, unsettled] {
-    fn submit(&self, statement: &Statement, _: &[u8]) -> Result<StatementId, NotAccepted> {
+vos_venue::forward_venue!(Judging => model; forward [id, anchor, anchor_keys, status, held, time] {
+    fn submit(&self, statement: &Statement, _: &[u8]) -> SubmitOutcome {
         self.submissions.fetch_add(1, Ordering::SeqCst);
         let id = statement.id();
         if !self.accepted.lock().unwrap().insert(id.0) {
-            return Err(Refusal::Repeated.into());
+            return SubmitOutcome::judged(Refusal::Repeated.code());
         }
-        Ok(id)
+        SubmitOutcome::Accepted
     }
 
     fn anchored(&self, root: &RootRead) -> bool {

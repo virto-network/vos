@@ -80,7 +80,7 @@ fn prove(name: &str, actor: &str, attest: &Attest) -> Proved {
     let venue = Venue::pinned(VenueId([0x7e; 32]), &[genesis(1)], id);
     venue.anchor(&attest.roots[0]).expect("anchored");
     let verdict = vos_venue::VenueClient::submit(&venue.venue, &statement, &proof);
-    assert_eq!(vos_venue::code(&verdict), 0, "{name}: accepted");
+    assert_eq!(verdict.code(), 0, "{name}: accepted");
 
     let proved = Proved {
         rerun,

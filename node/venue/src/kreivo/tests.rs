@@ -1,12 +1,13 @@
 //! The mock under the venue rules' suite, and an ended space's deposit and
 //! sovereign account; [`KreivoVenue`] over the mock: an anchor taken at
 //! once and sent in the background, the pallet judging it; an anchor over
-//! another root, sent before or after it is held, the equivocation's
-//! evidence, which ends the space; an open window sent again a block
-//! later; a block and a pause sending nothing until they pass; the
-//! budget's refusal and a short sovereign account alerting; a lost answer
-//! and a dropped send never sending a call twice; statements judged through
-//! the client; every pallet error mapped.
+//! another root not sent until the leader, having read that root, offers
+//! it again, then sent as the equivocation's evidence, which ends the
+//! space; an open window sent again a block later; a block and a pause
+//! sending nothing; the budget's refusal and a short sovereign account
+//! alerting; a lost answer and a dropped send never sending a call twice;
+//! a key the venue stops listing answered unlisted; statements judged
+//! through the client; every pallet error mapped.
 
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -24,10 +25,10 @@ use super::conformance::submits::g7_chain;
 use super::conformance::world::{AUTHORITY_F, F};
 use super::mock::transport::{Fault, MockChain};
 use super::mock::{Account, Chain, Constants, Origin, Verdict};
-use super::send::{Answer, answer, judged};
+use super::send::{judged, outcome_of};
 use super::transport::{Included, Lost, SendError, Sent, Signed, Transport};
 use super::{Alert, KreivoVenue, Options, Sender};
-use crate::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
+use crate::{AnchorOutcome, Held, Status, SubmitOutcome, UNJUDGED, VenueClient};
 use vos_statement::Refusal;
 
 const UNITS: u128 = 1_000_000_000_000;
@@ -198,9 +199,9 @@ impl Setup {
 
 /// An anchor is taken at once while the chain takes its time, lands in
 /// the background, and is then held. The client does not judge anchors:
-/// the same anchor again, and one of a window behind the last, are sent,
-/// and settled by the pallet's answers, `AlreadyAnchored` and
-/// `WindowNotAfterLast`, without an alert.
+/// the same anchor again is taken unsent, the venue holding its root; one
+/// of a window behind the last, at which it holds none, is never taken,
+/// without an alert.
 #[test]
 fn an_anchor_is_taken_at_once_and_lands() {
     let setup = Setup::new(true);
@@ -210,11 +211,14 @@ fn an_anchor_is_taken_at_once_and_lands() {
         venue.anchor_keys(&setup.space),
         [setup.key.verifying_key().to_bytes()]
     );
-    setup.chain.set_latency(Duration::from_millis(300));
+    // The chain takes a second a call; both answers come well within it,
+    // on a loaded host too.
+    setup.chain.set_latency(Duration::from_secs(1));
     let start = Instant::now();
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
-    assert!(start.elapsed() < Duration::from_millis(100), "no wait");
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
+    let took = start.elapsed();
+    assert!(took < Duration::from_millis(500), "no wait: {took:?}");
     wait_until("window 5 lands", || setup.anchored_window(5));
     wait_until("the queue empties", || venue.queued() == 0);
     assert_eq!(setup.anchors_sent(), 1);
@@ -230,11 +234,18 @@ fn an_anchor_is_taken_at_once_and_lands() {
         ..read
     }));
     setup.chain.set_latency(Duration::ZERO);
-    for window in [5, 4] {
-        assert_eq!(venue.anchor(&setup.anchor(window, 1)), Ok(Anchored::Queued));
-        wait_until("the queue empties", || venue.queued() == 0);
-    }
-    assert_eq!(setup.anchors_sent(), 3);
+    assert_eq!(venue.held(&setup.space, 5), Held::Root([1; 32]));
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
+    assert_eq!(venue.queued(), 0, "held: not queued");
+    wait_until("window 4 read", || {
+        venue.held(&setup.space, 4) == Held::Nothing
+    });
+    assert_eq!(
+        venue.anchor(&setup.anchor(4, 1)),
+        AnchorOutcome::Never(Error::WindowNotAfterLast as u32)
+    );
+    assert_eq!(venue.held(&setup.space, 6), Held::Nothing, "past the last");
+    assert_eq!(setup.anchors_sent(), 1);
     assert!(!setup.anchored_window(4), "a window behind the last");
     assert!(venue.alerts().is_empty(), "{:?}", venue.alerts());
 }
@@ -313,25 +324,43 @@ impl Setup {
     }
 }
 
+impl Setup {
+    /// `venue` offered the node's anchor of window 5 while the venue holds
+    /// the attacker's root there: not sent, the root read; offered again
+    /// once read, as the leader does once its divergence guard passed, it
+    /// goes as the evidence.
+    fn offer_over(&self, venue: &KreivoVenue, stolen: &SigningKey) {
+        wait_until("the attacker's root read", || {
+            venue.held(&self.space, 5) == Held::Root([9; 32])
+        });
+        wait_until("nothing queued", || venue.queued() == 0);
+        assert_eq!(self.anchors_sent(), 0, "not sent over another root");
+        assert_eq!(venue.anchor(&self.anchor(5, 1)), AnchorOutcome::Taken);
+        self.evidence_lands(venue, stolen);
+    }
+}
+
 /// A listed key stolen anchors another root first: the node's anchor is
-/// sent all the same, and the pallet keeps it as the evidence, which ends
-/// the space; its anchors are then refused.
+/// not sent over it until the leader, having read that root, offers it
+/// again; then the pallet keeps it as the evidence, which ends the space;
+/// its anchors are then stopped.
 #[test]
 fn an_anchor_over_another_root_goes_as_evidence() {
     let setup = Setup::new(false);
     let stolen = setup.stolen();
     setup.chain.with(|chain| setup.attack(chain, &stolen));
     let venue = setup.venue();
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
-    setup.evidence_lands(&venue, &stolen);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
+    setup.offer_over(&venue, &stolen);
     assert_eq!(
         venue.anchor(&setup.anchor(6, 1)),
-        Err(AnchorRefusal::Stopped)
+        AnchorOutcome::Stopped(Error::SpaceNotActive as u32)
     );
 }
 
 /// A listed key stolen anchors another root after the node's anchor was
-/// queued, before it went: the node's goes as the evidence.
+/// queued, before it went: the node's is not sent until offered again,
+/// then goes as the evidence.
 #[test]
 fn a_queued_anchor_overtaken_goes_as_evidence() {
     let setup = Setup::new(false);
@@ -341,12 +370,14 @@ fn a_queued_anchor_overtaken_goes_as_evidence() {
         .chain
         .with(|chain| chain.set_storage(keys::paused(), vec![2]));
     read_again(&venue);
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::NotYet);
     setup.chain.with(|chain| {
         chain.set_storage(keys::paused(), vec![0]);
         setup.attack(chain, &stolen);
     });
-    setup.evidence_lands(&venue, &stolen);
+    read_again(&venue);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
+    setup.offer_over(&venue, &stolen);
     wait_until("the queue empties", || venue.queued() == 0);
 }
 
@@ -357,7 +388,7 @@ fn a_root_seen_held_is_not_anchored_once_its_space_ends() {
     let setup = Setup::new(false);
     let stolen = setup.stolen();
     let venue = setup.venue();
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
     wait_until("window 5 lands", || setup.anchored_window(5));
     let read = RootRead {
         kind: RootKind::Space,
@@ -385,7 +416,7 @@ fn a_root_seen_held_is_not_anchored_once_its_space_ends() {
 fn an_open_window_is_sent_again_a_block_later() {
     let setup = Setup::new(true);
     let venue = setup.venue();
-    assert_eq!(venue.anchor(&setup.anchor(6, 1)), Ok(Anchored::Queued));
+    assert_eq!(venue.anchor(&setup.anchor(6, 1)), AnchorOutcome::Taken);
     wait_until("refused once", || setup.anchors_sent() == 1);
     read_again(&venue);
     assert_eq!(setup.anchors_sent(), 1, "it waits a block");
@@ -436,9 +467,9 @@ impl Transport for Hooked {
     }
 }
 
-/// A blocked or ended space is sent nothing: its anchors are refused at
-/// once, and an anchor queued before a block waits until it is active
-/// again.
+/// A blocked or ended space is sent nothing: its anchors are stopped at
+/// once, and an anchor queued before a block is dropped unsent; offered
+/// again once the space is active, it lands.
 #[test]
 fn a_stopped_space_is_sent_nothing() {
     let setup = Setup::new(true);
@@ -451,35 +482,33 @@ fn a_stopped_space_is_sent_nothing() {
         assert!(venue.status(&setup.space).waits());
         assert_eq!(
             venue.anchor(&setup.anchor(5, 1)),
-            Err(AnchorRefusal::Stopped)
+            AnchorOutcome::Stopped(Error::SpaceNotActive as u32)
         );
     }
     setup.set_status(SpaceStatus::Active);
     wait_until("the unblock is read", || {
         venue.status(&setup.space) == Status::Active
     });
-    setup
-        .chain
-        .with(|chain| chain.set_storage(keys::paused(), vec![2]));
-    read_again(&venue);
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    // The open window's anchor, refused `WindowInFuture`, waits a block.
+    assert_eq!(venue.anchor(&setup.anchor(6, 1)), AnchorOutcome::Taken);
+    wait_until("refused once", || setup.anchors_sent() == 1);
     setup.set_status(SpaceStatus::Blocked);
     wait_until("the block is read", || {
         venue.status(&setup.space) == Status::Blocked
     });
-    setup
-        .chain
-        .with(|chain| chain.set_storage(keys::paused(), vec![0]));
-    read_again(&venue);
-    std::thread::sleep(A_WHILE);
-    assert_eq!(setup.anchors_sent(), 0, "nothing sent while blocked");
-    assert_eq!(venue.queued(), 1, "kept");
+    setup.set_now(CLOCK.boundary(6).unwrap() + 1);
+    wait_until("dropped", || venue.queued() == 0);
+    assert_eq!(setup.anchors_sent(), 1, "nothing sent while blocked");
     setup.set_status(SpaceStatus::Active);
-    wait_until("window 5 lands", || setup.anchored_window(5));
-    assert_eq!(setup.anchors_sent(), 1);
+    wait_until("the unblock is read", || {
+        venue.status(&setup.space) == Status::Active
+    });
+    assert_eq!(venue.anchor(&setup.anchor(6, 1)), AnchorOutcome::Taken);
+    wait_until("window 6 lands", || setup.anchored_window(6));
+    assert_eq!(setup.anchors_sent(), 2);
 }
 
-/// Paused anchors are not sent until the pause lifts.
+/// Paused anchors are not taken, and not sent, until the pause lifts.
 #[test]
 fn a_paused_venue_is_sent_no_anchor() {
     let setup = Setup::new(true);
@@ -488,13 +517,14 @@ fn a_paused_venue_is_sent_no_anchor() {
         .chain
         .with(|chain| chain.set_storage(keys::paused(), vec![2]));
     read_again(&venue);
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
-    read_again(&venue);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::NotYet);
     std::thread::sleep(A_WHILE);
     assert_eq!(setup.anchors_sent(), 0);
     setup
         .chain
         .with(|chain| chain.set_storage(keys::paused(), vec![0]));
+    read_again(&venue);
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
     wait_until("window 5 lands", || setup.anchored_window(5));
     assert_eq!(setup.anchors_sent(), 1);
 }
@@ -513,7 +543,7 @@ fn the_budgets_refusal_raises_a_funding_alert() {
         },
     );
     let venue = setup.venue();
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
     wait_until("the funding alert", || {
         venue
             .alerts()
@@ -546,7 +576,7 @@ fn the_budgets_refusal_raises_a_funding_alert() {
     let before = setup.chain.sends().len();
     assert_eq!(
         venue.submit(&statement, &[0]),
-        Err(NotAccepted::Unjudged(Unjudged::Funding))
+        SubmitOutcome::Retry(UNJUDGED)
     );
     assert!(setup.chain.sends().len() - before <= 1, "no submit sent");
     assert!(
@@ -582,7 +612,7 @@ fn a_lost_connection_never_sends_a_call_twice() {
     let setup = Setup::new(true);
     let venue = setup.venue();
     setup.chain.fault(Fault::LoseAnswer);
-    assert_eq!(venue.anchor(&setup.anchor(4, 1)), Ok(Anchored::Queued));
+    assert_eq!(venue.anchor(&setup.anchor(4, 1)), AnchorOutcome::Taken);
     wait_until("the queue empties", || venue.queued() == 0);
     assert!(setup.anchored_window(4));
     assert_eq!(setup.anchors_sent(), 1, "not sent again");
@@ -595,7 +625,7 @@ fn a_lost_connection_never_sends_a_call_twice() {
     assert!(venue.anchored(&read));
 
     setup.chain.fault(Fault::Drop);
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
     wait_until("window 5 lands", || setup.anchored_window(5));
     assert_eq!(setup.anchors_sent(), 3, "the dropped one sent again");
     let included = setup
@@ -618,7 +648,7 @@ fn a_pooled_anchor_lands_once() {
     let setup = Setup::new(true);
     let venue = setup.venue();
     setup.chain.fault(Fault::Pool);
-    assert_eq!(venue.anchor(&setup.anchor(4, 1)), Ok(Anchored::Queued));
+    assert_eq!(venue.anchor(&setup.anchor(4, 1)), AnchorOutcome::Taken);
     wait_until("its bytes are sent again", || setup.anchors_sent() >= 3);
     assert!(!setup.anchored_window(4));
     assert_eq!(venue.queued(), 1, "kept while it may land");
@@ -627,7 +657,7 @@ fn a_pooled_anchor_lands_once() {
     assert!(setup.anchored_window(4));
 
     setup.chain.fault(Fault::Pool);
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
     wait_until("it waits in the pool", || setup.chain.pooled() == 1);
     setup.chain.drop_pool();
     wait_until("window 5 lands", || setup.anchored_window(5));
@@ -641,48 +671,35 @@ fn a_pooled_anchor_lands_once() {
 }
 
 /// A key removed after its anchor was queued: the venue refuses it
-/// (`UnknownAnchorKey`), or the client, once it reads the listing, sends it
-/// no more; it alerts, drops it and hands its window back to be signed
-/// again; an anchor of the window signed by a listed key
-/// is then sent and lands.
+/// (`UnknownAnchorKey`), or the client, once it reads the listing, sends
+/// it no more; it drops it, and answers the anchor unlisted. Listed again,
+/// the anchor is taken, sent and lands.
 #[test]
-fn a_refused_key_hands_the_window_back_to_be_signed_again() {
+fn a_refused_key_is_answered_unlisted() {
     let setup = Setup::new(true);
     let venue = setup.venue();
-    setup
-        .chain
-        .with(|chain| chain.set_storage(keys::paused(), vec![2]));
-    read_again(&venue);
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    assert_eq!(venue.anchor(&setup.anchor(6, 1)), AnchorOutcome::Taken);
+    wait_until("refused once, for its open window", || {
+        setup.anchors_sent() == 1
+    });
     let key = keys::anchor_keys(&setup.space.0, &setup.key.verifying_key().to_bytes());
     let value = setup.chain.with(|chain| chain.storage()[&key].clone());
-    setup.chain.with(|chain| {
-        chain.remove_storage(&key);
-        chain.set_storage(keys::paused(), vec![0]);
-    });
-    wait_until("the window handed back", || {
-        venue.unsettled(&setup.space) == [setup.anchor(5, 1)]
-    });
+    setup.chain.with(|chain| chain.remove_storage(&key));
+    setup.set_now(CLOCK.boundary(6).unwrap() + 1);
+    wait_until("dropped", || venue.queued() == 0);
     assert_eq!(
-        venue.anchor(&setup.anchor(5, 1)),
-        Err(AnchorRefusal::Key),
-        "its key not listed: not taken again"
+        venue.anchor(&setup.anchor(6, 1)),
+        AnchorOutcome::Unlisted(Error::UnknownAnchorKey as u32),
+        "its key not listed"
     );
     // Refused by the venue, or unsent once the client read the listing.
     let refused = setup.anchors_sent();
-    assert!(refused <= 1);
-    assert_eq!(venue.queued(), 0, "dropped");
-    assert!(
-        venue
-            .alerts()
-            .iter()
-            .any(|alert| matches!(alert, Alert::Configuration { .. }))
-    );
+    assert!(refused <= 2);
+    assert!(!setup.anchored_window(6));
     setup.chain.with(|chain| chain.set_storage(key, value));
     read_again(&venue);
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
-    assert!(venue.unsettled(&setup.space).is_empty(), "queued again");
-    wait_until("the anchor lands", || setup.anchored_window(5));
+    assert_eq!(venue.anchor(&setup.anchor(6, 1)), AnchorOutcome::Taken);
+    wait_until("the anchor lands", || setup.anchored_window(6));
     assert_eq!(setup.anchors_sent(), refused + 1);
 }
 
@@ -700,14 +717,14 @@ fn a_venue_reached_late_anchors_once_reached() {
         Ok(chain.transport(Origin::Signed(NODE)) as Arc<dyn Transport>)
     });
     let venue = KreivoVenue::connect(connect, &[setup.space], setup.space, options());
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Err(AnchorRefusal::Open));
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::NotYet);
     assert_eq!(venue.status(&setup.space), Status::Unregistered);
     wait_until("reached and read", || {
         venue.status(&setup.space) == Status::Active
     });
     assert!(tries.load(Ordering::SeqCst) >= 4);
     assert_eq!(venue.id(), VENUE);
-    assert_eq!(venue.anchor(&setup.anchor(5, 1)), Ok(Anchored::Queued));
+    assert_eq!(venue.anchor(&setup.anchor(5, 1)), AnchorOutcome::Taken);
     wait_until("window 5 lands", || setup.anchored_window(5));
 }
 
@@ -753,21 +770,24 @@ fn statements_are_judged_through_the_client() {
         options(),
     );
     let statement = fx.statement();
-    let id = statement.id();
-    assert_eq!(venue.submit(statement, &fx.proof), Ok(id));
+    assert_eq!(venue.submit(statement, &fx.proof), SubmitOutcome::Accepted);
     let sent = chain.sends().len();
-    assert_eq!(venue.submit(statement, &fx.proof), Ok(id), "a repeat");
+    assert_eq!(
+        venue.submit(statement, &fx.proof),
+        SubmitOutcome::Accepted,
+        "a repeat"
+    );
     assert_eq!(chain.sends().len(), sent, "known accepted: not sent");
     let mut other = statement.clone();
     other.output.push(0);
     let refused = venue.submit(&other, &fx.proof);
     assert!(
-        matches!(refused, Err(NotAccepted::Refused(code)) if crate::proof_refused(code)),
+        matches!(refused, SubmitOutcome::Refused(code) if crate::proof_refused(code)),
         "the proof refused against another statement: {refused:?}"
     );
     assert_eq!(
         venue.submit(statement, &fx.tampered),
-        Ok(id),
+        SubmitOutcome::Accepted,
         "known accepted, whatever the proof"
     );
     let mut format = statement.clone();
@@ -775,7 +795,7 @@ fn statements_are_judged_through_the_client() {
     let sent = chain.sends().len();
     assert_eq!(
         venue.submit(&format, &fx.proof),
-        Err(Refusal::Format.into())
+        SubmitOutcome::Refused(Refusal::Format.code())
     );
     assert_eq!(chain.sends().len(), sent, "refused before paying");
     assert!(
@@ -800,32 +820,34 @@ fn a_refused_proof_reports_its_class() {
     );
     assert_eq!(
         venue.submit(fx.statement(), &fx.tampered),
-        Err(NotAccepted::Refused(fx.tampered_code))
+        SubmitOutcome::Refused(fx.tampered_code)
     );
     assert_eq!(
         venue.submit(fx.statement(), &fx.proof),
-        Ok(fx.statement().id())
+        SubmitOutcome::Accepted
     );
 }
 
-/// Every pallet error has its fate (`spaces-pallet.md` §9), and a submit's
-/// events their verdict: `Refused { 6 }` accepted.
+/// Every pallet error has its outcome (`spaces-pallet.md` §9), its code
+/// kept, and a submit's events their outcome: `Refused { 6 }` accepted,
+/// `Refused { 5 }` again later.
 #[test]
 fn every_error_and_refusal_is_mapped() {
     use Error::*;
     for error in (0..=u8::MAX).filter_map(Error::from_index) {
+        let code = error as u32;
         let expected = match error {
-            AlreadyAnchored | WindowNotAfterLast => Answer::Done,
-            WindowInFuture => Answer::Later,
-            WindowTooOld => Answer::Dead(error),
-            SpaceNotActive | Paused => Answer::Wait,
-            InsufficientSovereignBalance | OverBudget => Answer::Funding(error),
-            UnknownAnchorKey => Answer::Resign(error),
-            _ => Answer::Configuration,
+            AlreadyAnchored => AnchorOutcome::Taken,
+            WindowNotAfterLast | WindowTooOld | BadAnchorSignature | BadKind => {
+                AnchorOutcome::Never(code)
+            }
+            NotAuthority | UnknownAnchorKey => AnchorOutcome::Unlisted(code),
+            SpaceNotActive => AnchorOutcome::Stopped(code),
+            _ => AnchorOutcome::NotYet,
         };
-        assert_eq!(answer(Some(error)), expected, "{error:?}");
+        assert_eq!(outcome_of(Some(error)), expected, "{error:?}");
     }
-    assert_eq!(answer(None), Answer::Configuration);
+    assert_eq!(outcome_of(None), AnchorOutcome::NotYet);
     let id = vos_statement::StatementId([7; 32]);
     let refused = |code| Event::Refused {
         payer: [0; 32],
@@ -839,15 +861,19 @@ fn every_error_and_refusal_is_mapped() {
         payer: [0; 32],
         output_hash: [0; 32],
     };
-    assert_eq!(judged(&[accepted], id), Some(Ok(id)));
+    assert_eq!(judged(&[accepted], id), Some(SubmitOutcome::Accepted));
     assert_eq!(
         judged(&[refused(Refusal::Repeated.code())], id),
-        Some(Ok(id))
+        Some(SubmitOutcome::Accepted)
     );
-    for code in [1, 2, 3, 4, 5, 0x101, 0x108] {
+    assert_eq!(
+        judged(&[refused(Refusal::Unanchored.code())], id),
+        Some(SubmitOutcome::Retry(Refusal::Unanchored.code()))
+    );
+    for code in [1, 2, 3, 4, 0x101, 0x108] {
         assert_eq!(
             judged(&[refused(code)], id),
-            Some(Err(NotAccepted::Refused(code)))
+            Some(SubmitOutcome::Refused(code))
         );
     }
     assert_eq!(judged(&[], id), None);

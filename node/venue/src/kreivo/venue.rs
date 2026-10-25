@@ -11,40 +11,41 @@
 //! a time ([`Sender`]).
 //!
 //! The client does not judge an anchor: the pallet does, by the venue
-//! rules (`vos_anchor::venue`), and the client maps its answer. An anchor
-//! is not sent while the space is not active or anchors are paused, by
-//! the client's last read. It is settled by the venue holding it or a
-//! later window (14 `AlreadyAnchored`, 15 `WindowNotAfterLast`), by an
-//! equivocation (the pallet held another root there, signed by a listed
-//! key: this node's anchor is its evidence, and the space ends; an
-//! alert), or for good (17 `WindowTooOld`); otherwise it is kept: 16
-//! `WindowInFuture` a block of the venue's time; 19 and 20 until the space
-//! is active and anchors are not paused; 21 and 27, and
-//! `InvalidTransaction::Payment`, a funding alert, until the next read; 11
-//! `UnknownAnchorKey`, or a signer the space no longer lists by the
-//! client's last read (then unsent), an alert, and the anchor handed back
-//! to the representative's leader to sign again with a key it lists
-//! ([`VenueClient::unsettled`]); the others (7 `NotAuthority`, 12 the
-//! signature, 13 the kind) an alert, and again a window later; the pool's
-//! other refusals an alert, and again after a backoff.
+//! rules (`vos_anchor::venue`), and the client maps its answer onto the
+//! leader's [`AnchorOutcome`] by one table (`send::outcome`,
+//! `spaces-pallet.md` §9). It answers an anchor from its last read: not
+//! yet while it has not read the space, the space is not registered or
+//! anchors are paused; stopped while the space is not active; unlisted
+//! while the space does not list the signer; never for a window the venue
+//! refused for good, or one at or behind the space's last anchored at
+//! which it holds no root; else taken, and queued. The queue's worker
+//! sends it unless the venue already holds a root there: the same root
+//! settles it; another is sent only when the leader offered the anchor
+//! after reading that root ([`VenueClient::held`]), its divergence guard
+//! passed, as the equivocation's evidence, which ends the space. The
+//! pallet's answers are kept: 16 `WindowInFuture` waits a block of the
+//! venue's time; 20 `Paused`, 21 and 27, and `InvalidTransaction::Payment`
+//! (a funding alert) wait for the next read; 11 `UnknownAnchorKey` and 7
+//! `NotAuthority` drop the signer from the listing read, until the next
+//! read; the pool's other refusals an alert, and again after a backoff.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use vos_anchor::venue::{self as rules, Held, Roots};
 use vos_anchor::{Anchor, RootKind, RootRead, SpaceId, VenueId};
-use vos_statement::{Statement, StatementId};
+use vos_statement::Statement;
 
 use super::calls::{
     self, AccountInfo, AnchorRecord, Balance, Call, Error, MAX_PROOF_LEN, MAX_STATEMENT_LEN,
-    SpaceInfo, SpaceStatus, keys,
+    PAUSED_ANCHOR, SpaceInfo, SpaceStatus, keys,
 };
 use super::send::KreivoSend;
 use super::transport::{Backoff, Lost, Sender, Transport};
 use crate::queue::AnchorQueue;
-use crate::{AnchorRefusal, Anchored, NotAccepted, Status, Unjudged, VenueClient};
+use crate::{AnchorOutcome, Held as Holding, Status, SubmitOutcome, UNJUDGED, VenueClient};
 
 /// How the client paces itself, and what it takes a submit to cost.
 #[derive(Clone, Debug)]
@@ -117,9 +118,17 @@ pub(super) struct Known {
     pub(super) keys: Vec<[u8; 32]>,
     /// Its last anchored window (`Last[space][0]`).
     pub(super) last: Option<u64>,
-    /// The roots the client saw anchored, by window: the newest [`HELD`].
-    /// Forgotten when the space is read not active, or ends.
-    held: BTreeMap<u64, [u8; 32]>,
+    /// What the venue holds at the windows the client read (`Anchors[w]`):
+    /// a root, or none. Forgotten when the space is read not active, or
+    /// ends, and each window once it ages.
+    pub(super) held: BTreeMap<u64, Option<[u8; 32]>>,
+    /// The windows at or behind its last the leader asked of, to read.
+    wanted: BTreeSet<u64>,
+    /// The windows the venue refused for good, each with its code.
+    pub(super) never: BTreeMap<u64, u32>,
+    /// The windows at which the leader offered an anchor while the client
+    /// held another root read there: sent as the equivocation's evidence.
+    pub(super) evidence: BTreeSet<u64>,
 }
 
 #[derive(Default)]
@@ -138,10 +147,6 @@ pub(super) struct State {
     /// How many times it has read them.
     reads: u64,
 }
-
-/// The most anchored roots kept of a space, its newest: a leader asks
-/// again only of its last few windows.
-const HELD: usize = 64;
 
 /// The most alerts kept for [`KreivoVenue::alerts`].
 const ALERTS: usize = 256;
@@ -171,21 +176,19 @@ impl State {
     }
 
     /// `space` ended by an equivocation: none of its roots taken as
-    /// anchored.
+    /// anchored, and the space read again.
     pub(super) fn ended(&mut self, space: SpaceId) {
         if let Some(known) = self.spaces.get_mut(&space) {
             known.held.clear();
         }
+        self.refreshed = None;
     }
 
     /// `anchor` seen anchored.
     pub(super) fn held(&mut self, anchor: &Anchor) {
         self.forget((anchor.space, anchor.window));
         let known = self.spaces.entry(anchor.space).or_default();
-        known.held.insert(anchor.window, anchor.root);
-        while known.held.len() > HELD {
-            known.held.pop_first();
-        }
+        known.held.insert(anchor.window, Some(anchor.root));
         known.last = known.last.max(Some(anchor.window));
     }
 }
@@ -402,12 +405,27 @@ impl Shared {
                 .filter_map(|key| key.get(prefix.len()..)?.try_into().ok())
                 .collect();
             let last = self.read::<u64>(&keys::last(&space.0, 0))?;
-            read.push((space, info, keys, last));
+            let wanted: Vec<u64> = self
+                .state()
+                .spaces
+                .get(&space)
+                .map(|known| known.wanted.iter().copied().collect())
+                .unwrap_or_default();
+            let mut held = Vec::new();
+            for window in wanted {
+                let record = keys::anchors(&space.0, RootKind::Space as u8, window);
+                let root = self
+                    .read::<AnchorRecord>(&record)?
+                    .map(|record| record.root);
+                held.push((window, root));
+            }
+            read.push((space, info, keys, last, held));
         }
         let payer = read
             .iter()
             .find(|(space, ..)| *space == self.payer)
             .and_then(|(_, info, ..)| *info);
+        let now = self.state().now;
         let free = match &payer {
             Some(info) => self
                 .read::<AccountInfo>(&keys::account(&info.sovereign))?
@@ -418,11 +436,15 @@ impl Shared {
         };
         let mut state = self.state();
         state.paused = paused;
-        for (space, info, keys, last) in read {
+        for (space, info, keys, last, held) in read {
             let known = state.spaces.entry(space).or_default();
             known.read = true;
             known.info = info;
             known.keys = keys;
+            for (window, root) in held {
+                known.wanted.remove(&window);
+                known.held.entry(window).or_insert(root);
+            }
             // A blocked or ended space's roots are not anchored: what was
             // seen held is read from the venue anew.
             if info.is_none_or(|info| info.status != SpaceStatus::Active) {
@@ -431,6 +453,13 @@ impl Shared {
             // A venue's last window never goes back: a read begun before
             // an anchor landed does not undo the anchor seen held.
             known.last = known.last.max(last);
+            if let (Some(info), Some(now)) = (info, now) {
+                let fresh = |window: &u64| !rules::aged(&info.clock(), *window, now);
+                known.held.retain(|window, _| fresh(window));
+                known.never.retain(|window, _| fresh(window));
+                known.evidence.retain(fresh);
+                known.wanted.retain(fresh);
+            }
         }
         let floor = self
             .options
@@ -454,43 +483,57 @@ impl VenueClient for KreivoVenue {
         self.shared.id.get().copied().unwrap_or(VenueId([0; 32]))
     }
 
-    fn anchor(&self, anchor: &Anchor) -> Result<Anchored, AnchorRefusal> {
+    fn anchor(&self, anchor: &Anchor) -> AnchorOutcome {
         // Signed over the venue's id: one signed before Kreivo was reached
         // goes again, signed anew.
         let Some(id) = self.shared.id.get() else {
-            return Err(AnchorRefusal::Open);
+            return AnchorOutcome::NotYet;
         };
         if !crate::signed(anchor, id) {
-            return Err(AnchorRefusal::Open);
+            return AnchorOutcome::NotYet;
         }
         let mut state = self.shared.state();
-        let known = state.watch(anchor.space);
+        let paused = state.paused & PAUSED_ANCHOR != 0;
+        state.watch(anchor.space);
+        let Some(known) = state.spaces.get_mut(&anchor.space) else {
+            return AnchorOutcome::NotYet;
+        };
         if !known.read {
             self.shared.wake.notify_all();
-            return Err(AnchorRefusal::Open);
+            return AnchorOutcome::NotYet;
         }
         let Some(info) = known.info else {
-            return Err(AnchorRefusal::Unregistered);
+            return AnchorOutcome::NotYet;
         };
         if info.status != SpaceStatus::Active {
-            return Err(AnchorRefusal::Stopped);
+            return AnchorOutcome::Stopped(Error::SpaceNotActive as u32);
+        }
+        if paused {
+            return AnchorOutcome::NotYet;
         }
         if !known.keys.contains(&anchor.signer) {
-            return Err(AnchorRefusal::Key);
+            return AnchorOutcome::Unlisted(Error::UnknownAnchorKey as u32);
+        }
+        let window = anchor.window;
+        if let Some(code) = known.never.get(&window) {
+            return AnchorOutcome::Never(*code);
+        }
+        match known.held.get(&window) {
+            Some(Some(root)) if *root == anchor.root => return AnchorOutcome::Taken,
+            Some(Some(_)) => {
+                known.evidence.insert(window);
+            }
+            Some(None) if rules::passed(known.last, window) => {
+                return AnchorOutcome::Never(Error::WindowNotAfterLast as u32);
+            }
+            _ => {}
         }
         drop(state);
-        if self.queue.dead(&anchor.space, anchor.window) {
-            self.queue.settle(&anchor.space, anchor.window);
-            return Err(AnchorRefusal::Window);
-        }
-        // Its key listed by the last read: queued, even if an anchor of it
-        // by the same key was handed back before the listing changed; one
-        // queued by another key replaced.
-        self.queue.push_listed(anchor);
-        Ok(Anchored::Queued)
+        self.queue.push(anchor);
+        AnchorOutcome::Taken
     }
 
-    fn submit(&self, statement: &Statement, proof: &[u8]) -> Result<StatementId, NotAccepted> {
+    fn submit(&self, statement: &Statement, proof: &[u8]) -> SubmitOutcome {
         let id = statement.id();
         let bytes = statement.encode();
         let space = self.shared.payer;
@@ -499,10 +542,10 @@ impl VenueClient for KreivoVenue {
             self.shared
                 .state()
                 .alert(Alert::Configuration { space, what });
-            return Err(NotAccepted::Unjudged(Unjudged::Configuration));
+            return SubmitOutcome::Retry(UNJUDGED);
         }
         let Some(sender) = self.shared.sender.get() else {
-            return Err(NotAccepted::Unjudged(Unjudged::Unknown));
+            return SubmitOutcome::Retry(UNJUDGED);
         };
         if let Some(verdict) = self.shared.before_paying(statement, &id) {
             return verdict;
@@ -524,7 +567,11 @@ impl VenueClient for KreivoVenue {
             let mut state = self.shared.state();
             let now = state.now;
             let known = state.watch(root.space);
-            (known.info, now, known.held.get(&root.window).copied())
+            (
+                known.info,
+                now,
+                known.held.get(&root.window).copied().flatten(),
+            )
         };
         let (Some(info), Some(now)) = (info, now) else {
             return false;
@@ -561,8 +608,29 @@ impl VenueClient for KreivoVenue {
         self.shared.state().now
     }
 
-    fn unsettled(&self, space: &SpaceId) -> Vec<Anchor> {
-        self.queue.unsettled(space)
+    /// The root read at `window`: none past the space's last anchored;
+    /// unread at or behind it until the reader reads it.
+    fn held(&self, space: &SpaceId, window: u64) -> Holding {
+        let mut state = self.shared.state();
+        state.watch(*space);
+        let Some(known) = state.spaces.get_mut(space) else {
+            return Holding::Unread;
+        };
+        if !known.read {
+            return Holding::Unread;
+        }
+        match known.held.get(&window) {
+            Some(Some(root)) => Holding::Root(*root),
+            Some(None) => Holding::Nothing,
+            None if !rules::passed(known.last, window) => Holding::Nothing,
+            None => {
+                if known.wanted.insert(window) {
+                    state.refreshed = None;
+                    self.shared.wake.notify_all();
+                }
+                Holding::Unread
+            }
+        }
     }
 }
 
