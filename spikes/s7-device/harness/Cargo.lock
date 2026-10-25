@@ -839,6 +839,7 @@ dependencies = [
  "vos-pvm-precompiles",
  "vos-pvm-proof",
  "vos-pvm-proof-verifier",
+ "vos-pvm-recair",
  "vos-tree",
 ]
 
@@ -1240,6 +1241,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-pvm-final-verifier"
+version = "0.1.0"
+dependencies = [
+ "num-traits",
+ "serde",
+ "stwo",
+ "vos-pvm-recair-air",
+]
+
+[[package]]
 name = "vos-pvm-poseidon2"
 version = "0.1.0"
 
@@ -1270,6 +1281,7 @@ dependencies = [
  "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-pvm-proof-derive",
+ "vos-pvm-recair-air",
  "vos-wire",
 ]
 
@@ -1292,6 +1304,37 @@ dependencies = [
  "stwo",
  "stwo-constraint-framework",
  "vos-pvm-proof",
+]
+
+[[package]]
+name = "vos-pvm-recair"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "bytemuck",
+ "getrandom",
+ "num-traits",
+ "rand",
+ "rand_chacha",
+ "rayon",
+ "serde",
+ "stwo",
+ "stwo-constraint-framework",
+ "vos-pvm-final-verifier",
+ "vos-pvm-poseidon2",
+ "vos-pvm-proof",
+ "vos-pvm-recair-air",
+ "vos-wire",
+]
+
+[[package]]
+name = "vos-pvm-recair-air"
+version = "0.1.0"
+dependencies = [
+ "num-traits",
+ "stwo",
+ "stwo-constraint-framework",
+ "vos-pvm-poseidon2",
 ]
 
 [[package]]
