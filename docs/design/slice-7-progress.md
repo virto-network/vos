@@ -49,11 +49,11 @@ requires each venue's call to the core.
   `Refusal::Venue` (7, retired), the `Venue::id` judge input, the rootless
   `Seen` rule, `wrap-rootless.proof`, the final verifier runner's
   `statements` mode, and their tests and fixture cases.
-- **The Kreivo client's pre-checks** (slice 6's F2): `behind()` and the
-  window/age checks on the batch thread; the client queues an anchor of a
-  registered, active space signed by a listed key and lets the pallet
-  answer (`WindowInFuture` → again a block later; `Landed` → the record
-  read back).
+- **The Kreivo client's anchor-rule checks** (slice 6's F2): `behind()`
+  and the window and age checks on the batch thread. The client checks no
+  anchor rule; its reads of the space's status, the pause and the listed
+  keys stay, as pin D′ keeps them, and spare a fee (`WindowInFuture` →
+  again a block later; `Landed` → the record read back).
 
 **Folded:** L4 (strict ed25519 everywhere; a small-order key refused at
 registration as `BadGenesis` and when added as `BadAnchorKey` (30), the
@@ -130,3 +130,58 @@ conformance` byte for byte; `just e2e-chain` green.
 - `BadClock` before the origin and `OutOfRange` merged into the core's
   refusals: an anchor before the space's first window is
   `WindowNotAfterLast`, one before its origin `WindowInFuture`.
+
+### The review's fixes
+
+Fable's review (`research/slice-7/7.1-fable.md`: fix, then merge), folded
+as further commits:
+- **M1:** the anchor rule judges a window's age before its held root, so
+  a second root at an aged window is `Age` whether or not the venue has
+  pruned the first; only a fresh window's second root is evidence. A suite
+  case pins it at the three venues. `spaces.json`'s G4 changed (its stale
+  and before-the-first refusals had sat at aged windows; they now sit at
+  fresh ones, and G4 gains the aged second root, `WindowTooOld`, the space
+  active); G5, G16 and every other vector are byte-identical, and
+  `mutations.json` is unchanged.
+- **M2:** `proving.md` (§3.6's statement rules, §6's venues, §7's
+  equivocation and one venue, A.6's fixture tables) and
+  `clerk-across-spaces.md` follow pin D′.
+- **M3:** one venue a space is the space's discipline, which no venue
+  enforces: a founder may register the same genesis at two venues, and
+  with the same roots a statement is handled at both, with different
+  roots the space forks unseen. Stated in `vos-statement`'s crate doc,
+  `spaces-pallet.md` §0, §6.2 and §6.3, pin D′'s C1 bullet and
+  `simplify.md` C1 (an erratum).
+- **L1:** JAM's refine judges an anchor's signature before the state
+  checks; a suite case takes an anchor failing both its key and its
+  signature as refused by either, and refine's doc and `spaces-pallet.md`
+  §6.1 say so.
+- **L2:** the key-listing rule is the core's `venue::add_key` (small order,
+  listed, at most `MAX_FOUNDING_KEYS`), which the model, the service's
+  `AddKey` and the mock's `add_authority` call; a suite case fills a space's
+  keys; the mock's `MaxAnchorKeys` is the kit's constant.
+- **L3:** `check-venue-rules` also refuses `registrable`, the window
+  lengths, the key bound, `small_order(` and comparisons with the last
+  window anchored, now over jam-dev's commands too, and requires each
+  venue's `add_key`. It caught the two clients' settled check comparing
+  with the last window itself; both now ask the core (`venue::passed`).
+  The clients' sanctioned status and key reads are not flagged.
+- **L5:** the record's line on the Kreivo client corrected (above).
+- **L6:** `spaces-pallet.md` §9's rotation and hand-back language left for
+  7.2's doc pass.
+- The statement model's policy says why its spaces read active from window
+  0.
+
+**Not to run alone (L4):** until 7.2, the representative's leader signs its
+own cut's root (`node/host/src/leader/anchor.rs`), with no replicated
+anchor row and no divergence guard. A deposed leader whose close was not
+committed and a successor can sign two roots for one window: under 7.1
+that honest double-sign ends the space for good. 7.1 lands with 7.2, never
+alone, before any space whose state matters runs on it.
+
+**Gates after the fixes:** `just check` green (`check-venue-rules`: 44
+files, 18 calls); `just conformance` byte for byte; `just e2e-chain` green
+again [measured]: 1,036 s, the same verdicts, latency 47.5 s at Kreivo and
+60.8–109.0 s at JAM, each under its gate; the audit clean over 398
+carriers.
+
