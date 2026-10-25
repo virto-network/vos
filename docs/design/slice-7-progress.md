@@ -503,3 +503,26 @@ machine]:
   (load average about 11), failed one latency gate by 2.2 s (JAM's
   window-2 window statement, 228.8 s against 226.6 s) after every verdict
   had come out as expected; rerun at a load of about 4, green.
+
+### The review's fixes
+
+Fable's review (`research/slice-7/7.8a-fable.md`: merge), its four Lows
+folded as further commits:
+- **L1:** `proving.md`'s `final-verify.elf` gas line labelled as the
+  fixture pinned at 6.22 (146,564 bytes), historical (`1dde2ca7`).
+- **L2:** `teammate-note.md`'s drops: 7.8a carries the fixtures, the
+  vectors' wrap hashes and lengths and the vendored `vos-pvm-recair-air`
+  and `vos-pvm-final-verifier` sources, no pinned program id
+  (`825dd799`).
+- **L3:** the witness digest's unit test also varies the log sizes, the
+  format's number and the masks' height, each its own stream
+  (`7d7e355f`).
+- **L4:** `domain_point_rows` and `fri_fold_rows` state their
+  preconditions (`log_size ≥ 2`, `layers ≥ 2`) as `debug_assert!`s
+  (`18f57223`).
+
+The two nits (`Mode::of` as a `match`; the test helper's mode byte `[2]`,
+which 7.8b's item 27 deletes) are left.
+
+**Gates after the fixes:** `just check` green, 1,400 passed in 109 suites
+[measured].
