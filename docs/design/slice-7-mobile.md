@@ -208,37 +208,43 @@ G–L are M4's and M5's.
 
 ### Pin G: the credential actor and its Poseidon2 tree
 
-- **What it is:** `vos-credentials`, an actor installed in the agent whose
-  methods it guards (the demo's: the ledger's agent). Its tree is a
-  **positional sparse Merkle tree** of Poseidon2-M31, depth 32, kept in
-  its own committed rows: `slot(member) → u32`, keyed by the `member`
-  digest (the next free slot, freed slots reused lowest first), `leaf(slot) → Digest`, the non-empty
-  `node(level, index) → Digest`, the empty subtrees' digests as constants.
-- **The hashes:** through the `0x402` host call (pin H): the VOS host
+The full spec is `identity-and-authority.md` §6 (the actor, its rows, its
+ring, its methods) and `proving.md` §8 (the hash, the tree); pinned by
+7.7.
+- **What it is:** `vos-credentials`, a library actor installed in the
+  agent whose methods it guards (the demo's: the ledger's agent), one an
+  agent, found through the system row `credentials → instance` its install
+  writes. Its tree is a **positional sparse Merkle tree** of Poseidon2-M31
+  compressions, depth 32, in its own plain rows: `slots` (a `member`
+  digest → its slot; freed slots reused lowest first through an ordered
+  `free` table), `nodes` (level, index → the non-empty digests, level 0
+  the leaves), the empty subtrees' digests as constants.
+- **The hashes:** each one `0x402` call (pin H), `C(l, r)`: the VOS host
   serves it natively, a JAM-deployed agent pays the shim's software
   permutation (about 15,800 instructions); so VOS ≡ JAM holds, and the
-  tree is as deterministic as any row. `leaf = compress(TAG_LEAF ‖ slot,
-  member)` with `member` an 8-M31 digest (fixed length, so injective);
-  `node = compress(left, right)`; an empty leaf the zero digest; the tags
-  M31 constants from `BLAKE2b("vos/p2/<name>")`.
-- **Roots:** a replicated ring `roots[i] = (root, batch_time)` of the last
-  64 roots, one written per batch that changed the tree. Enrollment is
-  rare: 32 calls of `0x402` a write. **Freshness** (the Fable review's
-  H2): ingress accepts the current root at any age, and an older one only
-  if its `batch_time` is within `ROOT_MAX_AGE` (10 minutes) of the
-  replica's latest applied batch time, so a removal (revocation) takes
-  effect within it; the ring's count only bounds storage.
-- **The handle** (pin K, S25): a 32-byte value the founder draws once, set
-  at the actor's install and served with `path`; a re-founded space's
-  actor is installed with the same handle.
-- **Paths:** a public query method `path(member) → (root, slot,
-  siblings[32])` and `handle()`, served by any replica, rate-limited per
-  connection (a `member` digest is a pseudonym, and the tree's shape is
-  not secret from its readers). **What it reveals:** asking for a path by key tells the
-  operators which member is about to prove and when; `Anonymous` hides the
-  member from the log's readers and from other agents, not from operators
-  (`identity-and-authority.md` §3 and §8: hiding from operators is full
-  privacy, postponed). Recorded in `SECURITY.md`.
+  tree is as deterministic as any row. `leaf = C(T(leaf), member)`, the
+  slot not hashed (the path places it); a node `C(left, right)`; the empty
+  leaf eight zero words; a tag `T(name)` the block `[t, 0, …, 0]`, `t` from
+  `BLAKE2b-256("vos/p2/" ‖ name)`. 33 calls a write.
+- **Roots:** a replicated ring of the last 64 `(root, since)`, one entry a
+  batch time that changed the tree. **Freshness** (the Fable review's H2):
+  a root is accepted while it is the newest, and for `ROOT_MAX_AGE`
+  (10 minutes) after it was superseded (the next entry's `since`), by the
+  replica's latest applied batch time at ingress and by the batch's time at
+  apply, so a revocation takes effect within it at every replica; the
+  ring's count only bounds storage.
+- **The handle** (pin K, S25): 32 bytes the founder draws once, set at the
+  actor's install and served by `handle()`; a re-founded space's actor is
+  installed with the same handle.
+- **Methods:** `enroll`, `enroll_many` (the re-founding re-seed),
+  `invite`/`claim` (the demo's enrollment, the invitation naming the
+  digest), `revoke`, under the role `registrar` but `claim`; the queries
+  `path(member) → (root, slot, siblings[32])`, `root()` and `handle()`,
+  any caller, under the query route's limits. **What `path` reveals:**
+  asking by key tells the operators which member is about to prove and
+  when; `Anonymous` hides the member from the log's readers and from other
+  agents, not from operators (`identity-and-authority.md` §7's threat
+  model). Recorded in `SECURITY.md`.
 - **`RootKind` and the representative are untouched:** no venue checks a
   Poseidon2 root in this slice; a later cross-space credential proves its
   root's place under `S_w` by a Blake2b path outside the proof, its issuer
@@ -273,62 +279,76 @@ G–L are M4's and M5's.
 
 ### Pin I: the credential statements and their verifier at ingress
 
+The full spec is `proving.md` §8 (the hashes, the statements, the
+format) and `identity-and-authority.md` §5 (the request, the binding, the
+guards, ingress's checks and their codes, the apply rule, the origins);
+pinned by 7.7.
 - **The AIR:** a recursion-AIR circuit (recair's `Context` and gadgets)
   over the `p2` and `qm31` components, a fixed wiring per statement, so
   its circuit hash is its program id. Two components at least, so the
   claimed sums are blinded (a one-component masked set is not).
 - **Format 42, credential proofs** (`device-params.md`): masked (c),
-  Blake2s-M31 channel, **blowup 4, 43 queries, PoW 20, or 47 queries at
-  PoW 16** if 7.12's grind has a 95th percentile above 50 ms on the phone
-  [decided, S29], interaction PoW 8, fold step 1, affine DEEP
-  batching if the fork's Blake2s-M31 path takes it, else by powers; at
-  least 62 proven and 100 conjectured bits on its masked shape (62.69 and
-  106 [model]); `h = 512`, every component at least 2^11 rows. 30,
-  reserved at an unmasked count, is retired unregistered.
+  Blake2s-M31 channel, **blowup 4, 43 queries, PoW 20**, interaction PoW
+  8, fold step 1, affine DEEP batching if the fork's Blake2s-M31 path takes
+  it, else by powers; at least 62 proven and 100 conjectured bits on its
+  masked shape (62.69 and 106 [model]); `h = 512`, every component at
+  least 2^11 rows. If 7.12's grind has a 95th percentile above 50 ms on
+  the phone [decided, S29], the format is **44**, the same at 47 queries
+  and PoW 16 (62.66 and 110 [model]), and 42 is retired: a number names one
+  set of parameters. 30, reserved at an unmasked count, is retired
+  unregistered.
 - **The scope,** namespaced by the verifier and its space (the Fable
   review's H1):
-  `scope = P2(TAG_SCOPE ‖ BLAKE2b-256(space ‖ agent ‖ instance ‖ the guard's scope name))`,
-  computed by ingress from the method's guard; no two agents' "login",
-  in one space or two, share a pseudonym, even for a member whose secret
-  two spaces share (pin K).
-- **The binding:** `binding = P2(BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖
-  agent ‖ instance ‖ method ‖ program ‖ kind ‖ SCALE(arguments) ‖ nonce ‖
-  expires_ms))`: a proof authorizes one call, in one space, under one
-  statement.
+  `scope = C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))`,
+  `W` a 32-byte digest's eight 31-bit words, computed by ingress from the
+  method's guard; no two agents' "login", in one space or two, share a
+  pseudonym, even for a member whose secret two spaces share (pin K).
+- **The binding:** `binding = C(T(binding), W(b))`,
+  `b = BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖ agent ‖ instance ‖ method ‖ program ‖ kind ‖ SCALE(arguments) ‖ nonce ‖ expires_ms)`:
+  a proof authorizes one call, in one space, under one statement.
 - **Auth** (`CredentialKind::Auth = 0`), public
-  `(kind, map_root, scope, nullifier, binding)`, each 8 M31; private `s`,
-  the slot and its path. Proves `leaf(slot, member(s))` under `map_root`
-  and `nullifier = P2(TAG_NF ‖ s ‖ scope)`.
+  `(kind, map_root, scope, nullifier, binding)`, `kind` one word and each
+  digest 8; private `s`, the slot's bits and its path. Proves
+  `leaf(member(s))` under `map_root` and
+  `nullifier = C(C(T(nf), s), scope)`; 36 permutations.
 - **Pay** (`CredentialKind::Owner = 1`), public `(kind, owner, binding)`;
-  private `s`. Proves `owner = P2(TAG_OWNER ‖ s)`: a post-quantum
-  authorization by the owner of a row, about two permutations. No path,
-  no range check: the ledger debits the live row at apply, so its guard
-  compares the row's current `owner` with the proof's, and a previous
-  owner's proof fails once the row changes hands. A hidden payer waits for
-  full privacy (`identity-and-authority.md` §8).
-- **The request:** `POST /agents/{id}/calls` with
-  `Credentialed { call, kind, proof, public }`, no session (the reserved
-  session-less input kind, `identity-and-authority.md` §15 step 0).
-- **Ingress checks, in order:** the size per format (42: 512 KiB; 43:
-  1.5 MiB; the HTTP limit raised on this route alone; the log carries the
-  call and origin, never the proof, so `cap::REQUEST` is unchanged); the
-  format (42, or 43, pin J); the program id the schema pins for the
-  method; the scope; for auth, `map_root` the current root or a ring root
-  within `ROOT_MAX_AGE`, as applied here (one not yet applied: retryable,
-  the identity replica's lag rule); the binding; `expires_ms` within 120 s of the node's
-  clock (a client reads it from `GET /`); then the proof, on an
-  executor, **its PoW checked before any decommitment**. Each refusal a
-  `403` with its code. **Load:** a bound per connection and an executor
+  private `s`. Proves `owner = C(T(owner), s)`: a post-quantum
+  authorization by the owner of a row, one permutation. No path, no range
+  check: the ledger debits the live row at apply, so its handler compares
+  the row's current `owner` with the proof's, and a previous owner's proof
+  fails once the row changes hands. A hidden payer waits for full privacy
+  (`identity-and-authority.md` §8).
+- **The request:** `POST /agents/{id}/credentialed` with `Credentialed
+  { instance, method, arguments, nonce, expires_ms, format, public, proof }`,
+  no session (the reserved session-less input kind,
+  `identity-and-authority.md` §15 step 0); a route of its own, so the HTTP
+  layer sizes the body (1.5 MiB plus `cap::REQUEST` plus 4 KiB) before
+  decoding it. The node's clock is `GET /time`; `GET /` keeps serving its
+  key.
+- **Ingress checks, in order** (`identity-and-authority.md` §5's table,
+  each a `Rejected(Credential(code))`): the route's size; the decode; the
+  agent served; the space has a genesis; the format; the size per format
+  (42 or 44: 512 KiB; 43: 1.5 MiB; the log carries the call and origin,
+  never the proof, so `cap::REQUEST` is unchanged); `expires_ms` within
+  120 s ahead of the node's clock; the method's credential guard; the
+  kind; for auth, the scope; the binding; the binding digest not recorded;
+  for auth, `map_root` in the ring (else retryable, the identity
+  replica's lag rule) and fresh by `ROOT_MAX_AGE`; a verification slot;
+  then the proof, on an executor, **its PoW checked before any
+  decommitment**. **Load:** the node's connections and a verification
   budget (past it, `503`), no bucket per scope or method to drain.
-- **At apply:** the binding refused if `expires_ms` is before the batch
-  time, or if its digest is already recorded; the digest recorded until
-  `expires_ms` plus the clock skew allowed (60 s) by batch time. So a
-  proof replayed at another node runs nowhere twice.
+- **At apply:** refused if `expires_ms` is before the batch time, if the
+  binding digest is already recorded, or, for auth, if the root is stale by
+  the batch time; else the digest is recorded until `expires_ms` plus
+  60 s by batch time, and the method runs. So a proof replayed at another
+  node runs nowhere twice.
 - **The origin logged:** `Anonymous { scope, nullifier }` for auth (a
-  pseudonym in its scope; "once in this scope" is the guard's rule) and
-  `Owner { digest }` for pay; never the proof (`identity-and-authority.md`
-  §5). Guards: `#[msg(credential = Auth("login"))]`,
-  `#[msg(credential = Owner)]`.
+  pseudonym in its scope, stable; "once in this scope" is the handler's
+  rule) and `Owner(digest)` for pay, `Principal`'s indexes 3 and 4; never
+  the proof (`identity-and-authority.md` §5). Guards:
+  `#[msg(credential = Auth("login"))]`, `#[msg(credential = Owner)]`, in
+  `MethodSchema::credential`, whose `Auth` carries the device kernel M5
+  names, so M5 moves no pinned blob.
 - **Gates:** the native verify of a credential proof at most 10 ms on one
   x86 core; a proof with a wrong PoW refused in under 1 ms; fuzz targets
   for the `Credentialed` decode and the format 42 and 43 verifiers in
@@ -364,11 +384,13 @@ G–L are M4's and M5's.
   with selects), so its proof's shape never depends on the witness.
 - **What a device proof authorizes at ingress:** exactly what an auth
   credential proof does. A device kernel is an `#[attestable]` method whose
-  `public_args` are pin I's auth words `(kind, map_root, scope, nullifier,
-  binding)` and whose output is empty; ingress takes the words from the
-  request, recomputes the io-hash, verifies the proof against the device
-  program id the agent's schema pins for the method, then runs pin I's
-  auth checks and logs the same `Anonymous` origin. Payment stays a
+  `public_args` are pin I's auth words, the SCALE encoding of
+  `CredentialPublic::Auth` (its kind byte, then `map_root`, `scope`,
+  `nullifier`, `binding`), and whose output is empty; ingress takes the
+  words from the request, recomputes the io-hash, verifies the proof
+  against the device program id of the kernel the method's guard names
+  (`device`), then runs pin I's auth checks (the binding naming that
+  program) and logs the same `Anonymous` origin. Payment stays a
   credential proof. Nothing else a device proof states is admitted in this
   slice.
 - **Budgets on the Fairphone 6** [decided, S3, S20, S27, S28]: the auth
@@ -389,8 +411,8 @@ G–L are M4's and M5's.
   `s_i = u64_le(w[8i..8i+8]) mod p` for `i < 8` (bias below 2^-33 an
   element); derived again at each use from a fresh assertion with user
   verification.
-- **What a space stores:** `member(s) = P2(TAG_MEMBER ‖ s)` in the
-  credential actor, `owner(s) = P2(TAG_OWNER ‖ s)` in a ledger row; no
+- **What a space stores:** `member(s) = C(T(member), s)` in the
+  credential actor, `owner(s) = C(T(owner), s)` in a ledger row; no
   epoch, which the device could not keep nor the actor check (the Fable
   review's M7): a revocation removes the leaf (pin G's freshness makes it
   take effect), a new passkey is a new `s` and a new leaf. The handle is in
@@ -400,10 +422,10 @@ G–L are M4's and M5's.
   another space's public handle makes a member of both hold one `s`, so
   the two spaces' operators can link that member's `member` and `owner`
   digests; the scopes carry the `SpaceId`, so nullifiers stay distinct.
-- **Containment** (in `SECURITY.md`): the library zeroizes `s`, but the
-  PRF output, equivalent to `s`, reaches the app as a Java string and
-  cannot be zeroized; a synced passkey binds `s` to the Google account,
-  not to the phone.
+- **Containment** (in `SECURITY.md`; `identity-and-authority.md` §7's
+  threat model): the library zeroizes `s`, but the PRF output, equivalent
+  to `s`, reaches the app as a Java string and cannot be zeroized; a
+  synced passkey binds `s` to the Google account, not to the phone.
 
 ### Pin L: the device library
 
@@ -411,26 +433,15 @@ G–L are M4's and M5's.
   `vos-device-jni` (a thin JNI shim, `extern "system"` functions over byte
   arrays in the workspace codec), built for `aarch64-linux-android` with
   `cargo-ndk` against NDK 27.2, mimalloc, no other C dependency.
-- **The API:**
-
-  ```rust
-  pub struct DeviceSecret(/* [M31; 8], zeroized on drop */);
-  pub fn derive_secret(prf_output: &[u8; 32], handle: &[u8; 32]) -> DeviceSecret;
-  pub fn member(secret: &DeviceSecret) -> Digest;
-  pub fn owner(secret: &DeviceSecret) -> Digest;
-  pub struct ProverConfig { pub threads: Threads, pub max_memory: u64 }
-  pub enum Threads { Auto, Count(usize), Cores(Vec<usize>) }
-  pub struct Prover { /* the thread pool, the formats' twiddles */ }
-  impl Prover {
-      pub fn new(config: ProverConfig) -> Result<Self, DeviceError>;
-      pub fn prove_auth(&self, s: &DeviceSecret, witness: &AuthWitness, scope: &Digest,
-                        binding: &Binding) -> Result<CredentialProof, DeviceError>;
-      pub fn prove_owner(&self, s: &DeviceSecret, binding: &Binding)
-                         -> Result<CredentialProof, DeviceError>;
-      pub fn prove_kernel(&self, program: &DeviceProgram, arguments: &[u8])
-                          -> Result<DeviceProof, DeviceError>;   // M5
-  }
-  ```
+- **The API** is `proving.md` §8's, pinned by 7.7: `prf_input`,
+  `derive_secret`, `member`, `owner`; a `Call` (space, agent, instance,
+  method, arguments, a nonce from the OS, `expires_ms`) from which the
+  library computes the scope and the binding itself; `Prover::prove_auth`
+  (the secret, the `AuthWitness` from `path`, the guard's scope name, the
+  call), `prove_owner` (the secret, the call) and M5's `prove_kernel`;
+  `verify`; and the wire helpers (`time_answer`, `path_query` signed by a
+  key drawn for it alone, `path_answer`, `credentialed`), so the app
+  encodes nothing. `prove_auth` checks its witness before proving.
   `Threads::Auto` weights work by core class (7.17); `DeviceError` names
   what failed and no value. No logging of witnesses; the library has no
   `seeded-masks` (pin C's build check covers it).
@@ -716,7 +727,9 @@ and adds its set in a file of its own.
 - **What:** pin H's `0x402` in the runtime (`precompile.rs`, the refine
   host, the inner machines, the wire's price table) and the guest shim's
   software fallback; pin G's `vos-credentials` actor (enroll, revoke,
-  `path`, the ring) as a library actor; its price measured. No change to
+  `path`, the ring) as a library actor, as `identity-and-authority.md`
+  §6 pins it (its rows, the ring's freshness rule, `invite` and `claim`);
+  its price measured. No change to
   `node/host/src/roots` (so 7.3 and 7.9 do not meet).
 - **Tests:** the tree equals a reference built from scratch over random
   enrollments and revocations, on VOS and on the JAM-only host; slots
@@ -730,7 +743,8 @@ and adds its set in a file of its own.
   `MaskedComponents` set of `p2` and `qm31` (after the test's `P2Only`);
   the Blake2s-M31 channel wired in `pcs.rs` (the fork's
   `Blake2sM31MerkleChannel`); format 42 with its count on its own masked
-  shape; the prover and `verify_masked` over it.
+  shape, and 44's counted beside it (S29's alternative, registered only if
+  7.12 picks it); the prover and `verify_masked` over it.
 - **Gates:** soundness (a wrong path, a nullifier of another secret, an
   owner digest of another secret, a changed binding, each refused) and
   the forgery gates (a prover that skips the path's bits or the leaf's
@@ -746,20 +760,26 @@ and adds its set in a file of its own.
   `node/host/src/ingress.rs` and `calls.rs`; the origin ABI's `Anonymous`
   and `Owner` kinds and the session-less input kind
   (`identity-and-authority.md` §15 step 0); the guards; the replicated
-  binding set; the route's per-format size caps; the fuzz targets. Its
-  ABI change lands before 7.8b, so no pinned blob moves twice.
+  binding set; the route's per-format size caps; `GET /time`; the
+  schema's `credential` field and the `credentials` system row
+  (`Failure::Credentials`); the fuzz targets. Its ABI change lands before
+  7.8b, so no pinned blob moves twice.
 - **Tests:** each check's refusal in order; a proof replayed at another
   node, refused at apply; an expired binding at apply by batch time; a
   root the replica has not applied (retryable); a revoked member's proof
   against the pre-revocation root refused once `ROOT_MAX_AGE` has passed
   by batch time; a proof of one call sent with another; two agents'
   scopes distinct; two spaces sharing a handle: one secret, one guard
-  name, distinct nullifiers; a 1.4 MiB device proof taken, a 600 KiB
-  credential proof refused; a wrong-PoW proof refused in under 1 ms; the
+  name, distinct nullifiers; a 1.4 MiB format-43 body within the route's
+  size (refused `Format` until 7.20 admits 43), a 600 KiB credential
+  proof refused `Size`; a wrong-PoW proof refused in under 1 ms; the
   origin logged, the proof not; a pay proof refused once the row's owner
   changed.
 - **Gate:** pin I's gates; 1,000 credentialed calls a second on one node
-  at p99 within 50 ms of a signed call's.
+  at p99 within 50 ms of a signed call's. At 10 ms a verification that is
+  10 cores of verifying: the run records the node's executor threads, and
+  on fewer than 12 the rate is the executors' bound instead (owner's
+  question 7.7-Q6).
 - **Dep:** 7.10. **Estimate:** 2–3 weeks.
 
 ### 7.12 The device library and the credential phone gate
@@ -1111,5 +1131,45 @@ Two, each closed by a measurement:
    owner keeps ≤ 1 s or sets the gate from the measurement; until then the
    plan aims at 1 s.
 2. **The credential parameters** (S29): 7.12's grind on the phone picks
-   PoW 16 with 47 queries if its 95th percentile passes 50 ms, else PoW 20
-   with 43.
+   PoW 16 with 47 queries (format 44) if its 95th percentile passes 50 ms,
+   else PoW 20 with 43 (format 42).
+
+Six from 7.7's design round, each for the owner, with options and a
+recommendation (`slice-7-progress.md`, 7.7); until answered, the pins
+stand as written:
+- **7.7-Q1, revocation does not stop payment.** An owner proof reads no
+  tree, so a revoked member, or a thief of its `s`, pays until the
+  ledger's row changes owner. (a) The ledger's own remedy: `rekey(row,
+  owner)` and `freeze(row)` under an operator role, which is also a lost
+  passkey's recovery; (b) the owner statement also proves membership
+  (`map_root` and a path join its words): free on the phone, both circuits
+  padding to one floor, but every payer must then be enrolled, which
+  reopens S22; (c) accept, recorded. **Recommended: (a)** in the demo's
+  ledger.
+- **7.7-Q2, path fetches link a pseudonym to its member for operators.**
+  (a) As pinned: `path(member)` on demand, the leak recorded; (b) the
+  library refreshes its path when `root()` moves or on a timer, never just
+  before a proof (a path stays good for `ROOT_MAX_AGE` after its root is
+  superseded), so a fetch's time says nothing of a proof's: library only;
+  (c) beside (b), a query of a level-8 bucket (its 256 leaves and the 24
+  siblings above, about 9 KiB), so a fetch names one slot of 256, the app
+  keeping its slot. **Recommended: (b)** in 7.12; (c) when a space asks.
+- **7.7-Q3, a duplicate's answer.** (a) As pinned: `Replayed`, without
+  the first call's outcome, the client reading state; (b) the binding's
+  record keeps the outcome until it expires, as a session's reply window
+  does (up to 180,000 records at 1,000 calls a second). **Recommended:
+  (a).**
+- **7.7-Q4, the PRF output as a Java string.** (a) Accept for the demo,
+  recorded in `SECURITY.md`; (b) as (a), and P1 also checks whether Play
+  services' FIDO2 client returns the PRF output as a `byte[]` the app can
+  zero-fill, the demo taking that path if so. **Recommended: (b),** one
+  more line in 7.0b's list.
+- **7.7-Q5, "once in this scope".** (a) As pinned: a handler that admits a
+  member once a scope keeps its own nullifiers; (b) an SDK guard option
+  (`once`) that records them in system rows. **Recommended: (a)** in this
+  slice; (b) with the first handler that needs it.
+- **7.7-Q6, 7.11's rate gate.** 1,000 credentialed calls a second at
+  10 ms a verification is 10 cores of verifying. (a) Keep it, on a host
+  of at least 12 executor threads, the threads recorded; (b) restate it
+  as the executors' bound. **Recommended: (a),** on the owner's desktop,
+  falling back to (b) on a smaller host.
