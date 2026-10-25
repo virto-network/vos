@@ -78,9 +78,7 @@ pub(crate) fn report(base: &Base, to: AgentId, window: u64, root: [u8; 32]) -> R
     };
     let mut writes = Writes::new();
     let reported = writes.read::<(u64, AgentId)>(base, &keys::reported());
-    if space != SpaceId::NONE
-        && to != base.agent
-        && reported.is_none_or(|(last, _)| last < window)
+    if space != SpaceId::NONE && to != base.agent && reported.is_none_or(|(last, _)| last < window)
     {
         run.messages.push(Outgoing {
             to,
