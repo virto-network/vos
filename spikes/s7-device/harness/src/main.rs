@@ -586,11 +586,17 @@ fn real(cell: &Cell, run: &Run, trace_seconds: f64, reps: usize) {
         rss_reset &= std::fs::write("/proc/self/clear_refs", "5").is_ok();
         let cpu_started = cpu_seconds();
         let started = Instant::now();
-        let proof = prove_segment::<Blake2sMerkleChannel>(&format, &mut segment, mask, MaskRng::default())
-            .expect("the masked segment proves");
+        let proof =
+            prove_segment::<Blake2sMerkleChannel>(&format, &mut segment, mask, MaskRng::default())
+                .expect("the masked segment proves");
         times.push(started.elapsed().as_secs_f64());
         cpu.push(cpu_seconds() - cpu_started);
-        eprintln!("  {} rep {}/{reps}: {:.3} s", cell.name(), rep + 1, times[rep]);
+        eprintln!(
+            "  {} rep {}/{reps}: {:.3} s",
+            cell.name(),
+            rep + 1,
+            times[rep]
+        );
         made = Some(proof);
     }
     let rss = peak_rss_mib();
@@ -615,7 +621,9 @@ fn real(cell: &Cell, run: &Run, trace_seconds: f64, reps: usize) {
     };
     let mut cells = 0u64;
     let mut columns = 0usize;
-    let chips: Vec<usize> = (0..chip_idx::COUNT).filter(|chip| mask & (1 << chip) != 0).collect();
+    let chips: Vec<usize> = (0..chip_idx::COUNT)
+        .filter(|chip| mask & (1 << chip) != 0)
+        .collect();
     for (&log, &chip) in proof.log_sizes.iter().zip(&chips) {
         let component = vos_pvm_proof::all_components()[chip];
         for (index, tree) in component.trace_sizes(log).iter().enumerate() {
@@ -626,7 +634,11 @@ fn real(cell: &Cell, run: &Run, trace_seconds: f64, reps: usize) {
     }
     let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "auto".into());
     let list = |values: &[f64]| {
-        values.iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>().join(",")
+        values
+            .iter()
+            .map(|v| format!("{v:.4}"))
+            .collect::<Vec<_>>()
+            .join(",")
     };
     println!(
         "{{\"kind\":\"cell\",\"cell\":\"{}\",\"steps\":{steps},\"threads\":{},\"pool\":{},\"mask\":\"{mask:#010x}\",\

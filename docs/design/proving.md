@@ -645,8 +645,14 @@ last for decades.**
 ## 5. Masking [built: format 39]
 
 - **Where:** the final wrap. Device proofs (slice 7) reuse it:
-  the masking is generic over the component set and the channel. Segment,
-  leaf and fold proofs stay in the prover role, as the witness rows do.
+  the masking is generic over the component set and the channel. The
+  segment chips are built masked too (`vos_pvm_proof::masked`, slice 7's
+  7.14): each chip's blinding fraction joins its last batch of fractions,
+  no column or degree added; the boundary chips' claimed sums, which the
+  boundary states fix, stay unblinded; every chip pads to four times its
+  `h`. No admitted format proves them yet (the device format, 43, at
+  7.15–7.16). Node segment, leaf and fold proofs stay unmasked, in the
+  prover role, as the witness rows do.
 - **Device proofs at rate 1/2** serve authorizations a space re-checks at
   its ingress, never settlement.
 - **How:** spike 2's variant (c), already prototyped on our pinned Stwo
@@ -931,7 +937,9 @@ boundary, binding the run like this:
   has at least `4h` rows. At blowup 2 with 86–87 queries that is 2^12 rows
   (`h` = 1,024), at blowup 4 with 43 queries 2^11, at blowup 8 with 29
   2^10 [model, `research/slice-7/device-params.md`]; a component with no
-  next-row read (`|O| = 1`) needs half, so `h` is set per component.
+  next-row read (`|O| = 1`) needs half, so `h` is set per component. Every
+  segment chip reads its running sum's previous row, so each takes the
+  full `h` [built, 7.14].
 
 Its levers:
 1. no boundary, −58% [measured proxy];
