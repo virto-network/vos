@@ -399,7 +399,7 @@ attribution). Its full design is `recursion-air.md`.
     2,498 MiB, 122,085 bytes);
   - **on the JAM-only host** (`final-verify.elf`, Blake2b-256 in
     software, the guests' allocator a bump over its arena): the `valid`
-    fixture's 146,564-byte proof in 79.3M gas, the decode 1.50M of it and
+    fixture as pinned at 6.22 (146,564 bytes), historical, in 79.3M gas, the decode 1.50M of it and
     the verify 77.8M; the JAM statements service's refine of one
     statement 79.4M;
   - **in Wasm** under the PVF's semantics: 44.9M instructions (the window
