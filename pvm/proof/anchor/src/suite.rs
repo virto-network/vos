@@ -222,6 +222,15 @@ fn anchoring(h: &mut impl Harness) {
     let mut forged = signed(h, space, 5, 0x55, 1);
     forged.root[0] ^= 1;
     assert_eq!(h.anchor(&forged), Answer::Refused(AnchorRefusal::Signature));
+    // Two faults at once, an unlisted key and a bad signature: a venue
+    // that judges the signature before reading state (JAM's refine) says
+    // Signature, the others Key. Either refuses it.
+    let mut both = signed(h, space, 5, 0x55, 3);
+    both.root[0] ^= 1;
+    assert!(matches!(
+        h.anchor(&both),
+        Answer::Refused(AnchorRefusal::Key | AnchorRefusal::Signature)
+    ));
     let open = signed(h, space, 9, 0x99, 1);
     assert_eq!(h.anchor(&open), Answer::Refused(AnchorRefusal::Open));
     let future = signed(h, space, 12, 0x12, 1);

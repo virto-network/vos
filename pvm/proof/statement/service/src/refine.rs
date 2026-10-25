@@ -19,6 +19,11 @@
 //!   the checks before it pass.
 //!
 //! A signature is verified with `verify_strict`, as the venue rules ask.
+//! Refine reads no state, so it judges an anchor's signature before the
+//! venue rules' space, status and key checks, which accumulate makes: an
+//! anchor failing both a state check and its signature is refused
+//! `Signature` here where another venue says the state's refusal. The
+//! codes differ only when two faults coincide.
 
 use alloc::vec::Vec;
 

@@ -106,6 +106,10 @@ impl Roots for Policy {
         self.now_ms
     }
 
+    /// A policy lists its spaces' clocks alone: each reads as active from
+    /// window 0, which is all `anchored` asks of a space it lists (its
+    /// start and an ended or blocked status matter to the anchor rule and
+    /// to `anchored` at a venue, which keeps them).
     fn space(&self, space: &SpaceId) -> Option<rules::Space> {
         Policy::space(self, space).map(|space| rules::Space {
             clock: space.clock,
