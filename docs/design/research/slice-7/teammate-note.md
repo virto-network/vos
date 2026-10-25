@@ -44,8 +44,10 @@ Unchanged: the sovereign account and its budget, deposits and fees,
 `submit`'s check order, `Record`, formats and programs with their delay,
 the pause, `on_idle`, the storage keys of the items that stay.
 
-**Drops to expect:** v2 and the vectors at VOS's 7.1; the kit's fixtures
-and pinned program ids re-pinned at 7.8a; the kit's `vos-anchor` and
+**Drops to expect:** v2 and the vectors at VOS's 7.1; at 7.8a the kit's
+fixtures, the vectors' wrap hashes and lengths, and the vendored
+`vos-pvm-recair-air` and `vos-pvm-final-verifier` sources (no pinned
+program id moves); the kit's `vos-anchor` and
 statement pieces and the blob hashes at 7.8b; the fixtures and program ids
 once more at the slice's end (7.21), if VOS's node segment format changes
 (no change to the pallet's code, only the vendored tree and the pinned
