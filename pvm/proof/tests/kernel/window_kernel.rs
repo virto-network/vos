@@ -38,7 +38,7 @@ use vos_pvm_proof_verifier::{verify_kernel_chain, verify_kernel_segment};
 use vos_statement::vos_pvm_final_verifier::Error as FinalError;
 use vos_statement::{ProgramId, Refusal, Statement};
 use vos_tree::{Blake2b, Hasher};
-use vos_venue::VenueClient;
+use vos_venue::{SubmitOutcome, VenueClient};
 use vos_wire::abi::AttestError;
 use vos_wire::served::Served;
 use vos_wire::vos_anchor::venue::AnchorRefusal;
@@ -709,9 +709,9 @@ fn the_window_is_stated_at_the_model_venue() {
     let accepting = anchored();
     assert_eq!(code(&accepting, &statement), 0, "accepted");
     assert_eq!(
-        code(&accepting, &statement),
-        Refusal::Repeated.code(),
-        "a repeat"
+        accepting.venue.submit(&statement, &proof),
+        SubmitOutcome::Accepted,
+        "a repeat, the venue holding it accepted"
     );
 
     assert_eq!(
