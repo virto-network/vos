@@ -1,0 +1,347 @@
+Fairphone 6
+SM7635
+Fairphone/FP6/FP6:16/FP6.QREL.16.111.0/WS1Q:user/release-keys
+/sys/devices/system/cpu/cpu0 1804800
+/sys/devices/system/cpu/cpu1 1804800
+/sys/devices/system/cpu/cpu2 1804800
+/sys/devices/system/cpu/cpu3 1804800
+/sys/devices/system/cpu/cpu4 2400000
+/sys/devices/system/cpu/cpu5 2400000
+/sys/devices/system/cpu/cpu6 2400000
+/sys/devices/system/cpu/cpu7 2496000
+== round 1
+  level: 100
+  temperature: 260
+  Capacity level: -1
+{"kind":"device","arch":"aarch64","cpus":8,"cpu_parts":["0xd80","0xd80","0xd80","0xd80","0xd81","0xd81","0xd81","0xd81"],"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"mem_total_kib":"7579252","battery_temp_decic":"","battery_capacity":"","kernel":""}
+{"kind":"build","version":"s7-device/1","channel":"blake2s","format":37,"seeded_masks":true,"cells":"built/1:86:20/plain,floor/1:86:20/plain,floor/1:86:20/masked12,lean/1:86:20/plain,lean/1:86:20/masked12,floor/2:43:20/plain,floor/2:43:20/masked11,lean/2:43:20/masked11"}
+cell built/1:86:20/plain: threads auto, 5 reps
+  built/1:86:20/plain rep 1/5: 5.901 s
+  built/1:86:20/plain rep 2/5: 5.907 s
+  built/1:86:20/plain rep 3/5: 5.975 s
+  built/1:86:20/plain rep 4/5: 5.975 s
+  built/1:86:20/plain rep 5/5: 6.294 s
+{"kind":"cell","cell":"built/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ffff","chips":23,"log_sizes":[15, 12, 16, 17, 8, 6, 4, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":7821,"cells":142859040,"model_cells":142859040,"reps":5,"prove_s_best":5.9006,"prove_s_median":5.9746,"prove_s_runs":[5.9006,5.9070,5.9750,5.9746,6.2939],"cpu_s_median":31.370,"peak_rss_mib":2099,"peak_rss_reset":true,"trace_s":0.060,"proof_bytes":3538744,"proof_sha256":"aef9b3c2b35ff1d866121bce2c61d258d8b585b70ea26663607096c3609f2581","verified":true,"verify_ms":43.3,"matches_x86":true}
+cell floor/1:86:20/plain: threads auto, 5 reps
+  floor/1:86:20/plain rep 1/5: 2.315 s
+  floor/1:86:20/plain rep 2/5: 2.253 s
+  floor/1:86:20/plain rep 3/5: 2.475 s
+  floor/1:86:20/plain rep 4/5: 2.370 s
+  floor/1:86:20/plain rep 5/5: 2.310 s
+{"kind":"cell","cell":"floor/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[15, 12, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":4975,"cells":47856336,"model_cells":47856336,"reps":5,"prove_s_best":2.2526,"prove_s_median":2.3155,"prove_s_runs":[2.3155,2.2526,2.4745,2.3695,2.3100],"cpu_s_median":11.700,"peak_rss_mib":856,"peak_rss_reset":true,"trace_s":0.072,"proof_bytes":2245957,"proof_sha256":"3d3fcbe10daf1d05b4e4fe1f0a88f77a0b96bb7556ce3a9aee75393280b12aec","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/1:86:20/masked12: threads auto, 5 reps
+  floor/1:86:20/masked12 rep 1/5: 3.870 s
+  floor/1:86:20/masked12 rep 2/5: 3.820 s
+  floor/1:86:20/masked12 rep 3/5: 3.706 s
+  floor/1:86:20/masked12 rep 4/5: 3.851 s
+  floor/1:86:20/masked12 rep 5/5: 3.914 s
+{"kind":"cell","cell":"floor/1:86:20/masked12","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[16, 13, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13, 16],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19, 24],"columns":4975,"cells":99571408,"model_cells":100794368,"reps":5,"prove_s_best":3.7055,"prove_s_median":3.8512,"prove_s_runs":[3.8702,3.8204,3.7055,3.8512,3.9144],"cpu_s_median":21.910,"peak_rss_mib":1591,"peak_rss_reset":true,"trace_s":0.071,"proof_bytes":2292090,"proof_sha256":"d48da47ec2d258d359c8404fd3f9fad363da470b36469e2bd722f187bfc4aeba","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/1:86:20/plain: threads auto, 5 reps
+  lean/1:86:20/plain rep 1/5: 1.799 s
+  lean/1:86:20/plain rep 2/5: 1.909 s
+  lean/1:86:20/plain rep 3/5: 1.832 s
+  lean/1:86:20/plain rep 4/5: 1.792 s
+  lean/1:86:20/plain rep 5/5: 1.751 s
+{"kind":"cell","cell":"lean/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[15, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10],"fixed":[],"columns":1882,"cells":34880208,"model_cells":34880208,"reps":5,"prove_s_best":1.7513,"prove_s_median":1.7993,"prove_s_runs":[1.7993,1.9093,1.8320,1.7917,1.7513],"cpu_s_median":8.710,"peak_rss_mib":692,"peak_rss_reset":true,"trace_s":0.070,"proof_bytes":948004,"proof_sha256":"16b0dbeddbba87b51b7010211dfdb586f3305df21cf1faea23043ebe727b0254","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/1:86:20/masked12: threads auto, 5 reps
+  lean/1:86:20/masked12 rep 1/5: 3.133 s
+  lean/1:86:20/masked12 rep 2/5: 3.102 s
+  lean/1:86:20/masked12 rep 3/5: 3.607 s
+  lean/1:86:20/masked12 rep 4/5: 3.879 s
+  lean/1:86:20/masked12 rep 5/5: 3.635 s
+{"kind":"cell","cell":"lean/1:86:20/masked12","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":73946832,"model_cells":74842112,"reps":5,"prove_s_best":3.1024,"prove_s_median":3.6070,"prove_s_runs":[3.1332,3.1024,3.6070,3.8791,3.6351],"cpu_s_median":16.050,"peak_rss_mib":1206,"peak_rss_reset":true,"trace_s":0.072,"proof_bytes":988651,"proof_sha256":"5bbe0d854e6801e9e3a4b6110d2281e1d0cd29254518e0964b6c6aa8400fd170","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/2:43:20/plain: threads auto, 5 reps
+  floor/2:43:20/plain rep 1/5: 2.886 s
+  floor/2:43:20/plain rep 2/5: 3.078 s
+  floor/2:43:20/plain rep 3/5: 2.927 s
+  floor/2:43:20/plain rep 4/5: 2.807 s
+  floor/2:43:20/plain rep 5/5: 2.929 s
+{"kind":"cell","cell":"floor/2:43:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[15, 12, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":4975,"cells":47856336,"model_cells":47856336,"reps":5,"prove_s_best":2.8066,"prove_s_median":2.9271,"prove_s_runs":[2.8864,3.0782,2.9271,2.8066,2.9287],"cpu_s_median":14.240,"peak_rss_mib":1249,"peak_rss_reset":true,"trace_s":0.066,"proof_bytes":1217153,"proof_sha256":"0069404f5554e75c73a042720f6eaa0583e830d291d4c038ecbd7622dfaa6ca8","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/2:43:20/masked11: threads auto, 5 reps
+  floor/2:43:20/masked11 rep 1/5: 4.938 s
+  floor/2:43:20/masked11 rep 2/5: 4.941 s
+  floor/2:43:20/masked11 rep 3/5: 4.939 s
+  floor/2:43:20/masked11 rep 4/5: 4.934 s
+  floor/2:43:20/masked11 rep 5/5: 4.959 s
+{"kind":"cell","cell":"floor/2:43:20/masked11","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[16, 13, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12, 16],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19, 24],"columns":4975,"cells":96130768,"model_cells":96985088,"reps":5,"prove_s_best":4.9341,"prove_s_median":4.9393,"prove_s_runs":[4.9376,4.9409,4.9393,4.9341,4.9586],"cpu_s_median":26.580,"peak_rss_mib":2260,"peak_rss_reset":true,"trace_s":0.067,"proof_bytes":1243059,"proof_sha256":"dfadede348551febde4d8ff69e879ea61ad5386f7c6cb4da0349501911c27e41","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/2:43:20/masked11: threads auto, 5 reps
+  lean/2:43:20/masked11 rep 1/5: 4.008 s
+  lean/2:43:20/masked11 rep 2/5: 3.997 s
+  lean/2:43:20/masked11 rep 3/5: 3.779 s
+  lean/2:43:20/masked11 rep 4/5: 3.713 s
+  lean/2:43:20/masked11 rep 5/5: 3.962 s
+{"kind":"cell","cell":"lean/2:43:20/masked11","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":70506192,"model_cells":71032832,"reps":5,"prove_s_best":3.7132,"prove_s_median":3.9616,"prove_s_runs":[4.0083,3.9968,3.7792,3.7132,3.9616],"cpu_s_median":20.250,"peak_rss_mib":1893,"peak_rss_reset":true,"trace_s":0.058,"proof_bytes":561297,"proof_sha256":"b757e5ad1e14968347c887af3e00bc9e4e65b635f0cee0a5e40bccc6740da3f1","verified":null,"verify_ms":0.0,"matches_x86":true}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":64,"pool":8,"mean_ms":158.33,"median_ms":163.91,"p95_ms":197.22,"max_ms":206.09}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":64,"pool":8,"mean_ms":48.57,"median_ms":44.08,"p95_ms":89.96,"max_ms":110.61}
+{"kind":"done","ok":true,"wall_s":236.8}
+  level: 100
+  temperature: 270
+  Capacity level: -1
+== round 2
+  level: 100
+  temperature: 280
+  Capacity level: -1
+{"kind":"device","arch":"aarch64","cpus":8,"cpu_parts":["0xd80","0xd80","0xd80","0xd80","0xd81","0xd81","0xd81","0xd81"],"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"mem_total_kib":"7579252","battery_temp_decic":"","battery_capacity":"","kernel":""}
+{"kind":"build","version":"s7-device/1","channel":"blake2s","format":37,"seeded_masks":true,"cells":"built/1:86:20/plain,floor/1:86:20/plain,floor/1:86:20/masked12,lean/1:86:20/plain,lean/1:86:20/masked12,floor/2:43:20/plain,floor/2:43:20/masked11,lean/2:43:20/masked11"}
+cell built/1:86:20/plain: threads auto, 5 reps
+  built/1:86:20/plain rep 1/5: 5.899 s
+  built/1:86:20/plain rep 2/5: 6.046 s
+  built/1:86:20/plain rep 3/5: 5.900 s
+  built/1:86:20/plain rep 4/5: 5.946 s
+  built/1:86:20/plain rep 5/5: 6.110 s
+{"kind":"cell","cell":"built/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ffff","chips":23,"log_sizes":[15, 12, 16, 17, 8, 6, 4, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":7821,"cells":142859040,"model_cells":142859040,"reps":5,"prove_s_best":5.8991,"prove_s_median":5.9463,"prove_s_runs":[5.8991,6.0460,5.8999,5.9463,6.1097],"cpu_s_median":31.620,"peak_rss_mib":2044,"peak_rss_reset":true,"trace_s":0.054,"proof_bytes":3538744,"proof_sha256":"aef9b3c2b35ff1d866121bce2c61d258d8b585b70ea26663607096c3609f2581","verified":true,"verify_ms":43.3,"matches_x86":true}
+cell floor/1:86:20/plain: threads auto, 5 reps
+  floor/1:86:20/plain rep 1/5: 2.341 s
+  floor/1:86:20/plain rep 2/5: 2.223 s
+  floor/1:86:20/plain rep 3/5: 2.397 s
+  floor/1:86:20/plain rep 4/5: 2.263 s
+  floor/1:86:20/plain rep 5/5: 2.310 s
+{"kind":"cell","cell":"floor/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[15, 12, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":4975,"cells":47856336,"model_cells":47856336,"reps":5,"prove_s_best":2.2234,"prove_s_median":2.3099,"prove_s_runs":[2.3410,2.2234,2.3972,2.2631,2.3099],"cpu_s_median":11.390,"peak_rss_mib":823,"peak_rss_reset":true,"trace_s":0.065,"proof_bytes":2245957,"proof_sha256":"3d3fcbe10daf1d05b4e4fe1f0a88f77a0b96bb7556ce3a9aee75393280b12aec","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/1:86:20/masked12: threads auto, 5 reps
+  floor/1:86:20/masked12 rep 1/5: 3.759 s
+  floor/1:86:20/masked12 rep 2/5: 4.152 s
+  floor/1:86:20/masked12 rep 3/5: 4.012 s
+  floor/1:86:20/masked12 rep 4/5: 3.899 s
+  floor/1:86:20/masked12 rep 5/5: 3.706 s
+{"kind":"cell","cell":"floor/1:86:20/masked12","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[16, 13, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13, 16],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19, 24],"columns":4975,"cells":99571408,"model_cells":100794368,"reps":5,"prove_s_best":3.7063,"prove_s_median":3.8986,"prove_s_runs":[3.7589,4.1520,4.0123,3.8986,3.7063],"cpu_s_median":22.130,"peak_rss_mib":1504,"peak_rss_reset":true,"trace_s":0.073,"proof_bytes":2292090,"proof_sha256":"d48da47ec2d258d359c8404fd3f9fad363da470b36469e2bd722f187bfc4aeba","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/1:86:20/plain: threads auto, 5 reps
+  lean/1:86:20/plain rep 1/5: 1.908 s
+  lean/1:86:20/plain rep 2/5: 1.821 s
+  lean/1:86:20/plain rep 3/5: 1.965 s
+  lean/1:86:20/plain rep 4/5: 1.861 s
+  lean/1:86:20/plain rep 5/5: 1.790 s
+{"kind":"cell","cell":"lean/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[15, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10],"fixed":[],"columns":1882,"cells":34880208,"model_cells":34880208,"reps":5,"prove_s_best":1.7898,"prove_s_median":1.8613,"prove_s_runs":[1.9079,1.8210,1.9651,1.8613,1.7898],"cpu_s_median":8.720,"peak_rss_mib":673,"peak_rss_reset":true,"trace_s":0.060,"proof_bytes":948004,"proof_sha256":"16b0dbeddbba87b51b7010211dfdb586f3305df21cf1faea23043ebe727b0254","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/1:86:20/masked12: threads auto, 5 reps
+  lean/1:86:20/masked12 rep 1/5: 3.057 s
+  lean/1:86:20/masked12 rep 2/5: 3.634 s
+  lean/1:86:20/masked12 rep 3/5: 3.457 s
+  lean/1:86:20/masked12 rep 4/5: 3.418 s
+  lean/1:86:20/masked12 rep 5/5: 3.038 s
+{"kind":"cell","cell":"lean/1:86:20/masked12","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":73946832,"model_cells":74842112,"reps":5,"prove_s_best":3.0379,"prove_s_median":3.4181,"prove_s_runs":[3.0572,3.6341,3.4567,3.4181,3.0379],"cpu_s_median":16.920,"peak_rss_mib":1212,"peak_rss_reset":true,"trace_s":0.074,"proof_bytes":988651,"proof_sha256":"5bbe0d854e6801e9e3a4b6110d2281e1d0cd29254518e0964b6c6aa8400fd170","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/2:43:20/plain: threads auto, 5 reps
+  floor/2:43:20/plain rep 1/5: 2.709 s
+  floor/2:43:20/plain rep 2/5: 2.894 s
+  floor/2:43:20/plain rep 3/5: 2.604 s
+  floor/2:43:20/plain rep 4/5: 2.764 s
+  floor/2:43:20/plain rep 5/5: 2.664 s
+{"kind":"cell","cell":"floor/2:43:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[15, 12, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":4975,"cells":47856336,"model_cells":47856336,"reps":5,"prove_s_best":2.6041,"prove_s_median":2.7093,"prove_s_runs":[2.7093,2.8935,2.6041,2.7638,2.6644],"cpu_s_median":14.410,"peak_rss_mib":1245,"peak_rss_reset":true,"trace_s":0.064,"proof_bytes":1217153,"proof_sha256":"0069404f5554e75c73a042720f6eaa0583e830d291d4c038ecbd7622dfaa6ca8","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/2:43:20/masked11: threads auto, 5 reps
+  floor/2:43:20/masked11 rep 1/5: 4.764 s
+  floor/2:43:20/masked11 rep 2/5: 4.744 s
+  floor/2:43:20/masked11 rep 3/5: 4.712 s
+  floor/2:43:20/masked11 rep 4/5: 4.830 s
+  floor/2:43:20/masked11 rep 5/5: 4.888 s
+{"kind":"cell","cell":"floor/2:43:20/masked11","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[16, 13, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12, 16],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19, 24],"columns":4975,"cells":96130768,"model_cells":96985088,"reps":5,"prove_s_best":4.7125,"prove_s_median":4.7643,"prove_s_runs":[4.7643,4.7444,4.7125,4.8298,4.8880],"cpu_s_median":27.690,"peak_rss_mib":2282,"peak_rss_reset":true,"trace_s":0.072,"proof_bytes":1243059,"proof_sha256":"dfadede348551febde4d8ff69e879ea61ad5386f7c6cb4da0349501911c27e41","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/2:43:20/masked11: threads auto, 5 reps
+  lean/2:43:20/masked11 rep 1/5: 3.912 s
+  lean/2:43:20/masked11 rep 2/5: 3.675 s
+  lean/2:43:20/masked11 rep 3/5: 4.275 s
+  lean/2:43:20/masked11 rep 4/5: 3.740 s
+  lean/2:43:20/masked11 rep 5/5: 3.819 s
+{"kind":"cell","cell":"lean/2:43:20/masked11","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":70506192,"model_cells":71032832,"reps":5,"prove_s_best":3.6749,"prove_s_median":3.8192,"prove_s_runs":[3.9124,3.6749,4.2745,3.7403,3.8192],"cpu_s_median":20.560,"peak_rss_mib":1839,"peak_rss_reset":true,"trace_s":0.069,"proof_bytes":561297,"proof_sha256":"b757e5ad1e14968347c887af3e00bc9e4e65b635f0cee0a5e40bccc6740da3f1","verified":null,"verify_ms":0.0,"matches_x86":true}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":64,"pool":8,"mean_ms":154.92,"median_ms":155.12,"p95_ms":191.21,"max_ms":201.99}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":64,"pool":8,"mean_ms":54.15,"median_ms":53.87,"p95_ms":81.18,"max_ms":115.56}
+{"kind":"done","ok":true,"wall_s":233.2}
+  level: 100
+  temperature: 300
+  Capacity level: -1
+== round 3
+  level: 100
+  temperature: 300
+  Capacity level: -1
+{"kind":"device","arch":"aarch64","cpus":8,"cpu_parts":["0xd80","0xd80","0xd80","0xd80","0xd81","0xd81","0xd81","0xd81"],"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"mem_total_kib":"7579252","battery_temp_decic":"","battery_capacity":"","kernel":""}
+{"kind":"build","version":"s7-device/1","channel":"blake2s","format":37,"seeded_masks":true,"cells":"built/1:86:20/plain,floor/1:86:20/plain,floor/1:86:20/masked12,lean/1:86:20/plain,lean/1:86:20/masked12,floor/2:43:20/plain,floor/2:43:20/masked11,lean/2:43:20/masked11"}
+cell built/1:86:20/plain: threads auto, 5 reps
+  built/1:86:20/plain rep 1/5: 5.780 s
+  built/1:86:20/plain rep 2/5: 5.813 s
+  built/1:86:20/plain rep 3/5: 5.933 s
+  built/1:86:20/plain rep 4/5: 6.282 s
+  built/1:86:20/plain rep 5/5: 6.639 s
+{"kind":"cell","cell":"built/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ffff","chips":23,"log_sizes":[15, 12, 16, 17, 8, 6, 4, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":7821,"cells":142859040,"model_cells":142859040,"reps":5,"prove_s_best":5.7799,"prove_s_median":5.9332,"prove_s_runs":[5.7799,5.8125,5.9332,6.2823,6.6390],"cpu_s_median":31.370,"peak_rss_mib":2031,"peak_rss_reset":true,"trace_s":0.062,"proof_bytes":3538744,"proof_sha256":"aef9b3c2b35ff1d866121bce2c61d258d8b585b70ea26663607096c3609f2581","verified":true,"verify_ms":43.8,"matches_x86":true}
+cell floor/1:86:20/plain: threads auto, 5 reps
+  floor/1:86:20/plain rep 1/5: 2.359 s
+  floor/1:86:20/plain rep 2/5: 2.289 s
+  floor/1:86:20/plain rep 3/5: 2.180 s
+  floor/1:86:20/plain rep 4/5: 2.387 s
+  floor/1:86:20/plain rep 5/5: 2.360 s
+{"kind":"cell","cell":"floor/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[15, 12, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":4975,"cells":47856336,"model_cells":47856336,"reps":5,"prove_s_best":2.1804,"prove_s_median":2.3594,"prove_s_runs":[2.3594,2.2888,2.1804,2.3866,2.3604],"cpu_s_median":11.510,"peak_rss_mib":882,"peak_rss_reset":true,"trace_s":0.067,"proof_bytes":2245957,"proof_sha256":"3d3fcbe10daf1d05b4e4fe1f0a88f77a0b96bb7556ce3a9aee75393280b12aec","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/1:86:20/masked12: threads auto, 5 reps
+  floor/1:86:20/masked12 rep 1/5: 3.940 s
+  floor/1:86:20/masked12 rep 2/5: 3.720 s
+  floor/1:86:20/masked12 rep 3/5: 3.717 s
+  floor/1:86:20/masked12 rep 4/5: 3.996 s
+  floor/1:86:20/masked12 rep 5/5: 3.905 s
+{"kind":"cell","cell":"floor/1:86:20/masked12","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[16, 13, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13, 16],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19, 24],"columns":4975,"cells":99571408,"model_cells":100794368,"reps":5,"prove_s_best":3.7174,"prove_s_median":3.9053,"prove_s_runs":[3.9404,3.7198,3.7174,3.9959,3.9053],"cpu_s_median":22.030,"peak_rss_mib":1476,"peak_rss_reset":true,"trace_s":0.076,"proof_bytes":2292090,"proof_sha256":"d48da47ec2d258d359c8404fd3f9fad363da470b36469e2bd722f187bfc4aeba","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/1:86:20/plain: threads auto, 5 reps
+  lean/1:86:20/plain rep 1/5: 1.778 s
+  lean/1:86:20/plain rep 2/5: 1.934 s
+  lean/1:86:20/plain rep 3/5: 1.901 s
+  lean/1:86:20/plain rep 4/5: 1.894 s
+  lean/1:86:20/plain rep 5/5: 1.902 s
+{"kind":"cell","cell":"lean/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[15, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10],"fixed":[],"columns":1882,"cells":34880208,"model_cells":34880208,"reps":5,"prove_s_best":1.7780,"prove_s_median":1.9008,"prove_s_runs":[1.7780,1.9338,1.9008,1.8936,1.9022],"cpu_s_median":8.880,"peak_rss_mib":682,"peak_rss_reset":true,"trace_s":0.071,"proof_bytes":948004,"proof_sha256":"16b0dbeddbba87b51b7010211dfdb586f3305df21cf1faea23043ebe727b0254","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/1:86:20/masked12: threads auto, 5 reps
+  lean/1:86:20/masked12 rep 1/5: 3.388 s
+  lean/1:86:20/masked12 rep 2/5: 3.431 s
+  lean/1:86:20/masked12 rep 3/5: 3.181 s
+  lean/1:86:20/masked12 rep 4/5: 3.626 s
+  lean/1:86:20/masked12 rep 5/5: 3.179 s
+{"kind":"cell","cell":"lean/1:86:20/masked12","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":73946832,"model_cells":74842112,"reps":5,"prove_s_best":3.1789,"prove_s_median":3.3877,"prove_s_runs":[3.3877,3.4311,3.1810,3.6258,3.1789],"cpu_s_median":16.660,"peak_rss_mib":1177,"peak_rss_reset":true,"trace_s":0.067,"proof_bytes":988651,"proof_sha256":"5bbe0d854e6801e9e3a4b6110d2281e1d0cd29254518e0964b6c6aa8400fd170","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/2:43:20/plain: threads auto, 5 reps
+  floor/2:43:20/plain rep 1/5: 2.815 s
+  floor/2:43:20/plain rep 2/5: 2.827 s
+  floor/2:43:20/plain rep 3/5: 2.648 s
+  floor/2:43:20/plain rep 4/5: 2.864 s
+  floor/2:43:20/plain rep 5/5: 2.630 s
+{"kind":"cell","cell":"floor/2:43:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[15, 12, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":4975,"cells":47856336,"model_cells":47856336,"reps":5,"prove_s_best":2.6304,"prove_s_median":2.8148,"prove_s_runs":[2.8148,2.8273,2.6481,2.8644,2.6304],"cpu_s_median":14.430,"peak_rss_mib":1230,"peak_rss_reset":true,"trace_s":0.074,"proof_bytes":1217153,"proof_sha256":"0069404f5554e75c73a042720f6eaa0583e830d291d4c038ecbd7622dfaa6ca8","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/2:43:20/masked11: threads auto, 5 reps
+  floor/2:43:20/masked11 rep 1/5: 4.783 s
+  floor/2:43:20/masked11 rep 2/5: 5.124 s
+  floor/2:43:20/masked11 rep 3/5: 4.908 s
+  floor/2:43:20/masked11 rep 4/5: 4.686 s
+  floor/2:43:20/masked11 rep 5/5: 4.905 s
+{"kind":"cell","cell":"floor/2:43:20/masked11","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[16, 13, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12, 16],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19, 24],"columns":4975,"cells":96130768,"model_cells":96985088,"reps":5,"prove_s_best":4.6865,"prove_s_median":4.9051,"prove_s_runs":[4.7828,5.1244,4.9077,4.6865,4.9051],"cpu_s_median":27.310,"peak_rss_mib":2270,"peak_rss_reset":true,"trace_s":0.070,"proof_bytes":1243059,"proof_sha256":"dfadede348551febde4d8ff69e879ea61ad5386f7c6cb4da0349501911c27e41","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/2:43:20/masked11: threads auto, 5 reps
+  lean/2:43:20/masked11 rep 1/5: 3.980 s
+  lean/2:43:20/masked11 rep 2/5: 4.373 s
+  lean/2:43:20/masked11 rep 3/5: 4.056 s
+  lean/2:43:20/masked11 rep 4/5: 4.357 s
+  lean/2:43:20/masked11 rep 5/5: 3.826 s
+{"kind":"cell","cell":"lean/2:43:20/masked11","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":70506192,"model_cells":71032832,"reps":5,"prove_s_best":3.8259,"prove_s_median":4.0558,"prove_s_runs":[3.9803,4.3729,4.0558,4.3572,3.8259],"cpu_s_median":20.960,"peak_rss_mib":1777,"peak_rss_reset":true,"trace_s":0.072,"proof_bytes":561297,"proof_sha256":"b757e5ad1e14968347c887af3e00bc9e4e65b635f0cee0a5e40bccc6740da3f1","verified":null,"verify_ms":0.0,"matches_x86":true}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":64,"pool":8,"mean_ms":156.99,"median_ms":160.37,"p95_ms":194.19,"max_ms":206.97}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":64,"pool":8,"mean_ms":34.95,"median_ms":32.83,"p95_ms":61.73,"max_ms":74.39}
+{"kind":"done","ok":true,"wall_s":234.4}
+  level: 100
+  temperature: 310
+  Capacity level: -1
+== pinned f0 t4
+  level: 100
+  temperature: 310
+  Capacity level: -1
+{"kind":"device","arch":"aarch64","cpus":4,"cpu_parts":["0xd80","0xd80","0xd80","0xd80","0xd81","0xd81","0xd81","0xd81"],"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"mem_total_kib":"7579252","battery_temp_decic":"","battery_capacity":"","kernel":""}
+{"kind":"build","version":"s7-device/1","channel":"blake2s","format":37,"seeded_masks":true,"cells":"built/1:86:20/plain,floor/1:86:20/plain,floor/1:86:20/masked12,lean/1:86:20/plain,lean/1:86:20/masked12,floor/2:43:20/plain,floor/2:43:20/masked11,lean/2:43:20/masked11"}
+cell built/1:86:20/plain: threads 4, 5 reps
+  built/1:86:20/plain rep 1/5: 7.093 s
+  built/1:86:20/plain rep 2/5: 7.235 s
+  built/1:86:20/plain rep 3/5: 6.832 s
+  built/1:86:20/plain rep 4/5: 7.096 s
+  built/1:86:20/plain rep 5/5: 7.360 s
+{"kind":"cell","cell":"built/1:86:20/plain","steps":19192,"threads":"4","pool":4,"mask":"0x01f9ffff","chips":23,"log_sizes":[15, 12, 16, 17, 8, 6, 4, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":7821,"cells":142859040,"model_cells":142859040,"reps":5,"prove_s_best":6.8323,"prove_s_median":7.0956,"prove_s_runs":[7.0930,7.2352,6.8323,7.0956,7.3598],"cpu_s_median":18.300,"peak_rss_mib":1990,"peak_rss_reset":true,"trace_s":0.041,"proof_bytes":3538744,"proof_sha256":"aef9b3c2b35ff1d866121bce2c61d258d8b585b70ea26663607096c3609f2581","verified":true,"verify_ms":43.5,"matches_x86":true}
+cell floor/1:86:20/plain: threads 4, 5 reps
+  floor/1:86:20/plain rep 1/5: 2.591 s
+  floor/1:86:20/plain rep 2/5: 2.709 s
+  floor/1:86:20/plain rep 3/5: 2.568 s
+  floor/1:86:20/plain rep 4/5: 2.691 s
+  floor/1:86:20/plain rep 5/5: 2.551 s
+{"kind":"cell","cell":"floor/1:86:20/plain","steps":19192,"threads":"4","pool":4,"mask":"0x01f9ff8b","chips":19,"log_sizes":[15, 12, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":4975,"cells":47856336,"model_cells":47856336,"reps":5,"prove_s_best":2.5505,"prove_s_median":2.5906,"prove_s_runs":[2.5906,2.7089,2.5681,2.6909,2.5505],"cpu_s_median":6.570,"peak_rss_mib":850,"peak_rss_reset":true,"trace_s":0.053,"proof_bytes":2245957,"proof_sha256":"3d3fcbe10daf1d05b4e4fe1f0a88f77a0b96bb7556ce3a9aee75393280b12aec","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/1:86:20/masked12: threads 4, 5 reps
+  floor/1:86:20/masked12 rep 1/5: 4.677 s
+  floor/1:86:20/masked12 rep 2/5: 4.764 s
+  floor/1:86:20/masked12 rep 3/5: 4.657 s
+  floor/1:86:20/masked12 rep 4/5: 4.785 s
+  floor/1:86:20/masked12 rep 5/5: 4.798 s
+{"kind":"cell","cell":"floor/1:86:20/masked12","steps":19192,"threads":"4","pool":4,"mask":"0x01f9ff8b","chips":19,"log_sizes":[16, 13, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13, 16],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19, 24],"columns":4975,"cells":99571408,"model_cells":100794368,"reps":5,"prove_s_best":4.6573,"prove_s_median":4.7644,"prove_s_runs":[4.6767,4.7644,4.6573,4.7851,4.7979],"cpu_s_median":12.460,"peak_rss_mib":1433,"peak_rss_reset":true,"trace_s":0.059,"proof_bytes":2292090,"proof_sha256":"d48da47ec2d258d359c8404fd3f9fad363da470b36469e2bd722f187bfc4aeba","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/1:86:20/plain: threads 4, 5 reps
+  lean/1:86:20/plain rep 1/5: 1.927 s
+  lean/1:86:20/plain rep 2/5: 1.905 s
+  lean/1:86:20/plain rep 3/5: 1.986 s
+  lean/1:86:20/plain rep 4/5: 2.017 s
+  lean/1:86:20/plain rep 5/5: 2.009 s
+{"kind":"cell","cell":"lean/1:86:20/plain","steps":19192,"threads":"4","pool":4,"mask":"0x00f9ff89","chips":17,"log_sizes":[15, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10],"fixed":[],"columns":1882,"cells":34880208,"model_cells":34880208,"reps":5,"prove_s_best":1.9053,"prove_s_median":1.9863,"prove_s_runs":[1.9266,1.9053,1.9863,2.0171,2.0086],"cpu_s_median":4.840,"peak_rss_mib":577,"peak_rss_reset":true,"trace_s":0.052,"proof_bytes":948004,"proof_sha256":"16b0dbeddbba87b51b7010211dfdb586f3305df21cf1faea23043ebe727b0254","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/1:86:20/masked12: threads 4, 5 reps
+  lean/1:86:20/masked12 rep 1/5: 3.625 s
+  lean/1:86:20/masked12 rep 2/5: 3.505 s
+  lean/1:86:20/masked12 rep 3/5: 3.496 s
+  lean/1:86:20/masked12 rep 4/5: 3.514 s
+  lean/1:86:20/masked12 rep 5/5: 3.476 s
+{"kind":"cell","cell":"lean/1:86:20/masked12","steps":19192,"threads":"4","pool":4,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":73946832,"model_cells":74842112,"reps":5,"prove_s_best":3.4763,"prove_s_median":3.5051,"prove_s_runs":[3.6254,3.5051,3.4963,3.5144,3.4763],"cpu_s_median":9.120,"peak_rss_mib":1173,"peak_rss_reset":true,"trace_s":0.052,"proof_bytes":988651,"proof_sha256":"5bbe0d854e6801e9e3a4b6110d2281e1d0cd29254518e0964b6c6aa8400fd170","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/2:43:20/plain: threads 4, 5 reps
+  floor/2:43:20/plain rep 1/5: 3.187 s
+  floor/2:43:20/plain rep 2/5: 3.226 s
+  floor/2:43:20/plain rep 3/5: 3.276 s
+  floor/2:43:20/plain rep 4/5: 3.301 s
+  floor/2:43:20/plain rep 5/5: 3.207 s
+{"kind":"cell","cell":"floor/2:43:20/plain","steps":19192,"threads":"4","pool":4,"mask":"0x01f9ff8b","chips":19,"log_sizes":[15, 12, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":4975,"cells":47856336,"model_cells":47856336,"reps":5,"prove_s_best":3.1871,"prove_s_median":3.2262,"prove_s_runs":[3.1871,3.2262,3.2762,3.3013,3.2069],"cpu_s_median":8.350,"peak_rss_mib":1194,"peak_rss_reset":true,"trace_s":0.058,"proof_bytes":1217153,"proof_sha256":"0069404f5554e75c73a042720f6eaa0583e830d291d4c038ecbd7622dfaa6ca8","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell floor/2:43:20/masked11: threads 4, 5 reps
+  floor/2:43:20/masked11 rep 1/5: 5.827 s
+  floor/2:43:20/masked11 rep 2/5: 5.627 s
+  floor/2:43:20/masked11 rep 3/5: 5.539 s
+  floor/2:43:20/masked11 rep 4/5: 5.580 s
+  floor/2:43:20/masked11 rep 5/5: 5.657 s
+{"kind":"cell","cell":"floor/2:43:20/masked11","steps":19192,"threads":"4","pool":4,"mask":"0x01f9ff8b","chips":19,"log_sizes":[16, 13, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12, 16],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19, 24],"columns":4975,"cells":96130768,"model_cells":96985088,"reps":5,"prove_s_best":5.5385,"prove_s_median":5.6267,"prove_s_runs":[5.8275,5.6267,5.5385,5.5803,5.6571],"cpu_s_median":15.350,"peak_rss_mib":2383,"peak_rss_reset":true,"trace_s":0.056,"proof_bytes":1243059,"proof_sha256":"dfadede348551febde4d8ff69e879ea61ad5386f7c6cb4da0349501911c27e41","verified":null,"verify_ms":0.0,"matches_x86":true}
+cell lean/2:43:20/masked11: threads 4, 5 reps
+  lean/2:43:20/masked11 rep 1/5: 4.388 s
+  lean/2:43:20/masked11 rep 2/5: 4.235 s
+  lean/2:43:20/masked11 rep 3/5: 4.256 s
+  lean/2:43:20/masked11 rep 4/5: 4.229 s
+  lean/2:43:20/masked11 rep 5/5: 4.220 s
+{"kind":"cell","cell":"lean/2:43:20/masked11","steps":19192,"threads":"4","pool":4,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":70506192,"model_cells":71032832,"reps":5,"prove_s_best":4.2202,"prove_s_median":4.2350,"prove_s_runs":[4.3880,4.2350,4.2563,4.2292,4.2202],"cpu_s_median":11.380,"peak_rss_mib":1908,"peak_rss_reset":true,"trace_s":0.058,"proof_bytes":561297,"proof_sha256":"b757e5ad1e14968347c887af3e00bc9e4e65b635f0cee0a5e40bccc6740da3f1","verified":null,"verify_ms":0.0,"matches_x86":true}
+{"kind":"done","ok":true,"wall_s":243.2}
+== timing
+  level: 100
+  temperature: 320
+  Capacity level: -1
+{"kind":"device","arch":"aarch64","cpus":8,"cpu_parts":["0xd80","0xd80","0xd80","0xd80","0xd81","0xd81","0xd81","0xd81"],"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"mem_total_kib":"7579252","battery_temp_decic":"","battery_capacity":"","kernel":""}
+{"kind":"build","version":"s7-device/1","channel":"blake2s","format":37,"seeded_masks":false,"cells":"built/1:86:20/plain,floor/1:86:20/plain,floor/1:86:20/masked12,lean/1:86:20/plain,lean/1:86:20/masked12,floor/2:43:20/plain,floor/2:43:20/masked11,lean/2:43:20/masked11"}
+cell built/1:86:20/plain: threads auto, 5 reps
+  built/1:86:20/plain rep 1/5: 6.351 s
+  built/1:86:20/plain rep 2/5: 6.072 s
+  built/1:86:20/plain rep 3/5: 6.140 s
+  built/1:86:20/plain rep 4/5: 6.410 s
+  built/1:86:20/plain rep 5/5: 6.588 s
+{"kind":"cell","cell":"built/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ffff","chips":23,"log_sizes":[15, 12, 16, 17, 8, 6, 4, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":7821,"cells":142859040,"model_cells":142859040,"reps":5,"prove_s_best":6.0719,"prove_s_median":6.3513,"prove_s_runs":[6.3513,6.0719,6.1403,6.4103,6.5881],"cpu_s_median":32.100,"peak_rss_mib":2024,"peak_rss_reset":true,"trace_s":0.056,"proof_bytes":3538744,"proof_sha256":"aef9b3c2b35ff1d866121bce2c61d258d8b585b70ea26663607096c3609f2581","verified":true,"verify_ms":43.1,"matches_x86":null}
+cell floor/1:86:20/plain: threads auto, 5 reps
+  floor/1:86:20/plain rep 1/5: 2.356 s
+  floor/1:86:20/plain rep 2/5: 2.286 s
+  floor/1:86:20/plain rep 3/5: 2.393 s
+  floor/1:86:20/plain rep 4/5: 2.339 s
+  floor/1:86:20/plain rep 5/5: 2.281 s
+{"kind":"cell","cell":"floor/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[15, 12, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":4975,"cells":47856336,"model_cells":47856336,"reps":5,"prove_s_best":2.2806,"prove_s_median":2.3392,"prove_s_runs":[2.3562,2.2858,2.3932,2.3392,2.2806],"cpu_s_median":11.650,"peak_rss_mib":851,"peak_rss_reset":true,"trace_s":0.074,"proof_bytes":2245957,"proof_sha256":"3d3fcbe10daf1d05b4e4fe1f0a88f77a0b96bb7556ce3a9aee75393280b12aec","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell floor/1:86:20/masked12: threads auto, 5 reps
+  floor/1:86:20/masked12 rep 1/5: 3.819 s
+  floor/1:86:20/masked12 rep 2/5: 3.994 s
+  floor/1:86:20/masked12 rep 3/5: 3.899 s
+  floor/1:86:20/masked12 rep 4/5: 3.728 s
+  floor/1:86:20/masked12 rep 5/5: 3.837 s
+{"kind":"cell","cell":"floor/1:86:20/masked12","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[16, 13, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13, 16],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19, 24],"columns":4975,"cells":99571408,"model_cells":100794368,"reps":5,"prove_s_best":3.7281,"prove_s_median":3.8373,"prove_s_runs":[3.8186,3.9940,3.8988,3.7281,3.8373],"cpu_s_median":21.900,"peak_rss_mib":1501,"peak_rss_reset":true,"trace_s":0.067,"proof_bytes":2292090,"proof_sha256":"d48da47ec2d258d359c8404fd3f9fad363da470b36469e2bd722f187bfc4aeba","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell lean/1:86:20/plain: threads auto, 5 reps
+  lean/1:86:20/plain rep 1/5: 1.779 s
+  lean/1:86:20/plain rep 2/5: 1.982 s
+  lean/1:86:20/plain rep 3/5: 1.833 s
+  lean/1:86:20/plain rep 4/5: 1.899 s
+  lean/1:86:20/plain rep 5/5: 1.744 s
+{"kind":"cell","cell":"lean/1:86:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[15, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10],"fixed":[],"columns":1882,"cells":34880208,"model_cells":34880208,"reps":5,"prove_s_best":1.7439,"prove_s_median":1.8334,"prove_s_runs":[1.7795,1.9816,1.8334,1.8991,1.7439],"cpu_s_median":8.760,"peak_rss_mib":654,"peak_rss_reset":true,"trace_s":0.062,"proof_bytes":948004,"proof_sha256":"16b0dbeddbba87b51b7010211dfdb586f3305df21cf1faea23043ebe727b0254","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell lean/1:86:20/masked12: threads auto, 5 reps
+  lean/1:86:20/masked12 rep 1/5: 3.420 s
+  lean/1:86:20/masked12 rep 2/5: 3.643 s
+  lean/1:86:20/masked12 rep 3/5: 3.355 s
+  lean/1:86:20/masked12 rep 4/5: 3.452 s
+  lean/1:86:20/masked12 rep 5/5: 3.085 s
+{"kind":"cell","cell":"lean/1:86:20/masked12","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 13, 8, 8, 6, 8, 13, 13, 13, 13],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":73946832,"model_cells":74842112,"reps":5,"prove_s_best":3.0845,"prove_s_median":3.4199,"prove_s_runs":[3.4199,3.6431,3.3550,3.4517,3.0845],"cpu_s_median":16.710,"peak_rss_mib":1183,"peak_rss_reset":true,"trace_s":0.063,"proof_bytes":988651,"proof_sha256":"5bbe0d854e6801e9e3a4b6110d2281e1d0cd29254518e0964b6c6aa8400fd170","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell floor/2:43:20/plain: threads auto, 5 reps
+  floor/2:43:20/plain rep 1/5: 2.894 s
+  floor/2:43:20/plain rep 2/5: 2.892 s
+  floor/2:43:20/plain rep 3/5: 2.908 s
+  floor/2:43:20/plain rep 4/5: 2.726 s
+  floor/2:43:20/plain rep 5/5: 2.992 s
+{"kind":"cell","cell":"floor/2:43:20/plain","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[15, 12, 16, 16, 4, 4, 4, 15, 7, 10, 8, 8, 6, 8, 11, 11, 12, 10, 16],"fixed":[],"columns":4975,"cells":47856336,"model_cells":47856336,"reps":5,"prove_s_best":2.7264,"prove_s_median":2.8938,"prove_s_runs":[2.8938,2.8916,2.9080,2.7264,2.9924],"cpu_s_median":14.710,"peak_rss_mib":1249,"peak_rss_reset":true,"trace_s":0.071,"proof_bytes":1217153,"proof_sha256":"0069404f5554e75c73a042720f6eaa0583e830d291d4c038ecbd7622dfaa6ca8","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell floor/2:43:20/masked11: threads auto, 5 reps
+  floor/2:43:20/masked11 rep 1/5: 4.823 s
+  floor/2:43:20/masked11 rep 2/5: 4.718 s
+  floor/2:43:20/masked11 rep 3/5: 4.806 s
+  floor/2:43:20/masked11 rep 4/5: 4.767 s
+  floor/2:43:20/masked11 rep 5/5: 4.744 s
+{"kind":"cell","cell":"floor/2:43:20/masked11","steps":19192,"threads":"auto","pool":8,"mask":"0x01f9ff8b","chips":19,"log_sizes":[16, 13, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12, 16],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19, 24],"columns":4975,"cells":96130768,"model_cells":96985088,"reps":5,"prove_s_best":4.7178,"prove_s_median":4.7668,"prove_s_runs":[4.8234,4.7178,4.8062,4.7668,4.7440],"cpu_s_median":27.580,"peak_rss_mib":2278,"peak_rss_reset":true,"trace_s":0.074,"proof_bytes":1243059,"proof_sha256":"dfadede348551febde4d8ff69e879ea61ad5386f7c6cb4da0349501911c27e41","verified":null,"verify_ms":0.0,"matches_x86":null}
+cell lean/2:43:20/masked11: threads auto, 5 reps
+  lean/2:43:20/masked11 rep 1/5: 3.898 s
+  lean/2:43:20/masked11 rep 2/5: 4.079 s
+  lean/2:43:20/masked11 rep 3/5: 3.644 s
+  lean/2:43:20/masked11 rep 4/5: 3.746 s
+  lean/2:43:20/masked11 rep 5/5: 3.640 s
+{"kind":"cell","cell":"lean/2:43:20/masked11","steps":19192,"threads":"auto","pool":8,"mask":"0x00f9ff89","chips":17,"log_sizes":[16, 17, 17, 4, 4, 4, 15, 7, 12, 8, 8, 6, 8, 12, 12, 13, 12],"fixed":[8, 9, 10, 11, 12, 14, 15, 16, 19],"columns":1882,"cells":70506192,"model_cells":71032832,"reps":5,"prove_s_best":3.6397,"prove_s_median":3.7458,"prove_s_runs":[3.8979,4.0786,3.6439,3.7458,3.6397],"cpu_s_median":20.400,"peak_rss_mib":1890,"peak_rss_reset":true,"trace_s":0.066,"proof_bytes":561297,"proof_sha256":"b757e5ad1e14968347c887af3e00bc9e4e65b635f0cee0a5e40bccc6740da3f1","verified":null,"verify_ms":0.0,"matches_x86":null}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":64,"pool":8,"mean_ms":160.73,"median_ms":164.57,"p95_ms":191.04,"max_ms":203.96}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":64,"pool":8,"mean_ms":42.27,"median_ms":37.50,"p95_ms":75.47,"max_ms":92.13}
+{"kind":"done","ok":true,"wall_s":234.8}
+  level: 100
+  temperature: 320
+  Capacity level: -1
+exit=0
