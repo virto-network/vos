@@ -21,12 +21,17 @@
 //!   range-checked, the top byte below 128 and the word not p, so the bytes
 //!   are the word's one canonical encoding.
 //!
-//! The addresses `ptr + i` are byte limbs: limb 0 `ptr₀ + i − 256·c_i` with
-//! `c_i` a boolean carry, limbs 1..3 the pointer's or, when `c_i = 1`, those
-//! of `(ptr >> 8) + 1`, an increment with boolean carries (as BLAKE2b's
-//! chip). A carry chosen wrong gives an address whose limbs are not bytes,
-//! which no first touch produces, so its group in the ledger has no start
-//! and the proof does not balance.
+//! The addresses `ptr + i` are four limbs: limb 0 `ptr₀ + i − 256·c_i` with
+//! `c_i` a boolean carry, limbs 1..3 the pointer's or, when `c_i = 1`, those of
+//! `(ptr >> 8) + 1`, an increment with boolean carries. Whatever the carries,
+//! the increment's limbs sum to `(ptr >> 8) + 1` and the address's to the
+//! integer `ptr + i`, every identity being over small integers. So the
+//! ledger's 16-bit halves of a row's address either are the true address's,
+//! and the row joins that byte's group and reads or writes it there, or one
+//! of them lies outside `[0, 2^16)`, which no `ts = 0` write's halves do (its
+//! limbs are bytes): such a row can join no group and start none, and the
+//! proof does not balance. A wrong carry buys nothing, so limb 0 needs no
+//! range check, unlike BLAKE2b's chip, whose carries are pinned by one.
 //!
 //! Every fraction is its own interaction column (`Logup::Single`): the
 //! addresses are of degree 2.

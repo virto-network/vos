@@ -1261,8 +1261,9 @@ Branch `s7/7.15`, from vos-core `4e7b4982` (7.14 merged).
   below 128 by two `Range256` lookups, its bytes' sum not `3·255 + 127` by
   an inverse), each output byte range-checked and each output word
   canonical (top byte below 128, not p), the addresses `ptr + i` as byte
-  limbs with boolean carries (as BLAKE2b's chip; a wrong carry gives an
-  address no first touch produces). 527 main columns and 169 fractions,
+  limbs with boolean carries (the limbs sum to `ptr + i` whatever the
+  carries, so a wrong carry gives the true address's ledger halves or
+  halves outside `[0, 2^16)`, which join no group and start none). 527 main columns and 169 fractions,
   each its own interaction column (`Logup::Single`, the addresses being of
   degree 2): about 1,200 columns a row [measured, the build].
 - **The device shape** (`vos_pvm_proof::device`, pin J): the shared chip
@@ -1354,9 +1355,14 @@ the device shape's leakage gates, two witnesses at equal public values.
   proof's bytes; no opening shared by two proofs of one run nor two
   witnesses' from one seed; a right guess reproduces DeviceIoChip's sum
   alone; one shape for both witnesses.
-- **Format 35 byte for byte:** `fixtures::the_fixtures_are_the_generators`
-  and `the_fixtures_are_judged` pass, and `constants::` with every pinned
-  value unchanged (in `test-proof`).
+- **Format 35 byte for byte** for kernels without `ecalli 0x402`:
+  `fixtures::the_fixtures_are_the_generators` and
+  `the_fixtures_are_judged` pass, and `constants::` with every pinned
+  value unchanged (in `test-proof`). ProgramMemory now commits the call's
+  dispatch id 102 under every format, so a node kernel holding the call
+  has another program-memory root; under format 35 it was and stays
+  unprovable past the call, and pin H admits the call in device kernels
+  alone.
 - **`just check`:** green at `e67b7fee` (1,463 passed in 106 suites, the
   device's 22 among them; under a 12 GiB scope, `nice -n 10`,
   `CARGO_BUILD_JOBS=8`, other agents' runs on the machine, load 18–28).
@@ -1403,8 +1409,8 @@ re-measured beside it]:
   ms; the install (program and root) 0.18–0.19 s.
 - R1 in one attempt, 11 ms at 43 queries, 41 ms at 86.
 - Under load (another agent's runs, load 18–28: `runs/x86-device-load.jsonl`)
-  the same cells took ×3–5 longer, the device and floor cells within each
-  other's noise.
+  the same cells took ×4.0–6.5 longer (the floor cell at 2:43 10.69 s
+  against 1.65 s), the device and floor cells within each other's noise.
 
 **Where the plan was off:**
 - **Pin J's shape needs boundary chips of its own,** not only a data table
@@ -1420,7 +1426,8 @@ re-measured beside it]:
   a CPU column and a precompile dispatch the continuation must count, so
   the shared chip set's CPU is not format 35's: `CpuP2Chip`, one column
   and three fractions more. Format 41 therefore re-pins the CPU too (7.21
-  re-pins every program id anyway); format 35 keeps its CPU byte for byte.
+  re-pins every program id anyway); format 35 keeps its CPU byte for byte
+  (and its program ids, for kernels without `ecalli 0x402`).
 - **The device chips cannot join `chip_idx`** before 7.21: its count is
   the wire's `SEGMENT_CHIPS` and the install record's `Shape`. Their
   indices continue past it (`device::device_chip`), the masks staying
@@ -1448,3 +1455,21 @@ gates; `381da708` the spike's `device` cell (and the floor seam's hunk on
 the device-aware ledger); `e67b7fee` the heavy acceptance, `test-proof`'s
 device suite, the docs and `proving.md` §5 and §8; this record and the
 runs.
+
+**Review (Fable):** accept; L1–L4 folded
+(`docs/design/research/slice-7/7.15-fable.md`). The carry argument in the
+Poseidon2 chip's doc restated (the limbs sum to `ptr + i` whatever the
+carry; BLAKE2b's address doc already holds, its limb 0 range-checked), and
+DeviceMemoryChip's doc says two rows for one byte are harmless; this
+record's load range and the format-35 caveat corrected; three gates added
+(`a_non_canonical_poseidon2_output_word_is_refused`, an input inverted
+from an output whose first word is 0, written as p: the prover and,
+forced, `OodsNotMatching`; `a_trapping_run_is_refused`, logup;
+`a_wrong_address_carry_is_refused`, every constraint held, logup) and
+`a_second_segment_is_refused` asserting `Error::Logup`; the first and the
+third fail with the output's inverse constraint dropped or the carry left
+true [measured]; `LogupTraceBuilder`'s column writes one helper. Gates:
+the device suite 24 of 24 (`heavy` gated off), the device degree audit,
+`logup_trace_builder`'s bit-identity test, `fixtures::` (format 35 byte for
+byte), `just check` green (1,466 passed in 106 suites; 12 GiB scope,
+`nice -n 10`, 10 jobs).

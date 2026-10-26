@@ -172,6 +172,54 @@ pub fn trace_program(
     trace(blob, arguments, &[], gas, false, |_| {})
 }
 
+/// [`trace_device_kernel`] run to whatever exit it reaches, a trap
+/// included: its side note and how it stopped, what a forged trace of a run
+/// that does not halt starts from. The tests' dev edge alone
+/// (`seeded-masks`).
+#[cfg(feature = "seeded-masks")]
+pub fn trace_device_kernel_to_exit(
+    blob: &[u8],
+    input: &[u8],
+    gas: u64,
+) -> Result<(SideNote, ExitReason), KernelTraceError> {
+    let (mut tracer, image, permissions) = start(blob, &[], input, gas, true, |_| {})?;
+    let exit = tracer.run_with_precompiles();
+    let side_note = tracer
+        .into_side_note()
+        .with_sparse_memory(image)
+        .with_memory_layout(permissions);
+    Ok((side_note, exit))
+}
+
+/// `blob` loaded on `arguments` and `input` with `gas`, `forge` applied, its
+/// tracer at its first step.
+fn start(
+    blob: &[u8],
+    arguments: &[u8],
+    input: &[u8],
+    gas: u64,
+    poseidon2: bool,
+    forge: impl FnOnce(&mut Memory),
+) -> Result<
+    (
+        TracingPvm,
+        SparseMemoryImage,
+        crate::memory_layout::MemoryLayout,
+    ),
+    KernelTraceError,
+> {
+    let (machine, image, permissions) = load(blob, arguments, gas, forge)?;
+    let tracer = TracingPvm::new(machine)
+        .with_witness_input(input.to_vec())
+        .ok_or(KernelTraceError::Input)?;
+    let tracer = if poseidon2 {
+        tracer.with_poseidon2()
+    } else {
+        tracer
+    };
+    Ok((tracer, image, permissions))
+}
+
 fn trace(
     blob: &[u8],
     arguments: &[u8],
@@ -180,13 +228,7 @@ fn trace(
     poseidon2: bool,
     forge: impl FnOnce(&mut Memory),
 ) -> Result<KernelTrace, KernelTraceError> {
-    let (machine, image, permissions) = load(blob, arguments, gas, forge)?;
-    let mut tracer = TracingPvm::new(machine)
-        .with_witness_input(input.to_vec())
-        .ok_or(KernelTraceError::Input)?;
-    if poseidon2 {
-        tracer = tracer.with_poseidon2();
-    }
+    let (mut tracer, image, permissions) = start(blob, arguments, input, gas, poseidon2, forge)?;
     let exit = tracer.run_with_precompiles();
     if exit != ExitReason::Halt {
         return Err(KernelTraceError::Exit(exit));

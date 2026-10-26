@@ -10,7 +10,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use num_traits::{One, Zero};
 use stwo::core::channel::MerkleChannel;
+use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
+use stwo::core::utils::{bit_reverse_index, coset_index_to_circle_domain_index};
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
 use stwo::core::verifier::VerificationError;
 use stwo::prover::ProvingError;
@@ -19,11 +21,13 @@ use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_compiler::assembler::{Assembler, Reg};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masked::{Claim, verify_masked};
+use vos_pvm_proof::AirColumn;
+use vos_pvm_proof::chips::poseidon2;
 use vos_pvm_proof::core::ecall::ECALL_WITNESS_INPUT;
-use vos_pvm_proof::device::device_chip;
+use vos_pvm_proof::device::{device_chip, device_chips_of_mask};
 use vos_pvm_proof::format::{ChannelKind, Format};
 use vos_pvm_proof::framework_access::AllLookupElements;
-use vos_pvm_proof::kernel::{PERM_RW, trace_forged_device_kernel};
+use vos_pvm_proof::kernel::{PERM_RW, trace_device_kernel_to_exit, trace_forged_device_kernel};
 use vos_pvm_proof::masked::{DeviceComponents, device_bound_sums, device_public_values};
 use vos_pvm_proof::poseidon2::P2MerkleChannel;
 use vos_pvm_proof::segment::SegmentCursor;
@@ -37,7 +41,7 @@ use vos_pvm_recair::masked::{Checks, MaskRng};
 use vos_pvm_recair_air::masked::MaskedComponents;
 
 use crate::support::{
-    HEAP, Proof, RO_BASE, STACK_TOP, blob, format, io_and_halt, io_bytes, program, prove, run,
+    HEAP, IO, Proof, RO_BASE, STACK_TOP, blob, format, io_and_halt, io_bytes, program, prove, run,
     small_format, the_program, verify, witness,
 };
 
@@ -331,10 +335,37 @@ fn a_second_segment_is_refused() {
     let second = || SegmentCursor::new(&full).side_note(call + 1, steps);
     let result = prove_device::<P2>(&format(), the_program(), &mut second(), MaskRng::Seeded(7));
     if let Ok((proof, _)) = result {
-        assert!(verify_device::<P2>(&format(), the_program(), &proof).is_err());
+        assert!(matches!(
+            verify_device::<P2>(&format(), the_program(), &proof),
+            Err(Error::Logup)
+        ));
     }
     let proof = forced(the_program(), &mut second(), |_, _| {}, UNCHECKED);
-    assert!(verify_device::<P2>(&format(), the_program(), &proof).is_err());
+    let outcome = verify_device::<P2>(&format(), the_program(), &proof);
+    assert!(matches!(outcome, Err(Error::Logup)), "{outcome:?}");
+}
+
+/// A run that traps instead of halting is refused: a kernel that sets its
+/// io-hash and traps, under its own program. Its last step produces no
+/// `(ts, HALT_PC)` for DeviceBoundaryChip's halt to consume.
+#[test]
+fn a_trapping_run_is_refused() {
+    let mut asm = Assembler::new();
+    asm.set_stack_pages(1);
+    for (register, word) in [Reg::A2, Reg::A3, Reg::A4, Reg::A5].into_iter().zip(IO) {
+        asm.load_imm(register, word as i32);
+    }
+    asm.trap();
+    let kernel = asm.build();
+    let trapped = || {
+        let (side_note, exit) = trace_device_kernel_to_exit(&kernel, &[], 10_000).expect("runs");
+        assert_eq!(exit, vos_pvm::ExitReason::Panic);
+        side_note
+    };
+    let format = format();
+    let (active, log_sizes) = device_shape(&format, &kernel, &mut trapped()).expect("a shape");
+    let program = install::<P2>(&format, &kernel, active, &log_sizes).expect("installs");
+    refused_as_unbalanced(&program, trapped());
 }
 
 /// A Poseidon2 output that is not the permutation's is refused: the call's
@@ -346,6 +377,147 @@ fn a_poseidon2_output_not_the_permutations_is_refused() {
         side_note.poseidon2_ops[0].output[0] ^= 1;
         side_note
     });
+}
+
+/// A Poseidon2 output word written non-canonically is refused: an input
+/// whose permutation's first word is 0, that word written as p's bytes,
+/// which the field reads as 0 too, so only the word's encoding is wrong.
+/// The honest run on that input proves.
+#[test]
+fn a_non_canonical_poseidon2_output_word_is_refused() {
+    use vos_pvm_poseidon2::P;
+    let input = input_whose_first_output_word_is_zero();
+    let (proof, _) = prove::<P2>(
+        &format(),
+        the_program(),
+        &blob(),
+        &input,
+        MaskRng::Seeded(8),
+    )
+    .expect("proves");
+    verify_device::<P2>(&format(), the_program(), &proof).expect("verifies");
+    refused_as_a_broken_constraint(the_program(), || {
+        let mut side_note = run(&blob(), &input);
+        let output = &mut side_note.poseidon2_ops[0].output;
+        assert_eq!(output[..4], [0; 4]);
+        output[..4].copy_from_slice(&P.to_le_bytes());
+        side_note
+    });
+}
+
+/// 64 witness bytes, sixteen words below p, whose permutation's first word
+/// is 0: the permutation inverted from the state `0, 1, .., 15`.
+fn input_whose_first_output_word_is_zero() -> Vec<u8> {
+    use vos_pvm_poseidon2::{
+        EXTERNAL_ROUND_CONSTS, INTERNAL_ROUND_CONSTS, M31, N_HALF_FULL_ROUNDS, N_STATE, P,
+        apply_external_round_matrix, apply_internal_round_matrix, permute,
+    };
+    fn pow(base: M31, exponent: u64) -> M31 {
+        (0..64).rev().fold(M31::ONE, |acc, bit| {
+            let acc = acc * acc;
+            if exponent >> bit & 1 == 1 {
+                acc * base
+            } else {
+                acc
+            }
+        })
+    }
+    // `5 · ROOT ≡ 1 (mod p − 1)`: `x ↦ x^ROOT` inverts the S-box.
+    const ROOT: u64 = 1_717_986_917;
+    // `x` with `linear(x) = y`, by elimination over the map's matrix.
+    fn solve(linear: fn(&mut [M31; N_STATE]), y: [M31; N_STATE]) -> [M31; N_STATE] {
+        let mut rows = [[M31::ZERO; N_STATE + 1]; N_STATE];
+        for k in 0..N_STATE {
+            let mut unit = [M31::ZERO; N_STATE];
+            unit[k] = M31::ONE;
+            linear(&mut unit);
+            for (row, value) in rows.iter_mut().zip(unit) {
+                row[k] = value;
+            }
+        }
+        for (row, value) in rows.iter_mut().zip(y) {
+            row[N_STATE] = value;
+        }
+        for col in 0..N_STATE {
+            let pivot = (col..N_STATE)
+                .find(|&row| rows[row][col] != M31::ZERO)
+                .expect("an invertible map");
+            rows.swap(col, pivot);
+            let inverse = pow(rows[col][col], u64::from(P) - 2);
+            rows[col] = rows[col].map(|value| value * inverse);
+            let pivot_row = rows[col];
+            for (row, values) in rows.iter_mut().enumerate() {
+                let factor = values[col];
+                if row != col && factor != M31::ZERO {
+                    for (value, &pivot) in values.iter_mut().zip(&pivot_row) {
+                        *value = *value - factor * pivot;
+                    }
+                }
+            }
+        }
+        rows.map(|row| row[N_STATE])
+    }
+    let external = |state: &mut [M31; N_STATE]| apply_external_round_matrix(state);
+    let internal = |state: &mut [M31; N_STATE]| apply_internal_round_matrix::<M31, M31>(state);
+    let undo_full = |state: &mut [M31; N_STATE], constants: &[M31; N_STATE]| {
+        *state = solve(external, *state);
+        for (word, &constant) in state.iter_mut().zip(constants) {
+            *word = pow(*word, ROOT) - constant;
+        }
+    };
+    let target: [M31; N_STATE] = core::array::from_fn(|j| M31::new(j as u32));
+    let mut state = target;
+    for constants in EXTERNAL_ROUND_CONSTS[N_HALF_FULL_ROUNDS..].iter().rev() {
+        undo_full(&mut state, constants);
+    }
+    for &constant in INTERNAL_ROUND_CONSTS.iter().rev() {
+        state = solve(internal, state);
+        state[0] = pow(state[0], ROOT) - constant;
+    }
+    for constants in EXTERNAL_ROUND_CONSTS[..N_HALF_FULL_ROUNDS].iter().rev() {
+        undo_full(&mut state, constants);
+    }
+    state = solve(external, state);
+    let input = state;
+    permute(&mut state);
+    assert_eq!(state, target);
+    input
+        .iter()
+        .flat_map(|word| word.value().to_le_bytes())
+        .collect()
+}
+
+/// A wrong address carry is refused: the call's row with the carry out of
+/// its first input address's low byte set where the address does not
+/// overflow it. The limbs still sum to the address, but its ledger halves
+/// are not the address's and one is negative, so the read joins no group:
+/// every constraint holds and the memory ledger does not balance.
+#[test]
+fn a_wrong_address_carry_is_refused() {
+    let program = the_program();
+    let side_note = || run(&blob(), &witness(1));
+    assert!(side_note().poseidon2_ops[0].in_ptr & 0xff < 0x100 - 64);
+    let position = device_chips_of_mask(program.active)
+        .position(|chip| chip == device_chip::POSEIDON2)
+        .expect("the Poseidon2 chip");
+    let tamper = |trace: &mut vos_pvm_proof::masked::MaskedDeviceTrace| {
+        let log_size = trace.log_sizes[position];
+        let columns = trace.main_columns_mut().nth(position).expect("the chip");
+        let row = bit_reverse_index(coset_index_to_circle_domain_index(0, log_size), log_size);
+        columns[poseidon2::Column::InCarry.offset()].as_mut_slice()[row] = BaseField::from(1);
+    };
+    let (proof, _) = prove_device_forced::<P2>(
+        &format(),
+        program,
+        &mut side_note(),
+        MaskRng::Seeded(7),
+        tamper,
+        |_, _| {},
+        Checks::ALL,
+    )
+    .expect("every constraint holds");
+    let outcome = verify_device::<P2>(&format(), program, &proof);
+    assert!(matches!(outcome, Err(Error::Logup)), "{outcome:?}");
 }
 
 /// The run with its Poseidon2 call's first input word `word`: the witness

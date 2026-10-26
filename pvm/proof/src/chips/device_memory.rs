@@ -20,6 +20,11 @@
 //! The closing timestamp is a column: the ledger orders every access before
 //! it and requires it to close its address's group, so no choice of it lets
 //! an access go unread.
+//!
+//! Two rows for one byte are harmless: the ledger keeps one group per
+//! address, both rows' `ts = 0` writes carry the same first touch (the
+//! table's or zero) and both closing reads chain in that group, so a
+//! duplicated first touch stages no stale read.
 
 use crate::prelude::*;
 use num_traits::{One, Zero};

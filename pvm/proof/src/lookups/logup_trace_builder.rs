@@ -111,25 +111,7 @@ impl LogupTraceBuilder {
             tuple,
         );
 
-        if self.single {
-            let mut logup_col_gen = self.logup_trace_gen.new_col();
-            for (vec_row, (a, b)) in frac_iter.enumerate() {
-                logup_col_gen.write_frac(vec_row, a, b);
-            }
-            logup_col_gen.finalize_col();
-        } else if self.pending_logup.is_empty() {
-            self.pending_logup.extend(frac_iter);
-        } else {
-            let mut logup_col_gen = self.logup_trace_gen.new_col();
-
-            for (vec_row, (a, b)) in frac_iter.enumerate() {
-                let (c, d) = self.pending_logup[vec_row];
-                logup_col_gen.write_frac(vec_row, a * d + b * c, b * d);
-            }
-
-            logup_col_gen.finalize_col();
-            self.pending_logup.clear();
-        }
+        self.push_fractions(frac_iter);
     }
 
     /// Like `add_to_relation_with`, but the tuple values are computed per-row
@@ -162,25 +144,36 @@ impl LogupTraceBuilder {
             (p0, p1)
         });
 
+        self.push_fractions(frac_iter);
+    }
+
+    /// One relation's fractions: a column of their own when `single`,
+    /// otherwise held until the next relation's and paired with them in one
+    /// column.
+    fn push_fractions(&mut self, fractions: impl Iterator<Item = LogUpFrac>) {
         if self.single {
-            let mut logup_col_gen = self.logup_trace_gen.new_col();
-            for (vec_row, (a, b)) in frac_iter.enumerate() {
-                logup_col_gen.write_frac(vec_row, a, b);
-            }
-            logup_col_gen.finalize_col();
+            self.write_column(fractions);
         } else if self.pending_logup.is_empty() {
-            self.pending_logup.extend(frac_iter);
+            self.pending_logup.extend(fractions);
         } else {
-            let mut logup_col_gen = self.logup_trace_gen.new_col();
-
-            for (vec_row, (a, b)) in frac_iter.enumerate() {
-                let (c, d) = self.pending_logup[vec_row];
-                logup_col_gen.write_frac(vec_row, a * d + b * c, b * d);
-            }
-
-            logup_col_gen.finalize_col();
-            self.pending_logup.clear();
+            let mut pending = core::mem::take(&mut self.pending_logup);
+            self.write_column(
+                fractions
+                    .zip(&pending)
+                    .map(|((a, b), &(c, d))| (a * d + b * c, b * d)),
+            );
+            pending.clear();
+            self.pending_logup = pending;
         }
+    }
+
+    /// One interaction column of `fractions`, a packed row each.
+    fn write_column(&mut self, fractions: impl IntoIterator<Item = LogUpFrac>) {
+        let mut logup_col_gen = self.logup_trace_gen.new_col();
+        for (vec_row, (a, b)) in fractions.into_iter().enumerate() {
+            logup_col_gen.write_frac(vec_row, a, b);
+        }
+        logup_col_gen.finalize_col();
     }
 
     pub fn finalize(
@@ -190,11 +183,8 @@ impl LogupTraceBuilder {
         SecureField,
     ) {
         if !self.pending_logup.is_empty() {
-            let mut logup_col_gen = self.logup_trace_gen.new_col();
-            for (vec_row, (a, b)) in self.pending_logup.into_iter().enumerate() {
-                logup_col_gen.write_frac(vec_row, a, b);
-            }
-            logup_col_gen.finalize_col();
+            let pending = core::mem::take(&mut self.pending_logup);
+            self.write_column(pending);
         }
 
         self.logup_trace_gen.finalize_last()
