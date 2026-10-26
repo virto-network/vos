@@ -37,4 +37,7 @@ pub mod io;
 pub use io::{RootKind, RootRead, UnknownRootKind, compute_io_hash};
 
 pub mod poseidon2;
-pub use poseidon2::{poseidon2_compress, poseidon2_compress_block};
+pub use poseidon2::{
+    checked_poseidon2_compress_block, poseidon2_compress, poseidon2_compress_block,
+    poseidon2_compress_into,
+};

@@ -454,6 +454,7 @@ fn an_unlisted_leader_hands_off_to_a_listed_replica() {
     assert_eq!(held.signer, cluster.node(next).id().0);
     // The handoff names a listed replica; under load an election may
     // move leadership on from it to the other before the anchor.
+    let listed = anchoring.venue.anchor_keys(&space);
     assert!(
         alerts(&cluster, leader).iter().any(|alert| matches!(
             alert,
@@ -461,7 +462,7 @@ fn an_unlisted_leader_hands_off_to_a_listed_replica() {
                 window: 0,
                 code: 3,
                 to: Some(to),
-            } if *to != leader
+            } if listed.contains(&cluster.node(*to).id().0)
         )),
         "{:?}",
         alerts(&cluster, leader)

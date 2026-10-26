@@ -34,6 +34,16 @@ pub fn poseidon2_compress(left: &[u32; 8], right: &[u32; 8]) -> [u32; 8] {
 /// When a word is at or above p.
 pub fn poseidon2_compress_block(input: &[u32; 16]) -> [u32; 8] {
     let mut output = [0u32; 8];
+    poseidon2_compress_into(input, &mut output);
+    output
+}
+
+/// [`poseidon2_compress_block`] written to `output`, which the call writes
+/// itself where a host serves it.
+///
+/// # Panics
+/// When a word is at or above p.
+pub fn poseidon2_compress_into(input: &[u32; 16], output: &mut [u32; 8]) {
     #[cfg(target_arch = "riscv64")]
     if crate::ecalls::call::<ECALL_POSEIDON2>(
         input.as_ptr() as u64,
@@ -41,7 +51,7 @@ pub fn poseidon2_compress_block(input: &[u32; 16]) -> [u32; 8] {
         0,
         0,
     ) {
-        return output;
+        return;
     }
     let mut state = [vos_pvm_poseidon2::M31::ZERO; vos_pvm_poseidon2::N_STATE];
     for (word, &value) in state.iter_mut().zip(input) {
@@ -52,7 +62,15 @@ pub fn poseidon2_compress_block(input: &[u32; 16]) -> [u32; 8] {
     for (out, word) in output.iter_mut().zip(&state) {
         *out = word.value();
     }
-    output
+}
+
+/// [`poseidon2_compress_block`] refusing, rather than trapping on, a word at
+/// or above p: `None` where the call would trap.
+pub fn checked_poseidon2_compress_block(input: &[u32; 16]) -> Option<[u32; 8]> {
+    input
+        .iter()
+        .all(|&word| word < P)
+        .then(|| poseidon2_compress_block(input))
 }
 
 #[cfg(test)]
@@ -66,6 +84,18 @@ mod tests {
         let right: [u32; 8] = core::array::from_fn(|i| P - 1 - i as u32);
         let expected = vos_pvm_poseidon2::compress(&left.map(M31::new), &right.map(M31::new));
         assert_eq!(poseidon2_compress(&left, &right), expected.map(M31::value));
+    }
+
+    #[test]
+    fn the_checked_compression_refuses_a_word_at_p() {
+        let left: [u32; 8] = core::array::from_fn(|i| P - 1 - i as u32);
+        let mut input: [u32; 16] = core::array::from_fn(|i| left[i % 8]);
+        assert_eq!(
+            checked_poseidon2_compress_block(&input),
+            Some(poseidon2_compress(&left, &left))
+        );
+        input[15] = P;
+        assert_eq!(checked_poseidon2_compress_block(&input), None);
     }
 
     #[test]

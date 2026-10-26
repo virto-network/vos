@@ -401,6 +401,69 @@ fn requests_progress_beside_large_computations() {
     assert!(steps.iter().all(|&taken| taken >= 2), "{steps:?}");
 }
 
+/// A Poseidon2 compression whose output, at φ8, lands on a page the meter
+/// cannot pay: the step ends before it, unserved, rather than serving it
+/// and failing at the page; the next step serves it first. The batch's
+/// room is the least that takes the step to the compression: the pages
+/// its own code writes before, too few for the output's too. The state is
+/// the one computed straight, and the backends agree on every batch.
+#[test]
+fn a_compression_whose_output_the_meter_cannot_pay_waits_unserved() {
+    let rounds = 3u32;
+    let mut state = [0u8; 32];
+    for round in 0..rounds {
+        let mut block = [0u8; 64];
+        block[..32].copy_from_slice(&state);
+        for word in block[32..].chunks_exact_mut(4) {
+            word.copy_from_slice(&round.to_le_bytes());
+        }
+        state = vos_pvm::precompile::poseidon2_compress(&block).unwrap();
+    }
+    let words: Vec<u32> = state
+        .chunks_exact(4)
+        .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+        .collect();
+    let mut runs = Vec::new();
+    for backend in Node::backends() {
+        let mut flows = Flows::at_default_budget(Node::on(backend));
+        let start = flows.start("absorb", rounds);
+        let mut results = vec![flows.unmodelled(1, vec![start])];
+        let pending = |flows: &Flows, pages: u64| {
+            let budget = keep(flows, 0) + defaults::SWEEP_RESERVE + pages * defaults::WRITTEN_PAGE;
+            let work =
+                flows
+                    .node
+                    .budgeted_work(flows.time + 1, [0; 32], budget, vec![flows.sweeping(1)]);
+            let output = flows.node.refine_with(&work, budget);
+            let result = split_output(&output).unwrap().0;
+            due(&result, 0)
+                .writes
+                .iter()
+                .find(|write| write.key == keys::workflow(WorkflowId(0)))
+                .and_then(|write| vos_wire::Decode::decode(write.value.as_ref()?).ok())
+                .and_then(|(record, _): (Workflow, _)| record.snapshot)
+                .and_then(|snapshot| snapshot.pending)
+        };
+        let room = (1..16)
+            .find(|&pages| pending(&flows, pages) == Some(precompile::POSEIDON2))
+            .expect("a room that takes the step to its compression");
+        flows.budget = keep(&flows, 0) + defaults::SWEEP_RESERVE + room * defaults::WRITTEN_PAGE;
+        let sweep = flows.sweeping(1);
+        results.push(flows.unmodelled(1, vec![sweep]));
+        let snapshot = flows.record(0).snapshot.unwrap();
+        assert_eq!(snapshot.pending, Some(precompile::POSEIDON2));
+        flows.budget = defaults::REFINE_GAS;
+        while !matches!(flows.record(0).state, WorkflowState::Ended(_)) {
+            let sweep = flows.sweeping(1);
+            results.push(flows.unmodelled(1, vec![sweep]));
+            assert!(results.len() < 20, "it ends");
+        }
+        assert_eq!(ended(&flows.record(0)), &Outcome::Done(words.encode()));
+        runs.push(results);
+    }
+    assert!(runs.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
 /// A call of this agent's that is its unit's first effect, whose reply
 /// lands on a page the meter cannot pay: the call waits, unserved, as its
 /// output is kept for before it is served, so its effects never outrun

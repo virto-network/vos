@@ -198,8 +198,9 @@ macro_rules! rows_handle {
 
             /// The first row in the transform's order, fetched with a
             /// buffer as small as the row allows, where [`Self::iter`]
-            /// fetches a buffer's worth of rows. A row that does not decode
-            /// traps.
+            /// fetches a buffer's worth of rows. As in [`Iter`], a row that
+            /// does not decode traps, and a scan that frames no row is
+            /// none.
             pub fn first(&self) -> Option<(K, V)> {
                 let mut capacity = 64;
                 loop {
@@ -212,7 +213,7 @@ macro_rules! rows_handle {
                     }
                     let rest = buffer.get(..written as usize)?;
                     let (key, used) = Vec::<u8>::decode(rest).ok()?;
-                    let (value, _) = Vec::<u8>::decode(&rest[used..]).expect("a row");
+                    let (value, _) = Vec::<u8>::decode(&rest[used..]).ok()?;
                     let key = K::decode_key(&key).expect("an undecodable table key");
                     let (value, _) = V::decode(&value).expect("an undecodable table row");
                     return Some((key, value));

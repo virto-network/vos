@@ -520,13 +520,8 @@ impl Machine {
         for (word, chunk) in input.iter_mut().zip(bytes.chunks_exact(4)) {
             *word = u32::from_le_bytes(chunk.try_into().unwrap());
         }
-        if input
-            .iter()
-            .any(|&word| word >= vos_pvm_precompiles::poseidon2::P)
-        {
-            return Err(Failure::Trapped);
-        }
-        let output = vos_pvm_precompiles::poseidon2_compress_block(&input);
+        let output = vos_pvm_precompiles::checked_poseidon2_compress_block(&input)
+            .ok_or(Failure::Trapped)?;
         let mut bytes = [0u8; 32];
         for (chunk, word) in bytes.chunks_exact_mut(4).zip(&output) {
             chunk.copy_from_slice(&word.to_le_bytes());
