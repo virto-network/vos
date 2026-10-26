@@ -2582,6 +2582,7 @@ name = "vos-api"
 version = "0.1.0"
 dependencies = [
  "proptest",
+ "quinn",
  "vos-pvm-codec",
  "vos-wire",
 ]
@@ -2723,6 +2724,7 @@ dependencies = [
  "parity-scale-codec",
  "proptest",
  "quick_cache",
+ "quinn",
  "rayon",
  "rcgen",
  "rustls",

@@ -39,6 +39,11 @@ pub struct Settings {
     api_connections: Option<usize>,
     /// The most requests in flight on one connection of the node API.
     api_in_flight: Option<usize>,
+    /// Where the node API's QUIC endpoint listens: none by default.
+    api_listen: Option<std::net::SocketAddr>,
+    /// The keys, in hex, the QUIC endpoint admits: gateways, drivers and
+    /// remote tools, no authority among them.
+    gateways: Option<Vec<String>>,
 }
 
 /// The node API's socket by default, in the data directory.
@@ -52,6 +57,10 @@ pub struct Fronts {
     /// The socket's path, if not the default.
     pub api_socket: Option<PathBuf>,
     pub api_socket_mode: u32,
+    /// The QUIC endpoint's address, if it serves one.
+    pub api_listen: Option<std::net::SocketAddr>,
+    /// The keys the QUIC endpoint admits.
+    pub gateways: Vec<[u8; 32]>,
 }
 
 impl Settings {
@@ -111,9 +120,17 @@ impl Settings {
                 "an api_socket_mode of {mode:#o}: a file mode is 0o777 at most"
             ));
         }
+        let gateways = self
+            .gateways
+            .unwrap_or_default()
+            .iter()
+            .map(|key| crate::key_bytes(key).map_err(|why| format!("a gateway's key {key}: {why}")))
+            .collect::<Result<_, _>>()?;
         Ok(Fronts {
             api_socket: self.api_socket,
             api_socket_mode: mode,
+            api_listen: self.api_listen,
+            gateways,
         })
     }
 }
@@ -158,6 +175,16 @@ mod tests {
         );
         assert_eq!(fronts.api_socket_mode, 0o600);
         assert!(applied("api_socket_mode = 0o1777\n").is_err());
+        let fronts = toml::from_str::<Settings>(&format!(
+            "api_listen = \"127.0.0.1:7710\"\ngateways = [\"{}\"]\n",
+            "ab".repeat(32)
+        ))
+        .unwrap()
+        .apply(&mut Config::new(Vec::new()))
+        .unwrap();
+        assert_eq!(fronts.api_listen, Some("127.0.0.1:7710".parse().unwrap()));
+        assert_eq!(fronts.gateways, vec![[0xab; 32]]);
+        assert!(applied("gateways = [\"ab\"]\n").is_err());
     }
 
     #[test]

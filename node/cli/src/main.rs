@@ -180,6 +180,12 @@ impl RunArgs {
         println!("listening on {address}");
         println!("node {}", hex::encode(node.id().0));
         println!("api on {}", socket.display());
+        if let Some(listen) = fronts.api_listen {
+            let address = node
+                .serve_quic(listen, fronts.gateways)
+                .map_err(|error| format!("{error:?}"))?;
+            println!("api on quic://{address}");
+        }
         loop {
             std::thread::park();
         }

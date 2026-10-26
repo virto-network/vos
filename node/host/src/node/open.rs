@@ -172,6 +172,7 @@ impl Node {
             secret,
             ingress_tls: config.ingress_tls,
             fronts: Mutex::new(Vec::new()),
+            quic_api: Mutex::new(None),
             stop: Some(stop),
             runtime: Some(thread),
             liveness,
@@ -219,6 +220,7 @@ impl Node {
         // End the ingress, the API's socket and their connections while the
         // runtime still runs them, so none outlives the node holding its
         // store.
+        drop(lock(&self.quic_api).take());
         let fronts = std::mem::take(&mut *lock(&self.fronts));
         for (task, stop) in fronts {
             let _ = stop.try_send(());

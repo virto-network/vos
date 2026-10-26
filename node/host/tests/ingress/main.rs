@@ -9,6 +9,7 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod api;
 mod operator;
+mod quic;
 mod requests;
 mod sessions;
 mod workflows;

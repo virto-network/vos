@@ -12,8 +12,8 @@ use vos_api::Kind;
 use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
-    AgentInfo, Create, Grant, Install, QueryCall, Rejection, Replace, Response, WorkflowRead,
-    workflow_read_horizon,
+    AgentInfo, Create, Grant, Install, OperatorRefusal, QueryCall, Rejection, Replace, Response,
+    WorkflowRead, workflow_read_horizon,
 };
 use vos_wire::records::{Installed, unstored};
 use vos_wire::schema::Schema;
@@ -24,6 +24,7 @@ use crate::node::{Inner, ReplaceError};
 use crate::queries::Asked;
 use crate::signature::verify;
 
+pub(crate) mod quic;
 pub(crate) mod socket;
 
 /// How far ahead a query's `not_after` may be.
@@ -34,6 +35,8 @@ const QUERY_HORIZON_MS: u64 = 300_000;
 pub(crate) enum Via {
     /// The unix socket: its file mode is the access.
     Socket,
+    /// QUIC, from a key the node lists in `gateways`.
+    Quic,
     /// The node's own HTTP: an operator's bare body, once the node's
     /// bearer token admitted it.
     Http,
@@ -110,6 +113,7 @@ impl Api {
         if kind.operator() {
             return match via {
                 Via::Socket | Via::Http => self.operate(kind, body).await,
+                Via::Quic => Response::Rejected(Rejection::Operator(OperatorRefusal::SocketOnly)),
             };
         }
         match kind {

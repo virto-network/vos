@@ -6,6 +6,8 @@
 
 mod frame;
 mod operated;
+#[cfg(feature = "quic")]
+pub mod quic;
 
 pub use frame::{Event, Frame, Framing, Header, MAX_ANSWER, Reader, Requests, error_frame, frame};
 pub use operated::{CREDENTIALS, OPERATOR_DOMAIN, Operated, operator_message};

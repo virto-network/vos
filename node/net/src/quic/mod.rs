@@ -41,7 +41,7 @@ use crate::{
     Arrivals, Class, Deliver, Limits, Network, NodeKey, NodeNumber, Peer, Refused, arrivals,
 };
 
-mod executor;
+pub(crate) mod executor;
 mod receive;
 mod send;
 

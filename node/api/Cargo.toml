@@ -5,9 +5,15 @@ edition.workspace = true
 license.workspace = true
 description = "The VOS node's binary API: its frames, its kinds and their limits, operator requests, and clients over a byte stream and over QUIC."
 
+[features]
+# A client over QUIC, a stream a request, on quinn's own API whatever its
+# runtime.
+quic = ["dep:quinn"]
+
 [dependencies]
 scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features = false }
 vos-wire = { workspace = true }
+quinn = { version = "0.11.12", default-features = false, optional = true }
 
 [dev-dependencies]
 proptest = "1"

@@ -407,4 +407,34 @@ impl Node {
         lock(&self.fronts).push((task, stop));
         Ok(())
     }
+
+    /// Serve the node API over QUIC on `listen` (`127.0.0.1:0` picks a
+    /// port), to the clients whose keys `gateways` lists, checked at the
+    /// handshake: the address it listens on. A listed key is a transport's
+    /// admission, no authority.
+    pub fn serve_quic(
+        &self,
+        listen: SocketAddr,
+        gateways: Vec<[u8; 32]>,
+    ) -> Result<SocketAddr, Error> {
+        let settings = &self.inner.settings;
+        let limits = crate::api::quic::Limits {
+            connections: settings.api_connections,
+            in_flight: settings.api_in_flight,
+            deadline: settings.api_frame_deadline,
+        };
+        let served = crate::api::quic::serve(
+            Arc::clone(&self.api),
+            &self.secret,
+            listen,
+            gateways,
+            limits,
+        )
+        .map_err(|error| Error::Data(format!("{listen}: {error}")))?;
+        let local = served
+            .local_addr()
+            .map_err(|error| Error::Data(error.to_string()))?;
+        *lock(&self.quic_api) = Some(served);
+        Ok(local)
+    }
 }

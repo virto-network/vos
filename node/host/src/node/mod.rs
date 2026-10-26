@@ -524,6 +524,8 @@ pub struct Node {
     /// The servers on the node's thread (the HTTP ingress, the API's
     /// socket), and what stops each.
     fronts: Mutex<Vec<(smol::Task<()>, smol::channel::Sender<()>)>>,
+    /// The API's QUIC endpoint, on its own thread.
+    quic_api: Mutex<Option<crate::api::quic::Served>>,
     stop: Option<smol::channel::Sender<()>>,
     runtime: Option<JoinHandle<()>>,
     /// The pair heartbeat's thread, and what stops it.
