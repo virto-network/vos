@@ -2270,3 +2270,37 @@ in 43 suites) and `test-reads` (7 of 7). Its failures, each run alone:
   job was read while the record still held the witness. Holding the old
   leader's proof until every replica's worker held the job did not help:
   a follower's backlog stays empty. The node prover's (7.3's) to settle.
+
+**Review (Fable):** merge; L1–L6 folded (L4 handed off)
+(`docs/design/research/slice-7/7.9-fable.md`). L1, the handoff test
+asserts the alert names a replica whose key the venue lists, not merely
+one other than the leader. L2, `RootRefusal::Unknown` retryable by a path
+refetch, stated in pin I's ingress checks, 7.11's tests and identity §5's
+check 14: an honest member meets it on a replica's lag, a root replaced at
+its own batch time, or one pushed out of the ring. L3,
+`a_compression_whose_output_the_meter_cannot_pay_waits_unserved`: the
+shop's `absorb` workflow keeps its Poseidon2 state in a page only the
+agent writes, at φ8, and a sweep with room for the step's own pages but
+not the output's ends at the call unserved, then finishes with the state
+computed straight, the backends byte-equal; with `units.rs` pricing φ7
+instead it fails [measured]. L4 handed off: the quiet native re-measure
+of the call's absolute cost (the machine stayed loaded), for the next
+quiet `precompile native` run; the price rests on the loaded ratio, which
+errs toward over-pricing. L5, `a_kernel_calling_poseidon2_is_refused`, by
+name, split from the unknown-id test. L6, the shim's
+`checked_poseidon2_compress_block` (`None` for a word at or above p) and
+`poseidon2_compress_into` (the call writes the caller's output), the agent
+serving through the former instead of its own p check; `Table::first`
+treats a scan that frames no row as `None`, as `Iter` does, a row that
+does not decode still trapping. Hand-off to 7.12: the ring's 64 entries
+bound freshness in a busy space (64 tree-changing batches within
+`ROOT_MAX_AGE` make an honest root `Unknown` before `Stale`), so
+`PathKeeper`'s refresh period is well under 64 batches' time; written into
+pin G, pin L, 7.12 and identity §6. Gates: the touched tests (the shim's,
+`derive`'s, the testkit's workflows, credentials, pricing and hosts, 69;
+the handoff test), then `just check` [measured; 12 GiB scope, `nice -n 10`,
+6 jobs, other builds running]: green through the formatting, the docs,
+the no-std builds, the lints, the core crates and `test-recair`; in the
+agent crates only `prover::a_leader_change_submits_a_recorded_statement_once`
+failed (the known flake, being fixed apart), and the agent crates rerun
+with `--no-fail-fast` passed 627 of 627 in 43 suites, `test-reads` 7 of 7.

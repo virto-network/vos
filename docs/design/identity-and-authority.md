@@ -334,7 +334,7 @@ Ingress verifies the proof and logs only the origin it proves.
   | 11 | `binding` is `C(T(binding), W(b))` of this request | `Binding`, 7 | 403 |
   | 12 | `b` is not recorded | `Replayed`, 8 | 409 |
   | 13 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 9 | 409 |
-  | 14 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10: fetch the path again, or ask another replica | 503 |
+  | 14 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, fetch the path again, or ask another replica; an honest member meets it on a replica's lag, a root replaced at its own batch time, or one past the ring's 64 entries (§6) | 503 |
   | 15 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 11 | 403 |
   | 16 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
   | 17 | on an executor, the proof decodes; its interaction PoW and its PoW hold, checked before any Merkle decommitment is read; then it verifies under the program for its kind | `Proof`, 12 | 403 |
@@ -502,8 +502,12 @@ across a space's agents wait for the identity agent above.
   moment it was superseded. Ingress measures that by the replica's latest
   applied batch time, apply by the batch's (§5). So a revocation binds
   within `ROOT_MAX_AGE` of its batch, and an honest member's path stays
-  good for as long after any change to the tree. The 64 entries only bound
-  storage: a root that has fallen out is `RootUnknown`.
+  good for as long after any change to the tree. The 64 entries bound
+  storage, and in a busy space freshness too: a root that has fallen out
+  is `RootUnknown`, so 64 tree-changing batches within `ROOT_MAX_AGE` make
+  an honest root unknown before it is stale. `RootUnknown` is retryable by
+  a path refetch, and the device library refreshes its path well within
+  64 batches' time (`slice-7-mobile.md` pin L).
 - **Its methods:**
   - `enroll(member) → slot`, role `registrar`: the lowest free slot, else
     `next`; refused for a member enrolled;
