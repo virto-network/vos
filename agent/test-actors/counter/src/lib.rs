@@ -231,8 +231,8 @@ impl Counter {
     /// 10 `log`, 11 `delete`, 12 `self_id`, 13 `input`, 14 `get` of a 1 KiB
     /// key, 15 `put` of one byte at a 1 KiB key; and at 1 KiB keys of zero
     /// bytes but the index, 16 `get`, 17 `put` of one byte, and 18 a `scan`
-    /// as large as a scan may be, from the table's first row; and 19 a
-    /// BLAKE2b compression, a precompile call.
+    /// as large as a scan may be, from the table's first row; 19 a BLAKE2b
+    /// compression and 20 a Poseidon2 compression, each a precompile call.
     #[msg(gas = 100_000_000)]
     pub async fn ops(
         &mut self,
@@ -247,6 +247,7 @@ impl Counter {
         let mut zeros = [0u8; 1024];
         let mut full = alloc::vec![0u8; vos_sdk::abi::cap::SCAN];
         let mut h = [1u8; 64];
+        let mut words = [1u32; 8];
         for (kind, start, count) in phases {
             for index in start..start + count {
                 let [_, a, b, c] = index.to_be_bytes();
@@ -294,9 +295,13 @@ impl Counter {
                         0
                     }
                     18 => vos_sdk::host::scan(RAW, None, &mut full),
-                    _ => {
+                    19 => {
                         vos_pvm_precompiles::blake2b_compress(&mut h, &[2; 128], 128, false);
                         u64::from(h[0])
+                    }
+                    _ => {
+                        words = vos_pvm_precompiles::poseidon2_compress(&words, &[2; 8]);
+                        u64::from(words[0])
                     }
                 };
             }
@@ -314,6 +319,14 @@ impl Counter {
             digest = vos_pvm_precompiles::blake2b_hash::<32>(b"vos/test", &[input]);
         }
         digest
+    }
+
+    /// The Poseidon2 compression of sixteen words, a precompile call the
+    /// agent serves: a word at or above p traps it.
+    #[msg]
+    pub async fn compress(&self, words: Vec<u32>) -> Vec<u32> {
+        let words: [u32; 16] = words.try_into().unwrap_or([0; 16]);
+        vos_pvm_precompiles::poseidon2_compress_block(&words).to_vec()
     }
 
     /// Set the counter to the batch time, and return a random draw.

@@ -406,42 +406,48 @@ fn the_reserves_cover_the_agents_own_work() {
 /// actor pays the node's price for it on every host, and the agent's own
 /// work serving it, its bounce (the exit, the copies, and the compression,
 /// natively on a VOS node and in software on JAM), leaves a fifth of what
-/// the agent accounts for it spare (`PRECOMPILE_SERVING`).
+/// the agent accounts for it spare (`PRECOMPILE_SERVING` for a BLAKE2b
+/// compression, `POSEIDON2_SERVING` for a Poseidon2 one).
 #[test]
 fn serving_a_precompile_costs_the_agent_its_bounce() {
-    use vos_wire::abi::precompile::{BLAKE2B_COMPRESS, price};
-    let price = price(BLAKE2B_COMPRESS).unwrap();
-    let mut actor_gas = Vec::new();
-    for (host, node) in [("VOS", Node::new()), ("JAM", Node::jam(true))] {
-        let (actors, node) = counter_only(node);
-        let ops = actors.method(COUNTER, "ops");
-        // The refine's gas and its step's, with `count` compressions.
-        let run = |count: u32| {
-            let arguments = (vec![(19u8, 0u32, count)], (0u32, 0u32)).encode();
-            let work = node.work(1, vec![request(ALICE, 1, COUNTER, ops, arguments)]);
-            let invocation = node.run_refine(&work, OUTER_GAS);
-            let bytes = invocation.output_bounded(cap::OUTPUT).unwrap();
-            let (result, _) = WorkResult::decode(&bytes).unwrap();
-            let used = ran_done(&result.steps[0]).gas_used;
-            (invocation.gas_used as i64, used as i64)
-        };
-        let ((refine, used), (refine_without, used_without)) = (run(1000), run(0));
-        let per_call = (used - used_without) / 1000;
-        let bounce = price as i64 + (refine - used - (refine_without - used_without)) / 1000;
-        println!(
-            "{host}: a compression costs the actor {per_call}, {price} of it its price; \
-             serving it costs the agent {bounce}"
-        );
-        actor_gas.push(per_call);
-        assert!(
-            bounce <= (defaults::PRECOMPILE_SERVING * 4 / 5) as i64,
-            "{host}: {bounce}"
+    use vos_wire::abi::precompile::{BLAKE2B_COMPRESS, POSEIDON2, price, serving};
+    for (name, kind, id) in [
+        ("BLAKE2b", 19u8, BLAKE2B_COMPRESS),
+        ("Poseidon2", 20, POSEIDON2),
+    ] {
+        let price = price(id).unwrap();
+        let mut actor_gas = Vec::new();
+        for (host, node) in [("VOS", Node::new()), ("JAM", Node::jam(true))] {
+            let (actors, node) = counter_only(node);
+            let ops = actors.method(COUNTER, "ops");
+            // The refine's gas and its step's, with `count` compressions.
+            let run = |count: u32| {
+                let arguments = (vec![(kind, 0u32, count)], (0u32, 0u32)).encode();
+                let work = node.work(1, vec![request(ALICE, 1, COUNTER, ops, arguments)]);
+                let invocation = node.run_refine(&work, OUTER_GAS);
+                let bytes = invocation.output_bounded(cap::OUTPUT).unwrap();
+                let (result, _) = WorkResult::decode(&bytes).unwrap();
+                let used = ran_done(&result.steps[0]).gas_used;
+                (invocation.gas_used as i64, used as i64)
+            };
+            let ((refine, used), (refine_without, used_without)) = (run(1000), run(0));
+            let per_call = (used - used_without) / 1000;
+            let bounce = price as i64 + (refine - used - (refine_without - used_without)) / 1000;
+            println!(
+                "{host}: a {name} compression costs the actor {per_call}, {price} of it its \
+                 price; serving it costs the agent {bounce}"
+            );
+            actor_gas.push(per_call);
+            assert!(
+                bounce <= (serving(id) * 4 / 5) as i64,
+                "{host}, {name}: {bounce}"
+            );
+        }
+        assert_eq!(
+            actor_gas[0], actor_gas[1],
+            "{name}: the actor pays the same on both"
         );
     }
-    assert_eq!(
-        actor_gas[0], actor_gas[1],
-        "the actor pays the same on both"
-    );
 }
 
 /// What a refine spends before its first step, decoding its batch, and on

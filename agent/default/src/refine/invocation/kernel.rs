@@ -26,7 +26,7 @@ pub(crate) fn serve_precompile(
         machine.set_gas(0);
         return Err(Failure::OutOfGas);
     }
-    if !meter.take(defaults::PRECOMPILE_SERVING) {
+    if !meter.take(precompile::serving(id)) {
         return Err(Failure::OutOfGas);
     }
     machine.precompile(id)
@@ -44,8 +44,8 @@ pub(crate) struct KernelRun {
 /// Run an attestable method's kernel in its own machine with `gas`: laid
 /// out with no arguments, its registers the loader's for none, it reads them
 /// through its witness input from `input`; output by the halt convention, at
-/// most `output` bytes, and no host calls but precompiles and the witness
-/// input, which the agent serves. An input past a work result's cap is
+/// most `output` bytes, and no host calls but the BLAKE2b precompile and the
+/// witness input, which the agent serves. An input past a work result's cap is
 /// refused. A failed run's error comes with the gas it used.
 pub(crate) fn kernel(
     meter: &Meter,
@@ -89,8 +89,8 @@ fn run(
                 }
                 read += machine.witness_input(rest)?;
             }
-            Exit::Host(id) if precompile::price(id).is_some() => {
-                serve_precompile(meter, machine, id)?;
+            Exit::Host(precompile::BLAKE2B_COMPRESS) => {
+                serve_precompile(meter, machine, precompile::BLAKE2B_COMPRESS)?;
             }
             Exit::Halt => {
                 let gas_used = gas - machine.gas();

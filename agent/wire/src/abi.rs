@@ -494,6 +494,13 @@ pub mod precompile {
     /// block.
     pub const BLAKE2B_COMPRESS: u64 = 0x400;
 
+    /// One Poseidon2-M31 compression: φ7 sixteen words (64 bytes, each a
+    /// little-endian `u32` below p), φ8 the first eight words of their
+    /// permutation (32 bytes, written). A word at or above p traps the
+    /// call. Handlers may make it; kernels may not, since the node's
+    /// segments do not prove it.
+    pub const POSEIDON2: u64 = 0x402;
+
     /// A kernel's witness input: φ7 the destination, φ8 the capacity. The
     /// agent writes the next `min(capacity, remaining)` bytes of the input
     /// the attest supplies and returns their count in φ7, 0 at its end, and
@@ -515,7 +522,18 @@ pub mod precompile {
     pub const fn price(id: u64) -> Option<u64> {
         match id {
             BLAKE2B_COMPRESS => Some(600),
+            POSEIDON2 => Some(2_400),
             _ => None,
+        }
+    }
+
+    /// The batch's gas the agent accounts for serving a machine's call of
+    /// precompile `id`, beyond the price the machine pays: its bounce, and
+    /// the computation in software on JAM.
+    pub const fn serving(id: u64) -> u64 {
+        match id {
+            POSEIDON2 => crate::defaults::POSEIDON2_SERVING,
+            _ => crate::defaults::PRECOMPILE_SERVING,
         }
     }
 }

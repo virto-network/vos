@@ -5,10 +5,10 @@
 //! `precompile tamper <n> call-input|memory-output|unacknowledged`: corrupt a
 //! recorded call; proving, or verification against the honest run's
 //! program, must reject it.
-//! `precompile native`: the native cost of serving one compression, in
-//! nanoseconds and time-stamp-counter cycles, and the gas the guest pays
-//! for one compression in software on a JAM host. The VOS price is set from
-//! these.
+//! `precompile native`: the native cost of serving one BLAKE2b and one
+//! Poseidon2 compression, in nanoseconds and time-stamp-counter cycles, and
+//! the gas the guest pays for each in software on a JAM host. The VOS
+//! prices are set from these.
 //!
 //! Cross-host agreement is a test: `tests/precompile_agreement.rs`.
 
@@ -87,7 +87,10 @@ fn main() {
                 Err(_) => println!("{what}: rejected (prover panicked)"),
             }
         }
-        "native" => native(),
+        "native" => {
+            native();
+            native_poseidon2();
+        }
         _ => panic!("usage: precompile prove <n> | tamper <n> <what> | native"),
     }
 }
@@ -129,6 +132,51 @@ fn native() {
     let per_hash = (gas_for(101) - gas_for(1)) / 100;
     println!(
         "served compression: {:.0} ns, {:.0} TSC cycles; software hash in the guest: {per_hash} gas",
+        elapsed.as_nanos() as f64 / CALLS as f64,
+        tsc as f64 / CALLS as f64,
+    );
+}
+
+/// Native cost of serving one Poseidon2 compression, and the guest's
+/// software cost when the host answers `WHAT`.
+fn native_poseidon2() {
+    use vos_pvm::interpreter::{Memory, PERM_RW};
+    use vos_pvm::precompile::{POSEIDON2, execute};
+
+    const CALLS: u64 = 1_000_000;
+    let mut memory = Memory::flat(vec![0x3a; 0x2000]);
+    memory.set_page_perms(vec![PERM_RW; 2]);
+    let mut registers = [0u64; vos_pvm::PVM_REGISTER_COUNT];
+    registers[7] = 0x0;
+    registers[8] = 0x1000;
+    for _ in 0..10_000 {
+        std::hint::black_box(execute(POSEIDON2, &registers, &mut memory));
+    }
+    let started = Instant::now();
+    // SAFETY: reading the time-stamp counter has no side effects.
+    let tsc_start = unsafe { core::arch::x86_64::_rdtsc() };
+    for _ in 0..CALLS {
+        std::hint::black_box(execute(POSEIDON2, &registers, &mut memory));
+    }
+    // SAFETY: as above.
+    let tsc = unsafe { core::arch::x86_64::_rdtsc() } - tsc_start;
+    let elapsed = started.elapsed();
+
+    let guest = vos_pvm_bench::guest_program("poseidon2");
+    let gas_for = |n: u64| {
+        let invocation = vos_pvm::refine_host::RefineContext::load(&guest, &n.to_le_bytes(), GAS)
+            .expect("load")
+            .without_precompiles()
+            .run_with_host(|_, machine| {
+                machine.registers_mut()[7] = vos_pvm_bench::WHAT;
+                Ok(())
+            });
+        invocation.gas_used
+    };
+    let per_hash = (gas_for(101) - gas_for(1)) / 100;
+    println!(
+        "served Poseidon2 compression: {:.0} ns, {:.0} TSC cycles; in software in the guest, \
+         its unserved call answered for free: {per_hash} gas",
         elapsed.as_nanos() as f64 / CALLS as f64,
         tsc as f64 / CALLS as f64,
     );

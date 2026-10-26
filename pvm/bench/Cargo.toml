@@ -11,6 +11,8 @@ vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
 vos-pvm-proof = { workspace = true }
 vos-pvm-program = { workspace = true }
+# The reference Poseidon2 compression the precompile is checked against.
+vos-pvm-poseidon2 = { workspace = true }
 blake2 = "0.10"
 lz4_flex = "0.11"
 libc = "0.2"

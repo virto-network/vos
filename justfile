@@ -33,7 +33,7 @@ test-recair:
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
-    with-env { CARGO_INCREMENTAL: "0" } { for guest in [workflows actor agent hash-software hash-precompile diverse] { do { cd $"pvm/bench/guests/($guest)"; cargo build --release --target ../../../guest/riscv64em-vos.json } } }
+    with-env { CARGO_INCREMENTAL: "0" } { for guest in [workflows actor agent hash-software hash-precompile poseidon2 diverse] { do { cd $"pvm/bench/guests/($guest)"; cargo build --release --target ../../../guest/riscv64em-vos.json } } }
 
 # Cross-host checks that need the bench guests. The bench tests that prove
 # run in `test-bench-proof`.

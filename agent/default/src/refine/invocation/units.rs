@@ -272,7 +272,8 @@ impl Invocation<'_> {
             Some(Op::Random) => (r(7), 32, 0),
             // The callee's reply, at most the cap.
             Some(Op::Call) => (r(11), (r(12) as usize).min(cap::REPLY), 0),
-            None if precompile::price(id).is_some() => (r(7), 64, defaults::PRECOMPILE_SERVING),
+            None if id == precompile::POSEIDON2 => (r(8), 32, precompile::serving(id)),
+            None if precompile::price(id).is_some() => (r(7), 64, precompile::serving(id)),
             _ => return (0, 0),
         };
         let pages = machine.unwritten_in(address, len as u64);

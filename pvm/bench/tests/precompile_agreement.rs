@@ -31,3 +31,31 @@ fn precompile_agrees_with_software_on_every_host() {
         );
     }
 }
+
+/// The Poseidon2 precompile agrees across hosts: served natively on a VOS
+/// refine host, computed in software by the guest on a JAM-like host that
+/// answers `WHAT`, and the reference permutation's compression, chained.
+#[test]
+fn poseidon2_agrees_with_the_reference_on_every_host() {
+    use vos_pvm_poseidon2::M31;
+    let guest = guest_program("poseidon2");
+    for n in [1u64, 10, 100] {
+        let args = n.to_le_bytes();
+        let right = [9, 8, 7, 6, 5, 4, 3, 2].map(M31::new);
+        let mut left = [M31::new(7); 8];
+        for _ in 0..n {
+            left = vos_pvm_poseidon2::compress(&left, &right);
+        }
+        let expected: Vec<u8> = left
+            .iter()
+            .flat_map(|word| word.value().to_le_bytes())
+            .collect();
+        assert_eq!(
+            run_vos(&guest, &args),
+            expected,
+            "VOS precompile, {n} calls"
+        );
+        let (jam, _) = run_jam(&guest, &args);
+        assert_eq!(jam, expected, "JAM fallback, {n} calls");
+    }
+}

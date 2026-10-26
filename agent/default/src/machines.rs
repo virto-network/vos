@@ -477,7 +477,10 @@ impl Machine {
         if !self.charge(price) {
             return Err(Failure::OutOfGas);
         }
-        self.blake2b_compress()
+        match id {
+            precompile::POSEIDON2 => self.poseidon2(),
+            _ => self.blake2b_compress(),
+        }
     }
 
     /// Serve the machine's witness-input call from `rest`, the input it has
@@ -504,6 +507,31 @@ impl Machine {
         let last = self.register(10) != 0;
         vos_pvm_precompiles::blake2b_compress(&mut h, &m, u128::from(self.register(9)), last);
         self.write(address, &h)
+    }
+
+    /// The Poseidon2 call: sixteen words at φ7, each below p or the call
+    /// traps, and the first eight words of their permutation at φ8.
+    fn poseidon2(&mut self) -> Result<(), Failure> {
+        let mut bytes = [0u8; 64];
+        if !self.peek_into(self.register(7), &mut bytes) {
+            return Err(Failure::Trapped);
+        }
+        let mut input = [0u32; 16];
+        for (word, chunk) in input.iter_mut().zip(bytes.chunks_exact(4)) {
+            *word = u32::from_le_bytes(chunk.try_into().unwrap());
+        }
+        if input
+            .iter()
+            .any(|&word| word >= vos_pvm_precompiles::poseidon2::P)
+        {
+            return Err(Failure::Trapped);
+        }
+        let output = vos_pvm_precompiles::poseidon2_compress_block(&input);
+        let mut bytes = [0u8; 32];
+        for (chunk, word) in bytes.chunks_exact_mut(4).zip(&output) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        self.write(self.register(8), &bytes)
     }
 }
 

@@ -161,8 +161,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-pvm-poseidon2"
+version = "0.1.0"
+
+[[package]]
 name = "vos-pvm-precompiles"
 version = "0.1.0"
+dependencies = [
+ "vos-pvm-poseidon2",
+]
 
 [[package]]
 name = "vos-pvm-program"

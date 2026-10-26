@@ -28,16 +28,33 @@ pub const BLAKE2B_COMPRESS: u64 = 0x400;
 /// same hash in software inside the guest costs about 15,900 gas.
 pub const BLAKE2B_COMPRESS_GAS: crate::Gas = 600;
 
+/// One Poseidon2-M31 compression: φ\[7\] = input pointer (64 bytes, read:
+/// sixteen M31 words, little-endian `u32`, each below p), φ\[8\] = output
+/// pointer (32 bytes, written: the first eight words of the width-16
+/// permutation of the sixteen). A word at or above p, p itself included,
+/// traps the call, as an unreadable or unwritable range does; it has no
+/// other effect.
+pub const POSEIDON2: u64 = 0x402;
+
+/// Gas for one Poseidon2 compression, on top of its `ecalli`'s block gas.
+///
+/// Serving one natively takes about 270 time-stamp-counter cycles on the
+/// reference machine (`precompile native` in `pvm/bench`); the price rounds
+/// that up as BLAKE2B_COMPRESS_GAS does. Computing the same compression in
+/// software inside the guest costs about 15,000 gas.
+pub const POSEIDON2_GAS: crate::Gas = 2_400;
+
 /// Whether `id` names a precompile the refine host serves in place for the
 /// outer machine.
 pub const fn is_precompile(id: u64) -> bool {
-    id == BLAKE2B_COMPRESS
+    matches!(id, BLAKE2B_COMPRESS | POSEIDON2)
 }
 
 /// The gas a call to precompile `id` costs, or `None` if `id` names none.
 pub const fn price(id: u64) -> Option<crate::Gas> {
     match id {
         BLAKE2B_COMPRESS => Some(BLAKE2B_COMPRESS_GAS),
+        POSEIDON2 => Some(POSEIDON2_GAS),
         _ => None,
     }
 }
@@ -62,10 +79,11 @@ pub const WITNESS_INPUT_BYTE_GAS: crate::Gas = 24;
 /// (`vos_wire::abi::cap::WORK_RESULT`): the attest that records it fits one.
 pub const WITNESS_INPUT_MAX: usize = 4 << 20;
 
-/// Whether `id` names a call a kernel may make: a precompile, or its
-/// witness input.
+/// Whether `id` names a call a kernel may make: the BLAKE2b precompile, or
+/// its witness input. The node's segments prove no Poseidon2 call, so a
+/// kernel makes none.
 pub const fn is_kernel_call(id: u64) -> bool {
-    is_precompile(id) || id == WITNESS_INPUT
+    matches!(id, BLAKE2B_COMPRESS | WITNESS_INPUT)
 }
 
 /// A kernel's witness input as one run reads it, call by call: its bytes,
@@ -213,6 +231,10 @@ pub fn blake2b_256(data: &[u8]) -> [u8; 32] {
 
 /// The inputs and output of one served precompile call.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "a call is returned once, by value, and read where it is served"
+)]
 pub enum PrecompileCall {
     Blake2bCompress {
         h_ptr: u32,
@@ -224,6 +246,12 @@ pub enum PrecompileCall {
         h_bytes: [u8; 64],
         m_bytes: [u8; 128],
         out_bytes: [u8; 64],
+    },
+    Poseidon2 {
+        in_ptr: u32,
+        out_ptr: u32,
+        input: [u8; 64],
+        output: [u8; 32],
     },
 }
 
@@ -237,8 +265,52 @@ pub fn execute(
 ) -> Option<PrecompileCall> {
     match id {
         BLAKE2B_COMPRESS => blake2b_compress(registers, memory),
+        POSEIDON2 => poseidon2(registers, memory),
         _ => None,
     }
+}
+
+fn poseidon2(
+    registers: &[u64; crate::PVM_REGISTER_COUNT],
+    memory: &mut crate::interpreter::Memory,
+) -> Option<PrecompileCall> {
+    let in_ptr = u32::try_from(registers[7]).ok()?;
+    let out_ptr = u32::try_from(registers[8]).ok()?;
+    let mut input = [0u8; 64];
+    if !memory.read_bytes_checked(in_ptr, &mut input) {
+        return None;
+    }
+    let output = poseidon2_compress(&input)?;
+    if !memory.write_bytes_checked(out_ptr, &output) {
+        return None;
+    }
+    Some(PrecompileCall::Poseidon2 {
+        in_ptr,
+        out_ptr,
+        input,
+        output,
+    })
+}
+
+/// The Poseidon2 precompile's function on bytes: the first eight words of
+/// the permutation of `input`'s sixteen little-endian words, or `None` when
+/// a word is not below p.
+pub fn poseidon2_compress(input: &[u8; 64]) -> Option<[u8; 32]> {
+    use vos_pvm_poseidon2::{M31, N_STATE, P};
+    let mut state = [M31::ZERO; N_STATE];
+    for (word, bytes) in state.iter_mut().zip(input.chunks_exact(4)) {
+        let value = u32::from_le_bytes(bytes.try_into().unwrap());
+        if value >= P {
+            return None;
+        }
+        *word = M31::new(value);
+    }
+    vos_pvm_poseidon2::permute(&mut state);
+    let mut output = [0u8; 32];
+    for (bytes, word) in output.chunks_exact_mut(4).zip(&state) {
+        bytes.copy_from_slice(&word.value().to_le_bytes());
+    }
+    Some(output)
 }
 
 fn blake2b_compress(
@@ -476,6 +548,7 @@ mod witness_tests {
         assert!(WitnessInput::new(&bytes[..WITNESS_INPUT_MAX]).is_some());
         assert!(WitnessInput::new(&bytes[..]).is_none());
         assert!(is_kernel_call(WITNESS_INPUT) && is_kernel_call(BLAKE2B_COMPRESS));
+        assert!(is_precompile(POSEIDON2) && !is_kernel_call(POSEIDON2));
         assert!(!is_precompile(WITNESS_INPUT) && price(WITNESS_INPUT).is_none());
     }
 }
@@ -498,5 +571,99 @@ mod id_tests {
             assert!(charge(id, &mut gas) && gas == 10, "{id}");
             assert!(execute(id, &[0; crate::PVM_REGISTER_COUNT], &mut memory).is_none());
         }
+    }
+}
+
+#[cfg(test)]
+mod poseidon2_tests {
+    use super::*;
+    use crate::interpreter::{Memory, PERM_NONE, PERM_RO, PERM_RW};
+    use vos_pvm_poseidon2::{M31, P};
+
+    /// Page 1 writable, page 2 read-only.
+    fn memory(input: &[u8; 64]) -> Memory {
+        let mut memory = Memory::sparse(1 << 32);
+        let pages = memory.pages();
+        assert!(memory.set_page_range(0, pages, PERM_NONE));
+        assert!(memory.set_page_range(1, 1, PERM_RW));
+        assert!(memory.write_bytes_checked(0x1000, input));
+        assert!(memory.set_page_range(2, 1, PERM_RO));
+        memory
+    }
+
+    fn registers(input: u64, output: u64) -> [u64; crate::PVM_REGISTER_COUNT] {
+        let mut registers = [0; crate::PVM_REGISTER_COUNT];
+        registers[7] = input;
+        registers[8] = output;
+        registers
+    }
+
+    fn bytes(words: &[u32; 16]) -> [u8; 64] {
+        let mut bytes = [0u8; 64];
+        for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// The call writes, at φ8, the reference compression of the two halves
+    /// at φ7, and nothing else; the output may overlap the input.
+    #[test]
+    fn the_call_is_the_reference_compression() {
+        let words: [u32; 16] = core::array::from_fn(|i| (i as u32 + 1) * 0x0765_4321 % P);
+        let left = core::array::from_fn(|i| M31::new(words[i]));
+        let right = core::array::from_fn(|i| M31::new(words[8 + i]));
+        let expected = vos_pvm_poseidon2::compress(&left, &right);
+        let mut expected_bytes = [0u8; 32];
+        for (chunk, word) in expected_bytes.chunks_exact_mut(4).zip(&expected) {
+            chunk.copy_from_slice(&word.value().to_le_bytes());
+        }
+        for output in [0x1800u64, 0x1000, 0x1020] {
+            let mut memory = memory(&bytes(&words));
+            let served = execute(POSEIDON2, &registers(0x1000, output), &mut memory);
+            assert!(
+                matches!(served, Some(PrecompileCall::Poseidon2 { output: o, .. }) if o == expected_bytes)
+            );
+            let mut written = [0u8; 32];
+            assert!(memory.read_bytes_checked(output as u32, &mut written));
+            assert_eq!(written, expected_bytes, "{output:#x}");
+        }
+    }
+
+    /// A word at or above p, p itself included, refuses the call, as an
+    /// unreadable input or an unwritable output does; a refused call writes
+    /// nothing.
+    #[test]
+    fn a_word_at_or_above_p_is_refused() {
+        for (index, word) in [(0, P), (15, P), (7, 1 << 31), (3, u32::MAX)] {
+            let mut words = [1u32; 16];
+            words[index] = word;
+            let mut memory = memory(&bytes(&words));
+            assert_eq!(
+                execute(POSEIDON2, &registers(0x1000, 0x1800), &mut memory),
+                None,
+                "word {index} = {word:#x}"
+            );
+            let mut output = [0u8; 32];
+            assert!(memory.read_bytes_checked(0x1800, &mut output));
+            assert_eq!(output, [0; 32], "nothing written");
+        }
+        let words = [P - 1; 16];
+        for (input, output) in [
+            (0x0fe0, 0x1800),
+            (0x3000, 0x1800),
+            (0x1000, 0x2000),
+            (0x1000, 0x1ff0),
+        ] {
+            let mut memory = memory(&bytes(&words));
+            assert_eq!(
+                execute(POSEIDON2, &registers(input, output), &mut memory),
+                None,
+                "{input:#x} → {output:#x}"
+            );
+        }
+        let mut memory = memory(&bytes(&words));
+        assert!(execute(POSEIDON2, &registers(1 << 32, 0x1800), &mut memory).is_none());
+        assert!(execute(POSEIDON2, &registers(0x1000, 0x1800), &mut memory).is_some());
     }
 }

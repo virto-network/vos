@@ -73,9 +73,9 @@ pub(crate) struct KernelRun {
 
 /// Run an attestable method's kernel: laid out with no arguments, which it
 /// reads through its witness input from `input`, output by the halt
-/// convention, and no host calls but precompiles. An input past a work
-/// result's cap is refused. A failed run's error comes with the gas it
-/// used.
+/// convention, and no host calls but the BLAKE2b precompile. An input past
+/// a work result's cap is refused. A failed run's error comes with the gas
+/// it used.
 pub(crate) fn kernel(
     program: &[u8],
     input: &[u8],
@@ -104,7 +104,7 @@ pub(crate) fn kernel(
                     Err(WitnessFault::Unwritable) => return failed(&machine, Failure::Trapped),
                 }
             }
-            ExitReason::HostCall(id) if vos_pvm::precompile::is_precompile(id) => {
+            ExitReason::HostCall(id) if vos_pvm::precompile::is_kernel_call(id) => {
                 compressions += 1;
                 if let Err(code) = precompile(&mut machine, id) {
                     return failed(&machine, code);

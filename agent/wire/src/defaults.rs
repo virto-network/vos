@@ -71,7 +71,8 @@ pub const REFINE_GAS: u64 = 1_000_000_000;
 /// earlier steps left covers its reserve, its handler's limit and the
 /// finish, and it takes its reserve, the gas its handler used, the
 /// installed records it read first, and its served precompiles'
-/// [`PRECOMPILE_SERVING`]. So every host dispatches the same steps.
+/// [`PRECOMPILE_SERVING`] or [`POSEIDON2_SERVING`]. So every host
+/// dispatches the same steps.
 pub const STEP_RESERVE: u64 = 300_000;
 /// The same for an input that runs no handler: an acknowledgement, a
 /// reply, a message that failed in refine.
@@ -172,6 +173,11 @@ pub const fn min_refine_gas(max_inputs: usize) -> u64 {
 /// 600 of its gas and the batch's budget this much, so one step hashes
 /// at most about 4 MiB in a refine of the default budget, on any host.
 pub const PRECOMPILE_SERVING: u64 = 27_000;
+/// [`PRECOMPILE_SERVING`] for a Poseidon2 compression: about 5,800 natively
+/// on a VOS node and about 38,600 in software on JAM, its permutation's
+/// arithmetic dearer in the guest than a BLAKE2b compression's. Measured by
+/// the same test.
+pub const POSEIDON2_SERVING: u64 = 60_000;
 /// The agent's own work on each byte of the rows a read at a window's cut
 /// is served ([`crate::batch::Input::Resume`]), beyond decoding its batch:
 /// decoding and checking them against its request, and handing them to
