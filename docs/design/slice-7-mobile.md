@@ -1,8 +1,10 @@
 # Slice 7: simplify and scale, then proofs on the phone
 
 Plan, draft 4, with the owner's answers and Fable's review of draft 3
-folded (2026-10-25). It takes the owner's slice-7 decisions S1–S33 (`research/slice-7/owner-decisions.md`)
-and the first real phone run (`research/slice-7/phone-fairphone6-s5kit.txt`).
+folded (2026-10-25), and the owner's S34–S52 since
+(2026-10-26). It takes the owner's slice-7 decisions S1–S52
+(`research/slice-7/owner-decisions.md`) and the first real phone run
+(`research/slice-7/phone-fairphone6-s5kit.txt`).
 Slice 6's decisions 1–18 stand, except those S9–S17 reverse ("Decisions"
 lists each). Two questions stay open: S3's gate after 7.0a (S20) and the
 credential parameters after 7.12 (S29).
@@ -16,8 +18,10 @@ credential parameters after 7.12 (S29).
   - **M3.9, simplify and scale:** the anchoring protocol simplified by
     C1–C11; a scale test across the owner's LAN;
   - **M4, the credential AIR:** slice 6's re-pin batch; a credential actor
-    keeping a Poseidon2 tree in its own rows; the credential AIR; its
-    verifier at a space's ingress; the device library and an Android demo;
+    keeping a Poseidon2 tree in its own rows; the credential AIR; the
+    node's binary API and its gateway (S41); the credential verifier at a
+    space's ingress; the device library and a demo in s4's Android client
+    (S40);
   - **M5, the device profile:** the general zkVM on the phone, the auth
     statement in at most 1 s on the Fairphone 6 [decided, S3], **a gate at
     real risk** (M5's outlook, below); then the Poseidon2 chip and M5's
@@ -44,6 +48,22 @@ harness's host facts (M6); no epoch (M7); a witness-independent device
 trace (M8); 41 recounted (M9); nine planned phone sessions (M10, S33); and
 the eleven lows.
 
+**Since draft 4:** 7.7 pinned G, I, K and L in the design docs; the owner
+answered its questions and two more (S37–S44): the ledger's `rekey` and
+`freeze`, and a gate on a membership-and-payment proof (S37); paths
+refreshed apart from proofs (S38); a duplicate answered `Replayed` (S39);
+the demo in s4 (S40, 7.13); the node's binary API and a gateway, a new
+step 7.10b (S41); the Keystore's HMAC key and a security key as the
+secret's sources, no passkeys (S42, pin K, 7.0b); the `once` guard
+(S43); 7.11's rate gate a bound per thread (S44). Fable's review of 7.7
+(`research/slice-7/7.7-fable.md`, "fix-then-merge") folded with the
+owner's answers S46–S51: signed operator requests, socket-only until
+built (S46); the `once` row only on `Ok` (S47); the facility's own form
+for the payee and the amount (S48); a `vos-api` SSH subsystem for paths
+and time (S49); 7.10b beside 7.9 and 7.10 (S50); the input's tag
+`"vos/device/input/v1"` (S51); the demo's ledger, the library's `root`
+helpers and 7.10b's frame grammar pinned.
+
 **Earlier drafts:** draft 2 folded the Opus review of draft 1
 (`plan1-review.md`); draft 3 took the owner's answers S6–S31.
 
@@ -54,17 +74,20 @@ the eleven lows.
 2. **Scale measured, not extrapolated:** a scripted test on the owner's
    LAN, a million simulated users and tens of thousands of agents in one
    space, the targets met or each gap recorded with its lever.
-3. **Credentials on the phone:** a device secret from a real passkey PRF;
-   masked auth and payment proofs on the Fairphone 6, verified at a local
-   space's ingress; an Android demo end to end.
-4. **The general zkVM on the phone:** the auth statement under the device
+3. **Credentials on the phone:** a device secret from a key the phone
+   never exports (the Android Keystore's, or a security key's); masked
+   auth and payment proofs on the Fairphone 6, verified at a local space's
+   ingress; a demo in s4's Android client end to end.
+4. **A node that speaks one binary API:** its HTTP, public TLS and
+   front-end concerns in a gateway that holds no authority (S41).
+5. **The general zkVM on the phone:** the auth statement under the device
    profile, masked, in at most 1 s and 1 GiB on the Fairphone 6 [decided,
    S3], or the gap measured lever by lever for the owner to judge.
-5. **Two program-id re-pins and one blob lock, each one commit:** slice
+6. **Two program-id re-pins and one blob lock, each one commit:** slice
    6's pvm-internal items early (7.8a), its agent-side items with
    `blobs.lock` after 7.3 and 7.11 (7.8b); the node's segment format 41
    late (7.21), with what S32's count lets in.
-6. **Every item slice 6 carried** placed in a step or carried by name.
+7. **Every item slice 6 carried** placed in a step or carried by name.
 
 **No value rides on a proof in this slice:** the external audit comes
 first (slice 6's decision 14); slice 7 adds the credential AIR, the
@@ -88,8 +111,9 @@ device shape, the Poseidon2 chip and the CPU split to its scope.
   61.86 proven bits under masking (c); at 86 queries every masked
   component pads to 2^12 rows, not §8's 2^11.
 - **Not built:** a Blake2s-M31 channel in `pcs.rs`; masking for the
-  segment chips; any Android, JNI or passkey code; an operator path to the
-  representative; a multi-host driver.
+  segment chips; any Android or Keystore code; a node API apart from HTTP,
+  or a gateway; an operator path to the representative; a multi-host
+  driver.
 
 ## How every step runs
 
@@ -123,7 +147,7 @@ device shape, the Poseidon2 chip and the CPU split to its scope.
 
   | session | when | what |
   |---|---|---|
-  | P1 | 7.0a's end | the baseline and masked proxy; 7.0b's PRF, across a reboot and a Google Password Manager re-sync |
+  | P1 | 7.0a's end | the baseline and masked proxy; 7.0b's secret sources, across uses, a reboot and a security key's re-plug |
   | P2 | 7.12 | PG1 and the grind's 95th percentile (S29); the demo's first run |
   | P3 | 7.13's end | PG3 recorded |
   | P4 | 7.16 | the device parameters' candidates |
@@ -208,37 +232,48 @@ G–L are M4's and M5's.
 
 ### Pin G: the credential actor and its Poseidon2 tree
 
-- **What it is:** `vos-credentials`, an actor installed in the agent whose
-  methods it guards (the demo's: the ledger's agent). Its tree is a
-  **positional sparse Merkle tree** of Poseidon2-M31, depth 32, kept in
-  its own committed rows: `slot(member) → u32`, keyed by the `member`
-  digest (the next free slot, freed slots reused lowest first), `leaf(slot) → Digest`, the non-empty
-  `node(level, index) → Digest`, the empty subtrees' digests as constants.
-- **The hashes:** through the `0x402` host call (pin H): the VOS host
+The full spec is `identity-and-authority.md` §6 (the actor, its rows, its
+ring, its methods) and `proving.md` §8 (the hash, the tree); pinned by
+7.7.
+- **What it is:** `vos-credentials`, a library actor installed in the
+  agent whose methods it guards (the demo's: the ledger's agent), one an
+  agent, found through the system row `credentials → instance` its install
+  writes. Its tree is a **positional sparse Merkle tree** of Poseidon2-M31
+  compressions, depth 32, in its own plain rows: `slots` (a `member`
+  digest → its slot; freed slots reused lowest first through an ordered
+  `free` table), `nodes` (level, index → the non-empty digests, level 0
+  the leaves), the empty subtrees' digests as constants.
+- **The hashes:** each one `0x402` call (pin H), `C(l, r)`: the VOS host
   serves it natively, a JAM-deployed agent pays the shim's software
   permutation (about 15,800 instructions); so VOS ≡ JAM holds, and the
-  tree is as deterministic as any row. `leaf = compress(TAG_LEAF ‖ slot,
-  member)` with `member` an 8-M31 digest (fixed length, so injective);
-  `node = compress(left, right)`; an empty leaf the zero digest; the tags
-  M31 constants from `BLAKE2b("vos/p2/<name>")`.
-- **Roots:** a replicated ring `roots[i] = (root, batch_time)` of the last
-  64 roots, one written per batch that changed the tree. Enrollment is
-  rare: 32 calls of `0x402` a write. **Freshness** (the Fable review's
-  H2): ingress accepts the current root at any age, and an older one only
-  if its `batch_time` is within `ROOT_MAX_AGE` (10 minutes) of the
-  replica's latest applied batch time, so a removal (revocation) takes
-  effect within it; the ring's count only bounds storage.
-- **The handle** (pin K, S25): a 32-byte value the founder draws once, set
-  at the actor's install and served with `path`; a re-founded space's
-  actor is installed with the same handle.
-- **Paths:** a public query method `path(member) → (root, slot,
-  siblings[32])` and `handle()`, served by any replica, rate-limited per
-  connection (a `member` digest is a pseudonym, and the tree's shape is
-  not secret from its readers). **What it reveals:** asking for a path by key tells the
-  operators which member is about to prove and when; `Anonymous` hides the
-  member from the log's readers and from other agents, not from operators
-  (`identity-and-authority.md` §3 and §8: hiding from operators is full
-  privacy, postponed). Recorded in `SECURITY.md`.
+  tree is as deterministic as any row. `leaf = C(T(leaf), member)`, the
+  slot not hashed (the path places it); a node `C(left, right)`; the empty
+  leaf eight zero words; a tag `T(name)` the block `[t, 0, …, 0]`, `t` from
+  `BLAKE2b-256("vos/p2/" ‖ name)`. 33 calls a write.
+- **Roots:** a replicated ring of the last 64 `(root, since)`, one entry a
+  batch time that changed the tree. **Freshness** (the Fable review's H2):
+  a root is accepted while it is the newest, and for `ROOT_MAX_AGE`
+  (10 minutes) after it was superseded (the next entry's `since`), by the
+  replica's latest applied batch time at ingress and by the batch's time at
+  apply, so a revocation takes effect within it at every replica; the
+  ring's count only bounds storage.
+- **The handle** (pin K, S25): 32 bytes the founder draws once, set at the
+  actor's install and served by `handle()`; a re-founded space's actor is
+  installed with the same handle.
+- **Methods:** `enroll`, `enroll_many` (the re-founding re-seed),
+  `invite`/`claim` (the demo's enrollment, the invitation naming the
+  digest), `revoke`, under the role `registrar` but `claim`; the queries
+  `path(member) → (root, slot, siblings[32])`, `root()` and `handle()`,
+  any caller, under a query's limits. **What `path` reveals:** asking by
+  key tells the operators which member digest is online, and from which
+  address; the library refreshes its path apart from its proofs (when
+  `root()` moves and on a timer, never just before a proof) [decided,
+  S38], so a fetch's time says nothing of a proof's. The leak is reduced,
+  not closed: `Anonymous` hides the member from the log's readers and from
+  other agents, not from operators (`identity-and-authority.md` §7's
+  threat model). Recorded in `node/SECURITY.md`, new in 7.11 for the
+  node's credential surface (`pvm/proof/SECURITY.md` stays the
+  prover's).
 - **`RootKind` and the representative are untouched:** no venue checks a
   Poseidon2 root in this slice; a later cross-space credential proves its
   root's place under `S_w` by a Blake2b path outside the proof, its issuer
@@ -273,62 +308,107 @@ G–L are M4's and M5's.
 
 ### Pin I: the credential statements and their verifier at ingress
 
+The full spec is `proving.md` §8 (the hashes, the statements, the
+format) and `identity-and-authority.md` §5 (the request, the binding, the
+guards, ingress's checks and their codes, the apply rule, the origins);
+pinned by 7.7.
 - **The AIR:** a recursion-AIR circuit (recair's `Context` and gadgets)
   over the `p2` and `qm31` components, a fixed wiring per statement, so
   its circuit hash is its program id. Two components at least, so the
   claimed sums are blinded (a one-component masked set is not).
 - **Format 42, credential proofs** (`device-params.md`): masked (c),
-  Blake2s-M31 channel, **blowup 4, 43 queries, PoW 20, or 47 queries at
-  PoW 16** if 7.12's grind has a 95th percentile above 50 ms on the phone
-  [decided, S29], interaction PoW 8, fold step 1, affine DEEP
-  batching if the fork's Blake2s-M31 path takes it, else by powers; at
-  least 62 proven and 100 conjectured bits on its masked shape (62.69 and
-  106 [model]); `h = 512`, every component at least 2^11 rows. 30,
-  reserved at an unmasked count, is retired unregistered.
+  Blake2s-M31 channel, **blowup 4, 43 queries, PoW 20**, interaction PoW
+  8, fold step 1, affine DEEP batching if the fork's Blake2s-M31 path takes
+  it, else by powers; at least 62 proven and 100 conjectured bits on its
+  masked shape (62.69 and 106 [model]); `h = 512`, every component at
+  least 2^11 rows. If 7.12's grind has a 95th percentile above 50 ms on
+  the phone [decided, S29], the format is **44**, the same at 47 queries
+  and PoW 16 (62.66 and 110 [model]), and 42 is retired: a number names one
+  set of parameters. 30, reserved at an unmasked count, is retired
+  unregistered.
 - **The scope,** namespaced by the verifier and its space (the Fable
   review's H1):
-  `scope = P2(TAG_SCOPE ‖ BLAKE2b-256(space ‖ agent ‖ instance ‖ the guard's scope name))`,
-  computed by ingress from the method's guard; no two agents' "login",
-  in one space or two, share a pseudonym, even for a member whose secret
-  two spaces share (pin K).
-- **The binding:** `binding = P2(BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖
-  agent ‖ instance ‖ method ‖ program ‖ kind ‖ SCALE(arguments) ‖ nonce ‖
-  expires_ms))`: a proof authorizes one call, in one space, under one
-  statement.
+  `scope = C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))`,
+  `W` a 32-byte digest's eight 31-bit words, computed by ingress from the
+  method's guard; no two agents' "login", in one space or two, share a
+  pseudonym, even for a member whose secret two spaces share (pin K).
+- **The binding:** `binding = C(T(binding), W(b))`,
+  `b = BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖ agent ‖ instance ‖ method ‖ program ‖ kind ‖ SCALE(arguments) ‖ nonce ‖ expires_ms)`:
+  a proof authorizes one call, in one space, under one statement.
 - **Auth** (`CredentialKind::Auth = 0`), public
-  `(kind, map_root, scope, nullifier, binding)`, each 8 M31; private `s`,
-  the slot and its path. Proves `leaf(slot, member(s))` under `map_root`
-  and `nullifier = P2(TAG_NF ‖ s ‖ scope)`.
+  `(kind, map_root, scope, nullifier, binding)`, `kind` one word and each
+  digest 8; private `s`, the slot's bits and its path. Proves
+  `leaf(member(s))` under `map_root` and
+  `nullifier = C(C(T(nf), s), scope)`; 36 permutations.
 - **Pay** (`CredentialKind::Owner = 1`), public `(kind, owner, binding)`;
-  private `s`. Proves `owner = P2(TAG_OWNER ‖ s)`: a post-quantum
-  authorization by the owner of a row, about two permutations. No path,
-  no range check: the ledger debits the live row at apply, so its guard
-  compares the row's current `owner` with the proof's, and a previous
-  owner's proof fails once the row changes hands. A hidden payer waits for
-  full privacy (`identity-and-authority.md` §8).
-- **The request:** `POST /agents/{id}/calls` with
-  `Credentialed { call, kind, proof, public }`, no session (the reserved
-  session-less input kind, `identity-and-authority.md` §15 step 0).
-- **Ingress checks, in order:** the size per format (42: 512 KiB; 43:
-  1.5 MiB; the HTTP limit raised on this route alone; the log carries the
-  call and origin, never the proof, so `cap::REQUEST` is unchanged); the
-  format (42, or 43, pin J); the program id the schema pins for the
-  method; the scope; for auth, `map_root` the current root or a ring root
-  within `ROOT_MAX_AGE`, as applied here (one not yet applied: retryable,
-  the identity replica's lag rule); the binding; `expires_ms` within 120 s of the node's
-  clock (a client reads it from `GET /`); then the proof, on an
-  executor, **its PoW checked before any decommitment**. Each refusal a
-  `403` with its code. **Load:** a bound per connection and an executor
-  budget (past it, `503`), no bucket per scope or method to drain.
-- **At apply:** the binding refused if `expires_ms` is before the batch
-  time, or if its digest is already recorded; the digest recorded until
-  `expires_ms` plus the clock skew allowed (60 s) by batch time. So a
-  proof replayed at another node runs nowhere twice.
+  private `s`. Proves `owner = C(T(owner), s)`: a post-quantum
+  authorization by the owner of a row, one permutation. No path, no range
+  check: the ledger debits the live row at apply, so its handler compares
+  the row's current `owner` with the proof's, and a previous owner's proof
+  fails once the row changes hands. A hidden payer waits for full privacy
+  (`identity-and-authority.md` §8). Revocation does not stop payment: the
+  ledger's `rekey(row, owner)` and `freeze(row)`, under an operator role,
+  do [decided, S37].
+- **Membership and payment together,** measured, not admitted [decided,
+  S37]: a third circuit proving auth's leaf, path and nullifier and
+  owner's digest from one `s` (37 permutations), built in 7.10 and timed
+  on the phone in 7.12, so the later private payment's statement is known
+  to fit the budget: a floor for a shielded spend, whose notes, values
+  and ranges cost far more. No `CredentialKind` and no ingress path in
+  this slice.
+- **The request:** a request of the node API (7.10b), addressed to its
+  agent as every agent request there is,
+  `Credentialed { instance, method, arguments, nonce, expires_ms, format, public, proof }`,
+  no session (the reserved session-less input kind,
+  `identity-and-authority.md` §15 step 0); a frame kind of its own, so the
+  node sizes the frame (1.5 MiB plus `cap::REQUEST` plus 4 KiB) before
+  decoding it. The node's clock is the API's `Time` request, unsigned: a
+  relay that lies about it costs the client a new proof and cannot
+  extend a proof's life, since ingress checks the expiry by its own
+  clock. A gateway translates `POST /agents/{id}/credentialed` and
+  `GET /time` onto them and holds no authority: every check below is the
+  node's.
+- **Ingress checks, in order** (`identity-and-authority.md` §5's table,
+  each a `Rejected(Credential(code))`, the codes in check order): the
+  frame's size; the decode; the
+  agent served; the space has a genesis; the format; the size per format
+  (42 or 44: 512 KiB; 43: 1.5 MiB; the log carries the call and origin,
+  never the proof, so `cap::REQUEST` is unchanged); `expires_ms` within
+  120 s ahead of the node's clock; the method's credential guard; the
+  kind; for auth, the scope; the binding; the binding digest not recorded;
+  for a `once` guard, the nullifier not recorded in its scope; for auth,
+  `map_root` in the ring (else retryable, the identity replica's lag
+  rule) and fresh by `ROOT_MAX_AGE`; a verification slot; then the proof,
+  on an executor, **its PoW checked before any decommitment**. **Load:**
+  the node's connections and a verification budget (past it, `Busy`), no
+  bucket per scope or method to drain; the gateway adds its own limits
+  before authentication (S41).
+- **At apply:** refused if `expires_ms` is before the batch time, if the
+  binding digest is already recorded, for auth if the root is stale by
+  the batch time, or for a `once` guard if its nullifier is recorded in
+  its scope; else the digest is recorded until `expires_ms` plus 60 s by
+  batch time, whatever the method then does, and the method runs; a
+  `once` guard's nullifier is recorded for good only if the method
+  returned `Ok`, in the same apply [decided, S47]. So a proof replayed at
+  another node runs nowhere twice. A duplicate is answered
+  `Refusal::Replayed` (refine's enum; `CredentialRefusal::Replayed` at
+  ingress), without the first call's outcome [decided, S39].
 - **The origin logged:** `Anonymous { scope, nullifier }` for auth (a
-  pseudonym in its scope; "once in this scope" is the guard's rule) and
-  `Owner { digest }` for pay; never the proof (`identity-and-authority.md`
-  §5). Guards: `#[msg(credential = Auth("login"))]`,
-  `#[msg(credential = Owner)]`.
+  pseudonym in its scope, stable) and `Owner(digest)` for pay,
+  `Principal`'s indexes 3 and 4; never the proof
+  (`identity-and-authority.md` §5). Guards:
+  `#[msg(credential = Auth("login"))]`, `#[msg(credential = Owner)]`, in
+  `MethodSchema::credential`, whose `Auth` carries the device kernel M5
+  names, so M5 moves no pinned blob.
+- **The `once` guard** [decided, S43]: `#[msg(credential = Auth("vote"), once)]`
+  admits a nullifier once in its scope, the scope's (space, agent,
+  instance, name) by construction. Apply records it in the system row
+  `once(scope ‖ nullifier) → t`, the batch time of its admission, kept for
+  good, only when the handler returns `Ok` [decided, S47]: a call the
+  handler fails or refuses leaves the member free to try again with a new
+  proof. A repeat of an admitted nullifier is refused,
+  `CredentialRefusal::Once` at ingress and `Refusal::Once` at apply. A
+  new round takes a new name ("vote/2026-11"), so a new scope.
 - **Gates:** the native verify of a credential proof at most 10 ms on one
   x86 core; a proof with a wrong PoW refused in under 1 ms; fuzz targets
   for the `Credentialed` decode and the format 42 and 43 verifiers in
@@ -364,11 +444,13 @@ G–L are M4's and M5's.
   with selects), so its proof's shape never depends on the witness.
 - **What a device proof authorizes at ingress:** exactly what an auth
   credential proof does. A device kernel is an `#[attestable]` method whose
-  `public_args` are pin I's auth words `(kind, map_root, scope, nullifier,
-  binding)` and whose output is empty; ingress takes the words from the
-  request, recomputes the io-hash, verifies the proof against the device
-  program id the agent's schema pins for the method, then runs pin I's
-  auth checks and logs the same `Anonymous` origin. Payment stays a
+  `public_args` are pin I's auth words, the SCALE encoding of
+  `CredentialPublic::Auth` (its kind byte, then `map_root`, `scope`,
+  `nullifier`, `binding`), and whose output is empty; ingress takes the
+  words from the request, recomputes the io-hash, verifies the proof
+  against the device program id of the kernel the method's guard names
+  (`device`), then runs pin I's auth checks (the binding naming that
+  program) and logs the same `Anonymous` origin. Payment stays a
   credential proof. Nothing else a device proof states is admitted in this
   slice.
 - **Budgets on the Fairphone 6** [decided, S3, S20, S27, S28]: the auth
@@ -376,71 +458,97 @@ G–L are M4's and M5's.
   at most **1 GiB** (target 768 MiB), the proof at most 1.5 MiB; verify at
   ingress at most 40 ms on one x86 core.
 
-### Pin K: the device secret from a passkey's PRF
+### Pin K: the device secret from a secret source
 
-- **The PRF input:** `first = SHA-256("vos/prf/v1" ‖ handle)`, the WebAuthn
-  PRF extension's `eval.first`; the client (the platform's WebAuthn
-  client, not the authenticator) applies the `"WebAuthn PRF\0"` prefix.
-  `handle` is the space's stable handle (pin G), not its `SpaceId`, so a
-  member's secret survives a re-founding [decided, S25]. The app shows
-  the handle and pins it at the first enrollment.
-- **The derivation:** `o` the 32-byte PRF output;
+The full spec is `proving.md` §8 (the derivation) and
+`identity-and-authority.md` §7 (its threat model); the sources are the
+owner's [decided, S42].
+- **The source:** a keyed HMAC-SHA-256 whose key the device never
+  exports, evaluated once per use after the user's consent:
+  - **by default, an Android Keystore HMAC key:** `KEY_ALGORITHM_HMAC_SHA256`,
+    purpose sign, user authentication required at every use (biometric
+    or the device's PIN, `setUserAuthenticationParameters(0, …)`, through
+    the platform's `BiometricPrompt` with the `Mac` as its crypto
+    object), StrongBox-backed when the phone has it (recorded), not
+    invalidated by a new biometric enrollment; Android 11 (API 30) or
+    later. `Mac.doFinal` returns a `byte[]`, zero-filled once copied;
+  - **optionally, a security key's `hmac-secret`,** by CTAP2 directly
+    through YubiKit, over USB or NFC, always with user verification (its
+    PIN) and a touch: CTAP2 keys a credential's `hmac-secret` apart with
+    and without user verification, so a use without the PIN would derive
+    another `s`. One credential for every handle (the salt varies), made
+    under one pinned `rpId` constant, `"vos.device"` (a CTAP2 string, not
+    a WebAuthn relying party); its credential id is the stored reference.
+    The salt is the input below as it is, no WebAuthn client prefixing
+    it.
+  - **Not in this slice:** Credential Manager, passkeys, Play services and
+    the Play Store; a source that spans devices is later work.
+- **The input:** `input = SHA-256("vos/device/input/v1" ‖ handle)`
+  [decided, S51], the message the source's HMAC takes. `handle` is the
+  space's stable handle (pin G), not its `SpaceId`, so a member's secret
+  survives a re-founding [decided, S25]. The client shows the handle and
+  pins it at the first enrollment. The device keeps only the **source's
+  reference** (the Keystore alias, or the security key's credential id)
+  beside the pinned handle.
+- **The derivation:** `o` the source's 32-byte output;
   `w = BLAKE2b-512("vos/device/secret/v1" ‖ handle ‖ o)`;
   `s_i = u64_le(w[8i..8i+8]) mod p` for `i < 8` (bias below 2^-33 an
-  element); derived again at each use from a fresh assertion with user
-  verification.
-- **What a space stores:** `member(s) = P2(TAG_MEMBER ‖ s)` in the
-  credential actor, `owner(s) = P2(TAG_OWNER ‖ s)` in a ledger row; no
+  element); derived again at each use, never stored.
+- **What a space stores:** `member(s) = C(T(member), s)` in the
+  credential actor, `owner(s) = C(T(owner), s)` in a ledger row; no
   epoch, which the device could not keep nor the actor check (the Fable
   review's M7): a revocation removes the leaf (pin G's freshness makes it
-  take effect), a new passkey is a new `s` and a new leaf. The handle is in
-  the derivation, so one passkey gives unlinkable secrets in two spaces
+  take effect), a new source is a new `s` and a new leaf. The handle is in
+  the derivation, so one source gives unlinkable secrets in two spaces
   with different handles.
-- **The handle-copy linkage** (in `SECURITY.md`): a founder who copies
+- **The handle-copy linkage** (in `node/SECURITY.md`): a founder who copies
   another space's public handle makes a member of both hold one `s`, so
   the two spaces' operators can link that member's `member` and `owner`
   digests; the scopes carry the `SpaceId`, so nullifiers stay distinct.
-- **Containment** (in `SECURITY.md`): the library zeroizes `s`, but the
-  PRF output, equivalent to `s`, reaches the app as a Java string and
-  cannot be zeroized; a synced passkey binds `s` to the Google account,
-  not to the phone.
+- **Containment** (in `vos-device`'s own `SECURITY.md`, new in 7.12;
+  `identity-and-authority.md` §7's threat model): the key stays in the
+  Keystore (or on the security key); `o`, equivalent to `s`, crosses
+  into the app's process at each use, as a `byte[]` the bridge
+  zero-fills and the library zeroizes after copying. Code in the process
+  during a use reads `o`. A lost key (a factory reset, the screen lock
+  removed, a lost security key) is a lost `s`: the member is revoked and
+  enrolls again, and the ledger's `rekey` moves its rows (S37).
 
 ### Pin L: the device library
 
 - **Crates:** `vos-device` (the prover API, `std`, aarch64 and x86_64),
-  `vos-device-jni` (a thin JNI shim, `extern "system"` functions over byte
-  arrays in the workspace codec), built for `aarch64-linux-android` with
-  `cargo-ndk` against NDK 27.2, mimalloc, no other C dependency.
-- **The API:**
-
-  ```rust
-  pub struct DeviceSecret(/* [M31; 8], zeroized on drop */);
-  pub fn derive_secret(prf_output: &[u8; 32], handle: &[u8; 32]) -> DeviceSecret;
-  pub fn member(secret: &DeviceSecret) -> Digest;
-  pub fn owner(secret: &DeviceSecret) -> Digest;
-  pub struct ProverConfig { pub threads: Threads, pub max_memory: u64 }
-  pub enum Threads { Auto, Count(usize), Cores(Vec<usize>) }
-  pub struct Prover { /* the thread pool, the formats' twiddles */ }
-  impl Prover {
-      pub fn new(config: ProverConfig) -> Result<Self, DeviceError>;
-      pub fn prove_auth(&self, s: &DeviceSecret, witness: &AuthWitness, scope: &Digest,
-                        binding: &Binding) -> Result<CredentialProof, DeviceError>;
-      pub fn prove_owner(&self, s: &DeviceSecret, binding: &Binding)
-                         -> Result<CredentialProof, DeviceError>;
-      pub fn prove_kernel(&self, program: &DeviceProgram, arguments: &[u8])
-                          -> Result<DeviceProof, DeviceError>;   // M5
-  }
-  ```
-  `Threads::Auto` weights work by core class (7.17); `DeviceError` names
-  what failed and no value. No logging of witnesses; the library has no
-  `seeded-masks` (pin C's build check covers it).
+  linked as a Rust crate by s4's Android client, itself a Rust `cdylib`
+  (S40): no JNI shim of VOS's own. Built for `aarch64-linux-android` with
+  `cargo-ndk` against the s4 client's NDK (28.2), mimalloc, no other C
+  dependency. The only Java is s4's: its `KeystoreBridge` (pin K's source)
+  and YubiKit, already in s4.
+- **The API** is `proving.md` §8's, pinned by 7.7: `source_input`,
+  `derive_secret`, `member`, `owner`; a `Call` (space, agent, instance,
+  method, arguments, a nonce from the OS, `expires_ms`) from which the
+  library computes the scope and the binding itself; `Prover::prove_auth`
+  (the secret, the `AuthWitness` from `path`, the guard's scope name, the
+  call), `prove_owner` (the secret, the call) and M5's `prove_kernel`;
+  `verify`; and the wire helpers, node-API requests and their answers
+  (`time_request`, `time_answer`; `path_query` and `root_query`, each
+  addressed to the agent's id and signed over its 32-byte identity by a
+  key drawn for it alone; `path_answer`, `root_answer`; `credentialed`),
+  so neither the client nor the gateway encodes a credential's bytes.
+  `prove_auth`
+  checks its witness before proving. **Paths** are refreshed apart from
+  proofs (pin G, S38): `PathKeeper` holds the current path and says when
+  to fetch again (`root()` moved, or a timer with jitter), and a proof
+  uses the path it holds. `Threads::Auto` is rayon's even split over
+  every core until 7.17 weights work by core class; `DeviceError` names
+  what failed and no value. No logging of
+  witnesses; the library has no `seeded-masks` (pin C's build check
+  covers it).
 
 ## M3.9: simplify and scale
 
 Two tracks from the first day: the simplification (7.1–7.3) and the scale
 harness (7.4–7.5) meet in the scale runs (7.6). The probes (7.0a, 7.0b),
-M4's 7.7, 7.8a, 7.9 and 7.10 and M5's 7.14 run beside them [decided,
-S7].
+M4's 7.7, 7.8a, 7.9, 7.10 and 7.10b and M5's 7.14 run beside them
+[decided, S7, S50].
 
 ### 7.0 The docs, the picks and two probes
 
@@ -458,18 +566,18 @@ S7].
   (S20). The proxy hashes the undoubled tree shape, omitting the doubled
   leaf layer's hashing that dominated the wrap's factor: it is a floor on
   the masking factor, not an estimate. **Estimate:** 1–1.5 weeks.
-- **7.0b The passkey PRF on the gate device** (a probe, session P1): a
-  throwaway app creating a passkey with PRF through Credential Manager
-  under the demo's relying party; `prf.results.first` equal twice, after a
-  reboot and after a Google Password Manager re-sync (a changed output
-  loses `s`). PRF for a native app through GPM is undocumented: this is
-  the evidence. **The relying party** [decided, S6]: a subdomain serving
-  `/.well-known/assetlinks.json` and nothing else (any page there could
-  ask for the same PRF input); a demo keystore committed, its SHA-256 in
-  `assetlinks.json`. **Fallback:** a FIDO2 key's `hmac-secret` through a
-  CTAP library (Credential Manager may not pass PRF to a security key),
-  applying `SHA-256("WebAuthn PRF\0" ‖ input)` itself; else a stored key
-  stands in for the PRF in the demo. **Estimate:** 2–3 days.
+- **7.0b The secret sources on the gate device** (a probe, session P1,
+  throwaway code in s4's Android host): a Keystore HMAC key under pin K's
+  spec, used through `BiometricPrompt` with its `Mac`; `Mac.doFinal` of
+  one input equal across uses and after a reboot; the key's StrongBox
+  backing and per-use prompt recorded; its output a `byte[]` the bridge
+  zero-fills. A security key's `hmac-secret` through YubiKit's CTAP2
+  session under pin K's `rpId`, with user verification, over USB and NFC,
+  equal twice and after a re-plug. No relying
+  party and no `assetlinks.json` [decided, S42; S6 reversed]; no Play
+  services. **Fallback:** if StrongBox refuses a per-use HMAC key, the
+  TEE-backed key, recorded; without a security key at hand, the Keystore
+  alone. **Estimate:** 2–3 days.
 
 ### 7.1 The venue side simplified (S)
 
@@ -730,7 +838,9 @@ and adds its set in a file of its own.
 - **What:** pin H's `0x402` in the runtime (`precompile.rs`, the refine
   host, the inner machines, the wire's price table) and the guest shim's
   software fallback; pin G's `vos-credentials` actor (enroll, revoke,
-  `path`, the ring) as a library actor; its price measured. No change to
+  `path`, the ring) as a library actor, as `identity-and-authority.md`
+  §6 pins it (its rows, the ring's freshness rule, `invite` and `claim`);
+  its price measured. No change to
   `node/host/src/roots` (so 7.3 and 7.9 do not meet).
 - **Tests:** the tree equals a reference built from scratch over random
   enrollments and revocations, on VOS and on the JAM-only host; slots
@@ -744,79 +854,274 @@ and adds its set in a file of its own.
   `MaskedComponents` set of `p2` and `qm31` (after the test's `P2Only`);
   the Blake2s-M31 channel wired in `pcs.rs` (the fork's
   `Blake2sM31MerkleChannel`); format 42 with its count on its own masked
-  shape; the prover and `verify_masked` over it.
+  shape, and 44's counted beside it (S29's alternative, registered only if
+  7.12 picks it); the prover and `verify_masked` over it; the
+  membership-and-payment circuit (pin I, S37), measured only.
 - **Gates:** soundness (a wrong path, a nullifier of another secret, an
   owner digest of another secret, a changed binding, each refused) and
   the forgery gates (a prover that skips the path's bits or the leaf's
   tag); a one-component masked set refused; leakage 2, 3 and 5 at N = 500
-  in `test-proof` (2,000 at the slice's end); on x86 auth at most 60 ms
-  and owner at most 30 ms on 4 threads [est from the masked floor: 2^11
-  rows × about 400 columns].
+  in `test-proof` (2,000 at the slice's end); on x86 auth and the
+  membership-and-payment circuit at most 60 ms and owner at most 30 ms on
+  4 threads [est from the masked floor: 2^11 rows × about 400 columns].
 - **Dep:** 7.7, 7.9 (the tree's hashes). **Estimate:** 3–4 weeks.
+
+### 7.10b The node API and the gateway (S)
+
+- **What** [decided, S41, S46, S49, S50]: the node keeps one binary API,
+  and everything in front of it moves to a gateway.
+  - **First, the grammar,** in the step's brief, which Fable reads before
+    any code: a frame is a `u32` little-endian length of what follows, a
+    `u16` request kind, over the socket a `u64` request id, then the
+    kind's SCALE body; an answer frame repeats the header (the request's
+    kind, and its id over the socket) before the answer's SCALE body. A
+    frame the node cannot take is answered by the frame error, kind
+    `0xffff`, its body a `FrameError` (`Oversize { limit }`,
+    `UnknownKind`, `Truncated`, `NotRelayed`), and the stream (QUIC) or
+    the connection (the socket) is closed. **The kind table** comes with
+    it: each kind's number, body, answer and size limit, checked from the
+    length and the kind before decoding (today's limit per route; an
+    install's larger; 7.11's credentialed call's 1.5 MiB plus
+    `cap::REQUEST` plus 4 KiB; `Time`'s and the node key's empty)
+    [proposed widths].
+  - **The node API:** every route of `node/host/src/ingress.rs` becomes a
+    kind (the node's key, an agent's info and status, calls, queries,
+    workflows, a schema, stats, agent and representative creation,
+    installs, replicas, roles, reports), with today's answers. Two
+    transports: a **unix socket** for a co-located gateway (its file mode
+    the access), and **QUIC with mutual TLS** on `node/net`'s stack (raw
+    ed25519 keys, an ALPN of its own, `vos-api/1`) for a remote one, the
+    node accepting the gateway keys its config lists. Over QUIC one stream
+    a request; over the socket, frames carry a request id and are answered
+    out of order.
+  - **Operator requests** [decided, S46]: the operator kinds (agent and
+    representative creation, installs, replicas, roles, reports) are each
+    signed by an operator key the node's config lists, with a nonce and an
+    expiry as a call's, instead of the bearer token in an HTTP header; the
+    node keeps each nonce until its expiry, so a gateway that relays one
+    keeps nothing it can replay (`identity-and-authority.md` §6). Until
+    they are built, the node accepts operator kinds on its unix socket
+    only and refuses them over QUIC.
+  - **The gateway,** `vos-gateway`, a binary of its own: today's HTTP
+    routes, byte for byte (paths, bodies, statuses), translated onto the
+    node API; the public TLS (`node/host/src/tls.rs`'s, moved); limits per
+    address before authentication; leader-aware balancing across a
+    space's nodes (it follows `NotLeader` and `Elsewhere`, as the client
+    does now); 7.13's s4 screens on its SSH port. s4's operator console,
+    when one is built, lives in it and only relays: the operator signs in
+    their own client, never in the gateway (none is built here).
+  - **The `vos-api` subsystem** [decided, S49]: the gateway's SSH port
+    also serves an SSH subsystem, `vos-api`, under any key (a fresh
+    ephemeral one, as no one in particular): a channel of node-API frames
+    that relays the read-only kinds only (queries, among them the
+    credential actor's `path` and `root()`, and `Time`), every other kind
+    answered `NotRelayed` by the gateway, never sent to the node. 7.13's
+    client fetches its paths and the node's time over it.
+  - **The s4 app's client key:** the gateway's s4 app holds one ordinary
+    VOS client key, with which it sends the claims (`claim(member)`, the
+    ledger's `claim_row`) of members who have no key of their own; its
+    authority is the registrar's invitations, which name the digests. It
+    holds no credential bytes: the facility builds them.
+  - **The gateway holds no authority:** the node verifies every
+    signature and proof and runs every ingress check, whoever relays the
+    frame. A compromised gateway can drop, delay or reorder requests and
+    reads what it relays; it can forge nothing.
+  - **The client's seam** is `node/host/src/client/http.rs`: a node-API
+    transport beside it, used by `vosx`, the tests and `vos-scale`'s
+    drivers (which measure the node; the gateway's cost is a row of its
+    own); HTTP through a gateway stays for clients that want it.
+  - **The node's HTTP is deleted** (`node/host/src/{ingress,http,tls}.rs`)
+    once the gateway carries every route, the HTTP tests pass through it,
+    and 7.6's final scale run is done, or T1 is re-measured over the
+    node-API transport and both recorded [decided, S50].
+- **Tests:** every route through the gateway answers as the node's HTTP
+  did (a differential test while both exist); each kind's size refused
+  before decoding, an unknown kind and a truncated frame, each with its
+  frame error; a QUIC peer with an unlisted key refused at the handshake;
+  a gateway that alters a signed call refused `BadSignature` by the node;
+  an operator kind over QUIC refused while operator requests are
+  socket-only; then an operator request unsigned, by an unlisted key,
+  replayed or expired, each refused; a kind other than a query or `Time`
+  over `vos-api` answered `NotRelayed` and never reaching the node; the
+  gateway following `NotLeader`; the end-to-end suites through the
+  gateway.
+- **Dep:** 7.7 [decided, S50]: it needs nothing of the credential AIR and
+  runs beside 7.9 and 7.10; 7.3 and 7.5, the last to change
+  `node/host/src/{ingress,http,tls,client/http}.rs`, are merged.
+  **Estimate:** 2–3 weeks.
 
 ### 7.11 The verifier at ingress (S)
 
-- **What:** pin I's request, checks, apply rule and origins in
-  `node/host/src/ingress.rs` and `calls.rs`; the origin ABI's `Anonymous`
-  and `Owner` kinds and the session-less input kind
-  (`identity-and-authority.md` §15 step 0); the guards; the replicated
-  binding set; the route's per-format size caps; the fuzz targets. Its
-  ABI change lands before 7.8b, so no pinned blob moves twice.
+- **What:** pin I's request, checks, apply rule and origins in the node
+  API (7.10b) and `calls.rs`; the gateway's `POST /agents/{id}/credentialed`
+  and `GET /time` as translations; the origin ABI's `Anonymous` and
+  `Owner` kinds and the session-less input kind
+  (`identity-and-authority.md` §15 step 0); the guards, with `once`
+  (S43) and its system rows; the replicated binding set; the frame's
+  per-format size caps; the `Time` request; the schema's `credential`
+  field and the `credentials` system row (`Failure::Credentials`); the
+  ledger test actor below, the demo's ledger in 7.13; the fuzz targets;
+  `node/SECURITY.md` opened (the path leak, the handle copy, what
+  operators and gateways learn). Its ABI change lands before 7.8b, so no
+  pinned blob moves twice.
+- **The ledger:** rows keyed by a name (1–32 bytes of UTF-8, which the
+  client's chrome shows verbatim), each `(owner, balance, frozen)`,
+  `owner` an owner digest. `invite_row(name, owner, expires_ms)` under the
+  role `operator`, and `claim_row(name, owner)`, any caller, before the
+  expiry: the credential actor's two steps, the invitation naming the
+  digest. `mint(name, amount)` under `operator`. `transfer(from, to,
+  amount)` under `Owner`: the handler debits `from` only if its live
+  owner is the proof's digest and it is not frozen, and credits `to`,
+  which must exist. `balance(name)`, a query, any caller. `rekey(name,
+  owner)` and `freeze(name)` under `operator` [decided, S37]: `rekey` sets
+  the row's owner digest, its name and balance kept, and lifts a freeze
+  (a lost secret's recovery, after the member enrolls again); `freeze`
+  refuses the row's debits until a `rekey`. Custodial by design
+  (`identity-and-authority.md` §7).
 - **Tests:** each check's refusal in order; a proof replayed at another
   node, refused at apply; an expired binding at apply by batch time; a
   root the replica has not applied (retryable); a revoked member's proof
   against the pre-revocation root refused once `ROOT_MAX_AGE` has passed
   by batch time; a proof of one call sent with another; two agents'
   scopes distinct; two spaces sharing a handle: one secret, one guard
-  name, distinct nullifiers; a 1.4 MiB device proof taken, a 600 KiB
-  credential proof refused; a wrong-PoW proof refused in under 1 ms; the
-  origin logged, the proof not; a pay proof refused once the row's owner
-  changed.
-- **Gate:** pin I's gates; 1,000 credentialed calls a second on one node
-  at p99 within 50 ms of a signed call's.
-- **Dep:** 7.10. **Estimate:** 2–3 weeks.
+  name, distinct nullifiers; a `once` guard: a second call of one
+  nullifier refused, at ingress and, raced past it at another replica, at
+  apply, while another scope's guard admits it; a `once` handler that
+  fails or refuses leaves its nullifier free (a second proof of it
+  admitted), while the first call's `b` sent again is refused `Replayed`
+  [decided, S47]; a 1.4 MiB format-43 body
+  within the frame's size (refused `Format` until 7.20 admits 43), a
+  600 KiB credential proof refused `Size`; a wrong-PoW proof refused in
+  under 1 ms; the origin logged, the proof not; a pay proof refused once
+  the row's owner changed, and on a frozen row; a rekeyed row paying to
+  the new owner's proof; a `claim_row` of a digest the invitation does
+  not name refused; a transfer to a row that does not exist refused, its
+  payer's balance unchanged.
+- **Gate:** pin I's gates; **the executors' bound** [decided, S44]: at
+  `k` verifying threads, for `k` = 1, 2, 4 up to the host's `N`, at least
+  `100·k` credentialed calls a second, p99 within 50 ms of a signed
+  call's; `N` and the host recorded. No absolute rate is claimed.
+- **Dep:** 7.10, 7.10b (whichever ends last). **Estimate:** 2.5–3.5
+  weeks.
 
 ### 7.12 The device library and the credential phone gate
 
 - **What:** pins K and L for M4 (`prove_auth`, `prove_owner`, the
-  derivation), the Android build, and the phone bench (`tools/phone`,
-  both builds).
+  derivation, `PathKeeper`), the Android build, and the phone bench
+  (`tools/phone`, both builds). Paths refreshed apart from proofs
+  [decided, S38]; `node/SECURITY.md`'s path entry states the leak as
+  reduced: operators learn that a member digest is online, and its
+  address, not when it proves; `vos-device`'s `SECURITY.md` states
+  containment. `Threads::Auto` a plain even split until 7.17.
 - **Phone gate PG1** (Fairphone 6): auth masked at most **250 ms** (target
-  150 ms) and owner at most 150 ms, each within 256 MiB, the 95th
-  percentile recorded; verified on the phone and on x86; the seeded
-  build's bytes equal to x86's.
+  150 ms), the membership-and-payment proof at most 250 ms (S37), and
+  owner at most 150 ms, each within 256 MiB, the 95th percentile
+  recorded; verified on the phone and on x86; the seeded build's bytes
+  equal to x86's.
 - **Phone session:** P2. **Dep:** 7.10. **Estimate:** 1.5–2.5 weeks.
 
-### 7.13 The Android demo
+### 7.13 The demo in s4
 
-- **Scope, minimal:** one Kotlin activity (Views, no Compose), minimum SDK
-  34; the library through JNI (`arm64-v8a`); the Gradle wrapper; the demo
-  keystore of 7.0b; the phone reaches the development machine's space by
-  `adb reverse tcp:7700 tcp:7700`, with a `network_security_config`
-  allowing cleartext to `localhost`, so the ingress's plain HTTP on
-  loopback serves it.
-- **Three buttons:** *Enroll* (show and pin the space's handle, create a
-  passkey with PRF, derive `s`, send `member(s)` and `owner(s)` to the
-  space's credential and ledger actors under an operator-granted
-  invitation that names those two digests, so an interceptor cannot
-  enroll its own); *Sign in* (a PRF
-  assertion, the path fetched, auth proved, the call sent, its answer and
-  the proving time shown); *Pay* (an amount and a payee, the owner proof,
-  the transfer sent, the balance shown).
-- **Not in scope:** recovery, several devices, iOS, the Play Store, UI
-  beyond the three buttons, storing anything but the credential id.
+- **Where** [decided, S40]: s4 (`~/src/virto/s4`), the owner's semantic UI
+  over SSH, now ours to change as the demo needs: its Android client (a
+  Rust `cdylib` with small Java bridges) and a server app in the gateway
+  (7.10b). The node knows nothing of SSH or s4: the gateway speaks the
+  node API to it.
+- **The screens:** an s4 app (`s4_server::rui::App`) the gateway serves on
+  its SSH port, three server-owned documents: *Enroll*, *Sign in*, *Pay*.
+- **The facility `vos.credential`:** a client facility, called by the
+  server and gated by the client's grant (a sensitive one, for the
+  session by default), implemented in the client's Rust over 7.12's
+  `vos-device`. Its operations: `enroll` (the handle, the space, the
+  agents it names with their identities, and the methods it may prove
+  for: the guarded methods' ids and scope names and the ledger's
+  `transfer`; answers `member(s)` and `owner(s)`), `sign_in` (a call of a
+  pinned method and its guard's scope name; answers the `Credentialed`
+  body), `pay` (a prefill: the payer's row, the payee's row and the
+  amount; answers the `Credentialed` body). The gateway forwards a body
+  to the node as is; it builds no credential bytes. The facility needs
+  Android 11 (API 30, pin K's Keystore key) and reports itself
+  unsupported below it; s4 runs from API 23.
+- **The secret sources** (pin K): s4's new `KeystoreBridge` (Java: the
+  HMAC key's creation and use under `BiometricPrompt`, the `byte[]` handed
+  to Rust and zero-filled) and YubiKit's CTAP2 `hmac-secret`, beside the
+  YubiKit s4 already uses for SSH security keys. The client stores the
+  source's reference and the pinned handle, agents and methods, nothing
+  else.
+- **An anonymous transport:** the gateway's credential surface accepts
+  an ephemeral SSH key, drawn per connection, as no one in particular;
+  authority comes from the proofs and the operator's invitation alone.
+  The client keeps no resume token and remembers no grant for it, and
+  pins the gateway's host key as for any host.
+- **Paths and time** [decided, S49]: the facility opens a second SSH
+  connection to the gateway, under a fresh ephemeral key, and the
+  `vos-api` subsystem on it (7.10b); over it, it fetches its path when
+  `root()` moves and on a timer (S38), never in the session that proves
+  and never just before a proof, and reads `Time` before it picks an
+  expiry. The library's `path_query`, `root_query` and `time_request`
+  build the frames.
+- **Trusted confirmation** [decided, S48]: before an owner proof the
+  facility shows its own form in trusted chrome, the payer's row, the
+  payee's row name and the amount, pre-filled from the server's `pay`
+  request and editable; it encodes `transfer(from, to, amount)` from
+  what the user confirmed, so what the binding covers is what the
+  member saw, whatever the server's document says. Before an auth proof
+  the chrome names the method and, for a `once` guard, that the call
+  spends the member's one admission in its scope, so a server cannot
+  pass a vote off as a sign-in. The facility's grant (per session, at
+  `ServerHello`) and a call's confirmation (per call) are two prompts;
+  the grant never stands in for the confirmation. The handle, the agents
+  and the methods are shown and pinned in chrome at enrollment; a later
+  request naming another space, agent or method is refused.
+- **Claims:** a member here has no VOS client key, so the gateway's s4
+  app sends `claim(member)` and the ledger's `claim_row` under its own
+  client key (7.10b), its authority the operator's invitations, which
+  name the digests.
+- **The flows:** *Enroll* (the handle, agents and methods shown and
+  pinned; the source's key created; `s` derived; `member(s)` and
+  `owner(s)` claimed under an operator's invitation naming those two
+  digests, so an interceptor cannot enroll its own); *Sign in* (the
+  method and its guard shown in chrome, the user's consent at the
+  source, auth proved on the path held, the call sent, its answer and
+  the proving time shown); *Pay* (the server's form pre-filling the
+  facility's; the payee and the amount confirmed or edited in chrome;
+  the owner proof; the transfer sent; the balance shown).
+- **Reach:** the phone reaches the development machine's gateway by
+  `adb reverse` of the gateway's SSH port, which carries both the s4
+  session and the `vos-api` connections; the gateway reaches the node by
+  its unix socket.
+- **What s4 changes:** its facility registry admits a facility of an
+  external namespace (`vos.`) that a client build registers, as widget
+  extensions are admitted now (today's rows are `s4.` only); `s4-server`
+  gains an anonymous authenticator policy (any key, an identity for the
+  connection only, no resume and no remembered grants across
+  connections); the client gains a per-connection key for the credential
+  surface (no saved token, no remembered grant, the host-key pin kept)
+  and an SSH subsystem client for `vos-api`; a facility shows its own
+  trusted-chrome form and asks a per-call confirmation apart from the
+  session's grant, never with the document's text; the
+  `KeystoreBridge`.
+- **Not in scope:** recovery beyond revoking and enrolling again (and the
+  ledger's `rekey`), several devices or a source that spans them, iOS,
+  Credential Manager and passkeys, Play services and the Play Store, the
+  desktop client's facility, a general method's confirmation from its
+  schema, UI beyond the three screens, storing anything but the source's
+  reference and what enrollment pinned (the handle, the agents, the
+  methods).
 - **Gate PG3:** the three flows end to end on the Fairphone 6 against a
-  local space, recorded (a screen capture and the node's log); phone
-  session P3.
-- **Dep:** 7.0b, 7.11, 7.12. **Estimate:** 1.5–2.5 weeks.
+  local space through the gateway, recorded (a screen capture, the
+  gateway's and the node's logs); phone session P3.
+- **Dep:** 7.0b, 7.10b, 7.11, 7.12. **Estimate:** 2–3 weeks.
 
 ### M4 acceptance
 
 - **Gates:** `ci-full`, the checker loop, PG1, PG3.
 - **Recorded:** the credential AIR's rows, proof bytes, proving on x86 and
-  the phone, verify at ingress; `0x402`'s price; the re-pinned constants.
+  the phone, verify at ingress; `0x402`'s price; the re-pinned constants;
+  a call's cost through the gateway beside the node API's.
 - **Reviews:** Fable on 7.8a–7.11 (the re-pins, the actor and its host
-  call, the AIR and its masking, the ingress); then a push.
+  call, the AIR and its masking, the node API and the gateway, the
+  ingress); then a push.
 
 ## M5: the device profile
 
@@ -986,8 +1291,9 @@ together on the phone in session P5.
 ### 7.22 The carrier audit, extended
 
 - **What:** slice 6's R7 audit over the new carriers (the credentialed
-  call and its log entry, the `path` query, the library's errors, the JNI
-  shim, the demo's log, the phone bench); slice 6's M6 (more needles, a
+  call and its log entry, the `path` query, the library's errors, the
+  node API's frames, the gateway's logs, s4's `KeystoreBridge` and
+  facility, the phone bench); slice 6's M6 (more needles, a
   run over small values).
 - **Dep:** 7.11, 7.20. **Estimate:** 1 week.
 
@@ -1045,15 +1351,21 @@ together on the phone in session P5.
 | masking the segment chips costs more than the wrap's factor (the 2^12 floor, padded tables, 14 unpaired chips), or its proofs are too big to send | 7.0a's proxy and bytes; 7.14's gates; per-component `h`; blowup 4 halves the floor and the bytes; pin J's 1.5 MiB | 7.0a, 7.14, 7.16 |
 | a device format under its margin (37 counts 61.86 under (c)) | formats 42 and 43 counted on their masked shapes, pinned by tests | 7.10, 7.16 |
 | 7.14 breaks the nodes' segment proofs (it edits the shared prover) | format 35's proofs byte for byte | 7.14 |
-| Credential Manager returns no PRF to a native app on Android 16 (undocumented) | 7.0b's probe; a security key's `hmac-secret` through a CTAP library; a stored key as the last fallback | 7.0b |
-| a page at the relying party derives members' secrets | the subdomain serves `assetlinks.json` only | 7.0b |
+| the gate device's Keystore refuses a per-use HMAC key (no StrongBox, or the prompt refusing a `Mac`) | 7.0b's probe; the TEE-backed key, recorded; a security key's `hmac-secret` through YubiKit | 7.0b |
+| a lost key (a factory reset, the screen lock removed, a lost security key) loses `s` and the member's funds | revoke and enroll again; the ledger's `rekey` moves the rows (S37) | 7.11, 7.13 |
+| a revoked member, or a thief of `s`, keeps paying | the ledger's `rekey` and `freeze` under an operator role (S37) | 7.11 |
+| a gateway forges, alters or replays requests | the node verifies every signature and proof and runs every check; operator requests signed, not bearer tokens, and socket-only until built (S46); the s4 console signs in the operator's client; a test of an altered call | 7.10b |
+| moving the node's HTTP to a gateway changes an answer | a differential test of every route while both exist; the end-to-end suites through the gateway before the node's HTTP is deleted | 7.10b |
+| deleting the node's HTTP leaves 7.6's T1 measured on a transport that no longer exists | the deletion after 7.6's final run, or T1 re-measured over the node API and both recorded (S50) | 7.6, 7.10b |
+| a hostile gateway's document makes the member confirm another payment, or spend a `once` admission as a sign-in | the facility's own chrome form for the payee and the amount, the server's request a prefill only, the arguments encoded from what the user confirmed (S48); the method and its `once` guard named in chrome; the agents and methods pinned at enrollment, others refused | 7.13 |
+| a `once` admission spent by a call the handler refused | the `once` row written only on `Ok`, in the same apply (S47); a test | 7.11 |
 | a single-component masked set leaks its claimed sum | two components at least (pin I), a test that a one-component set is refused | 7.10 |
 | a credential proof replayed at another node, or across agents or spaces | the binding names the space, agent, method and program; recorded at apply; scopes namespaced by space and agent | 7.11 |
-| two spaces sharing a handle link their members | the scope carries the `SpaceId`; the app shows and pins the handle; stated in `SECURITY.md` | 7.11 |
+| two spaces sharing a handle link their members | the scope carries the `SpaceId`; the app shows and pins the handle; stated in `node/SECURITY.md` | 7.11 |
 | a revoked member proves against an old root | ring roots older than `ROOT_MAX_AGE` refused | 7.11 |
 | ingress becomes a verification DoS target | per-format size caps first, the PoW before any decommitment, a bound per connection and an executor budget, no shared bucket; fuzzing at ingress | 7.11 |
 | a device proof's shape leaks its witness | the trace padded to the program id's log sizes; branch-free kernels; a test with two path shapes | 7.20 |
-| path fetches reveal which member proves | stated in pin G and `SECURITY.md`; syncing the tree is the later fix | 7.9 |
+| path fetches reveal which member proves | paths refreshed apart from proofs on a connection of their own, the `vos-api` subsystem under a fresh key (S38, S49); the address still links, and each tree change shows the online members, stated in pin G and `node/SECURITY.md`; syncing the tree is the later fix | 7.12, 7.13 |
 | a re-pin breaks the kit, the vectors or the teammate's vendored tree, or parallel steps collide in `pvm/proof` | the batch split (7.8a before 7.14, 7.8b after 7.3 and 7.11); `blobs.lock`; the vectors regenerated once in 7.1; four drops announced in `teammate-note.md` | 7.1, 7.8a, 7.8b, 7.21 |
 | simplifying pin D changes a design the teammate is building | the teammate told now (S19); one regeneration of `spaces-pallet.md` and the vectors | 7.0, 7.1 |
 | a stolen key ends a space for good (accepted, S11) | the tombstone; the deposit released and `dispatch_as_sovereign` callable on an ended space; the runbook re-seeds the tree from the old `member` digests | 7.1 |
@@ -1075,11 +1387,11 @@ together on the phone in session P5.
 | M3.9 simplification (7.1–7.3) | 6.5–9.5 |
 | M3.9 scale (7.4–7.6) | 4.5–8 |
 | M3.9 acceptance | 0.5 |
-| M4 (7.7–7.13 with 7.8a and 7.8b, and acceptance) | 12.5–18 |
+| M4 (7.7–7.13 with 7.8a, 7.8b and 7.10b, and acceptance) | 15.5–22 |
 | M5 (7.14–7.18, 7.20, 7.21 and acceptance) | 22–33.5 |
 | M5's word-level memory, if needed (7.19) | 4–6 |
 | the slice's end (7.22–7.23) | 4–5 |
-| **slice 7, engineer-weeks** | **about 52–77, up to 83** |
+| **slice 7, engineer-weeks** | **about 55–81, up to 87** |
 
 - **The critical path is M5's chain:** 7.0 → 7.8a (beside 7.0a) → 7.14 →
   7.15 → 7.16 → 7.17 → 7.18 → 7.21 → M5's acceptance → 7.22 → 7.23, about
@@ -1088,19 +1400,30 @@ together on the phone in session P5.
   phone session within a week of its ask (S33). 7.20 runs beside 7.21.
 - **The second re-pin costs 1–4 weeks** on that path (S23, S32).
 - **Beside it:** M3.9's two tracks (7.1 → 7.2 → 7.3 → 7.6, and 7.4 → 7.5
-  → 7.6); M4's chain (7.7 → 7.9 → 7.10 → 7.11 → 7.13, with 7.8b after 7.3
-  and 7.11, and 7.12 after 7.10), about 10–13 weeks, done within M5's.
+  → 7.6); M4's chain (7.7 → 7.9 → 7.10 → 7.11 → 7.13, with 7.10b beside
+  7.9 and 7.10 and 7.11 after whichever of 7.10 and 7.10b ends last
+  [decided, S50], 7.8b after 7.3 and 7.11, and 7.12 after 7.10), 9.5–13
+  weeks of steps, about 11–14.5 with acceptance, done within M5's; 7.10b
+  off the chain takes 2–3 weeks from it.
 - **Against `proving.md` §11's 12–20 weeks for M4 and M5:** that row left
-  out M3.9, the re-pin, the ingress verifier, the demo, masking the
-  segment chips (7.14) and the CPU split.
+  out M3.9, the re-pin, the node API and its gateway, the ingress
+  verifier, the demo, masking the segment chips (7.14) and the CPU split.
 
 ## Decisions
 
 **Taken by the owner:** S1–S5 before the plan; S6–S31 on draft 2; S32
-and S33 on draft 3 (`research/slice-7/owner-decisions.md`), among them
-C1–C11 all taken and C4 fully terminal (S8–S18), the teammate told now
-(S19), the chip and the levers in the node's format too as the leaf count
-allows (S23, S32), a stable PRF handle (S25), the phone sessions (S33).
+and S33 on draft 3; S34 on 7.2's review; S35 and S36 on the scale runs'
+hardware and S52 on its wiring; S37–S44 on 7.7's questions and S46–S51
+on Fable's review of 7.7 (`research/slice-7/owner-decisions.md`),
+among them C1–C11 all taken and C4 fully terminal (S8–S18), the teammate
+told now (S19), the chip and the levers in the node's format too as the
+leaf count allows (S23, S32), a stable space handle (S25), the phone
+sessions (S33), the demo in s4 (S40), the node's binary API and its
+gateway (S41), the Keystore and security keys instead of passkeys (S42,
+reversing S6), the `once` guard (S43), signed operator requests (S46),
+the `once` row on `Ok` only (S47), the facility's own confirmation form
+(S48), the `vos-api` subsystem (S49), 7.10b beside 7.9 and 7.10 (S50),
+the input's tag (S51).
 S7, S11 and S25 carry the review's amendments (7.8's split; the
 divergence guard and the deposit released on `Ended`; the scope's
 `SpaceId`, the re-seeding runbook and `member` without an epoch).
@@ -1126,5 +1449,12 @@ Two, each closed by a measurement:
    owner keeps ≤ 1 s or sets the gate from the measurement; until then the
    plan aims at 1 s.
 2. **The credential parameters** (S29): 7.12's grind on the phone picks
-   PoW 16 with 47 queries if its 95th percentile passes 50 ms, else PoW 20
-   with 43.
+   PoW 16 with 47 queries (format 44) if its 95th percentile passes 50 ms,
+   else PoW 20 with 43 (format 42).
+
+7.7's design round asked six more (7.7-Q1 to Q6, `slice-7-progress.md`,
+7.7); the owner answered each: Q1 by S37, Q2 by S38, Q3 by S39, Q4 by
+S42, Q5 by S43, Q6 by S44, folded into the pins and steps above. Fable's
+review of 7.7 asked six (`research/slice-7/7.7-fable.md`, Q1 to Q6),
+among them the operator requests S41's fold had left open; the owner
+answered each by S46–S51, folded likewise.

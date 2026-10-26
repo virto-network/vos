@@ -202,7 +202,7 @@ before the levers' factors and added back:
 - **For the owner (S20):** after P1 measures the ratio on today's AIR, the
   gate stays at ≤ 1 s or is set from the measured range.
 
-### 7.0b: the passkey PRF on the gate device
+### 7.0b: the secret sources on the gate device
 
 Pending P1.
 
@@ -1233,6 +1233,145 @@ of degree below `N + h` has a quotient of degree `2N + 3h ≤ 3.5N < 4N` for
 `h ≤ N/2`), with the degree audit and the lifting test re-run. On this
 statement the pads are about 4% of the cells, so each yields a few percent
 here, more on lean kernels; R1 halves with `h`.
+
+
+## Step 7.7: the design round
+
+Pins G, I, K and L checked against the code at vos-core `4e7b4982` and
+the owner's S21–S25, S7, S28 and S29, with the Fable review's H1, H2, M3,
+M5, M7 and M8; written into `proving.md` §8 (the hash, the tree, the
+statements, format 42, the PRF derivation, the device library's API) and
+`identity-and-authority.md` §5 (the origins, credentialed calls, the
+binding, the guards, ingress's checks with every refusal code, the apply
+rule), §6 (the credential actor: its rows, its ring, its methods,
+re-founding) and §7 (the in-space credential and its threat model). The
+plan's pins now summarize those sections and point to them.
+
+**What the code holds today** (the pins' starting point):
+- the logged caller is `vos_wire::ids::Principal`, `Client` 0, `Agent` 1,
+  `Instance` 2; no origin of the identity design's ABI was reserved, and
+  the batch's `Input` has no session-less kind (indexes 0–9 taken);
+- ingress's refusals are `Rejection` (indexes 0–8), mapped to HTTP statuses
+  in `node/host/src/ingress.rs`; the HTTP layer picks a body's limit by
+  path before decoding (`/install` alone is larger);
+- `GET /` answers the node's key, which clients pin; no route answers the
+  node's time;
+- an agent's state holds its `SpaceId` (`keys::space`), `SpaceId::NONE`
+  without a genesis; an `AgentId` is unique in its space (the creating
+  node's number in its top byte), not across spaces;
+- refine checks a method's role in `refine/invocation.rs`, from the
+  schema's `MethodSchema::role`; `MethodSchema` has no credential field;
+- `vos-pvm-poseidon2`'s `compress` is the width-16 permutation of
+  `left ‖ right`, truncated to 8 words; formats 30 and 37 are registered,
+  reserved, at unmasked counts; 41–44 are free.
+
+**Fixed in the pins** (each an inconsistency or a gap):
+- **The tree's leaf no longer hashes its slot:** a `u32` slot does not
+  fit one M31 word, and 32 direction bits recomposed mod p would alias; in
+  a positional tree the path places the leaf. `leaf = C(T(leaf), member)`.
+  A write is 33 calls of `0x402`, not 32 (the leaf and 32 levels).
+- **Every hash pinned as `C(l, r)`,** the compression of two 8-word halves,
+  with tags as `[t, 0, …, 0]` blocks and 32-byte digests mapped to words by
+  `W` (eight 31-bit words): the plan's `P2(TAG ‖ s ‖ scope)` had 17 words
+  for a 16-word permutation. The nullifier is `C(C(T(nf), s), scope)`.
+- **The ring's freshness runs from a root's supersession,** not from its
+  write: as written, a root current for a month became stale the moment an
+  unrelated enrollment replaced it, so every honest path fetched before
+  that change failed at once. Revocation still binds within
+  `ROOT_MAX_AGE` of the revoking batch (H2's goal). The ring is also
+  checked at apply, by batch time, not only at ingress, which the plan's
+  7.11 test already assumed ("by batch time").
+- **A route of its own,** `POST /agents/{id}/credentialed`: the HTTP layer
+  caps a body by path before decoding, so a 1.5 MiB body cannot share
+  `/calls`' 68 KiB limit; and `GET /time` for the node's clock, since
+  `GET /` serves the pinned node key.
+- **S29's alternative is format 44,** not 42 with other parameters: a
+  number names one set of parameters.
+- **A space without a genesis refuses credentialed calls** (`NoSpace`):
+  every such space's scopes would collide under `SpaceId::NONE`.
+- **The scope's BLAKE2b preimage takes a domain tag,**
+  `"vos/cred/scope/v1"`, as the binding's does.
+- **The program id for format 42 is the circuit's,** chosen by `kind`,
+  never by the schema; the schema names a device kernel only for format
+  43, in the guard's `device` field, which exists from 7.11 so that M5
+  moves no pinned blob after 7.8b's `blobs.lock`.
+- **"Once in this scope" is the handler's rule:** a login's nullifier is a
+  stable pseudonym; a handler that admits a member once keeps its own set.
+  The identity design's wording ("once in this scope" on the origin) is
+  corrected.
+- **`path` is an ordinary query,** under the query route's limits: the
+  host has no per-method limiter, and the tree's shape is not secret from
+  its readers. Queries are signed, so the library signs each `path` with a
+  key drawn for it alone.
+- **The agent finds its credential actor** through a system row its
+  install writes (`credentials → instance`, one an agent); an `Auth` guard
+  without one fails install (`Failure::Credentials`).
+- **`proving.md` §8's stale text** (a balance row and range check for
+  payment, a binding to a challenge, a Poseidon2 root kind for credential
+  maps) replaced by the decided statements; §4's table and §12's decision
+  4 follow; 30 and 37 retire when 42 and 43 register.
+- **7.11's tests and gate:** the 1.4 MiB device body passes the route's
+  size and is refused `Format` until 7.20 admits 43; the 1,000-a-second
+  gate is 10 cores of verifying at 10 ms (Q6).
+
+**The owner's questions,** with options and recommendations, in the
+plan's "Open questions": Q1, revocation does not stop payment (recommended:
+the ledger's `rekey` and `freeze` under an operator role); Q2, path fetches
+link a pseudonym to its member for operators (recommended: the library
+refreshes paths apart from proofs; a bucket query later); Q3, a duplicate
+answered `Replayed` without its outcome (recommended: as pinned); Q4, the
+PRF output as a Java string (recommended: accept, and P1 checks Play
+services' FIDO2 client for a `byte[]`); Q5, "once in this scope" in the
+handler (recommended: as pinned); Q6, 7.11's rate gate on a host of at
+least 12 executor threads (recommended: keep, threads recorded).
+
+**Answered** (2026-10-26): the owner's S37–S44 folded into the pins, the
+design docs and the plan (`owner-decisions.md`): S37 Q1, S38 Q2, S39 Q3,
+S42 Q4 (no passkeys: the Keystore and a security key), S43 Q5 (a `once`
+guard, superseding "the handler's rule" above), S44 Q6; with S40 (the
+demo in s4) and S41 (the node's binary API and a gateway, step 7.10b).
+
+**Left to the steps:** `SECURITY.md`'s entries (the path leak, the handle
+copy, the containment) with 7.11 and 7.12, as the plan has them.
+
+**Review (Fable):** fix-then-merge; M1–M8, L1–L13 folded; owner S46–S51
+(`research/slice-7/7.7-fable.md`, `owner-decisions.md`). The fixes: the
+`once` row written only when the handler returns `Ok`, `b` recorded
+whatever it does, and 7.11's test (M1, S47); the demo client's paths and
+time over a `vos-api` SSH subsystem on the gateway, under a fresh key,
+and the s4 app's client key sending the claims of keyless members (M2,
+S49); the facility's own chrome form for the payee and the amount, the
+server's request a prefill, the method and its `once` guard named
+before a sign-in, the grant and a call's confirmation two prompts (M3,
+S48, L5); the demo's ledger, rows by name with `invite_row`/`claim_row`,
+`mint`, `transfer`, `balance`, `rekey` and `freeze` (M4); `path_query`
+addressed by the agent's id and signed over its identity, and
+`root_query`/`root_answer` and `time_request` added (M5); 7.10b's
+dependency 7.7, beside 7.9 and 7.10, the node's HTTP deleted after 7.6's
+final run or T1 re-measured, the chain 9.5–13 weeks of steps (M6, S50);
+the input's tag `"vos/device/input/v1"` (M7, S51); the scope an input
+of the nullifier's compression, neither preimage hashed in the circuit
+(M8). The lows: a security key always with user verification, one
+credential under the pinned `rpId` `"vos.device"` (L1); which enum's
+`Replayed` and `Once` (L2); `Time`'s bound stated (L3); the operator
+console signs in the operator's client (L4, S46: operator requests
+signed, socket-only until built); the client's per-connection key, no
+token, no remembered grant (L6); `Threads::Auto` an even split until
+7.17, the facility unsupported below API 30 (L7); the joint circuit a
+floor, the in-space ledger custodial by design (L8); 7.10b's frame
+grammar, frame error and kind table first (L9); `CredentialRefusal`'s
+codes renumbered in check order, `Once` 9, `RootUnknown` 10,
+`RootStale` 11, `Proof` 12 (L10); agents and methods pinned at
+enrollment (L11); `node/SECURITY.md` and `vos-device`'s `SECURITY.md`
+named (L12); the arguments in clear and the online set at each tree
+change in §7's residues (L13).
+
+**Gate** [measured]: `just check` green at `d524aef3` (1,441 passed in 105
+suites). Its first run failed `anchoring::a_dissenting_replica_does_not_block_the_evidence`,
+a race in the test as 7.2 left it, 2 runs in 5 on `4e7b4982`: the venue
+ends the space inside the leader's offer, and the test read the leader's
+alerts before the offer's answer raised `Evidence`. The test now waits for
+the alert (`d524aef3`); 8 runs in 8 passed.
 
 ## Step 7.5: the load model and its drivers
 

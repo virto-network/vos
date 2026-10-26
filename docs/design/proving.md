@@ -586,7 +586,8 @@ last for decades.**
 |---|---|---|---|
 | segment proofs (format 35) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.86) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
-| device and credential proofs (37, 30; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin | blowup 2 (log 1), 86 queries, PoW 20, plus interaction PoW 8 | 106 / 62 |
+| credential proofs (42, or 44 by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 43 queries, PoW 20 (44: 47 queries, PoW 16), plus interaction PoW 8; variant (c) | 106 / 62 (62.69); 44: 110 / 62 (62.66) |
+| device proofs (43; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | chosen by 7.16 among blowup 2 with 86–87 queries, 4 with 43 (or 47 at PoW 16), 8 with 29; variant (c) | ≥ 100 / ≥ 62 |
 | the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
 | the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
 
@@ -893,43 +894,252 @@ last for decades.**
   - Committed rows sit first in the keyspace, under `0x03`, so an
     agent's root is the same on both hosts: VOS's tree per agent equals
     JAM's node at `0x03` [decided]. `RootKind { Space = 0 }`; 1 is
-    reserved for the Poseidon2 kind (§8).
-  - A map may take the **Poseidon2 root kind** (§8). Its root is then a
-    Poseidon2-M31 tree's root.
+    reserved for a Poseidon2 kind, which the cross-space credential will
+    take (§8). The in-space credential's tree needs none: it lives in its
+    actor's rows, and only its space's ingress reads it.
 
-## 8. Mobile [decided: credential AIR first, then the device profile; PRF first, then chips]
+## 8. Mobile [decided: credential AIR first, then the device profile; device-held secrets first, then chips]
 
-**1. The credential AIR** comes first. It is a small, dedicated
-Poseidon2-M31 AIR, built from the recursion AIR's Poseidon2 component.
-- **Authentication:**
-  - membership of a credential leaf in a Poseidon2 tree;
-  - a nullifier scoped to the context;
-  - a binding to the challenge.
-- **Payment authorization:**
-  - a balance row read from a Poseidon2 tree;
-  - a range check that balance ≥ amount;
-  - a binding to the payment.
-- **Proved on the phone in Blake2s-M31, masked** (variant (c), the
-  device parameters of §4). It is verified at the space's ingress.
-- **Projected at tens of milliseconds** [model].
+**1. The credential AIR** comes first [decided, S21–S25]. Two fixed circuits over the recursion
+AIR's `p2` and `qm31` components prove facts about a device secret `s`,
+and a space's ingress verifies them. This section pins what they hash,
+the tree they read, the format and the secret's derivation; the actor
+keeping the tree, the request, ingress's checks and the origins are
+`identity-and-authority.md` §5–§7.
 
-**Passkeys, post-quantum** [decided, first]:
-- The passkey's PRF extension (shipped on iOS, Android and Chrome)
-  derives a device secret.
-- The credential leaf is `Poseidon2(secret ‖ …)`.
-- The passkey stays the user experience and the key wrap. No curve
-  arithmetic enters the proof.
+**The hash is one function,** Poseidon2-M31's compression `C(l, r)`: the
+first 8 words of the width-16 permutation (4 + 4 full rounds, 14 partial,
+`vos-pvm-poseidon2`'s constants) of `l ‖ r`, each half 8 words, with no
+feed-forward. The `0x402` host call computes exactly `C` (pin H), so the
+actor's tree, the node and the phone agree word for word.
+- **A digest** is 8 M31 words. Its bytes are the words as little-endian
+  `u32`s, 32 bytes; a decode refuses a word ≥ p.
+- **A tag** `T(name)` is the 8-word block `[t, 0, 0, 0, 0, 0, 0, 0]`, where
+  `t` is `u32_le(BLAKE2b-256("vos/p2/" ‖ name)[0..4]) & 0x7fff_ffff`,
+  reduced mod p. The names are `member`, `owner`, `leaf`, `nf`, `scope`
+  and `binding`; a test pins the six `t` distinct and nonzero.
+- **The words of 32 bytes** `W(d)`: word `i` is
+  `u32_le(d[4i..4i+4]) & 0x7fff_ffff`, reduced mod p (`2^31 − 1` becomes
+  0). Eight words, 248 bits.
 
-**The Poseidon2 root kind,** needed by the credential AIR:
-- **vos-tree gains a Poseidon2-M31 root kind** per map. Credential sets
-  and the balances phones read take it.
-- **The zkPVM gains a Poseidon2 precompile chip** (one permutation a row,
-  about 300 columns at degree ≤ 3, like the recursion AIR's `p2`). Node
-  kernels can then read those maps, and it is cheaper than BLAKE2b
-  in-AIR.
+**What is stored, logged and proven** (each `C` is one permutation):
+
+| value | definition | where it lives |
+|---|---|---|
+| `member(s)` | `C(T(member), s)` | the credential actor's tree, under a leaf |
+| `owner(s)` | `C(T(owner), s)` | a ledger row's owner |
+| `leaf(m)` | `C(T(leaf), m)` | the tree, at the member's slot |
+| a node | `C(left, right)` | the tree |
+| `scope` | `C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))` | computed by ingress from the method's guard |
+| `nullifier` | `C(C(T(nf), s), scope)` | auth's public word; the logged pseudonym |
+| `binding` | `C(T(binding), W(b))`, `b` the call's binding digest | both statements' public word |
+
+`s` is 8 words (below). In the scope's preimage `space` is the `SpaceId`'s
+32 bytes, `agent` the `AgentId` and `instance` the `InstanceId` as 4
+little-endian bytes each, `name` the guard's scope name (1–64 bytes) in
+SCALE (a compact length, then the bytes). `b` is
+`identity-and-authority.md` §5's binding digest.
+- **No epoch in `member`** (the Fable review's M7): a revocation removes
+  the leaf, and a new secret source is a new `s` and a new leaf.
+- **The nullifier** is `scope` keyed by `C(T(nf), s)`, a value only the
+  holder of `s` computes: two scopes' nullifiers are unlinkable, and
+  neither links to `member` or `owner`. In one scope it is stable: a
+  pseudonym, not a one-time token (`identity-and-authority.md` §5).
+- **The leaf does not hash its slot:** the position is the path's. A
+  32-bit slot would not fit one M31 word, and its bits recomposed mod p
+  would alias.
+
+**The tree** (`identity-and-authority.md` §6): a positional sparse Merkle
+tree of depth 32 over `C`. Slot `i` (a `u32`) holds `leaf(member)`, or the
+empty leaf `E_0`, eight zero words; node `i` at level `l` is
+`C(child 2i, child 2i + 1)` of level `l − 1`, level 0 the leaves; the empty
+subtree at level `l` is `E_l = C(E_{l−1}, E_{l−1})`, a constant. A path is
+the 32 siblings from level 0 up; bit `l` of the slot, least significant
+first, is 1 when the level-`l` node is a right child. No leaf equals
+`E_0` but with a preimage of `C`, so an empty slot proves nothing. An
+enrollment or a revocation costs 33 calls of `C`: the leaf and 32 levels.
+
+**The statements:**
+- **Auth** (`CredentialKind::Auth = 0`). Public, in this order: `kind`,
+  `map_root`, `scope`, `nullifier`, `binding` (1 + 4 × 8 = 33 words).
+  Private: `s`, the slot's 32 bits and the 32 siblings. The circuit
+  computes `m = C(T(member), s)` and `C(T(leaf), m)`, walks the path with
+  one select a level on a boolean-constrained bit (branch-free, so the
+  trace's shape never depends on the witness), asserts the top equals
+  `map_root`, and asserts `C(C(T(nf), s), scope) = nullifier`: 36
+  permutations.
+- **Owner** (`CredentialKind::Owner = 1`). Public: `kind`, `owner`,
+  `binding` (17 words). Private: `s`. Asserts `C(T(owner), s) = owner`:
+  one permutation. No path, no balance and no range check: the payer is
+  public [decided, S22]. The ledger's handler compares the live row's
+  owner at apply, so a former owner's proof fails once the row changes
+  hands. Revocation does not stop payment; the ledger's `rekey(row,
+  owner)` and `freeze(row)`, under an operator role, do [decided, S37].
+- **Membership and payment together** [decided, S37], measured, not
+  admitted: a third circuit on the same shape proves auth's leaf, path and
+  nullifier and owner's digest from one `s` (37 permutations). Slice 7
+  times it on the phone against auth's budget, so the later private
+  payment's statement (`identity-and-authority.md` §8) is known to fit; it
+  has no `CredentialKind` and no ingress path. It is a floor for a
+  shielded spend, not its estimate: notes, values and range checks cost
+  far more than its 37 permutations.
+- **The public words bind the proof:** each is a public value of the
+  masked transcript (§5, its step 4), in the order listed, `kind` one word
+  and each digest its eight; the circuit consumes every word through the
+  public sums, so a proof verifies under its own words alone. Neither
+  `scope` nor `binding` is computed from its BLAKE2b preimage in the
+  circuit: ingress computes both from the guard and the request. `scope`
+  is the second input of the nullifier's outer compression, so the
+  circuit hashes it; `binding` is a public word only, read by no gate and
+  bound by the transcript and the public sums.
+- **The program id** of each circuit is its circuit hash, a constant the
+  verifier's build pins under a stale-fixture test. The verifier takes the
+  circuit by `kind`, never from the proof; the binding names the program,
+  so a proof for one circuit authorizes nothing under another.
+- **The shape:** `p2` and `qm31`, two blinded components at least (a
+  one-component masked set leaves its claimed sum in the clear), each
+  padded to the masking floor, 2^11 rows (`h = 512`). Auth and owner share
+  the shape, so their proofs are the same size.
+
+**Format 42, credential proofs** [decided, S29; the PoW open until 7.12]:
+masked (c), the Blake2s-M31 channel (the fork's
+`Blake2sM31MerkleChannel`), blowup 4 (log 2), 43 queries, PoW 20,
+interaction PoW 8, fold step 1, last layer 2^0, affine DEEP batching if the
+fork's Blake2s-M31 path takes it, else by powers; at least 62 proven and
+100 conjectured bits on its masked shape (62.69 and 106 [model]). If 7.12's
+grind has a 95th percentile above 50 ms on the phone, the credential
+format is **44** instead: the same at 47 queries and PoW 16 (62.66 and 110
+[model]), and 42 is retired. A number names one set of parameters, so the
+switch takes a new one. 30, reserved at an unmasked count, is retired
+unregistered. Ingress takes a proof of at most 512 KiB.
+
+**The device secret, from a secret source** [decided, S25, S42]:
+- **The source** is an HMAC-SHA-256 under a key the device never
+  exports, evaluated once a use after the user's consent: by default an
+  Android Keystore HMAC key (user authentication at every use, by a
+  biometric or the PIN through `BiometricPrompt`; StrongBox-backed when
+  present; Android 11 or later); optionally a security key's
+  `hmac-secret` by CTAP2 directly through YubiKit, always with user
+  verification (its PIN) and a touch: CTAP2 keeps a credential's
+  `hmac-secret` key apart with and without user verification, so a use
+  without the PIN would derive another `s`. One credential serves every
+  handle (the salt varies), made under one pinned `rpId` constant,
+  `"vos.device"`, a CTAP2 string and not a WebAuthn relying party. No
+  passkeys, Credential Manager or Play services; a source that spans
+  devices is later work. The device keeps the source's reference (the
+  Keystore alias, or the security key's credential id).
+- **The input:** `input = SHA-256("vos/device/input/v1" ‖ handle)`
+  [decided, S51], the message the source's HMAC takes (a security key's
+  salt as it is: no WebAuthn client prefixes it). `handle` is the space's
+  stable 32-byte handle (`identity-and-authority.md` §6), not its
+  `SpaceId`, so a member's secret survives a re-founding.
+- **The derivation:** `o` the source's 32-byte output;
+  `w = BLAKE2b-512("vos/device/secret/v1" ‖ handle ‖ o)`;
+  `s_i = u64_le(w[8i..8i+8]) mod p` for `i < 8` (a bias below 2^-33 a
+  word). It is derived again at each use, from a fresh evaluation, and
+  never stored.
+- **One source, many spaces:** spaces with different handles get
+  unrelated secrets. Two that share a handle share `s`, so their `member`
+  and `owner` digests are equal; their scopes carry the `SpaceId`, so
+  their nullifiers are not. The client shows the handle and pins it at
+  the first enrollment.
+- **What `s` is exposed to** is `identity-and-authority.md` §7's threat
+  model.
+
+**The device library** (`vos-device`, `std`, aarch64 and x86_64; linked
+as a Rust crate by s4's Android client, a Rust `cdylib`, so VOS has no JNI
+shim of its own; built for `aarch64-linux-android` with `cargo-ndk`
+against the client's NDK; mimalloc, no other C dependency). Neither the
+client nor a gateway encodes a credential's bytes: the library builds
+every request and decodes every answer it needs.
+
+```rust
+pub struct Digest(pub [u32; 8]);                  // each word below p
+pub struct DeviceSecret(/* [M31; 8]; zeroized on drop, no Clone, no Debug */);
+
+pub fn source_input(handle: &[u8; 32]) -> [u8; 32];
+pub fn derive_secret(source_output: &[u8; 32], handle: &[u8; 32]) -> DeviceSecret;
+pub fn member(secret: &DeviceSecret) -> Digest;
+pub fn owner(secret: &DeviceSecret) -> Digest;
+
+/// The call a proof authorizes; `new` draws the nonce from the OS.
+pub struct Call {
+    pub space: [u8; 32], pub agent: u32, pub instance: u32, pub method: u32,
+    pub arguments: Vec<u8>, pub nonce: [u8; 16], pub expires_ms: u64,
+}
+pub struct AuthWitness { pub root: Digest, pub slot: u32, pub siblings: [Digest; 32] }
+pub struct CredentialProof { pub format: u32, pub public: CredentialPublic, pub proof: Vec<u8> }
+
+pub struct ProverConfig { pub threads: Threads, pub max_memory: u64 }
+pub enum Threads { Auto, Count(usize), Cores(Vec<usize>) }
+pub struct Prover { /* the thread pool, the formats' twiddles */ }
+impl Prover {
+    pub fn new(config: ProverConfig) -> Result<Self, DeviceError>;
+    /// `name` is the guard's scope name; the scope and binding are computed here.
+    pub fn prove_auth(&self, s: &DeviceSecret, witness: &AuthWitness, name: &[u8],
+                      call: &Call) -> Result<CredentialProof, DeviceError>;
+    pub fn prove_owner(&self, s: &DeviceSecret, call: &Call)
+                       -> Result<CredentialProof, DeviceError>;
+    pub fn prove_kernel(&self, program: &DeviceProgram, arguments: &[u8])
+                        -> Result<DeviceProof, DeviceError>;   // M5
+}
+pub fn verify(proof: &CredentialProof, call: &Call, name: Option<&[u8]>)
+              -> Result<(), DeviceError>;
+
+// The wire (identity-and-authority.md §5–§6): node-API requests, each its
+// kind and SCALE body (the transport adds the length and any request id).
+// `agent` addresses the request; `identity` is the agent's 32-byte
+// identity, which a query's key signs over.
+pub fn time_request() -> Vec<u8>;                                    // Time
+pub fn time_answer(body: &[u8]) -> Result<u64, DeviceError>;
+/// A `QueryCall` of `path`, signed by a fresh key.
+pub fn path_query(agent: u32, identity: &[u8; 32], instance: u32,
+                  member: &Digest, not_after: u64) -> Vec<u8>;
+pub fn path_answer(body: &[u8]) -> Result<Option<AuthWitness>, DeviceError>;
+/// A `QueryCall` of `root()`, signed by a fresh key.
+pub fn root_query(agent: u32, identity: &[u8; 32], instance: u32,
+                  not_after: u64) -> Vec<u8>;
+/// The root and its `since`.
+pub fn root_answer(body: &[u8]) -> Result<(Digest, u64), DeviceError>;
+/// The request, addressed to `call.agent`.
+pub fn credentialed(call: &Call, proof: &CredentialProof) -> Vec<u8>;
+
+/// The path held, refreshed apart from proofs [decided, S38].
+pub struct PathKeeper { /* the member, the path held, the next fetch's time */ }
+impl PathKeeper {
+    pub fn new(member: Digest) -> Self;
+    /// Whether to fetch now: the root moved, or the jittered timer is due.
+    pub fn due(&self, now_ms: u64, root: Option<&Digest>) -> bool;
+    pub fn update(&mut self, witness: AuthWitness, now_ms: u64);
+    pub fn witness(&self) -> Option<&AuthWitness>;
+}
+```
+- **`prove_auth` checks its witness first:** the leaf of `member(s)` under
+  `root` by the path, else `DeviceError::Witness` before any proving.
+- **`DeviceError`** is `Config`, `Memory`, `Witness`, `Prove`, `Decode` or
+  `Verify`: it names what failed and carries no value.
+- **`Threads::Auto`** weights work by core class (7.17) [decided, S28];
+  until 7.17 it is rayon's even split over every core.
+- **`path_query` and `root_query` sign with a key drawn for that query
+  alone,** so fetches link to no client key; a proof uses the path
+  `PathKeeper` holds, and no fetch precedes it. `path_answer` is `None`
+  for a digest not enrolled.
+- **No logging of witnesses,** and no `seeded-masks` feature (pin C's
+  build check). The client's bridge zero-fills its `byte[]` of `o` once
+  the library has copied it; the library zeroizes its copies of `o` and
+  `s`.
+
+**No Poseidon2 root kind for the in-space credential** [settled by the
+evidence, the owner's to override]: the credential tree lives in the actor's own rows,
+hashed through `0x402`, and no venue checks a Poseidon2 root. `RootKind`
+1 stays reserved for the cross-space credential, which will prove its
+root's place under `S_w` by a BLAKE2b path outside the proof, its issuer
+reporting every window (C10).
+- **The zkPVM gains a Poseidon2 chip** (pin H, 7.15): one permutation a
+  row, about 300 columns at degree ≤ 3, like the recursion AIR's `p2`.
+  Kernels that call `0x402` then prove it, cheaper than BLAKE2b in-AIR.
 - **The host serves Poseidon2 natively.** A JAM-deployed agent pays it in
-  software, about 15,800 instructions a permutation, as it does
-  BLAKE2b.
+  software, about 15,800 instructions a permutation, as it does BLAKE2b.
 
 **2. The device profile** comes next [built: the shape, slice 7's 7.15;
 `vos_pvm_proof::device`]. The general zkVM runs on phones, for any
@@ -957,6 +1167,18 @@ binding the run like this:
   segment chip reads its running sum's previous row, so each takes the
   full `h` [built, 7.14].
 
+**What a device proof authorizes** [decided, S24]: exactly what an auth
+credential proof does. A device kernel is an `#[attestable]` method whose
+`public_args` are the SCALE encoding of auth's `CredentialPublic` (its
+kind byte, then `map_root`, `scope`, `nullifier` and `binding`, 32 bytes
+each) and whose output is empty. Ingress takes the words from the request,
+recomputes the io-hash, verifies the proof under format 43 against the
+device program id the agent's derivation pins for the kernel the guard
+names, and then runs auth's checks (`identity-and-authority.md` §5); the
+binding names that program. The trace is witness-independent: the prover
+pads every chip to the program id's log sizes and fails on a run past
+them, and the kernel walks its path with selects.
+
 Its levers:
 1. no boundary, −58% [measured proxy];
 2. lean kernels and narrow BLAKE2b chips, about −54% of the rest;
@@ -966,7 +1188,7 @@ Its levers:
 It projects to 0.36–0.9 s on Apple-class phones [projected].
 
 **3. Signature chips** come last, for flows that must prove a standard
-signature [decided, after PRF]:
+signature [decided, after the hash credentials]:
 - SHA-256 and SHA-512, in the narrow layout;
 - one generic modular bignum chip (q·m form, 8-bit limbs), with the
   moduli (p25519, p256, n256) preprocessed;
@@ -1029,7 +1251,7 @@ that narrows the inner proof makes folds cheaper too.
 | **6** | **M2 Masking** | R1–R8 on the final wrap, generic over components and channel for slice 7; format 39; 248-bit salts; leakage and soundness gates; the items carried from slice 5 | 8.5–13 weeks |
 | **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo spaces pallet's design, the verifier kit and the node's client (the pallet is the Kreivo teammate's); the JAM statements service | 18.5–29 weeks |
 | **7** | **M3.9 Simplify and scale** | the anchoring protocol simplified (pin D′: one venue core, five outcomes on the node, no migration, no rotation, equivocation terminal); a scale test across the owner's LAN | 11.5–18 weeks |
-| **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call and chip; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 42); its verifier at ingress; PRF passkeys, the device library and an Android demo; phone gates | 12.5–18 weeks |
+| **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call and chip; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 42); the node's binary API and its gateway; its verifier at ingress; device secrets from the Android Keystore or a security key, the device library and a demo in s4's Android client; phone gates | 15.5–22 weeks |
 | **7** | **M5 Device profile** | the segment chips masked; the boundary-free device shape (format 43); levers 1–4; the CPU split by opcode family, word-level memory if needed; the Poseidon2 chip and the levers in the node's segment format (41), as its leaves allow; the ≤ 1 s phone gate | 22–33.5 weeks, 26–39.5 with word-level memory |
 | **later** | **M6 Signature chips** | SHA-256, SHA-512, the bignum chip, the P-256 and Edwards drivers; moved past slice 7 by the owner (S1) | 8–14 weeks |
 
@@ -1043,10 +1265,10 @@ that narrows the inner proof makes folds cheaper too.
   and M3: slice 6 is 32–49 engineer-weeks (`slice-6-on-chain.md`,
   "Estimates").
 - The Clerk across spaces follows slice 6.
-- Slice 7 is about 52–77 engineer-weeks, up to 83 with word-level memory,
+- Slice 7 is about 55–81 engineer-weeks, up to 87 with word-level memory,
   with its acceptance and the slice-6 items it carries
   (`slice-7-mobile.md`, "Estimates"). Its 12–20 weeks for M4 and M5 here
-  before left out M3.9, the re-pins, the ingress verifier, the demo,
+  before left out M3.9, the re-pins, the node API, the ingress verifier, the demo,
   masking the segment chips and the CPU split.
 
 ## 12. Decisions
@@ -1056,10 +1278,14 @@ that narrows the inner proof makes folds cheaper too.
    on StarkWare's design, with Poseidon2 from day one.
 2. **Device proofs** are not folded in v1. They are verified at a space's
    ingress, and chain statements are node-proved.
-3. **Signatures:** both, PRF first. Passkey-derived secrets with hash
-   credentials come first, and P-256 and ed25519 chips after.
-4. **Mobile:** both, credential AIR first. It brings a Poseidon2 root kind
-   and a zkPVM Poseidon2 chip; the device profile follows.
+3. **Signatures:** both, device-held secrets first. Secrets derived from
+   a key the device never exports (the Android Keystore's HMAC, or a
+   security key's `hmac-secret`), with hash credentials, come first, and
+   P-256 and ed25519 chips after.
+4. **Mobile:** both, credential AIR first. It brings the `0x402` host call
+   and a zkPVM Poseidon2 chip; the device profile follows. The in-space
+   credential's tree lives in its actor's rows, so it needs no Poseidon2
+   root kind (§8); `RootKind` 1 stays reserved for the cross-space one.
 5. **The final channel:** Blake2b-256.
 6. **Arguments** go through a witness-input precompile.
 7. **The Kreivo pallet** comes after the recursion, with P0 and P1
@@ -1204,6 +1430,9 @@ counts as conjectured / proven at the reference shape [model]:
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted; the one production venues accept |
 | 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 
+- **30 and 37 are retired unregistered** when their masked successors
+  register: 42 (or 44) for credential proofs, 43 for device proofs, each
+  counted on its masked shape (§8).
 - **Each entry** holds its channel, its parameters, the DEEP batching its
   proven floor assumes and both bit counts.
 - **Every entry uses A.3's encodings** and exactly its parameters.

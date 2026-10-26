@@ -241,3 +241,114 @@ S35. **One machine besides the desktop.** The owner has one other machine,
 S36. **T5-partial.** With all three nodes on compumax, T5 kills one
   node's unit under load, and is recorded as T5-partial; the full host
   kill re-runs when more machines exist. (2026-10-26)
+
+S45. **The driver may be on Wi-Fi.** The desktop, the drivers' and the
+  coordinator's machine, reaches the LAN over Wi-Fi only; the owner
+  accepts it, its round trips measured and recorded with each run, and a
+  wired rerun if they show the radio in the latencies. `check` refuses a
+  node on Wi-Fi and only warns of a driver on it. Narrows S35.
+  (2026-10-26)
+
+S52. **compumax is wired.** The desktop's driver, still on Wi-Fi,
+  measured p50 3.6 ms and p99 6.9 ms to compumax [measured]; `vos-scale
+  check` warns of a driver on Wi-Fi and records its round trips to each
+  node machine. (2026-10-26)
+
+## On 7.7's design round, and the demo's home (2026-10-26)
+
+On the plan's questions 7.7-Q1 to Q6 (`slice-7-progress.md`, 7.7), and
+two decisions on the demo and the node's ingress. Each [decided].
+
+S37. **Revocation does not stop payment, and the privacy tiers** (Q1):
+  the ledger's own remedy now: `rekey(row, owner)` and `freeze(row)` under
+  an operator role, which is also a lost secret's recovery. Slice 7 also
+  gates that a proof of membership and payment together (auth's path and
+  nullifier beside owner's digest) fits the phone's time budget. The
+  primitives for fully private, cash-like payments (membership proven
+  privately, a hidden payer, a shielded pool) come later
+  (`identity-and-authority.md` §8); each space chooses its privacy tier.
+
+S38. **Path fetches** (Q2): the device library refreshes its path apart
+  from proofs, when `root()` moves and on a timer, never just before a
+  proof, in 7.12. `SECURITY.md` records the leak as reduced, not closed.
+
+S39. **A duplicate credentialed call** (Q3): answered `Replayed`, without
+  the first call's outcome, as pinned.
+
+S40. **The demo moves to s4** (`~/src/virto/s4`, the owner's semantic UI
+  over SSH, now Claude's to change as the demo needs). The screens (enroll,
+  sign in, pay) are server-owned s4 documents served by a separate gateway;
+  the proving is a client facility, `vos.credential` (server-initiated,
+  permission-gated), in s4's Rust client, which links the device library.
+  The credential surface accepts an ephemeral per-session SSH key, so the
+  transport stays anonymous and authority comes from the proof alone; the
+  payee and the amount are confirmed in the client's trusted chrome, not
+  in the server's document, before an owner proof. The node knows nothing
+  of SSH or s4. Replaces S5's "small Android demo app".
+
+S41. **The node keeps a binary API only:** `vos_wire` request and response
+  frames over a unix socket (a co-located gateway) and over QUIC with
+  mutual TLS (`node/net`'s stack) for remote gateways. The HTTP routes,
+  s4, the operator console, public TLS, pre-authentication rate limits and
+  leader-aware load balancing across a space's nodes move to the gateway.
+  The gateway is untrusted for authority: the node verifies every
+  signature and proof and runs every ingress check. A new step before 7.11
+  builds the API, so the credentialed call is born there; the node's HTTP
+  is deleted once the gateway carries every route.
+
+S42. **The device secret's sources** (Q4): by default an **Android
+  Keystore HMAC key** (non-exportable, bound to a biometric or the PIN at
+  each use, StrongBox when present; its output a `byte[]`, zeroed);
+  optionally a **security key's `hmac-secret`**, by CTAP2 directly through
+  YubiKit. **No Credential Manager and no passkeys in this slice,** so
+  7.0b's relying party and `assetlinks.json` are dropped; no dependency on
+  Play services or the Play Store (the owner's devices have neither). A
+  source that spans devices is later work. Reverses S6; narrows S5.
+
+S43. **A `once` guard in the SDK, in this slice** (Q5): a method's guard
+  option that records each admitted nullifier in system rows and refuses a
+  repeat in its scope (space, agent, instance, name), so no handler keeps
+  its own set. Reverses 7.7's pin ("the handler's rule").
+
+S44. **7.11's rate gate** (Q6): the executors' bound, at least 100
+  credentialed verifications a second a verifying thread, scaling
+  linearly to N threads, the threads recorded; no absolute claim of 1,000
+  a second.
+
+On Fable's review of 7.7 (`7.7-fable.md`, "fix-then-merge"), its
+questions Q1 to Q6. Each [decided].
+
+S46. **Operator requests over the node API** (Q1): signed by an operator
+  key the node's config lists, with a nonce and an expiry as a call's;
+  the gateway and s4's operator console only relay, and the console's
+  operator signs in its own client. Until signed operator requests are
+  built, the node accepts operator kinds on its local unix socket only.
+  Closes the plan's open question 3.
+
+S47. **The `once` row when the handler fails** (Q2): written only when the
+  handler returns `Ok`, in the same apply; a failed or refused call
+  leaves the member free to try again with a new proof. The binding
+  digest is recorded whatever the handler does, so a replay is still
+  refused `Replayed`. 7.11 tests it.
+
+S48. **What the member confirms before a credential proof** (Q3): the
+  `vos.credential` facility shows its own trusted-chrome form for the
+  payee and the amount; the server's request only pre-fills it, and the
+  user may edit both; the facility encodes the transfer from what the
+  user confirmed. For `sign_in` the chrome names the method and, for a
+  `once` guard, that the call spends the member's one admission in its
+  scope. A facility's grant (per session) and a call's confirmation (per
+  call) are two prompts.
+
+S49. **The demo client's channel for `path`, `root()` and `Time`** (Q4):
+  a second SSH connection to the gateway under a fresh ephemeral key,
+  opening a `vos-api` subsystem that relays the node API's read-only
+  kinds only (queries and `Time`). Defined in 7.10b (the gateway) and
+  7.13 (the client).
+
+S50. **7.10b's start** (Q5): now, beside 7.9 and 7.10, its dependency 7.7
+  alone. The node's HTTP is deleted only after 7.6's final scale run, or
+  T1 is re-measured over the node API.
+
+S51. **The source input's domain tag** (Q6): `"vos/device/input/v1"`,
+  replacing `"vos/prf/v1"` everywhere.
