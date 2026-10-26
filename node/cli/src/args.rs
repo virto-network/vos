@@ -44,16 +44,16 @@ pub enum Command {
         #[command(subcommand)]
         command: SpaceCommand,
     },
-    /// Agents, with the node's admin token.
+    /// Agents, with the node's operator key.
     Agent {
         #[command(subcommand)]
         command: AgentCommand,
     },
     /// Install a package, an actor's ELF, as an instance of an agent, with
-    /// the admin token: prints the programs the node derived from it.
+    /// the operator key: prints the programs the node derived from it.
     Install(InstallArgs),
-    /// Grant a client key a role in an agent, or revoke it, with the admin
-    /// token.
+    /// Grant a client key a role in an agent, or revoke it, with the
+    /// operator key.
     Role(RoleArgs),
     /// Call a command, signed with a client key.
     Call(CallArgs),
@@ -102,7 +102,7 @@ pub enum NodeCommand {
 
 #[derive(clap::Args)]
 pub struct RunArgs {
-    /// The node's data directory: its store and admin token.
+    /// The node's data directory: its store, its keys and its API's socket.
     #[arg(long)]
     pub data: PathBuf,
     #[arg(long, default_value = "127.0.0.1:7700")]
@@ -156,7 +156,7 @@ pub enum SpaceCommand {
         #[arg(long)]
         origin_ms: Option<u64>,
     },
-    /// Create the space's representative, with the admin token of the
+    /// Create the space's representative, with the operator key of the
     /// space's first founding node, which creates it once: its id is
     /// printed. Then install the representative's package as its instance.
     Representative {
@@ -287,9 +287,15 @@ impl TlsArgs {
 #[derive(clap::Args)]
 pub struct NodeArgs {
     /// The node's address: `http://` reaches a loopback address only,
-    /// `https://` needs `--node-key` or `--ca`.
+    /// `https://` needs `--node-key` or `--ca`; `unix:PATH` reaches its
+    /// API's socket, `quic://HOST:PORT` its API over QUIC, which needs
+    /// `--node-key` and `--api-key`.
     #[arg(long, default_value = "http://127.0.0.1:7700")]
     node: String,
+    /// The seed file of the key this client presents over QUIC, which the
+    /// node lists in its `gateways`.
+    #[arg(long, env = "VOS_API_KEY")]
+    api_key: Option<PathBuf>,
     /// The node's key, in hex, which its TLS must show: as `vos node run`
     /// printed it. It wins over `--ca`.
     #[arg(long, env = "VOS_NODE_KEY")]
@@ -307,6 +313,19 @@ impl NodeArgs {
     /// The target, pinned by the key in `kept` when neither a key nor a CA
     /// is given for an `https://` node.
     pub fn target_or(&self, kept: Option<&Path>) -> Result<Target, String> {
+        if self.node.starts_with("quic://") {
+            let node = match (&self.node_key, kept) {
+                (Some(key), _) => key_bytes(key)?,
+                (None, Some(kept)) => key_bytes(&std::fs::read_to_string(kept).map_err(at(kept))?)?,
+                (None, None) => return Err("a quic:// node needs --node-key".into()),
+            };
+            let seed = self
+                .api_key
+                .as_ref()
+                .ok_or("a quic:// node needs --api-key")?;
+            let client = key_bytes(&std::fs::read_to_string(seed).map_err(at(seed))?)?;
+            return Target::quic(&self.node, node, client).map_err(failed);
+        }
         let kept = kept.filter(|_| self.node.starts_with("https://"));
         let trust = match (&self.node_key, &self.ca, kept) {
             (Some(key), _, _) => Trust::NodeKey(key_bytes(key)?),
@@ -325,8 +344,9 @@ impl NodeArgs {
 pub struct OperatorArgs {
     #[command(flatten)]
     pub node: NodeArgs,
-    /// The node's data directory, which holds its admin token: operator
-    /// commands run on the node's host.
+    /// The node's data directory, which holds its operator key and its
+    /// node key: operator commands run on the node's host, signed for that
+    /// node.
     #[arg(long)]
     pub data: PathBuf,
 }

@@ -1,12 +1,14 @@
 //! A blocking client of a node's ingress: a client key's sessions, signed
 //! calls and queries, its workflows' results, and the operator's commands.
 
+mod api;
 mod call;
 mod http;
 mod operator;
 mod read;
 mod signed;
 mod target;
+mod transport;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Mutex, MutexGuard};
@@ -19,7 +21,6 @@ use vos_wire::ingress::{AgentInfo, Contact, NodeId, Response};
 
 use crate::lock;
 use crate::tls::Trust;
-use http::Http;
 pub use operator::Operator;
 pub use read::schema;
 pub use signed::{
@@ -27,6 +28,7 @@ pub use signed::{
 };
 pub use target::Target;
 use target::authority;
+use transport::Transport;
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -70,7 +72,7 @@ fn decode_answer(status: u16, body: &[u8]) -> Result<Response, ClientError> {
 /// POST `body` to `path`: the status and body answered. For requests this
 /// client does not otherwise make, as a test of the ingress does.
 pub fn post(target: &Target, path: &str, body: &[u8]) -> Result<(u16, Vec<u8>), ClientError> {
-    Http::new(target).post_once(path, None, body)
+    Transport::new(target).post_once(path, None, body)
 }
 
 /// POST `body` to `path` on a connection of its own: the answer. Each
@@ -84,29 +86,29 @@ pub fn post_within(
     body: &[u8],
     within: Duration,
 ) -> Result<Response, ClientError> {
-    let (status, body) = Http::within(target, within).post_once(path, None, body)?;
+    let (status, body) = Transport::within(target, within).post_once(path, None, body)?;
     decode_answer(status, &body)
 }
 
 /// The node's identity, its key, which its TLS presents. A pinned node
 /// must name itself by the key it was pinned by.
 pub fn node_id(target: &Target) -> Result<NodeId, ClientError> {
-    Http::new(target).node_id()
+    Transport::new(target).node_id()
 }
 
 /// Agent `agent`'s creation record and replicas, as the node knows them:
 /// `None` when it knows no such agent.
 pub fn agent_info(target: &Target, agent: AgentId) -> Result<Option<AgentInfo>, ClientError> {
-    Http::new(target).agent_info(agent)
+    Transport::new(target).agent_info(agent)
 }
 
-impl Http {
+impl Transport {
     fn node_id(&self) -> Result<NodeId, ClientError> {
         let (status, body) = self.get("/", None)?;
         let id = NodeId::decode(&body)
             .map(|(id, _)| id)
             .map_err(|_| ClientError::Undecodable(status))?;
-        match self.target.trust {
+        match self.target().trust {
             Trust::NodeKey(key) if key != id.0 => Err(ClientError::NotTheNode),
             _ => Ok(id),
         }
@@ -143,9 +145,12 @@ pub struct Kept {
 /// with [`Client::repeats_unknown`]; once the agent has collected the
 /// session, such a call ends [`ClientError::Lost`].
 pub struct Client {
-    http: Http,
+    transport: Transport,
     key: SigningKey,
     state: Mutex<State>,
+    /// Over the node API, each node's target by its key: where a redirect
+    /// or a failover goes.
+    routes: HashMap<[u8; 32], Target>,
 }
 
 /// What a client keeps of the agents it calls.
@@ -195,10 +200,18 @@ impl Client {
             ..State::default()
         };
         Self {
-            http: Http::new(target),
+            transport: Transport::new(target),
             key,
             state: Mutex::new(state),
+            routes: HashMap::new(),
         }
+    }
+
+    /// Over the node API, the target of each node by its key, where a
+    /// redirect or a failover goes: a contact names an HTTP address.
+    pub fn with_routes(mut self, routes: HashMap<[u8; 32], Target>) -> Self {
+        self.routes = routes;
+        self
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -227,7 +240,7 @@ impl Client {
     /// The node this client calls: the one it was given, or the last a
     /// redirect named.
     pub fn target(&self) -> &Target {
-        &self.http.target
+        self.transport.target()
     }
 
     pub fn principal(&self) -> Principal {
@@ -277,7 +290,10 @@ impl Client {
     /// Fetch `agent`'s record and replicas from the node. An identity kept
     /// from before stands: a node that names another is refused.
     fn learn(&self, agent: AgentId) -> Result<[u8; 32], ClientError> {
-        let info = self.http.agent_info(agent)?.ok_or(ClientError::NoAgent)?;
+        let info = self
+            .transport
+            .agent_info(agent)?
+            .ok_or(ClientError::NoAgent)?;
         let identity = crate::identity(&info.record);
         let mut state = self.state();
         if *state.identities.entry(agent).or_insert(identity) != identity {
@@ -306,11 +322,19 @@ impl Client {
             .get(&agent)
             .cloned()
             .unwrap_or_default();
-        let current = Some(self.http.target.authority.clone());
-        match replicas
+        let target = self.transport.target();
+        // Over the node API, the node this client calls is the one its
+        // routes give the target, by key.
+        let called = self
+            .routes
             .iter()
-            .position(|replica| authority(&replica.address) == current)
-        {
+            .find(|(_, route)| route.authority == target.authority)
+            .map(|(key, _)| *key);
+        let current = |replica: &Contact| match &target.api {
+            Some(_) => called == Some(replica.node.0),
+            None => authority(&replica.address).as_deref() == Some(target.authority()),
+        };
+        match replicas.iter().position(current) {
             Some(at) => [&replicas[at + 1..], &replicas[..at]].concat(),
             None => replicas,
         }
@@ -323,10 +347,22 @@ impl Client {
         self.state().offset = offset.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
     }
 
-    /// The node `contact` names, trusted as this client trusts nodes.
+    /// The node `contact` names, trusted as this client trusts nodes; over
+    /// the node API, the target this client's routes give its key.
     fn target_for(&self, contact: &Contact) -> Result<Target, ClientError> {
-        let trust = match &self.http.target.trust {
+        let target = self.transport.target();
+        if target.api.is_some() {
+            return self.routes.get(&contact.node.0).cloned().ok_or_else(|| {
+                ClientError::Http(format!(
+                    "no API address for node {}",
+                    hex::encode(contact.node.0)
+                ))
+            });
+        }
+        let trust = match &target.trust {
             Trust::Ca(roots) => Trust::Ca(roots.clone()),
+            // A gateway routes again: its pin holds wherever it sends.
+            Trust::Gateway(key) => Trust::Gateway(*key),
             Trust::NodeKey(_) | Trust::Loopback if contact.address.starts_with("https://") => {
                 Trust::NodeKey(contact.node.0)
             }

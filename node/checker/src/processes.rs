@@ -190,6 +190,8 @@ pub fn target(url: &str, key: &str, tls: bool) -> Target {
 pub struct Options {
     /// TLS on the ingress, clients pinning the nodes' keys.
     pub tls: bool,
+    /// Clients reach the nodes over the node API's sockets, not HTTP.
+    pub api: bool,
     /// Lines of each faults file a node reads once, at start: the groups'
     /// timing and compaction, QUIC's idle timeout.
     pub settings: String,
@@ -209,9 +211,9 @@ struct Slot {
     jump: AtomicI64,
     /// The generation its faults file holds.
     written: AtomicU64,
-    /// Its operator, with the token of the run it was made for: kept, so
-    /// that what polls the node goes on one connection.
-    operator: Mutex<Option<(String, Arc<Operator>)>>,
+    /// Its operator, with the start it was made for: kept, so that what
+    /// polls the node goes on one connection.
+    operator: Mutex<Option<(u64, Arc<Operator>)>>,
     /// Its ports, held from its kill to its restart.
     held: Mutex<Vec<HeldPort>>,
 }
@@ -273,19 +275,42 @@ impl Processes {
         &self.targets[number - 1]
     }
 
-    /// Node `number`'s operator, by the token its run wrote: the same
-    /// one, and its kept connections, until the node starts again.
+    /// Node `number`'s operator, signing with the operator key its data
+    /// directory holds: the same one, and its kept connections, until the
+    /// node starts again.
     pub(crate) fn operator(&self, number: usize) -> Arc<Operator> {
-        let token = std::fs::read_to_string(self.data(number).join(vos_node::ADMIN_TOKEN)).unwrap();
+        let starts = self.slot(number).starts.load(Ordering::SeqCst);
         let mut kept = self.slot(number).operator.lock().unwrap();
-        match &*kept {
-            Some((made_for, operator)) if *made_for == token => Arc::clone(operator),
-            _ => {
-                let operator = Arc::new(Operator::within(self.target(number), &token, OPERATOR));
-                *kept = Some((token, Arc::clone(&operator)));
-                operator
-            }
+        if let Some((made_for, operator)) = &*kept
+            && *made_for == starts
+        {
+            return Arc::clone(operator);
         }
+        let seed = std::fs::read_to_string(self.data(number).join(vos_node::OPERATOR_KEY)).unwrap();
+        let mut secret = [0u8; 32];
+        hex::decode_to_slice(seed.trim(), &mut secret).unwrap();
+        let mut node = [0u8; 32];
+        hex::decode_to_slice(&self.keys[number - 1], &mut node).unwrap();
+        let operator = Arc::new(Operator::signing_within(
+            self.target(number),
+            ed25519_dalek::SigningKey::from_bytes(&secret),
+            vos_wire::ingress::NodeId(node),
+            OPERATOR,
+        ));
+        *kept = Some((starts, Arc::clone(&operator)));
+        operator
+    }
+
+    /// Each node's target by its key, for a client over the node API to
+    /// follow a redirect.
+    pub fn routes(&self) -> std::collections::HashMap<[u8; 32], Target> {
+        (1..=self.count)
+            .map(|number| {
+                let mut key = [0u8; 32];
+                hex::decode_to_slice(&self.keys[number - 1], &mut key).unwrap();
+                (key, self.target(number).clone())
+            })
+            .collect()
     }
 
     pub fn is_running(&self, number: usize) -> bool {
@@ -330,7 +355,12 @@ impl Processes {
             let nodes = (0..count).map(|at| (&*keys[at], relay.listed(at + 1), &*urls[at]));
             std::fs::write(dir.path().join("space"), space_file(nodes)).unwrap();
             let targets = (0..count)
-                .map(|at| target(&urls[at], &keys[at], options.tls))
+                .map(|at| match options.api {
+                    true => {
+                        Target::socket(dir.path().join(format!("node-{}", at + 1)).join("api.sock"))
+                    }
+                    false => target(&urls[at], &keys[at], options.tls),
+                })
                 .collect();
             let processes = Processes {
                 vos: vos.to_path_buf(),

@@ -21,6 +21,9 @@ pub enum Trust {
     Loopback,
     /// TLS from the node with this key.
     NodeKey([u8; 32]),
+    /// TLS from a gateway with this key, in front of nodes it routes to:
+    /// kept across redirects, and the node key it answers not compared.
+    Gateway([u8; 32]),
     /// TLS with a certificate for the host, from one of these CAs.
     Ca(Vec<CertificateDer<'static>>),
 }
@@ -41,7 +44,7 @@ pub(crate) fn client_config(trust: &Trust) -> Result<Arc<rustls::ClientConfig>, 
         .map_err(|error| error.to_string())?;
     let mut config = match trust {
         Trust::Loopback => return Err("plain HTTP has no TLS".into()),
-        Trust::NodeKey(key) => builder
+        Trust::NodeKey(key) | Trust::Gateway(key) => builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinnedKey {
                 key: *key,

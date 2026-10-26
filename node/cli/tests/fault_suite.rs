@@ -542,20 +542,22 @@ fn five_processes_apply_once_through_faults() {
         .ok()
         .and_then(|seed| seed.parse().ok())
         .unwrap_or(0x5eed_0003_u64);
-    let (tls, mode) = (
+    let (tls, mode, api) = (
         !seed.is_multiple_of(2),
         if (seed >> 1).is_multiple_of(2) {
             Mode::OneAtATime
         } else {
             Mode::Pipelined
         },
+        !(seed >> 2).is_multiple_of(2),
     );
-    println!("seed {seed}: tls {tls}, {mode:?}");
+    println!("seed {seed}: tls {tls}, {mode:?}, api {api}");
     let space = Processes::start(
         env!("CARGO_BIN_EXE_vos"),
         NODES,
         Options {
             tls,
+            api,
             settings: SETTINGS.to_string(),
         },
     );

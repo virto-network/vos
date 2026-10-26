@@ -1,8 +1,9 @@
-//! The operator's commands, with a node's admin token: agents, installs
-//! and roles.
+//! The operator's commands, signed by the operator key in a node's data
+//! directory for that node: agents, installs and roles.
 
+use ed25519_dalek::SigningKey;
 use vos_node::client::Operator;
-use vos_node::{ADMIN_TOKEN, NODE_KEY};
+use vos_node::{NODE_KEY, OPERATOR_KEY};
 use vos_wire::Decode;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{Install, Response};
@@ -143,9 +144,14 @@ impl RoleArgs {
 }
 
 pub(crate) fn operator_of(args: &OperatorArgs) -> Result<Operator, String> {
-    let path = args.data.join(ADMIN_TOKEN);
-    let token = std::fs::read_to_string(&path).map_err(at(&path))?;
+    let read = |name: &str| {
+        let path = args.data.join(name);
+        let text = std::fs::read_to_string(&path).map_err(at(&path))?;
+        crate::key_bytes(&text)
+    };
+    let key = SigningKey::from_bytes(&read(OPERATOR_KEY)?);
+    let node = vos_wire::ingress::NodeId(read(NODE_KEY)?);
     // On the node's host, its data directory holds its key.
     let target = args.node.target_or(Some(&args.data.join(NODE_KEY)))?;
-    Ok(Operator::new(&target, &token))
+    Ok(Operator::signing(&target, key, node))
 }

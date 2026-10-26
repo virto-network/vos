@@ -14,7 +14,7 @@ use vos_http::{MAX_HEAD, content_length};
 const REUSE: Duration = Duration::from_secs(20);
 const CONNECT: Duration = Duration::from_secs(10);
 /// A request's answer may take this long: an install prepares a program.
-const ANSWER: Duration = Duration::from_secs(300);
+pub(super) const ANSWER: Duration = Duration::from_secs(300);
 /// The largest answer taken: a schema, a reply, a refusal.
 const MAX_ANSWER: usize = 16 << 20;
 /// The largest request body sent in one write with its head.
@@ -44,10 +44,6 @@ pub(super) struct Http {
 }
 
 impl Http {
-    pub(super) fn new(target: &Target) -> Self {
-        Self::within(target, ANSWER)
-    }
-
     /// One whose requests are answered within `answer`, connecting within
     /// it too.
     pub(super) fn within(target: &Target, answer: Duration) -> Self {
@@ -130,23 +126,23 @@ impl Http {
         })
     }
 
-    /// Send a request and read its answer. `repeatable` says the node
+    /// Send a request, with an `Authorization` header's value if any, and
+    /// read its answer. `repeatable` says the node
     /// takes it twice as once (a read, or a signed call or query, which
     /// the node deduplicates): such a request that fails on a kept
     /// connection before any answer arrives is sent once more on a new
     /// one. The node likely restarted, so no kept connection is used.
-    fn request(
+    pub(super) fn request(
         &self,
         method: &str,
         path: &str,
-        token: Option<&str>,
+        authorization: Option<&str>,
         body: &[u8],
         repeatable: bool,
     ) -> Result<(u16, Vec<u8>), ClientError> {
         let failed = |error: std::io::Error| ClientError::Http(error.to_string());
-        let authorization = token.map_or(String::new(), |token| {
-            format!("Authorization: Bearer {token}\r\n")
-        });
+        let authorization =
+            authorization.map_or(String::new(), |value| format!("Authorization: {value}\r\n"));
         let head = format!(
             "{method} {path} HTTP/1.1\r\nHost: {}\r\nContent-Length: {}\r\n{authorization}\r\n",
             self.target.authority,
@@ -167,34 +163,6 @@ impl Http {
             self.keep(connection);
         }
         Ok((status, body))
-    }
-
-    /// A read, by the operator when `token` is theirs.
-    pub(super) fn get(
-        &self,
-        path: &str,
-        token: Option<&str>,
-    ) -> Result<(u16, Vec<u8>), ClientError> {
-        self.request("GET", path, token, &[], true)
-    }
-
-    /// A request the node may not take twice as once: never sent again.
-    pub(super) fn post_once(
-        &self,
-        path: &str,
-        token: Option<&str>,
-        body: &[u8],
-    ) -> Result<(u16, Vec<u8>), ClientError> {
-        self.request("POST", path, token, body, false)
-    }
-
-    /// A request the node takes twice as once: a signed call or read.
-    pub(super) fn post_repeatable(
-        &self,
-        path: &str,
-        body: &[u8],
-    ) -> Result<(u16, Vec<u8>), ClientError> {
-        self.request("POST", path, None, body, true)
     }
 }
 

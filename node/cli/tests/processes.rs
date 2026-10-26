@@ -29,11 +29,21 @@ fn start() -> Processes {
     Processes::start(env!("CARGO_BIN_EXE_vos"), 3, Options::default())
 }
 
+/// Its clients and operator over the node API's sockets, redirects
+/// followed by the nodes' keys.
 #[test]
 fn a_leader_cut_off_by_the_relay_is_replaced_and_catches_up() {
-    let space = start();
+    let space = Processes::start(
+        env!("CARGO_BIN_EXE_vos"),
+        3,
+        Options {
+            api: true,
+            ..Options::default()
+        },
+    );
     let agent = space.counter_agent(COUNTER);
-    let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[31; 32]));
+    let mut client =
+        Client::new(space.target(1), SigningKey::from_bytes(&[31; 32])).with_routes(space.routes());
     let add = served_method(&mut client, agent, COUNTER, "increment");
     let mut total = 0;
     for by in 1..=5 {

@@ -1,4 +1,4 @@
-//! `vos`: run a node, operate it with its admin token, and call its agents
+//! `vos`: run a node, operate it with its operator key, and call its agents
 //! with a client key.
 
 mod args;

@@ -13,6 +13,7 @@ mod operator_api;
 mod quic;
 mod requests;
 mod sessions;
+mod transports;
 mod workflows;
 
 use std::io::{Read, Write};
