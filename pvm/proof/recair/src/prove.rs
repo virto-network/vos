@@ -99,6 +99,8 @@ pub enum ProveError {
     Entropy,
     /// The segment's run cannot be traced over its chips.
     Segment(String),
+    /// The witness does not satisfy the circuit: the piece that refuses it.
+    Witness(&'static str),
 }
 
 impl core::fmt::Display for ProveError {
@@ -113,6 +115,7 @@ impl core::fmt::Display for ProveError {
             Self::Masking(what) => write!(f, "the masking: {what}"),
             Self::Entropy => f.write_str("no randomness from the operating system"),
             Self::Segment(error) => write!(f, "the segment: {error}"),
+            Self::Witness(piece) => write!(f, "the witness does not satisfy {piece}"),
         }
     }
 }

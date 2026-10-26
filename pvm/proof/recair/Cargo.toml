@@ -8,8 +8,9 @@ description = "The recursion AIR's prover: circuits built by a Context, their wi
 [dependencies]
 vos-pvm-recair-air = { workspace = true }
 # The wrap's proof, its public words and its layout, which the prover
-# produces and the final verifier reads; format 39's fixed layout.
-vos-pvm-final-verifier = { workspace = true }
+# produces and the final verifier reads; format 39's fixed layout; a
+# credential proof's bytes.
+vos-pvm-final-verifier = { workspace = true, features = ["credential-bytes"] }
 # Format 28's bytes, and a watched tree's proofs' encoding.
 postcard = { version = "1", features = ["alloc"], optional = true }
 vos-pvm-poseidon2 = { workspace = true }

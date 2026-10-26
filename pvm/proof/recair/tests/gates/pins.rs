@@ -3,8 +3,9 @@
 //! (`vos_pvm_recair_air::circuit_hash`, however it is named at the call)
 //! are computed nowhere in the workspace's sources but `recair`'s
 //! `prove.rs` (the fold's in-AIR child hash aside), whose
-//! `preprocessed_root_on` runs `Circuit::check_wiring` first, and the
-//! gates' forger. A second yield, which the relation alone balances
+//! `preprocessed_root_on` runs `Circuit::check_wiring` first, the
+//! credential prover's, which runs `Circuit::check_wiring_without_h8`
+//! first, and the gates' forger. A second yield, which the relation alone balances
 //! (`multiplicities`), is refused because of it.
 
 use std::path::Path;
@@ -36,8 +37,13 @@ fn only_checked_wirings_are_committed() {
         "pvm/proof/recair/src/fold/child.rs",
         "pvm/proof/recair/src/fold/mod.rs",
         "pvm/proof/recair/tests/gates/forge.rs",
-        // The generic masked prover's `p2`-only set, its wiring checked.
+        // The one-component set the masked prover refuses, its wiring checked.
         "pvm/proof/recair/tests/circuit/masked_prover.rs",
+        // The credential circuits: their columns read after
+        // `Circuit::check_wiring_without_h8`, and the program id the circuit
+        // hash of a root so committed.
+        "pvm/proof/recair/src/credential/mod.rs",
+        "pvm/proof/recair-air/src/credential.rs",
         // The masking's soundness gates: a circuit turned so that a chained
         // row is row 0, which the wiring check refuses, to test the wrap row.
         "pvm/proof/recair/tests/circuit/masked_gates.rs",
