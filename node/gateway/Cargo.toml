@@ -30,7 +30,7 @@ vos-api = { workspace = true, features = ["client", "quic"] }
 vos-http = { workspace = true }
 vos-net = { workspace = true }
 vos-wire = { workspace = true }
-s4-server = { path = "../../../../../s4-vos/server", optional = true }
+s4-server = { git = "https://codeberg.org/Virto/s4", rev = "cee80d95ef6644081c1155c50a3042a95b37b367", optional = true }
 russh = { version = "0.61", default-features = false, features = ["ring", "flate2"], optional = true }
 
 [dev-dependencies]
