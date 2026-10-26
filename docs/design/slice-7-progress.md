@@ -1848,6 +1848,42 @@ and the default agent's (L3).
   failed once in the whole cluster suite at load 16 (every group's term
   moved by one), and passed three times alone.
 
+### 7.3: a recorded statement's witness kept
+
+`prover::a_leader_change_submits_a_recorded_statement_once` failed about
+3 runs in 5. Apply stripped a record's witness once its `Proven` applied
+(M3, L2 above), so a follower's worker that read the record only after
+that (its scan runs each second; the leader's model proof takes less)
+held a job it could not prove; the new leader, the old one's proof gone
+with it, refused the statement `REFUSED_UNWITNESSED` and never submitted
+it. The record now keeps its witness until its window's roots age past
+`MaxRootAge`, so any replica, a snapshot-installed one too, proves again a
+statement whose proof was lost.
+
+- **Tests:** cluster:
+  `a_record_read_after_its_proof_is_recorded_is_proved_again` (the
+  followers' workers held back until `Proven` applies; it fails 3 of 3
+  without the fix); the leader-change test asserts the record kept whole.
+  Worker: the mock keeps the witness, and a leader that never fetches the
+  proofs proves all three again, each accepted once.
+- **Carried:** a failover proves again every statement whose proof the old
+  leader alone held, accepted ones too, since no replica learns of an
+  acceptance; and the witnesses stay up to `MaxRootAge` (`SECURITY.md`'s
+  table updated). A replicated acceptance (an input the leader proposes,
+  which also drops the witness), or a venue query before proving a lost
+  one again, would bound both. `Input::Proven`'s `attested` is no longer
+  read by apply.
+- **Gates** [measured]: the leader-change test 10 of 10 (twice: after
+  the fix, and after the review's folds), the regression test 5 of 5 (3 of
+  3 failing without the fix); `vos-node-prover`'s tests and the cluster
+  suite (116) green; `just check` green on its second run (the first lost
+  `snapshots::a_snapshot_stream_outlasting_the_leaders_deadline_goes_on`
+  once at load ~20, a counter agent's snapshot stream, then 5 of 5 alone).
+  Found, not fixed: one whole-suite run hung in
+  `replication::an_agent_belongs_to_its_nodes_space` (its node threads
+  gone, the test thread parked on a futex) at load 22; it passed 8 of 8
+  alone and in the two suite runs since.
+
 ## Step 7.15: the device shape and its Poseidon2 chip
 
 Branch `s7/7.15`, from vos-core `4e7b4982` (7.14 merged).

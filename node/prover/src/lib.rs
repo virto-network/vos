@@ -7,9 +7,10 @@
 //! work result makes, with its witness, and drops it once its roots age,
 //! and a snapshot carries them. So every replica running a prover holds a
 //! job of each, a new leader too, one that installed a snapshot among
-//! them, and a failover proves again at most the statements in flight or
-//! proved by the old leader alone, whose proofs went with it. A proof a replica ends once no longer
-//! leading goes to the agent's leader to record.
+//! them. A failover proves again the statement in flight and each whose
+//! proof the old leader alone held, those the venue accepted among them:
+//! no replica learns of an acceptance. A proof a replica ends once no
+//! longer leading goes to the agent's leader to record.
 //!
 //! **Its table** is node-local ([`Jobs`]): each statement's job by id,
 //! `queued | proving | proved(proof) | submitted | accepted |

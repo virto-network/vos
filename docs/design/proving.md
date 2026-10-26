@@ -801,9 +801,10 @@ last for decades.**
   (`keys::attested`) with its witness until its window's roots age, so a
   replica that installs a snapshot and then leads holds every statement
   still to prove, and proves again one whose proof went with the old
-  leader. The prover is built into the
-  node and stays there [decided]; the extension host that will carry the
-  venues' transports is deferred. The worker proves statements at an
+  leader (an accepted one too: no replica learns of an acceptance; the
+  witnesses kept are up to `MaxRootAge` of the agent's reads). The prover
+  is built into the node and stays there [decided]; the extension host
+  that will carry the venues' transports is deferred. The worker proves statements at an
   anchored cut alone (an attest with a window), the only statements a
   venue judges.
 

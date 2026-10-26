@@ -539,8 +539,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
     /// Prove `job`: taken as proved when its agent records it proved by
     /// another replica; dead when its anchor would age past `MaxRootAge`
     /// before its proof ends; refused once [`MAX_ATTEMPTS`] proofs of it
-    /// began, or when its record kept no witness (recorded proved, its proof
-    /// never fetched); else proved, its proof kept, held and recorded, or
+    /// began, or when its record holds no witness; else proved, its proof kept, held and recorded, or
     /// refused. False when its kernel's blob is not here, or the prover
     /// failed: it waits, queued.
     fn prove(&mut self, id: StatementId, job: Job) -> Result<bool, String> {
@@ -576,10 +575,7 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             return Ok(true);
         }
         if attest.witness_input.is_empty() {
-            tracing::error!(
-                agent,
-                "a statement recorded proved whose proof never arrived, its record without its witness: refused"
-            );
+            tracing::error!(agent, "a statement's record holds no witness: refused");
             self.jobs
                 .put(&id, &job.to(State::Refused(REFUSED_UNWITNESSED)))?;
             return Ok(true);

@@ -125,11 +125,11 @@ impl Inner {
 
 /// The writes beside `result`'s, applied to `agent` as `snapshot` holds it,
 /// that keep the records of its attests at a window's cut
-/// (`keys::attested`): each it made, kept with its witness, since a proof
-/// held by the replica that made it alone may be lost and the statement
-/// then proved again by another; and, when its time crosses one of the
-/// agent's window boundaries, those of windows whose roots have aged past
-/// `MaxRootAge` by it, dropped. The same writes on every replica.
+/// (`keys::attested`): each it made, kept with its witness, so another
+/// replica proves it again should its proof be lost; and, when its time
+/// crosses one of the agent's window boundaries, those of windows whose
+/// roots have aged past `MaxRootAge` by it, dropped. The same writes on
+/// every replica.
 pub(crate) fn attested(
     snapshot: &Snapshot,
     agent: AgentId,

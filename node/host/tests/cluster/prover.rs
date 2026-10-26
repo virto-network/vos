@@ -79,6 +79,27 @@ impl Prover for NodeProofs {
     }
 }
 
+/// [`Proofs`] on node `node`, whose worker reads no record while
+/// `waiting` names the node: no kernel's program id is computed then.
+struct Waiting {
+    proofs: Arc<Proofs>,
+    node: NodeNumber,
+    waiting: Arc<Mutex<BTreeSet<NodeNumber>>>,
+}
+
+impl Prover for Waiting {
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError> {
+        if self.waiting.lock().unwrap().contains(&self.node) {
+            return Err(ProveError::Failed("this node's worker waits"));
+        }
+        self.proofs.program(kernel)
+    }
+
+    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+        self.proofs.prove(kernel, attest)
+    }
+}
+
 /// Releases a held prover when dropped: a test that fails while it holds
 /// one stops its nodes all the same.
 struct Released(Arc<Proofs>);
@@ -94,28 +115,22 @@ impl Drop for Released {
 /// group's log compacted every 8 entries to a tail of 2, so a record the
 /// prover's scan has not read would go at once but for its mark.
 fn cluster(judging: &Arc<Judging>, proofs: &Arc<Proofs>) -> Cluster {
-    let provers = Arc::new(Mutex::new(BTreeSet::from([1, 2, 3])));
-    cluster_proving_on(judging, proofs, &provers)
+    let prover: Arc<dyn Prover> = proofs.clone();
+    cluster_with(judging, move |_| Arc::clone(&prover))
 }
 
-/// [`cluster`], a node running a prover only when `provers` names it as it
-/// starts.
-fn cluster_proving_on(
+/// [`cluster`], node `n` proving with `prover(n)`.
+fn cluster_with(
     judging: &Arc<Judging>,
-    proofs: &Arc<Proofs>,
-    provers: &Arc<Mutex<BTreeSet<NodeNumber>>>,
+    prover: impl Fn(NodeNumber) -> Arc<dyn Prover> + Send + Sync + 'static,
 ) -> Cluster {
     let venue: Arc<dyn VenueClient> = judging.clone();
-    let prover: Arc<dyn Prover> = proofs.clone();
-    let provers = Arc::clone(provers);
     Cluster::in_space(
         3,
         Some(clock()),
         move |node: NodeNumber, config: &mut Config| {
             config.venue = Some(Arc::clone(&venue));
-            if provers.lock().unwrap().contains(&node) {
-                config.prover = Some(Arc::clone(&prover));
-            }
+            config.prover = Some(prover(node));
             config.compact_every = 8;
             config.compact_tail = 2;
             config.prover_options = Options {
@@ -305,18 +320,25 @@ fn a_leader_change_submits_a_recorded_statement_once() {
     }
 }
 
-/// The followers run no prover until the leader's proof is recorded, so
-/// their workers read the statement's record only after its `Proven`
+/// The followers' workers read no record until the leader's proof is
+/// recorded, so they read the statement's record only after its `Proven`
 /// applies. The leader then stops, its proof with it; the new leader proves
-/// the statement again from the record, and the venue holds it accepted
-/// once.
+/// the statement again from the record, which every replica keeps with its
+/// witness, and the venue holds it accepted once.
 #[test]
 fn a_record_read_after_its_proof_is_recorded_is_proved_again() {
     let anchoring = Anchoring::new();
     let judging = Arc::new(Judging::new(Arc::clone(&anchoring.venue), true));
     let proofs = Arc::new(Proofs::default());
-    let provers = Arc::new(Mutex::new(BTreeSet::from([1, 2, 3])));
-    let mut cluster = cluster_proving_on(&judging, &proofs, &provers);
+    let waiting = Arc::new(Mutex::new(BTreeSet::new()));
+    let (shared, gate) = (Arc::clone(&proofs), Arc::clone(&waiting));
+    let mut cluster = cluster_with(&judging, move |node| {
+        Arc::new(Waiting {
+            proofs: Arc::clone(&shared),
+            node,
+            waiting: Arc::clone(&gate),
+        })
+    });
     anchoring.register(&cluster);
     let agents = Agents {
         representative: cluster.representative(&[1, 2, 3]),
@@ -326,13 +348,7 @@ fn a_record_read_after_its_proof_is_recorded_is_proved_again() {
     write(&cluster, agent, 1..=20);
     let leader = cluster.leader(agent);
     let followers: Vec<NodeNumber> = (1..=3).filter(|node| *node != leader).collect();
-    provers.lock().unwrap().retain(|node| *node == leader);
-    for &follower in &followers {
-        cluster.stop(follower);
-        cluster.start(follower);
-        cluster.caught_up(follower, agent, leader);
-    }
-    assert_eq!(cluster.leader(agent), leader, "the leader proves");
+    waiting.lock().unwrap().extend(&followers);
     let attest = read_at(
         &cluster,
         &anchoring,
@@ -345,19 +361,23 @@ fn a_record_read_after_its_proof_is_recorded_is_proved_again() {
         recorded(&cluster, agent, &id)
     });
     assert_eq!(proofs.made.load(Ordering::SeqCst), 1);
-    provers.lock().unwrap().extend(&followers);
+    waiting.lock().unwrap().clear();
     for &follower in &followers {
-        cluster.stop(follower);
-        cluster.start(follower);
         let node = cluster.node(follower);
         wait_until("the follower's worker holds the statement proved", || {
-            node.prover_backlog()
-                .is_some_and(|backlog| backlog.proved == 1)
+            node.store()
+                .prover_jobs()
+                .unwrap()
+                .iter()
+                .any(|(_, held, job)| {
+                    *held == id.0
+                        && Job::decode_exact(job)
+                            .is_some_and(|job| matches!(job.state, State::Proved { .. }))
+                })
         });
     }
     cluster.stop(leader);
-    let new = cluster.leader(agent);
-    assert_ne!(new, leader);
+    assert_ne!(cluster.leader(agent), leader);
     judging.hold.store(false, Ordering::SeqCst);
     wait_until("the venue accepts the statement", || {
         judging.accepted.lock().unwrap().contains(&id.0)

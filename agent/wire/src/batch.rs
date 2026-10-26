@@ -173,9 +173,8 @@ pub enum Input {
     /// BLAKE2b-256) in the prover's blob store, the attest's record the one
     /// whose digest is `attested` ([`crate::result::Attest::digest`]):
     /// refine records it ([`crate::keys::proven`]), the first proof of an id
-    /// alone.
-    /// The prover, the agent's leader, puts it in a batch once the proof is
-    /// stored.
+    /// alone. The prover, the agent's leader, puts it in a batch once the
+    /// proof is stored.
     #[codec(index = 9)]
     Proven {
         window: u64,

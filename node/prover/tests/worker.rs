@@ -144,8 +144,8 @@ fn a_prover_that_panics_gives_up_after_three_attempts() {
 /// before its roots were anchored: the new leader proves nothing again,
 /// fetches the proof from the first and submits it; the first, no longer
 /// leading, submits nothing. A statement recorded after the change is
-/// proved by the new leader. Without the proofs, a leader whose records
-/// kept no witness once recorded proved refuses each for that.
+/// proved by the new leader. A leader that never fetches the proofs proves
+/// each again from its record, and the venue takes each once.
 #[test]
 fn a_leader_change_proves_nothing_twice() {
     let agent = Arc::new(Mutex::new(Agent::default()));
@@ -190,9 +190,8 @@ fn a_leader_change_proves_nothing_twice() {
     assert_eq!(venue.accepted(), 2);
     assert_eq!(b.blobs(), 2, "the first's proof fetched, the second's made");
 
-    // A third statement proved by a leader whose proof then is lost: its
-    // record kept no witness once recorded proved, so a new leader that
-    // never fetches the proofs refuses each for that, proving none again.
+    // A third statement proved by a leader whose proofs then are lost: a
+    // new leader that never fetches them proves each again from its record.
     agent.lock().unwrap().attests(vec![attest(5, 3)]);
     venue.now.store(after(5), Ordering::SeqCst);
     on_b.step().unwrap();
@@ -209,13 +208,9 @@ fn a_leader_change_proves_nothing_twice() {
     for _ in 0..6 {
         on_c.step().unwrap();
     }
-    assert_eq!(
-        states(&c_jobs),
-        [State::Refused(REFUSED_UNWITNESSED); 3],
-        "{:?}",
-        states(&c_jobs)
-    );
-    assert_eq!(prover.made.load(Ordering::SeqCst), 3, "none proved again");
+    assert_eq!(states(&c_jobs), [State::Accepted; 3]);
+    assert_eq!(prover.made.load(Ordering::SeqCst), 6, "each proved again");
+    assert_eq!(venue.accepted(), 3);
 }
 
 /// A statement whose anchor would pass `MaxRootAge` by the venue's time
@@ -361,7 +356,7 @@ fn a_kernel_is_held_and_one_fetched_late_proves() {
 }
 
 /// A statement recorded proved whose proof never arrives, its record
-/// without its witness, is refused for that reason, its kernel never run.
+/// holding no witness, is refused for that reason, its kernel never run.
 #[test]
 fn a_witnessless_record_is_refused_for_it() {
     let agent = Arc::new(Mutex::new(Agent::default()));
