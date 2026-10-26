@@ -1,6 +1,12 @@
 //! The node API on a unix socket: frames with ids, read in order, each
 //! request started as it arrives and answered when it is done, out of
 //! order. The socket file's mode is the access.
+//!
+//! After a frame error the requests in flight run on, detached, and the
+//! connection's place is given back as it closes: a local client that
+//! fills its places and then sends a bad frame can have more requests
+//! running than `api_connections × api_in_flight`, each to its end. The
+//! socket's mode bounds who can.
 
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -12,7 +18,7 @@ use smol::lock::{Mutex, Semaphore};
 use smol::net::unix::{UnixListener, UnixStream};
 use vos_api::{Event, Framing, Kind, Reader, Requests, error_frame, frame};
 
-use super::{Api, Via};
+use super::{Api, Via, is_large};
 use crate::timeout;
 
 /// The most one read takes off the socket.
@@ -122,6 +128,8 @@ async fn connection(
     // When the frame part read began to arrive: it must end within the
     // deadline.
     let mut started: Option<Instant> = None;
+    // The frame part read's place among the large bodies, if it is large.
+    let mut large = None;
     loop {
         let read = match started {
             Some(started) => {
@@ -160,12 +168,13 @@ async fn connection(
                     let kind = Kind::from_u16(request.kind).expect("the reader's kinds");
                     let (api, writer) = (Arc::clone(&api), Arc::clone(&writer));
                     let runtime = Arc::clone(&api.inner.runtime);
+                    let large = large.take();
                     requests.push(runtime.spawn(async move {
                         let answer = api.handle(kind, request.body, Via::Socket).await;
                         let bytes = frame(Framing::Stream, request.kind, request.id, &answer);
                         // Written whole: an answer never interleaves another.
                         let _ = writer.lock().await.write_all(&bytes).await;
-                        drop(slot);
+                        drop((slot, large));
                     }));
                 }
                 Event::Error { error, id } => {
@@ -190,5 +199,11 @@ async fn connection(
             (true, Some(started)) => Some(started),
             (true, None) => Some(Instant::now()),
         };
+        // A large body is read only once it holds a place; its deadline
+        // runs from then, as the wait is the node's.
+        if large.is_none() && is_large(&reader, Framing::Stream) {
+            large = Some(api.large.acquire_arc().await);
+            started = Some(Instant::now());
+        }
     }
 }

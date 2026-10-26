@@ -65,7 +65,7 @@ impl Header {
     }
 
     /// The body's length, if the length holds the header's rest.
-    fn body(&self, framing: Framing) -> Option<u32> {
+    pub fn body(&self, framing: Framing) -> Option<u32> {
         self.length.checked_sub(framing.rest())
     }
 }
@@ -153,6 +153,22 @@ impl Reader {
     /// Whether a frame is part read: its deadline runs.
     pub fn pending(&self) -> bool {
         !self.done && self.buffer.len() > self.at
+    }
+
+    /// The header of the frame part read, once its bytes arrived: after
+    /// [`Reader::event`] gave `None`, one it checked.
+    pub fn header(&self) -> Option<Header> {
+        let bytes = self.buffer.get(self.at..).filter(|_| !self.done)?;
+        let header = bytes.get(..self.framing.header())?;
+        let id = match self.framing {
+            Framing::Quic => 0,
+            Framing::Stream => u64::from_le_bytes(header[6..14].try_into().expect("eight")),
+        };
+        Some(Header {
+            length: u32::from_le_bytes(header[..4].try_into().expect("four bytes")),
+            kind: u16::from_le_bytes(header[4..6].try_into().expect("two bytes")),
+            id,
+        })
     }
 
     /// The next frame, or the frame error that ends the reader; `None`
@@ -337,6 +353,7 @@ mod tests {
             if limit > 0 {
                 assert_eq!(reader.event(), None, "{kind:?}");
                 assert!(reader.pending());
+                assert_eq!(reader.header(), Some(header));
             } else {
                 assert!(matches!(reader.event(), Some(Event::Frame(_))));
             }

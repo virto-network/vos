@@ -2,17 +2,17 @@
 //! client's key checked at the handshake against the node's `gateways`,
 //! one request a bidirectional stream.
 
-use std::collections::HashSet;
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use quinn::VarInt;
-use vos_api::{Event, Framing, Kind, Reader, Requests, error_frame, frame};
+use vos_api::{Event, FrameError, Framing, Kind, Reader, Requests, error_frame, frame};
 use vos_net::api::{Runner, Runtime, Spawner};
 
-use super::{Api, Via};
+use super::{Api, Via, is_large};
 use crate::timeout;
 
 /// A connection quiet this long closes.
@@ -26,6 +26,9 @@ const STOPPED: VarInt = VarInt::from_u32(0);
 const FULL: VarInt = VarInt::from_u32(1);
 /// Handshakes under way at once: past them, a client is refused.
 const HANDSHAKES: usize = 64;
+/// Handshakes under way at once from one address (an IPv6 address's /64):
+/// one host cannot take every handshake's place.
+const HANDSHAKES_PER_ADDRESS: usize = 8;
 /// How long a handshake may take.
 const HANDSHAKE: Duration = Duration::from_secs(10);
 
@@ -111,6 +114,48 @@ impl Drop for Place {
     }
 }
 
+/// A handshake's place among its address's, given back when it ends.
+struct Shaking {
+    by: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    address: IpAddr,
+}
+
+impl Shaking {
+    /// A place for a handshake from `address`, if it has fewer than its
+    /// share under way.
+    fn take(by: &Arc<Mutex<HashMap<IpAddr, usize>>>, address: IpAddr) -> Option<Self> {
+        let address = match address {
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => IpAddr::V6((u128::from(v6) & !((1u128 << 64) - 1)).into()),
+            },
+            v4 => v4,
+        };
+        let mut counts = by.lock().expect("the handshakes");
+        let count = counts.entry(address).or_insert(0);
+        if *count >= HANDSHAKES_PER_ADDRESS {
+            return None;
+        }
+        *count += 1;
+        Some(Self {
+            by: Arc::clone(by),
+            address,
+        })
+    }
+}
+
+impl Drop for Shaking {
+    fn drop(&mut self) {
+        let mut counts = self.by.lock().expect("the handshakes");
+        if let Some(count) = counts.get_mut(&self.address) {
+            *count -= 1;
+            if *count == 0 {
+                counts.remove(&self.address);
+            }
+        }
+    }
+}
+
 /// A place among `open`, if fewer than `most` hold one.
 fn take(open: &Arc<AtomicUsize>, most: usize) -> Option<Place> {
     open.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
@@ -123,6 +168,7 @@ fn take(open: &Arc<AtomicUsize>, most: usize) -> Option<Place> {
 async fn accept(api: Arc<Api>, endpoint: quinn::Endpoint, spawner: Spawner, limits: Limits) {
     let limits = Arc::new(limits);
     let (open, handshaking) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let by_address = Arc::new(Mutex::new(HashMap::new()));
     while let Some(incoming) = endpoint.accept().await {
         // A client proves its address first, so a flood from addresses
         // that are not its sender's holds no handshake.
@@ -130,6 +176,10 @@ async fn accept(api: Arc<Api>, endpoint: quinn::Endpoint, spawner: Spawner, limi
             let _ = incoming.retry();
             continue;
         }
+        let Some(own) = Shaking::take(&by_address, incoming.remote_address().ip()) else {
+            incoming.refuse();
+            continue;
+        };
         let Some(shaking) = take(&handshaking, HANDSHAKES) else {
             incoming.refuse();
             continue;
@@ -145,7 +195,7 @@ async fn accept(api: Arc<Api>, endpoint: quinn::Endpoint, spawner: Spawner, limi
                 }
                 None => return,
             };
-            drop(shaking);
+            drop((shaking, own));
             // Past the connections allowed, one is closed once it shook
             // hands: a listed client's, as the handshake checked its key.
             let Some(_place) = take(&open, limits.connections) else {
@@ -175,9 +225,25 @@ async fn request(
 ) {
     let mut reader = Reader::requests(Framing::Quic, Requests::All);
     let mut started: Option<Instant> = None;
+    // The request's place among the large bodies, if it is large: past
+    // them, it is answered `Unavailable` before its body is read.
+    let mut large = None;
     let event = loop {
         if let Some(event) = reader.event() {
             break event;
+        }
+        if large.is_none() && is_large(&reader, Framing::Quic) {
+            match api.large.try_acquire_arc() {
+                Some(place) => large = Some(place),
+                None => {
+                    let _ = receive.stop(STOPPED);
+                    let bytes = error_frame(Framing::Quic, 0, FrameError::Unavailable);
+                    if send.write_all(&bytes).await.is_ok() {
+                        let _ = send.finish();
+                    }
+                    return;
+                }
+            }
         }
         let read = match started {
             Some(started) => {
@@ -223,4 +289,5 @@ async fn request(
     if send.write_all(&bytes).await.is_ok() {
         let _ = send.finish();
     }
+    drop(large);
 }

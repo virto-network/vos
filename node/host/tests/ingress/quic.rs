@@ -170,3 +170,56 @@ fn quic_connections_and_frames_are_bounded() {
         dial(&served, address, GATEWAY, vos_net::api::ALPN).is_ok()
     });
 }
+
+/// At most four install-size bodies are held at once: a fifth is answered
+/// `Unavailable` from its header, its body unread, and the stream after a
+/// place is given back is read again.
+#[test]
+fn install_size_bodies_over_quic_are_bounded() {
+    let (served, address) = quic_served(|_| {});
+    let connection = dial(&served, address, GATEWAY, vos_net::api::ALPN).unwrap();
+    let large = vos_api::LARGE as usize + 1;
+    let header = Header::of(Framing::Quic, Kind::Install as u16, 0, large).encode(Framing::Quic);
+    let held: Vec<(quinn::SendStream, quinn::RecvStream)> = smol::block_on(async {
+        let mut held = Vec::new();
+        for _ in 0..4 {
+            let (mut send, receive) = connection.open_bi().await.unwrap();
+            send.write_all(&header).await.unwrap();
+            held.push((send, receive));
+        }
+        held
+    });
+    std::thread::sleep(Duration::from_millis(300));
+    let fifth = |header: Vec<u8>| {
+        smol::block_on(async {
+            let (mut send, mut receive) = connection.open_bi().await.unwrap();
+            send.write_all(&header).await.unwrap();
+            receive.read_to_end(1 << 10).await
+        })
+    };
+    let answer = fifth(header.clone()).unwrap();
+    assert_eq!(&answer[4..6], &FRAME_ERROR.to_le_bytes());
+    assert_eq!(
+        FrameError::decode_exact(&answer[6..]),
+        Some(FrameError::Unavailable)
+    );
+    // A body that is not large holds no place.
+    let (kind, _) = ask(&connection, Kind::Time as u16, &[]);
+    assert_eq!(kind, Kind::Time as u16);
+    drop(held);
+    wait_until("a place is given back", || {
+        smol::block_on(async {
+            let (mut send, receive) = connection.open_bi().await.unwrap();
+            send.write_all(&header).await.unwrap();
+            // Taken: the node waits for the body, answering nothing yet.
+            let mut receive = receive;
+            let answered = async { Some(receive.read_to_end(1 << 10).await) };
+            let waited = smol::future::or(answered, async {
+                smol::Timer::after(Duration::from_millis(300)).await;
+                None
+            })
+            .await;
+            waited.is_none()
+        })
+    });
+}

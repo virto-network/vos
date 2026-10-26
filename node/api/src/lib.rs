@@ -31,6 +31,9 @@ const REQUEST: u32 = (cap::REQUEST + ENVELOPE) as u32;
 const INSTALL: u32 = (cap::MAX_ELF + ENVELOPE) as u32;
 /// An operator read's inner body, at most: an agent, with room to spare.
 const OPERATOR_READ: u32 = ENVELOPE as u32;
+/// A body past this is large: only an install's is. A node holds few at
+/// once, from every transport.
+pub const LARGE: u32 = REQUEST + AGENT + OPERATED;
 
 /// The frame error's kind: an answer only, never a request.
 pub const FRAME_ERROR: u16 = 0xffff;
@@ -182,6 +185,9 @@ mod tests {
             assert_eq!(limit(kind), 69_792);
         }
         assert_eq!(limit(Kind::Install), 67_113_120);
+        for kind in Kind::ALL {
+            assert_eq!(kind.limit() > LARGE, kind == Kind::Install, "{kind:?}");
+        }
     }
 
     #[test]

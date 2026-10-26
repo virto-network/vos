@@ -31,6 +31,10 @@ pub use operator::{OPERATOR_KEY, OPERATOR_PUB};
 
 /// How far ahead a query's `not_after` may be.
 const QUERY_HORIZON_MS: u64 = 300_000;
+/// Large bodies ([`vos_api::LARGE`], an install's) held at once, from the
+/// socket and QUIC together: past them, the socket reads a large frame's
+/// body only as one ends, and QUIC answers `Unavailable`.
+const LARGE_BODIES: usize = 4;
 
 /// The transport a request came by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +60,8 @@ pub(crate) struct Api {
     nonces: Nonces,
     /// Requests the API's transports brought, the node's HTTP's aside.
     pub(crate) frames: AtomicU64,
+    /// The large bodies' places.
+    pub(crate) large: Arc<smol::lock::Semaphore>,
 }
 
 /// A read's place among those waiting, given back when it ends, however it
@@ -81,6 +87,14 @@ impl Drop for Waiting<'_> {
     }
 }
 
+/// Whether the frame `reader` has part read is large ([`vos_api::LARGE`]).
+fn is_large(reader: &vos_api::Reader, framing: vos_api::Framing) -> bool {
+    reader
+        .header()
+        .and_then(|header| header.body(framing))
+        .is_some_and(|body| body > vos_api::LARGE)
+}
+
 fn decode<T: Decode>(body: &[u8]) -> Result<T, Response> {
     T::decode_exact(body).ok_or(Response::Rejected(Rejection::Malformed))
 }
@@ -93,6 +107,7 @@ impl Api {
             operators,
             nonces,
             frames: AtomicU64::new(0),
+            large: Arc::new(smol::lock::Semaphore::new(LARGE_BODIES)),
         }
     }
 
