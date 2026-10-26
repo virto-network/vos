@@ -24,12 +24,16 @@ use crate::node::{Inner, ReplaceError};
 use crate::queries::Asked;
 use crate::signature::verify;
 
+pub(crate) mod socket;
+
 /// How far ahead a query's `not_after` may be.
 const QUERY_HORIZON_MS: u64 = 300_000;
 
 /// The transport a request came by.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Via {
+    /// The unix socket: its file mode is the access.
+    Socket,
     /// The node's own HTTP: an operator's bare body, once the node's
     /// bearer token admitted it.
     Http,
@@ -105,7 +109,7 @@ impl Api {
     async fn respond(&self, kind: Kind, body: Vec<u8>, via: Via) -> Response {
         if kind.operator() {
             return match via {
-                Via::Http => self.operate(kind, body).await,
+                Via::Socket | Via::Http => self.operate(kind, body).await,
             };
         }
         match kind {

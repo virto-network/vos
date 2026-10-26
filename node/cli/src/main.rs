@@ -149,9 +149,11 @@ impl RunArgs {
         config.ingress_tls = self.tls.ingress();
         config.space = self.space.as_deref().map(Space::read).transpose()?;
         config.peer_bind = self.peer_bind;
-        if let Some(path) = &self.config {
-            config::Settings::read(path)?.apply(&mut config)?;
-        }
+        let settings = match &self.config {
+            Some(path) => config::Settings::read(path)?,
+            None => config::Settings::default(),
+        };
+        let fronts = settings.apply(&mut config)?;
         #[cfg(feature = "prover")]
         {
             config.prover = Some(std::sync::Arc::new(
@@ -170,8 +172,14 @@ impl RunArgs {
         let address = node
             .serve(self.listen)
             .map_err(|error| format!("{error:?}"))?;
+        let socket = fronts
+            .api_socket
+            .unwrap_or_else(|| self.data.join(config::API_SOCKET));
+        node.serve_socket(&socket, fronts.api_socket_mode)
+            .map_err(|error| format!("{error:?}"))?;
         println!("listening on {address}");
         println!("node {}", hex::encode(node.id().0));
+        println!("api on {}", socket.display());
         loop {
             std::thread::park();
         }

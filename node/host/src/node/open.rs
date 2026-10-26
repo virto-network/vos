@@ -166,11 +166,12 @@ impl Node {
             .prover
             .and_then(|prover| crate::prover::start(&inner, prover, config.prover_options));
         Ok(Self {
+            api: Arc::new(crate::api::Api::new(Arc::clone(&inner))),
             inner,
             data,
             secret,
             ingress_tls: config.ingress_tls,
-            ingress: Mutex::new(None),
+            fronts: Mutex::new(Vec::new()),
             stop: Some(stop),
             runtime: Some(thread),
             liveness,
@@ -215,10 +216,11 @@ impl Node {
             let _ = stop.send(());
             let _ = thread.join();
         }
-        // End the ingress and its connections while the runtime still runs
-        // them, so none outlives the node holding its store.
-        let ingress = lock(&self.ingress).take();
-        if let Some((task, stop)) = ingress {
+        // End the ingress, the API's socket and their connections while the
+        // runtime still runs them, so none outlives the node holding its
+        // store.
+        let fronts = std::mem::take(&mut *lock(&self.fronts));
+        for (task, stop) in fronts {
             let _ = stop.try_send(());
             smol::block_on(task);
         }

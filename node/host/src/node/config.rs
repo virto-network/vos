@@ -132,6 +132,15 @@ pub struct Config {
     /// The most connections the ingress holds open at once: one past them
     /// is closed as it is accepted.
     pub ingress_connections: usize,
+    /// The most connections the node API holds open at once on each of
+    /// its transports: one past them is refused.
+    pub api_connections: usize,
+    /// The most requests in flight on one connection of the node API:
+    /// past them, its next request is read only as one ends.
+    pub api_in_flight: usize,
+    /// How long a frame of the node API may take to arrive from its first
+    /// byte.
+    pub api_frame_deadline: Duration,
 }
 
 impl Config {
@@ -182,6 +191,9 @@ impl Config {
             workflow_waits: 64,
             workflow_wait: Duration::from_millis(vos_wire::ingress::MAX_WORKFLOW_WAIT_MS),
             ingress_connections: 1024,
+            api_connections: 1024,
+            api_in_flight: 1024,
+            api_frame_deadline: vos_http::server::REQUEST_DEADLINE,
         }
     }
 }
@@ -212,6 +224,9 @@ pub(crate) struct Settings {
     pub(crate) workflow_waits: usize,
     pub(crate) workflow_wait: Duration,
     pub(crate) ingress_connections: usize,
+    pub(crate) api_connections: usize,
+    pub(crate) api_in_flight: usize,
+    pub(crate) api_frame_deadline: Duration,
 }
 
 impl Settings {
@@ -244,6 +259,9 @@ impl Settings {
                 vos_wire::ingress::MAX_WORKFLOW_WAIT_MS,
             )),
             ingress_connections: config.ingress_connections,
+            api_connections: config.api_connections,
+            api_in_flight: config.api_in_flight,
+            api_frame_deadline: config.api_frame_deadline,
         }
     }
 }

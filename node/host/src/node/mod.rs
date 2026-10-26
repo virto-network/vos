@@ -519,8 +519,11 @@ pub struct Node {
     /// The seed of the node's key.
     secret: [u8; 32],
     ingress_tls: Option<IngressTls>,
-    /// The ingress, and what stops it.
-    ingress: Mutex<Option<(smol::Task<()>, smol::channel::Sender<()>)>>,
+    /// The node API's one handler, whichever transport brings a request.
+    api: Arc<crate::api::Api>,
+    /// The servers on the node's thread (the HTTP ingress, the API's
+    /// socket), and what stops each.
+    fronts: Mutex<Vec<(smol::Task<()>, smol::channel::Sender<()>)>>,
     stop: Option<smol::channel::Sender<()>>,
     runtime: Option<JoinHandle<()>>,
     /// The pair heartbeat's thread, and what stops it.

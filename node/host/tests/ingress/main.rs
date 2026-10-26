@@ -1,11 +1,13 @@
-//! The node's HTTP ingress, end to end on the default agent and the
-//! counter actor: client-named sessions, signed calls in their sequences,
-//! the reply window, expiry, the operator's token, and workflows started
-//! by clients and read by their owners.
+//! The node's HTTP ingress and its API's socket, end to end on the default
+//! agent and the counter actor: client-named sessions, signed calls in
+//! their sequences, the reply window, expiry, the operator's token,
+//! workflows started by clients and read by their owners, and the API's
+//! frames.
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod api;
 mod operator;
 mod requests;
 mod sessions;
@@ -45,6 +47,8 @@ struct Served {
     node: Node,
     address: SocketAddr,
     target: Target,
+    /// The node API's unix socket.
+    socket: std::path::PathBuf,
     clock: Arc<AtomicU64>,
     token: String,
     agent: AgentId,
@@ -78,6 +82,8 @@ impl Served {
         configure(&mut config);
         let node = Node::open(dir.path(), config).unwrap();
         let address = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
+        let socket = dir.path().join("api.sock");
+        node.serve_socket(&socket, 0o600).unwrap();
         let target = Target::loopback(&format!("http://{address}")).unwrap();
         let token = std::fs::read_to_string(dir.path().join(ADMIN_TOKEN)).unwrap();
         let operator = Operator::new(&target, &token);
@@ -93,6 +99,7 @@ impl Served {
             node,
             address,
             target,
+            socket,
             clock,
             token,
             agent,

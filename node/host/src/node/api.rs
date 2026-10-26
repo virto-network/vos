@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -375,13 +376,35 @@ impl Node {
         let local = listener
             .local_addr()
             .map_err(|error| Error::Data(error.to_string()))?;
-        let api = Arc::new(crate::api::Api::new(Arc::clone(&self.inner)));
         let (stop, stopped) = smol::channel::bounded(1);
-        let task = self
-            .inner
-            .runtime
-            .spawn(crate::ingress::serve(api, token, listener, tls, stopped));
-        *lock(&self.ingress) = Some((task, stop));
+        let task = self.inner.runtime.spawn(crate::ingress::serve(
+            Arc::clone(&self.api),
+            token,
+            listener,
+            tls,
+            stopped,
+        ));
+        lock(&self.fronts).push((task, stop));
         Ok(local)
+    }
+
+    /// Serve the node API on a unix socket at `path`, its file given
+    /// `mode`: whoever may write to it may send any request. A stale
+    /// socket file is replaced; a lock file beside it refuses a second node
+    /// given the same path.
+    pub fn serve_socket(&self, path: &Path, mode: u32) -> Result<(), Error> {
+        let bound = crate::api::socket::bind(path, mode).map_err(Error::Data)?;
+        let settings = &self.inner.settings;
+        let (stop, stopped) = smol::channel::bounded(1);
+        let task = self.inner.runtime.spawn(crate::api::socket::serve(
+            Arc::clone(&self.api),
+            bound,
+            settings.api_connections,
+            settings.api_in_flight,
+            settings.api_frame_deadline,
+            stopped,
+        ));
+        lock(&self.fronts).push((task, stop));
+        Ok(())
     }
 }
