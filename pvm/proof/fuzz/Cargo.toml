@@ -26,6 +26,9 @@ vos-statement = { path = "../statement", features = ["fixtures"] }
 # A space's genesis, anchors, migrations and golden vectors, as a venue
 # decodes them.
 vos-anchor = { path = "../anchor", features = ["vectors"] }
+# The node API's frame reader and operator envelope, as a node reads them.
+vos-api = { path = "../../../node/api" }
+vos-wire = { path = "../../../agent/wire" }
 postcard = { version = "1", features = ["alloc"] }
 stwo = { git = "https://github.com/olanod/stwo", rev = "c3ec981357a0053e373e00f1057ec5a62675f7eb", default-features = false }
 
@@ -77,5 +80,17 @@ doc = false
 [[bin]]
 name = "anchor_decode"
 path = "fuzz_targets/anchor_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "api_reader"
+path = "fuzz_targets/api_reader.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "operated_decode"
+path = "fuzz_targets/operated_decode.rs"
 test = false
 doc = false

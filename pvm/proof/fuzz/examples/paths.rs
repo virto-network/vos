@@ -21,8 +21,10 @@ use std::path::Path;
 use arbitrary::{Arbitrary, Unstructured};
 use vos_anchor::vectors::Vector;
 use vos_anchor::{Anchor, SpaceGenesis};
+use vos_api::{Event, Framing, Operated, Reader, Requests};
 use vos_pvm_final_verifier::{masked, Error, LINKED};
 use vos_statement::model::judge_bytes;
+use vos_wire::Decode;
 
 /// A verifier's verdict, its variant and what it names.
 fn verdict<T>(result: Result<T, Error>) -> String {
@@ -113,6 +115,32 @@ fn paths(target: &str, bytes: &[u8]) -> Vec<String> {
             decoded("anchor", Anchor::decode(bytes)),
             decoded("vector", Vector::decode(bytes)),
         ],
+        "api_reader" => {
+            let Some((&cuts, data)) = bytes.split_first() else {
+                return vec!["empty".into()];
+            };
+            let mut reader = Reader::requests(Framing::Stream, Requests::All);
+            for chunk in data.chunks(usize::from(cuts) + 1) {
+                reader.push(chunk);
+            }
+            let mut paths = Vec::new();
+            while let Some(event) = reader.event() {
+                paths.push(match event {
+                    Event::Frame(frame) => format!("frame {:#06x}", frame.kind),
+                    Event::Error { error, .. } => format!("{error:?}"),
+                });
+            }
+            paths.extend(
+                reader
+                    .finish()
+                    .map(|event| format!("at the end: {event:?}")),
+            );
+            paths
+        }
+        "operated_decode" => vec![match Operated::decode_exact(bytes) {
+            Some(_) => "an envelope".into(),
+            None => "no envelope".into(),
+        }],
         _ => vec!["a program".into()],
     }
 }

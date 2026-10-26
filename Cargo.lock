@@ -2578,6 +2578,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "vos-api"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "vos-pvm-codec",
+ "vos-wire",
+]
+
+[[package]]
 name = "vos-checker"
 version = "0.1.0"
 dependencies = [

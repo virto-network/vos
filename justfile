@@ -516,7 +516,7 @@ _kit-workspace:
 # layout's bounds; the statement's and the space's decoders and the venue's
 # check; and prove-then-verify on random programs. A target's property is
 # no panic and nothing accepted but a golden.
-fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode"
+fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode api_reader operated_decode"
 
 # Each target's checked-in corpus (`pvm/proof/fuzz/replay`) run once, every
 # input, optimized and without a sanitizer: no crash. `cargo run --example

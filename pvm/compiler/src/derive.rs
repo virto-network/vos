@@ -96,7 +96,7 @@ const SERVED_CHUNK: u64 = ARGUMENTS;
 const READS_SERVED: u64 = 1 << 32;
 
 /// The largest ELF a derivation reads: an install's body.
-pub const MAX_ELF: usize = 64 << 20;
+pub use vos_wire::abi::cap::MAX_ELF;
 
 /// The most attestable methods an actor may have: a schema's methods.
 const MAX_ATTESTABLES: usize = 1024;

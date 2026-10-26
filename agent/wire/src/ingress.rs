@@ -201,7 +201,8 @@ pub enum Rejection {
     /// `now`: start one with a time near it.
     #[codec(index = 5)]
     StaleSession { now: u64 },
-    /// An operator command without the node's admin token.
+    /// An operator command without the node's admin token, or signed by a
+    /// key the node does not list.
     #[codec(index = 6)]
     Unauthorized,
     #[codec(index = 7)]
@@ -210,6 +211,30 @@ pub enum Rejection {
     /// in time: ask another.
     #[codec(index = 8)]
     Behind,
+    /// An operator request refused: why.
+    #[codec(index = 10)]
+    Operator(OperatorRefusal),
+}
+
+/// Why an operator request was refused, its signature aside: an unlisted
+/// key is [`Rejection::Unauthorized`], a bad signature
+/// [`Rejection::BadSignature`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum OperatorRefusal {
+    /// Its expiry is past, or too far ahead of `now`, the node's time:
+    /// sign it again with an expiry near it.
+    #[codec(index = 0)]
+    Expiry { now: u64 },
+    /// Its nonce ran a command already.
+    #[codec(index = 1)]
+    Replayed,
+    /// Taken on the node's unix socket only. Retired: every transport
+    /// takes signed operator requests.
+    #[codec(index = 2)]
+    SocketOnly,
+    /// It is signed for another node.
+    #[codec(index = 3)]
+    OtherNode,
 }
 
 /// Ingress's answer to a call, a query or an operator command.

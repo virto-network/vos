@@ -12,8 +12,8 @@ use vos_wire::abi::{Refusal, cap};
 use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
-    AgentInfo, Create, Install, QueryCall, Rejection, Replace, Response, WorkflowRead,
-    workflow_read_horizon,
+    AgentInfo, Create, Install, OperatorRefusal, QueryCall, Rejection, Replace, Response,
+    WorkflowRead, workflow_read_horizon,
 };
 use vos_wire::records::{Installed, unstored};
 use vos_wire::{Decode, Encode, keys};
@@ -30,7 +30,7 @@ const QUERY_HORIZON_MS: u64 = 300_000;
 const ENVELOPE: usize = 4096;
 /// The most an install's body may hold: a package's ELF, at the most a
 /// derivation reads, and its envelope.
-const MAX_INSTALL: usize = vos_pvm_compiler::MAX_ELF + ENVELOPE;
+const MAX_INSTALL: usize = cap::MAX_ELF + ENVELOPE;
 
 pub(crate) struct Ingress {
     inner: Arc<Inner>,
@@ -85,6 +85,11 @@ fn status(answer: &Response) -> u16 {
             Rejection::StaleQuery { .. } | Rejection::Malformed => 400,
             // Another replica may be further along.
             Rejection::Behind => 503,
+            Rejection::Operator(refusal) => match refusal {
+                OperatorRefusal::Expiry { .. } | OperatorRefusal::SocketOnly => 403,
+                OperatorRefusal::Replayed => 409,
+                OperatorRefusal::OtherNode => 421,
+            },
         },
         Response::NotConsumed => 500,
         Response::NoAgent => 404,
