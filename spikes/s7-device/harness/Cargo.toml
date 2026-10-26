@@ -27,6 +27,7 @@ vos-pvm = { path = "../../../pvm/runtime" }
 vos-pvm-proof = { path = "../../../pvm/proof" }
 vos-pvm-proof-verifier = { path = "../../../pvm/proof/verifier" }
 vos-pvm-recair = { path = "../../../pvm/proof/recair" }
+vos-pvm-recair-air = { path = "../../../pvm/proof/recair-air" }
 vos-pvm-compiler = { path = "../../../pvm/compiler" }
 vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles" }
 vos-tree = { path = "../../../agent/tree" }
