@@ -881,6 +881,105 @@ fn install_size_bodies_are_bounded_and_refused_from_their_heads() {
     );
 }
 
+/// A node that does not answer delays none of the others' requests: its
+/// dial holds no lock another request waits on, reads in turn skip it
+/// while it is dialed, and the request that had to go to it is answered
+/// 503, at once while it is down.
+#[test]
+fn a_dead_node_delays_no_other_nodes_requests() {
+    let served = Served::start(PerAddress::default());
+    // A QUIC address where nothing answers: its dial runs to its timeout.
+    let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let dead = SigningKey::from_bytes(&[77; 32]).verifying_key().to_bytes();
+    let front = Front::start(
+        vec![
+            (
+                served.node.id().0,
+                Address::Socket(served.socket.clone()),
+            ),
+            (
+                dead,
+                Address::Quic(silent.local_addr().unwrap().to_string()),
+            ),
+        ],
+        PerAddress::default(),
+    );
+    let stats = operated_header(&signed_operated(
+        NodeId(dead),
+        &SigningKey::from_bytes(&OPERATOR),
+        Kind::Stats,
+        fresh_nonce(),
+        served.now() + 60_000,
+        Vec::new(),
+    ));
+    let address = front.address;
+    let to_the_dead = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let (status, _, _) = exchange(
+            address,
+            &request("GET", "/stats", &[format!("Authorization: {stats}")], b""),
+        );
+        (status, started.elapsed())
+    });
+    // Its dial under way for a while.
+    std::thread::sleep(Duration::from_secs(1));
+    let reads = |count: usize| {
+        let started = std::time::Instant::now();
+        let reads: Vec<_> = (0..count)
+            .map(|_| {
+                std::thread::spawn(move || {
+                    exchange(address, &request("GET", "/time", &[], b"")).0
+                })
+            })
+            .collect();
+        let statuses: Vec<u16> = reads.into_iter().map(|read| read.join().unwrap()).collect();
+        (statuses, started.elapsed())
+    };
+    let (statuses, took) = reads(8);
+    let (status, waited) = to_the_dead.join().unwrap();
+    assert_eq!(statuses, vec![200; 8]);
+    assert!(took < Duration::from_secs(2), "while it is dialed: {took:?}");
+    assert_eq!(status, 503);
+    assert!(waited >= Duration::from_secs(5), "its dial ran: {waited:?}");
+    // Down after its failed dial: its own requests are answered at once.
+    let stats = operated_header(&signed_operated(
+        NodeId(dead),
+        &SigningKey::from_bytes(&OPERATOR),
+        Kind::Stats,
+        fresh_nonce(),
+        served.now() + 60_000,
+        Vec::new(),
+    ));
+    let started = std::time::Instant::now();
+    let (status, _, _) = exchange(
+        address,
+        &request("GET", "/stats", &[format!("Authorization: {stats}")], b""),
+    );
+    assert_eq!(status, 503);
+    assert!(started.elapsed() < Duration::from_millis(900));
+    drop(silent);
+}
+
+/// A body past its route's limit is refused 413 by the gateway: no frame
+/// reaches the node. The node's time comes through the gateway as the
+/// node's clock reads.
+#[test]
+fn a_refusal_for_size_never_reaches_the_node() {
+    let served = Served::start(PerAddress::default());
+    let before = served.node.api_frames();
+    let path = format!("/agents/{}/install", served.agent.0);
+    let header = format!(
+        "POST {path} HTTP/1.1\r\nHost: node\r\nContent-Length: {}\r\n\r\n",
+        vos_wire::abi::cap::MAX_ELF + vos_api::ENVELOPE + 1
+    );
+    assert_eq!(exchange(served.front.address, header.as_bytes()).0, 413);
+    assert_eq!(served.node.api_frames(), before);
+    let (status, body, _) = exchange(served.front.address, &request("GET", "/time", &[], b""));
+    assert_eq!(status, 200);
+    assert_eq!(u64::decode_exact(&body), Some(served.now()));
+    assert_eq!(served.node.api_frames(), before + 1);
+}
+
 /// Two nodes of one space behind a gateway: a request to the node that
 /// does not hold the agent is sent on to the one that does; a gateway
 /// knowing no such node passes the redirect on; an operator's request goes

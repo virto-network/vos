@@ -1,5 +1,5 @@
 //! Leader-aware routing across the nodes behind the gateway: a call to
-//! the agent's leader as last learned, a read to any node in turn, an
+//! the agent's leader as last learned, a read to any ready node in turn, an
 //! operator's request to the one node it is signed for; `NotLeader` and
 //! `Elsewhere` followed, resending the same frame, up to four times.
 
@@ -82,10 +82,12 @@ impl Gateway {
         let agent = body
             .get(..4)
             .map(|agent| u32::from_le_bytes(agent.try_into().expect("four bytes")));
+        // A leader not ready may have died: another node names the next.
         let learned = match (kind, agent) {
             (Kind::Call, Some(agent)) => self.leaders.lock().expect("leaders").get(&agent).copied(),
             _ => None,
-        };
+        }
+        .filter(|at| self.upstreams[*at].ready());
         let mut at = learned.unwrap_or_else(|| self.next());
         let mut redirects = 0;
         loop {
@@ -121,8 +123,15 @@ impl Gateway {
         self.by_key(&contact.node.0)
     }
 
+    /// The next upstream in turn that is ready ([`Upstream::ready`]), or
+    /// the next in turn when none is.
     fn next(&self) -> usize {
-        self.turn.fetch_add(1, Ordering::Relaxed) % self.upstreams.len()
+        let count = self.upstreams.len();
+        let first = self.turn.fetch_add(1, Ordering::Relaxed);
+        (0..count)
+            .map(|step| (first + step) % count)
+            .find(|at| self.upstreams[*at].ready())
+            .unwrap_or(first % count)
     }
 
     async fn send(&self, at: usize, kind: Kind, body: &[u8]) -> Answer {
