@@ -4,12 +4,11 @@
 //! proves and submits the statements of the agents it leads. The records
 //! of its attests at a window's cut are the agent's state
 //! (`vos_wire::keys::attested`): every replica's apply writes each one a
-//! work result makes, keeps it without its witness once the statement's
-//! `Input::Proven` applies, and drops it once its roots age, and a
-//! snapshot carries them. So
-//! every replica running a prover holds a job of each, a new leader too,
-//! one that installed a snapshot among them, and a failover proves again
-//! at most the statement in flight. A proof a replica ends once no longer
+//! work result makes, with its witness, and drops it once its roots age,
+//! and a snapshot carries them. So every replica running a prover holds a
+//! job of each, a new leader too, one that installed a snapshot among
+//! them, and a failover proves again at most the statements in flight or
+//! proved by the old leader alone, whose proofs went with it. A proof a replica ends once no longer
 //! leading goes to the agent's leader to record.
 //!
 //! **Its table** is node-local ([`Jobs`]): each statement's job by id,

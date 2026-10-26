@@ -798,9 +798,10 @@ last for decades.**
   records the proof's hash in the agent (`Input::Proven`) and submits it
   once its roots are anchored, a repeat counted as accepted. Its records
   are the agent's state: every replica's apply keeps each attest at a cut
-  (`keys::attested`), without its witness once proved, until its window's
-  roots age, so a replica that installs a snapshot and then leads holds
-  every statement still to prove. The prover is built into the
+  (`keys::attested`) with its witness until its window's roots age, so a
+  replica that installs a snapshot and then leads holds every statement
+  still to prove, and proves again one whose proof went with the old
+  leader. The prover is built into the
   node and stays there [decided]; the extension host that will carry the
   venues' transports is deferred. The worker proves statements at an
   anchored cut alone (an attest with a window), the only statements a

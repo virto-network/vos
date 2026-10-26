@@ -35,9 +35,9 @@ impl Leader {
                 self.inner.unrecorded.recorded(self.id, &id);
                 continue;
             }
-            // Recorded only once this node holds the proof too: the record
-            // then keeps no witness, so a proof held by its prover alone
-            // could be lost for good.
+            // Recorded only once this node holds the proof too: a proof
+            // held by its prover alone is lost with it, and the statement
+            // then proved again once the replicas' patience runs out.
             if !self.inner.blobs.contains(&proof).unwrap_or(false) {
                 continue;
             }

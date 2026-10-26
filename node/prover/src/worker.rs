@@ -76,8 +76,7 @@ pub trait Host {
 }
 
 /// The record of an attest at a window's cut: its window, its digest
-/// ([`Attest::digest`]) and the attest, its witness gone once its
-/// statement is recorded proved.
+/// ([`Attest::digest`]) and the attest, with its witness.
 pub type Record = (u64, [u8; 32], Attest);
 
 /// The worker's table, durable: each statement's job by id.

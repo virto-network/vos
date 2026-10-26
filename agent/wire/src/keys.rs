@@ -704,10 +704,9 @@ pub fn anchor_entry(key: &[u8]) -> Option<u64> {
 /// The record of an attest at window `window`'s cut
 /// ([`crate::result::Attest`]), by its digest
 /// ([`crate::result::Attest::digest`]): node-local, written by the node's
-/// apply of the work result that made it, kept without its witness once
-/// the statement's `Proven` applies, and dropped once the window's roots
-/// age past `MaxRootAge`; the same rows on every replica, so a replica that
-/// installs a snapshot holds them. The prover reads its jobs from these.
+/// apply of the work result that made it, kept with its witness, and
+/// dropped once the window's roots age past `MaxRootAge`; the same rows on
+/// every replica, so a replica that installs a snapshot holds them. The prover reads its jobs from these.
 pub fn attested(window: u64, digest: &[u8; 32]) -> Vec<u8> {
     TreeRow::Attested.key(&[&window.to_be_bytes()[..], digest].concat())
 }
