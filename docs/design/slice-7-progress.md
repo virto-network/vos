@@ -202,7 +202,7 @@ before the levers' factors and added back:
 - **For the owner (S20):** after P1 measures the ratio on today's AIR, the
   gate stays at ≤ 1 s or is set from the measured range.
 
-### 7.0b: the passkey PRF on the gate device
+### 7.0b: the secret sources on the gate device
 
 Pending P1.
 
@@ -1324,6 +1324,12 @@ PRF output as a Java string (recommended: accept, and P1 checks Play
 services' FIDO2 client for a `byte[]`); Q5, "once in this scope" in the
 handler (recommended: as pinned); Q6, 7.11's rate gate on a host of at
 least 12 executor threads (recommended: keep, threads recorded).
+
+**Answered** (2026-10-26): the owner's S37–S44 folded into the pins, the
+design docs and the plan (`owner-decisions.md`): S37 Q1, S38 Q2, S39 Q3,
+S42 Q4 (no passkeys: the Keystore and a security key), S43 Q5 (a `once`
+guard, superseding "the handler's rule" above), S44 Q6; with S40 (the
+demo in s4) and S41 (the node's binary API and a gateway, step 7.10b).
 
 **Left to the steps:** `SECURITY.md`'s entries (the path leak, the handle
 copy, the containment) with 7.11 and 7.12, as the plan has them.

@@ -235,10 +235,14 @@ wants one says "from agent G, with claim `decision(d)`".
 **Credentialed calls** [decided, S21–S24]: a call whose authority is a
 credential proof (`proving.md` §8), with no session and no signature.
 Ingress verifies the proof and logs only the origin it proves.
-- **The route:** `POST /agents/{agent}/credentialed`. It has a route of
-  its own, so the HTTP layer sizes its body before decoding it: at most
-  1.5 MiB plus `cap::REQUEST` plus the 4 KiB envelope, `413` past it. The
-  body, in SCALE:
+- **The request:** `Credentialed`, a request kind of the node's binary
+  API (`vos_wire` frames over a unix socket or QUIC with mutual TLS)
+  addressed to an agent [decided, S41]. Its kind is read before its body,
+  so the node sizes the frame before decoding it: at most 1.5 MiB plus
+  `cap::REQUEST` plus the 4 KiB envelope. A gateway serves it over HTTP as
+  `POST /agents/{agent}/credentialed`, `413` past the size; the gateway
+  translates and holds no authority, and every check below is the node's.
+  The body, in SCALE:
 
   ```rust
   pub struct Credentialed {
@@ -259,11 +263,11 @@ Ingress verifies the proof and logs only the origin it proves.
   }
   ```
   The enum's index is the statement's `kind`.
-- **The node's clock:** `GET /time` answers the node's time in
-  milliseconds, a SCALE `u64`. A client reads it before it picks
-  `expires_ms`, because the proof binds that value and a refused expiry
-  costs a new proof. `GET /` keeps answering the node's key, which clients
-  pin.
+- **The node's clock:** the API's `Time` request answers the node's time
+  in milliseconds, a SCALE `u64` (a gateway's `GET /time`). A client reads
+  it before it picks `expires_ms`, because the proof binds that value and
+  a refused expiry costs a new proof. The node's key, which clients pin,
+  keeps its own request (a gateway's `GET /`).
 - **The binding digest:**
   `b = BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖ agent ‖ instance ‖ method ‖ program ‖ kind ‖ arguments ‖ nonce ‖ expires_ms)`:
   `space` the `SpaceId`'s 32 bytes; `agent`, `instance` and `method` 4
@@ -291,17 +295,23 @@ Ingress verifies the proof and logs only the origin it proves.
   - An `Auth` guard needs its agent's credential actor (§6): installing a
     program with one into an agent without that actor fails
     `Failure::Credentials` (15).
-  - "Once in this scope" is the handler's rule, not the guard's: the
-    nullifier is a stable pseudonym, and a handler that admits a member
-    once a scope (a vote) keeps its own set of nullifiers.
+  - **`once`** [decided, S43]: `#[msg(credential = Auth("vote"), once)]`
+    admits each nullifier once in its scope. The nullifier is a stable
+    pseudonym, so the guard, not the handler, keeps the set: apply records
+    the system row `once(scope ‖ nullifier) → t`, `t` the batch time of
+    its admission, kept for good; the scope digest names the space, agent,
+    instance and guard name, so the rows are scoped by construction. A
+    repeat is refused (`Once` at ingress, `Refusal::Once` at apply). A new
+    round takes a new name, so a new scope. `once` needs an `Auth` guard
+    and is part of `CredentialGuard::Auth`, so it moves no pinned blob.
 - **Ingress's checks, in order,** each cheap one before any dearer, every
   state read on this replica's applied state; each refusal is
   `Rejected(Credential(code))` (index 9 of `Rejection`), `code` a
   `CredentialRefusal` of the index shown:
 
-  | # | check | refusal | HTTP |
+  | # | check | refusal | a gateway's HTTP |
   |---|---|---|---|
-  | 1 | the body within the route's size | the HTTP layer's | 413 |
+  | 1 | the frame within its kind's size | the node API's | 413 |
   | 2 | it decodes, exactly | `Malformed` (not a credential code) | 400 |
   | 3 | this node serves the agent | `NoAgent`, `Elsewhere`, as for calls | 404, 421 |
   | 4 | the node's space has a genesis (its `SpaceId` is not `NONE`) | `NoSpace`, 0 | 403 |
@@ -313,10 +323,11 @@ Ingress verifies the proof and logs only the origin it proves.
   | 10 | auth: `scope` is the one the guard's name gives | `Scope`, 6 | 403 |
   | 11 | `binding` is `C(T(binding), W(b))` of this request | `Binding`, 7 | 403 |
   | 12 | `b` is not recorded | `Replayed`, 8 | 409 |
-  | 13 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 9: fetch the path again, or ask another replica | 503 |
-  | 14 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 10 | 403 |
-  | 15 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
-  | 16 | on an executor, the proof decodes; its interaction PoW and its PoW hold, checked before any Merkle decommitment is read; then it verifies under the program for its kind | `Proof`, 11 | 403 |
+  | 13 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 12 | 409 |
+  | 14 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 9: fetch the path again, or ask another replica | 503 |
+  | 15 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 10 | 403 |
+  | 16 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
+  | 17 | on an executor, the proof decodes; its interaction PoW and its PoW hold, checked before any Merkle decommitment is read; then it verifies under the program for its kind | `Proof`, 11 | 403 |
 
   Then the call goes to the agent's leader as `Input::Credentialed`,
   forwarded as a call is by a replica that does not lead, and its answer
@@ -347,15 +358,19 @@ Ingress verifies the proof and logs only the origin it proves.
   2. `b` recorded: refused, `Refusal::Replayed` (8);
   3. auth: `root` neither the ring's newest nor superseded at most
      `ROOT_MAX_AGE` before `t`: refused, `Refusal::StaleRoot` (9);
-  4. `b` recorded, the system row `binding(b) → expires_ms`, collected by
-     the sweep at `expires_ms` plus 60 s through the due index;
-  5. the method runs, its caller the origin, under its guard
+  4. a `once` guard: `once(scope ‖ nullifier)` recorded: refused,
+     `Refusal::Once` (10);
+  5. `b` recorded, the system row `binding(b) → expires_ms`, collected by
+     the sweep at `expires_ms` plus 60 s through the due index; a `once`
+     guard's row recorded;
+  6. the method runs, its caller the origin, under its guard
      (`Failure::Forbidden` consumes the input; `b` stays recorded).
 
   A refused input writes nothing. So a proof replayed at another replica
   runs once, and a revocation binds every replica at the same batch. A
-  duplicate is answered `Replayed`, without the first call's outcome: a
-  client that lost its answer reads state (a balance, a record).
+  duplicate is answered `Replayed`, without the first call's outcome
+  [decided, S39]: a client that lost its answer reads state (a balance, a
+  record).
 - **On JAM,** an agent whose builder is one of the space's nodes takes a
   credentialed input as it takes any: its builder's ingress verified the
   proof, under the trust-boundary rule above.
@@ -510,8 +525,9 @@ across a space's agents wait for the identity agent above.
 - **Timing links:** a credential issued in A and proven in B within one
   window links by time, so proofs should wait or batch.
 - **A nullifier is scoped:** one pseudonym a scope, never global, or it
-  becomes the global handle the owner refuses. A handler that admits a
-  member once a scope keeps the nullifiers it has seen.
+  becomes the global handle the owner refuses. A method that admits a
+  member once a scope takes the `once` guard (§5), which keeps the
+  nullifiers it has seen.
 - **Across spaces, a leaf is keyed by the identity and its revocation
   epoch,** so an identity revoked in A cannot keep proving old facts in
   B.
@@ -549,30 +565,32 @@ space three of them take a simpler form:
   nodes for integrity, as every cell of §3 does. A space that wants
   evidence turns on the non-repudiation side store, which keeps the
   proofs.
-- **The device secret's containment, as it is:**
-  - `s` lives in the library, zeroized on drop. But the PRF output `o`,
-    from which anyone holding the public handle derives `s`, reaches the
-    app from Android's Credential Manager as base64url inside a JSON
-    string. A Java `String` is immutable and cannot be zeroized: it stays
-    in the app's heap until the collector reclaims it, beside the response
-    object that held it. The app's own `byte[]` copy is zero-filled after
-    the call; the strings are not.
-  - Code in the app's process during an assertion (a compromised
-    dependency, a debugger on a debuggable build, a rooted phone) reads
-    `o`, and with it `s` for good.
-  - The passkey syncs through Google Password Manager, so `s` is bound to
-    the Google account and the screen lock or PIN that unlocks its
-    passkeys, not to the phone:
-    whoever restores the passkey on a device of their own and passes user
-    verification derives `s`.
-  - Each proof takes a fresh assertion with user verification, so malware
-    cannot evaluate the PRF silently; one assertion is enough to keep `s`.
+- **The device secret's containment, as it is** (its sources are
+  `proving.md` §8's [decided, S42]):
+  - `s` lives in the library, zeroized on drop. Its source's key never
+    leaves the Keystore (or the security key), but the source's output
+    `o`, from which anyone holding the public handle derives `s`, crosses
+    into the app's process at each use: a `byte[]` from `Mac.doFinal` (or
+    YubiKit's answer), which the bridge zero-fills and the library
+    zeroizes once copied.
+  - Code in the app's process during a use (a compromised dependency, a
+    debugger on a debuggable build, a rooted phone) reads `o`, and with it
+    `s` for good.
+  - The key is bound to the phone (or to the security key), not to an
+    account: nothing syncs it, and no restore elsewhere derives `s`. Its
+    loss (a factory reset, the screen lock removed, a lost security key)
+    loses `s`: the member is revoked and enrolls again, and the ledger's
+    `rekey` moves its rows.
+  - Each use takes the user's consent at the source (a biometric or the
+    PIN at the Keystore; the PIN and a touch at a security key), so
+    malware cannot evaluate it silently; one use is enough to keep `s`.
   - What `s` gives a thief: auth as its member in every scope of the space
     (and of every space sharing its handle), payment from every row
     `owner(s)` owns, and every nullifier the member has used or will use,
     so the member's past pseudonyms link to it. Revoking the leaf stops
     auth within `ROOT_MAX_AGE`; it does not stop payment, which reads no
-    tree: the ledger must change the row's owner.
+    tree: the ledger's `rekey(row, owner)` and `freeze(row)`, under an
+    operator role, do [decided, S37].
 - **Replay** is bound by the binding digest (§5): another space (its
   `SpaceId`), another agent, instance or method, other arguments or
   another statement each change `b`, so the proof fails ingress's
@@ -581,20 +599,26 @@ space three of them take a simpler form:
   of the agent; a re-founded space has a new `SpaceId`, so no proof made
   for the ended one authorizes anything in it. A proof intercepted in
   flight can be sent by the interceptor before its owner: it is the same
-  call, run once; the ingress's TLS keeps it from on-path observers.
+  call, run once. The transports keep it from on-path observers (the node
+  API's QUIC, a gateway's TLS or SSH); a gateway sees every proof it
+  relays and can do the same, and nothing more: it holds no authority.
 - **Revocation** binds every replica within `ROOT_MAX_AGE` of the
   revoking batch, by batch time (§5's apply rule): a revoked member's
   proof against an older root is refused then, whatever a lagging
   replica's ingress accepted. Within the window a revoked member can still
   authenticate.
 - **What operators learn:**
-  - from `path(member)`: which member digest is about to prove, when and
-    from which address. The query's key is drawn for it alone and links
-    nothing, but the credentialed call that follows, by its time and
-    address, links its nullifier to that digest, and the digest to whoever
-    the registrar enrolled. So `Anonymous` hides the member from the log's
+  - from `path(member)`: which member digest is online, and from which
+    address. The query's key is drawn for it alone and links nothing, and
+    the library refreshes its path apart from its proofs (when `root()`
+    moves and on a timer, never just before a proof, on a connection of
+    its own) [decided, S38], so a fetch's time says nothing of a proof's.
+    The leak is reduced, not closed: a proof from the same address still
+    links its nullifier to the digest, and the digest to whoever the
+    registrar enrolled. So `Anonymous` hides the member from the log's
     readers, other agents and other members, not from the operators of
-    the nodes that serve its requests; that is full privacy's (§3, §8);
+    the nodes and gateways that serve its requests; that is full
+    privacy's (§3, §8);
   - from the log: each auth call's scope and nullifier (a pseudonym's
     activity in one scope), each payment's owner digest (a public payer,
     S22), and the metadata every cell leaks (§3);
@@ -616,7 +640,12 @@ space A", and only to whom they choose.
 
 **Postponed** [decided]. These are the primitives that serve the "hidden
 from the operators, actor anonymous" cell, recorded so that the
-primitives built first don't preclude them. A space opts in.
+primitives built first don't preclude them. A space opts in: each space
+chooses its privacy tier [decided, S37]. Fully private, cash-like
+payments are this section's: membership proven privately, a hidden
+payer, the shielded pool. Slice 7 measures only that a proof of
+membership and payment together fits the phone's budget (`proving.md`
+§8).
 
 - **A personal space** is the VOS runtime inside the person's wallet
   app: a space with one node, whose state lives on the device.

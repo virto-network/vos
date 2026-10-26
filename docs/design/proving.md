@@ -895,7 +895,7 @@ last for decades.**
     take (§8). The in-space credential's tree needs none: it lives in its
     actor's rows, and only its space's ingress reads it.
 
-## 8. Mobile [decided: credential AIR first, then the device profile; PRF first, then chips]
+## 8. Mobile [decided: credential AIR first, then the device profile; device-held secrets first, then chips]
 
 **1. The credential AIR** comes first [decided, S21–S25]. Two fixed circuits over the recursion
 AIR's `p2` and `qm31` components prove facts about a device secret `s`,
@@ -937,7 +937,7 @@ little-endian bytes each, `name` the guard's scope name (1–64 bytes) in
 SCALE (a compact length, then the bytes). `b` is
 `identity-and-authority.md` §5's binding digest.
 - **No epoch in `member`** (the Fable review's M7): a revocation removes
-  the leaf, and a new passkey is a new `s` and a new leaf.
+  the leaf, and a new secret source is a new `s` and a new leaf.
 - **The nullifier** is `scope` keyed by `C(T(nf), s)`, a value only the
   holder of `s` computes: two scopes' nullifiers are unlinkable, and
   neither links to `member` or `owner`. In one scope it is stable: a
@@ -970,7 +970,14 @@ enrollment or a revocation costs 33 calls of `C`: the leaf and 32 levels.
   one permutation. No path, no balance and no range check: the payer is
   public [decided, S22]. The ledger's handler compares the live row's
   owner at apply, so a former owner's proof fails once the row changes
-  hands.
+  hands. Revocation does not stop payment; the ledger's `rekey(row,
+  owner)` and `freeze(row)`, under an operator role, do [decided, S37].
+- **Membership and payment together** [decided, S37], measured, not
+  admitted: a third circuit on the same shape proves auth's leaf, path and
+  nullifier and owner's digest from one `s` (37 permutations). Slice 7
+  times it on the phone against auth's budget, so the later private
+  payment's statement (`identity-and-authority.md` §8) is known to fit; it
+  has no `CredentialKind` and no ingress path.
 - **The public words bind the proof:** each is a public value of the
   masked transcript (§5, its step 4), in the order listed, `kind` one word
   and each digest its eight; the circuit consumes every word through the
@@ -997,39 +1004,47 @@ format is **44** instead: the same at 47 queries and PoW 16 (62.66 and 110
 switch takes a new one. 30, reserved at an unmasked count, is retired
 unregistered. Ingress takes a proof of at most 512 KiB.
 
-**The device secret, from a passkey's PRF** [decided, S25]:
-- **The PRF input:** `first = SHA-256("vos/prf/v1" ‖ handle)`, the WebAuthn
-  PRF extension's `eval.first`. The platform's WebAuthn client, not the
-  authenticator, hashes it as `SHA-256("WebAuthn PRF" ‖ 0x00 ‖ first)`
-  before `hmac-secret`. `handle` is the space's stable 32-byte handle
+**The device secret, from a secret source** [decided, S25, S42]:
+- **The source** is an HMAC-SHA-256 under a key the device never
+  exports, evaluated once a use after the user's consent: by default an
+  Android Keystore HMAC key (user authentication at every use, by a
+  biometric or the PIN through `BiometricPrompt`; StrongBox-backed when
+  present; Android 11 or later); optionally a security key's
+  `hmac-secret` by CTAP2 directly through YubiKit, with its PIN and a
+  touch. No passkeys, Credential Manager or Play services; a source that
+  spans devices is later work. The device keeps the source's reference
+  (the Keystore alias, or the security key's credential id).
+- **The input:** `input = SHA-256("vos/prf/v1" ‖ handle)`, the message
+  the source's HMAC takes (a security key's salt as it is: no WebAuthn
+  client prefixes it). `handle` is the space's stable 32-byte handle
   (`identity-and-authority.md` §6), not its `SpaceId`, so a member's
   secret survives a re-founding.
-- **The derivation:** `o` the 32-byte PRF output;
+- **The derivation:** `o` the source's 32-byte output;
   `w = BLAKE2b-512("vos/device/secret/v1" ‖ handle ‖ o)`;
   `s_i = u64_le(w[8i..8i+8]) mod p` for `i < 8` (a bias below 2^-33 a
-  word). It is derived again at each use, from a fresh assertion with user
-  verification, and never stored.
-- **One passkey, many spaces:** spaces with different handles get
+  word). It is derived again at each use, from a fresh evaluation, and
+  never stored.
+- **One source, many spaces:** spaces with different handles get
   unrelated secrets. Two that share a handle share `s`, so their `member`
   and `owner` digests are equal; their scopes carry the `SpaceId`, so
-  their nullifiers are not. The app shows the handle and pins it at the
-  first enrollment.
+  their nullifiers are not. The client shows the handle and pins it at
+  the first enrollment.
 - **What `s` is exposed to** is `identity-and-authority.md` §7's threat
   model.
 
-**The device library** (`vos-device`, `std`, aarch64 and x86_64;
-`vos-device-jni`, a thin JNI shim of `extern "system"` functions over byte
-arrays in the workspace codec, built for `aarch64-linux-android` with
-`cargo-ndk` against NDK 27.2; mimalloc, no other C dependency). The app
-encodes nothing itself: the library builds every request and decodes every
-answer it needs.
+**The device library** (`vos-device`, `std`, aarch64 and x86_64; linked
+as a Rust crate by s4's Android client, a Rust `cdylib`, so VOS has no JNI
+shim of its own; built for `aarch64-linux-android` with `cargo-ndk`
+against the client's NDK; mimalloc, no other C dependency). Neither the
+client nor a gateway encodes a credential's bytes: the library builds
+every request and decodes every answer it needs.
 
 ```rust
 pub struct Digest(pub [u32; 8]);                  // each word below p
 pub struct DeviceSecret(/* [M31; 8]; zeroized on drop, no Clone, no Debug */);
 
-pub fn prf_input(handle: &[u8; 32]) -> [u8; 32];
-pub fn derive_secret(prf_output: &[u8; 32], handle: &[u8; 32]) -> DeviceSecret;
+pub fn source_input(handle: &[u8; 32]) -> [u8; 32];
+pub fn derive_secret(source_output: &[u8; 32], handle: &[u8; 32]) -> DeviceSecret;
 pub fn member(secret: &DeviceSecret) -> Digest;
 pub fn owner(secret: &DeviceSecret) -> Digest;
 
@@ -1057,12 +1072,22 @@ impl Prover {
 pub fn verify(proof: &CredentialProof, call: &Call, name: Option<&[u8]>)
               -> Result<(), DeviceError>;
 
-// The wire (identity-and-authority.md §5–§6):
-pub fn time_answer(body: &[u8]) -> Result<u64, DeviceError>;         // GET /time
+// The wire (identity-and-authority.md §5–§6), the node API's bodies:
+pub fn time_answer(body: &[u8]) -> Result<u64, DeviceError>;         // Time
 pub fn path_query(agent_identity: &[u8; 32], instance: u32, member: &Digest,
                   not_after: u64) -> Vec<u8>;    // a QueryCall, signed by a fresh key
 pub fn path_answer(body: &[u8]) -> Result<AuthWitness, DeviceError>;
 pub fn credentialed(call: &Call, proof: &CredentialProof) -> Vec<u8>; // the request body
+
+/// The path held, refreshed apart from proofs [decided, S38].
+pub struct PathKeeper { /* the member, the path held, the next fetch's time */ }
+impl PathKeeper {
+    pub fn new(member: Digest) -> Self;
+    /// Whether to fetch now: the root moved, or the jittered timer is due.
+    pub fn due(&self, now_ms: u64, root: Option<&Digest>) -> bool;
+    pub fn update(&mut self, witness: AuthWitness, now_ms: u64);
+    pub fn witness(&self) -> Option<&AuthWitness>;
+}
 ```
 - **`prove_auth` checks its witness first:** the leaf of `member(s)` under
   `root` by the path, else `DeviceError::Witness` before any proving.
@@ -1070,10 +1095,12 @@ pub fn credentialed(call: &Call, proof: &CredentialProof) -> Vec<u8>; // the req
   `Verify`: it names what failed and carries no value.
 - **`Threads::Auto`** weights work by core class (7.17) [decided, S28].
 - **`path_query` signs with a key drawn for that query alone,** so path
-  fetches link to no client key.
+  fetches link to no client key; a proof uses the path `PathKeeper`
+  holds, and no fetch precedes it.
 - **No logging of witnesses,** and no `seeded-masks` feature (pin C's
-  build check). The JNI shim zeroizes its copies of `o` and `s`; the app
-  zero-fills its `byte[]` of `o` once the call returns.
+  build check). The client's bridge zero-fills its `byte[]` of `o` once
+  the library has copied it; the library zeroizes its copies of `o` and
+  `s`.
 
 **No Poseidon2 root kind for the in-space credential** [settled by the
 evidence, the owner's to override]: the credential tree lives in the actor's own rows,
@@ -1130,7 +1157,7 @@ Its levers:
 It projects to 0.36–0.9 s on Apple-class phones [projected].
 
 **3. Signature chips** come last, for flows that must prove a standard
-signature [decided, after PRF]:
+signature [decided, after the hash credentials]:
 - SHA-256 and SHA-512, in the narrow layout;
 - one generic modular bignum chip (q·m form, 8-bit limbs), with the
   moduli (p25519, p256, n256) preprocessed;
@@ -1193,7 +1220,7 @@ that narrows the inner proof makes folds cheaper too.
 | **6** | **M2 Masking** | R1–R8 on the final wrap, generic over components and channel for slice 7; format 39; 248-bit salts; leakage and soundness gates; the items carried from slice 5 | 8.5–13 weeks |
 | **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo spaces pallet's design, the verifier kit and the node's client (the pallet is the Kreivo teammate's); the JAM statements service | 18.5–29 weeks |
 | **7** | **M3.9 Simplify and scale** | the anchoring protocol simplified (pin D′: one venue core, five outcomes on the node, no migration, no rotation, equivocation terminal); a scale test across the owner's LAN | 11.5–18 weeks |
-| **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call and chip; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 42); its verifier at ingress; PRF passkeys, the device library and an Android demo; phone gates | 12.5–18 weeks |
+| **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call and chip; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 42); the node's binary API and its gateway; its verifier at ingress; device secrets from the Android Keystore or a security key, the device library and a demo in s4's Android client; phone gates | 15.5–22 weeks |
 | **7** | **M5 Device profile** | the segment chips masked; the boundary-free device shape (format 43); levers 1–4; the CPU split by opcode family, word-level memory if needed; the Poseidon2 chip and the levers in the node's segment format (41), as its leaves allow; the ≤ 1 s phone gate | 22–33.5 weeks, 26–39.5 with word-level memory |
 | **later** | **M6 Signature chips** | SHA-256, SHA-512, the bignum chip, the P-256 and Edwards drivers; moved past slice 7 by the owner (S1) | 8–14 weeks |
 
@@ -1207,10 +1234,10 @@ that narrows the inner proof makes folds cheaper too.
   and M3: slice 6 is 32–49 engineer-weeks (`slice-6-on-chain.md`,
   "Estimates").
 - The Clerk across spaces follows slice 6.
-- Slice 7 is about 52–77 engineer-weeks, up to 83 with word-level memory,
+- Slice 7 is about 55–81 engineer-weeks, up to 87 with word-level memory,
   with its acceptance and the slice-6 items it carries
   (`slice-7-mobile.md`, "Estimates"). Its 12–20 weeks for M4 and M5 here
-  before left out M3.9, the re-pins, the ingress verifier, the demo,
+  before left out M3.9, the re-pins, the node API, the ingress verifier, the demo,
   masking the segment chips and the CPU split.
 
 ## 12. Decisions
@@ -1220,8 +1247,10 @@ that narrows the inner proof makes folds cheaper too.
    on StarkWare's design, with Poseidon2 from day one.
 2. **Device proofs** are not folded in v1. They are verified at a space's
    ingress, and chain statements are node-proved.
-3. **Signatures:** both, PRF first. Passkey-derived secrets with hash
-   credentials come first, and P-256 and ed25519 chips after.
+3. **Signatures:** both, device-held secrets first. Secrets derived from
+   a key the device never exports (the Android Keystore's HMAC, or a
+   security key's `hmac-secret`), with hash credentials, come first, and
+   P-256 and ed25519 chips after.
 4. **Mobile:** both, credential AIR first. It brings the `0x402` host call
    and a zkPVM Poseidon2 chip; the device profile follows. The in-space
    credential's tree lives in its actor's rows, so it needs no Poseidon2
