@@ -23,13 +23,13 @@ mkdir -p "$DIR"
 echo "arch=$(uname -m)"
 echo "kernel=$(uname -r)"
 echo "cpu=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ *//')"
-echo "cpus=$(nproc --all)"
+echo "cpus=$(getconf _NPROCESSORS_ONLN)"
 echo "clk_tck=$(getconf CLK_TCK)"
 echo "governors=$(cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor 2>/dev/null | sort -u | paste -sd, -)"
 echo "mem_total_kb=$(awk '/^MemTotal/{print $2}' /proc/meminfo)"
 echo "mem_available_kb=$(awk '/^MemAvailable/{print $2}' /proc/meminfo)"
 echo "disk_free_kb=$(df -Pk "$DIR" | awk 'NR==2{print $4}')"
-source=$(df -P "$DIR" | awk 'NR==2{print $1}')
+source=$(findmnt -no SOURCE -T "$DIR" | sed 's/\[.*//')
 echo "disk_source=$source"
 disk=$(lsblk -nsro NAME,TYPE "$source" 2>/dev/null | awk '$2=="disk"{print $1; exit}')
 echo "disk=$disk"

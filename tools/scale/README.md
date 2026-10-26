@@ -102,7 +102,7 @@ Every host, nodes and drivers alike, needs:
   driver) and records their p50, p99, maximum and losses in `hosts.json`,
   so a run's latencies can be read against its link.
 - **Packages:** `rsync`, `openssh-server`, `systemd` (with a user manager),
-  `util-linux` (`taskset`, `lsblk`) and `iproute2` (`ip`, `ss`). Nothing
+  `util-linux` (`taskset`, `lsblk`, `findmnt`) and `iproute2` (`ip`, `ss`). Nothing
   else: `deploy` ships static binaries.
 - **ssh by key** from the coordinator, as the user that runs the units.
   The harness uses batch mode, so log in once from the coordinator first
