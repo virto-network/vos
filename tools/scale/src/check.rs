@@ -283,8 +283,11 @@ pub fn judge(facts: &mut Facts, host: &Host, harness: &Harness) {
 
 /// The verdicts on the hosts together, by machine (its machine id, else
 /// its ssh host): the memory caps of a machine's entries must fit in what
-/// it has free less a reserve, and a node's machine holds no driver and
-/// is not the coordinator's, unless the inventory is a smoke's.
+/// it has free less a reserve, the nodes sharing one data disk need its
+/// free space each, and a node's machine holds no driver and is not the
+/// coordinator's, unless the inventory is a smoke's. Several nodes may
+/// share a machine, each with its own dir and ports; drivers and the
+/// coordinator may share one that holds no node.
 pub fn judge_machines(facts: &mut [Facts], hosts: &[Host], harness: &Harness, coordinator: &str) {
     let machine = |facts: &Facts, host: &Host| {
         facts
@@ -318,6 +321,24 @@ pub fn judge_machines(facts: &mut [Facts], hosts: &[Host], harness: &Harness, co
                 MEMORY_RESERVE_KB >> 10,
                 available >> 10
             ));
+        }
+        if hosts[at].role == Role::Node {
+            let disk = facts[at].get("disk_source").map(str::to_string);
+            let sharing = mine
+                .iter()
+                .filter(|other| {
+                    hosts[**other].role == Role::Node
+                        && facts[**other].get("disk_source").map(str::to_string) == disk
+                })
+                .count() as u64;
+            let free = facts[at].number("disk_free_kb").unwrap_or(0);
+            if sharing > 1 && free < sharing * MIN_FREE_DISK_KB {
+                facts[at].refused.push(format!(
+                    "{sharing} nodes share its data disk, {} MiB free: {} MiB each at least",
+                    free >> 10,
+                    MIN_FREE_DISK_KB >> 10
+                ));
+            }
         }
         let node = mine.iter().any(|other| hosts[*other].role == Role::Node);
         let driver = mine.iter().any(|other| hosts[*other].role == Role::Driver);
@@ -703,6 +724,82 @@ mod tests {
                 .iter()
                 .any(|warning| warning.contains("smoke"))
         );
+    }
+
+    /// Three nodes on one machine (each its dir and ports, their caps
+    /// summed), the drivers and the coordinator on another that holds no
+    /// node: the two machines a scale run has.
+    #[test]
+    fn three_nodes_on_one_machine_and_the_drivers_on_the_coordinator_pass() {
+        let mut text = String::from("[harness]\nmemory_max = \"8G\"\n");
+        for at in 1..=3 {
+            text += &format!(
+                "[[host]]\nname = \"c{at}\"\nssh = \"owner@10.0.0.2\"\naddress = \"10.0.0.2\"\nrole = \"node\"\ndir = \"/srv/vos-scale/n{at}\"\ncores = \"{}-{}\"\ningress = {}\npeer = {}\n",
+                4 * (at - 1),
+                4 * at - 1,
+                7700 + at,
+                7800 + at
+            );
+        }
+        for at in 1..=2 {
+            text += &format!(
+                "[[host]]\nname = \"d{at}\"\nssh = \"localhost\"\naddress = \"10.0.0.1\"\nrole = \"driver\"\ndir = \"/var/tmp/vos-scale/d{at}\"\nmemory_max = \"2G\"\n"
+            );
+        }
+        let inventory = Inventory::parse(&text).unwrap();
+        let judged = |free_gib: u64, disk_free_gib: u64| {
+            let mut facts: Vec<Facts> = inventory
+                .hosts
+                .iter()
+                .map(|host| {
+                    let mut facts = good();
+                    let machine = if host.is_local() { "desk" } else { "compumax" };
+                    facts.probe.insert("machine_id".into(), machine.into());
+                    facts
+                        .probe
+                        .insert("mem_available_kb".into(), (free_gib << 20).to_string());
+                    facts
+                        .probe
+                        .insert("disk_source".into(), "/dev/nvme0n1p2".into());
+                    facts
+                        .probe
+                        .insert("disk_free_kb".into(), (disk_free_gib << 20).to_string());
+                    judge(&mut facts, host, &inventory.harness);
+                    facts
+                })
+                .collect();
+            judge_machines(&mut facts, &inventory.hosts, &inventory.harness, "desk");
+            facts
+        };
+        let facts = judged(32, 100);
+        assert!(
+            facts.iter().all(|facts| facts.refused.is_empty()),
+            "{:?}",
+            facts.iter().map(|facts| &facts.refused).collect::<Vec<_>>()
+        );
+        assert!(facts.iter().all(|facts| facts.warnings.is_empty()));
+        // Three 8 GiB caps and the reserve need 26 GiB on compumax.
+        let facts = judged(25, 100);
+        assert!(
+            facts[0]
+                .refused
+                .iter()
+                .any(|refusal| refusal.contains("memory caps"))
+        );
+        assert!(
+            facts[3].refused.is_empty(),
+            "the drivers' machine: {:?}",
+            facts[3].refused
+        );
+        // Three nodes on one disk need its free space thrice.
+        let facts = judged(32, 25);
+        assert!(
+            facts[0]
+                .refused
+                .iter()
+                .any(|refusal| refusal.contains("share its data disk"))
+        );
+        assert!(facts[3].refused.is_empty());
     }
 
     #[test]

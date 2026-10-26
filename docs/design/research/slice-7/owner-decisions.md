@@ -226,3 +226,18 @@ S34. **The divergence guard: the majority decides.** When a quorum of the
   again every 2 s, its alert raised once. A dissent never settles the
   window for the leadership. Narrows S11's amendment ("sends nothing if
   any differs").
+
+## On the scale runs' hardware (2026-10-26)
+
+S35. **One machine besides the desktop.** The owner has one other machine,
+  `compumax`, on the LAN. The scale runs put **3 nodes on compumax**, each
+  in its own unit with its own memory cap and data directory; the drivers
+  and the coordinator run on the desktop and reach the nodes over the real
+  LAN. T1, T3, T4 and T6 are measured as the plan specifies. T2's knee on
+  four node hosts or more, and run 2's rerun without the slowest host,
+  are recorded as not measurable on this hardware, to be run when more
+  machines exist. Narrows S2.
+
+S36. **T5-partial.** With all three nodes on compumax, T5 kills one
+  node's unit under load, and is recorded as T5-partial; the full host
+  kill re-runs when more machines exist. (2026-10-26)

@@ -1334,3 +1334,478 @@ a race in the test as 7.2 left it, 2 runs in 5 on `4e7b4982`: the venue
 ends the space inside the leader's offer, and the test read the leader's
 alerts before the offer's answer raised `Evidence`. The test now waits for
 the alert (`d524aef3`); 8 runs in 8 passed.
+
+## Step 7.5: the load model and its drivers
+
+From vos-core `e5389045`, in two commits and this entry.
+
+**S35, recorded** (`owner-decisions.md`): one machine besides the
+desktop, `compumax`, holds the runs' three nodes, each its own unit, cap,
+cores and data directory; the drivers and the coordinator run on the
+desktop. §7.6 and the targets now say so: run 2's knee is one host's, not
+T2's; T2 and the rerun without the slowest host are recorded as not
+measurable until more machines exist. S35 does not name T5: run 5 kills
+one of compumax's nodes, not a host, and whether that stands for T5 is
+left to the owner (§7.6, the T5 row). `check` already admitted this
+layout; a test now pins it (three nodes on one machine with their caps
+summed against its memory; the drivers and the coordinator on a machine
+with no node), and nodes sharing a data disk need its free space each.
+`inventory.example.toml` is that layout.
+
+**Built:**
+- **The shard actor** (`agent/test-actors/shard`): accounts in a
+  `CommittedMap` (an absent one holds `2^40`), `transfer` here or by a
+  `credit` message to the payee's shard, `balance`, the workflow `tally`,
+  `holds_at_cut` (`attest_at_cut` over the payer's row), and the identity
+  rows (`fill_identities`, a thousand a call; `set_identity`). A testkit
+  test covers it.
+- **`agents`:** `K` shards and `I` idle agents by weight, the shard actor
+  in each; `--identity-rows U` creates the stand-in identity agent on every
+  node and writes its rows from eight clients. `deploy` founds the space at
+  an origin it records, so drivers know each window's close `B_w + D`.
+- **The model** (`tools/scale/src/load.rs`): users are keys from the seed
+  and index, accounts by hash onto the shards; offered load `U·a·r`
+  (`--users`, `--active`, `--per-user` or `--rate`); Poisson arrivals; the
+  mix (`--mix`, default 80% transfers, 15% queries, 4.5% workflows, 0.5%
+  reads at a cut); the cross-shard share `x` (`--cross`, random payees'
+  `1 − 1/K` by default); Zipf(1.0) by rejection-inversion, ranks spread over
+  the users by a stride coprime to `U`. Drivers split the users by index
+  and the rate evenly; the first writes the identity agent 10 times a
+  second, from 16 writer keys in turn.
+- **The drivers** (`engine.rs`, `drive-local`): a planning thread draws and
+  signs each operation up to 500 ms ahead; one sending thread (a smol
+  executor) sends it at its time, single attempts (`call_at`'s semantics:
+  no retry, no redirect followed; a `NotLeader` updates the leader hint),
+  over at most 512 kept connections a node (64 opened before the load),
+  calls to the shard's leader (read from the nodes before the load) and
+  queries to a follower. A user's calls go one at a time in its session,
+  in order; one refused before it ran gives its sequence to the next, one
+  of unknown fate starts a new session. Workflows are read until they end;
+  a read at a cut is read once for its window, then again from its close
+  and timed from it (`cut_read`, against T4's 10 s). Every 10 s a line a
+  kind (sent, answered, refusals by name, rate, p50/p99/p99.9, the late
+  sends, the calls queued behind their user's), a total a kind at the end,
+  and the mix as sent against its target, the driver's CPU over the load
+  (`load_cores`) and by thread. The report sets each kind apart, the model
+  beside it, and "not modeled" as before.
+- **The capacity probe** (`"probe": true` in a plan given to `drive-local`
+  by hand): every request to a node that does not replicate its agent,
+  answered `Elsewhere` at once, before any signature check. The driver does
+  all its work and the nodes almost none.
+
+**What the driver needed to reach the rate** [measured, this desktop]:
+signing is the planning thread's whole cost (curve25519 about 55% of the
+driver's samples), and three costs of the sending thread went:
+- a timer a request (600,000 pending at 20,000 a second for a 30 s
+  bound): now a reaper every second shuts a late request's socket. The
+  sending thread's CPU fell by about a third and its periodic stalls went;
+- naming a refusal by formatting the whole answer (`Elsewhere` prints its
+  contacts): 21% of the samples in `memcpy` under `Debug`; now by variant;
+- a 16 KiB read buffer on each request's future, copied at each spawn.
+Sessions are now timed from their first call: users keyed before the load
+and first called a minute later were refused `StaleSession`.
+
+**The gate** [measured, this desktop: Core Ultra 7 155H, governor
+`powersave` (EPP `balance_performance`), load average 5–12 from other
+agents' builds through every run; the driver pinned to cpus 1–2, one
+P-core's two threads; four nodes on the other cores]:
+- **The nodes cannot commit 20,000 calls a second here.** At 5,000 a
+  second (K = 64, `x` = 98%) they fell behind (p50 12 s; refine and dry
+  runs queued ~100 ms for executors each busy about 0.79 of a core, on a
+  starved host: 92% busy, a third of it other agents' niced builds, its
+  cores at 17% of their top clock, 0.6–0.9 GHz; the figures over the load
+  alone, per the review's H1, where the first report's window took in the
+  drain and showed the executors 28% busy); at 20,000 offered they answered about 10,000
+  and lost leaders (92 elections), and the driver, its users' calls
+  queueing behind unanswered ones, fell 60 s behind
+  (`20261025T172227Z-s75-20k-a`, `…182820Z-s75-20k-b`).
+- **The driver at 20,000 a second, by the probe** (60 s, `U = 4·10^5`,
+  `a` = 5%, `r` = 1, K = 64, the default mix; three runs of the final
+  binary, their records kept out of the repository): 1,199,155 sent and
+  answered, 20,009 a second offered; **the mix within 0.06 points** of its
+  target (worst: queries, 14.94% against 15%; transfers 80.04%, workflows
+  4.51%, reads at a cut 0.50%, the cross share 98.44% against 98.44%); **0.62 and 0.77
+  cores** of the pair over the load, the sending thread 0.22–0.26 and
+  the planner the rest; 1.0% and 0.9% of sends more than 10 ms late, at
+  worst 47–60 ms, all in the one or two intervals where the answers
+  stalled about a second (answer p99 1 s, from 64 µs otherwise), none in
+  the others. A third run, during another agent's burst (load 10, the
+  cores at 0.4 GHz), went 1.32 cores and 16% late. Earlier runs before the
+  last fixes: 0.80–1.21 cores, 0.7–1.8% late.
+- **The full stack at a rate the nodes keep** (3,000 a second, 120 s,
+  the same model, `20261025T192411Z-s75-full-3k-b`): 359,964 answered, no
+  error, p50 164 ms, p99 655 ms; 0.01% of sends late; 0.27 cores; the
+  mix within 0.05 points; every read at a cut served, 1.8 s past its
+  window's close at most; the identity agent written 10 a second.
+- **Verdict:** the driver sustains 20,000 calls a second on one core
+  pair, its mix within 0.06 points, at about two thirds of the pair's
+  CPU, against the nodes' cheapest answer; its schedule held within the
+  M1 bound (1% of sends more than 10 ms late) in two runs of three, at it
+  in one, the misses at node-side stalls. What the probe leaves out: the
+  nodes' commits, and the reads of workflows and cuts (5% of operations,
+  a signature and a request each more). It was not shown end to end:
+  the localhost nodes commit about 5,000 a second here.
+
+**Gates:** `just check` green (110 suites), on the first commit and again
+on the last.
+
+**Left for 7.6:**
+- compumax reachable by ssh with the owner's key touched once
+  (`ControlMaster`, README), lingering on, three directories of the
+  harness's own on its data disk, its LAN address and its cores split in
+  three; the desktop's wired address for the driver's entry
+  (`inventory.example.toml`).
+- Both machines on the `performance` governor, and the desktop quiet: at
+  `powersave` under other agents' load the driver's cores ran at 0.4–2 GHz,
+  and its cost per call varied threefold with them.
+- The node's throughput is the first thing the runs will meet: at 5,000
+  a second (T1's rate) four nodes on this starved desktop fell behind,
+  their executors saturated. The review's node findings (below) name why
+  T1's p99 is out of reach as built; the levers are scheduled after 7.6's
+  first real run.
+
+**What the plan left open, and how it was read:**
+- "A share `a` active, each at `r`" and "users drawn Zipf(1.0)" cannot
+  both hold per call: Zipf per call gives the hottest of 10^5 users 8% of
+  all calls, a rate no session serves one call at a time. The model draws
+  *who becomes active* Zipf and keeps `r` per active user, with a mean
+  active span (`--active-s`, 300 s) the plan does not give.
+- The mix's shares are not in the plan; the defaults above are the
+  harness's, every report states them.
+- "Within 1% of its target" is read as each share within one percentage
+  point; every run's worst was 0.06.
+- One core pair is read as two logical CPUs, here one physical core's two
+  threads: the strictest reading on this desktop.
+
+### The review's fixes
+
+The Opus review said fix, then merge. Folded as further commits; the
+owner's S36 recorded.
+
+**S36:** with all three nodes on compumax, T5 kills one node's unit under
+load: T5-partial, the host kill re-run when more machines exist
+(`owner-decisions.md`, §7.6's run 5, the T5 row).
+
+**High:**
+- **H1, the report's window:** each driver's total now carries its load's
+  span, first send to last (`load_from_ms`, `load_to_ms`), and the report's
+  window is that span past the ramp: the drain, when the last answers and
+  the reads at a cut come in, is left out. A test pins it. The 5,000-a-
+  second run re-reported over its load alone changed the account above:
+  the executors were saturated on a starved host, not 28% busy.
+- **H2, routes:** a call goes to its agent's leader as last learned and a
+  query to a follower up; a node that gives no answer, `Unavailable` or a
+  `NotLeader` naming no leader is left out for 2 s and the leader's place
+  moves to the next replica up; workflow and cut reads follow the same
+  routes. Tests: the routes (a dead leader, a dead follower, the backoff's
+  end) and the pool against a closed port (fails at once, holds no place).
+- **H3, timing:** an operation is timed from its schedule, or from its
+  send when it went early (`min`, not `max`, which had timed a late send
+  from its send and hidden the lateness).
+
+**Medium:**
+- **M1:** every interval and total line counts the requests that waited
+  for a connection (with the wait's p99) and the most in use at once; the
+  report warns when the pool bound. The cap is `[harness]
+  driver_connections` (512), and `drive` refuses when the drivers' caps
+  together pass the nodes' `ingress_connections`. Several drivers on one
+  machine (each its own entry, directory and cores) work, with a test.
+- **M2:** the probe refuses to run when an agent is on every node, and
+  writes no identity rows. The signatures the sending thread makes (calls
+  signed again for their turn, the reads of workflows and cuts) are
+  counted by kind (`signed_sending`): in the verification run, one per
+  workflow, about six per read at a cut, one transfer in 2,000.
+- **M3:** `--readers`, a share of all the agents (the shards and the idle
+  ones) each reading once at a cut a window at a uniform time within it
+  (`reader`, `reader_read`), the idle agents' identities read at the start
+  sixteen at a time; a test of the windows. Reads at a cut wait a jitter of
+  up to 0.5 s after the close, then read every 0.5 s: their latency is
+  resolved to about a second, not two.
+- **M4:** each driver counts each shard's distinct users and the sessions
+  opened at it, and the report gives the totals and the busiest shard's.
+  The report, the README and this entry state the mix's defaults as the
+  harness's own, pending the owner.
+
+**Low:** L1, the last interval's rate over its real seconds; L2, `cpu_s` a
+delta each interval and `load_cores` over the send span; L3, sessions
+unused for 55 minutes dropped; L4, the sampler reads involuntary switches
+and the report gives preemptions a second; L5, tests of the pool's
+accounting (a cap of two, six requests: two opened, four waited) and of a
+session's turns (`NeverRan`, `Renew`); L6, T6 judges RSS once the
+accounts stop growing (§7.6, the T6 row); L7, timeouts on the wait for a
+connection and on `connect`. The engine is now four modules (`engine/`:
+the sending thread, the pool, the sessions, the counts).
+
+**The node findings (Q3)**, recorded here and as a T1 risk in the plan:
+- one FIFO executor queue takes all work: signature checks, refine and
+  the dry run as two hops, accumulates, queries and root builds;
+- the single `vos-node` runtime thread also reads the store synchronously
+  each batch (81–85% of a core in the verification run below);
+- a group has one batch in flight (commit p50 41–49 ms plus apply
+  25–29 ms in these runs), so T1's 50 ms p99 is out of reach without
+  pipelining.
+The review's levers, in order, scheduled after 7.6's first real run: refine
+and dry run in one executor job; a priority lane for the batch path; batch
+signature verification; the per-batch reads off the runtime thread;
+runtime threads sharded by group; batch pipelining. Added now: the node's
+`root_build_queue` and `root_build` stages (a root build's batch waiting
+for an executor, and its run), and the report gives them with the refine
+and dry-run queues.
+
+**The verification run** [measured, `20261025T231824Z-s75-verify`, this
+desktop, load average 9–13]: four nodes (executors 3), K = 64, 100 idle
+agents, the identity agent, `U = 4·10^5` at 2,000 calls a second, readers
+5%, 180 s; node n4's unit stopped 30 s into the load.
+- **H1:** the window is the load past its 10 s ramp (170 s), the drain's
+  lines out.
+- **H2:** n4's loss cost 67 queries refused at its port, 397 calls
+  answered `NotLeader` while its groups re-elected, and 41 broken
+  connections; the interval it fell in had p99 1.3 s, and the next ones
+  were back to 0.26 s. Reads followed the routes after this run only
+  (50 reads at a cut had gone to n4 and been refused).
+- **H3:** 0.01% of sends past 10 ms, at worst 12.6 ms.
+- 358,692 answered of 359,197; the mix within 0.09 points; 12 reads by the
+  readers' share, all served, 3.1 s past their window's close at the
+  median; 29,558 users and 29,590 sessions over the 64 shards, 515 at the
+  busiest.
+- From about 100 s the three nodes left fell behind (their runtime
+  threads 81–85% of a core, preemptions 1,700–2,600 a second from the
+  host's other work), the pool bound (512 in use) and p99 rose to 16 s:
+  the warning fired as it should.
+
+**Two failures `just check` met on the loaded host (load average up to
+34), both fixed:** `tree_crash` saw no round killed between a build's
+batches (its kills land at random; it now runs up to three sets of twelve
+rounds until one does); and anchoring's dissent test read the leader's
+alerts the moment the space ended, while the leader raises the evidence
+alert just after the venue takes it (it now waits for the alert). Neither
+was this step's change.
+
+**Gates after the fixes:** `just check` green (110 suites); `vos-scale`'s
+42 tests.
+
+## Step 7.3: reads, reports and the worker's edges
+
+C9, C10 and C11 (pin D′), the prover worker's carried edges (slice 6's
+M3, M4, L6 (a)–(f)) and item 68 (S30), from vos-core `61c0950e`, in
+seven commits.
+
+**No re-cuts (C9):** a read is served at the cut of the window it was
+asked in, once the representative's `Closed` of that window applies, or
+ends `NotClosed` at `B_{w+2}`; the caller asks again. `keys::moved`,
+`RECUTS` and the chain of serving windows (`serving_windows` in
+`vos-wire`, the node's `serving_windows`/`served_at`, refine's and the
+testkit's walk) go; `READ_WINDOWS` and `CUT_KEEP` fall to 2; a request has
+one cut proof.
+
+**Cuts and reports only where a read waits (C10):** apply records a cut
+only for the window of the agent's batch-time mark when a read waits on
+it (`keys::reading`, written by the ask, and at the representative by a
+stored report), or for every window crossed when the agent reports every
+window (`Admin::ReportEveryWindow`, `keys::every_window`,
+`Node::report_every_window`: the issuers' opt-in). What it waits on is
+read before the result's steps, so a read or report a result makes never
+cuts a window that result crosses. The leader's marker follows the same
+rule, so an idle agent no read waits on gets none. Every report asks for
+its path: `AgentRoot`'s and `Input::Report`'s `pending` go, and the
+representative's `asked` table indexes every report. The prune of cut and
+close rows runs from the latest recording's windows (`keys::cut_mark`, its
+first and last, which replaces `serving`), a bounded range however sparse
+the cuts; a `Closed` is taken only for a window the agent cut. The
+representative needs no opt-in: its reports drive its cuts.
+
+**No anchor for an unreported window (C11):** the representative's close
+writes its closing and anchor rows only when some agent's row reaches its
+cut.
+
+**Item 68 (S30):** a row of a window's close that does not decode (the
+report and close marks, a held `Closed`, the representative's last report
+of a sender, its reading window) is moved aside under `keys::quarantined`
+with its bytes, read as absent, and the step goes on; every replica's
+apply logs it at error level. The representative's store of a report no
+longer drops it silently on any such row.
+
+**The worker's records are the agent's state (M3):** every replica's
+apply keeps each attest at a cut as a node-local record
+(`keys::attested(window, digest)`, the same bytes on every replica,
+carried by snapshots), keeps it without its witness once the statement's
+`Proven` applies (`Input::Proven` and `InputRef::Proven` name it), and
+drops it once its window's roots age past `MaxRootAge`. The worker reads
+its jobs from these records, from the earliest window a new one may still
+come of, instead of the log: no watermark, no lost records, and a replica
+that installs a snapshot and then leads holds every statement still to
+prove, and every proved one still to submit.
+
+**M4:** `prune` makes any aged unfinished job dead (its proof unheld)
+and removes an aged finished one, whatever its agent's placement; each
+unfinished job's kernel is held under `NODE_AGENT`, fetched from the
+replicas when absent; a record whose kernel is absent waits for it, with
+a warning, the step proving another job meanwhile (the review's M1).
+
+**L6:** (a) compaction no longer waits on the prover: `PROVER_HOLD`, the
+`proving` flag and the prover's mark go with the log scan (`NodeRow` 0x12
+reserved); (b) the node marks its prover's table stopping before it waits
+for a proof under way (`NodeRow::ProverStopping`), and an attempt ended
+then is not counted against the statement; (c) a proof is written
+`Proved` before it is pinned, so an opening re-holds it; (d) a venue's
+failures to judge a statement are counted in its job (`Job::resubmits`),
+across restarts; (e) a node that ends a proof no longer leading the agent
+sends it to the leader (`PeerMessage::Proved`), which records it;
+(f) `core-model.md` states the stall bound as the code measures it.
+
+**Tests:** testkit: a read served at its own window alone; `NotClosed`
+when the close misses it; only a window a read waits on is cut; a jump
+past `MAX_CUTS` cutting nothing; the prune over sparse cuts; a `Closed` of
+an uncut window refused; the representative's reading window; a row that
+does not decode quarantined, the model agreeing; both hosts cutting every
+window of an agent that reports every one (JAM's witness reading the
+opt-in). Node: an idle agent appends no marker, a reading one one; an
+agent misses the close, `NotClosed`; only a reported window anchored (two
+idle windows nothing, an issuer's every window, a read's window); the
+clock-jump cuts of an issuer; the cut model with the opt-in; a snapshot-
+installed replica holding a queued statement's job and proving it once
+after the leader stops (`a_snapshot_installed_replica_proves_a_queued_statement`,
+M3); a record proved past compaction; a recorded statement's record kept
+without its witness. Worker: jobs aging out, a rootless record refused;
+a kernel held, and one fetched late proved; a stop mid-proof counted only when the node was not stopping;
+resubmissions counted across restarts. The anchoring and Kreivo cluster
+suites gain an issuer (C11 would leave their windows unanchored) and step
+their clocks past each boundary before the close, so the reports land.
+
+**Lines** (`git diff --numstat 61c0950e`):
+
+| crate | added | removed |
+|---|---|---|
+| vos-node (src) | +381 | −350 |
+| vos-node (tests, bench) | +433 | −163 |
+| vos-node-prover (src) | +286 | −193 |
+| vos-node-prover (tests) | +234 | −87 |
+| vos-wire (src) | +201 | −103 |
+| vos-wire (tests) | +21 | −17 |
+| the default agent (refine) | +197 | −139 |
+| vos-testkit (src) | +147 | −127 |
+| vos-testkit (tests) | +204 | −136 |
+| vos-pvm-proof (tests) | +6 | −3 |
+| docs | +41 | −11 |
+
+By commit, the sources (node, prover, wire, agent, testkit): C9 +103
+−235; C10/C11 +256 −152; item 68 +260 −174; the worker +624 −380.
+
+**Unchanged:** the kernel program ids (`the_program_ids_are_the_repositorys`
+passes). The agent image changes (refine, apply and `vos-wire`).
+
+**Gates** [measured]:
+- `just check` green (its second run; the first failed `fmt-check` on
+  `agent/default`, outside the workspace, fixed by `9ff16e89`).
+- The checker loop, `EXACTLY_ONCE_SEED` 7311–7314 with `CUTS_FULL`, the
+  three exactly-once tests and `cuts`: green, 114–190 s a seed at load
+  14–21; 10, 20, 17 and 13 anchors, one a window, every one the replicas'
+  row, no evidence; of 161–325 reads an agent, 10–27% ended `NotClosed`
+  (the run's stops, partitions and clock jumps; none unserved).
+- The cut's bench (`cargo bench -p vos-node --bench cuts`), against slice
+  6's 5.06 µs and 373 ms, and beside vos-core `61c0950e` built apart, run
+  alternately: at load 1.8–2.0, a write with a cut pending 5.34 and
+  5.05 µs (base 5.21 and 5.15), a cut's build with 100 proofs 381 and
+  369 ms (base 384 and 385): within 10%. Under the other agents' load
+  (7–21) both builds spread 4.9–30 µs and 557–1,285 ms alike.
+- `just e2e-chain` green first time, 1,227 s: the same verdicts; latency
+  76.3 s at Kreivo and 61.6–121.7 s at JAM, each under its gate; one
+  Kreivo anchor, 3.5 UNITS charged (7.2: 5 anchors, 7.5 UNITS): only the
+  windows reads waited on are anchored; the audit clean over 443 carriers.
+
+**Where the plan was off:**
+- **C10's "the `asked` table goes":** the representative's roots map is
+  keyed agent first, by the kernel's prologue (its key fixed with the
+  kernel ids), so the close needs the per-window index the `asked` table
+  is; it stays, every report an ask. The `pending` flag goes.
+- **The opt-in is an admin command, not an `#[agent]` attribute:** an
+  actor schema flag would change every actor's ELF and the kernel ids; the
+  representative needs none (its reports drive its cuts).
+- **The cut rule needs a replicated "a read waits" row:** apply reads
+  points, not prefixes (JAM's witness), so `keys::reading` and
+  `keys::every_window` are new rows, and the prune needs the last
+  recording's window range (`cut_mark`) once cuts are sparse.
+- **M3's marker holds the attest:** an "attested, unproven" marker alone
+  would tell a new leader what it lacks, not give it the witness. The
+  records keep the attest (its witness until proved), node-local but the
+  same on every replica and in snapshots; they must outlive the proof to
+  submit (a new leader holds a proved statement's record too), so they go
+  with `MaxRootAge`, and a proved one keeps no witness. This replaces the
+  worker's log scan, and with it L6 (a)'s compaction hold.
+- **The node-side lines:** vos-node's source is +31 net, not the −1,000
+  to −1,400 `simplify.md` §4 counts for C1–C11: C9 removed 132 net, C10
+  and C11 added about 100 (the reading and opt-in rows, the cut mark, the
+  marker rule), and the worker's edges grew it (the records, the kernel
+  holds, the forwarded proof). The estimate counted the removals alone.
+- **The cluster suites' clocks:** with C11 a window anchors only when a
+  report lands before the close, so the suites that jumped every clock
+  past a close in one step now step past the boundary first.
+- **The cut bench** needed its agent to report every window, or its
+  first crossing cuts nothing.
+- Found, not fixed: the cut bench's process sometimes waits for good after
+  printing (its store's release thread), on vos-core as here; killed by
+  PID.
+
+### 7.3: the review's fixes
+
+Fable's review (`research/slice-7/7.3-fable.md`, fix-then-merge), folded
+in six commits on `142554d4`: +592 −248 over 29 files.
+
+- **M1, a kernel late past the patience:** a record whose kernel the node
+  lacks waits for it, with one warning, and is proved under the right
+  program id once it arrives; nothing is refused for patience and a lost
+  kernel is never cached (`NO_PROGRAM` and `missing` go). The read
+  records fold into the job table plus a window watermark (`read` and
+  `unread` go), the proof asks and lost fetches into one map (`asked` and
+  `unfetched` go); a rootless record is a refused job
+  (`REFUSED_ROOTLESS`), so the table alone dedups. `1cb4c489`.
+- **L1, the asks at the cut:** the representative's `asked` is a
+  committed map, and a close reads the window's asks as the cut held
+  them (the live rows and the cut's undo rows), so a replica that builds
+  the cut late writes the same close and anchor row. A `Hooks::build`
+  holds a replica's builds for the test. `2d8e529b`.
+- **L2, Proven with the proof held:** `prove()` refuses a witness-less
+  record with its own code (`REFUSED_UNWITNESSED`); a replica records a
+  peer's `Proved` once it holds the blob, fetching it otherwise, and the
+  leader proposes `Proven` only for a proof it holds. `1cb4c489`.
+- **L3:** the ask writes `reading` only when it is below the window, as
+  the representative's stored report does. `69191b6c`.
+- **L4, the cut rule once:** `vos_wire::apply::Waits::cuts`, used by
+  apply, the leader's marker (`cut_due`) and the cut model. `a7f7372f`.
+- **L5:** documented (the `Admin::ReportEveryWindow` docs and
+  `operations.md`): the issuer must be an agent other than the
+  representative, whose own cuts carry no report of it. `c55fac89`.
+- **L6:** `vos agent reports --agent A --every true|false`, over a new
+  admin route (`POST /agents/{id}/reports`, `Operator::report_every_window`);
+  `operations.md` points at it. `c55fac89`.
+- **Info, pins and prune:** at open the worker drops the node's own pins
+  that no job wants (`Host::held`, `Blobs::held_by_node`), so a crash leaks
+  none; `prune` ages every job by its deadline (a rootless one by its
+  window's) and no longer removes an absent agent's jobs, which its
+  records would make again. `1cb4c489`, `18a71a31`.
+
+**Tests:** worker: a kernel fetched late proved under its id
+(`a_kernel_is_held_and_one_fetched_late_proves`), a witness-less record
+refused (`a_witnessless_record_is_refused_for_it`), jobs outlasting their
+agent's absence; testkit: `a_read_never_moves_the_reading_window_back`;
+cluster: `a_late_build_closes_the_asks_its_cut_holds` (it fails with the
+close reading the live asks alone: no anchor row of window 0); ingress:
+`the_operator_sets_an_agent_to_report_every_window`.
+
+**Unchanged:** the kernel program ids (`the_program_ids_are_the_repositorys`
+passes). The representative's image changes (`asked` a committed map),
+and the default agent's (L3).
+
+**Gates** [measured]:
+- `just check` green.
+- The checker loop, seeds 7315 and 7316 with `CUTS_FULL`: green, 138 and
+  112 s at load 25–35; 8 and 12 anchors, one a window, no evidence.
+- `just e2e-chain`: the first run failed its latency gate at load 27–34,
+  JAM's window-1 balance statement 253.4 s against 233.3 s (102.5 s of it
+  after its proof, the testnet's blocks); the second, at load 19–31,
+  green in 1,665 s: Kreivo 89.9 s, JAM 145.0–210.9 s, the tightest 0.8 s
+  under its gate; one Kreivo anchor, 3.5 UNITS charged; the audit clean
+  over 443 carriers.
+- Found, not fixed: `liveness::idle_groups_send_nothing_but_the_pair_heartbeat`
+  failed once in the whole cluster suite at load 16 (every group's term
+  moved by one), and passed three times alone.

@@ -5,12 +5,15 @@
 #
 #   target/x86_64-unknown-linux-musl/release/vos-scale \
 #     -i tools/scale/inventory.localhost.toml run \
-#     --agents 4 --representative --users 40 --rate 20 --secs 30
+#     --shards 4 --identity --representative --users 10000 --rate 200 --secs 30
 #
 # and again without a node, compared with the first:
 #
-#   ... --exclude n4 run --agents 4 --users 40 --rate 20 --secs 30
+#   ... --exclude n4 run --shards 4 --users 10000 --rate 200 --secs 30
 #   ... report --compare <the first run>
+#
+# The cores: the driver on one core pair (cpus 1 and 2, one P-core's two
+# threads on the owner's desktop), the nodes on others.
 
 [harness]
 runs = "/var/tmp/vos-scale/runs"
@@ -29,7 +32,7 @@ ssh = "localhost"
 address = "127.0.0.1"
 role = "node"
 dir = "/var/tmp/vos-scale/n1"
-cores = "0-3"
+cores = "3,4,6,7"
 ingress = 7911
 peer = 7921
 
@@ -39,7 +42,7 @@ ssh = "localhost"
 address = "127.0.0.1"
 role = "node"
 dir = "/var/tmp/vos-scale/n2"
-cores = "4-7"
+cores = "8-11"
 ingress = 7912
 peer = 7922
 
@@ -48,9 +51,8 @@ name = "n3"
 ssh = "localhost"
 address = "127.0.0.1"
 role = "node"
-weight = 2
 dir = "/var/tmp/vos-scale/n3"
-cores = "8-11"
+cores = "12-15"
 ingress = 7913
 peer = 7923
 
@@ -70,4 +72,4 @@ ssh = "localhost"
 address = "127.0.0.1"
 role = "driver"
 dir = "/var/tmp/vos-scale/d1"
-cores = "20-21"
+cores = "1-2"

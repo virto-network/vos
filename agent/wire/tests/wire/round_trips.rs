@@ -143,8 +143,10 @@ proptest! {
             keys::cut_proof(request, sequence),
             keys::reported(),
             keys::closed(sequence),
-            keys::moved(sequence),
-            keys::serving(),
+            keys::cut_mark(),
+            keys::reading(),
+            keys::every_window(),
+            keys::quarantined(&keys::reports(AgentId(agent))),
             keys::close_mark(),
             keys::closing(sequence),
             keys::proven(sequence, &[agent as u8; 32]),
@@ -174,7 +176,9 @@ proptest! {
             keys::next_workflow(),
             keys::live_workflows(),
             keys::reported(),
-            keys::serving(),
+            keys::cut_mark(),
+            keys::reading(),
+            keys::every_window(),
             keys::close_mark(),
         ];
         for (a, b, transform, key, number, member, triple, level) in parts {
@@ -217,7 +221,6 @@ proptest! {
                 keys::cut_root(number),
                 keys::cut_proof(RequestId { workflow: WorkflowId(number), awaits: u64::from(a) }, u64::from(b)),
                 keys::closed(number),
-                keys::moved(number),
                 keys::closing(number),
                 keys::proven(number, &triple.key),
             ]);

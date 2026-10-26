@@ -89,14 +89,9 @@ pub(crate) fn body() -> impl Strategy<Value = Body> {
             workflow: WorkflowId(workflow),
             awaiting,
         }),
-        (any::<u8>(), any::<u64>(), any::<[u8; 32]>(), any::<bool>()).prop_map(
-            |(kind, window, root, pending)| Body::Report(vos_wire::served::AgentRoot {
-                kind,
-                window,
-                root,
-                pending,
-            })
-        ),
+        (any::<u8>(), any::<u64>(), any::<[u8; 32]>()).prop_map(|(kind, window, root)| {
+            Body::Report(vos_wire::served::AgentRoot { kind, window, root })
+        }),
     ]
 }
 
@@ -184,6 +179,7 @@ pub(crate) fn input() -> impl Strategy<Value = Input> {
             ),
         (principal(), any::<Option<u8>>())
             .prop_map(|(principal, role)| Input::Admin(Admin::SetRole(Grant { principal, role }))),
+        any::<bool>().prop_map(|every| Input::Admin(Admin::ReportEveryWindow(every))),
         prop::collection::vec((any::<u64>(), due()), 0..4).prop_map(|due| Input::Sweep { due }),
         (any::<u64>(), any::<(u64, u64)>(), prop::option::of(bytes())).prop_map(
             |(window, (workflow, awaits), served)| Input::Resume {

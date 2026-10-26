@@ -863,9 +863,10 @@ node-level log, keyed by (agent, index):
   agent (open question 3);
 - storage I/O never runs on executor threads;
 - writes that only move the commit index are not fsynced;
-- **a stalled writer hands over leadership** [decided]: a sync held past
-  the stall bound (`Config::writer_stall`, by default the election
-  timeout's upper end, 3 s at the defaults) marks the writer stalled, and
+- **a stalled writer hands over leadership** [decided]: a commit waiting
+  past the stall bound (`Config::writer_stall`, by default the election
+  timeout's upper end, 3 s at the defaults), its queueing behind other
+  commits counted with its sync, marks the writer stalled, and
   the node stops leading the groups it leads, which elect elsewhere. A
   slow sync so costs leadership no sooner than a crash would be detected.
 

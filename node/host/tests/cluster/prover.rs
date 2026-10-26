@@ -4,7 +4,9 @@
 //! root is anchored; a leader stopped after recording its proof and before
 //! submitting it leaves a new leader that proves it again, the proof gone
 //! with the old, and the venue holds it accepted once; a record applied
-//! during a proof, its log compacting every few entries, is proved.
+//! during a proof, its log compacted past it, is proved; and a replica that
+//! installs a snapshot past a queued statement's record holds its job, and
+//! proves it once it leads.
 //!
 //! The proofs are a model prover's (the masked prover proves in minutes,
 //! `just test-proof`'s), so the venue judges anchors as the model venue
@@ -27,7 +29,7 @@ use vos_wire::{Decode, keys};
 use crate::common::{Cluster, log_start, wait_until};
 use crate::support::past_close;
 use crate::support::{Anchoring, Judging, attests, ended, holds, replica};
-use crate::support::{ask_in, call, clock, reader_agent, write, writes};
+use crate::support::{ask_in, call, clock, later, reader_agent, write, writes};
 
 /// The model prover's program id for every kernel.
 const PROGRAM: ProgramId = ProgramId([7; 8]);
@@ -51,6 +53,27 @@ impl Prover for Proofs {
         }
         let made = self.made.fetch_add(1, Ordering::SeqCst);
         Ok([b"proof".as_slice(), &attest.output, &made.to_le_bytes()].concat())
+    }
+}
+
+/// [`Proofs`] on node `node`, which fails every proof while it is the
+/// node `failing` names.
+struct NodeProofs {
+    proofs: Arc<Proofs>,
+    node: NodeNumber,
+    failing: Arc<AtomicUsize>,
+}
+
+impl Prover for NodeProofs {
+    fn program(&self, kernel: &[u8]) -> Result<ProgramId, ProveError> {
+        self.proofs.program(kernel)
+    }
+
+    fn prove(&self, kernel: &[u8], attest: &Attest) -> Result<Vec<u8>, ProveError> {
+        if self.failing.load(Ordering::SeqCst) == usize::from(self.node) {
+            return Err(ProveError::Failed("this node's prover fails"));
+        }
+        self.proofs.prove(kernel, attest)
     }
 }
 
@@ -140,17 +163,6 @@ fn read_at(
     let attests = attests(replica(cluster, agent), agent, read);
     assert_eq!(attests.len(), 1);
     attests[0].clone()
-}
-
-/// A session opened at `agent`'s leader's time now: the clocks have moved
-/// past the cluster's session's expiry.
-fn later(cluster: &Cluster, agent: AgentId) -> Session {
-    let t0 = cluster.clock(cluster.leader(agent));
-    Session {
-        key: [1; 32],
-        name: t0.to_le_bytes().repeat(2).try_into().unwrap(),
-        t0,
-    }
 }
 
 /// Requests `sequences` of `session`, writing `agent`'s rows.
@@ -264,13 +276,21 @@ fn a_leader_change_submits_a_recorded_statement_once() {
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(judging.accepted.lock().unwrap().len(), 1, "accepted once");
     assert_eq!(proofs.made.load(Ordering::SeqCst), 2);
-    let backlog = cluster.node(new).prover_backlog().unwrap();
-    assert_eq!(backlog.lost, 0, "no record lost to compaction");
+    for (_, node) in cluster.running() {
+        let record = node
+            .store()
+            .snapshot()
+            .get(agent, &keys::attested(0, &attest.digest()))
+            .unwrap()
+            .and_then(|bytes| Attest::decode_exact(&bytes))
+            .expect("its record kept");
+        assert!(record.witness_input.is_empty(), "without its witness");
+    }
 }
 
-/// A record applied while the leader proves another stays in the log until
-/// the prover's scan reads it, however many entries follow, and is proved:
-/// the log compacts no further than the scan's mark while the proof runs.
+/// A record applied while the leader proves another is proved, however far
+/// the log is compacted past it: every replica holds it in the agent's
+/// state until its statement is recorded proved.
 #[test]
 fn a_record_applied_during_a_proof_is_proved() {
     let anchoring = Anchoring::new();
@@ -290,28 +310,22 @@ fn a_record_applied_during_a_proof_is_proved() {
                 Job::decode_exact(job).is_some_and(|job| job.state == State::Proving)
             })
     };
-    let mut prover = None;
     wait_until("a leader proves the first statement", || {
-        prover = cluster
-            .running()
-            .find(|(_, node)| proving(node))
-            .map(|(number, _)| number);
-        prover.is_some()
+        cluster.running().any(|(_, node)| proving(node))
     });
-    let node = cluster.node(prover.unwrap());
     let session = later(&cluster, agent);
     let second = read_at(&cluster, &anchoring, &agents, 1, (session, 1));
+    let index = replica(&cluster, agent).applied(agent).unwrap();
     write_in(&cluster, agent, later(&cluster, agent), 1..=60);
-    let mark = node.store().prover_mark(agent).unwrap();
-    let applied = node.applied(agent).unwrap();
-    assert!(
-        applied > mark + 40,
-        "the log runs past the mark: {mark}, {applied}"
-    );
-    assert!(
-        log_start(node, agent) <= mark,
-        "compacted to the mark at most"
-    );
+    cluster.compacted_past(agent, index);
+    for (_, node) in cluster.running() {
+        let held = node
+            .store()
+            .snapshot()
+            .get(agent, &keys::attested(1, &second.digest()))
+            .unwrap();
+        assert!(held.is_some(), "the second's record held");
+    }
     proofs.hold.store(false, Ordering::SeqCst);
     for attest in [&first, &second] {
         let id = statement(attest).id();
@@ -323,8 +337,74 @@ fn a_record_applied_during_a_proof_is_proved() {
     // venue holds each accepted once.
     assert!(proofs.made.load(Ordering::SeqCst) >= 2);
     assert_eq!(judging.accepted.lock().unwrap().len(), 2);
-    for (_, node) in cluster.running() {
-        let backlog = node.prover_backlog().unwrap();
-        assert_eq!(backlog.lost, 0, "no record lost to compaction");
-    }
+}
+
+/// A replica that installs a snapshot past a queued statement's record
+/// holds its job: the agent's leader's prover fails every proof, so the
+/// statement stays queued, while a follower, down when the read was
+/// served, comes back by a snapshot of the leader's compacted log. Its
+/// table holds the statement queued, from the records in the snapshot.
+/// Once the leader stops, the new leader proves it once, and the venue
+/// holds it accepted.
+#[test]
+fn a_snapshot_installed_replica_proves_a_queued_statement() {
+    let anchoring = Anchoring::new();
+    let judging = Arc::new(Judging::new(Arc::clone(&anchoring.venue), false));
+    let proofs = Arc::new(Proofs::default());
+    let failing = Arc::new(AtomicUsize::new(0));
+    let venue: Arc<dyn VenueClient> = judging.clone();
+    let (shared, failed) = (Arc::clone(&proofs), Arc::clone(&failing));
+    let mut cluster = Cluster::in_space(3, Some(clock()), move |node, config: &mut Config| {
+        config.venue = Some(Arc::clone(&venue));
+        config.prover = Some(Arc::new(NodeProofs {
+            proofs: Arc::clone(&shared),
+            node,
+            failing: Arc::clone(&failed),
+        }));
+        config.compact_every = 8;
+        config.compact_tail = 2;
+        config.snapshot_chunk = 64;
+    });
+    anchoring.register(&cluster);
+    let agents = Agents {
+        representative: cluster.representative(&[1, 2, 3]),
+        reader: reader_agent(&cluster, &[1, 2, 3]),
+    };
+    let agent = agents.reader;
+    write(&cluster, agent, 1..=20);
+    let (leader, follower) = cluster.leader_and_follower(agent);
+    failing.store(usize::from(leader), Ordering::SeqCst);
+    let stopped_at = cluster.node(follower).applied(agent).unwrap();
+    cluster.stop(follower);
+    let attest = read_at(
+        &cluster,
+        &anchoring,
+        &agents,
+        0,
+        (cluster.session(agent), 21),
+    );
+    let id = statement(&attest).id();
+    write_in(&cluster, agent, later(&cluster, agent), 1..=40);
+    cluster.compacted_past(agent, stopped_at + 30);
+    cluster.start(follower);
+    let back = cluster.node(follower);
+    wait_until("the follower installs a snapshot and holds the job", || {
+        log_start(back, agent) > stopped_at
+            && back
+                .store()
+                .prover_jobs()
+                .unwrap()
+                .iter()
+                .any(|(_, held, job)| {
+                    *held == id.0
+                        && Job::decode_exact(job).is_some_and(|job| job.state == State::Queued)
+                })
+    });
+    assert_eq!(proofs.made.load(Ordering::SeqCst), 0, "not proved yet");
+    cluster.stop(leader);
+    wait_until("the venue accepts the statement", || {
+        judging.accepted.lock().unwrap().contains(&id.0)
+    });
+    assert_eq!(proofs.made.load(Ordering::SeqCst), 1, "proved once");
+    assert_eq!(judging.accepted.lock().unwrap().len(), 1);
 }

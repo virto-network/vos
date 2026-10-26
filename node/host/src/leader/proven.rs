@@ -1,7 +1,9 @@
 //! Statements this node's prover proved, recorded in their agent: the
 //! leader proposes `Input::Proven` for each the worker handed over that
-//! the agent does not hold recorded, from its replica's state, never
-//! queued. Refine keeps the first proof of an id alone.
+//! the agent does not hold recorded, once this node holds its proof (one a
+//! replica sent is fetched from it), from its replica's state, never
+//! queued.
+//! Refine keeps the first proof of an id alone.
 
 use vos_wire::batch::Input;
 use vos_wire::keys;
@@ -25,7 +27,7 @@ impl Leader {
     /// recorded, at most [`PROVEN`]; those it holds are forgotten.
     pub(super) fn proofs(&self, snapshot: &Snapshot) -> Result<Vec<Pending>, Fault> {
         let mut due = Vec::new();
-        for (id, window, proof) in self.inner.unrecorded.of(self.id) {
+        for (id, (window, proof, attested)) in self.inner.unrecorded.of(self.id) {
             if snapshot
                 .get(self.id, &keys::proven(window, &id.0))?
                 .is_some()
@@ -33,11 +35,18 @@ impl Leader {
                 self.inner.unrecorded.recorded(self.id, &id);
                 continue;
             }
+            // Recorded only once this node holds the proof too: the record
+            // then keeps no witness, so a proof held by its prover alone
+            // could be lost for good.
+            if !self.inner.blobs.contains(&proof).unwrap_or(false) {
+                continue;
+            }
             if due.len() < PROVEN {
                 due.push(Pending::Duty(Input::Proven {
                     window,
                     id: id.0,
                     proof,
+                    attested,
                 }));
             }
         }

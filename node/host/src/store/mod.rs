@@ -330,15 +330,13 @@ impl Fjall {
             .map(|job| job.to_vec()))
     }
 
-    /// The last index of `agent`'s log the prover read into jobs: 0 for
-    /// none.
-    pub fn prover_mark(&self, agent: AgentId) -> Result<u64> {
-        let key = node_record(NodeRow::ProverMark, &agent.0.to_be_bytes());
+    /// Whether the node was stopping when it last ran, for its prover's
+    /// table.
+    pub fn prover_stopping(&self) -> Result<bool> {
         Ok(self
             .system()
-            .get(key)?
-            .and_then(|bytes| be_u64(&bytes))
-            .unwrap_or(0))
+            .get(node_record(NodeRow::ProverStopping, &[]))?
+            .is_some())
     }
 
     /// The node's last run, as its pair heartbeat numbered it.

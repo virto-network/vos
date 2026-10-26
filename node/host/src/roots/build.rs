@@ -3,6 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use vos_tree::{Blake2b, Child, Leaf, empty_root};
 use vos_wire::ids::AgentId;
@@ -313,6 +314,9 @@ impl Build {
     }
 }
 
+/// How long a build a test's hook holds waits before asking again.
+const HELD: Duration = Duration::from_millis(50);
+
 /// Build `shared`'s agent's root after its applies that leave dirty rows,
 /// until its group stops: one build at a time, each at the latest state
 /// version, so builds coalesce the applies made meanwhile. The batches run
@@ -336,6 +340,11 @@ pub(crate) async fn build(inner: Arc<Inner>, shared: Arc<Shared>) {
         }
         seen = Some(state.applied);
         if !inner.storage.take_dirtied(agent) && !std::mem::take(&mut due) {
+            continue;
+        }
+        if !inner.hooks.build(agent) {
+            crate::timeout(HELD, shared.wait(|state| state.stopped)).await;
+            due = true;
             continue;
         }
         match run(&inner, &shared).await {
@@ -369,13 +378,21 @@ async fn run(inner: &Inner, shared: &Shared) -> Result<(), Error> {
             build = build.representing(space, clock);
         }
         while !shared.state().stopped {
-            let (returned, change) = inner
+            let asked = Instant::now();
+            let stats = Arc::clone(&inner.stats);
+            let (returned, change, started) = inner
                 .offload(move || {
+                    let started = Instant::now();
                     let change = build.next_batch();
-                    (build, change)
+                    stats.root_build.took(started.elapsed());
+                    (build, change, started)
                 })
                 .await
                 .ok_or_else(|| Error::Halted("the executors stopped".into()))?;
+            inner
+                .stats
+                .root_build_queue
+                .took(started.saturating_duration_since(asked));
             build = returned;
             let Some(change) = change? else {
                 break;

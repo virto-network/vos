@@ -27,7 +27,7 @@ use vos_wire::vos_anchor::{Anchor, VenueId, WindowClock};
 
 use crate::common::{Cluster, wait_until};
 use crate::support::clock;
-use crate::support::{OffsetClock, closed_on, past_close};
+use crate::support::{OffsetClock, close_with, closed_on};
 
 const UNITS: u128 = 1_000_000_000_000;
 const VENUE: VenueId = VenueId([0x6b; 32]);
@@ -246,19 +246,22 @@ fn windows(calls: &[(Origin, Vec<u8>)]) -> Vec<u64> {
 }
 
 /// A space of three nodes anchoring at the mock, registered there, its
-/// representative on every node.
+/// representative on every node, and an agent on every node reporting
+/// every window.
 fn space() -> (Kreivo, Cluster, WindowClock, AgentId) {
     let clock = clock();
     let kreivo = Kreivo::new();
     let cluster = Cluster::in_space(3, Some(clock), kreivo.tuning());
     kreivo.register(&cluster);
     let representative = cluster.representative(&[1, 2, 3]);
+    cluster.issuer(&[1, 2, 3]);
     (kreivo, cluster, clock, representative)
 }
 
-/// Set the clocks past `window`'s close.
+/// Set the clocks past `window`'s boundary, then, once its report is in,
+/// past its close.
 fn close(kreivo: &Kreivo, cluster: &Cluster, clock: &WindowClock, window: u64) {
-    kreivo.set_clocks(cluster, past_close(clock, window));
+    close_with(cluster, clock, window, |at| kreivo.set_clocks(cluster, at));
 }
 
 /// Wait until the representative's replicas have closed `window`.

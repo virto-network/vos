@@ -190,6 +190,19 @@ pub enum AgentCommand {
         #[arg(long, value_delimiter = ',')]
         replicas: Vec<u8>,
     },
+    /// Have an agent cut its state and report its root to the space's
+    /// representative at every window (`--every true`), as an issuer's
+    /// agent does so that each window is anchored, or only at the windows
+    /// a read of it waits on (`--every false`, the default an agent starts
+    /// with).
+    Reports {
+        #[command(flatten)]
+        operator: OperatorArgs,
+        #[arg(long)]
+        agent: u32,
+        #[arg(long, action = clap::ArgAction::Set)]
+        every: bool,
+    },
     /// Replace one of an agent's replicas by another node, at its leader:
     /// the replicas are printed once the change committed.
     Replace {

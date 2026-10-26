@@ -331,3 +331,49 @@ fn a_kernel_may_not_make_host_calls() {
         }
     );
 }
+
+#[test]
+fn a_shard_moves_balances_here_or_by_a_credit_to_another_shard() {
+    const SHARD: InstanceId = InstanceId(1);
+    const OPENING: u64 = 1 << 40;
+    let mut kit = Testkit::new(AgentId(7));
+    let shard = actor("shard");
+    let holds = kernel("shard", "holds");
+    kit.install(SHARD, &shard, &[(method(&shard, "holds"), &holds)], &[])
+        .unwrap();
+    let (a, b) = ([1u8; 16], [2u8; 16]);
+    // Four arguments: encoded one after another, as a call's are.
+    let transfer = |kit: &mut Testkit, from: [u8; 16], to: [u8; 16], agent: u32, amount: u64| {
+        let method = kit.method(SHARD, "transfer").expect("a method");
+        let arguments = [from.encode(), to.encode(), agent.encode(), amount.encode()].concat();
+        kit.command(ALICE, SHARD, method, &arguments)
+    };
+
+    let here = transfer(&mut kit, a, b, 7, 5);
+    assert_eq!(reply::<u64>(here.outcome), OPENING - 5);
+    assert!(here.messages.is_empty());
+    assert_eq!(query::<_, u64>(&kit, SHARD, "balance", b), OPENING + 5);
+
+    let away = transfer(&mut kit, a, b, 9, 3);
+    assert_eq!(reply::<u64>(away.outcome), OPENING - 8);
+    assert_eq!(away.messages.len(), 1);
+    assert_eq!(away.messages[0].to, AgentId(9));
+    assert_eq!(query::<_, u64>(&kit, SHARD, "balance", b), OPENING + 5);
+
+    let credited = call(&mut kit, SHARD, "credit", (b, 3u64));
+    assert_eq!(reply::<u64>(credited.outcome), OPENING + 8);
+    let short = transfer(&mut kit, a, b, 7, OPENING);
+    assert!(matches!(short.outcome, Outcome::Failed { .. }));
+
+    let filled = call(&mut kit, SHARD, "fill_identities", (10u64, 1_000u32));
+    assert_eq!(reply::<u64>(filled.outcome), 1_010);
+    let row = query::<_, Option<[u8; 32]>>(&kit, SHARD, "identity", 1_009u64).unwrap();
+    assert_eq!(row[..8], 1_009u64.to_le_bytes());
+    let too_many = call(&mut kit, SHARD, "fill_identities", (0u64, 1_001u32));
+    assert!(matches!(too_many.outcome, Outcome::Failed { .. }));
+    call(&mut kit, SHARD, "set_identity", (1_009u64, [9u8; 32]));
+    assert_eq!(
+        query::<_, Option<[u8; 32]>>(&kit, SHARD, "identity", 1_009u64),
+        Some([9; 32])
+    );
+}

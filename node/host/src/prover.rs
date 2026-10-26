@@ -1,12 +1,14 @@
 //! The prover worker on a node (`vos_node_prover`): its thread, the node
-//! it reads (the logs of the agents it leads, their applied state, the
-//! blob store) and its table, the node's own rows.
+//! it reads (the agents' applied state, their records of the statements
+//! waiting to be proved among it, and the blob store) and its table, the
+//! node's own rows; and those records, which every replica's apply keeps
+//! ([`attested`]).
 //!
 //! A statement proved here reaches its agent through the agent's leader:
 //! the worker hands it over ([`Unrecorded`]) and wakes the leader, whose
 //! next batch proposes `Input::Proven` for each statement the agent has
-//! not recorded. The table and the watermarks are node-local, never
-//! replicated.
+//! not recorded; a node no longer leading it sends it to the leader
+//! (`PeerMessage::Proved`). The table is node-local, never replicated.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::Ordering;
@@ -14,18 +16,20 @@ use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use vos_node_prover::{Backlog, Host, Job, Jobs, Options, Prover, Worker};
+use vos_node_prover::{Backlog, Host, Job, Jobs, Options, Prover, Record, Worker};
 use vos_raft::Role;
 use vos_venue::vos_statement::StatementId;
 use vos_wire::ids::{AgentId, ProgramHash};
-use vos_wire::peer::PeerMessage;
-use vos_wire::result::{Attest, Step, WorkResult};
-use vos_wire::{Decode, Encode, WindowClock, keys};
+use vos_wire::peer::{NodeNumber, PeerMessage};
+use vos_wire::result::{Attest, InputRef, Step, WorkResult, Write};
+use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
+use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
 
 use crate::blobs::{Keep, blob_ref};
+use crate::fault::{Fault, read};
 use crate::lock;
 use crate::node::Inner;
-use crate::store::{EntryKind, Fjall, NODE_AGENT, PersistMode};
+use crate::store::{Fjall, NODE_AGENT, PersistMode, Snapshot};
 
 /// How long an idle worker waits before it looks again: for a new record,
 /// an anchor, or a proof another replica sends.
@@ -35,31 +39,27 @@ const IDLE: Duration = Duration::from_secs(1);
 const REPORT_EVERY: Duration = Duration::from_secs(60);
 
 /// The statements proved here that their agents have still to record: by
-/// agent, each statement's id and its proof.
+/// agent, each statement's id, its window, its proof and its record.
 #[derive(Default)]
 pub(crate) struct Unrecorded(Mutex<HashMap<AgentId, Proofs>>);
 
-/// Statements' windows and proofs, by statement id.
-type Proofs = BTreeMap<StatementId, (u64, [u8; 32])>;
+/// A proved statement waiting to be recorded: its window, its proof and
+/// the digest of its record.
+pub(crate) type Proved = (u64, [u8; 32], [u8; 32]);
+
+/// Statements' proofs, by statement id.
+type Proofs = BTreeMap<StatementId, Proved>;
 
 impl Unrecorded {
-    fn add(&self, agent: AgentId, window: u64, id: StatementId, proof: [u8; 32]) {
-        lock(&self.0)
-            .entry(agent)
-            .or_default()
-            .insert(id, (window, proof));
+    pub(crate) fn add(&self, agent: AgentId, id: StatementId, proved: Proved) {
+        lock(&self.0).entry(agent).or_default().insert(id, proved);
     }
 
-    /// `agent`'s, each its statement's id, its window and its proof.
-    pub(crate) fn of(&self, agent: AgentId) -> Vec<(StatementId, u64, [u8; 32])> {
+    /// `agent`'s, each its statement's id and what proved it.
+    pub(crate) fn of(&self, agent: AgentId) -> Vec<(StatementId, Proved)> {
         lock(&self.0)
             .get(&agent)
-            .map(|waiting| {
-                waiting
-                    .iter()
-                    .map(|(id, (window, proof))| (*id, *window, *proof))
-                    .collect()
-            })
+            .map(|waiting| waiting.iter().map(|(id, proved)| (*id, *proved)).collect())
             .unwrap_or_default()
     }
 
@@ -73,6 +73,124 @@ impl Unrecorded {
             }
         }
     }
+}
+
+impl Inner {
+    /// A replica of `agent` on node `from` proved its statement `id`, no
+    /// longer leading it: its proof fetched, and recorded through this
+    /// replica's leader once here, if it leads.
+    pub(crate) fn on_proved(
+        &self,
+        from: NodeNumber,
+        agent: AgentId,
+        window: u64,
+        id: [u8; 32],
+        (proof, attested): ([u8; 32], [u8; 32]),
+    ) {
+        if !self.admit(agent, from) {
+            return;
+        }
+        if let Some(run) = self.run(agent) {
+            self.unrecorded
+                .add(agent, StatementId(id), (window, proof, attested));
+            if !self.blobs.contains(&proof).unwrap_or(false) {
+                self.fetch(agent, &proof);
+            }
+            run.agent.wake();
+        }
+    }
+
+    /// Ask `agent`'s other replicas for the blob `hash`, which this node
+    /// does not hold.
+    fn fetch(&self, agent: AgentId, hash: &[u8; 32]) {
+        let others: Vec<_> = self
+            .placement(agent)
+            .map(|placement| placement.replicas)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|node| *node != self.number)
+            .collect();
+        self.want(agent, &[*hash], Keep::Aged);
+        for to in others {
+            self.send(
+                to,
+                &PeerMessage::BlobRequest {
+                    agent,
+                    hashes: vec![*hash],
+                },
+            );
+        }
+    }
+}
+
+/// The writes beside `result`'s, applied to `agent` as `snapshot` holds it,
+/// that keep the records of its attests at a window's cut
+/// (`keys::attested`): each it made, kept; each its `Proven` steps name,
+/// kept without its witness, which no one proves again; and, when its time
+/// crosses one of the agent's window boundaries, those of windows whose
+/// roots have aged past `MaxRootAge` by it, dropped. The same writes on
+/// every replica.
+pub(crate) fn attested(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    result: &WorkResult,
+) -> Result<Vec<Write>, Fault> {
+    let mut writes = Vec::new();
+    for step in &result.steps {
+        let Step::Ran(run) = step else {
+            continue;
+        };
+        if let InputRef::Proven {
+            window, attested, ..
+        } = run.input
+        {
+            let key = keys::attested(window, &attested);
+            let record = snapshot
+                .get(agent, &key)?
+                .and_then(|bytes| Attest::decode_exact(&bytes));
+            if let Some(attest) = record.filter(|attest| !attest.witness_input.is_empty()) {
+                let proved = Attest {
+                    witness_input: Vec::new(),
+                    ..attest
+                };
+                writes.push(Write {
+                    key,
+                    value: Some(proved.encode()),
+                });
+            }
+        }
+        for attest in &run.attests {
+            let Some(window) = attest.window else {
+                continue;
+            };
+            writes.push(Write {
+                key: keys::attested(window, &attest.digest()),
+                value: Some(attest.encode()),
+            });
+        }
+    }
+    let space = read::<SpaceId>(snapshot, agent, &keys::space())?;
+    let clock = read::<WindowClock>(snapshot, agent, &keys::clock())?;
+    let mark = read::<u64>(snapshot, agent, &keys::batch_time())?.unwrap_or(0);
+    let (Some(space), Some(clock)) = (space, clock) else {
+        return Ok(writes);
+    };
+    if space == SpaceId::NONE || clock.window(mark) == clock.window(result.time) {
+        return Ok(writes);
+    }
+    // The windows whose roots are anchored still: those whose boundary is
+    // within `MaxRootAge` of the result's time.
+    let live = clock
+        .window(result.time.saturating_sub(MAX_ROOT_AGE_MS))
+        .unwrap_or(0);
+    for row in snapshot.scan(agent, &keys::attested_prefix(), None) {
+        let (key, _) = row?;
+        match keys::attested_entry(&key) {
+            Some((window, _)) if window >= live => break,
+            _ => writes.push(Write { key, value: None }),
+        }
+    }
+    Ok(writes)
 }
 
 /// The node as the worker reads it.
@@ -90,75 +208,34 @@ impl Host for NodeHost {
         lock(&self.0.runs).keys().copied().collect()
     }
 
-    fn applied(&self, agent: AgentId) -> u64 {
-        self.0
-            .store
-            .snapshot()
-            .applied(agent)
-            .ok()
-            .flatten()
-            .unwrap_or(0)
+    fn attested(&self, agent: AgentId, from: u64) -> Result<Vec<Record>, String> {
+        let snapshot = self.0.store.snapshot();
+        let after = keys::attested_from(from);
+        let mut records = Vec::new();
+        for row in snapshot.scan(agent, &keys::attested_prefix(), Some(&after)) {
+            let (key, value) = row.map_err(|error| format!("{error:?}"))?;
+            let (Some((window, digest)), Some(attest)) =
+                (keys::attested_entry(&key), Attest::decode_exact(&value))
+            else {
+                tracing::error!(agent = agent.0, "a record at a cut does not decode: no job");
+                continue;
+            };
+            records.push((window, digest, attest));
+        }
+        Ok(records)
     }
 
-    fn log_start(&self, agent: AgentId) -> Result<u64, String> {
-        self.0
-            .store
-            .agent_rows(agent)
-            .map(|rows| rows.log_start)
-            .map_err(|error| format!("{error:?}"))
-    }
-
-    fn attests(&self, agent: AgentId, index: u64) -> Result<Option<Vec<Attest>>, String> {
-        let Some(entry) = self
-            .0
-            .store
-            .log_entry(agent, index)
-            .map_err(|error| format!("{error:?}"))?
-        else {
-            return Ok(None);
-        };
-        let body = match entry.kind {
-            EntryKind::Result => entry.body,
-            EntryKind::LargeResult => {
-                let Some(blob) = entry.result_blob() else {
-                    return Ok(None);
-                };
-                match self
-                    .0
-                    .blobs
-                    .get(&blob.hash)
-                    .map_err(|error| format!("{error:?}"))?
-                {
-                    Some(body) => body,
-                    None => return Ok(None),
-                }
-            }
-            EntryKind::NoOp | EntryKind::Configuration => return Ok(Some(Vec::new())),
-        };
-        // A body that does not decode applied as no result: it attests
-        // nothing.
-        let Ok((result, _)) = WorkResult::decode(&body) else {
-            return Ok(Some(Vec::new()));
-        };
-        Ok(Some(
-            result
-                .steps
-                .into_iter()
-                .flat_map(|step| match step {
-                    Step::Ran(run) => run.attests,
-                    _ => Vec::new(),
-                })
-                .collect(),
-        ))
-    }
-
-    fn program(&self, hash: &ProgramHash) -> Option<Vec<u8>> {
-        self.0.blobs.get(&hash.0).ok().flatten()
+    fn program(&self, agent: AgentId, hash: &ProgramHash) -> Option<Vec<u8>> {
+        let program = self.0.blobs.get(&hash.0).ok().flatten();
+        if program.is_none() {
+            self.0.fetch(agent, &hash.0);
+        }
+        program
     }
 
     fn proven(&self, agent: AgentId, window: u64, id: &StatementId) -> Option<[u8; 32]> {
         let snapshot = self.0.store.snapshot();
-        crate::fault::read::<[u8; 32]>(&snapshot, agent, &keys::proven(window, &id.0))
+        read::<[u8; 32]>(&snapshot, agent, &keys::proven(window, &id.0))
             .ok()
             .flatten()
     }
@@ -183,35 +260,48 @@ impl Host for NodeHost {
         }
     }
 
+    fn held(&self) -> Vec<[u8; 32]> {
+        self.0.blobs.held_by_node().unwrap_or_else(|error| {
+            tracing::warn!("the node's pins were not read: {error:?}");
+            Vec::new()
+        })
+    }
+
     fn proof(&self, agent: AgentId, hash: &[u8; 32]) -> Option<Vec<u8>> {
         if let Ok(Some(proof)) = self.0.blobs.get(hash) {
             return Some(proof);
         }
-        let others: Vec<_> = self
-            .0
-            .placement(agent)
-            .map(|placement| placement.replicas)
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|node| *node != self.0.number)
-            .collect();
-        self.0.want(agent, &[*hash], Keep::Aged);
-        for to in others {
-            self.0.send(
-                to,
-                &PeerMessage::BlobRequest {
-                    agent,
-                    hashes: vec![*hash],
-                },
-            );
-        }
+        self.0.fetch(agent, hash);
         None
     }
 
-    fn record(&self, agent: AgentId, window: u64, id: StatementId, proof: [u8; 32]) {
-        self.0.unrecorded.add(agent, window, id, proof);
-        if let Some(run) = self.0.run(agent) {
-            run.agent.wake();
+    /// Through this node's leader, or, when another node leads `agent`,
+    /// sent to it as well.
+    fn record(
+        &self,
+        agent: AgentId,
+        window: u64,
+        id: StatementId,
+        proof: [u8; 32],
+        attested: [u8; 32],
+    ) {
+        self.0.unrecorded.add(agent, id, (window, proof, attested));
+        let Some(run) = self.0.run(agent) else {
+            return;
+        };
+        run.agent.wake();
+        let leader = run.shared.state().leader;
+        if let Some(leader) = leader.filter(|leader| *leader != self.0.number) {
+            self.0.send(
+                leader,
+                &PeerMessage::Proved {
+                    agent,
+                    window,
+                    id: id.0,
+                    proof,
+                    attested,
+                },
+            );
         }
     }
 
@@ -259,17 +349,21 @@ impl Jobs for NodeJobs {
         Ok(jobs)
     }
 
-    fn watermark(&self, agent: AgentId) -> Result<u64, String> {
-        self.0.prover_mark(agent).map_err(failed)
+    fn stopping(&self) -> Result<bool, String> {
+        self.0.prover_stopping().map_err(failed)
     }
 
-    /// Not synced: the jobs it reads past are, so a mark lost to a crash
-    /// only has the scan read those records again, each to the job it made.
-    fn set_watermark(&self, agent: AgentId, index: u64) -> Result<(), String> {
-        let mut batch = self.0.batch();
-        batch.prover_mark(agent, index);
-        batch.commit(PersistMode::Buffer).map_err(failed)
+    fn set_stopping(&self, stopping: bool) -> Result<(), String> {
+        set_stopping(&self.0, stopping)
     }
+}
+
+/// Mark the node stopping, or running, for its prover's table: a proof
+/// under way when it stops was stopped by its operator.
+pub(crate) fn set_stopping(store: &Fjall, stopping: bool) -> Result<(), String> {
+    let mut batch = store.batch();
+    batch.prover_stopping(stopping);
+    batch.commit(PersistMode::SyncAll).map_err(failed)
 }
 
 /// The worker's thread, and what stops it: none without a venue to submit
@@ -295,7 +389,6 @@ pub(crate) fn start(
             return None;
         }
     };
-    inner.proving.store(true, Ordering::SeqCst);
     let thread = std::thread::Builder::new()
         .name("vos-prover".into())
         .spawn(move || work(worker, &stopped))
@@ -342,7 +435,6 @@ fn report(backlog: &Backlog) {
         proved = backlog.proved,
         submitted = backlog.submitted,
         oldest = ?backlog.oldest,
-        lost = backlog.lost,
         "the prover's backlog"
     );
 }

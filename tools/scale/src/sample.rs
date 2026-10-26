@@ -22,6 +22,10 @@ pub struct Thread {
     pub stime: u64,
     /// Times it slept by choice: its wakes.
     pub voluntary: u64,
+    /// Times it was taken off a core it wanted: the host's other work
+    /// preempting it.
+    #[serde(default)]
+    pub involuntary: u64,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -131,12 +135,17 @@ fn process(pid: u32) -> Option<Process> {
             &read(task.path().join("status")).unwrap_or_default(),
             "voluntary_ctxt_switches",
         );
+        let involuntary = status_field(
+            &read(task.path().join("status")).unwrap_or_default(),
+            "nonvoluntary_ctxt_switches",
+        );
         threads.push(Thread {
             tid,
             comm,
             utime,
             stime,
             voluntary,
+            involuntary,
         });
     }
     Some(Process {
@@ -261,9 +270,10 @@ mod tests {
     fn a_threads_stat_and_status_read() {
         let stat = "4242 (vos exec (1)) S 1 2 3 4 5 6 7 8 9 10 1234 567 0 0 20 0 1 0";
         assert_eq!(thread_stat(stat), Some(("vos exec (1)".into(), 1234, 567)));
-        let status = "Name:\tvos\nVmRSS:\t  20480 kB\nvoluntary_ctxt_switches:\t99\n";
+        let status = "Name:\tvos\nVmRSS:\t  20480 kB\nvoluntary_ctxt_switches:\t99\nnonvoluntary_ctxt_switches:\t7\n";
         assert_eq!(status_field(status, "VmRSS"), 20480);
         assert_eq!(status_field(status, "voluntary_ctxt_switches"), 99);
+        assert_eq!(status_field(status, "nonvoluntary_ctxt_switches"), 7);
         assert_eq!(status_field(status, "VmHWM"), 0);
     }
 

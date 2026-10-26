@@ -155,7 +155,6 @@ impl Node {
             halted: AtomicBool::new(false),
             liveness: crate::liveness::Liveness::new(incarnation),
             unrecorded: crate::prover::Unrecorded::default(),
-            proving: AtomicBool::new(false),
             backlog: Mutex::new(None),
         });
         inner.resume(records, placements);
@@ -202,8 +201,12 @@ impl Node {
             let _ = thread.join();
         }
         // A proof under way ends first: the worker writes its table and
-        // the blob store.
+        // the blob store. Marked stopping first, so a proof the operator
+        // ends by killing the node meanwhile is not counted against it.
         if let Some((stop, thread)) = self.prover.take() {
+            if let Err(error) = crate::prover::set_stopping(&self.inner.store, true) {
+                tracing::warn!("the prover's stop was not marked: {error}");
+            }
             let _ = stop.send(());
             let _ = thread.join();
         }

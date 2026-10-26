@@ -789,11 +789,15 @@ last for decades.**
 - **Venues in the node:** a space anchors and submits at one venue, through a `VenueClient` (`vos-venue`: the trait, `ModelVenue`,
   the `AnchorQueue` that sends anchors until the venue answers, and
   `KreivoVenue`). The
-  representative's leader signs and anchors each window; the prover
-  worker (`vos-node-prover`), on the leader of the agent whose record it
-  is, proves each statement at an anchored cut, records the proof's hash
-  in the agent (`Input::Proven`) and submits it once its roots are
-  anchored, a repeat counted as accepted. The prover is built into the
+  representative's leader signs and anchors each window some agent
+  reported; the prover worker (`vos-node-prover`), on the leader of the
+  agent whose record it is, proves each statement at an anchored cut,
+  records the proof's hash in the agent (`Input::Proven`) and submits it
+  once its roots are anchored, a repeat counted as accepted. Its records
+  are the agent's state: every replica's apply keeps each attest at a cut
+  (`keys::attested`), without its witness once proved, until its window's
+  roots age, so a replica that installs a snapshot and then leads holds
+  every statement still to prove. The prover is built into the
   node and stays there [decided]; the extension host that will carry the
   venues' transports is deferred. The worker proves statements at an
   anchored cut alone (an attest with a window), the only statements a
@@ -830,7 +834,11 @@ last for decades.**
   agent: `S_w = BLAKE2b-256("vos/space/v1" ‖ space ‖ w ‖ A_rep)`, `A_rep`
   the representative's agent root at its own cut of w, over its rows
   `(agent, kind, w) → the agent's root at cut(w)` (`slice-6-on-chain.md`,
-  pin D).
+  pin D). An agent cuts, and reports its root, only at a window a read of
+  it waits on, or at every window when it reports every one (an issuer,
+  `Admin::ReportEveryWindow`), so `S_w` covers the agents that reported
+  w; a window no agent reported is not anchored (`slice-7-mobile.md`, C10
+  and C11, S17 and S18).
 - **Anchors** [decided] are signed by one registered node key, a node's
   key set once when the controller lists it (`slice-7-mobile.md`,
   pin D′). The representative's close of each window writes `S_w` in a
@@ -865,7 +873,8 @@ last for decades.**
   the space forks unseen, since equivocation is caught per venue (an
   anchor gives no integrity).
 - **Retention:** none past a cut. A request made in window w reads at
-  `cut(w)` and is served at the next cut.
+  `cut(w)` and is served there once the representative closes w, or
+  fails `NotClosed` at `B_{w+2}`; the caller asks again (C9, S16).
 - **Spans** [decided]: a statement over a span of windows takes a carried
   commitment to its last settled state as a `#[public]` argument, not an
   old root; no tree history is kept.

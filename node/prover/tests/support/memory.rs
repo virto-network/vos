@@ -8,8 +8,9 @@ use vos_wire::ids::AgentId;
 
 use vos_node_prover::{Job, Jobs};
 
-/// Jobs and watermarks in memory, shared by its clones: a clone outlives a
-/// worker dropped as a stopped node's, for the next to open.
+/// Jobs in memory, and whether the node was stopping, shared by its
+/// clones: a clone outlives a worker dropped as a stopped node's, for the
+/// next to open.
 #[derive(Clone, Default)]
 pub(crate) struct MemoryJobs {
     held: Arc<Mutex<Held>>,
@@ -18,7 +19,7 @@ pub(crate) struct MemoryJobs {
 #[derive(Default)]
 struct Held {
     jobs: BTreeMap<(AgentId, [u8; 32]), Job>,
-    watermarks: BTreeMap<AgentId, u64>,
+    stopping: bool,
 }
 
 impl MemoryJobs {
@@ -53,12 +54,12 @@ impl Jobs for MemoryJobs {
             .collect())
     }
 
-    fn watermark(&self, agent: AgentId) -> Result<u64, String> {
-        Ok(self.held().watermarks.get(&agent).copied().unwrap_or(0))
+    fn stopping(&self) -> Result<bool, String> {
+        Ok(self.held().stopping)
     }
 
-    fn set_watermark(&self, agent: AgentId, index: u64) -> Result<(), String> {
-        self.held().watermarks.insert(agent, index);
+    fn set_stopping(&self, stopping: bool) -> Result<(), String> {
+        self.held().stopping = stopping;
         Ok(())
     }
 }

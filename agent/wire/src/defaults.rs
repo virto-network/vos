@@ -29,19 +29,15 @@ pub const MAX_READS: usize = 256;
 /// How many windows a read at a window's cut waits to be served: one asked
 /// in window `w` that no [`crate::batch::Input::Resume`] has served by the
 /// boundary `B_{w + READ_WINDOWS}` ends
-/// [`crate::abi::AttestError::NotClosed`]: its cut's, and its re-cuts' at
-/// the next [`RECUTS`] windows when the representative's `Closed` has not
-/// come.
-pub const READ_WINDOWS: u64 = 1 + RECUTS;
-/// How many times a pending read whose window went unclosed is re-cut at
-/// the next window before its deadline ends it.
-pub const RECUTS: u64 = 2;
-/// How many windows behind the latest recorded cut the agent keeps its
-/// cut, re-cut and close rows: a cut recording window `w` deletes those of
-/// every window before `w − CUT_KEEP`. It covers a read's whole life, its
-/// window and its [`RECUTS`] re-cuts, and one window more for the close's
-/// lag. A consensus constant, on every host.
-pub const CUT_KEEP: u64 = 2 + RECUTS;
+/// [`crate::abi::AttestError::NotClosed`]. It is served at its own window's
+/// cut alone, once the representative's `Closed` of that window comes; the
+/// caller asks again.
+pub const READ_WINDOWS: u64 = 2;
+/// How many windows behind the latest recorded cut the agent keeps its cut
+/// and close rows: a cut recording window `w` deletes those of every window
+/// before `w − CUT_KEEP`. It covers a read's whole life, to its deadline. A
+/// consensus constant, on every host.
+pub const CUT_KEEP: u64 = READ_WINDOWS;
 /// The most paths one of the representative's closes sends, a message
 /// each, within every target's messages a step
 /// ([`crate::abi::cap::Limits::messages`]): a window whose agents asked for

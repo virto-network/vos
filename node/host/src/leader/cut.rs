@@ -1,12 +1,14 @@
 //! The leader's `Cut` marker: an empty work result an idle agent of a
 //! space is given once the leader's own clock passes the boundary after
-//! the agent's batch-time mark, so its apply records the window's cut
+//! the agent's batch-time mark, when a read waits on the mark's window or
+//! the agent reports every window, so its apply records the window's cut
 //! though no input came. The marker is timed at the leader's clock, never
 //! at the boundary: a leader whose clock trails cuts late, never wrongly.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use vos_wire::apply::Waits;
 use vos_wire::batch::Batch;
 use vos_wire::ids::AgentId;
 use vos_wire::keys;
@@ -31,38 +33,41 @@ fn space_clock(snapshot: &Snapshot, agent: AgentId) -> Result<Option<WindowClock
     read::<WindowClock>(snapshot, agent, &keys::clock())
 }
 
-/// The first boundary past `mark` on `clock`.
-fn next_boundary(clock: &WindowClock, mark: u64) -> Option<u64> {
-    clock.boundary(clock.window(mark).unwrap_or(0))
-}
-
 /// The first boundary past the agent's batch-time mark on its space's
-/// clock; none when it belongs to no space.
+/// clock, when its apply would cut there: a read waits on the mark's
+/// window ([`keys::reading`]), or the agent reports every window; none
+/// otherwise, and when it belongs to no space.
 fn cut_due(snapshot: &Snapshot, agent: AgentId) -> Result<Option<u64>, Fault> {
     let Some(clock) = space_clock(snapshot, agent)? else {
         return Ok(None);
     };
     let mark = read::<u64>(snapshot, agent, &keys::batch_time())?.unwrap_or(0);
-    Ok(next_boundary(&clock, mark))
+    let waits = Waits {
+        every: snapshot.get(agent, &keys::every_window())?.is_some(),
+        reading: read::<u64>(snapshot, agent, &keys::reading())?,
+    };
+    let boundary = clock.boundary(clock.window(mark).unwrap_or(0));
+    Ok(boundary.filter(|boundary| waits.cuts(&clock, mark, *boundary).is_some()))
 }
 
-/// What a marker is made of, as `snapshot` holds the agent: its space's
-/// clock, its version, its batch-time floor and its applied index.
+/// What a marker is made of, as `snapshot` holds the agent: the first
+/// boundary past its batch-time mark at which it cuts, its version, its
+/// batch-time floor and its applied index.
 fn marker_state(
     snapshot: &Snapshot,
     agent: AgentId,
-) -> Result<(Option<WindowClock>, u64, u64, u64), Fault> {
-    let clock = space_clock(snapshot, agent)?;
+) -> Result<(Option<u64>, u64, u64, u64), Fault> {
+    let due = cut_due(snapshot, agent)?;
     let version = read::<u64>(snapshot, agent, &keys::version())?.unwrap_or(0);
     let floor = read::<u64>(snapshot, agent, &keys::batch_time())?.unwrap_or(0);
     let applied = snapshot.applied(agent)?.unwrap_or(0);
-    Ok((clock, version, floor, applied))
+    Ok((due, version, floor, applied))
 }
 
 impl Leader {
     /// How long until an idle leader appends a marker: zero when one is
     /// due now, its clock at or past the first boundary after the agent's
-    /// batch-time mark; none when the agent belongs to no space.
+    /// batch-time mark; none when the agent cuts there no window.
     pub(super) fn cut_wait(&self) -> Option<Duration> {
         let snapshot = self.inner.store.snapshot();
         let boundary = match cut_due(&snapshot, self.id) {
@@ -84,10 +89,10 @@ impl Leader {
     /// refined. False when a hook stops the leader.
     pub(super) async fn marker(&mut self) -> bool {
         let snapshot = Arc::new(self.inner.store.snapshot());
-        let (clock, version, floor) = match marker_state(&snapshot, self.id) {
-            Ok((clock, version, floor, applied)) => {
+        let (boundary, version, floor) = match marker_state(&snapshot, self.id) {
+            Ok((boundary, version, floor, applied)) => {
                 self.applied = applied;
-                (clock, version, floor)
+                (boundary, version, floor)
             }
             Err(fault) => {
                 self.retry(Vec::new(), fault).await;
@@ -95,9 +100,7 @@ impl Leader {
             }
         };
         let time = self.time(floor);
-        let due = clock
-            .and_then(|clock| next_boundary(&clock, floor))
-            .is_some_and(|boundary| boundary <= time);
+        let due = boundary.is_some_and(|boundary| boundary <= time);
         if !due {
             return true;
         }

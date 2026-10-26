@@ -75,6 +75,16 @@ impl Operator {
         self.post(&format!("/agents/{}/roles", agent.0), &grant.encode())
     }
 
+    /// Have `agent` cut and report its root at every window (`true`), as
+    /// an issuer's agent does, or only at the windows a read waits on.
+    pub fn report_every_window(
+        &self,
+        agent: AgentId,
+        every: bool,
+    ) -> Result<Response, ClientError> {
+        self.post(&format!("/agents/{}/reports", agent.0), &every.encode())
+    }
+
     /// Replace `agent`'s replica `remove` by node `add`, at its leader.
     pub fn replace(&self, agent: AgentId, remove: u8, add: u8) -> Result<Response, ClientError> {
         let replace = Replace { remove, add };

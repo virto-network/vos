@@ -156,16 +156,25 @@ fn values(version: u64) -> BTreeMap<MapId, Values> {
     values
 }
 
+/// Sets of rounds run, at most, until one cuts a build between its
+/// batches: the kills land at random moments, and on a loaded host a set
+/// can miss every build.
+const SETS: usize = 3;
+
 fn main() {
-    let mut last = 0;
     let mut cut = 0;
-    ROUNDS.run(writer, journal(TEAR), |round| {
-        cut += usize::from(check(round, &mut last))
-    });
+    let mut sets = 0;
+    while cut == 0 && sets < SETS {
+        let mut last = 0;
+        ROUNDS.run(writer, journal(TEAR), |round| {
+            cut += usize::from(check(round, &mut last))
+        });
+        sets += 1;
+    }
     assert!(cut > 0, "no round was killed between a build's batches");
     println!(
         "tree crash: {} rounds resumed to the root from scratch, {cut} of them cut mid-build",
-        ROUNDS.rounds
+        sets * ROUNDS.rounds
     );
 }
 

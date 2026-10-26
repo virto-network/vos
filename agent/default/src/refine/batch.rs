@@ -309,18 +309,20 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
                     None => Stepped::ran(consumed(input, Outcome::Done(Vec::new()))),
                 }
             }
-            Input::Report {
-                to,
-                window,
-                root,
-                pending,
-            } => Stepped::ran(closes::report(base, to, window, root, pending)),
+            Input::Report { to, window, root } => {
+                Stepped::ran(closes::report(base, to, window, root))
+            }
             Input::Close {
                 window,
                 rep_root,
                 paths,
             } => Stepped::ran(closes::close(base, window, rep_root, paths)),
-            Input::Proven { window, id, proof } => Stepped::ran(proven(base, window, id, proof)),
+            Input::Proven {
+                window,
+                id,
+                proof,
+                attested,
+            } => Stepped::ran(proven(base, window, id, (proof, attested))),
         };
         let Some(due) = batched.take(base, stepped, plan.reserve, plan.runs) else {
             break;

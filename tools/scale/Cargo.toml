@@ -13,12 +13,17 @@ path = "src/main.rs"
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 ed25519-dalek = "2"
+futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 hex = "0.4"
+httparse = "1"
 libc = "0.2"
 # The allocator `vos` uses: a driver's clients free across threads.
 mimalloc = "0.1.52"
 serde = { workspace = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 serde_json = "1"
+# The drivers' sending thread: one executor, its connections and timers.
+smol = "2"
 toml = "1"
 # The harness's clients: the operator's admin commands and signed calls,
 # each node pinned by its key over TLS.

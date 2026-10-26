@@ -1,20 +1,27 @@
-//! `agents`: agents created on three nodes each, drawn by the nodes'
-//! weights, and an actor installed in each; with `--representative`, the
-//! space's representative first, on three founding nodes by weight. The
-//! agents are kept in the deployed space's `agents.json` for the drivers.
+//! `agents`: the load model's agents, each created on three nodes drawn by
+//! the nodes' weights with the shard actor installed: `K` ledger shards
+//! and `I` idle agents; the stand-in identity agent on every node, its `U`
+//! rows written; with `--representative`, the space's representative
+//! first, on three founding nodes by weight. The agents are kept in the
+//! deployed space's `agents.json` for the drivers.
 
 use std::path::Path;
 use std::time::Duration;
 
+use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
-use vos_node::client::Operator;
+use vos_node::client::{Client, Operator};
 use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{Install, Response};
+use vos_wire::result::Outcome;
 
 use crate::deploy::Deployed;
 use crate::hosts::wait_for;
 use crate::inventory::{Host, Inventory};
-use crate::nodes::operator;
+use crate::nodes::{operator, target};
+
+/// Identity rows a call writes: the shard actor's most.
+const FILL: u64 = 1_000;
 
 /// How long an operator's command may take at one node.
 const ANSWER: Duration = Duration::from_secs(30);
@@ -27,12 +34,25 @@ pub struct Placed {
     pub replicas: Vec<u8>,
     pub actor: String,
     pub instance: u32,
+    /// Its leader as last read, by node number.
+    #[serde(default)]
+    pub leader: Option<u8>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Agents {
     pub representative: Option<Placed>,
+    /// The ledger shards the load calls.
     pub agents: Vec<Placed>,
+    /// Agents created and installed, and never called.
+    #[serde(default)]
+    pub idle: Vec<Placed>,
+    /// The stand-in identity agent, replicated on every node, and its
+    /// rows.
+    #[serde(default)]
+    pub identity: Option<Placed>,
+    #[serde(default)]
+    pub identity_rows: u64,
 }
 
 impl Agents {
@@ -52,6 +72,7 @@ impl Agents {
 
 /// A small deterministic generator (SplitMix64): placements are a
 /// function of the seed.
+#[derive(Clone, Copy)]
 pub struct Mix(pub u64);
 
 impl Mix {
@@ -143,6 +164,56 @@ fn install(
     .map_err(|error| format!("{error}: {last}"))
 }
 
+/// Write the identity agent's rows `0..rows`, [`FILL`] a call, from a few
+/// clients at once.
+fn fill_identities(
+    deployed: &Deployed,
+    identity: &Placed,
+    rows: u64,
+    seed: u64,
+) -> Result<(), String> {
+    let agent = AgentId(identity.agent);
+    let instance = InstanceId(identity.instance);
+    let target = target(&deployed.nodes[usize::from(identity.replicas[0]) - 1])?;
+    let schema = vos_node::client::schema(&target, agent, instance)
+        .map_err(|error| error.to_string())?
+        .ok_or("the identity agent has nothing installed")?;
+    let method = schema
+        .method_id("fill_identities")
+        .ok_or("the shard actor has no fill_identities")?;
+    let calls = rows.div_ceil(FILL);
+    let writers = calls.min(8);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..writers)
+            .map(|writer| {
+                let target = target.clone();
+                scope.spawn(move || -> Result<(), String> {
+                    let (key, _) = crate::load::user(seed ^ 0xf111, writer);
+                    let mut client = Client::new(&target, SigningKey::from_bytes(&key));
+                    for call in (writer..calls).step_by(writers as usize) {
+                        let start = call * FILL;
+                        let count = FILL.min(rows - start) as u32;
+                        let arguments = [&start.to_le_bytes()[..], &count.to_le_bytes()].concat();
+                        match client.call(agent, instance, method, &arguments) {
+                            Ok(Response::Ran {
+                                outcome: Outcome::Done(_),
+                                ..
+                            }) => {}
+                            other => {
+                                return Err(format!("identity rows from {start}: {other:?}"));
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .try_for_each(|handle| handle.join().expect("a writer"))
+    })
+}
+
 fn created(answer: Result<Response, vos_node::client::ClientError>) -> Result<AgentId, String> {
     match answer.map_err(|error| error.to_string())? {
         Response::Created(agent) | Response::Unconfirmed(agent) => Ok(agent),
@@ -156,7 +227,12 @@ fn read_elf(path: &Path) -> Result<Vec<u8>, String> {
 
 /// What `agents` makes.
 pub struct Request<'a> {
+    /// Ledger shards, `K`.
     pub count: u32,
+    /// Idle agents, `I`.
+    pub idle: u32,
+    /// The identity agent's rows, `U`; none without one.
+    pub identity_rows: u64,
     pub actor: &'a Path,
     pub instance: u32,
     /// The representative's ELF, to create and install it first.
@@ -189,6 +265,7 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
             replicas,
             actor: "representative".into(),
             instance: vos_wire::served::REPRESENTATIVE.0,
+            leader: None,
         });
     }
     let elf = read_elf(request.actor)?;
@@ -197,20 +274,46 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
-    for at in 0..request.count {
-        let replicas = place(&weights, &mut mix);
+    let place_one = |replicas: Vec<u8>| -> Result<Placed, String> {
         let creator = &operators[usize::from(replicas[0]) - 1];
         let agent = created(creator.create_agent(replicas.clone()))?;
         install(&operators, agent, &replicas, request.instance, &elf)?;
-        agents.agents.push(Placed {
+        Ok(Placed {
             agent: agent.0,
             replicas,
             actor: actor.clone(),
             instance: request.instance,
-        });
-        if (at + 1).is_multiple_of(10) || at + 1 == request.count {
-            eprintln!("{} of {} agents created", at + 1, request.count);
+            leader: None,
+        })
+    };
+    let total = request.count + request.idle;
+    for at in 0..total {
+        let placed = place_one(place(&weights, &mut mix))?;
+        if at < request.count {
+            agents.agents.push(placed);
+        } else {
+            agents.idle.push(placed);
         }
+        if (at + 1).is_multiple_of(10) || at + 1 == total {
+            eprintln!(
+                "{} of {} agents created ({} shards, {} idle)",
+                at + 1,
+                total,
+                request.count,
+                request.idle
+            );
+        }
+    }
+    if request.identity_rows > 0 {
+        let every: Vec<u8> = (1..=hosts.len() as u8).collect();
+        let identity = place_one(every)?;
+        fill_identities(&deployed, &identity, request.identity_rows, request.seed)?;
+        eprintln!(
+            "the identity agent: agent {} on every node, {} rows",
+            identity.agent, request.identity_rows
+        );
+        agents.identity = Some(identity);
+        agents.identity_rows = request.identity_rows;
     }
     agents.write(inventory)?;
     Ok(agents)
