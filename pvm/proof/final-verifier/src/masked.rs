@@ -66,7 +66,7 @@ use stwo::core::verifier::VerificationError;
 use vos_pvm_recair_air::GateRelation;
 use vos_pvm_recair_air::gate::public_logup_sum;
 use vos_pvm_recair_air::masked::{
-    MaskPins, MaskedComponents, WrapComponents, air_log_size, committed_log_sizes,
+    MaskPins, MaskedComponents, WrapComponents, air_log_size, blinds_its_sums, committed_log_sizes,
     composition_oods_eval, eval_lifted_composition, sample_points, sample_points_from_zero,
 };
 
@@ -440,8 +440,9 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
     })
 }
 
-/// The checks on `proof` and `claim` before the transcript: the header (the
-/// log sizes and the configuration the format's), the shape at `layout`'s
+/// The checks on `proof` and `claim` before the transcript: the set blinds
+/// its claimed sums (two blinded components at least, or none), the header
+/// (the log sizes and the configuration the format's), the shape at `layout`'s
 /// trees and sample points (`check_shape`), the claimed sums canonical and
 /// the preprocessed root the circuit's. Returns the trees' column log sizes
 /// and the sample points at zero.
@@ -451,6 +452,11 @@ fn admitted<H: MerkleHasherLifted, C: MaskedComponents>(
     layout: &C,
     proof: &StarkProof<H>,
 ) -> Result<(TreeVec<Vec<u32>>, Points), Error> {
+    if !blinds_its_sums(layout) {
+        return Err(Error::Shape(
+            "one blinded component: its claimed sum is in the clear",
+        ));
+    }
     let config = PcsConfig {
         deep_batching: format.config.deep_batching,
         ..proof.config

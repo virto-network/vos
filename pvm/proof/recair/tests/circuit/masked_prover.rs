@@ -1,8 +1,8 @@
 //! The masked prover (`vos_pvm_recair::masked`) on small circuits: the mask
 //! keeps a column on its domain, R1 refuses a randomizer too small for what
 //! the proof reveals, the FRI mask's DEEP coefficients span QM31, an invalid
-//! witness is refused, the prover runs on another channel and component set,
-//! every masked root and claimed sum is fresh, and the seeded seam
+//! witness is refused, a one-component set is refused by the prover and the
+//! verifier, every masked root and claimed sum is fresh, and the seeded seam
 //! reproduces a proof byte for byte. Each proof is verified by the final
 //! verifier's masked verifier (`vos_pvm_final_verifier::masked`), over the
 //! set and channel it was proved on, under the format as the verifier pins
@@ -10,7 +10,7 @@
 
 use crate::common::random_circuit;
 use vos_pvm_final_verifier::Error;
-use vos_pvm_final_verifier::masked::{Claim, replay, verify_masked};
+use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, replay, verify_masked};
 
 use num_traits::{One, Zero};
 use stwo::core::air::Component;
@@ -27,15 +27,15 @@ use stwo_constraint_framework::preprocessed_columns::PreProcessedColumnId;
 use stwo_constraint_framework::{FrameworkComponent, TraceLocationAllocator};
 use vos_pvm_proof::format::{DeepBatching, Format, FormatParams, MASKED_WRAP, Masking};
 use vos_pvm_recair::masked::{
-    MaskRng, MaskStats, MaskedProof, MaskedProvers, MaskedTrace, prove_masked, rank_m31,
-    verifier_format,
+    MaskRng, MaskStats, MaskedProvers, MaskedTrace, prove_masked, rank_m31, verifier_format,
 };
 use vos_pvm_recair::prove::prove_masked_on;
 use vos_pvm_recair::trace::{self, FirstRowFraction};
 use vos_pvm_recair::{Finalized, ProveError, RecairProof};
 use vos_pvm_recair_air::gate::{GateRelation, Layout, public_logup_sum};
 use vos_pvm_recair_air::masked::{
-    BlindRelation, MaskedComponents, MaskedEval, Rebound, WrapComponents,
+    BlindRelation, MaskedComponents, MaskedEval, Rebound, WrapComponents, blinded_components,
+    blinds_its_sums,
 };
 use vos_pvm_recair_air::p2::{self, P2Eval};
 
@@ -273,11 +273,8 @@ fn an_invalid_witness_is_refused() {
     ));
 }
 
-/// The recursion AIR's `p2` alone: a component set of one, which the masked
-/// prover takes as it takes the wrap's. A set of one is not blinded, its
-/// claimed sum in the clear; this test's verifier checks no logup total
-/// (`p2`'s relation does not balance alone), so it tests the transcript,
-/// not zero knowledge.
+/// The recursion AIR's `p2` alone: a component set of one, whose claimed
+/// sum the logup total and the public sum fix, so no blinding hides it.
 struct P2Only {
     p2: FrameworkComponent<MaskedEval<P2Eval>>,
     log_sizes: [u32; 1],
@@ -376,13 +373,14 @@ impl MaskedProvers for P2Only {
     }
 }
 
-/// Generic: the masked prover and the tests' verifier on the Blake2s
-/// channel over the `p2`-only set; a tampered sample is refused.
+/// A one-component set is refused (pin I): the prover refuses to prove it,
+/// and the verifier refuses any proof laid out as it, before any other
+/// check. The masked prover's genericity is the credential set's
+/// (`tests/credential`), two components on any channel.
 #[test]
-fn the_masked_prover_is_generic() {
+fn a_one_component_set_is_refused() {
     let finalized = circuit(4);
     let circuit = &finalized.circuit;
-    circuit.check_wiring().unwrap();
     let log_sizes = [LOG_SIZE];
     let preprocessed = trace::evaluations(&trace::preprocessed_columns(circuit)[0], LOG_SIZE);
     let main = trace::main_trace(circuit, &finalized.witness);
@@ -394,23 +392,24 @@ fn the_masked_prover_is_generic() {
         vec![p2]
     };
     let format = format();
-    let prove = || {
-        prove_masked::<Blake2sMerkleChannel, P2Only>(
-            &format,
-            MaskedTrace {
-                active: (),
-                log_sizes: &log_sizes,
-                preprocessed: preprocessed.clone(),
-                main: &main_of,
-                public: &finalized.witness.outputs,
-                interaction: &interaction,
-            },
-            MaskRng::default(),
-        )
-        .unwrap()
-        .0
-    };
-    let proof: MaskedProof<_> = prove();
+    let refused = prove_masked::<Blake2sMerkleChannel, P2Only>(
+        &format,
+        MaskedTrace {
+            active: (),
+            log_sizes: &log_sizes,
+            preprocessed,
+            main: &main_of,
+            public: &finalized.witness.outputs,
+            interaction: &interaction,
+        },
+        MaskRng::default(),
+    );
+    assert!(
+        matches!(refused, Err(ProveError::Masking(_))),
+        "{:?}",
+        refused.map(|_| ())
+    );
+
     let layout = P2Only::new(
         (),
         &GateRelation::dummy(),
@@ -419,40 +418,32 @@ fn the_masked_prover_is_generic() {
         &[SecureField::zero()],
     )
     .unwrap();
-    let pinned = verifier_format(&format, &log_sizes, &layout).expect("a masked format");
-    let claim = |proof: &MaskedProof<_>| -> Result<(), Error> {
-        verify_masked::<Blake2sMerkleChannel, P2Only>(
-            &pinned,
-            &Claim {
-                log_sizes: &log_sizes,
-                circuit: None,
-                public: &finalized.witness.outputs,
-                public_sum: None,
-                bound_sums: None,
-                interaction_pow: proof.interaction_pow,
-                claimed_sums: &proof.claimed_sums,
-            },
-            &layout,
-            proof.stark_proof.clone(),
-        )
+    assert_eq!(blinded_components(&layout), 1);
+    assert!(!blinds_its_sums(&layout));
+    let (proof, _) =
+        prove::<Blake2sMerkleChannel>(&format, &finalized, MaskRng::default()).unwrap();
+    let pinned = MaskedFormat {
+        log_sizes: &log_sizes,
+        ..verifier_format(&format, &proof.log_sizes, &wrap_layout(&proof.log_sizes)).unwrap()
     };
-    claim(&proof).unwrap();
-    // The main tree: `p2`'s columns, its blinding's 4 and 8 salts.
-    assert_eq!(
-        proof.stark_proof.queried_values[1].len(),
-        p2::N_MAIN + 4 + 8
+    let refused = verify_masked::<Blake2sMerkleChannel, P2Only>(
+        &pinned,
+        &Claim {
+            log_sizes: &log_sizes,
+            circuit: None,
+            public: &finalized.witness.outputs,
+            public_sum: None,
+            bound_sums: None,
+            interaction_pow: proof.interaction_pow,
+            claimed_sums: &proof.claimed_sums[..1],
+        },
+        &layout,
+        proof.stark_proof.clone(),
     );
-    let mut tampered = proof.clone();
-    tampered.stark_proof.0.sampled_values[1][0][0] += SecureField::one();
-    assert!(claim(&tampered).is_err());
-    let mut tampered = proof.clone();
-    tampered.stark_proof.0.queried_values[1][p2::N_MAIN + 4][0] += BaseField::one();
-    assert!(claim(&tampered).is_err());
-    let other = prove();
-    assert_ne!(
-        other.stark_proof.commitments[1],
-        proof.stark_proof.commitments[1]
-    );
+    assert!(matches!(refused, Err(Error::Shape(_))), "{refused:?}");
+    // Three components, each blinded, prove and verify.
+    assert!(blinds_its_sums(&wrap_layout(&proof.log_sizes)));
+    verify::<Blake2sMerkleChannel>(&format, &proof).unwrap();
 }
 
 /// Two proofs of one witness share only the preprocessed root: every masked

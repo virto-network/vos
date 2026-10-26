@@ -314,10 +314,8 @@ pub struct MaskStats {
 /// The claimed sums are blinded (R2) by values summing to zero, so their
 /// total is the unblinded one; the sums the public values fix
 /// ([`MaskedComponents::public_sums`]) are left unblinded. A set of one
-/// blinded component is therefore left unblinded: its claimed sum is in the
-/// clear, and its verifier must check it against a public total
-/// (`claimed + public = 0`), which makes it public; a verifier that checks no
-/// total would leave a witness-dependent value in the clear.
+/// blinded component is refused ([`air::blinds_its_sums`]): its blinding
+/// would be zero and its claimed sum in the clear.
 ///
 /// Each component's mask takes its own `h` ([`mask_rows`]).
 pub fn prove_masked<MC: MerkleChannel, C: MaskedProvers>(
@@ -433,6 +431,11 @@ where
     let set_layout = C::layout(trace.active, trace.log_sizes).ok_or(ProveError::TraceShape(
         "the component set refuses its log sizes",
     ))?;
+    if !air::blinds_its_sums(&set_layout) {
+        return Err(ProveError::Masking(
+            "one blinded component: its claimed sum would be in the clear",
+        ));
+    }
     let mask_rows = mask_rows(format, &set_layout)
         .ok_or(ProveError::Masking("the set's masks do not fit its trees"))?;
     let public_sums = if checks.public_unblinded {
@@ -877,8 +880,8 @@ fn rank_check<R, A>(
 
 /// The blinding values (R2), one a component: zero for the components
 /// `public` names, uniform for the others but the last, which makes them sum
-/// to zero, so the claimed sums' total is the unblinded one. A set of one
-/// blinded component is left unblinded.
+/// to zero, so the claimed sums' total is the unblinded one. The prover
+/// refuses a set of one blinded component before it gets here.
 fn blinding(n_components: usize, public: &[usize], rng: &mut ChaCha20Rng) -> Vec<SecureField> {
     let blinded: Vec<usize> = (0..n_components)
         .filter(|component| !public.contains(component))
