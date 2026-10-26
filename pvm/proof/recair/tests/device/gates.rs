@@ -1,5 +1,5 @@
 //! The device shape's acceptance and forgery gates
-//! (`docs/design/slice-7-mobile.md`, 7.15): every run below is the kernel's
+//! (`docs/design/slice-7-mobile.md`, pins H and J): every run below is the kernel's
 //! own but for the one property its gate forges, so the refusal is that
 //! property's. A constraint a forged trace breaks is refused by the honest
 //! prover and, its proof forced past the prover's check, by the verifier
@@ -524,4 +524,37 @@ fn the_io_hash_is_the_one_public_sum() {
         layout.public_sums(),
         position.into_iter().collect::<Vec<_>>()
     );
+}
+
+/// Masked acceptance at the device candidates' parameters
+/// (`device-params.md`): blowup 4 with 43 queries (`h = 512`, every chip at
+/// `2^11` rows at least) and blowup 2 with 86 (`h = 1,024`, `2^12`), on
+/// Blake2s; R1 in one attempt, two witnesses under one program.
+#[cfg(feature = "heavy-gates")]
+#[test]
+fn heavy_device_proofs_verify_at_the_device_parameters() {
+    for (log_blowup, queries, log_mask_rows, floor) in [(2, 43, 9, 11), (1, 86, 10, 12)] {
+        let format = Format {
+            params: vos_pvm_proof::format::FormatParams {
+                log_blowup,
+                ..small_format(ChannelKind::Blake2s, log_mask_rows, queries).params
+            },
+            ..small_format(ChannelKind::Blake2s, log_mask_rows, queries)
+        };
+        let program = program::<Blake2sMerkleChannel>(&format, &blob());
+        assert!(program.log_sizes.iter().all(|&log_size| log_size >= floor));
+        for seed in [1, 2] {
+            let (proof, stats) = prove::<Blake2sMerkleChannel>(
+                &format,
+                &program,
+                &blob(),
+                &witness(seed),
+                MaskRng::Seeded(seed),
+            )
+            .expect("proves");
+            verify_device::<Blake2sMerkleChannel>(&format, &program, &proof).expect("verifies");
+            assert_eq!(stats.attempts, 1);
+            assert!(2 * stats.revealed_rows <= 1 << log_mask_rows, "{stats:?}");
+        }
+    }
 }

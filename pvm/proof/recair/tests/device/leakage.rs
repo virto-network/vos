@@ -1,5 +1,5 @@
 //! The masking's leakage gates on the device shape
-//! (`docs/design/proving.md` §5; slice 6's 6.6; the 7.14 review's hand-off),
+//! (`docs/design/proving.md` §5; slice 6's 6.6; pin J),
 //! at N proofs a witness: 16 in `just check`; under `heavy-gates`,
 //! `LEAKAGE_SEGMENT_N`, [`MEDIUM`] unless it is set (`just test-proof`;
 //! `just slice-gate` sets the full N).

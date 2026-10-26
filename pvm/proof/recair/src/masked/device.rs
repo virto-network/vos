@@ -13,10 +13,10 @@
 //!   halt, and nothing else: the public values after the main tree's root
 //!   are its 32 bytes, DeviceIoChip's claimed sum the one the verifier
 //!   recomputes from them, every other blinded.
-//! - **The trace is the program's shape** (the Fable review's M8): every
-//!   chip at its program's log size, the prover refusing a run that needs
-//!   more ([`vos_pvm_proof::ProvingError::Shape`]), so a proof's shape never
-//!   depends on its witness. A kernel whose step count does not depend on its
+//! - **The trace is the program's shape** (pin J's witness-independent
+//!   trace): every chip at its program's log size, the prover refusing a run
+//!   that needs more ([`vos_pvm_proof::ProvingError::Shape`]), so a proof's
+//!   shape never depends on its witness. A kernel whose step count does not depend on its
 //!   witness (branch-free) proves every witness under one program.
 
 use num_traits::Zero;

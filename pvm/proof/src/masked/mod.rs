@@ -1,5 +1,5 @@
 //! The segment AIR masked: variant (c) (`docs/design/proving.md` §5) over
-//! the segment's chips, a component set the masked prover and verifier take
+//! a chip set's chips, a component set the masked prover and verifier take
 //! (`vos_pvm_recair_air::masked::MaskedComponents`).
 //!
 //! - **A chip masked** ([`MaskedChipEval`]): its constraints and fractions,
@@ -8,25 +8,25 @@
 //!   blinding adds neither an interaction column nor a degree; the chip's own
 //!   batching (its `Logup`) otherwise. The constraints are bounded at
 //!   `log_size + 2`.
-//! - **The set** ([`SegmentComponents`]): the chips its active-chip mask
-//!   names, in chip order, each at its log size; the relations drawn chip by
-//!   chip in that order, as the unmasked segment draws them.
-//! - **The public sums:** the boundary chips' claimed sums, which the
-//!   verifier recomputes from the boundary states ([`bound_sums`]), stay
-//!   unblinded; the other chips' are blinded.
+//! - **The set** ([`Components`], over a [`ChipSet`]): the chips its
+//!   active-chip mask names, in the set's order, each at its log size; the
+//!   relations drawn chip by chip in that order. Two sets: the node's
+//!   segment ([`SegmentComponents`], format 35's chips in chip order) and
+//!   the device's ([`DeviceComponents`], `crate::device`'s).
+//! - **The public sums:** the claimed sums the public values fix stay
+//!   unblinded, every other is blinded. The node's are its four boundary
+//!   chips' (the registers in and out, the program's boundary, the memory
+//!   roots), recomputed from the boundary states ([`bound_sums`]), a mask
+//!   without one refused. The device's is DeviceIoChip's alone, recomputed
+//!   from the io-hash ([`device_bound_sums`]): its entry is the program's and
+//!   its exit hidden but for φ9..12.
 //!
-//! Every chip pads to its masking's floor (four times its `h`): the fixed
+//! Every chip pads to a floor of at least four times its `h`: the fixed
 //! tables repeat their entries with no multiplicity, the boundaries add rows
-//! that claim nothing. The unmasked segment formats never read this module.
-//!
-//! **The node's shape, assumed:** [`bound_sums`] and the public sums take the
-//! four boundary chips (the registers in and out, the program's boundary,
-//! the memory roots), and a mask without one is refused. Pin J's device
-//! shape drops the memory roots and outputs the io-hash in φ9..12, so both
-//! are generalized there (`slice-7-mobile.md`, 7.15). Nor is the shape
-//! pinned yet: the chips (`active`) and their sizes are the run's, above the
-//! floors, so they depend on the witness until the device program id pins
-//! them and the prover pads to them (7.15).
+//! that claim nothing. The node's segment takes each chip at its run's size
+//! above its floor; the device's at its program's ([`DeviceSizes::Pinned`]),
+//! never the run's, so its shape does not depend on the witness. The
+//! unmasked segment formats never read this module.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
