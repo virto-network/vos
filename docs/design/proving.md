@@ -977,12 +977,18 @@ enrollment or a revocation costs 33 calls of `C`: the leaf and 32 levels.
   nullifier and owner's digest from one `s` (37 permutations). Slice 7
   times it on the phone against auth's budget, so the later private
   payment's statement (`identity-and-authority.md` §8) is known to fit; it
-  has no `CredentialKind` and no ingress path.
+  has no `CredentialKind` and no ingress path. It is a floor for a
+  shielded spend, not its estimate: notes, values and range checks cost
+  far more than its 37 permutations.
 - **The public words bind the proof:** each is a public value of the
   masked transcript (§5, its step 4), in the order listed, `kind` one word
   and each digest its eight; the circuit consumes every word through the
-  public sums, so a proof verifies under its own words alone. `scope` and
-  `binding` enter no hash in the circuit: ingress computes both.
+  public sums, so a proof verifies under its own words alone. Neither
+  `scope` nor `binding` is computed from its BLAKE2b preimage in the
+  circuit: ingress computes both from the guard and the request. `scope`
+  is the second input of the nullifier's outer compression, so the
+  circuit hashes it; `binding` is a public word only, read by no gate and
+  bound by the transcript and the public sums.
 - **The program id** of each circuit is its circuit hash, a constant the
   verifier's build pins under a stale-fixture test. The verifier takes the
   circuit by `kind`, never from the proof; the binding names the program,
@@ -1010,15 +1016,20 @@ unregistered. Ingress takes a proof of at most 512 KiB.
   Android Keystore HMAC key (user authentication at every use, by a
   biometric or the PIN through `BiometricPrompt`; StrongBox-backed when
   present; Android 11 or later); optionally a security key's
-  `hmac-secret` by CTAP2 directly through YubiKit, with its PIN and a
-  touch. No passkeys, Credential Manager or Play services; a source that
-  spans devices is later work. The device keeps the source's reference
-  (the Keystore alias, or the security key's credential id).
-- **The input:** `input = SHA-256("vos/prf/v1" ‖ handle)`, the message
-  the source's HMAC takes (a security key's salt as it is: no WebAuthn
-  client prefixes it). `handle` is the space's stable 32-byte handle
-  (`identity-and-authority.md` §6), not its `SpaceId`, so a member's
-  secret survives a re-founding.
+  `hmac-secret` by CTAP2 directly through YubiKit, always with user
+  verification (its PIN) and a touch: CTAP2 keeps a credential's
+  `hmac-secret` key apart with and without user verification, so a use
+  without the PIN would derive another `s`. One credential serves every
+  handle (the salt varies), made under one pinned `rpId` constant,
+  `"vos.device"`, a CTAP2 string and not a WebAuthn relying party. No
+  passkeys, Credential Manager or Play services; a source that spans
+  devices is later work. The device keeps the source's reference (the
+  Keystore alias, or the security key's credential id).
+- **The input:** `input = SHA-256("vos/device/input/v1" ‖ handle)`
+  [decided, S51], the message the source's HMAC takes (a security key's
+  salt as it is: no WebAuthn client prefixes it). `handle` is the space's
+  stable 32-byte handle (`identity-and-authority.md` §6), not its
+  `SpaceId`, so a member's secret survives a re-founding.
 - **The derivation:** `o` the source's 32-byte output;
   `w = BLAKE2b-512("vos/device/secret/v1" ‖ handle ‖ o)`;
   `s_i = u64_le(w[8i..8i+8]) mod p` for `i < 8` (a bias below 2^-33 a
@@ -1072,12 +1083,23 @@ impl Prover {
 pub fn verify(proof: &CredentialProof, call: &Call, name: Option<&[u8]>)
               -> Result<(), DeviceError>;
 
-// The wire (identity-and-authority.md §5–§6), the node API's bodies:
-pub fn time_answer(body: &[u8]) -> Result<u64, DeviceError>;         // Time
-pub fn path_query(agent_identity: &[u8; 32], instance: u32, member: &Digest,
-                  not_after: u64) -> Vec<u8>;    // a QueryCall, signed by a fresh key
-pub fn path_answer(body: &[u8]) -> Result<AuthWitness, DeviceError>;
-pub fn credentialed(call: &Call, proof: &CredentialProof) -> Vec<u8>; // the request body
+// The wire (identity-and-authority.md §5–§6): node-API requests, each its
+// kind and SCALE body (the transport adds the length and any request id).
+// `agent` addresses the request; `identity` is the agent's 32-byte
+// identity, which a query's key signs over.
+pub fn time_request() -> Vec<u8>;                                    // Time
+pub fn time_answer(body: &[u8]) -> Result<u64, DeviceError>;
+/// A `QueryCall` of `path`, signed by a fresh key.
+pub fn path_query(agent: u32, identity: &[u8; 32], instance: u32,
+                  member: &Digest, not_after: u64) -> Vec<u8>;
+pub fn path_answer(body: &[u8]) -> Result<Option<AuthWitness>, DeviceError>;
+/// A `QueryCall` of `root()`, signed by a fresh key.
+pub fn root_query(agent: u32, identity: &[u8; 32], instance: u32,
+                  not_after: u64) -> Vec<u8>;
+/// The root and its `since`.
+pub fn root_answer(body: &[u8]) -> Result<(Digest, u64), DeviceError>;
+/// The request, addressed to `call.agent`.
+pub fn credentialed(call: &Call, proof: &CredentialProof) -> Vec<u8>;
 
 /// The path held, refreshed apart from proofs [decided, S38].
 pub struct PathKeeper { /* the member, the path held, the next fetch's time */ }
@@ -1093,10 +1115,12 @@ impl PathKeeper {
   `root` by the path, else `DeviceError::Witness` before any proving.
 - **`DeviceError`** is `Config`, `Memory`, `Witness`, `Prove`, `Decode` or
   `Verify`: it names what failed and carries no value.
-- **`Threads::Auto`** weights work by core class (7.17) [decided, S28].
-- **`path_query` signs with a key drawn for that query alone,** so path
-  fetches link to no client key; a proof uses the path `PathKeeper`
-  holds, and no fetch precedes it.
+- **`Threads::Auto`** weights work by core class (7.17) [decided, S28];
+  until 7.17 it is rayon's even split over every core.
+- **`path_query` and `root_query` sign with a key drawn for that query
+  alone,** so fetches link to no client key; a proof uses the path
+  `PathKeeper` holds, and no fetch precedes it. `path_answer` is `None`
+  for a digest not enrolled.
 - **No logging of witnesses,** and no `seeded-masks` feature (pin C's
   build check). The client's bridge zero-fills its `byte[]` of `o` once
   the library has copied it; the library zeroizes its copies of `o` and

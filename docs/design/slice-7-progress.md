@@ -1334,6 +1334,38 @@ demo in s4) and S41 (the node's binary API and a gateway, step 7.10b).
 **Left to the steps:** `SECURITY.md`'s entries (the path leak, the handle
 copy, the containment) with 7.11 and 7.12, as the plan has them.
 
+**Review (Fable):** fix-then-merge; M1–M8, L1–L13 folded; owner S46–S51
+(`research/slice-7/7.7-fable.md`, `owner-decisions.md`). The fixes: the
+`once` row written only when the handler returns `Ok`, `b` recorded
+whatever it does, and 7.11's test (M1, S47); the demo client's paths and
+time over a `vos-api` SSH subsystem on the gateway, under a fresh key,
+and the s4 app's client key sending the claims of keyless members (M2,
+S49); the facility's own chrome form for the payee and the amount, the
+server's request a prefill, the method and its `once` guard named
+before a sign-in, the grant and a call's confirmation two prompts (M3,
+S48, L5); the demo's ledger, rows by name with `invite_row`/`claim_row`,
+`mint`, `transfer`, `balance`, `rekey` and `freeze` (M4); `path_query`
+addressed by the agent's id and signed over its identity, and
+`root_query`/`root_answer` and `time_request` added (M5); 7.10b's
+dependency 7.7, beside 7.9 and 7.10, the node's HTTP deleted after 7.6's
+final run or T1 re-measured, the chain 9.5–13 weeks of steps (M6, S50);
+the input's tag `"vos/device/input/v1"` (M7, S51); the scope an input
+of the nullifier's compression, neither preimage hashed in the circuit
+(M8). The lows: a security key always with user verification, one
+credential under the pinned `rpId` `"vos.device"` (L1); which enum's
+`Replayed` and `Once` (L2); `Time`'s bound stated (L3); the operator
+console signs in the operator's client (L4, S46: operator requests
+signed, socket-only until built); the client's per-connection key, no
+token, no remembered grant (L6); `Threads::Auto` an even split until
+7.17, the facility unsupported below API 30 (L7); the joint circuit a
+floor, the in-space ledger custodial by design (L8); 7.10b's frame
+grammar, frame error and kind table first (L9); `CredentialRefusal`'s
+codes renumbered in check order, `Once` 9, `RootUnknown` 10,
+`RootStale` 11, `Proof` 12 (L10); agents and methods pinned at
+enrollment (L11); `node/SECURITY.md` and `vos-device`'s `SECURITY.md`
+named (L12); the arguments in clear and the online set at each tree
+change in §7's residues (L13).
+
 **Gate** [measured]: `just check` green at `d524aef3` (1,441 passed in 105
 suites). Its first run failed `anchoring::a_dissenting_replica_does_not_block_the_evidence`,
 a race in the test as 7.2 left it, 2 runs in 5 on `4e7b4982`: the venue

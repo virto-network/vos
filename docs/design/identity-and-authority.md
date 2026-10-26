@@ -266,8 +266,11 @@ Ingress verifies the proof and logs only the origin it proves.
 - **The node's clock:** the API's `Time` request answers the node's time
   in milliseconds, a SCALE `u64` (a gateway's `GET /time`). A client reads
   it before it picks `expires_ms`, because the proof binds that value and
-  a refused expiry costs a new proof. The node's key, which clients pin,
-  keeps its own request (a gateway's `GET /`).
+  a refused expiry costs a new proof. The answer is not signed: a relay
+  that lies about it makes the client pick an expiry the node refuses,
+  which costs a new proof and nothing more, since ingress checks the
+  expiry against its own clock. The node's key, which clients pin, keeps
+  its own request (a gateway's `GET /`).
 - **The binding digest:**
   `b = BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖ agent ‖ instance ‖ method ‖ program ‖ kind ‖ arguments ‖ nonce ‖ expires_ms)`:
   `space` the `SpaceId`'s 32 bytes; `agent`, `instance` and `method` 4
@@ -300,18 +303,25 @@ Ingress verifies the proof and logs only the origin it proves.
     pseudonym, so the guard, not the handler, keeps the set: apply records
     the system row `once(scope ‖ nullifier) → t`, `t` the batch time of
     its admission, kept for good; the scope digest names the space, agent,
-    instance and guard name, so the rows are scoped by construction. A
-    repeat is refused (`Once` at ingress, `Refusal::Once` at apply). A new
-    round takes a new name, so a new scope. `once` needs an `Auth` guard
+    instance and guard name, so the rows are scoped by construction. The
+    row is written only when the handler returns `Ok`, in the apply that
+    ran it [decided, S47]: a refused ballot is not a cast vote, so a call
+    the handler fails or refuses leaves the member free to try again,
+    with a new proof (its `b` stays recorded). A repeat of an admitted
+    nullifier is refused (`CredentialRefusal::Once` at ingress,
+    `Refusal::Once` at apply). A new round takes a new name, so a new
+    scope. `once` needs an `Auth` guard
     and is part of `CredentialGuard::Auth`, so it moves no pinned blob.
 - **Ingress's checks, in order,** each cheap one before any dearer, every
   state read on this replica's applied state; each refusal is
   `Rejected(Credential(code))` (index 9 of `Rejection`), `code` a
-  `CredentialRefusal` of the index shown:
+  `CredentialRefusal` of the index shown, the codes in check order. Apply
+  refuses under refine's `Refusal`, another enum; where both have a name
+  (`Replayed`, `Once`), the text says which:
 
   | # | check | refusal | a gateway's HTTP |
   |---|---|---|---|
-  | 1 | the frame within its kind's size | the node API's | 413 |
+  | 1 | the frame within its kind's size | the frame error `Oversize` (not a credential code) | 413 |
   | 2 | it decodes, exactly | `Malformed` (not a credential code) | 400 |
   | 3 | this node serves the agent | `NoAgent`, `Elsewhere`, as for calls | 404, 421 |
   | 4 | the node's space has a genesis (its `SpaceId` is not `NONE`) | `NoSpace`, 0 | 403 |
@@ -323,11 +333,11 @@ Ingress verifies the proof and logs only the origin it proves.
   | 10 | auth: `scope` is the one the guard's name gives | `Scope`, 6 | 403 |
   | 11 | `binding` is `C(T(binding), W(b))` of this request | `Binding`, 7 | 403 |
   | 12 | `b` is not recorded | `Replayed`, 8 | 409 |
-  | 13 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 12 | 409 |
-  | 14 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 9: fetch the path again, or ask another replica | 503 |
-  | 15 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 10 | 403 |
+  | 13 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 9 | 409 |
+  | 14 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10: fetch the path again, or ask another replica | 503 |
+  | 15 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 11 | 403 |
   | 16 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
-  | 17 | on an executor, the proof decodes; its interaction PoW and its PoW hold, checked before any Merkle decommitment is read; then it verifies under the program for its kind | `Proof`, 11 | 403 |
+  | 17 | on an executor, the proof decodes; its interaction PoW and its PoW hold, checked before any Merkle decommitment is read; then it verifies under the program for its kind | `Proof`, 12 | 403 |
 
   Then the call goes to the agent's leader as `Input::Credentialed`,
   forwarded as a call is by a replica that does not lead, and its answer
@@ -361,16 +371,20 @@ Ingress verifies the proof and logs only the origin it proves.
   4. a `once` guard: `once(scope ‖ nullifier)` recorded: refused,
      `Refusal::Once` (10);
   5. `b` recorded, the system row `binding(b) → expires_ms`, collected by
-     the sweep at `expires_ms` plus 60 s through the due index; a `once`
-     guard's row recorded;
-  6. the method runs, its caller the origin, under its guard
-     (`Failure::Forbidden` consumes the input; `b` stays recorded).
+     the sweep at `expires_ms` plus 60 s through the due index;
+  6. the method runs, its caller the origin, under its guard; whatever it
+     returns, `b` stays recorded (`Failure::Forbidden` or a trap consumes
+     the input);
+  7. a `once` guard: the row `once(scope ‖ nullifier) → t` recorded only
+     if the method returned `Ok`, in this apply, beside its writes
+     [decided, S47].
 
   A refused input writes nothing. So a proof replayed at another replica
   runs once, and a revocation binds every replica at the same batch. A
-  duplicate is answered `Replayed`, without the first call's outcome
-  [decided, S39]: a client that lost its answer reads state (a balance, a
-  record).
+  duplicate is answered `Refusal::Replayed` at apply (or
+  `CredentialRefusal::Replayed` at an ingress that has applied the
+  first), without the first call's outcome [decided, S39]: a client that
+  lost its answer reads state (a balance, a record).
 - **On JAM,** an agent whose builder is one of the space's nodes takes a
   credentialed input as it takes any: its builder's ingress verified the
   proof, under the trust-boundary rule above.
@@ -435,6 +449,16 @@ origin is the sending service or space, and the authority is a proof
 - **Operators are identities too:** a node's key is bound to its
   operator's identity, so hosting and acting are two grants, never one
   key for both.
+- **Operator requests** (creating agents and representatives, installs,
+  replicas, roles, reports) [decided, S46]: requests of the node's binary
+  API, each signed by an operator key the node's config lists, with a
+  nonce and an expiry as a call's; the node records the nonce until the
+  expiry and refuses an unlisted key, a replay or an expired request. A
+  gateway, and s4's operator console in it, only relays them: the
+  console's operator signs in their own client, so a relay keeps nothing
+  it can reuse. Until signed operator requests are built, the node
+  accepts operator kinds on its local unix socket only, its file mode
+  the access, and refuses them over QUIC (`slice-7-mobile.md`, 7.10b).
 - **Registration of identities** is the space's choice: open
   self-registration, invitation (the onboarding tokens master had), or
   a governance decision.
@@ -486,7 +510,12 @@ across a space's agents wait for the identity agent above.
   - `invite(member, expires_ms)`, role `registrar`, and `claim(member)`,
     any caller: an invited member enrolls itself before the expiry. The
     invitation names the digest, so whoever intercepts the claim cannot
-    enroll another (a ledger's owner rows take the same two steps);
+    enroll another (the demo's ledger rows take the same two steps,
+    `invite_row` and `claim_row`, `slice-7-mobile.md` 7.11). A member with
+    no client key of its own has its claim sent by the app that serves it
+    (the demo's gateway app, under its own client key): an ordinary
+    client's authority, bounded by the invitation, which names the
+    digest;
   - `revoke(member)`, role `registrar`: the leaf back to the empty leaf,
     the slot freed;
   - queries, any caller: `path(member) → Option<(root, slot, siblings)>`,
@@ -527,7 +556,7 @@ across a space's agents wait for the identity agent above.
 - **A nullifier is scoped:** one pseudonym a scope, never global, or it
   becomes the global handle the owner refuses. A method that admits a
   member once a scope takes the `once` guard (§5), which keeps the
-  nullifiers it has seen.
+  nullifiers it has admitted.
 - **Across spaces, a leaf is keyed by the identity and its revocation
   epoch,** so an identity revoked in A cannot keep proving old facts in
   B.
@@ -591,6 +620,11 @@ space three of them take a simpler form:
     auth within `ROOT_MAX_AGE`; it does not stop payment, which reads no
     tree: the ledger's `rekey(row, owner)` and `freeze(row)`, under an
     operator role, do [decided, S37].
+  - **The in-space ledger is custodial by design:** an operator who can
+    `rekey` can move any row to a key of its choosing. It is the tier
+    such a space picks [decided, S37]; the log attributes each `rekey` to
+    the operator's origin, so the power is visible, not hidden. A space
+    that refuses custody waits for full privacy's pool (§8).
 - **Replay** is bound by the binding digest (§5): another space (its
   `SpaceId`), another agent, instance or method, other arguments or
   another statement each change `b`, so the proof fails ingress's
@@ -602,6 +636,9 @@ space three of them take a simpler form:
   call, run once. The transports keep it from on-path observers (the node
   API's QUIC, a gateway's TLS or SSH); a gateway sees every proof it
   relays and can do the same, and nothing more: it holds no authority.
+  The node's `Time` is unsigned; a relay that lies about it costs a
+  client a new proof, and cannot extend a proof's life past the 120 s
+  ingress allows by its own clock.
 - **Revocation** binds every replica within `ROOT_MAX_AGE` of the
   revoking batch, by batch time (§5's apply rule): a revoked member's
   proof against an older root is refused then, whatever a lagging
@@ -621,7 +658,12 @@ space three of them take a simpler form:
     privacy's (§3, §8);
   - from the log: each auth call's scope and nullifier (a pseudonym's
     activity in one scope), each payment's owner digest (a public payer,
-    S22), and the metadata every cell leaks (§3);
+    S22), each credentialed call's arguments in clear (a payment's payee
+    and amount beside its payer), and the metadata every cell leaks (§3);
+  - from a tree change: every online member's library refreshes its path
+    when `root()` moves, so each enrollment or revocation shows which
+    member digests are online then (the timer's jitter spreads the
+    fetches, it does not hide them); syncing the tree is the later fix;
   - from the tree: how many members there are and when each was enrolled
     or revoked; a leaf hides its digest, so whether a digest is enrolled
     is learned only by asking `path` for it;

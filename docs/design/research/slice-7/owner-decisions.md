@@ -242,6 +242,11 @@ S36. **T5-partial.** With all three nodes on compumax, T5 kills one
   node's unit under load, and is recorded as T5-partial; the full host
   kill re-runs when more machines exist. (2026-10-26)
 
+S52. **compumax is wired.** The desktop's driver, still on Wi-Fi,
+  measured p50 3.6 ms and p99 6.9 ms to compumax [measured]; `vos-scale
+  check` warns of a driver on Wi-Fi and records its round trips to each
+  node machine. (2026-10-26)
+
 ## On 7.7's design round, and the demo's home (2026-10-26)
 
 On the plan's questions 7.7-Q1 to Q6 (`slice-7-progress.md`, 7.7), and
@@ -302,3 +307,41 @@ S44. **7.11's rate gate** (Q6): the executors' bound, at least 100
   credentialed verifications a second a verifying thread, scaling
   linearly to N threads, the threads recorded; no absolute claim of 1,000
   a second.
+
+On Fable's review of 7.7 (`7.7-fable.md`, "fix-then-merge"), its
+questions Q1 to Q6. Each [decided].
+
+S46. **Operator requests over the node API** (Q1): signed by an operator
+  key the node's config lists, with a nonce and an expiry as a call's;
+  the gateway and s4's operator console only relay, and the console's
+  operator signs in its own client. Until signed operator requests are
+  built, the node accepts operator kinds on its local unix socket only.
+  Closes the plan's open question 3.
+
+S47. **The `once` row when the handler fails** (Q2): written only when the
+  handler returns `Ok`, in the same apply; a failed or refused call
+  leaves the member free to try again with a new proof. The binding
+  digest is recorded whatever the handler does, so a replay is still
+  refused `Replayed`. 7.11 tests it.
+
+S48. **What the member confirms before a credential proof** (Q3): the
+  `vos.credential` facility shows its own trusted-chrome form for the
+  payee and the amount; the server's request only pre-fills it, and the
+  user may edit both; the facility encodes the transfer from what the
+  user confirmed. For `sign_in` the chrome names the method and, for a
+  `once` guard, that the call spends the member's one admission in its
+  scope. A facility's grant (per session) and a call's confirmation (per
+  call) are two prompts.
+
+S49. **The demo client's channel for `path`, `root()` and `Time`** (Q4):
+  a second SSH connection to the gateway under a fresh ephemeral key,
+  opening a `vos-api` subsystem that relays the node API's read-only
+  kinds only (queries and `Time`). Defined in 7.10b (the gateway) and
+  7.13 (the client).
+
+S50. **7.10b's start** (Q5): now, beside 7.9 and 7.10, its dependency 7.7
+  alone. The node's HTTP is deleted only after 7.6's final scale run, or
+  T1 is re-measured over the node API.
+
+S51. **The source input's domain tag** (Q6): `"vos/device/input/v1"`,
+  replacing `"vos/prf/v1"` everywhere.
