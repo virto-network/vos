@@ -97,7 +97,13 @@ impl Operator {
     /// The `Authorization` header's value for a request of `method` to
     /// `path` holding `body`: the token, or the envelope signed over the
     /// route's kind and inner body.
-    fn authorization(&self, method: &str, path: &str, body: &[u8]) -> Option<String> {
+    fn authorization(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        nonce: [u8; 16],
+    ) -> Option<String> {
         match &self.authority {
             Authority::Token(token) => Some(format!("Bearer {token}")),
             Authority::Key { key, node } => {
@@ -121,7 +127,7 @@ impl Operator {
                     *node,
                     key,
                     kind,
-                    crate::random(),
+                    nonce,
                     now.saturating_add(GOOD_FOR_MS),
                     inner,
                 );
@@ -131,25 +137,36 @@ impl Operator {
     }
 
     /// A request, signed again once at the node's time if the node says
-    /// its expiry was off.
+    /// its expiry was off: with the same nonce, so the two copies run once
+    /// between them, whoever holds the first.
     fn send(&self, method: &str, path: &str, body: &[u8]) -> Result<Response, ClientError> {
-        let mut answer = self.once(method, path, body)?;
+        let nonce = crate::random();
+        let mut answer = self.once(method, path, body, nonce)?;
         if let Response::Rejected(Rejection::Operator(OperatorRefusal::Expiry { now })) = answer {
             let offset = i128::from(now) - i128::from(crate::wall_clock());
             *lock(&self.offset) = offset.clamp(i64::MIN.into(), i64::MAX.into()) as i64;
-            answer = self.once(method, path, body)?;
+            answer = self.once(method, path, body, nonce)?;
         }
         Ok(answer)
     }
 
-    fn once(&self, method: &str, path: &str, body: &[u8]) -> Result<Response, ClientError> {
-        let authorization = self.authorization(method, path, body);
+    fn once(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        nonce: [u8; 16],
+    ) -> Result<Response, ClientError> {
+        let authorization = self.authorization(method, path, body, nonce);
+        // A signed command runs once by its nonce: it may go again on a
+        // fresh connection when a kept one failed. A token's command may
+        // not be idempotent: never sent twice.
+        let repeatable = matches!(self.authority, Authority::Key { .. });
         let (status, answer) = match method {
             "GET" => self.transport.get(path, authorization.as_deref())?,
-            // An operator's command may not be idempotent: never sent twice.
             _ => self
                 .transport
-                .post_once(path, authorization.as_deref(), body)?,
+                .post(path, authorization.as_deref(), body, repeatable)?,
         };
         decode_answer(status, &answer)
     }

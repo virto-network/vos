@@ -147,6 +147,7 @@ impl Node {
             recording: smol::lock::Mutex::new(()),
             calls: crate::calls::Calls::default(),
             reads: crate::asking::Waits::default(),
+            floor_waits: std::sync::atomic::AtomicUsize::new(0),
             anchor_rows: crate::asking::Waits::default(),
             anchor_alerts: Mutex::default(),
             anchor_handed: Mutex::default(),

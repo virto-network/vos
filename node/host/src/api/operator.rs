@@ -201,36 +201,45 @@ impl Api {
 
     async fn admit(&self, kind: Kind, body: Vec<u8>) -> Result<Command, Response> {
         let refused = |refusal| Response::Rejected(Rejection::Operator(refusal));
-        let operated: Operated = decode(&body)?;
-        if operated.node != self.inner.node_id {
+        // The envelope's fixed fields first, from its prefix: a body is
+        // decoded, and its message built, only for a listed key's request
+        // to this node within its time, and off the node's thread.
+        let Some(prefix) = body.get(..88) else {
+            return Err(Response::Rejected(Rejection::Malformed));
+        };
+        if prefix[..32] != self.inner.node_id.0 {
             return Err(refused(OperatorRefusal::OtherNode));
         }
-        if !self.operators.contains(&operated.key) {
+        let key: [u8; 32] = prefix[32..64].try_into().expect("32 bytes");
+        if !self.operators.contains(&key) {
             return Err(Response::Rejected(Rejection::Unauthorized));
         }
+        let expires_ms = u64::from_le_bytes(prefix[80..88].try_into().expect("8 bytes"));
         let now = (self.inner.clock)();
-        if operated.expires_ms < now || operated.expires_ms > now.saturating_add(HORIZON_MS) {
+        if expires_ms < now || expires_ms > now.saturating_add(HORIZON_MS) {
             return Err(refused(OperatorRefusal::Expiry { now }));
         }
-        let message = operated.message(kind);
-        let (key, signature) = (operated.key, operated.signature);
-        let signed = self
+        let checked = self
             .inner
             .offload({
                 let stats = Arc::clone(&self.inner.stats);
                 move || {
+                    let operated: Operated = decode(&body)?;
                     let started = Instant::now();
-                    let signed = verify(&key, &message, &signature);
+                    let signed =
+                        verify(&operated.key, &operated.message(kind), &operated.signature);
                     stats.verify.took(started.elapsed());
-                    signed
+                    match signed {
+                        true => Ok(operated),
+                        false => Err(Response::Rejected(Rejection::BadSignature)),
+                    }
                 }
             })
             .await;
-        match signed {
-            Some(true) => {}
-            Some(false) => return Err(Response::Rejected(Rejection::BadSignature)),
+        let operated = match checked {
+            Some(checked) => checked?,
             None => return Err(Response::Unavailable),
-        }
+        };
         let command = parse(&self.inner, kind, operated.body).await?;
         if kind.records_nonce() {
             let now = (self.inner.clock)();
@@ -295,7 +304,13 @@ pub(crate) fn operator_key(data: &Path) -> Result<[u8; 32], String> {
     let key = ed25519_dalek::SigningKey::from_bytes(&secret)
         .verifying_key()
         .to_bytes();
-    std::fs::write(&public, hex::encode(key)).map_err(|error| failed(&public, error))?;
+    // Whole or not at all: written beside it, then moved into place.
+    let mut name = public.as_os_str().to_owned();
+    name.push(".new");
+    let written = std::path::PathBuf::from(name);
+    std::fs::write(&written, hex::encode(key))
+        .and_then(|()| std::fs::rename(&written, &public))
+        .map_err(|error| failed(&public, error))?;
     Ok(key)
 }
 

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use s4_server::rui::{App, Cx, Id, View, ViewContext, view};
 use s4_server::{Credential, Identity, Server, SubsystemChannel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use vos_api::{Event, Framing, Kind, Reader, Requests, error_frame, frame};
+use vos_api::{Event, FrameError, Framing, Kind, Reader, Requests, error_frame, frame};
 
 use crate::Gateway;
 use crate::limits::Limits;
@@ -69,13 +69,18 @@ pub fn server(
         .subsystem_fn(SUBSYSTEM, move |channel| {
             let (gateway, limits) = (Arc::clone(&gateway), Arc::clone(&limits));
             async move {
-                let admitted = channel
-                    .peer()
-                    .map(|peer: SocketAddr| peer.ip())
-                    .is_none_or(|address: IpAddr| limits.request(address));
-                if admitted {
-                    relay(gateway, channel).await;
-                }
+                let address = channel.peer().map(|peer: SocketAddr| peer.ip());
+                // A channel holds a place among its address's, as an HTTP
+                // connection does.
+                let place = match address {
+                    Some(address) => match limits.connect(address) {
+                        Some(place) => Some(place),
+                        None => return,
+                    },
+                    None => None,
+                };
+                relay(gateway, channel, Some((limits, address))).await;
+                drop(place);
             }
         })
 }
@@ -108,7 +113,14 @@ pub async fn start(
 }
 
 /// Relay one channel's frames until it ends, or a frame error closes it.
-pub async fn relay(gateway: Arc<Gateway>, channel: SubsystemChannel) {
+/// With `limits`, each frame takes a token of its address's rate (past
+/// it, the channel closes) and, while in flight, a place among its
+/// address's (past them, it is answered `Unavailable`).
+pub async fn relay(
+    gateway: Arc<Gateway>,
+    channel: SubsystemChannel,
+    limits: Option<(Arc<Limits>, Option<IpAddr>)>,
+) {
     let (mut reading, writer) = channel.into_split();
     let writer = Arc::new(tokio::sync::Mutex::new(writer));
     let slots = Arc::new(tokio::sync::Semaphore::new(IN_FLIGHT));
@@ -146,12 +158,29 @@ pub async fn relay(gateway: Arc<Gateway>, channel: SubsystemChannel) {
         while let Some(event) = reader.event() {
             match event {
                 Event::Frame(request) => {
+                    // A whole frame read: the next one's deadline runs from
+                    // its own first byte.
+                    started = None;
                     let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
                         return;
                     };
+                    let mut place = None;
+                    if let Some((limits, Some(address))) = &limits {
+                        if !limits.request(*address) {
+                            return;
+                        }
+                        place = limits.connect(*address);
+                        if place.is_none() {
+                            let bytes =
+                                error_frame(Framing::Stream, request.id, FrameError::Unavailable);
+                            let _ = writer.lock().await.write_all(&bytes).await;
+                            continue;
+                        }
+                    }
                     let kind = Kind::from_u16(request.kind).expect("the reader's kinds");
                     let (gateway, writer) = (Arc::clone(&gateway), Arc::clone(&writer));
                     requests.spawn(async move {
+                        let _place = place;
                         let (answered, body) = gateway.relay(kind, &request.body).await;
                         let bytes = frame(Framing::Stream, answered, request.id, &body);
                         // Whole: an answer never interleaves another.

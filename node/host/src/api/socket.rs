@@ -53,8 +53,15 @@ pub(crate) fn bind(path: &Path, mode: u32) -> Result<Bound, String> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(failed(error)),
     }
-    let listener = UnixListener::bind(path).map_err(failed)?;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).map_err(failed)?;
+    // Bound beside it and given its mode first, then moved into place: no
+    // one connects to it before its mode is the access.
+    let mut name = path.as_os_str().to_owned();
+    name.push(".binding");
+    let binding = PathBuf::from(name);
+    let _ = std::fs::remove_file(&binding);
+    let listener = UnixListener::bind(&binding).map_err(failed)?;
+    std::fs::set_permissions(&binding, std::fs::Permissions::from_mode(mode)).map_err(failed)?;
+    std::fs::rename(&binding, path).map_err(failed)?;
     Ok(Bound {
         listener,
         _lock: lock,
@@ -145,6 +152,9 @@ async fn connection(
         while let Some(event) = reader.event() {
             match event {
                 Event::Frame(request) => {
+                    // A whole frame read: the next one's deadline runs from
+                    // its own first byte.
+                    started = None;
                     let slot = slots.acquire_arc().await;
                     requests.retain(|task| !task.is_finished());
                     let kind = Kind::from_u16(request.kind).expect("the reader's kinds");
@@ -159,6 +169,12 @@ async fn connection(
                     }));
                 }
                 Event::Error { error, id } => {
+                    // The requests in flight run on to their end, their
+                    // answers unsent: an operator's command whose nonce is
+                    // recorded is not cut short.
+                    for request in requests.drain(..) {
+                        request.detach();
+                    }
                     let mut writer = writer.lock().await;
                     writer
                         .write_all(&error_frame(Framing::Stream, id, error))

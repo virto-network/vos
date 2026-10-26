@@ -56,6 +56,18 @@ impl Transport {
         self.request("GET", path, authorization, &[], true)
     }
 
+    /// A post, with an `Authorization` header's value if any, sent again
+    /// on a fresh connection when a kept one failed if `repeatable`.
+    pub(super) fn post(
+        &self,
+        path: &str,
+        authorization: Option<&str>,
+        body: &[u8],
+        repeatable: bool,
+    ) -> Result<(u16, Vec<u8>), ClientError> {
+        self.request("POST", path, authorization, body, repeatable)
+    }
+
     /// A request the node may not take twice as once: never sent again.
     pub(super) fn post_once(
         &self,

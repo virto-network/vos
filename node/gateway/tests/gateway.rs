@@ -291,6 +291,51 @@ fn every_route_through_the_gateway_answers_as_the_nodes_http() {
         role: Some(1),
     }
     .encode();
+    // A first call of a session of its own for each front, adding 0: both
+    // fronts' calls run, and answer the same total.
+    let callers = AtomicU64::new(60);
+    let first_call = || {
+        let seed = callers.fetch_add(1, Ordering::SeqCst) as u8;
+        let key = SigningKey::from_bytes(&[seed; 32]);
+        let client = Client::new(&Target::socket(served.socket.clone()), key.clone());
+        signed_call(
+            &identity,
+            &key,
+            client.session(served.agent),
+            1,
+            COUNTER,
+            served.increment,
+            0u64.encode(),
+        )
+        .encode()
+    };
+    // A header whose command already ran: replayed at both fronts.
+    let ran = served.header(Kind::Reports, [agent.encode(), true.encode()].concat());
+    let reports = format!("/agents/{agent}/reports");
+    let (status, _, _) = exchange(
+        served.http,
+        &request(
+            "POST",
+            &reports,
+            &[format!("Authorization: {ran}")],
+            &true.encode(),
+        ),
+    );
+    assert_eq!(status, 200);
+    let header_for = |node: NodeId, expires_ms: u64| {
+        operated_header(&signed_operated(
+            node,
+            &SigningKey::from_bytes(&OPERATOR),
+            Kind::Stats,
+            fresh_nonce(),
+            expires_ms,
+            Vec::new(),
+        ))
+    };
+    let expired = header_for(served.node.id(), served.now() - 1);
+    let elsewhere = header_for(NodeId([3; 32]), served.now() + 60_000);
+    let create = vos_wire::ingress::Create { replicas: vec![1] }.encode();
+    let replace = vos_wire::ingress::Replace { remove: 5, add: 6 }.encode();
     // Each request, made fresh for each front: an operator's header is
     // good once.
     type Make<'a> = Box<dyn Fn() -> Vec<u8> + 'a>;
@@ -508,6 +553,103 @@ fn every_route_through_the_gateway_answers_as_the_nodes_http() {
                     "GET",
                     "/stats",
                     &["Authorization: Operated !!".to_string()],
+                    b"",
+                )
+            }),
+        ),
+        (
+            "a first call",
+            Box::new(|| {
+                request(
+                    "POST",
+                    &format!("/agents/{agent}/calls"),
+                    &[],
+                    &first_call(),
+                )
+            }),
+        ),
+        (
+            "a read with a body",
+            Box::new(|| request("GET", &format!("/agents/{agent}"), &[], b"ignored")),
+        ),
+        (
+            "an agent created on replicas",
+            Box::new(|| {
+                request(
+                    "POST",
+                    "/agents",
+                    &[format!(
+                        "Authorization: {}",
+                        served.header(Kind::CreateAgent, create.clone())
+                    )],
+                    &create,
+                )
+            }),
+        ),
+        (
+            "a representative",
+            Box::new(|| {
+                request(
+                    "POST",
+                    "/representative",
+                    &[format!(
+                        "Authorization: {}",
+                        served.header(Kind::CreateRepresentative, Vec::new())
+                    )],
+                    b"",
+                )
+            }),
+        ),
+        (
+            "reports",
+            Box::new(|| {
+                request(
+                    "POST",
+                    &reports,
+                    &[format!(
+                        "Authorization: {}",
+                        served.header(Kind::Reports, [agent.encode(), false.encode()].concat())
+                    )],
+                    &false.encode(),
+                )
+            }),
+        ),
+        (
+            "a replacement",
+            Box::new(|| {
+                request(
+                    "POST",
+                    &format!("/agents/{agent}/replicas"),
+                    &[format!(
+                        "Authorization: {}",
+                        served.header(Kind::Replace, [agent.encode(), replace.clone()].concat())
+                    )],
+                    &replace,
+                )
+            }),
+        ),
+        (
+            "a replayed command",
+            Box::new(|| {
+                request(
+                    "POST",
+                    &reports,
+                    &[format!("Authorization: {ran}")],
+                    &true.encode(),
+                )
+            }),
+        ),
+        (
+            "an expired read",
+            Box::new(|| request("GET", "/stats", &[format!("Authorization: {expired}")], b"")),
+        ),
+        (
+            "a read signed for another node",
+            Box::new(|| {
+                request(
+                    "GET",
+                    "/stats",
+                    &[format!("Authorization: {elsewhere}")],
                     b"",
                 )
             }),

@@ -257,14 +257,16 @@ its expiry; socket-only until built.
   envelope names its node (the review's M1) so a relay can route it to
   the one node it is signed for, and that node refuses it as
   `Operator(OtherNode)` before any signature check.
-- **The node's checks, in order:** the frame; `Operated` decodes
-  (`Malformed`); `node` is this node (`Operator(OtherNode)`); `key`
-  listed (`Unauthorized`); `now ≤ expires_ms ≤ now + 120 s`
-  (`Operator(Expiry { now })`); the signature, off the node's thread as
-  `Ingress::signed` does (`BadSignature`); the inner body decodes
-  (`Malformed`); for a write kind, the nonce recorded (below); then the
-  command runs as today. The signature comes before the store, so junk
-  fills nothing.
+- **The node's checks, in order:** the frame; the envelope's fixed
+  88-byte prefix present (`Malformed`); `node` is this node
+  (`Operator(OtherNode)`); `key` listed (`Unauthorized`);
+  `now ≤ expires_ms ≤ now + 120 s` (`Operator(Expiry { now })`); then, off
+  the node's thread as `Ingress::signed` does, the envelope decoded
+  (`Malformed`) and its signature checked (`BadSignature`), so a body as
+  large as an install is copied only for a listed key's request to this
+  node in time; the inner body decodes (`Malformed`); for a write kind,
+  the nonce recorded (below); then the command runs as today. The
+  signature comes before the store, so junk fills nothing.
 - **Recording a nonce** (the review's M4) is one step on the node's
   thread, after the signature returns: an insert of `(key, nonce)` if
   absent (`Operator(Replayed)` if present), so two copies of one request
@@ -289,7 +291,11 @@ its expiry; socket-only until built.
   [orchestrator, Q3(a)]; after the first start the node reads only
   `operator.pub`. `admin.token` goes with the node's HTTP (C10). The
   client's `Operator` learns the node's time from `Expiry { now }`, as
-  `with_learned_time` does for queries, and signs again once.
+  `with_learned_time` does for queries, and signs again once, with the
+  same nonce: a relay that holds the first copy back and forges the
+  refusal gets the command run once between the two (the Opus review's
+  M3). A signed command may go again on a fresh connection, its nonce
+  deduping it.
 - **The interim** [decided, S46]: until the envelope lands (commit C5,
   §9), operator kinds take their bare body, on the unix socket only; over
   QUIC they are answered `Rejected(Operator(SocketOnly))`. Once it lands,
@@ -340,7 +346,13 @@ its expiry; socket-only until built.
   connection never caps a co-located gateway or a driver below the
   node's own; the gateway still keeps a few socket connections a node, and
   the numbers are recorded with S50's re-measure. The verification budget
-  of 7.11 (`Busy`) is per node.
+  of 7.11 (`Busy`) is per node. Over QUIC a client proves its address
+  first (a Retry), at most 64 handshakes are under way, each within 10 s,
+  and `api_connections` counts connections that shook hands. A frame's
+  deadline runs from its own first byte. Queries waiting for their
+  replica to reach their floor are at most `floor_waits` (256): one past
+  them is answered `Behind` at once, so slow reads cannot hold a
+  connection's in-flight places for long.
 - **One handler:** `Ingress::handle`'s routing becomes
   `api::handle(kind, body, transport) → answer bytes`, which both
   transports and, while it exists, the node's HTTP call: the HTTP ingress
@@ -357,7 +369,9 @@ its expiry; socket-only until built.
     node API over a byte stream (multiplexed) and over QUIC (a stream a
     request), generic over futures-io, the QUIC side over quinn's own
     API whatever its runtime. The node, the gateway, the client and the
-    7.13 client facility share it.
+    7.13 client facility share it. The multiplexed client only queues a
+    whole frame; its task writes it, so a request cancelled at any point
+    leaves no part of a frame on a stream others share.
   - `vos-http` (`node/http`): the HTTP server (`http.rs`, moved from the
     node and made runtime-neutral: an accept stream and a spawn function
     in place of `smol::net::TcpListener` and the node's runtime), the
@@ -436,7 +450,11 @@ its expiry; socket-only until built.
   reading its body or sending anything to a node, checks the limit, then
   relays the frame to a node under a fresh upstream id and maps the answer
   back. At most 16 requests in flight a channel, past which it stops
-  reading; each frame within 60 s of its first byte. s4-server gains a hook
+  reading; each frame within 60 s of its first byte. A channel holds a
+  place among its address's connections, as an HTTP connection does; each
+  frame takes a token of its address's rate (past it, the channel closes)
+  and, while in flight, a place among its address's (past them, it is
+  answered `Unavailable`). An IPv6 address counts by its /64. s4-server gains a hook
   for a named subsystem with a raw channel (`Server::subsystem(name,
   handler)`), in the s4 repository (S40 makes s4 Claude's to change),
   under s4's own rule for channel input: the SSH loop's `data` callback

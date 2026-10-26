@@ -114,6 +114,9 @@ pub struct Reader {
     framing: Framing,
     mode: Mode,
     buffer: Vec<u8>,
+    /// Where the next frame starts in `buffer`: the frames before it are
+    /// taken, their bytes dropped when more arrive.
+    at: usize,
     done: bool,
 }
 
@@ -133,6 +136,7 @@ impl Reader {
             framing,
             mode,
             buffer: Vec::new(),
+            at: 0,
             done: false,
         }
     }
@@ -140,13 +144,15 @@ impl Reader {
     /// Bytes that arrived.
     pub fn push(&mut self, bytes: &[u8]) {
         if !self.done {
+            self.buffer.drain(..self.at);
+            self.at = 0;
             self.buffer.extend_from_slice(bytes);
         }
     }
 
     /// Whether a frame is part read: its deadline runs.
     pub fn pending(&self) -> bool {
-        !self.done && !self.buffer.is_empty()
+        !self.done && self.buffer.len() > self.at
     }
 
     /// The next frame, or the frame error that ends the reader; `None`
@@ -156,20 +162,21 @@ impl Reader {
             return None;
         }
         let framing = self.framing;
-        if self.buffer.len() < 6 {
+        let bytes = &self.buffer[self.at..];
+        if bytes.len() < 6 {
             return None;
         }
-        let length = u32::from_le_bytes(self.buffer[..4].try_into().expect("four bytes"));
-        let kind = u16::from_le_bytes(self.buffer[4..6].try_into().expect("two bytes"));
+        let length = u32::from_le_bytes(bytes[..4].try_into().expect("four bytes"));
+        let kind = u16::from_le_bytes(bytes[4..6].try_into().expect("two bytes"));
         if length < framing.rest() {
             return self.fail(FrameError::Truncated, 0);
         }
-        if self.buffer.len() < framing.header() {
+        if bytes.len() < framing.header() {
             return None;
         }
         let id = match framing {
             Framing::Quic => 0,
-            Framing::Stream => u64::from_le_bytes(self.buffer[6..14].try_into().expect("eight")),
+            Framing::Stream => u64::from_le_bytes(bytes[6..14].try_into().expect("eight")),
         };
         let header = Header { length, kind, id };
         let body = header.body(framing).expect("checked above");
@@ -189,11 +196,11 @@ impl Reader {
             return self.fail(FrameError::Oversize { limit }, id);
         }
         let end = framing.header() + body as usize;
-        if self.buffer.len() < end {
+        if bytes.len() < end {
             return None;
         }
-        let body = self.buffer[framing.header()..end].to_vec();
-        self.buffer.drain(..end);
+        let body = bytes[framing.header()..end].to_vec();
+        self.at += end;
         Some(Event::Frame(Frame { kind, id, body }))
     }
 
@@ -202,9 +209,10 @@ impl Reader {
         if !self.pending() {
             return None;
         }
+        let bytes = &self.buffer[self.at..];
         let id = match self.framing {
-            Framing::Stream if self.buffer.len() >= Framing::Stream.header() => {
-                u64::from_le_bytes(self.buffer[6..14].try_into().expect("eight"))
+            Framing::Stream if bytes.len() >= Framing::Stream.header() => {
+                u64::from_le_bytes(bytes[6..14].try_into().expect("eight"))
             }
             _ => 0,
         };

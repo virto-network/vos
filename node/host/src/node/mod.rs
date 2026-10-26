@@ -156,6 +156,8 @@ pub(crate) struct Inner {
     pub(crate) calls: crate::calls::Calls,
     /// The read indexes this replica asked its leaders for.
     pub(crate) reads: crate::asking::Waits<Option<u64>>,
+    /// Queries waiting for their replica to apply through their floor.
+    pub(crate) floor_waits: std::sync::atomic::AtomicUsize,
     /// The anchor rows the representative's leader here asked its
     /// replicas for: each answer's node and root.
     pub(crate) anchor_rows: crate::asking::Waits<(NodeNumber, Option<[u8; 32]>)>,

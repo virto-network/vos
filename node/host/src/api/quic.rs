@@ -22,6 +22,12 @@ const IDLE: Duration = Duration::from_secs(30);
 const STREAM_WINDOW: u32 = 1 << 20;
 /// The code a stream is stopped or reset with.
 const STOPPED: VarInt = VarInt::from_u32(0);
+/// The code a connection past the node's bound is closed with.
+const FULL: VarInt = VarInt::from_u32(1);
+/// Handshakes under way at once: past them, a client is refused.
+const HANDSHAKES: usize = 64;
+/// How long a handshake may take.
+const HANDSHAKE: Duration = Duration::from_secs(10);
 
 /// The API's QUIC endpoint, served until dropped.
 pub(crate) struct Served {
@@ -105,27 +111,46 @@ impl Drop for Place {
     }
 }
 
+/// A place among `open`, if fewer than `most` hold one.
+fn take(open: &Arc<AtomicUsize>, most: usize) -> Option<Place> {
+    open.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
+        (held < most).then_some(held + 1)
+    })
+    .ok()
+    .map(|_| Place(Arc::clone(open)))
+}
+
 async fn accept(api: Arc<Api>, endpoint: quinn::Endpoint, spawner: Spawner, limits: Limits) {
     let limits = Arc::new(limits);
-    let open = Arc::new(AtomicUsize::new(0));
+    let (open, handshaking) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
     while let Some(incoming) = endpoint.accept().await {
-        let taken = open.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
-            (held < limits.connections).then_some(held + 1)
-        });
-        if taken.is_err() {
-            incoming.refuse();
+        // A client proves its address first, so a flood from addresses
+        // that are not its sender's holds no handshake.
+        if !incoming.remote_address_validated() {
+            let _ = incoming.retry();
             continue;
         }
-        let place = Place(Arc::clone(&open));
+        let Some(shaking) = take(&handshaking, HANDSHAKES) else {
+            incoming.refuse();
+            continue;
+        };
         let (api, limits, streams) = (Arc::clone(&api), Arc::clone(&limits), spawner.clone());
+        let open = Arc::clone(&open);
         let Some(task) = spawner.spawn(async move {
-            let _place = place;
-            let connection = match incoming.await {
-                Ok(connection) => connection,
-                Err(error) => {
+            let connection = match timeout(HANDSHAKE, async { incoming.await }).await {
+                Some(Ok(connection)) => connection,
+                Some(Err(error)) => {
                     tracing::debug!(%error, "an API client's handshake failed");
                     return;
                 }
+                None => return,
+            };
+            drop(shaking);
+            // Past the connections allowed, one is closed once it shook
+            // hands: a listed client's, as the handshake checked its key.
+            let Some(_place) = take(&open, limits.connections) else {
+                connection.close(FULL, b"");
+                return;
             };
             while let Ok((send, receive)) = connection.accept_bi().await {
                 let api = Arc::clone(&api);

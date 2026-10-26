@@ -32,15 +32,34 @@ struct Bucket {
     at: Instant,
 }
 
-/// Buckets kept before the full ones are let go: a full bucket is a fresh
-/// one.
+/// Buckets kept: past them the full ones are let go (a full bucket is a
+/// fresh one), then the longest idle.
 const BUCKETS: usize = 1 << 14;
+/// The shortest time between two sweeps of the buckets.
+const SWEEP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The address a limit counts: an IPv6 address's /64, which one
+/// subscriber holds whole, else the address.
+pub fn counted(address: IpAddr) -> IpAddr {
+    match address {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6((u128::from(v6) & !((1u128 << 64) - 1)).into()),
+        },
+        v4 => v4,
+    }
+}
 
 /// Each address's connections and requests.
 pub struct Limits {
     per: PerAddress,
     open: Mutex<HashMap<IpAddr, usize>>,
-    buckets: Mutex<HashMap<IpAddr, Bucket>>,
+    buckets: Mutex<Buckets>,
+}
+
+struct Buckets {
+    by: HashMap<IpAddr, Bucket>,
+    swept: Instant,
 }
 
 /// A connection's place among its address's, given back when it ends.
@@ -66,13 +85,17 @@ impl Limits {
         Arc::new(Self {
             per,
             open: Mutex::new(HashMap::new()),
-            buckets: Mutex::new(HashMap::new()),
+            buckets: Mutex::new(Buckets {
+                by: HashMap::new(),
+                swept: Instant::now(),
+            }),
         })
     }
 
     /// A place for a connection from `address`, if it holds fewer than its
     /// limit.
     pub fn connect(self: &Arc<Self>, address: IpAddr) -> Option<Place> {
+        let address = counted(address);
         let mut open = self.open.lock().expect("the open connections");
         let count = open.entry(address).or_insert(0);
         if *count >= self.per.connections {
@@ -88,15 +111,24 @@ impl Limits {
     /// Whether `address` may make a request now: a token taken from its
     /// bucket.
     pub fn request(&self, address: IpAddr) -> bool {
+        let address = counted(address);
         let now = Instant::now();
         let (rate, burst) = (f64::from(self.per.rate), f64::from(self.per.burst.max(1)));
         let mut buckets = self.buckets.lock().expect("the buckets");
-        if buckets.len() >= BUCKETS {
-            buckets.retain(|_, bucket| {
+        if buckets.by.len() >= BUCKETS && now.duration_since(buckets.swept) >= SWEEP {
+            buckets.swept = now;
+            buckets.by.retain(|_, bucket| {
                 bucket.tokens + now.duration_since(bucket.at).as_secs_f64() * rate < burst
             });
+            if buckets.by.len() >= BUCKETS {
+                // Still full: the longest idle half goes.
+                let mut idle: Vec<Instant> = buckets.by.values().map(|bucket| bucket.at).collect();
+                idle.sort_unstable();
+                let cut = idle[idle.len() / 2];
+                buckets.by.retain(|_, bucket| bucket.at > cut);
+            }
         }
-        let bucket = buckets.entry(address).or_insert(Bucket {
+        let bucket = buckets.by.entry(address).or_insert(Bucket {
             tokens: burst,
             at: now,
         });
@@ -134,5 +166,11 @@ mod tests {
         assert!((0..3).all(|_| limits.request(address)));
         assert!(!limits.request(address), "past the burst");
         assert!(limits.request(other), "another address's own");
+        // One subscriber's /64 is one address.
+        let first: IpAddr = "2001:db8:1:2::1".parse().unwrap();
+        let second: IpAddr = "2001:db8:1:2:ffff::9".parse().unwrap();
+        assert!((0..3).all(|_| limits.request(first)));
+        assert!(!limits.request(second));
+        assert_eq!(counted("::ffff:10.0.0.1".parse().unwrap()), address);
     }
 }
