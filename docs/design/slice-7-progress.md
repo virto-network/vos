@@ -2086,3 +2086,144 @@ the device suite 24 of 24 (`heavy` gated off), the device degree audit,
 `logup_trace_builder`'s bit-identity test, `fixtures::` (format 35 byte for
 byte), `just check` green (1,466 passed in 106 suites; 12 GiB scope,
 `nice -n 10`, 10 jobs).
+
+## Step 7.10b: the node API and the gateway
+
+Branch `s7/7.10b`, from vos-core `ad1ff380`. The brief, `node-api.md`,
+revised with Fable's review (`research/slice-7/7.10b-brief-fable.md`,
+fix-then-implement): M1–M8 and L1–L15 folded, the questions answered in
+its §10 (Q-C, s4 as a git dependency from its `vos` branch, the owner's).
+
+**Built** (C1–C9 of the brief's plan; C10, deleting the node's HTTP,
+waits on S50's gate):
+- **`vos-api`** (`node/api`): the frame (a `u32` LE length, a `u16` kind,
+  on a byte stream a `u64` id), a sans-IO `Reader` that checks each header
+  before keeping its body (length, kind, a relay's set, the kind's limit),
+  `Kind` and its table, `FrameError` with `Unavailable`, `Operated` naming
+  its node; a multiplexed client over any byte stream and a QUIC client.
+  `Rejection::Operator` (index 10) and `cap::MAX_ELF` in `vos-wire`; fuzz
+  targets `api_reader` and `operated_decode` in `just fuzz`.
+- **`vos-http`** (`node/http`): the HTTP server made runtime-neutral, the
+  public TLS, and the route table both fronts run.
+- **The node**: one handler (`api::handle`), its own HTTP a translation
+  onto it; the unix socket (`api_socket`, a lock file against twins, the
+  file bound beside its path and moved in with its mode); the QUIC endpoint
+  on its own port and thread (`api_listen`, `gateways`, ALPN `vos-api/1`);
+  `api_connections`, `api_in_flight`, a frame's deadline, `floor_waits`;
+  signed operator requests on every transport (`operators`,
+  `local_operator`, `operator.key` and `operator.pub`), the nonce recorded
+  in one step and synced before the command, the reads recording none.
+- **The client**: `unix:` and `quic://` targets, a transport of HTTP's
+  requests over either (translated by the route table), redirects over the
+  API by the client's routes, the operator signing for one node (the
+  envelope as the body, or in the `Authorization` header over HTTP),
+  `Trust::Gateway`. `vos` signs operator commands with `operator.key`.
+- **`vos-gateway`** (`node/gateway`): HTTP byte for byte onto the nodes'
+  APIs, public TLS, limits per address, leader-aware routing; with its
+  `ssh` feature (`just test-gateway-ssh`), s4's SSH port and the `vos-api`
+  subsystem, and `app.key`.
+- **s4**: the named-subsystem hook, `bd3c435` on s4's `vos` branch, under
+  s4's gate, now on codeberg (`Virto/s4`); the gateway pins it by git rev
+  at `cee80d95` (the hook and an advisory fix) behind its `ssh` feature,
+  off by default: s4's crates ask Rust 1.94.1, which the workspace's
+  nightly builds with `--ignore-rust-version`.
+- **`vos-scale`**: the drivers over QUIC (one connection a node, a stream
+  a request, the deployed `driver.key` listed in `gateways`), the
+  coordinator signing with the deployed `operator.key`, each node's `api`
+  port, and the gateway's cost, a row of its own. The checker's processes
+  and the served cluster reach their nodes over the API's sockets as their
+  options and seeds choose; a kill suite's client calls through a gateway.
+
+**Tests:** the brief's 1–18 (with the Fable fold: the install-size
+budget and the head-time refusals at the gateway and over QUIC, a dead
+upstream delaying no other's requests, `NotLeader` followed, a client's
+pin across a 421, an install in the corpus): the codec's pins and proptests; each kind's
+limit from its header, unknown kinds, truncated frames, out-of-order
+answers, the in-flight bound, the deadline and the connections, a stale
+socket and its twin (`tests/ingress/api.rs`, `quic.rs`); every operator
+refusal on both transports, two copies at once, a replay after a restart,
+the nonces' bound (`operator_api.rs`); one client and operator over HTTP,
+the socket and QUIC (`transports.rs`); the differential corpus, a signed
+call altered, the burst's 429, a 413 that reaches no node, redirects
+followed and operators routed by their node, a client pinning the
+gateway (`node/gateway/tests/gateway.rs`); the `vos-api` subsystem's relay
+set, `Unavailable` keeping the channel, sixteen in flight
+(`node/gateway/tests/ssh.rs`); the scale pool over QUIC against a node.
+
+**Measured** (test 16): the localhost smoke over the node API, three
+nodes and a driver on this machine (`--exclude n4`: four would not fit
+the disk check), 20 s at 50 calls/s: 1,016 sent, 0 errors (the 7
+`cut_read`s `Attesting`, a 20 s run being shorter than a window), p99
+32.8 ms; the gateway's row: 173/500 µs p50/p99 through it against
+144/721 µs to the node's API (a smoke's numbers only).
+
+**Review (Opus):** no authority leak found (operator commands run only
+signed, or behind the node's own token; no node other than the one an
+envelope names; the relay set enforced from the header). Folded: H1 (the
+multiplexed client's cancelled write could leave half a frame on a shared
+socket: requests now queue whole frames for a writer task); H2 (one
+address could stall a node's sockets: SSH channels and in-flight frames
+take places among their address's, each frame a token of its rate, and
+the node bounds queries waiting for a floor); M1 (a frame's deadline runs
+from its own first byte); M2 (QUIC Retry, handshakes bounded and timed,
+connections counted after the handshake); M3 (the re-sign after `Expiry`
+keeps its nonce); M4 (the envelope checked from its fixed prefix before
+it is decoded, off the node's thread); M5 (IPv6 by /64, the buckets'
+sweep bounded); L2, L3, L5, L6, L9, L10. Left: L1 (a nonce forgotten as
+the wall clock passes its expiry could be taken again if the clock steps
+back past it), L4 (dials under the upstream's lock), L7 (a node's closing
+frame error passed on an SSH channel left open), L8 (no write deadlines,
+as before), and M4's head-time refusal of an install-size body at the
+gateway and a budget of large bodies in flight; all but L7 and L8 folded
+with Fable's review, below.
+
+**Gates:** `just check` green after the fold (EXIT 0; 12 GiB scope, `nice -n 10`, 6 jobs), `just test-gateway-ssh` green.
+
+**Review (Fable):** fix-then-merge; M1, M2, L1, L2, L3, L5, L6, L9, L10,
+L11, L12 folded (`research/slice-7/7.10b-fable.md`). No authority found
+beyond relaying, on any transport; the two mediums were the public
+face's availability:
+- **M1** (no budget for install-size bodies: one address could hold
+  4 GiB of the gateway's memory with no key): `vos-http`'s
+  `Limits::large`, at most four bodies past the ordinary limit held at
+  once from every connection, a request past them answered 503 from its
+  head, its body unread, on the node's own HTTP too; and a server's head
+  hook, with which the gateway answers an operator's route with no
+  `Operated` header 401, and one signed for a node behind no upstream
+  421, before any body is read, as the whole request would be (L5: its
+  429 too). This was the gate before the gateway faces the internet; it
+  is closed.
+- **M2** (dials under the upstream's lock: one dead node delayed a share
+  of every read by its dial in turn): a dial holds no lock a request with
+  a connection open waits on, one at a time per upstream; a failed dial
+  marks the node down for a backoff (1 s doubling to 8 s), answered at
+  once while it lasts; reads in turn, and calls to a learned leader, skip
+  a node down or slow to dial while another is ready; a failed request
+  clears only the QUIC connection it used.
+- The lows: a nonce forgotten only past its expiry and the 120 s horizon
+  (L1); the socket's detached requests after a frame error noted in its
+  module and `node-api.md` (L2); QUIC handshakes bounded per address, 8
+  of the 64 (an IPv6 /64), and `api_listen` to be firewalled to gateways
+  and drivers (L3); at most four large bodies across the node's socket
+  and QUIC, the socket reading the next only as one ends, QUIC answering
+  `Unavailable` from the header (L6); tests (L9): a stand-in node
+  answering `NotLeader` followed to the leader it names, then learned (a
+  live cluster answers `NotLeader` only while its leader changes:
+  followers forward calls and read indexes), a successful install in the
+  differential corpus, and a client pinning a gateway following a 421 to
+  a second gateway under the same key; `Operator::send`'s resend
+  answering `Replayed` when the first copy ran, in its doc (L10);
+  `Kind::operator()` naming the table's kinds (L12).
+- **Open:** L7 (a node's closing frame error passed on an SSH channel
+  left open: only under version skew) and L8 (no write deadlines), both
+  acceptable for the step; the review's hand-offs to 7.11 (`Credentialed`
+  and the verification budget) and 7.13 stand.
+
+**Gates after the Fable fold:** the touched suites (`vos-api` 17,
+`vos-http` 3, the node's `ingress` `api::`, `quic::`, `operator_api::`
+and `transports::` 20) and the gateway suite (10, with the `ssh` feature
+on s4's codeberg rev 3 more) green; `just check` green at `89becd5d`
+(EXIT 0, 1,552 passed in 121 suites; 12 GiB scope, `nice -n 10`, 6
+jobs), `just test-gateway-ssh` green at `7c04fb40`.
+
+**Not done:** C10 (S50's gate).

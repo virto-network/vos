@@ -74,7 +74,8 @@ fn a_follower_forwards_a_call_and_answers_once_it_applied_it() {
     let (agent, increment, _) = counter_agent(&cluster, vec![1, 2, 3]);
     let leader = cluster.leader(agent).unwrap();
     let follower = leader % NODES + 1;
-    let mut client = Client::new(cluster.target(follower), SigningKey::from_bytes(&[7; 32]));
+    let mut client = Client::new(cluster.target(follower), SigningKey::from_bytes(&[7; 32]))
+        .with_routes(cluster.routes());
     for (sequence, (by, total)) in [(5u64, 5u64), (2, 7)].into_iter().enumerate() {
         let answer = client
             .call(agent, COUNTER, increment, &by.encode())
@@ -102,7 +103,8 @@ fn a_follower_forwards_no_call_it_cannot_verify() {
     let (agent, increment, value) = counter_agent(&cluster, vec![1, 2, 3]);
     let leader = cluster.leader(agent).unwrap();
     let follower = leader % NODES + 1;
-    let client = Client::new(cluster.target(follower), SigningKey::from_bytes(&[9; 32]));
+    let client = Client::new(cluster.target(follower), SigningKey::from_bytes(&[9; 32]))
+        .with_routes(cluster.routes());
     let body = client
         .call_body(agent, 1, COUNTER, increment, &5u64.encode())
         .unwrap();
@@ -129,7 +131,8 @@ fn a_follower_forwards_no_call_it_cannot_verify() {
 fn a_client_follows_elsewhere_to_a_replica() {
     let cluster = Cluster::new(SEED);
     let (agent, increment, _) = counter_agent(&cluster, vec![1, 2]);
-    let mut client = Client::new(cluster.target(3), SigningKey::from_bytes(&[10; 32]));
+    let mut client = Client::new(cluster.target(3), SigningKey::from_bytes(&[10; 32]))
+        .with_routes(cluster.routes());
     let answer = client
         .call(agent, COUNTER, increment, &4u64.encode())
         .unwrap();
@@ -151,7 +154,8 @@ fn a_leader_whose_clock_trails_times_its_batches_at_the_agents() {
     let cluster = Cluster::new(SEED);
     let (agent, increment, _) = counter_agent(&cluster, vec![1, 2, 3]);
     let leader = cluster.leader(agent).unwrap();
-    let mut client = Client::new(cluster.target(leader), SigningKey::from_bytes(&[8; 32]));
+    let mut client = Client::new(cluster.target(leader), SigningKey::from_bytes(&[8; 32]))
+        .with_routes(cluster.routes());
     let batch_time = || {
         let node = cluster.node(leader).unwrap();
         vos_checker::applied::<u64>(node.store(), agent, &keys::batch_time()).unwrap()
@@ -232,7 +236,8 @@ fn a_follower_holding_back_its_apply_holds_back_its_answer() {
     let (agent, increment, value) = counter_agent(&cluster, vec![1, 2, 3]);
     let leader = cluster.leader(agent).unwrap();
     let follower = leader % NODES + 1;
-    let mut client = Client::new(cluster.target(follower), SigningKey::from_bytes(&[12; 32]));
+    let mut client = Client::new(cluster.target(follower), SigningKey::from_bytes(&[12; 32]))
+        .with_routes(cluster.routes());
     client.identity(agent).unwrap();
     let commits = &cluster.slot(follower).trip.commits;
     std::thread::scope(|scope| {
@@ -337,7 +342,7 @@ fn a_query_a_replica_is_behind_for_goes_to_another() {
     let leader = cluster.leader(agent).unwrap();
     let follower = leader % NODES + 1;
     let key = SigningKey::from_bytes(&[15; 32]);
-    let mut client = Client::new(cluster.target(leader), key.clone());
+    let mut client = Client::new(cluster.target(leader), key.clone()).with_routes(cluster.routes());
     let identity = client.identity(agent).unwrap();
     let commits = &cluster.slot(follower).trip.commits;
     std::thread::scope(|_| {
@@ -355,7 +360,8 @@ fn a_query_a_replica_is_behind_for_goes_to_another() {
             matches!(answer, Ok(Response::Rejected(Rejection::Behind))),
             "{answer:?}"
         );
-        let reader = Client::new(cluster.target(follower), key.clone());
+        let reader =
+            Client::new(cluster.target(follower), key.clone()).with_routes(cluster.routes());
         reader.raise_floor(agent, at);
         let answer = reader
             .query(agent, COUNTER, value, &[], vos_node::wall_clock() + 60_000)

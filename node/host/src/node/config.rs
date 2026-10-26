@@ -132,6 +132,28 @@ pub struct Config {
     /// The most connections the ingress holds open at once: one past them
     /// is closed as it is accepted.
     pub ingress_connections: usize,
+    /// How many queries may wait at once for their replica to apply
+    /// through the index they ask for: one past them is answered behind
+    /// at once, and its client asks another replica.
+    pub floor_waits: usize,
+    /// The most connections the node API holds open at once on each of
+    /// its transports: one past them is refused.
+    pub api_connections: usize,
+    /// The most requests in flight on one connection of the node API:
+    /// past them, its next request is read only as one ends.
+    pub api_in_flight: usize,
+    /// How long a frame of the node API may take to arrive from its first
+    /// byte.
+    pub api_frame_deadline: Duration,
+    /// The operator keys the node lists: each may sign any operator
+    /// request.
+    pub operators: Vec<[u8; 32]>,
+    /// Whether the node also lists the key it keeps in its data directory
+    /// (`operator.key`), made at its first start, for the CLI on its host.
+    pub local_operator: bool,
+    /// The most operator commands' nonces the node keeps at once: past
+    /// them, a command is answered busy until some expire.
+    pub operator_nonces: usize,
 }
 
 impl Config {
@@ -182,6 +204,13 @@ impl Config {
             workflow_waits: 64,
             workflow_wait: Duration::from_millis(vos_wire::ingress::MAX_WORKFLOW_WAIT_MS),
             ingress_connections: 1024,
+            floor_waits: 256,
+            api_connections: 1024,
+            api_in_flight: 1024,
+            api_frame_deadline: vos_http::server::REQUEST_DEADLINE,
+            operators: Vec::new(),
+            local_operator: true,
+            operator_nonces: 1 << 16,
         }
     }
 }
@@ -212,6 +241,10 @@ pub(crate) struct Settings {
     pub(crate) workflow_waits: usize,
     pub(crate) workflow_wait: Duration,
     pub(crate) ingress_connections: usize,
+    pub(crate) floor_waits: usize,
+    pub(crate) api_connections: usize,
+    pub(crate) api_in_flight: usize,
+    pub(crate) api_frame_deadline: Duration,
 }
 
 impl Settings {
@@ -244,6 +277,10 @@ impl Settings {
                 vos_wire::ingress::MAX_WORKFLOW_WAIT_MS,
             )),
             ingress_connections: config.ingress_connections,
+            floor_waits: config.floor_waits,
+            api_connections: config.api_connections,
+            api_in_flight: config.api_in_flight,
+            api_frame_deadline: config.api_frame_deadline,
         }
     }
 }

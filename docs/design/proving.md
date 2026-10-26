@@ -937,7 +937,8 @@ actor's tree, the node and the phone agree word for word.
 `s` is 8 words (below). In the scope's preimage `space` is the `SpaceId`'s
 32 bytes, `agent` the `AgentId` and `instance` the `InstanceId` as 4
 little-endian bytes each, `name` the guard's scope name (1–64 bytes) in
-SCALE (a compact length, then the bytes). `b` is
+SCALE (a `u32` little-endian length, then the bytes, as the codec
+writes them). `b` is
 `identity-and-authority.md` §5's binding digest.
 - **No epoch in `member`** (the Fable review's M7): a revocation removes
   the leaf, and a new secret source is a new `s` and a new leaf.

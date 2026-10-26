@@ -52,6 +52,10 @@ pub use vos_wire::peer::NodeNumber;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// An operator request's nonce as the store keeps it: its key, the nonce,
+/// and the time it is kept until.
+pub type OperatorNonce = ([u8; 32], [u8; 16], u64);
+
 /// One of an agent's rows: its agent-relative key and its value.
 pub type Row = (Vec<u8>, Vec<u8>);
 
@@ -337,6 +341,27 @@ impl Fjall {
             .system()
             .get(node_record(NodeRow::ProverStopping, &[]))?
             .is_some())
+    }
+
+    /// The operator requests' nonces recorded: each one's key, nonce and
+    /// the time it is kept until.
+    pub fn operator_nonces(&self) -> Result<Vec<OperatorNonce>> {
+        let prefix = node_record(NodeRow::OperatorNonce, &[]);
+        let mut nonces = Vec::new();
+        for row in self.system().prefix(&prefix) {
+            let (key, value) = row.into_inner()?;
+            let rest = &key[prefix.len()..];
+            let (Ok(operator), Ok(nonce), Ok(expires)) = (
+                <[u8; 32]>::try_from(&rest[..rest.len().min(32)]),
+                <[u8; 16]>::try_from(rest.get(32..).unwrap_or_default()),
+                <[u8; 8]>::try_from(&value[..]),
+            ) else {
+                tracing::error!("an operator's nonce is misnamed; it is not read");
+                continue;
+            };
+            nonces.push((operator, nonce, u64::from_be_bytes(expires)));
+        }
+        Ok(nonces)
     }
 
     /// The node's last run, as its pair heartbeat numbered it.

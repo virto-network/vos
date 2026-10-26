@@ -10,7 +10,7 @@ use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode};
 
 use super::{
-    Client, ClientError, Http, Target, decode_answer, signed_query, signed_workflow_read,
+    Client, ClientError, Target, Transport, decode_answer, signed_query, signed_workflow_read,
     workflow_read_not_after,
 };
 
@@ -125,8 +125,8 @@ impl Client {
     /// this replica cannot answer now goes to the others in turn, the
     /// client still calling this one. An answer raises the agent's floor.
     fn read(&self, agent: AgentId, path: &str, body: &[u8]) -> Result<Response, ClientError> {
-        let ask = |http: &Http| -> Result<Response, ClientError> {
-            let (status, answered) = http.post_repeatable(path, body)?;
+        let ask = |transport: &Transport| -> Result<Response, ClientError> {
+            let (status, answered) = transport.post_repeatable(path, body)?;
             decode_answer(status, &answered)
         };
         let unanswered = |answer: &Result<Response, ClientError>| {
@@ -141,13 +141,13 @@ impl Client {
                         | Response::Elsewhere { .. })
             )
         };
-        let mut answer = ask(&self.http);
+        let mut answer = ask(&self.transport);
         if unanswered(&answer) {
             for replica in self.other_replicas(agent) {
                 let Ok(target) = self.target_for(&replica) else {
                     continue;
                 };
-                answer = ask(&Http::new(&target));
+                answer = ask(&Transport::new(&target));
                 if !unanswered(&answer) {
                     break;
                 }
@@ -183,7 +183,7 @@ impl Client {
         agent: AgentId,
         instance: InstanceId,
     ) -> Result<Option<Schema>, ClientError> {
-        self.http.schema(agent, instance)
+        self.transport.schema(agent, instance)
     }
 }
 
@@ -193,10 +193,10 @@ pub fn schema(
     agent: AgentId,
     instance: InstanceId,
 ) -> Result<Option<Schema>, ClientError> {
-    Http::new(target).schema(agent, instance)
+    Transport::new(target).schema(agent, instance)
 }
 
-impl Http {
+impl Transport {
     fn schema(&self, agent: AgentId, instance: InstanceId) -> Result<Option<Schema>, ClientError> {
         let path = format!("/agents/{}/instances/{}/schema", agent.0, instance.0);
         let (status, body) = self.get(&path, None)?;

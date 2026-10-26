@@ -51,6 +51,7 @@ if systemctl --user show-environment >/dev/null 2>&1; then echo "user_manager=1"
 echo "linger=$(loginctl show-user "$(id -un)" -p Linger --value 2>/dev/null || echo unknown)"
 if [ -n "$INGRESS" ] && [ -n "$(ss -Hltn "sport = :$INGRESS" 2>/dev/null)" ]; then echo "taken=tcp/$INGRESS"; fi
 if [ -n "$PEER" ] && [ -n "$(ss -Hlun "sport = :$PEER" 2>/dev/null)" ]; then echo "taken=udp/$PEER"; fi
+if [ -n "$API" ] && [ -n "$(ss -Hlun "sport = :$API" 2>/dev/null)" ]; then echo "taken=udp/$API"; fi
 echo "machine_id=$(cat /etc/machine-id 2>/dev/null)"
 echo "ntp_synchronized=$(timedatectl show -p NTPSynchronized --value 2>/dev/null)"
 if command -v chronyc >/dev/null; then
@@ -219,16 +220,21 @@ fn clock(host: &Host) -> Result<(f64, f64), String> {
 
 /// Probe `host`: its facts, without a verdict.
 pub fn probe(host: &Host) -> Result<Facts, String> {
-    let (ingress, peer) = match host.role {
-        Role::Node => (host.ingress.to_string(), host.peer.to_string()),
-        Role::Driver => (String::new(), String::new()),
+    let (ingress, peer, api) = match host.role {
+        Role::Node => (
+            host.ingress.to_string(),
+            host.peer.to_string(),
+            host.api_port().to_string(),
+        ),
+        Role::Driver => (String::new(), String::new(), String::new()),
     };
     let script = format!(
-        "DIR={} ADDR={} INGRESS={} PEER={}\n{PROBE}",
+        "DIR={} ADDR={} INGRESS={} PEER={} API={}\n{PROBE}",
         quote(&host.dir),
         quote(&host.address),
         quote(&ingress),
-        quote(&peer)
+        quote(&peer),
+        quote(&api)
     );
     let text = hosts::run(host, &script)?;
     let mut probe: BTreeMap<String, String> = BTreeMap::new();

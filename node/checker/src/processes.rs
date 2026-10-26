@@ -190,6 +190,11 @@ pub fn target(url: &str, key: &str, tls: bool) -> Target {
 pub struct Options {
     /// TLS on the ingress, clients pinning the nodes' keys.
     pub tls: bool,
+    /// Clients reach the nodes over the node API's sockets, not HTTP.
+    pub api: bool,
+    /// A gateway in front of the nodes' sockets, which clients may reach
+    /// over HTTP ([`Processes::gateway`]).
+    pub gateway: bool,
     /// Lines of each faults file a node reads once, at start: the groups'
     /// timing and compaction, QUIC's idle timeout.
     pub settings: String,
@@ -209,9 +214,9 @@ struct Slot {
     jump: AtomicI64,
     /// The generation its faults file holds.
     written: AtomicU64,
-    /// Its operator, with the token of the run it was made for: kept, so
-    /// that what polls the node goes on one connection.
-    operator: Mutex<Option<(String, Arc<Operator>)>>,
+    /// Its operator, with the start it was made for: kept, so that what
+    /// polls the node goes on one connection.
+    operator: Mutex<Option<(u64, Arc<Operator>)>>,
     /// Its ports, held from its kill to its restart.
     held: Mutex<Vec<HeldPort>>,
 }
@@ -244,6 +249,67 @@ pub struct Processes {
     log: Log,
     /// Nodes that exited before the harness killed them.
     exits: Mutex<Vec<String>>,
+    /// The gateway in front of the nodes, if the options ask for one.
+    front: Option<Front>,
+}
+
+/// A gateway on its own runtime, and what stops it.
+struct Front {
+    target: Target,
+    _stop: tokio::sync::oneshot::Sender<()>,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl Front {
+    /// A gateway in front of the sockets of the nodes whose keys, in hex,
+    /// are `keys` and whose data directories `data` names.
+    fn start(keys: &[String], data: impl Fn(usize) -> PathBuf) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let upstreams = keys
+            .iter()
+            .enumerate()
+            .map(|(at, key)| {
+                let mut node = [0u8; 32];
+                hex::decode_to_slice(key, &mut node).unwrap();
+                vos_gateway::upstream::Upstream::new(
+                    node,
+                    vos_gateway::upstream::Address::Socket(data(at + 1).join("api.sock")),
+                    [0x9a; 32],
+                )
+            })
+            .collect();
+        let gateway = std::sync::Arc::new(vos_gateway::Gateway::new(upstreams));
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        runtime.spawn(vos_gateway::front::serve(
+            gateway,
+            vos_gateway::limits::Limits::new(vos_gateway::limits::PerAddress {
+                connections: 1024,
+                rate: u32::MAX,
+                burst: u32::MAX,
+            }),
+            listener,
+            vos_gateway::front::Http {
+                tls: None,
+                connections: 1024,
+            },
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        Self {
+            target: Target::loopback(&format!("http://{address}")).unwrap(),
+            _stop: stop,
+            _runtime: runtime,
+        }
+    }
 }
 
 /// How long a status or an operator's command may take at one node.
@@ -268,24 +334,53 @@ impl Processes {
         format!("{scheme}://127.0.0.1:{}", self.ingress[number - 1])
     }
 
+    /// The gateway in front of every node, over HTTP, when the options
+    /// ask for one.
+    pub fn gateway(&self) -> Option<&Target> {
+        self.front.as_ref().map(|front| &front.target)
+    }
+
     /// Where node `number`'s ingress is reached.
     pub fn target(&self, number: usize) -> &Target {
         &self.targets[number - 1]
     }
 
-    /// Node `number`'s operator, by the token its run wrote: the same
-    /// one, and its kept connections, until the node starts again.
+    /// Node `number`'s operator, signing with the operator key its data
+    /// directory holds: the same one, and its kept connections, until the
+    /// node starts again.
     pub(crate) fn operator(&self, number: usize) -> Arc<Operator> {
-        let token = std::fs::read_to_string(self.data(number).join(vos_node::ADMIN_TOKEN)).unwrap();
+        let starts = self.slot(number).starts.load(Ordering::SeqCst);
         let mut kept = self.slot(number).operator.lock().unwrap();
-        match &*kept {
-            Some((made_for, operator)) if *made_for == token => Arc::clone(operator),
-            _ => {
-                let operator = Arc::new(Operator::within(self.target(number), &token, OPERATOR));
-                *kept = Some((token, Arc::clone(&operator)));
-                operator
-            }
+        if let Some((made_for, operator)) = &*kept
+            && *made_for == starts
+        {
+            return Arc::clone(operator);
         }
+        let seed = std::fs::read_to_string(self.data(number).join(vos_node::OPERATOR_KEY)).unwrap();
+        let mut secret = [0u8; 32];
+        hex::decode_to_slice(seed.trim(), &mut secret).unwrap();
+        let mut node = [0u8; 32];
+        hex::decode_to_slice(&self.keys[number - 1], &mut node).unwrap();
+        let operator = Arc::new(Operator::signing_within(
+            self.target(number),
+            ed25519_dalek::SigningKey::from_bytes(&secret),
+            vos_wire::ingress::NodeId(node),
+            OPERATOR,
+        ));
+        *kept = Some((starts, Arc::clone(&operator)));
+        operator
+    }
+
+    /// Each node's target by its key, for a client over the node API to
+    /// follow a redirect.
+    pub fn routes(&self) -> std::collections::HashMap<[u8; 32], Target> {
+        (1..=self.count)
+            .map(|number| {
+                let mut key = [0u8; 32];
+                hex::decode_to_slice(&self.keys[number - 1], &mut key).unwrap();
+                (key, self.target(number).clone())
+            })
+            .collect()
     }
 
     pub fn is_running(&self, number: usize) -> bool {
@@ -330,7 +425,12 @@ impl Processes {
             let nodes = (0..count).map(|at| (&*keys[at], relay.listed(at + 1), &*urls[at]));
             std::fs::write(dir.path().join("space"), space_file(nodes)).unwrap();
             let targets = (0..count)
-                .map(|at| target(&urls[at], &keys[at], options.tls))
+                .map(|at| match options.api {
+                    true => {
+                        Target::socket(dir.path().join(format!("node-{}", at + 1)).join("api.sock"))
+                    }
+                    false => target(&urls[at], &keys[at], options.tls),
+                })
                 .collect();
             let processes = Processes {
                 vos: vos.to_path_buf(),
@@ -350,6 +450,7 @@ impl Processes {
                 clients_paused: AtomicBool::new(false),
                 log: Log::default(),
                 exits: Mutex::new(Vec::new()),
+                front: None,
             };
             let started = (1..=count).all(|number| match processes.launch(number) {
                 Some(running) => {
@@ -360,6 +461,13 @@ impl Processes {
                 None => false,
             });
             if started {
+                let mut processes = processes;
+                if options.gateway {
+                    let dir = processes.dir.path().to_path_buf();
+                    processes.front = Some(Front::start(&processes.keys, |number| {
+                        dir.join(format!("node-{number}"))
+                    }));
+                }
                 return processes;
             }
             for number in 1..=count {

@@ -31,6 +31,9 @@ pub struct DeployedNode {
     /// Its key, in hex: clients pin its TLS to it.
     pub key: String,
     pub url: String,
+    /// Its API over QUIC: `quic://address:port`.
+    #[serde(default)]
+    pub api: String,
 }
 
 /// What a deploy shipped, and the space it founded.
@@ -80,6 +83,15 @@ impl Deployed {
     pub fn node(&self, host: &Host) -> Option<&DeployedNode> {
         self.nodes.iter().find(|node| node.name == host.name)
     }
+}
+
+/// The public key, in hex, of the seed `seed`.
+fn public(seed: &[u8; 32]) -> String {
+    hex::encode(
+        ed25519_dalek::SigningKey::from_bytes(seed)
+            .verifying_key()
+            .to_bytes(),
+    )
 }
 
 /// Whether the ELF at `path` is a static x86-64 executable: no
@@ -200,7 +212,13 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
     }
     let local = Deployed::dir(inventory);
     std::fs::create_dir_all(&local).map_err(|error| format!("{}: {error}", local.display()))?;
-    for stale in ["deployed.json", "space", "space.genesis", "agents.json"] {
+    for stale in [
+        "deployed.json",
+        "space",
+        "space.genesis",
+        "agents.json",
+        "node.toml",
+    ] {
         let _ = std::fs::remove_file(local.join(stale));
     }
     // Every entry's units stop, an excluded one's too: none runs on.
@@ -239,6 +257,7 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
             name: host.name.clone(),
             key,
             url: host.ingress_url(),
+            api: host.api_url(),
         })
         .collect();
     let space: String = nodes
@@ -252,16 +271,25 @@ pub fn deploy(inventory: &Inventory, artifacts: &Artifacts) -> Result<Deployed, 
         })
         .collect();
     write(&local.join("space"), &space)?;
-    let settings = toml::to_string(&inventory.node).map_err(|error| error.to_string())?;
-    write(&local.join("node.toml"), &settings)?;
+    // The harness's keys: its operator's, which every node lists and the
+    // coordinator alone holds, and its drivers', which every node's API
+    // admits over QUIC.
+    let operator = public(&crate::keys::seed(&local.join(crate::keys::OPERATOR))?);
+    let driver = public(&crate::keys::seed(&local.join(crate::keys::DRIVER))?);
     let node_hosts = inventory.nodes();
     for host in &node_hosts {
+        let mut settings = inventory.node.clone();
+        settings.insert("operators".into(), vec![operator.clone()].into());
+        settings.insert("gateways".into(), vec![driver.clone()].into());
+        settings.insert(
+            "api_listen".into(),
+            format!("{}:{}", host.address, host.api_port()).into(),
+        );
+        let settings = toml::to_string(&settings).map_err(|error| error.to_string())?;
+        let file = local.join(format!("{}.node.toml", host.name));
+        write(&file, &settings)?;
         hosts::push(host, &local.join("space"), &format!("{}/space", host.dir))?;
-        hosts::push(
-            host,
-            &local.join("node.toml"),
-            &format!("{}/node.toml", host.dir),
-        )?;
+        hosts::push(host, &file, &format!("{}/node.toml", host.dir))?;
     }
     let founder = node_hosts[0];
     let dir = quote(&founder.dir);

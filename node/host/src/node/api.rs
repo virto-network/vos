@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -16,7 +17,7 @@ use vos_wire::peer::{NodeNumber, Placement};
 use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
 
-use super::open::write_token;
+use super::open::write_private;
 use super::{ADMIN_TOKEN, CallError, Error, Inner, Node, Pending, ReplaceError, Reply};
 use crate::queries::Asked;
 use crate::store::Fjall;
@@ -72,6 +73,11 @@ impl Node {
     /// The node's identity, its public key, which its TLS presents.
     pub fn id(&self) -> NodeId {
         self.inner.node_id
+    }
+
+    /// Requests the node API's socket and QUIC endpoint brought.
+    pub fn api_frames(&self) -> u64 {
+        self.api.frames.load(Ordering::Relaxed)
     }
 
     /// Snapshots this node's groups switched to.
@@ -368,20 +374,72 @@ impl Node {
             }
         };
         let token = random();
-        write_token(&self.data.join(ADMIN_TOKEN), &token)
+        write_private(&self.data.join(ADMIN_TOKEN), &token)
             .map_err(|error| Error::Data(error.to_string()))?;
         let listener = smol::block_on(smol::net::TcpListener::bind(address))
             .map_err(|error| Error::Data(error.to_string()))?;
         let local = listener
             .local_addr()
             .map_err(|error| Error::Data(error.to_string()))?;
-        let ingress = crate::ingress::Ingress::new(Arc::clone(&self.inner), token);
         let (stop, stopped) = smol::channel::bounded(1);
-        let task = self
-            .inner
-            .runtime
-            .spawn(ingress.serve(listener, tls, stopped));
-        *lock(&self.ingress) = Some((task, stop));
+        let task = self.inner.runtime.spawn(crate::ingress::serve(
+            Arc::clone(&self.api),
+            token,
+            listener,
+            tls,
+            stopped,
+        ));
+        lock(&self.fronts).push((task, stop));
+        Ok(local)
+    }
+
+    /// Serve the node API on a unix socket at `path`, its file given
+    /// `mode`: whoever may write to it may send any request. A stale
+    /// socket file is replaced; a lock file beside it refuses a second node
+    /// given the same path.
+    pub fn serve_socket(&self, path: &Path, mode: u32) -> Result<(), Error> {
+        let bound = crate::api::socket::bind(path, mode).map_err(Error::Data)?;
+        let settings = &self.inner.settings;
+        let (stop, stopped) = smol::channel::bounded(1);
+        let task = self.inner.runtime.spawn(crate::api::socket::serve(
+            Arc::clone(&self.api),
+            bound,
+            settings.api_connections,
+            settings.api_in_flight,
+            settings.api_frame_deadline,
+            stopped,
+        ));
+        lock(&self.fronts).push((task, stop));
+        Ok(())
+    }
+
+    /// Serve the node API over QUIC on `listen` (`127.0.0.1:0` picks a
+    /// port), to the clients whose keys `gateways` lists, checked at the
+    /// handshake: the address it listens on. A listed key is a transport's
+    /// admission, no authority.
+    pub fn serve_quic(
+        &self,
+        listen: SocketAddr,
+        gateways: Vec<[u8; 32]>,
+    ) -> Result<SocketAddr, Error> {
+        let settings = &self.inner.settings;
+        let limits = crate::api::quic::Limits {
+            connections: settings.api_connections,
+            in_flight: settings.api_in_flight,
+            deadline: settings.api_frame_deadline,
+        };
+        let served = crate::api::quic::serve(
+            Arc::clone(&self.api),
+            &self.secret,
+            listen,
+            gateways,
+            limits,
+        )
+        .map_err(|error| Error::Data(format!("{listen}: {error}")))?;
+        let local = served
+            .local_addr()
+            .map_err(|error| Error::Data(error.to_string()))?;
+        *lock(&self.quic_api) = Some(served);
         Ok(local)
     }
 }

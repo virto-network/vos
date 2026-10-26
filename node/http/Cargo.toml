@@ -1,0 +1,21 @@
+[package]
+name = "vos-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VOS's HTTP front: a small HTTP/1.1 server on any runtime, its public TLS, and the route table that translates today's HTTP routes onto the node API."
+
+[dependencies]
+# Timers on any runtime: async-io drives its own reactor when none runs.
+async-io = "2"
+async-net = "2"
+base64 = "0.22"
+futures-lite = "2"
+futures-rustls = { version = "0.26", default-features = false, features = ["ring"] }
+httparse = "1"
+rcgen = { version = "0.13", default-features = false, features = ["ring"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tracing = "0.1"
+vos-api = { workspace = true }
+vos-net = { workspace = true }
+vos-wire = { workspace = true }

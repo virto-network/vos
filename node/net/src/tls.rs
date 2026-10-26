@@ -20,7 +20,8 @@ use rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
 
 use crate::{NodeKey, NodeNumber};
 
-const ALPN: &[u8] = b"vos/1";
+/// The peers' protocol.
+pub(crate) const ALPN: &[u8] = b"vos/1";
 
 /// An ed25519 key's SubjectPublicKeyInfo, before the key.
 const SPKI_PREFIX: [u8; 12] = [
@@ -151,8 +152,19 @@ impl Identity {
         peers: Table,
         transport: Arc<quinn::TransportConfig>,
     ) -> quinn::ServerConfig {
+        self.server_with(Expect::Configured(peers), ALPN, transport)
+    }
+
+    /// The accepting side of protocol `alpn`, taking the keys `expect`
+    /// takes.
+    pub fn server_with(
+        &self,
+        expect: Expect,
+        alpn: &[u8],
+        transport: Arc<quinn::TransportConfig>,
+    ) -> quinn::ServerConfig {
         let verifier = Arc::new(Verifier {
-            expect: Expect::Configured(peers),
+            expect,
             provider: Arc::clone(&self.provider),
         });
         let mut tls = rustls::ServerConfig::builder_with_provider(Arc::clone(&self.provider))
@@ -162,7 +174,7 @@ impl Identity {
             .with_cert_resolver(Arc::new(
                 rustls::server::AlwaysResolvesServerRawPublicKeys::new(Arc::clone(&self.certified)),
             ));
-        tls.alpn_protocols = vec![ALPN.to_vec()];
+        tls.alpn_protocols = vec![alpn.to_vec()];
         // A resumed session skips the key check, so a peer removed since
         // could still connect: every handshake is a full one.
         tls.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
@@ -180,6 +192,17 @@ impl Identity {
         peer: NodeKey,
         transport: Arc<quinn::TransportConfig>,
     ) -> quinn::ClientConfig {
+        self.client_with(ALPN, peer, transport)
+    }
+
+    /// The dialing side of protocol `alpn`, pinned to the one key it
+    /// dials.
+    pub fn client_with(
+        &self,
+        alpn: &[u8],
+        peer: NodeKey,
+        transport: Arc<quinn::TransportConfig>,
+    ) -> quinn::ClientConfig {
         let verifier = Arc::new(Verifier {
             expect: Expect::Pinned(peer),
             provider: Arc::clone(&self.provider),
@@ -192,7 +215,7 @@ impl Identity {
             .with_client_cert_resolver(Arc::new(
                 rustls::client::AlwaysResolvesClientRawPublicKeys::new(Arc::clone(&self.certified)),
             ));
-        tls.alpn_protocols = vec![ALPN.to_vec()];
+        tls.alpn_protocols = vec![alpn.to_vec()];
         tls.resumption = rustls::client::Resumption::disabled();
         let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(tls)
             .expect("a TLS 1.3 configuration for QUIC");
@@ -267,12 +290,23 @@ fn tls12_refused() -> Result<HandshakeSignatureValid, rustls::Error> {
 const SCHEMES: [SignatureScheme; 1] = [SignatureScheme::ED25519];
 
 /// The keys a side takes.
-#[derive(Debug)]
-enum Expect {
+pub(crate) enum Expect {
     /// The one peer this side dialed.
     Pinned(NodeKey),
     /// Any configured peer.
     Configured(Table),
+    /// Any key the check takes.
+    Listed(Arc<dyn Fn(&NodeKey) -> bool + Send + Sync>),
+}
+
+impl std::fmt::Debug for Expect {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Expect::Pinned(key) => f.debug_tuple("Pinned").field(key).finish(),
+            Expect::Configured(peers) => f.debug_tuple("Configured").field(peers).finish(),
+            Expect::Listed(_) => f.write_str("Listed"),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -289,6 +323,7 @@ impl Verifier {
                 Expect::Configured(peers) => {
                     peers.read().expect("the peer table").contains_key(&key)
                 }
+                Expect::Listed(listed) => listed(&key),
             });
         if expected {
             Ok(())

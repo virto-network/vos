@@ -276,7 +276,8 @@ Ingress verifies the proof and logs only the origin it proves.
   `space` the `SpaceId`'s 32 bytes; `agent`, `instance` and `method` 4
   little-endian bytes each; `program` the statement's program id as 32
   bytes (the circuit's, or for a device proof the kernel's); `kind` one
-  byte; `arguments` in SCALE (a compact length, then the bytes); `nonce`
+  byte; `arguments` as the codec writes them (a `u32` little-endian
+  length, then the bytes); `nonce`
   16 bytes; `expires_ms` 8 little-endian bytes. The proof's public
   `binding` is `C(T(binding), W(b))` (`proving.md` §8). So a proof
   authorizes one call: one space, agent, instance and method, one

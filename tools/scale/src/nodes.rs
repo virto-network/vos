@@ -1,7 +1,7 @@
 //! `up` and `down`: each node a `vos node run` in a user unit under the
 //! harness's memory cap, its ingress over the node's own TLS (clients pin
-//! its key; the harness makes no certificates), with a sampler beside it;
-//! stopped by their units' names.
+//! its key; the harness makes no certificates) and its API over QUIC, with
+//! a sampler beside it; stopped by their units' names.
 
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use vos_node::tls::Trust;
 
 use crate::check::{self, Facts};
 use crate::deploy::{Deployed, DeployedNode};
-use crate::hosts::{self, Unit, quote};
+use crate::hosts::{self, Unit};
 use crate::inventory::{Host, Inventory, Role};
 use crate::runs::Run;
 
@@ -32,13 +32,20 @@ pub fn target(node: &DeployedNode) -> Result<Target, String> {
     Target::new(&node.url, Trust::NodeKey(key)).map_err(|error| error.to_string())
 }
 
-/// `host`'s node's operator, by the admin token its data directory holds.
-pub fn operator(host: &Host, node: &DeployedNode, answer: Duration) -> Result<Operator, String> {
-    let token = hosts::run(
-        host,
-        &format!("cat {}/data/{}\n", quote(&host.dir), vos_node::ADMIN_TOKEN),
-    )?;
-    Ok(Operator::within(&target(node)?, token.trim(), answer))
+/// `node`'s operator: the harness's operator key, which every node
+/// lists, signing for that node alone.
+pub fn operator(
+    inventory: &Inventory,
+    node: &DeployedNode,
+    answer: Duration,
+) -> Result<Operator, String> {
+    let seed = crate::keys::seed(&Deployed::dir(inventory).join(crate::keys::OPERATOR))?;
+    Ok(Operator::signing_within(
+        &target(node)?,
+        ed25519_dalek::SigningKey::from_bytes(&seed),
+        vos_wire::ingress::NodeId(crate::keys::hex32(&node.key)?),
+        answer,
+    ))
 }
 
 fn node_unit<'a>(host: &'a Host, run: &Run, inventory: &'a Inventory) -> Unit<'a> {

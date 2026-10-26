@@ -9,7 +9,7 @@ use vos_wire::defaults;
 use vos_wire::ids::{AgentId, InstanceId, MethodId};
 use vos_wire::ingress::{Contact, Rejection, Response};
 
-use super::{Client, ClientError, Http, decode_answer, signed_call};
+use super::{Client, ClientError, Transport, decode_answer, signed_call};
 
 /// What became of a call whose fate was unknown, once its session was
 /// refused.
@@ -201,7 +201,7 @@ impl Client {
     /// trusts nodes: by the same CAs, or pinned by the key the redirecting
     /// node gave, as this client already trusts what that node says.
     fn follow(&mut self, contact: &Contact) -> Result<(), ClientError> {
-        self.http = Http::new(&self.target_for(contact)?);
+        self.transport = Transport::new(&self.target_for(contact)?);
         Ok(())
     }
 
@@ -217,7 +217,7 @@ impl Client {
     ) -> Result<Response, ClientError> {
         let body = self.call_body(agent, sequence, instance, method, arguments)?;
         let path = format!("/agents/{}/calls", agent.0);
-        let (status, body) = self.http.post_repeatable(&path, &body)?;
+        let (status, body) = self.transport.post_repeatable(&path, &body)?;
         decode_answer(status, &body)
     }
 

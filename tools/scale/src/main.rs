@@ -12,9 +12,11 @@ mod collect;
 mod deploy;
 mod drive;
 mod engine;
+mod gateway;
 mod histogram;
 mod hosts;
 mod inventory;
+mod keys;
 mod load;
 mod nodes;
 mod report;
@@ -479,7 +481,17 @@ fn run(cli: Cli) -> Result<(), String> {
                     };
                     make_agents(&inventory, &args, Some(&run))
                 })
-                .and_then(|()| drive_and_poll(&inventory, &run, &load));
+                .and_then(|()| drive_and_poll(&inventory, &run, &load))
+                .map(|()| {
+                    // The gateway's cost, a row of its own, while the
+                    // nodes still run.
+                    if inventory.harness.transport == inventory::Transport::Api {
+                        match gateway::measure(&inventory, &run) {
+                            Ok(cost) => eprintln!("{}", cost.line()),
+                            Err(error) => eprintln!("the gateway's cost: {error}"),
+                        }
+                    }
+                });
             let stopped = nodes::down(&inventory);
             // A failed run is collected too, for its logs.
             let gathered = collect::gather(&inventory, &run);

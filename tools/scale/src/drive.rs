@@ -52,6 +52,12 @@ pub struct Plan {
     /// node's `ingress_connections`, its drivers' together.
     #[serde(default = "connections")]
     pub connections: usize,
+    /// The seed, in hex, of the key the driver presents to the nodes'
+    /// APIs over QUIC, which every node admits: with it, the driver keeps
+    /// one QUIC connection a node and sends a stream a request; without
+    /// it, HTTPS connections.
+    #[serde(default)]
+    pub driver_key: Option<String>,
 }
 
 fn connections() -> usize {
@@ -86,9 +92,9 @@ fn leaders(inventory: &Inventory, deployed: &Deployed, placed: &mut [Placed]) {
         .nodes()
         .iter()
         .map(|host| {
-            deployed
-                .node(host)
-                .and_then(|node| crate::nodes::operator(host, node, Duration::from_secs(10)).ok())
+            deployed.node(host).and_then(|node| {
+                crate::nodes::operator(inventory, node, Duration::from_secs(10)).ok()
+            })
         })
         .collect();
     for agent in placed {
@@ -125,7 +131,8 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
         .get("ingress_connections")
         .and_then(toml::Value::as_integer)
         .map_or(1_024, |value| value.max(0) as usize);
-    if connections * drivers.len() > ingress {
+    let api = inventory.harness.transport == crate::inventory::Transport::Api;
+    if !api && connections * drivers.len() > ingress {
         return Err(format!(
             "{} drivers keep {connections} connections a node each, past the nodes' ingress_connections ({ingress}): raise [node] ingress_connections, or lower [harness] driver_connections",
             drivers.len()
@@ -163,6 +170,12 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
             window,
             probe: false,
             connections,
+            driver_key: api
+                .then(|| {
+                    crate::keys::seed(&Deployed::dir(inventory).join(crate::keys::DRIVER))
+                        .map(hex::encode)
+                })
+                .transpose()?,
         };
         drain_s = plan.drain_ms().div_ceil(1_000);
         let local = run.file(&format!("drive-{}.json", host.name));

@@ -37,6 +37,9 @@ vos-node = { path = "../host", features = ["dump"] }
 vos-net = { workspace = true }
 vos-testkit = { path = "../../agent/testkit" }
 vos-wire = { workspace = true }
+# The end-to-end suites through a gateway in front of the nodes' sockets.
+vos-gateway = { path = "../gateway" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync"] }
 
 [dev-dependencies]
 # The carrier audit's tests: a root laid out as postcard lays it out.

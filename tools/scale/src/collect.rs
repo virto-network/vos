@@ -34,7 +34,7 @@ pub fn poll(inventory: &Inventory, run: &Run, stop: &AtomicBool) -> Result<(), S
             let node = deployed
                 .node(host)
                 .ok_or_else(|| format!("{}: not deployed", host.name))?;
-            Ok((node.number, operator(host, node, READ)?))
+            Ok((node.number, operator(inventory, node, READ)?))
         })
         .collect::<Result<Vec<_>, String>>()?;
     let path = run.file("nodes.jsonl");

@@ -1,14 +1,19 @@
-//! The node's HTTP ingress, end to end on the default agent and the
-//! counter actor: client-named sessions, signed calls in their sequences,
-//! the reply window, expiry, the operator's token, and workflows started
-//! by clients and read by their owners.
+//! The node's HTTP ingress and its API's socket, end to end on the default
+//! agent and the counter actor: client-named sessions, signed calls in
+//! their sequences, the reply window, expiry, the operator's token,
+//! workflows started by clients and read by their owners, and the API's
+//! frames.
 
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod api;
 mod operator;
+mod operator_api;
+mod quic;
 mod requests;
 mod sessions;
+mod transports;
 mod workflows;
 
 use std::io::{Read, Write};
@@ -39,12 +44,16 @@ use vos_wire::{Decode, Encode};
 use vos_wire::{defaults, expiry, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
+/// The seed of the operator key every served node lists.
+const OPERATOR: [u8; 32] = [31; 32];
 
 /// A node serving ingress, with one agent running the counter.
 struct Served {
     node: Node,
     address: SocketAddr,
     target: Target,
+    /// The node API's unix socket.
+    socket: std::path::PathBuf,
     clock: Arc<AtomicU64>,
     token: String,
     agent: AgentId,
@@ -75,9 +84,12 @@ impl Served {
             let clock = Arc::clone(&clock);
             Arc::new(move || clock.load(Ordering::SeqCst))
         };
+        config.operators = vec![SigningKey::from_bytes(&OPERATOR).verifying_key().to_bytes()];
         configure(&mut config);
         let node = Node::open(dir.path(), config).unwrap();
         let address = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
+        let socket = dir.path().join("api.sock");
+        node.serve_socket(&socket, 0o600).unwrap();
         let target = Target::loopback(&format!("http://{address}")).unwrap();
         let token = std::fs::read_to_string(dir.path().join(ADMIN_TOKEN)).unwrap();
         let operator = Operator::new(&target, &token);
@@ -93,6 +105,7 @@ impl Served {
             node,
             address,
             target,
+            socket,
             clock,
             token,
             agent,
@@ -104,6 +117,20 @@ impl Served {
 
     fn now(&self) -> u64 {
         self.clock.load(Ordering::SeqCst)
+    }
+
+    /// An operator request of `kind` holding `body`, signed by the listed
+    /// operator key for this node, with a fresh nonce, good for a minute.
+    fn operated(&self, kind: vos_api::Kind, body: Vec<u8>) -> Vec<u8> {
+        client::signed_operated(
+            self.node.id(),
+            &SigningKey::from_bytes(&OPERATOR),
+            kind,
+            fresh_nonce(),
+            self.now() + 60_000,
+            body,
+        )
+        .encode()
     }
 
     fn client(&self, seed: u8) -> Client {
@@ -159,6 +186,14 @@ impl Served {
         let (_, body) = vos_node::client::post(&self.target, path, body).unwrap();
         Response::decode(&body).unwrap().0
     }
+}
+
+/// A nonce no other request of this process holds.
+fn fresh_nonce() -> [u8; 16] {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let mut nonce = [0u8; 16];
+    nonce[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::SeqCst).to_le_bytes());
+    nonce
 }
 
 /// The status line a raw request gets.

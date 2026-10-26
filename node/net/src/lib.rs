@@ -21,6 +21,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 
+pub mod api;
 pub mod memory;
 pub mod quic;
 mod tls;

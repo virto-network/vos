@@ -7,7 +7,7 @@ default:
 core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
 # The agent's suites' crates, which `test-agent` and `check` run.
-agent_crates := "-p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale"
+agent_crates := "-p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-api -p vos-http -p vos-gateway -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale"
 
 # A guest build for the PVM: the statement's target, its standard library
 # built from source. Every guest and blob build sets `CARGO_INCREMENTAL` to
@@ -206,6 +206,14 @@ test-agent: build-test-actors build-agent build-representative
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
     just test-reads
+
+# The gateway's SSH port and its `vos-api` subsystem (`vos-gateway`'s
+# `ssh` feature), on s4-server: a dependency built apart from the default
+# workspace build, its crates asking a newer stable Rust than the
+# workspace's nightly names, which builds them.
+test-gateway-ssh: build-test-actors build-agent
+    cargo clippy -p vos-gateway --features ssh --ignore-rust-version --all-targets --quiet -- -D warnings
+    cargo test -p vos-gateway --features ssh --ignore-rust-version
 
 # The default agent as a service on a local PolkaJam testnet, which it
 # starts and stops: a workflow suspended in one work package and resumed in
@@ -516,7 +524,7 @@ _kit-workspace:
 # layout's bounds; the statement's and the space's decoders and the venue's
 # check; and prove-then-verify on random programs. A target's property is
 # no panic and nothing accepted but a golden.
-fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode"
+fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode api_reader operated_decode"
 
 # Each target's checked-in corpus (`pvm/proof/fuzz/replay`) run once, every
 # input, optimized and without a sanitizer: no crash. `cargo run --example

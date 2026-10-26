@@ -52,6 +52,9 @@ impl Node {
                 },
             )?;
         let secret = node_secret(&store)?;
+        let operators = crate::api::listed(&data, &config.operators, config.local_operator)
+            .map_err(Error::Data)?;
+        let nonces = crate::api::Nonces::load(&store, (config.clock)(), config.operator_nonces)?;
         // Each run's pair heartbeat outranks the last run's, whatever the
         // clock did between them.
         let incarnation = crate::liveness::next_incarnation(store.incarnation()?);
@@ -144,6 +147,7 @@ impl Node {
             recording: smol::lock::Mutex::new(()),
             calls: crate::calls::Calls::default(),
             reads: crate::asking::Waits::default(),
+            floor_waits: std::sync::atomic::AtomicUsize::new(0),
             anchor_rows: crate::asking::Waits::default(),
             anchor_alerts: Mutex::default(),
             anchor_handed: Mutex::default(),
@@ -165,12 +169,15 @@ impl Node {
         let prover = config
             .prover
             .and_then(|prover| crate::prover::start(&inner, prover, config.prover_options));
+        let api = crate::api::Api::new(Arc::clone(&inner), operators, nonces);
         Ok(Self {
+            api: Arc::new(api),
             inner,
             data,
             secret,
             ingress_tls: config.ingress_tls,
-            ingress: Mutex::new(None),
+            fronts: Mutex::new(Vec::new()),
+            quic_api: Mutex::new(None),
             stop: Some(stop),
             runtime: Some(thread),
             liveness,
@@ -215,10 +222,12 @@ impl Node {
             let _ = stop.send(());
             let _ = thread.join();
         }
-        // End the ingress and its connections while the runtime still runs
-        // them, so none outlives the node holding its store.
-        let ingress = lock(&self.ingress).take();
-        if let Some((task, stop)) = ingress {
+        // End the ingress, the API's socket and their connections while the
+        // runtime still runs them, so none outlives the node holding its
+        // store.
+        drop(lock(&self.quic_api).take());
+        let fronts = std::mem::take(&mut *lock(&self.fronts));
+        for (task, stop) in fronts {
             let _ = stop.try_send(());
             smol::block_on(task);
         }
@@ -422,8 +431,9 @@ fn collect_blobs(inner: &Inner, stopped: &mpsc::Receiver<()>) {
     }
 }
 
-/// Write the operator's token, in hex, readable by its owner only.
-pub(super) fn write_token(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
+/// Write a secret, the operator's token or key, in hex, readable by its
+/// owner only.
+pub(crate) fn write_private(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let hex = hex::encode(token);

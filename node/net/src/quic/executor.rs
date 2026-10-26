@@ -9,14 +9,14 @@ use std::sync::{Arc, Weak};
 /// the network runs on it, quinn's included, so a connection's readers are
 /// polled in the order they were woken: the receiving side's turns rely
 /// on it. Tasks reach it by a [`Spawner`], which does not keep it alive.
-pub(super) struct Runner {
+pub struct Runner {
     executor: Arc<smol::Executor<'static>>,
     stop: smol::channel::Sender<()>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Runner {
-    pub(super) fn start() -> io::Result<Self> {
+    pub fn start() -> io::Result<Self> {
         let executor = Arc::new(smol::Executor::new());
         let (stop, stopped) = smol::channel::bounded::<()>(1);
         let thread = std::thread::Builder::new().name("vos-net".into()).spawn({
@@ -32,7 +32,7 @@ impl Runner {
         })
     }
 
-    pub(super) fn spawner(&self) -> Spawner {
+    pub fn spawner(&self) -> Spawner {
         Spawner(Arc::downgrade(&self.executor))
     }
 }
@@ -50,10 +50,10 @@ impl Drop for Runner {
 
 /// Spawns on the network's executor while it runs.
 #[derive(Clone, Debug)]
-pub(super) struct Spawner(Weak<smol::Executor<'static>>);
+pub struct Spawner(Weak<smol::Executor<'static>>);
 
 impl Spawner {
-    pub(super) fn spawn<T: Send + 'static>(
+    pub fn spawn<T: Send + 'static>(
         &self,
         future: impl Future<Output = T> + Send + 'static,
     ) -> Option<smol::Task<T>> {
@@ -84,7 +84,7 @@ impl Tasks {
 
 /// quinn's smol runtime, spawning on the network's executor.
 #[derive(Debug)]
-pub(super) struct Runtime(pub(super) Spawner);
+pub struct Runtime(pub Spawner);
 
 impl quinn::Runtime for Runtime {
     fn new_timer(&self, at: std::time::Instant) -> Pin<Box<dyn quinn::AsyncTimer>> {

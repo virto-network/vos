@@ -335,6 +335,8 @@ pinned by 7.7.
 - **The binding:** `binding = C(T(binding), W(b))`,
   `b = BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖ agent ‖ instance ‖ method ‖ program ‖ kind ‖ SCALE(arguments) ‖ nonce ‖ expires_ms)`:
   a proof authorizes one call, in one space, under one statement.
+  `SCALE(arguments)` is the codec's, a `u32` little-endian length then the
+  bytes (`node-api.md` §10).
 - **Auth** (`CredentialKind::Auth = 0`), public
   `(kind, map_root, scope, nullifier, binding)`, `kind` one word and each
   digest 8; private `s`, the slot's bits and its path. Proves

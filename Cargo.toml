@@ -7,6 +7,9 @@ members = [
     "agent/testkit",
     "agent/tree",
     "node/host",
+    "node/api",
+    "node/http",
+    "node/gateway",
     "node/net",
     "node/cli",
     "node/checker",
@@ -45,6 +48,9 @@ default-members = [
     "agent/testkit",
     "agent/tree",
     "node/host",
+    "node/api",
+    "node/http",
+    "node/gateway",
     "node/net",
     "node/cli",
     "node/jam",
@@ -211,6 +217,8 @@ vos-pvm-codec-derive = { path = "pvm/codec-derive" }
 vos-wire = { path = "agent/wire" }
 vos-tree = { path = "agent/tree" }
 vos-net = { path = "node/net" }
+vos-api = { path = "node/api" }
+vos-http = { path = "node/http" }
 vos-jam = { path = "node/jam" }
 vos-venue = { path = "node/venue" }
 vos-node-prover = { path = "node/prover" }

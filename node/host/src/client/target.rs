@@ -1,7 +1,8 @@
-//! A node's ingress as a client reaches it: its address, and how the
-//! client trusts it.
+//! A node as a client reaches it: its HTTP address, or its API's socket or
+//! QUIC address, and how the client trusts it.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use rustls::pki_types::ServerName;
@@ -9,11 +10,23 @@ use rustls::pki_types::ServerName;
 use super::ClientError;
 use crate::tls::{self, Trust};
 
-/// A node's ingress, and how this client trusts it.
+/// The node API, as a target reaches it.
+#[derive(Clone)]
+pub(super) enum Api {
+    /// Its unix socket.
+    Socket(PathBuf),
+    /// Its QUIC endpoint, as the client whose seed is `client`.
+    Quic { client: [u8; 32] },
+}
+
+/// A node's ingress or API, and how this client trusts it.
 #[derive(Clone)]
 pub struct Target {
-    /// The `host:port` to connect to, which is also the `Host` header.
+    /// The `host:port` to connect to, which is also the `Host` header; a
+    /// socket's path.
     pub(super) authority: String,
+    /// The node API it reaches, if not HTTP.
+    pub(super) api: Option<Api>,
     /// Where a plain target connects: loopback addresses, never a name a
     /// resolver could answer for.
     pub(super) loopback: Option<Vec<SocketAddr>>,
@@ -36,9 +49,17 @@ impl Target {
 
     /// The node at `url` (`http://` or `https://`, then a host and an
     /// optional port), trusted as `trust` says. Plain HTTP reaches
-    /// loopback addresses only, and HTTPS needs a key or a CA to trust.
+    /// loopback addresses only, and HTTPS needs a key or a CA to trust (or
+    /// a gateway's key). `unix:` and a path reaches the node API's socket,
+    /// whose file mode is the access.
     pub fn new(url: &str, trust: Trust) -> Result<Self, ClientError> {
         let invalid = |why: &str| ClientError::Http(format!("{url}: {why}"));
+        if let Some(path) = url.strip_prefix("unix:") {
+            return Ok(Self::socket(PathBuf::from(path)));
+        }
+        if url.starts_with("quic://") {
+            return Err(invalid("a quic:// node takes a client key: Target::quic"));
+        }
         let (secure, rest) =
             scheme(url).ok_or_else(|| invalid("not an http:// or https:// address"))?;
         let (host, port) = host_and_port(rest, secure).map_err(invalid)?;
@@ -72,9 +93,11 @@ impl Target {
                     (Ok(name), _) => name,
                     // A pinned key does not need the name, which only
                     // goes in the handshake.
-                    (Err(_), Trust::NodeKey(_)) => ServerName::try_from("node.vos")
-                        .expect("a host name")
-                        .to_owned(),
+                    (Err(_), Trust::NodeKey(_) | Trust::Gateway(_)) => {
+                        ServerName::try_from("node.vos")
+                            .expect("a host name")
+                            .to_owned()
+                    }
                     (Err(_), _) => return Err(invalid("not a host name or an address")),
                 };
                 Some((config, name))
@@ -82,9 +105,43 @@ impl Target {
         };
         Ok(Self {
             authority: format!("{host}:{port}"),
+            api: None,
             loopback,
             tls,
             trust,
+        })
+    }
+
+    /// The node API's unix socket at `path`.
+    pub fn socket(path: PathBuf) -> Self {
+        Self {
+            authority: path.display().to_string(),
+            api: Some(Api::Socket(path)),
+            loopback: None,
+            tls: None,
+            trust: Trust::Loopback,
+        }
+    }
+
+    /// The node API over QUIC at `url` (`quic://host:port`), pinned to the
+    /// node whose key is `node`, as the client whose seed is `client`,
+    /// which the node must list in its `gateways`.
+    pub fn quic(url: &str, node: [u8; 32], client: [u8; 32]) -> Result<Self, ClientError> {
+        let invalid = |why: &str| ClientError::Http(format!("{url}: {why}"));
+        let rest = url
+            .strip_prefix("quic://")
+            .ok_or_else(|| invalid("not a quic:// address"))?;
+        let authority = rest.trim_end_matches('/');
+        match authority.rsplit_once(':') {
+            Some((host, port)) if !host.is_empty() && port.parse::<u16>().is_ok() => {}
+            _ => return Err(invalid("a host and a port")),
+        }
+        Ok(Self {
+            authority: authority.to_string(),
+            api: Some(Api::Quic { client }),
+            loopback: None,
+            tls: None,
+            trust: Trust::NodeKey(node),
         })
     }
 

@@ -1,0 +1,40 @@
+[package]
+name = "vos-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VOS's gateway: today's HTTP routes, public TLS, limits per address and leader-aware routing in front of nodes' binary APIs, holding no authority; and s4's SSH port with the vos-api subsystem."
+
+[[bin]]
+name = "vos-gateway"
+path = "src/main.rs"
+
+[features]
+# The SSH port: s4's screens and the `vos-api` subsystem, on s4-server.
+ssh = ["dep:s4-server", "dep:russh"]
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ed25519-dalek = "2"
+getrandom = "0.2"
+hex = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+serde = { workspace = true }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "sync", "signal", "io-util"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+toml = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+vos-api = { workspace = true, features = ["client", "quic"] }
+vos-http = { workspace = true }
+vos-net = { workspace = true }
+vos-wire = { workspace = true }
+s4-server = { git = "https://codeberg.org/Virto/s4", rev = "cee80d95ef6644081c1155c50a3042a95b37b367", optional = true }
+russh = { version = "0.61", default-features = false, features = ["ring", "flate2"], optional = true }
+
+[dev-dependencies]
+# The tests run real nodes behind the gateway: dev edges only.
+vos-node = { path = "../host" }
+vos-checker = { path = "../checker" }
+tempfile = "3"

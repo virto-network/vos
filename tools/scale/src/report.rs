@@ -156,6 +156,9 @@ pub struct Summary {
     pub t2: String,
     /// The load model the drivers ran: `U`, `a`, `r`, the mix, `x`.
     pub model: serde_json::Value,
+    /// The gateway's cost, when the run measured it.
+    #[serde(default)]
+    pub gateway: Option<crate::gateway::Cost>,
 }
 
 fn jsonl<T: for<'de> Deserialize<'de>>(path: &Path) -> Vec<T> {
@@ -633,6 +636,9 @@ pub fn report(
         summary.drivers.push(driver);
     }
     summary.slowest = slowest(&summary);
+    summary.gateway = std::fs::read_to_string(run.file("gateway.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok());
     let node_hosts = facts.iter().filter(|host| host.role == "node").count();
     if node_hosts < 4 {
         summary.warnings.push(format!(
@@ -837,6 +843,9 @@ pub fn text(summary: &Summary) -> String {
             driver.in_use_max,
             driver.connections
         );
+    }
+    if let Some(gateway) = &summary.gateway {
+        text += &format!("  {}\n", gateway.line());
     }
     text += "\n";
     if let Some(slowest) = &summary.slowest {

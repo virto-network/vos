@@ -127,7 +127,7 @@ fn operators(inventory: &Inventory, deployed: &Deployed) -> Result<Vec<Operator>
             let node = deployed
                 .node(host)
                 .ok_or_else(|| format!("{}: not deployed", host.name))?;
-            operator(host, node, ANSWER)
+            operator(inventory, node, ANSWER)
         })
         .collect()
 }

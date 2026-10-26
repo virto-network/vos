@@ -75,7 +75,8 @@ pub struct Cluster {
     pub space: Space,
     agent: Vec<u8>,
     slots: Vec<Slot>,
-    /// Each node's ingress, as clients reach it.
+    /// Each node, as clients reach it: its HTTP ingress, or its API's
+    /// socket.
     targets: Vec<Target>,
     /// What happened: printed, so a run shows what it tried, and the
     /// latest events, for a failure to show what led to it.
@@ -132,9 +133,15 @@ impl Cluster {
                 ingress,
             })
             .collect();
+        // Clients reach the nodes over HTTP on even seeds and over the node
+        // API's sockets on odd ones: one table run two ways.
+        let api = !seed.is_multiple_of(2);
         let targets = slots
             .iter()
-            .map(|slot| Target::loopback(&format!("http://{}", slot.ingress)).unwrap())
+            .map(|slot| match api {
+                true => Target::socket(slot.dir.path().join("api.sock")),
+                false => Target::loopback(&format!("http://{}", slot.ingress)).unwrap(),
+            })
             .collect();
         let offset = Arc::new(AtomicI64::new(0));
         let venue_offset = Arc::clone(&offset);
@@ -217,6 +224,8 @@ impl Cluster {
             assert!(Instant::now() < until, "node {number}: {error:?}");
             std::thread::sleep(Duration::from_millis(10));
         }
+        node.serve_socket(&slot.dir.path().join("api.sock"), 0o600)
+            .unwrap();
         slot.starts.fetch_add(1, Ordering::SeqCst);
         *slot.node.lock().unwrap() = Some(Arc::new(node));
     }
@@ -269,6 +278,16 @@ impl Cluster {
             leading.is_some()
         });
         leading.unwrap()
+    }
+
+    /// Each node's target by its key, for a client over the node API to
+    /// follow a redirect.
+    pub fn routes(&self) -> std::collections::HashMap<[u8; 32], Target> {
+        self.space
+            .nodes()
+            .iter()
+            .map(|node| (node.key, self.target(node.number).clone()))
+            .collect()
     }
 
     /// `agent`'s identity, from the record node `at` serves.

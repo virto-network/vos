@@ -50,6 +50,9 @@ pub(super) enum NodeRow {
     // tag.
     Layout = 0x13,
     ProverStopping = 0x14,
+    /// An operator request's nonce, by its key and nonce: until when it is
+    /// kept (a u64 big-endian, milliseconds by the node's clock).
+    OperatorNonce = 0x15,
 }
 
 /// The keyspace layout this build reads and writes, as the store's layout

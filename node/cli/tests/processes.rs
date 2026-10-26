@@ -2,9 +2,9 @@
 //! over QUIC:
 //! - a leader the relay cuts off from the others is replaced, its calls go
 //!   on, and it catches up once the cut heals;
-//! - three processes as one space take calls through any of them and send
-//!   messages to another agent, through the leader's SIGKILL and its
-//!   restart, every call applied once;
+//! - three processes as one space take calls through a gateway in front of
+//!   them and send messages to another agent, through the leader's SIGKILL
+//!   and its restart, every call applied once;
 //! - a workflow awaiting another agent completes once through its leader's
 //!   SIGKILL and a partition;
 //! - built with `--features faults`, the faults of `mod faults`, which a
@@ -29,11 +29,21 @@ fn start() -> Processes {
     Processes::start(env!("CARGO_BIN_EXE_vos"), 3, Options::default())
 }
 
+/// Its clients and operator over the node API's sockets, redirects
+/// followed by the nodes' keys.
 #[test]
 fn a_leader_cut_off_by_the_relay_is_replaced_and_catches_up() {
-    let space = start();
+    let space = Processes::start(
+        env!("CARGO_BIN_EXE_vos"),
+        3,
+        Options {
+            api: true,
+            ..Options::default()
+        },
+    );
     let agent = space.counter_agent(COUNTER);
-    let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[31; 32]));
+    let mut client =
+        Client::new(space.target(1), SigningKey::from_bytes(&[31; 32])).with_routes(space.routes());
     let add = served_method(&mut client, agent, COUNTER, "increment");
     let mut total = 0;
     for by in 1..=5 {
@@ -59,13 +69,23 @@ fn a_leader_cut_off_by_the_relay_is_replaced_and_catches_up() {
     assert!(space.troubles().is_empty(), "{:?}", space.troubles());
 }
 
+/// Its client through a gateway in front of the nodes' sockets, which
+/// follows the agents' leaders through the kills.
 #[test]
 fn three_processes_apply_every_call_once_through_a_kill() {
-    let space = start();
+    let space = Processes::start(
+        env!("CARGO_BIN_EXE_vos"),
+        3,
+        Options {
+            gateway: true,
+            ..Options::default()
+        },
+    );
     let counter = package("counter");
     let create = || space.agent_with(vec![1, 2, 3], &counter, &[INBOX, COUNTER]);
     let (sender, receiver) = (create(), create());
-    let mut client = Client::new(space.target(1), SigningKey::from_bytes(&[21; 32]));
+    let gateway = space.gateway().expect("a gateway");
+    let mut client = Client::new(gateway, SigningKey::from_bytes(&[21; 32]));
     let schema = client.schema(sender, COUNTER).unwrap().unwrap();
     let (increment, forward, value) = (
         schema.method_id("increment").unwrap(),

@@ -7,6 +7,7 @@ pub mod blobs;
 #[global_allocator]
 static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod api;
 mod asking;
 mod calls;
 pub mod client;
@@ -16,7 +17,6 @@ mod fault;
 #[cfg(feature = "faults")]
 pub mod faults;
 mod group;
-mod http;
 mod ingress;
 mod leader;
 mod liveness;
@@ -36,6 +36,7 @@ pub mod store;
 pub mod tls;
 mod workflows;
 
+pub use api::{OPERATOR_KEY, OPERATOR_PUB};
 pub use leader::AnchorAlert;
 pub use node::{
     ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, ReplaceError, Reply, STORE,
