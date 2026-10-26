@@ -76,6 +76,28 @@ fn shell(host: &Host, command: &str) -> Command {
     }
 }
 
+/// Open the shared connection to every remote host, one machine at a
+/// time, before any command runs on them in parallel: commands racing to
+/// open one connection would each authenticate, a hardware key's touch
+/// apiece, and all but one fail.
+pub fn connect(hosts: &[Host]) -> Result<(), String> {
+    let mut opened: Vec<&str> = Vec::new();
+    for host in hosts.iter().filter(|host| !host.is_local()) {
+        if opened.contains(&host.ssh.as_str()) {
+            continue;
+        }
+        let status = shell(host, "true")
+            .stdin(Stdio::null())
+            .status()
+            .map_err(|error| format!("{}: {error}", host.name))?;
+        if !status.success() {
+            return Err(format!("{}: ssh {} failed", host.name, host.ssh));
+        }
+        opened.push(&host.ssh);
+    }
+    Ok(())
+}
+
 /// `text` as one shell word.
 pub fn quote(text: &str) -> String {
     format!("'{}'", text.replace('\'', r"'\''"))

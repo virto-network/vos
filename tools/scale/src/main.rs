@@ -368,9 +368,14 @@ fn drive_and_poll(inventory: &Inventory, run: &Run, load: &LoadArgs) -> Result<(
 
 fn run(cli: Cli) -> Result<(), String> {
     let inventory = || Inventory::read(&cli.inventory, &cli.exclude);
+    let reached = || {
+        let inventory = inventory()?;
+        hosts::connect(&inventory.hosts)?;
+        Ok::<_, String>(inventory)
+    };
     match cli.command {
         Command::Check { json } => {
-            let inventory = inventory()?;
+            let inventory = reached()?;
             let facts = check::check(&inventory);
             print!("{}", check::table(&facts));
             if let Some(path) = json {
@@ -383,7 +388,7 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Deploy(args) => {
-            let deployed = deploy::deploy(&inventory()?, &artifacts(args))?;
+            let deployed = deploy::deploy(&reached()?, &artifacts(args))?;
             println!(
                 "space {} on {} nodes",
                 deployed.space_id,
@@ -392,29 +397,29 @@ fn run(cli: Cli) -> Result<(), String> {
             Ok(())
         }
         Command::Up { label, force } => {
-            let inventory = inventory()?;
+            let inventory = reached()?;
             let run = Run::new(&inventory, label.as_deref())?;
             nodes::up(&inventory, &run, force)?;
             println!("run {}", run.id);
             Ok(())
         }
         Command::Agents(args) => {
-            let inventory = inventory()?;
+            let inventory = reached()?;
             let run = Run::open(&inventory, None).ok();
             make_agents(&inventory, &args, run.as_ref())
         }
         Command::Drive(load) => {
-            let inventory = inventory()?;
+            let inventory = reached()?;
             let run = Run::open(&inventory, None)?;
             drive_and_poll(&inventory, &run, &load)
         }
         Command::Collect => {
-            let inventory = inventory()?;
+            let inventory = reached()?;
             let run = Run::open(&inventory, None)?;
             keep_agents(&inventory, &run)?;
             collect::gather(&inventory, &run)
         }
-        Command::Down => nodes::down(&inventory()?),
+        Command::Down => nodes::down(&reached()?),
         Command::Report {
             run,
             from_ms,
@@ -445,7 +450,7 @@ fn run(cli: Cli) -> Result<(), String> {
             no_deploy,
             force,
         } => {
-            let inventory = inventory()?;
+            let inventory = reached()?;
             // Interrupted, the run's waits end and its units stop.
             hosts::stop_on_interrupt();
             if !no_deploy {
