@@ -2227,3 +2227,221 @@ on s4's codeberg rev 3 more) green; `just check` green at `89becd5d`
 jobs), `just test-gateway-ssh` green at `7c04fb40`.
 
 **Not done:** C10 (S50's gate).
+
+## Step 7.9: the Poseidon2 host call and the credential actor
+
+Branch `s7/7.9`, from vos-core `ad1ff380`.
+
+**Built:**
+- **The call in the runtime** (pin H's `0x402`): `vos_pvm::precompile::POSEIDON2`
+  at `POSEIDON2_GAS` (2,400), computed by `vos-pvm-poseidon2`'s permutation
+  (`poseidon2_compress`, which the proof's tracer now calls too: one
+  function on bytes). The refine host serves it in place for the outer
+  machine; a word at or above p, p itself included, or an unreadable input
+  or unwritable output, panics the machine on the call's own counter, with
+  nothing written. It joins `REFINE_HOST_CALL_ALLOWLIST`; `is_kernel_call`
+  does not take it (node kernels prove under format 35, which has no
+  Poseidon2 chip), nor does `surface::kernel`, so `derive` still refuses a
+  kernel that calls it.
+- **The agent and the wire:** `vos_wire::abi::precompile::POSEIDON2` at
+  the same price; the agent serves an inner machine's call (its input read,
+  each word checked below p or the actor's step trapped, the output written
+  at φ8 through the machine's tracked writes, the written page priced at
+  φ8's 32 bytes), computing it through its own `0x402` call: natively on a
+  VOS node, in software on JAM. `precompile::serving(id)`: the batch's
+  gas the agent takes for serving a call, `POSEIDON2_SERVING` (60,000) for
+  this one, since its software permutation costs JAM about 38,600 against
+  BLAKE2b's 17,100. A kernel's run serves the BLAKE2b precompile alone.
+- **The guest shim:** `vos_pvm_precompiles::poseidon2_compress(left,
+  right)` and `poseidon2_compress_block`: the call, and on `WHAT`
+  `vos-pvm-poseidon2`'s permutation, which panics (traps the guest) on a
+  word at or above p as the call does. The proof's tracer charges the
+  call's price when it serves it (`with_poseidon2`), as the runtime does.
+- **`vos_wire::credentials`** (`identity-and-authority.md` §6,
+  `proving.md` §8): the six tags pinned (`Tag`, `#[repr(u8)]`, each `t`
+  checked against `BLAKE2b-256("vos/p2/" ‖ name)`, distinct and nonzero),
+  `W`, a digest's words (a word ≥ p refused), `C` through the shim,
+  `leaf`, the 33 empty subtrees pinned (`EMPTY`), `root_of`, `Path` (root,
+  slot, 32 siblings as 1,024 bytes) with `Path::proves`, the `Ring` of the
+  last 64 `(root, since)` with `record` and `accepts` (the freshness rule:
+  newest, or superseded at most `ROOT_MAX_AGE` before; a root held twice
+  judged by its later entry; `RootRefusal::{Unknown, Stale}`),
+  `defaults::ROOT_MAX_AGE` (10 minutes), the table names and the ring's
+  key, and `CredentialError`. Ingress and apply (7.11) and the device
+  library (7.12) read these.
+- **`vos-credentials`** (`agent/credentials`, its own guest workspace,
+  `just build-credentials`, in `check` and `test-agent`): the actor and its
+  handlers in `lib.rs`; its rows `slots`, `nodes`, `free` (ordered),
+  `invites` and `ring`, its struct `handle`, `next`, `count`. `found(handle)`
+  (once, never zeros; writes the ring's first root, the empty tree's), then
+  `enroll`, `enroll_many` (at most 256; one refused, none enrolled),
+  `invite`, `claim` (any caller, until the expiry, `t ≤ expires_ms`),
+  `revoke` (also withdraws an invitation), all but `claim` under
+  `registrar`; the queries `path`, `root`, `handle` and `count`. A write
+  sets its leaves and recomputes each node above them once: 33 calls an
+  enrollment, 32 a revocation, and an `enroll_many` of 256 contiguous slots
+  535; a node equal to its level's empty subtree is deleted, not kept.
+  `enroll` and `claim` take the lowest freed slot through the SDK's new
+  `Table::first` (a scan as small as one row); `enroll_many` takes only
+  slots never used, the re-seed's case.
+
+**Tests** (`agent/testkit/tests/agent/credentials.rs`, the default agent
+on the node's hosts; and the runtime's, the wire's, the shim's and the
+bench's):
+- the tree equals a reference built from scratch from `proving.md` §8
+  alone (the reference's own tag from BLAKE2b, its own empty subtrees,
+  every level rebuilt), over twelve batches of random enrollments, `enroll_many`s
+  and revocations, on a VOS host and on the JAM-only host: the two refine
+  every batch to the same work result byte for byte and accumulate to the
+  same storage; each slot the reference's; the root and `since` the
+  reference's and the batch's; every member's path the reference's,
+  verified by the reference's walk and by `Path::proves`, and refused for
+  another member;
+- freed slots reused lowest first, whatever order they were freed in, then
+  the lowest never used;
+- the refusals (`Unfounded`, `ZeroHandle`, `Founded`, `NotADigest`,
+  `Enrolled`, `NotEnrolled`, `TooMany`, an `enroll_many` with a duplicate
+  enrolling none, `Forbidden` for a caller without `registrar`); an
+  invitation claimed by any caller before its expiry and refused after it,
+  once, a claim of a digest not invited, a withdrawn invitation; the ring's 64
+  entries read from the stored row, one a batch, and judged `Unknown` and
+  `Stale` by `Ring::accepts`;
+- an `enroll_many` of 256 within one handler's gas;
+- a word ≥ p traps the live call: on the refine host, on both backends,
+  at the call's counter with nothing written (p at words 0 and 15,
+  `u32::MAX`); through an actor (the counter's `compress`) on a VOS host
+  and on the JAM-only host, `Failure::Trapped`, the served call the
+  reference's at one price on both; the runtime's `execute` refusing p,
+  `2^31` and `u32::MAX`, and unreadable or unwritable ranges;
+- the bench's cross-host agreement: the `poseidon2` guest's chain on a VOS
+  host, on a JAM-like host answering `WHAT`, and the reference's.
+
+**Measurements** [measured]:
+- **The price** (`precompile native`, x86, the machine loaded by other
+  agents' runs, load 9–27): serving a Poseidon2 compression natively took
+  1.2–1.7 µs, 3,640–5,190 time-stamp-counter cycles (best 3,640), 2.6–4.4
+  times a BLAKE2b compression's in the same run (BLAKE2b 884–1,980 here,
+  520 on the quiet reference machine): about 1,800 cycles quiet [est].
+  `POSEIDON2_GAS` is 2,400, four BLAKE2b prices, rounding up as
+  BLAKE2b's 600 does its 520. The scalar permutation is
+  `vos-pvm-poseidon2`'s reference; its packed form serves sixteen at once,
+  no help to one call. In the guest, in software on `WHAT`, a compression
+  costs 37,585 gas, against 15,874 for BLAKE2b's.
+- **The agent's serving** (`serving_a_precompile_costs_the_agent_its_bounce`):
+  a Poseidon2 call costs an actor 3,121 gas, 2,400 of it its price, on
+  both hosts; serving it costs the agent 5,756 on a VOS node and 38,630 on
+  JAM (BLAKE2b's: 4,250 and 17,127), under `POSEIDON2_SERVING`'s four
+  fifths.
+- **The actor:** an enrollment 4.09M gas, a revocation 4.06M, an
+  `enroll_many` of 256 78.3M (against the 100M a handler may request): the
+  rows dominate (a `put` 64,000, a `get` 30,000), the 33 calls about
+  100,000. With a free-table scan a member it took 98.9M.
+
+**Where the plan was off:**
+- **The software permutation costs about 37,600 gas,** not pin G's
+  "about 15,800 instructions"; natively the call costs about four BLAKE2b
+  compressions, so its price is 2,400, not BLAKE2b's 600. Pin G, pin H,
+  `proving.md` §8 and identity §6 now give the measured numbers.
+- **One serving charge did not fit both calls:** `PRECOMPILE_SERVING`
+  covers a BLAKE2b compression in software on JAM (17,100), not a
+  Poseidon2 one (38,600); the serving is now per precompile.
+- **A revocation is 32 calls,** not 33: its leaf is the empty one.
+- **The install cannot take the handle:** an actor's state is made by
+  `new()`, with no arguments, at its first load; `found(handle)` is the
+  install's step, and the actor takes no write before it.
+- **`enroll_many(256)` fits a handler only batched, and only on fresh
+  slots:** 256 enrollments one at a time would take about 1G gas; one
+  write over all their leaves shares the upper nodes, but 256 freed slots
+  scattered over the tree share few (about 230M [est]), so it takes the
+  slots never used, as a re-seed into a new space's tree does. On a
+  JAM-target instance a step's 128 rows bound it to about three members a
+  call.
+- **Left to 7.11,** which reads them: the schema's credential-actor mark
+  (`#[actor(credentials)]`), the system row `credentials → instance`, and
+  `Failure::Credentials`; this step's actor is installed and called as any
+  library actor.
+
+**Review (Opus):** no high finding; all folded. M1, a free-table scan a
+placement (a 4 KiB scan page, about 0.4M gas from a large free table) and
+scattered freed slots putting `enroll_many(256)` past its gas: `Table::first`
+in the SDK, `enroll_many` on fresh slots only, its test. M2, the price's
+doc comment contradicting the measurements: re-measured and restated
+(above). L1, the claim's expiry boundary untested: a claim at
+`expires_ms` enrolls and one at `expires_ms + 1` is refused, the pins say
+"until, inclusive". L2, expired invitations never collected: documented in
+identity §6 (a `revoke` or a new `invite` replaces them). L3,
+`ROOT_MAX_AGE`'s comment: a root also falls out after 64 later roots. L4,
+`Ring::record` replacing the newest root at an equal batch time drops a
+root a client may have fetched if two batches share a time: as pinned;
+batch times are monotone (core model §8.4) but not strictly, which 7.11's
+ingress check should keep in mind. L5, test gaps: kernels' surface
+asserted equal to `is_kernel_call`; paths queried on the JAM host too;
+`invite` of a malformed digest; the ring test's doc says it judges by
+`Ring::accepts`. A workflow's `0x402` call (the φ8 page priced in
+`units.rs`) is still untested by a workflow. L6, `count()` and `found`
+added to identity §6 and pin G.
+
+**Commits:** `04ec0ad9` the call (runtime, agent, wire, shim, tracer, bench,
+the serving per precompile); `e44c4c6e` `vos_wire::credentials` and
+`vos-credentials` with their tests; `412949dd` the anchoring test's race;
+`c45d0bc6` the review's fixes; the counter's schema list; this record and
+the pins' numbers.
+
+**Gate** [measured; 12 GiB scope, `nice -n 10`, 8 jobs, other agents' runs
+on the machine, load 9–33]: `just check` at `c45d0bc6` green through the
+formatting, the docs, the no-std builds, the lints, the core crates and
+`test-recair`; the agent crates then run with `--no-fail-fast` (624 passed
+in 43 suites) and `test-reads` (7 of 7). Its failures, each run alone:
+- `programs_carry_their_schema_first_in_read_only_data`: the counter's new
+  `compress` handler, added to its list (12 of 12);
+- `anchoring::an_unlisted_leader_hands_off_to_a_listed_replica` (once, under
+  load 27): the alert named node 2, and an election moved leadership on to
+  node 3 before the anchor; the test now takes any listed replica the
+  alert names (6 of 6 alone);
+- `leakage::no_hidden_state_is_in_a_proof` (once): the 4-byte needle, φ7's
+  low half, met by chance in a proof masked with the OS's randomness (3 of
+  3 alone); a 4-byte needle in a proof of megabytes has a chance of
+  about its length over 2^32 a run;
+- **left open:** `prover::a_leader_change_submits_a_recorded_statement_once`
+  fails 3 runs in 5 on the base `ad1ff380` as on this branch, at low load
+  too. The new leader's job was read from the record after the `Proven`
+  step stripped its witness (`node/host/src/prover.rs`, `attested`), so its
+  worker refuses it ("recorded proved whose proof never arrived, its record
+  without its witness") instead of proving it again; the test assumes the
+  job was read while the record still held the witness. Holding the old
+  leader's proof until every replica's worker held the job did not help:
+  a follower's backlog stays empty. The node prover's (7.3's) to settle.
+
+**Review (Fable):** merge; L1–L6 folded (L4 handed off)
+(`docs/design/research/slice-7/7.9-fable.md`). L1, the handoff test
+asserts the alert names a replica whose key the venue lists, not merely
+one other than the leader. L2, `RootRefusal::Unknown` retryable by a path
+refetch, stated in pin I's ingress checks, 7.11's tests and identity §5's
+check 14: an honest member meets it on a replica's lag, a root replaced at
+its own batch time, or one pushed out of the ring. L3,
+`a_compression_whose_output_the_meter_cannot_pay_waits_unserved`: the
+shop's `absorb` workflow keeps its Poseidon2 state in a page only the
+agent writes, at φ8, and a sweep with room for the step's own pages but
+not the output's ends at the call unserved, then finishes with the state
+computed straight, the backends byte-equal; with `units.rs` pricing φ7
+instead it fails [measured]. L4 handed off: the quiet native re-measure
+of the call's absolute cost (the machine stayed loaded), for the next
+quiet `precompile native` run; the price rests on the loaded ratio, which
+errs toward over-pricing. L5, `a_kernel_calling_poseidon2_is_refused`, by
+name, split from the unknown-id test. L6, the shim's
+`checked_poseidon2_compress_block` (`None` for a word at or above p) and
+`poseidon2_compress_into` (the call writes the caller's output), the agent
+serving through the former instead of its own p check; `Table::first`
+treats a scan that frames no row as `None`, as `Iter` does, a row that
+does not decode still trapping. Hand-off to 7.12: the ring's 64 entries
+bound freshness in a busy space (64 tree-changing batches within
+`ROOT_MAX_AGE` make an honest root `Unknown` before `Stale`), so
+`PathKeeper`'s refresh period is well under 64 batches' time; written into
+pin G, pin L, 7.12 and identity §6. Gates: the touched tests (the shim's,
+`derive`'s, the testkit's workflows, credentials, pricing and hosts, 69;
+the handoff test), then `just check` [measured; 12 GiB scope, `nice -n 10`,
+6 jobs, other builds running]: green through the formatting, the docs,
+the no-std builds, the lints, the core crates and `test-recair`; in the
+agent crates only `prover::a_leader_change_submits_a_recorded_statement_once`
+failed (the known flake, being fixed apart), and the agent crates rerun
+with `--no-fail-fast` passed 627 of 627 in 43 suites, `test-reads` 7 of 7.

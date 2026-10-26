@@ -122,6 +122,15 @@ fn the_agent_serves_the_precompiles_a_node_does_at_its_price() {
         )
     );
     assert!(surface::kernel(abi::precompile::WITNESS_INPUT));
+    // A kernel's surface is the calls derive admits in a kernel.
+    for id in surface::PRECOMPILES {
+        assert_eq!(
+            surface::kernel(id),
+            vos_pvm::precompile::is_kernel_call(id),
+            "{id:#x}"
+        );
+    }
+    assert!(!surface::kernel(abi::precompile::POSEIDON2));
     assert_eq!(
         vos_pvm::precompile::WITNESS_INPUT_MAX,
         vos_wire::abi::cap::WORK_RESULT

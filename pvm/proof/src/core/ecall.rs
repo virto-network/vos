@@ -44,11 +44,11 @@ pub(crate) const DISPATCH_POSEIDON2: u8 = 102;
 /// identifier: exactly the calls [`crate::core::tracing::TracingPvm`]
 /// serves by default.
 ///
-/// This is a kernel's calls, the runtime's precompile set and the witness
-/// input. Any other id, 110 to 114 included, has no handler: a program
-/// reaching one does not trace. The Poseidon2 call is served only by a
-/// tracer that enables it (`TracingPvm::with_poseidon2`), until the runtime
-/// serves it.
+/// This is a kernel's calls (`vos_pvm::precompile::is_kernel_call`): the
+/// BLAKE2b precompile and the witness input. Any other id, 110 to 114
+/// included, has no handler: a program reaching one does not trace. The
+/// runtime's Poseidon2 precompile is served only by a tracer that enables
+/// it (`TracingPvm::with_poseidon2`), for the shared chip set's proofs.
 ///
 /// ProgramMemory commits the dispatch identifier, which is non-zero exactly
 /// for the calls a proof's CPU may acknowledge, so an untrusted prover cannot
@@ -75,7 +75,7 @@ mod tests {
     use super::*;
 
     /// The tracer serves exactly the calls a kernel may make, the refine
-    /// host's precompiles and the witness input; 110 to 114 are none.
+    /// host's BLAKE2b precompile and the witness input; 110 to 114 are none.
     #[test]
     fn tracer_serves_exactly_the_kernel_calls() {
         assert_eq!(

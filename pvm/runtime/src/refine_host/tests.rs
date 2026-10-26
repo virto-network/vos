@@ -604,6 +604,82 @@ fn unpayable_precompile_stops_out_of_gas_unserved() {
     assert_eq!(h, [0x5a; 64], "the call was not served");
 }
 
+/// `compression_program(0x402)` over `input` at φ7: its sixteen words in
+/// the read-write data, the output written at φ8, 64 bytes on.
+fn poseidon2_program(input: &[u8; 64]) -> Vec<u8> {
+    let [id_lo, id_hi] = (crate::precompile::POSEIDON2 as u16).to_le_bytes();
+    let (code, starts) = crate::test_support::code(&[
+        &[51, 7, 0x00, 0x00, 0x02], // load_imm φ7, 0x2_0000
+        &[51, 8, 0x40, 0x00, 0x02], // load_imm φ8, 0x2_0040
+        &[10, id_lo, id_hi],        // ecalli 0x402
+        &[50, 0],                   // jump_ind φ0 (the halt address)
+    ]);
+    let mut rw = [0u8; 96];
+    rw[..64].copy_from_slice(input);
+    standard_program_with_rw(&code, &starts, &rw)
+}
+
+/// The live Poseidon2 call on every backend: served in place at its price,
+/// the output the reference compression's; a word at or above p, p itself
+/// included, traps the call at its own counter, with nothing written.
+#[test]
+fn the_live_poseidon2_call_is_served_and_a_word_at_or_above_p_traps() {
+    let backends = [
+        PvmBackend::ForceInterpreter,
+        #[cfg(all(feature = "std", target_os = "linux", target_arch = "x86_64"))]
+        PvmBackend::ForceRecompiler,
+    ];
+    let run = |program: &[u8], backend| {
+        RefineContext::load_with_backend(
+            program,
+            &[],
+            1_000_000,
+            crate::refine::MemoryModel::Auto,
+            backend,
+        )
+        .unwrap()
+        .try_run()
+        .unwrap()
+    };
+    let mut input = [0u8; 64];
+    for (i, chunk) in input.chunks_exact_mut(4).enumerate() {
+        chunk.copy_from_slice(&(0x7654_3210 - i as u32 * 0x0101_0101).to_le_bytes());
+    }
+    let expected = crate::precompile::poseidon2_compress(&input).unwrap();
+    let unpriced = RefineContext::load(&compression_program(0x4ff), &[], 1_000_000)
+        .unwrap()
+        .run_with_host(|_, _| Ok(()));
+    for backend in backends {
+        let served = run(&poseidon2_program(&input), backend);
+        assert_eq!(served.exit, ExitReason::Halt, "{backend:?}");
+        let mut output = [0u8; 32];
+        served.memory().read_bytes(0x2_0040, &mut output);
+        assert_eq!(output, expected, "{backend:?}");
+        assert_eq!(
+            served.gas_used,
+            unpriced.gas_used + crate::precompile::POSEIDON2_GAS,
+            "{backend:?}"
+        );
+        for (index, word) in [
+            (0, vos_pvm_poseidon2::P),
+            (15, vos_pvm_poseidon2::P),
+            (9, u32::MAX),
+        ] {
+            let mut refused = input;
+            refused[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+            let trapped = run(&poseidon2_program(&refused), backend);
+            assert_eq!(trapped.exit, ExitReason::Panic, "{backend:?}, word {index}");
+            assert_eq!(
+                trapped.pc, 10,
+                "{backend:?}: traps on the call's own counter"
+            );
+            let mut output = [0xffu8; 32];
+            trapped.memory().read_bytes(0x2_0040, &mut output);
+            assert_eq!(output, [0; 32], "{backend:?}: nothing written");
+        }
+    }
+}
+
 /// Run an inner machine whose program is `ecalli id; trap` with `gas` in
 /// its invocation frame, the host computing the outer machine's
 /// precompiles or not. Returns the outcome code in φ7 and the gas left

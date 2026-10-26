@@ -1013,7 +1013,7 @@ mod tests {
     }
 
     /// Ids 110 to 114 are no precompile: a kernel that reaches one is
-    /// refused, naming it, as one reaching any host call but a precompile
+    /// refused, naming it, as one reaching any host call but a kernel's
     /// is; one reaching BLAKE2b's, or its witness input, derives.
     #[test]
     fn a_kernel_reaching_an_unknown_id_is_refused() {
@@ -1038,9 +1038,20 @@ mod tests {
         ] {
             assert!(derived(admitted as i32).is_ok(), "{admitted:#x}");
         }
-        assert!(matches!(
-            derived(0x402),
-            Err(DeriveError::HostCall { id: 0x402, .. })
-        ));
+    }
+
+    /// Poseidon2's call is a precompile but no kernel's: a kernel that
+    /// makes it is refused at derivation, naming it.
+    #[test]
+    fn a_kernel_calling_poseidon2_is_refused() {
+        const ENTRY: u64 = 0x10_0000;
+        let poseidon2 = vos_pvm::precompile::POSEIDON2;
+        let elf = LinkedElf::text(ENTRY, calling(poseidon2 as i32));
+        match kernel(&Graph::new(&elf), 7, ENTRY, Input::Arguments) {
+            Err(DeriveError::HostCall { method, id, .. }) => {
+                assert_eq!((method, id), (7, poseidon2));
+            }
+            other => panic!("{:?}", other.map(|kernel| kernel.len())),
+        }
     }
 }

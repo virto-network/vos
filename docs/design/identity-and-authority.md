@@ -335,7 +335,7 @@ Ingress verifies the proof and logs only the origin it proves.
   | 11 | `binding` is `C(T(binding), W(b))` of this request | `Binding`, 7 | 403 |
   | 12 | `b` is not recorded | `Replayed`, 8 | 409 |
   | 13 | auth with `once`: `(scope, nullifier)` not recorded | `Once`, 9 | 409 |
-  | 14 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10: fetch the path again, or ask another replica | 503 |
+  | 14 | auth: `map_root` is in the credential actor's ring | `RootUnknown`, 10 (`RootRefusal::Unknown`): retryable, fetch the path again, or ask another replica; an honest member meets it on a replica's lag, a root replaced at its own batch time, or one past the ring's 64 entries (§6) | 503 |
   | 15 | auth: `map_root` is the ring's newest, or was superseded at most `ROOT_MAX_AGE` before the replica's latest applied batch time | `RootStale`, 11 | 403 |
   | 16 | a verification slot is free: fewer verifications in flight than the node's budget (by default twice its executor threads) | `Busy` (not a credential code) | 503 |
   | 17 | on an executor, the proof decodes; its interaction PoW and its PoW hold, checked before any Merkle decommitment is read; then it verifies under the program for its kind | `Proof`, 12 | 403 |
@@ -476,7 +476,9 @@ across a space's agents wait for the identity agent above.
 - **Its install** takes the space's **handle**: 32 bytes the founder draws
   once and keeps across re-foundings, so members' device secrets survive
   one [decided, S25]. It is public: the app shows it and pins it at a
-  member's first enrollment.
+  member's first enrollment. The actor takes it by `found(handle)`, role
+  `registrar`, once and never zeros, which also writes the ring's first
+  root; it takes no other write before.
 - **Its rows,** the instance's tables, each tagged
   `derive_id("vos/table/", name)`, plain rows (not committed: no venue
   reads them):
@@ -501,15 +503,23 @@ across a space's agents wait for the identity agent above.
   moment it was superseded. Ingress measures that by the replica's latest
   applied batch time, apply by the batch's (§5). So a revocation binds
   within `ROOT_MAX_AGE` of its batch, and an honest member's path stays
-  good for as long after any change to the tree. The 64 entries only bound
-  storage: a root that has fallen out is `RootUnknown`.
+  good for as long after any change to the tree. The 64 entries bound
+  storage, and in a busy space freshness too: a root that has fallen out
+  is `RootUnknown`, so 64 tree-changing batches within `ROOT_MAX_AGE` make
+  an honest root unknown before it is stale. `RootUnknown` is retryable by
+  a path refetch, and the device library refreshes its path well within
+  64 batches' time (`slice-7-mobile.md` pin L).
 - **Its methods:**
   - `enroll(member) → slot`, role `registrar`: the lowest free slot, else
     `next`; refused for a member enrolled;
-  - `enroll_many(members)`, role `registrar`, at most 256 a call: the
-    re-founding runbook's re-seed;
+  - `enroll_many(members)`, role `registrar`, at most 256 a call, at the
+    lowest slots never used: the re-founding runbook's re-seed, into a
+    tree with no freed slot (fresh slots are contiguous, so 256 fit one
+    handler's gas wherever slots were freed);
   - `invite(member, expires_ms)`, role `registrar`, and `claim(member)`,
-    any caller: an invited member enrolls itself before the expiry. The
+    any caller: an invited member enrolls itself until the expiry, a claim
+    at `expires_ms` included. An expired invitation stays until a
+    `revoke` withdraws it or a new `invite` replaces it. The
     invitation names the digest, so whoever intercepts the claim cannot
     enroll another (the demo's ledger rows take the same two steps,
     `invite_row` and `claim_row`, `slice-7-mobile.md` 7.11). A member with
@@ -518,14 +528,18 @@ across a space's agents wait for the identity agent above.
     client's authority, bounded by the invitation, which names the
     digest;
   - `revoke(member)`, role `registrar`: the leaf back to the empty leaf,
-    the slot freed;
+    the slot freed; for a member only invited, the invitation withdrawn;
   - queries, any caller: `path(member) → Option<(root, slot, siblings)>`,
     the 32 siblings from the leaf's level up; `root() → (root, since)`;
-    `handle() → [u8; 32]`. A query is signed by a client key like any
-    other; the device library signs each with a key drawn for it alone.
-- **Its cost:** 33 calls of `0x402` a write. The VOS host serves it
+    `handle() → [u8; 32]`; `count()`, the members enrolled. A query is
+    signed by a client key like any other; the device library signs each
+    with a key drawn for it alone.
+- **Its cost:** 33 calls of `0x402` an enrollment (32 a revocation, whose
+  leaf is the empty one; an `enroll_many` shares the nodes its members
+  have in common), each 2,400 gas to the actor. The VOS host serves it
   natively and a JAM-deployed agent through the shim's software
-  permutation, so the tree is a function of its writes on both.
+  permutation (about 37,600 gas), so the tree is a function of its writes
+  on both [measured, `slice-7-progress.md` 7.9].
 - **Re-founding** (`slice-7-mobile.md`, pin D′): the runbook installs the
   new space's credential actor with the ended space's handle and re-seeds
   it with `enroll_many` from the ended space's `member` digests, with no

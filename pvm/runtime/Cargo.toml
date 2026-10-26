@@ -20,6 +20,8 @@ debug-internals = []
 libc = { version = "0.2", optional = true }
 memoffset = { version = "0.9", optional = true }
 vos-pvm-program = { path = "../program" }
+# The Poseidon2-M31 permutation the `0x402` precompile computes.
+vos-pvm-poseidon2 = { path = "../proof/poseidon2" }
 # Not a workspace dependency: workspace pins enable default features, and
 # vos_pvm's always-compiled modules must stay no_std-clean.
 tracing = { version = "0.1", default-features = false }

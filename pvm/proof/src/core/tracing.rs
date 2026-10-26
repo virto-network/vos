@@ -48,21 +48,7 @@ impl Poseidon2Op {
     /// The call over `input`, its sixteen words each below p: the first
     /// eight words of their permutation; `None` when a word is not.
     pub fn compress(input: &[u8; 64]) -> Option<[u8; 32]> {
-        use vos_pvm_poseidon2::{M31, N_STATE, P};
-        let mut state = [M31::ZERO; N_STATE];
-        for (word, bytes) in state.iter_mut().zip(input.chunks_exact(4)) {
-            let value = u32::from_le_bytes(bytes.try_into().expect("four bytes"));
-            if value >= P {
-                return None;
-            }
-            *word = M31::new(value);
-        }
-        vos_pvm_poseidon2::permute(&mut state);
-        let mut output = [0u8; 32];
-        for (bytes, word) in output.chunks_exact_mut(4).zip(&state) {
-            bytes.copy_from_slice(&word.value().to_le_bytes());
-        }
-        Some(output)
+        vos_pvm::precompile::poseidon2_compress(input)
     }
 }
 
@@ -124,10 +110,10 @@ impl TracingPvm {
         Some(self)
     }
 
-    /// Serve the Poseidon2 call (`ECALL_POSEIDON2`) as pin H states it, for
-    /// the shared chip set's proofs: the runtime does not serve it yet, so
-    /// only a tracer built with this serves it, and only that chip set's CPU
-    /// acknowledges it in a proof.
+    /// Serve the Poseidon2 call (`ECALL_POSEIDON2`) as the runtime does, at
+    /// its price, for the shared chip set's proofs: only that chip set's CPU
+    /// acknowledges it, so a node segment's tracer, built without this,
+    /// ends a run at it.
     pub fn with_poseidon2(mut self) -> Self {
         self.poseidon2 = true;
         self
@@ -293,7 +279,7 @@ impl TracingPvm {
         // A served call pays its VOS price first, exactly as on the refine
         // host; an unpayable call stops out of gas, unserved.
         if let ExitReason::HostCall(id) = exit
-            && crate::core::ecall::is_proof_host_call_allowed(id)
+            && self.serves(id)
             && !vos_pvm::precompile::charge(id, &mut self.pvm.gas)
         {
             return Some(ExitReason::OutOfGas);

@@ -5144,6 +5144,7 @@ dependencies = [
  "proptest",
  "serde_json",
  "tracing",
+ "vos-pvm-poseidon2",
  "vos-pvm-program",
 ]
 
@@ -5157,6 +5158,7 @@ dependencies = [
  "postcard",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-poseidon2",
  "vos-pvm-program",
  "vos-pvm-proof",
 ]
@@ -5214,6 +5216,7 @@ name = "vos-pvm-precompiles"
 version = "0.1.0"
 dependencies = [
  "blake2 0.10.6",
+ "vos-pvm-poseidon2",
 ]
 
 [[package]]
@@ -5412,6 +5415,7 @@ dependencies = [
  "vos-jam",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-poseidon2",
  "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-tree",

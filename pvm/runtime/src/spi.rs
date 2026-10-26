@@ -16,12 +16,12 @@ pub use vos_pvm_program::{
 };
 
 /// The complete host-call surface implemented by [`crate::refine_host`]:
-/// `gas`, the standard inner-machine calls, `log`, the BLAKE2b precompile,
-/// `instantiate` and `state_read`.
+/// `gas`, the standard inner-machine calls, `log`, the BLAKE2b and Poseidon2
+/// precompiles, `instantiate` and `state_read`.
 ///
 /// Runtime package admission uses this exact set to reject even unreachable
 /// calls outside it.
-pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 12] = [
+pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 13] = [
     0,
     9,
     10,
@@ -31,6 +31,7 @@ pub const REFINE_HOST_CALL_ALLOWLIST: [u64; 12] = [
     14,
     100,
     crate::precompile::BLAKE2B_COMPRESS,
+    crate::precompile::POSEIDON2,
     crate::inner::host_call::INSTANTIATE as u64,
     crate::inner::host_call::STATE_READ as u64,
     crate::inner::host_call::STATE_SCAN as u64,
@@ -242,6 +243,7 @@ mod tests {
                 crate::inner::host_call::EXPUNGE as u64,
                 crate::inner::gp_call::LOG as u64,
                 crate::precompile::BLAKE2B_COMPRESS,
+                crate::precompile::POSEIDON2,
                 crate::inner::host_call::INSTANTIATE as u64,
                 crate::inner::host_call::STATE_READ as u64,
                 crate::inner::host_call::STATE_SCAN as u64,

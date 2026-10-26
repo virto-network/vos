@@ -8,6 +8,12 @@
 /// φ\[9\]=t_low (counter low 64 bits), φ\[10\]=f (finalize flag).
 pub const ECALL_BLAKE2B_COMPRESS: u32 = 0x400;
 
+/// One Poseidon2-M31 compression per call.
+/// Mirrors `vos_pvm_proof::core::ecall::ECALL_POSEIDON2`.
+/// Convention: φ\[7\]=input pointer (sixteen words, 64B in), φ\[8\]=output
+/// pointer (eight words, 32B out); a word at or above p traps the call.
+pub const ECALL_POSEIDON2: u32 = 0x402;
+
 /// Gray Paper `WHAT`: the host does not know this call.
 #[cfg(target_arch = "riscv64")]
 pub(crate) const WHAT: u64 = u64::MAX - 1;

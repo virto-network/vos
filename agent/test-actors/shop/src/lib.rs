@@ -71,6 +71,9 @@ static IMAGE: Page = Page(UnsafeCell::new([7; 4096]));
 /// A page `digest` keeps its hash state in, which only the agent writes,
 /// serving the compression.
 static STATE: Page = Page(UnsafeCell::new([0; 4096]));
+/// A page `absorb` keeps its Poseidon2 state in, which only the agent
+/// writes, serving the compression.
+static SPONGE: Page = Page(UnsafeCell::new([0; 4096]));
 /// The page `tally` counts in.
 static TALLY: Page = Page(UnsafeCell::new([0; 4096]));
 
@@ -404,6 +407,24 @@ impl Shop {
                 .unwrap_or(0);
         }
         sales
+    }
+
+    /// Compress the state with the round's words `rounds` times, the
+    /// state kept in a page the workflow itself never writes, which the
+    /// agent writes serving each compression at φ8, pausing after each: the
+    /// state.
+    #[workflow]
+    pub async fn absorb(ctx: &mut Workflow<Self>, rounds: u32) -> Vec<u32> {
+        // SAFETY: a workflow runs on one thread, nothing else holds the
+        // page, and its start is aligned for a word.
+        let state = unsafe { &mut *SPONGE.0.get().cast::<[u32; 8]>() };
+        for round in 0..rounds {
+            let mut block = [round; 16];
+            block[..8].copy_from_slice(state);
+            vos_pvm_precompiles::poseidon2_compress_into(&block, state);
+            ctx.sleep_until(ctx.now()).await;
+        }
+        state.to_vec()
     }
 
     /// `digest` with no await, on a limit of a few hundred compressions:

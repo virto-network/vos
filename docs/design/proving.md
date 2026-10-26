@@ -958,7 +958,7 @@ subtree at level `l` is `E_l = C(E_{l−1}, E_{l−1})`, a constant. A path is
 the 32 siblings from level 0 up; bit `l` of the slot, least significant
 first, is 1 when the level-`l` node is a right child. No leaf equals
 `E_0` but with a preimage of `C`, so an empty slot proves nothing. An
-enrollment or a revocation costs 33 calls of `C`: the leaf and 32 levels.
+enrollment costs 33 calls of `C`, the leaf and 32 levels; a revocation 32.
 
 **The statements:**
 - **Auth** (`CredentialKind::Auth = 0`). Public, in this order: `kind`,
@@ -1139,8 +1139,9 @@ reporting every window (C10).
 - **The zkPVM gains a Poseidon2 chip** (pin H, 7.15): one permutation a
   row, about 300 columns at degree ≤ 3, like the recursion AIR's `p2`.
   Kernels that call `0x402` then prove it, cheaper than BLAKE2b in-AIR.
-- **The host serves Poseidon2 natively.** A JAM-deployed agent pays it in
-  software, about 15,800 instructions a permutation, as it does BLAKE2b.
+- **The host serves Poseidon2 natively** [built, 7.9], at 2,400 gas a
+  call. A JAM-deployed agent pays it in software, about 37,600 gas a
+  permutation [measured], as it does BLAKE2b.
 
 **2. The device profile** comes next [built: the shape, slice 7's 7.15;
 `vos_pvm_proof::device`]. The general zkVM runs on phones, for any

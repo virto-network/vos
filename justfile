@@ -33,7 +33,7 @@ test-recair:
 
 # Bench guests, built with the guest toolchain in `pvm/guest`.
 build-bench-guests:
-    with-env { CARGO_INCREMENTAL: "0" } { for guest in [workflows actor agent hash-software hash-precompile diverse] { do { cd $"pvm/bench/guests/($guest)"; cargo build --release --target ../../../guest/riscv64em-vos.json } } }
+    with-env { CARGO_INCREMENTAL: "0" } { for guest in [workflows actor agent hash-software hash-precompile poseidon2 diverse] { do { cd $"pvm/bench/guests/($guest)"; cargo build --release --target ../../../guest/riscv64em-vos.json } } }
 
 # Cross-host checks that need the bench guests. The bench tests that prove
 # run in `test-bench-proof`.
@@ -151,7 +151,7 @@ export MIMALLOC_ALLOW_THP := "0"
 # Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
-    for manifest in ([agent/default agent/representative agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+    for manifest in ([agent/default agent/representative agent/credentials agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
 # item.
@@ -194,6 +194,11 @@ build-agent:
 build-representative:
     with-env { CARGO_INCREMENTAL: "0" } { cd agent/representative; cargo build --release --target ../../pvm/guest/riscv64em-vos.json }
 
+# The credential actor, a library actor, built with the guest toolchain in
+# `pvm/guest`.
+build-credentials:
+    with-env { CARGO_INCREMENTAL: "0" } { cd agent/credentials; cargo build --release --target ../../pvm/guest/riscv64em-vos.json }
+
 # The JAM statements service's program, `statement-service.elf`.
 build-statement-service:
     with-env { CARGO_INCREMENTAL: "0" } { cargo build -p vos-statement-service --release --features pvm-guest --bin statement-service {{guest_flags}} }
@@ -201,7 +206,7 @@ build-statement-service:
 # The SDK, its macros' restrictions, the test actors on the testkit, the
 # default agent against it, the checker's own model, the node running the
 # agent, the network between nodes, and the `vos` command.
-test-agent: build-test-actors build-agent build-representative
+test-agent: build-test-actors build-agent build-representative build-credentials
     cargo test {{agent_crates}}
     cargo test -p vos-cli --features faults --test processes faults::
     cargo test -p vos-cli --features faults --test fault_suite
@@ -552,7 +557,7 @@ fuzz secs="60":
 # Left to `just ci`: the slow fault runs (the five-process fault suite, the
 # fault build's process tests), the PVM vectors, the bench and prover
 # library tests, and the lints of other feature sets.
-check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-kit build-test-actors build-agent build-representative fuzz-replay
+check: fmt-check doc-check check-venue-rules check-no-std check-no-leaks check-kit build-test-actors build-agent build-representative build-credentials fuzz-replay
     cargo clippy --workspace --all-targets --quiet -- -D warnings
     cargo clippy -p vos-venue --all-targets --quiet -- -D warnings
     just clippy-prover

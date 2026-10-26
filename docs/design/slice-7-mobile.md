@@ -245,21 +245,26 @@ ring, its methods) and `proving.md` §8 (the hash, the tree); pinned by
   the leaves), the empty subtrees' digests as constants.
 - **The hashes:** each one `0x402` call (pin H), `C(l, r)`: the VOS host
   serves it natively, a JAM-deployed agent pays the shim's software
-  permutation (about 15,800 instructions); so VOS ≡ JAM holds, and the
-  tree is as deterministic as any row. `leaf = C(T(leaf), member)`, the
-  slot not hashed (the path places it); a node `C(left, right)`; the empty
-  leaf eight zero words; a tag `T(name)` the block `[t, 0, …, 0]`, `t` from
-  `BLAKE2b-256("vos/p2/" ‖ name)`. 33 calls a write.
+  permutation (about 37,600 gas [measured, 7.9]); so VOS ≡ JAM holds,
+  and the tree is as deterministic as any row. `leaf = C(T(leaf),
+  member)`, the slot not hashed (the path places it); a node `C(left,
+  right)`; the empty leaf eight zero words; a tag `T(name)` the block
+  `[t, 0, …, 0]`, `t` from `BLAKE2b-256("vos/p2/" ‖ name)`. 33 calls an
+  enrollment, 32 a revocation.
 - **Roots:** a replicated ring of the last 64 `(root, since)`, one entry a
   batch time that changed the tree. **Freshness** (the Fable review's H2):
   a root is accepted while it is the newest, and for `ROOT_MAX_AGE`
   (10 minutes) after it was superseded (the next entry's `since`), by the
   replica's latest applied batch time at ingress and by the batch's time at
-  apply, so a revocation takes effect within it at every replica; the
-  ring's count only bounds storage.
+  apply, so a revocation takes effect within it at every replica. The
+  ring's count bounds storage, and in a busy space freshness too: 64
+  tree-changing batches within `ROOT_MAX_AGE` drop an honest root from the
+  ring, `Unknown` before it is `Stale`, which a path refetch answers (pin
+  I, pin L).
 - **The handle** (pin K, S25): 32 bytes the founder draws once, set at the
-  actor's install and served by `handle()`; a re-founded space's actor is
-  installed with the same handle.
+  actor's install by `found(handle)` (once; no write before it) and served
+  by `handle()`; a re-founded space's actor is installed with the same
+  handle.
 - **Methods:** `enroll`, `enroll_many` (the re-founding re-seed),
   `invite`/`claim` (the demo's enrollment, the invitation naming the
   digest), `revoke`, under the role `registrar` but `claim`; the queries
@@ -289,7 +294,7 @@ ring, its methods) and `proving.md` §8 (the hash, the tree); pinned by
   bytes (16 M31 words, little-endian u32, each `< p`; a word ≥ p, p itself
   included, traps the live call), φ8 at 32 bytes written with the 8-word
   output of `compress`; no other effect. Served natively by the VOS host
-  at a price measured in 7.9; on JAM the guest shim computes it in
+  at 2,400 gas, measured in 7.9; on JAM the guest shim computes it in
   software on `WHAT`.
 - **The chip** (7.15), in the device format, and in the node's segment
   format as S32 allows [decided, S23, S32]: one permutation a row, `p2`'s
@@ -379,8 +384,13 @@ pinned by 7.7.
   120 s ahead of the node's clock; the method's credential guard; the
   kind; for auth, the scope; the binding; the binding digest not recorded;
   for a `once` guard, the nullifier not recorded in its scope; for auth,
-  `map_root` in the ring (else retryable, the identity replica's lag
-  rule) and fresh by `ROOT_MAX_AGE`; a verification slot; then the proof,
+  `map_root` in the ring and fresh by `ROOT_MAX_AGE`. A root not in the
+  ring (`RootUnknown`, `vos_wire::credentials::RootRefusal::Unknown`) is
+  **retryable by a path refetch**, or at another replica: an honest member
+  meets it when the replica lags (the identity replica's lag rule), when a
+  later write at the same batch time replaced its root, or when 64 later
+  tree-changing batches have pushed it out of the ring; only `RootStale`
+  is final; a verification slot; then the proof,
   on an executor, **its PoW checked before any decommitment**. **Load:**
   the node's connections and a verification budget (past it, `Busy`), no
   bucket per scope or method to drain; the gateway adds its own limits
@@ -539,7 +549,12 @@ owner's [decided, S42].
   checks its witness before proving. **Paths** are refreshed apart from
   proofs (pin G, S38): `PathKeeper` holds the current path and says when
   to fetch again (`root()` moved, or a timer with jitter), and a proof
-  uses the path it holds. `Threads::Auto` is rayon's even split over
+  uses the path it holds. The ring's 64 entries bound freshness in a busy
+  space (64 tree-changing batches within `ROOT_MAX_AGE` make an honest
+  root `Unknown` before `Stale`), so the timer's period is well under the
+  time the space takes to make 64 such batches, not merely under
+  `ROOT_MAX_AGE`; a `RootUnknown` refusal fetches the path again and
+  proves anew. `Threads::Auto` is rayon's even split over
   every core until 7.17 weights work by core class; `DeviceError` names
   what failed and no value. No logging of
   witnesses; the library has no `seeded-masks` (pin C's build check
@@ -982,7 +997,10 @@ and adds its set in a file of its own.
   (`identity-and-authority.md` §7).
 - **Tests:** each check's refusal in order; a proof replayed at another
   node, refused at apply; an expired binding at apply by batch time; a
-  root the replica has not applied (retryable); a revoked member's proof
+  root the replica has not applied, a root replaced at its own batch time
+  and one pushed out of the ring by 64 later batches, each `RootUnknown`
+  (`RootRefusal::Unknown`) and admitted after a path refetch; a revoked
+  member's proof
   against the pre-revocation root refused once `ROOT_MAX_AGE` has passed
   by batch time; a proof of one call sent with another; two agents'
   scopes distinct; two spaces sharing a handle: one secret, one guard
@@ -1011,7 +1029,11 @@ and adds its set in a file of its own.
 - **What:** pins K and L for M4 (`prove_auth`, `prove_owner`, the
   derivation, `PathKeeper`), the Android build, and the phone bench
   (`tools/phone`, both builds). Paths refreshed apart from proofs
-  [decided, S38]; `node/SECURITY.md`'s path entry states the leak as
+  [decided, S38], the refresh period well under the time a busy space
+  takes to make 64 tree-changing batches, since past them an honest root
+  is `RootUnknown` before it is `RootStale` (pin L), with a test that an
+  `Unknown` answer refetches and proves again; `node/SECURITY.md`'s path
+  entry states the leak as
   reduced: operators learn that a member digest is online, and its
   address, not when it proves; `vos-device`'s `SECURITY.md` states
   containment. `Threads::Auto` a plain even split until 7.17.
