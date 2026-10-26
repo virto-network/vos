@@ -280,8 +280,11 @@ its expiry; socket-only until built.
   bound at T3's 10^4 agents.
 - **The nonce store:** a node-local table in the node's store (fjall, not
   replicated), `key ‖ nonce → expires_ms`, loaded at start, swept as
-  entries expire. Durable [orchestrator, Q4(a)]. At most 65,536 live
-  entries; past them, `Busy`. The listed keys are the node's operators,
+  entries expire. Durable [orchestrator, Q4(a)]. An entry is forgotten
+  only once the node's clock is past its expiry by more than the 120 s
+  horizon, so a clock stepped back by up to the horizon still refuses
+  the replay (the Fable review's L1). At most 65,536 live entries; past
+  them, `Busy`. The listed keys are the node's operators,
   all trusted alike: the bound is shared, not per key.
 - **The keys,** in the node's TOML (`node/cli/src/config.rs`):
   `operators = ["<hex>", …]`. The node also makes `operator.key` in its
@@ -295,7 +298,9 @@ its expiry; socket-only until built.
   same nonce: a relay that holds the first copy back and forges the
   refusal gets the command run once between the two (the Opus review's
   M3). A signed command may go again on a fresh connection, its nonce
-  deduping it.
+  deduping it: if the first copy ran before the kept connection failed,
+  the resend answers `Replayed` (409), not the command's outcome, which
+  the operator reads from the node (the Fable review's L10).
 - **The interim** [decided, S46]: until the envelope lands (commit C5,
   §9), operator kinds take their bare body, on the unix socket only; over
   QUIC they are answered `Rejected(Operator(SocketOnly))`. Once it lands,
@@ -347,9 +352,20 @@ its expiry; socket-only until built.
   node's own; the gateway still keeps a few socket connections a node, and
   the numbers are recorded with S50's re-measure. The verification budget
   of 7.11 (`Busy`) is per node. Over QUIC a client proves its address
-  first (a Retry), at most 64 handshakes are under way, each within 10 s,
-  and `api_connections` counts connections that shook hands. A frame's
-  deadline runs from its own first byte. Queries waiting for their
+  first (a Retry), at most 64 handshakes are under way, 8 from one
+  address (an IPv6 /64), each within 10 s, and `api_connections` counts
+  connections that shook hands. A host that passed Retry needs no key to
+  hold a handshake's place until the TLS verdict, so the API's port is
+  for gateways and drivers: a deployment firewalls `api_listen` to them
+  (the Fable review's L3). At most four large bodies (an install's, past
+  `vos_api::LARGE`) are held at once across the socket and QUIC: the
+  socket reads a large frame's body only once it holds a place, its
+  deadline running from then, and QUIC answers `Unavailable` from the
+  header (L6). A frame's deadline runs from its own first byte. After a
+  frame error on the socket, the requests in flight run on detached
+  while the connection's place is given back, so a local client can have
+  more running than `api_connections × api_in_flight`; the socket's mode
+  bounds who can (L2). Queries waiting for their
   replica to reach their floor are at most `floor_waits` (256): one past
   them is answered `Behind` at once, so slow reads cannot hold a
   connection's in-flight places for long.
@@ -397,6 +413,18 @@ its expiry; socket-only until built.
   (the install's by the path's suffix, even on an unknown path), 431 past
   a 16 KiB head, `100 Continue` as today. New routes: `GET /time`, and
   7.11's `POST /agents/{a}/credentialed`.
+- **Large bodies** (the Fable review's M1): `vos-http` holds at most four
+  bodies past its ordinary limit (an install's) at once, from every
+  connection (`Limits::large`), and answers a request past them 503 from
+  its head, the body unread; the node's own HTTP takes the same budget.
+  Before that, the gateway answers an operator's route from its head, as
+  the whole request would be answered: 401 with no `Operated` header (or
+  one that is not 152 bytes), 421 `Operator(OtherNode)` for an envelope
+  naming no upstream. Neither answer depends on the body, so the
+  differential corpus is unchanged, and a request with no plausible
+  envelope never reaches the budget. A refused body past the ordinary
+  limit, or one the client waits for `100 Continue` to send, is never
+  read: the connection closes after the answer.
 - **The operator routes** [orchestrator, Q-A; the review's M2]: today's
   bearer token is the node's, and a gateway holding it would hold
   authority. So the routes keep today's methods, paths and bodies byte for
@@ -433,11 +461,18 @@ its expiry; socket-only until built.
   goes to the HTTP client as is (421). Resending is safe for every kind it
   redirects (§3's "repeated"). `Busy` is passed on, not retried: the
   client's backoff stays the client's. An upstream that fails mid-request
-  is answered `Unavailable` (503), never resent.
+  is answered `Unavailable` (503), never resent. A dial holds no lock a
+  request with a connection open waits on, and one dial is under way at
+  a time per upstream; an upstream whose dial failed is down for a
+  backoff (1 s, doubling to 8 s), answered `Unavailable` at once while it
+  lasts, and reads in turn, and calls to a learned leader, skip an
+  upstream that is down or whose dial has been under way for over 250
+  ms while another is ready: one dead node delays only the requests that
+  must go to it (the Fable review's M2).
 - **Per-address limits,** before any authentication or decoding:
   connections per source address (default 64), and requests a second per
-  address with a burst (default 200, 400), past which HTTP answers 429 and
-  SSH refuses the channel; s4-server's `ServerLimits` bounds its
+  address with a burst (default 200, 400), past which HTTP answers 429
+  from the request's head, its body unread, and SSH refuses the channel; s4-server's `ServerLimits` bounds its
   connections and handshakes before authentication. s4's per-identity
   session caps mean nothing under ephemeral keys: the per-address limits
   are the bound (the review's L9).
@@ -561,9 +596,10 @@ this brief before C1; the Opus review takes the branch.
 **s4's pin** [owner, Q-C]: s4 is a git dependency on codeberg's
 `Virto/s4`, pinned by rev, from its `vos` branch, created from the
 owner's `main` once pushed; the subsystem hook lands on that branch
-first. TODO: until that branch is pushed, the gateway names s4 by a path
-to a local worktree of it, behind the gateway's `ssh` feature, off by
-default; the rev pin replaces the path when the branch is on codeberg.
+first. The gateway pins it at `cee80d95` (the hook `bd3c435` and an
+advisory fix), behind its `ssh` feature, off by default; s4's crates ask
+Rust 1.94.1, which the workspace's nightly builds with
+`--ignore-rust-version` (`just test-gateway-ssh`).
 
 ## 10. Decisions
 

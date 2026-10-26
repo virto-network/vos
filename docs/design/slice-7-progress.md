@@ -2122,11 +2122,11 @@ waits on S50's gate):
   APIs, public TLS, limits per address, leader-aware routing; with its
   `ssh` feature (`just test-gateway-ssh`), s4's SSH port and the `vos-api`
   subsystem, and `app.key`.
-- **s4**: the named-subsystem hook, `bd3c435` on the `vos` branch of
-  `~/src/virto/s4-vos`, under s4's gate, **not pushed**. Until it is, the
-  gateway names s4 by a path to that worktree behind its `ssh` feature, off
-  by default: s4's crates ask Rust 1.94.1, which the workspace's nightly
-  builds with `--ignore-rust-version`.
+- **s4**: the named-subsystem hook, `bd3c435` on s4's `vos` branch, under
+  s4's gate, now on codeberg (`Virto/s4`); the gateway pins it by git rev
+  at `cee80d95` (the hook and an advisory fix) behind its `ssh` feature,
+  off by default: s4's crates ask Rust 1.94.1, which the workspace's
+  nightly builds with `--ignore-rust-version`.
 - **`vos-scale`**: the drivers over QUIC (one connection a node, a stream
   a request, the deployed `driver.key` listed in `gateways`), the
   coordinator signing with the deployed `operator.key`, each node's `api`
@@ -2134,7 +2134,10 @@ waits on S50's gate):
   and the served cluster reach their nodes over the API's sockets as their
   options and seeds choose; a kill suite's client calls through a gateway.
 
-**Tests:** the brief's 1–18: the codec's pins and proptests; each kind's
+**Tests:** the brief's 1–18 (with the Fable fold: the install-size
+budget and the head-time refusals at the gateway and over QUIC, a dead
+upstream delaying no other's requests, `NotLeader` followed, a client's
+pin across a 421, an install in the corpus): the codec's pins and proptests; each kind's
 limit from its header, unknown kinds, truncated frames, out-of-order
 answers, the in-flight bound, the deadline and the connections, a stale
 socket and its twin (`tests/ingress/api.rs`, `quic.rs`); every operator
@@ -2171,9 +2174,56 @@ the wall clock passes its expiry could be taken again if the clock steps
 back past it), L4 (dials under the upstream's lock), L7 (a node's closing
 frame error passed on an SSH channel left open), L8 (no write deadlines,
 as before), and M4's head-time refusal of an install-size body at the
-gateway and a budget of large bodies in flight.
+gateway and a budget of large bodies in flight; all but L7 and L8 folded
+with Fable's review, below.
 
 **Gates:** `just check` green after the fold (EXIT 0; 12 GiB scope, `nice -n 10`, 6 jobs), `just test-gateway-ssh` green.
 
-**Not done:** C10 (S50's gate); the rev pin of s4 (once `vos` is on
-codeberg).
+**Review (Fable):** fix-then-merge; M1, M2, L1, L2, L3, L5, L6, L9, L10,
+L11, L12 folded (`research/slice-7/7.10b-fable.md`). No authority found
+beyond relaying, on any transport; the two mediums were the public
+face's availability:
+- **M1** (no budget for install-size bodies: one address could hold
+  4 GiB of the gateway's memory with no key): `vos-http`'s
+  `Limits::large`, at most four bodies past the ordinary limit held at
+  once from every connection, a request past them answered 503 from its
+  head, its body unread, on the node's own HTTP too; and a server's head
+  hook, with which the gateway answers an operator's route with no
+  `Operated` header 401, and one signed for a node behind no upstream
+  421, before any body is read, as the whole request would be (L5: its
+  429 too). This was the gate before the gateway faces the internet; it
+  is closed.
+- **M2** (dials under the upstream's lock: one dead node delayed a share
+  of every read by its dial in turn): a dial holds no lock a request with
+  a connection open waits on, one at a time per upstream; a failed dial
+  marks the node down for a backoff (1 s doubling to 8 s), answered at
+  once while it lasts; reads in turn, and calls to a learned leader, skip
+  a node down or slow to dial while another is ready; a failed request
+  clears only the QUIC connection it used.
+- The lows: a nonce forgotten only past its expiry and the 120 s horizon
+  (L1); the socket's detached requests after a frame error noted in its
+  module and `node-api.md` (L2); QUIC handshakes bounded per address, 8
+  of the 64 (an IPv6 /64), and `api_listen` to be firewalled to gateways
+  and drivers (L3); at most four large bodies across the node's socket
+  and QUIC, the socket reading the next only as one ends, QUIC answering
+  `Unavailable` from the header (L6); tests (L9): a stand-in node
+  answering `NotLeader` followed to the leader it names, then learned (a
+  live cluster answers `NotLeader` only while its leader changes:
+  followers forward calls and read indexes), a successful install in the
+  differential corpus, and a client pinning a gateway following a 421 to
+  a second gateway under the same key; `Operator::send`'s resend
+  answering `Replayed` when the first copy ran, in its doc (L10);
+  `Kind::operator()` naming the table's kinds (L12).
+- **Open:** L7 (a node's closing frame error passed on an SSH channel
+  left open: only under version skew) and L8 (no write deadlines), both
+  acceptable for the step; the review's hand-offs to 7.11 (`Credentialed`
+  and the verification budget) and 7.13 stand.
+
+**Gates after the Fable fold:** the touched suites (`vos-api` 17,
+`vos-http` 3, the node's `ingress` `api::`, `quic::`, `operator_api::`
+and `transports::` 20) and the gateway suite (10, with the `ssh` feature
+on s4's codeberg rev 3 more) green; `just check` green at `89becd5d`
+(EXIT 0, 1,552 passed in 121 suites; 12 GiB scope, `nice -n 10`, 6
+jobs), `just test-gateway-ssh` green at `7c04fb40`.
+
+**Not done:** C10 (S50's gate).
