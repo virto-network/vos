@@ -17,7 +17,8 @@
 use alloc::vec::Vec;
 
 use vos_pvm::ExitReason;
-use vos_pvm::interpreter::{Interpreter, Memory, PERM_NONE, PERM_RO, PERM_RW};
+use vos_pvm::interpreter::{Interpreter, PERM_NONE};
+pub use vos_pvm::interpreter::{Memory, PERM_RO, PERM_RW};
 use vos_pvm::precompile::WitnessRead;
 
 use crate::SideNote;
@@ -63,6 +64,7 @@ fn load(
     blob: &[u8],
     arguments: &[u8],
     gas: u64,
+    forge: impl FnOnce(&mut Memory),
 ) -> Result<
     (
         Interpreter,
@@ -100,6 +102,7 @@ fn load(
             memory.init_copy(base as u32, data);
         }
     }
+    forge(&mut memory);
     let image: SparseMemoryImage = memory.nonzero_page_image().into();
     let permissions = crate::memory_layout::MemoryLayout::standard(&layout);
     let registers = layout.registers;
@@ -119,7 +122,7 @@ fn load(
 /// jump table, initial memory and layout, and no step. What its
 /// preprocessed roots are computed from.
 pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
-    let (machine, image, permissions) = load(blob, &[], 0)?;
+    let (machine, image, permissions) = load(blob, &[], 0, |_| {})?;
     Ok(TracingPvm::new(machine)
         .into_side_note()
         .with_sparse_memory(image)
@@ -130,7 +133,32 @@ pub fn kernel_side_note(blob: &[u8]) -> Result<SideNote, KernelTraceError> {
 /// agent runs it: the standard layout with no arguments, φ0 the halt
 /// address, φ1 the stack's top, φ7 the argument window and φ8 0.
 pub fn trace_kernel(blob: &[u8], input: &[u8], gas: u64) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, &[], input, gas)
+    trace(blob, &[], input, gas, false, |_| {})
+}
+
+/// [`trace_kernel`] with the Poseidon2 call served
+/// (`TracingPvm::with_poseidon2`): a device kernel's run, which only the
+/// shared chip set proves.
+pub fn trace_device_kernel(
+    blob: &[u8],
+    input: &[u8],
+    gas: u64,
+) -> Result<KernelTrace, KernelTraceError> {
+    trace(blob, &[], input, gas, true, |_| {})
+}
+
+/// [`trace_device_kernel`] with the machine's memory changed by `forge`
+/// before the run (its pages' permissions, its bytes), the change in the
+/// run's entering image: the device forgery gates' runs, which no loader
+/// makes. The tests' dev edge alone (`seeded-masks`).
+#[cfg(feature = "seeded-masks")]
+pub fn trace_forged_device_kernel(
+    blob: &[u8],
+    input: &[u8],
+    gas: u64,
+    forge: impl FnOnce(&mut Memory),
+) -> Result<KernelTrace, KernelTraceError> {
+    trace(blob, &[], input, gas, true, forge)
 }
 
 /// Run standard program `blob` with `gas` on `arguments`, mapped read-only
@@ -141,7 +169,55 @@ pub fn trace_program(
     arguments: &[u8],
     gas: u64,
 ) -> Result<KernelTrace, KernelTraceError> {
-    trace(blob, arguments, &[], gas)
+    trace(blob, arguments, &[], gas, false, |_| {})
+}
+
+/// [`trace_device_kernel`] run to whatever exit it reaches, a trap
+/// included: its side note and how it stopped, what a forged trace of a run
+/// that does not halt starts from. The tests' dev edge alone
+/// (`seeded-masks`).
+#[cfg(feature = "seeded-masks")]
+pub fn trace_device_kernel_to_exit(
+    blob: &[u8],
+    input: &[u8],
+    gas: u64,
+) -> Result<(SideNote, ExitReason), KernelTraceError> {
+    let (mut tracer, image, permissions) = start(blob, &[], input, gas, true, |_| {})?;
+    let exit = tracer.run_with_precompiles();
+    let side_note = tracer
+        .into_side_note()
+        .with_sparse_memory(image)
+        .with_memory_layout(permissions);
+    Ok((side_note, exit))
+}
+
+/// `blob` loaded on `arguments` and `input` with `gas`, `forge` applied, its
+/// tracer at its first step.
+fn start(
+    blob: &[u8],
+    arguments: &[u8],
+    input: &[u8],
+    gas: u64,
+    poseidon2: bool,
+    forge: impl FnOnce(&mut Memory),
+) -> Result<
+    (
+        TracingPvm,
+        SparseMemoryImage,
+        crate::memory_layout::MemoryLayout,
+    ),
+    KernelTraceError,
+> {
+    let (machine, image, permissions) = load(blob, arguments, gas, forge)?;
+    let tracer = TracingPvm::new(machine)
+        .with_witness_input(input.to_vec())
+        .ok_or(KernelTraceError::Input)?;
+    let tracer = if poseidon2 {
+        tracer.with_poseidon2()
+    } else {
+        tracer
+    };
+    Ok((tracer, image, permissions))
 }
 
 fn trace(
@@ -149,11 +225,10 @@ fn trace(
     arguments: &[u8],
     input: &[u8],
     gas: u64,
+    poseidon2: bool,
+    forge: impl FnOnce(&mut Memory),
 ) -> Result<KernelTrace, KernelTraceError> {
-    let (machine, image, permissions) = load(blob, arguments, gas)?;
-    let mut tracer = TracingPvm::new(machine)
-        .with_witness_input(input.to_vec())
-        .ok_or(KernelTraceError::Input)?;
+    let (mut tracer, image, permissions) = start(blob, arguments, input, gas, poseidon2, forge)?;
     let exit = tracer.run_with_precompiles();
     if exit != ExitReason::Halt {
         return Err(KernelTraceError::Exit(exit));

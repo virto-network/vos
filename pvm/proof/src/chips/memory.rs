@@ -149,9 +149,9 @@ pub enum PreprocessedColumn {}
 #[derive(Clone, Debug)]
 pub(crate) struct MemEntry {
     pub(crate) address: u32,
-    value: u8,
-    timestamp: u64,
-    is_write: bool,
+    pub(crate) value: u8,
+    pub(crate) timestamp: u64,
+    pub(crate) is_write: bool,
 }
 
 /// Decompose a multi-byte access into individual byte entries.
@@ -463,6 +463,26 @@ pub(crate) fn access_entries(side_note: &SideNote) -> Vec<MemEntry> {
             });
         }
     }
+    // Poseidon2 calls: 64 byte reads at in_ptr, 32 byte writes at out_ptr,
+    // at the call step's ts; `Poseidon2Chip` produces their tuples.
+    for op in &side_note.poseidon2_ops {
+        for (i, &value) in op.input.iter().enumerate() {
+            entries.push(MemEntry {
+                address: op.in_ptr.wrapping_add(i as u32),
+                value,
+                timestamp: op.ts,
+                is_write: false,
+            });
+        }
+        for (i, &value) in op.output.iter().enumerate() {
+            entries.push(MemEntry {
+                address: op.out_ptr.wrapping_add(i as u32),
+                value,
+                timestamp: op.ts,
+                is_write: true,
+            });
+        }
+    }
     entries
 }
 
@@ -487,7 +507,25 @@ impl BuiltInProverComponent for MemoryChip {
         // listed page.  Subsumes the old read-before-write ts=0 injection
         // (MemoryBoundaryChip is deleted); the producers are MemoryPageChip.
         let closing_ts = crate::chips::register_memory_closing::closing_ts_for(side_note);
-        if let Some(payload) = &side_note.memory_pages {
+        // A device run (`crate::device`) has no page boundary: each byte it
+        // touches enters with the byte its layout gives and closes at its
+        // last value, both produced by DeviceMemoryChip.
+        if let Some(run) = &side_note.device {
+            for touched in &run.touched {
+                entries.push(MemEntry {
+                    address: touched.address,
+                    value: touched.initial,
+                    timestamp: 0,
+                    is_write: true,
+                });
+                entries.push(MemEntry {
+                    address: touched.address,
+                    value: touched.last,
+                    timestamp: closing_ts,
+                    is_write: false,
+                });
+            }
+        } else if let Some(payload) = &side_note.memory_pages {
             for page in &payload.pages {
                 let base = page.page_idx as u64 * crate::page_merkle::PAGE_SIZE as u64;
                 for i in 0..crate::page_merkle::PAGE_SIZE {
@@ -538,6 +576,19 @@ impl BuiltInProverComponent for MemoryChip {
         let mut keys = vec![0u64; num_rows];
         let mut same_addr = vec![false; num_rows];
         let layout = side_note.layout();
+        let permission_of = |address: u32| {
+            use crate::memory_layout::Permission;
+            match &side_note.device {
+                Some(run) => match run.layout.region_of(address) {
+                    None => Permission::Unmapped,
+                    Some(region) if crate::device::region::READABLE_ONLY[region] => {
+                        Permission::Readable
+                    }
+                    Some(_) => Permission::Writable,
+                },
+                None => layout.permission(address / crate::page_merkle::PAGE_SIZE as u32),
+            }
+        };
         for (row, entry) in entries.iter().enumerate() {
             trace.fill_columns_bytes(row, &entry.address.to_le_bytes(), Column::Address);
             trace.fill_columns(row, entry.value, Column::Value);
@@ -563,11 +614,11 @@ impl BuiltInProverComponent for MemoryChip {
             let is_closing = closing_ts != 0 && entry.timestamp == closing_ts;
             trace.fill_columns(row, is_closing, Column::IsClosing);
 
-            // The page's permission, as MemoryPageChip proves it, held
+            // The page's permission, as MemoryPageChip (or, on a device
+            // run, DeviceMemoryChip) proves it, held
             // along the address's group; on its start, also the tuple's.
             use crate::memory_layout::Permission;
-            let permission =
-                layout.permission(entry.address / crate::page_merkle::PAGE_SIZE as u32);
+            let permission = permission_of(entry.address);
             trace.fill_columns(row, permission >= Permission::Readable, Column::Readable);
             trace.fill_columns(row, permission == Permission::Writable, Column::Writable);
             let is_start = row == 0 || entries[row - 1].address != entry.address;

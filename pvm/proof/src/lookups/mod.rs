@@ -23,9 +23,10 @@ pub use self::{
     relations::{
         BitcountLookupElements, BitwiseAndByteLookupElements, BitwiseAndLookupElements,
         BitwiseLookupElements, Blake2bCallLookupElements, Blake2bCompressionLookupElements,
-        ByteToBitsLookupElements, CompareLookupElements, DivRemLookupElements,
-        JumpTableLookupElements, MemoryAccessLookupElements, MerkleNodeLookupElements,
-        MultiplicationLookupElements, PopcountLookupElements, PowerOfTwoLookupElements,
+        ByteToBitsLookupElements, CompareLookupElements, DataTableLookupElements,
+        DivRemLookupElements, IoHashLookupElements, JumpTableLookupElements,
+        MemoryAccessLookupElements, MerkleNodeLookupElements, MultiplicationLookupElements,
+        PopcountLookupElements, Poseidon2CallLookupElements, PowerOfTwoLookupElements,
         ProgramExecutionLookupElements, ProgramMemoryLookupElements, RegisterMemoryLookupElements,
         WitnessCallLookupElements,
     },
@@ -53,6 +54,9 @@ macros::register_relation! {
         DivRemLookupElements,
         ByteToBitsLookupElements,
         WitnessCallLookupElements,
+        Poseidon2CallLookupElements,
+        DataTableLookupElements,
+        IoHashLookupElements,
     };
     pub(crate) trait RegisteredLookupBound {}
 }

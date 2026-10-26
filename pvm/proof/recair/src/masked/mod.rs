@@ -35,6 +35,7 @@
 //! The format pins the masking ([`Masking`]); nothing here names the wrap,
 //! whose set is [`WrapComponents`].
 
+pub mod device;
 mod drawn;
 mod layout;
 mod rank;
@@ -178,6 +179,7 @@ pub fn verifier_format<'a>(
         log_sizes,
         tree_widths,
         deep_values,
+        program: &[],
     })
 }
 
@@ -381,6 +383,21 @@ pub(crate) fn prove_masked_checked<MC: MerkleChannel, C: MaskedProvers>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
+    prove_masked_program::<MC, C>(format, &[], trace, rng, checks)
+}
+
+/// [`prove_masked_checked`] of `program`, words the transcript mixes right
+/// after the header (`MaskedFormat::program`).
+pub(crate) fn prove_masked_program<MC: MerkleChannel, C: MaskedProvers>(
+    format: &Format,
+    program: &[u64],
+    trace: MaskedTrace<'_, C::Relations, C::Active>,
+    rng: MaskRng,
+    checks: Checks,
+) -> Result<(MaskedProof<MC::H>, MaskStats), ProveError>
+where
+    SimdBackend: BackendForChannel<MC>,
+{
     let masking = match format.masking {
         Some(masking) if format.masked => masking,
         _ => return Err(ProveError::UnmaskedFormat),
@@ -434,6 +451,7 @@ where
     let preprocessed = extend_preprocessed(trace.preprocessed, &twiddles);
     let setup = Setup {
         format,
+        program,
         masking,
         active: trace.active,
         mask_rows: &mask_rows,
@@ -466,6 +484,8 @@ where
 /// What every attempt shares.
 struct Setup<'a, 'm, R, A> {
     format: &'a Format,
+    /// The words mixed after the header.
+    program: &'a [u64],
     masking: Masking,
     active: A,
     /// Each component's `log2 h`.
@@ -513,6 +533,9 @@ where
     let config = format.pcs_config();
     let channel = &mut MC::C::default();
     mix_statement_header(channel, format.number, &config, setup.log_sizes);
+    for &word in setup.program {
+        channel.mix_u64(word);
+    }
     let mut scheme = Scheme::<MC>::new(config, setup.twiddles);
     scheme.set_store_polynomials_coefficients();
 

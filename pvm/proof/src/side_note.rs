@@ -51,6 +51,9 @@ pub struct SideNote {
     /// writes for output).  MemoryChip ingests these into the ledger so the
     /// Blake2bChip memory-consumer lookups balance.
     pub blake2b_mem_ops: Vec<crate::core::tracing::Blake2bMemOp>,
+    /// The Poseidon2 calls served (`core::ecall::ECALL_POSEIDON2`), which
+    /// `Poseidon2Chip` proves and the memory ledger records.
+    pub poseidon2_ops: Vec<crate::core::tracing::Poseidon2Op>,
     /// Synthetic blake2b compressions for the in-AIR memory-page Merkle
     /// boundary multiproof, proven by `Blake2bBoundaryChip`.  Unlike
     /// `blake2b_calls` these hash page images (leaves) and node pairs, with
@@ -141,6 +144,11 @@ pub struct SideNote {
     /// through [`Self::memory_layout`]; attached by
     /// [`Self::with_memory_layout`].
     memory_layout: Option<crate::memory_layout::MemoryLayout>,
+    /// A device proof's run (`crate::device`): its layout and the bytes it
+    /// touches, whose first touches and closing reads `DeviceMemoryChip`
+    /// produces in place of the page boundary. `None` on a node's proof.
+    #[cfg(feature = "prover")]
+    pub device: Option<alloc::sync::Arc<crate::device::DeviceRun>>,
 }
 
 /// One listed page's entering and exit byte images (each `PAGE_SIZE` bytes).
@@ -302,6 +310,7 @@ impl SideNote {
             byte_to_bits_counts: vec![0u32; 256],
             blake2b_calls: Vec::new(),
             blake2b_mem_ops: Vec::new(),
+            poseidon2_ops: Vec::new(),
             merkle_blake2b_calls: Vec::new(),
             merkle_blake2b_mults: Vec::new(),
             initial_regs: [0u64; NUM_REGS],
@@ -317,6 +326,8 @@ impl SideNote {
             #[cfg(feature = "prover")]
             memory_pages: None,
             memory_layout: None,
+            #[cfg(feature = "prover")]
+            device: None,
         }
     }
 

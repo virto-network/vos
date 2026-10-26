@@ -13,18 +13,18 @@
 //! The verifier pins the preprocessed root ([`circuit_root`]): the tables'
 //! and the code's content has no other pin. It takes the chips and their
 //! sizes from the proof, and the transcript does not mix the chips (as
-//! format 35's does not): the device program id, which 7.15 mixes into the
-//! header and verifies against, pins both.
+//! format 35's does not); the device's segment ([`super::device`]) takes
+//! both from its program and mixes the chips after the header.
 
 use num_traits::Zero;
 use stwo::core::channel::MerkleChannel;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::poly::circle::CanonicCoset;
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
+use stwo::prover::CommitmentSchemeProver;
 use stwo::prover::backend::BackendForChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::poly::circle::PolyOps;
-use stwo::prover::{CommitmentSchemeProver, ComponentProver};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, verify_masked};
 use vos_pvm_proof::SegmentState;
@@ -36,17 +36,9 @@ use vos_pvm_proof::masked::{
 use vos_pvm_proof::side_note::SideNote;
 use vos_pvm_recair_air::masked::MaskedComponents;
 
-use super::{
-    Checks, MaskRng, MaskStats, MaskedProof, MaskedProvers, MaskedTrace, mask_rows, verifier_format,
-};
+use super::{Checks, MaskRng, MaskStats, MaskedProof, MaskedTrace, mask_rows, verifier_format};
 use crate::prove::ProveError;
 use crate::trace::FirstRowFraction;
-
-impl MaskedProvers for SegmentComponents {
-    fn provers(&self) -> Vec<&dyn ComponentProver<SimdBackend>> {
-        SegmentComponents::provers(self)
-    }
-}
 
 /// A masked segment proof: its chips, their log sizes, the boundary states
 /// and the masked proof.

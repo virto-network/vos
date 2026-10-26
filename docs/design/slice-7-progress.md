@@ -1708,3 +1708,242 @@ and the default agent's (L3).
 - Found, not fixed: `liveness::idle_groups_send_nothing_but_the_pair_heartbeat`
   failed once in the whole cluster suite at load 16 (every group's term
   moved by one), and passed three times alone.
+
+## Step 7.15: the device shape and its Poseidon2 chip
+
+Branch `s7/7.15`, from vos-core `4e7b4982` (7.14 merged).
+
+**Built:**
+- **The Poseidon2 call's proof side** (pin H's `0x402`, dispatch 102):
+  `core::ecall::ECALL_POSEIDON2`; the tracer serves it only when built
+  `with_poseidon2` (`kernel::trace_device_kernel`), as pin H states it (64
+  bytes at φ7, sixteen words each below p or the call traps; the first
+  eight words of their permutation written at φ8; no other effect), since
+  the runtime does not serve it before 7.9; the ledger records its 64
+  reads and 32 writes, the registers' ledger its φ7 and φ8 reads.
+- **The shared chip set's CPU** (`chips::CpuP2Chip`): format 35's CPU and
+  one more main column after its own, `IsP2Ecall`, which the host-call
+  continuation counts among the precompile selectors (dispatch 102); the
+  call's row reads φ7 and φ8 below 2^32 and hands `(ts, φ7, φ8)` to the
+  chip (`Poseidon2Call`), three fractions after format 35's. Format 35
+  keeps `CpuChip`, its constraints exactly its own (one constraint body,
+  the variant's selector an `Option`).
+- **The Poseidon2 chip** (`chips::Poseidon2Chip`): one permutation a row,
+  the S-boxes as `p2`'s (`a = y²`, `out = a²·y`, 284 columns, degree 3,
+  unchained), the input's 64 bytes read and the output's 32 written through
+  the ledger at the call's timestamp, each input word below p (its top byte
+  below 128 by two `Range256` lookups, its bytes' sum not `3·255 + 127` by
+  an inverse), each output byte range-checked and each output word
+  canonical (top byte below 128, not p), the addresses `ptr + i` as byte
+  limbs with boolean carries (the limbs sum to `ptr + i` whatever the
+  carries, so a wrong carry gives the true address's ledger halves or
+  halves outside `[0, 2^16)`, which join no group and start none). 527 main columns and 169 fractions,
+  each its own interaction column (`Logup::Single`, the addresses being of
+  degree 2): about 1,200 columns a row [measured, the build].
+- **The device shape** (`vos_pvm_proof::device`, pin J): the shared chip
+  set without the page boundary or the node's boundary chips, in
+  `DEVICE_ORDER`, and four chips of its own:
+  - `DeviceMemoryChip`, a row a byte the run touches: its address as 32
+    bits, its region selected among the layout's five (read-only data,
+    argument window, read-write data, heap, stack; preprocessed bounds,
+    `page − first` and `end − 1 − page` as 20-bit distances), exactly one
+    on a real row; its `ts = 0` write (the first touch, carrying
+    `2·permission`, readable only for the read-only data and the argument
+    window) and its closing read; the first touch of a data region's byte
+    looked up in the data table, of any other region's zero. `MemoryChip`
+    takes these pairs in place of the page boundary's (a device run's
+    `side_note.device`), its constraints unchanged.
+  - `DataTableChip`: every byte of the read-only and the read-write data's
+    pages, `(address, byte)` preprocessed, a multiplicity column.
+  - `DeviceBoundaryChip` (blinded): a row a register, the layout's entry
+    value preprocessed; each register's entry write and its closing read at
+    the halt's timestamp, the entry `(ts 1, pc 0)` produced and the halt
+    `(final ts, HALT_PC)` consumed, φ9..12's final values handed to the
+    `IoHash` relation. So the entry is the program's, the run halts, it is
+    one segment, and no register but φ9..12 is public.
+  - `DeviceIoChip` (its sum public): four rows producing `(r, φr)` for
+    r = 9..12; the verifier recomputes its claimed sum from the io-hash
+    (`masked::device_bound_sums`).
+- **The shape is the program's** (pin J's witness-independent trace): the
+  chips its code reaches (`device_chips_of_code`: every opcode's, each
+  precompile an `ecalli` names), whatever a run takes; a log size each,
+  chosen at install from a reference run and at least the masking's floor;
+  the prover traces every chip at exactly its log size
+  (`masked::DeviceSizes::Pinned`) and refuses a run that needs more
+  (`ProvingError::Shape`).
+- **The masked device segment** (`vos_pvm_recair::masked::device`):
+  `install` computes the program (its chips, log sizes, layout and the
+  preprocessed root they commit: code, data table, regions and
+  permissions, entry registers) from the kernel alone; `prove_device`
+  proves a run against it; `verify_device` takes nothing of the program
+  from the proof. The transcript mixes the program's chips after the
+  header (`MaskedFormat::program`, empty for the wrap and the node's
+  segment, whose bytes are unchanged); the header already holds the
+  format and the log sizes, the first commitment the root. The public
+  values are the io-hash's 32 bytes.
+- **The masked set generalized** (the review's M2): `masked::Components`
+  over a `ChipSet` (`Node`, format 35's chips and its four public sums;
+  `Device`, `DEVICE_ORDER` and DeviceIoChip's sum alone), so
+  `public_sums` and the bound sums are the set's.
+
+**The 7.14 review's hand-offs:** the program's chips mixed into the
+transcript and verified against (`the_program_is_mixed_into_the_transcript`);
+`bound_sums` and `public_sums` per chip set; the pinned shape on the device
+prover (the node's masked segment keeps its floors; its shape is pinned per
+class by 7.21's install record); the shape witness-independent
+(`the_program_is_the_kernels`, `an_unused_chip_proves_at_its_pinned_size`);
+the device shape's leakage gates, two witnesses at equal public values.
+
+**Gates** [measured]:
+- **Forgery** (`recair/tests/device/gates.rs`), each refused: a first touch
+  of a data byte other than the table's (logup); a nonzero first touch of
+  the stack or the heap (the prover, and forced the verifier's
+  `OodsNotMatching`); a touch outside the regions (the same); a write to a
+  read-only page (the same); a second segment (refused); a Poseidon2 output
+  not the permutation's (constraint); an input word at or above p, p itself
+  (constraint) and `2^31 + 5` (logup); a call without its row (logup). Each
+  forged run is the kernel's own but for its one property: its machine's
+  memory changed before the run (`kernel::trace_forged_device_kernel`,
+  `seeded-masks`), or its record edited.
+- **The public sum and the program:** an io-hash other than the run's and
+  a forced proof blinding DeviceIoChip's sum refused; another program's
+  chips mixed after the header, or its root, refused; six tampers refused,
+  none a panic; a run past the program's shape refused by the prover; a
+  chip set not the code's, or a log size under its floor, refused at
+  install.
+- **Acceptance:** the device kernel (witness input, the Poseidon2 call, the
+  read-only and read-write data, the heap, the stack) on both channels,
+  two witnesses under one program; under `heavy-gates`, at blowup 4 with
+  43 queries (`h = 512`) and blowup 2 with 86 (`h = 1,024`) on Blake2s, R1
+  in one attempt.
+- **Degree audit** (`circuit`'s `the_masked_device_chips_pass_the_degree_audit`):
+  every chip a device shape may hold, masked, at degree 3 or under; the
+  shared CPU 826 constraints `[0, 17, 726, 83]`, the Poseidon2 chip 592
+  `[0, 0, 330, 262]`, DeviceMemoryChip 86, DeviceBoundaryChip 11.
+- **Leakage** (`recair/tests/device/leakage.rs`; 16 proofs a witness in
+  `check`, `LEAKAGE_SEGMENT_N` under `heavy-gates`): the device shape states
+  the io-hash alone, so two witnesses of the kernel (other 64 bytes read
+  and hashed, one io-hash) have equal public values, slice 6's pairs with
+  no deviation: witness indistinguishability (per field χ², pooled KS) and
+  uniformity; neither the witness's bytes nor the call's output in a
+  proof's bytes; no opening shared by two proofs of one run nor two
+  witnesses' from one seed; a right guess reproduces DeviceIoChip's sum
+  alone; one shape for both witnesses.
+- **Format 35 byte for byte** for kernels without `ecalli 0x402`:
+  `fixtures::the_fixtures_are_the_generators` and
+  `the_fixtures_are_judged` pass, and `constants::` with every pinned
+  value unchanged (in `test-proof`). ProgramMemory now commits the call's
+  dispatch id 102 under every format, so a node kernel holding the call
+  has another program-memory root; under format 35 it was and stays
+  unprovable past the call, and pin H admits the call in device kernels
+  alone.
+- **`just check`:** green at `e67b7fee` (1,463 passed in 106 suites, the
+  device's 22 among them; under a 12 GiB scope, `nice -n 10`,
+  `CARGO_BUILD_JOBS=8`, other agents' runs on the machine, load 18–28).
+- **`just test-proof`** (the leakage gates at their medium N, 64 proofs a
+  witness on the device shape, `--test device` added to the recipe): green,
+  574 passed in 49 suites, 42 minutes; the device's heavy acceptance and
+  leakage tests 30 s; the carrier audit clean (451 `WrapRandomness`
+  needles).
+
+**The masked device shape of the auth statement, x86** [measured,
+`spikes/s7-device/runs/x86-device-quiet.jsonl`; the statement as 7.0a
+derived it, 19,192 steps, over its BLAKE2b tree; the Blake2s channel;
+4 threads pinned to four P-cores, median of 5; quiet, load 1.7–1.8; the
+`device` cell installs the kernel's program at the shape its run needs and
+proves against it, verified; `floor` and `lean` are 7.14's `real` cells,
+re-measured beside it]:
+
+| cell | prove | CPU | peak | bytes | cells | columns | verify |
+|---|---|---|---|---|---|---|---|
+| device, 2:43:20 (h 512) | 1.67 s | 5.87 s | 2,803 MiB | 1,448,867 | 105.3M | 5,288 | 12.4 ms |
+| floor, 2:43:20 | 1.65 s | 5.77 s | 2,756 MiB | 1,419,991 | 99.3M | 5,051 | |
+| lean, 2:43:20 | 1.26 s | 4.35 s | 2,175 MiB | 687,281 | 72.8M | 1,950 | |
+| device, 1:86:20 (h 1,024) | 1.30 s | 4.46 s | 1,811 MiB | 2,671,685 | 109.4M | 5,288 | 15.9 ms |
+| floor, 1:86:20 | 1.27 s | 4.30 s | 1,770 MiB | 2,625,211 | 103.4M | 5,051 | |
+| lean, 1:86:20 | 0.99 s | 3.30 s | 1,392 MiB | 1,220,214 | 76.8M | 1,950 | |
+
+- **The device shape costs what 7.14's floor proxy did:** ×1.01–1.02 in
+  time, memory and bytes. Its chips: the CPU at 2^15, BLAKE2b at 2^12, the
+  memory ledger and the registers' at 2^16, DeviceMemoryChip at 2^13 (a
+  row a byte the run touches), the data table at 2^13 (the statement's two
+  data pages), the AND table at 2^16, every other at its floor; 20 chips,
+  5,288 columns against the floor's 5,051 (the device's four chips against
+  the node's three boundary chips, and the CPU's selector).
+- **Against 7.14's lean shape** (the same session; 7.14's quiet table
+  1.29 s, 2,153 MiB, 687,456 B at 2:43 and 1.02 s, 1,402 MiB, 1,219,144 B
+  at 1:86): ×1.31–1.32 in time, ×1.29–1.30 in memory, ×2.1–2.2 in bytes.
+  The difference is BLAKE2b and its AND table, which the statement over
+  BLAKE2b still needs: lever 1 (7.17), the statement over the Poseidon2
+  tree through the chip, removes them.
+- **Pin J's budgets:** the proof fits 1.5 MiB at blowup 4 with 43 queries
+  (1.45 MB) and not at blowup 2 with 86 (2.67 MB) until lever 1; peak
+  memory 2.7 GiB and 1.8 GiB, past the 1 GiB budget (the CPU-side levers'
+  target). Verification 12–16 ms on one x86 core's share, under pin J's 40
+  ms; the install (program and root) 0.18–0.19 s.
+- R1 in one attempt, 11 ms at 43 queries, 41 ms at 86.
+- Under load (another agent's runs, load 18–28: `runs/x86-device-load.jsonl`)
+  the same cells took ×4.0–6.5 longer (the floor cell at 2:43 10.69 s
+  against 1.65 s), the device and floor cells within each other's noise.
+
+**Where the plan was off:**
+- **Pin J's shape needs boundary chips of its own,** not only a data table
+  and a permission table. The node's register and program boundary chips
+  publish the whole boundary (every register in and out, the pc and the
+  timestamps), so a device proof built from them would publish its run's
+  step count and every final register. The device shape replaces them with
+  DeviceBoundaryChip (the entry as the program's preprocessed constants,
+  the halt's pc a constant, everything at the halt blinded) and
+  DeviceIoChip (the io-hash, the one public sum), beside DeviceMemoryChip
+  and the data table: four chips besides the Poseidon2 chip.
+- **The Poseidon2 call changes the CPU.** Pin H's `IsP2Ecall` selector is
+  a CPU column and a precompile dispatch the continuation must count, so
+  the shared chip set's CPU is not format 35's: `CpuP2Chip`, one column
+  and three fractions more. Format 41 therefore re-pins the CPU too (7.21
+  re-pins every program id anyway); format 35 keeps its CPU byte for byte
+  (and its program ids, for kernels without `ecalli 0x402`).
+- **The device chips cannot join `chip_idx`** before 7.21: its count is
+  the wire's `SEGMENT_CHIPS` and the install record's `Shape`. Their
+  indices continue past it (`device::device_chip`), the masks staying
+  32-bit; 7.21 decides where the Poseidon2 chip sits in 41's.
+- **The Poseidon2 chip is about four times pin H's "about 300 main
+  columns":** the permutation is 284 (the 16 input words are the bytes'
+  expressions), but the 96 byte accesses with their address carries and
+  the range checks bring it to 527 main columns and 169 fractions, each
+  its own interaction column (the addresses are of degree 2): about 1,200
+  columns a row. A row a call, at the masking's floor of 2^11–2^12 rows,
+  so about 5–10M masked cells [model] however few the calls: a lever for 7.17 (word-wide
+  accesses, the address limbs as columns and paired fractions, or a
+  pointer-alignment rule pin H does not have).
+- **The program's log sizes need a reference run:** branch-free is
+  necessary but not enough when a chip's rows follow the input's length
+  (the witness input's bytes, the bytes touched); the install takes a run
+  and the prover refuses one past it. A kernel's schema should state the
+  input's bound its program is sized for (7.20).
+- **The runtime does not serve `0x402` yet** (7.9): the proof's tracer
+  serves it behind `with_poseidon2`, unpriced, the ABI exactly pin H's.
+
+**Commits:** `4729d746` the Poseidon2 call's proof side, the shared CPU, the
+Poseidon2 chip, the device's chips, the masked device segment and their
+gates; `381da708` the spike's `device` cell (and the floor seam's hunk on
+the device-aware ledger); `e67b7fee` the heavy acceptance, `test-proof`'s
+device suite, the docs and `proving.md` §5 and §8; this record and the
+runs.
+
+**Review (Fable):** accept; L1–L4 folded
+(`docs/design/research/slice-7/7.15-fable.md`). The carry argument in the
+Poseidon2 chip's doc restated (the limbs sum to `ptr + i` whatever the
+carry; BLAKE2b's address doc already holds, its limb 0 range-checked), and
+DeviceMemoryChip's doc says two rows for one byte are harmless; this
+record's load range and the format-35 caveat corrected; three gates added
+(`a_non_canonical_poseidon2_output_word_is_refused`, an input inverted
+from an output whose first word is 0, written as p: the prover and,
+forced, `OodsNotMatching`; `a_trapping_run_is_refused`, logup;
+`a_wrong_address_carry_is_refused`, every constraint held, logup) and
+`a_second_segment_is_refused` asserting `Error::Logup`; the first and the
+third fail with the output's inverse constraint dropped or the carry left
+true [measured]; `LogupTraceBuilder`'s column writes one helper. Gates:
+the device suite 24 of 24 (`heavy` gated off), the device degree audit,
+`logup_trace_builder`'s bit-identity test, `fixtures::` (format 35 byte for
+byte), `just check` green (1,466 passed in 106 suites; 12 GiB scope,
+`nice -n 10`, 10 jobs).

@@ -141,6 +141,7 @@ pub mod air_column;
 pub mod boundary_binding;
 pub mod chips;
 pub mod core;
+pub mod device;
 mod framework;
 pub mod framework_access;
 mod lookups;
@@ -342,6 +343,57 @@ chips! {
     /// their trace-gen (idx 1/2), so it must be generated after all its
     /// consumers (the ordering rule).
     BITWISE_AND_BYTE = chips::BitwiseAndByteChip,
+}
+
+/// Calls `visitor` with the shared chip set's chip at `index` as a device
+/// shape holds it (`device::device_chip`): the shared set's CPU at
+/// [`chip_idx::CPU`], the device's chips past [`chip_idx::COUNT`], format
+/// 35's otherwise.
+///
+/// # Panics
+/// When `index` is no chip's.
+pub(crate) fn visit_device_chip<V: ChipVisitor>(index: usize, visitor: V) -> V::Output {
+    use device::device_chip;
+    match index {
+        chip_idx::CPU => visitor.visit(&chips::CpuP2Chip),
+        device_chip::POSEIDON2 => visitor.visit(&chips::Poseidon2Chip),
+        device_chip::DEVICE_MEMORY => visitor.visit(&chips::DeviceMemoryChip),
+        device_chip::DATA_TABLE => visitor.visit(&chips::DataTableChip),
+        device_chip::DEVICE_BOUNDARY => visitor.visit(&chips::DeviceBoundaryChip),
+        device_chip::DEVICE_IO => visitor.visit(&chips::DeviceIoChip),
+        _ => visit_chip(index, visitor),
+    }
+}
+
+/// The shared chip set's chip at `index` as a device shape holds it, as a
+/// prover component ([`visit_device_chip`]'s).
+#[cfg(feature = "prover")]
+pub(crate) fn device_component(index: usize) -> &'static dyn framework::MachineProverComponent {
+    use device::device_chip;
+    match index {
+        chip_idx::CPU => &chips::CpuP2Chip,
+        device_chip::POSEIDON2 => &chips::Poseidon2Chip,
+        device_chip::DEVICE_MEMORY => &chips::DeviceMemoryChip,
+        device_chip::DATA_TABLE => &chips::DataTableChip,
+        device_chip::DEVICE_BOUNDARY => &chips::DeviceBoundaryChip,
+        device_chip::DEVICE_IO => &chips::DeviceIoChip,
+        _ => BASE_COMPONENTS[index],
+    }
+}
+
+/// The shared chip set's chip at `index` as a device shape holds it, as a
+/// verifier component ([`visit_device_chip`]'s).
+pub(crate) fn device_machine_component(index: usize) -> &'static dyn framework::MachineComponent {
+    use device::device_chip;
+    match index {
+        chip_idx::CPU => &chips::CpuP2Chip,
+        device_chip::POSEIDON2 => &chips::Poseidon2Chip,
+        device_chip::DEVICE_MEMORY => &chips::DeviceMemoryChip,
+        device_chip::DATA_TABLE => &chips::DataTableChip,
+        device_chip::DEVICE_BOUNDARY => &chips::DeviceBoundaryChip,
+        device_chip::DEVICE_IO => &chips::DeviceIoChip,
+        _ => BASE_COMPONENTS[index],
+    }
 }
 
 /// Deterministic, side-note-driven filter on `BASE_COMPONENTS`.

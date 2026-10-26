@@ -167,3 +167,22 @@ fn fill_row(out: &mut Sinks, s: Step) {
     helpers::residual(out, s, &shift, &div, &counts);
     host_call::disposition(out, s);
 }
+
+/// The shared chip set's `IsP2Ecall` column at `log_size` rows, a row a
+/// step: 1 on a served Poseidon2 call (`PvmStep::served_ecall`), 0 on every
+/// other row and the padding.
+pub(super) fn poseidon2_selector(
+    side_note: &SideNote,
+    log_size: u32,
+) -> stwo::prover::backend::simd::column::BaseColumn {
+    let call = Some(u64::from(crate::core::ecall::ECALL_POSEIDON2));
+    let mut column = vec![BaseField::from(0u32); 1 << log_size];
+    for (row, step) in side_note.steps.iter().enumerate() {
+        if step.served_ecall() == call {
+            column[row] = BaseField::from(1u32);
+        }
+    }
+    crate::trace::utils::finalize_columns(vec![column])
+        .pop()
+        .expect("one column")
+}

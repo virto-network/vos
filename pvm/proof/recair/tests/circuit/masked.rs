@@ -198,6 +198,59 @@ fn the_masked_segment_chips_pass_the_degree_audit() {
     );
 }
 
+/// R5 on the device's masked segment: every chip a device shape may hold
+/// (the shared chip set's CPU, the Poseidon2 chip, the device's boundary
+/// chips, format 35's tables and arithmetic) keeps every constraint at
+/// degree 3 or under, masked; the shared CPU holds format 35's CPU's
+/// constraints and four more (the call's selector and its pointers'
+/// high bytes); and the set built at its layout declares them, each bounded
+/// at `log_size + 2`.
+#[test]
+fn the_masked_device_chips_pass_the_degree_audit() {
+    use vos_pvm_proof::device::{DEVICE_ALL, device_chip, device_chips_of_mask};
+    use vos_pvm_proof::masked::{DeviceComponents, drive_masked_device_chip};
+    let channel = &mut Blake2sChannel::default();
+    let lookups = DeviceComponents::draw_relations(DEVICE_ALL, channel);
+    let blind = BlindRelation::draw(channel);
+    let mut total = 0;
+    for chip in device_chips_of_mask(DEVICE_ALL) {
+        let info = drive_masked_device_chip(chip, 10, &lookups, &blind, InfoEvaluator::empty());
+        let preprocessed = preprocessed_of(&info);
+        let preprocessed: Vec<&str> = preprocessed.iter().map(String::as_str).collect();
+        let recorded = drive_masked_device_chip(chip, 10, &lookups, &blind, ExprEvaluator::new());
+        let name = format!("device chip {chip}");
+        let counted = audit(&name, &recorded, &preprocessed);
+        assert_eq!(counted.len(), info.n_constraints, "{name}");
+        eprintln!(
+            "{name}: {} constraints {:?}",
+            counted.len(),
+            histogram(&counted)
+        );
+        total += counted.len();
+        if chip == device_chip::CPU {
+            let plain = drive_masked_chip(chip, 10, &lookups, &blind, InfoEvaluator::empty());
+            let fractions = |info: &InfoEvaluator| info.logup.fracs.len();
+            assert_eq!(fractions(&info), fractions(&plain) + 3);
+        }
+    }
+    let count = device_chips_of_mask(DEVICE_ALL).count();
+    let built = DeviceComponents::layout(DEVICE_ALL, &vec![10; count]).unwrap();
+    assert_eq!(
+        built
+            .components()
+            .iter()
+            .map(|component| component.n_constraints())
+            .sum::<usize>(),
+        total
+    );
+    assert!(
+        built
+            .components()
+            .iter()
+            .all(|component| component.max_constraint_log_degree_bound() == 12)
+    );
+}
+
 /// The cubic census (the review's option 4), a measurement: which of the
 /// masked segment's 759 cubic constraints are logup batches (the pairs'
 /// `Δ·d_1·d_2 − (n_1·d_2 + n_2·d_1)`, the blinding's constant denominator

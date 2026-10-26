@@ -650,9 +650,12 @@ last for decades.**
   7.14): each chip's blinding fraction joins its last batch of fractions,
   no column or degree added; the boundary chips' claimed sums, which the
   boundary states fix, stay unblinded; every chip pads to four times its
-  `h`. No admitted format proves them yet (the device format, 43, at
-  7.15–7.16). Node segment, leaf and fold proofs stay unmasked, in the
-  prover role, as the witness rows do.
+  `h`. The device shape proves them masked against its program
+  (`vos_pvm_recair::masked::device`, slice 7's 7.15): the program's chips
+  mixed after the header, its log sizes pinned, the io-hash the one public
+  sum. No admitted format proves either yet (the device format, 43, at
+  7.16). Node segment, leaf and fold proofs stay unmasked, in the prover
+  role, as the witness rows do.
 - **Device proofs at rate 1/2** serve authorizations a space re-checks at
   its ingress, never settlement.
 - **How:** spike 2's variant (c), already prototyped on our pinned Stwo
@@ -928,9 +931,10 @@ Poseidon2-M31 AIR, built from the recursion AIR's Poseidon2 component.
   software, about 15,800 instructions a permutation, as it does
   BLAKE2b.
 
-**2. The device profile** comes next. The general zkVM runs on phones,
-for any attestable kernel. It proves one segment with no page-Merkle
-boundary, binding the run like this:
+**2. The device profile** comes next [built: the shape, slice 7's 7.15;
+`vos_pvm_proof::device`]. The general zkVM runs on phones, for any
+attestable kernel. It proves one segment with no page-Merkle boundary,
+binding the run like this:
 - **code:** program memory, preprocessed;
 - **first touches** (`ts = 0` ledger entries), by address region:
   - the data region: a preprocessed data table;
@@ -939,7 +943,10 @@ boundary, binding the run like this:
 - **arguments:** the witness-input precompile;
 - **read-only pages:** a preprocessed permission table per region refuses
   writes;
-- **output:** the io-hash only;
+- **output:** the io-hash only: the entry (timestamp 1, pc 0, the
+  layout's registers) and the halt's pc are the program's constants, every
+  other register at the halt hidden, φ9..12 bound to the public io-hash by
+  one public claimed sum (DeviceIoChip's);
 - **masking:** a floor of rows per masked component, set by the queries:
   the randomizer covers twice the rows a column reveals, `4|O| + q(|O| + 1)`
   for `|O|` offsets a column, rounded to a power of two `h`, and a component

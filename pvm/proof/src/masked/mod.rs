@@ -1,5 +1,5 @@
 //! The segment AIR masked: variant (c) (`docs/design/proving.md` §5) over
-//! the segment's chips, a component set the masked prover and verifier take
+//! a chip set's chips, a component set the masked prover and verifier take
 //! (`vos_pvm_recair_air::masked::MaskedComponents`).
 //!
 //! - **A chip masked** ([`MaskedChipEval`]): its constraints and fractions,
@@ -8,25 +8,25 @@
 //!   blinding adds neither an interaction column nor a degree; the chip's own
 //!   batching (its `Logup`) otherwise. The constraints are bounded at
 //!   `log_size + 2`.
-//! - **The set** ([`SegmentComponents`]): the chips its active-chip mask
-//!   names, in chip order, each at its log size; the relations drawn chip by
-//!   chip in that order, as the unmasked segment draws them.
-//! - **The public sums:** the boundary chips' claimed sums, which the
-//!   verifier recomputes from the boundary states ([`bound_sums`]), stay
-//!   unblinded; the other chips' are blinded.
+//! - **The set** ([`Components`], over a [`ChipSet`]): the chips its
+//!   active-chip mask names, in the set's order, each at its log size; the
+//!   relations drawn chip by chip in that order. Two sets: the node's
+//!   segment ([`SegmentComponents`], format 35's chips in chip order) and
+//!   the device's ([`DeviceComponents`], `crate::device`'s).
+//! - **The public sums:** the claimed sums the public values fix stay
+//!   unblinded, every other is blinded. The node's are its four boundary
+//!   chips' (the registers in and out, the program's boundary, the memory
+//!   roots), recomputed from the boundary states ([`bound_sums`]), a mask
+//!   without one refused. The device's is DeviceIoChip's alone, recomputed
+//!   from the io-hash ([`device_bound_sums`]): its entry is the program's and
+//!   its exit hidden but for φ9..12.
 //!
-//! Every chip pads to its masking's floor (four times its `h`): the fixed
+//! Every chip pads to a floor of at least four times its `h`: the fixed
 //! tables repeat their entries with no multiplicity, the boundaries add rows
-//! that claim nothing. The unmasked segment formats never read this module.
-//!
-//! **The node's shape, assumed:** [`bound_sums`] and the public sums take the
-//! four boundary chips (the registers in and out, the program's boundary,
-//! the memory roots), and a mask without one is refused. Pin J's device
-//! shape drops the memory roots and outputs the io-hash in φ9..12, so both
-//! are generalized there (`slice-7-mobile.md`, 7.15). Nor is the shape
-//! pinned yet: the chips (`active`) and their sizes are the run's, above the
-//! floors, so they depend on the witness until the device program id pins
-//! them and the prover pads to them (7.15).
+//! that claim nothing. The node's segment takes each chip at its run's size
+//! above its floor; the device's at its program's ([`DeviceSizes::Pinned`]),
+//! never the run's, so its shape does not depend on the witness. The
+//! unmasked segment formats never read this module.
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -58,7 +58,10 @@ use crate::{BASE_COMPONENTS, ChipVisitor, chip_idx, chips_of_mask, visit_chip};
 #[cfg(feature = "prover")]
 mod trace;
 #[cfg(feature = "prover")]
-pub use trace::{Evaluations, MaskedSegmentTrace, masked_segment_trace};
+pub use trace::{
+    ChipTraces, DeviceSizes, Evaluations, MaskedDeviceTrace, MaskedSegmentTrace,
+    device_preprocessed, masked_device_trace, masked_segment_trace,
+};
 
 /// A chip's evaluation as the masked segment proves it: the chip's
 /// constraints and fractions, its blinding columns and their fraction joined
@@ -131,13 +134,107 @@ type Boxed = Box<dyn stwo::prover::ComponentProver<stwo::prover::backend::simd::
 #[cfg(not(feature = "prover"))]
 type Boxed = Box<dyn Component>;
 
-/// The segment AIR's chips an active-chip mask names, masked, at their log
-/// sizes, in chip order.
-pub struct SegmentComponents {
+/// A chip set a masked segment proves: which chips an active-chip mask
+/// names and in what order, the chip at an index, and the claimed sums the
+/// public values fix.
+pub trait ChipSet: 'static {
+    /// The chips `active` names, in commitment order; `None` when it is not
+    /// a mask of the set's.
+    fn chips(active: u32) -> Option<Vec<usize>>;
+
+    /// Calls `visitor` with the chip at `index`.
+    #[allow(private_bounds, private_interfaces)]
+    fn visit<V: ChipVisitor>(index: usize, visitor: V) -> V::Output;
+
+    /// The chip at `index`, as the verifier's component.
+    fn machine(index: usize) -> &'static dyn MachineComponent;
+
+    /// The positions, among `active`'s chips, of the claimed sums the
+    /// public values fix: the prover leaves them unblinded.
+    fn public_sums(active: u32) -> Vec<usize>;
+}
+
+/// The node's segment: format 35's chips in chip order, its boundary chips'
+/// claimed sums public (the registers in and out, the program's boundary,
+/// the memory roots).
+pub enum Node {}
+
+impl ChipSet for Node {
+    fn chips(active: u32) -> Option<Vec<usize>> {
+        (active & !chip_idx::ALL == 0).then(|| chips_of_mask(active).collect())
+    }
+
+    #[allow(private_bounds, private_interfaces)]
+    fn visit<V: ChipVisitor>(index: usize, visitor: V) -> V::Output {
+        visit_chip(index, visitor)
+    }
+
+    fn machine(index: usize) -> &'static dyn MachineComponent {
+        BASE_COMPONENTS[index]
+    }
+
+    fn public_sums(active: u32) -> Vec<usize> {
+        boundary_positions_in_mask(active).map_or_else(Vec::new, |at| {
+            alloc::vec![
+                at.register_boundary,
+                at.register_closing,
+                at.program_boundary,
+                at.memory_root_boundary,
+            ]
+        })
+    }
+}
+
+/// The device profile's segment (`crate::device`): the shared chip set
+/// without the page boundary, in
+/// [`DEVICE_ORDER`](crate::device::DEVICE_ORDER), the io-hash's claimed sum
+/// (DeviceIoChip's) its one public sum.
+pub enum Device {}
+
+impl ChipSet for Device {
+    fn chips(active: u32) -> Option<Vec<usize>> {
+        crate::device::is_device_mask(active)
+            .then(|| crate::device::device_chips_of_mask(active).collect())
+    }
+
+    #[allow(private_bounds, private_interfaces)]
+    fn visit<V: ChipVisitor>(index: usize, visitor: V) -> V::Output {
+        crate::visit_device_chip(index, visitor)
+    }
+
+    fn machine(index: usize) -> &'static dyn MachineComponent {
+        crate::device_machine_component(index)
+    }
+
+    fn public_sums(active: u32) -> Vec<usize> {
+        device_io_position(active).into_iter().collect()
+    }
+}
+
+/// DeviceIoChip's position among `active`'s chips, a device mask's.
+pub fn device_io_position(active: u32) -> Option<usize> {
+    crate::device::is_device_mask(active)
+        .then(|| {
+            crate::device::device_chips_of_mask(active)
+                .position(|chip| chip == crate::device::device_chip::DEVICE_IO)
+        })
+        .flatten()
+}
+
+/// A chip set's chips an active-chip mask names, masked, at their log sizes,
+/// in the set's order.
+pub struct Components<S: ChipSet> {
     active: u32,
     log_sizes: Vec<u32>,
     components: Vec<Boxed>,
+    set: core::marker::PhantomData<S>,
 }
+
+/// The node's masked segment.
+pub type SegmentComponents = Components<Node>;
+
+/// The device profile's masked segment.
+pub type DeviceComponents = Components<Device>;
 
 /// A chip masked, its columns allocated after those before it.
 struct Build<'a> {
@@ -187,12 +284,7 @@ impl<Ch: Channel> ChipVisitor for Draw<'_, Ch> {
     }
 }
 
-/// Whether `active` names chips of the segment AIR, `n` of them.
-fn names(active: u32, n: usize) -> bool {
-    active & !chip_idx::ALL == 0 && active.count_ones() as usize == n
-}
-
-impl SegmentComponents {
+impl<S: ChipSet> Components<S> {
     /// The chips `active` names under `relations` and `blind`, at
     /// `log_sizes` with `claimed_sums`; `None` unless each count is the
     /// mask's.
@@ -203,15 +295,17 @@ impl SegmentComponents {
         log_sizes: &[u32],
         claimed_sums: &[SecureField],
     ) -> Option<Self> {
-        if !names(active, log_sizes.len()) || claimed_sums.len() != log_sizes.len() {
+        let chips = S::chips(active)?;
+        if chips.len() != log_sizes.len() || claimed_sums.len() != log_sizes.len() {
             return None;
         }
         let allocator = &mut TraceLocationAllocator::default();
-        let components = chips_of_mask(active)
+        let components = chips
+            .into_iter()
             .zip(log_sizes)
             .zip(claimed_sums)
             .map(|((chip, &log_size), &claimed_sum)| {
-                visit_chip(
+                S::visit(
                     chip,
                     Build {
                         allocator,
@@ -227,10 +321,11 @@ impl SegmentComponents {
             active,
             log_sizes: log_sizes.to_vec(),
             components,
+            set: core::marker::PhantomData,
         })
     }
 
-    /// The chips' provers, in chip order.
+    /// The chips' provers, in the set's order.
     #[cfg(feature = "prover")]
     pub fn provers(
         &self,
@@ -242,14 +337,14 @@ impl SegmentComponents {
     }
 }
 
-impl MaskedComponents for SegmentComponents {
+impl<S: ChipSet> MaskedComponents for Components<S> {
     type Relations = AllLookupElements;
     type Active = u32;
 
     fn draw_relations(active: u32, channel: &mut impl Channel) -> AllLookupElements {
         let mut relations = AllLookupElements::default();
-        for chip in chips_of_mask(active & chip_idx::ALL) {
-            visit_chip(
+        for chip in S::chips(active).unwrap_or_default() {
+            S::visit(
                 chip,
                 Draw {
                     relations: &mut relations,
@@ -292,21 +387,16 @@ impl MaskedComponents for SegmentComponents {
     }
 
     fn public_sums(&self) -> Vec<usize> {
-        boundary_positions_in_mask(self.active).map_or_else(Vec::new, |at| {
-            alloc::vec![
-                at.register_boundary,
-                at.register_closing,
-                at.program_boundary,
-                at.memory_root_boundary,
-            ]
-        })
+        S::public_sums(self.active)
     }
 
     fn preprocessed_log_sizes(&self) -> Vec<u32> {
-        chips_of_mask(self.active)
+        S::chips(self.active)
+            .unwrap_or_default()
+            .into_iter()
             .zip(&self.log_sizes)
             .flat_map(|(chip, &log_size)| {
-                MachineComponent::preprocessed_trace_sizes(BASE_COMPONENTS[chip], log_size)
+                MachineComponent::preprocessed_trace_sizes(S::machine(chip), log_size)
             })
             .collect()
     }
@@ -366,10 +456,58 @@ pub fn bound_sums(
     })
 }
 
+/// The values a device proof's transcript mixes after the main tree's
+/// root: its io-hash (φ9..12 at the halt, 32 LE bytes), one M31 a byte,
+/// four a QM31. Nothing else of the run is public.
+pub fn device_public_values(io: &[u8; 32]) -> Vec<SecureField> {
+    io.chunks(4)
+        .map(|bytes| SecureField::from_m31_array(from_fn(|i| BaseField::from(u32::from(bytes[i])))))
+        .collect()
+}
+
+/// Whether DeviceIoChip's claimed sum, among `claimed_sums` in the order of
+/// `active`'s chips, is the one io-hash `io` fixes under `relations`.
+pub fn device_bound_sums(
+    active: u32,
+    io: &[u8; 32],
+    relations: &AllLookupElements,
+    claimed_sums: &[SecureField],
+) -> bool {
+    device_io_position(active)
+        .and_then(|at| claimed_sums.get(at))
+        .is_some_and(|&sum| {
+            let io_relation: &crate::lookups::IoHashLookupElements = relations.as_ref();
+            sum == crate::chips::device_boundary::io_claimed_sum(io_relation, io)
+        })
+}
+
 /// A chip of the masked segment driven at `log_size` through `eval`, under
 /// `relations` and `blind`: the masked evaluation, which the degree audit
 /// walks. `chip` is its index ([`chip_idx`]).
 pub fn drive_masked_chip<E: EvalAtRow>(
+    chip: usize,
+    log_size: u32,
+    relations: &AllLookupElements,
+    blind: &BlindRelation,
+    eval: E,
+) -> E {
+    drive::<Node, E>(chip, log_size, relations, blind, eval)
+}
+
+/// A chip of the device's masked segment driven at `log_size` through
+/// `eval` ([`drive_masked_chip`]'s), `chip` its shared index
+/// (`device::device_chip`).
+pub fn drive_masked_device_chip<E: EvalAtRow>(
+    chip: usize,
+    log_size: u32,
+    relations: &AllLookupElements,
+    blind: &BlindRelation,
+    eval: E,
+) -> E {
+    drive::<Device, E>(chip, log_size, relations, blind, eval)
+}
+
+fn drive<S: ChipSet, E: EvalAtRow>(
     chip: usize,
     log_size: u32,
     relations: &AllLookupElements,
@@ -401,7 +539,7 @@ pub fn drive_masked_chip<E: EvalAtRow>(
         }
     }
 
-    visit_chip(
+    S::visit(
         chip,
         Drive {
             log_size,

@@ -157,18 +157,22 @@ pub(crate) fn step_reg_accesses(step: &crate::core::step::PvmStep) -> StepRegAcc
     //   blake2b: φ[7..=10] ([`BLAKE2B_CALL_REGS`]).
     //   witness input: φ[7,8] (destination/capacity), before the step's
     //   write of its count to φ[7].
+    //   Poseidon2: φ[7,8] (input/output pointers), which only the shared
+    //   chip set's CPU (`CpuP2Chip`) produces; format 35's never serves the
+    //   call.
     // Only a served call reads them (`PvmStep::served_ecall`): for any
     // other the CpuChip emits no producer.
     let ecall = step.served_ecall();
     let is_blake_ecall = ecall == Some(ECALL_BLAKE2B_COMPRESS as u64);
-    let is_witness_ecall = ecall == Some(ECALL_WITNESS_INPUT as u64);
+    let reads_pointers = ecall == Some(ECALL_WITNESS_INPUT as u64)
+        || ecall == Some(u64::from(crate::core::ecall::ECALL_POSEIDON2));
     let ecall_reads = if is_blake_ecall {
         let mut regs = BLAKE2B_CALL_REGS.map(|reg| reg as u8);
         regs.sort_unstable();
         regs.iter()
             .map(|&reg| (reg, step.regs_before[usize::from(reg)]))
             .collect()
-    } else if is_witness_ecall {
+    } else if reads_pointers {
         vec![(7u8, step.regs_before[7]), (8u8, step.regs_before[8])]
     } else {
         Vec::new()

@@ -1,18 +1,16 @@
 diff --git a/pvm/proof/src/chips/memory.rs b/pvm/proof/src/chips/memory.rs
-index ffaef5d..7d6e9d8 100644
 --- a/pvm/proof/src/chips/memory.rs
 +++ b/pvm/proof/src/chips/memory.rs
-@@ -485,11 +485,20 @@ impl BuiltInProverComponent for MemoryChip {
-         // listed page.  Subsumes the old read-before-write ts=0 injection
-         // (MemoryBoundaryChip is deleted); the producers are MemoryPageChip.
-         let closing_ts = crate::chips::register_memory_closing::closing_ts_for(side_note);
-+        // The spike's floor seam (`S7_TOUCHED_BYTES`): the boundary pair
-+        // only for the bytes the trace accesses, the ledger a one-segment
-+        // shape without the page-Merkle boundary carries. The page chips'
-+        // relation no longer balances: a cost proxy only.
-+        let accessed: Option<std::collections::HashSet<u32>> = std::env::var_os("S7_TOUCHED_BYTES")
-+            .map(|_| entries.iter().map(|entry| entry.address).collect());
-         if let Some(payload) = &side_note.memory_pages {
+@@ -526,10 +526,19 @@
+                 });
+             }
+         } else if let Some(payload) = &side_note.memory_pages {
++            // The spike's floor seam (`S7_TOUCHED_BYTES`): the boundary pair
++            // only for the bytes the trace accesses, the ledger a one-segment
++            // shape without the page-Merkle boundary carries. The page chips'
++            // relation no longer balances: a cost proxy only.
++            let accessed: Option<std::collections::HashSet<u32>> = std::env::var_os("S7_TOUCHED_BYTES")
++                .map(|_| entries.iter().map(|entry| entry.address).collect());
              for page in &payload.pages {
                  let base = page.page_idx as u64 * crate::page_merkle::PAGE_SIZE as u64;
                  for i in 0..crate::page_merkle::PAGE_SIZE {

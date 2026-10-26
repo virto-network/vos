@@ -23,7 +23,10 @@
 //!     content fixes (the tables, the program) stays at it;
 //!   - `real`: masked for real, by the masked segment prover (7.14), each
 //!     chip padded to four times its `h` (`2·(8 + 3q)` rounded up), the
-//!     masks from the OS; verified for the built shape.
+//!     masks from the OS; verified for the built shape;
+//!   - `device` (with `real` alone): pin J's device shape (7.15), the
+//!     kernel's program installed at the shape its run needs (each chip at
+//!     least its floor), proved masked against it and verified.
 //! - `grind [--bits B] [--n N] [--threads N]`: N grinds of the Blake2s-M31
 //!   channel's PoW, each from its own transcript: mean, median, 95th
 //!   percentile.
@@ -245,6 +248,7 @@ fn generate(elf: &Path, dir: &Path) {
 struct Run {
     side_note: vos_pvm_proof::SideNote,
     chips: u32,
+    kernel: Vec<u8>,
 }
 
 impl Run {
@@ -271,6 +275,7 @@ impl Run {
         Self {
             side_note: trace.side_note,
             chips: derived.shapes[position].chips,
+            kernel: derived.kernels[position].1.clone(),
         }
     }
 
@@ -297,6 +302,8 @@ struct Cell {
     /// Masked for real: the segment's chips proved by the masked prover
     /// (slice 7's 7.14), each padded to four times its `h`.
     real: bool,
+    /// Pin J's device shape (7.15), masked for real.
+    device: bool,
 }
 
 impl Cell {
@@ -307,10 +314,11 @@ impl Cell {
             3,
             "a cell is shape/blowup:queries:pow/proxy: {text}"
         );
-        let (floor, lean) = match parts[0] {
-            "built" => (false, false),
-            "floor" => (true, false),
-            "lean" => (true, true),
+        let (floor, lean, device) = match parts[0] {
+            "built" => (false, false, false),
+            "floor" => (true, false, false),
+            "lean" => (true, true, false),
+            "device" => (false, false, true),
             other => panic!("unknown shape {other}"),
         };
         let config: Vec<&str> = parts[1].split(':').collect();
@@ -332,6 +340,7 @@ impl Cell {
             pow: config[2].parse().unwrap(),
             masked,
             real,
+            device,
         }
     }
 
@@ -339,6 +348,7 @@ impl Cell {
         format!(
             "{}/{}:{}:{}/{}",
             match (self.floor, self.lean) {
+                _ if self.device => "device",
                 (_, true) => "lean",
                 (true, false) => "floor",
                 (false, false) => "built",
@@ -390,6 +400,10 @@ fn cell(cell: &Cell, elf: &[u8], input: &[u8], expected: &[u8], reps: usize, out
     let format = cell.install_format();
     let started = Instant::now();
     let run = Run::of(elf, input, expected);
+    if cell.device {
+        assert!(cell.real, "the device shape is masked for real");
+        return device_cell(cell, &run, input, reps);
+    }
     if cell.real {
         return real(cell, &run, started.elapsed().as_secs_f64(), reps);
     }
@@ -660,6 +674,110 @@ fn real(cell: &Cell, run: &Run, trace_seconds: f64, reps: usize) {
         list(&times),
         median(&cpu),
         bytes.len(),
+        stats.attempts,
+        stats.classes,
+        stats.revealed_rows,
+        stats.rank_check.as_secs_f64() * 1e3,
+    );
+}
+
+/// Pin J's device shape (7.15): the auth kernel's program installed at the
+/// shape its run needs, proved masked against it from the OS's randomness
+/// `reps` times, verified.
+fn device_cell(cell: &Cell, run: &Run, input: &[u8], reps: usize) {
+    use stwo::core::air::Component;
+    use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
+    use vos_pvm_proof::masked::DeviceComponents;
+    use vos_pvm_recair::masked::MaskRng;
+    use vos_pvm_recair::masked::device::{device_shape, install, prove_device, verify_device};
+    use vos_pvm_recair_air::masked::MaskedComponents;
+    let format = masked_format(cell);
+    let trace = || {
+        vos_pvm_proof::kernel::trace_device_kernel(&run.kernel, input, GAS)
+            .expect("the kernel runs")
+            .side_note
+    };
+    let started = Instant::now();
+    let (active, log_sizes) = device_shape(&format, &run.kernel, &mut trace()).expect("a shape");
+    let program = install::<Blake2sMerkleChannel>(&format, &run.kernel, active, &log_sizes)
+        .expect("installs");
+    let install_seconds = started.elapsed().as_secs_f64();
+    let steps = run.steps();
+    let (mut times, mut cpu) = (Vec::new(), Vec::new());
+    let mut made = None;
+    let mut rss_reset = true;
+    for rep in 0..reps {
+        let mut side_note = trace();
+        rss_reset &= std::fs::write("/proc/self/clear_refs", "5").is_ok();
+        let cpu_started = cpu_seconds();
+        let started = Instant::now();
+        let proof = prove_device::<Blake2sMerkleChannel>(
+            &format,
+            &program,
+            &mut side_note,
+            MaskRng::default(),
+        )
+        .expect("the device shape proves");
+        times.push(started.elapsed().as_secs_f64());
+        cpu.push(cpu_seconds() - cpu_started);
+        eprintln!(
+            "  {} rep {}/{reps}: {:.3} s",
+            cell.name(),
+            rep + 1,
+            times[rep]
+        );
+        made = Some(proof);
+    }
+    let rss = peak_rss_mib();
+    let (proof, stats) = made.unwrap();
+    let bytes = postcard::to_allocvec(&(
+        &proof.io,
+        &proof.proof.stark_proof,
+        &proof.proof.claimed_sums,
+        proof.proof.interaction_pow,
+    ))
+    .unwrap();
+    let mut best = f64::INFINITY;
+    let mut ok = true;
+    for _ in 0..3 {
+        let started = Instant::now();
+        ok &= verify_device::<Blake2sMerkleChannel>(&format, &program, &proof).is_ok();
+        best = best.min(started.elapsed().as_secs_f64());
+    }
+    let layout = DeviceComponents::layout(active, &log_sizes).expect("laid out");
+    let (mut columns, mut cells) = (0usize, 0u64);
+    for component in layout.components() {
+        for tree in component.trace_log_degree_bounds().iter() {
+            columns += tree.len();
+            cells += tree.iter().map(|&log| 2u64 << log).sum::<u64>();
+        }
+    }
+    let chips: Vec<usize> = vos_pvm_proof::device::device_chips_of_mask(active).collect();
+    let threads = std::env::var("RAYON_NUM_THREADS").unwrap_or_else(|_| "auto".into());
+    let list = |values: &[f64]| {
+        values
+            .iter()
+            .map(|v| format!("{v:.4}"))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    println!(
+        "{{\"kind\":\"cell\",\"cell\":\"{}\",\"steps\":{steps},\"threads\":{},\"pool\":{},\"mask\":\"{active:#010x}\",\
+         \"chips\":{chips:?},\"log_sizes\":{log_sizes:?},\"log_mask_rows\":{},\"columns\":{columns},\"cells\":{cells},\"reps\":{reps},\
+         \"install_s\":{install_seconds:.3},\"prove_s_best\":{:.4},\"prove_s_median\":{:.4},\"prove_s_runs\":[{}],\"cpu_s_median\":{:.3},\
+         \"peak_rss_mib\":{rss:.0},\"peak_rss_reset\":{rss_reset},\
+         \"proof_bytes\":{},\"verified\":{ok},\"verify_ms\":{:.1},\
+         \"r1_attempts\":{},\"r1_classes\":{},\"r1_rows\":{},\"r1_ms\":{:.1}}}",
+        cell.name(),
+        json_str(&threads),
+        rayon_threads(),
+        format.masking.unwrap().log_mask_rows,
+        times.iter().copied().fold(f64::INFINITY, f64::min),
+        median(&times),
+        list(&times),
+        median(&cpu),
+        bytes.len(),
+        best * 1e3,
         stats.attempts,
         stats.classes,
         stats.revealed_rows,
