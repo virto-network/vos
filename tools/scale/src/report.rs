@@ -121,6 +121,10 @@ pub struct KindSummary {
     pub ok: u64,
     pub errors: u64,
     pub by_error: BTreeMap<String, u64>,
+    /// Reads at a cut whose window closed after the load ended, left open
+    /// by the run's end: apart from the errors.
+    #[serde(default)]
+    pub not_closed: u64,
     pub rate: f64,
     pub p50_us: u64,
     pub p99_us: u64,
@@ -587,6 +591,7 @@ pub fn report(
                     ok: line["ok"].as_u64().unwrap_or(0),
                     errors: line["errors"].as_u64().unwrap_or(0),
                     by_error: serde_json::from_value(line["by_error"].clone()).unwrap_or_default(),
+                    not_closed: line["not_closed"].as_u64().unwrap_or(0),
                     rate: line["rate"].as_f64().unwrap_or(0.0),
                     p50_us: line["p50_us"].as_u64().unwrap_or(0),
                     p99_us: line["p99_us"].as_u64().unwrap_or(0),
@@ -797,7 +802,7 @@ pub fn text(summary: &Summary) -> String {
         for kind in KINDS {
             if let Some(stats) = driver.kinds.get(kind) {
                 text += &format!(
-                    "    {kind:<9} {:>9} sent {:>9} ok {:>7} errors {:?}, {:.1}/s, p50 {} us, p99 {} us, p99.9 {} us\n",
+                    "    {kind:<9} {:>9} sent {:>9} ok {:>7} errors {:?}, {:.1}/s, p50 {} us, p99 {} us, p99.9 {} us{}\n",
                     stats.sent,
                     stats.ok,
                     stats.errors,
@@ -805,7 +810,11 @@ pub fn text(summary: &Summary) -> String {
                     stats.rate,
                     stats.p50_us,
                     stats.p99_us,
-                    stats.p999_us
+                    stats.p999_us,
+                    match stats.not_closed {
+                        0 => String::new(),
+                        open => format!("; {open} not closed in the run"),
+                    }
                 );
             }
         }
@@ -1002,7 +1011,8 @@ mod tests {
 
     /// The window is the drivers' load past its ramp: the drain's lines,
     /// written while the last answers come, are left out; a pool that made
-    /// requests wait is warned of.
+    /// requests wait is warned of; reads at a cut left open by the run's
+    /// end are reported apart from the errors.
     #[test]
     fn the_window_is_the_load_not_the_drain() {
         let dir = tempfile::tempdir().unwrap();
@@ -1024,12 +1034,17 @@ mod tests {
         for t in (110_000..=400_000).step_by(10_000) {
             lines += &format!("{{\"t_ms\":{t},\"total\":false,\"kind\":\"all\",\"sent\":1}}\n");
         }
+        lines += "{\"t_ms\":400000,\"total\":true,\"kind\":\"cut_read\",\"sent\":0,\"ok\":5,\"errors\":1,\"by_error\":{\"Workflow(Attesting)\":1},\"not_closed\":3}\n";
         lines += "{\"t_ms\":400000,\"total\":true,\"kind\":\"all\",\"sent\":1000,\"conn_waits\":50,\"load_from_ms\":100000,\"load_to_ms\":160000}\n";
         let hosts = run.dir.join("hosts").join("d");
         std::fs::create_dir_all(&hosts).unwrap();
         std::fs::write(hosts.join("r.drive.jsonl"), lines).unwrap();
         let summary = super::report(&run, None, Some(10)).unwrap();
         assert_eq!(summary.window_ms, (110_000, 160_000));
+        let reads = &summary.drivers[0].kinds["cut_read"];
+        assert_eq!((reads.ok, reads.errors, reads.not_closed), (5, 1, 3));
+        assert!(text(&summary).contains("1 errors {\"Workflow(Attesting)\": 1}"));
+        assert!(text(&summary).contains("; 3 not closed in the run"));
         assert!(
             summary
                 .warnings
