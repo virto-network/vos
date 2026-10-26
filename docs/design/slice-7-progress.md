@@ -1014,12 +1014,11 @@ come of, instead of the log: no watermark, no lost records, and a replica
 that installs a snapshot and then leads holds every statement still to
 prove, and every proved one still to submit.
 
-**M4:** `prune` makes any aged unfinished job dead (its proof unheld) and
-removes the jobs of an agent the node no longer replicates; each
+**M4:** `prune` makes any aged unfinished job dead (its proof unheld)
+and removes an aged finished one, whatever its agent's placement; each
 unfinished job's kernel is held under `NODE_AGENT`, fetched from the
-replicas when absent, and a statement whose kernel never arrives within
-the worker's patience is refused (`NO_PROGRAM`), the step proving another
-job meanwhile.
+replicas when absent; a record whose kernel is absent waits for it, with
+a warning, the step proving another job meanwhile (the review's M1).
 
 **L6:** (a) compaction no longer waits on the prover: `PROVER_HOLD`, the
 `proving` flag and the prover's mark go with the log scan (`NodeRow` 0x12
@@ -1045,9 +1044,8 @@ clock-jump cuts of an issuer; the cut model with the opt-in; a snapshot-
 installed replica holding a queued statement's job and proving it once
 after the leader stops (`a_snapshot_installed_replica_proves_a_queued_statement`,
 M3); a record proved past compaction; a recorded statement's record kept
-without its witness. Worker: jobs aging out and going with their agent,
-a rootless record making no job; a kernel held and one never fetched
-refused; a stop mid-proof counted only when the node was not stopping;
+without its witness. Worker: jobs aging out, a rootless record refused;
+a kernel held, and one fetched late proved; a stop mid-proof counted only when the node was not stopping;
 resubmissions counted across restarts. The anchoring and Kreivo cluster
 suites gain an issuer (C11 would leave their windows unanchored) and step
 their clocks past each boundary before the close, so the reports land.
@@ -1125,3 +1123,67 @@ passes). The agent image changes (refine, apply and `vos-wire`).
 - Found, not fixed: the cut bench's process sometimes waits for good after
   printing (its store's release thread), on vos-core as here; killed by
   PID.
+
+### 7.3: the review's fixes
+
+Fable's review (`research/slice-7/7.3-fable.md`, fix-then-merge), folded
+in six commits on `142554d4`: +592 −248 over 29 files.
+
+- **M1, a kernel late past the patience:** a record whose kernel the node
+  lacks waits for it, with one warning, and is proved under the right
+  program id once it arrives; nothing is refused for patience and a lost
+  kernel is never cached (`NO_PROGRAM` and `missing` go). The read
+  records fold into the job table plus a window watermark (`read` and
+  `unread` go), the proof asks and lost fetches into one map (`asked` and
+  `unfetched` go); a rootless record is a refused job
+  (`REFUSED_ROOTLESS`), so the table alone dedups. `1cb4c489`.
+- **L1, the asks at the cut:** the representative's `asked` is a
+  committed map, and a close reads the window's asks as the cut held
+  them (the live rows and the cut's undo rows), so a replica that builds
+  the cut late writes the same close and anchor row. A `Hooks::build`
+  holds a replica's builds for the test. `2d8e529b`.
+- **L2, Proven with the proof held:** `prove()` refuses a witness-less
+  record with its own code (`REFUSED_UNWITNESSED`); a replica records a
+  peer's `Proved` once it holds the blob, fetching it otherwise, and the
+  leader proposes `Proven` only for a proof it holds. `1cb4c489`.
+- **L3:** the ask writes `reading` only when it is below the window, as
+  the representative's stored report does. `69191b6c`.
+- **L4, the cut rule once:** `vos_wire::apply::Waits::cuts`, used by
+  apply, the leader's marker (`cut_due`) and the cut model. `a7f7372f`.
+- **L5:** documented (the `Admin::ReportEveryWindow` docs and
+  `operations.md`): the issuer must be an agent other than the
+  representative, whose own cuts carry no report of it. `c55fac89`.
+- **L6:** `vos agent reports --agent A --every true|false`, over a new
+  admin route (`POST /agents/{id}/reports`, `Operator::report_every_window`);
+  `operations.md` points at it. `c55fac89`.
+- **Info, pins and prune:** at open the worker drops the node's own pins
+  that no job wants (`Host::held`, `Blobs::held_by_node`), so a crash leaks
+  none; `prune` ages every job by its deadline (a rootless one by its
+  window's) and no longer removes an absent agent's jobs, which its
+  records would make again. `1cb4c489`, `18a71a31`.
+
+**Tests:** worker: a kernel fetched late proved under its id
+(`a_kernel_is_held_and_one_fetched_late_proves`), a witness-less record
+refused (`a_witnessless_record_is_refused_for_it`), jobs outlasting their
+agent's absence; testkit: `a_read_never_moves_the_reading_window_back`;
+cluster: `a_late_build_closes_the_asks_its_cut_holds` (it fails with the
+close reading the live asks alone: no anchor row of window 0); ingress:
+`the_operator_sets_an_agent_to_report_every_window`.
+
+**Unchanged:** the kernel program ids (`the_program_ids_are_the_repositorys`
+passes). The representative's image changes (`asked` a committed map),
+and the default agent's (L3).
+
+**Gates** [measured]:
+- `just check` green.
+- The checker loop, seeds 7315 and 7316 with `CUTS_FULL`: green, 138 and
+  112 s at load 25–35; 8 and 12 anchors, one a window, no evidence.
+- `just e2e-chain`: the first run failed its latency gate at load 27–34,
+  JAM's window-1 balance statement 253.4 s against 233.3 s (102.5 s of it
+  after its proof, the testnet's blocks); the second, at load 19–31,
+  green in 1,665 s: Kreivo 89.9 s, JAM 145.0–210.9 s, the tightest 0.8 s
+  under its gate; one Kreivo anchor, 3.5 UNITS charged; the audit clean
+  over 443 carriers.
+- Found, not fixed: `liveness::idle_groups_send_nothing_but_the_pair_heartbeat`
+  failed once in the whole cluster suite at load 16 (every group's term
+  moved by one), and passed three times alone.
