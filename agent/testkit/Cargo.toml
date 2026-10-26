@@ -21,6 +21,7 @@ lz4_flex = "0.13"
 proptest = "1"
 tempfile = "3"
 vos-jam = { workspace = true }
+vos-pvm-poseidon2 = { workspace = true }
 vos-pvm-precompiles = { workspace = true }
 vos-pvm-program = { workspace = true }
 

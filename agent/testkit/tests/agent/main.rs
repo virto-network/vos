@@ -3,6 +3,7 @@
 //! The tests fail, not skip, when the programs are missing.
 
 mod common;
+mod credentials;
 mod hosts;
 mod jam;
 mod limits;

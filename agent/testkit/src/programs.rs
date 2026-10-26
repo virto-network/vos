@@ -1,7 +1,7 @@
 //! The guest programs this repository builds (`just build-agent
-//! build-representative build-test-actors`), linked or derived as an install derives them, and
-//! their methods by name: for the tests and benches of the testkit and of
-//! the node.
+//! build-representative build-credentials build-test-actors`), linked or
+//! derived as an install derives them, and their methods by name: for the
+//! tests and benches of the testkit and of the node.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -17,7 +17,7 @@ fn guest(path: &str) -> PathBuf {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(path);
     assert!(
         path.exists(),
-        "{}: run `just build-agent build-representative build-test-actors`",
+        "{}: run `just build-agent build-representative build-credentials build-test-actors`",
         path.display()
     );
     path
@@ -36,6 +36,11 @@ fn representative_elf() -> PathBuf {
 /// The space's representative's package, as its crate builds it.
 pub fn representative_package() -> Vec<u8> {
     read(&representative_elf())
+}
+
+/// The credential actor's ELF.
+pub fn credentials_elf() -> PathBuf {
+    guest("credentials/target/riscv64em-vos/release/vos-credentials.elf")
 }
 
 /// Test actor `name`'s ELF.
@@ -108,6 +113,11 @@ pub fn agent() -> Vec<u8> {
 /// Test actor `name`, linked.
 pub fn actor(name: &str) -> Vec<u8> {
     link(&actor_elf(name))
+}
+
+/// The credential actor, linked.
+pub fn credentials() -> Vec<u8> {
+    link(&credentials_elf())
 }
 
 /// The default agent, linked, and the counter actor, linked and as its

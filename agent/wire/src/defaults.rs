@@ -190,6 +190,13 @@ pub const SERVED_BYTE: u64 = 64;
 /// the rest.
 pub const ACK_LIMIT: u64 = 1024;
 
+/// How long a credential actor's root stays accepted after a write
+/// superseded it, in milliseconds of batch time
+/// ([`crate::credentials::Ring::accepts`]): so a revocation binds every
+/// replica within it, and an honest member's path stays good as long after
+/// any change to the tree. Not the venues' `MaxRootAge`.
+pub const ROOT_MAX_AGE: u64 = 10 * 60 * 1000;
+
 /// An await's deadline when its call sets none: after the batch time
 /// of the step that awaits, in milliseconds.
 pub const AWAIT_MS: u64 = 60 * 1000;
