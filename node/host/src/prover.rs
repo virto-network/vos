@@ -2,7 +2,7 @@
 //! it reads (the agents' applied state, their records of the statements
 //! waiting to be proved among it, and the blob store) and its table, the
 //! node's own rows; and those records, which every replica's apply keeps
-//! ([`attested`]).
+//! with their witnesses until their roots age ([`attested`]).
 //!
 //! A statement proved here reaches its agent through the agent's leader:
 //! the worker hands it over ([`Unrecorded`]) and wakes the leader, whose
@@ -21,7 +21,7 @@ use vos_raft::Role;
 use vos_venue::vos_statement::StatementId;
 use vos_wire::ids::{AgentId, ProgramHash};
 use vos_wire::peer::{NodeNumber, PeerMessage};
-use vos_wire::result::{Attest, InputRef, Step, WorkResult, Write};
+use vos_wire::result::{Attest, Step, WorkResult, Write};
 use vos_wire::vos_anchor::MAX_ROOT_AGE_MS;
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, keys};
 
@@ -125,8 +125,8 @@ impl Inner {
 
 /// The writes beside `result`'s, applied to `agent` as `snapshot` holds it,
 /// that keep the records of its attests at a window's cut
-/// (`keys::attested`): each it made, kept; each its `Proven` steps name,
-/// kept without its witness, which no one proves again; and, when its time
+/// (`keys::attested`): each it made, kept with its witness, so another
+/// replica proves it again should its proof be lost; and, when its time
 /// crosses one of the agent's window boundaries, those of windows whose
 /// roots have aged past `MaxRootAge` by it, dropped. The same writes on
 /// every replica.
@@ -140,25 +140,6 @@ pub(crate) fn attested(
         let Step::Ran(run) = step else {
             continue;
         };
-        if let InputRef::Proven {
-            window, attested, ..
-        } = run.input
-        {
-            let key = keys::attested(window, &attested);
-            let record = snapshot
-                .get(agent, &key)?
-                .and_then(|bytes| Attest::decode_exact(&bytes));
-            if let Some(attest) = record.filter(|attest| !attest.witness_input.is_empty()) {
-                let proved = Attest {
-                    witness_input: Vec::new(),
-                    ..attest
-                };
-                writes.push(Write {
-                    key,
-                    value: Some(proved.encode()),
-                });
-            }
-        }
         for attest in &run.attests {
             let Some(window) = attest.window else {
                 continue;

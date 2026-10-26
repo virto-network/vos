@@ -21,8 +21,7 @@ pub const REFUSED_KERNEL: u32 = 0x1_0002;
 /// it.
 pub const REFUSED_ROOTLESS: u32 = 0x1_0003;
 
-/// A job's code when its record kept no witness, its statement recorded
-/// proved by a proof this node never fetched: no re-run proves it.
+/// A job's code when its record holds no witness: no re-run proves it.
 pub const REFUSED_UNWITNESSED: u32 = 0x1_0004;
 
 /// The times proving a statement may begin before it is refused

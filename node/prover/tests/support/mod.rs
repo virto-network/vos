@@ -190,21 +190,10 @@ impl Host for Node {
         None
     }
 
-    /// The leader's next batch records it, and keeps its record without
-    /// its witness: at once here.
-    fn record(
-        &self,
-        _: AgentId,
-        window: u64,
-        id: StatementId,
-        proof: [u8; 32],
-        attested: [u8; 32],
-    ) {
+    /// The leader's next batch records it: at once here.
+    fn record(&self, _: AgentId, _: u64, id: StatementId, proof: [u8; 32], _: [u8; 32]) {
         let mut agent = self.agent.lock().unwrap();
         agent.proven.entry(id.0).or_insert(proof);
-        if let Some(record) = agent.records.get_mut(&(window, attested)) {
-            record.witness_input.clear();
-        }
     }
 
     fn clock(&self) -> WindowClock {
