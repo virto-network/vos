@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use clap::Parser;
 use vos_gateway::Gateway;
+use vos_gateway::app::AppClient;
 use vos_gateway::config::{Config, seed};
 use vos_gateway::front::{self, Http};
 use vos_gateway::limits::Limits;
@@ -42,6 +43,13 @@ fn run(cli: Cli) -> Result<(), String> {
         .map(|(key, address)| Upstream::new(key, address, secret))
         .collect();
     let gateway = Arc::new(Gateway::new(upstreams));
+    // The s4 app's client key, apart from the gateway's: its apps' claims
+    // go as it.
+    let app = config
+        .app_key
+        .as_ref()
+        .map(|path| seed(path).map(|seed| AppClient::new(seed, Arc::clone(&gateway))))
+        .transpose()?;
     let limits = Limits::new(config.per_address());
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
     runtime.block_on(async {
@@ -52,6 +60,12 @@ fn run(cli: Cli) -> Result<(), String> {
         let public = ed25519_dalek::SigningKey::from_bytes(&secret).verifying_key();
         println!("listening on {address}");
         println!("gateway {}", hex::encode(public.to_bytes()));
+        if let Some(app) = &app {
+            println!("app {}", hex::encode(app.key()));
+        }
+        #[cfg(feature = "ssh")]
+        let ssh =
+            vos_gateway::ssh::start(&config, Arc::clone(&gateway), Arc::clone(&limits)).await?;
         let http = Http {
             tls,
             connections: config.connections.unwrap_or(1024),
@@ -60,6 +74,10 @@ fn run(cli: Cli) -> Result<(), String> {
             let _ = tokio::signal::ctrl_c().await;
         })
         .await;
+        #[cfg(feature = "ssh")]
+        if let Some(ssh) = ssh {
+            ssh.abort();
+        }
         Ok(())
     })
 }

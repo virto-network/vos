@@ -207,6 +207,14 @@ test-agent: build-test-actors build-agent build-representative
     cargo test -p vos-cli --features faults --test fault_suite
     just test-reads
 
+# The gateway's SSH port and its `vos-api` subsystem (`vos-gateway`'s
+# `ssh` feature), on s4-server: a dependency built apart from the default
+# workspace build, its crates asking a newer stable Rust than the
+# workspace's nightly names, which builds them.
+test-gateway-ssh: build-test-actors build-agent
+    cargo clippy -p vos-gateway --features ssh --ignore-rust-version --all-targets --quiet -- -D warnings
+    cargo test -p vos-gateway --features ssh --ignore-rust-version
+
 # The default agent as a service on a local PolkaJam testnet, which it
 # starts and stops: a workflow suspended in one work package and resumed in
 # later ones, every read witnessed. Outside `ci`: it needs the PolkaJam

@@ -3,11 +3,15 @@ name = "vos-gateway"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "VOS's gateway: today's HTTP routes, public TLS, limits per address and leader-aware routing in front of nodes' binary APIs, holding no authority."
+description = "VOS's gateway: today's HTTP routes, public TLS, limits per address and leader-aware routing in front of nodes' binary APIs, holding no authority; and s4's SSH port with the vos-api subsystem."
 
 [[bin]]
 name = "vos-gateway"
 path = "src/main.rs"
+
+[features]
+# The SSH port: s4's screens and the `vos-api` subsystem, on s4-server.
+ssh = ["dep:s4-server", "dep:russh"]
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
@@ -26,6 +30,8 @@ vos-api = { workspace = true, features = ["client", "quic"] }
 vos-http = { workspace = true }
 vos-net = { workspace = true }
 vos-wire = { workspace = true }
+s4-server = { path = "../../../../../s4-vos/server", optional = true }
+russh = { version = "0.61", default-features = false, features = ["ring", "flate2"], optional = true }
 
 [dev-dependencies]
 # The tests run real nodes behind the gateway: dev edges only.
