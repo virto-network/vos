@@ -600,6 +600,9 @@ S7].
 
 ### 7.6 The scale runs
 
+- **The hardware** [decided, S35]: 3 nodes on `compumax`, each in its own
+  unit with its own memory cap, cores and data directory; the drivers and
+  the coordinator on the desktop, reaching the nodes over the LAN.
 - **The runs,** in order, each 30 minutes steady after a ramp; every run
   that measures windows at `L` = 2 min (15 windows a run):
   1. **the per-replica cost:** 1k, 5k and 10k idle agents: RSS, idle wakes
@@ -607,15 +610,21 @@ S7].
      allocated whole at creation, and idle Raft timers, are the suspects;
      quiescing idle groups is the lever), fixed first if it binds;
   2. **the baseline:** `K = 64`, `U = 10^5`, `x` = 98% and again at 30%,
-     the rate stepped to the knee; then once more with the slowest host
-     excluded, the difference reported (a group commits at its median
-     replica's fsync, so a slow host gates every group it follows);
+     the rate stepped to the knee: one host's knee, three nodes sharing
+     its disk and NIC, not T2's. The rerun with the slowest host excluded
+     needs four node hosts: recorded as not measurable (S35), to run when
+     more machines exist;
   3. **users:** `U = 10^6`, `K = 64`, at the T1 rate, then at 80% of the
      knee;
   4. **agents:** `I` stepped 10^4 → 10^5 at the baseline's load;
-  5. **faults:** run 3 with a node host killed at minute 10, restarted at
-     minute 15;
-  6. **soak:** run 3 for 2 hours.
+  5. **faults** [decided, S36]: run 3 with one node's unit killed at
+     minute 10, restarted at minute 15: **T5-partial**. The three nodes
+     share one host, so re-election and rejoin are measured, a host's
+     loss (its disk and link with it) is not; the host kill runs when more
+     machines exist;
+  6. **soak:** run 3 for 2 hours. An account's row is written at its
+     first transfer, so the state grows through the first hour or so of
+     U = 10^6 users: T6's flat RSS is judged after it, the growth reported.
 - **Folded:** slice 6's item 53 (one snapshot per idle wake), item 58's
   performance half (the worker's table reads), and the levers the runs
   show binding (the runtime thread, the inbox, idle timers, the signature
@@ -623,7 +632,9 @@ S7].
   (slice 6's L8, the clock-jump outage, catch-up by log) in
   `docs/operations.md`.
 - **During timed runs,** drivers and the coordinator never share a node
-  host.
+  host: `check` refuses a node's machine that holds a driver or the
+  coordinator, and admits three nodes on one machine (their caps summed
+  against its memory, its disk's free space against all three).
 - **Gate:** "The scale test" targets met, or each miss recorded with its
   measured cause and its lever (a step, or carried by name); C9's read
   fail rate at the LAN's real skew reported as a metric.
@@ -637,10 +648,13 @@ S7].
 
 ## The scale test
 
-**Hardware** [decided, S2]: the owner's desktop and other LAN machines,
-uneven, on a real network: 3 to 5 node hosts (one `vos` process each, the
-desktop perhaps two), every agent's 3 replicas on three hosts by weight;
-1 or 2 driver hosts; the desktop as coordinator.
+**Hardware** [decided, S2, narrowed by S35]: the owner's desktop and one
+other LAN machine, `compumax`, on a real network: 3 nodes on compumax
+(each its own unit, cap and data directory), so every agent's 3 replicas
+share that host; the drivers and the coordinator on the desktop. T1, T3,
+T4 and T6 are measured as specified; T2 and run 2's rerun without the
+slowest host need four node hosts, and are recorded as not measurable
+until more machines exist.
 
 **Users** are keys and account rows, not agents: an agent holds at most
 65,536 live sessions (slice 3's cap), so a million users active within an
@@ -659,11 +673,11 @@ adjusted only by the owner:
 | | target |
 |---|---|
 | T1 users | 10^6 users in one space at `U·a·r` = 5,000 calls a second, cross-shard share 98%, client p99 at most 50 ms, no session refused |
-| T2 headroom | the knee at least 8× T1's rate (40,000 calls a second) on 4 node hosts or more, client p99 at most 50 ms below it, no leader lost: room for 8 million users at this rate, with `K` scaled to them (65,536 sessions an agent: `K ≥ 128`) |
+| T2 headroom | the knee at least 8× T1's rate (40,000 calls a second) on 4 node hosts or more, client p99 at most 50 ms below it, no leader lost: room for 8 million users at this rate, with `K` scaled to them (65,536 sessions an agent: `K ≥ 128`). Not measurable on S35's hardware (one node host): recorded so, the one host's knee reported beside it |
 | T3 agents | 10^4 agents a space: idle cost at most 5% of a core and 64 MiB of RSS per 1,000 replicas (10^5 measured, a stretch) |
 | T4 windows | at L = 2 min, 15 windows, with 1% of agents reading each window: every read served by `B_w + D + 10 s`, none `NotClosed` without a fault; the representative's work a window proportional to readers (C10) |
-| T5 faults | a node host killed under load: every agent led again within 5 s, throughput back to 80% within 30 s, the host rejoined within 60 s of its restart |
-| T6 soak | 2 hours at T1: RSS flat within 10% after the first 30 minutes, p99 within 20% of the first half hour |
+| T5 faults | a node host killed under load: every agent led again within 5 s, throughput back to 80% within 30 s, the host rejoined within 60 s of its restart. On S35's hardware, **T5-partial** [decided, S36]: one node's unit killed under load, the same bounds; the host kill re-run when more machines exist |
+| T6 soak | 2 hours at T1: RSS flat within 10% after the first 30 minutes, p99 within 20% of the first half hour. Accounts are written at their first transfer: the RSS judged once the accounts' rows stop growing, their growth reported |
 
 ## M4: the credential AIR
 
@@ -1048,6 +1062,7 @@ together on the phone in session P5.
 | format 41's wider segment AIR overflows a kernel leaf's 2^16 `p2` rows | 7.18's first-day count; the split device-only, the chip alone or nothing in 41; no fold-shape change (S32) | 7.18, 7.21 |
 | the CPU split or word-level memory, shared with the node, slows node proving or opens a forgery on node shapes | the forgery gates on node segments with the boundary; the throughput test against slice 6's 46.5 s | 7.18, 7.21 |
 | per-replica memory, idle timers or the single runtime thread cap agents per node | 7.6's run 1 first; quiescing idle groups the named lever | 7.6 |
+| **T1 at risk:** a node cannot commit 5,000 calls a second at a 50 ms p99. One FIFO executor queue takes all work (signature checks, refine and dry run as two hops, accumulates, queries, root builds); the single `vos-node` runtime thread also reads the store synchronously each batch; a group has one batch in flight (commit p50 41–49 ms plus apply 25–29 ms in 7.5's runs) | 7.6's first run measures the queues (`refine_queue`, `dry_run_queue`, `root_build_queue`); the levers in order: refine and dry run in one executor job, a priority lane for the batch path, batch signature verification, per-batch reads off the runtime thread, runtime threads sharded by group, batch pipelining | 7.6 |
 | LAN clock skew fails reads or moves windows | `vos-scale check` refuses offsets above 100 ms; C9's fail rate measured | 7.4, 7.6 |
 | the knee is a slow host's, a NIC's or a governor's, not the node's | `check` records disks, links and governors, refuses Wi-Fi; `report` names each host's binding resource; run 2 without the slowest host | 7.4, 7.6 |
 | thermal throttling skews the phone numbers | the runbook's temperature and battery checks, rounds 60 s apart, the 95th percentile recorded | every PG |

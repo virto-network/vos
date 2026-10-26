@@ -81,6 +81,10 @@ pub(crate) struct Stats {
     pub(crate) resume: Histogram,
     /// A signature check of a call or a query, on an executor.
     pub(crate) verify: Histogram,
+    /// A batch of an agent's root build waiting for an executor, and its
+    /// run there: the builds share the executors with the batches.
+    pub(crate) root_build_queue: Histogram,
+    pub(crate) root_build: Histogram,
     /// How late a probe on the runtime wakes once due: a proxy for every
     /// task's wait to be polled there, the driver's and the applier's too
     /// (to the timers' millisecond or so).
@@ -140,6 +144,8 @@ impl Stats {
             stage("between", &self.between),
             stage("resume", &self.resume),
             stage("verify", &self.verify),
+            stage("root_build_queue", &self.root_build_queue),
+            stage("root_build", &self.root_build),
             stage("late", &self.late),
         ];
         stages.extend(more);

@@ -349,6 +349,11 @@ fn a_dissenting_replica_does_not_block_the_evidence() {
     let evidence = anchoring.venue.evidence();
     assert_eq!(evidence.len(), 1);
     assert_eq!(evidence[0].1.root, root);
+    // The leader alerts the evidence once the venue took it: a moment after
+    // the space ended.
+    wait_until("the evidence alerted", || {
+        alerts(&cluster, leader).contains(&AnchorAlert::Evidence { window: 0 })
+    });
     let alerts = alerts(&cluster, leader);
     assert!(
         alerts.contains(&AnchorAlert::Divergent {
@@ -358,7 +363,6 @@ fn a_dissenting_replica_does_not_block_the_evidence() {
         }),
         "{alerts:?}"
     );
-    assert!(alerts.contains(&AnchorAlert::Evidence { window: 0 }));
 }
 
 /// Without a quorum nothing is sent and nothing settled: both other

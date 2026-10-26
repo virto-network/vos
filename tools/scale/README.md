@@ -10,8 +10,8 @@ drives it, with one `[[host]]` entry for each node or driver.
 | `check` | Reads every host: architecture, kernel, clock offset, free memory and disk, the data disk's type, CPU and governor, the link's speed, the tools, the user manager, and whether the ports are free. It refuses a host that would make the numbers mislead, and exits 1 if it refuses any host. |
 | `deploy` | Ships the static `vos` and `vos-scale` and the agent's ELF to every host with `rsync`, wipes the nodes' data, makes each node's key, and founds a new space. |
 | `up` | Starts a run: each node and each host's sampler in a `systemd-run --user` unit under a memory cap. Ingress uses each node's own TLS, pinned by its key, so the harness makes no certificates. |
-| `agents` | Creates agents on three nodes each, picked by weight, and installs an actor in each (`--representative` creates the space's representative first). |
-| `drive` | Drives a load from every driver host while it polls each node's `/stats` and `/agents/*/status`. |
+| `agents` | Creates the `K` ledger shards and `I` idle agents on three nodes each, picked by weight, with the shard actor installed in each; `--identity-rows U` creates the stand-in identity agent on every node and writes its rows; `--representative` creates the space's representative first. |
+| `drive` | Drives the load model from every driver host while it polls each node's `/stats` and `/agents/*/status`. |
 | `collect` | Copies each host's samples, node log and driver record into the run's directory. |
 | `down` | Stops every unit on every host, by unit name. |
 | `report` | Summarises a run: each host's binding resource, the nodes' stages, leader changes, the drivers' rates and latencies, and the slowest node host. `--compare RUN` sets two runs side by side. |
@@ -29,9 +29,64 @@ directory holds the inventory, the hosts' facts (`hosts.json`), the versions
 and space (`deployed.json`), the agents, the polls (`nodes.jsonl`), each
 host's samples and logs (`hosts/<name>/`), `summary.json` and `report.txt`.
 
-The load `drive` offers is the harness's smoke load: one method, users
-picked uniformly, open loop, and one client and connection per active
-user. The load model and its drivers are step 7.5's work.
+## The load model
+
+`drive` offers one load, set by one rate: `U` users (`--users`), a share
+`a` of them active at once (`--active`, 5%), each making `r` calls a
+second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
+
+- **Users** are keys derived from the seed and their index; nothing is
+  stored. Each has an account in one of the `K` ledger shards, by hash.
+- **Who is active** is drawn Zipf(1.0) over the users (`--zipf`): a user
+  becomes active, stays so for an exponential span (`--active-s`, mean
+  300 s) making `r` calls a second, and is replaced. Its session opens at
+  its first call and is kept.
+- **Calls** arrive open loop, as a Poisson process, and each one's latency
+  is timed from its scheduled send.
+- **The mix** (`--mix`, `transfer=0.8,query=0.15,workflow=0.045,cut=0.005`
+  by default, the harness's own shares pending the owner's): transfers, a share `x` of them to a payee in another shard
+  (`--cross`; random payees' `1 − 1/K` by default), sent to the shard's
+  leader; queries on a follower; workflows, read until they end; and reads
+  at a cut, read again once their window closes (`B_w + D`) and timed from
+  then (`cut_read`).
+- **The identity agent** (`run --identity`, or `agents --identity-rows`)
+  holds a row a user, replicated on every node; the first driver writes
+  it `--identity-hz` times a second (10).
+- **The readers** (`--readers`, 0 by default; T4's is 1%): a share of all
+  the agents, the shards and the idle ones, each read once at a cut every
+  window, at a uniform time within it (`reader`, and `reader_read` timed
+  from the close).
+- **The drivers** split the users and the rate. Each signs its calls ahead
+  of their schedule, keeps at most `[harness] driver_connections` (512)
+  connections a node, and sends each call once (no retry, no redirect
+  followed). All the drivers' connections together must fit in the nodes'
+  `[node] ingress_connections` (1,024 by default), or `drive` refuses. A
+  call goes to its agent's leader as last learned, a query to a follower;
+  a node that does not answer, or answers `Unavailable` or names no
+  leader, is left out for 2 s and the leader's place moves to the next
+  replica. Each operation is timed from its schedule (or from its send,
+  if that came first: never from a later instant). A user's calls go one
+  at a time, in order: a call scheduled while the user's last is
+  unanswered waits for it (`queued`). A read at a cut is read again from
+  its window's close, after a jitter of up to 0.5 s, every 0.5 s.
+- **The record**, every interval: a line a kind (sent, answered, refusals
+  by name, rate, p50, p99, p99.9, sends late, signatures the sending thread
+  made), and a line for the mix with the driver's CPU in the interval, the
+  requests that waited for a connection and the most in use. The totals
+  add the load's span (its first and last sends, the report's window), the
+  mix as sent against its target, the CPU over the load, and each shard's
+  distinct users and sessions opened. The report warns when the
+  connections bound or the driver fell behind. A machine may run several
+  drivers, each its own entry, directory and cores.
+- **The capacity probe:** a plan with `"probe": true`, given to
+  `vos-scale drive-local --plan` by hand, sends every request to a node
+  that does not replicate its agent, which answers `Elsewhere` at once.
+  The driver does all its own work and the nodes almost none: its cost at
+  a rate the nodes could not commit. It refuses to run when an agent is on
+  every node, and writes no identity rows. Its total line's `load_cores`
+  and `threads_cpu_s` give the CPU it took.
+- **Not modeled**, as every report says: the per-call identity read,
+  credentialed calls, cross-space traffic and proving.
 
 ## On each machine
 
@@ -130,18 +185,26 @@ step's gate is one command (raise `ingress_connections` in `[node]`
 when many users call at once):
 
     target/x86_64-unknown-linux-musl/release/vos-scale -i inventory.toml run \
-        --agents 100 --users 10000 --rate 200 --secs 300 --label gate
+        --shards 100 --identity --users 10000 --rate 200 --secs 300 --label gate
 
 The report names the slowest node host: the one whose node has the highest
 commit p99, with disk time per I/O breaking ties. With four node hosts or
 more, rerun without it and compare the two runs:
 
-    vos-scale -i inventory.toml --exclude SLOWEST run --agents 100 --users 10000 --rate 200 --secs 300 --label without-SLOWEST
+    vos-scale -i inventory.toml --exclude SLOWEST run --shards 100 --users 10000 --rate 200 --secs 300 --label without-SLOWEST
     vos-scale -i inventory.toml report --compare <the first run's id>
 
 `tools/scale/inventory.localhost.toml` runs the same thing on one machine.
 It lists four nodes and a driver as `localhost` entries, and is marked
 `smoke = true`.
+
+The runs' layout (`inventory.example.toml`, decided S35): three nodes on
+one machine, each its own entry with its own ports, cores and `dir`, and
+the driver and the coordinator on the desktop. `check` sums a machine's
+caps against its memory and its nodes' disk needs against the disk they
+share, and refuses a node's machine only when a driver or the coordinator
+is on it. With every node on one host, the rerun without the slowest
+host cannot be made.
 
 The report's window is the drivers' span, minus a ramp at the start (one
 sampling interval by default; `--ramp-s` sets it, `--from-ms` and
