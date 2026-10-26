@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use vos_api::Kind;
@@ -54,6 +54,8 @@ pub(crate) struct Api {
     operators: HashSet<[u8; 32]>,
     /// The operators' commands' nonces, until their expiries.
     nonces: Nonces,
+    /// Requests the API's transports brought, the node's HTTP's aside.
+    pub(crate) frames: AtomicU64,
 }
 
 /// A read's place among those waiting, given back when it ends, however it
@@ -90,12 +92,16 @@ impl Api {
             waiting: AtomicUsize::new(0),
             operators,
             nonces,
+            frames: AtomicU64::new(0),
         }
     }
 
     /// The answer to a request of `kind` holding `body`, which came `via`
     /// a transport, in SCALE.
     pub(crate) async fn handle(&self, kind: Kind, body: Vec<u8>, via: Via) -> Vec<u8> {
+        if matches!(via, Via::Socket | Via::Quic) {
+            self.frames.fetch_add(1, Ordering::Relaxed);
+        }
         match kind {
             Kind::NodeKey => self.inner.node_id.encode(),
             Kind::Time => (self.inner.clock)().encode(),

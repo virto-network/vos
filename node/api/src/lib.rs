@@ -4,6 +4,8 @@
 //! frame's header before a byte of it is read; operator kinds carry an
 //! [`Operated`] envelope, signed for one node.
 
+#[cfg(feature = "client")]
+pub mod client;
 mod frame;
 mod operated;
 #[cfg(feature = "quic")]

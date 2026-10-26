@@ -75,6 +75,11 @@ impl Node {
         self.inner.node_id
     }
 
+    /// Requests the node API's socket and QUIC endpoint brought.
+    pub fn api_frames(&self) -> u64 {
+        self.api.frames.load(Ordering::Relaxed)
+    }
+
     /// Snapshots this node's groups switched to.
     pub fn snapshots_installed(&self) -> u64 {
         self.inner.counters.installed.load(Ordering::Relaxed)

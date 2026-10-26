@@ -6,6 +6,8 @@ license.workspace = true
 description = "The VOS node's binary API: its frames, its kinds and their limits, operator requests, and clients over a byte stream and over QUIC."
 
 [features]
+# A multiplexed client over any futures-io byte stream.
+client = ["dep:futures-lite", "dep:async-channel", "dep:async-lock"]
 # A client over QUIC, a stream a request, on quinn's own API whatever its
 # runtime.
 quic = ["dep:quinn"]
@@ -14,6 +16,10 @@ quic = ["dep:quinn"]
 scale = { package = "vos-pvm-codec", path = "../../pvm/codec", default-features = false }
 vos-wire = { workspace = true }
 quinn = { version = "0.11.12", default-features = false, optional = true }
+futures-lite = { version = "2", optional = true }
+async-channel = { version = "2", optional = true }
+async-lock = { version = "3", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+smol = "2"
