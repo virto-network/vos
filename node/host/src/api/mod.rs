@@ -4,28 +4,30 @@
 //! workflows are checked here, and operator kinds run the operator's
 //! commands.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use vos_api::Kind;
-use vos_wire::batch::Admin;
 use vos_wire::ids::{AgentId, InstanceId, Principal};
 use vos_wire::ingress::{
-    AgentInfo, Create, Grant, Install, OperatorRefusal, QueryCall, Rejection, Replace, Response,
-    WorkflowRead, workflow_read_horizon,
+    AgentInfo, QueryCall, Rejection, Response, WorkflowRead, workflow_read_horizon,
 };
 use vos_wire::records::{Installed, unstored};
 use vos_wire::schema::Schema;
 use vos_wire::{Decode, Encode, keys};
 
-use crate::calls::answer_of;
-use crate::node::{Inner, ReplaceError};
+use crate::node::Inner;
 use crate::queries::Asked;
 use crate::signature::verify;
 
+mod operator;
 pub(crate) mod quic;
 pub(crate) mod socket;
+
+pub(crate) use operator::{Nonces, listed};
+pub use operator::{OPERATOR_KEY, OPERATOR_PUB};
 
 /// How far ahead a query's `not_after` may be.
 const QUERY_HORIZON_MS: u64 = 300_000;
@@ -37,15 +39,21 @@ pub(crate) enum Via {
     Socket,
     /// QUIC, from a key the node lists in `gateways`.
     Quic,
+    /// The node's own HTTP, an operator's envelope in its header.
+    Http,
     /// The node's own HTTP: an operator's bare body, once the node's
     /// bearer token admitted it.
-    Http,
+    Token,
 }
 
 pub(crate) struct Api {
     pub(crate) inner: Arc<Inner>,
     /// Owners' reads of workflows waiting now.
     waiting: AtomicUsize,
+    /// The operator keys the node lists.
+    operators: HashSet<[u8; 32]>,
+    /// The operators' commands' nonces, until their expiries.
+    nonces: Nonces,
 }
 
 /// A read's place among those waiting, given back when it ends, however it
@@ -75,20 +83,13 @@ fn decode<T: Decode>(body: &[u8]) -> Result<T, Response> {
     T::decode_exact(body).ok_or(Response::Rejected(Rejection::Malformed))
 }
 
-/// A `Create` from an operator's body: an empty one is the default.
-fn create(body: &[u8]) -> Result<Create, Response> {
-    if body.is_empty() {
-        Ok(Create::default())
-    } else {
-        decode(body)
-    }
-}
-
 impl Api {
-    pub(crate) fn new(inner: Arc<Inner>) -> Self {
+    pub(crate) fn new(inner: Arc<Inner>, operators: HashSet<[u8; 32]>, nonces: Nonces) -> Self {
         Self {
             inner,
             waiting: AtomicUsize::new(0),
+            operators,
+            nonces,
         }
     }
 
@@ -112,8 +113,11 @@ impl Api {
     async fn respond(&self, kind: Kind, body: Vec<u8>, via: Via) -> Response {
         if kind.operator() {
             return match via {
-                Via::Socket | Via::Http => self.operate(kind, body).await,
-                Via::Quic => Response::Rejected(Rejection::Operator(OperatorRefusal::SocketOnly)),
+                Via::Token => match operator::parse(&self.inner, kind, body).await {
+                    Ok(command) => operator::run(&self.inner, command).await,
+                    Err(answer) => answer,
+                },
+                Via::Socket | Via::Quic | Via::Http => self.operated(kind, body).await,
             };
         }
         match kind {
@@ -131,71 +135,6 @@ impl Api {
             },
             _ => Response::Rejected(Rejection::Malformed),
         }
-    }
-
-    /// An operator's command, its body bare: its authority checked by the
-    /// transport.
-    async fn operate(&self, kind: Kind, body: Vec<u8>) -> Response {
-        let inner = &self.inner;
-        let answer = match kind {
-            Kind::Stats => decode::<()>(&body).map(|()| Response::Stats(inner.stats())),
-            Kind::Status => decode(&body).map(|agent| inner.replica_status(agent)),
-            Kind::CreateAgent => match create(&body) {
-                Ok(create) => Ok(match inner.create_agent(create.replicas).await {
-                    Ok(agent) => Response::Created(agent),
-                    Err(error) => error.into(),
-                }),
-                Err(answer) => Err(answer),
-            },
-            Kind::CreateRepresentative => match create(&body) {
-                Ok(create) => Ok(match inner.create_representative(create.replicas).await {
-                    Ok(agent) => Response::Created(agent),
-                    Err(error) => error.into(),
-                }),
-                Err(answer) => Err(answer),
-            },
-            Kind::Install => {
-                // A package may be large: decode it off the leaders' thread.
-                let decoded = inner
-                    .offload(move || decode::<(AgentId, Install)>(&body))
-                    .await;
-                match decoded {
-                    Some(Ok((agent, install))) => {
-                        let reply = inner
-                            .install(agent, install.instance, install.elf, install.roles)
-                            .await;
-                        Ok(answer_of(reply))
-                    }
-                    Some(Err(answer)) => Err(answer),
-                    None => Ok(Response::Unavailable),
-                }
-            }
-            Kind::Replace => match decode(&body) {
-                Ok((agent, Replace { remove, add })) => {
-                    Ok(match inner.replace(agent, remove, add).await {
-                        Ok(replicas) => Response::Placed(replicas),
-                        Err(ReplaceError::Unplaced(why)) => Response::Unplaced(why),
-                        Err(ReplaceError::TimedOut) => Response::TimedOut,
-                        Err(ReplaceError::Call(error)) => error.into(),
-                    })
-                }
-                Err(answer) => Err(answer),
-            },
-            Kind::Grant => match decode::<(AgentId, Grant)>(&body) {
-                Ok((agent, grant)) => {
-                    Ok(answer_of(inner.admin(agent, Admin::SetRole(grant)).await))
-                }
-                Err(answer) => Err(answer),
-            },
-            Kind::Reports => match decode::<(AgentId, bool)>(&body) {
-                Ok((agent, every)) => Ok(answer_of(
-                    inner.admin(agent, Admin::ReportEveryWindow(every)).await,
-                )),
-                Err(answer) => Err(answer),
-            },
-            _ => Err(Response::Rejected(Rejection::Malformed)),
-        };
-        answer.unwrap_or_else(|answer| answer)
     }
 
     /// Agent `agent`'s creation record and replicas, when this node knows

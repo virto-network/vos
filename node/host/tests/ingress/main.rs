@@ -9,6 +9,7 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod api;
 mod operator;
+mod operator_api;
 mod quic;
 mod requests;
 mod sessions;
@@ -42,6 +43,8 @@ use vos_wire::{Decode, Encode};
 use vos_wire::{defaults, expiry, keys};
 
 const COUNTER: InstanceId = InstanceId(1);
+/// The seed of the operator key every served node lists.
+const OPERATOR: [u8; 32] = [31; 32];
 
 /// A node serving ingress, with one agent running the counter.
 struct Served {
@@ -80,6 +83,7 @@ impl Served {
             let clock = Arc::clone(&clock);
             Arc::new(move || clock.load(Ordering::SeqCst))
         };
+        config.operators = vec![SigningKey::from_bytes(&OPERATOR).verifying_key().to_bytes()];
         configure(&mut config);
         let node = Node::open(dir.path(), config).unwrap();
         let address = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
@@ -112,6 +116,20 @@ impl Served {
 
     fn now(&self) -> u64 {
         self.clock.load(Ordering::SeqCst)
+    }
+
+    /// An operator request of `kind` holding `body`, signed by the listed
+    /// operator key for this node, with a fresh nonce, good for a minute.
+    fn operated(&self, kind: vos_api::Kind, body: Vec<u8>) -> Vec<u8> {
+        client::signed_operated(
+            self.node.id(),
+            &SigningKey::from_bytes(&OPERATOR),
+            kind,
+            fresh_nonce(),
+            self.now() + 60_000,
+            body,
+        )
+        .encode()
     }
 
     fn client(&self, seed: u8) -> Client {
@@ -167,6 +185,14 @@ impl Served {
         let (_, body) = vos_node::client::post(&self.target, path, body).unwrap();
         Response::decode(&body).unwrap().0
     }
+}
+
+/// A nonce no other request of this process holds.
+fn fresh_nonce() -> [u8; 16] {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let mut nonce = [0u8; 16];
+    nonce[..8].copy_from_slice(&NEXT.fetch_add(1, Ordering::SeqCst).to_le_bytes());
+    nonce
 }
 
 /// The status line a raw request gets.

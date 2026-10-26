@@ -52,6 +52,9 @@ impl Node {
                 },
             )?;
         let secret = node_secret(&store)?;
+        let operators = crate::api::listed(&data, &config.operators, config.local_operator)
+            .map_err(Error::Data)?;
+        let nonces = crate::api::Nonces::load(&store, (config.clock)(), config.operator_nonces)?;
         // Each run's pair heartbeat outranks the last run's, whatever the
         // clock did between them.
         let incarnation = crate::liveness::next_incarnation(store.incarnation()?);
@@ -165,8 +168,9 @@ impl Node {
         let prover = config
             .prover
             .and_then(|prover| crate::prover::start(&inner, prover, config.prover_options));
+        let api = crate::api::Api::new(Arc::clone(&inner), operators, nonces);
         Ok(Self {
-            api: Arc::new(crate::api::Api::new(Arc::clone(&inner))),
+            api: Arc::new(api),
             inner,
             data,
             secret,
@@ -426,8 +430,9 @@ fn collect_blobs(inner: &Inner, stopped: &mpsc::Receiver<()>) {
     }
 }
 
-/// Write the operator's token, in hex, readable by its owner only.
-pub(super) fn write_token(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
+/// Write a secret, the operator's token or key, in hex, readable by its
+/// owner only.
+pub(crate) fn write_private(path: &Path, token: &[u8; 32]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
     let hex = hex::encode(token);

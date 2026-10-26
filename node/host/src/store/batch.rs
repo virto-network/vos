@@ -271,6 +271,18 @@ impl Batch {
         }
     }
 
+    /// Record an operator request's `nonce`, by `key`, until `expires_ms`;
+    /// or forget it (`None`).
+    pub fn operator_nonce(&mut self, key: &[u8; 32], nonce: &[u8; 16], expires_ms: Option<u64>) {
+        let row = node_record(NodeRow::OperatorNonce, &[&key[..], &nonce[..]].concat());
+        match expires_ms {
+            Some(expires) => self
+                .batch
+                .insert(self.store.system(), row, expires.to_be_bytes()),
+            None => self.batch.remove(self.store.system(), row),
+        }
+    }
+
     /// Write the node's `row` for the agent.
     fn set(&mut self, agent: AgentId, row: NodeRow, value: impl Into<fjall::Slice>) {
         self.batch

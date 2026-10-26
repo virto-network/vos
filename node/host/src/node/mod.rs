@@ -45,6 +45,7 @@ pub(crate) use config::Settings;
 pub use config::{Config, Peers};
 pub(crate) use directory::Directory;
 pub use error::{CallError, Error, ReplaceError, Reply};
+pub(crate) use open::write_private;
 pub use open::{ADMIN_TOKEN, NODE_KEY, STORE, wall_clock};
 pub(crate) use queue::{Agent, Answered, Pending};
 

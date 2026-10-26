@@ -1,14 +1,16 @@
 //! The node's own HTTP: today's routes translated onto the node API by
-//! `vos-http`'s table, the gateway's, and the operator's routes admitted
-//! by the node's bearer token.
+//! `vos-http`'s table, the gateway's. An operator route carries a signed
+//! envelope in its header, as through the gateway, or the node's bearer
+//! token.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use subtle::ConstantTimeEq;
-use vos_api::ENVELOPE;
+use vos_api::{ENVELOPE, Operated};
 use vos_http::routes::{self, Authorization, Routed};
 use vos_http::{Handler, Limits, Serve, Spawned};
+use vos_wire::Encode;
 use vos_wire::abi::cap;
 use vos_wire::ingress::{Rejection, Response};
 
@@ -75,13 +77,23 @@ async fn handle(api: &Api, token: &[u8; 32], request: vos_http::Request) -> vos_
             kind,
             inner,
         } => {
-            if !admitted(&authorization, token) {
-                return routes::respond(&Response::Rejected(Rejection::Unauthorized));
-            }
-            match inner {
-                Ok(inner) => (kind, inner, Via::Http),
+            let unauthorized = || routes::respond(&Response::Rejected(Rejection::Unauthorized));
+            let via = match &authorization {
+                Authorization::Operated(_) => Via::Http,
+                bearer if admitted(bearer, token) => Via::Token,
+                _ => return unauthorized(),
+            };
+            let inner = match inner {
+                Ok(inner) => inner,
                 Err(answer) => return answer,
-            }
+            };
+            let body = match authorization {
+                Authorization::Operated(credentials) => {
+                    Operated::with_credentials(&credentials, inner).encode()
+                }
+                _ => inner,
+            };
+            (kind, body, via)
         }
     };
     let answer = api.handle(kind, body, via).await;

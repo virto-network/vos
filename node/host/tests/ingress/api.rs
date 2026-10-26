@@ -12,7 +12,7 @@ use vos_node::client::signed_query;
 use super::*;
 
 /// A connection to `path`, its reads given up after 30 s.
-fn connect(path: &Path) -> UnixStream {
+pub(super) fn connect(path: &Path) -> UnixStream {
     let stream = UnixStream::connect(path).unwrap();
     stream
         .set_read_timeout(Some(Duration::from_secs(30)))
@@ -20,7 +20,7 @@ fn connect(path: &Path) -> UnixStream {
     stream
 }
 
-fn send(stream: &mut UnixStream, kind: u16, id: u64, body: &[u8]) {
+pub(super) fn send(stream: &mut UnixStream, kind: u16, id: u64, body: &[u8]) {
     stream
         .write_all(&frame(Framing::Stream, kind, id, body))
         .unwrap();
@@ -28,7 +28,7 @@ fn send(stream: &mut UnixStream, kind: u16, id: u64, body: &[u8]) {
 
 /// The next answer frame's kind, id and body; `None` once the node closed
 /// the connection.
-fn receive(stream: &mut UnixStream) -> Option<(u16, u64, Vec<u8>)> {
+pub(super) fn receive(stream: &mut UnixStream) -> Option<(u16, u64, Vec<u8>)> {
     let mut header = [0u8; 14];
     match stream.read_exact(&mut header) {
         Ok(()) => {}
@@ -173,18 +173,23 @@ fn the_socket_answers_what_http_does() {
             Response::Rejected(Rejection::Malformed).encode()
         ))
     );
-    send(&mut stream, Kind::CreateAgent as u16, 7, &[]);
+    // An operator's command, signed; bare, it is no envelope.
+    let create = served.operated(Kind::CreateAgent, Vec::new());
+    send(&mut stream, Kind::CreateAgent as u16, 7, &create);
     let (_, _, created) = receive(&mut stream).unwrap();
     assert!(matches!(
         Response::decode_exact(&created),
         Some(Response::Created(_))
     ));
     send(&mut stream, Kind::Stats as u16, 8, &[]);
-    let (_, _, stats) = receive(&mut stream).unwrap();
-    assert!(matches!(
-        Response::decode_exact(&stats),
-        Some(Response::Stats(_))
-    ));
+    assert_eq!(
+        receive(&mut stream),
+        Some((
+            Kind::Stats as u16,
+            8,
+            Response::Rejected(Rejection::Malformed).encode()
+        ))
+    );
 }
 
 /// A slow request does not hold back one sent after it: each is answered

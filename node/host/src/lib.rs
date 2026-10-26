@@ -36,6 +36,7 @@ pub mod store;
 pub mod tls;
 mod workflows;
 
+pub use api::{OPERATOR_KEY, OPERATOR_PUB};
 pub use leader::AnchorAlert;
 pub use node::{
     ADMIN_TOKEN, CallError, Config, Error, NODE_KEY, Node, Peers, ReplaceError, Reply, STORE,

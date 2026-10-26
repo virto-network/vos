@@ -44,6 +44,20 @@ pub struct Settings {
     /// The keys, in hex, the QUIC endpoint admits: gateways, drivers and
     /// remote tools, no authority among them.
     gateways: Option<Vec<String>>,
+    /// The operator keys, in hex, whose signed requests the node runs.
+    operators: Option<Vec<String>>,
+    /// Whether the node lists the operator key in its data directory too:
+    /// true by default.
+    local_operator: Option<bool>,
+}
+
+/// The keys `listed` names in hex, each named `what` when it is not one.
+fn keys(what: &str, listed: Option<Vec<String>>) -> Result<Vec<[u8; 32]>, String> {
+    listed
+        .unwrap_or_default()
+        .iter()
+        .map(|key| crate::key_bytes(key).map_err(|why| format!("{what} key {key}: {why}")))
+        .collect()
 }
 
 /// The node API's socket by default, in the data directory.
@@ -120,12 +134,9 @@ impl Settings {
                 "an api_socket_mode of {mode:#o}: a file mode is 0o777 at most"
             ));
         }
-        let gateways = self
-            .gateways
-            .unwrap_or_default()
-            .iter()
-            .map(|key| crate::key_bytes(key).map_err(|why| format!("a gateway's key {key}: {why}")))
-            .collect::<Result<_, _>>()?;
+        config.operators = keys("an operator's", self.operators)?;
+        config.local_operator = self.local_operator.unwrap_or(config.local_operator);
+        let gateways = keys("a gateway's", self.gateways)?;
         Ok(Fronts {
             api_socket: self.api_socket,
             api_socket_mode: mode,
@@ -185,6 +196,13 @@ mod tests {
         assert_eq!(fronts.api_listen, Some("127.0.0.1:7710".parse().unwrap()));
         assert_eq!(fronts.gateways, vec![[0xab; 32]]);
         assert!(applied("gateways = [\"ab\"]\n").is_err());
+        let config = applied(&format!(
+            "operators = [\"{}\"]\nlocal_operator = false\n",
+            "cd".repeat(32)
+        ))
+        .unwrap();
+        assert_eq!(config.operators, vec![[0xcd; 32]]);
+        assert!(!config.local_operator);
     }
 
     #[test]

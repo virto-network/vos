@@ -141,6 +141,15 @@ pub struct Config {
     /// How long a frame of the node API may take to arrive from its first
     /// byte.
     pub api_frame_deadline: Duration,
+    /// The operator keys the node lists: each may sign any operator
+    /// request.
+    pub operators: Vec<[u8; 32]>,
+    /// Whether the node also lists the key it keeps in its data directory
+    /// (`operator.key`), made at its first start, for the CLI on its host.
+    pub local_operator: bool,
+    /// The most operator commands' nonces the node keeps at once: past
+    /// them, a command is answered busy until some expire.
+    pub operator_nonces: usize,
 }
 
 impl Config {
@@ -194,6 +203,9 @@ impl Config {
             api_connections: 1024,
             api_in_flight: 1024,
             api_frame_deadline: vos_http::server::REQUEST_DEADLINE,
+            operators: Vec::new(),
+            local_operator: true,
+            operator_nonces: 1 << 16,
         }
     }
 }

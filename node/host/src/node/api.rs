@@ -17,7 +17,7 @@ use vos_wire::peer::{NodeNumber, Placement};
 use vos_wire::records::unstored;
 use vos_wire::result::Outcome;
 
-use super::open::write_token;
+use super::open::write_private;
 use super::{ADMIN_TOKEN, CallError, Error, Inner, Node, Pending, ReplaceError, Reply};
 use crate::queries::Asked;
 use crate::store::Fjall;
@@ -369,7 +369,7 @@ impl Node {
             }
         };
         let token = random();
-        write_token(&self.data.join(ADMIN_TOKEN), &token)
+        write_private(&self.data.join(ADMIN_TOKEN), &token)
             .map_err(|error| Error::Data(error.to_string()))?;
         let listener = smol::block_on(smol::net::TcpListener::bind(address))
             .map_err(|error| Error::Data(error.to_string()))?;

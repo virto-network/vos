@@ -1,11 +1,14 @@
 //! Signed requests as a client builds them: a call in its session, a
 //! query, and a read of a workflow, each signed by its key for the agent
-//! whose identity it names.
+//! whose identity it names; and an operator's request, signed for one
+//! node.
 
 use ed25519_dalek::{Signer, SigningKey};
+use vos_api::{Kind, Operated};
 use vos_wire::ids::{InstanceId, MethodId, Session, WorkflowId};
 use vos_wire::ingress::{
-    Call, Consistency, QueryCall, WORKFLOW_READ_HORIZON_MS, WorkflowRead, workflow_read_horizon,
+    Call, Consistency, NodeId, QueryCall, WORKFLOW_READ_HORIZON_MS, WorkflowRead,
+    workflow_read_horizon,
 };
 
 /// A call at `sequence` of `session`, whose key is `key`, to the agent
@@ -84,4 +87,27 @@ pub fn signed_workflow_read(
 /// it.
 pub fn workflow_read_not_after(now: u64, wait_ms: u64) -> u64 {
     now.saturating_add(workflow_read_horizon(wait_ms) - WORKFLOW_READ_HORIZON_MS / 2)
+}
+
+/// An operator request of `kind` holding `body`, signed by `key` for node
+/// `node`, good until `expires_ms` by the node's clock, its command run
+/// once by `nonce`.
+pub fn signed_operated(
+    node: NodeId,
+    key: &SigningKey,
+    kind: Kind,
+    nonce: [u8; 16],
+    expires_ms: u64,
+    body: Vec<u8>,
+) -> Operated {
+    let mut operated = Operated {
+        node,
+        key: key.verifying_key().to_bytes(),
+        nonce,
+        expires_ms,
+        body,
+        signature: [0; 64],
+    };
+    operated.signature = key.sign(&operated.message(kind)).to_bytes();
+    operated
 }

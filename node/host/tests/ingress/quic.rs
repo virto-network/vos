@@ -1,7 +1,7 @@
 //! The node API over QUIC: the client's key and protocol checked at the
 //! handshake, one request a stream, frames sized from their headers,
-//! operator kinds refused before signed requests, the connections at
-//! once and the frame deadline.
+//! signed operator requests, the connections at once and the frame
+//! deadline.
 
 use std::net::UdpSocket;
 
@@ -10,11 +10,11 @@ use vos_api::{FRAME_ERROR, FrameError, Framing, Header, Kind};
 use super::*;
 
 /// A gateway's key, which the node lists.
-const GATEWAY: [u8; 32] = [21; 32];
+pub(super) const GATEWAY: [u8; 32] = [21; 32];
 
 /// A node serving its API over QUIC to [`GATEWAY`]: the node, and its
 /// API's address.
-fn quic_served(configure: impl FnOnce(&mut Config)) -> (Served, SocketAddr) {
+pub(super) fn quic_served(configure: impl FnOnce(&mut Config)) -> (Served, SocketAddr) {
     let served = Served::start_with(Arc::new(vos_node::NoHooks), configure);
     let gateway = ed25519_dalek::SigningKey::from_bytes(&GATEWAY)
         .verifying_key()
@@ -37,7 +37,7 @@ fn endpoint() -> quinn::Endpoint {
 }
 
 /// A connection by the client whose seed is `secret`, speaking `alpn`.
-fn dial(
+pub(super) fn dial(
     served: &Served,
     address: SocketAddr,
     secret: [u8; 32],
@@ -64,7 +64,7 @@ fn dial(
     })
 }
 
-fn ask(connection: &quinn::Connection, kind: u16, body: &[u8]) -> (u16, Vec<u8>) {
+pub(super) fn ask(connection: &quinn::Connection, kind: u16, body: &[u8]) -> (u16, Vec<u8>) {
     smol::block_on(vos_api::quic::request(connection, kind, body)).unwrap()
 }
 
@@ -86,21 +86,25 @@ fn an_unlisted_key_or_another_protocol_is_refused_at_the_handshake() {
     assert_eq!(info[0], 1, "the agent's record");
 }
 
+/// Over QUIC an operator's request is signed as over the socket, and runs.
 #[test]
-fn operator_kinds_over_quic_are_refused_before_signed_requests() {
+fn signed_operator_requests_run_over_quic() {
     let (served, address) = quic_served(|_| {});
     let connection = dial(&served, address, GATEWAY, vos_net::api::ALPN).unwrap();
-    for kind in Kind::ALL.into_iter().filter(|kind| kind.operator()) {
-        let (answered, body) = ask(&connection, kind as u16, &[]);
-        assert_eq!(answered, kind as u16);
-        assert_eq!(
-            Response::decode_exact(&body),
-            Some(Response::Rejected(Rejection::Operator(
-                vos_wire::ingress::OperatorRefusal::SocketOnly
-            ))),
-            "{kind:?}"
-        );
-    }
+    let (_, body) = ask(
+        &connection,
+        Kind::CreateAgent as u16,
+        &served.operated(Kind::CreateAgent, Vec::new()),
+    );
+    assert!(matches!(
+        Response::decode_exact(&body),
+        Some(Response::Created(_))
+    ));
+    let (_, body) = ask(&connection, Kind::Stats as u16, &[]);
+    assert_eq!(
+        Response::decode_exact(&body),
+        Some(Response::Rejected(Rejection::Malformed))
+    );
 }
 
 #[test]
