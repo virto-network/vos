@@ -1,11 +1,13 @@
 //! `check`: what each host is, read there by one script, and whether a
 //! run may use it. A host is refused for what would make a run's numbers
 //! mislead or fail: another architecture, a kernel the JIT cannot use, a
-//! clock off by more than the bound, Wi-Fi, too little memory or disk,
+//! clock off by more than the bound, a node on Wi-Fi, too little memory or disk,
 //! missing tools, a port taken, or (over ssh) a user manager that ends
 //! with the session. What only skews the numbers (a governor other than
-//! `performance`, a rotating disk, a link under 1 GbE or of unknown speed)
-//! is warned of, and recorded with the run.
+//! `performance`, a rotating disk, a link under 1 GbE or of unknown speed,
+//! a driver on Wi-Fi) is warned of, and recorded with the run. Each
+//! driver's round trips to the nodes' machines are measured and recorded,
+//! so a run's latencies can be read against its link.
 
 use std::collections::BTreeMap;
 
@@ -81,8 +83,95 @@ pub struct Facts {
     /// midpoint, and the round trip it was read within.
     pub clock_offset_ms: f64,
     pub clock_rtt_ms: f64,
+    /// A driver's round trips to each node machine's address.
+    #[serde(default)]
+    pub links: Vec<Link>,
     pub refused: Vec<String>,
     pub warnings: Vec<String>,
+}
+
+/// A driver's round trips to one address: pings sent a fifth of a second
+/// apart, their quantiles and the share lost.
+#[derive(Clone, Debug, Default, Serialize, serde::Deserialize)]
+pub struct Link {
+    pub to: String,
+    pub sent: u32,
+    pub lost: u32,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+}
+
+/// How many pings a link's measure sends.
+const PINGS: u32 = 50;
+
+/// The round trips from `host` to `address`, `pings` of them read by
+/// `ping` there.
+fn link(host: &Host, address: &str, pings: u32) -> Result<Link, String> {
+    let text = hosts::run(
+        host,
+        &format!(
+            "ping -n -c {pings} -i 0.2 -W 1 {} 2>&1; true",
+            quote(address)
+        ),
+    )?;
+    let mut times: Vec<f64> = text
+        .lines()
+        .filter_map(|line| {
+            line.split_once("time=")?
+                .1
+                .split_whitespace()
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect();
+    if times.is_empty() {
+        return Err(format!("{}: no ping answered from {address}", host.name));
+    }
+    times.sort_by(f64::total_cmp);
+    let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize];
+    Ok(Link {
+        to: address.to_string(),
+        sent: pings,
+        lost: pings.saturating_sub(times.len() as u32),
+        p50_ms: at(0.5),
+        p99_ms: at(0.99),
+        max_ms: times[times.len() - 1],
+    })
+}
+
+/// Measure every reachable driver's links to the nodes' distinct
+/// addresses, in parallel; a link that cannot be measured is warned of.
+fn measure_links(facts: &mut [Facts], hosts: &[Host]) {
+    let mut nodes: Vec<&str> = hosts
+        .iter()
+        .filter(|host| host.role == Role::Node)
+        .map(|host| host.address.as_str())
+        .collect();
+    nodes.sort_unstable();
+    nodes.dedup();
+    std::thread::scope(|scope| {
+        let measures: Vec<_> = facts
+            .iter_mut()
+            .zip(hosts)
+            .filter(|(facts, host)| host.role == Role::Driver && facts.get("iface").is_some())
+            .map(|(facts, host)| {
+                let nodes = &nodes;
+                scope.spawn(move || {
+                    for address in nodes {
+                        match link(host, address, PINGS) {
+                            Ok(link) => facts.links.push(link),
+                            Err(error) => facts.warnings.push(format!("its link: {error}")),
+                        }
+                    }
+                })
+            })
+            .collect();
+        for measure in measures {
+            measure.join().expect("a link thread");
+        }
+    });
 }
 
 impl Facts {
@@ -164,6 +253,7 @@ pub fn probe(host: &Host) -> Result<Facts, String> {
         probe,
         clock_offset_ms,
         clock_rtt_ms,
+        links: Vec::new(),
         refused: Vec::new(),
         warnings: Vec::new(),
     })
@@ -223,6 +313,9 @@ pub fn judge(facts: &mut Facts, host: &Host, harness: &Harness) {
     }
     match (facts.get("iface"), facts.get("wireless")) {
         (None, _) => refused.push(format!("no interface holds {}", host.address)),
+        (Some(_), Some("1")) if host.role == Role::Driver => warnings.push(
+            "its link is Wi-Fi: its calls' latencies include the radio's, read them against its round trips".into(),
+        ),
         (Some(_), Some("1")) => refused.push("its link is Wi-Fi".into()),
         (Some("lo"), _) => {}
         (Some(iface), _) => match facts.number("link_mbps").filter(|speed| *speed < 1 << 31) {
@@ -371,6 +464,7 @@ pub fn check(inventory: &Inventory) -> Vec<Facts> {
         .trim()
         .to_string();
     let mut facts = probe_all(inventory);
+    measure_links(&mut facts, &inventory.hosts);
     judge_machines(
         &mut facts,
         &inventory.hosts,
@@ -466,6 +560,14 @@ pub fn table(facts: &[Facts]) -> String {
             link,
             host.clock_offset_ms,
         );
+    }
+    for host in facts {
+        for link in &host.links {
+            text += &format!(
+                "{}: link to {}: p50 {:.1} ms, p99 {:.1} ms, max {:.1} ms, {} of {} lost\n",
+                host.name, link.to, link.p50_ms, link.p99_ms, link.max_ms, link.lost, link.sent
+            );
+        }
     }
     for host in facts {
         for refusal in &host.refused {
@@ -800,6 +902,52 @@ mod tests {
                 .any(|refusal| refusal.contains("share its data disk"))
         );
         assert!(facts[3].refused.is_empty());
+    }
+
+    #[test]
+    fn a_driver_on_wifi_is_warned_of_and_a_node_on_wifi_refused() {
+        let mut text = String::new();
+        for at in 1..=3 {
+            text += &format!(
+                "[[host]]\nname = \"n{at}\"\nssh = \"me@10.0.0.2\"\naddress = \"10.0.0.2\"\nrole = \"node\"\ndir = \"/srv/n{at}\"\ningress = {}\npeer = {}\n",
+                7000 + at,
+                7100 + at
+            );
+        }
+        text += r#"
+            [[host]]
+            name = "d"
+            ssh = "localhost"
+            address = "10.0.0.1"
+            role = "driver"
+            dir = "/var/tmp/d"
+            "#;
+        let inventory = Inventory::parse(&text).unwrap();
+        let judged = |at: usize| {
+            let mut facts = good();
+            facts.probe.insert("wireless".into(), "1".into());
+            judge(&mut facts, &inventory.hosts[at], &inventory.harness);
+            facts
+        };
+        let node = judged(0);
+        assert!(node.refused.iter().any(|refusal| refusal.contains("Wi-Fi")));
+        let driver = judged(3);
+        assert!(driver.refused.is_empty(), "{:?}", driver.refused);
+        assert!(
+            driver
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("Wi-Fi"))
+        );
+    }
+
+    #[test]
+    fn a_link_is_measured_by_its_round_trips() {
+        let inventory = inventory();
+        let link = super::link(&inventory.hosts[1], "127.0.0.1", 3).unwrap();
+        assert_eq!((link.sent, link.lost), (3, 0));
+        assert!(link.p50_ms <= link.p99_ms && link.p99_ms <= link.max_ms);
+        assert!(link.max_ms < 50.0, "{link:?}");
     }
 
     #[test]

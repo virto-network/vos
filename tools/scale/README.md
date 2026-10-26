@@ -95,8 +95,12 @@ Every host, nodes and drivers alike, needs:
 - **x86-64 Linux 6.7 or later.** The PVM's JIT needs 6.7. A host on an
   older kernel can stay only with `old_kernel = true` and a lower
   `weight`. aarch64 hosts are not deployed to.
-- **A wired link.** `check` refuses Wi-Fi. A link under 1 GbE, or of
-  unknown speed, gets a warning: at the knee the NIC may be what binds.
+- **A wired link.** `check` refuses a node on Wi-Fi and warns of a driver
+  on it. A link under 1 GbE, or of unknown speed, gets a warning: at the
+  knee the NIC may be what binds. `check` also measures each driver's
+  round trips to the nodes' machines (50 pings, `iputils`' `ping` on the
+  driver) and records their p50, p99, maximum and losses in `hosts.json`,
+  so a run's latencies can be read against its link.
 - **Packages:** `rsync`, `openssh-server`, `systemd` (with a user manager),
   `util-linux` (`taskset`, `lsblk`) and `iproute2` (`ip`, `ss`). Nothing
   else: `deploy` ships static binaries.
