@@ -9,8 +9,13 @@ use super::{Lookups, Row};
 use crate::chips::cpu::tuples::BLAKE2B_CALL_REGS;
 use crate::core::step::WORD_SIZE;
 
-/// Host-call continuation.
-pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(eval: &mut E, row: &Row<E::F>) {
+/// Host-call continuation; `p2` the shared chip set's Poseidon2 selector,
+/// one more precompile relation (dispatch 102).
+pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(
+    eval: &mut E,
+    row: &Row<E::F>,
+    p2: Option<&E::F>,
+) {
     let f256 = E::F::from(BaseField::from(256u32));
     // ── Host-call continuation ──
     //
@@ -38,11 +43,18 @@ pub(in crate::chips::cpu) fn host_call_continuation<E: EvalAtRow>(eval: &mut E, 
         // relation, and its weighted selector must equal that
         // authenticated ID, so only a supported call can be acknowledged.
         // A call that is not acknowledged selects no relation.
-        let precompile_selector_sum =
+        let mut precompile_selector_sum =
             row.is_blake_ecall[0].clone() + row.is_witness_ecall[0].clone();
+        if let Some(is_p2) = p2 {
+            precompile_selector_sum += is_p2.clone();
+        }
         eval.add_constraint(precompile_selector_sum - row.host_call_acknowledged[0].clone());
-        let selected_dispatch = row.is_blake_ecall[0].clone() * E::F::from(BaseField::from(100u32))
+        let mut selected_dispatch = row.is_blake_ecall[0].clone()
+            * E::F::from(BaseField::from(100u32))
             + row.is_witness_ecall[0].clone() * E::F::from(BaseField::from(101u32));
+        if let Some(is_p2) = p2 {
+            selected_dispatch += is_p2.clone() * E::F::from(BaseField::from(102u32));
+        }
         eval.add_constraint(
             selected_dispatch
                 - row.host_call_acknowledged[0].clone()
@@ -284,4 +296,39 @@ pub(in crate::chips::cpu) fn witness_input<E: EvalAtRow>(
             ));
         }
     }
+}
+
+/// The Poseidon2 call (the shared chip set's CPU alone): `is_p2` boolean,
+/// the call's pointers φ7 and φ8 below 2^32 and read at the step's
+/// timestamp, and `(ts, φ7, φ8)` handed to `Poseidon2Chip`. Three
+/// fractions, after every other of the CPU's.
+pub(in crate::chips::cpu) fn poseidon2_call<E: EvalAtRow>(
+    eval: &mut E,
+    row: &Row<E::F>,
+    lookups: &Lookups,
+    p2_call: &crate::lookups::Poseidon2CallLookupElements,
+    is_p2: E::F,
+) {
+    eval.add_constraint(is_p2.clone() * (E::F::one() - is_p2.clone()));
+    for i in 4..WORD_SIZE {
+        eval.add_constraint(is_p2.clone() * row.h_ptr[i].clone());
+        eval.add_constraint(is_p2.clone() * row.m_ptr[i].clone());
+    }
+    for (reg_idx, value) in [(7u32, &row.h_ptr), (8u32, &row.m_ptr)] {
+        let mut tuple: Vec<E::F> = Vec::with_capacity(18);
+        tuple.push(E::F::from(BaseField::from(reg_idx)));
+        tuple.extend(value.iter().cloned());
+        tuple.extend(row.timestamp.iter().cloned());
+        tuple.push(E::F::zero());
+        eval.add_to_relation(RelationEntry::new(
+            &lookups.reg_lookup,
+            is_p2.clone().into(),
+            &tuple,
+        ));
+    }
+    let mut call: Vec<E::F> = Vec::with_capacity(16);
+    call.extend(row.timestamp.iter().cloned());
+    call.extend(row.h_ptr[..4].iter().cloned());
+    call.extend(row.m_ptr[..4].iter().cloned());
+    eval.add_to_relation(RelationEntry::new(p2_call, is_p2.into(), &call));
 }

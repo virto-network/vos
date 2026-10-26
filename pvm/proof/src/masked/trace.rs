@@ -1,7 +1,8 @@
-//! A run's columns as the masked segment proves them: each active chip's
-//! preprocessed, main and interaction columns, its rows at least a floor,
-//! and its interaction trace with its blinding fraction
-//! ([`MaskedSegmentTrace::interaction`]).
+//! A run's columns as a masked segment proves them: each active chip's
+//! preprocessed, main and interaction columns, and its interaction trace
+//! with its blinding fraction ([`ChipTraces::interaction`]). The node's
+//! segment ([`masked_segment_trace`]) takes each chip at least a floor; the
+//! device's ([`masked_device_trace`]) at the program's log sizes exactly.
 
 use num_traits::Zero;
 use rayon::prelude::*;
@@ -16,6 +17,7 @@ use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo_constraint_framework::PREPROCESSED_TRACE_IDX;
 
+use crate::framework::MachineProverComponent;
 use crate::lookups::AllLookupElements;
 use crate::proof::SegmentState;
 use crate::prove::{
@@ -29,7 +31,15 @@ use crate::{BASE_COMPONENTS, chip_idx, chips_of_mask};
 /// Columns as Stwo's evaluations, in bit-reversed order.
 pub type Evaluations = ColumnVec<CircleEvaluation<SimdBackend, BaseField, BitReversedOrder>>;
 
-/// A run's chips, traced: what the masked prover commits.
+/// A run's chips, traced, in a chip set's order: what the masked prover
+/// commits.
+pub struct ChipTraces {
+    components: Vec<&'static dyn MachineProverComponent>,
+    traces: Vec<ComponentTrace>,
+}
+
+/// A run's chips, traced as the node's segment: what the masked prover
+/// commits.
 pub struct MaskedSegmentTrace {
     /// The chips, as an active-chip mask.
     pub active: u32,
@@ -37,7 +47,21 @@ pub struct MaskedSegmentTrace {
     pub log_sizes: Vec<u32>,
     pub initial_state: SegmentState,
     pub final_state: SegmentState,
-    traces: Vec<ComponentTrace>,
+    chips: ChipTraces,
+}
+
+impl core::ops::Deref for MaskedSegmentTrace {
+    type Target = ChipTraces;
+
+    fn deref(&self) -> &ChipTraces {
+        &self.chips
+    }
+}
+
+impl core::ops::DerefMut for MaskedSegmentTrace {
+    fn deref_mut(&mut self) -> &mut ChipTraces {
+        &mut self.chips
+    }
 }
 
 /// `side_note`'s run traced over the chips `active` names, each chip at
@@ -68,11 +92,145 @@ pub fn masked_segment_trace(
         log_sizes: traces.iter().map(ComponentTrace::log_size).collect(),
         initial_state,
         final_state,
-        traces,
+        chips: ChipTraces { components, traces },
     })
 }
 
+/// A run's chips, traced as the device's segment (`crate::device`).
+pub struct MaskedDeviceTrace {
+    /// The chips, as a device mask.
+    pub active: u32,
+    /// Each chip's log size, in `DEVICE_ORDER`: the program's.
+    pub log_sizes: Vec<u32>,
+    /// φ9..12 at the halt, 32 LE bytes: the one public output.
+    pub io: [u8; 32],
+    chips: ChipTraces,
+}
+
+impl core::ops::Deref for MaskedDeviceTrace {
+    type Target = ChipTraces;
+
+    fn deref(&self) -> &ChipTraces {
+        &self.chips
+    }
+}
+
+impl core::ops::DerefMut for MaskedDeviceTrace {
+    fn deref_mut(&mut self) -> &mut ChipTraces {
+        &mut self.chips
+    }
+}
+
+impl MaskedDeviceTrace {
+    /// The values mixed after the main tree's root: the io-hash
+    /// ([`super::device_public_values`]).
+    pub fn public(&self) -> Vec<SecureField> {
+        super::device_public_values(&self.io)
+    }
+}
+
+/// The log sizes a device segment is traced at.
+#[derive(Clone, Copy, Debug)]
+pub enum DeviceSizes<'a> {
+    /// The program's, exactly: a run that needs more rows of a chip is
+    /// refused ([`ProvingError::Shape`]), one that needs fewer is padded.
+    Pinned(&'a [u32]),
+    /// At least these: a reference run's sizes, for choosing a program's.
+    AtLeast(&'a [u32]),
+}
+
+/// `side_note`'s run traced as the device's segment of a program laid out
+/// as `layout`, over the chips `active` names (a device mask), each at its
+/// log size in `sizes`: the program's shape, never the run's. The run is
+/// taken whole: its first touches are the layout's, its registers at entry
+/// the layout's.
+pub fn masked_device_trace(
+    side_note: &mut SideNote,
+    layout: &crate::device::DeviceLayout,
+    active: u32,
+    sizes: DeviceSizes<'_>,
+) -> Result<MaskedDeviceTrace, ProvingError> {
+    let (DeviceSizes::Pinned(log_sizes) | DeviceSizes::AtLeast(log_sizes)) = sizes;
+    use super::ChipSet;
+    let chips = super::Device::chips(active).ok_or(ProvingError::MalformedShape)?;
+    if chips.len() != log_sizes.len() {
+        return Err(ProvingError::MalformedShape);
+    }
+    validate_memory_witnesses(side_note)?;
+    prepare_side_note_for_verification(side_note);
+    side_note.device = Some(alloc::sync::Arc::new(crate::device::DeviceRun::of(
+        side_note,
+        layout.clone(),
+    )));
+    let components: Vec<_> = chips
+        .iter()
+        .map(|&chip| crate::device_component(chip))
+        .collect();
+    let traces = generate_component_traces(side_note, &components, log_sizes);
+    if let DeviceSizes::Pinned(log_sizes) = sizes
+        && let Some((&chip, (trace, &pinned))) = chips
+            .iter()
+            .zip(traces.iter().zip(log_sizes))
+            .find(|(_, (trace, pinned))| trace.log_size != **pinned)
+    {
+        return Err(ProvingError::Shape {
+            chip,
+            log_size: trace.log_size,
+            pinned,
+        });
+    }
+    let mut io = [0u8; 32];
+    for (bytes, register) in io
+        .chunks_exact_mut(8)
+        .zip(&side_note.final_regs[crate::chips::device_boundary::IO_REGISTERS])
+    {
+        bytes.copy_from_slice(&register.to_le_bytes());
+    }
+    Ok(MaskedDeviceTrace {
+        active,
+        log_sizes: traces.iter().map(ComponentTrace::log_size).collect(),
+        io,
+        chips: ChipTraces { components, traces },
+    })
+}
+
+/// The preprocessed columns of a device program laid out as `layout`,
+/// `code` its kernel's side note (no run needed), at the shape `active`,
+/// `log_sizes`: what its program id's preprocessed root commits.
+pub fn device_preprocessed(
+    code: &SideNote,
+    layout: &crate::device::DeviceLayout,
+    active: u32,
+    log_sizes: &[u32],
+) -> Result<Evaluations, ProvingError> {
+    use super::ChipSet;
+    let chips = super::Device::chips(active).ok_or(ProvingError::MalformedShape)?;
+    if chips.len() != log_sizes.len() {
+        return Err(ProvingError::MalformedShape);
+    }
+    let mut side_note = SideNote::new(Vec::new(), code.code.to_vec(), code.bitmask.to_vec())
+        .with_jump_table(code.jump_table.to_vec());
+    side_note.device = Some(alloc::sync::Arc::new(crate::device::DeviceRun::empty(
+        layout.clone(),
+    )));
+    Ok(chips
+        .iter()
+        .zip(log_sizes)
+        .flat_map(|(&chip, &log_size)| {
+            crate::device_component(chip).generate_preprocessed_trace(log_size, &side_note)
+        })
+        .collect())
+}
+
 impl MaskedSegmentTrace {
+    /// The values mixed after the main tree's root: the boundary states
+    /// ([`super::public_values`]).
+    pub fn public(&self) -> Vec<SecureField> {
+        super::public_values(&self.initial_state, &self.final_state)
+    }
+}
+
+impl ChipTraces {
     /// The preprocessed columns, chip after chip.
     pub fn preprocessed(&self) -> Evaluations {
         self.traces
@@ -108,12 +266,6 @@ impl MaskedSegmentTrace {
             .map(|trace| &mut trace.preprocessed_trace)
     }
 
-    /// The values mixed after the main tree's root: the boundary states
-    /// ([`super::public_values`]).
-    pub fn public(&self) -> Vec<SecureField> {
-        super::public_values(&self.initial_state, &self.final_state)
-    }
-
     /// Each chip's interaction columns and claimed sum under `relations`,
     /// its blinding fraction `(numerator, denominator)` in `blinding` (on the
     /// first row of the coset, zero on every other) joined to its last batch:
@@ -125,10 +277,7 @@ impl MaskedSegmentTrace {
         relations: &AllLookupElements,
         blinding: &[(SecureField, SecureField)],
     ) -> Vec<(Evaluations, SecureField)> {
-        let components: Vec<_> = chips_of_mask(self.active)
-            .map(|chip| BASE_COMPONENTS[chip])
-            .collect();
-        components
+        self.components
             .par_iter()
             .zip(&self.traces)
             .enumerate()

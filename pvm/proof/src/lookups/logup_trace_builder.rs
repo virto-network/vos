@@ -30,6 +30,8 @@ pub struct LogupTraceBuilder {
     /// dead majority.  The reference (always-combine) path is kept for the
     /// bit-identity test.
     skip_dead_rows: bool,
+    /// Each fraction its own column (`Logup::Single`), never paired.
+    single: bool,
 }
 
 impl LogupTraceBuilder {
@@ -44,6 +46,16 @@ impl LogupTraceBuilder {
             logup_trace_gen: LogupTraceGenerator::new(log_size),
             pending_logup: Vec::with_capacity(1 << (log_size - LOG_N_LANES)),
             skip_dead_rows,
+            single: false,
+        }
+    }
+
+    /// A builder that gives each fraction its own column: a
+    /// `Logup::Single` chip's interaction trace.
+    pub fn single(log_size: u32) -> Self {
+        Self {
+            single: true,
+            ..Self::new(log_size)
         }
     }
 }
@@ -99,7 +111,13 @@ impl LogupTraceBuilder {
             tuple,
         );
 
-        if self.pending_logup.is_empty() {
+        if self.single {
+            let mut logup_col_gen = self.logup_trace_gen.new_col();
+            for (vec_row, (a, b)) in frac_iter.enumerate() {
+                logup_col_gen.write_frac(vec_row, a, b);
+            }
+            logup_col_gen.finalize_col();
+        } else if self.pending_logup.is_empty() {
             self.pending_logup.extend(frac_iter);
         } else {
             let mut logup_col_gen = self.logup_trace_gen.new_col();
@@ -144,7 +162,13 @@ impl LogupTraceBuilder {
             (p0, p1)
         });
 
-        if self.pending_logup.is_empty() {
+        if self.single {
+            let mut logup_col_gen = self.logup_trace_gen.new_col();
+            for (vec_row, (a, b)) in frac_iter.enumerate() {
+                logup_col_gen.write_frac(vec_row, a, b);
+            }
+            logup_col_gen.finalize_col();
+        } else if self.pending_logup.is_empty() {
             self.pending_logup.extend(frac_iter);
         } else {
             let mut logup_col_gen = self.logup_trace_gen.new_col();

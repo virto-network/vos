@@ -29,30 +29,43 @@ pub const ECALL_WITNESS_INPUT: u32 = 0x401;
 /// CPU-chip dispatch code for the witness input.
 pub(crate) const DISPATCH_WITNESS_INPUT: u8 = 101;
 
+/// Hostcall ID for the Poseidon2-M31 compression (`slice-7-mobile.md`, pin
+/// H): φ\[7\] points at 64 bytes, sixteen M31 words as little-endian u32,
+/// each below p; φ\[8\] at the 32 bytes the call writes, the first eight
+/// words of the permutation of the sixteen. A word at or above p (p itself
+/// included) traps the call; it has no other effect. Only the shared chip
+/// set's CPU (`chips::CpuP2Chip`) acknowledges it; format 35's CPU ends a
+/// run at it.
+pub const ECALL_POSEIDON2: u32 = 0x402;
+/// CPU-chip dispatch code for the Poseidon2 call.
+pub(crate) const DISPATCH_POSEIDON2: u8 = 102;
+
 /// Whether the proof runtime has a deterministic handler for this `ecalli`
 /// identifier: exactly the calls [`crate::core::tracing::TracingPvm`]
-/// serves.
+/// serves by default.
 ///
 /// This is a kernel's calls, the runtime's precompile set and the witness
 /// input. Any other id, 110 to 114 included, has no handler: a program
-/// reaching one does not trace.
+/// reaching one does not trace. The Poseidon2 call is served only by a
+/// tracer that enables it (`TracingPvm::with_poseidon2`), until the runtime
+/// serves it.
 ///
 /// ProgramMemory commits the dispatch identifier, which is non-zero exactly
-/// for these calls, so an untrusted prover cannot mark an unknown call as
-/// acknowledged and continue execution past it.
+/// for the calls a proof's CPU may acknowledge, so an untrusted prover cannot
+/// mark an unknown call as acknowledged and continue execution past it.
 pub(crate) const fn is_proof_host_call_allowed(id: u64) -> bool {
-    proof_precompile_dispatch_id(id) != 0
+    proof_precompile_dispatch_id(id) != 0 && id != ECALL_POSEIDON2 as u64
 }
 
 /// Exact proof-chip dispatch identifier for a precompile or the witness
-/// input, or
-/// zero for any other identifier. A non-zero value is committed by
+/// input, or zero for any other identifier. A non-zero value is committed by
 /// ProgramMemory and binds a continued host-call row to the matching CPU
 /// selector (and therefore to that selector's call relation).
 pub const fn proof_precompile_dispatch_id(id: u64) -> u8 {
     match id {
         id if id == ECALL_BLAKE2B_COMPRESS as u64 => DISPATCH_BLAKE2B_COMPRESS,
         id if id == ECALL_WITNESS_INPUT as u64 => DISPATCH_WITNESS_INPUT,
+        id if id == ECALL_POSEIDON2 as u64 => DISPATCH_POSEIDON2,
         _ => 0,
     }
 }

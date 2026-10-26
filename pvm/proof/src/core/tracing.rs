@@ -32,6 +32,40 @@ pub struct Blake2bMemOp {
     pub out_bytes: [u8; 64],
 }
 
+/// A served Poseidon2 call (`0x402`): the 64 bytes it read at φ\[7\] and
+/// the 32 it wrote at φ\[8\], at the call step's timestamp, which
+/// `Poseidon2Chip` proves and the memory ledger records.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Poseidon2Op {
+    pub in_ptr: u32,
+    pub out_ptr: u32,
+    pub ts: u64,
+    pub input: [u8; 64],
+    pub output: [u8; 32],
+}
+
+impl Poseidon2Op {
+    /// The call over `input`, its sixteen words each below p: the first
+    /// eight words of their permutation; `None` when a word is not.
+    pub fn compress(input: &[u8; 64]) -> Option<[u8; 32]> {
+        use vos_pvm_poseidon2::{M31, N_STATE, P};
+        let mut state = [M31::ZERO; N_STATE];
+        for (word, bytes) in state.iter_mut().zip(input.chunks_exact(4)) {
+            let value = u32::from_le_bytes(bytes.try_into().expect("four bytes"));
+            if value >= P {
+                return None;
+            }
+            *word = M31::new(value);
+        }
+        vos_pvm_poseidon2::permute(&mut state);
+        let mut output = [0u8; 32];
+        for (bytes, word) in output.chunks_exact_mut(4).zip(&state) {
+            bytes.copy_from_slice(&word.value().to_le_bytes());
+        }
+        Some(output)
+    }
+}
+
 pub struct TracingPvm {
     pub pvm: Interpreter,
     /// Recorded steps in compact form — the register-file snapshots are
@@ -57,6 +91,10 @@ pub struct TracingPvm {
     witness_input: Option<WitnessInput<Vec<u8>>>,
     /// Each witness-input call served, in order.
     pub witness_reads: Vec<WitnessRead>,
+    /// Whether the Poseidon2 call is served (`with_poseidon2`).
+    poseidon2: bool,
+    /// Each Poseidon2 call served, in order.
+    pub poseidon2_ops: Vec<Poseidon2Op>,
     timestamp: u64,
 }
 
@@ -72,6 +110,8 @@ impl TracingPvm {
             blake2b_mem_ops: Vec::new(),
             witness_input: None,
             witness_reads: Vec::new(),
+            poseidon2: false,
+            poseidon2_ops: Vec::new(),
             timestamp: 1, // 0 is reserved for initial memory entries
         }
     }
@@ -82,6 +122,21 @@ impl TracingPvm {
     pub fn with_witness_input(mut self, input: Vec<u8>) -> Option<Self> {
         self.witness_input = Some(WitnessInput::new(input)?);
         Some(self)
+    }
+
+    /// Serve the Poseidon2 call (`ECALL_POSEIDON2`) as pin H states it, for
+    /// the shared chip set's proofs: the runtime does not serve it yet, so
+    /// only a tracer built with this serves it, and only that chip set's CPU
+    /// acknowledges it in a proof.
+    pub fn with_poseidon2(mut self) -> Self {
+        self.poseidon2 = true;
+        self
+    }
+
+    /// Whether this tracer serves call `id`.
+    fn serves(&self, id: u64) -> bool {
+        crate::core::ecall::is_proof_host_call_allowed(id)
+            || (self.poseidon2 && id == u64::from(crate::core::ecall::ECALL_POSEIDON2))
     }
 
     /// The witness input's bytes read so far, and how many remain.
@@ -256,6 +311,15 @@ impl TracingPvm {
                     return Some(ExitReason::Panic);
                 }
             }
+            ExitReason::HostCall(id)
+                if self.poseidon2 && id == u64::from(crate::core::ecall::ECALL_POSEIDON2) =>
+            {
+                // A range the machine cannot read or write, or an input
+                // word at or above p, traps the call.
+                if !self.handle_poseidon2() {
+                    return Some(ExitReason::Panic);
+                }
+            }
             other => return Some(other),
         }
         self.acknowledge_handled_host_call();
@@ -272,7 +336,7 @@ impl TracingPvm {
         let pending = self.pvm.pending_host_call();
         if let Some(call) = pending {
             assert!(
-                crate::core::ecall::is_proof_host_call_allowed(call.id),
+                self.serves(call.id),
                 "proof tracer attempted to acknowledge unsupported host call {}",
                 call.id,
             );
@@ -384,6 +448,35 @@ impl TracingPvm {
         true
     }
 
+    /// Serve one Poseidon2 call and record it: false when its input or
+    /// output range is out of the machine's accessible memory, or an input
+    /// word is not below p.
+    fn handle_poseidon2(&mut self) -> bool {
+        let registers = self.pvm.registers;
+        let (Ok(in_ptr), Ok(out_ptr)) = (u32::try_from(registers[7]), u32::try_from(registers[8]))
+        else {
+            return false;
+        };
+        let mut input = [0u8; 64];
+        if !self.pvm.memory().read_bytes_checked(in_ptr, &mut input) {
+            return false;
+        }
+        let Some(output) = Poseidon2Op::compress(&input) else {
+            return false;
+        };
+        if !self.pvm.memory_mut().write_bytes_checked(out_ptr, &output) {
+            return false;
+        }
+        self.poseidon2_ops.push(Poseidon2Op {
+            in_ptr,
+            out_ptr,
+            ts: self.timestamp - 1,
+            input,
+            output,
+        });
+        true
+    }
+
     /// Number of steps recorded so far.
     pub fn num_steps(&self) -> usize {
         self.steps.len()
@@ -428,6 +521,7 @@ impl TracingPvm {
         let mut side_note = crate::SideNote::new(steps, code, bitmask).with_jump_table(jump_table);
         side_note.blake2b_calls = self.blake2b_records;
         side_note.blake2b_mem_ops = self.blake2b_mem_ops;
+        side_note.poseidon2_ops = self.poseidon2_ops;
         side_note
     }
 

@@ -156,6 +156,11 @@ fn collect_writes(side_note: &SideNote, ts_upper: Option<u64>) -> Vec<PendingWri
             writes.push(write_of_bytes(op.ts, op.h_ptr, &op.out_bytes));
         }
     }
+    for op in &side_note.poseidon2_ops {
+        if keep(op.ts) {
+            writes.push(write_of_bytes(op.ts, op.out_ptr, &op.output));
+        }
+    }
     writes
 }
 

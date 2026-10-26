@@ -241,6 +241,27 @@ stwo_constraint_framework::relation!(
 const REL_MERKLE_NODE_LOOKUP_SIZE: usize = 1 + 1 + 32 + 32;
 stwo_constraint_framework::relation!(MerkleNodeLookupElements, REL_MERKLE_NODE_LOOKUP_SIZE);
 
+// (ts[8], in_ptr[4], out_ptr[4]) — one tuple per served Poseidon2 call
+// (`0x402`). The CPU of the shared chip set produces it from the call's row
+// (its timestamp, φ[7]'s and φ[8]'s low four bytes); Poseidon2Chip consumes
+// it at the call's row, which reads the 64 input bytes and writes the 32
+// output bytes at that timestamp.
+const REL_POSEIDON2_CALL_LOOKUP_SIZE: usize = TS_SIZE + 4 + 4;
+stwo_constraint_framework::relation!(Poseidon2CallLookupElements, REL_POSEIDON2_CALL_LOOKUP_SIZE);
+
+// (addr[4], value[1]) — a byte of a device program's data: DataTableChip's
+// preprocessed table holds every byte of its read-only and read-write data
+// pages; DeviceMemoryChip consumes one tuple per first touch in them.
+const REL_DATA_TABLE_LOOKUP_SIZE: usize = PC_SIZE + 1;
+stwo_constraint_framework::relation!(DataTableLookupElements, REL_DATA_TABLE_LOOKUP_SIZE);
+
+// (reg[1], value[8]) — an io-hash register at a device run's halt.
+// DeviceIoChip produces the four the public io-hash names, its claimed sum
+// the verifier's to recompute; DeviceBoundaryChip consumes φ9..12's final
+// values.
+const REL_IO_HASH_LOOKUP_SIZE: usize = 1 + WORD_SIZE;
+stwo_constraint_framework::relation!(IoHashLookupElements, REL_IO_HASH_LOOKUP_SIZE);
+
 /// The widest relation's tuple, which the logup term of the security counts
 /// takes (`crate::security`).
 pub const MAX_RELATION_WIDTH: usize = {
@@ -264,6 +285,9 @@ pub const MAX_RELATION_WIDTH: usize = {
         REL_WITNESS_CALL_LOOKUP_SIZE,
         REL_BLAKE2B_COMPRESSION_LOOKUP_SIZE,
         REL_MERKLE_NODE_LOOKUP_SIZE,
+        REL_POSEIDON2_CALL_LOOKUP_SIZE,
+        REL_DATA_TABLE_LOOKUP_SIZE,
+        REL_IO_HASH_LOOKUP_SIZE,
         super::range_check::RANGE_CHECK_LOOKUP_SIZE,
     ];
     let mut widest = 0;

@@ -413,6 +413,10 @@ pub fn touched_pages(side_note: &crate::side_note::SideNote) -> BTreeSet<u32> {
         add_range(&mut pages, op.m_ptr, op.m_bytes.len() as u32);
         // out_bytes overwrite the h range — same pages.
     }
+    for op in &side_note.poseidon2_ops {
+        add_range(&mut pages, op.in_ptr, op.input.len() as u32);
+        add_range(&mut pages, op.out_ptr, op.output.len() as u32);
+    }
     pages
 }
 

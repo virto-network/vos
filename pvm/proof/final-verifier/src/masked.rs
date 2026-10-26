@@ -161,6 +161,10 @@ pub struct MaskedFormat<'a> {
     pub tree_widths: [usize; TREES],
     /// The values its DEEP quotient batches.
     pub deep_values: usize,
+    /// The program the proof is of, as words the transcript mixes right
+    /// after the header (a device program's chips, `crate`-independent);
+    /// empty for a set whose shape the format alone fixes.
+    pub program: &'a [u64],
 }
 
 /// `format::MASKED_WRAP`, the masked wrap.
@@ -173,6 +177,7 @@ pub const MASKED_WRAP: MaskedFormat<'static> = MaskedFormat {
     log_sizes: &LOG_SIZES,
     tree_widths: TREE_WIDTHS,
     deep_values: DEEP_VALUES,
+    program: &[],
 };
 
 /// The sample points' DEEP values: one a sample, and a third for a
@@ -374,6 +379,9 @@ pub fn replay<MC: MerkleChannel, C: MaskedComponents>(
         &format.config,
         format.log_sizes,
     );
+    for &word in format.program {
+        channel.mix_u64(word);
+    }
     let mut scheme = CommitmentSchemeVerifier::<MC>::new(format.config);
     scheme.commit(preprocessed_root, preprocessed_tree, &mut channel);
     scheme.commit(main_root, main_tree, &mut channel);
