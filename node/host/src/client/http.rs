@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use super::{ClientError, Target};
-use crate::http::{MAX_HEAD, content_length};
 use crate::lock;
+use vos_http::{MAX_HEAD, content_length};
 
 /// A connection is used again only if it was idle less than this long,
 /// well within the node's idle limit.

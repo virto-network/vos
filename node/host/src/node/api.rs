@@ -375,12 +375,12 @@ impl Node {
         let local = listener
             .local_addr()
             .map_err(|error| Error::Data(error.to_string()))?;
-        let ingress = crate::ingress::Ingress::new(Arc::clone(&self.inner), token);
+        let api = Arc::new(crate::api::Api::new(Arc::clone(&self.inner)));
         let (stop, stopped) = smol::channel::bounded(1);
         let task = self
             .inner
             .runtime
-            .spawn(ingress.serve(listener, tls, stopped));
+            .spawn(crate::ingress::serve(api, token, listener, tls, stopped));
         *lock(&self.ingress) = Some((task, stop));
         Ok(local)
     }

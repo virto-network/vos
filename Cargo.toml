@@ -8,6 +8,7 @@ members = [
     "agent/tree",
     "node/host",
     "node/api",
+    "node/http",
     "node/net",
     "node/cli",
     "node/checker",
@@ -47,6 +48,7 @@ default-members = [
     "agent/tree",
     "node/host",
     "node/api",
+    "node/http",
     "node/net",
     "node/cli",
     "node/jam",
@@ -214,6 +216,7 @@ vos-wire = { path = "agent/wire" }
 vos-tree = { path = "agent/tree" }
 vos-net = { path = "node/net" }
 vos-api = { path = "node/api" }
+vos-http = { path = "node/http" }
 vos-jam = { path = "node/jam" }
 vos-venue = { path = "node/venue" }
 vos-node-prover = { path = "node/prover" }
