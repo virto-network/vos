@@ -50,6 +50,7 @@ pub(crate) async fn serve(
         install: MAX_INSTALL,
         idle: Duration::from_secs(30),
         connections: api.inner.settings.ingress_connections,
+        large: vos_http::LARGE,
     };
     let handler: Handler = Arc::new(move |request| {
         let api = Arc::clone(&api);
@@ -61,6 +62,7 @@ pub(crate) async fn serve(
         limits,
         spawn: Arc::new(move |connection| Box::new(Task(runtime.spawn(connection)))),
         admit: None,
+        head: None,
     };
     vos_http::serve(listener, serve, async {
         let _ = stop.recv().await;

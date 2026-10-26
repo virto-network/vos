@@ -27,7 +27,14 @@ pub struct Limits {
     pub idle: Duration,
     /// The most connections at once; more are closed on accept.
     pub connections: usize,
+    /// The most bodies past `body` (an install's) held at once, from every
+    /// connection: past them, a request is answered 503 from its head,
+    /// its body unread.
+    pub large: usize,
 }
+
+/// Bodies past `body` held at once, unless a server says otherwise.
+pub const LARGE: usize = 4;
 
 pub struct Request {
     pub method: String,
@@ -75,6 +82,11 @@ pub trait Spawned: Send {
     fn cancel(self: Box<Self>) -> BoxFuture<()>;
 }
 
+/// A request's answer from its head, before its body is read (`body` is
+/// empty, `peer` set), or `None` to read the body and run the handler:
+/// a refusal whose answer never depends on the body.
+pub type Head = Arc<dyn Fn(&Request) -> Option<Response> + Send + Sync>;
+
 /// Spawns a connection's task on the server's runtime.
 pub type Spawn = Arc<dyn Fn(BoxFuture<()>) -> Box<dyn Spawned> + Send + Sync>;
 
@@ -113,6 +125,7 @@ pub struct Serve {
     pub limits: Limits,
     pub spawn: Spawn,
     pub admit: Option<Admit>,
+    pub head: Option<Head>,
 }
 
 /// Accept connections on `listener` and answer each request with the
@@ -135,6 +148,7 @@ async fn accept(
     connections: &mut Vec<Box<dyn Spawned>>,
 ) {
     let open = Arc::new(AtomicUsize::new(0));
+    let large = Arc::new(AtomicUsize::new(0));
     let acceptor = serve.tls.clone().map(futures_rustls::TlsAcceptor::from);
     while let Ok((stream, peer)) = listener.accept().await {
         connections.retain(|connection| !connection.is_finished());
@@ -148,22 +162,26 @@ async fn accept(
             },
             None => None,
         };
-        let handler = Arc::clone(&serve.handler);
-        let limits = serve.limits.clone();
+        let shared = Shared {
+            handler: Arc::clone(&serve.handler),
+            head: serve.head.clone(),
+            limits: serve.limits.clone(),
+            large: Arc::clone(&large),
+        };
         let acceptor = acceptor.clone();
         connections.push((serve.spawn)(Box::pin(async move {
             let _slot = slot;
             let _admitted = admitted;
             let served = match acceptor {
                 Some(acceptor) => match timeout(HANDSHAKE, acceptor.accept(stream)).await {
-                    Some(Ok(stream)) => connection(stream, peer, handler, &limits).await,
+                    Some(Ok(stream)) => connection(stream, peer, &shared).await,
                     Some(Err(error)) => Err(error),
                     None => Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "a slow TLS handshake",
                     )),
                 },
-                None => connection(stream, peer, handler, &limits).await,
+                None => connection(stream, peer, &shared).await,
             };
             if let Err(error) = served {
                 tracing::debug!("an HTTP connection ended: {error}");
@@ -182,8 +200,18 @@ pub async fn timeout<T>(limit: Duration, work: impl Future<Output = T>) -> Optio
     .await
 }
 
-/// A connection's place among the open ones, given back when its task
-/// ends, however it ends: a handler's panic, or a cancel, too.
+/// What every connection of a server shares.
+struct Shared {
+    handler: Handler,
+    head: Option<Head>,
+    limits: Limits,
+    /// The large bodies held now.
+    large: Arc<AtomicUsize>,
+}
+
+/// A place among those counted (connections, or large bodies), given back
+/// when its holder ends, however it ends: a handler's panic, or a cancel,
+/// too.
 struct Slot(Arc<AtomicUsize>);
 
 impl Slot {
@@ -210,31 +238,36 @@ pub const REQUEST_DEADLINE: Duration = Duration::from_secs(60);
 async fn connection(
     mut stream: impl AsyncRead + AsyncWrite + Unpin,
     peer: SocketAddr,
-    handler: Handler,
-    limits: &Limits,
+    shared: &Shared,
 ) -> std::io::Result<()> {
     let mut buffer = Vec::with_capacity(4096);
     loop {
-        let (mut request, used) = match read_request(&mut stream, &mut buffer, limits).await? {
-            Read::Request(request, used) => (request, used),
-            Read::Closed => return Ok(()),
-            Read::Refuse(status) => {
-                // Say why before closing: the rest of the request is unread.
-                let response = Response::new(status, Vec::new());
-                return write_response(&mut stream, &response, true).await;
+        let (response, next) = match read_request(&mut stream, &mut buffer, peer, shared).await? {
+            Read::Request(request, used, large) => {
+                let close = closes(&request);
+                let response = (shared.handler)(request).await;
+                // The large body's place is held until its answer is out.
+                drop(large);
+                (response, (!close).then_some(used))
             }
+            Read::Answered(response, next) => (response, next),
+            Read::Closed => return Ok(()),
         };
-        buffer.drain(..used);
-        request.peer = Some(peer);
-        let close = request
-            .header("connection")
-            .is_some_and(|value| value.eq_ignore_ascii_case(b"close"));
-        let response = handler(request).await;
-        write_response(&mut stream, &response, close).await?;
-        if close {
-            return Ok(());
+        // With no next request to read, say why before closing: the rest
+        // of this one may be unread.
+        write_response(&mut stream, &response, next.is_none()).await?;
+        match next {
+            Some(used) => drop(buffer.drain(..used)),
+            None => return Ok(()),
         }
     }
+}
+
+/// Whether the client asks the connection to close after this request.
+fn closes(request: &Request) -> bool {
+    request
+        .header("connection")
+        .is_some_and(|value| value.eq_ignore_ascii_case(b"close"))
 }
 
 /// A `Content-Length` header's value, if it is a length.
@@ -267,19 +300,48 @@ async fn read(
 }
 
 enum Read {
-    Request(Request, usize),
+    /// A request, the bytes of the buffer it used, and its large body's
+    /// place if its body is large.
+    Request(Request, usize, Option<Slot>),
+    /// A request answered without the handler: the answer, and the bytes
+    /// of the buffer it used if the connection goes on, `None` to close.
+    Answered(Response, Option<usize>),
     /// The client closed between requests.
     Closed,
-    /// A request the server will not read: answer this status and close.
-    Refuse(u16),
 }
 
-/// The next request on the connection, and the bytes of `buffer` it used.
+/// A refusal with no body, after which the connection closes.
+fn refuse(status: u16) -> Read {
+    Read::Answered(Response::new(status, Vec::new()), None)
+}
+
+/// Read into `buffer` until it holds `end` bytes.
+async fn fill(
+    stream: &mut (impl AsyncRead + Unpin),
+    buffer: &mut Vec<u8>,
+    end: usize,
+    idle: Duration,
+    deadline: Option<Instant>,
+) -> std::io::Result<()> {
+    let mut chunk = [0u8; 8192];
+    while buffer.len() < end {
+        let read = read(stream, &mut chunk, idle, deadline).await?;
+        if read == 0 {
+            return Err(invalid("the body ended early"));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    Ok(())
+}
+
+/// The next request on the connection, or its answer from its head.
 async fn read_request(
     stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
     buffer: &mut Vec<u8>,
-    limits: &Limits,
+    peer: SocketAddr,
+    shared: &Shared,
 ) -> std::io::Result<Read> {
+    let limits = &shared.limits;
     let mut chunk = [0u8; 8192];
     let mut deadline = (!buffer.is_empty()).then(|| Instant::now() + REQUEST_DEADLINE);
     loop {
@@ -296,15 +358,15 @@ async fn read_request(
                         .map(|header| (header.name.to_string(), header.value.to_vec()))
                         .collect(),
                     body: Vec::new(),
-                    peer: None,
+                    peer: Some(peer),
                 };
                 // Bodies come with a length: chunked ones are not read.
                 if request.header("transfer-encoding").is_some() {
-                    return Ok(Read::Refuse(411));
+                    return Ok(refuse(411));
                 }
                 let length = match request.header("content-length").map(content_length) {
                     Some(Some(length)) => length,
-                    Some(None) => return Ok(Read::Refuse(400)),
+                    Some(None) => return Ok(refuse(400)),
                     None => 0,
                 };
                 let limit = if request.method == "POST" && request.path.ends_with("/install") {
@@ -313,30 +375,41 @@ async fn read_request(
                     limits.body
                 };
                 if length > limit {
-                    return Ok(Read::Refuse(413));
+                    return Ok(refuse(413));
                 }
-                let pending = buffer.len() < head + length;
-                if pending
-                    && request
-                        .header("expect")
-                        .is_some_and(|value| value.eq_ignore_ascii_case(b"100-continue"))
-                {
+                let end = head + length;
+                let pending = buffer.len() < end;
+                let continues = request
+                    .header("expect")
+                    .is_some_and(|value| value.eq_ignore_ascii_case(b"100-continue"));
+                if let Some(answer) = shared.head.as_ref().and_then(|head| head(&request)) {
+                    // A large body, or one the client waits to be asked
+                    // for, is never read: the connection closes instead.
+                    if pending && (length > limits.body || continues) {
+                        return Ok(Read::Answered(answer, None));
+                    }
+                    fill(stream, buffer, end, limits.idle, deadline).await?;
+                    let next = (!closes(&request)).then_some(end);
+                    return Ok(Read::Answered(answer, next));
+                }
+                let large = match length > limits.body {
+                    true => match Slot::take(&shared.large, limits.large) {
+                        Some(place) => Some(place),
+                        None => return Ok(refuse(503)),
+                    },
+                    false => None,
+                };
+                if pending && continues {
                     stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
                     stream.flush().await?;
                 }
-                while buffer.len() < head + length {
-                    let read = read(stream, &mut chunk, limits.idle, deadline).await?;
-                    if read == 0 {
-                        return Err(invalid("the body ended early"));
-                    }
-                    buffer.extend_from_slice(&chunk[..read]);
-                }
-                request.body = buffer[head..head + length].to_vec();
-                return Ok(Read::Request(request, head + length));
+                fill(stream, buffer, end, limits.idle, deadline).await?;
+                request.body = buffer[head..end].to_vec();
+                return Ok(Read::Request(request, end, large));
             }
             Ok(httparse::Status::Partial) => {
                 if buffer.len() > MAX_HEAD {
-                    return Ok(Read::Refuse(431));
+                    return Ok(refuse(431));
                 }
                 let read = read(stream, &mut chunk, limits.idle, deadline).await?;
                 if read == 0 {
@@ -349,7 +422,7 @@ async fn read_request(
                 deadline.get_or_insert_with(|| Instant::now() + REQUEST_DEADLINE);
                 buffer.extend_from_slice(&chunk[..read]);
             }
-            Err(_) => return Ok(Read::Refuse(400)),
+            Err(_) => return Ok(refuse(400)),
         }
     }
 }

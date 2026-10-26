@@ -48,6 +48,11 @@ impl Gateway {
         self.sent.load(Ordering::Relaxed)
     }
 
+    /// Whether the node keyed `key` is behind the gateway.
+    pub fn serves(&self, key: &[u8; 32]) -> bool {
+        self.by_key(key).is_some()
+    }
+
     fn by_key(&self, key: &[u8; 32]) -> Option<usize> {
         self.upstreams
             .iter()
