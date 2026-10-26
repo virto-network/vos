@@ -160,6 +160,17 @@ they are.
   | channel first | `prev[0,8)` | `act·m` | an absorb after an absorb; the second PoW permutation |
   | channel continue | `prev[0,8)` | `prev[8,16) + act·m` | an absorb's next chunks (`:531-547`) |
   | wired | `m` | `(c_8, c_9, 0…)` | a squeeze `(n_draws, 3)`, the first PoW permutation `(n_bits, 0)` (`:549-580`) |
+  | tagged | `c[0,8)` | `m` | the credential AIR's `C(T(name), x)`: a tag's block and a wire pair (`proving.md` §8) |
+
+- **The tagged row has no selector of its own.** A row's input constraint
+  is linear in the selectors, which are preprocessed: the tagged row sets
+  leaf start's and node's to 1 and channel first's to −1, with `act` zero
+  and its bit a use of the zero wire (so `b = 0` by the relation). Its
+  input is `[c + prev − prev, m]`, `[c, m]` as polynomials, the previous
+  row's output cancelled whatever it holds; so the row is not chained and
+  no column, constraint or degree is added. No single mode puts a constant
+  block on the left of a wire pair; the wrap, the leaves and the folds hold
+  no tagged row, and their preprocessed columns are unchanged.
 
 - **Row order is part of the circuit:** a chained row follows its
   predecessor, and row 0, whose offset −1 is the last row, is never chained.

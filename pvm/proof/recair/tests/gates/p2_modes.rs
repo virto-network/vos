@@ -7,7 +7,9 @@
 //! circuit's outputs, carry the forged digest: only the row's input
 //! constraint is left to refuse it, and the verifier does (Stwo's OODS
 //! comparison).
-//! - **A mode swapped:** each mode's row computed by every other mode's rule.
+//! - **A mode swapped:** each mode's row computed by every other mode's rule,
+//!   the tagged composite among them (its input `[c, m]`, the row above's
+//!   output not read).
 //! - **A chain broken:** a leaf's sponge continued from another leaf's row, a
 //!   leaf's sponge restarted mid-leaf, an absorption dropped from the
 //!   transcript.
@@ -18,7 +20,7 @@ use num_traits::{One, Zero};
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_poseidon2::{M31, N_STATE};
-use vos_pvm_recair::gadgets::{TranscriptGadget, leaf_hash, node};
+use vos_pvm_recair::gadgets::{TranscriptGadget, leaf_hash, node, tagged};
 use vos_pvm_recair::verifier::witness::pack;
 use vos_pvm_recair::{Context, Finalized, Message, P2Mode, Var};
 
@@ -82,6 +84,16 @@ fn ending_in(mode: P2Mode) -> Finalized<SecureField> {
             transcript.absorb(&mut context, &wires, 4);
             transcript.squeeze(&mut context)
         }
+        P2Mode::Tagged => {
+            // After a row of another chain, whose output the tagged row's
+            // input does not read.
+            let wires = guesses(&mut context, &mut rng, 12);
+            leaf_hash(&mut context, &wires, 12);
+            let x = guesses(&mut context, &mut rng, 8);
+            let block =
+                core::array::from_fn(|j| BaseField::from(if j == 0 { 0x5ed0_2b0c } else { 0 }));
+            tagged(&mut context, block, [x[0], x[1]], None).digest
+        }
     };
     context.set_outputs(&digest);
     context.finalize().expect("the wiring checks")
@@ -131,6 +143,7 @@ fn input_by(
             P2Mode::ChannelFirst => (prev[j], h),
             P2Mode::ChannelContinue => (prev[j], prev[8 + j] + h),
             P2Mode::Wired => (a, if j < 2 { wiring.c[8 + j] } else { zero }),
+            P2Mode::Tagged => (wiring.c[j], m[j]),
         };
         input[j] = low;
         input[8 + j] = high;
@@ -166,11 +179,16 @@ fn assert_input_refused(
     );
 }
 
+/// Every mode a row takes: the selector modes and the tagged composite.
+fn every_mode() -> impl Iterator<Item = P2Mode> {
+    P2Mode::ALL.into_iter().chain([P2Mode::Tagged])
+}
+
 /// The malicious prover proves an honest trace, and each row's honest input
 /// is its mode's rule: the forger's model is the AIR's.
 #[test]
 fn the_forger_proves_an_honest_trace() {
-    for mode in P2Mode::ALL {
+    for mode in every_mode() {
         let finalized = ending_in(mode);
         let forgery = Forgery::honest(&finalized);
         for (row, wiring) in finalized.circuit.p2.iter().enumerate() {
@@ -197,13 +215,13 @@ fn the_forger_proves_an_honest_trace() {
 #[test]
 fn a_row_computed_by_another_mode_is_refused() {
     let mut forged = 0;
-    for mode in P2Mode::ALL {
+    for mode in every_mode() {
         let finalized = ending_in(mode);
         let forgery = Forgery::honest(&finalized);
         let row = last_row(&finalized, mode);
         let (_, bit) = forgery.p2_message(row);
         let prev = above(&forgery, row);
-        for other in P2Mode::ALL.into_iter().filter(|&other| other != mode) {
+        for other in every_mode().filter(|&other| other != mode) {
             let input = input_by(&forgery, row, other, bit, prev);
             if input == forgery.p2_input(row) {
                 continue;

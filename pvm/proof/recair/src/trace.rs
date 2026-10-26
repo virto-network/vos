@@ -19,7 +19,7 @@ use stwo::prover::poly::BitReversedOrder;
 use stwo::prover::poly::circle::CircleEvaluation;
 use stwo_constraint_framework::LogupTraceGenerator;
 use vos_pvm_recair_air::gate::GateRelation;
-use vos_pvm_recair_air::p2::{self, P2Mode};
+use vos_pvm_recair_air::p2;
 use vos_pvm_recair_air::{h8, qm31};
 
 use crate::circuit::{Circuit, Entry, signed};
@@ -69,7 +69,11 @@ pub fn preprocessed_columns(circuit: &Circuit) -> [CosetColumns; 3] {
     for (row, wiring) in circuit.p2.iter().enumerate() {
         let mut set = |column: usize, value: BaseField| p2_columns[column][row] = value;
         if let Some(mode) = wiring.mode {
-            set(p2::pre::SELECTORS + mode as usize, BaseField::one());
+            for (i, selector) in mode.selectors().into_iter().enumerate() {
+                if selector != 0 {
+                    set(p2::pre::SELECTORS + i, signed(i64::from(selector)));
+                }
+            }
         }
         for w in 0..2 {
             set(p2::pre::ADDR_M[w], BaseField::from(wiring.m[w].address));
@@ -244,7 +248,7 @@ impl MainTrace {
                     fraction(
                         Entry {
                             address: wiring.bit_address,
-                            multiplicity: i64::from(wiring.mode == Some(P2Mode::Node)),
+                            multiplicity: wiring.bit_multiplicity(),
                         },
                         [b, BaseField::zero(), BaseField::zero(), BaseField::zero()],
                     ),
@@ -311,49 +315,71 @@ impl MainTrace {
         relation: &GateRelation,
         extra: [Option<FirstRowFraction>; 3],
     ) -> [(Evaluations, SecureField); 3] {
-        let log_sizes = circuit.log_sizes();
         let fractions = self.fractions(circuit);
         core::array::from_fn(|component| {
-            let log_size = log_sizes[component];
-            let rows = &fractions[component];
-            let positions = storage_positions(log_size);
-            let term = |f: &Fraction| {
-                let [l0, l1, l2, l3] = f.limbs;
-                let denominator: SecureField = relation.0.combine(&[f.address, l0, l1, l2, l3]);
-                (SecureField::from(f.multiplicity), denominator)
-            };
-            let n_fractions = rows[0].len() + usize::from(extra[component].is_some());
-            // The `i`-th fraction of `row`: its own, then the extra one.
-            let fraction = |row: usize, i: usize| match rows[row].get(i) {
-                Some(own) => Some(term(own)),
-                None => extra[component]
-                    .filter(|_| i == rows[row].len())
-                    .map(|e| e.at(row)),
-            };
-            let mut generator = LogupTraceGenerator::new(log_size);
-            for pair in (0..n_fractions).step_by(2) {
-                let mut stored = vec![(SecureField::zero(), SecureField::one()); rows.len()];
-                for (row, &position) in positions.iter().enumerate() {
-                    let (n0, d0) =
-                        fraction(row, pair).unwrap_or((SecureField::zero(), SecureField::one()));
-                    stored[position] = match fraction(row, pair + 1) {
-                        Some((n1, d1)) => (n0 * d1 + n1 * d0, d0 * d1),
-                        None => (n0, d0),
-                    };
-                }
-                let mut column = generator.new_col();
-                for (vec_row, chunk) in stored.chunks(N_LANES).enumerate() {
-                    column.write_frac(
-                        vec_row,
-                        PackedSecureField::from_array(core::array::from_fn(|i| chunk[i].0)),
-                        PackedSecureField::from_array(core::array::from_fn(|i| chunk[i].1)),
-                    );
-                }
-                column.finalize_col();
-            }
-            generator.finalize_last()
+            component_interaction(&fractions[component], relation, extra[component])
         })
     }
+
+    /// The interaction of `p2` and `qm31` alone, for a circuit without `h8`
+    /// (the credential AIR's set), each component's `extra` fraction a row
+    /// after its own.
+    pub fn interaction_without_h8(
+        &self,
+        circuit: &Circuit,
+        relation: &GateRelation,
+        extra: [Option<FirstRowFraction>; 2],
+    ) -> [(Evaluations, SecureField); 2] {
+        let [p2, qm31, _] = self.fractions(circuit);
+        [
+            component_interaction(&p2, relation, extra[0]),
+            component_interaction(&qm31, relation, extra[1]),
+        ]
+    }
+}
+
+/// A component's interaction columns and claimed sum from its rows'
+/// fractions, `extra` after each row's own: its fractions in pairs, as
+/// `finalize_logup_in_pairs` batches them.
+fn component_interaction(
+    rows: &[Vec<Fraction>],
+    relation: &GateRelation,
+    extra: Option<FirstRowFraction>,
+) -> (Evaluations, SecureField) {
+    let log_size = rows.len().ilog2();
+    let positions = storage_positions(log_size);
+    let term = |f: &Fraction| {
+        let [l0, l1, l2, l3] = f.limbs;
+        let denominator: SecureField = relation.0.combine(&[f.address, l0, l1, l2, l3]);
+        (SecureField::from(f.multiplicity), denominator)
+    };
+    let n_fractions = rows[0].len() + usize::from(extra.is_some());
+    // The `i`-th fraction of `row`: its own, then the extra one.
+    let fraction = |row: usize, i: usize| match rows[row].get(i) {
+        Some(own) => Some(term(own)),
+        None => extra.filter(|_| i == rows[row].len()).map(|e| e.at(row)),
+    };
+    let mut generator = LogupTraceGenerator::new(log_size);
+    for pair in (0..n_fractions).step_by(2) {
+        let mut stored = vec![(SecureField::zero(), SecureField::one()); rows.len()];
+        for (row, &position) in positions.iter().enumerate() {
+            let (n0, d0) = fraction(row, pair).unwrap_or((SecureField::zero(), SecureField::one()));
+            stored[position] = match fraction(row, pair + 1) {
+                Some((n1, d1)) => (n0 * d1 + n1 * d0, d0 * d1),
+                None => (n0, d0),
+            };
+        }
+        let mut column = generator.new_col();
+        for (vec_row, chunk) in stored.chunks(N_LANES).enumerate() {
+            column.write_frac(
+                vec_row,
+                PackedSecureField::from_array(core::array::from_fn(|i| chunk[i].0)),
+                PackedSecureField::from_array(core::array::from_fn(|i| chunk[i].1)),
+            );
+        }
+        column.finalize_col();
+    }
+    generator.finalize_last()
 }
 
 /// A fraction on every row of a component, its numerator `numerator` at the

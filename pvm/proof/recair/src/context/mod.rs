@@ -589,8 +589,9 @@ impl<V: Value> Context<V> {
     ///
     /// # Panics
     /// When a chained mode has no predecessor, or its predecessor already has
-    /// a successor; when a node has no bit; when `out` is not two consecutive
-    /// addresses.
+    /// a successor; when a node has no bit; when a tagged row absorbs (`act`
+    /// not zero), sets `c_8` or `c_9`, or its message is not two wires; when
+    /// `out` is not two consecutive addresses.
     pub fn p2(&mut self, row: P2Row<'_, V>) -> P2Handle<V> {
         let P2Row {
             mode,
@@ -617,6 +618,16 @@ impl<V: Value> Context<V> {
             Message::Wire(var) => self.value(var),
             Message::Free(value) => value,
         });
+        if mode == P2Mode::Tagged {
+            assert!(
+                act == [BaseField::zero(); 8] && c[8..] == [BaseField::zero(); 2],
+                "a tagged row absorbs nothing and sets no c_8 or c_9"
+            );
+            assert!(
+                m.iter().all(|message| matches!(message, Message::Wire(_))),
+                "a tagged row's message is two wires"
+            );
+        }
         let b = match (mode, bit) {
             (P2Mode::Node, Some(bit)) => self.value(bit.var()),
             (P2Mode::Node, None) => panic!("a node row needs its bit"),
@@ -649,6 +660,7 @@ impl<V: Value> Context<V> {
                 wire(&[c[8], c[9], BaseField::zero(), BaseField::zero()]),
                 zero,
             ],
+            P2Mode::Tagged => [c_wires[0], c_wires[1], m_values[0], m_values[1]],
         };
         let state = V::permute(input);
 
@@ -656,9 +668,12 @@ impl<V: Value> Context<V> {
             Message::Wire(var) => self.slot(var, true),
             Message::Free(_) => Slot::FREE,
         });
-        let bit = bit
-            .filter(|_| mode == P2Mode::Node)
-            .map(|bit| self.slot(bit.var(), false).address);
+        let bit = match mode {
+            P2Mode::Node => bit.map(|bit| self.slot(bit.var(), false).address),
+            // The zero wire's use: `b = 0`, so the input is `[c, m]`.
+            P2Mode::Tagged => Some(self.zero().0),
+            _ => None,
+        };
         let (digest, out_slots) = match out {
             None => {
                 let digest = [0, 1].map(|w| self.new_var(state[w], State::Yielded));
