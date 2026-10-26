@@ -1,12 +1,12 @@
 //! The credential prover (`docs/design/proving.md` §8): a statement's
-//! circuit ([`circuit`]) proved masked over the credential AIR's set, the
+//! circuit ([`mod@circuit`]) proved masked over the credential AIR's set, the
 //! recursion AIR's `p2` and `qm31` (`vos_pvm_recair_air::masked::
 //! CredentialComponents`), under format 42 on the Blake2s-M31 channel
 //! ([`prove`]); the final verifier's [`vos_pvm_final_verifier::credential`]
 //! verifies it.
 //!
 //! - **The program** of a kind is its circuit, built from no witness
-//!   ([`circuit`]), and its preprocessed root under the format
+//!   ([`circuit()`]), and its preprocessed root under the format
 //!   ([`preprocessed_root`]); the final verifier pins both kinds' roots and
 //!   program ids, which the tests compute here.
 //! - **The witness is checked first:** a statement its witness does not
