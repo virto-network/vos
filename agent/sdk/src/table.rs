@@ -196,6 +196,29 @@ macro_rules! rows_handle {
                 host::delete(self.rows(), &encoded(key));
             }
 
+            /// The first row in the transform's order, fetched with a
+            /// buffer as small as the row allows, where [`Self::iter`]
+            /// fetches a buffer's worth of rows. A row that does not decode
+            /// traps.
+            pub fn first(&self) -> Option<(K, V)> {
+                let mut capacity = 64;
+                loop {
+                    let mut buffer = alloc::vec![0u8; capacity];
+                    let written = host::scan(self.rows(), None, &mut buffer);
+                    if written == code::FULL {
+                        assert!(capacity < cap::SCAN, "a row larger than a scan");
+                        capacity = (capacity * 2).min(cap::SCAN);
+                        continue;
+                    }
+                    let rest = buffer.get(..written as usize)?;
+                    let (key, used) = Vec::<u8>::decode(rest).ok()?;
+                    let (value, _) = Vec::<u8>::decode(&rest[used..]).expect("a row");
+                    let key = K::decode_key(&key).expect("an undecodable table key");
+                    let (value, _) = V::decode(&value).expect("an undecodable table row");
+                    return Some((key, value));
+                }
+            }
+
             /// Rows in the transform's order (hash order for [`Hashed`],
             /// key order for [`Ordered`]), starting after `after` when
             /// given.

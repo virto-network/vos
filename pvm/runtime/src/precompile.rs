@@ -38,10 +38,11 @@ pub const POSEIDON2: u64 = 0x402;
 
 /// Gas for one Poseidon2 compression, on top of its `ecalli`'s block gas.
 ///
-/// Serving one natively takes about 270 time-stamp-counter cycles on the
-/// reference machine (`precompile native` in `pvm/bench`); the price rounds
-/// that up as BLAKE2B_COMPRESS_GAS does. Computing the same compression in
-/// software inside the guest costs about 15,000 gas.
+/// Serving one natively takes 2.6 to 4.4 times a BLAKE2b compression's
+/// time-stamp-counter cycles in paired runs (`precompile native` in
+/// `pvm/bench`), so about 1,800 at the 520 BLAKE2b takes on the reference
+/// machine; the price is four times [`BLAKE2B_COMPRESS_GAS`]. Computing the
+/// same compression in software inside the guest costs about 37,600 gas.
 pub const POSEIDON2_GAS: crate::Gas = 2_400;
 
 /// Whether `id` names a precompile the refine host serves in place for the

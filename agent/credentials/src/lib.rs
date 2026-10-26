@@ -87,13 +87,16 @@ impl Credentials {
     ) -> Result<u32, CredentialError> {
         self.founded()?;
         let leaf = self.admit(&member)?;
-        let slot = self.place(&member, &mut true)?;
+        let slot = self.place(&member, true)?;
         self.write(ctx.now(), BTreeMap::from([(slot, leaf)]));
         Ok(slot)
     }
 
-    /// Enroll each of `members`, at most [`ENROLL_MANY`], in order: the
-    /// re-founding runbook's re-seed. One fails, and none is enrolled.
+    /// Enroll each of `members`, at most [`ENROLL_MANY`], in order, at the
+    /// lowest slots never used: the re-founding runbook's re-seed, into a
+    /// tree with no freed slot. Contiguous fresh slots share their upper
+    /// nodes, so the most members fit one handler's gas whatever slots the
+    /// tree has freed. One fails, and none is enrolled.
     #[msg(role = "registrar", gas = 100_000_000)]
     pub async fn enroll_many(
         &mut self,
@@ -106,10 +109,9 @@ impl Credentials {
         }
         let mut leaves = BTreeMap::new();
         let mut slots = Vec::with_capacity(members.len());
-        let mut freed = true;
         for member in &members {
             let leaf = self.admit(member)?;
-            let slot = self.place(member, &mut freed)?;
+            let slot = self.place(member, false)?;
             leaves.insert(slot, leaf);
             slots.push(slot);
         }
@@ -149,7 +151,7 @@ impl Credentials {
         if ctx.now() > expires {
             return Err(CredentialError::Expired);
         }
-        let slot = self.place(&member, &mut true)?;
+        let slot = self.place(&member, true)?;
         self.write(ctx.now(), BTreeMap::from([(slot, leaf)]));
         Ok(slot)
     }
@@ -236,17 +238,10 @@ impl Credentials {
         Ok(tree::leaf(&words))
     }
 
-    /// Give `member` the lowest freed slot, else the lowest never used, and
-    /// drop its invitation. `freed` is whether a freed slot may be left: a
-    /// call that finds none clears it, and later placements in the call
-    /// look no more.
-    fn place(&mut self, member: &Digest, freed: &mut bool) -> Result<u32, CredentialError> {
-        let lowest = if *freed {
-            self.free.iter(None).next()
-        } else {
-            None
-        };
-        *freed = lowest.is_some();
+    /// Give `member` the lowest freed slot when `reuse`, else (or when none
+    /// is freed) the lowest never used, and drop its invitation.
+    fn place(&mut self, member: &Digest, reuse: bool) -> Result<u32, CredentialError> {
+        let lowest = if reuse { self.free.first() } else { None };
         let slot = match lowest {
             Some((slot, ())) => {
                 self.free.remove(&slot);

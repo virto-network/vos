@@ -194,7 +194,8 @@ pub const ACK_LIMIT: u64 = 1024;
 /// superseded it, in milliseconds of batch time
 /// ([`crate::credentials::Ring::accepts`]): so a revocation binds every
 /// replica within it, and an honest member's path stays good as long after
-/// any change to the tree. Not the venues' `MaxRootAge`.
+/// any change to the tree, unless the ring's 64 later roots push its root
+/// out first. Not the venues' `MaxRootAge`.
 pub const ROOT_MAX_AGE: u64 = 10 * 60 * 1000;
 
 /// An await's deadline when its call sets none: after the batch time

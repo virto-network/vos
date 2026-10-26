@@ -81,6 +81,13 @@ impl Reference {
         slot
     }
 
+    /// An enrollment of many's: the lowest slot never used.
+    fn enroll_fresh(&mut self, member: Digest) -> u32 {
+        self.next += 1;
+        assert!(self.slots.insert(member, self.next - 1).is_none());
+        self.next - 1
+    }
+
     fn revoke(&mut self, member: &Digest) {
         let slot = self.slots.remove(member).unwrap();
         self.free.insert(slot);
@@ -287,7 +294,7 @@ fn the_tree_equals_a_reference_built_from_scratch_on_vos_and_jam() {
                             member(seed)
                         })
                         .collect();
-                    let slots = members.iter().map(|m| reference.enroll(*m)).collect();
+                    let slots = members.iter().map(|m| reference.enroll_fresh(*m)).collect();
                     ("enroll_many", members.encode(), Reply::Slots(slots))
                 }
                 _ => {
@@ -340,6 +347,8 @@ fn the_tree_equals_a_reference_built_from_scratch_on_vos_and_jam() {
             let path = vos
                 .query::<_, Option<Path>>("path", *member)
                 .expect("enrolled");
+            let on_jam: Option<Path> = jam.query("path", *member);
+            assert_eq!(on_jam.as_ref(), Some(&path));
             assert_eq!(Some(&path), reference.path(member).as_ref());
             assert!(Reference::verifies(&path, member));
             assert!(path.proves(member));
@@ -376,7 +385,8 @@ fn founded(members: &[Digest]) -> Actor {
 
 /// A revoked member's slot is freed, and enrollments take the freed slots
 /// lowest first, whatever order they were freed in, then the lowest never
-/// used; a revoked member enrolls again as any other.
+/// used; a revoked member enrolls again as any other. An enrollment of
+/// many takes only slots never used.
 #[test]
 fn freed_slots_are_reused_lowest_first() {
     let members: Vec<Digest> = (1..=6).map(member).collect();
@@ -402,6 +412,17 @@ fn freed_slots_are_reused_lowest_first() {
     assert_eq!(path.map(|path| path.slot), Some(7));
     let gone: Option<Path> = actor.query("path", members[4]);
     assert_eq!(gone, None);
+    // An enrollment of many takes the slots never used, past any freed.
+    let revoked = actor.input(ALICE, "revoke", members[0]);
+    actor.node.batch(4, vec![revoked]);
+    let many = actor.input(ALICE, "enroll_many", vec![member(20), member(21)]);
+    let steps = actor.node.batch(5, vec![many]).steps;
+    assert_eq!(answer::<Vec<u32>>(&steps[0]), Ok(vec![8, 9]));
+    let one = actor.input(ALICE, "enroll", member(22));
+    assert_eq!(
+        answer::<u32>(&actor.node.batch(6, vec![one]).steps[0]),
+        Ok(0)
+    );
 }
 
 /// The refusals: no write before the handle is set, which is set once and
@@ -506,18 +527,35 @@ fn an_invitation_enrolls_its_member_until_its_expiry() {
     assert_eq!(answer::<u32>(&steps[1]), Err(CredentialError::Enrolled));
     assert_eq!(answer::<u32>(&steps[2]), Err(CredentialError::Expired));
     assert_eq!(answer::<u32>(&steps[3]), Err(CredentialError::NotInvited));
-    let at_expiry = vec![actor.input(BOB, "claim", member(3))];
+    // The expiry is inclusive: a claim at `expires_ms` enrolls, one a
+    // millisecond later is refused.
+    let inputs = vec![
+        actor.input(ALICE, "invite", (member(7), 6_000u64)),
+        actor.input(ALICE, "invite", (member(8), 5_999u64)),
+    ];
+    actor.node.batch(5_000, inputs);
+    let inputs = vec![
+        actor.input(BOB, "claim", member(7)),
+        actor.input(BOB, "claim", member(8)),
+    ];
+    let steps = actor.node.batch(6_000, inputs).steps;
+    assert_eq!(answer::<u32>(&steps[0]), Ok(2));
+    assert_eq!(answer::<u32>(&steps[1]), Err(CredentialError::Expired));
+    let mut malformed = member(9);
+    malformed[..4].copy_from_slice(&P.to_le_bytes());
+    let invited = vec![actor.input(ALICE, "invite", (malformed, 9_000u64))];
     assert_eq!(
-        answer::<u32>(&actor.node.batch(5_000, at_expiry).steps[0]),
-        Err(CredentialError::Expired)
+        answer::<()>(&actor.node.batch(7_000, invited).steps[0]),
+        Err(CredentialError::NotADigest)
     );
-    assert_eq!(actor.query::<_, u64>("count", ()), 2);
+    assert_eq!(actor.query::<_, u64>("count", ()), 3);
 }
 
 /// The ring: the install's entry is the empty tree's from the founding's
 /// time; a batch's writes leave one entry, from its time; a root fallen out
 /// of the last 64 is unknown, and a superseded one stale past
-/// `ROOT_MAX_AGE`, as ingress and apply judge it from the stored row.
+/// `ROOT_MAX_AGE`, by `Ring::accepts` on the stored row, which ingress and
+/// apply read.
 #[test]
 fn the_ring_keeps_a_root_a_batch_from_its_time() {
     use vos_wire::credentials::{RING, Ring, RootRefusal, tables};
