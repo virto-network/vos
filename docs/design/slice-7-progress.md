@@ -1200,4 +1200,13 @@ agents, the identity agent, `U = 4·10^5` at 2,000 calls a second, readers
   host's other work), the pool bound (512 in use) and p99 rose to 16 s:
   the warning fired as it should.
 
-**Gates after the fixes:** `just check` green; `vos-scale`'s 42 tests.
+**Two failures `just check` met on the loaded host (load average up to
+34), both fixed:** `tree_crash` saw no round killed between a build's
+batches (its kills land at random; it now runs up to three sets of twelve
+rounds until one does); and anchoring's dissent test read the leader's
+alerts the moment the space ended, while the leader raises the evidence
+alert just after the venue takes it (it now waits for the alert). Neither
+was this step's change.
+
+**Gates after the fixes:** `just check` green (110 suites); `vos-scale`'s
+42 tests.
