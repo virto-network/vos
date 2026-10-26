@@ -117,9 +117,20 @@ impl Kind {
         )
     }
 
-    /// Whether an operator key must sign it.
+    /// Whether an operator key must sign it: the table says, not the
+    /// number's range.
     pub fn operator(self) -> bool {
-        (self as u16) >> 8 == 0x02
+        matches!(
+            self,
+            Kind::Stats
+                | Kind::Status
+                | Kind::CreateAgent
+                | Kind::CreateRepresentative
+                | Kind::Install
+                | Kind::Replace
+                | Kind::Grant
+                | Kind::Reports
+        )
     }
 
     /// Whether the node records its nonce: an operator's command, which may
@@ -211,6 +222,8 @@ mod tests {
         );
         let nonces = Kind::ALL.into_iter().filter(|k| k.records_nonce()).count();
         assert_eq!(nonces, 6);
+        let operators = Kind::ALL.into_iter().filter(|k| k.operator()).count();
+        assert_eq!(operators, 8);
         assert!(Kind::Stats.operator() && !Kind::Stats.records_nonce());
         assert!(!Kind::Call.operator());
     }

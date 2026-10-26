@@ -139,6 +139,14 @@ impl Operator {
     /// A request, signed again once at the node's time if the node says
     /// its expiry was off: with the same nonce, so the two copies run once
     /// between them, whoever holds the first.
+    ///
+    /// A signed command sent on a kept connection that fails is sent once
+    /// more on a fresh one, under its nonce. If the first copy ran before
+    /// the connection failed, the answer is `Replayed` (409), not the
+    /// command's outcome: it ran once, and what it did is the node's to
+    /// read (its status, the agent's record). The one `Replayed` whose
+    /// command never ran follows an `Unavailable`, the node's store having
+    /// failed to record the nonce; each `send` signs a fresh nonce.
     fn send(&self, method: &str, path: &str, body: &[u8]) -> Result<Response, ClientError> {
         let nonce = crate::random();
         let mut answer = self.once(method, path, body, nonce)?;

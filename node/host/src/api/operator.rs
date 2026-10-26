@@ -118,13 +118,22 @@ pub(super) async fn run(inner: &Arc<Inner>, command: Command) -> Response {
 type Held = ([u8; 32], [u8; 16]);
 
 /// The operators' commands' nonces, by key and nonce, each until its
-/// expiry: a command whose nonce is recorded never runs again, across
-/// restarts too.
+/// expiry and a horizon past it: a command whose nonce is recorded never
+/// runs again, across restarts too, and a clock stepped back by up to the
+/// horizon still finds it.
 pub(crate) struct Nonces {
     store: Fjall,
     recorded: Mutex<HashMap<Held, u64>>,
     /// The most kept at once: past them, a command is answered `Busy`.
     most: usize,
+}
+
+/// Whether a nonce expiring at `expires` may be forgotten at `now`: once
+/// `now` is past its expiry by more than the horizon. A clock stepped back
+/// by up to the horizon still finds it, and refuses its request as a
+/// replay rather than running it again.
+fn may_forget(expires: u64, now: u64) -> bool {
+    expires.saturating_add(HORIZON_MS) < now
 }
 
 /// Why a nonce was not recorded.
@@ -134,13 +143,13 @@ enum Unrecorded {
 }
 
 impl Nonces {
-    /// The nonces `store` holds, those expired by `now` forgotten.
+    /// The nonces `store` holds, less those it may forget by `now`.
     pub(crate) fn load(store: &Fjall, now: u64, most: usize) -> crate::store::Result<Self> {
         let mut recorded = HashMap::new();
         let mut batch = store.batch();
         let mut expired = false;
         for (key, nonce, expires) in store.operator_nonces()? {
-            if expires < now {
+            if may_forget(expires, now) {
                 batch.operator_nonce(&key, &nonce, None);
                 expired = true;
             } else {
@@ -158,8 +167,9 @@ impl Nonces {
     }
 
     /// Record `key`'s `nonce` until `expires`, if it is not recorded:
-    /// one step, so two copies of one request cannot both pass. Those
-    /// expired by `now` are forgotten first; the forgotten, to delete.
+    /// one step, so two copies of one request cannot both pass. Past the
+    /// most kept, those it may forget by `now` go first; they are
+    /// returned, to delete.
     fn insert(
         &self,
         key: [u8; 32],
@@ -174,7 +184,7 @@ impl Nonces {
         let mut forgotten = Vec::new();
         if recorded.len() >= self.most {
             recorded.retain(|held, expires| {
-                let keep = *expires >= now;
+                let keep = !may_forget(*expires, now);
                 if !keep {
                     forgotten.push(*held);
                 }
@@ -347,8 +357,17 @@ mod tests {
             nonces.insert([3; 32], [1; 16], 30, 5),
             Err(Unrecorded::Full)
         ));
-        // Once one expired, it is forgotten for a new one.
-        let forgotten = nonces.insert([3; 32], [1; 16], 30, 15).ok().unwrap();
+        // Expired, one is still kept for the horizon: a clock stepped back
+        // within it refuses the replay.
+        assert!(matches!(
+            nonces.insert([3; 32], [1; 16], 30, 10 + HORIZON_MS),
+            Err(Unrecorded::Full)
+        ));
+        // Past it, it is forgotten for a new one.
+        let forgotten = nonces
+            .insert([3; 32], [1; 16], 30, 11 + HORIZON_MS)
+            .ok()
+            .unwrap();
         assert_eq!(forgotten, [([1; 32], [1; 16])]);
     }
 }
