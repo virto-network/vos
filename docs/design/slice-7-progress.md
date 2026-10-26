@@ -1327,3 +1327,10 @@ least 12 executor threads (recommended: keep, threads recorded).
 
 **Left to the steps:** `SECURITY.md`'s entries (the path leak, the handle
 copy, the containment) with 7.11 and 7.12, as the plan has them.
+
+**Gate** [measured]: `just check` green at `d524aef3` (1,441 passed in 105
+suites). Its first run failed `anchoring::a_dissenting_replica_does_not_block_the_evidence`,
+a race in the test as 7.2 left it, 2 runs in 5 on `4e7b4982`: the venue
+ends the space inside the leader's offer, and the test read the leader's
+alerts before the offer's answer raised `Evidence`. The test now waits for
+the alert (`d524aef3`); 8 runs in 8 passed.
