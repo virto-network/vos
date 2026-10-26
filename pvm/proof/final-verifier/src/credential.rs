@@ -220,7 +220,10 @@ pub fn verify_bytes(kind: CredentialKind, words: &[u32], bytes: &[u8]) -> Result
 /// Verifies `proof` of the circuit whose preprocessed root is
 /// `preprocessed_root`, under `format`, against its public `words`: the
 /// masked transcript over the credential set, the claimed sums and the
-/// words' public uses adding to zero.
+/// words' public uses adding to zero. It takes no kind and checks no kind
+/// word: ingress calls [`verify`], which picks the root by kind; this is
+/// the circuit-generic step it runs, which the tests and the joint
+/// circuit's measurement call with roots of their own.
 pub fn verify_with(
     format: &MaskedFormat<'_>,
     preprocessed_root: &[u8; 32],

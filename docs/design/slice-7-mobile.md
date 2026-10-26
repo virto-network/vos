@@ -325,10 +325,10 @@ pinned by 7.7.
   Blake2s-M31 channel, **blowup 4, 43 queries, PoW 20**, interaction PoW
   8, fold step 1, affine DEEP batching if the fork's Blake2s-M31 path takes
   it, else by powers; at least 62 proven and 100 conjectured bits on its
-  masked shape (62.69 and 106 [model]); `h = 512`, every component at
+  masked shape (62.93 and 106, counted on the built set in 7.10); `h = 512`, every component at
   least 2^11 rows. If 7.12's grind has a 95th percentile above 50 ms on
   the phone [decided, S29], the format is **44**, the same at 47 queries
-  and PoW 16 (62.66 and 110 [model]), and 42 is retired: a number names one
+  and PoW 16 (62.92 and 110), and 42 is retired: a number names one
   set of parameters. 30, reserved at an unmasked count, is retired
   unregistered.
 - **The scope,** namespaced by the verifier and its space (the Fable

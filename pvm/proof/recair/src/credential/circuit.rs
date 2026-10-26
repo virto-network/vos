@@ -25,7 +25,7 @@ use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use vos_pvm_recair_air::credential::{CredentialKind, DIGEST_WORDS, layout};
 use vos_pvm_recair_air::p2::P2Mode;
-use vos_wire::credentials::{DEPTH, Tag};
+use vos_wire::credentials::{DEPTH, P, Tag};
 
 use crate::circuit::WiringError;
 use crate::context::{Context, Finalized, Message, Mismatch, P2Handle, P2Row, Var};
@@ -119,6 +119,30 @@ impl Statement {
             Statement::Auth(..) => Some(CredentialKind::Auth),
             Statement::Owner(..) => Some(CredentialKind::Owner),
             Statement::Joint(..) => None,
+        }
+    }
+
+    /// Whether every word of it, public and private, is below `p`.
+    pub fn is_canonical(&self) -> bool {
+        let below = |words: &Words| words.iter().all(|&word| word < P);
+        let auth = |public: &AuthPublic, witness: &AuthWitness| {
+            [
+                public.map_root,
+                public.scope,
+                public.nullifier,
+                public.binding,
+                witness.secret,
+            ]
+            .iter()
+            .chain(&witness.siblings)
+            .all(below)
+        };
+        match self {
+            Statement::Auth(public, witness) => auth(public, witness),
+            Statement::Owner(public, secret) => {
+                [public.owner, public.binding, *secret].iter().all(below)
+            }
+            Statement::Joint(public, owner, witness) => auth(public, witness) && below(owner),
         }
     }
 

@@ -271,7 +271,11 @@ impl Body for P2Eval {
                 id: PREPROCESSED[i].to_string(),
             })
         });
-        let selector = |mode: P2Mode| pre[pre::SELECTORS + mode as usize].clone();
+        // A selector mode's column; the tagged row has none.
+        let selector = |mode: P2Mode| {
+            debug_assert!(mode != P2Mode::Tagged, "the tagged row has no selector");
+            pre[pre::SELECTORS + mode as usize].clone()
+        };
         let act: [E::F; 8] = from_fn(|j| pre[pre::ACT + j].clone());
         let c: [E::F; 10] = from_fn(|j| pre[pre::C + j].clone());
 

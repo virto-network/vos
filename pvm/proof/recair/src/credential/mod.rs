@@ -65,9 +65,13 @@ pub fn circuit(kind: Option<CredentialKind>) -> Circuit {
         .circuit
 }
 
-/// `statement`'s circuit and its witness's values, refused when the witness
-/// does not satisfy it, by the piece that refuses it.
+/// `statement`'s circuit and its witness's values, refused when a word of
+/// it is at or above `p`, or the witness does not satisfy it, by the piece
+/// that refuses it.
 pub fn witness(statement: &Statement) -> Result<Finalized<SecureField>, ProveError> {
+    if !statement.is_canonical() {
+        return Err(ProveError::Witness("a word at or above p"));
+    }
     let (finalized, mismatches) =
         circuit::finalize::<SecureField>(statement, &Forge::NONE).map_err(ProveError::Wiring)?;
     match mismatches.first() {

@@ -316,3 +316,53 @@ fn a_prover_that_skips_the_paths_bits_is_refused() {
     let unbalanced = forced(&pinned, &finalized, |_| {}, Checks::ALL).unwrap();
     assert!(matches!(verify(&statement, unbalanced), Err(Error::Logup)));
 }
+
+/// A tagged row whose bit is not zero: the owner's row with `b = 1`, its
+/// input the node rule's at that bit (`[c + m − prev, prev]`, `prev` the
+/// last padding row's output) so its constraints hold, its output the
+/// stated owner digest. The bit's use of the zero wire carries 1, which no
+/// yield balances: refused by the logup total.
+#[test]
+fn a_tagged_rows_bit_is_zero() {
+    use vos_pvm_poseidon2::{M31, N_STATE, permute};
+    use vos_pvm_recair_air::p2::{self, main};
+
+    let Statement::Owner(public, s) = owner_statement(37) else {
+        unreachable!()
+    };
+    let mut prev = [M31::ZERO; N_STATE];
+    permute(&mut prev);
+    let tag = Tag::Owner.block();
+    let input: [M31; N_STATE] = core::array::from_fn(|j| {
+        if j < 8 {
+            M31::new(tag[j]) + M31::new(s[j]) - prev[j]
+        } else {
+            prev[j - 8]
+        }
+    });
+    let mut columns = vec![M31::ZERO; main::M];
+    let output = p2::permutation_columns(input, &mut columns);
+    let forged: Words = core::array::from_fn(|j| output[j].value());
+    let statement = Statement::Owner(
+        vos_pvm_recair::credential::OwnerPublic {
+            owner: forged,
+            ..public
+        },
+        s,
+    );
+    let (finalized, mismatches) = credential::forge(&statement, &Forge::NONE);
+    assert!(
+        mismatches.iter().all(|m| m.piece == "owner"),
+        "{mismatches:?}"
+    );
+    let tamper = |trace: &mut MainTrace| {
+        let p2 = &mut trace.columns[0];
+        for (column, word) in columns.iter().enumerate() {
+            p2[column][0] = BaseField::from(word.value());
+        }
+        p2[main::B][0] = BaseField::from(1);
+    };
+    let proof = forced(&finalized.circuit, &finalized, tamper, Checks::ALL)
+        .expect("every constraint holds at b = 1");
+    assert!(matches!(verify(&statement, proof), Err(Error::Logup)));
+}

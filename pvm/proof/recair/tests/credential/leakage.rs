@@ -14,21 +14,24 @@
 //!   KS. Every published value is a field: both claimed sums are blinded.
 //! - **Uniformity (3):** each field of the first witness's N proofs against
 //!   uniform M31.
-//! - **Hidden state (4):** the secret, the member digest, its leaf and
-//!   every sibling not an empty subtree (those are public constants), eight
-//!   bytes at a time, are in no proof's bytes.
+//! - **Hidden state (4):** the secret, the nullifier's key, the member
+//!   digest, its leaf and every sibling not an empty subtree (those are
+//!   public constants) are not among a proof's published values, which a
+//!   planted control finds.
 //! - **Fresh randomness (5):** two proofs of one witness share no opening,
 //!   nor two witnesses' proofs from one seed.
 //! - **The shape (7):** the two witnesses' proofs have one shape.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
+
 #[cfg(feature = "heavy-gates")]
 use std::sync::OnceLock;
+use stwo::core::fields::m31::BaseField;
 
-use vos_pvm_final_verifier::credential::{CredentialProof, encode};
-use vos_pvm_recair::credential::{self, Statement};
+use vos_pvm_final_verifier::credential::CredentialProof;
+use vos_pvm_recair::credential::{self, Statement, Words};
 use vos_pvm_recair::masked::MaskRng;
-use vos_wire::credentials::{EMPTY, leaf};
+use vos_wire::credentials::{EMPTY, Tag, compress, leaf};
 
 use crate::common::Rng;
 use crate::common::leakage::{Fields, Key, Verdicts, indistinguishable, published, uniform};
@@ -99,37 +102,61 @@ fn the_published_values_do_not_depend_on_the_witness() {
     assert!(verdicts.refused().is_empty(), "{:?}", verdicts.refused());
 }
 
-/// No hidden state in a proof's bytes: the secret, the member digest, its
-/// leaf and every sibling not an empty subtree, each eight bytes at a time.
+/// The hidden digests among `hidden` a proof's published values hold: two
+/// or more of a digest's words among them. A random word is among a proof's
+/// values with probability about their count over `p` (10^5 / 2^31), two of
+/// one digest's about its square.
+fn leaked(proof: &CredentialProof, hidden: &[Words]) -> Vec<Words> {
+    let published: HashSet<u32> = fields(proof).into_iter().map(|(_, value)| value).collect();
+    hidden
+        .iter()
+        .filter(|digest| {
+            digest
+                .iter()
+                .filter(|word| published.contains(word))
+                .count()
+                >= 2
+        })
+        .copied()
+        .collect()
+}
+
+/// No hidden state among a proof's published values: the secret, the
+/// nullifier's key `C(T(nf), s)`, the member digest, its leaf and every
+/// sibling not an empty subtree (those are public constants), none with two
+/// of its words among them. The control: the secret's words planted among a
+/// proof's queried values are found.
 #[test]
 fn no_hidden_state_is_in_a_proof() {
     let [statement, _] = the_pair();
     let proof = proof(&statement, MaskRng::default());
-    let bytes = encode(&proof).unwrap();
-    verify(&statement, proof).unwrap();
+    verify(&statement, proof.clone()).unwrap();
     let Statement::Auth(_, witness) = statement else {
         unreachable!()
     };
-    let m = member(&witness.secret);
-    // The siblings that are no empty subtree's: those are public constants.
+    let s = witness.secret;
+    let m = member(&s);
     let occupied = witness
         .siblings
         .iter()
         .enumerate()
         .filter(|&(level, sibling)| *sibling != EMPTY[level])
-        .map(|(_, sibling)| sibling);
-    let hidden: Vec<u8> = [witness.secret, m, leaf(&m)]
-        .iter()
+        .map(|(_, sibling)| *sibling);
+    let hidden: Vec<Words> = [s, compress(&Tag::Nf.block(), &s), m, leaf(&m)]
+        .into_iter()
         .chain(occupied)
-        .flatten()
-        .flat_map(|word| word.to_le_bytes())
         .collect();
-    for needle in hidden.chunks_exact(8) {
-        assert!(
-            !bytes.windows(8).any(|window| window == needle),
-            "{needle:02x?} is in the proof's bytes"
-        );
+    assert!(hidden.len() > 4, "siblings of other members");
+    assert_eq!(leaked(&proof, &hidden), Vec::<Words>::new());
+
+    let mut planted = proof;
+    for (value, &word) in planted.stark_proof.0.queried_values[1][0]
+        .iter_mut()
+        .zip(&s)
+    {
+        *value = BaseField::from(word);
     }
+    assert_eq!(leaked(&planted, &hidden), vec![s], "the control");
 }
 
 /// Fresh randomness: two proofs of one witness share no opening, and a
@@ -155,7 +182,8 @@ fn every_opening_is_fresh() {
     eprintln!("{n} openings of one witness, {m} of two from one seed: none shared");
 }
 
-/// The shape public: the two witnesses' proofs have one layout.
+/// The shape public: the two witnesses' proofs have one layout. Their
+/// Merkle witnesses' lengths follow the query positions, the coins'.
 #[test]
 fn the_shape_is_the_programs_and_the_coins() {
     let shape = |proof: &CredentialProof| {

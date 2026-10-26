@@ -586,7 +586,7 @@ last for decades.**
 |---|---|---|---|
 | segment proofs (format 35) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.86) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
-| credential proofs (42, or 44 by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 43 queries, PoW 20 (44: 47 queries, PoW 16), plus interaction PoW 8; variant (c) | 106 / 62 (62.69); 44: 110 / 62 (62.66) |
+| credential proofs (42, or 44 by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 43 queries, PoW 20 (44: 47 queries, PoW 16), plus interaction PoW 8; variant (c) | 106 / 62 (62.93); 44: 110 / 62 (62.92) [built, 7.10] |
 | device proofs (43; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | chosen by 7.16 among blowup 2 with 86–87 queries, 4 with 43 (or 47 at PoW 16), 8 with 29; variant (c) | ≥ 100 / ≥ 62 |
 | the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
 | the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
@@ -1008,13 +1008,23 @@ enrollment costs 33 calls of `C`, the leaf and 32 levels; a revocation 32.
 masked (c), the Blake2s-M31 channel (the fork's
 `Blake2sM31MerkleChannel`), blowup 4 (log 2), 43 queries, PoW 20,
 interaction PoW 8, fold step 1, last layer 2^0, affine DEEP batching if the
-fork's Blake2s-M31 path takes it, else by powers; at least 62 proven and
-100 conjectured bits on its masked shape (62.69 and 106 [model]). If 7.12's
-grind has a 95th percentile above 50 ms on the phone, the credential
-format is **44** instead: the same at 47 queries and PoW 16 (62.66 and 110
-[model]), and 42 is retired. A number names one set of parameters, so the
-switch takes a new one. 30, reserved at an unmasked count, is retired
-unregistered. Ingress takes a proof of at most 512 KiB.
+fork's Blake2s-M31 path takes it (it does: affine), else by powers; at
+least 62 proven and 100 conjectured bits on its masked shape (62.93 and
+106, counted on the built set [built, 7.10]). If 7.12's grind has a 95th
+percentile above 50 ms on the phone, the credential format is **44**
+instead: the same at 47 queries and PoW 16 (62.92 and 110), and 42 is
+retired. A number names one set of parameters, so the switch takes a new
+one. 30, reserved at an unmasked count, is retired unregistered [built,
+7.10]. Ingress takes a proof of at most 512 KiB; a proof is about 200 KB
+[measured].
+- **Built** (slice 7's 7.10, `vos_pvm_recair::credential`,
+  `vos_pvm_final_verifier::credential`): each `C(T(name), x)` is one `p2`
+  row of the tagged form (`recursion-air.md` §1.3: a constant block on
+  the left of a wire pair, from three modes' selectors, no AIR change);
+  the set is `p2` and `qm31` alone, each at 2^11 rows, `h8` absent; the
+  verifier pins both kinds' preprocessed roots and program ids (the
+  circuit hash of format 42, its parameters, the log sizes `[11, 11, 0]`
+  and the root).
 
 **The device secret, from a secret source** [decided, S25, S42]:
 - **The source** is an HMAC-SHA-256 under a key the device never

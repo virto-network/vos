@@ -223,7 +223,9 @@ struct LaneCensus {
 }
 
 impl Circuit {
-    /// The components' log sizes.
+    /// The components' log sizes, for a circuit with all three
+    /// ([`Circuit::check_wiring`], which every caller runs first, refuses
+    /// one without `h8`; its sizes are [`Circuit::log_sizes_without_h8`]).
     pub fn log_sizes(&self) -> [u32; 3] {
         [self.p2.len(), self.qm31.len(), self.h8.len()].map(|rows| rows.ilog2())
     }
