@@ -1,8 +1,9 @@
 //! The gateway in front of real nodes: every route answering as the node's
 //! own HTTP does, the operator's envelope in the header, a signed call a
-//! compromised gateway alters refused by the node, leader-aware routing,
-//! the limits per address, and a refusal for size that never reaches a
-//! node.
+//! compromised gateway alters refused by the node, leader-aware routing
+//! and a client's pin across it, the limits per address, refusals for size
+//! and from the head that never reach a node, the budget of install-size
+//! bodies, and a dead node delaying no other's requests.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -24,7 +25,9 @@ use vos_http::routes::operated_header;
 use vos_node::client::{Client, Operator, Target, signed_call, signed_operated, signed_query};
 use vos_node::{Config, Node, Peers};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, WorkflowId};
-use vos_wire::ingress::{Consistency, NodeId, OperatorRefusal, Rejection, Response, WorkflowRead};
+use vos_wire::ingress::{
+    Consistency, Contact, NodeId, OperatorRefusal, Rejection, Response, WorkflowRead,
+};
 use vos_wire::{Decode, Encode};
 
 const COUNTER: InstanceId = InstanceId(1);
@@ -67,6 +70,17 @@ impl Front {
         per: PerAddress,
         tls: Option<Arc<rustls::ServerConfig>>,
     ) -> Self {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Self::start_on(listener, upstreams, per, tls)
+    }
+
+    /// A gateway on `listener`, bound before the space naming it is made.
+    fn start_on(
+        listener: std::net::TcpListener,
+        upstreams: Vec<([u8; 32], Address)>,
+        per: PerAddress,
+        tls: Option<Arc<rustls::ServerConfig>>,
+    ) -> Self {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -77,9 +91,11 @@ impl Front {
             .map(|(key, address)| Upstream::new(key, address, GATEWAY))
             .collect();
         let gateway = Arc::new(Gateway::new(upstreams));
-        let listener = runtime
-            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
-            .unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let listener = {
+            let _entered = runtime.enter();
+            tokio::net::TcpListener::from_std(listener).unwrap()
+        };
         let address = listener.local_addr().unwrap();
         let (stop, stopped) = tokio::sync::oneshot::channel();
         runtime.spawn(front::serve(
@@ -893,10 +909,7 @@ fn a_dead_node_delays_no_other_nodes_requests() {
     let dead = SigningKey::from_bytes(&[77; 32]).verifying_key().to_bytes();
     let front = Front::start(
         vec![
-            (
-                served.node.id().0,
-                Address::Socket(served.socket.clone()),
-            ),
+            (served.node.id().0, Address::Socket(served.socket.clone())),
             (
                 dead,
                 Address::Quic(silent.local_addr().unwrap().to_string()),
@@ -927,9 +940,7 @@ fn a_dead_node_delays_no_other_nodes_requests() {
         let started = std::time::Instant::now();
         let reads: Vec<_> = (0..count)
             .map(|_| {
-                std::thread::spawn(move || {
-                    exchange(address, &request("GET", "/time", &[], b"")).0
-                })
+                std::thread::spawn(move || exchange(address, &request("GET", "/time", &[], b"")).0)
             })
             .collect();
         let statuses: Vec<u16> = reads.into_iter().map(|read| read.join().unwrap()).collect();
@@ -938,7 +949,10 @@ fn a_dead_node_delays_no_other_nodes_requests() {
     let (statuses, took) = reads(8);
     let (status, waited) = to_the_dead.join().unwrap();
     assert_eq!(statuses, vec![200; 8]);
-    assert!(took < Duration::from_secs(2), "while it is dialed: {took:?}");
+    assert!(
+        took < Duration::from_secs(2),
+        "while it is dialed: {took:?}"
+    );
     assert_eq!(status, 503);
     assert!(waited >= Duration::from_secs(5), "its dial ran: {waited:?}");
     // Down after its failed dial: its own requests are answered at once.
@@ -980,6 +994,218 @@ fn a_refusal_for_size_never_reaches_the_node() {
     assert_eq!(served.node.api_frames(), before + 1);
 }
 
+/// Nodes of one space over a hub, each serving its API's socket, their
+/// ingress as `ingress` names it by number.
+struct Cluster {
+    programs: Programs,
+    nodes: Vec<Node>,
+    sockets: Vec<PathBuf>,
+    _dirs: Vec<tempfile::TempDir>,
+}
+
+impl Cluster {
+    fn start(count: usize, ingress: impl Fn(u8) -> String) -> Self {
+        let programs = Programs::load();
+        let dirs: Vec<tempfile::TempDir> =
+            (0..count).map(|_| tempfile::tempdir().unwrap()).collect();
+        let space = vos_checker::spaces::space(&programs.agent, &dirs, ingress);
+        let hub = vos_net::memory::Hub::new(7);
+        let clock = Arc::new(AtomicU64::new(vos_node::wall_clock()));
+        let nodes: Vec<Node> = dirs
+            .iter()
+            .map(|dir| {
+                let mut config = config(&programs, &clock);
+                config.space = Some(space.clone());
+                config.peers = Peers::Hub(hub.clone());
+                let node = Node::open(dir.path(), config).unwrap();
+                node.serve_socket(&dir.path().join("api.sock"), 0o600)
+                    .unwrap();
+                node
+            })
+            .collect();
+        let sockets = dirs.iter().map(|dir| dir.path().join("api.sock")).collect();
+        Self {
+            programs,
+            nodes,
+            sockets,
+            _dirs: dirs,
+        }
+    }
+
+    /// The operator, signing for node `at` and reaching it on its socket.
+    fn operator(&self, at: usize) -> Operator {
+        Operator::signing(
+            &Target::socket(self.sockets[at].clone()),
+            SigningKey::from_bytes(&OPERATOR),
+            self.nodes[at].id(),
+        )
+    }
+
+    /// Node `at` as an upstream.
+    fn upstream(&self, at: usize) -> ([u8; 32], Address) {
+        (
+            self.nodes[at].id().0,
+            Address::Socket(self.sockets[at].clone()),
+        )
+    }
+
+    /// The counter's `increment`, as `agent` has it installed.
+    fn increment(&self, agent: AgentId) -> MethodId {
+        vos_node::client::schema(&Target::socket(self.sockets[0].clone()), agent, COUNTER)
+            .unwrap()
+            .unwrap()
+            .method_id("increment")
+            .unwrap()
+    }
+}
+
+/// A stand-in node on a unix socket at `path` answering every request
+/// `NotLeader`, naming `leader`: what a replica answers while its group
+/// changes leaders.
+fn deposed(runtime: &tokio::runtime::Runtime, path: &std::path::Path, leader: NodeId) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use vos_api::{Event, Framing, Reader, Requests, frame};
+    let listener = {
+        let _entered = runtime.enter();
+        tokio::net::UnixListener::bind(path).unwrap()
+    };
+    runtime.spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut reader = Reader::requests(Framing::Stream, Requests::All);
+                let mut chunk = vec![0u8; 1 << 16];
+                let answer = Response::NotLeader {
+                    leader: Some(Contact {
+                        address: "http://127.0.0.1:1".into(),
+                        node: leader,
+                    }),
+                }
+                .encode();
+                while let Ok(read @ 1..) = stream.read(&mut chunk).await {
+                    reader.push(&chunk[..read]);
+                    while let Some(Event::Frame(request)) = reader.event() {
+                        let bytes = frame(Framing::Stream, request.kind, request.id, &answer);
+                        if stream.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+}
+
+/// A call the gateway sends to a node that no longer leads is sent on to
+/// the leader its `NotLeader` names, which the gateway then learns: the
+/// next call goes there at once.
+#[test]
+fn the_gateway_follows_not_leader_to_the_leader_it_names() {
+    let served = Served::start(PerAddress::default());
+    let dir = tempfile::tempdir().unwrap();
+    let stand_in = dir.path().join("deposed.sock");
+    // The stand-in first: the gateway's first request of the turn.
+    let front = Front::start(
+        vec![
+            ([78; 32], Address::Socket(stand_in.clone())),
+            (served.node.id().0, Address::Socket(served.socket.clone())),
+        ],
+        PerAddress::default(),
+    );
+    deposed(&front.runtime, &stand_in, served.node.id());
+    let call = |seed: u8| {
+        let body = Client::new(
+            &Target::socket(served.socket.clone()),
+            SigningKey::from_bytes(&[seed; 32]),
+        )
+        .call_body(served.agent, 1, COUNTER, served.increment, &1u64.encode())
+        .unwrap();
+        exchange(
+            front.address,
+            &request(
+                "POST",
+                &format!("/agents/{}/calls", served.agent.0),
+                &[],
+                &body,
+            ),
+        )
+    };
+    let (status, body, _) = call(53);
+    assert_eq!(status, 200, "{:?}", Response::decode_exact(&body));
+    assert!(matches!(
+        Response::decode_exact(&body),
+        Some(Response::Ran { .. })
+    ));
+    assert_eq!(front.gateway.sent(), 2, "the stand-in, then the leader");
+    let (status, _, _) = call(54);
+    assert_eq!(status, 200);
+    assert_eq!(front.gateway.sent(), 3, "the leader as learned");
+}
+
+/// A client pinning a gateway follows a 421 through it: a gateway knowing
+/// only the node that does not hold the agent passes its `Elsewhere` on,
+/// the replica's ingress names a second gateway under the same key, and
+/// the pin carried across the redirect holds there.
+#[test]
+fn a_client_pinning_the_gateway_follows_a_421_through_it() {
+    let listeners: Vec<std::net::TcpListener> = (0..2)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").unwrap())
+        .collect();
+    let urls: Vec<String> = listeners
+        .iter()
+        .map(|listener| format!("https://{}", listener.local_addr().unwrap()))
+        .collect();
+    // Node 1's ingress is the first gateway, node 2's the second.
+    let cluster = Cluster::start(2, |number| urls[usize::from(number) - 1].clone());
+    let Ok(Response::Created(agent)) = cluster.operator(0).create_agent(Vec::new()) else {
+        panic!("an agent on node 1")
+    };
+    installed(
+        cluster
+            .operator(0)
+            .install(agent, &install_of(COUNTER, &cluster.programs.counter_elf))
+            .unwrap(),
+    );
+    let at_second = Target::socket(cluster.sockets[1].clone());
+    wait_until("node 2 learns the agent", || {
+        matches!(vos_node::client::agent_info(&at_second, agent), Ok(Some(_)))
+    });
+    let increment = cluster.increment(agent);
+    let tls = || {
+        vos_http::tls::server_config(
+            &vos_http::tls::IngressTls::NodeKey {
+                names: vec!["127.0.0.1".into()],
+            },
+            &GATEWAY,
+        )
+        .unwrap()
+    };
+    let mut listeners = listeners.into_iter();
+    let first = Front::start_on(
+        listeners.next().unwrap(),
+        vec![cluster.upstream(0)],
+        PerAddress::default(),
+        Some(tls()),
+    );
+    let second = Front::start_on(
+        listeners.next().unwrap(),
+        vec![cluster.upstream(1)],
+        PerAddress::default(),
+        Some(tls()),
+    );
+    let gateway = SigningKey::from_bytes(&GATEWAY).verifying_key().to_bytes();
+    let pinned = Target::new(&urls[1], vos_node::tls::Trust::Gateway(gateway)).unwrap();
+    let mut client = Client::new(&pinned, SigningKey::from_bytes(&[13; 32]));
+    let answer = client
+        .call(agent, COUNTER, increment, &5u64.encode())
+        .unwrap();
+    assert_eq!(vos_checker::calls::done(answer), 5);
+    assert!(
+        second.gateway.sent() >= 1,
+        "asked first, it passed the 421 on"
+    );
+    assert!(first.gateway.sent() >= 1, "the redirect reached the first");
+}
+
 /// Two nodes of one space behind a gateway: a request to the node that
 /// does not hold the agent is sent on to the one that does; a gateway
 /// knowing no such node passes the redirect on; an operator's request goes
@@ -987,39 +1213,17 @@ fn a_refusal_for_size_never_reaches_the_node() {
 /// the gateway's.
 #[test]
 fn the_gateway_follows_redirects_and_routes_operators_by_their_node() {
-    let programs = Programs::load();
-    let dirs: Vec<tempfile::TempDir> = (0..2).map(|_| tempfile::tempdir().unwrap()).collect();
-    let space = vos_checker::spaces::space(&programs.agent, &dirs, |number| {
+    let cluster = Cluster::start(2, |number| {
         format!("http://127.0.0.1:{}", 7000 + u16::from(number))
     });
-    let hub = vos_net::memory::Hub::new(7);
-    let clock = Arc::new(AtomicU64::new(vos_node::wall_clock()));
-    let nodes: Vec<Node> = dirs
-        .iter()
-        .map(|dir| {
-            let mut config = config(&programs, &clock);
-            config.space = Some(space.clone());
-            config.peers = Peers::Hub(hub.clone());
-            let node = Node::open(dir.path(), config).unwrap();
-            node.serve_socket(&dir.path().join("api.sock"), 0o600)
-                .unwrap();
-            node
-        })
-        .collect();
-    let sockets: Vec<PathBuf> = dirs.iter().map(|dir| dir.path().join("api.sock")).collect();
-    let operator = |at: usize| {
-        Operator::signing(
-            &Target::socket(sockets[at].clone()),
-            SigningKey::from_bytes(&OPERATOR),
-            nodes[at].id(),
-        )
-    };
+    let (nodes, sockets) = (&cluster.nodes, &cluster.sockets);
+    let operator = |at: usize| cluster.operator(at);
     let Ok(Response::Created(agent)) = operator(0).create_agent(Vec::new()) else {
         panic!("an agent on node 1")
     };
     installed(
         operator(0)
-            .install(agent, &install_of(COUNTER, &programs.counter_elf))
+            .install(agent, &install_of(COUNTER, &cluster.programs.counter_elf))
             .unwrap(),
     );
     // Node 2 learns where the agent is.
@@ -1027,21 +1231,14 @@ fn the_gateway_follows_redirects_and_routes_operators_by_their_node() {
     wait_until("node 2 learns the agent", || {
         matches!(vos_node::client::agent_info(&at_second, agent), Ok(Some(_)))
     });
-    let both = vec![
-        (nodes[1].id().0, Address::Socket(sockets[1].clone())),
-        (nodes[0].id().0, Address::Socket(sockets[0].clone())),
-    ];
+    let both = vec![cluster.upstream(1), cluster.upstream(0)];
     let front = Front::start(both, PerAddress::default());
     let url = format!("http://{}", front.address);
     let mut client = Client::new(
         &Target::loopback(&url).unwrap(),
         SigningKey::from_bytes(&[8; 32]),
     );
-    let increment = vos_node::client::schema(&Target::socket(sockets[0].clone()), agent, COUNTER)
-        .unwrap()
-        .unwrap()
-        .method_id("increment")
-        .unwrap();
+    let increment = cluster.increment(agent);
     for by in 1..=3u64 {
         let answer = client
             .call(agent, COUNTER, increment, &by.encode())
@@ -1049,10 +1246,7 @@ fn the_gateway_follows_redirects_and_routes_operators_by_their_node() {
         assert!(matches!(answer, Response::Ran { .. }), "{answer:?}");
     }
     // A gateway knowing only node 2 passes the redirect on.
-    let alone = Front::start(
-        vec![(nodes[1].id().0, Address::Socket(sockets[1].clone()))],
-        PerAddress::default(),
-    );
+    let alone = Front::start(vec![cluster.upstream(1)], PerAddress::default());
     let call = Client::new(
         &Target::socket(sockets[0].clone()),
         SigningKey::from_bytes(&[9; 32]),
