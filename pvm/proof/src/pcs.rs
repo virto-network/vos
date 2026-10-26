@@ -2,9 +2,16 @@
 //!
 //! A format names its channel ([`crate::format::ChannelKind`]); the code that
 //! proves, verifies or replays a transcript is generic over [`PcsStack`],
-//! and [`with_stack!`](crate::with_stack) picks the stack for a channel. A proof holds its Stwo
-//! proof as a [`StarkProofAny`], whose variant is its channel's, and its
-//! commitments as [`Commitment`]s.
+//! and [`with_stack!`](crate::with_stack) picks the stack for a segment
+//! format's channel. A proof holds its Stwo proof as a [`StarkProofAny`],
+//! whose variant is its channel's, and its commitments as [`Commitment`]s.
+//!
+//! **Three stacks:** Blake2s, Poseidon2-M31 and Blake2s-M31 (the fork's
+//! `Blake2sM31MerkleChannel`: Blake2s with each digest word reduced below
+//! `p`, the credential formats' and the device format's). A Blake2s-M31 root
+//! is a [`Blake2sHash`] whose words are each below `p`; its commitment is
+//! [`Commitment::Blake2sM31`], tagged by its stack, not by its hash type,
+//! which it shares with Blake2s ([`PcsStack::commitment`]).
 //!
 //! The lookup elements are drawn through object-safe component methods, so
 //! they take a [`ChannelRef`], which names the concrete channel.
@@ -12,12 +19,14 @@
 use core::fmt;
 
 use serde::{Deserialize, Serialize};
-use stwo::core::channel::{Blake2sChannel, Channel, MerkleChannel};
+use stwo::core::channel::{Blake2sChannel, Blake2sM31Channel, Channel, MerkleChannel};
 use stwo::core::fields::m31::{BaseField, P};
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs::hash::Hash;
-use stwo::core::vcs_lifted::blake2_merkle::{Blake2sMerkleChannel, Blake2sMerkleHasher};
+use stwo::core::vcs_lifted::blake2_merkle::{
+    Blake2sM31MerkleChannel, Blake2sM31MerkleHasher, Blake2sMerkleChannel, Blake2sMerkleHasher,
+};
 use stwo::core::vcs_lifted::merkle_hasher::MerkleHasherLifted;
 
 use crate::format::ChannelKind;
@@ -28,6 +37,7 @@ use crate::poseidon2::{P2Hash, P2MerkleChannel, P2MerkleHasher, Poseidon2M31Chan
 pub enum ChannelRef<'a> {
     Blake2s(&'a mut Blake2sChannel),
     Poseidon2M31(&'a mut Poseidon2M31Channel),
+    Blake2sM31(&'a mut Blake2sM31Channel),
 }
 
 impl<'a> From<&'a mut Blake2sChannel> for ChannelRef<'a> {
@@ -39,6 +49,12 @@ impl<'a> From<&'a mut Blake2sChannel> for ChannelRef<'a> {
 impl<'a> From<&'a mut Poseidon2M31Channel> for ChannelRef<'a> {
     fn from(channel: &'a mut Poseidon2M31Channel) -> Self {
         Self::Poseidon2M31(channel)
+    }
+}
+
+impl<'a> From<&'a mut Blake2sM31Channel> for ChannelRef<'a> {
+    fn from(channel: &'a mut Blake2sM31Channel) -> Self {
+        Self::Blake2sM31(channel)
     }
 }
 
@@ -54,6 +70,17 @@ pub trait FsChannel: Channel {
 impl FsChannel for Blake2sChannel {
     fn as_ref_channel(&mut self) -> ChannelRef<'_> {
         ChannelRef::Blake2s(self)
+    }
+
+    fn mix_bytes(&mut self, bytes: &[u8]) {
+        let words: alloc::vec::Vec<u32> = bytes.iter().map(|&byte| u32::from(byte)).collect();
+        self.mix_u32s(&words);
+    }
+}
+
+impl FsChannel for Blake2sM31Channel {
+    fn as_ref_channel(&mut self) -> ChannelRef<'_> {
+        ChannelRef::Blake2sM31(self)
     }
 
     fn mix_bytes(&mut self, bytes: &[u8]) {
@@ -141,6 +168,8 @@ impl ProofHash for P2Hash {
 pub enum Commitment {
     Blake2s(Blake2sHash),
     Poseidon2M31(P2Hash),
+    /// A Blake2s-M31 root: each word below `p`.
+    Blake2sM31(Blake2sHash),
 }
 
 impl Commitment {
@@ -148,25 +177,38 @@ impl Commitment {
         match self {
             Self::Blake2s(_) => ChannelKind::Blake2s,
             Self::Poseidon2M31(_) => ChannelKind::Poseidon2M31,
+            Self::Blake2sM31(_) => ChannelKind::Blake2sM31,
         }
     }
 
     /// The 32-byte form ([`ProofHash::to_bytes`]).
     pub fn to_bytes(&self) -> [u8; 32] {
         match self {
-            Self::Blake2s(hash) => hash.to_bytes(),
+            Self::Blake2s(hash) | Self::Blake2sM31(hash) => hash.to_bytes(),
             Self::Poseidon2M31(hash) => ProofHash::to_bytes(hash),
         }
     }
 
-    /// A commitment of `channel`'s hash from its 32-byte form.
+    /// A commitment of `channel`'s hash from its 32-byte form: a
+    /// Blake2s-M31 root's words each below `p`.
     pub fn from_bytes(channel: ChannelKind, bytes: &[u8; 32]) -> Option<Self> {
         match channel {
             ChannelKind::Blake2s => Blake2sHash::from_bytes(bytes).map(Self::Blake2s),
             ChannelKind::Poseidon2M31 => P2Hash::from_bytes(bytes).map(Self::Poseidon2M31),
-            ChannelKind::Blake2sM31 | ChannelKind::Blake2b256 => None,
+            ChannelKind::Blake2sM31 => Some(Blake2sHash(*bytes))
+                .filter(words_below_p)
+                .map(Self::Blake2sM31),
+            ChannelKind::Blake2b256 => None,
         }
     }
+}
+
+/// Whether each of a Blake2s-M31 root's eight little-endian words is below
+/// `p`, as the hasher reduces them.
+pub fn words_below_p(root: &Blake2sHash) -> bool {
+    root.0
+        .chunks_exact(4)
+        .all(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]]) < P)
 }
 
 impl fmt::Display for Commitment {
@@ -183,6 +225,7 @@ impl fmt::Display for Commitment {
 pub enum StarkProofAny {
     Blake2s(StarkProof<Blake2sMerkleHasher>),
     Poseidon2M31(StarkProof<P2MerkleHasher>),
+    Blake2sM31(StarkProof<Blake2sM31MerkleHasher>),
 }
 
 impl StarkProofAny {
@@ -190,22 +233,16 @@ impl StarkProofAny {
         match self {
             Self::Blake2s(_) => ChannelKind::Blake2s,
             Self::Poseidon2M31(_) => ChannelKind::Poseidon2M31,
+            Self::Blake2sM31(_) => ChannelKind::Blake2sM31,
         }
     }
 
     /// Every tree's root, in tree order.
     pub fn commitments(&self) -> alloc::vec::Vec<Commitment> {
         match self {
-            Self::Blake2s(proof) => proof
-                .commitments
-                .iter()
-                .map(|root| root.into_commitment())
-                .collect(),
-            Self::Poseidon2M31(proof) => proof
-                .commitments
-                .iter()
-                .map(|root| root.into_commitment())
-                .collect(),
+            Self::Blake2s(proof) => roots::<Blake2sMerkleChannel>(proof).collect(),
+            Self::Poseidon2M31(proof) => roots::<P2MerkleChannel>(proof).collect(),
+            Self::Blake2sM31(proof) => roots::<Blake2sM31MerkleChannel>(proof).collect(),
         }
     }
 
@@ -214,20 +251,16 @@ impl StarkProofAny {
         match self {
             Self::Blake2s(proof) => proof.commitments.len(),
             Self::Poseidon2M31(proof) => proof.commitments.len(),
+            Self::Blake2sM31(proof) => proof.commitments.len(),
         }
     }
 
     /// The root of tree `index`.
     pub fn commitment(&self, index: usize) -> Option<Commitment> {
         match self {
-            Self::Blake2s(proof) => proof
-                .commitments
-                .get(index)
-                .map(|root| root.into_commitment()),
-            Self::Poseidon2M31(proof) => proof
-                .commitments
-                .get(index)
-                .map(|root| root.into_commitment()),
+            Self::Blake2s(proof) => roots::<Blake2sMerkleChannel>(proof).nth(index),
+            Self::Poseidon2M31(proof) => roots::<P2MerkleChannel>(proof).nth(index),
+            Self::Blake2sM31(proof) => roots::<Blake2sM31MerkleChannel>(proof).nth(index),
         }
     }
 
@@ -236,6 +269,7 @@ impl StarkProofAny {
         match self {
             Self::Blake2s(proof) => proof.proof_of_work,
             Self::Poseidon2M31(proof) => proof.proof_of_work,
+            Self::Blake2sM31(proof) => proof.proof_of_work,
         }
     }
 
@@ -243,8 +277,14 @@ impl StarkProofAny {
         match self {
             Self::Blake2s(proof) => proof.config,
             Self::Poseidon2M31(proof) => proof.config,
+            Self::Blake2sM31(proof) => proof.config,
         }
     }
+}
+
+/// A proof's roots as commitments of `MC`'s stack.
+fn roots<MC: PcsStack>(proof: &StarkProof<MC::H>) -> impl Iterator<Item = Commitment> + '_ {
+    proof.commitments.iter().map(|&root| MC::commitment(root))
 }
 
 /// The Merkle channel, channel and hash of one format channel.
@@ -252,6 +292,11 @@ pub trait PcsStack:
     MerkleChannel<C: FsChannel, H: MerkleHasherLifted<Hash: ProofHash>> + Default + 'static
 {
     const CHANNEL: ChannelKind;
+
+    /// A root of the stack's trees as a commitment, tagged by the stack.
+    fn commitment(root: <Self::H as MerkleHasherLifted>::Hash) -> Commitment {
+        root.into_commitment()
+    }
 
     fn stark(proof: &StarkProofAny) -> Option<&StarkProof<Self::H>>;
 
@@ -268,14 +313,14 @@ impl PcsStack for Blake2sMerkleChannel {
     fn stark(proof: &StarkProofAny) -> Option<&StarkProof<Self::H>> {
         match proof {
             StarkProofAny::Blake2s(proof) => Some(proof),
-            StarkProofAny::Poseidon2M31(_) => None,
+            StarkProofAny::Poseidon2M31(_) | StarkProofAny::Blake2sM31(_) => None,
         }
     }
 
     fn stark_mut(proof: &mut StarkProofAny) -> Option<&mut StarkProof<Self::H>> {
         match proof {
             StarkProofAny::Blake2s(proof) => Some(proof),
-            StarkProofAny::Poseidon2M31(_) => None,
+            StarkProofAny::Poseidon2M31(_) | StarkProofAny::Blake2sM31(_) => None,
         }
     }
 
@@ -286,7 +331,7 @@ impl PcsStack for Blake2sMerkleChannel {
     fn from_any(proof: StarkProofAny) -> Option<StarkProof<Self::H>> {
         match proof {
             StarkProofAny::Blake2s(proof) => Some(proof),
-            StarkProofAny::Poseidon2M31(_) => None,
+            StarkProofAny::Poseidon2M31(_) | StarkProofAny::Blake2sM31(_) => None,
         }
     }
 }
@@ -297,14 +342,14 @@ impl PcsStack for P2MerkleChannel {
     fn stark(proof: &StarkProofAny) -> Option<&StarkProof<Self::H>> {
         match proof {
             StarkProofAny::Poseidon2M31(proof) => Some(proof),
-            StarkProofAny::Blake2s(_) => None,
+            StarkProofAny::Blake2s(_) | StarkProofAny::Blake2sM31(_) => None,
         }
     }
 
     fn stark_mut(proof: &mut StarkProofAny) -> Option<&mut StarkProof<Self::H>> {
         match proof {
             StarkProofAny::Poseidon2M31(proof) => Some(proof),
-            StarkProofAny::Blake2s(_) => None,
+            StarkProofAny::Blake2s(_) | StarkProofAny::Blake2sM31(_) => None,
         }
     }
 
@@ -315,7 +360,40 @@ impl PcsStack for P2MerkleChannel {
     fn from_any(proof: StarkProofAny) -> Option<StarkProof<Self::H>> {
         match proof {
             StarkProofAny::Poseidon2M31(proof) => Some(proof),
-            StarkProofAny::Blake2s(_) => None,
+            StarkProofAny::Blake2s(_) | StarkProofAny::Blake2sM31(_) => None,
+        }
+    }
+}
+
+impl PcsStack for Blake2sM31MerkleChannel {
+    const CHANNEL: ChannelKind = ChannelKind::Blake2sM31;
+
+    fn commitment(root: Blake2sHash) -> Commitment {
+        Commitment::Blake2sM31(root)
+    }
+
+    fn stark(proof: &StarkProofAny) -> Option<&StarkProof<Self::H>> {
+        match proof {
+            StarkProofAny::Blake2sM31(proof) => Some(proof),
+            StarkProofAny::Blake2s(_) | StarkProofAny::Poseidon2M31(_) => None,
+        }
+    }
+
+    fn stark_mut(proof: &mut StarkProofAny) -> Option<&mut StarkProof<Self::H>> {
+        match proof {
+            StarkProofAny::Blake2sM31(proof) => Some(proof),
+            StarkProofAny::Blake2s(_) | StarkProofAny::Poseidon2M31(_) => None,
+        }
+    }
+
+    fn into_any(proof: StarkProof<Self::H>) -> StarkProofAny {
+        StarkProofAny::Blake2sM31(proof)
+    }
+
+    fn from_any(proof: StarkProofAny) -> Option<StarkProof<Self::H>> {
+        match proof {
+            StarkProofAny::Blake2sM31(proof) => Some(proof),
+            StarkProofAny::Blake2s(_) | StarkProofAny::Poseidon2M31(_) => None,
         }
     }
 }

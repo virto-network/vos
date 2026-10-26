@@ -169,6 +169,7 @@ where
         match channel {
             ChannelRef::Blake2s(channel) => C::LookupElements::draw(lookup_elements, channel),
             ChannelRef::Poseidon2M31(channel) => C::LookupElements::draw(lookup_elements, channel),
+            ChannelRef::Blake2sM31(channel) => C::LookupElements::draw(lookup_elements, channel),
         }
     }
 
