@@ -644,10 +644,21 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
     if identity.is_none() {
         model.identity_hz = 0.0;
     }
-    let pools = targets
-        .iter()
-        .map(|target| Pool::new(target, plan.connections))
-        .collect::<Result<Vec<_>, _>>()?;
+    // Over the node API, one QUIC connection a node as the drivers' key;
+    // else HTTPS connections, as many as the plan allows.
+    let pools = match &plan.driver_key {
+        Some(seed) => {
+            let client = crate::keys::hex32(seed)?;
+            plan.nodes
+                .iter()
+                .map(|node| Pool::quic(&node.api, crate::keys::hex32(&node.key)?, client))
+                .collect::<Result<Vec<_>, String>>()?
+        }
+        None => targets
+            .iter()
+            .map(|target| Pool::new(target, plan.connections))
+            .collect::<Result<Vec<_>, _>>()?,
+    };
     let mut file =
         std::fs::File::create(out).map_err(|error| format!("{}: {error}", out.display()))?;
     let secs = plan.secs as f64;

@@ -57,10 +57,18 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
   window, at a uniform time within it (`reader`, and `reader_read` timed
   from the close).
 - **The drivers** split the users and the rate. Each signs its calls ahead
-  of their schedule, keeps at most `[harness] driver_connections` (512)
-  connections a node, and sends each call once (no retry, no redirect
-  followed). All the drivers' connections together must fit in the nodes'
-  `[node] ingress_connections` (1,024 by default), or `drive` refuses. A
+  of their schedule and sends each call once (no retry, no redirect
+  followed). By default (`[harness] transport = "api"`) a driver keeps one
+  QUIC connection to each node's API, a stream a request, its key (the
+  deployed `driver.key`) listed in every node's `gateways`; with
+  `transport = "http"` it keeps at most `[harness] driver_connections`
+  (512) HTTPS connections a node, and all the drivers' connections
+  together must fit in the nodes' `[node] ingress_connections` (1,024 by
+  default), or `drive` refuses. The coordinator's operator key (the
+  deployed `operator.key`), which every node lists, signs its commands
+  and its polls. A run over the API ends with the gateway's cost, a row of
+  its own: the node's time asked of the first node's API directly and
+  through a gateway in front of it, 500 times each. A
   call goes to its agent's leader as last learned, a query to a follower;
   a node that does not answer, or answers `Unavailable` or names no
   leader, is left out for 2 s and the leader's place moves to the next
@@ -123,8 +131,8 @@ Every host, nodes and drivers alike, needs:
 - **The `performance` CPU governor** for timed runs
   (`sudo cpupower frequency-set -g performance`). Laptops run on AC
   power with their lid open. `check` warns about any other governor.
-- **Open ports** between the hosts: each node's `ingress` (TCP) and
-  `peer` (UDP).
+- **Open ports** between the hosts: each node's `ingress` (TCP), `peer`
+  (UDP) and `api` (UDP).
 
 The coordinator also needs the repository, built from its root:
 
@@ -164,7 +172,8 @@ Copy `inventory.example.toml` to `inventory.toml` and give one
 - `cores`: optional, as `taskset -c` takes them, e.g. `0-11`. Use it
   when the desktop runs two nodes, giving each its own cores, ports and
   `dir`.
-- `ingress` and `peer`: the node's TCP and UDP ports.
+- `ingress` and `peer`: the node's TCP and UDP ports; `api`, its API's
+  QUIC port (UDP), the ingress's plus 1,000 when absent.
 - `memory_max`: optional; it overrides `harness.memory_max` for this host.
   On each machine, the caps of all its entries plus a 2 GiB reserve must
   fit in its free memory, or `check` refuses it.

@@ -192,6 +192,9 @@ pub struct Options {
     pub tls: bool,
     /// Clients reach the nodes over the node API's sockets, not HTTP.
     pub api: bool,
+    /// A gateway in front of the nodes' sockets, which clients may reach
+    /// over HTTP ([`Processes::gateway`]).
+    pub gateway: bool,
     /// Lines of each faults file a node reads once, at start: the groups'
     /// timing and compaction, QUIC's idle timeout.
     pub settings: String,
@@ -246,6 +249,67 @@ pub struct Processes {
     log: Log,
     /// Nodes that exited before the harness killed them.
     exits: Mutex<Vec<String>>,
+    /// The gateway in front of the nodes, if the options ask for one.
+    front: Option<Front>,
+}
+
+/// A gateway on its own runtime, and what stops it.
+struct Front {
+    target: Target,
+    _stop: tokio::sync::oneshot::Sender<()>,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl Front {
+    /// A gateway in front of the sockets of the nodes whose keys, in hex,
+    /// are `keys` and whose data directories `data` names.
+    fn start(keys: &[String], data: impl Fn(usize) -> PathBuf) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let upstreams = keys
+            .iter()
+            .enumerate()
+            .map(|(at, key)| {
+                let mut node = [0u8; 32];
+                hex::decode_to_slice(key, &mut node).unwrap();
+                vos_gateway::upstream::Upstream::new(
+                    node,
+                    vos_gateway::upstream::Address::Socket(data(at + 1).join("api.sock")),
+                    [0x9a; 32],
+                )
+            })
+            .collect();
+        let gateway = std::sync::Arc::new(vos_gateway::Gateway::new(upstreams));
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        runtime.spawn(vos_gateway::front::serve(
+            gateway,
+            vos_gateway::limits::Limits::new(vos_gateway::limits::PerAddress {
+                connections: 1024,
+                rate: u32::MAX,
+                burst: u32::MAX,
+            }),
+            listener,
+            vos_gateway::front::Http {
+                tls: None,
+                connections: 1024,
+            },
+            async {
+                let _ = stopped.await;
+            },
+        ));
+        Self {
+            target: Target::loopback(&format!("http://{address}")).unwrap(),
+            _stop: stop,
+            _runtime: runtime,
+        }
+    }
 }
 
 /// How long a status or an operator's command may take at one node.
@@ -268,6 +332,12 @@ impl Processes {
     pub(crate) fn url(&self, number: usize) -> String {
         let scheme = if self.options.tls { "https" } else { "http" };
         format!("{scheme}://127.0.0.1:{}", self.ingress[number - 1])
+    }
+
+    /// The gateway in front of every node, over HTTP, when the options
+    /// ask for one.
+    pub fn gateway(&self) -> Option<&Target> {
+        self.front.as_ref().map(|front| &front.target)
     }
 
     /// Where node `number`'s ingress is reached.
@@ -380,6 +450,7 @@ impl Processes {
                 clients_paused: AtomicBool::new(false),
                 log: Log::default(),
                 exits: Mutex::new(Vec::new()),
+                front: None,
             };
             let started = (1..=count).all(|number| match processes.launch(number) {
                 Some(running) => {
@@ -390,6 +461,13 @@ impl Processes {
                 None => false,
             });
             if started {
+                let mut processes = processes;
+                if options.gateway {
+                    let dir = processes.dir.path().to_path_buf();
+                    processes.front = Some(Front::start(&processes.keys, |number| {
+                        dir.join(format!("node-{number}"))
+                    }));
+                }
                 return processes;
             }
             for number in 1..=count {

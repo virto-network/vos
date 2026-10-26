@@ -45,6 +45,9 @@ pub struct Host {
     /// The node's peer port (QUIC, UDP).
     #[serde(default)]
     pub peer: u16,
+    /// The node API's QUIC port (UDP): the ingress's plus 1000 when absent.
+    #[serde(default)]
+    pub api: u16,
     /// A memory cap for its unit, over the harness's.
     pub memory_max: Option<String>,
     /// Run on a kernel older than the JIT's 6.7, the owner having
@@ -81,6 +84,19 @@ impl Host {
         format!("https://{}:{}", self.address, self.ingress)
     }
 
+    /// The node API's QUIC port.
+    pub fn api_port(&self) -> u16 {
+        if self.api == 0 {
+            self.ingress.saturating_add(1000)
+        } else {
+            self.api
+        }
+    }
+
+    pub fn api_url(&self) -> String {
+        format!("quic://{}:{}", self.address, self.api_port())
+    }
+
     pub fn memory_max<'a>(&'a self, harness: &'a Harness) -> &'a str {
         self.memory_max.as_deref().unwrap_or(&harness.memory_max)
     }
@@ -113,10 +129,24 @@ pub struct Harness {
     /// the coordinator, which `check` otherwise refuses.
     #[serde(default)]
     pub smoke: bool,
-    /// The most connections each driver keeps to each node: the drivers'
-    /// together within the nodes' `ingress_connections`.
+    /// The most connections each driver keeps to each node over HTTP: the
+    /// drivers' together within the nodes' `ingress_connections`.
     #[serde(default = "driver_connections")]
     pub driver_connections: usize,
+    /// How the drivers reach the nodes: over the node API's QUIC, one
+    /// connection a node and a stream a request (`api`, the default), or
+    /// over HTTPS (`http`).
+    #[serde(default)]
+    pub transport: Transport,
+}
+
+/// How the drivers reach the nodes.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Transport {
+    #[default]
+    Api,
+    Http,
 }
 
 fn runs() -> PathBuf {
@@ -313,7 +343,11 @@ impl Inventory {
                 if host.weight == 0 {
                     return Err(format!("host {}: a node's weight is at least 1", host.name));
                 }
-                for (kind, port) in [("tcp", host.ingress), ("udp", host.peer)] {
+                for (kind, port) in [
+                    ("tcp", host.ingress),
+                    ("udp", host.peer),
+                    ("udp", host.api_port()),
+                ] {
                     if !ports.insert((&host.address, kind, port)) {
                         return Err(format!(
                             "host {}: {kind} port {port} at {} is taken by another entry",

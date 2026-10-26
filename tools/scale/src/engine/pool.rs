@@ -1,7 +1,9 @@
 //! Kept connections to one node, plain or in TLS: at most the driver's cap,
 //! one request on each at a time; past the cap a request waits for one.
 //! No timer runs per request: a reaper shuts the socket of a request past
-//! its deadline.
+//! its deadline. Or, over the node API, one QUIC connection, a stream a
+//! request, each within its deadline, the node's stream limit holding
+//! the rest back.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
@@ -137,8 +139,19 @@ impl PoolStats {
     }
 }
 
+/// The node API over QUIC: its address, the node's key it pins, the
+/// driver's key it presents, and the connection once dialed.
+struct Quic {
+    authority: String,
+    node: [u8; 32],
+    client: [u8; 32],
+    dialed: smol::lock::Mutex<Option<(quinn::Endpoint, quinn::Connection)>>,
+}
+
 /// Kept connections to one node.
 pub struct Pool {
+    /// The node API over QUIC, in place of HTTP's connections.
+    quic: Option<Quic>,
     addresses: Vec<SocketAddr>,
     tls: Option<(TlsConnector, ServerName<'static>)>,
     pub authority: String,
@@ -165,6 +178,7 @@ impl Pool {
             .map_err(|error| format!("{}: {error}", target.authority()))?
             .collect();
         Ok(Self {
+            quic: None,
             addresses,
             tls: target
                 .tls()
@@ -179,6 +193,122 @@ impl Pool {
             next: Cell::new(0),
             stats: RefCell::new(PoolStats::default()),
         })
+    }
+
+    /// The node API at `url` (`quic://host:port`) over QUIC, pinned to the
+    /// node's key `node`, as the driver's key `client`.
+    pub fn quic(url: &str, node: [u8; 32], client: [u8; 32]) -> Result<Self, String> {
+        let authority = url
+            .strip_prefix("quic://")
+            .ok_or_else(|| format!("{url}: not a quic:// address"))?
+            .to_string();
+        Ok(Self {
+            quic: Some(Quic {
+                authority: authority.clone(),
+                node,
+                client,
+                dialed: smol::lock::Mutex::new(None),
+            }),
+            addresses: Vec::new(),
+            tls: None,
+            authority,
+            cap: 1,
+            idle: RefCell::new(Vec::new()),
+            open: Cell::new(0),
+            in_use: Cell::new(0),
+            waiting: RefCell::new(VecDeque::new()),
+            asked: RefCell::new(HashMap::new()),
+            next: Cell::new(0),
+            stats: RefCell::new(PoolStats::default()),
+        })
+    }
+
+    /// The QUIC connection, dialed if none is open.
+    async fn connection(quic: &Quic) -> Result<quinn::Connection, String> {
+        let mut dialed = quic.dialed.lock().await;
+        if let Some((_, connection)) = dialed.as_ref()
+            && connection.close_reason().is_none()
+        {
+            return Ok(connection.clone());
+        }
+        let address = quic
+            .authority
+            .to_socket_addrs()
+            .map_err(|error| error.to_string())?
+            .next()
+            .ok_or("the node has no address")?;
+        let bind: SocketAddr = if address.is_ipv4() {
+            "0.0.0.0:0".parse().expect("an address")
+        } else {
+            "[::]:0".parse().expect("an address")
+        };
+        let socket = std::net::UdpSocket::bind(bind).map_err(|error| error.to_string())?;
+        let endpoint = quinn::Endpoint::new(
+            quinn::EndpointConfig::default(),
+            None,
+            socket,
+            std::sync::Arc::new(quinn::SmolRuntime),
+        )
+        .map_err(|error| error.to_string())?;
+        let config = vos_net::api::client_config(
+            &quic.client,
+            quic.node,
+            std::sync::Arc::new(quinn::TransportConfig::default()),
+        );
+        let connecting = endpoint
+            .connect_with(config, address, "node.vos")
+            .map_err(|error| error.to_string())?;
+        let late = async {
+            Timer::after(CONNECT).await;
+            Err(quinn::ConnectionError::TimedOut)
+        };
+        let connection = smol::future::or(connecting, late)
+            .await
+            .map_err(|error| error.to_string())?;
+        *dialed = Some((endpoint, connection.clone()));
+        Ok(connection)
+    }
+
+    /// POST `body` to `path` over the node API, as the route table
+    /// translates it: the node's answer, within `within`.
+    async fn post_quic(
+        &self,
+        quic: &Quic,
+        path: &str,
+        body: &[u8],
+        within: Duration,
+    ) -> Result<Response, String> {
+        let request = vos_http::Request {
+            method: "POST".into(),
+            path: path.into(),
+            headers: Vec::new(),
+            body: body.to_vec(),
+            peer: None,
+        };
+        let vos_http::routes::Routed::Request { kind, body } = vos_http::routes::route(&request)
+        else {
+            return Err(format!("{path}: not a request the node API takes"));
+        };
+        let asked = async {
+            let connection = Self::connection(quic).await?;
+            self.in_use.set(self.in_use.get() + 1);
+            {
+                let mut stats = self.stats.borrow_mut();
+                stats.in_use_max = stats.in_use_max.max(self.in_use.get());
+            }
+            let answered = vos_api::quic::request(&connection, kind as u16, &body).await;
+            self.in_use.set(self.in_use.get() - 1);
+            answered.map_err(|error| error.to_string())
+        };
+        let late = async {
+            Timer::after(within).await;
+            Err("timed out".to_string())
+        };
+        let (answered, bytes) = smol::future::or(asked, late).await?;
+        let answer = vos_http::routes::answer(answered, &bytes);
+        Response::decode(&answer.body)
+            .map(|(response, _)| response)
+            .map_err(|_| format!("an answer it cannot read (status {})", answer.status))
     }
 
     /// The connections open, and those idle.
@@ -330,6 +460,10 @@ impl Pool {
     /// Open a connection and keep it: a handshake done before the load
     /// starts.
     pub async fn warm(&self) {
+        if let Some(quic) = &self.quic {
+            let _ = Self::connection(quic).await;
+            return;
+        }
         if self.open.get() >= self.cap {
             return;
         }
@@ -348,6 +482,9 @@ impl Pool {
         body: &[u8],
         within: Duration,
     ) -> Result<Response, String> {
+        if let Some(quic) = &self.quic {
+            return self.post_quic(quic, path, body, within).await;
+        }
         let held = Held(Cell::new(false), self);
         let mut conn = match self.take(&held, within).await {
             Ok(conn) => conn,
@@ -522,6 +659,46 @@ mod tests {
         });
         assert_eq!(answer, Err("timed out".into()));
         assert_eq!(pool.counts(), (0, 0));
+    }
+
+    /// A node's API over QUIC, as a driver's pool reaches it: one
+    /// connection, its requests' answers each the node's.
+    #[test]
+    fn a_pool_over_quic_reaches_the_nodes_api() {
+        use vos_wire::ingress::Rejection;
+        let programs = vos_checker::programs::Programs::load();
+        let dir = tempfile::tempdir().unwrap();
+        let driver = [17u8; 32];
+        let node = vos_node::Node::open(dir.path(), vos_node::Config::new(programs.agent.clone()))
+            .unwrap();
+        let listed = ed25519_dalek::SigningKey::from_bytes(&driver)
+            .verifying_key()
+            .to_bytes();
+        let address = node
+            .serve_quic("127.0.0.1:0".parse().unwrap(), vec![listed])
+            .unwrap();
+        let agent = node.create_agent().unwrap();
+        let pool = Pool::quic(&format!("quic://{address}"), node.id().0, driver).unwrap();
+        let answers = smol::block_on(async {
+            pool.warm().await;
+            let within = Duration::from_secs(10);
+            let malformed = pool
+                .post(&format!("/agents/{}/queries", agent.0), b"x", within)
+                .await;
+            let absent = pool.post("/agents/99/calls", b"x", within).await;
+            (malformed, absent)
+        });
+        assert_eq!(answers.0, Ok(Response::Rejected(Rejection::Malformed)));
+        assert_eq!(answers.1, Ok(Response::Rejected(Rejection::Malformed)));
+        assert_eq!(pool.take_stats().in_use_max, 1);
+        // Another key is refused at the handshake.
+        let stranger = Pool::quic(&format!("quic://{address}"), node.id().0, [18; 32]).unwrap();
+        let refused = smol::block_on(stranger.post(
+            &format!("/agents/{}/queries", agent.0),
+            b"x",
+            Duration::from_secs(10),
+        ));
+        assert!(refused.is_err(), "{refused:?}");
     }
 
     /// Every future of `futures`, run together on this thread.

@@ -559,6 +559,7 @@ fn five_processes_apply_once_through_faults() {
             tls,
             api,
             settings: SETTINGS.to_string(),
+            ..Options::default()
         },
     );
     let run = Run {

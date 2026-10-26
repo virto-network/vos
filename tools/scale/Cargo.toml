@@ -28,8 +28,18 @@ toml = "1"
 # The harness's clients: the operator's admin commands and signed calls,
 # each node pinned by its key over TLS.
 vos-node = { path = "../../node/host" }
+# The drivers over the node API: its frames, its QUIC, and the route
+# table that turns their requests into frames.
+vos-api = { workspace = true, features = ["quic"] }
+vos-http = { workspace = true }
+vos-net = { workspace = true }
+quinn = { version = "0.11.12", default-features = false, features = ["runtime-smol", "rustls-ring"] }
+# The gateway's cost, measured in front of a node from the coordinator.
+vos-gateway = { path = "../../node/gateway" }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync"] }
 vos-pvm = { workspace = true }
 vos-wire = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
+vos-checker = { path = "../../node/checker" }
