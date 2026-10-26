@@ -46,22 +46,24 @@ fn least_queries(base: FormatParams) -> Option<usize> {
     })
 }
 
-/// Variant (c) moves no unmasked count: every other format samples its
-/// composition at the out-of-domain point itself and counts what it pins,
-/// format 28 82.60; format 39's reference is 28's at (c)'s levels.
+/// Variant (c) moves no unmasked count: every format but the masked ones
+/// counted on their masked shapes (39, 42) samples its composition at the
+/// out-of-domain point itself and counts what it pins, format 28 82.60;
+/// format 39's reference is 28's at (c)'s levels.
 #[test]
 fn the_unmasked_counts_do_not_move() {
+    let counted_masked = [MASKED_WRAP.number, CREDENTIAL_PROOF.number];
     for format in REGISTRY {
-        let doublings = u32::from(format.number == MASKED_WRAP.number);
+        let doublings = u32::from(counted_masked.contains(&format.number));
         assert_eq!(
             format.reference.composition_point_doublings, doublings,
             "format {}",
             format.number
         );
-        assert_eq!(format.masked, [30, 37, 39].contains(&format.number));
+        assert_eq!(format.masked, [37, 39, 42].contains(&format.number));
         assert_eq!(
             format.masking.is_some(),
-            format.number == MASKED_WRAP.number,
+            counted_masked.contains(&format.number),
             "format {}",
             format.number
         );
@@ -294,4 +296,36 @@ fn the_masked_wraps_masking_meets_its_bounds() {
     let smallest = 1usize << 11;
     assert!(4 * h <= smallest && 3 * h <= 2 * smallest);
     assert!(31 * masking.salt_columns >= 248);
+}
+
+/// Formats 42 and 44 counted on the credential AIR's masked shape: 42 at
+/// 106 / 62 (62.927; blowup 4, 43 queries, PoW 20), 44 at 110 / 62
+/// (62.920; 47 queries, PoW 16), the query term binding both, the DEEP
+/// batching 0.01 bits above it; 44 unregistered.
+#[test]
+fn the_credential_formats_count_on_their_masked_shape() {
+    for (format, conjectured, (low, high)) in [
+        (CREDENTIAL_PROOF, 106, (62.92, 62.93)),
+        (CREDENTIAL_PROOF_44, 110, (62.92, 62.93)),
+    ] {
+        let bits = security_bits(&format.params, &CREDENTIAL_REFERENCE).unwrap();
+        assert_eq!(bits, format.bits, "format {}", format.number);
+        assert_eq!(bits.conjectured, conjectured);
+        let proven = count(&format.params, &CREDENTIAL_REFERENCE);
+        let terms = term_bits(&format.params, &CREDENTIAL_REFERENCE).unwrap();
+        eprintln!(
+            "format {}: {proven:.3} proven bits, {terms:?}",
+            format.number
+        );
+        assert!((low..high).contains(&proven), "{proven}");
+        assert_eq!(terms.query, proven, "format {}", format.number);
+        assert!(format.meets_floors());
+    }
+    assert!(lookup(CREDENTIAL_PROOF_44.number).is_none());
+    assert_eq!(lookup(42), Some(&CREDENTIAL_PROOF));
+    assert!(RETIRED.contains(&30) && lookup(30).is_none());
+    assert_eq!(
+        CREDENTIAL_PROOF_44.masking, CREDENTIAL_PROOF.masking,
+        "one masking, one shape"
+    );
 }

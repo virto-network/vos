@@ -1432,11 +1432,12 @@ counts as conjectured / proven at the reference shape [model]:
 | 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 | 28 | the final wrap, unmasked (tests only) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted; the one production venues accept |
-| 30 | credential proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
+| 42 | credential proofs, masked (variant (c)) | Blake2s-M31 | 2, 43, 20, 1, 0, 8, affine DEEP batching | 100 / 60 | 106 / 62 (62.93), on its masked shape | admitted |
 
-- **30 and 37 are retired unregistered** when their masked successors
-  register: 42 (or 44) for credential proofs, 43 for device proofs, each
-  counted on its masked shape (§8).
+- **30 is retired unregistered** (slice 7's 7.10): 42 counts credential
+  proofs on their masked shape; 44 (47 queries, PoW 16: 110 / 62, 62.92)
+  is counted beside it in the registry's code and registered only if the
+  phone gate picks it. **37** retires the same way when 43 registers.
 - **Each entry** holds its channel, its parameters, the DEEP batching its
   proven floor assumes and both bit counts.
 - **Every entry uses A.3's encodings** and exactly its parameters.
@@ -1446,8 +1447,9 @@ counts as conjectured / proven at the reference shape [model]:
   segment shape 35's count is its query term's, 62.86; 32's parameters give
   62.74, their batching term binding.
 - **35 and 37 name the segment AIR,** hardened and without the columns and
-  next-row masks no constraint reads (§3.2); 28, 30 and 32 prove the
-  recursion AIR, 32's leaves verifying the segment AIR. A reserved entry is
+  next-row masks no constraint reads (§3.2); 28, 32 and 39 prove the
+  recursion AIR, 32's leaves verifying the segment AIR, and 42 its `p2`
+  and `qm31` alone. A reserved entry is
   refused until its AIR and channel exist. 32's exist from slice 5's 5.8:
   `vos-pvm-recair` proves and verifies its proofs natively, and the registry
   refuses it, as no verifier outside the recursion reads a leaf or a fold.
