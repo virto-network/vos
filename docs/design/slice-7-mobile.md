@@ -245,11 +245,12 @@ ring, its methods) and `proving.md` §8 (the hash, the tree); pinned by
   the leaves), the empty subtrees' digests as constants.
 - **The hashes:** each one `0x402` call (pin H), `C(l, r)`: the VOS host
   serves it natively, a JAM-deployed agent pays the shim's software
-  permutation (about 15,800 instructions); so VOS ≡ JAM holds, and the
-  tree is as deterministic as any row. `leaf = C(T(leaf), member)`, the
-  slot not hashed (the path places it); a node `C(left, right)`; the empty
-  leaf eight zero words; a tag `T(name)` the block `[t, 0, …, 0]`, `t` from
-  `BLAKE2b-256("vos/p2/" ‖ name)`. 33 calls a write.
+  permutation (about 37,600 gas [measured, 7.9]); so VOS ≡ JAM holds,
+  and the tree is as deterministic as any row. `leaf = C(T(leaf),
+  member)`, the slot not hashed (the path places it); a node `C(left,
+  right)`; the empty leaf eight zero words; a tag `T(name)` the block
+  `[t, 0, …, 0]`, `t` from `BLAKE2b-256("vos/p2/" ‖ name)`. 33 calls an
+  enrollment, 32 a revocation.
 - **Roots:** a replicated ring of the last 64 `(root, since)`, one entry a
   batch time that changed the tree. **Freshness** (the Fable review's H2):
   a root is accepted while it is the newest, and for `ROOT_MAX_AGE`
@@ -258,8 +259,9 @@ ring, its methods) and `proving.md` §8 (the hash, the tree); pinned by
   apply, so a revocation takes effect within it at every replica; the
   ring's count only bounds storage.
 - **The handle** (pin K, S25): 32 bytes the founder draws once, set at the
-  actor's install and served by `handle()`; a re-founded space's actor is
-  installed with the same handle.
+  actor's install by `found(handle)` (once; no write before it) and served
+  by `handle()`; a re-founded space's actor is installed with the same
+  handle.
 - **Methods:** `enroll`, `enroll_many` (the re-founding re-seed),
   `invite`/`claim` (the demo's enrollment, the invitation naming the
   digest), `revoke`, under the role `registrar` but `claim`; the queries
@@ -289,7 +291,7 @@ ring, its methods) and `proving.md` §8 (the hash, the tree); pinned by
   bytes (16 M31 words, little-endian u32, each `< p`; a word ≥ p, p itself
   included, traps the live call), φ8 at 32 bytes written with the 8-word
   output of `compress`; no other effect. Served natively by the VOS host
-  at a price measured in 7.9; on JAM the guest shim computes it in
+  at 2,400 gas, measured in 7.9; on JAM the guest shim computes it in
   software on `WHAT`.
 - **The chip** (7.15), in the device format, and in the node's segment
   format as S32 allows [decided, S23, S32]: one permutation a row, `p2`'s
