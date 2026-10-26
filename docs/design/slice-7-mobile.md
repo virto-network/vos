@@ -2,7 +2,7 @@
 
 Plan, draft 4, with the owner's answers and Fable's review of draft 3
 folded (2026-10-25), and the owner's S34–S44 and S46–S52 since
-(2026-10-26). It takes the owner's slice-7 decisions S1–S44 and S46–S52
+(2026-10-26). It takes the owner's slice-7 decisions S1–S52
 (`research/slice-7/owner-decisions.md`) and the first real phone run
 (`research/slice-7/phone-fairphone6-s5kit.txt`).
 Slice 6's decisions 1–18 stand, except those S9–S17 reverse ("Decisions"

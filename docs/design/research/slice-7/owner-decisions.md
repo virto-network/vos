@@ -242,6 +242,13 @@ S36. **T5-partial.** With all three nodes on compumax, T5 kills one
   node's unit under load, and is recorded as T5-partial; the full host
   kill re-runs when more machines exist. (2026-10-26)
 
+S45. **The driver may be on Wi-Fi.** The desktop, the drivers' and the
+  coordinator's machine, reaches the LAN over Wi-Fi only; the owner
+  accepts it, its round trips measured and recorded with each run, and a
+  wired rerun if they show the radio in the latencies. `check` refuses a
+  node on Wi-Fi and only warns of a driver on it. Narrows S35.
+  (2026-10-26)
+
 S52. **compumax is wired.** The desktop's driver, still on Wi-Fi,
   measured p50 3.6 ms and p99 6.9 ms to compumax [measured]; `vos-scale
   check` warns of a driver on Wi-Fi and records its round trips to each
