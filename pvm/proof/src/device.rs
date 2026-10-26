@@ -12,7 +12,7 @@
 //!   program's data), [`DeviceBoundaryChip`](crate::chips::DeviceBoundaryChip)
 //!   (the run's entry and halt) and [`DeviceIoChip`](crate::chips::DeviceIoChip)
 //!   (the io-hash, the only public output). Their indices continue
-//!   [`chip_idx`](crate::chip_idx)'s ([`device_chip`]); [`DEVICE_ORDER`] is
+//!   [`chip_idx`]'s ([`device_chip`]); [`DEVICE_ORDER`] is
 //!   the set's commitment order.
 //! - **The run is bound** by the program's code (PROGRAM_MEMORY,
 //!   preprocessed); its first touches by region ([`DeviceLayout`]): the
