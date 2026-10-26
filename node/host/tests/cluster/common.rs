@@ -11,6 +11,7 @@ use vos_checker::calls::{done, install_at_leader};
 use vos_checker::programs::Programs;
 pub use vos_checker::spaces::wait_in_process as wait_until;
 use vos_checker::spaces::{HeldPort, IN_PROCESS_WAIT, open_node, space};
+use vos_checker::watch::{self, Watched, waiting};
 use vos_net::memory::{Endpoint, Hub};
 use vos_net::{Arrivals, Class, Network};
 use vos_node::{CallError, Config, Hooks, Node, Peers, ReplaceError, Reply, Space};
@@ -32,6 +33,19 @@ pub const WRITER_STALL: Duration = Duration::from_secs(5);
 /// Past how long a follower drops a snapshot it staged in part once the
 /// stream stops arriving (30 s).
 pub const STAGED_IDLE: Duration = Duration::from_secs(45);
+
+/// How long a suite's clusters may take, each suite its own
+/// (`crate::BOUNDS`): past a bound, and the watch's grace, a cluster hung.
+pub struct Bounds {
+    /// A test's cluster, its start and its stop with it.
+    pub lifetime: Duration,
+    /// A node's start or stop: a stop waits for a proof under way.
+    pub start_stop: Duration,
+    /// The suite with no cluster alive and no wait moving: a test thread
+    /// stuck past its cluster's end, in its exit or in the harness's join
+    /// of it. `None` in a suite whose tests wait outside the watch.
+    pub idle: Option<Duration>,
+}
 
 /// What a test sets in node `number`'s config, past the harness's own.
 type Tuning = Box<dyn Fn(NodeNumber, &mut Config) + Send + Sync>;
@@ -55,6 +69,9 @@ pub struct Cluster {
     /// How far each node's clock is set ahead of its own, by node, from
     /// node 1.
     pub offsets: Vec<Arc<AtomicI64>>,
+    /// The cluster's life watched, through its nodes' stop and its data
+    /// directories' removal: dropped last.
+    _lifetime: Watched,
 }
 
 /// Node `number`'s own clock's lead on the wall's: a few milliseconds,
@@ -143,6 +160,14 @@ impl Cluster {
         tuning: Tuning,
         founding: impl Fn(NodeNumber) -> bool,
     ) -> Self {
+        let bounds = &crate::BOUNDS;
+        if let Some(idle) = bounds.idle {
+            watch::idle(idle);
+        }
+        let lifetime = waiting(
+            format!("a cluster of {count} nodes to end"),
+            bounds.lifetime,
+        );
         let programs = Arc::new(Programs::load());
         let dirs: Vec<tempfile::TempDir> =
             (0..count).map(|_| tempfile::tempdir().unwrap()).collect();
@@ -166,6 +191,7 @@ impl Cluster {
             tuning,
             sessions: Mutex::default(),
             offsets: (0..count).map(|_| Arc::default()).collect(),
+            _lifetime: lifetime,
         };
         for number in 1..=count {
             cluster.start(number);
@@ -200,6 +226,7 @@ impl Cluster {
         let at = usize::from(number) - 1;
         let dir = self.dirs[at].path().to_path_buf();
         drop(self.held[at].take());
+        let _watched = waiting(format!("node {number} to start"), crate::BOUNDS.start_stop);
         let node = open_node(number, &dir, || self.config(number));
         self.nodes[at] = Some(node);
     }
@@ -207,6 +234,7 @@ impl Cluster {
     pub fn stop(&mut self, number: NodeNumber) {
         let at = usize::from(number) - 1;
         if let Some(node) = self.nodes[at].take() {
+            let _watched = waiting(format!("node {number} to stop"), crate::BOUNDS.start_stop);
             node.shutdown();
             if self.quic {
                 let node = self.space.nodes().iter().find(|node| node.number == number);
@@ -232,6 +260,7 @@ impl Cluster {
     /// deadline, what each running replica says of itself.
     #[track_caller]
     pub fn leader(&self, agent: AgentId) -> NodeNumber {
+        let _watched = waiting(format!("a leader of agent {}", agent.0), IN_PROCESS_WAIT);
         let until = Instant::now() + IN_PROCESS_WAIT;
         loop {
             let leading: Vec<NodeNumber> = self
@@ -386,8 +415,8 @@ impl Cluster {
         let agent = self.counter_agent(replicas);
         let until = Instant::now() + IN_PROCESS_WAIT;
         loop {
-            let leader = self.node(self.leader(agent));
-            match smol::block_on(leader.report_every_window(agent, true)) {
+            let leader = self.leader(agent);
+            match called(leader, self.node(leader).report_every_window(agent, true)) {
                 Ok(_) => return agent,
                 Err(_) if Instant::now() < until => {
                     std::thread::sleep(Duration::from_millis(10));
@@ -465,7 +494,10 @@ impl Cluster {
         sequence: u64,
         by: u64,
     ) -> Result<Reply, CallError> {
-        smol::block_on(self.node(at).call(agent, self.request(agent, sequence, by)))
+        called(
+            at,
+            self.node(at).call(agent, self.request(agent, sequence, by)),
+        )
     }
 
     /// `request` at `agent`'s leader, followed when it moves: a call sent
@@ -479,8 +511,8 @@ impl Cluster {
         let until = Instant::now() + IN_PROCESS_WAIT;
         let mut backoff = Duration::from_millis(10);
         loop {
-            let node = self.node(self.leader(agent));
-            match smol::block_on(node.call(agent, request.clone())) {
+            let leader = self.leader(agent);
+            match called(leader, self.node(leader).call(agent, request.clone())) {
                 Err(CallError::NotLeader(_) | CallError::TimedOut) if Instant::now() < until => {
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(Duration::from_millis(500));
@@ -539,13 +571,16 @@ impl Cluster {
     }
 
     pub fn query_value(&self, at: NodeNumber, agent: AgentId) -> Result<Outcome, CallError> {
-        smol::block_on(self.node(at).query(
-            agent,
-            ALICE,
-            COUNTER,
-            self.programs.method("value"),
-            Vec::new(),
-        ))
+        called(
+            at,
+            self.node(at).query(
+                agent,
+                ALICE,
+                COUNTER,
+                self.programs.method("value"),
+                Vec::new(),
+            ),
+        )
     }
 
     /// Every running node the newest placement of `agent` names runs it,
@@ -620,6 +655,26 @@ impl Cluster {
         endpoint.set_peers(self.space.peers());
         Impersonation { endpoint, arrivals }
     }
+}
+
+impl Drop for Cluster {
+    /// Every node stopped before its data directory is removed, its port
+    /// left free.
+    fn drop(&mut self) {
+        for (number, node) in (1..).zip(&mut self.nodes) {
+            if let Some(node) = node.take() {
+                let _watched = waiting(format!("node {number} to stop"), crate::BOUNDS.start_stop);
+                node.shutdown();
+            }
+        }
+    }
+}
+
+/// `call` to node `at`, waited for and watched: a node answers or refuses
+/// every call within its deadline.
+fn called<T>(at: NodeNumber, call: impl Future<Output = T>) -> T {
+    let _watched = waiting(format!("a call at node {at}"), IN_PROCESS_WAIT);
+    smol::block_on(call)
 }
 
 /// The test speaking for a stopped node, on the hub.
