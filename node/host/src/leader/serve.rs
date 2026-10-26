@@ -1,14 +1,13 @@
-//! Reads at a window's cut served: once this replica has built a cut that
-//! serves a pending request ([`keys::request`], at the window it was asked
-//! in or one a re-cut moved it to, [`roots::serving_windows`]) and the
+//! Reads at a window's cut served: once this replica has built the cut of
+//! the window a pending request was asked in ([`keys::request`]) and the
 //! agent holds the representative's close of that window
 //! ([`keys::closed`]), the request goes into a batch as a
 //! [`Input::Resume`]: its rows and their proof as the cut's build
-//! persisted them ([`roots::cut_proof_at`]), with the close's root, salt
-//! and path of the agent's root at the cut to the space's root; the first
-//! such window. A request whose rows pass its target's [`Limits::served`]
-//! goes unserved, so its workflow learns at once. One not closed waits:
-//! its window is re-cut, or its deadline ends it.
+//! persisted them ([`roots::cut_proof`]), with the close's root, salt and
+//! path of the agent's root at the cut to the space's root. A request
+//! whose rows pass its target's [`Limits::served`] goes unserved, so its
+//! workflow learns at once. One not closed waits until its deadline ends
+//! it.
 
 use vos_wire::abi::cap::{Limits, Target};
 use vos_wire::batch::Input;
@@ -29,11 +28,10 @@ use crate::store::Snapshot;
 const RESUMES: usize = 8;
 
 /// A pending request this replica can serve: the window it was asked in,
-/// its id, and the window whose cut serves it.
+/// and its id.
 struct Ready {
     asked: u64,
     request: RequestId,
-    serving: u64,
 }
 
 impl Leader {
@@ -66,15 +64,14 @@ impl Leader {
     }
 }
 
-/// The pending requests a cut `snapshot`'s replica has built serves, the
+/// The pending requests whose cut `snapshot`'s replica has built, the
 /// agent holding its close, at most [`RESUMES`], in the order of the
-/// windows they were asked in, each at the first such cut.
+/// windows they were asked in.
 fn proved(snapshot: &Snapshot, agent: AgentId) -> Result<Vec<Ready>, Fault> {
     let Some(latest) = roots::latest_built(snapshot, agent)? else {
         return Ok(Vec::new());
     };
     let mut ready = Vec::new();
-    let mut windows: Option<(u64, Vec<u64>)> = None;
     for row in snapshot.scan(agent, &keys::request_prefix(), None) {
         let (key, _) = row?;
         // A key that does not read is skipped, as the cut's build skips it.
@@ -84,31 +81,18 @@ fn proved(snapshot: &Snapshot, agent: AgentId) -> Result<Vec<Ready>, Fault> {
         if asked > latest || ready.len() == RESUMES {
             break;
         }
-        let serving = match windows.take() {
-            Some((of, serving)) if of == asked => serving,
-            _ => roots::serving_windows(snapshot, agent, asked)?,
-        };
-        let (_, serving) = windows.insert((asked, serving));
-        for window in serving.iter().copied().filter(|window| *window <= latest) {
-            let closed = snapshot.get(agent, &keys::closed(window))?.is_some();
-            let proved = closed
-                && snapshot
-                    .get(agent, &keys::cut_proof(request, window))?
-                    .is_some();
-            if proved {
-                ready.push(Ready {
-                    asked,
-                    request,
-                    serving: window,
-                });
-                break;
-            }
+        let proved = snapshot.get(agent, &keys::closed(asked))?.is_some()
+            && snapshot
+                .get(agent, &keys::cut_proof(request, asked))?
+                .is_some();
+        if proved {
+            ready.push(Ready { asked, request });
         }
     }
     Ok(ready)
 }
 
-/// The encoded rows of `ready`'s request as served at its serving cut,
+/// The encoded rows of `ready`'s request as served at its window's cut,
 /// within `limits`, with the close of that window; `None` when they pass
 /// the cap.
 fn served(
@@ -118,7 +102,7 @@ fn served(
     limits: &Limits,
     ready: &Ready,
 ) -> Result<Option<Vec<u8>>, Fault> {
-    let proof = roots::cut_proof_at(snapshot, agent, ready.request, ready.serving)?;
+    let proof = roots::cut_proof(snapshot, agent, ready.request)?;
     let Some(CutProof {
         window,
         agent_root,

@@ -26,9 +26,10 @@ pub type RepKey = (u32, (u8, u64));
 pub struct Representative {
     /// Each agent's root at each window's cut.
     roots: CommittedMap<RepKey, [u8; 32], Ordered>,
-    /// The agents whose reads wait on a window's close, by window: the
-    /// close sends each its row's path.
-    asked: Table<(u64, u32), (), Ordered>,
+    /// The agents that reported each window, by window: the close sends
+    /// each its row's path. Committed, so a window's asks at its cut are
+    /// fixed however late a replica builds it.
+    asked: CommittedMap<(u64, u32), (), Ordered>,
 }
 
 #[messages]
@@ -36,7 +37,7 @@ impl Representative {
     pub fn new() -> Self {
         Self {
             roots: CommittedMap::default(),
-            asked: Table::default(),
+            asked: CommittedMap::default(),
         }
     }
 }

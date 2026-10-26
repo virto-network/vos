@@ -1,9 +1,11 @@
-//! The worker: from the logs of the agents this node replicates, each
-//! attest at a window's cut becomes a job; for the agents it leads, one job
-//! at a time is proved, and each proof is kept, recorded in its agent, and
-//! submitted once its roots are anchored.
+//! The worker: from the records of the agents this node replicates, each
+//! attest at a window's cut whose statement waits to be proved
+//! (`vos_wire::keys::attested`, the same on every replica and carried by
+//! its snapshots) becomes a job; for the agents it leads, one job at a time
+//! is proved, and each proof is kept, recorded in its agent, and submitted
+//! once its roots are anchored. Each unfinished job's kernel is held.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -13,8 +15,11 @@ use vos_wire::ids::{AgentId, ProgramHash};
 use vos_wire::result::Attest;
 use vos_wire::{SpaceId, WindowClock};
 
+use vos_wire::defaults::READ_WINDOWS;
+
 use crate::job::{
-    Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, State, deadline,
+    Job, MAX_ATTEMPTS, MAX_RESUBMITS, REFUSED_KERNEL, REFUSED_RERUN, REFUSED_ROOTLESS,
+    REFUSED_UNWITNESSED, State, deadline,
 };
 
 /// The longest wait before a statement not accepted goes again: the
@@ -29,40 +34,53 @@ pub trait Host {
     /// Whether this node leads `agent` now: only its leader proves its
     /// records and submits their statements.
     fn leads(&self, agent: AgentId) -> bool;
-    /// The agents this node replicates: every replica reads its log into
-    /// jobs, so a new leader holds them already.
+    /// The agents this node replicates: every replica reads their records
+    /// into jobs, so a new leader holds them already.
     fn agents(&self) -> Vec<AgentId>;
-    /// The last index of `agent`'s log this replica applied.
-    fn applied(&self, agent: AgentId) -> u64;
-    /// The last index compacted out of `agent`'s log: 0 for none.
-    fn log_start(&self, agent: AgentId) -> Result<u64, String>;
-    /// The attests the work result at `index` of `agent`'s log recorded:
-    /// none for another kind of entry; `None` when the log no longer holds
-    /// the entry.
-    fn attests(&self, agent: AgentId, index: u64) -> Result<Option<Vec<Attest>>, String>;
-    /// A program's blob, by its hash: a kernel an attest names.
-    fn program(&self, hash: &ProgramHash) -> Option<Vec<u8>>;
+    /// The records of `agent`'s attests at the cuts of window `from` and
+    /// later (`vos_wire::keys::attested`), as this replica applied them, in
+    /// window order.
+    fn attested(&self, agent: AgentId, from: u64) -> Result<Vec<Record>, String>;
+    /// A program's blob, by its hash: a kernel an attest names. When this
+    /// node does not hold it, `agent`'s other replicas are asked for it.
+    fn program(&self, agent: AgentId, hash: &ProgramHash) -> Option<Vec<u8>>;
     /// The proof `agent` holds recorded for statement `id` of window
     /// `window`'s cut (`vos_wire::keys::proven`), as this replica applied
     /// it.
     fn proven(&self, agent: AgentId, window: u64, id: &StatementId) -> Option<[u8; 32]>;
     /// Keep a final proof: its BLAKE2b-256.
     fn keep(&self, proof: &[u8]) -> Result<[u8; 32], String>;
-    /// Keep the proof `hash` whatever its age (`held`), or no longer: a
-    /// statement's proof is held from its proof until its job finishes.
+    /// Keep the blob `hash` whatever its age (`held`), or no longer: a
+    /// statement's proof from its proof until its job finishes, and each
+    /// unfinished job's kernel.
     fn hold(&self, hash: &[u8; 32], held: bool);
+    /// The blobs this node holds whatever their age, as [`Host::hold`]
+    /// holds them.
+    fn held(&self) -> Vec<[u8; 32]>;
     /// The proof `hash`, if this node holds it; when not, `agent`'s other
     /// replicas are asked for it.
     fn proof(&self, agent: AgentId, hash: &[u8; 32]) -> Option<Vec<u8>>;
     /// Have `agent`'s leader record statement `id` of window `window`'s cut
-    /// proved by `proof` (`vos_wire::batch::Input::Proven`).
-    fn record(&self, agent: AgentId, window: u64, id: StatementId, proof: [u8; 32]);
+    /// proved by `proof`, of the record `attested`
+    /// (`vos_wire::batch::Input::Proven`).
+    fn record(
+        &self,
+        agent: AgentId,
+        window: u64,
+        id: StatementId,
+        proof: [u8; 32],
+        attested: [u8; 32],
+    );
     /// The space's clock, which numbers the windows its roots are of.
     fn clock(&self) -> WindowClock;
 }
 
-/// The worker's table, durable: each statement's job by id, and how far
-/// each agent's log has been read.
+/// The record of an attest at a window's cut: its window, its digest
+/// ([`Attest::digest`]) and the attest, its witness gone once its
+/// statement is recorded proved.
+pub type Record = (u64, [u8; 32], Attest);
+
+/// The worker's table, durable: each statement's job by id.
 pub trait Jobs {
     fn get(&self, agent: AgentId, id: &StatementId) -> Result<Option<Job>, String>;
     /// Write `job`, durably before it returns.
@@ -71,9 +89,11 @@ pub trait Jobs {
     fn remove(&self, agent: AgentId, id: &StatementId) -> Result<(), String>;
     /// Every job.
     fn all(&self) -> Result<Vec<(StatementId, Job)>, String>;
-    /// The last index of `agent`'s log read into jobs: 0 for none.
-    fn watermark(&self, agent: AgentId) -> Result<u64, String>;
-    fn set_watermark(&self, agent: AgentId, index: u64) -> Result<(), String>;
+    /// Whether the node was stopping when it last ran: a proof it ended
+    /// then was ended by its operator, not by its kernel.
+    fn stopping(&self) -> Result<bool, String>;
+    /// Mark the node stopping, or (`false`) running, durably.
+    fn set_stopping(&self, stopping: bool) -> Result<(), String>;
 }
 
 /// Why a statement is not proved.
@@ -135,8 +155,6 @@ pub struct Backlog {
     pub accepted: usize,
     pub refused: usize,
     pub dead: usize,
-    /// Records the log no longer held when read: never proved here.
-    pub lost: u64,
     /// The earliest window a queued job's statement reads, if any.
     pub oldest: Option<u64>,
 }
@@ -184,24 +202,41 @@ pub struct Worker<H, J> {
     prover: Arc<dyn Prover>,
     venue: Arc<dyn VenueClient>,
     options: Options,
-    /// Each kernel's program id, by its blob's hash.
+    /// Each kernel's program id, by its blob's hash, once computed.
     programs: HashMap<ProgramHash, ProgramId>,
-    /// When each proof another replica made was first asked for.
-    asked: HashMap<StatementId, Instant>,
-    /// The statements whose proof another replica made never arrived:
-    /// proved here.
-    unfetched: std::collections::HashSet<StatementId>,
+    /// The kernels asked of the replicas, not here when a record named
+    /// them: alerted once each.
+    fetching: HashSet<ProgramHash>,
+    /// The kernels held for the unfinished jobs.
+    kernels: BTreeSet<ProgramHash>,
+    /// Each agent's earliest window a record not yet read into a job may
+    /// be of: the window of the reads still served, or of a record whose
+    /// kernel was not here.
+    from: HashMap<AgentId, u64>,
+    /// The proofs another replica made, asked for or never arrived.
+    fetches: HashMap<StatementId, Fetch>,
     /// When each submission whose answer was lost, or that was refused for
-    /// now, goes again, the wait after that, and how often it went again.
-    retries: HashMap<StatementId, (Instant, Duration, u32)>,
+    /// now, goes again, and the wait after that.
+    retries: HashMap<StatementId, (Instant, Duration)>,
     /// The longest proof timed.
     longest: Duration,
-    lost: u64,
+}
+
+/// A proof another replica made, as this node fetches it.
+#[derive(Clone, Copy)]
+enum Fetch {
+    /// Asked for since then.
+    Asked(Instant),
+    /// Never arrived: proved here.
+    Lost,
 }
 
 impl<H: Host, J: Jobs> Worker<H, J> {
     /// A worker over `jobs`: a job a stopped worker was proving goes back
-    /// to the queue, to be proved again.
+    /// to the queue, to be proved again, the attempt not counted when the
+    /// node was stopping then. Of the blobs the node holds, those no job
+    /// wants any more (a crash between a job's end and the next step) are
+    /// held no longer.
     pub fn open(
         host: H,
         jobs: J,
@@ -209,18 +244,39 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         venue: Arc<dyn VenueClient>,
         options: Options,
     ) -> Result<Self, String> {
+        let stopping = jobs.stopping()?;
+        let mut wanted = HashSet::new();
         for (id, job) in jobs.all()? {
+            if let Some(proof) = job.state.proof() {
+                wanted.insert(proof);
+            }
+            if let Some(attest) = job.attest.as_ref().filter(|_| !job.state.finished()) {
+                wanted.insert(attest.program.0);
+            }
             match job.state {
-                State::Proving => jobs.put(&id, &job.to(State::Queued))?,
+                State::Proving => {
+                    let attempts = job.attempts.saturating_sub(u32::from(stopping));
+                    let job = Job {
+                        attempts,
+                        ..job.to(State::Queued)
+                    };
+                    jobs.put(&id, &job)?;
+                }
                 State::Proved { proof } | State::Submitted { proof } => {
                     host.hold(&proof, true);
                     if host.proven(job.agent, job.window, &id).is_none() {
-                        host.record(job.agent, job.window, id, proof);
+                        host.record(job.agent, job.window, id, proof, job.attested);
                     }
                 }
                 _ => {}
             }
         }
+        for held in host.held() {
+            if !wanted.contains(&held) {
+                host.hold(&held, false);
+            }
+        }
+        jobs.set_stopping(false)?;
         Ok(Self {
             host,
             jobs,
@@ -228,11 +284,12 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             venue,
             options,
             programs: HashMap::new(),
-            asked: HashMap::new(),
-            unfetched: Default::default(),
+            fetching: HashSet::new(),
+            kernels: BTreeSet::new(),
+            from: HashMap::new(),
+            fetches: HashMap::new(),
             retries: HashMap::new(),
             longest: Duration::ZERO,
-            lost: 0,
         })
     }
 
@@ -246,32 +303,33 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         &self.jobs
     }
 
-    /// One step: every replicated agent's new records read into jobs,
-    /// through its applied index, the led agents' proved statements whose
-    /// roots are anchored submitted, then one statement proved, the one
-    /// whose anchor ages first.
+    /// One step: every replicated agent's new records read into jobs, the
+    /// unfinished jobs' kernels held, the led agents' proved statements
+    /// whose roots are anchored submitted, then one statement proved, the
+    /// one whose anchor ages first of those whose kernel is here.
     pub fn step(&mut self) -> Result<Stepped, String> {
         let mut stepped = Stepped::default();
         for agent in self.host.agents() {
             stepped.read += self.scan(agent)?;
         }
         let jobs = self.follow(self.jobs.all()?)?;
+        self.hold_kernels(&jobs);
         stepped.submitted = self.submit(&jobs)?;
-        if let Some((id, job)) = self.next(&jobs)
-            && self.prove(id, job)?
-        {
-            stepped.proved = true;
-            stepped.more = self.next(&self.jobs.all()?).is_some();
+        let mut tried = HashSet::new();
+        while let Some((id, job)) = self.next(&jobs, &tried) {
+            tried.insert(id);
+            if self.prove(id, job)? {
+                stepped.proved = true;
+                stepped.more = self.next(&self.jobs.all()?, &HashSet::new()).is_some();
+                break;
+            }
         }
         Ok(stepped)
     }
 
     /// The jobs counted by state.
     pub fn backlog(&self) -> Result<Backlog, String> {
-        let mut backlog = Backlog {
-            lost: self.lost,
-            ..Backlog::default()
-        };
+        let mut backlog = Backlog::default();
         for (_, job) in self.jobs.all()? {
             match job.state {
                 State::Queued => {
@@ -293,98 +351,100 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         Ok(backlog)
     }
 
-    /// Remove the finished jobs whose roots no venue anchors any more:
-    /// their records are read past, and their statements can be judged
-    /// nowhere. A rootless statement, judged at no deadline, has its
-    /// finished job removed once its record is read past and compacted out
-    /// of its agent's log: no read of the log can make the job again.
+    /// Age out the jobs whose roots no venue anchors any more: a finished
+    /// one removed, an unfinished one dead, its proof held no longer. The
+    /// jobs of an agent this node does not replicate now age out alike: an
+    /// agent absent for a while only, as across a placement change, finds
+    /// its jobs as it left them, none proved twice.
     pub fn prune(&mut self) -> Result<usize, String> {
         let now = self.venue.time();
         let clock = self.host.clock();
+        let agents: HashSet<AgentId> = self.host.agents().into_iter().collect();
         let mut removed = 0;
         for (id, job) in self.jobs.all()? {
-            let Some(statement) = job.statement() else {
-                continue;
-            };
-            if statement.roots.is_empty() {
-                if job.state.finished() && self.read_past(&job)? {
-                    self.jobs.remove(job.agent, &id)?;
-                    removed += 1;
+            let aged = job
+                .deadline(&clock)
+                .zip(now)
+                .is_some_and(|(deadline, now)| now > deadline);
+            if aged && job.state.finished() {
+                if let Some(proof) = job.state.proof() {
+                    self.host.hold(&proof, false);
                 }
-                continue;
-            }
-            let aged = now
-                .zip(deadline(&statement, &clock))
-                .is_some_and(|(now, deadline)| now > deadline);
-            if job.state.finished() && aged {
                 self.jobs.remove(job.agent, &id)?;
                 removed += 1;
-            } else if aged && let Some(proof) = job.state.proof() {
-                self.host.hold(&proof, false);
+            } else if aged {
+                if let Some(proof) = job.state.proof() {
+                    self.host.hold(&proof, false);
+                }
                 self.jobs.put(&id, &job.to(State::Dead))?;
             }
         }
+        self.from.retain(|agent, _| agents.contains(agent));
         Ok(removed)
     }
 
-    /// Whether `job`'s record is behind its agent's watermark and compacted
-    /// out of its log.
-    fn read_past(&self, job: &Job) -> Result<bool, String> {
-        Ok(self.jobs.watermark(job.agent)? >= job.index
-            && self.host.log_start(job.agent)? >= job.index)
-    }
-
-    /// Read `agent`'s records past its watermark, through its applied
-    /// index, into jobs: the new jobs.
+    /// Read `agent`'s records into jobs, from the earliest window one not
+    /// yet read may be of: the new jobs. A record already a job (by its
+    /// statement's id) makes none; one whose kernel is not here is read
+    /// again later; a rootless one, which no venue takes, makes a refused
+    /// job. A new record is of a window at most [`READ_WINDOWS`] before the
+    /// latest, the windows of the reads still served.
     fn scan(&mut self, agent: AgentId) -> Result<usize, String> {
-        let applied = self.host.applied(agent);
-        let from = self.jobs.watermark(agent)?;
+        let from = self.from.get(&agent).copied().unwrap_or(0);
+        let mut latest = None;
+        let mut waiting: Option<u64> = None;
         let mut made = 0;
-        let mut through = from;
-        for index in from + 1..=applied {
-            let Some(attests) = self.host.attests(agent, index)? else {
-                self.lost += 1;
-                through = index;
+        for (window, digest, attest) in self.host.attested(agent, from)? {
+            latest = Some(window);
+            let Some(statement) = self.statement(agent, &attest)? else {
+                waiting = Some(waiting.map_or(window, |earliest| earliest.min(window)));
                 continue;
             };
-            for attest in attests.into_iter().filter(|attest| attest.window.is_some()) {
-                let Some(statement) = self.statement(&attest)? else {
-                    // Its kernel's blob is not here yet: read again later.
-                    self.jobs.set_watermark(agent, through)?;
-                    return Ok(made);
-                };
-                let id = statement.id();
-                if self.jobs.get(agent, &id)?.is_some() {
-                    continue;
-                }
-                let window = attest.window.unwrap_or(0);
-                let state = match self.host.proven(agent, window, &id) {
-                    Some(proof) => State::Proved { proof },
-                    None => State::Queued,
-                };
-                self.jobs
-                    .put(&id, &Job::new(agent, index, attest, &statement, state))?;
-                made += 1;
+            let id = statement.id();
+            if self.jobs.get(agent, &id)?.is_some() {
+                continue;
             }
-            through = index;
+            let state = match (
+                attest.roots.is_empty(),
+                self.host.proven(agent, window, &id),
+            ) {
+                (true, _) => {
+                    tracing::warn!(agent = agent.0, "a record at a cut states no root: refused");
+                    State::Refused(REFUSED_ROOTLESS)
+                }
+                (false, Some(proof)) => State::Proved { proof },
+                (false, None) => State::Queued,
+            };
+            let job = Job::new(agent, digest, attest, &statement, state);
+            self.jobs.put(&id, &job)?;
+            made += 1;
         }
-        if through != from {
-            self.jobs.set_watermark(agent, through)?;
+        if let Some(latest) = latest {
+            let next = latest.saturating_sub(READ_WINDOWS);
+            let next = waiting.map_or(next, |waiting| waiting.min(next));
+            self.from.insert(agent, next.max(from));
         }
         Ok(made)
     }
 
     /// The statement `attest` makes: `None` while its kernel's blob is not
-    /// here, or its program could not be computed for now; a kernel the
-    /// prover cannot read makes a statement of no program, which the
-    /// prover then refuses.
-    fn statement(&mut self, attest: &Attest) -> Result<Option<Statement>, String> {
+    /// here (asked of the replicas, alerted once), or its program could not
+    /// be computed for now; a kernel the prover cannot read makes a
+    /// statement of no program, which the prover then refuses.
+    fn statement(&mut self, agent: AgentId, attest: &Attest) -> Result<Option<Statement>, String> {
         let program = match self.programs.get(&attest.program) {
             Some(program) => *program,
             None => {
-                let Some(blob) = self.host.program(&attest.program) else {
+                let Some(blob) = self.host.program(agent, &attest.program) else {
+                    if self.fetching.insert(attest.program) {
+                        tracing::warn!(
+                            agent = agent.0,
+                            "a record's kernel is not here: asked of the replicas, its record waiting"
+                        );
+                    }
                     return Ok(None);
                 };
+                self.fetching.remove(&attest.program);
                 let program = match self.prover.program(&blob) {
                     Ok(program) => program,
                     Err(ProveError::Kernel(_)) => ProgramId([u32::MAX; 8]),
@@ -395,6 +455,22 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             }
         };
         Ok(Some(statement(attest, program)))
+    }
+
+    /// Hold the kernel of each unfinished job, and no longer those of none.
+    fn hold_kernels(&mut self, jobs: &[(StatementId, Job)]) {
+        let wanted: BTreeSet<ProgramHash> = jobs
+            .iter()
+            .filter(|(_, job)| !job.state.finished())
+            .filter_map(|(_, job)| job.attest.as_ref().map(|attest| attest.program))
+            .collect();
+        for kernel in wanted.difference(&self.kernels) {
+            self.host.hold(&kernel.0, true);
+        }
+        for kernel in self.kernels.difference(&wanted) {
+            self.host.hold(&kernel.0, false);
+        }
+        self.kernels = wanted;
     }
 
     /// `jobs`, each queued job of an agent this node follows that its agent
@@ -418,19 +494,16 @@ impl<H: Host, J: Jobs> Worker<H, J> {
 
     /// Submit `id` again no sooner than a wait from now, twice the last
     /// one, [`Options::retry`] the first time, at most [`RETRY_MAX`]: the
-    /// wait, and how often it has gone again for an answer `counted`
-    /// towards [`MAX_RESUBMITS`], this time included if it is.
-    fn retry_later(&mut self, id: StatementId, counted: bool) -> (Duration, u32) {
-        let (wait, count) = self
+    /// wait.
+    fn retry_later(&mut self, id: StatementId) -> Duration {
+        let wait = self
             .retries
             .get(&id)
-            .map_or((self.options.retry, 0), |(_, wait, count)| {
-                (wait.saturating_mul(2).min(RETRY_MAX), *count)
+            .map_or(self.options.retry, |(_, wait)| {
+                wait.saturating_mul(2).min(RETRY_MAX)
             });
-        let count = count + u32::from(counted);
-        self.retries
-            .insert(id, (Instant::now() + wait, wait, count));
-        (wait, count)
+        self.retries.insert(id, (Instant::now() + wait, wait));
+        wait
     }
 
     /// Whether `statement`'s anchor passes `MaxRootAge` by the venue's time
@@ -444,16 +517,22 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             .is_some_and(|now| now.saturating_add(ahead.as_millis() as u64) > deadline)
     }
 
-    /// The queued job of a led agent to prove next: the one whose anchor
-    /// ages first, then the oldest record.
-    fn next(&self, jobs: &[(StatementId, Job)]) -> Option<(StatementId, Job)> {
+    /// The queued job of a led agent to prove next, of those not `tried`:
+    /// the one whose anchor ages first, then by agent and record.
+    fn next(
+        &self,
+        jobs: &[(StatementId, Job)],
+        tried: &HashSet<StatementId>,
+    ) -> Option<(StatementId, Job)> {
         jobs.iter()
-            .filter(|(_, job)| job.state == State::Queued && self.host.leads(job.agent))
+            .filter(|(id, job)| {
+                job.state == State::Queued && self.host.leads(job.agent) && !tried.contains(id)
+            })
             .min_by_key(|(_, job)| {
                 let deadline = job
                     .statement()
                     .and_then(|statement| deadline(&statement, &self.host.clock()));
-                (deadline.unwrap_or(u64::MAX), job.agent, job.index)
+                (deadline.unwrap_or(u64::MAX), job.agent, job.attested)
             })
             .cloned()
     }
@@ -461,13 +540,15 @@ impl<H: Host, J: Jobs> Worker<H, J> {
     /// Prove `job`: taken as proved when its agent records it proved by
     /// another replica; dead when its anchor would age past `MaxRootAge`
     /// before its proof ends; refused once [`MAX_ATTEMPTS`] proofs of it
-    /// began; else proved, its proof kept, held and recorded, or refused.
-    /// False when its kernel's blob is not here, or the prover failed: it
-    /// waits, queued.
+    /// began, or when its record kept no witness (recorded proved, its proof
+    /// never fetched); else proved, its proof kept, held and recorded, or
+    /// refused. False when its kernel's blob is not here, or the prover
+    /// failed: it waits, queued.
     fn prove(&mut self, id: StatementId, job: Job) -> Result<bool, String> {
         let agent = job.agent.0;
+        let lost = matches!(self.fetches.get(&id), Some(Fetch::Lost));
         if let Some(proof) = self.host.proven(job.agent, job.window, &id)
-            && !self.unfetched.contains(&id)
+            && !lost
         {
             self.jobs.put(&id, &job.to(State::Proved { proof }))?;
             return Ok(true);
@@ -495,7 +576,16 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 .put(&id, &job.to(State::Refused(REFUSED_KERNEL)))?;
             return Ok(true);
         }
-        let Some(kernel) = self.host.program(&attest.program) else {
+        if attest.witness_input.is_empty() {
+            tracing::error!(
+                agent,
+                "a statement recorded proved whose proof never arrived, its record without its witness: refused"
+            );
+            self.jobs
+                .put(&id, &job.to(State::Refused(REFUSED_UNWITNESSED)))?;
+            return Ok(true);
+        }
+        let Some(kernel) = self.host.program(job.agent, &attest.program) else {
             return Ok(false);
         };
         let mut job = job.to(State::Proving);
@@ -509,13 +599,15 @@ impl<H: Host, J: Jobs> Worker<H, J> {
         match proved {
             Ok(proof) => {
                 self.longest = self.longest.max(took);
-                self.unfetched.remove(&id);
+                self.fetches.remove(&id);
                 let proof = self.host.keep(&proof)?;
-                self.host.hold(&proof, true);
-                let (recorder, window) = (job.agent, job.window);
+                let (recorder, window, attested) = (job.agent, job.window, job.attested);
+                // Proved before held: a crash between the two leaves a job
+                // whose opening holds its proof.
                 self.jobs.put(&id, &job.to(State::Proved { proof }))?;
+                self.host.hold(&proof, true);
                 tracing::info!(agent, seconds = took.as_secs_f64(), "a statement proved");
-                self.host.record(recorder, window, id, proof);
+                self.host.record(recorder, window, id, proof, attested);
             }
             Err(ProveError::Rerun(_)) => {
                 tracing::error!(agent, "a record's re-run is not its statement: refused");
@@ -555,11 +647,11 @@ impl<H: Host, J: Jobs> Worker<H, J> {
     /// The proved jobs of the agents this node leads, in the order of
     /// their statements' earliest windows.
     fn submittable(&self, jobs: &[(StatementId, Job)]) -> Vec<(StatementId, Job)> {
-        let mut by_window: BTreeMap<(u64, AgentId, u64), (StatementId, Job)> = BTreeMap::new();
+        let mut by_window: BTreeMap<(u64, AgentId, [u8; 32]), (StatementId, Job)> = BTreeMap::new();
         for (id, job) in jobs {
             if job.state.proof().is_some() && self.host.leads(job.agent) {
                 let window = job.earliest_window().unwrap_or(0);
-                by_window.insert((window, job.agent, job.index), (*id, job.clone()));
+                by_window.insert((window, job.agent, job.attested), (*id, job.clone()));
             }
         }
         by_window.into_values().collect()
@@ -591,13 +683,14 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             }
             // Recorded in its agent first, so every replica knows it proved.
             if self.host.proven(job.agent, job.window, &id).is_none() {
-                self.host.record(job.agent, job.window, id, proof);
+                self.host
+                    .record(job.agent, job.window, id, proof, job.attested);
                 continue;
             }
             if self
                 .retries
                 .get(&id)
-                .is_some_and(|(at, ..)| Instant::now() < *at)
+                .is_some_and(|(at, _)| Instant::now() < *at)
             {
                 continue;
             }
@@ -605,11 +698,15 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 continue;
             }
             let Some(bytes) = self.host.proof(job.agent, &proof) else {
-                let asked = *self.asked.entry(id).or_insert_with(Instant::now);
-                if asked.elapsed() >= self.options.patience {
+                let fetch = *self
+                    .fetches
+                    .entry(id)
+                    .or_insert_with(|| Fetch::Asked(Instant::now()));
+                if let Fetch::Asked(asked) = fetch
+                    && asked.elapsed() >= self.options.patience
+                {
                     tracing::warn!(agent = job.agent.0, "a proof never arrived: proved here");
-                    self.asked.remove(&id);
-                    self.unfetched.insert(id);
+                    self.fetches.insert(id, Fetch::Lost);
                     let state = if job.attest.is_some() {
                         State::Queued
                     } else {
@@ -619,12 +716,13 @@ impl<H: Host, J: Jobs> Worker<H, J> {
                 }
                 continue;
             };
-            self.asked.remove(&id);
+            self.fetches.remove(&id);
             self.host.hold(&proof, true);
-            let job = job.to(State::Submitted { proof });
+            let mut job = job.to(State::Submitted { proof });
             self.jobs.put(&id, &job)?;
             handed += 1;
-            let Some(state) = self.judged(id, &job, &statement, &bytes) else {
+            let Some(state) = self.judged(id, &mut job, &statement, &bytes) else {
+                self.jobs.put(&id, &job)?;
                 continue;
             };
             self.retries.remove(&id);
@@ -635,13 +733,13 @@ impl<H: Host, J: Jobs> Worker<H, J> {
 
     /// The venue's outcome of `statement` with its proof's `bytes`, as
     /// `job`'s next state: none while it goes again later. A venue's
-    /// failure to judge it counts towards [`MAX_RESUBMITS`]; the rest that
-    /// go again (its anchor yet to land, the paying space's configuration
-    /// or funds, an answer lost) go until its anchor ages.
+    /// failure to judge it counts towards [`MAX_RESUBMITS`], in the job;
+    /// the rest that go again (its anchor yet to land, the paying space's
+    /// configuration or funds, an answer lost) go until its anchor ages.
     fn judged(
         &mut self,
         id: StatementId,
-        job: &Job,
+        job: &mut Job,
         statement: &Statement,
         bytes: &[u8],
     ) -> Option<State> {
@@ -657,16 +755,18 @@ impl<H: Host, J: Jobs> Worker<H, J> {
             }
             SubmitOutcome::Retry(code) => code,
         };
-        let unjudged = (vos_venue::UNJUDGED_FROM..vos_venue::UNJUDGED).contains(&code);
-        let (wait, count) = self.retry_later(id, unjudged);
-        if unjudged && count > MAX_RESUBMITS {
-            tracing::error!(
-                agent = job.agent.0,
-                code,
-                "a statement the venue failed to judge, every time: refused"
-            );
-            return Some(State::Refused(code));
+        if (vos_venue::UNJUDGED_FROM..vos_venue::UNJUDGED).contains(&code) {
+            job.resubmits += 1;
+            if job.resubmits > MAX_RESUBMITS {
+                tracing::error!(
+                    agent = job.agent.0,
+                    code,
+                    "a statement the venue failed to judge, every time: refused"
+                );
+                return Some(State::Refused(code));
+            }
         }
+        let wait = self.retry_later(id);
         tracing::warn!(
             agent = job.agent.0,
             code,

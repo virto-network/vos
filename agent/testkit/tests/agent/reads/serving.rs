@@ -6,7 +6,7 @@ use super::*;
 
 /// A workflow asks to read entries at the cut of its window: its step
 /// records the request, the rows by their full keys in order, and pauses
-/// awaiting it until `B_{w+3}`. Served, the kernel runs on the call's
+/// awaiting it until `B_{w+2}`. Served, the kernel runs on the call's
 /// arguments and the rows, the absent one proved absent, and its statement
 /// is recorded: the window, the witness input the arguments then the
 /// served rows, the reader and the `#[public]` keys as its public
@@ -312,7 +312,7 @@ fn an_ask_is_refused_at_once() {
     ));
 }
 
-/// A read no `Resume` serves by its deadline, `B_{w+3}`, ends
+/// A read no `Resume` serves by its deadline, `B_{w+2}`, ends
 /// `NotClosed` at the deadline's step, its request gone; a `Resume` past it
 /// resumes nothing.
 #[test]

@@ -262,13 +262,13 @@ impl Batch {
         }
     }
 
-    /// Write the last index of `agent`'s log the prover read into jobs.
-    pub fn prover_mark(&mut self, agent: AgentId, index: u64) {
-        self.batch.insert(
-            self.store.system(),
-            node_record(NodeRow::ProverMark, &agent.0.to_be_bytes()),
-            index.to_be_bytes(),
-        );
+    /// Mark the node stopping, for its prover's table, or running.
+    pub fn prover_stopping(&mut self, stopping: bool) {
+        let key = node_record(NodeRow::ProverStopping, &[]);
+        match stopping {
+            true => self.batch.insert(self.store.system(), key, []),
+            false => self.batch.remove(self.store.system(), key),
+        }
     }
 
     /// Write the node's `row` for the agent.

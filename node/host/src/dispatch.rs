@@ -217,6 +217,13 @@ impl Inner {
             PeerMessage::AnchorRowAnswer { agent, token, root } => {
                 self.on_answer(&self.anchor_rows, from, agent, token, (from, root))
             }
+            PeerMessage::Proved {
+                agent,
+                window,
+                id,
+                proof,
+                attested,
+            } => self.on_proved(from, agent, window, id, (proof, attested)),
             PeerMessage::Blob { .. } | PeerMessage::Directory { .. } => {
                 unreachable!("blobs and records are handled in tasks")
             }

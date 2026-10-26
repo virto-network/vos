@@ -150,6 +150,19 @@ pub enum PeerMessage {
         token: u64,
         root: Option<[u8; 32]>,
     },
+    /// A replica of `agent` that proved its statement `id` of window
+    /// `window`'s cut, the proof the blob `proof`, of the attest whose
+    /// record's digest is `attested`, no longer leading it: its leader
+    /// records it ([`crate::batch::Input::Proven`]), and fetches the proof
+    /// from the replicas when it submits.
+    #[codec(index = 18)]
+    Proved {
+        agent: AgentId,
+        window: u64,
+        id: [u8; 32],
+        proof: [u8; 32],
+        attested: [u8; 32],
+    },
 }
 
 /// What makes an agent the agent it is. Its hash is the agent's identity.

@@ -23,6 +23,42 @@ fn operator_commands_need_the_token() {
     );
 }
 
+/// The operator sets an agent to report every window and back, and a
+/// stranger cannot: the agent's state holds the opt-in while it is set.
+#[test]
+fn the_operator_sets_an_agent_to_report_every_window() {
+    let served = Served::plain();
+    let stranger = Operator::new(&served.target, &"00".repeat(32));
+    assert_eq!(
+        stranger.report_every_window(served.agent, true).unwrap(),
+        Response::Rejected(Rejection::Unauthorized)
+    );
+    let operator = Operator::new(&served.target, &served.token);
+    let set = || {
+        served
+            .node
+            .store()
+            .snapshot()
+            .get(served.agent, &keys::every_window())
+            .unwrap()
+            .is_some()
+    };
+    for every in [true, false] {
+        let answer = operator.report_every_window(served.agent, every).unwrap();
+        assert!(
+            matches!(
+                answer,
+                Response::Ran {
+                    outcome: Outcome::Done(_),
+                    ..
+                }
+            ),
+            "{answer:?}"
+        );
+        assert_eq!(set(), every);
+    }
+}
+
 /// A bearer token of 64 bytes that are not 64 hex digits, here multi-byte
 /// characters a pair of bytes would split, is refused like any wrong
 /// token, more often than the ingress holds connections: each connection's

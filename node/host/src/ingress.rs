@@ -194,7 +194,9 @@ impl Ingress {
             }
             (
                 "POST",
-                ["agents"] | ["representative"] | ["agents", _, "install" | "roles" | "replicas"],
+                ["agents"]
+                | ["representative"]
+                | ["agents", _, "install" | "roles" | "replicas" | "reports"],
             )
             | ("GET", ["agents", _, "status"] | ["stats"])
                 if !self.admitted(&request) =>
@@ -270,6 +272,14 @@ impl Ingress {
                 Ok((agent, grant)) => {
                     answer_of(self.inner.admin(agent, Admin::SetRole(grant)).await)
                 }
+                Err(answer) => answer,
+            }),
+            ("POST", ["agents", id, "reports"]) => respond(match agent_and(id, &request.body) {
+                Ok((agent, every)) => answer_of(
+                    self.inner
+                        .admin(agent, Admin::ReportEveryWindow(every))
+                        .await,
+                ),
                 Err(answer) => answer,
             }),
             _ => http::Response::not_found(),

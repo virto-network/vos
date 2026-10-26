@@ -95,8 +95,14 @@ fn main() {
     let mut rng = Random(0x2545_f491_4f6c_dd1d);
 
     // The map, loaded in results of 10,000 writes within window 0, then
-    // built.
-    agent.apply(&Entry::install(agent.time, SPACE));
+    // built, in an agent that cuts every window, so the result crossing
+    // `B_0` cuts though no read waits there.
+    let mut install = Entry::install(agent.time, SPACE);
+    install.writes.push(vos_wire::result::Write {
+        key: vos_wire::keys::every_window(),
+        value: Some(Vec::new()),
+    });
+    agent.apply(&install);
     let all: Vec<u64> = (0..keys).collect();
     for chunk in all.chunks(10_000) {
         let writes = chunk

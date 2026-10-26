@@ -189,7 +189,7 @@ impl Base {
 
     /// A row of applied state as stored, by agent-relative key; `None`
     /// when absent.
-    fn stored(&self, key: &[u8]) -> Option<Vec<u8>> {
+    pub(crate) fn stored(&self, key: &[u8]) -> Option<Vec<u8>> {
         match &self.source {
             Source::Node => state_read(key),
             Source::Witness(witnessed) => witnessed.read(key).map(<[u8]>::to_vec),

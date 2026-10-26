@@ -144,17 +144,17 @@ pub enum Input {
         served: Option<Vec<u8>>,
     },
     /// The agent's root at window `window`'s cut, `root`, for its space's
-    /// representative `to`, and whether reads wait on its close
-    /// (`pending`): refine sends it to the representative as a
+    /// representative `to`: refine sends it to the representative as a
     /// [`Body::Report`], once a window, after the latest window it reported
-    /// ([`crate::keys::reported`]).
-    /// The node puts it in a batch once its replica has built the cut.
+    /// ([`crate::keys::reported`]). The node puts it in a batch once its
+    /// replica has built the cut, which it records only for a window a
+    /// read waits on, or every window when the agent reports every one
+    /// ([`Admin::ReportEveryWindow`]).
     #[codec(index = 7)]
     Report {
         to: AgentId,
         window: u64,
         root: [u8; 32],
-        pending: bool,
     },
     /// The representative's close of window `window`: its root at its cut
     /// of the window, `rep_root`, and for each agent that asked, its row's
@@ -170,15 +170,19 @@ pub enum Input {
     },
     /// The statement `id` of one of the agent's attests at window
     /// `window`'s cut proved, its final proof the blob `proof` (its
-    /// BLAKE2b-256) in the prover's blob store: refine records it
-    /// ([`crate::keys::proven`]), the first proof of an id alone. The
-    /// prover, the agent's leader, puts it in a batch once the proof is
+    /// BLAKE2b-256) in the prover's blob store, the attest's record the one
+    /// whose digest is `attested` ([`crate::result::Attest::digest`]):
+    /// refine records it ([`crate::keys::proven`]), the first proof of an id
+    /// alone, and the node keeps that record without its witness
+    /// ([`crate::keys::attested`]).
+    /// The prover, the agent's leader, puts it in a batch once the proof is
     /// stored.
     #[codec(index = 9)]
     Proven {
         window: u64,
         id: [u8; 32],
         proof: [u8; 32],
+        attested: [u8; 32],
     },
 }
 
@@ -339,4 +343,12 @@ pub enum Admin {
     /// its roles, and `#[msg(role)]` refers to one by name.
     #[codec(index = 1)]
     SetRole(Grant),
+    /// Record the agent's cut, and report its root there, at every window
+    /// (`true`), as an issuer whose verifiers demand a recent root does, or
+    /// only at the windows a read waits on (`false`, the default)
+    /// ([`crate::keys::every_window`]). Set on the representative, it
+    /// anchors nothing of its own: a window is anchored for the reports of
+    /// other agents its cut holds.
+    #[codec(index = 2)]
+    ReportEveryWindow(bool),
 }

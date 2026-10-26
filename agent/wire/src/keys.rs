@@ -145,11 +145,14 @@ enum Row {
     Request = 0x1c,
     Reported = 0x1d,
     Closed = 0x1e,
-    Moved = 0x1f,
-    Serving = 0x20,
+    // 0x1f: reserved.
+    CutMark = 0x20,
     CloseMark = 0x21,
     Reports = 0x22,
     Proven = 0x23,
+    Reading = 0x24,
+    EveryWindow = 0x25,
+    Quarantined = 0x26,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -166,6 +169,7 @@ enum TreeRow {
     CutProof = 0x06,
     Closing = 0x07,
     Anchor = 0x08,
+    Attested = 0x09,
 }
 
 impl TreeRow {
@@ -435,9 +439,10 @@ pub fn built() -> Vec<u8> {
 
 /// The state version of the window `window`'s cut: the version before the
 /// first work result applied with a time at or past the window's boundary
-/// ([`crate::WindowClock::boundary`]). Apply writes it, for every window
-/// that result's time crosses, in an agent of a space; it is replicated,
-/// and never rewritten.
+/// ([`crate::WindowClock::boundary`]). Apply writes it, in an agent of a
+/// space, for the window a read waits on, or for every window that
+/// result's time crosses when the agent reports every one; it is
+/// replicated, and never rewritten.
 pub fn cut(window: u64) -> Vec<u8> {
     key(&[&Row::Cut.prefix(), &window.to_be_bytes()])
 }
@@ -532,9 +537,9 @@ pub fn cut_root_entry(key: &[u8]) -> Option<u64> {
     Some(u64::from_be_bytes(rest.try_into().ok()?))
 }
 
-/// A pending request's rows and their proof at window `window`'s cut,
-/// node-local, written in the commit that marks the cut built: one for the
-/// window it was asked in, and one for each window a re-cut moved it to.
+/// A pending request's rows and their proof at the cut of window `window`,
+/// the one it was asked in: node-local, written in the commit that marks
+/// the cut built.
 pub fn cut_proof(id: RequestId, window: u64) -> Vec<u8> {
     TreeRow::CutProof.key(
         &[
@@ -546,7 +551,7 @@ pub fn cut_proof(id: RequestId, window: u64) -> Vec<u8> {
     )
 }
 
-/// The prefix of the [`cut_proof`] rows of request `id`, in window order.
+/// The prefix of the [`cut_proof`] row of request `id`.
 pub fn cut_proofs_of(id: RequestId) -> Vec<u8> {
     TreeRow::CutProof.key(&[&id.workflow.0.to_be_bytes()[..], &id.awaits.to_be_bytes()].concat())
 }
@@ -594,20 +599,39 @@ pub fn closed_prefix() -> Vec<u8> {
     Row::Closed.prefix().to_vec()
 }
 
-/// The window whose cut serves the pending requests the window `window`'s
-/// cut served, once that window went unclosed: its requests' re-cut. Apply
-/// writes it with the next cut recorded after `window`'s, when the
-/// representative's `Closed` of `window` has not been applied by then
-/// ([`crate::apply`]). Replicated.
-pub fn moved(window: u64) -> Vec<u8> {
-    key(&[&Row::Moved.prefix(), &window.to_be_bytes()])
+/// The first and last of the windows the latest recording cut. Replicated,
+/// written by apply with the cuts: the rows of earlier windows lie no
+/// further back than `CUT_KEEP` before its first.
+pub fn cut_mark() -> Vec<u8> {
+    Row::CutMark.prefix().to_vec()
 }
 
-/// The window of the latest cut recorded whose requests it serves: the
-/// first of the windows the latest recording cut. Replicated, written by
-/// apply with the cuts.
-pub fn serving() -> Vec<u8> {
-    Row::Serving.prefix().to_vec()
+/// The latest window a read waits on: one asked in it at a cut
+/// ([`crate::abi::Op::AttestAt`]), or, at the space's representative, an
+/// agent's report of it. Replicated, written by those steps; apply records
+/// the cut of the window the agent's batch-time mark lies in only when it
+/// is this one or an earlier ([`crate::apply`]).
+pub fn reading() -> Vec<u8> {
+    Row::Reading.prefix().to_vec()
+}
+
+/// A row of a window's close that did not decode, moved aside by the step
+/// that read it, under its own key: its bytes, the decoded value's when it
+/// was stored whole, else as stored. Replicated; the step goes on as if the
+/// row were absent, and the node alerts.
+pub fn quarantined(row: &[u8]) -> Vec<u8> {
+    key(&[&Row::Quarantined.prefix(), row])
+}
+
+/// The prefix of every [`quarantined`] row.
+pub fn quarantined_prefix() -> Vec<u8> {
+    Row::Quarantined.prefix().to_vec()
+}
+
+/// Present when the agent records its cut, and reports its root there, at
+/// every window ([`crate::batch::Admin::ReportEveryWindow`]). Replicated.
+pub fn every_window() -> Vec<u8> {
+    Row::EveryWindow.prefix().to_vec()
 }
 
 /// The representative's mark of the closes it has sent
@@ -638,8 +662,9 @@ pub fn proven(window: u64, id: &[u8; 32]) -> Vec<u8> {
 }
 
 /// The representative's close of the window `window`, node-local, written
-/// by the commit that finishes its cut's build: its root there, and the
-/// path of each agent that asked for one ([`crate::served::Closing`]).
+/// by the commit that finishes its cut's build when some agent's row
+/// reaches it: its root there, and the path of each agent that reported
+/// the window ([`crate::served::Closing`]).
 pub fn closing(window: u64) -> Vec<u8> {
     TreeRow::Closing.key(&window.to_be_bytes())
 }
@@ -657,9 +682,10 @@ pub fn closing_entry(key: &[u8]) -> Option<u64> {
 
 /// The space's root `S_w` of the window `window`, as the representative's
 /// close of it makes it: node-local, written by the commit that finishes
-/// the representative's cut build of the window, the same bytes on every
-/// replica, the cut fixed by the committed log. Kept for `MaxRootAge`; its
-/// leader signs only these.
+/// the representative's cut build of the window when some agent reported
+/// it, the same bytes on every replica, the cut fixed by the committed
+/// log. Kept for `MaxRootAge`; its leader signs only these, so a window no
+/// one reported is not anchored.
 pub fn anchor(window: u64) -> Vec<u8> {
     TreeRow::Anchor.key(&window.to_be_bytes())
 }
@@ -673,6 +699,36 @@ pub fn anchors() -> Vec<u8> {
 pub fn anchor_entry(key: &[u8]) -> Option<u64> {
     let rest = key.strip_prefix(&TreeRow::Anchor.prefix())?;
     Some(u64::from_be_bytes(rest.try_into().ok()?))
+}
+
+/// The record of an attest at window `window`'s cut
+/// ([`crate::result::Attest`]), by its digest
+/// ([`crate::result::Attest::digest`]): node-local, written by the node's
+/// apply of the work result that made it, kept without its witness once
+/// the statement's `Proven` applies, and dropped once the window's roots
+/// age past `MaxRootAge`; the same rows on every replica, so a replica that
+/// installs a snapshot holds them. The prover reads its jobs from these.
+pub fn attested(window: u64, digest: &[u8; 32]) -> Vec<u8> {
+    TreeRow::Attested.key(&[&window.to_be_bytes()[..], digest].concat())
+}
+
+/// The key the [`attested`] rows of window `window` and later follow, in
+/// window order.
+pub fn attested_from(window: u64) -> Vec<u8> {
+    TreeRow::Attested.key(&window.to_be_bytes())
+}
+
+/// The prefix of every [`attested`] row.
+pub fn attested_prefix() -> Vec<u8> {
+    TreeRow::Attested.prefix().to_vec()
+}
+
+/// The window and digest an [`attested`] key names; `None` for any other
+/// key.
+pub fn attested_entry(key: &[u8]) -> Option<(u64, [u8; 32])> {
+    let rest = key.strip_prefix(&TreeRow::Attested.prefix())?;
+    let (window, digest) = rest.split_first_chunk::<8>()?;
+    Some((u64::from_be_bytes(*window), digest.try_into().ok()?))
 }
 
 /// The window a [`closed`] key names; `None` for any other key.

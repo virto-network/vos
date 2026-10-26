@@ -1,4 +1,4 @@
-//! Operator commands: installs and roles.
+//! Operator commands: installs, roles and reporting every window.
 
 use alloc::vec::Vec;
 
@@ -17,8 +17,9 @@ use crate::machines::{self, Machine};
 /// Where a program's schema starts: the read-only zone.
 const SCHEMA_AT: u64 = 1 << 16;
 
-/// An operator command: install a package or set a role. Its writes are
-/// under the step write cap like any step's.
+/// An operator command: install a package, set a role, or have the agent
+/// report every window. Its writes are under the step write cap like any
+/// step's.
 pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
     let failed = |outcome| Step::Ran(consumed(InputRef::Admin, outcome));
     let (writes, reply) = match admin {
@@ -72,6 +73,13 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
             let write = Write {
                 key: keys::member(&grant.principal),
                 value: grant.role.map(|role| alloc::vec![role]),
+            };
+            (alloc::vec![write], Vec::new())
+        }
+        Admin::ReportEveryWindow(every) => {
+            let write = Write {
+                key: keys::every_window(),
+                value: every.then(Vec::new),
             };
             (alloc::vec![write], Vec::new())
         }

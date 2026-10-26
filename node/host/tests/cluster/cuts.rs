@@ -1,6 +1,6 @@
 //! Window cuts on replicated agents: the leader's `Cut` marker for an idle
-//! agent, timed at its own clock; a fast clock's jump cutting several
-//! windows at one version; and reads at a cut, the reader's workflows'
+//! agent a read waits on, timed at its own clock, and none for one no read
+//! waits on; a fast clock's jump cutting several windows at one version; and reads at a cut, the reader's workflows'
 //! (`agent/test-actors/reader`): a replica down across a cut, and a leader
 //! change between a cut and its close, each finding every replica holding
 //! the cut's proofs; and a read served by its leader and stated.
@@ -29,24 +29,26 @@ use vos_wire::{Decode, Encode, WindowClock};
 use crate::common::{Cluster, compacting, log_start, wait_until};
 use crate::support::past_close;
 use crate::support::{
-    Anchoring, READER, ask, clock, cuts, reader_agent, rep_root, results, same_state, settled,
-    stored_applied, version, write,
+    Anchoring, READER, ask, ask_in, clock, cuts, later, reader_agent, rep_root, results,
+    same_state, settled, stored_applied, version, write,
 };
 
-/// The leader's `Cut` marker for an idle agent. While the leader's clock
-/// trails `B_0` it appends none, though every follower's clock is past it,
-/// and an input's result is timed at its clock, before `B_0`: no cut is
-/// recorded. Once its own clock passes `B_0` it appends one
-/// empty work result, timed at its clock (at or past `B_0`, never `B_0`
-/// itself when its clock is later), and every replica records `cut(0)` at
-/// the agent's version before it. No second marker comes in the same
-/// window.
+/// The leader's `Cut` marker for an idle agent a read waits on. While the
+/// leader's clock trails `B_0` it appends none, though every follower's
+/// clock is past it, and an input's result is timed at its clock, before
+/// `B_0`: no cut is recorded. Once its own clock passes `B_0` it appends
+/// one empty work result, timed at its clock (at or past `B_0`, never
+/// `B_0` itself when its clock is later), and every replica records
+/// `cut(0)` at the agent's version before it. No second marker comes in
+/// the same window.
 #[test]
 fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     let clock = clock();
     let b0 = clock.boundary(0).unwrap();
     let cluster = Cluster::in_space(3, Some(clock), |_, _| {});
     let agent = reader_agent(&cluster, &[1, 2, 3]);
+    write(&cluster, agent, 1..=20);
+    ask(&cluster, agent, 21);
     let leader = cluster.leader(agent);
     let node = cluster.node(leader);
     let applied = stored_applied(node, agent);
@@ -61,7 +63,7 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     );
     assert!(results(node, agent, applied).is_empty(), "nor appends");
     // An input: its result timed at the leader's clock, before `B_0`.
-    write(&cluster, agent, 1..=1);
+    write(&cluster, agent, 22..=22);
     let written = results(node, agent, applied);
     let [(_, result)] = &written[..] else {
         panic!("one result: {written:?}");
@@ -105,6 +107,36 @@ fn an_idle_agents_leader_appends_one_marker_at_its_own_clock() {
     );
 }
 
+/// An idle agent no read waits on is given no marker: its clocks pass
+/// `B_0` and `B_1`, its leader appends nothing, and no replica records a
+/// cut. Once one reads in window 2, the next boundary cuts that window
+/// alone.
+#[test]
+fn an_idle_agent_appends_no_marker() {
+    let clock = clock();
+    let cluster = Cluster::in_space(3, Some(clock), |_, _| {});
+    let agent = reader_agent(&cluster, &[1, 2, 3]);
+    write(&cluster, agent, 1..=20);
+    let leader = cluster.leader(agent);
+    let node = cluster.node(leader);
+    let applied = stored_applied(node, agent);
+    for window in 0..2 {
+        cluster.set_clocks(clock.boundary(window).unwrap() + 1_000);
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    assert!(results(node, agent, applied).is_empty(), "no marker");
+    for number in 1..=3 {
+        assert!(cuts(cluster.node(number), agent).is_empty(), "no cut");
+    }
+    ask_in(&cluster, agent, later(&cluster, agent), 1, 2);
+    cluster.set_clocks(clock.boundary(2).unwrap() + 1_000);
+    for number in 1..=3 {
+        wait_until("every replica cuts the read's window", || {
+            cuts(cluster.node(number), agent).keys().eq([&2])
+        });
+    }
+}
+
 /// An agent of no space, its nodes' space founded with no genesis, runs no
 /// cuts: its leader appends no marker as its clock passes a boundary of
 /// the default clock, and no replica records a cut.
@@ -135,15 +167,15 @@ fn an_agent_of_no_space_gets_no_marker() {
 }
 
 /// A leader's clock jumping Δ ahead, from window 0 into window 3, cuts
-/// windows 0 to 2 at one version, the agent's before the marker its clock
-/// times past them; every replica records the same. The clock stepping
-/// back cuts nothing more: batch time stands at the mark until real time
-/// passes it.
+/// windows 0 to 2 at one version of an agent reporting every window, the
+/// agent's before the marker its clock times past them; every replica
+/// records the same. The clock stepping back cuts nothing more: batch time
+/// stands at the mark until real time passes it.
 #[test]
 fn a_leaders_clock_jumping_ahead_cuts_every_window_it_passes_at_one_version() {
     let clock = clock();
     let cluster = Cluster::in_space(3, Some(clock), |_, _| {});
-    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let agent = cluster.issuer(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     let node = cluster.node(leader);
     let before = version(node, agent);
@@ -231,7 +263,7 @@ fn a_replica_down_across_a_cut_holds_its_proofs_on_return() {
 /// they stood at the cut, with their salts, under one proof against the
 /// root at the cut, the same bytes on every replica. Later writes rewrite
 /// those rows. Then the leader stops: the new leader's replica, and the
-/// third, still hold the proof unchanged, of window 0 (no re-cut), and the
+/// third, still hold the proof unchanged, of window 0, and the
 /// old leader's, restarted, holds it too.
 #[test]
 fn a_leader_change_between_a_cut_and_its_close_keeps_its_proofs() {

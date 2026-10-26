@@ -19,17 +19,18 @@
 //!
 //! The commit that finishes a cut's build writes the root at the cut,
 //! keeps it and the one before, drops the window's undo rows, and persists,
-//! for each pending request the cut serves ([`keys::request`], asked in the
-//! window or re-cut to it, [`keys::moved`]), its rows as they stood at the
-//! cut with their salts, under one proof against that root ([`CutProof`]):
+//! for each request pending at the cut ([`keys::request`], asked in the
+//! window), its rows as they stood at the cut with their salts, under one
+//! proof against that root ([`CutProof`]):
 //! the same bytes on every replica. The space's representative's also keeps
-//! its close of the window: its root, and the path of each agent that asked
-//! ([`keys::closing`]); the same bytes on every replica that builds the cut
-//! within a few windows, since the asks are a plain table read where the
-//! build starts, and pruned: a replica far behind omits paths only dead
-//! reads need. Its close writes the space's root of the window too
-//! ([`keys::anchor`]), the only root its leader signs, kept for
-//! `MaxRootAge`. An undo row an apply wrote racing that commit, of a
+//! its close of the window, once some agent reported it: its root, and the
+//! path of each agent that reported ([`keys::closing`]); the same bytes on
+//! every replica that builds the cut within a few windows, since the
+//! reports are a plain table read where the build starts, and pruned: a
+//! replica far behind omits paths only dead reads need. Its close writes
+//! the space's root of the window too ([`keys::anchor`]), the only root its
+//! leader signs, kept for `MaxRootAge`: a window no one reported is not
+//! anchored. An undo row an apply wrote racing that commit, of a
 //! window built, is garbage the next build deletes, as are a request's
 //! proof once it is answered and a close once sent.
 
@@ -37,12 +38,14 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use vos_tree::{BatchProof, Hash, NodeStore};
 use vos_wire::ids::{AgentId, RequestId};
-use vos_wire::keys::{self, Transform};
+use vos_wire::keys;
 use vos_wire::records::{PendingRead, unstored};
 use vos_wire::result::Write;
-use vos_wire::served::{ASKED_TAG, Closing, REPRESENTATIVE, representative_row};
+use vos_wire::served::{
+    Closing, representative_ask_entry, representative_asks_of, representative_row,
+};
 use vos_wire::vos_anchor::{MAX_ROOT_AGE_MS, RootKind, space_root};
-use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, scale};
+use vos_wire::{Decode, Encode, SpaceId, WindowClock, scale};
 
 use super::{AgentStore, Error, decoded, value_row};
 use crate::store::Snapshot;
@@ -136,15 +139,9 @@ pub(super) fn orphans(snapshot: &Snapshot, agent: AgentId) -> Result<Vec<Vec<u8>
     }
     for row in snapshot.scan(agent, &keys::cut_proofs(), None) {
         let (key, _) = row?;
-        // The request was asked at the proof's window, or re-cut there from
-        // the windows before it the agent keeps.
         let (id, window) =
             keys::cut_proof_entry(&key).ok_or(Error::Corrupt("a cut proof's key"))?;
-        let mut pending = false;
-        for asked in window.saturating_sub(defaults::CUT_KEEP)..=window {
-            pending |= snapshot.get(agent, &keys::request(asked, id))?.is_some();
-        }
-        if !pending {
+        if snapshot.get(agent, &keys::request(window, id))?.is_none() {
             orphans.push(key);
         }
     }
@@ -168,18 +165,15 @@ pub(super) fn orphans(snapshot: &Snapshot, agent: AgentId) -> Result<Vec<Vec<u8>
 }
 
 /// The node-local rows the node's apply deletes beside `writes`: the
-/// proofs of each pending request they delete, now answered, at the window
-/// it was asked in and each a re-cut may have moved it to.
+/// proof of each pending request they delete, now answered.
 pub fn answered(writes: &[Write]) -> Vec<Write> {
     writes
         .iter()
         .filter(|write| write.value.is_none())
         .filter_map(|write| keys::request_entry(&write.key))
-        .flat_map(|(asked, id)| {
-            (asked..=asked.saturating_add(defaults::CUT_KEEP)).map(move |window| Write {
-                key: keys::cut_proof(id, window),
-                value: None,
-            })
+        .map(|(window, id)| Write {
+            key: keys::cut_proof(id, window),
+            value: None,
         })
         .collect()
 }
@@ -237,32 +231,18 @@ pub fn cut_root(
     decoded(snapshot.get(agent, &keys::cut_root(window))?, "a cut root")
 }
 
-/// The rows and proof this replica persisted for `request` at the latest
-/// cut built of the windows that serve it.
+/// The rows and proof this replica persisted for `request` at the cut of
+/// the window it was asked in, once that cut is built.
 pub fn cut_proof(
     snapshot: &Snapshot,
     agent: AgentId,
     request: RequestId,
 ) -> Result<Option<CutProof>, Error> {
-    let latest = snapshot
+    let proof = snapshot
         .scan(agent, &keys::cut_proofs_of(request), None)
-        .last()
+        .next()
         .transpose()?;
-    decoded(latest.map(|(_, bytes)| bytes), "a cut proof")
-}
-
-/// The rows and proof this replica persisted for `request` at window
-/// `window`'s cut, once that cut is built.
-pub fn cut_proof_at(
-    snapshot: &Snapshot,
-    agent: AgentId,
-    request: RequestId,
-    window: u64,
-) -> Result<Option<CutProof>, Error> {
-    decoded(
-        snapshot.get(agent, &keys::cut_proof(request, window))?,
-        "a cut proof",
-    )
+    decoded(proof.map(|(_, bytes)| bytes), "a cut proof")
 }
 
 /// The stored bytes of the committed row `row` at `cut`, as `at` holds the
@@ -296,8 +276,8 @@ pub(super) struct Finish {
 impl Finish {
     /// The writes that finish the build: the root at the cut, the cut
     /// roots kept (this one and the latest before it), the window's undo
-    /// rows dropped, as `fresh` holds them, and the proof of each pending
-    /// request the cut serves ([`served_at`]), read off `tree`, the agent's
+    /// rows dropped, as `fresh` holds them, and the proof of each request
+    /// pending at the cut ([`requests_at`]), read off `tree`, the agent's
     /// tree at the cut, its values off `at`; the representative's, its
     /// close of the window too, and the space's root of the window, those
     /// of windows past `MaxRootAge` dropped.
@@ -325,7 +305,7 @@ impl Finish {
         for row in fresh.scan(agent, &keys::undos(cut.window), None) {
             writes.insert(row?.0, None);
         }
-        for (id, value) in served_at(at, agent, cut.window)? {
+        for (id, value) in requests_at(at, agent, cut.window)? {
             let read = unstored(&value).and_then(PendingRead::decode_exact);
             let Some(read) =
                 read.filter(|read| read.rows.iter().all(|row| keys::is_committed(row)))
@@ -355,10 +335,14 @@ impl Finish {
             }
         }
         if let Some((space, clock)) = representative {
-            let closing = closing(at, agent, cut.window, tree, root)?;
-            writes.insert(keys::closing(cut.window), Some(closing.encode()));
-            let space_root = space_root(&space, cut.window, &root);
-            writes.insert(keys::anchor(cut.window), Some(space_root.to_vec()));
+            let closing = closing(at, agent, cut, tree, root)?;
+            // A window no agent's row reaches closes nothing, and is not
+            // anchored.
+            if !closing.paths.is_empty() {
+                writes.insert(keys::closing(cut.window), Some(closing.encode()));
+                let space_root = space_root(&space, cut.window, &root);
+                writes.insert(keys::anchor(cut.window), Some(space_root.to_vec()));
+            }
             let kept = MAX_ROOT_AGE_MS.div_ceil(clock.length_ms.max(1));
             let first = keys::anchor(cut.window.saturating_sub(kept));
             for row in fresh.scan(agent, &keys::anchors(), None) {
@@ -373,87 +357,61 @@ impl Finish {
     }
 }
 
-/// The windows whose cuts may serve the reads asked in window `window`, as
-/// `snapshot` holds the agent's re-cuts ([`keys::moved`]): its own, then
-/// each a re-cut moved them to.
-pub fn serving_windows(
-    snapshot: &Snapshot,
-    agent: AgentId,
-    window: u64,
-) -> Result<Vec<u64>, Error> {
-    let mut failed = None;
-    let at = vos_wire::served::serving_windows(window, |window| {
-        match snapshot.get(agent, &keys::moved(window)) {
-            Ok(moved) => moved
-                .as_deref()
-                .and_then(unstored)
-                .and_then(u64::decode_exact),
-            Err(error) => {
-                failed = Some(error);
-                None
-            }
-        }
-    });
-    match failed {
-        Some(error) => Err(error.into()),
-        None => Ok(at),
-    }
-}
-
-/// The pending requests whose reads window `window`'s cut may serve, as
-/// `at` holds them: those asked in it, and those a re-cut moved to it, each
-/// its id and its row as stored. Whether a request was moved to `window` is
-/// fixed once `window`'s cut is recorded, whatever later re-cuts `at`
-/// holds. A key that does not read is skipped, and logged.
-pub fn served_at(
+/// The requests pending at window `window`'s cut, as `at` holds them, those
+/// asked in it: each its id and its row as stored. A key that does not
+/// read is skipped, and logged.
+pub fn requests_at(
     at: &Snapshot,
     agent: AgentId,
     window: u64,
 ) -> Result<Vec<(RequestId, Vec<u8>)>, Error> {
-    let mut served = Vec::new();
-    for asked in window.saturating_sub(defaults::CUT_KEEP)..=window {
-        if !serving_windows(at, agent, asked)?.contains(&window) {
+    let mut requests = Vec::new();
+    for row in at.scan(agent, &keys::requests(window), None) {
+        let (key, value) = row?;
+        let Some((_, id)) = keys::request_entry(&key) else {
+            tracing::warn!(
+                agent = agent.0,
+                "a pending request's key does not read; it is not proved"
+            );
             continue;
-        }
-        for row in at.scan(agent, &keys::requests(asked), None) {
-            let (key, value) = row?;
-            let Some((_, id)) = keys::request_entry(&key) else {
-                tracing::warn!(
-                    agent = agent.0,
-                    "a pending request's key does not read; it is not proved"
-                );
-                continue;
-            };
-            served.push((id, value));
-        }
+        };
+        requests.push((id, value));
     }
-    Ok(served)
+    Ok(requests)
 }
 
-/// The representative's close of window `window`: its root at its cut,
-/// `root`, and the path of each agent that asked whose row its tree at the
-/// cut holds, in agent order. An ask whose row the cut lacks, its report
-/// applied after the close, gets none: the agent's reads re-cut.
+/// The representative's close of `cut`: its root there, `root`, and the
+/// path of each agent that reported the window whose row its tree at the
+/// cut holds, in agent order. The reports are those the cut holds: the
+/// asks of the window whose rows stood at the cut, read off `at` and its
+/// undo rows, so a replica that builds the cut late finds the same. A
+/// report whose row the cut lacks, applied after the close, gets none: the
+/// agent's reads end `NotClosed`.
 fn closing(
     at: &Snapshot,
     agent: AgentId,
-    window: u64,
+    cut: Cut,
     tree: &AgentStore<'_>,
     root: Hash,
 ) -> Result<Closing, Error> {
-    let prefix = keys::table_rows(REPRESENTATIVE, ASKED_TAG, Transform::Ordered);
-    // The window's asks: its key escaped, without the terminator the whole
-    // key's escape ends with, is a prefix of each.
-    let mut escaped = Transform::Ordered.apply(&window.to_be_bytes());
-    escaped.truncate(escaped.len() - 2);
-    let mut paths = Vec::new();
-    for row in at.scan(agent, &[&prefix[..], &escaped].concat(), None) {
+    let prefix = representative_asks_of(cut.window);
+    let mut asks = BTreeSet::new();
+    for row in at.scan(agent, &prefix, None) {
+        asks.insert(row?.0);
+    }
+    let undone = keys::undo(cut.window, &prefix);
+    for row in at.scan(agent, &undone, None) {
         let (key, _) = row?;
-        let raw = Transform::Ordered.raw(&key[prefix.len()..]);
-        let Some((asked, of)) = raw.as_deref().and_then(asked_entry) else {
+        if let Some((_, row)) = keys::undo_entry(&key) {
+            asks.insert(row.to_vec());
+        }
+    }
+    let mut paths = Vec::new();
+    for ask in asks {
+        let Some((window, of)) = representative_ask_entry(&ask) else {
             continue;
         };
-        if asked != window {
+        if window != cut.window || at_cut(at, agent, cut, &ask)?.is_none() {
             continue;
         }
         let row = representative_row(of, RootKind::Space, window);
@@ -464,16 +422,6 @@ fn closing(
         paths.push((of, leaf.salt, path));
     }
     Ok(Closing { root, paths })
-}
-
-/// The window and agent an ask's raw key names: `w (8, BE) ‖ agent (4, BE)`.
-fn asked_entry(raw: &[u8]) -> Option<(u64, AgentId)> {
-    let (window, agent) = raw.split_first_chunk::<8>()?;
-    let agent: [u8; 4] = agent.try_into().ok()?;
-    Some((
-        u64::from_be_bytes(*window),
-        AgentId(u32::from_be_bytes(agent)),
-    ))
 }
 
 /// The space's roots the representative's closes made ([`keys::anchor`]),

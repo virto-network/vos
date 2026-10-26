@@ -21,7 +21,7 @@ use vos_wire::keys::{self, Transform};
 use vos_wire::peer::NodeNumber;
 use vos_wire::records::{PendingRead, Workflow, WorkflowState, unstored, unversioned};
 use vos_wire::result::{Attest, InputRef, Outcome, Step, WorkResult};
-use vos_wire::served::representative_row;
+use vos_wire::served::{representative_asks_of, representative_row};
 use vos_wire::vos_anchor::{MAX_LENGTH_MS, RootKind, RootRead, VenueId};
 use vos_wire::{Decode, Encode, WindowClock};
 
@@ -191,6 +191,17 @@ pub(crate) fn ask_keys(
     ask_in(cluster, agent, cluster.session(agent), sequence, 0)
 }
 
+/// A session opened at `agent`'s leader's time now: the clocks have moved
+/// past the cluster's session's expiry.
+pub(crate) fn later(cluster: &Cluster, agent: AgentId) -> Session {
+    let t0 = cluster.clock(cluster.leader(agent));
+    Session {
+        key: [1; 32],
+        name: t0.to_le_bytes().repeat(2).try_into().unwrap(),
+        t0,
+    }
+}
+
 /// [`ask_keys`] as request `sequence` of `session`, asked in window
 /// `window`.
 pub(crate) fn ask_in(
@@ -346,6 +357,37 @@ pub(crate) fn closed_on(node: &Node, representative: AgentId, window: u64) -> bo
         &keys::close_mark(),
     )
     .is_some_and(|(closed, _)| closed >= window)
+}
+
+/// Whether `representative`'s replica on `node` holds some agent's report
+/// of `window`.
+pub(crate) fn reported_on(node: &Node, representative: AgentId, window: u64) -> bool {
+    node.store()
+        .snapshot()
+        .scan(representative, &representative_asks_of(window), None)
+        .next()
+        .is_some()
+}
+
+/// Every clock set a second past window `window`'s boundary, before its
+/// close, by `set`; once every running replica of the space's
+/// representative holds some agent's report of the window, past its close.
+pub(crate) fn close_with(cluster: &Cluster, clock: &WindowClock, window: u64, set: impl Fn(u64)) {
+    set(clock.boundary(window).unwrap() + 1_000);
+    let representative = cluster
+        .running()
+        .find_map(|(_, node)| node.representative())
+        .expect("a representative");
+    wait_until(
+        &format!("the representative holds a report of window {window}"),
+        || {
+            cluster
+                .running()
+                .filter(|(_, node)| node.applied(representative).is_some())
+                .all(|(_, node)| reported_on(node, representative, window))
+        },
+    );
+    set(past_close(clock, window));
 }
 
 /// A second past window `window`'s close on `clock`, `B_w + D`.

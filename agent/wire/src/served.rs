@@ -60,9 +60,10 @@ pub const REPRESENTATIVE_ROOTS: &str = "roots";
 /// kernel's prologue hashes nothing for it.
 pub const REPRESENTATIVE_TAG: u32 = 0x4b14_a09e;
 
-/// The name of the representative's table of the agents that asked for
-/// their paths at a window's close, keyed `w (8, BE) ‖ agent (4, BE)`,
-/// ordered.
+/// The name of the representative's committed map of the agents that
+/// reported each window, so asked for their paths at its close, keyed
+/// `w (8, BE) ‖ agent (4, BE)`, ordered: an agent reports a window a read
+/// waits on, or every window when it reports every one.
 pub const REPRESENTATIVE_ASKED: &str = "asked";
 
 /// The tag [`REPRESENTATIVE_ASKED`] derives.
@@ -75,14 +76,14 @@ pub const ASKED_TAG: u32 = 0xf5ab_2cca;
 pub const REPORTS_KEPT: u64 = 2;
 
 /// An agent's report of its root at a window's cut, a [`crate::batch::Body::Report`]:
-/// the root's kind, the window, the root, and whether reads wait on the
-/// window's close. The reporting agent is the message's sender.
+/// the root's kind, the window and the root. The reporting agent is the
+/// message's sender, and its report asks for its path at the window's
+/// close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRoot {
     pub kind: u8,
     pub window: u64,
     pub root: [u8; 32],
-    pub pending: bool,
 }
 
 /// The representative's close of a window as an agent holds it
@@ -98,9 +99,10 @@ pub struct ClosedRow {
 
 /// The representative's close of a window as its node keeps it
 /// ([`keys::closing`]), once its cut's build is done: its root at the
-/// cut, and for each agent that asked and whose row the cut holds, in
-/// agent order, the row's salt and a `vos_tree::BatchProof`'s encoding of
-/// it against the root.
+/// cut, and for each agent that reported the window and whose row the cut
+/// holds, in agent order, the row's salt and a `vos_tree::BatchProof`'s
+/// encoding of it against the root. A window no agent's row reaches has
+/// none: nothing is anchored of it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Closing {
     pub root: [u8; 32],
@@ -112,24 +114,6 @@ pub struct Closing {
 pub fn representative(genesis: &crate::SpaceGenesis) -> Option<AgentId> {
     let (founder, _) = genesis.nodes.first()?;
     Some(crate::peer::CreationRecord::agent_id(*founder, 0))
-}
-
-/// The windows whose cuts may serve a read asked in window `window`, in
-/// order: its own, then each its re-cuts moved it to ([`keys::moved`]), as
-/// `moved` reads them. The last is the cut its pending read waits on; any
-/// whose close the agent holds serves it. At most
-/// [`crate::defaults::RECUTS`] moves are followed: a third is recorded only
-/// at or past the read's deadline.
-pub fn serving_windows(window: u64, mut moved: impl FnMut(u64) -> Option<u64>) -> Vec<u64> {
-    let mut windows = alloc::vec![window];
-    for _ in 0..crate::defaults::RECUTS {
-        let at = *windows.last().expect("one window");
-        match moved(at) {
-            Some(next) if next > at => windows.push(next),
-            _ => break,
-        }
-    }
-    windows
 }
 
 /// The representative's committed map of agents' roots at their cuts.
@@ -151,16 +135,46 @@ pub fn representative_row(agent: AgentId, kind: RootKind, window: u64) -> Vec<u8
     keys::committed(&representative_map(), &Transform::Ordered.apply(&raw))
 }
 
+/// The representative's committed map of the agents that reported each
+/// window ([`REPRESENTATIVE_ASKED`]): committed, so its rows at a window's
+/// cut are fixed however late a replica builds the cut.
+pub const fn representative_asks() -> MapId {
+    MapId {
+        instance: REPRESENTATIVE,
+        tag: ASKED_TAG,
+        transform: Transform::Ordered,
+    }
+}
+
 /// The full key of the representative's ask of `agent` at window `window`:
-/// a row of its table [`REPRESENTATIVE_ASKED`], keyed `w (8, BE) ‖ agent
-/// (4, BE)`, ordered, its value empty.
+/// a row of [`representative_asks`], keyed `w (8, BE) ‖ agent (4, BE)`,
+/// ordered, its value empty.
 pub fn representative_ask(window: u64, agent: AgentId) -> Vec<u8> {
     let mut raw = [0u8; 12];
     raw[..8].copy_from_slice(&window.to_be_bytes());
     raw[8..].copy_from_slice(&agent.0.to_be_bytes());
-    let mut key = keys::table_rows(REPRESENTATIVE, ASKED_TAG, Transform::Ordered);
-    key.extend_from_slice(&Transform::Ordered.apply(&raw));
-    key
+    keys::committed(&representative_asks(), &Transform::Ordered.apply(&raw))
+}
+
+/// The prefix of the representative's asks of window `window`: the
+/// window's key escaped, without the terminator the whole key's escape
+/// ends with.
+pub fn representative_asks_of(window: u64) -> Vec<u8> {
+    let mut escaped = Transform::Ordered.apply(&window.to_be_bytes());
+    escaped.truncate(escaped.len() - 2);
+    [keys::committed_rows(&representative_asks()), escaped].concat()
+}
+
+/// The window and agent an ask's full key names; `None` for any other key.
+pub fn representative_ask_entry(key: &[u8]) -> Option<(u64, AgentId)> {
+    let raw = Transform::Ordered
+        .raw(key.strip_prefix(&keys::committed_rows(&representative_asks())[..])?)?;
+    let (window, agent) = raw.split_first_chunk::<8>()?;
+    let agent: [u8; 4] = agent.try_into().ok()?;
+    Some((
+        u64::from_be_bytes(*window),
+        AgentId(u32::from_be_bytes(agent)),
+    ))
 }
 
 /// The space root of window `window` over the representative's root

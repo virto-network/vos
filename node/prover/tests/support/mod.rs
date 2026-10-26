@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use vos_node_prover::{Host, Jobs, Options, ProveError, Prover, State, Worker};
+use vos_node_prover::{Host, Jobs, Options, ProveError, Prover, Record, State, Worker};
 use vos_venue::vos_statement::{ProgramId, Refusal, Statement, StatementId};
 use vos_venue::{AnchorOutcome, Held, Status, SubmitOutcome, UNJUDGED, VenueClient};
 use vos_wire::ids::{AgentId, ProgramHash};
@@ -46,21 +46,30 @@ pub(crate) fn root(window: u64) -> RootRead {
     }
 }
 
-/// The agent as its replicas apply it: its log's attests by index, and
-/// the proofs it recorded.
+/// The agent as its replicas apply it: the records of its attests at a
+/// cut, by window and digest, and the proofs it recorded.
 #[derive(Default)]
 pub(crate) struct Agent {
-    pub(crate) log: Vec<Vec<Attest>>,
-    /// The log's entries through this index compacted away.
-    pub(crate) compacted: u64,
+    pub(crate) records: BTreeMap<(u64, [u8; 32]), Attest>,
     pub(crate) proven: BTreeMap<[u8; 32], [u8; 32]>,
+}
+
+impl Agent {
+    /// The records of a work result's attests, kept.
+    pub(crate) fn attests(&mut self, attests: Vec<Attest>) {
+        for attest in attests {
+            let window = attest.window.unwrap_or(0);
+            self.records.insert((window, attest.digest()), attest);
+        }
+    }
 }
 
 /// A node's blobs, by hash.
 pub(crate) type Blobs = Arc<Mutex<HashMap<[u8; 32], Vec<u8>>>>;
 
 /// A node: the agent it replicates, whether it leads it, its blobs, and
-/// its peers' blobs, which it asks for a proof it lacks.
+/// its peers' blobs, which it asks for a proof it lacks; and whether it
+/// holds the kernel's blob.
 #[derive(Clone)]
 pub(crate) struct Node {
     pub(crate) agent: Arc<Mutex<Agent>>,
@@ -69,8 +78,12 @@ pub(crate) struct Node {
     pub(crate) peers: Arc<Mutex<Vec<Blobs>>>,
     /// The proofs it asked its peers for, which arrive at the next ask.
     pub(crate) asked: Arc<Mutex<BTreeSet<[u8; 32]>>>,
-    /// The proofs it holds pinned.
+    /// The blobs it holds pinned: proofs and kernels.
     pub(crate) pins: Arc<Mutex<BTreeSet<[u8; 32]>>>,
+    /// Whether it lacks the kernel's blob.
+    pub(crate) no_kernel: Arc<AtomicBool>,
+    /// Whether it replicates the agent.
+    pub(crate) replicates: Arc<AtomicBool>,
 }
 
 impl Node {
@@ -82,6 +95,8 @@ impl Node {
             peers: Arc::default(),
             asked: Arc::default(),
             pins: Arc::default(),
+            no_kernel: Arc::default(),
+            replicates: Arc::new(AtomicBool::new(true)),
         }
     }
 
@@ -98,33 +113,41 @@ pub(crate) fn hash(bytes: &[u8]) -> [u8; 32] {
     ProgramHash::of(bytes).0
 }
 
+/// The proofs `node` holds pinned: its pins but the kernel's.
+pub(crate) fn proofs_held(node: &Node) -> usize {
+    let kernel = hash(KERNEL);
+    node.pins
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|pin| **pin != kernel)
+        .count()
+}
+
 impl Host for Node {
     fn leads(&self, _: AgentId) -> bool {
         self.leads.load(Ordering::SeqCst)
     }
 
     fn agents(&self) -> Vec<AgentId> {
-        vec![AGENT]
-    }
-
-    fn applied(&self, _: AgentId) -> u64 {
-        self.agent.lock().unwrap().log.len() as u64
-    }
-
-    fn log_start(&self, _: AgentId) -> Result<u64, String> {
-        Ok(self.agent.lock().unwrap().compacted)
-    }
-
-    fn attests(&self, _: AgentId, index: u64) -> Result<Option<Vec<Attest>>, String> {
-        let agent = self.agent.lock().unwrap();
-        if index <= agent.compacted {
-            return Ok(None);
+        match self.replicates.load(Ordering::SeqCst) {
+            true => vec![AGENT],
+            false => Vec::new(),
         }
-        Ok(agent.log.get(index as usize - 1).cloned())
     }
 
-    fn program(&self, hash: &ProgramHash) -> Option<Vec<u8>> {
-        (*hash == ProgramHash::of(KERNEL)).then(|| KERNEL.to_vec())
+    fn attested(&self, _: AgentId, from: u64) -> Result<Vec<Record>, String> {
+        let agent = self.agent.lock().unwrap();
+        Ok(agent
+            .records
+            .range((from, [0; 32])..)
+            .map(|((window, digest), attest)| (*window, *digest, attest.clone()))
+            .collect())
+    }
+
+    fn program(&self, _: AgentId, hash: &ProgramHash) -> Option<Vec<u8>> {
+        let here = !self.no_kernel.load(Ordering::SeqCst);
+        (here && *hash == ProgramHash::of(KERNEL)).then(|| KERNEL.to_vec())
     }
 
     fn proven(&self, _: AgentId, _: u64, id: &StatementId) -> Option<[u8; 32]> {
@@ -145,6 +168,10 @@ impl Host for Node {
         };
     }
 
+    fn held(&self) -> Vec<[u8; 32]> {
+        self.pins.lock().unwrap().iter().copied().collect()
+    }
+
     fn proof(&self, _: AgentId, key: &[u8; 32]) -> Option<Vec<u8>> {
         if let Some(bytes) = self.blobs.lock().unwrap().get(key) {
             return Some(bytes.clone());
@@ -163,14 +190,21 @@ impl Host for Node {
         None
     }
 
-    /// The leader's next batch records it: at once here.
-    fn record(&self, _: AgentId, _: u64, id: StatementId, proof: [u8; 32]) {
-        self.agent
-            .lock()
-            .unwrap()
-            .proven
-            .entry(id.0)
-            .or_insert(proof);
+    /// The leader's next batch records it, and keeps its record without
+    /// its witness: at once here.
+    fn record(
+        &self,
+        _: AgentId,
+        window: u64,
+        id: StatementId,
+        proof: [u8; 32],
+        attested: [u8; 32],
+    ) {
+        let mut agent = self.agent.lock().unwrap();
+        agent.proven.entry(id.0).or_insert(proof);
+        if let Some(record) = agent.records.get_mut(&(window, attested)) {
+            record.witness_input.clear();
+        }
     }
 
     fn clock(&self) -> WindowClock {
