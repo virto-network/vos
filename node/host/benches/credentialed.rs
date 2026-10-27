@@ -175,9 +175,10 @@ struct Reached {
 impl Reached {
     /// Transfers enough for `seconds` at `rate`, each proved by the
     /// payer's owner, round the agents, good until `LIFE_MS` past when
-    /// making them is expected to end, at the rate a first round of four
-    /// on every core makes them; returned at that moment by the node's
-    /// clock, or once made if later.
+    /// making them is expected to end: half again the time a first round of
+    /// four on every core gives, and 30 s, so a generator whose load
+    /// changes meanwhile still makes them in time. Returned at that moment
+    /// by the node's clock, or once made if later.
     fn calls(&self, rate: f64, seconds: f64) -> Vec<(AgentId, Credentialed)> {
         let round = 4 * rayon::current_num_threads();
         let started = Instant::now();
@@ -185,7 +186,7 @@ impl Reached {
         self.made(round, now + LIFE_MS);
         let per_second = round as f64 / started.elapsed().as_secs_f64();
         let count = (rate * seconds).ceil() as usize;
-        let expected = (count as f64 / per_second * 1.1 * 1e3) as u64 + 5_000;
+        let expected = (count as f64 / per_second * 1.5 * 1e3) as u64 + 30_000;
         let ready = client::time(&self.target).unwrap() + expected;
         let calls = self.made(count, ready + LIFE_MS);
         let now = client::time(&self.target).unwrap();
