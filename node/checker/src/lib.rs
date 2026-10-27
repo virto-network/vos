@@ -19,7 +19,9 @@
 //! [`spaces`], nodes in one process and free ports; [`carriers`], the
 //! carrier audit; [`crash`], the crash
 //! tests' rounds; [`processes`], node processes and the relay between
-//! them; [`rounds`], the workflows the checker starts and their reads.
+//! them; [`rounds`], the workflows the checker starts and their reads;
+//! [`watch`], the watch that turns a test's hung wait into a fast failure
+//! that says where it hung.
 
 pub mod calls;
 pub mod carriers;
@@ -30,6 +32,7 @@ mod model;
 pub mod processes;
 pub mod rounds;
 pub mod spaces;
+pub mod watch;
 
 pub use vos_testkit::programs;
 
@@ -66,8 +69,20 @@ impl Random {
     }
 }
 
-/// Whether `done` holds within `within`, checking every 5 ms.
-pub fn poll(within: Duration, mut done: impl FnMut() -> bool) -> bool {
+/// Whether `done` holds within `within`, checking every 5 ms, the wait
+/// [watched](watch) by where it was called from.
+#[track_caller]
+pub fn poll(within: Duration, done: impl FnMut() -> bool) -> bool {
+    polled(
+        &format!("a poll at {}", std::panic::Location::caller()),
+        within,
+        done,
+    )
+}
+
+/// [`poll`], the wait watched as one for `what`.
+fn polled(what: &str, within: Duration, mut done: impl FnMut() -> bool) -> bool {
+    let _watched = watch::waiting(what, within);
     let until = Instant::now() + within;
     loop {
         if done() {
@@ -83,7 +98,11 @@ pub fn poll(within: Duration, mut done: impl FnMut() -> bool) -> bool {
 /// Wait until `done`, checking every 5 ms, for at most `within`.
 #[track_caller]
 pub fn wait_until(what: &str, within: Duration, done: impl FnMut() -> bool) {
-    assert!(poll(within, done), "timed out: {what}");
+    let at = std::panic::Location::caller();
+    assert!(
+        polled(&format!("{what} at {at}"), within, done),
+        "timed out: {what}"
+    );
 }
 
 /// A value of `agent`'s applied state in `store`, decoded: `None` while

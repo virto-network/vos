@@ -109,7 +109,9 @@ pub fn install_at_leader<N: Deref<Target = Node>>(
     elf: &[u8],
 ) {
     // Past one try's whole deadline, for the next.
-    let until = Instant::now() + 2 * crate::spaces::IN_PROCESS_WAIT;
+    let within = 2 * crate::spaces::IN_PROCESS_WAIT;
+    let _watched = crate::watch::waiting(format!("an install at agent {}", agent.0), within);
+    let until = Instant::now() + within;
     loop {
         match smol::block_on(leader().install(agent, instance, elf, Vec::new())) {
             Err(CallError::NotLeader(_) | CallError::TimedOut) if Instant::now() < until => {

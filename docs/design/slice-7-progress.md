@@ -2481,3 +2481,63 @@ the no-std builds, the lints, the core crates and `test-recair`; in the
 agent crates only `prover::a_leader_change_submits_a_recorded_statement_once`
 failed (the known flake, being fixed apart), and the agent crates rerun
 with `--no-fail-fast` passed 627 of 627 in 43 suites, `test-reads` 7 of 7.
+
+### The cluster suite's hang: fjall's drop
+
+The hang 7.3 found (a test thread parked on a futex, its nodes' threads
+gone) is fjall's: `DatabaseInner::drop` in 3.1.12 sends `Close` to its
+workers with a blocking `send` on a queue of 1 000, every 10 µs, until its
+worker count reaches zero. On a loaded host the workers take the first
+few late, the queue fills, and once the last worker has taken its own
+and is leaving, the next `send` blocks for good: nothing takes from the
+queue again. Every store close can meet it; caught here in
+`vos_checker::spaces::node_key` (a node opened and shut down to learn its
+key) under `messages::messages_cross_overlapping_replica_sets`, the
+stack fjall's `db.rs:76` in `flume::Sender::send`. Upstream fixed it in
+3.1.13 (`f18624f`, a `try_send` that drains first), so the pin moves to
+`=3.1.13` (its crate checked equal to the tag; it also skips journal
+items already flushed on recovery, makes `remove_weak` weak, and moves
+`Openable`; none of which the store uses but the recovery fix).
+
+- **The watch** (`vos_checker::watch`): every `wait_until`, `poll` and
+  `install_at_leader`, in every suite, is registered with its bound; the
+  cluster harness also watches each node's start and stop, its calls,
+  `leader` and the cluster's whole life, by bounds each suite sets
+  (`BOUNDS`: the cluster suite 600 s a cluster, 60 s a start or stop,
+  and an idle bound of 300 s with no wait pending or moving; the chain
+  and carrier suites, whose proofs take minutes, 3 600 s and 1 800 s and
+  no idle bound). A wait past its bound plus 180 s of grace, or the idle
+  bound, writes every wait pending, the last each thread ended, each
+  thread's state and wchan and, where `gdb` can attach (the process sets
+  `PR_SET_PTRACER`), every thread's stack, then aborts; in the carrier
+  suite that goes to its capture file. `VOS_CHECKER_WATCH=off` turns it
+  off, for a test held in a debugger. It is what caught this one: the run
+  aborted at 780 s with the stack above instead of hanging. The cluster
+  now stops its nodes before its data directories go (they were removed
+  first; nothing was seen to fail from it).
+- **Tests:** the watch's own two, each the test binary run again alone:
+  a wait that never ends aborts naming it, and an idle process aborts
+  naming the last wait each thread ended (both hang without the watch,
+  failing at the parent's minute). No regression test for fjall's race:
+  it needs a worker preempted between taking its `Close` and leaving, and
+  a standalone loop of 540 store drops under CPU hogs, one CPU, or a
+  flush in flight at drop, never met it.
+- **Runs** [measured; two whole suites at once, load 40–90]: 58 suites on
+  3.1.12 under `gdb` without the watch, no hang (1 timing failure); 19
+  suites with the watch, one hang caught as above (and 1 timing failure);
+  40 runs of `snapshots::` and `replication::`, one failure of
+  `a_snapshot_stream_outlasting_the_leaders_deadline_goes_on` ("node 2
+  started 1 streams past the answered one"), a stream started again past
+  an answered one on a starved host, not a hang; left as it is. The two
+  timing failures were `liveness::a_restarted_follower_hears_its_quiet_leaders_at_once`
+  (10.02 s against 10 s) and
+  `liveness::quiet_groups_elect_again_when_their_leaders_node_stops`
+  (never quiet within 10 s), both at load near 80.
+- **Review (Opus):** folded: the cluster bounds made each suite's (the
+  chain and carrier suites share the harness, and their proofs take
+  minutes), the cluster's drop stops its nodes without holding their
+  ports (a second panic while unwinding), `VOS_CHECKER_WATCH=off` and
+  `nostacks` in place of an empty `PATH`, unnamed threads by id.
+- **Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs]: the watch's
+  tests, the chain and carrier suites built, the cluster suite twice
+  (116 of 116 each), then `just check` green.

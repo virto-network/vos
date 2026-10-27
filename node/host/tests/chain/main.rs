@@ -38,6 +38,14 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 #[allow(dead_code)]
 #[path = "../cluster/common.rs"]
 mod common;
+
+/// The harness's bounds: a statement's acceptance alone may take twenty
+/// minutes, and a node stopping waits for its masked proof under way.
+const BOUNDS: common::Bounds = common::Bounds {
+    lifetime: std::time::Duration::from_secs(3_600),
+    start_stop: std::time::Duration::from_secs(1_800),
+    idle: None,
+};
 #[allow(dead_code)]
 #[path = "../cluster/support.rs"]
 mod support;

@@ -9,6 +9,14 @@ static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod anchoring;
 mod common;
+
+/// The harness's bounds: the longest test takes about two minutes on a
+/// loaded host, and its nodes prove with the model prover.
+const BOUNDS: common::Bounds = common::Bounds {
+    lifetime: std::time::Duration::from_secs(600),
+    start_stop: std::time::Duration::from_secs(60),
+    idle: Some(std::time::Duration::from_secs(300)),
+};
 mod cuts;
 mod kreivo;
 mod large_results;
