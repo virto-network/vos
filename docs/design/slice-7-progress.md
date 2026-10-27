@@ -3710,3 +3710,89 @@ in the agent crates `vos-checker`'s
 beside it; untouched here) and passed 3 of 3 alone; the agent crates
 rerun with `--no-fail-fast`, 699 passed in 53 suites, and `test-reads`
 green. `just test-proof` green, 579 passed in 50 suites.
+
+## Step 7.8b: the agent-side items and `blobs.lock`
+
+Branch `s7/7.8b`, from vos-core `4a143e9f`: slice 6's carried items
+outside `pvm/proof`'s chips (the plan's split, `slice-7-mobile.md` §7.8b;
+the items `research/slice-6/quality-review.md`'s), in one commit with the
+review's fixes after it, and the lock of every guest blob (L2).
+
+| item | what |
+|---|---|
+| 3 | the service's `RegisterCode`, `AnchorCode` and `ControlCode` declared by one `codes!` macro, each with its `TryFrom<u32>` (the code back when it names none); jam-dev's `anchor_code` gone, `register_code` a `match` on the `TryFrom` |
+| 4, guest half | nothing left: 7.1's `vos_anchor::venue::{expiry, fresh, aged, seen_expiry}` are the root-expiry and `seen_expiry_of` the item asked for, and `check-venue-rules` keeps the rule there |
+| 17–19 | no `vos-anchor` or service piece: all three were recair's and the final verifier's, landed at 7.8a |
+| 20, the service's piece | `#[repr(u8)]` tags: the verdict's private `Tag` (its order is not `item::Kind`'s, now said where it is defined), the control's `OpTag`, the storage's `keys::Prefix` (`CURSOR` and `GAS` keys of it); the bytes unchanged |
+| 21 | `codec::{flag, option_u64}` and `Reader::{flag, option_u64}` in `vos-anchor`, used by the service's `SpaceRecord`; `ProgramId::decode_from` public in `vos-statement` (its `decode_program` gone), used by the service's `Config::decode`. The flag and pin codecs the item also named went with 7.1's rootless and `venue_bound` removals |
+| 22 | the service's handlers return their code enums, cast once in `apply`; `From<AnchorRefusal> for AnchorCode` and `From<RegisterRefusal> for RegisterCode` (refine's `register_code` gone); `Outcome.kind: Option<Kind>`, its byte `u8::MAX` for none as before (`Kind::{encode_option, decode_option}`, shared with the verdict's refusal) |
+| 23 | the guests' runtime (`src/bin/guest/runtime.rs`) holds the `entries!` macro (the `_start` trampolines, the same instructions, so refine stays at instruction 0 and the service's accumulate at 5), `Output`, the host calls as `Call` and `fetch`'s kinds as `FetchKind` (`#[repr(u64)]`), and `NONE`. The `vos-pvm-guest-rt` crate the item named for later, which would drop the service's dummy `heap-peak` feature, is not made |
+| 24, the service's piece | refine split into `refine_register`, `refine_anchor`, `refine_control`; an accepted statement's id is the one `admit` computed, hashed again only for a refusal's outcome; `fetch_exact`, the one read `fetch` and the proof share |
+| 25 | `Anchor::decode_from` (the service reads its item through it, no byte count of its own); `keys::anchor` and `keys::evidence` one `at_window`; `Evidence::decode` splits at `AnchorRecord::BYTES`; `RootKind::decode_from` through its `TryFrom`. Left: `pvm/codec/src/anchor.rs`'s offsets (Low in the review; the codec reaches the kernels) |
+| 26 | `SpaceGenesis::version` dropped; the encoding writes `GENESIS_VERSION` as before, byte for byte; the anchor vectors unchanged |
+| 27 | `final-verify.elf` has no `Anchors` mode: a mode byte 2 is a bad payload there, its digests zeros (`the_anchor_vectors_are_computed_on_the_jam_only_host_as_pinned` checks both programs); `final-verify-test.elf` computes the vectors. `vos-statement`'s `test-formats` enables `vos-anchor/vectors`, `pvm-guest` no longer does |
+| 28 | the service's `natural` and `Operand::decode_input` gone: refine's arguments are `vos_wire::jam::RefineArgs::decode`, accumulate's `vos_pvm_program::read_nat`, its inputs `vos_wire::jam::AccumulateInput::decode`, and the operand `vos_wire`'s. Stricter: canonical naturals only; refine's arguments whole, the package's hash after the payload and nothing past it; an input in its exact layout, its work error one of the six Gray Paper 0.8.0 codes |
+| 33 | `vos_pvm::refine_host::FetchKind`, Gray Paper 0.8.0's sixteen kinds: the JAM-only host's prices and its serving, and the accumulate host's `FETCH_INPUT(S)`, all through it |
+| 64 | `Attest::weight` and `Attest::weighed` in `vos-wire`; the default agent's `attests_counted` and the testkit's `counted` gone, with the save and restore of them around a failed call |
+| 65 | `Base::decoded`, exact, for `admin`'s and `closes`' row readers; exact decodes of the space and clock rows read through the step, a pending read, the served rows, a kernel's return, an installed record and a workflows' count. Left: the workflow record (`Workflow::decode`, versioned by its `format`), and `vos-sdk`'s `served`, exact already and in every kernel |
+| 66 | the cut and close rows split into `keys/cuts.rs`; `window_of` for the five window-only parsers; `request_id` and `request_of`, the `RequestId` layout once. Of the test-only API the review named, `is_replicated` has a production user now (the checker), `closed_prefix` the reads' tests, and `moved` is gone |
+| 67 | `AgentRoot.kind: RootKind`; `AgentPath` for the `(agent, salt, path)` tuple; `vos_tree`'s `EntryTag` enum for the `Entry` tag constants; `From<Attesting> for WorkflowState`. SCALE bytes unchanged |
+| 69 | one guest workspace, `agent/programs` (the lockfile, the toolchain, the target configuration and the release profile), for the default agent, the representative and the credential actor, each built alone (`_build-program`) and its ELF under `agent/programs/target`; the window actor's forward-looking sentence and two unreflowed doc paragraphs fixed (`inputs.rs`'s was already) |
+| L2 | `blobs.lock` (below) |
+
+**`blobs.lock`:** the SHA-256 of each of the 33 guest blobs, written by
+`just blobs-lock` and checked by `just check-blobs` at the end of
+`check-no-std`: `final-verify.elf`, `final-verify-test.elf`,
+`statement-service.elf`, both Wasm blobs, the three agent programs and the
+25 test actors' ELFs (the bins the test actors' workspace declares, so an
+ELF another branch left in the target is not one). The venue guests are
+built by `_venue-guest` with `--remap-path-prefix` for the checkout's root,
+`CARGO_HOME` and the toolchain's sysroot: before, `final-verify.elf` and
+`statement-service.elf` carried this machine's `$HOME` in 39–41 panic
+locations, so their bytes depended on the checkout and the machine. The
+other blobs carry no path. A set `CARGO_TARGET_DIR` is refused.
+
+**What moved:**
+- Every guest blob (the lock pins them from here): the venue guests and
+  the Wasm blobs with the runtime, the anchor and the statement changes and
+  the remap; the agent programs with the wire and the workspace; the test
+  actors' ELFs in their symbol tables (the wire's moved and new items),
+  their code unchanged.
+- No pinned value: `kernel constants::` passes as at `4a143e9f`
+  (`WINDOW_PROGRAM`, `BALANCE_PROGRAM`, `PREDICATE_PROGRAM`, the derive pins).
+- Behaviour, each deliberate: the service refuses non-canonical naturals
+  and inexact arguments and inputs (item 28): a work error past 6 now drops
+  its input, where the old decode recorded `FAILED + code`; no Gray Paper
+  0.8.0 node gives one. A `Report` body of a root kind other than `Space`
+  no longer decodes, where it decoded and was ignored; only the agent's own
+  close step makes one. Rows with trailing bytes are corrupt where item 65
+  reads them.
+
+**The teammate's third drop:** the vendored `vos-anchor` (`SpaceGenesis`
+without `version`, its encoding unchanged; `Anchor::decode_from`; the
+codec's flag and option pieces) and `vos-statement` (`ProgramId::decode_from`;
+the guest's `Anchors` mode in the test program alone; `test-formats`
+enabling the vectors). The pallet's only code change: a `SpaceGenesis`
+built without the field. The conformance vectors and the fixtures are
+unchanged, and no pinned program id moved. `blobs.lock` is VOS's own: no
+blob ships in the kit. `teammate-note.md`'s drop line says so.
+
+### The review's fixes
+
+One Opus review of the commit, no High; folded:
+- **M1:** `check-blobs` hashed every ELF in the test actors' target, so one
+  another branch left failed the check: the actors are now the bins
+  `cargo metadata` lists; a set `CARGO_TARGET_DIR` is refused.
+- **M2:** path independence shown, not assumed: the lock reproduced from a
+  clean clone at another path (gates).
+- **L5:** the `_forbidden` rows read `agent/programs`'s whole workspace,
+  the representative and the credential actor with the agent.
+- **L6:** the installed record and the workflows' count decoded exactly.
+- **L7:** the guest's doc says the mode is `test-formats`'s.
+- **Nits:** `hostcall!`'s `($id) as u64`; `request_of` by `as_chunks`; a
+  doc paragraph reflowed.
+- Left: the six byte-to-enum tables as they are (each its crate's, two of
+  them the guest's and the host's `FetchKind`); the `AgentPath`
+  destructuring, whose renames are `Body::Closed`'s fields; refine's copy
+  of the payload (`RefineArgs` owns it), a few hundred gas; L3 and L4,
+  recorded above.

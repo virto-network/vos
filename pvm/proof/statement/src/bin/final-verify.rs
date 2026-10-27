@@ -24,7 +24,7 @@
 //!
 //!   then the proof's Blake2b-256 hash and its length (`u32`,
 //!   little-endian);
-//!   - 2, `final-verify-test.elf`'s alone: a golden vector of `vos-anchor`
+//!   - 2, under `test-formats` alone (`final-verify-test.elf`'s): a golden vector of `vos-anchor`
 //!     (`vos_anchor::vectors::Vector`'s encoding), and nothing after it: its
 //!     digests are computed, and no proof is read. `final-verify.elf`
 //!     refuses it as a bad payload, so no build a venue runs accepts

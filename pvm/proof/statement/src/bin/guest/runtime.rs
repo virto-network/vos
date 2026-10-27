@@ -108,7 +108,7 @@ macro_rules! hostcall {
                 "li t0, {id}",
                 "csrw 0x801, zero",
                 "ecall",
-                id = const $id as u64,
+                id = const ($id) as u64,
                 lateout("t0") _,
                 inlateout("a0") a[0] => r,
                 inlateout("a1") a[1] => _,

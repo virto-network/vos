@@ -230,9 +230,10 @@ build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest") (_
 
 # Every guest blob `blobs.lock` pins, its path from the repository's root:
 # the venue's programs, the final verifier's Wasm blobs, the agent's
-# programs and the test actors.
+# programs and the test actors, each a binary of the test actors'
+# workspace (an ELF another branch left in its target is none).
 _blob-paths:
-    let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf" "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "agent/programs/target/riscv64em-vos/release/vos-agent.elf" "agent/programs/target/riscv64em-vos/release/vos-representative.elf" "agent/programs/target/riscv64em-vos/release/vos-credentials.elf"]; let actors = (glob agent/test-actors/target/riscv64em-vos/release/*.elf | each {|path| $path | path relative-to $env.PWD } | sort); $fixed ++ $actors | str join "\n" | print
+    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf" "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "agent/programs/target/riscv64em-vos/release/vos-agent.elf" "agent/programs/target/riscv64em-vos/release/vos-representative.elf" "agent/programs/target/riscv64em-vos/release/vos-credentials.elf"]; let actors = (cd agent/test-actors; cargo metadata --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); $fixed ++ $actors | str join "\n" | print
 
 # Every guest blob, built as `check` builds it.
 build-blobs: build-final-verify build-statement-service build-wasm-blobs build-agent build-representative build-credentials build-test-actors
@@ -325,19 +326,19 @@ _forbidden +gates:
         [seeded-masks "--workspace" [seeded-masks] []] \
         [seeded-masks "-p vos-cli --features prover" [seeded-masks] []] \
         [seeded-masks "-p vos-device" [seeded-masks] []] \
-        [seeded-masks "--manifest-path agent/default/Cargo.toml" [seeded-masks] []] \
+        [seeded-masks "--manifest-path agent/programs/Cargo.toml --workspace" [seeded-masks] []] \
         [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml" [seeded-masks] []] \
         [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks] []] \
         [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [seeded-masks] []] \
         [debug-internals "--workspace" [debug-internals disclosing watch] []] \
         [debug-internals "-p vos-cli --features prover" [debug-internals disclosing watch] []] \
         [debug-internals "-p vos-statement-service --features pvm-guest" [debug-internals] []] \
-        [debug-internals "--manifest-path agent/default/Cargo.toml" [debug-internals] []] \
+        [debug-internals "--manifest-path agent/programs/Cargo.toml --workspace" [debug-internals] []] \
         [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [debug-internals] []] \
         [debug-internals "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [debug-internals] []] \
         [test-formats "--workspace" [test-formats] []] \
         [test-formats "-p vos-cli --features prover" [test-formats] []] \
-        [test-formats "--manifest-path agent/default/Cargo.toml" [test-formats] []] \
+        [test-formats "--manifest-path agent/programs/Cargo.toml --workspace" [test-formats] []] \
         [test-formats "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [test-formats] []] \
         [test-formats "--manifest-path pvm/proof/final-verifier/wasm/blob/Cargo.toml" [test-formats] []] \
         [test-formats "-p vos-statement --features fixtures,pvm-guest" [test-formats] []] \

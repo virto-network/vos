@@ -251,7 +251,8 @@ pub fn anchor_entry(key: &[u8]) -> Option<u64> {
 /// ([`crate::result::Attest::digest`]): node-local, written by the node's
 /// apply of the work result that made it, kept with its witness, and
 /// dropped once the window's roots age past `MaxRootAge`; the same rows on
-/// every replica, so a replica that installs a snapshot holds them. The prover reads its jobs from these.
+/// every replica, so a replica that installs a snapshot holds them. The
+/// prover reads its jobs from these.
 pub fn attested(window: u64, digest: &[u8; 32]) -> Vec<u8> {
     TreeRow::Attested.key(&[&window.to_be_bytes()[..], digest].concat())
 }
@@ -297,10 +298,11 @@ fn request_id(id: RequestId) -> [u8; 16] {
 
 /// The request id [`request_id`] wrote.
 fn request_of(bytes: &[u8; 16]) -> RequestId {
-    let (workflow, awaits) = bytes.split_at(8);
-    let word = |half: &[u8]| u64::from_be_bytes(half.try_into().unwrap_or_default());
+    let ([workflow, awaits], _) = bytes.as_chunks::<8>() else {
+        unreachable!("16 bytes are two words")
+    };
     RequestId {
-        workflow: WorkflowId(word(workflow)),
-        awaits: word(awaits),
+        workflow: WorkflowId(u64::from_be_bytes(*workflow)),
+        awaits: u64::from_be_bytes(*awaits),
     }
 }

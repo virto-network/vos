@@ -295,7 +295,7 @@ impl Base {
             return Err(Failure::OutOfGas);
         }
         let installed = match self.read(&key)? {
-            Some(bytes) => Some(Rc::new(Installed::decode(&bytes).map_err(|_| Corrupt)?.0)),
+            Some(bytes) => Some(Rc::new(Installed::decode_exact(&bytes).ok_or(Corrupt)?)),
             None => None,
         };
         self.installed

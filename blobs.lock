@@ -2,10 +2,10 @@
 # checkout: `just blobs-lock` writes it, `just check-blobs` checks it.
 2b776a62b3c3acfaa9e85801026e41236e92cb1c14e10bc85b1ac1dd7033dceb  target/riscv64em-vos/release/final-verify.elf
 b7beca86b51efc265c6e10769e40dd0cd49c8a278e7e3a03655bfde1e4b062cb  target/riscv64em-vos/release/final-verify-test.elf
-efd81f67e78193f98c9861fdf7772985aed53a155b7a430507e01f8083ec5698  target/riscv64em-vos/release/statement-service.elf
+da7eef2cfead40974107cc0cf2476fad3eccfd797bdf0b8bce0bb7170b08d631  target/riscv64em-vos/release/statement-service.elf
 674e0b2c6d196e7ffdd8187f135d3037c1d65ec2c613d9e3dbd825f0c4809366  pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
 8b808891e83ceb68832fa9fb61e3e48bff0f85e569ae026690ed596299255da8  pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm
-5d627ba25c4bd87e5bc1f2769ae1a665c228e26a25aa623fee87b792bd9959f1  agent/programs/target/riscv64em-vos/release/vos-agent.elf
+02e076c0a13ac68b948618ae2fd2bcf8429d617efb8d80a6bd57c0354c5b2808  agent/programs/target/riscv64em-vos/release/vos-agent.elf
 47cc4a52deb477516fd7511b5a5a16568d907646f35a6863f1f844597b506977  agent/programs/target/riscv64em-vos/release/vos-representative.elf
 0be71e4a75d45940e58470d419e6d82f6aade33ad43e3985762e50a17bc6e55e  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
 7742814684296432737e9834ad3b9e8ac2d6e74cd68bfd030dc2cb1e6294f980  agent/test-actors/target/riscv64em-vos/release/accounts.elf
