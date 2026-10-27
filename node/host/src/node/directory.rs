@@ -351,7 +351,7 @@ impl Inner {
         }
         let shared = Arc::new(Shared::new(record));
         let agent = Arc::new(Agent::new());
-        let (inbox, inputs) = smol::channel::bounded(GROUP_INBOX);
+        let (inbox, inputs) = group::Inbox::new(GROUP_INBOX);
         let (local, locals) = smol::channel::unbounded();
         let (inner, run) = (Arc::clone(self), (&agent, &shared));
         let tasks = vec![
