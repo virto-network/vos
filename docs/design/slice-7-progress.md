@@ -3688,6 +3688,12 @@ documented). For the merge: 7.11 replaces `vos_api::CREDENTIALED` with
   refetch); the docs' scope lines say both widths and the SCALE name.
 - **The rate bench and the verifier under 44:** 7.11's entry (quick
   sanity under another agent's load, not the gate).
+- **Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, another
+  agent's proving stress beside it]: the served `credentialed` 6 (the
+  new one among them), `vos-device`'s 8, the wire's, `kernel
+  constants::`; `just check` green at `057a0364` (exit 0, 1,638 passed in
+  125 suites, no flake); `just test-proof` green, 579 passed in 50
+  suites.
 
 **Commits:** `5f8678fb` format 44 registered, 42 retired; `814caf3c` the
 device library and the phone bench; `95950c51` session P2's record; this
