@@ -3198,7 +3198,7 @@ threads (8), 60 s apart, and one seeded round on the four big cores]:
   verify`, the timing build's and the seeded build's, a flipped byte
   refused); **the seeded build's bytes equal x86's** for all three, every
   rep (`matches_x86` true, one distinct proof a cell, at 8 threads on the
-  phone and at 1, 3 and 4 on x86: the chunked grind's nonce is the
+  phone and at 1, 3 and 22 on x86: the chunked grind's nonce is the
   smallest whatever the threads).
 - **Missed:** auth's target of 150 ms at automatic threads (166), met on
   the four big cores (129 / 147); **owner's 150 ms** at automatic threads
