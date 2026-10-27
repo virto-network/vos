@@ -260,9 +260,11 @@ paths` lists what each input reaches. The paths it covers are recorded in
 
 ## The Stwo fork's open divergences
 
-The workspace pins olanod/stwo at `4cd1f83f` (`vos/grind-chunks`: the
-prover's parallel grind in chunks of 2^14 nonces, its nonce unchanged, on
-`vos/verify-panics`' `c3ec9813`, on `vos/wrap`'s `ab294189`). Its divergence
+The workspace pins olanod/stwo at `9e9b4ff6` (`vos/simd-m31-reduce`: the
+SIMD backend's Blake2s-M31 digest words reduced canonically over the whole
+u32 range, as the verifier reduces them, on `vos/grind-chunks`' `4cd1f83f`:
+the prover's parallel grind in chunks of 2^14 nonces, its nonce unchanged,
+on `vos/verify-panics`' `c3ec9813`, on `vos/wrap`'s `ab294189`). Its divergence
 log (`.claude/skills/paper-implementation-divergence-log.md`) holds two
 open items both wraps' counts rest on, and one the verifier's
 panic-freedom does:
