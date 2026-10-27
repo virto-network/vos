@@ -321,21 +321,17 @@ pinned by 7.7.
   over the `p2` and `qm31` components, a fixed wiring per statement, so
   its circuit hash is its program id. Two components at least, so the
   claimed sums are blinded (a one-component masked set is not).
-- **Format 42, credential proofs** (`device-params.md`): masked (c),
-  Blake2s-M31 channel, **blowup 4, 43 queries, PoW 20**, interaction PoW
-  8, fold step 1, affine DEEP batching if the fork's Blake2s-M31 path takes
-  it, else by powers; at least 62 proven and 100 conjectured bits on its
-  masked shape (62.93 and 106, counted on the built set in 7.10); `h = 512`, every component at
-  least 2^11 rows. If 7.12's grind has a 95th percentile above 50 ms on
-  the phone [decided, S29], the format is **44**, the same at 47 queries
-  and PoW 16 (62.92 and 110), and 42 is retired: a number names one
-  set of parameters. 30, reserved at an unmasked count, is retired
-  unregistered. The choice is the phone's, at 7.12, on the fork's chunked
-  grind (`vos/grind-chunks`: the smallest nonce kept, so a seeded proof's
-  bytes are x86's, and the grind scales with threads at PoW 20); 7.10's
-  x86 numbers favour 44, so 7.11 and 7.12 take the format from the
-  registry and build nothing on 42's numbers [decided under S29, 7.10's
-  review].
+- **Format 44, credential proofs** (`device-params.md`): masked (c),
+  Blake2s-M31 channel, **blowup 4, 47 queries, PoW 16**, interaction PoW
+  8, fold step 1, affine DEEP batching; at least 62 proven and 100
+  conjectured bits on its masked shape (62.92 and 110, counted on the
+  built set); `h = 512`, every component at least 2^11 rows. Chosen on the
+  phone at 7.12 [decided, S29]: the fork's chunked grind
+  (`vos/grind-chunks` `4cd1f83f`) at PoW 20 had a 95th percentile of
+  69–72 ms on the Fairphone 6 at automatic threads, above 50 ms, so 42
+  (the same at 43 queries and PoW 20: 62.93 and 106) is retired, a number
+  naming one set of parameters [measured, `phone-fairphone6-p2.txt`]. 30,
+  reserved at an unmasked count, is retired unregistered.
 - **The scope,** namespaced by the verifier and its space (the Fable
   review's H1):
   `scope = C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))`,
@@ -384,7 +380,7 @@ pinned by 7.7.
   each a `Rejected(Credential(code))`, the codes in check order): the
   frame's size; the decode; the
   agent served; the space has a genesis; the format; the size per format
-  (42 or 44: 512 KiB; 43: 1.5 MiB; the log carries the call and origin,
+  (44: 512 KiB; 43: 1.5 MiB; the log carries the call and origin,
   never the proof, so `cap::REQUEST` is unchanged); `expires_ms` within
   120 s ahead of the node's clock; the method's credential guard; the
   kind; for auth, the scope; the binding; the binding digest not recorded;
@@ -428,7 +424,7 @@ pinned by 7.7.
   new round takes a new name ("vote/2026-11"), so a new scope.
 - **Gates:** the native verify of a credential proof at most 10 ms on one
   x86 core; a proof with a wrong PoW refused in under 1 ms; fuzz targets
-  for the `Credentialed` decode and the format 42 and 43 verifiers in
+  for the `Credentialed` decode and the format 44 and 43 verifiers in
   `just fuzz`.
 
 ### Pin J: the device profile, and format 43
@@ -1492,14 +1488,13 @@ I).
 
 ## Open questions
 
-Two, each closed by a measurement:
+Two, each closed by a measurement (the second closed):
 1. **S3's gate** (S20): after 7.0a's masked-cost proxy on today's AIR, the
    owner keeps ≤ 1 s or sets the gate from the measurement; until then the
    plan aims at 1 s.
-2. **The credential parameters** (S29): 7.12's grind on the phone picks
-   PoW 16 with 47 queries (format 44) if its 95th percentile passes 50 ms,
-   else PoW 20 with 43 (format 42); on the fork's chunked grind, x86
-   favouring 44 (7.10).
+2. **The credential parameters** (S29): **closed at 7.12,** format 44
+   (PoW 16, 47 queries): the PoW-20 grind's 95th percentile on the phone
+   was 69–72 ms at automatic threads, past 50 ms.
 
 7.7's design round asked six more (7.7-Q1 to Q6, `slice-7-progress.md`,
 7.7); the owner answered each: Q1 by S37, Q2 by S38, Q3 by S39, Q4 by

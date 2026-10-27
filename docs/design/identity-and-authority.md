@@ -251,7 +251,7 @@ Ingress verifies the proof and logs only the origin it proves.
       pub arguments: Vec<u8>,          // at most cap::REQUEST
       pub nonce: [u8; 16],             // the client's, at random
       pub expires_ms: u64,             // by the node's clock
-      pub format: u32,                 // 42 (or 44, S29); 43 for a device proof
+      pub format: u32,                 // 44 (S29); 43 for a device proof
       pub public: CredentialPublic,
       pub proof: Vec<u8>,
   }
@@ -327,7 +327,7 @@ Ingress verifies the proof and logs only the origin it proves.
   | 3 | this node serves the agent | `NoAgent`, `Elsewhere`, as for calls | 404, 421 |
   | 4 | the node's space has a genesis (its `SpaceId` is not `NONE`) | `NoSpace`, 0 | 403 |
   | 5 | `format` is a credential or device format this node admits | `Format`, 1 | 403 |
-  | 6 | `proof` within its format's cap (42 or 44: 512 KiB; 43: 1.5 MiB), `arguments` within `cap::REQUEST` | `Size`, 2 | 403 |
+  | 6 | `proof` within its format's cap (44: 512 KiB; 43: 1.5 MiB), `arguments` within `cap::REQUEST` | `Size`, 2 | 403 |
   | 7 | `now ≤ expires_ms ≤ now + 120 s`, `now` the node's clock | `Expiry { now }`, 3 | 403 |
   | 8 | the instance's method exists and has a credential guard | `Method`, 4 | 403 |
   | 9 | `public`'s kind is the guard's, and the format proves it for this method (43: auth, for a guard that names a device kernel) | `Kind`, 5 | 403 |
