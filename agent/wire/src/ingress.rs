@@ -307,6 +307,17 @@ pub struct Stats {
     pub stages: Vec<Stage>,
     /// The node's replica groups now.
     pub groups: Groups,
+    /// What its caches hold now.
+    pub memory: Memory,
+}
+
+/// What a node's caches hold at one moment, in bytes: the store's block
+/// cache and write buffers, and its groups' Raft entry caches summed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
+pub struct Memory {
+    pub store_cache: u64,
+    pub store_buffers: u64,
+    pub log_cache: u64,
 }
 
 /// A node's replica groups at one moment: how many it holds, how many it

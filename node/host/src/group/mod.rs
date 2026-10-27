@@ -212,6 +212,9 @@ pub(crate) struct Shared {
     /// clock: a leader whose driver stopped going round is not vouched
     /// for.
     pub woke: AtomicU64,
+    /// Bytes the group's Raft entry cache held when its driver last went
+    /// round.
+    pub log_cache: AtomicU64,
     /// Set while the driver waits on no timer of its own, and why.
     pub quiet: Mutex<Option<Quiet>>,
 }
@@ -241,6 +244,7 @@ impl Shared {
             outcomes: Mutex::new(VecDeque::new()),
             applying: smol::lock::Mutex::new(()),
             woke: AtomicU64::new(0),
+            log_cache: AtomicU64::new(0),
             quiet: Mutex::new(None),
         }
     }

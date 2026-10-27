@@ -873,6 +873,12 @@ impl<N: NodeId> Core<N> {
         core::mem::take(&mut self.actions)
     }
 
+    /// Bytes of recent entries the core holds in memory
+    /// ([`Config::cache_bytes`] bounds them).
+    pub fn cached_bytes(&self) -> usize {
+        self.log.cached_bytes()
+    }
+
     pub fn role(&self) -> Role {
         self.role
     }

@@ -271,6 +271,9 @@ impl Driver {
                 self.shared
                     .woke
                     .store(self.inner.liveness.elapsed(), Ordering::Relaxed);
+                self.shared
+                    .log_cache
+                    .store(self.core.cached_bytes() as u64, Ordering::Relaxed);
                 // What the driver waits for besides the core.
                 let mut other: Option<Instant> = None;
                 let mut sooner = |at: Instant| {

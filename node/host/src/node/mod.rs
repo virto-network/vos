@@ -401,7 +401,9 @@ impl Inner {
             stats.groups.leading += u64::from(state.role == vos_raft::Role::Leader);
             stats.groups.terms += state.term;
             stats.groups.quiet += u64::from(lock(&run.shared.quiet).is_some());
+            stats.memory.log_cache += run.shared.log_cache.load(Ordering::Relaxed);
         }
+        (stats.memory.store_cache, stats.memory.store_buffers) = self.store.memory();
         stats
     }
 

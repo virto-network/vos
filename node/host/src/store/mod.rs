@@ -136,6 +136,12 @@ pub type DumpedRow = (&'static str, Vec<u8>, Vec<u8>);
 pub type ProverJob = (AgentId, [u8; 32], Vec<u8>);
 
 impl Fjall {
+    /// Bytes its block cache holds, and its write buffers.
+    pub(crate) fn memory(&self) -> (u64, u64) {
+        let db = &self.0.db;
+        (db.cache_size(), db.write_buffer_size())
+    }
+
     /// Open the store at `path`. Everything it will recover is synced
     /// first: rows a crashed process left in the page cache could otherwise
     /// still be lost to a power cut after the node relied on them. (This

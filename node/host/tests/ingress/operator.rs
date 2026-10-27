@@ -85,7 +85,8 @@ fn a_token_that_is_not_hex_is_refused_and_frees_its_connection() {
 }
 
 /// A node's stats count its replica groups: a node of one holds and leads
-/// each of its agents, at a term of one at least.
+/// each of its agents, at a term of one at least. They give what its
+/// groups' entry caches hold, which a leader's own entries fill.
 #[test]
 fn the_stats_count_the_groups_a_node_holds_and_leads() {
     let served = Served::plain();
@@ -96,6 +97,7 @@ fn the_stats_count_the_groups_a_node_holds_and_leads() {
     assert!(stats.groups.replicas >= 1, "{:?}", stats.groups);
     assert_eq!(stats.groups.leading, stats.groups.replicas);
     assert!(stats.groups.terms >= stats.groups.replicas);
+    assert!(stats.memory.log_cache > 0, "{:?}", stats.memory);
 }
 
 /// The operator reads a replica's status, and a stranger cannot. A node

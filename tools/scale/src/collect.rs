@@ -48,6 +48,7 @@ pub fn poll(inventory: &Inventory, run: &Run, stop: &AtomicBool) -> Result<(), S
     while !stop.load(Ordering::Relaxed) && !hosts::interrupted() {
         for (number, operator) in &operators {
             let mut groups = serde_json::Value::Null;
+            let mut memory = serde_json::Value::Null;
             let stats = match operator.stats() {
                 Ok(Response::Stats(stats)) => {
                     groups = serde_json::json!({
@@ -55,6 +56,11 @@ pub fn poll(inventory: &Inventory, run: &Run, stop: &AtomicBool) -> Result<(), S
                         "leading": stats.groups.leading,
                         "terms": stats.groups.terms,
                         "quiet": stats.groups.quiet,
+                    });
+                    memory = serde_json::json!({
+                        "store_cache": stats.memory.store_cache,
+                        "store_buffers": stats.memory.store_buffers,
+                        "log_cache": stats.memory.log_cache,
                     });
                     serde_json::Value::Object(
                         stats
@@ -105,6 +111,7 @@ pub fn poll(inventory: &Inventory, run: &Run, stop: &AtomicBool) -> Result<(), S
                 "node": number,
                 "stats": stats,
                 "groups": groups,
+                "memory": memory,
                 "statuses": statuses,
             });
             writeln!(file, "{line}").map_err(|error| error.to_string())?;
