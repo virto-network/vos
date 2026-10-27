@@ -3177,9 +3177,9 @@ Branch `s7/7.11`, from vos-core `920103b3`.
   the guard's `Forbidden`; `once`: a refused vote leaving the nullifier
   free while its binding is `Replayed`, a second admitted vote `Once`,
   another scope's guard admitting it; a credentialed call's own work under
-  a step's reserve on both hosts with the ring full (64 roots): 69,691
-  on VOS, 154,130 on JAM, of 300,000; the batch's first auth call, which
-  pays and decodes the ring once for the refine, 157,301 and 241,814.
+  a step's reserve on both hosts with the ring full (64 roots): 69,601
+  on VOS, 154,040 on JAM, of 300,000; the batch's first auth call, which
+  pays and decodes the ring once for the refine, 157,212 and 241,725.
 - **Ingress** (`node/host/tests/served/credentialed.rs`, three nodes of a
   founded space, real proofs): each refusal in its check order (413 from
   the head past the frame; `Malformed`; `NoAgent`; `NoSpace` at an
@@ -3397,8 +3397,11 @@ balance kernel's re-pin; this record and the bench's sizing. The Fable
 review's folds: `3655d50d` M1 and the executor wait; `b8301c48` M2 and L2;
 `f0ba9262` L1 and L3; `1941c258`, `cfdd2ef4`, `a7928932`, `ee3ad377`,
 `c6cc3a16` the bench (L7, its 10 s runs, its `serve` and `drive` modes);
-`242f275d` M3, L4 and L5 in the docs; `285e939c` S55; the review, this
-record and the gates.
+`242f275d` M3, L4 and L5 in the docs; `285e939c` S55; `db432858` the
+review and this record; `fa91abb8` vos-scale's requests; `4b3e0e68` the
+ring's key inline (as a plain function it moved `WINDOW_PROGRAM`, the
+wire's codegen shifting though the window kernel never calls it); the
+gates.
 
 **Gates** [measured; 12 GiB scope, `nice -n 10`, 8 jobs, other agents'
 runs on the machine]: the touched suites (the wire's 51, the testkit's
@@ -3411,3 +3414,9 @@ gateway's `ssh` feature. Fixed on the way: `prove::the_slot_does_not_move_the_sh
 compared each tree's queried values per column, which follow the distinct
 query positions (42 or 43 as the coins fall): it compares the trees'
 columns.
+After the Fable review's folds [measured; the same scope, other agents'
+runs on the machine]: the wire's `credentialed` 6, the testkit's
+`credentialed` 6, the served `credentialed` 5, `vos-http`'s, `vos-node`'s
+`api::` and `credentialed::` units; `just check` green at `4b3e0e68`
+(exit 0, 1,629 passed in 122 suites). The rate bench as above; the
+compumax run is S55's, left.
