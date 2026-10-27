@@ -254,6 +254,15 @@ S52. **compumax is wired.** The desktop's driver, still on Wi-Fi,
   check` warns of a driver on Wi-Fi and records its round trips to each
   node machine. (2026-10-26)
 
+S53. **compumax runs at the `performance` governor** for the timed
+  scale runs, set by the owner. (2026-10-26)
+
+S54. **fjall 3.1.13 taken at once.** fjall 3.1.12's `Database` drop can
+  block forever on its full close queue once its workers have gone (a
+  hang the cluster suite's watch caught); 3.1.13 fixes it. The owner takes
+  it a day after its release rather than waiting two weeks, the crate
+  checked identical to its upstream tag. (2026-10-27)
+
 ## On 7.7's design round, and the demo's home (2026-10-26)
 
 On the plan's questions 7.7-Q1 to Q6 (`slice-7-progress.md`, 7.7), and
