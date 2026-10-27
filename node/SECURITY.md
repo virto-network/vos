@@ -7,8 +7,9 @@ and the gateways that relay requests learn, and where the node is open to
 denial of service. It is descriptive, not a formal argument. The design is
 `docs/design/identity-and-authority.md` (§5 the request, its checks and
 the apply rule; §6 the credential actor; §7 the threat model) and
-`docs/design/proving.md` §8 (the statements). What a verified proof proves
-is `pvm/proof/SECURITY.md`'s.
+`docs/design/proving.md` §8 (the statements). What the device library
+holds is `pvm/device/SECURITY.md`'s, and what a verified proof proves is
+`pvm/proof/SECURITY.md`'s.
 
 ## Who is trusted
 
@@ -106,21 +107,34 @@ naming one is `Malformed`).
 from other members, not from the operators of the nodes and gateways that
 serve its requests:
 
-- **The path leak.** Asking the credential actor for `path(member)` tells
-  the operators which member digest is online, and from which address.
-  The query's key is drawn for it alone and links nothing; the device
-  library refreshes its path apart from its proofs (when `root()` moves
-  and on a timer, never just before a proof, on a connection of its own),
-  so a fetch's time says nothing of a proof's. The leak is reduced, not
-  closed: a proof from the same address still links its nullifier to the
-  digest, and the digest to whoever the registrar enrolled.
+- **The path leak, reduced, not closed.** Asking the credential actor for
+  `path(member)` tells the operators which member digest is online, and
+  from which address. What they do not learn is when it proves:
+  - the device library (`PathKeeper`) fetches its path apart from its
+    proofs: on a timer of 30 s jittered uniformly between 15 s and 45 s,
+    and at a time drawn below 10 s after a moved `root()` answer is first
+    seen, never because a proof is about to be made; the client sends
+    the queries on a connection of their own;
+  - each `path` and `root()` query is signed by a key drawn for it alone,
+    so a fetch links to no client key; `root()` names no member;
+  - so a fetch's time says nothing of a proof's, but a proof from the same
+    address still links its nullifier to the digest, and the digest to
+    whoever the registrar enrolled.
+- **A refetch after `RootUnknown`** precedes the proof that retries the
+  call, so that fetch's time links to that proof's. It happens only when
+  the replica's ring does not hold the proof's root: a lagging replica, a
+  root replaced at its own batch time, or 64 tree-changing batches within
+  one timer period (about 1.4 a second, for 45 s), past which the library
+  halves its period for the space's pace.
 - **From the log:** each auth call's scope and nullifier (a pseudonym's
   activity in one scope), each payment's owner digest (a public payer),
   each credentialed call's arguments in clear, and the metadata every
   call leaks.
-- **From a tree change:** every online member's library refreshes its
-  path when `root()` moves, so each enrollment or revocation shows which
-  member digests are online then.
+- **From a tree change:** every online member's library fetches its path
+  within 10 s of seeing `root()` move, so each enrollment or revocation
+  shows which member digests are online then; the spread, and the
+  clients' own jitter in polling `root()`, spread the fetches, they do
+  not hide them. Syncing the tree is the later fix.
 - **From the tree:** how many members there are, and when each was
   enrolled or revoked.
 - **From a copied handle:** two spaces whose credential actors share a

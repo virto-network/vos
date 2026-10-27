@@ -29,7 +29,8 @@ reference shape, from the security tool (`src/security.rs`):
 | 32 | leaves and folds | Poseidon2-M31 | 108 / 63 | 100 / 60 | reserved: proved and verified inside the recursion, refused by every outside verifier |
 | 28 | the final wrap, unmasked | Blake2b-256 | 146 / 82.6 | 100 / 80 | admitted: the tests' and the fixtures', linked by the final verifier under `test-formats` alone |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 146 / 82.70 | 100 / 80 | admitted: what production venues accept |
-| 37, 30 | device and credential proofs | Blake2s-M31 | 106 / 62.10, 62.52 | 100 / 60 | reserved |
+| 44 | credential proofs, masked (variant (c)) | Blake2s-M31 | 110 / 62.92 | 100 / 60 | admitted: what a space's ingress takes |
+| 37 | device proofs | Blake2s-M31 | 106 / 62.10 | 100 / 60 | reserved |
 
 - **Conjectured** bits are PoW plus queries times log blowup (the ethSTARK
   conjecture, refuted as stated in 2025; the parameters carry a margin for
@@ -44,7 +45,9 @@ reference shape, from the security tool (`src/security.rs`):
   so 37 counts 62.104 (by samples, 62.129); 35's query term binds, 62.86
   either way.
 - A verifier rejects a number the registry does not admit, a retired one
-  (24 to 27, 29, 31, 33, 34; 36, the legacy segment format, whose 57
+  (24 to 27, 29, 30, 31, 33, 34; 42, the credential format at PoW 20,
+  retired when the gate phone's grind passed 50 ms at its 95th
+  percentile; 36, the legacy segment format, whose 57
   proven bits at its MOBILE shape were below the 60-bit floor; and 40, the
   blowup-64 masked wrap a measured proof was made under, never registered)
   among them, and a proof on another channel than its format's. The

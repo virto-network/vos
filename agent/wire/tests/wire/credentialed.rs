@@ -226,12 +226,22 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
             &[0x11; 32],
             &1u32.to_le_bytes(),
             &2u32.to_le_bytes(),
+            &4u32.to_le_bytes(),
             b"vote",
         ]
         .concat(),
     );
     let words = credentials::compress(&Tag::Scope.block(), &credentials::reduced(&hash));
     assert_eq!(scope, credentials::digest(&words));
+    // The device library's vector (`vos-device`'s `SCOPE_VECTOR`): the
+    // name in SCALE, as `proving.md` §8 pins it.
+    assert_eq!(
+        credentials::scope(&SpaceId([0x51; 32]), AgentId(4), InstanceId(2), b"login"),
+        [
+            176, 47, 24, 3, 211, 3, 208, 103, 92, 44, 198, 75, 144, 255, 58, 99, 210, 27, 59, 25,
+            235, 172, 49, 126, 162, 142, 147, 35, 82, 189, 54, 43,
+        ]
+    );
     for other in [
         credentials::scope(&space, AgentId(9), InstanceId(2), b"vote"),
         credentials::scope(&SpaceId([0x12; 32]), AgentId(1), InstanceId(2), b"vote"),

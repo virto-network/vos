@@ -631,7 +631,8 @@ impl Ring {
 /// The scope a guard named `name` gives in `space`'s agent `agent`, at
 /// `instance` (`identity-and-authority.md` §7):
 /// `C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))`,
-/// the agent and the instance four little-endian bytes each. No two
+/// the agent and the instance four little-endian bytes each, `name` as the
+/// codec writes it (a `u32` little-endian length, then the bytes). No two
 /// agents' guards of one name, in one space or two, share a pseudonym.
 pub fn scope(space: &SpaceId, agent: AgentId, instance: InstanceId, name: &[u8]) -> Digest {
     let hash = vos_pvm_precompiles::blake2b_hash::<32>(
@@ -640,6 +641,7 @@ pub fn scope(space: &SpaceId, agent: AgentId, instance: InstanceId, name: &[u8])
             &space.0,
             &agent.0.to_le_bytes(),
             &instance.0.to_le_bytes(),
+            &(name.len() as u32).to_le_bytes(),
             name,
         ],
     );

@@ -47,7 +47,7 @@ fn least_queries(base: FormatParams) -> Option<usize> {
 }
 
 /// Variant (c) moves no unmasked count: every format but the masked ones
-/// counted on their masked shapes (39, 42) samples its composition at the
+/// counted on their masked shapes (39, 44) samples its composition at the
 /// out-of-domain point itself and counts what it pins, format 28 82.60;
 /// format 39's reference is 28's at (c)'s levels.
 #[test]
@@ -60,7 +60,7 @@ fn the_unmasked_counts_do_not_move() {
             "format {}",
             format.number
         );
-        assert_eq!(format.masked, [37, 39, 42].contains(&format.number));
+        assert_eq!(format.masked, [37, 39, 44].contains(&format.number));
         assert_eq!(
             format.masking.is_some(),
             counted_masked.contains(&format.number),
@@ -298,34 +298,38 @@ fn the_masked_wraps_masking_meets_its_bounds() {
     assert!(31 * masking.salt_columns >= 248);
 }
 
-/// Formats 42 and 44 counted on the credential AIR's masked shape: 42 at
-/// 106 / 62 (62.927; blowup 4, 43 queries, PoW 20), 44 at 110 / 62
-/// (62.920; 47 queries, PoW 16), the query term binding both, the DEEP
-/// batching 0.01 bits above it; 44 unregistered.
+/// Format 44 counted on the credential AIR's masked shape at 110 / 62
+/// (62.920; blowup 4, 47 queries, PoW 16), and the retired 42's parameters
+/// at 106 / 62 (62.927; 43 queries, PoW 20), the query term binding both,
+/// the DEEP batching 0.01 bits above it; 42 and 30 retired.
 #[test]
 fn the_credential_formats_count_on_their_masked_shape() {
-    for (format, conjectured, (low, high)) in [
-        (CREDENTIAL_PROOF, 106, (62.92, 62.93)),
-        (CREDENTIAL_PROOF_44, 110, (62.92, 62.93)),
+    let retired_42 = FormatParams {
+        n_queries: 43,
+        pow_bits: 20,
+        ..CREDENTIAL_PROOF.params
+    };
+    for (params, conjectured, (low, high)) in [
+        (CREDENTIAL_PROOF.params, 110, (62.92, 62.93)),
+        (retired_42, 106, (62.92, 62.93)),
     ] {
-        let bits = security_bits(&format.params, &CREDENTIAL_REFERENCE).unwrap();
-        assert_eq!(bits, format.bits, "format {}", format.number);
+        let bits = security_bits(&params, &CREDENTIAL_REFERENCE).unwrap();
         assert_eq!(bits.conjectured, conjectured);
-        let proven = count(&format.params, &CREDENTIAL_REFERENCE);
-        let terms = term_bits(&format.params, &CREDENTIAL_REFERENCE).unwrap();
+        assert!(bits.proven >= INNER_FLOOR.proven);
+        let proven = count(&params, &CREDENTIAL_REFERENCE);
+        let terms = term_bits(&params, &CREDENTIAL_REFERENCE).unwrap();
         eprintln!(
-            "format {}: {proven:.3} proven bits, {terms:?}",
-            format.number
+            "{} queries: {proven:.3} proven bits, {terms:?}",
+            params.n_queries
         );
         assert!((low..high).contains(&proven), "{proven}");
-        assert_eq!(terms.query, proven, "format {}", format.number);
-        assert!(format.meets_floors());
+        assert_eq!(terms.query, proven, "{} queries", params.n_queries);
     }
-    assert!(lookup(CREDENTIAL_PROOF_44.number).is_none());
-    assert_eq!(lookup(42), Some(&CREDENTIAL_PROOF));
-    assert!(RETIRED.contains(&30) && lookup(30).is_none());
-    assert_eq!(
-        CREDENTIAL_PROOF_44.masking, CREDENTIAL_PROOF.masking,
-        "one masking, one shape"
-    );
+    let bits = security_bits(&CREDENTIAL_PROOF.params, &CREDENTIAL_REFERENCE).unwrap();
+    assert_eq!(bits, CREDENTIAL_PROOF.bits);
+    assert!(CREDENTIAL_PROOF.meets_floors());
+    assert_eq!(lookup(44), Some(&CREDENTIAL_PROOF));
+    for number in [30, 42] {
+        assert!(RETIRED.contains(&number) && lookup(number).is_none());
+    }
 }

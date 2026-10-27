@@ -1,0 +1,28 @@
+[package]
+name = "vos-phone"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The phone bench, which no VOS node links: the device library's credential proofs timed on a phone and on x86, verified, their memory measured, the PoW grinds timed, and a seeded build's proofs compared byte for byte with x86's."
+publish = false
+
+[[bin]]
+name = "vos-phone"
+path = "src/main.rs"
+
+[features]
+# The seeded build: every proof's masks from a fixed seed, so its bytes are
+# x86's (the references compiled in from `VOS_PHONE_REFERENCES`). The
+# prover's test seam: no production build enables it, and the workspace's
+# default features leave it off.
+seeded = ["vos-device/seeded-masks"]
+# mimalloc as the allocator, as the phone's client links it.
+mimalloc = ["dep:mimalloc"]
+
+[dependencies]
+vos-device = { workspace = true }
+vos-wire = { workspace = true }
+stwo = { workspace = true }
+rayon = { workspace = true }
+sha2 = "0.10"
+mimalloc = { version = "0.1.52", optional = true }

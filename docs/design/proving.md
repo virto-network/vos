@@ -586,7 +586,7 @@ last for decades.**
 |---|---|---|---|
 | segment proofs (format 35) | ≥ 100 / ≥ 60 | blowup 4 (log 2), 40 queries, PoW 24, plus interaction PoW 8; FRI fold step 1, log last-layer degree bound 0 | 104 / 62 (62.86) |
 | leaf and fold proofs (32) | ≥ 100 / ≥ 60 | blowup 4, 44 queries, PoW 20, plus interaction PoW 8; fold step 1, last layer 2^0 | 108 / 63 |
-| credential proofs (42, or 44 by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 43 queries, PoW 20 (44: 47 queries, PoW 16), plus interaction PoW 8; variant (c) | 106 / 62 (62.93); 44: 110 / 62 (62.92) [built, 7.10] |
+| credential proofs (44, by S29; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | blowup 4 (log 2), 47 queries, PoW 16, plus interaction PoW 8; variant (c) | 110 / 62 (62.92) [built, 7.10; registered, 7.12] |
 | device proofs (43; verified at ingress, never folded) | ≥ 100 / ≥ 60, with 2 bits of margin, counted on the masked shape | chosen by 7.16 among blowup 2 with 86–87 queries, 4 with 43 (or 47 at PoW 16), 8 with 29; variant (c) | ≥ 100 / ≥ 62 |
 | the final wrap, unmasked (28; tests only) | ≥ 100 / ≥ 80 | blowup 64 (log 6), 20 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching (§3.5) | 146 / 82 (82.60) |
 | the final wrap, masked (39) | ≥ 100 / ≥ 80 | blowup 32 (log 5), 24 queries, PoW 26, plus interaction PoW 8; fold step 3, last layer 2^6; affine DEEP batching; variant (c) | 146 / 82 (82.70) |
@@ -1004,18 +1004,20 @@ enrollment costs 33 calls of `C`, the leaf and 32 levels; a revocation 32.
   padded to the masking floor, 2^11 rows (`h = 512`). Auth and owner share
   the shape, so their proofs are the same size.
 
-**Format 42, credential proofs** [decided, S29; the PoW open until 7.12]:
+**Format 44, credential proofs** [decided, S29, on the phone at 7.12]:
 masked (c), the Blake2s-M31 channel (the fork's
-`Blake2sM31MerkleChannel`), blowup 4 (log 2), 43 queries, PoW 20,
-interaction PoW 8, fold step 1, last layer 2^0, affine DEEP batching if the
-fork's Blake2s-M31 path takes it (it does: affine), else by powers; at
-least 62 proven and 100 conjectured bits on its masked shape (62.93 and
-106, counted on the built set [built, 7.10]). If 7.12's grind has a 95th
-percentile above 50 ms on the phone, the credential format is **44**
-instead: the same at 47 queries and PoW 16 (62.92 and 110), and 42 is
-retired. A number names one set of parameters, so the switch takes a new
-one. 30, reserved at an unmasked count, is retired unregistered [built,
-7.10]. Ingress takes a proof of at most 512 KiB; a proof is about 200 KB
+`Blake2sM31MerkleChannel`), blowup 4 (log 2), 47 queries, PoW 16,
+interaction PoW 8, fold step 1, last layer 2^0, affine DEEP batching (the
+fork's Blake2s-M31 path takes it); at least 62 proven and 100 conjectured
+bits on its masked shape (62.92 and 110, counted on the built set). S29's
+rule picked it over **42** (the same at 43 queries and PoW 20: 62.93 and
+106): the fork's chunked grind (`vos/grind-chunks` `4cd1f83f`) at PoW 20
+had a 95th percentile of 69–72 ms on the Fairphone 6 at its automatic 8
+threads (110–119 ms on its four big cores), above 50 ms; PoW 16's was
+6.2–6.9 ms [measured, `research/slice-7/phone-fairphone6-p2.txt`]. 42 is
+retired: proofs were made under it, and a number names one set of
+parameters. 30, reserved at an unmasked count, is retired unregistered.
+Ingress takes a proof of at most 512 KiB; a proof is about 215–222 KB
 [measured].
 - **Built** (slice 7's 7.10, `vos_pvm_recair::credential`,
   `vos_pvm_final_verifier::credential`): each `C(T(name), x)` is one `p2`
@@ -1023,8 +1025,8 @@ one. 30, reserved at an unmasked count, is retired unregistered [built,
   the left of a wire pair, from three modes' selectors, no AIR change);
   the set is `p2` and `qm31` alone, each at 2^11 rows, `h8` absent; the
   verifier pins both kinds' preprocessed roots and program ids (the
-  circuit hash of format 42, its parameters, the log sizes `[11, 11, 0]`
-  and the root).
+  circuit hash of the registry's format, its parameters, the log sizes
+  `[11, 11, 0]` and the root), re-pinned under 44 at 7.12.
 
 **The device secret, from a secret source** [decided, S25, S42]:
 - **The source** is an HMAC-SHA-256 under a key the device never
@@ -1141,6 +1143,28 @@ impl PathKeeper {
   build check). The client's bridge zero-fills its `byte[]` of `o` once
   the library has copied it; the library zeroizes its copies of `o` and
   `s`.
+- **Built** (slice 7's 7.12, `pvm/device`, its `SECURITY.md`): as
+  sketched, and beside it `Prover::prove_membership_and_payment` and
+  `verify_joint` (the joint statement's binding names its own program and
+  the kind byte `0xff`, which no `CredentialPublic` takes); the masks
+  always the operating system's, a `seeded-masks` test seam
+  (`Prover::seeded`) for the phone bench's byte comparison alone;
+  `Call::new`, `path_query` and `root_query` answering `Result` (the
+  operating system's randomness may fail); `PathKeeper::due` taking
+  `&mut self` (a moved root brings the fetch forward to a time drawn
+  below 10 s after it is first seen), `update` refusing a path not its
+  member's, and `unknown` for a `RootUnknown` or `RootStale` answer, with
+  `wire::credentialed_answer` (the node's `Response` decoded exactly, a
+  credential refusal as `vos_wire`'s `CredentialRefusal`, `Expiry`'s
+  `now` kept); the request is `vos_wire`'s `Credentialed` under
+  `Kind::Credentialed`, the scope and the binding `vos_wire`'s
+  `credentials::scope` and `Bound::digest`, so the library and ingress
+  share one computation. The keeper's timer is 30 s with a uniform jitter of half a
+  period either way, halved on each `RootUnknown` (to 1 s) and doubled
+  back on a fetch that finds the root unmoved. A
+  credential proof peaks at 113–133 MiB on the Fairphone 6 and 144–162
+  MiB on x86 [measured]; `Prover::new` refuses an allowance below
+  `PEAK_BYTES`, 192 MiB.
 
 **No Poseidon2 root kind for the in-space credential** [settled by the
 evidence, the owner's to override]: the credential tree lives in the actor's own rows,
@@ -1265,7 +1289,7 @@ that narrows the inner proof makes folds cheaper too.
 | **6** | **M2 Masking** | R1–R8 on the final wrap, generic over components and channel for slice 7; format 39; 248-bit salts; leakage and soundness gates; the items carried from slice 5 | 8.5–13 weeks |
 | **6** | **M3 Statements on chain** | the public-input model; `&self` witnessed reads to the space root at anchored cuts; the prover worker; the Kreivo spaces pallet's design, the verifier kit and the node's client (the pallet is the Kreivo teammate's); the JAM statements service | 18.5–29 weeks |
 | **7** | **M3.9 Simplify and scale** | the anchoring protocol simplified (pin D′: one venue core, five outcomes on the node, no migration, no rotation, equivocation terminal); a scale test across the owner's LAN | 11.5–18 weeks |
-| **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call and chip; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 42); the node's binary API and its gateway; its verifier at ingress; device secrets from the Android Keystore or a security key, the device library and a demo in s4's Android client; phone gates | 15.5–22 weeks |
+| **7** | **M4 Credential AIR** | slice 6's re-pin batch; the zkPVM Poseidon2 host call and chip; a credential actor keeping a Poseidon2 tree in its own rows; the credential AIR (format 44); the node's binary API and its gateway; its verifier at ingress; device secrets from the Android Keystore or a security key, the device library and a demo in s4's Android client; phone gates | 15.5–22 weeks |
 | **7** | **M5 Device profile** | the segment chips masked; the boundary-free device shape (format 43); levers 1–4; the CPU split by opcode family, word-level memory if needed; the Poseidon2 chip and the levers in the node's segment format (41), as its leaves allow; the ≤ 1 s phone gate | 22–33.5 weeks, 26–39.5 with word-level memory |
 | **later** | **M6 Signature chips** | SHA-256, SHA-512, the bignum chip, the P-256 and Edwards drivers; moved past slice 7 by the owner (S1) | 8–14 weeks |
 
@@ -1442,12 +1466,12 @@ counts as conjectured / proven at the reference shape [model]:
 | 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 | reserved |
 | 28 | the final wrap, unmasked (tests only) | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted |
 | 39 | the final wrap, masked (variant (c)) | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 | admitted; the one production venues accept |
-| 42 | credential proofs, masked (variant (c)) | Blake2s-M31 | 2, 43, 20, 1, 0, 8, affine DEEP batching | 100 / 60 | 106 / 62 (62.93), on its masked shape | admitted |
+| 44 | credential proofs, masked (variant (c)) | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 (62.92), on its masked shape | admitted |
 
-- **30 is retired unregistered** (slice 7's 7.10): 42 counts credential
-  proofs on their masked shape; 44 (47 queries, PoW 16: 110 / 62, 62.92)
-  is counted beside it in the registry's code and registered only if the
-  phone gate picks it. **37** retires the same way when 43 registers.
+- **30 is retired unregistered** (slice 7's 7.10), and **42 retired**
+  (7.12): 44 counts credential proofs on their masked shape, PoW 16 at 47
+  queries, picked over 42's PoW 20 at 43 by the phone's grind (S29).
+  **37** retires unregistered when 43 registers.
 - **Each entry** holds its channel, its parameters, the DEEP batching its
   proven floor assumes and both bit counts.
 - **Every entry uses A.3's encodings** and exactly its parameters.
@@ -1458,7 +1482,7 @@ counts as conjectured / proven at the reference shape [model]:
   62.74, their batching term binding.
 - **35 and 37 name the segment AIR,** hardened and without the columns and
   next-row masks no constraint reads (§3.2); 28, 32 and 39 prove the
-  recursion AIR, 32's leaves verifying the segment AIR, and 42 its `p2`
+  recursion AIR, 32's leaves verifying the segment AIR, and 44 its `p2`
   and `qm31` alone. A reserved entry is
   refused until its AIR and channel exist. 32's exist from slice 5's 5.8:
   `vos-pvm-recair` proves and verifies its proofs natively, and the registry

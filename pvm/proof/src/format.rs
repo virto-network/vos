@@ -12,7 +12,7 @@
 //! | 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 |
 //! | 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
 //! | 39 | the final wrap, masked | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
-//! | 42 | credential proofs, masked | Blake2s-M31 | 2, 43, 20, 1, 0, 8, affine DEEP batching | 100 / 60 | 106 / 62 |
+//! | 44 | credential proofs, masked | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
 //!
 //! - **The segment AIR** is the one every segment, leaf and device format
 //!   names: 35 and 37 name its current form, without the columns and
@@ -23,7 +23,7 @@
 //!   33 and 34 named the hardened form with those columns, 31 at 44 queries;
 //!   36 named its legacy Blake2s form, below the proven floor.
 //!   28, 32 and 39 prove the recursion AIR (`vos-pvm-recair-air`) and keep
-//!   their numbers; 42 proves its `p2` and `qm31` alone, the credential AIR.
+//!   their numbers; 44 proves its `p2` and `qm31` alone, the credential AIR.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
 //!   before the relation challenges. 37 is registered and refused until its
@@ -36,7 +36,7 @@
 //!   feature), fold step 3 reviewed in the fork. 39 is admitted: the masked
 //!   wrap, `vos-pvm-recair`'s masked prover and `vos-pvm-final-verifier`'s
 //!   masked verifier, its bytes a fixed layout ([`ProofBytes::FixedLayout`]);
-//!   production venues accept it alone. 42 is admitted: `vos-pvm-recair`'s
+//!   production venues accept it alone. 44 is admitted: `vos-pvm-recair`'s
 //!   credential prover and `vos-pvm-final-verifier`'s credential verifier,
 //!   on the fork's Blake2s-M31 channel; a space's ingress takes it. A
 //!   segment verifier takes only a segment format ([`admitted_segment`]).
@@ -48,14 +48,14 @@
 //!   bits: a fold verifies under half the recursion AIR's shape.
 //! - **The device format** (37) takes the least query count, 86, whose
 //!   proven count clears the floor of 60 by 2 bits.
-//! - **The credential format** (42) is counted on its masked shape
+//! - **The credential format** (44) is counted on its masked shape
 //!   ([`CREDENTIAL_REFERENCE`]): two components at the masking's floor of
-//!   2^11 rows, where every blowup costs the same cells, so blowup 4 and the
-//!   least queries that clear 62 bits with PoW 20, 43. Its alternative, 44
-//!   ([`CREDENTIAL_PROOF_44`]: 47 queries and PoW 16, for a phone whose
-//!   grind is too slow), is counted beside it and registered only if the
-//!   phone gate picks it: a number names one set of parameters. 30, reserved
-//!   for credential proofs at an unmasked count, is retired unregistered.
+//!   2^11 rows, where every blowup costs the same cells, so blowup 4, and
+//!   PoW 16 with the least queries that clear 62 bits beside it, 47. The
+//!   gate phone picked it over 42 (43 queries, PoW 20), whose grind's 95th
+//!   percentile there passed 50 ms; 42 is retired, since a number names one
+//!   set of parameters. 30, reserved for credential proofs at an unmasked
+//!   count, is retired unregistered.
 //! - **The wrap** (28) needs DEEP batching with an independent coefficient a
 //!   sampled value ([`DeepBatching::Affine`]) for its proven 80. Stwo batches
 //!   by powers of one coefficient, whose error is the batched values' count
@@ -342,7 +342,7 @@ pub const MASKED_WRAP_REFERENCE: SecurityShape = SecurityShape {
     ..WRAP_REFERENCE.variant_c()
 };
 
-/// The credential AIR (`proving.md` §8), format 42's reference: the
+/// The credential AIR (`proving.md` §8), format 44's reference: the
 /// recursion AIR's `p2` and `qm31` at the masking's floor of 2^11 rows,
 /// masked under variant (c) (columns at degree bound 2^12, the composition
 /// whole at 2^13, sampled at `π(z)`), as the built set lays it out: 50
@@ -521,9 +521,9 @@ pub const DEVICE_PROOF: Format = Format {
     },
 };
 
-/// Format 42's masking: 8 salt columns a tree; an `R` of 8 columns (R3
+/// Format 44's masking: 8 salt columns a tree; an `R` of 8 columns (R3
 /// under affine batching); and `h = 512`, at least
-/// `2(4|O| + q(|O| + 1)) = 274` for `q = 43` queries and `|O| = 2` offsets,
+/// `2(4|O| + q(|O| + 1)) = 298` for `q = 47` queries and `|O| = 2` offsets,
 /// so each component pads to `4h = 2^11` rows.
 pub const CREDENTIAL_MASKING: Masking = Masking {
     salt_columns: 8,
@@ -533,8 +533,8 @@ pub const CREDENTIAL_MASKING: Masking = Masking {
 
 const CREDENTIAL: FormatParams = FormatParams {
     log_blowup: 2,
-    n_queries: 43,
-    pow_bits: 20,
+    n_queries: 47,
+    pow_bits: 16,
     fold_step: 1,
     log_last_layer: 0,
     interaction_pow_bits: 8,
@@ -543,7 +543,7 @@ const CREDENTIAL: FormatParams = FormatParams {
 
 /// Credential proofs, masked: see the module's notes.
 pub const CREDENTIAL_PROOF: Format = Format {
-    number: 42,
+    number: 44,
     kind: ProofKind::Credential,
     channel: ChannelKind::Blake2sM31,
     params: CREDENTIAL,
@@ -554,29 +554,9 @@ pub const CREDENTIAL_PROOF: Format = Format {
     status: Status::Admitted,
     reference: CREDENTIAL_REFERENCE,
     bits: SecurityBits {
-        conjectured: 106,
-        proven: 62,
-    },
-};
-
-/// Format 42's alternative, counted beside it and **not registered**: the
-/// same at 47 queries and PoW 16, for a phone whose grind's 95th
-/// percentile passes 50 ms (S29). Registered, and 42 retired, only if the
-/// phone gate picks it; `h = 512` still covers its `2(4·2 + 47·3) = 298`
-/// revealed rows.
-pub const CREDENTIAL_PROOF_44: Format = Format {
-    number: 44,
-    params: FormatParams {
-        n_queries: 47,
-        pow_bits: 16,
-        ..CREDENTIAL
-    },
-    status: Status::Reserved,
-    bits: SecurityBits {
         conjectured: 110,
         proven: 62,
     },
-    ..CREDENTIAL_PROOF
 };
 
 /// Every registered format, by number.
@@ -603,11 +583,15 @@ pub const REGISTRY: [Format; 6] = [
 ///   proved and measured as a candidate for 39. A proof was made under it,
 ///   so no later format takes it;
 /// - **30, reserved, never admitted:** credential proofs at blowup 2 and 86
-///   queries, counted on an unmasked shape; 42 is the credential format,
-///   counted on its masked one.
+///   queries, counted on an unmasked shape; 44 is the credential format,
+///   counted on its masked one;
+/// - **42, admitted, then retired:** credential proofs at 43 queries and
+///   PoW 20 (106 / 62), whose grind's 95th percentile on the gate phone
+///   passed 50 ms; 44 takes PoW 16 at 47 queries. Proofs were made under
+///   it, so no later format takes it.
 ///
 /// So a number names one AIR and one set of parameters.
-pub const RETIRED: [u32; 11] = [24, 25, 26, 27, 29, 30, 31, 33, 34, 36, 40];
+pub const RETIRED: [u32; 12] = [24, 25, 26, 27, 29, 30, 31, 33, 34, 36, 40, 42];
 
 /// The entry for `number`, admitted or not.
 pub fn lookup(number: u32) -> Option<&'static Format> {
@@ -720,7 +704,7 @@ mod tests {
                 (35, 104, 62),
                 (37, 106, 62),
                 (39, 146, 82),
-                (42, 106, 62),
+                (44, 110, 62),
             ]
         );
         assert!(REGISTRY.iter().all(Format::meets_floors));
@@ -736,7 +720,7 @@ mod tests {
     /// The unrounded counts the parameters were chosen by: the segments'
     /// 62.86 at 40 queries and PoW 24, no less than 44 queries at PoW 20
     /// give the same shape, and the device and credential formats' least
-    /// query count whose count clears 62 (44's beside 42's).
+    /// query count whose count clears 62.
     #[test]
     fn the_parameters_are_the_least_that_clear_their_margins() {
         let count = |params: &FormatParams, shape: &SecurityShape| {
@@ -746,7 +730,7 @@ mod tests {
         assert!((62.85..62.86).contains(&segment), "{segment}");
         let at_44 = count(&LEAF_FOLD.params, &SEGMENT_REFERENCE);
         assert!((62.74..62.75).contains(&at_44), "{at_44}");
-        for format in [DEVICE_PROOF, CREDENTIAL_PROOF, CREDENTIAL_PROOF_44] {
+        for format in [DEVICE_PROOF, CREDENTIAL_PROOF] {
             let fewer = FormatParams {
                 n_queries: format.params.n_queries - 1,
                 ..format.params
@@ -828,7 +812,7 @@ mod tests {
         }
     }
 
-    /// Every number names one entry; only 28, 35, 39 and 42 are admitted, and a
+    /// Every number names one entry; only 28, 35, 39 and 44 are admitted, and a
     /// segment verifier takes 35 alone; the retired numbers are
     /// refused as retired and name no entry; every other number is refused.
     #[test]

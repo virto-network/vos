@@ -1,4 +1,4 @@
-//! Credential proofs (`docs/design/proving.md` §8): format 42, the
+//! Credential proofs (`docs/design/proving.md` §8): format 44, the
 //! credential AIR's `p2` and `qm31` masked under variant (c) on the fork's
 //! Blake2s-M31 channel, verified against the program of the statement's
 //! kind ([`verify`]).
@@ -46,37 +46,37 @@ use crate::masked::{Claim, MaskedFormat, TREES, verify_masked};
 pub use vos_pvm_recair_air::credential::CredentialKind;
 
 /// The credential format's number (`vos_pvm_proof::format::CREDENTIAL_PROOF`).
-pub const FORMAT: u32 = 42;
+pub const FORMAT: u32 = 44;
 
-/// Format 42's PCS configuration: blowup 4, 43 queries, PoW 20, FRI fold
+/// Format 44's PCS configuration: blowup 4, 47 queries, PoW 16, FRI fold
 /// step 1, a last layer of one coefficient, affine DEEP batching.
 pub const CONFIG: PcsConfig = PcsConfig {
-    pow_bits: 20,
+    pow_bits: 16,
     fri_config: FriConfig {
         log_last_layer_degree_bound: 0,
         log_blowup_factor: 2,
-        n_queries: 43,
+        n_queries: 47,
         fold_step: 1,
     },
     lifting_log_size: None,
     deep_batching: DeepBatching::Affine,
 };
 
-/// Format 42's parameters as the program id hashes them: log blowup,
+/// Format 44's parameters as the program id hashes them: log blowup,
 /// queries, PoW, fold step, log last layer, interaction PoW.
-pub const PARAMS: [u32; 6] = [2, 43, 20, 1, 0, 8];
+pub const PARAMS: [u32; 6] = [2, 47, 16, 1, 0, 8];
 
-/// Format 42's interaction PoW.
+/// Format 44's interaction PoW.
 pub const INTERACTION_POW_BITS: u32 = 8;
 
-/// Format 42's trees beside the AIR's columns: 8 salt columns a salted
+/// Format 44's trees beside the AIR's columns: 8 salt columns a salted
 /// tree, an `R` of 8 columns.
 pub const PINS: MaskPins = MaskPins {
     salt_columns: 8,
     fri_mask_columns: 8,
 };
 
-/// Format 42's `log2 h`: the prover's randomizer, 512 coefficients a
+/// Format 44's `log2 h`: the prover's randomizer, 512 coefficients a
 /// column. The verifier reads no mask; pinned with the format.
 pub const LOG_MASK_ROWS: u32 = 9;
 
@@ -84,13 +84,13 @@ pub const LOG_MASK_ROWS: u32 = 9;
 /// `4h` rows, whatever its statement uses of them.
 pub const LOG_SIZES: [u32; 2] = [11, 11];
 
-/// Format 42's trees' widths: preprocessed 50 (`p2`'s 33, `qm31`'s 17);
+/// Format 44's trees' widths: preprocessed 50 (`p2`'s 33, `qm31`'s 17);
 /// main 341 (`p2`'s 309 and `qm31`'s 16, 4 blinding columns each, 8
 /// salts); interaction 32 (12 and 12, 8 salts); composition 20 (its 4
 /// coordinates, `R`'s 8, 8 salts).
 pub const TREE_WIDTHS: [usize; TREES] = [50, 341, 32, 20];
 
-/// The values format 42's DEEP quotient batches: one a sampled column
+/// The values format 44's DEEP quotient batches: one a sampled column
 /// (`50 + 333 + 24 + 4 + 8`), and two more for each of the 24 columns read
 /// at the previous row (`p2`'s 16, each running sum's 4), a second sample
 /// and its periodicity value.
@@ -99,7 +99,7 @@ pub const DEEP_VALUES: usize = 467;
 /// The longest credential proof a decode reads, in bytes: ingress's cap.
 pub const MAX_PROOF_BYTES: usize = 512 << 10;
 
-/// Format 42 as its verifier pins it.
+/// Format 44 as its verifier pins it.
 pub const CREDENTIAL: MaskedFormat<'static> = MaskedFormat {
     number: FORMAT,
     config: CONFIG,
@@ -113,7 +113,7 @@ pub const CREDENTIAL: MaskedFormat<'static> = MaskedFormat {
 };
 
 /// The auth circuit's preprocessed root on the Blake2s-M31 trees under
-/// format 42: `vos-pvm-recair`'s credential tests compute it from the
+/// format 44: `vos-pvm-recair`'s credential tests compute it from the
 /// circuit, and refuse a change here that is not theirs.
 pub const AUTH_ROOT: [u8; 32] = [
     218, 77, 85, 120, 51, 250, 250, 87, 36, 62, 83, 81, 242, 254, 49, 93, 240, 230, 50, 68, 159,
@@ -126,18 +126,18 @@ pub const OWNER_ROOT: [u8; 32] = [
     119, 108, 146, 19, 120, 54, 146, 134, 80, 37,
 ];
 
-/// The auth circuit's program id under format 42
+/// The auth circuit's program id under format 44
 /// ([`vos_pvm_recair_air::credential::program_id`] of [`AUTH_ROOT`]): what a
 /// binding names.
 pub const AUTH_PROGRAM: [u8; 32] = [
-    187, 33, 248, 87, 177, 255, 104, 73, 219, 202, 147, 68, 29, 200, 89, 34, 109, 100, 197, 30,
-    134, 196, 201, 16, 98, 58, 130, 107, 74, 110, 68, 118,
+    168, 99, 111, 36, 65, 57, 118, 59, 226, 167, 173, 28, 45, 51, 172, 33, 92, 81, 247, 62, 202,
+    75, 214, 81, 201, 182, 20, 47, 48, 187, 87, 109,
 ];
 
-/// The owner circuit's program id under format 42, as [`AUTH_PROGRAM`].
+/// The owner circuit's program id under format 44, as [`AUTH_PROGRAM`].
 pub const OWNER_PROGRAM: [u8; 32] = [
-    55, 63, 103, 84, 89, 130, 93, 7, 116, 111, 171, 81, 214, 216, 165, 24, 91, 17, 198, 25, 46, 61,
-    243, 62, 108, 118, 92, 47, 59, 232, 104, 125,
+    56, 184, 78, 6, 73, 157, 226, 3, 138, 223, 15, 117, 74, 243, 0, 39, 229, 226, 251, 123, 103,
+    120, 67, 8, 112, 192, 66, 22, 102, 194, 24, 14,
 ];
 
 /// The preprocessed root of `kind`'s circuit.
@@ -148,7 +148,7 @@ pub const fn preprocessed_root(kind: CredentialKind) -> &'static [u8; 32] {
     }
 }
 
-/// The program id of `kind`'s circuit under format 42.
+/// The program id of `kind`'s circuit under format 44.
 pub const fn program(kind: CredentialKind) -> &'static [u8; 32] {
     match kind {
         CredentialKind::Auth => &AUTH_PROGRAM,
@@ -168,7 +168,7 @@ pub struct CredentialProof {
 }
 
 /// The proof in `bytes`: at most [`MAX_PROOF_BYTES`], its postcard encoding
-/// read whole and canonical (re-encoded, the same bytes), its format 42.
+/// read whole and canonical (re-encoded, the same bytes), its format 44.
 #[cfg(feature = "credential-bytes")]
 pub fn decode(bytes: &[u8]) -> Result<CredentialProof, Error> {
     if bytes.len() > MAX_PROOF_BYTES {
@@ -193,7 +193,7 @@ pub fn encode(proof: &CredentialProof) -> Option<Vec<u8>> {
 }
 
 /// Verifies `proof` of a `kind` statement whose public words are `words`
-/// (the kind's first): the circuit `kind`'s, under format 42.
+/// (the kind's first): the circuit `kind`'s, under format 44.
 pub fn verify(kind: CredentialKind, words: &[u32], proof: CredentialProof) -> Result<(), Error> {
     check_words(kind, words)?;
     verify_with(&CREDENTIAL, preprocessed_root(kind), words, proof)
@@ -263,7 +263,7 @@ mod tests {
 
     use crate::masked::{fri_rounds, shape_of};
 
-    /// The credential set at format 42's pins: the trees' widths and DEEP
+    /// The credential set at format 44's pins: the trees' widths and DEEP
     /// values as pinned, the composition tree the last and the tallest, at
     /// FRI's degree bound 2^13.
     #[test]
@@ -277,11 +277,11 @@ mod tests {
         assert_eq!(fri_rounds(13, &CONFIG.fri_config).unwrap(), [1; 13]);
     }
 
-    /// The constants are format 42's registry entry; its program ids are
+    /// The constants are format 44's registry entry; its program ids are
     /// its roots' under the circuit hash; the header is the segment
     /// transcript's.
     #[test]
-    fn the_constants_are_format_42s() {
+    fn the_constants_are_the_registrys() {
         let entry = &vos_pvm_proof::format::CREDENTIAL_PROOF;
         let masking = entry.masking.unwrap();
         assert_eq!(entry.number, FORMAT);

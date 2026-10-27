@@ -1,9 +1,9 @@
-//! The credential proofs' x86 timings (slice 7's 7.10 gate): auth, owner,
-//! and membership and payment together, each proved masked under formats
-//! 42 and 44 on the Blake2s-M31 channel, `ROUNDS` times after two warm-ups;
-//! the median and the 95th percentile of the prove times, the PoW grinds
-//! alone (20 and 16 bits, `GRINDS` of each), R1, the verify time and the
-//! proof's bytes. Each thread count named on the command line (1, 4 and 8
+//! The credential proofs' timings: auth, owner, and membership and payment
+//! together, each proved masked under the registry's credential format on
+//! the Blake2s-M31 channel, `ROUNDS` times after two warm-ups; the median
+//! and the 95th percentile of the prove times, the PoW grinds alone (20
+//! bits, the retired 42's, and 16, 44's: `GRINDS` of each, the evidence
+//! the format was picked on), R1, the verify time and the proof's bytes. Each thread count named on the command line (1, 4 and 8
 //! if none) runs in a rayon pool of its own; the cores are the caller's
 //! (`taskset`).
 //!
@@ -16,7 +16,7 @@ use stwo::core::proof_of_work::GrindOps;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_final_verifier::credential::{self as verifier, encode};
-use vos_pvm_proof::format::{CREDENTIAL_PROOF, CREDENTIAL_PROOF_44, Format};
+use vos_pvm_proof::format::{CREDENTIAL_PROOF, Format};
 use vos_pvm_recair::credential::{self, AuthPublic, AuthWitness, OwnerPublic, Statement, Words};
 use vos_pvm_recair::masked::MaskRng;
 use vos_wire::credentials::{DEPTH, EMPTY, Tag, compress, leaf, root_of};
@@ -120,10 +120,7 @@ fn proves(name: &str, statement: &Statement, format: &Format) {
             stark_proof: proof.stark_proof.clone(),
         };
         bytes = encode(&proof).unwrap().len();
-        if let Some(kind) = statement
-            .kind()
-            .filter(|_| format.number == CREDENTIAL_PROOF.number)
-        {
+        if let Some(kind) = statement.kind() {
             verifier::verify(kind, &statement.words(), proof).unwrap();
         }
         if round >= 2 {
@@ -160,10 +157,8 @@ fn main() {
         pool.install(|| {
             grinds(20);
             grinds(16);
-            for format in [&CREDENTIAL_PROOF, &CREDENTIAL_PROOF_44] {
-                for (name, statement) in statements() {
-                    proves(name, &statement, format);
-                }
+            for (name, statement) in statements() {
+                proves(name, &statement, &CREDENTIAL_PROOF);
             }
         });
     }

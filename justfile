@@ -4,7 +4,7 @@ default:
     @just --list
 
 # The fast suites' crates, which `test` and `check` run.
-core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
+core_crates := "-p vos-pvm -p vos-pvm-compiler -p vos-pvm-program -p vos-pvm-codec -p vos-raft -p merkle-crdt -p vos-pvm-precompiles -p vos-pvm-poseidon2 -p vos-pvm-proof-verifier -p vos-wire -p vos-tree -p vos-jam -p vos-pvm-recair-air -p vos-pvm-final-verifier -p vos-device -p vos-anchor -p vos-statement -p vos-statement-service --features vos-anchor/vectors,vos-statement/fixtures"
 
 # The agent's suites' crates, which `test-agent` and `check` run.
 agent_crates := "-p vos-sdk -p vos-sdk-macros -p vos-testkit -p vos-checker -p vos-api -p vos-http -p vos-gateway -p vos-node -p vos-node-prover -p vos-venue -p vos-net -p vos-cli -p vos-jam-dev -p vos-scale"
@@ -25,6 +25,11 @@ test:
     cargo test -p vos-statement --features heap-peak --test heap
     just test-recair
     cargo test -p vos-pvm-proof --lib
+
+# The phone bench's two Android binaries (arm64-v8a, the NDK s4 builds
+# with), the seeded one holding an x86 run's proof hashes: `tools/phone`.
+phone out="target/phone":
+    tools/phone/build.sh {{out}}
 
 # The recursion AIR's prover tests, four at a time: at every core at once
 # its recursion suite passed 12 GiB, the limit the gates run under.
@@ -280,6 +285,7 @@ _forbidden +gates:
         [venue-clients "-p vos-node --features prover" [kreivo-mock kreivo model] []] \
         [seeded-masks "--workspace" [seeded-masks] []] \
         [seeded-masks "-p vos-cli --features prover" [seeded-masks] []] \
+        [seeded-masks "-p vos-device" [seeded-masks] []] \
         [seeded-masks "--manifest-path agent/default/Cargo.toml" [seeded-masks] []] \
         [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml" [seeded-masks] []] \
         [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks] []] \

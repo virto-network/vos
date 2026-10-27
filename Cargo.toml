@@ -34,9 +34,11 @@ members = [
     "pvm/proof/anchor",
     "pvm/proof/derive",
     "pvm/proof/verifier",
+    "pvm/device",
     "pvm/bench",
     "tools/jam-dev",
     "tools/scale",
+    "tools/phone",
 ]
 # A plain `cargo build` builds what ships: the development crates (the
 # checker, the JAM tooling, the scale harness) enable test features of the
@@ -74,6 +76,7 @@ default-members = [
     "pvm/proof/anchor",
     "pvm/proof/derive",
     "pvm/proof/verifier",
+    "pvm/device",
     "pvm/bench",
 ]
 exclude = [
@@ -209,6 +212,7 @@ vos-pvm-poseidon2 = { path = "pvm/proof/poseidon2" }
 vos-pvm-recair-air = { path = "pvm/proof/recair-air" }
 vos-pvm-recair = { path = "pvm/proof/recair" }
 vos-pvm-final-verifier = { path = "pvm/proof/final-verifier" }
+vos-device = { path = "pvm/device" }
 vos-statement = { path = "pvm/proof/statement" }
 vos-anchor = { path = "pvm/proof/anchor" }
 vos-statement-service = { path = "pvm/proof/statement/service" }

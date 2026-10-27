@@ -1,7 +1,7 @@
 //! The credential prover (`docs/design/proving.md` §8): a statement's
 //! circuit ([`mod@circuit`]) proved masked over the credential AIR's set, the
 //! recursion AIR's `p2` and `qm31` (`vos_pvm_recair_air::masked::
-//! CredentialComponents`), under format 42 on the Blake2s-M31 channel
+//! CredentialComponents`), under format 44 on the Blake2s-M31 channel
 //! ([`prove`]); the final verifier's [`vos_pvm_final_verifier::credential`]
 //! verifies it.
 //!
@@ -128,7 +128,7 @@ where
     Ok(scheme.roots()[0])
 }
 
-/// The program id of `kind`'s circuit under format 42: its circuit hash
+/// The program id of `kind`'s circuit under format 44: its circuit hash
 /// (`vos_pvm_recair_air::credential::program_id`).
 pub fn program_id(kind: CredentialKind) -> [u8; 32] {
     let root =
@@ -143,7 +143,7 @@ pub fn program_id(kind: CredentialKind) -> [u8; 32] {
     .expect("a Blake2s-M31 root's words are below p")
 }
 
-/// Proves `statement` under format 42 on the Blake2s-M31 channel, its masks
+/// Proves `statement` under format 44 on the Blake2s-M31 channel, its masks
 /// from `rng`; the witness checked first.
 pub fn prove(
     statement: &Statement,
@@ -251,7 +251,7 @@ where
 
 /// Verifies `proof` of the credential circuit whose preprocessed root is
 /// `root`, masked under `format` on `MC`, against its public `words`: the
-/// final verifier's masked verifier over the credential set, as format 42's
+/// final verifier's masked verifier over the credential set, as format 44's
 /// verifier runs it on any channel and format.
 pub fn verify_on<MC: MerkleChannel>(
     format: &Format,

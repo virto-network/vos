@@ -6,8 +6,9 @@
 //! time and one pushed out of the ring, each `RootUnknown` and admitted
 //! after a path refetch; a revoked member's root refused once
 //! `ROOT_MAX_AGE` has passed by batch time; owner proofs paying from their
-//! rows; no log entry holding a proof; and a verified call holding no
-//! large body's place while it waits to apply.
+//! rows; no log entry holding a proof; a verified call holding no large
+//! body's place while it waits to apply; and the device library's
+//! requests and proofs admitted as they leave it.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -791,4 +792,209 @@ fn a_revoked_members_root_goes_stale_and_owners_pay_their_rows() {
     done(&founded.send(at, &founded.pay(at, &renewed, "alice", "bob", 5)));
     let balance: Option<u64> = founded.read(PURSES, "balance", b"bob".to_vec());
     assert_eq!(balance, Some(75));
+}
+
+/// `vos-device`'s `SCOPE_VECTOR`: `scope([0x51; 32], 4, 2, "login")`, the
+/// name in SCALE.
+const SCOPE_VECTOR: [u8; 32] = [
+    176, 47, 24, 3, 211, 3, 208, 103, 92, 44, 198, 75, 144, 255, 58, 99, 210, 27, 59, 25, 235, 172,
+    49, 126, 162, 142, 147, 35, 82, 189, 54, 43,
+];
+
+/// A device request's answer, its bytes sent as they leave the library:
+/// its kind's two bytes and the agent's four name the route, the rest is
+/// the body.
+fn device_send(founded: &Founded, at: NodeNumber, request: &[u8]) -> Vec<u8> {
+    let kind = u16::from_le_bytes([request[0], request[1]]);
+    let agent = u32::from_le_bytes(request[2..6].try_into().unwrap());
+    assert_eq!(agent, founded.agent.0);
+    let route = match kind {
+        k if k == vos_api::Kind::Query as u16 => "queries",
+        k if k == vos_api::Kind::Credentialed as u16 => "credentialed",
+        other => panic!("not a device request: {other:#x}"),
+    };
+    let path = format!("/agents/{agent}/{route}");
+    let (_, body) = client::post(founded.cluster.target(at), &path, &request[6..]).unwrap();
+    body
+}
+
+/// The device library's scope is ingress's, the vector on both sides; its
+/// path query, its auth and owner proofs and its requests are admitted by
+/// a follower's ingress as they leave it, the poll's `ctx.nullifier` the
+/// library's, and the purses paying from the row its owner digest claims;
+/// a `RootUnknown` answer decodes as the library's.
+#[test]
+fn the_device_librarys_proofs_are_admitted() {
+    use vos_device::wire::{self, Answer};
+
+    assert_eq!(
+        vos_device::scope(&[0x51; 32], 4, 2, b"login")
+            .unwrap()
+            .to_bytes(),
+        SCOPE_VECTOR
+    );
+    assert_eq!(
+        tree::scope(&SpaceId([0x51; 32]), AgentId(4), InstanceId(2), b"login"),
+        SCOPE_VECTOR
+    );
+
+    let founded = Founded::new();
+    let at = founded.follower();
+    let space = founded.space.0;
+    let agent = founded.agent;
+    let secret = vos_device::derive_secret(&[0x5e; 32], &[0x42; 32]);
+    let member = vos_device::member(&secret).to_bytes();
+    founded.write(CREDENTIALS, "enroll", member);
+    let prover = vos_device::Prover::new(vos_device::ProverConfig {
+        threads: vos_device::Threads::Count(4),
+        ..vos_device::ProverConfig::default()
+    })
+    .unwrap();
+    let time = || client::time(founded.cluster.target(at)).unwrap();
+    let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
+
+    let mut keeper = vos_device::PathKeeper::new(vos_device::member(&secret));
+    let now = time();
+    assert!(keeper.due(now, None));
+    let query = wire::path_query(
+        agent.0,
+        &identity,
+        CREDENTIALS.0,
+        &vos_device::member(&secret),
+        now + 60_000,
+    )
+    .unwrap();
+    let witness = wire::path_answer(&device_send(&founded, at, &query))
+        .unwrap()
+        .expect("an enrolled member's path");
+    keeper.update(witness, now).unwrap();
+
+    let name = b"login";
+    let login = |expires_ms| {
+        vos_device::Call::new(
+            space,
+            agent.0,
+            POLL.0,
+            founded.method(POLL, "login").0,
+            ().encode(),
+            expires_ms,
+        )
+        .unwrap()
+    };
+    let call = login(time() + 60_000);
+    let proof = prover
+        .prove_auth(&secret, keeper.witness().unwrap(), name, &call)
+        .unwrap();
+    vos_device::verify(&proof, &call, Some(name)).unwrap();
+    let vos_device::CredentialPublic::Auth {
+        scope, nullifier, ..
+    } = proof.public
+    else {
+        unreachable!()
+    };
+    assert_eq!(scope.to_bytes(), founded.scope(POLL, "login"));
+    let answer = device_send(&founded, at, &wire::credentialed(&call, &proof));
+    let Ok(Answer::Ran {
+        outcome: Outcome::Done(reply),
+        ..
+    }) = wire::credentialed_answer(&answer)
+    else {
+        panic!("the device's auth call: {answer:?}");
+    };
+    assert_eq!(
+        Option::<[u8; 32]>::decode_exact(&reply).unwrap(),
+        Some(nullifier.to_bytes()),
+        "the poll's `ctx.nullifier` is the library's"
+    );
+    assert_eq!(
+        wire::credentialed_answer(&device_send(
+            &founded,
+            at,
+            &wire::credentialed(&call, &proof)
+        )),
+        Ok(Answer::Refused(CredentialRefusal::Replayed))
+    );
+
+    // Pushed out of the ring: the library's answer, a path fetched again,
+    // and a new proof admitted.
+    for seed in 200..200 + tree::RING as u32 + 4 {
+        founded.write(CREDENTIALS, "enroll", Secret::new(seed).member());
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let call = login(time() + 60_000);
+    let proof = prover
+        .prove_auth(&secret, keeper.witness().unwrap(), name, &call)
+        .unwrap();
+    let leader = founded.cluster.leader(agent).unwrap();
+    assert_eq!(
+        wire::credentialed_answer(&device_send(
+            &founded,
+            leader,
+            &wire::credentialed(&call, &proof)
+        )),
+        Ok(Answer::RootUnknown)
+    );
+    keeper.unknown();
+    let now = time();
+    assert!(keeper.due(now, None));
+    let query = wire::path_query(
+        agent.0,
+        &identity,
+        CREDENTIALS.0,
+        &vos_device::member(&secret),
+        now + 60_000,
+    )
+    .unwrap();
+    let fetched = wire::path_answer(&device_send(&founded, leader, &query))
+        .unwrap()
+        .unwrap();
+    keeper.update(fetched, now).unwrap();
+    let proof = prover
+        .prove_auth(&secret, keeper.witness().unwrap(), name, &call)
+        .unwrap();
+    assert!(matches!(
+        wire::credentialed_answer(&device_send(
+            &founded,
+            leader,
+            &wire::credentialed(&call, &proof)
+        )),
+        Ok(Answer::Ran {
+            outcome: Outcome::Done(_),
+            ..
+        })
+    ));
+
+    // An owner proof pays from the row its digest claims.
+    let owner = vos_device::owner(&secret).to_bytes();
+    let expires = time() + 60_000;
+    for (row, digest) in [("device", owner), ("shop", Secret::new(9).owner())] {
+        let row = row.as_bytes().to_vec();
+        founded.write(PURSES, "invite_row", (row.clone(), digest, expires));
+        founded.write(PURSES, "claim_row", (row.clone(), digest));
+        founded.write(PURSES, "mint", (row, 50u64));
+    }
+    let arguments = (b"device".to_vec(), b"shop".to_vec(), 20u64).encode();
+    let pay = vos_device::Call::new(
+        space,
+        agent.0,
+        PURSES.0,
+        founded.method(PURSES, "transfer").0,
+        arguments,
+        time() + 60_000,
+    )
+    .unwrap();
+    let proof = prover.prove_owner(&secret, &pay).unwrap();
+    let answer = device_send(&founded, at, &wire::credentialed(&pay, &proof));
+    assert!(
+        matches!(
+            wire::credentialed_answer(&answer),
+            Ok(Answer::Ran {
+                outcome: Outcome::Done(_),
+                ..
+            })
+        ),
+        "the device's payment: {answer:?}"
+    );
+    let balance: Option<u64> = founded.read(PURSES, "balance", b"shop".to_vec());
+    assert_eq!(balance, Some(70));
 }

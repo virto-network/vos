@@ -1,0 +1,122 @@
+# Session P2 on the Fairphone 6 (slice 7's 7.12), 2026-10-27. Part 1: S29's format decision,
+# recair's credential_timing example (formats 42 and 44, system allocator), NDK 28.2, API 30.
+Tue Oct 27 03:08:14 PM CET 2026
+  level: 71
+  temperature: 300
+  Capacity level: -1
+ 15:08:15 up 8 days, 19:09,  0 users,  load average: 1.39, 1.56, 1.68
+8 threads:
+  PoW 20 grind alone: mean 24.8 ms, p50 16.6 ms, p95 71.9 ms
+  PoW 16 grind alone: mean 4.0 ms, p50 3.6 ms, p95 6.2 ms
+  auth, format 42: prove p50 161.6 ms, p95 202.5 ms; R1 p50 9.1 ms; verify p50 3.39 ms; 201816 bytes
+  owner, format 42: prove p50 157.7 ms, p95 213.9 ms; R1 p50 9.3 ms; verify p50 3.38 ms; 198681 bytes
+  membership and payment, format 42: prove p50 162.8 ms, p95 201.8 ms; R1 p50 9.1 ms; verify p50 3.44 ms; 206948 bytes
+  auth, format 44: prove p50 154.0 ms, p95 178.3 ms; R1 p50 12.3 ms; verify p50 4.22 ms; 219471 bytes
+  owner, format 44: prove p50 156.6 ms, p95 175.1 ms; R1 p50 13.0 ms; verify p50 3.93 ms; 219005 bytes
+  membership and payment, format 44: prove p50 156.6 ms, p95 179.5 ms; R1 p50 12.2 ms; verify p50 3.88 ms; 220752 bytes
+  level: 71
+  temperature: 300
+  Capacity level: -1
+exit=0
+== round 2, taskset f0, 4 threads
+Tue Oct 27 03:09:13 PM CET 2026
+  level: 71
+  temperature: 300
+  Capacity level: -1
+4 threads:
+  PoW 20 grind alone: mean 36.5 ms, p50 23.2 ms, p95 110.0 ms
+  PoW 16 grind alone: mean 2.7 ms, p50 1.8 ms, p95 5.2 ms
+  auth, format 42: prove p50 163.1 ms, p95 266.2 ms; R1 p50 10.6 ms; verify p50 3.47 ms; 195520 bytes
+  owner, format 42: prove p50 166.5 ms, p95 233.2 ms; R1 p50 10.6 ms; verify p50 3.49 ms; 202279 bytes
+  membership and payment, format 42: prove p50 166.1 ms, p95 269.6 ms; R1 p50 10.2 ms; verify p50 3.51 ms; 201601 bytes
+  auth, format 44: prove p50 147.3 ms, p95 156.5 ms; R1 p50 12.9 ms; verify p50 3.81 ms; 219216 bytes
+  owner, format 44: prove p50 149.5 ms, p95 165.2 ms; R1 p50 13.1 ms; verify p50 3.79 ms; 218187 bytes
+  membership and payment, format 44: prove p50 156.3 ms, p95 171.3 ms; R1 p50 14.2 ms; verify p50 3.92 ms; 220269 bytes
+  level: 71
+  temperature: 300
+  Capacity level: -1
+
+# Part 2: phone gate PG1, tools/phone (vos-phone, mimalloc), format 44 registered.
+# Binaries: bf37a8d474bf7062109ba6ace52f01551fa0483706f47688dce7afe2e0dc4da1  vos-phone-timing 188d0a6209deb6e242368c633adf3b38252104e2b75a9bdf5848760d01966cdc  vos-phone-seeded 
+# x86 references: auth=906a5898bdbb3c32e0e5039f3617e5be3e53d07164a6fb6ce2df68021b55792e owner=2c478edea7b8b1271139b9a3bb2a18c55944b9001b9cedfc019280c8475b49d7 joint=14307f330492babffbfac22952b0ac2b47e736f02d266307ae35d1806e8a4dad 
+Fairphone 6
+SM7635
+Fairphone/FP6/FP6:16/FP6.QREL.16.111.0/WS1Q:user/release-keys
+ 15:56:17 up 8 days, 19:57,  0 users,  load average: 1.68, 1.41, 1.33
+== round 1, seeded, threads auto
+Tue Oct 27 03:56:17 PM CET 2026
+  level: 77
+  temperature: 300
+  Capacity level: -1
+{"kind":"device","arch":"aarch64","os":"android","cpus":8,"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"build":"seeded","format":44}
+{"kind":"cell","cell":"auth","format":44,"threads":8,"reps":20,"prove_ms_p50":166.1,"prove_ms_p95":197.1,"prove_ms_min":134.2,"prove_ms_max":197.1,"prove_ms_runs":[165.4,155.8,168.9,197.1,157.7,165.2,170.0,180.7,182.1,157.1,166.1,164.1,170.8,168.2,189.4,153.1,138.5,134.2,159.0,183.8],"verify_ms":24.28,"proof_bytes":216762,"distinct_proofs":1,"proof_sha256":"906a5898bdbb3c32e0e5039f3617e5be3e53d07164a6fb6ce2df68021b55792e","matches_x86":true,"verified":true,"peak_rss_mib":127.5}
+{"kind":"cell","cell":"owner","format":44,"threads":8,"reps":20,"prove_ms_p50":166.2,"prove_ms_p95":203.4,"prove_ms_min":155.6,"prove_ms_max":203.4,"prove_ms_runs":[161.3,166.2,176.4,203.4,161.3,163.6,159.4,166.6,174.7,169.4,165.8,157.6,164.6,168.6,164.8,161.7,166.4,168.6,155.6,173.9],"verify_ms":25.23,"proof_bytes":216815,"distinct_proofs":1,"proof_sha256":"2c478edea7b8b1271139b9a3bb2a18c55944b9001b9cedfc019280c8475b49d7","matches_x86":true,"verified":true,"peak_rss_mib":125.6}
+{"kind":"cell","cell":"joint","format":44,"threads":8,"reps":20,"prove_ms_p50":161.4,"prove_ms_p95":193.4,"prove_ms_min":149.8,"prove_ms_max":193.4,"prove_ms_runs":[159.6,165.1,149.8,193.4,150.8,154.6,157.3,161.2,168.2,158.9,161.4,164.0,176.2,189.3,169.9,160.0,156.1,154.5,164.0,173.9],"verify_ms":25.00,"proof_bytes":220441,"distinct_proofs":1,"proof_sha256":"14307f330492babffbfac22952b0ac2b47e736f02d266307ae35d1806e8a4dad","matches_x86":true,"verified":true,"peak_rss_mib":118.0}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":300,"threads":8,"mean_ms":24.80,"p50_ms":16.54,"p95_ms":68.94,"max_ms":179.04}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":300,"threads":8,"mean_ms":4.29,"p50_ms":3.76,"p95_ms":6.70,"max_ms":27.63}
+{"kind":"done"}
+  level: 77
+  temperature: 300
+  Capacity level: -1
+== round 2, seeded, threads auto
+Tue Oct 27 03:57:39 PM CET 2026
+  level: 77
+  temperature: 300
+  Capacity level: -1
+{"kind":"device","arch":"aarch64","os":"android","cpus":8,"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"build":"seeded","format":44}
+{"kind":"cell","cell":"auth","format":44,"threads":8,"reps":20,"prove_ms_p50":163.8,"prove_ms_p95":180.3,"prove_ms_min":158.9,"prove_ms_max":180.3,"prove_ms_runs":[164.7,166.9,163.8,168.7,161.3,167.1,168.2,161.2,160.9,160.0,160.7,158.9,159.9,163.2,180.3,166.3,163.8,163.5,171.6,168.4],"verify_ms":23.60,"proof_bytes":216762,"distinct_proofs":1,"proof_sha256":"906a5898bdbb3c32e0e5039f3617e5be3e53d07164a6fb6ce2df68021b55792e","matches_x86":true,"verified":true,"peak_rss_mib":120.9}
+{"kind":"cell","cell":"owner","format":44,"threads":8,"reps":20,"prove_ms_p50":164.9,"prove_ms_p95":184.7,"prove_ms_min":120.9,"prove_ms_max":184.7,"prove_ms_runs":[152.1,130.0,120.9,168.0,184.7,168.7,153.7,166.0,160.8,173.2,156.8,158.4,166.8,156.0,164.9,158.6,171.3,160.4,167.9,172.7],"verify_ms":24.82,"proof_bytes":216815,"distinct_proofs":1,"proof_sha256":"2c478edea7b8b1271139b9a3bb2a18c55944b9001b9cedfc019280c8475b49d7","matches_x86":true,"verified":true,"peak_rss_mib":127.0}
+{"kind":"cell","cell":"joint","format":44,"threads":8,"reps":20,"prove_ms_p50":162.7,"prove_ms_p95":172.2,"prove_ms_min":141.8,"prove_ms_max":172.2,"prove_ms_runs":[159.4,157.6,167.0,165.2,158.2,161.7,141.8,152.6,166.7,172.2,167.3,161.2,166.3,161.8,153.9,157.0,162.8,165.4,162.7,168.7],"verify_ms":25.18,"proof_bytes":220441,"distinct_proofs":1,"proof_sha256":"14307f330492babffbfac22952b0ac2b47e736f02d266307ae35d1806e8a4dad","matches_x86":true,"verified":true,"peak_rss_mib":116.6}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":300,"threads":8,"mean_ms":24.93,"p50_ms":16.14,"p95_ms":69.76,"max_ms":179.08}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":300,"threads":8,"mean_ms":4.27,"p50_ms":3.77,"p95_ms":6.92,"max_ms":24.22}
+{"kind":"done"}
+  level: 77
+  temperature: 300
+  Capacity level: -1
+== round 3, seeded, threads auto
+Tue Oct 27 03:59:01 PM CET 2026
+  level: 77
+  temperature: 300
+  Capacity level: -1
+{"kind":"device","arch":"aarch64","os":"android","cpus":8,"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"build":"seeded","format":44}
+{"kind":"cell","cell":"auth","format":44,"threads":8,"reps":20,"prove_ms_p50":168.5,"prove_ms_p95":184.3,"prove_ms_min":139.9,"prove_ms_max":184.3,"prove_ms_runs":[162.2,177.5,179.9,164.5,170.1,167.8,161.9,139.9,179.7,168.7,161.8,147.2,152.7,157.7,161.9,184.3,173.3,172.6,168.5,176.1],"verify_ms":26.62,"proof_bytes":216762,"distinct_proofs":1,"proof_sha256":"906a5898bdbb3c32e0e5039f3617e5be3e53d07164a6fb6ce2df68021b55792e","matches_x86":true,"verified":true,"peak_rss_mib":112.7}
+{"kind":"cell","cell":"owner","format":44,"threads":8,"reps":20,"prove_ms_p50":161.4,"prove_ms_p95":169.5,"prove_ms_min":119.9,"prove_ms_max":169.5,"prove_ms_runs":[119.9,161.4,148.5,154.7,169.5,157.3,166.0,152.0,145.0,136.5,163.8,161.0,167.9,155.7,166.0,164.4,163.3,160.2,165.4,161.7],"verify_ms":25.38,"proof_bytes":216815,"distinct_proofs":1,"proof_sha256":"2c478edea7b8b1271139b9a3bb2a18c55944b9001b9cedfc019280c8475b49d7","matches_x86":true,"verified":true,"peak_rss_mib":119.9}
+{"kind":"cell","cell":"joint","format":44,"threads":8,"reps":20,"prove_ms_p50":163.4,"prove_ms_p95":190.2,"prove_ms_min":131.5,"prove_ms_max":190.2,"prove_ms_runs":[162.8,171.9,183.7,190.2,163.3,152.7,144.5,166.5,182.7,131.5,157.5,169.3,163.4,165.3,158.7,154.6,168.9,157.2,159.4,176.9],"verify_ms":23.99,"proof_bytes":220441,"distinct_proofs":1,"proof_sha256":"14307f330492babffbfac22952b0ac2b47e736f02d266307ae35d1806e8a4dad","matches_x86":true,"verified":true,"peak_rss_mib":115.4}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":300,"threads":8,"mean_ms":24.50,"p50_ms":16.52,"p95_ms":69.82,"max_ms":178.97}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":300,"threads":8,"mean_ms":4.09,"p50_ms":3.61,"p95_ms":6.55,"max_ms":12.78}
+{"kind":"done"}
+  level: 77
+  temperature: 300
+  Capacity level: -1
+== pinned f0, 4 threads, seeded
+Tue Oct 27 04:00:38 PM CET 2026
+  level: 78
+  temperature: 300
+  Capacity level: -1
+{"kind":"device","arch":"aarch64","os":"android","cpus":4,"cpu_max_khz":[1804800,1804800,1804800,1804800],"build":"seeded","format":44}
+{"kind":"cell","cell":"auth","format":44,"threads":4,"reps":20,"prove_ms_p50":129.4,"prove_ms_p95":146.7,"prove_ms_min":122.1,"prove_ms_max":146.7,"prove_ms_runs":[125.9,124.9,126.6,130.0,131.6,145.4,124.5,129.4,127.6,134.7,126.3,128.2,142.0,146.7,142.7,124.9,131.2,130.5,122.1,125.1],"verify_ms":3.92,"proof_bytes":216762,"distinct_proofs":1,"proof_sha256":"906a5898bdbb3c32e0e5039f3617e5be3e53d07164a6fb6ce2df68021b55792e","matches_x86":true,"verified":true,"peak_rss_mib":131.8}
+{"kind":"cell","cell":"owner","format":44,"threads":4,"reps":20,"prove_ms_p50":130.7,"prove_ms_p95":153.9,"prove_ms_min":124.8,"prove_ms_max":153.9,"prove_ms_runs":[134.8,132.4,133.7,131.4,125.1,153.9,135.6,127.3,132.0,130.0,135.3,124.8,130.5,130.5,126.2,137.2,125.5,126.1,130.0,130.7],"verify_ms":3.82,"proof_bytes":216815,"distinct_proofs":1,"proof_sha256":"2c478edea7b8b1271139b9a3bb2a18c55944b9001b9cedfc019280c8475b49d7","matches_x86":true,"verified":true,"peak_rss_mib":132.8}
+{"kind":"cell","cell":"joint","format":44,"threads":4,"reps":20,"prove_ms_p50":126.1,"prove_ms_p95":141.5,"prove_ms_min":120.8,"prove_ms_max":141.5,"prove_ms_runs":[127.4,131.3,122.1,122.4,121.2,128.6,124.7,124.7,124.2,130.5,131.1,128.4,120.8,141.5,122.0,133.3,123.0,123.5,126.1,135.3],"verify_ms":3.84,"proof_bytes":220441,"distinct_proofs":1,"proof_sha256":"14307f330492babffbfac22952b0ac2b47e736f02d266307ae35d1806e8a4dad","matches_x86":true,"verified":true,"peak_rss_mib":117.6}
+{"kind":"grind","channel":"blake2s-m31","bits":20,"n":300,"threads":4,"mean_ms":40.33,"p50_ms":26.83,"p95_ms":119.01,"max_ms":309.02}
+{"kind":"grind","channel":"blake2s-m31","bits":16,"n":300,"threads":4,"mean_ms":3.92,"p50_ms":3.43,"p95_ms":7.86,"max_ms":15.94}
+{"kind":"done"}
+== timing build, threads auto
+Tue Oct 27 04:02:00 PM CET 2026
+  level: 78
+  temperature: 310
+  Capacity level: -1
+{"kind":"device","arch":"aarch64","os":"android","cpus":8,"cpu_max_khz":[1804800,1804800,1804800,1804800,2400000,2400000,2400000,2496000],"build":"timing","format":44}
+{"kind":"cell","cell":"auth","format":44,"threads":8,"reps":20,"prove_ms_p50":170.1,"prove_ms_p95":185.0,"prove_ms_min":150.6,"prove_ms_max":185.0,"prove_ms_runs":[165.9,172.0,155.3,185.0,167.3,170.1,169.3,161.8,163.5,156.7,151.9,150.6,181.9,178.2,174.8,171.6,161.2,171.2,173.2,183.6],"verify_ms":23.88,"proof_bytes":217870,"distinct_proofs":20,"proof_sha256":"e3f820cf3cf51393a8db69e5fb9f8f44a6a082e8da267774565a5cb4df85fcdf","matches_x86":null,"verified":true,"peak_rss_mib":125.8}
+{"kind":"cell","cell":"owner","format":44,"threads":8,"reps":20,"prove_ms_p50":179.0,"prove_ms_p95":187.3,"prove_ms_min":156.8,"prove_ms_max":187.3,"prove_ms_runs":[160.8,182.9,165.3,183.3,179.9,170.1,169.4,165.6,183.0,184.7,180.9,187.3,179.0,184.6,176.3,156.8,174.0,159.1,183.0,168.2],"verify_ms":25.09,"proof_bytes":216931,"distinct_proofs":20,"proof_sha256":"fa11fd8cac16d76b52259ace4a0787042f236d853ccdf2ba1b4f0a836a86cc05","matches_x86":null,"verified":true,"peak_rss_mib":115.8}
+{"kind":"cell","cell":"joint","format":44,"threads":8,"reps":20,"prove_ms_p50":164.0,"prove_ms_p95":180.5,"prove_ms_min":142.4,"prove_ms_max":180.5,"prove_ms_runs":[166.4,165.2,164.0,180.5,153.5,159.3,154.6,162.6,176.1,154.5,164.6,168.3,155.3,145.0,169.8,177.8,142.4,159.3,160.7,169.4],"verify_ms":25.35,"proof_bytes":215429,"distinct_proofs":20,"proof_sha256":"6144ad4983bb8e807b3ab61c3e5af11ee32c4b6f5eafc0d8bdecb80c47ae99f3","matches_x86":null,"verified":true,"peak_rss_mib":118.5}
+{"kind":"done"}
+  level: 78
+  temperature: 310
+  Capacity level: -1
+# The pulled proofs verified on x86 (vos-phone verify):
+{"kind":"verify","cell":"auth","proof_sha256":"e3f820cf3cf51393a8db69e5fb9f8f44a6a082e8da267774565a5cb4df85fcdf","verified":true}
+{"kind":"verify","cell":"owner","proof_sha256":"fa11fd8cac16d76b52259ace4a0787042f236d853ccdf2ba1b4f0a836a86cc05","verified":true}
+{"kind":"verify","cell":"joint","proof_sha256":"6144ad4983bb8e807b3ab61c3e5af11ee32c4b6f5eafc0d8bdecb80c47ae99f3","verified":true}
+{"kind":"verify","cell":"auth","proof_sha256":"906a5898bdbb3c32e0e5039f3617e5be3e53d07164a6fb6ce2df68021b55792e","verified":true}
+{"kind":"verify","cell":"owner","proof_sha256":"2c478edea7b8b1271139b9a3bb2a18c55944b9001b9cedfc019280c8475b49d7","verified":true}
+{"kind":"verify","cell":"joint","proof_sha256":"14307f330492babffbfac22952b0ac2b47e736f02d266307ae35d1806e8a4dad","verified":true}

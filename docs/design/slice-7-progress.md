@@ -3270,6 +3270,19 @@ threads (6 P-cores with SMT, 8 E-cores, 2 LP E-cores)]:
   answered `Proof` at ingress: a completeness failure of the format-42
   prover and verifier pair at about one proof in 30,000, found here and
   not fixed in 7.11 (below, left).
+- **Under format 44, at the merge with 7.12** [measured; the same laptop,
+  another agent's proving stress beside it, load 11 to 18]: the
+  verifier on one core (`credential_ingress`, core 3) auth 5.52 / 10.26
+  ms, owner 5.48 / 10.35, a wrong PoW refused in 1.56 / 2.18, a byte cut
+  0.43 / 0.45; the cut's refusal, which no format changes, ran 2.4 times
+  its quiet 0.18 ms, so the machine, not the format, is most of the
+  rise. The rate bench at k = 1 and 4 (`-- 1 4`) missed under that load:
+  76 and 301 a second of 100 and 400, credentialed p50 / p99 1.9 / 4.1 s
+  and 2.2 / 3.4 s, signed 5.5 / 6.7 and 5.3 / 7.3 ms, a verification's
+  mean 12.0 and 12.6 ms after 10.9 and 10.7 ms of executor wait, the
+  proofs made at 10 a second (30 quiet); every honest proof of the 5,000
+  verified. A quick sanity of the format change, not the gate: S55's run
+  is the gate's.
 
 **Where the plan was off:**
 - **The schema's section** could not simply grow a field: the section is
@@ -3420,3 +3433,280 @@ runs on the machine]: the wire's `credentialed` 6, the testkit's
 `api::` and `credentialed::` units; `just check` green at `4b3e0e68`
 (exit 0, 1,629 passed in 122 suites). The rate bench as above; the
 compumax run is S55's, left.
+
+## Step 7.12: the device library and the credential phone gate
+
+Branch `s7/7.12`, from vos-core `920103b3`.
+
+**S29 decided: format 44.** The rule: the grind's 95th percentile on the
+phone above 50 ms takes PoW 16 at 47 queries (44), else PoW 20 at 43
+(42). The grind is the fork's chunked one (olanod/stwo `vos/grind-chunks`
+`4cd1f83f`: 2^14 nonces a chunk, the smallest nonce kept), timed alone on
+the Blake2s-M31 channel, 300 grinds a run [measured; Fairphone 6, session
+P2 below; `research/slice-7/phone-fairphone6-p2.txt`]:
+
+| PoW | threads | mean / p50 / p95 / max, ms | runs |
+|---|---|---|---|
+| 20 | 8 (automatic) | 24.5–24.9 / 16.1–16.6 / **68.9–71.9** / 179 | 4 |
+| 20 | 4 big cores (`taskset f0`) | 36.5–40.3 / 23.2–26.8 / **110–119** / 309 | 2 |
+| 16 | 8 | 4.0–4.3 / 3.6–3.8 / **6.2–6.9** / 28 | 4 |
+| 16 | 4 big cores | 2.7–3.9 / 1.8–3.4 / **5.2–7.9** / 16 | 2 |
+
+PoW 20's 95th percentile is above 50 ms at every thread count, so **44**
+is registered and admitted, and **42 retired** (proofs were made under it;
+a number names one set of parameters). 30 stays retired unregistered. The
+same decision run proved under both formats (recair's `credential_timing`,
+the system allocator, 40 proves): at 8 threads auth p50 / p95 161.6 /
+202.5 ms under 42 and 154.0 / 178.3 under 44; on four big cores 163.1 /
+266.2 under 42 and 147.3 / 156.5 under 44: 42's tail is its grind's.
+
+**Built:**
+- **Format 44** (`vos_pvm_proof::format::CREDENTIAL_PROOF`, number 44, 47
+  queries, PoW 16, 110 / 62, admitted; `RETIRED` gains 42): the final
+  verifier's constants re-pinned (`FORMAT`, `CONFIG`, `PARAMS`; the
+  preprocessed roots unchanged, the same columns at the same blowup; both
+  program ids new, they hash the format); recair's tests prove under 44,
+  and a proof under 42's parameters is refused under 44 (and a proof
+  relabelled 42 refused as `Format`); the count test keeps 42's 106 / 62
+  for the record; `pvm/proof/SECURITY.md`'s table.
+- **`vos-device`** (`pvm/device`, `std`; pins K and L):
+  - `source_input` (SHA-256 of `vos/device/input/v1` ‖ handle),
+    `derive_secret` (BLAKE2b-512 of `vos/device/secret/v1` ‖ handle ‖ o,
+    eight `u64`s mod p; `w` zeroized), `DeviceSecret` (zeroized on drop,
+    no `Clone`, no `Debug`), `member`, `owner`;
+  - `Call` (`new` draws the nonce from the OS), `binding_digest` and
+    `binding`, `scope` (the name 1–64 bytes, SCALE as `proving.md` §8
+    pins it);
+  - `Prover` (`ProverConfig { threads, max_memory, masks }`):
+    `prove_auth` (the witness checked first, `Witness` before any
+    proving), `prove_owner`, `prove_membership_and_payment` (the joint
+    circuit: its own program id, kind byte `0xff`); the secret's words
+    and the circuit's private values zeroized after each proof;
+    `Threads::Auto` one thread a core, an even split, `Count`, `Cores`
+    (pinned by `sched_setaffinity`); `PEAK_BYTES` (192 MiB) below which
+    `new` refuses `Memory`;
+  - `verify` (the format the registry's, the binding the call's under the
+    kind's program, auth's scope the guard name's, then the final
+    verifier by kind) and `verify_joint`;
+  - `wire`: `time_request` / `time_answer`, `path_query` / `root_query`
+    (`QueryCall`s signed over the agent's identity by a key drawn for each,
+    the replica's applied state), `path_answer` / `root_answer`,
+    `credentialed` (identity §5's body after the agent's id) and
+    `credentialed_answer` (`Ran`, `RootUnknown`, another credential
+    refusal by code, any other answer);
+  - `PathKeeper`: due with no path, when a `root()` answer moved, or on
+    its timer (30 s, a twentieth of `ROOT_MAX_AGE`, jittered uniformly by
+    half a period either way); `update` refuses a path not its member's;
+    `unknown` drops the path and halves the period (to 1 s), a fetch
+    finding the root unmoved doubles it back;
+  - its `SECURITY.md`: the secret's containment (what is zeroized and what
+    is not: the trace and its masked polynomials, the hashes' states),
+    what the library shows, the witness and the call, paths.
+- **`node/SECURITY.md`**, new here (7.11's, unmerged, has the fuller
+  surface): the path leak stated as reduced, not closed (operators learn a
+  digest is online and its address, not when it proves), the refetch after
+  `RootUnknown` linking that one fetch to its proof, a tree change showing
+  the online members.
+- **`tools/phone`** (`vos-phone`): `run` (one child process a cell, so a
+  cell's peak is its own: p50, p95, min, max, verify, bytes, distinct
+  proofs, SHA-256, `matches_x86`, peak resident from `VmHWM`; then the
+  grinds at PoW 20 and 16) and `verify DIR` (a phone's proofs verified on
+  x86); `--features seeded` (recair's seeded masks, the x86 run's hashes
+  compiled in) and `mimalloc`. `tools/phone/build.sh` (`just phone`):
+  the x86 seeded run's references, then both Android binaries with
+  `cargo ndk -t arm64-v8a -P 30` against NDK 28.2.13676358, stripped.
+- **The plan's text:** pin I's format paragraph and identity §5's
+  `format` now 44; `proving.md` §8's format and a "Built" note for the
+  library; S29's open question closed.
+
+**Tests** (`pvm/device/tests/device.rs`, 8, in `check`'s core crates):
+the derivation against SHA-256 and BLAKE2b-512 computed apart; the scope
+and binding against their preimages, each field changing them, the
+name's bounds; each proof verified against its call and refused against
+other arguments, another name, no name, a relabelled format, a flipped
+byte, another secret's owner digest; a bad witness refused before
+proving (another member's path, a sibling changed, a word ≥ p, a slot's
+bit flipped, another secret's joint); the configuration (memory below
+`PEAK_BYTES`, no threads, no cores; `Auto` a thread a core; two pinned
+cores prove); the wire (every request decoded back, each query's
+signature checked with `verify_strict` and its key fresh, the answers,
+the body's layout); the keeper's timer and `unknown`; and **a
+`RootUnknown` answer refetching and proving anew**: a member's path held,
+64 tree-changing batches a second apart push its root out of `Ring` while
+it is still within `ROOT_MAX_AGE` (`Unknown`, not `Stale`), ingress's
+`[2, 9, 10]` decodes as `RootUnknown`, the keeper drops the path and is
+due, the new path's root is accepted by the ring and the new proof
+verifies, under the same nullifier.
+
+**Phone gate PG1** [measured; session P2, 2026-10-27 15:56–16:02; Fairphone
+6, SM7635, Android 16 (`FP6.QREL.16.111.0`); battery 77–78%, 30.0–31.0 °C
+at every round's start and end, USB powered, the phone's load average
+1.3–1.7 before the runs; `vos-phone` built with mimalloc; 20 proves a cell
+after 2 warm-ups; three seeded rounds and one timing round at automatic
+threads (8), 60 s apart, and one seeded round on the four big cores]:
+
+| statement | gate | automatic threads, p50 / p95, ms (per round) | 4 big cores, p50 / p95 | peak resident | bytes |
+|---|---|---|---|---|---|
+| auth | ≤ 250 (target 150) | 166.1 / 197.1, 163.8 / 180.3, 168.5 / 184.3; timing 170.1 / 185.0 | 129.4 / 146.7 | 113–132 MiB | 216,762 |
+| owner | ≤ 150 | 166.2 / 203.4, 164.9 / 184.7, 161.4 / 169.5; timing 179.0 / 187.3 | 130.7 / 153.9 | 116–133 MiB | 216,815 |
+| membership and payment | ≤ 250 | 161.4 / 193.4, 162.7 / 172.2, 163.4 / 190.2; timing 164.0 / 180.5 | 126.1 / 141.5 | 117–119 MiB | 220,441 |
+
+- **Met:** auth within 250 ms (median of the rounds' medians 166 ms, the
+  worst 95th percentile 197 ms), membership and payment within 250 ms
+  (163, 193), each within 256 MiB (at most 133 MiB); every proof verified
+  on the phone (verify 23.6–26.6 ms at automatic threads, 3.8–3.9 ms on a
+  big core); the phone's proofs pulled and verified on x86 (`vos-phone
+  verify`, the timing build's and the seeded build's, a flipped byte
+  refused); **the seeded build's bytes equal x86's** for all three, every
+  rep (`matches_x86` true, one distinct proof a cell, at 8 threads on the
+  phone and at 1, 3 and 22 on x86: the chunked grind's nonce is the
+  smallest whatever the threads).
+- **Missed:** auth's target of 150 ms at automatic threads (166), met on
+  the four big cores (129 / 147); **owner's 150 ms** at automatic threads
+  (p50 161–179), met on the big cores at the median (131) but not at the
+  95th percentile (154). Owner costs what auth does, as on x86 (7.10's
+  review restated the x86 target as owner at most auth's, the floor being
+  the masking's): the shape is the floor's, `4h = 2^11` rows a component
+  whatever the circuit, so owner at most auth's holds (equal within the
+  noise) while 150 ms is out of reach at automatic threads without a
+  lever.
+- **The breakdown** (the decision run, 44, 8 threads): the PoW-16 grind
+  about 4 ms (p95 7), R1 12–13 ms, verify-free prove the rest, about
+  140 ms: the masked prove of two components at 2^11 rows (columns at
+  2^12, the composition at 2^13, the trees at 2^15).
+- **The levers, in order:** (1) threads by core class (7.17): the even
+  split over all eight cores is about 22% slower than four threads on the
+  big cores (166 against 129 ms for auth), the little cores (A520-class
+  at 1.8 GHz) holding the split back; (2) `h = 256` (7.14's option 2),
+  floors 2^10, the masked prove about halved, at the price of a re-pin
+  and a measured R1 retry rate; (3) blowup 8 with 29 queries, floor 2^10.
+  None is taken here: PG1's two hard budgets hold, and S29's choice is
+  made.
+
+**x86** [measured; `vos-phone` timing build, 4 threads on cores 1, 3, 6,
+8, 20 proves a cell, quiet (load 3.5 falling)]: auth p50 / p95 44.0 / 46.8
+ms, owner 41.4 / 44.6, membership and payment 42.6 / 49.2, as 7.10's
+`credential_timing` found under 44; verify 2.1–2.2 ms; peak 137–153 MiB;
+the PoW-20 grind p95 37 ms, PoW-16 2.2 ms. The phone at automatic threads
+is about 3.8 times x86 on four P-cores, on its four big cores about 2.9.
+A first x86 run under another agent's credential run (about 21 cores
+busy, load 7–24) took 425–469 ms at the median: discarded.
+
+**Where the plan was off:**
+- **Owner at most 150 ms** on the phone is out of reach at automatic
+  threads for the reason 7.10 found on x86: the masking's floor, not the
+  statement, sets the cost.
+- **`Threads::Auto`'s even split costs** about a fifth on this phone
+  against the big cores alone: 7.17's weighting is the first lever, now
+  with a phone number.
+- **The scope's name:** `proving.md` §8 pins it in SCALE (a `u32` length,
+  then the bytes), and this library hashes it so; 7.11's
+  `vos_wire::credentials::scope` (unmerged) hashes the name's bytes alone,
+  so every auth proof from this library would be refused `Scope` by 7.11's
+  ingress as it stands. One of the two changes at the merge; the pinned
+  text says the library's.
+- **The API grew** (recorded in `proving.md` §8's "Built" note): the joint
+  proof and its verifier, `ProverConfig::masks`, `Result` where the OS's
+  randomness may fail, `PathKeeper::unknown` and `credentialed_answer`.
+- **The Android build is the NDK's** (bionic, dynamically linked, API 30),
+  not the static musl build P1's spike used; nothing but mimalloc compiles
+  C.
+
+**For 7.11's merge:** `vos-device`'s `wire` mirrors identity §5's
+`Credentialed` body and the `Rejection::Credential(RootUnknown)` bytes
+(`[2, 9, 10]`), and `call` the binding and scope: at the merge they move
+onto `vos_wire::ingress::{Credentialed, CredentialPublic,
+CredentialRefusal}` and `vos_wire::credentials::{scope, Bound, binding}`,
+with a test that the library's request decodes as 7.11's and its proof
+passes 7.11's ingress; the scope's name encoding settled first (above);
+7.11's fuzz replay corpora (`credential_verify_bytes/auth`, `owner`) were
+made under 42 and are made again under 44; `node/SECURITY.md` keeps 7.11's
+text, its path entry taking this one's specifics (the timer, the
+`RootUnknown` refetch).
+
+**Review (Opus):** no high soundness or secret-handling finding; one
+high merge blocker, H1, the scope name's encoding against 7.11's (above):
+`proving.md` §8's SCALE kept, pin I's and identity §7's formula lines now
+say so, and a vector pinned (`SCOPE_VECTOR`) for 7.11's `scope` to meet.
+Folded: M1, the seeded masks were a public `ProverConfig` field any
+consumer could set once another crate unified recair's feature: the
+masks are now always the OS's, and the seam is `vos-device`'s own
+`seeded-masks` feature (`Prover::seeded`, the bench's `seeded` build its
+only user), with a `check-no-seeded-masks` row for the library's default
+build. M2, a moved root made every online member fetch at once: `due`
+now brings the fetch forward to a time drawn below 10 s after the move is
+first seen, and the client's duties (its own jittered `root()` polls, a
+connection apart) are stated in both `SECURITY.md`s. L1, `verify` checks
+the arguments' cap and says it runs the stateless checks alone. L2,
+`credentialed_answer` decodes a refusal exactly (`Expiry { now }` kept,
+`RootStale` its own answer, a code past `Proof` or a trailing byte
+refused). L4, `AuthWitness`'s `Debug` shows nothing. L5, the statement's
+secret zeroized by a drop guard, unwinding included; recair's `Context`
+copy added to `SECURITY.md`'s "does not". L6, auth proofs with a changed
+nullifier or root (words the call does not fix) refused by the proof
+itself. Not taken: L3 (a path older than the one held: `path` answers no
+`since`, and an older root the ring holds is still accepted within
+`ROOT_MAX_AGE`), L7 (the OS's randomness failing reported as `Prove`, as
+documented). For the merge: 7.11 replaces `vos_api::CREDENTIALED` with
+`Kind::Credentialed`, which `wire.rs` then names.
+
+**The merge with 7.11** (vos-core `7b78d9af`):
+- **The scope's name in SCALE** everywhere: `vos_wire::credentials::scope`
+  hashes the name's `u32` little-endian length before its bytes, as
+  `proving.md` §8, pin I and identity §7 pin it; ingress, the apply-time
+  check and the fuzz target call it, and `vos-device`'s `scope` and
+  `Call::binding_digest` are now `vos_wire`'s `credentials::scope` and
+  `Bound::digest`, one computation for both sides. The wire test pins
+  `SCOPE_VECTOR`. No pin moved: `kernel constants::` passes unchanged
+  (`WINDOW_PROGRAM`, `BALANCE_PROGRAM`, `PREDICATE_PROGRAM` and the
+  derive pins), and no served read's format changed (only the default
+  agent's refine calls `scope`, and no pinned blob holds that kernel).
+- **The mirrors deleted:** `wire::credentialed` sends `vos_wire`'s
+  `ingress::Credentialed` under `Kind::Credentialed`;
+  `credentialed_answer` decodes the node's `Response` exactly and
+  answers `Answer::Refused(CredentialRefusal)` for the refusals it does
+  not tell apart (`CREDENTIALED`, `PublicBody`, `CredentialedBody`,
+  `LAST_REFUSAL` and the refusal bytes gone).
+- **End to end** (`node/host/tests/served/credentialed.rs`,
+  `the_device_librarys_proofs_are_admitted`): `SCOPE_VECTOR` from both
+  `vos_device::scope` and `vos_wire`'s; on three nodes of a founded space
+  the library's `path_query` bytes answered over the node's HTTP into a
+  `PathKeeper`, its `prove_auth` proof's request admitted at a follower's
+  ingress as it leaves the library, the poll's `login` answering
+  `ctx.nullifier` equal to the proof's nullifier, the same request
+  `Replayed`; 68 enrollments pushing the root out, the leader's answer
+  decoding as `Answer::RootUnknown`, the keeper's refetch and a new proof
+  admitted; an owner proof paying 20 from the row its owner digest
+  claimed. Under 7.11's scope (the name's bytes alone) the vector
+  differs, so the scope assertions would fail and ingress refuse the
+  proof `Scope` [inferred].
+- **The fuzz replay seeds** of `credentialed_decode` and
+  `credential_verify_bytes` made again under 44 (`credential_ingress
+  --seeds`); no other corpus held a 42 proof.
+- **`node/SECURITY.md`** is 7.11's, its path leak taking this step's
+  specifics (the timer, the moved root's spread, the `RootUnknown`
+  refetch); the docs' scope lines say both widths and the SCALE name.
+- **The rate bench and the verifier under 44:** 7.11's entry (quick
+  sanity under another agent's load, not the gate).
+- **Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, another
+  agent's proving stress beside it]: the served `credentialed` 6 (the
+  new one among them), `vos-device`'s 8, the wire's, `kernel
+  constants::`; `just check` green at `057a0364` (exit 0, 1,638 passed in
+  125 suites, no flake); `just test-proof` green, 579 passed in 50
+  suites.
+
+**Commits:** `5f8678fb` format 44 registered, 42 retired; `814caf3c` the
+device library and the phone bench; `95950c51` session P2's record; this
+record and the plan's text.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, another agent's
+runs at times]: `just check` at `11bef490` green through the formatting,
+the docs, the venue rules, the no-std builds, the leak gates (the new
+`seeded-masks` row among them), the kit, the guests, the fuzz replay, the
+lints, the core crates (`vos-device`'s 8 among them) and `test-recair`;
+in the agent crates `vos-checker`'s
+`a_held_tcp_port_takes_no_listener_and_resets_what_connects` failed once
+(`AddrInUse` rebinding its port, other agents' runs binding ports
+beside it; untouched here) and passed 3 of 3 alone; the agent crates
+rerun with `--no-fail-fast`, 699 passed in 53 suites, and `test-reads`
+green. `just test-proof` green, 579 passed in 50 suites.
