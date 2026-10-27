@@ -169,8 +169,12 @@ the table, not the range, is the rule.
 `0xffff` is the frame error's, an answer only: as a request it is
 `UnknownKind`. `0x0104`, the credentialed call, is 7.11's: its checks,
 in order, are `identity-and-authority.md` §5's (and `node/SECURITY.md`'s);
-its body is not large (only an install's is): its verifications are bounded
-by the node's verification budget, past which it is answered `Busy`.
+its body is large (every proof is past a call's limit), and takes a place
+of the credentialed calls' own, apart from the installs': the body is dropped
+once decoded and the place given back once the proof is verified, so the
+places bound proofs held and verified, not calls waiting to apply; its
+verifications are bounded by the node's verification budget, past which it
+is answered `Busy`.
 
 - **Who may send each, and what may be repeated:**
 

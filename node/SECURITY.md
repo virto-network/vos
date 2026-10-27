@@ -158,14 +158,25 @@ serve its requests:
   node's connections and its verification budget, past which a call is
   answered `Busy` before its proof is decoded; a statement with a word at
   or above p is refused `Proof` without spending a verification.
-- Credentialed bodies past a call's size take places of their own, 64 at
-  once on the node's socket and QUIC together and 64 on each HTTP front
-  (about 100 MiB at the largest), apart from the installs' four: past
-  them, QUIC and HTTP answer at once from the header or head, the socket
-  reads the next only as one ends.
+- Credentialed bodies past a call's size (every one with a proof) take
+  places of their own, 64 at once on the node's socket and QUIC together
+  and 64 on the node's HTTP (about 100 MiB at the largest), apart from
+  the installs' four: past them, QUIC and HTTP answer at once from the
+  header or head, the socket reads the next only as one ends. A body is
+  dropped once decoded, and its place given back with its proof once the
+  proof is verified, never held through the apply or a forward's wait:
+  the places bound proofs held and verified at once, so 64 valid proofs
+  sent to a follower of a slow leader hold none of them past their
+  verifications. The gateway's HTTP keeps a body, and its place, until
+  the node answers, as it relays the body whole: its 64 places bound the
+  credentialed calls in flight through one gateway, under its limits per
+  address.
 - A binding digest's row is forgotten by the sweep, up to 64 a sweep
-  beside the 32 sessions' and workflows' rows it lists, so a burst of
-  credentialed calls holds no timer back.
+  beside the 32 sessions' and workflows' rows it lists, a sweep a batch
+  while rows are due: sustained credentialed calls past 64 a batch grow
+  the binding rows until the load falls, and while more than 96 bindings
+  are due before a session's or a workflow's row, that row waits for them
+  to drain.
 - A proof's verification takes about 2 ms on one x86 core; one whose PoW
   is wrong is refused in about 0.7 ms (the composition check runs before
   the PoW in the verifier's order), one cut short in about 0.2 ms
