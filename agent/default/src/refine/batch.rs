@@ -108,6 +108,13 @@ impl Batched {
             let key = keys::committed(&write.map, &write.key);
             base.earlier.insert(key, write.value.clone());
         }
+        let ring = base.ring.get_mut();
+        if ring
+            .as_ref()
+            .is_some_and(|(key, _)| run.writes.iter().any(|write| write.key == *key))
+        {
+            *ring = None;
+        }
         let mut stored = stepped.pages.into_iter();
         for page in &run.pages {
             let range = page
@@ -335,8 +342,10 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
             batched.counts.add(&key);
         }
         if admin {
-            // An admin step may change installed records.
+            // An admin step may change installed records, and the
+            // credential actor.
             base.installed.borrow_mut().clear();
+            *base.ring.borrow_mut() = None;
         }
         let mut floor = Floor::new(swept && with_inputs);
         for (at, workflow) in due {

@@ -11,7 +11,7 @@ use vos_testkit::programs::{actor, actor_elf, credentials, credentials_elf, meth
 use vos_wire::abi::cap::Target;
 use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::{Admin, CredentialedInput, Input, Request};
-use vos_wire::credentials::{self, Digest, RootEntry};
+use vos_wire::credentials::{self, Digest, Ring, RootEntry};
 use vos_wire::defaults::{BINDING_KEPT_MS, ROOT_MAX_AGE};
 use vos_wire::ids::{InstanceId, Principal, Session};
 use vos_wire::ingress::Grant;
@@ -601,11 +601,31 @@ fn a_once_guard_admits_a_nullifier_once_on_ok_alone() {
 /// The agent's own work on a credentialed auth call, its scope computed
 /// again and the credential actor's ring read beside the handler's run,
 /// leaves a fifth of a step's reserve spare, on a VOS host and on a JAM
-/// host, whose Poseidon2 compression is software.
+/// host, whose Poseidon2 compression is software, with the ring full: the
+/// ring is paid for once a refine, by the batch's first auth call.
 #[test]
 fn a_credentialed_calls_own_work_is_within_a_steps_reserve() {
     for (host, node) in [("VOS", Node::new()), ("JAM", Node::jam(true))] {
         let mut agent = Agent::on(node);
+        // A root a batch, each at its own time, until the ring is full: one
+        // session's requests in sequence.
+        let Input::Request(first) = agent.request(ALICE, CREDENTIALS, "enroll", (), START + 2)
+        else {
+            unreachable!()
+        };
+        for at in 0..credentials::RING as u32 {
+            let enroll = Request {
+                sequence: u64::from(at) + 1,
+                arguments: owner(1_000 + at).encode(),
+                ..first.clone()
+            };
+            agent.done(START + 2 + u64::from(at), vec![Input::Request(enroll)]);
+        }
+        let ring: Ring = agent
+            .node
+            .value(&credentials::ring_key(CREDENTIALS))
+            .expect("the ring");
+        assert_eq!(ring.0.len(), credentials::RING);
         let root = agent.root().root;
         let calls: Vec<Input> = (1..=21u8)
             .map(|nullifier| {
@@ -617,7 +637,10 @@ fn a_credentialed_calls_own_work_is_within_a_steps_reserve() {
         let empty = agent.node.agent_gas(vec![]);
         let one = agent.node.agent_gas(calls[..1].to_vec()) - empty;
         let each = (agent.node.agent_gas(calls) - empty - one) / 20;
-        println!("{host}: a credentialed call costs the agent {each}, the first {one}");
+        println!(
+            "{host}: a credentialed call costs the agent {each}, the first, paying the full \
+             ring, {one}"
+        );
         assert!(
             each <= (vos_wire::defaults::STEP_RESERVE * 4 / 5) as i64,
             "{host}: {each}"

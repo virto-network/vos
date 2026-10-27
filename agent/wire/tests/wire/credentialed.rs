@@ -281,3 +281,22 @@ fn the_credential_rows_are_their_own_and_read_back() {
     let listed = keys::due_rows(rows.iter().map(Ok::<_, ()>), 7, 8).unwrap();
     assert_eq!(listed.len(), 2);
 }
+
+/// The ring's row is the credential actor's hashed table `ring`'s one row,
+/// under the key byte 0, at that actor's instance alone.
+#[test]
+fn the_rings_row_is_its_tables_one_row() {
+    let rows = vos_wire::abi::Rows::Table {
+        tag: vos_wire::ids::derive_id("vos/table/", credentials::tables::RING),
+        transform: keys::Transform::Hashed,
+    };
+    let actor = InstanceId(9);
+    assert_eq!(
+        credentials::ring_key(actor),
+        keys::row(actor, rows, &[credentials::tables::RING_KEY]).unwrap()
+    );
+    assert_ne!(
+        credentials::ring_key(actor),
+        credentials::ring_key(InstanceId(8))
+    );
+}

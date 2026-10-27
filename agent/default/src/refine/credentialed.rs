@@ -8,13 +8,14 @@
 //! fails the call before anything is recorded: nothing of it ran, and it
 //! may come again.
 
+use alloc::rc::Rc;
 use alloc::vec::Vec;
 
 use vos_wire::abi::{Failure, Refusal};
 use vos_wire::batch::CredentialedInput;
-use vos_wire::credentials::{self, Ring, tables};
-use vos_wire::ids::{InstanceId, Principal, derive_id};
-use vos_wire::keys::{self, Due, Transform};
+use vos_wire::credentials::{self, Ring};
+use vos_wire::ids::{InstanceId, Principal};
+use vos_wire::keys::{self, Due};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::CredentialGuard;
 use vos_wire::{Decode, Encode, SpaceId, defaults};
@@ -129,25 +130,29 @@ fn space(base: &Base) -> Option<SpaceId> {
 }
 
 /// The credential actor's ring, `None` in an agent with none; its row
-/// paid for by its length. A row that does not read fails the step
+/// paid for by its length the first time a refine reads it
+/// ([`Base::ring`]). A row that does not read fails the step
 /// ([`Failure::Trapped`]), as one the meter cannot pay does
 /// ([`Failure::OutOfGas`]).
-fn ring(base: &Base) -> Result<Option<Ring>, Failure> {
+fn ring(base: &Base) -> Result<Option<Rc<Ring>>, Failure> {
     let corrupt = |_: Corrupt| Failure::Trapped;
     let Some(actor) = base.read(&keys::credentials()).map_err(corrupt)? else {
         return Ok(None);
     };
     let actor = InstanceId::decode_exact(&actor).ok_or(Failure::Trapped)?;
-    let rows = vos_wire::abi::Rows::Table {
-        tag: derive_id("vos/table/", tables::RING),
-        transform: Transform::Hashed,
-    };
-    let key = keys::row(actor, rows, &tables::RING_KEY.encode())?;
+    let key = credentials::ring_key(actor);
+    if let Some((cached, ring)) = base.ring.borrow().as_ref()
+        && *cached == key
+    {
+        return Ok(Some(Rc::clone(ring)));
+    }
     let Some(bytes) = base.read(&key).map_err(corrupt)? else {
         return Ok(None);
     };
     if !base.meter.take(defaults::RECORD_BYTE * bytes.len() as u64) {
         return Err(Failure::OutOfGas);
     }
-    Ring::decode_exact(&bytes).ok_or(Failure::Trapped).map(Some)
+    let ring = Rc::new(Ring::decode_exact(&bytes).ok_or(Failure::Trapped)?);
+    *base.ring.borrow_mut() = Some((key, Rc::clone(&ring)));
+    Ok(Some(ring))
 }

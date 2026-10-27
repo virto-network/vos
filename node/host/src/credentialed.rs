@@ -19,13 +19,13 @@ use std::time::Instant;
 use vos_pvm_final_verifier::credential::{self as verifier, CredentialKind};
 use vos_wire::abi::cap;
 use vos_wire::batch::CredentialedInput;
-use vos_wire::credentials::{self, Bound, Ring, tables};
-use vos_wire::ids::{AgentId, InstanceId, derive_id};
+use vos_wire::credentials::{self, Bound, Ring};
+use vos_wire::ids::{AgentId, InstanceId};
 use vos_wire::ingress::{CredentialPublic, CredentialRefusal, Credentialed, Rejection, Response};
-use vos_wire::keys::{self, Transform};
+use vos_wire::keys;
 use vos_wire::records::{Installed, unstored};
 use vos_wire::schema::CredentialGuard;
-use vos_wire::{Decode, Encode, SpaceId, defaults};
+use vos_wire::{Decode, SpaceId, defaults};
 
 use crate::calls::Forwardable;
 use crate::fault::{Fault, read};
@@ -293,15 +293,8 @@ fn ring(snapshot: &Snapshot, agent: AgentId) -> Result<Option<Ring>, Fault> {
     let Some(actor) = read::<InstanceId>(snapshot, agent, &keys::credentials())? else {
         return Ok(None);
     };
-    let rows = vos_wire::abi::Rows::Table {
-        tag: derive_id("vos/table/", tables::RING),
-        transform: Transform::Hashed,
-    };
-    let Ok(key) = keys::row(actor, rows, &tables::RING_KEY.encode()) else {
-        return Ok(None);
-    };
     Ok(snapshot
-        .get(agent, &key)?
+        .get(agent, &credentials::ring_key(actor))?
         .and_then(|bytes| Ring::decode_exact(unstored(&bytes)?)))
 }
 
