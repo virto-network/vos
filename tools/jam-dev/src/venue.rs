@@ -382,26 +382,6 @@ impl<S: Service> AnchorSend for JamSend<S> {
     }
 }
 
-/// The anchor outcome the service's `code` is; none for another code.
-pub fn anchor_code(code: u32) -> Option<AnchorCode> {
-    use AnchorCode::*;
-    [
-        New,
-        Again,
-        Item,
-        Signature,
-        Unregistered,
-        Ended,
-        Key,
-        Window,
-        Open,
-        Age,
-        Equivocation,
-    ]
-    .into_iter()
-    .find(|known| *known as u32 == code)
-}
-
 /// The leader's outcome of an anchor the service answered `code`, the code
 /// kept: `New` and `Again` taken; `Signature`, `Window` and `Age` never;
 /// `Key` unlisted; `Ended` and `Equivocation` (this anchor the evidence)
@@ -409,7 +389,7 @@ pub fn anchor_code(code: u32) -> Option<AnchorCode> {
 /// not yet.
 pub fn outcome(code: u32) -> AnchorOutcome {
     use AnchorCode::*;
-    match anchor_code(code) {
+    match AnchorCode::try_from(code).ok() {
         Some(New | Again) => AnchorOutcome::Taken,
         Some(Signature | Window | Age) => AnchorOutcome::Never(code),
         Some(Key) => AnchorOutcome::Unlisted(code),
@@ -688,16 +668,14 @@ impl Roots for Read {
 
 /// A registration's code read as its name, for a record.
 pub fn register_code(code: u32) -> &'static str {
-    [
-        (RegisterCode::Registered, "registered"),
-        (RegisterCode::Item, "undecodable"),
-        (RegisterCode::Genesis, "genesis"),
-        (RegisterCode::Founder, "not a founder, or its signature"),
-        (RegisterCode::Again, "registered already"),
-    ]
-    .into_iter()
-    .find(|(named, _)| *named as u32 == code)
-    .map_or("unknown", |(_, name)| name)
+    match RegisterCode::try_from(code) {
+        Ok(RegisterCode::Registered) => "registered",
+        Ok(RegisterCode::Item) => "undecodable",
+        Ok(RegisterCode::Genesis) => "genesis",
+        Ok(RegisterCode::Founder) => "not a founder, or its signature",
+        Ok(RegisterCode::Again) => "registered already",
+        Err(_) => "unknown",
+    }
 }
 
 #[cfg(test)]
@@ -777,7 +755,7 @@ mod tests {
             let operand = Operand {
                 package_hash,
                 payload_hash,
-                result: Ok(output),
+                ..Operand::new(output)
             };
             accumulate(&self.config, self.venue(), *slot, &[operand], storage);
             let id = state::outcome_id(&package_hash, &payload_hash);
@@ -839,7 +817,6 @@ mod tests {
         let controller = SigningKey::from_bytes(&[0xc0; 32]);
         let clock = WindowClock::DEFAULT;
         let genesis = SpaceGenesis {
-            version: vos_anchor::GENESIS_VERSION,
             nodes: vec![
                 (0, honest.verifying_key().to_bytes()),
                 (1, stolen.verifying_key().to_bytes()),

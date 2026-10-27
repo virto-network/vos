@@ -13,7 +13,6 @@ fn hex(bytes: &[u8]) -> alloc::string::String {
 
 fn genesis() -> SpaceGenesis {
     SpaceGenesis {
-        version: 1,
         nodes: vec![(1, [0x11; 32]), (2, [0x22; 32])],
         clock: WindowClock {
             origin_ms: 1_000_000,
@@ -49,8 +48,7 @@ fn a_genesis_encodes_field_by_field() {
 /// A genesis decode refuses what is not one canonical genesis of its
 /// version: another version, a byte short, a byte more, the count in a
 /// longer compact mode, a count past the input, no node, node numbers not
-/// strictly ascending. Its encoding writes its version whatever the field
-/// holds.
+/// strictly ascending. Its encoding writes its one version.
 #[test]
 fn a_genesis_decode_is_canonical() {
     let bytes = genesis().encode();
@@ -79,9 +77,7 @@ fn a_genesis_decode_is_canonical() {
         change(&mut other.nodes);
         assert_eq!(refused(&other.encode()), DecodeError::Noncanonical);
     }
-    let mut versioned = genesis();
-    versioned.version = 2;
-    assert_eq!(versioned.encode(), bytes);
+    assert_eq!(bytes[0], GENESIS_VERSION);
 }
 
 /// Window w holds `[B_{w-1}, B_w)`: the origin opens window 0, a time

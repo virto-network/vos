@@ -119,10 +119,7 @@ fn run(
 /// A kernel's return as its statement's parts, decoded whole, their
 /// io-hash the one it left; `None` otherwise, a kernel's bug.
 pub(crate) fn parts(returned: &[u8], io_hash: &[u8; 32]) -> Option<KernelReturn> {
-    match KernelReturn::decode(returned) {
-        Ok((parts, used)) if used == returned.len() && parts.io_hash() == *io_hash => Some(parts),
-        _ => None,
-    }
+    KernelReturn::decode_exact(returned).filter(|parts| parts.io_hash() == *io_hash)
 }
 
 /// [`Op::Random`]'s bytes: BLAKE2b-256 of `vos/random`, the seed, the step's

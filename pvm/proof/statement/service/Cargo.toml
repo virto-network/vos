@@ -24,9 +24,13 @@ bench = false
 # The statement, its venue checks and the final verifier (format 39); the
 # space's types, re-exported.
 vos-statement = { workspace = true }
-# The anchors', registrations' and migrations' signatures, verified at
+# The anchors', registrations' and controls' signatures, verified at
 # refine.
 ed25519-dalek = { version = "2", default-features = false }
+# The Gray Paper's naturals, and the refine arguments and accumulate inputs
+# a JAM node gives, in their one encoding.
+vos-pvm-program = { workspace = true }
+vos-wire = { workspace = true }
 
 [dev-dependencies]
 # The golden fixtures, judged by the service as by every venue.
@@ -38,5 +42,3 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 # linker.
 vos-pvm = { workspace = true }
 vos-pvm-compiler = { workspace = true }
-# The accumulate inputs' encoding a JAM node gives, which the service reads.
-vos-wire = { workspace = true }

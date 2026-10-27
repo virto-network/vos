@@ -1,7 +1,8 @@
 //! The venue's JAM programs' runtime, shared by the guests that link the
 //! final verifier (`final-verify`, `final-verify-test` and
-//! `vos-statement-service`'s): a stack of its own, the heap, the host-call
-//! convention, the panic handler and the single-core atomic libcalls.
+//! `vos-statement-service`'s): a stack of its own and the entries onto it,
+//! the heap, the host calls and their convention, the output, the panic
+//! handler and the single-core atomic libcalls.
 
 use core::cell::UnsafeCell;
 use core::fmt::Write;
@@ -23,6 +24,38 @@ unsafe impl Sync for Stack {}
 #[unsafe(no_mangle)]
 pub static VERIFY_STACK: Stack = Stack(UnsafeCell::new([0; STACK_BYTES]));
 
+/// The program's entries, each a label (`_start` first, at instruction 0)
+/// whose code moves the stack to [`VERIFY_STACK`] and calls its
+/// `extern "C"` main, returning with the main's φ7 and φ8. `STACK_BYTES`
+/// in scope where it is used.
+macro_rules! entries {
+    ($($label:literal => $main:literal),+ $(,)?) => {
+        core::arch::global_asm!(
+            $(
+                concat!(".global ", $label),
+                concat!(".type ", $label, ", @function"),
+                concat!($label, ":"),
+                "mv s0, ra",
+                "lla t0, VERIFY_STACK",
+                "li t1, {size}",
+                "add sp, t0, t1",
+                concat!("jal ra, ", $main),
+                "mv ra, s0",
+                "ret",
+            )+
+            size = const STACK_BYTES,
+        );
+    };
+}
+
+/// What an entry's main returns: the address and the length of its
+/// output (φ7, φ8).
+#[repr(C)]
+pub struct Output {
+    pub address: u64,
+    pub len: u64,
+}
+
 // ── The allocator ────────────────────────────────────────────────────────
 
 #[path = "heap.rs"]
@@ -34,6 +67,34 @@ pub use heap::Heap;
 pub static HEAP: Heap<ARENA_BYTES> = Heap::new();
 
 // ── Host calls ───────────────────────────────────────────────────────────
+
+/// The host calls the guests make, by their Gray Paper index.
+#[allow(dead_code, reason = "each guest makes some of them")]
+#[derive(Clone, Copy)]
+#[repr(u64)]
+pub enum Call {
+    Gas = 0,
+    Fetch = 2,
+    Read = 4,
+    Write = 5,
+    HistoricalLookup = 7,
+}
+
+/// `fetch`'s kinds (φ10) the guests read.
+#[allow(dead_code, reason = "each guest reads some of them")]
+#[derive(Clone, Copy)]
+#[repr(u64)]
+pub enum FetchKind {
+    /// The running item's extrinsic φ11.
+    OurExtrinsic = 4,
+    /// Work item φ11's payload.
+    Payload = 13,
+    /// Accumulate's input φ11.
+    Input = 15,
+}
+
+/// A host call's answer of none: no such value, or nothing written.
+pub const NONE: u64 = u64::MAX;
 
 /// `ecalli id` with φ7..φ12 = `a`; φ7 after it.
 macro_rules! hostcall {
@@ -47,7 +108,7 @@ macro_rules! hostcall {
                 "li t0, {id}",
                 "csrw 0x801, zero",
                 "ecall",
-                id = const $id,
+                id = const $id as u64,
                 lateout("t0") _,
                 inlateout("a0") a[0] => r,
                 inlateout("a1") a[1] => _,
@@ -64,7 +125,7 @@ macro_rules! hostcall {
 
 /// The gas left (`gas`, host call 0).
 pub fn gas_left() -> u64 {
-    hostcall!(0, [0; 6])
+    hostcall!(Call::Gas, [0; 6])
 }
 
 /// A static a single-threaded invocation borrows mutably.

@@ -79,9 +79,6 @@ pub(crate) struct Invocation<'a> {
     pub(crate) instances: Vec<InstanceGas>,
     pub(crate) messages: Vec<Outgoing>,
     pub(crate) attests: Vec<Attest>,
-    /// What the step's attests count against its limit: one each, an
-    /// attest at a window's cut [`cap::AT_CUT`].
-    attests_counted: usize,
     /// The bytes of state the step has written, and the rows, against
     /// its limits.
     write_bytes: usize,
@@ -106,7 +103,6 @@ impl<'a> Invocation<'a> {
             instances: Vec::new(),
             messages: Vec::new(),
             attests: Vec::new(),
-            attests_counted: 0,
             write_bytes: 0,
             rows_written: 0,
             draws: 0,
@@ -331,7 +327,7 @@ impl<'a> Invocation<'a> {
         self.frames.push(BTreeMap::new());
         let effects = (
             self.messages.len(),
-            (self.attests.len(), self.attests_counted),
+            self.attests.len(),
             self.write_bytes,
             self.rows_written,
         );
@@ -358,10 +354,9 @@ impl<'a> Invocation<'a> {
             Ended::Paused(_) => unreachable!("only a workflow pauses"),
         };
         if failed.is_some() {
-            let (messages, (attests, counted), written, rows) = effects;
+            let (messages, attests, written, rows) = effects;
             self.messages.truncate(messages);
             self.attests.truncate(attests);
-            self.attests_counted = counted;
             self.write_bytes = written;
             self.rows_written = rows;
         }
@@ -525,7 +520,7 @@ impl<'a> Invocation<'a> {
         let r = machine.registers();
         let method = MethodId(r[7] as u32);
         let call_arguments = read(machine, r[8], r[9], self.limits.attest)?;
-        if self.attests_counted + 1 > self.limits.attests {
+        if Attest::weighed(&self.attests) + 1 > self.limits.attests {
             return Err(Failure::Cap);
         }
         let installed = installed.ok_or(Failure::Unknown)?;
@@ -570,7 +565,6 @@ impl<'a> Invocation<'a> {
         copy_out(machine, &parts.output, r[10], 0, r[11])?;
         machine.set_register(7, parts.output.len() as u64);
         machine.set_register(8, 0);
-        self.attests_counted += 1;
         self.attests.push(Attest {
             program,
             window: None,
@@ -692,8 +686,8 @@ impl<'a> Invocation<'a> {
         let (Some(space), Some(clock)) = (space, clock) else {
             return Ok(None);
         };
-        let space = SpaceId::decode(&space).map_err(|_| Failure::Trapped)?.0;
-        let clock = WindowClock::decode(&clock).map_err(|_| Failure::Trapped)?.0;
+        let space = SpaceId::decode_exact(&space).ok_or(Failure::Trapped)?;
+        let clock = WindowClock::decode_exact(&clock).ok_or(Failure::Trapped)?;
         Ok((space != SpaceId::NONE).then_some((space, clock)))
     }
 
@@ -737,7 +731,7 @@ impl<'a> Invocation<'a> {
         let Some(program) = installed.kernel(method) else {
             return (Attested::Failed(AttestError::Unknown), 0);
         };
-        if self.attests_counted + cap::AT_CUT > self.limits.attests {
+        if Attest::weighed(&self.attests) + cap::AT_CUT > self.limits.attests {
             return (Attested::Failed(AttestError::Failed), 0);
         }
         let declared = installed
@@ -759,7 +753,6 @@ impl<'a> Invocation<'a> {
         let Some(parts) = parts(&run.output, &run.io_hash) else {
             return (Attested::Failed(AttestError::Failed), spent);
         };
-        self.attests_counted += cap::AT_CUT;
         self.attests.push(Attest {
             program,
             window: Some(window),
@@ -787,13 +780,12 @@ impl<'a> Invocation<'a> {
             return None;
         }
         let asked = self.read_state(&keys::request(window, request)).ok()??;
-        let (asked, _) = PendingRead::decode(&asked).ok()?;
-        let (served, used) = Served::decode(bytes).ok()?;
+        let asked = PendingRead::decode_exact(&asked)?;
+        let served = Served::decode_exact(bytes)?;
         let closed = self.read_state(&keys::closed(window)).ok()??;
         let closed = ClosedRow::decode_exact(&closed)?;
         let space = matches!(self.space(), Ok(Some((space, _))) if space == served.space);
-        let holds = used == bytes.len()
-            && space
+        let holds = space
             && served.window == window
             && served.agent == self.base.agent
             && served.instance == instance

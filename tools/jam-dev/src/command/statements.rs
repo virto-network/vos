@@ -26,7 +26,7 @@ use std::time::Duration;
 use ed25519_dalek::{Signer, SigningKey};
 use vos_jam_dev::live::statements::{Deployed, deploy};
 use vos_jam_dev::live::{PolkaJam, Watch};
-use vos_jam_dev::venue::{JamVenue, anchor_code, register_code};
+use vos_jam_dev::venue::{JamVenue, register_code};
 use vos_pvm::refine_host::{JamItem, JamRefine, RefineContext};
 use vos_statement::fixtures::{self, Fixture};
 use vos_statement::vos_anchor::{
@@ -322,7 +322,6 @@ impl Run<'_> {
             length_ms: LENGTH_MS,
         };
         let genesis = SpaceGenesis {
-            version: 1,
             nodes: vec![(0, founder.verifying_key().to_bytes())],
             clock,
             time: now,
@@ -496,7 +495,8 @@ fn check([unanchored, lone]: &[u32; 2], controlled: &Controlled) -> Result<(), F
     if codes != &[0, 0] || *replayed_add != ControlCode::Nonce as u32 {
         return Err(format!("the controls: {codes:?}, the replay {replayed_add}").into());
     }
-    if after.as_ref().ok().copied().and_then(anchor_code) != Some(AnchorCode::Ended) {
+    let after_code = after.as_ref().ok().map(|&code| AnchorCode::try_from(code));
+    if after_code != Some(Ok(AnchorCode::Ended)) {
         return Err(format!("the rotated key's anchor: {after:?}").into());
     }
     Ok(())

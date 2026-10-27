@@ -32,9 +32,7 @@ use vos_wire::records::{PendingRead, WorkflowState};
 use vos_wire::result::{Attest, KernelReturn, Outcome};
 use vos_wire::served::{Served, representative_row};
 use vos_wire::vos_anchor::venue::{AnchorRefusal, Anchoring};
-use vos_wire::vos_anchor::{
-    Anchor, GENESIS_VERSION, RootKind, RootRead, SpaceGenesis, VenueId, space_root,
-};
+use vos_wire::vos_anchor::{Anchor, RootKind, RootRead, SpaceGenesis, VenueId, space_root};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock};
 
 use crate::common::{self, NodeRun, Totals};
@@ -525,7 +523,6 @@ pub fn founder() -> SigningKey {
 /// `nonce`.
 pub fn genesis(nonce: u8) -> SpaceGenesis {
     SpaceGenesis {
-        version: GENESIS_VERSION,
         nodes: vec![(1, founder().verifying_key().to_bytes())],
         clock: CLOCK,
         time: 1_000,

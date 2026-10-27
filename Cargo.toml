@@ -84,7 +84,9 @@ exclude = [
     "pvm/proof/fuzz",
     "pvm/bench/guests",
     "agent/test-actors",
+    "agent/programs",
     "agent/default",
+    "agent/representative",
     "agent/credentials",
     # The final verifier's Wasm blob and its measuring runner: each its own
     # workspace, the blob verify-only for wasm32, the runner on wasmtime.

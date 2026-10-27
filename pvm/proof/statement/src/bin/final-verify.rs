@@ -24,9 +24,11 @@
 //!
 //!   then the proof's Blake2b-256 hash and its length (`u32`,
 //!   little-endian);
-//!   - 2: a golden vector of `vos-anchor` (`vos_anchor::vectors::Vector`'s
-//!     encoding), and nothing after it: its digests are computed, and no
-//!     proof is read;
+//!   - 2, `final-verify-test.elf`'s alone: a golden vector of `vos-anchor`
+//!     (`vos_anchor::vectors::Vector`'s encoding), and nothing after it: its
+//!     digests are computed, and no proof is read. `final-verify.elf`
+//!     refuses it as a bad payload, so no build a venue runs accepts
+//!     without a proof;
 //! - the proof, in its format's encoding, as a preimage of the running
 //!   service, read by `historical_lookup`: only once a judgement's checks
 //!   before the proof pass, and only when its length is at most
@@ -36,7 +38,7 @@
 //! Output (φ7 address, φ8 length): `Report`, every field a little-endian
 //! `u64`: the verdict, the gas left at each phase, the heap's figures, a
 //! refusal's text, a judgement's code and accepted statement id, and a
-//! vector's digests.
+//! vector's digests (zeros but in mode 2).
 //! Blake2b-256 is computed in software: JAM serves no hash.
 
 #![no_std]

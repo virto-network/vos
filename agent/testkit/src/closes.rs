@@ -9,7 +9,8 @@ use vos_wire::batch::Body;
 use vos_wire::ids::AgentId;
 use vos_wire::result::{Outcome, Outgoing, Write};
 use vos_wire::served::{
-    AgentRoot, ClosedRow, REPORTS_KEPT, REPRESENTATIVE, representative_ask, representative_row,
+    AgentPath, AgentRoot, ClosedRow, REPORTS_KEPT, REPRESENTATIVE, representative_ask,
+    representative_row,
 };
 use vos_wire::vos_anchor::RootKind;
 use vos_wire::{Decode, Encode, SpaceId, defaults, keys};
@@ -83,7 +84,7 @@ impl Testkit {
             messages.push(Outgoing {
                 to,
                 body: Body::Report(AgentRoot {
-                    kind: RootKind::Space as u8,
+                    kind: RootKind::Space,
                     window,
                     root,
                 }),
@@ -98,12 +99,7 @@ impl Testkit {
     /// `rep_root`: a `Closed` to each agent of `paths` past its close mark,
     /// at most [`defaults::CLOSE_PATHS`] of them in agent order, and the
     /// mark moved to the last.
-    pub fn close(
-        &mut self,
-        window: u64,
-        rep_root: [u8; 32],
-        paths: Vec<(AgentId, [u8; 16], Vec<u8>)>,
-    ) -> Step {
+    pub fn close(&mut self, window: u64, rep_root: [u8; 32], paths: Vec<AgentPath>) -> Step {
         let mut writes = Writes::default();
         let mark = writes.read::<(u64, Option<AgentId>)>(self, &keys::close_mark());
         let after = match mark {
@@ -115,9 +111,13 @@ impl Testkit {
         let mut messages = Vec::new();
         if let Some(after) = after {
             let mut last: Option<AgentId> = None;
-            for (agent, rep_salt, space_path) in paths
+            for AgentPath {
+                agent,
+                salt: rep_salt,
+                path: space_path,
+            } in paths
                 .into_iter()
-                .filter(|(agent, ..)| after.is_none_or(|after| *agent > after))
+                .filter(|path| after.is_none_or(|after| path.agent > after))
                 .take(defaults::CLOSE_PATHS)
             {
                 if last.is_some_and(|last| agent <= last) {
@@ -177,7 +177,7 @@ impl Testkit {
                 .window(self.time)
                 .map_or(0, |open| open.saturating_add(1));
         if space == SpaceId::NONE
-            || report.kind != RootKind::Space as u8
+            || report.kind != RootKind::Space
             || from == self.agent
             || !self.instances.contains_key(&REPRESENTATIVE)
             || ahead

@@ -266,13 +266,28 @@ impl PartialTree {
     }
 }
 
-impl Entry {
-    /// The tags of the entries' encodings, each its variant's
-    /// `codec(index)`, which the encoded proof's reader matches on.
-    pub(crate) const BRANCH: u8 = 0;
-    pub(crate) const HASH: u8 = 1;
-    pub(crate) const LEAF: u8 = 2;
-    pub(crate) const EMPTY: u8 = 3;
+/// The tag of an [`Entry`]'s encoding, its variant's `codec(index)`, which
+/// the encoded proof's reader matches on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum EntryTag {
+    Branch = 0,
+    Hash = 1,
+    Leaf = 2,
+    Empty = 3,
+}
+
+impl EntryTag {
+    /// The tag `byte` is; none for another byte.
+    pub(crate) const fn of(byte: u8) -> Option<Self> {
+        Some(match byte {
+            0 => Self::Branch,
+            1 => Self::Hash,
+            2 => Self::Leaf,
+            3 => Self::Empty,
+            _ => return None,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -282,19 +297,21 @@ mod tests {
     #[test]
     fn the_tags_are_the_codec_indices() {
         let entries = [
-            (Entry::Branch(7), Entry::BRANCH),
-            (Entry::Hash([1; 32]), Entry::HASH),
+            (Entry::Branch(7), EntryTag::Branch),
+            (Entry::Hash([1; 32]), EntryTag::Hash),
             (
                 Entry::Leaf {
                     key: vec![2],
                     value_hash: [3; 32],
                 },
-                Entry::LEAF,
+                EntryTag::Leaf,
             ),
-            (Entry::Empty, Entry::EMPTY),
+            (Entry::Empty, EntryTag::Empty),
         ];
         for (entry, tag) in entries {
-            assert_eq!(entry.encode()[0], tag, "{entry:?}");
+            assert_eq!(entry.encode()[0], tag as u8, "{entry:?}");
+            assert_eq!(EntryTag::of(tag as u8), Some(tag));
         }
+        assert_eq!(EntryTag::of(4), None);
     }
 }

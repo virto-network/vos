@@ -293,7 +293,7 @@ fn artifacts(args: DeployArgs) -> deploy::Artifacts {
             .unwrap_or_else(|| repository().join("target/x86_64-unknown-linux-musl/release")),
         agent: args
             .agent
-            .unwrap_or_else(|| guest("agent/default/target/riscv64em-vos/release/vos-agent.elf")),
+            .unwrap_or_else(|| guest("agent/programs/target/riscv64em-vos/release/vos-agent.elf")),
         repository: repository(),
     }
 }
@@ -305,7 +305,7 @@ fn agents_request(args: &AgentsArgs) -> (PathBuf, Option<PathBuf>) {
         .unwrap_or_else(|| guest("agent/test-actors/target/riscv64em-vos/release/shard.elf"));
     let representative = args
         .representative
-        .then(|| guest("agent/representative/target/riscv64em-vos/release/vos-representative.elf"));
+        .then(|| guest("agent/programs/target/riscv64em-vos/release/vos-representative.elf"));
     (actor, representative)
 }
 

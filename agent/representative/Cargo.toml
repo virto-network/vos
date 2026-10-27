@@ -1,12 +1,11 @@
 # The space's representative, a system agent's actor, built for the PVM
 # with the guest toolchain: `just build-representative`.
-[workspace]
-
 [package]
 name = "vos-representative"
 version = "0.1.0"
 edition = "2024"
 publish = false
+workspace = "../programs"
 
 [lib]
 name = "vos_representative"
@@ -22,9 +21,3 @@ bench = false
 
 [dependencies]
 vos-sdk = { path = "../sdk" }
-
-[profile.release]
-opt-level = 3
-lto = true
-panic = "abort"
-codegen-units = 1

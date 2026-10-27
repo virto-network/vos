@@ -129,7 +129,7 @@ fn unsent(
             Some((closed, _)) if closed > window => continue,
             Some((closed, None)) if closed == window => continue,
             Some((closed, Some(last))) if closed == window => {
-                closing.paths.retain(|(of, ..)| *of > last);
+                closing.paths.retain(|path| path.agent > last);
                 if closing.paths.is_empty() {
                     continue;
                 }

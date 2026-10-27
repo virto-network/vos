@@ -115,7 +115,6 @@ fn an_equivocation_keeps_both_anchors() {
         length_ms: MIN_LENGTH_MS,
     };
     let genesis = SpaceGenesis {
-        version: vos_anchor::GENESIS_VERSION,
         nodes: vec![(1, model.key(1)), (2, model.key(2))],
         clock,
         time: 7,
@@ -153,7 +152,6 @@ fn a_statement_is_judged_against_the_anchors() {
         length_ms: MIN_LENGTH_MS,
     };
     let genesis = SpaceGenesis {
-        version: vos_anchor::GENESIS_VERSION,
         nodes: vec![(1, model.key(1))],
         clock,
         time: 7,

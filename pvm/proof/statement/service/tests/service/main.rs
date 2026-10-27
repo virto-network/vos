@@ -123,7 +123,7 @@ fn what_does_not_decode_is_refused() {
     let valid = fixture("valid");
     let mut rig = fixture_rig(&valid);
     let unknown = rig.item(vec![9, 1, 2], Vec::new());
-    assert_eq!((unknown.outcome.kind, unknown.outcome.code), (u8::MAX, 1));
+    assert_eq!((unknown.outcome.kind, unknown.outcome.code), (None, 1));
     let statement = valid.input.statement.encode();
     let short = rig.code(
         submit(&statement[..statement.len() - 1]),
@@ -135,7 +135,7 @@ fn what_does_not_decode_is_refused() {
     let long = rig.code(submit(&long.encode()), vec![valid.proof.clone()]);
     assert_eq!(long, 1);
     let empty = rig.item(Vec::new(), Vec::new());
-    assert_eq!((empty.outcome.kind, empty.outcome.code), (u8::MAX, 1));
+    assert_eq!((empty.outcome.kind, empty.outcome.code), (None, 1));
 }
 
 // ── Spaces and anchors ────────────────────────────────────────────────────
@@ -166,7 +166,6 @@ fn founded(founders: u8) -> Space {
 fn founded_on(founders: u8, clock: WindowClock) -> Space {
     let founders: Vec<SigningKey> = (1..=founders).map(key).collect();
     let genesis = SpaceGenesis {
-        version: 1,
         nodes: founders
             .iter()
             .enumerate()
@@ -601,7 +600,7 @@ fn a_full_storage_traps_the_accumulate() {
             previous.map(|value| value.len())
         }
         fn full(&self, key: &[u8], _: Option<&[u8]>) -> bool {
-            key[0] == keys::SEEN
+            key[0] == keys::Prefix::Seen as u8
         }
     }
     let valid = fixture("valid");
@@ -680,7 +679,10 @@ fn rows_age_out_past_max_root_age() {
     assert_eq!(state::outcome(&mut rig.storage, &anchored.id), None);
     assert!(rig.space(&space.id).is_some(), "a space is never dropped");
     let hour = rig.now() / 3_600_000;
-    let queued = rig.storage.keys().filter(|key| key[0] == keys::QUEUED);
+    let queued = rig
+        .storage
+        .keys()
+        .filter(|key| key[0] == keys::Prefix::Queued as u8);
     assert!(
         queued
             .map(|key| u64::from_be_bytes(key[1..9].try_into().unwrap()))
