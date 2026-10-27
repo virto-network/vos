@@ -8,7 +8,9 @@
 //! `N`, if none), one node of a founded space of one runs `AGENTS` agents
 //! of the purses' ledger and the counter; the proofs are made first, on
 //! every core, then sent open loop at `100·k` a second over the node API's
-//! socket for `SECONDS`, the latency of each from the time it was due;
+//! socket for `SECONDS`, or as long as making them within 80 s allows (a
+//! proof expires 120 s after the node's time), the latency of each from
+//! the time it was due;
 //! then signed increments at the same rate, the same way.
 //!
 //! `cargo bench -p vos-node --bench credentialed -- 1 2 4` (after `just
@@ -130,17 +132,21 @@ fn start(executors: usize) -> Bench {
 }
 
 impl Bench {
-    /// `count` transfers, each proved by the payer's owner, round the
-    /// agents, good until 50 s past when making them all is expected
-    /// to end: the time a first round on every core takes, scaled.
-    fn calls(&self, count: usize) -> Vec<(AgentId, Credentialed)> {
-        let cores = rayon::current_num_threads();
+    /// Transfers enough for `SECONDS` at `rate`, or for as long as making
+    /// them within 80 s allows, each proved by the payer's owner, round the
+    /// agents; good until 30 s past when making them all is expected to
+    /// end, at the rate a first round of four on every core makes them.
+    fn calls(&self, rate: f64) -> Vec<(AgentId, Credentialed)> {
+        let round = 4 * rayon::current_num_threads();
         let started = Instant::now();
         let now = client::time(&self.target).unwrap();
-        self.made(cores, now + 115_000);
-        let round = started.elapsed().as_millis() as u64;
-        let expected = round * (count as u64).div_ceil(cores as u64) * 11 / 10;
-        let calls = self.made(count, now + round + expected + 50_000);
+        self.made(round, now + 115_000);
+        let per_second = round as f64 / started.elapsed().as_secs_f64();
+        let seconds = (80.0 * per_second / rate).clamp(1.0, SECONDS as f64);
+        let count = (rate * seconds) as usize;
+        let expected = (count as f64 / per_second * 1.15 * 1e3) as u64;
+        let elapsed = started.elapsed().as_millis() as u64;
+        let calls = self.made(count, now + elapsed + expected + 30_000);
         let expires_ms = calls[0].1.expires_ms;
         let now = client::time(&self.target).unwrap();
         assert!(
@@ -251,15 +257,15 @@ fn main() {
             .collect();
     }
     println!(
-        "host N = {host}; {AGENTS} agents, {SECONDS} s a run, {SENDERS} senders; latency from \
-         when each was due, ms"
+        "host N = {host}; {AGENTS} agents, at most {SECONDS} s a run, {SENDERS} senders; latency \
+         from when each was due, ms"
     );
     for executors in counts {
         let bench = start(executors);
         let rate = 100.0 * executors as f64;
-        let count = (rate as usize) * SECONDS as usize;
         let started = Instant::now();
-        let calls = Arc::new(bench.calls(count));
+        let calls = Arc::new(bench.calls(rate));
+        let count = calls.len();
         let proving = started.elapsed();
         let target = bench.target.clone();
         let (mut credentialed, elapsed) = drive(count, rate, |_, index| {
@@ -300,9 +306,10 @@ fn main() {
         let (c99, s99) = (percentile(&credentialed, 99), percentile(&signed, 99));
         let pass = achieved >= rate * 0.99 && c99 - s99 <= 50.0;
         println!(
-            "k = {executors}: {count} proofs made in {:.1} s; {achieved:.0} a second of {rate:.0} \
-             asked; credentialed p50 {:.1} p99 {c99:.1}; signed p50 {:.1} p99 {s99:.1}; {}",
+            "k = {executors}: {count} proofs made in {:.1} s, sent over {:.1} s; {achieved:.0} a \
+             second of {rate:.0} asked; credentialed p50 {:.1} p99 {c99:.1}; signed p50 {:.1} p99 {s99:.1}; {}",
             proving.as_secs_f64(),
+            count as f64 / rate,
             percentile(&credentialed, 50),
             percentile(&signed, 50),
             if pass { "within the bound" } else { "MISSED" }
