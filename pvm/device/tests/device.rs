@@ -11,7 +11,8 @@ use blake2::{Blake2b512, Digest as _};
 use ed25519_dalek::{Signature, VerifyingKey};
 use scale::{Decode, Encode};
 use sha2::Sha256;
-use vos_device::wire::{self, Answer, CredentialedBody, PublicBody};
+use vos_api::Kind;
+use vos_device::wire::{self, Answer};
 use vos_device::{
     AuthWitness, Call, CredentialPublic, DeviceError, Digest, FORMAT, PEAK_BYTES, PathKeeper,
     Prover, ProverConfig, Threads, derive_secret, member, owner, scope, source_input, verify,
@@ -22,7 +23,10 @@ use vos_wire::credentials::{
     compress, leaf,
 };
 use vos_wire::ids::{AgentId, InstanceId, MethodId, derive_id};
-use vos_wire::ingress::{Consistency, QueryCall, Response, query_message};
+use vos_wire::ingress::{
+    self, Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response,
+    query_message,
+};
 use vos_wire::result::Outcome;
 
 const HANDLE: [u8; 32] = [7; 32];
@@ -537,19 +541,19 @@ fn the_wire_requests_and_answers() {
     let call = call(b"yes");
     let proof = prover.prove_owner(&secret, &call).unwrap();
     let request = wire::credentialed(&call, &proof);
-    assert_eq!(request[..2], wire::CREDENTIALED.to_le_bytes());
-    let (agent, body) = <(AgentId, CredentialedBody)>::decode_exact(&request[2..]).unwrap();
+    assert_eq!(request[..2], (Kind::Credentialed as u16).to_le_bytes());
+    let (agent, body) = <(AgentId, Credentialed)>::decode_exact(&request[2..]).unwrap();
     assert_eq!(agent, AgentId(call.agent));
     assert_eq!(
         body,
-        CredentialedBody {
+        Credentialed {
             instance: InstanceId(call.instance),
             method: MethodId(call.method),
             arguments: call.arguments.clone(),
             nonce: call.nonce,
             expires_ms: call.expires_ms,
             format: FORMAT,
-            public: PublicBody::Owner {
+            public: ingress::CredentialPublic::Owner {
                 owner: owner(&secret).to_bytes(),
                 binding: proof.public.binding().to_bytes(),
             },
@@ -563,6 +567,8 @@ fn the_wire_requests_and_answers() {
     assert_eq!(bytes[4..8], call.method.to_le_bytes());
     assert_eq!(bytes[8..12], (call.arguments.len() as u32).to_le_bytes());
 
+    let refused = |refusal| Response::Rejected(Rejection::Credential(refusal)).encode();
+    assert_eq!(refused(CredentialRefusal::RootUnknown), [2, 9, 10]);
     assert_eq!(
         wire::credentialed_answer(&[2, 9, 10]),
         Ok(Answer::RootUnknown)
@@ -573,7 +579,7 @@ fn the_wire_requests_and_answers() {
     );
     assert_eq!(
         wire::credentialed_answer(&[2, 9, 6]),
-        Ok(Answer::Refused(6))
+        Ok(Answer::Refused(CredentialRefusal::Scope))
     );
     let mut expiry = vec![2, 9, 3];
     expiry.extend(1_234u64.to_le_bytes());

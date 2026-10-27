@@ -5127,6 +5127,7 @@ dependencies = [
  "tracing",
  "vos-api",
  "vos-checker",
+ "vos-device",
  "vos-http",
  "vos-jam",
  "vos-jam-dev",

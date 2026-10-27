@@ -1154,8 +1154,12 @@ impl PathKeeper {
   `&mut self` (a moved root brings the fetch forward to a time drawn
   below 10 s after it is first seen), `update` refusing a path not its
   member's, and `unknown` for a `RootUnknown` or `RootStale` answer, with
-  `wire::credentialed_answer` (the refusals decoded exactly, `Expiry`'s
-  `now` kept). The keeper's timer is 30 s with a uniform jitter of half a
+  `wire::credentialed_answer` (the node's `Response` decoded exactly, a
+  credential refusal as `vos_wire`'s `CredentialRefusal`, `Expiry`'s
+  `now` kept); the request is `vos_wire`'s `Credentialed` under
+  `Kind::Credentialed`, the scope and the binding `vos_wire`'s
+  `credentials::scope` and `Bound::digest`, so the library and ingress
+  share one computation. The keeper's timer is 30 s with a uniform jitter of half a
   period either way, halved on each `RootUnknown` (to 1 s) and doubled
   back on a fetch that finds the root unmoved. A
   credential proof peaks at 113–133 MiB on the Fairphone 6 and 144–162

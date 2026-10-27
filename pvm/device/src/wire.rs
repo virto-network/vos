@@ -13,20 +13,14 @@ use scale::{Decode, Encode};
 use vos_api::Kind;
 use vos_wire::credentials::{Path, RootEntry};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, derive_id};
-use vos_wire::ingress::{Consistency, QueryCall, Response, query_message};
+use vos_wire::ingress::{
+    self, Consistency, CredentialRefusal, Credentialed, QueryCall, Rejection, Response,
+    query_message,
+};
 use vos_wire::result::Outcome;
 use zeroize::Zeroize;
 
 use crate::{AuthWitness, Call, CredentialProof, CredentialPublic, DeviceError, Digest};
-
-/// The credentialed call's request kind.
-pub const CREDENTIALED: u16 = vos_api::CREDENTIALED;
-
-/// `Rejection::Credential`'s index, and `CredentialRefusal::RootUnknown`'s:
-/// the one refusal a path refetch answers.
-const REJECTED: u8 = 2;
-const CREDENTIAL_REJECTION: u8 = 9;
-const ROOT_UNKNOWN: u8 = 10;
 
 /// `kind`'s request holding `body`.
 fn request(kind: u16, body: impl Encode) -> Vec<u8> {
@@ -153,35 +147,7 @@ pub fn root_answer(body: &[u8]) -> Result<(Digest, u64), DeviceError> {
     ))
 }
 
-/// A statement's public digests as the request carries them.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
-pub enum PublicBody {
-    #[codec(index = 0)]
-    Auth {
-        map_root: [u8; 32],
-        scope: [u8; 32],
-        nullifier: [u8; 32],
-        binding: [u8; 32],
-    },
-    #[codec(index = 1)]
-    Owner { owner: [u8; 32], binding: [u8; 32] },
-}
-
-/// A `Credentialed` request's body after its agent
-/// (`identity-and-authority.md` §5).
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct CredentialedBody {
-    pub instance: InstanceId,
-    pub method: MethodId,
-    pub arguments: Vec<u8>,
-    pub nonce: [u8; 16],
-    pub expires_ms: u64,
-    pub format: u32,
-    pub public: PublicBody,
-    pub proof: Vec<u8>,
-}
-
-impl From<&CredentialPublic> for PublicBody {
+impl From<&CredentialPublic> for ingress::CredentialPublic {
     fn from(public: &CredentialPublic) -> Self {
         match *public {
             CredentialPublic::Auth {
@@ -189,13 +155,13 @@ impl From<&CredentialPublic> for PublicBody {
                 scope,
                 nullifier,
                 binding,
-            } => PublicBody::Auth {
+            } => ingress::CredentialPublic::Auth {
                 map_root: map_root.to_bytes(),
                 scope: scope.to_bytes(),
                 nullifier: nullifier.to_bytes(),
                 binding: binding.to_bytes(),
             },
-            CredentialPublic::Owner { owner, binding } => PublicBody::Owner {
+            CredentialPublic::Owner { owner, binding } => ingress::CredentialPublic::Owner {
                 owner: owner.to_bytes(),
                 binding: binding.to_bytes(),
             },
@@ -204,19 +170,19 @@ impl From<&CredentialPublic> for PublicBody {
 }
 
 /// The credentialed request of `call` under `proof`, addressed to
-/// `call.agent`.
+/// `call.agent` (`identity-and-authority.md` §5).
 pub fn credentialed(call: &Call, proof: &CredentialProof) -> Vec<u8> {
-    let body = CredentialedBody {
+    let body = Credentialed {
         instance: InstanceId(call.instance),
         method: MethodId(call.method),
         arguments: call.arguments.clone(),
         nonce: call.nonce,
         expires_ms: call.expires_ms,
         format: proof.format,
-        public: PublicBody::from(&proof.public),
+        public: ingress::CredentialPublic::from(&proof.public),
         proof: proof.proof.clone(),
     };
-    request(CREDENTIALED, (AgentId(call.agent), body))
+    request(Kind::Credentialed as u16, (AgentId(call.agent), body))
 }
 
 /// What a credentialed call's answer means to the client.
@@ -234,39 +200,27 @@ pub enum Answer {
     /// The expiry is outside the node's window: `now` is the node's clock,
     /// from which a new proof picks its expiry.
     Expiry { now: u64 },
-    /// Any other credential refusal at ingress, by its code
-    /// (`CredentialRefusal`'s index, at most [`LAST_REFUSAL`]): this proof
-    /// will not be admitted.
-    Refused(u8),
+    /// Any other credential refusal at ingress: this proof will not be
+    /// admitted.
+    Refused(CredentialRefusal),
     /// Any other answer, as the node sent it: busy, not the leader, a
     /// refusal at apply.
     Other(Vec<u8>),
 }
 
-/// `CredentialRefusal`'s codes this library tells apart: `Expiry` carries
-/// the node's time; `RootUnknown` and `RootStale` drop the path; the last
-/// code is `Proof`'s.
-const EXPIRY: u8 = 3;
-const ROOT_STALE: u8 = 11;
-pub const LAST_REFUSAL: u8 = 12;
-
-/// The answer to a credentialed request: a credential refusal decoded
-/// exactly, its code known; any other answer as it came.
+/// The answer to a credentialed request, decoded exactly; an answer that
+/// does not decode is [`DeviceError::Decode`].
 pub fn credentialed_answer(body: &[u8]) -> Result<Answer, DeviceError> {
-    match body {
-        [REJECTED, CREDENTIAL_REJECTION, EXPIRY, now @ ..] => {
-            let now = u64::decode_exact(now).ok_or(DeviceError::Decode)?;
-            Ok(Answer::Expiry { now })
-        }
-        [REJECTED, CREDENTIAL_REJECTION, ROOT_UNKNOWN] => Ok(Answer::RootUnknown),
-        [REJECTED, CREDENTIAL_REJECTION, ROOT_STALE] => Ok(Answer::RootStale),
-        [REJECTED, CREDENTIAL_REJECTION, code] if *code <= LAST_REFUSAL => {
-            Ok(Answer::Refused(*code))
-        }
-        [REJECTED, CREDENTIAL_REJECTION, ..] | [] => Err(DeviceError::Decode),
-        _ => match Response::decode_exact(body) {
-            Some(Response::Ran { outcome, at }) => Ok(Answer::Ran { outcome, at }),
-            _ => Ok(Answer::Other(body.to_vec())),
+    Ok(
+        match Response::decode_exact(body).ok_or(DeviceError::Decode)? {
+            Response::Ran { outcome, at } => Answer::Ran { outcome, at },
+            Response::Rejected(Rejection::Credential(refusal)) => match refusal {
+                CredentialRefusal::RootUnknown => Answer::RootUnknown,
+                CredentialRefusal::RootStale => Answer::RootStale,
+                CredentialRefusal::Expiry { now } => Answer::Expiry { now },
+                refusal => Answer::Refused(refusal),
+            },
+            _ => Answer::Other(body.to_vec()),
         },
-    }
+    )
 }
