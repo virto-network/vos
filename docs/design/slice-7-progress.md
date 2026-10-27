@@ -2794,6 +2794,263 @@ cache:**
 - The node caps that run 4 needs.
 - The memtable plateau, judged at T1 in runs 2 and 6.
 
+### 7.6: runs 2–4 on the LAN
+
+From vos-core `920103b3` (the levers above included), on `s7/7.6c`. The
+nodes and the binaries (`~/vos-scale/bins-7.6c`, copied from vos-core's
+build) are the same in every run.
+
+**The setup:**
+- S35's layout: three nodes on compumax, cores 0-3, 4-7 and 8-11,
+  `performance`, one Samsung 970 PRO shared by all three, 8 GiB caps.
+- The driver on `sigma`, wired, cores 0-7, `performance`. Its round
+  trips to compumax were p50 0.4 ms and p99 0.4–0.6 ms; the desktop
+  only coordinated.
+- Clock offsets were 3–10 ms in every `check`, all hosts synced.
+- Every run: `L` = 2 min, `--representative`, `--identity` (a row a user,
+  written 10 times a second), the default mix, `K` = 64, a full deploy.
+- The window is the load past a 10 s ramp; the 30-minute runs were
+  reported again with `--ramp-s 60` (`report-ramp60.txt` in each run).
+
+**The harness, three commits:**
+- **`c85ba9f6` T5's fault.** `--kill NODE --kill-at-s --restart-at-s` on
+  `run` and `drive` kills a node's unit (SIGKILL) under load and starts
+  it again on its data, the instants in the run's `faults.json`. Test:
+  the kill waits for the unit to go, and fails when it outlives the kill.
+- **`b54ae465` The identity agent's install read again.** One replica
+  answers the install; the one the rows go through may apply it later,
+  and run 2's first 2,000-a-second step failed with "the identity agent
+  has nothing installed". Test: the read retries until it finds the
+  schema, and times out.
+- **`35f28f52` `--creators`**, the agents created at once (16 by
+  default). At 64, creation ran at 9–10 agents a second, against 6 at
+  16: 10^4 in 18 minutes, 10^5 in about 2.8 hours. The node, not the
+  harness, bounds it past that.
+
+`cargo test -p vos-scale` green (51), clippy clean.
+
+**Run 2, the baseline** (`U` = 10^5, 8-minute steps, then 30 minutes at
+T1's rate). Rates are all calls a second; transfers are 80% of them.
+Latencies are the transfers', in ms. Node figures are the mean of the
+three; commit is the worst node's.
+
+`x` = 98%:
+
+| offered | transfers offered, answered/s | p50 / p99 / p99.9 | errors | node cores (of 4) | `vos-node` thread | commit p50 / p99 | runtime `late` p99 | disk ms/io | driver late, worst |
+|---|---|---|---|---|---|---|---|---|---|
+| 1,000 | 800, 800 | 98 / 229 / 328 | 0 | 1.77 | 64% | 25 / 49 | 20.5 | 1.0 | 2.0 ms |
+| 1,500 | 1,200, 1,200 | 98 / 328 / 459 | 0 | 1.89 | 62% | 25 / 57 | 20.5 | 1.3 | 1.9 ms |
+| 2,000 | 1,600, 1,599 | 115 / 328 / 524 | 0 | 1.98 | 61% | 25 / 82 | 20.5 | 1.6 | 2.1 ms |
+| 3,000 | 2,403, 2,403 | 115 / 459 / 655 | 0 | 2.13 | 54% | 29 / 98 | 16.4 | 2.0 | 2.4 ms |
+| 4,000 | 3,196, 3,197 | 131 / 524 / 918 | 0 | 2.30 | 50% | 33 / 131 | 16.4 | 3.5 | 2.3 ms |
+| 5,000 | 3,999, 3,999 | 164 / 655 / 1,311 | 0 | 2.45 | 46% | 33 / 164 | 20.5 | 4.4 | 2.1 ms |
+| 5,000, 30 min | 4,001, 4,001 | 164 / 786 / 1,311 | 0 | 2.51 | 48% | 33 / 197 | 20.5 | 5.6 | 2.8 ms |
+| 6,500 | 5,199, 5,190 | 229 / 1,573 / 2,621 | 0 | 2.73 | 43% | 41 / 229 | 24.6 | 6.1 | 2.4 ms |
+| 8,000 | 6,402, 6,371 | 393 / 4,194 / 7,340 | 0 | 2.93 | 39% | 49 / 328 | 28.7 | 9.3 | 2.8 ms |
+| 10,000 | 8,003, 7,173 | 10,486 / 100,663 / 117,441 | 0 | 3.04 | 36% | 57 / 393 | 24.6 | 9.3 | 3.1 ms |
+
+`x` = 30%:
+
+| offered | transfers offered, answered/s | p50 / p99 / p99.9 | errors | node cores | `vos-node` | commit p50 / p99 | `late` p99 | disk ms/io | driver late |
+|---|---|---|---|---|---|---|---|---|---|
+| 5,000 | 4,001, 4,001 | 131 / 655 / 1,049 | 0 | 2.27 | 46% | 33 / 131 | 16.4 | 4.7 | 1.8 ms |
+| 5,000, 30 min | 4,001, 4,002 | 131 / 655 / 1,049 | 0 | 2.33 | 47% | 33 / 164 | 16.4 | 4.5 | 3.1 ms |
+| 8,000 | 6,401, 6,388 | 229 / 1,835 / 3,146 | 0 | 2.75 | 40% | 49 / 262 | 20.5 | 6.3 | 2.3 ms |
+| 10,000 | 8,002, 7,879 | 786 / 25,166 / 33,554 | 0 | 2.92 | 36% | 49 / 328 | 20.5 | 7.7 | 2.8 ms |
+| 12,000 | 9,607, 8,162 | 2,621 / 201,327 / 234,881 | 0 | 2.96 | 35% | 57 / 328 | 20.5 | 8.6 | 2.5 ms |
+
+- **The knee,** one host's (S35): at `x` = 98% the nodes keep up through
+  8,000 a second, p99 oscillating 1–7 s with no trend. At 10,000 they
+  answer about 7,200 transfers a second against 8,000 offered, and the
+  backlog grows. **The knee is about 8,000–9,000 a second.** At `x` = 30%
+  it is about 10,000: transfers are answered at offer there, but p99
+  climbs through the run, and 12,000 is past it. The cross share costs
+  little: at 5,000, p99 786 against 655 ms.
+- **No p99 within 50 ms at any rate:** 229 ms at 1,000 a second.
+- 0 errors, 0 elections and 0 leader changes in every step. The driver
+  was never late (at worst 3.1 ms, 0.00% of sends past 10 ms) and used
+  at most 0.39 cores. The driver did not bind.
+- **The rerun without the slowest host is not measurable** (S35): three
+  node hosts on one machine. Each report names a "slowest" node (c1, c2
+  or c3, by commit p99), but the three share one disk, NIC and CPU.
+- **The model at `U` = 10^5:** past 5,000 a second each active user makes
+  `r` = rate / 5,000 calls a second, one at a time. At 8,000, half the
+  transfers waited behind their own user's previous call (`queued`).
+  Part of the latency past the knee is that serialisation, not the nodes.
+- The report's "binding" column says "disk 70%" at most rates. That is
+  the NVMe's `%util`, which counts any I/O in flight and saturates long
+  before the device does. Read it as the fsync latency below, not as a
+  full disk. At 10,000 a second the column reads CPU 75%.
+
+**Where a transfer's time goes**, at 5,000 a second, 30 minutes, node 1
+(means from `nodes.jsonl`, in ms):
+- **queued 63:** waiting for the agent's next batch. A group has one batch
+  in flight, so this is about one batch's length.
+- **batch 103:** refine start to apply. Of it:
+  - commit 45 (p99 197);
+  - commit to apply here 37 (p99 164);
+  - refine 2.1;
+  - dry run 0.9;
+  - the executor queues 1.8 and 3.7;
+  - propose 1.1.
+- **batch inputs:** 19 a batch.
+- **The writer's fsync** (`flush_synced`) 21 ms mean, p99 82, 46 a second
+  a node, on the disk all three nodes share. Disk writes ran at 51 MB/s.
+- **CPU:**
+  - the runtime thread 48% of a core, its `late` p99 20 ms;
+  - three executors at 45% each, `vos-storage` 34%;
+  - 2.5 of the node's 4 cores;
+  - 1,400–7,400 preemptions a second (the node runs more busy threads
+    than its 4 cores).
+- **At 10,000 a second:**
+  - the executors reach 60–63% each;
+  - the node uses 3.0 of its 4 cores;
+  - the disk's ms per I/O reaches 9.3;
+  - the runtime thread stays at 36%.
+
+  The knee is the 4-core cpuset and the shared disk's fsync, together.
+
+**Run 3, users** (`U` = 10^6, `x` = 98%, 30 minutes each; runs
+`20261027T180915Z-r3-u1m-5000`, `20261027T184355Z-r3-u1m-6400`):
+
+| offered | transfers answered/s | p50 / p99 / p99.9 | errors | users, sessions | node cores | commit p50 / p99 | fsync mean / p99 | disk MB/s, ms/io | `late` p99 |
+|---|---|---|---|---|---|---|---|---|---|
+| 5,000 (T1) | 3,989 | 393 / 10,486 / 25,166 | 223 timed out | 231,384, 231,601 | 2.61 | 57 / 393 | 35 / 262 | 78, 16.4 | 41 |
+| 6,400 (80% of 8,000) | 3,652 | 41,943 / 536,871 / 671,089 | 1,479,494 (all but 39 timed out) | 233,052, 1,678,470 | 2.57 | 57 / 393 | | 16.0 | 57 |
+
+- **At T1's rate it holds, barely.** It answered at offer, but p99 rose
+  from about 1 s in the first 15 minutes to 10–21 s in the last.
+- **At 6,400 it collapsed.** Transfers were answered at 3,600–4,000 a
+  second, timeouts began at minute 9, and the run was lost. Sessions
+  re-opened after timeouts reached 1.68 million. **At 10^6 users the knee
+  is about 5,000 a second, not 8,000.**
+- **What changed from 10^5 users at the same rate:**
+  - 231,000 distinct users and accounts written in the run, against 23,000;
+  - disk writes 78 against 51 MB/s;
+  - the fsync mean 35 against 21 ms, its p99 262 against 82;
+  - batches twice as large (37 inputs) and twice as long (207 ms);
+  - CPU and the runtime thread barely moved.
+
+  **The binding resource at T1's shape is the shared disk:** the store's
+  write traffic as the state grows, and the fsync each commit waits on.
+- 0 elections and 0 leader changes; no session refused.
+
+**Run 4, agents** (`U` = 10^5, 5,000 a second, `x` = 98%, readers 1%,
+`--creators 64`):
+
+| `I` | replicas a node | RSS (window start) | transfers p50 / p99 / p99.9 | errors | node cores | `vos-node` | quiet groups | reader reads, p99 from close |
+|---|---|---|---|---|---|---|---|---|
+| 64 (run 2's 30 min) | 66 | 1,830 MiB | 164 / 786 / 1,311 | 0 | 2.51 | 48% | | |
+| 10^4 | 10,066 | 2,294 MiB | 164 / 918 / 1,311 | 0 | 2.51 | 47% | 10,066 of 10,066 | 1,560 of 1,560 served, 1.8 s |
+| 10^5 | stopped | | | | | | | |
+
+- At 10^4, the idle replicas cost 464 MiB, **46 MiB per 1,000**, run 1b's
+  slope. They cost no measurable CPU under load. Every replica was quiet
+  once idle; 0 elections.
+- **10^5 was stopped at 70,600 agents created** (`20261027T200856Z-r4-
+  idle-100k`), 1 h 56 min into creation, when the owner's quota ran out.
+  No load was driven. Its inventory raised the nodes' caps to 12 GiB
+  (`inventory.r4-12g.toml`: 3 × 12 + 2 GiB within compumax's 57 GiB
+  free): the slope gives 4.6 GiB of replicas, the run-2 load's 1.8 GiB
+  (1 GiB of it the block cache) beside them. At 24,000 replicas each
+  unit held 1.3 GB.
+
+**The memory under load:**
+- The store's block cache fills to its 1 GiB cap within each 30-minute
+  run; that is the RSS growth.
+- The write buffers cycle, their plateau about 130 MiB.
+- The Raft entry caches held 74–217 MiB.
+- So a node at T1's shape settles near 2 GiB, plus 46 MiB per 1,000 idle
+  replicas.
+
+**The targets so far:**
+- **T1 missed.**
+  - At 10^6 users and 5,000 a second (`x` = 98%), p99 was 10.5 s against
+    50 ms, and 223 calls timed out.
+  - No session was refused.
+  - The binding resource is the one disk's fsync and write traffic, with
+    one batch in flight a group.
+  - Even at 10^5 users, p99 was 786 ms.
+- **T2 not measurable** (S35). One host's knee is about 8,000–9,000 a
+  second at 10^5 users and about 5,000 at 10^6, against T2's 40,000.
+- **T3:** met at 10^4 on memory (46 MiB per 1,000, run 1b) and on CPU
+  (run 1b's 0.16% per 1,000). The 10^5 stretch is not run.
+- **T4 met where measured:**
+  - Every read at a cut was served in run 2's 30-minute runs (46,652 and
+    46,368, p99 2.1 s from the close) and in run 4 at 10^4 (46,399, p99
+    2.6 s).
+  - In run 4, 1,560 of 1,560 readers' reads were served, p99 1.8 s from
+    the close, against `B_w + D + 10 s`.
+  - None was `NotClosed`.
+  - At 10^6 users, one read of 47,005 timed out, with p99 14.7 s.
+  - The representative's work per reader was not separated.
+  - C9's fail rate at the LAN's 3–10 ms skew was 0 of 139,467 reads in
+    the runs that kept up.
+- **T5 and T6 not run** (below).
+
+**The levers, by measured effect:**
+1. **Batch pipelining**, more than one batch in flight a group. Queued
+   (63 ms) is about one batch, so pipelining removes about a third of a
+   transfer's time at 5,000 a second. That is the largest share not
+   spent on the disk.
+2. **The commit-to-apply gap** (37 ms mean at 5,000 a second, 65 ms at
+   10^6 users). It sits after the commit, on the latency path, and is
+   not fsync.
+3. **The fsync's cost on a shared disk.** At 10^6 users, fsync's p99 is
+   262 ms, and the store writes about 16 KB per call across the three
+   nodes. Write amplification needs measuring (memtable size,
+   compaction) before a lever is chosen. On more hosts each node has
+   its own disk; T1 and T2 should be re-measured there before this is
+   judged a node defect.
+4. **The runtime thread does not bind.** It is at 36–64% of a core, its
+   `late` p99 16–41 ms. The batch path's priority lane and sharding the
+   runtime by group come after the levers above.
+5. **The executors and the 4-core cpuset** bind at the knee (3.0 of 4
+   cores, 60% each). Batch signature verification is the CPU lever.
+   `verify` is 0.09 ms a call, about 0.45 of a core at 5,000 a second.
+
+**Stopped at** (2026-10-27, about 23:00 CET, the owner's quota):
+- Run 4's 10^5 step was interrupted during creation.
+- `vos-scale down` left no unit on compumax or sigma.
+- Nothing runs.
+- **Next is run 4's 10^5 step, again from its deploy** (about 2.8 hours
+  of creation, then 31 minutes of load), from `~/vos-scale`:
+
+      INV=$HOME/vos-scale/inventory.r4-12g.toml s76c/step.sh r4-idle-100k \
+        --shards 64 --idle 100000 --creators 64 --readers 0.01 \
+        --users 100000 --rate 5000 --secs 1860
+
+  `s76c/step.sh` checks both ssh masters and runs `bins-7.6c/vos-scale-
+  coord -i $INV run --bins bins-7.6c --agent bins-7.6c/vos-agent.elf
+  --actor bins-7.6c/shard.elf --identity --representative --label L ...`.
+  `vos-scale-coord` is this branch's build, with the commits above.
+- **Then runs 5 and 6, `s76c/r56.sh`:**
+  - Run 5: `INV=inventory.r5.toml` (`every_s` = 1, for second-grain
+    polls), `--users 1000000 --rate 5000 --secs 1860 --kill c2
+    --kill-at-s 600 --restart-at-s 900`.
+  - Run 6: `--users 1000000 --rate 5000 --secs 7260`.
+  - Both `--shards 64`.
+  - Run 3 showed T1's shape degrading over 30 minutes, so run 6 will
+    likely show the p99 drift and the timeouts. T6's RSS should be
+    judged after the block cache fills (1 GiB, within the first 30
+    minutes).
+- **The run ids so far**, under `~/vos-scale/runs/`:
+  - `20261027T142927Z-s76c-smoke`;
+  - run 2 at 98%: `…143502Z-r2-x98-1000`, `…151411Z-r2-x98-1500`,
+    `…145251Z-r2-x98-2000` (`…144544Z` is the failed attempt),
+    `…150332Z-r2-x98-3000`, `…152509Z-r2-x98-4000`,
+    `…153549Z-r2-x98-5000`, `…154629Z-r2-x98-6500`,
+    `…155712Z-r2-x98-8000`, `…160753Z-r2-x98-10000`,
+    `…170345Z-r2-x98-5000-steady`;
+  - run 2 at 30%: `…161903Z-r2-x30-5000`, `…162943Z-r2-x30-8000`,
+    `…164023Z-r2-x30-10000`, `…165103Z-r2-x30-12000`,
+    `…173625Z-r2-x30-5000-steady`;
+  - run 3: `…180915Z-r3-u1m-5000`, `…184355Z-r3-u1m-6400`;
+  - run 4: `…192015Z-r4-idle-10k`, `…200856Z-r4-idle-100k`
+    (interrupted).
+- The scripts that summarise a run (`row.py`, `md.py`, `stages.py`,
+  `intervals.py`) are in `~/vos-scale/s76c/`.
+
 ## Step 7.10: the credential AIR
 
 Branch `s7/7.10`, from vos-core `84607818`.
