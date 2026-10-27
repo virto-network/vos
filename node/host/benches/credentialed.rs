@@ -52,7 +52,9 @@ use vos_pvm_recair::credential::{OwnerPublic, Statement, prove};
 use vos_pvm_recair::masked::MaskRng;
 use vos_wire::credentials::{self as tree, Bound, Tag, Words};
 use vos_wire::ids::{AgentId, InstanceId, MethodId, Principal};
-use vos_wire::ingress::{CredentialPublic, Credentialed, Response, Stage};
+use vos_wire::ingress::{
+    CredentialPublic, CredentialRefusal, Credentialed, Rejection, Response, Stage,
+};
 use vos_wire::result::Outcome;
 use vos_wire::{Encode, SpaceId, WindowClock};
 
@@ -266,13 +268,14 @@ impl Reached {
 /// A run's sends: the latency of each from when it was due, the seconds
 /// from the first due to the last answered, the calls in flight, on
 /// average (the time spent sending over the run's) and at most, and the
-/// sends answered `Busy`.
+/// sends answered `Busy`, and the honest proofs refused `Proof`.
 struct Driven {
     latencies: Vec<Duration>,
     elapsed: f64,
     in_flight: f64,
     most: usize,
     busy: usize,
+    refused: usize,
 }
 
 /// A call answered `Busy` is sent again after this, as a client would:
@@ -289,13 +292,14 @@ fn drive(
 ) -> Driven {
     let next = AtomicUsize::new(0);
     let (flying, most, sending) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicU64::new(0));
-    let busy = AtomicUsize::new(0);
+    let (busy, refused) = (AtomicUsize::new(0), AtomicUsize::new(0));
     let start = Instant::now() + Duration::from_millis(100);
     let latencies = std::sync::Mutex::new(Vec::with_capacity(count));
     std::thread::scope(|scope| {
         for sender in 0..SENDERS {
             let (next, latencies, send) = (&next, &latencies, &send);
-            let (flying, most, sending, busy) = (&flying, &most, &sending, &busy);
+            let (flying, most, sending) = (&flying, &most, &sending);
+            let (busy, refused) = (&busy, &refused);
             scope.spawn(move || {
                 loop {
                     let index = next.fetch_add(1, Ordering::SeqCst);
@@ -314,12 +318,23 @@ fn drive(
                         std::thread::sleep(AGAIN);
                         answer = send(sender, index);
                     }
+                    sending.fetch_add(sent.elapsed().as_nanos() as u64, Ordering::Relaxed);
+                    flying.fetch_sub(1, Ordering::SeqCst);
+                    // An honest proof the verifier refuses: counted apart,
+                    // its latency left out.
+                    if matches!(
+                        answer,
+                        Ok(Response::Rejected(Rejection::Credential(
+                            CredentialRefusal::Proof
+                        )))
+                    ) {
+                        refused.fetch_add(1, Ordering::Relaxed);
+                        continue;
+                    }
                     assert!(
                         answer.as_ref().is_ok_and(ran),
                         "call {index} did not run: {answer:?}"
                     );
-                    sending.fetch_add(sent.elapsed().as_nanos() as u64, Ordering::Relaxed);
-                    flying.fetch_sub(1, Ordering::SeqCst);
                     latencies.lock().unwrap().push(due.elapsed());
                 }
             });
@@ -334,6 +349,7 @@ fn drive(
         in_flight: sending.into_inner() as f64 / 1e9 / elapsed,
         most: most.into_inner(),
         busy: busy.into_inner(),
+        refused: refused.into_inner(),
     }
 }
 
@@ -411,8 +427,8 @@ fn run(reached: &Reached, client_target: &Target, executors: usize, seconds: f64
     println!(
         "    {verified} verifications, mean {verify:.2} ms each after {queue:.2} ms waiting for an \
          executor; credentialed calls in flight {:.1} on average, {} at most, of {SENDERS} \
-         senders; {} sends answered Busy and sent again",
-        credentialed.in_flight, credentialed.most, credentialed.busy
+         senders; {} sends answered Busy and sent again; {} honest proofs refused Proof",
+        credentialed.in_flight, credentialed.most, credentialed.busy, credentialed.refused
     );
 }
 
