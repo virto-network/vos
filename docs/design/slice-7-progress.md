@@ -3270,6 +3270,19 @@ threads (6 P-cores with SMT, 8 E-cores, 2 LP E-cores)]:
   answered `Proof` at ingress: a completeness failure of the format-42
   prover and verifier pair at about one proof in 30,000, found here and
   not fixed in 7.11 (below, left).
+- **Under format 44, at the merge with 7.12** [measured; the same laptop,
+  another agent's proving stress beside it, load 11 to 18]: the
+  verifier on one core (`credential_ingress`, core 3) auth 5.52 / 10.26
+  ms, owner 5.48 / 10.35, a wrong PoW refused in 1.56 / 2.18, a byte cut
+  0.43 / 0.45; the cut's refusal, which no format changes, ran 2.4 times
+  its quiet 0.18 ms, so the machine, not the format, is most of the
+  rise. The rate bench at k = 1 and 4 (`-- 1 4`) missed under that load:
+  76 and 301 a second of 100 and 400, credentialed p50 / p99 1.9 / 4.1 s
+  and 2.2 / 3.4 s, signed 5.5 / 6.7 and 5.3 / 7.3 ms, a verification's
+  mean 12.0 and 12.6 ms after 10.9 and 10.7 ms of executor wait, the
+  proofs made at 10 a second (30 quiet); every honest proof of the 5,000
+  verified. A quick sanity of the format change, not the gate: S55's run
+  is the gate's.
 
 **Where the plan was off:**
 - **The schema's section** could not simply grow a field: the section is
@@ -3636,6 +3649,45 @@ itself. Not taken: L3 (a path older than the one held: `path` answers no
 `ROOT_MAX_AGE`), L7 (the OS's randomness failing reported as `Prove`, as
 documented). For the merge: 7.11 replaces `vos_api::CREDENTIALED` with
 `Kind::Credentialed`, which `wire.rs` then names.
+
+**The merge with 7.11** (vos-core `7b78d9af`):
+- **The scope's name in SCALE** everywhere: `vos_wire::credentials::scope`
+  hashes the name's `u32` little-endian length before its bytes, as
+  `proving.md` §8, pin I and identity §7 pin it; ingress, the apply-time
+  check and the fuzz target call it, and `vos-device`'s `scope` and
+  `Call::binding_digest` are now `vos_wire`'s `credentials::scope` and
+  `Bound::digest`, one computation for both sides. The wire test pins
+  `SCOPE_VECTOR`. No pin moved: `kernel constants::` passes unchanged
+  (`WINDOW_PROGRAM`, `BALANCE_PROGRAM`, `PREDICATE_PROGRAM` and the
+  derive pins), and no served read's format changed (only the default
+  agent's refine calls `scope`, and no pinned blob holds that kernel).
+- **The mirrors deleted:** `wire::credentialed` sends `vos_wire`'s
+  `ingress::Credentialed` under `Kind::Credentialed`;
+  `credentialed_answer` decodes the node's `Response` exactly and
+  answers `Answer::Refused(CredentialRefusal)` for the refusals it does
+  not tell apart (`CREDENTIALED`, `PublicBody`, `CredentialedBody`,
+  `LAST_REFUSAL` and the refusal bytes gone).
+- **End to end** (`node/host/tests/served/credentialed.rs`,
+  `the_device_librarys_proofs_are_admitted`): `SCOPE_VECTOR` from both
+  `vos_device::scope` and `vos_wire`'s; on three nodes of a founded space
+  the library's `path_query` bytes answered over the node's HTTP into a
+  `PathKeeper`, its `prove_auth` proof's request admitted at a follower's
+  ingress as it leaves the library, the poll's `login` answering
+  `ctx.nullifier` equal to the proof's nullifier, the same request
+  `Replayed`; 68 enrollments pushing the root out, the leader's answer
+  decoding as `Answer::RootUnknown`, the keeper's refetch and a new proof
+  admitted; an owner proof paying 20 from the row its owner digest
+  claimed. Under 7.11's scope (the name's bytes alone) the vector
+  differs, so the scope assertions would fail and ingress refuse the
+  proof `Scope` [inferred].
+- **The fuzz replay seeds** of `credentialed_decode` and
+  `credential_verify_bytes` made again under 44 (`credential_ingress
+  --seeds`); no other corpus held a 42 proof.
+- **`node/SECURITY.md`** is 7.11's, its path leak taking this step's
+  specifics (the timer, the moved root's spread, the `RootUnknown`
+  refetch); the docs' scope lines say both widths and the SCALE name.
+- **The rate bench and the verifier under 44:** 7.11's entry (quick
+  sanity under another agent's load, not the gate).
 
 **Commits:** `5f8678fb` format 44 registered, 42 retired; `814caf3c` the
 device library and the phone bench; `95950c51` session P2's record; this
