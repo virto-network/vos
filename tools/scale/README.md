@@ -17,6 +17,13 @@ drives it, with one `[[host]]` entry for each node or driver.
 | `report` | Summarises a run: each host's binding resource, the nodes' stages, leader changes, the drivers' rates and latencies, and the slowest node host. `--compare RUN` sets two runs side by side. |
 | `run` | Does all of these with one command: deploy, up, agents, drive, collect, down, report. |
 
+`--kill NAME`, given to `run` or `drive`, is T5's fault: that node host's
+unit is killed outright (SIGKILL) `--kill-at-s` seconds into the load (600
+by default) and started again on its data at `--restart-at-s` (900). The
+kill, the unit's end, the restart and the node's first answer are written
+to the run's `faults.json`, to read the polls and the drivers' intervals
+against; a shorter `harness.every_s` gives them a finer grain.
+
 `--exclude NAME`, given before the command, leaves a host out as if the
 inventory did not list it. Use it for a second run without the slowest host.
 That needs four node hosts or more: every agent has three replicas, so a
