@@ -452,6 +452,10 @@ fn run(cli: Cli) -> Result<(), String> {
             no_deploy,
             force,
         } => {
+            // Refused before the deploy and the agents' creation, not
+            // after them.
+            let model = load.model(shards as usize)?;
+            model.check_representative(representative)?;
             let inventory = reached()?;
             // Interrupted, the run's waits end and its units stop.
             hosts::stop_on_interrupt();
