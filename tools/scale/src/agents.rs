@@ -179,9 +179,11 @@ fn fill_identities(
     let agent = AgentId(identity.agent);
     let instance = InstanceId(identity.instance);
     let target = target(&deployed.nodes[usize::from(identity.replicas[0]) - 1])?;
-    let schema = vos_node::client::schema(&target, agent, instance)
-        .map_err(|error| error.to_string())?
-        .ok_or("the identity agent has nothing installed")?;
+    // The install is answered by one replica; this one may apply it later.
+    let schema = installed(INSTALLED, Duration::from_millis(200), || {
+        vos_node::client::schema(&target, agent, instance).map_err(|error| error.to_string())
+    })
+    .map_err(|error| format!("the identity agent: {error}"))?;
     let method = schema
         .method_id("fill_identities")
         .ok_or("the shard actor has no fill_identities")?;
@@ -216,6 +218,21 @@ fn fill_identities(
             .into_iter()
             .try_for_each(|handle| handle.join().expect("a writer"))
     })
+}
+
+/// What `read` gives once it gives something: an install's schema, at a
+/// replica that may apply the install after another answered it.
+fn installed<T>(
+    limit: Duration,
+    every: Duration,
+    mut read: impl FnMut() -> Result<Option<T>, String>,
+) -> Result<T, String> {
+    let mut found = None;
+    wait_for("its install applied", limit, every, || {
+        found = read()?;
+        Ok(found.is_some())
+    })?;
+    Ok(found.expect("found once the wait ends"))
 }
 
 fn created(answer: Result<Response, vos_node::client::ClientError>) -> Result<AgentId, String> {
@@ -357,7 +374,26 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
 
 #[cfg(test)]
 mod tests {
-    use super::{Mix, place};
+    use std::time::Duration;
+
+    use super::{Mix, installed, place};
+
+    /// A replica that has not applied the install yet is read again.
+    #[test]
+    fn an_install_is_read_again_until_applied() {
+        let mut reads = 0;
+        let schema = installed(Duration::from_secs(5), Duration::from_millis(1), || {
+            reads += 1;
+            Ok((reads == 3).then_some("schema"))
+        });
+        assert_eq!(schema, Ok("schema"));
+        assert_eq!(reads, 3);
+        let never: Result<(), String> =
+            installed(Duration::from_millis(20), Duration::from_millis(1), || {
+                Ok(None)
+            });
+        assert!(never.unwrap_err().contains("not within"));
+    }
 
     #[test]
     fn replicas_are_three_distinct_nodes_drawn_by_weight() {
