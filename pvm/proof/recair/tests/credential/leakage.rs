@@ -22,7 +22,7 @@
 //!   nor two witnesses' proofs from one seed.
 //! - **The shape (7):** the two witnesses' proofs have one shape.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
 
 #[cfg(feature = "heavy-gates")]
 use std::sync::OnceLock;
@@ -34,7 +34,7 @@ use vos_pvm_recair::masked::MaskRng;
 use vos_wire::credentials::{EMPTY, Tag, compress, leaf};
 
 use crate::common::Rng;
-use crate::common::leakage::{Fields, Key, Verdicts, indistinguishable, published, uniform};
+use crate::common::leakage::{self, Fields, Key, Verdicts, indistinguishable, published, uniform};
 use crate::prove::verify;
 use crate::support::{self, member};
 
@@ -102,23 +102,10 @@ fn the_published_values_do_not_depend_on_the_witness() {
     assert!(verdicts.refused().is_empty(), "{:?}", verdicts.refused());
 }
 
-/// The hidden digests among `hidden` a proof's published values hold: two
-/// or more of a digest's words among them. A random word is among a proof's
-/// values with probability about their count over `p` (10^5 / 2^31), two of
-/// one digest's about its square.
+/// The hidden digests among `hidden` a proof's published values hold
+/// ([`leakage::leaked`]).
 fn leaked(proof: &CredentialProof, hidden: &[Words]) -> Vec<Words> {
-    let published: HashSet<u32> = fields(proof).into_iter().map(|(_, value)| value).collect();
-    hidden
-        .iter()
-        .filter(|digest| {
-            digest
-                .iter()
-                .filter(|word| published.contains(word))
-                .count()
-                >= 2
-        })
-        .copied()
-        .collect()
+    leakage::leaked(&fields(proof), hidden)
 }
 
 /// No hidden state among a proof's published values: the secret, the

@@ -15,8 +15,9 @@
 //!   preprocessed tree's, DeviceIoChip's claimed sum).
 //! - **Uniformity:** each field of the first witness's N proofs against
 //!   uniform M31.
-//! - **Hidden state:** the witness's bytes and the Poseidon2 call's output,
-//!   eight bytes at a time, are in no proof's bytes.
+//! - **Hidden state:** the witness's words and the Poseidon2 call's output
+//!   words, and their bytes eight at a time, are not among a proof's
+//!   published values, which a planted control finds.
 //! - **Fresh randomness:** two proofs of one run share no opening, nor two
 //!   witnesses' proofs from one seed.
 //! - **The claimed sums' control:** a right guess of the run's sums under
@@ -29,6 +30,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use stwo::core::channel::{Channel, MerkleChannel};
+use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
 use stwo::core::proof::StarkProof;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sMerkleChannel;
@@ -41,7 +43,9 @@ use vos_pvm_proof::proof::mix_statement_header;
 use vos_pvm_recair::masked::MaskRng;
 use vos_pvm_recair_air::masked::MaskedComponents;
 
-use crate::common::leakage::{Fields, Key, Kind, Verdicts, indistinguishable, published, uniform};
+use crate::common::leakage::{
+    Fields, Key, Kind, Verdicts, indistinguishable, leaked, published, uniform,
+};
 use crate::support::{
     Proof, blob, format, io_bytes, program, prove, run, small_format, the_program, verify, witness,
 };
@@ -117,8 +121,12 @@ fn the_published_values_do_not_depend_on_the_witness() {
     assert!(verdicts.refused().is_empty(), "{:?}", verdicts.refused());
 }
 
-/// No hidden state in a proof's bytes: the witness's 64 bytes and the
-/// Poseidon2 call's 32 output bytes, eight at a time.
+/// No hidden state among a proof's published values: the witness's sixteen
+/// words, in the two blocks of eight the Poseidon2 call absorbs, the call's
+/// eight output words, and the witness's and the output's bytes eight at a
+/// time, as memory holds them; none with two of its values among them. The
+/// control: the output's words planted among a proof's queried values are
+/// found.
 #[test]
 fn no_hidden_state_is_in_a_proof() {
     let format = format();
@@ -129,14 +137,34 @@ fn no_hidden_state_is_in_a_proof() {
             .expect("proves");
     verify::<P2MerkleChannel>(&format, program, &proof).expect("verifies");
     let output = run(&blob(), &input).poseidon2_ops[0].output;
-    let bytes = postcard::to_allocvec(&(&proof.proof.stark_proof, &proof.proof.claimed_sums))
-        .expect("encodes");
-    for needle in input.chunks_exact(8).chain(output.chunks_exact(8)) {
-        assert!(
-            !bytes.windows(needle.len()).any(|window| window == needle),
-            "{needle:02x?} is in the proof's bytes"
-        );
+    let words = |bytes: &[u8]| -> Vec<u32> {
+        bytes
+            .chunks_exact(4)
+            .map(|word| u32::from_le_bytes(word.try_into().unwrap()))
+            .collect()
+    };
+    let output_words = words(&output);
+    let hidden: Vec<Vec<u32>> = input
+        .chunks_exact(32)
+        .map(words)
+        .chain([output_words.clone()])
+        .chain(
+            input
+                .chunks_exact(8)
+                .chain(output.chunks_exact(8))
+                .map(|bytes| bytes.iter().map(|&byte| u32::from(byte)).collect()),
+        )
+        .collect();
+    let stark = &proof.proof.stark_proof;
+    let found = leaked(&published(stark, &proof.proof.claimed_sums), &hidden);
+    assert_eq!(found, Vec::<Vec<u32>>::new());
+
+    let mut planted = stark.clone();
+    for (value, &word) in planted.0.queried_values[1][0].iter_mut().zip(&output_words) {
+        *value = BaseField::from(word);
     }
+    let found = leaked(&published(&planted, &proof.proof.claimed_sums), &hidden);
+    assert_eq!(found, vec![output_words], "the control");
 }
 
 /// Fresh randomness: two proofs of one run share no opening; and a replayed
