@@ -205,7 +205,7 @@ pub struct CredentialedInput {
     pub instance: InstanceId,
     pub method: MethodId,
     pub arguments: Vec<u8>,
-    /// The binding digest `b` ([`crate::credentials::binding_digest`]).
+    /// The binding digest `b` ([`crate::credentials::Bound::digest`]).
     pub binding: [u8; 32],
     /// By batch time.
     pub expires_ms: u64,

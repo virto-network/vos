@@ -506,8 +506,18 @@ fn every_ingress_refusal_comes_in_its_check_order() {
     );
     call.public = real.public;
     check(&call, CredentialRefusal::Proof, "no proof");
-    // The proof mended: the call runs, as the member's pseudonym.
+    // The proof of one call, sent with another's arguments.
     call.proof = real.proof.clone();
+    let other = Credentialed {
+        arguments: 4u8.encode(),
+        ..call.clone()
+    };
+    check(
+        &other,
+        CredentialRefusal::Binding,
+        "another call's arguments",
+    );
+    // The proof mended: the call runs, as the member's pseudonym.
     assert_eq!(call, real);
     assert_eq!(u32::decode_exact(done(&founded.send(at, &call))), Some(1));
     // Sent again: replayed, its outcome not repeated.

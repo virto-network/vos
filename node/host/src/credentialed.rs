@@ -294,3 +294,26 @@ fn ring(snapshot: &Snapshot, agent: AgentId) -> Result<Option<Ring>, Fault> {
         .get(agent, &key)?
         .and_then(|bytes| Ring::decode_exact(unstored(&bytes)?)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A verification takes a place while fewer than the budget hold one,
+    /// and gives it back when it ends.
+    #[test]
+    fn the_verification_budget_is_held_and_given_back() {
+        let in_flight = AtomicUsize::new(0);
+        let first = Verifying::take(&in_flight, 2).expect("a place");
+        let second = Verifying::take(&in_flight, 2).expect("a place");
+        assert!(Verifying::take(&in_flight, 2).is_none(), "the budget spent");
+        drop(first);
+        assert!(Verifying::take(&in_flight, 2).is_some());
+        drop(second);
+        assert_eq!(in_flight.load(Ordering::SeqCst), 0);
+        assert!(
+            Verifying::take(&in_flight, 0).is_none(),
+            "no budget, no place"
+        );
+    }
+}

@@ -239,6 +239,15 @@ fn the_binding_and_the_scope_are_their_fields_hashes() {
     ] {
         assert_ne!(other, scope);
     }
+    // Two spaces sharing a handle: one secret, one guard's name, two
+    // nullifiers.
+    let secret = [1, 2, 3, 4, 5, 6, 7, 8];
+    let nullifier = |scope: &credentials::Digest| {
+        let key = credentials::compress(&Tag::Nf.block(), &secret);
+        credentials::compress(&key, &credentials::words(scope).unwrap())
+    };
+    let elsewhere = credentials::scope(&SpaceId([0x12; 32]), AgentId(1), InstanceId(2), b"vote");
+    assert_ne!(nullifier(&scope), nullifier(&elsewhere));
 }
 
 /// The rows apply keeps: the credential actor's instance, each binding
