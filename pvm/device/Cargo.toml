@@ -1,0 +1,32 @@
+[package]
+name = "vos-device"
+edition.workspace = true
+version.workspace = true
+license = "Apache-2.0"
+description = "The device library: a member's secret from a secret source, its credential proofs (auth, owner, and membership and payment measured), their verification, the node-API requests a client sends for them, and the path it keeps apart from its proofs."
+
+[dependencies]
+# The credential circuits and their masked prover.
+vos-pvm-recair = { workspace = true }
+vos-pvm-recair-air = { workspace = true }
+# The credential verifier, its pinned programs and a proof's bytes.
+vos-pvm-final-verifier = { workspace = true, features = ["credential-bytes"] }
+# The registry's credential format.
+vos-pvm-proof = { workspace = true }
+# The tags, the compression, the tree and the node API's types and kinds.
+vos-wire = { workspace = true }
+vos-api = { workspace = true }
+vos-pvm-precompiles = { workspace = true }
+scale = { package = "vos-pvm-codec", path = "../codec", default-features = false }
+stwo = { workspace = true }
+rayon = { workspace = true }
+num-traits = { workspace = true }
+# The derivation (BLAKE2b-512) and the source's input (SHA-256).
+blake2 = "0.10"
+sha2 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+# A query's key, drawn for that query alone.
+ed25519-dalek = "2"
+getrandom = "0.2"
+# A pool's threads pinned to the cores `Threads::Cores` names.
+libc = "0.2"
