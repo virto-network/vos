@@ -2655,3 +2655,108 @@ failed 5 of 9 at the node's start under load 50+ (empty logs), and passed
 9 of 9 alone; the agent crates rerun with `--no-fail-fast` and
 `test-reads`, 691 passed in 53 suites. `just test-proof` green, 579 passed
 in 50 suites, the credential suite's leakage at N = 500 among them.
+
+**Review (Fable):** accept; M1, M2, L1–L6 folded
+(`research/slice-7/7.10-fable.md`). No soundness or zero-knowledge
+defect. The folds:
+- **M1, the device hidden-state gate** (`tests/device/leakage.rs`) searched
+  8-byte needles in postcard bytes, which varint-encode every M31, so it
+  could not fail. It now takes the credential gate's method, moved to
+  `common::leakage::leaked`: two or more distinct values of a hidden
+  digest among the proof's published M31s; the hidden digests are the
+  witness's sixteen words in the Poseidon2 call's two blocks, the call's
+  eight output words, and the witness's and the output's bytes eight at a
+  time. The control plants the output's words among a queried column and
+  is found; on that planted proof the old byte search finds nothing and
+  the new one names the output digest [measured, a temporary assertion].
+- **M2, the fork's grind** (olanod/stwo `vos/grind-chunks` `4cd1f83f`, on
+  `c3ec9813`, unpushed; the workspace, the fuzz crate and the kit's, the
+  blob's and the runner's lockfiles re-pinned by rev): a thread's unit of
+  work is 2^14 consecutive nonces of one high word's range instead of the
+  whole 2^20, the nonce space `(hi << 32) | lo`, `lo < 2^20`, unchanged,
+  so the grind returns the same smallest nonce whatever the threads; the
+  smallest good chunk lowered by `fetch_min`. The fork's tests: the
+  grind's nonce is a scalar scan's smallest, past the first chunk, at 1, 3
+  and 8 threads, for Blake2s, Blake2s-M31 and Blake2b. **No fixture
+  moved:** 300 seeds' nonces at PoW 20 and 16 are the same before and
+  after at 1, 4 and 8 threads (one digest of all of them), and
+  `test-proof`'s seeded fixtures pass unchanged. 2^16 chunks measured
+  beside 2^14: slower at every count (PoW 20, 4 threads, mean 39.7 against
+  34.6 ms on a generic build), so 14.
+- **L1:** `Circuit::log_sizes` debug-asserts `h8` is not empty, naming
+  `log_sizes_without_h8`.
+- **L4:** `a_tagged_rows_free_message_is_refused` (the leaf's tagged row
+  on a free message, the member row's yield rebalanced:
+  `FreeMessageAbsorbed` at that row) and, in
+  `an_honest_proof_of_another_statement_is_refused`, one word fewer and
+  one more under `verify_with` (`Logup` or `InteractionPow`).
+- **L5:** `credential_timing` proves every statement under 42 and 44 and
+  reports p50 and p95 of 40 proves and of 300 grinds at each thread count
+  on its command line (1, 4 and 8 by default), a rayon pool each.
+- **L2** to 7.16's text (the Blake2s-M31 channel's `mix_bytes` packs four
+  bytes a word before a format pins a transcript that mixes bytes);
+  **L3** to 7.11's (ingress calls `verify`, never `verify_with`; the fuzz
+  target `verify_bytes`; the time to refuse a wrong PoW measured, the
+  composition check running before the PoW check in Stwo's order).
+- **L6:** the final verifier is single-threaded, so its time is the
+  one-core time: 1.61 ms on one thread pinned to one core [measured,
+  below], under pin I's 10 ms.
+
+**Decisions** [under S29, at this review; pin I, §7.10, §7.12]: the
+owner statement's x86 target of 30 ms is restated as **owner at most
+auth's**, the floor being the masking's and shared by both kinds (Q1);
+S29's format is chosen on the phone at 7.12, after M2, as planned, the x86
+evidence favouring 44 (Q2); the x86 target of 60 ms stays as format 44's,
+42's miss recorded (Q3); `h = 256` is a later lever, taken only if PG1
+needs it.
+
+**The grind before and after M2** [measured; a standalone bench on each
+fork commit, `target-cpu=native`, fat LTO; 300 seeds after 3 warm-ups;
+1 thread on core 1, 4 on cores 1, 3, 6, 8 (P-cores), 8 on those and E-cores
+12–15; load 2.2–2.8; mean / p50 / p95, ms]:
+
+| PoW | threads | before | after |
+|---|---|---|---|
+| 20 | 1 | 25.5 / 16.9 / 78.0 | 25.9 / 17.3 / 79.3 |
+| 20 | 4 | 27.8 / 27.7 / 31.7 | **9.8 / 6.4 / 28.2** |
+| 20 | 8 | 45.7 / 46.6 / 52.5 | **7.6 / 5.0 / 21.7** |
+| 16 | 1 | 1.5 / 1.0 / 4.2 | 1.5 / 1.1 / 4.2 |
+| 16 | 4 | 3.5 / 3.1 / 7.7 | **1.0 / 0.7 / 2.0** |
+| 16 | 8 | 6.4 / 5.9 / 11.2 | **1.2 / 1.1 / 2.0** |
+
+Before, four threads were no faster than one and eight slower (each thread
+finishing a whole 2^20 range); after, the grind scales and orders
+correctly. The record's earlier "PoW 20, 37–43 ms on 4 threads" was this
+artefact.
+
+**Re-timed after M2** [measured; `credential_timing`, the pinning above,
+40 proves after 2 warm-ups, 300 grinds; load 2.1–3.3 throughout; prove p50 /
+p95, ms; verify p50]:
+
+| statement, format | 1 thread | 4 threads | 8 threads |
+|---|---|---|---|
+| auth, 42 | 115 / 219 | 51.0 / 79.8 | 44.5 / 66.4 |
+| owner, 42 | 114 / 227 | 50.5 / 83.3 | 47.2 / 57.0 |
+| membership and payment, 42 | 106 / 227 | 50.1 / 83.5 | 46.0 / 71.7 |
+| auth, 44 | 84.7 / 89.2 | **44.6 / 47.5** | 40.6 / 43.6 |
+| owner, 44 | 85.2 / 90.3 | **44.0 / 47.2** | 39.6 / 44.2 |
+| membership and payment, 44 | 84.1 / 90.7 | **43.7 / 47.6** | 40.2 / 43.5 |
+| PoW 20 grind (mean / p50 / p95) | 45.1 / 29.3 / 134.6 | 13.9 / 9.4 / 41.0 | 10.2 / 7.0 / 28.4 |
+| PoW 16 grind | 2.5 / 1.7 / 7.1 | 1.3 / 0.9 / 2.6 | 1.5 / 1.4 / 2.4 |
+| verify | 1.61–1.71 ms | 2.10–2.22 ms | 2.26–2.43 ms |
+
+R1 3.9–5.1 ms; proofs 195–221 KB (the Merkle witnesses follow the
+coins). At 4 threads 44 is inside 60 ms at its 95th percentile for every
+statement and owner equals auth; 42's median is now inside 60 ms but its
+95th percentile, the grind's tail, is not (80–84 ms). On x86 the grind's
+p95 at PoW 20 is 41 ms on 4 threads, under S29's 50 ms; the phone decides.
+
+**Review folds' commits:** `af52e21c` the fork's pin; `b2f1847e` the
+device hidden-state gate; `ce231ed0` the gate gaps and `log_sizes`;
+`9b7cac32` the timing example; this record with the review and the plan's
+amendments.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, other agents'
+runs, load 2–23]: the touched suites (`credential` 20, `device` 24, the
+fork's grind tests 7, with and without `parallel`); `just check` green;
+`just test-proof` green, 579 passed in 50 suites.

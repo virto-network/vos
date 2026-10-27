@@ -330,7 +330,12 @@ pinned by 7.7.
   the phone [decided, S29], the format is **44**, the same at 47 queries
   and PoW 16 (62.92 and 110), and 42 is retired: a number names one
   set of parameters. 30, reserved at an unmasked count, is retired
-  unregistered.
+  unregistered. The choice is the phone's, at 7.12, on the fork's chunked
+  grind (`vos/grind-chunks`: the smallest nonce kept, so a seeded proof's
+  bytes are x86's, and the grind scales with threads at PoW 20); 7.10's
+  x86 numbers favour 44, so 7.11 and 7.12 take the format from the
+  registry and build nothing on 42's numbers [decided under S29, 7.10's
+  review].
 - **The scope,** namespaced by the verifier and its space (the Fable
   review's H1):
   `scope = C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))`,
@@ -879,8 +884,11 @@ and adds its set in a file of its own.
   the forgery gates (a prover that skips the path's bits or the leaf's
   tag); a one-component masked set refused; leakage 2, 3 and 5 at N = 500
   in `test-proof` (2,000 at the slice's end); on x86 auth and the
-  membership-and-payment circuit at most 60 ms and owner at most 30 ms on
-  4 threads [est from the masked floor: 2^11 rows × about 400 columns].
+  membership-and-payment circuit at most 60 ms on 4 threads under format
+  44 (42 misses it, recorded), and owner at most auth's: the floor is the
+  masking's, `4h` rows whatever the circuit, so both kinds share one shape
+  and one cost; the first estimate's 30 ms for owner counted its one
+  permutation, not the floor [decided under S29, 7.10's review].
 - **Dep:** 7.7, 7.9 (the tree's hashes). **Estimate:** 3–4 weeks.
 
 ### 7.10b The node API and the gateway (S)
@@ -978,6 +986,11 @@ and adds its set in a file of its own.
   per-format size caps; the `Time` request; the schema's `credential`
   field and the `credentials` system row (`Failure::Credentials`); the
   ledger test actor below, the demo's ledger in 7.13; the fuzz targets;
+  ingress calls the final verifier's `verify`, which picks the circuit by
+  kind, never `verify_with`, which takes any root, and pin I's fuzz target
+  is `verify_bytes`; the time to refuse a wrong PoW is measured, not
+  assumed, since in Stwo's order the composition check runs before the
+  PoW check (7.10's review L3);
   `node/SECURITY.md` opened (the path leak, the handle copy, what
   operators and gateways learn). Its ABI change lands before 7.8b, so no
   pinned blob moves twice.
@@ -1037,6 +1050,12 @@ and adds its set in a file of its own.
   reduced: operators learn that a member digest is online, and its
   address, not when it proves; `vos-device`'s `SECURITY.md` states
   containment. `Threads::Auto` a plain even split until 7.17.
+- **The format** [decided under S29, 7.10's review]: S29 is decided here,
+  on the phone, after the fork's chunked grind (the entry names the grind
+  its numbers were taken on); 7.10's x86 numbers favour 44. `h = 256`
+  (7.14's option 2: the masked prove about halved, at the price of a
+  re-pin and a measured R1 retry rate) is a later lever, taken only if
+  PG1 needs it once the format is chosen.
 - **Phone gate PG1** (Fairphone 6): auth masked at most **250 ms** (target
   150 ms), the membership-and-payment proof at most 250 ms (S37), and
   owner at most 150 ms, each within 256 MiB, the 95th percentile
@@ -1219,7 +1238,12 @@ change in this slice. The nodes prove under 35 until 7.21.
   at PoW 20 or 47 at PoW 16, blowup 8 with 29; the Blake2s-M31 channel,
   Blake2b-256 for comparison) on x86, then on the phone; format 43 pinned
   at the fastest candidate within pin J's memory and size budgets, by its
-  median and its 95th percentile. Phone session P4.
+  median and its 95th percentile. Phone session P4. Before a format on the
+  Blake2s-M31 channel pins a transcript that mixes bytes, its `mix_bytes`
+  packs four bytes a word (`pcs.rs` mixes one u32 a byte today, harmless
+  where nothing calls it, 32 times a boundary mix's hashing where
+  something does): a transcript's encoding is settled before the pin, not
+  after (7.10's review L2).
 - **Dep:** 7.15. **Estimate:** 1–1.5 weeks.
 
 ### 7.17 Levers 1–4
@@ -1474,7 +1498,8 @@ Two, each closed by a measurement:
    plan aims at 1 s.
 2. **The credential parameters** (S29): 7.12's grind on the phone picks
    PoW 16 with 47 queries (format 44) if its 95th percentile passes 50 ms,
-   else PoW 20 with 43 (format 42).
+   else PoW 20 with 43 (format 42); on the fork's chunked grind, x86
+   favouring 44 (7.10).
 
 7.7's design round asked six more (7.7-Q1 to Q6, `slice-7-progress.md`,
 7.7); the owner answered each: Q1 by S37, Q2 by S38, Q3 by S39, Q4 by
