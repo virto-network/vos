@@ -43,7 +43,7 @@ use ed25519_dalek::SigningKey;
 use rayon::prelude::*;
 use vos_checker::calls::installed;
 use vos_checker::programs::{Programs, actor, method, package};
-use vos_node::client::{self, Client, Operator, Target};
+use vos_node::client::{self, Client, ClientError, Operator, Target};
 use vos_node::{Config, Node};
 use vos_pvm_final_verifier::credential as verifier;
 use vos_pvm_recair::credential::{OwnerPublic, Statement, prove};
@@ -272,7 +272,11 @@ struct Driven {
 
 /// Each of `count` sends at `rate` a second, open loop, by `SENDERS`
 /// threads. `send` makes the `i`th.
-fn drive(count: usize, rate: f64, send: impl Fn(usize, usize) -> bool + Sync) -> Driven {
+fn drive(
+    count: usize,
+    rate: f64,
+    send: impl Fn(usize, usize) -> Result<Response, ClientError> + Sync,
+) -> Driven {
     let next = AtomicUsize::new(0);
     let (flying, most, sending) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicU64::new(0));
     let start = Instant::now() + Duration::from_millis(100);
@@ -293,7 +297,11 @@ fn drive(count: usize, rate: f64, send: impl Fn(usize, usize) -> bool + Sync) ->
                     }
                     most.fetch_max(flying.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                     let sent = Instant::now();
-                    assert!(send(sender, index), "call {index} did not run");
+                    let answer = send(sender, index);
+                    assert!(
+                        answer.as_ref().is_ok_and(ran),
+                        "call {index} did not run: {answer:?}"
+                    );
                     sending.fetch_add(sent.elapsed().as_nanos() as u64, Ordering::Relaxed);
                     flying.fetch_sub(1, Ordering::SeqCst);
                     latencies.lock().unwrap().push(due.elapsed());
@@ -345,7 +353,7 @@ fn run(reached: &Reached, client_target: &Target, executors: usize, seconds: f64
     let before = reached.stats();
     let credentialed = drive(count, rate, |_, index| {
         let (agent, call) = &calls[index];
-        client::credentialed(client_target, *agent, call).is_ok_and(|answer| ran(&answer))
+        client::credentialed(client_target, *agent, call)
     });
     let after = reached.stats();
     drop(calls);
@@ -364,7 +372,6 @@ fn run(reached: &Reached, client_target: &Target, executors: usize, seconds: f64
             .lock()
             .unwrap()
             .call(agent, COUNTER, increment, &1u64.encode())
-            .is_ok_and(|answer| ran(&answer))
     });
     let achieved = count as f64 / credentialed.elapsed;
     let (c99, s99) = (
