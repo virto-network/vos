@@ -295,3 +295,30 @@ fn a_leader_with_a_read_waiting_is_not_quiescent() {
     core.take_actions();
     assert!(!core.quiescent(0));
 }
+
+#[test]
+fn a_leader_resumed_after_a_quiet_wait_counts_only_members_heard_since() {
+    let mut core = idle_leader_of_three();
+    core.tick(1_000 + 60);
+    core.take_actions();
+    assert!(core.quiescent(0));
+    // Quiet past check-quorum's window, its members' nodes fell silent:
+    // what it heard of them before the wait no longer holds it up.
+    core.resume(5_000);
+    core.vouch(5_000, |_, _| None, |_| None);
+    core.tick(5_000);
+    core.take_actions();
+    assert_eq!(core.role(), Role::Follower);
+}
+
+#[test]
+fn a_leader_resumed_with_its_members_heard_keeps_leading() {
+    let mut core = idle_leader_of_three();
+    core.tick(1_000 + 60);
+    core.take_actions();
+    core.resume(5_000);
+    core.vouch(5_000, |_, _| None, |_| Some(4_900));
+    core.tick(5_000);
+    core.take_actions();
+    assert_eq!(core.role(), Role::Leader);
+}

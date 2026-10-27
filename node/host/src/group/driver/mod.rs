@@ -339,6 +339,9 @@ impl Driver {
                         .store(self.inner.liveness.elapsed(), Ordering::Relaxed);
                 }
                 let now = self.now();
+                if quiesced {
+                    self.core.resume(now);
+                }
                 // A deadline due runs only once the pair heartbeat had its
                 // say, as does a round after a quiet wait, whose timers it
                 // stood in for.
@@ -398,7 +401,8 @@ impl Driver {
     /// core needs no tick but those the pair heartbeat stands in for, which
     /// notices a lapse within a round of it.
     fn quiet(&self) -> Option<Quiet> {
-        if !self.core.quiescent(self.inner.settings.heartbeat_ms) {
+        let every = self.inner.settings.heartbeat_ms;
+        if !self.inner.liveness.on_time(every) || !self.core.quiescent(every) {
             return None;
         }
         let status = self.core.status();

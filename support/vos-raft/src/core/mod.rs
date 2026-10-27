@@ -826,6 +826,20 @@ impl<N: NodeId> Core<N> {
         }
     }
 
+    /// The host ticks a quiescent core again after a wait, at `now`: a
+    /// leader whose check-quorum came due meanwhile counts as heard only
+    /// the members heard since, which the host's vouch that follows adds,
+    /// not those heard before the wait.
+    pub fn resume(&mut self, now: u64) {
+        self.now = self.now.max(now);
+        if self.role == Role::Leader
+            && self.now >= self.check_quorum_due
+            && let Some(leading) = self.leading.as_mut()
+        {
+            leading.recent.clear();
+        }
+    }
+
     /// `node` came back (a new run of it, or heard again after a silence):
     /// a leader no longer counts it as caught up, and sends it a heartbeat
     /// at once, so a replica that restarted learns its leader and the

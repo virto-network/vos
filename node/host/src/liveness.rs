@@ -22,7 +22,7 @@ use vos_wire::ids::AgentId;
 use vos_wire::peer::{Leading, NodeNumber, PeerMessage, Placement};
 
 use crate::group::{Local, Quiet};
-use crate::node::Inner;
+use crate::node::{Inner, Run};
 use crate::peer;
 use crate::{lock, timeout};
 
@@ -53,6 +53,9 @@ pub(crate) struct Liveness {
     /// The last round sent, kept across the heartbeat's restarts: peers
     /// ignore a round below the last they took from this run.
     round: AtomicU64,
+    /// When the heartbeat last went round, in milliseconds since the node
+    /// started: a group goes quiet only while it goes round on time.
+    beaten: AtomicU64,
 }
 
 impl Liveness {
@@ -62,12 +65,20 @@ impl Liveness {
             table: RwLock::new(PeerTable::new()),
             started: Instant::now(),
             round: AtomicU64::new(0),
+            beaten: AtomicU64::new(0),
         }
     }
 
     /// The next round to send.
     fn next_round(&self) -> u64 {
         self.round.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Whether the heartbeat went round within two of its intervals, `every`
+    /// milliseconds: only then does it stand in for a quiet group's timers.
+    pub(crate) fn on_time(&self, every: u64) -> bool {
+        let beaten = self.beaten.load(Ordering::Relaxed);
+        self.elapsed().saturating_sub(beaten) < 2 * every
     }
 
     /// Milliseconds since the node started.
@@ -180,6 +191,10 @@ async fn beat(inner: Arc<Inner>) -> Ended {
             inner.to_led(None, || Local::Wake);
         }
         inner.wake_quiet();
+        inner
+            .liveness
+            .beaten
+            .store(inner.liveness.elapsed(), Ordering::Relaxed);
         let round = inner.liveness.next_round();
         // None listed while the writer is stalled, so their followers elect
         // leaders that can write, and none that is not live.
@@ -230,8 +245,9 @@ fn frames(incarnation: u64, round: u64, listed: &[Leading], size: usize) -> Vec<
 impl Inner {
     /// The groups this node leads, at their terms, each with its placement
     /// when known, and whether it is live: not stopped, and its driver gone
-    /// round in two election timeouts, or quiet with nothing waiting for
-    /// it.
+    /// round in two election timeouts. A quiet driver with nothing waiting
+    /// for it, its leader loop's queue included, counts as gone round now:
+    /// the two timeouts run from the first work that waits for it.
     fn led(&self) -> Vec<(Leading, Option<Placement>, bool)> {
         let now = self.liveness.elapsed();
         let stuck = 2 * self.settings.election_timeout_ms.1;
@@ -239,11 +255,15 @@ impl Inner {
             .iter()
             .filter_map(|(agent, run)| {
                 let state = run.shared.state();
-                let woke = run.shared.woke.load(Ordering::Relaxed);
-                let quiet = lock(&run.shared.quiet).is_some()
+                let idle = lock(&run.shared.quiet).is_some()
                     && run.inbox.is_empty()
-                    && run.local.is_empty();
-                let live = !state.stopped && (now.saturating_sub(woke) < stuck || quiet);
+                    && run.local.is_empty()
+                    && lock(&run.agent.queue).is_empty();
+                if idle {
+                    run.shared.woke.fetch_max(now, Ordering::Relaxed);
+                }
+                let woke = run.shared.woke.load(Ordering::Relaxed);
+                let live = !state.stopped && now.saturating_sub(woke) < stuck;
                 let leading = Leading {
                     agent: *agent,
                     term: state.term,
@@ -274,8 +294,13 @@ impl Inner {
         let lapsed = |at: Option<Instant>, within: u64| {
             at.is_none_or(|at| at + Duration::from_millis(within) <= ahead)
         };
+        // Taken apart from the runs' lock, which no group's quiet then waits
+        // behind.
+        let runs: Vec<(AgentId, Arc<Run>)> = lock(&self.runs)
+            .iter()
+            .map(|(agent, run)| (*agent, Arc::clone(run)))
+            .collect();
         let due: Vec<AgentId> = {
-            let runs = lock(&self.runs);
             let table = self.liveness.table();
             runs.iter()
                 .filter(|(agent, run)| match &*lock(&run.shared.quiet) {
