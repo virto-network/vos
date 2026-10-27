@@ -18,7 +18,7 @@ fuzz_target!(|data: &[u8]| {
     let Some((agent, call)) = <(AgentId, Credentialed)>::decode_exact(data) else {
         return;
     };
-    assert_eq!((agent, &call).encode(), data, "one encoding");
+    assert_eq!((agent, call.clone()).encode(), data, "one encoding");
     if let Some(words) = call.public.words() {
         assert_eq!(words[0], u32::from(call.public.kind()));
     }
