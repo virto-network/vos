@@ -9,7 +9,10 @@
 //! - [`gate`]: the `Gate` relation `(address, l0, l1, l2, l3)` that wires
 //!   them, with signed, preprocessed multiplicities, and why it is sound;
 //! - [`masked`]: the three as the masked wrap proves them, masked, blinded
-//!   and at a constraint bound of `4N`; leaves and folds never use it.
+//!   and at a constraint bound of `4N`, and `p2` and `qm31` as the
+//!   credential AIR proves them; leaves and folds never use it;
+//! - [`credential`]: the credential statements' public words and program
+//!   ids.
 //!
 //! A circuit is the components' preprocessed columns: its coefficients,
 //! selectors, addresses and multiplicities. Every constraint is of degree at
@@ -22,6 +25,7 @@
 
 extern crate alloc;
 
+pub mod credential;
 pub mod gate;
 pub mod h8;
 pub mod masked;

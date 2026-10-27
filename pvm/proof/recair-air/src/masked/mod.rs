@@ -20,7 +20,8 @@
 //! The masking is the wrap's alone: leaves and folds never read this module,
 //! and their components keep [`crate::LOG_CONSTRAINT_EXPANSION`]. Everything
 //! here is generic over the component set ([`MaskedComponents`]);
-//! [`WrapComponents`] is the recursion AIR's.
+//! [`WrapComponents`] is the recursion AIR's, [`CredentialComponents`] the
+//! credential AIR's (`p2` and `qm31`).
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
@@ -58,9 +59,11 @@ pub const TREES: usize = 4;
 const AIR_TREES: usize = TREES - 1;
 
 mod component;
+mod credential;
 mod wrap;
 
 pub use component::{MaskedComponent, Rebound};
+pub use credential::{CredentialComponents, CredentialLogSizes, credential_preprocessed_ids};
 pub use wrap::WrapComponents;
 
 relation!(BlindRelation, 1);
@@ -185,6 +188,23 @@ pub trait MaskedComponents: Sized {
         blind: &BlindRelation,
         claimed_sums: &[SecureField],
     ) -> Option<Vec<Box<dyn Component + 'a>>>;
+}
+
+/// The components whose claimed sums the prover blinds: every one but
+/// [`MaskedComponents::public_sums`]'.
+pub fn blinded_components(set: &impl MaskedComponents) -> usize {
+    let public = set.public_sums();
+    (0..set.components().len())
+        .filter(|component| !public.contains(component))
+        .count()
+}
+
+/// Whether the set blinds its claimed sums: two blinded components at
+/// least, or none. One blinded component's sum is the logup total's less
+/// the public ones', a value the verifier computes, so a set of one carries
+/// it in the clear: the prover and the verifier refuse it.
+pub fn blinds_its_sums(set: &impl MaskedComponents) -> bool {
+    blinded_components(set) != 1
 }
 
 /// The level the AIR is evaluated at, its tallest masked column's: `m + 1`.

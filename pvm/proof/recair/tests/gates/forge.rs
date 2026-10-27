@@ -119,7 +119,7 @@ impl Forgery {
                     Slot::P2Output { row, w },
                 ));
             }
-            if wiring.mode == Some(vos_pvm_recair::P2Mode::Node) {
+            if wiring.bit_multiplicity() != 0 {
                 slots.push((
                     Entry {
                         address: wiring.bit_address,

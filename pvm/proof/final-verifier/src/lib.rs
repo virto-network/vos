@@ -34,6 +34,11 @@
 //! A venue keys what it has accepted on the statement's id (`vos-statement`),
 //! never on the proof.
 //!
+//! **Credential proofs** ([`credential`], format 42) share the masked
+//! verifier: the credential AIR's `p2` and `qm31` on the Blake2s-M31
+//! channel, verified against the program of the statement's kind, as a
+//! space's ingress takes them.
+//!
 //! The crate is `no_std`, uses no nightly feature, and builds on stable for
 //! x86 and wasm32 and on the pinned nightly for the PVM.
 //!
@@ -61,6 +66,7 @@
 extern crate alloc;
 
 mod constants;
+pub mod credential;
 mod layout;
 pub mod masked;
 #[cfg(feature = "test-formats")]

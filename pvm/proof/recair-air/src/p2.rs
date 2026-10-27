@@ -21,6 +21,16 @@
 //! | channel first | `prev[0, 8)` | `h` | an absorption over the last digest; the PoW's second permutation |
 //! | channel continue | `prev[0, 8)` | `prev[8, 16) + h` | an absorption's next chunks |
 //! | wired | `a` | `(c_8, c_9, 0, …)` | a draw, the PoW's first permutation |
+//! | tagged | `c[0, 8)` | `m` | a tag's block and a wire pair: the credential AIR's `C(T(name), x)` |
+//!
+//! **The tagged row has no selector of its own:** it sets leaf start's and
+//! node's selectors to 1 and channel first's to −1, with `act` zero and its
+//! bit the zero wire's (a use, so `b = 0` by the relation). The constraint is
+//! linear in the selectors, so its input is the sum of the three modes':
+//! `[c + prev + 0·(m − prev) − prev, m + 0·(prev − m) − 0]`, which is
+//! `[c, m]` as polynomials, `prev` cancelled whatever the row before it holds.
+//! A constant block on the left of a wire pair is a compression no single
+//! mode forms ([`P2Mode::Tagged`]).
 //!
 //! A padding row has no selector, so its input is zero and the row holds the
 //! permutation of zero. Row order is part of the circuit: a chained row
@@ -58,9 +68,14 @@ pub enum P2Mode {
     ChannelFirst,
     ChannelContinue,
     Wired,
+    /// `[c[0, 8), m]`: three modes' selectors at once, none of its own (the
+    /// module's notes).
+    Tagged,
 }
 
 impl P2Mode {
+    /// The modes with a selector column each, in the columns' order:
+    /// every mode but [`P2Mode::Tagged`].
     pub const ALL: [P2Mode; 7] = [
         P2Mode::LeafStart,
         P2Mode::LeafContinue,
@@ -71,12 +86,41 @@ impl P2Mode {
         P2Mode::Wired,
     ];
 
-    /// Whether the row's input reads the previous row's output.
+    /// Whether the row's input reads the previous row's output. A tagged
+    /// row's terms in it cancel, so it is not chained.
     pub const fn is_chained(self) -> bool {
         matches!(
             self,
             P2Mode::LeafContinue | P2Mode::Node | P2Mode::ChannelFirst | P2Mode::ChannelContinue
         )
+    }
+
+    /// The selectors a row of this mode sets, in [`P2Mode::ALL`]'s order:
+    /// its own at 1; a tagged row's leaf start and node at 1 and channel
+    /// first at −1.
+    pub const fn selectors(self) -> [i8; 7] {
+        let mut selectors = [0; 7];
+        match self {
+            P2Mode::Tagged => {
+                selectors[P2Mode::LeafStart as usize] = 1;
+                selectors[P2Mode::Node as usize] = 1;
+                selectors[P2Mode::ChannelFirst as usize] = -1;
+            }
+            mode => selectors[mode as usize] = 1,
+        }
+        selectors
+    }
+
+    /// Whether the row's bit is a use: node's selector is set. A tagged
+    /// row's is the zero wire's.
+    pub const fn reads_bit(self) -> bool {
+        matches!(self, P2Mode::Node | P2Mode::Tagged)
+    }
+
+    /// Whether the row reads every lane of its message, whatever its `act`:
+    /// a node's and a tagged row's.
+    pub const fn reads_whole_message(self) -> bool {
+        matches!(self, P2Mode::Node | P2Mode::Tagged)
     }
 }
 
@@ -227,7 +271,11 @@ impl Body for P2Eval {
                 id: PREPROCESSED[i].to_string(),
             })
         });
-        let selector = |mode: P2Mode| pre[pre::SELECTORS + mode as usize].clone();
+        // A selector mode's column; the tagged row has none.
+        let selector = |mode: P2Mode| {
+            debug_assert!(mode != P2Mode::Tagged, "the tagged row has no selector");
+            pre[pre::SELECTORS + mode as usize].clone()
+        };
         let act: [E::F; 8] = from_fn(|j| pre[pre::ACT + j].clone());
         let c: [E::F; 10] = from_fn(|j| pre[pre::C + j].clone());
 

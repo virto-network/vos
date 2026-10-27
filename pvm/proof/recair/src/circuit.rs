@@ -47,6 +47,21 @@ impl P2Wiring {
     pub fn absorbed(&self, w: usize) -> [bool; 4] {
         core::array::from_fn(|j| !self.act[4 * w + j].is_zero())
     }
+
+    /// The lanes of message slot `w` the row's input reads: every lane in a
+    /// node or a tagged row, else those its `act` absorbs.
+    pub fn reads(&self, w: usize) -> [bool; 4] {
+        if self.mode.is_some_and(P2Mode::reads_whole_message) {
+            [true; 4]
+        } else {
+            self.absorbed(w)
+        }
+    }
+
+    /// The bit's multiplicity: a use where node's selector is set.
+    pub fn bit_multiplicity(&self) -> i64 {
+        i64::from(self.mode.is_some_and(P2Mode::reads_bit))
+    }
 }
 
 /// The QM31 gate's coefficients:
@@ -118,7 +133,8 @@ pub struct Circuit {
 /// Why a circuit's wiring is refused.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WiringError {
-    /// A component's rows are not a power of two of at least 16.
+    /// A component's rows are not a power of two of at least 16, or an
+    /// `h8` meant to be absent has rows.
     Size {
         component: &'static str,
         rows: usize,
@@ -207,8 +223,14 @@ struct LaneCensus {
 }
 
 impl Circuit {
-    /// The components' log sizes.
+    /// The components' log sizes, for a circuit with all three
+    /// ([`Circuit::check_wiring`], which every caller runs first, refuses
+    /// one without `h8`; its sizes are [`Circuit::log_sizes_without_h8`]).
     pub fn log_sizes(&self) -> [u32; 3] {
+        debug_assert!(
+            !self.h8.is_empty(),
+            "a circuit without h8 has two log sizes, log_sizes_without_h8's"
+        );
         [self.p2.len(), self.qm31.len(), self.h8.len()].map(|rows| rows.ilog2())
     }
 
@@ -228,7 +250,7 @@ impl Circuit {
                 },
                 Entry {
                     address: row.bit_address,
-                    multiplicity: i64::from(row.mode == Some(P2Mode::Node)),
+                    multiplicity: row.bit_multiplicity(),
                 },
             ]
         });
@@ -258,9 +280,22 @@ impl Circuit {
     /// multiplicity of its uses, and the absolute multiplicities' sum below
     /// `p`; and every read bound (`check_reads`).
     pub fn check_wiring(&self) -> Result<WiringStats, WiringError> {
-        let stats = self.check_relation()?;
+        let stats = self.check_relation(true)?;
         self.check_reads()?;
         Ok(stats)
+    }
+
+    /// [`Circuit::check_wiring`] for a circuit of `p2` and `qm31` alone (the
+    /// credential AIR's set): no `h8` row, the others as there.
+    pub fn check_wiring_without_h8(&self) -> Result<WiringStats, WiringError> {
+        let stats = self.check_relation(false)?;
+        self.check_reads()?;
+        Ok(stats)
+    }
+
+    /// The log sizes of `p2` and `qm31`, for a circuit without `h8`.
+    pub fn log_sizes_without_h8(&self) -> [u32; 2] {
+        [self.p2.len(), self.qm31.len()].map(|rows| rows.ilog2())
     }
 
     /// Every value a gate reads is a wire's, or a lane some row absorbs:
@@ -299,7 +334,7 @@ impl Circuit {
         for (row, wiring) in self.p2.iter().enumerate() {
             let node = wiring.mode == Some(P2Mode::Node);
             let absorbs_free =
-                (0..2).any(|w| free(&wiring.m[w]) && wiring.absorbed(w).contains(&true));
+                (0..2).any(|w| free(&wiring.m[w]) && wiring.reads(w).contains(&true));
             if wiring.mode.is_some() && !node && absorbs_free {
                 return Err(WiringError::FreeMessageAbsorbed { row });
             }
@@ -363,7 +398,7 @@ impl Circuit {
             }
         }
         for wiring in &self.p2 {
-            if wiring.mode == Some(P2Mode::Node) {
+            if wiring.bit_multiplicity() != 0 {
                 let bit = Entry {
                     address: wiring.bit_address,
                     multiplicity: 1,
@@ -397,11 +432,7 @@ impl Circuit {
                 if entry.multiplicity == 0 {
                     continue;
                 }
-                let lanes = if wiring.mode == Some(P2Mode::Node) {
-                    [true; 4]
-                } else {
-                    wiring.absorbed(w)
-                };
+                let lanes = wiring.reads(w);
                 let all = absorbed.entry(entry.address).or_default();
                 for (all, lane) in all.iter_mut().zip(lanes) {
                     *all |= lane;
@@ -431,14 +462,19 @@ impl Circuit {
         }
     }
 
-    /// The relation's part of [`Circuit::check_wiring`].
-    fn check_relation(&self) -> Result<WiringStats, WiringError> {
+    /// The relation's part of [`Circuit::check_wiring`], `h8` present or
+    /// empty.
+    fn check_relation(&self, h8: bool) -> Result<WiringStats, WiringError> {
         for (component, rows) in [
             ("p2", self.p2.len()),
             ("qm31", self.qm31.len()),
             ("h8", self.h8.len()),
         ] {
-            if rows < MIN_ROWS || !rows.is_power_of_two() {
+            let absent = component == "h8" && !h8;
+            if absent && rows != 0 {
+                return Err(WiringError::Size { component, rows });
+            }
+            if !absent && (rows < MIN_ROWS || !rows.is_power_of_two()) {
                 return Err(WiringError::Size { component, rows });
             }
         }

@@ -12,7 +12,7 @@
 //! column, a reused mask, an unblinded sum); zero knowledge is the
 //! argument's, R1 on every proof.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use stwo::core::fields::m31::BaseField;
 use stwo::core::fields::qm31::SecureField;
@@ -100,6 +100,22 @@ pub fn published<H: MerkleHasherLifted>(
         }
     }
     fields
+}
+
+/// The hidden digests among `hidden` whose words a proof's published values
+/// hold: two or more distinct words of one among them. A given word is among
+/// a proof's values with probability about their count over `p` (10^5 /
+/// 2^31), two of one digest's about its square.
+pub fn leaked<T: AsRef<[u32]> + Clone>(published: &[(Key, u32)], hidden: &[T]) -> Vec<T> {
+    let values: HashSet<u32> = published.iter().map(|&(_, value)| value).collect();
+    hidden
+        .iter()
+        .filter(|digest| {
+            let words: HashSet<u32> = digest.as_ref().iter().copied().collect();
+            words.iter().filter(|word| values.contains(word)).count() >= 2
+        })
+        .cloned()
+        .collect()
 }
 
 /// Proofs' fields gathered by key.

@@ -2793,3 +2793,282 @@ cache:**
 - The O(groups) beat at 10^5.
 - The node caps that run 4 needs.
 - The memtable plateau, judged at T1 in runs 2 and 6.
+
+## Step 7.10: the credential AIR
+
+Branch `s7/7.10`, from vos-core `84607818`.
+
+**Built:**
+- **The tagged `p2` row** (`vos_pvm_recair_air::p2::P2Mode::Tagged`,
+  `gadgets::tagged`): `C(T(name), x)`, a constant block on the left of a
+  wire pair, which no single mode forms (a wire enters the right half only
+  as a node's message beside the row above, or as `act·m` with zeros or
+  `prev` on the left). The row sets leaf start's and node's selectors to 1
+  and channel first's to −1, `act` zero, its bit a use of the zero wire:
+  the input constraint, linear in the preprocessed selectors, reads
+  `[c + b·(m − prev), m + b·(prev − m)]`, and `b = 0` by the relation, so
+  `[c, m]` with `prev` cancelled. **No AIR change:** no column, constraint
+  or degree; the wrap's, the leaves' and the folds' preprocessed columns
+  unchanged (`selectors()` is the old one-hot for every other mode). The
+  wiring check reads a tagged row's whole message and refuses a free one.
+- **Circuits without `h8`** (`Context::finalize_without_h8`,
+  `Circuit::check_wiring_without_h8`, `MainTrace::interaction_without_h8`):
+  `h8`'s padding rows use the zero wire, so a two-component set must have
+  no `h8` row at all.
+- **The circuits** (`vos_pvm_recair::credential::circuit`), each one
+  wiring whatever its witness: auth (member, leaf, 32 node rows on
+  boolean bits, the root out; the nullifier's key, then `scope` absorbed
+  by a channel-first row, the nullifier out), 36 permutations; owner, 1;
+  membership and payment, 37 (measured, no kind). Every output a public
+  word, one M31 a word (`kind` the zero or the one wire's lane), `binding`
+  read by no row. Each component at 2^11 rows, the masking's floor.
+- **The set** (`vos_pvm_recair_air::masked::CredentialComponents`, a file
+  of its own): `p2` and `qm31` masked, after the test's `P2Only`.
+- **A one-component masked set refused** (`masked::blinds_its_sums`): one
+  blinded component's sum is the logup total's less the public ones', so
+  the masked prover and the masked verifier refuse it (before any other
+  check); `P2Only`'s test is now that refusal.
+- **The Blake2s-M31 stack in `pcs.rs`:** `PcsStack` for the fork's
+  `Blake2sM31MerkleChannel`, its `StarkProofAny`, `Commitment` (tagged by
+  the stack; a root word ≥ p refused) and `ChannelRef` variants, appended,
+  so existing encodings are unchanged.
+- **Format 42** registered and admitted, counted on its masked shape
+  (`CREDENTIAL_REFERENCE`, derived from the built set by a test): 106 / 62
+  (62.93), the query term binding, affine batching (the fork's Blake2s-M31
+  path takes it); `h = 512`. **44** (`CREDENTIAL_PROOF_44`, 47 queries, PoW
+  16) counted beside it, 110 / 62 (62.92), not registered. **30** retired.
+- **The prover and the verifier:** `credential::prove` (the witness checked
+  first: a word ≥ p or an unsatisfied piece is `ProveError::Witness`),
+  generic `prove_on` / `verify_on` over any channel and format;
+  `vos_pvm_final_verifier::credential` (format 42 pinned: configuration,
+  pins, log sizes `[11, 11]`, tree widths `[50, 341, 32, 20]`, 467 DEEP
+  values; each kind's preprocessed root and program id, the circuit hash of
+  format 42, its parameters, `[11, 11, 0]` and the root), `verify(kind,
+  words, proof)` picking the circuit by kind; the bytes (postcard,
+  canonical, at most 512 KiB) under `credential-bytes`, a feature the
+  verifier kit drops (the kit's lockfile has no postcard).
+- **The timing example** (`recair/examples/credential_timing.rs`).
+
+**Tests** (`recair/tests/credential`, 19; and the mode gates):
+- **Against `vos_wire::credentials`:** every `p2` row's 16 input words the
+  reference's compression in order (member, leaf, each node on the side its
+  bit picks, the key, the nullifier) at slots 0, `u32::MAX`, `0x8000_0001`
+  and random, the root the reference tree's, `Path::proves` on the path;
+  the outputs the statement's words; the owner and joint circuits likewise
+  (37 and 36 permutations counted); the wiring the blank statement's for
+  any witness and slot; a witness the reference refuses refused by the
+  circuit by piece (`path`, `nullifier`, `owner`).
+- **Proving:** auth and owner proved under 42 and verified by the final
+  verifier, from the proof and from its bytes (a trailing or missing byte,
+  an oversized buffer refused); the pinned roots and program ids the
+  circuits'; two slots one shape; the joint circuit and auth under 44
+  verified, a 44 proof refused under 42; the prover on plain Blake2s, a
+  tampered sample refused; the reference shape the built set's.
+- **Soundness** (each a constraint-satisfying proof of an unsatisfied
+  statement, refused by the logup total): a sibling changed, the slot's
+  bit 20 flipped, a nullifier of another secret, an owner digest of
+  another secret; an honest proof under a changed binding word (the
+  interaction PoW or the logup), a changed root, scope or nullifier word,
+  the other kind (`PublicWords`), the other kind's root (`Circuit`), a
+  relabelled format (`Format`).
+- **Forgery:** a prover that skips the leaf's tag (`C(0, m)`, its path's
+  root stated): its own circuit verifies under its own root and is refused
+  as `Circuit` against auth's; its witness under the pinned circuit refused
+  by the prover and, forced, `OodsNotMatching`. A prover that skips the
+  path's bits (level 0's selector 2, a blend of both orders, its root
+  stated): with the bit's row balanced, refused by the prover and, forced,
+  `OodsNotMatching`; unbalanced, `Logup`. A tagged row with `b = 1`, its
+  input the node rule's so its constraints hold: `Logup` (the review's L1).
+  The mode gates cover the tagged row (honest, and as and against every
+  other mode's rule).
+- **One-component set:** refused by the prover (`Masking`) and by the
+  verifier (`Shape`), before any other check.
+- **Leakage** (`leakage.rs`; the pair one member's leaf at two slots of one
+  tree, equal public words): 2 and 3 at N = 500 under `heavy-gates`
+  [measured]: indistinguishability 19,984 hypotheses, smallest p 6.2e-7
+  against a threshold of 1.25e-8; uniformity 19,987, smallest p 6.6e-5;
+  none refused (354 s). 4 (the secret, the nullifier's key, the member, its
+  leaf and every occupied sibling, two words of one among a proof's
+  published values; a planted control found), 5 (two proofs of one witness,
+  and of the two witnesses from one seed, share no opening) and 7 (one
+  layout).
+
+**x86 timings against the targets** [measured; `credential_timing`, 4
+threads pinned to cores 1, 3, 6, 8, `RAYON_NUM_THREADS=4`, median of 15
+after 2 warm-ups, quiet (load 2–2.5), two runs]:
+
+| statement | target | prove, median | least | verify | bytes |
+|---|---|---|---|---|---|
+| auth, 42 | ≤ 60 ms | **74–85 ms (missed)** | 64 ms | 1.9–2.1 ms | 201–205 KB |
+| owner, 42 | ≤ 30 ms | **74–84 ms (missed)** | 72 ms | 1.9–2.1 ms | 200–203 KB |
+| membership and payment, 42 | ≤ 60 ms | **84–86 ms (missed)** | 47 ms | 2.1–2.2 ms | |
+| auth, 44 | (≤ 60 ms) | 40–47 ms | 38 ms | 1.9–2.1 ms | |
+
+- **The breakdown:** the PoW-20 grind alone takes 37–43 ms on average on
+  the same 4 threads (12–81 ms, geometric), about half the proof; R1
+  3.4–4.0 ms; the rest, about 35–40 ms, is the masked prove of two
+  components at 2^11 rows (columns at 2^12, the composition at 2^13, every
+  tree at the lifting height 2^15). PoW 16 (format 44) grinds 4–5 ms, so
+  auth under 44 proves in 40–47 ms, inside 60.
+- **Owner costs what auth does:** the shape is the floor's, not the
+  statement's. One permutation or 37, each component pads to `4h = 2^11`
+  rows, so the cells, the trees and the grind are the same; the target of
+  30 ms is out of reach at this format whatever the circuit (at 44 it
+  would be about 40 ms too).
+- Verification 1.9–2.2 ms on 4 threads, under pin I's 10 ms on one core
+  (not measured on one core here). Under load (other agents' runs, load
+  20–60) the same cells took 98–440 ms (`timing1`–`timing3` runs); 8
+  threads across the P- and E-cores were slower (auth 100 ms), the grind's
+  threads on E-cores.
+
+**Where the plan was off:**
+- **The recursion AIR's modes cannot form `C(T(name), x)`** for a wire
+  pair `x` that no row above outputs (the secret, as `member`, `owner` and
+  the nullifier's key need): the tagged composite of three selectors does,
+  with no AIR change.
+- **The set cannot be `p2` and `qm31` of a three-component circuit:**
+  `h8`'s padding uses the zero wire, so the circuit has no `h8` at all.
+- **The x86 targets miss** (above): the plan's estimate counted cells
+  ("2^11 rows × about 400 columns") but not the 20-bit grind, about half of
+  each proof on 4 threads, nor that owner pays the same floor as auth. The
+  levers: format 44's PoW 16 (S29's alternative, now with an x86 reason
+  beside the phone's grind), a smaller `h` (7.14's option 2: `2·revealed`
+  rounded, `h = 256`, floors 2^10), blowup 8 with 29 queries (floor 2^10,
+  bytes down) — 7.12's phone gate decides with the phone's numbers.
+- **Counts:** 62.93 and 62.92 proven bits on the built set, against the
+  plan's model of 62.69 and 62.66.
+- **The verifier kit:** a credential proof's bytes need postcard, which the
+  kit's lockfile lacks; they sit under `credential-bytes`, which the kit
+  drops as it drops `test-formats`.
+
+**Review (Opus):** no high finding; folded M1 (the hidden-state gate
+searched fixed little-endian bytes against postcard's varints, so it was
+vacuous: now two words of a hidden digest among the published values, the
+nullifier's key added, a planted control), L1 (the tagged row's `b = 1`
+gate), L3 (words ≥ p refused by the prover), L4 (`selector` asserts a
+selector mode), L5 (`verify_with` documented as the circuit-generic step),
+L6 (`Circuit::log_sizes` documented: every caller checks the wiring, which
+refuses an `h8`-less circuit, first). Not taken: L2 (comparing Merkle
+witnesses' lengths: they follow the query positions, the coins, and differ
+between two proofs — measured), L7 (the timings are recorded here, not
+asserted: they are the machine's).
+
+**Commits:** `9643af7e` the tagged row and circuits without `h8`;
+`1eaec998` the Blake2s-M31 stack; `f4e6348c` formats 42 and 44, 30
+retired; `0e9ddbd5` the one-component refusal; `0c2e1dff` the credential
+AIR, its prover, verifier and gates; `c23cf24b` doc links; `0a863046` the
+review's folds; this record.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 8 jobs, other agents'
+runs, load 20–86]: `just check` at `0a863046` green through the formatting,
+the docs, the no-std builds, the leak gates, the kit, the lints, the core
+crates and `test-recair`; in the agent crates `vos-cli`'s `cli` suite
+failed 5 of 9 at the node's start under load 50+ (empty logs), and passed
+9 of 9 alone; the agent crates rerun with `--no-fail-fast` and
+`test-reads`, 691 passed in 53 suites. `just test-proof` green, 579 passed
+in 50 suites, the credential suite's leakage at N = 500 among them.
+
+**Review (Fable):** accept; M1, M2, L1–L6 folded
+(`research/slice-7/7.10-fable.md`). No soundness or zero-knowledge
+defect. The folds:
+- **M1, the device hidden-state gate** (`tests/device/leakage.rs`) searched
+  8-byte needles in postcard bytes, which varint-encode every M31, so it
+  could not fail. It now takes the credential gate's method, moved to
+  `common::leakage::leaked`: two or more distinct values of a hidden
+  digest among the proof's published M31s; the hidden digests are the
+  witness's sixteen words in the Poseidon2 call's two blocks, the call's
+  eight output words, and the witness's and the output's bytes eight at a
+  time. The control plants the output's words among a queried column and
+  is found; on that planted proof the old byte search finds nothing and
+  the new one names the output digest [measured, a temporary assertion].
+- **M2, the fork's grind** (olanod/stwo `vos/grind-chunks` `4cd1f83f`, on
+  `c3ec9813`, unpushed; the workspace, the fuzz crate and the kit's, the
+  blob's and the runner's lockfiles re-pinned by rev): a thread's unit of
+  work is 2^14 consecutive nonces of one high word's range instead of the
+  whole 2^20, the nonce space `(hi << 32) | lo`, `lo < 2^20`, unchanged,
+  so the grind returns the same smallest nonce whatever the threads; the
+  smallest good chunk lowered by `fetch_min`. The fork's tests: the
+  grind's nonce is a scalar scan's smallest, past the first chunk, at 1, 3
+  and 8 threads, for Blake2s, Blake2s-M31 and Blake2b. **No fixture
+  moved:** 300 seeds' nonces at PoW 20 and 16 are the same before and
+  after at 1, 4 and 8 threads (one digest of all of them), and
+  `test-proof`'s seeded fixtures pass unchanged. 2^16 chunks measured
+  beside 2^14: slower at every count (PoW 20, 4 threads, mean 39.7 against
+  34.6 ms on a generic build), so 14.
+- **L1:** `Circuit::log_sizes` debug-asserts `h8` is not empty, naming
+  `log_sizes_without_h8`.
+- **L4:** `a_tagged_rows_free_message_is_refused` (the leaf's tagged row
+  on a free message, the member row's yield rebalanced:
+  `FreeMessageAbsorbed` at that row) and, in
+  `an_honest_proof_of_another_statement_is_refused`, one word fewer and
+  one more under `verify_with` (`Logup` or `InteractionPow`).
+- **L5:** `credential_timing` proves every statement under 42 and 44 and
+  reports p50 and p95 of 40 proves and of 300 grinds at each thread count
+  on its command line (1, 4 and 8 by default), a rayon pool each.
+- **L2** to 7.16's text (the Blake2s-M31 channel's `mix_bytes` packs four
+  bytes a word before a format pins a transcript that mixes bytes);
+  **L3** to 7.11's (ingress calls `verify`, never `verify_with`; the fuzz
+  target `verify_bytes`; the time to refuse a wrong PoW measured, the
+  composition check running before the PoW check in Stwo's order).
+- **L6:** the final verifier is single-threaded, so its time is the
+  one-core time: 1.61 ms on one thread pinned to one core [measured,
+  below], under pin I's 10 ms.
+
+**Decisions** [under S29, at this review; pin I, §7.10, §7.12]: the
+owner statement's x86 target of 30 ms is restated as **owner at most
+auth's**, the floor being the masking's and shared by both kinds (Q1);
+S29's format is chosen on the phone at 7.12, after M2, as planned, the x86
+evidence favouring 44 (Q2); the x86 target of 60 ms stays as format 44's,
+42's miss recorded (Q3); `h = 256` is a later lever, taken only if PG1
+needs it.
+
+**The grind before and after M2** [measured; a standalone bench on each
+fork commit, `target-cpu=native`, fat LTO; 300 seeds after 3 warm-ups;
+1 thread on core 1, 4 on cores 1, 3, 6, 8 (P-cores), 8 on those and E-cores
+12–15; load 2.2–2.8; mean / p50 / p95, ms]:
+
+| PoW | threads | before | after |
+|---|---|---|---|
+| 20 | 1 | 25.5 / 16.9 / 78.0 | 25.9 / 17.3 / 79.3 |
+| 20 | 4 | 27.8 / 27.7 / 31.7 | **9.8 / 6.4 / 28.2** |
+| 20 | 8 | 45.7 / 46.6 / 52.5 | **7.6 / 5.0 / 21.7** |
+| 16 | 1 | 1.5 / 1.0 / 4.2 | 1.5 / 1.1 / 4.2 |
+| 16 | 4 | 3.5 / 3.1 / 7.7 | **1.0 / 0.7 / 2.0** |
+| 16 | 8 | 6.4 / 5.9 / 11.2 | **1.2 / 1.1 / 2.0** |
+
+Before, four threads were no faster than one and eight slower (each thread
+finishing a whole 2^20 range); after, the grind scales and orders
+correctly. The record's earlier "PoW 20, 37–43 ms on 4 threads" was this
+artefact.
+
+**Re-timed after M2** [measured; `credential_timing`, the pinning above,
+40 proves after 2 warm-ups, 300 grinds; load 2.1–3.3 throughout; prove p50 /
+p95, ms; verify p50]:
+
+| statement, format | 1 thread | 4 threads | 8 threads |
+|---|---|---|---|
+| auth, 42 | 115 / 219 | 51.0 / 79.8 | 44.5 / 66.4 |
+| owner, 42 | 114 / 227 | 50.5 / 83.3 | 47.2 / 57.0 |
+| membership and payment, 42 | 106 / 227 | 50.1 / 83.5 | 46.0 / 71.7 |
+| auth, 44 | 84.7 / 89.2 | **44.6 / 47.5** | 40.6 / 43.6 |
+| owner, 44 | 85.2 / 90.3 | **44.0 / 47.2** | 39.6 / 44.2 |
+| membership and payment, 44 | 84.1 / 90.7 | **43.7 / 47.6** | 40.2 / 43.5 |
+| PoW 20 grind (mean / p50 / p95) | 45.1 / 29.3 / 134.6 | 13.9 / 9.4 / 41.0 | 10.2 / 7.0 / 28.4 |
+| PoW 16 grind | 2.5 / 1.7 / 7.1 | 1.3 / 0.9 / 2.6 | 1.5 / 1.4 / 2.4 |
+| verify | 1.61–1.71 ms | 2.10–2.22 ms | 2.26–2.43 ms |
+
+R1 3.9–5.1 ms; proofs 195–221 KB (the Merkle witnesses follow the
+coins). At 4 threads 44 is inside 60 ms at its 95th percentile for every
+statement and owner equals auth; 42's median is now inside 60 ms but its
+95th percentile, the grind's tail, is not (80–84 ms). On x86 the grind's
+p95 at PoW 20 is 41 ms on 4 threads, under S29's 50 ms; the phone decides.
+
+**Review folds' commits:** `af52e21c` the fork's pin; `b2f1847e` the
+device hidden-state gate; `ce231ed0` the gate gaps and `log_sizes`;
+`9b7cac32` the timing example; this record with the review and the plan's
+amendments.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, other agents'
+runs, load 2–23]: the touched suites (`credential` 20, `device` 24, the
+fork's grind tests 7, with and without `parallel`); `just check` green;
+`just test-proof` green, 579 passed in 50 suites.

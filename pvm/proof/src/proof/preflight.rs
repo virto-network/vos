@@ -40,6 +40,7 @@ pub fn preflight_proof_structure_readonly(
     let bytes = match &proof.stark_proof {
         StarkProofAny::Blake2s(stark) => preflight_structure(proof, stark, max_log_size),
         StarkProofAny::Poseidon2M31(stark) => preflight_structure(proof, stark, max_log_size),
+        StarkProofAny::Blake2sM31(stark) => preflight_structure(proof, stark, max_log_size),
     }?;
     Ok((format, bytes))
 }
@@ -262,6 +263,7 @@ pub fn proof_owned_bytes(proof: &Proof) -> Option<usize> {
     match &proof.stark_proof {
         StarkProofAny::Blake2s(stark) => proof_owned_bytes_of(proof, stark),
         StarkProofAny::Poseidon2M31(stark) => proof_owned_bytes_of(proof, stark),
+        StarkProofAny::Blake2sM31(stark) => proof_owned_bytes_of(proof, stark),
     }
 }
 
@@ -323,6 +325,7 @@ pub fn preflight_proof_structure(
     match &mut proof.stark_proof {
         StarkProofAny::Blake2s(stark) => normalize_last_layer(stark),
         StarkProofAny::Poseidon2M31(stark) => normalize_last_layer(stark),
+        StarkProofAny::Blake2sM31(stark) => normalize_last_layer(stark),
     }
     Ok(format)
 }

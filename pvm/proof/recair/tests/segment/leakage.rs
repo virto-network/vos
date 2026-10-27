@@ -120,7 +120,9 @@ fn unmasked(io: [u32; 4]) -> vos_pvm_proof::Proof {
 fn poseidon(proof: &vos_pvm_proof::Proof) -> &StarkProof<vos_pvm_proof::poseidon2::P2MerkleHasher> {
     match &proof.stark_proof {
         StarkProofAny::Poseidon2M31(stark) => stark,
-        StarkProofAny::Blake2s(_) => panic!("format 35 is on the Poseidon2-M31 channel"),
+        StarkProofAny::Blake2s(_) | StarkProofAny::Blake2sM31(_) => {
+            panic!("format 35 is on the Poseidon2-M31 channel")
+        }
     }
 }
 

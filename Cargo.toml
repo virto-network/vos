@@ -241,8 +241,8 @@ cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3
 # Declared without features: workspace features are additive, and the
 # verifier-only build must stay free of std and rayon. The prover adds
 # `std,prover,parallel` through vos-pvm-proof's `prover` feature.
-stwo = { git = "https://github.com/olanod/stwo", rev = "c3ec981357a0053e373e00f1057ec5a62675f7eb", default-features = false }
-stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "c3ec981357a0053e373e00f1057ec5a62675f7eb", default-features = false }
+stwo = { git = "https://github.com/olanod/stwo", rev = "4cd1f83ff4c090afcd3362e27e2d34eb634a0161", default-features = false }
+stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "4cd1f83ff4c090afcd3362e27e2d34eb634a0161", default-features = false }
 
 num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }

@@ -281,7 +281,9 @@ impl KernelProgram {
         for root in &self.preprocessed_roots {
             match root {
                 Commitment::Poseidon2M31(hash) => words.extend(hash.0),
-                Commitment::Blake2s(_) => words.extend(byte_limbs(&root.to_bytes())),
+                Commitment::Blake2s(_) | Commitment::Blake2sM31(_) => {
+                    words.extend(byte_limbs(&root.to_bytes()))
+                }
             }
         }
         words.extend(byte_limbs(&self.image_root));

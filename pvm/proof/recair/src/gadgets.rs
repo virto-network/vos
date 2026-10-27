@@ -1,7 +1,8 @@
 //! The Poseidon2 modes as a circuit uses them, each the `vos_pvm_poseidon2`
 //! mode it mirrors: a Merkle leaf's sponge ([`leaf_hash`]), a path step
-//! ([`node`]), and the Fiat-Shamir transcript ([`TranscriptGadget`]); and
-//! a one-hot choice among candidate hashes ([`assert_one_of`]).
+//! ([`node`]), a constant block compressed with a wire pair ([`tagged`]),
+//! and the Fiat-Shamir transcript ([`TranscriptGadget`]); and a one-hot
+//! choice among candidate hashes ([`assert_one_of`]).
 //!
 //! Values travel packed, four M31 limbs a wire, so a block of eight is two
 //! wires.
@@ -95,6 +96,26 @@ pub fn node<V: Value>(
         bit: Some(bit),
         out,
         ..P2Row::new(P2Mode::Node)
+    })
+}
+
+/// `compress(block, x)`: the first eight words of the permutation of the
+/// constant `block` and the wire pair `x`, a tagged row
+/// ([`P2Mode::Tagged`]), its block in the circuit's constants. The output is
+/// `out` when given.
+pub fn tagged<V: Value>(
+    context: &mut Context<V>,
+    block: [BaseField; 8],
+    x: [Var; 2],
+    out: Option<[Var; 2]>,
+) -> P2Handle<V> {
+    let mut c = [BaseField::zero(); 10];
+    c[..8].copy_from_slice(&block);
+    context.p2(P2Row {
+        m: x.map(Message::Wire),
+        c,
+        out,
+        ..P2Row::new(P2Mode::Tagged)
     })
 }
 

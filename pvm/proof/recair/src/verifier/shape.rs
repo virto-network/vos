@@ -255,7 +255,7 @@ impl SegmentShape {
 fn preprocessed_root(proof: &Proof) -> Option<P2Hash> {
     match proof.preprocessed_commitment()? {
         Commitment::Poseidon2M31(root) => Some(root),
-        Commitment::Blake2s(_) => None,
+        Commitment::Blake2s(_) | Commitment::Blake2sM31(_) => None,
     }
 }
 

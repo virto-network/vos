@@ -31,14 +31,52 @@ impl<V: Value> Context<V> {
 
     /// [`Context::finalize`], padding to `sizes` (`p2`, `qm31`, `h8`) rows.
     pub fn finalize_to(mut self, sizes: Option<[usize; 3]>) -> Result<Finalized<V>, WiringError> {
+        self.close();
+        let rows = self.rows();
+        let sizes = sizes.unwrap_or(rows.map(|rows| rows.next_power_of_two().max(MIN_ROWS)));
+        Self::check_sizes(&["p2", "qm31", "h8"], &rows, &sizes)?;
+        self.pad(sizes);
+        let finalized = self.wire();
+        finalized.circuit.check_wiring()?;
+        Ok(finalized)
+    }
+
+    /// [`Context::finalize`] for a circuit of `p2` and `qm31` alone (the
+    /// credential AIR's set), padded to `sizes` rows: it has no `h8` row,
+    /// and `h8`'s padding, whose inputs use the zero wire, is not added.
+    pub fn finalize_without_h8(mut self, sizes: [usize; 2]) -> Result<Finalized<V>, WiringError> {
+        self.close();
+        let [p2, qm31, h8] = self.rows();
+        if h8 != 0 {
+            return Err(WiringError::Size {
+                component: "h8",
+                rows: h8,
+            });
+        }
+        Self::check_sizes(&["p2", "qm31"], &[p2, qm31], &sizes)?;
+        self.pad([sizes[0], sizes[1], 0]);
+        let finalized = self.wire();
+        finalized.circuit.check_wiring_without_h8()?;
+        Ok(finalized)
+    }
+
+    /// The constants fixed and the pending guesses yielded: the rows a
+    /// circuit has before its padding.
+    fn close(&mut self) {
         assert!(self.outputs_set, "the outputs are set before finalizing");
         self.piece("finalize");
         self.fix_constants();
         self.yield_guesses();
-        let rows = self.rows();
-        let sizes = sizes.unwrap_or(rows.map(|rows| rows.next_power_of_two().max(MIN_ROWS)));
-        for (component, (&rows, &size)) in ["p2", "qm31", "h8"].iter().zip(rows.iter().zip(&sizes))
-        {
+    }
+
+    /// Each component's `rows` within its size, a power of two of at least
+    /// [`MIN_ROWS`].
+    fn check_sizes(
+        components: &[&'static str],
+        rows: &[usize],
+        sizes: &[usize],
+    ) -> Result<(), WiringError> {
+        for ((&component, &rows), &size) in components.iter().zip(rows).zip(sizes) {
             if rows > size || size < MIN_ROWS || !size.is_power_of_two() {
                 return Err(WiringError::Size {
                     component,
@@ -46,10 +84,7 @@ impl<V: Value> Context<V> {
                 });
             }
         }
-        self.pad(sizes);
-        let finalized = self.wire();
-        finalized.circuit.check_wiring()?;
-        Ok(finalized)
+        Ok(())
     }
 
     /// The rows the circuit has once finalized, before its padding: its

@@ -3,13 +3,17 @@ name = "vos-pvm-final-verifier"
 edition.workspace = true
 version.workspace = true
 license = "Apache-2.0"
-description = "The final wrap's verifier: a format-39 proof (masked, its fixed layout) against its 24 public words, the program id and the io-hash; format 28 under `test-formats`. no_std, for x86, wasm32 and the PVM."
+description = "The final wrap's verifier: a format-39 proof (masked, its fixed layout) against its 24 public words, the program id and the io-hash; format 28 under `test-formats`; and credential proofs, format 42. no_std, for x86, wasm32 and the PVM."
 
 [features]
 # Format 28, the unmasked wrap, and its postcard decode: the tests' and the
 # fixtures' format. No production venue accepts it; without the feature a
 # build links format 39 alone.
 test-formats = ["dep:postcard"]
+# A credential proof's bytes (`credential::decode`, `encode`,
+# `verify_bytes`): ingress's and the device library's. The verifier kit
+# leaves it out.
+credential-bytes = ["dep:postcard"]
 
 [dependencies]
 # Without features: no std, and none of the prover's nightly SIMD.
@@ -17,6 +21,7 @@ stwo = { workspace = true }
 vos-pvm-recair-air = { workspace = true }
 num-traits = { version = "0.2", default-features = false }
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+# Format 28's bytes, and a credential proof's.
 postcard = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]

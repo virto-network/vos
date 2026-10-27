@@ -75,11 +75,12 @@ CRATES = [
 
 # Features left in VOS: `vos-statement`'s `pvm-guest` builds the JAM refine
 # program, a bin; `test-formats` links format 28, the unmasked wrap, which no
-# production venue accepts. Their code compiles out of the kit, and an
-# optional dependency only they enabled goes with them.
+# production venue accepts; `credential-bytes` decodes credential proofs,
+# which a space's ingress reads and no venue does. Their code compiles out of
+# the kit, and an optional dependency only they enabled goes with them.
 DROPPED_FEATURES = {
     "vos-statement": ["pvm-guest", "test-formats"],
-    "vos-pvm-final-verifier": ["test-formats"],
+    "vos-pvm-final-verifier": ["test-formats", "credential-bytes"],
 }
 
 # The golden fixtures `vos-statement`'s `fixtures` reader takes: the final
