@@ -2507,7 +2507,7 @@ quiet desktop, which the owner schedules.
 `cargo test -p vos-scale` green (48), clippy clean.
 
 **Run 1, the per-replica cost** [measured; `~/vos-scale/runs/`
-`20261026T211953Z-r1-idle-1k`, `20261026T224431Z-r1-idle-5k`,
+`20261026T211953Z-r1-idle-1k`, `20261026T220041Z-r1-idle-5k`,
 `20261026T225257Z-r1-idle-10k`]:
 - **The setup:** S35's layout, the three nodes on compumax (Threadripper
   2990WX, cores 0-3, 4-7 and 8-11, `performance`, one Samsung 970 PRO,
