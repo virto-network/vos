@@ -580,7 +580,7 @@ impl Inner {
                 // the run's effects.
                 Some((_, Response::Refused(Refusal::Replayed))) => {
                     if let Forwardable::Credentialed(call) = &call {
-                        return self.recorded(run, agent, &call.binding, until).await;
+                        return self.recorded(run, agent, call, until).await;
                     }
                     return Response::Refused(Refusal::Replayed);
                 }
@@ -589,22 +589,31 @@ impl Inner {
         }
     }
 
-    /// `Replayed`, once this replica has applied the binding `binding`'s
-    /// record, by `until`.
+    /// `Replayed`, once this replica has applied `call`'s binding record,
+    /// or a batch past its expiry (by then the run is applied here, and
+    /// its record may be swept), by `until`.
     async fn recorded(
         &self,
         run: &Arc<Run>,
         agent: AgentId,
-        binding: &[u8; 32],
+        call: &CredentialedInput,
         until: Instant,
     ) -> Response {
-        let key = keys::binding(binding);
+        let key = keys::binding(&call.binding);
         loop {
             // The mark read first: an apply after it wakes the wait below.
             let applied = run.shared.state().applied;
-            match self.store.snapshot().get(agent, &key) {
-                Ok(Some(_)) => return Response::Refused(Refusal::Replayed),
-                Ok(None) => {}
+            let snapshot = self.store.snapshot();
+            let held = snapshot
+                .get(agent, &key)
+                .map_err(Fault::from)
+                .and_then(|held| {
+                    let time = read::<u64>(&snapshot, agent, &keys::batch_time())?;
+                    Ok(held.is_some() || time.is_some_and(|time| time > call.expires_ms))
+                });
+            match held {
+                Ok(true) => return Response::Refused(Refusal::Replayed),
+                Ok(false) => {}
                 Err(_) => return Response::Unavailable,
             }
             let left = until.saturating_duration_since(Instant::now());

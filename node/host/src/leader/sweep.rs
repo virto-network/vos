@@ -91,11 +91,16 @@ impl Leader {
     }
 }
 
-/// The first row of `agent`'s due index: the earliest, its time and entry.
+/// The first row of `agent`'s due index: the earliest, its time and entry,
+/// the keys read until it.
 pub(super) fn first_due(snapshot: &Snapshot, agent: AgentId) -> Result<Option<(u64, Due)>, Fault> {
-    Ok(due_rows_until(snapshot, agent, u64::MAX, 1)?
-        .into_iter()
-        .next())
+    for row in snapshot.scan(agent, &keys::due_prefix(), None) {
+        let (key, _) = row?;
+        if let Some(due) = keys::due_entry(&key) {
+            return Ok(Some(due));
+        }
+    }
+    Ok(None)
 }
 
 /// The rows of `agent`'s due index due at `time`, earliest first, as many
