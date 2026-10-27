@@ -93,7 +93,9 @@ impl Leader {
 
 /// The first row of `agent`'s due index: the earliest, its time and entry.
 pub(super) fn first_due(snapshot: &Snapshot, agent: AgentId) -> Result<Option<(u64, Due)>, Fault> {
-    Ok(due_rows_until(snapshot, agent, u64::MAX, 1)?.pop())
+    Ok(due_rows_until(snapshot, agent, u64::MAX, 1)?
+        .into_iter()
+        .next())
 }
 
 /// The rows of `agent`'s due index due at `time`, earliest first, as many

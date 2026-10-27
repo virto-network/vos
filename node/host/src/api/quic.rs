@@ -12,7 +12,7 @@ use quinn::VarInt;
 use vos_api::{Event, FrameError, Framing, Kind, Reader, Requests, error_frame, frame};
 use vos_net::api::{Runner, Runtime, Spawner};
 
-use super::{Api, Via, is_large};
+use super::{Api, Via};
 use crate::timeout;
 
 /// A connection quiet this long closes.
@@ -232,8 +232,10 @@ async fn request(
         if let Some(event) = reader.event() {
             break event;
         }
-        if large.is_none() && is_large(&reader, Framing::Quic) {
-            match api.large.try_acquire_arc() {
+        if large.is_none()
+            && let Some(places) = api.large_places(&reader, Framing::Quic)
+        {
+            match places.try_acquire_arc() {
                 Some(place) => large = Some(place),
                 None => {
                     let _ = receive.stop(STOPPED);

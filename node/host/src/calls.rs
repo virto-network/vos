@@ -23,6 +23,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use vos_wire::abi::Refusal;
 use vos_wire::batch::{CredentialedInput, Request};
 use vos_wire::ids::{AgentId, Principal, Session, SessionId};
 use vos_wire::ingress::{Call, Rejection, Response};
@@ -64,7 +65,7 @@ pub(crate) struct Calls {
     /// answered once, when it ends.
     forwarded: Mutex<HashMap<NodeNumber, HashSet<u64>>>,
     /// Credential proofs being verified now.
-    pub(crate) verifying: std::sync::atomic::AtomicUsize,
+    pub(crate) verifying: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A forwarded call's place among those running, given back when it ends,
@@ -573,7 +574,51 @@ impl Inner {
                     return Response::TimedOut;
                 }
                 Some((_, Response::TimedOut)) | None => {}
+                // A credentialed call that ran already, by an earlier send
+                // or another replica's copy: answered once this replica
+                // holds its binding, so a client reading state here reads
+                // the run's effects.
+                Some((_, Response::Refused(Refusal::Replayed))) => {
+                    if let Forwardable::Credentialed(call) = &call {
+                        return self.recorded(run, agent, &call.binding, until).await;
+                    }
+                    return Response::Refused(Refusal::Replayed);
+                }
                 Some((_, answer)) => return answer,
+            }
+        }
+    }
+
+    /// `Replayed`, once this replica has applied the binding `binding`'s
+    /// record, by `until`.
+    async fn recorded(
+        &self,
+        run: &Arc<Run>,
+        agent: AgentId,
+        binding: &[u8; 32],
+        until: Instant,
+    ) -> Response {
+        let key = keys::binding(binding);
+        loop {
+            // The mark read first: an apply after it wakes the wait below.
+            let applied = run.shared.state().applied;
+            match self.store.snapshot().get(agent, &key) {
+                Ok(Some(_)) => return Response::Refused(Refusal::Replayed),
+                Ok(None) => {}
+                Err(_) => return Response::Unavailable,
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Response::TimedOut;
+            }
+            let state = timeout(
+                left,
+                run.shared
+                    .wait(|state| state.stopped || state.applied > applied),
+            )
+            .await;
+            if state.is_none_or(|state| state.stopped) {
+                return state.map_or(Response::TimedOut, |_| Response::Stopped);
             }
         }
     }

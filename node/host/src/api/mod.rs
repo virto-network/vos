@@ -60,8 +60,9 @@ pub(crate) struct Api {
     nonces: Nonces,
     /// Requests the API's transports brought, the node's HTTP's aside.
     pub(crate) frames: AtomicU64,
-    /// The large bodies' places.
+    /// The large bodies' places: installs', and credentialed calls'.
     pub(crate) large: Arc<smol::lock::Semaphore>,
+    pub(crate) credentialed: Arc<smol::lock::Semaphore>,
 }
 
 /// A read's place among those waiting, given back when it ends, however it
@@ -87,16 +88,27 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// Whether the frame `reader` has part read is large: an install's past
-/// [`vos_api::LARGE`]. A credentialed call's is not: its verifications are
-/// bounded by the node's budget instead.
-fn is_large(reader: &vos_api::Reader, framing: vos_api::Framing) -> bool {
-    reader.header().is_some_and(|header| {
-        header.kind == Kind::Install as u16
-            && header
-                .body(framing)
-                .is_some_and(|body| body > vos_api::LARGE)
-    })
+/// Credentialed calls' bodies past a call's limit held at once, from the
+/// socket and QUIC together, apart from the installs' large bodies.
+const CREDENTIALED_BODIES: usize = vos_http::CREDENTIALED_LARGE;
+
+impl Api {
+    /// The places the frame `reader` has part read takes one of, if its
+    /// body is large: an install's past [`vos_api::LARGE`], or a
+    /// credentialed call's past a call's limit, each from its own.
+    fn large_places(
+        &self,
+        reader: &vos_api::Reader,
+        framing: vos_api::Framing,
+    ) -> Option<&Arc<smol::lock::Semaphore>> {
+        let header = reader.header()?;
+        let body = header.body(framing)?;
+        match Kind::from_u16(header.kind)? {
+            Kind::Install if body > vos_api::LARGE => Some(&self.large),
+            Kind::Credentialed if body > Kind::Call.limit() => Some(&self.credentialed),
+            _ => None,
+        }
+    }
 }
 
 fn decode<T: Decode>(body: &[u8]) -> Result<T, Response> {
@@ -112,6 +124,7 @@ impl Api {
             nonces,
             frames: AtomicU64::new(0),
             large: Arc::new(smol::lock::Semaphore::new(LARGE_BODIES)),
+            credentialed: Arc::new(smol::lock::Semaphore::new(CREDENTIALED_BODIES)),
         }
     }
 

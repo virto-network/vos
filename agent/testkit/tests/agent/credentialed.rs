@@ -66,7 +66,10 @@ impl Agent {
     }
 
     fn new() -> Self {
-        let mut node = Node::new();
+        Self::on(Node::new())
+    }
+
+    fn on(mut node: Node) -> Self {
         let poll_elf = std::fs::read(actor_elf("poll")).unwrap();
         let purses_elf = std::fs::read(actor_elf("purses")).unwrap();
         let credentials_elf = std::fs::read(credentials_elf()).unwrap();
@@ -593,4 +596,31 @@ fn a_once_guard_admits_a_nullifier_once_on_ok_alone() {
         Outcome::Done(_)
     ));
     assert_eq!(agent.query::<_, u32>(POLL, "tally", 4u8), 2);
+}
+
+/// The agent's own work on a credentialed auth call, its scope computed
+/// again and the credential actor's ring read beside the handler's run,
+/// leaves a fifth of a step's reserve spare, on a VOS host and on a JAM
+/// host, whose Poseidon2 compression is software.
+#[test]
+fn a_credentialed_calls_own_work_is_within_a_steps_reserve() {
+    for (host, node) in [("VOS", Node::new()), ("JAM", Node::jam(true))] {
+        let mut agent = Agent::on(node);
+        let root = agent.root().root;
+        let calls: Vec<Input> = (1..=21u8)
+            .map(|nullifier| {
+                let origin = agent.anonymous("login", nullifier);
+                let call = agent.call(origin, POLL, "login", (), u64::MAX, Some(root));
+                Input::Credentialed(Box::new(call))
+            })
+            .collect();
+        let empty = agent.node.agent_gas(vec![]);
+        let one = agent.node.agent_gas(calls[..1].to_vec()) - empty;
+        let each = (agent.node.agent_gas(calls) - empty - one) / 20;
+        println!("{host}: a credentialed call costs the agent {each}, the first {one}");
+        assert!(
+            each <= (vos_wire::defaults::STEP_RESERVE * 4 / 5) as i64,
+            "{host}: {each}"
+        );
+    }
 }

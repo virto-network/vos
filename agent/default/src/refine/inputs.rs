@@ -262,7 +262,11 @@ pub(crate) fn sweep(base: &Base, listed: &[(u64, Due)]) -> Stepped {
     let mut sessions = Vec::new();
     let mut workflows = Vec::new();
     let mut bindings = Vec::new();
-    for &(at, entry) in listed.iter().take(defaults::SWEEP_LIMIT) {
+    let mut budget = keys::SweepBudget::new(defaults::SWEEP_LIMIT);
+    for &(at, entry) in listed.iter().take(budget.rows()) {
+        if !budget.take(&entry) {
+            continue;
+        }
         if at > base.time || !base.holds(&keys::due(at, entry)) {
             continue;
         }

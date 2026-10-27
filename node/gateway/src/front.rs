@@ -87,6 +87,7 @@ pub async fn serve(
             idle: Duration::from_secs(30),
             connections: http.connections,
             large: vos_http::LARGE,
+            credentialed_large: vos_http::CREDENTIALED_LARGE,
         },
         spawn: Arc::new(|connection| Box::new(Task(tokio::spawn(connection)))),
         admit: Some(Arc::new(move |peer: SocketAddr| {

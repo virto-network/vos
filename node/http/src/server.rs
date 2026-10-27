@@ -24,8 +24,7 @@ pub struct Limits {
     /// `/install`) may hold, in place of `body`.
     pub install: usize,
     /// The most a credentialed call's body (a `POST` to a path ending in
-    /// `/credentialed`) may hold, in place of `body`: not large, its
-    /// verification bounded by the node's budget instead.
+    /// `/credentialed`) may hold, in place of `body`.
     pub credentialed: usize,
     /// How long a connection may wait for its next bytes.
     pub idle: Duration,
@@ -35,10 +34,16 @@ pub struct Limits {
     /// connection: past them, a request is answered 503 from its head,
     /// its body unread.
     pub large: usize,
+    /// The same for credentialed calls' bodies past `body`, apart from the
+    /// installs': a proof of any size takes no install's place.
+    pub credentialed_large: usize,
 }
 
 /// Bodies past `body` held at once, unless a server says otherwise.
 pub const LARGE: usize = 4;
+/// Credentialed calls' bodies past `body` held at once, unless a server
+/// says otherwise: about 100 MiB of them at their largest.
+pub const CREDENTIALED_LARGE: usize = 64;
 
 pub struct Request {
     pub method: String,
@@ -153,6 +158,7 @@ async fn accept(
 ) {
     let open = Arc::new(AtomicUsize::new(0));
     let large = Arc::new(AtomicUsize::new(0));
+    let credentialed = Arc::new(AtomicUsize::new(0));
     let acceptor = serve.tls.clone().map(futures_rustls::TlsAcceptor::from);
     while let Ok((stream, peer)) = listener.accept().await {
         connections.retain(|connection| !connection.is_finished());
@@ -171,6 +177,7 @@ async fn accept(
             head: serve.head.clone(),
             limits: serve.limits.clone(),
             large: Arc::clone(&large),
+            credentialed: Arc::clone(&credentialed),
         };
         let acceptor = acceptor.clone();
         connections.push((serve.spawn)(Box::pin(async move {
@@ -209,8 +216,9 @@ struct Shared {
     handler: Handler,
     head: Option<Head>,
     limits: Limits,
-    /// The large bodies held now.
+    /// The large bodies held now: installs', and credentialed calls'.
     large: Arc<AtomicUsize>,
+    credentialed: Arc<AtomicUsize>,
 }
 
 /// A place among those counted (connections, or large bodies), given back
@@ -374,15 +382,15 @@ async fn read_request(
                     None => 0,
                 };
                 let post = |end: &str| request.method == "POST" && request.path.ends_with(end);
-                let install = post("/install");
-                let limit = if install {
-                    limits.install
+                let (limit, pool) = if post("/install") {
+                    (limits.install, Some((&shared.large, limits.large)))
                 } else if post("/credentialed") {
-                    limits.credentialed
+                    let pool = (&shared.credentialed, limits.credentialed_large);
+                    (limits.credentialed, Some(pool))
                 } else {
-                    limits.body
+                    (limits.body, None)
                 };
-                let large = install && length > limits.body;
+                let large = length > limits.body;
                 if length > limit {
                     return Ok(refuse(413));
                 }
@@ -401,12 +409,12 @@ async fn read_request(
                     let next = (!closes(&request)).then_some(end);
                     return Ok(Read::Answered(answer, next));
                 }
-                let large = match large {
-                    true => match Slot::take(&shared.large, limits.large) {
+                let large = match pool.filter(|_| large) {
+                    Some((held, most)) => match Slot::take(held, most) {
                         Some(place) => Some(place),
                         None => return Ok(refuse(503)),
                     },
-                    false => None,
+                    None => None,
                 };
                 if pending && continues {
                     stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;

@@ -10,7 +10,7 @@
 //! There is no bucket per scope or method for an attacker to drain: what
 //! bounds the node's work is its connections and its verification budget
 //! ([`crate::node::Config::verifications`]), past which a call is answered
-//! `Busy` before any proof byte is read.
+//! `Busy` before its proof is decoded.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -38,23 +38,25 @@ use crate::store::Snapshot;
 /// device kernel is admitted.
 const ADMITTED: [(u32, usize); 1] = [(verifier::FORMAT, verifier::MAX_PROOF_BYTES)];
 
-/// A verification's place among those in flight, given back when it ends,
-/// however it ends.
-pub(crate) struct Verifying<'a>(&'a AtomicUsize);
+/// A verification's place among those in flight, given back when the
+/// verification ends, however it ends: it goes with the executor's job, so
+/// a request cancelled while its proof is verified holds its place until
+/// the job is done.
+pub(crate) struct Verifying(Arc<AtomicUsize>);
 
-impl<'a> Verifying<'a> {
+impl Verifying {
     /// A place, if fewer than `most` verifications are in flight.
-    fn take(in_flight: &'a AtomicUsize, most: usize) -> Option<Self> {
+    fn take(in_flight: &Arc<AtomicUsize>, most: usize) -> Option<Self> {
         in_flight
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |held| {
                 (held < most).then_some(held + 1)
             })
             .ok()
-            .map(|_| Verifying(in_flight))
+            .map(|_| Verifying(Arc::clone(in_flight)))
     }
 }
 
-impl Drop for Verifying<'_> {
+impl Drop for Verifying {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::SeqCst);
     }
@@ -118,27 +120,30 @@ impl Inner {
             Ok(checked) => checked,
             Err(refused) => return refused.into(),
         };
-        let Some(place) = Verifying::take(&self.calls.verifying, self.settings.verifications)
-        else {
-            return Response::Busy;
-        };
         let Checked {
             kind,
             words,
             proof,
             input,
         } = checked;
+        // A word at or above p proves nothing: no verification is spent.
+        let Some(words) = words else {
+            return Response::Rejected(Rejection::Credential(CredentialRefusal::Proof));
+        };
+        let Some(place) = Verifying::take(&self.calls.verifying, self.settings.verifications)
+        else {
+            return Response::Busy;
+        };
         let stats = Arc::clone(&self.stats);
         let verified = self
             .offload(move || {
                 let started = Instant::now();
-                let verified =
-                    words.is_some_and(|words| verifier::verify_bytes(kind, &words, &proof).is_ok());
+                let verified = verifier::verify_bytes(kind, &words, &proof).is_ok();
                 stats.credential.took(started.elapsed());
+                drop(place);
                 verified
             })
             .await;
-        drop(place);
         match verified {
             Some(true) => {}
             Some(false) => {
@@ -303,7 +308,7 @@ mod tests {
     /// and gives it back when it ends.
     #[test]
     fn the_verification_budget_is_held_and_given_back() {
-        let in_flight = AtomicUsize::new(0);
+        let in_flight = Arc::new(AtomicUsize::new(0));
         let first = Verifying::take(&in_flight, 2).expect("a place");
         let second = Verifying::take(&in_flight, 2).expect("a place");
         assert!(Verifying::take(&in_flight, 2).is_none(), "the budget spent");

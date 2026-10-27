@@ -19,6 +19,8 @@ is `pvm/proof/SECURITY.md`'s.
   can therefore log an origin it never verified, as it could run any call:
   members trust their space's nodes for integrity. A space that wants
   evidence keeps the proofs in the non-repudiation side store (not built).
+  Likewise a replica forwards a verified call to the agent's leader with
+  its origin alone, and the leader takes it as a replica's word.
 - **A gateway holds no authority.** It translates
   `POST /agents/{agent}/credentialed` and `GET /time` onto the node API
   and runs none of the checks: every check is the node's, whoever relays
@@ -128,6 +130,10 @@ serve its requests:
 
 ## Replay and custody
 
+- **A replay answered by a replica that forwarded it** (`Replayed`, the
+  call having run by an earlier send or another replica's copy) is
+  answered once that replica has applied the binding, so a client that
+  reads state there reads the first run's effects.
 - **Replay** is bound by the binding digest: another space, agent,
   instance or method, other arguments or another statement change it, so
   the proof fails `Binding`; a proof is good for 120 s at most; and its
@@ -150,9 +156,16 @@ serve its requests:
   frame's size is refused from its header, over HTTP from the head.
 - There is no bucket per scope or method to drain: the bounds are the
   node's connections and its verification budget, past which a call is
-  answered `Busy` before its proof is decoded. Large install bodies keep
-  their own budget; a credentialed body is bounded by its kind's size and
-  the connections.
+  answered `Busy` before its proof is decoded; a statement with a word at
+  or above p is refused `Proof` without spending a verification.
+- Credentialed bodies past a call's size take places of their own, 64 at
+  once on the node's socket and QUIC together and 64 on each HTTP front
+  (about 100 MiB at the largest), apart from the installs' four: past
+  them, QUIC and HTTP answer at once from the header or head, the socket
+  reads the next only as one ends.
+- A binding digest's row is forgotten by the sweep, up to 64 a sweep
+  beside the 32 sessions' and workflows' rows it lists, so a burst of
+  credentialed calls holds no timer back.
 - A proof's verification takes about 2 ms on one x86 core; one whose PoW
   is wrong is refused in about 0.7 ms (the composition check runs before
   the PoW in the verifier's order), one cut short in about 0.2 ms

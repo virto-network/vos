@@ -914,18 +914,60 @@ pub fn due_entry(key: &[u8]) -> Option<(u64, Due)> {
     Some((at, entry))
 }
 
+/// What one sweep lists of the due index, in its order: at most `limit`
+/// sessions' and workflows' rows, and at most
+/// [`crate::defaults::SWEEP_BINDINGS`] binding digests' beside them, so a
+/// backlog of either kind never holds the other back.
+#[derive(Clone, Copy, Debug)]
+pub struct SweepBudget {
+    limit: usize,
+    others: usize,
+    bindings: usize,
+}
+
+impl SweepBudget {
+    pub const fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            others: 0,
+            bindings: 0,
+        }
+    }
+
+    /// Whether a sweep lists `entry` after those it took: false once its
+    /// kind's count is full.
+    pub fn take(&mut self, entry: &Due) -> bool {
+        let (count, most) = match entry {
+            Due::Binding(_) => (&mut self.bindings, crate::defaults::SWEEP_BINDINGS),
+            Due::Session(_) | Due::Workflow(_) => (&mut self.others, self.limit),
+        };
+        if *count == most {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// The most rows a sweep looks at: both counts' worth.
+    pub const fn rows(&self) -> usize {
+        self.limit + crate::defaults::SWEEP_BINDINGS
+    }
+}
+
 /// Of the due index's keys in order, from its start, the rows due at
-/// `time`, earliest first, at most `limit`: a key under the index that
-/// names no row of it is passed over, and the keys end at the first past
-/// the index.
+/// `time`, earliest first, within a [`SweepBudget`] of `limit`, a row of a
+/// kind whose count is full passed over: at most the budget's rows are
+/// looked at, a key under the index that names no row of it is passed
+/// over, and the keys end at the first past the index.
 pub fn due_rows<K: AsRef<[u8]>, E>(
     keys: impl IntoIterator<Item = Result<K, E>>,
     time: u64,
     limit: usize,
 ) -> Result<Vec<(u64, Due)>, E> {
     let prefix = Row::Due.prefix();
+    let mut budget = SweepBudget::new(limit);
     let mut due = Vec::new();
-    for key in keys {
+    for key in keys.into_iter().take(budget.rows()) {
         let key = key?;
         if !key.as_ref().starts_with(&prefix) {
             break;
@@ -933,10 +975,12 @@ pub fn due_rows<K: AsRef<[u8]>, E>(
         let Some((at, entry)) = due_entry(key.as_ref()) else {
             continue;
         };
-        if at > time || due.len() == limit {
+        if at > time {
             break;
         }
-        due.push((at, entry));
+        if budget.take(&entry) {
+            due.push((at, entry));
+        }
     }
     Ok(due)
 }

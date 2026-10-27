@@ -3072,3 +3072,72 @@ amendments.
 runs, load 2–23]: the touched suites (`credential` 20, `device` 24, the
 fork's grind tests 7, with and without `parallel`); `just check` green;
 `just test-proof` green, 579 passed in 50 suites.
+
+## Step 7.11: the verifier at ingress
+
+Branch `s7/7.11`, from vos-core `920103b3`.
+
+**Built:**
+- **The wire** (`vos-wire`): `Principal::Anonymous { scope, nullifier }`
+  (3) and `Principal::Owner(digest)` (4), never granted a role
+  (`is_credential`); the request `ingress::Credentialed`, its
+  `CredentialPublic` (the index its kind), `CredentialRefusal` (the codes in
+  check order) under `Rejection::Credential` (9); the session-less input
+  `batch::Input::Credentialed` (10, boxed) carrying `CredentialedInput`
+  (the origin, the call, `b`, `expires_ms`, auth's root; no proof, nonce or
+  format) and its step's `InputRef::Credentialed { binding }` (9);
+  `schema::CredentialGuard` (`Auth { name, device, once }`, `Owner`) in
+  `MethodSchema::credential`, validated (a command's alone, no role, not
+  linearizable, a name of 1–64 bytes), and `Schema::credentials`, the
+  section's last byte; `credentials::scope` and `credentials::Bound::digest`
+  (the binding digest, the arguments with their `u32` length) and
+  `credentials::binding`; the system rows `credentials` (the actor's
+  instance), `binding(b) → expires_ms` and `once(scope ‖ nullifier) → t`,
+  and `Due::Binding(b)` (kind 2, its 32 bytes the id), which the sweep's
+  step lists (`Step::Swept { due, bindings }`) and accumulate forgets;
+  `Failure::Credentials` (15); refine's `CredentialExpired` (7),
+  `Replayed` (8), `StaleRoot` (9), `Once` (10); `defaults::
+  CREDENTIAL_HORIZON_MS` (120 s) and `BINDING_KEPT_MS` (60 s).
+- **The apply rule** (`agent/default/src/refine/credentialed.rs`), by the
+  batch's time: refused, writing nothing, if expired, if `b` is recorded,
+  for auth if the root is not the ring's newest or superseded at most
+  `ROOT_MAX_AGE` before, for `once` if the nullifier is admitted; else `b`
+  and its due row recorded whatever the method does, the method run as the
+  origin (an auth origin whose scope is not its guard's `Forbidden`), and a
+  `once` nullifier recorded only on `Ok`, in the same step. A guard admits
+  its origin's kind alone and a method without one refuses a credential's
+  origin (`invoke`); an install records the credential actor's row, and
+  fails `Failure::Credentials` for a second actor, for the actor's instance
+  replaced by another program, and for an auth guard with no actor; a
+  `SetRole` naming a credential's origin fails `Forbidden`.
+- **The SDK:** `#[msg(credential = Auth("vote"), once)]`,
+  `#[msg(credential = Owner)]`, `device = "..."`, each refused off a
+  `&mut self` handler or beside a role or `linearizable`;
+  `#[actor(credentials)]` (`vos_sdk::state::Marked`), the schema's last
+  byte; `ctx.owner()` and `ctx.nullifier()`; the caller's buffer 65 bytes,
+  an `Anonymous`'s. `vos-credentials` is `#[actor(credentials)]`.
+- **The ledger** (`agent/test-actors/purses`, the demo's in 7.13): rows by
+  name (1–32 bytes of UTF-8), each `(owner, balance, frozen)`;
+  `invite_row` and `mint` under `operator`, `claim_row` by any caller
+  before the invitation's expiry and only for the digest it names;
+  `transfer(from, to, amount)` under `Owner`, debiting `from` only while
+  its live owner is the proof's digest and it is not frozen, crediting
+  `to`, which must exist; `balance`, `row`; `rekey` (lifts a freeze) and
+  `freeze` under `operator`. And `poll`: `vote` (`Auth("vote")`, `once`),
+  `vote_again` (`Auth("vote/2")`, `once`), `login` (`Auth("login")`).
+- **Ingress** (`node/host/src/credentialed.rs`): the node API's
+  `Credentialed` (0x0104, 1,642,496 bytes; the node's HTTP and the
+  gateway's `POST /agents/{a}/credentialed` a body of 4 less); the checks
+  in pin I's order on the replica's applied state, the format the proof
+  registry names as the final verifier pins it (`credential::FORMAT`, no
+  literal); then a verification slot (`Config::verifications`, by default
+  twice the executors; past it `Busy`), and the final verifier's
+  `credential::verify_bytes` on an executor (picking the circuit by kind);
+  the `credential` stage in the node's stats. A verified call goes to the
+  leader, queued outside any lane (`Pending::Credentialed`), forwarded by a
+  follower as a call is (`PeerMessage::ForwardCredentialed`, 19), and is
+  answered once this replica applied it. A `Grant` naming a credential's
+  origin is `Malformed`. The client's `credentialed` and `time`.
+- **The fuzz targets** `credentialed_decode` and `credential_verify_bytes`
+  in `just fuzz`, their replay seeds (an honest proof of each kind) from
+  recair's `credential_ingress --seeds`; **`node/SECURITY.md`**.

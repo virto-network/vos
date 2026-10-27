@@ -4,7 +4,9 @@
 //! when a `once` guard admitted its nullifier; else its binding digest is
 //! recorded, whatever the method then does, and the method runs as the
 //! call's origin, a `once` guard's nullifier recorded only when the method
-//! returned `Ok`.
+//! returned `Ok`. A ring the meter cannot pay, or that does not read,
+//! fails the call before anything is recorded: nothing of it ran, and it
+//! may come again.
 
 use alloc::vec::Vec;
 

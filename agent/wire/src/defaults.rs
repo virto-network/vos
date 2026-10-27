@@ -11,8 +11,14 @@ pub const SESSION_SKEW_MS: u64 = 60 * 1000;
 /// milliseconds: a session is collected at most this long after it
 /// expires.
 pub const SESSION_BUCKET_MS: u64 = 5 * 60 * 1000;
-/// The most rows of the due index one sweep lists.
+/// The most rows of the due index one sweep lists, sessions' and
+/// workflows'.
 pub const SWEEP_LIMIT: usize = 32;
+/// The most binding digests one sweep forgets, beside them
+/// ([`crate::keys::SweepBudget`]): a backlog of the bindings credentialed
+/// calls leave holds no session's or workflow's row back, and drains a
+/// sweep at a time, every batch while rows are due.
+pub const SWEEP_BINDINGS: usize = 64;
 /// The most sessions an agent holds: more are refused until some are
 /// collected.
 pub const MAX_SESSIONS: u64 = 1 << 16;
@@ -106,6 +112,11 @@ pub const DECODE_BYTE: u64 = 20;
 /// `the_start_reserves_cover_decoding_a_batch`.
 pub const DECODE_KERNEL: u64 = 8_000;
 
+/// Gas a refine keeps per row of the due index a sweep of its batch lists,
+/// for decoding it, past its bytes' [`DECODE_BYTE`]. Measured by the
+/// testkit's `the_start_reserves_cover_decoding_a_batch`.
+pub const DECODE_DUE: u64 = 2_000;
+
 /// What decoding a batch of `inputs` may take, from refine arguments of
 /// `len` bytes, when its installs name no kernel, and so a bound for a
 /// batch without installs: the gas a node gives a refine beyond its
@@ -115,21 +126,22 @@ pub const fn refine_start(inputs: usize, len: usize) -> u64 {
 }
 
 /// What decoding `batch` may take, from refine arguments of `len` bytes:
-/// [`refine_start`], and [`DECODE_KERNEL`] for each kernel its installs
-/// name. The gas a node gives a refine beyond its batch's budget, which
-/// its steps alone take from. The agent checks that the budget is left
+/// [`refine_start`], [`DECODE_KERNEL`] for each kernel its installs name,
+/// and [`DECODE_DUE`] for each row its sweeps list. The gas a node gives a
+/// refine beyond its batch's budget, which its steps alone take from. The agent checks that the budget is left
 /// once it has decoded the batch, and traps otherwise.
 pub fn batch_start(batch: &crate::batch::Batch, len: usize) -> u64 {
     use crate::batch::{Admin, Input};
-    let kernels: usize = batch
+    let (kernels, due) = batch
         .inputs
         .iter()
         .map(|input| match input {
-            Input::Admin(Admin::Install { derivation, .. }) => derivation.kernels.len(),
-            _ => 0,
+            Input::Admin(Admin::Install { derivation, .. }) => (derivation.kernels.len(), 0),
+            Input::Sweep { due } => (0, due.len()),
+            _ => (0, 0),
         })
-        .sum();
-    refine_start(batch.inputs.len(), len) + DECODE_KERNEL * kernels as u64
+        .fold((0, 0), |(k, d), (kernels, due)| (k + kernels, d + due));
+    refine_start(batch.inputs.len(), len) + DECODE_KERNEL * kernels as u64 + DECODE_DUE * due as u64
 }
 
 /// The least budget of a batch of at most `max_inputs` that dispatches

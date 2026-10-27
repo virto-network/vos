@@ -18,7 +18,7 @@ use smol::lock::{Mutex, Semaphore};
 use smol::net::unix::{UnixListener, UnixStream};
 use vos_api::{Event, Framing, Kind, Reader, Requests, error_frame, frame};
 
-use super::{Api, Via, is_large};
+use super::{Api, Via};
 use crate::timeout;
 
 /// The most one read takes off the socket.
@@ -201,8 +201,10 @@ async fn connection(
         };
         // A large body is read only once it holds a place; its deadline
         // runs from then, as the wait is the node's.
-        if large.is_none() && is_large(&reader, Framing::Stream) {
-            large = Some(api.large.acquire_arc().await);
+        if large.is_none()
+            && let Some(places) = api.large_places(&reader, Framing::Stream)
+        {
+            large = Some(places.acquire_arc().await);
             started = Some(Instant::now());
         }
     }

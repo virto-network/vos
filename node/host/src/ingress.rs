@@ -52,6 +52,7 @@ pub(crate) async fn serve(
         idle: Duration::from_secs(30),
         connections: api.inner.settings.ingress_connections,
         large: vos_http::LARGE,
+        credentialed_large: vos_http::CREDENTIALED_LARGE,
     };
     let handler: Handler = Arc::new(move |request| {
         let api = Arc::clone(&api);
