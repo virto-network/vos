@@ -12,6 +12,14 @@ pub trait Tables {
     fn bind_tables(&mut self);
 }
 
+/// What `#[actor(...)]` marks an actor as, which its program's schema
+/// carries. `#[actor]` implements it.
+pub trait Marked {
+    /// `#[actor(credentials)]`: its agent's credential actor, whose ring
+    /// the agent's auth guards read.
+    const CREDENTIALS: bool;
+}
+
 /// The state of a new instance. `#[messages]` implements it with the
 /// actor's `fn new() -> Self`.
 pub trait New {

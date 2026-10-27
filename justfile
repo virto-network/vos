@@ -533,9 +533,11 @@ _kit-workspace:
 # final verifier on arbitrary bytes, on the golden wraps mutated, on format
 # 39's layout past its header and on its queried parts reshaped within the
 # layout's bounds; the statement's and the space's decoders and the venue's
-# check; and prove-then-verify on random programs. A target's property is
-# no panic and nothing accepted but a golden.
-fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode api_reader operated_decode"
+# check; prove-then-verify on random programs; and a credentialed call's
+# decode and the credential verifier's bytes, ingress's. A target's
+# property is no panic and nothing accepted but a golden (a credential
+# proof: its one encoding).
+fuzz_targets := "final_verifier_bytes final_verifier_mutate statement_decode prove_verify_roundtrip masked_bytes masked_shape anchor_decode api_reader operated_decode credentialed_decode credential_verify_bytes"
 
 # Each target's checked-in corpus (`pvm/proof/fuzz/replay`) run once, every
 # input, optimized and without a sanitizer: no crash. `cargo run --example

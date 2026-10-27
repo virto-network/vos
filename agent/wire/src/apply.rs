@@ -12,7 +12,8 @@
 //! with its row in the due index. A workflow's step writes the pages its
 //! snapshot stores and deletes those back at their base. A refused step
 //! applies nothing. A sweep collects the sessions it lists that have
-//! expired, and moves the rows of those active since. A work result built
+//! expired, and moves the rows of those active since, and forgets the
+//! binding digests it lists. A work result built
 //! on another state version, timed before the agent's latest, or holding
 //! a new session whose creation time is far from its own or past a cap,
 //! applies nothing at all: refine refuses such a session, so the result
@@ -117,7 +118,10 @@ impl Apply<'_> {
                     self.run(run, result.time, next, &mut pages);
                     committed |= !run.committed.is_empty();
                 }
-                Step::Swept { due } => self.sweep(due, result.time),
+                Step::Swept { due, bindings } => {
+                    self.sweep(due, result.time);
+                    self.forget(bindings);
+                }
                 Step::Refused { .. } => {}
             }
         }
@@ -256,6 +260,15 @@ impl Apply<'_> {
         }
     }
 
+    /// Forget each listed binding digest: its row and its row in the due
+    /// index.
+    fn forget(&mut self, bindings: &[(u64, [u8; 32])]) {
+        for (at, binding) in bindings {
+            self.delete(&keys::binding(binding));
+            self.delete(&keys::due(*at, Due::Binding(*binding)));
+        }
+    }
+
     /// Remove a session: its index row, whole, mark, kept replies and key
     /// count. Without its whole, its index row and key count cannot be
     /// found, and stay.
@@ -335,7 +348,8 @@ impl Apply<'_> {
             | InputRef::Resume { .. }
             | InputRef::Report { .. }
             | InputRef::Close { .. }
-            | InputRef::Proven { .. } => {}
+            | InputRef::Proven { .. }
+            | InputRef::Credentialed { .. } => {}
             InputRef::Ack { to, sequence } => {
                 // Monotonic and idempotent: a stale ack does nothing, one
                 // past what was sent stops there, and one ack clears at most

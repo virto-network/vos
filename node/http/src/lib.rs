@@ -8,6 +8,6 @@ pub mod server;
 pub mod tls;
 
 pub use server::{
-    Admit, BoxFuture, Handler, Head, LARGE, Limits, Listener, MAX_HEAD, Request, Response, Serve,
-    Spawn, Spawned, content_length, serve,
+    Admit, BoxFuture, CREDENTIALED_LARGE, Handler, Head, LARGE, Large, Limits, Listener, MAX_HEAD,
+    Request, Response, Serve, Spawn, Spawned, content_length, serve,
 };

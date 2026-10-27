@@ -14,7 +14,7 @@ use vos_wire::Encode;
 use vos_wire::abi::cap;
 use vos_wire::ingress::{Rejection, Response};
 
-use crate::api::{Api, Via};
+use crate::api::{Api, LargePlace, Via};
 
 /// The most an install's body may hold: a package's ELF, at the most a
 /// derivation reads, and its envelope.
@@ -48,9 +48,11 @@ pub(crate) async fn serve(
     let limits = Limits {
         body: cap::REQUEST + ENVELOPE,
         install: MAX_INSTALL,
+        credentialed: vos_api::CREDENTIALED_HTTP,
         idle: Duration::from_secs(30),
         connections: api.inner.settings.ingress_connections,
         large: vos_http::LARGE,
+        credentialed_large: vos_http::CREDENTIALED_LARGE,
     };
     let handler: Handler = Arc::new(move |request| {
         let api = Arc::clone(&api);
@@ -70,7 +72,11 @@ pub(crate) async fn serve(
     .await;
 }
 
-async fn handle(api: &Api, token: &[u8; 32], request: vos_http::Request) -> vos_http::Response {
+async fn handle(api: &Api, token: &[u8; 32], mut request: vos_http::Request) -> vos_http::Response {
+    let large = request
+        .large
+        .take()
+        .map(|place| Box::new(place) as LargePlace);
     let (kind, body, via) = match routes::route(&request) {
         Routed::Answer(answer) => return answer,
         Routed::Request { kind, body } => (kind, body, Via::Http),
@@ -98,7 +104,9 @@ async fn handle(api: &Api, token: &[u8; 32], request: vos_http::Request) -> vos_
             (kind, body, via)
         }
     };
-    let answer = api.handle(kind, body, via).await;
+    // The route holds its own copy of the body.
+    drop(request);
+    let answer = api.handle(kind, body, via, large).await;
     routes::answer(kind as u16, &answer)
 }
 

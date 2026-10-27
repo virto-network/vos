@@ -424,9 +424,11 @@ pinned by 7.7.
   `CredentialRefusal::Once` at ingress and `Refusal::Once` at apply. A
   new round takes a new name ("vote/2026-11"), so a new scope.
 - **Gates:** the native verify of a credential proof at most 10 ms on one
-  x86 core; a proof with a wrong PoW refused in under 1 ms; fuzz targets
-  for the `Credentialed` decode and the format 44 and 43 verifiers in
-  `just fuzz`.
+  x86 core; a proof with a wrong PoW refused in under 1 ms; a
+  verification on one of a node's executors, the node under full
+  credentialed load on its physical performance cores, within 5 ms on
+  average [decided, S55]; fuzz targets for the `Credentialed` decode and
+  the format 44 and 43 verifiers in `just fuzz`.
 
 ### Pin J: the device profile, and format 43
 
@@ -1027,10 +1029,16 @@ and adds its set in a file of its own.
   the new owner's proof; a `claim_row` of a digest the invitation does
   not name refused; a transfer to a row that does not exist refused, its
   payer's balance unchanged.
-- **Gate:** pin I's gates; **the executors' bound** [decided, S44]: at
-  `k` verifying threads, for `k` = 1, 2, 4 up to the host's `N`, at least
-  `100·k` credentialed calls a second, p99 within 50 ms of a signed
-  call's; `N` and the host recorded. No absolute rate is claimed.
+- **Gate:** pin I's gates; **the executors' bound** [decided, S44, as
+  S55 measures it]: at `k` verifying threads, for `k` = 1, 2, 4 up to the
+  host's physical performance cores, at least `100·k` credentialed calls
+  a second, p99 within 50 ms of a signed call's; the node pinned to those
+  cores, the load generator on another machine over QUIC, each run at
+  least 10 s; `N` recorded as the physical cores and the logical threads,
+  and the host. Measured once, on compumax, the desktop the generator
+  (`cargo bench -p vos-node --bench credentialed`, its `serve` and `drive`
+  modes); the development machine's table stays as measured there. No
+  absolute rate is claimed.
 - **Dep:** 7.10, 7.10b (whichever ends last). **Estimate:** 2.5–3.5
   weeks.
 
@@ -1458,8 +1466,9 @@ together on the phone in session P5.
 
 **Taken by the owner:** S1–S5 before the plan; S6–S31 on draft 2; S32
 and S33 on draft 3; S34 on 7.2's review; S35 and S36 on the scale runs'
-hardware and S52 on its wiring; S37–S44 on 7.7's questions and S46–S51
-on Fable's review of 7.7 (`research/slice-7/owner-decisions.md`),
+hardware and S52 on its wiring; S37–S44 on 7.7's questions, S46–S51
+on Fable's review of 7.7 and S55 on Fable's review of 7.11
+(`research/slice-7/owner-decisions.md`),
 among them C1–C11 all taken and C4 fully terminal (S8–S18), the teammate
 told now (S19), the chip and the levers in the node's format too as the
 leaf count allows (S23, S32), a stable space handle (S25), the phone
@@ -1468,7 +1477,8 @@ gateway (S41), the Keystore and security keys instead of passkeys (S42,
 reversing S6), the `once` guard (S43), signed operator requests (S46),
 the `once` row on `Ok` only (S47), the facility's own confirmation form
 (S48), the `vos-api` subsystem (S49), 7.10b beside 7.9 and 7.10 (S50),
-the input's tag (S51).
+the input's tag (S51), the rate gate up to the physical cores, measured
+on compumax (S55).
 S7, S11 and S25 carry the review's amendments (7.8's split; the
 divergence guard and the deposit released on `Ended`; the scope's
 `SpaceId`, the re-seeding runbook and `member` without an epoch).
@@ -1502,4 +1512,6 @@ Two, each closed by a measurement (the second closed):
 S42, Q5 by S43, Q6 by S44, folded into the pins and steps above. Fable's
 review of 7.7 asked six (`research/slice-7/7.7-fable.md`, Q1 to Q6),
 among them the operator requests S41's fold had left open; the owner
-answered each by S46–S51, folded likewise.
+answered each by S46–S51, folded likewise. Fable's review of 7.11 asked
+one (`research/slice-7/7.11-fable.md`, Q1, how S44 is measured); the
+owner answered it by S55, folded into pin I and 7.11's gate.

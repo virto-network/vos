@@ -406,17 +406,14 @@ impl Node {
     }
 
     /// A sweep of the rows of the due index due at `time`, as a leader
-    /// lists them: the earliest first, at most `SWEEP_LIMIT`.
+    /// lists them: the earliest first, within a sweep's budget.
     pub fn sweep(&self, time: u64) -> Input {
         let prefix = keys::due_prefix();
-        let due = self
+        let rows = self
             .state
             .range(prefix.clone()..)
-            .take_while(|(key, _)| key.starts_with(&prefix))
-            .filter_map(|(key, _)| keys::due_entry(key))
-            .take_while(|(at, _)| *at <= time)
-            .take(vos_wire::defaults::SWEEP_LIMIT)
-            .collect();
+            .map(|(key, _)| Ok::<_, ()>(key));
+        let due = keys::due_rows(rows, time, vos_wire::defaults::SWEEP_LIMIT).unwrap();
         Input::Sweep { due }
     }
 

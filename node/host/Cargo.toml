@@ -55,12 +55,16 @@ vos-venue = { workspace = true }
 # recorded and submitted.
 vos-node-prover = { workspace = true }
 vos-wire = { workspace = true }
+# A credentialed call's proof, verified at ingress (its bytes decoded).
+vos-pvm-final-verifier = { workspace = true, features = ["credential-bytes"] }
 webpki = { package = "rustls-webpki", version = "0.103", default-features = false, features = ["alloc", "ring"] }
 
 [dev-dependencies]
 # Its integration tests only: never its unit tests, which build a second
 # vos-node the checker's types do not unify with.
 vos-checker = { path = "../checker" }
+# Credential proofs, made as a device makes them, for ingress to verify.
+vos-pvm-recair = { workspace = true }
 # A kernel run alone, as an attest runs it.
 vos-testkit = { path = "../../agent/testkit" }
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
@@ -142,6 +146,10 @@ harness = false
 
 [[bench]]
 name = "cuts"
+harness = false
+
+[[bench]]
+name = "credentialed"
 harness = false
 
 # The carrier audit: three nodes proving with the masked prover, every

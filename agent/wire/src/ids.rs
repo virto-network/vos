@@ -87,7 +87,9 @@ pub fn derive_id(domain: &str, name: &str) -> u32 {
 
 /// Who made a request: a client, authenticated at ingress by its key,
 /// another agent, or, for a nested call, the calling instance of the same
-/// agent. Each holds only the roles granted to it.
+/// agent; or the sender of a credential proof, which ingress verified
+/// (`identity-and-authority.md` §5). Each holds only the roles granted to
+/// it, and a credential's origin none: a guard admits it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub enum Principal {
     #[codec(index = 0)]
@@ -96,4 +98,23 @@ pub enum Principal {
     Agent(AgentId),
     #[codec(index = 2)]
     Instance(InstanceId),
+    /// An auth proof's: the sender knows the secret behind a member's leaf,
+    /// and `nullifier` is its pseudonym in `scope`, stable across its
+    /// calls. Each digest is eight M31 words, as little-endian `u32`s.
+    #[codec(index = 3)]
+    Anonymous {
+        scope: [u8; 32],
+        nullifier: [u8; 32],
+    },
+    /// An owner proof's: the sender knows the secret behind `digest`, the
+    /// owner a row names.
+    #[codec(index = 4)]
+    Owner([u8; 32]),
+}
+
+impl Principal {
+    /// Whether a credential proof made it: no role is ever granted to one.
+    pub const fn is_credential(&self) -> bool {
+        matches!(self, Principal::Anonymous { .. } | Principal::Owner(_))
+    }
 }

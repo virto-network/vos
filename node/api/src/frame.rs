@@ -315,7 +315,7 @@ mod tests {
 
     #[test]
     fn unknown_kinds_and_the_frame_errors_kind_are_unknown() {
-        for kind in [0u16, FRAME_ERROR, crate::CREDENTIALED, 0x0300] {
+        for kind in [0u16, FRAME_ERROR, 0x0105, 0x0300] {
             let events = read_all(
                 &mut requests(Framing::Stream),
                 &[&frame(Framing::Stream, kind, 7, &[])],

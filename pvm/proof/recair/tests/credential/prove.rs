@@ -151,11 +151,13 @@ fn the_slot_does_not_move_the_shape() {
         let statement = support::auth_at(&mut rng, &enrolled, slot);
         let proof = prove(&statement);
         let len = verifier::encode(&proof).unwrap().len();
-        let widths: Vec<Vec<usize>> = proof
+        // The columns a tree commits: the shape. How many values each
+        // carries follows the distinct query positions, the coins'.
+        let widths: Vec<usize> = proof
             .stark_proof
             .queried_values
             .iter()
-            .map(|tree| tree.iter().map(Vec::len).collect())
+            .map(|tree| tree.len())
             .collect();
         verify(&statement, proof).unwrap();
         (len, widths)

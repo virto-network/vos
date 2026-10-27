@@ -79,7 +79,7 @@ pub(crate) fn message(
             awaiting,
         } => {
             let call = Call {
-                caller: Principal::Agent(from),
+                caller: &Principal::Agent(from),
                 instance,
                 method,
                 arguments: &arguments,
@@ -195,7 +195,7 @@ pub(crate) fn proven(
     run
 }
 
-fn command(base: &Base, index: u32, input: InputRef, call: Call) -> Run {
+pub(crate) fn command(base: &Base, index: u32, input: InputRef, call: Call) -> Run {
     let mut invocation = Invocation::new(base, index, Kind::Command);
     let outcome = invocation.top(call);
     let Invocation {
@@ -261,16 +261,26 @@ pub(crate) fn acknowledge(to: AgentId, sequence: u64) -> Step {
 pub(crate) fn sweep(base: &Base, listed: &[(u64, Due)]) -> Stepped {
     let mut sessions = Vec::new();
     let mut workflows = Vec::new();
-    for &(at, entry) in listed.iter().take(defaults::SWEEP_LIMIT) {
+    let mut bindings = Vec::new();
+    let mut budget = keys::SweepBudget::new(defaults::SWEEP_LIMIT);
+    for &(at, entry) in listed.iter().take(budget.rows()) {
+        if !budget.take(&entry) {
+            continue;
+        }
         if at > base.time || !base.holds(&keys::due(at, entry)) {
             continue;
         }
         match entry {
             Due::Session(session) => sessions.push((at, session)),
             Due::Workflow(workflow) => workflows.push((at, workflow)),
+            Due::Binding(binding) => bindings.push((at, binding)),
         }
     }
-    let mut stepped = Stepped::new(Step::Swept { due: sessions }, None);
+    let swept = Step::Swept {
+        due: sessions,
+        bindings,
+    };
+    let mut stepped = Stepped::new(swept, None);
     stepped.due = workflows;
     stepped
 }

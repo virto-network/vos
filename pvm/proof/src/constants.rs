@@ -23,7 +23,7 @@ pub const WINDOW_PROGRAM: [u32; 8] = [
 
 /// The balance kernel's: the `balance` test actor's `at_least`.
 pub const BALANCE_PROGRAM: [u32; 8] = [
-    2138763073, 1583761847, 703805682, 1398107483, 579051229, 1648017018, 285859894, 1294321447,
+    582303518, 1319574662, 1332224574, 933326015, 1754214048, 576513983, 2021218581, 2108346586,
 ];
 
 /// The solvency predicate's: the `kernels` test actor's `areas`.

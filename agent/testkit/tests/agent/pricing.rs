@@ -255,9 +255,13 @@ fn the_install_reserve_and_record_price_cover_the_largest_install() {
             role: None,
             gas: None,
             linearizable: false,
+            credential: None,
         })
         .collect();
-    let schema = Schema { methods };
+    let schema = Schema {
+        methods,
+        credentials: false,
+    };
     let section = schema.section();
     assert!(section.len() - 8 <= MAX_LEN && section.len() - 8 > MAX_LEN - 4096);
     // Return to the halt address at once.
@@ -389,13 +393,38 @@ fn the_reserves_cover_the_agents_own_work() {
             .unwrap()
             .0;
         assert!(
-            matches!(&swept.steps[0], vos_wire::result::Step::Swept { due } if due.len() == defaults::SWEEP_LIMIT)
+            matches!(&swept.steps[0], vos_wire::result::Step::Swept { due, .. } if due.len() == defaults::SWEEP_LIMIT)
         );
         let idle = node
             .run_refine(&node.work(later, vec![]), OUTER_GAS)
             .gas_used;
         check(
             "a full sweep",
+            (sweeping.gas_used - idle) as i64,
+            defaults::SWEEP_RESERVE,
+        );
+        // And as many binding digests as a sweep forgets beside them.
+        // Due before the sessions, so the sweep lists both its counts' worth.
+        for index in 0..defaults::SWEEP_BINDINGS as u32 {
+            let mut binding = [0u8; 32];
+            binding[..4].copy_from_slice(&index.to_le_bytes());
+            let row = vos_wire::keys::due(1, vos_wire::keys::Due::Binding(binding));
+            node.state.insert(row, vos_wire::records::stored(&[]));
+            let kept = vos_wire::keys::binding(&binding);
+            node.state
+                .insert(kept, vos_wire::records::stored(&later.encode()));
+        }
+        let sweeping = node.run_refine(&node.work(later, vec![node.sweep(later)]), OUTER_GAS);
+        let swept = WorkResult::decode(&sweeping.output_bounded(cap::OUTPUT).unwrap())
+            .unwrap()
+            .0;
+        assert!(matches!(
+            &swept.steps[0],
+            vos_wire::result::Step::Swept { due, bindings }
+                if due.len() == defaults::SWEEP_LIMIT && bindings.len() == defaults::SWEEP_BINDINGS
+        ));
+        check(
+            "a full sweep with bindings",
             (sweeping.gas_used - idle) as i64,
             defaults::SWEEP_RESERVE,
         );
@@ -521,6 +550,7 @@ fn the_start_reserves_cover_decoding_a_batch() {
             "6 installs of 33 kernels at the most classes",
             installs(6, &widest),
         ),
+        ("a sweep of its most rows", vec![most_swept()]),
     ] {
         let work = node.budgeted_work(1, [0; 32], 0, inputs);
         let arguments = node.arguments(&work).len() as u64;
@@ -671,4 +701,23 @@ fn a_section_pays_for_its_serving() {
     let cost = charge as i64 + (own(count) - own(0)) / i64::from(count);
     println!("a section: charged {charge}, costs the agent {cost}");
     assert!(cost <= (charge * 4 / 5) as i64, "{cost} of {charge}");
+}
+
+/// A sweep listing the most rows one may: its sessions' and workflows', and
+/// its bindings' beside them.
+fn most_swept() -> vos_wire::batch::Input {
+    use vos_wire::ids::{SessionId, WorkflowId};
+    use vos_wire::keys::Due;
+    let others = (0..defaults::SWEEP_LIMIT as u64).map(|id| match id % 2 {
+        0 => (id, Due::Session(SessionId(id))),
+        _ => (id, Due::Workflow(WorkflowId(id))),
+    });
+    let bindings = (0..defaults::SWEEP_BINDINGS as u64).map(|id| {
+        let mut binding = [0xb1; 32];
+        binding[..8].copy_from_slice(&id.to_le_bytes());
+        (id, Due::Binding(binding))
+    });
+    vos_wire::batch::Input::Sweep {
+        due: others.chain(bindings).collect(),
+    }
 }

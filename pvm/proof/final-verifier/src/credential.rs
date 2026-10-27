@@ -37,11 +37,13 @@ use stwo::core::proof::StarkProof;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs_lifted::blake2_merkle::{Blake2sM31MerkleChannel, Blake2sM31MerkleHasher};
 use vos_pvm_recair_air::GateRelation;
-use vos_pvm_recair_air::credential::{self, CredentialKind};
+use vos_pvm_recair_air::credential;
 use vos_pvm_recair_air::masked::{CredentialComponents, MaskPins};
 
 use crate::Error;
 use crate::masked::{Claim, MaskedFormat, TREES, verify_masked};
+
+pub use vos_pvm_recair_air::credential::CredentialKind;
 
 /// The credential format's number (`vos_pvm_proof::format::CREDENTIAL_PROOF`).
 pub const FORMAT: u32 = 44;

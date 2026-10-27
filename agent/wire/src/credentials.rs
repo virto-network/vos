@@ -20,6 +20,9 @@ use alloc::vec::Vec;
 
 use scale::{Decode, DecodeError, Encode};
 
+use crate::SpaceId;
+use crate::ids::{AgentId, InstanceId, MethodId};
+
 /// A digest's bytes: eight M31 words as little-endian `u32`s.
 pub type Digest = [u8; 32];
 
@@ -625,6 +628,75 @@ impl Ring {
     }
 }
 
+/// The scope a guard named `name` gives in `space`'s agent `agent`, at
+/// `instance` (`identity-and-authority.md` §7):
+/// `C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))`,
+/// the agent and the instance four little-endian bytes each. No two
+/// agents' guards of one name, in one space or two, share a pseudonym.
+pub fn scope(space: &SpaceId, agent: AgentId, instance: InstanceId, name: &[u8]) -> Digest {
+    let hash = vos_pvm_precompiles::blake2b_hash::<32>(
+        b"vos/cred/scope/v1",
+        &[
+            &space.0,
+            &agent.0.to_le_bytes(),
+            &instance.0.to_le_bytes(),
+            name,
+        ],
+    );
+    digest(&compress(&Tag::Scope.block(), &reduced(&hash)))
+}
+
+/// What a binding digest binds: one call of one method, in one space,
+/// under one statement, once, before `expires_ms`.
+#[derive(Clone, Copy, Debug)]
+pub struct Bound<'a> {
+    pub space: &'a SpaceId,
+    pub agent: AgentId,
+    pub instance: InstanceId,
+    pub method: MethodId,
+    /// The statement's program id: its circuit's, or a device proof's
+    /// kernel's.
+    pub program: &'a [u8; 32],
+    /// The statement's kind, [`crate::ingress::CredentialPublic`]'s index.
+    pub kind: u8,
+    pub arguments: &'a [u8],
+    pub nonce: &'a [u8; 16],
+    pub expires_ms: u64,
+}
+
+impl Bound<'_> {
+    /// `b = BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖ agent ‖ instance ‖
+    /// method ‖ program ‖ kind ‖ arguments ‖ nonce ‖ expires_ms)`: the
+    /// agent, instance and method four little-endian bytes each, the kind
+    /// one byte, the arguments as the codec writes them (a `u32`
+    /// little-endian length, then the bytes), `expires_ms` eight
+    /// little-endian bytes.
+    pub fn digest(&self) -> [u8; 32] {
+        let length = (self.arguments.len() as u32).to_le_bytes();
+        vos_pvm_precompiles::blake2b_hash::<32>(
+            b"vos/cred/binding/v1",
+            &[
+                &self.space.0,
+                &self.agent.0.to_le_bytes(),
+                &self.instance.0.to_le_bytes(),
+                &self.method.0.to_le_bytes(),
+                self.program,
+                &[self.kind],
+                &length,
+                self.arguments,
+                self.nonce,
+                &self.expires_ms.to_le_bytes(),
+            ],
+        )
+    }
+}
+
+/// The proof's public `binding` of the binding digest `b`:
+/// `C(T(binding), W(b))`.
+pub fn binding(b: &[u8; 32]) -> Digest {
+    digest(&compress(&Tag::Binding.block(), &reduced(b)))
+}
+
 /// Why the credential actor refused a call: its handlers' error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 #[repr(u8)]
@@ -659,6 +731,20 @@ pub enum CredentialError {
     /// The handle given is all zeros, which reads as none.
     #[codec(index = 9)]
     ZeroHandle = 9,
+}
+
+/// The key of the ring's row of the credential actor at `actor`: the row
+/// [`tables::RING_KEY`] of its hashed table [`tables::RING`], which
+/// ingress and the refine both read. Inline, so it is compiled only where
+/// it is called: a pinned kernel that does not call it keeps its program
+/// id.
+#[inline]
+pub fn ring_key(actor: InstanceId) -> Vec<u8> {
+    let rows = crate::abi::Rows::Table {
+        tag: crate::ids::derive_id("vos/table/", tables::RING),
+        transform: crate::keys::Transform::Hashed,
+    };
+    crate::keys::row(actor, rows, &[tables::RING_KEY]).expect("a hashed row's key")
 }
 
 #[cfg(test)]

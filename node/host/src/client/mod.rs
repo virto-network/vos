@@ -15,9 +15,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
-use vos_wire::Decode;
 use vos_wire::ids::{AgentId, Principal, Session};
-use vos_wire::ingress::{AgentInfo, Contact, NodeId, Response};
+use vos_wire::ingress::{AgentInfo, Contact, Credentialed, NodeId, Response};
+use vos_wire::{Decode, Encode};
 
 use crate::lock;
 use crate::tls::Trust;
@@ -88,6 +88,26 @@ pub fn post_within(
 ) -> Result<Response, ClientError> {
     let (status, body) = Transport::within(target, within).post_once(path, None, body)?;
     decode_answer(status, &body)
+}
+
+/// A credentialed call to `agent`, its proof its authority: the node's
+/// answer. A repeat is answered `Replayed`, never the first outcome.
+pub fn credentialed(
+    target: &Target,
+    agent: AgentId,
+    call: &Credentialed,
+) -> Result<Response, ClientError> {
+    let path = format!("/agents/{}/credentialed", agent.0);
+    let (status, body) = post(target, &path, &call.encode())?;
+    decode_answer(status, &body)
+}
+
+/// The node's clock, in milliseconds: what a credentialed call's
+/// `expires_ms` is judged by. Unsigned: a relay that lies about it costs
+/// the client a new proof, never a longer life for one.
+pub fn time(target: &Target) -> Result<u64, ClientError> {
+    let (status, body) = Transport::new(target).get("/time", None)?;
+    u64::decode_exact(&body).ok_or(ClientError::Undecodable(status))
 }
 
 /// The node's identity, its key, which its TLS presents. A pinned node

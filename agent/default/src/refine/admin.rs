@@ -5,6 +5,7 @@ use alloc::vec::Vec;
 use vos_wire::abi::cap::{Limits, Refused, Target};
 use vos_wire::abi::{Failure, cap};
 use vos_wire::batch::Admin;
+use vos_wire::ids::InstanceId;
 use vos_wire::records::{Derivation, Installed};
 use vos_wire::result::{InputRef, Outcome, Step, Write};
 use vos_wire::schema::Schema;
@@ -47,10 +48,15 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
                     Ok(installed) => installed,
                     Err(outcome) => return failed(outcome),
                 };
+            let credentials = match credentials(base, instance, &installed.schema) {
+                Ok(credentials) => credentials,
+                Err(outcome) => return failed(outcome),
+            };
             let mut writes = alloc::vec![Write {
                 key: keys::installed(instance),
                 value: Some(installed.encode()),
             }];
+            writes.extend(credentials);
             if agent.is_none() {
                 writes.extend([
                     Write {
@@ -68,6 +74,11 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
                 ]);
             }
             (writes, reply)
+        }
+        // No role is ever granted to a credential's origin: a guard admits
+        // it.
+        Admin::SetRole(grant) if grant.principal.is_credential() => {
+            return failed(Outcome::failed(Failure::Forbidden));
         }
         Admin::SetRole(grant) => {
             let write = Write {
@@ -94,6 +105,36 @@ pub(crate) fn admin(base: &Base, admin: Admin) -> Step {
     let mut run = consumed(InputRef::Admin, Outcome::Done(reply));
     run.writes.extend(writes);
     Step::Ran(run)
+}
+
+/// The row naming the agent's credential actor that an install of
+/// `schema` at `instance` writes, if it is one; or its failure,
+/// [`Failure::Credentials`]: a second credential actor at another
+/// instance, the actor's instance replaced by a program that is not one,
+/// or an auth guard in an agent with no credential actor.
+fn credentials(
+    base: &Base,
+    instance: InstanceId,
+    schema: &Schema,
+) -> Result<Option<Write>, Outcome> {
+    let refused = || Outcome::failed(Failure::Credentials);
+    let actor = match base.read(&keys::credentials()) {
+        Ok(row) => row
+            .map(|bytes| InstanceId::decode_exact(&bytes).ok_or(Corrupt))
+            .transpose(),
+        Err(corrupt) => Err(corrupt),
+    }
+    .map_err(|_| Outcome::failed(Failure::Trapped))?;
+    match actor {
+        Some(actor) if actor != instance && schema.credentials => Err(refused()),
+        Some(actor) if actor == instance && !schema.credentials => Err(refused()),
+        None if schema.guards_auth() && !schema.credentials => Err(refused()),
+        None if schema.credentials => Ok(Some(Write {
+            key: keys::credentials(),
+            value: Some(instance.encode()),
+        })),
+        _ => Ok(None),
+    }
 }
 
 /// What an agent's first install recorded: its target, its space and its

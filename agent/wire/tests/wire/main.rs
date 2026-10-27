@@ -2,6 +2,7 @@
 //! carry.
 
 mod abi;
+mod credentialed;
 mod encodings;
 mod keys;
 mod results;

@@ -8,6 +8,7 @@ use core::cell::{Cell, RefCell};
 use core::ops::Range;
 
 use vos_wire::abi::{Failure, cap};
+use vos_wire::credentials::Ring;
 use vos_wire::ids::{AgentId, InstanceId, Principal, WorkflowId};
 use vos_wire::records::{Installed, unstored, unversioned};
 use vos_wire::result::{PAGE, PageSection};
@@ -149,6 +150,10 @@ pub(crate) struct Base {
     /// Installed records read in this refine. Only admin steps change
     /// them, and they clear it.
     pub(crate) installed: RefCell<BTreeMap<InstanceId, Option<Rc<Installed>>>>,
+    /// The credential actor's ring read in this refine, by its row's key:
+    /// paid once, as an installed record is. A step that writes the row,
+    /// and an admin step, clear it.
+    pub(crate) ring: RefCell<Option<(Vec<u8>, Rc<Ring>)>>,
     /// The output's page section, and where in it lies each page the
     /// steps taken stored, or that they dropped: a later step of the
     /// workflow restores from there.
@@ -173,6 +178,7 @@ impl Base {
             meter: Meter::new(budget),
             earlier: BTreeMap::new(),
             installed: RefCell::new(BTreeMap::new()),
+            ring: RefCell::new(None),
             section: RefCell::new(PageSection::new()),
             pages: BTreeMap::new(),
         }

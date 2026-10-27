@@ -1,0 +1,18 @@
+[package]
+name = "poll"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[lib]
+test = false
+bench = false
+
+[[bin]]
+name = "poll"
+path = "src/main.rs"
+test = false
+bench = false
+
+[dependencies]
+vos-sdk = { workspace = true }

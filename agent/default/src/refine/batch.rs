@@ -16,6 +16,7 @@ use super::Call;
 use super::admin::admin;
 use super::base::Base;
 use super::closes;
+use super::credentialed::credentialed;
 use super::inputs::{
     acknowledge, called, consumed, failed_in_refine, message, out_of_order, proven, sweep,
 };
@@ -107,6 +108,13 @@ impl Batched {
             let key = keys::committed(&write.map, &write.key);
             base.earlier.insert(key, write.value.clone());
         }
+        let ring = base.ring.get_mut();
+        if ring
+            .as_ref()
+            .is_some_and(|(key, _)| run.writes.iter().any(|write| write.key == *key))
+        {
+            *ring = None;
+        }
         let mut stored = stepped.pages.into_iter();
         for page in &run.pages {
             let range = page
@@ -162,6 +170,7 @@ fn plan(base: &Base, pairs: &BTreeMap<AgentId, u64>, input: &Input, handler: boo
     };
     match input {
         Input::Request(request) => plain(limit(base, request.instance, request.method)?),
+        Input::Credentialed(call) => plain(limit(base, call.instance, call.method)?),
         Input::Message(Message {
             body: Body::Call {
                 instance, method, ..
@@ -243,6 +252,7 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
         let handler = matches!(
             &input,
             Input::Request(_)
+                | Input::Credentialed(_)
                 | Input::Message(Message {
                     body: Body::Call { .. },
                     ..
@@ -274,7 +284,7 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
                         };
                         let mark = Mark::Session(request.session, held.advanced(mark));
                         let call = Call {
-                            caller: request.caller,
+                            caller: &request.caller,
                             instance: request.instance,
                             method: request.method,
                             arguments: &request.arguments,
@@ -323,6 +333,7 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
                 proof,
                 attested,
             } => Stepped::ran(proven(base, window, id, (proof, attested))),
+            Input::Credentialed(call) => credentialed(base, index, *call),
         };
         let Some(due) = batched.take(base, stepped, plan.reserve, plan.runs) else {
             break;
@@ -331,8 +342,10 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
             batched.counts.add(&key);
         }
         if admin {
-            // An admin step may change installed records.
+            // An admin step may change installed records, and the
+            // credential actor.
             base.installed.borrow_mut().clear();
+            *base.ring.borrow_mut() = None;
         }
         let mut floor = Floor::new(swept && with_inputs);
         for (at, workflow) in due {

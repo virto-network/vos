@@ -5,7 +5,7 @@ use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use vos_wire::batch::{Admin, Input, Message, Request};
+use vos_wire::batch::{Admin, CredentialedInput, Input, Message, Request};
 use vos_wire::ids::AgentId;
 use vos_wire::keys::Due;
 
@@ -26,6 +26,11 @@ pub(crate) type Answer = smol::channel::Sender<Result<Answered, CallError>>;
 pub(crate) enum Pending {
     Request {
         request: Request,
+        answer: Answer,
+    },
+    /// A credentialed call, its proof verified at a replica's ingress.
+    Credentialed {
+        call: CredentialedInput,
         answer: Answer,
     },
     /// An admin command, with the blobs its entry names.
@@ -57,6 +62,7 @@ impl Pending {
     pub(crate) fn input(&self) -> Input {
         match self {
             Pending::Request { request, .. } => Input::Request(request.clone()),
+            Pending::Credentialed { call, .. } => Input::Credentialed(Box::new(call.clone())),
             Pending::Admin { admin, .. } => Input::Admin(admin.clone()),
             Pending::Message(message) => Input::Message(message.clone()),
             Pending::Failed(message) => Input::Failed {
@@ -76,6 +82,7 @@ impl Pending {
     pub(crate) fn bytes(&self) -> usize {
         match self {
             Pending::Request { request, .. } => request.arguments.len(),
+            Pending::Credentialed { call, .. } => call.arguments.len(),
             Pending::Message(message) => message.body.payload_len(),
             Pending::Duty(Input::Resume { served, .. }) => served.as_ref().map_or(0, Vec::len),
             // Its batch carries no body.
@@ -89,7 +96,10 @@ impl Pending {
 
     /// Counts against the queue cap: what a client queued.
     pub(crate) fn capped(&self) -> bool {
-        matches!(self, Pending::Request { .. } | Pending::Admin { .. })
+        matches!(
+            self,
+            Pending::Request { .. } | Pending::Credentialed { .. } | Pending::Admin { .. }
+        )
     }
 
     /// Counts against the cap on the messages other agents queue, which
@@ -101,7 +111,10 @@ impl Pending {
 
     /// Answer the input's caller, when it has one.
     pub(crate) fn answer(self, answered: Result<Answered, CallError>) {
-        if let Pending::Request { answer, .. } | Pending::Admin { answer, .. } = self {
+        if let Pending::Request { answer, .. }
+        | Pending::Credentialed { answer, .. }
+        | Pending::Admin { answer, .. } = self
+        {
             let _ = answer.try_send(answered);
         }
     }

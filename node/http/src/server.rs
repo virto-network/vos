@@ -23,18 +23,27 @@ pub struct Limits {
     /// The most an install's body (a `POST` to a path ending in
     /// `/install`) may hold, in place of `body`.
     pub install: usize,
+    /// The most a credentialed call's body (a `POST` to a path ending in
+    /// `/credentialed`) may hold, in place of `body`.
+    pub credentialed: usize,
     /// How long a connection may wait for its next bytes.
     pub idle: Duration,
     /// The most connections at once; more are closed on accept.
     pub connections: usize,
-    /// The most bodies past `body` (an install's) held at once, from every
+    /// The most install bodies past `body` held at once, from every
     /// connection: past them, a request is answered 503 from its head,
     /// its body unread.
     pub large: usize,
+    /// The same for credentialed calls' bodies past `body`, apart from the
+    /// installs': a proof of any size takes no install's place.
+    pub credentialed_large: usize,
 }
 
 /// Bodies past `body` held at once, unless a server says otherwise.
 pub const LARGE: usize = 4;
+/// Credentialed calls' bodies past `body` held at once, unless a server
+/// says otherwise: about 100 MiB of them at their largest.
+pub const CREDENTIALED_LARGE: usize = 64;
 
 pub struct Request {
     pub method: String,
@@ -43,6 +52,15 @@ pub struct Request {
     pub body: Vec<u8>,
     /// Where the connection came from.
     pub peer: Option<SocketAddr>,
+    /// The body's place among the large bodies the server holds at once,
+    /// if it is large: given back when dropped, so a handler done with
+    /// the body may give it back before it answers.
+    pub large: Option<Large>,
+}
+
+/// A large body's place: see [`Request::large`].
+pub struct Large {
+    _place: Slot,
 }
 
 impl Request {
@@ -149,6 +167,7 @@ async fn accept(
 ) {
     let open = Arc::new(AtomicUsize::new(0));
     let large = Arc::new(AtomicUsize::new(0));
+    let credentialed = Arc::new(AtomicUsize::new(0));
     let acceptor = serve.tls.clone().map(futures_rustls::TlsAcceptor::from);
     while let Ok((stream, peer)) = listener.accept().await {
         connections.retain(|connection| !connection.is_finished());
@@ -167,6 +186,7 @@ async fn accept(
             head: serve.head.clone(),
             limits: serve.limits.clone(),
             large: Arc::clone(&large),
+            credentialed: Arc::clone(&credentialed),
         };
         let acceptor = acceptor.clone();
         connections.push((serve.spawn)(Box::pin(async move {
@@ -205,8 +225,9 @@ struct Shared {
     handler: Handler,
     head: Option<Head>,
     limits: Limits,
-    /// The large bodies held now.
+    /// The large bodies held now: installs', and credentialed calls'.
     large: Arc<AtomicUsize>,
+    credentialed: Arc<AtomicUsize>,
 }
 
 /// A place among those counted (connections, or large bodies), given back
@@ -243,12 +264,15 @@ async fn connection(
     let mut buffer = Vec::with_capacity(4096);
     loop {
         let (response, next) = match read_request(&mut stream, &mut buffer, peer, shared).await? {
-            Read::Request(request, used, large) => {
+            Read::Request(request, used) => {
                 let close = closes(&request);
+                // The request's bytes leave the buffer before the handler
+                // runs: a large body is held once, by the request, and its
+                // place is held until the handler drops it or answers.
+                buffer.drain(..used);
+                buffer.shrink_to(4096);
                 let response = (shared.handler)(request).await;
-                // The large body's place is held until its answer is out.
-                drop(large);
-                (response, (!close).then_some(used))
+                (response, (!close).then_some(0))
             }
             Read::Answered(response, next) => (response, next),
             Read::Closed => return Ok(()),
@@ -300,9 +324,8 @@ async fn read(
 }
 
 enum Read {
-    /// A request, the bytes of the buffer it used, and its large body's
-    /// place if its body is large.
-    Request(Request, usize, Option<Slot>),
+    /// A request, and the bytes of the buffer it used.
+    Request(Request, usize),
     /// A request answered without the handler: the answer, and the bytes
     /// of the buffer it used if the connection goes on, `None` to close.
     Answered(Response, Option<usize>),
@@ -359,6 +382,7 @@ async fn read_request(
                         .collect(),
                     body: Vec::new(),
                     peer: Some(peer),
+                    large: None,
                 };
                 // Bodies come with a length: chunked ones are not read.
                 if request.header("transfer-encoding").is_some() {
@@ -369,11 +393,16 @@ async fn read_request(
                     Some(None) => return Ok(refuse(400)),
                     None => 0,
                 };
-                let limit = if request.method == "POST" && request.path.ends_with("/install") {
-                    limits.install
+                let post = |end: &str| request.method == "POST" && request.path.ends_with(end);
+                let (limit, pool) = if post("/install") {
+                    (limits.install, Some((&shared.large, limits.large)))
+                } else if post("/credentialed") {
+                    let pool = (&shared.credentialed, limits.credentialed_large);
+                    (limits.credentialed, Some(pool))
                 } else {
-                    limits.body
+                    (limits.body, None)
                 };
+                let large = length > limits.body;
                 if length > limit {
                     return Ok(refuse(413));
                 }
@@ -385,19 +414,19 @@ async fn read_request(
                 if let Some(answer) = shared.head.as_ref().and_then(|head| head(&request)) {
                     // A large body, or one the client waits to be asked
                     // for, is never read: the connection closes instead.
-                    if pending && (length > limits.body || continues) {
+                    if pending && (large || continues) {
                         return Ok(Read::Answered(answer, None));
                     }
                     fill(stream, buffer, end, limits.idle, deadline).await?;
                     let next = (!closes(&request)).then_some(end);
                     return Ok(Read::Answered(answer, next));
                 }
-                let large = match length > limits.body {
-                    true => match Slot::take(&shared.large, limits.large) {
-                        Some(place) => Some(place),
+                request.large = match pool.filter(|_| large) {
+                    Some((held, most)) => match Slot::take(held, most) {
+                        Some(place) => Some(Large { _place: place }),
                         None => return Ok(refuse(503)),
                     },
-                    false => None,
+                    None => None,
                 };
                 if pending && continues {
                     stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
@@ -405,7 +434,7 @@ async fn read_request(
                 }
                 fill(stream, buffer, end, limits.idle, deadline).await?;
                 request.body = buffer[head..end].to_vec();
-                return Ok(Read::Request(request, end, large));
+                return Ok(Read::Request(request, end));
             }
             Ok(httparse::Status::Partial) => {
                 if buffer.len() > MAX_HEAD {

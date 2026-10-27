@@ -4,7 +4,7 @@
 # (`actor_program!`).
 [workspace]
 members = [
-    "counter", "ledger", "caller", "tracker", "shop", "rounds", "kernels", "tainted", "bounds", "wide",
+    "counter", "ledger", "purses", "poll", "caller", "tracker", "shop", "rounds", "kernels", "tainted", "bounds", "wide",
     "bulky", "greedy", "window", "reader", "accounts", "balance", "shard",
 ]
 resolver = "3"
