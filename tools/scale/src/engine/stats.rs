@@ -87,6 +87,10 @@ pub struct KindStats {
     /// Signatures the sending thread made: calls signed again for their
     /// turn, and the reads of workflows and cuts.
     pub signed: u64,
+    /// Reads at a cut still open when the driver gave up on them, their
+    /// window closing after the load's last send: the run ended before
+    /// the window could close, so they are neither answered nor errors.
+    pub not_closed: u64,
 }
 
 impl KindStats {
@@ -103,6 +107,7 @@ impl KindStats {
         self.queued += other.queued;
         self.cross += other.cross;
         self.signed += other.signed;
+        self.not_closed += other.not_closed;
     }
 
     pub fn line(&self, t_ms: u64, seconds: f64, kind: &str, total: bool) -> serde_json::Value {
@@ -128,6 +133,7 @@ impl KindStats {
             "queued": self.queued,
             "cross": self.cross,
             "signed_sending": self.signed,
+            "not_closed": self.not_closed,
         })
     }
 }
@@ -240,7 +246,7 @@ pub fn mix_line(plan: &Plan, whole: &BTreeMap<&str, KindStats>) -> serde_json::V
 
 #[cfg(test)]
 mod tests {
-    use super::refusal;
+    use super::{KindStats, refusal};
     use vos_wire::Encode;
     use vos_wire::abi::{AttestError, Failure, Refusal};
     use vos_wire::ingress::{Rejection, Response, WorkflowStatus};
@@ -278,5 +284,24 @@ mod tests {
             "Workflow(Running)"
         );
         assert_eq!(refusal(&Err("timed out".into())), "client: timed out");
+    }
+
+    /// A read left open by the run's end is counted apart from the errors,
+    /// in an interval's line and in the totals.
+    #[test]
+    fn reads_not_closed_in_the_run_are_not_errors() {
+        let interval = KindStats {
+            sent: 3,
+            ok: 1,
+            not_closed: 2,
+            ..KindStats::default()
+        };
+        let mut whole = KindStats::default();
+        whole.absorb(&interval);
+        whole.absorb(&interval);
+        let line = whole.line(0, 1.0, "cut_read", true);
+        assert_eq!(line["not_closed"], 4);
+        assert_eq!(line["errors"], 0);
+        assert_eq!(line["ok"], 2);
     }
 }

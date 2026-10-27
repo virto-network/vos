@@ -128,6 +128,13 @@ fn unserved(answer: &Result<Response, String>) -> bool {
     )
 }
 
+/// Whether a read at a cut that never ended is left out of the errors:
+/// its window, closing at `close_ms`, closes after the load ended at
+/// `load_ended_ms`, so the run, not the nodes, left it open.
+fn closes_after_load(close_ms: u64, load_ended_ms: Option<u64>) -> bool {
+    load_ended_ms.is_some_and(|ended| close_ms > ended)
+}
+
 /// The sending thread's state.
 struct Engine {
     shared: Arc<Shared>,
@@ -150,6 +157,8 @@ struct Engine {
     flushed: Cell<(Instant, f64)>,
     /// The first and last sends, in ms since the epoch.
     sends: Cell<Option<(u64, u64)>>,
+    /// When the load's last operation was sent, in the agents' time.
+    load_ended: Cell<Option<u64>>,
     jitter: Cell<Mix>,
 }
 
@@ -480,6 +489,16 @@ impl Engine {
                 Timer::after(CUT_POLL - asked.elapsed()).await;
             }
         };
+        let ended = matches!(
+            last,
+            Ok(Response::Workflow {
+                status: WorkflowStatus::Ended(_),
+                ..
+            })
+        );
+        if !ended && closes_after_load(close, self.load_ended.get()) {
+            return self.record(kind, |stats| stats.not_closed += 1);
+        }
         self.done(kind, closed, &last);
     }
 
@@ -729,6 +748,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
             probe: plan.probe,
             flushed: Cell::new((Instant::now(), cpu_seconds())),
             sends: Cell::new(None),
+            load_ended: Cell::new(None),
             jitter: Cell::new(Mix(plan.model.seed ^ plan.driver ^ 0x7177)),
         });
         let every = Duration::from_secs(plan.every_s.max(1));
@@ -783,6 +803,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
                     engine.dispatch(op);
                 }
                 load_cpu = cpu_seconds() - cpu_before;
+                engine.load_ended.set(Some(engine.shared.agent_now()));
                 // The load is sent: its answers, and the reads waiting for
                 // a cut's close, within the drain.
                 let ended = Instant::now();
@@ -830,7 +851,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Routes, unserved};
+    use super::{Routes, closes_after_load, unserved};
     use std::time::{Duration, Instant};
     use vos_wire::ingress::Response;
 
@@ -860,5 +881,15 @@ mod tests {
         // The leader failing too: its place goes on, to a node up first.
         routes.failed(0, &replicas, 3, later);
         assert_eq!(routes.call(0), 0);
+    }
+
+    /// A read at a cut left open is an error while the load runs, and is
+    /// left out once its window closes after the load's last send.
+    #[test]
+    fn a_window_closing_after_the_load_is_not_an_error() {
+        assert!(!closes_after_load(5_000, None), "the load still running");
+        assert!(!closes_after_load(5_000, Some(5_000)));
+        assert!(!closes_after_load(5_000, Some(9_000)), "closed in the run");
+        assert!(closes_after_load(9_000, Some(5_000)));
     }
 }

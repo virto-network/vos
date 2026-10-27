@@ -268,12 +268,20 @@ impl Unit<'_> {
     }
 }
 
-/// The script that stops `units`, each by its unit, and forgets them.
+/// The script that stops `units`, each by its unit, and forgets them; it
+/// fails when one still runs. Each is stopped on its own: `systemctl stop`
+/// given a unit that is not loaded stops none of the others.
 pub fn stop_script(units: &[String]) -> String {
     let names: Vec<String> = units.iter().map(|unit| quote(unit)).collect();
     let names = names.join(" ");
     format!(
-        "systemctl --user stop {names} 2>/dev/null || true\nsystemctl --user reset-failed {names} 2>/dev/null || true\n"
+        "for unit in {names}; do\n\
+         \x20 systemctl --user stop \"$unit\" 2>/dev/null || true\n\
+         \x20 systemctl --user reset-failed \"$unit\" 2>/dev/null || true\n\
+         done\n\
+         for unit in {names}; do\n\
+         \x20 if systemctl --user is-active --quiet \"$unit\"; then echo \"$unit still runs\" >&2; exit 1; fi\n\
+         done\n"
     )
 }
 
@@ -337,9 +345,62 @@ mod tests {
         assert!(script.contains("'taskset' '-c' '0-3' '/d/bin/vos' 'node' 'run'"));
         assert!(script.contains("is-active --quiet 'vos-scale-node-a'"));
         let stop = stop_script(&["vos-scale-node-a".into()]);
-        assert!(stop.starts_with("systemctl --user stop 'vos-scale-node-a'"));
+        assert!(stop.starts_with("for unit in 'vos-scale-node-a'; do"));
         for script in [script, stop] {
             assert!(!script.contains("pkill") && !script.contains("killall"));
         }
+    }
+
+    /// Stopped together, units are refused all at once when one of them is
+    /// not loaded, as systemd does: each is stopped on its own, and a unit
+    /// still running fails the script.
+    #[test]
+    fn every_unit_stops_though_another_is_not_loaded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        // A `systemctl` that keeps each unit's state in a file: `stop` of
+        // several units, or of one not loaded, stops none and fails; the
+        // unit `stuck` never stops.
+        let systemctl = dir.path().join("systemctl");
+        std::fs::write(
+            &systemctl,
+            format!(
+                "#!/bin/bash\nshift\nverb=$1; shift\nstate={}\n\
+                 case $verb in\n\
+                 stop) [ $# -eq 1 ] && [ -e \"$state/$1\" ] || exit 5\n\
+                 \x20 [ \"$1\" = stuck ] || echo inactive > \"$state/$1\";;\n\
+                 is-active) [ \"$(cat \"$state/$2\" 2>/dev/null)\" = active ];;\n\
+                 esac\n",
+                state.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            dir.path().display(),
+            std::env::var("PATH").unwrap()
+        );
+        let run = |units: &[&str]| {
+            let units: Vec<String> = units.iter().map(|unit| unit.to_string()).collect();
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(stop_script(&units))
+                .env("PATH", &path)
+                .status()
+                .unwrap()
+                .success()
+        };
+        for unit in ["node", "sample", "stuck"] {
+            std::fs::write(state.join(unit), "active").unwrap();
+        }
+        assert!(run(&["node", "sample", "drive"]));
+        for unit in ["node", "sample"] {
+            let now = std::fs::read_to_string(state.join(unit)).unwrap();
+            assert_eq!(now.trim(), "inactive", "{unit}");
+        }
+        assert!(!run(&["stuck"]), "a unit still running fails the stop");
     }
 }
