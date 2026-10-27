@@ -81,7 +81,9 @@ pub(crate) struct Stats {
     pub(crate) resume: Histogram,
     /// A signature check of a call or a query, on an executor.
     pub(crate) verify: Histogram,
-    /// A credential proof's verification, on an executor.
+    /// A credential proof's verification waiting for an executor, from
+    /// its verification slot taken, and its run there.
+    pub(crate) credential_queue: Histogram,
     pub(crate) credential: Histogram,
     /// A batch of an agent's root build waiting for an executor, and its
     /// run there: the builds share the executors with the batches.
@@ -146,6 +148,7 @@ impl Stats {
             stage("between", &self.between),
             stage("resume", &self.resume),
             stage("verify", &self.verify),
+            stage("credential_queue", &self.credential_queue),
             stage("credential", &self.credential),
             stage("root_build_queue", &self.root_build_queue),
             stage("root_build", &self.root_build),

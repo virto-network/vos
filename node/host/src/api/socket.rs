@@ -18,7 +18,7 @@ use smol::lock::{Mutex, Semaphore};
 use smol::net::unix::{UnixListener, UnixStream};
 use vos_api::{Event, Framing, Kind, Reader, Requests, error_frame, frame};
 
-use super::{Api, Via};
+use super::{Api, LargePlace, Via};
 use crate::timeout;
 
 /// The most one read takes off the socket.
@@ -168,13 +168,13 @@ async fn connection(
                     let kind = Kind::from_u16(request.kind).expect("the reader's kinds");
                     let (api, writer) = (Arc::clone(&api), Arc::clone(&writer));
                     let runtime = Arc::clone(&api.inner.runtime);
-                    let large = large.take();
+                    let large = large.take().map(|place| Box::new(place) as LargePlace);
                     requests.push(runtime.spawn(async move {
-                        let answer = api.handle(kind, request.body, Via::Socket).await;
+                        let answer = api.handle(kind, request.body, Via::Socket, large).await;
                         let bytes = frame(Framing::Stream, request.kind, request.id, &answer);
                         // Written whole: an answer never interleaves another.
                         let _ = writer.lock().await.write_all(&bytes).await;
-                        drop((slot, large));
+                        drop(slot);
                     }));
                 }
                 Event::Error { error, id } => {

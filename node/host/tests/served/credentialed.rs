@@ -6,7 +6,8 @@
 //! time and one pushed out of the ring, each `RootUnknown` and admitted
 //! after a path refetch; a revoked member's root refused once
 //! `ROOT_MAX_AGE` has passed by batch time; owner proofs paying from their
-//! rows; and no log entry holding a proof.
+//! rows; no log entry holding a proof; and a verified call holding no
+//! large body's place while it waits to apply.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -617,6 +618,61 @@ fn a_replay_and_a_once_race_past_ingress_are_refused_at_apply() {
     assert_eq!(tally + other, 1, "one vote of the nullifier");
     let next = founded.auth(follower, &secret, &path, ("vote_again", "vote/2"), 4u8);
     done(&founded.send(follower, &next));
+}
+
+/// A credentialed call's body takes a place among the node's large bodies
+/// only until its proof is verified: with the leader's refines held, a call
+/// sent to the leader and one sent to a follower and forwarded each give
+/// their places back while they wait to apply, and both then run.
+#[test]
+fn a_verified_call_holds_no_large_place_while_it_waits_to_apply() {
+    let founded = Founded::new();
+    let secret = Secret::new(10);
+    founded.write(CREDENTIALS, "enroll", secret.member());
+    let leader = founded.cluster.leader(founded.agent).unwrap();
+    let follower = founded.follower();
+    let path = founded.path(&secret);
+    let [here, forwarded] =
+        [leader, follower].map(|at| founded.auth(at, &secret, &path, ("login", "login"), ()));
+    let gate = &founded.cluster.slot(leader).trip.refines;
+    let reached = gate.reached();
+    let closed = gate.close();
+    let founded = &founded;
+    let free = |at: NodeNumber| {
+        let node = founded.cluster.node(at).unwrap();
+        node.credentialed_places_free() == vos_http::CREDENTIALED_LARGE
+    };
+    let verified = |at: NodeNumber| {
+        let node = founded.cluster.node(at).unwrap();
+        node.stats()
+            .stages
+            .iter()
+            .find(|stage| stage.name == "credential")
+            .map_or(0, |stage| stage.counts.iter().sum::<u64>())
+    };
+    let answers = std::thread::scope(|scope| {
+        let a = scope.spawn(move || founded.send(leader, &here));
+        vos_checker::wait_until("the call held at refine", Duration::from_secs(30), || {
+            gate.reached() > reached
+        });
+        assert!(free(leader), "the leader's place given back before apply");
+        let before = verified(follower);
+        let b = scope.spawn(move || founded.send(follower, &forwarded));
+        vos_checker::wait_until("the follower verified", Duration::from_secs(30), || {
+            verified(follower) > before
+        });
+        vos_checker::wait_until(
+            "the follower's place given back",
+            Duration::from_secs(5),
+            || free(follower),
+        );
+        assert!(!a.is_finished() && !b.is_finished(), "neither applied yet");
+        drop(closed);
+        [a.join().unwrap(), b.join().unwrap()]
+    });
+    for answer in &answers {
+        done(answer);
+    }
 }
 
 /// A root this replica has not applied is `RootUnknown` there, and

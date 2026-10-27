@@ -234,6 +234,7 @@ mod tests {
             headers: Vec::new(),
             body: body.to_vec(),
             peer: None,
+            large: None,
         }
     }
 

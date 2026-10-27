@@ -52,6 +52,15 @@ pub struct Request {
     pub body: Vec<u8>,
     /// Where the connection came from.
     pub peer: Option<SocketAddr>,
+    /// The body's place among the large bodies the server holds at once,
+    /// if it is large: given back when dropped, so a handler done with
+    /// the body may give it back before it answers.
+    pub large: Option<Large>,
+}
+
+/// A large body's place: see [`Request::large`].
+pub struct Large {
+    _place: Slot,
 }
 
 impl Request {
@@ -255,12 +264,15 @@ async fn connection(
     let mut buffer = Vec::with_capacity(4096);
     loop {
         let (response, next) = match read_request(&mut stream, &mut buffer, peer, shared).await? {
-            Read::Request(request, used, large) => {
+            Read::Request(request, used) => {
                 let close = closes(&request);
+                // The request's bytes leave the buffer before the handler
+                // runs: a large body is held once, by the request, and its
+                // place is held until the handler drops it or answers.
+                buffer.drain(..used);
+                buffer.shrink_to(4096);
                 let response = (shared.handler)(request).await;
-                // The large body's place is held until its answer is out.
-                drop(large);
-                (response, (!close).then_some(used))
+                (response, (!close).then_some(0))
             }
             Read::Answered(response, next) => (response, next),
             Read::Closed => return Ok(()),
@@ -312,9 +324,8 @@ async fn read(
 }
 
 enum Read {
-    /// A request, the bytes of the buffer it used, and its large body's
-    /// place if its body is large.
-    Request(Request, usize, Option<Slot>),
+    /// A request, and the bytes of the buffer it used.
+    Request(Request, usize),
     /// A request answered without the handler: the answer, and the bytes
     /// of the buffer it used if the connection goes on, `None` to close.
     Answered(Response, Option<usize>),
@@ -371,6 +382,7 @@ async fn read_request(
                         .collect(),
                     body: Vec::new(),
                     peer: Some(peer),
+                    large: None,
                 };
                 // Bodies come with a length: chunked ones are not read.
                 if request.header("transfer-encoding").is_some() {
@@ -409,9 +421,9 @@ async fn read_request(
                     let next = (!closes(&request)).then_some(end);
                     return Ok(Read::Answered(answer, next));
                 }
-                let large = match pool.filter(|_| large) {
+                request.large = match pool.filter(|_| large) {
                     Some((held, most)) => match Slot::take(held, most) {
-                        Some(place) => Some(place),
+                        Some(place) => Some(Large { _place: place }),
                         None => return Ok(refuse(503)),
                     },
                     None => None,
@@ -422,7 +434,7 @@ async fn read_request(
                 }
                 fill(stream, buffer, end, limits.idle, deadline).await?;
                 request.body = buffer[head..end].to_vec();
-                return Ok(Read::Request(request, end, large));
+                return Ok(Read::Request(request, end));
             }
             Ok(httparse::Status::Partial) => {
                 if buffer.len() > MAX_HEAD {

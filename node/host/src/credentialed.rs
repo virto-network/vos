@@ -106,11 +106,14 @@ impl From<Refused> for Response {
 
 impl Inner {
     /// A credentialed call to `agent`, as ingress takes it: checked, then
-    /// verified, then run at the agent's leader, here or forwarded.
+    /// verified, then run at the agent's leader, here or forwarded. `large`,
+    /// its body's place if the transport held one, goes with the proof once
+    /// it is verified: a call waiting to apply holds neither.
     pub(crate) async fn credentialed(
         self: &Arc<Self>,
         agent: AgentId,
         call: Credentialed,
+        large: Option<crate::api::LargePlace>,
     ) -> Response {
         let run = match self.present(agent) {
             Ok(run) => run,
@@ -135,12 +138,14 @@ impl Inner {
             return Response::Busy;
         };
         let stats = Arc::clone(&self.stats);
+        let queued = Instant::now();
         let verified = self
             .offload(move || {
                 let started = Instant::now();
+                stats.credential_queue.took(started - queued);
                 let verified = verifier::verify_bytes(kind, &words, &proof).is_ok();
                 stats.credential.took(started.elapsed());
-                drop(place);
+                drop((place, proof, large));
                 verified
             })
             .await;
