@@ -1,8 +1,9 @@
-//! Proving and verifying: each kind proved under format 42 on the
+//! Proving and verifying: each kind proved under format 44 on the
 //! Blake2s-M31 channel and verified by the final verifier against its
 //! pinned program; the pins computed from the circuits; the joint circuit
-//! and format 44 proved and verified; the prover generic over the channel;
-//! the built set's shape the registry's reference.
+//! proved and verified, and a proof under the retired 42's parameters
+//! refused; the prover generic over the channel; the built set's shape the
+//! registry's reference.
 
 use num_traits::Zero;
 use stwo::core::air::Component;
@@ -16,9 +17,7 @@ use vos_pvm_final_verifier::credential::{
     self as verifier, AUTH_PROGRAM, AUTH_ROOT, CredentialProof, MAX_PROOF_BYTES, OWNER_PROGRAM,
     OWNER_ROOT, PINS,
 };
-use vos_pvm_proof::format::{
-    CREDENTIAL_PROOF, CREDENTIAL_PROOF_44, CREDENTIAL_REFERENCE, Format, FormatParams,
-};
+use vos_pvm_proof::format::{CREDENTIAL_PROOF, CREDENTIAL_REFERENCE, Format, FormatParams};
 use vos_pvm_proof::security::{SecurityShape, proven_count};
 use vos_pvm_recair::credential::{self, LOG_SIZES, Statement};
 use vos_pvm_recair::masked::MaskRng;
@@ -32,7 +31,7 @@ use vos_pvm_recair_air::masked::{
 use crate::common::Rng;
 use crate::support::{self, auth, joint, owner_statement};
 
-/// `statement`'s proof under format 42.
+/// `statement`'s proof under format 44.
 pub fn prove(statement: &Statement) -> CredentialProof {
     credential::prove(statement, MaskRng::default())
         .expect("the statement proves")
@@ -73,15 +72,15 @@ fn the_pinned_programs_are_the_circuits() {
     .unwrap()
     .0;
     assert!(!roots.contains(&joint));
-    // Format 44 commits the same columns at the same blowup: one root,
-    // another program id, which hashes the format.
-    let at_44 = credential::preprocessed_root::<Blake2sM31MerkleChannel>(
-        &CREDENTIAL_PROOF_44,
+    // The retired 42 committed the same columns at the same blowup: one
+    // root, another program id, which hashes the format.
+    let at_42 = credential::preprocessed_root::<Blake2sM31MerkleChannel>(
+        &retired_42(),
         &credential::circuit(Some(CredentialKind::Auth)),
     )
     .unwrap()
     .0;
-    assert_eq!(at_44, AUTH_ROOT);
+    assert_eq!(at_42, AUTH_ROOT);
     let params = |format: &Format| {
         let p = format.params;
         [
@@ -95,8 +94,8 @@ fn the_pinned_programs_are_the_circuits() {
     };
     assert_ne!(
         vos_pvm_recair_air::credential::program_id(
-            44,
-            params(&CREDENTIAL_PROOF_44),
+            42,
+            params(&retired_42()),
             &LOG_SIZES,
             &AUTH_ROOT
         ),
@@ -104,7 +103,21 @@ fn the_pinned_programs_are_the_circuits() {
     );
 }
 
-/// Auth and owner prove under format 42 and verify against their kinds'
+/// The retired format 42: 43 queries and PoW 20, its number refused by
+/// the registry; the tests prove under it to show 44 refuses its proofs.
+fn retired_42() -> Format {
+    Format {
+        number: 42,
+        params: FormatParams {
+            n_queries: 43,
+            pow_bits: 20,
+            ..CREDENTIAL_PROOF.params
+        },
+        ..CREDENTIAL_PROOF
+    }
+}
+
+/// Auth and owner prove under format 44 and verify against their kinds'
 /// programs, from the proof and from its bytes; the bytes within ingress's
 /// cap, decoded only whole and canonical.
 #[test]
@@ -152,10 +165,10 @@ fn the_slot_does_not_move_the_shape() {
 }
 
 /// Membership and payment together proves and verifies over its own
-/// circuit, measured and not admitted; and auth under format 44, the
-/// alternative counted beside 42.
+/// circuit, measured and not admitted; and auth under the retired 42's
+/// parameters is refused under 44.
 #[test]
-fn the_joint_circuit_and_format_44_prove_and_verify() {
+fn the_joint_circuit_proves_and_a_retired_42_proof_is_refused() {
     let statement = joint(3);
     let finalized = credential::witness(&statement).unwrap();
     let root = credential::preprocessed_root::<Blake2sM31MerkleChannel>(
@@ -182,7 +195,7 @@ fn the_joint_circuit_and_format_44_prove_and_verify() {
     let statement = auth(4);
     let finalized = credential::witness(&statement).unwrap();
     let (proof, _) = credential::prove_on::<Blake2sM31MerkleChannel>(
-        &CREDENTIAL_PROOF_44,
+        &retired_42(),
         &finalized.circuit,
         &finalized.witness,
         MaskRng::default(),
@@ -190,7 +203,7 @@ fn the_joint_circuit_and_format_44_prove_and_verify() {
     .unwrap();
     let root = stwo::core::vcs::blake2_hash::Blake2sHash(AUTH_ROOT);
     credential::verify_on::<Blake2sM31MerkleChannel>(
-        &CREDENTIAL_PROOF_44,
+        &retired_42(),
         root,
         &statement.words(),
         &proof,
@@ -204,12 +217,12 @@ fn the_joint_circuit_and_format_44_prove_and_verify() {
             &proof
         )
         .is_err(),
-        "a format-44 proof is not a format-42 proof"
+        "a format-42 proof is not a format-44 proof"
     );
 }
 
 /// The prover and the verifier are generic over the channel: auth on the
-/// plain Blake2s trees, under format 42's parameters, and a tampered
+/// plain Blake2s trees, under format 44's parameters, and a tampered
 /// sample refused.
 #[test]
 fn the_prover_is_generic_over_the_channel() {
@@ -290,13 +303,13 @@ fn credential_shape() -> SecurityShape {
     }
 }
 
-/// The registry's reference for formats 42 and 44 is the built set's
-/// shape, field for field.
+/// The registry's reference for format 44 is the built set's shape, field
+/// for field, and 47 is the least query count clearing 62 bits on it.
 #[test]
 fn the_credential_reference_shape_is_the_built_sets() {
     let built = credential_shape();
     assert_eq!(built, CREDENTIAL_REFERENCE);
-    for format in [CREDENTIAL_PROOF, CREDENTIAL_PROOF_44] {
+    for format in [CREDENTIAL_PROOF, retired_42()] {
         let count = proven_count(&format.params, &built).unwrap();
         eprintln!("format {}: {count:.3} proven bits", format.number);
         assert!(count >= 62.0);

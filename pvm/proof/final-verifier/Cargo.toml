@@ -3,7 +3,7 @@ name = "vos-pvm-final-verifier"
 edition.workspace = true
 version.workspace = true
 license = "Apache-2.0"
-description = "The final wrap's verifier: a format-39 proof (masked, its fixed layout) against its 24 public words, the program id and the io-hash; format 28 under `test-formats`; and credential proofs, format 42. no_std, for x86, wasm32 and the PVM."
+description = "The final wrap's verifier: a format-39 proof (masked, its fixed layout) against its 24 public words, the program id and the io-hash; format 28 under `test-formats`; and credential proofs, format 44. no_std, for x86, wasm32 and the PVM."
 
 [features]
 # Format 28, the unmasked wrap, and its postcard decode: the tests' and the

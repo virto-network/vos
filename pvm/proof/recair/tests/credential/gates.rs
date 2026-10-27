@@ -48,7 +48,7 @@ fn credential_proof(proof: MaskedProof<Hasher>) -> CredentialProof {
 }
 
 /// `finalized`'s witness proved over `circuit` (its own or the pinned one)
-/// under format 42, held to `checks`, the trace through `tamper`.
+/// under format 44, held to `checks`, the trace through `tamper`.
 fn forced(
     circuit: &vos_pvm_recair::Circuit,
     finalized: &Finalized<SecureField>,
@@ -178,7 +178,7 @@ fn an_honest_proof_of_another_statement_is_refused() {
         );
     }
     let mut relabelled = proof.clone();
-    relabelled.format_version = 44;
+    relabelled.format_version = 42;
     assert!(matches!(verify(&statement, relabelled), Err(Error::Format)));
 
     let owner = owner_statement(34);

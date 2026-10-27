@@ -35,7 +35,7 @@ use crate::value::{Value, embed};
 /// A digest's eight words, each below `p`.
 pub type Words = [u32; DIGEST_WORDS];
 
-/// Each component's rows: the masking's floor under format 42, `4h`.
+/// Each component's rows: the masking's floor under format 44, `4h`.
 pub const ROWS: [usize; 2] = [1 << 11, 1 << 11];
 
 /// The tags' blocks a circuit's rows hold: `T(member)`, `T(owner)`,

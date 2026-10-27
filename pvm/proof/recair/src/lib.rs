@@ -33,7 +33,7 @@
 //! - [`tree`] proves a run's tree node by node: leaves, folds, the wrap.
 //! - [`credential`] proves the credential statements (auth, owner, and
 //!   membership and payment together) masked over `p2` and `qm31` alone,
-//!   under format 42 on the Blake2s-M31 channel.
+//!   under format 44 on the Blake2s-M31 channel.
 
 pub mod circuit;
 pub mod compile;
