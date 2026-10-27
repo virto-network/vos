@@ -23,11 +23,11 @@ use vos_pvm_final_verifier::credential::{
     self as verifier, AUTH_ROOT, CREDENTIAL, CredentialProof, OWNER_ROOT,
 };
 use vos_pvm_proof::format::CREDENTIAL_PROOF;
-use vos_pvm_recair::ProveError;
 use vos_pvm_recair::context::Finalized;
 use vos_pvm_recair::credential::{self, Forge, Statement, Tags, Words};
 use vos_pvm_recair::masked::{Checks, MaskRng, MaskedProof};
 use vos_pvm_recair::trace::MainTrace;
+use vos_pvm_recair::{Entry, P2Mode, ProveError, WiringError};
 use vos_pvm_recair_air::credential::CredentialKind;
 use vos_wire::credentials::Tag;
 
@@ -128,7 +128,9 @@ fn a_statement_its_witness_does_not_satisfy_is_refused() {
 }
 
 /// An honest proof under another binding, another kind word, another
-/// kind's circuit, or another format's pins: refused.
+/// kind's circuit, or another format's pins: refused; and under
+/// `verify_with`, which counts no words, one word fewer or one more: an
+/// output yielded and not used, or a use not yielded.
 #[test]
 fn an_honest_proof_of_another_statement_is_refused() {
     let statement = auth(33);
@@ -162,6 +164,19 @@ fn an_honest_proof_of_another_statement_is_refused() {
         verifier::verify_with(&CREDENTIAL, &OWNER_ROOT, &words, proof.clone()),
         Err(Error::Circuit)
     ));
+    let mut short = words.clone();
+    short.pop();
+    let long = [words.as_slice(), &[0]].concat();
+    for wrong in [short, long] {
+        assert!(
+            matches!(
+                verifier::verify_with(&CREDENTIAL, &AUTH_ROOT, &wrong, proof.clone()),
+                Err(Error::Logup | Error::InteractionPow)
+            ),
+            "{} words under verify_with",
+            wrong.len()
+        );
+    }
     let mut relabelled = proof.clone();
     relabelled.format_version = 44;
     assert!(matches!(verify(&statement, relabelled), Err(Error::Format)));
@@ -365,4 +380,36 @@ fn a_tagged_rows_bit_is_zero() {
     let proof = forced(&finalized.circuit, &finalized, tamper, Checks::ALL)
         .expect("every constraint holds at b = 1");
     assert!(matches!(verify(&statement, proof), Err(Error::Logup)));
+}
+
+/// A tagged row whose message is no wire: the leaf's row reading a free
+/// message instead of the member digest's wire, the member row's yield
+/// balanced to the use it lost. Refused by the wiring check, which only a
+/// node's free sibling passes.
+#[test]
+fn a_tagged_rows_free_message_is_refused() {
+    let mut circuit = credential::circuit(Some(CredentialKind::Auth));
+    circuit
+        .check_wiring_without_h8()
+        .expect("the pinned circuit's wiring");
+    let tagged: Vec<usize> = (0..circuit.p2.len())
+        .filter(|&row| circuit.p2[row].mode == Some(P2Mode::Tagged))
+        .collect();
+    let leaf = tagged[1];
+    let removed = circuit.p2[leaf].m[0];
+    assert!(
+        removed.multiplicity > 0,
+        "the leaf's row uses the member wire"
+    );
+    circuit.p2[leaf].m[0] = Entry::FREE;
+    let member = circuit
+        .p2
+        .iter_mut()
+        .find(|row| row.out_address == removed.address)
+        .expect("the member row yields it");
+    member.out_multiplicity[0] += removed.multiplicity;
+    assert_eq!(
+        circuit.check_wiring_without_h8(),
+        Err(WiringError::FreeMessageAbsorbed { row: leaf })
+    );
 }

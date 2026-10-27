@@ -227,6 +227,10 @@ impl Circuit {
     /// ([`Circuit::check_wiring`], which every caller runs first, refuses
     /// one without `h8`; its sizes are [`Circuit::log_sizes_without_h8`]).
     pub fn log_sizes(&self) -> [u32; 3] {
+        debug_assert!(
+            !self.h8.is_empty(),
+            "a circuit without h8 has two log sizes, log_sizes_without_h8's"
+        );
         [self.p2.len(), self.qm31.len(), self.h8.len()].map(|rows| rows.ilog2())
     }
 
