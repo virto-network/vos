@@ -16,7 +16,9 @@ use stwo::core::{
 use crate::security::SecurityShape;
 use stwo_constraint_framework::TraceLocationAllocator;
 
-pub use crate::lookups::{AllLookupElements, RelationChallenges, boundary_relation_challenges};
+pub use crate::lookups::{
+    AllLookupElements, MAX_RELATION_WIDTH, RelationChallenges, boundary_relation_challenges,
+};
 use crate::pcs::FsChannel;
 
 use crate::BASE_COMPONENTS;

@@ -31,7 +31,8 @@ vos-pvm-recair-air = { path = "../../../pvm/proof/recair-air" }
 vos-pvm-compiler = { path = "../../../pvm/compiler" }
 vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles" }
 vos-tree = { path = "../../../agent/tree" }
-stwo = { git = "https://github.com/olanod/stwo", rev = "c3ec981357a0053e373e00f1057ec5a62675f7eb", default-features = false, features = ["std", "prover", "parallel"] }
+vos-wire = { path = "../../../agent/wire" }
+stwo = { git = "https://github.com/olanod/stwo", rev = "4cd1f83ff4c090afcd3362e27e2d34eb634a0161", default-features = false, features = ["std", "prover", "parallel"] }
 postcard = { version = "1", features = ["alloc"] }
 sha2 = "0.10"
 mimalloc = { version = "0.1", optional = true, default-features = false }

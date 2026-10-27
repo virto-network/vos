@@ -108,6 +108,12 @@ pub const DEVICE_OPTIONAL: u32 =
 /// Every chip a device shape may hold.
 pub const DEVICE_ALL: u32 = DEVICE_ALWAYS | DEVICE_OPTIONAL;
 
+/// The most rows a device program's chip takes, `2^16` (pin J: one segment
+/// of at most `2^16` steps): the device format's security count is taken
+/// with every chip at it (`format::DEVICE_REFERENCE`), so a program with a
+/// taller chip is refused at install.
+pub const DEVICE_MAX_LOG_SIZE: u32 = 17;
+
 const _: () = {
     let mut mask = 0u32;
     let mut i = 0;

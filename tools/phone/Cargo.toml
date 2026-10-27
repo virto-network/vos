@@ -3,7 +3,7 @@ name = "vos-phone"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "The phone bench, which no VOS node links: the device library's credential proofs timed on a phone and on x86, verified, their memory measured, the PoW grinds timed, and a seeded build's proofs compared byte for byte with x86's."
+description = "The phone bench, which no VOS node links: the device library's credential proofs timed on a phone and on x86, verified, their memory measured, the PoW grinds timed, and a seeded build's proofs compared byte for byte with x86's; and device kernels proved under the device profile at candidate parameters."
 publish = false
 
 [[bin]]
@@ -22,6 +22,12 @@ mimalloc = ["dep:mimalloc"]
 [dependencies]
 vos-device = { workspace = true }
 vos-wire = { workspace = true }
+# The device profile's masked prover and verifier, and its format.
+vos-pvm-proof = { workspace = true }
+vos-pvm-recair = { workspace = true }
+vos-pvm-recair-air = { workspace = true }
+serde = { workspace = true }
+postcard = { version = "1", features = ["alloc"] }
 stwo = { workspace = true }
 rayon = { workspace = true }
 sha2 = "0.10"

@@ -3,3 +3,4 @@ target-*/
 data/
 phone-dist/s7-*
 !phone-dist/*.sha256
+kernels/

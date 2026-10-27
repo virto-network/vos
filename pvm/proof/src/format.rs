@@ -283,13 +283,24 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
     composition_point_doublings: 0,
 };
 
-/// Every chip of the segment AIR at 2^16 rows, a phone's segment.
+/// The device format's reference (pin J), format 43's: the device set
+/// (`vos_pvm_proof::device`) with every chip a device program may hold at
+/// `2^16` rows (`device::DEVICE_MAX_LOG_SIZE`, which install enforces),
+/// masked under variant (c): its columns at degree bound 2^17, the
+/// composition whole at 2^18, sampled at `π(z)`; 7,548 values in the DEEP
+/// batch, 4,292 constraints, every fraction a masked row evaluates (the
+/// blinding's among them), the widest relation's 265 limbs. A test in
+/// `vos-pvm-recair` derives it from the built set.
 pub const DEVICE_REFERENCE: SecurityShape = SecurityShape {
-    log_degree_bound: 16,
-    log_trace_length: 16,
-    log_composition_degree_bound: 17,
-    logup_fractions: 97_124_352,
-    ..SEGMENT_REFERENCE
+    log_degree_bound: 18,
+    log_trace_length: 17,
+    log_composition_degree_bound: 18,
+    sampled_values: 7_548,
+    max_samples_per_column: 3,
+    constraints: 4_292,
+    logup_fractions: 77_529_088,
+    relation_width: SEGMENT_RELATION_WIDTH,
+    composition_point_doublings: 1,
 };
 
 /// The recursion AIR's padded shape (`recursion-air.md` §0, §1.2): `p2`,
@@ -395,7 +406,7 @@ const DEVICE: FormatParams = FormatParams {
     fold_step: 1,
     log_last_layer: 0,
     interaction_pow_bits: 8,
-    batching: DeepBatching::Powers,
+    batching: DeepBatching::Affine,
 };
 
 const INNER_FLOOR: SecurityFloor = SecurityFloor {
@@ -504,14 +515,24 @@ pub const MASKED_WRAP: Format = Format {
     },
 };
 
+/// Format 43's masking: 8 salt columns a tree; an `R` of 8 columns; and
+/// `h = 1,024`, at least `2(4|O| + q(|O| + 1)) = 532` for `q = 86` queries
+/// and `|O| = 2` offsets, so each component pads to `4h = 2^12` rows.
+pub const DEVICE_MASKING: Masking = Masking {
+    salt_columns: 8,
+    fri_mask_columns: 8,
+    log_mask_rows: 10,
+};
+
+/// Device proofs, masked: see the module's notes.
 pub const DEVICE_PROOF: Format = Format {
-    number: 37,
+    number: 43,
     kind: ProofKind::Device,
     channel: ChannelKind::Blake2sM31,
     params: DEVICE,
     bytes: ProofBytes::Postcard,
     masked: true,
-    masking: None,
+    masking: Some(DEVICE_MASKING),
     floor: INNER_FLOOR,
     status: Status::Reserved,
     reference: DEVICE_REFERENCE,
@@ -564,8 +585,8 @@ pub const REGISTRY: [Format; 6] = [
     WRAP,
     LEAF_FOLD,
     SEGMENT,
-    DEVICE_PROOF,
     MASKED_WRAP,
+    DEVICE_PROOF,
     CREDENTIAL_PROOF,
 ];
 
@@ -591,7 +612,7 @@ pub const REGISTRY: [Format; 6] = [
 ///   it, so no later format takes it.
 ///
 /// So a number names one AIR and one set of parameters.
-pub const RETIRED: [u32; 12] = [24, 25, 26, 27, 29, 30, 31, 33, 34, 36, 40, 42];
+pub const RETIRED: [u32; 13] = [24, 25, 26, 27, 29, 30, 31, 33, 34, 36, 37, 40, 42];
 
 /// The entry for `number`, admitted or not.
 pub fn lookup(number: u32) -> Option<&'static Format> {
@@ -671,12 +692,12 @@ mod tests {
             .security_shape(&refs)
     }
 
-    /// The registry's segment and device reference shapes are the segment
-    /// AIR's, every chip at 2^20 and 2^16 rows.
+    /// The registry's segment reference shape is the segment AIR's, every
+    /// chip at 2^20 rows (the device's, the masked device set's, is
+    /// `vos-pvm-recair`'s device tests').
     #[test]
     fn the_reference_shapes_are_the_segment_airs() {
         assert_eq!(segment_air_shape(20, &SEGMENT), SEGMENT_REFERENCE);
-        assert_eq!(segment_air_shape(16, &DEVICE_PROOF), DEVICE_REFERENCE);
         assert_eq!(
             crate::lookups::MAX_RELATION_WIDTH as u64,
             SEGMENT_RELATION_WIDTH

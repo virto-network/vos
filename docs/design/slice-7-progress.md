@@ -2123,6 +2123,76 @@ the device suite 24 of 24 (`heavy` gated off), the device degree audit,
 byte), `just check` green (1,466 passed in 106 suites; 12 GiB scope,
 `nice -n 10`, 10 jobs).
 
+## Step 7.16: the device parameters, measured
+
+Branch `s7/7.16`, from vos-core `4a143e9f`. **Stopped at** (work in
+progress, wound down for the owner's quota; nothing pushed to the phone,
+no phone session started, no run left going):
+
+**Built (uncommitted parts committed here as WIP, not gated):**
+- `pcs.rs`: Blake2s-M31's `mix_bytes` packs four bytes a little-endian
+  word, the last zero-padded (7.10's review L2), with a unit test. Nothing
+  calls it on that channel (the unmasked segment prover is the only
+  `mix_bytes` caller, and no format on Blake2s-M31 is built there; the
+  masked transcripts mix public values as felts), so no fixture should
+  move: to be confirmed by `fixtures::` and `constants::` in `test-proof`.
+- `format.rs`: format 43 registered (Reserved), `DEVICE_MASKING` (`h =
+  1,024`), affine batching, tentative parameters blowup 2, 86 queries, PoW
+  20; 37 retired; `DEVICE_REFERENCE` now the masked device set's shape
+  (derived by `recair/tests/device/format.rs`). `device::DEVICE_MAX_LOG_SIZE`
+  and `install` refusing a chip above it.
+- The spike: `guest`'s `auth_p2` (auth over the credential actor's
+  Poseidon2 tree through `0x402`, pin J's public words, the path walked by
+  masks); `pvm-proof.patch` admits `0x402` in derivation;
+  `harness kernels` writes `kernels/{b2,p2}.{kernel,input}`; the harness's
+  stwo pin moved to `4cd1f83f`; `scripts/x86-params.sh`.
+- `tools/phone`: `vos-phone device` (device cells
+  `statement/blowup:queries:pow/channel`, `b2sm31` or `b2b`, each in a
+  child process: install, warm-ups, timed proves, verify, bytes, peak).
+
+**Measured so far** [measured, x86, not timing]:
+- The kernels: `b2` 19,240 steps (981 B input), `p2` 18,733 steps (1,189 B
+  input): the Poseidon2 statement is not shorter in steps (argument
+  decoding and copying, the selects; lever 3's material).
+- **The memory ledger is at 2^17 rows** for both statements (shape `p2`:
+  `[15, 11, 11, 17, 13, 13, 16, 11, 11, 15, 11, …, 12, 11, 11, 16]` in
+  `DEVICE_ORDER`; 7.15's record said 2^16), so `DEVICE_MAX_LOG_SIZE` was
+  raised from 16 to 17 and the reference must be re-pinned at 2^17.
+- Counts on the masked reference at 2^16 (affine / powers): 1:86:20 62.80
+  / 61.92; 1:87:20 63.28 / 62.34; 2:43:20 62.86 / 62.19; 2:47:16 62.84 /
+  62.14; 3:29:20 63.35 / 62.67; conjectured 106, 107, 106, 110, 107.
+  Smaller programs count more (2^11 62.90 … 2^16 62.80 at 1:86:20 affine).
+- At 2^17 (`SecurityShape { 19, 18, 19, 7,548, 3, 4,292, 155,058,176,
+  265, 1 }`), the least queries clearing 62: blowup 2 PoW 20 87 by powers,
+  **85 affine**; blowup 4 PoW 20 43; blowup 4 PoW 16 47; blowup 8 PoW 20
+  29 (either batching).
+
+**Remains:**
+- Re-pin `DEVICE_REFERENCE` to the 2^17 shape above, update
+  `format.rs`'s doc line (7,548 values, 4,292 constraints, 2^17), restore
+  the candidate assertions in `recair/tests/device/format.rs` (remove the
+  `continue`, fill the 2^17 bits, drop the `least` printout or make it an
+  assertion), and the `the_unmasked_counts_do_not_move`/bit tests.
+- The x86 matrix (every candidate, `p2` and `b2`, Blake2s-M31 and
+  Blake2b-256), then session P4 on the phone (build `just phone`; push
+  `vos-phone-timing` and `kernels/` under `/data/local/tmp/`), then the pin
+  (fastest within 1 GiB and 1.5 MiB by median and p95), the module docs,
+  `SECURITY.md`'s table, pin J and `proving.md` §8's format 43, PG2's
+  standing and the lever ranking, this record, the gates, the Opus review.
+- Remove the temporary panic message in `tools/phone/src/device.rs`'s
+  install (keep it or reword), and add `x86-params.sh`'s run.
+
+**Next commands** (from the worktree; `TMPDIR` on disk, `CARGO_INCREMENTAL=0`,
+each under `systemd-run --user --scope -q -p MemoryMax=12G -p
+MemorySwapMax=0 nice -n 10`, `-j 6`):
+1. `cargo test --release -p vos-pvm-recair --test device format:: -- --nocapture`
+   after the re-pin.
+2. `cargo build --release -p vos-phone`, then
+   `spikes/s7-device/scripts/x86-params.sh target/release/vos-phone spikes/s7-device/kernels spikes/s7-device/runs/x86-params.jsonl`
+   (the kernels regenerate with `scripts/tree.sh`, the harness built there,
+   `s7-device gen <elf> data` and `s7-device kernels <elf> data kernels`).
+3. `just phone`; P4 under the phone rules; then the record and the gates.
+
 ## Step 7.10b: the node API and the gateway
 
 Branch `s7/7.10b`, from vos-core `ad1ff380`. The brief, `node-api.md`,

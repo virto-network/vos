@@ -24,6 +24,8 @@ bench = false
 vos-sdk = { path = "../../../agent/sdk" }
 vos-tree = { path = "../../../agent/tree" }
 vos-pvm-precompiles = { path = "../../../pvm/proof/precompiles" }
+# The credential tree's hash and tags.
+vos-wire = { path = "../../../agent/wire" }
 
 [profile.release]
 opt-level = 3

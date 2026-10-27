@@ -30,7 +30,7 @@ use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::{CommitmentSchemeProver, ComponentProver};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, verify_masked};
-use vos_pvm_proof::device::{DeviceLayout, device_chips_of_code};
+use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceLayout, device_chips_of_code};
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{
@@ -118,7 +118,8 @@ pub fn device_shape(
 /// Kernel `blob`'s device program under `format` on `MC`'s trees, at the
 /// chips `active` and the log sizes `log_sizes`: its layout and its
 /// preprocessed root, computed from the kernel alone. Refused when `active`
-/// is not the chips its code reaches, or a log size is under its floor.
+/// is not the chips its code reaches, a log size is under its floor, or one
+/// is above `DEVICE_MAX_LOG_SIZE`, where the format's count stops holding.
 pub fn install<MC: MerkleChannel>(
     format: &Format,
     blob: &[u8],
@@ -143,6 +144,11 @@ where
     ))?;
     if floors.len() != log_sizes.len() || log_sizes.iter().zip(&floors).any(|(s, f)| s < f) {
         return Err(ProveError::TraceShape("a log size under its floor"));
+    }
+    if log_sizes.iter().any(|&size| size > DEVICE_MAX_LOG_SIZE) {
+        return Err(ProveError::TraceShape(
+            "a log size above the device format's reference",
+        ));
     }
     let preprocessed = device_preprocessed(&code, &layout, active, log_sizes)
         .map_err(|error| ProveError::Segment(error.to_string()))?;
