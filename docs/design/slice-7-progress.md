@@ -2481,3 +2481,119 @@ the no-std builds, the lints, the core crates and `test-recair`; in the
 agent crates only `prover::a_leader_change_submits_a_recorded_statement_once`
 failed (the known flake, being fixed apart), and the agent crates rerun
 with `--no-fail-fast` passed 627 of 627 in 43 suites, `test-reads` 7 of 7.
+
+## Step 7.6: the scale runs
+
+From vos-core `84607818`, on `s7/7.6`. Run 1 only; runs 2–6 wait for a
+quiet desktop, which the owner schedules.
+
+**The harness, three commits:**
+- **Reads at a cut left open by the run's end** are counted apart
+  (`not_closed`): a read still `Attesting` when the driver gives up, its
+  window closing after the load's last send, is neither answered nor an
+  error; the report gives it as "N not closed in the run". Tests: the
+  verdict, the counts, the report's line.
+- **`down` stopped nothing on a node host.** `systemctl --user stop A B C`
+  with one unit not loaded (a node host has no driver unit) stops none of
+  them, and the script hid the error: the smoke's nodes and samplers ran
+  on for 40 minutes after its report, and the next `check` refused the
+  ports. Each unit is now stopped on its own, and the script fails when one
+  still runs. Test: a stand-in `systemctl` that refuses as systemd does.
+- **Agents are created sixteen at once.** Each creation mostly waits for
+  its group's first election, about 2 s: 10,000 idle agents took over five
+  hours one at a time, and now 26 minutes (0.15–0.17 s an agent).
+  Placements are still drawn in order from the seed.
+
+`cargo test -p vos-scale` green (48), clippy clean.
+
+**Run 1, the per-replica cost** [measured; `~/vos-scale/runs/`
+`20261026T211953Z-r1-idle-1k`, `20261026T224431Z-r1-idle-5k`,
+`20261026T225257Z-r1-idle-10k`]:
+- **The setup:** S35's layout, the three nodes on compumax (Threadripper
+  2990WX, cores 0-3, 4-7 and 8-11, `performance`, one Samsung 970 PRO,
+  1 GbE wired), the driver and the coordinator on the desktop over Wi-Fi
+  (S45, S52: its round trips p50 1.0 ms, p99 2.4 ms). Every agent has three
+  replicas on three nodes, so each node holds every agent: `I` idle agents
+  are `I` replicas a node.
+- **The command:** `vos-scale run --shards 8 --idle I --users 1000
+  --rate 10 --secs 2100`, `I` = 1,000, 5,000 and 10,000: the same seed, the
+  same light load (10 calls a second, the default mix) and the same
+  placements of the shards. The window is the load past its 10 s ramp,
+  34.5–34.7 minutes, every agent created before it.
+- **The numbers,** per node, the mean of the three (each node within a
+  few percent of the others):
+
+| replicas a node | RSS at the window's start | node CPU | `vos-node` thread | its wakes/s | all wakes/s | `late` p50/p99/p99.9 |
+|---|---|---|---|---|---|---|
+| 1,008 | 307 MiB | 7.4% of a core | 2.9% | 957 | 2,250 | 8 / 192–320 / 1,280–1,536 µs |
+| 5,008 | 1,182 MiB | 9.8% | 5.1% | 2,648 | 3,874 | 7 / 192–320 / 1,280–1,536 µs |
+| 10,008 | 2,272 MiB | 12.6% | 7.6% | 4,579 | 5,768 | 8 / 192–224 / 1,280 µs |
+
+- **Per 1,000 idle replicas** (the slope from 1,008 to 10,008): **218 MiB
+  of RSS**, 0.58% of a core, 0.40 wakes a second a replica on the runtime
+  thread. The intercept, a node with no idle agents, is about 87 MiB.
+  0 elections and 0 leader changes in all three runs, over 30,024 groups
+  at 10k. The load's own numbers did not move with `I`: 21,046 calls
+  answered in each run, no error, transfers p99 41 ms, disk 15.6–15.7%
+  busy at 0.8 ms an I/O in each.
+- **T3** (10^4 agents a space, at most 5% of a core and 64 MiB per 1,000
+  replicas): the 10k run is T3's shape, every node holding 10^4 replicas.
+  **CPU met** (0.58% of a core per 1,000, nine times under); **RSS missed,
+  3.4 times over** (218 MiB per 1,000; 2.2 GiB a node for idle agents).
+
+**The binding resource is memory, and the first suspect binds:**
+- **The group inbox, allocated whole at creation.** Each group's inbox is
+  `smol::channel::bounded(GROUP_INBOX)`, 1,024 slots
+  (`node/host/src/node/directory.rs`), and a bounded `concurrent-queue`
+  allocates and stamps every slot when it is made. A slot is the stamp and
+  a `group::Input`, 176 bytes [measured, `size_of`], so 184 bytes, and
+  1,024 of them are 184 KiB a group: **about 84% of the 218 KiB a replica
+  costs**, in a queue an idle group never fills. The rest, about 34 KiB a
+  replica, is the group's tasks, its Raft core and its shared state; that
+  alone would meet T3 (34 MiB per 1,000).
+- **Idle Raft timers wake, but do not bind here.** The runtime thread's
+  wakes grow by 0.40 a replica a second, what the code predicts: a
+  follower's election deadline fires every 1.5–3 s (pushed out by the pair
+  heartbeat once awake), a leader's check-quorum every 3 s, with no
+  per-group heartbeats while idle. At 10k they cost the runtime thread
+  7.6% of a core against 2.9% at 1k, and its `late` did not move: the
+  timers are not what binds at 10^4.
+- **A growth with the load, not with `I`:** RSS grew by 136–141 MiB over
+  each window, linearly (3.9 MiB a minute, about 6.5 KB a call), the same
+  at 1k, 5k and 10k. Not yet attributed; the suspect is the Raft entry
+  cache (`cache_bytes`, 16 MiB a group by default, 8 shards here: 128 MiB
+  at most), with the accounts' and sessions' rows. Not run long enough to
+  see whether it levels.
+
+**What this means for runs 2–6 and the levers:**
+- **Run 4 cannot run as built.** 10^5 idle agents are 10^5 replicas a node
+  here: at 218 KiB each, 21 GiB a node, past the units' 8 GiB cap and,
+  three nodes together, past compumax's 62 GiB. The inbox lever comes
+  first: allocate it as it fills (a channel without slots reserved, its
+  bound kept by a count), or a much smaller bound. That would bring a
+  replica to about 34 KiB, 10^5 to about 3.4 GiB a node.
+- **Quiescing idle groups is run 4's second lever.** At 10^5 replicas the
+  timers' slope gives about 40,000 wakes a second and about 58% of a core
+  on the one runtime thread, which 7.5 already found 81–85% busy under
+  load. Run 4 will likely meet it once the inbox is fixed.
+- **Runs 2, 3, 5 and 6 (`K` = 64, few idle agents):** the per-replica
+  cost is negligible there (64 replicas a node, 14 MiB). The load-driven
+  growth matters for T6: if it is the entry cache, 64 shards may hold up
+  to 1 GiB a node before it levels, and T6's flat RSS is judged after it.
+- **Creating 10^5 agents** at sixteen at once would take about 4.5 hours:
+  run 4 wants more creators.
+- **Reads at a cut need `--representative`** (below).
+
+**Odd, and recorded:**
+- **Every read at a cut failed, in every run, while the load ran:**
+  94–98 `Workflow(Attesting)` a run, only 1–5 of them left open by the
+  run's end. A read is served once the representative's `Closed` for its
+  window applies (7.3, C9), and these runs, as the smoke, had no
+  representative: no window ever closes. The smoke's 14 errors were this,
+  not the run's end. Runs 2–6 pass `--representative`; the harness could
+  refuse a mix with reads at a cut and no representative.
+- compumax's clock read 16–34 ms ahead of the desktop's, both synced:
+  under `check`'s 100 ms bound, but in every latency that crosses the two.
+- The desktop's governor was `powersave` (warned), harmless for run 1:
+  the driver used 0.01 cores.
+- `owner-decisions.md` has no S53; S35, S36, S45 and S52 were read.
