@@ -33,7 +33,7 @@ use vos_wire::peer::{NodeNumber, Placement};
 use crate::Hooks;
 use crate::blobs::{Blobs, Keep};
 use crate::executor::Executors;
-use crate::group::{self, DryRun, Input as GroupInput, Local, Shared};
+use crate::group::{self, DryRun, Inbox, Input as GroupInput, Local, Shared};
 use crate::pvm::Machines;
 use crate::space::Space;
 use crate::storage::StorageThread;
@@ -54,9 +54,9 @@ pub(crate) use queue::{Agent, Answered, Pending};
 pub(crate) struct Run {
     pub(crate) agent: Arc<Agent>,
     pub(crate) shared: Arc<Shared>,
-    pub(crate) inbox: smol::channel::Sender<GroupInput>,
+    pub(crate) inbox: Inbox,
     /// The leader loop's proposals and its retirement, never dropped.
-    local: smol::channel::Sender<Local>,
+    pub(crate) local: smol::channel::Sender<Local>,
     tasks: Mutex<Vec<smol::Task<()>>>,
 }
 
@@ -400,7 +400,10 @@ impl Inner {
             stats.groups.replicas += 1;
             stats.groups.leading += u64::from(state.role == vos_raft::Role::Leader);
             stats.groups.terms += state.term;
+            stats.groups.quiet += u64::from(lock(&run.shared.quiet).is_some());
+            stats.memory.log_cache += run.shared.log_cache.load(Ordering::Relaxed);
         }
+        (stats.memory.store_cache, stats.memory.store_buffers) = self.store.memory();
         stats
     }
 
@@ -438,7 +441,7 @@ impl Inner {
             .unwrap_or_default();
         for id in waiting {
             if let Some(run) = self.run(id) {
-                let _ = run.inbox.try_send(GroupInput::Blobs);
+                run.inbox.send(GroupInput::Blobs);
             }
         }
     }

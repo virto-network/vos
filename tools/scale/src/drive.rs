@@ -68,7 +68,7 @@ impl Plan {
     /// How long past the load a driver waits for its last answers: past a
     /// window and its close when reads at a cut wait for one.
     pub fn drain_ms(&self) -> u64 {
-        if self.model.shares.cut > 0.0 || self.model.readers > 0.0 {
+        if self.model.reads_at_cuts() {
             self.window.1 + self.window.2 + 90_000
         } else {
             30_000
@@ -125,6 +125,8 @@ pub fn drive(inventory: &Inventory, run: &Run, load: &Load) -> Result<(), String
         return Err("no driver host in the inventory".into());
     }
     load.model.validate(agents.agents.len())?;
+    load.model
+        .check_representative(agents.representative.is_some())?;
     let connections = inventory.harness.driver_connections;
     let ingress = inventory
         .node

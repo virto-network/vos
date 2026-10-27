@@ -81,9 +81,7 @@ impl Inner {
     /// Give `agent`'s group `input`: false, and counted, when no group here
     /// runs it or its inbox is full; the sender sends again.
     fn to_inbox(&self, agent: AgentId, input: Input) -> bool {
-        let routed = self
-            .run(agent)
-            .is_some_and(|run| run.inbox.try_send(input).is_ok());
+        let routed = self.run(agent).is_some_and(|run| run.inbox.send(input));
         if !routed {
             self.drops.count(peer::Refusal::Unrouted);
         }

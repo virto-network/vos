@@ -793,6 +793,53 @@ impl<N: NodeId> Core<N> {
         }
     }
 
+    /// Whether the core's only deadline is one the host's pair heartbeat
+    /// stands in for: a follower's election timer while its leader was
+    /// vouched for more than `margin` before its stickiness lapses, or an
+    /// idle leader's check-quorum while every member's node is heard and
+    /// holds every entry and the commit. The host may then stop ticking it
+    /// until a message comes, its leader stops listing the group at its
+    /// term, or a member's node falls silent, provided it notices either
+    /// within `margin`; it vouches before the tick it then gives
+    /// ([`Self::vouch`]).
+    pub fn quiescent(&self, margin: u64) -> bool {
+        if !self.reads.is_empty() || self.writer_stalled || !self.is_member() {
+            return false;
+        }
+        match self.role {
+            Role::Follower => {
+                let low = self.cfg.election_timeout_ms.0;
+                self.seen_leader.is_some_and(|leader| leader != self.cfg.me)
+                    && self
+                        .last_heard_leader
+                        .is_some_and(|heard| heard + low > self.now + margin)
+            }
+            Role::Leader => self.leading.as_ref().is_some_and(|leading| {
+                self.election_deadline == u64::MAX
+                    && leading.silent.is_empty()
+                    && leading.in_flight.is_empty()
+                    && leading.snapshotting.is_empty()
+                    && leading.loading.is_empty()
+                    && leading.transfer.is_none()
+            }),
+            Role::PreCandidate | Role::Candidate => false,
+        }
+    }
+
+    /// The host ticks a quiescent core again after a wait, at `now`: a
+    /// leader whose check-quorum came due meanwhile counts as heard only
+    /// the members heard since, which the host's vouch that follows adds,
+    /// not those heard before the wait.
+    pub fn resume(&mut self, now: u64) {
+        self.now = self.now.max(now);
+        if self.role == Role::Leader
+            && self.now >= self.check_quorum_due
+            && let Some(leading) = self.leading.as_mut()
+        {
+            leading.recent.clear();
+        }
+    }
+
     /// `node` came back (a new run of it, or heard again after a silence):
     /// a leader no longer counts it as caught up, and sends it a heartbeat
     /// at once, so a replica that restarted learns its leader and the
@@ -838,6 +885,12 @@ impl<N: NodeId> Core<N> {
             });
         }
         core::mem::take(&mut self.actions)
+    }
+
+    /// Bytes of recent entries the core holds in memory
+    /// ([`Config::cache_bytes`] bounds them).
+    pub fn cached_bytes(&self) -> usize {
+        self.log.cached_bytes()
     }
 
     pub fn role(&self) -> Role {

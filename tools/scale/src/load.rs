@@ -167,6 +167,27 @@ impl Model {
         1.0 - 1.0 / shards.max(1) as f64
     }
 
+    /// Whether the load reads at a cut: its mix's share or its readers'.
+    pub fn reads_at_cuts(&self) -> bool {
+        self.shares.cut > 0.0 || self.readers > 0.0
+    }
+
+    /// Refused when the load reads at a cut and the space has no
+    /// representative: a read is served once the representative's close of
+    /// its window applies, and without one no window closes, so every
+    /// such read fails.
+    pub fn check_representative(&self, representative: bool) -> Result<(), String> {
+        if self.reads_at_cuts() && !representative {
+            return Err(
+                "the load reads at a cut (the mix's `cut` share or `--readers`), which \
+                 the space's representative serves by closing each window, and the run has \
+                 none: pass --representative, or a --mix with cut=0 and no --readers"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
+
     pub fn validate(&self, shards: usize) -> Result<(), String> {
         if self.users == 0 || self.users > u64::from(u32::MAX) {
             return Err("users: from 1 to 2^32 - 1".into());
@@ -623,6 +644,26 @@ mod tests {
         };
         assert!((model.rate() - 5_000.0).abs() < 1e-6);
         assert!((Model::random_cross(64) - 0.984_375).abs() < 1e-9);
+    }
+
+    #[test]
+    fn reads_at_a_cut_need_the_representative() {
+        let mixed = model(1_000, 10.0);
+        assert!(mixed.shares.cut > 0.0, "the default mix reads at a cut");
+        let refused = mixed.check_representative(false).unwrap_err();
+        assert!(refused.contains("--representative"), "{refused}");
+        assert!(mixed.check_representative(true).is_ok());
+        let none = Model {
+            shares: Shares::parse("transfer=0.8,query=0.15,workflow=0.05,cut=0").unwrap(),
+            ..model(1_000, 10.0)
+        };
+        assert!(none.check_representative(false).is_ok());
+        let readers = Model {
+            readers: 0.01,
+            ..none.clone()
+        };
+        assert!(readers.check_representative(false).is_err());
+        assert!(readers.check_representative(true).is_ok());
     }
 
     #[test]

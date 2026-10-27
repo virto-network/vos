@@ -81,6 +81,11 @@ impl<N: NodeId> LogView<N> {
         }
     }
 
+    /// Bytes the cache holds, as it counts them.
+    pub(crate) fn cached_bytes(&self) -> usize {
+        self.cache_bytes
+    }
+
     pub(crate) fn snap_index(&self) -> u64 {
         self.snap_index
     }

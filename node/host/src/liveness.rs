@@ -4,6 +4,9 @@
 //! peer table, which its groups' drivers read to vouch for their leaders
 //! and members before their own timers lapse
 //! ([`vos_raft::core::Core::vouch`]): an idle group then sends nothing.
+//! A group whose core needs no tick but those this stands in for waits on
+//! no timer at all ([`crate::group::Quiet`]): each round wakes those whose
+//! leader stopped listing them, or with a member whose node fell silent.
 //! Whatever goes wrong here leaves Raft's own timing in charge.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -18,8 +21,8 @@ use vos_raft::pair::PeerTable;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{Leading, NodeNumber, PeerMessage, Placement};
 
-use crate::group::Local;
-use crate::node::Inner;
+use crate::group::{Local, Quiet};
+use crate::node::{Inner, Run};
 use crate::peer;
 use crate::{lock, timeout};
 
@@ -50,6 +53,9 @@ pub(crate) struct Liveness {
     /// The last round sent, kept across the heartbeat's restarts: peers
     /// ignore a round below the last they took from this run.
     round: AtomicU64,
+    /// When the heartbeat last went round, in milliseconds since the node
+    /// started: a group goes quiet only while it goes round on time.
+    beaten: AtomicU64,
 }
 
 impl Liveness {
@@ -59,12 +65,20 @@ impl Liveness {
             table: RwLock::new(PeerTable::new()),
             started: Instant::now(),
             round: AtomicU64::new(0),
+            beaten: AtomicU64::new(0),
         }
     }
 
     /// The next round to send.
     fn next_round(&self) -> u64 {
         self.round.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    /// Whether the heartbeat went round within two of its intervals, `every`
+    /// milliseconds: only then does it stand in for a quiet group's timers.
+    pub(crate) fn on_time(&self, every: u64) -> bool {
+        let beaten = self.beaten.load(Ordering::Relaxed);
+        self.elapsed().saturating_sub(beaten) < 2 * every
     }
 
     /// Milliseconds since the node started.
@@ -176,6 +190,11 @@ async fn beat(inner: Arc<Inner>) -> Ended {
             stalled = !stalled;
             inner.to_led(None, || Local::Wake);
         }
+        inner.wake_quiet();
+        inner
+            .liveness
+            .beaten
+            .store(inner.liveness.elapsed(), Ordering::Relaxed);
         let round = inner.liveness.next_round();
         // None listed while the writer is stalled, so their followers elect
         // leaders that can write, and none that is not live.
@@ -226,7 +245,9 @@ fn frames(incarnation: u64, round: u64, listed: &[Leading], size: usize) -> Vec<
 impl Inner {
     /// The groups this node leads, at their terms, each with its placement
     /// when known, and whether it is live: not stopped, and its driver gone
-    /// round in two election timeouts.
+    /// round in two election timeouts. A quiet driver with nothing waiting
+    /// for it, its leader loop's queue included, counts as gone round now:
+    /// the two timeouts run from the first work that waits for it.
     fn led(&self) -> Vec<(Leading, Option<Placement>, bool)> {
         let now = self.liveness.elapsed();
         let stuck = 2 * self.settings.election_timeout_ms.1;
@@ -234,6 +255,13 @@ impl Inner {
             .iter()
             .filter_map(|(agent, run)| {
                 let state = run.shared.state();
+                let idle = lock(&run.shared.quiet).is_some()
+                    && run.inbox.is_empty()
+                    && run.local.is_empty()
+                    && lock(&run.agent.queue).is_empty();
+                if idle {
+                    run.shared.woke.fetch_max(now, Ordering::Relaxed);
+                }
                 let woke = run.shared.woke.load(Ordering::Relaxed);
                 let live = !state.stopped && now.saturating_sub(woke) < stuck;
                 let leading = Leading {
@@ -252,6 +280,44 @@ impl Inner {
                 (leading, placement, live)
             })
             .collect()
+    }
+
+    /// Wake each quiet group whose quiet the pair heartbeat no longer
+    /// vouches for, or will not by the next round: a follower whose leader
+    /// has not listed the group at its term within the election timeout's
+    /// lower end, a leader with a member whose node has not been heard
+    /// within its upper end, as [`vos_raft::core::Core::vouch`] judges
+    /// them.
+    fn wake_quiet(&self) {
+        let (low, high) = self.settings.election_timeout_ms;
+        let ahead = Instant::now() + Duration::from_millis(self.settings.heartbeat_ms);
+        let lapsed = |at: Option<Instant>, within: u64| {
+            at.is_none_or(|at| at + Duration::from_millis(within) <= ahead)
+        };
+        // Taken apart from the runs' lock, which no group's quiet then waits
+        // behind.
+        let runs: Vec<(AgentId, Arc<Run>)> = lock(&self.runs)
+            .iter()
+            .map(|(agent, run)| (*agent, Arc::clone(run)))
+            .collect();
+        let due: Vec<AgentId> = {
+            let table = self.liveness.table();
+            runs.iter()
+                .filter(|(agent, run)| match &*lock(&run.shared.quiet) {
+                    None => false,
+                    Some(Quiet::Following { leader, term }) => {
+                        lapsed(table.listed(*leader, agent, *term), low)
+                    }
+                    Some(Quiet::Leading { members }) => members
+                        .iter()
+                        .any(|&member| lapsed(table.heard_at(member), high)),
+                })
+                .map(|(agent, _)| *agent)
+                .collect()
+        };
+        for agent in due {
+            self.to_group(agent, Local::Wake);
+        }
     }
 
     /// Give each group this node leads `local`: every one, or those whose

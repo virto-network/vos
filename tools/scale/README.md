@@ -48,7 +48,10 @@ second while active (`--per-user`, 0.1; or `--rate` for `U·a·r` itself).
   (`--cross`; random payees' `1 − 1/K` by default), sent to the shard's
   leader; queries on a follower; workflows, read until they end; and reads
   at a cut, read again once their window closes (`B_w + D`) and timed from
-  then (`cut_read`).
+  then (`cut_read`). A read at a cut is served once the space's
+  representative closes its window, so `run` and `drive` refuse a load that
+  reads at a cut (the mix's `cut` share, or `--readers`) when the space has
+  no representative: pass `--representative`, or a mix with `cut=0`.
 - **The identity agent** (`run --identity`, or `agents --identity-rows`)
   holds a row a user, replicated on every node; the first driver writes
   it `--identity-hz` times a second (10).
@@ -198,13 +201,13 @@ step's gate is one command (raise `ingress_connections` in `[node]`
 when many users call at once):
 
     target/x86_64-unknown-linux-musl/release/vos-scale -i inventory.toml run \
-        --shards 100 --identity --users 10000 --rate 200 --secs 300 --label gate
+        --shards 100 --identity --representative --users 10000 --rate 200 --secs 300 --label gate
 
 The report names the slowest node host: the one whose node has the highest
 commit p99, with disk time per I/O breaking ties. With four node hosts or
 more, rerun without it and compare the two runs:
 
-    vos-scale -i inventory.toml --exclude SLOWEST run --shards 100 --users 10000 --rate 200 --secs 300 --label without-SLOWEST
+    vos-scale -i inventory.toml --exclude SLOWEST run --shards 100 --representative --users 10000 --rate 200 --secs 300 --label without-SLOWEST
     vos-scale -i inventory.toml report --compare <the first run's id>
 
 `tools/scale/inventory.localhost.toml` runs the same thing on one machine.

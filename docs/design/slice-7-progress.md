@@ -2657,3 +2657,139 @@ quiet desktop, which the owner schedules.
 - The desktop's governor was `powersave` (warned), harmless for run 1:
   the driver used 0.01 cores.
 - `owner-decisions.md` has no S53; S35, S36, S45 and S52 were read.
+
+### 7.6: the per-replica cost's levers
+
+From vos-core `b824740c`, on `s7/7.6b`. Run 1 found memory binding, so
+the plan's levers came first, each its own commit:
+
+- **`722d6932` The inbox takes memory as it fills.** The group inbox was
+  `smol::channel::bounded(1024)`, 184 KiB reserved per group. It is now
+  an unbounded channel with its bound kept by its count: an input past
+  1,024 is dropped and resent as before, in the same order. Its 31-slot
+  blocks are allocated as it fills and freed as it drains, so an idle
+  group holds none. Test: the bound drops past it, keeps order, and
+  makes room as it drains.
+- **`8e0a4fe9` and `a899ef7b` Quiet groups wait on no timer of their own.**
+  `Core::quiescent(margin)` says when the core's only deadline is one
+  the pair heartbeat stands in for:
+  - a follower whose leader was vouched for more than one heartbeat
+    interval before its stickiness lapses;
+  - a leader that is idle, caught up, and has every member's node heard.
+
+  The driver then records a `Quiet` and waits for a message, a local, or
+  a safety round of ten election timeouts. Each pair heartbeat round
+  wakes the quiet groups it no longer vouches for: a follower whose
+  leader has not listed it within the lower bound, or a leader with a
+  member unheard within the upper bound. The woken driver vouches
+  before it ticks. `Groups::quiet` counts the quiet groups.
+
+  The Opus review (Raft correctness and liveness) found nothing unsafe.
+  Its fixes are folded into `a899ef7b`:
+  - A quiet leader with nothing waiting for it (inbox, locals, and its
+    leader loop's queue) counts as gone round at each beat. A queued
+    input behind a busy runtime then no longer drops it from the listing
+    at once, and a wedged runtime with calls queued still does after
+    two timeouts.
+  - Groups go quiet only while the beat is on time.
+  - `Core::resume` makes a leader resumed past its check-quorum count
+    only members heard since.
+  - `wake_quiet` no longer holds the runs' lock.
+
+  Tests:
+  - the core's quiescence and resumption (5);
+  - a cluster test: every idle replica is quiet, a call wakes its group
+    with no term moving, and the group goes quiet again.
+
+  The liveness suite stays green, including elections when a leader's
+  node stops or its writer stalls.
+- **`ccf2780f` The stats give what the caches hold:** the store's block
+  cache and write buffers, and the groups' Raft entry caches summed,
+  recorded each poll in `nodes.jsonl`. This attributed the growth
+  (below).
+- **`a13f5400` The harness refuses reads at a cut without
+  `--representative`.** `run` refuses before it deploys and `drive`
+  refuses too, each naming the way out. Test included.
+
+`just check` green.
+
+**Run 1 again** [measured; `~/vos-scale/runs/`
+`20261027T064256Z-r1b-idle-1k`, `20261027T072743Z-r1b-idle-10k`]:
+- **The setup and command** were run 1's: `--shards 8 --idle I --users
+  1000 --rate 10 --secs 2100`, plus `--representative`, which the
+  harness now requires for the default mix. That adds one agent, three
+  replicas.
+- **Binaries.** The 1k run used the binary before the review's fixes
+  (`ccf2780f`); the 10k run used `a899ef7b`. The fixes change only
+  liveness edges, not idle cost.
+- **The table** gives the mean of the three nodes, over the same
+  34.8-minute window past the ramp:
+
+| replicas a node | RSS at the window's start | node CPU | `vos-node` thread | its wakes/s | all wakes/s |
+|---|---|---|---|---|---|
+| 1,009 | 132 MiB (was 307) | 6.7% (7.4%) | 2.2% (2.9%) | 527 (957) | 1,787 (2,250) |
+| 10,009 | 542 MiB (was 2,272) | 8.1% (12.6%) | 2.7% (7.6%) | 817 (4,579) | 2,159 (5,768) |
+
+**Per 1,000 idle replicas** (the slope from 1k to 10k), against run 1:
+
+| | before | after |
+|---|---|---|
+| RSS | 218 MiB | 45.6 MiB |
+| node CPU | 0.58% of a core | 0.16% |
+| runtime-thread wakes per replica a second | 0.40 | 0.032 |
+| runtime thread's CPU | | 0.05% of a core |
+
+- **T3 met on both counts:** 45.6 MiB against 64 MiB, and 0.16% of a
+  core against 5%.
+- The intercept is unchanged at about 86 MiB.
+- Every replica was quiet at both sizes: 10,008–10,009 of 10,009.
+- 0 elections and 0 leader changes.
+- The load's numbers held: 21,046 calls answered, no errors, transfer
+  p99 within run 1's.
+- **Reads at a cut now succeed:** all 99 in each run, p50 164 ms, p99
+  459 ms from the window's close. Run 1 failed all of them.
+- **What the remaining wakes are:**
+  - The runtime thread's 0.032 wakes per replica a second are the safety
+    round, one every 30 s.
+  - At 10^5 replicas they project to about 3,200 a second, against
+    40,000 before.
+  - Lengthening the safety round is the lever if run 4 needs it.
+  - The pair heartbeat's thread (`vos-liveness`) took 0.9% of a core at
+    10k for its listing and quiet scan, both O(groups) per beat. That
+    thread is the next to watch at 10^5.
+- **Expected at 10^5:** the slope puts 10^5 replicas at about 4.6 GiB a
+  node. That is within an 8 GiB unit, but three such nodes do not fit
+  compumax's 62 GiB beside its reserve. Run 4 needs higher caps or fewer
+  replicas a node.
+
+**The growth under load is the store's memtables, not the Raft entry
+cache:**
+- **RSS still grew 4.1 MiB a minute** at both sizes, as in run 1.
+- **The write buffers account for nearly all of it:**
+  - At 1k, fjall's write buffers grew from 4.6 to 126 MiB in the window
+    (3.5 MiB a minute), against RSS's 141 MiB.
+  - At 10k, they grew from 37 to 155 MiB, 3.5 MiB a minute, until minute
+    33.8. A memtable of about 64 MiB then flushed and the buffers fell
+    to 91 MiB.
+- **The Raft entry caches stayed flat:** 1.2–2.6 MB a node at 1k and
+  11–12 MB at 10k. The block cache stayed under 1 MB.
+- **So no bound changes here.** The entry cache is not what grows. Each
+  keyspace's memtable is already bounded at fjall's 64 MiB, four
+  keyspaces, and flushes there, as the 10k run shows. Fjall 3.1.13's
+  total write-buffer cap (`max_write_buffer_size`) is accepted but not
+  enforced.
+- **Why it rises at this load:** at 10 calls a second the memtables take
+  over half an hour to fill, so the growth looks unbounded within a
+  35-minute run. At T1's rate they fill and flush in seconds.
+- **The plateau** is about 256 MiB of active memtables a node, plus
+  those being flushed.
+- **The trade-off:** smaller memtables would lower the plateau at the
+  cost of more flushes and compaction at T1, the load already at risk.
+  Left for run 2's measurement. T6's soak should judge RSS after the
+  memtables' first full cycle.
+
+**Left:**
+- The safety round's length, if run 4's wakes bind.
+- The O(groups) beat at 10^5.
+- The node caps that run 4 needs.
+- The memtable plateau, judged at T1 in runs 2 and 6.

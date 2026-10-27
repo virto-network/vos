@@ -1,7 +1,7 @@
 //! Leaders on nodes in one process, vouched for by the pair heartbeat:
-//! quiet groups sending nothing else, electing again when their leader's
-//! node stops, halts or stalls, a lossy link moving no term, and a stalled
-//! leader answering within its deadline.
+//! quiet groups sending nothing else and waiting on no timer, electing
+//! again when their leader's node stops, halts or stalls, a lossy link
+//! moving no term, and a stalled leader answering within its deadline.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -92,6 +92,28 @@ fn idle_groups_send_nothing_but_the_pair_heartbeat() {
     let terms_before = terms(&cluster, &agents);
     assert_eq!(done(cluster.increment_at_leader(agents[0], 1, 4)), 4);
     assert_eq!(terms(&cluster, &agents), terms_before);
+}
+
+/// Idle groups go quiet: every replica, leader and follower, waits on no
+/// timer of its own, the pair heartbeat standing in. A call wakes its
+/// group and goes through at once, no term moving, and the group goes
+/// quiet again.
+#[test]
+fn idle_groups_wait_on_no_timer_of_their_own() {
+    let cluster = Cluster::new(3);
+    let agents = agents(&cluster, 30);
+    cluster.install(agents[0]);
+    let all_quiet = |cluster: &Cluster| {
+        cluster.running().all(|(_, node)| {
+            let groups = node.stats().groups;
+            groups.quiet == groups.replicas
+        })
+    };
+    wait_until("every replica is quiet", || all_quiet(&cluster));
+    let terms_before = terms(&cluster, &agents);
+    assert_eq!(done(cluster.increment_at_leader(agents[0], 1, 3)), 3);
+    assert_eq!(terms(&cluster, &agents), terms_before);
+    wait_until("every replica is quiet again", || all_quiet(&cluster));
 }
 
 /// The node leading many quiet groups stops: each group elects another

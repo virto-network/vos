@@ -152,6 +152,7 @@ impl Stats {
         Wire {
             stages,
             groups: Default::default(),
+            memory: Default::default(),
         }
     }
 }

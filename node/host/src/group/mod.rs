@@ -32,8 +32,8 @@ pub(crate) type ReadIndexed = smol::channel::Sender<Result<u64, ReadIndexError>>
 /// configuration, or why not.
 pub(crate) type MembershipChanged = smol::channel::Sender<Result<u64, ChangeMembershipError>>;
 
-/// What a group hears from the network and the node: bounded, and
-/// dropped when full.
+/// What a group hears from the network and the node: bounded by its
+/// [`Inbox`], and dropped when full.
 pub(crate) enum Input {
     /// A Raft message from a peer, already checked.
     Raft {
@@ -50,6 +50,38 @@ pub(crate) enum Input {
     },
     /// A follower's acknowledgement of a snapshot stream.
     ChunkAck { from: NodeNumber, ack: SnapshotAck },
+}
+
+/// A group's inbox, as the network and the node send to it: at most
+/// `bound` inputs queued, and one past them dropped, which its sender
+/// sends again. Its queue takes memory as it fills and gives it back as it
+/// drains, not whole at its creation: an idle group's holds none.
+pub(crate) struct Inbox {
+    sender: smol::channel::Sender<Input>,
+    bound: usize,
+}
+
+impl Inbox {
+    /// An inbox of `bound` inputs, and the driver's end of it.
+    pub(crate) fn new(bound: usize) -> (Self, smol::channel::Receiver<Input>) {
+        let (sender, receiver) = smol::channel::unbounded();
+        (Self { sender, bound }, receiver)
+    }
+
+    /// Queue `input`, in order: false, and dropped, when the inbox is full
+    /// or closed. Senders that race past the bound queue at most one more
+    /// each.
+    pub(crate) fn send(&self, input: Input) -> bool {
+        self.sender.len() < self.bound && self.sender.try_send(input).is_ok()
+    }
+
+    pub(crate) fn close(&self) {
+        self.sender.close();
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sender.is_empty()
+    }
 }
 
 /// What a group hears from its own leader loop, never dropped.
@@ -118,6 +150,18 @@ impl Local {
     }
 }
 
+/// Why a group's driver waits on no timer of its own: the pair
+/// heartbeat's thread wakes it once this no longer holds
+/// ([`crate::liveness`]), and its timers take over again.
+#[derive(Clone, Debug)]
+pub(crate) enum Quiet {
+    /// It follows `leader` at `term`, which lists the group.
+    Following { leader: NodeNumber, term: u64 },
+    /// It leads, every one of `members` holds every entry and the commit,
+    /// and each one's node is heard.
+    Leading { members: Vec<NodeNumber> },
+}
+
 /// How many results' outcomes a group remembers, for its leader loop to
 /// read after its own apply.
 const OUTCOMES: usize = 256;
@@ -168,6 +212,11 @@ pub(crate) struct Shared {
     /// clock: a leader whose driver stopped going round is not vouched
     /// for.
     pub woke: AtomicU64,
+    /// Bytes the group's Raft entry cache held when its driver last went
+    /// round.
+    pub log_cache: AtomicU64,
+    /// Set while the driver waits on no timer of its own, and why.
+    pub quiet: Mutex<Option<Quiet>>,
 }
 
 impl Shared {
@@ -195,6 +244,8 @@ impl Shared {
             outcomes: Mutex::new(VecDeque::new()),
             applying: smol::lock::Mutex::new(()),
             woke: AtomicU64::new(0),
+            log_cache: AtomicU64::new(0),
+            quiet: Mutex::new(None),
         }
     }
 
@@ -237,5 +288,48 @@ impl Shared {
 
     pub fn stop(&self) {
         self.update(|state| state.stopped = true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vote(term: u64) -> Input {
+        Input::Raft {
+            from: 1,
+            message: Message::VoteAnswer {
+                term,
+                granted: true,
+            },
+        }
+    }
+
+    fn term(input: Input) -> u64 {
+        match input {
+            Input::Raft {
+                message: Message::VoteAnswer { term, .. },
+                ..
+            } => term,
+            _ => panic!("a vote's answer"),
+        }
+    }
+
+    #[test]
+    fn an_inbox_drops_past_its_bound_and_keeps_its_order() {
+        let (inbox, inputs) = Inbox::new(3);
+        assert!((1..=3).all(|term| inbox.send(vote(term))));
+        assert!(!inbox.send(vote(4)), "full");
+        assert_eq!(term(inputs.try_recv().unwrap()), 1);
+        assert!(inbox.send(vote(5)), "one taken makes room for one");
+        assert!(!inbox.send(vote(6)), "full again");
+        let taken: Vec<u64> = std::iter::from_fn(|| inputs.try_recv().ok())
+            .map(term)
+            .collect();
+        assert_eq!(taken, [2, 3, 5]);
+        assert!(inbox.send(vote(7)), "drained");
+        inbox.close();
+        assert!(!inbox.send(vote(8)), "closed");
+        assert_eq!(term(inputs.try_recv().unwrap()), 7, "what was queued stays");
     }
 }
