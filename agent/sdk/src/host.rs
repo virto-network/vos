@@ -146,7 +146,9 @@ pub fn log(level: u8, message: &[u8]) {
 
 /// The caller's encoded principal.
 pub fn caller() -> Vec<u8> {
-    let mut out = [0u8; 64];
+    // The longest principal's encoding: an `Anonymous`'s, its index and
+    // two digests.
+    let mut out = [0u8; 65];
     let len = ecalli!(
         Op::Caller.id(),
         [ptr_mut(&mut out), out.len() as u64, 0, 0, 0, 0]

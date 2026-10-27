@@ -365,6 +365,22 @@ fn every_route_through_the_gateway_answers_as_the_nodes_http() {
         }
     };
     let replace = vos_wire::ingress::Replace { remove: 5, add: 6 }.encode();
+    // A credentialed call in shape, its proof not one: the node refuses it
+    // by its own checks (a node of no space), the gateway checking none.
+    let credentialed = vos_wire::ingress::Credentialed {
+        instance: vos_wire::ids::InstanceId(1),
+        method: vos_wire::ids::MethodId(2),
+        arguments: vec![3],
+        nonce: [4; 16],
+        expires_ms: served.now() + 60_000,
+        format: 42,
+        public: vos_wire::ingress::CredentialPublic::Owner {
+            owner: [5; 32],
+            binding: [6; 32],
+        },
+        proof: vec![7; 4096],
+    }
+    .encode();
     // Each request, made fresh for each front: an operator's header is
     // good once.
     type Make<'a> = Box<dyn Fn() -> Vec<u8> + 'a>;
@@ -416,6 +432,32 @@ fn every_route_through_the_gateway_answers_as_the_nodes_http() {
         (
             "a call",
             Box::new(|| request("POST", &format!("/agents/{agent}/calls"), &[], &call)),
+        ),
+        (
+            "a credentialed call",
+            Box::new(|| {
+                request(
+                    "POST",
+                    &format!("/agents/{agent}/credentialed"),
+                    &[],
+                    &credentialed,
+                )
+            }),
+        ),
+        (
+            "a credentialed call that does not decode",
+            Box::new(|| {
+                request(
+                    "POST",
+                    &format!("/agents/{agent}/credentialed"),
+                    &[],
+                    &[0xff],
+                )
+            }),
+        ),
+        (
+            "a credentialed call to no agent",
+            Box::new(|| request("POST", "/agents/99999/credentialed", &[], &credentialed)),
         ),
         (
             "a malformed call",
@@ -724,6 +766,19 @@ fn every_route_through_the_gateway_answers_as_the_nodes_http() {
         assert_ne!(node_status, 0, "{name}");
         let _ = (node_raw, front_raw);
     }
+    // The credentialed call's refusal is the node's, through the gateway.
+    let path = format!("/agents/{agent}/credentialed");
+    let (status, body, _) = exchange(
+        served.front.address,
+        &request("POST", &path, &[], &credentialed),
+    );
+    assert_eq!(status, 403);
+    assert_eq!(
+        Response::decode_exact(&body),
+        Some(Response::Rejected(
+            vos_wire::ingress::Rejection::Credential(vos_wire::ingress::CredentialRefusal::NoSpace)
+        ))
+    );
     // `Expect: 100-continue`: each says go on before the body is sent.
     let expect = |address: SocketAddr| {
         let mut stream = TcpStream::connect(address).unwrap();

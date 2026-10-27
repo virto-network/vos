@@ -223,11 +223,16 @@ pub enum Step {
     Refused { input: InputRef, code: Refusal },
     /// The sweep: the sessions among the rows of the due index the leader
     /// listed that refine found there and due, each the time its row is due
-    /// at and the session. Accumulate collects each session that has
-    /// expired and moves the row of one active since. The listed workflows'
-    /// steps follow it.
+    /// at and the session; and the binding digests likewise, each recorded
+    /// for a credentialed call until its row's time. Accumulate collects
+    /// each session that has expired and moves the row of one active since,
+    /// and deletes each binding's rows. The listed workflows' steps follow
+    /// it.
     #[codec(index = 2)]
-    Swept { due: Vec<(u64, SessionId)> },
+    Swept {
+        due: Vec<(u64, SessionId)>,
+        bindings: Vec<(u64, [u8; 32])>,
+    },
 }
 
 /// A dispatched step: how it ended and its effects. A failed step has no
@@ -303,6 +308,10 @@ pub enum InputRef {
         id: [u8; 32],
         attested: [u8; 32],
     },
+    /// A credentialed call ([`crate::batch::Input::Credentialed`]), by its
+    /// binding digest.
+    #[codec(index = 9)]
+    Credentialed { binding: [u8; 32] },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]

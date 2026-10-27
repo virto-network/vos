@@ -89,6 +89,7 @@ impl Api {
                 .collect(),
             body: body.to_vec(),
             peer: None,
+            large: None,
         };
         let (kind, body) = match routes::route(&request) {
             Routed::Answer(answer) => return Ok((answer.status, answer.body)),

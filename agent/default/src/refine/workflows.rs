@@ -243,7 +243,7 @@ fn started(base: &Base, call: Call) -> Result<(WorkflowId, Overlay), Failure> {
     let schema = installed.schema.method(method).ok_or(Failure::Unknown)?;
     if let Some(role) = &schema.role {
         let required = installed.role(role).expect("checked at install");
-        if base.role(&caller)? != Some(required) {
+        if base.role(caller)? != Some(required) {
             return Err(Failure::Forbidden);
         }
     }
@@ -268,7 +268,7 @@ fn started(base: &Base, call: Call) -> Result<(WorkflowId, Overlay), Failure> {
         program,
         instance,
         method,
-        owner: caller,
+        owner: *caller,
         gas: schema.gas_limit(),
         writable: writable as u32,
         awaits: 0,
@@ -525,7 +525,7 @@ fn run(
     let resumed = machine.registers();
     let resumed_at = snapshot.map_or(0, |snapshot| snapshot.counter);
     let call = Call {
-        caller: workflow.owner,
+        caller: &workflow.owner,
         instance: workflow.instance,
         method: workflow.method,
         arguments: resume,

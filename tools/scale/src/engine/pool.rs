@@ -284,6 +284,7 @@ impl Pool {
             headers: Vec::new(),
             body: body.to_vec(),
             peer: None,
+            large: None,
         };
         let vos_http::routes::Routed::Request { kind, body } = vos_http::routes::route(&request)
         else {

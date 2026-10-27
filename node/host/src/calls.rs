@@ -15,13 +15,16 @@
 //!
 //! A replica that does not lead runs no lane: its marks may lag. It checks
 //! the call's signature, forwards the call to the leader, again through
-//! leader changes, and answers once it has applied the call itself.
+//! leader changes, and answers once it has applied the call itself. A
+//! credentialed call, its proof verified, goes the same way, outside any
+//! lane: apply refuses its binding digest once recorded.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use vos_wire::batch::Request;
+use vos_wire::abi::Refusal;
+use vos_wire::batch::{CredentialedInput, Request};
 use vos_wire::ids::{AgentId, Principal, Session, SessionId};
 use vos_wire::ingress::{Call, Rejection, Response};
 use vos_wire::peer::{NodeNumber, PeerMessage};
@@ -61,6 +64,8 @@ pub(crate) struct Calls {
     /// them, each by its token: a call forwarded again while it runs is
     /// answered once, when it ends.
     forwarded: Mutex<HashMap<NodeNumber, HashSet<u64>>>,
+    /// Credential proofs being verified now.
+    pub(crate) verifying: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A forwarded call's place among those running, given back when it ends,
@@ -124,6 +129,35 @@ pub(crate) fn session_mark(
         id,
         read::<SessionMark>(snapshot, agent, &keys::session(id))?,
     )))
+}
+
+/// What a replica that does not lead forwards to its agent's leader: a
+/// client's call, its signature checked, or a credentialed call, its proof
+/// verified.
+#[derive(Clone)]
+pub(crate) enum Forwardable {
+    Call(Call),
+    Credentialed(CredentialedInput),
+}
+
+impl Forwardable {
+    /// The message forwarding it to the leader at `term`, under `token`.
+    fn message(&self, agent: AgentId, token: u64, term: u64) -> PeerMessage {
+        match self {
+            Forwardable::Call(call) => PeerMessage::Forward {
+                agent,
+                token,
+                term,
+                call: call.clone(),
+            },
+            Forwardable::Credentialed(call) => PeerMessage::ForwardCredentialed {
+                agent,
+                token,
+                term,
+                call: call.clone(),
+            },
+        }
+    }
 }
 
 enum Next {
@@ -201,8 +235,34 @@ impl Inner {
         if run.agent.leading() {
             self.lane_call(agent, call).await
         } else {
-            self.forward(&run, agent, call).await
+            self.forward(&run, agent, Forwardable::Call(call)).await
         }
+    }
+
+    /// Run `call` as this replica's leader would: a client's call in its
+    /// lane, a credentialed call queued.
+    async fn lead(self: &Arc<Self>, agent: AgentId, call: Forwardable) -> Response {
+        match call {
+            Forwardable::Call(call) => self.lane_call(agent, call).await,
+            Forwardable::Credentialed(call) => self.credentialed_call(agent, call).await,
+        }
+    }
+
+    /// Run a credentialed call, its proof verified: this replica must lead
+    /// the agent, else the answer says where the leader is. Apply refuses a
+    /// binding digest recorded, so a call sent twice runs once.
+    pub(crate) async fn credentialed_call(
+        self: &Arc<Self>,
+        agent: AgentId,
+        call: CredentialedInput,
+    ) -> Response {
+        if let Err(error) = self.leading(agent).await {
+            return error.into();
+        }
+        let running = self.call_credentialed(agent, call);
+        timeout(self.settings.answered, running)
+            .await
+            .map_or(Response::TimedOut, answer_of)
     }
 
     /// Run a call whose signature was checked in its lane: this replica
@@ -405,7 +465,12 @@ impl Inner {
 
     /// Forward a checked call to the agent's leader until it is answered,
     /// then answer once this replica has applied it.
-    async fn forward(self: &Arc<Self>, run: &Arc<Run>, agent: AgentId, call: Call) -> Response {
+    pub(crate) async fn forward(
+        self: &Arc<Self>,
+        run: &Arc<Run>,
+        agent: AgentId,
+        call: Forwardable,
+    ) -> Response {
         let until = Instant::now() + FORWARDING;
         let wait = self.calls.forwards.register(agent);
         // How many times the call went: once it went before, nothing the
@@ -423,9 +488,9 @@ impl Inner {
             if state.stopped {
                 return Response::Stopped;
             }
-            // This replica leads now: the call runs in its own lane.
+            // This replica leads now: the call runs here.
             if run.agent.leading() {
-                return self.lane_call(agent, call).await;
+                return self.lead(agent, call).await;
             }
             // The leader this replica follows, or one named at a later term
             // until this replica's own core reaches it.
@@ -448,15 +513,7 @@ impl Inner {
                 continue;
             };
             sent += 1;
-            self.send(
-                to,
-                &PeerMessage::Forward {
-                    agent,
-                    token: wait.token,
-                    term,
-                    call: call.clone(),
-                },
-            );
+            self.send(to, &call.message(agent, wait.token, term));
             match wait.within(REASK.min(left), run.shared.wait(changed)).await {
                 // A node that leads at a later term than this replica
                 // knows, or knows who does: there, at once. One at an
@@ -517,7 +574,60 @@ impl Inner {
                     return Response::TimedOut;
                 }
                 Some((_, Response::TimedOut)) | None => {}
+                // A credentialed call that ran already, by an earlier send
+                // or another replica's copy: answered once this replica
+                // holds its binding, so a client reading state here reads
+                // the run's effects.
+                Some((_, Response::Refused(Refusal::Replayed))) => {
+                    if let Forwardable::Credentialed(call) = &call {
+                        return self.recorded(run, agent, call, until).await;
+                    }
+                    return Response::Refused(Refusal::Replayed);
+                }
                 Some((_, answer)) => return answer,
+            }
+        }
+    }
+
+    /// `Replayed`, once this replica has applied `call`'s binding record,
+    /// or a batch past its expiry (by then the run is applied here, and
+    /// its record may be swept), by `until`.
+    async fn recorded(
+        &self,
+        run: &Arc<Run>,
+        agent: AgentId,
+        call: &CredentialedInput,
+        until: Instant,
+    ) -> Response {
+        let key = keys::binding(&call.binding);
+        loop {
+            // The mark read first: an apply after it wakes the wait below.
+            let applied = run.shared.state().applied;
+            let snapshot = self.store.snapshot();
+            let held = snapshot
+                .get(agent, &key)
+                .map_err(Fault::from)
+                .and_then(|held| {
+                    let time = read::<u64>(&snapshot, agent, &keys::batch_time())?;
+                    Ok(held.is_some() || time.is_some_and(|time| time > call.expires_ms))
+                });
+            match held {
+                Ok(true) => return Response::Refused(Refusal::Replayed),
+                Ok(false) => {}
+                Err(_) => return Response::Unavailable,
+            }
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Response::TimedOut;
+            }
+            let state = timeout(
+                left,
+                run.shared
+                    .wait(|state| state.stopped || state.applied > applied),
+            )
+            .await;
+            if state.is_none_or(|state| state.stopped) {
+                return state.map_or(Response::TimedOut, |_| Response::Stopped);
             }
         }
     }
@@ -534,7 +644,7 @@ impl Inner {
         agent: AgentId,
         token: u64,
         term: u64,
-        call: Call,
+        call: Forwardable,
     ) {
         if !self.admit(agent, from) {
             return;
@@ -577,7 +687,7 @@ impl Inner {
                 from,
                 token,
             };
-            let answer = inner.lane_call(agent, call).await;
+            let answer = inner.lead(agent, call).await;
             drop(running);
             let term = inner.run(agent).map_or(term, |run| run.shared.state().term);
             inner.answer_forward(from, agent, token, term, answer);

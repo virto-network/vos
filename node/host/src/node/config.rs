@@ -154,6 +154,9 @@ pub struct Config {
     /// The most operator commands' nonces the node keeps at once: past
     /// them, a command is answered busy until some expire.
     pub operator_nonces: usize,
+    /// The most credential proofs the node verifies at once: past them, a
+    /// credentialed call is answered busy. `None` for twice its executors.
+    pub verifications: Option<usize>,
 }
 
 impl Config {
@@ -211,6 +214,7 @@ impl Config {
             operators: Vec::new(),
             local_operator: true,
             operator_nonces: 1 << 16,
+            verifications: None,
         }
     }
 }
@@ -245,6 +249,8 @@ pub(crate) struct Settings {
     pub(crate) api_connections: usize,
     pub(crate) api_in_flight: usize,
     pub(crate) api_frame_deadline: Duration,
+    /// [`Config::verifications`], resolved.
+    pub(crate) verifications: usize,
 }
 
 impl Settings {
@@ -281,6 +287,7 @@ impl Settings {
             api_connections: config.api_connections,
             api_in_flight: config.api_in_flight,
             api_frame_deadline: config.api_frame_deadline,
+            verifications: config.verifications.unwrap_or(2 * config.executors.max(1)),
         }
     }
 }

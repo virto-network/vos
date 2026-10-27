@@ -31,14 +31,19 @@ const REQUEST: u32 = (cap::REQUEST + ENVELOPE) as u32;
 const INSTALL: u32 = (cap::MAX_ELF + ENVELOPE) as u32;
 /// An operator read's inner body, at most: an agent, with room to spare.
 const OPERATOR_READ: u32 = ENVELOPE as u32;
-/// A body past this is large: only an install's is. A node holds few at
-/// once, from every transport.
+/// An install's body past this is large. A node holds few at once, from
+/// every transport.
 pub const LARGE: u32 = REQUEST + AGENT + OPERATED;
+/// The most a credential proof holds, in any format: a device proof's
+/// 1.5 MiB.
+pub const MAX_CREDENTIAL_PROOF: usize = 3 << 19;
+/// A credentialed call's body as HTTP takes it: the proof, the arguments'
+/// cap and the envelope, less the agent's id a frame's body leads with.
+pub const CREDENTIALED_HTTP: usize =
+    MAX_CREDENTIAL_PROOF + cap::REQUEST + ENVELOPE - AGENT as usize;
 
 /// The frame error's kind: an answer only, never a request.
 pub const FRAME_ERROR: u16 = 0xffff;
-/// The credentialed call's kind, reserved for the verifier at ingress.
-pub const CREDENTIALED: u16 = 0x0104;
 
 /// A request's kind: its number, its body's limit, who may send it, and
 /// whether a relay passes it on.
@@ -56,6 +61,9 @@ pub enum Kind {
     Call = 0x0101,
     Query = 0x0102,
     Workflow = 0x0103,
+    /// A call whose authority is a credential proof: no session, no
+    /// signature.
+    Credentialed = 0x0104,
     Stats = 0x0201,
     Status = 0x0202,
     CreateAgent = 0x0203,
@@ -67,7 +75,7 @@ pub enum Kind {
 }
 
 impl Kind {
-    pub const ALL: [Kind; 15] = [
+    pub const ALL: [Kind; 16] = [
         Kind::NodeKey,
         Kind::Time,
         Kind::AgentInfo,
@@ -75,6 +83,7 @@ impl Kind {
         Kind::Call,
         Kind::Query,
         Kind::Workflow,
+        Kind::Credentialed,
         Kind::Stats,
         Kind::Status,
         Kind::CreateAgent,
@@ -91,13 +100,16 @@ impl Kind {
     }
 
     /// The most its body holds, in bytes: today's HTTP limit for its route
-    /// plus the agent's id where it names one, and an operator's envelope.
+    /// plus the agent's id where it names one, and an operator's envelope;
+    /// a credentialed call's, the largest proof's 1.5 MiB plus the
+    /// arguments' cap and 4 KiB.
     pub fn limit(self) -> u32 {
         match self {
             Kind::NodeKey | Kind::Time => 0,
             Kind::AgentInfo => AGENT,
             Kind::Schema => 2 * AGENT,
             Kind::Call | Kind::Query | Kind::Workflow => REQUEST + AGENT,
+            Kind::Credentialed => (CREDENTIALED_HTTP + AGENT as usize) as u32,
             Kind::Stats | Kind::Status => OPERATOR_READ + OPERATED,
             Kind::Install => INSTALL + AGENT + OPERATED,
             Kind::CreateAgent
@@ -196,8 +208,11 @@ mod tests {
             assert_eq!(limit(kind), 69_792);
         }
         assert_eq!(limit(Kind::Install), 67_113_120);
+        assert_eq!(limit(Kind::Credentialed), 1_642_496);
+        assert_eq!(CREDENTIALED_HTTP, 1_642_492);
         for kind in Kind::ALL {
-            assert_eq!(kind.limit() > LARGE, kind == Kind::Install, "{kind:?}");
+            let large = matches!(kind, Kind::Install | Kind::Credentialed);
+            assert_eq!(kind.limit() > LARGE, large, "{kind:?}");
         }
     }
 
@@ -206,7 +221,8 @@ mod tests {
         for kind in Kind::ALL {
             assert_eq!(Kind::from_u16(kind as u16), Some(kind));
         }
-        for number in [0, CREDENTIALED, FRAME_ERROR, 0x0005, 0x0209] {
+        assert_eq!(Kind::Credentialed as u16, 0x0104);
+        for number in [0, FRAME_ERROR, 0x0005, 0x0105, 0x0209] {
             assert_eq!(Kind::from_u16(number), None, "{number:#06x}");
         }
         let relayed: Vec<Kind> = Kind::ALL.into_iter().filter(|k| k.relayed()).collect();

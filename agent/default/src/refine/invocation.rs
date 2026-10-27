@@ -172,9 +172,18 @@ impl<'a> Invocation<'a> {
             .ok_or((Failure::Unknown, 0))?;
         if let Some(role) = &schema.role {
             let required = installed.role(role).expect("checked at install");
-            if self.role(&caller).map_err(|_| (Failure::Trapped, 0))? != Some(required) {
+            if self.role(caller).map_err(|_| (Failure::Trapped, 0))? != Some(required) {
                 return Ok((Ended::Forbidden, 0));
             }
+        }
+        // A guarded method admits its credential's origin alone, and no
+        // other method admits one.
+        let admitted = match &schema.credential {
+            Some(guard) => guard.admits(caller),
+            None => !caller.is_credential(),
+        };
+        if !admitted {
+            return Ok((Ended::Forbidden, 0));
         }
         if self.stack.contains(&instance) {
             return Err((Failure::Cycle, 0));
@@ -328,7 +337,7 @@ impl<'a> Invocation<'a> {
         );
         let gas = machine.gas();
         let call = Call {
-            caller: Principal::Instance(instance),
+            caller: &Principal::Instance(instance),
             instance: callee,
             method,
             arguments: &call_arguments,

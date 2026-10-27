@@ -15,7 +15,7 @@ use alloc::vec::Vec;
 use scale::{Decode, Encode};
 
 use crate::SpaceId;
-use crate::batch::Message;
+use crate::batch::{CredentialedInput, Message};
 use crate::ids::{AgentId, ProgramHash};
 use crate::ingress::{Call, Response};
 
@@ -162,6 +162,17 @@ pub enum PeerMessage {
         id: [u8; 32],
         proof: [u8; 32],
         attested: [u8; 32],
+    },
+    /// A credentialed call to `agent`, whose proof the sending replica
+    /// verified, for the leader to run: forwarded as a client's call is
+    /// ([`PeerMessage::Forward`]), answered by a [`PeerMessage::Forwarded`].
+    /// It carries the origin the proof proved, never the proof.
+    #[codec(index = 19)]
+    ForwardCredentialed {
+        agent: AgentId,
+        token: u64,
+        term: u64,
+        call: CredentialedInput,
     },
 }
 

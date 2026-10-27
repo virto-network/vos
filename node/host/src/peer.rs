@@ -312,6 +312,7 @@ pub fn class(message: &PeerMessage) -> Class {
         | PeerMessage::DirectoryAck { .. }
         | PeerMessage::DirectoryRequest { .. }
         | PeerMessage::Forward { .. }
+        | PeerMessage::ForwardCredentialed { .. }
         | PeerMessage::Forwarded { .. }
         | PeerMessage::ReadIndex { .. }
         | PeerMessage::ReadIndexAnswer { .. }
@@ -337,6 +338,7 @@ pub fn stream(message: &PeerMessage) -> u64 {
         PeerMessage::DirectoryAck { agent, .. }
         | PeerMessage::DirectoryRequest { agent }
         | PeerMessage::Forward { agent, .. }
+        | PeerMessage::ForwardCredentialed { agent, .. }
         | PeerMessage::Forwarded { agent, .. }
         | PeerMessage::ReadIndex { agent, .. }
         | PeerMessage::ReadIndexAnswer { agent, .. }
@@ -406,6 +408,7 @@ pub fn check(
         | PeerMessage::BlobRequest { .. }
         | PeerMessage::Liveness { .. }
         | PeerMessage::Forward { .. }
+        | PeerMessage::ForwardCredentialed { .. }
         | PeerMessage::Forwarded { .. }
         | PeerMessage::ReadIndex { .. }
         | PeerMessage::ReadIndexAnswer { .. }

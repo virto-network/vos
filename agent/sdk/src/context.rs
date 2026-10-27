@@ -182,6 +182,27 @@ impl<A> Query<A> {
         (AgentId(agent), InstanceId(instance))
     }
 
+    /// The owner digest the caller proved the secret of, under
+    /// `#[msg(credential = Owner)]`: a handler that debits a row compares
+    /// it with the row's owner, as the row is now. `None` for any other
+    /// caller.
+    pub fn owner(&self) -> Option<[u8; 32]> {
+        match self.caller() {
+            Principal::Owner(digest) => Some(digest),
+            _ => None,
+        }
+    }
+
+    /// The caller's pseudonym in its auth guard's scope, its nullifier,
+    /// under `#[msg(credential = Auth("..."))]`: stable across its calls of
+    /// that scope. `None` for any other caller.
+    pub fn nullifier(&self) -> Option<[u8; 32]> {
+        match self.caller() {
+            Principal::Anonymous { nullifier, .. } => Some(nullifier),
+            _ => None,
+        }
+    }
+
     batch_reads!();
 
     /// Call a query of another instance of this agent.

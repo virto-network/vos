@@ -113,6 +113,7 @@ impl Operator {
                     headers: Vec::new(),
                     body: body.to_vec(),
                     peer: None,
+                    large: None,
                 };
                 let Routed::Operator {
                     kind,

@@ -141,7 +141,7 @@ impl Reads {
             .flatten()
             .filter_map(|&(at, due)| match due {
                 Due::Workflow(workflow) => Some((workflow, at)),
-                Due::Session(_) => None,
+                Due::Session(_) | Due::Binding(_) => None,
             })
             .collect();
         let mut inputs = inputs.iter();

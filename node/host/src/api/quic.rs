@@ -12,7 +12,7 @@ use quinn::VarInt;
 use vos_api::{Event, FrameError, Framing, Kind, Reader, Requests, error_frame, frame};
 use vos_net::api::{Runner, Runtime, Spawner};
 
-use super::{Api, Via, is_large};
+use super::{Api, LargePlace, Via};
 use crate::timeout;
 
 /// A connection quiet this long closes.
@@ -232,8 +232,10 @@ async fn request(
         if let Some(event) = reader.event() {
             break event;
         }
-        if large.is_none() && is_large(&reader, Framing::Quic) {
-            match api.large.try_acquire_arc() {
+        if large.is_none()
+            && let Some(places) = api.large_places(&reader, Framing::Quic)
+        {
+            match places.try_acquire_arc() {
                 Some(place) => large = Some(place),
                 None => {
                     let _ = receive.stop(STOPPED);
@@ -278,9 +280,10 @@ async fn request(
         Event::Frame(request) => {
             let kind = Kind::from_u16(request.kind).expect("the reader's kinds");
             let runtime = Arc::clone(&api.inner.runtime);
+            let large = large.take().map(|place| Box::new(place) as LargePlace);
             // On the node's thread, as every request is handled.
             let answer = runtime
-                .spawn(async move { api.handle(kind, request.body, Via::Quic).await })
+                .spawn(async move { api.handle(kind, request.body, Via::Quic, large).await })
                 .await;
             frame(Framing::Quic, request.kind, 0, &answer)
         }
@@ -289,5 +292,4 @@ async fn request(
     if send.write_all(&bytes).await.is_ok() {
         let _ = send.finish();
     }
-    drop(large);
 }

@@ -87,7 +87,7 @@ fn stateful_batches(backend: PvmBackend) {
     };
     assert!(!due.is_empty(), "sessions due");
     let swept = paired.batch(later, vec![sweep]);
-    assert!(matches!(&swept.result.steps[0], Step::Swept { due } if !due.is_empty()));
+    assert!(matches!(&swept.result.steps[0], Step::Swept { due, .. } if !due.is_empty()));
     let alices = Session {
         key: [1; 32],
         name: [0; 16],

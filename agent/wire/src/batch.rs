@@ -182,6 +182,35 @@ pub enum Input {
         proof: [u8; 32],
         attested: [u8; 32],
     },
+    /// A credentialed call, its proof verified at ingress: no session, its
+    /// origin the one the proof proved (`identity-and-authority.md` §5).
+    /// The log carries neither the proof, nor its nonce, nor its format.
+    /// Boxed, so every input does not carry its size.
+    #[codec(index = 10)]
+    Credentialed(alloc::boxed::Box<CredentialedInput>),
+}
+
+/// A credentialed call as the log carries it. Refine refuses it if
+/// `expires_ms` is before the batch's time, if `binding` is recorded, if
+/// an auth call's `root` is not fresh by the batch's time, or if a `once`
+/// guard's nullifier is recorded; else it records `binding` until
+/// `expires_ms` plus [`crate::defaults::BINDING_KEPT_MS`] and runs the
+/// method, its caller `origin`, recording a `once` guard's nullifier only
+/// if the method returns `Ok`.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct CredentialedInput {
+    /// `Anonymous { scope, nullifier }` for auth, `Owner(digest)` for
+    /// owner.
+    pub origin: Principal,
+    pub instance: InstanceId,
+    pub method: MethodId,
+    pub arguments: Vec<u8>,
+    /// The binding digest `b` ([`crate::credentials::Bound::digest`]).
+    pub binding: [u8; 32],
+    /// By batch time.
+    pub expires_ms: u64,
+    /// Auth's `map_root`; `None` for owner.
+    pub root: Option<[u8; 32]>,
 }
 
 /// A client request, in its session's sequence for this agent.

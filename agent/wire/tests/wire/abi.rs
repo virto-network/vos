@@ -184,6 +184,7 @@ fn schemas_read_back_from_their_section_and_validate() {
         role: Some(b"minter".to_vec()),
         gas: Some(1_000_000),
         linearizable: false,
+        credential: None,
     };
     let linearizable = MethodSchema {
         linearizable: true,
@@ -191,6 +192,7 @@ fn schemas_read_back_from_their_section_and_validate() {
     };
     let schema = Schema {
         methods: vec![method(7, Kind::Command), linearizable],
+        credentials: false,
     };
     let mut ro_data = schema.section();
     ro_data.extend_from_slice(b"the rest of the read-only data");
@@ -207,6 +209,7 @@ fn schemas_read_back_from_their_section_and_validate() {
     );
     let duplicate = Schema {
         methods: vec![method(7, Kind::Command), method(7, Kind::Query)],
+        credentials: false,
     };
     assert_eq!(
         Schema::read(&duplicate.section()),
@@ -214,6 +217,7 @@ fn schemas_read_back_from_their_section_and_validate() {
     );
     let reserved = Schema {
         methods: vec![method(0, Kind::Command)],
+        credentials: false,
     };
     assert_eq!(
         Schema::read(&reserved.section()),
@@ -224,6 +228,7 @@ fn schemas_read_back_from_their_section_and_validate() {
             linearizable: true,
             ..method(7, Kind::Command)
         }],
+        credentials: false,
     };
     assert_eq!(
         Schema::read(&command.section()),
@@ -231,8 +236,98 @@ fn schemas_read_back_from_their_section_and_validate() {
     );
 }
 
+/// A credential guard sits on a command alone, with no role and not
+/// linearizable, an auth guard's name 1 to 64 bytes; the credential
+/// actor's mark is the section's last byte.
+#[test]
+fn credential_guards_validate_and_the_mark_is_last() {
+    use vos_wire::ids::Principal;
+    use vos_wire::schema::{CredentialGuard, MethodSchema, Schema, SchemaError};
+    let auth = |name: &[u8]| CredentialGuard::Auth {
+        name: name.to_vec(),
+        device: None,
+        once: true,
+    };
+    let guarded = |kind, credential| MethodSchema {
+        id: MethodId(3),
+        name: b"vote".to_vec(),
+        kind,
+        role: None,
+        gas: None,
+        linearizable: false,
+        credential: Some(Box::new(credential)),
+    };
+    let schema = |methods| Schema {
+        methods,
+        credentials: true,
+    };
+    let fine = schema(vec![
+        guarded(Kind::Command, auth(b"vote")),
+        MethodSchema {
+            id: MethodId(4),
+            ..guarded(Kind::Command, CredentialGuard::Owner)
+        },
+    ]);
+    let section = fine.section();
+    assert_eq!(Schema::read(&section), Ok(fine.clone()));
+    // A section with no guard and no mark is the methods' alone, as before
+    // guards were; the mark alone follows them.
+    let unguarded = |credentials| Schema {
+        methods: vec![MethodSchema {
+            credential: None,
+            ..guarded(Kind::Command, CredentialGuard::Owner)
+        }],
+        credentials,
+    };
+    let plain = unguarded(false).section();
+    let marked = unguarded(true).section();
+    assert_eq!(&marked[plain.len()..], [1, 0, 0, 0, 0]);
+    assert_eq!(&plain[4..8], &((plain.len() - 8) as u32).to_le_bytes());
+    assert_eq!(Schema::read(&plain), Ok(unguarded(false)));
+    assert_eq!(Schema::read(&marked), Ok(unguarded(true)));
+    let mut empty = plain.clone();
+    empty.extend_from_slice(&[0, 0, 0, 0, 0]);
+    let len = (empty.len() - 8) as u32;
+    empty[4..8].copy_from_slice(&len.to_le_bytes());
+    assert_eq!(
+        Schema::read(&empty),
+        Err(SchemaError::Undecodable),
+        "an empty mark"
+    );
+    assert!(fine.guards_auth());
+    let refused = MethodId(3);
+    for methods in [
+        vec![guarded(Kind::Query, CredentialGuard::Owner)],
+        vec![guarded(Kind::Workflow, auth(b"vote"))],
+        vec![guarded(Kind::Command, auth(b""))],
+        vec![guarded(Kind::Command, auth(&[b'n'; 65]))],
+        vec![MethodSchema {
+            role: Some(b"minter".to_vec()),
+            ..guarded(Kind::Command, CredentialGuard::Owner)
+        }],
+    ] {
+        assert_eq!(
+            Schema::read(&schema(methods).section()),
+            Err(SchemaError::Credential(refused))
+        );
+    }
+    let longest = schema(vec![guarded(Kind::Command, auth(&[b'n'; 64]))]);
+    assert_eq!(Schema::read(&longest.section()), Ok(longest));
+
+    let anonymous = Principal::Anonymous {
+        scope: [1; 32],
+        nullifier: [2; 32],
+    };
+    let owner = Principal::Owner([3; 32]);
+    assert!(auth(b"vote").admits(&anonymous) && !auth(b"vote").admits(&owner));
+    assert!(CredentialGuard::Owner.admits(&owner) && !CredentialGuard::Owner.admits(&anonymous));
+    assert!(!CredentialGuard::Owner.admits(&Principal::Client([3; 32])));
+    assert!(anonymous.is_credential() && owner.is_credential());
+    assert!(!Principal::Client([0; 32]).is_credential());
+}
+
 /// A method's schema encodes as the agent and the node read it: its id,
-/// name, kind, role, gas and marking, in that order.
+/// name, kind, role, gas, marking and credential guard, in that order.
 #[test]
 fn method_schemas_encode_field_by_field() {
     use vos_wire::schema::MethodSchema;
@@ -243,10 +338,27 @@ fn method_schemas_encode_field_by_field() {
         role: Some(b"r".to_vec()),
         gas: Some(5),
         linearizable: true,
+        credential: None,
     };
     assert_eq!(
         method.encode(),
-        hex("04030201030000006765740101010000007201050000000000000001")
+        hex("0403020103000000676574010101000000720105000000000000000100")
+    );
+    let guarded = MethodSchema {
+        kind: Kind::Command,
+        role: None,
+        gas: None,
+        linearizable: false,
+        credential: Some(Box::new(vos_wire::schema::CredentialGuard::Auth {
+            name: b"v".to_vec(),
+            device: None,
+            once: true,
+        })),
+        ..method
+    };
+    assert_eq!(
+        guarded.encode(),
+        hex("040302010300000067657400000000010001000000760001")
     );
 }
 
@@ -310,6 +422,7 @@ fn codes_keep_their_values() {
         (Failure::Expired, 12),
         (Failure::Target, 13),
         (Failure::Space, 14),
+        (Failure::Credentials, 15),
     ];
     for (failure, code) in failures {
         assert_eq!(failure.code(), code);
@@ -323,13 +436,17 @@ fn codes_keep_their_values() {
         (Refusal::StaleSession, 4),
         (Refusal::SessionsFull, 5),
         (Refusal::KeySessionsFull, 6),
+        (Refusal::CredentialExpired, 7),
+        (Refusal::Replayed, 8),
+        (Refusal::StaleRoot, 9),
+        (Refusal::Once, 10),
     ];
     for (refusal, code) in refusals {
         assert_eq!(refusal.code(), code);
         assert_eq!(Refusal::from_code(code), Some(refusal));
         assert_eq!(refusal.encode(), code.to_le_bytes());
     }
-    for outside in [0u32, 15, u32::MAX] {
+    for outside in [0u32, 16, u32::MAX] {
         assert!(Failure::decode(&outside.to_le_bytes()).is_err());
     }
     // An install's refusal, its failure's detail.
@@ -370,7 +487,7 @@ fn codes_keep_their_values() {
         .concat()
     );
     assert_eq!(gas.failure(), Failure::Cap);
-    for outside in [0u32, 7, u32::MAX] {
+    for outside in [0u32, 11, u32::MAX] {
         assert!(Refusal::decode(&outside.to_le_bytes()).is_err());
     }
     let failed = Outcome::Failed {

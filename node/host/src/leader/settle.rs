@@ -57,6 +57,10 @@ impl Leader {
                     let at = self.applied;
                     let _ = answer.try_send(answered.map(|reply| Answered { reply, at }));
                 }
+                credentialed @ Pending::Credentialed { .. } => credentialed.answer(Ok(Answered {
+                    reply: reply(step),
+                    at: self.applied,
+                })),
                 admin @ Pending::Admin { .. } => admin.answer(Ok(Answered {
                     reply: reply(step),
                     at: self.applied,

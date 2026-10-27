@@ -80,6 +80,12 @@ impl Node {
         self.api.frames.load(Ordering::Relaxed)
     }
 
+    /// The node API's places for credentialed calls' large bodies free
+    /// now, from the socket and QUIC together.
+    pub fn credentialed_places_free(&self) -> usize {
+        self.api.credentialed_free()
+    }
+
     /// Snapshots this node's groups switched to.
     pub fn snapshots_installed(&self) -> u64 {
         self.inner.counters.installed.load(Ordering::Relaxed)

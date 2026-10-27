@@ -190,10 +190,13 @@ fn installs_keep_their_bytes() {
     let installed = Installed {
         derivation,
         roles: vec![(b"m".to_vec(), 7)],
-        schema: Schema { methods: vec![] },
+        schema: Schema {
+            methods: vec![],
+            credentials: false,
+        },
         target: Target::Jam,
     };
-    let record = [&derived[..], &roles, &0u32.to_le_bytes(), &[1]].concat();
+    let record = [&derived[..], &roles, &0u32.to_le_bytes(), &[0], &[1]].concat();
     assert_eq!(installed.encode(), record);
     assert_eq!(
         installed.programs().collect::<Vec<_>>(),

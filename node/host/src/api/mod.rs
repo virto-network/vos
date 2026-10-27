@@ -60,8 +60,9 @@ pub(crate) struct Api {
     nonces: Nonces,
     /// Requests the API's transports brought, the node's HTTP's aside.
     pub(crate) frames: AtomicU64,
-    /// The large bodies' places.
+    /// The large bodies' places: installs', and credentialed calls'.
     pub(crate) large: Arc<smol::lock::Semaphore>,
+    pub(crate) credentialed: Arc<smol::lock::Semaphore>,
 }
 
 /// A read's place among those waiting, given back when it ends, however it
@@ -87,12 +88,56 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// Whether the frame `reader` has part read is large ([`vos_api::LARGE`]).
-fn is_large(reader: &vos_api::Reader, framing: vos_api::Framing) -> bool {
-    reader
-        .header()
-        .and_then(|header| header.body(framing))
-        .is_some_and(|body| body > vos_api::LARGE)
+/// Credentialed calls' bodies past a call's limit held at once, from the
+/// socket and QUIC together, apart from the installs' large bodies. A
+/// credentialed call gives its place back once its proof is verified, so
+/// they bound proofs held and verified, not calls waiting to apply.
+const CREDENTIALED_BODIES: usize = vos_http::CREDENTIALED_LARGE;
+
+/// A large body's place among those its kind's pool holds, given back when
+/// dropped: by the transport once the answer is out, or by a credentialed
+/// call once its proof is verified.
+pub(crate) type LargePlace = Box<dyn Send>;
+
+/// Which large bodies' pool a request of `kind` with a body of `body`
+/// bytes takes a place in, if any: an install's past
+/// [`vos_api::LARGE`], a credentialed call's past a call's limit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Large {
+    Install,
+    Credentialed,
+}
+
+fn large(kind: Kind, body: u32) -> Option<Large> {
+    match kind {
+        Kind::Install if body > vos_api::LARGE => Some(Large::Install),
+        Kind::Credentialed if body > Kind::Call.limit() => Some(Large::Credentialed),
+        _ => None,
+    }
+}
+
+impl Api {
+    /// The places the frame `reader` has part read takes one of, if its
+    /// body is large.
+    fn large_places(
+        &self,
+        reader: &vos_api::Reader,
+        framing: vos_api::Framing,
+    ) -> Option<&Arc<smol::lock::Semaphore>> {
+        let header = reader.header()?;
+        let body = header.body(framing)?;
+        match large(Kind::from_u16(header.kind)?, body)? {
+            Large::Install => Some(&self.large),
+            Large::Credentialed => Some(&self.credentialed),
+        }
+    }
+
+    /// The credentialed calls' places free now.
+    pub(crate) fn credentialed_free(&self) -> usize {
+        std::iter::from_fn(|| self.credentialed.try_acquire())
+            .collect::<Vec<_>>()
+            .len()
+    }
 }
 
 fn decode<T: Decode>(body: &[u8]) -> Result<T, Response> {
@@ -108,12 +153,20 @@ impl Api {
             nonces,
             frames: AtomicU64::new(0),
             large: Arc::new(smol::lock::Semaphore::new(LARGE_BODIES)),
+            credentialed: Arc::new(smol::lock::Semaphore::new(CREDENTIALED_BODIES)),
         }
     }
 
     /// The answer to a request of `kind` holding `body`, which came `via`
-    /// a transport, in SCALE.
-    pub(crate) async fn handle(&self, kind: Kind, body: Vec<u8>, via: Via) -> Vec<u8> {
+    /// a transport holding `large`, its body's place if it is large, in
+    /// SCALE.
+    pub(crate) async fn handle(
+        &self,
+        kind: Kind,
+        body: Vec<u8>,
+        via: Via,
+        large: Option<LargePlace>,
+    ) -> Vec<u8> {
         if matches!(via, Via::Socket | Via::Quic) {
             self.frames.fetch_add(1, Ordering::Relaxed);
         }
@@ -126,12 +179,18 @@ impl Api {
             Kind::Schema => <(AgentId, InstanceId)>::decode_exact(&body)
                 .and_then(|(agent, instance)| self.schema(agent, instance))
                 .encode(),
-            _ => self.respond(kind, body, via).await.encode(),
+            _ => self.respond(kind, body, via, large).await.encode(),
         }
     }
 
     /// The answer to a kind answering a [`Response`].
-    async fn respond(&self, kind: Kind, body: Vec<u8>, via: Via) -> Response {
+    async fn respond(
+        &self,
+        kind: Kind,
+        body: Vec<u8>,
+        via: Via,
+        large: Option<LargePlace>,
+    ) -> Response {
         if kind.operator() {
             return match via {
                 Via::Token => match operator::parse(&self.inner, kind, body).await {
@@ -152,6 +211,15 @@ impl Api {
             },
             Kind::Workflow => match decode(&body) {
                 Ok((agent, read)) => self.workflow(agent, read).await,
+                Err(answer) => answer,
+            },
+            // The body goes once decoded; the proof and the place go once
+            // the proof is verified.
+            Kind::Credentialed => match decode(&body) {
+                Ok((agent, call)) => {
+                    drop(body);
+                    self.inner.credentialed(agent, call, large).await
+                }
                 Err(answer) => answer,
             },
             _ => Response::Rejected(Rejection::Malformed),
@@ -279,5 +347,36 @@ impl Api {
             .flatten()
             .and_then(|bytes| Installed::decode(unstored(&bytes)?).ok());
         installed.map(|(installed, _)| installed.schema)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An install takes an install's place past [`vos_api::LARGE`], a
+    /// credentialed call a credentialed call's past a call's limit, and no
+    /// other kind takes one at any size.
+    #[test]
+    fn large_bodies_take_their_kinds_places() {
+        let call = Kind::Call.limit();
+        assert_eq!(large(Kind::Install, vos_api::LARGE), None);
+        assert_eq!(
+            large(Kind::Install, vos_api::LARGE + 1),
+            Some(Large::Install)
+        );
+        assert_eq!(large(Kind::Credentialed, call), None);
+        assert_eq!(
+            large(Kind::Credentialed, call + 1),
+            Some(Large::Credentialed)
+        );
+        assert_eq!(
+            large(Kind::Credentialed, Kind::Credentialed.limit()),
+            Some(Large::Credentialed)
+        );
+        for kind in [Kind::Call, Kind::Query, Kind::Workflow, Kind::Grant] {
+            assert_eq!(large(kind, kind.limit()), None, "{kind:?}");
+            assert_eq!(large(kind, u32::MAX), None, "{kind:?}");
+        }
     }
 }

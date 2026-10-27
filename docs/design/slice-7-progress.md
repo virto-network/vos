@@ -3072,3 +3072,351 @@ amendments.
 runs, load 2–23]: the touched suites (`credential` 20, `device` 24, the
 fork's grind tests 7, with and without `parallel`); `just check` green;
 `just test-proof` green, 579 passed in 50 suites.
+
+## Step 7.11: the verifier at ingress
+
+Branch `s7/7.11`, from vos-core `920103b3`.
+
+**Built:**
+- **The wire** (`vos-wire`): `Principal::Anonymous { scope, nullifier }`
+  (3) and `Principal::Owner(digest)` (4), never granted a role
+  (`is_credential`); the request `ingress::Credentialed`, its
+  `CredentialPublic` (the index its kind), `CredentialRefusal` (the codes in
+  check order) under `Rejection::Credential` (9); the session-less input
+  `batch::Input::Credentialed` (10, boxed) carrying `CredentialedInput`
+  (the origin, the call, `b`, `expires_ms`, auth's root; no proof, nonce or
+  format) and its step's `InputRef::Credentialed { binding }` (9);
+  `schema::CredentialGuard` (`Auth { name, device, once }`, `Owner`) in
+  `MethodSchema::credential`, validated (a command's alone, no role, not
+  linearizable, a name of 1–64 bytes), and `Schema::credentials`; a
+  program's section carries both after its methods, as `Credentials`, only
+  when there is a guard or the mark, so an unguarded program's section is
+  the one it carried before; `credentials::scope` and `credentials::Bound::digest`
+  (the binding digest, the arguments with their `u32` length) and
+  `credentials::binding`; the system rows `credentials` (the actor's
+  instance), `binding(b) → expires_ms` and `once(scope ‖ nullifier) → t`,
+  and `Due::Binding(b)` (kind 2, its 32 bytes the id), which the sweep's
+  step lists (`Step::Swept { due, bindings }`) and accumulate forgets, a
+  sweep listing up to 64 of them beside its 32 sessions' and workflows'
+  rows (`keys::SweepBudget`, `defaults::SWEEP_BINDINGS`), a refine
+  reserving `DECODE_DUE` (2,000) per listed row;
+  `Failure::Credentials` (15); refine's `CredentialExpired` (7),
+  `Replayed` (8), `StaleRoot` (9), `Once` (10); `defaults::
+  CREDENTIAL_HORIZON_MS` (120 s) and `BINDING_KEPT_MS` (60 s).
+- **The apply rule** (`agent/default/src/refine/credentialed.rs`), by the
+  batch's time: refused, writing nothing, if expired, if `b` is recorded,
+  for auth if the root is not the ring's newest or superseded at most
+  `ROOT_MAX_AGE` before, for `once` if the nullifier is admitted; else `b`
+  and its due row recorded whatever the method does, the method run as the
+  origin (an auth origin whose scope is not its guard's `Forbidden`), and a
+  `once` nullifier recorded only on `Ok`, in the same step. A guard admits
+  its origin's kind alone and a method without one refuses a credential's
+  origin (`invoke`); an install records the credential actor's row, and
+  fails `Failure::Credentials` for a second actor, for the actor's instance
+  replaced by another program, and for an auth guard with no actor; a
+  `SetRole` naming a credential's origin fails `Forbidden`.
+- **The SDK:** `#[msg(credential = Auth("vote"), once)]`,
+  `#[msg(credential = Owner)]`, `device = "..."`, each refused off a
+  `&mut self` handler or beside a role or `linearizable`;
+  `#[actor(credentials)]` (`vos_sdk::state::Marked`), which picks the
+  marked section of the two `#[messages]` makes (`runtime::schema_section`); `ctx.owner()` and `ctx.nullifier()`; the caller's buffer 65 bytes,
+  an `Anonymous`'s. `vos-credentials` is `#[actor(credentials)]`.
+- **The ledger** (`agent/test-actors/purses`, the demo's in 7.13): rows by
+  name (1–32 bytes of UTF-8), each `(owner, balance, frozen)`;
+  `invite_row` and `mint` under `operator`, `claim_row` by any caller
+  before the invitation's expiry and only for the digest it names;
+  `transfer(from, to, amount)` under `Owner`, debiting `from` only while
+  its live owner is the proof's digest and it is not frozen, crediting
+  `to`, which must exist; `balance`, `row`; `rekey` (lifts a freeze) and
+  `freeze` under `operator`. And `poll`: `vote` (`Auth("vote")`, `once`),
+  `vote_again` (`Auth("vote/2")`, `once`), `login` (`Auth("login")`).
+- **Ingress** (`node/host/src/credentialed.rs`): the node API's
+  `Credentialed` (0x0104, 1,642,496 bytes; the node's HTTP and the
+  gateway's `POST /agents/{a}/credentialed` a body of 4 less); the checks
+  in pin I's order on the replica's applied state, the format the proof
+  registry names as the final verifier pins it (`credential::FORMAT`, no
+  literal); then a verification slot (`Config::verifications`, by default
+  twice the executors; past it `Busy`), and the final verifier's
+  `credential::verify_bytes` on an executor (picking the circuit by kind);
+  the `credential` stage in the node's stats. A verified call goes to the
+  leader, queued outside any lane (`Pending::Credentialed`), forwarded by a
+  follower as a call is (`PeerMessage::ForwardCredentialed`, 19), and is
+  answered once this replica applied it. A `Grant` naming a credential's
+  origin is `Malformed`. The client's `credentialed` and `time`.
+- **The fuzz targets** `credentialed_decode` and `credential_verify_bytes`
+  in `just fuzz`, their replay seeds (an honest proof of each kind) from
+  recair's `credential_ingress --seeds`; **`node/SECURITY.md`**.
+
+**Tests:**
+- **The wire** (`agent/wire/tests/wire/credentialed.rs`, `abi.rs`): the
+  origins' indexes; the request, its public statement and the refusal codes
+  in order under `Rejection`'s 9, pinned; the logged input (10) without the
+  proof; `b` as BLAKE2b-256 of its fields at their widths, each field
+  changing it; `binding` and `scope` as their compressions, two agents',
+  two spaces' and two names' scopes distinct, and two spaces sharing a
+  handle giving one secret two nullifiers; the rows and a binding's due row
+  read back; the guards' validation, the section without guards byte for
+  byte the old one, the mark alone after it, an empty mark refused; the new
+  codes; the ring's row key (`credentials::ring_key`, which ingress and
+  the refine share).
+- **Apply** (`agent/testkit/tests/agent/credentialed.rs`, the default
+  agent): an auth guard refused an install without the credential actor, a
+  second actor and the actor's instance replaced each `Failure::
+  Credentials`; owner proofs paying from their rows (the live owner's
+  alone, nothing from a frozen row, a rekeyed row from the new owner's, a
+  transfer to no row refused with the payer's balance kept, a claim of a
+  digest the invitation does not name and one past its expiry refused, the
+  operator's methods under its role); an origin admitted by its guard alone
+  (an owner proof to an unguarded method, an auth proof to an owner guard,
+  a client to a guarded method, each `Forbidden`, the binding recorded; no
+  role granted to a credential's origin); apply's refusals writing nothing
+  (an expired call, a recorded binding from another replica's copy and from
+  a twin in one batch, a root never held) and the sweep forgetting a
+  binding and its row; an auth root fresh for `ROOT_MAX_AGE` after a
+  revocation superseded it and `StaleRoot` a millisecond later, a scope not
+  the guard's `Forbidden`; `once`: a refused vote leaving the nullifier
+  free while its binding is `Replayed`, a second admitted vote `Once`,
+  another scope's guard admitting it; a credentialed call's own work under
+  a step's reserve on both hosts with the ring full (64 roots): 69,601
+  on VOS, 154,040 on JAM, of 300,000; the batch's first auth call, which
+  pays and decodes the ring once for the refine, 157,212 and 241,725.
+- **Ingress** (`node/host/tests/served/credentialed.rs`, three nodes of a
+  founded space, real proofs): each refusal in its check order (413 from
+  the head past the frame; `Malformed`; `NoAgent`; `NoSpace` at an
+  uninstalled agent; then one request failing every check from the format
+  on, mended a check at a time: `Format` for a 1.4 MiB format-43 body,
+  `Size` for it under the credential format and for a 600 KiB proof,
+  `Expiry`, `Method`, `Kind`, `Scope`, `Binding` (and a real proof sent
+  with another call's arguments), `RootUnknown`, `Proof`), the call
+  running, `Replayed` sent again, `Once` before `RootUnknown`, a wrong-PoW
+  proof `Proof`, no log entry holding a proof's bytes; a replay and a
+  `once` race sent to the leader and a follower with the leader's refines
+  held: one runs, the other `Replayed` and `Once` at apply, another scope
+  admitting the nullifier; a root a lagging replica (its commits held) has
+  not applied `RootUnknown` there and admitted at the leader, a root
+  replaced at its own batch time (the clock held back) and one pushed out
+  by 68 later roots each `RootUnknown` and admitted on the path fetched
+  again; a revoked member admitted within `ROOT_MAX_AGE` and `RootStale`
+  past it; owner proofs paying, an old owner's failing after a rekey; a
+  call sent to the leader and one forwarded by a follower, the leader's
+  refines held, each giving its large body's place back once verified,
+  before it applies.
+  `ingress::api`'s per-kind header sizes cover `Credentialed`; the budget's
+  places (`credentialed::tests`); the large bodies' places by kind and
+  size (`api::tests`).
+- **The gateway** (`node/gateway/tests/gateway.rs`): a credentialed call,
+  one that does not decode and one to no agent answer through the gateway
+  as through the node's HTTP, the node's `NoSpace` passed on; `GET /time`.
+- **Pricing:** a sweep of 32 sessions and 64 bindings under its reserve;
+  decoding a sweep of its most rows under `batch_start`.
+
+**Measured** [measured; this machine, Intel Core Ultra 7 155H, 22 logical
+threads (6 P-cores with SMT, 8 E-cores, 2 LP E-cores)]:
+- **The verifier, one thread** (`recair`'s `credential_ingress`, core 1,
+  200 runs after two warm-ups, median / p95): auth verified in 1.87 / 2.11
+  ms, owner 1.78 / 1.85 ms (pin I's ≤ 10 ms); **a wrong PoW refused in
+  0.66 / 0.70 ms** (owner 0.62 / 0.65), under pin I's 1 ms though the
+  composition check runs before the PoW in Stwo's order; a wrong
+  interaction PoW 0.48 / 0.52 ms; a proof cut by a byte 0.18 / 0.18 ms.
+  Proofs 196–206 KB.
+- **The executors' bound (S44), on this laptop** (`cargo bench -p vos-node
+  --bench credentialed`, after the review's folds; one node of a founded
+  space of one, 4 agents, owner transfers over the API's socket, open loop
+  at `100·k` a second for 10 s, a call answered `Busy` sent again a
+  millisecond later; a signed increment at the same rate beside; the
+  node and the generator in one process; `N` = 22 logical threads, 16
+  physical cores of which 6 performance cores). k = 1 to 8 in one run
+  (load 6.4 at its start, the generator's proving then at 22); k = 16
+  and 22 in another (load 3.8 at its start, 10 to 24 while it ran, from
+  other agents' builds):
+
+  | k | asked | achieved | credentialed p50 / p99 | signed p50 / p99 | verify mean | its executor wait | in flight (mean / most) | `Busy` | |
+  |---|---|---|---|---|---|---|---|---|---|
+  | 1 | 100 | 100 | 5.2 / 7.0 ms | 3.6 / 5.1 ms | 1.81 ms | 0.01 ms | 0.5 / 2 | 0 | within |
+  | 2 | 200 | 200 | 5.4 / 6.7 ms | 3.2 / 4.3 ms | 1.98 ms | 0.01 ms | 1.1 / 2 | 0 | within |
+  | 4 | 400 | 400 | 5.8 / 7.1 ms | 3.2 / 4.4 ms | 2.29 ms | 0.01 ms | 2.3 / 5 | 0 | within |
+  | 8 | 800 | 799 | 6.8 / 14.7 ms | 3.3 / 4.6 ms | 2.72 ms | 0.01 ms | 5.8 / 16 | 0 | within |
+  | 16 | 1,600 | 1,037 | 2.6 / 5.4 s | 5.6 / 11.1 ms | 14.4 ms | 10.5 ms | 91.8 / 96 | 5,422 | **missed** |
+  | 22 | 2,200 | 953 | 6.5 / 13.0 s | 8.9 / 18.1 ms | 17.7 ms | 4.6 ms | 95.2 / 96 | 733 | **missed** |
+
+  A first k = 16 run (load 2.4 at its start, 40 before it ended) took
+  1,281 a second, a verification's mean 11.4 ms after 7.8 ms of wait.
+  Each run's proofs are made first, on every thread (about 30 a second
+  here, 15 to 22 minutes for k = 16 and 22 on the shared machine), each
+  good until 115 s past when making them is expected to end, so a run
+  lasts its 10 s or longer. The bound holds to k = 8, where a
+  verification takes 1.8 to 2.7 ms and waits for no executor. At k = 16
+  and 22 it is missed, and not by the places' cap the review found (the
+  calls in flight now stop at the generator's 96 senders, past the 64
+  places, which are given back once a proof is verified): the
+  verifications run at 11 to 18 ms each against 1.8 on a performance
+  core alone, so the executors themselves saturate (16 × 1 / 14.4 ms is
+  1,100 a second; 22 × 1 / 17.7 ms is 1,240), the generator's senders
+  and proofs, the node's runtime and applies, and other agents' builds
+  sharing the 22 threads. `100·k` a second on `k` executors leaves each
+  call 10 ms of an executor, verification and apply together, so a host
+  whose threads verify in more than about 7 ms under full load misses
+  the gate as S44 worded it, whatever the node does; the previous table's
+  k = 22 miss (1,738 a second over a 1.4 s run, before these folds) was
+  also the 64 places held through the apply wait (64 / 1,738 a second
+  is 37 ms a call). S55 measures the gate on compumax, the node pinned
+  to its performance cores, the generator on the desktop over QUIC
+  (`credentialed serve` and `drive`), runs of 10 s; this table is the
+  laptop's.
+- **An honest proof refused** [measured]: of 30,000 owner proofs made
+  and verified directly (`verify_bytes`), one was refused
+  (`Stark(Fri(InnerLayerCommitmentInvalid { inner_layer: 7, error:
+  RootMismatch }))`), and one of the bench's 16,000 at k = 16 was
+  answered `Proof` at ingress: a completeness failure of the format-42
+  prover and verifier pair at about one proof in 30,000, found here and
+  not fixed in 7.11 (below, left).
+
+**Where the plan was off:**
+- **The schema's section** could not simply grow a field: the section is
+  in every kernel's read-only data, so a byte more in every program's
+  section moved `WINDOW_PROGRAM` and the fixtures with it. The guards and
+  the mark follow the methods only when there are any, so unguarded
+  programs keep their sections byte for byte. `BALANCE_PROGRAM` moved all
+  the same: its served reads format a row key's `Failure`, which gained
+  `Credentials` (re-pinned in `pvm/proof/src/constants.rs`; no fixture
+  holds it). `WINDOW_PROGRAM`, `PREDICATE_PROGRAM` and the derive pins
+  are unchanged.
+- **A larger principal** (an `Anonymous`'s 65 bytes, the request's caller
+  copied in every decode) and the guards' field raised the agent's own
+  costs past their reserves: `DECODE_INPUT` 6,000 → 7,000,
+  `INSTALL_RESERVE` 9M → 10M, `RECORD_BYTE` 64 → 68; refine's `Call`
+  takes its caller by reference. The SDK's caller buffer grew to 65 bytes.
+- **A VOS node logs work results,** not batches: "the origin logged"
+  holds of the batch refine (and a JAM package) carries; the node's log
+  carries the run's effects and `InputRef::Credentialed { b }`, and the
+  test asserts no entry holds a proof.
+- **The format number:** ingress admits the final verifier's
+  `credential::FORMAT`, which its test pins to the registry's
+  `CREDENTIAL_PROOF`, so 7.12's choice of 44 moves one constant.
+- **`Time`** and `GET /time` were 7.10b's; 7.11 added the client's `time`.
+- **The binding set's sweep** needed its own budget (the review's M3) and
+  a refine its decode reserve per listed row: the leader's first listing
+  of 288 rows ran past `batch_start` and trapped the refine.
+- **Busy** is tested on the budget's places, not end to end: a
+  credentialed call reaches the slot only past every state check, on a
+  founded space whose harness fixes the node's config.
+
+**Review (Opus):** no high finding; the authority core (the binding's
+fields, the program by kind, `verify` never `verify_with`, the twin in one
+batch, the `once` row on `Ok` alone, every invocation gated, no role for a
+credential's origin, one scope source, the ring's key, the binding kept
+past any copy's admission) checked and holding. Folded: M1 (credentialed
+bodies of 1.6 MB counted against no budget: their own places, 64 on the
+node API and on each HTTP front, apart from the installs'); M2 (a
+follower answering a forwarded `Replayed` before it applied the first run,
+so a client reading state there could pay again: answered once it holds
+the binding); M3 (binding rows in the sweep's 32 could hold timers back:
+their own budget of 64, and a decode reserve per listed row); L1 (a
+credentialed call's own work measured on both hosts); L2 (the budget's
+place goes with the executor's job); L3 (a statement with a word at or
+above p spends no verification); L5 (a ring the meter cannot pay consumes
+the input unrecorded: documented); the nits (the module doc's "before its
+proof is decoded"; a forwarded input's trust in `node/SECURITY.md`). Not
+taken: L4 (ingress decodes the instance's installed record per request:
+a cache per installed version is for 7.13's load, noted).
+
+**Review (Fable):** fix-then-merge; M1–M3 (+Ls) folded
+(`research/slice-7/7.11-fable.md`). The authority core, the check order,
+the apply rule and the replicated rows found as pinned. Folded:
+- **M1** (a credentialed body and its large place held through the apply
+  wait and a forward's, up to 30 s: the node's credentialed concurrency
+  64, and one member with 64 valid proofs to a follower of a slow leader
+  could hold every place): the body is dropped once decoded and the place
+  goes with the proof once it is verified (`api::LargePlace`, handed from
+  the socket, QUIC and the node's HTTP, whose server now hands a large
+  body's place to its handler, `vos_http::Request::large`, and drops the
+  request's bytes from its buffer before the handler runs). Tested served
+  (a call to the leader and one forwarded by a follower, the leader's
+  refines held, each place given back before the apply) and by kind and
+  size (`api::tests`, the review's L8). The gateway keeps its body, and
+  its place, until the node answers, as it relays the body whole:
+  `node/SECURITY.md` says so.
+- **M2** (the ring paid `RECORD_BYTE × len` and decoded on every auth
+  call, measured on a ring of two): paid and decoded once a refine
+  (`Base::ring`, cleared by a step writing the ring's row and by an admin
+  step), re-measured on a full ring (above, both hosts).
+- **M3**: this entry's rate paragraph, `node-api.md` (credentialed bodies
+  are large, their places given back once verified), `node/SECURITY.md`
+  (the places' concurrency, the gateway's, the binding drain).
+- **L1** (a follower lagging past a binding's sweep answering a forwarded
+  `Replayed` as `TimedOut`): it answers `Replayed` once it holds the
+  binding or has applied a batch past the call's expiry, by then the
+  run's batch is applied there.
+- **L2:** `credentials::ring_key`, the ring's row key once, for ingress and
+  the refine, pinned by a wire test.
+- **L3:** `first_due` reads the due index to its first row, not a sweep's
+  listing.
+- **L4:** the drain stated (`defaults::SWEEP_BINDINGS`,
+  `node/SECURITY.md`): 64 bindings a sweep, a sweep a batch while rows
+  are due, so sustained credentialed calls past 64 a batch grow the
+  binding rows until the load falls, and more than 96 due bindings ahead
+  of a session's or a workflow's row hold that row until they drain. The
+  rate bench's heaviest load (2,200 a second over four agents, 550 an
+  agent) stays under it while each agent runs 9 batches a second or more.
+- **L5:** with M3.
+- **L6:** the 7.10b hand-off on the operator nonce margin was taken
+  before 7.11, on vos-core (`21c8c1d6`, `api::operator::may_forget`: a
+  nonce kept `HORIZON_MS` past its expiry); the review read the branch's
+  own commits only.
+- **L7:** the bench prints the calls in flight (mean and most), the
+  verifications' executor wait (the node's `credential_queue` stage) and
+  the `SENDERS` bound, and sends a call answered `Busy` again.
+Not taken: the note on the apply-time scope re-check (kept; it guards
+against a node logging a scope not its guard's, and costs a hash and a
+compression). Q1 answered by the owner as S55 (above, and the plan's
+pin I and 7.11 gate).
+
+**Left:**
+- **S55's run on compumax** (the owner at the key; scheduled apart): the
+  node under `taskset` on the performance cores, `credentialed serve
+  --listen 0.0.0.0:PORT --executors k`, the desktop running the `drive`
+  line it prints, for each `k` up to those cores; `N` recorded as the
+  physical cores and the logical threads.
+- **The honest proof refused** (above): one format-42 owner proof in about
+  30,000 fails its FRI inner layer 7's decommitment (`RootMismatch`), a
+  completeness failure of the prover and verifier pair (the masked
+  prover and the Stwo fork's FRI), not of ingress; a member's device
+  proves again and the call goes through. The failing proof, the
+  `Credentialed` encoding of a bench call, was kept outside the
+  repository for whoever takes it up.
+- The gateway's HTTP holds a credentialed body's place until the node
+  answers (`node/SECURITY.md`); handing it back once the body is sent on
+  would need the upstream's request split from its answer.
+
+**Commits:** `18d1a80f` apply, the guards, the rows, the ledger; `43d2a87f`
+ingress, the kind, the gateway's route, the tests, the bench, the fuzz
+targets, `node/SECURITY.md`; `f5ae9fdf` the budget's places, another
+call's arguments, two spaces' nullifiers; `c36fe3c6` the decode target;
+`29bca4ed` the review's folds; `b909b175` the section format and the
+balance kernel's re-pin; this record and the bench's sizing. The Fable
+review's folds: `3655d50d` M1 and the executor wait; `b8301c48` M2 and L2;
+`f0ba9262` L1 and L3; `1941c258`, `cfdd2ef4`, `a7928932`, `ee3ad377`,
+`c6cc3a16` the bench (L7, its 10 s runs, its `serve` and `drive` modes);
+`242f275d` M3, L4 and L5 in the docs; `285e939c` S55; `db432858` the
+review and this record; `fa91abb8` vos-scale's requests; `4b3e0e68` the
+ring's key inline (as a plain function it moved `WINDOW_PROGRAM`, the
+wire's codegen shifting though the window kernel never calls it); the
+gates.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 8 jobs, other agents'
+runs on the machine]: the touched suites (the wire's 51, the testkit's
+166, the served `credentialed` 4, `ingress` 41, the gateway's
+differential corpus, `vos-node`'s 81, the compiler's, `kernel
+constants::`, the prover's `masked`); the two new fuzz targets' replays;
+`just check` green at `43fac86f` (exit 0, 1,626 passed in 122 suites). Not run:
+`test-proof` beyond `kernel constants::` (no AIR or fixture moved), the
+gateway's `ssh` feature. Fixed on the way: `prove::the_slot_does_not_move_the_shape`
+compared each tree's queried values per column, which follow the distinct
+query positions (42 or 43 as the coins fall): it compares the trees'
+columns.
+After the Fable review's folds [measured; the same scope, other agents'
+runs on the machine]: the wire's `credentialed` 6, the testkit's
+`credentialed` 6, the served `credentialed` 5, `vos-http`'s, `vos-node`'s
+`api::` and `credentialed::` units; `just check` green at `4b3e0e68`
+(exit 0, 1,629 passed in 122 suites). The rate bench as above; the
+compumax run is S55's, left.

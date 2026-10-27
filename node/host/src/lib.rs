@@ -11,6 +11,7 @@ mod api;
 mod asking;
 mod calls;
 pub mod client;
+mod credentialed;
 mod dispatch;
 mod executor;
 mod fault;

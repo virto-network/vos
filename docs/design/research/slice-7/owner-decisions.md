@@ -361,3 +361,16 @@ S50. **7.10b's start** (Q5): now, beside 7.9 and 7.10, its dependency 7.7
 
 S51. **The source input's domain tag** (Q6): `"vos/device/input/v1"`,
   replacing `"vos/prf/v1"` everywhere.
+
+## On Fable's review of 7.11 (2026-10-27)
+
+On its question Q1 (`7.11-fable.md`, "fix-then-merge"). [decided]
+
+S55. **How S44 is measured** (Q1, option (b)): `k` up to the host's
+  physical performance cores, the node pinned to them, the load generator
+  on another machine over QUIC, each run at least 10 s, `N` recorded as
+  the physical cores and the logical threads. Measured once, on compumax,
+  the desktop as the generator; the development machine's table stays as
+  measured there. A bound per verification may join pin I's gates: a
+  verification on one executor under full load within 5 ms on average.
+  Narrows S44. (2026-10-27)
