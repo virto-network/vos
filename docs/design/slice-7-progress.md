@@ -3292,3 +3292,15 @@ targets, `node/SECURITY.md`; `f5ae9fdf` the budget's places, another
 call's arguments, two spaces' nullifiers; `c36fe3c6` the decode target;
 `29bca4ed` the review's folds; `b909b175` the section format and the
 balance kernel's re-pin; this record and the bench's sizing.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 8 jobs, other agents'
+runs on the machine]: the touched suites (the wire's 51, the testkit's
+166, the served `credentialed` 4, `ingress` 41, the gateway's
+differential corpus, `vos-node`'s 81, the compiler's, `kernel
+constants::`, the prover's `masked`); the two new fuzz targets' replays;
+`just check` green at `43fac86f` (exit 0, 1,626 passed in 122 suites). Not run:
+`test-proof` beyond `kernel constants::` (no AIR or fixture moved), the
+gateway's `ssh` feature. Fixed on the way: `prove::the_slot_does_not_move_the_shape`
+compared each tree's queried values per column, which follow the distinct
+query positions (42 or 43 as the coins fall): it compares the trees'
+columns.
