@@ -30,7 +30,7 @@ vos-anchor = { path = "../anchor", features = ["vectors"] }
 vos-api = { path = "../../../node/api" }
 vos-wire = { path = "../../../agent/wire" }
 postcard = { version = "1", features = ["alloc"] }
-stwo = { git = "https://github.com/olanod/stwo", rev = "c3ec981357a0053e373e00f1057ec5a62675f7eb", default-features = false }
+stwo = { git = "https://github.com/olanod/stwo", rev = "4cd1f83ff4c090afcd3362e27e2d34eb634a0161", default-features = false }
 
 # Skip the test profile's default panic strategy override;
 # libfuzzer-sys requires panic=abort on its own targets.

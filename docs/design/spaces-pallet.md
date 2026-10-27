@@ -223,7 +223,7 @@ VOS writes the kit; Kreivo vendors it whole and edits none of it.
     `vos-pvm-recair-air` and `vos-pvm-poseidon2`: their sources, and
     concrete manifests: no workspace inheritance, each other by path,
     Stwo a git dependency at VOS's pin
-    (`https://github.com/olanod/stwo`, `rev = c3ec9813…`) with
+    (`https://github.com/olanod/stwo`, `rev = 4cd1f83f…`) with
     `default-features = false`; no dev-dependencies, tests or bins (they
     stay in VOS; `[lib] test = false`, so `cargo test --workspace` in
     Kreivo, which takes path dependencies under its root as members,

@@ -260,8 +260,9 @@ paths` lists what each input reaches. The paths it covers are recorded in
 
 ## The Stwo fork's open divergences
 
-The workspace pins olanod/stwo at `c3ec9813` (`vos/verify-panics`, on
-`vos/wrap`'s `ab294189`). Its divergence
+The workspace pins olanod/stwo at `4cd1f83f` (`vos/grind-chunks`: the
+prover's parallel grind in chunks of 2^14 nonces, its nonce unchanged, on
+`vos/verify-panics`' `c3ec9813`, on `vos/wrap`'s `ab294189`). Its divergence
 log (`.claude/skills/paper-implementation-divergence-log.md`) holds two
 open items both wraps' counts rest on, and one the verifier's
 panic-freedom does:
@@ -272,7 +273,7 @@ panic-freedom does:
   sample point whose `y` is its own conjugate; a conjugate line through a
   queried point), each with a unit test from a constructed point. The
   accepted set is unchanged. Branch `vos/verify-panics` (`c3ec9813`), on
-  `ab294189`: the pin.
+  `ab294189`, under the pin.
 - **DIVERGENCE-011:** the first FRI round folds by `2^fold_step`, the
   circle fold in it. The security tool counts it so; a model counting the
   circle fold as its own round would differ by about 0.8 bits on the fold
