@@ -3292,3 +3292,15 @@ documented). For the merge: 7.11 replaces `vos_api::CREDENTIALED` with
 **Commits:** `5f8678fb` format 44 registered, 42 retired; `814caf3c` the
 device library and the phone bench; `95950c51` session P2's record; this
 record and the plan's text.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, another agent's
+runs at times]: `just check` at `11bef490` green through the formatting,
+the docs, the venue rules, the no-std builds, the leak gates (the new
+`seeded-masks` row among them), the kit, the guests, the fuzz replay, the
+lints, the core crates (`vos-device`'s 8 among them) and `test-recair`;
+in the agent crates `vos-checker`'s
+`a_held_tcp_port_takes_no_listener_and_resets_what_connects` failed once
+(`AddrInUse` rebinding its port, other agents' runs binding ports
+beside it; untouched here) and passed 3 of 3 alone; the agent crates
+rerun with `--no-fail-fast`, 699 passed in 53 suites, and `test-reads`
+green. `just test-proof` green, 579 passed in 50 suites.
