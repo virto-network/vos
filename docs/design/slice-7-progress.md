@@ -3818,3 +3818,31 @@ One Opus review of the commit, no High; folded:
   destructuring, whose renames are `Body::Closed`'s fields; refine's copy
   of the payload (`RefineArgs` owns it), a few hundred gas; L3 and L4,
   recorded above.
+
+### Stopped at (wind-down, before the step's gates)
+
+- **Done:** every item in the table above, the review folded, `blobs.lock`
+  (30 blobs) reproduced from a clean clone at another path
+  (`just check-blobs` there: 30 of 30). No item's definition was missing;
+  4's guest half (7.1 landed it) and 17–19 (no piece outside 7.8a's)
+  needed no code.
+- **Left:** the default agent's and the Wasm blobs' path dependence (not
+  in the lock; the owner's lever above); `pvm/codec/src/anchor.rs`'s
+  offsets (item 25, Low); `vos-pvm-guest-rt` (item 23's later crate).
+- **Gates so far** [measured]: the first `just check` passed everything up
+  to `check-blobs` (then failing only on a lock written before
+  `cargo fmt`, since rewritten). The second, at `06bcc094`, passed
+  `fmt-check`, `doc-check`, `check-venue-rules`, `check-no-std` with
+  `check-blobs` (30 blobs), `check-no-leaks` and `check-kit`, and was
+  stopped in `fuzz-replay`. `kernel constants::` passes (no pinned id
+  moved); `vos-anchor`'s, `vos-statement`'s (fixtures feature) and the
+  service's suites, and `vos-wire`'s, pass.
+- **Vectors and fixtures:** expected to be unchanged (no encoding moved; no
+  program id moved), not yet confirmed: the conformance vectors' generator
+  runs in `check`'s agent crates, and the fixtures' generator in
+  `test-proof`.
+- **Next:** rerun `just check` to `exit=0`; then
+  `cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators`
+  alone (a heavy run) to confirm the fixtures. Then the step is done (no
+  merge or push). The scratch worktree `s78b-base` (at `4a143e9f`, used
+  for the baseline blobs) can be removed with `git worktree remove`.
