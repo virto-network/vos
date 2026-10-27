@@ -11,8 +11,10 @@
 //! `100·k` a second, each good until 115 s past when making them all is
 //! expected to end (a proof expires at most 120 s after the node's time),
 //! the run waiting for that moment if they were made sooner; then they are
-//! sent open loop at `100·k` a second by `SENDERS` threads, the latency of
-//! each from the time it was due; then signed increments at the same rate,
+//! sent open loop at `100·k` a second by `SENDERS` threads, a call
+//! answered `Busy` (past the node's verification budget) sent again a
+//! millisecond later as a client would, the latency of each from the time
+//! it was due; then signed increments at the same rate,
 //! the same way. `SENDERS` bounds the calls in flight, so the generator
 //! sends at most `SENDERS / latency` a second: a run reports its calls in
 //! flight, the mean and the most, to show it was not the bound. The node's
@@ -261,17 +263,24 @@ impl Reached {
 }
 
 /// A run's sends: the latency of each from when it was due, the seconds
-/// from the first due to the last answered, and the calls in flight, on
-/// average (the time spent sending over the run's) and at most.
+/// from the first due to the last answered, the calls in flight, on
+/// average (the time spent sending over the run's) and at most, and the
+/// sends answered `Busy`.
 struct Driven {
     latencies: Vec<Duration>,
     elapsed: f64,
     in_flight: f64,
     most: usize,
+    busy: usize,
 }
 
+/// A call answered `Busy` is sent again after this, as a client would:
+/// nothing of it ran.
+const AGAIN: Duration = Duration::from_millis(1);
+
 /// Each of `count` sends at `rate` a second, open loop, by `SENDERS`
-/// threads. `send` makes the `i`th.
+/// threads, each again while it is answered `Busy`, its latency counting
+/// the waits. `send` makes the `i`th.
 fn drive(
     count: usize,
     rate: f64,
@@ -279,12 +288,13 @@ fn drive(
 ) -> Driven {
     let next = AtomicUsize::new(0);
     let (flying, most, sending) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicU64::new(0));
+    let busy = AtomicUsize::new(0);
     let start = Instant::now() + Duration::from_millis(100);
     let latencies = std::sync::Mutex::new(Vec::with_capacity(count));
     std::thread::scope(|scope| {
         for sender in 0..SENDERS {
             let (next, latencies, send) = (&next, &latencies, &send);
-            let (flying, most, sending) = (&flying, &most, &sending);
+            let (flying, most, sending, busy) = (&flying, &most, &sending, &busy);
             scope.spawn(move || {
                 loop {
                     let index = next.fetch_add(1, Ordering::SeqCst);
@@ -297,7 +307,12 @@ fn drive(
                     }
                     most.fetch_max(flying.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                     let sent = Instant::now();
-                    let answer = send(sender, index);
+                    let mut answer = send(sender, index);
+                    while matches!(answer, Ok(Response::Busy)) {
+                        busy.fetch_add(1, Ordering::Relaxed);
+                        std::thread::sleep(AGAIN);
+                        answer = send(sender, index);
+                    }
                     assert!(
                         answer.as_ref().is_ok_and(ran),
                         "call {index} did not run: {answer:?}"
@@ -317,6 +332,7 @@ fn drive(
         elapsed,
         in_flight: sending.into_inner() as f64 / 1e9 / elapsed,
         most: most.into_inner(),
+        busy: busy.into_inner(),
     }
 }
 
@@ -394,8 +410,8 @@ fn run(reached: &Reached, client_target: &Target, executors: usize, seconds: f64
     println!(
         "    {verified} verifications, mean {verify:.2} ms each after {queue:.2} ms waiting for an \
          executor; credentialed calls in flight {:.1} on average, {} at most, of {SENDERS} \
-         senders",
-        credentialed.in_flight, credentialed.most
+         senders; {} sends answered Busy and sent again",
+        credentialed.in_flight, credentialed.most, credentialed.busy
     );
 }
 
