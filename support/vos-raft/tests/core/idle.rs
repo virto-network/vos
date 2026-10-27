@@ -233,3 +233,65 @@ fn a_leader_whose_appends_go_unanswered_steps_down_though_the_node_is_heard() {
     core.take_actions();
     assert_eq!(core.role(), Role::Follower);
 }
+
+#[test]
+fn a_follower_is_quiescent_while_its_leader_is_vouched_for() {
+    let mut core = follower(1, &[1], 1);
+    assert!(!core.quiescent(0), "no leader heard yet");
+    core.receive(LEADER_A, append(1, LEADER_A, (1, 1), 1, &[]));
+    core.take_actions();
+    // Heard at 0, its stickiness holds until 150: a host that notices a
+    // lapse within 50 may stop ticking it, one that needs 150 may not.
+    assert!(core.quiescent(50));
+    assert!(!core.quiescent(150));
+    core.tick(120);
+    core.take_actions();
+    assert!(!core.quiescent(50), "120 and 50 reach 150");
+    core.vouch(120, |_, _| Some(110), |_| None);
+    assert!(core.quiescent(50), "vouched for at 110");
+    // Its leader no longer listed, the deadline lapses: a pre-candidate
+    // keeps its timers.
+    core.tick(1_000);
+    assert!(
+        sent(&core.take_actions())
+            .iter()
+            .any(|message| matches!(message, Message::PreVote { .. }))
+    );
+    assert!(!core.quiescent(0));
+}
+
+#[test]
+fn an_idle_leader_is_quiescent_once_every_member_is_caught_up_and_heard() {
+    let mut core = idle_leader_of_three();
+    assert!(!core.quiescent(0), "a heartbeat round is due");
+    // The round finds both caught up: check-quorum's is the only deadline.
+    core.tick(1_000 + 60);
+    core.take_actions();
+    assert!(core.quiescent(0));
+    // A member's node unheard: the leader keeps its timers.
+    core.vouch(
+        1_000 + 70,
+        |_, _| None,
+        |node| (node == LEADER_A).then_some(1_000 + 65),
+    );
+    assert!(!core.quiescent(0));
+    core.vouch(1_000 + 80, |_, _| None, |_| Some(1_000 + 75));
+    assert!(core.quiescent(0));
+    // An entry on its way keeps it ticking.
+    core.propose(1, vec![1]);
+    let actions = core.take_actions();
+    persist(&mut core, writes(&actions).last().unwrap());
+    core.take_actions();
+    assert!(!core.quiescent(0));
+}
+
+#[test]
+fn a_leader_with_a_read_waiting_is_not_quiescent() {
+    let mut core = idle_leader_of_three();
+    core.tick(1_000 + 60);
+    core.take_actions();
+    assert!(core.quiescent(0));
+    core.read_index(9, None);
+    core.take_actions();
+    assert!(!core.quiescent(0));
+}

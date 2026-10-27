@@ -56,7 +56,7 @@ pub(crate) struct Run {
     pub(crate) shared: Arc<Shared>,
     pub(crate) inbox: Inbox,
     /// The leader loop's proposals and its retirement, never dropped.
-    local: smol::channel::Sender<Local>,
+    pub(crate) local: smol::channel::Sender<Local>,
     tasks: Mutex<Vec<smol::Task<()>>>,
 }
 
@@ -400,6 +400,7 @@ impl Inner {
             stats.groups.replicas += 1;
             stats.groups.leading += u64::from(state.role == vos_raft::Role::Leader);
             stats.groups.terms += state.term;
+            stats.groups.quiet += u64::from(lock(&run.shared.quiet).is_some());
         }
         stats
     }

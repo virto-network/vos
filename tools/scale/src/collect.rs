@@ -54,6 +54,7 @@ pub fn poll(inventory: &Inventory, run: &Run, stop: &AtomicBool) -> Result<(), S
                         "replicas": stats.groups.replicas,
                         "leading": stats.groups.leading,
                         "terms": stats.groups.terms,
+                        "quiet": stats.groups.quiet,
                     });
                     serde_json::Value::Object(
                         stats

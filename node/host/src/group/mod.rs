@@ -78,6 +78,10 @@ impl Inbox {
     pub(crate) fn close(&self) {
         self.sender.close();
     }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.sender.is_empty()
+    }
 }
 
 /// What a group hears from its own leader loop, never dropped.
@@ -146,6 +150,18 @@ impl Local {
     }
 }
 
+/// Why a group's driver waits on no timer of its own: the pair
+/// heartbeat's thread wakes it once this no longer holds
+/// ([`crate::liveness`]), and its timers take over again.
+#[derive(Clone, Debug)]
+pub(crate) enum Quiet {
+    /// It follows `leader` at `term`, which lists the group.
+    Following { leader: NodeNumber, term: u64 },
+    /// It leads, every one of `members` holds every entry and the commit,
+    /// and each one's node is heard.
+    Leading { members: Vec<NodeNumber> },
+}
+
 /// How many results' outcomes a group remembers, for its leader loop to
 /// read after its own apply.
 const OUTCOMES: usize = 256;
@@ -196,6 +212,8 @@ pub(crate) struct Shared {
     /// clock: a leader whose driver stopped going round is not vouched
     /// for.
     pub woke: AtomicU64,
+    /// Set while the driver waits on no timer of its own, and why.
+    pub quiet: Mutex<Option<Quiet>>,
 }
 
 impl Shared {
@@ -223,6 +241,7 @@ impl Shared {
             outcomes: Mutex::new(VecDeque::new()),
             applying: smol::lock::Mutex::new(()),
             woke: AtomicU64::new(0),
+            quiet: Mutex::new(None),
         }
     }
 

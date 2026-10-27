@@ -17,12 +17,12 @@ mod fetch;
 mod membership;
 mod snapshot;
 
-use super::{Input, Local, MembershipChanged, Proposed, ReadIndexed, Shared};
+use super::{Input, Local, MembershipChanged, Proposed, Quiet, ReadIndexed, Shared};
 use crate::blobs::Held;
 use crate::node::Inner;
 use crate::raft::{self, EntryReports};
-use crate::random;
 use crate::storage::Change;
+use crate::{lock, random};
 use fetch::Fetch;
 use membership::established;
 use snapshot::{INSTALL_IDLE, STREAM_HOLD, Snapshots};
@@ -33,6 +33,11 @@ const ROUND: usize = 1024;
 
 /// How long a read index may wait for a quorum to confirm the leader.
 const READ_INDEX_MS: u64 = 2_000;
+
+/// A quiet group's driver still goes round once every this many of the
+/// election timeout's upper end: should the pair heartbeat's thread fail
+/// to wake it, its own timers take over then.
+const QUIET_ROUNDS: u32 = 10;
 
 enum Event {
     Input(Input),
@@ -266,12 +271,10 @@ impl Driver {
                 self.shared
                     .woke
                     .store(self.inner.liveness.elapsed(), Ordering::Relaxed);
-                // An idle core may need no tick at all.
-                let mut wake = self
-                    .start
-                    .checked_add(Duration::from_millis(self.core.next_deadline()));
+                // What the driver waits for besides the core.
+                let mut other: Option<Instant> = None;
                 let mut sooner = |at: Instant| {
-                    wake = Some(wake.map_or(at, |wake| wake.min(at)));
+                    other = Some(other.map_or(at, |other| other.min(at)));
                 };
                 if let Some(due) = self.fetch.due() {
                     sooner(due);
@@ -287,6 +290,25 @@ impl Driver {
                 {
                     sooner(staged + STREAM_HOLD);
                 }
+                // A quiet core's timers are the pair heartbeat's to stand
+                // in for: the driver sleeps until a message, a local, the
+                // pair heartbeat's wake, or its long round.
+                let quiet = other.is_none().then(|| self.quiet()).flatten();
+                let quiesced = quiet.is_some();
+                *lock(&self.shared.quiet) = quiet;
+                let wake = if quiesced {
+                    let round = Duration::from_millis(self.inner.settings.election_timeout_ms.1);
+                    Some(Instant::now() + round * QUIET_ROUNDS)
+                } else {
+                    // An idle core may need no tick at all.
+                    let core = self
+                        .start
+                        .checked_add(Duration::from_millis(self.core.next_deadline()));
+                    match (core, other) {
+                        (Some(core), Some(other)) => Some(core.min(other)),
+                        (core, other) => core.or(other),
+                    }
+                };
                 let event = async {
                     match local.recv().await {
                         Ok(local) => Event::Local(local),
@@ -307,10 +329,17 @@ impl Driver {
                     Event::Timer
                 })
                 .await;
+                if quiesced {
+                    *lock(&self.shared.quiet) = None;
+                    self.shared
+                        .woke
+                        .store(self.inner.liveness.elapsed(), Ordering::Relaxed);
+                }
                 let now = self.now();
                 // A deadline due runs only once the pair heartbeat had its
-                // say.
-                if self.core.next_deadline() <= now {
+                // say, as does a round after a quiet wait, whose timers it
+                // stood in for.
+                if quiesced || self.core.next_deadline() <= now {
                     self.vouch(now);
                 }
                 self.core.tick(now);
@@ -360,6 +389,36 @@ impl Driver {
             local.refuse_stopped();
         }
         self.answers.stop();
+    }
+
+    /// Why the driver may wait on no timer of its own now, if it may: the
+    /// core needs no tick but those the pair heartbeat stands in for, which
+    /// notices a lapse within a round of it.
+    fn quiet(&self) -> Option<Quiet> {
+        if !self.core.quiescent(self.inner.settings.heartbeat_ms) {
+            return None;
+        }
+        let status = self.core.status();
+        match status.role {
+            Role::Follower => Some(Quiet::Following {
+                leader: status.leader_hint?,
+                term: status.current_term,
+            }),
+            Role::Leader => {
+                let me = self.inner.number;
+                let mut members: Vec<NodeNumber> = status
+                    .members
+                    .iter()
+                    .chain(status.joint_old.iter().flatten())
+                    .copied()
+                    .filter(|&member| member != me)
+                    .collect();
+                members.sort_unstable();
+                members.dedup();
+                Some(Quiet::Leading { members })
+            }
+            Role::PreCandidate | Role::Candidate => None,
+        }
     }
 
     fn take(&mut self, input: Input) {

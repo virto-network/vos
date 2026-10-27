@@ -4,6 +4,9 @@
 //! peer table, which its groups' drivers read to vouch for their leaders
 //! and members before their own timers lapse
 //! ([`vos_raft::core::Core::vouch`]): an idle group then sends nothing.
+//! A group whose core needs no tick but those this stands in for waits on
+//! no timer at all ([`crate::group::Quiet`]): each round wakes those whose
+//! leader stopped listing them, or with a member whose node fell silent.
 //! Whatever goes wrong here leaves Raft's own timing in charge.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -18,7 +21,7 @@ use vos_raft::pair::PeerTable;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{Leading, NodeNumber, PeerMessage, Placement};
 
-use crate::group::Local;
+use crate::group::{Local, Quiet};
 use crate::node::Inner;
 use crate::peer;
 use crate::{lock, timeout};
@@ -176,6 +179,7 @@ async fn beat(inner: Arc<Inner>) -> Ended {
             stalled = !stalled;
             inner.to_led(None, || Local::Wake);
         }
+        inner.wake_quiet();
         let round = inner.liveness.next_round();
         // None listed while the writer is stalled, so their followers elect
         // leaders that can write, and none that is not live.
@@ -226,7 +230,8 @@ fn frames(incarnation: u64, round: u64, listed: &[Leading], size: usize) -> Vec<
 impl Inner {
     /// The groups this node leads, at their terms, each with its placement
     /// when known, and whether it is live: not stopped, and its driver gone
-    /// round in two election timeouts.
+    /// round in two election timeouts, or quiet with nothing waiting for
+    /// it.
     fn led(&self) -> Vec<(Leading, Option<Placement>, bool)> {
         let now = self.liveness.elapsed();
         let stuck = 2 * self.settings.election_timeout_ms.1;
@@ -235,7 +240,10 @@ impl Inner {
             .filter_map(|(agent, run)| {
                 let state = run.shared.state();
                 let woke = run.shared.woke.load(Ordering::Relaxed);
-                let live = !state.stopped && now.saturating_sub(woke) < stuck;
+                let quiet = lock(&run.shared.quiet).is_some()
+                    && run.inbox.is_empty()
+                    && run.local.is_empty();
+                let live = !state.stopped && (now.saturating_sub(woke) < stuck || quiet);
                 let leading = Leading {
                     agent: *agent,
                     term: state.term,
@@ -252,6 +260,39 @@ impl Inner {
                 (leading, placement, live)
             })
             .collect()
+    }
+
+    /// Wake each quiet group whose quiet the pair heartbeat no longer
+    /// vouches for, or will not by the next round: a follower whose leader
+    /// has not listed the group at its term within the election timeout's
+    /// lower end, a leader with a member whose node has not been heard
+    /// within its upper end, as [`vos_raft::core::Core::vouch`] judges
+    /// them.
+    fn wake_quiet(&self) {
+        let (low, high) = self.settings.election_timeout_ms;
+        let ahead = Instant::now() + Duration::from_millis(self.settings.heartbeat_ms);
+        let lapsed = |at: Option<Instant>, within: u64| {
+            at.is_none_or(|at| at + Duration::from_millis(within) <= ahead)
+        };
+        let due: Vec<AgentId> = {
+            let runs = lock(&self.runs);
+            let table = self.liveness.table();
+            runs.iter()
+                .filter(|(agent, run)| match &*lock(&run.shared.quiet) {
+                    None => false,
+                    Some(Quiet::Following { leader, term }) => {
+                        lapsed(table.listed(*leader, agent, *term), low)
+                    }
+                    Some(Quiet::Leading { members }) => members
+                        .iter()
+                        .any(|&member| lapsed(table.heard_at(member), high)),
+                })
+                .map(|(agent, _)| *agent)
+                .collect()
+        };
+        for agent in due {
+            self.to_group(agent, Local::Wake);
+        }
     }
 
     /// Give each group this node leads `local`: every one, or those whose

@@ -310,13 +310,15 @@ pub struct Stats {
 }
 
 /// A node's replica groups at one moment: how many it holds, how many it
-/// leads, and their terms summed, which grows by one at each election any
-/// of them holds.
+/// leads, their terms summed, which grows by one at each election any of
+/// them holds, and how many are quiet: idle, their timers left to the
+/// node's pair heartbeat.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode)]
 pub struct Groups {
     pub replicas: u64,
     pub leading: u64,
     pub terms: u64,
+    pub quiet: u64,
 }
 
 /// One stage's histogram: how many times it took a value in each bucket,
