@@ -23,11 +23,15 @@ pub struct Limits {
     /// The most an install's body (a `POST` to a path ending in
     /// `/install`) may hold, in place of `body`.
     pub install: usize,
+    /// The most a credentialed call's body (a `POST` to a path ending in
+    /// `/credentialed`) may hold, in place of `body`: not large, its
+    /// verification bounded by the node's budget instead.
+    pub credentialed: usize,
     /// How long a connection may wait for its next bytes.
     pub idle: Duration,
     /// The most connections at once; more are closed on accept.
     pub connections: usize,
-    /// The most bodies past `body` (an install's) held at once, from every
+    /// The most install bodies past `body` held at once, from every
     /// connection: past them, a request is answered 503 from its head,
     /// its body unread.
     pub large: usize,
@@ -369,11 +373,16 @@ async fn read_request(
                     Some(None) => return Ok(refuse(400)),
                     None => 0,
                 };
-                let limit = if request.method == "POST" && request.path.ends_with("/install") {
+                let post = |end: &str| request.method == "POST" && request.path.ends_with(end);
+                let install = post("/install");
+                let limit = if install {
                     limits.install
+                } else if post("/credentialed") {
+                    limits.credentialed
                 } else {
                     limits.body
                 };
+                let large = install && length > limits.body;
                 if length > limit {
                     return Ok(refuse(413));
                 }
@@ -385,14 +394,14 @@ async fn read_request(
                 if let Some(answer) = shared.head.as_ref().and_then(|head| head(&request)) {
                     // A large body, or one the client waits to be asked
                     // for, is never read: the connection closes instead.
-                    if pending && (length > limits.body || continues) {
+                    if pending && (large || continues) {
                         return Ok(Read::Answered(answer, None));
                     }
                     fill(stream, buffer, end, limits.idle, deadline).await?;
                     let next = (!closes(&request)).then_some(end);
                     return Ok(Read::Answered(answer, next));
                 }
-                let large = match length > limits.body {
+                let large = match large {
                     true => match Slot::take(&shared.large, limits.large) {
                         Some(place) => Some(place),
                         None => return Ok(refuse(503)),

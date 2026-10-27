@@ -462,7 +462,28 @@ impl Inner {
         request: Request,
     ) -> impl Future<Output = Result<Answered, CallError>> + use<> {
         let (answer, reply) = smol::channel::bounded(1);
-        let pending = Pending::Request { request, answer };
+        self.queue_answered(agent, Pending::Request { request, answer }, reply)
+    }
+
+    /// A credentialed call, its proof verified, queued as [`Inner::call`]
+    /// queues a call.
+    pub(crate) fn call_credentialed(
+        self: &Arc<Self>,
+        agent: AgentId,
+        call: vos_wire::batch::CredentialedInput,
+    ) -> impl Future<Output = Result<Answered, CallError>> + use<> {
+        let (answer, reply) = smol::channel::bounded(1);
+        self.queue_answered(agent, Pending::Credentialed { call, answer }, reply)
+    }
+
+    /// Queue `pending`, whose answer `reply` receives: at once when the
+    /// group knows where calls go, else once it does.
+    fn queue_answered(
+        self: &Arc<Self>,
+        agent: AgentId,
+        pending: Pending,
+        reply: smol::channel::Receiver<Result<Answered, CallError>>,
+    ) -> impl Future<Output = Result<Answered, CallError>> + use<> {
         let known = self.run(agent).is_some_and(|run| {
             let state = run.shared.state();
             state.stopped || self.knows_leader(&run, &state)

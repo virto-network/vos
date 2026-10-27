@@ -94,7 +94,7 @@ fn every_kind_past_its_limit_is_refused_from_its_header() {
 #[test]
 fn unknown_kinds_and_truncated_frames_are_refused_and_closed() {
     let served = Served::plain();
-    for kind in [0u16, FRAME_ERROR, vos_api::CREDENTIALED, 0x0300] {
+    for kind in [0u16, FRAME_ERROR, 0x0105, 0x0300] {
         let mut stream = connect(&served.socket);
         send(&mut stream, kind, 3, &[]);
         assert_eq!(

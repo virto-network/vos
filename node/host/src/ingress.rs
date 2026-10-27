@@ -48,6 +48,7 @@ pub(crate) async fn serve(
     let limits = Limits {
         body: cap::REQUEST + ENVELOPE,
         install: MAX_INSTALL,
+        credentialed: vos_api::CREDENTIALED_HTTP,
         idle: Duration::from_secs(30),
         connections: api.inner.settings.ingress_connections,
         large: vos_http::LARGE,

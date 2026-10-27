@@ -21,7 +21,7 @@ vos-pvm-proof = { path = ".." }
 vos-pvm-proof-verifier = { path = "../verifier" }
 # The final verifier on the bytes a venue receives: arbitrary bytes, and the
 # golden wraps' bytes and structure mutated, formats 28 and 39.
-vos-pvm-final-verifier = { path = "../final-verifier", features = ["test-formats"] }
+vos-pvm-final-verifier = { path = "../final-verifier", features = ["test-formats", "credential-bytes"] }
 vos-statement = { path = "../statement", features = ["fixtures"] }
 # A space's genesis, anchors, migrations and golden vectors, as a venue
 # decodes them.
@@ -92,5 +92,17 @@ doc = false
 [[bin]]
 name = "operated_decode"
 path = "fuzz_targets/operated_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "credentialed_decode"
+path = "fuzz_targets/credentialed_decode.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "credential_verify_bytes"
+path = "fuzz_targets/credential_verify_bytes.rs"
 test = false
 doc = false

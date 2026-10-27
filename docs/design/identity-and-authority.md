@@ -372,7 +372,8 @@ Ingress verifies the proof and logs only the origin it proves.
   4. a `once` guard: `once(scope ‖ nullifier)` recorded: refused,
      `Refusal::Once` (10);
   5. `b` recorded, the system row `binding(b) → expires_ms`, collected by
-     the sweep at `expires_ms` plus 60 s through the due index;
+     the sweep at `expires_ms` plus 60 s through the due index (the
+     sweep's step lists the bindings it forgets beside its sessions);
   6. the method runs, its caller the origin, under its guard; whatever it
      returns, `b` stays recorded (`Failure::Forbidden` or a trap consumes
      the input);
@@ -598,8 +599,9 @@ space three of them take a simpler form:
   `ROOT_MAX_AGE` after it was superseded (§6).
 - **The scope carries the space:**
   `scope = C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))`,
-  so no two agents' guards of one name, in one space or two, share a
-  pseudonym, even for a member whose secret two spaces share.
+  the agent and the instance four little-endian bytes each, the name its
+  bytes; so no two agents' guards of one name, in one space or two, share
+  a pseudonym, even for a member whose secret two spaces share.
 
 **The in-space credential's threat model:**
 - **Whom it protects against:** outsiders and the space's other members,

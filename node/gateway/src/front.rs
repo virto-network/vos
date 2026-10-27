@@ -83,6 +83,7 @@ pub async fn serve(
         limits: HttpLimits {
             body: cap::REQUEST + ENVELOPE,
             install: cap::MAX_ELF + ENVELOPE,
+            credentialed: vos_api::CREDENTIALED_HTTP,
             idle: Duration::from_secs(30),
             connections: http.connections,
             large: vos_http::LARGE,

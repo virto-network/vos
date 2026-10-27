@@ -87,12 +87,16 @@ impl Drop for Waiting<'_> {
     }
 }
 
-/// Whether the frame `reader` has part read is large ([`vos_api::LARGE`]).
+/// Whether the frame `reader` has part read is large: an install's past
+/// [`vos_api::LARGE`]. A credentialed call's is not: its verifications are
+/// bounded by the node's budget instead.
 fn is_large(reader: &vos_api::Reader, framing: vos_api::Framing) -> bool {
-    reader
-        .header()
-        .and_then(|header| header.body(framing))
-        .is_some_and(|body| body > vos_api::LARGE)
+    reader.header().is_some_and(|header| {
+        header.kind == Kind::Install as u16
+            && header
+                .body(framing)
+                .is_some_and(|body| body > vos_api::LARGE)
+    })
 }
 
 fn decode<T: Decode>(body: &[u8]) -> Result<T, Response> {
@@ -152,6 +156,10 @@ impl Api {
             },
             Kind::Workflow => match decode(&body) {
                 Ok((agent, read)) => self.workflow(agent, read).await,
+                Err(answer) => answer,
+            },
+            Kind::Credentialed => match decode(&body) {
+                Ok((agent, call)) => self.inner.credentialed(agent, call).await,
                 Err(answer) => answer,
             },
             _ => Response::Rejected(Rejection::Malformed),

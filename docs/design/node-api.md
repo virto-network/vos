@@ -155,7 +155,7 @@ the table, not the range, is the rule.
 | `0x0101` | `Call` | `POST /agents/{a}/calls` | `(Agent, Call)` | `Response` | 69,636 |
 | `0x0102` | `Query` | `POST /agents/{a}/queries` | `(Agent, QueryCall)` | `Response` | 69,636 |
 | `0x0103` | `Workflow` | `POST /agents/{a}/workflows` | `(Agent, WorkflowRead)` | `Response` | 69,636 |
-| `0x0104` | `Credentialed` | `POST /agents/{a}/credentialed` | `(Agent, Credentialed)` | `Response` | 1,642,496 (reserved, 7.11) |
+| `0x0104` | `Credentialed` | `POST /agents/{a}/credentialed` | `(Agent, Credentialed)` | `Response` | 1,642,496 |
 | `0x0201` | `Stats` | `GET /stats` | `Operated` of empty | `Response` | 4,252 |
 | `0x0202` | `Status` | `GET /agents/{a}/status` | `Operated` of `Agent` | `Response` | 4,252 |
 | `0x0203` | `CreateAgent` | `POST /agents` | `Operated` of `Create` | `Response` | 69,792 |
@@ -167,8 +167,10 @@ the table, not the range, is the rule.
 
 `0x0000` is never assigned; a kind's number never changes or returns.
 `0xffff` is the frame error's, an answer only: as a request it is
-`UnknownKind`. `0x0104` is reserved for 7.11: until it lands the node
-answers it `UnknownKind` and the gateway's route is an unknown path.
+`UnknownKind`. `0x0104`, the credentialed call, is 7.11's: its checks,
+in order, are `identity-and-authority.md` §5's (and `node/SECURITY.md`'s);
+its body is not large (only an install's is): its verifications are bounded
+by the node's verification budget, past which it is answered `Busy`.
 
 - **Who may send each, and what may be repeated:**
 

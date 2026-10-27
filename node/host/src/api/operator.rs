@@ -70,7 +70,12 @@ pub(super) async fn parse(inner: &Inner, kind: Kind, body: Vec<u8>) -> Result<Co
             Command::Replace(agent, replace)
         }
         Kind::Grant => {
-            let (agent, grant) = decode(&body)?;
+            let (agent, grant): (AgentId, Grant) = decode(&body)?;
+            // No role is ever granted to a credential's origin: a guard
+            // admits it.
+            if grant.principal.is_credential() {
+                return Err(Response::Rejected(Rejection::Malformed));
+            }
             Command::Grant(agent, grant)
         }
         Kind::Reports => {

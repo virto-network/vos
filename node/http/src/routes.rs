@@ -7,7 +7,7 @@
 use base64::Engine;
 use vos_api::{CREDENTIALS, FRAME_ERROR, FrameError, Kind, Operated};
 use vos_wire::abi::Refusal;
-use vos_wire::ingress::{OperatorRefusal, Rejection, Response as Answer};
+use vos_wire::ingress::{CredentialRefusal, OperatorRefusal, Rejection, Response as Answer};
 use vos_wire::{Decode, Encode};
 
 use crate::server::{Request, Response};
@@ -119,6 +119,7 @@ pub fn route(request: &Request) -> Routed {
         ("POST", ["agents", id, "calls"]) => to(Kind::Call, agent_and(id, body)),
         ("POST", ["agents", id, "queries"]) => to(Kind::Query, agent_and(id, body)),
         ("POST", ["agents", id, "workflows"]) => to(Kind::Workflow, agent_and(id, body)),
+        ("POST", ["agents", id, "credentialed"]) => to(Kind::Credentialed, agent_and(id, body)),
         ("GET", ["stats"]) => operator(Kind::Stats, Ok(Vec::new())),
         ("GET", ["agents", id, "status"]) => operator(Kind::Status, agent_and(id, &[])),
         ("POST", ["agents"]) => operator(Kind::CreateAgent, Ok(body.clone())),
@@ -147,6 +148,8 @@ pub fn status(answer: &Answer) -> u16 {
         // No new session until some are collected.
         Answer::Refused(Refusal::SessionsFull) => 503,
         Answer::Refused(Refusal::KeySessionsFull) => 429,
+        // A credentialed call too late, or on a root too old: a new proof.
+        Answer::Refused(Refusal::CredentialExpired | Refusal::StaleRoot) => 403,
         Answer::Refused(_) => 409,
         Answer::Rejected(rejection) => match rejection {
             Rejection::TooOld | Rejection::StaleSession { .. } => 410,
@@ -155,6 +158,21 @@ pub fn status(answer: &Answer) -> u16 {
             Rejection::StaleQuery { .. } | Rejection::Malformed => 400,
             // Another replica may be further along.
             Rejection::Behind => 503,
+            Rejection::Credential(refusal) => match refusal {
+                CredentialRefusal::Replayed | CredentialRefusal::Once => 409,
+                // Retryable: fetch the path again, or ask another replica.
+                CredentialRefusal::RootUnknown => 503,
+                CredentialRefusal::NoSpace
+                | CredentialRefusal::Format
+                | CredentialRefusal::Size
+                | CredentialRefusal::Expiry { .. }
+                | CredentialRefusal::Method
+                | CredentialRefusal::Kind
+                | CredentialRefusal::Scope
+                | CredentialRefusal::Binding
+                | CredentialRefusal::RootStale
+                | CredentialRefusal::Proof => 403,
+            },
             Rejection::Operator(refusal) => match refusal {
                 OperatorRefusal::Expiry { .. } | OperatorRefusal::SocketOnly => 403,
                 OperatorRefusal::Replayed => 409,

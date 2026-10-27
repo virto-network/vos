@@ -12,6 +12,7 @@ use vos_wire::Encode;
 use vos_wire::ids::AgentId;
 use vos_wire::peer::{NodeNumber, PeerMessage};
 
+use crate::calls::Forwardable;
 use crate::group::Input;
 use crate::node::Inner;
 use crate::peer;
@@ -178,7 +179,13 @@ impl Inner {
                 token,
                 term,
                 call,
-            } => self.on_forward(from, agent, token, term, call),
+            } => self.on_forward(from, agent, token, term, Forwardable::Call(call)),
+            PeerMessage::ForwardCredentialed {
+                agent,
+                token,
+                term,
+                call,
+            } => self.on_forward(from, agent, token, term, Forwardable::Credentialed(call)),
             PeerMessage::Forwarded {
                 agent,
                 token,
