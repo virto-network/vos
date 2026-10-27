@@ -3740,20 +3740,40 @@ review's fixes after it, and the lock of every guest blob (L2).
 | 69 | one guest workspace, `agent/programs` (the lockfile, the toolchain, the target configuration and the release profile), for the default agent, the representative and the credential actor, each built alone (`_build-program`) and its ELF under `agent/programs/target`; the window actor's forward-looking sentence and two unreflowed doc paragraphs fixed (`inputs.rs`'s was already) |
 | L2 | `blobs.lock` (below) |
 
-**`blobs.lock`:** the SHA-256 of each of the 33 guest blobs, written by
+**`blobs.lock`:** the SHA-256 of 30 guest blobs, each ELF with its symbols
+and relocations stripped (the toolchain's own `rust-objcopy`), written by
 `just blobs-lock` and checked by `just check-blobs` at the end of
 `check-no-std`: `final-verify.elf`, `final-verify-test.elf`,
-`statement-service.elf`, both Wasm blobs, the three agent programs and the
-25 test actors' ELFs (the bins the test actors' workspace declares, so an
-ELF another branch left in the target is not one). The venue guests are
-built by `_venue-guest` with `--remap-path-prefix` for the checkout's root,
-`CARGO_HOME` and the toolchain's sysroot: before, `final-verify.elf` and
-`statement-service.elf` carried this machine's `$HOME` in 39–41 panic
-locations, so their bytes depended on the checkout and the machine. The
-other blobs carry no path. A set `CARGO_TARGET_DIR` is refused.
+`statement-service.elf`, the representative, the credential actor and the
+25 test actors (the bins their workspace declares, so an ELF another
+branch left in the target is not one). A set `CARGO_TARGET_DIR` is
+refused, and a blob that cannot be hashed fails the check.
+- **The venue guests** are built by `_venue-guest` with
+  `--remap-path-prefix` for the checkout's root, `CARGO_HOME` and the
+  toolchain's sysroot: before, `final-verify.elf` and
+  `statement-service.elf` carried this machine's `$HOME` in 39–41 panic
+  locations, so their bytes depended on the checkout and the machine.
+- **Why stripped** [measured, a clone at another path built from clean]:
+  cargo's `-C metadata` hashes a path dependency by its path relative to
+  the workspace's root when it lies under it, else by its absolute path.
+  The venue guests' workspace (the repository's) holds all their sources;
+  the out-of-tree workspaces (`agent/test-actors`, `agent/programs`, the
+  Wasm blob's) depend on `agent/sdk`, `agent/wire` and `pvm/…` outside
+  their roots, so their symbol names hash the checkout's path. For the test
+  actors, the representative and the credential actor only the symbol
+  table differs (stripped, all 27 equal); the kernels' program ids, which
+  read the code, never moved.
+- **Left out, the code itself differing between checkouts:** the default
+  agent's `.text` (`vos-agent.elf`; its `.rodata`, `.data` and schema
+  equal) and both Wasm blobs (48,515 bytes differ, from the function
+  table on), the items' order following the symbols' hashes. So the
+  default agent's program hash depends on the checkout's path today. The
+  levers, for the owner: build those workspaces from a fixed path, or
+  bring their crates under one workspace root with their dependencies (the
+  repository's), which the toolchain and the profiles now keep apart.
 
 **What moved:**
-- Every guest blob (the lock pins them from here): the venue guests and
+- Every guest blob: the venue guests and
   the Wasm blobs with the runtime, the anchor and the statement changes and
   the remap; the agent programs with the wire and the workspace; the test
   actors' ELFs in their symbol tables (the wire's moved and new items),
@@ -3783,8 +3803,10 @@ One Opus review of the commit, no High; folded:
 - **M1:** `check-blobs` hashed every ELF in the test actors' target, so one
   another branch left failed the check: the actors are now the bins
   `cargo metadata` lists; a set `CARGO_TARGET_DIR` is refused.
-- **M2:** path independence shown, not assumed: the lock reproduced from a
-  clean clone at another path (gates).
+- **M2:** right: built from clean in a clone at another path, every blob
+  but the venue guests differed. The lock hashes the ELFs stripped and
+  leaves out the default agent and the Wasm blobs (above); the clone's
+  clean build then checks it, 30 of 30.
 - **L5:** the `_forbidden` rows read `agent/programs`'s whole workspace,
   the representative and the credential actor with the agent.
 - **L6:** the installed record and the workflows' count decoded exactly.

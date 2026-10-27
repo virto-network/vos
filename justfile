@@ -228,25 +228,36 @@ build-statement-service: (_venue-guest "vos-statement-service" "statement-servic
 # alone, and `final-verify-test.elf`, linking 28 beside it.
 build-final-verify: (_venue-guest "vos-statement" "final-verify" "pvm-guest") (_venue-guest "vos-statement" "final-verify-test" "pvm-guest,test-formats")
 
-# Every guest blob `blobs.lock` pins, its path from the repository's root:
-# the venue's programs, the final verifier's Wasm blobs, the agent's
-# programs and the test actors, each a binary of the test actors'
-# workspace (an ELF another branch left in its target is none).
-_blob-paths:
-    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf" "pvm/proof/final-verifier/wasm/blob/target/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "pvm/proof/final-verifier/wasm/blob/target/test-formats/wasm32-unknown-unknown/release/vos_pvm_final_verifier_wasm.wasm" "agent/programs/target/riscv64em-vos/release/vos-agent.elf" "agent/programs/target/riscv64em-vos/release/vos-representative.elf" "agent/programs/target/riscv64em-vos/release/vos-credentials.elf"]; let actors = (cd agent/test-actors; cargo metadata --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); $fixed ++ $actors | str join "\n" | print
+# Every guest blob `blobs.lock` pins, its hash then its path from the
+# repository's root: the venue's programs, the representative, the
+# credential actor and the test actors (the bins of their workspace, so an
+# ELF another branch left in its target is none). Each ELF is hashed with
+# its symbols and relocations stripped (the toolchain's `rust-objcopy`): an
+# out-of-tree workspace's symbol names hash its path dependencies' absolute
+# paths (cargo's `-C metadata`), so its symbol table differs between
+# checkouts while its code does not. The default agent and the final
+# verifier's Wasm blobs are left out: their code too differs between
+# checkouts, for the same reason.
+_blob-hashes:
+    if ($env.CARGO_TARGET_DIR? | is-not-empty) { error make { msg: "the blobs are hashed where the recipes build them: unset CARGO_TARGET_DIR" } }; let fixed = ["target/riscv64em-vos/release/final-verify.elf" "target/riscv64em-vos/release/final-verify-test.elf" "target/riscv64em-vos/release/statement-service.elf" "agent/programs/target/riscv64em-vos/release/vos-representative.elf" "agent/programs/target/riscv64em-vos/release/vos-credentials.elf"]; let actors = (cargo metadata --manifest-path agent/test-actors/Cargo.toml --no-deps --format-version 1 | from json | get packages.targets | flatten | where {|target| "bin" in $target.kind } | get name | sort | each {|name| $"agent/test-actors/target/riscv64em-vos/release/($name).elf" }); let sysroot = (rustc --print sysroot | str trim); let objcopy = ($sysroot | path join lib rustlib (rustc -vV | lines | parse "host: {host}" | get host.0) bin rust-objcopy); let stripped = (mktemp -t); for path in ($fixed ++ $actors) { with-env { LD_LIBRARY_PATH: ($sysroot | path join lib) } { ^$objcopy --strip-all $path $stripped }; print $"(open --raw $stripped | hash sha256)  ($path)" }; rm $stripped
 
-# Every guest blob, built as `check` builds it.
-build-blobs: build-final-verify build-statement-service build-wasm-blobs build-agent build-representative build-credentials build-test-actors
+# Every guest blob `blobs.lock` pins, built as `check` builds it.
+build-blobs: build-final-verify build-statement-service build-representative build-credentials build-test-actors
 
 # `blobs.lock` written anew from the blobs as built: after a change that
 # moves one, which the lock's diff then shows.
 blobs-lock: build-blobs
-    just _blob-paths | lines | each {|path| $"(open --raw $path | hash sha256)  ($path)" } | prepend ["# Every guest blob's SHA-256, as `just build-blobs` builds it from a clean" "# checkout: `just blobs-lock` writes it, `just check-blobs` checks it."] | str join "\n" | $in + "\n" | save -f blobs.lock
+    {{_hashed}}; $built | prepend ["# Every pinned guest blob's SHA-256, its symbols and relocations stripped," "# as `just build-blobs` builds it: `just blobs-lock` writes it, `just" "# check-blobs` checks it (the justfile's `_blob-hashes` says which blobs)."] | str join "\n" | $in + "\n" | save -f blobs.lock
 
-# Every guest blob built and hashed, each its `blobs.lock` hash, and the
-# lock naming every blob built: a change that moves a blob moves its line.
+# The pinned blobs' hashes, `_blob-hashes`' lines; its failure fails the
+# recipe that reads them.
+_hashed := 'let hashed = (just _blob-hashes | complete); if $hashed.exit_code != 0 or ($hashed.stdout | is-empty) { print -e $hashed.stderr; error make { msg: "the guest blobs could not be hashed" } }; let built = ($hashed.stdout | lines)'
+
+# Every pinned guest blob built and hashed, each its `blobs.lock` hash, and
+# the lock naming every blob built: a change that moves a blob moves its
+# line.
 check-blobs: build-blobs
-    let built = (just _blob-paths | lines | each {|path| $"(open --raw $path | hash sha256)  ($path)" }); let locked = (open --raw blobs.lock | lines | where {|line| not ($line | str starts-with "#") }); let moved = ($built | where {|line| $line not-in $locked }); let gone = ($locked | where {|line| $line not-in $built }); for line in $moved { print -e $"built: ($line)" }; for line in $gone { print -e $"locked: ($line)" }; if ($moved ++ $gone | is-not-empty) { error make { msg: "the guest blobs are not blobs.lock's: `just blobs-lock` after a change that moves them" } }; print $"every guest blob is blobs.lock's: ($built | length) blobs"
+    {{_hashed}}; let locked = (open --raw blobs.lock | lines | where {|line| not ($line | str starts-with "#") }); let moved = ($built | where {|line| $line not-in $locked }); let gone = ($locked | where {|line| $line not-in $built }); for line in $moved { print -e $"built: ($line)" }; for line in $gone { print -e $"locked: ($line)" }; if ($moved ++ $gone | is-not-empty) { error make { msg: "the guest blobs are not blobs.lock's: `just blobs-lock` after a change that moves them" } }; print $"every pinned guest blob is blobs.lock's: ($built | length) blobs"
 
 # The SDK, its macros' restrictions, the test actors on the testkit, the
 # default agent against it, the checker's own model, the node running the
