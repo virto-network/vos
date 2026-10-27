@@ -23,8 +23,9 @@
 //!
 //! The format is the registry's credential format
 //! ([`vos_pvm_proof::format::CREDENTIAL_PROOF`]). No witness is logged, and
-//! the library has no seeded masks: its proofs' masks are the operating
-//! system's. `SECURITY.md` states what the secret is exposed to.
+//! its proofs' masks are the operating system's (a seeded stream exists
+//! only under the `seeded-masks` test seam, which no production build
+//! enables). `SECURITY.md` states what the secret is exposed to.
 
 mod call;
 mod path;
@@ -35,8 +36,8 @@ pub mod wire;
 pub use call::{Call, NAME_BYTES, scope};
 pub use path::PathKeeper;
 pub use prover::{
-    CredentialProof, CredentialPublic, JointProof, JointPublic, Masks, PEAK_BYTES, Prover,
-    ProverConfig, Threads, verify, verify_joint,
+    CredentialProof, CredentialPublic, JointProof, JointPublic, PEAK_BYTES, Prover, ProverConfig,
+    Threads, verify, verify_joint,
 };
 pub use secret::{DeviceSecret, derive_secret, member, owner, source_input};
 
@@ -71,12 +72,18 @@ impl Digest {
 
 /// A member's place in the credential actor's tree, as `path(member)`
 /// answers it: the tree's root, the member's slot and the 32 siblings from
-/// its leaf up.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// its leaf up. Its `Debug` shows neither: they place the member's leaf.
+#[derive(Clone, PartialEq, Eq)]
 pub struct AuthWitness {
     pub root: Digest,
     pub slot: u32,
     pub siblings: [Digest; credentials::DEPTH],
+}
+
+impl core::fmt::Debug for AuthWitness {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("AuthWitness").finish_non_exhaustive()
+    }
 }
 
 impl AuthWitness {

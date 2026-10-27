@@ -32,7 +32,7 @@ use stwo::core::channel::{Blake2sM31Channel, Channel};
 use stwo::core::proof_of_work::GrindOps;
 use stwo::prover::backend::simd::SimdBackend;
 use vos_device::{
-    AuthWitness, Call, Digest, Masks, Prover, ProverConfig, Threads, derive_secret, member, verify,
+    AuthWitness, Call, Digest, Prover, ProverConfig, Threads, derive_secret, member, verify,
     verify_joint,
 };
 use vos_wire::credentials::{DEPTH, EMPTY, leaf, root_of};
@@ -117,13 +117,6 @@ fn threads(options: &Options) -> Threads {
     options.threads.map_or(Threads::Auto, Threads::Count)
 }
 
-fn masks() -> Masks {
-    #[cfg(feature = "seeded")]
-    return Masks::Seeded(SEED);
-    #[cfg(not(feature = "seeded"))]
-    Masks::Os
-}
-
 fn ms(duration: Duration) -> f64 {
     duration.as_secs_f64() * 1e3
 }
@@ -191,10 +184,11 @@ fn prove(prover: &Prover, cell: &str) -> (Vec<u8>, Duration) {
 fn cell(cell: &str, options: &Options) {
     let prover = Prover::new(ProverConfig {
         threads: threads(options),
-        masks: masks(),
         ..ProverConfig::default()
     })
     .expect("a prover");
+    #[cfg(feature = "seeded")]
+    let prover = prover.seeded(SEED);
     for _ in 0..2 {
         prove(&prover, cell);
     }

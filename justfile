@@ -285,6 +285,7 @@ _forbidden +gates:
         [venue-clients "-p vos-node --features prover" [kreivo-mock kreivo model] []] \
         [seeded-masks "--workspace" [seeded-masks] []] \
         [seeded-masks "-p vos-cli --features prover" [seeded-masks] []] \
+        [seeded-masks "-p vos-device" [seeded-masks] []] \
         [seeded-masks "--manifest-path agent/default/Cargo.toml" [seeded-masks] []] \
         [seeded-masks "--manifest-path pvm/proof/fuzz/Cargo.toml" [seeded-masks] []] \
         [seeded-masks "--manifest-path pvm/proof/final-verifier/wasm/run/Cargo.toml" [seeded-masks] []] \

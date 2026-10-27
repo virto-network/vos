@@ -5,6 +5,12 @@ version.workspace = true
 license = "Apache-2.0"
 description = "The device library: a member's secret from a secret source, its credential proofs (auth, owner, and membership and payment measured), their verification, the node-API requests a client sends for them, and the path it keeps apart from its proofs."
 
+[features]
+# The prover's seeded masks (`Prover::seeded`), so a proof's bytes are any
+# machine's: the phone bench's seeded build alone. A test seam: no
+# production build enables it (`just check-no-seeded-masks`).
+seeded-masks = ["vos-pvm-recair/seeded-masks"]
+
 [dependencies]
 # The credential circuits and their masked prover.
 vos-pvm-recair = { workspace = true }

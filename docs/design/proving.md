@@ -1146,15 +1146,18 @@ impl PathKeeper {
 - **Built** (slice 7's 7.12, `pvm/device`, its `SECURITY.md`): as
   sketched, and beside it `Prover::prove_membership_and_payment` and
   `verify_joint` (the joint statement's binding names its own program and
-  the kind byte `0xff`, which no `CredentialPublic` takes);
-  `ProverConfig::masks` (the operating system's, the only value a
-  production build has); `Call::new`, `path_query` and `root_query`
-  answering `Result` (the operating system's randomness may fail);
-  `PathKeeper::update` refusing a path not its member's, and
-  `PathKeeper::unknown` for a `RootUnknown` answer, with
-  `wire::credentialed_answer`. The keeper's timer is 30 s with a uniform
-  jitter of half a period either way, halved on each `RootUnknown` (to
-  1 s) and doubled back on a fetch that finds the root unmoved. A
+  the kind byte `0xff`, which no `CredentialPublic` takes); the masks
+  always the operating system's, a `seeded-masks` test seam
+  (`Prover::seeded`) for the phone bench's byte comparison alone;
+  `Call::new`, `path_query` and `root_query` answering `Result` (the
+  operating system's randomness may fail); `PathKeeper::due` taking
+  `&mut self` (a moved root brings the fetch forward to a time drawn
+  below 10 s after it is first seen), `update` refusing a path not its
+  member's, and `unknown` for a `RootUnknown` or `RootStale` answer, with
+  `wire::credentialed_answer` (the refusals decoded exactly, `Expiry`'s
+  `now` kept). The keeper's timer is 30 s with a uniform jitter of half a
+  period either way, halved on each `RootUnknown` (to 1 s) and doubled
+  back on a fetch that finds the root unmoved. A
   credential proof peaks at 113–133 MiB on the Fairphone 6 and 144–162
   MiB on x86 [measured]; `Prover::new` refuses an allowance below
   `PEAK_BYTES`, 192 MiB.

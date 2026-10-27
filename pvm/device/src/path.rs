@@ -1,7 +1,9 @@
 //! The path held, refreshed apart from proofs (`slice-7-mobile.md` pin G,
 //! pin L) [decided, S38]: fetched when `root()` moves and on a jittered
 //! timer, never because a proof is about to be made, so a fetch's time
-//! says nothing of a proof's.
+//! says nothing of a proof's. The client polls `root()` on a jittered timer
+//! of its own and sends the queries on a connection of their own, apart
+//! from the one that carries its proofs: the keeper only says when.
 //!
 //! **Freshness.** The credential actor's ring holds the last 64 roots, one
 //! a tree-changing batch, and accepts a superseded root for
@@ -11,7 +13,7 @@
 //! the space takes to make 64 such batches, not merely under
 //! `ROOT_MAX_AGE`. The timer fetches the path at least once a period, and
 //! a `root()` answer that moved (the query names no member) fetches it
-//! sooner, so a held root is at most one period behind the tree: it
+//! sooner, within [`PathKeeper::MOVED_SPREAD_MS`], so a held root is at most one period behind the tree: it
 //! survives unless the space makes 64 tree-changing batches within one
 //! period ([`PathKeeper::PERIOD_MS`], 30 s, with its jitter at most 45 s:
 //! about 1.4 such batches a second, held for that long). A space faster
@@ -30,6 +32,9 @@ pub struct PathKeeper {
     next: u64,
     /// The timer's period before its jitter.
     period: u64,
+    /// Whether a moved root has brought the timer forward since the last
+    /// fetch.
+    moved: bool,
 }
 
 impl PathKeeper {
@@ -38,6 +43,10 @@ impl PathKeeper {
     pub const PERIOD_MS: u64 = vos_wire::defaults::ROOT_MAX_AGE / 20;
     /// The least period a run of `RootUnknown` answers halves it to.
     pub const MIN_PERIOD_MS: u64 = 1_000;
+    /// The spread of the fetch a moved root brings forward: drawn
+    /// uniformly below it, so the members online at a tree change do not
+    /// all fetch at once.
+    pub const MOVED_SPREAD_MS: u64 = 10_000;
 
     /// A keeper for `member`, holding no path: due at once.
     pub fn new(member: Digest) -> Self {
@@ -46,17 +55,27 @@ impl PathKeeper {
             held: None,
             next: 0,
             period: Self::PERIOD_MS,
+            moved: false,
         }
     }
 
-    /// Whether to fetch the path now: none is held, `root` (the latest
-    /// `root()` answer, if one was read) is not the held path's, or the
-    /// jittered timer is due.
-    pub fn due(&self, now_ms: u64, root: Option<&Digest>) -> bool {
+    /// Whether to fetch the path now: none is held, or the jittered timer
+    /// is due. `root`, the latest `root()` answer if one was read, brings
+    /// the timer forward when it is not the held path's: to a time drawn
+    /// below [`PathKeeper::MOVED_SPREAD_MS`] after the moment it is first
+    /// seen, so a tree change does not make every online member fetch at
+    /// once.
+    pub fn due(&mut self, now_ms: u64, root: Option<&Digest>) -> bool {
         let Some(held) = &self.held else {
             return true;
         };
-        root.is_some_and(|root| *root != held.root) || now_ms >= self.next
+        if root.is_some_and(|root| *root != held.root) && !self.moved {
+            self.moved = true;
+            self.next = self
+                .next
+                .min(now_ms.saturating_add(jitter(Self::MOVED_SPREAD_MS)));
+        }
+        now_ms >= self.next
     }
 
     /// Holds `witness`, fetched at `now_ms`, and sets the timer: its next
@@ -75,6 +94,7 @@ impl PathKeeper {
             self.period = (self.period * 2).min(Self::PERIOD_MS);
         }
         self.held = Some(witness);
+        self.moved = false;
         self.next = now_ms.saturating_add(self.period / 2 + jitter(self.period));
         Ok(())
     }

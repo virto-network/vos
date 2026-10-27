@@ -228,22 +228,44 @@ pub enum Answer {
     /// The replica's ring does not hold the proof's root: drop the path
     /// ([`crate::PathKeeper::unknown`]), fetch it again, prove anew.
     RootUnknown,
+    /// The proof's root was superseded more than `ROOT_MAX_AGE` ago: drop
+    /// the path as for [`Answer::RootUnknown`]; a new path proves anew.
+    RootStale,
+    /// The expiry is outside the node's window: `now` is the node's clock,
+    /// from which a new proof picks its expiry.
+    Expiry { now: u64 },
     /// Any other credential refusal at ingress, by its code
-    /// (`CredentialRefusal`'s index): this proof will not be admitted.
+    /// (`CredentialRefusal`'s index, at most [`LAST_REFUSAL`]): this proof
+    /// will not be admitted.
     Refused(u8),
-    /// Any other answer: the node's (busy, not the leader, a refusal at
-    /// apply).
+    /// Any other answer, as the node sent it: busy, not the leader, a
+    /// refusal at apply.
     Other(Vec<u8>),
 }
 
-/// The answer to a credentialed request.
+/// `CredentialRefusal`'s codes this library tells apart: `Expiry` carries
+/// the node's time; `RootUnknown` and `RootStale` drop the path; the last
+/// code is `Proof`'s.
+const EXPIRY: u8 = 3;
+const ROOT_STALE: u8 = 11;
+pub const LAST_REFUSAL: u8 = 12;
+
+/// The answer to a credentialed request: a credential refusal decoded
+/// exactly, its code known; any other answer as it came.
 pub fn credentialed_answer(body: &[u8]) -> Result<Answer, DeviceError> {
     match body {
+        [REJECTED, CREDENTIAL_REJECTION, EXPIRY, now @ ..] => {
+            let now = u64::decode_exact(now).ok_or(DeviceError::Decode)?;
+            Ok(Answer::Expiry { now })
+        }
         [REJECTED, CREDENTIAL_REJECTION, ROOT_UNKNOWN] => Ok(Answer::RootUnknown),
-        [REJECTED, CREDENTIAL_REJECTION, code, ..] => Ok(Answer::Refused(*code)),
+        [REJECTED, CREDENTIAL_REJECTION, ROOT_STALE] => Ok(Answer::RootStale),
+        [REJECTED, CREDENTIAL_REJECTION, code] if *code <= LAST_REFUSAL => {
+            Ok(Answer::Refused(*code))
+        }
+        [REJECTED, CREDENTIAL_REJECTION, ..] | [] => Err(DeviceError::Decode),
         _ => match Response::decode_exact(body) {
             Some(Response::Ran { outcome, at }) => Ok(Answer::Ran { outcome, at }),
-            _ if body.is_empty() => Err(DeviceError::Decode),
             _ => Ok(Answer::Other(body.to_vec())),
         },
     }

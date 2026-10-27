@@ -3222,13 +3222,14 @@ threads (8), 60 s apart, and one seeded round on the four big cores]:
   None is taken here: PG1's two hard budgets hold, and S29's choice is
   made.
 
-**x86** [measured; the machine loaded by another agent's credential run
-at about 21 cores, load 7–24, so these are not quiet numbers]:
-`vos-phone` timing build, 4 threads on cores 1, 3, 6, 8: auth p50 / p95
-431 / 555 ms, owner 425 / 533, joint 469 / 587; peak 144–162 MiB;
-verify 12–13 ms; the PoW-20 grind p95 310 ms, PoW-16 32 ms; against 7.10's
-quiet 44.6 / 47.5 ms for auth under 44. The quiet re-measure is left to a
-quiet `credential_timing` run; nothing here gates on x86 time.
+**x86** [measured; `vos-phone` timing build, 4 threads on cores 1, 3, 6,
+8, 20 proves a cell, quiet (load 3.5 falling)]: auth p50 / p95 44.0 / 46.8
+ms, owner 41.4 / 44.6, membership and payment 42.6 / 49.2, as 7.10's
+`credential_timing` found under 44; verify 2.1–2.2 ms; peak 137–153 MiB;
+the PoW-20 grind p95 37 ms, PoW-16 2.2 ms. The phone at automatic threads
+is about 3.8 times x86 on four P-cores, on its four big cores about 2.9.
+A first x86 run under another agent's credential run (about 21 cores
+busy, load 7–24) took 425–469 ms at the median: discarded.
 
 **Where the plan was off:**
 - **Owner at most 150 ms** on the phone is out of reach at automatic
@@ -3261,6 +3262,32 @@ passes 7.11's ingress; the scope's name encoding settled first (above);
 made under 42 and are made again under 44; `node/SECURITY.md` keeps 7.11's
 text, its path entry taking this one's specifics (the timer, the
 `RootUnknown` refetch).
+
+**Review (Opus):** no high soundness or secret-handling finding; one
+high merge blocker, H1, the scope name's encoding against 7.11's (above):
+`proving.md` §8's SCALE kept, pin I's and identity §7's formula lines now
+say so, and a vector pinned (`SCOPE_VECTOR`) for 7.11's `scope` to meet.
+Folded: M1, the seeded masks were a public `ProverConfig` field any
+consumer could set once another crate unified recair's feature: the
+masks are now always the OS's, and the seam is `vos-device`'s own
+`seeded-masks` feature (`Prover::seeded`, the bench's `seeded` build its
+only user), with a `check-no-seeded-masks` row for the library's default
+build. M2, a moved root made every online member fetch at once: `due`
+now brings the fetch forward to a time drawn below 10 s after the move is
+first seen, and the client's duties (its own jittered `root()` polls, a
+connection apart) are stated in both `SECURITY.md`s. L1, `verify` checks
+the arguments' cap and says it runs the stateless checks alone. L2,
+`credentialed_answer` decodes a refusal exactly (`Expiry { now }` kept,
+`RootStale` its own answer, a code past `Proof` or a trailing byte
+refused). L4, `AuthWitness`'s `Debug` shows nothing. L5, the statement's
+secret zeroized by a drop guard, unwinding included; recair's `Context`
+copy added to `SECURITY.md`'s "does not". L6, auth proofs with a changed
+nullifier or root (words the call does not fix) refused by the proof
+itself. Not taken: L3 (a path older than the one held: `path` answers no
+`since`, and an older root the ring holds is still accepted within
+`ROOT_MAX_AGE`), L7 (the OS's randomness failing reported as `Prove`, as
+documented). For the merge: 7.11 replaces `vos_api::CREDENTIALED` with
+`Kind::Credentialed`, which `wire.rs` then names.
 
 **Commits:** `5f8678fb` format 44 registered, 42 retired; `814caf3c` the
 device library and the phone bench; `95950c51` session P2's record; this

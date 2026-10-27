@@ -20,10 +20,7 @@ use zeroize::Zeroize;
 use crate::secret::{self, DeviceSecret};
 use crate::{AuthWitness, Call, DeviceError, Digest, FORMAT, scope};
 
-/// Where a proof's masks come from: the operating system's randomness, the
-/// only choice a production build has (the prover's seeded stream exists
-/// only under its tests' feature, which no production build enables).
-pub use vos_pvm_recair::masked::MaskRng as Masks;
+use vos_pvm_recair::masked::MaskRng;
 
 /// The most memory a credential proof takes, in bytes: its peak resident
 /// size measured on the gate phone and on x86, rounded up. A configuration
@@ -46,13 +43,13 @@ pub enum Threads {
     Cores(Vec<usize>),
 }
 
-/// A prover's threads, its memory allowance and its masks.
+/// A prover's threads and its memory allowance. Its masks are the
+/// operating system's.
 #[derive(Clone, Debug)]
 pub struct ProverConfig {
     pub threads: Threads,
     /// The memory a proof may take, in bytes: at least [`PEAK_BYTES`].
     pub max_memory: u64,
-    pub masks: Masks,
 }
 
 impl Default for ProverConfig {
@@ -60,7 +57,6 @@ impl Default for ProverConfig {
         Self {
             threads: Threads::Auto,
             max_memory: PEAK_BYTES,
-            masks: Masks::Os,
         }
     }
 }
@@ -165,7 +161,7 @@ pub struct JointProof {
 /// The prover: its thread pool.
 pub struct Prover {
     pool: rayon::ThreadPool,
-    masks: Masks,
+    masks: MaskRng,
 }
 
 impl Prover {
@@ -196,8 +192,21 @@ impl Prover {
         let pool = builder.build().map_err(|_| DeviceError::Config)?;
         Ok(Self {
             pool,
-            masks: config.masks,
+            masks: MaskRng::Os,
         })
+    }
+
+    /// This prover with every proof's masks from `seed`, so a proof's
+    /// bytes are any machine's: the phone bench's seeded build. A test seam
+    /// (`seeded-masks`), refused in every production build by `just
+    /// check-no-seeded-masks`.
+    #[cfg(feature = "seeded-masks")]
+    #[doc(hidden)]
+    pub fn seeded(self, seed: u64) -> Self {
+        Self {
+            masks: MaskRng::Seeded(seed),
+            ..self
+        }
     }
 
     /// The pool's threads.
@@ -225,9 +234,12 @@ impl Prover {
             verifier::program(CredentialKind::Auth),
             CredentialKind::Auth as u8,
         )?;
-        let mut statement = Statement::Auth(public.circuit(), circuit_witness(secret, witness));
-        let proof = self.prove(&statement);
-        wipe(&mut statement);
+        let statement = Held(Statement::Auth(
+            public.circuit(),
+            circuit_witness(secret, witness),
+        ));
+        let proof = self.prove(&statement.0);
+        drop(statement);
         Ok(CredentialProof {
             format: FORMAT,
             public: CredentialPublic::Auth {
@@ -252,15 +264,15 @@ impl Prover {
             verifier::program(CredentialKind::Owner),
             CredentialKind::Owner as u8,
         );
-        let mut statement = Statement::Owner(
+        let statement = Held(Statement::Owner(
             OwnerPublic {
                 owner: owner.0,
                 binding: binding.0,
             },
             secret.0,
-        );
-        let proof = self.prove(&statement);
-        wipe(&mut statement);
+        ));
+        let proof = self.prove(&statement.0);
+        drop(statement);
         Ok(CredentialProof {
             format: FORMAT,
             public: CredentialPublic::Owner { owner, binding },
@@ -287,13 +299,13 @@ impl Prover {
             owner: secret::owner(secret),
             binding: auth.binding,
         };
-        let mut statement = Statement::Joint(
+        let statement = Held(Statement::Joint(
             auth.circuit(),
             public.owner.0,
             circuit_witness(secret, witness),
-        );
-        let proof = self.prove(&statement);
-        wipe(&mut statement);
+        ));
+        let proof = self.prove(&statement.0);
+        drop(statement);
         Ok(JointProof {
             format: FORMAT,
             public,
@@ -358,6 +370,7 @@ pub fn verify(
 pub fn verify_joint(proof: &JointProof, call: &Call, name: &[u8]) -> Result<(), DeviceError> {
     let joint = joint();
     if proof.format != FORMAT
+        || call.check().is_err()
         || proof.public.binding != call.binding(&joint.program, JOINT_KIND)
         || scope(&call.space, call.agent, call.instance, name) != Some(proof.public.scope)
     {
@@ -419,11 +432,18 @@ fn circuit_witness(secret: &DeviceSecret, witness: &AuthWitness) -> circuits::Au
     }
 }
 
-/// Zeroizes the secret's words in `statement`.
-fn wipe(statement: &mut Statement) {
-    match statement {
-        Statement::Auth(_, witness) | Statement::Joint(_, _, witness) => witness.secret.zeroize(),
-        Statement::Owner(_, secret) => secret.zeroize(),
+/// A statement whose secret words are zeroized when it is dropped, a
+/// prover's panic unwinding included.
+struct Held(Statement);
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        match &mut self.0 {
+            Statement::Auth(_, witness) | Statement::Joint(_, _, witness) => {
+                witness.secret.zeroize()
+            }
+            Statement::Owner(_, secret) => secret.zeroize(),
+        }
     }
 }
 

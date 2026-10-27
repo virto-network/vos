@@ -17,9 +17,10 @@ serve its requests.
   `path(member)` tells the operators which member digest is online, and
   from which address. What they do not learn is when it proves:
   - the device library (`PathKeeper`) fetches its path apart from its
-    proofs: when a `root()` answer has moved and on a timer of 30 s
-    jittered uniformly between 15 s and 45 s, never because a proof is
-    about to be made, on a connection of its own;
+    proofs: on a timer of 30 s jittered uniformly between 15 s and 45 s,
+    and at a time drawn below 10 s after a moved `root()` answer is first
+    seen, never because a proof is about to be made; the client sends
+    the queries on a connection of their own;
   - each `path` and `root()` query is signed by a key drawn for it alone,
     so a fetch links to no client key; `root()` names no member;
   - so a fetch's time says nothing of a proof's, but a proof from the same
@@ -32,6 +33,7 @@ serve its requests.
   one timer period (about 1.4 a second, for 45 s), past which the library
   halves its period for the space's pace.
 - **From a tree change:** every online member's library fetches its path
-  when `root()` moves, so each enrollment or revocation shows which member
-  digests are online then; the jitter spreads the fetches, it does not
-  hide them. Syncing the tree is the later fix.
+  within 10 s of seeing `root()` move, so each enrollment or revocation
+  shows which member digests are online then; the spread, and the
+  clients' own jitter in polling `root()`, spread the fetches, they do
+  not hide them. Syncing the tree is the later fix.

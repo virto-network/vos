@@ -15,13 +15,12 @@ path = "src/main.rs"
 # x86's (the references compiled in from `VOS_PHONE_REFERENCES`). The
 # prover's test seam: no production build enables it, and the workspace's
 # default features leave it off.
-seeded = ["vos-pvm-recair/seeded-masks"]
+seeded = ["vos-device/seeded-masks"]
 # mimalloc as the allocator, as the phone's client links it.
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
 vos-device = { workspace = true }
-vos-pvm-recair = { workspace = true }
 vos-wire = { workspace = true }
 stwo = { workspace = true }
 rayon = { workspace = true }

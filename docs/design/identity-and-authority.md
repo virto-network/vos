@@ -598,7 +598,8 @@ space three of them take a simpler form:
   `ROOT_MAX_AGE` after it was superseded (§6).
 - **The scope carries the space:**
   `scope = C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))`,
-  so no two agents' guards of one name, in one space or two, share a
+  `name` in SCALE (a `u32` little-endian length, then its bytes,
+  `proving.md` §8), so no two agents' guards of one name, in one space or two, share a
   pseudonym, even for a member whose secret two spaces share.
 
 **The in-space credential's threat model:**

@@ -27,6 +27,11 @@ use vos_wire::result::Outcome;
 
 const HANDLE: [u8; 32] = [7; 32];
 const NAME: &[u8] = b"login";
+/// `scope([0x51; 32], 4, 2, "login")`'s bytes, the name in SCALE.
+const SCOPE_VECTOR: [u8; 32] = [
+    176, 47, 24, 3, 211, 3, 208, 103, 92, 44, 198, 75, 144, 255, 58, 99, 210, 27, 59, 25, 235, 172,
+    49, 126, 162, 142, 147, 35, 82, 189, 54, 43,
+];
 
 /// A sparse tree of depth 32 over `C`, rebuilt from its leaves: the
 /// credential actor's, as `proving.md` §8 defines it.
@@ -193,6 +198,11 @@ fn the_scope_and_the_binding_name_the_call() {
     ] {
         assert_ne!(other, scope(&space, 4, 2, b"login"));
     }
+    // A vector the ingress's scope must give too.
+    assert_eq!(
+        scope(&space, 4, 2, b"login").unwrap().to_bytes(),
+        SCOPE_VECTOR
+    );
     assert_eq!(scope(&space, 4, 2, b""), None);
     assert_eq!(scope(&space, 4, 2, &[b'a'; 65]), None);
     assert!(scope(&space, 4, 2, &[b'a'; 64]).is_some());
@@ -282,6 +292,34 @@ fn each_proof_verifies_against_its_call_alone() {
         Err(DeviceError::Verify)
     );
     assert_eq!(verify(&auth, &call, None), Err(DeviceError::Verify));
+    // Words the call does not fix, changed: refused by the proof itself.
+    let CredentialPublic::Auth {
+        scope: s,
+        nullifier,
+        binding,
+        ..
+    } = auth.public
+    else {
+        unreachable!()
+    };
+    for (map_root, nullifier) in [
+        (map_root, Digest(compress(&nullifier.0, &nullifier.0))),
+        (Tree::default().root(), nullifier),
+    ] {
+        let changed = vos_device::CredentialProof {
+            public: CredentialPublic::Auth {
+                map_root,
+                scope: s,
+                nullifier,
+                binding,
+            },
+            ..auth.clone()
+        };
+        assert_eq!(
+            verify(&changed, &call, Some(NAME)),
+            Err(DeviceError::Verify)
+        );
+    }
     let relabelled = vos_device::CredentialProof {
         format: 42,
         ..auth.clone()
@@ -531,8 +569,24 @@ fn the_wire_requests_and_answers() {
     );
     assert_eq!(
         wire::credentialed_answer(&[2, 9, 11]),
-        Ok(Answer::Refused(11))
+        Ok(Answer::RootStale)
     );
+    assert_eq!(
+        wire::credentialed_answer(&[2, 9, 6]),
+        Ok(Answer::Refused(6))
+    );
+    let mut expiry = vec![2, 9, 3];
+    expiry.extend(1_234u64.to_le_bytes());
+    assert_eq!(
+        wire::credentialed_answer(&expiry),
+        Ok(Answer::Expiry { now: 1_234 })
+    );
+    for malformed in [&[2, 9, 10, 0][..], &[2, 9, 3], &[2, 9, 13], &[2, 9]] {
+        assert_eq!(
+            wire::credentialed_answer(malformed),
+            Err(DeviceError::Decode)
+        );
+    }
     assert_eq!(
         wire::credentialed_answer(&ran(vec![1])),
         Ok(Answer::Ran {
@@ -566,8 +620,15 @@ fn the_path_is_kept_apart_from_proofs() {
     assert_eq!(keeper.witness(), Some(&tree.witness(5)));
     assert!(!keeper.due(1_000 + period / 2 - 1, None));
     assert!(!keeper.due(1_000 + period / 2 - 1, Some(&tree.root())));
-    assert!(keeper.due(1_000 + period / 2 - 1, Some(&Tree::default().root())));
     assert!(keeper.due(1_000 + period * 3 / 2, None));
+    // A moved root brings the fetch forward, spread below
+    // `MOVED_SPREAD_MS` from when it is first seen: before the timer's
+    // earliest, half a period on.
+    keeper.update(tree.witness(5), 1_000).unwrap();
+    let seen = 2_000;
+    assert!(seen + PathKeeper::MOVED_SPREAD_MS < 1_000 + period / 2);
+    keeper.due(seen, Some(&Tree::default().root()));
+    assert!(keeper.due(seen + PathKeeper::MOVED_SPREAD_MS, None));
 
     keeper.unknown();
     assert!(keeper.witness().is_none());

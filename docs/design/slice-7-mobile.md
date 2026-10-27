@@ -335,8 +335,9 @@ pinned by 7.7.
 - **The scope,** namespaced by the verifier and its space (the Fable
   review's H1):
   `scope = C(T(scope), W(BLAKE2b-256("vos/cred/scope/v1" ‖ space ‖ agent ‖ instance ‖ name)))`,
-  `W` a 32-byte digest's eight 31-bit words, computed by ingress from the
-  method's guard; no two agents' "login", in one space or two, share a
+  `W` a 32-byte digest's eight 31-bit words, `name` in SCALE (a `u32`
+  little-endian length, then its bytes, `proving.md` §8), computed by
+  ingress from the method's guard; no two agents' "login", in one space or two, share a
   pseudonym, even for a member whose secret two spaces share (pin K).
 - **The binding:** `binding = C(T(binding), W(b))`,
   `b = BLAKE2b-256("vos/cred/binding/v1" ‖ space ‖ agent ‖ instance ‖ method ‖ program ‖ kind ‖ SCALE(arguments) ‖ nonce ‖ expires_ms)`:

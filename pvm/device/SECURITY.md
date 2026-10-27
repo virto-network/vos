@@ -24,9 +24,11 @@ and what a node does with one is `node/SECURITY.md`'s.
 - **What the library zeroizes:** the derivation's 64-byte `w` and each
   wide word; `DeviceSecret` on drop (no `Clone`, no `Debug`); the
   nullifier's key `C(T(nf), s)`; the secret's words in the circuit's
-  statement after each proof; the circuit's private values (every row of
-  the witness but its public outputs) once the prover has taken them.
-- **What it does not:** the prover's trace and its masked polynomials,
+  statement after each proof, a panic unwinding included; the circuit's
+  private values (every row of the witness but its public outputs) once
+  the prover has taken them.
+- **What it does not:** the circuit builder's own copy of the values
+  (recair's `Context`), the prover's trace and its masked polynomials,
   which hold the secret's words and every value derived from it, are
   freed with the proof's other buffers, not overwritten; so are BLAKE2b's
   and the Poseidon2 permutation's internal states, and copies the
@@ -52,12 +54,14 @@ and what a node does with one is `node/SECURITY.md`'s.
 
 - **No logging of witnesses:** it logs nothing. `DeviceError` names what
   failed and carries no value: no secret, path, word or proof byte.
-- **No seeded masks:** the library has no `seeded-masks` feature, and its
-  proofs' masks are the operating system's (`Masks::Os`, the only value a
-  production build has). The prover's seeded stream, which makes a proof
-  reproducible byte for byte, exists only where the prover's tests'
-  feature is on (the phone bench's seeded build); `just
-  check-no-seeded-masks` refuses it in a production build.
+- **No seeded masks in a production build:** a proof's masks are the
+  operating system's, and no configuration chooses otherwise. The one
+  seam is the library's `seeded-masks` feature (`Prover::seeded`), which
+  the phone bench's seeded build turns on so its proofs' bytes can be
+  compared with x86's; `just check-no-seeded-masks` refuses it in the
+  library's default build and in every production build.
+- **`AuthWitness`'s `Debug` shows nothing** of its root, slot or
+  siblings, which place the member's leaf.
 - **A proof's shape is the statement's:** every component pads to the
   masking's floor, and the auth circuit walks its path with selects, so
   its rows do not depend on the slot or the secret.
@@ -78,12 +82,18 @@ and what a node does with one is `node/SECURITY.md`'s.
 
 ## Paths, and what fetching them shows
 
-- **Paths are fetched apart from proofs** (`PathKeeper`): when `root()`
-  moves and on a jittered timer, never because a proof is about to be
-  made, and each `path` or `root()` query is signed by a key drawn for it
-  alone. `node/SECURITY.md` states what the fetches still show the
-  operators.
-- **A `RootUnknown` answer** drops the held path: the client fetches it
+- **Paths are fetched apart from proofs** (`PathKeeper`): on a jittered
+  timer, and within a spread of up to 10 s after a moved `root()` is
+  first seen, never because a proof is about to be made; each `path` or
+  `root()` query is signed by a key drawn for it alone. The keeper only
+  says when: **the client** polls `root()` on a jittered timer of its own
+  and sends the queries on a connection of their own, apart from the one
+  that carries its proofs. `node/SECURITY.md` states what the fetches
+  still show the operators.
+- **`verify`** runs ingress's checks that need neither a clock nor
+  state; the expiry window, the root's freshness and replay are the
+  node's.
+- **A `RootUnknown` (or `RootStale`) answer** drops the held path: the client fetches it
   again and proves anew. That one fetch precedes a proof, so its time
   links to the proof's; it happens only when the ring no longer holds the
   root (a replica's lag, a root replaced at its own batch time, or 64
