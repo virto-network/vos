@@ -268,6 +268,24 @@ macro_rules! actor_program {
     };
 }
 
+/// The schema section a program carries: `marked` when its actor is the
+/// agent's credential actor (`#[actor(credentials)]`), else `plain`, each
+/// `N` bytes long as `credentials` picks. `#[messages]` makes both.
+pub const fn schema_section<const N: usize>(
+    plain: &[u8],
+    marked: &[u8],
+    credentials: bool,
+) -> [u8; N] {
+    let from = if credentials { marked } else { plain };
+    let mut section = [0u8; N];
+    let mut at = 0;
+    while at < N {
+        section[at] = from[at];
+        at += 1;
+    }
+    section
+}
+
 /// Run a handler or a workflow to completion. Every operation either
 /// awaits is ready when polled: the agent completes a nested call before
 /// the caller's machine resumes, and a workflow's pause returns only once

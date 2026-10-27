@@ -10,7 +10,10 @@ use crate::ids::MethodId;
 use crate::{Decode, Encode};
 
 /// The section starts with these bytes, then the schema's length as four
-/// little-endian bytes, then the schema.
+/// little-endian bytes, then the schema: its methods, each without its
+/// credential guard, then, only when the program is the credential actor
+/// or a method has a guard, the [`Credentials`] that say which. A program
+/// with neither carries the section it carried before guards were.
 pub const MAGIC: [u8; 4] = *b"VOSS";
 
 /// The most a schema may hold: what a refine reads before installing.
@@ -21,14 +24,34 @@ pub const MAX_NAME: usize = 256;
 /// The longest name a credential guard's scope takes.
 pub const MAX_GUARD_NAME: usize = 64;
 
+/// An installed record carries it whole; a program's section as
+/// [`Schema::section`] writes it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Schema {
     pub methods: Vec<MethodSchema>,
     /// The program is its agent's credential actor (`#[actor(credentials)]`):
     /// its install records the row [`crate::keys::credentials`], whose ring
-    /// the agent's auth guards read. Last, so a program's section ends
-    /// with it.
+    /// the agent's auth guards read.
     pub credentials: bool,
+}
+
+/// A method in a program's section: its schema but its guard.
+#[derive(Encode, Decode)]
+struct Plain {
+    id: MethodId,
+    name: Vec<u8>,
+    kind: Kind,
+    role: Option<Vec<u8>>,
+    gas: Option<u64>,
+    linearizable: bool,
+}
+
+/// What follows a section's methods when the program is the credential
+/// actor or guards a method: the mark, and each guard by its method.
+#[derive(Encode, Decode)]
+pub struct Credentials {
+    pub actor: bool,
+    pub guards: Vec<(MethodId, CredentialGuard)>,
 }
 
 /// What a credentialed call's origin must be for a method to run it
@@ -130,7 +153,32 @@ pub enum SchemaError {
 impl Schema {
     /// The section's bytes.
     pub fn section(&self) -> Vec<u8> {
-        let body = self.encode();
+        let mut body = Vec::new();
+        let plain: Vec<Plain> = self
+            .methods
+            .iter()
+            .map(|method| Plain {
+                id: method.id,
+                name: method.name.clone(),
+                kind: method.kind,
+                role: method.role.clone(),
+                gas: method.gas,
+                linearizable: method.linearizable,
+            })
+            .collect();
+        plain.encode_to(&mut body);
+        let guards: Vec<(MethodId, CredentialGuard)> = self
+            .methods
+            .iter()
+            .filter_map(|method| Some((method.id, (**method.credential.as_ref()?).clone())))
+            .collect();
+        if self.credentials || !guards.is_empty() {
+            Credentials {
+                actor: self.credentials,
+                guards,
+            }
+            .encode_to(&mut body);
+        }
         let mut section = Vec::with_capacity(8 + body.len());
         section.extend_from_slice(&MAGIC);
         section.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -152,9 +200,41 @@ impl Schema {
             return Err(SchemaError::Size);
         }
         let body = ro_data.get(8..8 + len).ok_or(SchemaError::Size)?;
-        let (schema, used) = Self::decode(body).map_err(|_| SchemaError::Undecodable)?;
+        let (plain, used) = <Vec<Plain>>::decode(body).map_err(|_| SchemaError::Undecodable)?;
+        let mut schema = Schema {
+            methods: plain
+                .into_iter()
+                .map(|method| MethodSchema {
+                    id: method.id,
+                    name: method.name,
+                    kind: method.kind,
+                    role: method.role,
+                    gas: method.gas,
+                    linearizable: method.linearizable,
+                    credential: None,
+                })
+                .collect(),
+            credentials: false,
+        };
         if used != len {
-            return Err(SchemaError::Undecodable);
+            let credentials =
+                Credentials::decode_exact(&body[used..]).ok_or(SchemaError::Undecodable)?;
+            // An empty mark says nothing: the section carries none.
+            if !credentials.actor && credentials.guards.is_empty() {
+                return Err(SchemaError::Undecodable);
+            }
+            schema.credentials = credentials.actor;
+            for (id, guard) in credentials.guards {
+                let method = schema
+                    .methods
+                    .iter_mut()
+                    .find(|method| method.id == id)
+                    .ok_or(SchemaError::Credential(id))?;
+                if method.credential.is_some() {
+                    return Err(SchemaError::Credential(id));
+                }
+                method.credential = Some(alloc::boxed::Box::new(guard));
+            }
         }
         schema.validate()?;
         Ok(schema)

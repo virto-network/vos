@@ -86,8 +86,8 @@ pub const INPUT_RESERVE: u64 = 50_000;
 /// The same for a sweep: reading the rows of the due index it lists.
 pub const SWEEP_RESERVE: u64 = 1_000_000;
 /// The same for an install: reading, validating and encoding a schema
-/// of `schema::MAX_LEN` bytes from its program's machine, about 7.4M.
-pub const INSTALL_RESERVE: u64 = 9_500_000;
+/// of `schema::MAX_LEN` bytes from its program's machine, about 7.7M.
+pub const INSTALL_RESERVE: u64 = 10_000_000;
 /// Gas the agent takes per byte of an installed record it reads for the
 /// first time in a refine, before it reads it: reading and decoding the
 /// record, about 3.7M for a schema of `schema::MAX_LEN` bytes. The

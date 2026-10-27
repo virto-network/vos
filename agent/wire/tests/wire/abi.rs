@@ -269,8 +269,31 @@ fn credential_guards_validate_and_the_mark_is_last() {
         },
     ]);
     let section = fine.section();
-    assert_eq!(section.last(), Some(&1), "the mark, last");
     assert_eq!(Schema::read(&section), Ok(fine.clone()));
+    // A section with no guard and no mark is the methods' alone, as before
+    // guards were; the mark alone follows them.
+    let unguarded = |credentials| Schema {
+        methods: vec![MethodSchema {
+            credential: None,
+            ..guarded(Kind::Command, CredentialGuard::Owner)
+        }],
+        credentials,
+    };
+    let plain = unguarded(false).section();
+    let marked = unguarded(true).section();
+    assert_eq!(&marked[plain.len()..], [1, 0, 0, 0, 0]);
+    assert_eq!(&plain[4..8], &((plain.len() - 8) as u32).to_le_bytes());
+    assert_eq!(Schema::read(&plain), Ok(unguarded(false)));
+    assert_eq!(Schema::read(&marked), Ok(unguarded(true)));
+    let mut empty = plain.clone();
+    empty.extend_from_slice(&[0, 0, 0, 0, 0]);
+    let len = (empty.len() - 8) as u32;
+    empty[4..8].copy_from_slice(&len.to_le_bytes());
+    assert_eq!(
+        Schema::read(&empty),
+        Err(SchemaError::Undecodable),
+        "an empty mark"
+    );
     assert!(fine.guards_auth());
     let refused = MethodId(3);
     for methods in [
