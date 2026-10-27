@@ -63,17 +63,6 @@ pub mod tables {
     pub const RING_KEY: u8 = 0;
 }
 
-/// The key of the ring's row of the credential actor at `actor`: the row
-/// [`tables::RING_KEY`] of its hashed table [`tables::RING`], which
-/// ingress and the refine both read.
-pub fn ring_key(actor: InstanceId) -> Vec<u8> {
-    let rows = crate::abi::Rows::Table {
-        tag: crate::ids::derive_id("vos/table/", tables::RING),
-        transform: crate::keys::Transform::Hashed,
-    };
-    crate::keys::row(actor, rows, &[tables::RING_KEY]).expect("a hashed row's key")
-}
-
 /// The tags' names (`proving.md` §8): `T(name)` is the block
 /// `[t, 0, 0, 0, 0, 0, 0, 0]`, `t` from `BLAKE2b-256("vos/p2/" ‖ name)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
@@ -742,6 +731,20 @@ pub enum CredentialError {
     /// The handle given is all zeros, which reads as none.
     #[codec(index = 9)]
     ZeroHandle = 9,
+}
+
+/// The key of the ring's row of the credential actor at `actor`: the row
+/// [`tables::RING_KEY`] of its hashed table [`tables::RING`], which
+/// ingress and the refine both read. Inline, so it is compiled only where
+/// it is called: a pinned kernel that does not call it keeps its program
+/// id.
+#[inline]
+pub fn ring_key(actor: InstanceId) -> Vec<u8> {
+    let rows = crate::abi::Rows::Table {
+        tag: crate::ids::derive_id("vos/table/", tables::RING),
+        transform: crate::keys::Transform::Hashed,
+    };
+    crate::keys::row(actor, rows, &[tables::RING_KEY]).expect("a hashed row's key")
 }
 
 #[cfg(test)]
