@@ -24,8 +24,8 @@ use crate::nodes::{operator, target};
 /// Identity rows a call writes: the shard actor's most.
 const FILL: u64 = 1_000;
 
-/// Agents created at once.
-const CREATORS: u32 = 16;
+/// Agents created at once, by default.
+pub const CREATORS: u32 = 16;
 
 /// How long an operator's command may take at one node.
 const ANSWER: Duration = Duration::from_secs(30);
@@ -259,6 +259,8 @@ pub struct Request<'a> {
     /// The representative's ELF, to create and install it first.
     pub representative: Option<&'a Path>,
     pub seed: u64,
+    /// Agents created at once.
+    pub creators: u32,
 }
 
 /// Create `request.count` agents by the nodes' weights, each with the
@@ -315,7 +317,7 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
     let next = AtomicU32::new(0);
     let mut placed: Vec<Option<Placed>> = vec![None; total as usize];
     std::thread::scope(|scope| -> Result<(), String> {
-        let workers: Vec<_> = (0..CREATORS.min(total.max(1)))
+        let workers: Vec<_> = (0..request.creators.max(1).min(total.max(1)))
             .map(|_| {
                 scope.spawn(|| -> Result<Vec<(u32, Placed)>, String> {
                     let operators = crate::agents::operators(inventory, &deployed)?;

@@ -111,6 +111,10 @@ struct AgentsArgs {
     /// The placements' seed.
     #[arg(long, default_value_t = 1)]
     seed: u64,
+    /// Agents created at once: each mostly waits for its group's first
+    /// election.
+    #[arg(long, default_value_t = agents::CREATORS)]
+    creators: u32,
 }
 
 #[derive(clap::Args)]
@@ -284,6 +288,9 @@ enum Command {
         /// Idle agents beside them, `I`.
         #[arg(long, default_value_t = 0)]
         idle: u32,
+        /// Agents created at once.
+        #[arg(long, default_value_t = agents::CREATORS)]
+        creators: u32,
         /// Create the stand-in identity agent, with a row a user.
         #[arg(long)]
         identity: bool,
@@ -358,6 +365,7 @@ fn make_agents(inventory: &Inventory, args: &AgentsArgs, run: Option<&Run>) -> R
             instance: args.instance,
             representative: representative.as_deref(),
             seed: args.seed,
+            creators: args.creators,
         },
     )?;
     if let Some(run) = run {
@@ -495,6 +503,7 @@ fn run(cli: Cli) -> Result<(), String> {
             fault,
             shards,
             idle,
+            creators,
             identity,
             actor,
             representative,
@@ -533,6 +542,7 @@ fn run(cli: Cli) -> Result<(), String> {
                         instance: 1,
                         representative,
                         seed: load.seed,
+                        creators,
                     };
                     make_agents(&inventory, &args, Some(&run))
                 })

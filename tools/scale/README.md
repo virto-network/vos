@@ -10,7 +10,7 @@ drives it, with one `[[host]]` entry for each node or driver.
 | `check` | Reads every host: architecture, kernel, clock offset, free memory and disk, the data disk's type, CPU and governor, the link's speed, the tools, the user manager, and whether the ports are free. It refuses a host that would make the numbers mislead, and exits 1 if it refuses any host. |
 | `deploy` | Ships the static `vos` and `vos-scale` and the agent's ELF to every host with `rsync`, wipes the nodes' data, makes each node's key, and founds a new space. |
 | `up` | Starts a run: each node and each host's sampler in a `systemd-run --user` unit under a memory cap. Ingress uses each node's own TLS, pinned by its key, so the harness makes no certificates. |
-| `agents` | Creates the `K` ledger shards and `I` idle agents on three nodes each, picked by weight, with the shard actor installed in each; `--identity-rows U` creates the stand-in identity agent on every node and writes its rows; `--representative` creates the space's representative first. |
+| `agents` | Creates the `K` ledger shards and `I` idle agents on three nodes each, picked by weight, with the shard actor installed in each, `--creators` of them at once (16); `--identity-rows U` creates the stand-in identity agent on every node and writes its rows; `--representative` creates the space's representative first. |
 | `drive` | Drives the load model from every driver host while it polls each node's `/stats` and `/agents/*/status`. |
 | `collect` | Copies each host's samples, node log and driver record into the run's directory. |
 | `down` | Stops every unit on every host, by unit name. |
