@@ -30,7 +30,7 @@ fn session(key: u8, name: u8, t0: u64) -> Session {
 /// The sessions a sweep listed, each by its row's bucket.
 fn swept(step: &Step) -> Vec<(u64, SessionId)> {
     match step {
-        Step::Swept { due } => due.iter().map(|&(at, id)| (bucket_of(at), id)).collect(),
+        Step::Swept { due, .. } => due.iter().map(|&(at, id)| (bucket_of(at), id)).collect(),
         other => panic!("not a sweep: {other:?}"),
     }
 }
@@ -444,6 +444,7 @@ fn accumulate_holds_the_caps_and_clears_the_rows_a_sweep_lists() {
         seed: [0; 32],
         steps: vec![Step::Swept {
             due: vec![(expiry::due(orphan.0), orphan.1), (expiry::due(bucket), id)],
+            bindings: Vec::new(),
         }],
     };
     node.accumulate(&sweep(now + 1, version(&node)).encode());

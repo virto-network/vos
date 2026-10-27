@@ -250,14 +250,18 @@ fn the_install_reserve_and_record_price_cover_the_largest_install() {
     let methods: Vec<MethodSchema> = (1..=1000u32)
         .map(|id| MethodSchema {
             id: MethodId(id),
-            name: format!("{id:0>53}").into_bytes(),
+            name: format!("{id:0>52}").into_bytes(),
             kind: Kind::Command,
             role: None,
             gas: None,
             linearizable: false,
+            credential: None,
         })
         .collect();
-    let schema = Schema { methods };
+    let schema = Schema {
+        methods,
+        credentials: false,
+    };
     let section = schema.section();
     assert!(section.len() - 8 <= MAX_LEN && section.len() - 8 > MAX_LEN - 4096);
     // Return to the halt address at once.
@@ -389,7 +393,7 @@ fn the_reserves_cover_the_agents_own_work() {
             .unwrap()
             .0;
         assert!(
-            matches!(&swept.steps[0], vos_wire::result::Step::Swept { due } if due.len() == defaults::SWEEP_LIMIT)
+            matches!(&swept.steps[0], vos_wire::result::Step::Swept { due, .. } if due.len() == defaults::SWEEP_LIMIT)
         );
         let idle = node
             .run_refine(&node.work(later, vec![]), OUTER_GAS)

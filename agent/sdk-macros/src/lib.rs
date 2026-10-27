@@ -12,7 +12,6 @@ mod messages;
 mod names;
 
 use proc_macro::TokenStream;
-use proc_macro2::Span;
 use syn::{Error, ItemImpl, ItemStruct, LitStr, Type, parse_macro_input};
 
 use actor::actor_impl;
@@ -43,15 +42,24 @@ pub(crate) fn string_arg(meta: &syn::meta::ParseNestedMeta) -> syn::Result<Strin
 /// A table's tag derives from its field's name, or from
 /// `#[table(name = "...")]`, which keeps rows reachable when the field is
 /// renamed. Its key transform is its type's.
+///
+/// `#[actor(credentials)]` marks its agent's credential actor
+/// (`identity-and-authority.md` §6): its program's schema says so, and its
+/// install records the instance whose ring the agent's auth guards read.
 #[proc_macro_attribute]
 pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
-    if !attr.is_empty() {
-        return Error::new(Span::call_site(), "#[actor] takes no arguments")
-            .to_compile_error()
-            .into();
-    }
+    let mut credentials = false;
+    let parser = syn::meta::parser(|meta| {
+        if meta.path.is_ident("credentials") {
+            credentials = true;
+            Ok(())
+        } else {
+            Err(meta.error("expected `credentials`, or no argument"))
+        }
+    });
+    parse_macro_input!(attr with parser);
     let input = parse_macro_input!(item as ItemStruct);
-    actor_impl(input)
+    actor_impl(input, credentials)
         .unwrap_or_else(Error::into_compile_error)
         .into()
 }
@@ -82,6 +90,13 @@ pub fn actor(attr: TokenStream, item: TokenStream) -> TokenStream {
 /// - **Linearizable:** on a query, `#[msg(linearizable)]` always reads
 ///   after a read index, whatever consistency its client asks. That governs
 ///   the query a client names: a method it calls reads its snapshot.
+/// - **Credential guards:** `#[msg(credential = Auth("login"))]` admits
+///   the callers proving a member's leaf, each by its pseudonym in the
+///   scope `"login"` names, with `device = "..."` the attestable kernel
+///   whose device proofs it also takes and `once` each pseudonym once;
+///   `#[msg(credential = Owner)]` admits the callers proving an owner
+///   digest's secret, which `ctx.owner()` gives. Only a `&mut self`
+///   handler takes one, with no role and not `linearizable`.
 /// - **A new instance's state:** the impl block must define
 ///   `fn new() -> Self`.
 #[proc_macro_attribute]

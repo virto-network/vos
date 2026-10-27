@@ -28,7 +28,7 @@ use vos_wire::credentials::{
     Siblings, Words, tables::RING_KEY,
 };
 
-#[actor]
+#[actor(credentials)]
 pub struct Credentials {
     /// The space's handle, 32 bytes its founder drew; zeros until `found`.
     handle: Digest,

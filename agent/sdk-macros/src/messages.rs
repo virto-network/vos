@@ -10,7 +10,7 @@ use syn::{
 };
 use vos_wire::abi::Kind;
 use vos_wire::ids::MethodId;
-use vos_wire::schema::{MethodSchema, Schema};
+use vos_wire::schema::{CredentialGuard, MAX_GUARD_NAME, MethodSchema, Schema};
 
 use crate::names::{Ids, snake, upper_camel};
 use crate::{is_named, last_segment, string_arg};
@@ -65,6 +65,47 @@ struct Options {
     /// An attestable method whose statements bind the venue that judges
     /// them: a leading `venue: VenueId` public argument.
     venue_bound: Option<Span>,
+    /// `credential = Auth("name")` or `credential = Owner`.
+    credential: Option<(CredentialGuard, Span)>,
+    /// An auth guard's device kernel, `device = "..."`.
+    device: Option<(String, Span)>,
+    /// An auth guard that admits each nullifier once, `once`.
+    once: Option<Span>,
+}
+
+/// `Auth("name")` or `Owner`, a guard's value.
+fn credential_arg(meta: &syn::meta::ParseNestedMeta) -> syn::Result<CredentialGuard> {
+    let expected = || meta.error("expected `credential = Auth(\"name\")` or `credential = Owner`");
+    match meta.value()?.parse::<Expr>()? {
+        Expr::Path(path) if path.path.is_ident("Owner") => Ok(CredentialGuard::Owner),
+        Expr::Call(call) => {
+            let Expr::Path(function) = &*call.func else {
+                return Err(expected());
+            };
+            if !function.path.is_ident("Auth") || call.args.len() != 1 {
+                return Err(expected());
+            }
+            let Some(Expr::Lit(ExprLit {
+                lit: Lit::Str(name),
+                ..
+            })) = call.args.first()
+            else {
+                return Err(expected());
+            };
+            let name = name.value().into_bytes();
+            if !(1..=MAX_GUARD_NAME).contains(&name.len()) {
+                return Err(meta.error(format!(
+                    "an auth guard's name takes 1 to {MAX_GUARD_NAME} bytes"
+                )));
+            }
+            Ok(CredentialGuard::Auth {
+                name,
+                device: None,
+                once: false,
+            })
+        }
+        _ => Err(expected()),
+    }
 }
 
 fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
@@ -77,6 +118,14 @@ fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
                 options.linearizable = Some(meta.path.span());
             } else if meta.path.is_ident("venue_bound") {
                 options.venue_bound = Some(meta.path.span());
+            } else if meta.path.is_ident("credential") {
+                let span = meta.path.span();
+                options.credential = Some((credential_arg(&meta)?, span));
+            } else if meta.path.is_ident("device") {
+                let span = meta.path.span();
+                options.device = Some((string_arg(&meta)?, span));
+            } else if meta.path.is_ident("once") {
+                options.once = Some(meta.path.span());
             } else if meta.path.is_ident("gas") {
                 let Expr::Lit(ExprLit {
                     lit: Lit::Int(value),
@@ -88,13 +137,61 @@ fn msg_options(attribute: &Attribute) -> syn::Result<Options> {
                 options.gas = Some(value.base10_parse()?);
             } else {
                 return Err(meta.error(
-                    "expected `role = \"...\"`, `gas = N`, `linearizable` or `venue_bound`",
+                    "expected `role = \"...\"`, `gas = N`, `linearizable`, `venue_bound`, \
+                     `credential = ...`, `device = \"...\"` or `once`",
                 ));
             }
             Ok(())
         })?;
     }
     Ok(options)
+}
+
+/// A handler's credential guard, its `device` and `once` folded in: only
+/// a command takes one, with no role and not linearizable; `device` and
+/// `once` only beside an auth guard.
+fn guard(options: &mut Options, kind: Kind) -> syn::Result<()> {
+    let Some((guard, span)) = &mut options.credential else {
+        if let Some(span) = options
+            .device
+            .as_ref()
+            .map(|(_, span)| *span)
+            .or(options.once)
+        {
+            return Err(Error::new(
+                span,
+                "`device` and `once` go with `credential = Auth(\"...\")`",
+            ));
+        }
+        return Ok(());
+    };
+    if kind != Kind::Command || options.role.is_some() || options.linearizable.is_some() {
+        return Err(Error::new(
+            *span,
+            "a credential guard sits on a `&mut self` #[msg] handler alone, with no role and not \
+             `linearizable`: the proof is its caller's authority",
+        ));
+    }
+    match guard {
+        CredentialGuard::Auth { device, once, .. } => {
+            *device = options.device.take().map(|(name, _)| name.into_bytes());
+            *once = options.once.take().is_some();
+        }
+        CredentialGuard::Owner => {
+            if let Some(span) = options
+                .device
+                .as_ref()
+                .map(|(_, span)| *span)
+                .or(options.once)
+            {
+                return Err(Error::new(
+                    span,
+                    "`device` and `once` go with `credential = Auth(\"...\")`, not `Owner`",
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The kind an attribute marks a method to run as, apart from a handler:
@@ -116,7 +213,7 @@ fn handler(
     ids: &mut Ids,
 ) -> syn::Result<Handler> {
     let name = method.sig.ident.to_string();
-    let options = msg_options(attribute)?;
+    let mut options = msg_options(attribute)?;
     if marked == Some(Kind::Attestable)
         && (options.role.is_some() || options.linearizable.is_some())
     {
@@ -179,6 +276,7 @@ fn handler(
             "only a query (`&self`) is `linearizable`: what runs through the log already is",
         ));
     }
+    guard(&mut options, kind)?;
     let Arguments {
         has_context,
         arguments,
@@ -373,6 +471,8 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
         attestables: Vec::new(),
         schema: Schema {
             methods: Vec::new(),
+            // The actor's mark, set in the section's last byte below.
+            credentials: false,
         },
     };
     for handler in &handlers {
@@ -430,7 +530,13 @@ pub(crate) fn messages_impl(mut input: ItemImpl, module: Option<String>) -> syn:
 
             /// The schema's section bytes; `vos_sdk::actor_program!` places
             /// them in `.vos_schema`, first in the program's read-only data.
-            pub const SCHEMA: [u8; #schema_len] = [#(#schema),*];
+            /// Its last byte is the actor's `credentials` mark.
+            pub const SCHEMA: [u8; #schema_len] = {
+                let mut section = [#(#schema),*];
+                section[#schema_len - 1] =
+                    <super::#actor as ::vos_sdk::state::Marked>::CREDENTIALS as u8;
+                section
+            };
 
             /// Each attestable method's entry, which
             /// `vos_sdk::actor_program!` places in `.vos_attest`.
@@ -476,6 +582,11 @@ impl Generated {
             role: handler.options.role.clone().map(String::into_bytes),
             gas: handler.options.gas,
             linearizable: handler.options.linearizable.is_some(),
+            credential: handler
+                .options
+                .credential
+                .as_ref()
+                .map(|(guard, _)| Box::new(guard.clone())),
         });
         self.types.push(quote! {
             #[derive(::vos_sdk::Encode, ::vos_sdk::Decode)]

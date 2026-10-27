@@ -7,6 +7,7 @@ mod admin;
 mod base;
 mod batch;
 mod closes;
+mod credentialed;
 mod inputs;
 mod invocation;
 mod jam;
@@ -36,7 +37,7 @@ type Overlay = BTreeMap<Vec<u8>, Option<Vec<u8>>>;
 /// workflow's step, the step's input.
 #[derive(Clone, Copy)]
 struct Call<'a> {
-    caller: Principal,
+    caller: &'a Principal,
     instance: InstanceId,
     method: MethodId,
     arguments: &'a [u8],
@@ -62,7 +63,7 @@ fn run_query(agent: AgentId, query: Query) -> Outcome {
     let base = Base::new(agent, Source::Node, query.time, query.seed, u64::MAX);
     let mut invocation = Invocation::new(&base, 0, Kind::Query);
     invocation.top(Call {
-        caller: query.caller,
+        caller: &query.caller,
         instance: query.instance,
         method: query.method,
         arguments: &query.arguments,

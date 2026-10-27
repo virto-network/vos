@@ -153,6 +153,9 @@ enum Row {
     Reading = 0x24,
     EveryWindow = 0x25,
     Quarantined = 0x26,
+    Credentials = 0x27,
+    Binding = 0x28,
+    Once = 0x29,
 }
 
 /// The root builder's rows, each tagged after [`Owner::Tree`]: the rows of
@@ -785,6 +788,25 @@ pub fn member(principal: &Principal) -> Vec<u8> {
     key(&[&Row::Member.prefix(), &principal.encode()])
 }
 
+/// The instance of the agent's credential actor, whose ring its auth
+/// guards read: written by the actor's install, once.
+pub fn credentials() -> Vec<u8> {
+    Row::Credentials.prefix().to_vec()
+}
+
+/// A credentialed call's binding digest `b`, recorded at its apply with its
+/// `expires_ms`: a second call of it is refused, at every replica, until
+/// the sweep forgets it ([`Due::Binding`]).
+pub fn binding(binding: &[u8; 32]) -> Vec<u8> {
+    key(&[&Row::Binding.prefix(), binding])
+}
+
+/// A `once` guard's admission of `nullifier` in `scope`, with the batch
+/// time of its admission: kept for good.
+pub fn once(scope: &[u8; 32], nullifier: &[u8; 32]) -> Vec<u8> {
+    key(&[&Row::Once.prefix(), scope, nullifier])
+}
+
 /// A session's high-water mark and last activity, for this agent.
 pub fn session(session: SessionId) -> Vec<u8> {
     key(&[&Row::Session.prefix(), &session.0.to_be_bytes()])
@@ -816,7 +838,8 @@ pub fn session_of(session: SessionId) -> Vec<u8> {
 }
 
 /// What a row of the due index brings: a session to collect once it has
-/// expired, or a workflow's step.
+/// expired, a workflow's step, or a credentialed call's binding digest to
+/// forget.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode)]
 pub enum Due {
     #[codec(index = 0)]
@@ -824,33 +847,49 @@ pub enum Due {
     /// Its first step, its deadline or timer, or its collection once ended.
     #[codec(index = 1)]
     Workflow(WorkflowId),
+    /// A binding digest's row ([`binding`]), forgotten at its row's time.
+    #[codec(index = 2)]
+    Binding([u8; 32]),
 }
 
-impl Due {
-    fn tag(self) -> (u8, u64) {
-        match self {
-            Due::Session(id) => (0, id.0),
-            Due::Workflow(id) => (1, id.0),
-        }
-    }
+/// The kind byte of each [`Due`] in its row's key.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum DueKind {
+    Session = 0,
+    Workflow = 1,
+    Binding = 2,
 }
 
 /// A row of the due index, which the leader reads to time its sweeps and
 /// lists in them: the batch time it is due at, then its entry's kind and
 /// id, big-endian, so a scan meets the earliest first. A session's row is
 /// due once it may have expired ([`crate::expiry::due`]), and lies at or
-/// before that.
+/// before that. A binding's id is its 32 bytes; the kind byte fixes the
+/// id's width, so the keys stay prefix-free.
 pub fn due(at: u64, entry: Due) -> Vec<u8> {
-    let (kind, id) = entry.tag();
+    let (kind, number) = match &entry {
+        Due::Session(id) => (DueKind::Session, id.0),
+        Due::Workflow(id) => (DueKind::Workflow, id.0),
+        Due::Binding(binding) => {
+            return key(&[
+                &Row::Due.prefix(),
+                &at.to_be_bytes(),
+                &[DueKind::Binding as u8],
+                binding,
+            ]);
+        }
+    };
     key(&[
         &Row::Due.prefix(),
         &at.to_be_bytes(),
-        &[kind],
-        &id.to_be_bytes(),
+        &[kind as u8],
+        &number.to_be_bytes(),
     ])
 }
 
-/// The length of a [`due`] key.
+/// The length of a [`due`] key of a session or a workflow; a binding's is
+/// 24 bytes more.
 const DUE_LEN: usize = 2 + 8 + 1 + 8;
 
 /// The prefix of the due index.
@@ -860,14 +899,16 @@ pub fn due_prefix() -> Vec<u8> {
 
 /// The time and entry a [`due`] key names; `None` for any other key.
 pub fn due_entry(key: &[u8]) -> Option<(u64, Due)> {
-    if key.len() != DUE_LEN || key[..2] != Row::Due.prefix() {
+    if key.len() < DUE_LEN || key[..2] != Row::Due.prefix() {
         return None;
     }
     let at = u64::from_be_bytes(key[2..10].try_into().ok()?);
-    let id = u64::from_be_bytes(key[11..].try_into().ok()?);
+    let id = &key[11..];
+    let number = || id.try_into().ok().map(u64::from_be_bytes);
     let entry = match key[10] {
-        0 => Due::Session(SessionId(id)),
-        1 => Due::Workflow(WorkflowId(id)),
+        kind if kind == DueKind::Session as u8 => Due::Session(SessionId(number()?)),
+        kind if kind == DueKind::Workflow as u8 => Due::Workflow(WorkflowId(number()?)),
+        kind if kind == DueKind::Binding as u8 => Due::Binding(id.try_into().ok()?),
         _ => return None,
     };
     Some((at, entry))

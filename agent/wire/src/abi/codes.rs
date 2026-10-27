@@ -100,6 +100,11 @@ codes! {
         /// agent's: an agent belongs to one space, whose clock is frozen in
         /// its genesis.
         Space = 14,
+        /// An install of a program with an auth credential guard into an
+        /// agent with no credential actor, or of a second credential actor
+        /// at another instance: an agent's guards read the one actor its
+        /// row `credentials` names ([`crate::keys::credentials`]).
+        Credentials = 15,
     }
 }
 
@@ -123,6 +128,20 @@ codes! {
         /// A new session, while its key holds as many as it may at the
         /// agent.
         KeySessionsFull = 6,
+        /// A credentialed call whose `expires_ms` is before the batch's
+        /// time.
+        CredentialExpired = 7,
+        /// A credentialed call whose binding digest is recorded: it ran
+        /// once already, here or at another replica. Its first outcome is
+        /// not repeated.
+        Replayed = 8,
+        /// An auth call whose root is neither the credential actor's newest
+        /// nor superseded at most [`crate::defaults::ROOT_MAX_AGE`] before
+        /// the batch's time.
+        StaleRoot = 9,
+        /// An auth call of a `once` guard whose nullifier its scope has
+        /// admitted.
+        Once = 10,
     }
 }
 

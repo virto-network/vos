@@ -18,9 +18,59 @@ pub const MAX_LEN: usize = 64 << 10;
 pub const MAX_METHODS: usize = 1024;
 pub const MAX_NAME: usize = 256;
 
+/// The longest name a credential guard's scope takes.
+pub const MAX_GUARD_NAME: usize = 64;
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Schema {
     pub methods: Vec<MethodSchema>,
+    /// The program is its agent's credential actor (`#[actor(credentials)]`):
+    /// its install records the row [`crate::keys::credentials`], whose ring
+    /// the agent's auth guards read. Last, so a program's section ends
+    /// with it.
+    pub credentials: bool,
+}
+
+/// What a credentialed call's origin must be for a method to run it
+/// (`identity-and-authority.md` §5), from its handler's attribute. Its
+/// index is the statement's kind.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum CredentialGuard {
+    /// `#[msg(credential = Auth("name"))]`: an `Anonymous` origin of the
+    /// scope `name` gives, 1 to [`MAX_GUARD_NAME`] bytes, in this space,
+    /// agent and instance. `device` names the attestable kernel whose
+    /// device proofs it also takes; `once` admits each nullifier once in
+    /// the scope.
+    #[codec(index = 0)]
+    Auth {
+        name: Vec<u8>,
+        device: Option<Vec<u8>>,
+        once: bool,
+    },
+    /// `#[msg(credential = Owner)]`: an `Owner` origin, whose digest the
+    /// handler compares with the row it debits.
+    #[codec(index = 1)]
+    Owner,
+}
+
+impl CredentialGuard {
+    /// The statement's kind it admits, its encoding's index.
+    pub const fn kind(&self) -> u8 {
+        match self {
+            CredentialGuard::Auth { .. } => 0,
+            CredentialGuard::Owner => 1,
+        }
+    }
+
+    /// Whether `caller` is an origin it admits: its kind's.
+    pub fn admits(&self, caller: &crate::ids::Principal) -> bool {
+        use crate::ids::Principal;
+        matches!(
+            (self, caller),
+            (CredentialGuard::Auth { .. }, Principal::Anonymous { .. })
+                | (CredentialGuard::Owner, Principal::Owner(_))
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -40,6 +90,11 @@ pub struct MethodSchema {
     /// client names: a method that query calls reads the caller's snapshot,
     /// marked or not.
     pub linearizable: bool,
+    /// The credential a caller proves, if any: only a command takes one,
+    /// with no role and not linearizable. A method with none refuses an
+    /// `Anonymous` or `Owner` caller, and one with a guard refuses every
+    /// other caller. Boxed, so every method does not carry its size.
+    pub credential: Option<alloc::boxed::Box<CredentialGuard>>,
 }
 
 impl MethodSchema {
@@ -66,6 +121,10 @@ pub enum SchemaError {
     /// A method marked linearizable that is not a query: what runs through
     /// the log reads its state as it applies.
     Linearizable(MethodId),
+    /// A credential guard on a method that is not a command, or beside a
+    /// role or `linearizable`, or an auth guard's name empty or past
+    /// [`MAX_GUARD_NAME`], or its device kernel's past [`MAX_NAME`].
+    Credential(MethodId),
 }
 
 impl Schema {
@@ -123,6 +182,11 @@ impl Schema {
             if method.linearizable && method.kind != Kind::Query {
                 return Err(SchemaError::Linearizable(method.id));
             }
+            if let Some(guard) = &method.credential
+                && !guard_fits(method, guard)
+            {
+                return Err(SchemaError::Credential(method.id));
+            }
             ids.push(method.id.0);
         }
         // Sorted, a duplicate sits next to its twin: a refine validates a
@@ -132,6 +196,17 @@ impl Schema {
             Some(pair) => Err(SchemaError::Duplicate(MethodId(pair[0]))),
             None => Ok(()),
         }
+    }
+
+    /// Whether a method holds an auth guard, which needs the agent's
+    /// credential actor.
+    pub fn guards_auth(&self) -> bool {
+        self.methods.iter().any(|method| {
+            matches!(
+                method.credential.as_deref(),
+                Some(CredentialGuard::Auth { .. })
+            )
+        })
     }
 
     pub fn method(&self, id: MethodId) -> Option<&MethodSchema> {
@@ -145,4 +220,19 @@ impl Schema {
             .find(|method| method.name == name.as_bytes())
             .map(|method| method.id)
     }
+}
+
+/// Whether `guard` may sit on `method`: a command's, with no role and not
+/// linearizable, an auth guard's names within their bounds.
+fn guard_fits(method: &MethodSchema, guard: &CredentialGuard) -> bool {
+    let names = match guard {
+        CredentialGuard::Auth { name, device, .. } => {
+            (1..=MAX_GUARD_NAME).contains(&name.len())
+                && device
+                    .as_ref()
+                    .is_none_or(|device| device.len() <= MAX_NAME)
+        }
+        CredentialGuard::Owner => true,
+    };
+    names && method.kind == Kind::Command && method.role.is_none() && !method.linearizable
 }

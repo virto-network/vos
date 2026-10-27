@@ -16,6 +16,7 @@ use super::Call;
 use super::admin::admin;
 use super::base::Base;
 use super::closes;
+use super::credentialed::credentialed;
 use super::inputs::{
     acknowledge, called, consumed, failed_in_refine, message, out_of_order, proven, sweep,
 };
@@ -162,6 +163,7 @@ fn plan(base: &Base, pairs: &BTreeMap<AgentId, u64>, input: &Input, handler: boo
     };
     match input {
         Input::Request(request) => plain(limit(base, request.instance, request.method)?),
+        Input::Credentialed(call) => plain(limit(base, call.instance, call.method)?),
         Input::Message(Message {
             body: Body::Call {
                 instance, method, ..
@@ -243,6 +245,7 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
         let handler = matches!(
             &input,
             Input::Request(_)
+                | Input::Credentialed(_)
                 | Input::Message(Message {
                     body: Body::Call { .. },
                     ..
@@ -274,7 +277,7 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
                         };
                         let mark = Mark::Session(request.session, held.advanced(mark));
                         let call = Call {
-                            caller: request.caller,
+                            caller: &request.caller,
                             instance: request.instance,
                             method: request.method,
                             arguments: &request.arguments,
@@ -323,6 +326,7 @@ pub(crate) fn run_batch(base: &mut Base, batch: Batch) -> ResultWriter {
                 proof,
                 attested,
             } => Stepped::ran(proven(base, window, id, (proof, attested))),
+            Input::Credentialed(call) => credentialed(base, index, *call),
         };
         let Some(due) = batched.take(base, stepped, plan.reserve, plan.runs) else {
             break;

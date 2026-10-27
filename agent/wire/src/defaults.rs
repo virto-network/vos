@@ -80,13 +80,13 @@ pub const INPUT_RESERVE: u64 = 50_000;
 /// The same for a sweep: reading the rows of the due index it lists.
 pub const SWEEP_RESERVE: u64 = 1_000_000;
 /// The same for an install: reading, validating and encoding a schema
-/// of `schema::MAX_LEN` bytes from its program's machine, about 6.8M.
-pub const INSTALL_RESERVE: u64 = 9_000_000;
+/// of `schema::MAX_LEN` bytes from its program's machine, about 7.4M.
+pub const INSTALL_RESERVE: u64 = 9_500_000;
 /// Gas the agent takes per byte of an installed record it reads for the
 /// first time in a refine, before it reads it: reading and decoding the
-/// record, about 3.4M for a schema of `schema::MAX_LEN` bytes. The
+/// record, about 3.7M for a schema of `schema::MAX_LEN` bytes. The
 /// refine keeps it after, and so pays a record once whatever reads it.
-pub const RECORD_BYTE: u64 = 64;
+pub const RECORD_BYTE: u64 = 68;
 /// Gas a refine keeps to finish its result once its steps are written.
 pub const FINISH_RESERVE: u64 = 100_000;
 /// Gas a refine keeps to start: the program's entry and the batch's
@@ -94,8 +94,9 @@ pub const FINISH_RESERVE: u64 = 100_000;
 /// each, and [`DECODE_BYTE`] for every byte of the refine's arguments.
 /// Measured by the testkit's `the_start_reserves_cover_decoding_a_batch`.
 pub const START_RESERVE: u64 = 100_000;
-/// Gas a refine keeps per input of its batch, for decoding it.
-pub const DECODE_INPUT: u64 = 6_000;
+/// Gas a refine keeps per input of its batch, for decoding it: about
+/// 7,500 for a request.
+pub const DECODE_INPUT: u64 = 7_000;
 /// Gas a refine keeps per byte of its arguments, for decoding them.
 pub const DECODE_BYTE: u64 = 20;
 
@@ -197,6 +198,15 @@ pub const ACK_LIMIT: u64 = 1024;
 /// any change to the tree, unless the ring's 64 later roots push its root
 /// out first. Not the venues' `MaxRootAge`.
 pub const ROOT_MAX_AGE: u64 = 10 * 60 * 1000;
+
+/// How far ahead of the node's clock a credentialed call's `expires_ms` may
+/// be, in milliseconds: a proof is good at ingress for this long at most.
+pub const CREDENTIAL_HORIZON_MS: u64 = 120_000;
+
+/// How long past its `expires_ms` a credentialed call's binding digest stays
+/// recorded, in milliseconds of batch time: past it, the sweep forgets it,
+/// and the call is long refused as expired.
+pub const BINDING_KEPT_MS: u64 = 60_000;
 
 /// An await's deadline when its call sets none: after the batch time
 /// of the step that awaits, in milliseconds.
