@@ -170,7 +170,7 @@ export MIMALLOC_ALLOW_THP := "0"
 # Formatting: the workspace's, and each crate's it excludes.
 fmt-check:
     cargo fmt --all -- --check
-    for manifest in ([agent/default agent/representative agent/credentials agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm spikes] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
+    for manifest in ([agent/default agent/representative agent/credentials agent/test-actors pvm/bench/guests pvm/proof/fuzz pvm/proof/final-verifier/wasm spikes node/gateway/demo] | each {|dir| glob $'($dir)/**/Cargo.toml' --exclude ['**/target/**'] } | flatten | where {|manifest| open --raw $manifest | str contains '[package]' }) { cargo fmt --manifest-path $manifest -- --check }
 
 # The docs' links: none broken, and none from a public doc to a private
 # item.
@@ -271,10 +271,15 @@ test-agent: build-test-actors build-agent build-representative build-credentials
 # The gateway's SSH port and its `vos-api` subsystem (`vos-gateway`'s
 # `ssh` feature), on s4-server: a dependency built apart from the default
 # workspace build, its crates asking a newer stable Rust than the
-# workspace's nightly names, which builds them.
-test-gateway-ssh: build-test-actors build-agent
+# workspace's nightly names, which builds them. Then the demo on a local
+# space (`node/gateway/demo`, outside the workspace): a headless s4 client
+# enrolling, signing in and paying through the SSH port, proving with the
+# device library through s4's `vos.credential` facility.
+test-gateway-ssh: build-test-actors build-agent build-credentials
     cargo clippy -p vos-gateway --features ssh --ignore-rust-version --all-targets --quiet -- -D warnings
     cargo test -p vos-gateway --features ssh --ignore-rust-version
+    cargo clippy --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version --all-targets --quiet -- -D warnings
+    cargo test --manifest-path node/gateway/demo/Cargo.toml --ignore-rust-version
 
 # The default agent as a service on a local PolkaJam testnet, which it
 # starts and stops: a workflow suspended in one work package and resumed in

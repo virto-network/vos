@@ -7,10 +7,10 @@
 //!
 //! An owner statement of seed `s` is the credential tests'
 //! `owner_statement(s)`; an auth statement is a lone member at a random
-//! slot. Format 42's proofs are verified from their bytes by the final
-//! verifier, 44's by the native verifier.
+//! slot. The admitted format's proofs are verified from their bytes by the
+//! final verifier; another format's, by the native verifier.
 //!
-//! `cargo run --release -p vos-pvm-recair --example credential_stress -- THREADS FIRST COUNT [owner|auth|both] [42|44]`
+//! `cargo run --release -p vos-pvm-recair --example credential_stress -- THREADS FIRST COUNT [owner|auth|both] [44]`
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
@@ -19,7 +19,7 @@ use rayon::prelude::*;
 use stwo::core::vcs::blake2_hash::Blake2sHash;
 use stwo::core::vcs_lifted::blake2_merkle::Blake2sM31MerkleChannel;
 use vos_pvm_final_verifier::credential::{self as verifier, CredentialKind, CredentialProof};
-use vos_pvm_proof::format::{CREDENTIAL_PROOF, CREDENTIAL_PROOF_44, Format};
+use vos_pvm_proof::format::{CREDENTIAL_PROOF, Format};
 use vos_pvm_recair::credential::{self, AuthPublic, AuthWitness, OwnerPublic, Statement, Words};
 use vos_pvm_recair::masked::MaskRng;
 use vos_wire::credentials::{DEPTH, EMPTY, P, Tag, compress, leaf, root_of};
@@ -92,7 +92,8 @@ enum Failure {
 
 /// Proves `statement` under `format` with seed `seed`'s masks and verifies
 /// it against `root`, `format`'s preprocessed root of the statement's
-/// circuit (44's; 42's verifier holds its pins).
+/// circuit, for a format other than the admitted one (whose verifier holds
+/// its pins).
 fn round(statement: &Statement, format: &Format, root: Root, seed: u64) -> Result<(), Failure> {
     let failed = |stage: &str, error: &dyn core::fmt::Debug| format!("{stage}: {error:?}");
     let finalized = credential::witness(statement)
@@ -121,7 +122,7 @@ fn round(statement: &Statement, format: &Format, root: Root, seed: u64) -> Resul
     verifier::verify_bytes(kind, &words, &bytes).map_err(|error| refused(&error))
 }
 
-const USAGE: &str = "credential_stress THREADS FIRST COUNT [owner|auth|both] [42|44]";
+const USAGE: &str = "credential_stress THREADS FIRST COUNT [owner|auth|both] [44]";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -141,8 +142,7 @@ fn main() {
         Some(_) => panic!("usage: {USAGE}"),
     };
     let format = match args.get(4).map(String::as_str) {
-        None | Some("42") => &CREDENTIAL_PROOF,
-        Some("44") => &CREDENTIAL_PROOF_44,
+        None | Some("44") => &CREDENTIAL_PROOF,
         Some(_) => panic!("usage: {USAGE}"),
     };
     let pool = rayon::ThreadPoolBuilder::new()

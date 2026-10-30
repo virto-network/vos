@@ -30,7 +30,9 @@ vos-api = { workspace = true, features = ["client", "quic"] }
 vos-http = { workspace = true }
 vos-net = { workspace = true }
 vos-wire = { workspace = true }
-s4-server = { git = "https://codeberg.org/Virto/s4", rev = "cee80d95ef6644081c1155c50a3042a95b37b367", optional = true }
+# An agent's identity, its creation record's BLAKE2b-256.
+vos-pvm-precompiles = { workspace = true }
+s4-server = { git = "https://codeberg.org/Virto/s4", rev = "6f60229e97fb1f54b51f53c2406c168e1004a19b", optional = true }
 russh = { version = "0.61", default-features = false, features = ["ring", "flate2"], optional = true }
 
 [dev-dependencies]

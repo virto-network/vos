@@ -48,7 +48,7 @@ fn run(cli: Cli) -> Result<(), String> {
     let app = config
         .app_key
         .as_ref()
-        .map(|path| seed(path).map(|seed| AppClient::new(seed, Arc::clone(&gateway))))
+        .map(|path| seed(path).map(|seed| Arc::new(AppClient::new(seed, Arc::clone(&gateway)))))
         .transpose()?;
     let limits = Limits::new(config.per_address());
     let runtime = tokio::runtime::Runtime::new().map_err(|error| error.to_string())?;
@@ -64,8 +64,13 @@ fn run(cli: Cli) -> Result<(), String> {
             println!("app {}", hex::encode(app.key()));
         }
         #[cfg(feature = "ssh")]
-        let ssh =
-            vos_gateway::ssh::start(&config, Arc::clone(&gateway), Arc::clone(&limits)).await?;
+        let ssh = vos_gateway::ssh::start(
+            &config,
+            Arc::clone(&gateway),
+            Arc::clone(&limits),
+            app.clone(),
+        )
+        .await?;
         let http = Http {
             tls,
             connections: config.connections.unwrap_or(1024),

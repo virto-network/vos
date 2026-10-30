@@ -4016,3 +4016,118 @@ suites, `pcs::tests` among them); `just check` again with this record.
 
 **Commits:** the fork's `9e9b4ff6` (`vos/simd-m31-reduce`); `87232c17` the
 pin, the tests and the harness; this record.
+
+## Step 7.13: the demo in s4
+
+Branch `s7/7.13`, from vos-core `4a143e9f`; s4 on its `vos` branch (the
+worktree `~/src/virto/s4-vos`), from `cee80d9`.
+
+**Built in s4** (AGPL-3.0-or-later):
+- **External facilities** (`s4-protocol`): the `s4.` namespace stays
+  closed, another namespace's facility is admitted (`admits_facility`,
+  `CapabilityError::UnregisteredFacility`); `STATE-MACHINES.md` says so.
+- **`s4-server`**: `Server::facility(id, major)` offers one
+  (`InvalidFacility` for `s4.` or a repeat); `Server::anonymous()` takes
+  any public key as an identity for its connection alone
+  (`Identity::anonymous()`): no session parked or resumed (a resume
+  request gets a fresh id nothing keeps) and remembered grants stripped.
+- **`s4-credential`** (`credential/`, outside s4's workspace on VOS's
+  nightly, a `cdylib` with the `ffi` feature): the `vos.credential`
+  facility on `vos-device`, `vos-api` and `vos-wire` at vos-core
+  `4a143e9f` (no VOS library change was needed). Enroll pins the space,
+  agents, methods, guards and scopes in a chrome form and shows the two
+  digests in another; sign-in names the method and its `once` guard; pay
+  proves `transfer` with the payee and amount the chrome form returned,
+  the server's only a pre-fill. The path and the node's time come over
+  `vos-api` connections of their own, each under a fresh key and the
+  session's verified host key. Values cross the C ABI as CBOR.
+- **The client**: external facilities in trusted chrome (a grant prompt per
+  connection, then a form per call), offered only on anonymous
+  connections under a key drawn for the connection (`Auth::Ephemeral`),
+  with no resume and no remembered grant; `libs4_credential.so` loaded by
+  `libloading`. On Android, `KeystoreBridge` (a non-exportable HMAC key in
+  StrongBox when present, biometric or PIN at each use, the output a
+  `byte[]` zeroed after the copy) and the YubiKey's hmac-secret through
+  YubiKit's `HmacSecretExtension` (user verification, rpId `vos.device`);
+  the facility reports itself unsupported below API 30. `-Ps4Vos` builds
+  the debug APK with the credential library (arm64).
+
+**Built in VOS:**
+- **The gateway's s4 app** (`node/gateway/src/demo.rs`, the `ssh` feature):
+  three screens (enroll, sign in, pay) against the `purses` ledger and the
+  credential actor, and the `vos.gateway` host service relaying a
+  facility's `Credentialed` request only when it names the demo's agent
+  and the screen's instance and method; the app key sends `claim` and
+  `claim_row` for invited members without a key.
+- **`node/gateway/demo`** (outside the workspace, s4's crates asking a
+  newer Rust): a local founded space and its gateway (`LocalSpace`), the
+  `vos-gateway-demo` binary for the phone run (stdin commands `invite`,
+  `mint`, `balance`; the host key's seed kept under `--data`), and the
+  end-to-end test with a headless s4 client.
+- **`node/SECURITY.md`**: the demo's SSH surface.
+
+**Tests:** s4's `anonymous` e2e (an external facility reaching a client
+that grants it; no resume or remembered grant when anonymous; `s4.` or a
+repeat refused), the credential crate's 7 unit and 3 integration tests
+(enroll, sign in and pay as the chrome confirmed; the API channel's host
+key; nothing proved before enrollment), the client's facility tests; in
+VOS `enroll_sign_in_and_pay_through_the_gateways_ssh_port` (the
+document's fields say 999 to mallory, the chrome confirms 20 to shop:
+shop gets 20, mallory nothing) and
+`a_request_naming_another_method_never_reaches_the_node`, in
+`just test-gateway-ssh`.
+
+**Deviations:**
+- s4 does not build on VOS's nightly (`typed-index-collections`, Slint)
+  and VOS's crates not on s4's stable, so the facility is a `cdylib` the
+  client loads, not a crate it links.
+- The enrollment file keeps the member digest beside the handle (0600),
+  so a path can be asked for without the secret.
+- The demo crate sits outside VOS's workspace.
+
+**The review** (Opus, read-only) found three high, nine medium and eight
+low; folded:
+- H1: the path is kept per enrollment for the process, refreshed on a
+  schedule of its own (a drawn first delay, a spread, at most once in 30
+  s), each fetch and each time read on its own connection.
+- H2: the digests shown in the device's chrome; the gateway's screen no
+  longer shows them, and the e2e reads them from the chrome.
+- H3, in part: a path is used only when its root is one the root polls saw;
+  a gateway marking an address's polls is left to node-signed roots, as
+  `SECURITY.md` says.
+- M1: a `once` call with arguments refused; M2, in part: an owner guard is
+  pinned only for `transfer`; M3: names shown are ASCII
+  `[A-Za-z0-9._-]`; M4: one call at a time per session, a form answers
+  only after 600 ms on screen and never from Enter; M5: the same payment
+  within its expiry answers the same request; M6: a node time more than
+  five minutes from the device's refused; M7: external facilities only on
+  anonymous connections; M8: `refresh` rate-limited and spread; M9: an
+  enrollment refused when another origin holds the handle or space.
+- L2 (rows 28), L3's first copy (zeroizing), L4 (host key kept), L6 (a
+  form's values reset), L7 (the chrome's lifetime documented), L8
+  (`SECURITY.md`).
+
+Left: L1 (a cancelled call's form stays until answered; the proof is
+dropped), L3's PIN in the `Editable` and YubiKit's own copies, L5 (no way
+to forget an enrollment), M2's `once` label still the gateway's word at
+enrollment, H3's marked polls.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 4 jobs]: VOS `just
+check` green at `4dbc590f` (exit 0, 1,638 passed in 125 suites) and
+`just test-gateway-ssh` green (the gateway's 10, the SSH port's 3, the
+demo's 2); s4 `just ci` green at `57fbab9` (exit 0, the `vos` step among
+its gates). The first s4 run failed `deny` on two advisories new to the
+database (RUSTSEC-2026-0414 in `pulldown-cmark`, RUSTSEC-2026-0424 in
+`wasmtime`), not this step's; `57fbab9` takes their fixed releases. The
+debug APK builds with `libs4_credential.so` for arm64.
+
+**PG3 not run.** The phone was not attached, and every flow needs the
+owner's fingerprint or PIN (Keystore at each use). What the owner does is
+in this step's report.
+
+**Commits:** s4 `9b920d0` external namespaces; `e8f9c16` the server's
+facilities and anonymous connections; `bd79bb8` `s4-credential`;
+`76bf809` the client; `bc1534b` and `6f60229` the review's folds;
+`57fbab9` the advisories' updates. VOS `504f4b47` the gateway's screens;
+`fcbf6f45` the demo and its e2e; `4dbc590f` the review's folds (s4 pinned
+at `6f60229e`); this record.
