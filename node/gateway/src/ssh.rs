@@ -1,5 +1,8 @@
-//! The SSH port: s4's screens and the `vos-api` subsystem, under any key,
-//! a fresh ephemeral one expected. The subsystem is a byte stream of the
+//! The SSH port: s4's screens and the `vos-api` subsystem, under any key as
+//! no one in particular (s4's anonymous policy: an identity for the
+//! connection alone, no resumable session, no remembered grant), a fresh
+//! ephemeral key expected. The screens are the demo's ([`crate::demo`]) when
+//! the file names its agent. The subsystem is a byte stream of the
 //! node API's frames, with ids: the gateway reads each header, refuses a
 //! kind outside the relay set (`NotRelayed`) before reading its body or
 //! asking any node, checks its limit, then relays it to a node and writes
@@ -11,7 +14,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use s4_server::rui::{App, Cx, Id, View, ViewContext, view};
-use s4_server::{Credential, Identity, Server, SubsystemChannel};
+use s4_server::{Server, SubsystemChannel};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use vos_api::{Event, FrameError, Framing, Kind, Reader, Requests, error_frame, frame};
 
@@ -26,7 +29,7 @@ pub const IN_FLIGHT: usize = 16;
 /// How long a frame may take to arrive from its first byte.
 pub const DEADLINE: Duration = Duration::from_secs(60);
 
-/// The SSH port's screen until the demo's are built.
+/// The SSH port's screen when the file names no demo.
 struct Screen;
 
 impl App for Screen {
@@ -44,28 +47,33 @@ impl App for Screen {
     }
 }
 
-/// The SSH server, on `listener`, relaying through `gateway`, past each
-/// address's rate refusing its channels.
+/// The SSH server, relaying through `gateway`, past each address's rate
+/// refusing its channels; with `demo`, its screens, whose claims go as the
+/// app's key.
 pub fn server(
     host_key: russh::keys::PrivateKey,
     gateway: Arc<Gateway>,
     limits: Arc<Limits>,
+    demo: Option<(crate::demo::Demo, Arc<crate::app::AppClient>)>,
 ) -> Server {
-    Server::new("vos.gateway", || Screen)
+    let server = match demo {
+        Some((demo, app)) => {
+            let service = Arc::new(crate::demo::Service::new(demo, Arc::clone(&gateway), app));
+            Server::new(crate::demo::APPLICATION, move || {
+                crate::demo::Screens::new(demo)
+            })
+            .facility(crate::demo::FACILITY, 1)
+            .host_service_fn(crate::demo::SERVICE, move |request| {
+                Arc::clone(&service).serve(request)
+            })
+        }
+        None => Server::new(crate::demo::APPLICATION, || Screen),
+    };
+    server
         .host_key(host_key)
-        // Any key: the subsystem's clients are no one in particular, and
-        // the node checks every signature and proof.
-        .authenticator_fn(|authentication| async move {
-            match authentication.credential {
-                Credential::PublicKey(key) => {
-                    let fingerprint = key.fingerprint(Default::default());
-                    Identity::new(format!("key:{fingerprint}"))
-                        .map(Some)
-                        .map_err(|error| s4_server::AuthError::new(error.to_string()))
-                }
-                _ => Ok(None),
-            }
-        })
+        // Any key, as no one in particular: authority is what a request
+        // proves, and the node checks every signature and proof.
+        .anonymous()
         .subsystem_fn(SUBSYSTEM, move |channel| {
             let (gateway, limits) = (Arc::clone(&gateway), Arc::clone(&limits));
             async move {
@@ -91,6 +99,7 @@ pub async fn start(
     config: &crate::config::Config,
     gateway: Arc<Gateway>,
     limits: Arc<Limits>,
+    app: Option<Arc<crate::app::AppClient>>,
 ) -> Result<Option<tokio::task::JoinHandle<()>>, String> {
     let Some(address) = config.ssh else {
         return Ok(None);
@@ -104,7 +113,12 @@ pub async fn start(
     let listener = tokio::net::TcpListener::bind(address)
         .await
         .map_err(|error| format!("{address}: {error}"))?;
-    let server = server(host_key, gateway, limits);
+    let demo = match (config.demo, app) {
+        (Some(demo), Some(app)) => Some((demo, app)),
+        (Some(_), None) => return Err("the demo's screens need app_key".into()),
+        (None, _) => None,
+    };
+    let server = server(host_key, gateway, limits, demo);
     Ok(Some(tokio::spawn(async move {
         if let Err(error) = server.serve_on(listener).await {
             tracing::warn!(%error, "the SSH port ended");

@@ -59,6 +59,9 @@ pub struct Config {
     /// The s4 app's client key's seed file, made if missing: an ordinary
     /// client key, apart from the gateway's.
     pub app_key: Option<PathBuf>,
+    /// The demo's agent and its actors, whose screens the SSH port serves.
+    #[cfg(feature = "ssh")]
+    pub demo: Option<crate::demo::Demo>,
 }
 
 impl Config {

@@ -76,7 +76,8 @@ async fn port(key: [u8; 32], socket: PathBuf) -> std::net::SocketAddr {
         [41; 32],
     )]));
     let host_key = ssh_key::PrivateKey::from(ssh_key::private::Ed25519Keypair::from_seed(&[3; 32]));
-    let server = vos_gateway::ssh::server(host_key, gateway, Limits::new(PerAddress::default()));
+    let server =
+        vos_gateway::ssh::server(host_key, gateway, Limits::new(PerAddress::default()), None);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     tokio::spawn(async move {

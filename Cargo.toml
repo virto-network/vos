@@ -93,6 +93,9 @@ exclude = [
     "pvm/proof/final-verifier/wasm",
     # Throwaway measurement code from the design runs.
     "spikes",
+    # The s4 demo and its end-to-end test: s4's crates, built with
+    # `--ignore-rust-version` (`just test-gateway-ssh`).
+    "node/gateway/demo",
 ]
 
 # fjall's lsm-tree: 3.1.10 with three fixes, each on a branch of the fork:

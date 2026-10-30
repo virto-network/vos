@@ -3748,7 +3748,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s4-protocol"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=cee80d95ef6644081c1155c50a3042a95b37b367#cee80d95ef6644081c1155c50a3042a95b37b367"
+source = "git+https://codeberg.org/Virto/s4?rev=6f60229e97fb1f54b51f53c2406c168e1004a19b#6f60229e97fb1f54b51f53c2406c168e1004a19b"
 dependencies = [
  "base64",
  "ciborium",
@@ -3760,7 +3760,7 @@ dependencies = [
 [[package]]
 name = "s4-rui"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=cee80d95ef6644081c1155c50a3042a95b37b367#cee80d95ef6644081c1155c50a3042a95b37b367"
+source = "git+https://codeberg.org/Virto/s4?rev=6f60229e97fb1f54b51f53c2406c168e1004a19b#6f60229e97fb1f54b51f53c2406c168e1004a19b"
 dependencies = [
  "base64",
  "libc",
@@ -3778,7 +3778,7 @@ dependencies = [
 [[package]]
 name = "s4-server"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=cee80d95ef6644081c1155c50a3042a95b37b367#cee80d95ef6644081c1155c50a3042a95b37b367"
+source = "git+https://codeberg.org/Virto/s4?rev=6f60229e97fb1f54b51f53c2406c168e1004a19b#6f60229e97fb1f54b51f53c2406c168e1004a19b"
 dependencies = [
  "rand 0.10.3",
  "russh",
@@ -3791,7 +3791,7 @@ dependencies = [
 [[package]]
 name = "s4-widgets"
 version = "0.1.0"
-source = "git+https://codeberg.org/Virto/s4?rev=cee80d95ef6644081c1155c50a3042a95b37b367#cee80d95ef6644081c1155c50a3042a95b37b367"
+source = "git+https://codeberg.org/Virto/s4?rev=6f60229e97fb1f54b51f53c2406c168e1004a19b#6f60229e97fb1f54b51f53c2406c168e1004a19b"
 dependencies = [
  "s4-protocol",
  "serde",
@@ -5026,6 +5026,7 @@ dependencies = [
  "vos-http",
  "vos-net",
  "vos-node",
+ "vos-pvm-precompiles",
  "vos-wire",
 ]
 

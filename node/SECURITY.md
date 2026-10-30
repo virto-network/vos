@@ -142,6 +142,64 @@ serve its requests:
   nullifiers stay apart, since the scope names the space. The app shows and
   pins a space's handle at a member's first enrollment.
 
+## The demo's SSH surface
+
+The gateway's SSH port serves s4's screens and the `vos-api` subsystem to
+a member's phone (`slice-7-mobile.md` 7.13):
+
+- **No one in particular.** The port takes any public key as an identity
+  for its connection alone (s4's anonymous policy): no session is parked
+  or resumed, and no remembered grant is selected. The client draws a key
+  for each connection, and another for each `vos-api` connection that
+  fetches its path, the root or the node's time, so no two of them share a
+  key. Keys are all that stops linking them: the gateway still sees their
+  address and timing, and a proof from the address that fetched a digest's
+  path links its nullifier to that digest, as above. The client fetches
+  its path on a schedule of its own (a drawn first delay, a spread on each
+  refresh, at most one refresh in thirty seconds), not on the way to a
+  proof, which loosens the timing link without removing it.
+- **The root a proof names.** A path is used only if its root is one of the
+  last roots the client's own root polls saw, so a gateway cannot hand one
+  member a path to a root of its own making and know the member by it
+  unless it also answers that member's root polls with that root. The polls
+  name no member, but they come from the member's address: a gateway that
+  marks an address's polls with a root of its own still learns which
+  member proves on it. Roots the node signs, under a key pinned at
+  enrollment, would close this; until then, the gateway is trusted not to
+  mark roots.
+- **What the server can steer.** The screens are the gateway's document;
+  the proofs are the client's facility's (`vos.credential`), which shows
+  its own forms in the client's chrome and acts on what the user confirms
+  there. A payment's payee and amount are the chrome form's, the server's
+  request only a pre-fill; a sign-in's chrome names the method and, for a
+  `once` guard, that it spends the member's one admission in its scope; the
+  space, agents and methods the device proves for are shown and pinned at
+  its first enrollment, and a later request naming others is refused by
+  the client. What enrollment pins is the gateway's word, shown to the user
+  once, as a host key is: a hostile gateway at enrollment can mislabel a
+  method's guard, and the node's guard still decides what a proof admits.
+- **What the gateway relays.** It forwards a facility's `Credentialed`
+  request as it is, after checking it names the demo's agent and the
+  screen's instance and method; any other is refused before a node sees
+  it. It holds no credential bytes, builds none, and its app key sends only
+  the claims (`claim(member)`, `claim_row`) the operator's invitations name.
+  The binding names the space, so a proof made for another space fails the
+  node's `Binding` check whoever relays it.
+- **The enrollment's digests** are shown in the client's chrome, never in
+  the gateway's screen, which only asks the member to read them from there
+  to the operator; the operator invites them out of band. A gateway's
+  screen therefore cannot have its own digests invited in the member's
+  place, and the claim it relays names only digests an invitation holds.
+- **Time.** The calls' expiries are reckoned on the node's time, which the
+  gateway answers; the client refuses a time more than five minutes from
+  its own clock, so a gateway can stretch a call's life by at most that.
+- **A proof the gateway holds back.** The gateway may withhold a proof it
+  relays and submit it later, until the call's expiry; it cannot alter it
+  (the binding covers the call) or make another from it. Asking again for
+  the same payment within its expiry yields the same request, so a retry
+  after a withheld one cannot pay twice; a `once` guard's nullifier admits
+  it at most once whenever it lands.
+
 ## Replay and custody
 
 - **A replay answered by a replica that forwarded it** (`Replayed`, the
