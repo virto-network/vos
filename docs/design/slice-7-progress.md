@@ -3843,3 +3843,82 @@ credential stress beside it]:
 - **`kernel constants::`:** green; no pinned program id moved.
 - **`blobs.lock` reproduced:** `just check-blobs` in a clone at another
   path, built from clean: 30 of 30.
+
+## The honest credential proof refused
+
+Branch `s7/completeness`, from vos-core `7b78d9af`. 7.11's left item: one
+honest format-42 proof in about 30,000 refused by the verifier.
+
+**The cause** [measured]: the Stwo fork's SIMD `reduce_to_m31_simd`, which
+reduces each word of a Blake2s-M31 leaf's or node's digest below p,
+computed `M31::reduce`'s formula in 32-bit lanes, where
+`v + (v >> 31) + 1` wraps for `v ≥ 2^32 − 2`: the prover's tree held
+p − 1 and p where the verifier, reducing in 64 bits, recomputes 0 and 1.
+A node with such a word on a queried path, about one word in 2^31, made
+the recomputed root differ (`RootMismatch`). The kept proof's refusal is
+this: its FRI layer 7 decommits a leaf of 4 M31s
+(`0x52080a2a 0x5368d2ec 0x1b80dd5a 0x2826d36f`) whose digest's word 4 is
+`0xffffffff`, and a verifier made to reduce as the SIMD prover did accepts
+it. Not a race, not the masks' randomness, not FRI's folding: the seeded
+build refuses the same seed every time.
+
+**The fix:** the fork's `vos/simd-m31-reduce` (`9e9b4ff6`, on
+`vos/grind-chunks`' `4cd1f83f`; not pushed) folds `v = hi·2^31 + lo` to
+`lo + hi ≤ p + 1` and subtracts p once, canonical over the whole `u32`
+range, with tests of the edges, windows of 2^16 values against
+`M31::reduce`, and a leaf and a node whose raw digests reach `2^32 − 1`
+and `2^32 − 2` built alike on the SIMD and CPU backends. The workspace,
+the kit's, the Wasm blob's and runner's locks and the fuzz crate pin it.
+VOS's own tests: `pcs::tests` (a SIMD-committed tree holding the leaf
+verified by the CPU Merkle verifier; a SIMD node at the `2^32 − 2` word),
+both refused on `4cd1f83f`; `credential/prove::a_digest_word_at_the_top_of_the_u32_range_verifies`
+(seed 4033's auth proof, `RootMismatch` on `4cd1f83f`); and the
+`credential_stress` example, which proves and verifies seeded statements
+in volume and prints each failing seed.
+
+**Before and after** [measured; `credential_stress`, 6 threads, `nice`,
+other agents' runs on the machine]:
+
+| pin | format | proofs (owner + auth) | refused |
+|---|---|---|---|
+| `4cd1f83f` | 42 | 60,000 (seeds 0–29,999) | 2 (auth 4033: trace tree; auth 25464: FRI layer 7) |
+| `9e9b4ff6` | 42 | 180,000 (seeds 0–89,999, 4033 and 25464 among them) | 0 |
+| `9e9b4ff6` | 44 | 20,000 (seeds 0–9,999) | 0 |
+
+At the rate before the fix, 180,000 proofs would have held about six
+refusals; none at 3× the volume that found two bounds the rate after it
+below about one in 60,000 at 95% (`3 / 180,000`); the reduction, now
+exact, leaves none.
+
+**Other formats:** only the Blake2s-M31 stack reduces a digest: formats
+42 and 44 and the device format 37 (registered, refused until its AIR and
+channel exist; the device library's prover would have hit it on any
+target, SIMD lanes being portable). Blake2s without the reduction (the
+small test formats), Poseidon2-M31 (32, 35) and Blake2b-256 (28, 39) never
+call it; the PoW grind reduces with `PackedM31::reduce_simd`, correct over
+`u32`. The pinned credential roots and program ids are unchanged
+(`prove::the_pinned_programs_are_the_circuits`).
+
+**Left:** pushing `vos/simd-m31-reduce` before this pin reaches a shared
+branch; Kreivo re-vendors the kit's lock after. The device spike
+(`spikes/s7-device/harness`, at `c3ec9813`, its lock already behind the
+workspace) needs the pin before a phone run of format 37. A committed
+column lane equal to p (which `PackedM31` can hold: `-0`) would mismatch
+the same way at a leaf; VOS's salts and FFTs never produce one, so it is
+latent, noted for the fork.
+
+**Review:** one Opus review: the reduction correct for every input and on
+every `min` branch; no other prover/verifier reduction mismatch in the fork
+or VOS. Folded: the fork's tests assert the raw digest words, a windowed
+sweep; `pcs`'s comments timeless and raw words asserted; the harness's
+refusals counted apart from failures to prove, 44's roots computed once,
+its usage.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, other agents'
+runs on the machine]: the fork's `stwo` lib tests (306, `prover,parallel`)
+and clippy; `just check` green at `87232c17` (exit 0, 1,630 passed in 122
+suites); `just test-proof` green at `87232c17` (exit 0, 581 passed in 50
+suites, `pcs::tests` among them); `just check` again with this record.
+
+**Commits:** the fork's `9e9b4ff6` (`vos/simd-m31-reduce`); `87232c17` the
+pin, the tests and the harness; this record.

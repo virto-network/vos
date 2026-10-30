@@ -27,6 +27,7 @@ use vos_pvm_recair_air::masked::{
     BlindRelation, CredentialComponents, MaskedComponent, MaskedComponents, air_log_size,
     committed_log_sizes, composition_log_degree_bound, sample_points,
 };
+use vos_wire::credentials::leaf;
 
 use crate::common::Rng;
 use crate::support::{self, auth, joint, owner_statement};
@@ -139,6 +140,30 @@ fn each_kind_proves_and_verifies() {
             Err(vos_pvm_final_verifier::Error::Length)
         ));
     }
+}
+
+/// A lone member's auth statement and masks of seed 4033 (the
+/// `credential_stress` example's), whose proof decommits a tree node with a
+/// Blake2s digest word at the top of the `u32` range: the prover's tree is
+/// the verifier's only if it reduces that word as the verifier does. The
+/// whole proof's check; `vos-pvm-proof`'s `pcs` tests hold the reduction
+/// itself, which a change of the circuit or the masks leaves in place.
+#[test]
+fn a_digest_word_at_the_top_of_the_u32_range_verifies() {
+    const SEED: u64 = 4033;
+    let mut rng = Rng::new(SEED);
+    let secret = support::digest(&mut rng);
+    let slot = rng.next_u64() as u32;
+    let enrolled = support::Enrolled {
+        secret,
+        tree: support::Tree::new(&[(slot, leaf(&support::member(&secret)))]),
+    };
+    let scope = support::digest(&mut rng);
+    let statement = support::auth_in(&enrolled, slot, scope, support::digest(&mut rng));
+    let (proof, _) = credential::prove(&statement, MaskRng::Seeded(SEED)).expect("it proves");
+    let bytes = verifier::encode(&proof).unwrap();
+    verifier::verify_bytes(CredentialKind::Auth, &statement.words(), &bytes)
+        .expect("the verifier recomputes the prover's roots");
 }
 
 /// Members at two slots of one tree, one statement each: the same shape,
