@@ -160,10 +160,13 @@ a member's phone (`slice-7-mobile.md` 7.13):
   proof, which loosens the timing link without removing it.
 - **The root a proof names.** A path is used only if its root is one of the
   last roots the client's own root polls saw, so a gateway cannot hand one
-  member a path to a root of its own making and know the member by it. A
-  gateway that answers every poll of one member with roots no one else sees
-  can still mark that member; the node accepts only roots its tree held, so
-  such a proof fails rather than passing unnoticed.
+  member a path to a root of its own making and know the member by it
+  unless it also answers that member's root polls with that root. The polls
+  name no member, but they come from the member's address: a gateway that
+  marks an address's polls with a root of its own still learns which
+  member proves on it. Roots the node signs, under a key pinned at
+  enrollment, would close this; until then, the gateway is trusted not to
+  mark roots.
 - **What the server can steer.** The screens are the gateway's document;
   the proofs are the client's facility's (`vos.credential`), which shows
   its own forms in the client's chrome and acts on what the user confirms
