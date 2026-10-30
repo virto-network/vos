@@ -35,7 +35,8 @@
 //!   `0x1234_5678` of a tree whose siblings at levels 0, 5 and 17 are
 //!   occupied); each `<name>.kernel` (the derived blob, which the patched
 //!   derivation admits with the call) and `<name>.input`, each traced once
-//!   on the device tracer to its halt.
+//!   on the device tracer to its halt. With `S7_PROFILE=<dir>`, each
+//!   kernel's steps and the bytes its loads and stores touch, by function.
 //! - `grind [--bits B] [--n N] [--threads N]`: N grinds of the Blake2s-M31
 //!   channel's PoW, each from its own transcript: mean, median, 95th
 //!   percentile.
@@ -265,9 +266,10 @@ fn kernel_of(elf: &[u8], name: &[u8]) -> Vec<u8> {
         .expect("the kernel")
 }
 
-/// `auth_p2`'s witness input: the method's arguments in order, its public
-/// ones auth's `CredentialPublic` (the kind byte, then `map_root`, `scope`,
-/// `nullifier` and `binding`).
+/// `auth_p2`'s witness input: the method's arguments in order, the
+/// siblings, the secret and the slot, then its public ones, auth's
+/// `CredentialPublic` (the kind byte, then `map_root`, `scope`, `nullifier`
+/// and `binding`).
 fn p2_input() -> Vec<u8> {
     use vos_wire::credentials::{DEPTH, EMPTY, Tag, compress, digest, leaf, root_of};
     let secret: [u32; 8] = core::array::from_fn(|i| 0x0123_4567 + 7_919 * i as u32);
@@ -281,13 +283,15 @@ fn p2_input() -> Vec<u8> {
     let scope: [u32; 8] = core::array::from_fn(|i| 0x5c5c_0000 + i as u32);
     let nullifier = compress(&compress(&Tag::Nf.block(), &secret), &scope);
     let binding: [u32; 8] = core::array::from_fn(|i| 0x0b1b_0000 + i as u32);
-    let mut input = vec![0u8];
-    for words in [root, scope, nullifier, binding, secret] {
-        input.extend_from_slice(&digest(&words));
-    }
-    input.extend_from_slice(&slot.to_le_bytes());
+    let mut input = Vec::new();
     for sibling in &siblings {
         input.extend_from_slice(&digest(sibling));
+    }
+    input.extend_from_slice(&digest(&secret));
+    input.extend_from_slice(&slot.to_le_bytes());
+    input.push(0);
+    for words in [root, scope, nullifier, binding] {
+        input.extend_from_slice(&digest(&words));
     }
     input
 }
@@ -315,6 +319,44 @@ fn kernels(elf: &Path, data: &Path, out: &Path) {
         );
         std::fs::write(out.join(format!("{name}.kernel")), &kernel).unwrap();
         std::fs::write(out.join(format!("{name}.input")), &input).unwrap();
+        if let Some(dir) = std::env::var_os("S7_PROFILE") {
+            profile(&trace.side_note, Path::new(&dir), method);
+        }
+    }
+}
+
+/// With `S7_PROFILE` set to a directory (the patched derivation writing
+/// each kernel's functions there), a kernel's steps and the bytes its
+/// loads and stores touch, by function, the most first.
+fn profile(side_note: &vos_pvm_proof::SideNote, dir: &Path, method: &[u8]) {
+    let hash = vos_pvm_precompiles::blake2b_hash::<32>(b"vos/method/", &[method]);
+    let id = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    let text = std::fs::read_to_string(dir.join(format!("{id:08x}.functions"))).unwrap();
+    let functions: Vec<(u32, &str)> = text
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .map(|(at, name)| (at.parse().unwrap(), name))
+        .collect();
+    let mut by: std::collections::BTreeMap<&str, (usize, usize)> = Default::default();
+    let mut bytes = 0;
+    for step in &side_note.steps {
+        let at = functions.partition_point(|(start, _)| *start <= step.pc);
+        let name = if at == 0 { "(prologue)" } else { functions[at - 1].1 };
+        let touched: usize = [&step.mem_read, &step.mem_write]
+            .into_iter()
+            .flatten()
+            .map(|access| access.size as usize)
+            .sum();
+        bytes += touched;
+        let entry = by.entry(name).or_default();
+        entry.0 += 1;
+        entry.1 += touched;
+    }
+    let mut rows: Vec<_> = by.into_iter().collect();
+    rows.sort_by_key(|(_, (steps, _))| std::cmp::Reverse(*steps));
+    println!("  {} steps, {bytes} bytes by loads and stores", side_note.steps.len());
+    for (name, (steps, touched)) in rows.iter().take(30) {
+        println!("  {steps:>7} {touched:>7}  {name}");
     }
 }
 
