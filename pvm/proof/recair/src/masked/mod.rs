@@ -388,7 +388,8 @@ where
 
 /// What every proof of one program shares, computed once: the twiddles
 /// at its lifting height and its preprocessed tree, committed as a masked
-/// format commits it ([`extend_preprocessed`]), its coefficients kept.
+/// format commits it (each column interpolated and extended one level), its
+/// coefficients kept.
 pub struct Committed<MC: MerkleChannel>
 where
     SimdBackend: BackendForChannel<MC>,

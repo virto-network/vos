@@ -2267,18 +2267,54 @@ PoW 16 puts the BLAKE2b statement's proof 1% past 1.5 MiB where PoW 20
 keeps it under. Format 43 stays reserved; 7.17's lever 4 counts again on
 the lighter shape.
 
-**Session P4: not run.** The Fairphone 6 was not on USB when this step
-reached it (2026-10-30 17:40–19:00: `adb devices` empty, the phone not in
-`lsusb`, an adb server restart changed nothing). Ready to run:
-`just phone` built `vos-phone-timing` (SHA-256 `ddeefcf6…750d`) with the
-device cells; `spikes/s7-device/scripts/p4.sh target/phone/vos-phone-timing
-spikes/s7-device/kernels <out>` runs the session (three rounds of p2 at
-every candidate at automatic threads, one on the four big cores, one of
-b2, one Blake2b-256 cell; battery at least 50% and below 35.0 °C before
-each round, waiting up to an hour; it removes `/data/local/tmp/vos-p4`).
-The pin is therefore x86's; the phone may move it only between blowup 4
-at PoW 16 and at PoW 20 (the same bytes and memory), which the grind's
-tail already decided at 7.12.
+**Session P4** (run during 7.17, 2026-10-30 23:42 to 2026-10-31 00:33,
+on the merged base's `vos-phone-timing`, SHA-256 `2ab80736…fdad`, built by
+`just phone` at 7.16's tip; `runs/phone-p4.txt`) [measured, the Fairphone
+6, the kernels 7.16 pinned; battery 84–90%, 31–35 °C before each round; 5
+reps after a warm-up, p50 / p95; the first try was stopped after round 2
+at the owner's request (PG3 on the phone; its blowup-8 cell's memory
+pressure ended the foreground app), and resumed for the rest]:
+
+| cell | threads | rounds' p50 | p95 (worst) | peak | bytes |
+|---|---|---|---|---|---|
+| p2, 2:86:20 | auto (8) | 4.97 / 5.08 / 5.00 s | 5.30 s | 2,465–2,495 MiB | 3,235,394–3,253,005 |
+| p2, 2:87:20 | auto | 5.09 / 5.00 / 4.95 s | 5.21 s | 2,451–2,505 MiB | 3,269,498–3,274,495 |
+| p2, 4:43:20 | auto | 5.76 / 5.98 / 5.81 s | 6.17 s | 3,583–3,614 MiB | 1,740,764–1,746,207 |
+| **p2, 4:47:16** | auto | **5.79 / 5.98 / 5.90 s** | 6.38 s | 3,565–3,604 MiB | 1,882,386–1,892,274 |
+| p2, 8:29:20 | auto | 15.6 / 18.6 / 14.6 s | 22.9 s | 4,838–5,555 MiB | 1,253,997–1,256,734 |
+| p2, 2:86:20 | 4 big (`f0`) | 6.05 s | 6.29 s | 2,450 MiB | 3,231,153 |
+| p2, 2:87:20 | 4 big | 5.99 s | 6.15 s | 2,410 MiB | 3,267,061 |
+| p2, 4:43:20 | 4 big | 6.95 s | 7.39 s | 3,614 MiB | 1,741,933 |
+| p2, 4:47:16 | 4 big | 7.29 s | 7.39 s | 3,540 MiB | 1,888,930 |
+| p2, 8:29:20 | 4 big | 12.5 s | 14.3 s | 5,547 MiB | 1,247,024 |
+| b2, 2:86:20 | auto | 4.76 s | 4.82 s | 2,303 MiB | 2,708,838 |
+| b2, 4:43:20 | auto | 5.97 s | 6.11 s | 3,772 MiB | 1,460,107 |
+| b2, 4:47:16 | auto | 6.11 s | 6.42 s | 3,766 MiB | 1,585,611 |
+| b2, 8:29:20 | auto | 27.7 s | 36.9 s | 5,737 MiB | 1,058,040 |
+
+Verification on the phone 33–210 ms in the prover's pool (not one core's
+budget); R1 one attempt in every cell. The Blake2b-256 cell was not run: at
+46–49 s a proof on x86 it would take minutes a proof on the phone, and the
+channel is out of the running already.
+- **The pin stands, flagged:** at blowup 4, PoW 16 and PoW 20 tie on the
+  phone (p50 5.79–5.98 against 5.76–5.98 s, the 95th percentiles within
+  4%), so the grind's choice holds. But the phone favours **blowup 2** more
+  than x86 did: about 15% faster (4.95–5.09 against 5.79–5.98 s) and 30%
+  less memory (2.4–2.5 against 3.5–3.6 GiB), its proofs 3.2–3.3 MB, about
+  2.2 times the 1.5 MiB budget. Format 43 stays at blowup 4 on the byte
+  budget; 7.17's lever 4 counts again on the lighter shape, where blowup
+  2's proofs shrink with the columns.
+- **Blowup 8 is out on the phone:** 12.5–18.6 s, 4.8–5.7 GiB, and its
+  memory pressure is what ended the foreground app during PG3.
+- **The even split over all eight cores beat the four big cores** on this
+  statement by 1.17–1.26× (blowup 2 and 4), the reverse of 7.12's credential
+  proofs (the big cores 1.2× faster there): the heavier proof keeps the
+  A520s busy. Only at blowup 8, memory-bound, were the big cores faster
+  (12.5 against 15.6 s). 7.17's `Threads::Auto` measures the classes'
+  rates rather than assuming either.
+- **The ARM factor:** the pin's 5.9 s against x86's 1.97 s on four P-cores
+  measured quiet at 7.17 (2.64 s under 7.16's load) is about 3.0× (2.2×
+  against the loaded figure).
 
 **Where PG2's 1 s stands:** the pin proves the auth statement in 2.64 s
 on four x86 P-cores (1.93 s on 8) under load 3–5; at 7.12's ratio (the
