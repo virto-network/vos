@@ -51,14 +51,19 @@ pub fn member_of(
 
 /// `N` bytes of a kernel's arguments where its witness input left them,
 /// in the argument pages, which hold them for the whole run: decoded
-/// without a copy. Its encoding is the bytes'.
+/// without a copy, valid only while the bytes it was decoded from live (a
+/// kernel's arguments, for its run). Its encoding is the bytes'.
 #[derive(Clone, Copy)]
 pub struct InPlace<const N: usize>(*const u8);
 
 impl<const N: usize> InPlace<N> {
-    pub fn bytes(&self) -> &[u8; N] {
-        // SAFETY: decoded from at least `N` bytes of the arguments, which
-        // live as long as the kernel's run.
+    /// The bytes.
+    ///
+    /// # Safety
+    ///
+    /// The bytes it was decoded from must still live.
+    pub unsafe fn bytes(&self) -> &[u8; N] {
+        // SAFETY: decoded from at least `N` bytes, live by the contract.
         unsafe { &*self.0.cast::<[u8; N]>() }
     }
 
@@ -78,7 +83,9 @@ impl<const N: usize> Decode for InPlace<N> {
 
 impl<const N: usize> Encode for InPlace<N> {
     fn encode_to(&self, buf: &mut Vec<u8>) {
-        buf.extend_from_slice(self.bytes());
+        // SAFETY: a kernel encodes its public arguments during its run,
+        // while the argument pages hold them.
+        buf.extend_from_slice(unsafe { self.bytes() });
     }
 }
 
@@ -165,20 +172,24 @@ pub unsafe fn auth_p2_lean(
     use vos_wire::credentials::Tag;
     let mut head = [0u64; 8];
     let mut lane = [0u64; 12];
+    let mut nullifier = [0u64; 4];
+    // One pointer each, every access through it: the call reads and
+    // writes the same buffer.
+    let (head, lane) = (head.as_mut_ptr(), lane.as_mut_ptr());
     unsafe {
         let s = aligned(secret);
-        head[..4].copy_from_slice(&tag(Tag::Nf));
-        head[4..].copy_from_slice(&s);
-        p2(head.as_ptr(), head.as_mut_ptr());
-        head[4..].copy_from_slice(&unaligned(scope));
-        let mut nullifier = [0u64; 4];
-        p2(head.as_ptr(), nullifier.as_mut_ptr());
-        head[..4].copy_from_slice(&tag(Tag::Member));
-        head[4..].copy_from_slice(&s);
-        p2(head.as_ptr(), head.as_mut_ptr().add(4));
-        head[..4].copy_from_slice(&tag(Tag::Leaf));
-        p2(head.as_ptr(), lane.as_mut_ptr().add(4));
-        let lane = lane.as_mut_ptr();
+        let put =
+            |at: *mut u64, words: &[u64; 4]| core::ptr::copy_nonoverlapping(words.as_ptr(), at, 4);
+        put(head, &tag(Tag::Nf));
+        put(head.add(4), &s);
+        p2(head, head);
+        put(head.add(4), &unaligned(scope));
+        p2(head, nullifier.as_mut_ptr());
+        put(head, &tag(Tag::Member));
+        put(head.add(4), &s);
+        p2(head, head.add(4));
+        put(head, &tag(Tag::Leaf));
+        p2(head, lane.add(4));
         for level in 0..32 {
             let sibling = aligned(siblings.add(32 * level));
             core::ptr::copy_nonoverlapping(sibling.as_ptr(), lane, 4);
@@ -256,8 +267,12 @@ impl Statements {
         #[public] binding: InPlace<32>,
     ) {
         let _ = binding;
+        assert!(
+            (siblings.ptr() as usize | secret.ptr() as usize) & 7 == 0,
+            "8-aligned arguments"
+        );
         // SAFETY: each `InPlace` points at its bytes in the argument pages,
-        // page-aligned for the siblings and 8-aligned for the secret.
+        // the siblings and the secret 8-aligned.
         let matched = unsafe {
             let (root, derived) = auth_p2_lean(secret.ptr(), slot, siblings.ptr(), scope.ptr());
             u64::from(kind == 0) & same(&root, map_root.ptr()) & same(&derived, nullifier.ptr())

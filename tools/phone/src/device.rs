@@ -145,7 +145,7 @@ fn measure<MC: MerkleChannel>(
     let (active, log_sizes) = device_shape(&format, &kernel, &mut reference).expect("a shape");
     let prover = DeviceProver::<MC>::install(&format, &kernel, active, &log_sizes)
         .unwrap_or_else(|error| panic!("{name} at {log_sizes:?}: {error:?}"));
-    let program = &prover.program;
+    let program = prover.program();
     let install_ms = ms(started.elapsed());
     let (mut traces, mut proves, mut verifies) = (Vec::new(), Vec::new(), Vec::new());
     let (mut hashes, mut bytes, mut stats) = (Vec::new(), Vec::new(), None);

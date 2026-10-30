@@ -140,8 +140,8 @@ pub struct DeviceProver<MC: MerkleChannel>
 where
     SimdBackend: BackendForChannel<MC>,
 {
-    pub format: Format,
-    pub program: DeviceProgram<MC::H>,
+    format: Format,
+    program: DeviceProgram<MC::H>,
     committed: Committed<MC>,
 }
 
@@ -191,6 +191,16 @@ where
             },
             committed,
         })
+    }
+
+    /// Its format.
+    pub fn format(&self) -> &Format {
+        &self.format
+    }
+
+    /// Its program, as its verifier pins it.
+    pub fn program(&self) -> &DeviceProgram<MC::H> {
+        &self.program
     }
 
     /// [`prove_device`] of its program under its format, the preprocessed

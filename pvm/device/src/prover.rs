@@ -27,13 +27,6 @@ use vos_pvm_recair::masked::MaskRng;
 /// allowing less is refused.
 pub const PEAK_BYTES: u64 = 192 << 20;
 
-/// The share of the fastest class's measured rate a core class needs to
-/// take work under [`Threads::Auto`]: on x86's performance and efficient
-/// cores the even split over both beat the performance cores alone, and on
-/// the Fairphone 6 the even split over its A720s and A520s was about a
-/// fifth slower than the A720s alone [measured, slice 7's 7.12 and 7.17].
-pub const CLASS_RATE_FLOOR: f64 = 0.5;
-
 /// A pool thread's stack, in bytes: the prover's nested joins overflowed
 /// rayon's default 2 MiB on a device kernel's proof at blowup 8 on 8
 /// threads, about once in 18 proofs, and never in 24 at this size.
@@ -46,14 +39,18 @@ const JOINT_KIND: u8 = 0xff;
 /// How a [`Prover`]'s pool spreads its work.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Threads {
-    /// By core class: the cores this process may run on, grouped by the
+    /// By core class: the cores this thread may run on, grouped by the
     /// rate the system states for each (its capacity, else its highest
-    /// clock), each class's rate measured on one of its cores. Every class
-    /// whose measured rate is at least [`CLASS_RATE_FLOOR`] of the
-    /// fastest's takes work: all of them, one unpinned thread a core, when
-    /// none falls below it; else one thread pinned to each core of the
-    /// classes that clear it, so a slow class never holds the even split
-    /// back. One thread a core where the system states no classes.
+    /// clock), each class's rate measured on one of its cores. An even
+    /// split over cores runs at its slowest core's rate times their number,
+    /// so the work goes to the fastest classes whose count times the
+    /// slowest kept rate is greatest: every class, one unpinned thread a
+    /// core, when that is all of them; else one thread pinned to each core
+    /// of the classes kept. One thread a core where the system states no
+    /// classes. On x86's four performance and four efficient cores the even
+    /// split over both is about 1.3 times the performance cores alone; on
+    /// the Fairphone 6 the A720s alone were about 1.2 times the split over
+    /// them and the A520s [measured, slice 7's 7.17 and 7.12].
     Auto,
     /// This many threads, unpinned.
     Count(usize),
@@ -554,7 +551,7 @@ fn pin(core: usize) {
 
 /// `Threads::Auto`'s core classes and their measured rates.
 pub(crate) mod classes {
-    use super::{CLASS_RATE_FLOOR, pin};
+    use super::pin;
 
     /// The cores `Auto` pins one thread to each of, or `None` for one
     /// unpinned thread a core: every class taking work, or no classes.
@@ -581,26 +578,22 @@ pub(crate) mod classes {
         kept(&classes, &rates)
     }
 
-    /// The cores of the classes whose rate is at least
-    /// [`CLASS_RATE_FLOOR`] of the fastest's, in class order; `None` when
-    /// every class is kept.
+    /// The cores of the fastest classes whose even split is quickest,
+    /// their count times the slowest kept rate the greatest (`classes` the
+    /// fastest first), in class order; `None` when that is every class, or
+    /// no rate was measured.
     pub(crate) fn kept(classes: &[Vec<usize>], rates: &[f64]) -> Option<Vec<usize>> {
-        let fastest = rates.iter().copied().fold(0.0, f64::max);
-        let keep: Vec<bool> = rates
-            .iter()
-            .map(|&rate| rate >= CLASS_RATE_FLOOR * fastest)
-            .collect();
-        if keep.iter().all(|&kept| kept) {
-            return None;
+        let mut best = (0.0, 0);
+        let (mut cores, mut slowest) = (0, f64::INFINITY);
+        for (k, (class, &rate)) in classes.iter().zip(rates).enumerate() {
+            cores += class.len();
+            slowest = slowest.min(rate);
+            let split = cores as f64 * slowest;
+            if split > best.0 {
+                best = (split, k + 1);
+            }
         }
-        Some(
-            classes
-                .iter()
-                .zip(&keep)
-                .filter(|(_, kept)| **kept)
-                .flat_map(|(class, _)| class.iter().copied())
-                .collect(),
-        )
+        (0 < best.1 && best.1 < classes.len()).then(|| classes[..best.1].concat())
     }
 
     /// `cores` grouped by `stated`'s rate (a core's capacity where the
@@ -661,29 +654,36 @@ pub(crate) mod classes {
     /// core.
     const WORK: usize = 1 << 20;
 
+    /// How long a core is kept busy before its rate is measured, so its
+    /// clock has risen.
+    const WARM_UP: std::time::Duration = std::time::Duration::from_millis(40);
+
     /// `core`'s rate, in hashed bytes a second: BLAKE2s over [`WORK`]
-    /// bytes on a thread pinned to it, the best of three after a warm-up
-    /// that brings its clock up.
+    /// bytes on a thread pinned to it, the best of three after [`WARM_UP`]
+    /// of the same work; 0 when no thread can be made.
     fn rate(core: usize) -> f64 {
         use blake2::Digest;
-        std::thread::spawn(move || {
-            pin(core);
-            let block = [0x5au8; 4096];
-            let run = || {
-                let started = std::time::Instant::now();
-                let mut hasher = blake2::Blake2s256::new();
-                for _ in 0..WORK / block.len() {
-                    hasher.update(block);
+        std::thread::Builder::new()
+            .spawn(move || {
+                pin(core);
+                let block = [0x5au8; 4096];
+                let run = || {
+                    let started = std::time::Instant::now();
+                    let mut hasher = blake2::Blake2s256::new();
+                    for _ in 0..WORK / block.len() {
+                        hasher.update(block);
+                    }
+                    std::hint::black_box(hasher.finalize());
+                    started.elapsed().as_secs_f64()
+                };
+                let warming = std::time::Instant::now();
+                while warming.elapsed() < WARM_UP {
+                    run();
                 }
-                std::hint::black_box(hasher.finalize());
-                started.elapsed().as_secs_f64()
-            };
-            run();
-            let best = (0..3).map(|_| run()).fold(f64::INFINITY, f64::min);
-            WORK as f64 / best.max(f64::MIN_POSITIVE)
-        })
-        .join()
-        .unwrap_or(0.0)
+                let best = (0..3).map(|_| run()).fold(f64::INFINITY, f64::min);
+                WORK as f64 / best.max(f64::MIN_POSITIVE)
+            })
+            .map_or(0.0, |thread| thread.join().unwrap_or(0.0))
     }
 
     #[cfg(test)]
@@ -720,14 +720,19 @@ pub(crate) mod classes {
             assert_eq!(classes(&[4, 9], &stated), None);
         }
 
-        /// A class under half the fastest's rate takes no work, and the
-        /// rest are pinned; every class kept is the even split.
+        /// The fastest classes whose even split is quickest take the
+        /// work: a slow class takes none, and every class kept is the even
+        /// split.
         #[test]
         fn a_slow_class_takes_no_work() {
             let classes = vec![vec![4, 5], vec![0, 1], vec![9]];
             assert_eq!(kept(&classes, &[1.0, 0.7, 0.6]), None);
-            assert_eq!(kept(&classes, &[1.0, 0.4, 0.6]), Some(vec![4, 5, 9]));
             assert_eq!(kept(&classes, &[1.0, 0.4, 0.3]), Some(vec![4, 5]));
+            assert_eq!(kept(&classes, &[1.0, 0.6, 0.3]), Some(vec![4, 5, 0, 1]));
+            let phone = vec![vec![7, 4, 5, 6], vec![0, 1, 2, 3]];
+            assert_eq!(kept(&phone, &[1.0, 0.4]), Some(vec![7, 4, 5, 6]));
+            assert_eq!(kept(&phone, &[1.0, 0.6]), None);
+            assert_eq!(kept(&phone, &[0.0, 0.0]), None);
         }
     }
 }

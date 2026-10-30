@@ -517,10 +517,10 @@ impl BuiltInProverComponent for Poseidon2Chip {
     ) {
         use stwo::prover::backend::simd::m31::PackedBaseField;
 
-        let mut logup = LogupTraceBuilder::single_then_pairs(
-            component_trace.log_size(),
-            INPUT_BYTES + OUTPUT_BYTES,
-        );
+        let Logup::SingleThenPairs { singles, .. } = Self::LOGUP else {
+            unreachable!("the chip's batching")
+        };
+        let mut logup = LogupTraceBuilder::single_then_pairs(component_trace.log_size(), singles);
         let call: &Poseidon2CallLookupElements = lookup_elements.as_ref();
         let memory: &MemoryAccessLookupElements = lookup_elements.as_ref();
         let range: &Range256LookupElements = lookup_elements.as_ref();

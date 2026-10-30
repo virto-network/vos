@@ -31,8 +31,7 @@ pub struct LogupTraceBuilder {
     /// bit-identity test.
     skip_dead_rows: bool,
     /// How many of the next fractions take a column each, never paired:
-    /// all for `Logup::Single`, the first `singles` for
-    /// `Logup::SingleThenPairs`, none for `Logup::Pairs`.
+    /// the first `singles` for `Logup::SingleThenPairs`, none otherwise.
     singles: usize,
 }
 
@@ -50,12 +49,6 @@ impl LogupTraceBuilder {
             skip_dead_rows,
             singles: 0,
         }
-    }
-
-    /// A builder that gives each fraction its own column: a
-    /// `Logup::Single` chip's interaction trace.
-    pub fn single(log_size: u32) -> Self {
-        Self::single_then_pairs(log_size, usize::MAX)
     }
 
     /// A builder that gives each of the first `singles` fractions its own
