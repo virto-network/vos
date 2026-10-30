@@ -2366,6 +2366,13 @@ term-by-term argument, not a test); `DeviceProgram`'s fields stay public
 check that the format is the registry's 43 waits for ingress (7.20),
 since the bench and the gates prove under formats of their own.
 
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, other agents'
+runs beside]: the device suite 29 of 29 and `vos-pvm-proof`'s format and
+`pcs` tests; `just check` green at `3a95da42` (1,646 passed in 125 suites;
+its first run caught a clippy type and the formatting, fixed); `just
+test-proof` green at `3a95da42`, `fixtures::` and `constants::` among it
+(nothing moved by `mix_bytes`).
+
 **Commits:** `a69e76b0` (work in progress, at the quota stop),
 `8f58ae0c` the first merge, `a4fdb6d4` the pin and the measurements, the
 second merge, `d421c7ee` and `583b6c5a` this record and its formatting,
