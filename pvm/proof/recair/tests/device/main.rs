@@ -6,6 +6,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod format;
 mod gates;
 mod leakage;
 mod support;

@@ -62,8 +62,11 @@ impl<'a> From<&'a mut Blake2sM31Channel> for ChannelRef<'a> {
 pub trait FsChannel: Channel {
     fn as_ref_channel(&mut self) -> ChannelRef<'_>;
 
-    /// Absorb `bytes`, one M31 a byte, as one run: the lossless encoding of
-    /// the boundary states.
+    /// Absorb `bytes` as one run: the lossless encoding of a run whose
+    /// length the transcript fixes (the boundary states', 296 bytes).
+    /// Blake2s and Poseidon2-M31 take one word a byte; Blake2s-M31, whose
+    /// words a hash absorbs as bytes, four bytes a little-endian word, and
+    /// refuses a run that is not whole words.
     fn mix_bytes(&mut self, bytes: &[u8]);
 }
 
@@ -84,7 +87,14 @@ impl FsChannel for Blake2sM31Channel {
     }
 
     fn mix_bytes(&mut self, bytes: &[u8]) {
-        let words: alloc::vec::Vec<u32> = bytes.iter().map(|&byte| u32::from(byte)).collect();
+        assert!(
+            bytes.len().is_multiple_of(4),
+            "a Blake2s-M31 run is whole words"
+        );
+        let words: alloc::vec::Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
         self.mix_u32s(&words);
     }
 }
@@ -533,5 +543,41 @@ mod tests {
         let node = Blake2sM31MerkleHasher::hash_children(children);
         assert_eq!(node.0[..4], [0; 4]);
         assert_eq!(built[EDGE_NODE], node);
+    }
+}
+
+#[cfg(all(test, feature = "prover"))]
+mod mix_tests {
+    use super::*;
+
+    /// Blake2s-M31 mixes a run's bytes four a word: the digest of the
+    /// channel's state and the bytes themselves, so a boundary-state run of
+    /// 296 bytes hashes 296 bytes, not 1,184; each byte of a run moves it,
+    /// and a run of part of a word is refused.
+    #[test]
+    fn blake2s_m31_mixes_four_bytes_a_word() {
+        let bytes: alloc::vec::Vec<u8> = (0..296u32).map(|i| (i * 37 + 11) as u8).collect();
+        let mixed = |bytes: &[u8]| {
+            let mut channel = Blake2sM31Channel::default();
+            channel.mix_bytes(bytes);
+            channel.digest()
+        };
+        let mut packed = Blake2sM31Channel::default();
+        let words: alloc::vec::Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect();
+        packed.mix_u32s(&words);
+        assert_eq!(mixed(&bytes), packed.digest());
+        let mut one_a_byte = Blake2sM31Channel::default();
+        let wide: alloc::vec::Vec<u32> = bytes.iter().map(|&byte| u32::from(byte)).collect();
+        one_a_byte.mix_u32s(&wide);
+        assert_ne!(mixed(&bytes), one_a_byte.digest());
+        assert!(std::panic::catch_unwind(|| mixed(&[1, 2, 3])).is_err());
+        for at in [0, 1, 2, 3, 147, 295] {
+            let mut changed = bytes.clone();
+            changed[at] ^= 1;
+            assert_ne!(mixed(&changed), mixed(&bytes), "byte {at}");
+        }
     }
 }

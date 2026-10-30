@@ -5167,10 +5167,15 @@ name = "vos-phone"
 version = "0.1.0"
 dependencies = [
  "mimalloc",
+ "postcard",
  "rayon",
+ "serde",
  "sha2 0.10.9",
  "stwo",
  "vos-device",
+ "vos-pvm-proof",
+ "vos-pvm-recair",
+ "vos-pvm-recair-air",
  "vos-wire",
 ]
 

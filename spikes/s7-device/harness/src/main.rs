@@ -27,6 +27,15 @@
 //!   - `device` (with `real` alone): pin J's device shape (7.15), the
 //!     kernel's program installed at the shape its run needs (each chip at
 //!     least its floor), proved masked against it and verified.
+//! - `kernels <elf> <data> <out>`: the two auth kernels as a device proves
+//!   them, for `tools/phone`'s device cells (slice 7's 7.16): `b2`, the
+//!   statement over the vos-tree (`auth`, its witness input `gen`'s), and
+//!   `p2`, over the credential actor's Poseidon2 tree through the `0x402`
+//!   call (`auth_p2`, its witness input made here: a member's leaf at slot
+//!   `0x1234_5678` of a tree whose siblings at levels 0, 5 and 17 are
+//!   occupied); each `<name>.kernel` (the derived blob, which the patched
+//!   derivation admits with the call) and `<name>.input`, each traced once
+//!   on the device tracer to its halt.
 //! - `grind [--bits B] [--n N] [--threads N]`: N grinds of the Blake2s-M31
 //!   channel's PoW, each from its own transcript: mean, median, 95th
 //!   percentile.
@@ -242,6 +251,71 @@ fn generate(elf: &Path, dir: &Path) {
         run.steps(),
         hex(&expected)
     );
+}
+
+/// The derived kernel of method `name`.
+fn kernel_of(elf: &[u8], name: &[u8]) -> Vec<u8> {
+    let derived = vos_pvm_compiler::derive(elf).expect("derive");
+    let hash = vos_pvm_precompiles::blake2b_hash::<32>(b"vos/method/", &[name]);
+    let id = u32::from_be_bytes([hash[0], hash[1], hash[2], hash[3]]);
+    derived
+        .kernels
+        .into_iter()
+        .find_map(|(method, kernel)| (method == id).then_some(kernel))
+        .expect("the kernel")
+}
+
+/// `auth_p2`'s witness input: the method's arguments in order, its public
+/// ones auth's `CredentialPublic` (the kind byte, then `map_root`, `scope`,
+/// `nullifier` and `binding`).
+fn p2_input() -> Vec<u8> {
+    use vos_wire::credentials::{DEPTH, EMPTY, Tag, compress, digest, leaf, root_of};
+    let secret: [u32; 8] = core::array::from_fn(|i| 0x0123_4567 + 7_919 * i as u32);
+    let slot = 0x1234_5678u32;
+    let mut siblings: [[u32; 8]; DEPTH] = core::array::from_fn(|level| EMPTY[level]);
+    for (n, level) in [0, 5, 17].into_iter().enumerate() {
+        siblings[level] = core::array::from_fn(|i| (n as u32 + 1) * 1_000_003 + i as u32);
+    }
+    let member = compress(&Tag::Member.block(), &secret);
+    let root = root_of(&leaf(&member), slot, &siblings);
+    let scope: [u32; 8] = core::array::from_fn(|i| 0x5c5c_0000 + i as u32);
+    let nullifier = compress(&compress(&Tag::Nf.block(), &secret), &scope);
+    let binding: [u32; 8] = core::array::from_fn(|i| 0x0b1b_0000 + i as u32);
+    let mut input = vec![0u8];
+    for words in [root, scope, nullifier, binding, secret] {
+        input.extend_from_slice(&digest(&words));
+    }
+    input.extend_from_slice(&slot.to_le_bytes());
+    for sibling in &siblings {
+        input.extend_from_slice(&digest(sibling));
+    }
+    input
+}
+
+/// The two auth kernels and their witness inputs, for `tools/phone`.
+fn kernels(elf: &Path, data: &Path, out: &Path) {
+    std::fs::create_dir_all(out).unwrap();
+    let elf = std::fs::read(elf).unwrap();
+    for (name, method, input) in [
+        (
+            "b2",
+            &b"auth"[..],
+            std::fs::read(data.join("auth.input")).unwrap(),
+        ),
+        ("p2", &b"auth_p2"[..], p2_input()),
+    ] {
+        let kernel = kernel_of(&elf, method);
+        let trace = vos_pvm_proof::kernel::trace_device_kernel(&kernel, &input, GAS)
+            .expect("the kernel runs to its halt");
+        println!(
+            "{name}: kernel {} B, input {} B, {} steps",
+            kernel.len(),
+            input.len(),
+            trace.side_note.steps.len()
+        );
+        std::fs::write(out.join(format!("{name}.kernel")), &kernel).unwrap();
+        std::fs::write(out.join(format!("{name}.input")), &input).unwrap();
+    }
 }
 
 /// The auth kernel, derived, and its run.
@@ -1028,6 +1102,11 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("gen") if args.len() == 4 => generate(Path::new(&args[2]), Path::new(&args[3])),
+        Some("kernels") if args.len() == 5 => kernels(
+            Path::new(&args[2]),
+            Path::new(&args[3]),
+            Path::new(&args[4]),
+        ),
         Some("run") => run(&args[2..]),
         Some("--child") => child(&args[2..]),
         Some("grind") => {

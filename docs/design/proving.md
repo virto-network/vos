@@ -655,10 +655,10 @@ last for decades.**
   `h`. The device shape proves them masked against its program
   (`vos_pvm_recair::masked::device`, slice 7's 7.15): the program's chips
   mixed after the header, its log sizes pinned, the io-hash the one public
-  sum. No admitted format proves either yet (the device format, 43, at
-  7.16). Node segment, leaf and fold proofs stay unmasked, in the prover
+  sum. No admitted format proves either yet (the device format, 43, is
+  registered and refused until ingress takes device proofs). Node segment, leaf and fold proofs stay unmasked, in the prover
   role, as the witness rows do.
-- **Device proofs at rate 1/2** serve authorizations a space re-checks at
+- **Device proofs (format 43, rate 1/4)** serve authorizations a space re-checks at
   its ingress, never settlement.
 - **How:** spike 2's variant (c), already prototyped on our pinned Stwo
   fork, with Fable's R1–R8:
@@ -1205,6 +1205,14 @@ binding the run like this:
   next-row read (`|O| = 1`) needs half, so `h` is set per component. Every
   segment chip reads its running sum's previous row, so each takes the
   full `h` [built, 7.14].
+
+**Format 43, device proofs** [measured, slice 7's 7.16]: masked (c), the
+Blake2s-M31 channel, blowup 4, 47 queries, PoW 16, interaction PoW 8,
+affine DEEP batching, `h = 512` (format 44's parameters); 110 conjectured
+and 62.82 proven bits on its masked reference, every device chip at
+2^17 rows (`DEVICE_MAX_LOG_SIZE`, which install enforces: the memory
+ledger, a row a byte touched, takes 2^17 on the auth statements). It is
+registered and refused until ingress takes device proofs.
 
 **What a device proof authorizes** [decided, S24]: exactly what an auth
 credential proof does. A device kernel is an `#[attestable]` method whose

@@ -77,3 +77,13 @@ index 2ebbea7..e35ad00 100644
              | $crate::format::ChannelKind::Blake2b256 => $unbuilt,
          }
      };
+diff --git a/pvm/runtime/src/precompile.rs b/pvm/runtime/src/precompile.rs
+--- a/pvm/runtime/src/precompile.rs
++++ b/pvm/runtime/src/precompile.rs
+@@ -86,3 +86,5 @@
+ pub const fn is_kernel_call(id: u64) -> bool {
+-    matches!(id, BLAKE2B_COMPRESS | WITNESS_INPUT)
++    // The spike's device kernels: the Poseidon2 call derived as a device
++    // kernel's, which the derivation does not admit yet.
++    matches!(id, BLAKE2B_COMPRESS | WITNESS_INPUT | POSEIDON2)
+ }

@@ -30,7 +30,7 @@ use stwo::prover::poly::circle::PolyOps;
 use stwo::prover::{CommitmentSchemeProver, ComponentProver};
 use vos_pvm_final_verifier::Error;
 use vos_pvm_final_verifier::masked::{Claim, MaskedFormat, verify_masked};
-use vos_pvm_proof::device::{DeviceLayout, device_chips_of_code};
+use vos_pvm_proof::device::{DEVICE_MAX_LOG_SIZE, DeviceLayout, device_chips_of_code};
 use vos_pvm_proof::format::Format;
 use vos_pvm_proof::framework_access::AllLookupElements;
 use vos_pvm_proof::masked::{
@@ -118,7 +118,8 @@ pub fn device_shape(
 /// Kernel `blob`'s device program under `format` on `MC`'s trees, at the
 /// chips `active` and the log sizes `log_sizes`: its layout and its
 /// preprocessed root, computed from the kernel alone. Refused when `active`
-/// is not the chips its code reaches, or a log size is under its floor.
+/// is not the chips its code reaches, a log size is under its floor, or one
+/// is above `DEVICE_MAX_LOG_SIZE`, where the format's count stops holding.
 pub fn install<MC: MerkleChannel>(
     format: &Format,
     blob: &[u8],
@@ -143,6 +144,11 @@ where
     ))?;
     if floors.len() != log_sizes.len() || log_sizes.iter().zip(&floors).any(|(s, f)| s < f) {
         return Err(ProveError::TraceShape("a log size under its floor"));
+    }
+    if log_sizes.iter().any(|&size| size > DEVICE_MAX_LOG_SIZE) {
+        return Err(ProveError::TraceShape(
+            "a log size above the device format's reference",
+        ));
     }
     let preprocessed = device_preprocessed(&code, &layout, active, log_sizes)
         .map_err(|error| ProveError::Segment(error.to_string()))?;
@@ -233,6 +239,9 @@ fn prove_device_with<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
+    device_format(format, program, &program.header()).ok_or(ProveError::TraceShape(
+        "a log size under its floor or above the device format's reference",
+    ))?;
     let mut trace = device_trace(program, side_note)?;
     let side_note: &SideNote = side_note;
     tamper(&mut trace);
@@ -271,12 +280,25 @@ where
 }
 
 /// The masked format `format` pins for `program`, as its verifier takes it,
-/// and its chips laid out.
+/// and its chips laid out. `None` when a log size is under its floor or
+/// above `DEVICE_MAX_LOG_SIZE`, where the device format's count stops
+/// holding: the prover and the verifier both refuse such a program,
+/// however it was made.
 pub fn device_format<'a, H: MerkleHasherLifted>(
     format: &Format,
     program: &'a DeviceProgram<H>,
     header: &'a [u64],
 ) -> Option<(MaskedFormat<'a>, DeviceComponents)> {
+    let floors = device_floors(format, program.active)?;
+    let fits = floors.len() == program.log_sizes.len()
+        && program
+            .log_sizes
+            .iter()
+            .zip(&floors)
+            .all(|(&size, &floor)| floor <= size && size <= DEVICE_MAX_LOG_SIZE);
+    if !fits {
+        return None;
+    }
     let layout = DeviceComponents::layout(program.active, &program.log_sizes)?;
     let masked = super::verifier_format(format, &program.log_sizes, &layout)?;
     Some((

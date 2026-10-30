@@ -10,6 +10,11 @@
 //!   every line JSON.
 //! - `vos-phone verify DIR`: verifies the proofs `run --out DIR` wrote,
 //!   against the same calls: a phone's proofs verified on x86.
+//! - `vos-phone device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR]`:
+//!   device kernels proved masked under the device profile at candidate
+//!   parameters (`device.rs`, 7.16), one `device_cell` line a cell, each in
+//!   a child process of its own; the kernels and their witness inputs read
+//!   from DIR (default `kernels` beside the binary).
 //!
 //! **Two builds:** the timing build (masks from the operating system, as
 //! the library's every build) and the seeded build (`--features seeded`:
@@ -36,6 +41,8 @@ use vos_device::{
     verify_joint,
 };
 use vos_wire::credentials::{DEPTH, EMPTY, leaf, root_of};
+
+mod device;
 
 /// The cells, in order.
 const CELLS: [&str; 3] = ["auth", "owner", "joint"];
@@ -83,6 +90,8 @@ struct Options {
     cells: Vec<String>,
     grind: u64,
     out: Option<PathBuf>,
+    kernels: Option<PathBuf>,
+    warmups: usize,
 }
 
 fn options(args: &[String]) -> Options {
@@ -92,6 +101,8 @@ fn options(args: &[String]) -> Options {
         cells: CELLS.iter().map(|cell| cell.to_string()).collect(),
         grind: 300,
         out: None,
+        kernels: None,
+        warmups: 1,
     };
     let mut args = args.iter();
     while let Some(flag) = args.next() {
@@ -107,6 +118,8 @@ fn options(args: &[String]) -> Options {
             "--cells" => options.cells = value().split(',').map(str::to_string).collect(),
             "--grind" => options.grind = value().parse().expect("a count"),
             "--out" => options.out = Some(PathBuf::from(value())),
+            "--kernels" => options.kernels = Some(PathBuf::from(value())),
+            "--warmups" => options.warmups = value().parse().expect("a count"),
             other => panic!("unknown flag {other}"),
         }
     }
@@ -335,6 +348,54 @@ fn run(args: &[String]) {
     println!("{{\"kind\":\"done\"}}");
 }
 
+/// The device cells, each in a child process of its own.
+fn device_run(args: &[String]) {
+    device();
+    let mut options = options(args);
+    if !args.iter().any(|arg| arg == "--cells") {
+        options.cells = device::CELLS.split(',').map(str::to_string).collect();
+    }
+    let exe = std::env::current_exe().expect("this binary's path");
+    for name in &options.cells {
+        let status = Command::new(&exe)
+            .arg("device-cell")
+            .arg(name)
+            .args(args)
+            .status()
+            .expect("the cell's process");
+        if !status.success() {
+            println!("{{\"kind\":\"error\",\"cell\":\"{name}\",\"status\":\"{status}\"}}");
+        }
+    }
+    println!("{{\"kind\":\"done\"}}");
+}
+
+/// A device cell's worker threads' stacks: the prover's nested joins at
+/// blowup 8 overflowed the default 2 MiB about once in 18 proves on 8
+/// threads, and never in 24 at this size.
+const DEVICE_STACK: usize = 16 << 20;
+
+/// One device cell, in a pool of the threads asked for.
+fn device_cell(name: &str, args: &[String]) {
+    let options = options(args);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(options.threads.unwrap_or(0))
+        .stack_size(DEVICE_STACK)
+        .build_global()
+        .expect("the pool");
+    let kernels = options.kernels.clone().unwrap_or_else(|| {
+        let exe = std::env::current_exe().expect("this binary's path");
+        exe.with_file_name("kernels")
+    });
+    device::cell(
+        name,
+        &kernels,
+        options.reps,
+        options.warmups,
+        options.out.as_ref(),
+    );
+}
+
 /// Verifies the proofs `run --out` wrote in `dir` against their calls.
 fn verify_dir(dir: &str) {
     let secret = derive_secret(&SOURCE_OUTPUT, &HANDLE);
@@ -381,9 +442,12 @@ fn main() {
         Some("run") => run(&args[1..]),
         Some("cell") => cell(&args[1], &options(&args[2..])),
         Some("verify") => verify_dir(&args[1]),
+        Some("device") => device_run(&args[1..]),
+        Some("device-cell") => device_cell(&args[1], &args[2..]),
         _ => {
             eprintln!(
-                "vos-phone run [--reps N] [--threads auto|N] [--cells LIST] [--grind N] [--out DIR] | verify DIR"
+                "vos-phone run [--reps N] [--threads auto|N] [--cells LIST] [--grind N] [--out DIR] | verify DIR \
+                 | device [--kernels DIR] [--cells LIST] [--reps N] [--warmups N] [--threads auto|N] [--out DIR]"
             );
             std::process::exit(2);
         }

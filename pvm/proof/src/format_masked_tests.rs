@@ -47,12 +47,16 @@ fn least_queries(base: FormatParams) -> Option<usize> {
 }
 
 /// Variant (c) moves no unmasked count: every format but the masked ones
-/// counted on their masked shapes (39, 44) samples its composition at the
+/// counted on their masked shapes (39, 43, 44) samples its composition at the
 /// out-of-domain point itself and counts what it pins, format 28 82.60;
 /// format 39's reference is 28's at (c)'s levels.
 #[test]
 fn the_unmasked_counts_do_not_move() {
-    let counted_masked = [MASKED_WRAP.number, CREDENTIAL_PROOF.number];
+    let counted_masked = [
+        MASKED_WRAP.number,
+        DEVICE_PROOF.number,
+        CREDENTIAL_PROOF.number,
+    ];
     for format in REGISTRY {
         let doublings = u32::from(counted_masked.contains(&format.number));
         assert_eq!(
@@ -60,7 +64,7 @@ fn the_unmasked_counts_do_not_move() {
             "format {}",
             format.number
         );
-        assert_eq!(format.masked, [37, 39, 44].contains(&format.number));
+        assert_eq!(format.masked, [39, 43, 44].contains(&format.number));
         assert_eq!(
             format.masking.is_some(),
             counted_masked.contains(&format.number),
