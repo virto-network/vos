@@ -189,7 +189,9 @@ Copy `inventory.example.toml` to `inventory.toml` and give one
   fit in its free memory, or `check` refuses it.
 
 `[harness]` sets where runs are kept, the units' memory cap, the window
-length, the clock bound and the sampling interval. `[node]` holds the
+length, the clock bound, the sampling interval, and `start_s`, how long a
+node may take to answer once started (90 s; a node opens every group it
+replicates first, so 10^5 idle agents need more). `[node]` holds the
 nodes' settings (`vos node run --config`): `executors`, `queue`,
 `max_inputs`, `max_bytes`, `linger_ms`, `ingress_connections`,
 `election_timeout_ms = [low, high]` and `heartbeat_ms`.
