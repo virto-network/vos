@@ -11,7 +11,7 @@ use vos_wire::keys;
 
 use super::close::Closes;
 use super::execute::{Flight, Launched};
-use super::{Ended, Leader};
+use super::{Ended, Leader, is_due};
 use crate::fault::{Fault, read};
 use crate::node::{Answered, Pending, Reply};
 use crate::store::{BlobRef, Snapshot, Unapplied};
@@ -51,7 +51,7 @@ impl Leader {
         let admin = pending
             .iter()
             .any(|item| matches!(item, Pending::Admin { .. }));
-        if (admin || self.doomed) && !self.land_all().await {
+        if (admin || self.doomed || self.cut_short) && !self.land_all().await {
             self.agent.requeue(pending);
             return false;
         }
@@ -162,11 +162,18 @@ impl Leader {
                 proposed,
             }) => {
                 self.sweeps.writes(&writes);
-                // The batches after it take its messages as consumed.
+                // The batches after it read its senders' marks over its
+                // writes: those it ran, and not those it cut short.
                 for item in &pending {
                     if let Pending::Message(message) | Pending::Failed(message) = item {
-                        raise(&mut self.marks, message.from, message.sequence);
+                        self.marks.remove(&message.from);
                     }
+                }
+                // Inputs a result cut short go again once it lands: no
+                // batch flies past them meanwhile, so none overtakes them.
+                let ran = result.steps.iter().filter(|step| !is_due(step)).count();
+                if ran < pending.len() {
+                    self.cut_short = true;
                 }
                 self.in_flight.push_back(Flight {
                     pending,
@@ -188,6 +195,14 @@ impl Leader {
                     item.refuse(&hint);
                 }
                 true
+            }
+            // Refined over batches in flight, the failure may be of a state
+            // that never applies: those land, and the inputs go again, on
+            // the applied state.
+            Err(Fault::Agent(_)) if !self.in_flight.is_empty() => {
+                let landed = self.land_all().await;
+                self.agent.requeue(pending);
+                landed
             }
             Err(Fault::Agent(message)) => {
                 if let Some(first) = sweeping.filter(|_| pending.len() == 1) {
@@ -249,12 +264,14 @@ impl Leader {
         } = flight;
         let doomed = self.doomed;
         if !matches!(ended, Ok(Ended::Done(_))) {
-            // What those after it took as consumed is not.
+            // What those after it took as consumed, or as swept, is not.
             self.doomed = true;
             self.marks.clear();
+            self.sweeps.lost_writes();
         }
         if self.in_flight.is_empty() {
             self.doomed = false;
+            self.cut_short = false;
         }
         match ended {
             Ok(Ended::Done(result)) => {
@@ -339,7 +356,7 @@ impl Leader {
                     if message.sequence <= mark {
                         // Acknowledged only once applied: one a batch in
                         // flight consumes is acknowledged as it applies.
-                        if let Some(applied) = self.applied_mark(message.from, mark)
+                        if let Some(applied) = self.applied_mark(message.from)
                             && message.sequence <= applied
                         {
                             raise(&mut acks, message.from, applied);
@@ -390,13 +407,9 @@ impl Leader {
         kept
     }
 
-    /// `from`'s pair mark as applied, `mark` being the one the next batch
-    /// runs at: the same while no batch is in flight. None when it cannot
-    /// be read.
-    fn applied_mark(&self, from: AgentId, mark: u64) -> Option<u64> {
-        if self.in_flight.is_empty() {
-            return Some(mark);
-        }
+    /// `from`'s pair mark as applied, read from the store: the only mark a
+    /// message is acknowledged at. None when it cannot be read.
+    fn applied_mark(&self, from: AgentId) -> Option<u64> {
         let snapshot = self.inner.store.snapshot();
         read::<u64>(&snapshot, self.id, &keys::pair_in(from))
             .ok()

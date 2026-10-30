@@ -83,7 +83,9 @@ impl Leader {
                         // At or below the mark, a duplicate: acknowledge
                         // it. Above, a gap: drop it, and tell the sender it
                         // is behind.
-                        match self.mark(&snapshot, message.from) {
+                        let applied = read::<u64>(&snapshot, self.id, &keys::pair_in(message.from))
+                            .map(|mark| mark.unwrap_or(0));
+                        match applied {
                             Ok(mark) if message.sequence <= mark => {
                                 raise(&mut acks, message.from, mark);
                             }

@@ -109,6 +109,9 @@ struct Leader {
     /// A batch in flight did not apply as proposed: those after it land
     /// before another flies.
     doomed: bool,
+    /// A batch in flight ran fewer inputs than it took: it lands before
+    /// another flies.
+    cut_short: bool,
     /// The node's clock trails the agent's time: batches are timed at the
     /// agent's.
     trailing: bool,
@@ -193,6 +196,7 @@ impl Leader {
             applied: 0,
             in_flight: VecDeque::new(),
             doomed: false,
+            cut_short: false,
             trailing: false,
             marks: HashMap::new(),
             windows: HashMap::new(),

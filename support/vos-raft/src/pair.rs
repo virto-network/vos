@@ -231,6 +231,7 @@ impl<N: Ord + Copy, G: Ord + Copy, T: Ord + Copy> PeerTable<N, G, T> {
     /// it did not name.
     pub fn heard(&mut self, from: N, now: T, frame: Frame<G>) -> Option<Heard<T, G>> {
         let at = (frame.incarnation, frame.round);
+        let mut cleared = Vec::new();
         let (new_run, before) = match self.peers.get_mut(&from) {
             Some(peer) => {
                 if at < peer.last {
@@ -238,6 +239,8 @@ impl<N: Ord + Copy, G: Ord + Copy, T: Ord + Copy> PeerTable<N, G, T> {
                 }
                 let new_run = frame.incarnation != peer.last.0;
                 if new_run {
+                    // Every group the last run listed is no longer listed.
+                    cleared.extend(peer.leading.keys().copied());
                     peer.leading.clear();
                     peer.whole = None;
                     peer.taking = None;
@@ -278,7 +281,7 @@ impl<N: Ord + Copy, G: Ord + Copy, T: Ord + Copy> PeerTable<N, G, T> {
         peer.taking = next
             .filter(|&(_, due)| due == part)
             .map(|(round, due)| (round, due + 1));
-        let mut changed = Vec::new();
+        let mut changed = cleared;
         let applies =
             listing.since == 0 || peer.whole.is_some_and(|(taken, _)| listing.since <= taken);
         if !applies {
@@ -474,8 +477,9 @@ mod tests {
             Some(Heard {
                 new_run: true,
                 before: Some(10),
-                changed: Vec::new()
-            })
+                changed: vec![7]
+            }),
+            "what the last run listed is no longer"
         );
         assert_eq!(table.listed(2, &7, 4), None);
         assert_eq!(table.taken(2), None, "nothing taken whole from the new run");

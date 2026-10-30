@@ -362,10 +362,13 @@ impl Driver {
                 // of the node's campaigns: past their bound it is put off by
                 // a fresh election timeout, so a node that wakes many
                 // leaderless groups at once elects them in turn rather
-                // than have them all time out together.
+                // than have them all time out together. A round that did
+                // not settle gives its campaign back and waits a timeout,
+                // so groups that keep losing do not keep the others out.
                 if self.core.campaign_due(now) {
-                    self.campaign = None;
-                    self.campaign = self.inner.campaigns.take();
+                    if self.campaign.take().is_none() {
+                        self.campaign = self.inner.campaigns.take();
+                    }
                     if self.campaign.is_none() {
                         self.core.defer_campaign(now);
                     }

@@ -219,6 +219,9 @@ async fn beat(inner: Arc<Inner>) -> Ended {
         } else {
             inner.led()
         };
+        // The round's frames wait for room until half an interval from
+        // now, all peers together: slow ones do not hold the next round.
+        let room = Instant::now() + interval / 2;
         for &peer in inner.numbers.iter().filter(|&&peer| peer != inner.number) {
             // A group whose placement this node does not hold goes to
             // every node.
@@ -236,7 +239,7 @@ async fn beat(inner: Arc<Inner>) -> Ended {
             // A frame the peer's queue has no room for ends the round
             // there: the next names its changes again.
             for frame in frames {
-                if !inner.send_heartbeat(peer, &frame, interval / 4).await {
+                if !inner.send_heartbeat(peer, &frame, room).await {
                     break;
                 }
             }
@@ -357,13 +360,14 @@ impl Inner {
         led
     }
 
-    /// Send one frame of the pair heartbeat to `to`, waiting up to `room`
-    /// for room in its queue: false when it was refused.
-    async fn send_heartbeat(&self, to: NodeNumber, message: &PeerMessage, room: Duration) -> bool {
+    /// Send one frame of the pair heartbeat to `to`, waiting until `room`
+    /// at most for room in its queue: false when it was refused.
+    async fn send_heartbeat(&self, to: NodeNumber, message: &PeerMessage, room: Instant) -> bool {
         let Some(network) = &self.network else {
             return false;
         };
-        timeout(room, network.ready(to, Class::Liveness)).await;
+        let wait = room.saturating_duration_since(Instant::now());
+        timeout(wait, network.ready(to, Class::Liveness)).await;
         network
             .send(to, Class::Liveness, 0, message.encode())
             .is_ok()

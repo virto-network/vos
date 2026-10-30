@@ -59,6 +59,13 @@ impl Sweeps {
         }
     }
 
+    /// A batch in flight did not apply as proposed: the rows its writes
+    /// deleted may stand, below the floor its scan left. The next scan
+    /// starts from the index's start.
+    pub(super) fn lost_writes(&mut self) {
+        self.floor = None;
+    }
+
     /// The first row of `agent`'s due index on `snapshot`, the state with
     /// every batch of this leadership's that flies over it: the floor rises
     /// to it.
