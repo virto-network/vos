@@ -572,7 +572,7 @@ mod tests {
     fn agent_program() -> Vec<u8> {
         let path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../agent/default/target/riscv64em-vos/release/vos-agent.elf"
+            "/../../agent/programs/target/riscv64em-vos/release/vos-agent.elf"
         );
         let elf = std::fs::read(path).expect("run `just build-agent`");
         vos_pvm_compiler::link_elf_spi(&elf).expect("links")

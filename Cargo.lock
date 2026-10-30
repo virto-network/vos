@@ -4341,7 +4341,7 @@ dependencies = [
 [[package]]
 name = "stwo"
 version = "2.2.0"
-source = "git+https://github.com/olanod/stwo?rev=4cd1f83ff4c090afcd3362e27e2d34eb634a0161#4cd1f83ff4c090afcd3362e27e2d34eb634a0161"
+source = "git+https://github.com/olanod/stwo?rev=9e9b4ff61abb319489be745b729880d8ac8177a4#9e9b4ff61abb319489be745b729880d8ac8177a4"
 dependencies = [
  "blake2 0.10.6",
  "blake3",
@@ -4369,7 +4369,7 @@ dependencies = [
 [[package]]
 name = "stwo-constraint-framework"
 version = "2.2.0"
-source = "git+https://github.com/olanod/stwo?rev=4cd1f83ff4c090afcd3362e27e2d34eb634a0161#4cd1f83ff4c090afcd3362e27e2d34eb634a0161"
+source = "git+https://github.com/olanod/stwo?rev=9e9b4ff61abb319489be745b729880d8ac8177a4#9e9b4ff61abb319489be745b729880d8ac8177a4"
 dependencies = [
  "hashbrown 0.17.1",
  "itertools 0.12.1",
@@ -5443,6 +5443,7 @@ dependencies = [
  "vos-anchor",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-program",
  "vos-statement",
  "vos-wire",
 ]

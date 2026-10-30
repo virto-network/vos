@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 
 use crate::{
     Admitted, DecodeError, ProgramId, Refusal, RootKind, RootRead, SpaceId, Statement, StatementId,
-    Venue, WindowClock, admit, decode_program, judge, seen_expiry,
+    Venue, WindowClock, admit, judge, seen_expiry,
 };
 use vos_anchor::codec::{self, Reader};
 use vos_anchor::venue::{self as rules, Held, Roots, Status};
@@ -187,7 +187,7 @@ impl Input {
     /// The input at the start of `bytes`, and the bytes it takes.
     pub fn decode_prefix(bytes: &[u8]) -> Result<(Self, usize), DecodeError> {
         let mut reader = Reader::new(bytes);
-        let program = decode_program(&mut reader)?;
+        let program = ProgramId::decode_from(&mut reader)?;
         let now_ms = reader.u64()?;
         let count = reader.count(4)?;
         let formats = (0..count).map(|_| reader.u32()).collect::<Result<_, _>>()?;

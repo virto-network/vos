@@ -39,10 +39,10 @@ mkdir -p "$run/builder"
 rpc="localhost:19800"
 unit="vos-jam-testnet-$$"
 dev="${CARGO_TARGET_DIR:-$root/target}/debug/vos-jam-dev"
-agent="${CARGO_TARGET_DIR:-$root/agent/default/target}/riscv64em-vos/release/vos-agent.elf"
+agent="${CARGO_TARGET_DIR:-$root/agent/programs/target}/riscv64em-vos/release/vos-agent.elf"
 actors="${CARGO_TARGET_DIR:-$root/agent/test-actors/target}/riscv64em-vos/release"
 service="${CARGO_TARGET_DIR:-$root/target}/riscv64em-vos/release/statement-service.elf"
-representative="${CARGO_TARGET_DIR:-$root/agent/representative/target}/riscv64em-vos/release/vos-representative.elf"
+representative="${CARGO_TARGET_DIR:-$root/agent/programs/target}/riscv64em-vos/release/vos-representative.elf"
 
 for binary in polkajam-testnet polkajam jamt; do
     [ -x "$POLKAJAM/$binary" ] || { echo "no $binary in $POLKAJAM" >&2; exit 1; }

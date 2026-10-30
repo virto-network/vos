@@ -81,7 +81,6 @@ const CLOCK: WindowClock = WindowClock {
 /// A genesis of the test keys `seeds`.
 fn genesis(harness: &impl Harness, seeds: &[u8], nonce: u8) -> SpaceGenesis {
     SpaceGenesis {
-        version: crate::GENESIS_VERSION,
         nodes: seeds
             .iter()
             .enumerate()

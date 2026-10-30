@@ -84,7 +84,9 @@ exclude = [
     "pvm/proof/fuzz",
     "pvm/bench/guests",
     "agent/test-actors",
+    "agent/programs",
     "agent/default",
+    "agent/representative",
     "agent/credentials",
     # The final verifier's Wasm blob and its measuring runner: each its own
     # workspace, the blob verify-only for wasm32, the runner on wasmtime.
@@ -241,12 +243,15 @@ cipher-clerk = { git = "https://codeberg.org/Virto/CipherClerk.git", tag = "v0.3
 # (`vos/base`); then the final wrap's Blake2b-256 Merkle hasher and channel,
 # FRI fold step 3 reviewed, affine DEEP batching opt-in per configuration,
 # and errors in place of panics on a malformed last layer and on
-# inconsistent queried values.
+# inconsistent queried values; then the PoW grind in chunks of 2^14
+# nonces, the smallest kept (`vos/grind-chunks`), and the SIMD backend's
+# Blake2s-M31 digest words reduced canonically over the whole u32 range,
+# as the verifier reduces them (`vos/simd-m31-reduce`).
 # Declared without features: workspace features are additive, and the
 # verifier-only build must stay free of std and rayon. The prover adds
 # `std,prover,parallel` through vos-pvm-proof's `prover` feature.
-stwo = { git = "https://github.com/olanod/stwo", rev = "4cd1f83ff4c090afcd3362e27e2d34eb634a0161", default-features = false }
-stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "4cd1f83ff4c090afcd3362e27e2d34eb634a0161", default-features = false }
+stwo = { git = "https://github.com/olanod/stwo", rev = "9e9b4ff61abb319489be745b729880d8ac8177a4", default-features = false }
+stwo-constraint-framework = { git = "https://github.com/olanod/stwo", rev = "9e9b4ff61abb319489be745b729880d8ac8177a4", default-features = false }
 
 num-traits = "0.2"
 serde = { version = "1", features = ["derive"] }

@@ -549,10 +549,11 @@ pub struct Statement {
     other vos dependency than `vos-anchor`, which it re-exports, so Kreivo
     can depend on it; its `model` is a venue as plain data, which the
     fixtures are judged against, and its JAM refine program
-    (`final-verify.elf`) the harness's on the JAM-only host: a test and
-    vector program, which judges the fixtures and computes the anchor
-    vectors (its `ANCHORS` mode accepts with no proof read), so it is
-    never deployed as a venue; the JAM venue is the statements service;
+    (`final-verify.elf`) the harness's on the JAM-only host, which judges
+    the fixtures and accepts nothing without a proof; its test build
+    (`final-verify-test.elf`) links format 28 beside 39 and alone computes
+    the anchor vectors (its `ANCHORS` mode, no proof read). Neither is
+    deployed as a venue; the JAM venue is the statements service;
   - `statement/service` (`vos-statement-service`): the JAM statements
     service (§6), its refine and accumulate over `vos-statement`, built
     as a JAM program (`statement-service.elf`);

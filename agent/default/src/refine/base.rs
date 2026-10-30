@@ -271,6 +271,14 @@ impl Base {
         }
     }
 
+    /// A row through this refine's earlier steps and applied state,
+    /// decoded whole: trailing bytes are as corrupt as a short row.
+    pub(crate) fn decoded<T: Decode>(&self, key: &[u8]) -> Result<Option<T>, Corrupt> {
+        self.read(key)?
+            .map(|bytes| T::decode_exact(&bytes).ok_or(Corrupt))
+            .transpose()
+    }
+
     /// An instance's installed record. Read the first time in a refine, it
     /// is paid first, by its length ([`defaults::RECORD_BYTE`]): out of gas
     /// when the meter cannot pay it.
@@ -287,7 +295,7 @@ impl Base {
             return Err(Failure::OutOfGas);
         }
         let installed = match self.read(&key)? {
-            Some(bytes) => Some(Rc::new(Installed::decode(&bytes).map_err(|_| Corrupt)?.0)),
+            Some(bytes) => Some(Rc::new(Installed::decode_exact(&bytes).ok_or(Corrupt)?)),
             None => None,
         };
         self.installed

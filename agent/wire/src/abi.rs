@@ -305,11 +305,12 @@ operations! {
 
 /// Whether operation `op` is an effect a workflow makes: a call, a send, a
 /// request or a wait for a result, a read at its window's cut, a section on
-/// its instance's state, or its result. A workflow's unit, the code between two awaits, is preempted
-/// only before its first effect, and from it runs to its next await with
-/// the step's whole limit. A section's reads count too: a value read and
-/// then written within one unit stays atomic. Every other operation a
-/// workflow may use only reads, sets registers or pauses.
+/// its instance's state, or its result. A workflow's unit, the code between
+/// two awaits, is preempted only before its first effect, and from it runs
+/// to its next await with the step's whole limit. A section's reads count
+/// too: a value read and then written within one unit stays atomic. Every
+/// other operation a workflow may use only reads, sets registers or
+/// pauses.
 pub const fn is_effect(op: Op) -> bool {
     matches!(
         op,

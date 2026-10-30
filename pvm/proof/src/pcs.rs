@@ -426,8 +426,128 @@ macro_rules! with_stack {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "prover"))]
 mod tests {
+    use alloc::vec::Vec;
+
+    use stwo::core::fields::m31::M31;
+    use stwo::core::vcs_lifted::verifier::MerkleVerifierLifted;
+    use stwo::prover::backend::simd::SimdBackend;
+    use stwo::prover::backend::simd::column::BaseColumn;
+    use stwo::prover::vcs_lifted::ops::MerkleOpsLifted;
+    use stwo::prover::vcs_lifted::prover::MerkleProverLifted;
+
+    use super::*;
+
+    /// A leaf of 4 M31s whose Blake2s digest's word 4 is `2^32 - 1`, which
+    /// reduces to 1.
+    const EDGE_LEAF: [u32; 4] = [0x5208_0a2a, 0x5368_d2ec, 0x1b80_dd5a, 0x2826_d36f];
+
+    /// Two children whose Blake2s digest's word 0 is `2^32 - 2`, which
+    /// reduces to 0.
+    const EDGE_CHILDREN: [u32; 16] = [
+        0x3332_5aa3,
+        0x0,
+        0x3c6e_f372,
+        0x5aa6_6d2c,
+        0x78dd_e6e4,
+        0x1715_609d,
+        0x354c_da57,
+        0x5384_540f,
+        0x71bb_cdc9,
+        0x0ff3_4782,
+        0x2e2a_c13a,
+        0x4c62_3af4,
+        0x6a99_b4ac,
+        0x08d1_2e65,
+        0x2708_a81f,
+        0x4540_21d7,
+    ];
+
+    fn hash(words: &[u32]) -> Blake2sHash {
+        let mut bytes = [0u8; 32];
+        for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
+            chunk.copy_from_slice(&word.to_le_bytes());
+        }
+        Blake2sHash(bytes)
+    }
+
+    /// [`EDGE_LEAF`]'s hash under `H`.
+    fn leaf<H: MerkleHasherLifted<Hash = Blake2sHash>>() -> Blake2sHash {
+        let mut hasher = H::default();
+        hasher.update_leaf(&EDGE_LEAF.map(M31::from_u32_unchecked));
+        hasher.finalize()
+    }
+
+    /// The SIMD prover's Blake2s-M31 tree is the one the verifier
+    /// recomputes when a leaf's digest has a word at the top of the `u32`
+    /// range: the word reduced to 1, the leaf's decommitment verified
+    /// against the root.
+    #[test]
+    fn a_leaf_digest_word_at_the_top_reduces_as_the_verifier_does() {
+        const LOG_SIZE: u32 = 5;
+        const EDGE_ROW: usize = 19;
+        let columns: Vec<BaseColumn> = (0..EDGE_LEAF.len())
+            .map(|i| {
+                let values: Vec<M31> = (0..1u32 << LOG_SIZE)
+                    .map(|row| match row as usize {
+                        EDGE_ROW => M31::from_u32_unchecked(EDGE_LEAF[i]),
+                        _ => M31::from(row * 4 + i as u32),
+                    })
+                    .collect();
+                BaseColumn::from_cpu(&values)
+            })
+            .collect();
+        let tree = MerkleProverLifted::<SimdBackend, Blake2sM31MerkleHasher>::commit(
+            columns.iter().collect(),
+            LOG_SIZE,
+            0,
+        );
+        assert_eq!(
+            leaf::<Blake2sMerkleHasher>().0[16..20],
+            u32::MAX.to_le_bytes()
+        );
+        assert_eq!(
+            leaf::<Blake2sM31MerkleHasher>().0[16..20],
+            1u32.to_le_bytes()
+        );
+
+        let (values, decommitment) = tree.decommit(&[EDGE_ROW], columns.iter().collect());
+        assert!(words_below_p(&tree.root()));
+        MerkleVerifierLifted::<Blake2sM31MerkleHasher>::new(
+            tree.root(),
+            alloc::vec![LOG_SIZE; EDGE_LEAF.len()],
+            None,
+        )
+        .verify(&[EDGE_ROW], values, decommitment.decommitment)
+        .expect("the verifier recomputes the prover's root");
+    }
+
+    /// The SIMD prover hashes two children whose digest has a word at
+    /// `2^32 - 2` to the verifier's node, the word reduced to 0.
+    #[test]
+    fn a_node_digest_word_at_the_top_reduces_as_the_verifier_does() {
+        const EDGE_NODE: usize = 11;
+        let layer: Vec<Blake2sHash> = (0..64u32)
+            .map(|i| match i as usize {
+                i if i == 2 * EDGE_NODE => hash(&EDGE_CHILDREN[..8]),
+                i if i == 2 * EDGE_NODE + 1 => hash(&EDGE_CHILDREN[8..]),
+                _ => hash(&[i; 8]),
+            })
+            .collect();
+        let built =
+            <SimdBackend as MerkleOpsLifted<Blake2sM31MerkleHasher>>::build_next_layer(&layer);
+        let children = (hash(&EDGE_CHILDREN[..8]), hash(&EDGE_CHILDREN[8..]));
+        let raw = Blake2sMerkleHasher::hash_children(children);
+        assert_eq!(raw.0[..4], (u32::MAX - 1).to_le_bytes());
+        let node = Blake2sM31MerkleHasher::hash_children(children);
+        assert_eq!(node.0[..4], [0; 4]);
+        assert_eq!(built[EDGE_NODE], node);
+    }
+}
+
+#[cfg(test)]
+mod mix_tests {
     use super::*;
 
     /// Blake2s-M31 mixes a run's bytes four a word: the digest of the

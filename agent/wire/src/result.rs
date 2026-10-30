@@ -406,6 +406,22 @@ pub struct Attest {
 }
 
 impl Attest {
+    /// What it counts against a step's limit on attests
+    /// ([`crate::abi::cap::Limits::attests`]): one, and an attest at a
+    /// window's cut [`crate::abi::cap::AT_CUT`].
+    pub fn weight(&self) -> usize {
+        if self.window.is_some() {
+            crate::abi::cap::AT_CUT
+        } else {
+            1
+        }
+    }
+
+    /// The weight of `attests`, together ([`Attest::weight`]).
+    pub fn weighed(attests: &[Self]) -> usize {
+        attests.iter().map(Self::weight).sum()
+    }
+
     /// The digest that names this attest's record while its statement
     /// waits to be proved ([`crate::keys::attested`]): the BLAKE2b-256 of
     /// its encoding.

@@ -171,11 +171,13 @@ fn a_proof_too_long_is_refused_before_its_lookup() {
 }
 
 /// On the JAM-only host: each golden vector of `vos-anchor` decoded and its
-/// digests computed by the guest, the pinned bytes; a vector cut short
-/// refused.
+/// digests computed by the test guest, the pinned bytes; a vector cut short
+/// refused. The production guest, a venue's, has no such mode: it refuses
+/// the request as a bad payload, computing nothing.
 #[test]
 fn the_anchor_vectors_are_computed_on_the_jam_only_host_as_pinned() {
-    let (program, _) = jam::program();
+    let (production, _) = jam::program();
+    let (program, _) = jam::test_program();
     for golden in vectors::golden() {
         let vector = golden.vector.encode();
         let (gas, report) = jam::run_payload(&program, jam::anchors_request(&vector), None);
@@ -198,5 +200,9 @@ fn the_anchor_vectors_are_computed_on_the_jam_only_host_as_pinned() {
         let short = jam::anchors_request(&vector[..vector.len() - 1]);
         let (_, report) = jam::run_payload(&program, short, None);
         assert_eq!(report.verdict, jam::BAD_PAYLOAD, "{}", golden.name);
+
+        let (_, report) = jam::run_payload(&production, jam::anchors_request(&vector), None);
+        assert_eq!(report.verdict, jam::BAD_PAYLOAD, "{}", golden.name);
+        assert_eq!(report.digests, [0; 160], "{}", golden.name);
     }
 }

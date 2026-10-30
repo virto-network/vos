@@ -50,6 +50,25 @@ pub(crate) struct Attesting {
     pub(crate) deadline: u64,
 }
 
+impl From<Attesting> for WorkflowState {
+    fn from(attesting: Attesting) -> Self {
+        let Attesting {
+            counter,
+            window,
+            method,
+            arguments,
+            deadline,
+        } = attesting;
+        WorkflowState::Attesting {
+            counter,
+            window,
+            method,
+            arguments,
+            deadline,
+        }
+    }
+}
+
 impl Pause {
     /// The batch time its row in the due index lies at, in a batch at
     /// `time`: a preempted workflow's is the next millisecond's, so its row
@@ -84,22 +103,7 @@ impl Pause {
                 deadline,
             },
             Pause::Sleep { until } => WorkflowState::Sleeping { until },
-            Pause::Attesting(attesting) => {
-                let Attesting {
-                    counter,
-                    window,
-                    method,
-                    arguments,
-                    deadline,
-                } = *attesting;
-                WorkflowState::Attesting {
-                    counter,
-                    window,
-                    method,
-                    arguments,
-                    deadline,
-                }
-            }
+            Pause::Attesting(attesting) => (*attesting).into(),
             Pause::Preempted { .. } => WorkflowState::Preempted(input.to_vec()),
         }
     }

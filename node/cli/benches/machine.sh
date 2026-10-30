@@ -256,7 +256,7 @@ trap cleanup EXIT
 # --- The builds -----------------------------------------------------------------
 note "building (the first build installs the pinned toolchains and takes a while)"
 {
-  (cd agent/default && confined nice -n 10 cargo build --release --target ../../pvm/guest/riscv64em-vos.json)
+  (cd agent/programs && confined nice -n 10 cargo build --release -p vos-agent --target ../../pvm/guest/riscv64em-vos.json)
   (cd agent/test-actors && confined nice -n 10 cargo build --release --target ../../pvm/guest/riscv64em-vos.json)
   confined nice -n 10 cargo bench -p vos-cli --bench processes --no-run
   confined nice -n 10 cargo bench -p vos-node --bench acceptance --no-run

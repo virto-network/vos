@@ -137,6 +137,19 @@ impl ProgramId {
         }
         bytes
     }
+
+    /// A program id's eight words (each four little-endian bytes), read
+    /// from `reader`, a word at or past `p` refused.
+    pub fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        let mut words = [0u32; 8];
+        for word in &mut words {
+            *word = reader.u32()?;
+            if *word >= P {
+                return Err(DecodeError::Noncanonical);
+            }
+        }
+        Ok(Self(words))
+    }
 }
 
 /// A statement's id, what a venue remembers it by.
@@ -198,7 +211,7 @@ impl Statement {
 
     pub(crate) fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
         let format = reader.u32()?;
-        let program = decode_program(reader)?;
+        let program = ProgramId::decode_from(reader)?;
         let space = SpaceId(reader.array()?);
         let public_args = reader.bytes()?;
         let output = reader.bytes()?;
@@ -240,18 +253,6 @@ impl Statement {
             io_hash,
         ]))
     }
-}
-
-/// A program id's eight words, each below `p`.
-pub(crate) fn decode_program(reader: &mut Reader<'_>) -> Result<ProgramId, DecodeError> {
-    let mut words = [0u32; 8];
-    for word in &mut words {
-        *word = reader.u32()?;
-        if *word >= P {
-            return Err(DecodeError::Noncanonical);
-        }
-    }
-    Ok(ProgramId(words))
 }
 
 /// The M31 modulus.

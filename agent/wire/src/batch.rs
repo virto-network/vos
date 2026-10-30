@@ -11,6 +11,7 @@ use crate::ingress::Grant;
 use crate::keys::Due;
 use crate::records::Derivation;
 use crate::result::Outcome;
+use crate::served::AgentPath;
 
 /// A refine's work item payload: a batch through the log, a query on
 /// applied state, or a batch on JAM.
@@ -166,7 +167,7 @@ pub enum Input {
     Close {
         window: u64,
         rep_root: [u8; 32],
-        paths: Vec<(AgentId, [u8; 16], Vec<u8>)>,
+        paths: Vec<AgentPath>,
     },
     /// The statement `id` of one of the agent's attests at window
     /// `window`'s cut proved, its final proof the blob `proof` (its

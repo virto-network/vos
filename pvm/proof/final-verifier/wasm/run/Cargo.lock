@@ -2823,7 +2823,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 [[package]]
 name = "stwo"
 version = "2.2.0"
-source = "git+https://github.com/olanod/stwo?rev=4cd1f83ff4c090afcd3362e27e2d34eb634a0161#4cd1f83ff4c090afcd3362e27e2d34eb634a0161"
+source = "git+https://github.com/olanod/stwo?rev=9e9b4ff61abb319489be745b729880d8ac8177a4#9e9b4ff61abb319489be745b729880d8ac8177a4"
 dependencies = [
  "blake2",
  "blake3",
@@ -2848,7 +2848,7 @@ dependencies = [
 [[package]]
 name = "stwo-constraint-framework"
 version = "2.2.0"
-source = "git+https://github.com/olanod/stwo?rev=4cd1f83ff4c090afcd3362e27e2d34eb634a0161#4cd1f83ff4c090afcd3362e27e2d34eb634a0161"
+source = "git+https://github.com/olanod/stwo?rev=9e9b4ff61abb319489be745b729880d8ac8177a4#9e9b4ff61abb319489be745b729880d8ac8177a4"
 dependencies = [
  "hashbrown 0.15.5",
  "itertools 0.12.1",

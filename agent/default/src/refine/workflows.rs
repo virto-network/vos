@@ -182,10 +182,7 @@ pub(crate) fn is_start(base: &Base, instance: InstanceId, method: MethodId) -> b
 fn count(base: &Base, key: &[u8]) -> u64 {
     match base.read(key) {
         Ok(None) => 0,
-        Ok(Some(bytes)) => match u64::decode(&bytes) {
-            Ok((count, _)) => count,
-            Err(_) => lost("a workflows' count"),
-        },
+        Ok(Some(bytes)) => u64::decode_exact(&bytes).unwrap_or_else(|| lost("a workflows' count")),
         Err(_) => lost("a workflows' count"),
     }
 }

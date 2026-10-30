@@ -43,6 +43,22 @@ pub fn compact(out: &mut Vec<u8>, value: u64) {
     }
 }
 
+/// A flag's byte: 0 or 1.
+pub fn flag(out: &mut Vec<u8>, value: bool) {
+    out.push(u8::from(value));
+}
+
+/// An `Option<u64>`: 0, or 1 then the value (8, little-endian).
+pub fn option_u64(out: &mut Vec<u8>, value: Option<u64>) {
+    match value {
+        None => out.push(0),
+        Some(value) => {
+            out.push(1);
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+}
+
 /// Bytes read in order, each read refusing what the input does not hold.
 pub struct Reader<'a> {
     bytes: &'a [u8],
@@ -90,6 +106,24 @@ impl<'a> Reader<'a> {
     /// A little-endian `u64`.
     pub fn u64(&mut self) -> Result<u64, DecodeError> {
         Ok(u64::from_le_bytes(self.array()?))
+    }
+
+    /// A flag: 0 or 1, any other byte refused.
+    pub fn flag(&mut self) -> Result<bool, DecodeError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(DecodeError::Noncanonical),
+        }
+    }
+
+    /// An `Option<u64>` ([`option_u64`]), its flag 0 or 1.
+    pub fn option_u64(&mut self) -> Result<Option<u64>, DecodeError> {
+        Ok(if self.flag()? {
+            Some(self.u64()?)
+        } else {
+            None
+        })
     }
 
     /// A compact, in its shortest mode.
@@ -209,6 +243,26 @@ mod tests {
                 "{bytes:02x?}"
             );
         }
+    }
+
+    /// A flag and an option decode from their encodings; a flag's byte past
+    /// 1 is refused.
+    #[test]
+    fn flags_and_options_are_canonical() {
+        for value in [None, Some(0), Some(u64::MAX)] {
+            let mut out = Vec::new();
+            option_u64(&mut out, value);
+            flag(&mut out, value.is_some());
+            let mut reader = Reader::new(&out);
+            assert_eq!(reader.option_u64(), Ok(value));
+            assert_eq!(reader.flag(), Ok(value.is_some()));
+            reader.finish().unwrap();
+        }
+        assert_eq!(Reader::new(&[2]).flag(), Err(DecodeError::Noncanonical));
+        assert_eq!(
+            Reader::new(&[2, 0]).option_u64(),
+            Err(DecodeError::Noncanonical)
+        );
     }
 
     /// A count the input cannot hold is refused before anything is read.

@@ -42,7 +42,7 @@ use vos_wire::keys;
 use vos_wire::records::{PendingRead, unstored};
 use vos_wire::result::Write;
 use vos_wire::served::{
-    Closing, representative_ask_entry, representative_asks_of, representative_row,
+    AgentPath, Closing, representative_ask_entry, representative_asks_of, representative_row,
 };
 use vos_wire::vos_anchor::{MAX_ROOT_AGE_MS, RootKind, space_root};
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, scale};
@@ -419,7 +419,11 @@ fn closing(
             continue;
         };
         let path = BatchProof::generate(tree, &[row])?.encode();
-        paths.push((of, leaf.salt, path));
+        paths.push(AgentPath {
+            agent: of,
+            salt: leaf.salt,
+            path,
+        });
     }
     Ok(Closing { root, paths })
 }

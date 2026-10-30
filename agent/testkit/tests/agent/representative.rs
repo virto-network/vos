@@ -63,7 +63,7 @@ fn representative() -> (Node, Testkit) {
 /// A report of `root` at `window`, as an agent's report step sends it.
 fn report_body(window: u64, root: [u8; 32]) -> Body {
     Body::Report(AgentRoot {
-        kind: RootKind::Space as u8,
+        kind: RootKind::Space,
         window,
         root,
     })
@@ -200,7 +200,7 @@ fn no_call_writes_a_report(node: &mut Node, a: AgentId) {
     let before = committed(node);
     let method = MethodId(derive_id("vos/method/", "report"));
     let arguments = AgentRoot {
-        kind: 0,
+        kind: RootKind::Space,
         window: 9,
         root: [9; 32],
     }

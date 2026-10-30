@@ -85,7 +85,8 @@ pub const REGISTER_DOMAIN: &[u8] = b"vos/space/register";
 /// A JAM venue's id's domain.
 pub const JAM_VENUE_DOMAIN: &[u8] = b"vos/venue/jam";
 
-/// The genesis's version, the one [`SpaceGenesis::decode`] reads.
+/// The genesis's version, the one its encoding writes and
+/// [`SpaceGenesis::decode`] reads.
 pub const GENESIS_VERSION: u8 = 1;
 
 /// The shortest window a venue registers, two minutes.
@@ -192,9 +193,6 @@ impl WindowClock {
 /// A space's founding record: its id is its hash ([`space_id`]).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SpaceGenesis {
-    /// [`GENESIS_VERSION`], the one its encoding writes whatever this
-    /// holds.
-    pub version: u8,
     /// The founding nodes' numbers and ed25519 keys, by ascending number:
     /// the space's first anchor keys. A venue registers 1 to
     /// [`MAX_FOUNDING_KEYS`].
@@ -243,8 +241,7 @@ impl SpaceGenesis {
 
     /// A genesis of version [`GENESIS_VERSION`], read from `reader`.
     pub fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        let version = reader.u8()?;
-        if version != GENESIS_VERSION {
+        if reader.u8()? != GENESIS_VERSION {
             return Err(DecodeError::Noncanonical);
         }
         let count = reader.count(1 + 32)?;
@@ -255,7 +252,6 @@ impl SpaceGenesis {
             return Err(DecodeError::Noncanonical);
         }
         Ok(Self {
-            version,
             nodes,
             clock: WindowClock::decode_from(reader)?,
             time: reader.u64()?,
@@ -317,7 +313,7 @@ impl RootKind {
 
     /// A kind, read from `reader`, an unknown byte refused.
     pub fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        Self::from_u8(reader.u8()?).ok_or(DecodeError::Noncanonical)
+        reader.u8()?.try_into()
     }
 }
 
@@ -436,16 +432,21 @@ impl Anchor {
     /// The anchor `bytes` encode, all of them, an unknown kind refused.
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
         let mut reader = Reader::new(bytes);
-        let anchor = Self {
+        let anchor = Self::decode_from(&mut reader)?;
+        reader.finish()?;
+        Ok(anchor)
+    }
+
+    /// An anchor, read from `reader`, an unknown kind refused.
+    pub fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
+        Ok(Self {
             space: SpaceId(reader.array()?),
             window: reader.u64()?,
-            kind: RootKind::decode_from(&mut reader)?,
+            kind: RootKind::decode_from(reader)?,
             root: reader.array()?,
             signer: reader.array()?,
             signature: reader.array()?,
-        };
-        reader.finish()?;
-        Ok(anchor)
+        })
     }
 }
 

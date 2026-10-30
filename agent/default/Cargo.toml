@@ -1,12 +1,11 @@
 # The default agent program, built for the PVM with the guest toolchain:
 # `just build-agent`.
-[workspace]
-
 [package]
 name = "vos-agent"
 version = "0.1.0"
 edition = "2024"
 publish = false
+workspace = "../programs"
 
 [lib]
 name = "vos_agent"
@@ -27,9 +26,3 @@ vos-pvm-precompiles = { path = "../../pvm/proof/precompiles" }
 vos-sdk = { path = "../sdk" }
 vos-tree = { path = "../tree" }
 vos-wire = { path = "../wire" }
-
-[profile.release]
-opt-level = 3
-lto = true
-panic = "abort"
-codegen-units = 1

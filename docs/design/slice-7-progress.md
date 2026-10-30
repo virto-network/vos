@@ -3780,3 +3780,239 @@ in the agent crates `vos-checker`'s
 beside it; untouched here) and passed 3 of 3 alone; the agent crates
 rerun with `--no-fail-fast`, 699 passed in 53 suites, and `test-reads`
 green. `just test-proof` green, 579 passed in 50 suites.
+
+## Step 7.8b: the agent-side items and `blobs.lock`
+
+Branch `s7/7.8b`, from vos-core `4a143e9f`: slice 6's carried items
+outside `pvm/proof`'s chips (the plan's split, `slice-7-mobile.md` §7.8b;
+the items `research/slice-6/quality-review.md`'s), in one commit with the
+review's fixes after it, and the lock of every guest blob (L2).
+
+| item | what |
+|---|---|
+| 3 | the service's `RegisterCode`, `AnchorCode` and `ControlCode` declared by one `codes!` macro, each with its `TryFrom<u32>` (the code back when it names none); jam-dev's `anchor_code` gone, `register_code` a `match` on the `TryFrom` |
+| 4, guest half | nothing left: 7.1's `vos_anchor::venue::{expiry, fresh, aged, seen_expiry}` are the root-expiry and `seen_expiry_of` the item asked for, and `check-venue-rules` keeps the rule there |
+| 17–19 | no `vos-anchor` or service piece: all three were recair's and the final verifier's, landed at 7.8a |
+| 20, the service's piece | `#[repr(u8)]` tags: the verdict's private `Tag` (its order is not `item::Kind`'s, now said where it is defined), the control's `OpTag`, the storage's `keys::Prefix` (`CURSOR` and `GAS` keys of it); the bytes unchanged |
+| 21 | `codec::{flag, option_u64}` and `Reader::{flag, option_u64}` in `vos-anchor`, used by the service's `SpaceRecord`; `ProgramId::decode_from` public in `vos-statement` (its `decode_program` gone), used by the service's `Config::decode`. The flag and pin codecs the item also named went with 7.1's rootless and `venue_bound` removals |
+| 22 | the service's handlers return their code enums, cast once in `apply`; `From<AnchorRefusal> for AnchorCode` and `From<RegisterRefusal> for RegisterCode` (refine's `register_code` gone); `Outcome.kind: Option<Kind>`, its byte `u8::MAX` for none as before (`Kind::{encode_option, decode_option}`, shared with the verdict's refusal) |
+| 23 | the guests' runtime (`src/bin/guest/runtime.rs`) holds the `entries!` macro (the `_start` trampolines, the same instructions, so refine stays at instruction 0 and the service's accumulate at 5), `Output`, the host calls as `Call` and `fetch`'s kinds as `FetchKind` (`#[repr(u64)]`), and `NONE`. The `vos-pvm-guest-rt` crate the item named for later, which would drop the service's dummy `heap-peak` feature, is not made |
+| 24, the service's piece | refine split into `refine_register`, `refine_anchor`, `refine_control`; an accepted statement's id is the one `admit` computed, hashed again only for a refusal's outcome; `fetch_exact`, the one read `fetch` and the proof share |
+| 25 | `Anchor::decode_from` (the service reads its item through it, no byte count of its own); `keys::anchor` and `keys::evidence` one `at_window`; `Evidence::decode` splits at `AnchorRecord::BYTES`; `RootKind::decode_from` through its `TryFrom`. Left: `pvm/codec/src/anchor.rs`'s offsets (Low in the review; the codec reaches the kernels) |
+| 26 | `SpaceGenesis::version` dropped; the encoding writes `GENESIS_VERSION` as before, byte for byte; the anchor vectors unchanged |
+| 27 | `final-verify.elf` has no `Anchors` mode: a mode byte 2 is a bad payload there, its digests zeros (`the_anchor_vectors_are_computed_on_the_jam_only_host_as_pinned` checks both programs); `final-verify-test.elf` computes the vectors. `vos-statement`'s `test-formats` enables `vos-anchor/vectors`, `pvm-guest` no longer does |
+| 28 | the service's `natural` and `Operand::decode_input` gone: refine's arguments are `vos_wire::jam::RefineArgs::decode`, accumulate's `vos_pvm_program::read_nat`, its inputs `vos_wire::jam::AccumulateInput::decode`, and the operand `vos_wire`'s. Stricter: canonical naturals only; refine's arguments whole, the package's hash after the payload and nothing past it; an input in its exact layout, its work error one of the six Gray Paper 0.8.0 codes |
+| 33 | `vos_pvm::refine_host::FetchKind`, Gray Paper 0.8.0's sixteen kinds: the JAM-only host's prices and its serving, and the accumulate host's `FETCH_INPUT(S)`, all through it |
+| 64 | `Attest::weight` and `Attest::weighed` in `vos-wire`; the default agent's `attests_counted` and the testkit's `counted` gone, with the save and restore of them around a failed call |
+| 65 | `Base::decoded`, exact, for `admin`'s and `closes`' row readers; exact decodes of the space and clock rows read through the step, a pending read, the served rows, a kernel's return, an installed record and a workflows' count. Left: the workflow record (`Workflow::decode`, versioned by its `format`), and `vos-sdk`'s `served`, exact already and in every kernel |
+| 66 | the cut and close rows split into `keys/cuts.rs`; `window_of` for the five window-only parsers; `request_id` and `request_of`, the `RequestId` layout once. Of the test-only API the review named, `is_replicated` has a production user now (the checker), `closed_prefix` the reads' tests, and `moved` is gone |
+| 67 | `AgentRoot.kind: RootKind`; `AgentPath` for the `(agent, salt, path)` tuple; `vos_tree`'s `EntryTag` enum for the `Entry` tag constants; `From<Attesting> for WorkflowState`. SCALE bytes unchanged |
+| 69 | one guest workspace, `agent/programs` (the lockfile, the toolchain, the target configuration and the release profile), for the default agent, the representative and the credential actor, each built alone (`_build-program`) and its ELF under `agent/programs/target`; the window actor's forward-looking sentence and two unreflowed doc paragraphs fixed (`inputs.rs`'s was already) |
+| L2 | `blobs.lock` (below) |
+
+**`blobs.lock`:** the SHA-256 of 30 guest blobs, each ELF with its symbols
+and relocations stripped (the toolchain's own `rust-objcopy`), written by
+`just blobs-lock` and checked by `just check-blobs` at the end of
+`check-no-std`: `final-verify.elf`, `final-verify-test.elf`,
+`statement-service.elf`, the representative, the credential actor and the
+25 test actors (the bins their workspace declares, so an ELF another
+branch left in the target is not one). A set `CARGO_TARGET_DIR` is
+refused, and a blob that cannot be hashed fails the check.
+- **The venue guests** are built by `_venue-guest` with
+  `--remap-path-prefix` for the checkout's root, `CARGO_HOME` and the
+  toolchain's sysroot: before, `final-verify.elf` and
+  `statement-service.elf` carried this machine's `$HOME` in 39–41 panic
+  locations, so their bytes depended on the checkout and the machine.
+- **Why stripped** [measured, a clone at another path built from clean]:
+  cargo's `-C metadata` hashes a path dependency by its path relative to
+  the workspace's root when it lies under it, else by its absolute path.
+  The venue guests' workspace (the repository's) holds all their sources;
+  the out-of-tree workspaces (`agent/test-actors`, `agent/programs`, the
+  Wasm blob's) depend on `agent/sdk`, `agent/wire` and `pvm/…` outside
+  their roots, so their symbol names hash the checkout's path. For the test
+  actors, the representative and the credential actor only the symbol
+  table differs (stripped, all 27 equal); the kernels' program ids, which
+  read the code, never moved.
+- **Left out, the code itself differing between checkouts:** the default
+  agent's `.text` (`vos-agent.elf`; its `.rodata`, `.data` and schema
+  equal) and both Wasm blobs (48,515 bytes differ, from the function
+  table on), the items' order following the symbols' hashes. So the
+  default agent's program hash depends on the checkout's path today. The
+  levers, for the owner: build those workspaces from a fixed path, or
+  bring their crates under one workspace root with their dependencies (the
+  repository's), which the toolchain and the profiles now keep apart.
+
+**What moved:**
+- Every guest blob: the venue guests and
+  the Wasm blobs with the runtime, the anchor and the statement changes and
+  the remap; the agent programs with the wire and the workspace; the test
+  actors' ELFs in their symbol tables (the wire's moved and new items),
+  their code unchanged.
+- No pinned value: `kernel constants::` passes as at `4a143e9f`
+  (`WINDOW_PROGRAM`, `BALANCE_PROGRAM`, `PREDICATE_PROGRAM`, the derive pins).
+- Behaviour, each deliberate: the service refuses non-canonical naturals
+  and inexact arguments and inputs (item 28): a work error past 6 now drops
+  its input, where the old decode recorded `FAILED + code`; no Gray Paper
+  0.8.0 node gives one. A `Report` body of a root kind other than `Space`
+  no longer decodes, where it decoded and was ignored; only the agent's own
+  close step makes one. Rows with trailing bytes are corrupt where item 65
+  reads them.
+
+**The teammate's third drop:** the vendored `vos-anchor` (`SpaceGenesis`
+without `version`, its encoding unchanged; `Anchor::decode_from`; the
+codec's flag and option pieces) and `vos-statement` (`ProgramId::decode_from`;
+the guest's `Anchors` mode in the test program alone; `test-formats`
+enabling the vectors). The pallet's only code change: a `SpaceGenesis`
+built without the field. The conformance vectors and the fixtures are
+unchanged, and no pinned program id moved. `blobs.lock` is VOS's own: no
+blob ships in the kit. `teammate-note.md`'s drop line says so.
+
+### The review's fixes
+
+One Opus review of the commit, no High; folded:
+- **M1:** `check-blobs` hashed every ELF in the test actors' target, so one
+  another branch left failed the check: the actors are now the bins
+  `cargo metadata` lists; a set `CARGO_TARGET_DIR` is refused.
+- **M2:** right: built from clean in a clone at another path, every blob
+  but the venue guests differed. The lock hashes the ELFs stripped and
+  leaves out the default agent and the Wasm blobs (above); the clone's
+  clean build then checks it, 30 of 30.
+- **L5:** the `_forbidden` rows read `agent/programs`'s whole workspace,
+  the representative and the credential actor with the agent.
+- **L6:** the installed record and the workflows' count decoded exactly.
+- **L7:** the guest's doc says the mode is `test-formats`'s.
+- **Nits:** `hostcall!`'s `($id) as u64`; `request_of` by `as_chunks`; a
+  doc paragraph reflowed.
+- Left: the six byte-to-enum tables as they are (each its crate's, two of
+  them the guest's and the host's `FetchKind`); the `AgentPath`
+  destructuring, whose renames are `Body::Closed`'s fields; refine's copy
+  of the payload (`RefineArgs` owns it), a few hundred gas; L3 and L4,
+  recorded above.
+
+**Left:**
+- **The owner's call, pending:** the default agent's and the final
+  verifier's Wasm blobs' code depends on the checkout's path (above), so
+  they are outside `blobs.lock`, and the default agent's program hash
+  differs between checkouts. The levers: build those workspaces from a
+  fixed path, or bring their crates under one workspace root with their
+  dependencies.
+- **Trim-paths, tried** [measured, branch `s7/repro-blobs`; two clean
+  worktrees at paths of different lengths, each its own targets]: built
+  as the recipes build them, the three differ raw and stripped, and no
+  path is among their strings. What differs is order alone: the crate
+  hashes in the symbol names (`vos_wire`, `vos_tree`, `vos_agent` itself,
+  each outside `agent/programs`; `core` and `alloc` equal) order the items
+  rustc sorts by symbol name, so four `drop_in_place` glues in the
+  agent's `.text` trade places (2,489 bytes; every function's size, the
+  other sections and the headers equal; no build id) and the Wasm blobs'
+  functions likewise. Trim-paths (`-Ztrim-paths` with the profile's
+  `trim-paths = "all"`), alone or with the venue guests' remap
+  (checkout root, `$CARGO_HOME`), changes every crate hash (the profile
+  is hashed) but not that they differ: the three still differ. It cannot
+  fix it: cargo hashes a path dependency outside the workspace's root by
+  its absolute path, whatever rustc's flags. Neither can a `-Cmetadata`
+  in the flags (rustc joins every `-Cmetadata` with cargo's, it replaces
+  none) nor `__CARGO_DEFAULT_LIB_METADATA` (one more seed beside the
+  path: the agent still differs). Built through one fixed path instead
+  (a symlink to each checkout, `--manifest-path` through it), the three
+  are byte-identical, raw and stripped. So both levers fix it: a fixed
+  build path, measured; one workspace root holding the crates and their
+  dependencies, as the venue guests already reproduce unstripped. A
+  fixed path shared by checkouts needs a lock against two building at
+  once.
+- `pvm/codec/src/anchor.rs`'s hand-computed offsets (item 25, Low; the
+  codec reaches the kernels).
+- The `vos-pvm-guest-rt` crate item 23 named for later, which would drop
+  the statement service's dummy `heap-peak` feature.
+- The workflow record's loose decode (item 65), versioned by its `format`.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, another agent's
+credential stress beside it]:
+- **`just check`:** green at `dae8b822` (exit 0, 1,640 passed in 125
+  suites): `check-blobs` among it (30 blobs), the conformance vectors'
+  generator (`the_vectors_are_the_generators`, the vectors unchanged) and
+  `check-kit`.
+- **The fixtures:** `fixtures::the_fixtures_are_the_generators` alone,
+  green (243 s): the fixtures unchanged.
+- **`kernel constants::`:** green; no pinned program id moved.
+- **`blobs.lock` reproduced:** `just check-blobs` in a clone at another
+  path, built from clean: 30 of 30.
+
+## The honest credential proof refused
+
+Branch `s7/completeness`, from vos-core `7b78d9af`. 7.11's left item: one
+honest format-42 proof in about 30,000 refused by the verifier.
+
+**The cause** [measured]: the Stwo fork's SIMD `reduce_to_m31_simd`, which
+reduces each word of a Blake2s-M31 leaf's or node's digest below p,
+computed `M31::reduce`'s formula in 32-bit lanes, where
+`v + (v >> 31) + 1` wraps for `v ≥ 2^32 − 2`: the prover's tree held
+p − 1 and p where the verifier, reducing in 64 bits, recomputes 0 and 1.
+A node with such a word on a queried path, about one word in 2^31, made
+the recomputed root differ (`RootMismatch`). The kept proof's refusal is
+this: its FRI layer 7 decommits a leaf of 4 M31s
+(`0x52080a2a 0x5368d2ec 0x1b80dd5a 0x2826d36f`) whose digest's word 4 is
+`0xffffffff`, and a verifier made to reduce as the SIMD prover did accepts
+it. Not a race, not the masks' randomness, not FRI's folding: the seeded
+build refuses the same seed every time.
+
+**The fix:** the fork's `vos/simd-m31-reduce` (`9e9b4ff6`, on
+`vos/grind-chunks`' `4cd1f83f`; not pushed) folds `v = hi·2^31 + lo` to
+`lo + hi ≤ p + 1` and subtracts p once, canonical over the whole `u32`
+range, with tests of the edges, windows of 2^16 values against
+`M31::reduce`, and a leaf and a node whose raw digests reach `2^32 − 1`
+and `2^32 − 2` built alike on the SIMD and CPU backends. The workspace,
+the kit's, the Wasm blob's and runner's locks and the fuzz crate pin it.
+VOS's own tests: `pcs::tests` (a SIMD-committed tree holding the leaf
+verified by the CPU Merkle verifier; a SIMD node at the `2^32 − 2` word),
+both refused on `4cd1f83f`; `credential/prove::a_digest_word_at_the_top_of_the_u32_range_verifies`
+(seed 4033's auth proof, `RootMismatch` on `4cd1f83f`); and the
+`credential_stress` example, which proves and verifies seeded statements
+in volume and prints each failing seed.
+
+**Before and after** [measured; `credential_stress`, 6 threads, `nice`,
+other agents' runs on the machine]:
+
+| pin | format | proofs (owner + auth) | refused |
+|---|---|---|---|
+| `4cd1f83f` | 42 | 60,000 (seeds 0–29,999) | 2 (auth 4033: trace tree; auth 25464: FRI layer 7) |
+| `9e9b4ff6` | 42 | 180,000 (seeds 0–89,999, 4033 and 25464 among them) | 0 |
+| `9e9b4ff6` | 44 | 20,000 (seeds 0–9,999) | 0 |
+
+At the rate before the fix, 180,000 proofs would have held about six
+refusals; none at 3× the volume that found two bounds the rate after it
+below about one in 60,000 at 95% (`3 / 180,000`); the reduction, now
+exact, leaves none.
+
+**Other formats:** only the Blake2s-M31 stack reduces a digest: formats
+42 and 44 and the device format 37 (registered, refused until its AIR and
+channel exist; the device library's prover would have hit it on any
+target, SIMD lanes being portable). Blake2s without the reduction (the
+small test formats), Poseidon2-M31 (32, 35) and Blake2b-256 (28, 39) never
+call it; the PoW grind reduces with `PackedM31::reduce_simd`, correct over
+`u32`. The pinned credential roots and program ids are unchanged
+(`prove::the_pinned_programs_are_the_circuits`).
+
+**Left:** pushing `vos/simd-m31-reduce` before this pin reaches a shared
+branch; Kreivo re-vendors the kit's lock after. The device spike
+(`spikes/s7-device/harness`, at `c3ec9813`, its lock already behind the
+workspace) needs the pin before a phone run of format 37. A committed
+column lane equal to p (which `PackedM31` can hold: `-0`) would mismatch
+the same way at a leaf; VOS's salts and FFTs never produce one, so it is
+latent, noted for the fork.
+
+**Review:** one Opus review: the reduction correct for every input and on
+every `min` branch; no other prover/verifier reduction mismatch in the fork
+or VOS. Folded: the fork's tests assert the raw digest words, a windowed
+sweep; `pcs`'s comments timeless and raw words asserted; the harness's
+refusals counted apart from failures to prove, 44's roots computed once,
+its usage.
+
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, other agents'
+runs on the machine]: the fork's `stwo` lib tests (306, `prover,parallel`)
+and clippy; `just check` green at `87232c17` (exit 0, 1,630 passed in 122
+suites); `just test-proof` green at `87232c17` (exit 0, 581 passed in 50
+suites, `pcs::tests` among them); `just check` again with this record.
+
+**Commits:** the fork's `9e9b4ff6` (`vos/simd-m31-reduce`); `87232c17` the
+pin, the tests and the harness; this record.

@@ -67,7 +67,7 @@ impl Service {
         let operand = Operand {
             package_hash,
             payload_hash,
-            result: Ok(output),
+            ..Operand::new(output)
         };
         let at = Config {
             genesis_ms: self.now,

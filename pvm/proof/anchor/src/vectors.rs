@@ -138,7 +138,6 @@ pub fn golden() -> Vec<Golden> {
             name: "one founder, window 0",
             vector: Vector {
                 genesis: SpaceGenesis {
-                    version: 1,
                     nodes: alloc::vec![(1, [0x11; 32])],
                     clock: WindowClock {
                         origin_ms: 1_700_000_000_000,
@@ -166,7 +165,6 @@ pub fn golden() -> Vec<Golden> {
             name: "three founders",
             vector: Vector {
                 genesis: SpaceGenesis {
-                    version: 1,
                     nodes: alloc::vec![
                         (1, counting(0x10)),
                         (2, counting(0x30)),
@@ -198,7 +196,6 @@ pub fn golden() -> Vec<Golden> {
             name: "every integer at its top",
             vector: Vector {
                 genesis: SpaceGenesis {
-                    version: 1,
                     nodes: (0..64).map(|n| (n, [n; 32])).collect(),
                     clock: WindowClock {
                         origin_ms: u64::MAX,

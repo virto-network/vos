@@ -47,8 +47,12 @@ the pause, `on_idle`, the storage keys of the items that stay.
 **Drops to expect:** v2 and the vectors at VOS's 7.1; at 7.8a the kit's
 fixtures, the vectors' wrap hashes and lengths, and the vendored
 `vos-pvm-recair-air` and `vos-pvm-final-verifier` sources (no pinned
-program id moves); the kit's `vos-anchor` and
-statement pieces and the blob hashes at 7.8b; the fixtures and program ids
+program id moves); at 7.8b the kit's `vos-anchor` and
+`vos-statement` sources (`SpaceGenesis` without its `version` field, its
+encoding unchanged; `Anchor::decode_from`; the codec's flag and option
+pieces; `ProgramId::decode_from`; the test program alone computing the
+anchor vectors), the vectors and fixtures unchanged and no pinned program
+id moved; the fixtures and program ids
 once more at the slice's end (7.21), if VOS's node segment format changes
 (no change to the pallet's code, only the vendored tree and the pinned
 ids).

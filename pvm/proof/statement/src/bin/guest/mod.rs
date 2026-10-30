@@ -5,58 +5,52 @@
 mod runtime;
 
 use alloc::vec::Vec;
-use core::arch::global_asm;
 use core::cell::UnsafeCell;
 use core::fmt::Write;
 
-use runtime::{Cursor, HEAP, STACK_BYTES, Static, gas_left};
+use runtime::{Call, Cursor, FetchKind, HEAP, NONE, Output, STACK_BYTES, Static, gas_left};
 use vos_pvm_final_verifier::PUBLIC_WORDS;
 use vos_statement::model::Input;
+#[cfg(feature = "test-formats")]
 use vos_statement::vos_anchor::vectors::{Digests, Vector};
 use vos_statement::{Refusal, StatementId};
 
-global_asm!(
-    ".global _start",
-    ".type _start, @function",
-    "_start:",
-    "mv s0, ra",
-    "lla t0, VERIFY_STACK",
-    "li t1, {size}",
-    "add sp, t0, t1",
-    "jal ra, verify_main",
-    "mv ra, s0",
-    "ret",
-    size = const STACK_BYTES,
-);
-
-// ── Host calls ───────────────────────────────────────────────────────────
-
-const FETCH: u64 = 2;
-const HISTORICAL_LOOKUP: u64 = 7;
-const FETCH_PAYLOAD: u64 = 13;
-const NONE: u64 = u64::MAX;
+entries!("_start" => "verify_main");
 
 // ── The verify ──────────────────────────────────────────────────────────
 
 /// The payload's buffer: a judgement's input holds the statement.
 const PAYLOAD_MAX: usize = 16 << 10;
 
-/// The payload's modes, its first byte.
+/// The payload's modes, its first byte. `Anchors`, the harness's golden
+/// vectors computed with no proof read, is the test program's alone: the
+/// production program, a venue's, accepts nothing without a proof.
 #[derive(Clone, Copy)]
 #[repr(u8)]
 enum Mode {
     Words = 0,
     Judge = 1,
+    #[cfg(feature = "test-formats")]
     Anchors = 2,
 }
 
 impl Mode {
-    const ALL: [Self; 3] = [Self::Words, Self::Judge, Self::Anchors];
-
     fn of(byte: u8) -> Option<Self> {
-        Self::ALL.into_iter().find(|&mode| mode as u8 == byte)
+        Some(match byte {
+            0 => Self::Words,
+            1 => Self::Judge,
+            #[cfg(feature = "test-formats")]
+            2 => Self::Anchors,
+            _ => return None,
+        })
     }
 }
+
+/// A golden vector's digests' bytes in the report, zeros but in the test
+/// program's `Anchors` mode.
+const DIGESTS_BYTES: usize = 5 * 32;
+#[cfg(feature = "test-formats")]
+const _: () = assert!(DIGESTS_BYTES == Digests::BYTES);
 
 /// The program's verdicts, `Report::verdict`.
 #[derive(Clone, Copy)]
@@ -91,7 +85,7 @@ pub struct Report {
     /// An accepted statement's id.
     id: [u8; 32],
     /// A golden vector's digests.
-    digests: [u8; Digests::BYTES],
+    digests: [u8; DIGESTS_BYTES],
 }
 
 impl Report {
@@ -110,7 +104,7 @@ impl Report {
             error: [0; 192],
             code: u64::MAX,
             id: [0; 32],
-            digests: [0; Digests::BYTES],
+            digests: [0; DIGESTS_BYTES],
         }
     }
 
@@ -136,12 +130,6 @@ impl Report {
         self.error_len = cursor.len as u64;
         Verdict::Reject
     }
-}
-
-#[repr(C)]
-pub struct Output {
-    address: u64,
-    len: u64,
 }
 
 #[unsafe(no_mangle)]
@@ -186,6 +174,7 @@ fn request(mode: Mode, body: &[u8]) -> Option<(Request<Input>, [u8; 32], usize)>
             let (input, used) = Input::decode_prefix(body).ok()?;
             (Request::Judge(input), body.get(used..)?)
         }
+        #[cfg(feature = "test-formats")]
         Mode::Anchors => return None,
     };
     let [hash @ .., l0, l1, l2, l3] = <[u8; 36]>::try_from(rest).ok()?;
@@ -193,6 +182,7 @@ fn request(mode: Mode, body: &[u8]) -> Option<(Request<Input>, [u8; 32], usize)>
 }
 
 /// A golden vector's digests, computed: no proof is read.
+#[cfg(feature = "test-formats")]
 fn vectors(report: &mut Report, vector: &[u8]) -> Verdict {
     match Vector::decode(vector) {
         Ok(vector) => {
@@ -211,7 +201,7 @@ fn vectors(report: &mut Report, vector: &[u8]) -> Verdict {
 fn lookup_proof(hash: &[u8; 32], proof_len: usize) -> Option<Vec<u8>> {
     let mut bytes: Vec<u8> = Vec::with_capacity(proof_len);
     let found = hostcall!(
-        HISTORICAL_LOOKUP,
+        Call::HistoricalLookup,
         [
             NONE,
             hash.as_ptr() as u64,
@@ -233,12 +223,12 @@ fn verify(report: &mut Report) -> Verdict {
     // SAFETY: single-threaded; nothing else borrows the payload buffer.
     let payload = unsafe { &mut *PAYLOAD.0.get() };
     let len = hostcall!(
-        FETCH,
+        Call::Fetch,
         [
             payload.as_mut_ptr() as u64,
             0,
             payload.len() as u64,
-            FETCH_PAYLOAD,
+            FetchKind::Payload as u64,
             0,
             0
         ]
@@ -252,6 +242,7 @@ fn verify(report: &mut Report) -> Verdict {
     else {
         return Verdict::BadPayload;
     };
+    #[cfg(feature = "test-formats")]
     if let Mode::Anchors = mode {
         return vectors(report, body);
     }

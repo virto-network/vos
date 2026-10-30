@@ -5,7 +5,7 @@ mod lookup;
 mod machines;
 mod state;
 
-pub use jam::{JamItem, JamRefine, JamRun, MAX_EXPORTS, Preimages, SEGMENT, jam_gas};
+pub use jam::{FetchKind, JamItem, JamRefine, JamRun, MAX_EXPORTS, Preimages, SEGMENT, jam_gas};
 pub use lookup::{LOOKUP_GAS, serve_lookup};
 #[cfg(feature = "std")]
 pub use machines::ProgramSource;

@@ -27,6 +27,16 @@ pub const UNDECODABLE: u64 = 4;
 
 const SERVICE: u64 = 7;
 
+/// A request's mode, its first byte.
+#[derive(Clone, Copy)]
+#[repr(u8)]
+enum Mode {
+    Words = 0,
+    Judge = 1,
+    /// The test guest's alone.
+    Anchors = 2,
+}
+
 /// What the guest reports: its verdict, the gas left at its start, after
 /// the proof's lookup, after its decode and at its end; the proof's
 /// length; its heap's peak, high-water mark and allocations; a refusal's
@@ -78,7 +88,7 @@ pub fn guest(name: &str) -> (Vec<u8>, usize) {
 
 /// A request to verify a proof of `format` against `words`.
 pub fn words_request(format: u32, words: &[u32; PUBLIC_WORDS]) -> Vec<u8> {
-    let mut request = vec![0];
+    let mut request = vec![Mode::Words as u8];
     request.extend(format.to_le_bytes());
     request.extend(words.iter().flat_map(|word| word.to_le_bytes()));
     request
@@ -86,12 +96,12 @@ pub fn words_request(format: u32, words: &[u32; PUBLIC_WORDS]) -> Vec<u8> {
 
 /// A request to judge a statement: `input`, then the proof.
 pub fn judge_request(input: &Input) -> Vec<u8> {
-    [&[1][..], &input.encode()].concat()
+    [&[Mode::Judge as u8][..], &input.encode()].concat()
 }
 
 /// A request to compute a golden vector's digests: its encoding.
 pub fn anchors_request(vector: &[u8]) -> Vec<u8> {
-    [&[2][..], vector].concat()
+    [&[Mode::Anchors as u8][..], vector].concat()
 }
 
 /// The guest run on `request` and `proof`: its gas and its report.
