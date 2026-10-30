@@ -160,12 +160,17 @@ fn the_least_queries_that_clear_62_bits() {
     }
 }
 
+/// A candidate's log blowup, queries and PoW.
+type Candidate = (u32, usize, u32);
+/// Conjectured and proven bits.
+type Bits = (u32, u32);
+
 /// The candidates measured (`device-params.md`), each counted on the
 /// reference: `(log blowup, queries, PoW)`, its bits by powers and by
 /// affine batching.
 #[test]
 fn the_candidates_count_on_the_reference() {
-    let candidates: [((u32, usize, u32), (u32, u32), (u32, u32)); 5] = [
+    let candidates: [(Candidate, Bits, Bits); 5] = [
         ((1, 86, 20), (106, 61), (106, 62)),
         ((1, 87, 20), (107, 62), (107, 63)),
         ((2, 43, 20), (106, 62), (106, 62)),
