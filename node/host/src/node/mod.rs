@@ -155,6 +155,8 @@ pub(crate) struct Inner {
     pub(crate) halted: AtomicBool,
     /// The pair heartbeat this node sends, and what it hears.
     pub(crate) liveness: crate::liveness::Liveness,
+    /// The campaigns its groups run at once.
+    pub(crate) campaigns: Arc<group::Campaigns>,
     /// Clients' calls: their lanes, and the calls forwarded both ways.
     pub(crate) calls: crate::calls::Calls,
     /// The read indexes this replica asked its leaders for.

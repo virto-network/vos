@@ -7,8 +7,8 @@ mod driver;
 mod epochs;
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use vos_raft::core::{ChangeMembershipError, ProposeError, ReadIndexError};
@@ -162,6 +162,42 @@ pub(crate) enum Quiet {
     Leading { members: Vec<NodeNumber> },
 }
 
+/// The campaigns a node's groups run at once, bounded: a group's driver
+/// holds a [`Campaign`] from its election timer's firing until it leads,
+/// follows a leader, or the timer fires again.
+pub(crate) struct Campaigns {
+    running: AtomicUsize,
+    most: usize,
+}
+
+impl Campaigns {
+    pub(crate) fn new(most: usize) -> Arc<Self> {
+        Arc::new(Self {
+            running: AtomicUsize::new(0),
+            most,
+        })
+    }
+
+    /// One of the campaigns, unless as many as the bound already run.
+    pub(crate) fn take(self: &Arc<Self>) -> Option<Campaign> {
+        self.running
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |running| {
+                (running < self.most).then_some(running + 1)
+            })
+            .ok()
+            .map(|_| Campaign(Arc::clone(self)))
+    }
+}
+
+/// One campaign of a node's bounded number, given back when dropped.
+pub(crate) struct Campaign(Arc<Campaigns>);
+
+impl Drop for Campaign {
+    fn drop(&mut self) {
+        self.0.running.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 /// How many results' outcomes a group remembers, for its leader loop to
 /// read after its own apply.
 const OUTCOMES: usize = 256;
@@ -313,6 +349,19 @@ mod tests {
             } => term,
             _ => panic!("a vote's answer"),
         }
+    }
+
+    #[test]
+    fn campaigns_run_up_to_their_bound_and_free_as_they_end() {
+        let campaigns = Campaigns::new(2);
+        let first = campaigns.take().expect("one");
+        let second = campaigns.take().expect("two");
+        assert!(campaigns.take().is_none(), "past the bound");
+        drop(first);
+        let third = campaigns.take().expect("one freed");
+        assert!(campaigns.take().is_none());
+        drop((second, third));
+        assert!(campaigns.take().is_some());
     }
 
     #[test]

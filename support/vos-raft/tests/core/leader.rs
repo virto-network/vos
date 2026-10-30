@@ -565,3 +565,32 @@ fn candidate_steps_down_on_higher_term_vote_response() {
         (Role::Follower, 99)
     );
 }
+
+/// A host bounding its campaigns asks before each tick whether one is due,
+/// and may put it off by a fresh election timeout: the follower then sends
+/// nothing until that lapses, and campaigns after it. A leader's is never
+/// due.
+#[test]
+fn a_campaign_due_can_be_put_off_by_a_fresh_timeout() {
+    let mut core = follower(2, &[2], 1);
+    assert!(!core.campaign_due(100), "within the first timeout");
+    assert!(core.campaign_due(300));
+    core.defer_campaign(300);
+    assert!(!core.campaign_due(300));
+    core.tick(400);
+    assert!(sent(&core.take_actions()).is_empty(), "put off");
+    assert!(!core.campaigning());
+    // Past a full timeout after it, the campaign starts.
+    assert!(core.campaign_due(600));
+    core.tick(600);
+    assert!(
+        sent(&core.take_actions())
+            .iter()
+            .any(|message| matches!(message, Message::PreVote { .. }))
+    );
+    assert!(core.campaigning());
+    let mut leader = idle_leader_of_three();
+    assert!(!leader.campaign_due(u64::MAX / 2));
+    leader.defer_campaign(10);
+    assert_eq!(leader.role(), Role::Leader);
+}

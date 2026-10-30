@@ -17,7 +17,7 @@ mod fetch;
 mod membership;
 mod snapshot;
 
-use super::{Input, Local, MembershipChanged, Proposed, Quiet, ReadIndexed, Shared};
+use super::{Campaign, Input, Local, MembershipChanged, Proposed, Quiet, ReadIndexed, Shared};
 use crate::blobs::Held;
 use crate::node::Inner;
 use crate::raft::{self, EntryReports};
@@ -100,6 +100,8 @@ struct Driver {
     /// task of its own, as the driver never waits on the node-wide lock a
     /// placement takes.
     announced: Option<Order>,
+    /// The node's campaign this replica holds while it campaigns.
+    campaign: Option<Campaign>,
 }
 
 /// Where the core's answers go, by the token each request took.
@@ -230,6 +232,7 @@ impl Driver {
             compact_bound: 0,
             compact_due: false,
             announced: None,
+            campaign: None,
             inner,
             shared,
         })
@@ -355,6 +358,18 @@ impl Driver {
                 if quiesced || self.core.next_deadline() <= now {
                     self.vouch(now);
                 }
+                // A campaign starts, or goes another round, only with one
+                // of the node's campaigns: past their bound it is put off by
+                // a fresh election timeout, so a node that wakes many
+                // leaderless groups at once elects them in turn rather
+                // than have them all time out together.
+                if self.core.campaign_due(now) {
+                    self.campaign = None;
+                    self.campaign = self.inner.campaigns.take();
+                    if self.campaign.is_none() {
+                        self.core.defer_campaign(now);
+                    }
+                }
                 self.core.tick(now);
                 match event {
                     Event::Closed => break,
@@ -388,6 +403,10 @@ impl Driver {
                 }
                 self.settle_membership();
                 self.fetch_blobs();
+                // A campaign ends as the replica leads or follows a leader.
+                if !self.core.campaigning() {
+                    self.campaign = None;
+                }
             }
         }
         // A caller who sees the group gone sees it lead nothing, and a

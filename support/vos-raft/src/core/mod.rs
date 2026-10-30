@@ -503,6 +503,31 @@ impl<N: NodeId> Core<N> {
         }
     }
 
+    /// Whether a tick at `now` would start a campaign, or a campaign's
+    /// next round: a member that does not lead, can write, holds the log it
+    /// held before any wipe, and whose election deadline is due.
+    pub fn campaign_due(&self, now: u64) -> bool {
+        self.role != Role::Leader
+            && now.max(self.now) >= self.election_deadline
+            && self.is_member()
+            && !self.writer_stalled
+            && !self.short_of_floor()
+    }
+
+    /// Put off a campaign due at `now` by a fresh election timeout: a host
+    /// that bounds the campaigns its groups run at once defers the others.
+    pub fn defer_campaign(&mut self, now: u64) {
+        self.now = self.now.max(now);
+        if self.role != Role::Leader {
+            self.reset_election_timer();
+        }
+    }
+
+    /// Whether it is campaigning: a pre-candidate or a candidate.
+    pub fn campaigning(&self) -> bool {
+        matches!(self.role, Role::PreCandidate | Role::Candidate)
+    }
+
     /// When the core next needs a tick.
     pub fn next_deadline(&self) -> u64 {
         let mut deadline = self.election_deadline;

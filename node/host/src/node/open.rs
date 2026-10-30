@@ -159,6 +159,7 @@ impl Node {
             retiring: Mutex::new(HashSet::new()),
             halted: AtomicBool::new(false),
             liveness: crate::liveness::Liveness::new(incarnation),
+            campaigns: crate::group::Campaigns::new(settings.campaigns),
             unrecorded: crate::prover::Unrecorded::default(),
             backlog: Mutex::new(None),
         });

@@ -108,7 +108,7 @@ impl<N: NodeId> Core<N> {
     /// Whether a host wiped a longer log than this replica holds now: it
     /// may have acknowledged entries a quorum committed, which it no longer
     /// holds, so it does not campaign until its log reaches what it held.
-    fn short_of_floor(&self) -> bool {
+    pub(super) fn short_of_floor(&self) -> bool {
         self.vote_floor.is_some_and(|(index, term)| {
             (self.log.last_term(), self.log.last_index()) < (term, index)
         })

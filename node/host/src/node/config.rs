@@ -82,6 +82,11 @@ pub struct Config {
     pub election_timeout_ms: (u64, u64),
     /// How often a group's leader sends heartbeats, in milliseconds.
     pub heartbeat_ms: u64,
+    /// The most campaigns the node's groups run at once: a group whose
+    /// election comes due past them puts it off by a fresh election
+    /// timeout, so a node that wakes many leaderless groups at once (at
+    /// its start, or a peer lost) elects them in turn.
+    pub campaigns: usize,
     /// How long the node's oldest pending commit may wait before its
     /// writer counts as stalled, and the groups it leads hand over: by
     /// default (`None`) the election timeout's upper end, so a slow sync
@@ -199,6 +204,7 @@ impl Config {
             peers: Peers::Quic,
             election_timeout_ms: (1500, 3000),
             heartbeat_ms: 500,
+            campaigns: 512,
             writer_stall: None,
             answered: Duration::from_secs(30),
             resend_round: Duration::from_secs(1),
@@ -243,6 +249,8 @@ pub(crate) struct Settings {
     pub(crate) heartbeat_ms: u64,
     /// [`Config::peer_lanes`], one at least.
     pub(crate) lanes: u32,
+    /// [`Config::campaigns`], one at least.
+    pub(crate) campaigns: usize,
     pub(crate) compact_every: u64,
     pub(crate) compact_bytes: u64,
     pub(crate) compact_tail: u64,
@@ -277,6 +285,7 @@ impl Settings {
             resend_round: config.resend_round,
             heartbeat_ms: config.heartbeat_ms,
             lanes: config.peer_lanes.max(1),
+            campaigns: config.campaigns.max(1),
             compact_every: config.compact_every,
             compact_bytes: config.compact_bytes,
             compact_tail: config.compact_tail,

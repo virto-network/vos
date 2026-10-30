@@ -224,6 +224,38 @@ fn more_groups_than_streams_elect_after_every_node_restarts() {
     assert!(took < Duration::from_secs(15), "{took:?}");
 }
 
+/// Nodes that run two campaigns at once elect every group in turn after
+/// they all restart together: the others put theirs off by a fresh
+/// election timeout, and no term runs away.
+#[test]
+fn a_bound_on_campaigns_elects_every_group_in_turn() {
+    let mut cluster = Cluster::tuned(3, |_, config| config.campaigns = 2);
+    let agents = agents(&cluster, 24);
+    let before = terms(&cluster, &agents);
+    for number in 1..=3 {
+        cluster.stop(number);
+    }
+    let started = Instant::now();
+    for number in 1..=3 {
+        cluster.start(number);
+    }
+    for &agent in &agents {
+        cluster.leader(agent);
+    }
+    let took = started.elapsed();
+    let moved: u64 = terms(&cluster, &agents)
+        .iter()
+        .zip(&before)
+        .map(|(after, before)| after - before)
+        .sum();
+    eprintln!(
+        "{} groups elected within {took:?}, their terms moved {moved} in all",
+        agents.len()
+    );
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    assert!(moved <= 3 * agents.len() as u64, "{moved}");
+}
+
 /// A follower node restarted while its groups are quiet, nothing written
 /// meanwhile, hears its leaders at once: each probes it on hearing its
 /// new run, rather than waiting for its own deadline to draw a heartbeat.
