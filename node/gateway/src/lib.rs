@@ -6,6 +6,8 @@
 
 pub mod app;
 pub mod config;
+#[cfg(feature = "ssh")]
+pub mod demo;
 pub mod front;
 pub mod limits;
 pub mod routing;
