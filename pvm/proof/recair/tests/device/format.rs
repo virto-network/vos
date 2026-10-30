@@ -88,19 +88,10 @@ fn candidate(log_blowup: u32, n_queries: usize, pow_bits: u32, batching: DeepBat
 
 /// The registry's reference for format 43 is the built device set's
 /// masked shape at `DEVICE_MAX_LOG_SIZE`, field for field; 43 counts its
-/// pinned bits on it, and one query fewer falls under 62.
+/// pinned bits on it (62.82), and one query fewer falls under 62.
 #[test]
 fn the_device_reference_shape_is_the_built_sets() {
     let built = device_shape(DEVICE_MAX_LOG_SIZE);
-    eprintln!("{built:?}");
-    for (log_blowup, pow_bits) in [(1, 20), (2, 20), (2, 16), (3, 20)] {
-        for batching in [DeepBatching::Powers, DeepBatching::Affine] {
-            let least = (1..200).find(|&q| {
-                proven_count(&candidate(log_blowup, q, pow_bits, batching), &built).unwrap() >= 62.0
-            });
-            eprintln!("least {log_blowup}:{pow_bits} {batching:?}: {least:?}");
-        }
-    }
     assert_eq!(built, DEVICE_REFERENCE);
     let bits = security_bits(&DEVICE_PROOF.params, &built).unwrap();
     assert_eq!(bits, DEVICE_PROOF.bits);
@@ -123,8 +114,27 @@ fn the_reference_bounds_smaller_programs() {
     let reference = proven_count(&DEVICE_PROOF.params, &DEVICE_REFERENCE).unwrap();
     for log_size in 10..DEVICE_MAX_LOG_SIZE {
         let count = proven_count(&DEVICE_PROOF.params, &device_shape(log_size)).unwrap();
-        eprintln!("2^{log_size}: {count:.3}");
         assert!(count >= reference, "2^{log_size}: {count} against {reference}");
+    }
+}
+
+/// The least queries clearing 62 proven bits on the reference, by blowup,
+/// PoW and batching: blowup 2 at PoW 20 87 by powers and 85 affine; blowup
+/// 4 43 at PoW 20 and 47 at PoW 16; blowup 8 29 at PoW 20; either batching
+/// where one count is given.
+#[test]
+fn the_least_queries_that_clear_62_bits() {
+    let least = |log_blowup, pow_bits, batching| {
+        (1..=256).find(|&n_queries| {
+            let params = candidate(log_blowup, n_queries, pow_bits, batching);
+            proven_count(&params, &DEVICE_REFERENCE).unwrap() >= 62.0
+        })
+    };
+    for (log_blowup, pow_bits, powers, affine) in
+        [(1, 20, 87, 85), (2, 20, 43, 43), (2, 16, 47, 47), (3, 20, 29, 29)]
+    {
+        assert_eq!(least(log_blowup, pow_bits, DeepBatching::Powers), Some(powers));
+        assert_eq!(least(log_blowup, pow_bits, DeepBatching::Affine), Some(affine));
     }
 }
 
@@ -145,11 +155,6 @@ fn the_candidates_count_on_the_reference() {
             [(DeepBatching::Powers, powers), (DeepBatching::Affine, affine)]
         {
             let params = candidate(log_blowup, n_queries, pow_bits, batching);
-            let count = proven_count(&params, &DEVICE_REFERENCE).unwrap();
-            eprintln!("{log_blowup}:{n_queries}:{pow_bits} {batching:?}: {count:.3} proven bits");
-            let _ = (conjectured, proven);
-            continue;
-            #[allow(unreachable_code)]
             assert_eq!(
                 security_bits(&params, &DEVICE_REFERENCE),
                 Some(SecurityBits {

@@ -370,11 +370,17 @@ fn device_run(args: &[String]) {
     println!("{{\"kind\":\"done\"}}");
 }
 
+/// A device cell's worker threads' stacks: the prover's nested joins at
+/// blowup 8 overflowed the default 2 MiB about once in 18 proves on 8
+/// threads, and never in 24 at this size.
+const DEVICE_STACK: usize = 16 << 20;
+
 /// One device cell, in a pool of the threads asked for.
 fn device_cell(name: &str, args: &[String]) {
     let options = options(args);
     rayon::ThreadPoolBuilder::new()
         .num_threads(options.threads.unwrap_or(0))
+        .stack_size(DEVICE_STACK)
         .build_global()
         .expect("the pool");
     let kernels = options.kernels.clone().unwrap_or_else(|| {

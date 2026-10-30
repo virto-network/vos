@@ -33,11 +33,12 @@ use crate::{hex, ms, peak_rss_mib, quantile};
 /// The gas a device kernel's run takes at most.
 const GAS: u64 = 50_000_000;
 
-/// The cells session P4 measures: the auth statement over the Poseidon2
-/// tree (`p2`) at every candidate on Blake2s-M31, then on Blake2b-256, then
-/// the statement over the vos-tree (`b2`) on Blake2s-M31.
+/// The cells by default: the auth statement over the Poseidon2 tree (`p2`)
+/// at every candidate on Blake2s-M31, then the statement over the vos-tree
+/// (`b2`) beside it. Blake2b-256, about ten times slower on the prover's
+/// trees, is asked for by name.
 pub const CELLS: &str = "p2/1:86:20/b2sm31,p2/1:87:20/b2sm31,p2/2:43:20/b2sm31,\
-p2/2:47:16/b2sm31,p2/3:29:20/b2sm31,p2/1:86:20/b2b,p2/2:43:20/b2b,p2/2:47:16/b2b,p2/3:29:20/b2b,\
+p2/2:47:16/b2sm31,p2/3:29:20/b2sm31,\
 b2/1:86:20/b2sm31,b2/2:43:20/b2sm31,b2/2:47:16/b2sm31,b2/3:29:20/b2sm31";
 
 /// One device cell, parsed.
@@ -178,11 +179,16 @@ fn measure<MC: MerkleChannel>(
     }
     let layout = DeviceComponents::layout(active, &log_sizes).expect("laid out");
     let (mut columns, mut cells) = (0usize, 0u64);
+    let mut by_chip = Vec::new();
     for component in layout.components() {
+        let (mut chip_columns, mut chip_cells) = (0usize, 0u64);
         for tree in component.trace_log_degree_bounds().iter() {
-            columns += tree.len();
-            cells += tree.iter().map(|&log| 2u64 << log).sum::<u64>();
+            chip_columns += tree.len();
+            chip_cells += tree.iter().map(|&log| 2u64 << log).sum::<u64>();
         }
+        columns += chip_columns;
+        cells += chip_cells;
+        by_chip.push(format!("[{chip_columns},{chip_cells}]"));
     }
     let chips: Vec<usize> = vos_pvm_proof::device::device_chips_of_mask(active).collect();
     let sorted = |values: &[f64]| {
@@ -207,7 +213,7 @@ fn measure<MC: MerkleChannel>(
     };
     println!(
         "{{\"kind\":\"device_cell\",\"cell\":\"{name}\",\"format\":{},\"threads\":{},\"steps\":{steps},\
-         \"chips\":{chips:?},\"log_sizes\":{log_sizes:?},\"log_mask_rows\":{},\"columns\":{columns},\"cells\":{cells},\
+         \"chips\":{chips:?},\"log_sizes\":{log_sizes:?},\"log_mask_rows\":{},\"columns\":{columns},\"cells\":{cells},\"by_chip\":[{}],\
          \"reps\":{reps},\"install_ms\":{install_ms:.1},\"trace_ms_p50\":{:.1},\
          \"prove_ms_p50\":{:.1},\"prove_ms_p95\":{:.1},\"prove_ms_min\":{:.1},\"prove_ms_max\":{:.1},\"prove_ms_runs\":[{}],\
          \"verify_ms_p50\":{:.2},\"r1_attempts\":{},\"r1_ms\":{:.1},\"proof_bytes\":{},\"distinct_proofs\":{distinct},\
@@ -215,6 +221,7 @@ fn measure<MC: MerkleChannel>(
         format.number,
         rayon::current_num_threads(),
         format.masking.expect("masked").log_mask_rows,
+        by_chip.join(","),
         quantile(&traces_sorted, 0.5),
         quantile(&proves_sorted, 0.5),
         quantile(&proves_sorted, 0.95),

@@ -446,11 +446,16 @@ pinned by 7.7.
   finalize hook for the 14 chips that finalize unpaired, a per-component
   `h` by the component's offsets (`|O| = 1` components at half the
   floor), the fixed tables padded to the floor.
-- **Format 43, device proofs:** Blake2s-M31 channel, parameters chosen by
-  7.16 from `device-params.md`'s candidates (blowup 2 with 86–87 queries,
-  4 with 43, or 4 with 47 at PoW 16, 8 with 29), at least 62 proven and
-  100 conjectured bits on its masked shape. 37, reserved at an unmasked
-  count, is retired unregistered.
+- **Format 43, device proofs** [measured, 7.16]: masked (c), the
+  Blake2s-M31 channel, **blowup 4, 47 queries, PoW 16**, interaction PoW 8,
+  affine DEEP batching, `h = 512`: format 44's parameters; 110 conjectured
+  and 62.82 proven bits on its masked reference (every device chip at
+  2^17 rows, the most install admits, `DEVICE_MAX_LOG_SIZE`). Chosen from
+  `device-params.md`'s candidates on x86 (none within both budgets on the
+  auth statement: blowup 8 alone fits 1.5 MiB but peaks near 5.7 GiB;
+  blowup 4 at PoW 16 the fastest with the shortest grind tail);
+  `slice-7-progress.md`'s 7.16. 37, reserved at an unmasked count, is
+  retired unregistered. 7.17's lever 4 counts again on the lighter shape.
 - **The device program id:** the format, the chip mask, the log sizes and
   the preprocessed roots (program memory, data table, permissions), as a
   segment program's; computed at install, never taken as submitted.

@@ -10,12 +10,12 @@
 //! | 28 | the final wrap | Blake2b-256 | 6, 20, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
 //! | 32 | leaves and folds | Poseidon2-M31 | 2, 44, 20, 1, 0, 8 | 100 / 60 | 108 / 63 |
 //! | 35 | segments | Poseidon2-M31 | 2, 40, 24, 1, 0, 8 | 100 / 60 | 104 / 62 |
-//! | 37 | device proofs, masked | Blake2s-M31 | 1, 86, 20, 1, 0, 8 | 100 / 60 | 106 / 62 |
 //! | 39 | the final wrap, masked | Blake2b-256 | 5, 24, 26, 3, 6, 8, affine DEEP batching | 100 / 80 | 146 / 82 |
+//! | 43 | device proofs, masked | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
 //! | 44 | credential proofs, masked | Blake2s-M31 | 2, 47, 16, 1, 0, 8, affine DEEP batching | 100 / 60 | 110 / 62 |
 //!
 //! - **The segment AIR** is the one every segment, leaf and device format
-//!   names: 35 and 37 name its current form, without the columns and
+//!   names: 35 and 43 name its current form, without the columns and
 //!   next-row masks no constraint reads, and 32's leaves verify it. The
 //!   numbers that named its earlier forms are [`RETIRED`]: refused, and never
 //!   registered again. 24 to 27 and 29 named it before its hardening (the
@@ -26,8 +26,9 @@
 //!   their numbers; 44 proves its `p2` and `qm31` alone, the credential AIR.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
-//!   before the relation challenges. 37 is registered and refused until its
-//!   AIR and channel exist. 32 is registered and refused
+//!   before the relation challenges. 43 is registered and refused until a
+//!   space's ingress verifies device proofs; `vos-pvm-recair` proves and
+//!   verifies them (`masked::device`). 32 is registered and refused
 //!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
 //!   its proofs natively, pinning each circuit by its hash, and no verifier
 //!   outside the recursion reads a leaf or a fold. 28 is admitted:
@@ -46,8 +47,17 @@
 //!   segment's width times its queries, and 4 fewer queries keep the leaf's
 //!   `p2` under 2^16 with room. Leaves and folds (32) take 44 queries and 20
 //!   bits: a fold verifies under half the recursion AIR's shape.
-//! - **The device format** (37) takes the least query count, 86, whose
-//!   proven count clears the floor of 60 by 2 bits.
+//! - **The device format** (43) is counted on the device shape's masked
+//!   reference ([`DEVICE_REFERENCE`]: every chip a device program may hold
+//!   at `2^17` rows, the most install admits). Of the candidates measured
+//!   (blowup 2 with 85–87 queries, 4 with 43 at PoW 20 or 47 at PoW 16, 8
+//!   with 29), it takes the credential format's: blowup 4, 47 queries, PoW
+//!   16, affine batching (62.82 proven bits). On the auth statement none
+//!   meets the device budget's 1 GiB, and only blowup 8 its 1.5 MiB; blowup
+//!   8 peaks at about 5.7 GiB, past a phone's memory, blowup 2's proofs are
+//!   twice the budget, and blowup 4 with PoW 16 proves fastest with the
+//!   shortest grind tail. 37, reserved at an unmasked count before the
+//!   masking, is retired unregistered.
 //! - **The credential format** (44) is counted on its masked shape
 //!   ([`CREDENTIAL_REFERENCE`]): two components at the masking's floor of
 //!   2^11 rows, where every blowup costs the same cells, so blowup 4, and
@@ -223,9 +233,7 @@ pub struct Format {
     pub params: FormatParams,
     pub bytes: ProofBytes,
     pub masked: bool,
-    /// The masking's pins, for a masked format whose masking is built; `None`
-    /// for an unmasked format, and for the masked formats reserved before
-    /// their masking (30, 37).
+    /// The masking's pins for a masked format, `None` for an unmasked one.
     pub masking: Option<Masking>,
     pub floor: SecurityFloor,
     pub status: Status,
@@ -285,20 +293,20 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
 
 /// The device format's reference (pin J), format 43's: the device set
 /// (`vos_pvm_proof::device`) with every chip a device program may hold at
-/// `2^16` rows (`device::DEVICE_MAX_LOG_SIZE`, which install enforces),
-/// masked under variant (c): its columns at degree bound 2^17, the
-/// composition whole at 2^18, sampled at `π(z)`; 7,548 values in the DEEP
+/// `2^17` rows (`device::DEVICE_MAX_LOG_SIZE`, which install enforces),
+/// masked under variant (c): its columns at degree bound 2^18, the
+/// composition whole at 2^19, sampled at `π(z)`; 7,548 values in the DEEP
 /// batch, 4,292 constraints, every fraction a masked row evaluates (the
 /// blinding's among them), the widest relation's 265 limbs. A test in
 /// `vos-pvm-recair` derives it from the built set.
 pub const DEVICE_REFERENCE: SecurityShape = SecurityShape {
-    log_degree_bound: 18,
-    log_trace_length: 17,
-    log_composition_degree_bound: 18,
+    log_degree_bound: 19,
+    log_trace_length: 18,
+    log_composition_degree_bound: 19,
     sampled_values: 7_548,
     max_samples_per_column: 3,
     constraints: 4_292,
-    logup_fractions: 77_529_088,
+    logup_fractions: 155_058_176,
     relation_width: SEGMENT_RELATION_WIDTH,
     composition_point_doublings: 1,
 };
@@ -399,10 +407,12 @@ const LEAF_FOLD_PARAMS: FormatParams = FormatParams {
     batching: DeepBatching::Powers,
 };
 
+/// Device proofs': credential proofs' parameters (format 44), picked by
+/// 7.16's measurement (see the module's notes).
 const DEVICE: FormatParams = FormatParams {
-    log_blowup: 1,
-    n_queries: 86,
-    pow_bits: 20,
+    log_blowup: 2,
+    n_queries: 47,
+    pow_bits: 16,
     fold_step: 1,
     log_last_layer: 0,
     interaction_pow_bits: 8,
@@ -515,13 +525,14 @@ pub const MASKED_WRAP: Format = Format {
     },
 };
 
-/// Format 43's masking: 8 salt columns a tree; an `R` of 8 columns; and
-/// `h = 1,024`, at least `2(4|O| + q(|O| + 1)) = 532` for `q = 86` queries
-/// and `|O| = 2` offsets, so each component pads to `4h = 2^12` rows.
+/// Format 43's masking: 8 salt columns a tree; an `R` of 8 columns (R3
+/// under affine batching); and `h = 512`, at least
+/// `2(4|O| + q(|O| + 1)) = 298` for `q = 47` queries and `|O| = 2`
+/// offsets, so each component pads to `4h = 2^11` rows.
 pub const DEVICE_MASKING: Masking = Masking {
     salt_columns: 8,
     fri_mask_columns: 8,
-    log_mask_rows: 10,
+    log_mask_rows: 9,
 };
 
 /// Device proofs, masked: see the module's notes.
@@ -537,7 +548,7 @@ pub const DEVICE_PROOF: Format = Format {
     status: Status::Reserved,
     reference: DEVICE_REFERENCE,
     bits: SecurityBits {
-        conjectured: 106,
+        conjectured: 110,
         proven: 62,
     },
 };
@@ -609,7 +620,10 @@ pub const REGISTRY: [Format; 6] = [
 /// - **42, admitted, then retired:** credential proofs at 43 queries and
 ///   PoW 20 (106 / 62), whose grind's 95th percentile on the gate phone
 ///   passed 50 ms; 44 takes PoW 16 at 47 queries. Proofs were made under
-///   it, so no later format takes it.
+///   it, so no later format takes it;
+/// - **37, reserved, never admitted:** device proofs at blowup 2 and 86
+///   queries, counted on an unmasked shape; 43 is the device format,
+///   counted on its masked one.
 ///
 /// So a number names one AIR and one set of parameters.
 pub const RETIRED: [u32; 13] = [24, 25, 26, 27, 29, 30, 31, 33, 34, 36, 37, 40, 42];
@@ -723,8 +737,8 @@ mod tests {
                 (28, 146, 82),
                 (32, 108, 63),
                 (35, 104, 62),
-                (37, 106, 62),
                 (39, 146, 82),
+                (43, 110, 62),
                 (44, 110, 62),
             ]
         );

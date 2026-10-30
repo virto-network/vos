@@ -108,10 +108,11 @@ pub const DEVICE_OPTIONAL: u32 =
 /// Every chip a device shape may hold.
 pub const DEVICE_ALL: u32 = DEVICE_ALWAYS | DEVICE_OPTIONAL;
 
-/// The most rows a device program's chip takes, `2^16` (pin J: one segment
-/// of at most `2^16` steps): the device format's security count is taken
-/// with every chip at it (`format::DEVICE_REFERENCE`), so a program with a
-/// taller chip is refused at install.
+/// The most rows a device program's chip takes, `2^17`: the memory ledger,
+/// rows by the bytes a run touches, outgrows the steps (the auth
+/// statements' ledgers take 2^17 rows at about 19,000 steps). The device format's security
+/// count is taken with every chip at it (`format::DEVICE_REFERENCE`), so a
+/// program with a taller chip is refused at install.
 pub const DEVICE_MAX_LOG_SIZE: u32 = 17;
 
 const _: () = {
