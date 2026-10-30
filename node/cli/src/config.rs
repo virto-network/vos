@@ -21,6 +21,10 @@ pub struct Settings {
     max_inputs: Option<usize>,
     /// The most argument bytes in one batch.
     max_bytes: Option<usize>,
+    /// The most batches an agent's leader has in flight.
+    in_flight: Option<usize>,
+    /// The most campaigns the node's groups run at once.
+    campaigns: Option<usize>,
     /// How long a leader waits for more inputs after the first.
     linger_ms: Option<u64>,
     /// The most connections the ingress holds open at once.
@@ -86,7 +90,7 @@ impl Settings {
     /// Set what the file gives on `config`. Refused: an election timeout
     /// whose ends are out of order or that a heartbeat does not fit in, and
     /// a zero for a count of executors, queued requests, batch inputs or
-    /// bytes, or connections.
+    /// bytes, batches in flight, campaigns, or connections.
     pub fn apply(self, config: &mut Config) -> Result<Fronts, String> {
         let set = |value: Option<usize>, field: &mut usize| *field = value.unwrap_or(*field);
         set(self.api_connections, &mut config.api_connections);
@@ -95,6 +99,8 @@ impl Settings {
         set(self.queue, &mut config.queue);
         set(self.max_inputs, &mut config.max_inputs);
         set(self.max_bytes, &mut config.max_bytes);
+        set(self.in_flight, &mut config.in_flight);
+        set(self.campaigns, &mut config.campaigns);
         set(self.ingress_connections, &mut config.ingress_connections);
         if let Some(linger) = self.linger_ms {
             config.linger = Duration::from_millis(linger);
@@ -120,6 +126,8 @@ impl Settings {
             ("queue", config.queue),
             ("max_inputs", config.max_inputs),
             ("max_bytes", config.max_bytes),
+            ("in_flight", config.in_flight),
+            ("campaigns", config.campaigns),
             ("ingress_connections", config.ingress_connections),
             ("api_connections", config.api_connections),
             ("api_in_flight", config.api_in_flight),
@@ -164,9 +172,11 @@ mod tests {
     #[test]
     fn a_file_sets_what_it_names_and_keeps_the_rest() {
         let config = applied(
-            "executors = 3\nlinger_ms = 5\nelection_timeout_ms = [1000, 2000]\nheartbeat_ms = 200\n",
+            "executors = 3\nlinger_ms = 5\nelection_timeout_ms = [1000, 2000]\nheartbeat_ms = 200\n\
+             in_flight = 2\ncampaigns = 64\n",
         )
         .unwrap();
+        assert_eq!((config.in_flight, config.campaigns), (2, 64));
         let defaults = Config::new(Vec::new());
         assert_eq!(config.executors, 3);
         assert_eq!(config.linger.as_millis(), 5);
@@ -215,6 +225,8 @@ mod tests {
             "queue",
             "max_inputs",
             "max_bytes",
+            "in_flight",
+            "campaigns",
             "ingress_connections",
             "api_connections",
             "api_in_flight",
