@@ -3819,30 +3819,27 @@ One Opus review of the commit, no High; folded:
   of the payload (`RefineArgs` owns it), a few hundred gas; L3 and L4,
   recorded above.
 
-### Stopped at (wind-down, before the step's gates)
+**Left:**
+- **The owner's call, pending:** the default agent's and the final
+  verifier's Wasm blobs' code depends on the checkout's path (above), so
+  they are outside `blobs.lock`, and the default agent's program hash
+  differs between checkouts. The levers: build those workspaces from a
+  fixed path, or bring their crates under one workspace root with their
+  dependencies.
+- `pvm/codec/src/anchor.rs`'s hand-computed offsets (item 25, Low; the
+  codec reaches the kernels).
+- The `vos-pvm-guest-rt` crate item 23 named for later, which would drop
+  the statement service's dummy `heap-peak` feature.
+- The workflow record's loose decode (item 65), versioned by its `format`.
 
-- **Done:** every item in the table above, the review folded, `blobs.lock`
-  (30 blobs) reproduced from a clean clone at another path
-  (`just check-blobs` there: 30 of 30). No item's definition was missing;
-  4's guest half (7.1 landed it) and 17–19 (no piece outside 7.8a's)
-  needed no code.
-- **Left:** the default agent's and the Wasm blobs' path dependence (not
-  in the lock; the owner's lever above); `pvm/codec/src/anchor.rs`'s
-  offsets (item 25, Low); `vos-pvm-guest-rt` (item 23's later crate).
-- **Gates so far** [measured]: the first `just check` passed everything up
-  to `check-blobs` (then failing only on a lock written before
-  `cargo fmt`, since rewritten). The second, at `06bcc094`, passed
-  `fmt-check`, `doc-check`, `check-venue-rules`, `check-no-std` with
-  `check-blobs` (30 blobs), `check-no-leaks` and `check-kit`, and was
-  stopped in `fuzz-replay`. `kernel constants::` passes (no pinned id
-  moved); `vos-anchor`'s, `vos-statement`'s (fixtures feature) and the
-  service's suites, and `vos-wire`'s, pass.
-- **Vectors and fixtures:** expected to be unchanged (no encoding moved; no
-  program id moved), not yet confirmed: the conformance vectors' generator
-  runs in `check`'s agent crates, and the fixtures' generator in
-  `test-proof`.
-- **Next:** rerun `just check` to `exit=0`; then
-  `cargo test -p vos-pvm-proof --test kernel fixtures::the_fixtures_are_the_generators`
-  alone (a heavy run) to confirm the fixtures. Then the step is done (no
-  merge or push). The scratch worktree `s78b-base` (at `4a143e9f`, used
-  for the baseline blobs) can be removed with `git worktree remove`.
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 6 jobs, another agent's
+credential stress beside it]:
+- **`just check`:** green at `dae8b822` (exit 0, 1,640 passed in 125
+  suites): `check-blobs` among it (30 blobs), the conformance vectors'
+  generator (`the_vectors_are_the_generators`, the vectors unchanged) and
+  `check-kit`.
+- **The fixtures:** `fixtures::the_fixtures_are_the_generators` alone,
+  green (243 s): the fixtures unchanged.
+- **`kernel constants::`:** green; no pinned program id moved.
+- **`blobs.lock` reproduced:** `just check-blobs` in a clone at another
+  path, built from clean: 30 of 30.
