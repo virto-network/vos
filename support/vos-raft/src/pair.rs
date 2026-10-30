@@ -565,7 +565,9 @@ mod tests {
                 let told = telling.round(round, now);
                 // Split into parts of three entries at most.
                 let mut parts: Vec<Round<u32>> = Vec::new();
-                let entries: Vec<(Option<(u32, u64)>, Option<u32>)> = told
+                // Each entry a group listed, or one unlisted.
+                type Entry = (Option<(u32, u64)>, Option<u32>);
+                let entries: Vec<Entry> = told
                     .leading
                     .iter()
                     .map(|entry| (Some(*entry), None))
