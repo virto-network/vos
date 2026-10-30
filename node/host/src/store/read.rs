@@ -1,12 +1,14 @@
 //! Reads of applied state: a store snapshot's view, and an agent's
 //! export for a snapshot stream.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::iter::Peekable;
 use std::ops::Bound;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use fjall::Readable;
 use vos_wire::ids::AgentId;
+use vos_wire::result::Write;
 
 use super::keys::{
     AGENT_KEY_PREFIX, NodeRow, agent_key, applied, decode_entry, decode_last_result,
@@ -23,6 +25,7 @@ impl Fjall {
             snapshot: self.database().snapshot(),
             store: self.clone(),
             epochs: Mutex::new(HashMap::new()),
+            unapplied: None,
         }
     }
 
@@ -137,17 +140,61 @@ impl Export {
     }
 }
 
-/// A read-only view of applied state, as of one store snapshot. Keys are
-/// relative to the agent.
+/// Writes to one agent's rows not yet applied, in order: a leader's
+/// batches in flight, which its next batch refines over.
+#[derive(Debug)]
+pub struct Unapplied {
+    agent: AgentId,
+    /// Each row's last write: a value, or (`None`) a deletion.
+    rows: BTreeMap<Vec<u8>, Option<Vec<u8>>>,
+}
+
+impl Unapplied {
+    /// `agent`'s rows as `writes` leave them, later writes to a key over
+    /// earlier ones.
+    pub fn new<'a>(agent: AgentId, writes: impl IntoIterator<Item = &'a Write>) -> Self {
+        let rows = writes
+            .into_iter()
+            .map(|write| (write.key.clone(), write.value.clone()))
+            .collect();
+        Self { agent, rows }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+}
+
+/// A read-only view of applied state, as of one store snapshot, and of one
+/// agent's writes not yet applied over it, if any. Keys are relative to
+/// the agent.
 pub struct Snapshot {
     snapshot: fjall::Snapshot,
     store: Fjall,
     /// Each agent's epoch, read once from this snapshot: a reader never
     /// mixes epochs, nor sees a half-installed snapshot.
     epochs: Mutex<HashMap<AgentId, u8>>,
+    unapplied: Option<Arc<Unapplied>>,
 }
 
 impl Snapshot {
+    /// This view with `unapplied` over its agent's rows: each written row
+    /// reads as written, each deleted one as absent. They must follow what
+    /// this view holds applied, as the batches in flight follow it.
+    pub fn over(self, unapplied: Arc<Unapplied>) -> Self {
+        Self {
+            unapplied: (!unapplied.is_empty()).then_some(unapplied),
+            ..self
+        }
+    }
+
+    /// The unapplied rows over `agent`'s, if any.
+    fn unapplied(&self, agent: AgentId) -> Option<&Unapplied> {
+        self.unapplied
+            .as_deref()
+            .filter(|unapplied| unapplied.agent == agent)
+    }
+
     /// The epoch the agent's rows are under.
     pub fn epoch(&self, agent: AgentId) -> Result<u8> {
         if let Some(&epoch) = lock(&self.epochs).get(&agent) {
@@ -159,6 +206,12 @@ impl Snapshot {
     }
 
     pub fn get(&self, agent: AgentId, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(written) = self
+            .unapplied(agent)
+            .and_then(|unapplied| unapplied.rows.get(key))
+        {
+            return Ok(written.clone());
+        }
         let epoch = self.epoch(agent)?;
         Ok(self
             .snapshot
@@ -169,7 +222,32 @@ impl Snapshot {
     /// Rows whose key starts with `prefix`, in key order, starting after
     /// `after` when given. `prefix` must not be empty: it selects the
     /// partition.
-    pub fn scan(
+    pub fn scan<'a>(
+        &'a self,
+        agent: AgentId,
+        prefix: &'a [u8],
+        after: Option<&'a [u8]>,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a {
+        let applied = self.applied_scan(agent, prefix, after);
+        let unapplied = self.unapplied(agent).map(|unapplied| {
+            let start = match after {
+                Some(after) if after >= prefix => Bound::Excluded(after),
+                _ => Bound::Included(prefix),
+            };
+            unapplied
+                .rows
+                .range::<[u8], _>((start, Bound::Unbounded))
+                .take_while(move |(key, _)| key.starts_with(prefix))
+                .peekable()
+        });
+        Merged {
+            applied: applied.peekable(),
+            unapplied,
+        }
+    }
+
+    /// [`Self::scan`] of the applied rows alone.
+    fn applied_scan(
         &self,
         agent: AgentId,
         prefix: &[u8],
@@ -224,5 +302,49 @@ impl Snapshot {
     /// The node's `row` for the agent.
     fn row(&self, agent: AgentId, row: NodeRow) -> Result<Option<fjall::Slice>> {
         self.snapshot.get(self.store.system(), node_row(agent, row))
+    }
+}
+
+/// Applied rows, with unapplied writes over them, in key order.
+struct Merged<A: Iterator, U: Iterator> {
+    applied: Peekable<A>,
+    unapplied: Option<Peekable<U>>,
+}
+
+impl<'a, A, U> Iterator for Merged<A, U>
+where
+    A: Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>,
+    U: Iterator<Item = (&'a Vec<u8>, &'a Option<Vec<u8>>)>,
+{
+    type Item = Result<(Vec<u8>, Vec<u8>)>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let Some(unapplied) = self.unapplied.as_mut() else {
+            return self.applied.next();
+        };
+        loop {
+            let written = unapplied.peek().map(|(key, _)| key.as_slice());
+            let stored = match self.applied.peek() {
+                Some(Ok((key, _))) => Some(key.as_slice()),
+                // A failed read is the scan's next item.
+                Some(Err(_)) => return self.applied.next(),
+                None => None,
+            };
+            match (stored, written) {
+                (None, None) => return None,
+                (Some(_), None) => return self.applied.next(),
+                (Some(stored), Some(written)) if stored < written => return self.applied.next(),
+                (stored, Some(written)) => {
+                    // The write takes the row's place.
+                    if stored == Some(written) {
+                        self.applied.next();
+                    }
+                    let (key, value) = unapplied.next().expect("peeked");
+                    if let Some(value) = value {
+                        return Some(Ok((key.clone(), value.clone())));
+                    }
+                }
+            }
+        }
     }
 }

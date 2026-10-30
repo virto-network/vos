@@ -21,7 +21,13 @@ impl Leader {
     /// result did not cover, deliver the outbox and acknowledge applied
     /// messages. A step no input made, a workflow's due step after its
     /// start or the sweep, pairs with no input.
-    pub(super) fn settle(&mut self, pending: Vec<Pending>, result: &WorkResult, before: &Snapshot) {
+    pub(super) fn settle(
+        &mut self,
+        pending: Vec<Pending>,
+        result: &WorkResult,
+        before: &Snapshot,
+        at: u64,
+    ) {
         let snapshot = self.inner.store.snapshot();
         let mut acks: HashMap<AgentId, u64> = HashMap::new();
         let mut rest = Vec::new();
@@ -54,21 +60,20 @@ impl Leader {
                             .map_err(|fault| CallError::Failed(fault.message().to_string())),
                         _ => Ok(reply(step)),
                     };
-                    let at = self.applied;
                     let _ = answer.try_send(answered.map(|reply| Answered { reply, at }));
                 }
                 credentialed @ Pending::Credentialed { .. } => credentialed.answer(Ok(Answered {
                     reply: reply(step),
-                    at: self.applied,
+                    at,
                 })),
                 admin @ Pending::Admin { .. } => admin.answer(Ok(Answered {
                     reply: reply(step),
-                    at: self.applied,
+                    at,
                 })),
                 Pending::Sweep(_) | Pending::Duty(_) => {}
                 Pending::Message(message) | Pending::Failed(message) => match step {
                     Step::Ran(_) => {
-                        self.marks.insert(message.from, message.sequence);
+                        raise(&mut self.marks, message.from, message.sequence);
                         raise(&mut acks, message.from, message.sequence);
                     }
                     Step::Refused {

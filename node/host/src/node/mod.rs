@@ -126,7 +126,8 @@ pub(crate) struct Inner {
     /// The agents whose replica here leads, as their drivers last said:
     /// what the pair heartbeat lists, without a pass over every group.
     pub(crate) leaders: Mutex<HashSet<AgentId>>,
-    pub(crate) dry_runs: Mutex<HashMap<AgentId, DryRun>>,
+    /// Each agent's leader's dry runs of its results in flight.
+    pub(crate) dry_runs: Mutex<HashMap<AgentId, Vec<DryRun>>>,
     /// The blobs groups here asked for.
     wanted: Mutex<HashMap<[u8; 32], Wanted>>,
     pub(crate) drops: crate::peer::Drops,

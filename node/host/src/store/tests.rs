@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use vos_wire::ids::{InstanceId, SessionId};
 use vos_wire::keys;
 use vos_wire::result::Write;
@@ -603,4 +605,52 @@ fn a_store_with_rows_and_no_layout_is_refused() {
     let message = LayoutMismatch::shown(&error);
     assert!(message.contains("names no layout"), "{message}");
     assert!(message.contains("discards the node's secret"), "{message}");
+}
+
+#[test]
+fn unapplied_writes_read_over_the_applied_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Fjall::open(dir.path()).unwrap();
+    let mut batch = store.batch();
+    let applied: Vec<_> = [1, 3, 5, 7]
+        .map(|index| put(row(1, index), b"applied"))
+        .to_vec();
+    batch.apply(A, 0, 1, &applied);
+    batch.apply(B, 0, 1, &[put(row(1, 2), b"other")]);
+    batch.commit(PersistMode::Buffer).unwrap();
+    let delete = |key: Vec<u8>| Write { key, value: None };
+    let unapplied = Arc::new(Unapplied::new(
+        A,
+        &[
+            put(row(1, 2), b"new"),
+            put(row(1, 3), b"first"),
+            delete(row(1, 5)),
+            put(row(1, 3), b"again"),
+            put(row(1, 9), b"last"),
+            delete(row(1, 11)),
+        ],
+    ));
+    let view = store.snapshot().over(unapplied);
+    let prefix = keys::table_prefix(InstanceId(1), 7);
+    let read: Vec<(Vec<u8>, Vec<u8>)> = view.scan(A, &prefix, None).map(Result::unwrap).collect();
+    let expected: Vec<(Vec<u8>, Vec<u8>)> = [
+        (1, &b"applied"[..]),
+        (2, b"new"),
+        (3, b"again"),
+        (7, b"applied"),
+        (9, b"last"),
+    ]
+    .map(|(index, value)| (row(1, index), value.to_vec()))
+    .to_vec();
+    assert_eq!(read, expected);
+    let after = row(1, 3);
+    assert_eq!(
+        rows(&view, A, &prefix, Some(&after)),
+        [row(1, 7), row(1, 9)]
+    );
+    assert_eq!(view.get(A, &row(1, 3)).unwrap(), Some(b"again".to_vec()));
+    assert_eq!(view.get(A, &row(1, 5)).unwrap(), None);
+    assert_eq!(view.get(A, &row(1, 7)).unwrap(), Some(b"applied".to_vec()));
+    // Another agent's rows read as applied.
+    assert_eq!(rows(&view, B, &prefix, None), [row(1, 2)]);
 }

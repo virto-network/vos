@@ -11,7 +11,7 @@ use vos_wire::result::{WorkResult, Write as StateWrite};
 use vos_wire::{Decode, keys};
 
 use super::Shared;
-use crate::fault::Fault;
+use crate::fault::{Fault, read};
 use crate::node::Inner;
 use crate::storage::Change;
 use crate::store::{EntryKind, LogEntry, Snapshot};
@@ -19,37 +19,54 @@ use crate::{Backoff, lock, timeout};
 
 /// A leader's accumulate of its own result, run before proposing it, kept
 /// so the apply of that entry need not run it again. It matches the result
-/// entry right after the state's index, of the proposing leader's term,
-/// carrying the batch's seed: a leader loop proposes its next result only
-/// once the last one applied or was refused.
+/// entry right after the index of the state it ran on, of the proposing
+/// leader's term, carrying the batch's seed, and applies only to a state
+/// at the version it ran at: with batches in flight before it, it ran over
+/// their writes, and one of them applying as no writes leaves the state at
+/// another version.
 pub(crate) struct DryRun {
-    /// The applied index the state was at.
+    /// The index of the state it ran on: applied, or the last batch in
+    /// flight before it.
     pub applied: u64,
     /// The term of the leader proposing the result.
     pub term: u64,
     /// The seed of the batch the result is of.
     pub seed: [u8; 32],
+    /// The agent's version it ran at.
+    pub version: u64,
     pub writes: Vec<StateWrite>,
 }
 
 impl Inner {
     pub(crate) fn keep_dry_run(&self, id: AgentId, dry_run: DryRun) {
-        lock(&self.dry_runs).insert(id, dry_run);
+        lock(&self.dry_runs).entry(id).or_default().push(dry_run);
     }
 
     /// The writes of the leader's dry run of the result entry at `index`,
     /// of `term` and the batch `seed`, if it ran on the state that entry
-    /// applies to.
+    /// applies to, at `version`. Those of earlier entries go.
     pub(crate) fn dry_run(
         &self,
         id: AgentId,
         index: u64,
         term: u64,
         seed: Option<[u8; 32]>,
+        version: u64,
     ) -> Option<Vec<StateWrite>> {
-        let kept = lock(&self.dry_runs).remove(&id)?;
-        (kept.applied + 1 == index && kept.term == term && Some(kept.seed) == seed)
-            .then_some(kept.writes)
+        let mut dry_runs = lock(&self.dry_runs);
+        let kept = dry_runs.get_mut(&id)?;
+        let at = kept.iter().position(|kept| {
+            kept.applied + 1 == index
+                && kept.term == term
+                && Some(kept.seed) == seed
+                && kept.version == version
+        });
+        let found = at.map(|at| kept.swap_remove(at).writes);
+        kept.retain(|kept| kept.applied + 1 > index);
+        if kept.is_empty() {
+            dry_runs.remove(&id);
+        }
+        found
     }
 
     /// Commit `changes`, then take out of the pool the programs they unpin
@@ -140,7 +157,8 @@ async fn apply_one(inner: &Inner, shared: &Shared, index: u64) -> Result<(), Fau
                 Vec::new()
             } else {
                 let seed = result.as_ref().map(|result| result.seed);
-                match inner.dry_run(agent, index, term, seed) {
+                let version = read::<u64>(&snapshot, agent, &keys::version())?.unwrap_or(0);
+                match inner.dry_run(agent, index, term, seed, version) {
                     Some(writes) => writes,
                     None => accumulate(inner, shared, &snapshot, body, index).await?,
                 }

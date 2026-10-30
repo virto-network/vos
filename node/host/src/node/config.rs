@@ -33,6 +33,9 @@ pub struct Config {
     pub max_inputs: usize,
     /// The most argument bytes in one batch.
     pub max_bytes: usize,
+    /// The most batches an agent's leader has proposed whose results have
+    /// not yet applied: each refines over the writes of those before it.
+    pub in_flight: usize,
     /// How long a leader waits for more inputs after the first, when it
     /// found its queue empty.
     pub linger: Duration,
@@ -186,6 +189,7 @@ impl Config {
             queue: 1024,
             max_inputs: 256,
             max_bytes: 1 << 20,
+            in_flight: 4,
             linger: Duration::from_millis(2),
             refine_gas: defaults::REFINE_GAS,
             accumulate_gas: defaults::REFINE_GAS,
@@ -240,6 +244,8 @@ pub(crate) struct Settings {
     pub(crate) queue_cap: usize,
     pub(crate) max_inputs: usize,
     pub(crate) max_bytes: usize,
+    /// [`Config::in_flight`], one at least.
+    pub(crate) in_flight: usize,
     pub(crate) linger: Duration,
     pub(crate) refine_gas: u64,
     pub(crate) accumulate_gas: u64,
@@ -277,6 +283,7 @@ impl Settings {
             queue_cap: config.queue,
             max_inputs: config.max_inputs.max(1),
             max_bytes: config.max_bytes,
+            in_flight: config.in_flight.max(1),
             linger: config.linger,
             refine_gas: config.refine_gas,
             accumulate_gas: config.accumulate_gas,
