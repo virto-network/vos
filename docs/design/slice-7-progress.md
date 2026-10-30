@@ -2370,7 +2370,8 @@ since the bench and the gates prove under formats of their own.
 runs beside]: the device suite 29 of 29 and `vos-pvm-proof`'s format and
 `pcs` tests; `just check` green at `3a95da42` (1,646 passed in 125 suites;
 its first run caught a clippy type and the formatting, fixed); `just
-test-proof` green at `3a95da42`, `fixtures::` and `constants::` among it
+test-proof` green at `3a95da42` (582 passed in 50 suites), `fixtures::`
+and `constants::` among it
 (nothing moved by `mix_bytes`).
 
 **Commits:** `a69e76b0` (work in progress, at the quota stop),
