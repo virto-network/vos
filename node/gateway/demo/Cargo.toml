@@ -1,0 +1,52 @@
+[package]
+name = "vos-gateway-demo"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+publish = false
+description = "The s4 demo on a local space: one node of a founded space with the credential actor, the poll and the purses' ledger, and the gateway's SSH port serving the screens; and its end-to-end test, a headless s4 client proving with the device library."
+
+# Outside VOS's workspace: s4's crates ask a newer Rust than the workspace's
+# nightly, which builds them with `--ignore-rust-version`
+# (`just test-gateway-ssh`), so `just check` never resolves them.
+[workspace]
+
+[[bin]]
+name = "vos-gateway-demo"
+path = "src/main.rs"
+
+[dependencies]
+vos-gateway = { path = "..", features = ["ssh"] }
+vos-node = { path = "../../host" }
+vos-testkit = { path = "../../../agent/testkit" }
+vos-wire = { path = "../../../agent/wire" }
+vos-api = { path = "../../api" }
+ed25519-dalek = "2"
+getrandom = "0.2"
+hex = "0.4"
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "time", "io-std", "io-util", "signal"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+russh = { version = "0.61", default-features = false, features = ["ring", "flate2"] }
+
+[dev-dependencies]
+# The headless client: s4's protocol, and the `vos.credential` facility
+# proving with this tree's device library.
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "bd79bb852b67a518d46e26f4c6587910d21d9e4f" }
+s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "bd79bb852b67a518d46e26f4c6587910d21d9e4f" }
+hmac = "0.12"
+sha2 = "0.10"
+
+# The facility's device library is this tree's.
+[patch."https://codeberg.org/Virto/VOS"]
+vos-device = { path = "../../../pvm/device" }
+vos-api = { path = "../../api" }
+vos-wire = { path = "../../../agent/wire" }
+
+# As VOS's workspace: fjall's lsm-tree fork.
+[patch.crates-io]
+lsm-tree = { git = "https://github.com/olanod/lsm-tree", rev = "d0791931a96ff2be9b23af4e0d1ef17a330ed9f2" }
+
+# As VOS's workspace: the prover's crates optimized, since tests prove.
+[profile.dev.package."*"]
+opt-level = 3
