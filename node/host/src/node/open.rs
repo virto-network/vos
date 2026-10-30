@@ -349,6 +349,7 @@ fn connect(
             let (quic, arrivals) = vos_net::quic::Quic::bind(vos_net::quic::Config {
                 peers: space.peers(),
                 idle: config.quic_idle,
+                streams: config.peer_lanes.max(1).saturating_mul(4),
                 ..vos_net::quic::Config::new(number, secret, listen)
             })
             .map_err(|error| Error::Data(format!("{listen}: {error}")))?;

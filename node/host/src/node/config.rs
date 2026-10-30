@@ -71,6 +71,12 @@ pub struct Config {
     pub peer_bind: Option<std::net::SocketAddr>,
     /// How long a connection to a peer may stay quiet before it closes.
     pub quic_idle: Duration,
+    /// The streams to each peer that one class of the groups' traffic
+    /// shares: a group's consensus messages go on one of them by its id,
+    /// and its requests on another. A peer may hold four times as many
+    /// open at once, so no group waits for a stream however many talk at
+    /// once. The same on every node of a space.
+    pub peer_lanes: u32,
     /// A replica group's election timeout in milliseconds, drawn between
     /// these.
     pub election_timeout_ms: (u64, u64),
@@ -189,6 +195,7 @@ impl Config {
             prover_options: vos_node_prover::Options::default(),
             peer_bind: None,
             quic_idle: vos_net::quic::IDLE,
+            peer_lanes: crate::peer::LANES,
             peers: Peers::Quic,
             election_timeout_ms: (1500, 3000),
             heartbeat_ms: 500,
@@ -234,6 +241,8 @@ pub(crate) struct Settings {
     pub(crate) answered: Duration,
     pub(crate) resend_round: Duration,
     pub(crate) heartbeat_ms: u64,
+    /// [`Config::peer_lanes`], one at least.
+    pub(crate) lanes: u32,
     pub(crate) compact_every: u64,
     pub(crate) compact_bytes: u64,
     pub(crate) compact_tail: u64,
@@ -267,6 +276,7 @@ impl Settings {
             answered: config.answered,
             resend_round: config.resend_round,
             heartbeat_ms: config.heartbeat_ms,
+            lanes: config.peer_lanes.max(1),
             compact_every: config.compact_every,
             compact_bytes: config.compact_bytes,
             compact_tail: config.compact_tail,

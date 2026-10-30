@@ -7,13 +7,13 @@ use super::*;
 fn a_forwarded_call_comes_from_a_replica_on_its_agent_s_requests_stream() {
     let forward = forward();
     assert_eq!(peer::class(&forward), Class::Requests);
-    assert_eq!(peer::stream(&forward), u64::from(AGENT.0));
+    assert_eq!(peer::stream(&forward, peer::LANES), u64::from(AGENT.0));
     let read_index = PeerMessage::ReadIndex {
         agent: AGENT,
         token: 1,
     };
     assert_eq!(peer::class(&read_index), Class::Requests);
-    assert_eq!(peer::stream(&read_index), u64::from(AGENT.0));
+    assert_eq!(peer::stream(&read_index, peer::LANES), u64::from(AGENT.0));
     // An acknowledgement travels on its sender's stream: the agent it is
     // for.
     let acknowledge = PeerMessage::Acknowledge {
@@ -23,13 +23,14 @@ fn a_forwarded_call_comes_from_a_replica_on_its_agent_s_requests_stream() {
         relayed: false,
     };
     assert_eq!(peer::class(&acknowledge), Class::Requests);
-    assert_eq!(peer::stream(&acknowledge), u64::from(AGENT.0));
+    assert_eq!(peer::stream(&acknowledge, peer::LANES), u64::from(AGENT.0));
     assert_eq!(
         peer::check(
             &SPACE,
             &OURS,
             2,
             (Class::Consensus, u64::from(AGENT.0)),
+            peer::LANES,
             &forward,
             unfollowed
         ),
@@ -67,7 +68,7 @@ fn each_message_comes_on_its_class_and_a_raft_message_on_its_agent_s_stream() {
         entries: Vec::new(),
     });
     assert_eq!(peer::class(&append), Class::Consensus);
-    assert_eq!(peer::stream(&append), u64::from(AGENT.0));
+    assert_eq!(peer::stream(&append, peer::LANES), u64::from(AGENT.0));
     // On bulk, a Raft frame would escape its class's bound.
     assert_eq!(
         peer::check(
@@ -75,13 +76,22 @@ fn each_message_comes_on_its_class_and_a_raft_message_on_its_agent_s_stream() {
             &OURS,
             2,
             (Class::Bulk, u64::from(AGENT.0)),
+            peer::LANES,
             &append,
             unfollowed
         ),
         Err(Refusal::WrongClass)
     );
     assert_eq!(
-        peer::check(&SPACE, &OURS, 2, (Class::Consensus, 8), &append, unfollowed),
+        peer::check(
+            &SPACE,
+            &OURS,
+            2,
+            (Class::Consensus, 8),
+            peer::LANES,
+            &append,
+            unfollowed
+        ),
         Err(Refusal::WrongStream)
     );
     let bytes = b"a blob".to_vec();
@@ -90,11 +100,27 @@ fn each_message_comes_on_its_class_and_a_raft_message_on_its_agent_s_stream() {
         bytes,
     };
     assert_eq!(
-        peer::check(&SPACE, &OURS, 2, (Class::Consensus, 0), &blob, unfollowed),
+        peer::check(
+            &SPACE,
+            &OURS,
+            2,
+            (Class::Consensus, 0),
+            peer::LANES,
+            &blob,
+            unfollowed
+        ),
         Err(Refusal::WrongClass)
     );
     assert_eq!(
-        peer::check(&SPACE, &OURS, 2, (Class::Bulk, 3), &blob, unfollowed),
+        peer::check(
+            &SPACE,
+            &OURS,
+            2,
+            (Class::Bulk, 3),
+            peer::LANES,
+            &blob,
+            unfollowed
+        ),
         Ok(())
     );
 }
@@ -216,4 +242,58 @@ fn drops_are_counted_by_why() {
             assert_eq!(drops.get(refusal), 0);
         }
     }
+}
+
+/// However many groups talk at once, their frames to a peer share a
+/// bounded set of streams: an agent's id folds onto one of the lanes, its
+/// messages of every kind take that lane, and a Raft message on another
+/// stream is refused.
+#[test]
+fn groups_share_a_bounded_set_of_lanes() {
+    let far = AgentId(AGENT.0 + 3 * peer::LANES);
+    let append = PeerMessage::Raft {
+        agent: far,
+        message: Raft::Append {
+            term: 2,
+            leader: 2,
+            prev_index: 0,
+            prev_term: 0,
+            commit: 0,
+            round: 1,
+            entries: Vec::new(),
+        },
+    };
+    assert_eq!(peer::stream(&append, peer::LANES), u64::from(AGENT.0));
+    let read_index = PeerMessage::ReadIndex {
+        agent: far,
+        token: 1,
+    };
+    assert_eq!(peer::stream(&read_index, peer::LANES), u64::from(AGENT.0));
+    assert_eq!(
+        peer::check(
+            &SPACE,
+            &OURS,
+            2,
+            (Class::Consensus, u64::from(AGENT.0)),
+            peer::LANES,
+            &append,
+            unfollowed
+        ),
+        Ok(())
+    );
+    assert_eq!(
+        peer::check(
+            &SPACE,
+            &OURS,
+            2,
+            (Class::Consensus, u64::from(far.0)),
+            peer::LANES,
+            &append,
+            unfollowed
+        ),
+        Err(Refusal::WrongStream)
+    );
+    // Four lanes: a hundred thousand groups on four streams.
+    assert!((0..100_000).all(|id| peer::lane(AgentId(id), 4) < 4));
+    assert_eq!(peer::stream(&append, 4), u64::from(far.0 % 4));
 }

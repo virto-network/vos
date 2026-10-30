@@ -158,6 +158,31 @@ fn quiet_groups_elect_again_when_their_leaders_node_stops() {
     assert!(quiet, "the groups never went quiet again");
 }
 
+/// Every node restarts at once with more groups than a peer's connection
+/// holds streams for: the groups share a few lanes, and each elects a
+/// leader within a few election timeouts. A stream per group would leave
+/// those without one waiting for streams the groups still electing keep
+/// busy.
+#[test]
+fn more_groups_than_streams_elect_after_every_node_restarts() {
+    // Two lanes a class: eight streams a connection.
+    let mut cluster = Cluster::over_quic_tuned(3, |_, config| config.peer_lanes = 2);
+    let agents = agents(&cluster, 24);
+    for number in 1..=3 {
+        cluster.stop(number);
+    }
+    let started = Instant::now();
+    for number in 1..=3 {
+        cluster.start(number);
+    }
+    for &agent in &agents {
+        cluster.leader(agent);
+    }
+    let took = started.elapsed();
+    eprintln!("{} groups elected within {took:?}", agents.len());
+    assert!(took < Duration::from_secs(15), "{took:?}");
+}
+
 /// A follower node restarted while its groups are quiet, nothing written
 /// meanwhile, hears its leaders at once: each probes it on hearing its
 /// new run, rather than waiting for its own deadline to draw a heartbeat.

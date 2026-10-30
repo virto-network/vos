@@ -41,6 +41,7 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
             &OURS,
             from,
             (Class::Requests, u64::from(agent.0)),
+            peer::LANES,
             &message,
             |_| None,
         )
@@ -77,6 +78,7 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
             &OURS,
             3,
             (Class::Requests, u64::from(agent.0)),
+            peer::LANES,
             &relayed,
             |_| None,
         ),
@@ -106,6 +108,7 @@ fn a_placement_comes_from_its_creator_then_from_its_members() {
                 &OURS,
                 creator,
                 (Class::Requests, u64::from(agent.0)),
+                peer::LANES,
                 &message,
                 |_| None,
             ),

@@ -353,6 +353,7 @@ impl Inner {
             &self.space_and_clock().0,
             from,
             (Class::Liveness, stream),
+            self.settings.lanes,
             &message,
             |_| None,
         ) {

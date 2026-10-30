@@ -6,10 +6,10 @@
 //!   key; every arrival carries the authenticated peer it came from.
 //! - **Classes of traffic** ([`Class`]), each with its priority, its own
 //!   arrival queue and its own bound on a frame's size.
-//! - **Streams by group or by message.** Liveness, Consensus and Requests
-//!   frames travel on a long-lived stream per id (an agent's group), so
-//!   one agent's large frame never delays another's; Bulk opens a stream
-//!   per frame. Order holds within one stream on one connection, and only
+//! - **Streams by id or by message.** Liveness, Consensus and Requests
+//!   frames travel on a long-lived stream per id (the caller's: a node
+//!   folds its groups onto a bounded set of lanes), so one id's large
+//!   frame never delays another's; Bulk opens a stream per frame. Order holds within one stream on one connection, and only
 //!   there: a redial can reorder across the old and new connections. A
 //!   frame is delivered at most once.
 //! - **Frames are bytes;** their meaning belongs to the layer above.
