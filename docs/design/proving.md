@@ -1195,7 +1195,8 @@ binding the run like this:
 - **output:** the io-hash only: the entry (timestamp 1, pc 0, the
   layout's registers) and the halt's pc are the program's constants, every
   other register at the halt hidden, φ9..12 bound to the public io-hash by
-  one public claimed sum (DeviceIoChip's);
+  one public claimed sum (DeviceIoChip's); a device kernel's io-hash is
+  `H_io` below, over Poseidon2, not BLAKE2b;
 - **masking:** a floor of rows per masked component, set by the queries:
   the randomizer covers twice the rows a column reveals, `4|O| + q(|O| + 1)`
   for `|O|` offsets a column, rounded to a power of two `h`, and a component
@@ -1205,6 +1206,63 @@ binding the run like this:
   next-row read (`|O| = 1`) needs half, so `h` is set per component. Every
   segment chip reads its running sum's previous row, so each takes the
   full `h` [built, 7.14].
+
+**The device io-hash `H_io`** [proposed, slice 7's 7.17; for Fable's
+design check]. A device kernel's io-hash was `compute_io_hash`'s BLAKE2b-256,
+so BLAKE2b (3,136 columns) and its AND table stayed in every device
+shape, the Poseidon2 statement's too: 48% of its columns, and the Merkle
+hashing and the proof's bytes go with the columns [measured, 7.16]. Over
+`C`, a kernel that hashes only through `0x402` reaches neither.
+- **The bytes:** `E`, exactly what `compute_io_hash` hashes after its
+  domain: `compact(|a|) ‖ a ‖ compact(|o|) ‖ o ‖ compact(|R|)`, then each
+  root read's kind byte, space, window (8 bytes little-endian) and root;
+  `a` the public arguments, `o` the output, `R` the roots. `ℓ = |E|`, at
+  most a work result's 4 MiB, below 2^24; a longer return traps.
+- **The words:** `E` zero-padded to `n = ⌈ℓ / 24⌉` blocks of 24 bytes
+  (`n ≥ 1`: `E` holds at least three bytes); block `i`'s word `j` is
+  `b₀ + 2^8·b₁ + 2^16·b₂` of its three bytes, below 2^24, so no word
+  reaches p and the call never traps on one.
+- **The chain:** `h₀ = [t_io, ℓ, 0, 0, 0, 0, 0, 0]`, `t_io` the tag word
+  of the name `io` (`T(io)` with the length in word 1);
+  `h_i = C(h_{i−1}, block_i)`; `H_io = h_n`, its 8 words as 32
+  little-endian bytes in φ9..12 as before (each word below p, so the bytes
+  are canonical).
+- **Domain separation:** `t_io` is a seventh tag, pinned distinct from the
+  six. Every other first call of `C` in the system takes a tag block
+  (word 1 zero) or a digest on the left; `h₀`'s word 1 is `ℓ ≥ 3`, so
+  `H_io`'s first call is no other computation's but by a preimage of `C`,
+  and its later calls take `C`'s outputs.
+- **Why it binds:** an `H_io` collision gives a collision or an
+  IV-preimage of `C`. Equal `ℓ` means equal `n` and a padding injective at
+  that length, so two chains that meet hold a `C` collision (Merkle–Damgård
+  over a fixed IV); unequal `ℓ` start at different `h₀`, and walking two
+  meeting chains back ends at a `C` collision or at a `C` output equal to
+  some `h₀` (six zero words): a preimage. `C` is 248 bits, about 124 bits
+  against collisions (BLAKE2b-256's 128), far above the proofs' 62 proven
+  bits.
+- **What a device kernel is:** `#[attestable(device)]`, whose end writes
+  `H_io` (`vos_sdk`'s `attested_device`); an auth guard's `device = "..."`
+  must name one, else the macro refuses. Node kernels, formats 35 and 41
+  and their program ids keep BLAKE2b; `0x402` stays a device kernel's (pin
+  H).
+- **What the verifier and ingress check:** the verifier is unchanged (the
+  io-hash's 32 bytes are the public values, DeviceIoChip's sum recomputed
+  from them); ingress computes `H_io` from the request's words
+  (`a` the SCALE encoding of `CredentialPublic::Auth`, 129 bytes, `o`
+  empty, no roots: `ℓ = 133`, six blocks) by the one function the kernel's
+  end, the runtime and the testkit share
+  (`vos_pvm_precompiles::compute_device_io_hash`), and verifies the proof
+  under 43 against it. A proof whose kernel ended with BLAKE2b states
+  another io-hash and fails.
+- **What moves:** every device kernel's code and program id (none pinned
+  before ingress takes device proofs); a device kernel's io-hash wherever
+  its return is checked (`KernelReturn` by the kernel's profile);
+  the tags. **What does not:** pin I's auth words, the device chips,
+  DeviceIoChip, format 43's reference and bits (a device program may
+  still hold BLAKE2b, so the reference keeps it), every node format.
+- **Its cost:** six calls for auth (the Poseidon2 chip's rows 36 to 42,
+  under its floor) and the packing's steps; BLAKE2b and the AND table
+  leave the auth kernel's shape.
 
 **Format 43, device proofs** [measured, slice 7's 7.16]: masked (c), the
 Blake2s-M31 channel, blowup 4, 47 queries, PoW 16, interaction PoW 8,
