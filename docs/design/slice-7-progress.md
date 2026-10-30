@@ -3826,6 +3826,30 @@ One Opus review of the commit, no High; folded:
   differs between checkouts. The levers: build those workspaces from a
   fixed path, or bring their crates under one workspace root with their
   dependencies.
+- **Trim-paths, tried** [measured, branch `s7/repro-blobs`; two clean
+  worktrees at paths of different lengths, each its own targets]: built
+  as the recipes build them, the three differ raw and stripped, and no
+  path is among their strings. What differs is order alone: the crate
+  hashes in the symbol names (`vos_wire`, `vos_tree`, `vos_agent` itself,
+  each outside `agent/programs`; `core` and `alloc` equal) order the items
+  rustc sorts by symbol name, so four `drop_in_place` glues in the
+  agent's `.text` trade places (2,489 bytes; every function's size, the
+  other sections and the headers equal; no build id) and the Wasm blobs'
+  functions likewise. Trim-paths (`-Ztrim-paths` with the profile's
+  `trim-paths = "all"`), alone or with the venue guests' remap
+  (checkout root, `$CARGO_HOME`), changes every crate hash (the profile
+  is hashed) but not that they differ: the three still differ. It cannot
+  fix it: cargo hashes a path dependency outside the workspace's root by
+  its absolute path, whatever rustc's flags. Neither can a `-Cmetadata`
+  in the flags (rustc joins every `-Cmetadata` with cargo's, it replaces
+  none) nor `__CARGO_DEFAULT_LIB_METADATA` (one more seed beside the
+  path: the agent still differs). Built through one fixed path instead
+  (a symlink to each checkout, `--manifest-path` through it), the three
+  are byte-identical, raw and stripped. So both levers fix it: a fixed
+  build path, measured; one workspace root holding the crates and their
+  dependencies, as the venue guests already reproduce unstripped. A
+  fixed path shared by checkouts needs a lock against two building at
+  once.
 - `pvm/codec/src/anchor.rs`'s hand-computed offsets (item 25, Low; the
   codec reaches the kernels).
 - The `vos-pvm-guest-rt` crate item 23 named for later, which would drop
