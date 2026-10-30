@@ -2155,11 +2155,15 @@ fixed). Stopped once for the owner's quota (2026-10-27) and resumed
   row's, the blinding's among them), the widest relation's 265 limbs;
   derived from the built set by `recair/tests/device/format.rs`, which also
   pins 43's bits, one query fewer under 62, the least queries by blowup,
-  PoW and batching, the candidates' bits, and that a smaller program counts
-  more (2^11 62.90 down to 2^16 62.80 at blowup 2 with 86, affine).
-- **`device::DEVICE_MAX_LOG_SIZE` = 17**, which `install` enforces: a
-  program with a taller chip is refused, so the count holds for every
-  program 43 proves.
+  PoW and batching, the candidates' bits, and that a program with every
+  chip smaller counts more (uniform sizes 2^10 to 2^16; subsets and mixed
+  sizes are argued term by term in the review, not tested).
+- **`device::DEVICE_MAX_LOG_SIZE` = 17**, enforced by `install` and by
+  `device_format`, which the prover and the verifier both take: a program
+  with a taller chip, or one under its floor, however it was made, is
+  refused (`a_program_outside_the_formats_count_is_refused`), so the count
+  holds for every program 43 proves. No headroom: the auth statements'
+  ledgers are at 2^17 already.
 - **`tools/phone`'s device cells** (`vos-phone device`, `device.rs`):
   `statement/blowup:queries:pow/channel` (`b2sm31`, `b2b`), each in a child
   process: install from a reference run, a warm-up, timed traces and
@@ -2191,8 +2195,12 @@ affine; blowup 4, 43 at PoW 20 and 47 at PoW 16; blowup 8, 29.
 **x86** [measured, `spikes/s7-device/runs/x86-params.jsonl`,
 `x86-params-extra.jsonl`; `vos-phone device` on the fixed fork pin; 4
 threads pinned to four P-cores (1, 3, 6, 8), 8 over the six P-cores'
-twelve; 5 reps after a warm-up; masks from the OS; load 3.3–8 (other
-agents' runs), so about ±15%]; `p2` the auth statement over the Poseidon2
+twelve; 5 reps after a warm-up (the p95 of 5 is their maximum); the
+Blake2b-256 cells one rep, no warm-up; masks from the OS (the x86 binary
+was `just phone`'s seeded build, whose seed only the credential cells
+take: 5 distinct proofs a cell; the header's `format` is the credential
+format's, every cell's 43 whatever its parameters); load 3.3–10.6 (other
+agents' runs; the extra file at 7.7–10.6), so about ±15%]; `p2` the auth statement over the Poseidon2
 tree (18,733 steps), `b2` over the vos-tree (19,240):
 
 | cell | threads | prove p50 / p95 | peak | bytes | verify | R1 |
@@ -2217,13 +2225,15 @@ tree (18,733 steps), `b2` over the vos-tree (19,240):
 | p2 on Blake2b-256, 8:29:20 | 4 | 90.5 s | 5,647 MiB | 1,249,983 | 17.6 ms | |
 
 Configurations are blowup : queries : PoW. The trace takes 6–10 ms, the
-install (program and preprocessed root) 0.22–0.46 s; verification
+install (program and preprocessed root) 0.22–0.62 s; verification
 17–42 ms in the prover's pool (under pin J's 40 ms at the pin, not
 measured on one core).
 
-**The shape and the breakdown** [measured; p2 at 8:29:20 and b2 at
-4:43:20 by chip, the committed columns and their cells before blowup;
-perf over p2 at 4:47:16, 4 threads]:
+**The shape and the breakdown** [measured; p2 at 8:29:20 (floors 2^10)
+and b2 at 4:43:20 by chip, each component's committed columns and their
+cells at the masked level, before blowup (salts, `R` and the composition
+not counted); at the pin's floors of 2^11 the floor chips' shares, BLAKE2b's
+among them, about double; perf over p2 at 4:47:16, 4 threads, load 9.6]:
 - p2's 21 chips, 6,495 columns: **the CPU 54% of the cells** (2^15 rows,
   785 columns), the memory ledger 17% (**2^17 rows**), the registers' 9%
   (2^16), **BLAKE2b 7% at its floor but 3,136 columns**, program memory 3%,
@@ -2237,19 +2247,25 @@ perf over p2 at 4:47:16, 4 threads]:
 
 **The pin: format 43 at blowup 4, 47 queries, PoW 16** (affine; 110 /
 62.82). **No candidate meets both of pin J's budgets on the auth
-statement**: every one peaks at 2.3–5.7 GiB on x86 against 1 GiB, and of
-the Poseidon2 statement's proofs only blowup 8's fit 1.5 MiB (1.25 MB).
-Blowup 8 is the slowest (×1.5) and peaks near 5.7 GiB (about 6.5 GiB on
-the phone's mimalloc build, past what the phone's 7.5 GB leaves a
-process); blowup 2's proofs are 3.2 MB, twice the budget, more than any
-one lever removes. Blowup 4 is the middle on both, and with PoW 16 it
-proves fastest on 4 threads by median and 95th percentile (2.64 / 2.77
-s) and has the shortest grind tail (PoW 20's 95th percentile on the phone
-is 69–72 ms, PoW 16's 6–7 ms, 7.12's P2); its proof falls under 1.5 MiB
-once the io-hash's BLAKE2b leaves the shape (below, about 1.0 MB [est]).
-It is format 44's parameters, so the device and the credential formats
-share one grind and one parameter set. Format 43 stays reserved; 7.17's
-lever 4 counts again on the lighter shape.
+statements**: every one peaks at 2.2–6.3 GiB on x86 against 1 GiB. On
+bytes, the Poseidon2 statement's proofs fit 1.5 MiB only at blowup 8 (1.25
+MB), the BLAKE2b statement's at blowup 4 with PoW 20 (1.47 MB) and blowup
+8. Blowup 8 is the slowest (×1.5) and peaks near 5.7 GiB (about 6.5 GiB
+on the phone's mimalloc build, past what the phone's 7.5 GB leaves a
+process); blowup 2's proofs are 2.7–3.3 MB, about twice the budget, more
+than any one lever removes. **On time the candidates at blowup 2 and 4
+tie** within the noise (p2 on 4 threads 2.64–2.78 s, on 8 1.84–2.00 s,
+blowup 2 slightly ahead there; b2 favours blowup 2 by 25%, 2.12 against
+2.84 s), so the pin rests on bytes, memory and the grind: blowup 4's proofs
+are within about 20% of the budget (p2 1.89 MB; b2 1.59 MB at PoW 16, 1%
+over, 1.47 MB at PoW 20) and fall under it once the io-hash's BLAKE2b
+leaves the shape (about 1.0 MB [est], below); PoW 16's grind has the short
+tail (on the phone PoW 20's 95th percentile is 69–72 ms, PoW 16's 6–7 ms,
+7.12's P2) for 4 more queries and 8% more bytes; and it is format 44's
+parameter set, one grind and one set for both formats. The trade, taken:
+PoW 16 puts the BLAKE2b statement's proof 1% past 1.5 MiB where PoW 20
+keeps it under. Format 43 stays reserved; 7.17's lever 4 counts again on
+the lighter shape.
 
 **Session P4: not run.** The Fairphone 6 was not on USB when this step
 reached it (2026-10-30 17:40–19:00: `adb devices` empty, the phone not in
@@ -2295,11 +2311,11 @@ lever 1 removes BLAKE2b and its AND table, which it does not (below).
    19% of p2's columns (word-wide accesses, paired fractions; 7.15's note).
 5. **Threads by core class (lever 2):** 22% at PG1 on the phone; to be
    measured at P5.
-6. **Parameters again (lever 4):** on this shape blowup 2 and 4 cost the
-   same time; the floor's share is small at the device's sizes (the
+6. **Parameters again (lever 4):** on the Poseidon2 statement blowup 2
+   and 4 tie in time (on the BLAKE2b one blowup 2 is 25% faster); the floor's share is small at the device's sizes (the
    masking's floors are 2^10–2^12, the tall chips 2^15–2^17), so a tighter
    `h` buys little here; on a lean shape the floor's share grows.
-Memory is the second gate: every candidate is 2.3–5.7× the 1 GiB budget on
+Memory is the second gate: every candidate is 2.2–6.3× the 1 GiB budget on
 x86, and only the cells' reduction (levers 1–3) and the masked prover's
 working set bring it down.
 
@@ -2314,8 +2330,8 @@ working set bring it down.
 - **The memory ledger takes 2^17 rows** (a row a byte touched), not 2^16
   (7.15's record); so the reference is at 2^17, `install` refuses taller,
   and pin J's "at most 2^16 steps" bounds the CPU only.
-- **No candidate meets both budgets;** memory is 2.3–5.7× over on x86.
-- **Blake2b-256 is 8–25× slower** than Blake2s-M31 on the prover's trees
+- **No candidate meets both budgets;** memory is 2.2–6.3× over on x86.
+- **Blake2b-256 is 8–22× slower** than Blake2s-M31 on the prover's trees
   (the fork's Blake2b Merkle hashing has no SIMD path): 22–91 s against
   2.6–4.1 s; the comparison channel is out of the running for phones.
 - **A stack overflow at blowup 8 on 8 threads:** the prover's nested
@@ -2327,9 +2343,33 @@ working set bring it down.
   derivation path that admits it (pin H's "device kernels and handlers
   alone"); the spike patches it. For 7.20.
 
-**Commits:** `a69e76b0` (work in progress, at the quota stop), `8f58ae0c`
-the first merge, the pin and the measurements, the second merge, this
-record.
+**Review (Opus):** nothing high; the reference an upper bound term by
+term (levels maxima, constraints and fractions sums, the global relation
+width, affine batching ignoring the batch's size; the logup term near 97
+bits, not binding), `h = 512` enough for every device column (at most two
+offsets), affine batching what both sides run, the `mix_bytes` change
+unused by any pinned transcript. Folded: M1, the cap enforced only at
+install: `device_format`, which the prover and the verifier both take,
+now refuses a log size above `DEVICE_MAX_LOG_SIZE` or under its floor
+(the prover with `TraceShape`, the verifier with `Format`), and a gate
+shows it for a program made by hand; M2 and M3, the record's and the
+docs' pin claims (the BLAKE2b statement fits at blowup 4 with PoW 20; the
+times at blowup 2 and 4 a tie, the pin resting on bytes, memory and the
+grind); L2, a Blake2s-M31 run must be whole words (asserted, the 296-byte
+boundary run is), `transcript.rs`'s doc; L4–L6, the record's numbers and
+provenance; L7, pin J's shape bound restated as the rows' cap. Not taken:
+L1 (`mask_rows` lowers a component's `h` to the format's without error; no
+device column needs more at 47 queries, and the cap is pre-existing);
+L3 (the bound over chip subsets and mixed sizes is the review's
+term-by-term argument, not a test); `DeviceProgram`'s fields stay public
+(the gates build programs by hand; the checks are in `device_format`); a
+check that the format is the registry's 43 waits for ingress (7.20),
+since the bench and the gates prove under formats of their own.
+
+**Commits:** `a69e76b0` (work in progress, at the quota stop),
+`8f58ae0c` the first merge, `a4fdb6d4` the pin and the measurements, the
+second merge, `d421c7ee` and `583b6c5a` this record and its formatting,
+then the review's folds.
 
 ## Step 7.10b: the node API and the gateway
 

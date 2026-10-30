@@ -432,7 +432,9 @@ pinned by 7.7.
 
 ### Pin J: the device profile, and format 43
 
-- **The shape:** one segment, at most 2^16 steps; the shared chip set (the
+- **The shape:** one segment, every chip at most 2^17 rows
+  (`DEVICE_MAX_LOG_SIZE`: the memory ledger, a row a byte touched, outgrows
+  the steps); the shared chip set (the
   Poseidon2 chip and M5's levers, whether or not S32 lets them into 41)
   without the page-Merkle boundary (BLAKE2B_BOUNDARY, MEMORY_PAGE, MEMORY_MERKLE,
   MEMORY_ROOT_BOUNDARY); the run bound by
@@ -450,11 +452,12 @@ pinned by 7.7.
   Blake2s-M31 channel, **blowup 4, 47 queries, PoW 16**, interaction PoW 8,
   affine DEEP batching, `h = 512`: format 44's parameters; 110 conjectured
   and 62.82 proven bits on its masked reference (every device chip at
-  2^17 rows, the most install admits, `DEVICE_MAX_LOG_SIZE`). Chosen from
-  `device-params.md`'s candidates on x86 (none within both budgets on the
-  auth statement: blowup 8 alone fits 1.5 MiB but peaks near 5.7 GiB;
-  blowup 4 at PoW 16 the fastest with the shortest grind tail);
-  `slice-7-progress.md`'s 7.16. 37, reserved at an unmasked count, is
+  2^17 rows, the most install, the prover and the verifier admit,
+  `DEVICE_MAX_LOG_SIZE`). Chosen from `device-params.md`'s candidates on
+  x86 (none within both budgets on the auth statements: every one past 1
+  GiB, blowup 8 near 5.7 GiB; blowup 2's proofs about twice 1.5 MiB;
+  blowup 4 tying blowup 2 in time, its proofs within about 20% of the
+  budget, PoW 16 for the grind's tail); `slice-7-progress.md`'s 7.16. 37, reserved at an unmasked count, is
   retired unregistered. 7.17's lever 4 counts again on the lighter shape.
 - **The device program id:** the format, the chip mask, the log sizes and
   the preprocessed roots (program memory, data table, permissions), as a

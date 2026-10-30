@@ -49,15 +49,18 @@
 //!   bits: a fold verifies under half the recursion AIR's shape.
 //! - **The device format** (43) is counted on the device shape's masked
 //!   reference ([`DEVICE_REFERENCE`]: every chip a device program may hold
-//!   at `2^17` rows, the most install admits). Of the candidates measured
-//!   (blowup 2 with 85–87 queries, 4 with 43 at PoW 20 or 47 at PoW 16, 8
-//!   with 29), it takes the credential format's: blowup 4, 47 queries, PoW
-//!   16, affine batching (62.82 proven bits). On the auth statement none
-//!   meets the device budget's 1 GiB, and only blowup 8 its 1.5 MiB; blowup
-//!   8 peaks at about 5.7 GiB, past a phone's memory, blowup 2's proofs are
-//!   twice the budget, and blowup 4 with PoW 16 proves fastest with the
-//!   shortest grind tail. 37, reserved at an unmasked count before the
-//!   masking, is retired unregistered.
+//!   at `2^17` rows, the most install, the prover and the verifier admit).
+//!   Of the candidates measured (blowup 2 with 85–87 queries, 4 with 43 at
+//!   PoW 20 or 47 at PoW 16, 8 with 29), it takes the credential format's:
+//!   blowup 4, 47 queries, PoW 16, affine batching (62.82 proven bits). On
+//!   the auth statements none meets the device budget's 1 GiB; blowup 8 peaks
+//!   near 5.7 GiB, past a phone's memory, and blowup 2's proofs are about
+//!   twice the 1.5 MiB budget; blowup 4's times tie blowup 2's within the
+//!   noise, its proofs are within about 20% of the budget, and PoW 16's
+//!   grind has the short tail format 44 was chosen for (at PoW 20 the
+//!   BLAKE2b statement's proof fits the budget, at PoW 16 it passes it by
+//!   1%). 37, reserved at an unmasked count before the masking, is retired
+//!   unregistered.
 //! - **The credential format** (44) is counted on its masked shape
 //!   ([`CREDENTIAL_REFERENCE`]): two components at the masking's floor of
 //!   2^11 rows, where every blowup costs the same cells, so blowup 4, and

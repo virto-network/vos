@@ -67,8 +67,8 @@ pub fn mix_statement_header(
 /// A.1's third item: the boundary states, after the main trace's root and
 /// before any relation challenge, so the challenges depend on them and the
 /// boundary binding's public logup terms are bound: the boundary chips' own
-/// bytes ([`crate::boundary_binding::boundary_state_bytes`]), one M31 a byte,
-/// as one run of 296.
+/// bytes ([`crate::boundary_binding::boundary_state_bytes`]), as one run of
+/// 296 ([`crate::pcs::FsChannel::mix_bytes`]).
 pub fn mix_boundary_states(
     channel: &mut impl FsChannel,
     initial: &SegmentState,

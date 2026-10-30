@@ -239,6 +239,9 @@ fn prove_device_with<MC: MerkleChannel>(
 where
     SimdBackend: BackendForChannel<MC>,
 {
+    device_format(format, program, &program.header()).ok_or(ProveError::TraceShape(
+        "a log size under its floor or above the device format's reference",
+    ))?;
     let mut trace = device_trace(program, side_note)?;
     let side_note: &SideNote = side_note;
     tamper(&mut trace);
@@ -277,12 +280,25 @@ where
 }
 
 /// The masked format `format` pins for `program`, as its verifier takes it,
-/// and its chips laid out.
+/// and its chips laid out. `None` when a log size is under its floor or
+/// above `DEVICE_MAX_LOG_SIZE`, where the device format's count stops
+/// holding: the prover and the verifier both refuse such a program,
+/// however it was made.
 pub fn device_format<'a, H: MerkleHasherLifted>(
     format: &Format,
     program: &'a DeviceProgram<H>,
     header: &'a [u64],
 ) -> Option<(MaskedFormat<'a>, DeviceComponents)> {
+    let floors = device_floors(format, program.active)?;
+    let fits = floors.len() == program.log_sizes.len()
+        && program
+            .log_sizes
+            .iter()
+            .zip(&floors)
+            .all(|(&size, &floor)| floor <= size && size <= DEVICE_MAX_LOG_SIZE);
+    if !fits {
+        return None;
+    }
     let layout = DeviceComponents::layout(program.active, &program.log_sizes)?;
     let masked = super::verifier_format(format, &program.log_sizes, &layout)?;
     Some((

@@ -175,6 +175,37 @@ fn the_program_is_the_kernels() {
     assert!(install::<P2>(&format, &blob(), active, &under).is_err());
 }
 
+/// A program past the device format's reference (a chip above
+/// `DEVICE_MAX_LOG_SIZE`) or under a floor, however it was made, is refused
+/// at install, by the prover and by the verifier, which refuses an honest
+/// proof checked against it.
+#[test]
+fn a_program_outside_the_formats_count_is_refused() {
+    use vos_pvm_proof::device::DEVICE_MAX_LOG_SIZE;
+    let format = format();
+    let honest = the_program();
+    let (proof, _) =
+        prove::<P2>(&format, honest, &blob(), &witness(1), MaskRng::Seeded(5)).expect("proves");
+    verify::<P2>(&format, honest, &proof).expect("verifies");
+    let mut tall = honest.clone();
+    tall.log_sizes[0] = DEVICE_MAX_LOG_SIZE + 1;
+    let mut short = honest.clone();
+    short.log_sizes[0] = vos_pvm_recair::masked::device::device_floors(&format, honest.active)
+        .expect("floors")[0]
+        - 1;
+    assert!(install::<P2>(&format, &blob(), tall.active, &tall.log_sizes).is_err());
+    for program in [&tall, &short] {
+        assert!(matches!(
+            verify::<P2>(&format, program, &proof),
+            Err(Error::Format)
+        ));
+        assert!(matches!(
+            prove::<P2>(&format, program, &blob(), &witness(1), MaskRng::Seeded(5)),
+            Err(ProveError::TraceShape(_))
+        ));
+    }
+}
+
 /// A chip the code reaches and the run never uses proves at its program's
 /// log size, every row padding: a kernel whose multiplication follows its
 /// halt.
