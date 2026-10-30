@@ -712,10 +712,11 @@ impl App for Screens {
                     )
                     .button("Enroll this device", Message::Enroll);
                 match self.digests {
-                    Some((member, owner)) => page
-                        .text(format!("Member digest: {}", hex::encode(member)))
-                        .text(format!("Owner digest: {}", hex::encode(owner)))
-                        .text("Ask the space's operator to invite both, then claim them.")
+                    Some(_) => page
+                        .text(
+                            "Your device showed its two digests in its own window: read \
+                             them from there to the space's operator, then claim them.",
+                        )
                         .button("Claim", Message::Claim),
                     None => page,
                 }

@@ -32,8 +32,8 @@ russh = { version = "0.61", default-features = false, features = ["ring", "flate
 [dev-dependencies]
 # The headless client: s4's protocol, and the `vos.credential` facility
 # proving with this tree's device library.
-s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "bd79bb852b67a518d46e26f4c6587910d21d9e4f" }
-s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "bd79bb852b67a518d46e26f4c6587910d21d9e4f" }
+s4-protocol = { git = "https://codeberg.org/Virto/s4", rev = "6f60229e97fb1f54b51f53c2406c168e1004a19b" }
+s4-credential = { git = "https://codeberg.org/Virto/s4", rev = "6f60229e97fb1f54b51f53c2406c168e1004a19b" }
 hmac = "0.12"
 sha2 = "0.10"
 

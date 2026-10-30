@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 
 use tokio::io::AsyncBufReadExt as _;
-use vos_gateway_demo::{LocalSpace, host_key, random};
+use vos_gateway_demo::{LocalSpace, random};
 
 fn digest(text: &str) -> Result<[u8; 32], String> {
     hex::decode(text)
@@ -43,6 +43,33 @@ fn command(space: &LocalSpace, line: &str) -> Result<String, String> {
     }
 }
 
+/// The host key whose seed is kept at `path`, made there on the first run so
+/// that a phone which trusted it keeps recognising the gateway.
+fn kept_host_key(path: &std::path::Path) -> Result<russh::keys::PrivateKey, String> {
+    let seed: [u8; 32] = match std::fs::read(path) {
+        Ok(bytes) => bytes
+            .try_into()
+            .map_err(|_| format!("{}: not a 32-byte seed", path.display()))?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let seed = random();
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+                .and_then(|mut file| file.write_all(&seed))
+                .map_err(|error| format!("{}: {error}", path.display()))?;
+            seed
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    Ok(russh::keys::PrivateKey::from(
+        russh::keys::ssh_key::private::Ed25519Keypair::from_seed(&seed),
+    ))
+}
+
 fn main() -> Result<(), String> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -65,7 +92,7 @@ fn main() -> Result<(), String> {
         let listener = tokio::net::TcpListener::bind(&ssh)
             .await
             .map_err(|error| format!("{ssh}: {error}"))?;
-        let host_key = host_key();
+        let host_key = kept_host_key(&data.join("host_key"))?;
         let fingerprint = host_key
             .public_key()
             .fingerprint(russh::keys::ssh_key::HashAlg::Sha256);

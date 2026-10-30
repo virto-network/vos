@@ -361,8 +361,7 @@ impl Headless {
 }
 
 fn digest(shown: &str) -> [u8; 32] {
-    let hex = shown.rsplit(' ').next().unwrap();
-    hex::decode(hex).unwrap().try_into().unwrap()
+    hex::decode(shown).unwrap().try_into().unwrap()
 }
 
 /// A local space and its gateway, and a headless client on its SSH port.
@@ -398,10 +397,14 @@ async fn enroll_sign_in_and_pay_through_the_gateways_ssh_port() {
     // digests, which the operator invites before the claim.
     phone.type_into("Your row's name", "alice").await;
     user.will(confirm(&[]));
+    user.will(confirm(&[]));
     let at = phone.click("Enroll this device").await;
-    let member = digest(&phone.settle(at, &["Member digest"]).await);
-    let owner = digest(&phone.settle(0, &["Owner digest"]).await);
+    phone.settle(at, &["in its own window"]).await;
     let enrolled = user.shown.lock().unwrap()[0].clone();
+    let digests = user.shown.lock().unwrap()[1].clone();
+    assert_eq!(digests.title, "This device's digests");
+    let member = digest(&digests.rows[0].1);
+    let owner = digest(&digests.rows[1].1);
     assert_eq!(enrolled.title, "Enroll this device");
     assert!(
         enrolled
