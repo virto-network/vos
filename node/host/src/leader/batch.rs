@@ -11,7 +11,6 @@ use vos_wire::keys;
 
 use super::close::Closes;
 use super::execute::{Flight, Launched};
-use super::sweep::{due_rows, first_due};
 use super::{Ended, Leader};
 use crate::fault::{Fault, read};
 use crate::node::{Answered, Pending, Reply};
@@ -68,7 +67,7 @@ impl Leader {
         let read_state = read::<u64>(&snapshot, self.id, &keys::version()).and_then(|version| {
             let applied = snapshot.applied(self.id)?;
             let floor = read::<u64>(&snapshot, self.id, &keys::batch_time())?;
-            let first = first_due(&snapshot, self.id)?;
+            let first = self.sweeps.first_due(&snapshot, self.id)?;
             Ok((version, applied, floor, first))
         });
         let (version, floor, first) = match read_state {
@@ -103,7 +102,7 @@ impl Leader {
         // rows due at the batch's time, which refine takes by their keys.
         let sweeping = first.filter(|first| self.sweeps(*first, time));
         if sweeping.is_some() {
-            match due_rows(&snapshot, self.id, time) {
+            match self.sweeps.due_rows(&snapshot, self.id, time) {
                 Ok(due) => pending.insert(0, Pending::Sweep(due)),
                 Err(fault) => {
                     self.retry(pending, fault).await;
@@ -162,6 +161,7 @@ impl Leader {
                 writes,
                 proposed,
             }) => {
+                self.sweeps.writes(&writes);
                 // The batches after it take its messages as consumed.
                 for item in &pending {
                     if let Pending::Message(message) | Pending::Failed(message) = item {

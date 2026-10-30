@@ -228,12 +228,28 @@ impl Snapshot {
         prefix: &'a [u8],
         after: Option<&'a [u8]>,
     ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a {
-        let applied = self.applied_scan(agent, prefix, after);
+        let start = match after {
+            Some(after) if after >= prefix => Bound::Excluded(after),
+            _ => Bound::Included(prefix),
+        };
+        self.scan_from(agent, prefix, start)
+    }
+
+    /// Rows whose key starts with `prefix`, in key order, from `start`, or
+    /// from the prefix when `start` is below it.
+    pub fn scan_from<'a>(
+        &'a self,
+        agent: AgentId,
+        prefix: &'a [u8],
+        start: Bound<&'a [u8]>,
+    ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a {
+        let start = match start {
+            Bound::Included(key) | Bound::Excluded(key) if key < prefix => Bound::Included(prefix),
+            Bound::Unbounded => Bound::Included(prefix),
+            start => start,
+        };
+        let applied = self.applied_scan(agent, prefix, start);
         let unapplied = self.unapplied(agent).map(|unapplied| {
-            let start = match after {
-                Some(after) if after >= prefix => Bound::Excluded(after),
-                _ => Bound::Included(prefix),
-            };
             unapplied
                 .rows
                 .range::<[u8], _>((start, Bound::Unbounded))
@@ -251,7 +267,7 @@ impl Snapshot {
         &self,
         agent: AgentId,
         prefix: &[u8],
-        after: Option<&[u8]>,
+        start: Bound<&[u8]>,
     ) -> impl Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> {
         assert!(!prefix.is_empty(), "a scan names its partition");
         // An unreadable epoch row is the scan's first, and only, item: never
@@ -261,9 +277,10 @@ impl Snapshot {
             Err(error) => (0, Some(error)),
         };
         let broken = failed.is_some();
-        let start = match after {
-            Some(after) if after >= prefix => Bound::Excluded(agent_key(agent, epoch, after)),
-            _ => Bound::Included(agent_key(agent, epoch, prefix)),
+        let start = match start {
+            Bound::Excluded(after) => Bound::Excluded(agent_key(agent, epoch, after)),
+            Bound::Included(from) => Bound::Included(agent_key(agent, epoch, from)),
+            Bound::Unbounded => Bound::Included(agent_key(agent, epoch, prefix)),
         };
         let prefix = agent_key(agent, epoch, prefix);
         let rows = self

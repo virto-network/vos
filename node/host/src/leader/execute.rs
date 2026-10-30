@@ -78,6 +78,7 @@ impl Leader {
         else {
             return Ok(Ended::Lost);
         };
+        self.sweeps.writes(&writes);
         let flight = Flight {
             pending: Vec::new(),
             result,
