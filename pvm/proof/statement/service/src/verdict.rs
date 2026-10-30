@@ -11,7 +11,8 @@ use alloc::vec::Vec;
 
 use vos_statement::DecodeError;
 use vos_statement::vos_anchor::codec::{self, Reader};
-use vos_statement::vos_anchor::{RootKind, SpaceId, WindowClock};
+use vos_statement::vos_anchor::venue::{AnchorRefusal, RegisterRefusal};
+use vos_statement::vos_anchor::{RootKind, RootRead, SpaceId, WindowClock};
 
 use crate::item::{Kind, Op};
 
@@ -35,6 +36,16 @@ pub struct Root {
 
 impl Root {
     const BYTES: usize = 1 + 8 + 32;
+}
+
+impl From<&RootRead> for Root {
+    fn from(read: &RootRead) -> Self {
+        Self {
+            kind: read.kind,
+            window: read.window,
+            root: read.root,
+        }
+    }
 }
 
 /// A statement's judgement at refine: every check of `judge`'s but
@@ -91,6 +102,32 @@ pub enum Verdict {
     Refused { kind: Option<Kind>, code: u32 },
 }
 
+/// A verdict's tag, its first byte; 1 is retired, never reused. Not an
+/// item's [`Kind`]: a control's verdict is 5 where its item is 4, and 4 is
+/// a refusal's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum Tag {
+    Register = 0,
+    Anchor = 2,
+    Submit = 3,
+    Refused = 4,
+    Control = 5,
+}
+
+impl Tag {
+    const fn from_u8(byte: u8) -> Option<Self> {
+        Some(match byte {
+            0 => Self::Register,
+            2 => Self::Anchor,
+            3 => Self::Submit,
+            4 => Self::Refused,
+            5 => Self::Control,
+            _ => return None,
+        })
+    }
+}
+
 impl Verdict {
     /// Its encoding: a tag, then its fields; integers little-endian, a
     /// sequence a compact count before its items. At most
@@ -99,7 +136,7 @@ impl Verdict {
         let mut out = Vec::new();
         match self {
             Self::Register(registered) => {
-                out.push(0);
+                out.push(Tag::Register as u8);
                 out.extend_from_slice(&registered.space.0);
                 registered.clock.encode_to(&mut out);
                 out.extend_from_slice(&registered.controller);
@@ -115,7 +152,7 @@ impl Verdict {
                 root,
                 signer,
             } => {
-                out.push(2);
+                out.push(Tag::Anchor as u8);
                 out.extend_from_slice(&space.0);
                 out.extend_from_slice(&window.to_le_bytes());
                 out.push(*kind as u8);
@@ -123,7 +160,7 @@ impl Verdict {
                 out.extend_from_slice(signer);
             }
             Self::Submit(judged) => {
-                out.push(3);
+                out.push(Tag::Submit as u8);
                 out.extend_from_slice(&judged.id);
                 out.extend_from_slice(&judged.program);
                 out.extend_from_slice(&judged.space.0);
@@ -141,15 +178,15 @@ impl Verdict {
                 op,
                 controller,
             } => {
-                out.push(5);
+                out.push(Tag::Control as u8);
                 out.extend_from_slice(&space.0);
                 out.extend_from_slice(&nonce.to_le_bytes());
                 op.encode_to(&mut out);
                 out.extend_from_slice(controller);
             }
             Self::Refused { kind, code } => {
-                out.push(4);
-                out.push(kind.map_or(u8::MAX, |kind| kind as u8));
+                out.push(Tag::Refused as u8);
+                out.push(Kind::encode_option(*kind));
                 out.extend_from_slice(&code.to_le_bytes());
             }
         }
@@ -159,8 +196,9 @@ impl Verdict {
     /// The verdict at the start of `bytes`, and the bytes it takes.
     pub fn decode_prefix(bytes: &[u8]) -> Result<(Self, usize), DecodeError> {
         let mut reader = Reader::new(bytes);
-        let verdict = match reader.u8()? {
-            0 => {
+        let tag = Tag::from_u8(reader.u8()?).ok_or(DecodeError::Noncanonical)?;
+        let verdict = match tag {
+            Tag::Register => {
                 let space = SpaceId(reader.array()?);
                 let clock = WindowClock::decode_from(&mut reader)?;
                 let controller = reader.array()?;
@@ -175,14 +213,14 @@ impl Verdict {
                     keys,
                 })
             }
-            2 => Self::Anchor {
+            Tag::Anchor => Self::Anchor {
                 space: SpaceId(reader.array()?),
                 window: reader.u64()?,
                 kind: RootKind::decode_from(&mut reader)?,
                 root: reader.array()?,
                 signer: reader.array()?,
             },
-            3 => {
+            Tag::Submit => {
                 let id = reader.array()?;
                 let program = reader.array()?;
                 let space = SpaceId(reader.array()?);
@@ -205,23 +243,16 @@ impl Verdict {
                     code,
                 })
             }
-            4 => {
-                let kind = match reader.u8()? {
-                    u8::MAX => None,
-                    byte => Some(Kind::from_u8(byte).ok_or(DecodeError::Noncanonical)?),
-                };
-                Self::Refused {
-                    kind,
-                    code: reader.u32()?,
-                }
-            }
-            5 => Self::Control {
+            Tag::Refused => Self::Refused {
+                kind: Kind::decode_option(reader.u8()?)?,
+                code: reader.u32()?,
+            },
+            Tag::Control => Self::Control {
                 space: SpaceId(reader.array()?),
                 nonce: reader.u64()?,
                 op: Op::decode_from(&mut reader)?,
                 controller: reader.array()?,
             },
-            _ => return Err(DecodeError::Noncanonical),
         };
         Ok((verdict, reader.used()))
     }
@@ -238,10 +269,38 @@ impl Verdict {
     }
 }
 
+/// An outcome's codes, a `#[repr(u32)]` enum, with the variant a code
+/// names (`TryFrom<u32>`, the code back when it names none).
+macro_rules! codes {
+    (
+        $(#[$meta:meta])*
+        pub enum $name:ident {
+            $($(#[$doc:meta])* $variant:ident = $code:literal,)+
+        }
+    ) => {
+        $(#[$meta])*
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        #[repr(u32)]
+        pub enum $name {
+            $($(#[$doc])* $variant = $code,)+
+        }
+
+        impl TryFrom<u32> for $name {
+            type Error = u32;
+
+            fn try_from(code: u32) -> Result<Self, u32> {
+                match code {
+                    $($code => Ok(Self::$variant),)+
+                    _ => Err(code),
+                }
+            }
+        }
+    };
+}
+
+codes! {
 /// A registration's outcome (`vos_anchor::venue::RegisterRefusal`'s); 4, 6
 /// and 7 are retired, never reused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
 pub enum RegisterCode {
     Registered = 0,
     /// The item does not decode.
@@ -256,10 +315,20 @@ pub enum RegisterCode {
     /// The space is registered already, ended or not.
     Again = 5,
 }
+}
 
+impl From<RegisterRefusal> for RegisterCode {
+    fn from(refusal: RegisterRefusal) -> Self {
+        match refusal {
+            RegisterRefusal::Genesis | RegisterRefusal::Clock => Self::Genesis,
+            RegisterRefusal::Founder => Self::Founder,
+            RegisterRefusal::Exists => Self::Again,
+        }
+    }
+}
+
+codes! {
 /// An anchor's outcome: `vos_anchor::venue::anchor`'s, and refine's.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
 pub enum AnchorCode {
     New = 0,
     /// The venue held that root already.
@@ -281,10 +350,24 @@ pub enum AnchorCode {
     /// evidence, the space ended for good.
     Equivocation = 10,
 }
+}
 
+impl From<AnchorRefusal> for AnchorCode {
+    fn from(refusal: AnchorRefusal) -> Self {
+        match refusal {
+            AnchorRefusal::Unregistered => Self::Unregistered,
+            AnchorRefusal::Stopped => Self::Ended,
+            AnchorRefusal::Key => Self::Key,
+            AnchorRefusal::Signature => Self::Signature,
+            AnchorRefusal::Window => Self::Window,
+            AnchorRefusal::Open => Self::Open,
+            AnchorRefusal::Age => Self::Age,
+        }
+    }
+}
+
+codes! {
 /// A control's outcome; 7 is retired, never reused.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u32)]
 pub enum ControlCode {
     Done = 0,
     Item = 1,
@@ -297,6 +380,7 @@ pub enum ControlCode {
     /// A key listed already, `MAX_FOUNDING_KEYS` listed, or a key of small
     /// order, to add; one not listed to remove.
     Key = 6,
+}
 }
 
 #[cfg(test)]
@@ -352,5 +436,25 @@ mod tests {
             assert_eq!(Verdict::decode_prefix(&bytes), Ok((verdict, bytes.len())));
         }
         assert!(Verdict::decode_prefix(&[1]).is_err());
+    }
+
+    /// A code names its variant, and no variant another code.
+    #[test]
+    fn a_code_names_its_variant() {
+        for code in 0..=11 {
+            if let Ok(anchor) = AnchorCode::try_from(code) {
+                assert_eq!(anchor as u32, code);
+            }
+            if let Ok(register) = RegisterCode::try_from(code) {
+                assert_eq!(register as u32, code);
+            }
+            if let Ok(control) = ControlCode::try_from(code) {
+                assert_eq!(control as u32, code);
+            }
+        }
+        assert_eq!(AnchorCode::try_from(10), Ok(AnchorCode::Equivocation));
+        assert_eq!(AnchorCode::try_from(11), Err(11));
+        assert_eq!(RegisterCode::try_from(4), Err(4));
+        assert_eq!(ControlCode::try_from(7), Err(7));
     }
 }

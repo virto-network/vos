@@ -39,38 +39,17 @@ extern crate alloc;
 mod runtime;
 
 use alloc::vec::Vec;
-use core::arch::global_asm;
 
-use runtime::{STACK_BYTES, gas_left};
-use vos_statement_service::accumulate::{Operand, accumulate};
+use runtime::{Call, FetchKind, NONE, Output, STACK_BYTES, gas_left};
+use vos_pvm_program::read_nat;
+use vos_statement_service::accumulate::{accumulate, operand};
 use vos_statement_service::config::{self, Config};
-use vos_statement_service::natural;
 use vos_statement_service::refine::{Extrinsics, refine, venue};
 use vos_statement_service::state::{Storage, keys};
+use vos_statement_service::verdict::{RegisterCode, Verdict};
+use vos_wire::jam::RefineArgs;
 
-global_asm!(
-    ".global _start",
-    ".type _start, @function",
-    "_start:",
-    "mv s0, ra",
-    "lla t0, VERIFY_STACK",
-    "li t1, {size}",
-    "add sp, t0, t1",
-    "jal ra, refine_main",
-    "mv ra, s0",
-    "ret",
-    ".global accumulate",
-    ".type accumulate, @function",
-    "accumulate:",
-    "mv s0, ra",
-    "lla t0, VERIFY_STACK",
-    "li t1, {size}",
-    "add sp, t0, t1",
-    "jal ra, accumulate_main",
-    "mv ra, s0",
-    "ret",
-    size = const STACK_BYTES,
-);
+entries!("_start" => "refine_main", "accumulate" => "accumulate_main");
 
 /// The deployment's constants, as `config::configure` set them in the
 /// linked program; [`config::UNSET`] as built, which pins nothing.
@@ -92,24 +71,23 @@ fn config() -> Config {
 
 // ── Host calls ───────────────────────────────────────────────────────────
 
-const FETCH: u64 = 2;
-const READ: u64 = 4;
-const WRITE: u64 = 5;
-const NONE: u64 = u64::MAX;
-/// `fetch` kinds: the running item's extrinsic φ11, accumulate's input φ11.
-const OUR_EXTRINSIC: u64 = 4;
-const INPUT: u64 = 15;
 /// `read`'s service: the running one.
 const SELF_SERVICE: u64 = u64::MAX;
 
-/// The whole of a value `fetch` of `kind` and index `index` serves: none
-/// when there is none.
-fn fetch(kind: u64, index: u64) -> Option<Vec<u8>> {
-    let len = fetch_len(kind, index)?;
+/// The value `fetch` of `kind` and index `index` serves, all `len` bytes of
+/// it: none when the host writes another count.
+fn fetch_exact(kind: FetchKind, index: u64, len: usize) -> Option<Vec<u8>> {
     let mut bytes: Vec<u8> = Vec::with_capacity(len);
     let got = hostcall!(
-        FETCH,
-        [bytes.as_mut_ptr() as u64, 0, len as u64, kind, index, 0]
+        Call::Fetch,
+        [
+            bytes.as_mut_ptr() as u64,
+            0,
+            len as u64,
+            kind as u64,
+            index,
+            0
+        ]
     );
     if got != len as u64 {
         return None;
@@ -119,11 +97,20 @@ fn fetch(kind: u64, index: u64) -> Option<Vec<u8>> {
     Some(bytes)
 }
 
+/// The whole of a value `fetch` of `kind` and index `index` serves: none
+/// when there is none.
+fn fetch(kind: FetchKind, index: u64) -> Option<Vec<u8>> {
+    fetch_exact(kind, index, fetch_len(kind, index)?)
+}
+
 /// The length of the value `fetch` of `kind` and index `index` serves,
 /// asking for none of it.
-fn fetch_len(kind: u64, index: u64) -> Option<usize> {
+fn fetch_len(kind: FetchKind, index: u64) -> Option<usize> {
     let mut none = [0u8; 1];
-    let len = hostcall!(FETCH, [none.as_mut_ptr() as u64, 0, 0, kind, index, 0]);
+    let len = hostcall!(
+        Call::Fetch,
+        [none.as_mut_ptr() as u64, 0, 0, kind as u64, index, 0]
+    );
     (len != NONE).then(|| usize::try_from(len).ok()).flatten()
 }
 
@@ -132,28 +119,11 @@ struct Proof;
 
 impl Extrinsics for Proof {
     fn proof_len(&mut self) -> Option<usize> {
-        fetch_len(OUR_EXTRINSIC, 0)
+        fetch_len(FetchKind::OurExtrinsic, 0)
     }
 
     fn proof(&mut self, len: usize) -> Vec<u8> {
-        let mut bytes: Vec<u8> = Vec::with_capacity(len);
-        let got = hostcall!(
-            FETCH,
-            [
-                bytes.as_mut_ptr() as u64,
-                0,
-                len as u64,
-                OUR_EXTRINSIC,
-                0,
-                0
-            ]
-        );
-        if got != len as u64 {
-            return Vec::new();
-        }
-        // SAFETY: the host wrote all `len` bytes.
-        unsafe { bytes.set_len(len) };
-        bytes
+        fetch_exact(FetchKind::OurExtrinsic, 0, len).unwrap_or_default()
     }
 }
 
@@ -163,13 +133,13 @@ struct Service;
 impl Storage for Service {
     fn read(&mut self, key: &[u8]) -> Option<Vec<u8>> {
         let len = hostcall!(
-            READ,
+            Call::Read,
             [SELF_SERVICE, key.as_ptr() as u64, key.len() as u64, 0, 0, 0]
         );
         let len = usize::try_from(len).ok().filter(|_| len != NONE)?;
         let mut value: Vec<u8> = Vec::with_capacity(len);
         let got = hostcall!(
-            READ,
+            Call::Read,
             [
                 SELF_SERVICE,
                 key.as_ptr() as u64,
@@ -194,7 +164,7 @@ impl Storage for Service {
     fn write(&mut self, key: &[u8], value: Option<&[u8]>) {
         let value = value.unwrap_or_default();
         let answer = hostcall!(
-            WRITE,
+            Call::Write,
             [
                 key.as_ptr() as u64,
                 key.len() as u64,
@@ -222,22 +192,6 @@ fn trap() -> ! {
 
 // ── The entries ──────────────────────────────────────────────────────────
 
-#[repr(C)]
-pub struct Output {
-    address: u64,
-    len: u64,
-}
-
-/// Refine's arguments: the service and the payload.
-fn refine_args(args: &[u8]) -> Option<(u32, &[u8])> {
-    let (_, at) = natural(args, 0)?;
-    let (_, at) = natural(args, at)?;
-    let (service, at) = natural(args, at)?;
-    let (len, at) = natural(args, at)?;
-    let end = at.checked_add(usize::try_from(len).ok()?)?;
-    Some((u32::try_from(service).ok()?, args.get(at..end)?))
-}
-
 /// # Safety
 ///
 /// The host maps the argument window at (`args`, `len`).
@@ -247,11 +201,15 @@ unsafe extern "C" fn refine_main(args: *const u8, len: u64) -> Output {
     // SAFETY: see the function's contract.
     let args = unsafe { core::slice::from_raw_parts(args, len as usize) };
     let config = config();
-    let mut output = match refine_args(args) {
-        Some((service, payload)) => refine(&config, venue(&config, service), payload, &mut Proof),
-        None => vos_statement_service::verdict::Verdict::Refused {
+    let service = RefineArgs::decode(args).and_then(|args| {
+        let service = u32::try_from(args.service).ok()?;
+        Some((service, args.payload))
+    });
+    let mut output = match service {
+        Some((service, payload)) => refine(&config, venue(&config, service), &payload, &mut Proof),
+        None => Verdict::Refused {
             kind: None,
-            code: 1,
+            code: RegisterCode::Item as u32,
         },
     }
     .encode();
@@ -271,15 +229,15 @@ unsafe extern "C" fn accumulate_main(args: *const u8, len: u64) -> Output {
     let start = gas_left();
     // SAFETY: see the function's contract.
     let args = unsafe { core::slice::from_raw_parts(args, len as usize) };
-    let parsed = natural(args, 0).and_then(|(slot, at)| {
-        let (service, at) = natural(args, at)?;
-        let (count, _) = natural(args, at)?;
+    let parsed = read_nat(args, 0).and_then(|(slot, at)| {
+        let (service, used) = read_nat(args, at)?;
+        let (count, _) = read_nat(args, at.checked_add(used)?)?;
         Some((slot, u32::try_from(service).ok()?, count))
     });
     if let Some((slot, service, count)) = parsed {
-        let operands: Vec<Operand> = (0..count)
-            .filter_map(|index| fetch(INPUT, index))
-            .filter_map(|input| Operand::decode_input(&input))
+        let operands: Vec<_> = (0..count)
+            .filter_map(|index| fetch(FetchKind::Input, index))
+            .filter_map(|input| operand(&input))
             .collect();
         let config = config();
         let venue = venue(&config, service);

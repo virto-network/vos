@@ -1,0 +1,33 @@
+# Every pinned guest blob's SHA-256, its symbols and relocations stripped,
+# as `just build-blobs` builds it: `just blobs-lock` writes it, `just
+# check-blobs` checks it (the justfile's `_blob-hashes` says which blobs).
+e26a723c06a59a71734ead905db73e1e3fb34448276dfb5642c4947aba687fed  target/riscv64em-vos/release/final-verify.elf
+39bd9b1dd15ae1697f0b43a72a5da1c02e66ac9ce82a6fd016a1104dc1e46f86  target/riscv64em-vos/release/final-verify-test.elf
+571b4ee731bc9adc7e8da1d21505841a965e0947d3c78f304af4e8154fa4087c  target/riscv64em-vos/release/statement-service.elf
+7b88fe03e7dc51c7bea81bf26a16318199457e64e2b01210122655b53cca46a3  agent/programs/target/riscv64em-vos/release/vos-representative.elf
+44af1b301841a8832766ca7983cc36665b006a2feb58d6574e7b808b04c67a66  agent/programs/target/riscv64em-vos/release/vos-credentials.elf
+52bca4cbf81504cab10b873c1ad78e553c48745308a5e234a49de43a244b6069  agent/test-actors/target/riscv64em-vos/release/accounts.elf
+b52686b72e6df59d7750f9200963f127bf60d5d162b81a96821dcfb4f3b683a2  agent/test-actors/target/riscv64em-vos/release/ample.elf
+6ba098a6b31117d81ff758f920f3609f7f7ed0ebf29041766bb3c600a46d7075  agent/test-actors/target/riscv64em-vos/release/balance.elf
+c5ba4f3f44d17d28340258a666d51a4fd9118aa77b1d7cb072aafb2f68917789  agent/test-actors/target/riscv64em-vos/release/big.elf
+0281c1b45b04899f48e0fc23c90fc97501d42ed7a100dddf03634983bf8dcf08  agent/test-actors/target/riscv64em-vos/release/bounds.elf
+c0a21a2e4b30a4ae5b9e921d2a481435e80b38a6c8a75fc15fc685f79a41cd33  agent/test-actors/target/riscv64em-vos/release/bulky.elf
+afb55039443e0d3699f66b8c49be455b0949e48d7b9c43dfa5ca542410faf6b3  agent/test-actors/target/riscv64em-vos/release/caller.elf
+05eccad0c7528f7824ee148497dae2daacb639b257aff11de1f5a2e8f6e709de  agent/test-actors/target/riscv64em-vos/release/compact.elf
+ce0e5fbc4d52ced2eb00550b60d6a566b27d1563992a838aa7713969440f7790  agent/test-actors/target/riscv64em-vos/release/counter.elf
+c783b005c65e5f18aa4ccd71e086c573d468b48f31498041a939fe174447d5bb  agent/test-actors/target/riscv64em-vos/release/greedy.elf
+0e646b6a2b37cff7220e325d2c4ebc13518fa423c22d4df3ab1e06713d3760f8  agent/test-actors/target/riscv64em-vos/release/huge.elf
+355b1b7107abe8f77c7b2ff3c89eb41acfce995a5aad1a7171eeca76895ab04e  agent/test-actors/target/riscv64em-vos/release/kernels.elf
+2d68dfdc8c4b31584071b18534fadacf591f1e4a546ac57c2fa61276aa4ba162  agent/test-actors/target/riscv64em-vos/release/lean.elf
+f64519924390d5ac8747927ded62e90e0b81dc3c7defa15930c1d6cb7ffe58d4  agent/test-actors/target/riscv64em-vos/release/ledger.elf
+9907cb302771d049bf4a2a54ce90b85386587e288315741eee8f13ce2c8778c3  agent/test-actors/target/riscv64em-vos/release/poll.elf
+501bf06c490300981f8c8653a8faa13c8f041ebd646405c47c20eb6ad5b6ba94  agent/test-actors/target/riscv64em-vos/release/purses.elf
+e393a0947a9a2765f625a6580e0d9ebf8a494a6dc6ee4e9fb29e04a3051bb9c3  agent/test-actors/target/riscv64em-vos/release/reader.elf
+3d650786c3daec44a34a1509b59c61a4e29c557850e61c7b055b74d51d5279ab  agent/test-actors/target/riscv64em-vos/release/roomy.elf
+0f1dfcf4873a1bdc24a8b1b00ee386881f87f753480e54ed0067e2ea52ef9151  agent/test-actors/target/riscv64em-vos/release/rounds.elf
+aa2b1ca174b912a177798e74f2cb945248a87ec0e67089c08c35e6cb8e9fbee6  agent/test-actors/target/riscv64em-vos/release/shard.elf
+36739b742e991edb58b355dff05aef5ba533bf334027483b90ef41d7c8e6fc77  agent/test-actors/target/riscv64em-vos/release/shop.elf
+ef35eee108c9f048b8325b154003ad069219efbb98636b5bea97f67745125c8a  agent/test-actors/target/riscv64em-vos/release/tainted.elf
+fee8df17cc950747afb6b86fa8b8f12eee9892f06775f9dc1e204246850d5561  agent/test-actors/target/riscv64em-vos/release/tracker.elf
+fde888b05f26658b77db475d18905e2f45717bb0459e52f442855e87a4ce41a3  agent/test-actors/target/riscv64em-vos/release/wide.elf
+e7c1eb793927915b5ab580354930ea3d7412f5321dce0d1cc474e5c8dea2436a  agent/test-actors/target/riscv64em-vos/release/window.elf

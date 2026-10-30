@@ -18,16 +18,11 @@ use alloc::vec::Vec;
 
 use crate::inner::gp_call;
 use crate::refine::{Invocation, Machine, MemoryModel, PreparedProgram, RefineError};
-use crate::refine_host::result;
+use crate::refine_host::{FetchKind, result};
 use crate::{ExitReason, Gas};
 
 /// The accumulate entry point.
 pub const ACCUMULATE_ENTRY: u32 = 5;
-
-/// `fetch` kind for the encoded sequence of all inputs.
-pub const FETCH_INPUTS: u64 = 14;
-/// `fetch` kind for one input, indexed by φ11.
-pub const FETCH_INPUT: u64 = 15;
 
 /// `read` and `write` name the calling service with this id.
 pub const SELF_SERVICE: u64 = u64::MAX;
@@ -179,12 +174,12 @@ impl<'a, S: ServiceStorage> AccumulateContext<'a, S> {
     /// becomes the item's whole length, or `NONE`.
     fn fetch(&mut self) -> bool {
         let registers = *self.machine.registers();
-        let item = match registers[10] {
-            FETCH_INPUT => usize::try_from(registers[11])
+        let item = match FetchKind::from_u64(registers[10]) {
+            Some(FetchKind::Input) => usize::try_from(registers[11])
                 .ok()
                 .and_then(|index| self.inputs.get(index))
                 .cloned(),
-            FETCH_INPUTS => {
+            Some(FetchKind::Inputs) => {
                 let mut encoded = Vec::new();
                 vos_pvm_program::encode_nat(self.inputs.len() as u64, &mut encoded);
                 for input in self.inputs {

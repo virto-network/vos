@@ -28,19 +28,16 @@
 //! `Seen` entry dropped by the old bound would let its statement's replay
 //! through anchors still fresh by the new one (`spaces-pallet.md` §6.5).
 
-use alloc::vec::Vec;
-
-use vos_statement::vos_anchor::venue::{
-    self as rules, AnchorRefusal, Anchoring, Held, Roots, Status, VenueState,
-};
+use vos_statement::vos_anchor::venue::{self as rules, Anchoring, Held, Roots, Status, VenueState};
 use vos_statement::vos_anchor::{Anchor, RootKind, RootRead, SpaceId, VenueId};
 
+use vos_wire::jam::AccumulateInput;
+
+use crate::SLOT_MS;
 use crate::config::Config;
 use crate::item::Op;
-use crate::refine::register_code;
 use crate::state::{self, AnchorRecord, Evidence, Outcome, SpaceRecord, Storage, keys};
 use crate::verdict::{AnchorCode, ControlCode, Judged, RegisterCode, Registered, Verdict};
-use crate::{SLOT_MS, natural};
 
 /// How long an item's outcome is kept for its submitter to read: a day.
 /// It is also the horizon a client reading the drop queue scans, so every
@@ -52,44 +49,17 @@ pub const BUCKET_MS: u64 = 3_600_000;
 /// The queued rows an accumulate drops at most: this, and two an input.
 const PRUNE_BASE: u32 = 8;
 
-/// A work item's result as accumulate takes it: its payload's hash, and
-/// refine's output or the work error's code (Gray Paper 0.8.0: 1 out of
-/// gas, 2 a panic, …).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Operand {
-    pub package_hash: [u8; 32],
-    pub payload_hash: [u8; 32],
-    pub result: Result<Vec<u8>, u8>,
-}
+/// A work item's result as accumulate takes it: its package's and its
+/// payload's hashes, and refine's output or its work error
+/// (`vos_wire::jam`'s, as a JAM node gives it: `fetch` kind 15).
+pub use vos_wire::jam::Operand;
 
-impl Operand {
-    /// The operand an accumulate input holds (`fetch` kind 15): the kind
-    /// byte 0, the package's hash, its exports' root, the authorizer, the
-    /// payload's hash (32 each), the gas limit (a natural), the result
-    /// (0, a natural length and the output; or the error's byte) and the
-    /// authorizer's trace. None for a deferred transfer, or bytes that are
-    /// not an operand.
-    pub fn decode_input(bytes: &[u8]) -> Option<Self> {
-        let (&0, rest) = bytes.split_first()? else {
-            return None;
-        };
-        let package_hash = rest.get(..32)?.try_into().ok()?;
-        let payload_hash = rest.get(96..128)?.try_into().ok()?;
-        let (_, at) = natural(rest, 128)?;
-        let (&tag, rest) = rest.get(at..)?.split_first()?;
-        let result = match tag {
-            0 => {
-                let (len, at) = natural(rest, 0)?;
-                let len = usize::try_from(len).ok()?;
-                Ok(rest.get(at..at.checked_add(len)?)?.to_vec())
-            }
-            error => Err(error),
-        };
-        Some(Self {
-            package_hash,
-            payload_hash,
-            result,
-        })
+/// The operand an accumulate input holds: none for a deferred transfer,
+/// or bytes that are not an input in their one encoding.
+pub fn operand(input: &[u8]) -> Option<Operand> {
+    match AccumulateInput::decode(input)? {
+        AccumulateInput::Operand(operand) => Some(operand),
+        AccumulateInput::Transfer(_) => None,
     }
 }
 
@@ -130,14 +100,14 @@ pub fn accumulate(
 fn apply(storage: &mut impl Storage, venue: VenueId, now: u64, operand: &Operand) -> Outcome {
     let failed = |code: u32| Outcome {
         time: now,
-        kind: u8::MAX,
+        kind: None,
         code: Outcome::FAILED.saturating_add(code),
         subject: [0; 32],
         refine_gas: 0,
     };
     let output = match &operand.result {
         Ok(output) => output,
-        Err(error) => return failed(u32::from(*error)),
+        Err(error) => return failed(*error as u32),
     };
     let decoded = Verdict::decode_prefix(output)
         .ok()
@@ -148,9 +118,12 @@ fn apply(storage: &mut impl Storage, venue: VenueId, now: u64, operand: &Operand
     let Some((verdict, refine_gas)) = decoded else {
         return failed(u32::from(u8::MAX));
     };
-    let kind = verdict.kind().map_or(u8::MAX, |kind| kind as u8);
+    let kind = verdict.kind();
     let (code, subject) = match verdict {
-        Verdict::Register(registered) => (register(storage, now, &registered), registered.space.0),
+        Verdict::Register(registered) => (
+            register(storage, now, &registered) as u32,
+            registered.space.0,
+        ),
         Verdict::Anchor {
             space,
             window,
@@ -166,7 +139,7 @@ fn apply(storage: &mut impl Storage, venue: VenueId, now: u64, operand: &Operand
                 signer,
                 signature: [0; 64],
             };
-            (self::anchor(storage, venue, now, &anchor), space.0)
+            (self::anchor(storage, venue, now, &anchor) as u32, space.0)
         }
         Verdict::Submit(judged) => (submit(storage, venue, now, &judged), judged.id),
         Verdict::Control {
@@ -174,7 +147,10 @@ fn apply(storage: &mut impl Storage, venue: VenueId, now: u64, operand: &Operand
             nonce,
             op,
             controller,
-        } => (control(storage, &space, nonce, op, &controller), space.0),
+        } => (
+            control(storage, &space, nonce, op, &controller) as u32,
+            space.0,
+        ),
         Verdict::Refused { code, .. } => (code, [0; 32]),
     };
     Outcome {
@@ -261,7 +237,7 @@ impl VenueState for Snapshot {
     }
 }
 
-fn register(storage: &mut impl Storage, now: u64, registered: &Registered) -> u32 {
+fn register(storage: &mut impl Storage, now: u64, registered: &Registered) -> RegisterCode {
     let snapshot = Snapshot {
         venue: VenueId([0; 32]),
         now,
@@ -275,7 +251,7 @@ fn register(storage: &mut impl Storage, now: u64, registered: &Registered) -> u3
     };
     let start = match rules::register(&snapshot, &registration) {
         Ok(start) => start,
-        Err(refusal) => return register_code(refusal) as u32,
+        Err(refusal) => return refusal.into(),
     };
     let record = SpaceRecord {
         clock: registered.clock,
@@ -287,37 +263,27 @@ fn register(storage: &mut impl Storage, now: u64, registered: &Registered) -> u3
         nonce: 0,
     };
     storage.write(&keys::space(&registered.space), Some(&record.encode()));
-    RegisterCode::Registered as u32
+    RegisterCode::Registered
 }
 
 /// The anchor rule's answer to `anchor`, applied: a new root stored and
 /// queued to drop past `MaxRootAge`; evidence kept and the space ended.
-fn anchor(storage: &mut impl Storage, venue: VenueId, now: u64, anchor: &Anchor) -> u32 {
+fn anchor(storage: &mut impl Storage, venue: VenueId, now: u64, anchor: &Anchor) -> AnchorCode {
     let (space, kind, window) = (anchor.space, anchor.kind, anchor.window);
     let snapshot = Snapshot::read(storage, venue, now, &space, kind, window);
     let anchoring = match rules::anchor(&snapshot, anchor) {
         Ok(anchoring) => anchoring,
-        Err(refusal) => {
-            return match refusal {
-                AnchorRefusal::Unregistered => AnchorCode::Unregistered,
-                AnchorRefusal::Stopped => AnchorCode::Ended,
-                AnchorRefusal::Key => AnchorCode::Key,
-                AnchorRefusal::Signature => AnchorCode::Signature,
-                AnchorRefusal::Window => AnchorCode::Window,
-                AnchorRefusal::Open => AnchorCode::Open,
-                AnchorRefusal::Age => AnchorCode::Age,
-            } as u32;
-        }
+        Err(refusal) => return refusal.into(),
     };
     let Some(mut record) = snapshot.space else {
-        return AnchorCode::Unregistered as u32;
+        return AnchorCode::Unregistered;
     };
     let signed = AnchorRecord {
         root: anchor.root,
         signer: anchor.signer,
     };
     match anchoring {
-        Anchoring::Again => AnchorCode::Again as u32,
+        Anchoring::Again => AnchorCode::Again,
         Anchoring::New => {
             record.last = Some(window);
             storage.write(&keys::space(&space), Some(&record.encode()));
@@ -325,7 +291,7 @@ fn anchor(storage: &mut impl Storage, venue: VenueId, now: u64, anchor: &Anchor)
             storage.write(&at, Some(&signed.encode()));
             let expiry = rules::expiry(&record.clock, window).unwrap_or(u64::MAX);
             enqueue(storage, now, expiry, &at);
-            AnchorCode::New as u32
+            AnchorCode::New
         }
         Anchoring::Evidence(held) => {
             let evidence = Evidence {
@@ -339,7 +305,7 @@ fn anchor(storage: &mut impl Storage, venue: VenueId, now: u64, anchor: &Anchor)
             storage.write(&at, Some(&evidence.encode()));
             record.ended = true;
             storage.write(&keys::space(&space), Some(&record.encode()));
-            AnchorCode::Equivocation as u32
+            AnchorCode::Equivocation
         }
     }
 }
@@ -352,26 +318,26 @@ fn control(
     nonce: u64,
     op: Op,
     controller: &[u8; 32],
-) -> u32 {
+) -> ControlCode {
     let Some(mut record) = state::space(storage, space) else {
-        return ControlCode::Unregistered as u32;
+        return ControlCode::Unregistered;
     };
     if record.controller != *controller {
-        return ControlCode::Controller as u32;
+        return ControlCode::Controller;
     }
     if nonce != record.nonce {
-        return ControlCode::Nonce as u32;
+        return ControlCode::Nonce;
     }
     match op {
         Op::AddKey(key) => {
             if rules::add_key(record.keys.len(), record.keys.contains(&key), &key).is_err() {
-                return ControlCode::Key as u32;
+                return ControlCode::Key;
             }
             record.keys.push(key);
         }
         Op::RemoveKey(key) => {
             if !record.keys.contains(&key) {
-                return ControlCode::Key as u32;
+                return ControlCode::Key;
             }
             record.keys.retain(|held| *held != key);
         }
@@ -379,7 +345,7 @@ fn control(
     }
     record.nonce = nonce.saturating_add(1);
     storage.write(&keys::space(space), Some(&record.encode()));
-    ControlCode::Done as u32
+    ControlCode::Done
 }
 
 /// Whether the service holds `root` anchored at the venue's time `now`

@@ -63,6 +63,22 @@ impl Kind {
             _ => return None,
         })
     }
+
+    /// The byte of `kind`, or of none: `u8::MAX`.
+    pub fn encode_option(kind: Option<Self>) -> u8 {
+        kind.map_or(u8::MAX, |kind| kind as u8)
+    }
+
+    /// The kind, or none, `byte` names ([`Kind::encode_option`]); another
+    /// byte refused.
+    pub fn decode_option(byte: u8) -> Result<Option<Self>, DecodeError> {
+        match byte {
+            u8::MAX => Ok(None),
+            byte => Self::from_u8(byte)
+                .map(Some)
+                .ok_or(DecodeError::Noncanonical),
+        }
+    }
 }
 
 /// A space's registration, signed by one of its founding keys.
@@ -86,31 +102,44 @@ pub enum Op {
     SetController([u8; 32]),
 }
 
+/// An [`Op`]'s tag, its first byte; 2 is retired, never reused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+enum OpTag {
+    AddKey = 0,
+    RemoveKey = 1,
+    SetController = 3,
+}
+
+impl OpTag {
+    const fn from_u8(byte: u8) -> Option<Self> {
+        Some(match byte {
+            0 => Self::AddKey,
+            1 => Self::RemoveKey,
+            3 => Self::SetController,
+            _ => return None,
+        })
+    }
+}
+
 impl Op {
     pub fn encode_to(&self, out: &mut Vec<u8>) {
-        match self {
-            Self::AddKey(key) => {
-                out.push(0);
-                out.extend_from_slice(key);
-            }
-            Self::RemoveKey(key) => {
-                out.push(1);
-                out.extend_from_slice(key);
-            }
-            Self::SetController(key) => {
-                out.push(3);
-                out.extend_from_slice(key);
-            }
-        }
+        let (tag, key) = match self {
+            Self::AddKey(key) => (OpTag::AddKey, key),
+            Self::RemoveKey(key) => (OpTag::RemoveKey, key),
+            Self::SetController(key) => (OpTag::SetController, key),
+        };
+        out.push(tag as u8);
+        out.extend_from_slice(key);
     }
 
     pub fn decode_from(reader: &mut Reader<'_>) -> Result<Self, DecodeError> {
-        Ok(match reader.u8()? {
-            0 => Self::AddKey(reader.array()?),
-            1 => Self::RemoveKey(reader.array()?),
-            3 => Self::SetController(reader.array()?),
-            _ => return Err(DecodeError::Noncanonical),
-        })
+        let op = match OpTag::from_u8(reader.u8()?).ok_or(DecodeError::Noncanonical)? {
+            OpTag::AddKey => Self::AddKey,
+            OpTag::RemoveKey => Self::RemoveKey,
+            OpTag::SetController => Self::SetController,
+        };
+        Ok(op(reader.array()?))
     }
 }
 
@@ -214,7 +243,7 @@ impl Item {
                 founder_key: reader.array()?,
                 signature: reader.array()?,
             }),
-            Kind::Anchor => Self::Anchor(Anchor::decode(reader.take(Anchor::BYTES)?)?),
+            Kind::Anchor => Self::Anchor(Anchor::decode_from(&mut reader)?),
             Kind::Control => Self::Control(SignedControl {
                 control: Control::decode_from(&mut reader)?,
                 controller: reader.array()?,
@@ -235,7 +264,6 @@ mod tests {
 
     fn genesis() -> SpaceGenesis {
         SpaceGenesis {
-            version: 1,
             nodes: vec![(0, [1; 32]), (3, [2; 32])],
             clock: WindowClock::DEFAULT,
             time: 5,

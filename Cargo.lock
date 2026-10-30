@@ -5438,6 +5438,7 @@ dependencies = [
  "vos-anchor",
  "vos-pvm",
  "vos-pvm-compiler",
+ "vos-pvm-program",
  "vos-statement",
  "vos-wire",
 ]

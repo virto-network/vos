@@ -100,17 +100,9 @@ impl Config {
         if count > MAX_PINS {
             return Err(DecodeError::Noncanonical);
         }
-        let mut pins = Vec::with_capacity(count);
-        for _ in 0..count {
-            let mut words = [0u32; 8];
-            for word in &mut words {
-                *word = reader.u32()?;
-                if *word >= (1 << 31) - 1 {
-                    return Err(DecodeError::Noncanonical);
-                }
-            }
-            pins.push(ProgramId(words));
-        }
+        let pins = (0..count)
+            .map(|_| ProgramId::decode_from(&mut reader))
+            .collect::<Result<Vec<_>, _>>()?;
         let rest = reader.take(BYTES.saturating_sub(reader.used()))?;
         if rest.iter().any(|&byte| byte != 0) {
             return Err(DecodeError::Noncanonical);

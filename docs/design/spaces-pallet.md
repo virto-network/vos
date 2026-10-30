@@ -165,7 +165,7 @@ them and never re-implements their encodings.
 
 | Item | Definition | Crate API the pallet uses |
 |---|---|---|
-| `SpaceGenesis` | pin D's: the version (1 byte, `GENESIS_VERSION` = 1); the founding nodes, a compact count, then each its number (`NodeNumber`, 1 byte) and ed25519 key (32), numbers strictly ascending; the clock `WindowClock { origin_ms, length_ms }` (8 and 8, LE); the founder's time (8, LE); a nonce (16). The decode is canonical (a shortest compact, at least one node, nothing left over) and reads any count; **the venue registers 1 to 16 founding keys** (`MAX_FOUNDING_KEYS`) | `vos_anchor::SpaceGenesis::decode(&[u8])`, `vos_anchor::MAX_FOUNDING_KEYS` |
+| `SpaceGenesis` | pin D's: the version (1 byte, `GENESIS_VERSION` = 1, which the encoding writes and the type holds no field of); the founding nodes, a compact count, then each its number (`NodeNumber`, 1 byte) and ed25519 key (32), numbers strictly ascending; the clock `WindowClock { origin_ms, length_ms }` (8 and 8, LE); the founder's time (8, LE); a nonce (16). The decode is canonical (a shortest compact, at least one node, nothing left over) and reads any count; **the venue registers 1 to 16 founding keys** (`MAX_FOUNDING_KEYS`) | `vos_anchor::SpaceGenesis::decode(&[u8])`, `vos_anchor::MAX_FOUNDING_KEYS` |
 | `SpaceId` | `[u8; 32]` = `BLAKE2b-256("vos/space/id" ‖ SCALE(genesis))` | `vos_anchor::space_id(&genesis)` |
 | `VenueId` | Kreivo's genesis block hash | from `frame_system::block_hash(0)`, as `vos_anchor::VenueId` |
 | window of time t | `w = ⌊(t − origin_ms) / length_ms⌋`; `B_w = origin_ms + (w+1)·length_ms`; none for `t < origin_ms`, when no window is closed | `vos_anchor::WindowClock::{window, boundary}`, both `Option` |

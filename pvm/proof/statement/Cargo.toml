@@ -8,14 +8,16 @@ description = "A proved statement as a venue judges it: its types, its canonical
 [features]
 # Format 28, the unmasked wrap, linked beside 39 (the final verifier's
 # `test-formats`): the tests' and the fixtures' format, for the test builds
-# of the venues' harnesses. No production build enables it (`just
-# check-no-test-formats`), and neither `fixtures` nor `pvm-guest` implies it.
-test-formats = ["vos-pvm-final-verifier/test-formats"]
+# of the venues' harnesses; and `vos-anchor`'s golden vectors, which the
+# test program (`final-verify-test`) computes. No production build enables
+# it (`just check-no-test-formats`), and neither `fixtures` nor `pvm-guest`
+# implies it.
+test-formats = ["vos-pvm-final-verifier/test-formats", "vos-anchor/vectors"]
 # The golden fixtures' reader (`fixtures`), for the venues' harnesses: std.
 fixtures = ["vos-anchor/vectors"]
 # The venue as a JAM refine program (`src/bin/final-verify.rs`), for the
 # PVM target only: no_main, its own allocator and panic handler.
-pvm-guest = ["vos-anchor/vectors"]
+pvm-guest = []
 # The guests' heap peak (`guest/heap.rs`): the highest top the allocator
 # reached, which a guest reports as its high-water mark, for measurement
 # builds of `final-verify` only. Without it the report gives the top at the

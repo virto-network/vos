@@ -89,21 +89,3 @@ pub const REPORT_BYTES: usize = 48 << 10;
 pub const MAX_ITEMS: usize = REPORT_BYTES / MAX_VERDICT_BYTES;
 
 const _: () = assert!(MAX_ITEMS >= 1);
-
-/// A Gray Paper natural at `at` in `bytes`: its value and where it ends.
-pub fn natural(bytes: &[u8], at: usize) -> Option<(u64, usize)> {
-    let (&first, rest) = bytes.get(at..)?.split_first()?;
-    let extra = first.leading_ones() as usize;
-    let end = at.checked_add(1)?.checked_add(extra.min(8))?;
-    if extra == 8 {
-        return Some((u64::from_le_bytes(rest.get(..8)?.try_into().ok()?), end));
-    }
-    let mut value = 0u64;
-    for (shift, &byte) in (0u32..).step_by(8).zip(rest.get(..extra)?) {
-        value |= u64::from(byte).checked_shl(shift)?;
-    }
-    let high =
-        u64::from(first) & (0xffu64.checked_shr(u32::try_from(extra).ok()?.checked_add(1)?)?);
-    let shift = u32::try_from(extra).ok()?.checked_mul(8)?;
-    Some((value | high.checked_shl(shift)?, end))
-}

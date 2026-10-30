@@ -1,5 +1,0 @@
-# Guests need a newer nightly than the workspace: JSON target specs require
-# `-Zjson-target-spec`.
-[toolchain]
-channel = "nightly-2026-03-20"
-components = ["rust-src"]

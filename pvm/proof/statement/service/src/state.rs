@@ -23,6 +23,8 @@ use vos_statement::vos_anchor::codec::{self, Reader};
 use vos_statement::vos_anchor::{RootKind, SpaceId, WindowClock};
 use vos_statement::{DecodeError, StatementId};
 
+use crate::item::Kind;
+
 /// A service's storage, as accumulate's `read` and `write` reach it.
 pub trait Storage {
     fn read(&mut self, key: &[u8]) -> Option<Vec<u8>>;
@@ -78,57 +80,69 @@ pub mod keys {
     use vos_statement::StatementId;
     use vos_statement::vos_anchor::{RootKind, SpaceId};
 
-    pub const SPACE: u8 = 0x01;
-    pub const ANCHOR: u8 = 0x02;
-    pub const SEEN: u8 = 0x03;
-    pub const EVIDENCE: u8 = 0x04;
-    pub const OUTCOME: u8 = 0x05;
-    pub const BUCKET: u8 = 0x06;
-    pub const QUEUED: u8 = 0x07;
+    /// A key's first byte: what its row is.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(u8)]
+    pub enum Prefix {
+        Space = 0x01,
+        Anchor = 0x02,
+        Seen = 0x03,
+        Evidence = 0x04,
+        Outcome = 0x05,
+        Bucket = 0x06,
+        Queued = 0x07,
+        Cursor = 0x08,
+        Gas = 0x09,
+    }
+
     /// The pruning's cursor.
-    pub const CURSOR: &[u8] = &[0x08];
+    pub const CURSOR: &[u8] = &[Prefix::Cursor as u8];
     /// The gas the last accumulate took.
-    pub const GAS: &[u8] = &[0x09];
+    pub const GAS: &[u8] = &[Prefix::Gas as u8];
 
     pub fn space(space: &SpaceId) -> Vec<u8> {
-        [&[SPACE][..], &space.0].concat()
+        [&[Prefix::Space as u8][..], &space.0].concat()
+    }
+
+    /// A row of `space`'s root of `kind` at `window`, under `prefix`.
+    fn at_window(prefix: Prefix, space: &SpaceId, kind: RootKind, window: u64) -> Vec<u8> {
+        [
+            &[prefix as u8][..],
+            &space.0,
+            &[kind as u8],
+            &window.to_be_bytes(),
+        ]
+        .concat()
     }
 
     pub fn anchor(space: &SpaceId, kind: RootKind, window: u64) -> Vec<u8> {
-        [
-            &[ANCHOR][..],
-            &space.0,
-            &[kind as u8],
-            &window.to_be_bytes(),
-        ]
-        .concat()
+        at_window(Prefix::Anchor, space, kind, window)
     }
 
     pub fn seen(id: &StatementId) -> Vec<u8> {
-        [&[SEEN][..], &id.0].concat()
+        [&[Prefix::Seen as u8][..], &id.0].concat()
     }
 
     pub fn evidence(space: &SpaceId, kind: RootKind, window: u64) -> Vec<u8> {
-        [
-            &[EVIDENCE][..],
-            &space.0,
-            &[kind as u8],
-            &window.to_be_bytes(),
-        ]
-        .concat()
+        at_window(Prefix::Evidence, space, kind, window)
     }
 
     /// An item's outcome, by [`super::outcome_id`].
     pub fn outcome(id: &[u8; 32]) -> Vec<u8> {
-        [&[OUTCOME][..], id].concat()
+        [&[Prefix::Outcome as u8][..], id].concat()
     }
 
     pub fn bucket(bucket: u64) -> Vec<u8> {
-        [&[BUCKET][..], &bucket.to_be_bytes()].concat()
+        [&[Prefix::Bucket as u8][..], &bucket.to_be_bytes()].concat()
     }
 
     pub fn queued(bucket: u64, index: u32) -> Vec<u8> {
-        [&[QUEUED][..], &bucket.to_be_bytes(), &index.to_be_bytes()].concat()
+        [
+            &[Prefix::Queued as u8][..],
+            &bucket.to_be_bytes(),
+            &index.to_be_bytes(),
+        ]
+        .concat()
     }
 }
 
@@ -154,32 +168,14 @@ pub struct SpaceRecord {
     pub nonce: u64,
 }
 
-fn put_option(out: &mut Vec<u8>, value: Option<u64>) {
-    match value {
-        None => out.push(0),
-        Some(value) => {
-            out.push(1);
-            out.extend_from_slice(&value.to_le_bytes());
-        }
-    }
-}
-
-fn option(reader: &mut Reader<'_>) -> Result<Option<u64>, DecodeError> {
-    match reader.u8()? {
-        0 => Ok(None),
-        1 => Ok(Some(reader.u64()?)),
-        _ => Err(DecodeError::Noncanonical),
-    }
-}
-
 impl SpaceRecord {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         self.clock.encode_to(&mut out);
         out.extend_from_slice(&self.controller);
         out.extend_from_slice(&self.start.to_le_bytes());
-        put_option(&mut out, self.last);
-        out.push(u8::from(self.ended));
+        codec::option_u64(&mut out, self.last);
+        codec::flag(&mut out, self.ended);
         out.extend_from_slice(&self.nonce.to_le_bytes());
         codec::compact(&mut out, self.keys.len() as u64);
         for key in &self.keys {
@@ -193,12 +189,8 @@ impl SpaceRecord {
         let clock = WindowClock::decode_from(&mut reader)?;
         let controller = reader.array()?;
         let start = reader.u64()?;
-        let last = option(&mut reader)?;
-        let ended = match reader.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(DecodeError::Noncanonical),
-        };
+        let last = reader.option_u64()?;
+        let ended = reader.flag()?;
         let nonce = reader.u64()?;
         let count = reader.count(32)?;
         let keys = (0..count)
@@ -225,6 +217,9 @@ pub struct AnchorRecord {
 }
 
 impl AnchorRecord {
+    /// The bytes of its encoding: the root, then the signer.
+    pub const BYTES: usize = 32 + 32;
+
     pub fn encode(&self) -> Vec<u8> {
         [&self.root[..], &self.signer].concat()
     }
@@ -253,7 +248,9 @@ impl Evidence {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
-        let (held, other) = bytes.split_at_checked(64).ok_or(DecodeError::Short)?;
+        let (held, other) = bytes
+            .split_at_checked(AnchorRecord::BYTES)
+            .ok_or(DecodeError::Short)?;
         Ok(Self {
             held: AnchorRecord::decode(held)?,
             other: AnchorRecord::decode(other)?,
@@ -269,9 +266,10 @@ impl Evidence {
 pub struct Outcome {
     /// The venue's time, ms since the Unix epoch.
     pub time: u64,
-    /// The item's kind byte; `u8::MAX` when it did not decode, or refine
-    /// failed (`code` then [`Outcome::FAILED`] past the work error's).
-    pub kind: u8,
+    /// The item's kind; none when it did not decode, or refine failed
+    /// (`code` then [`Outcome::FAILED`] past the work error's). Its byte,
+    /// `u8::MAX` for none ([`Kind::encode_option`]).
+    pub kind: Option<Kind>,
     pub code: u32,
     pub subject: [u8; 32],
     pub refine_gas: u64,
@@ -286,7 +284,7 @@ impl Outcome {
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(Self::BYTES);
         out.extend_from_slice(&self.time.to_le_bytes());
-        out.push(self.kind);
+        out.push(Kind::encode_option(self.kind));
         out.extend_from_slice(&self.code.to_le_bytes());
         out.extend_from_slice(&self.subject);
         out.extend_from_slice(&self.refine_gas.to_le_bytes());
@@ -297,7 +295,7 @@ impl Outcome {
         let mut reader = Reader::new(bytes);
         let outcome = Self {
             time: reader.u64()?,
-            kind: reader.u8()?,
+            kind: Kind::decode_option(reader.u8()?)?,
             code: reader.u32()?,
             subject: reader.array()?,
             refine_gas: reader.u64()?,
@@ -384,12 +382,17 @@ mod tests {
         assert_eq!(Evidence::decode(&evidence.encode()), Ok(evidence));
         let outcome = Outcome {
             time: 1,
-            kind: 3,
+            kind: Some(Kind::Submit),
             code: 0x108,
             subject: [9; 32],
             refine_gas: 118_000_000,
         };
         assert_eq!(outcome.encode().len(), Outcome::BYTES);
         assert_eq!(Outcome::decode(&outcome.encode()), Ok(outcome));
+        let failed = Outcome {
+            kind: None,
+            ..outcome
+        };
+        assert_eq!(Outcome::decode(&failed.encode()), Ok(failed));
     }
 }

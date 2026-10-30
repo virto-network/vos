@@ -149,15 +149,10 @@ struct AgentRecord {
 /// The agent's record, none before its first install: all three rows, or
 /// none of them.
 fn agent_record(base: &Base) -> Result<Option<AgentRecord>, Corrupt> {
-    fn row<T: Decode>(base: &Base, key: &[u8]) -> Result<Option<T>, Corrupt> {
-        base.read(key)?
-            .map(|bytes| T::decode_exact(&bytes).ok_or(Corrupt))
-            .transpose()
-    }
     match (
-        row(base, &keys::target())?,
-        row(base, &keys::space())?,
-        row(base, &keys::clock())?,
+        base.decoded(&keys::target())?,
+        base.decoded(&keys::space())?,
+        base.decoded(&keys::clock())?,
     ) {
         (Some(target), Some(space), Some(clock)) => Ok(Some(AgentRecord {
             target,

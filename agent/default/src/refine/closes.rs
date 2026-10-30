@@ -11,7 +11,8 @@ use vos_wire::batch::Body;
 use vos_wire::ids::AgentId;
 use vos_wire::result::{CommittedWrite, InputRef, Outcome, Outgoing, Run, Write};
 use vos_wire::served::{
-    AgentRoot, ClosedRow, REPORTS_KEPT, REPRESENTATIVE, representative_ask, representative_row,
+    AgentPath, AgentRoot, ClosedRow, REPORTS_KEPT, REPRESENTATIVE, representative_ask,
+    representative_row,
 };
 use vos_wire::vos_anchor::RootKind;
 use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
@@ -19,14 +20,6 @@ use vos_wire::{Decode, Encode, SpaceId, WindowClock, defaults, keys};
 use super::Overlay;
 use super::base::{Base, Corrupt};
 use super::inputs::{consumed, split_writes};
-
-/// A row through the refine's earlier steps, decoded.
-fn read<T: Decode>(base: &Base, key: &[u8]) -> Result<Option<T>, Corrupt> {
-    match base.read(key)? {
-        Some(bytes) => T::decode_exact(&bytes).map(Some).ok_or(Corrupt),
-        None => Ok(None),
-    }
-}
 
 /// A step's writes over the rows it quarantines.
 struct Writes(Overlay);
@@ -73,7 +66,7 @@ impl Writes {
 pub(crate) fn report(base: &Base, to: AgentId, window: u64, root: [u8; 32]) -> Run {
     let input = InputRef::Report { window };
     let mut run = consumed(input, Outcome::Done(Vec::new()));
-    let Ok(Some(space)) = read::<SpaceId>(base, &keys::space()) else {
+    let Ok(Some(space)) = base.decoded::<SpaceId>(&keys::space()) else {
         return run;
     };
     let mut writes = Writes::new();
@@ -83,7 +76,7 @@ pub(crate) fn report(base: &Base, to: AgentId, window: u64, root: [u8; 32]) -> R
         run.messages.push(Outgoing {
             to,
             body: Body::Report(AgentRoot {
-                kind: RootKind::Space as u8,
+                kind: RootKind::Space,
                 window,
                 root,
             }),
@@ -99,12 +92,7 @@ pub(crate) fn report(base: &Base, to: AgentId, window: u64, root: [u8; 32]) -> R
 /// ([`keys::close_mark`]) sent its `Closed`, at most
 /// [`defaults::CLOSE_PATHS`], in agent order, and the mark moved to the
 /// last. A close of a window the mark has passed sends nothing.
-pub(crate) fn close(
-    base: &Base,
-    window: u64,
-    rep_root: [u8; 32],
-    paths: Vec<(AgentId, [u8; 16], Vec<u8>)>,
-) -> Run {
+pub(crate) fn close(base: &Base, window: u64, rep_root: [u8; 32], paths: Vec<AgentPath>) -> Run {
     let input = InputRef::Close { window };
     let mut run = consumed(input, Outcome::Done(Vec::new()));
     let mut writes = Writes::new();
@@ -117,9 +105,13 @@ pub(crate) fn close(
     };
     if let Some(after) = after {
         let mut last = None;
-        for (agent, rep_salt, space_path) in paths
+        for AgentPath {
+            agent,
+            salt: rep_salt,
+            path: space_path,
+        } in paths
             .into_iter()
-            .filter(|(agent, ..)| after.is_none_or(|after| *agent > after))
+            .filter(|path| after.is_none_or(|after| path.agent > after))
             .take(defaults::CLOSE_PATHS)
         {
             if last.is_some_and(|last| agent <= last) {
@@ -178,8 +170,8 @@ pub(crate) fn stored(
     report: AgentRoot,
 ) -> (Vec<Write>, Vec<CommittedWrite>) {
     let nothing = (Vec::new(), Vec::new());
-    let space = read::<SpaceId>(base, &keys::space());
-    let clock = read::<WindowClock>(base, &keys::clock());
+    let space = base.decoded::<SpaceId>(&keys::space());
+    let clock = base.decoded::<WindowClock>(&keys::clock());
     let (Ok(Some(space)), Ok(Some(clock))) = (space, clock) else {
         return nothing;
     };
@@ -187,7 +179,7 @@ pub(crate) fn stored(
     let open = clock.window(base.time);
     let ahead = window > open.map_or(0, |open| open.saturating_add(1));
     if space == SpaceId::NONE
-        || report.kind != RootKind::Space as u8
+        || report.kind != RootKind::Space
         || from == base.agent
         || !base.holds(&keys::installed(REPRESENTATIVE))
         || ahead

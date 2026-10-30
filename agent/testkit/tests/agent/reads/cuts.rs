@@ -3,6 +3,7 @@
 //! statement's proof recorded.
 
 use super::*;
+use vos_wire::served::AgentPath;
 
 /// The start of window `window`.
 fn start_of(window: u64) -> u64 {
@@ -211,7 +212,7 @@ fn a_report_goes_once_a_window() {
     };
     let result = reads.batch(T0 + 1, vec![report(3, REPRESENTATIVE)]);
     let call = vos_wire::served::AgentRoot {
-        kind: 0,
+        kind: RootKind::Space,
         window: 3,
         root: [3; 32],
     };
@@ -254,8 +255,12 @@ fn a_report_goes_once_a_window() {
 fn a_close_sends_each_path_once() {
     let mut reads = Reads::with(&[(1, 10)]);
     let count = 2 * defaults::CLOSE_PATHS + 6;
-    let paths: Vec<(AgentId, [u8; 16], Vec<u8>)> = (0..count as u32)
-        .map(|n| (AgentId(0x0300_0000 + n), [n as u8; 16], vec![n as u8; 5]))
+    let paths: Vec<AgentPath> = (0..count as u32)
+        .map(|n| AgentPath {
+            agent: AgentId(0x0300_0000 + n),
+            salt: [n as u8; 16],
+            path: vec![n as u8; 5],
+        })
         .collect();
     let close = |window| Input::Close {
         window,
@@ -280,7 +285,7 @@ fn a_close_sends_each_path_once() {
     assert_eq!(second.len(), 6);
     assert_eq!(
         [first, second].concat(),
-        paths.iter().map(|(agent, ..)| *agent).collect::<Vec<_>>()
+        paths.iter().map(|path| path.agent).collect::<Vec<_>>()
     );
     assert!(sent(&reads.batch(T0 + 3, vec![close(7)])).is_empty());
     let result = reads.batch(T0 + 4, vec![close(8), close(6)]);

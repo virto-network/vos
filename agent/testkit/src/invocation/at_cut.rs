@@ -127,7 +127,7 @@ impl Invocation<'_> {
         let Some(program) = installed.kernel(method) else {
             return (Attested::Failed(AttestError::Unknown), 0);
         };
-        if self.counted + cap::AT_CUT > self.limits.attests {
+        if Attest::weighed(&self.attests) + cap::AT_CUT > self.limits.attests {
             return (Attested::Failed(AttestError::Failed), 0);
         }
         let declared = installed
@@ -149,7 +149,6 @@ impl Invocation<'_> {
         let Some(parts) = parts(&run.output, &run.io_hash) else {
             return (Attested::Failed(AttestError::Failed), spent);
         };
-        self.counted += cap::AT_CUT;
         self.attests.push(Attest {
             program: ProgramHash::of(program),
             window: Some(window),

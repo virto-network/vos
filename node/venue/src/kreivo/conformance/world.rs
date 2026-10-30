@@ -75,7 +75,6 @@ pub(super) fn public(seed: u8) -> [u8; 32] {
 /// A two-founder genesis on `clock`, told apart by `nonce`.
 pub(super) fn genesis(clock: WindowClock, nonce: u8) -> SpaceGenesis {
     SpaceGenesis {
-        version: vos_anchor::GENESIS_VERSION,
         nodes: vec![(1, public(KEY_1)), (2, public(KEY_2))],
         clock,
         time: clock.origin_ms,

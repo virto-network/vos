@@ -25,12 +25,12 @@ fn guest(path: &str) -> PathBuf {
 
 /// The default agent's ELF.
 pub fn agent_elf() -> PathBuf {
-    guest("default/target/riscv64em-vos/release/vos-agent.elf")
+    guest("programs/target/riscv64em-vos/release/vos-agent.elf")
 }
 
 /// The space's representative's ELF.
 fn representative_elf() -> PathBuf {
-    guest("representative/target/riscv64em-vos/release/vos-representative.elf")
+    guest("programs/target/riscv64em-vos/release/vos-representative.elf")
 }
 
 /// The space's representative's package, as its crate builds it.
@@ -40,7 +40,7 @@ pub fn representative_package() -> Vec<u8> {
 
 /// The credential actor's ELF.
 pub fn credentials_elf() -> PathBuf {
-    guest("credentials/target/riscv64em-vos/release/vos-credentials.elf")
+    guest("programs/target/riscv64em-vos/release/vos-credentials.elf")
 }
 
 /// Test actor `name`'s ELF.

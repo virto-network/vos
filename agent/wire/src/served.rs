@@ -75,13 +75,13 @@ pub const ASKED_TAG: u32 = 0xf5ab_2cca;
 /// asks, of windows before `w − REPORTS_KEPT`.
 pub const REPORTS_KEPT: u64 = 2;
 
-/// An agent's report of its root at a window's cut, a [`crate::batch::Body::Report`]:
-/// the root's kind, the window and the root. The reporting agent is the
-/// message's sender, and its report asks for its path at the window's
-/// close.
+/// An agent's report of its root at a window's cut, a
+/// [`crate::batch::Body::Report`]: the root's kind, the window and the
+/// root. The reporting agent is the message's sender, and its report asks
+/// for its path at the window's close.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRoot {
-    pub kind: u8,
+    pub kind: RootKind,
     pub window: u64,
     pub root: [u8; 32],
 }
@@ -106,7 +106,17 @@ pub struct ClosedRow {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct Closing {
     pub root: [u8; 32],
-    pub paths: Vec<(AgentId, [u8; 16], Vec<u8>)>,
+    pub paths: Vec<AgentPath>,
+}
+
+/// An agent's row at the representative's cut of a window: the agent, the
+/// row's salt, and a `vos_tree::BatchProof`'s encoding of the row against
+/// the representative's root.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AgentPath {
+    pub agent: AgentId,
+    pub salt: [u8; 16],
+    pub path: Vec<u8>,
 }
 
 /// The agent that represents a space: the first founding node's agent 0,

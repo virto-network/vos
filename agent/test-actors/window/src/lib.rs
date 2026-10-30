@@ -17,8 +17,8 @@
 //! one, so an older cut cannot restate a settled pair.
 //!
 //! `cipher_clerk::settlement::window` takes two anchors and per-journal
-//! rows; this kernel nets the delta itself, as the Clerk's own window will
-//! once it takes one cut and a carried state.
+//! rows; this kernel takes one cut and a carried state, and nets the
+//! delta itself.
 
 #![no_std]
 

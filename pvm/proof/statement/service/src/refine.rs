@@ -28,15 +28,17 @@
 use alloc::vec::Vec;
 
 use ed25519_dalek::{Signature, VerifyingKey};
-use vos_statement::vos_anchor::RootRead;
-use vos_statement::vos_anchor::venue::{self as rules, RegisterRefusal};
+use vos_statement::vos_anchor::venue as rules;
+use vos_statement::vos_anchor::{Anchor, RootRead};
 use vos_statement::vos_pvm_final_verifier::{self, MAX_PROOF_BYTES};
 use vos_statement::{
     DecodeError, LINKED, ProgramId, Refusal, SpaceId, Statement, StatementId, Venue, VenueId, admit,
 };
 
 use crate::config::Config;
-use crate::item::{Item, Kind, MAX_ROOTS, MAX_STATEMENT_BYTES, control_digest};
+use crate::item::{
+    Item, Kind, MAX_ROOTS, MAX_STATEMENT_BYTES, Register, SignedControl, control_digest,
+};
 use crate::verdict::{AnchorCode, ControlCode, Judged, RegisterCode, Registered, Root, Verdict};
 
 /// The item's extrinsics, which a `Submit` reads its proof from.
@@ -87,8 +89,11 @@ pub fn refine(
     payload: &[u8],
     extrinsics: &mut impl Extrinsics,
 ) -> Verdict {
-    let item = match Item::decode(payload) {
-        Ok(item) => item,
+    match Item::decode(payload) {
+        Ok(Item::Register(register)) => refine_register(&venue, &register),
+        Ok(Item::Anchor(anchor)) => refine_anchor(&venue, &anchor),
+        Ok(Item::Submit(bytes)) => Verdict::Submit(judge(config, &bytes, extrinsics)),
+        Ok(Item::Control(control)) => refine_control(&venue, &control),
         Err(_) => {
             let kind = payload.first().copied().and_then(Kind::from_u8);
             let code = match kind {
@@ -96,74 +101,70 @@ pub fn refine(
                 Some(Kind::Control) => ControlCode::Item as u32,
                 _ => RegisterCode::Item as u32,
             };
-            return Verdict::Refused { kind, code };
-        }
-    };
-    match item {
-        Item::Register(register) => match rules::registration(
-            &venue,
-            &register.genesis,
-            &register.controller,
-            &register.founder_key,
-            &register.signature,
-            signed,
-        ) {
-            Ok(registration) => Verdict::Register(Registered {
-                space: registration.space,
-                clock: registration.clock,
-                controller: register.controller,
-                keys: registration.keys,
-            }),
-            Err(refusal) => Verdict::Refused {
-                kind: Some(Kind::Register),
-                code: register_code(refusal) as u32,
-            },
-        },
-        Item::Anchor(anchor) => {
-            if !signed(&anchor.signer, &anchor.digest(&venue), &anchor.signature) {
-                return Verdict::Refused {
-                    kind: Some(Kind::Anchor),
-                    code: AnchorCode::Signature as u32,
-                };
-            }
-            Verdict::Anchor {
-                space: anchor.space,
-                window: anchor.window,
-                kind: anchor.kind,
-                root: anchor.root,
-                signer: anchor.signer,
-            }
-        }
-        Item::Submit(bytes) => Verdict::Submit(judge(config, &bytes, extrinsics)),
-        Item::Control(signed_control) => {
-            let digest = control_digest(&venue, &signed_control.control);
-            if !signed(
-                &signed_control.controller,
-                &digest,
-                &signed_control.signature,
-            ) {
-                return Verdict::Refused {
-                    kind: Some(Kind::Control),
-                    code: ControlCode::Signature as u32,
-                };
-            }
-            let control = signed_control.control;
-            Verdict::Control {
-                space: control.space,
-                nonce: control.nonce,
-                op: control.op,
-                controller: signed_control.controller,
-            }
+            Verdict::Refused { kind, code }
         }
     }
 }
 
-/// The service's code of a registration's refusal.
-pub fn register_code(refusal: RegisterRefusal) -> RegisterCode {
-    match refusal {
-        RegisterRefusal::Genesis | RegisterRefusal::Clock => RegisterCode::Genesis,
-        RegisterRefusal::Founder => RegisterCode::Founder,
-        RegisterRefusal::Exists => RegisterCode::Again,
+/// A registration: `vos_anchor::venue::registration`'s checks.
+fn refine_register(venue: &VenueId, register: &Register) -> Verdict {
+    match rules::registration(
+        venue,
+        &register.genesis,
+        &register.controller,
+        &register.founder_key,
+        &register.signature,
+        signed,
+    ) {
+        Ok(registration) => Verdict::Register(Registered {
+            space: registration.space,
+            clock: registration.clock,
+            controller: register.controller,
+            keys: registration.keys,
+        }),
+        Err(refusal) => Verdict::Refused {
+            kind: Some(Kind::Register),
+            code: RegisterCode::from(refusal) as u32,
+        },
+    }
+}
+
+/// An anchor: signed by the key it names, over its digest at `venue`.
+fn refine_anchor(venue: &VenueId, anchor: &Anchor) -> Verdict {
+    if !signed(&anchor.signer, &anchor.digest(venue), &anchor.signature) {
+        return Verdict::Refused {
+            kind: Some(Kind::Anchor),
+            code: AnchorCode::Signature as u32,
+        };
+    }
+    Verdict::Anchor {
+        space: anchor.space,
+        window: anchor.window,
+        kind: anchor.kind,
+        root: anchor.root,
+        signer: anchor.signer,
+    }
+}
+
+/// A control: signed by the key it names, over its digest at `venue`.
+fn refine_control(venue: &VenueId, signed_control: &SignedControl) -> Verdict {
+    let digest = control_digest(venue, &signed_control.control);
+    if !signed(
+        &signed_control.controller,
+        &digest,
+        &signed_control.signature,
+    ) {
+        return Verdict::Refused {
+            kind: Some(Kind::Control),
+            code: ControlCode::Signature as u32,
+        };
+    }
+    let control = signed_control.control;
+    Verdict::Control {
+        space: control.space,
+        nonce: control.nonce,
+        op: control.op,
+        controller: signed_control.controller,
     }
 }
 
@@ -210,20 +211,12 @@ fn judge(config: &Config, bytes: &[u8], extrinsics: &mut impl Extrinsics) -> Jud
         admitted.verify(&proof)
     });
     let code = vos_statement::code(&verdict);
-    let roots = match verdict {
-        Ok(_) => statement
-            .roots
-            .iter()
-            .map(|root| Root {
-                kind: root.kind,
-                window: root.window,
-                root: root.root,
-            })
-            .collect(),
-        Err(_) => Vec::new(),
+    let (id, roots) = match verdict {
+        Ok(id) => (id, statement.roots.iter().map(Root::from).collect()),
+        Err(_) => (statement.id(), Vec::new()),
     };
     Judged {
-        id: statement.id().0,
+        id: id.0,
         program: statement.program.to_bytes(),
         space: statement.space,
         roots,

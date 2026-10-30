@@ -199,7 +199,6 @@ impl Space {
             .collect();
         nodes.sort_unstable();
         Ok(SpaceGenesis {
-            version: vos_wire::vos_anchor::GENESIS_VERSION,
             nodes,
             clock,
             time,

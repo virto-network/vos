@@ -86,7 +86,6 @@ impl Setup {
     fn new(fees: bool) -> Self {
         let key = SigningKey::from_bytes(&[1; 32]);
         let genesis = SpaceGenesis {
-            version: vos_anchor::GENESIS_VERSION,
             nodes: vec![(1, key.verifying_key().to_bytes())],
             clock: CLOCK,
             time: 7,

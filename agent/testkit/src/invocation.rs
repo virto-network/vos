@@ -79,9 +79,6 @@ pub(crate) struct Invocation<'a> {
     pub(crate) instances: Vec<InstanceGas>,
     pub(crate) messages: Vec<Outgoing>,
     pub(crate) attests: Vec<Attest>,
-    /// What the attests count against the step's limit: one each, one at a
-    /// window's cut [`cap::AT_CUT`].
-    counted: usize,
     /// The bytes and the rows of state the step has written, against its
     /// limits.
     write_bytes: usize,
@@ -105,7 +102,6 @@ impl<'a> Invocation<'a> {
             instances: Vec::new(),
             messages: Vec::new(),
             attests: Vec::new(),
-            counted: 0,
             write_bytes: 0,
             rows_written: 0,
             draws: 0,
@@ -459,7 +455,7 @@ impl<'a> Invocation<'a> {
         // keep counting.
         let effects = (
             self.messages.len(),
-            (self.attests.len(), self.counted),
+            self.attests.len(),
             self.write_bytes,
             self.rows_written,
         );
@@ -489,10 +485,9 @@ impl<'a> Invocation<'a> {
             }
         };
         if failed.is_some() {
-            let (messages, (attests, counted), written, rows) = effects;
+            let (messages, attests, written, rows) = effects;
             self.messages.truncate(messages);
             self.attests.truncate(attests);
-            self.counted = counted;
             self.write_bytes = written;
             self.rows_written = rows;
         }
@@ -512,7 +507,7 @@ impl<'a> Invocation<'a> {
     ) -> Result<(), Failure> {
         let method = MethodId(r[7] as u32);
         let call_arguments = read(machine, r[8], r[9], self.limits.attest)?;
-        if self.counted + 1 > self.limits.attests {
+        if Attest::weighed(&self.attests) + 1 > self.limits.attests {
             return Err(Failure::Cap);
         }
         let installed = self.kit.instances.get(&instance);
@@ -566,7 +561,6 @@ impl<'a> Invocation<'a> {
         copy_out(machine, &parts.output, r[10], 0, r[11])?;
         machine.registers_mut()[7] = parts.output.len() as u64;
         machine.registers_mut()[8] = 0;
-        self.counted += 1;
         self.attests.push(Attest {
             program: ProgramHash::of(program),
             window: None,
