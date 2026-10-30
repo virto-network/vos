@@ -130,7 +130,9 @@ const fn tag(tag: vos_wire::credentials::Tag) -> [u64; 4] {
 /// `from` must point at 32 readable bytes.
 #[inline(always)]
 unsafe fn unaligned(from: *const u8) -> [u64; 4] {
-    unsafe { core::array::from_fn(|i| u64::from_le(core::ptr::read_unaligned(from.add(8 * i).cast()))) }
+    unsafe {
+        core::array::from_fn(|i| u64::from_le(core::ptr::read_unaligned(from.add(8 * i).cast())))
+    }
 }
 
 /// The 32 bytes at `from`, 8-aligned, as four `u64`s.
@@ -257,8 +259,7 @@ impl Statements {
         // SAFETY: each `InPlace` points at its bytes in the argument pages,
         // page-aligned for the siblings and 8-aligned for the secret.
         let matched = unsafe {
-            let (root, derived) =
-                auth_p2_lean(secret.ptr(), slot, siblings.ptr(), scope.ptr());
+            let (root, derived) = auth_p2_lean(secret.ptr(), slot, siblings.ptr(), scope.ptr());
             u64::from(kind == 0) & same(&root, map_root.ptr()) & same(&derived, nullifier.ptr())
         };
         assert!(matched == 1, "a member");

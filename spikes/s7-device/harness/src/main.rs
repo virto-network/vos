@@ -341,7 +341,11 @@ fn profile(side_note: &vos_pvm_proof::SideNote, dir: &Path, method: &[u8]) {
     let mut bytes = 0;
     for step in &side_note.steps {
         let at = functions.partition_point(|(start, _)| *start <= step.pc);
-        let name = if at == 0 { "(prologue)" } else { functions[at - 1].1 };
+        let name = if at == 0 {
+            "(prologue)"
+        } else {
+            functions[at - 1].1
+        };
         let touched: usize = [&step.mem_read, &step.mem_write]
             .into_iter()
             .flatten()
@@ -354,7 +358,10 @@ fn profile(side_note: &vos_pvm_proof::SideNote, dir: &Path, method: &[u8]) {
     }
     let mut rows: Vec<_> = by.into_iter().collect();
     rows.sort_by_key(|(_, (steps, _))| std::cmp::Reverse(*steps));
-    println!("  {} steps, {bytes} bytes by loads and stores", side_note.steps.len());
+    println!(
+        "  {} steps, {bytes} bytes by loads and stores",
+        side_note.steps.len()
+    );
     for (name, (steps, touched)) in rows.iter().take(30) {
         println!("  {steps:>7} {touched:>7}  {name}");
     }
