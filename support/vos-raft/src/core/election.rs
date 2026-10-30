@@ -105,8 +105,17 @@ impl<N: NodeId> Core<N> {
         self.active.members().all(|member| member == self.cfg.me)
     }
 
+    /// Whether a host wiped a longer log than this replica holds now: it
+    /// may have acknowledged entries a quorum committed, which it no longer
+    /// holds, so it does not campaign until its log reaches what it held.
+    fn short_of_floor(&self) -> bool {
+        self.vote_floor.is_some_and(|(index, term)| {
+            (self.log.last_term(), self.log.last_index()) < (term, index)
+        })
+    }
+
     fn start_pre_election(&mut self) {
-        if !self.is_member() {
+        if !self.is_member() || self.short_of_floor() {
             self.reset_election_timer();
             return;
         }
@@ -127,7 +136,7 @@ impl<N: NodeId> Core<N> {
     }
 
     fn start_election(&mut self) {
-        if !self.is_member() {
+        if !self.is_member() || self.short_of_floor() {
             self.reset_election_timer();
             return;
         }

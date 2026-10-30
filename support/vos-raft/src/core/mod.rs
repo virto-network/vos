@@ -191,10 +191,11 @@ pub struct Recovered<N: NodeId> {
     pub applied: u64,
     /// The last log position (index, term) a replica held before its host
     /// wiped its log and state, keeping its term and vote: it votes only
-    /// for candidates whose log reaches it, as if it still held that log.
-    /// A host that wipes a replica a change removed keeps it, so the
-    /// replica, added again empty, never votes for a removed one that
-    /// never learned of its removal.
+    /// for candidates whose log reaches it, and campaigns only once its
+    /// own log does, as if it still held that log. A host that wipes a
+    /// replica a change removed keeps it, so the replica, added again
+    /// empty, never votes for a removed one that never learned of its
+    /// removal, nor leads by a configuration older than one it held.
     pub vote_floor: Option<(u64, u64)>,
 }
 

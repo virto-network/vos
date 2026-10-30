@@ -5,7 +5,7 @@ use vos_raft::{LogEntry, Message, Role};
 
 use crate::common::{
     LEADER_A, LEADER_B, ME, append, claimed, committed, compact_bounds, config, follower,
-    leader_of_two, matched, persist, recovered, sent, writes,
+    leader_of_two, matched, persist, recovered, sent, snapshotted, writes,
 };
 
 #[test]
@@ -367,6 +367,38 @@ fn a_wiped_replica_votes_only_for_a_log_reaching_what_it_held() {
         term: 5,
         granted: true,
     }));
+}
+
+/// A wiped replica restored from a snapshot older than the log it held
+/// does not campaign by the configuration the snapshot names: entries it
+/// acknowledged past the snapshot may have committed, and a quorum of the
+/// older configuration may lack them all. Once its log reaches what it
+/// held, it campaigns again.
+#[test]
+fn a_wiped_replica_campaigns_only_once_its_log_reaches_what_it_held() {
+    let campaigns = |core: &mut Core<u16>, at: u64| {
+        core.tick(at);
+        sent(&core.take_actions())
+            .iter()
+            .any(|message| matches!(message, Message::PreVote { .. } | Message::Vote { .. }))
+    };
+    let recovered = Recovered {
+        vote_floor: Some((40, 3)),
+        ..snapshotted(recovered(3, 20, Vec::new()), (20, 2))
+    };
+    let mut core = Core::new(config(), recovered, 0, 7);
+    core.take_actions();
+    assert!(!campaigns(&mut core, 1_000));
+    assert!(!campaigns(&mut core, 2_000));
+    assert_eq!(core.role(), Role::Follower);
+    // Its leader brings it to what it held, and goes silent.
+    let entries: Vec<(u64, u64)> = (21..=40).map(|index| (index, 3)).collect();
+    core.receive(LEADER_A, append(3, LEADER_A, (20, 2), 20, &entries));
+    for write in writes(&core.take_actions()) {
+        persist(&mut core, &write);
+    }
+    core.take_actions();
+    assert!(campaigns(&mut core, 10_000));
 }
 
 /// A replayed append, shorter than one already taken, leaves the log as it
