@@ -451,7 +451,9 @@ pinned by 7.7.
   shape holds neither. The encoded parts `E` are BLAKE2b's (`public_args`,
   `output`, `roots`, each SCALE-framed, the same bytes); `E` is packed three
   bytes a word, eight words a block, zero-padded; the chain starts at
-  `T(io)` with `E`'s byte length in word 1 and takes one `C` a block; the
+  `T(io)`, takes one `C` a block and ends with `C` of a block holding
+  `E`'s byte length (Merkle–Damgård strengthening, binding by `C`'s
+  collisions alone); an `E` of 2^24 bytes or more is refused; the
   digest's 8 words, as 32 little-endian bytes, are φ9..12. A device kernel
   is `#[attestable(device)]`, and a guard's `device = "..."` must name one;
   node kernels, formats 35 and 41 and their program ids keep BLAKE2b.

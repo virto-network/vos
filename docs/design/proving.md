@@ -1217,29 +1217,33 @@ hashing and the proof's bytes go with the columns [measured, 7.16]. Over
   domain: `compact(|a|) ‖ a ‖ compact(|o|) ‖ o ‖ compact(|R|)`, then each
   root read's kind byte, space, window (8 bytes little-endian) and root;
   `a` the public arguments, `o` the output, `R` the roots. `ℓ = |E|`, at
-  most a work result's 4 MiB, below 2^24; a longer return traps.
+  most a work result's 4 MiB, below 2^24: `compute_device_io_hash` refuses
+  a longer `E` (the kernel's end traps, ingress refuses the request), never
+  wrapping or truncating it.
 - **The words:** `E` zero-padded to `n = ⌈ℓ / 24⌉` blocks of 24 bytes
   (`n ≥ 1`: `E` holds at least three bytes); block `i`'s word `j` is
   `b₀ + 2^8·b₁ + 2^16·b₂` of its three bytes, below 2^24, so no word
   reaches p and the call never traps on one.
-- **The chain:** `h₀ = [t_io, ℓ, 0, 0, 0, 0, 0, 0]`, `t_io` the tag word
-  of the name `io` (`T(io)` with the length in word 1);
-  `h_i = C(h_{i−1}, block_i)`; `H_io = h_n`, its 8 words as 32
+- **The chain:** `h₀ = T(io)`, `t_io` the tag word of the name `io`;
+  `h_i = C(h_{i−1}, block_i)` for each block; then the length block,
+  `H_io = C(h_n, [ℓ, 0, 0, 0, 0, 0, 0, 0])`. Its 8 words are 32
   little-endian bytes in φ9..12 as before (each word below p, so the bytes
   are canonical).
 - **Domain separation:** `t_io` is a seventh tag, pinned distinct from the
-  six. Every other first call of `C` in the system takes a tag block
-  (word 1 zero) or a digest on the left; `h₀`'s word 1 is `ℓ ≥ 3`, so
-  `H_io`'s first call is no other computation's but by a preimage of `C`,
-  and its later calls take `C`'s outputs.
-- **Why it binds:** an `H_io` collision gives a collision or an
-  IV-preimage of `C`. Equal `ℓ` means equal `n` and a padding injective at
-  that length, so two chains that meet hold a `C` collision (Merkle–Damgård
-  over a fixed IV); unequal `ℓ` start at different `h₀`, and walking two
-  meeting chains back ends at a `C` collision or at a `C` output equal to
-  some `h₀` (six zero words): a preimage. `C` is 248 bits, about 124 bits
-  against collisions (BLAKE2b-256's 128), far above the proofs' 62 proven
-  bits.
+  six, and `H_io`'s first call takes `T(io)` on the left. No other
+  computation over `C` starts there: the credential values' first calls
+  take another tag, and a tree node's left input is a leaf or a node.
+- **Why it binds:** Merkle–Damgård with the length in its last block
+  (strengthening). Two encodings with one `H_io`: if their lengths differ,
+  the last calls' right inputs differ and the last call is a collision of
+  `C`; if equal, they have as many blocks, the padding at that length is
+  injective, so the encodings' blocks differ somewhere and walking the two
+  chains back from the meeting output finds a collision of `C` at the
+  first call where the inputs differ. No preimage of `C` enters (a
+  truncated permutation without feed-forward has easy preimages when both
+  halves are free, so the argument must not rest on one). `C` is 248 bits,
+  about 124 bits against collisions (BLAKE2b-256's 128), far above the
+  proofs' 62 proven bits.
 - **What a device kernel is:** `#[attestable(device)]`, whose end writes
   `H_io` (`vos_sdk`'s `attested_device`); an auth guard's `device = "..."`
   must name one, else the macro refuses. Node kernels, formats 35 and 41
@@ -1249,18 +1253,24 @@ hashing and the proof's bytes go with the columns [measured, 7.16]. Over
   io-hash's 32 bytes are the public values, DeviceIoChip's sum recomputed
   from them); ingress computes `H_io` from the request's words
   (`a` the SCALE encoding of `CredentialPublic::Auth`, 129 bytes, `o`
-  empty, no roots: `ℓ = 133`, six blocks) by the one function the kernel's
+  empty, no roots: `ℓ = 133`, six blocks and the length's) by the one
+  function the kernel's
   end, the runtime and the testkit share
   (`vos_pvm_precompiles::compute_device_io_hash`), and verifies the proof
   under 43 against it. A proof whose kernel ended with BLAKE2b states
   another io-hash and fails.
 - **What moves:** every device kernel's code and program id (none pinned
-  before ingress takes device proofs); a device kernel's io-hash wherever
-  its return is checked (`KernelReturn` by the kernel's profile);
-  the tags. **What does not:** pin I's auth words, the device chips,
-  DeviceIoChip, format 43's reference and bits (a device program may
-  still hold BLAKE2b, so the reference keeps it), every node format.
-- **Its cost:** six calls for auth (the Poseidon2 chip's rows 36 to 42,
+  before ingress takes device proofs); `vos_sdk`'s ends for a device
+  kernel (`attested_device`, and the device form of `attested_output` for
+  a kernel of no public part); a device kernel's io-hash wherever its
+  return is checked (`KernelReturn::io_hash` by the kernel's profile, the
+  runtime's and the testkit's checks); the spike harness's and `tools/phone`'s
+  kernels; a device kernel's gas (seven calls at 2,400 gas each where BLAKE2b's
+  blocks were); the tags. **What does not:** pin I's auth words, the
+  device chips, DeviceIoChip, format 43's reference and bits (a device
+  program may still hold BLAKE2b, so the reference keeps it), every node
+  format.
+- **Its cost:** seven calls for auth (the Poseidon2 chip's rows 36 to 43,
   under its floor) and the packing's steps; BLAKE2b and the AND table
   leave the auth kernel's shape.
 
