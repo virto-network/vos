@@ -2125,73 +2125,211 @@ byte), `just check` green (1,466 passed in 106 suites; 12 GiB scope,
 
 ## Step 7.16: the device parameters, measured
 
-Branch `s7/7.16`, from vos-core `4a143e9f`. **Stopped at** (work in
-progress, wound down for the owner's quota; nothing pushed to the phone,
-no phone session started, no run left going):
+Branch `s7/7.16`, from vos-core `4a143e9f`; vos-core merged twice before
+measuring (`8f58ae0c`, at `217c2982`, and at `44db9c32`), so every number
+below is on the Stwo fork's `9e9b4ff6` (the SIMD Blake2s-M31 reduction
+fixed). Stopped once for the owner's quota (2026-10-27) and resumed
+(2026-10-30).
 
-**Built (uncommitted parts committed here as WIP, not gated):**
-- `pcs.rs`: Blake2s-M31's `mix_bytes` packs four bytes a little-endian
-  word, the last zero-padded (7.10's review L2), with a unit test. Nothing
-  calls it on that channel (the unmasked segment prover is the only
-  `mix_bytes` caller, and no format on Blake2s-M31 is built there; the
-  masked transcripts mix public values as felts), so no fixture should
-  move: to be confirmed by `fixtures::` and `constants::` in `test-proof`.
-- `format.rs`: format 43 registered (Reserved), `DEVICE_MASKING` (`h =
-  1,024`), affine batching, tentative parameters blowup 2, 86 queries, PoW
-  20; 37 retired; `DEVICE_REFERENCE` now the masked device set's shape
-  (derived by `recair/tests/device/format.rs`). `device::DEVICE_MAX_LOG_SIZE`
-  and `install` refusing a chip above it.
-- The spike: `guest`'s `auth_p2` (auth over the credential actor's
-  Poseidon2 tree through `0x402`, pin J's public words, the path walked by
-  masks); `pvm-proof.patch` admits `0x402` in derivation;
-  `harness kernels` writes `kernels/{b2,p2}.{kernel,input}`; the harness's
-  stwo pin moved to `4cd1f83f`; `scripts/x86-params.sh`.
-- `tools/phone`: `vos-phone device` (device cells
-  `statement/blowup:queries:pow/channel`, `b2sm31` or `b2b`, each in a
-  child process: install, warm-ups, timed proves, verify, bytes, peak).
+**Built:**
+- **Blake2s-M31's `mix_bytes` packs four bytes a little-endian word**, the
+  last zero-padded (`pcs.rs`, 7.10's review L2), so a boundary-state run
+  of 296 bytes hashes 296 bytes, not 1,184; a unit test pins it against
+  `mix_u32s` of the packed words and shows every byte of a run moving the
+  digest. **Nothing moved:** no transcript calls it on that channel (the
+  unmasked segment prover is `mix_bytes`' one caller, and no format there
+  runs on Blake2s-M31; the masked transcripts, the credential's and the
+  device's, mix their public values as felts), and `fixtures::` and
+  `constants::` pass unchanged. The masked transcripts' felts (the device's
+  io-hash, 32 M31s, 128 bytes hashed) are the settled encoding.
+- **Format 43** (`format::DEVICE_PROOF`), registered and refused until
+  ingress takes device proofs: masked (c), Blake2s-M31, blowup 4, 47
+  queries, PoW 16, interaction PoW 8, affine DEEP batching, `h = 512`
+  (`DEVICE_MASKING`), **110 conjectured and 62.82 proven bits** on its
+  reference. **37 retired** unregistered. `pvm/proof/SECURITY.md`, the
+  module's notes, pin J and `proving.md` §8 say so.
+- **The masked device reference** (`format::DEVICE_REFERENCE`): the device
+  set with every chip a device program may hold at 2^17 rows, masked under
+  (c): columns at degree bound 2^18, the composition whole at 2^19, 7,548
+  DEEP values, 4,292 constraints, 155,058,176 fractions (each chip's masked
+  row's, the blinding's among them), the widest relation's 265 limbs;
+  derived from the built set by `recair/tests/device/format.rs`, which also
+  pins 43's bits, one query fewer under 62, the least queries by blowup,
+  PoW and batching, the candidates' bits, and that a smaller program counts
+  more (2^11 62.90 down to 2^16 62.80 at blowup 2 with 86, affine).
+- **`device::DEVICE_MAX_LOG_SIZE` = 17**, which `install` enforces: a
+  program with a taller chip is refused, so the count holds for every
+  program 43 proves.
+- **`tools/phone`'s device cells** (`vos-phone device`, `device.rs`):
+  `statement/blowup:queries:pow/channel` (`b2sm31`, `b2b`), each in a child
+  process: install from a reference run, a warm-up, timed traces and
+  proves, each proof verified, bytes (postcard), peak resident, R1, columns
+  and cells, by chip. The kernels and their witness inputs are files
+  (`--kernels`); the pool's stacks are 16 MiB (below).
+- **The spike** (`spikes/s7-device`): the guest's `auth_p2`, pin J's
+  device kernel over the credential actor's Poseidon2 tree through
+  `0x402` (its public words auth's `CredentialPublic`, its output empty,
+  the path walked with masks; 36 compressions); the patch admits `0x402`
+  in derivation (the derivation refuses it in kernels); `harness kernels`
+  writes `kernels/{b2,p2}.{kernel,input}`, each traced to its halt;
+  `scripts/x86-params.sh` and `scripts/p4.sh` (the session).
 
-**Measured so far** [measured, x86, not timing]:
-- The kernels: `b2` 19,240 steps (981 B input), `p2` 18,733 steps (1,189 B
-  input): the Poseidon2 statement is not shorter in steps (argument
-  decoding and copying, the selects; lever 3's material).
-- **The memory ledger is at 2^17 rows** for both statements (shape `p2`:
-  `[15, 11, 11, 17, 13, 13, 16, 11, 11, 15, 11, …, 12, 11, 11, 16]` in
-  `DEVICE_ORDER`; 7.15's record said 2^16), so `DEVICE_MAX_LOG_SIZE` was
-  raised from 16 to 17 and the reference must be re-pinned at 2^17.
-- Counts on the masked reference at 2^16 (affine / powers): 1:86:20 62.80
-  / 61.92; 1:87:20 63.28 / 62.34; 2:43:20 62.86 / 62.19; 2:47:16 62.84 /
-  62.14; 3:29:20 63.35 / 62.67; conjectured 106, 107, 106, 110, 107.
-  Smaller programs count more (2^11 62.90 … 2^16 62.80 at 1:86:20 affine).
-- At 2^17 (`SecurityShape { 19, 18, 19, 7,548, 3, 4,292, 155,058,176,
-  265, 1 }`), the least queries clearing 62: blowup 2 PoW 20 87 by powers,
-  **85 affine**; blowup 4 PoW 20 43; blowup 4 PoW 16 47; blowup 8 PoW 20
-  29 (either batching).
+**The counts** on the reference [measured, the security tool; proven bits
+by powers / affine, conjectured]:
 
-**Remains:**
-- Re-pin `DEVICE_REFERENCE` to the 2^17 shape above, update
-  `format.rs`'s doc line (7,548 values, 4,292 constraints, 2^17), restore
-  the candidate assertions in `recair/tests/device/format.rs` (remove the
-  `continue`, fill the 2^17 bits, drop the `least` printout or make it an
-  assertion), and the `the_unmasked_counts_do_not_move`/bit tests.
-- The x86 matrix (every candidate, `p2` and `b2`, Blake2s-M31 and
-  Blake2b-256), then session P4 on the phone (build `just phone`; push
-  `vos-phone-timing` and `kernels/` under `/data/local/tmp/`), then the pin
-  (fastest within 1 GiB and 1.5 MiB by median and p95), the module docs,
-  `SECURITY.md`'s table, pin J and `proving.md` §8's format 43, PG2's
-  standing and the lever ranking, this record, the gates, the Opus review.
-- Remove the temporary panic message in `tools/phone/src/device.rs`'s
-  install (keep it or reword), and add `x86-params.sh`'s run.
+| candidate | powers | affine | conjectured |
+|---|---|---|---|
+| blowup 2, 86 queries, PoW 20 | 61.77 | 62.77 | 106 |
+| blowup 2, 87, PoW 20 | 62.20 | 63.25 | 107 |
+| blowup 4, 43, PoW 20 | 62.09 | 62.83 | 106 |
+| **blowup 4, 47, PoW 16 (43)** | 62.01 | **62.82** | **110** |
+| blowup 8, 29, PoW 20 | 62.56 | 63.33 | 107 |
 
-**Next commands** (from the worktree; `TMPDIR` on disk, `CARGO_INCREMENTAL=0`,
-each under `systemd-run --user --scope -q -p MemoryMax=12G -p
-MemorySwapMax=0 nice -n 10`, `-j 6`):
-1. `cargo test --release -p vos-pvm-recair --test device format:: -- --nocapture`
-   after the re-pin.
-2. `cargo build --release -p vos-phone`, then
-   `spikes/s7-device/scripts/x86-params.sh target/release/vos-phone spikes/s7-device/kernels spikes/s7-device/runs/x86-params.jsonl`
-   (the kernels regenerate with `scripts/tree.sh`, the harness built there,
-   `s7-device gen <elf> data` and `s7-device kernels <elf> data kernels`).
-3. `just phone`; P4 under the phone rules; then the record and the gates.
+The least queries clearing 62: blowup 2 at PoW 20, 87 by powers, 85
+affine; blowup 4, 43 at PoW 20 and 47 at PoW 16; blowup 8, 29.
+
+**x86** [measured, `spikes/s7-device/runs/x86-params.jsonl`,
+`x86-params-extra.jsonl`; `vos-phone device` on the fixed fork pin; 4
+threads pinned to four P-cores (1, 3, 6, 8), 8 over the six P-cores'
+twelve; 5 reps after a warm-up; masks from the OS; load 3.3–8 (other
+agents' runs), so about ±15%]; `p2` the auth statement over the Poseidon2
+tree (18,733 steps), `b2` over the vos-tree (19,240):
+
+| cell | threads | prove p50 / p95 | peak | bytes | verify | R1 |
+|---|---|---|---|---|---|---|
+| p2, 2:86:20 | 4 | 2.70 / 2.87 s | 2,340 MiB | 3,234,956 | 32.0 ms | 76 ms |
+| p2, 2:87:20 | 4 | 2.69 / 2.92 s | 2,351 MiB | 3,278,981 | 32.6 ms | 94 ms |
+| p2, 4:43:20 | 4 | 2.78 / 2.92 s | 3,396 MiB | 1,750,427 | 23.2 ms | 22 ms |
+| **p2, 4:47:16** | 4 | **2.64 / 2.77 s** | 3,400 MiB | 1,890,322 | 23.6 ms | 25 ms |
+| p2, 8:29:20 | 4 | 4.07 / 4.15 s | 5,688 MiB | 1,254,233 | 21.4 ms | 8 ms |
+| p2, 2:86:20 | 8 | 1.84 / 1.89 s | 2,404 MiB | 3,247,820 | | |
+| p2, 2:87:20 | 8 | 1.89 / 2.15 s | 2,392 MiB | 3,281,054 | | |
+| p2, 4:43:20 | 8 | 2.00 / 2.73 s | 3,453 MiB | 1,740,471 | | |
+| p2, 4:47:16 | 8 | 1.93 / 2.36 s | 3,475 MiB | 1,895,246 | | |
+| p2, 8:29:20 | 8 | 3.72 / 4.55 s | 5,698 MiB | 1,251,166 | | |
+| b2, 2:86:20 | 4 | 2.12 / 2.20 s | 2,244 MiB | 2,706,930 | 24.8 ms | 82 ms |
+| b2, 4:43:20 | 4 | 2.88 / 2.99 s | 3,566 MiB | 1,465,162 | 19.7 ms | 24 ms |
+| b2, 4:47:16 | 4 | 2.84 / 2.98 s | 3,546 MiB | 1,589,518 | 20.2 ms | 26 ms |
+| b2, 8:29:20 | 4 | 4.50 / 4.55 s | 6,278 MiB | 1,058,938 | 17.4 ms | 10 ms |
+| p2 on Blake2b-256, 2:86:20 | 4 | 22.2 s (one) | 2,245 MiB | 3,248,128 | 30.1 ms | |
+| p2 on Blake2b-256, 4:43:20 | 4 | 46.2 s | 3,372 MiB | 1,746,058 | 33.0 ms | |
+| p2 on Blake2b-256, 4:47:16 | 4 | 48.5 s | 3,350 MiB | 1,888,115 | 23.7 ms | |
+| p2 on Blake2b-256, 8:29:20 | 4 | 90.5 s | 5,647 MiB | 1,249,983 | 17.6 ms | |
+
+Configurations are blowup : queries : PoW. The trace takes 6–10 ms, the
+install (program and preprocessed root) 0.22–0.46 s; verification
+17–42 ms in the prover's pool (under pin J's 40 ms at the pin, not
+measured on one core).
+
+**The shape and the breakdown** [measured; p2 at 8:29:20 and b2 at
+4:43:20 by chip, the committed columns and their cells before blowup;
+perf over p2 at 4:47:16, 4 threads]:
+- p2's 21 chips, 6,495 columns: **the CPU 54% of the cells** (2^15 rows,
+  785 columns), the memory ledger 17% (**2^17 rows**), the registers' 9%
+  (2^16), **BLAKE2b 7% at its floor but 3,136 columns**, program memory 3%,
+  **the Poseidon2 chip 3% and 1,207 columns**, the AND table 2% (2^16),
+  every other at most 2%. b2: 5,288 columns, the CPU 45%, BLAKE2b 23%
+  (2^12), the ledger 14%.
+- perf: Blake2s compression (the Merkle trees, every column lifted to the
+  lifting height) 36%, the FFTs about 10%, the constraint and logup
+  evaluation about 10%, rayon's bridged closures (interpolation,
+  extension) about 20%, the witness digest's BLAKE2b 3%.
+
+**The pin: format 43 at blowup 4, 47 queries, PoW 16** (affine; 110 /
+62.82). **No candidate meets both of pin J's budgets on the auth
+statement**: every one peaks at 2.3–5.7 GiB on x86 against 1 GiB, and of
+the Poseidon2 statement's proofs only blowup 8's fit 1.5 MiB (1.25 MB).
+Blowup 8 is the slowest (×1.5) and peaks near 5.7 GiB (about 6.5 GiB on
+the phone's mimalloc build, past what the phone's 7.5 GB leaves a
+process); blowup 2's proofs are 3.2 MB, twice the budget, more than any
+one lever removes. Blowup 4 is the middle on both, and with PoW 16 it
+proves fastest on 4 threads by median and 95th percentile (2.64 / 2.77
+s) and has the shortest grind tail (PoW 20's 95th percentile on the phone
+is 69–72 ms, PoW 16's 6–7 ms, 7.12's P2); its proof falls under 1.5 MiB
+once the io-hash's BLAKE2b leaves the shape (below, about 1.0 MB [est]).
+It is format 44's parameters, so the device and the credential formats
+share one grind and one parameter set. Format 43 stays reserved; 7.17's
+lever 4 counts again on the lighter shape.
+
+**Session P4: not run.** The Fairphone 6 was not on USB when this step
+reached it (2026-10-30 17:40–19:00: `adb devices` empty, the phone not in
+`lsusb`, an adb server restart changed nothing). Ready to run:
+`just phone` built `vos-phone-timing` (SHA-256 `ddeefcf6…750d`) with the
+device cells; `spikes/s7-device/scripts/p4.sh target/phone/vos-phone-timing
+spikes/s7-device/kernels <out>` runs the session (three rounds of p2 at
+every candidate at automatic threads, one on the four big cores, one of
+b2, one Blake2b-256 cell; battery at least 50% and below 35.0 °C before
+each round, waiting up to an hour; it removes `/data/local/tmp/vos-p4`).
+The pin is therefore x86's; the phone may move it only between blowup 4
+at PoW 16 and at PoW 20 (the same bytes and memory), which the grind's
+tail already decided at 7.12.
+
+**Where PG2's 1 s stands:** the pin proves the auth statement in 2.64 s
+on four x86 P-cores (1.93 s on 8) under load 3–5; at 7.12's ratio (the
+phone at automatic threads about 3.8× x86 on four P-cores, 2.9× on its
+big cores) that is **about 7.5–10 s on the phone [est]**, against 1 s, and
+3.4 GiB on x86 against 1 GiB. 7.15's quiet 1.67 s for b2 at 4:43:20 is
+now 2.88 s at load 3–5 with the memory ledger at 2^17 (the same cells
+within 8%): the load accounts for most of it, unmeasured quiet here. PG2
+needs about ×8–10 from the levers; the plan's outlook (0.75–1.7 s) assumed
+lever 1 removes BLAKE2b and its AND table, which it does not (below).
+
+**The levers, ranked by the breakdown:**
+1. **The io-hash through Poseidon2** (not in 7.17's list): the device
+   kernel's io-hash is BLAKE2b, so BLAKE2b (3,136 columns) and its AND
+   table stay in every device shape, the Poseidon2 statement's too. They
+   are 48% of p2's columns: the Merkle hashing, 36% of the time, goes
+   with the columns, not the cells, and so do the bytes. Moving the
+   io-hash (pin J's, pin I's words) onto Poseidon2 for device kernels: about
+   −45% bytes (1.89 → about 1.0 MB at the pin) and −15–20% time [est]. A
+   design change for 7.17's first day.
+2. **A lean kernel (lever 3):** the CPU is 54% of the cells at 2^15 rows
+   for 18,733 steps; under 16,384 steps the CPU and program memory halve
+   (about −30% of the cells), and fewer argument copies take the ledger
+   from 2^17 to 2^16 (−8%). The Poseidon2 statement takes as many steps as
+   the BLAKE2b one: decoding and copying 1,189 bytes of arguments and the
+   path's masks, not the hashing.
+3. **The CPU split (7.18):** the CPU's 785 columns a row are the largest
+   single share whatever its rows.
+4. **The Poseidon2 chip's width:** 1,207 columns for 36 rows at its floor,
+   19% of p2's columns (word-wide accesses, paired fractions; 7.15's note).
+5. **Threads by core class (lever 2):** 22% at PG1 on the phone; to be
+   measured at P5.
+6. **Parameters again (lever 4):** on this shape blowup 2 and 4 cost the
+   same time; the floor's share is small at the device's sizes (the
+   masking's floors are 2^10–2^12, the tall chips 2^15–2^17), so a tighter
+   `h` buys little here; on a lean shape the floor's share grows.
+Memory is the second gate: every candidate is 2.3–5.7× the 1 GiB budget on
+x86, and only the cells' reduction (levers 1–3) and the masked prover's
+working set bring it down.
+
+**Where the plan was off:**
+- **Lever 1 does not remove BLAKE2b:** the kernel's io-hash keeps it and
+  its AND table in every device shape. **The Poseidon2 statement is not
+  cheaper than the BLAKE2b one** on this AIR: 6,495 columns against 5,288
+  (the Poseidon2 chip's 1,207 added, BLAKE2b's kept at its floor), so its
+  proofs are larger (1.89 against 1.59 MB at the pin) and at blowup 2 it
+  is slower (2.70 against 2.12 s); at blowup 4 it is faster (2.64 against
+  2.84 s). S21's statement is lighter only once the io-hash moves.
+- **The memory ledger takes 2^17 rows** (a row a byte touched), not 2^16
+  (7.15's record); so the reference is at 2^17, `install` refuses taller,
+  and pin J's "at most 2^16 steps" bounds the CPU only.
+- **No candidate meets both budgets;** memory is 2.3–5.7× over on x86.
+- **Blake2b-256 is 8–25× slower** than Blake2s-M31 on the prover's trees
+  (the fork's Blake2b Merkle hashing has no SIMD path): 22–91 s against
+  2.6–4.1 s; the comparison channel is out of the running for phones.
+- **A stack overflow at blowup 8 on 8 threads:** the prover's nested
+  rayon joins overflowed a worker's default 2 MiB stack about once in 18
+  proves (gdb: a chain of `bridge_producer_consumer::helper` and
+  `join_context` frames); none in 24 at 16 MiB. The bench's pool sets 16
+  MiB; `vos-device`'s pool must too before it proves device kernels (7.20).
+- **The derivation refuses `0x402` in kernels:** device kernels need a
+  derivation path that admits it (pin H's "device kernels and handlers
+  alone"); the spike patches it. For 7.20.
+
+**Commits:** `a69e76b0` (work in progress, at the quota stop), `8f58ae0c`
+the first merge, the pin and the measurements, the second merge, this
+record.
 
 ## Step 7.10b: the node API and the gateway
 
