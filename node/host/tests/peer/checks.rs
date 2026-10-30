@@ -130,7 +130,12 @@ fn only_configured_nodes_are_heard() {
     let liveness = PeerMessage::Liveness {
         incarnation: 1,
         round: 1,
+        since: 0,
+        part: 0,
+        parts: 1,
         leading: Vec::new(),
+        unlisted: Vec::new(),
+        took: (0, 0),
     };
     assert_eq!(check(&SPACE, 4, &liveness, unfollowed), Ok(()));
     assert_eq!(

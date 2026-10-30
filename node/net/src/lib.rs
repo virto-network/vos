@@ -229,4 +229,9 @@ pub trait Network: Send + Sync + 'static {
 
     /// Resolves once `to` can likely take another frame of `class`.
     fn ready(&self, to: NodeNumber, class: Class) -> Pin<Box<dyn Future<Output = ()> + Send + '_>>;
+
+    /// The largest frame of each class it sends.
+    fn limits(&self) -> Limits {
+        Limits::DEFAULT
+    }
 }

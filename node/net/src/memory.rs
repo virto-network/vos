@@ -1,6 +1,7 @@
 //! Endpoints in one process, joined through a hub, for tests: frames go
 //! through channels, and the hub can cut links, lose frames and delay
-//! them. Order holds per pair of endpoints, as it does per stream over
+//! them. A delayed frame holds its bytes in its link's queue until it is
+//! delivered, and a queue past its class's budget refuses, as over QUIC. Order holds per pair of endpoints, as it does per stream over
 //! QUIC (and here across streams too, which QUIC does not promise). As
 //! over QUIC, a node takes frames only from the peers it lists.
 
@@ -110,6 +111,7 @@ impl Hub {
             hub: self.clone(),
             peers,
             delayed: Mutex::new(HashMap::new()),
+            held: Held::default(),
         };
         (endpoint, arrivals)
     }
@@ -180,6 +182,9 @@ impl Hub {
     }
 }
 
+/// Bytes each delayed link holds, by peer and class.
+type Held = Arc<Mutex<HashMap<(NodeNumber, Class), usize>>>;
+
 /// A node's endpoint on a [`Hub`].
 pub struct Endpoint {
     number: NodeNumber,
@@ -189,6 +194,8 @@ pub struct Endpoint {
     /// A delivery task per peer while frames are delayed, so they keep
     /// their order.
     delayed: Mutex<HashMap<NodeNumber, Delayed>>,
+    /// What the delayed frames hold of each link's queue.
+    held: Held,
 }
 
 struct Delayed {
@@ -217,9 +224,11 @@ impl Endpoint {
             let (frames, pending) = smol::channel::unbounded::<(Instant, Class, Incoming)>();
             let hub = self.hub.clone();
             let from = self.number;
+            let held = Arc::clone(&self.held);
             let task = smol::spawn(async move {
                 while let Ok((at, class, mut incoming)) = pending.recv().await {
                     smol::Timer::at(at).await;
+                    let bytes = incoming.frame.len();
                     // Wait while the run up then is full, looking again
                     // each time, so a run replaced meanwhile holds
                     // nothing up.
@@ -235,6 +244,9 @@ impl Endpoint {
                             }
                             _ => break,
                         }
+                    }
+                    if let Some(held) = held.lock().expect("the held bytes").get_mut(&(to, class)) {
+                        *held = held.saturating_sub(bytes);
                     }
                 }
             });
@@ -320,6 +332,17 @@ impl Network for Endpoint {
                 _ => Ok(()),
             };
         }
+        // A delayed link's queue holds what it has yet to deliver, under its
+        // class's budget: one under it takes one frame more.
+        {
+            let budget = self.hub.state().limits.queue(class);
+            let mut held = self.held.lock().expect("the held bytes");
+            let held = held.entry((to, class)).or_insert(0);
+            if *held >= budget {
+                return Err(Refused::Full);
+            }
+            *held += incoming.frame.len();
+        }
         // Once delayed, a link stays on its delivery task, so a later
         // frame never passes an earlier one.
         let _ = self
@@ -330,18 +353,32 @@ impl Network for Endpoint {
 
     fn ready(&self, to: NodeNumber, class: Class) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let hub = self.hub.clone();
+        let held = Arc::clone(&self.held);
         Box::pin(async move {
             loop {
-                let room = hub
-                    .state()
-                    .endpoints
-                    .get(&to)
-                    .is_none_or(|joined| joined.deliver.has_room(class));
-                if room {
+                let (arrivals, budget) = {
+                    let state = hub.state();
+                    let arrivals = state
+                        .endpoints
+                        .get(&to)
+                        .is_none_or(|joined| joined.deliver.has_room(class));
+                    (arrivals, state.limits.queue(class))
+                };
+                let queued = held
+                    .lock()
+                    .expect("the held bytes")
+                    .get(&(to, class))
+                    .copied()
+                    .unwrap_or(0);
+                if arrivals && queued < budget {
                     return;
                 }
                 smol::Timer::after(POLL).await;
             }
         })
+    }
+
+    fn limits(&self) -> Limits {
+        self.hub.state().limits
     }
 }

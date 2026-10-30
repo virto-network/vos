@@ -138,6 +138,7 @@ impl Node {
             directory: Directory::default(),
             dropping: Mutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
+            leaders: Mutex::new(HashSet::new()),
             dry_runs: Mutex::new(HashMap::new()),
             wanted: Mutex::new(HashMap::new()),
             drops: crate::peer::Drops::default(),

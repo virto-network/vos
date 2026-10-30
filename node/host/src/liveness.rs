@@ -1,37 +1,46 @@
 //! The pair heartbeat. Once per heartbeat interval each node tells every
 //! other node of its space that it is alive, and which of the groups that
-//! node replicates it leads, at what term. What a node hears goes into its
-//! peer table, which its groups' drivers read to vouch for their leaders
-//! and members before their own timers lapse
-//! ([`vos_raft::core::Core::vouch`]): an idle group then sends nothing.
-//! A group whose core needs no tick but those this stands in for waits on
-//! no timer at all ([`crate::group::Quiet`]): each round wakes those whose
-//! leader stopped listing them, or with a member whose node fell silent.
-//! Whatever goes wrong here leaves Raft's own timing in charge.
+//! node replicates it leads, at what term: what changed since the last
+//! round that node took whole, so an idle node's rounds name no group
+//! ([`vos_raft::pair`]). What a node hears goes into its peer table, which
+//! its groups' drivers read to vouch for their leaders and members before
+//! their own timers lapse ([`vos_raft::core::Core::vouch`]): an idle group
+//! then sends nothing. A group whose core needs no tick but those this
+//! stands in for waits on no timer at all ([`crate::group::Quiet`]): a
+//! change to its leader's listing wakes it as it arrives, and a round
+//! wakes those whose leader's listing went unrenewed, or with a member
+//! whose node fell silent. Whatever goes wrong here leaves Raft's own
+//! timing in charge.
 
+use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use smol::future::FutureExt;
 use vos_net::{Class, Incoming};
 use vos_raft::Role;
-use vos_raft::pair::PeerTable;
+use vos_raft::pair::{Frame, PeerTable, Round, Telling};
+use vos_wire::Encode;
 use vos_wire::ids::AgentId;
-use vos_wire::peer::{Leading, NodeNumber, PeerMessage, Placement};
+use vos_wire::peer::{Leading, NodeNumber, PeerMessage};
 
 use crate::group::{Local, Quiet};
-use crate::node::{Inner, Run};
+use crate::node::{Inner, Known, Run};
 use crate::peer;
 use crate::{lock, timeout};
 
-/// The most groups one frame lists, well within the network's cap on a
-/// liveness frame.
+/// The most groups one frame names, well within the network's default cap
+/// on a liveness frame.
 const LISTED: usize = 4_096;
-/// How long a listing not renewed is kept: far past any election timeout,
-/// so the table stays bounded as groups come and go.
-const FORGET: Duration = Duration::from_secs(60);
+
+/// The most groups one frame of at most `limit` bytes names: a group
+/// listed takes 12 bytes, one unlisted 4, and the frame's other fields
+/// under 64.
+fn per_frame(limit: usize) -> usize {
+    (limit.saturating_sub(64) / 12).clamp(1, LISTED)
+}
 /// How long the pair heartbeat waits to start again after it failed,
 /// first: short, as every group it leads is unvouched while it waits. It
 /// doubles while it keeps failing, to `RESTART_MOST`.
@@ -42,13 +51,15 @@ const RESTART_MOST: Duration = Duration::from_secs(1);
 const RECOVERED: Duration = Duration::from_secs(10);
 
 /// What this node heard of its peers: when, and which groups each leads.
-type Table = PeerTable<NodeNumber, AgentId, Instant>;
+pub(crate) type Table = PeerTable<NodeNumber, AgentId, Instant>;
 
 pub(crate) struct Liveness {
     /// This run of the node: its start time in microseconds, past every
     /// earlier run's.
     pub(crate) incarnation: u64,
     table: RwLock<Table>,
+    /// What this node tells each peer of the groups it leads.
+    telling: Mutex<HashMap<NodeNumber, Telling<AgentId>>>,
     started: Instant,
     /// The last round sent, kept across the heartbeat's restarts: peers
     /// ignore a round below the last they took from this run.
@@ -63,6 +74,7 @@ impl Liveness {
         Self {
             incarnation,
             table: RwLock::new(PeerTable::new()),
+            telling: Mutex::new(HashMap::new()),
             started: Instant::now(),
             round: AtomicU64::new(0),
             beaten: AtomicU64::new(0),
@@ -196,9 +208,13 @@ async fn beat(inner: Arc<Inner>) -> Ended {
             .beaten
             .store(inner.liveness.elapsed(), Ordering::Relaxed);
         let round = inner.liveness.next_round();
+        let size = inner
+            .network
+            .as_ref()
+            .map_or(LISTED, |network| per_frame(network.limits().liveness));
         // None listed while the writer is stalled, so their followers elect
         // leaders that can write, and none that is not live.
-        let leading = if inner.storage.stalled() {
+        let led = if inner.storage.stalled() {
             Vec::new()
         } else {
             inner.led()
@@ -206,55 +222,115 @@ async fn beat(inner: Arc<Inner>) -> Ended {
         for &peer in inner.numbers.iter().filter(|&&peer| peer != inner.number) {
             // A group whose placement this node does not hold goes to
             // every node.
-            let listed: Vec<Leading> = leading
+            let listed: Vec<(AgentId, u64)> = led
                 .iter()
-                .filter(|(_, placement, live)| {
-                    *live
-                        && placement
-                            .as_ref()
-                            .is_none_or(|placement| placement.admits(peer))
-                })
-                .map(|(leading, ..)| *leading)
+                .filter(|led| led.live && led.admits(peer))
+                .map(|led| (led.leading.agent, led.leading.term))
                 .collect();
-            for frame in frames(inner.liveness.incarnation, round, &listed, LISTED) {
-                inner.send(peer, &frame);
+            let told = lock(&inner.liveness.telling)
+                .entry(peer)
+                .or_default()
+                .round(round, listed);
+            let took = inner.liveness.table().taken(peer).unwrap_or((0, 0));
+            let frames = frames(inner.liveness.incarnation, round, told, took, size);
+            // A frame the peer's queue has no room for ends the round
+            // there: the next names its changes again.
+            for frame in frames {
+                if !inner.send_heartbeat(peer, &frame, interval / 4).await {
+                    break;
+                }
             }
-        }
-        if round.is_multiple_of(100)
-            && let Some(before) = Instant::now().checked_sub(FORGET)
-        {
-            inner.liveness.table_mut().forget_before(before);
         }
     }
 }
 
-/// One round's heartbeat: `listed` in frames of at most `size` groups,
-/// and one frame when it lists none.
-fn frames(incarnation: u64, round: u64, listed: &[Leading], size: usize) -> Vec<PeerMessage> {
-    let frame = |leading: &[Leading]| PeerMessage::Liveness {
-        incarnation,
-        round,
-        leading: leading.to_vec(),
-    };
-    if listed.is_empty() {
-        return vec![frame(&[])];
+/// One round's heartbeat to one peer: `told` in frames of at most `size`
+/// groups, and one frame when it names none.
+fn frames(
+    incarnation: u64,
+    round: u64,
+    told: Round<AgentId>,
+    took: (u64, u64),
+    size: usize,
+) -> Vec<PeerMessage> {
+    let Round {
+        since,
+        leading,
+        unlisted,
+    } = told;
+    let mut leading = leading
+        .into_iter()
+        .map(|(agent, term)| Leading { agent, term });
+    let mut unlisted = unlisted.into_iter();
+    let mut parts = Vec::new();
+    loop {
+        let listed: Vec<Leading> = leading.by_ref().take(size).collect();
+        let gone: Vec<AgentId> = unlisted.by_ref().take(size - listed.len()).collect();
+        if listed.is_empty() && gone.is_empty() && !parts.is_empty() {
+            break;
+        }
+        parts.push((listed, gone));
     }
-    listed.chunks(size).map(frame).collect()
+    let count = parts.len() as u32;
+    parts
+        .into_iter()
+        .zip(0..)
+        .map(|((leading, unlisted), part)| PeerMessage::Liveness {
+            incarnation,
+            round,
+            since,
+            part,
+            parts: count,
+            leading,
+            unlisted,
+            took,
+        })
+        .collect()
+}
+
+/// A group this node leads, at its term, as a round lists it.
+pub(crate) struct Led {
+    pub(crate) leading: Leading,
+    /// Not stopped, and its driver gone round in two election timeouts.
+    pub(crate) live: bool,
+    /// Its record and placement, when known.
+    known: Option<Arc<Known>>,
+}
+
+impl Led {
+    /// Whether its placement names `member`, or this node holds none.
+    pub(crate) fn admits(&self, member: NodeNumber) -> bool {
+        self.known
+            .as_ref()
+            .is_none_or(|known| known.placement.admits(member))
+    }
 }
 
 impl Inner {
-    /// The groups this node leads, at their terms, each with its placement
-    /// when known, and whether it is live: not stopped, and its driver gone
-    /// round in two election timeouts. A quiet driver with nothing waiting
-    /// for it, its leader loop's queue included, counts as gone round now:
-    /// the two timeouts run from the first work that waits for it.
-    fn led(&self) -> Vec<(Leading, Option<Placement>, bool)> {
+    /// The groups this node leads, at their terms, in group order, each
+    /// with its placement when known, and whether it is live: not stopped,
+    /// and its driver gone round in two election timeouts. A quiet driver
+    /// with nothing waiting for it, its leader loop's queue included,
+    /// counts as gone round now: the two timeouts run from the first work
+    /// that waits for it.
+    fn led(&self) -> Vec<Led> {
         let now = self.liveness.elapsed();
         let stuck = 2 * self.settings.election_timeout_ms.1;
-        let led: Vec<(Leading, bool)> = lock(&self.runs)
+        let leaders: Vec<AgentId> = lock(&self.leaders).iter().copied().collect();
+        let runs: Vec<(AgentId, Arc<Run>)> = {
+            let runs = lock(&self.runs);
+            leaders
+                .into_iter()
+                .filter_map(|agent| Some((agent, Arc::clone(runs.get(&agent)?))))
+                .collect()
+        };
+        let mut led: Vec<Led> = runs
             .iter()
             .filter_map(|(agent, run)| {
                 let state = run.shared.state();
+                if state.role != Role::Leader {
+                    return None;
+                }
                 let idle = lock(&run.shared.quiet).is_some()
                     && run.inbox.is_empty()
                     && run.local.is_empty()
@@ -263,23 +339,34 @@ impl Inner {
                     run.shared.woke.fetch_max(now, Ordering::Relaxed);
                 }
                 let woke = run.shared.woke.load(Ordering::Relaxed);
-                let live = !state.stopped && now.saturating_sub(woke) < stuck;
-                let leading = Leading {
-                    agent: *agent,
-                    term: state.term,
-                };
-                (state.role == Role::Leader).then_some((leading, live))
+                Some(Led {
+                    leading: Leading {
+                        agent: *agent,
+                        term: state.term,
+                    },
+                    live: !state.stopped && now.saturating_sub(woke) < stuck,
+                    known: None,
+                })
             })
             .collect();
+        led.sort_unstable_by_key(|led| led.leading.agent);
         let directory = lock(&self.directory.known);
-        led.into_iter()
-            .map(|(leading, live)| {
-                let placement = directory
-                    .get(&leading.agent)
-                    .map(|known| known.placement.clone());
-                (leading, placement, live)
-            })
-            .collect()
+        for led in &mut led {
+            led.known = directory.get(&led.leading.agent).cloned();
+        }
+        led
+    }
+
+    /// Send one frame of the pair heartbeat to `to`, waiting up to `room`
+    /// for room in its queue: false when it was refused.
+    async fn send_heartbeat(&self, to: NodeNumber, message: &PeerMessage, room: Duration) -> bool {
+        let Some(network) = &self.network else {
+            return false;
+        };
+        timeout(room, network.ready(to, Class::Liveness)).await;
+        network
+            .send(to, Class::Liveness, 0, message.encode())
+            .is_ok()
     }
 
     /// Wake each quiet group whose quiet the pair heartbeat no longer
@@ -294,6 +381,20 @@ impl Inner {
         let lapsed = |at: Option<Instant>, within: u64| {
             at.is_none_or(|at| at + Duration::from_millis(within) <= ahead)
         };
+        // A group goes quiet only while its leader's listing names it, and
+        // a change to that listing wakes it as it arrives: only a peer
+        // whose listing went unrenewed, or who fell silent, leaves groups
+        // to wake here.
+        let lapsing = {
+            let table = self.liveness.table();
+            self.numbers
+                .iter()
+                .filter(|&&peer| peer != self.number)
+                .any(|&peer| lapsed(table.renewed(peer), low) || lapsed(table.heard_at(peer), high))
+        };
+        if !lapsing {
+            return;
+        }
         // Taken apart from the runs' lock, which no group's quiet then waits
         // behind.
         let runs: Vec<(AgentId, Arc<Run>)> = lock(&self.runs)
@@ -320,14 +421,44 @@ impl Inner {
         }
     }
 
+    /// Note whether `agent`'s replica here leads.
+    pub(crate) fn led_here(&self, agent: AgentId, leads: bool) {
+        let mut leaders = lock(&self.leaders);
+        if leads {
+            leaders.insert(agent);
+        } else {
+            leaders.remove(&agent);
+        }
+    }
+
     /// Give each group this node leads `local`: every one, or those whose
     /// placement admits `member`.
     fn to_led(&self, member: Option<NodeNumber>, local: impl Fn() -> Local) {
-        for (leading, placement, _) in self.led() {
-            let admitted = member
-                .is_none_or(|member| placement.is_none_or(|placement| placement.admits(member)));
-            if admitted {
-                self.to_group(leading.agent, local());
+        for led in self.led() {
+            if member.is_none_or(|member| led.admits(member)) {
+                self.to_group(led.leading.agent, local());
+            }
+        }
+    }
+
+    /// Wake each quiet group among `changed`, whose listing by `from` just
+    /// changed, that the pair heartbeat no longer stands in for: one that
+    /// follows `from` at a term it no longer lists the group at, or follows
+    /// another node while `from` claims or gives up the group.
+    fn wake_changed(&self, from: NodeNumber, changed: &[AgentId]) {
+        let table = self.liveness.table();
+        for &agent in changed {
+            let Some(run) = self.run(agent) else {
+                continue;
+            };
+            let due = match &*lock(&run.shared.quiet) {
+                Some(Quiet::Following { leader, term }) => {
+                    *leader != from || table.listed(from, &agent, *term).is_none()
+                }
+                _ => false,
+            };
+            if due {
+                self.to_group(agent, Local::Wake);
             }
         }
     }
@@ -363,26 +494,53 @@ impl Inner {
         let PeerMessage::Liveness {
             incarnation,
             round,
+            since,
+            part,
+            parts,
             leading,
+            unlisted,
+            took,
         } = message
         else {
             return;
         };
-        let now = Instant::now();
-        let heard = self.liveness.table_mut().heard(
-            from,
-            now,
+        let frame = Frame {
             incarnation,
             round,
-            leading.into_iter().map(|led| (led.agent, led.term)),
-        );
+            part,
+            parts,
+            listing: Round {
+                since,
+                leading: leading
+                    .into_iter()
+                    .map(|led| (led.agent, led.term))
+                    .collect(),
+                unlisted,
+            },
+        };
+        let now = Instant::now();
+        let Some(heard) = self.liveness.table_mut().heard(from, now, frame) else {
+            return;
+        };
+        {
+            let mut telling = lock(&self.liveness.telling);
+            let teller = telling.entry(from).or_default();
+            // A new run of the peer holds nothing this node told the last.
+            if heard.new_run {
+                teller.reset();
+            }
+            if took.0 == self.liveness.incarnation {
+                teller.acked(took.1);
+            }
+        }
+        if !heard.changed.is_empty() {
+            self.wake_changed(from, &heard.changed);
+        }
         let silence = Duration::from_millis(self.settings.election_timeout_ms.1);
-        let returned = heard.is_some_and(|heard| {
-            heard.new_run
-                || heard
-                    .before
-                    .is_none_or(|before| now.duration_since(before) >= silence)
-        });
+        let returned = heard.new_run
+            || heard
+                .before
+                .is_none_or(|before| now.duration_since(before) >= silence);
         if returned {
             self.to_led(Some(from), || Local::Probe(from));
         }
@@ -413,29 +571,65 @@ mod tests {
     }
 
     #[test]
-    fn a_long_list_goes_in_frames_of_one_round() {
-        let listed: Vec<Leading> = (0..5)
-            .map(|agent| Leading {
-                agent: AgentId(agent),
-                term: 2,
-            })
-            .collect();
-        let frames = frames(7, 3, &listed, 2);
+    fn a_frame_of_as_many_groups_as_its_limit_allows_fits_it() {
+        for limit in [128, 1 << 10, vos_net::Limits::DEFAULT.liveness] {
+            let size = per_frame(limit);
+            let leading: Vec<(AgentId, u64)> = (0..size as u32)
+                .map(|agent| (AgentId(u32::MAX - agent), u64::MAX))
+                .collect();
+            let told = Round {
+                since: u64::MAX,
+                leading,
+                unlisted: Vec::new(),
+            };
+            let frames = frames(u64::MAX, u64::MAX, told, (u64::MAX, u64::MAX), size);
+            assert_eq!(frames.len(), 1);
+            assert!(frames[0].encode().len() <= limit, "{limit}");
+        }
+        assert_eq!(per_frame(vos_net::Limits::DEFAULT.liveness), LISTED);
+    }
+
+    #[test]
+    fn a_long_round_goes_in_frames_of_one_round() {
+        let leading: Vec<(AgentId, u64)> = (0..5).map(|agent| (AgentId(agent), 2)).collect();
+        let told = Round {
+            since: 4,
+            leading: leading.clone(),
+            unlisted: vec![AgentId(9)],
+        };
+        let frames = frames(7, 3, told, (8, 6), 2);
         assert_eq!(frames.len(), 3);
-        let mut all = Vec::new();
-        for frame in frames {
+        let (mut listed, mut gone) = (Vec::new(), Vec::new());
+        for (frame, at) in frames.into_iter().zip(0..) {
             let PeerMessage::Liveness {
                 incarnation,
                 round,
+                since,
+                part,
+                parts,
                 leading,
+                unlisted,
+                took,
             } = frame
             else {
                 panic!("a liveness frame");
             };
-            assert_eq!((incarnation, round), (7, 3));
-            all.extend(leading);
+            assert_eq!(
+                (incarnation, round, since, part, parts, took),
+                (7, 3, 4, at, 3, (8, 6))
+            );
+            assert!(leading.len() + unlisted.len() <= 2);
+            listed.extend(leading.into_iter().map(|led| (led.agent, led.term)));
+            gone.extend(unlisted);
         }
-        assert_eq!(all, listed);
-        assert_eq!(super::frames(7, 4, &[], 2).len(), 1, "one frame for none");
+        assert_eq!(listed, leading);
+        assert_eq!(gone, [AgentId(9)]);
+        let empty = Round {
+            since: 4,
+            leading: Vec::new(),
+            unlisted: Vec::new(),
+        };
+        let one = super::frames(7, 4, empty, (0, 0), 2);
+        assert_eq!(one.len(), 1, "one frame for none");
     }
 }

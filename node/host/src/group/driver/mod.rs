@@ -295,10 +295,17 @@ impl Driver {
                 }
                 // A quiet core's timers are the pair heartbeat's to stand
                 // in for: the driver sleeps until a message, a local, the
-                // pair heartbeat's wake, or its long round.
-                let quiet = other.is_none().then(|| self.quiet()).flatten();
-                let quiesced = quiet.is_some();
-                *lock(&self.shared.quiet) = quiet;
+                // pair heartbeat's wake, or its long round. Set under the
+                // peer table's lock, so a change to the listing it rests on
+                // either comes before, and keeps it awake, or finds it
+                // quiet, and wakes it.
+                let quiesced = {
+                    let table = self.inner.liveness.table();
+                    let quiet = other.is_none().then(|| self.quiet(&table)).flatten();
+                    let quiesced = quiet.is_some();
+                    *lock(&self.shared.quiet) = quiet;
+                    quiesced
+                };
                 let wake = if quiesced {
                     let round = Duration::from_millis(self.inner.settings.election_timeout_ms.1);
                     Some(Instant::now() + round * QUIET_ROUNDS)
@@ -385,6 +392,7 @@ impl Driver {
         }
         // A caller who sees the group gone sees it lead nothing, and a
         // proposal still queued hears so.
+        self.inner.led_here(self.shared.agent, false);
         self.shared.update(|state| {
             state.role = Role::Follower;
             state.leading_from = None;
@@ -400,17 +408,24 @@ impl Driver {
     /// Why the driver may wait on no timer of its own now, if it may: the
     /// core needs no tick but those the pair heartbeat stands in for, which
     /// notices a lapse within a round of it.
-    fn quiet(&self) -> Option<Quiet> {
+    fn quiet(&self, table: &crate::liveness::Table) -> Option<Quiet> {
         let every = self.inner.settings.heartbeat_ms;
         if !self.inner.liveness.on_time(every) || !self.core.quiescent(every) {
             return None;
         }
         let status = self.core.status();
         match status.role {
-            Role::Follower => Some(Quiet::Following {
-                leader: status.leader_hint?,
-                term: status.current_term,
-            }),
+            // Only while its leader's listing names it, fresh enough to
+            // stand in for its timer until the next round: a change to that
+            // listing then wakes it.
+            Role::Follower => {
+                let (leader, term) = (status.leader_hint?, status.current_term);
+                let listed = table.listed(leader, &self.shared.agent, term)?;
+                let (low, margin) = (self.inner.settings.election_timeout_ms.0, every);
+                let fresh = listed + Duration::from_millis(low)
+                    > Instant::now() + Duration::from_millis(margin);
+                fresh.then_some(Quiet::Following { leader, term })
+            }
             Role::Leader => {
                 let me = self.inner.number;
                 let mut members: Vec<NodeNumber> = status
@@ -627,6 +642,7 @@ impl Driver {
                 if role != Role::Leader {
                     self.snapshots.shipments.clear();
                 }
+                self.inner.led_here(self.shared.agent, role == Role::Leader);
                 // Becoming leader, the core appended its term's no-op last.
                 let leading_from =
                     (role == Role::Leader).then(|| self.core.status().last_log_index);

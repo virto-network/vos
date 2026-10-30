@@ -43,7 +43,7 @@ use crate::{lock, timeout};
 
 pub(crate) use config::Settings;
 pub use config::{Config, Peers};
-pub(crate) use directory::Directory;
+pub(crate) use directory::{Directory, Known};
 pub use error::{CallError, Error, ReplaceError, Reply};
 pub(crate) use open::write_private;
 pub use open::{ADMIN_TOKEN, NODE_KEY, STORE, wall_clock};
@@ -123,6 +123,9 @@ pub(crate) struct Inner {
     pub(crate) dropping: Mutex<HashMap<(AgentId, u8), usize>>,
     /// The agents this node replicates.
     pub(crate) runs: Mutex<HashMap<AgentId, Arc<Run>>>,
+    /// The agents whose replica here leads, as their drivers last said:
+    /// what the pair heartbeat lists, without a pass over every group.
+    pub(crate) leaders: Mutex<HashSet<AgentId>>,
     pub(crate) dry_runs: Mutex<HashMap<AgentId, DryRun>>,
     /// The blobs groups here asked for.
     wanted: Mutex<HashMap<[u8; 32], Wanted>>,

@@ -332,6 +332,10 @@ impl Network for Quic {
         link.frames.try_send(outgoing).map_err(|_| Refused::Closed)
     }
 
+    fn limits(&self) -> Limits {
+        self.inner.limits
+    }
+
     fn ready(&self, to: NodeNumber, class: Class) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         let shared = self
             .inner
