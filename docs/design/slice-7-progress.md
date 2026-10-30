@@ -2794,6 +2794,403 @@ cache:**
 - The node caps that run 4 needs.
 - The memtable plateau, judged at T1 in runs 2 and 6.
 
+### 7.6: runs 2–6 on the LAN
+
+From vos-core `920103b3` (the levers above included), on `s7/7.6c`. The
+node binary (`~/vos-scale/bins-7.6c/vos`, copied from vos-core's build) is
+the same in every run; `vos-scale` is this branch's.
+
+**The setup:**
+- S35's layout: three nodes on compumax, cores 0-3, 4-7 and 8-11, one
+  Samsung 970 PRO shared by all three, 8 GiB caps (12 GiB for run 4's
+  10^5 step).
+- The driver on `sigma`, wired, cores 0-7, `performance`. Its round
+  trips to compumax were p50 0.4 ms and p99 0.4–0.6 ms; the desktop
+  only coordinated.
+- **compumax's governor:** `performance` for runs 2–4 at 10^4
+  (2026-10-27), `ondemand` for run 4 at 10^5 and runs 5–6 (2026-10-30,
+  warned by every `check`; the harness changes nothing on the hosts).
+  Under load the nodes' cores ran at the same 76% of their top clock in
+  both, so the runs compare, but S53's setting was not in force for the
+  later three.
+- Clock offsets were 1–10 ms in every `check`, all hosts synced.
+- Every run: `L` = 2 min, `--representative`, `--identity` (a row a user,
+  written 10 times a second), the default mix, `K` = 64, a full deploy.
+- The window is the load past a 10 s ramp; the 30-minute and longer runs
+  were reported again with `--ramp-s 60` (`report-ramp60.txt` in each).
+
+**The harness, five commits:**
+- **`c85ba9f6` T5's fault.** `--kill NODE --kill-at-s --restart-at-s` on
+  `run` and `drive` kills a node's unit (SIGKILL) under load and starts
+  it again on its data, the instants in the run's `faults.json`. Test:
+  the kill waits for the unit to go, and fails when it outlives the kill.
+- **`b54ae465` The identity agent's install read again.** One replica
+  answers the install; the one the rows go through may apply it later,
+  and run 2's first 2,000-a-second step failed with "the identity agent
+  has nothing installed". Test: the read retries until it finds the
+  schema, and times out.
+- **`35f28f52` `--creators`**, the agents created at once (16 by
+  default). At 64, creation ran at 9–10 agents a second, against 6 at
+  16: 10^4 in 18 minutes, 10^5 in 2.8 hours. The node, not the harness,
+  bounds it past that.
+- **`8ee4fa5e` The driver reads its agents over kept connections.** It
+  read each agent's record over a connection of its own, one socket in
+  `TIME_WAIT` a read; with 10^5 idle agents for the readers, sigma ran
+  out of local ports ("Address not available") and run 4's first 10^5
+  attempt ended after its 2.8 hours of creation. Test: 64 agents over at
+  most 16 connections (64 before).
+- **`aca79db2` `harness.start_s`**, how long a node may take to answer
+  once started (90 s by default). A node opens every group it replicates
+  first: 3.5 minutes at 10^5.
+
+`cargo test -p vos-scale` green (52, its log ending `exit=0`), clippy
+clean.
+
+**Run 2, the baseline** (`U` = 10^5, 8-minute steps, then 30 minutes at
+T1's rate). Rates are all calls a second; transfers are 80% of them.
+Latencies are the transfers', in ms. Node figures are the mean of the
+three; commit is the worst node's.
+
+`x` = 98%:
+
+| offered | transfers offered, answered/s | p50 / p99 / p99.9 | errors | node cores (of 4) | `vos-node` thread | commit p50 / p99 | runtime `late` p99 | disk ms/io | driver late, worst |
+|---|---|---|---|---|---|---|---|---|---|
+| 1,000 | 800, 800 | 98 / 229 / 328 | 0 | 1.77 | 64% | 25 / 49 | 20.5 | 1.0 | 2.0 ms |
+| 1,500 | 1,200, 1,200 | 98 / 328 / 459 | 0 | 1.89 | 62% | 25 / 57 | 20.5 | 1.3 | 1.9 ms |
+| 2,000 | 1,600, 1,599 | 115 / 328 / 524 | 0 | 1.98 | 61% | 25 / 82 | 20.5 | 1.6 | 2.1 ms |
+| 3,000 | 2,403, 2,403 | 115 / 459 / 655 | 0 | 2.13 | 54% | 29 / 98 | 16.4 | 2.0 | 2.4 ms |
+| 4,000 | 3,196, 3,197 | 131 / 524 / 918 | 0 | 2.30 | 50% | 33 / 131 | 16.4 | 3.5 | 2.3 ms |
+| 5,000 | 3,999, 3,999 | 164 / 655 / 1,311 | 0 | 2.45 | 46% | 33 / 164 | 20.5 | 4.4 | 2.1 ms |
+| 5,000, 30 min | 4,001, 4,001 | 164 / 786 / 1,311 | 0 | 2.51 | 48% | 33 / 197 | 20.5 | 5.6 | 2.8 ms |
+| 6,500 | 5,199, 5,190 | 229 / 1,573 / 2,621 | 0 | 2.73 | 43% | 41 / 229 | 24.6 | 6.1 | 2.4 ms |
+| 8,000 | 6,402, 6,371 | 393 / 4,194 / 7,340 | 0 | 2.93 | 39% | 49 / 328 | 28.7 | 9.3 | 2.8 ms |
+| 10,000 | 8,003, 7,173 | 10,486 / 100,663 / 117,441 | 0 | 3.04 | 36% | 57 / 393 | 24.6 | 9.3 | 3.1 ms |
+
+`x` = 30%:
+
+| offered | transfers offered, answered/s | p50 / p99 / p99.9 | errors | node cores | `vos-node` | commit p50 / p99 | `late` p99 | disk ms/io | driver late |
+|---|---|---|---|---|---|---|---|---|---|
+| 5,000 | 4,001, 4,001 | 131 / 655 / 1,049 | 0 | 2.27 | 46% | 33 / 131 | 16.4 | 4.7 | 1.8 ms |
+| 5,000, 30 min | 4,001, 4,002 | 131 / 655 / 1,049 | 0 | 2.33 | 47% | 33 / 164 | 16.4 | 4.5 | 3.1 ms |
+| 8,000 | 6,401, 6,388 | 229 / 1,835 / 3,146 | 0 | 2.75 | 40% | 49 / 262 | 20.5 | 6.3 | 2.3 ms |
+| 10,000 | 8,002, 7,879 | 786 / 25,166 / 33,554 | 0 | 2.92 | 36% | 49 / 328 | 20.5 | 7.7 | 2.8 ms |
+| 12,000 | 9,607, 8,162 | 2,621 / 201,327 / 234,881 | 0 | 2.96 | 35% | 57 / 328 | 20.5 | 8.6 | 2.5 ms |
+
+- **The knee,** one host's (S35): at `x` = 98% the nodes keep up through
+  8,000 a second, p99 oscillating 1–7 s with no trend. At 10,000 they
+  answer about 7,200 transfers a second against 8,000 offered, and the
+  backlog grows. **The knee is about 8,000–9,000 a second.** At `x` = 30%
+  it is about 10,000: transfers are answered at offer there, but p99
+  climbs through the run, and 12,000 is past it. The cross share costs
+  little: at 5,000, p99 786 against 655 ms.
+- **No p99 within 50 ms at any rate:** 229 ms at 1,000 a second.
+- 0 errors, 0 elections and 0 leader changes in every step. The driver
+  was never late (at worst 3.1 ms, 0.00% of sends past 10 ms) and used
+  at most 0.39 cores. The driver did not bind.
+- **The rerun without the slowest host is not measurable** (S35): three
+  node hosts on one machine. Each report names a "slowest" node (c1, c2
+  or c3, by commit p99), but the three share one disk, NIC and CPU.
+- **The model at `U` = 10^5:** past 5,000 a second each active user makes
+  `r` = rate / 5,000 calls a second, one at a time. At 8,000, half the
+  transfers waited behind their own user's previous call (`queued`).
+  Part of the latency past the knee is that serialisation, not the nodes.
+- The report's "binding" column says "disk 70%" at most rates. That is
+  the NVMe's `%util`, which counts any I/O in flight and saturates long
+  before the device does. Read it as the fsync latency below, not as a
+  full disk. At 10,000 a second the column reads CPU 75%.
+
+**Where a transfer's time goes**, at 5,000 a second, 30 minutes, node 1
+(means from `nodes.jsonl`, in ms):
+- **queued 63:** waiting for the agent's next batch. A group has one batch
+  in flight, so this is about one batch's length.
+- **batch 103:** refine start to apply. Of it:
+  - commit 45 (p99 197);
+  - commit to apply here 37 (p99 164);
+  - refine 2.1;
+  - dry run 0.9;
+  - the executor queues 1.8 and 3.7;
+  - propose 1.1.
+- **batch inputs:** 19 a batch.
+- **The writer's fsync** (`flush_synced`) 21 ms mean, p99 82, 46 a second
+  a node, on the disk all three nodes share. Disk writes ran at 51 MB/s.
+- **CPU:**
+  - the runtime thread 48% of a core, its `late` p99 20 ms;
+  - three executors at 45% each, `vos-storage` 34%;
+  - 2.5 of the node's 4 cores;
+  - 1,400–7,400 preemptions a second (the node runs more busy threads
+    than its 4 cores).
+- **At 10,000 a second:**
+  - the executors reach 60–63% each;
+  - the node uses 3.0 of its 4 cores;
+  - the disk's ms per I/O reaches 9.3;
+  - the runtime thread stays at 36%.
+
+  The knee is the 4-core cpuset and the shared disk's fsync, together.
+
+**Run 3, users** (`U` = 10^6, `x` = 98%, 30 minutes each; runs
+`20261027T180915Z-r3-u1m-5000`, `20261027T184355Z-r3-u1m-6400`):
+
+| offered | transfers answered/s | p50 / p99 / p99.9 | errors | users, sessions | node cores | commit p50 / p99 | fsync mean / p99 | disk MB/s, ms/io | `late` p99 |
+|---|---|---|---|---|---|---|---|---|---|
+| 5,000 (T1) | 3,989 | 393 / 10,486 / 25,166 | 223 timed out | 231,384, 231,601 | 2.61 | 57 / 393 | 35 / 262 | 78, 16.4 | 41 |
+| 6,400 (80% of 8,000) | 3,652 | 41,943 / 536,871 / 671,089 | 1,479,494 (all but 39 timed out) | 233,052, 1,678,470 | 2.57 | 57 / 393 | | 16.0 | 57 |
+
+- **At T1's rate it holds, barely.** It answered at offer, but p99 rose
+  from about 1 s in the first 15 minutes to 10–21 s in the last.
+- **At 6,400 it collapsed.** Transfers were answered at 3,600–4,000 a
+  second, timeouts began at minute 9, and the run was lost. Sessions
+  re-opened after timeouts reached 1.68 million. **At 10^6 users the knee
+  is about 5,000 a second, not 8,000.**
+- **What changed from 10^5 users at the same rate:**
+  - 231,000 distinct users and accounts written in the run, against 23,000;
+  - disk writes 78 against 51 MB/s;
+  - the fsync mean 35 against 21 ms, its p99 262 against 82;
+  - batches twice as large (37 inputs) and twice as long (207 ms);
+  - CPU and the runtime thread barely moved.
+
+  **The binding resource at T1's shape is the shared disk:** the store's
+  write traffic as the state grows, and the fsync each commit waits on.
+- 0 elections and 0 leader changes; no session refused.
+
+**Run 4, agents** (`U` = 10^5, 5,000 a second, `x` = 98%, readers 1%,
+`--creators 64`):
+
+| `I` | replicas a node | RSS, all quiet, before load | under load | transfers p50 / p99 / p99.9 | errors | reader reads, p99 from close |
+|---|---|---|---|---|---|---|
+| 64 (run 2's 30 min) | 66 | | 1,830 MiB | 164 / 786 / 1,311 | 0 | |
+| 10^4 | 10,066 | | 2,294 MiB | 164 / 918 / 1,311 | 0 | 1,560 of 1,560, 1.8 s |
+| 10^5 | 100,066 | 4,330–4,440 MiB | to the 12 GiB cap in 10.5 min, two nodes OOM-killed | p50 / p99: 131 / 393 in the first 10 s, 524 / 2,621 at 2 min, 16,777 / 58,720 at 5 min | timeouts from minute 10; the driver OOM-killed at its 8 GiB | |
+
+- **10^4:** the idle replicas cost 464 MiB, **46 MiB per 1,000**, run 1b's
+  slope. They cost no measurable CPU under load. Every replica was quiet
+  once idle; 0 elections.
+- **10^5, idle:** every replica quiet (100,064–100,066 of 100,066).
+  - **4.33 GiB a node: about 43 MiB per 1,000** replicas past the
+    86 MiB intercept.
+  - **0.17–0.29 of a core a node** while the driver read the agents'
+    records before its load, at most 0.29% of a core per 1,000.
+  - `vos-liveness`, the pair heartbeat's O(groups) listing and quiet scan,
+    took 12.5–12.9% of a core, against 0.9% at 10^4: fourteen times for
+    ten times the groups.
+- **10^5, under the baseline load:** the nodes could not hold it.
+  - In the first minute transfers p99 went from 393 ms to 2.6 s.
+  - Quiet groups woke (quiet fell from 100,066 to 83,000–91,000) and
+    elected: node 1's summed terms rose from 109,000 to 1.24 million in
+    ten minutes. Node 2 counted 1.45 million elections.
+  - Commit p99 reached 3.1 s and queued p99 5.2 s.
+  - RSS grew about 1 GiB a minute, from 4.5 GiB to the 12 GiB cap.
+  - c3 and c1 were OOM-killed 10.5 minutes into the load, and c2 stopped
+    answering.
+  - The driver's unanswered calls (44,000 in flight) took it to its own
+    8 GiB cap and OOM.
+  - Run `20261030T113939Z-r4-idle-100k-c`.
+- **Why not higher caps:** compumax fits three 18 GiB caps at most
+  (3 × 18 + 2 within its 57 GiB free). Memory was not the cause: the
+  latency diverged and the elections began in the first minute, at
+  4.5 GiB. More memory would only delay the OOM by minutes.
+- **A cold restart at 10^5 does not converge either**
+  (`20261030T111501Z-r4-idle-100k-b`, the agents of the first attempt
+  started again on their data):
+  - Each node took 3.5 minutes to answer.
+  - Twenty minutes later only 6,468 of the 100,066 groups had a leader.
+  - The nodes' summed terms rose by about 120,000 a second, on 1.4 cores
+    a node.
+  - The shards' calls were refused `NotLeader`, then timed out. The run
+    was stopped.
+
+**Run 5, faults, T5-partial** (S36: run 3's shape, `U` = 10^6, 5,000 a
+second; c2's unit SIGKILLed at 600 s and started again at 900 s; polls
+and intervals every second, `every_s` = 1; run
+`20261030T143927Z-r5-fault-c2`):
+
+| | measured | T5's bound |
+|---|---|---|
+| agents c2 led at the kill | 21 of 65 | |
+| each led again elsewhere | 2.2–4.9 s after the kill (p50 2.9 s; the polls' 1 s grain) | 5 s: **met** |
+| throughput (all kinds, answered a second) | 5,031 before; 3,000–4,100 (60–80%) for 30 s; 4,700–5,900 from 31 s | 80% within 30 s: **missed by about a second** |
+| the node answering after its restart | 7.1 s, its statuses at 7.4 s | 60 s: **met** |
+| its replicas caught up (within 20 entries of the leaders) | 163 s after the restart, from 1,900 entries behind | |
+| elections, leader changes | 69, 22 | |
+
+- **The throughput gap** is the calls in flight to c2: they timed out at
+  the driver's 30 s bound (23,000 in the two seconds at 30–31 s), and a
+  user's next call waits behind its last. Everything else moved within
+  5 s.
+- **The restart costs more than the kill.**
+  - For 40 s after it, queries routed to the catching-up follower were
+    refused `Behind` (up to 10,000 a second).
+  - Answered calls fell to 1,900–3,300 a second while c2 replayed its
+    1,900 entries a group.
+- **The run did not settle again.** At T1's shape the system was at its
+  knee (run 3), and two of three replicas commit at their slower one.
+  Transfers p99 rose from 786 ms before the kill to 25 s in the next
+  minute, and to 400 s by the end. 839,000 calls timed out over the run.
+
+**Run 6, soak** (run 3's shape for 2 hours; run
+`20261030T151526Z-r6-soak`). Transfers per 10 minutes:
+
+| minutes | answered/s | errors | p99 (median interval) | RSS c1 / c2 / c3, MiB |
+|---|---|---|---|---|
+| 0–10 | 3,991 | 0 | 1,048 ms | 1,972 / 1,964 / 1,970 at 10 |
+| 10–30 | 3,998–4,007 | 0 | 1,835 ms | 2,033 / 2,015 / 2,055 at 30 |
+| 30–40 | 3,014 | 203,638 | 67 s | |
+| 40–60 | 2,623–2,645 | 543,000–668,000 | 336–537 s | 1,960 / 1,965 / 1,990 at 60 |
+| 60–90 | 1,642–2,156 | 822,000–1,190,000 | 11–18 min | 2,088 / 2,082 / 2,053 at 90 |
+| 90–120 | 1,387–1,651 | 1,241,000–1,302,000 | 22–36 min | 2,245 / 2,270 / 2,227 at 120 |
+
+- **It held T1's rate for 30 minutes, then collapsed.** 9.5 million
+  calls timed out in all. 551,861 distinct users opened 9.95 million
+  sessions (a timed-out call's user starts another), 162,009 at the
+  busiest shard.
+- **What bound after minute 30 was the runtime thread, not the disk:**
+
+  | node 1, minutes | `vos-node` | `late` p99 | `prepare` mean (the batch's state read, on the runtime thread) | `resume` mean | fsync mean | disk writes a second |
+  |---|---|---|---|---|---|---|
+  | 1–25 | 45% | 41 ms | 0.36 ms | 5.4 ms | 34 ms | 2,029 |
+  | 40–60 | 76% | 115 ms | 0.93 ms | 20 ms | 27 ms | 1,660 |
+  | 100–120 | 87% | 262 ms | 6.4 ms | 43 ms | 25 ms | 1,199 |
+
+  As the accounts and the sessions grew, each batch's synchronous state
+  read on the runtime thread grew eighteenfold. The leader loops' wait to
+  be polled (`resume`) followed it, while the disk did less.
+- **The memory:**
+  - RSS rose 10–13% from minute 30 to minute 120, ranging 1,960–2,270
+    MiB.
+  - The block cache sat at its 1 GiB cap from minute 15, and the write
+    buffers stayed at 105–145 MiB.
+  - The Raft entry caches moved between 167 and 283 MiB.
+  - 0 elections, 0 leader changes.
+
+**The memory under load:**
+- The store's block cache fills to its 1 GiB cap within 15–30 minutes of
+  load; that is most of the RSS growth.
+- The write buffers cycle, their plateau about 130 MiB.
+- The Raft entry caches held 74–283 MiB.
+- A node at T1's shape settles near 2.0–2.3 GiB, plus 43–46 MiB per 1,000
+  idle replicas.
+
+**The targets:**
+- **T1 missed.**
+  - At 10^6 users and 5,000 a second (`x` = 98%), p99 was 10.5 s against
+    50 ms over 30 minutes (run 3), and 223 calls timed out.
+  - The same load collapsed after 30 minutes in run 6.
+  - No session was refused.
+  - Even at 10^5 users, p99 was 786 ms.
+  - The binding resources: one batch in flight a group, the one disk's
+    fsync and write traffic, and, as the state grows, the batch's state
+    read on the runtime thread.
+- **T2 not measurable** (S35). One host's knee is about 8,000–9,000 a
+  second at 10^5 users and about 5,000 at 10^6, against T2's 40,000.
+- **T3 met at 10^4.** 46 MiB and 0.16% of a core per 1,000 replicas.
+- **T3's 10^5 stretch: idle cost met, the node at 10^5 under load
+  missed.**
+  - Idle, 43 MiB and at most 0.29% of a core per 1,000.
+  - Under the baseline load, quiet groups lost their leaders, elections
+    ran away, and memory grew to the cap (above).
+  - A cold restart at 10^5 never re-elected.
+- **T4 met where measured.**
+  - Every read at a cut was served in run 2's 30-minute runs (46,652 and
+    46,368, p99 2.1 s from the close) and in run 4 at 10^4 (46,399, p99
+    2.6 s).
+  - In run 4, 1,560 of 1,560 readers' reads were served, p99 1.8 s from
+    the close, against `B_w + D + 10 s`.
+  - None was `NotClosed`.
+  - At 10^6 users, reads timed out with the calls: 1 of 47,005 in run 3,
+    and 19,941 of 117,007 in run 6.
+  - The representative's work per reader was not separated.
+  - C9's fail rate at the LAN's 1–10 ms skew was 0 of 139,467 reads in
+    the runs that kept up.
+- **T5-partial: mostly met, missed on throughput by about a second.**
+  - Re-election in at most 4.9 s (5 s bound), met.
+  - Throughput back to 80% at 31 s (30 s bound), missed.
+  - The node rejoined, answering, in 7.1 s (60 s bound), met. It caught
+    up in 163 s.
+  - The load never returned to its pre-kill latency.
+- **T6 missed.**
+  - RSS after the first 30 minutes rose 10–13%, against within 10%:
+    missed by a hair, the block cache already full.
+  - p99 was 67 s to 36 minutes after the first half hour, against
+    1.0–1.8 s in it. Within 20% was the bound: missed, the throughput
+    collapsing at minute 30.
+  - The accounts kept growing through the run (551,861 users by its end).
+
+**The levers, by measured effect:**
+1. **Batch pipelining**, more than one batch in flight a group. Queued
+   (63 ms) is about one batch, so pipelining removes about a third of a
+   transfer's time at 5,000 a second. That is the largest share not
+   spent on the disk.
+2. **Per-batch reads off the runtime thread.** In run 6 the batch's state
+   read (`prepare`) grew from 0.36 to 6.4 ms as the state grew, and took
+   the runtime thread from 45% to 87% with its `late` p99 at 262 ms. That
+   is the soak's collapse. At 30 minutes the runtime thread was not yet
+   binding: it ran at 36–64% in runs 2–3.
+3. **Quiet groups' liveness at 10^5 under load and on a cold start.** The
+   pair heartbeat's O(groups) beat took 12.7% of a core idle. Under load
+   the quiet groups lost their leaders and elected without end, and a
+   restart never converged. The levers:
+   - stagger and rate-limit elections, so a woken or restarted node does
+     not campaign for every group at once;
+   - keep a quiet group's lease through a busy runtime;
+   - shard the liveness scan.
+
+   This needs its own run at 10^5 before T3's stretch can be judged.
+4. **The commit-to-apply gap** (37 ms mean at 5,000 a second, 65 ms at
+   10^6 users). It sits after the commit, on the latency path, and is
+   not fsync.
+5. **The fsync's cost on a shared disk.** At 10^6 users, fsync's p99 is
+   262 ms, and the store writes about 16 KB per call across the three
+   nodes. Write amplification needs measuring (memtable size,
+   compaction) before a lever is chosen. On more hosts each node has
+   its own disk; T1 and T2 should be re-measured there before this is
+   judged a node defect.
+6. **The executors and the 4-core cpuset** bind at the knee (3.0 of 4
+   cores, 60% each). Batch signature verification is the CPU lever.
+   `verify` is 0.09 ms a call, about 0.45 of a core at 5,000 a second.
+7. **Not a node lever, but it shapes runs 5 and 6:** the driver starts a
+   new session for each timed-out call's user (9.95 million sessions for
+   551,861 users in run 6). Once calls time out, the state and the load
+   grow with the timeouts. Whether a client should resume its session
+   instead is for the client's design, and the model should state its
+   choice.
+
+**Left:**
+- T2 and the run without the slowest host need four node hosts (S35).
+- T5's host kill needs a second node machine (S36).
+- T3's 10^5 stretch waits on lever 3.
+- T1 and T6 wait on levers 1, 2 and 5; each lever is a commit with its
+  before and after against these runs.
+- Run 4 at 10^5 and runs 5–6 ran at `ondemand` (above); rerun them at
+  `performance` when the levers land.
+
+**The runs**, under `~/vos-scale/runs/`:
+- **Run 2:**
+  - the smoke: `20261027T142927Z-s76c-smoke`;
+  - 98%, 1,000 to 3,000 a second: `20261027T143502Z-r2-x98-1000`,
+    `…151411Z-r2-x98-1500`, `…145251Z-r2-x98-2000` (`…144544Z` is the
+    attempt the identity race failed), `…150332Z-r2-x98-3000`;
+  - 98%, 4,000 a second and up: `…152509Z-r2-x98-4000`,
+    `…153549Z-r2-x98-5000`, `…154629Z-r2-x98-6500`,
+    `…155712Z-r2-x98-8000`, `…160753Z-r2-x98-10000`;
+  - 98%, 30 minutes: `…170345Z-r2-x98-5000-steady`;
+  - 30%: `…161903Z-r2-x30-5000`, `…162943Z-r2-x30-8000`,
+    `…164023Z-r2-x30-10000`, `…165103Z-r2-x30-12000`;
+  - 30%, 30 minutes: `…173625Z-r2-x30-5000-steady`.
+- **Run 3:** `20261027T180915Z-r3-u1m-5000`, `…184355Z-r3-u1m-6400`.
+- **Run 4:**
+  - `20261027T192015Z-r4-idle-10k`;
+  - `20261027T200856Z-r4-idle-100k`, stopped by the quota;
+  - `20261030T075946Z-r4-idle-100k`, the driver's ports;
+  - `20261030T111501Z-r4-idle-100k-b`, the cold restart;
+  - `20261030T113939Z-r4-idle-100k-c`, the run under load.
+- **Runs 5 and 6:** `20261030T143927Z-r5-fault-c2`,
+  `20261030T151526Z-r6-soak`.
+- **The inventories** `inventory.toml`, `inventory.r4-12g.toml` (12 GiB
+  caps, `start_s` = 1800) and `inventory.r5.toml` (`every_s` = 1) are in
+  `~/vos-scale`.
+- **The scripts:** those that ran the steps and summarise a run
+  (`step.sh`, `r56.sh`, `row.py`, `md.py`, `stages.py`,
+  `intervals.py`) are in `~/vos-scale/s76c/`.
+
 ## Step 7.10: the credential AIR
 
 Branch `s7/7.10`, from vos-core `84607818`.

@@ -12,6 +12,7 @@ mod collect;
 mod deploy;
 mod drive;
 mod engine;
+mod fault;
 mod gateway;
 mod histogram;
 mod hosts;
@@ -110,6 +111,39 @@ struct AgentsArgs {
     /// The placements' seed.
     #[arg(long, default_value_t = 1)]
     seed: u64,
+    /// Agents created at once: each mostly waits for its group's first
+    /// election.
+    #[arg(long, default_value_t = agents::CREATORS)]
+    creators: u32,
+}
+
+#[derive(clap::Args)]
+struct FaultArgs {
+    /// T5: kill this node host's unit (SIGKILL) under the load, and start
+    /// it again on its data.
+    #[arg(long)]
+    kill: Option<String>,
+    /// Seconds into the load the node is killed.
+    #[arg(long, default_value_t = 600, requires = "kill")]
+    kill_at_s: u64,
+    /// Seconds into the load it is started again.
+    #[arg(long, default_value_t = 900, requires = "kill")]
+    restart_at_s: u64,
+}
+
+impl FaultArgs {
+    fn fault(&self, inventory: &Inventory, secs: u64) -> Result<Option<fault::Fault>, String> {
+        let Some(node) = &self.kill else {
+            return Ok(None);
+        };
+        let fault = fault::Fault {
+            node: node.clone(),
+            kill_at_s: self.kill_at_s,
+            restart_at_s: self.restart_at_s,
+        };
+        fault.validate(inventory, secs)?;
+        Ok(Some(fault))
+    }
 }
 
 #[derive(clap::Args)]
@@ -211,7 +245,12 @@ enum Command {
     /// Create agents by weight and install an actor in each.
     Agents(AgentsArgs),
     /// Drive a load from the driver hosts while polling every node.
-    Drive(LoadArgs),
+    Drive {
+        #[command(flatten)]
+        load: LoadArgs,
+        #[command(flatten)]
+        fault: FaultArgs,
+    },
     /// Copy every host's record of the current run into its directory.
     Collect,
     /// Stop every unit on every host.
@@ -241,12 +280,17 @@ enum Command {
         deploy: DeployArgs,
         #[command(flatten)]
         load: LoadArgs,
+        #[command(flatten)]
+        fault: FaultArgs,
         /// Ledger shards to create, `K`.
         #[arg(long, alias = "agents")]
         shards: u32,
         /// Idle agents beside them, `I`.
         #[arg(long, default_value_t = 0)]
         idle: u32,
+        /// Agents created at once.
+        #[arg(long, default_value_t = agents::CREATORS)]
+        creators: u32,
         /// Create the stand-in identity agent, with a row a user.
         #[arg(long)]
         identity: bool,
@@ -321,6 +365,7 @@ fn make_agents(inventory: &Inventory, args: &AgentsArgs, run: Option<&Run>) -> R
             instance: args.instance,
             representative: representative.as_deref(),
             seed: args.seed,
+            creators: args.creators,
         },
     )?;
     if let Some(run) = run {
@@ -338,14 +383,24 @@ fn keep_agents(inventory: &Inventory, run: &Run) -> Result<(), String> {
     Ok(())
 }
 
-/// Drive `load` while polling every node; then collect.
-fn drive_and_poll(inventory: &Inventory, run: &Run, load: &LoadArgs) -> Result<(), String> {
+/// Drive `load` while polling every node, and inject `fault` if any;
+/// then collect.
+fn drive_and_poll(
+    inventory: &Inventory,
+    run: &Run,
+    load: &LoadArgs,
+    fault: Option<&fault::Fault>,
+) -> Result<(), String> {
     keep_agents(inventory, run)?;
     let shards = agents::Agents::read(inventory)?.agents.len();
     let model = load.model(shards)?;
     let stop = AtomicBool::new(false);
     std::thread::scope(|scope| {
         let poller = scope.spawn(|| collect::poll(inventory, run, &stop));
+        let faulted = scope.spawn(|| match fault {
+            Some(fault) => fault::inject(inventory, run, fault, &stop),
+            None => Ok(()),
+        });
         let driven = drive::drive(
             inventory,
             run,
@@ -363,7 +418,8 @@ fn drive_and_poll(inventory: &Inventory, run: &Run, load: &LoadArgs) -> Result<(
         );
         stop.store(true, Ordering::Relaxed);
         let polled = poller.join().expect("the poller");
-        driven.and(polled)
+        let faulted = faulted.join().expect("the fault");
+        driven.and(polled).and(faulted)
     })?;
     collect::gather(inventory, run)
 }
@@ -410,10 +466,11 @@ fn run(cli: Cli) -> Result<(), String> {
             let run = Run::open(&inventory, None).ok();
             make_agents(&inventory, &args, run.as_ref())
         }
-        Command::Drive(load) => {
+        Command::Drive { load, fault } => {
             let inventory = reached()?;
+            let fault = fault.fault(&inventory, load.secs)?;
             let run = Run::open(&inventory, None)?;
-            drive_and_poll(&inventory, &run, &load)
+            drive_and_poll(&inventory, &run, &load, fault.as_ref())
         }
         Command::Collect => {
             let inventory = reached()?;
@@ -443,8 +500,10 @@ fn run(cli: Cli) -> Result<(), String> {
         Command::Run {
             deploy,
             load,
+            fault,
             shards,
             idle,
+            creators,
             identity,
             actor,
             representative,
@@ -457,6 +516,7 @@ fn run(cli: Cli) -> Result<(), String> {
             let model = load.model(shards as usize)?;
             model.check_representative(representative)?;
             let inventory = reached()?;
+            let fault = fault.fault(&inventory, load.secs)?;
             // Interrupted, the run's waits end and its units stop.
             hosts::stop_on_interrupt();
             if !no_deploy {
@@ -482,10 +542,11 @@ fn run(cli: Cli) -> Result<(), String> {
                         instance: 1,
                         representative,
                         seed: load.seed,
+                        creators,
                     };
                     make_agents(&inventory, &args, Some(&run))
                 })
-                .and_then(|()| drive_and_poll(&inventory, &run, &load))
+                .and_then(|()| drive_and_poll(&inventory, &run, &load, fault.as_ref()))
                 .map(|()| {
                     // The gateway's cost, a row of its own, while the
                     // nodes still run.

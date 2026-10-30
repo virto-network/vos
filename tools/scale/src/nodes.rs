@@ -14,9 +14,6 @@ use crate::hosts::{self, Unit};
 use crate::inventory::{Host, Inventory, Role};
 use crate::runs::Run;
 
-/// How long a node may take to answer once its unit started.
-const START: Duration = Duration::from_secs(90);
-
 /// The units the harness may run on `host`.
 pub fn units_of(host: &Host) -> Vec<String> {
     ["node", "sample", "drive"]
@@ -151,37 +148,57 @@ pub fn up(inventory: &Inventory, run: &Run, force: bool) -> Result<(), String> {
         hosts::run(host, &script)?;
     }
     for host in inventory.nodes() {
-        let node = deployed
-            .node(host)
-            .ok_or_else(|| format!("{}: not deployed", host.name))?;
-        let target = target(node)?;
-        hosts::wait_for(
-            &format!("{} answers", host.name),
-            START,
-            Duration::from_millis(250),
-            || match vos_node::client::node_id(&target) {
-                Ok(id) if hex::encode(id.0) == node.key => Ok(true),
-                Ok(id) => Err(format!(
-                    "{}: answered as {}, not its key {}",
-                    host.name,
-                    hex::encode(id.0),
-                    node.key
-                )),
-                Err(_) => {
-                    let state = hosts::run(host, &hosts::state_script(&host.unit("node")))?;
-                    match state.trim() {
-                        "active" | "activating" => Ok(false),
-                        other => Err(format!(
-                            "{}: its node is {other}: see {}/logs/{}.node.log",
-                            host.name, host.dir, run.id
-                        )),
-                    }
-                }
-            },
-        )?;
-        eprintln!("{}: node {} up at {}", host.name, node.number, node.url);
+        answers(inventory, &deployed, run, host)?;
     }
     Ok(())
+}
+
+/// Wait for `host`'s node to answer with its key, failing early when its
+/// unit is gone.
+fn answers(
+    inventory: &Inventory,
+    deployed: &Deployed,
+    run: &Run,
+    host: &Host,
+) -> Result<(), String> {
+    let node = deployed
+        .node(host)
+        .ok_or_else(|| format!("{}: not deployed", host.name))?;
+    let target = target(node)?;
+    hosts::wait_for(
+        &format!("{} answers", host.name),
+        Duration::from_secs(inventory.harness.start_s),
+        Duration::from_millis(250),
+        || match vos_node::client::node_id(&target) {
+            Ok(id) if hex::encode(id.0) == node.key => Ok(true),
+            Ok(id) => Err(format!(
+                "{}: answered as {}, not its key {}",
+                host.name,
+                hex::encode(id.0),
+                node.key
+            )),
+            Err(_) => {
+                let state = hosts::run(host, &hosts::state_script(&host.unit("node")))?;
+                match state.trim() {
+                    "active" | "activating" => Ok(false),
+                    other => Err(format!(
+                        "{}: its node is {other}: see {}/logs/{}.node.log",
+                        host.name, host.dir, run.id
+                    )),
+                }
+            }
+        },
+    )?;
+    eprintln!("{}: node {} up at {}", host.name, node.number, node.url);
+    Ok(())
+}
+
+/// Start `host`'s node again for `run`, on its data, as `up` started it,
+/// and wait for it to answer.
+pub fn restart(inventory: &Inventory, run: &Run, host: &Host) -> Result<(), String> {
+    let deployed = Deployed::read(inventory)?;
+    hosts::run(host, &node_unit(host, run, inventory).start_script())?;
+    answers(inventory, &deployed, run, host)
 }
 
 /// Stop every unit the harness runs on every host the inventory lists,

@@ -24,8 +24,8 @@ use crate::nodes::{operator, target};
 /// Identity rows a call writes: the shard actor's most.
 const FILL: u64 = 1_000;
 
-/// Agents created at once.
-const CREATORS: u32 = 16;
+/// Agents created at once, by default.
+pub const CREATORS: u32 = 16;
 
 /// How long an operator's command may take at one node.
 const ANSWER: Duration = Duration::from_secs(30);
@@ -179,9 +179,11 @@ fn fill_identities(
     let agent = AgentId(identity.agent);
     let instance = InstanceId(identity.instance);
     let target = target(&deployed.nodes[usize::from(identity.replicas[0]) - 1])?;
-    let schema = vos_node::client::schema(&target, agent, instance)
-        .map_err(|error| error.to_string())?
-        .ok_or("the identity agent has nothing installed")?;
+    // The install is answered by one replica; this one may apply it later.
+    let schema = installed(INSTALLED, Duration::from_millis(200), || {
+        vos_node::client::schema(&target, agent, instance).map_err(|error| error.to_string())
+    })
+    .map_err(|error| format!("the identity agent: {error}"))?;
     let method = schema
         .method_id("fill_identities")
         .ok_or("the shard actor has no fill_identities")?;
@@ -218,6 +220,21 @@ fn fill_identities(
     })
 }
 
+/// What `read` gives once it gives something: an install's schema, at a
+/// replica that may apply the install after another answered it.
+fn installed<T>(
+    limit: Duration,
+    every: Duration,
+    mut read: impl FnMut() -> Result<Option<T>, String>,
+) -> Result<T, String> {
+    let mut found = None;
+    wait_for("its install applied", limit, every, || {
+        found = read()?;
+        Ok(found.is_some())
+    })?;
+    Ok(found.expect("found once the wait ends"))
+}
+
 fn created(answer: Result<Response, vos_node::client::ClientError>) -> Result<AgentId, String> {
     match answer.map_err(|error| error.to_string())? {
         Response::Created(agent) | Response::Unconfirmed(agent) => Ok(agent),
@@ -242,6 +259,8 @@ pub struct Request<'a> {
     /// The representative's ELF, to create and install it first.
     pub representative: Option<&'a Path>,
     pub seed: u64,
+    /// Agents created at once.
+    pub creators: u32,
 }
 
 /// Create `request.count` agents by the nodes' weights, each with the
@@ -298,7 +317,7 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
     let next = AtomicU32::new(0);
     let mut placed: Vec<Option<Placed>> = vec![None; total as usize];
     std::thread::scope(|scope| -> Result<(), String> {
-        let workers: Vec<_> = (0..CREATORS.min(total.max(1)))
+        let workers: Vec<_> = (0..request.creators.max(1).min(total.max(1)))
             .map(|_| {
                 scope.spawn(|| -> Result<Vec<(u32, Placed)>, String> {
                     let operators = crate::agents::operators(inventory, &deployed)?;
@@ -357,7 +376,26 @@ pub fn create(inventory: &Inventory, request: &Request) -> Result<Agents, String
 
 #[cfg(test)]
 mod tests {
-    use super::{Mix, place};
+    use std::time::Duration;
+
+    use super::{Mix, installed, place};
+
+    /// A replica that has not applied the install yet is read again.
+    #[test]
+    fn an_install_is_read_again_until_applied() {
+        let mut reads = 0;
+        let schema = installed(Duration::from_secs(5), Duration::from_millis(1), || {
+            reads += 1;
+            Ok((reads == 3).then_some("schema"))
+        });
+        assert_eq!(schema, Ok("schema"));
+        assert_eq!(reads, 3);
+        let never: Result<(), String> =
+            installed(Duration::from_millis(20), Duration::from_millis(1), || {
+                Ok(None)
+            });
+        assert!(never.unwrap_err().contains("not within"));
+    }
 
     #[test]
     fn replicas_are_three_distinct_nodes_drawn_by_weight() {

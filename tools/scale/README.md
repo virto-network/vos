@@ -10,12 +10,19 @@ drives it, with one `[[host]]` entry for each node or driver.
 | `check` | Reads every host: architecture, kernel, clock offset, free memory and disk, the data disk's type, CPU and governor, the link's speed, the tools, the user manager, and whether the ports are free. It refuses a host that would make the numbers mislead, and exits 1 if it refuses any host. |
 | `deploy` | Ships the static `vos` and `vos-scale` and the agent's ELF to every host with `rsync`, wipes the nodes' data, makes each node's key, and founds a new space. |
 | `up` | Starts a run: each node and each host's sampler in a `systemd-run --user` unit under a memory cap. Ingress uses each node's own TLS, pinned by its key, so the harness makes no certificates. |
-| `agents` | Creates the `K` ledger shards and `I` idle agents on three nodes each, picked by weight, with the shard actor installed in each; `--identity-rows U` creates the stand-in identity agent on every node and writes its rows; `--representative` creates the space's representative first. |
+| `agents` | Creates the `K` ledger shards and `I` idle agents on three nodes each, picked by weight, with the shard actor installed in each, `--creators` of them at once (16); `--identity-rows U` creates the stand-in identity agent on every node and writes its rows; `--representative` creates the space's representative first. |
 | `drive` | Drives the load model from every driver host while it polls each node's `/stats` and `/agents/*/status`. |
 | `collect` | Copies each host's samples, node log and driver record into the run's directory. |
 | `down` | Stops every unit on every host, by unit name. |
 | `report` | Summarises a run: each host's binding resource, the nodes' stages, leader changes, the drivers' rates and latencies, and the slowest node host. `--compare RUN` sets two runs side by side. |
 | `run` | Does all of these with one command: deploy, up, agents, drive, collect, down, report. |
+
+`--kill NAME`, given to `run` or `drive`, is T5's fault: that node host's
+unit is killed outright (SIGKILL) `--kill-at-s` seconds into the load (600
+by default) and started again on its data at `--restart-at-s` (900). The
+kill, the unit's end, the restart and the node's first answer are written
+to the run's `faults.json`, to read the polls and the drivers' intervals
+against; a shorter `harness.every_s` gives them a finer grain.
 
 `--exclude NAME`, given before the command, leaves a host out as if the
 inventory did not list it. Use it for a second run without the slowest host.
@@ -182,7 +189,9 @@ Copy `inventory.example.toml` to `inventory.toml` and give one
   fit in its free memory, or `check` refuses it.
 
 `[harness]` sets where runs are kept, the units' memory cap, the window
-length, the clock bound and the sampling interval. `[node]` holds the
+length, the clock bound, the sampling interval, and `start_s`, how long a
+node may take to answer once started (90 s; a node opens every group it
+replicates first, so 10^5 idle agents need more). `[node]` holds the
 nodes' settings (`vos node run --config`): `executors`, `queue`,
 `max_inputs`, `max_bytes`, `linger_ms`, `ingress_connections`,
 `election_timeout_ms = [low, high]` and `heartbeat_ms`.

@@ -542,17 +542,28 @@ fn pool_fields(line: &mut serde_json::Value, pooled: &PoolStats) {
 
 /// What the plan's agents are, read from the nodes, a few at once: the
 /// shards, the idle agents (only when readers read them), then the
-/// identity agent.
+/// identity agent. Each reader keeps one connection a node: a connection
+/// a read would leave one socket a read in `TIME_WAIT`, and 10^5 idle
+/// agents run the driver out of local ports.
 fn agents(placed: &[&Placed], targets: &[Target]) -> Result<Vec<Agent>, String> {
-    let one = |placed: &Placed| -> Result<Agent, String> {
+    let one = |clients: &mut Vec<Option<vos_node::client::Client>>,
+               placed: &Placed|
+     -> Result<Agent, String> {
         let agent = AgentId(placed.agent);
         let mut last = String::from("no replica answered");
         for replica in &placed.replicas {
-            match vos_node::client::agent_info(&targets[usize::from(*replica) - 1], agent) {
-                Ok(Some(info)) => {
+            let at = usize::from(*replica) - 1;
+            let client = clients[at].get_or_insert_with(|| {
+                vos_node::client::Client::new(
+                    &targets[at],
+                    ed25519_dalek::SigningKey::from_bytes(&[7; 32]),
+                )
+            });
+            match client.identity(agent) {
+                Ok(identity) => {
                     return Ok(Agent {
                         id: agent,
-                        identity: vos_node::identity(&info.record),
+                        identity,
                         replicas: placed
                             .replicas
                             .iter()
@@ -562,7 +573,9 @@ fn agents(placed: &[&Placed], targets: &[Target]) -> Result<Vec<Agent>, String> 
                             .map(|kind| format!("/agents/{}/{kind}", agent.0)),
                     });
                 }
-                Ok(None) => last = format!("agent {}: unknown to node {replica}", agent.0),
+                Err(vos_node::client::ClientError::NoAgent) => {
+                    last = format!("agent {}: unknown to node {replica}", agent.0)
+                }
                 Err(error) => last = format!("agent {}: {error}", agent.0),
             }
         }
@@ -573,9 +586,11 @@ fn agents(placed: &[&Placed], targets: &[Target]) -> Result<Vec<Agent>, String> 
         let handles: Vec<_> = (0..readers)
             .map(|reader| {
                 scope.spawn(move || {
+                    let mut clients: Vec<Option<vos_node::client::Client>> =
+                        targets.iter().map(|_| None).collect();
                     (reader..placed.len())
                         .step_by(readers)
-                        .map(|at| (at, one(placed[at])))
+                        .map(|at| (at, one(&mut clients, placed[at])))
                         .collect()
                 })
             })
@@ -851,7 +866,7 @@ pub fn run_local(plan: &Plan, out: &Path) -> Result<(), String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Routes, closes_after_load, unserved};
+    use super::{Routes, agents, closes_after_load, unserved};
     use std::time::{Duration, Instant};
     use vos_wire::ingress::Response;
 
@@ -891,5 +906,60 @@ mod tests {
         assert!(!closes_after_load(5_000, Some(5_000)));
         assert!(!closes_after_load(5_000, Some(9_000)), "closed in the run");
         assert!(closes_after_load(9_000, Some(5_000)));
+    }
+    /// The agents are read over one kept connection a reader and node, not
+    /// one a read: the driver's local ports outlast 10^5 idle agents.
+    #[test]
+    fn agents_are_read_over_kept_connections() {
+        use crate::agents::Placed;
+        let programs = vos_checker::programs::Programs::load();
+        let dir = tempfile::tempdir().unwrap();
+        let node = vos_node::Node::open(dir.path(), vos_node::Config::new(programs.agent.clone()))
+            .unwrap();
+        let address = node.serve("127.0.0.1:0".parse().unwrap()).unwrap();
+        let placed: Vec<Placed> = (0..64)
+            .map(|_| Placed {
+                agent: node.create_agent().unwrap().0,
+                replicas: vec![1],
+                actor: "idle".into(),
+                instance: 1,
+                leader: None,
+            })
+            .collect();
+        let target = vos_node::client::Target::new(
+            &format!("http://{address}"),
+            vos_node::tls::Trust::Loopback,
+        )
+        .unwrap();
+        let connections = || {
+            // Every socket to the node's port, in any state, TIME_WAIT
+            // among them: one a connection made.
+            let port = format!(":{:04X}", address.port());
+            ["/proc/net/tcp", "/proc/net/tcp6"]
+                .iter()
+                .filter_map(|path| std::fs::read_to_string(path).ok())
+                .map(|table| {
+                    table
+                        .lines()
+                        .skip(1)
+                        .filter(|line| {
+                            let fields: Vec<&str> = line.split_whitespace().collect();
+                            fields.len() > 2 && fields[2].ends_with(&port)
+                        })
+                        .count()
+                })
+                .sum::<usize>()
+        };
+        let before = connections();
+        let refs: Vec<&Placed> = placed.iter().collect();
+        let read = agents(&refs, &[target]).unwrap();
+        assert_eq!(read.len(), 64);
+        assert!(
+            read.iter()
+                .zip(&placed)
+                .all(|(agent, placed)| agent.id.0 == placed.agent)
+        );
+        let made = connections() - before;
+        assert!(made <= 16, "{made} connections for 64 agents");
     }
 }

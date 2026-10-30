@@ -125,6 +125,10 @@ pub struct Harness {
     /// it: a run left up is not left up for good.
     #[serde(default = "max_run_s")]
     pub max_run_s: u64,
+    /// How long a node may take to answer once its unit started: it opens
+    /// every group it replicates first, so 10^5 replicas take minutes.
+    #[serde(default = "start_s")]
+    pub start_s: u64,
     /// A smoke on shared hardware: a node host may also hold drivers or
     /// the coordinator, which `check` otherwise refuses.
     #[serde(default)]
@@ -166,6 +170,9 @@ fn every_s() -> u64 {
 }
 fn driver_connections() -> usize {
     512
+}
+fn start_s() -> u64 {
+    90
 }
 fn max_run_s() -> u64 {
     6 * 3_600
@@ -438,6 +445,7 @@ mod tests {
         assert_eq!(inventory.hosts[3].role, Role::Driver);
         assert_eq!(inventory.harness.memory_max, "4G");
         assert_eq!(inventory.harness.max_clock_offset_ms, 100);
+        assert_eq!(inventory.harness.start_s, 90);
         assert_eq!(inventory.node["executors"].as_integer(), Some(2));
         assert_eq!(inventory.hosts[0].unit("node"), "vos-scale-node-a");
         assert!(inventory.hosts[0].is_local() && !inventory.hosts[2].is_local());
