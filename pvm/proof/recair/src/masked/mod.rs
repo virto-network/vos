@@ -64,9 +64,9 @@ use stwo::core::verifier::PREPROCESSED_TRACE_IDX;
 use stwo::prover::backend::simd::SimdBackend;
 use stwo::prover::backend::simd::column::BaseColumn;
 use stwo::prover::backend::{BackendForChannel, Column};
+use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::poly::circle::{CircleCoefficients, CircleEvaluation, PolyOps};
 use stwo::prover::poly::twiddles::TwiddleTree;
-use stwo::prover::mempool::BaseColumnPool;
 use stwo::prover::{
     CommitmentSchemeProver, CommitmentTreeProver, ComponentProver, ComponentProvers,
     DomainEvaluationAccumulator, ProvingError, Trace,
@@ -403,7 +403,11 @@ where
 {
     /// The preprocessed columns of components of `log_sizes`, committed
     /// under `format`. `None` when a log size overflows.
-    pub(crate) fn new(format: &Format, log_sizes: &[u32], preprocessed: Evaluations) -> Option<Self> {
+    pub(crate) fn new(
+        format: &Format,
+        log_sizes: &[u32],
+        preprocessed: Evaluations,
+    ) -> Option<Self> {
         let lifting = lifting_log_size(format, log_sizes)?;
         let twiddles =
             SimdBackend::precompute_twiddles(CanonicCoset::new(lifting).circle_domain().half_coset);
@@ -472,7 +476,10 @@ where
     let composition = lifting - format.params.log_blowup;
     let own;
     let (twiddles, preprocessed) = match committed {
-        Some(committed) => (&committed.twiddles, Preprocessed::Committed(&committed.tree)),
+        Some(committed) => (
+            &committed.twiddles,
+            Preprocessed::Committed(&committed.tree),
+        ),
         None => {
             own = SimdBackend::precompute_twiddles(
                 CanonicCoset::new(lifting).circle_domain().half_coset,

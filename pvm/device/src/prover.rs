@@ -560,9 +560,12 @@ pub(crate) mod classes {
     /// unpinned thread a core: every class taking work, or no classes.
     pub(crate) fn auto_cores() -> Option<Vec<usize>> {
         let cores = allowed()?;
-        let capacities: Option<Vec<u64>> =
-            cores.iter().map(|&core| read(core, "cpu_capacity")).collect();
-        let by_capacity = capacities.is_some_and(|all| all.windows(2).any(|pair| pair[0] != pair[1]));
+        let capacities: Option<Vec<u64>> = cores
+            .iter()
+            .map(|&core| read(core, "cpu_capacity"))
+            .collect();
+        let by_capacity =
+            capacities.is_some_and(|all| all.windows(2).any(|pair| pair[0] != pair[1]));
         let stated = |core| {
             read(
                 core,
@@ -693,17 +696,22 @@ pub(crate) mod classes {
         /// rate, is none.
         #[test]
         fn cores_are_grouped_by_their_stated_rate() {
-            let phone = [1_804_800, 1_804_800, 1_804_800, 1_804_800, 2_400_000, 2_400_000, 2_400_000, 2_496_000];
+            let phone = [
+                1_804_800, 1_804_800, 1_804_800, 1_804_800, 2_400_000, 2_400_000, 2_400_000,
+                2_496_000,
+            ];
             let stated = |core: usize| phone.get(core).copied();
             assert_eq!(
                 classes(&(0..8).collect::<Vec<_>>(), &stated),
                 Some(vec![vec![7, 4, 5, 6], vec![0, 1, 2, 3]])
             );
-            let x86 = |core: usize| Some(match core {
-                0..=11 => 4_800_000,
-                12..=19 => 3_800_000,
-                _ => 2_500_000,
-            });
+            let x86 = |core: usize| {
+                Some(match core {
+                    0..=11 => 4_800_000,
+                    12..=19 => 3_800_000,
+                    _ => 2_500_000,
+                })
+            };
             assert_eq!(
                 classes(&[1, 3, 12, 13, 20], &x86),
                 Some(vec![vec![1, 3], vec![12, 13], vec![20]])
