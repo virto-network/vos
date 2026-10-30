@@ -298,17 +298,17 @@ pub const SEGMENT_REFERENCE: SecurityShape = SecurityShape {
 /// (`vos_pvm_proof::device`) with every chip a device program may hold at
 /// `2^17` rows (`device::DEVICE_MAX_LOG_SIZE`, which install enforces),
 /// masked under variant (c): its columns at degree bound 2^18, the
-/// composition whole at 2^19, sampled at `π(z)`; 7,548 values in the DEEP
-/// batch, 4,292 constraints, every fraction a masked row evaluates (the
+/// composition whole at 2^19, sampled at `π(z)`; 7,404 values in the DEEP
+/// batch, 4,256 constraints, every fraction a masked row evaluates (the
 /// blinding's among them), the widest relation's 265 limbs. A test in
 /// `vos-pvm-recair` derives it from the built set.
 pub const DEVICE_REFERENCE: SecurityShape = SecurityShape {
     log_degree_bound: 19,
     log_trace_length: 18,
     log_composition_degree_bound: 19,
-    sampled_values: 7_548,
+    sampled_values: 7_404,
     max_samples_per_column: 3,
-    constraints: 4_292,
+    constraints: 4_256,
     logup_fractions: 155_058_176,
     relation_width: SEGMENT_RELATION_WIDTH,
     composition_point_doublings: 1,

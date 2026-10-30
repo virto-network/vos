@@ -30,8 +30,10 @@ pub struct LogupTraceBuilder {
     /// dead majority.  The reference (always-combine) path is kept for the
     /// bit-identity test.
     skip_dead_rows: bool,
-    /// Each fraction its own column (`Logup::Single`), never paired.
-    single: bool,
+    /// How many of the next fractions take a column each, never paired:
+    /// all for `Logup::Single`, the first `singles` for
+    /// `Logup::SingleThenPairs`, none for `Logup::Pairs`.
+    singles: usize,
 }
 
 impl LogupTraceBuilder {
@@ -46,15 +48,21 @@ impl LogupTraceBuilder {
             logup_trace_gen: LogupTraceGenerator::new(log_size),
             pending_logup: Vec::with_capacity(1 << (log_size - LOG_N_LANES)),
             skip_dead_rows,
-            single: false,
+            singles: 0,
         }
     }
 
     /// A builder that gives each fraction its own column: a
     /// `Logup::Single` chip's interaction trace.
     pub fn single(log_size: u32) -> Self {
+        Self::single_then_pairs(log_size, usize::MAX)
+    }
+
+    /// A builder that gives each of the first `singles` fractions its own
+    /// column and pairs the rest: a `Logup::SingleThenPairs` chip's.
+    pub fn single_then_pairs(log_size: u32, singles: usize) -> Self {
         Self {
-            single: true,
+            singles,
             ..Self::new(log_size)
         }
     }
@@ -147,11 +155,12 @@ impl LogupTraceBuilder {
         self.push_fractions(frac_iter);
     }
 
-    /// One relation's fractions: a column of their own when `single`,
-    /// otherwise held until the next relation's and paired with them in one
+    /// One relation's fractions: a column of their own while `singles`
+    /// lasts, otherwise held until the next relation's and paired with them in one
     /// column.
     fn push_fractions(&mut self, fractions: impl Iterator<Item = LogUpFrac>) {
-        if self.single {
+        if self.singles > 0 {
+            self.singles -= 1;
             self.write_column(fractions);
         } else if self.pending_logup.is_empty() {
             self.pending_logup.extend(fractions);
