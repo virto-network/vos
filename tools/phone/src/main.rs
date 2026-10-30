@@ -87,6 +87,9 @@ fn witness(member: &Digest) -> AuthWitness {
 struct Options {
     reps: usize,
     threads: Option<usize>,
+    /// The cores a device cell's threads are pinned to, one thread an
+    /// entry (`--cores`), in place of `--threads`.
+    cores: Option<Vec<usize>>,
     cells: Vec<String>,
     grind: u64,
     out: Option<PathBuf>,
@@ -98,6 +101,7 @@ fn options(args: &[String]) -> Options {
     let mut options = Options {
         reps: 20,
         threads: None,
+        cores: None,
         cells: CELLS.iter().map(|cell| cell.to_string()).collect(),
         grind: 300,
         out: None,
@@ -115,6 +119,14 @@ fn options(args: &[String]) -> Options {
                     count => Some(count.parse().expect("a thread count")),
                 }
             }
+            "--cores" => {
+                options.cores = Some(
+                    value()
+                        .split(',')
+                        .map(|core| core.parse().expect("a core"))
+                        .collect(),
+                )
+            }
             "--cells" => options.cells = value().split(',').map(str::to_string).collect(),
             "--grind" => options.grind = value().parse().expect("a count"),
             "--out" => options.out = Some(PathBuf::from(value())),
@@ -127,7 +139,10 @@ fn options(args: &[String]) -> Options {
 }
 
 fn threads(options: &Options) -> Threads {
-    options.threads.map_or(Threads::Auto, Threads::Count)
+    match &options.cores {
+        Some(cores) => Threads::Cores(cores.clone()),
+        None => options.threads.map_or(Threads::Auto, Threads::Count),
+    }
 }
 
 fn ms(duration: Duration) -> f64 {
@@ -370,30 +385,24 @@ fn device_run(args: &[String]) {
     println!("{{\"kind\":\"done\"}}");
 }
 
-/// A device cell's worker threads' stacks: the prover's nested joins at
-/// blowup 8 overflowed the default 2 MiB about once in 18 proves on 8
-/// threads, and never in 24 at this size.
-const DEVICE_STACK: usize = 16 << 20;
-
-/// One device cell, in a pool of the threads asked for.
+/// One device cell, in the device library's pool of the threads asked for
+/// (`Threads::Auto` by default, by core class).
 fn device_cell(name: &str, args: &[String]) {
     let options = options(args);
-    rayon::ThreadPoolBuilder::new()
-        .num_threads(options.threads.unwrap_or(0))
-        .stack_size(DEVICE_STACK)
-        .build_global()
-        .expect("the pool");
+    let pool = vos_device::thread_pool(&threads(&options)).expect("the pool");
     let kernels = options.kernels.clone().unwrap_or_else(|| {
         let exe = std::env::current_exe().expect("this binary's path");
         exe.with_file_name("kernels")
     });
-    device::cell(
-        name,
-        &kernels,
-        options.reps,
-        options.warmups,
-        options.out.as_ref(),
-    );
+    pool.install(|| {
+        device::cell(
+            name,
+            &kernels,
+            options.reps,
+            options.warmups,
+            options.out.as_ref(),
+        )
+    });
 }
 
 /// Verifies the proofs `run --out` wrote in `dir` against their calls.

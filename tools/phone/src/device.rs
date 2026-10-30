@@ -10,8 +10,8 @@
 //! `h` twice the rows a column reading two rows reveals, `4·2 + 3q`,
 //! rounded up to a power of two. The program is installed once from a
 //! reference run of the same witness (the shape its run needs, each chip at
-//! least its floor); each rep traces the kernel and proves it against the
-//! program.
+//! least its floor), its preprocessed tree committed then; each rep traces
+//! the kernel and proves it against the program.
 
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -25,7 +25,7 @@ use stwo::prover::backend::simd::SimdBackend;
 use vos_pvm_proof::format::{ChannelKind, DEVICE_PROOF, Format, FormatParams, Masking};
 use vos_pvm_proof::masked::DeviceComponents;
 use vos_pvm_recair::masked::MaskRng;
-use vos_pvm_recair::masked::device::{device_shape, install, prove_device, verify_device};
+use vos_pvm_recair::masked::device::{DeviceProver, device_shape, verify_device};
 use vos_pvm_recair_air::masked::MaskedComponents;
 
 use crate::{hex, ms, peak_rss_mib, quantile};
@@ -143,8 +143,9 @@ fn measure<MC: MerkleChannel>(
     let mut reference = trace();
     let steps = reference.steps.len();
     let (active, log_sizes) = device_shape(&format, &kernel, &mut reference).expect("a shape");
-    let program = install::<MC>(&format, &kernel, active, &log_sizes)
+    let prover = DeviceProver::<MC>::install(&format, &kernel, active, &log_sizes)
         .unwrap_or_else(|error| panic!("{name} at {log_sizes:?}: {error:?}"));
+    let program = &prover.program;
     let install_ms = ms(started.elapsed());
     let (mut traces, mut proves, mut verifies) = (Vec::new(), Vec::new(), Vec::new());
     let (mut hashes, mut bytes, mut stats) = (Vec::new(), Vec::new(), None);
@@ -153,13 +154,13 @@ fn measure<MC: MerkleChannel>(
         let mut side_note = trace();
         let traced = started.elapsed();
         let started = Instant::now();
-        let (proof, made) =
-            prove_device::<MC>(&format, &program, &mut side_note, MaskRng::default())
-                .expect("the device kernel proves");
+        let (proof, made) = prover
+            .prove(&mut side_note, MaskRng::default())
+            .expect("the device kernel proves");
         let proved = started.elapsed();
         let started = Instant::now();
         assert!(
-            verify_device::<MC>(&format, &program, &proof).is_ok(),
+            verify_device::<MC>(&format, program, &proof).is_ok(),
             "{name} verifies"
         );
         let verified = started.elapsed();
