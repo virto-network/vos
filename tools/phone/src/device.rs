@@ -53,7 +53,11 @@ pub struct Cell {
 impl Cell {
     pub fn parse(text: &str) -> Self {
         let parts: Vec<&str> = text.split('/').collect();
-        assert_eq!(parts.len(), 3, "a cell is statement/blowup:queries:pow/channel: {text}");
+        assert_eq!(
+            parts.len(),
+            3,
+            "a cell is statement/blowup:queries:pow/channel: {text}"
+        );
         let config: Vec<u32> = parts[1]
             .split(':')
             .map(|part| part.parse().expect("a number"))
@@ -149,11 +153,15 @@ fn measure<MC: MerkleChannel>(
         let mut side_note = trace();
         let traced = started.elapsed();
         let started = Instant::now();
-        let (proof, made) = prove_device::<MC>(&format, &program, &mut side_note, MaskRng::default())
-            .expect("the device kernel proves");
+        let (proof, made) =
+            prove_device::<MC>(&format, &program, &mut side_note, MaskRng::default())
+                .expect("the device kernel proves");
         let proved = started.elapsed();
         let started = Instant::now();
-        assert!(verify_device::<MC>(&format, &program, &proof).is_ok(), "{name} verifies");
+        assert!(
+            verify_device::<MC>(&format, &program, &proof).is_ok(),
+            "{name} verifies"
+        );
         let verified = started.elapsed();
         if rep < warmups {
             continue;
@@ -161,7 +169,11 @@ fn measure<MC: MerkleChannel>(
         traces.push(ms(traced));
         proves.push(ms(proved));
         verifies.push(ms(verified));
-        eprintln!("  {name} rep {}/{reps}: {:.1} ms", rep + 1 - warmups, ms(proved));
+        eprintln!(
+            "  {name} rep {}/{reps}: {:.1} ms",
+            rep + 1 - warmups,
+            ms(proved)
+        );
         bytes = postcard::to_allocvec(&(
             &proof.io,
             &proof.proof.stark_proof,

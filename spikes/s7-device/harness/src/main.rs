@@ -297,7 +297,11 @@ fn kernels(elf: &Path, data: &Path, out: &Path) {
     std::fs::create_dir_all(out).unwrap();
     let elf = std::fs::read(elf).unwrap();
     for (name, method, input) in [
-        ("b2", &b"auth"[..], std::fs::read(data.join("auth.input")).unwrap()),
+        (
+            "b2",
+            &b"auth"[..],
+            std::fs::read(data.join("auth.input")).unwrap(),
+        ),
         ("p2", &b"auth_p2"[..], p2_input()),
     ] {
         let kernel = kernel_of(&elf, method);

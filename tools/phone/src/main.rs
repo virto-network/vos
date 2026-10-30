@@ -387,7 +387,13 @@ fn device_cell(name: &str, args: &[String]) {
         let exe = std::env::current_exe().expect("this binary's path");
         exe.with_file_name("kernels")
     });
-    device::cell(name, &kernels, options.reps, options.warmups, options.out.as_ref());
+    device::cell(
+        name,
+        &kernels,
+        options.reps,
+        options.warmups,
+        options.out.as_ref(),
+    );
 }
 
 /// Verifies the proofs `run --out` wrote in `dir` against their calls.
