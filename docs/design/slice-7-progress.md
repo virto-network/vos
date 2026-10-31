@@ -5652,7 +5652,9 @@ whose `h` is below a chip's revealed rows, so the install fails before
 any proof rather than after `MAX_ATTEMPTS` (`mask_rows` untouched, the
 R1-refusal tests keep their path; a test at `h = 128` and at 83
 queries); and `mask_rows`' per-chip `h` noted as below the format's cap
-only.
+only. Gates after the folds, at `bbb53fac`: `just check` exit 0 (1,672
+passed in 119 suites, 31 blobs `blobs.lock`'s); `just test-proof` exit 0
+(585 passed in 52 suites).
 
 **Left:** a phone session at 45 (P6's `h256` cell is its estimate: about
 0.61 s, peak 555 MiB); s4's comments.
