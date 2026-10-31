@@ -1333,7 +1333,11 @@ columns [measured, 7.16]. Over `C`, a kernel that hashes only through
   device chips to neither BLAKE2b's nor the AND table's
   (`device_kernel::a_device_kernels_shape_holds_no_blake2b`). The auth
   kernel then takes 2,860 steps, from 5,665: its end writes the parts once
-  [measured, 7.17b].
+  [measured, 7.17b]; and 1,722 once the end hashes `E` where it lies (one
+  four-byte load a packed word, `padded_device_io_words`) and the kernel
+  moves its words whole at any alignment (the PVM serves unaligned loads
+  and stores; the guest target's own go byte by byte): under 2^11 steps,
+  the CPU at the masking's floor, which the gate holds [measured, 7.17c].
 
 **Format 43, device proofs** [measured, slice 7's 7.16]: masked (c), the
 Blake2s-M31 channel, blowup 4, 47 queries, PoW 16, interaction PoW 8,
