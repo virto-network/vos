@@ -11,7 +11,8 @@
 //!   `0x402` call (`proving.md` §8, S21): pin J's device kernel, its public
 //!   arguments auth's `CredentialPublic` (the kind byte, then `map_root`,
 //!   `scope`, `nullifier` and `binding`), its output empty; 36
-//!   compressions. A lean kernel: its arguments read where the witness
+//!   compressions, and 7 for its io-hash, the Poseidon2 one
+//!   (`#[attestable(device)]`). A lean kernel: its arguments read where the witness
 //!   input left them ([`InPlace`], the siblings first, so page-aligned), never
 //!   copied, and the path walked in place in one lane (sibling, node,
 //!   sibling), each level's call reading the half the slot's bit picks by
@@ -253,8 +254,9 @@ impl Statements {
     /// `map_root` by `siblings`, and `nullifier` its nullifier for `scope`.
     /// Anything else traps. The siblings come first, so they lie
     /// page-aligned where the witness input left them, and the secret
-    /// 8-aligned after them.
-    #[attestable(gas = 50_000_000)]
+    /// 8-aligned after them. A device kernel: its io-hash the Poseidon2
+    /// one, so its shape holds no BLAKE2b.
+    #[attestable(gas = 50_000_000, device)]
     #[allow(clippy::too_many_arguments)]
     pub fn auth_p2(
         siblings: InPlace<1024>,

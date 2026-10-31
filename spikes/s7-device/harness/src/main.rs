@@ -33,8 +33,9 @@
 //!   `p2`, over the credential actor's Poseidon2 tree through the `0x402`
 //!   call (`auth_p2`, its witness input made here: a member's leaf at slot
 //!   `0x1234_5678` of a tree whose siblings at levels 0, 5 and 17 are
-//!   occupied); each `<name>.kernel` (the derived blob, which the patched
-//!   derivation admits with the call) and `<name>.input`, each traced once
+//!   occupied; a device kernel, `#[attestable(device)]`, which derivation
+//!   admits with the call); each `<name>.kernel` (the derived blob) and
+//!   `<name>.input`, each traced once
 //!   on the device tracer to its halt. With `S7_PROFILE=<dir>`, each
 //!   kernel's steps and the bytes its loads and stores touch, by function.
 //! - `grind [--bits B] [--n N] [--threads N]`: N grinds of the Blake2s-M31

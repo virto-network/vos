@@ -77,20 +77,10 @@ index 2ebbea7..e35ad00 100644
              | $crate::format::ChannelKind::Blake2b256 => $unbuilt,
          }
      };
-diff --git a/pvm/runtime/src/precompile.rs b/pvm/runtime/src/precompile.rs
---- a/pvm/runtime/src/precompile.rs
-+++ b/pvm/runtime/src/precompile.rs
-@@ -86,3 +86,5 @@
- pub const fn is_kernel_call(id: u64) -> bool {
--    matches!(id, BLAKE2B_COMPRESS | WITNESS_INPUT)
-+    // The spike's device kernels: the Poseidon2 call derived as a device
-+    // kernel's, which the derivation does not admit yet.
-+    matches!(id, BLAKE2B_COMPRESS | WITNESS_INPUT | POSEIDON2)
- }
 diff -u a/pvm/compiler/src/derive.rs b/pvm/compiler/src/derive.rs
 --- a/pvm/compiler/src/derive.rs
 +++ b/pvm/compiler/src/derive.rs
-@@ -788,10 +788,20 @@
+@@ -888,12 +888,22 @@
          // The argument pages, zeros past the read-write data, then the
          // linked program's own zero pages.
          heap_pages: elf.heap_pages + input.pages() as u32,
@@ -108,7 +98,9 @@ diff -u a/pvm/compiler/src/derive.rs b/pvm/compiler/src/derive.rs
 +            .collect();
 +        std::fs::write(std::path::Path::new(&dir).join(format!("{method:08x}.functions")), text).unwrap();
 +    }
-     checked_blob(graph, &reached, method, transpiled, arguments, input)
+     checked_blob(
+         graph, &reached, method, device, transpiled, arguments, input,
+     )
  }
  
 diff -u a/pvm/compiler/src/linker.rs b/pvm/compiler/src/linker.rs

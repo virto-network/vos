@@ -3,8 +3,8 @@
 #
 # The spike's seams (`pvm-proof.patch`: the Blake2s stack routed, a format
 # the process admits under the device number, the memory chip's floor seam,
-# the Poseidon2 call admitted in kernels, and a kernel's functions named for
-# the harness's profile under `S7_PROFILE`)
+# and a kernel's functions named for the harness's profile under
+# `S7_PROFILE`)
 # never enter the repository: the tree at HEAD is exported to <tree>
 # (default `$TMPDIR/s7-device-tree`) once and patched there; each call then
 # copies this spike's sources over the copy's, so a build there sees them.
