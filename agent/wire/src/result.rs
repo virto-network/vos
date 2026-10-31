@@ -457,18 +457,30 @@ pub struct KernelReturn {
 impl KernelReturn {
     /// The io-hash over its parts: a node kernel's.
     pub fn io_hash(&self) -> [u8; 32] {
-        vos_pvm_precompiles::compute_io_hash(&self.public_args, &self.output, &self.root_reads())
+        let roots: Vec<vos_pvm_precompiles::RootRead> = self
+            .roots
+            .iter()
+            .map(|root| vos_pvm_precompiles::RootRead {
+                kind: match root.kind {
+                    crate::vos_anchor::RootKind::Space => vos_pvm_precompiles::RootKind::Space,
+                },
+                space: root.space.0,
+                window: root.window,
+                root: root.root,
+            })
+            .collect();
+        vos_pvm_precompiles::compute_io_hash(&self.public_args, &self.output, &roots)
     }
 
     /// The io-hash over its parts as a device kernel's
     /// ([`crate::abi::Kind::Device`]) states it, over Poseidon2; `None`
-    /// when their encoding holds 2^24 bytes or more.
+    /// when their encoding holds 2^24 bytes or more, or it holds a root,
+    /// which no device kernel reads.
     pub fn device_io_hash(&self) -> Option<[u8; 32]> {
-        vos_pvm_precompiles::compute_device_io_hash(
-            &self.public_args,
-            &self.output,
-            &self.root_reads(),
-        )
+        if !self.roots.is_empty() {
+            return None;
+        }
+        vos_pvm_precompiles::compute_device_io_hash(&self.public_args, &self.output, &[])
     }
 
     /// A device kernel's return read back as its parts: its bytes are the
@@ -481,19 +493,5 @@ impl KernelReturn {
             output: output.to_vec(),
             roots: Vec::new(),
         })
-    }
-
-    fn root_reads(&self) -> Vec<vos_pvm_precompiles::RootRead> {
-        self.roots
-            .iter()
-            .map(|root| vos_pvm_precompiles::RootRead {
-                kind: match root.kind {
-                    crate::vos_anchor::RootKind::Space => vos_pvm_precompiles::RootKind::Space,
-                },
-                space: root.space.0,
-                window: root.window,
-                root: root.root,
-            })
-            .collect()
     }
 }

@@ -781,7 +781,7 @@ fn attestable_entry(
 }
 
 /// A device kernel's entry's body: its parts written once, in place, and
-/// their io-hash the Poseidon2 one ([`vos_sdk::runtime::DeviceReturn`]),
+/// their io-hash the Poseidon2 one ([`vos_sdk::device::DeviceReturn`]),
 /// whatever parts it states.
 fn device_body(handler: &Handler, module: &Ident, message: &Ident) -> Tokens {
     let method = &handler.method.sig.ident;
@@ -803,7 +803,7 @@ fn device_body(handler: &Handler, module: &Ident, message: &Ident) -> Tokens {
         else {
             ::core::panic!("undecodable arguments")
         };
-        let mut parts = ::vos_sdk::runtime::DeviceReturn::new();
+        let mut parts = ::vos_sdk::device::DeviceReturn::new();
         #bound
         #(#publics)*
         let output = Self::#method(#(#names),*);

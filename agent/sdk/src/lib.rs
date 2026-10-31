@@ -11,6 +11,7 @@
 extern crate alloc;
 
 pub mod context;
+pub mod device;
 pub mod heap;
 pub mod host;
 pub mod mem;
