@@ -10,9 +10,10 @@ use crate::runtime::Output;
 /// written once, in place, as the io-hash's encoding `E` (each part a
 /// compact length then its bytes, then a root count of 0: a device kernel
 /// reads none), which is both what the host reads at the halt
-/// ([`vos_wire::result::KernelReturn::from_device_return`]) and what the io-hash absorbs,
-/// through the Poseidon2 call alone
-/// ([`vos_pvm_precompiles::DeviceIoHasher`]): no BLAKE2b, no re-encoding.
+/// ([`vos_wire::result::KernelReturn::from_device_return`]) and what the io-hash absorbs
+/// where it lies, through the Poseidon2 call alone
+/// ([`vos_pvm_precompiles::device_io::padded_device_io_words`]): no BLAKE2b, no
+/// re-encoding, no copy.
 ///
 /// The bytes start with room for each part's compact length, four bytes
 /// before the public arguments and four before the output; [`Self::end`]
@@ -101,20 +102,55 @@ impl DeviceReturn {
         }
         // No root: a device kernel reads none.
         bytes.push(0);
-        let encoded = &bytes[start..];
-        let mut hasher =
-            vos_pvm_precompiles::DeviceIoHasher::<vos_pvm_precompiles::Poseidon2Call>::new();
-        hasher.update(encoded);
-        let hash = hasher.finalize().unwrap_or_else(|| trap());
-        // SAFETY: the caller's contract.
-        unsafe { io_hash.write(hash) };
+        // Zeros to a whole block past `E`, so the io-hash reads every block
+        // where it lies; the host reads `E` alone.
+        let len = bytes.len() - start;
+        bytes.resize(start + len.div_ceil(BLOCK) * BLOCK, 0);
+        let words = vos_pvm_precompiles::device_io::padded_device_io_words::<
+            vos_pvm_precompiles::Poseidon2Call,
+        >(&bytes[start..], len)
+        .unwrap_or_else(|| trap());
+        let at = io_hash.cast::<u8>();
+        for (i, &word) in words.iter().enumerate() {
+            // SAFETY: the caller's contract: 32 writable bytes at `io_hash`.
+            unsafe { store_u32(at.add(4 * i), word) };
+        }
         let output = Output {
-            address: encoded.as_ptr() as u64,
-            len: encoded.len() as u64,
+            address: bytes[start..].as_ptr() as u64,
+            len: len as u64,
         };
         core::mem::forget(bytes);
         output
     }
+}
+
+/// The io-hash's block: 24 bytes.
+const BLOCK: usize = 24;
+
+/// Stores `word` at `at`, any alignment, little-endian: on the guest in one
+/// store, which the PVM serves at any address (the target's own unaligned
+/// writes go byte by byte).
+///
+/// # Safety
+///
+/// `at` must point at four writable bytes.
+#[inline(always)]
+unsafe fn store_u32(at: *mut u8, word: u32) {
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: the caller's contract; the store touches nothing else.
+    unsafe {
+        core::arch::asm!(
+            "sw {word}, 0({at})",
+            word = in(reg) word,
+            at = in(reg) at,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    // SAFETY: the caller's contract.
+    unsafe {
+        core::ptr::write_unaligned(at.cast::<[u8; 4]>(), word.to_le_bytes())
+    };
 }
 
 /// A trap, on the guest; a panic elsewhere.
