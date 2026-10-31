@@ -329,22 +329,31 @@ impl Leader {
             for sender in told {
                 self.inner.behind(sender, self.id);
             }
-            if queued {
+            // A batch flies once the one before it committed: its append
+            // then goes alone, and inputs gather meanwhile, rather than
+            // split into more, smaller batches the executors and the log
+            // pay for each.
+            let term = self.term;
+            let last = self.in_flight.back().map(|flight| flight.index);
+            let committed = |state: &State| last.is_none_or(|last| state.commit >= last);
+            if queued && committed(&self.shared.state()) {
                 break;
             }
-            if !leads(&self.shared.state(), self.term) {
+            if !leads(&self.shared.state(), term) {
                 return None;
             }
-            // While batches fly, the next lands or inputs come: what idles
-            // a leader waits until they have landed.
+            // While batches fly, the oldest lands, the last commits, or
+            // inputs come: what idles a leader waits until they have landed.
             if let Some(index) = self.in_flight.front().map(|flight| flight.index) {
                 let woken = async {
+                    if queued {
+                        std::future::pending::<()>().await;
+                    }
                     match self.agent.woken.recv().await {
                         Ok(()) => Woke::Queue,
                         Err(_) => Woke::Lost,
                     }
                 };
-                let term = self.term;
                 let applied = async {
                     self.shared
                         .wait(|state| {
@@ -353,11 +362,19 @@ impl Leader {
                         .await;
                     Woke::Applied
                 };
-                match woken.or(applied).await {
+                let commits = async {
+                    if !queued {
+                        std::future::pending::<()>().await;
+                    }
+                    self.shared.wait(committed).await;
+                    Woke::Recheck
+                };
+                match woken.or(applied).or(commits).await {
                     Woke::Queue => {
                         waited = true;
                         continue;
                     }
+                    Woke::Recheck => continue,
                     _ => return Some(Taken::Land),
                 }
             }
