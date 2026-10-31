@@ -50,7 +50,8 @@ pub struct Cell {
     pub pow: u32,
     /// `log2 h`, when the cell names it (unchecked: the prover refuses an
     /// `h` its columns' reveals do not fit); else the least power of two at
-    /// least twice the rows a column reading two rows reveals.
+    /// least the rows a column reading two rows reveals, the device
+    /// format's rule (`proving.md` §5).
     pub log_mask_rows: Option<u32>,
     pub channel: ChannelKind,
 }
@@ -88,7 +89,7 @@ impl Cell {
 
     /// The device format at this cell's parameters.
     pub fn format(&self) -> Format {
-        let h = (2 * (4 * 2 + 3 * self.queries)).next_power_of_two();
+        let h = (4 * 2 + 3 * self.queries).next_power_of_two();
         Format {
             channel: self.channel,
             params: FormatParams {

@@ -1,7 +1,7 @@
 #!/bin/sh
 # x86-margin.sh <vos-phone-seeded> <vos-phone-seeded-mimalloc> <before> <lean>
-# <out.jsonl>: the device kernel's cheap levers on x86 at format 43's (blowup 4,
-# 47 queries, PoW 16, Blake2s-M31), the seeded builds (every proof's masks
+# <out.jsonl>: the device kernel's cheap levers on x86 at the device format's
+# (blowup 4, 47 queries, PoW 16, Blake2s-M31), the seeded builds (every proof's masks
 # from one seed, so a lever that moves no byte gives the same proof):
 # - three rounds interleaving, on four P-cores, 5 reps after a warm-up:
 #   the baseline kernel (<before>) and the one moving words (<lean>),
@@ -13,10 +13,27 @@
 #   43 at PoW 20;
 # - three cold runs as an app proves (`vos-phone kernel`: a fresh process,
 #   its prover and pool made, the program computed, one proof).
+# x86-margin.sh h <vos-phone-seeded> <lean> <out.jsonl>: the mask height
+# alone, `h = 512` (format 43's, `:9`) against 256 (45's, `:8`) on the lean
+# kernel, three interleaved rounds on four P-cores, 5 reps after a warm-up.
 # Under the owner's memory cap, one run at a time, the load recorded.
 set -e
-seeded=$1; mi=$2; before=$3; lean=$4; out=$5
 cap="systemd-run --user --scope -q -p MemoryMax=12G -p MemorySwapMax=0 nice -n 10"
+if [ "$1" = h ]; then
+  seeded=$2; lean=$3; out=$4
+  {
+    for round in 1 2 3; do
+      for log_h in 9 8; do
+        echo "# h$log_h-$round $(date -Is) $(uptime)"
+        $cap taskset -c 1,3,6,8 "$seeded" device-cell p2/2:47:16:$log_h/b2sm31 --kernels "$lean" \
+          --threads 4 --reps 5 --warmups 1 2>/dev/null | grep device_cell | sed "s/^/h$log_h-$round /"
+      done
+    done
+    echo "# end $(date -Is) $(uptime)"
+  } > "$out" 2>&1
+  exit
+fi
+seeded=$1; mi=$2; before=$3; lean=$4; out=$5
 pin=p2/2:47:16/b2sm31
 p4=1,3,6,8; p4e4=1,3,6,8,12,13,14,15
 # cell <name> <cpus> <VAR=value> <vos-phone> <kernels> <flags…>
