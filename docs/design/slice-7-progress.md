@@ -5340,3 +5340,150 @@ facilities and anonymous connections; `bd79bb8` `s4-credential`;
 `57fbab9` the advisories' updates. VOS `504f4b47` the gateway's screens;
 `fcbf6f45` the demo and its e2e; `4dbc590f` the review's folds (s4 pinned
 at `6f60229e`); this record.
+
+## Step 7.17c: cheap margin before the CPU split
+
+Branch `s7/7.17c`, from vos-core `8816e94e`. P5 left PG2 met by 3% (0.97
+s, the 95th percentile at the line); before 7.18's CPU split (6–10 weeks)
+the owner asked for cheaper margin. Each lever measured on x86 first,
+scaled by P5's factor (the phone about 2.4–2.8× x86); the phone itself
+reserved, session P6 scripted for it.
+
+**Where a proof goes** [measured, x86, one proof's phases timed under a
+patch not kept, 4 P-cores, load 3–4; and `perf` by symbol]: the trace 33
+ms (5%), the witness digest (BLAKE2b over the main columns, R4's hedge) 15
+(2%), the main tree 198 (29%: extension 65, Merkle 111), the interaction
+tree 132 (19%: its trace 24, extension 35, Merkle 63), the composition 162
+(23%), `prove_values` (DEEP, FRI, the grind, decommitment) 118 (17%), R1 27
+(4%). By symbol, Blake2s-M31's `compress16` 33% (the Merkle trees), the
+FFTs about 8%, QM31 products 7%. The PoW grind at 16 bits is under 1%
+(the phone's mean 3.9 ms on its big cores, P2).
+
+**Built:**
+- **The auth device kernel under 2^11 steps** (`bd893a3f`, `1e889a2c`):
+  2,860 → **1,722** steps, so the CPU sits at its masking floor (2^12 →
+  2^11 rows) and the registers' ledger at 2^12; 19.7M → 15.9M cells. The
+  statement, its public words and `H_io` are unchanged (the device suite's
+  gates: the io-hash of the return, two path shapes under one program).
+  The profile (the spike harness's, by call site) found 864 steps in the
+  walk, 384 in four byte-wise copies of the public arguments, about 800 in
+  `H_io` (24-byte blocks packed byte by byte, the hasher moved by value,
+  its tail copied, its buffers zeroed) and 209 in `memset`. Now:
+  `padded_device_io_words` (`vos_pvm_precompiles::device_io`) hashes `E`
+  where it lies, zero-padded to whole blocks in the return's own buffer,
+  one `lwu` a packed word on the guest (the PVM serves any alignment; the
+  guest target's unaligned reads go byte by byte); `DeviceReturn::end`
+  writes the io-hash with word stores; the kernel (`device` test actor,
+  and the spike's `auth_p2`) copies its public arguments and reads its
+  unaligned digests eight bytes at a time, leaves its lanes unzeroed
+  (every word written first), and stores each level's sibling once, on
+  the side its bit picks. A gate holds the auth kernel under 2^11 steps.
+  **Nothing of the node moved:** `just check-blobs` found only the
+  `device` actor's ELF changed, every other blob (the agent, the
+  representative, the credential actor, the verifiers, the other test
+  actors) byte for byte; the streaming hasher and the padded one agree for
+  every length 0–73 (`the_padded_hash_is_the_chains`).
+- **`vos-phone`** (`751a7833`, `0055dda4`): the seeded build seeds the
+  device cells' masks and every cell prints its proof's SHA-256, so a
+  lever that moves no byte shows the same proof; a cell may name its
+  mask height (`p2/2:47:16:8/b2sm31`, `h = 256`).
+- **`scripts/x86-margin.sh`** (`runs/x86-margin.jsonl`) and
+  **`scripts/p6.sh`**, session P6.
+
+**x86** [measured, `runs/x86-margin.jsonl`; seeded builds, 4 P-cores
+(1, 3, 6, 8) unless said, 5 reps after a warm-up, three interleaved
+rounds; load 2.5–4.2 (another agent's scale coordinator on one core), so
+the baseline measured 0.46–0.48 s against 7.17b's quiet 0.40]:
+
+| lever | rounds' p50 | p95 | peak | bytes | same proof |
+|---|---|---|---|---|---|
+| before (2,860 steps) | 472 / 464 / 475 ms | 468–486 | 575–581 MiB | 978,826 | |
+| **the lean kernel (1,722)** | **419 / 403 / 397 ms** | 400–428 | **495–498 MiB** | 970,665 | (another program) |
+| lean, mimalloc | 415 / 407 / 407 ms | 414–448 | 655–686 MiB | 970,665 | yes |
+| lean, mimalloc never purging | 404 / 397 / 403 ms | 404–412 | 655–693 MiB | 970,665 | yes |
+| lean, `h = 256` (proposal) | 327 / 330 / 328 ms | 329–353 | 408–418 MiB | 977,553 | (another format) |
+
+- **The kernel: ×0.85 in time (472 → 403 ms, the rounds' medians), ×0.86
+  in peak.** On the phone [est, P5's 0.97 s × 0.85]: **about 0.83 s, its
+  95th percentile about 0.86 s.**
+- **Threads** [lean kernel, 4 P + 4 E, two rounds]: `Auto` (both classes
+  kept, unpinned) 311 / 318 ms, the eight pinned 316 / 320, eight
+  unpinned 314 / 317, the P-cores alone pinned 388 / 409. On x86 pinning
+  is worth nothing once both classes work; the phone's question (its four
+  A520s at about 0.4 of an A720 by `Auto`'s measure, the A720s pinned 1.2×
+  unpinned in P5) is P6's: the eight pinned and big + two little pinned
+  against `Auto`'s four. No change to `Auto` without it.
+- **The allocator:** glibc and mimalloc tie within 2% (mimalloc's peak
+  +35%); mimalloc refaults about 1,900 pages a proof (`perf stat`: 21k
+  minor faults over an install and 11 proofs, 1.6k never purging; glibc
+  117k, all at the first proof). On the phone that is a few ms at most
+  [est]; P6 measures `MIMALLOC_PURGE_DELAY=-1`, an app's setting, no code.
+- **Queries and PoW** [lean]: 63 queries 411 ms against 47's 404 (about
+  0.4 ms a query), PoW 20 at 43 queries 412: the grind and the queries are
+  no lever (4 PoW bits buy 4 queries, and PoW 20's grind is 40 ms mean on
+  the phone's big cores). 31 queries proved in 320 ms, but only because
+  its `h` halves (below).
+- **Cold against warm** (`vos-phone kernel`, a fresh process as an app
+  proves: its pool, the program computed, one proof): install 56–60 ms,
+  the proof 445–449 ms against 397–419 warm (×1.1, the first touch of
+  about 440 MB: 112k minor faults under glibc). An app pays it once: the
+  prover and its pool, and the program, made before the sign-in, keep the
+  proof warm after its first.
+- **Compiler flags:** the release profile is already fat LTO, one codegen
+  unit. `-C target-cpu=cortex-a720` builds (`vos-phone-timing-a720`), and
+  its seeded aarch64 build's proof under qemu (`-cpu max`) is byte for byte
+  the generic aarch64 build's and x86's (`9d05efa6…`); its gain is P6's.
+  It runs only on cores of that generation (Armv9.2): an app would need a
+  runtime choice between two builds. PGO needs a profile taken on the
+  phone (the hot paths are `cfg`'d by architecture, so x86's profile does
+  not carry): a later session's.
+- **SIMD on aarch64:** the Stwo fork's NEON paths are active (M31 products
+  `mul_neon`, the FFTs' `mul_doubled_neon`; neon is aarch64's baseline).
+  But `compress16` (16 BLAKE2s states, `u32x16` each word) is 10,995
+  aarch64 instructions of which 4,538 are stack loads and stores (the
+  state alone takes 64 of NEON's 32 registers), rotations by `shl` +
+  `usra` (16 could be one `rev32`); x86 AVX2 spills too (2,450 of 5,088).
+  A NEON compression a quarter (`u32x4`) at a time, state and message in
+  registers, is the next implementation lever: the Merkle hashing is a
+  third of a proof [est −5–10% on the phone]; it is a Stwo fork change
+  (Fable's review, a re-pin of the fork), not taken here.
+
+**Proposed, not pinned: `h = 256` for format 43.** Format 43's rule sets
+`h` at least twice the rows a column reveals, `2(4|O| + q(|O| + 1)) =
+298` at 47 queries, so 512. At `h = 256` (still above the 149 rows
+revealed, and R1 accepted every transcript on its first attempt) every
+chip's floor halves to 2^10: the Poseidon2 chip and eleven others leave
+2^11, 15.9M → 11.7M cells, **×0.81 in time (403 → 328 ms), ×0.83 in
+peak**, the bytes +0.7%. The counted bits do not move: `h` enters neither
+the parameters nor the reference shape (110 conjectured, 62.82 proven,
+as now). What moves is the zero-knowledge margin: the factor two over the
+revealed rows is the design's (7.14, `proving.md` §8's masking), and
+dropping it needs that argument re-made (Fable's) and a new format number
+(43 names `h = 512`). Within the rule, `h = 256` needs at most 40 queries,
+which at blowup 4 costs PoW 23 (a grind of about 0.3 s on the phone), or
+blowup 8 (29 queries at PoW 20, slower in 7.16 and 7.17b). P6 measures it
+(`h256`). On the phone, with the kernel [est]: about 0.67 s.
+
+**Projected PG2 with what is built** [est, P5's phone figures × x86's
+ratio]: **p50 about 0.83 s, p95 about 0.86 s**, peak about 0.60 GiB, the
+proof 0.97 MB; with the proposal, about 0.67 s. P6 replaces the
+estimate.
+
+**Session P6** (`scripts/p6.sh`, the phone not used in this step):
+
+```sh
+sh spikes/s7-device/scripts/p6.sh <vos-phone-timing> <vos-phone-timing-a720> \
+  <before> <lean> spikes/s7-device/runs/phone-p6.txt
+```
+
+`<vos-phone-timing>` and the `-a720` build come from `tools/phone`'s
+`cargo ndk … --features mimalloc` (the second with
+`CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS="-C target-cpu=cortex-a720"`);
+`<before>` P5's kernel (`c650df97…`, 2,860 steps), `<lean>` the spike's
+`auth_p2` at this branch (`0f10b485…`, 1,722 steps, `harness kernels`),
+each with `p2.input`. Three rounds of seven interleaved runs (base, lean,
+lean on eight pinned cores, lean on the big four and two little, lean
+never purging, lean on the a720 build, lean at `h = 256`), 5 proofs after
+a warm-up each, then three cold `vos-phone kernel` runs; battery,
+temperature, memory and both clusters' governors around each run, P5's
+waits, the kills since the start, the pushed files removed on exit.
