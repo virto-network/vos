@@ -31,18 +31,18 @@ pub struct Installable {
 /// Derive package `elf`'s programs, as a VOS node derives them. One with an
 /// attestable method declaring more gas than a kernel runs with on JAM
 /// (`cap::JAM.kernel_gas()`) is refused, naming it, as its install would
-/// be.
+/// be; a device kernel's gas bounds a device's run, which no node makes.
 pub fn derive(elf: &[u8]) -> Result<Installable, Error> {
     let derived =
         vos_pvm_compiler::derive(elf).map_err(|error| Error::Package(error.to_string()))?;
     let schema = Schema::read(&derived.schema)
         .map_err(|error| Error::Package(format!("its schema: {error:?}")))?;
     let most = cap::JAM.kernel_gas().expect("JAM bounds a kernel");
-    if let Some(method) = schema
-        .methods
-        .iter()
-        .find(|method| method.kind.is_attestable() && method.gas.is_some_and(|gas| gas > most))
-    {
+    if let Some(method) = schema.methods.iter().find(|method| {
+        method.kind.is_attestable()
+            && method.kind != vos_wire::abi::Kind::Device
+            && method.gas.is_some_and(|gas| gas > most)
+    }) {
         return Err(Error::Package(format!(
             "attestable method `{}` declares gas {}, past the {most} a kernel runs with on JAM",
             String::from_utf8_lossy(&method.name),

@@ -5,6 +5,10 @@
 //! through the `0x402` call, its io-hash the Poseidon2 one, so its shape
 //! holds no BLAKE2b.
 //!
+//! `login` is an auth guard naming it, so a member signs in with a
+//! credential proof or a device proof of `auth`; the agent needs the
+//! credential actor.
+//!
 //! Its arguments are read where the witness input left them ([`InPlace`],
 //! the siblings first, so page-aligned), never copied, and the path is
 //! walked in place in one lane `[sibling, node, sibling]`, each level's call
@@ -190,6 +194,13 @@ pub struct Device {}
 impl Device {
     pub fn new() -> Self {
         Self {}
+    }
+
+    /// A member signed in, by a credential proof or a device proof of
+    /// `auth`: its pseudonym in the scope `"login"`.
+    #[msg(credential = Auth("login"), device = "auth")]
+    pub async fn login(&mut self, ctx: &mut Command<Self>) -> Option<[u8; 32]> {
+        ctx.nullifier()
     }
 
     /// Asks a node to attest method `method` on `arguments`, which it

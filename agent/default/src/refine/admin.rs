@@ -3,7 +3,7 @@
 use alloc::vec::Vec;
 
 use vos_wire::abi::cap::{Limits, Refused, Target};
-use vos_wire::abi::{Failure, cap};
+use vos_wire::abi::{Failure, Kind, cap};
 use vos_wire::batch::Admin;
 use vos_wire::ids::InstanceId;
 use vos_wire::records::{Derivation, Installed};
@@ -289,11 +289,12 @@ fn within(installed: &Installed, limits: &Limits) -> Option<Result<(), Refused>>
     let Some(most) = limits.kernel_gas() else {
         return Some(Ok(()));
     };
+    // A device kernel's gas bounds a device's run, which no node makes.
     let declared = installed
         .schema
         .methods
         .iter()
-        .filter(|method| method.kind.is_attestable())
+        .filter(|method| method.kind.is_attestable() && method.kind != Kind::Device)
         .find_map(|method| Some((method.id, method.gas.filter(|&gas| gas > most)?)));
     Some(match declared {
         Some((method, gas)) => Err(Refused::KernelGas { method, gas, most }),

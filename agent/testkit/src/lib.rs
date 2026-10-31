@@ -562,8 +562,10 @@ fn statics_within(
     let Some(most) = limits.kernel_gas() else {
         return Ok(());
     };
+    // A device kernel's gas bounds a device's run, which no node makes.
     for method in &schema.methods {
         if method.kind.is_attestable()
+            && method.kind != vos_wire::abi::Kind::Device
             && let Some(gas) = method.gas.filter(|&gas| gas > most)
         {
             return Err(Refused::KernelGas {

@@ -207,8 +207,9 @@ pub struct Limits {
     /// the agent ([`crate::defaults::PRECOMPILE_SERVING`]): a kernel runs
     /// within the gas they pay for ([`Limits::kernel_gas`]), and within the
     /// gas its method declares (`#[attestable(gas = N)]`), which its
-    /// install checks is no more. `None`: the calling handler's gas alone
-    /// bounds a kernel.
+    /// install checks is no more; a device kernel's, which no node runs,
+    /// is not held to it. `None`: the calling handler's gas alone bounds a
+    /// kernel.
     pub kernel_compressions: Option<u64>,
 }
 

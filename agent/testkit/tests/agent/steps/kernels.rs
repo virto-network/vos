@@ -194,10 +194,11 @@ fn derived_kernels_run_in_the_agent() {
 
 /// No node attests a device kernel's method: the agent refuses the attest
 /// before the kernel runs, as the model does, though the install binds the
-/// kernel.
+/// kernel. The device actor's `login` guard needs the credential actor,
+/// installed first.
 #[test]
 fn a_device_kernels_method_is_never_attested() {
-    use vos_testkit::programs::{derivation, derived, package};
+    use vos_testkit::programs::{credentials_elf, derivation, derived, package};
     let derived = derived("device");
     let instance = InstanceId(9);
     let kernels: Vec<(MethodId, &[u8])> = derived
@@ -212,15 +213,29 @@ fn a_device_kernels_method_is_never_attested() {
     for (_, kernel) in &kernels {
         node.add(kernel);
     }
-    let install = Input::Admin(Admin::Install {
-        instance,
-        derivation: derivation(&package("device"), &derived),
-        roles: vec![],
-        target: Target::Vos,
-        space: vos_wire::SpaceId::NONE,
-        clock: vos_wire::WindowClock::DEFAULT,
-    });
-    ran_done(&node.batch(0, vec![install]).steps[0]);
+    let elf = std::fs::read(credentials_elf()).unwrap();
+    let credentials = vos_pvm_compiler::derive(&elf).expect("derives");
+    node.add(&credentials.actor);
+    let install = |instance, derivation, roles: &[&str]| {
+        Input::Admin(Admin::Install {
+            instance,
+            derivation,
+            roles: roles
+                .iter()
+                .map(|role| (role.as_bytes().to_vec(), 1))
+                .collect(),
+            target: Target::Vos,
+            space: vos_wire::SpaceId::NONE,
+            clock: vos_wire::WindowClock::DEFAULT,
+        })
+    };
+    let installs = vec![
+        install(InstanceId(8), credentials.derivation(&elf), &["registrar"]),
+        install(instance, derivation(&package("device"), &derived), &[]),
+    ];
+    for step in &node.batch(0, installs).steps {
+        ran_done(step);
+    }
     let mut kit = Testkit::new(AGENT);
     kit.install_for(Target::Vos, instance, &derived.actor, &kernels, &[])
         .unwrap();

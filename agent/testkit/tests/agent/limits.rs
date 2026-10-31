@@ -275,6 +275,43 @@ fn an_install_past_the_jam_limits_is_refused() {
     }
 }
 
+/// A device kernel declaring more gas than a kernel runs with on JAM (the
+/// device actor's `auth`, 50M) installs for JAM, in the agent on every host
+/// as in the model, and a JAM builder derives it: its gas bounds a
+/// device's run, which no node makes. Its `login` guard needs the
+/// credential actor, installed first.
+#[test]
+fn a_device_kernels_gas_is_not_held_to_jams_kernel_cap() {
+    let device = derived("device");
+    let auth = method(&device.actor, "auth");
+    let schema = vos_testkit::programs::schema(&device.actor);
+    let declared = schema.method(auth).and_then(|method| method.gas);
+    assert!(declared > JAM.kernel_gas(), "{declared:?}");
+    vos_jam::programs::derive(&package("device")).expect("a JAM builder derives it");
+    let elf = std::fs::read(vos_testkit::programs::credentials_elf()).unwrap();
+    let credentials = vos_pvm_compiler::derive(&elf).expect("derives");
+    for mut node in hosts() {
+        node.add(&credentials.actor);
+        let mut kit = Testkit::new(AGENT);
+        let (input, model) =
+            derived_install(&mut node, &mut kit, "device", InstanceId(2), Target::Jam);
+        assert_eq!(model, Ok(()));
+        let credentials = Input::Admin(Admin::Install {
+            instance: InstanceId(1),
+            derivation: credentials.derivation(&elf),
+            roles: vec![(b"registrar".to_vec(), MINTER)],
+            target: Target::Jam,
+            space: SpaceId::NONE,
+            clock: WindowClock::DEFAULT,
+        });
+        let inputs = vec![credentials, input];
+        for step in &node.batch(0, inputs).steps {
+            let outcome = &ran(step).outcome;
+            assert!(matches!(outcome, Outcome::Done(_)), "{outcome:?}");
+        }
+    }
+}
+
 /// An agent runs on one target, which its first install names: an install
 /// for another is refused, `Target`, its detail the agent's, and writes no
 /// record, on every host as in the model. A refused first install names
