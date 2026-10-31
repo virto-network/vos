@@ -80,16 +80,21 @@ pub enum Tag {
     Scope = 4,
     #[codec(index = 5)]
     Binding = 5,
+    /// A device kernel's io-hash's chain starts at `T(io)`
+    /// (`vos_pvm_precompiles::compute_device_io_hash`).
+    #[codec(index = 6)]
+    Io = 6,
 }
 
 impl Tag {
-    pub const ALL: [Tag; 6] = [
+    pub const ALL: [Tag; 7] = [
         Tag::Member,
         Tag::Owner,
         Tag::Leaf,
         Tag::Nf,
         Tag::Scope,
         Tag::Binding,
+        Tag::Io,
     ];
 
     pub const fn name(self) -> &'static str {
@@ -100,6 +105,7 @@ impl Tag {
             Tag::Nf => "nf",
             Tag::Scope => "scope",
             Tag::Binding => "binding",
+            Tag::Io => "io",
         }
     }
 
@@ -112,6 +118,7 @@ impl Tag {
             Tag::Nf => 0x4f1c_f1e3,
             Tag::Scope => 0x26eb_19bd,
             Tag::Binding => 0x3657_e11e,
+            Tag::Io => vos_pvm_precompiles::DEVICE_IO_TAG,
         }
     }
 
@@ -753,7 +760,8 @@ pub fn ring_key(actor: InstanceId) -> Vec<u8> {
 mod tests {
     use super::*;
 
-    /// The six tags' `t` are their names', distinct and nonzero.
+    /// The seven tags' `t` are their names', distinct and nonzero; `io`'s
+    /// is the device io-hash's.
     #[test]
     fn the_tags_are_pinned_distinct_and_nonzero() {
         let mut seen = Vec::new();
@@ -763,6 +771,8 @@ mod tests {
             assert!(!seen.contains(&tag.word()), "{}", tag.name());
             seen.push(tag.word());
         }
+        assert_eq!(seen.len(), 7);
+        assert_eq!(Tag::Io.word(), 0x7038_de5c);
         // The domain is a prefix of one BLAKE2b input.
         let joined = vos_pvm_precompiles::blake2b_hash::<32>(b"", &[b"vos/p2/leaf"]);
         assert_eq!(

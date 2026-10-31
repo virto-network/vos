@@ -79,18 +79,18 @@ pub fn compute_io_hash(public_args: &[u8], output: &[u8], roots: &[RootRead]) ->
 }
 
 /// A length's SCALE compact encoding, at most nine bytes.
-struct Compact {
+pub(crate) struct Compact {
     bytes: [u8; 9],
     len: usize,
 }
 
 impl Compact {
-    fn as_slice(&self) -> &[u8] {
+    pub(crate) fn as_slice(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
 }
 
-fn compact(value: u64) -> Compact {
+pub(crate) fn compact(value: u64) -> Compact {
     let mut bytes = [0u8; 9];
     let len = match value {
         0..=0x3f => {

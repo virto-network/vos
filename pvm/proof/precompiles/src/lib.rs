@@ -1,7 +1,8 @@
 //! Guest-side shims for vos-pvm-proof precompile ECALLs.
 //!
 //! The shim provides a streaming `blake2b_hash` (under the `blake2b`
-//! feature), a kernel's io-hash and the Poseidon2-M31 compression
+//! feature), a kernel's io-hash, a device kernel's over Poseidon2
+//! (`compute_device_io_hash`) and the Poseidon2-M31 compression
 //! (`poseidon2_compress`). On `target_arch = "riscv64"` (the guest target)
 //! each compression makes a precompile host call, which the prover's chips
 //! record, and computes in software when the host answers `WHAT`. On other
@@ -35,6 +36,12 @@ pub use blake2b::{
 
 pub mod io;
 pub use io::{RootKind, RootRead, UnknownRootKind, compute_io_hash};
+
+pub mod device_io;
+pub use device_io::{
+    DEVICE_IO_TAG, DeviceIoHasher, MAX_DEVICE_IO, Poseidon2Call, Poseidon2Software,
+    compute_device_io_hash, device_return_parts,
+};
 
 pub mod poseidon2;
 pub use poseidon2::{
