@@ -173,10 +173,12 @@ pub struct JointProof {
     pub proof: Vec<u8>,
 }
 
-/// The prover: its thread pool.
+/// The prover: its thread pool, its masks' source and its memory
+/// allowance.
 pub struct Prover {
-    pool: rayon::ThreadPool,
-    masks: MaskRng,
+    pub(crate) pool: rayon::ThreadPool,
+    pub(crate) masks: MaskRng,
+    pub(crate) max_memory: u64,
 }
 
 impl Prover {
@@ -189,6 +191,7 @@ impl Prover {
         Ok(Self {
             pool: thread_pool(&config.threads)?,
             masks: MaskRng::Os,
+            max_memory: config.max_memory,
         })
     }
 
@@ -378,11 +381,11 @@ pub fn verify_joint(proof: &JointProof, call: &Call, name: &[u8]) -> Result<(), 
 }
 
 /// Auth's public digests.
-struct AuthDigests {
-    map_root: Digest,
-    scope: Digest,
-    nullifier: Digest,
-    binding: Digest,
+pub(crate) struct AuthDigests {
+    pub(crate) map_root: Digest,
+    pub(crate) scope: Digest,
+    pub(crate) nullifier: Digest,
+    pub(crate) binding: Digest,
 }
 
 impl AuthDigests {
@@ -398,7 +401,7 @@ impl AuthDigests {
 
 /// Auth's public digests for `secret` at `witness`, the guard `name` and
 /// `call`, the binding under `program` and `kind`; the witness checked.
-fn auth_public(
+pub(crate) fn auth_public(
     secret: &DeviceSecret,
     witness: &AuthWitness,
     name: &[u8],

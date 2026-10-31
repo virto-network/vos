@@ -14,6 +14,11 @@
 //!   admitted nowhere. A [`Call`] names what a proof authorizes; the scope
 //!   and the binding are computed here, from it. [`verify`] checks a proof
 //!   against its call as ingress does.
+//! - **Device kernels** ([`DeviceProgram`], [`Prover::prove_kernel`]): a
+//!   kernel's run proved under the device profile, format 43, against the
+//!   program ingress computes from the same kernel; auth's statement by a
+//!   device kernel ([`Prover::prove_device_auth`], [`verify_device`]), which
+//!   a guard naming that kernel takes as it takes auth's credential proof.
 //! - **The wire** ([`mod@wire`]): the node-API requests a client sends for
 //!   its time, its path, the root and a credentialed call, and the answers
 //!   it decodes.
@@ -21,19 +26,22 @@
 //!   root moves and on a jittered timer, never because a proof is about to
 //!   be made; an answer that the root is unknown drops it.
 //!
-//! The format is the registry's credential format
-//! ([`vos_pvm_proof::format::CREDENTIAL_PROOF`]). No witness is logged, and
+//! The formats are the registry's credential format
+//! ([`vos_pvm_proof::format::CREDENTIAL_PROOF`]) and its device format
+//! ([`vos_pvm_proof::format::DEVICE_PROOF`]). No witness is logged, and
 //! its proofs' masks are the operating system's (a seeded stream exists
 //! only under the `seeded-masks` test seam, which no production build
 //! enables). `SECURITY.md` states what the secret is exposed to.
 
 mod call;
+mod kernel;
 mod path;
 mod prover;
 mod secret;
 pub mod wire;
 
 pub use call::{Call, NAME_BYTES, scope};
+pub use kernel::{DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, DeviceProof, verify_device};
 pub use path::PathKeeper;
 pub use prover::{
     CredentialProof, CredentialPublic, JointProof, JointPublic, PEAK_BYTES, Prover, ProverConfig,
@@ -43,7 +51,7 @@ pub use secret::{DeviceSecret, derive_secret, member, owner, source_input};
 
 use vos_wire::credentials::{self, P};
 
-/// The credential format's number, the registry's.
+/// The credential format's number, the registry's: a credential proof's.
 pub const FORMAT: u32 = vos_pvm_proof::format::CREDENTIAL_PROOF.number;
 
 const _: () = assert!(FORMAT == vos_pvm_final_verifier::credential::FORMAT);
