@@ -48,7 +48,8 @@ pub struct Cell {
     pub log_blowup: u32,
     pub queries: usize,
     pub pow: u32,
-    /// `log2 h`, when the cell names it; else the least power of two at
+    /// `log2 h`, when the cell names it (unchecked: the prover refuses an
+    /// `h` its columns' reveals do not fit); else the least power of two at
     /// least twice the rows a column reading two rows reveals.
     pub log_mask_rows: Option<u32>,
     pub channel: ChannelKind,

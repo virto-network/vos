@@ -144,7 +144,7 @@ impl<L: Lane> DeviceIoHasher<L> {
         }
         let mut blocks = bytes.chunks_exact(BLOCK);
         for block in &mut blocks {
-            self.absorb(block);
+            self.absorb(block.try_into().expect("a whole block"));
         }
         let rest = blocks.remainder();
         self.buf[..rest.len()].copy_from_slice(rest);
@@ -173,7 +173,7 @@ impl<L: Lane> DeviceIoHasher<L> {
 
     /// One block of 24 bytes into the chain.
     #[inline(always)]
-    fn absorb(&mut self, block: &[u8]) {
+    fn absorb(&mut self, block: &[u8; BLOCK]) {
         pack(&mut self.lane, block);
         L::compress(&mut self.lane);
     }
@@ -193,7 +193,7 @@ pub fn padded_device_io_words<L: Lane>(padded: &[u8], len: usize) -> Option<[u32
     let mut lane = [0u32; 16];
     lane[0] = DEVICE_IO_TAG;
     for block in padded.chunks_exact(BLOCK) {
-        pack(&mut lane, block);
+        pack(&mut lane, block.try_into().expect("a whole block"));
         L::compress(&mut lane);
     }
     lane[8] = len as u32;
@@ -205,48 +205,48 @@ pub fn padded_device_io_words<L: Lane>(padded: &[u8], len: usize) -> Option<[u32
 }
 
 /// A block of 24 bytes as the lane's second half: eight words of three
-/// little-endian bytes. On the guest, one four-byte load a word, which the
-/// PVM serves at any address (the target's own unaligned reads go byte by
-/// byte).
+/// little-endian bytes, each the low three bytes of the four at its offset
+/// (the last word the high three of the four at 20).
 #[inline(always)]
-fn pack(lane: &mut [u32; 16], block: &[u8]) {
-    #[cfg(target_arch = "riscv64")]
-    {
-        assert!(block.len() == BLOCK);
-        let at = block.as_ptr();
-        // SAFETY: each load reads four of the block's 24 bytes.
-        unsafe {
-            for (j, word) in lane[8..15].iter_mut().enumerate() {
-                *word = load_u32(at.add(3 * j)) & 0x00ff_ffff;
-            }
-            lane[15] = load_u32(at.add(20)) >> 8;
+fn pack(lane: &mut [u32; 16], block: &[u8; BLOCK]) {
+    let at = block.as_ptr();
+    // SAFETY: each load reads four of the block's 24 bytes.
+    unsafe {
+        for (j, word) in lane[8..15].iter_mut().enumerate() {
+            *word = load_u32(at.add(3 * j)) & 0x00ff_ffff;
         }
-    }
-    #[cfg(not(target_arch = "riscv64"))]
-    for (word, bytes) in lane[8..].iter_mut().zip(block.chunks_exact(3)) {
-        *word = u32::from(bytes[0]) | u32::from(bytes[1]) << 8 | u32::from(bytes[2]) << 16;
+        lane[15] = load_u32(at.add(20)) >> 8;
     }
 }
 
-/// The four bytes at `at`, any alignment, little-endian, in one load.
+/// The four bytes at `at`, any alignment, little-endian: on the guest in
+/// one load, which the PVM serves at any address (the target's own
+/// unaligned reads go byte by byte).
 ///
 /// # Safety
 ///
 /// `at` must point at four readable bytes.
-#[cfg(target_arch = "riscv64")]
 #[inline(always)]
 unsafe fn load_u32(at: *const u8) -> u32 {
-    let word: u64;
-    // SAFETY: the caller's contract; the load touches nothing else.
-    unsafe {
-        core::arch::asm!(
-            "lwu {word}, 0({at})",
-            word = out(reg) word,
-            at = in(reg) at,
-            options(nostack, readonly, preserves_flags),
-        );
+    #[cfg(target_arch = "riscv64")]
+    {
+        let word: u64;
+        // SAFETY: the caller's contract; the load touches nothing else.
+        unsafe {
+            core::arch::asm!(
+                "lwu {word}, 0({at})",
+                word = out(reg) word,
+                at = in(reg) at,
+                options(nostack, readonly, preserves_flags),
+            );
+        }
+        word as u32
     }
-    word as u32
+    #[cfg(not(target_arch = "riscv64"))]
+    // SAFETY: the caller's contract.
+    unsafe {
+        u32::from_le_bytes(core::ptr::read_unaligned(at.cast()))
+    }
 }
 
 /// A device kernel's io-hash over its statement's parts, as

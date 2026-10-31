@@ -1,14 +1,14 @@
 #!/bin/sh
 # p6.sh <vos-phone-timing> <vos-phone-timing-a720> <before> <lean> <out.txt>:
-# session P6 on the gate phone (slice 7's 7.17c), over adb: the cheap
-# margin before the CPU split, each lever against the baseline at the pin
-# (blowup 4, 47 queries, PoW 16, Blake2s-M31, masked).
+# the device kernel's cheap levers on the gate phone, over adb (P6_SERIAL,
+# the gate phone's by default), each against the baseline at format 43's
+# parameters (blowup 4, 47 queries, PoW 16, Blake2s-M31, masked).
 #
 # - <vos-phone-timing>: `tools/phone/build.sh`'s timing build (mimalloc);
 #   <vos-phone-timing-a720>: the same built with `-C target-cpu=cortex-a720`;
-# - <before>: the device kernel as main has it (2,860 steps, the CPU at
-#   2^12 rows), `p2.kernel` and `p2.input`; <lean>: the kernel moving
-#   words (1,722 steps, the CPU at its floor 2^11), the same input.
+# - <before>: the baseline device kernel, `p2.kernel` and `p2.input`;
+#   <lean>: the kernel moving words (the CPU at its floor, 2^11 rows), the
+#   same input.
 #
 # Three rounds, each interleaving seven runs of 5 proofs after a warm-up,
 # every proof verified on the phone:
@@ -60,6 +60,7 @@ cleanup() {
   $a shell ls $dir 2>&1 || true
 }
 trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
 {
   $a shell getprop ro.product.model; $a shell getprop ro.build.fingerprint; $a shell uptime
   start=$($a shell "date '+%m-%d %H:%M:%S.000'" | tr -d '\r')

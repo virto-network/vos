@@ -106,6 +106,7 @@ impl DeviceReturn {
         // where it lies; the host reads `E` alone.
         let len = bytes.len() - start;
         bytes.resize(start + len.div_ceil(BLOCK) * BLOCK, 0);
+        // The resize may move the bytes: every address below is taken after it.
         let words = vos_pvm_precompiles::device_io::padded_device_io_words::<
             vos_pvm_precompiles::Poseidon2Call,
         >(&bytes[start..], len)

@@ -1,10 +1,10 @@
 #!/bin/sh
 # x86-margin.sh <vos-phone-seeded> <vos-phone-seeded-mimalloc> <before> <lean>
-# <out.jsonl>: 7.17c's x86 bench of the cheap levers at the pin (blowup 4,
+# <out.jsonl>: the device kernel's cheap levers on x86 at format 43's (blowup 4,
 # 47 queries, PoW 16, Blake2s-M31), the seeded builds (every proof's masks
 # from one seed, so a lever that moves no byte gives the same proof):
 # - three rounds interleaving, on four P-cores, 5 reps after a warm-up:
-#   the kernel as main has it (<before>) and the one moving words (<lean>),
+#   the baseline kernel (<before>) and the one moving words (<lean>),
 #   glibc's allocator against mimalloc's, mimalloc never purging;
 # - on four P-cores and four E-cores, the lean kernel: automatic threads
 #   (both classes kept, unpinned), the eight pinned, the P-cores alone
