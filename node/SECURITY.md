@@ -47,12 +47,14 @@ frame checks and the agent's placement come first, as for any call):
    `SpaceId`, and no proof may bind `NONE`;
 5. the format is one this node admits for a credential (`Format`): the
    credential format the proof registry names, as the final verifier pins
-   it; a device proof's is refused until a device kernel is admitted;
-6. the proof within its format's cap (512 KiB), the arguments within
-   `cap::REQUEST` (`Size`);
+   it, and the device format, 43;
+6. the proof within its format's cap (512 KiB for a credential proof,
+   1.5 MiB for a device proof), the arguments within `cap::REQUEST`
+   (`Size`);
 7. `now ≤ expires_ms ≤ now + 120 s` by the node's clock (`Expiry`);
 8. the method exists and carries a credential guard (`Method`);
-9. the statement's kind is the guard's (`Kind`);
+9. the statement's kind is the guard's (`Kind`); a device proof needs an
+   auth guard naming a device kernel whose program this node holds;
 10. for auth, the scope is the one the guard's name gives in this space,
     agent and instance (`Scope`);
 11. the binding is this request's (`Binding`): its space, agent,
@@ -78,6 +80,20 @@ frame checks and the agent's placement come first, as for any call):
 Ingress calls the final verifier's `credential::verify`, which picks the
 circuit by kind, never the circuit-generic step beneath it, which takes
 any preprocessed root.
+
+**A device proof** (format 43, `slice-7-mobile.md` pin J) authorizes as
+an auth credential proof does, and only for a method whose auth guard
+names a device kernel. Its program (the kernel's chips, their log sizes
+and the preprocessed root) is the one this node computes from the
+installed kernel by a run on auth's public reference statement
+(`vos_pvm_recair::device::Program::auth`), never one a request names: the
+leader computes it at the install, which fails for a kernel that does not
+run that statement within the format's shape, and a replica that did not
+install computes it at the first device proof naming the kernel, on an
+executor, then keeps it, a failure too, so a kernel costs one computation
+(about 0.2 s) a replica however many requests name it. The binding names
+the program's id; the io-hash is `H_io` of the request's auth words,
+computed here, so the proof's bytes carry no statement of their own.
 
 ## At apply
 

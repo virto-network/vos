@@ -11,12 +11,22 @@
 //! bounds the node's work is its connections and its verification budget
 //! ([`crate::node::Config::verifications`]), past which a call is answered
 //! `Busy` before its proof is decoded.
+//!
+//! **A device proof** (format 43, `slice-7-mobile.md` pin J) authorizes as
+//! an auth credential proof does, for a method whose auth guard names a
+//! device kernel: its program is the one this node computes from the
+//! installed kernel ([`vos_pvm_recair::device::Program::auth`], kept per
+//! kernel), its io-hash the Poseidon2 `H_io` of the request's auth words,
+//! and the binding names that program's id. A guard that names no device
+//! kernel takes no device proof (`Kind`).
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use vos_pvm_final_verifier::credential::{self as verifier, CredentialKind};
+use vos_pvm_recair::device::{self as device, Program};
 use vos_wire::abi::cap;
 use vos_wire::batch::CredentialedInput;
 use vos_wire::credentials::{self, Bound, Ring};
@@ -25,18 +35,39 @@ use vos_wire::ingress::{CredentialPublic, CredentialRefusal, Credentialed, Rejec
 use vos_wire::keys;
 use vos_wire::records::{Installed, unstored};
 use vos_wire::schema::CredentialGuard;
-use vos_wire::{Decode, SpaceId, defaults};
+use vos_wire::{Decode, Encode, SpaceId, defaults};
 
 use crate::calls::Forwardable;
 use crate::fault::{Fault, read};
+use crate::lock;
 use crate::node::Inner;
 use crate::store::Snapshot;
 
 /// The proof formats ingress admits for a credential, each with its
 /// proof's cap: the credential format the proof registry names, as the
-/// final verifier pins it. A device proof's (1.5 MiB) joins it once a
-/// device kernel is admitted.
-const ADMITTED: [(u32, usize); 1] = [(verifier::FORMAT, verifier::MAX_PROOF_BYTES)];
+/// final verifier pins it, and the device format.
+const ADMITTED: [(u32, usize); 2] = [
+    (verifier::FORMAT, verifier::MAX_PROOF_BYTES),
+    (device::FORMAT.number, device::MAX_PROOF_BYTES),
+];
+
+/// The device programs this node computed, by their kernel's program
+/// hash: `None` for a kernel whose program could not be computed (it does
+/// not run auth's reference, or its run is past the device format's
+/// shape), so a request naming it costs no second attempt.
+#[derive(Default)]
+pub(crate) struct DevicePrograms(Mutex<HashMap<[u8; 32], Option<Arc<Program>>>>);
+
+impl DevicePrograms {
+    /// Keeps `programs`, each by its kernel's program hash: an install's,
+    /// computed before its entry is queued.
+    pub(crate) fn pin(&self, programs: Vec<([u8; 32], Arc<Program>)>) {
+        let mut held = lock(&self.0);
+        for (kernel, program) in programs {
+            held.insert(kernel, Some(program));
+        }
+    }
+}
 
 /// A verification's place among those in flight, given back when the
 /// verification ends, however it ends: it goes with the executor's job, so
@@ -65,10 +96,41 @@ impl Drop for Verifying {
 /// A credentialed call that passed every check but the proof's: what the
 /// verifier takes, and the input the log carries once it verifies.
 struct Checked {
-    kind: CredentialKind,
-    words: Option<Vec<u32>>,
+    statement: Statement,
     proof: Vec<u8>,
     input: CredentialedInput,
+}
+
+/// What a proof is verified against.
+enum Statement {
+    /// A credential proof of `kind` stating `words`; `None` when a word is
+    /// at or above `p`, which proves nothing.
+    Credential {
+        kind: CredentialKind,
+        words: Option<Vec<u32>>,
+    },
+    /// A device proof of `program` stating the io-hash `io`.
+    Device { program: Arc<Program>, io: [u8; 32] },
+}
+
+impl Statement {
+    /// Whether the proof in `bytes` proves it.
+    fn verify(&self, bytes: &[u8]) -> bool {
+        match self {
+            Statement::Credential {
+                kind,
+                words: Some(words),
+            } => verifier::verify_bytes(*kind, words, bytes).is_ok(),
+            Statement::Credential { words: None, .. } => false,
+            Statement::Device { program, io } => program.verify(io, bytes).is_ok(),
+        }
+    }
+
+    /// Whether it can be proven at all: no verification is spent on one
+    /// that cannot.
+    fn provable(&self) -> bool {
+        !matches!(self, Statement::Credential { words: None, .. })
+    }
 }
 
 /// Why a check refused: a code, or the node could not read its state.
@@ -119,20 +181,20 @@ impl Inner {
             Ok(run) => run,
             Err(error) => return error.into(),
         };
-        let checked = match self.check(agent, call) {
+        let program = self.device_program(agent, &call).await;
+        let checked = match self.check(agent, call, program) {
             Ok(checked) => checked,
             Err(refused) => return refused.into(),
         };
         let Checked {
-            kind,
-            words,
+            statement,
             proof,
             input,
         } = checked;
         // A word at or above p proves nothing: no verification is spent.
-        let Some(words) = words else {
+        if !statement.provable() {
             return Response::Rejected(Rejection::Credential(CredentialRefusal::Proof));
-        };
+        }
         let Some(place) = Verifying::take(&self.calls.verifying, self.settings.verifications)
         else {
             return Response::Busy;
@@ -143,7 +205,7 @@ impl Inner {
             .offload(move || {
                 let started = Instant::now();
                 stats.credential_queue.took(started - queued);
-                let verified = verifier::verify_bytes(kind, &words, &proof).is_ok();
+                let verified = statement.verify(&proof);
                 stats.credential.took(started.elapsed());
                 drop((place, proof, large));
                 verified
@@ -167,9 +229,47 @@ impl Inner {
         }
     }
 
+    /// The device program of the kernel `call`'s guard names, for a device
+    /// proof: computed on an executor from the installed kernel the first
+    /// time, then kept. `None` for any other call, or when the method, its
+    /// guard, the kernel or its program is missing, which [`Inner::check`]
+    /// refuses in its order.
+    async fn device_program(&self, agent: AgentId, call: &Credentialed) -> Option<Arc<Program>> {
+        if call.format != device::FORMAT.number {
+            return None;
+        }
+        let snapshot = self.store.snapshot();
+        let installed = installed(&snapshot, agent, call.instance).ok()??;
+        let Some(CredentialGuard::Auth {
+            device: Some(name), ..
+        }) = installed.schema.method(call.method)?.credential.as_deref()
+        else {
+            return None;
+        };
+        let method = installed
+            .schema
+            .method_id(core::str::from_utf8(name).ok()?)?;
+        let kernel = installed.kernel(method)?.0;
+        if let Some(program) = lock(&self.calls.devices.0).get(&kernel) {
+            return program.clone();
+        }
+        let blob = self.blobs.get(&kernel).ok()??;
+        let program = self
+            .offload(move || Program::auth(&blob).ok().map(Arc::new))
+            .await?;
+        lock(&self.calls.devices.0).insert(kernel, program.clone());
+        program
+    }
+
     /// Every check of `call` but the proof's, in order, on this replica's
-    /// applied state.
-    fn check(&self, agent: AgentId, call: Credentialed) -> Result<Checked, Refused> {
+    /// applied state; `device` the program a device proof is verified
+    /// against ([`Inner::device_program`]).
+    fn check(
+        &self,
+        agent: AgentId,
+        call: Credentialed,
+        device: Option<Arc<Program>>,
+    ) -> Result<Checked, Refused> {
         let snapshot = self.store.snapshot();
         let space = read::<SpaceId>(&snapshot, agent, &keys::space())?
             .filter(|space| *space != SpaceId::NONE)
@@ -191,6 +291,18 @@ impl Inner {
             (CredentialGuard::Owner, CredentialPublic::Owner { .. }) => CredentialKind::Owner,
             _ => return Err(CredentialRefusal::Kind.into()),
         };
+        // A device proof answers only a guard naming a device kernel whose
+        // program this node holds.
+        let device = match (call.format == device::FORMAT.number, &guard) {
+            (false, _) => None,
+            (
+                true,
+                CredentialGuard::Auth {
+                    device: Some(_), ..
+                },
+            ) => Some(device.ok_or(CredentialRefusal::Kind)?),
+            (true, _) => return Err(CredentialRefusal::Kind.into()),
+        };
         if let (CredentialGuard::Auth { name, .. }, CredentialPublic::Auth { scope, .. }) =
             (&guard, &call.public)
             && credentials::scope(&space, agent, call.instance, name) != *scope
@@ -202,7 +314,9 @@ impl Inner {
             agent,
             instance: call.instance,
             method: call.method,
-            program: verifier::program(kind),
+            program: device
+                .as_ref()
+                .map_or(verifier::program(kind), |program| program.id()),
             kind: call.public.kind(),
             arguments: &call.arguments,
             nonce: &call.nonce,
@@ -235,9 +349,19 @@ impl Inner {
             }
             CredentialPublic::Owner { .. } => None,
         };
+        let statement = match device {
+            // An auth statement's 129 bytes are far under `H_io`'s bound.
+            Some(program) => Statement::Device {
+                io: device::auth_io(&call.public.encode()).ok_or(CredentialRefusal::Proof)?,
+                program,
+            },
+            None => Statement::Credential {
+                kind,
+                words: call.public.words(),
+            },
+        };
         Ok(Checked {
-            kind,
-            words: call.public.words(),
+            statement,
             proof: call.proof,
             input: CredentialedInput {
                 origin: call.public.origin(),
@@ -260,10 +384,7 @@ fn guard(
     instance: InstanceId,
     call: &Credentialed,
 ) -> Result<CredentialGuard, Refused> {
-    let installed = snapshot
-        .get(agent, &keys::installed(instance))?
-        .and_then(|bytes| Installed::decode_exact(unstored(&bytes)?));
-    installed
+    installed(snapshot, agent, instance)?
         .and_then(|installed| {
             installed
                 .schema
@@ -273,6 +394,17 @@ fn guard(
                 .cloned()
         })
         .ok_or(CredentialRefusal::Method.into())
+}
+
+/// The installed record of `instance`, if it has one.
+fn installed(
+    snapshot: &Snapshot,
+    agent: AgentId,
+    instance: InstanceId,
+) -> Result<Option<Installed>, Fault> {
+    Ok(snapshot
+        .get(agent, &keys::installed(instance))?
+        .and_then(|bytes| Installed::decode_exact(unstored(&bytes)?)))
 }
 
 /// That `root` is in the credential actor's ring and fresh by this

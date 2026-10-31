@@ -382,8 +382,9 @@ fn done(answer: &Response) -> &[u8] {
 /// Each check refuses in its order: a request failing every check from
 /// one on is refused by that one's code, then mended one check at a time.
 /// The frame's size and its decode first, then the agent and its space,
-/// the format (a 1.4 MiB device proof's within the frame, refused until a
-/// device kernel is admitted), the size (a 600 KiB credential proof), the
+/// the format (a retired one's), the size (a 1.4 MiB body within the frame
+/// and the device format's size, past the credential format's; a 600 KiB
+/// credential proof), the
 /// expiry, the method's guard, the kind, the scope, the binding, a
 /// recorded binding digest, an admitted nullifier, an unknown root, and
 /// the proof. A verified call runs, as its origin.
@@ -446,7 +447,7 @@ fn every_ingress_refusal_comes_in_its_check_order() {
     };
     let mut call = Credentialed {
         method: founded.method(POLL, "tally"),
-        format: 43,
+        format: 42,
         proof: vec![7; 1_400 << 10],
         expires_ms: real.expires_ms + 600_000,
         public: CredentialPublic::Owner {
@@ -462,7 +463,13 @@ fn every_ingress_refusal_comes_in_its_check_order() {
         (CredentialRefusal::Expiry { .. }, CredentialRefusal::Expiry { .. }) => {}
         (answer, code) => assert_eq!(answer, code, "{what}"),
     };
-    check(&call, CredentialRefusal::Format, "a device proof's format");
+    check(&call, CredentialRefusal::Format, "a retired format");
+    call.format = vos_pvm_recair::device::FORMAT.number;
+    check(
+        &call,
+        CredentialRefusal::Expiry { now: 0 },
+        "1.4 MiB under the device format, within its size",
+    );
     call.format = verifier::FORMAT;
     check(
         &call,
@@ -997,4 +1004,182 @@ fn the_device_librarys_proofs_are_admitted() {
     );
     let balance: Option<u64> = founded.read(PURSES, "balance", b"shop".to_vec());
     assert_eq!(balance, Some(70));
+}
+
+const DEVICE: InstanceId = InstanceId(4);
+
+/// A device proof signs in as an auth credential proof does (pin J): the
+/// device actor installed beside the founded space's, its `login` guard
+/// naming its device kernel `auth`; the device library proves the kernel
+/// as a phone proves it (`prove_device_auth`, format 43, the program
+/// computed from the kernel as ingress computes it), and a follower's
+/// ingress, which computes the program the first time, and the leader's,
+/// which pinned it at the install, admit it: the call runs as the
+/// member's pseudonym, the same as a credential proof's in that scope, and
+/// is `Replayed` sent again. Refused: a device proof to a guard naming no
+/// device kernel (`Kind`); one sent as a credential proof (`Size`) and a
+/// credential proof sent as a device proof (its binding names its
+/// circuit, not the device program: `Binding`); a device proof stating
+/// another nullifier and one cut by a byte (`Proof`).
+#[test]
+fn a_device_kernels_proof_signs_in_as_an_auth_proof_does() {
+    use vos_device::wire::{self, Answer};
+    use vos_device::{
+        Call, DEVICE_FORMAT, DEVICE_PEAK_BYTES, DeviceProgram, Prover, ProverConfig, Threads,
+    };
+
+    let founded = Founded::new();
+    let agent = founded.agent;
+    install(
+        &founded.cluster,
+        agent,
+        DEVICE,
+        &std::fs::read(actor_elf("device")).unwrap(),
+        "operator",
+    );
+    let device = actor("device");
+    let login = method(&device, "login");
+    let at = founded.follower();
+    let leader = founded.cluster.leader(agent).unwrap();
+    let secret = vos_device::derive_secret(&[0x6d; 32], &[0x42; 32]);
+    founded.write(
+        CREDENTIALS,
+        "enroll",
+        vos_device::member(&secret).to_bytes(),
+    );
+    let time = || client::time(founded.cluster.target(at)).unwrap();
+    let identity = founded.operator.lock().unwrap().identity(agent).unwrap();
+    let query = wire::path_query(
+        agent.0,
+        &identity,
+        CREDENTIALS.0,
+        &vos_device::member(&secret),
+        time() + 60_000,
+    )
+    .unwrap();
+    let witness = wire::path_answer(&device_send(&founded, at, &query))
+        .unwrap()
+        .expect("an enrolled member's path");
+    let prover = Prover::new(ProverConfig {
+        threads: Threads::Count(4),
+        max_memory: DEVICE_PEAK_BYTES,
+    })
+    .unwrap();
+    let kernel = vos_testkit::programs::kernel("device", "auth");
+    let program = DeviceProgram::auth(&kernel).unwrap();
+    let call = |instance: InstanceId, method: MethodId| {
+        Call::new(
+            founded.space.0,
+            agent.0,
+            instance.0,
+            method.0,
+            ().encode(),
+            time() + 60_000,
+        )
+        .unwrap()
+    };
+    let name = b"login";
+    let send = |at: NodeNumber, call: &Call, proof: &vos_device::CredentialProof| {
+        wire::credentialed_answer(&device_send(&founded, at, &wire::credentialed(call, proof)))
+            .unwrap()
+    };
+    let pseudonym = |answer: Answer| match answer {
+        Answer::Ran {
+            outcome: Outcome::Done(reply),
+            ..
+        } => Option::<[u8; 32]>::decode_exact(&reply).unwrap(),
+        other => panic!("not run: {other:?}"),
+    };
+
+    let signin = call(DEVICE, login);
+    let proof = prover
+        .prove_device_auth(&secret, &witness, name, &signin, &program)
+        .unwrap();
+    assert_eq!(proof.format, DEVICE_FORMAT);
+    vos_device::verify_device(&proof, &signin, name, &program).unwrap();
+    let vos_device::CredentialPublic::Auth { nullifier, .. } = proof.public else {
+        unreachable!()
+    };
+    assert_eq!(
+        pseudonym(send(at, &signin, &proof)),
+        Some(nullifier.to_bytes())
+    );
+    assert_eq!(
+        send(leader, &signin, &proof),
+        Answer::Refused(CredentialRefusal::Replayed)
+    );
+
+    // The leader, which pinned the program at the install, admits another.
+    let again = call(DEVICE, login);
+    let proof = prover
+        .prove_device_auth(&secret, &witness, name, &again, &program)
+        .unwrap();
+    assert_eq!(
+        pseudonym(send(leader, &again, &proof)),
+        Some(nullifier.to_bytes())
+    );
+
+    // A credential proof to the same guard: the same pseudonym.
+    let credential = call(DEVICE, login);
+    let proved = prover
+        .prove_auth(&secret, &witness, name, &credential)
+        .unwrap();
+    assert_eq!(
+        pseudonym(send(at, &credential, &proved)),
+        Some(nullifier.to_bytes())
+    );
+
+    // Refused.
+    let poll = call(POLL, founded.method(POLL, "login"));
+    let proof = prover
+        .prove_device_auth(&secret, &witness, name, &poll, &program)
+        .unwrap();
+    assert_eq!(
+        send(at, &poll, &proof),
+        Answer::Refused(CredentialRefusal::Kind),
+        "a guard naming no device kernel"
+    );
+    let fresh = call(DEVICE, login);
+    let proof = prover
+        .prove_device_auth(&secret, &witness, name, &fresh, &program)
+        .unwrap();
+    let as_credential = vos_device::CredentialProof {
+        format: verifier::FORMAT,
+        ..proof.clone()
+    };
+    assert_eq!(
+        send(at, &fresh, &as_credential),
+        Answer::Refused(CredentialRefusal::Size),
+        "a device proof's bytes past the credential format's"
+    );
+    let credential = call(DEVICE, login);
+    let proved = prover
+        .prove_auth(&secret, &witness, name, &credential)
+        .unwrap();
+    let as_device = vos_device::CredentialProof {
+        format: DEVICE_FORMAT,
+        ..proved
+    };
+    assert_eq!(
+        send(at, &credential, &as_device),
+        Answer::Refused(CredentialRefusal::Binding),
+        "a credential proof's binding names its circuit, not the device program"
+    );
+    let mut other = proof.clone();
+    let vos_device::CredentialPublic::Auth { nullifier, .. } = &mut other.public else {
+        unreachable!()
+    };
+    nullifier.0[0] ^= 1;
+    assert_eq!(
+        send(at, &fresh, &other),
+        Answer::Refused(CredentialRefusal::Proof),
+        "another io-hash"
+    );
+    let mut cut = proof.clone();
+    cut.proof.pop();
+    assert_eq!(
+        send(at, &fresh, &cut),
+        Answer::Refused(CredentialRefusal::Proof)
+    );
+    assert!(matches!(send(at, &fresh, &proof), Answer::Ran { .. }));
 }

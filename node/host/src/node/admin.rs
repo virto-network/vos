@@ -275,17 +275,25 @@ impl Inner {
                     Ok(ProgramHash(hash.0))
                 };
                 let derivation = derived.derivation(&elf);
+                let guarded = guarded_devices(&derived.schema);
                 pooled(derived.actor)?;
-                for (_, kernel) in derived.kernels {
-                    pooled(kernel)?;
+                let mut devices = Vec::new();
+                for (method, kernel) in derived.kernels {
+                    let program = match guarded.contains(&method) {
+                        true => Some(device_program(method, &kernel)?),
+                        false => None,
+                    };
+                    let hash = pooled(kernel)?;
+                    devices.extend(program.map(|program| (hash.0, program)));
                 }
-                Ok((derivation, stored))
+                Ok((derivation, stored, devices))
             })
             .await
             .map_err(|panicked| {
                 CallError::Failed(format!("deriving and storing the package: {}", panicked.0))
             })?;
-        let (derivation, stored) = pooled?;
+        let (derivation, stored, devices) = pooled?;
+        self.calls.devices.pin(devices);
         // Stored, a blob is kept by its age until the entry names it; the
         // apply then pins it.
         let mut references = Vec::with_capacity(stored.len());
@@ -348,4 +356,41 @@ impl Inner {
         )?;
         self.admin_answer(reply).await
     }
+}
+
+/// The methods of the schema in `section` an auth guard names as its device
+/// kernel: the kernels whose device programs ingress verifies against.
+fn guarded_devices(section: &[u8]) -> Vec<u32> {
+    use vos_wire::schema::{CredentialGuard, Schema};
+    let Ok(schema) = Schema::read(section) else {
+        return Vec::new();
+    };
+    schema
+        .methods
+        .iter()
+        .filter_map(|method| match method.credential.as_deref() {
+            Some(CredentialGuard::Auth {
+                device: Some(name), ..
+            }) => schema.method_id(core::str::from_utf8(name).ok()?),
+            _ => None,
+        })
+        .map(|id| id.0)
+        .collect()
+}
+
+/// Device kernel `kernel`'s program under the device format, as ingress
+/// verifies a device proof against it: refused, failing the install, when
+/// the kernel does not run auth's reference statement or its run is past
+/// the format's shape.
+fn device_program(
+    method: u32,
+    kernel: &[u8],
+) -> Result<std::sync::Arc<vos_pvm_recair::device::Program>, CallError> {
+    vos_pvm_recair::device::Program::auth(kernel)
+        .map(std::sync::Arc::new)
+        .map_err(|error| {
+            CallError::Failed(format!(
+                "device kernel {method:#010x}: no program under the device format: {error}"
+            ))
+        })
 }
