@@ -2615,6 +2615,151 @@ hit the flaky checker test above), `just test-proof` green at `8a93e17f`
 `ff3567cb` the review's folds, `7ebe7e3c` P4 in 7.16's section; formatting
 commits; this record and the runs.
 
+## Step 7.17b: lever 1, the device io-hash through Poseidon2
+
+Branch `s7/7.17b`, from vos-core `ef11d4e2`. Fable checked 7.17's note
+("sound with listed changes"); each change is folded into `proving.md` §8
+(*The device io-hash `H_io`*, now built but for ingress's check, 7.20's)
+and into the code.
+
+**Built:**
+- **`H_io`** (`vos_pvm_precompiles::device_io`): `DeviceIoHasher`, a
+  streaming hasher (the chain's state and the block in one lane of 16
+  words, a 24-byte buffer, the length so far) over a compression `Lane`:
+  `Poseidon2Call`, the `0x402` call issued directly (a host that does not
+  serve it traps; no software permutation linked in a kernel), or
+  `Poseidon2Software`; `compute_device_io_hash(a, o, R) -> Option<[u8;
+  32]>`, `None` at 2^24 bytes or more; `device_return_parts`, a device
+  return read back (canonical compacts, no root, nothing after).
+  `t_io = 0x7038_de5c` pinned (`DEVICE_IO_TAG`, `Tag::Io`, `Tag::ALL`
+  seven, the tag test extended). Tests: the chain by hand over every split
+  of the bytes, auth's 133 bytes, distinctness, the oversize refusal.
+- **`#[attestable(device)]`**: `DEVICE = 1 << 33` in the method word, the
+  schema's `Kind::Device` (index 6); no `&self`, not `venue_bound`, the
+  flag once; no `AttestableMethod`, so a workflow's attest of one does not
+  compile; an auth guard's `device = "..."` must name one of the actor's
+  (the macro; then the derivation on the marks). Its end,
+  `vos_sdk::device::DeviceReturn`: the parts written once into one buffer
+  with four bytes of room before each part's length, the lengths written
+  into their room, the output's gap closed, the root count 0 pushed, `H_io`
+  absorbed in place, and `E` itself returned (not `KernelReturn`'s codec,
+  whose lengths are four bytes: `KernelReturn::from_device_return` reads a
+  device return back). A device kernel always returns its parts; an end
+  whose output was begun twice, or never, traps.
+- **The derivation**: admits `0x402` only in a marked kernel and refuses
+  `0x400` there (`DeriveError::DeviceBlake2b`, the chain named); refuses a
+  mark its schema kind contradicts, a `Device` method of no entry and a
+  guard naming no marked method; names the device kernels
+  (`Derived::devices`); records a device kernel's node shape unproved and
+  not held to the recursion's leaves. Node kernels keep `is_kernel_call`
+  (BLAKE2b, the witness input); `is_device_kernel_call` is the Poseidon2
+  call and the witness input.
+- **No node attests one**: the agent and the model refuse `Attest` of a
+  `Device` method with `Unknown` before the kernel runs (`AttestAt` takes
+  `Reading` alone already). The testkit's `run_device_kernel` serves
+  `0x402` (and refuses BLAKE2b's), `device_parts` checks a return against
+  `H_io`.
+- **The `device` test actor**: 7.17's lean auth kernel (`InPlace`, the
+  lane walk, the tags as `Tag::word()` constants) as `#[attestable(device)]`
+  `auth`, and `attest_raw`, a command asking for an attest. Gates:
+  `device_kernel::a_device_kernels_shape_holds_no_blake2b` (its device
+  chips hold neither BLAKE2b nor the AND table, hold Poseidon2's; its trace
+  returns auth's 129 public bytes framed and leaves `H_io`),
+  `a_device_kernel_states_its_parts_under_the_poseidon2_io_hash` (the mark,
+  the kind, 36 + 7 calls, a node's runner traps it, a stranger traps),
+  `a_device_kernels_method_is_never_attested` (agent and model), the
+  derivation's unit gates (the calls; the marks against the kinds, the
+  entries and the guards), five compile-fail cases and one that compiles
+  (a guard naming a device kernel).
+- **The spike**: `auth_p2` is `#[attestable(device)]`; the patch no longer
+  admits `0x402` in every kernel (the derivation does, in device kernels);
+  `scripts/x86-device-io.sh`.
+
+**Nothing of the node moved:** `constants::` passes unchanged, and every
+test actor's kernels derive byte for byte as at `ef11d4e2` (each derived
+at both commits from this checkout and compared), the actors' ELFs too:
+`blobs.lock` gains the `device` actor alone. Two first cuts moved them:
+the device end inside `vos_sdk::runtime` shifted the window kernel's
+code, and as non-generic SDK functions its methods reordered the SDK's
+own `RawVec` growth among the node kernels' functions (`reader`'s kernels,
+`ledger`'s); `#[inline]` keeps its code in the device kernel's crate.
+
+**x86** [measured, `runs/x86-device-io.jsonl` (the kernel at 2,854
+steps) and `runs/x86-device-io-folded.jsonl` (after the review's folds,
+2,860); 7.17's `vos-phone` (its prover is this branch's), the pin (blowup
+4, 47 queries, PoW 16, Blake2s-M31), 4 threads pinned to P-cores 1, 3, 6,
+8, 5 reps after a warm-up, three interleaved rounds each; load 4.1–5.7
+(another agent's scale run), so the baseline measured 1.17–1.20 s against
+7.17's quiet 1.01 s]:
+
+| kernel | steps | columns | cells | prove p50 / p95 | peak | bytes | verify |
+|---|---|---|---|---|---|---|---|
+| 7.17's lean (BLAKE2b io-hash), these sessions | 5,665 | 6,351 | 44.9M | 1.17–1.20 / 1.17–1.23 s | 1,556–1,589 MiB | 1,819,837–1,832,566 | 32–35 ms |
+| 7.17's record (quiet) | 5,665 | 6,351 | 44.9M | 1.01 / 1.03 s | 1,548–1,557 MiB | 1,818,328 | 23–29 ms |
+| **device (`H_io`)** | **2,860** | **3,203** | **19.7M** | **0.44–0.49 / 0.46–0.65 s** | **575–585 MiB** | **971,712–984,283** | 16–20 ms |
+| the spike's `auth_p2`, device | 2,854 | 3,203 | 19.7M | 0.45 / 0.45 s | 581 MiB | 978,455 | 17 ms |
+| 7.17's lean, `Auto` on 4 P + 4 E | 5,665 | | | 0.95–1.05 / 0.96–1.10 s | 1,589–1,605 MiB | 1,832,406–1,834,640 | |
+| **device, `Auto` on 4 P + 4 E** | 2,860 | | | **0.35–0.36 / 0.37 s** | 589–597 MiB | 974,905–986,416 | |
+
+The device kernel takes ×0.37–0.42 of the same session's baseline: about
+**0.40 s on four P-cores** against 7.17's quiet 1.01 s [est, the ratio
+applied], **0.35 s measured under `Auto`** (against 0.80 s quiet), peak
+**0.57 GiB** (×0.37, from 1.55 GiB), proof **0.97–0.98 MB** (×0.54, from
+1.818 MB; under the 1.5 MiB budget). The shape loses BLAKE2b (3,136
+columns), the AND table (2^16 rows) and, under 4,096 steps, half the CPU
+(2^13 → 2^12 rows) and the ledgers (the memory ledger 2^15 → 2^14, the
+registers' 2^14 → 2^13).
+
+**Steps:** 5,665 → **2,860**. 7.17 counted about 3,500 steps in the SDK's
+end (2,121 `memcpy`, about 1,450 `realloc` and its growth: the public
+arguments re-encoded, the return encoded, BLAKE2b's 133 bytes); the device
+end writes the parts once into a buffer of room enough and hashes them in
+place: about 2,800 steps fewer, and the CPU at 2^12 rows.
+
+**Parameters on the device shape** [measured, the same sessions, 4
+P-cores]: blowup 2, 86 queries, PoW 20: 0.47–0.49 s, 468–475 MiB,
+1.66 MB (past the budget); blowup 4, 43, PoW 20: 0.45–0.46 s, 573–583
+MiB, 0.91 MB; blowup 8, 29, PoW 20: 0.58–0.59 s, 856–868 MiB, 0.65 MB.
+**No re-pin:** blowup 2 and 4 still tie in time, blowup 2's proof is past
+1.5 MiB, blowup 8 is slower; at blowup 4, PoW 20 would save 7% of the
+bytes for the grind's tail (7.16).
+
+**Where PG2's 1 s stands:** at P4's ARM factor (the phone under `Auto`
+about 3.0× x86 on four P-cores), **about 1.2–1.5 s on the phone [est]**
+(0.40–0.49 s × 3.0), against 1 s; its peak about 0.6 GiB [est] against
+1 GiB, its proof 0.98 MB against 1.5 MiB: both budgets met on x86's
+figures. PG2 needs about ×1.2–1.5 more: 7.18's CPU split (the CPU, 785 of
+3,203 columns, now about 33% of the cells at 2^12 rows) and 7.19's
+word-level memory (the ledger at 2^14 and the registers' at 2^13). The
+phone session P5 measures it.
+
+**Also:**
+- **The id of BLAKE2b's call:** Fable's check named `ecalli 0x401`; the
+  BLAKE2b precompile is `0x400` (`0x401` is the witness input), which the
+  note, the derivation and the gate use.
+- **2^24, not `p`:** the length bound stays 2^24 (the note says why).
+- **JAM's kernel gas cap** still holds a device method's declared gas at
+  install (`cap::JAM.kernel_gas()`, a budget counted in BLAKE2b
+  compressions), though no node runs it; the auth kernel's 50M fits. Left
+  for 7.20's install of device kernels.
+
+**Review (Opus):** the hasher, the framing, `DeviceReturn::end`'s
+arithmetic, the in-place call, the derivation's admission and the wire
+indices checked correct. Folded: H1, the binding argument (a collision of
+`H_io` gives a collision of `C` of a restricted form, a packed or length
+block on the right and `T(io)` or a chain output on the left, priced in
+the ideal-permutation model; an unrestricted collision of `C` is easy);
+M1, a device kernel's record keeps the node's shape, now not held to the
+recursion's leaves, and the docs say what installs the device profile
+(7.20); M2, every test actor's kernels compared at both commits (two had
+moved; `#[inline]` fixed it, above); M3, ingress's check marked 7.20's;
+L1, `DeviceReturn`'s output once, its end trapping without one; L2, a
+device kernel not `venue_bound`; L3, `device` given twice refused; L4, a
+guard naming a device kernel compiles (a pass case); L5, a `Device`
+method needs its entry; L6, the testkit's `compressions` documented; L7,
+the heap's bound in one figure. Not taken: L4's guarded command in the
+`device` actor (an install of it then needs the credential actor).
+
 ## Step 7.10b: the node API and the gateway
 
 Branch `s7/7.10b`, from vos-core `ad1ff380`. The brief, `node-api.md`,
