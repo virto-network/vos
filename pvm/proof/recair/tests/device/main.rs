@@ -9,4 +9,5 @@ mod common;
 mod format;
 mod gates;
 mod leakage;
+mod program;
 mod support;

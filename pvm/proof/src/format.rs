@@ -26,9 +26,10 @@
 //!   their numbers; 44 proves its `p2` and `qm31` alone, the credential AIR.
 //! - **Every format** takes exactly its parameters, mixes the boundary
 //!   states as the boundary chips' bytes and grinds its interaction PoW
-//!   before the relation challenges. 43 is registered and refused until a
-//!   space's ingress verifies device proofs; `vos-pvm-recair` proves and
-//!   verifies them (`masked::device`). 32 is registered and refused
+//!   before the relation challenges. 43 is admitted: a space's ingress
+//!   verifies device proofs of auth's statement against the program it
+//!   computes from the installed kernel (`vos-pvm-recair`'s `device`). 32
+//!   is registered and refused
 //!   although its AIR and channel exist: `vos-pvm-recair` proves and verifies
 //!   its proofs natively, pinning each circuit by its hash, and no verifier
 //!   outside the recursion reads a leaf or a fold. 28 is admitted:
@@ -548,7 +549,7 @@ pub const DEVICE_PROOF: Format = Format {
     masked: true,
     masking: Some(DEVICE_MASKING),
     floor: INNER_FLOOR,
-    status: Status::Reserved,
+    status: Status::Admitted,
     reference: DEVICE_REFERENCE,
     bits: SecurityBits {
         conjectured: 110,

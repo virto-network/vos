@@ -39,6 +39,7 @@ pub mod circuit;
 pub mod compile;
 pub mod context;
 pub mod credential;
+pub mod device;
 pub mod fold;
 pub mod gadgets;
 pub mod leaf;

@@ -5348,6 +5348,7 @@ dependencies = [
  "vos-pvm-compiler",
  "vos-pvm-final-verifier",
  "vos-pvm-poseidon2",
+ "vos-pvm-precompiles",
  "vos-pvm-program",
  "vos-pvm-proof",
  "vos-pvm-proof-verifier",

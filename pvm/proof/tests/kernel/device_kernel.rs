@@ -38,3 +38,44 @@ fn a_device_kernels_shape_holds_no_blake2b() {
     );
     println!("auth: {} steps", trace.side_note.steps.len());
 }
+
+/// Two witnesses of different path shapes (slot 0 under the empty tree's
+/// siblings, the last slot under a path whose every sibling is filled)
+/// each give the program ingress computes from the kernel, auth's reference
+/// run's, its id and log sizes; each proves under it and verifies against
+/// its own io-hash alone: pin J's witness-independent trace.
+#[test]
+fn every_path_shape_proves_under_one_device_program() {
+    use vos_pvm_recair::device::{MAX_PROOF_BYTES, Program, auth_io, encode};
+    use vos_pvm_recair::masked::MaskRng;
+    let blob = kernel("device", "auth");
+    let program = Program::auth(&blob).expect("the kernel's program");
+    let full: Vec<usize> = (0..32).collect();
+    let shapes = [
+        vos_testkit::device_auth_arguments(0x0101_0101, 0, &[]),
+        vos_testkit::device_auth_arguments(0x0202_0202, u32::MAX, &full),
+    ];
+    let mut proofs = Vec::new();
+    for (input, public) in &shapes {
+        let own = Program::install(&blob, input).expect("its own run's program");
+        assert_eq!(own.id(), program.id());
+        assert_eq!(own.log_sizes(), program.log_sizes());
+        let (proof, _) = program
+            .prove(input, MaskRng::default())
+            .expect("proves under the kernel's program");
+        assert_eq!(Some(proof.io), auth_io(public));
+        let bytes = encode(&proof.proof).expect("encodes");
+        assert!(bytes.len() <= MAX_PROOF_BYTES, "{} bytes", bytes.len());
+        program.verify(&proof.io, &bytes).expect("verifies");
+        proofs.push((proof.io, bytes));
+    }
+    assert_ne!(proofs[0].0, proofs[1].0);
+    assert!(program.verify(&proofs[1].0, &proofs[0].1).is_err());
+    assert!(program.verify(&proofs[0].0, &proofs[1].1).is_err());
+    println!(
+        "auth's device program: log sizes {:?}, proofs {} and {} bytes",
+        program.log_sizes(),
+        proofs[0].1.len(),
+        proofs[1].1.len()
+    );
+}
