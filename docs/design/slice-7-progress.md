@@ -5642,5 +5642,17 @@ byte for byte; the device leakage gates at medium N).
 format 45, `07731a2c` the bench, `af3fdb0f` the review's folds; this
 record.
 
+**Fable's check of `9c34e864`:** sound, nothing high or medium. Folded:
+L1, the composition's 16 coordinate samples at `π(z)` shown determined
+(its value's Galois conjugates from the conjugated column samples, the
+composition's QM31 inputs all public); L2, the argument stated
+conditional on R3, `R`'s size named (at least 32,768 M31 coefficients
+against about 10³ functionals); L3, `device_floors` refuses a format
+whose `h` is below a chip's revealed rows, so the install fails before
+any proof rather than after `MAX_ATTEMPTS` (`mask_rows` untouched, the
+R1-refusal tests keep their path; a test at `h = 128` and at 83
+queries); and `mask_rows`' per-chip `h` noted as below the format's cap
+only.
+
 **Left:** a phone session at 45 (P6's `h256` cell is its estimate: about
-0.61 s, peak 555 MiB); Fable's check of the argument; s4's comments.
+0.61 s, peak 555 MiB); s4's comments.

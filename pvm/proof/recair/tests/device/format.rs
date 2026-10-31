@@ -143,6 +143,28 @@ fn every_device_chip_reveals_at_most_its_h() {
     assert!(floors.iter().all(|&floor| floor == 10), "{floors:?}");
 }
 
+/// A format whose `h` is below the rows a chip reveals has no floors, so
+/// the install refuses it before any proof, where R1 would refuse every
+/// transcript: `h = 128` against 149 rows at 47 queries, and `h = 256`
+/// against `8 + 3·83 = 257` at 83 queries; 82 queries (254 rows) fit.
+#[test]
+fn an_h_under_the_rows_revealed_is_refused_before_any_proof() {
+    let with = |log_mask_rows, n_queries| vos_pvm_proof::format::Format {
+        params: FormatParams {
+            n_queries,
+            ..DEVICE_PROOF.params
+        },
+        masking: Some(vos_pvm_proof::format::Masking {
+            log_mask_rows,
+            ..DEVICE_PROOF.masking.unwrap()
+        }),
+        ..DEVICE_PROOF
+    };
+    assert!(device_floors(&with(7, 47), DEVICE_ALL).is_none());
+    assert!(device_floors(&with(8, 83), DEVICE_ALL).is_none());
+    assert!(device_floors(&with(8, 82), DEVICE_ALL).is_some());
+}
+
 /// A smaller device program counts more bits than the reference: the
 /// reference bounds every program the format admits.
 #[test]

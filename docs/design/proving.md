@@ -698,11 +698,25 @@ last for decades.**
       reads are other points than the decommitted one. Only the
       composition's value, a function of every column's reads, is
       published, so counting each column's own is an over-count.
-    - Nothing else: the DEEP quotients at the queries and the
-      composition's sample at `π(z)` are computed from these; FRI's
-      siblings, inner layers and last layer are masked by `R` (R3, an
-      `R` uniform in the FRI code); the claimed sums by R2; an unopened
-      leaf's hash by its salt; the preprocessed columns are public.
+    - Nothing else: the DEEP quotients at the queries are computed from
+      these; the claimed sums are blinded by R2; an unopened leaf's hash
+      is hidden by its salt; the preprocessed columns are public.
+    - **The composition's sample at `π(z)`:** its 4 coordinate columns
+      `C_k` are each sampled at `w = π(z)`, 16 M31 values against the one
+      QM31 value `C(w)`. They are determined all the same: the `C_k(w)`
+      follow from `C(σⁱw)`, `i = 0..3`, `σ` QM31's Frobenius over M31
+      (its Galois conjugates), and each `C(σⁱw)` is computable from the
+      columns' samples conjugated, since `f'`, `π` and the offsets' shifts
+      are over M31 and the composition's only QM31 inputs (its
+      coefficient `α`, the relation challenges, the blinded sums) are
+      public.
+    - **Conditional on R3:** FRI's siblings, inner layers and last layer
+      are hidden by `R`, uniform in the FRI code, whose rank is asserted
+      by construction, with no check (`masked/mod.rs`'s R3): 8 columns of
+      `2^{m+2}` coefficients each, at least 8·2^12 = 32,768 M31
+      coefficients for the smallest device shape, against about 10³
+      functionals FRI reveals at 47 queries. The `h` argument here
+      covers the columns' randomizers alone, and holds with R3.
   - **The count**, per column of offsets `O`, at `q` queries:
     `4|O| + q(|O| + 1)` rows, fewer when points coincide (two queries
     lifted to one point of a small component's domain, a read on a
@@ -755,7 +769,10 @@ last for decades.**
     under 256; `|O| = 4`: 251; `|O| = 5`: 302, over) or more queries. R1
     refuses a transcript whose rows pass `h` (`n_rows ≤ h` before the
     rank), so a shape that broke it would fail to prove (after
-    `MAX_ATTEMPTS` refused transcripts), never prove leaky; and `mask_rows` sizes each chip's `h` from its own offsets.
+    `MAX_ATTEMPTS` refused transcripts), never prove leaky; the device
+    install refuses such a format before any proof (`device_floors`).
+    `mask_rows` sizes each chip's `h` from its own offsets only below the
+    format's cap: at format 45 every device chip reaches the cap, 256.
 - **The composition mode:** a test pins that (c) lifts no constraint past
   the blowup. If it did, the prover would re-LDE every column.
 - **On the wrap** (spike 6a): no re-LDE [measured]; the prover ×2.6–2.9

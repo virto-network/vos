@@ -86,13 +86,21 @@ pub struct DeviceProof<H: MerkleHasherLifted> {
 
 /// Each of the chips `active` names padded to four times its `h` under
 /// `format` ([`mask_rows`]), in `DEVICE_ORDER`: the least log sizes a
-/// device program's chips may take. `None` for an unmasked format or a mask
-/// that is not a device's.
+/// device program's chips may take. `None` for an unmasked format, a mask
+/// that is not a device's, or a chip whose `h` is below the rows a column
+/// of it reveals ([`Reveal`], `proving.md` §5), which R1 would refuse on
+/// every transcript: such a format is refused at the install, before any
+/// proof.
 pub fn device_floors(format: &Format, active: u32) -> Option<Vec<u32>> {
     let any = format.masking?.log_mask_rows + 2;
     let chips = vos_pvm_proof::masked::Device::chips(active)?;
     let layout = DeviceComponents::layout(active, &vec![any; chips.len()])?;
-    Some(mask_rows(format, &layout)?.iter().map(|h| h + 2).collect())
+    let rows = mask_rows(format, &layout)?;
+    let covered = reveals(format, &layout)?
+        .iter()
+        .zip(&rows)
+        .all(|(reveal, &h)| reveal.rows <= 1 << h);
+    covered.then(|| rows.iter().map(|h| h + 2).collect())
 }
 
 /// What each of the chips `active` names, at `log_sizes`, reveals of its
@@ -124,7 +132,7 @@ pub fn device_shape(
         DeviceLayout::of_program(blob).ok_or(ProveError::TraceShape("not a standard program"))?;
     let active = device_chips_of_code(&reference.code, &reference.bitmask);
     let floors = device_floors(format, active).ok_or(ProveError::TraceShape(
-        "the format's masking does not fit the chips",
+        "the format's masking does not fit the chips, or an h under the rows a chip reveals",
     ))?;
     let trace = masked_device_trace(reference, &layout, active, DeviceSizes::AtLeast(&floors))
         .map_err(|error| ProveError::Segment(error.to_string()))?;
@@ -183,7 +191,7 @@ where
             return Err(ProveError::TraceShape("the chips are not the code's"));
         }
         let floors = device_floors(format, active).ok_or(ProveError::TraceShape(
-            "the format's masking does not fit the chips",
+            "the format's masking does not fit the chips, or an h under the rows a chip reveals",
         ))?;
         if floors.len() != log_sizes.len() || log_sizes.iter().zip(&floors).any(|(s, f)| s < f) {
             return Err(ProveError::TraceShape("a log size under its floor"));
