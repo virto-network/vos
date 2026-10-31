@@ -5878,3 +5878,41 @@ passed in 119 suites, 31 blobs `blobs.lock`'s); `just test-proof` exit 0
 
 **Left:** a phone session at 45 (P6's `h256` cell is its estimate: about
 0.61 s, peak 555 MiB); s4's comments.
+
+**Session P7** (2026-10-31, 20:34–20:40, `p7.sh` then `pg2.sh`, the
+Fairphone 6 at 97–98%, 27–28 °C, governor `walt` on both clusters; the
+lean kernel, 1,722 steps, `0f10b485…`). P6's timing build (`4f8856ca…`,
+format 43, scalar Blake2s) against the build of vos-core `9430bfee`
+(`5acc7a4c…`, format 45, Stwo's NEON compress16 at fork `e14925a`); 3
+rounds of 4 interleaved cells, 5 proofs each after a warm-up, automatic
+threads (4), every proof verified on the phone and all 5 distinct. The
+median of the rounds' medians and the 95th percentile of the 15 proofs:
+
+| cell | rounds' p50 (ms) | p50 | p95 | peak | bytes |
+|---|---|---|---|---|---|
+| A: old, `h = 512` (P6's lean) | 772 / 739 / 733 | 739 | 815 | 634 MiB | 975–985 KB |
+| B: old, `h = 256` (`h` alone) | 601 / 601 / 606 | 601 | 625 | 543 MiB | 977–984 KB |
+| C: new, `h = 512` (`:9`, NEON alone) | 783 / 712 / 711 | 712 | 796 | 639 MiB | 978–981 KB |
+| **D: new, default (format 45)** | 579 / 594 / 581 | **581** | **646** | 513 MiB | 976–983 KB |
+
+`h = 256` is ×0.81 of A (P6 ×0.82); NEON alone ×0.96 (C/A) and ×0.97
+with `h = 256` (D/B); together ×0.79. The microbench (single-threaded,
+`2^16` rows × 32 columns, 7 reps, digests agree): compress16 1,758.6 →
+1,386.2 ns on the prime core (cpu7, ×1.27) and 6,610.2 → 3,757.9 ns on
+a little core (cpu0, ×1.76); the Merkle layer at 1,438.2 ns per
+compress16 on cpu7. The hash is a small part of the proof on the big
+cores, so the kernel's gain is a few percent. The activity manager
+trimmed five empty cached apps during the session; lmkd killed nothing.
+The log is `spikes/s7-device/runs/phone-p7.txt`.
+
+**PG2's acceptance at ingress** (`pg2.sh`, 3 rounds, the same build):
+the phone proved the sign-in's device kernel at format 45 (program
+`49ed9ad6…`, one set of log sizes) in 617.6, 647.9 and 641.7 ms (install
+134–251 ms; peak 440–445 MiB; 977,087 / 984,389 / 981,681 bytes;
+verified there), and the node's ingress ran `login` as the member's
+pseudonym in 38.0, 35.6 and 33.7 ms, the same pseudonym every round.
+The log is `spikes/s7-device/runs/phone-pg2-p7.txt`. **PG2 passes**: the
+median of the rounds' medians 581 ms (device cells) and 642 ms
+(acceptance) against 1.0 s, peak 513 MiB against 1 GiB, proofs at most
+985 KB against 1.5 MiB, accepted at ingress. This is the first of the
+two passes a day apart; P8 remains.
