@@ -224,6 +224,59 @@ fn more_groups_than_streams_elect_after_every_node_restarts() {
     assert!(took < Duration::from_secs(15), "{took:?}");
 }
 
+/// A store whose every write is slow, as a disk all a host's nodes share
+/// is under load.
+#[derive(Default)]
+struct SlowWrites;
+
+impl vos_node::Hooks for SlowWrites {
+    fn before_commit(&self) {
+        std::thread::sleep(Duration::from_millis(40));
+    }
+}
+
+/// Every node restarts at once on a slow store: each group elects, and
+/// each new leader's placement reaches every node, many in one write.
+/// One write a placement, each waiting for the last, takes a node's store
+/// a write for each of its own leaders and of every other node's, and
+/// each sender sends its placement again every second until it is held:
+/// at many groups that backlog, and what it holds, grows without bound.
+#[test]
+fn every_new_leaders_placement_is_held_soon_after_every_node_restarts() {
+    let mut cluster = Cluster::hooked(3, Arc::new(SlowWrites));
+    let agents = agents(&cluster, 150);
+    for number in 1..=3 {
+        cluster.stop(number);
+    }
+    let started = Instant::now();
+    for number in 1..=3 {
+        cluster.start(number);
+    }
+    for &agent in &agents {
+        cluster.leader(agent);
+    }
+    let elected = started.elapsed();
+    wait_until("every node holds every new leader's placement", || {
+        agents.iter().all(|&agent| {
+            let placements: Vec<_> = cluster
+                .running()
+                .map(|(_, node)| node.placement(agent).map(|placement| placement.order()))
+                .collect();
+            let term = terms(&cluster, &[agent])[0];
+            placements
+                .iter()
+                .all(|order| order.is_some_and(|order| order.term == term))
+        })
+    });
+    let held = started.elapsed() - elected;
+    eprintln!(
+        "{} groups elected within {elected:?}, their placements held {held:?} later",
+        agents.len()
+    );
+    // A write a placement: about six seconds here.
+    assert!(held < Duration::from_secs(3), "{held:?}");
+}
+
 /// Nodes that run two campaigns at once elect every group in turn after
 /// they all restart together: the others put theirs off by a fresh
 /// election timeout, and no term runs away.

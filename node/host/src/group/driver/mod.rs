@@ -96,14 +96,21 @@ struct Driver {
     /// A compaction is due at the next chance.
     compact_due: bool,
     /// The order of the placement this replica last announced as leader,
-    /// since it last stepped down: set as it goes to the directory, in a
-    /// task of its own, as the driver never waits on the node-wide lock a
-    /// placement takes.
+    /// since it last stepped down: set as it goes to the directory's
+    /// recording, which the driver never waits on.
     announced: Option<Order>,
     /// The node's campaign this replica holds while it campaigns.
     campaign: Option<Campaign>,
     /// It waits its turn for one.
     waiting: bool,
+}
+
+/// A driver gone, however it ended (a panic included), neither waits for
+/// a campaign nor keeps one handed to it.
+impl Drop for Driver {
+    fn drop(&mut self) {
+        self.inner.campaigns.forget(self.shared.agent);
+    }
 }
 
 /// Where the core's answers go, by the token each request took.

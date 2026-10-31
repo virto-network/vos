@@ -4304,6 +4304,191 @@ revision in its report):
   branch's guests: the agent changed since 7.6c's, so the runs before
   and after differ in it too).
 
+### 7.6e: the soak's step and the cold restart's memory
+
+From vos-core `57f6b0fc` (7.6d included), on `s7/7.6e`. compumax's
+governor `performance` for every run, the driver on sigma, as in 7.6d.
+`perf` 7.3.1 on compumax (the owner's, `perf_event_paranoid` 1): the node
+built with line tables and frame pointers for the profiles alone
+(`~/vos-scale/bins-7.6e-prof`), stack samples of the runtime thread and
+page-fault samples of the process.
+
+**The soak's step at minute 30: the outbox's scans read deleted rows**
+[measured]. A profiling soak (`20261031T133343Z-r6e-soak-prof`, run 6's
+shape for 45 minutes) stepped as 7.6c's and 7.6d's did: the leader loops'
+`resume` mean 2.5 ms to 15 ms from minute 30, timeouts from minute 36. On
+node 1's runtime thread:
+
+| | minute 21 | minute 36 |
+|---|---|---|
+| `leader::outbox::deliver` (its scan) | 14.5% | 47.3% |
+| `roots::cuts::cut_roots` (from `latest_built`) | 14.2% | 7.0% |
+| `calls::session_mark` | 7.0% | 2.8% |
+
+Under `deliver` the time was lsm-tree's MVCC stream skipping entries
+(`MvccStream::find`, `drain_key_min`, the merge heap). A leader sends each
+target its outbox after every batch, scanning the outbox from the target's
+mark. The store's scan was a range to the end of the partition, filtered
+by the prefix: past the target's last row it went on to the next row the
+store held live, through every row deleted on the way, which the store
+holds as tombstones until a compaction drops them. Those are the
+acknowledged messages to the targets after it, about 3,900 cross-shard
+transfers a second's worth. A probe (the store test below): 1,000 scans of
+an empty prefix with 100,000 deleted rows after it took 469 s, 0.47 s a
+scan. The step's timing is when those tombstones stop being compacted away
+as fast as they come; not further attributed.
+
+**The cold restart's memory: a task per placement frame, waiting on a
+lock held across a write each** [measured]. Page faults sampled on node 1
+while its RSS grew (`r4h-restart-prof`, no load): 83% of new pages were
+the allocations of tasks `dispatch::arrive` spawned, one for each
+`Directory` frame. Each waited for the node-wide `recording` lock, held
+across one storage commit (an fsync) per placement, its own leaders' and
+other nodes', and was acknowledged only after it. At a cold restart every
+group elects, so each node takes about 100,000 new placements, and every
+sender sends each unacknowledged placement again every second: the tasks
+came faster than one write each could take them. (The check those tasks
+ran was also offloaded to the executors, behind the groups' start reads.)
+
+**The election rate: a campaign given back woke a group already woken**
+[measured, in process]. `Campaigns::give_back` woke the first group waiting
+without taking it off the queue, so the campaigns given back before it ran
+all woke the same group, and the others' freed places stayed idle until a
+waiting group's own timer (ten election timeouts). The node's storage
+flushes held 5–6 commits each at a cold restart, the campaigns' work
+trickling. And the waiting groups' `contains` was a pass over the queue,
+37% of node 1's runtime thread with about 60,000 waiting.
+
+**The commits:**
+- `63b2f033` **A scan ends at its prefix:** the store's scans of an agent's
+  rows (and the export's) give the range an upper bound, the prefix's
+  successor, so no scan reads past its prefix.
+- `214fd78b` **Placements stored many to a write by one task**
+  (`node/recording.rs`): a placement that supersedes none held is
+  acknowledged as it arrives (the directory takes one only once it is
+  stored, so what it holds is durable); the others wait, one entry an
+  agent, sender and order however often they come, and one task stores up
+  to 4,096 agents' in one write, then acknowledges each sender and
+  announces its own leaders'. `place` no longer waits. Campaigns waiting
+  are looked up in a set.
+- `274d76e3` **A campaign given back goes to the next group waiting,** each
+  to its own (`handed`), so many given back at once wake as many.
+- `24f11862` **The Opus review folded** (below).
+- `37471c97` The harness's driver names the node a read failed at.
+
+**The review** (Opus): no Raft safety or durability bug. Folded: a node's
+own placements were combined by order, so a later uncommitted placement
+could replace a committed one of the same configuration before either was
+stored (now taken in turn by `supersedes`, as one write after another);
+one row an agent a write; a bound on the placements sent that wait
+(2^18; past it a frame is dropped and comes again with its resend) and the
+queue in arrival order; a campaign handed to a driver that panics was
+never given back (a `Drop` on the driver now forgets it); `forget` passed
+over the whole queue for each group stopping (now passed over lazily).
+Not folded: the scan test asserts on time (the margin is 900-fold).
+
+Tests: a scan ends at its prefix (the probe above: under 0.5 s bounded, 469
+s before) and the prefix's end; the pending placements (a resend held
+once, the bound, the order), a write's supersession in turn, an
+uncommitted placement not replacing a committed one; campaigns given back
+together waking as many, groups gone passed over and every campaign
+coming back; in process, every node restarted on a store that takes 40 ms
+a write, 150 groups: each new leader's placement held on every node 0.4 s
+after the last group elected, against 6.4 s before (the bound 3 s).
+
+**`blobs.lock` is not stale:** `just check-blobs` on this branch, every one
+of the 30 pinned blobs is the lock's. The representative's ELF in
+`bins-7.6d` hashes differently only unstripped; stripped, it is the lock's
+`7b88fe03…`, as is this branch's build. The harness ships the unstripped
+ELF; the lock pins the stripped.
+
+**"Connection refused" after `up`** (7.6d's `r4d-…-b`): not the API's
+readiness. Node 1 was killed at its 12 GiB cap at 12.0 minutes (its RSS
+11.9 GiB a sample before), as the driver, started after `up` and a
+minute's wait, read the shard's schema from it. With the memory fixed, the
+driver started at once after `up` in every run below. The driver's errors
+now name the node.
+
+**The runs** (the node at `274d76e3` for `r4i`, at the final `24f11862` for
+`r4j`, `r6e` and `r5e`; the harness's `versions` line names the deployed
+revision, `d9824539` for the restarts, whose binaries were swapped in
+place: `bins-7.6e2`, `bins-7.6e3`):
+
+- **The cold restart at 10^5** (run 4's agents restored from a copy taken
+  after 7.6d, `~/vos-scale/keep-r4-100k`, then the baseline load at once
+  after `up`):
+
+  | | before (7.6d, `r4f`) | placements and scans (`r4h`) | final (`r4j`; `r4i` alike) |
+  |---|---|---|---|
+  | answering after `up` | 2.75 min | not timed | within 21 s with `check` (`r4i`) |
+  | groups led | 52,000 at 8 min, about 100 a second | 69,433 at 13 min, 30–120 a second | 100,066, every one quiet, at the first poll (2 min) |
+  | RSS | 1 GiB a minute, node 3 OOM-killed at 12.8 min | flat, 5.7 GiB at most | 6.2–6.3 GiB at most, flat |
+  | transfers p50 / p99 / p99.9 | timeouts, then OOM | (stopped at 15 min) | 524 ms / 8.4 s / 16.8 s, 0 errors |
+
+  `r4h` was stopped early once its memory was flat. **Converged within
+  memory.** p99 is past run 4e's 1.3 s: the leaders came out unbalanced
+  (node 2 leads 45,621 of 100,066, node 1 30,000 at 76% of its 4 cores).
+  Rebalancing leaders after a restart is not done.
+- **T6, run 6** (`20261031T160903Z-r6e-soak`, two hours): transfers per 10 minutes against
+  7.6d's (`r6d-soak`):
+
+  | minutes | answered/s | timed out | p99 (median interval) | RSS c1 / c2 / c3, MiB |
+  |---|---|---|---|---|
+  | 0–10 | 3,994 | 0 | 786 ms | 1,996 / 2,008 / 2,010 at 10 |
+  | 20–30 | 3,994 | 0 | 786 ms | 2,093 / 2,094 / 2,076 at 30 |
+  | 30–40 (7.6d: 3,014 a second, 84 s) | 4,006 | 0 | 1,049 ms | |
+  | 50–60 | 3,993 | 0 | 1,180 ms | 2,127 / 2,082 / 2,110 at 60 |
+  | 80–90 | 4,013 | 0 | 1,311 ms | 2,105 / 2,147 / 2,197 at 90 |
+  | 110–120 (7.6d: 31 minutes) | 4,002 | 0 | 2,097 ms | 2,167 / 2,065 / 2,108 at 120 |
+
+  **No collapse:** offered 4,999.5 a second, answered at offer for two
+  hours, none timed out (7.74 million before); 120 refused of 36.3 million
+  calls, all after minute 60 (`Expired` 24, `StaleSession` 96: sessions
+  the agents expired at their hour that the driver still held, not
+  investigated). The runtime thread's `resume` mean 1.0–2.8 ms throughout
+  (7.6d: 6–15 ms past minute 30). Transfers p50 / p99 / p99.9 over the run
+  328 ms / 3.1 s / 6.3 s. RSS within 5.0% of minute 30's at most.
+  **T6: RSS met; latency not:** p99 doubled from the first half hour (0.8
+  s) to the last ten minutes (2.1 s), against within 20%. It follows the
+  commit: commit p50 56 to 92 ms, the writer's fsync mean 28 to 40 ms, as
+  the state grows (551,862 users' accounts written by the end, 551,982
+  sessions against 7.6d's 8.77 million), the
+  shared disk binding as in run 3.
+- **T5-partial, run 5** (`20261031T181145Z-r5e-fault-c2`), at the final commit, run 5's shape:
+
+  | | 7.6c | 7.6d | 7.6e | bound |
+  |---|---|---|---|---|
+  | agents c2 led at the kill | 21 | 23 | 26 | |
+  | each led again elsewhere | p50 2.9 s, at most 4.9 s | p50 2.5 s, at most 3.6 s | p50 3.1 s, at most 5.3 s | 5 s: missed by 0.3 s (the polls' 1 s grain) |
+  | throughput under 80% after the kill | 33 of the first 60 s | 34 | 36 | 30 s: missed |
+  | answering after its restart | 7.1 s | 7.6 s | 2.2 s | 60 s: met |
+  | transfers timed out over the run | | 873,352 | 485,858 | |
+
+  As before: the calls in flight to c2 time out at the driver's 30 s and
+  hold their users' next calls (18,268 in the 30 s from 30 s after the
+  kill), and the restart's catch-up tips the nodes, at their knee at T1's
+  shape, past it: transfers p99 2.1 s before the kill, 134–268 s from the
+  restart on.
+
+**Gates:** `just check` green at `24f11862` (119 suites, 1,668 passed, the
+log ending `exit=0`); a first run failed `vos-checker`'s
+`a_held_tcp_port_takes_no_listener_and_resets_what_connects` with
+`AddrInUse` on its last bind, which passed 20 of 20 alone: a port taken by
+another process on the shared desktop between the hold's release and the
+bind, not attributed further. The exactly-once loop (seeds 7601–7610, the
+three tests each), the five-process fault suite and the fault build's
+process tests green; the node's whole suite and clippy at `274d76e3`.
+
+**Left:**
+- Leaders unbalanced after a cold restart, and its p99.
+- T6's latency drift with the state (the disk's fsync and the commit),
+  and T5's throughput gap and its restart's catch-up at T1's shape: the
+  disk and the knee, not a node defect found here.
+- The `Expired` / `StaleSession` refusals past the soak's hour (120).
+- The runs: `~/vos-scale/runs/` as named; the profiles in
+  `compumax:~/vos-scale/prof/`; the scripts in `~/vos-scale/s76e/`, the
+  binaries in `~/vos-scale/bins-7.6e3/` (final) and `bins-7.6e-prof/`.
+
 ## Step 7.10: the credential AIR
 
 Branch `s7/7.10`, from vos-core `84607818`.

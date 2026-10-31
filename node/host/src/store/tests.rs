@@ -654,3 +654,56 @@ fn unapplied_writes_read_over_the_applied_rows() {
     // Another agent's rows read as applied.
     assert_eq!(rows(&view, B, &prefix, None), [row(1, 2)]);
 }
+
+/// A scan ends at its prefix's last row: the rows deleted past it, which
+/// the store holds as tombstones until a compaction drops them, are never
+/// read. An agent's outbox to each target, its sent messages deleted as
+/// they are acknowledged, is scanned for every target after every batch:
+/// a scan going on past the prefix to the next row held read every
+/// message to the targets after it that the store still held deleted.
+#[test]
+fn a_scan_ends_at_its_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Fjall::open(dir.path()).unwrap();
+    let (empty, sent, last) = (AgentId(7), AgentId(8), AgentId(9));
+    let deleted = 100_000u64;
+    let mut batch = store.batch();
+    let writes: Vec<Write> = (0..deleted)
+        .map(|sequence| put(keys::outbox(sent, sequence), b"message"))
+        .chain([put(keys::outbox(last, 0), b"message")])
+        .collect();
+    batch.apply(A, 0, 1, &writes);
+    batch.commit(PersistMode::Buffer).unwrap();
+    let mut batch = store.batch();
+    let deletes: Vec<Write> = (0..deleted)
+        .map(|sequence| Write {
+            key: keys::outbox(sent, sequence),
+            value: None,
+        })
+        .collect();
+    batch.apply(A, 0, 2, &deletes);
+    batch.commit(PersistMode::Buffer).unwrap();
+    let view = store.snapshot();
+    let started = std::time::Instant::now();
+    for _ in 0..1_000 {
+        assert!(rows(&view, A, &keys::outbox_to(empty), None).is_empty());
+    }
+    let took = started.elapsed();
+    // Past the prefix, each scan reads the 100,000 deleted rows: seconds.
+    assert!(took < std::time::Duration::from_millis(500), "{took:?}");
+    assert_eq!(
+        rows(&view, A, &keys::outbox_prefix(), None),
+        [keys::outbox(last, 0)]
+    );
+    // A cursor past the prefix reads nothing.
+    let past = keys::outbox(AgentId(u32::MAX), 0);
+    assert!(rows(&view, A, &keys::outbox_to(empty), Some(&past)).is_empty());
+}
+
+#[test]
+fn a_prefix_ends_past_its_last_byte_below_the_highest() {
+    use std::ops::Bound;
+    assert_eq!(read::prefix_end(&[1, 2]), Bound::Excluded(vec![1, 3]));
+    assert_eq!(read::prefix_end(&[1, 0xff]), Bound::Excluded(vec![2]));
+    assert_eq!(read::prefix_end(&[0xff, 0xff]), Bound::Unbounded);
+}

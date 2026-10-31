@@ -6,7 +6,7 @@ mod apply;
 mod driver;
 mod epochs;
 
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
@@ -165,7 +165,8 @@ pub(crate) enum Quiet {
 /// The campaigns a node's groups run at once, bounded: a group's driver
 /// holds a [`Campaign`] from its election timer's firing until it leads,
 /// follows a leader, or the timer fires again. Those that find none free
-/// wait in turn, each woken as one is given back.
+/// wait in turn, and each one given back goes to the first of them that
+/// still runs, woken to take it.
 pub(crate) struct Campaigns {
     most: usize,
     state: Mutex<Running>,
@@ -173,10 +174,40 @@ pub(crate) struct Campaigns {
     wake: OnceLock<Box<dyn Fn(AgentId) -> bool + Send + Sync>>,
 }
 
+/// The campaigns running, among them those handed to groups woken to take
+/// them, and the groups waiting in turn: in a queue, and in a set, as
+/// every waiting group asks again each round, and a node starting many
+/// may have tens of thousands waiting.
 #[derive(Default)]
 struct Running {
     running: usize,
+    handed: HashSet<AgentId>,
     waiting: VecDeque<AgentId>,
+    queued: HashSet<AgentId>,
+}
+
+impl Running {
+    /// The first group still waiting, taken out: one forgotten is passed
+    /// over as it comes to the front.
+    fn pop(&mut self) -> Option<AgentId> {
+        while let Some(first) = self.waiting.pop_front() {
+            if self.queued.remove(&first) {
+                return Some(first);
+            }
+        }
+        None
+    }
+
+    /// The first group still waiting, those forgotten before it dropped.
+    fn first(&mut self) -> Option<AgentId> {
+        while let Some(&first) = self.waiting.front() {
+            if self.queued.contains(&first) {
+                return Some(first);
+            }
+            self.waiting.pop_front();
+        }
+        None
+    }
 }
 
 impl Campaigns {
@@ -193,36 +224,57 @@ impl Campaigns {
         let _ = self.wake.set(wake);
     }
 
-    /// One of the campaigns for `agent`: none while as many as the bound
-    /// run, or other groups wait before it, and it waits in turn.
+    /// One of the campaigns for `agent`: the one handed to it, else one
+    /// free unless other groups wait before it; else it waits in turn.
     pub(crate) fn take(self: &Arc<Self>, agent: AgentId) -> Option<Campaign> {
         let mut state = lock(&self.state);
-        let first = state.waiting.front().is_none_or(|first| *first == agent);
+        if state.handed.remove(&agent) {
+            return Some(Campaign(Arc::clone(self)));
+        }
+        let first = state.first().is_none_or(|first| first == agent);
         if state.running < self.most && first {
-            if !state.waiting.is_empty() {
-                state.waiting.pop_front();
-            }
+            state.pop();
             state.running += 1;
             return Some(Campaign(Arc::clone(self)));
         }
-        if !state.waiting.contains(&agent) {
+        if state.queued.insert(agent) {
             state.waiting.push_back(agent);
         }
         None
     }
 
-    /// Give one back: the first group waiting that still runs is woken.
+    /// `agent`'s group stopped: a campaign handed to it is given back, and
+    /// it no longer waits (its place in the queue passed over in turn, so
+    /// many groups stopping at once cost no pass over the queue each).
+    pub(crate) fn forget(&self, agent: AgentId) {
+        let mut state = lock(&self.state);
+        state.queued.remove(&agent);
+        if state.handed.remove(&agent) {
+            self.hand_on(&mut state);
+        }
+    }
+
+    /// Give one back.
     fn give_back(&self) {
         let mut state = lock(&self.state);
+        self.hand_on(&mut state);
+    }
+
+    /// A campaign ends: it goes to the first group waiting that still
+    /// runs, woken to take it. Each one given back goes to another, so
+    /// many ending at once wake as many.
+    fn hand_on(&self, state: &mut Running) {
         state.running = state.running.saturating_sub(1);
         let Some(wake) = self.wake.get() else {
             return;
         };
-        while let Some(&first) = state.waiting.front() {
+        while state.running < self.most
+            && let Some(first) = state.pop()
+        {
             if wake(first) {
-                return;
+                state.handed.insert(first);
+                state.running += 1;
             }
-            state.waiting.pop_front();
         }
     }
 }
@@ -414,6 +466,73 @@ mod tests {
         let fourth = campaigns.take(d).expect("its turn");
         drop((third, fourth));
         assert!(campaigns.take(a).is_some());
+    }
+
+    /// Campaigns given back together go to as many groups waiting, each
+    /// its own: handed to the first waiting alone, the rest would wait on
+    /// their timers while campaigns stood free. One handed to a group that
+    /// stops goes on to the next.
+    #[test]
+    fn campaigns_given_back_together_wake_as_many_groups() {
+        let campaigns = Campaigns::new(3);
+        let woken = Arc::new(Mutex::new(Vec::new()));
+        let wakes = Arc::clone(&woken);
+        campaigns.waking(Box::new(move |agent: AgentId| {
+            lock(&wakes).push(agent.0);
+            true
+        }));
+        let running: Vec<Campaign> = (1..=3)
+            .map(|agent| campaigns.take(AgentId(agent)).expect("free"))
+            .collect();
+        for agent in 4..=8 {
+            assert!(campaigns.take(AgentId(agent)).is_none());
+        }
+        drop(running);
+        assert_eq!(*lock(&woken), [4, 5, 6]);
+        assert!(campaigns.take(AgentId(7)).is_none(), "none free");
+        campaigns.forget(AgentId(5));
+        assert_eq!(lock(&woken).last(), Some(&7), "5's goes on to 7");
+        let taken: Vec<Campaign> = [4, 6, 7]
+            .into_iter()
+            .map(|agent| campaigns.take(AgentId(agent)).expect("handed"))
+            .collect();
+        assert!(campaigns.take(AgentId(8)).is_none());
+        drop(taken);
+        assert_eq!(lock(&woken).last(), Some(&8));
+        assert!(campaigns.take(AgentId(8)).is_some());
+    }
+
+    /// A group that no longer runs is passed over, its place given to the
+    /// next; one forgotten while it waits loses its place; and every
+    /// campaign comes back: once all are given back, the bound's worth can
+    /// be taken again.
+    #[test]
+    fn campaigns_pass_over_groups_gone_and_all_come_back() {
+        let campaigns = Campaigns::new(2);
+        campaigns.waking(Box::new(|agent: AgentId| agent.0 != 3));
+        let running: Vec<Campaign> = [1, 2]
+            .into_iter()
+            .map(|agent| campaigns.take(AgentId(agent)).expect("free"))
+            .collect();
+        for agent in 3..=6 {
+            assert!(campaigns.take(AgentId(agent)).is_none());
+        }
+        campaigns.forget(AgentId(4));
+        drop(running);
+        // 3 runs no more and 4 was forgotten: 5 and 6 are handed theirs.
+        let handed: Vec<Campaign> = [5, 6]
+            .into_iter()
+            .map(|agent| campaigns.take(AgentId(agent)).expect("handed"))
+            .collect();
+        assert!(campaigns.take(AgentId(4)).is_none(), "none free");
+        campaigns.forget(AgentId(4));
+        drop(handed);
+        let again: Vec<Campaign> = [7, 8]
+            .into_iter()
+            .map(|agent| campaigns.take(AgentId(agent)).expect("free again"))
+            .collect();
+        assert!(campaigns.take(AgentId(9)).is_none());
+        drop(again);
     }
 
     #[test]

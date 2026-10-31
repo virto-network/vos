@@ -316,30 +316,6 @@ impl Inner {
             || !self.store.stale_epochs(agent)?.is_empty())
     }
 
-    /// Take `placement`, which this node's leadership of the agent gives,
-    /// when it supersedes the one held: kept, acted on, and announced to
-    /// every other node until each holds it. One not kept is not taken
-    /// again: storage failed, and the node halts.
-    pub(crate) async fn place(self: &Arc<Self>, agent: AgentId, placement: Placement) {
-        let _recording = self.recording.lock().await;
-        let Some(known) = self.directory.get(agent) else {
-            return;
-        };
-        if !placement.supersedes(&known.placement) {
-            return;
-        }
-        let change = Change::Placement {
-            agent,
-            placement: placement.clone(),
-        };
-        if let Err(error) = self.storage.commit(vec![change]).await {
-            tracing::warn!(agent = agent.0, "a placement was not kept: {error}");
-            return;
-        }
-        self.learn(known.record.clone(), placement);
-        self.announce(agent);
-    }
-
     fn start(self: &Arc<Self>, record: CreationRecord) {
         // Under the runs' lock, which the node's shutdown takes to set
         // `closing`: a group starts before the shutdown takes the runs, or
@@ -411,64 +387,10 @@ impl Inner {
         })
     }
 
-    /// Keep a placement newer than the one held, with its record, durably,
-    /// act on it, then acknowledge it, saying whether this node could run
-    /// the agent's program.
-    pub(crate) async fn on_directory(
-        self: &Arc<Self>,
-        from: NodeNumber,
-        record: CreationRecord,
-        placement: Placement,
-    ) {
-        // A store that failed takes nothing more, and its node does not
-        // acknowledge: the sender's resends are dropped quietly.
-        if self.storage.failed() {
-            return;
-        }
-        let agent = record.agent;
-        let order = placement.order();
-        let recording = self.recording.lock().await;
-        let known = self.directory.get(agent);
-        if known.as_ref().is_some_and(|known| known.record != record) {
-            tracing::error!(
-                from,
-                agent = agent.0,
-                "a record differs from the one held for its agent; refused"
-            );
-            return;
-        }
-        if known
-            .as_ref()
-            .is_none_or(|known| placement.supersedes(&known.placement))
-        {
-            let mut changes = vec![Change::Placement {
-                agent,
-                placement: placement.clone(),
-            }];
-            if known.is_none() {
-                changes.insert(0, Change::Agent(record.clone()));
-            }
-            if let Err(error) = self.storage.commit(changes).await {
-                tracing::error!(agent = agent.0, "a placement was not stored: {error}");
-                return;
-            }
-            self.learn(record.clone(), placement);
-        }
-        drop(recording);
-        self.send(
-            from,
-            &PeerMessage::DirectoryAck {
-                agent,
-                order,
-                runs: self.could_run_here(&record),
-            },
-        );
-    }
-
     /// Whether this node could run the agent `record` creates: its agent
     /// program the node's, and, for the space's representative, an anchor
     /// key of this node's registered with the space.
-    fn could_run_here(&self, record: &CreationRecord) -> bool {
+    pub(super) fn could_run_here(&self, record: &CreationRecord) -> bool {
         if record.program != self.program_hash {
             return false;
         }
