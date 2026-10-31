@@ -2760,6 +2760,17 @@ method needs its entry; L6, the testkit's `compressions` documented; L7,
 the heap's bound in one figure. Not taken: L4's guarded command in the
 `device` actor (an install of it then needs the credential actor).
 
+**Gates** [measured; 12 GiB scope, `nice -n 10`, 8 jobs, another agent's
+scale run beside]: `just check` green at `43e3d8f0` (1,662 passed in 125
+suites); `just test-proof` green at `43e3d8f0` (583 passed in 51 suites,
+`fixtures::` and `constants::` among them unchanged: format 35 byte for
+byte, and the new `device_kernel::` gate).
+
+**Commits:** `69f483e2` the hasher and the tag, `6264a3e0` device kernels'
+plumbing, `6246a414` the test actor and its gates, `71417423` the end in a
+module of its own, `9caa091a` the spike and the run, the review's folds
+(code, then `proving.md`), `blobs.lock`, this record.
+
 ## Step 7.10b: the node API and the gateway
 
 Branch `s7/7.10b`, from vos-core `ad1ff380`. The brief, `node-api.md`,
