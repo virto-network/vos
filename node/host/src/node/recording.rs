@@ -12,7 +12,7 @@
 //! held) spends one write on many, and holds no more than one entry for
 //! each placement it has yet to store.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 
 use vos_wire::ids::AgentId;
@@ -24,6 +24,9 @@ use crate::storage::Change;
 
 /// The most agents' placements one write stores.
 const WRITE: usize = 4_096;
+/// The most placements other nodes sent that wait to be stored: past it a
+/// placement sent is dropped, and comes again with its sender's resend.
+const SENT: usize = 1 << 18;
 
 /// The placements waiting to be stored, and what wakes the task that
 /// stores them.
@@ -44,10 +47,11 @@ impl Default for Recording {
     }
 }
 
-/// An agent's placements waiting: its leader's here, and those sent.
+/// An agent's placements waiting: its leader's here, and those sent, each
+/// in the order it came.
 #[derive(Default)]
 struct Waiting {
-    own: Option<Placement>,
+    own: Vec<Placement>,
     sent: Vec<Sent>,
 }
 
@@ -58,45 +62,72 @@ struct Sent {
     placement: Placement,
 }
 
+/// The placements waiting, by agent, the agents in the order they came.
 #[derive(Default)]
-struct Pending(HashMap<AgentId, Waiting>);
+struct Pending {
+    agents: HashMap<AgentId, Waiting>,
+    order: VecDeque<AgentId>,
+    /// The placements other nodes sent that wait, at most [`SENT`].
+    sent: usize,
+}
 
 impl Pending {
+    fn waiting(&mut self, agent: AgentId) -> &mut Waiting {
+        let order = &mut self.order;
+        self.agents.entry(agent).or_insert_with(|| {
+            order.push_back(agent);
+            Waiting::default()
+        })
+    }
+
     fn own(&mut self, agent: AgentId, placement: Placement) {
-        let own = &mut self.0.entry(agent).or_default().own;
-        if own
-            .as_ref()
-            .is_none_or(|held| placement.order() > held.order())
-        {
-            *own = Some(placement);
+        let own = &mut self.waiting(agent).own;
+        if !own.iter().any(|held| held.order() == placement.order()) {
+            own.push(placement);
         }
     }
 
-    fn sent(&mut self, from: NodeNumber, record: CreationRecord, placement: Placement) {
-        let sent = &mut self.0.entry(record.agent).or_default().sent;
+    /// False when it is not kept: past [`SENT`] waiting, a sender's resend
+    /// brings it again.
+    fn sent(&mut self, from: NodeNumber, record: CreationRecord, placement: Placement) -> bool {
+        if self.sent >= SENT {
+            return false;
+        }
         let order = placement.order();
-        if !sent
+        let sent = &mut self.waiting(record.agent).sent;
+        if sent
             .iter()
             .any(|sent| sent.from == from && sent.placement.order() == order)
         {
-            sent.push(Sent {
-                from,
-                record,
-                placement,
-            });
+            return true;
         }
+        sent.push(Sent {
+            from,
+            record,
+            placement,
+        });
+        self.sent += 1;
+        true
     }
 
-    /// At most [`WRITE`] agents' placements, taken out.
+    /// The first [`WRITE`] agents' placements, at most, taken out.
     fn take(&mut self) -> Vec<(AgentId, Waiting)> {
-        if self.0.len() <= WRITE {
-            return self.0.drain().collect();
+        let count = self.order.len().min(WRITE);
+        let taken: Vec<(AgentId, Waiting)> = self
+            .order
+            .drain(..count)
+            .filter_map(|agent| self.agents.remove_entry(&agent))
+            .collect();
+        self.sent -= taken
+            .iter()
+            .map(|(_, waiting)| waiting.sent.len())
+            .sum::<usize>();
+        if self.agents.is_empty() {
+            // Many after a restart: what they took goes once they are stored.
+            self.agents.shrink_to(WRITE);
+            self.order.shrink_to(WRITE);
         }
-        let agents: Vec<AgentId> = self.0.keys().take(WRITE).copied().collect();
-        agents
-            .into_iter()
-            .filter_map(|agent| self.0.remove_entry(&agent))
-            .collect()
+        taken
     }
 }
 
@@ -109,18 +140,26 @@ impl Recording {
 /// What one write stores, and what follows it.
 #[derive(Default)]
 struct Write {
-    changes: Vec<Change>,
-    /// The placements it takes, each with its record and whether this
-    /// node's leader gave it, and so announces it: one sent that supersedes
-    /// it is its sender's to announce.
-    learned: HashMap<AgentId, (CreationRecord, Placement, bool)>,
+    /// The newest placement it takes for each agent, with its record,
+    /// whether the directory holds the agent already, and whether this
+    /// node's leader gave it, and so announces it: one sent that
+    /// supersedes it is its sender's to announce.
+    learned: HashMap<AgentId, Learned>,
     /// The acknowledgements it owes: to whom, for what.
     acks: Vec<(NodeNumber, CreationRecord, Placement)>,
 }
 
+struct Learned {
+    record: CreationRecord,
+    placement: Placement,
+    known: bool,
+    own: bool,
+}
+
 impl Write {
     /// Take `placement` for `record`'s agent when it supersedes what the
-    /// directory or this write already holds: false when it does not.
+    /// directory or this write already holds, each in the order it came, as
+    /// one write after another would: false when it does not.
     fn take(
         &mut self,
         known: Option<&Placement>,
@@ -132,21 +171,37 @@ impl Write {
         let held = self
             .learned
             .get(&agent)
-            .map(|(_, placement, _)| placement)
+            .map(|learned| &learned.placement)
             .or(known);
         if held.is_some_and(|held| !placement.supersedes(held)) {
             return false;
         }
-        if known.is_none() && !self.learned.contains_key(&agent) {
-            self.changes.push(Change::Agent(record.clone()));
-        }
-        self.changes.push(Change::Placement {
+        self.learned.insert(
             agent,
-            placement: placement.clone(),
-        });
-        self.learned
-            .insert(agent, (record.clone(), placement.clone(), own));
+            Learned {
+                record: record.clone(),
+                placement: placement.clone(),
+                known: known.is_some(),
+                own,
+            },
+        );
         true
+    }
+
+    /// The rows it writes: each agent's record where the directory has
+    /// none, and its newest placement.
+    fn changes(&self) -> Vec<Change> {
+        let mut changes = Vec::with_capacity(self.learned.len());
+        for (agent, learned) in &self.learned {
+            if !learned.known {
+                changes.push(Change::Agent(learned.record.clone()));
+            }
+            changes.push(Change::Placement {
+                agent: *agent,
+                placement: learned.placement.clone(),
+            });
+        }
+        changes
     }
 }
 
@@ -181,8 +236,9 @@ impl Inner {
                 self.acknowledge_placement(from, &record, &placement)
             }
             _ => {
-                lock(&self.recording.pending).sent(from, record, placement);
-                self.recording.wake();
+                if lock(&self.recording.pending).sent(from, record, placement) {
+                    self.recording.wake();
+                }
             }
         }
     }
@@ -224,16 +280,16 @@ impl Inner {
         let mut write = Write::default();
         for (agent, waiting) in taken {
             let known = self.directory.get(agent);
-            if let Some(own) = waiting.own
-                && let Some(known) = &known
-            {
-                write.take(Some(&known.placement), &known.record, &own, true);
+            if let Some(known) = &known {
+                for own in &waiting.own {
+                    write.take(Some(&known.placement), &known.record, own, true);
+                }
             }
             for sent in waiting.sent {
                 let held = write
                     .learned
                     .get(&agent)
-                    .map(|(record, _, _)| record)
+                    .map(|learned| &learned.record)
                     .or(known.as_ref().map(|known| &known.record));
                 if held.is_some_and(|held| *held != sent.record) {
                     refused(sent.from, &sent.record);
@@ -248,8 +304,9 @@ impl Inner {
                 write.acks.push((sent.from, sent.record, sent.placement));
             }
         }
-        if !write.changes.is_empty()
-            && let Err(error) = self.storage.commit(write.changes).await
+        let changes = write.changes();
+        if !changes.is_empty()
+            && let Err(error) = self.storage.commit(changes).await
         {
             tracing::error!(
                 placements = write.learned.len(),
@@ -257,10 +314,9 @@ impl Inner {
             );
             return;
         }
-        for (_, (record, placement, announce)) in write.learned {
-            let agent = record.agent;
-            self.learn(record, placement);
-            if announce {
+        for (agent, learned) in write.learned {
+            self.learn(learned.record, learned.placement);
+            if learned.own {
                 self.announce(agent);
             }
         }
@@ -312,41 +368,54 @@ mod tests {
     }
 
     /// A placement sent again and again while it waits is held once a
-    /// sender and order; another order, or another sender, is another.
+    /// sender and order; another order, or another sender, is another. Its
+    /// own leader's are kept in the order they came.
     #[test]
     fn a_placement_sent_again_waits_once() {
         let mut pending = Pending::default();
         for _ in 0..1_000 {
-            pending.sent(2, record(1), placement(3));
+            assert!(pending.sent(2, record(1), placement(3)));
         }
         pending.sent(3, record(1), placement(3));
         pending.sent(2, record(1), placement(4));
         pending.own(record(1).agent, placement(5));
         pending.own(record(1).agent, placement(4));
+        pending.own(record(1).agent, placement(5));
+        assert_eq!(pending.sent, 3);
         let taken = pending.take();
         assert_eq!(taken.len(), 1);
         let waiting = &taken[0].1;
         assert_eq!(waiting.sent.len(), 3);
-        assert_eq!(waiting.own.as_ref().map(|own| own.term), Some(5));
+        let own: Vec<u64> = waiting.own.iter().map(|own| own.term).collect();
+        assert_eq!(own, [5, 4]);
+        assert_eq!(pending.sent, 0);
     }
 
-    /// One write takes at most [`WRITE`] agents' placements; the rest wait
-    /// for the next.
+    /// One write takes at most [`WRITE`] agents' placements, the first to
+    /// come; the rest wait for the next. Past [`SENT`] waiting, a placement
+    /// sent is not kept.
     #[test]
-    fn a_write_takes_a_bounded_number() {
+    fn a_write_takes_a_bounded_number_in_turn() {
         let mut pending = Pending::default();
         for agent in 0..(WRITE as u32 + 10) {
             pending.sent(2, record(agent), placement(1));
         }
-        assert_eq!(pending.take().len(), WRITE);
-        assert_eq!(pending.take().len(), 10);
+        let first = pending.take();
+        assert_eq!(first.len(), WRITE);
+        assert_eq!(first[0].0, record(0).agent);
+        let rest = pending.take();
+        assert_eq!(rest.len(), 10);
+        assert_eq!(rest[0].0, record(WRITE as u32).agent);
         assert!(pending.take().is_empty());
+        pending.sent = SENT;
+        assert!(!pending.sent(2, record(1), placement(1)), "full");
+        assert!(pending.agents.is_empty());
     }
 
     /// A write takes each placement that supersedes what is held, the
-    /// directory's or an earlier one of the same write, the agent's record
-    /// once when the directory has none; and announces only its own
-    /// leader's.
+    /// directory's or an earlier one of the same write, in the order they
+    /// came, and writes each agent's newest once, with its record when the
+    /// directory has none; it announces only its own leader's.
     #[test]
     fn a_write_takes_what_supersedes() {
         let mut write = Write::default();
@@ -355,12 +424,43 @@ mod tests {
         assert!(write.take(Some(&held), &record(1), &placement(3), true));
         assert!(!write.take(Some(&held), &record(1), &placement(3), false));
         assert!(write.take(Some(&held), &record(1), &placement(4), false));
-        assert_eq!(write.changes.len(), 2, "two placements, no record");
-        let (_, kept, announce) = &write.learned[&record(1).agent];
-        assert_eq!((kept.term, *announce), (4, false));
+        let learned = &write.learned[&record(1).agent];
+        assert_eq!((learned.placement.term, learned.own), (4, false));
+        assert_eq!(write.changes().len(), 1, "the newest placement, no record");
         assert!(write.take(None, &record(2), &placement(1), false));
         assert!(write.take(None, &record(2), &placement(2), true));
-        assert!(matches!(write.changes[2], Change::Agent(_)));
-        assert_eq!(write.changes.len(), 5, "the new agent's record once");
+        let changes = write.changes();
+        assert_eq!(changes.len(), 3, "and the new agent's record once");
+        assert_eq!(
+            changes
+                .iter()
+                .filter(|change| matches!(change, Change::Agent(_)))
+                .count(),
+            1
+        );
+    }
+
+    /// A committed placement is never replaced by a later uncommitted one
+    /// of its configuration, however they come together: taken in turn,
+    /// the second does not supersede the first.
+    #[test]
+    fn an_uncommitted_placement_does_not_replace_a_committed_one() {
+        let mut write = Write::default();
+        let held = Placement {
+            index: 9,
+            ..placement(4)
+        };
+        let committed = Placement {
+            index: 10,
+            ..placement(5)
+        };
+        let uncommitted = Placement {
+            index: 10,
+            committed: false,
+            ..placement(6)
+        };
+        assert!(write.take(Some(&held), &record(1), &committed, true));
+        assert!(!write.take(Some(&held), &record(1), &uncommitted, true));
+        assert!(write.learned[&record(1).agent].placement.committed);
     }
 }

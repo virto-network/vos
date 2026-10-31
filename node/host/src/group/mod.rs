@@ -187,10 +187,26 @@ struct Running {
 }
 
 impl Running {
+    /// The first group still waiting, taken out: one forgotten is passed
+    /// over as it comes to the front.
     fn pop(&mut self) -> Option<AgentId> {
-        let first = self.waiting.pop_front()?;
-        self.queued.remove(&first);
-        Some(first)
+        while let Some(first) = self.waiting.pop_front() {
+            if self.queued.remove(&first) {
+                return Some(first);
+            }
+        }
+        None
+    }
+
+    /// The first group still waiting, those forgotten before it dropped.
+    fn first(&mut self) -> Option<AgentId> {
+        while let Some(&first) = self.waiting.front() {
+            if self.queued.contains(&first) {
+                return Some(first);
+            }
+            self.waiting.pop_front();
+        }
+        None
     }
 }
 
@@ -215,7 +231,7 @@ impl Campaigns {
         if state.handed.remove(&agent) {
             return Some(Campaign(Arc::clone(self)));
         }
-        let first = state.waiting.front().is_none_or(|first| *first == agent);
+        let first = state.first().is_none_or(|first| first == agent);
         if state.running < self.most && first {
             state.pop();
             state.running += 1;
@@ -228,12 +244,11 @@ impl Campaigns {
     }
 
     /// `agent`'s group stopped: a campaign handed to it is given back, and
-    /// it no longer waits.
+    /// it no longer waits (its place in the queue passed over in turn, so
+    /// many groups stopping at once cost no pass over the queue each).
     pub(crate) fn forget(&self, agent: AgentId) {
         let mut state = lock(&self.state);
-        if state.queued.remove(&agent) {
-            state.waiting.retain(|waiting| *waiting != agent);
-        }
+        state.queued.remove(&agent);
         if state.handed.remove(&agent) {
             self.hand_on(&mut state);
         }
@@ -485,6 +500,39 @@ mod tests {
         drop(taken);
         assert_eq!(lock(&woken).last(), Some(&8));
         assert!(campaigns.take(AgentId(8)).is_some());
+    }
+
+    /// A group that no longer runs is passed over, its place given to the
+    /// next; one forgotten while it waits loses its place; and every
+    /// campaign comes back: once all are given back, the bound's worth can
+    /// be taken again.
+    #[test]
+    fn campaigns_pass_over_groups_gone_and_all_come_back() {
+        let campaigns = Campaigns::new(2);
+        campaigns.waking(Box::new(|agent: AgentId| agent.0 != 3));
+        let running: Vec<Campaign> = [1, 2]
+            .into_iter()
+            .map(|agent| campaigns.take(AgentId(agent)).expect("free"))
+            .collect();
+        for agent in 3..=6 {
+            assert!(campaigns.take(AgentId(agent)).is_none());
+        }
+        campaigns.forget(AgentId(4));
+        drop(running);
+        // 3 runs no more and 4 was forgotten: 5 and 6 are handed theirs.
+        let handed: Vec<Campaign> = [5, 6]
+            .into_iter()
+            .map(|agent| campaigns.take(AgentId(agent)).expect("handed"))
+            .collect();
+        assert!(campaigns.take(AgentId(4)).is_none(), "none free");
+        campaigns.forget(AgentId(4));
+        drop(handed);
+        let again: Vec<Campaign> = [7, 8]
+            .into_iter()
+            .map(|agent| campaigns.take(AgentId(agent)).expect("free again"))
+            .collect();
+        assert!(campaigns.take(AgentId(9)).is_none());
+        drop(again);
     }
 
     #[test]

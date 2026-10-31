@@ -139,7 +139,9 @@ pub(crate) struct Inner {
     /// work groups hand off.
     tasks: Mutex<Tasks>,
     /// The placements waiting to be checked against the directory and
-    /// stored, by one task: none is stored over a newer one.
+    /// stored, by one task: none is stored over a newer one. The only other
+    /// writer of a placement is an agent's creation here, under an id no
+    /// other node knows until it is stored.
     recording: recording::Recording,
     /// Turns through an agent's replicas, for what goes to one of them.
     pub(crate) turn: AtomicU64,

@@ -695,6 +695,9 @@ fn a_scan_ends_at_its_prefix() {
         rows(&view, A, &keys::outbox_prefix(), None),
         [keys::outbox(last, 0)]
     );
+    // A cursor past the prefix reads nothing.
+    let past = keys::outbox(AgentId(u32::MAX), 0);
+    assert!(rows(&view, A, &keys::outbox_to(empty), Some(&past)).is_empty());
 }
 
 #[test]
