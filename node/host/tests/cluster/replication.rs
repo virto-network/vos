@@ -561,7 +561,7 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
 /// order, and every replica applies the same.
 #[test]
 fn batches_fly_over_those_before_them() {
-    let cluster = Cluster::new(3);
+    let cluster = Cluster::tuned(3, |_, config| config.in_flight = 4);
     let agent = cluster.counter_agent(&[1, 2, 3]);
     let leader = cluster.leader(agent);
     const SESSIONS: u8 = 16;

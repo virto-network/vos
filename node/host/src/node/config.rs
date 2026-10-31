@@ -35,6 +35,10 @@ pub struct Config {
     pub max_bytes: usize,
     /// The most batches an agent's leader has proposed whose results have
     /// not yet applied: each refines over the writes of those before it.
+    /// One by default: on one host's three nodes, at 5,000 calls a second
+    /// and 10^6 users, more split the inputs into more, smaller batches,
+    /// whose refines and log entries cost more than the queue's wait they
+    /// save (7.6d's runs).
     pub in_flight: usize,
     /// How long a leader waits for more inputs after the first, when it
     /// found its queue empty.
@@ -189,7 +193,7 @@ impl Config {
             queue: 1024,
             max_inputs: 256,
             max_bytes: 1 << 20,
-            in_flight: 4,
+            in_flight: 1,
             linger: Duration::from_millis(2),
             refine_gas: defaults::REFINE_GAS,
             accumulate_gas: defaults::REFINE_GAS,
