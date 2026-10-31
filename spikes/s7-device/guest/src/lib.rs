@@ -15,12 +15,16 @@
 //!   (`#[attestable(device)]`). A lean kernel: its arguments read where the witness
 //!   input left them ([`InPlace`], the siblings first, so page-aligned), never
 //!   copied, and the path walked in place in one lane (sibling, node,
-//!   sibling), each level's call reading the half the slot's bit picks by
-//!   its address, never a branch, and writing the parent over the node.
+//!   sibling), each level's sibling written on the side the slot's bit
+//!   picks and its call reading that half by its address, never a branch,
+//!   and writing the parent over the node; loads and stores a word at a
+//!   time, at any alignment, so the run stays under 2^11 steps.
 
 #![no_std]
 
 extern crate alloc;
+
+use core::mem::MaybeUninit;
 
 use vos_sdk::prelude::*;
 
@@ -83,11 +87,82 @@ impl<const N: usize> Decode for InPlace<N> {
 }
 
 impl<const N: usize> Encode for InPlace<N> {
+    /// The bytes appended eight at a time when `N` is a multiple of eight,
+    /// in one load and one store each, any alignment.
+    #[inline(always)]
     fn encode_to(&self, buf: &mut Vec<u8>) {
-        // SAFETY: a kernel encodes its public arguments during its run,
-        // while the argument pages hold them.
-        buf.extend_from_slice(unsafe { self.bytes() });
+        if N % 8 == 0 {
+            buf.reserve(N);
+            let len = buf.len();
+            // SAFETY: `N` bytes reserved past `len`, each written before
+            // the length takes them in; the source's `N` bytes live in the
+            // argument pages for the run.
+            unsafe {
+                let to = buf.as_mut_ptr().add(len);
+                for i in 0..N / 8 {
+                    store_u64(to.add(8 * i), load_u64(self.0.add(8 * i)));
+                }
+                buf.set_len(len + N);
+            }
+        } else {
+            // SAFETY: a kernel encodes its public arguments during its run,
+            // while the argument pages hold them.
+            buf.extend_from_slice(unsafe { self.bytes() });
+        }
     }
+}
+
+/// The eight bytes at `at`, any alignment, little-endian: on the guest in
+/// one load, which the PVM serves at any address (the target's own
+/// unaligned reads go byte by byte).
+///
+/// # Safety
+///
+/// `at` must point at eight readable bytes.
+#[inline(always)]
+unsafe fn load_u64(at: *const u8) -> u64 {
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: the caller's contract; the load touches nothing else.
+    unsafe {
+        let word: u64;
+        core::arch::asm!(
+            "ld {word}, 0({at})",
+            word = out(reg) word,
+            at = in(reg) at,
+            options(nostack, readonly, preserves_flags),
+        );
+        word
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    // SAFETY: the caller's contract.
+    unsafe {
+        u64::from_le(core::ptr::read_unaligned(at.cast()))
+    }
+}
+
+/// Stores `word` at `at`, any alignment, little-endian: on the guest in one
+/// store.
+///
+/// # Safety
+///
+/// `at` must point at eight writable bytes.
+#[inline(always)]
+unsafe fn store_u64(at: *mut u8, word: u64) {
+    #[cfg(target_arch = "riscv64")]
+    // SAFETY: the caller's contract; the store touches nothing else.
+    unsafe {
+        core::arch::asm!(
+            "sd {word}, 0({at})",
+            word = in(reg) word,
+            at = in(reg) at,
+            options(nostack, preserves_flags),
+        );
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    // SAFETY: the caller's contract.
+    unsafe {
+        core::ptr::write_unaligned(at.cast::<[u8; 8]>(), word.to_le_bytes())
+    };
 }
 
 /// The `0x402` call on the sixteen words at `input`, its eight out at
@@ -138,9 +213,7 @@ const fn tag(tag: vos_wire::credentials::Tag) -> [u64; 4] {
 /// `from` must point at 32 readable bytes.
 #[inline(always)]
 unsafe fn unaligned(from: *const u8) -> [u64; 4] {
-    unsafe {
-        core::array::from_fn(|i| u64::from_le(core::ptr::read_unaligned(from.add(8 * i).cast())))
-    }
+    unsafe { core::array::from_fn(|i| load_u64(from.add(8 * i))) }
 }
 
 /// The 32 bytes at `from`, 8-aligned, as four `u64`s.
@@ -171,12 +244,16 @@ pub unsafe fn auth_p2_lean(
     scope: *const u8,
 ) -> ([u64; 4], [u64; 4]) {
     use vos_wire::credentials::Tag;
-    let mut head = [0u64; 8];
-    let mut lane = [0u64; 12];
-    let mut nullifier = [0u64; 4];
+    // Every word is written before it is read, so none is zeroed first.
+    let mut head = MaybeUninit::<[u64; 8]>::uninit();
+    let mut lane = MaybeUninit::<[u64; 12]>::uninit();
+    let mut nullifier = MaybeUninit::<[u64; 4]>::uninit();
     // One pointer each, every access through it: the call reads and
     // writes the same buffer.
-    let (head, lane) = (head.as_mut_ptr(), lane.as_mut_ptr());
+    let (head, lane) = (
+        head.as_mut_ptr().cast::<u64>(),
+        lane.as_mut_ptr().cast::<u64>(),
+    );
     unsafe {
         let s = aligned(secret);
         let put =
@@ -185,7 +262,7 @@ pub unsafe fn auth_p2_lean(
         put(head.add(4), &s);
         p2(head, head);
         put(head.add(4), &unaligned(scope));
-        p2(head, nullifier.as_mut_ptr());
+        p2(head, nullifier.as_mut_ptr().cast::<u64>());
         put(head, &tag(Tag::Member));
         put(head.add(4), &s);
         p2(head, head.add(4));
@@ -193,14 +270,17 @@ pub unsafe fn auth_p2_lean(
         p2(head, lane.add(4));
         for level in 0..32 {
             let sibling = aligned(siblings.add(32 * level));
-            core::ptr::copy_nonoverlapping(sibling.as_ptr(), lane, 4);
-            core::ptr::copy_nonoverlapping(sibling.as_ptr(), lane.add(8), 4);
+            // A right child's call reads `sibling ‖ node` from the lane's
+            // start, a left child's `node ‖ sibling` from its middle: the
+            // sibling written on the side the bit picks.
             let left = 4 - 4 * ((slot as usize >> level) & 1);
+            core::ptr::copy_nonoverlapping(sibling.as_ptr(), lane.add(2 * left), 4);
             p2(lane.add(left), lane.add(4));
         }
         let mut root = [0u64; 4];
         core::ptr::copy_nonoverlapping(lane.add(4), root.as_mut_ptr(), 4);
-        (root, nullifier)
+        // SAFETY: the call wrote the nullifier's four words.
+        (root, nullifier.assume_init())
     }
 }
 

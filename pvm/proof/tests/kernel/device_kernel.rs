@@ -36,7 +36,11 @@ fn a_device_kernels_shape_holds_no_blake2b() {
         Some(trace.io_hash),
         vos_pvm_precompiles::compute_device_io_hash(&public, &[], &[])
     );
-    println!("auth: {} steps", trace.side_note.steps.len());
+    // Under 2^11 steps the CPU sits at the masking's floor (four times `h`
+    // = 512 rows): no step the kernel's end or its walk spares buys less.
+    let steps = trace.side_note.steps.len();
+    assert!(steps < 1 << 11, "auth: {steps} steps");
+    println!("auth: {steps} steps");
 }
 
 /// Two witnesses of different path shapes (slot 0 under the empty tree's
