@@ -265,7 +265,9 @@ paths` lists what each input reaches. The paths it covers are recorded in
 
 ## The Stwo fork's open divergences
 
-The workspace pins olanod/stwo at `9e9b4ff6` (`vos/simd-m31-reduce`: the
+The workspace pins olanod/stwo at `e14925a8` (`vos/neon-compress16`:
+Blake2s's 16-lane compression run as four NEON groups of four on
+aarch64, its words unchanged, on `vos/simd-m31-reduce`'s `9e9b4ff6`: the
 SIMD backend's Blake2s-M31 digest words reduced canonically over the whole
 u32 range, as the verifier reduces them, on `vos/grind-chunks`' `4cd1f83f`:
 the prover's parallel grind in chunks of 2^14 nonces, its nonce unchanged,
