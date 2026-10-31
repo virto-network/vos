@@ -14,7 +14,7 @@
 //!   that leader's term.
 //! - **A blob hashes to its name.**
 //! - **Each message comes on its class,** so a frame is bounded by its own
-//!   class's size, and a Raft message on its agent's stream.
+//!   class's size, and a Raft message on its agent's lane.
 //! - **A creation record comes from the node that created it,** whose
 //!   number its agent id carries.
 //!
@@ -246,7 +246,7 @@ pub enum Refusal {
     WrongBlob = 5,
     /// A message on a class not its own.
     WrongClass = 6,
-    /// A Raft message on a stream other than its agent's.
+    /// A Raft message on a stream other than its agent's lane.
     WrongStream = 7,
     /// A creation-time placement from a node other than its creator, or
     /// for an agent outside the creator's range; or a later placement from
@@ -326,15 +326,25 @@ pub fn class(message: &PeerMessage) -> Class {
     }
 }
 
-/// The stream a message travels on: its agent's, for those of a group.
-pub fn stream(message: &PeerMessage) -> u64 {
-    match message {
-        PeerMessage::Raft { agent, .. } | PeerMessage::BlobRequest { agent, .. } => {
-            u64::from(agent.0)
-        }
-        PeerMessage::SnapshotChunk(chunk) => u64::from(chunk.agent.0),
-        PeerMessage::SnapshotAck(ack) => u64::from(ack.agent.0),
-        PeerMessage::Directory { record, .. } => u64::from(record.agent.0),
+/// The streams to each peer that one class of the groups' traffic shares,
+/// unless configured otherwise: a group's frames go on one of them by its
+/// id, so a peer's connection holds a bounded number of streams however
+/// many groups talk at once.
+pub const LANES: u32 = 1024;
+
+/// The lane among `lanes` that `agent`'s frames of a class travel on.
+pub fn lane(agent: AgentId, lanes: u32) -> u64 {
+    u64::from(agent.0 % lanes.max(1))
+}
+
+/// The stream a message travels on, among `lanes`: its agent's lane, for
+/// those of a group.
+pub fn stream(message: &PeerMessage, lanes: u32) -> u64 {
+    let agent = match message {
+        PeerMessage::Raft { agent, .. } | PeerMessage::BlobRequest { agent, .. } => *agent,
+        PeerMessage::SnapshotChunk(chunk) => chunk.agent,
+        PeerMessage::SnapshotAck(ack) => ack.agent,
+        PeerMessage::Directory { record, .. } => record.agent,
         PeerMessage::DirectoryAck { agent, .. }
         | PeerMessage::DirectoryRequest { agent }
         | PeerMessage::Forward { agent, .. }
@@ -347,9 +357,10 @@ pub fn stream(message: &PeerMessage) -> u64 {
         | PeerMessage::Behind { sender: agent, .. }
         | PeerMessage::AnchorRow { agent, .. }
         | PeerMessage::AnchorRowAnswer { agent, .. }
-        | PeerMessage::Proved { agent, .. } => u64::from(agent.0),
-        PeerMessage::Blob { .. } | PeerMessage::Liveness { .. } => 0,
-    }
+        | PeerMessage::Proved { agent, .. } => *agent,
+        PeerMessage::Blob { .. } | PeerMessage::Liveness { .. } => return 0,
+    };
+    lane(agent, lanes)
 }
 
 /// A frame from a peer, whole.
@@ -357,14 +368,15 @@ pub fn decode(frame: &[u8]) -> Result<PeerMessage, Refusal> {
     PeerMessage::decode_exact(frame).ok_or(Refusal::Undecodable)
 }
 
-/// Check what `from` sent on `class` and `stream` against `space`, the
-/// nodes configured in the space, and `ours`, its id. `followed` gives the
+/// Check what `from` sent on `class` and `stream`, one of `lanes`,
+/// against `space`, the nodes configured in the space, and `ours`, its id. `followed` gives the
 /// leader a replica of an agent follows and its term, if it follows one.
 pub fn check(
     space: &[NodeNumber],
     ours: &SpaceId,
     from: NodeNumber,
     (class, stream): (Class, u64),
+    lanes: u32,
     message: &PeerMessage,
     followed: impl FnOnce(AgentId) -> Option<(NodeNumber, u64)>,
 ) -> Result<(), Refusal> {
@@ -375,7 +387,7 @@ pub fn check(
         return Err(Refusal::WrongClass);
     }
     match message {
-        PeerMessage::Raft { agent, .. } if stream != u64::from(agent.0) => {
+        PeerMessage::Raft { agent, .. } if stream != lane(*agent, lanes) => {
             Err(Refusal::WrongStream)
         }
         PeerMessage::Raft { message, .. } => check_raft(from, message),

@@ -120,6 +120,15 @@ impl Cluster {
         Self::build(count, true, Some(WindowClock::DEFAULT), Box::new(|_, _| {}))
     }
 
+    /// Nodes 1..=count over QUIC on localhost, each config tuned by
+    /// `tuning` as [`Cluster::tuned`] tunes it.
+    pub fn over_quic_tuned(
+        count: u8,
+        tuning: impl Fn(NodeNumber, &mut Config) + Send + Sync + 'static,
+    ) -> Self {
+        Self::build(count, true, Some(WindowClock::DEFAULT), Box::new(tuning))
+    }
+
     /// Nodes 1..=count on the hub, each config tuned by `tuning` past the
     /// harness's own: elections of one to two seconds, slow enough that a
     /// host starved for a second does not let a heartbeat lapse and move a
@@ -690,7 +699,7 @@ impl Impersonation {
             .send(
                 to,
                 Class::Requests,
-                vos_node::peer::stream(message),
+                vos_node::peer::stream(message, vos_node::peer::LANES),
                 message.encode(),
             )
             .unwrap();

@@ -138,6 +138,7 @@ impl Node {
             directory: Directory::default(),
             dropping: Mutex::new(HashMap::new()),
             runs: Mutex::new(HashMap::new()),
+            leaders: Mutex::new(HashSet::new()),
             dry_runs: Mutex::new(HashMap::new()),
             wanted: Mutex::new(HashMap::new()),
             drops: crate::peer::Drops::default(),
@@ -158,9 +159,16 @@ impl Node {
             retiring: Mutex::new(HashSet::new()),
             halted: AtomicBool::new(false),
             liveness: crate::liveness::Liveness::new(incarnation),
+            campaigns: crate::group::Campaigns::new(settings.campaigns),
             unrecorded: crate::prover::Unrecorded::default(),
             backlog: Mutex::new(None),
         });
+        let waking = Arc::downgrade(&inner);
+        inner.campaigns.waking(Box::new(move |agent| {
+            waking
+                .upgrade()
+                .is_some_and(|inner| inner.to_group(agent, crate::group::Local::Wake))
+        }));
         inner.resume(records, placements);
         let liveness = arrivals.map(|arrivals| start_liveness(&inner, arrivals));
         inner.spawn(super::directory::resend_records(Arc::clone(&inner)));
@@ -349,6 +357,7 @@ fn connect(
             let (quic, arrivals) = vos_net::quic::Quic::bind(vos_net::quic::Config {
                 peers: space.peers(),
                 idle: config.quic_idle,
+                streams: config.peer_lanes.max(1).saturating_mul(4),
                 ..vos_net::quic::Config::new(number, secret, listen)
             })
             .map_err(|error| Error::Data(format!("{listen}: {error}")))?;

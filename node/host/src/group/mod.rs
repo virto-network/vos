@@ -7,8 +7,8 @@ mod driver;
 mod epochs;
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::sync::atomic::AtomicU64;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use vos_raft::core::{ChangeMembershipError, ProposeError, ReadIndexError};
@@ -162,6 +162,80 @@ pub(crate) enum Quiet {
     Leading { members: Vec<NodeNumber> },
 }
 
+/// The campaigns a node's groups run at once, bounded: a group's driver
+/// holds a [`Campaign`] from its election timer's firing until it leads,
+/// follows a leader, or the timer fires again. Those that find none free
+/// wait in turn, each woken as one is given back.
+pub(crate) struct Campaigns {
+    most: usize,
+    state: Mutex<Running>,
+    /// Wakes a waiting group: false when it no longer runs here.
+    wake: OnceLock<Box<dyn Fn(AgentId) -> bool + Send + Sync>>,
+}
+
+#[derive(Default)]
+struct Running {
+    running: usize,
+    waiting: VecDeque<AgentId>,
+}
+
+impl Campaigns {
+    pub(crate) fn new(most: usize) -> Arc<Self> {
+        Arc::new(Self {
+            most,
+            state: Mutex::new(Running::default()),
+            wake: OnceLock::new(),
+        })
+    }
+
+    /// Wake a waiting group with `wake`, as the node does.
+    pub(crate) fn waking(&self, wake: Box<dyn Fn(AgentId) -> bool + Send + Sync>) {
+        let _ = self.wake.set(wake);
+    }
+
+    /// One of the campaigns for `agent`: none while as many as the bound
+    /// run, or other groups wait before it, and it waits in turn.
+    pub(crate) fn take(self: &Arc<Self>, agent: AgentId) -> Option<Campaign> {
+        let mut state = lock(&self.state);
+        let first = state.waiting.front().is_none_or(|first| *first == agent);
+        if state.running < self.most && first {
+            if !state.waiting.is_empty() {
+                state.waiting.pop_front();
+            }
+            state.running += 1;
+            return Some(Campaign(Arc::clone(self)));
+        }
+        if !state.waiting.contains(&agent) {
+            state.waiting.push_back(agent);
+        }
+        None
+    }
+
+    /// Give one back: the first group waiting that still runs is woken.
+    fn give_back(&self) {
+        let mut state = lock(&self.state);
+        state.running = state.running.saturating_sub(1);
+        let Some(wake) = self.wake.get() else {
+            return;
+        };
+        while let Some(&first) = state.waiting.front() {
+            if wake(first) {
+                return;
+            }
+            state.waiting.pop_front();
+        }
+    }
+}
+
+/// One campaign of a node's bounded number, given back when dropped.
+pub(crate) struct Campaign(Arc<Campaigns>);
+
+impl Drop for Campaign {
+    fn drop(&mut self) {
+        self.0.give_back();
+    }
+}
+
 /// How many results' outcomes a group remembers, for its leader loop to
 /// read after its own apply.
 const OUTCOMES: usize = 256;
@@ -313,6 +387,33 @@ mod tests {
             } => term,
             _ => panic!("a vote's answer"),
         }
+    }
+
+    #[test]
+    fn campaigns_run_up_to_their_bound_and_go_to_the_waiting_in_turn() {
+        let campaigns = Campaigns::new(2);
+        let woken = Arc::new(Mutex::new(Vec::new()));
+        let wakes = Arc::clone(&woken);
+        // Agent 9 no longer runs: it is passed over.
+        campaigns.waking(Box::new(move |agent: AgentId| {
+            lock(&wakes).push(agent.0);
+            agent.0 != 9
+        }));
+        let (a, b, c, d, gone) = (AgentId(1), AgentId(2), AgentId(3), AgentId(4), AgentId(9));
+        let first = campaigns.take(a).expect("one");
+        let second = campaigns.take(b).expect("two");
+        assert!(campaigns.take(gone).is_none(), "past the bound");
+        assert!(campaigns.take(c).is_none());
+        assert!(campaigns.take(d).is_none());
+        drop(first);
+        assert_eq!(*lock(&woken), [9, 3], "the first that still runs");
+        assert!(campaigns.take(d).is_none(), "not its turn");
+        let third = campaigns.take(c).expect("its turn");
+        drop(second);
+        assert_eq!(lock(&woken).last(), Some(&4));
+        let fourth = campaigns.take(d).expect("its turn");
+        drop((third, fourth));
+        assert!(campaigns.take(a).is_some());
     }
 
     #[test]

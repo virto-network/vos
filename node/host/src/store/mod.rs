@@ -46,7 +46,7 @@ pub use batch::Batch;
 pub use entry::{BlobRef, EntryKind, LARGE_RESULT, LogEntry};
 pub use fjall::{Error, PersistMode};
 pub use keys::{LAYOUT, NODE_AGENT, decode_configuration, encode_configuration, next_epoch};
-pub use read::{Export, Snapshot};
+pub use read::{Export, Snapshot, Unapplied};
 pub use tuning::Tuning;
 pub use vos_wire::peer::NodeNumber;
 

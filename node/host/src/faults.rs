@@ -285,6 +285,10 @@ impl Network for Lossy {
     ) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         self.network.ready(to, class)
     }
+
+    fn limits(&self) -> vos_net::Limits {
+        self.network.limits()
+    }
 }
 
 struct FaultHooks(Arc<Faults>);

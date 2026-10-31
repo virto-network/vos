@@ -33,6 +33,13 @@ pub struct Config {
     pub max_inputs: usize,
     /// The most argument bytes in one batch.
     pub max_bytes: usize,
+    /// The most batches an agent's leader has proposed whose results have
+    /// not yet applied: each refines over the writes of those before it.
+    /// One by default: on one host's three nodes, at 5,000 calls a second
+    /// and 10^6 users, more split the inputs into more, smaller batches,
+    /// whose refines and log entries cost more than the queue's wait they
+    /// save (7.6d's runs).
+    pub in_flight: usize,
     /// How long a leader waits for more inputs after the first, when it
     /// found its queue empty.
     pub linger: Duration,
@@ -71,11 +78,22 @@ pub struct Config {
     pub peer_bind: Option<std::net::SocketAddr>,
     /// How long a connection to a peer may stay quiet before it closes.
     pub quic_idle: Duration,
+    /// The streams to each peer that one class of the groups' traffic
+    /// shares: a group's consensus messages go on one of them by its id,
+    /// and its requests on another. A peer may hold four times as many
+    /// open at once, so no group waits for a stream however many talk at
+    /// once. The same on every node of a space.
+    pub peer_lanes: u32,
     /// A replica group's election timeout in milliseconds, drawn between
     /// these.
     pub election_timeout_ms: (u64, u64),
     /// How often a group's leader sends heartbeats, in milliseconds.
     pub heartbeat_ms: u64,
+    /// The most campaigns the node's groups run at once: a group whose
+    /// election comes due past them puts it off by a fresh election
+    /// timeout, so a node that wakes many leaderless groups at once (at
+    /// its start, or a peer lost) elects them in turn.
+    pub campaigns: usize,
     /// How long the node's oldest pending commit may wait before its
     /// writer counts as stalled, and the groups it leads hand over: by
     /// default (`None`) the election timeout's upper end, so a slow sync
@@ -175,6 +193,7 @@ impl Config {
             queue: 1024,
             max_inputs: 256,
             max_bytes: 1 << 20,
+            in_flight: 1,
             linger: Duration::from_millis(2),
             refine_gas: defaults::REFINE_GAS,
             accumulate_gas: defaults::REFINE_GAS,
@@ -189,9 +208,11 @@ impl Config {
             prover_options: vos_node_prover::Options::default(),
             peer_bind: None,
             quic_idle: vos_net::quic::IDLE,
+            peer_lanes: crate::peer::LANES,
             peers: Peers::Quic,
             election_timeout_ms: (1500, 3000),
             heartbeat_ms: 500,
+            campaigns: 4096,
             writer_stall: None,
             answered: Duration::from_secs(30),
             resend_round: Duration::from_secs(1),
@@ -227,6 +248,8 @@ pub(crate) struct Settings {
     pub(crate) queue_cap: usize,
     pub(crate) max_inputs: usize,
     pub(crate) max_bytes: usize,
+    /// [`Config::in_flight`], one at least.
+    pub(crate) in_flight: usize,
     pub(crate) linger: Duration,
     pub(crate) refine_gas: u64,
     pub(crate) accumulate_gas: u64,
@@ -234,6 +257,10 @@ pub(crate) struct Settings {
     pub(crate) answered: Duration,
     pub(crate) resend_round: Duration,
     pub(crate) heartbeat_ms: u64,
+    /// [`Config::peer_lanes`], one at least.
+    pub(crate) lanes: u32,
+    /// [`Config::campaigns`], one at least.
+    pub(crate) campaigns: usize,
     pub(crate) compact_every: u64,
     pub(crate) compact_bytes: u64,
     pub(crate) compact_tail: u64,
@@ -260,6 +287,7 @@ impl Settings {
             queue_cap: config.queue,
             max_inputs: config.max_inputs.max(1),
             max_bytes: config.max_bytes,
+            in_flight: config.in_flight.max(1),
             linger: config.linger,
             refine_gas: config.refine_gas,
             accumulate_gas: config.accumulate_gas,
@@ -267,6 +295,8 @@ impl Settings {
             answered: config.answered,
             resend_round: config.resend_round,
             heartbeat_ms: config.heartbeat_ms,
+            lanes: config.peer_lanes.max(1),
+            campaigns: config.campaigns.max(1),
             compact_every: config.compact_every,
             compact_bytes: config.compact_bytes,
             compact_tail: config.compact_tail,

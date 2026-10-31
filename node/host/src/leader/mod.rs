@@ -1,9 +1,10 @@
 //! An agent's leader loop, while this node leads its group. Per batch, in
-//! order: refine against the applied state, a dry run of accumulate on the
-//! same state, the result proposed, and once this replica has applied it,
-//! the replies, the outbox's deliveries and the acknowledgements. Between
-//! batches, the outbox's windows go again: in rounds, or at once when a
-//! receiver finds this agent behind it.
+//! order: refine against the applied state with the writes of the batches
+//! in flight over it, a dry run of accumulate on the same state, the
+//! result proposed, and once this replica has applied it, the replies, the
+//! outbox's deliveries and the acknowledgements. A few batches fly at
+//! once, landing in order. Between batches, the outbox's windows go again:
+//! in rounds, or at once when a receiver finds this agent behind it.
 
 mod anchor;
 mod batch;
@@ -17,7 +18,7 @@ mod settle;
 mod sweep;
 mod window;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -99,9 +100,18 @@ struct Leader {
     shared: Arc<Shared>,
     id: AgentId,
     term: u64,
-    /// The index applied when the last batch read its state, then the
-    /// index of its result.
+    /// The index of the state the next batch runs on: applied, or the
+    /// last batch in flight's.
     applied: u64,
+    /// The batches proposed whose results have yet to apply here, oldest
+    /// first.
+    in_flight: VecDeque<execute::Flight>,
+    /// A batch in flight did not apply as proposed: those after it land
+    /// before another flies.
+    doomed: bool,
+    /// A batch in flight ran fewer inputs than it took: it lands before
+    /// another flies.
+    cut_short: bool,
     /// The node's clock trails the agent's time: batches are timed at the
     /// agent's.
     trailing: bool,
@@ -118,7 +128,7 @@ struct Leader {
     /// writes: a second time, the batch is shortened as a failing one is.
     skipped: bool,
     sweeps: Sweeps,
-    /// When the last batch ended.
+    /// When the last batch ended: landed, or made no batch.
     ended: Option<Instant>,
     /// When it last told senders whose messages the queue dropped full
     /// that they are behind.
@@ -143,6 +153,8 @@ enum Taken {
     /// The representative's waiting anchors are due again: offered, with
     /// no batch.
     Anchor,
+    /// The oldest batch in flight applied, or leadership ended: it lands.
+    Land,
 }
 
 /// What woke an idle leader.
@@ -158,6 +170,8 @@ enum Woke {
     /// Its replica's root builder finished a window's cut: a report, a
     /// close or a read may be due.
     Built,
+    /// The oldest batch in flight applied.
+    Applied,
 }
 
 /// How a batch ended.
@@ -180,6 +194,9 @@ impl Leader {
             id: shared.agent,
             term,
             applied: 0,
+            in_flight: VecDeque::new(),
+            doomed: false,
+            cut_short: false,
             trailing: false,
             marks: HashMap::new(),
             windows: HashMap::new(),
@@ -210,12 +227,18 @@ impl Leader {
                 Taken::Sweep | Taken::Serve => Some(Vec::new()),
                 Taken::Anchor => None,
                 Taken::Marker => {
-                    if !self.marker().await {
+                    if !self.land_all().await || !self.marker().await {
                         return false;
                     }
                     None
                 }
                 Taken::Rounds => None,
+                Taken::Land => {
+                    if !self.land_oldest().await {
+                        return false;
+                    }
+                    None
+                }
             };
             match pending {
                 // Woken by a timer alone: let the node's other tasks run.
@@ -225,10 +248,24 @@ impl Leader {
                         self.inner.stats.between.took(ended.elapsed());
                     }
                     let ran = self.run(pending).await;
-                    self.ended = Some(Instant::now());
+                    // A batch launched ends as it lands.
+                    if self.in_flight.is_empty() {
+                        self.ended = Some(Instant::now());
+                    }
                     if !ran {
                         return false;
                     }
+                }
+            }
+            // Those applied land now; a full flight lands its oldest
+            // before another batch flies.
+            while self.in_flight.front().is_some_and(|flight| {
+                let state = self.shared.state();
+                state.applied >= flight.index || !leads(&state, self.term)
+            }) || self.in_flight.len() >= self.inner.settings.in_flight
+            {
+                if !self.land_oldest().await {
+                    return false;
                 }
             }
             // Woken for a round, or between batches: windows due go again.
@@ -237,7 +274,8 @@ impl Leader {
                 break;
             }
         }
-        true
+        // What is still in flight ends with the leadership.
+        self.land_all().await
     }
 
     /// Recover the outbox before taking any input, trying again after a
@@ -294,11 +332,54 @@ impl Leader {
             for sender in told {
                 self.inner.behind(sender, self.id);
             }
-            if queued {
+            // A batch flies once the one before it committed: its append
+            // then goes alone, and inputs gather meanwhile, rather than
+            // split into more, smaller batches the executors and the log
+            // pay for each.
+            let term = self.term;
+            let last = self.in_flight.back().map(|flight| flight.index);
+            let committed = |state: &State| last.is_none_or(|last| state.commit >= last);
+            if queued && committed(&self.shared.state()) {
                 break;
             }
-            if !leads(&self.shared.state(), self.term) {
+            if !leads(&self.shared.state(), term) {
                 return None;
+            }
+            // While batches fly, the oldest lands, the last commits, or
+            // inputs come: what idles a leader waits until they have landed.
+            if let Some(index) = self.in_flight.front().map(|flight| flight.index) {
+                let woken = async {
+                    if queued {
+                        std::future::pending::<()>().await;
+                    }
+                    match self.agent.woken.recv().await {
+                        Ok(()) => Woke::Queue,
+                        Err(_) => Woke::Lost,
+                    }
+                };
+                let applied = async {
+                    self.shared
+                        .wait(|state| {
+                            state.stopped || !leads(state, term) || state.applied >= index
+                        })
+                        .await;
+                    Woke::Applied
+                };
+                let commits = async {
+                    if !queued {
+                        std::future::pending::<()>().await;
+                    }
+                    self.shared.wait(committed).await;
+                    Woke::Recheck
+                };
+                match woken.or(applied).or(commits).await {
+                    Woke::Queue => {
+                        waited = true;
+                        continue;
+                    }
+                    Woke::Recheck => continue,
+                    _ => return Some(Taken::Land),
+                }
             }
             // Idle: a sweep due runs alone, after the node's other tasks.
             let sweep = self.sweep_wait();
@@ -380,7 +461,7 @@ impl Leader {
                 Woke::Queue => waited = true,
                 Woke::Lost => return None,
                 Woke::Round => return Some(Taken::Rounds),
-                Woke::Recheck | Woke::Built => {}
+                Woke::Recheck | Woke::Built | Woke::Applied => {}
             }
         }
         if waited {

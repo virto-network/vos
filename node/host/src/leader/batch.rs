@@ -10,11 +10,11 @@ use vos_wire::ids::AgentId;
 use vos_wire::keys;
 
 use super::close::Closes;
-use super::sweep::{due_rows, first_due};
-use super::{Ended, Leader};
+use super::execute::{Flight, Launched};
+use super::{Ended, Leader, is_due};
 use crate::fault::{Fault, read};
 use crate::node::{Answered, Pending, Reply};
-use crate::store::{BlobRef, Snapshot};
+use crate::store::{BlobRef, Snapshot, Unapplied};
 use crate::{Backoff, lock, raise, random};
 
 /// How far this node's clock may trail the agent's time before the leader
@@ -38,13 +38,28 @@ impl Leader {
         })
     }
 
-    /// Run one batch to its end. False when a hook stops the leader.
+    /// Prepare one batch on the state the batches in flight leave, and
+    /// launch it: it flies with them, up to the bound in flight, the
+    /// oldest landing first once the bound is reached. A batch with an
+    /// admin command, or with duties due, waits for those in flight to
+    /// land: it runs on the applied state. False when a hook stops the
+    /// leader.
     pub(super) async fn run(&mut self, mut pending: Vec<Pending>) -> bool {
+        // An install's programs are pinned as it applies: a batch after
+        // it refines once it has. Nor does a batch fly over one that did
+        // not apply as proposed.
+        let admin = pending
+            .iter()
+            .any(|item| matches!(item, Pending::Admin { .. }));
+        if (admin || self.doomed || self.cut_short) && !self.land_all().await {
+            self.agent.requeue(pending);
+            return false;
+        }
         let taken = Instant::now();
         // Whether to sweep, and what reads to serve, are decided below, on
         // the batch's state.
         pending.retain(|item| !matches!(item, Pending::Sweep(_) | Pending::Duty(_)));
-        let snapshot = Arc::new(self.inner.store.snapshot());
+        let snapshot = Arc::new(self.state());
         let before = Arc::clone(&snapshot);
         // The batch is refined on this state, at its version and no earlier
         // than its time: an entry an earlier leadership left may have
@@ -52,12 +67,15 @@ impl Leader {
         let read_state = read::<u64>(&snapshot, self.id, &keys::version()).and_then(|version| {
             let applied = snapshot.applied(self.id)?;
             let floor = read::<u64>(&snapshot, self.id, &keys::batch_time())?;
-            let first = first_due(&snapshot, self.id)?;
+            let first = self.sweeps.first_due(&snapshot, self.id)?;
             Ok((version, applied, floor, first))
         });
         let (version, floor, first) = match read_state {
             Ok((version, applied, floor, first)) => {
-                self.applied = applied.unwrap_or(0);
+                self.applied = match self.in_flight.back() {
+                    Some(flight) => flight.index,
+                    None => applied.unwrap_or(0),
+                };
                 (version.unwrap_or(0), floor.unwrap_or(0), first)
             }
             Err(fault) => {
@@ -84,7 +102,7 @@ impl Leader {
         // rows due at the batch's time, which refine takes by their keys.
         let sweeping = first.filter(|first| self.sweeps(*first, time));
         if sweeping.is_some() {
-            match due_rows(&snapshot, self.id, time) {
+            match self.sweeps.due_rows(&snapshot, self.id, time) {
                 Ok(due) => pending.insert(0, Pending::Sweep(due)),
                 Err(fault) => {
                     self.retry(pending, fault).await;
@@ -93,6 +111,20 @@ impl Leader {
             }
         }
         match self.duties(&snapshot) {
+            // Duties are made on the applied state, as their rows apply
+            // apart from the agent's writes: those in flight land first,
+            // and the batch is made again.
+            Ok(Some(duties)) if !duties.is_empty() && !self.in_flight.is_empty() => {
+                let pending = pending
+                    .into_iter()
+                    .filter(|item| !matches!(item, Pending::Sweep(_)))
+                    .collect();
+                if !self.land_all().await {
+                    self.agent.requeue(pending);
+                    return false;
+                }
+                return Box::pin(self.run(pending)).await;
+            }
             Ok(Some(duties)) => pending.extend(duties),
             Ok(None) => {
                 self.agent.requeue(pending);
@@ -122,7 +154,126 @@ impl Leader {
             })
             .collect();
         self.inner.stats.prepare.took(taken.elapsed());
-        match self.execute(snapshot, batch, blobs, None).await {
+        match self.launch(snapshot, batch, blobs, None).await {
+            Ok(Launched::Proposed {
+                index,
+                result,
+                writes,
+                proposed,
+            }) => {
+                self.sweeps.writes(&writes);
+                // The batches after it read its senders' marks over its
+                // writes: those it ran, and not those it cut short.
+                for item in &pending {
+                    if let Pending::Message(message) | Pending::Failed(message) = item {
+                        self.marks.remove(&message.from);
+                    }
+                }
+                // Inputs a result cut short go again once it lands: no
+                // batch flies past them meanwhile, so none overtakes them.
+                let ran = result.steps.iter().filter(|step| !is_due(step)).count();
+                if ran < pending.len() {
+                    self.cut_short = true;
+                }
+                self.in_flight.push_back(Flight {
+                    pending,
+                    result,
+                    before,
+                    index,
+                    writes,
+                    sweeping,
+                    started: taken,
+                    proposed,
+                });
+                let flying = self.in_flight.len() as u64;
+                self.inner.stats.in_flight.record(flying);
+                true
+            }
+            Ok(Launched::Lost) => {
+                let hint = self.inner.not_leader(&self.shared);
+                for item in pending {
+                    item.refuse(&hint);
+                }
+                true
+            }
+            // Refined over batches in flight, the failure may be of a state
+            // that never applies: those land, and the inputs go again, on
+            // the applied state.
+            Err(Fault::Agent(_)) if !self.in_flight.is_empty() => {
+                let landed = self.land_all().await;
+                self.agent.requeue(pending);
+                landed
+            }
+            Err(Fault::Agent(message)) => {
+                if let Some(first) = sweeping.filter(|_| pending.len() == 1) {
+                    self.sweeps.swept(first);
+                }
+                self.fail(pending, message);
+                true
+            }
+            Err(fault) if self.ended_by(&fault) => false,
+            Err(fault) => {
+                self.retry(pending, fault).await;
+                true
+            }
+        }
+    }
+
+    /// The state the next batch runs on: the applied state, with the
+    /// writes of the batches in flight over it.
+    pub(super) fn state(&self) -> Snapshot {
+        let snapshot = self.inner.store.snapshot();
+        if self.in_flight.is_empty() {
+            return snapshot;
+        }
+        let writes = self.in_flight.iter().flat_map(|flight| &flight.writes);
+        snapshot.over(Arc::new(Unapplied::new(self.id, writes)))
+    }
+
+    /// Land the oldest batch in flight, once it applied here or leadership
+    /// ended, and act on how it ended. False when a hook stops the leader.
+    pub(super) async fn land_oldest(&mut self) -> bool {
+        let Some(flight) = self.in_flight.pop_front() else {
+            return true;
+        };
+        let ended = self.land(&flight).await;
+        self.landed(flight, ended).await
+    }
+
+    /// Land every batch in flight. False when a hook stops the leader.
+    pub(super) async fn land_all(&mut self) -> bool {
+        while !self.in_flight.is_empty() {
+            if !self.land_oldest().await {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Act on how `flight` ended. Once one did not apply as proposed, those
+    /// after it ran over writes that never applied: they apply as no
+    /// writes, or not at all, and their inputs go again, uncounted.
+    async fn landed(&mut self, flight: Flight, ended: Result<Ended, Fault>) -> bool {
+        let Flight {
+            pending,
+            result: _,
+            before,
+            index,
+            sweeping,
+            ..
+        } = flight;
+        let doomed = self.doomed;
+        if !matches!(ended, Ok(Ended::Done(_))) {
+            // What those after it took as consumed, or as swept, is not.
+            self.doomed = true;
+            self.marks.clear();
+            self.sweeps.lost_writes();
+        }
+        if self.in_flight.is_empty() {
+            self.doomed = false;
+            self.cut_short = false;
+        }
+        match ended {
             Ok(Ended::Done(result)) => {
                 self.skipped = false;
                 self.max_inputs = self.inner.settings.max_inputs;
@@ -130,11 +281,11 @@ impl Leader {
                 if let Some(first) = sweeping {
                     self.sweeps.swept(first);
                 }
-                if !self.inner.hooks.after_commit(self.id, self.applied) {
+                if !self.inner.hooks.after_commit(self.id, index) {
                     return false;
                 }
                 let dispatching = Instant::now();
-                self.settle(pending, &result, &before);
+                self.settle(pending, &result, &before, index);
                 self.inner.stats.dispatch.took(dispatching.elapsed());
             }
             Ok(Ended::Lost) => {
@@ -143,6 +294,7 @@ impl Leader {
                     item.refuse(&hint);
                 }
             }
+            Ok(Ended::Skipped) if doomed => self.agent.requeue(pending),
             Ok(Ended::Skipped) if self.skipped => {
                 self.skipped = false;
                 self.fail(pending, "applied as no writes again".into());
@@ -155,15 +307,10 @@ impl Leader {
                 self.skipped = true;
                 self.agent.requeue(pending);
             }
-            Err(Fault::Agent(message)) => {
-                if let Some(first) = sweeping.filter(|_| pending.len() == 1) {
-                    self.sweeps.swept(first);
-                }
-                self.fail(pending, message);
-            }
             Err(fault) if self.ended_by(&fault) => return false,
             Err(fault) => self.retry(pending, fault).await,
         }
+        self.ended = Some(Instant::now());
         true
     }
 
@@ -208,7 +355,13 @@ impl Leader {
                     let mark = self.marks[&message.from];
                     let expected = next.entry(message.from).or_insert(mark + 1);
                     if message.sequence <= mark {
-                        raise(&mut acks, message.from, mark);
+                        // Acknowledged only once applied: one a batch in
+                        // flight consumes is acknowledged as it applies.
+                        if let Some(applied) = self.applied_mark(message.from)
+                            && message.sequence <= applied
+                        {
+                            raise(&mut acks, message.from, applied);
+                        }
                         continue;
                     }
                     if message.sequence > *expected {
@@ -253,6 +406,15 @@ impl Leader {
             self.inner.behind(sender, self.id);
         }
         kept
+    }
+
+    /// `from`'s pair mark as applied, read from the store: the only mark a
+    /// message is acknowledged at. None when it cannot be read.
+    fn applied_mark(&self, from: AgentId) -> Option<u64> {
+        let snapshot = self.inner.store.snapshot();
+        read::<u64>(&snapshot, self.id, &keys::pair_in(from))
+            .ok()
+            .map(|mark| mark.unwrap_or(0))
     }
 
     /// A batch's time: the node's clock, held at the agent's time, `floor`,

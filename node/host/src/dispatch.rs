@@ -59,7 +59,7 @@ impl Inner {
             let _ = network.send(
                 to,
                 peer::class(message),
-                peer::stream(message),
+                peer::stream(message, self.settings.lanes),
                 message.encode(),
             );
         }
@@ -119,11 +119,19 @@ impl Inner {
             let inner = Arc::clone(self);
             let space = Arc::clone(&self.numbers);
             let (ours, _) = self.space_and_clock();
+            let lanes = self.settings.lanes;
             self.spawn(async move {
                 let checked = inner
                     .offload(move || {
-                        let checked =
-                            peer::check(&space, &ours, from, (class, stream), &message, |_| None);
+                        let checked = peer::check(
+                            &space,
+                            &ours,
+                            from,
+                            (class, stream),
+                            lanes,
+                            &message,
+                            |_| None,
+                        );
                         (checked, message)
                     })
                     .await;
@@ -150,6 +158,7 @@ impl Inner {
             &ours,
             from,
             (class, stream),
+            self.settings.lanes,
             &message,
             |agent| self.followed(agent),
         );

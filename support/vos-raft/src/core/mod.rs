@@ -191,10 +191,11 @@ pub struct Recovered<N: NodeId> {
     pub applied: u64,
     /// The last log position (index, term) a replica held before its host
     /// wiped its log and state, keeping its term and vote: it votes only
-    /// for candidates whose log reaches it, as if it still held that log.
-    /// A host that wipes a replica a change removed keeps it, so the
-    /// replica, added again empty, never votes for a removed one that
-    /// never learned of its removal.
+    /// for candidates whose log reaches it, and campaigns only once its
+    /// own log does, as if it still held that log. A host that wipes a
+    /// replica a change removed keeps it, so the replica, added again
+    /// empty, never votes for a removed one that never learned of its
+    /// removal, nor leads by a configuration older than one it held.
     pub vote_floor: Option<(u64, u64)>,
 }
 
@@ -500,6 +501,46 @@ impl<N: NodeId> Core<N> {
         if self.now >= self.election_deadline {
             self.on_timer();
         }
+    }
+
+    /// Whether a tick at `now` would start a campaign, or a campaign's
+    /// next round: a member that does not lead, can write, holds the log it
+    /// held before any wipe, and whose election deadline is due.
+    pub fn campaign_due(&self, now: u64) -> bool {
+        self.role != Role::Leader
+            && now.max(self.now) >= self.election_deadline
+            && self.is_member()
+            && !self.writer_stalled
+            && !self.short_of_floor()
+    }
+
+    /// Put off a campaign due at `now` until `until`: a host that bounds
+    /// the campaigns its groups run at once defers the others, and starts
+    /// each again as one ends ([`Self::campaign_now`]).
+    pub fn defer_campaign(&mut self, now: u64, until: u64) {
+        self.now = self.now.max(now);
+        if self.role != Role::Leader {
+            self.election_deadline = until.max(self.now);
+        }
+    }
+
+    /// A campaign put off may start at `now`: its election deadline comes
+    /// due then, unless it heard a leader since within the election
+    /// timeout's lower end.
+    pub fn campaign_now(&mut self, now: u64) {
+        self.now = self.now.max(now);
+        let low = self.cfg.election_timeout_ms.0;
+        let heard = self
+            .last_heard_leader
+            .is_some_and(|heard| heard + low > self.now);
+        if self.role != Role::Leader && !heard {
+            self.election_deadline = self.election_deadline.min(self.now);
+        }
+    }
+
+    /// Whether it is campaigning: a pre-candidate or a candidate.
+    pub fn campaigning(&self) -> bool {
+        matches!(self.role, Role::PreCandidate | Role::Candidate)
     }
 
     /// When the core next needs a tick.

@@ -555,3 +555,46 @@ fn a_program_leaves_the_pool_with_its_last_pin() {
         "a restart pools a program pinned"
     );
 }
+
+/// Calls from many sessions at once keep several batches in flight, each
+/// refined over those before it: every call runs once, in each session's
+/// order, and every replica applies the same.
+#[test]
+fn batches_fly_over_those_before_them() {
+    let cluster = Cluster::tuned(3, |_, config| config.in_flight = 4);
+    let agent = cluster.counter_agent(&[1, 2, 3]);
+    let leader = cluster.leader(agent);
+    const SESSIONS: u8 = 16;
+    const CALLS: u64 = 20;
+    std::thread::scope(|scope| {
+        for name in 1..=SESSIONS {
+            let cluster = &cluster;
+            scope.spawn(move || {
+                let mut session = cluster.session(agent);
+                session.name = [name; 16];
+                for sequence in 1..=CALLS {
+                    let request = vos_wire::batch::Request {
+                        session,
+                        ..cluster.request(agent, sequence, 1)
+                    };
+                    let reply = cluster.call_at_leader(agent, request);
+                    assert!(matches!(reply, Ok(Reply::Ran(_))), "{reply:?}");
+                }
+            });
+        }
+    });
+    assert_eq!(cluster.value(leader, agent), u64::from(SESSIONS) * CALLS);
+    cluster.converged(agent);
+    let stats = cluster.node(leader).stats();
+    let flying = stats
+        .stages
+        .iter()
+        .find(|stage| stage.name == "in_flight")
+        .expect("the in-flight stage");
+    let most = flying
+        .counts
+        .iter()
+        .rposition(|count| *count > 0)
+        .expect("batches flew");
+    assert!(most >= 2, "at most {most} in flight");
+}

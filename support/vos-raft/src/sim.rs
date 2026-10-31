@@ -21,7 +21,7 @@ use crate::core::{Action, ActiveConfigRecord, Answer, Core, Recovered, SnapshotS
 use crate::log_entry::{EntryKind, LogEntry};
 use crate::message::Message;
 use crate::meta::Meta;
-use crate::pair::PeerTable;
+use crate::pair::{Frame, PeerTable, Round};
 pub use crate::random::Random;
 use crate::role::Role;
 
@@ -760,13 +760,19 @@ impl Cluster {
                     if self.cores.contains_key(&to)
                         && let Some(pair) = self.pair.as_mut()
                     {
-                        let heard = pair.tables.entry(to).or_default().heard(
-                            from,
-                            now,
+                        // Each round lists the one group whole.
+                        let frame = Frame {
                             incarnation,
                             round,
-                            leading.map(|term| ((), term)),
-                        );
+                            part: 0,
+                            parts: 1,
+                            listing: Round {
+                                since: 0,
+                                leading: leading.map(|term| ((), term)).into_iter().collect(),
+                                unlisted: Vec::new(),
+                            },
+                        };
+                        let heard = pair.tables.entry(to).or_default().heard(from, now, frame);
                         // A peer's new run, or one heard again after a
                         // silence, is probed, as a node does.
                         let gap = self.cfg.election_timeout_ms.1;

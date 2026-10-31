@@ -158,6 +158,104 @@ fn quiet_groups_elect_again_when_their_leaders_node_stops() {
     assert!(quiet, "the groups never went quiet again");
 }
 
+/// Each node leads more groups than its peers' liveness queues hold a
+/// listing of, frames delayed on the way: a round's frames past the
+/// queue's budget wait for room, and later rounds name only what changed.
+/// Every idle group stays quiet, and no term moves, while one of them
+/// takes calls. A listing whose last frames each round's queue refused
+/// would leave the same groups unlisted round after round, their
+/// followers electing.
+#[test]
+fn a_listing_larger_than_a_peers_queue_keeps_every_idle_group_quiet() {
+    let cluster = Cluster::new(3);
+    let agents = agents(&cluster, 150);
+    cluster.install(agents[0]);
+    let all_quiet = |cluster: &Cluster| {
+        cluster.running().all(|(_, node)| {
+            let groups = node.stats().groups;
+            groups.quiet == groups.replicas
+        })
+    };
+    wait_until("every replica is quiet", || all_quiet(&cluster));
+    // Eight groups a frame, and a queue of five frames: some fifty groups
+    // a node leads take seven.
+    cluster.hub.set_limits(vos_net::Limits {
+        liveness: 160,
+        ..vos_net::Limits::DEFAULT
+    });
+    cluster.hub.set_delay(Duration::from_millis(5));
+    let before = terms(&cluster, &agents);
+    let until = Instant::now() + Duration::from_secs(6);
+    let mut calls = 0;
+    while Instant::now() < until {
+        calls += 1;
+        assert_eq!(
+            done(cluster.increment_at_leader(agents[0], calls, 1)),
+            calls
+        );
+    }
+    assert_eq!(terms(&cluster, &agents), before);
+    wait_until("every replica is quiet again", || all_quiet(&cluster));
+    assert_eq!(terms(&cluster, &agents), before);
+}
+
+/// Every node restarts at once with more groups than a peer's connection
+/// holds streams for: the groups share a few lanes, and each elects a
+/// leader within a few election timeouts. A stream per group would leave
+/// those without one waiting for streams the groups still electing keep
+/// busy.
+#[test]
+fn more_groups_than_streams_elect_after_every_node_restarts() {
+    // Two lanes a class: eight streams a connection.
+    let mut cluster = Cluster::over_quic_tuned(3, |_, config| config.peer_lanes = 2);
+    let agents = agents(&cluster, 24);
+    for number in 1..=3 {
+        cluster.stop(number);
+    }
+    let started = Instant::now();
+    for number in 1..=3 {
+        cluster.start(number);
+    }
+    for &agent in &agents {
+        cluster.leader(agent);
+    }
+    let took = started.elapsed();
+    eprintln!("{} groups elected within {took:?}", agents.len());
+    assert!(took < Duration::from_secs(15), "{took:?}");
+}
+
+/// Nodes that run two campaigns at once elect every group in turn after
+/// they all restart together: the others put theirs off by a fresh
+/// election timeout, and no term runs away.
+#[test]
+fn a_bound_on_campaigns_elects_every_group_in_turn() {
+    let mut cluster = Cluster::tuned(3, |_, config| config.campaigns = 2);
+    let agents = agents(&cluster, 24);
+    let before = terms(&cluster, &agents);
+    for number in 1..=3 {
+        cluster.stop(number);
+    }
+    let started = Instant::now();
+    for number in 1..=3 {
+        cluster.start(number);
+    }
+    for &agent in &agents {
+        cluster.leader(agent);
+    }
+    let took = started.elapsed();
+    let moved: u64 = terms(&cluster, &agents)
+        .iter()
+        .zip(&before)
+        .map(|(after, before)| after - before)
+        .sum();
+    eprintln!(
+        "{} groups elected within {took:?}, their terms moved {moved} in all",
+        agents.len()
+    );
+    assert!(took < Duration::from_secs(30), "{took:?}");
+    assert!(moved <= 3 * agents.len() as u64, "{moved}");
+}
+
 /// A follower node restarted while its groups are quiet, nothing written
 /// meanwhile, hears its leaders at once: each probes it on hearing its
 /// new run, rather than waiting for its own deadline to draw a heartbeat.

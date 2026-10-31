@@ -49,6 +49,8 @@ pub(crate) struct Stats {
     pub(crate) queued: Histogram,
     /// Inputs in a batch.
     pub(crate) batch_inputs: Histogram,
+    /// Batches in flight as one is proposed, itself among them.
+    pub(crate) in_flight: Histogram,
     /// A batch's refine's gas, per input.
     pub(crate) refine_gas: Histogram,
     /// The gas its steps used, per input: what is left of `refine_gas` is
@@ -133,6 +135,7 @@ impl Stats {
         let mut stages = vec![
             stage("queued", &self.queued),
             stage("batch_inputs", &self.batch_inputs),
+            stage("in_flight", &self.in_flight),
             stage("refine_gas", &self.refine_gas),
             stage("step_gas", &self.step_gas),
             stage("refine_queue", &self.refine_queue),

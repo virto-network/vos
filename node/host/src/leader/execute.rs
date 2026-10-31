@@ -1,5 +1,6 @@
 //! A batch's run: refined and dry-run on executors, its result proposed,
-//! and waited for until this replica applied it.
+//! and, in flight with those after it, waited for until this replica
+//! applied it.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -8,6 +9,7 @@ use smol::future::FutureExt;
 use vos_wire::Encode;
 use vos_wire::batch::{Batch, Work};
 use vos_wire::keys;
+use vos_wire::keys::Due;
 use vos_wire::records::unstored;
 use vos_wire::result::{Step, WorkResult, Write as StateWrite};
 
@@ -16,9 +18,41 @@ use crate::blobs::{Held, Keep, blob_ref};
 use crate::fault::Fault;
 use crate::group::{DryRun, Local};
 use crate::node::Inner;
+use crate::node::Pending;
 use crate::pvm;
 use crate::stats::Histogram;
 use crate::store::{BlobRef, EntryKind, LARGE_RESULT, LogEntry, Snapshot};
+
+/// A batch proposed whose result has yet to apply here.
+pub(super) struct Flight {
+    pub(super) pending: Vec<Pending>,
+    pub(super) result: WorkResult,
+    /// The state it refined on.
+    pub(super) before: Arc<Snapshot>,
+    /// Its entry's index.
+    pub(super) index: u64,
+    /// Its dry run's writes, which the batches after it refine over.
+    pub(super) writes: Vec<StateWrite>,
+    /// The first due row its sweep found, if it swept.
+    pub(super) sweeping: Option<(u64, Due)>,
+    /// When it started, and when its proposal was answered.
+    pub(super) started: Instant,
+    pub(super) proposed: Instant,
+}
+
+/// A batch's run up to its proposal.
+pub(super) enum Launched {
+    /// Proposed at its index: its result, its dry run's writes and when the
+    /// proposal was answered.
+    Proposed {
+        index: u64,
+        result: WorkResult,
+        writes: Vec<StateWrite>,
+        proposed: Instant,
+    },
+    /// Leadership ended before it was proposed.
+    Lost,
+}
 
 impl Leader {
     /// Refine `batch`, or take `marker`, a `Cut` marker, as its result
@@ -31,8 +65,44 @@ impl Leader {
         blobs: Vec<BlobRef>,
         marker: Option<WorkResult>,
     ) -> Result<Ended, Fault> {
-        let id = self.id;
         let started = Instant::now();
+        let launched = self
+            .launch(Arc::clone(&snapshot), batch, blobs, marker)
+            .await?;
+        let Launched::Proposed {
+            index,
+            result,
+            writes,
+            proposed,
+        } = launched
+        else {
+            return Ok(Ended::Lost);
+        };
+        self.sweeps.writes(&writes);
+        let flight = Flight {
+            pending: Vec::new(),
+            result,
+            before: snapshot,
+            index,
+            writes,
+            sweeping: None,
+            started,
+            proposed,
+        };
+        self.land(&flight).await
+    }
+
+    /// Refine `batch`, or take `marker` as its result; dry-run accumulate
+    /// on the same state, which the batches in flight's writes are over,
+    /// and propose the result.
+    pub(super) async fn launch(
+        &mut self,
+        snapshot: Arc<Snapshot>,
+        batch: Batch,
+        blobs: Vec<BlobRef>,
+        marker: Option<WorkResult>,
+    ) -> Result<Launched, Fault> {
+        let id = self.id;
         let (version, inputs) = (batch.version, batch.inputs.len() as u64);
         let stats = &self.inner.stats;
         stats.batch_inputs.record(inputs);
@@ -100,7 +170,8 @@ impl Leader {
                 applied: self.applied,
                 term: self.term,
                 seed: result.seed,
-                writes,
+                version,
+                writes: writes.clone(),
             },
         );
         let (answer, answered) = smol::channel::bounded(1);
@@ -116,18 +187,32 @@ impl Leader {
             },
         );
         if !proposed {
-            return Ok(Ended::Lost);
+            return Ok(Launched::Lost);
         }
         let answer = async { Some(answered.recv().await) };
         let stopped = async {
             self.shared.wait(|state| state.stopped).await;
             None
         };
-        let (index, taken) = match answer.or(stopped).await {
+        let (index, proposed) = match answer.or(stopped).await {
             Some(Ok((Ok(index), taken))) => (index, taken),
-            _ => return Ok(Ended::Lost),
+            _ => return Ok(Launched::Lost),
         };
-        stats.ran(&stats.propose, proposing, taken);
+        stats.ran(&stats.propose, proposing, proposed);
+        // The next batch's state follows this one's.
+        self.applied = index;
+        Ok(Launched::Proposed {
+            index,
+            result,
+            writes,
+            proposed,
+        })
+    }
+
+    /// Wait until this replica applied `flight`'s result: how it ended.
+    pub(super) async fn land(&mut self, flight: &Flight) -> Result<Ended, Fault> {
+        let (term, index) = (self.term, flight.index);
+        let stats = &self.inner.stats;
         let state = self
             .shared
             .wait(|state| state.stopped || !leads(state, term) || state.commit >= index)
@@ -139,7 +224,7 @@ impl Leader {
         // saw them: the time this task took to be polled again is the
         // runtime's, apart.
         let committed = state.commit_at.unwrap_or_else(Instant::now);
-        stats.ran(&stats.commit, taken, committed);
+        stats.ran(&stats.commit, flight.proposed, committed);
         let state = self
             .shared
             .wait(|state| state.stopped || !leads(state, term) || state.applied >= index)
@@ -149,21 +234,20 @@ impl Leader {
         }
         let applied = state.applied_at.unwrap_or_else(Instant::now);
         stats.ran(&stats.apply, committed, applied);
-        stats.batch.took(started.elapsed());
+        stats.batch.took(flight.started.elapsed());
         // The entry at its index is this leader's, of its term.
         let ours = self
             .inner
             .store
-            .log_entry(id, index)?
+            .log_entry(self.id, index)?
             .is_some_and(|entry| entry.term == term);
         if !ours {
             return Ok(Ended::Lost);
         }
-        self.applied = index;
-        match self.shared.outcome(index) {
-            Some(true) => Ok(Ended::Done(result)),
-            _ => Ok(Ended::Skipped),
-        }
+        Ok(match self.shared.outcome(index) {
+            Some(true) => Ended::Done(flight.result.clone()),
+            _ => Ended::Skipped,
+        })
     }
 
     /// Refine `work`, a batch's, on an executor, unless the refine hook

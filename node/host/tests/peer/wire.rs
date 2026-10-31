@@ -139,10 +139,15 @@ fn every_other_message_survives_the_wire() {
         PeerMessage::Liveness {
             incarnation: 9,
             round: 3,
+            since: 2,
+            part: 1,
+            parts: 2,
             leading: vec![Leading {
                 agent: AGENT,
                 term: 4,
             }],
+            unlisted: vec![AgentId(8)],
+            took: (5, 6),
         },
         forward(),
         PeerMessage::ReadIndex {
@@ -210,7 +215,12 @@ fn a_frame_is_one_whole_message() {
     let frame = PeerMessage::Liveness {
         incarnation: 1,
         round: 2,
+        since: 0,
+        part: 0,
+        parts: 1,
         leading: Vec::new(),
+        unlisted: Vec::new(),
+        took: (0, 0),
     }
     .encode();
     assert_eq!(

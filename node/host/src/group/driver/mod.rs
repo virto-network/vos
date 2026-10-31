@@ -17,7 +17,7 @@ mod fetch;
 mod membership;
 mod snapshot;
 
-use super::{Input, Local, MembershipChanged, Proposed, Quiet, ReadIndexed, Shared};
+use super::{Campaign, Input, Local, MembershipChanged, Proposed, Quiet, ReadIndexed, Shared};
 use crate::blobs::Held;
 use crate::node::Inner;
 use crate::raft::{self, EntryReports};
@@ -100,6 +100,10 @@ struct Driver {
     /// task of its own, as the driver never waits on the node-wide lock a
     /// placement takes.
     announced: Option<Order>,
+    /// The node's campaign this replica holds while it campaigns.
+    campaign: Option<Campaign>,
+    /// It waits its turn for one.
+    waiting: bool,
 }
 
 /// Where the core's answers go, by the token each request took.
@@ -140,13 +144,24 @@ impl Driver {
     /// as a fresh append would.
     pub(super) async fn start(inner: Arc<Inner>, shared: Arc<Shared>) -> Result<Self, String> {
         let agent = shared.agent;
-        let store = &inner.store;
         let failed = |error: fjall::Error| error.to_string();
-        let rows = store.raft(agent).map_err(failed)?;
-        inner.storage.recovered(agent, rows.applied);
-        let cut = raft::recovery_cut(store, &inner.blobs, agent).map_err(failed)?;
-        inner.storage.commit(cut.changes).await?;
-        for epoch in store.stale_epochs(agent).map_err(failed)? {
+        // The store's reads run on an executor: a node starting many
+        // groups at once keeps its runtime for those already started.
+        let (store, blobs) = (inner.store.clone(), inner.blobs.clone());
+        let (applied, cut, stale) = inner
+            .offload(move || {
+                let applied = store.raft(agent)?.applied;
+                let cut = raft::recovery_cut(&store, &blobs, agent)?;
+                Ok((applied, cut, store.stale_epochs(agent)?))
+            })
+            .await
+            .ok_or("the executors stopped")?
+            .map_err(failed)?;
+        inner.storage.recovered(agent, applied);
+        if !cut.changes.is_empty() {
+            inner.storage.commit(cut.changes).await?;
+        }
+        for epoch in stale {
             inner
                 .storage
                 .commit(vec![Change::DropEpoch {
@@ -156,7 +171,12 @@ impl Driver {
                 }])
                 .await?;
         }
-        let rows = store.raft(agent).map_err(failed)?;
+        let store = inner.store.clone();
+        let rows = inner
+            .offload(move || store.raft(agent))
+            .await
+            .ok_or("the executors stopped")?
+            .map_err(failed)?;
         let last_index = rows
             .log
             .last()
@@ -230,6 +250,8 @@ impl Driver {
             compact_bound: 0,
             compact_due: false,
             announced: None,
+            campaign: None,
+            waiting: false,
             inner,
             shared,
         })
@@ -295,10 +317,17 @@ impl Driver {
                 }
                 // A quiet core's timers are the pair heartbeat's to stand
                 // in for: the driver sleeps until a message, a local, the
-                // pair heartbeat's wake, or its long round.
-                let quiet = other.is_none().then(|| self.quiet()).flatten();
-                let quiesced = quiet.is_some();
-                *lock(&self.shared.quiet) = quiet;
+                // pair heartbeat's wake, or its long round. Set under the
+                // peer table's lock, so a change to the listing it rests on
+                // either comes before, and keeps it awake, or finds it
+                // quiet, and wakes it.
+                let quiesced = {
+                    let table = self.inner.liveness.table();
+                    let quiet = other.is_none().then(|| self.quiet(&table)).flatten();
+                    let quiesced = quiet.is_some();
+                    *lock(&self.shared.quiet) = quiet;
+                    quiesced
+                };
                 let wake = if quiesced {
                     let round = Duration::from_millis(self.inner.settings.election_timeout_ms.1);
                     Some(Instant::now() + round * QUIET_ROUNDS)
@@ -348,6 +377,35 @@ impl Driver {
                 if quiesced || self.core.next_deadline() <= now {
                     self.vouch(now);
                 }
+                // A campaign starts, or goes another round, only with one
+                // of the node's campaigns: past their bound it waits its
+                // turn, so a node that wakes many leaderless groups at once
+                // elects them in turn rather than have them all time out
+                // together, each woken as one ends. A round that did not
+                // settle gives its campaign back and waits its turn again,
+                // so groups that keep losing do not keep the others out.
+                let due = self.core.campaign_due(now);
+                if due {
+                    self.campaign = None;
+                }
+                if (due || self.waiting) && self.campaign.is_none() {
+                    let high = self.inner.settings.election_timeout_ms.1;
+                    match self.inner.campaigns.take(self.shared.agent) {
+                        Some(campaign) => {
+                            self.campaign = Some(campaign);
+                            if std::mem::take(&mut self.waiting) {
+                                self.core.campaign_now(now);
+                            }
+                        }
+                        // Woken in turn, or failing that after ten election
+                        // timeouts.
+                        None => {
+                            self.waiting = true;
+                            self.core
+                                .defer_campaign(now, now + QUIET_ROUNDS as u64 * high);
+                        }
+                    }
+                }
                 self.core.tick(now);
                 match event {
                     Event::Closed => break,
@@ -381,10 +439,15 @@ impl Driver {
                 }
                 self.settle_membership();
                 self.fetch_blobs();
+                // A campaign ends as the replica leads or follows a leader.
+                if !self.core.campaigning() {
+                    self.campaign = None;
+                }
             }
         }
         // A caller who sees the group gone sees it lead nothing, and a
         // proposal still queued hears so.
+        self.inner.led_here(self.shared.agent, false);
         self.shared.update(|state| {
             state.role = Role::Follower;
             state.leading_from = None;
@@ -400,17 +463,24 @@ impl Driver {
     /// Why the driver may wait on no timer of its own now, if it may: the
     /// core needs no tick but those the pair heartbeat stands in for, which
     /// notices a lapse within a round of it.
-    fn quiet(&self) -> Option<Quiet> {
+    fn quiet(&self, table: &crate::liveness::Table) -> Option<Quiet> {
         let every = self.inner.settings.heartbeat_ms;
         if !self.inner.liveness.on_time(every) || !self.core.quiescent(every) {
             return None;
         }
         let status = self.core.status();
         match status.role {
-            Role::Follower => Some(Quiet::Following {
-                leader: status.leader_hint?,
-                term: status.current_term,
-            }),
+            // Only while its leader's listing names it, fresh enough to
+            // stand in for its timer until the next round: a change to that
+            // listing then wakes it.
+            Role::Follower => {
+                let (leader, term) = (status.leader_hint?, status.current_term);
+                let listed = table.listed(leader, &self.shared.agent, term)?;
+                let (low, margin) = (self.inner.settings.election_timeout_ms.0, every);
+                let fresh = listed + Duration::from_millis(low)
+                    > Instant::now() + Duration::from_millis(margin);
+                fresh.then_some(Quiet::Following { leader, term })
+            }
             Role::Leader => {
                 let me = self.inner.number;
                 let mut members: Vec<NodeNumber> = status
@@ -627,6 +697,7 @@ impl Driver {
                 if role != Role::Leader {
                     self.snapshots.shipments.clear();
                 }
+                self.inner.led_here(self.shared.agent, role == Role::Leader);
                 // Becoming leader, the core appended its term's no-op last.
                 let leading_from =
                     (role == Role::Leader).then(|| self.core.status().last_log_index);

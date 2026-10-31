@@ -41,15 +41,24 @@ pub enum PeerMessage {
     /// A blob, which the receiver hashes before taking.
     #[codec(index = 4)]
     Blob { hash: [u8; 32], bytes: Vec<u8> },
-    /// The sending node's pair heartbeat: it is alive, in its run
-    /// `incarnation` (its start time, in microseconds) at heartbeat
-    /// `round`, and leads each group in `leading` at its term. A long
-    /// list comes in several frames of one round.
+    /// The sending node's pair heartbeat, one frame of a round: it is
+    /// alive, in its run `incarnation` (its start time, in microseconds) at
+    /// heartbeat `round`. The groups it leads change from its listing as of
+    /// round `since`, the last the receiver took whole, or, with `since`
+    /// 0, are listed whole: each group in `leading` at its term, none in
+    /// `unlisted`. A round comes in `parts` frames, this one `part`. `took`
+    /// is the receiver's run and the last of its rounds the sender took
+    /// whole, or zeros.
     #[codec(index = 5)]
     Liveness {
         incarnation: u64,
         round: u64,
+        since: u64,
+        part: u32,
+        parts: u32,
         leading: Vec<Leading>,
+        unlisted: Vec<AgentId>,
+        took: (u64, u64),
     },
     /// Where an agent runs, with its creation record: from its creator at
     /// creation, then from its leader as its replicas change, or from a

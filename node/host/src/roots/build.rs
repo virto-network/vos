@@ -370,7 +370,14 @@ pub(crate) async fn build(inner: Arc<Inner>, shared: Arc<Shared>) {
 async fn run(inner: &Inner, shared: &Shared) -> Result<(), Error> {
     let agent = shared.agent;
     while !shared.state().stopped {
-        let Some(mut build) = Build::start(&inner.store, agent)? else {
+        // Read on an executor: a node starting many groups at once keeps
+        // its runtime for those already started.
+        let store = inner.store.clone();
+        let started = inner
+            .offload(move || Build::start(&store, agent))
+            .await
+            .ok_or_else(|| Error::Halted("the executors stopped".into()))?;
+        let Some(mut build) = started? else {
             return Ok(());
         };
         if inner.representative() == Some(agent) {

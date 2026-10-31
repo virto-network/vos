@@ -106,6 +106,6 @@ fn check(
     message: &PeerMessage,
     followed: impl FnOnce(AgentId) -> Option<(NodeNumber, u64)>,
 ) -> Result<(), Refusal> {
-    let way = (peer::class(message), peer::stream(message));
-    peer::check(space, &OURS, from, way, message, followed)
+    let way = (peer::class(message), peer::stream(message, peer::LANES));
+    peer::check(space, &OURS, from, way, peer::LANES, message, followed)
 }

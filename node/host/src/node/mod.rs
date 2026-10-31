@@ -43,7 +43,7 @@ use crate::{lock, timeout};
 
 pub(crate) use config::Settings;
 pub use config::{Config, Peers};
-pub(crate) use directory::Directory;
+pub(crate) use directory::{Directory, Known};
 pub use error::{CallError, Error, ReplaceError, Reply};
 pub(crate) use open::write_private;
 pub use open::{ADMIN_TOKEN, NODE_KEY, STORE, wall_clock};
@@ -123,7 +123,11 @@ pub(crate) struct Inner {
     pub(crate) dropping: Mutex<HashMap<(AgentId, u8), usize>>,
     /// The agents this node replicates.
     pub(crate) runs: Mutex<HashMap<AgentId, Arc<Run>>>,
-    pub(crate) dry_runs: Mutex<HashMap<AgentId, DryRun>>,
+    /// The agents whose replica here leads, as their drivers last said:
+    /// what the pair heartbeat lists, without a pass over every group.
+    pub(crate) leaders: Mutex<HashSet<AgentId>>,
+    /// Each agent's leader's dry runs of its results in flight.
+    pub(crate) dry_runs: Mutex<HashMap<AgentId, Vec<DryRun>>>,
     /// The blobs groups here asked for.
     wanted: Mutex<HashMap<[u8; 32], Wanted>>,
     pub(crate) drops: crate::peer::Drops,
@@ -152,6 +156,8 @@ pub(crate) struct Inner {
     pub(crate) halted: AtomicBool,
     /// The pair heartbeat this node sends, and what it hears.
     pub(crate) liveness: crate::liveness::Liveness,
+    /// The campaigns its groups run at once.
+    pub(crate) campaigns: Arc<group::Campaigns>,
     /// Clients' calls: their lanes, and the calls forwarded both ways.
     pub(crate) calls: crate::calls::Calls,
     /// The read indexes this replica asked its leaders for.
