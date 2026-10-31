@@ -15,7 +15,7 @@ c0a21a2e4b30a4ae5b9e921d2a481435e80b38a6c8a75fc15fc685f79a41cd33  agent/test-act
 afb55039443e0d3699f66b8c49be455b0949e48d7b9c43dfa5ca542410faf6b3  agent/test-actors/target/riscv64em-vos/release/caller.elf
 05eccad0c7528f7824ee148497dae2daacb639b257aff11de1f5a2e8f6e709de  agent/test-actors/target/riscv64em-vos/release/compact.elf
 ce0e5fbc4d52ced2eb00550b60d6a566b27d1563992a838aa7713969440f7790  agent/test-actors/target/riscv64em-vos/release/counter.elf
-10459c9c1aa812fcc4cf70de74c13bbda3dded6c3fcde4cef63953c619755263  agent/test-actors/target/riscv64em-vos/release/device.elf
+8644b10dde7e52afe3124ce51345cc14363c3f1c0ae3850df61cf6a3656b4a14  agent/test-actors/target/riscv64em-vos/release/device.elf
 c783b005c65e5f18aa4ccd71e086c573d468b48f31498041a939fe174447d5bb  agent/test-actors/target/riscv64em-vos/release/greedy.elf
 0e646b6a2b37cff7220e325d2c4ebc13518fa423c22d4df3ab1e06713d3760f8  agent/test-actors/target/riscv64em-vos/release/huge.elf
 355b1b7107abe8f77c7b2ff3c89eb41acfce995a5aad1a7171eeca76895ab04e  agent/test-actors/target/riscv64em-vos/release/kernels.elf

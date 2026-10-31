@@ -144,7 +144,7 @@ impl<L: Lane> DeviceIoHasher<L> {
         }
         let mut blocks = bytes.chunks_exact(BLOCK);
         for block in &mut blocks {
-            self.absorb(block);
+            self.absorb(block.try_into().expect("a whole block"));
         }
         let rest = blocks.remainder();
         self.buf[..rest.len()].copy_from_slice(rest);
@@ -173,11 +173,79 @@ impl<L: Lane> DeviceIoHasher<L> {
 
     /// One block of 24 bytes into the chain.
     #[inline(always)]
-    fn absorb(&mut self, block: &[u8]) {
-        for (word, bytes) in self.lane[8..].iter_mut().zip(block.chunks_exact(3)) {
-            *word = u32::from(bytes[0]) | u32::from(bytes[1]) << 8 | u32::from(bytes[2]) << 16;
-        }
+    fn absorb(&mut self, block: &[u8; BLOCK]) {
+        pack(&mut self.lane, block);
         L::compress(&mut self.lane);
+    }
+}
+
+/// `H_io` of `E`, the first `len` bytes of `padded`, as its eight words:
+/// `padded` holds `E` and then zeros up to the next multiple of 24 bytes,
+/// so every block is read where it lies, with no copy. `None` for an `E`
+/// of [`MAX_DEVICE_IO`] bytes or more, or a `padded` of another length.
+/// A device kernel's end hashes its return so; [`DeviceIoHasher`] gives
+/// the same words for the same `E`.
+#[inline(always)]
+pub fn padded_device_io_words<L: Lane>(padded: &[u8], len: usize) -> Option<[u32; 8]> {
+    if len as u64 >= MAX_DEVICE_IO || padded.len() != len.div_ceil(BLOCK) * BLOCK {
+        return None;
+    }
+    let mut lane = [0u32; 16];
+    lane[0] = DEVICE_IO_TAG;
+    for block in padded.chunks_exact(BLOCK) {
+        pack(&mut lane, block.try_into().expect("a whole block"));
+        L::compress(&mut lane);
+    }
+    lane[8] = len as u32;
+    lane[9..].fill(0);
+    L::compress(&mut lane);
+    let mut words = [0u32; 8];
+    words.copy_from_slice(&lane[..8]);
+    Some(words)
+}
+
+/// A block of 24 bytes as the lane's second half: eight words of three
+/// little-endian bytes, each the low three bytes of the four at its offset
+/// (the last word the high three of the four at 20).
+#[inline(always)]
+fn pack(lane: &mut [u32; 16], block: &[u8; BLOCK]) {
+    let at = block.as_ptr();
+    // SAFETY: each load reads four of the block's 24 bytes.
+    unsafe {
+        for (j, word) in lane[8..15].iter_mut().enumerate() {
+            *word = load_u32(at.add(3 * j)) & 0x00ff_ffff;
+        }
+        lane[15] = load_u32(at.add(20)) >> 8;
+    }
+}
+
+/// The four bytes at `at`, any alignment, little-endian: on the guest in
+/// one load, which the PVM serves at any address (the target's own
+/// unaligned reads go byte by byte).
+///
+/// # Safety
+///
+/// `at` must point at four readable bytes.
+#[inline(always)]
+unsafe fn load_u32(at: *const u8) -> u32 {
+    #[cfg(target_arch = "riscv64")]
+    {
+        let word: u64;
+        // SAFETY: the caller's contract; the load touches nothing else.
+        unsafe {
+            core::arch::asm!(
+                "lwu {word}, 0({at})",
+                word = out(reg) word,
+                at = in(reg) at,
+                options(nostack, readonly, preserves_flags),
+            );
+        }
+        word as u32
+    }
+    #[cfg(not(target_arch = "riscv64"))]
+    // SAFETY: the caller's contract.
+    unsafe {
+        u32::from_le_bytes(core::ptr::read_unaligned(at.cast()))
     }
 }
 
@@ -361,6 +429,31 @@ mod tests {
         hasher.update(&[0; 23]);
         hasher.update(&[1]);
         assert_ne!(zeros, hasher.finalize());
+    }
+
+    /// The padded hash is the chain's for every length across three blocks,
+    /// its words the hash's bytes; a padding of another length, or an
+    /// oversize encoding, has none.
+    #[test]
+    fn the_padded_hash_is_the_chains() {
+        for len in 0..=73usize {
+            let encoded: Vec<u8> = (0..len as u8).map(|byte| byte.wrapping_mul(37)).collect();
+            let mut padded = encoded.clone();
+            padded.resize(len.div_ceil(24) * 24, 0);
+            let words = padded_device_io_words::<Poseidon2Call>(&padded, len).unwrap();
+            let mut bytes = [0u8; 32];
+            for (chunk, word) in bytes.chunks_exact_mut(4).zip(words) {
+                chunk.copy_from_slice(&word.to_le_bytes());
+            }
+            assert_eq!(bytes, by_hand(&encoded), "{len}");
+            padded.push(0);
+            assert_eq!(padded_device_io_words::<Poseidon2Call>(&padded, len), None);
+        }
+        let oversize = MAX_DEVICE_IO as usize;
+        assert_eq!(
+            padded_device_io_words::<Poseidon2Software>(&alloc::vec![0; oversize + 8], oversize),
+            None
+        );
     }
 
     /// An encoding of 2^24 bytes or more has no hash; one byte less has.
